@@ -13,6 +13,6 @@ jobs:
           script: |
             mkdir -p ~/.ssh
             chmod 700 ~/.ssh
-            echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICTKiH5c11/bh3Oz4rvemPfyP/iwlBuIr4cNguK/KMAI vane-deploy' >> ~/.ssh/authorized_keys
+            echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKrrTLUvK4S8UKcDH378MV+8lzyhNcQiPE/UDa+oM+vW vane-deploy' > ~/.ssh/authorized_keys
             chmod 600 ~/.ssh/authorized_keys
             echo 'SSH key added successfully'
