@@ -1,0 +1,36 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/vane
+/bin/
+
+# Test
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Vendor (use go mod download)
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+/dist/
+/tmp/
