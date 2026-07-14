@@ -3,8 +3,16 @@ api.vane.zhuoqidev.com {
 	reverse_proxy localhost:8080
 }
 
-# 前端上线前的临时入口。前端就绪后，此域名的 DNS 改为双线 CNAME：
-# 默认（国内）→ 阿里云 CDN（回源 OSS），境外 → Cloudflare Pages（与主站 zhuoqidev.com 同模式）
+# 主站：Dashboard SPA 静态托管 + /api 反代到本机 vane 进程。
+# /srv/vane-web 由 compose 卷映射到宿主机 /opt/vane/web（vane-web CI 部署产物落这里）。
+# try_files 回落 index.html 是 SPA 刷新/直达路由不 404 的关键。
 vane.zhuoqidev.com {
-	reverse_proxy localhost:8080
+	handle /api/* {
+		reverse_proxy localhost:8080
+	}
+	handle {
+		root * /srv/vane-web
+		try_files {path} /index.html
+		file_server
+	}
 }

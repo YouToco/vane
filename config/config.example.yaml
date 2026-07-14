@@ -17,7 +17,7 @@ llm:
   provider: "deepseek"
   base_url: "https://api.deepseek.com"
   api_key: "" # VANE_LLM_API_KEY
-  model: "deepseek-chat"
+  model: "deepseek-v4-flash"
   max_concurrent: 5
 
 feishu:
@@ -38,3 +38,6 @@ agent:
 
 log:
   level: "info"
+
+dashboard:
+  password: "" # VANE_DASHBOARD_PASSWORD（为空则 Dashboard 登录不可用，只告警不拒启动）
