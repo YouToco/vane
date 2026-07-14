@@ -45,6 +45,9 @@ func (cg *CardGen) Generate(ctx context.Context, userID int64, item types.Scored
 		User:        buildCardUser(item.Item),
 		Temperature: f32ptr(0.7), // 解读文案要一点多样性，温度略高于打分
 		MaxTokens:   iptr(400),
+		// 关思维链：模板化摘要不需要 CoT；400 预算下 reasoning 偶发吃满会导致
+		// content 空 → 卡片只剩标题+链接兜底（2026-07-14 生产 1/15 次命中）。
+		DisableThinking: true,
 	}
 
 	meta := llm.CallMeta{

@@ -131,6 +131,38 @@ func TestCompleteOptionalFields(t *testing.T) {
 	if got, ok := gotBody["max_tokens"].(float64); !ok || got != 512 {
 		t.Errorf("max_tokens = %v, 期望 512", gotBody["max_tokens"])
 	}
+	// 未设 DisableThinking 时不得携带 thinking 字段（交上游默认）。
+	if _, present := gotBody["thinking"]; present {
+		t.Errorf("未禁思考时不应携带 thinking 字段，实际 %v", gotBody["thinking"])
+	}
+}
+
+// TestCompleteDisableThinking DisableThinking=true 必须序列化为
+// thinking:{type:"disabled"}——V4 默认思维链会吃光小 max_tokens 预算导致
+// content 恒空（打分全回退中位分的生产事故回归锚点）。
+func TestCompleteDisableThinking(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Write([]byte(okResponseBody))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, 5)
+	if _, err := c.Complete(context.Background(), Request{
+		User:            "hi",
+		DisableThinking: true,
+	}); err != nil {
+		t.Fatalf("Complete 返回错误: %v", err)
+	}
+
+	th, ok := gotBody["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("thinking 字段缺失或类型错误: %v", gotBody["thinking"])
+	}
+	if th["type"] != "disabled" {
+		t.Errorf("thinking.type = %v, 期望 disabled", th["type"])
+	}
 }
 
 // TestComplete429RateLimit HTTP 429 必须映射为 CodeLLMRateLimit（可重试）。

@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -59,6 +60,12 @@ type Request struct {
 	User        string
 	Temperature *float32 // nil = 不传该字段
 	MaxTokens   *int     // nil = 不传该字段
+	// DisableThinking 显式关闭 DeepSeek V4 的思维链输出（thinking: disabled）。
+	// V4 系列默认开启 reasoning：模型先在 reasoning_content 里思考再写 content，
+	// 两者共享 max_tokens 预算——小预算调用（如打分 16 token）会被思维链吃光、
+	// content 恒为空（2026-07-14 生产实锤：118/118 次打分 content 空、全部回退中位分）。
+	// 格式固定的结构化输出（打分/出卡）应设 true：省 token、快、且杜绝空 content。
+	DisableThinking bool
 }
 
 // Response 单次调用结果。CacheHitTokens/CacheMissTokens 对应 DeepSeek
@@ -82,16 +89,24 @@ type chatMessage struct {
 }
 
 type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Temperature *float32      `json:"temperature,omitempty"`
-	MaxTokens   *int          `json:"max_tokens,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []chatMessage   `json:"messages"`
+	Temperature *float32        `json:"temperature,omitempty"`
+	MaxTokens   *int            `json:"max_tokens,omitempty"`
+	Thinking    *thinkingConfig `json:"thinking,omitempty"`
+}
+
+// thinkingConfig 是 DeepSeek V4 的思维链开关（实测 type=disabled 生效：
+// reasoning_content 为空、content 正常、completion_tokens 大幅下降）。
+type thinkingConfig struct {
+	Type string `json:"type"` // "disabled" | "enabled"
 }
 
 type chatResponse struct {
 	Model   string `json:"model"`
 	Choices []struct {
-		Message struct {
+		FinishReason string `json:"finish_reason"`
+		Message      struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
@@ -136,11 +151,16 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	}
 	messages = append(messages, chatMessage{Role: "user", Content: req.User})
 
+	var thinking *thinkingConfig
+	if req.DisableThinking {
+		thinking = &thinkingConfig{Type: "disabled"}
+	}
 	payload, err := json.Marshal(chatRequest{
 		Model:       c.model,
 		Messages:    messages,
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
+		Thinking:    thinking,
 	})
 	if err != nil {
 		return nil, types.NewAppError(types.CodeLLMBadRequest, "llm: 请求体序列化失败", err)
@@ -188,6 +208,15 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	model := cr.Model
 	if model == "" {
 		model = c.model
+	}
+	// content 空是隐性故障信号（如思维链吃光 max_tokens 预算导致 finish_reason=length
+	// 且 content=""），静默返回会让上层用兜底值掩盖问题——2026-07-14 打分全回退中位分
+	// 三个批次才被发现。这里不报错（语义留给调用方），但必须留下可检索的告警。
+	if cr.Choices[0].Message.Content == "" {
+		slog.Warn("llm: 上游返回空 content",
+			"model", model,
+			"finish_reason", cr.Choices[0].FinishReason,
+			"completion_tokens", cr.Usage.CompletionTokens)
 	}
 	return &Response{
 		Content:          cr.Choices[0].Message.Content,

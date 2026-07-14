@@ -65,6 +65,9 @@ func (sc *Scorer) Score(ctx context.Context, userID int64, item types.ContentIte
 		User:        buildScoreUser(sc.profileHint(ctx, userID), item),
 		Temperature: f32ptr(0), // 打分要稳定可复现，温度取 0
 		MaxTokens:   iptr(16),  // 只需一个数字，压满上限省 token
+		// 必须关思维链：V4 默认 reasoning 会把 16 token 预算全部吃光、content 恒空，
+		// 打分全部回退中位分（2026-07-14 生产实锤：118/118 次空输出，三批全 50 分）。
+		DisableThinking: true,
 	}
 
 	meta := llm.CallMeta{
