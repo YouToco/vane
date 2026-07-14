@@ -166,3 +166,34 @@ type Schedule struct {
 	CreatedAt     time.Time       `json:"created_at"`
 	UpdatedAt     time.Time       `json:"updated_at"`
 }
+
+// AgentSession agent 对话会话（agent_sessions 表，M4 migration 005）。
+// 单 owner MVP：同一用户 TTL 窗口（默认 30 分钟）内的消息共享一个会话，
+// 超时由读取路径惰性置 expired。Messages 存 OpenAI 兼容消息数组 JSON
+// （含 tool_calls），延迟解析；system 消息不入库，由 agent loop 调用时动态前置。
+type AgentSession struct {
+	ID        int64              `json:"id"`
+	UserID    int64              `json:"user_id"`
+	Status    AgentSessionStatus `json:"status"`
+	Messages  json.RawMessage    `json:"messages"` // JSONB，[]llm.ChatMessage 序列化
+	TurnCount int                `json:"turn_count"`
+	CreatedAt time.Time          `json:"created_at"`
+	UpdatedAt time.Time          `json:"updated_at"` // 最后活跃时间，TTL 过期判定依据
+}
+
+// PendingAction 待确认的写工具动作（pending_actions 表，M4 migration 005）。
+// 交互基调"AI 出预填、人点执行"：写工具不直接执行，先落本表并发确认卡；
+// 卡片按钮 value 只携带 ID，参数以库中 Args 为准，杜绝客户端篡改（契约 §10）。
+// 主键 ID 为 TEXT（uuid）而非 001 的 BIGSERIAL 数值主键。
+type PendingAction struct {
+	ID         string              `json:"id"`                   // uuid
+	UserID     int64               `json:"user_id"`              // 归属用户，回调时必须校验一致
+	SessionID  *int64              `json:"session_id,omitempty"` // 可空：产生该动作的会话
+	ToolName   string              `json:"tool_name"`            // 工具注册表内的白名单名
+	Args       json.RawMessage     `json:"args"`                 // JSONB，模型产出的 arguments 原始 JSON
+	Summary    string              `json:"summary"`              // 卡片上展示过的人类可读摘要
+	Status     PendingActionStatus `json:"status"`
+	ExpiresAt  time.Time           `json:"expires_at"`            // 超过后不可再领取
+	ExecutedAt *time.Time          `json:"executed_at,omitempty"` // 未执行时为 NULL
+	CreatedAt  time.Time           `json:"created_at"`
+}

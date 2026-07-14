@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/YouToco/vane/llm"
@@ -63,7 +64,8 @@ func (h *handler) eventDispatcher() *dispatcher.EventDispatcher {
 			// 刻意不用回调入参 ctx（回调返回后可能失效），改用连接级 ctx。
 			go h.handle(h.ctx, event)
 			return nil
-		})
+		}).
+		OnP2CardActionTrigger(h.onCardAction)
 }
 
 // isDuplicate 报告 message_id 是否在去重窗口内出现过，顺带清理过期条目。
@@ -135,7 +137,17 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 		return
 	}
 
-	resp, err := llm.Do(ctx, h.m.cli, h.m.rec, llm.CallMeta{
+	// agent 已注入时消息交给 agent loop（M4）；未注入（如装配阶段配置不全）
+	// 回退下方 chat_reply 直连——保证任何装配形态下消息都有回应而非崩/沉默。
+	if runner := h.m.agentRunner(); runner != nil {
+		h.handleWithAgent(ctx, runner, msgID, openID, user.ID, text)
+		return
+	}
+
+	// 回退路径同样需要调用超时（连接级 ctx 无 deadline，llm.Client 由调用方控超时）。
+	llmCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	resp, err := llm.Do(llmCtx, h.m.cli, h.m.rec, llm.CallMeta{
 		TraceID:  uuid.NewString(),
 		SpanName: "chat_reply",
 		UserID:   &user.ID,
@@ -150,6 +162,187 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 	}
 
 	h.reply(ctx, msgID, BuildReplyCard(resp.Content))
+}
+
+// handleWithAgent 把消息交给 agent loop 并回复 Outcome.Reply；Confirm 非 nil
+// 时追加发一张确认卡。确认卡走 SendCard 新消息而非 reply：它有独立生命周期
+// （按钮回调后原地更新为结果），挂在原消息的回复串里会把两种语义搅在一起。
+func (h *handler) handleWithAgent(ctx context.Context, runner AgentRunner, msgID, openID string, userID int64, text string) {
+	// 整条消息的总预算（审查 #信号量瘫痪的纵深防御）：agent 单次模型调用已有
+	// 120s 超时，这里再兜住工具执行/DB 调用同类挂死——连接级 ctx 无 deadline，
+	// 没有这层预算时任何一环黑洞都会让 goroutine 永久滞留。
+	ctx, cancel := context.WithTimeout(ctx, agentMessageBudget)
+	defer cancel()
+
+	out, err := runner.HandleMessage(ctx, userID, text)
+	if err != nil {
+		slog.Error("feishu: agent 处理消息失败", "err", err, "user_id", userID)
+		h.reply(ctx, msgID, BuildReplyCard("这条消息我处理失败了："+humanizeLLMError(err)))
+		return
+	}
+	h.reply(ctx, msgID, BuildReplyCard(out.Reply))
+	if out.Confirm == nil {
+		return
+	}
+	card := BuildConfirmCard(out.Confirm.Summary, out.Confirm.ActionID)
+	if _, err := h.m.SendCard(ctx, openID, card); err != nil {
+		// 确认卡丢失意味着动作永远无法被确认（24h 后过期），必须明确告知用户。
+		slog.Error("feishu: 发送确认卡失败", "err", err, "action_id", out.Confirm.ActionID)
+		h.reply(ctx, msgID, BuildReplyCard("确认卡发送失败，本次操作未生效，请稍后重试。"))
+	}
+}
+
+// cardActionSyncBudget 是卡片回调的同步等待预算。飞书要求回调 3 秒内响应，
+// 否则重推事件；预留网络与前置查库的余量后取 2.5s，超时转异步补发结果消息
+// （契约 §9 降级路径：SDK 的 Token 延迟更新卡片要另走 cardkit API，MVP 不引入）。
+const cardActionSyncBudget = 2500 * time.Millisecond
+
+// agentMessageBudget 是一条 agent 消息端到端的硬预算（多轮模型调用 + 工具执行）。
+// 5 分钟容得下 maxTurns 内的正常循环，同时保证任何一环挂死都不会永久滞留。
+const agentMessageBudget = 5 * time.Minute
+
+// cardActionExecBudget 是确认动作执行（Claim 之后）的硬预算：脱离连接级 ctx 后
+// 必须有自己的上限，防工具内 DB/Temporal 调用无限阻塞。
+const cardActionExecBudget = 30 * time.Second
+
+// cardActionResult 是确认/取消动作的执行结果：text 恒为可直接展示的人话
+// （含失败话术），ok 仅用于区分 toast 的成功/失败样式。
+type cardActionResult struct {
+	text string
+	ok   bool
+}
+
+// onCardAction 处理确认卡按钮回调（契约 §9）：owner 校验 → confirm/cancel
+// 分发 → 预算内完成则原地把卡片更新为结果文本，超时先回「执行中」toast、
+// 完成后补发结果消息。恒返回 nil error：返回 error 只会让飞书反复重推回调，
+// 对用户没有任何额外价值。
+func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTriggerEvent) (resp *callback.CardActionTriggerResponse, _ error) {
+	// 与 handle 相同的 panic 兜底：WS 回调链上的 panic 会带崩整个进程。
+	// 命名返回值让 recover 后仍能给用户一个失败 toast 而非静默。
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("feishu: 卡片回调处理 panic", "recover", r)
+			resp = toastResponse("error", "内部错误，请稍后重试")
+		}
+	}()
+
+	if event == nil || event.Event == nil || event.Event.Action == nil {
+		return toastResponse("error", "回调数据缺失"), nil
+	}
+	verb, actionID := parseCardActionValue(event.Event.Action.Value)
+	if actionID == "" || (verb != cardActionConfirm && verb != cardActionCancel) {
+		// 不是 Vane 确认卡的回调（或 value 结构不识别）：静默忽略，不弹错误打扰。
+		return &callback.CardActionTriggerResponse{}, nil
+	}
+
+	var operatorID string
+	if event.Event.Operator != nil {
+		operatorID = event.Event.Operator.OpenID
+	}
+	// owner 为空（进程重启后缓存未预热等）时同样拒绝：宁可让主人重点一次，
+	// 也不能让白名单出现空窗（契约 §10：写动作只有 owner 能确认）。
+	if owner := h.m.ownerID(); operatorID == "" || owner == "" || operatorID != owner {
+		return toastResponse("error", "仅主人可操作"), nil
+	}
+
+	runner := h.m.agentRunner()
+	if runner == nil {
+		return toastResponse("error", "助手尚未就绪，请稍后重试"), nil
+	}
+
+	// 拿内部 user.ID：ExecuteAction/CancelAction 还会用它比对
+	// pending_action.user_id（服务端二次校验，契约 §10）。
+	user, err := h.m.st.UpsertUserByOpenID(h.ctx, operatorID, "")
+	if err != nil {
+		slog.Error("feishu: 卡片回调 upsert 用户失败", "err", err, "open_id", operatorID)
+		return toastResponse("error", "内部数据错误，请稍后重试"), nil
+	}
+
+	// 动作放 goroutine 执行：既是 2.5s 预算的实现载体，也保证超时后结果
+	// 不丢——同一 goroutine 跑完把结果送进 done，由补发分支接手。
+	// ctx 与连接生命周期解耦（审查 #Reconfigure 丢执行）：Claim 一旦成功动作即被
+	// 置为 executed 且不可再领取，此后的执行不能随 WS 换代（Dashboard 保存配置触发
+	// Reconfigure → h.ctx 取消）被中断，否则动作永久标记已执行但实际没执行、
+	// 结果也无处送达。WithoutCancel 摆脱连接取消，WithTimeout 自带 30s 上限防挂死。
+	done := make(chan cardActionResult, 1)
+	go func() {
+		execCtx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), cardActionExecBudget)
+		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("feishu: 卡片动作执行 panic", "recover", r, "action_id", actionID)
+				done <- cardActionResult{text: "内部错误，请稍后重试。"}
+			}
+		}()
+		var text string
+		var aerr error
+		if verb == cardActionConfirm {
+			text, aerr = runner.ExecuteAction(execCtx, user.ID, actionID)
+		} else {
+			text, aerr = runner.CancelAction(execCtx, user.ID, actionID)
+		}
+		if aerr != nil {
+			slog.Error("feishu: 卡片动作执行失败", "err", aerr, "action_id", actionID, "vane_action", verb)
+			done <- cardActionResult{text: "执行失败：" + humanizeLLMError(aerr)}
+			return
+		}
+		done <- cardActionResult{text: text, ok: true}
+	}()
+
+	timer := time.NewTimer(cardActionSyncBudget)
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		toastType, toastText := "success", "已处理"
+		if !res.ok {
+			toastType, toastText = "error", "执行失败"
+		}
+		// 原地把卡片更新为结果文本，正文样式沿用 BuildReplyCard；
+		// type=raw 表示 data 是完整卡片 JSON（SDK callback.Card 约定）。
+		return &callback.CardActionTriggerResponse{
+			Toast: &callback.Toast{Type: toastType, Content: toastText},
+			Card: &callback.Card{
+				Type: "raw",
+				Data: json.RawMessage(BuildReplyCard(res.text)),
+			},
+		}, nil
+	case <-timer.C:
+		go func() {
+			res := <-done
+			// 补发同样脱离连接 ctx（执行都熬过 Reconfigure 了，结果不能死在最后一步）。
+			sendCtx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), 15*time.Second)
+			defer cancel()
+			if _, serr := h.m.SendCard(sendCtx, operatorID, BuildReplyCard(res.text)); serr != nil {
+				slog.Error("feishu: 补发卡片动作结果失败", "err", serr, "action_id", actionID)
+			}
+		}()
+		// Toast + 撤下按钮（审查 #二次点击误导）：只回 toast 时按钮仍在，用户再点会
+		// 命中 Claim 幂等拒绝、卡片被替换成"已处理过"的三义文案，随后真结果又以新消息
+		// 到达——顺序错乱像失败。原地把卡片换成"执行中"说明，消除整个二次点击窗口。
+		return &callback.CardActionTriggerResponse{
+			Toast: &callback.Toast{Type: "info", Content: "执行中，稍后看结果消息"},
+			Card: &callback.Card{
+				Type: "raw",
+				Data: json.RawMessage(BuildReplyCard("执行中，结果稍后以新消息送达。")),
+			},
+		}, nil
+	}
+}
+
+// parseCardActionValue 从按钮 value（SDK 定型 map[string]interface{}）提取
+// vane_action 与 action_id；非字符串值按缺失处理（value 可被客户端伪造，
+// 类型断言失败不能 panic）。
+func parseCardActionValue(value map[string]interface{}) (verb, actionID string) {
+	verb, _ = value["vane_action"].(string)
+	actionID, _ = value["action_id"].(string)
+	return verb, actionID
+}
+
+// toastResponse 构造仅含 toast 的回调响应（不更新卡片）。
+func toastResponse(typ, content string) *callback.CardActionTriggerResponse {
+	return &callback.CardActionTriggerResponse{
+		Toast: &callback.Toast{Type: typ, Content: content},
+	}
 }
 
 // captureOwnerIfFirst 把第一个发消息的用户记为 owner（feishu_owner setting）。

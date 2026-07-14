@@ -210,6 +210,7 @@ func TestDefaults(t *testing.T) {
 		{"llm.provider", cfg.LLM.Provider, "deepseek"},
 		{"llm.base_url", cfg.LLM.BaseURL, "https://api.deepseek.com"},
 		{"llm.model", cfg.LLM.Model, "deepseek-v4-flash"},
+		{"llm.agent_model", cfg.LLM.AgentModel, "deepseek-v4-pro"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 5},
 		{"feishu.rate_interval_ms", cfg.Feishu.RateIntervalMS, 750},
 		{"fetch.rss_concurrency", cfg.Fetch.RSSConcurrency, 10},
@@ -218,6 +219,7 @@ func TestDefaults(t *testing.T) {
 		{"fetch.max_response_mb", cfg.Fetch.MaxResponseMB, 5},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
 		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 100000},
+		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},
 		{"log.level", cfg.Log.Level, "info"},
 	}
 	for _, c := range checks {

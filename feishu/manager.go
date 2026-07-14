@@ -18,10 +18,21 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
+	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
+
+// AgentRunner 是 feishu 对 agent loop 的窄依赖面（契约 §9）：消息入口 +
+// 确认卡的两个回调入口。用接口而非 *agent.Loop：feishu 只依赖这三个方法，
+// handler 单测可注入假实现；直接引用 agent.Outcome 不构成循环
+// （agent 不 import feishu，依赖单向）。
+type AgentRunner interface {
+	HandleMessage(ctx context.Context, userID int64, text string) (agent.Outcome, error)
+	ExecuteAction(ctx context.Context, userID int64, actionID string) (string, error)
+	CancelAction(ctx context.Context, userID int64, actionID string) (string, error)
+}
 
 // settings 表的两个已知 key（契约 §1）。导出供 api 层写入时复用，
 // 避免跨包用魔法字符串各写各的 "feishu"（改一处漏一处会导致保存后读不到）。
@@ -75,6 +86,11 @@ type Manager struct {
 	cli *llm.Client
 	rec *llm.Recorder
 
+	// agent 是消息链的 agent loop 入口（SetAgent 注入）；nil 时消息链
+	// 回退 chat_reply 直连 LLM——保证 agent 配置不全时通道仍可用。
+	// 由 mu 保护：注入发生在 main 装配期，但 handler goroutine 并发读。
+	agent AgentRunner
+
 	// captureMu 串行化 owner 捕获的 check-then-act（见 handler.captureOwnerIfFirst）。
 	captureMu sync.Mutex
 
@@ -106,6 +122,23 @@ type Manager struct {
 // 消息处理链（chat_reply）复用它们。
 func NewManager(st *store.Store, cli *llm.Client, rec *llm.Recorder) *Manager {
 	return &Manager{st: st, cli: cli, rec: rec}
+}
+
+// SetAgent 注入 agent loop（main 装配期、Start 之前调用）。
+// 选 Set 注入而非 NewManager 增参：agent 的构造依赖 scheduler，
+// 而 Manager 必须先于 scheduler 构造（pusher 依赖它做推送出口），
+// 增参会把装配顺序拧成环。
+func (m *Manager) SetAgent(a AgentRunner) {
+	m.mu.Lock()
+	m.agent = a
+	m.mu.Unlock()
+}
+
+// agentRunner 返回已注入的 agent；nil 表示未注入（消息链回退 chat_reply）。
+func (m *Manager) agentRunner() AgentRunner {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.agent
 }
 
 // Start 读取 settings 并在有配置且 enabled 时建立 WS 连接；无配置静默待命。
