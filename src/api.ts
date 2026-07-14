@@ -51,6 +51,14 @@ export interface Schedule {
   created_at?: string;
 }
 
+// 加订阅请求体，与后端 addSubscriptionReq 对齐（api/subscriptions.go）。
+// rss 只传 {url}（type 缺省即 rss，向后兼容）；exa/tikhub_xhs 传结构化搜索参数，
+// 幂等合成键（exa://... / tikhub://...）由后端生成，前端不拼。
+export type AddSubscriptionReq =
+  | { url: string }
+  | { type: "exa"; query: string; category?: string }
+  | { type: "tikhub_xhs"; keyword: string };
+
 // Source 直接复用后端 types.Source 的 JSON（entities.go）。
 // 信源管理页只用到其中几列，其余字段忽略即可。
 export interface Source {
@@ -163,8 +171,8 @@ export const api = {
 
   // ---- M3 信源管理（B8）----
   listSubscriptions: () => request<Source[]>("/api/subscriptions"),
-  addSubscription: (url: string) =>
-    post<{ source_id: number }>("/api/subscriptions", { url }),
+  addSubscription: (req: AddSubscriptionReq) =>
+    post<{ source_id: number }>("/api/subscriptions", req),
   removeSubscription: (sourceId: number) =>
     request<{ ok: boolean }>(`/api/subscriptions/${sourceId}`, { method: "DELETE" }),
 };

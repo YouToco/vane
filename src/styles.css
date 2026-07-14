@@ -776,20 +776,49 @@ a:hover {
 .src-intro {
   margin: -8px 0 16px;
 }
+/* 添加卡片两行：上排类型分段控件，下排该类型的输入 + 添加按钮 */
 .src-add {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: stretch;
+  padding: 16px 18px;
+}
+.src-add-row {
   display: flex;
   gap: 12px;
   align-items: center;
-  padding: 16px 18px;
 }
-.src-add .input {
+.src-add-row .input {
   flex: 1;
+  /* select 原生渲染比同 padding 的 input 高 2px，统一行内控件到按钮同高 */
+  height: 40px;
 }
-.src-add .btn {
+.src-add-row .btn {
   flex-shrink: 0;
+}
+/* exa 类别下拉：固定窄宽，不抢搜索词输入框的空间。
+   选择器必须带 .src-add-row 前缀：select 同时挂着 .input，
+   否则会被同文件 .src-add-row .input 的 flex:1（特异性 0-2-0）压掉。 */
+.src-add-row .src-category {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 116px;
 }
 
 .src-url {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 搜索型信源（exa/tikhub）：类型徽标 + 搜索词，合成键不渲染成链接 */
+.badge-type {
+  background: var(--primary-soft);
+  color: var(--primary-dark);
+  flex-shrink: 0;
+}
+.src-term {
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -865,7 +894,13 @@ a:hover {
   .sched-foot .btn {
     width: 100%;
   }
-  .src-add {
+  .src-add-row {
     flex-wrap: wrap;
+  }
+  /* flex-basis 为 0 时行永不溢出、上面的 wrap 形同虚设；
+     给文本输入一个实基准，exa 页签下让类别下拉和按钮真正折行，
+     输入框才不会在手机上被挤到 100px 左右。只命中 input，不动下拉的 auto 基准。 */
+  .src-add-row input.input {
+    flex-basis: 180px;
   }
 }
