@@ -1,0 +1,16 @@
+[Unit]
+Description=Vane server (见微)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vane
+EnvironmentFile=/opt/vane/.env
+ExecStart=/opt/vane/bin/vane
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

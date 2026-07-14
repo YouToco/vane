@@ -1,0 +1,40 @@
+# Vane 配置结构（Viper）。环境变量前缀 VANE_，嵌套用下划线：
+# 如 VANE_LLM_API_KEY 覆盖 llm.api_key，VANE_DB_URL 覆盖 db.url。
+# 敏感值一律走环境变量（/opt/vane/.env），本文件不放密钥。
+
+server:
+  addr: ":8080"
+
+db:
+  url: "" # VANE_DB_URL
+
+temporal:
+  host: "127.0.0.1:7233"
+  namespace: "default"
+  task_queue: "vane-push"
+
+llm:
+  provider: "deepseek"
+  base_url: "https://api.deepseek.com"
+  api_key: "" # VANE_LLM_API_KEY
+  model: "deepseek-chat"
+  max_concurrent: 5
+
+feishu:
+  app_id: ""     # VANE_FEISHU_APP_ID
+  app_secret: "" # VANE_FEISHU_APP_SECRET
+  rate_interval_ms: 750
+
+fetch:
+  rss_concurrency: 10
+  tikhub_concurrency: 3
+  tikhub_api_key: "" # VANE_TIKHUB_API_KEY
+  timeout_seconds: 20
+  max_response_mb: 5
+
+agent:
+  max_turns: 20
+  token_budget_daily: 100000
+
+log:
+  level: "info"
