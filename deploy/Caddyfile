@@ -1,3 +1,10 @@
+# 后端 API 永久入口
+api.vane.zhuoqidev.com {
+	reverse_proxy localhost:8080
+}
+
+# 前端上线前的临时入口。前端就绪后，此域名的 DNS 改为双线 CNAME：
+# 默认（国内）→ 阿里云 CDN（回源 OSS），境外 → Cloudflare Pages（与主站 zhuoqidev.com 同模式）
 vane.zhuoqidev.com {
 	reverse_proxy localhost:8080
 }
