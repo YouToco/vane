@@ -78,7 +78,9 @@ type FetchConfig struct {
 	RSSConcurrency    int `mapstructure:"rss_concurrency"`
 	TikhubConcurrency int `mapstructure:"tikhub_concurrency"`
 	// TikhubAPIKey 环境变量 VANE_FETCH_TIKHUB_API_KEY。
-	TikhubAPIKey   string `mapstructure:"tikhub_api_key"`
+	TikhubAPIKey string `mapstructure:"tikhub_api_key"`
+	// ExaAPIKey 环境变量 VANE_FETCH_EXA_API_KEY。
+	ExaAPIKey      string `mapstructure:"exa_api_key"`
 	TimeoutSeconds int    `mapstructure:"timeout_seconds"`
 	MaxResponseMB  int    `mapstructure:"max_response_mb"`
 }
@@ -109,6 +111,7 @@ var sensitiveKeys = []string{
 	"feishu.app_id",
 	"feishu.app_secret",
 	"fetch.tikhub_api_key",
+	"fetch.exa_api_key",
 	"dashboard.password",
 }
 

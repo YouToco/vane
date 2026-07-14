@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mmcdole/gofeed"
 
@@ -203,19 +204,53 @@ func mapItems(src types.Source, items []*gofeed.Item) []types.ContentItem {
 			PublishedAt: it.PublishedParsed,
 			FetchedAt:   now,
 		}
-		// 精确指纹落库（原为空串死代码）：让 content_hash 列真正可用。
-		item.ContentHash = dedup.ContentHash(item)
-		// 近似指纹落库（原为 nil）：72h 跨批近似去重依赖它。
-		sh := dedup.Simhash(item.Title + " " + item.Content)
-		item.Simhash = &sh
-		// 源既无 guid 又无 link 时用 content_hash 派生稳定键，
-		// 避免空串在 UNIQUE(source_id, external_id) 上静默冲突吞条目（001 的设计约束）。
-		if item.ExternalID == "" {
-			item.ExternalID = item.ContentHash
-		}
+		finalize(&item)
 		out = append(out, item)
 	}
 	return out
+}
+
+// truncateUTF8 把 s 截到至多 max 字节，并回退到最近的 rune 边界，保证结果是
+// 合法 UTF-8。裸 s[:max] 会把多字节字符（中文 3 字节、emoji 4 字节）从中间切裂，
+// 产生非法字节序列——Postgres 以 22021 invalid byte sequence 拒绝 INSERT，该条
+// 内容每轮抓取都在同一位置截坏、永久无法入库（审查 CRITICAL）。
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// noRedirect 禁止 http.Client 跟随重定向，30x 原样返回给调用方按非 2xx 处理。
+// 原因：Go 跨域重定向只剥离 Authorization/Cookie 等四个标准头，自定义头
+// （如 Exa 的 x-api-key）会被原样带到任意 Location 目标——上游 CDN 配置错误或
+// 域名被劫持时一次 30x 即可外带凭证。API 调用没有跟随重定向的正当需求。
+func noRedirect(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
+// finalize 为一条抓取到的内容补齐落库前的确定性字段：精确指纹 content_hash、
+// 近似指纹 simhash、以及 external_id 兜底。三个信源类型（RSS/Exa/TikHub）共用此逻辑，
+// 保证指纹计算方式一致——尤其 simhash 必须在抓取时就写入 content_items，Dedup 的
+// 排除自撞（查历史 simhash 时排除本批 ID）才成立。调用方只需填好业务字段。
+func finalize(item *types.ContentItem) {
+	if item.FetchedAt.IsZero() {
+		item.FetchedAt = time.Now().UTC()
+	}
+	// 精确指纹：让 content_hash 列真正可用（UNIQUE 精确去重依赖它）。
+	item.ContentHash = dedup.ContentHash(*item)
+	// 近似指纹：72h 跨批近似去重依赖它，抓取时即落库。
+	sh := dedup.Simhash(item.Title + " " + item.Content)
+	item.Simhash = &sh
+	// 无自然外部 ID 时用 content_hash 派生稳定键，
+	// 避免空串在 UNIQUE(source_id, external_id) 上静默冲突吞条目（001 的设计约束）。
+	if item.ExternalID == "" {
+		item.ExternalID = item.ContentHash
+	}
 }
 
 // authorName 从 gofeed 条目提取作者名。Author 已被 gofeed 标记 deprecated，

@@ -152,9 +152,12 @@ func retryableOrNot(err error) error {
 }
 
 // ioActivityOptions 用于网络 I/O 型 Activity（Fetch/Push）。
+// 120s：Fetch 串行抓多源、单源超时兜底 20s，60s 预算 3 个慢源就撞墙
+// （审查 #串行预算）；多源接入后源数增长，放宽到 120s。配合 due 过滤
+// （已成功源不重抓），重试也不重复计费。真正的并发扇出留到源数上百再做。
 func ioActivityOptions() workflow.ActivityOptions {
 	return workflow.ActivityOptions{
-		StartToCloseTimeout: 60 * time.Second,
+		StartToCloseTimeout: 120 * time.Second,
 		RetryPolicy:         defaultRetryPolicy(),
 	}
 }

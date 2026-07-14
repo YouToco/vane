@@ -88,7 +88,7 @@ func run() error {
 	// 组装推送管道各步依赖，注入 Activities（所有 I/O 只在 activity 内做，满足确定性约束）。
 	// 注：pipeline 各包构造函数由并行 agent 定稿，下列签名按 M3 规格 B4/B6 假定，
 	// 若与最终实现不符由主控在装配处对齐。
-	fetch := fetcher.New(cfg.Fetch)
+	fetch := fetcher.NewMulti(cfg.Fetch)
 	score := scorer.New(llmClient, recorder, st)
 	cards := cardgen.New(llmClient, recorder)
 	push := pusher.New(manager)
