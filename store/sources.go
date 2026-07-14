@@ -1,0 +1,173 @@
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/YouToco/vane/types"
+)
+
+// sourceColumns 是 sources 表的全列清单（以别名 s 限定，避免与 JOIN 的
+// subscriptions 表同名列 id/status/created_at 歧义），SELECT 与 scanSource 一一对应。
+const sourceColumns = `s.id, s.type, s.url, s.title, s.config, s.status,
+	s.fetch_interval_seconds, s.next_fetch_at, s.last_fetched_at, s.fail_count,
+	s.created_at, s.updated_at`
+
+// scanSource 把一行 sources 扫进 types.Source。
+// 可空列 last_fetched_at 扫进 *time.Time 字段（**time.Time 目标，NULL→nil）。
+// 复用于单行（pgx.Row）与多行（pgx.Rows，其 Scan 满足 pgx.Row 接口）两种场景。
+func scanSource(row pgx.Row, src *types.Source) error {
+	return row.Scan(
+		&src.ID, &src.Type, &src.URL, &src.Title, &src.Config, &src.Status,
+		&src.FetchIntervalSeconds, &src.NextFetchAt, &src.LastFetchedAt, &src.FailCount,
+		&src.CreatedAt, &src.UpdatedAt,
+	)
+}
+
+// ListActiveSourcesByUser 返回该用户 active 订阅、且信源本身 active 的所有信源。
+// 双重 active 过滤的原因：被连续失败自动 disabled 的信源不该再进入抓取；
+// 已取消（非 active）的订阅也不该被扇出。Fetch Activity 触发时刻现查用它。
+func (s *Store) ListActiveSourcesByUser(ctx context.Context, userID int64) ([]types.Source, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+sourceColumns+`
+		 FROM sources s
+		 JOIN subscriptions sub ON sub.source_id = s.id
+		 WHERE sub.user_id = $1 AND sub.status = $2 AND s.status = $3
+		 ORDER BY s.id`,
+		userID, types.SubscriptionStatusActive, types.SourceStatusActive)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询用户 %d 的 active 信源", userID), err)
+	}
+	defer rows.Close()
+
+	var out []types.Source
+	for rows.Next() {
+		var src types.Source
+		if err := scanSource(rows, &src); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "扫描 source 行", err)
+		}
+		out = append(out, src)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "遍历 source 结果集", err)
+	}
+	return out, nil
+}
+
+// ListSubscribedSourcesByUser 返回该用户 active 订阅的所有信源，**不过滤 source.status**。
+// 与 ListActiveSourcesByUser 的区别：这里保留 disabled/paused 的信源，供 API 的
+// GET /api/subscriptions 把订阅列表连同状态（含被自动 disabled / 暂停的源）一并回给
+// 前端，使 Sources.tsx 的状态灯可达。抓取扇出仍用双重 active 过滤的 ListActiveSourcesByUser。
+func (s *Store) ListSubscribedSourcesByUser(ctx context.Context, userID int64) ([]types.Source, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+sourceColumns+`
+		 FROM sources s
+		 JOIN subscriptions sub ON sub.source_id = s.id
+		 WHERE sub.user_id = $1 AND sub.status = $2
+		 ORDER BY s.id`,
+		userID, types.SubscriptionStatusActive)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询用户 %d 的全部订阅信源", userID), err)
+	}
+	defer rows.Close()
+
+	var out []types.Source
+	for rows.Next() {
+		var src types.Source
+		if err := scanSource(rows, &src); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "扫描 source 行", err)
+		}
+		out = append(out, src)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "遍历 source 结果集", err)
+	}
+	return out, nil
+}
+
+// UpsertSource 按 url 幂等地写入信源，返回其 id。
+//
+// 注意：001 未在 sources.url 上建唯一约束，无法用 ON CONFLICT(url)。这里以
+// "先查后写"实现幂等：命中则刷新可变元数据（type/title/config）并复用 id，
+// 未命中则新插入。单 owner MVP 无并发建源场景，先查后写的竞态可接受；若未来
+// 需要并发安全，应在 sources.url 上补唯一索引改用真正的 upsert（见 M3 store 报告）。
+func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (int64, error) {
+	// config NOT NULL DEFAULT '{}'：nil / 空 RawMessage 归一为 '{}'，避免写入 NULL 触发约束。
+	cfg := src.Config
+	if len(cfg) == 0 {
+		cfg = json.RawMessage("{}")
+	}
+
+	var id int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM sources WHERE url = $1 LIMIT 1`, src.URL).Scan(&id)
+	switch {
+	case err == nil:
+		// 已存在：刷新元数据与 updated_at，刻意不动抓取状态（next_fetch_at/
+		// last_fetched_at/fail_count）与 created_at，避免重复添加订阅时打乱调度节奏。
+		if _, uerr := s.pool.Exec(ctx,
+			`UPDATE sources SET type = $2, title = $3, config = $4, updated_at = now()
+			 WHERE id = $1`,
+			id, src.Type, src.Title, cfg); uerr != nil {
+			return 0, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("更新已存在信源（id=%d）", id), uerr)
+		}
+		return id, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		// 不存在：新插入。status / fetch_interval_seconds / next_fetch_at / fail_count
+		// 走 001 的 DB 默认值（active / 1800 / now() / 0），调用方无需关心冷启动细节。
+		if ierr := s.pool.QueryRow(ctx,
+			`INSERT INTO sources (type, url, title, config)
+			 VALUES ($1, $2, $3, $4)
+			 RETURNING id`,
+			src.Type, src.URL, src.Title, cfg).Scan(&id); ierr != nil {
+			return 0, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("插入信源（url=%s）", src.URL), ierr)
+		}
+		return id, nil
+	default:
+		return 0, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询信源（url=%s）", src.URL), err)
+	}
+}
+
+// UpdateSourceFetchState 抓取完成后同步写 last_fetched_at / next_fetch_at / fail_count。
+// next_fetch_at 是 001 的预计算列（调度靠它命中 (status, next_fetch_at) 索引），
+// 由抓取方按 interval 算好后传入，store 层只负责落库。
+func (s *Store) UpdateSourceFetchState(ctx context.Context, id int64, lastFetched, nextFetch time.Time, failCount int) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE sources
+		 SET last_fetched_at = $2, next_fetch_at = $3, fail_count = $4, updated_at = now()
+		 WHERE id = $1`,
+		id, lastFetched, nextFetch, failCount)
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("更新信源抓取状态（id=%d）", id), err)
+	}
+	return nil
+}
+
+// GetSource 按 id 读取单个信源；不存在时返回 CodeNotFound 的 AppError，
+// 调用方可用 errors.Is(err, types.ErrNotFound) 区分"不存在"与数据库故障。
+func (s *Store) GetSource(ctx context.Context, id int64) (*types.Source, error) {
+	var src types.Source
+	err := scanSource(
+		s.pool.QueryRow(ctx, `SELECT `+sourceColumns+` FROM sources s WHERE s.id = $1`, id),
+		&src)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, types.NewAppError(types.CodeNotFound,
+				fmt.Sprintf("信源 id=%d 不存在", id), err)
+		}
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询信源（id=%d）", id), err)
+	}
+	return &src, nil
+}

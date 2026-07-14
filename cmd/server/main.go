@@ -14,11 +14,20 @@ import (
 	"syscall"
 	"time"
 
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
+
 	"github.com/YouToco/vane/api"
+	"github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/feishu"
+	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/pusher"
+	"github.com/YouToco/vane/scheduler"
+	"github.com/YouToco/vane/scorer"
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/workflow"
 )
 
 func main() {
@@ -61,17 +70,59 @@ func run() error {
 	recorder := llm.NewRecorder(st)
 
 	// 飞书 Manager：凭证存 settings 表而非 config——用户在 Dashboard 向导中填入。
-	// Start 非阻塞：有配置且 enabled 则连 WS，无配置静默待命；ctx 取消时断开连接。
+	// 先构造不 Start：推送管道（pusher）要用它做主动发卡的出口；WS 连接推迟到
+	// worker/scheduler 就绪后再拉起（B10 装配顺序），保证首个定时触发时出口已备好。
 	manager := feishu.NewManager(st, llmClient, recorder)
+
+	// Temporal 客户端：worker 与 HTTP server 同进程。Temporal 是 M3 推送管道的核心，
+	// 连不上则拒绝启动（而非降级）——定时/立即推送都依赖它，静默半可用只会掩盖故障。
+	temporalClient, err := client.Dial(client.Options{
+		HostPort:  cfg.Temporal.Host,
+		Namespace: cfg.Temporal.Namespace,
+	})
+	if err != nil {
+		st.Close()
+		return fmt.Errorf("连接 Temporal(%s): %w", cfg.Temporal.Host, err)
+	}
+
+	// 组装推送管道各步依赖，注入 Activities（所有 I/O 只在 activity 内做，满足确定性约束）。
+	// 注：pipeline 各包构造函数由并行 agent 定稿，下列签名按 M3 规格 B4/B6 假定，
+	// 若与最终实现不符由主控在装配处对齐。
+	fetch := fetcher.New(cfg.Fetch)
+	score := scorer.New(llmClient, recorder, st)
+	cards := cardgen.New(llmClient, recorder)
+	push := pusher.New(manager)
+	activities := workflow.NewActivities(fetch, score, cards, push, st, manager)
+
+	// worker：非阻塞 Start，关停时 Stop()（见下方顺序关停）。
+	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, worker.Options{})
+	w.RegisterWorkflow(workflow.PushPipelineWorkflow)
+	w.RegisterActivity(activities.Fetch)
+	w.RegisterActivity(activities.Dedup)
+	w.RegisterActivity(activities.Score)
+	w.RegisterActivity(activities.Select)
+	w.RegisterActivity(activities.CardGen)
+	w.RegisterActivity(activities.Push)
+	if err := w.Start(); err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("启动 Temporal worker: %w", err)
+	}
+
+	// scheduler 是唯一直接碰 SDK client 的调度封装（供 API 建/删/触发调度）。
+	sched := scheduler.New(temporalClient, cfg.Temporal.TaskQueue, st)
+
+	// 依赖就绪后再拉飞书 WS 连接：无配置静默待命，ctx 取消时断开。
 	manager.Start(ctx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /readyz", handleReadyz(st))
 	api.Mount(mux, api.Deps{
-		Store:    st,
-		Manager:  manager,
-		Password: cfg.Dashboard.Password,
+		Store:     st,
+		Manager:   manager,
+		Scheduler: sched,
+		Password:  cfg.Dashboard.Password,
 	})
 
 	srv := &http.Server{
@@ -95,22 +146,28 @@ func run() error {
 	case <-ctx.Done():
 		slog.Info("收到关停信号，开始优雅关停")
 	case err := <-serveErr:
-		// 先取消 ctx 让飞书 Manager 断开 WS、停止使用连接池，再关池，
-		// 否则 pgxpool.Close 可能阻塞等待 Manager goroutine 归还连接。
+		// 先取消 ctx 让飞书 Manager 断开 WS、停止使用连接池，再按依赖逆序拆栈。
 		stop()
+		w.Stop()
+		temporalClient.Close()
 		st.Close()
 		return fmt.Errorf("HTTP 服务异常退出: %w", err)
 	}
 
-	// 顺序关停（契约 §7）：
+	// 顺序关停（契约 B10）：HTTP Shutdown → worker.Stop() → Temporal client.Close()
+	// → 飞书 Manager（随顶层 ctx 取消自行断 WS）→ DB 连接池。
+	// 逆装配序拆栈：先停对外入口，再停后台执行器，最后放连接类资源。
 	// 1) HTTP Shutdown（5s 预算）停止接新请求、等在途请求完成；
-	// 2) 飞书 Manager 随顶层 ctx 取消（信号已触发）自行断开 WS，无需显式调用；
-	// 3) 关闭 DB 连接池——此时已无正在执行的 DB 操作。
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Warn("HTTP 关停超时，放弃等待在途请求", "err", err)
 	}
+	// 2) 停 worker：阻塞等待在跑的 activity 收尾，之后不再拉新任务；
+	w.Stop()
+	// 3) 关 Temporal 客户端：worker 已停，scheduler 不再被调用，可安全释放连接；
+	temporalClient.Close()
+	// 4) 关 DB 连接池——此时已无正在执行的 DB 操作。
 	// 注意：pgxpool.Close 会阻塞等待借出连接归还——所有走 DB 的 handler
 	// 必须自带请求级超时（readyz 是 2s），否则关停可能挂住。
 	st.Close()
