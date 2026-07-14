@@ -9,7 +9,8 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # postgres:18+ 要求挂载父目录（数据在其 18/docker 子目录），见 docker-library/postgres#37
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U vane"]
       interval: 10s
