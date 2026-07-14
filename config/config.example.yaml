@@ -28,7 +28,7 @@ feishu:
 fetch:
   rss_concurrency: 10
   tikhub_concurrency: 3
-  tikhub_api_key: "" # VANE_TIKHUB_API_KEY
+  tikhub_api_key: "" # VANE_FETCH_TIKHUB_API_KEY
   timeout_seconds: 20
   max_response_mb: 5
 

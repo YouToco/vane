@@ -5,12 +5,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# MVP 阶段以 root 运行；M6 加固项：切换专用 vane 用户（需同步 chown /opt/vane 并调整 CI）。
 User=root
 WorkingDirectory=/opt/vane
 EnvironmentFile=/opt/vane/.env
 ExecStart=/opt/vane/bin/vane
 Restart=on-failure
 RestartSec=5
+
+# 最小加固（不影响 root 运行的前提下限制事故半径）：
+# 服务自身零文件系统写入（日志走 stdout→journald），故整个系统只读。
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
