@@ -83,6 +83,35 @@ jobs:
           source: "bin/vane"
           target: "/opt/vane/"
 
+      # 基础设施文件（Caddyfile / compose / systemd unit / dynamicconfig）随代码同步。
+      # 缺这步会导致：改了 Caddyfile 或 compose 后 VPS 仍跑旧配置——M2 前端 404 即因此
+      # （前端产物已就位但 Caddy 未挂 web 卷、Caddyfile 未更新）。strip_components 去掉 deploy/ 前缀。
+      - name: Upload infra files
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          port: ${{ secrets.VPS_PORT }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "deploy/Caddyfile,deploy/docker-compose.yml,deploy/vane.service,deploy/dynamicconfig/development-sql.yaml"
+          target: "/opt/vane/"
+          strip_components: 1
+
+      - name: Apply infra changes
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          port: ${{ secrets.VPS_PORT }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cp /opt/vane/vane.service /etc/systemd/system/vane.service
+            systemctl daemon-reload
+            # compose 幂等：service 定义或卷有变更才重建，无变更是 no-op
+            cd /opt/vane && docker compose up -d
+            # Caddyfile 是 bind mount，改内容不触发容器重建，需显式 reload
+            docker exec -w /etc/caddy vane-caddy-1 caddy reload || docker restart vane-caddy-1
+
       - name: Restart and verify
         uses: appleboy/ssh-action@v1
         with:
