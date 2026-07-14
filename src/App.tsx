@@ -3,6 +3,8 @@ import { api } from "./api";
 import Login from "./pages/Login";
 import Home from "./pages/Home";
 import FeishuSetup from "./pages/FeishuSetup";
+import Schedules from "./pages/Schedules";
+import Sources from "./pages/Sources";
 
 // hash 微型路由：不引 react-router（契约禁止新依赖），
 // 两三个页面用 hashchange 监听足够，还天然兼容静态托管的 SPA 回退。
@@ -14,6 +16,20 @@ function useHash(): string {
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
   return hash;
+}
+
+// hash → 页面组件。集中在一处便于新增 tab；未知 hash 回落总览。
+function renderPage(hash: string) {
+  switch (hash) {
+    case "#/setup":
+      return <FeishuSetup />;
+    case "#/schedules":
+      return <Schedules />;
+    case "#/sources":
+      return <Sources />;
+    default:
+      return <Home />;
+  }
 }
 
 // 需鉴权布局：进入时探一次 /api/auth/me——未登录时由 api.ts 统一踢到 #/login，
@@ -61,6 +77,12 @@ function Shell({ hash }: { hash: string }) {
           <a className={hash === "#/" ? "nav-link nav-active" : "nav-link"} href="#/">
             总览
           </a>
+          <a className={hash === "#/schedules" ? "nav-link nav-active" : "nav-link"} href="#/schedules">
+            定时任务
+          </a>
+          <a className={hash === "#/sources" ? "nav-link nav-active" : "nav-link"} href="#/sources">
+            信源
+          </a>
           <a className={hash === "#/setup" ? "nav-link nav-active" : "nav-link"} href="#/setup">
             飞书接入
           </a>
@@ -69,7 +91,7 @@ function Shell({ hash }: { hash: string }) {
           退出登录
         </button>
       </header>
-      <main className="main">{hash === "#/setup" ? <FeishuSetup /> : <Home />}</main>
+      <main className="main">{renderPage(hash)}</main>
     </div>
   );
 }

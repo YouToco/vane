@@ -24,6 +24,47 @@ export interface ConfigResult {
   verify: VerifyResult;
 }
 
+// ---- M3 推送管道相关类型 ----
+
+// PushScope 与后端 workflow.PushScope 对齐（B1）。M3 固化组件默认留空 = 该用户全部 active 订阅。
+export interface PushScope {
+  source_ids?: number[];
+  top_n?: number;
+}
+
+// ScheduleSpec 是前端时间选择器编译出的中立频率结构（B2 spec_json / B7 ScheduleSpec）。
+// 二选一：cron 表达式（每天/每周档位）或 every_seconds（自定义间隔）。绝不透传任意 cron。
+export interface ScheduleSpec {
+  cron?: string;
+  every_seconds?: number;
+  tz?: string;
+}
+
+// Schedule 对应 schedules 镜像表（B2）。GET /api/schedules 读 Postgres 镜像。
+export interface Schedule {
+  id: string;
+  nl_description: string;
+  spec: ScheduleSpec;
+  scope: PushScope;
+  status: string; // active/paused
+  next_run?: string; // 可选：后端若从 Temporal Describe 补充下次触发时间则有，否则前端按 spec 推导展示
+  created_at?: string;
+}
+
+// Source 直接复用后端 types.Source 的 JSON（entities.go）。
+// 信源管理页只用到其中几列，其余字段忽略即可。
+export interface Source {
+  id: number;
+  type: string;
+  url: string;
+  title: string;
+  status: string; // active/disabled/paused
+  fail_count: number;
+  last_fetched_at?: string;
+  next_fetch_at?: string;
+  created_at?: string;
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -67,6 +108,31 @@ function post<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
+// 后端 schedules 镜像表的 JSONB 列 tag 可能是 spec/spec_json（另一 agent owns types.Schedule），
+// 且 pgx 序列化 JSONB 时可能是内联对象也可能是字符串——这里统一收敛，页面只面对稳定形状。
+function asObject<T>(v: unknown): T {
+  if (typeof v === "string") {
+    try {
+      return JSON.parse(v) as T;
+    } catch {
+      return {} as T;
+    }
+  }
+  return (v ?? {}) as T;
+}
+
+function normalizeSchedule(raw: Record<string, unknown>): Schedule {
+  return {
+    id: String(raw.id ?? ""),
+    nl_description: typeof raw.nl_description === "string" ? raw.nl_description : "",
+    spec: asObject<ScheduleSpec>(raw.spec ?? raw.spec_json),
+    scope: asObject<PushScope>(raw.scope ?? raw.scope_json),
+    status: typeof raw.status === "string" ? raw.status : "active",
+    next_run: (raw.next_run ?? raw.next_run_at) as string | undefined,
+    created_at: raw.created_at as string | undefined,
+  };
+}
+
 export const api = {
   login: (password: string) => post<{ ok: boolean }>("/api/auth/login", { password }),
   logout: () => post<{ ok: boolean }>("/api/auth/logout"),
@@ -77,4 +143,28 @@ export const api = {
   feishuConfig: (appId: string, appSecret: string) =>
     post<ConfigResult>("/api/feishu/config", { app_id: appId, app_secret: appSecret }),
   feishuTest: () => post<{ ok: boolean }>("/api/feishu/test"),
+
+  // ---- M3 定时任务（B8）----
+  listSchedules: () =>
+    request<Record<string, unknown>[]>("/api/schedules").then((rows) =>
+      (rows ?? []).map(normalizeSchedule),
+    ),
+  createSchedule: (spec: ScheduleSpec, scope: PushScope, nlDescription: string) =>
+    post<{ schedule_id: string }>("/api/schedules", {
+      spec,
+      scope,
+      nl_description: nlDescription,
+    }),
+  deleteSchedule: (id: string) =>
+    request<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  // push/now 的 body 是 {scope?}（B8）；固化"现在推一次"默认不带 scope = 推全部订阅
+  pushNow: (scope?: PushScope) =>
+    post<{ run_id: string }>("/api/push/now", scope ? { scope } : {}),
+
+  // ---- M3 信源管理（B8）----
+  listSubscriptions: () => request<Source[]>("/api/subscriptions"),
+  addSubscription: (url: string) =>
+    post<{ source_id: number }>("/api/subscriptions", { url }),
+  removeSubscription: (sourceId: number) =>
+    request<{ ok: boolean }>(`/api/subscriptions/${sourceId}`, { method: "DELETE" }),
 };

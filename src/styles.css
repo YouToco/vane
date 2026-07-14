@@ -507,6 +507,341 @@ a:hover {
   flex-shrink: 0;
 }
 
+/* ========== M3 定时任务 / 信源管理（固化组件） ========== */
+
+/* 页头：标题 + 右侧动作按钮 */
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.page-head .page-title {
+  margin: 0;
+}
+
+.section-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 26px 0 12px;
+}
+
+/* "现在推一次"：轻微上浮 + 主色描边强调 */
+.btn-push-now {
+  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.12s, box-shadow 0.15s;
+}
+.btn-push-now:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgb(79 110 247 / 0.18);
+}
+
+/* 删除/移除按钮 */
+.btn-danger {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--muted);
+}
+.btn-danger:hover:not(:disabled) {
+  border-color: var(--err);
+  color: var(--err);
+  background: var(--err-soft);
+}
+
+/* ---------- 调度创建卡片 ---------- */
+
+.sched-builder {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* 分段控件（频率档位） */
+.seg {
+  display: inline-flex;
+  padding: 4px;
+  gap: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  align-self: flex-start;
+}
+.seg-item {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 7px 18px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 0.18s, color 0.18s, box-shadow 0.18s;
+}
+.seg-item:hover {
+  color: var(--primary);
+}
+.seg-active {
+  background: var(--card);
+  color: var(--primary);
+  box-shadow: 0 1px 3px rgb(31 36 48 / 0.1);
+}
+
+.sched-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  align-items: flex-end;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.field-label {
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 500;
+}
+.input-time,
+.input-num {
+  width: auto;
+  min-width: 130px;
+}
+
+/* 星期选择 */
+.weekday-row {
+  display: flex;
+  gap: 6px;
+}
+.weekday {
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: 8px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.1s;
+}
+.weekday:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.weekday-on {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+  font-weight: 600;
+}
+.weekday-on:hover {
+  color: #fff;
+}
+
+.sched-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+.sched-preview {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.preview-chip {
+  background: var(--primary-soft);
+  color: var(--primary-dark);
+  font-weight: 600;
+  font-size: 14px;
+  padding: 5px 12px;
+  border-radius: 20px;
+}
+.preview-tz {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.hint {
+  font-size: 13px;
+  margin-top: 8px;
+}
+.hint-warn {
+  color: var(--warn);
+}
+
+/* ---------- 列表通用 ---------- */
+
+.list-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  padding: 18px 0;
+}
+.empty-hint {
+  color: var(--muted);
+  font-size: 14px;
+  padding: 22px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+
+/* 卡片入场：淡入 + 轻微上移 */
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.sched-list,
+.src-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sched-card,
+.src-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 18px;
+  animation: card-in 0.22s ease both;
+  transition: box-shadow 0.18s, border-color 0.18s, transform 0.12s;
+}
+.sched-card:hover,
+.src-card:hover {
+  border-color: rgb(79 110 247 / 0.4);
+  box-shadow: 0 4px 14px rgb(31 36 48 / 0.07);
+  transform: translateY(-1px);
+}
+.is-paused {
+  opacity: 0.72;
+}
+
+.sched-card-main,
+.src-card-main {
+  flex: 1;
+  min-width: 0;
+}
+.sched-card-title,
+.src-card-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 3px;
+  word-break: break-word;
+}
+.sched-card-meta,
+.src-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--muted);
+}
+.meta-freq {
+  color: var(--primary-dark);
+  font-weight: 500;
+}
+
+.badge {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+.badge-paused {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* ---------- 信源页 ---------- */
+
+.src-intro {
+  margin: -8px 0 16px;
+}
+.src-add {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 16px 18px;
+}
+.src-add .input {
+  flex: 1;
+}
+.src-add .btn {
+  flex-shrink: 0;
+}
+
+.src-url {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.src-fetched {
+  flex-shrink: 0;
+}
+
+/* 状态灯补充色（复用总览的 .dot / .dot-ok / .dot-bad） */
+.dot-warn {
+  background: var(--warn);
+  box-shadow: 0 0 0 4px rgb(180 83 9 / 0.14);
+}
+.dot-mute {
+  background: var(--muted);
+  box-shadow: 0 0 0 4px rgb(122 129 148 / 0.12);
+}
+
+/* ---------- 轻提示 toast ---------- */
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 12px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 32px;
+  transform: translateX(-50%);
+  padding: 11px 20px;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  box-shadow: 0 6px 20px rgb(31 36 48 / 0.18);
+  z-index: 50;
+  animation: toast-in 0.2s ease both;
+}
+.toast-ok {
+  background: var(--ok);
+}
+.toast-err {
+  background: var(--err);
+}
+
 /* ---------- 响应式 ---------- */
 
 @media (max-width: 640px) {
@@ -521,6 +856,16 @@ a:hover {
     padding-left: 20px;
   }
   .copy-row {
+    flex-wrap: wrap;
+  }
+  .sched-foot {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .sched-foot .btn {
+    width: 100%;
+  }
+  .src-add {
     flex-wrap: wrap;
   }
 }
