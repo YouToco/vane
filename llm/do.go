@@ -61,7 +61,7 @@ func Do(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Reques
 			// 未报告缓存时按全量未命中计价：宁可略高估也不低估成本。
 			hitTokens, missTokens = 0, resp.PromptTokens
 		}
-		call.CostUSD = CostUSD(hitTokens, missTokens, resp.CompletionTokens)
+		call.CostUSD = CostUSD(resp.Model, hitTokens, missTokens, resp.CompletionTokens)
 	}
 
 	// 失败路径的 ctx 往往已经超时/取消，直接用它写库必然失败，

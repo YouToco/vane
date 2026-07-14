@@ -275,27 +275,32 @@ func TestCompleteSemaphoreSerial(t *testing.T) {
 	}
 }
 
-// TestCostUSD 用契约三段单价核对一组已知值。
+// TestCostUSD 按模型三段单价核对一组已知值（M4 起 flash/pro 双模型分价）。
 func TestCostUSD(t *testing.T) {
 	tests := []struct {
 		name                  string
+		model                 string
 		hit, miss, completion int
 		want                  float64
 	}{
 		// 整百万便于人肉核对：1M 命中 + 2M 未命中 + 0.5M 输出
-		// = 0.0028 + 0.28 + 0.14 = 0.4228
-		{"整百万", 1_000_000, 2_000_000, 500_000, 0.4228},
+		// flash = 0.0028 + 0.28 + 0.14 = 0.4228
+		{"flash整百万", "deepseek-v4-flash", 1_000_000, 2_000_000, 500_000, 0.4228},
+		// pro = 0.003625 + 0.87 + 0.435 = 1.308625
+		{"pro整百万", "deepseek-v4-pro", 1_000_000, 2_000_000, 500_000, 1.308625},
 		// 贴近真实单次调用量级：
 		// 100/1e6*0.0028 + 900/1e6*0.14 + 500/1e6*0.28 = 0.00026628
-		{"真实量级", 100, 900, 500, 0.00026628},
-		{"全零", 0, 0, 0, 0},
+		{"flash真实量级", "deepseek-v4-flash", 100, 900, 500, 0.00026628},
+		// 未知模型按最贵档（pro）兜底：宁高估不低估。
+		{"未知模型按pro兜底", "some-future-model", 1_000_000, 2_000_000, 500_000, 1.308625},
+		{"全零", "deepseek-v4-flash", 0, 0, 0, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := CostUSD(tt.hit, tt.miss, tt.completion)
+			got := CostUSD(tt.model, tt.hit, tt.miss, tt.completion)
 			if math.Abs(got-tt.want) > 1e-12 {
-				t.Errorf("CostUSD(%d, %d, %d) = %.10f, 期望 %.10f",
-					tt.hit, tt.miss, tt.completion, got, tt.want)
+				t.Errorf("CostUSD(%s, %d, %d, %d) = %.10f, 期望 %.10f",
+					tt.model, tt.hit, tt.miss, tt.completion, got, tt.want)
 			}
 		})
 	}

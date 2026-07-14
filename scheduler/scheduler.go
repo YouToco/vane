@@ -9,6 +9,7 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	enums "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 
 	"github.com/YouToco/vane/store"
@@ -143,6 +145,38 @@ func (s *Scheduler) PushNow(ctx context.Context, userID int64, scope workflow.Pu
 		},
 		workflow.PushPipelineWorkflow, params)
 	if err != nil {
+		return "", types.NewAppError(types.CodeInternal, "触发即时推送失败", err)
+	}
+	return run.GetID(), nil
+}
+
+// TriggerPushNow 是 agent push_now 工具的窄入口（M4 契约 §8 PushTrigger 接口）：
+// 行为等价于 API POST /api/push/now 空 body（零值 scope = 该用户全部 active 订阅）。
+// 单独包一层而非让 agent 直接调 PushNow：PushTrigger 只暴露 userID，
+// 不把 workflow.PushScope 这类管道内部结构泄进 agent 工具面（agent 也被禁止 import api）。
+//
+// 与 API 路径的关键差异（审查 #push_now 扇出）：workflow ID 用**确定性** ID 而非 uuid。
+// push_now 是免确认工具，模型一轮可产出任意多个调用——每个都是一整条烧 LLM 的推送管道。
+// 确定性 ID 依赖 Temporal 的 WorkflowExecutionAlreadyStarted 把并发钉死为 1：
+// 同一用户同时只有一条 agent 触发的管道在跑，跑完 ID 可复用（默认重用策略）。
+// API 的 PushNow 保持 uuid：按钮触发天然低频，且每次独立 run_id 便于排查。
+func (s *Scheduler) TriggerPushNow(ctx context.Context, userID int64) (string, error) {
+	params := workflow.PushParams{UserID: userID, Scope: workflow.PushScope{}}
+	run, err := s.c.ExecuteWorkflow(ctx,
+		client.StartWorkflowOptions{
+			ID:        fmt.Sprintf("push-agent-%d", userID),
+			TaskQueue: s.tq,
+		},
+		workflow.PushPipelineWorkflow, params)
+	if err != nil {
+		var already *serviceerror.WorkflowExecutionAlreadyStarted
+		if errors.As(err, &already) {
+			// 确定性拒绝：文案回给模型自纠（不再重复触发），不可重试。
+			ae := types.NewAppError(types.CodeValidation,
+				"已有一次推送正在进行，请等它完成后再触发", err)
+			ae.Retryable = false
+			return "", ae
+		}
 		return "", types.NewAppError(types.CodeInternal, "触发即时推送失败", err)
 	}
 	return run.GetID(), nil

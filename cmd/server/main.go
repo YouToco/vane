@@ -17,6 +17,7 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 
+	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/api"
 	"github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/config"
@@ -111,6 +112,22 @@ func run() error {
 
 	// scheduler 是唯一直接碰 SDK client 的调度封装（供 API 建/删/触发调度）。
 	sched := scheduler.New(temporalClient, cfg.Temporal.TaskQueue, st)
+
+	// agent loop（M4 契约 §9 装配序：store → llm → scheduler → tools → agent.New →
+	// manager 注入）：push_now 工具依赖 scheduler（TriggerPushNow 即 PushTrigger 窄接口），
+	// 故装配在 scheduler 之后；注入须在 manager.Start 之前，保证 WS 连接建立时
+	// 消息链已能走 agent 而非回退 chat_reply。
+	tools := agent.BuildTools(st, sched, sched)
+	agentLoop := agent.New(agent.Deps{
+		Client:     llmClient,
+		Recorder:   recorder,
+		Store:      st,
+		Tools:      tools,
+		Model:      cfg.LLM.AgentModel,
+		MaxTurns:   cfg.Agent.MaxTurns,
+		SessionTTL: time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
+	})
+	manager.SetAgent(agentLoop)
 
 	// 依赖就绪后再拉飞书 WS 连接：无配置静默待命，ctx 取消时断开。
 	manager.Start(ctx)

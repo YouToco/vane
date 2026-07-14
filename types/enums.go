@@ -68,3 +68,22 @@ const (
 	RefTypeFeedback    RefType = "feedback"     // 关联文字反馈解读
 	RefTypeContentItem RefType = "content_item" // 关联单条内容（摘要等）
 )
+
+// AgentSessionStatus agent 会话状态（agent_sessions.status，M4 契约 §3）。
+type AgentSessionStatus string
+
+const (
+	AgentSessionStatusActive  AgentSessionStatus = "active"  // 进行中，TTL 窗口内可续聊
+	AgentSessionStatusExpired AgentSessionStatus = "expired" // 超时过期（读取路径惰性翻转）
+	AgentSessionStatusClosed  AgentSessionStatus = "closed"  // 主动关闭
+)
+
+// PendingActionStatus 待确认动作状态（pending_actions.status，M4 契约 §3）。
+type PendingActionStatus string
+
+const (
+	PendingActionStatusPending   PendingActionStatus = "pending"   // 待用户确认
+	PendingActionStatusExecuted  PendingActionStatus = "executed"  // 用户已确认，Claim 原子置位
+	PendingActionStatusCancelled PendingActionStatus = "cancelled" // 用户点了取消
+	PendingActionStatusExpired   PendingActionStatus = "expired"   // 超时未确认
+)

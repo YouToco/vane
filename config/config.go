@@ -58,8 +58,12 @@ type LLMConfig struct {
 	Provider string `mapstructure:"provider"`
 	BaseURL  string `mapstructure:"base_url"`
 	// APIKey 环境变量 VANE_LLM_API_KEY。
-	APIKey        string `mapstructure:"api_key"`
-	Model         string `mapstructure:"model"`
+	APIKey string `mapstructure:"api_key"`
+	Model  string `mapstructure:"model"`
+	// AgentModel 是 agent loop（function calling）使用的模型，与 Model
+	//（摘要/评分等高频便宜档）分离：FC 多轮决策的质量依赖高档模型
+	//（v4-pro 实测 60/60 全过，M4 事实基准），成本按调用面分账。
+	AgentModel    string `mapstructure:"agent_model"`
 	MaxConcurrent int    `mapstructure:"max_concurrent"`
 }
 
@@ -89,6 +93,9 @@ type FetchConfig struct {
 type AgentConfig struct {
 	MaxTurns         int `mapstructure:"max_turns"`
 	TokenBudgetDaily int `mapstructure:"token_budget_daily"`
+	// SessionTTLMinutes 是会话闲置过期窗口（分钟）：同一 owner 在窗口内的
+	// 消息共享一个多轮会话（上下文连续），超时后新开会话（契约 §0）。
+	SessionTTLMinutes int `mapstructure:"session_ttl_minutes"`
 }
 
 // LogConfig 是日志配置。
@@ -165,6 +172,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("llm.base_url", "https://api.deepseek.com")
 	// deepseek-chat/deepseek-reasoner 为旧别名，2026-07-24 起废弃；默认用便宜档 v4-flash。
 	v.SetDefault("llm.model", "deepseek-v4-flash")
+	v.SetDefault("llm.agent_model", "deepseek-v4-pro")
 	v.SetDefault("llm.max_concurrent", 5)
 
 	v.SetDefault("feishu.rate_interval_ms", 750)
@@ -176,6 +184,7 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("agent.max_turns", 20)
 	v.SetDefault("agent.token_budget_daily", 100000)
+	v.SetDefault("agent.session_ttl_minutes", 30)
 
 	v.SetDefault("log.level", "info")
 }
