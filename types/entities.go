@@ -139,3 +139,30 @@ type LLMCall struct {
 	Error            string    `json:"error"`                      // 调用失败原因，成功为空串
 	CreatedAt        time.Time `json:"created_at"`
 }
+
+// ScheduleStatus 调度状态（schedules.status）。
+// 说明：本项目枚举通常集中在 enums.go，但 M3 store 扩展仅获准改动 entities.go，
+// 故与 Schedule 结构体就近定义于此；若后续 scheduler 包也需该类型，应统一
+// 收敛到 enums.go 去重（见 M3 store 报告）。
+type ScheduleStatus string
+
+const (
+	ScheduleStatusActive ScheduleStatus = "active" // 生效中（Temporal Schedule 未暂停）
+	ScheduleStatusPaused ScheduleStatus = "paused" // 已暂停
+)
+
+// Schedule 定时推送调度（schedules 表，M3 migration 003）。
+// 真源在 Temporal（schedule_id 即本表主键 ID），本表是 Postgres 侧镜像，
+// 供 /api/schedules 列表读取与对账；scheduler 在 Temporal Create 成功后写入。
+// 与 001 实体一致：JSONB 列 → json.RawMessage（延迟解析），status → typed 枚举。
+// 注意主键 ID 为 TEXT（Temporal schedule_id）而非 001 的 BIGSERIAL 数值主键。
+type Schedule struct {
+	ID            string          `json:"id"`             // Temporal schedule_id：push-{user_id}-{uuid}
+	UserID        int64           `json:"user_id"`        // 归属用户
+	NLDescription string          `json:"nl_description"` // 用户原话/展示名，DEFAULT ''
+	SpecJSON      json.RawMessage `json:"spec_json"`      // JSONB：{cron,tz} 或 {every_seconds}
+	ScopeJSON     json.RawMessage `json:"scope_json"`     // JSONB：PushScope 序列化
+	Status        ScheduleStatus  `json:"status"`         // active/paused
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+}

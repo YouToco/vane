@@ -5,7 +5,8 @@ import (
 	"testing"
 )
 
-// wantTables 是 Step 5 schema 的 9 张业务表 + M2 的 settings 表，迁移完成后必须全部存在。
+// wantTables 是 Step 5 schema 的 9 张业务表 + M2 settings 表 + M3 schedules 表，
+// 迁移完成后必须全部存在。
 var wantTables = []string{
 	"users",
 	"sources",
@@ -17,6 +18,7 @@ var wantTables = []string{
 	"profiles",
 	"llm_calls",
 	"settings",
+	"schedules",
 }
 
 // TestMigrate 是集成测试：依赖真实 Postgres（CI 的 test job 提供 service 与 DATABASE_URL）。
