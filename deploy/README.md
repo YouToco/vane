@@ -26,6 +26,7 @@ curl -fsSL https://get.docker.com | sh
 mkdir -p /opt/vane/bin
 # 把本目录（deploy/）内容拷到 /opt/vane/
 # 复制 .env.example 为 /opt/vane/.env 并填入真实密码/密钥
+chmod 600 /opt/vane/.env   # 密钥文件必须锁权限
 
 # 3. 起基础设施
 cd /opt/vane && docker compose up -d
