@@ -26,6 +26,63 @@ jobs:
       - name: Build
         run: npm run build
 
-  # M7 时接入部署：
+  # MVP 阶段直接 scp 到 VPS 由 Caddy 托管（/opt/vane/web，见 vane 仓库 deploy/）。
+  # M7 再切双线 CDN：
   #   deploy-oss:   aliyun CLI 上传 dist/ 到 OSS + CDN 刷新（国内线路）
   #   deploy-pages: wrangler pages deploy dist/（境外线路）
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # 先清空再传：避免旧构建的 hash 文件无限堆积、以及删除页面后残留可访问
+      - name: Prepare web directory
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          port: ${{ secrets.VPS_PORT }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            mkdir -p /opt/vane/web
+            # 只清目录内容不删目录本身，Caddy 容器挂载的是该目录的 inode
+            find /opt/vane/web -mindepth 1 -delete
+
+      # strip_components: 1 去掉 dist/ 前缀，确保落盘为 /opt/vane/web/index.html
+      # 而不是 /opt/vane/web/dist/index.html（scp-action 内部走 tar，支持该参数）
+      - name: Upload dist
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          port: ${{ secrets.VPS_PORT }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "dist/*"
+          target: "/opt/vane/web"
+          strip_components: 1
+
+      - name: Verify
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          port: ${{ secrets.VPS_PORT }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            # 部署后必须能直接看到 index.html，否则说明前缀/路径出了问题，CI 该红就红
+            test -f /opt/vane/web/index.html
+            echo "deploy verified: /opt/vane/web/index.html present"
