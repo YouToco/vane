@@ -60,7 +60,7 @@ type FeishuManager interface {
 type Store interface {
 	ListActiveSourcesByUser(ctx context.Context, userID int64) ([]types.Source, error)
 	InsertContentItemIfNew(ctx context.Context, item *types.ContentItem) (id int64, isNew bool, err error)
-	ListRecentSimhashes(ctx context.Context, sourceID int64, since time.Time) ([]int64, error)
+	ListRecentSimhashes(ctx context.Context, sourceID int64, since time.Time, excludeIDs []int64) ([]int64, error)
 	// UpdateSourceFetchState / ListUnpushedByUser 在 store 里 M3 就已实现，但此前没进本接口，
 	// 于是 UpdateSourceFetchState 从没被 Activity 调用过（抓取状态死代码 #7）；Fetch 重构后启用。
 	UpdateSourceFetchState(ctx context.Context, id int64, lastFetched, nextFetch time.Time, failCount int) error
@@ -209,8 +209,21 @@ func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok b
 // Dedup 做近似去重：精确去重（content_hash）已在 Fetch 的 InsertContentItemIfNew
 // 完成，本步用 simhash + 72h 窗口过滤"改标题/转载"式近重复。跨批用 store 里的
 // 历史 simhash，批内用累积集合——两者合并比对，避免同批内互为近重复的漏网。
+//
+// 关键修复（自撞）：Fetch 已在抓取时把 simhash 写入 content_items，本批内容自身也在
+// content_items 里。若查历史不排除本批 ID，每条内容都会查到自己刚入库的 simhash 而被
+// 判近重复，导致整批全删、pipeline "去重后无内容" 早退、永远推不出卡片。故先收集本批
+// 全部 ID，传给 ListRecentSimhashes 排除——"历史"只含本批之外的内容。
 func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem, error) {
 	since := time.Now().Add(-simhashWindow)
+
+	// 本批内容自身的 ID 集合，查历史时排除（避免每条与自己刚入库的 simhash 相撞）。
+	batchIDs := make([]int64, 0, len(in.Items))
+	for _, item := range in.Items {
+		if item.ID != 0 {
+			batchIDs = append(batchIDs, item.ID)
+		}
+	}
 
 	// 按源缓存历史 simhash，避免逐条查库（同源多条只查一次；历史本就是 per-source 的）。
 	histCache := make(map[int64][]int64)
@@ -223,7 +236,7 @@ func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem
 	for _, item := range in.Items {
 		hist, ok := histCache[item.SourceID]
 		if !ok {
-			h, err := a.store.ListRecentSimhashes(ctx, item.SourceID, since)
+			h, err := a.store.ListRecentSimhashes(ctx, item.SourceID, since, batchIDs)
 			if err != nil {
 				return nil, err
 			}

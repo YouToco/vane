@@ -5,11 +5,22 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/YouToco/vane/types"
 )
+
+// containsInt64 判断切片是否含某值（测试辅助）。
+func containsInt64(s []int64, v int64) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
 
 // TestPipelineStore 是 DATABASE_URL 门控的集成测试（无则跳过），覆盖 M3 store
 // 扩展的关键往返：UpsertSource 按 url 幂等、加订阅→列订阅、
@@ -159,6 +170,44 @@ func TestPipelineStore(t *testing.T) {
 		}
 		if id2 != id1 {
 			t.Errorf("重复插入应返回同 id：首次 %d，二次 %d", id1, id2)
+		}
+	})
+
+	t.Run("ListRecentSimhashes排除本批ID_防自撞", func(t *testing.T) {
+		// 回归测试：Fetch 在抓取时已把 simhash 写入 content_items，Dedup 随后查历史。
+		// 若不排除本批刚入库的 ID，每条内容都会查到自己的 simhash 而被判近重复、整批删光，
+		// pipeline "去重后无内容" 早退、永远推不出卡片（真实线上故障，2026-07-14 定位）。
+		var sh int64 = 0x0123456789abcdef
+		item := &types.ContentItem{
+			SourceID:    srcID,
+			ExternalID:  "sim-" + uuid.NewString(),
+			URL:         "https://example.com/sim",
+			Title:       "simhash 内容",
+			ContentHash: "shash-" + uuid.NewString(),
+			Simhash:     &sh,
+		}
+		id, _, err := st.InsertContentItemIfNew(ctx, item)
+		if err != nil {
+			t.Fatalf("插入带 simhash 内容失败: %v", err)
+		}
+		since := time.Now().Add(-time.Hour)
+
+		// 不排除：应能查到刚入库的 simhash。
+		got, err := st.ListRecentSimhashes(ctx, srcID, since, nil)
+		if err != nil {
+			t.Fatalf("ListRecentSimhashes(不排除) 失败: %v", err)
+		}
+		if !containsInt64(got, sh) {
+			t.Errorf("不排除时应包含刚入库的 simhash %x，实际 %v", sh, got)
+		}
+
+		// 排除本条 ID：绝不能再查到它自己的 simhash（否则 Dedup 自撞、整批删光）。
+		got2, err := st.ListRecentSimhashes(ctx, srcID, since, []int64{id})
+		if err != nil {
+			t.Fatalf("ListRecentSimhashes(排除本批) 失败: %v", err)
+		}
+		if containsInt64(got2, sh) {
+			t.Errorf("排除本批 ID 后不应再包含它自己的 simhash %x，实际 %v", sh, got2)
 		}
 	})
 

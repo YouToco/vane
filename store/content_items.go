@@ -48,12 +48,21 @@ func (s *Store) InsertContentItemIfNew(ctx context.Context, item *types.ContentI
 // ListRecentSimhashes 取该源在 since 之后、已算出 simhash 的指纹集合，供近似去重。
 // since 由调用方按 72h 窗口传入（now-72h）；查询命中 001 的
 // idx_content_items_source_fetched_simhash（INCLUDE simhash 支持 index-only scan）。
-func (s *Store) ListRecentSimhashes(ctx context.Context, sourceID int64, since time.Time) ([]int64, error) {
+//
+// excludeIDs 排除"本批正在去重的内容"自身——关键修复：Fetch 已在抓取时把 simhash
+// 写入 content_items，若不排除，Dedup 对每条内容查到的"历史"里就包含它自己刚入库
+// 的 simhash，HammingDistance(自己,自己)=0 必判近重复，导致整批被全部删光、pipeline
+// 在"去重后无内容"早退、永远推不出卡片。空切片时 `<> ALL('{}')` 恒真，不排除任何行。
+func (s *Store) ListRecentSimhashes(ctx context.Context, sourceID int64, since time.Time, excludeIDs []int64) ([]int64, error) {
+	if excludeIDs == nil {
+		excludeIDs = []int64{}
+	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT simhash FROM content_items
 		 WHERE source_id = $1 AND fetched_at >= $2 AND simhash IS NOT NULL
+		   AND id <> ALL($3)
 		 ORDER BY fetched_at DESC`,
-		sourceID, since)
+		sourceID, since, excludeIDs)
 	if err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("查询近期 simhash（source=%d）", sourceID), err)
