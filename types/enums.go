@@ -8,6 +8,7 @@ type SourceType string
 
 const (
 	SourceTypeRSS       SourceType = "rss"        // RSS / Atom 订阅源
+	SourceTypeExa       SourceType = "exa"        // Exa 语义搜索（按 query 抓最新结果）
 	SourceTypeTikHubXHS SourceType = "tikhub_xhs" // TikHub 小红书接口
 )
 

@@ -23,15 +23,21 @@ const (
 // 几百条都送进 LLM 打分，费用/时延失控。50 条足够 TopN 择优，又把上限压在可控范围。
 const maxScoreCandidates = 50
 
+// maxPerSourceCandidates 是单个信源最多进入候选窗口的条数（审查 #候选公平性）。
+// 全局窗口按 fetched_at DESC 截断时，高产源（tikhub 单页 20 条/轮 + exa 10 条/轮）
+// 会把先抓的低产 RSS 源永远挤出窗口；按源限额保证每源都有配额进入打分。
+const maxPerSourceCandidates = 20
+
 // ============================================================
 // 消费方接口：本包只依赖这些窄接口，具体实现（fetcher/scorer/cardgen/
 // pusher/store/feishu）由 cmd/server 装配时注入。方法签名对齐各业务包
 // 的导出方法（规格 B4/B5/B3），是并行开发的对接契约。
 // ============================================================
 
-// Fetcher 抓取单个信源的内容（fetcher.FetchRSS）。
+// Fetcher 抓取单个信源的内容。生产实现是 fetcher.Multi——按 src.Type
+// 分发到 RSS/Exa/TikHub 具体抓取器；Activity 侧不关心信源类型差异。
 type Fetcher interface {
-	FetchRSS(ctx context.Context, src types.Source) ([]types.ContentItem, error)
+	Fetch(ctx context.Context, src types.Source) ([]types.ContentItem, error)
 }
 
 // Scorer 给单条内容打分（scorer.Score，0-100）。traceID 贯穿 llm 记账。
@@ -58,13 +64,19 @@ type FeishuManager interface {
 // Store 是 Activity 需要的数据访问子集（规格 B3 的相关方法）。
 // 收窄成接口而非直接依赖 *store.Store：便于 Activity 单测注入替身。
 type Store interface {
-	ListActiveSourcesByUser(ctx context.Context, userID int64) ([]types.Source, error)
+	// ListDueSourcesByUser 只返回 next_fetch_at <= now() 的到期源（审查 #重复计费）：
+	// markFetchResult 成功后推进 next_fetch_at，Activity 超时重试时已抓成功的
+	// Exa/TikHub 付费调用自然被跳过，不重复计费。
+	ListDueSourcesByUser(ctx context.Context, userID int64) ([]types.Source, error)
 	InsertContentItemIfNew(ctx context.Context, item *types.ContentItem) (id int64, isNew bool, err error)
-	ListRecentSimhashes(ctx context.Context, sourceID int64, since time.Time, excludeIDs []int64) ([]int64, error)
+	// ListRecentSimhashesByUser 按 user 维度（跨该用户全部订阅源）查 72h simhash 历史
+	// （审查 #跨源去重）：Exa 搜索天然与 RSS 源内容重叠，per-source 历史拦不住
+	// "昨天 RSS 推过、今天 Exa 又抓到"的跨源重复推送。
+	ListRecentSimhashesByUser(ctx context.Context, userID int64, since time.Time, excludeIDs []int64) ([]int64, error)
 	// UpdateSourceFetchState / ListUnpushedByUser 在 store 里 M3 就已实现，但此前没进本接口，
 	// 于是 UpdateSourceFetchState 从没被 Activity 调用过（抓取状态死代码 #7）；Fetch 重构后启用。
 	UpdateSourceFetchState(ctx context.Context, id int64, lastFetched, nextFetch time.Time, failCount int) error
-	ListUnpushedByUser(ctx context.Context, userID int64, limit int) ([]types.ContentItem, error)
+	ListUnpushedByUser(ctx context.Context, userID int64, limit, perSourceCap int) ([]types.ContentItem, error)
 	// 幂等推送地基（FIX-A 新增实现）：重试时复用同一 batch、跳过已发条目，杜绝重复发卡（#1 CRITICAL）。
 	// 取代原 CreatePushBatch / InsertDelivery（store 仍保留其实现，只是 Activity 不再用）。
 	CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey string) (int64, error)
@@ -148,7 +160,9 @@ type PushIn struct {
 //   - #7 抓取状态死代码：每源抓取后调 markFetchResult 真正推进 fail_count / 时间戳。
 //   - #6 成本护栏：返回时用 maxScoreCandidates 截断候选，避免积压内容一次性打爆 LLM。
 func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentItem, error) {
-	sources, err := a.store.ListActiveSourcesByUser(ctx, p.UserID)
+	// 只抓到期源（next_fetch_at <= now()）：重试不重复计费，详见接口注释。
+	// 未到期源被跳过不影响推送——其已入库内容仍由下方 ListUnpushedByUser 捞出。
+	sources, err := a.store.ListDueSourcesByUser(ctx, p.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -157,12 +171,12 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	}
 
 	for _, src := range sources {
-		items, ferr := a.fetcher.FetchRSS(ctx, src)
+		items, ferr := a.fetcher.Fetch(ctx, src)
 		if ferr != nil {
-			// 单源失败不拖垮整批：某个 RSS 源挂了不该让当次推送整体失败；
+			// 单源失败不拖垮整批：某个源挂了不该让当次推送整体失败；
 			// 同时自增 fail_count 并推进 next_fetch_at，避免调度紧循环重试。
 			a.markFetchResult(ctx, src, false)
-			slog.Warn("fetch: 单源抓取失败，跳过", "source_id", src.ID, "url", src.URL, "err", ferr)
+			slog.Warn("fetch: 单源抓取失败，跳过", "source_id", src.ID, "type", src.Type, "url", src.URL, "err", ferr)
 			continue
 		}
 		for i := range items {
@@ -175,8 +189,8 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	}
 
 	// 返回"未投递候选"而非"本次新入库"，让 Fetch 重试幂等可续（修 #3）；
-	// 带上限截断，控制单批打分规模（修 #6）。
-	return a.store.ListUnpushedByUser(ctx, p.UserID, maxScoreCandidates)
+	// 全局上限 + 每源配额双重截断，控制单批打分规模且防高产源饿死低产源（修 #6）。
+	return a.store.ListUnpushedByUser(ctx, p.UserID, maxScoreCandidates, maxPerSourceCandidates)
 }
 
 // markFetchResult 抓取一个源后推进其抓取状态，消除 UpdateSourceFetchState 从不被调用的死代码（#7）。
@@ -208,12 +222,14 @@ func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok b
 
 // Dedup 做近似去重：精确去重（content_hash）已在 Fetch 的 InsertContentItemIfNew
 // 完成，本步用 simhash + 72h 窗口过滤"改标题/转载"式近重复。跨批用 store 里的
-// 历史 simhash，批内用累积集合——两者合并比对，避免同批内互为近重复的漏网。
+// 历史 simhash（user 维度、跨全部订阅源——审查 #跨源去重：Exa 搜索天然与 RSS 源
+// 内容重叠，per-source 历史拦不住"昨天 RSS 推过、今天 Exa 又抓到"的跨源同稿），
+// 批内用累积集合——两者合并比对，避免同批内互为近重复的漏网。
 //
 // 关键修复（自撞）：Fetch 已在抓取时把 simhash 写入 content_items，本批内容自身也在
 // content_items 里。若查历史不排除本批 ID，每条内容都会查到自己刚入库的 simhash 而被
 // 判近重复，导致整批全删、pipeline "去重后无内容" 早退、永远推不出卡片。故先收集本批
-// 全部 ID，传给 ListRecentSimhashes 排除——"历史"只含本批之外的内容。
+// 全部 ID，传给 ListRecentSimhashesByUser 排除——"历史"只含本批之外的内容。
 func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem, error) {
 	since := time.Now().Add(-simhashWindow)
 
@@ -225,27 +241,21 @@ func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem
 		}
 	}
 
-	// 按源缓存历史 simhash，避免逐条查库（同源多条只查一次；历史本就是 per-source 的）。
-	histCache := make(map[int64][]int64)
-	// 批内已保留项的 simhash 改用单一全局切片（不再按 source 分桶）：修 #simhash 批内只同源。
-	// 多源转载同一篇稿时，原来分桶后各源互相看不见、双双放行造成重复；合并成全局候选后，
+	// 用户级历史一次取齐（跨该用户全部订阅源的 72h simhash），替代原 per-source
+	// 逐源查询——既堵住跨源跨批重复推送，也把 N 源 N 次查询合并为 1 次。
+	hist, err := a.store.ListRecentSimhashesByUser(ctx, in.UserID, since, batchIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// 批内已保留项的 simhash 用单一全局切片（跨源合并比对）：多源转载同一篇稿时，
 	// 后到的转载能与批内已保留的同稿命中近重复而被拦下。
 	var batchSeen []int64
 
 	kept := make([]types.ContentItem, 0, len(in.Items))
 	for _, item := range in.Items {
-		hist, ok := histCache[item.SourceID]
-		if !ok {
-			h, err := a.store.ListRecentSimhashes(ctx, item.SourceID, since, batchIDs)
-			if err != nil {
-				return nil, err
-			}
-			hist = h
-			histCache[item.SourceID] = h
-		}
-
 		sh := dedup.Simhash(item.Title + " " + item.Content)
-		// 候选集 = 该源历史 simhash ∪ 全局批内已保留 simhash（跨源合并比对）。
+		// 候选集 = 用户级历史 simhash ∪ 全局批内已保留 simhash。
 		candidates := append(append([]int64{}, hist...), batchSeen...)
 		if dedup.IsNearDup(sh, candidates, simhashThreshold) {
 			continue

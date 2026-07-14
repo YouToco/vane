@@ -60,6 +60,44 @@ func (s *Store) ListActiveSourcesByUser(ctx context.Context, userID int64) ([]ty
 	return out, nil
 }
 
+// ListDueSourcesByUser 返回该用户 active 订阅、信源 active、且已到抓取时间
+// （next_fetch_at <= now()）的信源——这就是 001 注释里承诺的 ListDueForFetch 语义，
+// 命中 (status, next_fetch_at) 索引。
+//
+// Fetch Activity 用它而非 ListActiveSourcesByUser 的原因（审查 #重复计费）：
+// markFetchResult 成功后会推进 next_fetch_at，Activity 超时重试时已抓成功的源
+// 自然被跳过——否则每次重试都重跑全部源，已成功的 Exa/TikHub 付费调用重复计费。
+// 刚添加的源 next_fetch_at DEFAULT now()，立即 due；刚抓过的源虽被跳过，
+// 但其已入库内容仍会被 ListUnpushedByUser 捞出，不影响推送结果。
+func (s *Store) ListDueSourcesByUser(ctx context.Context, userID int64) ([]types.Source, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+sourceColumns+`
+		 FROM sources s
+		 JOIN subscriptions sub ON sub.source_id = s.id
+		 WHERE sub.user_id = $1 AND sub.status = $2 AND s.status = $3
+		   AND s.next_fetch_at <= now()
+		 ORDER BY s.id`,
+		userID, types.SubscriptionStatusActive, types.SourceStatusActive)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询用户 %d 的到期信源", userID), err)
+	}
+	defer rows.Close()
+
+	var out []types.Source
+	for rows.Next() {
+		var src types.Source
+		if err := scanSource(rows, &src); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "扫描 source 行", err)
+		}
+		out = append(out, src)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "遍历 source 结果集", err)
+	}
+	return out, nil
+}
+
 // ListSubscribedSourcesByUser 返回该用户 active 订阅的所有信源，**不过滤 source.status**。
 // 与 ListActiveSourcesByUser 的区别：这里保留 disabled/paused 的信源，供 API 的
 // GET /api/subscriptions 把订阅列表连同状态（含被自动 disabled / 暂停的源）一并回给
@@ -112,8 +150,11 @@ func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (int64, err
 	case err == nil:
 		// 已存在：刷新元数据与 updated_at，刻意不动抓取状态（next_fetch_at/
 		// last_fetched_at/fail_count）与 created_at，避免重复添加订阅时打乱调度节奏。
+		// title 用 COALESCE(NULLIF)：重复添加不带 title 时保留既有展示名，
+		// 而非静默清成空串（代价是无法通过传空串清除 title，可接受）。
 		if _, uerr := s.pool.Exec(ctx,
-			`UPDATE sources SET type = $2, title = $3, config = $4, updated_at = now()
+			`UPDATE sources SET type = $2, title = COALESCE(NULLIF($3, ''), title),
+			        config = $4, updated_at = now()
 			 WHERE id = $1`,
 			id, src.Type, src.Title, cfg); uerr != nil {
 			return 0, types.NewAppError(types.CodeDatabase,

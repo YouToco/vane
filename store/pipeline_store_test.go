@@ -173,10 +173,11 @@ func TestPipelineStore(t *testing.T) {
 		}
 	})
 
-	t.Run("ListRecentSimhashes排除本批ID_防自撞", func(t *testing.T) {
+	t.Run("ListRecentSimhashesByUser排除本批ID_防自撞", func(t *testing.T) {
 		// 回归测试：Fetch 在抓取时已把 simhash 写入 content_items，Dedup 随后查历史。
 		// 若不排除本批刚入库的 ID，每条内容都会查到自己的 simhash 而被判近重复、整批删光，
 		// pipeline "去重后无内容" 早退、永远推不出卡片（真实线上故障，2026-07-14 定位）。
+		// 历史按 user 维度（跨订阅源）查询——依赖前面子测试建立的 u→srcID 订阅关系。
 		var sh int64 = 0x0123456789abcdef
 		item := &types.ContentItem{
 			SourceID:    srcID,
@@ -192,19 +193,19 @@ func TestPipelineStore(t *testing.T) {
 		}
 		since := time.Now().Add(-time.Hour)
 
-		// 不排除：应能查到刚入库的 simhash。
-		got, err := st.ListRecentSimhashes(ctx, srcID, since, nil)
+		// 不排除：应能查到刚入库的 simhash（经 user→subscription→source 关联）。
+		got, err := st.ListRecentSimhashesByUser(ctx, u.ID, since, nil)
 		if err != nil {
-			t.Fatalf("ListRecentSimhashes(不排除) 失败: %v", err)
+			t.Fatalf("ListRecentSimhashesByUser(不排除) 失败: %v", err)
 		}
 		if !containsInt64(got, sh) {
 			t.Errorf("不排除时应包含刚入库的 simhash %x，实际 %v", sh, got)
 		}
 
 		// 排除本条 ID：绝不能再查到它自己的 simhash（否则 Dedup 自撞、整批删光）。
-		got2, err := st.ListRecentSimhashes(ctx, srcID, since, []int64{id})
+		got2, err := st.ListRecentSimhashesByUser(ctx, u.ID, since, []int64{id})
 		if err != nil {
-			t.Fatalf("ListRecentSimhashes(排除本批) 失败: %v", err)
+			t.Fatalf("ListRecentSimhashesByUser(排除本批) 失败: %v", err)
 		}
 		if containsInt64(got2, sh) {
 			t.Errorf("排除本批 ID 后不应再包含它自己的 simhash %x，实际 %v", sh, got2)
