@@ -7,6 +7,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -29,6 +30,8 @@ type Config struct {
 	Fetch    FetchConfig    `mapstructure:"fetch"`
 	Agent    AgentConfig    `mapstructure:"agent"`
 	Log      LogConfig      `mapstructure:"log"`
+
+	Dashboard DashboardConfig `mapstructure:"dashboard"`
 }
 
 // ServerConfig 是 HTTP 服务配置。
@@ -91,6 +94,13 @@ type LogConfig struct {
 	Level string `mapstructure:"level"`
 }
 
+// DashboardConfig 是 Web Dashboard 配置。
+type DashboardConfig struct {
+	// Password 是 Dashboard 登录密码，环境变量 VANE_DASHBOARD_PASSWORD。
+	// 为空时不 fail（允许无 Dashboard 场景），api 层对登录一律 401。
+	Password string `mapstructure:"password"`
+}
+
 // sensitiveKeys 需要显式 BindEnv：Viper 的 AutomaticEnv 只对"已知键"
 // （有默认值或出现在配置文件中）生效，纯环境变量运行时嵌套敏感键会漏读。
 var sensitiveKeys = []string{
@@ -99,6 +109,7 @@ var sensitiveKeys = []string{
 	"feishu.app_id",
 	"feishu.app_secret",
 	"fetch.tikhub_api_key",
+	"dashboard.password",
 }
 
 // Load 加载配置并校验。
@@ -149,7 +160,8 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("llm.provider", "deepseek")
 	v.SetDefault("llm.base_url", "https://api.deepseek.com")
-	v.SetDefault("llm.model", "deepseek-chat")
+	// deepseek-chat/deepseek-reasoner 为旧别名，2026-07-24 起废弃；默认用便宜档 v4-flash。
+	v.SetDefault("llm.model", "deepseek-v4-flash")
 	v.SetDefault("llm.max_concurrent", 5)
 
 	v.SetDefault("feishu.rate_interval_ms", 750)
@@ -196,6 +208,11 @@ func (c *Config) Validate() error {
 	}
 	if c.DB.URL == "" {
 		return errors.New("config: db.url 必填（可通过环境变量 VANE_DB_URL 设置）")
+	}
+	// 密码为空只告警不拒启动：允许纯后端（无 Dashboard）场景；
+	// api 层会在密码为空时对登录一律 401，不会形成裸奔入口。
+	if c.Dashboard.Password == "" {
+		slog.Warn("config: dashboard.password 未配置，Dashboard 登录将不可用（可通过环境变量 VANE_DASHBOARD_PASSWORD 设置）")
 	}
 	return nil
 }

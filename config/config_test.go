@@ -209,7 +209,7 @@ func TestDefaults(t *testing.T) {
 		{"temporal.task_queue", cfg.Temporal.TaskQueue, "vane-push"},
 		{"llm.provider", cfg.LLM.Provider, "deepseek"},
 		{"llm.base_url", cfg.LLM.BaseURL, "https://api.deepseek.com"},
-		{"llm.model", cfg.LLM.Model, "deepseek-chat"},
+		{"llm.model", cfg.LLM.Model, "deepseek-v4-flash"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 5},
 		{"feishu.rate_interval_ms", cfg.Feishu.RateIntervalMS, 750},
 		{"fetch.rss_concurrency", cfg.Fetch.RSSConcurrency, 10},

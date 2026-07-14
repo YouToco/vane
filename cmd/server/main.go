@@ -1,4 +1,5 @@
-// vane server 入口：加载配置 → 初始化日志 → 自动迁移 → 建库连接 → HTTP 服务 → 优雅关停。
+// vane server 入口：加载配置 → 初始化日志 → 自动迁移 → 建库连接 →
+// LLM 客户端/记账 → 飞书 Manager → HTTP 服务（healthz/readyz + Dashboard API）→ 优雅关停。
 package main
 
 import (
@@ -13,7 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/YouToco/vane/api"
 	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/feishu"
+	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/store"
 )
 
@@ -52,9 +56,23 @@ func run() error {
 		return fmt.Errorf("初始化数据库连接池: %w", err)
 	}
 
+	// LLM 客户端 + 调用记账（写库失败只记日志，不影响主流程）。
+	llmClient := llm.New(cfg.LLM)
+	recorder := llm.NewRecorder(st)
+
+	// 飞书 Manager：凭证存 settings 表而非 config——用户在 Dashboard 向导中填入。
+	// Start 非阻塞：有配置且 enabled 则连 WS，无配置静默待命；ctx 取消时断开连接。
+	manager := feishu.NewManager(st, llmClient, recorder)
+	manager.Start(ctx)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /readyz", handleReadyz(st))
+	api.Mount(mux, api.Deps{
+		Store:    st,
+		Manager:  manager,
+		Password: cfg.Dashboard.Password,
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
@@ -77,13 +95,17 @@ func run() error {
 	case <-ctx.Done():
 		slog.Info("收到关停信号，开始优雅关停")
 	case err := <-serveErr:
+		// 先取消 ctx 让飞书 Manager 断开 WS、停止使用连接池，再关池，
+		// 否则 pgxpool.Close 可能阻塞等待 Manager goroutine 归还连接。
+		stop()
 		st.Close()
 		return fmt.Errorf("HTTP 服务异常退出: %w", err)
 	}
 
-	// 顺序关停（Step 4 设计的三步，MVP 尚无 Temporal Worker，简化为两步）：
+	// 顺序关停（契约 §7）：
 	// 1) HTTP Shutdown（5s 预算）停止接新请求、等在途请求完成；
-	// 2) 关闭 DB 连接池——此时已无正在执行的 DB 操作。
+	// 2) 飞书 Manager 随顶层 ctx 取消（信号已触发）自行断开 WS，无需显式调用；
+	// 3) 关闭 DB 连接池——此时已无正在执行的 DB 操作。
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {

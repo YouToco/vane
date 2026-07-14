@@ -13,7 +13,8 @@
 --   5. 枚举值（sources.type / *.status / feedbacks.action）由应用层校验，未建 CHECK：
 --      规格中的 CHECK 取值集合与当前最新取值集合已不一致，等枚举稳定后再补迁移。
 --   6. 不建触发器；updated_at 由应用层负责更新。
---   7. agent_sessions / tool_policies / agent_events 属 M4，放 002 迁移，本文件不含。
+--   7. agent_sessions / tool_policies / agent_events 属 M4，放 003 及以后迁移，本文件不含
+--      （002 已被 M2 的 settings 表占用）。
 
 -- +goose Up
 

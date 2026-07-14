@@ -6,15 +6,23 @@
 
 ```
 用户 → Caddy (host 网络, 80/443, 自动 TLS)
-         └→ localhost:8080  vane 二进制 (systemd)
-                              ├→ 127.0.0.1:5432  Postgres 18 (docker)
-                              └→ 127.0.0.1:7233  Temporal 1.29 (docker)
-                                                   └ UI: 127.0.0.1:8233 (仅本机)
+         ├→ vane.zhuoqidev.com
+         │    ├ /api/*  → localhost:8080  vane 二进制 (systemd)
+         │    └ 其余    → /srv/vane-web 静态站 (SPA, try_files 回落 index.html)
+         │                 ↑ 挂载自宿主机 /opt/vane/web（vane-web CI 部署产物）
+         ├→ api.vane.zhuoqidev.com → localhost:8080（后端 API 永久入口）
+         └→ vane 二进制
+              ├→ 127.0.0.1:5432  Postgres 18 (docker)
+              └→ 127.0.0.1:7233  Temporal 1.29 (docker)
+                                   └ UI: 127.0.0.1:8233 (仅本机)
 ```
 
 - Postgres / Temporal / Temporal UI 只绑 127.0.0.1，不对公网暴露。
 - vane 二进制由 CI（GitHub Actions）构建并 scp 到 `/opt/vane/bin/vane`，systemd 管理。
-- Caddy 用 host 网络反代 localhost:8080，证书自动签发。
+- Web Dashboard（vane-web 仓库）由其 CI 构建，dist 内容 scp 到 `/opt/vane/web/`，
+  compose 里以只读卷 `./web:/srv/vane-web:ro` 挂给 Caddy 做静态托管；
+  两个仓库共用同一组 CI secrets（VPS_HOST/VPS_PORT/VPS_USER/VPS_SSH_KEY）。
+- Caddy 用 host 网络：主域名托管 SPA + 反代 /api，api 子域整体反代 8080，证书自动签发。
 
 ## 首次部署（bootstrap）
 
@@ -23,7 +31,7 @@
 curl -fsSL https://get.docker.com | sh
 
 # 2. 目录 + 文件
-mkdir -p /opt/vane/bin
+mkdir -p /opt/vane/bin /opt/vane/web   # web 目录先建好，caddy 卷挂载不会因缺目录失败
 # 把本目录（deploy/）内容拷到 /opt/vane/
 # 复制 .env.example 为 /opt/vane/.env 并填入真实密码/密钥
 chmod 600 /opt/vane/.env   # 密钥文件必须锁权限
