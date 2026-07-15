@@ -58,7 +58,7 @@ const sampleTikhubResponse = `{
 }`
 
 // newTestTikHub 构造指向 httptest.Server 的 TikHubFetcher。
-// detailInterval 压到 1ms：限速间隔本身由 TestTikHubFetch_DetailSerialInterval 单独验证，
+// detailInterval 压到 1ms：限速间隔本身由 TestWaitDetailSlot_SerialInterval 单独验证，
 // 其余用例没必要每条笔记真等 1.1s。
 func newTestTikHub(srvURL string, seen SeenChecker) *TikHubFetcher {
 	f := NewTikHub(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, TikhubAPIKey: "test-key"}, seen)
@@ -241,16 +241,20 @@ func (f *fakeSeen) EnrichedExternalIDs(_ context.Context, _ int64, ids []string,
 }
 
 // tikhubStub 是同时伺候 search + detail 两个路径的假上游，记录详情侧的全部命中，
-// 供"零调用""串行间隔""token 编码"等断言使用。
+// 供"零调用""token 编码"等断言使用。
+//
+// 刻意**不记录命中时刻**：这里是服务端收到请求的时间，而限速闸门管的是客户端何时
+// 发出，两者之间隔着一段会抖动的投递延迟（gap_observed = interval + (latency[n] −
+// latency[n−1])）——前一次投递慢、这一次快，观测间隔就会低于 interval，闸门明明没坏
+// 却报错。间隔断言只能看闸门自己的放行时刻，见 TestWaitDetailSlot_SerialInterval。
 type tikhubStub struct {
 	searchBody string
 	detailCode int                        // 详情 HTTP 状态码；0 视为 200
 	detailBody func(noteID string) string // 详情响应体；nil 时返回全文
 
 	mu          sync.Mutex
-	detailIDs   []string    // 被请求的 note_id，按顺序
-	detailToken []string    // 收到的 xsec_token（解码后）
-	detailAt    []time.Time // 每次详情命中的时刻
+	detailIDs   []string // 被请求的 note_id，按顺序
+	detailToken []string // 收到的 xsec_token（解码后）
 }
 
 func (s *tikhubStub) handler(w http.ResponseWriter, r *http.Request) {
@@ -262,7 +266,6 @@ func (s *tikhubStub) handler(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.detailIDs = append(s.detailIDs, id)
 		s.detailToken = append(s.detailToken, r.URL.Query().Get("xsec_token"))
-		s.detailAt = append(s.detailAt, time.Now())
 		s.mu.Unlock()
 
 		if s.detailCode != 0 && s.detailCode != http.StatusOK {
@@ -503,10 +506,43 @@ func TestTikHubFetch_SeenCheckerErrorSkipsDetail(t *testing.T) {
 	}
 }
 
-// TestTikHubFetch_DetailSerialInterval 验证详情调用串行且相邻两次间隔 ≥ detailInterval
-// （上游 1 req/s，超速直接 429）。用注入的小间隔断言，避免真等 1.1s 或看墙钟抖动。
-func TestTikHubFetch_DetailSerialInterval(t *testing.T) {
-	const interval = 200 * time.Millisecond
+// TestWaitDetailSlot_SerialInterval 验证限速闸门放行的相邻两个槽位至少相隔
+// detailInterval（上游 1 req/s，超速直接 429 且照常计费）。
+//
+// 断言的是闸门**自己记录的放行时刻** lastDetailAt —— 那正是它控制的量：
+// L[n] 在等满 time.After(interval − since(L[n−1])) 之后才写入，而 time.After 只会晚
+// 触发不会早触发，故 L[n] − L[n−1] ≥ interval 恒成立，与机器负载无关。
+// 任何在闸门之外取的时刻（stub 收到请求、RoundTrip 发出请求）都多叠一段抖动的延迟，
+// 拿来断言下界就会假失败。
+func TestWaitDetailSlot_SerialInterval(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	f := &TikHubFetcher{detailInterval: interval}
+
+	granted := make([]time.Time, 0, 3)
+	for i := 0; i < cap(granted); i++ {
+		if !f.waitDetailSlot(context.Background()) {
+			t.Fatalf("第 %d 次取槽位意外失败", i+1)
+		}
+		f.rateMu.Lock()
+		granted = append(granted, f.lastDetailAt)
+		f.rateMu.Unlock()
+	}
+
+	for i := 1; i < len(granted); i++ {
+		if gap := granted[i].Sub(granted[i-1]); gap < interval {
+			t.Errorf("第 %d 与第 %d 个槽位相隔 %v < %v，限速失效", i, i+1, gap, interval)
+		}
+	}
+}
+
+// TestTikHubFetch_DetailGoesThroughRateLimiter 固定"补全循环确实过闸门"这一接线事实
+// ——闸门本身的间隔语义由 TestWaitDetailSlot_SerialInterval 覆盖，这里只证它没被绕开。
+//
+// 判据是 Fetch 的墙钟耗时 ≥ (n−1)×interval：等待发生在 Fetch **内部**，任何额外开销
+// （调度、投递延迟）只会让耗时变长，故这个下界是单边的——闸门被摘掉或少等一轮必然
+// 报错，机器再忙也不会误报。反过来说，别在这里加耗时上界，那才会 flaky。
+func TestTikHubFetch_DetailGoesThroughRateLimiter(t *testing.T) {
+	const interval = 50 * time.Millisecond
 
 	stub := &tikhubStub{searchBody: tikhubSearchJSON(3, truncatedDesc)}
 	srv := httptest.NewServer(http.HandlerFunc(stub.handler))
@@ -514,20 +550,18 @@ func TestTikHubFetch_DetailSerialInterval(t *testing.T) {
 
 	f := newTestTikHub(srv.URL, &fakeSeen{})
 	f.detailInterval = interval
+
+	start := time.Now()
 	if _, err := f.Fetch(context.Background(), xhsSrc(7, `{"keyword":"x"}`)); err != nil {
 		t.Fatalf("Fetch 意外失败: %v", err)
 	}
+	elapsed := time.Since(start)
 
-	stub.mu.Lock()
-	at := append([]time.Time(nil), stub.detailAt...)
-	stub.mu.Unlock()
-	if len(at) != 3 {
-		t.Fatalf("期望 3 次详情调用，实际 %d", len(at))
+	if got := stub.hits(); len(got) != 3 {
+		t.Fatalf("期望 3 次详情调用，实际 %d: %v", len(got), got)
 	}
-	// time.After 只会晚触发不会早触发，故 ≥interval 是确定性断言，不 flaky。
-	for i := 1; i < len(at); i++ {
-		if gap := at[i].Sub(at[i-1]); gap < interval {
-			t.Errorf("第 %d 次与第 %d 次详情调用间隔 %v < %v，限速失效", i, i+1, gap, interval)
-		}
+	// 3 次调用 = 2 次等待。
+	if want := 2 * interval; elapsed < want {
+		t.Errorf("3 次详情调用共耗时 %v < %v，限速闸门未接进补全循环", elapsed, want)
 	}
 }
