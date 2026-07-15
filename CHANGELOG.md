@@ -11,6 +11,68 @@
 - 优雅关停不等待飞书消息处理 goroutine：关停瞬间在途消息的 LLM 记账可能丢失一条（仅日志）。
   收紧方案：Manager 加处理中 goroutine 的 WaitGroup，st.Close() 前 Wait。
 
+### 已知取舍（M4 审查记录）
+- 卡片回调回写是异步旁路：工具执行的 ~30s 窗口内用户抢先发消息，该条消息可能暂看不到
+  「[卡片回调]」通告（下一条自愈，有界最终一致）。
+- 富文本 post 消息暂被拒收（"暂只支持文本消息"），粘贴文字会触发——post→Markdown 支持进行中。
+
+## [0.4.0] - 2026-07-15 — M4 最小 agent loop
+
+### Added
+- agent/：最小 agent loop——飞书消息 → deepseek-v4-pro 原生 function calling 多轮 →
+  7 工具（list/add/remove_source、list/create/remove_schedule、push_now）；
+  会话 30min TTL + 60 条截断 + per-user 串行化；agent 关思维链（防打分事故复现）
+- 写工具确认卡（AI 出预填、人点执行）：pending_actions 24h 有效 + 原子 Claim 防双击 +
+  卡片回调（card.action.trigger 长连接）原地更新；owner 白名单纵深防御
+- store/：migration 005（agent_sessions + pending_actions）+ 原子 append 会话消息
+- 护栏：agent 全链路超时（单调用 120s / 每消息 5min）、push_now 确定性 workflow ID
+  钉死并发=1、v4-pro 计价入账
+
+### Fixed
+- V4 默认思维链吃光 scorer/cardgen 的小 max_tokens 预算致 content 恒空、打分静默回退
+  中位 50 分（三个批次全假分）——thinking:disabled + 空 content 记 WARN（#6）
+- push_now 重复触发返回假"已触发"：SDK 对运行中同 ID workflow 默认静默 attach 不报错，
+  显式 WorkflowExecutionErrorWhenAlreadyStarted 后"已有一次推送正在进行"文案生效（#8）
+- 确认卡点击结果不回写会话致模型把已处理动作说成"等待确认"——「[卡片回调]」通告
+  原子回写（独立 goroutine + 拿锁后另起 DB 预算；不续 TTL 防点卡复活超时会话）（#8）
+- 错误卫生：失败通告/拒绝文案只落 AppError.Message，错误链（连接串、Temporal 服务端
+  原文）不进模型上下文（#8）
+
+### 过程
+M4 spike：v4-pro function calling 6 场景×10 次 60/60 全过后定原生 FC 地基。契约先行
+（docs/m4-agent-contract.md）5 包并行实现一次统编全绿；27 agent 对抗审查 22 发现 →
+8 确认全处置（#7）。Gate 修复（#8）：16 agent 实现+审查（1 major：锁等待耗尽回调 ctx
+致回写必败）+ 双怀疑者突变体实验补 4 个测试缺口（互锁并发/WithoutCancel/裸 error 回退/
+already-started 分流），全程 -race 稳定。Gate：七项真人实测通过（2026-07-15，含防重复
+触发与状态回写重测）。
+
+## [0.3.1] - 2026-07-14 — M3.5 多源信息接入
+
+### Added
+- fetcher.Multi 按 src.Type 分发：RSS + Exa 搜索 + TikHub 小红书关键词三源并存；
+  query/keyword 即信源（合成 URL 幂等键）；Fetch 只抓到期源（重试不重复计费付费 API）
+- 跨源去重 per-source → per-user；候选窗口 per-source 配额（防单源饿死其他源）
+- CRITICAL 修复：content 字节截断切裂中文 UTF-8 → Postgres 22021 拒写（改 rune 边界回退）
+
+### 过程
+契约实测先行（Exa/TikHub 真实 key 逐字段核对响应）；21 agent 对抗审查 17 发现 →
+13 确认全处置（#5）。Gate：三源生产实测 71 条入库、5 张小红书解读卡送达（Boss 截图确认）。
+
+## [0.3.0] - 2026-07-14 — M3 推送管道
+
+### Added
+- workflow/：Temporal PushPipelineWorkflow（Fetch→Dedup→Score→Select→CardGen→Push）+
+  Temporal Schedule 定时调度（每日 08:30 Asia/Shanghai 推送今日精选）
+- dedup/（simhash）、scorer/、selector/（TopN）、cardgen/、pusher/（飞书解读卡）
+- POST /api/push/now 手动触发 + push_batches 幂等批次
+
+### Fixed
+- Dedup 自撞：fetcher 抓取时已写 simhash，查历史不排除本批 ID → 每条与自己相撞 →
+  整批删光（M3 阻塞根因，#4 + DB 门控回归测试）
+
+### 过程
+Gate：push→202→33 条 BBC→5 张卡片飞书送达（Boss 截图确认）。
+
 ## [0.2.0] - 2026-07-14 — M2 LLM + 飞书通道 + Dashboard
 
 ### Added
