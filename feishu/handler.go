@@ -100,16 +100,28 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 	msg := event.Event.Message
 	msgID := strVal(msg.MessageId)
 
-	// 图片 / 表情包 / 富文本等暂不支持：礼貌回复而非沉默，
-	// 避免用户以为机器人失灵。
-	if strVal(msg.MessageType) != "text" {
+	// text 与 post 都能提取文字；图片 / 表情包等其余类型礼貌拒绝而非沉默，
+	// 避免用户以为机器人失灵。post 必须支持：往输入框粘贴文字时飞书会自动
+	// 把消息升格成富文本，一律拒绝会把粘贴这个高频操作直接顶回去。
+	msgType := strVal(msg.MessageType)
+	var text string
+	switch msgType {
+	case "text":
+		text = parseTextContent(strVal(msg.Content))
+	case "post":
+		text = parsePostContent(strVal(msg.Content))
+	default:
 		h.reply(ctx, msgID, BuildReplyCard("暂只支持文本消息，请直接输入文字与我对话。"))
 		return
 	}
-
-	text := parseTextContent(strVal(msg.Content))
 	if text == "" {
-		h.reply(ctx, msgID, BuildReplyCard("没有读到文字内容，请重新输入。"))
+		// post 提取为空说明富文本里没有一个文字节点（纯图片等），按"不支持"
+		// 拒绝；text 解析为空才是"没读到字"。
+		if msgType == "post" {
+			h.reply(ctx, msgID, BuildReplyCard("暂只支持文本消息，请直接输入文字与我对话。"))
+		} else {
+			h.reply(ctx, msgID, BuildReplyCard("没有读到文字内容，请重新输入。"))
+		}
 		return
 	}
 
@@ -434,6 +446,64 @@ func parseTextContent(raw string) string {
 		return ""
 	}
 	return strings.TrimSpace(mentionRe.ReplaceAllString(body.Text, ""))
+}
+
+// postNode 是 post（富文本）消息段落里的一个内容节点。只关心三个字段：
+// tag 区分节点类型，text 承载该节点的可读文字（如有），href 是 a 节点的
+// 链接目标。
+type postNode struct {
+	Tag  string `json:"tag"`
+	Text string `json:"text"`
+	Href string `json:"href"`
+}
+
+// postTextTags 是提取纯文本时保留的节点类型：正文（text）、markdown（md）、
+// 代码块（code_block）与超链接锚文本（a）都是句子的组成部分，丢掉任何一种
+// 都会让粘贴的内容残缺——从网页复制的文字几乎必带超链接。at/img/media/
+// emotion/hr 等不承载正文，忽略。
+var postTextTags = map[string]bool{"text": true, "md": true, "code_block": true, "a": true}
+
+// parsePostContent 从 post（富文本）消息的 Content JSON 提取纯文本。
+// 结构为 {"title":"...","content":[[节点,...],...]}（官方文档 + lark-cli 实测）：
+// 接收侧顶层没有发送 API 的 zh_cn 语言包装，content 是段落二维数组。
+// 同段落的文本节点直接相接（一行文字因样式变化会被拆成多个节点），段落间
+// 以换行分隔，title 非空时作首行；段落内部空白原样保留（粘贴代码的缩进
+// 有意义），仅对拼接结果做一次首尾 TrimSpace——与 text 路径的
+// parseTextContent 对整条消息的归一化一致。post 的 @ 是结构化 at 节点
+//（占位符在其 user_id 字段），正文不会出现 "@_user_N"，因此不做 text
+// 消息那样的 mentionRe 剥离——粘贴内容恰好含该字样时不能误删。
+// 没有任何文字（纯图片等）返回空串，由调用方回退提示文案。
+func parsePostContent(raw string) string {
+	var body struct {
+		Title   string       `json:"title"`
+		Content [][]postNode `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		return ""
+	}
+	lines := make([]string, 0, len(body.Content)+1)
+	if title := strings.TrimSpace(body.Title); title != "" {
+		lines = append(lines, title)
+	}
+	for _, para := range body.Content {
+		var sb strings.Builder
+		for _, node := range para {
+			if !postTextTags[node.Tag] {
+				continue
+			}
+			sb.WriteString(node.Text)
+			// 超链接的目标不能静默丢失：agent 的工具（如 add_source）要的
+			// 正是 URL，锚文本与 href 不同时以"锚文本 (href)"并入正文；
+			// 相同（裸链接粘贴的常态）则不重复。
+			if node.Tag == "a" && node.Href != "" && node.Href != node.Text {
+				sb.WriteString(" (" + node.Href + ")")
+			}
+		}
+		if line := sb.String(); strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 // humanizeLLMError 把 LLM 错误翻成给飞书用户看的人话。
