@@ -2,9 +2,16 @@ package feishu
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"sync"
 	"testing"
 
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+
+	"github.com/YouToco/vane/agent"
+	"github.com/YouToco/vane/store"
 )
 
 // confirmValue 构造一个合法确认按钮的回调 value（契约 §9 形态）。
@@ -228,6 +235,132 @@ func TestParsePostContent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := parsePostContent(tc.raw); got != tc.want {
 				t.Errorf("parsePostContent() = %q, 期望 %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// fakeRunner 是 AgentRunner 的假实现：记录 HandleMessage 收到的文本，
+// 供 handle 入口路由测试断言"哪些消息进了 agent loop、进去的文本是什么"。
+type fakeRunner struct {
+	mu    sync.Mutex
+	texts []string
+}
+
+func (f *fakeRunner) HandleMessage(_ context.Context, _ int64, text string) (agent.Outcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.texts = append(f.texts, text)
+	return agent.Outcome{Reply: "ok"}, nil
+}
+
+func (f *fakeRunner) ExecuteAction(context.Context, int64, string) (string, error) {
+	return "", nil
+}
+
+func (f *fakeRunner) CancelAction(context.Context, int64, string) (string, error) {
+	return "", nil
+}
+
+func (f *fakeRunner) received() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.texts...)
+}
+
+// receiveEvent 构造一条 P2 消息接收事件（handle 的最小输入形态）。
+func receiveEvent(msgID, msgType, content, senderOpenID string) *larkim.P2MessageReceiveV1 {
+	return &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{
+				SenderId: &larkim.UserId{OpenId: &senderOpenID},
+			},
+			Message: &larkim.EventMessage{
+				MessageId:   &msgID,
+				MessageType: &msgType,
+				Content:     &content,
+			},
+		},
+	}
+}
+
+// TestHandleMessageRouting 是 handle 入口路由的集成测试（依赖真实 Postgres，
+// CI 的 test job 提供 DATABASE_URL；无则跳过）。钉死本次改动的用户可见行为：
+// post 提取出文本走 agent loop、纯图片 post 与其他类型不进 runner、text
+// 路径行为不回归。回复侧 API 客户端为 nil（reply 仅记日志），断言点是
+// runner 收到什么——这正是"提取结果进对话链路"的分界面。
+func TestHandleMessageRouting(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("未设置 DATABASE_URL，跳过 handle 集成测试")
+	}
+	ctx := t.Context()
+	if err := store.Migrate(ctx, dbURL); err != nil {
+		t.Fatalf("Migrate() 执行失败: %v", err)
+	}
+	st, err := store.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("store.New() 建池失败: %v", err)
+	}
+	defer st.Close()
+
+	// owner 预置为发送者本人：白名单放行，且 captureOwnerIfFirst 因缓存
+	// 已捕获而跳过写库，不污染共享测试库的 feishu_owner 设置。
+	const owner = "ou_test_post_routing"
+
+	cases := []struct {
+		name    string
+		msgType string
+		content string
+		// wantText 为空表示消息不应到达 agent loop（拒绝/回退路径）。
+		wantText string
+	}{
+		{
+			name:     "post 提取文本走 agent loop",
+			msgType:  "post",
+			content:  `{"title":"","content":[[{"tag":"text","text":"帮我订阅 "},{"tag":"a","text":"BBC News","href":"http://feeds.bbci.co.uk/news/rss.xml"}],[{"tag":"img","image_key":"img_v2_x"}]]}`,
+			wantText: "帮我订阅 BBC News (http://feeds.bbci.co.uk/news/rss.xml)",
+		},
+		{
+			name:    "纯图片 post 不进 agent loop",
+			msgType: "post",
+			content: `{"content":[[{"tag":"img","image_key":"img_v2_x"}]]}`,
+		},
+		{
+			name:     "text 路径不回归（剥离 @ 占位符）",
+			msgType:  "text",
+			content:  `{"text":"@_user_1 你好"}`,
+			wantText: "你好",
+		},
+		{
+			name:    "图片消息不进 agent loop",
+			msgType: "image",
+			content: `{"image_key":"img_v2_x"}`,
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(st, nil, nil)
+			m.setOwner(owner, "测试")
+			runner := &fakeRunner{}
+			m.SetAgent(runner)
+			h := newHandler(m, context.Background())
+
+			h.handle(context.Background(), receiveEvent(
+				fmt.Sprintf("om_test_routing_%d", i), tc.msgType, tc.content, owner))
+
+			got := runner.received()
+			if tc.wantText == "" {
+				if len(got) != 0 {
+					t.Errorf("消息不应进 agent loop，实际收到 %q", got)
+				}
+				return
+			}
+			if len(got) != 1 {
+				t.Fatalf("agent loop 应恰好收到 1 条文本，实际 %d 条: %q", len(got), got)
+			}
+			if got[0] != tc.wantText {
+				t.Errorf("agent loop 收到 %q, 期望 %q", got[0], tc.wantText)
 			}
 		})
 	}
