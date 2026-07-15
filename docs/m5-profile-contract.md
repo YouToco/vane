@@ -163,6 +163,11 @@ func (s *Store) LatestFeedbackAction(ctx context.Context, deliveryID int64, acti
 // HasFeedback 该 delivery 是否已有指定 action 的反馈（误判一次性 / deep_dive 预检）。
 func (s *Store) HasFeedback(ctx context.Context, deliveryID int64, action types.FeedbackAction) (bool, error)
 
+// GetFeedbackDetail 取该 delivery 指定 action 最新一条的 detail；无行 CodeNotFound。
+// deep_dive 幂等命中路径靠它重发既有长文（§10.4 第 1 步 + 审查 F4）——一次查询
+// 同时得到"有没有"与"正文"，优于 HasFeedback + 回查两步。
+func (s *Store) GetFeedbackDetail(ctx context.Context, deliveryID int64, action types.FeedbackAction) (string, error)
+
 // ListFeedbacksForEvolution 取 id > afterID 的反馈（id 升序，limit 截断），JOIN 出
 // 演化最小上下文（SQL 同前版；LEFT JOIN content_items 可空）。
 func (s *Store) ListFeedbacksForEvolution(ctx context.Context, userID int64, afterID int64, limit int) ([]types.FeedbackWithContent, error)

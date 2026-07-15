@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/dedup"
+	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/selector"
 	"github.com/YouToco/vane/types"
 )
@@ -45,9 +46,17 @@ type Scorer interface {
 	Score(ctx context.Context, userID int64, item types.ContentItem, traceID string) (float64, error)
 }
 
-// CardGenerator 为单条打分内容生成解读卡片（cardgen.Generate），返回卡片 JSON。
+// CardGenerator 为单条打分内容生成解读正文 markdown（cardgen.Generate 的
+// bodyMD，含阅读原文行）。最终卡片 JSON 由 Push 内经注入的 buildCard 构造——
+// 按钮 value 携带 delivery_id，只能在拿到 id 后生成（契约 §8.2）。
 type CardGenerator interface {
 	Generate(ctx context.Context, userID int64, item types.ScoredItem, traceID string) (string, error)
+}
+
+// ProfileEvolver 画像演化器（生产实现 evolver.Evolver）：推送前批量消费该用户
+// 的新反馈、演化画像 summary/tags（Boss 拍板①：演化随推送批量，非反馈即时）。
+type ProfileEvolver interface {
+	Evolve(ctx context.Context, userID int64, traceID string) error
 }
 
 // Pusher 主动推送一张卡片给指定 open_id（pusher.Push），返回飞书消息 ID。
@@ -82,7 +91,9 @@ type Store interface {
 	CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey string) (int64, error)
 	InsertDeliveryIdempotent(ctx context.Context, d *types.Delivery) (id int64, existed bool, sentAlready bool, err error)
 	UpdatePushBatchStatus(ctx context.Context, batchID int64, status types.BatchStatus) error
-	MarkDeliverySent(ctx context.Context, id int64, feishuMessageID string, sentAt time.Time) error
+	// MarkDeliverySent 发送成功后回填 message_id 与最终卡 JSON（契约 §3.3：
+	// 最终卡在拿到 delivery id 后才构造，只能在此落库而非 Insert 时）。
+	MarkDeliverySent(ctx context.Context, id int64, feishuMessageID string, cardJSON json.RawMessage, sentAt time.Time) error
 }
 
 // Activities 持有 6 步 pipeline 的全部依赖，方法即 Temporal Activity。
@@ -95,18 +106,31 @@ type Activities struct {
 	pusher  Pusher
 	store   Store
 	feishu  FeishuManager
+	evolver ProfileEvolver // nil = EvolveProfile 退化 no-op（灰度装配开关）
+	// buildCard 构造带反馈按钮的最终卡（生产装配传 feishu.BuildDeliveryCard）。
+	// 函数注入而非 import feishu：feishu→agent→workflow 依赖链已存在，
+	// 本包直接依赖 feishu 即成 import 环（契约 §8.2 CRITICAL）。
+	buildCard func(bodyMD string, deliveryID int64, st feedback.CardState) string
 }
 
-// NewActivities 装配 Activities。参数顺序与规格 B6"持有 fetcher/scorer/
-// cardgen/pusher/store/feishuMgr"一致。
-func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, fs FeishuManager) *Activities {
-	return &Activities{fetcher: f, scorer: sc, cardgen: cg, pusher: p, store: st, feishu: fs}
+// NewActivities 装配 Activities。前六参顺序与规格 B6"持有 fetcher/scorer/
+// cardgen/pusher/store/feishuMgr"一致；ev 可为 nil（演化灰度关闭）。
+func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, fs FeishuManager,
+	ev ProfileEvolver, buildCard func(bodyMD string, deliveryID int64, st feedback.CardState) string) *Activities {
+	return &Activities{fetcher: f, scorer: sc, cardgen: cg, pusher: p, store: st, feishu: fs,
+		evolver: ev, buildCard: buildCard}
 }
 
 // ============================================================
 // Activity 入参结构：每步用具体 struct 承载（含 UserID/TraceID/上一步结果），
 // 避免裸切片跨步传递时语义歧义（规格 B6）。出参直接复用 types.go 的跨包类型。
 // ============================================================
+
+// EvolveIn 是 EvolveProfile Activity 的入参。
+type EvolveIn struct {
+	UserID  int64  `json:"user_id"`
+	TraceID string `json:"trace_id"`
+}
 
 // DedupIn 是 Dedup Activity 的入参。
 type DedupIn struct {
@@ -148,6 +172,16 @@ type PushIn struct {
 // 6 个 Activity。约定：单条失败（单源抓取失败 / 单条打分失败）不阻断整批，
 // 只 warn 并跳过；只有"整批全军覆没"才返回错误触发 Temporal 重试。
 // ============================================================
+
+// EvolveProfile 画像演化前置步（契约 §8.1）。evolver 未注入时 no-op：统编阶段
+// 可先不传 evolver 灰度上线，pipeline 行为与 M4 完全一致。错误原样上抛交给
+// RetryPolicy；重试耗尽后由 workflow 侧吞掉——演化失败永不阻断推送（红线）。
+func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error {
+	if a.evolver == nil {
+		return nil
+	}
+	return a.evolver.Evolve(ctx, in.UserID, in.TraceID)
+}
 
 // Fetch 现查用户的 active 订阅源，逐源抓取入库并推进各源抓取状态，最后返回
 // 该用户"未投递候选"（带条数上限）。TraceID 由 workflow 生成后经后续 Activity
@@ -287,26 +321,26 @@ func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem,
 	return scored, nil
 }
 
-// Select 取 TopN，直接复用 selector.SelectTopN——ScoredItem 统一为 types.ScoredItem
-// 后，selector 与 workflow 都只 import types、彼此不依赖，无环，故不必再内联排序。
+// Select 取 TopN，复用 selector.RankTopN（显式同分裁决 + 新鲜度衰减排序，
+// 契约 §6）。activity 内取 time.Now() 合法：确定性约束只限 workflow 函数体。
 func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredItem, error) {
 	n := in.TopN
 	if n <= 0 {
 		n = defaultTopN
 	}
-	return selector.SelectTopN(in.Scored, n), nil
+	return selector.RankTopN(in.Scored, n, time.Now()), nil
 }
 
-// CardGen 逐条生成解读卡片。单条失败跳过；整批全失败返回错误触发重试。
+// CardGen 逐条生成解读正文。单条失败跳过；整批全失败返回错误触发重试。
 func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard, error) {
 	cards := make([]GeneratedCard, 0, len(in.Items))
 	for _, si := range in.Items {
-		cj, err := a.cardgen.Generate(ctx, in.UserID, si, in.TraceID)
+		body, err := a.cardgen.Generate(ctx, in.UserID, si, in.TraceID)
 		if err != nil {
 			slog.Warn("cardgen: 单条生成失败，跳过", "content_item_id", si.Item.ID, "trace_id", in.TraceID, "err", err)
 			continue
 		}
-		cards = append(cards, GeneratedCard{Scored: si, CardJSON: cj})
+		cards = append(cards, GeneratedCard{Scored: si, BodyMD: body})
 	}
 	if len(cards) == 0 && len(in.Items) > 0 {
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "整批卡片生成全部失败", nil)
@@ -334,11 +368,14 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	anySent := false
 	for _, card := range in.Cards {
 		d := &types.Delivery{
-			BatchID:  batchID,
-			UserID:   in.UserID,
-			Score:    card.Scored.Score,
-			CardJSON: json.RawMessage(card.CardJSON),
-			Status:   types.DeliveryStatusPending,
+			BatchID: batchID,
+			UserID:  in.UserID,
+			Score:   card.Scored.Score,
+			// 解读正文入 body_md；card_json 此时留空（store 归一为 '{}'）——
+			// 最终卡按钮 value 携带 delivery_id，只能在拿到 id 后构造，
+			// 由 MarkDeliverySent 回填（契约 §8.2）。
+			BodyMD: card.BodyMD,
+			Status: types.DeliveryStatusPending,
 		}
 		if card.Scored.Item.ID != 0 {
 			cid := card.Scored.Item.ID
@@ -355,12 +392,14 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			continue
 		}
 
-		msgID, perr := a.pusher.Push(ctx, owner, card.CardJSON)
+		// 新投递尚无任何反馈：状态行传零值 CardState。
+		cardJSON := a.buildCard(card.BodyMD, delID, feedback.CardState{})
+		msgID, perr := a.pusher.Push(ctx, owner, cardJSON)
 		if perr != nil {
 			slog.Warn("push: 单卡推送失败，跳过", "delivery_id", delID, "trace_id", in.TraceID, "err", perr)
 			continue
 		}
-		if merr := a.store.MarkDeliverySent(ctx, delID, msgID, time.Now()); merr != nil {
+		if merr := a.store.MarkDeliverySent(ctx, delID, msgID, json.RawMessage(cardJSON), time.Now()); merr != nil {
 			// 已发出但回执标记失败：记录不阻断，靠对账补偿（避免重复推送）。
 			slog.Warn("push: 标记已发失败（消息已送达）", "delivery_id", delID, "feishu_message_id", msgID, "err", merr)
 		}

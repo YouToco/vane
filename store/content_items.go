@@ -45,6 +45,27 @@ func (s *Store) InsertContentItemIfNew(ctx context.Context, item *types.ContentI
 	return id, false, nil
 }
 
+// GetContentItem 按 id 取内容条目（deep_dive / 追问取原文用）。无行返回 CodeNotFound。
+func (s *Store) GetContentItem(ctx context.Context, id int64) (*types.ContentItem, error) {
+	var ci types.ContentItem
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, source_id, external_id, url, title, content, author,
+		        published_at, content_hash, simhash, fetched_at, created_at
+		 FROM content_items WHERE id = $1`, id).Scan(
+		&ci.ID, &ci.SourceID, &ci.ExternalID, &ci.URL, &ci.Title, &ci.Content, &ci.Author,
+		&ci.PublishedAt, &ci.ContentHash, &ci.Simhash, &ci.FetchedAt, &ci.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, types.NewAppError(types.CodeNotFound,
+				fmt.Sprintf("内容条目 id=%d 不存在", id), err)
+		}
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询内容条目（id=%d）", id), err)
+	}
+	return &ci, nil
+}
+
 // ListRecentSimhashesByUser 取该用户 active 订阅的全部信源在 since 之后、
 // 已算出 simhash 的指纹集合，供近似去重。since 由调用方按 72h 窗口传入（now-72h）。
 //

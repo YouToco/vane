@@ -67,6 +67,7 @@ const (
 	RefTypePushBatch   RefType = "push_batch"   // 关联推送批次
 	RefTypeFeedback    RefType = "feedback"     // 关联文字反馈解读
 	RefTypeContentItem RefType = "content_item" // 关联单条内容（摘要等）
+	RefTypeProfile     RefType = "profile"      // 关联用户画像（画像演化记账）
 )
 
 // AgentSessionStatus agent 会话状态（agent_sessions.status，M4 契约 §3）。

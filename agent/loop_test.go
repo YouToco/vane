@@ -19,20 +19,34 @@ import (
 // ============================================================
 
 // fakeStore 是 Store 窄接口的内存实现，语义对齐契约 §2
-// （Get 按 since 过滤、Claim 原子幂等、Cancel 仅 pending 可取消）。
+// （Get 按 since 过滤、Claim 原子幂等、Cancel 仅 pending 可取消），
+// 同时充当 ProfileReader / profileStore（M5 画像面）的假实现。
 type fakeStore struct {
 	nextSessionID int64
 	sessions      map[int64]*types.AgentSession
 	actions       map[string]*types.PendingAction
 
+	profiles      map[int64]*types.Profile
+	profileGetErr error                 // 注入 GetProfile 的非 NotFound 失败
+	upsertErr     error                 // 注入 UpsertProfileFields 的失败
+	upsertCalls   []upsertProfileRecord // UpsertProfileFields 入参留痕，断言截断与 nil 语义
+
 	updateCalls   int
 	lastMessages  json.RawMessage
 	lastTurnCount int
 
-	// mu 保护 appendCalls 与 sessions 内容：卡片回调回写在独立 goroutine
-	// 里执行，与测试主 goroutine 的断言读取并发。
-	mu          sync.Mutex
-	appendCalls []appendRecord
+	// mu 保护 appendCalls、getActiveCalls 与 sessions 内容：卡片回调/事件通告回写
+	// 在独立 goroutine 里执行，与测试主 goroutine 的断言读取并发。
+	mu             sync.Mutex
+	appendCalls    []appendRecord
+	getActiveCalls int // GetActiveAgentSession 调用次数（F14 用例靠它判定现查在不在锁内）
+}
+
+// upsertProfileRecord 记录一次 UpsertProfileFields 调用入参。
+type upsertProfileRecord struct {
+	userID               int64
+	industry, occupation *string
+	tags                 []string
 }
 
 // appendRecord 记录一次 AppendAgentSessionMessages 调用，供断言回写目标与内容。
@@ -45,14 +59,63 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{
 		sessions: make(map[int64]*types.AgentSession),
 		actions:  make(map[string]*types.PendingAction),
+		profiles: make(map[int64]*types.Profile),
 	}
+}
+
+func (f *fakeStore) GetProfile(_ context.Context, userID int64) (*types.Profile, error) {
+	if f.profileGetErr != nil {
+		return nil, f.profileGetErr
+	}
+	p, ok := f.profiles[userID]
+	if !ok {
+		return nil, notFoundErr("fake: 无画像")
+	}
+	cp := *p
+	return &cp, nil
+}
+
+// UpsertProfileFields 对齐生产语义（store/profiles.go）：nil 不改、
+// 非 nil 整体替换（截前 12）、刷 updated_at、RETURNING 更新后全行。
+func (f *fakeStore) UpsertProfileFields(_ context.Context, userID int64, industry, occupation *string, tags []string) (*types.Profile, error) {
+	f.upsertCalls = append(f.upsertCalls, upsertProfileRecord{
+		userID: userID, industry: industry, occupation: occupation, tags: tags,
+	})
+	if f.upsertErr != nil {
+		return nil, f.upsertErr
+	}
+	p, ok := f.profiles[userID]
+	if !ok {
+		p = &types.Profile{UserID: userID}
+		f.profiles[userID] = p
+	}
+	if industry != nil {
+		p.Industry = *industry
+	}
+	if occupation != nil {
+		p.Occupation = *occupation
+	}
+	if tags != nil {
+		if len(tags) > 12 {
+			tags = tags[:12]
+		}
+		p.Tags = tags
+	}
+	p.UpdatedAt = time.Now()
+	cp := *p
+	return &cp, nil
 }
 
 func notFoundErr(msg string) error {
 	return types.NewAppError(types.CodeNotFound, msg, nil)
 }
 
+// GetActiveAgentSession 计数进 getActiveCalls：NotifyEvent 的"现查必须在 userMu 锁内"
+// （审查 F14）靠"锁被对端持有期间这里有没有被调到"来判定，故计数与回写同一把 mu 保护。
 func (f *fakeStore) GetActiveAgentSession(_ context.Context, userID int64, since time.Time) (*types.AgentSession, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getActiveCalls++
 	for _, s := range f.sessions {
 		if s.UserID == userID && s.Status == types.AgentSessionStatusActive && s.UpdatedAt.After(since) {
 			cp := *s
@@ -62,7 +125,22 @@ func (f *fakeStore) GetActiveAgentSession(_ context.Context, userID int64, since
 	return nil, notFoundErr("fake: 无 active 会话")
 }
 
+// getActiveCount / sessionCount 锁内取计数快照，供并发用例断言。
+func (f *fakeStore) getActiveCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getActiveCalls
+}
+
+func (f *fakeStore) sessionCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sessions)
+}
+
 func (f *fakeStore) CreateAgentSession(_ context.Context, userID int64) (*types.AgentSession, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.nextSessionID++
 	s := &types.AgentSession{
 		ID:        f.nextSessionID,
@@ -78,6 +156,8 @@ func (f *fakeStore) CreateAgentSession(_ context.Context, userID int64) (*types.
 }
 
 func (f *fakeStore) UpdateAgentSession(_ context.Context, id int64, messages json.RawMessage, turnCount int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	s, ok := f.sessions[id]
 	if !ok {
 		return notFoundErr("fake: 会话不存在")
@@ -223,10 +303,12 @@ func (s *scriptedChat) fn(_ context.Context, req llm.ChatRequest) (*llm.ChatResp
 
 // newTestLoop 构造注入假 chatFn 的 Loop。Client/Recorder 传 nil：
 // New 生成的默认 chatFn 随即被覆盖，永远不会被调用。
+// Profiles 与 Store 共用同一 fakeStore：无画像行时走 NotFound → 空画像分支。
 func newTestLoop(t *testing.T, fs *fakeStore, chat func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error), tools ...Tool) *Loop {
 	t.Helper()
 	l := New(Deps{
 		Store:      fs,
+		Profiles:   fs,
 		Tools:      tools,
 		Model:      "deepseek-v4-pro",
 		MaxTurns:   5,
@@ -274,7 +356,9 @@ func TestHandleMessage_PlainChat(t *testing.T) {
 		t.Fatalf("期望恰好 1 次模型调用, 实得 %d", len(chat.requests))
 	}
 	req := chat.requests[0]
-	if req.Messages[0].Role != "system" || req.Messages[0].Content != systemPrompt {
+	// system = 常量 prompt + 动态 [用户画像] 段（M5 §12.2）：画像注入只在请求侧，
+	// 不入库，故这里断言前缀而非全等。
+	if req.Messages[0].Role != "system" || !strings.HasPrefix(req.Messages[0].Content, systemPrompt) {
 		t.Fatalf("请求首条消息应为 system prompt, 实得 %+v", req.Messages[0])
 	}
 	if last := req.Messages[len(req.Messages)-1]; last.Role != "user" || last.Content != "你好" {
@@ -822,5 +906,275 @@ func TestAppendCardCallback_SerializesWithHandleMessage(t *testing.T) {
 	}
 	if prev := got[len(got)-2]; prev.Role != "assistant" || prev.Content != "好的" {
 		t.Fatalf("倒数第二条应为模型回复, 实得 %+v", prev)
+	}
+}
+
+// ============================================================
+// 画像动态注入（M5 契约 §12.2 / §15 agent 段）
+// ============================================================
+
+// runOneMessage 跑一条纯聊天消息，返回请求侧 system 消息内容。
+// 画像注入只发生在请求侧（system 不入库），全部两态断言都落在这里。
+func runOneMessage(t *testing.T, l *Loop, chat *scriptedChat, userID int64) string {
+	t.Helper()
+	if _, err := l.HandleMessage(context.Background(), userID, "你好"); err != nil {
+		t.Fatalf("画像是增强不是门槛, HandleMessage 不应失败: %v", err)
+	}
+	if len(chat.requests) != 1 {
+		t.Fatalf("期望恰好 1 次模型调用, 实得 %d", len(chat.requests))
+	}
+	sys := chat.requests[0].Messages[0]
+	if sys.Role != "system" {
+		t.Fatalf("请求首条消息应为 system, 实得 %+v", sys)
+	}
+	return sys.Content
+}
+
+// newChatOK 造一个"一问一答即收敛"的假 chat。
+func newChatOK() *scriptedChat {
+	return &scriptedChat{responses: []*llm.ChatResponse{{Content: "好的", FinishReason: "stop"}}}
+}
+
+// testProfile 是注入用例共用的满字段画像。
+func testProfile(userID int64) *types.Profile {
+	return &types.Profile{
+		UserID:     userID,
+		Industry:   "金融",
+		Occupation: "量化研究员",
+		Tags:       []string{"AI", "宏观"},
+		Summary:    "关注 AI 与宏观经济。",
+	}
+}
+
+// 画像注入两态（契约 §12.2 逐字文案）：有画像 → system 末尾是 profilehint.Build
+// 的单行渲染；NotFound / 读取失败 / 全空画像 / 未注入 → 一律「尚未建立。」且不失败。
+// 画像只进请求侧：M4「system 不入库」不变式对画像段同样成立。
+func TestHandleMessage_ProfileInjection(t *testing.T) {
+	t.Run("有画像时 system 末尾为画像段且不入库", func(t *testing.T) {
+		fs := newFakeStore()
+		fs.profiles[7] = testProfile(7)
+		chat := newChatOK()
+		sys := runOneMessage(t, newTestLoop(t, fs, chat.fn), chat, 7)
+
+		// 契约 §12.2 锁死的尾段文案，逐字钉住（渲染格式与 scorer/cardgen 同一份 Build）。
+		want := systemPrompt + "\n\n[用户画像] 行业：金融；职业：量化研究员；关注标签：AI、宏观；摘要：关注 AI 与宏观经济。"
+		if sys != want {
+			t.Fatalf("system 画像段不符:\n实得 %q\n期望 %q", sys, want)
+		}
+
+		// M4 不变式：system 不入库——画像一个字都不得随会话落库。
+		for _, m := range persistedMessages(t, fs) {
+			if m.Role == "system" {
+				t.Fatalf("system 不得入库, 实得 %+v", m)
+			}
+		}
+		if s := string(fs.lastMessages); strings.Contains(s, "[用户画像]") || strings.Contains(s, "量化研究员") {
+			t.Fatalf("画像不得随会话入库（画像变更靠下一条消息现查自然生效）, 实得 %s", s)
+		}
+	})
+
+	t.Run("画像 NotFound 时为尚未建立", func(t *testing.T) {
+		fs := newFakeStore() // 无画像行 → GetProfile 返回 CodeNotFound
+		chat := newChatOK()
+		sys := runOneMessage(t, newTestLoop(t, fs, chat.fn), chat, 7)
+
+		want := systemPrompt + "\n\n[用户画像] 尚未建立。"
+		if sys != want {
+			t.Fatalf("空画像段不符:\n实得 %q\n期望 %q", sys, want)
+		}
+	})
+
+	t.Run("画像读取 DB 失败时按空画像继续且不失败", func(t *testing.T) {
+		fs := newFakeStore()
+		// 画像行存在但读取失败：证明降级走的是失败分支，而不是"恰好没画像"。
+		fs.profiles[7] = testProfile(7)
+		fs.profileGetErr = types.NewAppError(types.CodeDatabase, "连接池耗尽", nil)
+		chat := newChatOK()
+		l := newTestLoop(t, fs, chat.fn)
+
+		out, err := l.HandleMessage(context.Background(), 7, "你好")
+		if err != nil {
+			t.Fatalf("画像是增强不是门槛：读取失败绝不能阻断消息处理, 实得 err=%v", err)
+		}
+		if out.Reply != "好的" {
+			t.Fatalf("降级后仍应正常回复, 实得 %q", out.Reply)
+		}
+		sys := chat.requests[0].Messages[0].Content
+		if sys != systemPrompt+"\n\n[用户画像] 尚未建立。" {
+			t.Fatalf("读取失败应按空画像继续, 实得 %q", sys)
+		}
+		if strings.Contains(sys, "金融") || strings.Contains(sys, "量化研究员") {
+			t.Fatalf("读取失败时不得漏出半截画像, 实得 %q", sys)
+		}
+	})
+
+	t.Run("全空画像等同尚未建立", func(t *testing.T) {
+		fs := newFakeStore()
+		fs.profiles[7] = &types.Profile{UserID: 7} // 有行但字段全空 → Build 返回 ""
+		chat := newChatOK()
+		sys := runOneMessage(t, newTestLoop(t, fs, chat.fn), chat, 7)
+
+		if sys != systemPrompt+"\n\n[用户画像] 尚未建立。" {
+			t.Fatalf("全空画像应走空态文案, 实得 %q", sys)
+		}
+	})
+
+	t.Run("Profiles 未注入时按空画像", func(t *testing.T) {
+		// 灰度装配：Deps.Profiles 为 nil 不得 panic，按空画像继续。
+		fs := newFakeStore()
+		chat := newChatOK()
+		l := New(Deps{Store: fs, Model: "deepseek-v4-pro", MaxTurns: 5, SessionTTL: 30 * time.Minute})
+		l.chatFn = chat.fn
+
+		sys := runOneMessage(t, l, chat, 7)
+		if sys != systemPrompt+"\n\n[用户画像] 尚未建立。" {
+			t.Fatalf("未注入 Profiles 应按空画像, 实得 %q", sys)
+		}
+	})
+}
+
+// ============================================================
+// NotifyEvent：反馈会话通告（M5 契约 §12.4）
+// ============================================================
+
+// noticeNotInterested 是契约 §12.4 的通告文案样例（由 feedback 层拼好整串传入）。
+const noticeNotInterested = "[卡片回调] 用户在推送卡片（delivery_id=42《标题》）上点击了「不感兴趣」"
+
+// NotifyEvent 的两条基本纪律（契约 §12.4）：有 active 会话 → role=user 通告原样追加；
+// 无 active 会话（从未对话 / TTL 外）→ 静默丢弃，绝不新建会话、绝不回写。
+func TestNotifyEvent(t *testing.T) {
+	t.Run("有 active 会话时以 role=user 追加通告", func(t *testing.T) {
+		fs := newFakeStore()
+		sess, _ := fs.CreateAgentSession(context.Background(), 7)
+		l := newTestLoop(t, fs, (&scriptedChat{}).fn)
+
+		l.NotifyEvent(context.Background(), 7, noticeNotInterested)
+		waitAppends(t, fs, 1)
+
+		if rec := appendCallAt(fs, 0); rec.sessionID != sess.ID {
+			t.Fatalf("应向 active 会话 %d 回写, 实得 %+v", sess.ID, rec)
+		}
+		msgs := appendedMessages(t, fs, 0)
+		if len(msgs) != 1 || msgs[0].Role != "user" {
+			t.Fatalf("通告应为 1 条 role=user 消息, 实得 %+v", msgs)
+		}
+		if msgs[0].Content != noticeNotInterested {
+			t.Fatalf("通告文案应原样落库（前缀由调用方拼好）, 实得 %q", msgs[0].Content)
+		}
+		// 与历史同构：整份 messages 仍能按 []llm.ChatMessage 无损解析。
+		if got := decodeMessages(fs.sessionMessages(sess.ID)); len(got) != 1 || got[0].Content != noticeNotInterested {
+			t.Fatalf("会话内容应含通告且可解析, 实得 %+v", got)
+		}
+		if fs.sessionCount() != 1 {
+			t.Fatalf("不应新建会话, 实得 %d 个", fs.sessionCount())
+		}
+	})
+
+	t.Run("无会话时静默丢弃且不新建", func(t *testing.T) {
+		fs := newFakeStore() // 用户从未对话过
+		l := newTestLoop(t, fs, (&scriptedChat{}).fn)
+
+		l.NotifyEvent(context.Background(), 7, noticeNotInterested)
+		waitAppends(t, fs, 0) // 等一拍确认没有回写溜进来
+
+		if fs.sessionCount() != 0 {
+			t.Fatalf("无 active 会话时绝不新建会话（用户没在对话，一条通告不值得开新会话）, 实得 %d 个", fs.sessionCount())
+		}
+		if fs.updateCalls != 0 {
+			t.Fatalf("丢弃路径不应写会话, 实得 %d 次", fs.updateCalls)
+		}
+	})
+
+	t.Run("TTL 外的过期会话不复活", func(t *testing.T) {
+		fs := newFakeStore()
+		sess, _ := fs.CreateAgentSession(context.Background(), 7)
+		// 会话最后更新在 TTL（30min）之外 → GetActiveAgentSession 按 since 过滤掉。
+		fs.sessions[sess.ID].UpdatedAt = time.Now().Add(-2 * time.Hour)
+		l := newTestLoop(t, fs, (&scriptedChat{}).fn)
+
+		l.NotifyEvent(context.Background(), 7, noticeNotInterested)
+		waitAppends(t, fs, 0)
+
+		if got := decodeMessages(fs.sessionMessages(sess.ID)); len(got) != 0 {
+			t.Fatalf("过期会话不得被通告写入, 实得 %+v", got)
+		}
+		if fs.sessionCount() != 1 {
+			t.Fatalf("不得为通告新建会话, 实得 %d 个", fs.sessionCount())
+		}
+	})
+}
+
+// F14 定向用例（"挪一行就静默失效"的不变式）：HandleMessage 持 userMu 期间来的事件通告，
+// ① GetActiveAgentSession 现查必须发生在锁内——锁外查到的会话可能在抢锁期间被换代
+//    （TTL 边界上 HandleMessage 新开会话），通告会写进过期会话；
+// ② 通告必须排在 saveSession 之后落地，否则被 UpdateAgentSession 的全量覆盖写吞掉。
+// 断言 ① 靠"锁被对端持有期间 GetActiveAgentSession 一次都不能被调到"，
+// 把现查挪到 mu.Lock() 之前（无论移进 NotifyEvent 本体还是 goroutine 开头）即变红。
+func TestNotifyEvent_QueriesInsideLockAndSerializesWithHandleMessage(t *testing.T) {
+	fs := newFakeStore()
+	sess, _ := fs.CreateAgentSession(context.Background(), 7)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	blockingChat := func(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		close(entered)
+		<-release
+		return &llm.ChatResponse{Content: "好的", FinishReason: "stop"}, nil
+	}
+	l := newTestLoop(t, fs, blockingChat)
+
+	handleDone := make(chan struct{})
+	go func() {
+		defer close(handleDone)
+		_, _ = l.HandleMessage(context.Background(), 7, "你好")
+	}()
+	<-entered // HandleMessage 已持锁、正卡在模型调用上
+
+	// HandleMessage 自己的 loadOrCreateSession 已查过一次，以此为基线。
+	baseQueries := fs.getActiveCount()
+	if baseQueries != 1 {
+		t.Fatalf("基线：HandleMessage 应已现查会话 1 次, 实得 %d", baseQueries)
+	}
+
+	// 调用方 ctx 已取消：回写必须靠 WithoutCancel 的独立 ctx 存活（对齐确认卡回调纪律）。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	l.NotifyEvent(ctx, 7, noticeNotInterested)
+
+	// 锁仍被 HandleMessage 持有：现查与回写都不可能发生。
+	time.Sleep(30 * time.Millisecond)
+	if got := fs.getActiveCount(); got != baseQueries {
+		t.Fatalf("F14 失守：GetActiveAgentSession 现查发生在 userMu 之外（锁等待期间被调到 %d 次），"+
+			"锁外查到的会话可能在抢锁期间被换代", got-baseQueries)
+	}
+	if got := fs.appendCount(); got != 0 {
+		t.Fatalf("锁被持有期间不应有通告落地, 实得 %d", got)
+	}
+
+	close(release)
+	<-handleDone
+	waitAppends(t, fs, 1)
+
+	// 拿到锁之后才现查（基线 +1），且写的是现查到的会话。
+	if got := fs.getActiveCount(); got != baseQueries+1 {
+		t.Fatalf("拿到锁后应恰好现查 1 次, 实得总计 %d（基线 %d）", got, baseQueries)
+	}
+	if rec := appendCallAt(fs, 0); rec.sessionID != sess.ID {
+		t.Fatalf("通告应写进现查到的会话 %d, 实得 %+v", sess.ID, rec)
+	}
+
+	// 会话 = HandleMessage 的完整历史 + 末尾通告：一条都不能被覆盖写吞掉。
+	got := decodeMessages(fs.sessionMessages(sess.ID))
+	if len(got) != 3 {
+		t.Fatalf("会话应为 [user, assistant, 通告] 三条, 实得 %+v", got)
+	}
+	if got[0].Role != "user" || got[0].Content != "你好" {
+		t.Fatalf("首条应为用户消息, 实得 %+v", got[0])
+	}
+	if got[1].Role != "assistant" || got[1].Content != "好的" {
+		t.Fatalf("次条应为模型回复, 实得 %+v", got[1])
+	}
+	if last := got[2]; last.Role != "user" || last.Content != noticeNotInterested {
+		t.Fatalf("通告应排在 saveSession 之后落地, 实得 %+v", last)
 	}
 }

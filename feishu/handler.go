@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
+	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/types"
 )
@@ -152,6 +154,14 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 	// agent 已注入时消息交给 agent loop（M4）；未注入（如装配阶段配置不全）
 	// 回退下方 chat_reply 直连——保证任何装配形态下消息都有回应而非崩/沉默。
 	if runner := h.m.agentRunner(); runner != nil {
+		// 追问识别（M5 契约 §11）：用户回复某张推送卡时，把原文与解读摘要作为
+		// 定界上下文并入本条消息。只在 agent 链路做——回退路径无会话语义，
+		// 包装无意义。未命中（回复的是普通消息/聊天卡）原样按普通消息处理。
+		if fb := h.m.feedbackRunner(); fb != nil {
+			if wrapped, ok := fb.WrapQuestion(ctx, user.ID, strVal(msg.ParentId), strVal(msg.RootId), text); ok {
+				text = wrapped
+			}
+		}
 		h.handleWithAgent(ctx, runner, msgID, openID, user.ID, text)
 		return
 	}
@@ -242,8 +252,9 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 		return toastResponse("error", "回调数据缺失"), nil
 	}
 	verb, actionID := parseCardActionValue(event.Event.Action.Value)
-	if actionID == "" || (verb != cardActionConfirm && verb != cardActionCancel) {
-		// 不是 Vane 确认卡的回调（或 value 结构不识别）：静默忽略，不弹错误打扰。
+	fbAction, deliveryID, isFeedback := parseFeedbackValue(event.Event.Action.Value)
+	// 三类 value 之外（含 value 结构不识别）静默忽略，不弹错误打扰。
+	if !isFeedback && (actionID == "" || (verb != cardActionConfirm && verb != cardActionCancel)) {
 		return &callback.CardActionTriggerResponse{}, nil
 	}
 
@@ -253,8 +264,21 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 	}
 	// owner 为空（进程重启后缓存未预热等）时同样拒绝：宁可让主人重点一次，
 	// 也不能让白名单出现空窗（契约 §10：写动作只有 owner 能确认）。
+	// 反馈按钮共用这道校验：反馈会驱动画像演化与深度解读（付费调用）。
 	if owner := h.m.ownerID(); operatorID == "" || owner == "" || operatorID != owner {
 		return toastResponse("error", "仅主人可操作"), nil
+	}
+
+	// 推送卡反馈（M5）在此与确认卡（M4）分流：分流点放在 agent 就绪检查之前，
+	// 且自带一次 UpsertUserByOpenID——反馈不依赖 agent loop（Notifier 缺席只是
+	// 少一条会话通告），下面 M4 路径的每一行则保持原样不动。
+	if isFeedback {
+		user, err := h.m.st.UpsertUserByOpenID(h.ctx, operatorID, "")
+		if err != nil {
+			slog.Error("feishu: 反馈回调 upsert 用户失败", "err", err, "open_id", operatorID)
+			return toastResponse("error", "内部数据错误，请稍后重试"), nil
+		}
+		return h.onFeedbackAction(user.ID, fbAction, deliveryID), nil
 	}
 
 	runner := h.m.agentRunner()
@@ -348,6 +372,93 @@ func parseCardActionValue(value map[string]interface{}) (verb, actionID string) 
 	verb, _ = value["vane_action"].(string)
 	actionID, _ = value["action_id"].(string)
 	return verb, actionID
+}
+
+// feedbackButtonActions 是按钮 value 里 fb 字段的白名单（M5 契约 §10.1）：
+// question 不出现在按钮上（它由回复消息产生）。
+var feedbackButtonActions = map[string]types.FeedbackAction{
+	string(types.FeedbackActionInterested):    types.FeedbackActionInterested,
+	string(types.FeedbackActionNotInterested): types.FeedbackActionNotInterested,
+	string(types.FeedbackActionMisjudged):     types.FeedbackActionMisjudged,
+	string(types.FeedbackActionDeepDive):      types.FeedbackActionDeepDive,
+}
+
+// parseFeedbackValue 解析推送卡反馈按钮的 value（M5 契约 §10.1）。
+// 任何字段缺失/类型不符/不在白名单/id 非法 → ok=false（调用方静默忽略）：
+// value 完全由客户端提供，解析层只做形状校验，语义与归属由服务端库内裁决。
+func parseFeedbackValue(value map[string]interface{}) (action types.FeedbackAction, deliveryID int64, ok bool) {
+	if verb, _ := value["vane_action"].(string); verb != cardActionFeedback {
+		return "", 0, false
+	}
+	raw, _ := value["fb"].(string)
+	action, known := feedbackButtonActions[raw]
+	if !known {
+		return "", 0, false
+	}
+	// delivery_id 恒为字符串（构卡侧 FormatInt）：JSON number 经 SDK 会变 float64，
+	// 大 id 有精度隐患。
+	idStr, _ := value["delivery_id"].(string)
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		return "", 0, false
+	}
+	return action, id, true
+}
+
+// onFeedbackAction 处理推送卡反馈按钮点击（M5 契约 §10.3）。
+//
+// 与 M4 确认卡回调的两点刻意差异：
+//  1. 超时后**丢弃结果不补发**——态度/误判是纯 DB 快路径，超时即异常态；且反馈
+//     幂等，用户重点一次即可自愈。确认卡则不同：Claim 成功后动作不可重复领取，
+//     结果不补发就永久丢失，所以那边必须补发。
+//  2. 卡片更新用 feedback 服务返回的整卡 JSON（正文原样保留），而非替换成结果文本。
+func (h *handler) onFeedbackAction(userID int64, action types.FeedbackAction, deliveryID int64) *callback.CardActionTriggerResponse {
+	fb := h.m.feedbackRunner()
+	if fb == nil {
+		return toastResponse("error", "反馈功能尚未就绪，请稍后重试")
+	}
+
+	done := make(chan feedback.ClickResult, 1)
+	go func() {
+		// 与连接生命周期解耦（同 M4 卡片动作）：deep_dive 会在 HandleClick 内再起
+		// 生成 goroutine，回调链结束不能中断它。
+		execCtx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), cardActionExecBudget)
+		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("feishu: 反馈处理 panic", "recover", r, "delivery_id", deliveryID)
+				done <- feedback.ClickResult{Toast: "内部错误，请稍后重试"}
+			}
+		}()
+		res, err := fb.HandleClick(execCtx, userID, feedback.Click{Action: action, DeliveryID: deliveryID})
+		if err != nil {
+			slog.Error("feishu: 反馈处理失败", "err", err, "delivery_id", deliveryID, "fb", action)
+			done <- feedback.ClickResult{Toast: "处理失败：" + humanizeLLMError(err)}
+			return
+		}
+		done <- res
+	}()
+
+	timer := time.NewTimer(cardActionSyncBudget)
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		toastType := "error"
+		if res.ToastOK {
+			toastType = "success"
+		}
+		resp := &callback.CardActionTriggerResponse{
+			Toast: &callback.Toast{Type: toastType, Content: res.Toast},
+		}
+		if res.CardJSON != "" {
+			resp.Card = &callback.Card{Type: "raw", Data: json.RawMessage(res.CardJSON)}
+		}
+		return resp
+	case <-timer.C:
+		// 结果丢弃不补发（见函数注释理由 1）：goroutine 仍会跑完并落库，
+		// 用户重看/重点即可看到最新状态。
+		return toastResponse("info", "处理中，可稍后重新点击")
+	}
 }
 
 // toastResponse 构造仅含 toast 的回调响应（不更新卡片）。

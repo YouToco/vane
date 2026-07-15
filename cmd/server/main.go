@@ -21,9 +21,12 @@ import (
 	"github.com/YouToco/vane/api"
 	"github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/evolver"
+	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/profilehint"
 	"github.com/YouToco/vane/pusher"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/scorer"
@@ -87,17 +90,25 @@ func run() error {
 	}
 
 	// 组装推送管道各步依赖，注入 Activities（所有 I/O 只在 activity 内做，满足确定性约束）。
-	// 注：pipeline 各包构造函数由并行 agent 定稿，下列签名按 M3 规格 B4/B6 假定，
-	// 若与最终实现不符由主控在装配处对齐。
+	// hints 由 scorer 与 cardgen 共享同一实例（M5 契约 §13）：同一 trace 内两者拿到
+	// 同一份画像快照——卡片"为什么与你有关"与打分依据必须是同一个画像。
 	fetch := fetcher.NewMulti(cfg.Fetch)
-	score := scorer.New(llmClient, recorder, st)
-	cards := cardgen.New(llmClient, recorder)
+	hints := profilehint.NewCache(st)
+	score := scorer.New(llmClient, recorder, st, hints)
+	cards := cardgen.New(llmClient, recorder, hints)
 	push := pusher.New(manager)
-	activities := workflow.NewActivities(fetch, score, cards, push, st, manager)
+	// 构卡函数注入而非 workflow 直接 import feishu：feishu→agent→workflow 依赖链
+	// 已存在，直接调用会成环（M5 契约 §8.2）。
+	ev := evolver.New(llmClient, recorder, st)
+	activities := workflow.NewActivities(fetch, score, cards, push, st, manager, ev, feishu.BuildDeliveryCard)
 
 	// worker：非阻塞 Start，关停时 Stop()（见下方顺序关停）。
 	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, worker.Options{})
 	w.RegisterWorkflow(workflow.PushPipelineWorkflow)
+	// 逐个注册（非整体 Register）：漏注册不会启动失败，而是每批推送在该活动上
+	// 重试到超时——EvolveProfile 的错误被 workflow 刻意吞掉，漏注册只会表现为
+	// 推送莫名变慢（M5 契约 §13 明示）。
+	w.RegisterActivity(activities.EvolveProfile)
 	w.RegisterActivity(activities.Fetch)
 	w.RegisterActivity(activities.Dedup)
 	w.RegisterActivity(activities.Score)
@@ -122,12 +133,28 @@ func run() error {
 		Client:     llmClient,
 		Recorder:   recorder,
 		Store:      st,
+		Profiles:   st,
 		Tools:      tools,
 		Model:      cfg.LLM.AgentModel,
 		MaxTurns:   cfg.Agent.MaxTurns,
 		SessionTTL: time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
 	})
 	manager.SetAgent(agentLoop)
+
+	// 反馈服务（M5 契约 §13）：装在 agent 之后——Notifier 就是 agentLoop
+	// （反馈点击要以「[卡片回调]」通告写进当前会话）；同样须在 manager.Start 之前
+	// 注入，否则 WS 连上后的首批卡片点击会落到 nil runner 上。
+	// deep_dive 走质量档 AgentModel（Boss 拍板③）：用户显式请求、低频、长文质量敏感。
+	fbSvc := feedback.New(feedback.Deps{
+		Store:         st,
+		Client:        llmClient,
+		Recorder:      recorder,
+		Sender:        manager,
+		Notifier:      agentLoop,
+		BuildCard:     feishu.BuildDeliveryCard,
+		DeepDiveModel: cfg.LLM.AgentModel,
+	})
+	manager.SetFeedback(fbSvc)
 
 	// 依赖就绪后再拉飞书 WS 连接：无配置静默待命，ctx 取消时断开。
 	manager.Start(ctx)

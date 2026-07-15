@@ -12,10 +12,15 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-// PushPipelineWorkflow 是推送管道的编排：Fetch→Dedup→Score→Select→CardGen→Push
-// 六步顺序执行，每步一个 Activity。函数体只做编排与纯计算，所有 I/O 在 Activity 内
-// （Temporal 确定性约束）。任一步失败即整体失败（由各步 RetryPolicy 先行重试）；
+// PushPipelineWorkflow 是推送管道的编排：EvolveProfile 前置步（失败只 Warn 不阻断）
+// 之后 Fetch→Dedup→Score→Select→CardGen→Push 六步顺序执行，每步一个 Activity。
+// 函数体只做编排与纯计算，所有 I/O 在 Activity 内（Temporal 确定性约束）。
+// 六主步任一失败即整体失败（由各步 RetryPolicy 先行重试）；
 // 中途"无内容可推"是正常终态，直接成功返回、不视为错误。
+//
+// Temporal 兼容（契约 §8.2）：EvolveProfile 插入与 Push 入参变更对 in-flight
+// workflow 是非确定性变更；推送是秒级短工作流，发布窗口避开 08:30 定时任务
+// 即可，刻意不做版本化。
 func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	log := workflow.GetLogger(ctx)
 
@@ -33,6 +38,13 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// a 仅用于让 ExecuteActivity 通过方法值解析出 Activity 名字；Temporal 按名
 	// 路由到 worker 注册的真实实例，nil 接收者不会被解引用（标准用法）。
 	var a *Activities
+
+	// 0. EvolveProfile —— 画像演化前置步（Boss 拍板①：每次推送前批量消费反馈）。
+	// 红线：演化失败永不阻断推送——重试耗尽后错误吞掉只 Warn，pipeline 照常走。
+	evolveCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
+	if err := workflow.ExecuteActivity(evolveCtx, a.EvolveProfile, EvolveIn{UserID: p.UserID, TraceID: traceID}).Get(evolveCtx, nil); err != nil {
+		log.Warn("画像演化失败，继续推送", "user_id", p.UserID, "trace_id", traceID, "err", err)
+	}
 
 	// 1. Fetch —— 网络 I/O。
 	var items []types.ContentItem
