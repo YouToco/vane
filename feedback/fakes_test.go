@@ -27,7 +27,13 @@ const (
 	testMsgID            = "om_delivery_42"
 	testBodyMD           = "**解读标题**\n一句话摘要。\n[阅读原文](https://example.com/a)"
 	testTitle            = "示例内容标题"
-	testContent          = "示例正文内容。"
+	// testContent 必须长于 deepDiveMinRunes（178 rune > 150）：默认 harness 代表
+	// 一条"正文健全、值得深度解读"的内容，否则证据闸门会把每条 deep_dive 测试
+	// 都挡在生成之前，幂等/落库/送达全都测不到。要测闸门本身请显式改短这个字段
+	// （见 TestHandleDeepDive_ShortContentGate），别把默认值改短。
+	testContent = "示例正文内容。这是一条用于测试的资讯正文，长度刻意超过深度解读的证据闸门下限 deepDiveMinRunes，" +
+		"以便默认装配的这条内容能走完整的生成路径。闸门只看正文 rune 数，所以这里必须是一段足够长的真实段落，" +
+		"而不是一句话占位符——否则默认 harness 里每条 deep_dive 测试都会被闸门挡在生成之前，测的就不再是它们各自想测的东西了。"
 )
 
 func notFoundErr(msg string) error   { return types.NewAppError(types.CodeNotFound, msg, nil) }
