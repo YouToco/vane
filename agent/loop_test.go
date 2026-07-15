@@ -28,6 +28,7 @@ type fakeStore struct {
 
 	profiles      map[int64]*types.Profile
 	profileGetErr error                 // 注入 GetProfile 的非 NotFound 失败
+	upsertErr     error                 // 注入 UpsertProfileFields 的失败
 	upsertCalls   []upsertProfileRecord // UpsertProfileFields 入参留痕，断言截断与 nil 语义
 
 	updateCalls   int
@@ -80,6 +81,9 @@ func (f *fakeStore) UpsertProfileFields(_ context.Context, userID int64, industr
 	f.upsertCalls = append(f.upsertCalls, upsertProfileRecord{
 		userID: userID, industry: industry, occupation: occupation, tags: tags,
 	})
+	if f.upsertErr != nil {
+		return nil, f.upsertErr
+	}
 	p, ok := f.profiles[userID]
 	if !ok {
 		p = &types.Profile{UserID: userID}
