@@ -1,5 +1,6 @@
 // Package workflow 定义见微 Vane 的推送管道：一个可被 Temporal 直接触发的
-// PushPipelineWorkflow（Fetch→Dedup→Score→Select→CardGen→Push 六步）及其 Activity。
+// PushPipelineWorkflow（EvolveProfile 前置步 + Fetch→Dedup→Score→Select→
+// CardGen→Push 六步）及其 Activity。
 //
 // 设计铁律（Temporal 确定性约束）：
 //   - workflow 函数体只做编排（ExecuteActivity + 纯计算），绝不直接碰 HTTP/DB；
@@ -34,9 +35,13 @@ type PushScope struct {
 	TopN      int     `json:"top_n,omitempty"`      // 每批最多推几条；0=defaultTopN
 }
 
-// GeneratedCard 是生成解读后的推送卡片（CardGen→Push 之间传递）。
+// GeneratedCard 是生成解读后的推送载荷（CardGen→Push 之间传递）。
 // 保留 Scored 是因为 Push 建 Delivery 时要回填 score 与 content_item_id。
 type GeneratedCard struct {
-	Scored   types.ScoredItem `json:"scored"`
-	CardJSON string           `json:"card_json"` // 飞书交互卡片 JSON 字符串
+	Scored types.ScoredItem `json:"scored"`
+	// BodyMD 解读正文 markdown（含阅读原文行）。最终卡片 JSON 由 Push 在拿到
+	// delivery_id 后经注入的 buildCard 构造。json tag 沿用 "card_json"：换 tag
+	// 会让停在 CardGen 之后的 in-flight workflow 重放时解出空正文、静默推空卡
+	// （契约 §8.2 重放兼容）。
+	BodyMD string `json:"card_json"`
 }

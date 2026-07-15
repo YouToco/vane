@@ -19,6 +19,7 @@ import (
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"github.com/YouToco/vane/agent"
+	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -32,6 +33,16 @@ type AgentRunner interface {
 	HandleMessage(ctx context.Context, userID int64, text string) (agent.Outcome, error)
 	ExecuteAction(ctx context.Context, userID int64, actionID string) (string, error)
 	CancelAction(ctx context.Context, userID int64, actionID string) (string, error)
+}
+
+// FeedbackRunner 是 feishu 对 feedback 服务的窄依赖面（M5 契约 §10.4）：
+// 推送卡按钮点击 + 追问识别。同 AgentRunner 的形态——feedback 不 import feishu
+// （构卡与发送都靠注入），依赖单向、无环。
+type FeedbackRunner interface {
+	HandleClick(ctx context.Context, userID int64, click feedback.Click) (feedback.ClickResult, error)
+	// WrapQuestion 尝试把"回复推送卡"的消息识别为追问并包装上下文；
+	// matched=false 时调用方按普通消息原样处理。
+	WrapQuestion(ctx context.Context, userID int64, parentMsgID, rootMsgID, text string) (wrapped string, matched bool)
 }
 
 // settings 表的两个已知 key（契约 §1）。导出供 api 层写入时复用，
@@ -91,6 +102,10 @@ type Manager struct {
 	// 由 mu 保护：注入发生在 main 装配期，但 handler goroutine 并发读。
 	agent AgentRunner
 
+	// feedback 是推送卡反馈与追问的入口（SetFeedback 注入）；nil 时反馈按钮
+	// 点击静默忽略、追问降级为普通消息——同 agent 的可选注入语义。
+	feedback FeedbackRunner
+
 	// captureMu 串行化 owner 捕获的 check-then-act（见 handler.captureOwnerIfFirst）。
 	captureMu sync.Mutex
 
@@ -139,6 +154,46 @@ func (m *Manager) agentRunner() AgentRunner {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.agent
+}
+
+// SetFeedback 注入反馈服务（main 装配期、Start 之前调用）。与 SetAgent 同构：
+// feedback 的构造依赖 agentLoop（Notifier），故只能在 agent 之后注入。
+func (m *Manager) SetFeedback(f FeedbackRunner) {
+	m.mu.Lock()
+	m.feedback = f
+	m.mu.Unlock()
+}
+
+// feedbackRunner 返回已注入的反馈服务；nil 表示未注入。
+func (m *Manager) feedbackRunner() FeedbackRunner {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.feedback
+}
+
+// ReplyMarkdown 以回复形式在指定消息下发一张 markdown 卡（深度解读结果送达用，
+// M5 契约 §10.4）。与 handler.reply 的差异只在可从任意 goroutine 调用：
+// 深度解读的异步生成结束时早已脱离原回调链。
+func (m *Manager) ReplyMarkdown(ctx context.Context, parentMessageID, markdown string) error {
+	api := m.api()
+	if api == nil {
+		return types.NewAppError(types.CodeInternal, "飞书未连接，无法发送消息", nil)
+	}
+	resp, err := api.Im.Message.Reply(ctx, larkim.NewReplyMessageReqBuilder().
+		MessageId(parentMessageID).
+		Body(larkim.NewReplyMessageReqBodyBuilder().
+			MsgType(larkim.MsgTypeInteractive).
+			Content(BuildReplyCard(markdown)).
+			Build()).
+		Build())
+	if err != nil {
+		return types.NewAppError(types.CodeInternal, "回复飞书消息失败", err)
+	}
+	if !resp.Success() {
+		return types.NewAppError(types.CodeInternal,
+			fmt.Sprintf("回复飞书消息失败（code=%d）: %s", resp.Code, resp.Msg), nil)
+	}
+	return nil
 }
 
 // Start 读取 settings 并在有配置且 enabled 时建立 WS 连接；无配置静默待命。

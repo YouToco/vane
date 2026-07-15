@@ -83,6 +83,7 @@ type Delivery struct {
 	UserID          int64           `json:"user_id"`
 	ContentItemID   *int64          `json:"content_item_id,omitempty"` // 可空：原内容已被清理
 	Score           float64         `json:"score"`                     // NUMERIC NOT NULL：Delivery 在打分之后才创建，恒有值
+	BodyMD          string          `json:"body_md"`                   // 解读正文 markdown（含阅读原文行）
 	CardJSON        json.RawMessage `json:"card_json"`                 // JSONB，飞书交互卡片
 	FeishuMessageID string          `json:"feishu_message_id"`         // 发送成功后回填
 	Status          DeliveryStatus  `json:"status"`
@@ -100,19 +101,29 @@ type Feedback struct {
 	CreatedAt  time.Time      `json:"created_at"`
 }
 
+// FeedbackWithContent 演化输入行（读模型，非表映射）：Feedback JOIN 出当时打分与
+// 内容最小上下文。内容被 TTL 清理时 ContentTitle/ContentExcerpt 空串。
+type FeedbackWithContent struct {
+	Feedback
+	Score          float64 `json:"score"`
+	ContentTitle   string  `json:"content_title"`
+	ContentExcerpt string  `json:"content_excerpt"` // 正文前 200 字符（SQL left()）
+}
+
 // Profile 用户画像与 token 预算（profiles 表），user_id UNIQUE（1:1）。
 type Profile struct {
-	ID               int64     `json:"id"`
-	UserID           int64     `json:"user_id"`
-	Industry         string    `json:"industry"`
-	Occupation       string    `json:"occupation"`
-	Tags             []string  `json:"tags"` // TEXT[] DEFAULT '{}'
-	Summary          string    `json:"summary"`
-	TokenBudgetDaily int       `json:"token_budget_daily"` // NOT NULL DEFAULT 100000
-	TokensUsedToday  int       `json:"tokens_used_today"`  // NOT NULL DEFAULT 0
-	TokenResetAt     time.Time `json:"token_reset_at"`     // NOT NULL
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID                    int64     `json:"id"`
+	UserID                int64     `json:"user_id"`
+	Industry              string    `json:"industry"`
+	Occupation            string    `json:"occupation"`
+	Tags                  []string  `json:"tags"` // TEXT[] DEFAULT '{}'
+	Summary               string    `json:"summary"`
+	TokenBudgetDaily      int       `json:"token_budget_daily"`       // NOT NULL DEFAULT 100000
+	TokensUsedToday       int       `json:"tokens_used_today"`        // NOT NULL DEFAULT 0
+	TokenResetAt          time.Time `json:"token_reset_at"`           // NOT NULL
+	LastEvolvedFeedbackID int64     `json:"last_evolved_feedback_id"` // 演化游标：已消费到的最大 feedbacks.id
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 // LLMCall 单次 LLM 调用记录（llm_calls 表，Step 6 可观测性核心）。
@@ -120,7 +131,7 @@ type Profile struct {
 type LLMCall struct {
 	ID               int64     `json:"id"`
 	TraceID          string    `json:"trace_id"`
-	SpanName         string    `json:"span_name"`         // 调用环节：score/cardgen/summarize/feedback_interpret/quality_check
+	SpanName         string    `json:"span_name"`         // 调用环节：score/cardgen/summarize/feedback_interpret/quality_check/profile_evolve/deep_dive
 	UserID           *int64    `json:"user_id,omitempty"` // 可空：系统级调用无归属用户；刻意不建 FK
 	RefType          RefType   `json:"ref_type"`
 	RefID            *int64    `json:"ref_id,omitempty"` // 可空（索引 WHERE ref_id IS NOT NULL）

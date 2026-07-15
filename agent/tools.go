@@ -28,6 +28,13 @@ type PushTrigger interface {
 	TriggerPushNow(ctx context.Context, userID int64) (runID string, err error)
 }
 
+// profileStore 是画像两工具依赖的窄接口（M5 契约 §12.3，*store.Store 已实现），
+// 收窄后 Execute 分支可用内存假实现覆盖，不依赖数据库。
+type profileStore interface {
+	GetProfile(ctx context.Context, userID int64) (*types.Profile, error)
+	UpsertProfileFields(ctx context.Context, userID int64, industry, occupation *string, tags []string) (*types.Profile, error)
+}
+
 // BuildTools 装配 agent 全部可用工具。返回的切片即工具白名单（契约 §10）：
 // loop 只认这里注册的名字，模型编造的工具名一律拒绝。
 func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger) []Tool {
@@ -39,6 +46,8 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger)
 		&createScheduleTool{sched: sched},
 		&removeScheduleTool{sched: sched},
 		&pushNowTool{pusher: pusher},
+		&viewProfileTool{st: st},
+		&updateProfileTool{st: st},
 	}
 }
 
@@ -499,3 +508,163 @@ func (t *pushNowTool) Execute(ctx context.Context, userID int64, _ json.RawMessa
 }
 
 func (t *pushNowTool) Summarize(json.RawMessage) string { return "" }
+
+// ============================================================
+// view_profile：读工具，查看当前用户画像（M5 契约 §12.3）。
+// ============================================================
+
+type viewProfileTool struct {
+	st profileStore
+}
+
+func (t *viewProfileTool) Name() string { return "view_profile" }
+func (t *viewProfileTool) Description() string {
+	return "查看用户当前画像（行业、职业、关注标签、摘要）。修改画像前应先调用本工具取现有标签，合并后再提交。"
+}
+func (t *viewProfileTool) Parameters() json.RawMessage { return json.RawMessage(emptyParamsSchema) }
+func (t *viewProfileTool) Mutating() bool              { return false }
+
+// Execute NotFound 回固定引导文案（契约 §12.3 锁死文本）而非报错：画像为空是
+// 常态起点，systemPrompt 会驱动模型据此自然引导首采。
+func (t *viewProfileTool) Execute(ctx context.Context, userID int64, _ json.RawMessage) (string, error) {
+	p, err := t.st.GetProfile(ctx, userID)
+	if err != nil {
+		if errors.Is(err, types.ErrNotFound) {
+			return "画像为空：还不了解你。可以告诉我你的行业、职业和关注的主题。", nil
+		}
+		return "", err
+	}
+	return "当前画像——" + renderProfile(p), nil
+}
+
+func (t *viewProfileTool) Summarize(json.RawMessage) string { return "" }
+
+// ============================================================
+// update_profile：写工具，画像首采（2.1）与人工修正（2.3）共用，走 M4 标准确认卡
+// （首采不特例：AI 出预填、人点执行的不变式对写画像同样成立）。
+// summary 刻意不在工具面：归演化独有；标签删除只在这里发生（演化只增不减）。
+// ============================================================
+
+// maxProfileTags 人工标签上限（契约 §2：与库内/演化上限统一为 12，超 12 截前 12——
+// 截断而非报错，人工整体替换不得静默丢演化标签，也不得因超限整次作废）。
+const maxProfileTags = 12
+
+const updateProfileSchema = `{
+  "type": "object",
+  "properties": {
+    "industry": {"type": "string", "description": "所在行业，省略表示不修改"},
+    "occupation": {"type": "string", "description": "职业/岗位，省略表示不修改"},
+    "tags": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "关注标签列表，整体替换现有标签：先用 view_profile 取现有标签、合并后完整提供（缺了的会被删除），最多 12 个；省略表示不修改"
+    }
+  }
+}`
+
+// updateProfileArgs 以指针/nil 切片区分「省略=不改」与「显式置空」，
+// 与 store.UpsertProfileFields 的 nil 语义一一对应。
+type updateProfileArgs struct {
+	Industry   *string  `json:"industry"`
+	Occupation *string  `json:"occupation"`
+	Tags       []string `json:"tags"`
+}
+
+type updateProfileTool struct {
+	st profileStore
+}
+
+func (t *updateProfileTool) Name() string { return "update_profile" }
+func (t *updateProfileTool) Description() string {
+	return "更新用户画像：行业、职业、关注标签。tags 是整体替换，提交前先用 view_profile 查看现有标签并合并；省略的字段保持不变。"
+}
+func (t *updateProfileTool) Parameters() json.RawMessage {
+	return json.RawMessage(updateProfileSchema)
+}
+func (t *updateProfileTool) Mutating() bool { return true }
+
+// Execute（确认后执行）：全缺省是确定性可自纠失败，回文案不触库；
+// UpsertProfileFields 部分更新（nil 不改），不触碰 summary/游标/token 三件套。
+func (t *updateProfileTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
+	var a updateProfileArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return "参数不是合法 JSON，请修正后重试", nil
+	}
+	if a.Industry == nil && a.Occupation == nil && a.Tags == nil {
+		return "没有提供任何要修改的字段，请至少提供 industry、occupation、tags 之一", nil
+	}
+	p, err := t.st.UpsertProfileFields(ctx, userID, a.Industry, a.Occupation, capProfileTags(a.Tags))
+	if err != nil {
+		return "", err
+	}
+	return "画像已更新。当前画像——" + renderProfile(p), nil
+}
+
+// Summarize 只列提供的字段（契约 §12.3）：确认卡如实展示本次会改什么，
+// 未提供的字段绝不出现——「不改」与「清空」在卡面上必须可区分。
+func (t *updateProfileTool) Summarize(args json.RawMessage) string {
+	var a updateProfileArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return summarizeFallback("更新画像", args)
+	}
+	var parts []string
+	if a.Industry != nil {
+		parts = append(parts, profileFieldChange("行业", *a.Industry))
+	}
+	if a.Occupation != nil {
+		parts = append(parts, profileFieldChange("职业", *a.Occupation))
+	}
+	if a.Tags != nil {
+		if tags := capProfileTags(a.Tags); len(tags) == 0 {
+			parts = append(parts, "清空关注标签")
+		} else {
+			// 展示截断后的实际生效值：卡面列 13 个而只落 12 个是对用户撒谎。
+			parts = append(parts, "关注标签整体替换为「"+strings.Join(tags, "、")+"」")
+		}
+	}
+	if len(parts) == 0 {
+		return "更新画像（未提供任何字段，确认后不会有变更）"
+	}
+	return "更新画像：" + strings.Join(parts, "；")
+}
+
+// capProfileTags 超 12 截前 12。nil 原样透传：nil=不改，截断不得把它变成非 nil 置空。
+func capProfileTags(tags []string) []string {
+	if len(tags) > maxProfileTags {
+		return tags[:maxProfileTags]
+	}
+	return tags
+}
+
+// profileFieldChange 渲染单字段变更描述；空串是显式清空，卡面要说人话。
+func profileFieldChange(name, v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "清空" + name
+	}
+	return name + "改为「" + v + "」"
+}
+
+// renderProfile 把画像渲染成给模型/用户看的中文单段（view_profile 与 update_profile
+// 结果共用）。行业/职业/标签为空时显式标注「未设置」：模型据此知道缺什么、该引导
+// 采集什么；summary 归演化独有，为空整段省略，不引导模型对它下手。
+func renderProfile(p *types.Profile) string {
+	var b strings.Builder
+	b.WriteString("行业：" + orUnset(p.Industry))
+	b.WriteString("；职业：" + orUnset(p.Occupation))
+	if len(p.Tags) > 0 {
+		b.WriteString("；关注标签：" + strings.Join(p.Tags, "、"))
+	} else {
+		b.WriteString("；关注标签：（未设置）")
+	}
+	if s := strings.TrimSpace(p.Summary); s != "" {
+		b.WriteString("；摘要：" + s)
+	}
+	return b.String()
+}
+
+func orUnset(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "（未设置）"
+	}
+	return s
+}
