@@ -48,21 +48,28 @@ type Subscription struct {
 	CreatedAt time.Time          `json:"created_at"`
 }
 
-// ContentItem 抓取到的内容条目（content_items 表），UNIQUE(source_id, external_id)。
+// ContentItem 抓取到的内容条目（content_items 表），UNIQUE(canonical_key)。
 // content_hash 精确去重，simhash 近似去重（72h 窗口）。
+//
+// 007 起内容身份全局唯一（不再 per-source）：SourceID / ExternalID 语义变为「首发源」
+// ——谁最先发现这条内容；"哪些源见过这条内容"由 content_sources 关联表承载。
 type ContentItem struct {
-	ID          int64      `json:"id"`
-	SourceID    int64      `json:"source_id"`
-	ExternalID  string     `json:"external_id"` // 源内唯一 ID（RSS guid / 平台条目 ID）
-	URL         string     `json:"url"`
-	Title       string     `json:"title"`
-	Content     string     `json:"content"`
-	Author      string     `json:"author"`
-	PublishedAt *time.Time `json:"published_at,omitempty"` // 源未提供发布时间时为 NULL
-	ContentHash string     `json:"content_hash"`           // NOT NULL
-	Simhash     *int64     `json:"simhash,omitempty"`      // BIGINT，可空（未计算时为 NULL）
-	FetchedAt   time.Time  `json:"fetched_at"`
-	CreatedAt   time.Time  `json:"created_at"`
+	ID         int64  `json:"id"`
+	SourceID   int64  `json:"source_id"`   // 首发源（007 起语义）
+	ExternalID string `json:"external_id"` // 首发源给的源内 ID（RSS guid / 平台条目 ID）
+	// CanonicalKey 是内容的跨源唯一身份，由 fetcher 按源类型构造（rss/exa=url、
+	// tikhub_xhs=note_id）。不能用单一字段通吃：BBC 更新文章会换 guid（url 稳定）、
+	// 小红书 url 带每次刷新的 xsec_token（note_id 稳定），两者恰好相反。
+	CanonicalKey string     `json:"canonical_key"`
+	URL          string     `json:"url"`
+	Title        string     `json:"title"`
+	Content      string     `json:"content"`
+	Author       string     `json:"author"`
+	PublishedAt  *time.Time `json:"published_at,omitempty"` // 源未提供发布时间时为 NULL
+	ContentHash  string     `json:"content_hash"`           // NOT NULL
+	Simhash      *int64     `json:"simhash,omitempty"`      // BIGINT，可空（未计算时为 NULL）
+	FetchedAt    time.Time  `json:"fetched_at"`
+	CreatedAt    time.Time  `json:"created_at"`
 }
 
 // PushBatch 一次推送决策周期（push_batches 表）。

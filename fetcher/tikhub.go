@@ -66,17 +66,22 @@ const (
 	tikhubEnrichBudget = 40 * time.Second
 )
 
-// SeenChecker 报告哪些 external_id **已入库且正文已补全**（生产实现是 *store.Store）。
+// SeenChecker 报告哪些 canonical_key **已入库且正文已补全**（生产实现是 *store.Store）。
 //
 // 存在的理由：详情接口 $0.01/次，已经拿到全文的笔记不该每轮重复付费。
 // 抓取器本身没有 DB 访问（去重发生在 workflow 活动层），因此只注入这一个窄方法，
 // 而不是把整个 store 拖进 fetcher。
 //
+// 按 **canonical_key 而非 (source_id, external_id)** 查是 M5 多用户重构的关键：
+// 内容身份全局化后，"哪些笔记已补全"是全局事实，不该按源各问一遍——否则用户 A 的
+// 「AI编程」补全过的笔记，用户 B 的「AI工具」搜到同一条时会被当成新笔记再付一次钱
+// （跨源重复，多用户才暴露）。去掉 sourceID 入参正是为了让这种误用无法表达。
+//
 // 判据是**正文长度**而非"行是否存在"：补全会失败（429/抖动/风控），失败的笔记
 // 仍以 ≤60 rune 的搜索摘要落库；若按"存在"跳过，一次瞬时 429 就让它终身 60 字
-// 且再无自愈路径（详见 store.EnrichedExternalIDs 的注释）。
+// 且再无自愈路径（详见 store.EnrichedCanonicalKeys 的注释）。
 type SeenChecker interface {
-	EnrichedExternalIDs(ctx context.Context, sourceID int64, externalIDs []string, minRunes int) (map[string]struct{}, error)
+	EnrichedCanonicalKeys(ctx context.Context, keys []string, minRunes int) (map[string]struct{}, error)
 }
 
 // TikHubFetcher 调用 TikHub 小红书搜索。
@@ -227,7 +232,7 @@ func (t *TikHubFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Co
 
 	q := url.Values{}
 	q.Set("keyword", sc.Keyword)
-	q.Set("page", "1") // MVP 单页 20 条；周期抓取下靠 UNIQUE(source_id, external_id) 增量去重
+	q.Set("page", "1") // MVP 单页 20 条；周期抓取下靠 canonical_key 全局唯一增量去重
 	q.Set("sort_type", sort)
 	if sc.NoteType != "" {
 		q.Set("note_type", sc.NoteType)
@@ -301,8 +306,13 @@ func (t *TikHubFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Co
 // desc 继续入库，与补全上线前的行为完全一致，不倒退。这与 Fetch 其余部分"全有或全无"
 // 的语义相反，所以刻意做成无返回值：让"这个函数不该让抓取失败"在签名上就成立。
 //
-// 只对同时满足三个条件的笔记付费：正文尚未补全（长度判定，见 SeenChecker）、
-// desc ≥60 rune（被截断的信号）、有 xsec_token（详情接口必填，空的话稳吃 400 还照样计费）。
+// 只对同时满足三个条件的笔记付费：正文尚未补全（长度判定 + **全局** canonical_key
+// 判定，见 SeenChecker）、desc ≥60 rune（被截断的信号）、有 xsec_token（详情接口
+// 必填，空的话稳吃 400 还照样计费）。
+//
+// "全局"是 M5 的实质改动：闸门查的是 note_id 这个全局身份，不带源号——多用户下
+// 同一篇笔记会同时命中好几个关键词源（A 订「AI编程」、B 订「AI工具」），按源查的话
+// 每个源都认为它是新笔记，$0.01 付 N 次；按全局身份查，第一个源补全后其余源全部命中跳过。
 //
 // **耗时预算**是硬约束而非注释警告：Fetch 活动在**同一个** 120s 的 StartToCloseTimeout
 // 里串行遍历用户的全部到期源，而单条详情最坏要等满 client.Timeout（默认 20s）——
@@ -334,14 +344,20 @@ func (t *TikHubFetcher) enrichDescs(ctx context.Context, src types.Source, items
 		return // 无候选：不查库、不发请求。
 	}
 
-	ids := make([]string, 0, len(cands))
+	// 用 canonical_key（xhs 即 note_id）查闸门，**不带 source_id**。这正是跨源重复
+	// 不再重复付费的地方：用户 A 订「AI编程」时已补全过的笔记，用户 B 订「AI工具」
+	// 搜到同一条时（两个源、同一 note_id）直接命中、跳过详情调用——旧的按
+	// (source_id, external_id) 查做不到这点，B 的源号对不上 A 的行，于是同一篇笔记
+	// 被付两次钱、还在库里存了两份。
+	// 键一律经 xhsKey 构造，与 finalize 落库用的键同源，杜绝归一化漂移导致的全 miss。
+	keys := make([]string, 0, len(cands))
 	for _, n := range cands {
-		ids = append(ids, n.ID)
+		keys = append(keys, xhsKey(n.ID))
 	}
-	seen, err := t.seen.EnrichedExternalIDs(ctx, src.ID, ids, tikhubDetailMinRunes)
+	seen, err := t.seen.EnrichedCanonicalKeys(ctx, keys, tikhubDetailMinRunes)
 	if err != nil {
 		// 查不出新旧就不补：宁可少补一轮，也不为一库老笔记重复付费。
-		slog.Warn("tikhub: 查询已补全 external_id 失败，跳过本轮详情补全",
+		slog.Warn("tikhub: 查询已补全 canonical_key 失败，跳过本轮详情补全",
 			"source_id", src.ID, "candidates", len(cands), "err", err)
 		return
 	}
@@ -349,8 +365,8 @@ func (t *TikHubFetcher) enrichDescs(ctx context.Context, src types.Source, items
 	deadline := time.Now().Add(t.enrichBudget)
 	sent := 0
 	for _, n := range cands {
-		if _, ok := seen[n.ID]; ok {
-			continue // 正文已补全过，不重复付费。
+		if _, ok := seen[xhsKey(n.ID)]; ok {
+			continue // 正文已补全过（可能是别的源、别的用户补的），不重复付费。
 		}
 		// 预算用尽就收手：剩余笔记保留 60 字 desc 入库，下轮重试（见函数注释）。
 		if time.Now().After(deadline) {
@@ -462,8 +478,12 @@ func (t *TikHubFetcher) detailDesc(ctx context.Context, noteID, xsecToken string
 	return card.Desc, nil
 }
 
-// mapTikhubNotes 把笔记映射为 ContentItem，指纹由 finalize 统一补齐。
+// mapTikhubNotes 把笔记映射为 ContentItem，指纹与身份由 finalize 统一补齐。
 // URL 拼 xsec_token（2024 起小红书 web 端直链必带，否则 404），来源标记 pc_search。
+//
+// 注意这个 URL **不能当身份用**：xsec_token 是每次搜索新发的临时票据，同一笔记
+// 两次搜到的 url 不同（实测）。小红书的身份是 note_id，即下面填进 ExternalID 的
+// n.ID，由 CanonicalKey 取用——与 rss/exa 认 url 的规则恰好相反。
 func mapTikhubNotes(src types.Source, items []tikhubSearchItem) []types.ContentItem {
 	now := time.Now().UTC()
 	out := make([]types.ContentItem, 0, len(items))
@@ -490,7 +510,11 @@ func mapTikhubNotes(src types.Source, items []tikhubSearchItem) []types.ContentI
 			PublishedAt: parseUnixSeconds(n.Timestamp),
 			FetchedAt:   now,
 		}
-		finalize(&item)
+		// 上面的 n.ID == "" 已挡掉无身份的笔记，这里是同一判定的第二道
+		// （身份规则只写在 finalize 一处，此处不重复表达）。
+		if !finalize(src, &item) {
+			continue
+		}
 		out = append(out, item)
 	}
 	return out

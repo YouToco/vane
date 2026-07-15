@@ -127,7 +127,9 @@ CREATE TABLE deliveries (
 CREATE INDEX idx_deliveries_batch_id ON deliveries (batch_id);
 -- ListByUser 推送历史
 CREATE INDEX idx_deliveries_user_created ON deliveries (user_id, created_at DESC);
--- 支撑 content_items TTL 批量删除时 ON DELETE SET NULL 的子表反查，避免逐行全表扫描
+-- 原为支撑 content_items TTL 批量删除的子表反查而建。**TTL 已作废**（Boss 决策
+-- 2026-07-15：数据是资产，一律不清理，留存做需求挖掘与信源质量评估，见 007）。
+-- 索引保留，语义改为分析查询用：按内容反查其投递历史（这条被推给过谁、反馈如何）。
 CREATE INDEX idx_deliveries_content_item_id ON deliveries (content_item_id);
 
 -- 反馈表：用户对投递的按钮/文字反馈
@@ -194,7 +196,9 @@ CREATE TABLE llm_calls (
 CREATE INDEX idx_llm_calls_trace_id ON llm_calls (trace_id, created_at);
 -- 多态关联查询（规格索引设计：partial index 排除无关联记录）
 CREATE INDEX idx_llm_calls_ref ON llm_calls (ref_type, ref_id) WHERE ref_id IS NOT NULL;
--- 90 天 TTL 清理按时间扫描
+-- 原为 90 天 TTL 清理按时间扫描而建。**TTL 已作废**（Boss 决策 2026-07-15：数据是
+-- 资产，一律不清理，见 007）。索引保留，语义改为分析查询用：按时间窗口统计 LLM
+-- 调用量与成本。
 CREATE INDEX idx_llm_calls_created_at ON llm_calls (created_at);
 
 -- +goose Down

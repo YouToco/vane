@@ -132,10 +132,20 @@ func (s *Store) ListSubscribedSourcesByUser(ctx context.Context, userID int64) (
 
 // UpsertSource 按 url 幂等地写入信源，返回其 id。
 //
-// 注意：001 未在 sources.url 上建唯一约束，无法用 ON CONFLICT(url)。这里以
-// "先查后写"实现幂等：命中则刷新可变元数据（type/title/config）并复用 id，
-// 未命中则新插入。单 owner MVP 无并发建源场景，先查后写的竞态可接受；若未来
-// 需要并发安全，应在 sources.url 上补唯一索引改用真正的 upsert（见 M3 store 报告）。
+// 007 起靠 uq_sources_url 做真正的原子 upsert（此前是 SELECT-then-INSERT）。换掉的理由
+// 是多用户：两个用户同时添加同一个源，先查后写的两个事务会双双查空、双双插入 ⇒ 重复
+// 信源行 ⇒ 同一内容存两份 + 每轮重复抓取重复付费（xhs 详情 $0.01/次）。单 owner MVP
+// 下这个竞态窗口撞不上，按多用户设计后它是必然事件，不是"可接受的竞态"。
+//
+// 沿用先前的取舍不变：
+//   - 命中既有行只刷新可变元数据（type/title/config）与 updated_at，刻意不动抓取状态
+//     （next_fetch_at / last_fetched_at / fail_count / status）与 created_at，
+//     避免重复添加订阅时打乱调度节奏、或让一个新订阅者把源的失败计数洗掉。
+//   - title 用 COALESCE(NULLIF(...))：重复添加不带 title 时保留既有展示名，而非静默
+//     清成空串（代价是无法通过传空串清除 title，可接受）。
+//
+// 新插入时 status / fetch_interval_seconds / next_fetch_at / fail_count 走 001 的 DB
+// 默认值（active / 1800 / now() / 0），调用方无需关心冷启动细节。
 func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (int64, error) {
 	// config NOT NULL DEFAULT '{}'：nil / 空 RawMessage 归一为 '{}'，避免写入 NULL 触发约束。
 	cfg := src.Config
@@ -143,40 +153,24 @@ func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (int64, err
 		cfg = json.RawMessage("{}")
 	}
 
+	// DO UPDATE 而非 DO NOTHING：DO NOTHING 在冲突时不返回行，还得补一次 SELECT；
+	// DO UPDATE 冲突时也 RETURNING id，一次往返拿到结果，且顺带完成元数据刷新。
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`SELECT id FROM sources WHERE url = $1 LIMIT 1`, src.URL).Scan(&id)
-	switch {
-	case err == nil:
-		// 已存在：刷新元数据与 updated_at，刻意不动抓取状态（next_fetch_at/
-		// last_fetched_at/fail_count）与 created_at，避免重复添加订阅时打乱调度节奏。
-		// title 用 COALESCE(NULLIF)：重复添加不带 title 时保留既有展示名，
-		// 而非静默清成空串（代价是无法通过传空串清除 title，可接受）。
-		if _, uerr := s.pool.Exec(ctx,
-			`UPDATE sources SET type = $2, title = COALESCE(NULLIF($3, ''), title),
-			        config = $4, updated_at = now()
-			 WHERE id = $1`,
-			id, src.Type, src.Title, cfg); uerr != nil {
-			return 0, types.NewAppError(types.CodeDatabase,
-				fmt.Sprintf("更新已存在信源（id=%d）", id), uerr)
-		}
-		return id, nil
-	case errors.Is(err, pgx.ErrNoRows):
-		// 不存在：新插入。status / fetch_interval_seconds / next_fetch_at / fail_count
-		// 走 001 的 DB 默认值（active / 1800 / now() / 0），调用方无需关心冷启动细节。
-		if ierr := s.pool.QueryRow(ctx,
-			`INSERT INTO sources (type, url, title, config)
-			 VALUES ($1, $2, $3, $4)
-			 RETURNING id`,
-			src.Type, src.URL, src.Title, cfg).Scan(&id); ierr != nil {
-			return 0, types.NewAppError(types.CodeDatabase,
-				fmt.Sprintf("插入信源（url=%s）", src.URL), ierr)
-		}
-		return id, nil
-	default:
+		`INSERT INTO sources (type, url, title, config)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (url) DO UPDATE
+		 SET type       = EXCLUDED.type,
+		     title      = COALESCE(NULLIF(EXCLUDED.title, ''), sources.title),
+		     config     = EXCLUDED.config,
+		     updated_at = now()
+		 RETURNING id`,
+		src.Type, src.URL, src.Title, cfg).Scan(&id)
+	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("查询信源（url=%s）", src.URL), err)
+			fmt.Sprintf("upsert 信源（url=%s）", src.URL), err)
 	}
+	return id, nil
 }
 
 // UpdateSourceFetchState 抓取完成后同步写 last_fetched_at / next_fetch_at / fail_count。

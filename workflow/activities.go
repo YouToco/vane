@@ -77,7 +77,11 @@ type Store interface {
 	// markFetchResult 成功后推进 next_fetch_at，Activity 超时重试时已抓成功的
 	// Exa/TikHub 付费调用自然被跳过，不重复计费。
 	ListDueSourcesByUser(ctx context.Context, userID int64) ([]types.Source, error)
-	InsertContentItemIfNew(ctx context.Context, item *types.ContentItem) (id int64, isNew bool, err error)
+	// UpsertContentItem 按 canonical_key 落内容（全局一份）再登记本次出现的源
+	// （content_sources）。取代 InsertContentItemIfNew：改名是因为语义变了——
+	// isNew 现在表示**内容本身首次入库**，而非"这个源首次见到"。本包不依赖 isNew
+	// （见 Fetch 里的调用点），故无分支受影响。
+	UpsertContentItem(ctx context.Context, item *types.ContentItem) (id int64, isNew bool, err error)
 	// ListRecentSimhashesByUser 按 user 维度（跨该用户全部订阅源）查 72h simhash 历史
 	// （审查 #跨源去重）：Exa 搜索天然与 RSS 源内容重叠，per-source 历史拦不住
 	// "昨天 RSS 推过、今天 Exa 又抓到"的跨源重复推送。
@@ -204,6 +208,10 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 		sources = filterSources(sources, p.Scope.SourceIDs)
 	}
 
+	// 逐源"抓取→立刻入库"的顺序是**有成本含义**的，别改成"先抓完所有源再统一入库"：
+	// TikHub 详情补全的付费闸门查的是库里已补全的 canonical_key（fetcher.SeenChecker）。
+	// 同一 run 内源 A 补全的笔记当场入库，源 B 抓到同一篇时闸门才命中、跳过付费；
+	// 若把入库推迟到循环之后，源 B 查库时 A 的内容还没落地，同一篇笔记会被重复付费。
 	for _, src := range sources {
 		items, ferr := a.fetcher.Fetch(ctx, src)
 		if ferr != nil {
@@ -214,7 +222,13 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 			continue
 		}
 		for i := range items {
-			if _, _, ierr := a.store.InsertContentItemIfNew(ctx, &items[i]); ierr != nil {
+			// isNew 刻意丢弃：007 起它的语义是"内容本身首次入库"（canonical_key
+			// 全局唯一）而非"这个源首次见到"，跨源命中同一篇时为 false。本活动
+			// 不据此分支——候选一律由下方 ListUnpushedByUser 从 DB 事实重新捞
+			// （修 #3 时就已改成这样），所以语义变化对这里无影响：跨源重复的
+			// 第二份不新建内容行，但 UpsertContentItem 会登记 content_sources，
+			// 用户仍能经自己订阅的源关联到那唯一一份。
+			if _, _, ierr := a.store.UpsertContentItem(ctx, &items[i]); ierr != nil {
 				// 单条入库失败只 warn：已入库的其它条目仍会被后面的 ListUnpushedByUser 捞出。
 				slog.Warn("fetch: 内容入库失败，跳过", "source_id", src.ID, "err", ierr)
 			}
@@ -254,7 +268,7 @@ func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok b
 	}
 }
 
-// Dedup 做近似去重：精确去重（content_hash）已在 Fetch 的 InsertContentItemIfNew
+// Dedup 做近似去重：精确去重（canonical_key）已在 Fetch 的 UpsertContentItem
 // 完成，本步用 simhash + 72h 窗口过滤"改标题/转载"式近重复。跨批用 store 里的
 // 历史 simhash（user 维度、跨全部订阅源——审查 #跨源去重：Exa 搜索天然与 RSS 源
 // 内容重叠，per-source 历史拦不住"昨天 RSS 推过、今天 Exa 又抓到"的跨源同稿），

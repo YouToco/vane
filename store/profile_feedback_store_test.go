@@ -287,16 +287,20 @@ func TestFeedbackStore(t *testing.T) {
 
 	newContent := func(t *testing.T, title, content string) int64 {
 		t.Helper()
-		id, _, err := st.InsertContentItemIfNew(ctx, &types.ContentItem{
-			SourceID:    srcID,
-			ExternalID:  "m5-" + uuid.NewString(),
-			URL:         "https://example.com/m5-item",
-			Title:       title,
-			Content:     content,
-			ContentHash: "m5hash-" + uuid.NewString(),
+		// CanonicalKey 每条唯一：007 起 content_items 按 canonical_key 全局唯一，
+		// 留空会让所有 fixture 撞在同一个空串上 —— 第二条起静默返回首条的 id
+		// （UpsertContentItem 冲突即回查），newContent 就再也建不出第二条内容。
+		id, _, err := st.UpsertContentItem(ctx, &types.ContentItem{
+			SourceID:     srcID,
+			ExternalID:   "m5-" + uuid.NewString(),
+			CanonicalKey: "https://example.com/m5-item-" + uuid.NewString(),
+			URL:          "https://example.com/m5-item",
+			Title:        title,
+			Content:      content,
+			ContentHash:  "m5hash-" + uuid.NewString(),
 		})
 		if err != nil {
-			t.Fatalf("InsertContentItemIfNew() 失败: %v", err)
+			t.Fatalf("UpsertContentItem() 失败: %v", err)
 		}
 		return id
 	}

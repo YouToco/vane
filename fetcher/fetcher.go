@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -184,6 +185,9 @@ func mapItems(src types.Source, items []*gofeed.Item) []types.ContentItem {
 			continue
 		}
 		// external_id 用 GUID 兜底 Link：部分源不给 guid，link 作为源内唯一键。
+		// 注意 external_id 自 007 起**不再是身份**（BBC 给同一篇文章发多个 guid，
+		// 生产 13 组冗余全是 url 相同、guid 不同），只作为源侧原始 ID 留档；
+		// 身份是 finalize 算出的 canonical_key（rss 认 url，见 CanonicalKey）。
 		externalID := it.GUID
 		if externalID == "" {
 			externalID = it.Link
@@ -204,7 +208,10 @@ func mapItems(src types.Source, items []*gofeed.Item) []types.ContentItem {
 			PublishedAt: it.PublishedParsed,
 			FetchedAt:   now,
 		}
-		finalize(&item)
+		// 无 link 的条目在此被丢弃：rss 的身份就是 url，没有 url 就没有身份。
+		if !finalize(src, &item) {
+			continue
+		}
 		out = append(out, item)
 	}
 	return out
@@ -234,23 +241,50 @@ func noRedirect(_ *http.Request, _ []*http.Request) error {
 }
 
 // finalize 为一条抓取到的内容补齐落库前的确定性字段：精确指纹 content_hash、
-// 近似指纹 simhash、以及 external_id 兜底。三个信源类型（RSS/Exa/TikHub）共用此逻辑，
-// 保证指纹计算方式一致——尤其 simhash 必须在抓取时就写入 content_items，Dedup 的
-// 排除自撞（查历史 simhash 时排除本批 ID）才成立。调用方只需填好业务字段。
-func finalize(item *types.ContentItem) {
+// 近似指纹 simhash、全局身份 canonical_key、以及 external_id 兜底。三个信源类型
+// （RSS/Exa/TikHub）共用此逻辑，保证计算方式一致——尤其 simhash 必须在抓取时就
+// 写入 content_items，Dedup 的排除自撞（查历史 simhash 时排除本批 ID）才成立。
+// 调用方只需填好业务字段。
+//
+// 需要 src 是因为 canonical_key 按信源类型分派（rss/exa 认 url、tikhub_xhs 认
+// note_id，见 CanonicalKey）——身份不是内容自己能决定的，得知道它从哪来。
+//
+// 返回 false 表示**这条必须丢弃**，三个 map 函数一律 continue（契约 §5）。做成
+// 返回值而非让调用方自己查 CanonicalKey，是为了让"忘了判空"这件事写不出来。
+//
+// 顺序有依赖，不能重排：content_hash 先算（external_id 兜底要用它）；canonical_key
+// 必须在 external_id 兜底**之前**算，否则 xhs 缺 note_id 时会拿到 content_hash 兜底
+// 出来的假身份——正文一改就变，同一笔记长出 N 份，而判空分支永远不触发。
+func finalize(src types.Source, item *types.ContentItem) bool {
 	if item.FetchedAt.IsZero() {
 		item.FetchedAt = time.Now().UTC()
 	}
-	// 精确指纹：让 content_hash 列真正可用（UNIQUE 精确去重依赖它）。
+	// 精确指纹：让 content_hash 列真正可用（同文去重依赖它）。
 	item.ContentHash = dedup.ContentHash(*item)
 	// 近似指纹：72h 跨批近似去重依赖它，抓取时即落库。
 	sh := dedup.Simhash(item.Title + " " + item.Content)
 	item.Simhash = &sh
-	// 无自然外部 ID 时用 content_hash 派生稳定键，
-	// 避免空串在 UNIQUE(source_id, external_id) 上静默冲突吞条目（001 的设计约束）。
+
+	// 全局身份：落库前就必须定好。M5 起内容按 canonical_key 全局唯一（同一篇
+	// 只存一份），留给 store 或调用方补算就会出现"有的行有键有的行没键"。
+	item.CanonicalKey = CanonicalKey(src, *item)
+	if item.CanonicalKey == "" {
+		// 宁可丢一条也不能让空串落库：canonical_key 上有 UNIQUE，两条各自缺身份
+		// 字段的内容会双双算出空串、在唯一索引上互撞而被判成同一条。把两篇无关内容
+		// 合并是不可逆的数据损坏（投递指向错的原文、信源统计口径被污染），
+		// 丢一条只是这轮少推一条，下轮源补上字段就自愈。
+		slog.Warn("fetcher: 内容缺少身份字段（rss/exa 需 url、xhs 需 note_id），跳过该条",
+			"source_id", src.ID, "type", src.Type, "url", item.URL, "title", item.Title)
+		return false
+	}
+
+	// 无自然外部 ID 时用 content_hash 派生稳定键，避免空串在源内唯一约束上
+	// 静默冲突吞条目（001 的设计约束）。注意这是**留档字段**不是身份：007 起
+	// external_id 只作为"该源给这条内容的 id"存进 content_sources 供溯源。
 	if item.ExternalID == "" {
 		item.ExternalID = item.ContentHash
 	}
+	return true
 }
 
 // authorName 从 gofeed 条目提取作者名。Author 已被 gofeed 标记 deprecated，

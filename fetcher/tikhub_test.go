@@ -216,25 +216,30 @@ var fullDesc = truncatedDesc + strings.Repeat("这是搜索接口给不了的正
 
 // fakeSeen 是 SeenChecker 的测试替身，记录调用次数以便断言"未入库判定确实走了"。
 type fakeSeen struct {
-	existing map[string]struct{} // 视为**已入库且正文已补全**的 external_id
+	existing map[string]struct{} // 视为**已入库且正文已补全**的 canonical_key（xhs 即 note_id）
 	err      error               // 非 nil 时模拟查库失败
 	calls    int
-	lastMin  int // 最近一次调用收到的 minRunes，供断言口径一致
+	lastMin  int      // 最近一次调用收到的 minRunes，供断言口径一致
+	lastKeys []string // 最近一次调用收到的键，供断言"查的是全局身份、不掺源号"
 }
 
-// EnrichedExternalIDs 对齐生产语义：只报"已入库**且**正文长于 minRunes"的。
+// EnrichedCanonicalKeys 对齐生产语义：只报"已入库**且**正文长于 minRunes"的。
 // 假实现直接用 existing 集合表达该判定结果——测试关心的是 fetcher 拿到集合后
 // 的行为，长度判定本身由 store 的 DB 门控测试覆盖。
-func (f *fakeSeen) EnrichedExternalIDs(_ context.Context, _ int64, ids []string, minRunes int) (map[string]struct{}, error) {
+//
+// 注意入参**没有 sourceID**：内容身份全局化后"哪些笔记已补全"是全局事实，
+// 这个替身也据此按 canonical_key 索引，与生产一致。
+func (f *fakeSeen) EnrichedCanonicalKeys(_ context.Context, keys []string, minRunes int) (map[string]struct{}, error) {
 	f.calls++
 	f.lastMin = minRunes
+	f.lastKeys = append([]string(nil), keys...)
 	if f.err != nil {
 		return nil, f.err
 	}
 	out := make(map[string]struct{})
-	for _, id := range ids {
-		if _, ok := f.existing[id]; ok {
-			out[id] = struct{}{}
+	for _, k := range keys {
+		if _, ok := f.existing[k]; ok {
+			out[k] = struct{}{}
 		}
 	}
 	return out, nil
@@ -349,6 +354,15 @@ func TestTikHubFetch_EnrichesNewTruncatedNote(t *testing.T) {
 	if seen.calls != 1 {
 		t.Errorf("期望查一次已入库集合，实际 %d 次", seen.calls)
 	}
+	// 闸门查的必须是 canonical_key，而 xhs 的 canonical_key **就是裸 note_id**
+	// （契约 §5，与 007 回填的 ci.external_id 逐字对齐）。若这里拼了前缀或塞进 url，
+	// 就会和 store 里按 canonical_key 索引的行永远对不上：闸门静默全 miss、每轮重复付费。
+	if len(seen.lastKeys) != 1 || seen.lastKeys[0] != "note0" {
+		t.Errorf("闸门应按裸 note_id（= canonical_key）查，实际收到 %v", seen.lastKeys)
+	}
+	if seen.lastMin != tikhubDetailMinRunes {
+		t.Errorf("minRunes 口径应与截断阈值一致，实际 %d", seen.lastMin)
+	}
 
 	// 核心断言：入库的是详情全文，不是 60 字残句。
 	if items[0].Content != fullDesc {
@@ -393,6 +407,57 @@ func TestTikHubFetch_SkipsDetailForSeenNotes(t *testing.T) {
 	}
 	if items[1].Content != fullDesc {
 		t.Error("新笔记应被补全为详情全文")
+	}
+}
+
+// TestTikHubFetch_SkipsDetailForNoteEnrichedByAnotherSource 是本次重构**唯一**
+// 的省钱证据，也是多用户才暴露的那条：用户 A 订「AI编程」、用户 B 订「AI工具」，
+// 同一篇笔记命中两个不同的源。
+//
+// 旧闸门按 (source_id, external_id) 查：B 的源号对不上 A 补全时写的行，于是同一篇
+// 笔记的详情被付两次钱（$0.01/次），库里还存了两份。新闸门按全局 canonical_key 查，
+// A 补全后 B **一次详情都不该调**。
+//
+// 断言写成"零调用"而非"少调用"：这里没有中间态——命中就是 0 次，漏一点就是全额重付。
+func TestTikHubFetch_SkipsDetailForNoteEnrichedByAnotherSource(t *testing.T) {
+	stub := &tikhubStub{searchBody: tikhubSearchJSON(2, truncatedDesc)}
+	srv := httptest.NewServer(http.HandlerFunc(stub.handler))
+	defer srv.Close()
+
+	// 库里的事实：note0/note1 已由**别的源**（用户 A 的「AI编程」，source_id=101）
+	// 补全过。注意 existing 里只有全局身份，压根没有源号——这正是重点。
+	seen := &fakeSeen{existing: map[string]struct{}{
+		"note0": {},
+		"note1": {},
+	}}
+
+	f := newTestTikHub(srv.URL, seen)
+	// 用户 B 的「AI工具」是另一个源（source_id=202），搜到同样两条笔记。
+	items, err := f.Fetch(context.Background(), xhsSrc(202, `{"keyword":"AI工具"}`))
+	if err != nil {
+		t.Fatalf("Fetch 意外失败: %v", err)
+	}
+
+	if hits := stub.hits(); len(hits) != 0 {
+		t.Errorf("跨源已补全的笔记必须零详情调用（每次 $0.01），实际调了 %d 次: %v", len(hits), hits)
+	}
+	if seen.calls != 1 {
+		t.Errorf("仍应查一次闸门，实际 %d 次", seen.calls)
+	}
+	// 闸门键必须逐字等于 note_id：掺进源号（"202"）跨源命中就无从谈起，
+	// 掺进 url 则会带上每次都不同的 xsec_token、连同源命中都保不住。
+	for _, k := range seen.lastKeys {
+		if k != "note0" && k != "note1" {
+			t.Errorf("闸门键必须是裸 note_id，实得 %q", k)
+		}
+	}
+
+	// 两条都保留搜索摘要入库：跳过补全是"不额外改善"，不是"倒退"。
+	// 真正的全文由 A 那次补全写进了同一 canonical_key 的行（store 侧事实）。
+	for i, it := range items {
+		if it.Content != truncatedDesc {
+			t.Errorf("第 %d 条应保留搜索 desc，实际长度 %d", i, len([]rune(it.Content)))
+		}
 	}
 }
 
