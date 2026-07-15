@@ -30,10 +30,11 @@ func TestMulti_DispatchesByType(t *testing.T) {
 	}))
 	defer xhsSrv.Close()
 
+	// seen 传 nil：本用例只验证按类型分发，不涉及详情补全（nil 会跳过补全）。
 	m := NewMulti(config.FetchConfig{
 		TimeoutSeconds: 10, MaxResponseMB: 1,
 		ExaAPIKey: "k", TikhubAPIKey: "k",
-	})
+	}, nil)
 	// 三个子抓取器分别指向对应假服务端；RSS 放行环回（httptest 监听 127.0.0.1）。
 	m.rss = newTestFetcher()
 	m.exa.searchURL = exaSrv.URL
@@ -61,7 +62,7 @@ func TestMulti_DispatchesByType(t *testing.T) {
 }
 
 func TestMulti_UnknownType(t *testing.T) {
-	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1})
+	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil)
 	_, err := m.Fetch(context.Background(), types.Source{ID: 1, Type: "carrier_pigeon"})
 	if !errors.Is(err, types.ErrValidation) {
 		t.Errorf("未知类型应判 ErrValidation，实际 %v", err)

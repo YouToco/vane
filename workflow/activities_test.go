@@ -106,7 +106,7 @@ func (s *fakeStore) ListDueSourcesByUser(context.Context, int64) ([]types.Source
 	return nil, nil
 }
 
-func (s *fakeStore) InsertContentItemIfNew(context.Context, *types.ContentItem) (int64, bool, error) {
+func (s *fakeStore) UpsertContentItem(context.Context, *types.ContentItem) (int64, bool, error) {
 	return 0, false, nil
 }
 

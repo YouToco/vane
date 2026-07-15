@@ -359,16 +359,20 @@ func TestEvolveIntegration(t *testing.T) {
 		t.Helper()
 		var contentID *int64
 		if title != "" {
-			id, _, err := st.InsertContentItemIfNew(ctx, &types.ContentItem{
-				SourceID:    srcID,
-				ExternalID:  "ev-" + uuid.NewString(),
-				URL:         "https://example.com/ev-item",
-				Title:       title,
-				Content:     "正文：" + title,
-				ContentHash: "evhash-" + uuid.NewString(),
+			// CanonicalKey 每条唯一：007 起 content_items 按 canonical_key 全局唯一，
+			// 留空会让所有 fixture 撞在同一个空串上 —— 第二条起静默返回首条的 id
+			// （UpsertContentItem 冲突即回查），本用例的多条 delivery 会全部指向同一条内容。
+			id, _, err := st.UpsertContentItem(ctx, &types.ContentItem{
+				SourceID:     srcID,
+				ExternalID:   "ev-" + uuid.NewString(),
+				CanonicalKey: "https://example.com/ev-item-" + uuid.NewString(),
+				URL:          "https://example.com/ev-item",
+				Title:        title,
+				Content:      "正文：" + title,
+				ContentHash:  "evhash-" + uuid.NewString(),
 			})
 			if err != nil {
-				t.Fatalf("InsertContentItemIfNew() 失败: %v", err)
+				t.Fatalf("UpsertContentItem() 失败: %v", err)
 			}
 			contentID = &id
 		}

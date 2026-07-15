@@ -92,7 +92,9 @@ func run() error {
 	// 组装推送管道各步依赖，注入 Activities（所有 I/O 只在 activity 内做，满足确定性约束）。
 	// hints 由 scorer 与 cardgen 共享同一实例（M5 契约 §13）：同一 trace 内两者拿到
 	// 同一份画像快照——卡片"为什么与你有关"与打分依据必须是同一个画像。
-	fetch := fetcher.NewMulti(cfg.Fetch)
+	// st 作为 fetcher.SeenChecker 注入：TikHub 详情补全按次计费，只为未入库的新笔记
+	// 付费（见 fetcher.SeenChecker）。传真实 store 而非 nil，否则补全整体被跳过。
+	fetch := fetcher.NewMulti(cfg.Fetch, st)
 	hints := profilehint.NewCache(st)
 	score := scorer.New(llmClient, recorder, st, hints)
 	cards := cardgen.New(llmClient, recorder, hints)
