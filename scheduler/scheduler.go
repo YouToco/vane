@@ -160,12 +160,21 @@ func (s *Scheduler) PushNow(ctx context.Context, userID int64, scope workflow.Pu
 // 确定性 ID 依赖 Temporal 的 WorkflowExecutionAlreadyStarted 把并发钉死为 1：
 // 同一用户同时只有一条 agent 触发的管道在跑，跑完 ID 可复用（默认重用策略）。
 // API 的 PushNow 保持 uuid：按钮触发天然低频，且每次独立 run_id 便于排查。
+//
+// SDK 坑：同 ID workflow 正在运行时 ExecuteWorkflow 默认**不返回错误**，而是静默
+// attach 到现有 execution 并正常返回其 run 句柄——AlreadyStarted 只有显式置
+// WorkflowExecutionErrorWhenAlreadyStarted:true 才会抛出（sdk v1.46.0 internal/client.go），
+// 否则下方拒绝分支永远走不到，重复触发会返回与成功相同的文案。
 func (s *Scheduler) TriggerPushNow(ctx context.Context, userID int64) (string, error) {
 	params := workflow.PushParams{UserID: userID, Scope: workflow.PushScope{}}
 	run, err := s.c.ExecuteWorkflow(ctx,
 		client.StartWorkflowOptions{
 			ID:        fmt.Sprintf("push-agent-%d", userID),
 			TaskQueue: s.tq,
+			// 见函数注释：不置 true 则同 ID 在跑时 SDK 静默 attach，并发护栏失效。
+			// 不影响"跑完 ID 复用"：默认 WorkflowIDReusePolicy=AllowDuplicate 允许
+			// 对已完成的同 ID re-run，本开关只在策略禁止 re-run 时才报错。
+			WorkflowExecutionErrorWhenAlreadyStarted: true,
 		},
 		workflow.PushPipelineWorkflow, params)
 	if err != nil {

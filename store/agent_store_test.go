@@ -243,18 +243,22 @@ func TestAgentStore(t *testing.T) {
 			t.Fatalf("CreatePendingAction() 失败: %v", err)
 		}
 		// 越权取消（错误 userID）：拒绝且动作保持 pending。
-		if err := st.CancelPendingAction(ctx, id, u.ID+9999); !errors.Is(err, types.ErrNotFound) {
+		if _, err := st.CancelPendingAction(ctx, id, u.ID+9999); !errors.Is(err, types.ErrNotFound) {
 			t.Errorf("非本人取消应 ErrNotFound，实际: %v", err)
 		}
-		if err := st.CancelPendingAction(ctx, id, u.ID); err != nil {
+		cancelled, err := st.CancelPendingAction(ctx, id, u.ID)
+		if err != nil {
 			t.Fatalf("CancelPendingAction() 失败（越权拒绝不应产生副作用）: %v", err)
+		}
+		if cancelled.Status != types.PendingActionStatusCancelled || cancelled.Summary != pa.Summary {
+			t.Errorf("取消回读不一致（回写通告依赖 Summary）: %+v", cancelled)
 		}
 		// 取消后不可领取。
 		if _, err := st.ClaimPendingAction(ctx, id, u.ID); !errors.Is(err, types.ErrNotFound) {
 			t.Errorf("已取消动作领取应 ErrNotFound，实际: %v", err)
 		}
 		// 重复取消（非 pending）NotFound。
-		if err := st.CancelPendingAction(ctx, id, u.ID); !errors.Is(err, types.ErrNotFound) {
+		if _, err := st.CancelPendingAction(ctx, id, u.ID); !errors.Is(err, types.ErrNotFound) {
 			t.Errorf("重复取消应 ErrNotFound，实际: %v", err)
 		}
 		// 已执行的动作不可取消（先确认后点取消的竞态收敛为 NotFound）。
@@ -272,12 +276,54 @@ func TestAgentStore(t *testing.T) {
 		if _, err := st.ClaimPendingAction(ctx, id2, u.ID); err != nil {
 			t.Fatalf("ClaimPendingAction() 失败: %v", err)
 		}
-		if err := st.CancelPendingAction(ctx, id2, u.ID); !errors.Is(err, types.ErrNotFound) {
+		if _, err := st.CancelPendingAction(ctx, id2, u.ID); !errors.Is(err, types.ErrNotFound) {
 			t.Errorf("已执行动作取消应 ErrNotFound，实际: %v", err)
 		}
 		// 取消不存在的 id 同样 NotFound。
-		if err := st.CancelPendingAction(ctx, uuid.NewString(), u.ID); !errors.Is(err, types.ErrNotFound) {
+		if _, err := st.CancelPendingAction(ctx, uuid.NewString(), u.ID); !errors.Is(err, types.ErrNotFound) {
 			t.Errorf("取消不存在动作应 ErrNotFound，实际: %v", err)
+		}
+	})
+
+	t.Run("Append消息原子拼接", func(t *testing.T) {
+		sess, err := st.CreateAgentSession(ctx, u.ID)
+		if err != nil {
+			t.Fatalf("CreateAgentSession() 失败: %v", err)
+		}
+		base := json.RawMessage(`[{"role":"user","content":"帮我加个源"}]`)
+		if err := st.UpdateAgentSession(ctx, sess.ID, base, 1); err != nil {
+			t.Fatalf("UpdateAgentSession() 失败: %v", err)
+		}
+		before, err := st.GetActiveAgentSession(ctx, u.ID, time.Now().Add(-30*time.Minute))
+		if err != nil {
+			t.Fatalf("append 前回读会话失败: %v", err)
+		}
+		appended := json.RawMessage(`[{"role":"user","content":"[卡片回调] 用户已点击「确认」"}]`)
+		if err := st.AppendAgentSessionMessages(ctx, sess.ID, appended); err != nil {
+			t.Fatalf("AppendAgentSessionMessages() 失败: %v", err)
+		}
+
+		got, err := st.GetActiveAgentSession(ctx, u.ID, time.Now().Add(-30*time.Minute))
+		if err != nil {
+			t.Fatalf("回读会话失败: %v", err)
+		}
+		// append 不得续 TTL：确认卡 24h 有效，点卡若刷 updated_at 会复活超时会话。
+		if !got.UpdatedAt.Equal(before.UpdatedAt) {
+			t.Errorf("append 不应刷新 updated_at：前 %v，后 %v", before.UpdatedAt, got.UpdatedAt)
+		}
+		var parsed []map[string]string
+		if err := json.Unmarshal(got.Messages, &parsed); err != nil {
+			t.Fatalf("回读 messages 解析失败: %v（原文 %s）", err, got.Messages)
+		}
+		// || 是数组拼接而非替换：原有消息保留、新消息按序追加在尾部。
+		if len(parsed) != 2 || parsed[0]["content"] != "帮我加个源" ||
+			parsed[1]["content"] != "[卡片回调] 用户已点击「确认」" {
+			t.Errorf("append 后 messages 不符: %s", got.Messages)
+		}
+
+		// 不存在的会话 NotFound（同 UpdateAgentSession）。
+		if err := st.AppendAgentSessionMessages(ctx, -1, appended); !errors.Is(err, types.ErrNotFound) {
+			t.Errorf("append 不存在会话应 ErrNotFound，实际: %v", err)
 		}
 	})
 }

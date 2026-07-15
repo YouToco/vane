@@ -106,6 +106,33 @@ func (s *Store) UpdateAgentSession(ctx context.Context, id int64, messages json.
 	return nil
 }
 
+// AppendAgentSessionMessages 原子追加会话消息：msgs 必须是 JSON 数组
+// （jsonb || 对两个数组才是拼接语义），在库内一条 UPDATE 完成。
+// 不走"读出→内存 append→UpdateAgentSession"：卡片回调与 HandleMessage 分属
+// 不同 goroutine，读改写会与 saveSession 的全量覆盖写产生竞态互吞消息，
+// 库内原子拼接则与任意时刻的覆盖写都只有先后、没有丢失。
+// 刻意不刷 updated_at：会话 TTL 以用户消息计（契约 §0 30 分钟），而确认卡
+// 有效期 24h（取消更无时限）——点卡若续期，深夜一次点击就能把陈旧会话
+// 连同全部上下文复活给下一条消息。通告落进已过期的会话行无害：新会话
+// 历史里本就没有那张卡的"等待确认"记录，不存在要消除的幻觉。
+// 目标行不存在返回 CodeNotFound（同 UpdateAgentSession：静默成功会掩盖 bug）。
+func (s *Store) AppendAgentSessionMessages(ctx context.Context, sessionID int64, msgs json.RawMessage) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE agent_sessions
+		 SET messages = messages || $2::jsonb
+		 WHERE id = $1`,
+		sessionID, msgs)
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("追加 agent 会话消息（id=%d）", sessionID), err)
+	}
+	if tag.RowsAffected() == 0 {
+		return types.NewAppError(types.CodeNotFound,
+			fmt.Sprintf("agent 会话 id=%d 不存在", sessionID), nil)
+	}
+	return nil
+}
+
 // CreatePendingAction 落一条待确认动作。id（uuid）与 expires_at 由调用方给定；
 // args NOT NULL DEFAULT '{}'，nil/空归一为 '{}'；status 空缺省 pending。
 func (s *Store) CreatePendingAction(ctx context.Context, a *types.PendingAction) error {
@@ -156,23 +183,26 @@ func (s *Store) ClaimPendingAction(ctx context.Context, id string, userID int64)
 	return &pa, nil
 }
 
-// CancelPendingAction pending → cancelled；非 pending（已执行/已取消/不存在）
-// 或归属不符返回 CodeNotFound 的 AppError。与 Claim 同样用单条条件 UPDATE 保证原子性，
+// CancelPendingAction pending → cancelled，RETURNING 全列（调用方回写会话通告
+// 需要 Summary 等字段）；非 pending（已执行/已取消/不存在）或归属不符返回
+// CodeNotFound 的 AppError。与 Claim 同样用单条条件 UPDATE 保证原子性，
 // userID 同样进 WHERE（安全红线 §10）。
 // 刻意不校验 expires_at：已超时但 status 仍为 pending 的动作允许取消——
 // 语义无害，且用户点"取消"永远能得到明确反馈而非"动作不存在"。
-func (s *Store) CancelPendingAction(ctx context.Context, id string, userID int64) error {
-	tag, err := s.pool.Exec(ctx,
+func (s *Store) CancelPendingAction(ctx context.Context, id string, userID int64) (*types.PendingAction, error) {
+	var pa types.PendingAction
+	err := scanPendingAction(s.pool.QueryRow(ctx,
 		`UPDATE pending_actions SET status = $2
-		 WHERE id = $1 AND user_id = $4 AND status = $3`,
-		id, types.PendingActionStatusCancelled, types.PendingActionStatusPending, userID)
+		 WHERE id = $1 AND user_id = $4 AND status = $3
+		 RETURNING `+pendingActionColumns,
+		id, types.PendingActionStatusCancelled, types.PendingActionStatusPending, userID), &pa)
 	if err != nil {
-		return types.NewAppError(types.CodeDatabase,
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, types.NewAppError(types.CodeNotFound,
+				fmt.Sprintf("待确认动作 id=%s 非 pending 或非本人，无法取消", id), err)
+		}
+		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("取消待确认动作（id=%s）", id), err)
 	}
-	if tag.RowsAffected() == 0 {
-		return types.NewAppError(types.CodeNotFound,
-			fmt.Sprintf("待确认动作 id=%s 非 pending 或非本人，无法取消", id), nil)
-	}
-	return nil
+	return &pa, nil
 }

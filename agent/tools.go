@@ -484,8 +484,14 @@ func (t *pushNowTool) Execute(ctx context.Context, userID int64, _ json.RawMessa
 	if err != nil {
 		// 确定性拒绝（并发护栏"已有推送在进行"）走自纠通道：文案回给模型，
 		// 由它向用户解释而不是重复触发；基础设施错误仍上抛。
+		// 只回 AppError.Message：Error() 会拼上 Cause（Temporal 服务端原文
+		// "Workflow execution is already running" 之类），错误链不进模型上下文。
 		if errors.Is(err, types.ErrValidation) {
-			return err.Error(), nil
+			var ae *types.AppError
+			if errors.As(err, &ae) && ae.Message != "" {
+				return ae.Message, nil
+			}
+			return "本次触发被拒绝，请稍后再试。", nil
 		}
 		return "", err
 	}
