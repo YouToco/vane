@@ -45,6 +45,54 @@ func (s *Store) InsertContentItemIfNew(ctx context.Context, item *types.ContentI
 	return id, false, nil
 }
 
+// EnrichedExternalIDs 返回 externalIDs 里"已入库**且正文长于 minRunes**"的那部分。
+//
+// 存在的理由是成本：抓取器据此跳过不必再花钱的笔记——上游详情接口按次计费
+// （$0.01/次），把已经拿到全文的老笔记每轮再补一遍纯属白烧。
+//
+// 判据是**正文长度**而不是"行是否存在"，这个区别是刻意的：详情补全会失败
+// （429/网络抖动/上游风控），失败时笔记仍以搜索摘要（≤60 rune 的半句话）落库。
+// 若按"行存在"跳过，一次瞬时 429 就让这条笔记**终身停在 60 字**，且系统再无自愈
+// 路径——而下游此时已把它判死（scorer 压到 0-20、deep_dive 闸门直接拒）。
+// 按长度判，则下一轮自然重试；代价是极少数"真实全文恰好 ≤minRunes"的笔记会在它
+// 还出现在搜索结果里的一两天内被重复补全（每次 $0.01），量级可忽略。
+//
+// 副作用（正是所需）：本方法上线前入库的存量条目正文都 ≤60，会被判为未补全，
+// 在其信源下次抓取命中时补一次全文。
+//
+// 去重本身仍由 UNIQUE(source_id, external_id) 在 InsertContentItemIfNew 里兜底，
+// 本方法漏判/多判都不会造成脏数据，最坏只是多花/少花几分钱。
+//
+// 空入参直接返回空 map 不查库：抓取器每轮都调，空批次不该白跑一次 DB 往返。
+func (s *Store) EnrichedExternalIDs(ctx context.Context, sourceID int64, externalIDs []string, minRunes int) (map[string]struct{}, error) {
+	out := make(map[string]struct{}, len(externalIDs))
+	if len(externalIDs) == 0 {
+		return out, nil
+	}
+	// char_length 数的是字符不是字节，与调用方的 utf8.RuneCountInString 同口径。
+	rows, err := s.pool.Query(ctx,
+		`SELECT external_id FROM content_items
+		 WHERE source_id = $1 AND external_id = ANY($2) AND char_length(content) > $3`,
+		sourceID, externalIDs, minRunes)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询信源 %d 已补全的 external_id", sourceID), err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var eid string
+		if err := rows.Scan(&eid); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "扫描 external_id 行", err)
+		}
+		out[eid] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "遍历 external_id 结果集", err)
+	}
+	return out, nil
+}
+
 // GetContentItem 按 id 取内容条目（deep_dive / 追问取原文用）。无行返回 CodeNotFound。
 func (s *Store) GetContentItem(ctx context.Context, id int64) (*types.ContentItem, error) {
 	var ci types.ContentItem

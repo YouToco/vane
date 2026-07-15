@@ -20,11 +20,15 @@ type Multi struct {
 
 // NewMulti 按抓取配置构造全部抓取器。未配置 key 的信源类型仍会构造
 // （构造零成本），等真有该类型的源被抓取时才在 Fetch 返回配置缺失错误。
-func NewMulti(cfg config.FetchConfig) *Multi {
+//
+// seen 只被 TikHub 抓取器用于"这条笔记是否已入库"，从而只为新笔记调用按次计费的
+// 详情接口（见 SeenChecker）。传 nil 合法：详情补全会被跳过，小红书正文退回搜索
+// 给的 60 字摘要——不改善，但也不比补全上线前更差。
+func NewMulti(cfg config.FetchConfig, seen SeenChecker) *Multi {
 	return &Multi{
 		rss:    New(cfg),
 		exa:    NewExa(cfg),
-		tikhub: NewTikHub(cfg),
+		tikhub: NewTikHub(cfg, seen),
 	}
 }
 

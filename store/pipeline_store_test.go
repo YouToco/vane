@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,6 +171,71 @@ func TestPipelineStore(t *testing.T) {
 		}
 		if id2 != id1 {
 			t.Errorf("重复插入应返回同 id：首次 %d，二次 %d", id1, id2)
+		}
+	})
+
+	t.Run("EnrichedExternalIDs只报已补全的", func(t *testing.T) {
+		// 抓取器靠它决定"这条笔记还要不要花 $0.01 补全"。判错的代价是钱
+		// （多判→为已补全的笔记重复付费）或内容质量（漏判→笔记永远停在 60 字残句），
+		// 所以必须真库往返验证 char_length + ANY($2) 的行为。
+		const minRunes = 60
+		long := "long-" + uuid.NewString()   // 已补全：正文远长于阈值
+		short := "short-" + uuid.NewString() // 补全失败过：只有搜索摘要
+		absent := "absent-" + uuid.NewString()
+
+		mk := func(extID, content string) {
+			t.Helper()
+			if _, _, err := st.InsertContentItemIfNew(ctx, &types.ContentItem{
+				SourceID:    srcID,
+				ExternalID:  extID,
+				URL:         "https://example.com/" + extID,
+				Title:       "条目",
+				Content:     content,
+				ContentHash: "ehash-" + uuid.NewString(),
+			}); err != nil {
+				t.Fatalf("准备条目 %s 失败: %v", extID, err)
+			}
+		}
+		// 中文正文：char_length 数字符、len() 数字节，两者差三倍——SQL 用错函数
+		// 会让每条中文笔记都被误判为"未补全"而每轮重复付费。
+		mk(long, strings.Repeat("正", 200))
+		mk(short, strings.Repeat("残", minRunes)) // 恰好 60：截断残句的典型长度
+
+		got, err := st.EnrichedExternalIDs(ctx, srcID, []string{long, short, absent}, minRunes)
+		if err != nil {
+			t.Fatalf("EnrichedExternalIDs() 失败: %v", err)
+		}
+		if _, ok := got[long]; !ok {
+			t.Errorf("正文已补全的 %q 应被报告（跳过付费），实际 %v", long, got)
+		}
+		// 边界是 > 而非 >=：恰好 60 rune 正是上游截断的长度，必须判为"未补全"
+		// 让它下轮重试——否则一次瞬时 429 就把这条笔记终身钉在 60 字。
+		if _, ok := got[short]; ok {
+			t.Errorf("正文恰好 %d rune（截断残句）不该被判为已补全，实际 %v", minRunes, got)
+		}
+		if _, ok := got[absent]; ok {
+			t.Errorf("未入库的 %q 不该被报告", absent)
+		}
+		if len(got) != 1 {
+			t.Errorf("期望恰好 1 个命中，实际 %d", len(got))
+		}
+
+		// 空入参：直接返回空 map，不该查库更不该报错。
+		empty, err := st.EnrichedExternalIDs(ctx, srcID, nil, minRunes)
+		if err != nil {
+			t.Fatalf("空入参不该报错: %v", err)
+		}
+		if len(empty) != 0 {
+			t.Errorf("空入参应返回空 map，实际 %v", empty)
+		}
+
+		// 按 source_id 隔离：同 external_id 挂在别的源下不算本源已补全。
+		other, err := st.EnrichedExternalIDs(ctx, srcID+9999, []string{long}, minRunes)
+		if err != nil {
+			t.Fatalf("EnrichedExternalIDs() 异源查询失败: %v", err)
+		}
+		if len(other) != 0 {
+			t.Errorf("external_id 应按 source_id 隔离，实际在异源查到 %v", other)
 		}
 	})
 
