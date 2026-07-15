@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +28,17 @@ type fakeStore struct {
 	updateCalls   int
 	lastMessages  json.RawMessage
 	lastTurnCount int
+
+	// mu 保护 appendCalls 与 sessions 内容：卡片回调回写在独立 goroutine
+	// 里执行，与测试主 goroutine 的断言读取并发。
+	mu          sync.Mutex
+	appendCalls []appendRecord
+}
+
+// appendRecord 记录一次 AppendAgentSessionMessages 调用，供断言回写目标与内容。
+type appendRecord struct {
+	sessionID int64
+	msgs      json.RawMessage
 }
 
 func newFakeStore() *fakeStore {
@@ -79,6 +91,67 @@ func (f *fakeStore) UpdateAgentSession(_ context.Context, id int64, messages jso
 	return nil
 }
 
+func (f *fakeStore) AppendAgentSessionMessages(ctx context.Context, sessionID int64, msgs json.RawMessage) error {
+	// 对齐 pgx 行为：已取消/过期的 ctx 立即失败不触库——回写必须在拿到锁后
+	// 用脱离调用方 deadline 的独立 ctx，否则这里就会把它打回。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.sessions[sessionID]
+	if !ok {
+		return notFoundErr("fake: 会话不存在")
+	}
+	// 模拟 jsonb || 的数组拼接语义（两边都必须是数组）。生产实现不刷 updated_at
+	// （防点卡复活超时会话），fake 同步该语义。
+	var existing, incoming []json.RawMessage
+	if err := json.Unmarshal(s.Messages, &existing); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(msgs, &incoming); err != nil {
+		return err
+	}
+	merged, err := json.Marshal(append(existing, incoming...))
+	if err != nil {
+		return err
+	}
+	s.Messages = merged
+	f.appendCalls = append(f.appendCalls, appendRecord{sessionID: sessionID, msgs: msgs})
+	return nil
+}
+
+func (f *fakeStore) appendCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.appendCalls)
+}
+
+// waitAppends 等回写 goroutine 落地到恰好 want 次（回写是异步的）。
+// 等到后再多留一拍确认没有多余回写溜进来。
+func waitAppends(t *testing.T, f *fakeStore, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for f.appendCount() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("等待 %d 次回写超时, 实得 %d", want, f.appendCount())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := f.appendCount(); got != want {
+		t.Fatalf("回写次数应稳定在 %d, 实得 %d", want, got)
+	}
+}
+
+// sessionMessages 锁内取会话当前 messages 快照（异步回写也写这份数据）。
+func (f *fakeStore) sessionMessages(id int64) *types.AgentSession {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := *f.sessions[id]
+	return &cp
+}
+
 func (f *fakeStore) CreatePendingAction(_ context.Context, a *types.PendingAction) error {
 	cp := *a
 	f.actions[a.ID] = &cp
@@ -97,13 +170,14 @@ func (f *fakeStore) ClaimPendingAction(_ context.Context, id string, userID int6
 	return &cp, nil
 }
 
-func (f *fakeStore) CancelPendingAction(_ context.Context, id string, userID int64) error {
+func (f *fakeStore) CancelPendingAction(_ context.Context, id string, userID int64) (*types.PendingAction, error) {
 	a, ok := f.actions[id]
 	if !ok || a.UserID != userID || a.Status != types.PendingActionStatusPending {
-		return notFoundErr("fake: 动作不可取消")
+		return nil, notFoundErr("fake: 动作不可取消")
 	}
 	a.Status = types.PendingActionStatusCancelled
-	return nil
+	cp := *a
+	return &cp, nil
 }
 
 // fakeTool 记录每次 Execute 调用，供断言"执行了几次、带什么参数"。
@@ -509,5 +583,244 @@ func TestCancelAction_ThenExecuteRejected(t *testing.T) {
 	got3, err := l.CancelAction(context.Background(), 7, "act-1")
 	if err != nil || got3 == "" {
 		t.Fatalf("重复取消应返回人话而非报错, 实得 got=%q err=%v", got3, err)
+	}
+}
+
+// ============================================================
+// 卡片回调结果回写会话
+// ============================================================
+
+// appendedMessages 解出第 i 次 AppendAgentSessionMessages 收到的消息数组。
+func appendedMessages(t *testing.T, fs *fakeStore, i int) []llm.ChatMessage {
+	t.Helper()
+	fs.mu.Lock()
+	rec := fs.appendCalls[i]
+	fs.mu.Unlock()
+	var msgs []llm.ChatMessage
+	if err := json.Unmarshal(rec.msgs, &msgs); err != nil {
+		t.Fatalf("append 的 msgs 不是合法 JSON 数组: %v", err)
+	}
+	return msgs
+}
+
+// appendCallAt 锁内取第 i 次回写记录的快照。
+func appendCallAt(fs *fakeStore, i int) appendRecord {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.appendCalls[i]
+}
+
+// newPendingAction 造一个 pending 状态的测试动作（1h 后过期）。
+func newPendingAction(id string, userID int64, sessionID *int64, tool, summary string) *types.PendingAction {
+	return &types.PendingAction{
+		ID:        id,
+		UserID:    userID,
+		SessionID: sessionID,
+		ToolName:  tool,
+		Args:      json.RawMessage("{}"),
+		Summary:   summary,
+		Status:    types.PendingActionStatusPending,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+}
+
+// 确认执行成功后要向来源会话回写「[卡片回调]」user 消息（含 Summary 与执行结果），
+// 且消息与 HandleMessage 持久化的历史同构（decodeMessages 可无损解析）；
+// 双击重放走幂等出口，不再回写。
+func TestExecuteAction_AppendsCardCallback(t *testing.T) {
+	fs := newFakeStore()
+	sess, _ := fs.CreateAgentSession(context.Background(), 7)
+	addTool := &fakeTool{name: "add_source", mutating: true, result: "已添加信源：示例"}
+	fs.actions["act-1"] = newPendingAction("act-1", 7, &sess.ID, "add_source", "新增 RSS 信源 example.com")
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn, addTool)
+
+	if _, err := l.ExecuteAction(context.Background(), 7, "act-1"); err != nil {
+		t.Fatalf("ExecuteAction 意外报错: %v", err)
+	}
+	waitAppends(t, fs, 1)
+	if rec := appendCallAt(fs, 0); rec.sessionID != sess.ID {
+		t.Fatalf("应向会话 %d 回写, 实得 %+v", sess.ID, rec)
+	}
+	msgs := appendedMessages(t, fs, 0)
+	if len(msgs) != 1 || msgs[0].Role != "user" {
+		t.Fatalf("回写应为 1 条 role=user 消息, 实得 %+v", msgs)
+	}
+	c := msgs[0].Content
+	if !strings.HasPrefix(c, "[卡片回调]") || !strings.Contains(c, "「确认」") ||
+		!strings.Contains(c, "新增 RSS 信源 example.com") || !strings.Contains(c, addTool.result) {
+		t.Fatalf("回写内容应含前缀/确认/Summary/执行结果, 实得 %q", c)
+	}
+	// 回写后的会话 messages 整体仍可按 []llm.ChatMessage 解析（与历史同构）。
+	if got := decodeMessages(fs.sessionMessages(sess.ID)); len(got) != 1 || got[0].Content != c {
+		t.Fatalf("会话内容应含回写消息且可解析, 实得 %+v", got)
+	}
+
+	// 双击重放（幂等出口）：人话文本，不再回写。
+	if _, err := l.ExecuteAction(context.Background(), 7, "act-1"); err != nil {
+		t.Fatalf("重复 ExecuteAction 不应报错: %v", err)
+	}
+	waitAppends(t, fs, 1)
+}
+
+// 执行失败与工具下线同样回写通告（模型该知道动作已被消耗）；返回语义不变：
+// 失败照旧上抛 err，下线返回人话 + nil error。
+func TestExecuteAction_AppendsOnFailureAndOfflineTool(t *testing.T) {
+	fs := newFakeStore()
+	sess, _ := fs.CreateAgentSession(context.Background(), 7)
+	// Cause 里的连接串细节不得进入模型上下文，回写只落 AppError.Message。
+	failTool := &fakeTool{name: "add_source", mutating: true,
+		execErr: types.NewAppError(types.CodeDatabase, "上游超时",
+			fmt.Errorf("dial tcp 10.0.0.1:5432: password=secret"))}
+	fs.actions["act-fail"] = newPendingAction("act-fail", 7, &sess.ID, "add_source", "摘要-fail")
+	fs.actions["act-ghost"] = newPendingAction("act-ghost", 7, &sess.ID, "ghost_tool", "摘要-ghost")
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn, failTool)
+
+	if _, err := l.ExecuteAction(context.Background(), 7, "act-fail"); err == nil {
+		t.Fatal("工具执行失败应照旧上抛 err")
+	}
+	waitAppends(t, fs, 1)
+	c := appendedMessages(t, fs, 0)[0].Content
+	if !strings.HasPrefix(c, "[卡片回调]") ||
+		!strings.Contains(c, "执行失败") || !strings.Contains(c, "上游超时") {
+		t.Fatalf("失败通告应含前缀与错误信息, 实得 %q", c)
+	}
+	if strings.Contains(c, "dial tcp") || strings.Contains(c, "secret") {
+		t.Fatalf("失败通告不得泄漏底层错误链, 实得 %q", c)
+	}
+
+	reply, err := l.ExecuteAction(context.Background(), 7, "act-ghost")
+	if err != nil || !strings.Contains(reply, "已不可用") {
+		t.Fatalf("下线工具应返回人话 + nil error, 实得 reply=%q err=%v", reply, err)
+	}
+	waitAppends(t, fs, 2)
+	if c := appendedMessages(t, fs, 1)[0].Content; !strings.Contains(c, "ghost_tool 已不可用") {
+		t.Fatalf("下线通告应含工具名与不可用文案, 实得 %q", c)
+	}
+}
+
+// 取消成功后回写「取消」通告（含 Summary）；重复取消走幂等出口，不回写。
+func TestCancelAction_AppendsCardCallback(t *testing.T) {
+	fs := newFakeStore()
+	sess, _ := fs.CreateAgentSession(context.Background(), 7)
+	fs.actions["act-1"] = newPendingAction("act-1", 7, &sess.ID, "add_source", "新增 RSS 信源 example.com")
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn)
+
+	if _, err := l.CancelAction(context.Background(), 7, "act-1"); err != nil {
+		t.Fatalf("CancelAction 意外报错: %v", err)
+	}
+	waitAppends(t, fs, 1)
+	if rec := appendCallAt(fs, 0); rec.sessionID != sess.ID {
+		t.Fatalf("取消应向会话 %d 回写, 实得 %+v", sess.ID, rec)
+	}
+	msgs := appendedMessages(t, fs, 0)
+	if msgs[0].Role != "user" {
+		t.Fatalf("回写应为 role=user, 实得 %+v", msgs[0])
+	}
+	c := msgs[0].Content
+	if !strings.HasPrefix(c, "[卡片回调]") || !strings.Contains(c, "「取消」") ||
+		!strings.Contains(c, "新增 RSS 信源 example.com") {
+		t.Fatalf("取消通告应含前缀/取消/Summary, 实得 %q", c)
+	}
+
+	// 重复取消（幂等出口）：不回写。
+	if _, err := l.CancelAction(context.Background(), 7, "act-1"); err != nil {
+		t.Fatalf("重复取消不应报错: %v", err)
+	}
+	waitAppends(t, fs, 1)
+}
+
+// SessionID 为 nil（动作无来源会话）时确认/取消都跳过回写，其余行为不变。
+func TestCardCallback_NilSessionSkipsAppend(t *testing.T) {
+	fs := newFakeStore()
+	addTool := &fakeTool{name: "add_source", mutating: true, result: "已添加"}
+	fs.actions["act-exec"] = newPendingAction("act-exec", 7, nil, "add_source", "摘要-exec")
+	fs.actions["act-cancel"] = newPendingAction("act-cancel", 7, nil, "add_source", "摘要-cancel")
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn, addTool)
+
+	got, err := l.ExecuteAction(context.Background(), 7, "act-exec")
+	if err != nil || got != addTool.result {
+		t.Fatalf("无会话动作应照常执行, 实得 got=%q err=%v", got, err)
+	}
+	if _, err := l.CancelAction(context.Background(), 7, "act-cancel"); err != nil {
+		t.Fatalf("无会话动作应照常取消: %v", err)
+	}
+	// nil session 路径根本不 spawn 回写 goroutine，稍等一拍后计数必须仍为 0。
+	waitAppends(t, fs, 0)
+}
+
+// 工具返回裸 error（非 AppError）时回写用通用文案兜底——原始错误文本
+// 一个字都不能进模型上下文。
+func TestExecuteAction_PlainErrorFallsBackToGenericNotice(t *testing.T) {
+	fs := newFakeStore()
+	sess, _ := fs.CreateAgentSession(context.Background(), 7)
+	failTool := &fakeTool{name: "add_source", mutating: true,
+		execErr: fmt.Errorf("dial tcp 10.0.0.1:5432: password=hunter2")}
+	fs.actions["act-1"] = newPendingAction("act-1", 7, &sess.ID, "add_source", "摘要")
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn, failTool)
+
+	if _, err := l.ExecuteAction(context.Background(), 7, "act-1"); err == nil {
+		t.Fatal("失败应照旧上抛 err")
+	}
+	waitAppends(t, fs, 1)
+	c := appendedMessages(t, fs, 0)[0].Content
+	if !strings.Contains(c, "内部错误") {
+		t.Fatalf("裸 error 应回退通用文案, 实得 %q", c)
+	}
+	if strings.Contains(c, "dial tcp") || strings.Contains(c, "hunter2") {
+		t.Fatalf("裸 error 原文不得进入通告, 实得 %q", c)
+	}
+}
+
+// 互锁与 ctx 语义：HandleMessage 持 userMu 期间点卡——回写必须排在 saveSession
+// 之后落地（不被全量覆盖写吞掉），且不受调用方已取消 ctx 的影响（拿锁后另起
+// 独立 ctx；fakeStore.Append 对齐 pgx、见 ctx 已死立即拒绝）。
+func TestAppendCardCallback_SerializesWithHandleMessage(t *testing.T) {
+	fs := newFakeStore()
+	sess, _ := fs.CreateAgentSession(context.Background(), 7)
+	addTool := &fakeTool{name: "add_source", mutating: true, result: "已添加"}
+	fs.actions["act-1"] = newPendingAction("act-1", 7, &sess.ID, "add_source", "摘要")
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	blockingChat := func(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		close(entered)
+		<-release
+		return &llm.ChatResponse{Content: "好的", FinishReason: "stop"}, nil
+	}
+	l := newTestLoop(t, fs, blockingChat, addTool)
+
+	handleDone := make(chan struct{})
+	go func() {
+		defer close(handleDone)
+		_, _ = l.HandleMessage(context.Background(), 7, "你好")
+	}()
+	<-entered // HandleMessage 已持锁、正卡在模型调用上
+
+	// 调用方 ctx 已取消（模拟 30s 回调预算在等锁中耗尽）。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := l.ExecuteAction(ctx, 7, "act-1"); err != nil {
+		t.Fatalf("ExecuteAction 意外报错: %v", err)
+	}
+	// 锁仍被 HandleMessage 持有，回写不可能先落地。
+	time.Sleep(30 * time.Millisecond)
+	if got := fs.appendCount(); got != 0 {
+		t.Fatalf("锁被持有期间不应有回写落地, 实得 %d", got)
+	}
+
+	close(release)
+	<-handleDone
+	waitAppends(t, fs, 1)
+
+	// 会话 = saveSession 的完整历史 + 排在其后的回调通告。
+	got := decodeMessages(fs.sessionMessages(sess.ID))
+	if len(got) < 2 {
+		t.Fatalf("会话应含 HandleMessage 历史与回调通告, 实得 %+v", got)
+	}
+	if last := got[len(got)-1]; !strings.HasPrefix(last.Content, "[卡片回调]") {
+		t.Fatalf("通告应排在 saveSession 之后落地, 实得末条 %+v", last)
+	}
+	if prev := got[len(got)-2]; prev.Role != "assistant" || prev.Content != "好的" {
+		t.Fatalf("倒数第二条应为模型回复, 实得 %+v", prev)
 	}
 }

@@ -65,7 +65,12 @@ func (s *Store) CreatePendingAction(ctx context.Context, a *types.PendingAction)
 // 幂等防双击）。归属校验进 WHERE 谓词（§10）：越权请求零副作用。
 func (s *Store) ClaimPendingAction(ctx context.Context, id string, userID int64) (*types.PendingAction, error)
 // CancelPendingAction pending → cancelled（同样带 user_id 谓词）；非 pending/非本人返回 ErrNotFound 类错误。
-func (s *Store) CancelPendingAction(ctx context.Context, id string, userID int64) error
+// RETURNING 返回实体：卡片回调回写通告需要 Summary。
+func (s *Store) CancelPendingAction(ctx context.Context, id string, userID int64) (*types.PendingAction, error)
+// AppendAgentSessionMessages 原子追加会话消息（msgs 必须是 JSON 数组，库内 jsonb || 拼接）。
+// 供卡片回调回写「[卡片回调]」通告：与 saveSession 的全量覆盖写并发时只有先后、没有丢失。
+// 刻意不刷 updated_at——确认卡有效期（24h）远超会话 TTL（30min），点卡不得复活超时会话。
+func (s *Store) AppendAgentSessionMessages(ctx context.Context, sessionID int64, msgs json.RawMessage) error
 ```
 
 ## 3. types 新实体（`types/entities.go` 追加；枚举加 `types/enums.go`）
