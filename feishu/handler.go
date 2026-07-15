@@ -448,11 +448,13 @@ func parseTextContent(raw string) string {
 	return strings.TrimSpace(mentionRe.ReplaceAllString(body.Text, ""))
 }
 
-// postNode 是 post（富文本）消息段落里的一个内容节点。只关心 tag 与 text：
-// tag 区分节点类型，text 承载该节点的可读文字（如有）。
+// postNode 是 post（富文本）消息段落里的一个内容节点。只关心三个字段：
+// tag 区分节点类型，text 承载该节点的可读文字（如有），href 是 a 节点的
+// 链接目标。
 type postNode struct {
 	Tag  string `json:"tag"`
 	Text string `json:"text"`
+	Href string `json:"href"`
 }
 
 // postTextTags 是提取纯文本时保留的节点类型：正文（text）、markdown（md）、
@@ -465,11 +467,12 @@ var postTextTags = map[string]bool{"text": true, "md": true, "code_block": true,
 // 结构为 {"title":"...","content":[[节点,...],...]}（官方文档 + lark-cli 实测）：
 // 接收侧顶层没有发送 API 的 zh_cn 语言包装，content 是段落二维数组。
 // 同段落的文本节点直接相接（一行文字因样式变化会被拆成多个节点），段落间
-// 以换行分隔，title 非空时作首行；行内空白原样保留（粘贴代码的缩进有意义），
-// 仅判空时 trim。post 的 @ 是结构化 at 节点（占位符在其 user_id 字段），
-// 正文不会出现 "@_user_N"，因此不做 text 消息那样的 mentionRe 剥离——
-// 粘贴内容恰好含该字样时不能误删。没有任何文字（纯图片等）返回空串，
-// 由调用方回退提示文案。
+// 以换行分隔，title 非空时作首行；段落内部空白原样保留（粘贴代码的缩进
+// 有意义），仅对拼接结果做一次首尾 TrimSpace——与 text 路径的
+// parseTextContent 对整条消息的归一化一致。post 的 @ 是结构化 at 节点
+//（占位符在其 user_id 字段），正文不会出现 "@_user_N"，因此不做 text
+// 消息那样的 mentionRe 剥离——粘贴内容恰好含该字样时不能误删。
+// 没有任何文字（纯图片等）返回空串，由调用方回退提示文案。
 func parsePostContent(raw string) string {
 	var body struct {
 		Title   string       `json:"title"`
@@ -485,8 +488,15 @@ func parsePostContent(raw string) string {
 	for _, para := range body.Content {
 		var sb strings.Builder
 		for _, node := range para {
-			if postTextTags[node.Tag] {
-				sb.WriteString(node.Text)
+			if !postTextTags[node.Tag] {
+				continue
+			}
+			sb.WriteString(node.Text)
+			// 超链接的目标不能静默丢失：agent 的工具（如 add_source）要的
+			// 正是 URL，锚文本与 href 不同时以"锚文本 (href)"并入正文；
+			// 相同（裸链接粘贴的常态）则不重复。
+			if node.Tag == "a" && node.Href != "" && node.Href != node.Text {
+				sb.WriteString(" (" + node.Href + ")")
 			}
 		}
 		if line := sb.String(); strings.TrimSpace(line) != "" {

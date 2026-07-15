@@ -147,7 +147,19 @@ func TestParsePostContent(t *testing.T) {
 				`[{"tag":"text","text":"看这个 "},{"tag":"a","text":"页面","href":"https://example.com"},{"tag":"text","text":" 的说明","style":[]}],` +
 				`[{"tag":"img","image_key":"img_v2_x"}],` +
 				`[{"tag":"at","user_id":"@_user_1","user_name":"某人"},{"tag":"text","text":"结论在最后"}]]}`,
-			want: "看这个 页面 的说明\n结论在最后",
+			want: "看这个 页面 (https://example.com) 的说明\n结论在最后",
+		},
+		{
+			// 命名链接的 href 是正文里唯一的链接目标（如"订阅 BBC News"场景
+			// 里 agent 要的正是 feed URL），静默丢弃会让下游工具拿不到 URL。
+			name: "锚文本与 href 不同时链接目标并入正文",
+			raw:  `{"content":[[{"tag":"text","text":"帮我订阅 "},{"tag":"a","text":"BBC News","href":"http://feeds.bbci.co.uk/news/rss.xml"}]]}`,
+			want: "帮我订阅 BBC News (http://feeds.bbci.co.uk/news/rss.xml)",
+		},
+		{
+			name: "裸链接粘贴（锚文本等于 href）不重复输出",
+			raw:  `{"content":[[{"tag":"a","text":"https://example.com/feed","href":"https://example.com/feed"}]]}`,
+			want: "https://example.com/feed",
 		},
 		{
 			name: "同段落多个 text 节点直接相接",
@@ -188,6 +200,13 @@ func TestParsePostContent(t *testing.T) {
 			name: "保留行内缩进",
 			raw:  `{"content":[[{"tag":"text","text":"func main() {"}],[{"tag":"text","text":"\tfmt.Println(1)"}],[{"tag":"text","text":"}"}]]}`,
 			want: "func main() {\n\tfmt.Println(1)\n}",
+		},
+		{
+			// 钉死外层 TrimSpace 的存在：与 parseTextContent 对整条消息的
+			// 归一化一致，首行前导/末行尾随空白被剥，中间行缩进原样保留。
+			name: "整体首尾 trim 与 text 路径一致",
+			raw:  `{"content":[[{"tag":"text","text":"    if x {"}],[{"tag":"text","text":"        do()"}],[{"tag":"text","text":"    }   "}]]}`,
+			want: "if x {\n        do()\n    }",
 		},
 		{
 			name: "正文含 @_user_N 字样不被误删",
