@@ -63,7 +63,7 @@ type twitterResponse struct {
 type twitterData struct {
 	Status   string           `json:"status"`
 	Timeline []twitterTweet   `json:"timeline"`
-	Pinned   []twitterTweet   `json:"pinned"`
+	Pinned   json.RawMessage  `json:"pinned"`
 	User     json.RawMessage  `json:"user"`
 }
 
