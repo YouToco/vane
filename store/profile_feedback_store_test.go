@@ -32,16 +32,18 @@ func TestProfileStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() 建池失败: %v", err)
 	}
-	defer st.Close()
+	registerStoreClose(t, st)
 
 	u, err := st.UpsertUserByOpenID(ctx, "test_profile_"+uuid.NewString(), "profile-test")
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
 	}
 	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
 		// FK 逆序：profiles → users。
-		_, _ = st.pool.Exec(ctx, `DELETE FROM profiles WHERE user_id = $1`, u.ID)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM profiles WHERE user_id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id = $1`, u.ID)
 	})
 
 	t.Run("首采INSERT与部分更新nil不改", func(t *testing.T) {
@@ -245,7 +247,7 @@ func TestFeedbackStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() 建池失败: %v", err)
 	}
-	defer st.Close()
+	registerStoreClose(t, st)
 
 	u, err := st.UpsertUserByOpenID(ctx, "test_feedback_"+uuid.NewString(), "feedback-test")
 	if err != nil {
@@ -277,13 +279,15 @@ func TestFeedbackStore(t *testing.T) {
 	}
 
 	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
 		// FK 逆序：feedbacks → deliveries → push_batches → content_items → sources → users。
-		_, _ = st.pool.Exec(ctx, `DELETE FROM feedbacks WHERE user_id = ANY($1)`, userIDs)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM deliveries WHERE user_id = ANY($1)`, userIDs)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM push_batches WHERE user_id = ANY($1)`, userIDs)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM content_items WHERE source_id = $1`, srcID)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM sources WHERE id = $1`, srcID)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM users WHERE id = ANY($1)`, userIDs)
+		cleanupExec(ctx, t, st, `DELETE FROM feedbacks WHERE user_id = ANY($1)`, userIDs)
+		cleanupExec(ctx, t, st, `DELETE FROM deliveries WHERE user_id = ANY($1)`, userIDs)
+		cleanupExec(ctx, t, st, `DELETE FROM push_batches WHERE user_id = ANY($1)`, userIDs)
+		cleanupExec(ctx, t, st, `DELETE FROM content_items WHERE source_id = $1`, srcID)
+		cleanupExec(ctx, t, st, `DELETE FROM sources WHERE id = $1`, srcID)
+		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id = ANY($1)`, userIDs)
 	})
 
 	newContent := func(t *testing.T, title, content string) int64 {
