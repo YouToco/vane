@@ -18,6 +18,7 @@ UPDATE sources SET url = 'vane://xhs/search?' || substring(url from length('tikh
  WHERE type = 'tikhub_xhs';
 
 -- ③' 后置守卫：把最贵的静默失败变成响亮失败。
+-- +goose StatementBegin
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM sources WHERE url LIKE 'exa://%' OR url LIKE 'tikhub://%') THEN
@@ -27,6 +28,7 @@ BEGIN
         RAISE EXCEPTION '008: 存在未映射的 sources 行（platform/capability 为空）';
     END IF;
 END $$;
+-- +goose StatementEnd
 
 -- ④ type 列退役。前端兼容由 api 层派生（契约 §13.2）。
 ALTER TABLE sources DROP COLUMN type;
