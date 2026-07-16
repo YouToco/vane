@@ -16,7 +16,7 @@
 - push 到 main 自动 CI → 部署 VPS（systemd `vane.service`，`/opt/vane`，Docker 栈：Postgres 18 / Temporal / Caddy）
 - VPS：ssh alias `vane`（凭证在 my-credentials，不在本仓库）；域名 https://vane.zhuoqidev.com
 - 每日推送调度：00:30 UTC（北京 08:30；VPS 本地 EDT 为前一天 20:30）
-- LLM 调用明细（打分 prompt/completion/token）落 DB `llm_traces` 表，不在系统日志里
+- LLM 调用明细（打分 prompt/completion/token）落 DB `llm_calls` 表，不在系统日志里
 
 ## 踩坑红线（均为历史真实事故，违反必炸）
 

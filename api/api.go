@@ -77,6 +77,9 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("POST /api/subscriptions", s.handleAddSubscription)
 	inner.HandleFunc("DELETE /api/subscriptions/{source_id}", s.handleRemoveSubscription)
 
+	// M5 Gate 探针端点（契约 §16）：只读体检，与 cmd/gate 共用 probe 包同一份判定。
+	inner.HandleFunc("GET /api/admin/observability", s.handleObservability)
+
 	mux.Handle("/api/", s.requireSession(inner))
 }
 

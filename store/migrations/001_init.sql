@@ -172,7 +172,7 @@ CREATE TABLE profiles (
 CREATE TABLE llm_calls (
     id                BIGSERIAL     PRIMARY KEY,
     trace_id          TEXT          NOT NULL DEFAULT '',
-    span_name         TEXT          NOT NULL DEFAULT '',      -- 调用环节：score/cardgen/summarize/feedback_interpret/quality_check
+    span_name         TEXT          NOT NULL DEFAULT '',      -- 调用环节，真实写入方恰好六个：score(scorer.go:131)/cardgen(cardgen.go:77)/profile_evolve(evolver.go:116)/deep_dive(deepdive.go:218)/chat_reply(feishu/handler.go:174)/agent(agent/loop.go:206)
     user_id           BIGINT,                                 -- 归属用户，系统级调用为 NULL；刻意不建 FK（与多态关联一致）
     ref_type          TEXT          NOT NULL DEFAULT '',
     ref_id            BIGINT,                                 -- 无关联对象时为 NULL

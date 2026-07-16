@@ -43,7 +43,14 @@ func (s *Store) CreatePushBatchIdempotent(ctx context.Context, userID int64, ide
 	return id, nil
 }
 
-// UpdatePushBatchStatus 推进批次状态（pending→pushing→done/failed）。
+// UpdatePushBatchStatus 推进批次状态。真实可观测的生命周期是 pending→done|failed：
+// 没有中间态，Push 活动跑完才一次性落终态。
+//
+// types.BatchStatusPushing（enums.go:37，"pushing"）是**死枚举**：全仓无任何赋值，
+// 也没有任何 SQL 写过它，故库里永远不会出现这个值。查询/看板不要为它留分支，
+// 更不要把"卡在 pushing"当成可能的异常形状去排查——那个状态不存在。
+// （枚举本身不在本 PR 删除：那是 types 包的改动，超出本 PR 的只读范围。）
+//
 // push_batches 无 updated_at 列（001），故只改 status。
 func (s *Store) UpdatePushBatchStatus(ctx context.Context, batchID int64, status types.BatchStatus) error {
 	_, err := s.pool.Exec(ctx,

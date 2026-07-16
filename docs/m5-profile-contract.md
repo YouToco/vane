@@ -650,6 +650,94 @@ negFeedbackMax 置 0 重编部署，或删 feedbacks 负反馈行。完整回滚
    **不会回来**（只增不减 + 游标语义的真人验证）；
 全过 → v0.5.0。
 
+### 16 修订记录（2026-07-16 Boss 拍板 · 探针固化 PR1）
+
+上面的原文保留不动以便对照。把 7 条探针从"人工 SSH + psql 手敲"固化成代码时，逐条对着源码核
+验了一遍——**7 条里 6 条的原文照抄下来会得到错误的结论**，且失效方向几乎全是**假绿**（探针说
+过了，实际没验着），这正是 M3 三批假 50 分静默照推的同一形状：坏掉的检查比没有检查更危险。
+以下修订随代码一并生效，冲突时以本节为准。
+
+- **探针 ②（中位分回退率，§16.2）**：原文「completion 无数字占比」未限定 `error`。失败行的
+  completion **恒为 ''**（`llm/do.go:41` 只在错误分支写 `call.Error`，`:46` 只在成功分支写
+  `call.Completion`），空串自然「无数字」——但失败条目**根本没发过中位分**，它被
+  `workflow/activities.go:325-329` 直接 `continue` 跳过了。把它算进分母，上游一次抖动就能凭空
+  冲爆 10% 红线，触发一次没有事故的回滚。**修订：分母限定 `error = ''`**，失败数单独展示不参与
+  红线（`store/observability.go:93` 的四联 FILTER 即此真值表）。
+- **探针 ①（分数区分度，§16.1）**：`span_name` 必须进 WHERE。一个 trace_id 横跨多个 span——
+  `workflow/workflow.go:45/74/100` 把同一个 traceID 依次传给 profile_evolve / score / cardgen。
+  不限定就把演化和卡片生成的 completion 混进"打分区分度"，distinct 被垫高 → **假绿**。
+  同理需限定 `error = ''`：失败行的 '' 既可能虚高 distinct（多一个空串）也可能虚低（整批失败
+  时 distinct=1 触发假红），两个方向都是误判。
+- **探针 ③（空输出零容忍，§16.3）**：**唯一无需修订的一条**，原文即可直接实现——
+  「error='' 且 completion=''」本就是 M3 事故（DisableThinking 回归）的精确形状。
+- **探针 ④a（注入反面断言，§16.4）**：两处修订。其一，**加 `span_name='score'` 限定**：cardgen
+  在**运行时**拼出一模一样的「用户画像：暂无」（`cardgen/cardgen.go:131` 的 "用户画像：" 拼
+  `:133` 的 "暂无"），源码里 grep 不到这个整串但库里确实有；每 trace 约 50 条 score + 5 条
+  cardgen，不限定就是两者混算。其二，**改为开头锚定**（`LIKE '用户画像：暂无%'`）而非原文的
+  `'%用户画像：暂无%'` 全文通配：正文是全系统最大的攻击面且 `promptguard.Sanitize` 不剥这串字，
+  一篇正文里恰好含「用户画像：暂无」的 RSS 就能让全文通配版误判成注入失效（**假红**）。
+  buildScoreUser 恒把画像行写在 user_prompt **开头**（`scorer/scorer.go:205/207` 两分支），开头
+  锚定不可伪造。
+  **前置条件**：必须先确认 `profiles` 有行。无画像时写「暂无」是**正确行为**，
+  profilehint 对 NotFound 刻意不告警（`profilehint/cache.go:35`：首采前的正常态）；且"画像读取
+  失败降级"与"本来就没画像"在 DB 里同形不可区分。故 owner 无画像时本探针判 **yellow 不适用**，
+  不是绿——vacuously green 会让人以为验过了。
+- **探针 ④b（`avg(prompt_tokens)` 应上浮，§16.4）**：**不可判定，已废**。原文无量级、无容差、
+  无基线存储三缺，且正文截断 800 rune 带来的抖动比画像本身大一个量级——同样的数字既能解释成
+  "画像注入了"也能解释成"今天的文章长一点"。**Boss 拍板改为正面字面量断言**（`LIKE '用户画像：%'`
+  且非「暂无」的条数 = 总条数），精确、无混淆因子，与 ④a 的反面断言恰好闭合成恒等式；
+  两边对不上（`Unrecognized > 0`）即 scorer 的 prompt 结构漂了而探针字面量没跟上，此时判**红并
+  指向探针自身**（`probe/probe.go:299-305`）——先修探针再谈判定。
+- **探针 ⑤（负面清单保尾，§16.5）**：不能用裸 `'%不感兴趣%'`/`'%不感兴趣：%'` 全文通配——
+  `scorer/scorer.go:223` 的快通道区块头【近期不感兴趣·…】里就有这四个字，而区块内嵌的是**用户
+  内容标题**：一条标题里恰好含"不感兴趣："就能让探针在**尾巴已经被切掉**时照样 PASS，正好把
+  审查 F1 要验的那件事验没了。**修订：锚定 user_prompt 第一行**（`split_part(user_prompt,
+  E'\n', 1)`）——画像 hint 是硬约束单行（profilehint 把换行折成空格），且 buildScoreUser 写完
+  画像行紧跟 `'\n'`（`scorer/scorer.go:209`），故可证明 hint 就是整个第一行。期望值由
+  `profilehint.NegTail(p)` 给出（本 PR 新导出）：负面句是 singleLine 之后的产物
+  （`profilehint.go:59→70→99`），与库里 summary 原文可能差在空白上，两边都折叠才能逐字比对。
+  当前画像无负面句时判 yellow 不适用，待 Gate 真人清单 ⑦ 跑过再复跑。
+- **探针 ⑥（成本，§16.6）**：**红线只卡 score span**（Boss 拍板）。M5 新增 profile_evolve 与
+  deep_dive 两个**全新** span，全 span 环比的首次比较必然因"上了新功能"而超标——那测的不是
+  "注入让打分变贵了"，是"M5 上线了"，红了也没有任何动作可做。全 span 总额仍展示，只是不卡。
+  **日界固定 UTC**：created_at 是 TIMESTAMPTZ（UTC），VPS 本地 EDT，Boss 读北京时间，三个时区
+  （红线 6）——探针内部一律认 DB 原生时区，换算只在前端，内部一出现本地时区"哪天"就随执行环境漂。
+  另加 **model 分组伴生探针**（`ListModelUsage`）：CostUSD 是按上游报回的 model 名查价算的，
+  未知 key **静默回落 v4-pro 价（约 3 倍）**——上游改个模型名就会无声烧穿预算，且不产生任何
+  error、不触发任何现有探针。按 model 分组能一眼看见没见过的名字。
+- **探针 ⑦（演化健康，§16.7）**：原文三条腿，只有一条能从 DB 判定。
+  - 「**tags 恒为旧集合超集**」→ **无历史表则不可从 DB 验证**：profiles 每用户仅一行、演化
+    就地覆盖（`store/profiles.go:98`），旧集合在写入那一刻就没了；migrations 001-007 无任何
+    历史表。反推 `llm_calls.completion` 同样**不成立**——completion 是模型的**提案**不是落库
+    结果：`normalizeTags` 会丢弃截断、`checkTagGuard` 可能整批拒绝，故 completion 里出现被删
+    标签恰恰是"守卫正确拦截了"的预期形状，拿它判红是把成功当失败。**Boss 拍板：移交单测**
+    （evolver 的 checkTagGuard 定向用例），PR2 加 `profile_snapshots` 历史表后本探针再补齐。
+  - 「语义失败 WARN 有 raw」→ 那是 journalctl 的活，不在 DB 里，探针只给查法不给判定。
+  - **可验证的部分**：`profiles.updated_at` 与最近一次 profile_evolve 调用时刻的先后。够用是
+    因为 `AdvanceProfileCursor` **刻意不刷 updated_at**（`store/profiles.go:112-120`：游标推进
+    不算内容变更），故 updated_at 晚于演化调用 ⇒ 确实写进去了。
+- **⚠️ Gate 执行顺序警告（新增，跨清单）**：真人清单第 **⑧ 项（手动修正画像）会无条件刷
+  `profiles.updated_at`**（`store/profiles.go:75`，UpsertProfileFields 的"人工恒赢"语义），
+  与探针 ⑦ 用的是**同一个信号**。**⑧ 与探针 ⑦ 的时间窗必须错开**，否则探针 ⑦ 的绿灯可能来自
+  你自己刚才的人工写入而不是演化——一个由 Gate 清单自身制造的假绿。建议顺序：先 ⑦（push_now
+  触发演化）→ 跑探针 ⑦ → 再做 ⑧。
+- **空批次缺口（新增，归 PR2）**：本契约的批次历史隐含假设 push_batches 有行，但 pipeline 有
+  **五处提前退出**（`workflow/workflow.go:55/66/77/92/103`：无新内容 / 去重后空 / 打分后空 /
+  择优后空 / 卡片生成后空）都在 Push 之前 `return nil`，此时 push_batches **零行**。
+  即"今早无新内容"这件事**在库里根本不存在**，不是查询查不到——看板与探针都无从区分"没跑"与
+  "跑了但没内容"。归 PR2（核心路径写入变更，按 CLAUDE.md 流程约定走全流程对抗审查）。
+- **探针已固化为代码**：判定与阈值在 `probe/` 包（`probe.Run` 返回 `Report`，含 7 条
+  `Result{ID,Name,ContractRef,Status,Summary,Detail}`，`Report.Worst()` 取最严重态）；SQL 在
+  `store/observability.go`（9 个只读聚合方法，不写任何表）。三态 green/yellow/red 而非布尔：
+  "没数据所以说不了话"必须是 yellow，算成绿就是假绿。探针本身**不调用任何模型**——用模型查
+  "模型有没有静默骗人"是循环论证，出问题时它自己也是坏的。
+  出口两个且共用 `probe/` 包：`/api/admin/observability`（看板，`api/observability.go` 的
+  `handleObservability`，走会话中间件）与 `cmd/gate`（CI/上线后一键跑，`cmd/gate/main.go`，
+  DB 直连不打 HTTP——"刚部署完服务还没起来"恰是探针最该说话的时刻，此时 HTTP 出口自己先挂了
+  只会把真指标盖成一片红；退出码 0 全绿/仅黄、1 有红、2 探针自身没跑起来，2 与 1 分开是因为
+  "红=产品坏了"与"探针连不上库"的处置动作完全不同）。单一实现是刻意的：探针 SQL 依赖 scorer
+  源码里的字面量，一旦有第二份必然漂。
+
 ## 17. 已知取舍与遗留（记录在案）
 
 - 语义失败推进游标=永久丢弃该批反馈影响（防死循环的刻意选择；WARN 含 raw 可追查）。
