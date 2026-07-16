@@ -74,14 +74,14 @@ type twitterTweet struct {
 	ConversationID string          `json:"conversation_id"`
 	Views          string          `json:"views"`
 	Source         string          `json:"source,omitempty"`
-	Retweeted      bool            `json:"retweeted"`
-	RetweetedTweet *twitterTweet   `json:"retweeted_tweet,omitempty"`
-	Quoted         *twitterTweet   `json:"quoted,omitempty"`
-	ReplyTo        string          `json:"reply_to,omitempty"`
 	Author         twitterAuthor   `json:"author"`
-	// 多态字段（§9.5）：空时为 []、非空时为 {}，不能用 struct 接。
-	Media    json.RawMessage `json:"media"`
-	Entities json.RawMessage `json:"entities"`
+	// 以下全部多态（§9.5 + 生产实测）：可能是 bool/string/对象/数组/null。
+	Retweeted      json.RawMessage `json:"retweeted"`
+	RetweetedTweet json.RawMessage `json:"retweeted_tweet"`
+	Quoted         json.RawMessage `json:"quoted"`
+	ReplyTo        json.RawMessage `json:"reply_to"`
+	Media          json.RawMessage `json:"media"`
+	Entities       json.RawMessage `json:"entities"`
 }
 
 type twitterAuthor struct {
@@ -173,8 +173,7 @@ func (f *TwitterFetcher) Fetch(ctx context.Context, src types.Source) ([]types.C
 func tweetToItem(tw twitterTweet, fallbackScreenName string) *types.ContentItem {
 	// 转推拆包（§9.4）：转推不是新内容，被转推的那条才是。
 	// ExternalID 取被转推那条的 tweet_id → 同一原创推经多号转发只落一行 content_item。
-	if tw.Retweeted && tw.RetweetedTweet != nil {
-		rt := tw.RetweetedTweet
+	if rt := extractRetweet(tw); rt != nil {
 		author := rt.Author.ScreenName
 		if author == "" {
 			author = fallbackScreenName
@@ -202,6 +201,30 @@ func tweetToItem(tw twitterTweet, fallbackScreenName string) *types.ContentItem 
 		Author:      author,
 		PublishedAt: parseTwitterTime(tw.CreatedAt),
 	}
+}
+
+// extractRetweet 从多态的 retweeted / retweeted_tweet 字段提取被转推的推文。
+// 生产实测 retweeted 可能是 bool(true) 或对象（含完整推文数据），retweeted_tweet
+// 可能存在或不存在。优先取 retweeted_tweet，其次尝试 retweeted 本身。
+func extractRetweet(tw twitterTweet) *twitterTweet {
+	if rt := tryParseTweet(tw.RetweetedTweet); rt != nil {
+		return rt
+	}
+	if rt := tryParseTweet(tw.Retweeted); rt != nil {
+		return rt
+	}
+	return nil
+}
+
+func tryParseTweet(raw json.RawMessage) *twitterTweet {
+	if len(raw) == 0 || raw[0] != '{' {
+		return nil
+	}
+	var t twitterTweet
+	if json.Unmarshal(raw, &t) == nil && t.TweetID != "" {
+		return &t
+	}
+	return nil
 }
 
 func parseTwitterTime(s string) *time.Time {
