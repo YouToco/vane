@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -188,6 +189,7 @@ func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.Conte
 	if err != nil {
 		return nil, err
 	}
+	items = f.applyCategories(src, items)
 	return mapItems(src, items), nil
 }
 
@@ -196,7 +198,8 @@ type rssSourceConfig struct {
 	// LookbackDays 只收最近 N 天发布的条目：0（含字段缺省）用默认 rssDefaultLookbackDays；
 	// <0 表示不限（全量）。语义与 exaSourceConfig.LookbackDays 一致——同一个 config 键
 	// 在不同源类型下含义相同，配源的人不必记住例外。
-	LookbackDays int `json:"lookback_days,omitempty"`
+	LookbackDays int      `json:"lookback_days,omitempty"`
+	Categories   []string `json:"categories,omitempty"`
 }
 
 // applyLookback 按 src.Config 的 lookback_days 丢弃过老的条目。
@@ -248,6 +251,46 @@ func (f *Fetcher) applyLookback(src types.Source, items []*gofeed.Item) ([]*gofe
 			"dropped", dropped, "kept", len(out))
 	}
 	return out, nil
+}
+
+func (f *Fetcher) applyCategories(src types.Source, items []*gofeed.Item) []*gofeed.Item {
+	var sc rssSourceConfig
+	if len(src.Config) > 0 {
+		_ = json.Unmarshal(src.Config, &sc)
+	}
+	if len(sc.Categories) == 0 {
+		return items
+	}
+
+	want := make(map[string]struct{}, len(sc.Categories))
+	for _, c := range sc.Categories {
+		want[strings.ToLower(strings.TrimSpace(c))] = struct{}{}
+	}
+
+	out := make([]*gofeed.Item, 0, len(items))
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		if matchesCategory(it.Categories, want) {
+			out = append(out, it)
+		}
+	}
+	if dropped := len(items) - len(out); dropped > 0 {
+		slog.Debug("RSS categories 过滤掉不匹配条目",
+			"source_id", src.ID, "categories", sc.Categories,
+			"dropped", dropped, "kept", len(out))
+	}
+	return out
+}
+
+func matchesCategory(itemCats []string, want map[string]struct{}) bool {
+	for _, c := range itemCats {
+		if _, ok := want[strings.ToLower(strings.TrimSpace(c))]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // mapItems 把 gofeed 条目映射为 ContentItem，并在入库前算好 content_hash（精确指纹）

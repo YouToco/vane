@@ -146,7 +146,7 @@ func (s *Store) ListSubscribedSourcesByUser(ctx context.Context, userID int64) (
 //
 // 新插入时 status / fetch_interval_seconds / next_fetch_at / fail_count 走 001 的 DB
 // 默认值（active / 1800 / now() / 0），调用方无需关心冷启动细节。
-func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (int64, error) {
+func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (id int64, updated bool, err error) {
 	// config NOT NULL DEFAULT '{}'：nil / 空 RawMessage 归一为 '{}'，避免写入 NULL 触发约束。
 	cfg := src.Config
 	if len(cfg) == 0 {
@@ -155,8 +155,9 @@ func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (int64, err
 
 	// DO UPDATE 而非 DO NOTHING：DO NOTHING 在冲突时不返回行，还得补一次 SELECT；
 	// DO UPDATE 冲突时也 RETURNING id，一次往返拿到结果，且顺带完成元数据刷新。
-	var id int64
-	err := s.pool.QueryRow(ctx,
+	// xmax = 0 表示 INSERT（行从未被更新过），xmax <> 0 表示 UPDATE（命中了既有行）。
+	var xmax int64
+	err = s.pool.QueryRow(ctx,
 		`INSERT INTO sources (platform, capability, url, title, config)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (url) DO UPDATE
@@ -165,13 +166,13 @@ func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (int64, err
 		     title      = COALESCE(NULLIF(EXCLUDED.title, ''), sources.title),
 		     config     = EXCLUDED.config,
 		     updated_at = now()
-		 RETURNING id`,
-		src.Platform, src.Capability, src.URL, src.Title, cfg).Scan(&id)
+		 RETURNING id, xmax`,
+		src.Platform, src.Capability, src.URL, src.Title, cfg).Scan(&id, &xmax)
 	if err != nil {
-		return 0, types.NewAppError(types.CodeDatabase,
+		return 0, false, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("upsert 信源（url=%s）", src.URL), err)
 	}
-	return id, nil
+	return id, xmax != 0, nil
 }
 
 // UpdateSourceFetchState 抓取完成后同步写 last_fetched_at / next_fetch_at / fail_count。

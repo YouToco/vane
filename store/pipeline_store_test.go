@@ -55,7 +55,7 @@ func TestPipelineStore(t *testing.T) {
 	}
 
 	srcURL := "https://example.com/test-pipeline-" + uuid.NewString()
-	srcID, err := st.UpsertSource(ctx, &types.Source{
+	srcID, _, err := st.UpsertSource(ctx, &types.Source{
 		Platform:   types.PlatformWeb,
 		Capability: types.CapFeed,
 		URL:        srcURL,
@@ -66,7 +66,7 @@ func TestPipelineStore(t *testing.T) {
 	}
 	// 第二个源：007 的跨源用例（同一条内容命中两个源）都要它。放在 Cleanup 注册前
 	// 建好，否则子测试里新建的源会漏出清理范围、污染共享测试库。
-	src2ID, err := st.UpsertSource(ctx, &types.Source{
+	src2ID, _, err := st.UpsertSource(ctx, &types.Source{
 		Platform:   types.PlatformWeb,
 		Capability: types.CapFeed,
 		URL:        "https://example.com/test-pipeline-2nd-" + uuid.NewString(),
@@ -96,7 +96,7 @@ func TestPipelineStore(t *testing.T) {
 	})
 
 	t.Run("UpsertSource按url幂等", func(t *testing.T) {
-		again, err := st.UpsertSource(ctx, &types.Source{
+		again, updated, err := st.UpsertSource(ctx, &types.Source{
 			Platform:   types.PlatformWeb,
 			Capability: types.CapFeed,
 			URL:        srcURL,
@@ -104,6 +104,9 @@ func TestPipelineStore(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatalf("UpsertSource() 二次调用失败: %v", err)
+		}
+		if !updated {
+			t.Error("同 url 第二次 upsert 应返回 updated=true")
 		}
 		if again != srcID {
 			t.Errorf("同 url 重复 upsert 应返回同 id：首次 %d，二次 %d", srcID, again)
@@ -126,7 +129,7 @@ func TestPipelineStore(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				<-start
-				ids[i], errs[i] = st.UpsertSource(ctx, &types.Source{
+				ids[i], _, errs[i] = st.UpsertSource(ctx, &types.Source{
 					Platform:   types.PlatformWeb,
 					Capability: types.CapFeed,
 					URL:        concURL,

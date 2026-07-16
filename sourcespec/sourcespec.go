@@ -61,13 +61,21 @@ func buildWeb(cap types.Capability, params map[string]string, title string) (*ty
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return nil, "url 必须是合法的 http/https 地址"
 		}
-		return &types.Source{
+		src := &types.Source{
 			Platform:   types.PlatformWeb,
 			Capability: types.CapFeed,
 			URL:        rawURL,
 			Title:      title,
 			Status:     types.SourceStatusActive,
-		}, ""
+		}
+		if catJSON := params["categories"]; catJSON != "" {
+			var cats []string
+			if json.Unmarshal([]byte(catJSON), &cats) == nil && len(cats) > 0 {
+				cfg, _ := json.Marshal(map[string]interface{}{"categories": cats})
+				src.Config = cfg
+			}
+		}
+		return src, ""
 
 	case types.CapSearch:
 		query := strings.TrimSpace(params["query"])

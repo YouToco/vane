@@ -260,7 +260,7 @@ func TestFeedbackStore(t *testing.T) {
 	}
 	userIDs := []int64{u.ID, u2.ID}
 
-	srcID, err := st.UpsertSource(ctx, &types.Source{
+	srcID, _, err := st.UpsertSource(ctx, &types.Source{
 		Platform:   types.PlatformWeb,
 		Capability: types.CapFeed,
 		URL:        "https://example.com/test-feedback-" + uuid.NewString(),
