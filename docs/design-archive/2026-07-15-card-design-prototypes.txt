@@ -1,0 +1,259 @@
+总消息数: 20
+
+=== 2026-07-15 11:52 | om_x100b6a4fe272b4a0b1 ===
+<card title="Agent 的下一个战场，不是模型，是 Runtime" subtitle="🤖 AI Agent 情报 · 53AI · 3 天前">
+「⚡ 92」
+**模型能力已经够用，卡住 Agent 上线的是运行时**
+
+执行沙箱、状态管理、浏览器自动化、可观测性——每项都有成熟供应商，但拼成一条完整链路的工程量，远超小团队的承受范围。OpenRouter 验证了路由，E2B 验证了沙箱，**统一入口仍是空白**。
+「为什么与你有关」 你正在自建 Vane 的 agent loop + Temporal 编排，这篇把「薄脚手架 + 状态 / 观测 / 恢复」的取舍讲透了。
+[阅读原文](https://www.53ai.com/news/LargeLanguageModel/2026071203816.html) [👍] [👎] [🔍 深挖]
+🚫 已记录：不感兴趣
+<form>
+哪里不对？说一句，下次就准了（可跳过）...
+[提交]
+</form>
+</card>
+
+=== 2026-07-15 11:38 | om_x100b6a4f375dc8a0b3 ===
+<card>
+</card>
+
+=== 2026-07-15 11:38 | om_x100b6a4f37ba04a4b4 ===
+<card>
+</card>
+
+=== 2026-07-15 11:36 | om_x100b6a4f3ca570a0b2 ===
+<card title="Agent 的下一个战场，不是模型，是 Runtime" subtitle="🤖 AI Agent 情报 · 53AI · 3 天前">
+「⚡ 92」
+**模型能力已经够用，卡住 Agent 上线的是运行时**
+
+执行沙箱、状态管理、浏览器自动化、可观测性——每项都有成熟供应商，但拼成一条完整链路的工程量，远超小团队的承受范围。OpenRouter 验证了路由，E2B 验证了沙箱，**统一入口仍是空白**。
+「为什么与你有关」 你正在自建 Vane 的 agent loop + Temporal 编排，这篇把「薄脚手架 + 状态 / 观测 / 恢复」的取舍讲透了。
+[阅读原文](https://www.53ai.com/news/LargeLanguageModel/2026071203816.html) [👍] [👎] [🔍 深挖]
+</card>
+
+=== 2026-07-15 11:33 | om_x100b6a4f2b9eb4a8b4 ===
+<card title="🐹 Go 生态 · 今日 2 条" subtitle="输入框常驻版 · 对比用">
+**Google ADK：Agentic Engineering 五件事**  「⚡ 88」
+Google 开源攒两年的 Agent 框架，Go 是一等公民。ADK 2.0 起 graph workflow 取代 Sequential/Loop 模板。
+「为什么与你有关」 Vane 是 Go 写的 agent loop，ADK 的 Go SDK 是少见的同级参照物。
+📝 Text Matrix · 4 天前
+[阅读原文](https://txtmix.com/posts/tech/google-adk-agentic-engineering-2026/) [👍] [👎] [🔍 深挖]
+<form>
+这条哪里不对？说一句，下次就准了...
+[提交评价]
+</form>
+---
+**从 LLM 到 AGI：大模型未来会走向哪里**  「⚡ 85」
+Agent 的关键进步不是多回答几轮，而是让系统具备显式状态、工具权限、终止条件和环境反馈。
+「为什么与你有关」 直接对应你 M5 画像 + 反馈闭环要解决的「长链路误差累积」。
+📝 Matt's Blog · 今天
+[阅读原文](https://matt33.com/2026/07/15/llm-to-agi/) [👍] [👎] [🔍 深挖]
+<form>
+这条哪里不对？说一句，下次就准了...
+[提交评价]
+</form>
+</card>
+
+=== 2026-07-15 11:27 | om_x100b6a4f012710a0b3 ===
+<card title="🐹 Go 生态 · 今日 2 条" subtitle="2026-07-15 08:30 · 按相关度排序">
+**Google ADK：Agentic Engineering 五件事**  「⚡ 88」
+Google 开源攒两年的 Agent 框架，Go 是一等公民。ADK 2.0 起 graph workflow 取代 Sequential/Loop 模板，官方明说新项目别用旧模板。
+「为什么与你有关」 Vane 是 Go 写的 agent loop，ADK 的 Go SDK 是目前少见的同级参照物。
+📝 Text Matrix · 4 天前
+[阅读原文](https://txtmix.com/posts/tech/google-adk-agentic-engineering-2026/) [👍] [👎] [🔍 深挖]
+---
+**从 LLM 到 AGI：大模型未来会走向哪里**  「⚡ 85」
+Agent 的关键进步不是多回答几轮，而是让系统具备显式状态、工具权限、终止条件和环境反馈。任务链路越长，局部错误越容易累积放大。
+「为什么与你有关」 直接对应你 M5 画像 + 反馈闭环要解决的「长链路误差累积」。
+📝 Matt's Blog · 今天
+[阅读原文](https://matt33.com/2026/07/15/llm-to-agi/) [👍] [👎] [🔍 深挖]
+📝 回复时说明第几条，我能记住你的偏好
+</card>
+
+=== 2026-07-15 11:27 | om_x100b6a4f011b28a4b2 ===
+<card title="Anthropic 高管对谈：Agent 的终极形态是看不见的操作系统" subtitle="🔮 Anthropic 动态 · 53AI · 2 天前">
+「⚡ 89」
+**脚手架正在变薄，因为模型不再需要被框死**
+
+模型变强后，团队开始拆掉层层嵌套的条件判断框架。多 agent 协作已内置竞争、唱反调、顾问求助等策略。终局是 agent 深嵌组织内部，像一层看不见的基底，而非一个个要主动去找的工具。
+「为什么与你有关」 你的 secretary / executor / validator 对抗式编排正是文中「一个提想法、一个专门唱反调」的实践。
+[阅读原文](https://www.53ai.com/news/LargeLanguageModel/2026071310263.html) [👍] [👎] [🔍 深挖]
+</card>
+
+=== 2026-07-15 11:27 | om_x100b6a4f010d10a0b3 ===
+<card title="Agent 的下一个战场，不是模型，是 Runtime" subtitle="🤖 AI Agent 情报 · 53AI · 3 天前">
+「⚡ 92」
+**模型能力已经够用，卡住 Agent 上线的是运行时**
+
+执行沙箱、状态管理、浏览器自动化、可观测性——每项都有成熟供应商，但拼成一条完整链路的工程量，远超小团队的承受范围。OpenRouter 验证了路由，E2B 验证了沙箱，**统一入口仍是空白**。
+「为什么与你有关」 你正在自建 Vane 的 agent loop + Temporal 编排，这篇把「薄脚手架 + 状态 / 观测 / 恢复」的取舍讲透了。
+[阅读原文](https://www.53ai.com/news/LargeLanguageModel/2026071203816.html) [👍] [👎] [🔍 深挖]
+📝 回复本条消息可补充说明，帮我下次推得更准
+</card>
+
+=== 2026-07-15 11:11 | om_x100b6a4f5def3cacb2 ===
+<card title="Go 生态 · 今日 2 条" subtitle="2026-07-15 08:30 · 按相关度排序">
+**Google ADK：Agentic Engineering 五件事**  「⚡ 88」
+Google 开源攒两年的 Agent 框架，Go 是一等公民。ADK 2.0 起 graph workflow 取代 Sequential/Loop 模板，官方明说新项目别用旧模板。
+「为什么与你有关」 Vane 是 Go 写的 agent loop，ADK 的 Go SDK 是少见的同级参照物。
+📝 Text Matrix · 4 天前
+[阅读原文](https://txtmix.com/posts/tech/google-adk-agentic-engineering-2026/) [👍] [👎] [🔍 深挖]
+---
+**从 LLM 到 AGI：大模型未来会走向哪里**  「⚡ 85」
+Agent 的关键进步不是多回答几轮，而是让系统具备显式状态、工具权限、终止条件和环境反馈。任务链路越长，局部错误越容易累积放大。
+「为什么与你有关」 直接对应你 M5 画像 + 反馈闭环要解决的「长链路误差累积」。
+📝 Matt's Blog · 今天
+[阅读原文](https://matt33.com/2026/07/15/llm-to-agi/) [👍] [👎] [🔍 深挖]
+</card>
+
+=== 2026-07-15 11:11 | om_x100b6a4f5dc634acb1 ===
+<card title="Anthropic 高管对谈：Agent 的终极形态是看不见的操作系统" subtitle="Anthropic 动态 · 53AI · 2 天前">
+「⚡ 89」
+**脚手架正在变薄，因为模型不再需要被框死**
+
+模型变强后，团队开始拆掉层层嵌套的条件判断框架。多 agent 协作已内置竞争、唱反调、顾问求助等策略。终局是 agent 深嵌组织内部，像一层看不见的基底，而非一个个要主动去找的工具。
+「为什么与你有关」 你的 secretary / executor / validator 对抗式编排正是文中「一个提想法、一个专门唱反调」的实践。
+[阅读原文](https://www.53ai.com/news/LargeLanguageModel/2026071310263.html) [👍] [👎] [🔍 深挖]
+</card>
+
+=== 2026-07-15 11:11 | om_x100b6a4f5c3ae0a0b4 ===
+<card title="Agent 的下一个战场，不是模型，是 Runtime" subtitle="AI Agent 情报 · 53AI · 3 天前">
+「⚡ 92」
+**模型能力已经够用，卡住 Agent 上线的是运行时**
+
+执行沙箱、状态管理、浏览器自动化、可观测性——每项都有成熟供应商，但拼成一条完整链路的工程量，远超小团队的承受范围。OpenRouter 验证了路由，E2B 验证了沙箱，**统一入口仍是空白**。
+「为什么与你有关」 你正在自建 Vane 的 agent loop + Temporal 编排，这篇把「薄脚手架 + 状态 / 观测 / 恢复」的取舍讲透了。
+[阅读原文](https://www.53ai.com/news/LargeLanguageModel/2026071203816.html) [👍] [👎] [🔍 深挖]
+</card>
+
+=== 2026-07-15 10:44 | om_x100b6a4ee2e7d4a0b3 ===
+<card title="见微 Vane · 今日 3 条" subtitle="2026-07-15 早报 · 按相关度排序">
+**Agent 的下一个战场，不是模型，是 Runtime**
+模型够用了，卡住上线的是执行沙箱、状态、观测这一层。OpenRouter 验证了路由，E2B 验证了沙箱，统一入口仍空白。
+📝 对照你的 Temporal 编排边界 · 53AI · 3 天前
+
+⋮ 阅读原文(open), 感兴趣(interested), 不感兴趣(not_interested), 深度解读(deep_dive)
+---
+**Anthropic 高管对谈：Agent 的终极形态是看不见的操作系统**
+模型变强后脚手架正在变薄，团队开始拆掉层层嵌套的条件判断。多 agent 已内置竞争、唱反调、顾问求助等策略。
+📝 你的 secretary / validator 对抗式编排正是此文实践 · 53AI · 2 天前
+
+⋮ 阅读原文(open), 感兴趣(interested), 不感兴趣(not_interested), 深度解读(deep_dive)
+---
+**Google ADK：Agentic Engineering 五件事**
+Google 开源攒两年的 Agent 框架，Go 是一等公民。ADK 2.0 起 graph workflow 取代 Sequential/Loop 模板。
+📝 Vane 是 Go agent loop，这是少见的同级参照物 · Text Matrix · 4 天前
+
+⋮ 阅读原文(open), 感兴趣(interested), 不感兴趣(not_interested), 深度解读(deep_dive)
+📝 回复「设置」调整推送偏好或退订
+</card>
+
+=== 2026-07-15 10:44 | om_x100b6a4ee2dc00acb1 ===
+<card title="Agent 的下一个战场，不是模型，是 Runtime" subtitle="53AI · 3 天前">
+模型能力已经够用，卡住 Agent 上线的是运行时。执行沙箱、状态管理、浏览器自动化、可观测性——每项都有成熟供应商，但拼成一条完整链路的工程量，远超小团队的承受范围。
+
+OpenRouter 验证了路由，E2B 验证了沙箱，Browserbase 验证了浏览器——**统一入口仍是空白**。
+📝 你正在自建 Vane 的 agent loop + Temporal 编排，这篇把「薄脚手架 + 状态 / 观测 / 恢复」的取舍讲透了，可对照检查自己的 Runtime 边界。
+[阅读原文](https://www.53ai.com/news/LargeLanguageModel/2026071203816.html)
+
+⋮ 感兴趣(interested), 不感兴趣(not_interested), 这条推错了(misjudged), 深度解读(deep_dive)
+</card>
+
+=== 2026-07-15 10:38 | om_x100b6a4ed6f124a0b2 ===
+<card title="图标探针 · 看哪些图标真的出现">
+📝 calendar_outlined
+📝 time_outlined
+📝 clock_outlined
+📝 internet_outlined
+📝 link-copy_outlined
+📝 tag_outlined
+📝 collection_outlined
+📝 thumbsup_outlined
+📝 thumbdown_outlined
+📝 robot_outlined
+📝 info_outlined
+📝 more_outlined
+📝 right_outlined
+📝 down-small-ccm_outlined
+📝 star_outlined
+📝 fire_outlined
+📝 warning_outlined
+📝 done_outlined
+📝 edit_outlined
+📝 share_outlined
+📝 group_outlined
+📝 chat_outlined
+📝 file_outlined
+📝 search_outlined
+📝 pin_outlined
+</card>
+
+=== 2026-07-15 10:32 | om_x100b6a4ece2890a0b2 ===
+<card title="能力探针 · 请忽略内容只看渲染" subtitle="测试 2.0 各组件是否可用">
+**1 markdown 语法**：*斜体* **加粗** ~~删除线~~ `行内代码` [链接](https://vane.zhuoqidev.com)
+- 列表项一
+- 列表项二> 引用块测试灰字 红字 绿字 蓝字
+---
+**2 markdown 内嵌 text_tag**：「蓝标签」 「红标签」 「绿标签」
+---
+<clickable url="https://vane.zhuoqidev.com">
+**3 interactive_container**：整块可点击 + 圆角边框 + padding
+</clickable>
+---
+**4 column 背景色**
+grey 底
+
+**column 背景**
+blue 底
+---
+| 来源 | 相关度 |
+|------|------|
+| 53AI | 92 |
+| Text Matrix | 88 |
+---
+**6 emoji 与图标**：🔥 ⚡ 📌 ✅ 🚫 📖 —— 结束
+</card>
+
+=== 2026-07-15 10:27 | om_x100b6a4e206c0cb0b2 ===
+<card title="Google ADK：Agentic Engineering 五件事" subtitle="Text Matrix · 07-11">
+「⚡ 88」
+**Google 开源了攒两年的 Agent 框架，Go SDK 一等公民**
+
+ADK 同步推出 Python / TypeScript / **Go** / Java / Kotlin 五个 SDK，配 1 小时 12 分课程。核心是 control flow 框架而非 prompt 编排：ADK 2.0 起 graph workflow 取代 Sequential/Loop/Parallel 模板，官方明说新项目别用旧模板。Session（短期）与 MemoryService（长期）边界要一开始就划清。
+▶ 为什么与你有关
+    Vane 是 Go 写的 agent loop，ADK 的 Go SDK 是目前少见的同级参照物。文中「Session vs MemoryService 边界」直接对应你 M5 画像+反馈闭环的存储分层决策；「graph workflow 取代模板」可对照你的 Temporal 编排取舍。
+▲
+---
+相关度
+**88** / 100
+
+来源
+Text Matrix
+
+发布
+4 天前
+---
+[阅读原文](https://txtmix.com/posts/tech/google-adk-agentic-engineering-2026/) [感兴趣] [不感兴趣] [误判] [深度解读]
+</card>
+
+=== 2026-07-15 10:27 | om_x100b6a4e204150acb3 ===
+<card title="Anthropic 高管对谈：Agent 的终极形态是看不见的操作系统" subtitle="53AI · 3 天前">
+Claude Platform 三位高管谈半年来 agent 基础设施的变化：脚手架正在变薄——模型变强后，团队开始拆掉层层嵌套的条件判断框架。多 agent 协作已内置竞争、唱反调、顾问求助等策略。终局是 agent 深嵌组织内部，像一层看不见的基底而非一个个要主动去找的工具。
+**与你有关** · 你的 secretary/executor/validator 对抗式编排正是文中「一个提想法、一个专门唱反调」的实践；「脚手架变薄」对照你 M4 从固定 pipeline 转向 agent loop 的决策。
+[阅读原文 ›](https://www.53ai.com/news/LargeLanguageModel/2026071310263.html) [👍] [👎] [🔍 深挖]
+</card>
+
+=== 2026-07-15 10:26 | om_x100b6a4e259fb0a0b1 ===
+<card title="Agent 的下一个战场，不是模型，是 Runtime" subtitle="53AI · 07-12 · 相关度 92">
+「AI Agent」 「高相关」
+**模型能力已经够用了，卡住 Agent 上线的是运行时**
+
+文章认为 Agent 竞争正从「模型能力」迁移到「Runtime 层」——执行沙箱、状态管理、浏览器自动化、可观测性，每项都有供应商，但拼成完整链路的工程量压垮小团队。OpenRouter 验证了路由、E2B 验证了沙箱，统一入口仍是空白。
+「为什么与你有关」 你正在自建 Vane 的 agent loop + Temporal 编排，这篇把「薄脚手架 + 状态/观测/恢复」的取舍讲透了，可对照检查自己的 Runtime 边界。
+---
+[阅读原文](https://www.53ai.com/news/LargeLanguageModel/2026071203816.html) [感兴趣] [不感兴趣] [深度解读]
+见微 Vane · 2026-07-15 08:30 · 今日第 1/5 条
+</card>
+
