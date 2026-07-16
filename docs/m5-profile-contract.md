@@ -660,11 +660,11 @@ negFeedbackMax 置 0 重编部署，或删 feedbacks 负反馈行。完整回滚
 - **探针 ②（中位分回退率，§16.2）**：原文「completion 无数字占比」未限定 `error`。失败行的
   completion **恒为 ''**（`llm/do.go:41` 只在错误分支写 `call.Error`，`:46` 只在成功分支写
   `call.Completion`），空串自然「无数字」——但失败条目**根本没发过中位分**，它被
-  `workflow/activities.go:325-329` 直接 `continue` 跳过了。把它算进分母，上游一次抖动就能凭空
+  `Score` 活动里"单条打分失败，跳过"那个分支直接 `continue` 跳过了。把它算进分母，上游一次抖动就能凭空
   冲爆 10% 红线，触发一次没有事故的回滚。**修订：分母限定 `error = ''`**，失败数单独展示不参与
   红线（`store/observability.go:93` 的四联 FILTER 即此真值表）。
 - **探针 ①（分数区分度，§16.1）**：`span_name` 必须进 WHERE。一个 trace_id 横跨多个 span——
-  `workflow/workflow.go:45/74/100` 把同一个 traceID 依次传给 profile_evolve / score / cardgen。
+  `PushPipelineWorkflow` 把同一个 traceID 依次传给 `EvolveProfile` / `Score` / `CardGen` 三步。
   不限定就把演化和卡片生成的 completion 混进"打分区分度"，distinct 被垫高 → **假绿**。
   同理需限定 `error = ''`：失败行的 '' 既可能虚高 distinct（多一个空串）也可能虚低（整批失败
   时 distinct=1 触发假红），两个方向都是误判。
@@ -722,10 +722,12 @@ negFeedbackMax 置 0 重编部署，或删 feedbacks 负反馈行。完整回滚
   你自己刚才的人工写入而不是演化——一个由 Gate 清单自身制造的假绿。建议顺序：先 ⑦（push_now
   触发演化）→ 跑探针 ⑦ → 再做 ⑧。
 - **空批次缺口（新增，归 PR2）**：本契约的批次历史隐含假设 push_batches 有行，但 pipeline 有
-  **五处提前退出**（`workflow/workflow.go:55/66/77/92/103`：无新内容 / 去重后空 / 打分后空 /
-  择优后空 / 卡片生成后空）都在 Push 之前 `return nil`，此时 push_batches **零行**。
+  **五处提前退出**（`workflow/workflow.go` 里五处 `recordEmpty` 调用所在的闸门：无新内容 /
+  去重后空 / 打分后空 / 择优后空 / 卡片生成后空）都在 Push 之前 `return nil`，此时
+  push_batches **零行**。
   即"今早无新内容"这件事**在库里根本不存在**，不是查询查不到——看板与探针都无从区分"没跑"与
   "跑了但没内容"。归 PR2（核心路径写入变更，按 CLAUDE.md 流程约定走全流程对抗审查）。
+  **↑ 已由 PR2 关闭，处置见下节。**
 - **探针已固化为代码**：判定与阈值在 `probe/` 包（`probe.Run` 返回 `Report`，含 7 条
   `Result{ID,Name,ContractRef,Status,Summary,Detail}`，`Report.Worst()` 取最严重态）；SQL 在
   `store/observability.go`（9 个只读聚合方法，不写任何表）。三态 green/yellow/red 而非布尔：
@@ -737,6 +739,72 @@ negFeedbackMax 置 0 重编部署，或删 feedbacks 负反馈行。完整回滚
   只会把真指标盖成一片红；退出码 0 全绿/仅黄、1 有红、2 探针自身没跑起来，2 与 1 分开是因为
   "红=产品坏了"与"探针连不上库"的处置动作完全不同）。单一实现是刻意的：探针 SQL 依赖 scorer
   源码里的字面量，一旦有第二份必然漂。
+
+### 16 修订记录续（2026-07-16 · 空批次可见化 PR2）
+
+上一节最后那条「空批次缺口」的处置。migration **009** 给 push_batches 加两列，五处提前退出各留
+一行 `status='empty'` 的批次：
+
+- **`exit_gate`（TEXT，默认 ''）**：从哪个闸门退出（`fetch|dedup|score|select|cardgen`），
+  取值见 `types.BatchExitGate`。**与 status 分列两列**而不是把 status 拆成 `empty_fetch/…`：
+  两者正交——status 答"结局是什么"（现有消费方按它分支），exit_gate 答"为什么"。塞进 status
+  会让每个现有 status 消费方都要认识 5 个新值，且"empty"这个结局本身反而没法一句话查。
+  空串 = 没提前退出（跑到了 Push），009 之前的历史行**全部**如此，故默认值即其真实语义，无需回填。
+- **`stage_counts`（JSONB，默认 '{}'）**：漏斗快照，见 `types.PipelineCounts`。
+  **字段用 `*int` 且 omitempty，这是本设计的关键**：nil = 这一步**没跑**，0 = 跑了、返回 0 条。
+  用零值记录会让停在 dedup 闸门的运行写出 `scored=0`，读起来是"打分跑了、一条没打出来"
+  （LLM 全军覆没的形状），而事实是打分压根没被调用——那正是本 PR 要消灭的混淆，换个地方再造一次。
+  于是"抓到 20 条但全被去重掉"（`fetched=20, deduped=0`）与"压根没抓到新内容"（`fetched=0`）
+  在库里终于可区分。
+- **`BatchStatusEmpty` 是正常终态，不是失败**：failed 是"该推却推不出去"（有 cards、推送炸了），
+  empty 是"跑完了确实没东西可推"。混成一个值就等于把"飞书挂了"和"今天没新闻"报成同一件事。
+  看板据此给 empty 静默色而非红——把最平常的早晨报成故障，几天后就没人再看这张表了。
+- **死枚举 `pushing` 一并删除**（`types/enums.go`）：从 001 起零赋值、无任何 SQL 写过。
+  PR1 只在注释里标注了它并把删除留给写入侧 PR——在新增 `empty` 这个**真状态**的同时留着一个
+  **假状态**，会让下一个人把"卡在 pushing"当成需要排查的形状。
+- **写入口独立**：新增 `store.RecordEmptyPushBatch`，**刻意不扩** `CreatePushBatchIdempotent`
+  的签名——后者是 #1 CRITICAL"重试不重复发卡"的地基，而空批次与真实推送在同一次运行里互斥
+  （五处闸门全在 Push 之前 return），为一个正交的新语义去动核心幂等路径是拿地基换便利。
+  两者共用 `idempotency_key = traceID`（004 的 `uq_push_batches_idem`），故一个 traceID 在
+  push_batches 里恒只对应一行。`DO UPDATE ... WHERE status='empty'` 是防覆写护栏：Temporal
+  reset 已完成的运行时 traceID 由 SideEffect 重放为同值、而重放这趟会在 fetch 闸门空退，
+  无护栏就会把 `done` 的真实批次改写成 `empty`（库里从此有一行"没推任何东西却挂着 5 条投递"）。
+- **记账失败不改变终态**：`RecordEmptyBatch` Activity 失败只 Warn 不阻断（与 `PushPipelineWorkflow`
+  里 `EvolveProfile` 步骤的 `log.Warn` 同款）。"无内容可推是正常终态"是产品语义；让一次记账失败把它
+  变成 workflow 失败，等于为了记录这件事而破坏这件事，制造出比"库里没行"更坏的假失败告警。
+- **Temporal 兼容**：五处闸门插入 Activity 对 in-flight workflow 是非确定性变更。沿用
+  §8.2 既有先例不做版本化——推送是秒级短工作流，发布窗口避开 08:30 定时任务即可。
+- **仍存在的边界（刻意，不是遗漏）**：**pipeline 中途报错的运行仍无行**——活动重试耗尽后
+  workflow 直接失败，走不到任何闸门。"跑崩了"本就有记录（Temporal 里是 Failed + journalctl），
+  而"跑完了但没东西推"此前才是两边都无记录（闸门全 `return nil`，Temporal 显示 Completed，
+  库里零行）。把 Temporal 的执行史往 Postgres 抄一遍是用更差的实现重造一个 Temporal。
+  故 push_batches 的语义是"推送决策的产物"，不是"每次触发的日志"，看板文案已如实写明。
+- **成功批次不填 stage_counts**（刻意的范围控制，但**补它不是纯加法**）：要给 done 批次也填漏斗，
+  得把计数经 `PushIn` 传进 Push 活动——`PushIn` 是 in-flight 敏感的 Temporal 载荷（改它 = 停在
+  Push 前的 workflow 重放时解不出新字段，见 §8.2），且写入点落在 `CreatePushBatchIdempotent`
+  那条 #1 CRITICAL 幂等路径上：正是本 PR 通篇刻意绕开的两样东西。schema 确实不用再动（JSONB
+  列已就位），但 schema 从来不是这件事的难点，别让"列都建好了"读起来像"接上就行"。真要做先想
+  清楚值不值：`DeliveryCount` 已经给了末端，中间各级的价值目前只是"好看"。
+- **探针未新增第 8 条**：§16 仍是 7 条判定。空批次是**展示数据**（`Report.Batches`），
+  不参与红线——"今天没新闻"没有阈值可卡，硬给它一条探针只会周期性假红。
+- **PR2 的另一半（`profile_snapshots` 历史表补齐探针 ⑦ 的 tags 超集验证）不在本次范围**，
+  `probe/probe.go` 里那条 yellow 与其注释保持原样。
+
+**合并前双怀疑者审查的两处实测产出（均为真事故，留档）：**
+
+- **`RecordEmptyBatch` 曾漏注册**：Activity 加进了 workflow，却没加进 `cmd/server/main.go` 的
+  逐个注册清单。`go build` / `go vet` / `go test -race` **全绿**，而线上五处闸门的记账会
+  **全部静默失败**——整个"空批次可见化"沦为死代码，且失败形态恰恰就是本 PR 要消灭的静默。
+  §13 早已写明这个失效模式（"漏注册=每批推送静默拖慢数分钟——必须显式列出"）**也没挡住**：
+  散文里的警告拦不住一次机械遗漏。现由 `workflow/registration_test.go` 用反射比对 workflow
+  引用的 Activity 与 `main.go` 清单钉死，漏一个 CI 就红——把纪律换成断言。
+- **护栏原本是单向的**：`RecordEmptyPushBatch` 有防覆写护栏（`DO UPDATE ... WHERE
+  status='empty'`，挡"空批次盖掉真实批次"），但反向的 `CreatePushBatchIdempotent` 不复位这两列，
+  于是"先在 fetch 闸门记空批次 → Temporal reset 重跑 → 这次有内容一路走到 Push"会复用同一行、
+  收尾只改 status，留下 `status='done'` 却挂着 `exit_gate='fetch'` 的**嵌合行**：自相矛盾程度
+  与护栏要防的那条相当，只是从另一个方向到达，且**更容易发生**（"今早怎么没推？修好信源 reset
+  重跑"正是本 PR 的可见性会引出来的运维动作）。已在 `CreatePushBatchIdempotent` 的 `DO UPDATE`
+  加 `exit_gate = '', stage_counts = '{}'` 反向复位，两道护栏成镜像；两个突变体实验均验证会咬。
 
 ## 17. 已知取舍与遗留（记录在案）
 

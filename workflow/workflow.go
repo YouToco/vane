@@ -18,9 +18,16 @@ import (
 // 六主步任一失败即整体失败（由各步 RetryPolicy 先行重试）；
 // 中途"无内容可推"是正常终态，直接成功返回、不视为错误。
 //
-// Temporal 兼容（契约 §8.2）：EvolveProfile 插入与 Push 入参变更对 in-flight
-// workflow 是非确定性变更；推送是秒级短工作流，发布窗口避开 08:30 定时任务
-// 即可，刻意不做版本化。
+// 五处"无内容可推"的提前退出现在各留一行空批次（009 / 契约 §16 修订记录
+// 「空批次缺口」）：此前它们全部静默 return nil，push_batches 零行，五种语义
+// 完全不同的结局在库里塌缩成同一个"什么都没有"——"今早为什么没推送"这件事
+// 不是查询查不到，是数据不存在。记账仍不改变终态：**空批次依然是成功**。
+//
+// Temporal 兼容（契约 §8.2）：EvolveProfile 插入、Push 入参变更、以及本次在五处
+// 闸门插入 RecordEmptyBatch，对 in-flight workflow 都是非确定性变更（重放到闸门处
+// 会发现历史里没有这个 Activity）。沿用既有先例：推送是秒级短工作流，发布窗口
+// 避开 08:30 定时任务即可，刻意不做版本化（不引入 workflow.GetVersion——
+// 版本分支一旦种下就永远删不掉，为一个秒级工作流背这个包袱不划算）。
 func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	log := workflow.GetLogger(ctx)
 
@@ -39,6 +46,36 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 路由到 worker 注册的真实实例，nil 接收者不会被解引用（标准用法）。
 	var a *Activities
 
+	// counts 是漏斗快照，每步拿到结果后立刻累加（纯计算，确定性无碍）。
+	// 它让"抓到 20 条但全被去重掉"与"压根没抓到新内容"在库里可区分——两者此前
+	// 都只是"没有行"。未跑到的阶段保持 nil，不是 0（见 types.PipelineCounts：
+	// "没跑"和"跑了得 0"是两种不同的事故，用零值记录等于重造一次本 PR 要修的混淆）。
+	var counts types.PipelineCounts
+
+	// recordEmpty 把一次"跑完了但没东西可推"落库。闭包而非方法：Activities 的方法
+	// 值只用于解析 Activity 名，编排逻辑属于 workflow 函数体。
+	//
+	// 吞错是**刻意的**，与下方 EvolveProfile 步骤同一条原则（其 log.Warn 失败只提示不阻断）：
+	// 记账是给人看的附加信息，而"无内容可推是正常终态"是产品语义（红线）。让一次记账
+	// 失败把一个本来正常的空批次变成 workflow 失败，等于为了记录这件事而破坏这件事
+	// 本身——那会制造出比"库里没行"更坏的东西：一条假的失败告警。
+	//
+	// 下面把原始 err 整个塞进 log.Warn 是**有意的，且没有脱敏**——别以为这里处理过。
+	// 红线 3（错误卫生）管的是**用户文案与模型上下文**这两个出口，日志不在其列：
+	// 排障恰恰需要完整错误链，剥成 AppError.Message 只会让日志变成"记账失败了"这种
+	// 废话。同款先例：下方 EvolveProfile 步骤的 log.Warn、cmd/gate 里 config.Load 失败的 slog.Error。
+	// 真正受红线 3 约束的是 activities.go 的 retryableOrNot——它只放 AppError.Message
+	// 进 ApplicationError，那才是会被展示/喂进上下文的那一层（activities_test.go 有钉）。
+	recordEmpty := func(gate types.BatchExitGate) {
+		// 用 quick 档：纯一条 INSERT，且它无论如何都不该拖长一次"其实没事干"的运行。
+		recCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
+		in := RecordEmptyIn{UserID: p.UserID, TraceID: traceID, Gate: gate, Counts: counts}
+		if err := workflow.ExecuteActivity(recCtx, a.RecordEmptyBatch, in).Get(recCtx, nil); err != nil {
+			log.Warn("空批次记账失败，本次仍按正常终态结束",
+				"user_id", p.UserID, "trace_id", traceID, "gate", gate, "err", err)
+		}
+	}
+
 	// 0. EvolveProfile —— 画像演化前置步（Boss 拍板①：每次推送前批量消费反馈）。
 	// 红线：演化失败永不阻断推送——重试耗尽后错误吞掉只 Warn，pipeline 照常走。
 	evolveCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
@@ -52,7 +89,9 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	if err := workflow.ExecuteActivity(fetchCtx, a.Fetch, p).Get(fetchCtx, &items); err != nil {
 		return err
 	}
+	counts = counts.WithFetched(len(items))
 	if len(items) == 0 {
+		recordEmpty(types.BatchExitGateFetch)
 		log.Info("无新内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
@@ -63,7 +102,9 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	if err := workflow.ExecuteActivity(dedupCtx, a.Dedup, DedupIn{UserID: p.UserID, TraceID: traceID, Items: items}).Get(dedupCtx, &deduped); err != nil {
 		return err
 	}
+	counts = counts.WithDeduped(len(deduped))
 	if len(deduped) == 0 {
+		recordEmpty(types.BatchExitGateDedup)
 		log.Info("去重后无内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
@@ -74,7 +115,19 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	if err := workflow.ExecuteActivity(scoreCtx, a.Score, ScoreIn{UserID: p.UserID, TraceID: traceID, Items: deduped}).Get(scoreCtx, &scored); err != nil {
 		return err
 	}
+	// 本闸门当前**够不着**（core review 时核实，不是猜的）：Score 只在
+	// len(in.Items)==0 时返回空切片，而 in.Items 就是上面刚校验过非空的 deduped；
+	// 整批打分全失败走的是 activities.go 的 CodeLLMUnavailable 错误分支，不是空切片。
+	// Select/CardGen 两个闸门同理（各自注释另有说明）。
+	//
+	// 那为什么还要接线而不是删掉它？因为"够不着"是**下游活动当前实现**的性质，
+	// 不是编排的约定：Score 一旦加上"低于阈值不推"的过滤（M6 很可能要做），
+	// 这个闸门立刻变成热路径。闸门本身是廉价的防御，删了它 = 把"打分后没东西"
+	// 重新变回静默 return nil ——正是本 PR 在修的那个洞。接线让它在被走到的**第一天**
+	// 就有记录，而不是等到出事后再回来补。
+	counts = counts.WithScored(len(scored))
 	if len(scored) == 0 {
+		recordEmpty(types.BatchExitGateScore)
 		log.Info("打分后无内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
@@ -89,7 +142,11 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	if err := workflow.ExecuteActivity(selectCtx, a.Select, SelectIn{UserID: p.UserID, TraceID: traceID, TopN: topN, Scored: scored}).Get(selectCtx, &selected); err != nil {
 		return err
 	}
+	// 同样够不着：selector.RankTopN 只在 n<=0 或输入为空时返回空切片
+	// （selector.go:65-67），而 topN 上面刚归一到 >=1、scored 刚校验非空。
+	counts = counts.WithSelected(len(selected))
 	if len(selected) == 0 {
+		recordEmpty(types.BatchExitGateSelect)
 		log.Info("择优后无内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
@@ -100,7 +157,11 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	if err := workflow.ExecuteActivity(cardCtx, a.CardGen, CardGenIn{UserID: p.UserID, TraceID: traceID, Items: selected}).Get(cardCtx, &cards); err != nil {
 		return err
 	}
+	// 同 Score：CardGen 整批全失败走 CodeLLMUnavailable 错误分支，空切片只在
+	// 入参为空时出现，而 selected 刚校验非空。
+	counts = counts.WithCards(len(cards))
 	if len(cards) == 0 {
+		recordEmpty(types.BatchExitGateCardGen)
 		log.Info("卡片生成后无内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}

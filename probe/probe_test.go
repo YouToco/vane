@@ -171,7 +171,7 @@ func TestJudgeFallbackRate(t *testing.T) {
 			types.ScoreQualityStat{OKTotal: 10, NoDigit: 10}, StatusRed},
 		{"零回退",
 			types.ScoreQualityStat{OKTotal: 50, NoDigit: 0}, StatusGreen},
-		// 分母只含成功调用：Errored 的条目被 pipeline 直接跳过（activities.go:325-329），
+		// 分母只含成功调用：Errored 的条目被 Score 活动的"单条打分失败，跳过"分支直接跳过，
 		// **没有发出任何分数**。把它算进回退率的话，一次上游 429 抖动就能冲爆红线。
 		{"90 次调用失败不进分母：0/10 是 0% 而不是 90%",
 			types.ScoreQualityStat{OKTotal: 10, NoDigit: 0, Errored: 90}, StatusGreen},

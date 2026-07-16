@@ -436,7 +436,7 @@ func judgeEvolve(e EvolveView) Result {
 	if e.Errored == e.Calls {
 		r.Status = StatusRed
 		r.Summary = fmt.Sprintf("%d 次演化调用全部失败", e.Calls)
-		r.Detail = "演化失败不阻断推送（workflow.go:46 只 Warn），所以链路看起来是绿的——" +
+		r.Detail = "演化失败不阻断推送（workflow 的 EvolveProfile 步骤只 Warn），所以链路看起来是绿的——" +
 			"但画像已经停止吸收反馈，「越用越准」这条线断了。" + tagsNote
 		return r
 	}
