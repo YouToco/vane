@@ -1,5 +1,3 @@
-// 自 api/subscriptions_test.go 原样迁移（M4 契约 §6）：用例逻辑不变，
-// buildSource(addSubscriptionReq{...}) 改为 Build(Spec{...})。
 package sourcespec
 
 import (
@@ -9,95 +7,170 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-func TestBuild_RSSDefault(t *testing.T) {
-	src, msg := Build(Spec{URL: "https://example.com/feed.xml"})
+func TestBuild_WebFeed(t *testing.T) {
+	src, msg := Build(Spec{
+		Platform:   "web",
+		Capability: "feed",
+		Params:     map[string]string{"url": "https://example.com/feed.xml"},
+	})
 	if msg != "" {
-		t.Fatalf("合法 RSS 请求不应报错: %s", msg)
+		t.Fatalf("合法 web/feed 请求不应报错: %s", msg)
 	}
-	if src.Type != types.SourceTypeRSS || src.URL != "https://example.com/feed.xml" {
-		t.Errorf("缺省 type 应为 rss，实际 %+v", src)
+	if src.Platform != types.PlatformWeb || src.Capability != types.CapFeed {
+		t.Errorf("应为 web/feed，实际 %s/%s", src.Platform, src.Capability)
+	}
+	if src.URL != "https://example.com/feed.xml" {
+		t.Errorf("URL 不符: %q", src.URL)
 	}
 }
 
-func TestBuild_RSSRejectsBadURL(t *testing.T) {
-	for _, u := range []string{"", "ftp://x.com/feed", "exa://search?q=x", "not-a-url"} {
-		if _, msg := Build(Spec{URL: u}); msg == "" {
+func TestBuild_WebFeedRejectsBadURL(t *testing.T) {
+	for _, u := range []string{"", "ftp://x.com/feed", "vane://web/search?q=x", "not-a-url"} {
+		if _, msg := Build(Spec{
+			Platform:   "web",
+			Capability: "feed",
+			Params:     map[string]string{"url": u},
+		}); msg == "" {
 			t.Errorf("URL %q 应被拒绝", u)
 		}
 	}
 }
 
-func TestBuild_ExaCategoryInIdempotencyKey(t *testing.T) {
-	// 回归（审查 #幂等键）：category 改变抓取语义，必须参与合成键——
-	// 否则同 query 不同 category 撞同一 sources 行，config 被静默覆盖。
-	a, msg := Build(Spec{Type: "exa", Query: "AI", Category: "news"})
+func TestBuild_WebSearchCategoryInIdempotencyKey(t *testing.T) {
+	a, msg := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": "AI", "category": "news"}})
 	if msg != "" {
 		t.Fatalf("意外报错: %s", msg)
 	}
-	b, msg := Build(Spec{Type: "exa", Query: "AI", Category: "research paper"})
+	b, msg := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": "AI", "category": "research paper"}})
 	if msg != "" {
 		t.Fatalf("意外报错: %s", msg)
 	}
-	c, msg := Build(Spec{Type: "exa", Query: "AI"})
+	c, msg := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": "AI"}})
 	if msg != "" {
 		t.Fatalf("意外报错: %s", msg)
 	}
 	if a.URL == b.URL || a.URL == c.URL || b.URL == c.URL {
 		t.Errorf("不同 category 应生成不同幂等键: %q / %q / %q", a.URL, b.URL, c.URL)
 	}
-	// 完全相同的 (query, category) 仍应幂等命中同一键。
-	a2, _ := Build(Spec{Type: "exa", Query: "AI", Category: "news"})
+	a2, _ := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": "AI", "category": "news"}})
 	if a.URL != a2.URL {
 		t.Errorf("同 (query,category) 应生成同一幂等键: %q vs %q", a.URL, a2.URL)
 	}
 }
 
 func TestBuild_TrimsWhitespace(t *testing.T) {
-	// 回归（审查 #归一化）："AI" 与 "AI " 必须收敛到同一幂等键；全空白应被拒。
-	a, _ := Build(Spec{Type: "exa", Query: "AI"})
-	b, _ := Build(Spec{Type: "exa", Query: "  AI  "})
+	a, _ := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": "AI"}})
+	b, _ := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": "  AI  "}})
 	if a.URL != b.URL {
 		t.Errorf("首尾空白应被归一化: %q vs %q", a.URL, b.URL)
 	}
-	if _, msg := Build(Spec{Type: "exa", Query: "   "}); msg == "" {
-		t.Error("全空白 query 应被拒绝（否则建出永久失败的源）")
+	if _, msg := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": "   "}}); msg == "" {
+		t.Error("全空白 query 应被拒绝")
 	}
-	if _, msg := Build(Spec{Type: "tikhub_xhs", Keyword: "\t \n"}); msg == "" {
+	if _, msg := Build(Spec{Platform: "xhs", Capability: "search", Params: map[string]string{"keyword": "\t \n"}}); msg == "" {
 		t.Error("全空白 keyword 应被拒绝")
 	}
 }
 
 func TestBuild_RejectsOverlongParams(t *testing.T) {
 	long := strings.Repeat("长", maxSourceParamRunes+1)
-	if _, msg := Build(Spec{Type: "exa", Query: long}); msg == "" {
+	if _, msg := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": long}}); msg == "" {
 		t.Error("超长 query 应被拒绝")
 	}
-	if _, msg := Build(Spec{Type: "tikhub_xhs", Keyword: long}); msg == "" {
+	if _, msg := Build(Spec{Platform: "xhs", Capability: "search", Params: map[string]string{"keyword": long}}); msg == "" {
 		t.Error("超长 keyword 应被拒绝")
 	}
 }
 
-func TestBuild_TikhubKeyword(t *testing.T) {
-	src, msg := Build(Spec{Type: "tikhub_xhs", Keyword: "AI 创业"})
+func TestBuild_XHSSearch(t *testing.T) {
+	src, msg := Build(Spec{Platform: "xhs", Capability: "search", Params: map[string]string{"keyword": "AI 创业"}})
 	if msg != "" {
 		t.Fatalf("意外报错: %s", msg)
 	}
-	if src.Type != types.SourceTypeTikHubXHS {
-		t.Errorf("Type 应为 tikhub_xhs，实际 %q", src.Type)
+	if src.Platform != types.PlatformXHS || src.Capability != types.CapSearch {
+		t.Errorf("应为 xhs/search，实际 %s/%s", src.Platform, src.Capability)
 	}
-	if !strings.HasPrefix(src.URL, "tikhub://xhs/search?keyword=") {
+	if !strings.HasPrefix(src.URL, "vane://xhs/search?keyword=") {
 		t.Errorf("合成 URL 前缀不符: %q", src.URL)
 	}
 	if src.Title != "小红书: AI 创业" {
 		t.Errorf("默认 Title 不符: %q", src.Title)
 	}
-	if _, msg := Build(Spec{Type: "tikhub_xhs"}); msg == "" {
+	if _, msg := Build(Spec{Platform: "xhs", Capability: "search", Params: map[string]string{}}); msg == "" {
 		t.Error("缺 keyword 应被拒绝")
 	}
 }
 
-func TestBuild_UnknownType(t *testing.T) {
-	if _, msg := Build(Spec{Type: "carrier_pigeon", URL: "https://x.com"}); msg == "" {
+func TestBuild_XUserPosts(t *testing.T) {
+	src, msg := Build(Spec{Platform: "x", Capability: "user_posts", Params: map[string]string{"screen_name": "@elonmusk"}})
+	if msg != "" {
+		t.Fatalf("意外报错: %s", msg)
+	}
+	if src.Platform != types.PlatformX || src.Capability != types.CapUserPosts {
+		t.Errorf("应为 x/user_posts，实际 %s/%s", src.Platform, src.Capability)
+	}
+	if !strings.HasPrefix(src.URL, "vane://x/user_posts?screen_name=") {
+		t.Errorf("合成 URL 前缀不符: %q", src.URL)
+	}
+	if strings.Contains(src.URL, "%40") || strings.Contains(src.URL, "@") {
+		t.Errorf("screen_name 中的 @ 应被去除: %q", src.URL)
+	}
+	if src.Title != "X: @elonmusk" {
+		t.Errorf("默认 Title 不符: %q", src.Title)
+	}
+	if _, msg := Build(Spec{Platform: "x", Capability: "user_posts", Params: map[string]string{}}); msg == "" {
+		t.Error("缺 screen_name 应被拒绝")
+	}
+}
+
+func TestBuild_UnknownPlatform(t *testing.T) {
+	if _, msg := Build(Spec{Platform: "carrier_pigeon", Capability: "user_posts"}); msg == "" {
+		t.Error("未知 platform 应被拒绝")
+	}
+}
+
+func TestBuildLegacy_RSS(t *testing.T) {
+	src, msg := BuildLegacy("rss", "https://example.com/feed.xml", "", "", "", "")
+	if msg != "" {
+		t.Fatalf("合法 rss legacy 请求不应报错: %s", msg)
+	}
+	if src.Platform != types.PlatformWeb || src.Capability != types.CapFeed {
+		t.Errorf("legacy rss 应映射到 web/feed，实际 %s/%s", src.Platform, src.Capability)
+	}
+}
+
+func TestBuildLegacy_EmptyTypeDefaultsToRSS(t *testing.T) {
+	src, msg := BuildLegacy("", "https://example.com/feed.xml", "", "", "", "")
+	if msg != "" {
+		t.Fatalf("type 为空应默认 rss: %s", msg)
+	}
+	if src.Platform != types.PlatformWeb || src.Capability != types.CapFeed {
+		t.Errorf("空 type 应映射到 web/feed，实际 %s/%s", src.Platform, src.Capability)
+	}
+}
+
+func TestBuildLegacy_Exa(t *testing.T) {
+	src, msg := BuildLegacy("exa", "", "AI", "", "", "news")
+	if msg != "" {
+		t.Fatalf("合法 exa legacy 请求不应报错: %s", msg)
+	}
+	if src.Platform != types.PlatformWeb || src.Capability != types.CapSearch {
+		t.Errorf("legacy exa 应映射到 web/search，实际 %s/%s", src.Platform, src.Capability)
+	}
+}
+
+func TestBuildLegacy_TikHubXHS(t *testing.T) {
+	src, msg := BuildLegacy("tikhub_xhs", "", "", "AI 创业", "", "")
+	if msg != "" {
+		t.Fatalf("合法 tikhub_xhs legacy 请求不应报错: %s", msg)
+	}
+	if src.Platform != types.PlatformXHS || src.Capability != types.CapSearch {
+		t.Errorf("legacy tikhub_xhs 应映射到 xhs/search，实际 %s/%s", src.Platform, src.Capability)
+	}
+}
+
+func TestBuildLegacy_UnknownType(t *testing.T) {
+	if _, msg := BuildLegacy("carrier_pigeon", "https://x.com", "", "", "", ""); msg == "" {
 		t.Error("未知 type 应被拒绝")
 	}
 }

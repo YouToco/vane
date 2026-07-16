@@ -318,12 +318,12 @@ func noRedirect(_ *http.Request, _ []*http.Request) error {
 }
 
 // finalize 为一条抓取到的内容补齐落库前的确定性字段：精确指纹 content_hash、
-// 近似指纹 simhash、全局身份 canonical_key、以及 external_id 兜底。三个信源类型
+// 近似指纹 simhash、全局身份 canonical_key、以及 external_id 兜底。全部抓取器
 // （RSS/Exa/TikHub）共用此逻辑，保证计算方式一致——尤其 simhash 必须在抓取时就
 // 写入 content_items，Dedup 的排除自撞（查历史 simhash 时排除本批 ID）才成立。
 // 调用方只需填好业务字段。
 //
-// 需要 src 是因为 canonical_key 按信源类型分派（rss/exa 认 url、tikhub_xhs 认
+// 需要 src 是因为 canonical_key 按 Platform 分派（web 认 url、xhs 认
 // note_id，见 CanonicalKey）——身份不是内容自己能决定的，得知道它从哪来。
 //
 // 返回 false 表示**这条必须丢弃**，三个 map 函数一律 continue（契约 §5）。做成
@@ -342,16 +342,14 @@ func finalize(src types.Source, item *types.ContentItem) bool {
 	sh := dedup.Simhash(item.Title + " " + item.Content)
 	item.Simhash = &sh
 
-	// 全局身份：落库前就必须定好。M5 起内容按 canonical_key 全局唯一（同一篇
-	// 只存一份），留给 store 或调用方补算就会出现"有的行有键有的行没键"。
-	item.CanonicalKey = CanonicalKey(src, *item)
+	// 全局身份：落库前就必须定好。M5 起内容按 canonical_key 全局唯一。
+	// 若调用方已预填 CanonicalKey（如 page_watch 的 watchKey），不覆盖。
 	if item.CanonicalKey == "" {
-		// 宁可丢一条也不能让空串落库：canonical_key 上有 UNIQUE，两条各自缺身份
-		// 字段的内容会双双算出空串、在唯一索引上互撞而被判成同一条。把两篇无关内容
-		// 合并是不可逆的数据损坏（投递指向错的原文、信源统计口径被污染），
-		// 丢一条只是这轮少推一条，下轮源补上字段就自愈。
-		slog.Warn("fetcher: 内容缺少身份字段（rss/exa 需 url、xhs 需 note_id），跳过该条",
-			"source_id", src.ID, "type", src.Type, "url", item.URL, "title", item.Title)
+		item.CanonicalKey = CanonicalKey(src, *item)
+	}
+	if item.CanonicalKey == "" {
+		slog.Warn("fetcher: 内容缺少身份字段，跳过该条",
+			"source_id", src.ID, "platform", src.Platform, "url", item.URL, "title", item.Title)
 		return false
 	}
 

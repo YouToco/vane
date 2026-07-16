@@ -3,13 +3,43 @@ package types
 // 本文件集中定义 typed string 枚举，与数据库 TEXT 列一一对应。
 // 用 typed string 而非 iota：DB 存文本、JSON 序列化直观、增值不破坏兼容。
 
-// SourceType 信源类型（sources.type）。
+// Platform 内容平台（sources.platform）。
+type Platform string
+
+const (
+	PlatformWeb Platform = "web" // 开放网页：身份=url，协议=HTTP
+	PlatformX   Platform = "x"   // X / Twitter：身份=tweet_id
+	PlatformXHS Platform = "xhs" // 小红书：身份=note_id
+)
+
+// Capability 从平台取什么（sources.capability）。
+type Capability string
+
+const (
+	CapFeed      Capability = "feed"       // 订阅 RSS/Atom feed
+	CapSearch    Capability = "search"     // 关键词/语义搜索
+	CapUserPosts Capability = "user_posts" // 某账号的新发布
+	CapPageWatch Capability = "page_watch" // 页面变化监控
+)
+
+// Kind 内容种类（content_items.kind）。决定下游 pipeline 怎么对待它——
+// Dedup 的 simhash 近似去重对 change 是灾难性的（设计目的「改动少量文字仍判重复」
+// 与 change 的信号「改动少量文字」直接对立）。
+type Kind string
+
+const (
+	KindArticle Kind = "article" // 一篇内容（默认；存量全是这个）
+	KindChange  Kind = "change"  // 一次变化事件（page_watch 产出）
+)
+
+// SourceType 旧信源类型枚举，008 迁移后 DB 不再有 type 列。
+// 仅供 sourcespec.BuildLegacy 和 api 兼容层使用，不得出现在新代码中。
 type SourceType string
 
 const (
-	SourceTypeRSS       SourceType = "rss"        // RSS / Atom 订阅源
-	SourceTypeExa       SourceType = "exa"        // Exa 语义搜索（按 query 抓最新结果）
-	SourceTypeTikHubXHS SourceType = "tikhub_xhs" // TikHub 小红书接口
+	SourceTypeRSS       SourceType = "rss"
+	SourceTypeExa       SourceType = "exa"
+	SourceTypeTikHubXHS SourceType = "tikhub_xhs"
 )
 
 // SourceStatus 信源状态（sources.status）。

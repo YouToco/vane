@@ -22,34 +22,27 @@ import (
 
 // CanonicalKey 算出内容的全局身份（content_items.canonical_key，UNIQUE）。
 //
-// **没有单一字段能通吃**，两条实测结论方向恰好相反（契约 §1）：
-//   - rss/exa → url：BBC 换 guid 重发同一篇文章时 url 逐字不变，url 才是"这篇文章"。
-//   - tikhub_xhs → note_id：小红书 url 带 xsec_token（每次搜索新发的临时票据），
-//     同一笔记两次搜到 url 不同，只有 note_id 稳定。
+// 按 Platform 分派（008 起取代 src.Type）：
+//   - web → url：BBC 换 guid 重发同一篇文章时 url 逐字不变，url 才是"这篇文章"。
+//   - xhs → note_id：小红书 url 带 xsec_token（每次搜索新发的临时票据），只有 note_id 稳定。
+//   - x   → tweet_id：推文 ID 是推特身份的唯一稳定锚点。
 //
-// 键是**裸值**（url 原文 / note_id 原文），不加命名空间前缀：007 迁移的回填
-// （`CASE WHEN s.type='tikhub_xhs' THEN ci.external_id ELSE ci.url END`）写的就是裸值，
-// 这里加前缀会让存量行的键与运行时算出的键永不相等，全库内容立刻重新长出一份重复。
-// 改这里必须同步改 007 的回填 CASE，反之亦然。
+// 键是裸值（url 原文 / note_id 原文 / tweet_id 原文），不加命名空间前缀：
+// 007 回填写的就是裸值，加前缀会让存量行的键与运行时算出的不相等 → 全库重复。
 //
-// 返回空串表示**这条内容没有可用身份**，调用方必须丢弃（见 finalize）。刻意不兜底成
-// 别的键：兜底键要么含 source_id（跨源不同 → 归并失效，等于没重构），要么含正文摘要
-// （内容一改就变 → 同一篇长出多份），两种都是"看着有身份、其实没有"，比直接丢一条更坏。
+// 返回空串表示这条内容没有可用身份，调用方必须丢弃（见 finalize）。
 func CanonicalKey(src types.Source, item types.ContentItem) string {
-	switch src.Type {
-	case types.SourceTypeTikHubXHS:
-		// 身份是 note_id，即 mapTikhubNotes 填进 ExternalID 的 n.ID。刻意不碰
-		// item.URL：它带 xsec_token，拿它当身份等于同一笔记每轮都是新内容。
+	switch src.Platform {
+	case types.PlatformXHS:
 		return xhsKey(item.ExternalID)
 
-	case types.SourceTypeRSS, types.SourceTypeExa:
-		// url 优先于 external_id：guid 只是"源内唯一"，url 才是"这篇文章"。
-		// 这也让 rss 与 exa 同属 url 派——Exa 搜到用户 RSS 源里的同一篇文章时能归并。
+	case types.PlatformX:
+		return strings.TrimSpace(item.ExternalID)
+
+	case types.PlatformWeb:
 		return strings.TrimSpace(item.URL)
 
 	default:
-		// 未知类型不猜身份字段：猜错会把两篇无关内容合并成一篇（不可逆）。Multi 分发时
-		// 已拒掉未知类型，这里返回空串是防"新增了类型却忘了加 case"时静默按 url 归并。
 		return ""
 	}
 }

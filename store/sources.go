@@ -14,7 +14,7 @@ import (
 
 // sourceColumns 是 sources 表的全列清单（以别名 s 限定，避免与 JOIN 的
 // subscriptions 表同名列 id/status/created_at 歧义），SELECT 与 scanSource 一一对应。
-const sourceColumns = `s.id, s.type, s.url, s.title, s.config, s.status,
+const sourceColumns = `s.id, s.platform, s.capability, s.url, s.title, s.config, s.status,
 	s.fetch_interval_seconds, s.next_fetch_at, s.last_fetched_at, s.fail_count,
 	s.created_at, s.updated_at`
 
@@ -23,7 +23,7 @@ const sourceColumns = `s.id, s.type, s.url, s.title, s.config, s.status,
 // 复用于单行（pgx.Row）与多行（pgx.Rows，其 Scan 满足 pgx.Row 接口）两种场景。
 func scanSource(row pgx.Row, src *types.Source) error {
 	return row.Scan(
-		&src.ID, &src.Type, &src.URL, &src.Title, &src.Config, &src.Status,
+		&src.ID, &src.Platform, &src.Capability, &src.URL, &src.Title, &src.Config, &src.Status,
 		&src.FetchIntervalSeconds, &src.NextFetchAt, &src.LastFetchedAt, &src.FailCount,
 		&src.CreatedAt, &src.UpdatedAt,
 	)
@@ -157,15 +157,16 @@ func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (int64, err
 	// DO UPDATE 冲突时也 RETURNING id，一次往返拿到结果，且顺带完成元数据刷新。
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO sources (type, url, title, config)
-		 VALUES ($1, $2, $3, $4)
+		`INSERT INTO sources (platform, capability, url, title, config)
+		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (url) DO UPDATE
-		 SET type       = EXCLUDED.type,
+		 SET platform   = EXCLUDED.platform,
+		     capability = EXCLUDED.capability,
 		     title      = COALESCE(NULLIF(EXCLUDED.title, ''), sources.title),
 		     config     = EXCLUDED.config,
 		     updated_at = now()
 		 RETURNING id`,
-		src.Type, src.URL, src.Title, cfg).Scan(&id)
+		src.Platform, src.Capability, src.URL, src.Title, cfg).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("upsert 信源（url=%s）", src.URL), err)

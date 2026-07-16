@@ -219,7 +219,7 @@ func mapExaResults(src types.Source, results []exaResult) []types.ContentItem {
 			PublishedAt: parseExaDate(r.PublishedDate),
 			FetchedAt:   now,
 		}
-		// finalize 据 src.Type 定身份：exa 与 rss 同属 url 派——这正是
+		// finalize 据 src.Platform 定身份：exa 与 rss 同属 web 平台、url 派——这正是
 		// "Exa 搜到用户 RSS 源里的同一篇文章"能被识别成一份的原因。
 		// 上面只挡了"url 与 title 双空"，有 title 无 url 的结果在此被丢弃（无身份）。
 		if !finalize(src, &item) {

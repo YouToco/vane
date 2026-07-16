@@ -15,15 +15,20 @@ import (
 )
 
 // addSubscriptionReq 是 POST /api/subscriptions 的请求体。
-// type 决定必填字段：rss（默认）→ url；exa → query；tikhub_xhs → keyword。
+// 008 起支持新格式（platform+capability+params）和旧格式（type+url/query/keyword）。
 type addSubscriptionReq struct {
-	Type    string `json:"type"`    // rss（默认）/ exa / tikhub_xhs
-	URL     string `json:"url"`     // rss 必填
-	Query   string `json:"query"`   // exa 必填：搜索词
-	Keyword string `json:"keyword"` // tikhub_xhs 必填：小红书搜索关键词
-	Title   string `json:"title"`   // 可选：展示名，缺省按类型生成
-	// Category 是 exa 可选的结果类别（如 "news"）；其余类型忽略。
-	Category string `json:"category"`
+	// 新格式（M6 起）
+	Platform   string            `json:"platform"`   // web / x / xhs
+	Capability string            `json:"capability"` // feed / search / user_posts / page_watch
+	Params     map[string]string `json:"params"`     // 随 platform+capability 而定
+	// 旧格式（vane-web 兼容窗口）
+	Type     string `json:"type"`     // rss / exa / tikhub_xhs
+	URL      string `json:"url"`      // rss 必填
+	Query    string `json:"query"`    // exa 必填
+	Keyword  string `json:"keyword"`  // tikhub_xhs 必填
+	Category string `json:"category"` // exa 可选
+	// 共用
+	Title string `json:"title"` // 可选展示名
 }
 
 // handleAddSubscription 幂等 upsert 信源（按 URL/合成键）→ 建立当前 owner 的订阅关系。
@@ -36,14 +41,18 @@ func (s *server) handleAddSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	src, errMsg := sourcespec.Build(sourcespec.Spec{
-		Type:     req.Type,
-		URL:      req.URL,
-		Query:    req.Query,
-		Keyword:  req.Keyword,
-		Title:    req.Title,
-		Category: req.Category,
-	})
+	var src *types.Source
+	var errMsg string
+	if req.Platform != "" {
+		src, errMsg = sourcespec.Build(sourcespec.Spec{
+			Platform:   req.Platform,
+			Capability: req.Capability,
+			Params:     req.Params,
+			Title:      req.Title,
+		})
+	} else {
+		src, errMsg = sourcespec.BuildLegacy(req.Type, req.URL, req.Query, req.Keyword, req.Title, req.Category)
+	}
 	if errMsg != "" {
 		writeError(w, http.StatusBadRequest, errMsg)
 		return
@@ -86,7 +95,32 @@ func (s *server) handleListSubscriptions(w http.ResponseWriter, r *http.Request)
 	if sources == nil {
 		sources = []types.Source{}
 	}
-	writeJSON(w, http.StatusOK, sources)
+	writeJSON(w, http.StatusOK, sourcesWithLegacyType(sources))
+}
+
+// sourceWithType 给 vane-web 兼容窗口回传 type 字段。
+type sourceWithType struct {
+	types.Source
+	Type string `json:"type"`
+}
+
+func sourcesWithLegacyType(sources []types.Source) []sourceWithType {
+	out := make([]sourceWithType, len(sources))
+	for i, s := range sources {
+		var typ string
+		switch {
+		case s.Platform == types.PlatformWeb && s.Capability == types.CapFeed:
+			typ = string(types.SourceTypeRSS)
+		case s.Platform == types.PlatformWeb && s.Capability == types.CapSearch:
+			typ = string(types.SourceTypeExa)
+		case s.Platform == types.PlatformXHS && s.Capability == types.CapSearch:
+			typ = string(types.SourceTypeTikHubXHS)
+		default:
+			typ = string(s.Platform) + "/" + string(s.Capability)
+		}
+		out[i] = sourceWithType{Source: s, Type: typ}
+	}
+	return out
 }
 
 // handleRemoveSubscription 取消当前 owner 对某源的订阅（保留信源本身与内容）。

@@ -53,7 +53,7 @@ func newTestExa(srvURL string) *ExaFetcher {
 
 // exaSrc 构造一个带 query 的 Exa 信源。
 func exaSrc(id int64, cfg string) types.Source {
-	return types.Source{ID: id, Type: types.SourceTypeExa, Config: json.RawMessage(cfg)}
+	return types.Source{ID: id, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(cfg)}
 }
 
 func TestExaFetch_MapsResults(t *testing.T) {

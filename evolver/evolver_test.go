@@ -300,9 +300,10 @@ func TestEvolveIntegration(t *testing.T) {
 	ev := New(cli, llm.NewRecorder(nil), st)
 
 	srcID, err := st.UpsertSource(ctx, &types.Source{
-		Type:  types.SourceTypeRSS,
-		URL:   "https://example.com/test-evolver-" + uuid.NewString(),
-		Title: "evolver-test-source",
+		Platform:   types.PlatformWeb,
+		Capability: types.CapFeed,
+		URL:        "https://example.com/test-evolver-" + uuid.NewString(),
+		Title:      "evolver-test-source",
 	})
 	if err != nil {
 		t.Fatalf("UpsertSource() 失败: %v", err)

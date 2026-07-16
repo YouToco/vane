@@ -35,7 +35,7 @@ const maxPerSourceCandidates = 20
 // 的导出方法（规格 B4/B5/B3），是并行开发的对接契约。
 // ============================================================
 
-// Fetcher 抓取单个信源的内容。生产实现是 fetcher.Multi——按 src.Type
+// Fetcher 抓取单个信源的内容。生产实现是 fetcher.Multi——按 (Platform, Capability)
 // 分发到 RSS/Exa/TikHub 具体抓取器；Activity 侧不关心信源类型差异。
 type Fetcher interface {
 	Fetch(ctx context.Context, src types.Source) ([]types.ContentItem, error)
@@ -218,7 +218,7 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 			// 单源失败不拖垮整批：某个源挂了不该让当次推送整体失败；
 			// 同时自增 fail_count 并推进 next_fetch_at，避免调度紧循环重试。
 			a.markFetchResult(ctx, src, false)
-			slog.Warn("fetch: 单源抓取失败，跳过", "source_id", src.ID, "type", src.Type, "url", src.URL, "err", ferr)
+			slog.Warn("fetch: 单源抓取失败，跳过", "source_id", src.ID, "platform", src.Platform, "capability", src.Capability, "url", src.URL, "err", ferr)
 			continue
 		}
 		for i := range items {

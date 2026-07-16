@@ -60,10 +60,11 @@ func TestFetchRSS_ParsesFeed(t *testing.T) {
 	defer srv.Close()
 
 	f := newTestFetcher()
-	// Type 是必填的，不是摆设：007 起 canonical_key 按源类型分派（见 CanonicalKey），
-	// 缺 Type 的源算不出身份、条目会被 finalize 全部丢弃。生产上 sources.type 为
-	// NOT NULL 且 Multi.Fetch 会先拒掉未知类型，故这里补全才是真实形态。
-	items, err := f.FetchRSS(context.Background(), types.Source{ID: 7, Type: types.SourceTypeRSS, URL: srv.URL})
+	// Platform/Capability 是必填的，不是摆设：007 起 canonical_key 按 Platform 分派
+	// （见 CanonicalKey），缺 Platform 的源算不出身份、条目会被 finalize 全部丢弃。
+	// 生产上 sources.platform 为 NOT NULL 且 Multi.Fetch 会先拒掉未知组合，
+	// 故这里补全才是真实形态。
+	items, err := f.FetchRSS(context.Background(), types.Source{ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL})
 	if err != nil {
 		t.Fatalf("FetchRSS 意外失败: %v", err)
 	}
@@ -285,7 +286,7 @@ func TestFetchRSS_LookbackFiltersStaleItems(t *testing.T) {
 	f := newTestFetcher()
 
 	items, err := f.FetchRSS(context.Background(),
-		types.Source{ID: 7, Type: types.SourceTypeRSS, URL: srv.URL})
+		types.Source{ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL})
 	if err != nil {
 		t.Fatalf("FetchRSS 意外失败: %v", err)
 	}
@@ -310,7 +311,7 @@ func TestFetchRSS_LookbackNegativeMeansUnlimited(t *testing.T) {
 	f := newTestFetcher()
 
 	items, err := f.FetchRSS(context.Background(), types.Source{
-		ID: 7, Type: types.SourceTypeRSS, URL: srv.URL,
+		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
 		Config: json.RawMessage(`{"lookback_days":-1}`),
 	})
 	if err != nil {
@@ -328,7 +329,7 @@ func TestFetchRSS_LookbackCustomWindow(t *testing.T) {
 	f := newTestFetcher()
 
 	items, err := f.FetchRSS(context.Background(), types.Source{
-		ID: 7, Type: types.SourceTypeRSS, URL: srv.URL,
+		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
 		Config: json.RawMessage(`{"lookback_days":30}`),
 	})
 	if err != nil {
@@ -353,7 +354,7 @@ func TestFetchRSS_LookbackEmptyConfigUsesDefault(t *testing.T) {
 	f := newTestFetcher()
 
 	items, err := f.FetchRSS(context.Background(), types.Source{
-		ID: 7, Type: types.SourceTypeRSS, URL: srv.URL,
+		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
 		Config: json.RawMessage(`{}`),
 	})
 	if err != nil {
@@ -371,7 +372,7 @@ func TestFetchRSS_InvalidConfigRejected(t *testing.T) {
 	f := newTestFetcher()
 
 	_, err := f.FetchRSS(context.Background(), types.Source{
-		ID: 7, Type: types.SourceTypeRSS, URL: srv.URL,
+		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
 		Config: json.RawMessage(`{"lookback_days":"seven"}`),
 	})
 	if err == nil {

@@ -34,12 +34,12 @@ func (s *Store) UpsertContentItem(ctx context.Context, item *types.ContentItem) 
 	err = s.pool.QueryRow(ctx,
 		`INSERT INTO content_items (
 			source_id, external_id, canonical_key, url, title, content, author,
-			published_at, content_hash, simhash
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			published_at, content_hash, simhash, kind
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (canonical_key) DO NOTHING
 		RETURNING id`,
 		item.SourceID, item.ExternalID, item.CanonicalKey, item.URL, item.Title, item.Content,
-		item.Author, item.PublishedAt, item.ContentHash, item.Simhash,
+		item.Author, item.PublishedAt, item.ContentHash, item.Simhash, item.Kind,
 	).Scan(&id)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -240,11 +240,11 @@ func (s *Store) ListRecentSimhashesByUser(ctx context.Context, userID int64, sin
 func (s *Store) ListUnpushedByUser(ctx context.Context, userID int64, limit, perSourceCap int) ([]types.ContentItem, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, source_id, external_id, canonical_key, url, title, content, author,
-		        published_at, content_hash, simhash, fetched_at, created_at
+		        published_at, content_hash, simhash, fetched_at, created_at, kind
 		 FROM (
 		     SELECT ci.id, ci.source_id, ci.external_id, ci.canonical_key, ci.url, ci.title,
 		            ci.content, ci.author, ci.published_at, ci.content_hash, ci.simhash,
-		            ci.fetched_at, ci.created_at,
+		            ci.fetched_at, ci.created_at, ci.kind,
 		            ROW_NUMBER() OVER (PARTITION BY ci.source_id ORDER BY ci.fetched_at DESC, ci.id DESC) AS rn
 		     FROM content_items ci
 		     WHERE EXISTS (
@@ -273,6 +273,7 @@ func (s *Store) ListUnpushedByUser(ctx context.Context, userID int64, limit, per
 		if err := rows.Scan(
 			&ci.ID, &ci.SourceID, &ci.ExternalID, &ci.CanonicalKey, &ci.URL, &ci.Title, &ci.Content,
 			&ci.Author, &ci.PublishedAt, &ci.ContentHash, &ci.Simhash, &ci.FetchedAt, &ci.CreatedAt,
+			&ci.Kind,
 		); err != nil {
 			return nil, types.NewAppError(types.CodeDatabase, "扫描 content_item 行", err)
 		}

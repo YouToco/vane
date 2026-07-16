@@ -45,9 +45,9 @@ func TestMulti_DispatchesByType(t *testing.T) {
 		src  types.Source
 		want int // 期望条数
 	}{
-		{"rss", types.Source{ID: 1, Type: types.SourceTypeRSS, URL: rssSrv.URL}, 2},
-		{"exa", types.Source{ID: 2, Type: types.SourceTypeExa, Config: json.RawMessage(`{"query":"x"}`)}, 2},
-		{"tikhub", types.Source{ID: 3, Type: types.SourceTypeTikHubXHS, Config: json.RawMessage(`{"keyword":"x"}`)}, 1},
+		{"rss", types.Source{ID: 1, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: rssSrv.URL}, 2},
+		{"exa", types.Source{ID: 2, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(`{"query":"x"}`)}, 2},
+		{"tikhub", types.Source{ID: 3, Platform: types.PlatformXHS, Capability: types.CapSearch, Config: json.RawMessage(`{"keyword":"x"}`)}, 1},
 	}
 	for _, tc := range cases {
 		items, err := m.Fetch(context.Background(), tc.src)
@@ -61,13 +61,13 @@ func TestMulti_DispatchesByType(t *testing.T) {
 	}
 }
 
-func TestMulti_UnknownType(t *testing.T) {
+func TestMulti_UnknownPlatform(t *testing.T) {
 	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil)
-	_, err := m.Fetch(context.Background(), types.Source{ID: 1, Type: "carrier_pigeon"})
+	_, err := m.Fetch(context.Background(), types.Source{ID: 1, Platform: "carrier_pigeon"})
 	if !errors.Is(err, types.ErrValidation) {
-		t.Errorf("未知类型应判 ErrValidation，实际 %v", err)
+		t.Errorf("未知平台应判 ErrValidation，实际 %v", err)
 	}
 	if types.IsRetryable(err) {
-		t.Error("未知类型不应可重试")
+		t.Error("未知平台不应可重试")
 	}
 }
