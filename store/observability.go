@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -294,15 +295,23 @@ func (s *Store) GetEvolveCallStat(ctx context.Context, userID int64, since time.
 
 // ListPushBatchSummaries 返回该用户最近的推送批次（含投递计数与原始分极值）。
 //
-// LEFT JOIN 而非 JOIN：投递数为 0 的批次必须显示——它意味着 Push 建了批次却一条
-// 都没插成（activities.go:399-402 的插入失败只 Warn 后继续），是要看见的异常。
-// 但注意它**不是**"今早无新内容"那种空批：后者连 push_batches 行都没有（见 PR2）。
+// LEFT JOIN 而非 JOIN：投递数为 0 的批次必须显示。008 起这里有**两种**零投递批次，
+// 读的人（和看板）必须靠 status 分开它们，别再一律当异常：
+//   - status=empty：正常终态，本就没东西可推，exit_gate 说明停在哪一步。
+//   - status=done|failed 而投递数为 0：真异常——Push 建了批次却一条都没插成
+//     （activities.go 的插入失败只 Warn 后继续）。
+//
+// 008 之前"今早无新内容"连行都没有，现在有了（见 types.PushBatchSummary 的注释，
+// 那里也写明了剩下的盲区：中途报错的运行仍无行，那是 Temporal 的账）。
+//
+// GROUP BY b.id 即可带出 b 的其余列：id 是主键，Postgres 认函数依赖，
+// 不必把 exit_gate/stage_counts 也堆进 GROUP BY。
 //
 // 无 ORDER BY 稳定性问题：created_at 有 DEFAULT now() 且同批次 id 单调，
 // 用 (created_at DESC, id DESC) 保证并列时序稳定。
 func (s *Store) ListPushBatchSummaries(ctx context.Context, userID int64, since time.Time, limit int) ([]types.PushBatchSummary, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT b.id, b.status, b.created_at, b.idempotency_key,
+		`SELECT b.id, b.status, b.exit_gate, b.stage_counts, b.created_at, b.idempotency_key,
 		        count(d.id)::int,
 		        count(d.id) FILTER (WHERE d.status = $4)::int,
 		        max(d.score)::float8, min(d.score)::float8
@@ -322,9 +331,16 @@ func (s *Store) ListPushBatchSummaries(ctx context.Context, userID int64, since 
 	var out []types.PushBatchSummary
 	for rows.Next() {
 		var b types.PushBatchSummary
-		if err := rows.Scan(&b.ID, &b.Status, &b.CreatedAt, &b.IdempotencyKey,
+		// stage_counts 先落 []byte 再解：JSONB NOT NULL DEFAULT '{}'（008），
+		// 空对象解出全 nil 的 PipelineCounts，恰是"这些阶段没记录"的正确语义。
+		var countsJSON []byte
+		if err := rows.Scan(&b.ID, &b.Status, &b.ExitGate, &countsJSON, &b.CreatedAt, &b.IdempotencyKey,
 			&b.DeliveryCount, &b.SentCount, &b.MaxScore, &b.MinScore); err != nil {
 			return nil, types.NewAppError(types.CodeDatabase, "扫描推送批次统计行", err)
+		}
+		if err := json.Unmarshal(countsJSON, &b.StageCounts); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("解析批次 %d 的漏斗计数", b.ID), err)
 		}
 		out = append(out, b)
 	}

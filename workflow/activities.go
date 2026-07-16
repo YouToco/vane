@@ -93,6 +93,15 @@ type Store interface {
 	// 幂等推送地基（FIX-A 新增实现）：重试时复用同一 batch、跳过已发条目，杜绝重复发卡（#1 CRITICAL）。
 	// 取代原 CreatePushBatch / InsertDelivery（store 仍保留其实现，只是 Activity 不再用）。
 	CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey string) (int64, error)
+	// RecordEmptyPushBatch 记录"跑完了但没东西可推"的空批次（008）。与上面那条幂等
+	// 地基共用 idempotency_key，但**写入路径完全独立**——空批次与真实推送在同一次
+	// 运行里互斥，刻意不去动 CreatePushBatchIdempotent 的签名（改它就得改这个窄接口
+	// 的全部替身，且那是 #1 CRITICAL 的地基）。
+	//
+	// skipped=true 表示 store 侧防覆写护栏拦下了本次写入（该 traceID 已有真实批次），
+	// 此时 id=0、err=nil——**不是错误，但必须出声**（见 RecordEmptyBatch 的处理）。
+	RecordEmptyPushBatch(ctx context.Context, userID int64, idempKey string,
+		gate types.BatchExitGate, counts types.PipelineCounts) (id int64, skipped bool, err error)
 	InsertDeliveryIdempotent(ctx context.Context, d *types.Delivery) (id int64, existed bool, sentAlready bool, err error)
 	UpdatePushBatchStatus(ctx context.Context, batchID int64, status types.BatchStatus) error
 	// MarkDeliverySent 发送成功后回填 message_id 与最终卡 JSON（契约 §3.3：
@@ -170,6 +179,16 @@ type PushIn struct {
 	UserID  int64           `json:"user_id"`
 	TraceID string          `json:"trace_id"`
 	Cards   []GeneratedCard `json:"cards"`
+}
+
+// RecordEmptyIn 是 RecordEmptyBatch Activity 的入参（008 / 契约 §16「空批次缺口」）。
+type RecordEmptyIn struct {
+	UserID  int64  `json:"user_id"`
+	TraceID string `json:"trace_id"` // = 幂等键，与 Push 建批次用的是同一个
+	// Gate 从哪个闸门退出。恒非空——五个调用点各自传死值（workflow.go）。
+	Gate types.BatchExitGate `json:"gate"`
+	// Counts 截至退出时刻的漏斗快照；未跑到的阶段字段为 nil（见 types.PipelineCounts）。
+	Counts types.PipelineCounts `json:"counts"`
 }
 
 // ============================================================
@@ -360,6 +379,35 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "整批卡片生成全部失败", nil)
 	}
 	return cards, nil
+}
+
+// RecordEmptyBatch 把一次"无内容可推"的正常终态落进 push_batches（008 /
+// 契约 §16 修订记录「空批次缺口」）。
+//
+// 本活动**没有**任何业务副作用：不发卡、不改内容、不推进任何游标，纯记账。
+// 这是它能被 workflow 侧安全吞错的前提——参见 workflow.go 的 recordEmpty，
+// 失败只 Warn 不阻断（红线：无内容可推必须仍是正常终态，workflow.go:19）。
+//
+// 错误交给 retryableOrNot 分流：CodeDatabase 可重试（连接抖动重试就好），
+// CodeValidation 不可重试（闸门/幂等键传空是代码 bug，重试只是重复失败，
+// 让它立刻失败并在 Warn 里露出来）。
+func (a *Activities) RecordEmptyBatch(ctx context.Context, in RecordEmptyIn) error {
+	// 返回的 batch_id 刻意丢弃：空批次底下没有 deliveries，没有任何后续写入需要它。
+	_, skipped, err := a.store.RecordEmptyPushBatch(ctx, in.UserID, in.TraceID, in.Gate, in.Counts)
+	if err != nil {
+		return retryableOrNot(err)
+	}
+	if skipped {
+		// 护栏拦下：该 traceID 已有真实批次（done/failed/pending），本次不覆写。
+		// 拦对了，所以不是错误——但必须出声。正常路径上这一条永远不会打印
+		// （空批次与真实推送在一次运行里互斥），它一旦出现就说明发生了别的事：
+		// 有人 reset 了这个 workflow，或者出现了第三个写 push_batches 的路径。
+		// 静默跳过会让"记录没写成"变成又一次静默失败——那正是本 PR 要消灭的东西，
+		// 在本 PR 自己身上重演一遍就太讽刺了。
+		slog.Info("空批次记账被护栏拦下：该 trace 已有真实批次，不覆写",
+			"user_id", in.UserID, "trace_id", in.TraceID, "gate", in.Gate)
+	}
+	return nil
 }
 
 // Push 建批次 → 逐条建 Delivery → 主动推送 → 标记已发 → 收尾批次状态。

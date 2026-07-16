@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"go.temporal.io/sdk/temporal"
+
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/types"
 )
@@ -93,6 +95,14 @@ type markSentCall struct {
 	cardJSON   string
 }
 
+// emptyBatchCall 记录 RecordEmptyPushBatch 收到的实参，供空批次闸门断言。
+type emptyBatchCall struct {
+	userID   int64
+	idempKey string
+	gate     types.BatchExitGate
+	counts   types.PipelineCounts
+}
+
 type fakeStore struct {
 	mu          sync.Mutex
 	unpushed    []types.ContentItem
@@ -100,6 +110,34 @@ type fakeStore struct {
 	sentAlready bool // true = 模拟重试时该 (batch, content) 已发过
 	inserted    []types.Delivery
 	marked      []markSentCall
+	// 空批次记账侧
+	emptyErr error // 非 nil = 模拟记账失败（验"记账失败不阻断正常终态"）
+	// emptySkipped = true 模拟 store 侧防覆写护栏拦下（该 traceID 已有真实批次）：
+	// 真 store 此时返回 (0, true, nil)，替身必须照此形状返回，否则测的就不是护栏路径。
+	emptySkipped bool
+	emptyBatchN  int64 // 递增出 batch_id；0 值起步即从 1 开始
+	emptyCalls   []emptyBatchCall
+}
+
+func (s *fakeStore) RecordEmptyPushBatch(_ context.Context, userID int64, idempKey string,
+	gate types.BatchExitGate, counts types.PipelineCounts) (int64, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.emptyCalls = append(s.emptyCalls, emptyBatchCall{userID, idempKey, gate, counts})
+	if s.emptyErr != nil {
+		return 0, false, s.emptyErr
+	}
+	if s.emptySkipped {
+		return 0, true, nil // 护栏拦下：id=0、skipped=true、err=nil
+	}
+	s.emptyBatchN++
+	return s.emptyBatchN, false, nil
+}
+
+func (s *fakeStore) emptyBatchCalls() []emptyBatchCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]emptyBatchCall(nil), s.emptyCalls...)
 }
 
 func (s *fakeStore) ListDueSourcesByUser(context.Context, int64) ([]types.Source, error) {
@@ -181,6 +219,119 @@ func TestEvolveProfile_DelegatesArgsAndError(t *testing.T) {
 	}
 	if calls, userID, traceID := ev.snapshot(); calls != 1 || userID != 5 || traceID != "tr-5" {
 		t.Errorf("evolver 实参不符: calls=%d userID=%d traceID=%q", calls, userID, traceID)
+	}
+}
+
+// TestRecordEmptyBatch_DelegatesArgs 空批次记账把 traceID 当幂等键、
+// 闸门与漏斗原样下传 store（008）。
+func TestRecordEmptyBatch_DelegatesArgs(t *testing.T) {
+	st := &fakeStore{}
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil)
+
+	counts := types.PipelineCounts{}.WithFetched(20).WithDeduped(0)
+	in := RecordEmptyIn{UserID: 5, TraceID: "tr-empty", Gate: types.BatchExitGateDedup, Counts: counts}
+	if err := a.RecordEmptyBatch(context.Background(), in); err != nil {
+		t.Fatalf("RecordEmptyBatch 意外报错: %v", err)
+	}
+
+	calls := st.emptyBatchCalls()
+	if len(calls) != 1 {
+		t.Fatalf("应恰好调 store 一次，实得 %d", len(calls))
+	}
+	got := calls[0]
+	// 幂等键必须就是 traceID：Temporal 重试本活动时靠它命中 004 的
+	// uq_push_batches_idem 复用同一行，而不是每次重试长一行空批次。
+	if got.userID != 5 || got.idempKey != "tr-empty" || got.gate != types.BatchExitGateDedup {
+		t.Errorf("store 实参不符: %+v", got)
+	}
+	if got.counts.Fetched == nil || *got.counts.Fetched != 20 {
+		t.Errorf("fetched 应为 20，实得: %v", got.counts.Fetched)
+	}
+	if got.counts.Deduped == nil || *got.counts.Deduped != 0 {
+		t.Errorf("deduped 应为 0（跑了得 0），实得: %v", got.counts.Deduped)
+	}
+	// 未跑到的阶段必须缺席而非 0——"没跑"与"跑了得 0"是两种不同的事故。
+	if got.counts.Scored != nil || got.counts.Selected != nil || got.counts.Cards != nil {
+		t.Errorf("dedup 闸门退出时下游阶段应缺席（nil），实得: %+v", got.counts)
+	}
+}
+
+// TestRecordEmptyBatch_SkipIsNotAnError store 侧护栏拦下（该 traceID 已有真实批次）
+// 时返回 (0, true, nil)，活动必须成功返回——护栏拦对了，它不是错误，不该被包成
+// ApplicationError 触发重试（重试只会被同一道护栏再拦一次）。
+//
+// 活动此时打的那条 slog.Info 是刻意的、也是本用例覆盖不到的部分：断言日志需要接管
+// slog 全局 handler，而本包的活动都用包级 slog（非注入 logger），拦它会污染并发跑的
+// 其他用例。这里钉住的是**控制流**（skipped ⇒ 成功返回、不报错），出声与否由
+// 代码审查保证——日志断言的性价比在此低于它引入的耦合。
+func TestRecordEmptyBatch_SkipIsNotAnError(t *testing.T) {
+	st := &fakeStore{emptySkipped: true} // 模拟真 store 的 (0, true, nil)
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil)
+
+	in := RecordEmptyIn{UserID: 1, TraceID: "tr", Gate: types.BatchExitGateFetch}
+	if err := a.RecordEmptyBatch(context.Background(), in); err != nil {
+		t.Fatalf("护栏跳过不是错误，实得: %v", err)
+	}
+	// 护栏是 store 侧的判断，活动必须**如实转达**而非自作主张跳过调用。
+	if calls := st.emptyBatchCalls(); len(calls) != 1 {
+		t.Fatalf("应仍调 store 一次（护栏在 store 侧生效），实得 %d", len(calls))
+	}
+}
+
+// TestRecordEmptyBatch_ValidationIsNonRetryable 确定性失败（闸门传空是代码 bug）
+// 必须包成不可重试，否则 RetryPolicy 会把同一个 bug 重试到上限才罢休。
+func TestRecordEmptyBatch_ValidationIsNonRetryable(t *testing.T) {
+	st := &fakeStore{emptyErr: types.NewAppError(types.CodeValidation, "空批次必须带退出闸门", nil)}
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil)
+
+	err := a.RecordEmptyBatch(context.Background(), RecordEmptyIn{UserID: 1, TraceID: "tr"})
+	if err == nil {
+		t.Fatal("VALIDATION 应上抛错误")
+	}
+	var appErr *temporal.ApplicationError
+	if !errors.As(err, &appErr) || !appErr.NonRetryable() {
+		t.Fatalf("VALIDATION 应包成不可重试的 ApplicationError，实得: %#v", err)
+	}
+	// 红线 3（错误卫生）：ApplicationError 携带的 Message 只能是 AppError.Message
+	// 这句人话，不能是原始 error 链（可能含连接串 / Temporal 服务端原文）。
+	if appErr.Message() != "空批次必须带退出闸门" {
+		t.Errorf("消息应为 AppError.Message 人话，实得: %q", appErr.Message())
+	}
+	// Type 必须恰为纯 Code，NonRetryableErrorTypes 才匹配得上（见 nonRetryable 注释）。
+	if appErr.Type() != string(types.CodeValidation) {
+		t.Errorf("Type 应为纯 Code %q，实得 %q", types.CodeValidation, appErr.Type())
+	}
+}
+
+// TestRecordEmptyBatch_DBErrorMessageIsClean 红线 3：DB 原始 error 链（连接串等）
+// 不得进 ApplicationError 的 Message——那是会被展示/喂进上下文的那一层。
+func TestRecordEmptyBatch_DBErrorMessageIsClean(t *testing.T) {
+	raw := errors.New("failed to connect to `host=10.0.0.5 user=vane password=hunter2`")
+	st := &fakeStore{emptyErr: types.NewAppError(types.CodeDatabase, "记录空批次（user=1, gate=fetch）", raw)}
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil)
+
+	err := a.RecordEmptyBatch(context.Background(), RecordEmptyIn{
+		UserID: 1, TraceID: "tr", Gate: types.BatchExitGateFetch})
+	var appErr *temporal.ApplicationError
+	if errors.As(err, &appErr) && strings.Contains(appErr.Message(), "password") {
+		t.Errorf("原始 error 链不得进 Message，实得: %q", appErr.Message())
+	}
+}
+
+// TestRecordEmptyBatch_DBErrorStaysRetryable 库连接抖动是可重试的，
+// 不该被误包成不可重试——那会让一次瞬时抖动直接丢掉这行记录。
+func TestRecordEmptyBatch_DBErrorStaysRetryable(t *testing.T) {
+	st := &fakeStore{emptyErr: types.NewAppError(types.CodeDatabase, "记录空批次", errors.New("conn reset"))}
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil)
+
+	err := a.RecordEmptyBatch(context.Background(), RecordEmptyIn{
+		UserID: 1, TraceID: "tr", Gate: types.BatchExitGateFetch})
+	if err == nil {
+		t.Fatal("DB 错误应上抛")
+	}
+	var appErr *temporal.ApplicationError
+	if errors.As(err, &appErr) && appErr.NonRetryable() {
+		t.Error("CodeDatabase 应保持可重试，不得被包成不可重试")
 	}
 }
 
