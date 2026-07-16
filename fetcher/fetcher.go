@@ -14,6 +14,7 @@ package fetcher
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +38,11 @@ import (
 // FetchRSS 再据此判定为 CodeValidation（与抓取前 LookupIP 预检的语义一致）。
 var errBlockedDial = errors.New("fetcher: 目标解析到私网/环回地址，已拒绝连接")
 
+// rssDefaultLookbackDays 是 RSS 源默认只收最近 N 天发布的条目，与
+// exaDefaultLookbackDays 取同一个值：跨源类型的"最新"语义应当一致。
+// 之所以要有默认而非默认全量，见 applyLookback 的注释。
+const rssDefaultLookbackDays = 7
+
 // Fetcher 是 RSS 抓取器。零依赖外部状态，可被多个 goroutine 并发复用。
 type Fetcher struct {
 	client   *http.Client
@@ -48,6 +54,11 @@ type Fetcher struct {
 	// 同时另一条用例保持默认规则验证私网拦截。生产路径永远用默认实现。
 	lookupIP  func(host string) ([]net.IP, error)
 	isBlocked func(ip net.IP) bool
+
+	// now 同样为可测试而抽出：lookback 过滤的截止点由它算出，测试注入固定时刻
+	// 才能让带固定 pubDate 的 fixture 不随真实时间流逝而漂出窗口（否则用例会在
+	// 未来某天无故变红）。生产路径用 time.Now。
+	now func() time.Time
 }
 
 // New 按抓取配置构造 Fetcher。TimeoutSeconds / MaxResponseMB 为非正数时回退到
@@ -67,6 +78,7 @@ func New(cfg config.FetchConfig) *Fetcher {
 		maxBytes:  int64(maxMB) * 1024 * 1024,
 		lookupIP:  net.LookupIP,
 		isBlocked: defaultBlockedIP,
+		now:       time.Now,
 	}
 
 	// Dialer.Control 在 DNS 解析之后、真正建连之前执行，拿到的是最终 IP，
@@ -99,9 +111,11 @@ func New(cfg config.FetchConfig) *Fetcher {
 
 // FetchRSS 抓取单个 RSS 源并返回映射后的内容条目。
 //
-// 失败语义：私网/非法 URL → CodeValidation（不可重试）；超时 → CodeFetchTimeout；
-// HTTP 429 → CodeFetchRateLimit；其余（非 2xx、超限、解析失败）归入 fetch 类
-// 但按确定性/瞬态区分 Retryable。解析失败只返回 error，绝不 panic。
+// 抓下来的条目会先经 applyLookback 按 config.lookback_days 滤掉过老的，再做映射。
+//
+// 失败语义：私网/非法 URL、非法 config → CodeValidation（不可重试）；超时 →
+// CodeFetchTimeout；HTTP 429 → CodeFetchRateLimit；其余（非 2xx、超限、解析失败）
+// 归入 fetch 类但按确定性/瞬态区分 Retryable。解析失败只返回 error，绝不 panic。
 func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.ContentItem, error) {
 	u, err := url.Parse(src.URL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
@@ -170,7 +184,70 @@ func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.Conte
 		return nil, nil
 	}
 
-	return mapItems(src, feed.Items), nil
+	items, err := f.applyLookback(src, feed.Items)
+	if err != nil {
+		return nil, err
+	}
+	return mapItems(src, items), nil
+}
+
+// rssSourceConfig 是 RSS 信源的 config JSONB 结构。
+type rssSourceConfig struct {
+	// LookbackDays 只收最近 N 天发布的条目：0（含字段缺省）用默认 rssDefaultLookbackDays；
+	// <0 表示不限（全量）。语义与 exaSourceConfig.LookbackDays 一致——同一个 config 键
+	// 在不同源类型下含义相同，配源的人不必记住例外。
+	LookbackDays int `json:"lookback_days,omitempty"`
+}
+
+// applyLookback 按 src.Config 的 lookback_days 丢弃过老的条目。
+//
+// 为什么 RSS 必须做这层过滤（2026-07-16 生产实证）：feed 常把全部历史塞在一份文档里
+// （openai.com/news/rss.xml 实测 1038 条，最早回溯到 2023 年）。首抓会把它们一次性入库
+// 且 fetched_at 全部相同，而候选窗口 ListUnpushedByUser 按 (fetched_at DESC, id DESC)
+// 取——feed 按时间倒序解析、越老的条目 id 越大，于是候选窗口恰好被最老的条目占满。
+// 下游两道闸门都拦不住：scorer 的 prompt 不含发布时间（模型看不出是旧闻），selector
+// 的新鲜度衰减封顶 12 分（85 分的 2023 年旧闻扣完仍有 73 分照样出线）。净效果是首批
+// 推送全是陈年旧闻，并污染 M5 的反馈与画像数据。
+//
+// 无 PublishedParsed 的条目一律保留：feed 不给日期时无从判断新旧，丢弃会让这类源静默
+// 颗粒无收——那比放进几条旧闻更难发现。代价是无日期的 feed 仍可能带进历史条目（已知
+// 取舍，实测 openai / blog.google 均提供 pubDate）。
+func (f *Fetcher) applyLookback(src types.Source, items []*gofeed.Item) ([]*gofeed.Item, error) {
+	var sc rssSourceConfig
+	if len(src.Config) > 0 {
+		if err := json.Unmarshal(src.Config, &sc); err != nil {
+			return nil, types.NewAppError(types.CodeValidation,
+				fmt.Sprintf("解析 RSS 信源 config 失败（source_id=%d）", src.ID), err)
+		}
+	}
+
+	lookback := sc.LookbackDays
+	if lookback == 0 {
+		lookback = rssDefaultLookbackDays
+	}
+	if lookback < 0 {
+		return items, nil
+	}
+
+	cutoff := f.now().UTC().Add(-time.Duration(lookback) * 24 * time.Hour)
+	out := make([]*gofeed.Item, 0, len(items))
+	dropped := 0
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		if it.PublishedParsed != nil && it.PublishedParsed.Before(cutoff) {
+			dropped++
+			continue
+		}
+		out = append(out, it)
+	}
+	if dropped > 0 {
+		slog.Debug("RSS lookback 过滤掉过老条目",
+			"source_id", src.ID, "lookback_days", lookback,
+			"dropped", dropped, "kept", len(out))
+	}
+	return out, nil
 }
 
 // mapItems 把 gofeed 条目映射为 ContentItem，并在入库前算好 content_hash（精确指纹）

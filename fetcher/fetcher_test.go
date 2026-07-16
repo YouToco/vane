@@ -2,11 +2,13 @@ package fetcher
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/types"
@@ -34,11 +36,19 @@ const sampleRSS = `<?xml version="1.0" encoding="UTF-8"?>
   </channel>
 </rss>`
 
+// testNow 是所有 fetcher 用例的固定"现在"，取在 sampleRSS 的 pubDate（2026-07-14）
+// 之后一天：既让 fixture 落在默认 lookback 窗口内，又不依赖真实时钟。
+var testNow = time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
+
 // newTestFetcher 构造放行环回地址的 Fetcher，以便对 httptest.Server（127.0.0.1）
 // 走通正常抓取路径。生产默认规则的私网拦截由 TestFetchRSS_BlocksLoopback 覆盖。
+//
+// now 钉死在 testNow：否则 lookback 默认窗口会随真实时间推移把带固定 pubDate 的
+// fixture 筛掉，让既有用例在未来某天毫无征兆地变红。
 func newTestFetcher() *Fetcher {
 	f := New(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1})
 	f.isBlocked = func(net.IP) bool { return false }
+	f.now = func() time.Time { return testNow }
 	return f
 }
 
@@ -217,5 +227,160 @@ func TestDefaultBlockedIP(t *testing.T) {
 		if defaultBlockedIP(net.ParseIP(s)) {
 			t.Errorf("%s 不应被拦截", s)
 		}
+	}
+}
+
+// lookbackRSS 造一份"新旧混排"的 feed，模拟 openai.com/news/rss.xml 的真实形态：
+// 按时间倒序、新条目在前、历史一路排到 2023 年。
+const lookbackRSS = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Lookback Feed</title>
+    <link>https://example.com</link>
+    <description>fixture</description>
+    <item>
+      <title>Fresh Post</title>
+      <link>https://example.com/posts/fresh</link>
+      <pubDate>Tue, 14 Jul 2026 08:00:00 +0000</pubDate>
+    </item>
+    <item>
+      <title>Undated Post</title>
+      <link>https://example.com/posts/undated</link>
+    </item>
+    <item>
+      <title>Stale Post</title>
+      <link>https://example.com/posts/stale</link>
+      <pubDate>Mon, 03 Jul 2026 08:00:00 +0000</pubDate>
+    </item>
+    <item>
+      <title>Ancient Post</title>
+      <link>https://example.com/posts/ancient</link>
+      <pubDate>Mon, 06 Mar 2023 08:00:00 +0000</pubDate>
+    </item>
+  </channel>
+</rss>`
+
+func lookbackServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/rss+xml")
+		_, _ = w.Write([]byte(lookbackRSS))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func titlesOf(items []types.ContentItem) []string {
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.Title)
+	}
+	return out
+}
+
+// TestFetchRSS_LookbackFiltersStaleItems 锁住本次修复的核心行为：默认窗口只放行
+// 近 7 天的条目，2023 年的历史条目不得入库——它们正是会占满候选窗口的那批。
+func TestFetchRSS_LookbackFiltersStaleItems(t *testing.T) {
+	srv := lookbackServer(t)
+	f := newTestFetcher()
+
+	items, err := f.FetchRSS(context.Background(),
+		types.Source{ID: 7, Type: types.SourceTypeRSS, URL: srv.URL})
+	if err != nil {
+		t.Fatalf("FetchRSS 意外失败: %v", err)
+	}
+
+	got := titlesOf(items)
+	// Fresh 在窗口内；Undated 无日期按约定保留；Stale(11 天前) 与 Ancient(2023) 应被滤掉。
+	want := []string{"Fresh Post", "Undated Post"}
+	if len(got) != len(want) {
+		t.Fatalf("期望 %v，实际 %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("期望 %v，实际 %v", want, got)
+		}
+	}
+}
+
+// TestFetchRSS_LookbackNegativeMeansUnlimited 覆盖 <0 = 全量的逃生舱：
+// 语义必须与 exaSourceConfig.LookbackDays 一致。
+func TestFetchRSS_LookbackNegativeMeansUnlimited(t *testing.T) {
+	srv := lookbackServer(t)
+	f := newTestFetcher()
+
+	items, err := f.FetchRSS(context.Background(), types.Source{
+		ID: 7, Type: types.SourceTypeRSS, URL: srv.URL,
+		Config: json.RawMessage(`{"lookback_days":-1}`),
+	})
+	if err != nil {
+		t.Fatalf("FetchRSS 意外失败: %v", err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("lookback_days=-1 应放行全部 4 条，实际 %d：%v", len(items), titlesOf(items))
+	}
+}
+
+// TestFetchRSS_LookbackCustomWindow 验证自定义窗口真的按天算：30 天能捞回 11 天前的
+// Stale，但仍挡住 2023 年的 Ancient。这条用例能杀死"把 lookback 当小时/分钟"的突变。
+func TestFetchRSS_LookbackCustomWindow(t *testing.T) {
+	srv := lookbackServer(t)
+	f := newTestFetcher()
+
+	items, err := f.FetchRSS(context.Background(), types.Source{
+		ID: 7, Type: types.SourceTypeRSS, URL: srv.URL,
+		Config: json.RawMessage(`{"lookback_days":30}`),
+	})
+	if err != nil {
+		t.Fatalf("FetchRSS 意外失败: %v", err)
+	}
+	got := titlesOf(items)
+	want := []string{"Fresh Post", "Undated Post", "Stale Post"}
+	if len(got) != len(want) {
+		t.Fatalf("期望 %v，实际 %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("期望 %v，实际 %v", want, got)
+		}
+	}
+}
+
+// TestFetchRSS_LookbackEmptyConfigUsesDefault 锁住现存生产源的形态：config 为 {}
+// （BBC 等 M3 期建的源就是这样）必须走默认 7 天，而不是被当成 0 天全滤光。
+func TestFetchRSS_LookbackEmptyConfigUsesDefault(t *testing.T) {
+	srv := lookbackServer(t)
+	f := newTestFetcher()
+
+	items, err := f.FetchRSS(context.Background(), types.Source{
+		ID: 7, Type: types.SourceTypeRSS, URL: srv.URL,
+		Config: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("FetchRSS 意外失败: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("空 config 应回落默认 7 天窗口（2 条），实际 %d：%v", len(items), titlesOf(items))
+	}
+}
+
+// TestFetchRSS_InvalidConfigRejected 非法 config 必须是不可重试的 CodeValidation：
+// 重试同一份坏配置永远不会好，只会白烧 Activity 预算。
+func TestFetchRSS_InvalidConfigRejected(t *testing.T) {
+	srv := lookbackServer(t)
+	f := newTestFetcher()
+
+	_, err := f.FetchRSS(context.Background(), types.Source{
+		ID: 7, Type: types.SourceTypeRSS, URL: srv.URL,
+		Config: json.RawMessage(`{"lookback_days":"seven"}`),
+	})
+	if err == nil {
+		t.Fatal("非法 config 应当报错")
+	}
+	if !errors.Is(err, types.ErrValidation) {
+		t.Errorf("非法 config 应归入 validation 类，实际 %v", err)
+	}
+	if types.IsRetryable(err) {
+		t.Error("非法 config 是确定性错误，不应可重试")
 	}
 }
