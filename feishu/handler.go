@@ -157,10 +157,15 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 		// 追问识别（M5 契约 §11）：用户回复某张推送卡时，把原文与解读摘要作为
 		// 定界上下文并入本条消息。只在 agent 链路做——回退路径无会话语义，
 		// 包装无意义。未命中（回复的是普通消息/聊天卡）原样按普通消息处理。
+		wrapped := false
 		if fb := h.m.feedbackRunner(); fb != nil {
-			if wrapped, ok := fb.WrapQuestion(ctx, user.ID, strVal(msg.ParentId), strVal(msg.RootId), text); ok {
-				text = wrapped
+			if w, ok := fb.WrapQuestion(ctx, user.ID, strVal(msg.ParentId), strVal(msg.RootId), text); ok {
+				text = w
+				wrapped = true
 			}
+		}
+		if !wrapped {
+			text = h.prependQuotedMessage(ctx, strVal(msg.ParentId), text)
 		}
 		h.handleWithAgent(ctx, runner, msgID, openID, user.ID, text)
 		return
@@ -534,6 +539,89 @@ func (h *handler) reply(ctx context.Context, messageID, cardJSON string) {
 		slog.Error("feishu: 回复消息被飞书拒绝",
 			"code", resp.Code, "msg", resp.Msg, "message_id", messageID)
 	}
+}
+
+// prependQuotedMessage 在用户引用/回复某条消息时，用飞书 API 拉取被引用消息
+// 的内容并拼到用户文本前面，让 LLM 看到完整上下文。parentID 为空时原样返回。
+// 拉取失败静默降级（只记日志），不影响正常消息处理。
+func (h *handler) prependQuotedMessage(ctx context.Context, parentID, text string) string {
+	if parentID == "" {
+		return text
+	}
+	client := h.m.api()
+	if client == nil {
+		return text
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := client.Im.Message.Get(fetchCtx, larkim.NewGetMessageReqBuilder().
+		MessageId(parentID).
+		Build())
+	if err != nil || !resp.Success() {
+		slog.Warn("feishu: 拉取引用消息失败", "parent_id", parentID, "err", err)
+		return text
+	}
+	if resp.Data == nil || len(resp.Data.Items) == 0 {
+		return text
+	}
+	quoted := resp.Data.Items[0]
+	if quoted.Body == nil || quoted.Body.Content == nil {
+		return text
+	}
+	var quotedText string
+	switch strVal(quoted.MsgType) {
+	case "text":
+		quotedText = parseTextContent(*quoted.Body.Content)
+	case "post":
+		quotedText = parsePostContent(*quoted.Body.Content)
+	case "interactive":
+		quotedText = parseInteractiveContent(*quoted.Body.Content)
+	default:
+		return text
+	}
+	if quotedText == "" {
+		return text
+	}
+	return "[用户引用的消息]\n" + quotedText + "\n[用户的回复]\n" + text
+}
+
+// parseInteractiveContent 从交互卡片的 JSON 中提取可读文本（卡片标题 + 文本元素）。
+// Vane 自己发的回复都是交互卡片，用户引用时需要提取其中的文字。
+func parseInteractiveContent(raw string) string {
+	var card struct {
+		Header *struct {
+			Title *struct {
+				Content string `json:"content"`
+			} `json:"title"`
+		} `json:"header"`
+		Elements []json.RawMessage `json:"elements"`
+	}
+	if err := json.Unmarshal([]byte(raw), &card); err != nil {
+		return ""
+	}
+	var parts []string
+	if card.Header != nil && card.Header.Title != nil && card.Header.Title.Content != "" {
+		parts = append(parts, card.Header.Title.Content)
+	}
+	for _, elem := range card.Elements {
+		var el struct {
+			Tag     string `json:"tag"`
+			Content string `json:"content"`
+			Text    *struct {
+				Content string `json:"content"`
+			} `json:"text"`
+		}
+		if json.Unmarshal(elem, &el) != nil {
+			continue
+		}
+		switch {
+		case el.Tag == "markdown" && el.Content != "":
+			parts = append(parts, el.Content)
+		case el.Tag == "div" && el.Text != nil && el.Text.Content != "":
+			parts = append(parts, el.Text.Content)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
 }
 
 // senderIdentity 从事件中提取发送者 open_id 与名字。

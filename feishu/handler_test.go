@@ -240,6 +240,53 @@ func TestParsePostContent(t *testing.T) {
 	}
 }
 
+// TestParseInteractiveContent 钉死交互卡片的纯文本提取（引用消息场景）。
+func TestParseInteractiveContent(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "markdown 元素提取",
+			raw:  `{"header":{"title":{"content":"通知","tag":"plain_text"}},"elements":[{"tag":"markdown","content":"这是一条通知"}]}`,
+			want: "通知\n这是一条通知",
+		},
+		{
+			name: "div+text 元素提取",
+			raw:  `{"elements":[{"tag":"div","text":{"tag":"plain_text","content":"普通文本"}}]}`,
+			want: "普通文本",
+		},
+		{
+			name: "无 header 只有 markdown",
+			raw:  `{"elements":[{"tag":"markdown","content":"第一段"},{"tag":"markdown","content":"第二段"}]}`,
+			want: "第一段\n第二段",
+		},
+		{
+			name: "忽略按钮等非文本元素",
+			raw:  `{"elements":[{"tag":"markdown","content":"内容"},{"tag":"action","actions":[{"tag":"button","text":{"content":"点我"}}]}]}`,
+			want: "内容",
+		},
+		{
+			name: "空卡片返回空串",
+			raw:  `{}`,
+			want: "",
+		},
+		{
+			name: "非法 JSON 返回空串",
+			raw:  `{invalid`,
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseInteractiveContent(tc.raw); got != tc.want {
+				t.Errorf("parseInteractiveContent() = %q, 期望 %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // fakeRunner 是 AgentRunner 的假实现：记录 HandleMessage 收到的文本，
 // 供 handle 入口路由测试断言"哪些消息进了 agent loop、进去的文本是什么"。
 type fakeRunner struct {
