@@ -557,8 +557,12 @@ func (h *handler) prependQuotedMessage(ctx context.Context, parentID, text strin
 	resp, err := client.Im.Message.Get(fetchCtx, larkim.NewGetMessageReqBuilder().
 		MessageId(parentID).
 		Build())
-	if err != nil || !resp.Success() {
-		slog.Warn("feishu: 拉取引用消息失败", "parent_id", parentID, "err", err)
+	if err != nil {
+		slog.Warn("feishu: 拉取引用消息网络失败", "parent_id", parentID, "err", err)
+		return text
+	}
+	if !resp.Success() {
+		slog.Warn("feishu: 拉取引用消息被拒", "parent_id", parentID, "code", resp.Code, "msg", resp.Msg)
 		return text
 	}
 	if resp.Data == nil || len(resp.Data.Items) == 0 {
