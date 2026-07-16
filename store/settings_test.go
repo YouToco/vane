@@ -25,12 +25,14 @@ func TestSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() 建池失败: %v", err)
 	}
-	defer st.Close()
+	registerStoreClose(t, st)
 
 	// key 带测试前缀并在结束时清理，避免污染共享测试库里的真实配置。
 	const key = "test_settings_roundtrip"
 	t.Cleanup(func() {
-		_, _ = st.pool.Exec(ctx, `DELETE FROM settings WHERE key = $1`, key)
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(ctx, t, st, `DELETE FROM settings WHERE key = $1`, key)
 	})
 
 	t.Run("不存在返回NotFound", func(t *testing.T) {

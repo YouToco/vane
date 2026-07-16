@@ -46,7 +46,7 @@ func TestPipelineStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() 建池失败: %v", err)
 	}
-	defer st.Close()
+	registerStoreClose(t, st)
 
 	// 测试数据用固定前缀 + uuid 后缀，结束时按 FK 逆序清理，避免污染共享测试库。
 	u, err := st.UpsertUserByOpenID(ctx, "test_pipeline_"+uuid.NewString(), "pipeline-test")
@@ -78,19 +78,21 @@ func TestPipelineStore(t *testing.T) {
 	srcIDs := []int64{srcID, src2ID}
 
 	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
 		// FK 逆序：deliveries→push_batches→content_sources→content_items→
 		// subscriptions/schedules→sources→users。
-		_, _ = st.pool.Exec(ctx, `DELETE FROM deliveries WHERE user_id = $1`, u.ID)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM push_batches WHERE user_id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM deliveries WHERE user_id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM push_batches WHERE user_id = $1`, u.ID)
 		// content_sources 必须显式先删：它对 content_items 的 FK 是 ON DELETE CASCADE，
 		// 但对 sources 的不是——按 source_id 删内容会漏掉"以另一个源首发"的那些行，
 		// 残留任意一行都会让下面删 sources 撞 FK。
-		_, _ = st.pool.Exec(ctx, `DELETE FROM content_sources WHERE source_id = ANY($1)`, srcIDs)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM content_items WHERE source_id = ANY($1)`, srcIDs)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM subscriptions WHERE user_id = $1`, u.ID)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM schedules WHERE user_id = $1`, u.ID)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM sources WHERE id = ANY($1)`, srcIDs)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM content_sources WHERE source_id = ANY($1)`, srcIDs)
+		cleanupExec(ctx, t, st, `DELETE FROM content_items WHERE source_id = ANY($1)`, srcIDs)
+		cleanupExec(ctx, t, st, `DELETE FROM subscriptions WHERE user_id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM schedules WHERE user_id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM sources WHERE id = ANY($1)`, srcIDs)
+		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id = $1`, u.ID)
 	})
 
 	t.Run("UpsertSource按url幂等", func(t *testing.T) {
@@ -136,7 +138,9 @@ func TestPipelineStore(t *testing.T) {
 		wg.Wait()
 
 		t.Cleanup(func() {
-			_, _ = st.pool.Exec(ctx, `DELETE FROM sources WHERE url = $1`, concURL)
+			ctx, cancel := cleanupContext()
+			defer cancel()
+			cleanupExec(ctx, t, st, `DELETE FROM sources WHERE url = $1`, concURL)
 		})
 
 		for i, err := range errs {
@@ -193,7 +197,10 @@ func TestPipelineStore(t *testing.T) {
 			t.Fatalf("置 source 为 disabled 失败: %v", err)
 		}
 		defer func() {
-			_, _ = st.pool.Exec(ctx, `UPDATE sources SET status = $2 WHERE id = $1`, srcID, types.SourceStatusActive)
+			// 恢复失败会让后续子测试面对一个 disabled 的源，不能吞。
+			ctx, cancel := cleanupContext()
+			defer cancel()
+			cleanupExec(ctx, t, st, `UPDATE sources SET status = $2 WHERE id = $1`, srcID, types.SourceStatusActive)
 		}()
 
 		all, err := st.ListSubscribedSourcesByUser(ctx, u.ID)

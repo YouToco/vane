@@ -29,7 +29,7 @@ func TestAgentStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() 建池失败: %v", err)
 	}
-	defer st.Close()
+	registerStoreClose(t, st)
 
 	// 测试数据用固定前缀 + uuid 后缀，结束时按 FK 逆序清理，避免污染共享测试库。
 	u, err := st.UpsertUserByOpenID(ctx, "test_agent_"+uuid.NewString(), "agent-test")
@@ -38,10 +38,12 @@ func TestAgentStore(t *testing.T) {
 	}
 
 	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
 		// FK 逆序：pending_actions → agent_sessions → users。
-		_, _ = st.pool.Exec(ctx, `DELETE FROM pending_actions WHERE user_id = $1`, u.ID)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM agent_sessions WHERE user_id = $1`, u.ID)
-		_, _ = st.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM pending_actions WHERE user_id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM agent_sessions WHERE user_id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id = $1`, u.ID)
 	})
 
 	t.Run("会话建取改", func(t *testing.T) {
