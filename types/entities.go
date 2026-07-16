@@ -138,10 +138,20 @@ type Profile struct {
 
 // LLMCall 单次 LLM 调用记录（llm_calls 表，Step 6 可观测性核心）。
 // trace_id 关联同一 pipeline 的多次调用；ref_type + ref_id 多态关联业务对象。
+//
+// span_name 的真实取值恰好六个，没有共享常量——每个写入方把字面量硬编码在自己的
+// CallMeta 里，故此处是清单副本，按 span 过滤时以写入方源码为准：
+//   score(scorer/scorer.go:131) / cardgen(cardgen/cardgen.go:77) /
+//   profile_evolve(evolver/evolver.go:116) / deep_dive(feedback/deepdive.go:218) /
+//   chat_reply(feishu/handler.go:174) / agent(agent/loop.go:206)
+//
+// 注意一个 trace_id 会横跨多个 span（workflow.go:45/74/100 把同一 traceID 依次传给
+// profile_evolve/score/cardgen），故按 trace 聚合打分指标时 span_name 必须进 WHERE，
+// 否则演化与卡片生成的行会混进打分统计。
 type LLMCall struct {
 	ID               int64     `json:"id"`
 	TraceID          string    `json:"trace_id"`
-	SpanName         string    `json:"span_name"`         // 调用环节：score/cardgen/summarize/feedback_interpret/quality_check/profile_evolve/deep_dive
+	SpanName         string    `json:"span_name"`
 	UserID           *int64    `json:"user_id,omitempty"` // 可空：系统级调用无归属用户；刻意不建 FK
 	RefType          RefType   `json:"ref_type"`
 	RefID            *int64    `json:"ref_id,omitempty"` // 可空（索引 WHERE ref_id IS NOT NULL）

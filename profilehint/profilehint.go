@@ -65,6 +65,27 @@ func Build(p *types.Profile) string {
 	return capHint(strings.Join(parts, "；"))
 }
 
+// NegTail 返回本画像**预期原样出现在 Build 产物里**的负面句（无则空串）。
+//
+// 为什么导出：Gate 探针 ⑤（契约 §16.5，F1 的线上验证）要拿"期望的负面句"去比对
+// llm_calls.user_prompt 的画像行。让探针自己 reimplement 一遍 singleLine+splitNegTail
+// 必然与这里漂移，而漂移的后果是探针**假绿**——它会去找一个谁都不会写出的串，
+// 永远比对不上却报"未命中即未截断"。故期望值必须由保尾逻辑的所有者亲自给出。
+//
+// 正确性依据（保尾三段路径，任一段都不剪 neg）：
+//   - buildSummary:74  truncateEllipsis(front, …) + neg —— 只剪 front
+//   - capHint:93       front[:headBudget] + ellipsis + neg —— 只剪 front
+//   - Build 的 parts 顺序里"摘要"恒在末位，故 capHint 的 LastIndex 找到的就是本段
+//
+// 故本函数的返回值必然是 Build(p) 的后缀（当 Build(p) 非空时）。
+func NegTail(p *types.Profile) string {
+	if p == nil {
+		return ""
+	}
+	_, neg := splitNegTail(singleLine(p.Summary))
+	return neg
+}
+
 // buildSummary 对单行化后的 summary 做"前段截断 + 负面句保尾"。
 func buildSummary(s string) string {
 	front, neg := splitNegTail(s)
