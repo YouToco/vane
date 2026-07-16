@@ -118,12 +118,61 @@ func TestExaFetch_MapsResults(t *testing.T) {
 	if req["numResults"] != float64(exaDefaultNumResults) {
 		t.Errorf("numResults 默认应为 %d，实际 %v", exaDefaultNumResults, req["numResults"])
 	}
-	if s, _ := req["startPublishedDate"].(string); s == "" {
-		t.Error("默认应带 startPublishedDate（最近 7 天）")
+	if _, has := req["startPublishedDate"]; has {
+		t.Error("默认不应带 startPublishedDate（Exa 的 publishedDate 是 HTML 猜的，官方页普遍为空）")
 	}
 	contents, _ := req["contents"].(map[string]any)
 	if contents == nil || contents["text"] != true {
 		t.Errorf("contents.text 应为 true，实际 %v", req["contents"])
+	}
+}
+
+func TestExaFetch_IncludeDomains(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(sampleExaResponse))
+	}))
+	defer srv.Close()
+
+	e := newTestExa(srv.URL)
+	cfg := `{"query":"Anthropic","include_domains":["anthropic.com","docs.anthropic.com"]}`
+	_, err := e.Fetch(context.Background(), exaSrc(1, cfg))
+	if err != nil {
+		t.Fatalf("Fetch 意外失败: %v", err)
+	}
+	var req map[string]any
+	if err := json.Unmarshal(gotBody, &req); err != nil {
+		t.Fatalf("请求体不是合法 JSON: %v", err)
+	}
+	domains, ok := req["includeDomains"].([]any)
+	if !ok || len(domains) != 2 {
+		t.Fatalf("includeDomains 期望 2 个域名，实际 %v", req["includeDomains"])
+	}
+	if domains[0] != "anthropic.com" || domains[1] != "docs.anthropic.com" {
+		t.Errorf("includeDomains 内容不符: %v", domains)
+	}
+}
+
+func TestExaFetch_ExplicitLookbackDays(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(sampleExaResponse))
+	}))
+	defer srv.Close()
+
+	e := newTestExa(srv.URL)
+	_, err := e.Fetch(context.Background(), exaSrc(1, `{"query":"x","lookback_days":30}`))
+	if err != nil {
+		t.Fatalf("Fetch 意外失败: %v", err)
+	}
+	var req map[string]any
+	if err := json.Unmarshal(gotBody, &req); err != nil {
+		t.Fatalf("请求体不是合法 JSON: %v", err)
+	}
+	if s, _ := req["startPublishedDate"].(string); s == "" {
+		t.Error("显式 lookback_days=30 应带 startPublishedDate")
 	}
 }
 

@@ -3,7 +3,7 @@
 // 故不需要 RSS 那套私网/SSRF 拦截（URL 非用户可控）。
 //
 // 契约：请求 POST https://api.exa.ai/search，鉴权头 x-api-key；请求体带
-// query/type/category/numResults/startPublishedDate 与 contents.text=true；
+// query/type/category/numResults/includeDomains 与 contents.text=true；
 // 响应 results[] 每项含 id/title/url/publishedDate/author/text。
 package fetcher
 
@@ -26,8 +26,6 @@ const (
 	exaDefaultNumResults = 10
 	// exaMaxNumResults 是 Exa /search 的硬上限（numResults ≤ 100）。
 	exaMaxNumResults = 100
-	// exaDefaultLookbackDays 是默认只取最近 N 天发布的结果，控制"最新"语义与噪音。
-	exaDefaultLookbackDays = 7
 	// exaMaxTextBytes 截断单条正文的字节上限，防超长文档打爆后续打分 token
 	// （成本护栏）。截断按 rune 边界回退（truncateUTF8），绝不产生非法 UTF-8。
 	exaMaxTextBytes = 4000
@@ -64,11 +62,12 @@ func NewExa(cfg config.FetchConfig) *ExaFetcher {
 
 // exaSourceConfig 是 Exa 信源的 config JSONB 结构。query 必填，其余可选。
 type exaSourceConfig struct {
-	Query        string `json:"query"`                   // 搜索词，必填
-	Category     string `json:"category,omitempty"`      // 结果类别，如 "news"（留空则不限）
-	Type         string `json:"type,omitempty"`          // 搜索模式，默认 "auto"
-	NumResults   int    `json:"num_results,omitempty"`   // 取回条数，默认 10、上限 100
-	LookbackDays int    `json:"lookback_days,omitempty"` // 只取最近 N 天，默认 7；<0 表示不限
+	Query          string   `json:"query"`                      // 搜索词，必填
+	Category       string   `json:"category,omitempty"`         // 结果类别，如 "news"（留空则不限）
+	Type           string   `json:"type,omitempty"`             // 搜索模式，默认 "auto"
+	NumResults     int      `json:"num_results,omitempty"`      // 取回条数，默认 10、上限 100
+	LookbackDays   int      `json:"lookback_days,omitempty"`    // >0 时只取最近 N 天；0 或 <0 不过滤
+	IncludeDomains []string `json:"include_domains,omitempty"`  // 限定结果域名白名单
 }
 
 // exaRequest 是 POST /search 请求体（字段名对齐 Exa API）。
@@ -78,6 +77,7 @@ type exaRequest struct {
 	Category           string         `json:"category,omitempty"`
 	NumResults         int            `json:"numResults,omitempty"`
 	StartPublishedDate string         `json:"startPublishedDate,omitempty"`
+	IncludeDomains     []string       `json:"includeDomains,omitempty"`
 	Contents           exaContentsReq `json:"contents"`
 }
 
@@ -134,19 +134,15 @@ func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Conte
 	}
 
 	reqBody := exaRequest{
-		Query:      sc.Query,
-		Type:       typ,
-		Category:   sc.Category,
-		NumResults: num,
-		Contents:   exaContentsReq{Text: true},
+		Query:          sc.Query,
+		Type:           typ,
+		Category:       sc.Category,
+		NumResults:     num,
+		IncludeDomains: sc.IncludeDomains,
+		Contents:       exaContentsReq{Text: true},
 	}
-	// 只取最近 N 天：lookback_days 为 0 用默认 7；<0 表示不加时间下限（全量）。
-	lookback := sc.LookbackDays
-	if lookback == 0 {
-		lookback = exaDefaultLookbackDays
-	}
-	if lookback > 0 {
-		start := time.Now().UTC().Add(-time.Duration(lookback) * 24 * time.Hour)
+	if sc.LookbackDays > 0 {
+		start := time.Now().UTC().Add(-time.Duration(sc.LookbackDays) * 24 * time.Hour)
 		reqBody.StartPublishedDate = start.Format(time.RFC3339)
 	}
 
