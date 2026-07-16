@@ -1,7 +1,6 @@
 // Package sourcespec 是 api 与 agent 工具共用的信源构造层（M4 契约 §6）：
 // 把用户输入（HTTP 请求体或模型产出的工具参数）校验并构造成待 upsert 的
-// types.Source。逻辑自 api/subscriptions.go 的 buildSource 原样迁移——
-// 两个入口共用同一份校验/幂等键规则，避免 agent 加源与 API 加源语义漂移。
+// types.Source。两个入口共用同一份校验/幂等键规则，避免 agent 加源与 API 加源语义漂移。
 package sourcespec
 
 import (
@@ -14,101 +13,184 @@ import (
 )
 
 // maxSourceParamRunes 是 query/keyword/title 的长度上限（字符数）。
-// 无上限时超长输入会生成超长 sources.url/title（仅受 8KB 请求体约束）。
 const maxSourceParamRunes = 256
 
-// Spec 是信源构造入参，字段与原 api.addSubscriptionReq 一致。
-// Type 决定必填字段：rss（默认）→ URL；exa → Query；tikhub_xhs → Keyword。
-// Title 可选（缺省按类型生成展示名）；Category 是 exa 可选的结果类别
-// （如 "news"），其余类型忽略。
+// Spec 是信源构造入参。Platform + Capability 决定必填 Params。
 type Spec struct {
-	Type, URL, Query, Keyword, Title, Category string
+	Platform   string
+	Capability string
+	Params     map[string]string
+	Title      string
 }
 
-// Build 校验并构造待 upsert 的信源；校验失败返回给用户的中文错误文案（空串=成功）。
+// Build 校验并构造待 upsert 的信源；校验失败返回给用户的中文文案（空串=成功）。
 //
-// 关键设计：UpsertSource 以 sources.url 为幂等键，而 exa/tikhub 源没有天然 URL，
-// 这里用确定性合成键（exa://search?q=... / tikhub://xhs/search?keyword=...）占位——
-// 同一搜索词重复添加会命中同一信源，不产生重复行；真实请求参数放 config JSONB，
-// 由对应 fetcher 解析。
+// 幂等键规则（契约 §5.2）：
+//   - web/feed → 真实 http(s) 地址（原样不合成）
+//   - 其余    → vane://<platform>/<capability>?<params>（手工固定顺序拼接）
 func Build(spec Spec) (*types.Source, string) {
-	// 归一化：去首尾空白再校验。否则全空白 query 穿透校验建出永久失败的源，
-	// "AI" 与 "AI " 生成两个幂等键、产生重复信源双倍烧配额。
-	spec.Query = strings.TrimSpace(spec.Query)
-	spec.Keyword = strings.TrimSpace(spec.Keyword)
-	spec.Title = strings.TrimSpace(spec.Title)
-	for name, v := range map[string]string{"query": spec.Query, "keyword": spec.Keyword, "title": spec.Title} {
+	for _, v := range spec.Params {
 		if utf8.RuneCountInString(v) > maxSourceParamRunes {
-			return nil, name + " 过长（上限 256 字符）"
+			return nil, "参数过长（上限 256 字符）"
 		}
 	}
+	if utf8.RuneCountInString(spec.Title) > maxSourceParamRunes {
+		return nil, "title 过长（上限 256 字符）"
+	}
 
-	switch types.SourceType(spec.Type) {
-	case types.SourceTypeRSS, "": // 缺省向后兼容为 rss
-		// 只做结构校验（scheme 合法）；SSRF/私网拦截在抓取时由 fetcher 统一兜底，
-		// 不在此重复一套 DNS 解析——加订阅与抓取是两个时点，抓取侧才是权威防线。
-		u, err := url.Parse(spec.URL)
+	p := types.Platform(spec.Platform)
+	c := types.Capability(spec.Capability)
+
+	switch p {
+	case types.PlatformWeb:
+		return buildWeb(c, spec.Params, spec.Title)
+	case types.PlatformX:
+		return buildX(c, spec.Params, spec.Title)
+	case types.PlatformXHS:
+		return buildXHS(c, spec.Params, spec.Title)
+	default:
+		return nil, "platform 仅支持 web / x / xhs"
+	}
+}
+
+func buildWeb(cap types.Capability, params map[string]string, title string) (*types.Source, string) {
+	switch cap {
+	case types.CapFeed:
+		rawURL := strings.TrimSpace(params["url"])
+		u, err := url.Parse(rawURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return nil, "url 必须是合法的 http/https 地址"
 		}
 		return &types.Source{
-			Type:   types.SourceTypeRSS,
-			URL:    spec.URL,
-			Title:  spec.Title,
-			Status: types.SourceStatusActive,
+			Platform:   types.PlatformWeb,
+			Capability: types.CapFeed,
+			URL:        rawURL,
+			Title:      title,
+			Status:     types.SourceStatusActive,
 		}, ""
 
-	case types.SourceTypeExa:
-		if spec.Query == "" {
-			return nil, "exa 信源必须提供 query（搜索词）"
+	case types.CapSearch:
+		query := strings.TrimSpace(params["query"])
+		if query == "" {
+			return nil, "web/search 必须提供 query（搜索词）"
 		}
-		cfgMap := map[string]string{"query": spec.Query}
-		if spec.Category != "" {
-			cfgMap["category"] = spec.Category
+		cfgMap := map[string]string{"query": query}
+		category := strings.TrimSpace(params["category"])
+		if category != "" {
+			cfgMap["category"] = category
 		}
 		cfg, err := json.Marshal(cfgMap)
 		if err != nil {
 			return nil, "构造信源配置失败"
 		}
-		title := spec.Title
 		if title == "" {
-			title = "Exa: " + spec.Query
+			title = "搜索: " + query
 		}
-		// category 参与幂等键：它改变抓取语义（news 与不限类别是两个信源），
-		// 不入键会让同 query 不同 category 撞同一行、config 被静默覆盖。
-		// 空 category 不追加，兼容已建的无 category 源行。
-		syntheticURL := "exa://search?q=" + url.QueryEscape(spec.Query)
-		if spec.Category != "" {
-			syntheticURL += "&category=" + url.QueryEscape(spec.Category)
+		syntheticURL := "vane://web/search?q=" + url.QueryEscape(query)
+		if category != "" {
+			syntheticURL += "&category=" + url.QueryEscape(category)
 		}
 		return &types.Source{
-			Type:   types.SourceTypeExa,
-			URL:    syntheticURL,
-			Title:  title,
-			Config: cfg,
-			Status: types.SourceStatusActive,
+			Platform:   types.PlatformWeb,
+			Capability: types.CapSearch,
+			URL:        syntheticURL,
+			Title:      title,
+			Config:     cfg,
+			Status:     types.SourceStatusActive,
 		}, ""
 
-	case types.SourceTypeTikHubXHS:
-		if spec.Keyword == "" {
-			return nil, "tikhub_xhs 信源必须提供 keyword（小红书搜索关键词）"
+	default:
+		return nil, "web 平台仅支持 feed / search 能力"
+	}
+}
+
+func buildX(cap types.Capability, params map[string]string, title string) (*types.Source, string) {
+	switch cap {
+	case types.CapUserPosts:
+		screenName := strings.TrimSpace(params["screen_name"])
+		if screenName == "" {
+			return nil, "x/user_posts 必须提供 screen_name"
 		}
-		cfg, err := json.Marshal(map[string]string{"keyword": spec.Keyword})
+		screenName = strings.TrimPrefix(screenName, "@")
+		cfg, err := json.Marshal(map[string]string{"screen_name": screenName})
 		if err != nil {
 			return nil, "构造信源配置失败"
 		}
-		title := spec.Title
 		if title == "" {
-			title = "小红书: " + spec.Keyword
+			title = "X: @" + screenName
 		}
 		return &types.Source{
-			Type:   types.SourceTypeTikHubXHS,
-			URL:    "tikhub://xhs/search?keyword=" + url.QueryEscape(spec.Keyword),
-			Title:  title,
-			Config: cfg,
-			Status: types.SourceStatusActive,
+			Platform:   types.PlatformX,
+			Capability: types.CapUserPosts,
+			URL:        "vane://x/user_posts?screen_name=" + url.QueryEscape(screenName),
+			Title:      title,
+			Config:     cfg,
+			Status:     types.SourceStatusActive,
 		}, ""
 
+	default:
+		return nil, "x 平台仅支持 user_posts 能力"
+	}
+}
+
+func buildXHS(cap types.Capability, params map[string]string, title string) (*types.Source, string) {
+	switch cap {
+	case types.CapSearch:
+		keyword := strings.TrimSpace(params["keyword"])
+		if keyword == "" {
+			return nil, "xhs/search 必须提供 keyword（小红书搜索关键词）"
+		}
+		cfg, err := json.Marshal(map[string]string{"keyword": keyword})
+		if err != nil {
+			return nil, "构造信源配置失败"
+		}
+		if title == "" {
+			title = "小红书: " + keyword
+		}
+		return &types.Source{
+			Platform:   types.PlatformXHS,
+			Capability: types.CapSearch,
+			URL:        "vane://xhs/search?keyword=" + url.QueryEscape(keyword),
+			Title:      title,
+			Config:     cfg,
+			Status:     types.SourceStatusActive,
+		}, ""
+
+	default:
+		return nil, "xhs 平台仅支持 search 能力"
+	}
+}
+
+// BuildLegacy 接受 M6 前的扁平入参（type + url/query/keyword/category），
+// 映射到 (platform, capability, params) 后转 Build。
+// 存在的唯一理由是仓库外前端 vane-web 的兼容窗口（契约 §13.2）。
+func BuildLegacy(typ, rawURL, query, keyword, title, category string) (*types.Source, string) {
+	switch types.SourceType(typ) {
+	case types.SourceTypeRSS, "":
+		return Build(Spec{
+			Platform:   string(types.PlatformWeb),
+			Capability: string(types.CapFeed),
+			Params:     map[string]string{"url": rawURL},
+			Title:      title,
+		})
+	case types.SourceTypeExa:
+		params := map[string]string{"query": query}
+		if category != "" {
+			params["category"] = category
+		}
+		return Build(Spec{
+			Platform:   string(types.PlatformWeb),
+			Capability: string(types.CapSearch),
+			Params:     params,
+			Title:      title,
+		})
+	case types.SourceTypeTikHubXHS:
+		return Build(Spec{
+			Platform:   string(types.PlatformXHS),
+			Capability: string(types.CapSearch),
+			Params:     map[string]string{"keyword": keyword},
+			Title:      title,
+		})
 	default:
 		return nil, "type 仅支持 rss / exa / tikhub_xhs"
 	}

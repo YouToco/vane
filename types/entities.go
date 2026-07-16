@@ -26,10 +26,11 @@ type User struct {
 // 调度查询 WHERE status='active' AND next_fetch_at <= now() 命中 (status, next_fetch_at) 索引。
 type Source struct {
 	ID                   int64           `json:"id"`
-	Type                 SourceType      `json:"type"`
+	Platform             Platform        `json:"platform"`   // 008 起取代 Type
+	Capability           Capability      `json:"capability"` // 008 起取代 Type
 	URL                  string          `json:"url"`
 	Title                string          `json:"title"`
-	Config               json.RawMessage `json:"config"` // JSONB，按 Type 各自定义结构
+	Config               json.RawMessage `json:"config"` // JSONB，按 Platform+Capability 各自定义结构
 	Status               SourceStatus    `json:"status"`
 	FetchIntervalSeconds int             `json:"fetch_interval_seconds"`
 	NextFetchAt          time.Time       `json:"next_fetch_at"`             // NOT NULL DEFAULT now()
@@ -57,10 +58,12 @@ type ContentItem struct {
 	ID         int64  `json:"id"`
 	SourceID   int64  `json:"source_id"`   // 首发源（007 起语义）
 	ExternalID string `json:"external_id"` // 首发源给的源内 ID（RSS guid / 平台条目 ID）
-	// CanonicalKey 是内容的跨源唯一身份，由 fetcher 按源类型构造（rss/exa=url、
-	// tikhub_xhs=note_id）。不能用单一字段通吃：BBC 更新文章会换 guid（url 稳定）、
+	// CanonicalKey 是内容的跨源唯一身份，由 fetcher 按平台构造（web=url、xhs=note_id、
+	// x=tweet_id）。不能用单一字段通吃：BBC 更新文章会换 guid（url 稳定）、
 	// 小红书 url 带每次刷新的 xsec_token（note_id 稳定），两者恰好相反。
-	CanonicalKey string     `json:"canonical_key"`
+	CanonicalKey string `json:"canonical_key"`
+	Kind         Kind   `json:"kind"` // 内容种类，决定 Dedup/scorer 怎么对待它
+
 	URL          string     `json:"url"`
 	Title        string     `json:"title"`
 	Content      string     `json:"content"`

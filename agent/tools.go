@@ -97,7 +97,7 @@ func (t *listSourcesTool) Execute(ctx context.Context, userID int64, _ json.RawM
 		if title == "" {
 			title = src.URL
 		}
-		fmt.Fprintf(&b, "- id=%d [%s] %s（状态: %s）\n", src.ID, src.Type, title, src.Status)
+		fmt.Fprintf(&b, "- id=%d [%s/%s] %s（状态: %s）\n", src.ID, src.Platform, src.Capability, title, src.Status)
 	}
 	return strings.TrimSuffix(b.String(), "\n"), nil
 }
@@ -108,35 +108,49 @@ func (t *listSourcesTool) Summarize(json.RawMessage) string { return "" }
 // add_source：写工具，校验/构造复用 sourcespec（与 API 加订阅同一份规则）。
 // ============================================================
 
-// addSourceArgs 与工具 schema 对应；字段语义与 sourcespec.Spec 一致。
+// addSourceArgs 与工具 schema 对应。优先用 Platform+Capability（M6 新），
+// 若 Type 非空则走 BuildLegacy 兼容旧前端。
 type addSourceArgs struct {
-	Type     string `json:"type"`
-	URL      string `json:"url"`
-	Query    string `json:"query"`
-	Keyword  string `json:"keyword"`
-	Title    string `json:"title"`
-	Category string `json:"category"`
+	Platform   string `json:"platform"`
+	Capability string `json:"capability"`
+	Type       string `json:"type"` // 旧字段，兼容 M6 前调用方（走 BuildLegacy）
+	URL        string `json:"url"`
+	Query      string `json:"query"`
+	Keyword    string `json:"keyword"`
+	ScreenName string `json:"screen_name"`
+	Title      string `json:"title"`
+	Category   string `json:"category"`
 }
 
-// addSourceSchema 对齐契约 §8 与 M4 spike 验证过的形态：
-// {type(enum rss/exa/tikhub_xhs), url, query, keyword, title?, category?}。
-// url/query/keyword 的条件必填（随 type 而定）写进 description 由模型遵循，
+// addSourceSchema 对齐 M6 信源插件化契约：优先 platform + capability，
+// 同时保留旧 type 字段走 BuildLegacy 兼容窗口。
+// url/query/keyword 的条件必填（随 platform/capability 而定）写进 description 由模型遵循，
 // 权威校验在 sourcespec.Build（与 POST /api/subscriptions 完全一致）。
 const addSourceSchema = `{
   "type": "object",
   "properties": {
+    "platform": {
+      "type": "string",
+      "enum": ["web", "x", "xhs"],
+      "description": "内容平台：web=开放网页；x=X(Twitter)；xhs=小红书"
+    },
+    "capability": {
+      "type": "string",
+      "enum": ["feed", "search", "user_posts"],
+      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索；user_posts=用户时间线（仅 x）"
+    },
     "type": {
       "type": "string",
       "enum": ["rss", "exa", "tikhub_xhs"],
-      "description": "信源类型：rss=RSS/Atom 订阅源；exa=Exa 语义搜索；tikhub_xhs=小红书关键词"
+      "description": "（兼容旧版）信源类型：rss→web/feed；exa→web/search；tikhub_xhs→xhs/search。优先用 platform+capability"
     },
-    "url": {"type": "string", "description": "RSS 源地址（http/https），type=rss 时必填"},
-    "query": {"type": "string", "description": "Exa 搜索词，type=exa 时必填"},
-    "keyword": {"type": "string", "description": "小红书搜索关键词，type=tikhub_xhs 时必填"},
+    "url": {"type": "string", "description": "RSS 源地址（http/https），platform=web capability=feed 时必填"},
+    "query": {"type": "string", "description": "Exa 搜索词，platform=web capability=search 时必填"},
+    "keyword": {"type": "string", "description": "小红书搜索关键词，platform=xhs 时必填"},
+    "screen_name": {"type": "string", "description": "X 用户名（如 OpenAI），platform=x capability=user_posts 时必填"},
     "title": {"type": "string", "description": "可选：展示名，缺省按类型自动生成"},
-    "category": {"type": "string", "description": "可选：Exa 结果类别（如 news），仅 type=exa 生效"}
-  },
-  "required": ["type"]
+    "category": {"type": "string", "description": "可选：Exa 结果类别（如 news），仅 web/search 生效"}
+  }
 }`
 
 type addSourceTool struct {
@@ -145,7 +159,7 @@ type addSourceTool struct {
 
 func (t *addSourceTool) Name() string { return "add_source" }
 func (t *addSourceTool) Description() string {
-	return "添加一个信源并建立订阅。支持三种类型：rss（提供 url）、exa（提供 query 搜索词）、tikhub_xhs（提供 keyword 小红书关键词）。"
+	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts），或传旧版 type 字段兼容。"
 }
 func (t *addSourceTool) Parameters() json.RawMessage { return json.RawMessage(addSourceSchema) }
 func (t *addSourceTool) Mutating() bool              { return true }
@@ -155,14 +169,34 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "参数不是合法 JSON，请修正后重试", nil
 	}
-	src, msg := sourcespec.Build(sourcespec.Spec{
-		Type:     a.Type,
-		URL:      a.URL,
-		Query:    a.Query,
-		Keyword:  a.Keyword,
-		Title:    a.Title,
-		Category: a.Category,
-	})
+	var src *types.Source
+	var msg string
+	if a.Platform != "" {
+		params := make(map[string]string)
+		if a.URL != "" {
+			params["url"] = a.URL
+		}
+		if a.Query != "" {
+			params["query"] = a.Query
+		}
+		if a.Keyword != "" {
+			params["keyword"] = a.Keyword
+		}
+		if a.Category != "" {
+			params["category"] = a.Category
+		}
+		if a.ScreenName != "" {
+			params["screen_name"] = a.ScreenName
+		}
+		src, msg = sourcespec.Build(sourcespec.Spec{
+			Platform:   a.Platform,
+			Capability: a.Capability,
+			Params:     params,
+			Title:      a.Title,
+		})
+	} else {
+		src, msg = sourcespec.BuildLegacy(a.Type, a.URL, a.Query, a.Keyword, a.Title, a.Category)
+	}
 	if msg != "" {
 		return msg, nil
 	}
@@ -177,7 +211,7 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 	if title == "" {
 		title = src.URL
 	}
-	return fmt.Sprintf("已添加并订阅信源（id=%d）：[%s] %s", sourceID, src.Type, title), nil
+	return fmt.Sprintf("已添加并订阅信源（id=%d）：[%s/%s] %s", sourceID, src.Platform, src.Capability, title), nil
 }
 
 func (t *addSourceTool) Summarize(args json.RawMessage) string {
@@ -186,18 +220,31 @@ func (t *addSourceTool) Summarize(args json.RawMessage) string {
 		return summarizeFallback("添加信源", args)
 	}
 	var b strings.Builder
-	switch types.SourceType(a.Type) {
-	case types.SourceTypeRSS, "": // 缺省同 Build：向后兼容为 rss
+	p, c := a.Platform, a.Capability
+	if p == "" {
+		switch types.SourceType(a.Type) {
+		case types.SourceTypeRSS, "":
+			p, c = "web", "feed"
+		case types.SourceTypeExa:
+			p, c = "web", "search"
+		case types.SourceTypeTikHubXHS:
+			p, c = "xhs", "search"
+		}
+	}
+	switch p + "/" + c {
+	case "web/feed":
 		fmt.Fprintf(&b, "添加 RSS 信源：%s", a.URL)
-	case types.SourceTypeExa:
-		fmt.Fprintf(&b, "添加 Exa 搜索信源：搜索词「%s」", strings.TrimSpace(a.Query))
+	case "web/search":
+		fmt.Fprintf(&b, "添加搜索信源：搜索词「%s」", strings.TrimSpace(a.Query))
 		if a.Category != "" {
 			fmt.Fprintf(&b, "，类别「%s」", a.Category)
 		}
-	case types.SourceTypeTikHubXHS:
+	case "xhs/search":
 		fmt.Fprintf(&b, "添加小红书关键词信源：「%s」", strings.TrimSpace(a.Keyword))
+	case "x/user_posts":
+		fmt.Fprintf(&b, "添加 X 用户时间线信源：@%s", strings.TrimSpace(a.ScreenName))
 	default:
-		fmt.Fprintf(&b, "添加信源（未知类型 %s，确认后会被拒绝）", a.Type)
+		fmt.Fprintf(&b, "添加信源（%s/%s，确认后校验）", p, c)
 	}
 	if title := strings.TrimSpace(a.Title); title != "" {
 		fmt.Fprintf(&b, "，展示名「%s」", title)

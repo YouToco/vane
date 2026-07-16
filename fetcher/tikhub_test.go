@@ -69,7 +69,7 @@ func newTestTikHub(srvURL string, seen SeenChecker) *TikHubFetcher {
 
 // xhsSrc 构造一个带 keyword 的小红书信源。
 func xhsSrc(id int64, cfg string) types.Source {
-	return types.Source{ID: id, Type: types.SourceTypeTikHubXHS, Config: json.RawMessage(cfg)}
+	return types.Source{ID: id, Platform: types.PlatformXHS, Capability: types.CapSearch, Config: json.RawMessage(cfg)}
 }
 
 func TestTikHubFetch_MapsNotes(t *testing.T) {

@@ -56,9 +56,10 @@ func TestPipelineStore(t *testing.T) {
 
 	srcURL := "https://example.com/test-pipeline-" + uuid.NewString()
 	srcID, err := st.UpsertSource(ctx, &types.Source{
-		Type:  types.SourceTypeRSS,
-		URL:   srcURL,
-		Title: "pipeline-test-source",
+		Platform:   types.PlatformWeb,
+		Capability: types.CapFeed,
+		URL:        srcURL,
+		Title:      "pipeline-test-source",
 	})
 	if err != nil {
 		t.Fatalf("UpsertSource() 失败: %v", err)
@@ -66,9 +67,10 @@ func TestPipelineStore(t *testing.T) {
 	// 第二个源：007 的跨源用例（同一条内容命中两个源）都要它。放在 Cleanup 注册前
 	// 建好，否则子测试里新建的源会漏出清理范围、污染共享测试库。
 	src2ID, err := st.UpsertSource(ctx, &types.Source{
-		Type:  types.SourceTypeRSS,
-		URL:   "https://example.com/test-pipeline-2nd-" + uuid.NewString(),
-		Title: "pipeline-test-source-2",
+		Platform:   types.PlatformWeb,
+		Capability: types.CapFeed,
+		URL:        "https://example.com/test-pipeline-2nd-" + uuid.NewString(),
+		Title:      "pipeline-test-source-2",
 	})
 	if err != nil {
 		t.Fatalf("UpsertSource() 建第二个源失败: %v", err)
@@ -93,9 +95,10 @@ func TestPipelineStore(t *testing.T) {
 
 	t.Run("UpsertSource按url幂等", func(t *testing.T) {
 		again, err := st.UpsertSource(ctx, &types.Source{
-			Type:  types.SourceTypeRSS,
-			URL:   srcURL,
-			Title: "pipeline-test-source-renamed",
+			Platform:   types.PlatformWeb,
+			Capability: types.CapFeed,
+			URL:        srcURL,
+			Title:      "pipeline-test-source-renamed",
 		})
 		if err != nil {
 			t.Fatalf("UpsertSource() 二次调用失败: %v", err)
@@ -122,9 +125,10 @@ func TestPipelineStore(t *testing.T) {
 				defer wg.Done()
 				<-start
 				ids[i], errs[i] = st.UpsertSource(ctx, &types.Source{
-					Type:  types.SourceTypeRSS,
-					URL:   concURL,
-					Title: "conc-source",
+					Platform:   types.PlatformWeb,
+					Capability: types.CapFeed,
+					URL:        concURL,
+					Title:      "conc-source",
 				})
 			}()
 		}

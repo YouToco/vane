@@ -19,9 +19,15 @@ const (
 	bbcGUIDNew = "https://www.bbc.co.uk/news/articles/c9q28dlyxrzo#1"
 )
 
-func rssSource(id int64) types.Source { return types.Source{ID: id, Type: types.SourceTypeRSS} }
-func exaSource(id int64) types.Source { return types.Source{ID: id, Type: types.SourceTypeExa} }
-func xhsSource(id int64) types.Source { return types.Source{ID: id, Type: types.SourceTypeTikHubXHS} }
+func rssSource(id int64) types.Source {
+	return types.Source{ID: id, Platform: types.PlatformWeb, Capability: types.CapFeed}
+}
+func exaSource(id int64) types.Source {
+	return types.Source{ID: id, Platform: types.PlatformWeb, Capability: types.CapSearch}
+}
+func xhsSource(id int64) types.Source {
+	return types.Source{ID: id, Platform: types.PlatformXHS, Capability: types.CapSearch}
+}
 
 // TestCanonicalKey_Golden 固定三类信源的键输出（契约 §5）。这是签名级断言：键一旦变了，
 // 全库存量内容的身份就全变了（007 回填出的旧行再也匹配不上新键，重复行立刻重新长出来），
@@ -160,8 +166,8 @@ func TestCanonicalKey_EmptyWhenNoIdentityField(t *testing.T) {
 			item: types.ContentItem{SourceID: 9, ExternalID: "  "},
 		},
 		{
-			name: "未知类型不猜身份字段",
-			src:  types.Source{ID: 9, Type: "carrier_pigeon"},
+			name: "未知平台不猜身份字段",
+			src:  types.Source{ID: 9, Platform: "carrier_pigeon"},
 			item: types.ContentItem{SourceID: 9, ExternalID: "x", URL: bbcURL},
 		},
 	}

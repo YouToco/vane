@@ -259,9 +259,10 @@ func TestFeedbackStore(t *testing.T) {
 	userIDs := []int64{u.ID, u2.ID}
 
 	srcID, err := st.UpsertSource(ctx, &types.Source{
-		Type:  types.SourceTypeRSS,
-		URL:   "https://example.com/test-feedback-" + uuid.NewString(),
-		Title: "feedback-test-source",
+		Platform:   types.PlatformWeb,
+		Capability: types.CapFeed,
+		URL:        "https://example.com/test-feedback-" + uuid.NewString(),
+		Title:      "feedback-test-source",
 	})
 	if err != nil {
 		t.Fatalf("UpsertSource() 失败: %v", err)
