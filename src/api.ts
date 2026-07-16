@@ -151,11 +151,37 @@ export interface EvolveView {
   summary_runes: number;
 }
 
+// BatchExitGate 对齐 types.BatchExitGate（enums.go）：pipeline 从哪个闸门提前退出。
+// 空串 = 没有提前退出（跑到了 Push）。取值顺序即 pipeline 顺序。
+// 注意闸门名 = 产出该结果的**上一步活动名**："dedup" 意为"Dedup 跑完后没剩下东西"。
+export type BatchExitGate = "" | "fetch" | "dedup" | "score" | "select" | "cardgen";
+
+// PipelineCounts 对齐 types.PipelineCounts（entities.go）：每一步**跑完之后还剩几条**。
+//
+// 字段全部可选，这是本类型存在的全部意义，别"顺手"补默认值：
+// 后端是 *int + omitempty —— **缺席 = 这一步根本没跑，0 = 跑了、返回 0 条**。
+// 二者是不同的事故。一个 `?? 0` 就把这份区分抹平：一次停在 dedup 闸门的运行会读成
+// "打分跑了、一条都没打出来"（LLM 全军覆没的形状），而事实是打分压根没被调用。
+// 后端专门用 *int 换来的这份区分，不要在渲染层扔掉（消费方见 Observability.tsx 的 Funnel）。
+export interface PipelineCounts {
+  fetched?: number;
+  deduped?: number;
+  scored?: number;
+  selected?: number;
+  cards?: number;
+}
+
 export interface PushBatchSummary {
   id: number;
-  // types.BatchStatus。真实可观测的只有 done|failed（pending 仅在 Push 活动内部
-  // 短暂存在，看到即异常）；枚举里的 "pushing" 是死值，全仓零赋值，不会出现。
+  // types.BatchStatus。008 起真实终态是 done|failed|empty——empty 是"跑完了确实没东西
+  // 可推"的**正常终态**，不是失败（failed 是"该推却推不出去"）。pending 仅在 Push 活动
+  // 内部短暂存在，看到即异常。"pushing" 已于 008 从枚举里删除（从 001 起就是死值）。
   status: string;
+  // 提前退出的闸门，空串 = 跑到了 Push。与 status=empty 恒同时出现：有 gate ⇔ 是空批次。
+  exit_gate: BatchExitGate;
+  // 各阶段跑完后剩余条数；字段缺席 = 那一步没跑（不是"跑了得 0"）。
+  // 008 之前的历史行（stage_counts 列默认 '{}'）、以及成功推送的批次，这里全缺席。
+  stage_counts: PipelineCounts;
   created_at: string; // UTC
   idempotency_key: string; // = workflow traceID，可据此关联 llm_calls
   delivery_count: number;
@@ -256,6 +282,15 @@ function arr<T>(v: T[] | null | undefined): T[] {
   return v ?? [];
 }
 
+// 008 之前的后端不返 stage_counts 这个键，取 b.stage_counts.fetched 会直接抛 TypeError
+// 打白屏（前端先于后端上线的那个窗口）。补成 {} 而不是补零：{} 解出来全是 undefined，
+// 恰好就是"这些阶段没记录"的真话，与 008 历史行走同一条渲染路径（→ 显示"—"）。
+// 补零就成了"漏斗各阶段都跑了、都是 0"——凭空编造一份观测结果，比白屏更坏。
+// exit_gate 同理：缺席按 "" 处理 = "没有提前退出"，那正是 008 之前所有行的真实语义。
+function normalizeBatch(b: PushBatchSummary): PushBatchSummary {
+  return { ...b, exit_gate: b.exit_gate ?? "", stage_counts: b.stage_counts ?? {} };
+}
+
 function normalizeReport(raw: ObservabilityReport): ObservabilityReport {
   return {
     ...raw,
@@ -264,7 +299,7 @@ function normalizeReport(raw: ObservabilityReport): ObservabilityReport {
     score_traces: arr(raw.score_traces),
     costs: arr(raw.costs),
     models: arr(raw.models),
-    batches: arr(raw.batches),
+    batches: arr(raw.batches).map(normalizeBatch),
   };
 }
 

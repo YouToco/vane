@@ -1237,10 +1237,56 @@ a:hover {
   border-top: 1px solid var(--border);
 }
 
-/* 写入路径已知缺口的说明条：这条不显眼就会让人误以为"没有空批次发生过" */
+/* 批次表的读法说明条。
+   空批次缺口已由 008 补上，这条现在讲的是**剩下**的边界（中途报错的运行不在表里），
+   即"怎么读"而不是"告警"——故不用 .alert-warn 的琥珀色，那会把一条常识说明伪装成待办。
+
+   两个坑都在这里绕开，改动前先读完（都是实测踩出来的）：
+   ① 自带 background 是必须的：裸 .alert 只给 padding/圆角/字号，**背景色全在 .alert-*
+      修饰类里**，不补背景这条就渲染成一段没有容器的正文，与正文流糊在一起。
+   ② 刻意不复用 .alert-info：它是 display:flex（见上方 .alert-info），套在这种多行散文
+      块上会把每个文本节点和每个 <strong> 拆成独立 flex item 各自换行，说明条被撕成碎片。
+      这里要的是 block 流式排版，故显式写 display:block 锁住，别再挂 flex 类上去。 */
 .obs-gap-note {
   margin: 0 0 10px;
   line-height: 1.7;
+  display: block;
+  background: var(--info-soft);
+  color: var(--text);
+  border-left: 3px solid var(--primary);
+}
+.obs-gap-note code,
+.chart-note code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.92em;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+/* 空批次 / 闸门徽标：静音灰。
+   与 .badge-bad（红）和 .badge-type（主色蓝）都一眼可分，但不带任何告警意味——
+   "今早没新内容"是正常终态。灰底在白卡上偏淡，故补一圈边框保住徽标的形状。 */
+.badge-muted {
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+/* 漏斗：只画真跑过的阶段（见 Observability.tsx 的 Funnel）。
+   箭头压暗、数字保持正文色——要读的是数字，箭头只是连接符。 */
+.funnel {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+.funnel-arrow {
+  color: var(--muted);
+  font-size: 11px;
+}
+.funnel-n {
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------- 响应式 ---------- */

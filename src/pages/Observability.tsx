@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { api, ApiError } from "../api";
 import type {
   ObservabilityReport,
+  PipelineCounts,
   ProbeResult,
   ProbeStatus,
   ScoreBucket,
@@ -80,6 +81,57 @@ function fmtUSD(v: number): string {
 // 全串挂 title 供复制——探针红灯 Detail 给的排查 SQL 要按 trace_id 查 llm_calls。
 function shortTrace(id: string): string {
   return id.length > 12 ? `${id.slice(0, 8)}…` : id;
+}
+
+// 闸门中文名（types.BatchExitGate 的五个取值）。
+//
+// 刻意不直接吐后端枚举：这一列要回答的是"今早为什么没推送"，而 "dedup" / "cardgen"
+// 是 pipeline 的内部活动名，把它甩给读者等于让人自己去翻代码。hint 挂 title，
+// 补上枚举名本身与一句展开——排查时要按 exit_gate 查库，那个英文串仍需可见。
+//
+// 闸门名 = 产出该结果的**上一步活动名**，不是"下一步没跑成"：
+// dedup 意为"Dedup 跑完后没剩下东西"。
+const GATE_META: Record<string, { label: string; hint: string }> = {
+  fetch: { label: "无新内容", hint: "fetch：抓取跑完后无候选——压根没抓到新内容" },
+  dedup: { label: "去重后空", hint: "dedup：去重跑完后无候选——抓到了，但全是重复" },
+  score: { label: "打分后空", hint: "score：打分跑完后无候选" },
+  select: { label: "择优后空", hint: "select：择优跑完后无候选" },
+  cardgen: { label: "卡片生成后空", hint: "cardgen：卡片生成跑完后无候选" },
+};
+
+// 漏斗阶段顺序 = pipeline 顺序，与 types.PipelineCounts 的字段一一对应。
+const FUNNEL_STAGES: [keyof PipelineCounts, string][] = [
+  ["fetched", "抓取"],
+  ["deduped", "去重"],
+  ["scored", "打分"],
+  ["selected", "择优"],
+  ["cards", "卡片"],
+];
+
+// ── 漏斗：只渲染**真跑过**的阶段 ──
+//
+// 用 `v !== undefined` 过滤，绝不用 `?? 0`。后端特意把 PipelineCounts 做成 *int +
+// omitempty，就是为了让"这步没跑"（缺席）与"跑了得 0"（0）在库里可区分；一个 `?? 0`
+// 就把这份区分抹平，把停在 dedup 闸门的运行画成 "20→0→0→0→0"——读起来是
+// "打分打出了 0 条"（LLM 全军覆没的形状），而事实是打分压根没被调用。
+// 那正是 PR2 要消灭的那类混淆，在渲染层重造一次等于白改。
+function Funnel({ counts }: { counts: PipelineCounts }) {
+  const steps = FUNNEL_STAGES.map(([k, label]) => ({ label, v: counts[k] })).filter(
+    (s): s is { label: string; v: number } => s.v !== undefined,
+  );
+  // 全缺席 = 008 之前的历史行（stage_counts 默认 '{}'），或跑到了 Push 的批次
+  // （刻意没填漏斗）。显示"—"表示**没有记录**，不拿 0 冒充观测结果。
+  if (steps.length === 0) return <span className="muted">—</span>;
+  return (
+    <span className="funnel" title={steps.map((s) => `${s.label} ${s.v}`).join(" → ")}>
+      {steps.map((s, i) => (
+        <Fragment key={s.label}>
+          {i > 0 && <span className="funnel-arrow" aria-hidden="true">→</span>}
+          <span className="funnel-n">{s.v}</span>
+        </Fragment>
+      ))}
+    </span>
+  );
 }
 
 // ── 单条探针卡片 ──
@@ -341,7 +393,7 @@ export default function Observability() {
             <ScoreHistogram buckets={report.score_distribution} />
             <p className="muted chart-note">
               横轴为 LLM 原始相关分（区间左闭右开，末桶 90–100 闭合），纵轴为打分次数。
-              只统计**解析得出数字**的成功调用：静默回退中位分 50 的那些调用（completion
+              只统计<strong>解析得出数字</strong>的成功调用：静默回退中位分 50 的那些调用（completion
               里没有数字）根本不在图里——所以"没有 50 尖峰"不等于"没有回退"，
               回退量请看下面的四联计数。
             </p>
@@ -384,7 +436,7 @@ export default function Observability() {
               </div>
             )}
             <p className="muted chart-note">
-              "不同输出"数的是模型**原话**去重（"85" 与 "85分" 算两种），不是夹逼后的分数——
+              "不同输出"数的是模型<strong>原话</strong>去重（"85" 与 "85分" 算两种），不是夹逼后的分数——
               这个方向只会让计数偏高、更不容易误报，而 M3 事故那种整批逐字节相同的 "50"
               依然会掉到 1。
             </p>
@@ -409,7 +461,7 @@ export default function Observability() {
             </div>
             <p className="muted chart-note">
               四者关系：empty_no_error ⊂ no_digit ⊂ ok_total，errored 与前三者互斥。
-              errored 的条目被 pipeline 直接跳过、**一分未发**，所以不算进回退率的分母——
+              errored 的条目被 pipeline 直接跳过、<strong>一分未发</strong>，所以不算进回退率的分母——
               否则一次上游 429 抖动就能冲爆 10% 红线。empty_no_error 是 M3 事故的精确形状，
               零容忍。
             </p>
@@ -435,7 +487,7 @@ export default function Observability() {
             <p className="muted chart-note">
               unrecognized 是探针的自检位，恒应为 0：它 &gt;0 说明 scorer 的 prompt 结构变了
               而探针字面量没跟上——那是探针坏了，不是画像坏了，先修探针再谈判定。
-              owner 尚无画像时 absent 全中是**正确行为**，不是故障。
+              owner 尚无画像时 absent 全中是<strong>正确行为</strong>，不是故障。
             </p>
             <dl className="kv-grid obs-negtail">
               <div>
@@ -505,7 +557,7 @@ export default function Observability() {
               </div>
             )}
             <p className="muted chart-note">
-              日界是 UTC（DB 原生），**不是北京日**：一个 UTC 日的桶装的是北京 08:00 到次日
+              日界是 UTC（DB 原生），<strong>不是北京日</strong>：一个 UTC 日的桶装的是北京 08:00 到次日
               08:00 的调用，故此列刻意不做时区换算。环比红线只卡 score span——M5 新增的
               profile_evolve / deep_dive 是全新 span，全 span 环比测的是"上了新功能"而非
               "注入变贵"。另：cost_usd 逐行舍入后求和，score 最便宜（MaxTokens=16），
@@ -541,7 +593,7 @@ export default function Observability() {
               </div>
             )}
             <p className="muted chart-note">
-              这里的 model 是**上游报回的名字**。计价按它查价，未知 key 静默回落 v4-pro 价
+              这里的 model 是<strong>上游报回的名字</strong>。计价按它查价，未知 key 静默回落 v4-pro 价
               （约 flash 的 3 倍），且不产生任何 error——上游一次改名就能无声烧穿预算。
               盯着这张表出现陌生名字，是唯一能提前看见它的角度。
             </p>
@@ -590,12 +642,17 @@ export default function Observability() {
 
           {/* ── 推送批次历史 ── */}
           <h3 className="section-title">推送批次历史（近 14 天）</h3>
-          <div className="alert alert-warn obs-gap-note">
-            <strong>已知缺口：空批次不会出现在这张表里。</strong>
-            pipeline 有五处提前退出（如"今早无新内容"）在建批次之前就 return，
-            push_batches 里**根本没有行**——不是查询查不到。所以这张表看起来连续，
-            不代表期间每天都推成了；反过来，看不到某天的行也不代表那天没跑过 pipeline。
-            补齐它需要改写入路径，PR2 修复。
+          <div className="alert obs-gap-note">
+            <strong>怎么读这张表：空批次现在有行了，跑崩的运行仍然没有。</strong>
+            pipeline 五处提前退出（无新内容 / 去重后空 / 打分后空 / 择优后空 / 卡片生成后空）
+            现在各留一行 <code>status=empty</code> 的批次，「闸门」列说明从哪一步退的，
+            「漏斗」列说明到那一步还剩几条——"今早没新内容"从此在库里查得到，
+            且它是<strong>正常终态不是事故</strong>，故给静音灰，不给告警色。
+            但 <strong>pipeline 中途报错的运行仍然没有行</strong>：Fetch/Score 等活动重试耗尽后
+            workflow 直接失败返回，走不到任何闸门；那类运行在 Temporal 里是 Failed
+            （另有 journalctl 错误日志），本表看不见。所以这张表的语义是
+            <strong>"推送决策的产物"，不是"每次触发的流水账"</strong>——看不到某天的行，
+            仍可能是那天跑崩了。
           </div>
           <section className="card obs-section">
             {report.batches.length === 0 ? (
@@ -607,6 +664,8 @@ export default function Observability() {
                     <tr>
                       <th className="num">id</th>
                       <th>状态</th>
+                      <th>闸门</th>
+                      <th>漏斗</th>
                       <th>创建（北京时间）</th>
                       <th className="num">投递</th>
                       <th className="num">已发</th>
@@ -614,35 +673,64 @@ export default function Observability() {
                     </tr>
                   </thead>
                   <tbody>
-                    {report.batches.map((b) => (
-                      <tr key={b.id} className={b.status === "failed" ? "row-bad" : ""}>
-                        <td className="num mono">{b.id}</td>
-                        <td>
-                          <span className={"badge " + batchBadge(b.status)}>{b.status}</span>
-                        </td>
-                        <td title={`幂等键 / traceID：${b.idempotency_key}`}>
-                          {fmtBeijing(b.created_at)}
-                        </td>
-                        <td className={"num" + (b.delivery_count === 0 ? " cell-bad" : "")}>
-                          {b.delivery_count}
-                        </td>
-                        <td className="num">{b.sent_count}</td>
-                        <td className="num mono">
-                          {b.min_score === undefined || b.max_score === undefined
-                            ? "—"
-                            : `${b.min_score.toFixed(0)}–${b.max_score.toFixed(0)}`}
-                        </td>
-                      </tr>
-                    ))}
+                    {report.batches.map((b) => {
+                      const gate = GATE_META[b.exit_gate];
+                      return (
+                        <tr key={b.id} className={b.status === "failed" ? "row-bad" : ""}>
+                          <td className="num mono">{b.id}</td>
+                          <td>
+                            <span className={"badge " + batchBadge(b.status)}>{b.status}</span>
+                          </td>
+                          {/* 空串 = 没有提前退出（跑到了 Push）→ 本列无话可说，显示"—"。
+                              未知枚举值（后端加了新闸门而前端没跟上）不吞掉：原样显示
+                              英文串，让"没跟上"露出来，而不是静默变成"—"装作没有闸门。 */}
+                          <td title={gate?.hint}>
+                            {b.exit_gate === "" ? (
+                              <span className="muted">—</span>
+                            ) : (
+                              <span className="badge badge-muted">{gate?.label ?? b.exit_gate}</span>
+                            )}
+                          </td>
+                          <td className="mono">
+                            <Funnel counts={b.stage_counts} />
+                          </td>
+                          <td title={`幂等键 / traceID：${b.idempotency_key}`}>
+                            {fmtBeijing(b.created_at)}
+                          </td>
+                          {/* 投递 0 只有在**该推**的批次上才是异常。empty 批次本就没有候选，
+                              0 是它的正确值——标红会把每个"今早没新内容"渲染成一起事故，
+                              让人去查一个没出问题的早晨。failed 的 0 投递仍然红。 */}
+                          <td
+                            className={
+                              "num" +
+                              (b.status !== "empty" && b.delivery_count === 0 ? " cell-bad" : "")
+                            }
+                          >
+                            {b.delivery_count}
+                          </td>
+                          <td className="num">{b.sent_count}</td>
+                          <td className="num mono">
+                            {b.min_score === undefined || b.max_score === undefined
+                              ? "—"
+                              : `${b.min_score.toFixed(0)}–${b.max_score.toFixed(0)}`}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
             )}
             <p className="muted chart-note">
-              投递数为 0 的批次是异常：批次建了但一条投递都没插成。分数是 LLM **原始相关分**，
-              不是排序用的有效分——有效分含时新度衰减、只在推送时刻内存中存在、从不落库，
-              所以卡片里"分数高的排在后面"是正常的。鼠标悬停"创建"列可看该批的
-              幂等键（= traceID），据此可与上面的区分度表对上。
+              「闸门」非空 ⇔ 该批在 Push 之前就没候选了（status 恒为 empty）。「漏斗」只画
+              <strong>真跑过</strong>的阶段：<code>20→0</code> 是"抓到 20 条、去重后剩 0"，后面的打分/择优
+              压根没被调用——所以那里没有数字，而不是 0。两列都显示"—"的行是 008 之前的历史
+              批次（那时没有这两个列）或跑到了 Push 的批次，那是<strong>没有记录</strong>，不是"计数为 0"。
+              投递数为 0 只在 done/failed 批次上才是异常（批次建了但一条投递都没插成）；
+              empty 批次没有投递是正确的。分数是 LLM <strong>原始相关分</strong>，不是排序用的有效分——
+              有效分含时新度衰减、只在推送时刻内存中存在、从不落库，所以卡片里"分数高的排在
+              后面"是正常的。鼠标悬停"创建"列可看该批的幂等键（= traceID），据此可与上面的
+              区分度表对上。
             </p>
           </section>
         </>
@@ -654,14 +742,16 @@ export default function Observability() {
 // 批次状态徽标配色。done 不给绿：批次"跑完了"不等于"推成了"——
 // sent_count 才是真的送达数，绿灯留给探针，别在这里制造第二个安全感来源。
 //
-// 刻意不为 "pushing" 留分支：它是死枚举（types/enums.go:37 定义，但全仓零赋值、
-// 无任何 SQL 写过它），库里永远不会出现。为不存在的状态写分支会让下一个人以为
-// "卡在 pushing" 是需要排查的形状，而那个状态根本不存在——本页存在的意义就是
-// 消灭这类误导，不该自己再造一个。真实生命周期只有 pending→done|failed。
+// empty 给静音灰，与 done 一眼可分但**不给告警色**：它是"跑完了确实没东西可推"的
+// 正常终态（008 起的真状态），把它染红等于报一起假事故，让人去查一个没出问题的早晨。
+// 与 failed 的区别是根本性的：failed 是"该推却推不出去"（有卡片、推送炸了），
+// 混成一个颜色就等于把"飞书挂了"和"今天没新闻"报成同一件事。
 //
-// pending 也几乎不该出现：它只在 Push 活动内部短暂存在，落库即改终态。
+// pending 几乎不该出现：它只在 Push 活动内部短暂存在，落库即改终态。
 // 真看到 pending 说明 Push 中途崩了，是异常，故与 failed 同样不给中性色。
+// （"pushing" 这个死枚举已于 008 从 types/enums.go 删除，本函数从来就没为它留过分支。）
 function batchBadge(status: string): string {
   if (status === "failed" || status === "pending") return "badge-bad";
+  if (status === "empty") return "badge-muted";
   return "badge-type";
 }
