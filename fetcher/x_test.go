@@ -121,6 +121,12 @@ func TestTwitterFetch_MapsTimeline(t *testing.T) {
 	if items[0].ExternalID != "t1" {
 		t.Errorf("第 1 条 ExternalID 应为 t1: %s", items[0].ExternalID)
 	}
+	if items[0].SourceID != 1 {
+		t.Errorf("SourceID 应为 1: %d", items[0].SourceID)
+	}
+	if items[0].CanonicalKey != "t1" {
+		t.Errorf("CanonicalKey 应为 tweet_id: %s", items[0].CanonicalKey)
+	}
 	if items[0].Author != "OpenAI" {
 		t.Errorf("第 1 条 Author 应为 OpenAI: %s", items[0].Author)
 	}

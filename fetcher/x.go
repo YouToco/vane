@@ -157,9 +157,14 @@ func (f *TwitterFetcher) Fetch(ctx context.Context, src types.Source) ([]types.C
 	var items []types.ContentItem
 	for _, tw := range tweets {
 		item := tweetToItem(tw, sc.ScreenName)
-		if item != nil {
-			items = append(items, *item)
+		if item == nil {
+			continue
 		}
+		item.SourceID = src.ID
+		if !finalize(src, item) {
+			continue
+		}
+		items = append(items, *item)
 	}
 
 	slog.Info("x/user_posts: 抓取完成",
