@@ -73,6 +73,114 @@ export interface Source {
   created_at?: string;
 }
 
+// ---- M5 Gate 可观测性（契约 §16）----
+// 下面这批类型逐字对齐后端 json tag：probe.Report / probe.Result / probe.EvolveView
+// （probe/probe.go）与 types/observability.go。字段名对不上不会报错，只会渲染成
+// undefined——看板上表现为"没数据"，正是红线 6 警告的失败模式，故改名必须两边同步。
+
+// ProbeStatus 三态（probe.Status）。yellow 不是"通过"，是"没验到"——
+// 判定语义见 probe.go 里 Status 的注释，UI 的呈现纪律见 Observability.tsx。
+export type ProbeStatus = "green" | "yellow" | "red";
+
+export interface ProbeResult {
+  id: string;
+  name: string;
+  contract_ref: string; // 契约条款号，如 "§16.1"
+  status: ProbeStatus;
+  summary: string;
+  detail?: string; // 后端 omitempty
+}
+
+// 分数分布的一个桶，区间 [lo, hi)，末桶闭合到 100。后端恒返 10 个桶。
+export interface ScoreBucket {
+  lo: number;
+  hi: number;
+  count: number;
+}
+
+export interface ScoreTraceStat {
+  trace_id: string;
+  n: number;
+  distinct_completions: number;
+  started_at: string; // UTC
+}
+
+export interface ScoreQualityStat {
+  ok_total: number;
+  no_digit: number;
+  empty_no_error: number;
+  errored: number;
+}
+
+export interface ProfileInjectionStat {
+  total: number;
+  absent: number;
+  present: number;
+  unrecognized: number; // 恒应为 0，>0 表示探针字面量已漂移
+}
+
+export interface NegTailStat {
+  total: number;
+  intact: number;
+  expected_tail: string; // 空 = 当前画像无负面句，探针不适用
+}
+
+export interface SpanDayCost {
+  day: string; // UTC 日界，不是北京日（见 Observability.tsx 的 fmtUTCDay）
+  span_name: string;
+  calls: number;
+  cost_usd: number;
+}
+
+export interface ModelUsage {
+  model: string;
+  calls: number;
+  cost_usd: number;
+}
+
+// EvolveView 内嵌了 types.EvolveCallStat（Go 匿名嵌入 = JSON 平铺），
+// 故 calls/errored/last_call_at 与外层字段同级，这里照平铺写。
+export interface EvolveView {
+  calls: number;
+  errored: number;
+  last_call_at?: string; // 不限窗口的最近一次演化调用；缺省 = 从未演化
+  has_profile: boolean;
+  profile_updated_at?: string;
+  cursor: number; // profiles.last_evolved_feedback_id
+  tag_count: number;
+  summary_runes: number;
+}
+
+export interface PushBatchSummary {
+  id: number;
+  // types.BatchStatus。真实可观测的只有 done|failed（pending 仅在 Push 活动内部
+  // 短暂存在，看到即异常）；枚举里的 "pushing" 是死值，全仓零赋值，不会出现。
+  status: string;
+  created_at: string; // UTC
+  idempotency_key: string; // = workflow traceID，可据此关联 llm_calls
+  delivery_count: number;
+  sent_count: number;
+  // 原始相关分极值，缺省 = 本批无投递。注意不是排序用的有效分（不落库）。
+  max_score?: number;
+  min_score?: number;
+}
+
+export interface ObservabilityReport {
+  generated_at: string; // UTC
+  window_hours: number;
+  user_id: number;
+  results: ProbeResult[];
+  score_distribution: ScoreBucket[];
+  score_traces: ScoreTraceStat[];
+  quality: ScoreQualityStat;
+  injection: ProfileInjectionStat;
+  neg_tail: NegTailStat;
+  costs: SpanDayCost[];
+  models: ModelUsage[];
+  evolve: EvolveView;
+  batches: PushBatchSummary[];
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -141,6 +249,25 @@ function normalizeSchedule(raw: Record<string, unknown>): Schedule {
   };
 }
 
+// Go 的 nil slice 序列化成 null 而不是 []：窗口内没跑过批次时 score_traces/costs/
+// batches 全是 null，页面直接 .map 就白屏。与 normalizeSchedule 同一策略——
+// 形状在 api 层收敛一次，页面只面对稳定数组。
+function arr<T>(v: T[] | null | undefined): T[] {
+  return v ?? [];
+}
+
+function normalizeReport(raw: ObservabilityReport): ObservabilityReport {
+  return {
+    ...raw,
+    results: arr(raw.results),
+    score_distribution: arr(raw.score_distribution),
+    score_traces: arr(raw.score_traces),
+    costs: arr(raw.costs),
+    models: arr(raw.models),
+    batches: arr(raw.batches),
+  };
+}
+
 export const api = {
   login: (password: string) => post<{ ok: boolean }>("/api/auth/login", { password }),
   logout: () => post<{ ok: boolean }>("/api/auth/logout"),
@@ -175,4 +302,12 @@ export const api = {
     post<{ source_id: number }>("/api/subscriptions", req),
   removeSubscription: (sourceId: number) =>
     request<{ ok: boolean }>(`/api/subscriptions/${sourceId}`, { method: "DELETE" }),
+
+  // ---- M5 Gate 可观测性（契约 §16）----
+  // 只读端点，窗口由前端固化档位给（见 Observability.tsx 的 WINDOW_OPTIONS），
+  // 不接受自由输入——window_hours 直接进后端 time.Duration 与全部聚合 SQL 的 since。
+  observability: (windowHours: number) =>
+    request<ObservabilityReport>(
+      `/api/admin/observability?window_hours=${encodeURIComponent(windowHours)}`,
+    ).then(normalizeReport),
 };

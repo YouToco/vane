@@ -871,6 +871,378 @@ a:hover {
   background: var(--err);
 }
 
+/* ========== M5 可观测看板（固化组件，只读） ========== */
+
+.obs-intro {
+  margin: -8px 0 16px;
+}
+
+.obs-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.obs-generated {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 总体结论条：颜色由 .probe-green/.probe-yellow/.probe-red 提供 */
+.obs-verdict {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 14px;
+}
+
+/* ---------- 探针红绿灯卡片 ---------- */
+
+.probe-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.probe-card {
+  padding: 14px 16px;
+  animation: card-in 0.22s ease both;
+}
+
+.probe-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.probe-icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff;
+  margin-top: 2px;
+}
+
+.probe-title-wrap {
+  flex: 1;
+  min-width: 0;
+}
+.probe-title {
+  font-size: 15px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.probe-ref {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.probe-summary {
+  font-size: 13px;
+  color: var(--muted);
+  margin-top: 2px;
+  word-break: break-word;
+}
+
+.probe-tag {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: 10px;
+}
+
+.probe-toggle {
+  margin-top: 10px;
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.probe-toggle:hover {
+  color: var(--primary);
+}
+
+.probe-detail {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text);
+  word-break: break-word;
+}
+
+/* 绿 / 黄 / 红三态配色。
+   黄灯必须与绿灯**一眼可辨**：它是"没验到"不是"验过了"，做成绿色系会造成假安全感
+   （probe.Status 注释：vacuously green 会让人以为验过了）。故黄灯除了琥珀色，
+   还带 dashed 边框——色觉障碍下绿/琥珀可能糊成一片，边框形状不会。 */
+.probe-green {
+  border-color: rgb(22 163 74 / 0.35);
+  background: var(--card);
+}
+.probe-green .probe-icon {
+  background: var(--ok);
+}
+.probe-green .probe-tag {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.obs-verdict.probe-green {
+  background: var(--ok-soft);
+  color: var(--ok);
+  border: 1px solid rgb(22 163 74 / 0.35);
+}
+
+.probe-yellow {
+  border: 1px dashed var(--warn);
+  background: var(--warn-soft);
+}
+.probe-yellow .probe-icon {
+  background: var(--warn);
+}
+.probe-yellow .probe-tag {
+  background: var(--warn);
+  color: #fff;
+}
+.probe-yellow .probe-summary {
+  color: var(--warn);
+}
+.probe-yellow .probe-detail {
+  background: rgb(255 255 255 / 0.65);
+}
+.obs-verdict.probe-yellow {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border: 1px dashed var(--warn);
+}
+
+.probe-red {
+  border-color: var(--err);
+  background: var(--err-soft);
+}
+.probe-red .probe-icon {
+  background: var(--err);
+}
+.probe-red .probe-tag {
+  background: var(--err);
+  color: #fff;
+}
+.probe-red .probe-summary {
+  color: var(--err);
+  font-weight: 600;
+}
+.probe-red .probe-detail {
+  background: rgb(255 255 255 / 0.65);
+}
+.obs-verdict.probe-red {
+  background: var(--err-soft);
+  color: var(--err);
+  border: 1px solid var(--err);
+}
+
+/* ---------- 指标区块 ---------- */
+
+.obs-section {
+  padding: 16px 18px;
+}
+
+.chart-note {
+  margin: 12px 0 0;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/* 计数格 */
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+}
+.stat {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+.stat-value {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+.stat-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+.stat-warn {
+  border-color: rgb(180 83 9 / 0.4);
+  background: var(--warn-soft);
+}
+.stat-warn .stat-value {
+  color: var(--warn);
+}
+.stat-bad {
+  border-color: var(--err);
+  background: var(--err-soft);
+}
+.stat-bad .stat-value {
+  color: var(--err);
+}
+
+/* ---------- 手写 SVG 图表（契约禁止新依赖，不引图表库） ---------- */
+
+.chart {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.chart-axis {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.chart-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+}
+.chart-bar {
+  fill: var(--primary);
+}
+.chart-bar:hover {
+  fill: var(--primary-dark);
+}
+.chart-tick {
+  fill: var(--muted);
+  font-size: 11px;
+}
+.chart-value {
+  fill: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* ---------- 只读数据表 ---------- */
+
+/* 表比 .main 的 860px 窄不下来时横向滚动，不撑破布局 */
+.table-wrap {
+  overflow-x: auto;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.table th,
+.table td {
+  padding: 7px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.table th {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.table tbody tr:last-child td {
+  border-bottom: none;
+}
+.table .num {
+  text-align: right;
+}
+.mono {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.wrap {
+  white-space: normal;
+  word-break: break-word;
+}
+
+.row-bad {
+  background: var(--err-soft);
+}
+.row-bad td {
+  color: var(--err);
+}
+.cell-bad {
+  color: var(--err);
+  font-weight: 700;
+}
+/* score 行：日成本环比红线只卡它，视觉上单独拎出来 */
+.row-mark {
+  background: var(--primary-soft);
+}
+.row-total td {
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 2px solid var(--border);
+}
+
+.badge-bad {
+  background: var(--err-soft);
+  color: var(--err);
+}
+/* 紧跟在数字后面的徽标才需要留白。间距不写进 .badge-bad：
+   它在批次表里是单元格唯一子元素（会平白缩进），在 .kv-grid dd 里又已有 flex gap（会叠加）。 */
+.badge-inline {
+  margin-left: 6px;
+}
+
+/* 键值网格（演化健康 / 负面清单） */
+.kv-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 14px;
+  margin: 0;
+}
+.kv-grid dt {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.kv-grid dd {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.obs-negtail {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+/* 写入路径已知缺口的说明条：这条不显眼就会让人误以为"没有空批次发生过" */
+.obs-gap-note {
+  margin: 0 0 10px;
+  line-height: 1.7;
+}
+
 /* ---------- 响应式 ---------- */
 
 @media (max-width: 640px) {
@@ -902,5 +1274,17 @@ a:hover {
      输入框才不会在手机上被挤到 100px 左右。只命中 input，不动下拉的 auto 基准。 */
   .src-add-row input.input {
     flex-basis: 180px;
+  }
+  /* 导航 tab 变多（M5 加了「可观测」），窄屏放不下就横向滚，不要挤成两行把顶栏撑高 */
+  .nav {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .nav-link {
+    white-space: nowrap;
+  }
+  .obs-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
