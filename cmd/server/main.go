@@ -110,12 +110,21 @@ func run() error {
 	// 逐个注册（非整体 Register）：漏注册不会启动失败，而是每批推送在该活动上
 	// 重试到超时——EvolveProfile 的错误被 workflow 刻意吞掉，漏注册只会表现为
 	// 推送莫名变慢（M5 契约 §13 明示）。
+	//
+	// 这份清单漏一个的后果在 009 上真实发生过：RecordEmptyBatch 加进 workflow 却
+	// 忘了加进这里，全套测试与 go build 照样绿（Temporal 按名查表是运行时行为），
+	// 而线上五处闸门的记账**全部静默失败**——整个"空批次可见化"沦为死代码，
+	// 库里依旧零行，与没做这个功能逐字一致。由怀疑者审查在合并前抓出。
+	// 现已由 workflow/registration_test.go 钉死：它反射 *Activities 的全部
+	// Activity 方法并逐字比对本清单，漏一个 CI 就红。**新增 Activity 时改这里即可，
+	// 那个测试会告诉你漏没漏。**
 	w.RegisterActivity(activities.EvolveProfile)
 	w.RegisterActivity(activities.Fetch)
 	w.RegisterActivity(activities.Dedup)
 	w.RegisterActivity(activities.Score)
 	w.RegisterActivity(activities.Select)
 	w.RegisterActivity(activities.CardGen)
+	w.RegisterActivity(activities.RecordEmptyBatch)
 	w.RegisterActivity(activities.Push)
 	if err := w.Start(); err != nil {
 		temporalClient.Close()

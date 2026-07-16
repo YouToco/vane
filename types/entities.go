@@ -75,13 +75,63 @@ type ContentItem struct {
 	CreatedAt    time.Time  `json:"created_at"`
 }
 
+// PipelineCounts 是一次 pipeline 的漏斗快照（push_batches.stage_counts，JSONB）：
+// 每一步**跑完之后还剩几条**。它把"抓到 20 条但全被去重掉"与"压根没抓到新内容"
+// 这两种在库里此前完全同形（都是零行）的结局区分开。
+//
+// 为什么字段是 *int 而不是 int —— 这是本类型存在的全部意义，别"顺手"改成值类型：
+// nil 表示**这一步根本没跑**，0 表示**跑了，返回 0 条**。二者是不同的事故。
+// 若用 int 零值，一次停在 dedup 闸门的运行会写出 scored=0，读起来是
+// "打分跑了、一条都没打出来"（LLM 全军覆没的形状），而事实是打分压根没被调用。
+// 那正是本 PR 要消灭的那类混淆——用零值记录它等于换个地方再造一次。
+//
+// 为什么用一个 JSONB 列而不是 5 个 INT 列：① 上面的"没跑 vs 跑了得 0"用列表达
+// 就得 5 个 nullable INT，push_batches 会被一张漏斗表撑宽；② 阶段会变（M6 信源
+// 插件化在改 pipeline），JSONB 加字段不需要 ALTER，老行读出来自然是 nil = "那时
+// 没这一步"，语义正确；③ 主查询键是 exit_gate（真列），counts 只是展开细节，
+// 不承担过滤职责。
+//
+// 与 001 "JSONB → json.RawMessage（延迟解析）" 的约定不冲突：那条针对的是
+// **多态**载荷（sources.config 按 type 各自定义、pending_actions.args 是模型产出），
+// 消费方各不相同故不能在 types 里定死。漏斗计数恰恰相反——形状固定且全系统唯一，
+// 定成结构体才能让 store/probe/前端共用一份、编译期对齐。
+type PipelineCounts struct {
+	Fetched  *int `json:"fetched,omitempty"`
+	Deduped  *int `json:"deduped,omitempty"`
+	Scored   *int `json:"scored,omitempty"`
+	Selected *int `json:"selected,omitempty"`
+	Cards    *int `json:"cards,omitempty"`
+}
+
+// WithFetched 等五个方法逐级填漏斗，返回副本而非就地改。
+//
+// 值接收者 + 返回副本是为了在 **workflow 函数体内**安全使用（Temporal 确定性约束，
+// workflow/types.go:5-8）：纯计算、无共享状态、重放逐字一致。顺带把取地址收进
+// 方法内部——每次调用的形参 n 都是新变量，杜绝了循环里 &i 全指同一个的经典坑。
+func (c PipelineCounts) WithFetched(n int) PipelineCounts  { c.Fetched = &n; return c }
+func (c PipelineCounts) WithDeduped(n int) PipelineCounts  { c.Deduped = &n; return c }
+func (c PipelineCounts) WithScored(n int) PipelineCounts   { c.Scored = &n; return c }
+func (c PipelineCounts) WithSelected(n int) PipelineCounts { c.Selected = &n; return c }
+func (c PipelineCounts) WithCards(n int) PipelineCounts    { c.Cards = &n; return c }
+
 // PushBatch 一次推送决策周期（push_batches 表）。
 type PushBatch struct {
-	ID          int64       `json:"id"`
-	UserID      int64       `json:"user_id"`
-	ScheduledAt *time.Time  `json:"scheduled_at,omitempty"` // 计划推送时间，可空
+	ID     int64 `json:"id"`
+	UserID int64 `json:"user_id"`
+	// ScheduledAt 计划推送时间，可空。**从无代码写入，恒为 NULL**：即时批次的
+	// 时间锚点是 created_at，批次由 Temporal Schedule 触发时刻决定。要按时间查
+	// 批次一律用 created_at（001 的 idx_push_batches_status_scheduled 同样是死索引）。
+	ScheduledAt *time.Time  `json:"scheduled_at,omitempty"`
 	Status      BatchStatus `json:"status"`
-	CreatedAt   time.Time   `json:"created_at"`
+	// IdempotencyKey 幂等键 = workflow 的确定性 traceID（004 加列）。
+	// 本字段此前一直缺失——struct 从 004 起就没跟上 migration，故"按幂等键复用批次"
+	// 这件事在 Go 类型上是隐形的。同时它也是关联 llm_calls.trace_id 的唯一钥匙。
+	IdempotencyKey string `json:"idempotency_key"`
+	// ExitGate / StageCounts 见 BatchExitGate 与 PipelineCounts（009 加列）。
+	// 仅 Status=empty 的行有意义；其余行 ExitGate='' 且 StageCounts 全 nil。
+	ExitGate    BatchExitGate  `json:"exit_gate"`
+	StageCounts PipelineCounts `json:"stage_counts"`
+	CreatedAt   time.Time      `json:"created_at"`
 }
 
 // Delivery 单条内容投递记录（deliveries 表）。
@@ -145,8 +195,8 @@ type Profile struct {
 //   profile_evolve(evolver/evolver.go:116) / deep_dive(feedback/deepdive.go:218) /
 //   chat_reply(feishu/handler.go:174) / agent(agent/loop.go:206)
 //
-// 注意一个 trace_id 会横跨多个 span（workflow.go:45/74/100 把同一 traceID 依次传给
-// profile_evolve/score/cardgen），故按 trace 聚合打分指标时 span_name 必须进 WHERE，
+// 注意一个 trace_id 会横跨多个 span（PushPipelineWorkflow 把同一 traceID 依次传给
+// profile_evolve/score/cardgen 三步），故按 trace 聚合打分指标时 span_name 必须进 WHERE，
 // 否则演化与卡片生成的行会混进打分统计。
 type LLMCall struct {
 	ID               int64     `json:"id"`

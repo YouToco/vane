@@ -123,8 +123,8 @@ func TestObservabilityStore(t *testing.T) {
 		// 同批混一条失败行：error<>'' 的 completion 恒为 ''（llm/do.go 只在成功分支赋值），
 		// 混进来会让 distinct 虚高成 2 —— 整批同分反而变绿，正是要防的假绿。
 		insertLLMCall(ctx, t, st, llmRow{TraceID: "obs-flat", Completion: "", Error: "429", CreatedAt: at})
-		// 同 trace 的 cardgen 行：workflow 给整条 pipeline 传同一个 traceID
-		// （workflow.go:45/74/100），不限定 span 就会把卡片文案混进分数统计。
+		// 同 trace 的 cardgen 行：PushPipelineWorkflow 给整条 pipeline 传同一个 traceID
+		// （EvolveProfile/Score/CardGen 三步共用），不限定 span 就会把卡片文案混进分数统计。
 		insertLLMCall(ctx, t, st, llmRow{TraceID: "obs-flat", SpanName: cardgenSpan,
 			Completion: "一段卡片文案", CreatedAt: at})
 

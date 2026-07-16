@@ -58,15 +58,52 @@ const (
 	SubscriptionStatusInactive SubscriptionStatus = "inactive" // 已取消（保留记录）
 )
 
-// BatchStatus 推送批次状态（push_batches.status），
-// 取值与规格 Step 5 CHECK 约束对齐：pending / pushing / done / failed。
+// BatchStatus 推送批次状态（push_batches.status）。
+//
+// 真实生命周期只有两条：
+//   - 有内容可推：pending（Push 活动内短暂存在）→ done | failed
+//   - 无内容可推：直接 empty（009 起，见下）——**这是正常终态，不是失败**。
+//
+// "pushing" 已于 009 删除：它从 001 起就是死枚举，全仓零赋值、无任何 SQL 写过它，
+// 库里永远不会出现。PR1 只在注释里标注了它（store/push_batches.go），刻意把删除
+// 留给本次写入侧变更——在新增 empty 这个**真状态**的同时留着一个**假状态**，
+// 会让下一个人把"卡在 pushing"当成需要排查的形状，而那个形状根本不存在。
 type BatchStatus string
 
 const (
-	BatchStatusPending BatchStatus = "pending" // 已创建待处理
-	BatchStatusPushing BatchStatus = "pushing" // 推送进行中
-	BatchStatusDone    BatchStatus = "done"    // 全部完成
-	BatchStatusFailed  BatchStatus = "failed"  // 失败终态
+	BatchStatusPending BatchStatus = "pending" // 已创建待处理（仅 Push 活动内部短暂存在）
+	BatchStatusDone    BatchStatus = "done"    // 至少推成一张卡
+	BatchStatusFailed  BatchStatus = "failed"  // 建了批次但一张都没推成
+	// BatchStatusEmpty 无内容可推的正常终态（009 / M5 契约 §16 修订记录「空批次缺口」）。
+	// 与 failed 的区别是根本性的：failed 是"该推却推不出去"（有 cards、推送炸了），
+	// empty 是"跑完了确实没东西可推"（pipeline 在 Push 之前就没候选了）。
+	// 把两者混成一个值，就等于把"飞书挂了"和"今天没新闻"报成同一件事。
+	// 具体停在哪一步由 push_batches.exit_gate 承载（见 BatchExitGate）。
+	BatchStatusEmpty BatchStatus = "empty"
+)
+
+// BatchExitGate 是"pipeline 从哪个闸门提前退出"（push_batches.exit_gate）。
+//
+// 为什么与 status 分列两列而不是把 status 拆成 empty_fetch/empty_dedup/…：
+// 两者是**正交的两个维度**——status 回答"这批的结局是什么"（现有消费方：
+// 看板徽标、探针、deliveries 关联都按它分支），exit_gate 回答"为什么是这个结局"。
+// 塞进 status 会让每个现有 status 消费方都要认识 5 个新值，且"empty"这个结局
+// 本身反而没法一句话查（得 IN 五个值）。
+//
+// 空串 = 没有提前退出（跑到了 Push）。009 之前的历史行全部如此，故列默认 ''
+// 恰好就是它们的真实语义，无需回填。
+//
+// 取值与 workflow/workflow.go 的五处提前退出一一对应；顺序即 pipeline 顺序，
+// 故 exit_gate 天然可比较"死得多早"。注意闸门名 = 产出该结果的**上一步活动名**
+// （不是"下一步没跑成"）：BatchExitGateDedup 意为"Dedup 跑完后没剩下东西"。
+type BatchExitGate string
+
+const (
+	BatchExitGateFetch   BatchExitGate = "fetch"   // 抓取后无候选：压根没抓到新内容
+	BatchExitGateDedup   BatchExitGate = "dedup"   // 去重后无候选：抓到了但全是重复
+	BatchExitGateScore   BatchExitGate = "score"   // 打分后无候选
+	BatchExitGateSelect  BatchExitGate = "select"  // 择优后无候选
+	BatchExitGateCardGen BatchExitGate = "cardgen" // 卡片生成后无候选
 )
 
 // DeliveryStatus 单条投递状态（deliveries.status）。

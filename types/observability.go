@@ -16,7 +16,7 @@ import "time"
 // 为什么按 trace 分组：一次 pipeline = 一个 trace_id，也就是"一批"。
 // M3 事故的形状是"整批同分"，只有按批聚合才看得见——全局 distinct 会被
 // 其它正常批次稀释掉。注意同一 trace_id 还覆盖 profile_evolve/cardgen
-// （workflow.go:45/74/100 传同一个 traceID），故 SQL 必须限定 span_name。
+// （PushPipelineWorkflow 给这三步传同一个 traceID），故 SQL 必须限定 span_name。
 type ScoreTraceStat struct {
 	TraceID string `json:"trace_id"`
 	// N 是该批次成功返回的打分次数（error='' 的行）。
@@ -37,7 +37,7 @@ type ScoreTraceStat struct {
 //   - NoDigit   ⊂ OKTotal：答了但没数字 → parseScore 失败 → 静默回退中位分 50。
 //   - EmptyNoError ⊂ NoDigit：答了但完全为空 → M3 事故的精确形状（thinking 吃光预算）。
 //   - Errored   = error<>'' 的行，与上面三者互斥：调用本身失败，
-//     该条目被 activities.go:325-329 直接跳过，**没有发出任何分数**。
+//     该条目被 Score 活动的"单条打分失败，跳过"分支直接跳过，**没有发出任何分数**。
 //
 // 契约 §16 原文"completion 无数字占比"未限定 error，会把 Errored 也算成回退——
 // 一次上游 429 抖动就能冲爆 10% 红线，而它其实一分都没发。故分母必须是 OKTotal。
@@ -124,15 +124,39 @@ type EvolveCallStat struct {
 
 // PushBatchSummary 是推送批次历史的一行（含投递计数）。
 //
-// 已知盲区（M5 契约 §16 修订记录 / PR2 待办）：本结构只能覆盖**真的建了行**的
-// 批次。pipeline 有五处提前退出（workflow.go:55/66/77/92/103）在 Push 之前
-// return nil，push_batches 零行——"今早无新内容"这类空批次在库里根本不存在，
-// 不是查询查不到。补齐它需要写入路径变更，见 PR2。
+// 空批次盲区已由 009 补上（PR2）：五处提前退出（workflow.go 的 fetch/dedup/score/
+// select/cardgen 闸门）现在各自留一行 Status=empty 的批次，ExitGate 说明从哪退的、
+// StageCounts 说明各阶段还剩几条。故"今早无新内容"现在**在库里有行**。
+//
+// 仍存在的盲区，读这张表时必须知道（别把它当成 pipeline 的完整流水账）：
+// **pipeline 中途报错的运行仍然没有行**。Fetch/Score 等活动重试耗尽后 workflow
+// 直接失败返回，压根走不到任何闸门。这是刻意的边界，不是遗漏——"跑崩了"本就
+// 有记录（Temporal 里该 workflow 是 Failed，加 journalctl 的错误日志），而"跑完了
+// 但没东西推"此前才是真的无记录（五处闸门全 return nil，Temporal 显示 Completed，
+// 库里零行，两边都说不出话）。把 Temporal 的执行史再往 Postgres 抄一遍，是用更差的
+// 实现重造一个 Temporal。故本表的语义是"推送决策的产物"，不是"每次触发的日志"。
 type PushBatchSummary struct {
 	ID     int64       `json:"id"`
 	Status BatchStatus `json:"status"`
+	// ExitGate 提前退出的闸门，空串 = 跑到了 Push（Status=done|failed|pending）。
+	// 与 Status=empty 恒同时出现：有 gate ⇔ 是空批次。
+	ExitGate BatchExitGate `json:"exit_gate"`
+	// StageCounts 各阶段跑完后剩余条数；字段为 nil = 那一步没跑（不是"跑了得 0"）。
+	// 009 之前的历史行、以及**成功推送的批次**，这里全 nil。
+	//
+	// done 批次没有漏斗是刻意的范围控制，但别把补它想成免费的——代价不比现在小：
+	// 计数得经 PushIn 传进 Push 活动，而 PushIn 是 in-flight 敏感的 Temporal 载荷
+	// （改它 = 停在 Push 前的 workflow 重放时解不出新字段，契约 §8.2），且写入点在
+	// CreatePushBatchIdempotent 那条 #1 CRITICAL 幂等路径上——正是本 PR 通篇刻意
+	// 绕开的两样东西。schema 确实不用再动（JSONB 列已就位），但 schema 从来不是
+	// 这件事的难点，别让"列都建好了"读起来像"接上就行"。
+	//
+	// 真要做，先想清楚它值不值：done 批次的漏斗信息，DeliveryCount 已经给了末端，
+	// 中间各级的价值目前只是"好看"。
+	StageCounts PipelineCounts `json:"stage_counts"`
 	// CreatedAt 是批次时间锚点（UTC）。刻意不用 scheduled_at：该列从无代码写入，
-	// 恒为 NULL（store/push_batches.go:16/36 两处 INSERT 都不含它）。
+	// 恒为 NULL（store/push_batches.go 里三处 INSERT——CreatePushBatch /
+	// CreatePushBatchIdempotent / RecordEmptyPushBatch——的列清单都不含它）。
 	CreatedAt      time.Time `json:"created_at"`
 	IdempotencyKey string    `json:"idempotency_key"` // = workflow 的 traceID，可据此关联 llm_calls
 	DeliveryCount  int       `json:"delivery_count"`
