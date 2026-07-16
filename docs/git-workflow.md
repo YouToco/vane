@@ -61,6 +61,6 @@ chore(deps): bump pgx to v5.8
 | v0.3.0 | M3 | 推送管道闭环（开始自用） |
 | v0.4.0 | M4 | Agent Loop 对话交互 |
 | v0.5.0 | M5 | 反馈闭环 |
-| v0.6.0 | M6 | 加固 |
+| v0.6.0 | M6 | 源插件化 |
 | v0.7.0 | M7 | Web Dashboard（vane-web 同步打 v0.7.0） |
 | v1.0.0 | — | MVP 全量验收 |
