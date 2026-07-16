@@ -1320,10 +1320,19 @@ ORDER BY ps.id DESC LIMIT 1;
 
 ```go
 // 抽取后必须过不变量断言，**不满足 = 报错（fail_count++），不是"变化"**：
-//   - HTTP 非 2xx（尤其 403 challenge）→ CodeFetchTimeout，Retryable 按 5xx/4xx
-//   - 抽出行数 < min_rows（默认 5）→ CodeValidation
+//   - HTTP 403 challenge → CodeFetchTimeout + **Retryable = true**
+//   - 其余非 2xx → CodeFetchTimeout，Retryable 按 5xx/4xx（沿用 fetcher.go 现状）
+//   - 抽出行数 < min_rows（默认 5；**散文文档页应设 0 关闭本闸门**，见 §18）→ CodeValidation
 //   - 抽出价格数 < min_prices（默认 3，仅当上次快照有价格时）→ CodeValidation
-//   - 相对上次快照**塌缩超过 50%** → CodeValidation
+//   - 相对上次快照**塌缩超过 50%** → CodeValidation，**且不得 PutSnapshot**
+//     （塌缩文本若成了基准，页面恢复时会再报一次假变化）
+//
+// **403 的错误码与 exa/tikhub 刻意不同，别"对齐"**（对抗审查指出的冲突点）：
+//   exa.go / tikhub.go 把 401/403 归 CodeValidation，因为那是**鉴权失败**——
+//   "key 配错是本方配置问题，不可重试"。
+//   而 page_watch 抓的是**无需鉴权的公开页**，它的 403 是 **bot challenge**：
+//   实测 openai.com 呈现 200 → 403 → 200 的**间歇性**（三份独立报告三次命中）
+//   ⇒ 是瞬态，Retryable = true；判成 CodeValidation 会让这个源被当成"配置错"永久搁置。
 //
 // 为什么这是硬要求（实测）：openai.com 的 challenge 页只有 9,929B，
 // 真实页 582,777B。不设防的话 challenge 页会被抽取成完全不同的文本 →
@@ -1346,7 +1355,13 @@ ORDER BY ps.id DESC LIMIT 1;
 → **不需要 changedetection.io 那套复杂 ignore 规则**。广告位/A-B/cookie 横幅的顾虑
   **在官方 docs 站上基本不存在**（这不是电商页）。
 
-**LLM 门**（`span_name = "page_diff"`）：
+**LLM 门**（`span_name = "page_diff"`，**`ref_type = "source"` / `ref_id = <source_id>`**）：
+
+> **`types.RefType` 需新增 `RefTypeSource = "source"`**（对抗审查指出）：
+> 已复验 `llm_calls` **无 source_id 列**，多态关联只有 `ref_type + ref_id`，
+> 而现有 RefType 只有 `push_batch / feedback / content_item / profile`。
+> 不加这一项，§17.1 的 page_diff 探针**无从按源聚合**——
+> "这个源的门跑了 N 次却一条都没产出"（楔死告警）就写不出来。
 
 ```go
 // 只在 hash 已变之后才跑；只喂 diff hunk（几行）不喂整页 → 一次几百 token，远低于 $0.001。
@@ -1424,17 +1439,44 @@ ORDER BY ps.id DESC LIMIT 1;
 func StripInvisible(s string) string
 ```
 
-### 12.3 抽取必须在 `finalize` **之前**
+### 12.3 【重写】**任何进入指纹的文本都必须是抽取后的文本**
+
+> **初稿把地标钉在「finalize 之前」上，是错的**（对抗审查纠正，已复验）：
+> - `dedup.ContentHash` 实测 = `sha256(item.Title + "\n" + item.URL)` —— **根本不含正文**。
+>   初稿说"content_hash 会随 nonce 抖动"是错的。
+> - **`page_watch` 的 `newHash = sha256(text)` 根本不经 `finalize`**。
+>   ⇒ 实现者按初稿字面照做（"我确实放在 finalize 之前了"）**仍然可以把 newHash 算在裸 HTML 上**。
+> **地标应钉在"指纹"上，不是钉在某个函数上。**
+
+**规则**：HTML 剥离（含注释、`<script>`/`<style>`/`<template>`/`<noscript>`、
+`display:none`/`aria-hidden` 子树）+ `StripInvisible` **必须先于任何指纹计算完成**。
+
+**全部指纹点（穷举，新增指纹点必须登记到此清单）**：
+
+| 指纹 | 位置 | 输入 | 约束 |
+|---|---|---|---|
+| `simhash` | `finalize`（`fetcher.go:342`） | `item.Title + " " + item.Content` | **Content 必须已剥离** |
+| `content_hash` | `finalize`（`fetcher.go:340`） | `Title + "\n" + URL` | 不含正文，**本条与它无关** |
+| **`newHash`** | `pagewatch`（§10.4 步骤 1） | `sha256(extracted_text)` | **text 必须是 §10.2 的压平结果，绝非裸 HTML** |
+
+**为什么这是正确性要求而不只是安全要求**：正文若是裸 HTML，`simhash` / `newHash` 会随
+属性顺序与 nonce 抖动（**实测**：Radix UI 每次渲染生成随机组件 ID，
+`platform.claude.com/pricing` 5 个、`models/overview` 17 个）→ 每轮都判"变了"
+→ **红线 5 禁止 TTL 清理 ⇒ content_items / page_snapshots 无限膨胀且不可回收**。
+
+**做成"写不出来"而非"注释提醒"**（与 §7.2 同构的哲学）：
 
 ```go
-// HTML 剥离（含注释、<script>/<style>/<template>/<noscript>、display:none/aria-hidden 子树）
-// **必须在 finalize 之前完成**。
-//
-// finalize 算 content_hash/simhash，正文若是裸 HTML，指纹会随属性顺序/nonce 抖动
-// （实测 Radix UI 每次渲染生成随机组件 ID）→ 每轮都判"变了"
-// → **红线 5 禁止 TTL 清理 ⇒ content_items 无限膨胀且不可回收**。
-// 这既是安全要求也是正确性要求。
+// finalize 加护栏：正文含裸 HTML 标签即拒绝，不让它进指纹。
+if htmlTagRe.MatchString(item.Content) {   // `<[a-zA-Z/!]`
+    slog.Warn("fetcher: 正文含裸 HTML，抽取未在指纹之前完成（契约 §12.3），跳过该条", ...)
+    return false
+}
 ```
+
+> ⚠️ **护栏会改变 `web/feed` 的现状**：实测 2/63 条 RSS 内容含裸 HTML 标签。
+> 上线护栏前必须先落地 §12.3 的 feed 剥离（否则这 2 类条目会被丢弃而非剥离）。
+> **顺序：先剥离，再护栏。** §16 有"干净文本原样通过"的黄金用例守着剥离是恒等的。
 
 **顺带修一个既有小洞**：`web/feed` 的 content 也过 HTML 剥离
 （实测 2/63 条 RSS 内容含裸 HTML 标签直送 LLM prompt）。
@@ -1586,16 +1628,26 @@ VPS 打包产物复验含 4 处 ``===`rss`` + 4 处 `tikhub_xhs`。
   | 态 | 断言 | 抓哪个突变体 |
   |---|---|---|
   | 首轮 | 建基线（`verdict=baseline`），**产出 0 条** | — |
-  | 无变化 | 产出 0 条 | — |
+  | 无变化（**nonce fixture**：两次渲染正文逐字相同、仅 5 处 `radix-_R_<随机>_` 不同） | 抽取文本逐字节相等 ∧ 产出 0 条 ∧ **`PutSnapshot` 未被调用** | **M8** |
   | 变化 + 门判重要 | 产出 1 条，key=`#H1->H2`，`verdict=pending` | — |
-  | 🔴 **产出后崩溃重试** | base **仍是 H1**，**重新产出同键** | **M4**（`Baseline` 写成 `ORDER BY id DESC`） |
   | 🔴 **变化 + 门判不重要** | `verdict=suppressed`，**base 前进到 H2**（下轮 diff 不得对着 H1） | §10.4/§10.6 矛盾 |
-  | 🔴 **回退后稳态** | 序列 `H1(基线)→H2→H3→H2`：第 4 步产出 key=`#H3->H2` 且**必须落库** | **M10**（简化成 `#newHash`） |
+  | 🔴 **回退后稳态** | 序列 `H1(基线)→H2→H3→H2(回退)→H2(不变)`，三条断言见下 | **M10** |
   | A/B 抖动第 3 轮 | key 撞第 1 轮 → 静音 | — |
 
+  🔴 **「回退后稳态」的三条断言**（M10 的逃逸分析给的，**A1 刻意断言不变量而非格式**）：
+  - **A1**：`R4[0].CanonicalKey != R2[0].CanonicalKey` ——「**两次到达同一内容 hash，身份必须不同**」。
+    `#newHash`-only 在构造上不可能满足。**比黄金字符串强**：实现者改键格式也逃不掉。
+  - **A2**：回退轮 `PutSnapshot` **必须新增一行**（快照行数 3→4）。
+  - **A3**：第 5 轮页面仍 H2 → 产出 **0 条** 且 `page_diff` 门调用 **0 次**（fake 计数器）。
+
   > **🔴 前置硬要求**：fake `SnapshotStore` **必须真实模拟 `UNIQUE(source_id, canonical_key)`
-  > 的 ON CONFLICT DO NOTHING**。用 map 直接覆写的 fake 会**把 bug 一起藏掉**
-  > （突变体 M10 的逃逸分析明确点出了这一点）。
+  > 的 ON CONFLICT DO NOTHING**。用 map 直接覆写的 fake 会**把 bug 一起藏掉**。
+
+  > **🔴 「产出后崩溃重试自愈」不在本层测——那是恒真的复印件**（终审纠正）：
+  > fetcher 层的 fake `SnapshotStore` 会实现你写进它的任何 Baseline 语义，
+  > 用它测 reportedness **等于用实现测实现**。**该断言必须在 store 层跑真 DB**（下方 store 条目）。
+  > 本层的四态因此退化为三态；分工照抄现有 `fakeSeen` 的注释写法写清楚，
+  > 让「忘了在 store 层测」这件事更难发生。
 
   🔴 **合理性闸门必须有「塌缩独占」用例**（突变体 M7 逃逸）：现有两条（非 2xx / 行数不足）
   会**遮蔽**塌缩闸门，使它形同虚设。造一个**只有塌缩能抓**的 fixture：
@@ -1619,8 +1671,28 @@ VPS 打包产物复验含 4 处 ``===`rss`` + 4 处 `tikhub_xhs`。
   DB 门控。**这一条抓的是"契约漏掉了 store 层 SQL"这件事本身**——它是初稿真实犯过的错。
 - **scorer**：`KindArticle` 的 prompt 与 M5 **逐字节一致**（守住 M5 黄金用例）；`KindChange` 走新 prompt。
 - **promptguard**：`StripInvisible` 覆盖四类字符 + **Unicode Tags 块**；对干净文本恒等。
-- **store**：`page_snapshots` 的 `Baseline` 两段式查询（有已报告 / 无已报告）；
-  `PutSnapshot` ON CONFLICT 幂等（DB 门控）。
+- **store（DB 门控，CI 已带 postgres）**：🔴 **`Baseline` 的判别性 fixture ——
+  这是杀死突变体 M4 的唯一一条断言，也是「产出后崩溃重试自愈」的真正测试位置**：
+
+  ```go
+  // TestBaseline_跳过比已报告快照更新的未报告快照
+  // fixture（同一 source S，三行快照）：
+  //   id=1 key="watch://u#->H1"   verdict=baseline    —— 首轮基线
+  //   id=2 key="watch://u#H1->H2" verdict=pending  + **插 content_items(canonical_key=该键)**
+  //   id=3 key="watch://u#H2->H3" verdict=pending  + **不插 content_item**（崩溃窗口）
+  got, _ := st.Baseline(ctx, S)
+  // 必须是 id=2（最近的**已 settled** 快照）；
+  // 突变体的 `ORDER BY id DESC LIMIT 1` 会返回 id=3 → 红。
+  require.Equal(t, "watch://u#H1->H2", got.CanonicalKey)
+  ```
+
+  🔴 **`verdict=suppressed` 也算 settled**（同 fixture，把 id=3 的 verdict 改成 suppressed
+  → `Baseline` 必须返回 id=3）——这条守着 §10.4 与 §10.6 不再矛盾。
+
+  🔴 **无 settled 快照时返回 nil**（≥2 行 fixture，全 `pending` 且无 content_item）
+  ——单行 fixture 证明不了方向，必须 ≥2 条。
+
+  其余：`PutSnapshot` ON CONFLICT 幂等；`SettleSnapshot` 只改 verdict 不动别的。
 - **migration 008**：在**有存量的库**上跑完后 —— canonical_key **231 条逐字节未变**（快照比对）；
   9 行 source 的 platform/capability 正确且 **6 行 disabled 同样被迁**；
   幂等键前缀替换后 `Build()` 复算一致；`kind` 全为 `article`；Down 后旧代码能跑（DB 门控）。
@@ -1698,15 +1770,64 @@ VPS 打包产物复验含 4 处 ``===`rss`` + 4 处 `tikhub_xhs`。
    > **唯一能抓住它的是查存储，不是查行为。**
 
    ```sql
-   -- 期望 = 0。非 0 ⇒ 抽取跑在了 hash/存储之后，§12.3 被违反 → 立即回滚
-   SELECT count(*) FROM page_snapshots WHERE extracted_text LIKE '%<%';
+   -- 期望 = 0。非 0 ⇒ 抽取跑在了指纹/存储之后，§12.3 被违反 → 立即回滚
+   -- 用正则而非 LIKE '%<%'：压平文本里可能有合法的 "<"（如 "<1ms"），
+   -- `<[a-zA-Z/!]` 才是标签的形态。
+   SELECT count(*) FROM page_snapshots WHERE extracted_text ~ '<[a-zA-Z/!]';
+   SELECT count(*) FROM content_items WHERE content ~ '<[a-zA-Z/!]' AND kind = 'change';
+   ```
+
+   **配套探针「静止页零增长」**（次日复跑；页面确未真实变化时）：
+   ```sql
+   -- 期望 new_snaps = 0。≥1 且人工比对抽取文本逐字相同 ⇒ 指纹算在了裸 HTML 上
+   SELECT s.id, count(ps.id) AS new_snaps
+   FROM sources s JOIN page_snapshots ps ON ps.source_id = s.id
+   WHERE s.capability = 'page_watch' AND ps.id > <部署后基线快照 id>
+   GROUP BY 1;
    ```
 
 10. **【新增】快照存的是压平文本不是裸 HTML**（红线 5 的成本护栏，§10.7）
 
     ```sql
-    -- 期望：p95 远小于 100KB。压平行实测 ~26KB/页；裸 HTML 是 582KB-1.4MB。
+    -- 期望：远小于 100KB。压平行实测 ~26KB/页；裸 HTML 是 582KB-1.4MB。
     SELECT max(length(extracted_text)), avg(length(extracted_text)) FROM page_snapshots;
+    ```
+
+11. **【新增】page_watch 楔死告警 —— 门跑了但一条都没产出**（§10.4 自愈失效的唯一线上信号）
+
+    ```sql
+    -- 断言 NOT (gate_calls_3d >= 3 AND emitted_3d = 0)
+    -- 门连跑 3 天却零产出 ⇒ base 卡住了（Baseline 取了未 settled 的快照，或转移键退化）。
+    -- 依赖 §10.6 的 ref_type='source' / ref_id=<source_id> 记账。
+    SELECT l.ref_id AS source_id,
+           count(*) FILTER (WHERE l.created_at > now() - interval '3 days') AS gate_calls_3d,
+           (SELECT count(*) FROM content_items ci
+             WHERE ci.source_id = l.ref_id AND ci.kind = 'change'
+               AND ci.created_at > now() - interval '3 days')            AS emitted_3d
+    FROM llm_calls l
+    WHERE l.span_name = 'page_diff' AND l.ref_type = 'source'
+    GROUP BY l.ref_id;
+    ```
+
+12. **【新增】已报告的 change 键必须首尾相接成链**（断链 ⇒ 有一次变化永久丢失）
+
+    ```sql
+    -- 期望 0 行。转移键 watch://<url>#<prev>-><new> 天然构成链：
+    -- 每条 change 的 prev_hash 必须是前一条 change 的 new_hash，或是首轮基线。
+    WITH ch AS (
+      SELECT cs.source_id,
+             split_part(split_part(ci.canonical_key, '#', 2), '->', 1) AS prev_hash,
+             split_part(split_part(ci.canonical_key, '#', 2), '->', 2) AS new_hash
+      FROM content_items ci
+      JOIN content_sources cs ON cs.content_item_id = ci.id
+      WHERE ci.kind = 'change'
+    )
+    SELECT * FROM ch a
+    WHERE NOT EXISTS (SELECT 1 FROM ch b
+                      WHERE b.source_id = a.source_id AND b.new_hash = a.prev_hash)
+      AND NOT EXISTS (SELECT 1 FROM page_snapshots ps
+                      WHERE ps.source_id = a.source_id
+                        AND ps.canonical_key LIKE '%#->' || a.prev_hash);  -- 首轮基线
     ```
 
 ### 17.2 供应商可替换性——**这条能真验，不是纸面承诺**
@@ -1758,7 +1879,14 @@ VPS 打包产物复验含 4 处 ``===`rss`` + 4 处 `tikhub_xhs`。
   **不得**说"已添加"（那意味着 Product 被静默抹掉了）；
 ⑫ **门判不重要后基准要前进**（§10.4 与 §10.6 的真人验）：盯一个有每轮变动 build id 的页面
   → 连续两天都不应收到推送，且**第三天真实变化时 diff 只含真实变化**、
-  不含前两天累积的噪音（若含，说明基准卡在首轮基线上）。
+  不含前两天累积的噪音（若含，说明基准卡在首轮基线上）；
+⑬ **注入故障的真人验**（§17.3 ①-⑫ 全是 happy path，而 §10.4 整节只为故障路径存在）：
+  在 page_watch 产出后、内容项入库前**人为杀进程** → 下一轮**必须重新产出同一个 key 的
+  change 并送达卡片**，且 `SELECT count(*) FROM content_items WHERE canonical_key='watch://…#H1->H2'` = **1**。
+  判「无变化」或该 key 计数为 0 ⇒ Baseline 取了未 settled 的快照；
+⑭ **回退的真人验**（M10 的判据）：把页面改回**上一个已推送过的状态**（**不是基线态**
+  ——基线态不产出条目，会假阴性）→ 必须收到「改回去了」的卡片，
+  且**再下一轮不得再收到任何卡片**（后半句才是楔死的判据）。
 
 全过 → 打 tag（版本号见 §19）。
 
@@ -1972,9 +2100,26 @@ UPDATE sources SET config = config || '{"lookback_days":-1}'::jsonb WHERE id = 9
 | **自我表扬** | 「三轴让『忘了做』更难发生」——**而本契约自己就忘了做** | §18 |
 
 **突变体实验：12 个突变体，5 个逃逸**（即初稿的测试/Gate 清单约四成是装饰品）。
-逃逸的都已补上定向用例（§16 标 🔴）。最阴的是 **M8**：把抽取挪到 `finalize` 之后
-**保留了全部用户可见行为**（LLM 看到的、卡片显示的仍是干净文本）→ 每条行为断言都绿
+逃逸的都已补上定向用例（§16 标 🔴）+ 5 条新探针（§17.1 ⑨⑩⑪⑫）。
+
+最阴的是 **M8**：把抽取挪到 `finalize` 之后**保留了全部用户可见行为**
+（LLM 看到的、卡片显示的仍是干净文本）→ 每条行为断言都绿
 → **只有查存储的 SQL 探针能抓住它**（§17.1 ⑨）。
+它顺带证伪了初稿 §12.3 本身：地标钉在 `finalize` 上是错的
+（`ContentHash` 实测不含正文；`page_watch` 的 `newHash` 根本不经 finalize），
+**实现者按字面照做仍能把 newHash 算在裸 HTML 上** → §12.3 已重写为"钉在指纹上"。
+
+**M4 还揭穿了一个更隐蔽的问题：测试放错了层就是恒真的复印件。**
+初稿把「产出后崩溃重试自愈」放在 `fetcher/pagewatch` 的用例里，
+而那一层的 fake `SnapshotStore` **会实现你写进它的任何 Baseline 语义**
+——用它测 reportedness 等于用实现测实现。该断言已挪到 store 层跑真 DB（§16）。
+
+> **给后人的两条方法论**：
+> 1. 本次 5 个逃逸里有 3 个的共同点是——**契约用注释警告了，但没有会失败的测试**。
+>    注释不是防线。突变体实验的判定标准就该是「有没有一条**会红**的用例」，
+>    而不是「有没有人写过这件事很危险」。
+> 2. **测试所在的层决定它能不能证伪**。凡是"被测对象的行为由 fake 定义"的地方，
+>    那条用例就是装饰品——它只会重复你已经相信的东西。
 
 > **给后人的一条方法论**：本次 5 个逃逸里有 3 个的共同点是——
 > **契约用注释警告了，但没有会失败的测试**。注释不是防线。
