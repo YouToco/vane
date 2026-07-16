@@ -104,10 +104,33 @@
 5. **幂等与最新为准**：沿用 M5 既有语义——态度可改、追加式事件日志、重复点幂等 toast。
 6. **状态行措辞**改为「已记录」（对齐设计）。
 
-## 6. 待定/风险
+## 6. form 回调结构（2026-07-16 已验证）
 
-- **form 提交的飞书事件结构未验证**：原型是 lark-cli 发的，其 form 从未接过真实回调。
-  实现前需先用 lark-cli 发一张带 form 的卡并真点一次，抓 `card.action.trigger` 的实际 payload。
+查 SDK `oapi-sdk-go/v3@v3.9.9` 的 `event/dispatcher/callback/model.go:30-40`，
+Vane 已在用的 `CardActionTriggerEvent` 走的 `CallBackAction` 结构**原生支持 form**：
+
+```go
+type CallBackAction struct {
+    Value      map[string]interface{} `json:"value"`       // 提交按钮自带的 value（放 vane_action + delivery_id）
+    Tag        string                 `json:"tag"`
+    Name       string                 `json:"name"`        // form 容器的 name
+    FormValue  map[string]interface{} `json:"form_value"`  // form 提交：{input_name: 用户输入}
+    InputValue string                 `json:"input_value"` // 单 input 场景的值
+    Options    []string               `json:"options"`
+    Checked    bool                   `json:"checked"`
+}
+```
+
+**结论：无需换 SDK 或改订阅**。form 提交复用现有 `card.action.trigger` 通道，
+在 `onCardAction` 里按新的 `vane_action` 值分流即可，`FormValue` 取用户填写的原因文本。
+
+实现约定：
+- 提交按钮 value 带 `vane_action: "fbr"`（feedback reason）+ `delivery_id`（**字符串**，
+  沿用 §10.1 既有约定：JSON number 经 SDK 会变 float64，大 id 有精度隐患）。
+- 原因文本从 `FormValue` 取，**长度上限 500**（对齐原型的 `0/500`），超长截断而非拒绝。
+- 与既有按钮回调一样，`value` 只当线索——动作合法性、归属一律以服务端库内为准。
+
+## 7. 待定/风险
 - **图标可用性**：10:38 的图标探针列了 25 个候选，但压缩视图看不出哪些真渲染成功；
   定稿用的是 emoji（👍/👎/🔍）而非 `*_outlined` 图标名，实现照 emoji 走即可。
 - **卡片 2.0 原始 JSON 不可得**：lark-cli 的 `+chat-messages-list` 只返回压缩视图，
