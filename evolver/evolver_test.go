@@ -299,7 +299,7 @@ func TestEvolveIntegration(t *testing.T) {
 	// Recorder 传 nil store：Record 是 no-op，测试不写 llm_calls。
 	ev := New(cli, llm.NewRecorder(nil), st)
 
-	srcID, err := st.UpsertSource(ctx, &types.Source{
+	srcID, _, err := st.UpsertSource(ctx, &types.Source{
 		Platform:   types.PlatformWeb,
 		Capability: types.CapFeed,
 		URL:        "https://example.com/test-evolver-" + uuid.NewString(),

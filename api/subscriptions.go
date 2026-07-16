@@ -64,7 +64,7 @@ func (s *server) handleAddSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sourceID, err := s.deps.Store.UpsertSource(r.Context(), src)
+	sourceID, _, err := s.deps.Store.UpsertSource(r.Context(), src)
 	if err != nil {
 		writeAppError(w, err)
 		return

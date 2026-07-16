@@ -111,15 +111,16 @@ func (t *listSourcesTool) Summarize(json.RawMessage) string { return "" }
 // addSourceArgs 与工具 schema 对应。优先用 Platform+Capability（M6 新），
 // 若 Type 非空则走 BuildLegacy 兼容旧前端。
 type addSourceArgs struct {
-	Platform   string `json:"platform"`
-	Capability string `json:"capability"`
-	Type       string `json:"type"` // 旧字段，兼容 M6 前调用方（走 BuildLegacy）
-	URL        string `json:"url"`
-	Query      string `json:"query"`
-	Keyword    string `json:"keyword"`
-	ScreenName string `json:"screen_name"`
-	Title      string `json:"title"`
-	Category   string `json:"category"`
+	Platform   string   `json:"platform"`
+	Capability string   `json:"capability"`
+	Type       string   `json:"type"` // 旧字段，兼容 M6 前调用方（走 BuildLegacy）
+	URL        string   `json:"url"`
+	Query      string   `json:"query"`
+	Keyword    string   `json:"keyword"`
+	ScreenName string   `json:"screen_name"`
+	Title      string   `json:"title"`
+	Category   string   `json:"category"`
+	Categories []string `json:"categories"`
 }
 
 // addSourceSchema 对齐 M6 信源插件化契约：优先 platform + capability，
@@ -149,7 +150,8 @@ const addSourceSchema = `{
     "keyword": {"type": "string", "description": "小红书搜索关键词，platform=xhs 时必填"},
     "screen_name": {"type": "string", "description": "X 用户名（如 OpenAI），platform=x capability=user_posts 时必填"},
     "title": {"type": "string", "description": "可选：展示名，缺省按类型自动生成"},
-    "category": {"type": "string", "description": "可选：Exa 结果类别（如 news），仅 web/search 生效"}
+    "category": {"type": "string", "description": "可选：Exa 结果类别（如 news），仅 web/search 生效"},
+    "categories": {"type": "array", "items": {"type": "string"}, "description": "可选：RSS 分类过滤（如 [\"Product\",\"Research\"]），仅 web/feed 生效；不传=不限"}
   }
 }`
 
@@ -188,6 +190,10 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 		if a.ScreenName != "" {
 			params["screen_name"] = a.ScreenName
 		}
+		if len(a.Categories) > 0 {
+			catJSON, _ := json.Marshal(a.Categories)
+			params["categories"] = string(catJSON)
+		}
 		src, msg = sourcespec.Build(sourcespec.Spec{
 			Platform:   a.Platform,
 			Capability: a.Capability,
@@ -200,7 +206,7 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 	if msg != "" {
 		return msg, nil
 	}
-	sourceID, err := t.st.UpsertSource(ctx, src)
+	sourceID, updated, err := t.st.UpsertSource(ctx, src)
 	if err != nil {
 		return "", err
 	}
@@ -211,7 +217,11 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 	if title == "" {
 		title = src.URL
 	}
-	return fmt.Sprintf("已添加并订阅信源（id=%d）：[%s/%s] %s", sourceID, src.Platform, src.Capability, title), nil
+	verb := "已添加并订阅"
+	if updated {
+		verb = "已更新既有"
+	}
+	return fmt.Sprintf("%s信源（id=%d）：[%s/%s] %s", verb, sourceID, src.Platform, src.Capability, title), nil
 }
 
 func (t *addSourceTool) Summarize(args json.RawMessage) string {

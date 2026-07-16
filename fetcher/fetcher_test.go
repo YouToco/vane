@@ -385,3 +385,78 @@ func TestFetchRSS_InvalidConfigRejected(t *testing.T) {
 		t.Error("非法 config 是确定性错误，不应可重试")
 	}
 }
+
+func categoriesServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	rss := `<?xml version="1.0"?>
+<rss version="2.0">
+<channel><title>Test</title>
+<item><title>Product Launch</title><link>https://example.com/product</link>
+  <category>Product</category><pubDate>` + time.Now().UTC().Format(time.RFC1123Z) + `</pubDate></item>
+<item><title>Research Paper</title><link>https://example.com/research</link>
+  <category>Research</category><pubDate>` + time.Now().UTC().Format(time.RFC1123Z) + `</pubDate></item>
+<item><title>Company Update</title><link>https://example.com/company</link>
+  <category>Company</category><pubDate>` + time.Now().UTC().Format(time.RFC1123Z) + `</pubDate></item>
+<item><title>Multi Cat</title><link>https://example.com/multi</link>
+  <category>Research</category><category>Product</category><pubDate>` + time.Now().UTC().Format(time.RFC1123Z) + `</pubDate></item>
+<item><title>No Category</title><link>https://example.com/nocat</link>
+  <pubDate>` + time.Now().UTC().Format(time.RFC1123Z) + `</pubDate></item>
+</channel></rss>`
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.Write([]byte(rss))
+	}))
+}
+
+func TestFetchRSS_CategoriesFilter(t *testing.T) {
+	srv := categoriesServer(t)
+	defer srv.Close()
+	f := newTestFetcher()
+
+	items, err := f.FetchRSS(context.Background(), types.Source{
+		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
+		Config: json.RawMessage(`{"categories":["Product"]}`),
+	})
+	if err != nil {
+		t.Fatalf("FetchRSS 出错: %v", err)
+	}
+	got := titlesOf(items)
+	if len(got) != 2 {
+		t.Fatalf("categories=[Product] 应匹配 2 条（Product Launch + Multi Cat），实际 %d: %v", len(got), got)
+	}
+}
+
+func TestFetchRSS_CategoriesCaseInsensitive(t *testing.T) {
+	srv := categoriesServer(t)
+	defer srv.Close()
+	f := newTestFetcher()
+
+	items, err := f.FetchRSS(context.Background(), types.Source{
+		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
+		Config: json.RawMessage(`{"categories":["research"]}`),
+	})
+	if err != nil {
+		t.Fatalf("FetchRSS 出错: %v", err)
+	}
+	got := titlesOf(items)
+	if len(got) != 2 {
+		t.Fatalf("categories=[research] 大小写不敏感应匹配 2 条，实际 %d: %v", len(got), got)
+	}
+}
+
+func TestFetchRSS_CategoriesEmpty_NoFilter(t *testing.T) {
+	srv := categoriesServer(t)
+	defer srv.Close()
+	f := newTestFetcher()
+
+	items, err := f.FetchRSS(context.Background(), types.Source{
+		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
+		Config: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("FetchRSS 出错: %v", err)
+	}
+	if len(items) != 5 {
+		t.Fatalf("无 categories 应返回全部 5 条，实际 %d", len(items))
+	}
+}

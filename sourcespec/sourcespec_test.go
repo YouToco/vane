@@ -1,6 +1,7 @@
 package sourcespec
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -33,6 +34,37 @@ func TestBuild_WebFeedRejectsBadURL(t *testing.T) {
 		}); msg == "" {
 			t.Errorf("URL %q 应被拒绝", u)
 		}
+	}
+}
+
+func TestBuild_WebFeedWithCategories(t *testing.T) {
+	catJSON, _ := json.Marshal([]string{"Product", "Research"})
+	src, msg := Build(Spec{
+		Platform:   "web",
+		Capability: "feed",
+		Params:     map[string]string{"url": "https://openai.com/news/rss.xml", "categories": string(catJSON)},
+	})
+	if msg != "" {
+		t.Fatalf("合法请求不应报错: %s", msg)
+	}
+	if src.URL != "https://openai.com/news/rss.xml" {
+		t.Errorf("URL 应为原始地址（categories 不入键）: %q", src.URL)
+	}
+	var cfg struct{ Categories []string `json:"categories"` }
+	if err := json.Unmarshal(src.Config, &cfg); err != nil {
+		t.Fatalf("config 应包含 categories: %v", err)
+	}
+	if len(cfg.Categories) != 2 || cfg.Categories[0] != "Product" || cfg.Categories[1] != "Research" {
+		t.Errorf("categories 不符: %v", cfg.Categories)
+	}
+}
+
+func TestBuild_WebFeedCategoriesNotInKey(t *testing.T) {
+	catJSON, _ := json.Marshal([]string{"Product"})
+	a, _ := Build(Spec{Platform: "web", Capability: "feed", Params: map[string]string{"url": "https://openai.com/rss.xml"}})
+	b, _ := Build(Spec{Platform: "web", Capability: "feed", Params: map[string]string{"url": "https://openai.com/rss.xml", "categories": string(catJSON)}})
+	if a.URL != b.URL {
+		t.Errorf("categories 不应影响幂等键: %q vs %q", a.URL, b.URL)
 	}
 }
 
