@@ -10,6 +10,11 @@ vane.zhuoqidev.com {
 	handle /api/* {
 		reverse_proxy localhost:8080
 	}
+	# A2A agent card 发现端点走后端（a2a-contract §11 PR-infra；拍板：card 放主域）。
+	# Caddy 的 handle 按最长路径前缀匹配，不受声明顺序影响；A2A 未启用时后端对该路径 404。
+	handle /.well-known/* {
+		reverse_proxy localhost:8080
+	}
 	handle {
 		root * /srv/vane-web
 		try_files {path} /index.html
