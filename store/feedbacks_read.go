@@ -61,12 +61,16 @@ func (s *Store) ListFeedbacksForEvolution(ctx context.Context, userID int64, aft
 // "窗口内旧态度遮蔽窗口外新态度"的组合。
 //
 // JOIN content_items 取标题（INNER）：内容已清理（content_item_id NULL）的行
-// 自然丢弃——无标题即无从注入打分 prompt；空标题同理在 Go 侧跳过。
-// 去重按标题保序（同一标题多条 delivery 只留最新一次）；不在 SQL 加 LIMIT，
+// 自然丢弃——无标题即无从注入打分 prompt。空标题回退正文前 200 字符
+// （X 官号类无标题内容整批 title=''，2026-07-17 实测其负反馈对打分 prompt
+// 完全不可见——Gate ⑥ 盲区；200 与演化通道 ListFeedbacksForEvolution 的
+// excerpt 同宽，scorer 侧 SingleLine+TruncateRunes 负责渲染收窄）；
+// 标题与正文都空才在 Go 侧跳过。
+// 去重按注入串保序（同一标题多条 delivery 只留最新一次）；不在 SQL 加 LIMIT，
 // 去重后可能不足 limit（单用户反馈量级小，全量扫窗口可接受）。
 func (s *Store) ListRecentNegativeFeedbackTitles(ctx context.Context, userID int64, since time.Time, limit int) ([]string, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT ci.title
+		`SELECT COALESCE(NULLIF(ci.title, ''), left(ci.content, 200))
 		 FROM (
 		     SELECT DISTINCT ON (f.delivery_id)
 		            f.delivery_id, f.action, f.created_at

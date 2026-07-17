@@ -563,6 +563,55 @@ func TestFeedbackStore(t *testing.T) {
 		}
 	})
 
+	t.Run("ListRecentNegativeFeedbackTitles空标题回退正文", func(t *testing.T) {
+		// Gate ⑥ 盲区回归：X 官号类内容 title=''，负反馈曾对打分 prompt 不可见。
+		// 独立用户隔离，不与「最新态度过滤」子测试的清单断言耦合。
+		since := time.Now().Add(-14 * 24 * time.Hour)
+		u3, err := st.UpsertUserByOpenID(ctx, "test_feedback3_"+uuid.NewString(), "feedback-test-3")
+		if err != nil {
+			t.Fatalf("UpsertUserByOpenID() u3 失败: %v", err)
+		}
+		batchID3, err := st.CreatePushBatch(ctx, u3.ID)
+		if err != nil {
+			t.Fatalf("CreatePushBatch() u3 失败: %v", err)
+		}
+		t.Cleanup(func() {
+			ctx, cancel := cleanupContext()
+			defer cancel()
+			cleanupExec(ctx, t, st, `DELETE FROM feedbacks WHERE user_id = $1`, u3.ID)
+			cleanupExec(ctx, t, st, `DELETE FROM deliveries WHERE user_id = $1`, u3.ID)
+			cleanupExec(ctx, t, st, `DELETE FROM push_batches WHERE user_id = $1`, u3.ID)
+			cleanupExec(ctx, t, st, `DELETE FROM users WHERE id = $1`, u3.ID)
+		})
+		mk := func(title, content string) int64 {
+			ci := newContent(t, title, content)
+			return newDelivery(t, u3.ID, batchID3, &ci, "")
+		}
+
+		// 长正文（>200 字符，含 CJK）验证 left() 按字符截断而非字节。
+		longContent := strings.Repeat("模型动态摘要。", 30) // 7 字符 × 30 = 210 字符
+		dLong := mk("", longContent)
+		addFeedback(t, u3.ID, dLong, types.FeedbackActionNotInterested, "")
+		dTitled := mk("有标题内容", "标题应优先于正文")
+		addFeedback(t, u3.ID, dTitled, types.FeedbackActionNotInterested, "")
+		dBlank := mk("", "")
+		addFeedback(t, u3.ID, dBlank, types.FeedbackActionNotInterested, "") // 双空 → 跳过
+		// 同正文第二条无标题 delivery → 按回退串去重只留一条。
+		dDup := mk("", longContent)
+		addFeedback(t, u3.ID, dDup, types.FeedbackActionMisjudged, "")
+
+		titles, err := st.ListRecentNegativeFeedbackTitles(ctx, u3.ID, since, 10)
+		if err != nil {
+			t.Fatalf("ListRecentNegativeFeedbackTitles() 失败: %v", err)
+		}
+		wantHead := string([]rune(longContent)[:200])
+		// 倒序：dDup（与 dLong 回退串相同被去重，留最新一次）→ dBlank 跳过 → dTitled → dLong。
+		want := []string{wantHead, "有标题内容"}
+		if len(titles) != len(want) || titles[0] != want[0] || titles[1] != want[1] {
+			t.Errorf("空标题回退清单应为 %v，实际 %v", want, titles)
+		}
+	})
+
 	t.Run("GetDeliveryForUser归属与body_md回读", func(t *testing.T) {
 		ci := newContent(t, "归属校验内容", "正文")
 		body := "**标题**\n一句话摘要\n[阅读原文](https://example.com/a)"
