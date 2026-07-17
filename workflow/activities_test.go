@@ -140,6 +140,10 @@ func (s *fakeStore) emptyBatchCalls() []emptyBatchCall {
 	return append([]emptyBatchCall(nil), s.emptyCalls...)
 }
 
+func (s *fakeStore) GetSource(_ context.Context, id int64) (*types.Source, error) {
+	return &types.Source{ID: id, Title: "fake-source", Platform: "rss"}, nil
+}
+
 func (s *fakeStore) ListDueSourcesByUser(context.Context, int64) ([]types.Source, error) {
 	return nil, nil
 }
@@ -349,11 +353,11 @@ func TestPush_BuildCardInjectedAndPersisted(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var builds []buildArgs
-	buildCard := func(bodyMD string, deliveryID int64, cs feedback.CardState) string {
+	buildCard := func(input feedback.CardInput) string {
 		mu.Lock()
 		defer mu.Unlock()
-		builds = append(builds, buildArgs{bodyMD, deliveryID, cs})
-		return fmt.Sprintf(`{"final_card":true,"delivery_id":%d}`, deliveryID)
+		builds = append(builds, buildArgs{input.BodyMD, input.DeliveryID, input.State})
+		return fmt.Sprintf(`{"final_card":true,"delivery_id":%d}`, input.DeliveryID)
 	}
 	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, buildCard)
 
@@ -397,7 +401,7 @@ func TestPush_SentAlreadySkipsBuildAndSend(t *testing.T) {
 	st := &fakeStore{sentAlready: true}
 	push := &fakePusher{}
 	buildCalls := 0
-	buildCard := func(string, int64, feedback.CardState) string {
+	buildCard := func(feedback.CardInput) string {
 		buildCalls++
 		return "{}"
 	}

@@ -107,6 +107,8 @@ type Store interface {
 	// MarkDeliverySent 发送成功后回填 message_id 与最终卡 JSON（契约 §3.3：
 	// 最终卡在拿到 delivery id 后才构造，只能在此落库而非 Insert 时）。
 	MarkDeliverySent(ctx context.Context, id int64, feishuMessageID string, cardJSON json.RawMessage, sentAt time.Time) error
+	// GetSource 按 id 查信源（卡片改版：subtitle 需要 source.Title 和 Platform）。
+	GetSource(ctx context.Context, id int64) (*types.Source, error)
 }
 
 // Activities 持有 6 步 pipeline 的全部依赖，方法即 Temporal Activity。
@@ -123,13 +125,13 @@ type Activities struct {
 	// buildCard 构造带反馈按钮的最终卡（生产装配传 feishu.BuildDeliveryCard）。
 	// 函数注入而非 import feishu：feishu→agent→workflow 依赖链已存在，
 	// 本包直接依赖 feishu 即成 import 环（契约 §8.2 CRITICAL）。
-	buildCard func(bodyMD string, deliveryID int64, st feedback.CardState) string
+	buildCard func(input feedback.CardInput) string
 }
 
 // NewActivities 装配 Activities。前六参顺序与规格 B6"持有 fetcher/scorer/
 // cardgen/pusher/store/feishuMgr"一致；ev 可为 nil（演化灰度关闭）。
 func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, fs FeishuManager,
-	ev ProfileEvolver, buildCard func(bodyMD string, deliveryID int64, st feedback.CardState) string) *Activities {
+	ev ProfileEvolver, buildCard func(input feedback.CardInput) string) *Activities {
 	return &Activities{fetcher: f, scorer: sc, cardgen: cg, pusher: p, store: st, feishu: fs,
 		evolver: ev, buildCard: buildCard}
 }
@@ -321,6 +323,16 @@ func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem
 
 	kept := make([]types.ContentItem, 0, len(in.Items))
 	for _, item := range in.Items {
+		// change 类内容豁免 simhash 近似去重（契约 §8.1）。
+		// simhash 的设计目的「改动少量文字仍判为重复」与 change 的信号直接对立；
+		// change 的精确去重由 canonical_key 的 UNIQUE 承担（§10.4）。
+		if item.Kind == types.KindChange {
+			s := dedup.Simhash(item.Title + " " + item.Content)
+			item.Simhash = &s
+			kept = append(kept, item)
+			continue
+		}
+
 		sh := dedup.Simhash(item.Title + " " + item.Content)
 		// 候选集 = 用户级历史 simhash ∪ 全局批内已保留 simhash。
 		candidates := append(append([]int64{}, hist...), batchSeen...)
@@ -454,8 +466,23 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			continue
 		}
 
-		// 新投递尚无任何反馈：状态行传零值 CardState。
-		cardJSON := a.buildCard(card.BodyMD, delID, feedback.CardState{})
+		// 构卡元数据：标题/分数/URL 从 pipeline 上下文取，源信息 best-effort 查库。
+		ci := feedback.CardInput{
+			BodyMD:      card.BodyMD,
+			DeliveryID:  delID,
+			State:       feedback.CardState{},
+			Title:       card.Scored.Item.Title,
+			Score:       int(card.Scored.Score),
+			URL:         card.Scored.Item.URL,
+			PublishedAt: card.Scored.Item.PublishedAt,
+		}
+		if card.Scored.Item.SourceID != 0 {
+			if src, serr := a.store.GetSource(ctx, card.Scored.Item.SourceID); serr == nil {
+				ci.SourceTitle = src.Title
+				ci.Platform = src.Platform
+			}
+		}
+		cardJSON := a.buildCard(ci)
 		msgID, perr := a.pusher.Push(ctx, owner, cardJSON)
 		if perr != nil {
 			slog.Warn("push: 单卡推送失败，跳过", "delivery_id", delID, "trace_id", in.TraceID, "err", perr)
