@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -224,6 +225,80 @@ func TestProfileStore(t *testing.T) {
 			p.UpdatedAt, p.LastEvolvedFeedbackID+10); err != nil {
 			t.Errorf("正确游标续推应成功，实际: %v", err)
 		}
+	})
+
+	t.Run("removed_tags黑名单维护", func(t *testing.T) {
+		// Gate ⑧ FAIL 回归（migration 014）：人工删标签入黑名单、加回出黑名单、
+		// nil tags 不触碰。独立用户隔离，不依赖前序子测试的画像状态。
+		uRM, err := st.UpsertUserByOpenID(ctx, "test_profile_rm_"+uuid.NewString(), "profile-rm-test")
+		if err != nil {
+			t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
+		}
+		t.Cleanup(func() {
+			ctx, cancel := cleanupContext()
+			defer cancel()
+			cleanupExec(ctx, t, st, `DELETE FROM profiles WHERE user_id = $1`, uRM.ID)
+			cleanupExec(ctx, t, st, `DELETE FROM users WHERE id = $1`, uRM.ID)
+		})
+		// 黑名单语义是集合，比较序无关：array_agg ORDER BY 的具体顺序取决于库
+		// collation（中文在 en_US.UTF-8 与 C 下排序不同），断言顺序会跨环境碎。
+		eq := func(t *testing.T, got, want []string, label string) {
+			t.Helper()
+			g := append([]string(nil), got...)
+			w := append([]string(nil), want...)
+			sort.Strings(g)
+			sort.Strings(w)
+			if len(g) != len(w) {
+				t.Fatalf("%s: 应为 %v，实际 %v", label, want, got)
+			}
+			for i := range w {
+				if g[i] != w[i] {
+					t.Fatalf("%s: 应为 %v，实际 %v", label, want, got)
+				}
+			}
+		}
+
+		p, err := st.UpsertProfileFields(ctx, uRM.ID, nil, nil, []string{"甲", "乙", "丙"})
+		if err != nil {
+			t.Fatalf("首采失败: %v", err)
+		}
+		eq(t, p.RemovedTags, []string{}, "首采黑名单应为空")
+
+		// 删「乙」→ 入列。
+		p, err = st.UpsertProfileFields(ctx, uRM.ID, nil, nil, []string{"甲", "丙"})
+		if err != nil {
+			t.Fatalf("删乙失败: %v", err)
+		}
+		eq(t, p.RemovedTags, []string{"乙"}, "删乙后")
+
+		// 再删「丙」同时新增「丁」→ 乙丙都在列（array_agg 按文本序）。
+		p, err = st.UpsertProfileFields(ctx, uRM.ID, nil, nil, []string{"甲", "丁"})
+		if err != nil {
+			t.Fatalf("删丙加丁失败: %v", err)
+		}
+		eq(t, p.RemovedTags, []string{"乙", "丙"}, "删丙加丁后")
+
+		// nil tags（只改 occupation）→ 黑名单不动。
+		occ := "验证员"
+		p, err = st.UpsertProfileFields(ctx, uRM.ID, nil, &occ, nil)
+		if err != nil {
+			t.Fatalf("nil tags 更新失败: %v", err)
+		}
+		eq(t, p.RemovedTags, []string{"乙", "丙"}, "nil tags 后黑名单不动")
+
+		// 人工加回「乙」→ 出列，「丙」留列。
+		p, err = st.UpsertProfileFields(ctx, uRM.ID, nil, nil, []string{"甲", "丁", "乙"})
+		if err != nil {
+			t.Fatalf("加回乙失败: %v", err)
+		}
+		eq(t, p.RemovedTags, []string{"丙"}, "加回乙后")
+
+		// GetProfile 回读一致（RETURNING 与 SELECT 同列序）。
+		got, err := st.GetProfile(ctx, uRM.ID)
+		if err != nil {
+			t.Fatalf("GetProfile() 失败: %v", err)
+		}
+		eq(t, got.RemovedTags, []string{"丙"}, "GetProfile 回读")
 	})
 }
 
