@@ -1,6 +1,6 @@
 -- 010: page_watch 页面快照表（M6 契约 §4 / §10）
 
--- +migrate Up
+-- +goose Up
 
 CREATE TABLE page_snapshots (
     id             BIGSERIAL   PRIMARY KEY,
@@ -18,6 +18,6 @@ CREATE TABLE page_snapshots (
 
 CREATE INDEX idx_page_snapshots_source ON page_snapshots (source_id, id DESC);
 
--- +migrate Down
+-- +goose Down
 
 DROP TABLE IF EXISTS page_snapshots;
