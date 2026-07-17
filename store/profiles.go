@@ -16,14 +16,14 @@ import (
 const maxProfileTags = 12
 
 // profileColumns 是 profiles 表全列，SELECT 与 scanProfile 一一对应。
-const profileColumns = `id, user_id, industry, occupation, tags, summary,
+const profileColumns = `id, user_id, industry, occupation, tags, removed_tags, summary,
 	token_budget_daily, tokens_used_today, token_reset_at,
 	last_evolved_feedback_id, created_at, updated_at`
 
 // scanProfile 把一行 profiles 扫进 types.Profile（复用于单行与 RETURNING）。
 func scanProfile(row pgx.Row, p *types.Profile) error {
 	return row.Scan(
-		&p.ID, &p.UserID, &p.Industry, &p.Occupation, &p.Tags, &p.Summary,
+		&p.ID, &p.UserID, &p.Industry, &p.Occupation, &p.Tags, &p.RemovedTags, &p.Summary,
 		&p.TokenBudgetDaily, &p.TokensUsedToday, &p.TokenResetAt,
 		&p.LastEvolvedFeedbackID, &p.CreatedAt, &p.UpdatedAt,
 	)
@@ -55,6 +55,11 @@ func (s *Store) GetProfile(ctx context.Context, userID int64) (*types.Profile, e
 // 必须是 INSERT ... ON CONFLICT (user_id) DO UPDATE：并发首采两张确认卡同时确认时
 // 后者命中 DO UPDATE 而非报错。无条件写 + updated_at=now()：人工恒赢，
 // 刷 updated_at 使并发演化的 CAS 失效退让。RETURNING 全列。
+//
+// removed_tags 黑名单（014，Gate ⑧）：tags 非 nil 时同语句维护——
+// 新黑名单 = (旧黑名单 ∪ 旧 tags) − 新 tags（集合语义）。被删的旧标签入列、
+// 人工加回的出列、仍在列上的保留；单语句维护无读-改-写窗口，与并发首采/演化
+// 的原子性约定一致。演化侧凭本列硬过滤"加回人工删除标签"（evolver.dropRemovedTags）。
 func (s *Store) UpsertProfileFields(ctx context.Context, userID int64, industry, occupation *string, tags []string) (*types.Profile, error) {
 	if len(tags) > maxProfileTags {
 		tags = tags[:maxProfileTags]
@@ -64,15 +69,24 @@ func (s *Store) UpsertProfileFields(ctx context.Context, userID int64, industry,
 	// 注意谓词区分的是 nil 与非 nil——非 nil 空串/空数组是合法的"置空"。
 	// $4::text[] 显式转型是必须的：COALESCE 参数不继承 INSERT 目标列类型，
 	// 不写会被 PG 解析为 text 报 42804。
+	// removed_tags 的 EXCEPT 子查询是集合语义（自带去重）；array_agg 加 ORDER BY
+	// 使黑名单顺序确定，便于测试与人读。
 	var p types.Profile
 	err := scanProfile(s.pool.QueryRow(ctx,
 		`INSERT INTO profiles (user_id, industry, occupation, tags, updated_at)
 		 VALUES ($1, COALESCE($2, ''), COALESCE($3, ''), COALESCE($4::text[], '{}'), now())
 		 ON CONFLICT (user_id) DO UPDATE SET
-		     industry   = COALESCE($2, profiles.industry),
-		     occupation = COALESCE($3, profiles.occupation),
-		     tags       = COALESCE($4::text[], profiles.tags),
-		     updated_at = now()
+		     industry     = COALESCE($2, profiles.industry),
+		     occupation   = COALESCE($3, profiles.occupation),
+		     tags         = COALESCE($4::text[], profiles.tags),
+		     removed_tags = CASE WHEN $4::text[] IS NULL THEN profiles.removed_tags ELSE
+		         (SELECT COALESCE(array_agg(t ORDER BY t), '{}'::text[]) FROM (
+		             SELECT unnest(profiles.removed_tags || profiles.tags) AS t
+		             EXCEPT
+		             SELECT unnest($4::text[])
+		         ) diff(t))
+		     END,
+		     updated_at   = now()
 		 RETURNING `+profileColumns,
 		userID, industry, occupation, tags), &p)
 	if err != nil {

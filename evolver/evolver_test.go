@@ -133,6 +133,48 @@ func TestCheckTagGuard(t *testing.T) {
 	}
 }
 
+// TestDropRemovedTags Gate ⑧ FAIL 回归（014 黑名单硬过滤）：演化新增的
+// 人工已删标签被丢弃；既有标签即使误入黑名单也放行（删除权只归人工）。
+func TestDropRemovedTags(t *testing.T) {
+	cases := []struct {
+		name              string
+		tags, old, banned []string
+		want              []string
+	}{
+		{"空黑名单原样返回", []string{"Go", "红队"}, []string{"Go"}, nil, []string{"Go", "红队"}},
+		{"新增黑名单标签被丢弃", []string{"Go", "红队"}, []string{"Go"}, []string{"红队"}, []string{"Go"}},
+		{"非黑名单新增放行", []string{"Go", "A", "红队"}, []string{"Go"}, []string{"红队"}, []string{"Go", "A"}},
+		{"既有标签在黑名单仍放行", []string{"Go"}, []string{"Go"}, []string{"Go"}, []string{"Go"}},
+		{"黑名单带空白按trim口径", []string{"Go", "红队"}, []string{"Go"}, []string{" 红队 "}, []string{"Go"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dropRemovedTags(tc.tags, tc.old, tc.banned, 1, "trace-test")
+			if len(got) != len(tc.want) {
+				t.Fatalf("dropRemovedTags = %v，期望 %v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("dropRemovedTags = %v，期望 %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildEvolveUserRemovedTags 黑名单渲染：非空才出现「用户已移除的标签」行。
+func TestBuildEvolveUserRemovedTags(t *testing.T) {
+	p := &types.Profile{Tags: []string{"Go"}, RemovedTags: []string{"红队", "宏观经济"}}
+	got := buildEvolveUser(p, nil)
+	if !strings.Contains(got, "用户已移除的标签（绝不能重新加入）：红队、宏观经济") {
+		t.Errorf("黑名单非空应渲染移除行，实际:\n%s", got)
+	}
+	p2 := &types.Profile{Tags: []string{"Go"}}
+	if strings.Contains(buildEvolveUser(p2, nil), "用户已移除的标签") {
+		t.Error("黑名单为空不应渲染移除行")
+	}
+}
+
 func TestBuildEvolveUser(t *testing.T) {
 	at := time.Date(2026, 7, 15, 10, 30, 0, 0, time.UTC)
 	p := &types.Profile{

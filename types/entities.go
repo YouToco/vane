@@ -188,7 +188,8 @@ type Profile struct {
 	UserID                int64     `json:"user_id"`
 	Industry              string    `json:"industry"`
 	Occupation            string    `json:"occupation"`
-	Tags                  []string  `json:"tags"` // TEXT[] DEFAULT '{}'
+	Tags                  []string  `json:"tags"`         // TEXT[] DEFAULT '{}'
+	RemovedTags           []string  `json:"removed_tags"` // TEXT[] DEFAULT '{}'：人工删除且未加回的标签，演化不得再新增（Gate ⑧）
 	Summary               string    `json:"summary"`
 	TokenBudgetDaily      int       `json:"token_budget_daily"`       // NOT NULL DEFAULT 100000
 	TokensUsedToday       int       `json:"tokens_used_today"`        // NOT NULL DEFAULT 0
