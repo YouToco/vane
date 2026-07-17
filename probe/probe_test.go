@@ -36,6 +36,7 @@ type fakeStore struct {
 
 	// 回声位：记录 Run 实际传下来的参数，用于断言窗口与期望串没接反。
 	gotSince      time.Time
+	gotInjSince   time.Time
 	gotMinN       int
 	gotTail       string
 	gotBatchSince time.Time
@@ -55,7 +56,8 @@ func (f *fakeStore) ListScoreDistribution(context.Context, time.Time) ([]types.S
 	return f.dist, nil
 }
 
-func (f *fakeStore) GetProfileInjectionStat(context.Context, time.Time) (types.ProfileInjectionStat, error) {
+func (f *fakeStore) GetProfileInjectionStat(_ context.Context, since time.Time) (types.ProfileInjectionStat, error) {
+	f.gotInjSince = since
 	return f.inj, nil
 }
 
@@ -563,6 +565,10 @@ func TestRun_WiringAndWindows(t *testing.T) {
 	if want := now.Add(-DefaultWindow); !f.gotSince.Equal(want) {
 		t.Errorf("since 应为 now-24h=%v，实际 %v", want, f.gotSince)
 	}
+	// 画像创建早于窗口起点（本用例 CreatedAt 为零值）→ 注入统计不钳窗，仍用公共 since。
+	if want := now.Add(-DefaultWindow); !f.gotInjSince.Equal(want) {
+		t.Errorf("画像早于窗口时注入统计 since 应保持 %v，实际 %v", want, f.gotInjSince)
+	}
 	if f.gotMinN != minTraceN {
 		t.Errorf("minN 应为契约的 %d，实际 %d", minTraceN, f.gotMinN)
 	}
@@ -672,5 +678,33 @@ func TestRun_ProfileNotFoundIsNotAnError(t *testing.T) {
 	// 一份"什么都没验到"的报告绝不能是绿的。
 	if got := rep.Worst(); got != StatusYellow {
 		t.Errorf("无画像的空报告应是 yellow 而非 %s——vacuously green 正是本设计要防的", got)
+	}
+}
+
+// 画像创建时刻落在探针窗口**之内**时，注入统计的起点必须钳到创建时刻：
+// 画像存在之前的打分写「暂无」是正确行为，算进 Absent 会让首采后的头 24h 恒报
+// 假击穿（2026-07-17 生产实锤：画像 02:37 UTC 建立，24h 窗口把 18:53–00:30 的
+// 142 条历史「暂无」判成 §16.4 红线击穿，而画像建立后 52 条全部注入正常）。
+func TestRun_InjectionWindowClampedToProfileCreation(t *testing.T) {
+	now := time.Date(2026, 7, 17, 14, 30, 0, 0, time.UTC)
+	created := time.Date(2026, 7, 17, 2, 37, 48, 0, time.UTC) // 落在 now-24h 之后
+	f := &fakeStore{
+		profile: &types.Profile{
+			UserID:    7,
+			Summary:   "关注 AI 基础设施。不感兴趣：股市。",
+			Tags:      []string{"AI"},
+			CreatedAt: created,
+			UpdatedAt: created,
+		},
+	}
+	if _, err := Run(t.Context(), f, 7, now, 0); err != nil {
+		t.Fatalf("Run() 失败: %v", err)
+	}
+	if !f.gotInjSince.Equal(created) {
+		t.Errorf("注入统计 since 应钳到画像创建时刻 %v，实际 %v", created, f.gotInjSince)
+	}
+	// 其余统计不受钳窗影响，仍用公共 since。
+	if want := now.Add(-DefaultWindow); !f.gotSince.Equal(want) {
+		t.Errorf("公共 since 应保持 %v，实际 %v", want, f.gotSince)
 	}
 }
