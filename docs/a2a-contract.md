@@ -348,7 +348,18 @@ skill 粒度 = 一个可独立授权的能力边界，不按内部函数枚举�
 - SDK 内部 artifact 深拷贝用 gob：executor data part 的具体类型须 `gob.Register`
   （executor.go init 注册 `[]map[string]any{}`，httptest 实测不注册整任务转 FAILED）；
 - `go list -deps ./a2a/` 实测第三方依赖面：SDK 自身 + `github.com/google/uuid` +
-  `golang.org/x/sync/errgroup`（与 §1.5 预期一致，附 PR 描述）。
+  `golang.org/x/sync/errgroup`（与 §1.5 预期一致，附 PR 描述）；
+- **§5.2 关停语义勘误（审查 CONFIRMED）**：SDK v2.3.1 的执行实际跑在
+  `context.WithoutCancel` 的**后台 goroutine**（local_manager.go:182-185），taskstore
+  写库不随请求/关停取消——"无自有后台 goroutine、Shutdown 天然覆盖"只对 executor 自身
+  成立。缓解：storeAdapter 四方法各自套 5s 请求级超时（opCtx），破坏面收敛为
+  "极端时序下单个任务留 WORKING 非终态"（可查可 Cancel，无资源泄漏）；
+- **taskstore 错误卫生（审查 HIGH）**：SDK `toJSONRPCError` 把 taskstore 错误的
+  `Error()` 文本逐字写进 JSON-RPC error.message——适配层非哨兵错误一律经
+  `storeErr`（原始链落 slog，对外 ErrInternalError+sanitize 文案），突变测试钉死；
+- **§9.5 装配项守卫落位**：`cmd/server/a2a_guard_test.go` 读源码 + 花括号配平断言
+  `a2a.Mount` 恰一次且在 `if cfg.A2A.Enabled` 块内（审查突变实验证明 404 断言
+  单独守不住装配）。
 
 ### 5.9 taskstore 适配（`a2a/taskstore.go`）——SDK 哨兵错误映射（完整表）
 

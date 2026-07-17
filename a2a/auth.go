@@ -35,11 +35,30 @@ func (l *authFailLimiter) allow(ip string, now time.Time) bool {
 	return len(l.fails[ip]) < l.maxFails
 }
 
+// maxTrackedIPs 是失败记录 map 的硬上限（审查提示：prune 只在同 IP 复访时触发，
+// 一次性失败的 IP 条目会永久滞留——IPv6 轮换可让内存无界增长）。超限先全局清窗口外
+// 条目，仍超则随机逐出到上限内：宁可放过攻击者一次尝试，不让内存被打爆。
+const maxTrackedIPs = 4096
+
 func (l *authFailLimiter) recordFailure(ip string, now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.prune(ip, now)
 	l.fails[ip] = append(l.fails[ip], now)
+	if len(l.fails) <= maxTrackedIPs {
+		return
+	}
+	for tracked := range l.fails {
+		l.prune(tracked, now)
+	}
+	for tracked := range l.fails {
+		if len(l.fails) <= maxTrackedIPs {
+			break
+		}
+		if tracked != ip {
+			delete(l.fails, tracked)
+		}
+	}
 }
 
 func (l *authFailLimiter) prune(ip string, now time.Time) {

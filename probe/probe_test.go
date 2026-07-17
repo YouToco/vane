@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -726,4 +727,47 @@ func TestRun_InjectionWindowClampedToProfileCreation(t *testing.T) {
 	if want := now.Add(-DefaultWindow); !f.gotSince.Equal(want) {
 		t.Errorf("公共 since 应保持 %v，实际 %v", want, f.gotSince)
 	}
+}
+
+// TestJudgeA2ATasks P-A2A 两分支（a2a-contract §10）：查询成功（含 0 行）= green；
+// 报错 = 就地 StatusRed 且 **Run 不中断**（对既有"Store 报错中断整轮"模式的刻意偏离——
+// 表缺失/不可读是产品事实不是探针故障）。
+func TestJudgeA2ATasks(t *testing.T) {
+	now := time.Date(2026, 7, 17, 8, 30, 0, 0, time.UTC)
+
+	t.Run("查询报错red且Run不中断", func(t *testing.T) {
+		f := &fakeStore{a2aErr: errors.New(`relation "a2a_tasks" does not exist`)}
+		rep, err := Run(t.Context(), f, 7, now, 24*time.Hour)
+		if err != nil {
+			t.Fatalf("P-A2A 报错不得中断 Run（应就地记 red），实际 err=%v", err)
+		}
+		res := findResult(t, rep, "P-A2A")
+		if res.Status != StatusRed {
+			t.Fatalf("查询报错应 red，实际 %s", res.Status)
+		}
+	})
+
+	t.Run("零行green", func(t *testing.T) {
+		f := &fakeStore{a2aCount: 0}
+		rep, err := Run(t.Context(), f, 7, now, 24*time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res := findResult(t, rep, "P-A2A")
+		if res.Status != StatusGreen {
+			t.Fatalf("表可读（0 行）应 green，实际 %s: %s", res.Status, res.Summary)
+		}
+	})
+}
+
+// findResult 按 ID 取判定结果。
+func findResult(t *testing.T, rep Report, id string) Result {
+	t.Helper()
+	for _, r := range rep.Results {
+		if r.ID == id {
+			return r
+		}
+	}
+	t.Fatalf("Results 里没有 %s", id)
+	return Result{}
 }

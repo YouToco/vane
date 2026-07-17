@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // TestRequireBearer 拒绝矩阵表驱动（契约 §9.1，仿 api/session_test.go）。
@@ -70,6 +71,19 @@ func TestAuthFailLimiter(t *testing.T) {
 	}
 	if got := do("10.0.0.2", "Bearer secret"); got != http.StatusOK {
 		t.Fatalf("其他 IP 不应受影响，实际 %d", got)
+	}
+}
+
+// TestAuthFailLimiterMapCap 失败记录 map 硬上限：海量一次性 IP（IPv6 轮换攻击面）
+// 不得让内存无界增长。
+func TestAuthFailLimiterMapCap(t *testing.T) {
+	l := newAuthFailLimiter()
+	now := time.Now()
+	for i := 0; i < maxTrackedIPs+500; i++ {
+		l.recordFailure(fmt.Sprintf("2001:db8::%x", i), now)
+	}
+	if got := len(l.fails); got > maxTrackedIPs {
+		t.Fatalf("失败 map 超硬上限: %d > %d", got, maxTrackedIPs)
 	}
 }
 

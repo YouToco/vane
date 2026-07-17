@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
@@ -24,6 +25,23 @@ type storeAdapter struct {
 func newTaskStore(st TaskStorage) *storeAdapter { return &storeAdapter{st: st} }
 
 var _ taskstore.Store = (*storeAdapter)(nil)
+
+// storeErr 是适配层非哨兵错误的唯一出口（契约 §8.1 红线，审查 HIGH 实证）：
+// SDK 的 toJSONRPCError 把 taskstore 错误的 Error() 文本逐字写进 JSON-RPC
+// error.message——裸返回 pgx 错误链等于把 DB 细节送上公网。原始错误落 slog，
+// 对外只有 ErrInternalError 哨兵（SDK 映射 -32603）+ sanitize 文案。
+func storeErr(op, taskID string, err error) error {
+	slog.Error("a2a: taskstore "+op+" 失败", "task_id", taskID, "err", err)
+	return fmt.Errorf("%w: %s", a2a.ErrInternalError, sanitize(err))
+}
+
+// opCtx 给每个适配层 DB 操作套请求级超时（审查 CONFIRMED：SDK v2.3.1 的执行跑在
+// context.WithoutCancel 的后台 goroutine 里，taskstore 写库不随请求/关停取消——
+// 无界的库调用会让 pgxpool.Close 无限阻塞、或把任务永久滞留 WORKING。
+// 契约 §5.2 的"无自有后台 goroutine"只对 executor 成立，SDK 侧不成立，勘误见 §5.8）。
+func opCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, dbQueryTimeout)
+}
 
 // marshalTask 序列化 a2a.Task 为 JSONB 权威载荷。
 func marshalTask(task *a2a.Task) (json.RawMessage, error) {
@@ -47,9 +65,11 @@ func unmarshalTask(t *types.A2ATask) (*a2a.Task, error) {
 // Create 落新任务。id 已存在 → taskstore.ErrTaskAlreadyExists（接口文档 "should return"）；
 // 成功返回 TaskVersion(1)（表默认值，契约 §5.9）。
 func (a *storeAdapter) Create(ctx context.Context, task *a2a.Task) (taskstore.TaskVersion, error) {
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	raw, err := marshalTask(task)
 	if err != nil {
-		return taskstore.TaskVersionMissing, err
+		return taskstore.TaskVersionMissing, storeErr("Create/marshal", string(task.ID), err)
 	}
 	err = a.st.CreateA2ATask(ctx, &types.A2ATask{
 		ID:        string(task.ID),
@@ -61,23 +81,25 @@ func (a *storeAdapter) Create(ctx context.Context, task *a2a.Task) (taskstore.Ta
 		if errors.Is(err, types.ErrConflict) {
 			return taskstore.TaskVersionMissing, taskstore.ErrTaskAlreadyExists
 		}
-		return taskstore.TaskVersionMissing, err
+		return taskstore.TaskVersionMissing, storeErr("Create", string(task.ID), err)
 	}
 	return taskstore.TaskVersion(1), nil
 }
 
 // Get 按 id 取任务。无行 → a2a.ErrTaskNotFound（§9.2 的 -32001 断言依赖本行）。
 func (a *storeAdapter) Get(ctx context.Context, taskID a2a.TaskID) (*taskstore.StoredTask, error) {
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	row, err := a.st.GetA2ATask(ctx, string(taskID))
 	if err != nil {
 		if errors.Is(err, types.ErrNotFound) {
 			return nil, a2a.ErrTaskNotFound
 		}
-		return nil, err
+		return nil, storeErr("Get", string(taskID), err)
 	}
 	task, err := unmarshalTask(row)
 	if err != nil {
-		return nil, err
+		return nil, storeErr("Get/unmarshal", string(taskID), err)
 	}
 	return &taskstore.StoredTask{Task: task, Version: taskstore.TaskVersion(row.Version)}, nil
 }
@@ -88,9 +110,11 @@ func (a *storeAdapter) Get(ctx context.Context, taskID a2a.TaskID) (*taskstore.S
 // PrevVersion==TaskVersionMissing（SDK "不跟踪版本"哨兵）时先回读当前版本再条件更新
 //（InMemory 同语义：跳过乐观锁检查；回读窗口内的并发前进会得 Conflict，语义仍正确）。
 func (a *storeAdapter) Update(ctx context.Context, update *taskstore.UpdateRequest) (taskstore.TaskVersion, error) {
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	raw, err := marshalTask(update.Task)
 	if err != nil {
-		return taskstore.TaskVersionMissing, err
+		return taskstore.TaskVersionMissing, storeErr("Update/marshal", string(update.Task.ID), err)
 	}
 	prev := update.PrevVersion
 	if prev == taskstore.TaskVersionMissing {
@@ -99,7 +123,7 @@ func (a *storeAdapter) Update(ctx context.Context, update *taskstore.UpdateReque
 			if errors.Is(err, types.ErrNotFound) {
 				return taskstore.TaskVersionMissing, a2a.ErrTaskNotFound
 			}
-			return taskstore.TaskVersionMissing, err
+			return taskstore.TaskVersionMissing, storeErr("Update/get-version", string(update.Task.ID), err)
 		}
 		prev = taskstore.TaskVersion(row.Version)
 	}
@@ -112,7 +136,7 @@ func (a *storeAdapter) Update(ctx context.Context, update *taskstore.UpdateReque
 		case errors.Is(err, types.ErrConflict):
 			return taskstore.TaskVersionMissing, taskstore.ErrConcurrentModification
 		}
-		return taskstore.TaskVersionMissing, err
+		return taskstore.TaskVersionMissing, storeErr("Update", string(update.Task.ID), err)
 	}
 	return prev + 1, nil
 }
@@ -131,15 +155,17 @@ func (a *storeAdapter) List(ctx context.Context, req *a2a.ListTasksRequest) (*a2
 	if req.StatusTimestampAfter != nil {
 		q.StatusTimestampAfter = *req.StatusTimestampAfter
 	}
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	rows, total, next, err := a.st.ListA2ATasks(ctx, q)
 	if err != nil {
-		return nil, err
+		return nil, storeErr("List", "", err)
 	}
 	tasks := make([]*a2a.Task, 0, len(rows))
 	for i := range rows {
 		task, err := unmarshalTask(&rows[i])
 		if err != nil {
-			return nil, err
+			return nil, storeErr("List/unmarshal", rows[i].ID, err)
 		}
 		trimHistory(task, req.HistoryLength)
 		if !req.IncludeArtifacts {

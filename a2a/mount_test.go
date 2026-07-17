@@ -140,6 +140,26 @@ func TestSendMessageCompleted(t *testing.T) {
 	}
 }
 
+// TestTaskstoreErrorSanitized 适配层错误卫生突变测试（契约 §8.1，审查 HIGH 实证）：
+// SDK 把 taskstore 错误的 Error() 文本写进 JSON-RPC error.message——注入原始 DB
+// 错误链，断言响应逐字不含。
+func TestTaskstoreErrorSanitized(t *testing.T) {
+	const leak = "pgx: connection refused; host=127.0.0.1 dbname=vane"
+	srv, storage := newTestServer(t, &fakeContent{})
+	storage.getErr = fmt.Errorf("%s", leak)
+
+	out := rpc(t, srv, testToken, "GetTask", map[string]any{"id": "any-task"})
+	raw, _ := json.Marshal(out)
+	for _, frag := range []string{"pgx", "dbname", "127.0.0.1"} {
+		if strings.Contains(string(raw), frag) {
+			t.Fatalf("taskstore 错误泄露内部链（%q）: %s", frag, raw)
+		}
+	}
+	if out["error"] == nil {
+		t.Fatalf("应返回错误响应，实际 %v", out)
+	}
+}
+
 // TestGetTaskNotFound 查不存在 taskId 得 -32001（依赖 §5.9 Get→a2a.ErrTaskNotFound 映射）。
 func TestGetTaskNotFound(t *testing.T) {
 	srv, _ := newTestServer(t, &fakeContent{})
