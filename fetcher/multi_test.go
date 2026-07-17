@@ -34,7 +34,7 @@ func TestMulti_DispatchesByType(t *testing.T) {
 	m := NewMulti(config.FetchConfig{
 		TimeoutSeconds: 10, MaxResponseMB: 1,
 		ExaAPIKey: "k", TikhubAPIKey: "k",
-	}, nil)
+	}, nil, nil)
 	// 三个子抓取器分别指向对应假服务端；RSS 放行环回（httptest 监听 127.0.0.1）。
 	m.rss = newTestFetcher()
 	m.exa.searchURL = exaSrv.URL
@@ -62,7 +62,7 @@ func TestMulti_DispatchesByType(t *testing.T) {
 }
 
 func TestMulti_UnknownPlatform(t *testing.T) {
-	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil)
+	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil, nil)
 	_, err := m.Fetch(context.Background(), types.Source{ID: 1, Platform: "carrier_pigeon"})
 	if !errors.Is(err, types.ErrValidation) {
 		t.Errorf("未知平台应判 ErrValidation，实际 %v", err)

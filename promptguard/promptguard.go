@@ -5,7 +5,10 @@
 // 整条防线。定界前缀清单是全系统唯一事实来源，新增定界块必须同步登记到这里。
 package promptguard
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 // systemDelimiterPrefixes 是本系统全部定界块的起始前缀（结束符以对应前缀开头，
 // 替换前缀即一并失效）。新增定界块时必须在此登记，否则该块的终结符可被外部文本伪造。
@@ -55,6 +58,36 @@ func TruncateRunes(s string, n int) string {
 		return s
 	}
 	return string(r[:n])
+}
+
+// StripInvisible 剥除对人不可见、对模型是 token 的字符（§12.2）：
+// 零宽（U+200B-200D）、BOM（U+FEFF）、双向控制符（U+202A-202E, U+2066-2069）、
+// Unicode Tags 块（U+E0000-E007F），以及其余 Cf 类。
+func StripInvisible(s string) string {
+	return strings.Map(func(r rune) rune {
+		if isInvisible(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func isInvisible(r rune) bool {
+	switch {
+	case r >= 0x200B && r <= 0x200D:
+		return true
+	case r == 0xFEFF:
+		return true
+	case r >= 0x202A && r <= 0x202E:
+		return true
+	case r >= 0x2066 && r <= 0x2069:
+		return true
+	case r >= 0xE0000 && r <= 0xE007F:
+		return true
+	case unicode.Is(unicode.Cf, r):
+		return true
+	}
+	return false
 }
 
 // SingleLine 把任意空白串（含换行）折叠为单个空格并去除首尾空白。

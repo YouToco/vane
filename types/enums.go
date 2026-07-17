@@ -135,6 +135,18 @@ const (
 	RefTypeFeedback    RefType = "feedback"     // 关联文字反馈解读
 	RefTypeContentItem RefType = "content_item" // 关联单条内容（摘要等）
 	RefTypeProfile     RefType = "profile"      // 关联用户画像（画像演化记账）
+	RefTypeSource      RefType = "source"       // 关联信源（page_watch LLM 门记账）
+)
+
+// SnapshotVerdict page_snapshots 行的判定状态（§10.4）。
+// pending = 门尚未判定；baseline = 首次建基线；suppressed = 门判"不重要"。
+// 没有 reported——那个状态由 content_items 行的存在性证明。
+type SnapshotVerdict string
+
+const (
+	SnapshotVerdictPending    SnapshotVerdict = "pending"
+	SnapshotVerdictBaseline   SnapshotVerdict = "baseline"
+	SnapshotVerdictSuppressed SnapshotVerdict = "suppressed"
 )
 
 // AgentSessionStatus agent 会话状态（agent_sessions.status，M4 契约 §3）。

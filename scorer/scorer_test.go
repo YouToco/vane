@@ -385,6 +385,61 @@ func TestBuildScoreUserSanitizesContent(t *testing.T) {
 	}
 }
 
+func TestScore_KindChangeUsesChangePrompt(t *testing.T) {
+	sc, captured := newCapturingScorer(t, http.StatusOK, "75", nil)
+	item := types.ContentItem{
+		ID:      99,
+		Kind:    types.KindChange,
+		Title:   "pricing changed",
+		Content: "+ Pro | $25\n- Pro | $20",
+	}
+	if _, err := sc.Score(context.Background(), 1, item, "trace-kc"); err != nil {
+		t.Fatalf("Score 意外报错: %v", err)
+	}
+	reqs := captured()
+	if len(reqs) != 1 {
+		t.Fatalf("请求数 = %d, 期望 1", len(reqs))
+	}
+	sys := ""
+	for _, m := range reqs[0].Messages {
+		if m.Role == "system" {
+			sys = m.Content
+		}
+	}
+	if !strings.Contains(sys, "页面变化的 diff") {
+		t.Errorf("KindChange 应使用 scoreChangeSystemPrompt，实际 system: %s", sys[:min(len(sys), 100)])
+	}
+	if strings.Contains(sys, "正文信息过少") {
+		t.Errorf("KindChange 不应包含「正文信息过少」惩罚规则")
+	}
+}
+
+func TestScore_KindArticleUsesDefaultPrompt(t *testing.T) {
+	sc, captured := newCapturingScorer(t, http.StatusOK, "80", nil)
+	item := types.ContentItem{
+		ID:      100,
+		Kind:    types.KindArticle,
+		Title:   "normal article",
+		Content: "article body",
+	}
+	if _, err := sc.Score(context.Background(), 1, item, "trace-ka"); err != nil {
+		t.Fatalf("Score 意外报错: %v", err)
+	}
+	reqs := captured()
+	sys := ""
+	for _, m := range reqs[0].Messages {
+		if m.Role == "system" {
+			sys = m.Content
+		}
+	}
+	if strings.Contains(sys, "页面变化的 diff") {
+		t.Errorf("KindArticle 不应使用 scoreChangeSystemPrompt")
+	}
+	if !strings.Contains(sys, "正文信息过少") {
+		t.Errorf("KindArticle 应包含「正文信息过少」惩罚规则")
+	}
+}
+
 func TestParseScore(t *testing.T) {
 	cases := []struct {
 		raw    string

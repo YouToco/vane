@@ -90,3 +90,26 @@ func TestSingleLine(t *testing.T) {
 		t.Errorf("SingleLine 结果异常: %q", got)
 	}
 }
+
+func TestStripInvisible(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"零宽空格", "hello​world", "helloworld"},
+		{"零宽连字", "a‌b‍c", "abc"},
+		{"BOM", "\uFEFFdata", "data"},
+		{"双向控制符", "x‪y‮z", "xyz"},
+		{"双向隔离符", "a⁦b⁩c", "abc"},
+		{"Unicode Tags", "text\U000E0001\U000E007F", "text"},
+		{"Cf 类软连字符", "soft­hyphen", "softhyphen"},
+		{"正常中文不动", "价格 $20", "价格 $20"},
+		{"正常英文不动", "hello world", "hello world"},
+		{"空串", "", ""},
+		{"混合攻击", "\uFEFF\u200BPrice‪: $20‍", "Price: $20"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := StripInvisible(tc.in); got != tc.want {
+				t.Errorf("StripInvisible(%q) = %q, 期望 %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
