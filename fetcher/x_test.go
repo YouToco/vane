@@ -3,8 +3,10 @@ package fetcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/YouToco/vane/config"
@@ -198,6 +200,108 @@ func TestTwitterFetch_MissingScreenName(t *testing.T) {
 	_, err := f.Fetch(context.Background(), src)
 	if err == nil {
 		t.Fatal("缺少 screen_name 应报错")
+	}
+}
+
+// TestTwitterFetch_HTTPErrorClassification 验证非 200 的错误分类（契约 §6，
+// 对齐 tikhub.go 现状）：429→限流可重试、401/403→鉴权确定性失败、
+// 5xx 可重试、其余 4xx 不可重试；且错误信息携带 body 摘要（2026-07-17 生产
+// 400 断供的教训：日志没有 body，根因定位只能本地重放）。
+func TestTwitterFetch_HTTPErrorClassification(t *testing.T) {
+	cases := []struct {
+		name          string
+		status        int
+		body          string
+		wantCode      types.ErrCode
+		wantRetryable bool
+		wantInMsg     string
+	}{
+		{"429 限流", http.StatusTooManyRequests, `{"detail":"rate limited"}`,
+			types.CodeFetchRateLimit, true, ""},
+		{"401 鉴权", http.StatusUnauthorized, `{"detail":"invalid key"}`,
+			types.CodeValidation, false, "invalid key"},
+		{"403 禁止", http.StatusForbidden, `{"detail":"scope missing"}`,
+			types.CodeValidation, false, "scope missing"},
+		{"400 上游失败", http.StatusBadRequest, `{"detail":{"code":400,"message":"Request failed. Please retry."}}`,
+			types.CodeFetchTimeout, false, "Request failed. Please retry."},
+		{"500 服务端错误", http.StatusInternalServerError, `{"detail":"boom"}`,
+			types.CodeFetchTimeout, true, "boom"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			f := newTestTwitter(srv.URL)
+			_, err := f.Fetch(context.Background(), twitterSrc(10, "AnthropicAI"))
+			if err == nil {
+				t.Fatalf("HTTP %d 应报错", tc.status)
+			}
+
+			var ae *types.AppError
+			if !errors.As(err, &ae) {
+				t.Fatalf("应返回 *types.AppError: %T", err)
+			}
+			if ae.Code != tc.wantCode {
+				t.Errorf("Code 应为 %s: got %s", tc.wantCode, ae.Code)
+			}
+			if ae.Retryable != tc.wantRetryable {
+				t.Errorf("Retryable 应为 %v: got %v", tc.wantRetryable, ae.Retryable)
+			}
+			if tc.wantInMsg != "" && !strings.Contains(ae.Message, tc.wantInMsg) {
+				t.Errorf("错误信息应携带 body 摘要 %q: got %q", tc.wantInMsg, ae.Message)
+			}
+		})
+	}
+}
+
+// TestTwitterFetch_ErrBodyTruncated 验证超长 body 只截前 twitterErrBodyMax 字节进错误信息。
+func TestTwitterFetch_ErrBodyTruncated(t *testing.T) {
+	longBody := strings.Repeat("x", 4096)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(longBody))
+	}))
+	defer srv.Close()
+
+	f := newTestTwitter(srv.URL)
+	_, err := f.Fetch(context.Background(), twitterSrc(1, "A"))
+	if err == nil {
+		t.Fatal("应报错")
+	}
+	var ae *types.AppError
+	if !errors.As(err, &ae) {
+		t.Fatalf("应返回 *types.AppError: %T", err)
+	}
+	if len(ae.Message) > twitterErrBodyMax+120 {
+		t.Errorf("错误信息应截断 body（≤%d 字节 + 前缀），实际长度 %d", twitterErrBodyMax, len(ae.Message))
+	}
+}
+
+// TestTwitterFetch_ScreenNameEscaped 验证 screen_name 经 QueryEscape 后特殊
+// 字符不会污染 query（& 注入、空格、= 等）。
+func TestTwitterFetch_ScreenNameEscaped(t *testing.T) {
+	raw := "bad name&extra=1"
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.URL.Query().Get("screen_name")
+		if r.URL.Query().Get("extra") != "" {
+			t.Error("screen_name 里的 & 不应注入出新的 query 参数")
+		}
+		w.Write([]byte(`{"code":200,"data":{"status":"ok","timeline":[]}}`))
+	}))
+	defer srv.Close()
+
+	f := newTestTwitter(srv.URL)
+	if _, err := f.Fetch(context.Background(), twitterSrc(1, raw)); err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
+	if got != raw {
+		t.Errorf("服务端解析回的 screen_name 应等于原值 %q: got %q", raw, got)
 	}
 }
 
