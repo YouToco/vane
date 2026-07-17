@@ -67,6 +67,88 @@ func (h *handler) eventDispatcher() *dispatcher.EventDispatcher {
 			go h.handle(h.ctx, event)
 			return nil
 		}).
+		OnP2MessageReadV1(func(_ context.Context, event *larkim.P2MessageReadV1) error {
+			if event == nil || event.Event == nil {
+				return nil
+			}
+			d := event.Event
+			var readerID, readTime string
+			if d.Reader != nil {
+				if d.Reader.ReaderId != nil {
+					readerID = strVal(d.Reader.ReaderId.OpenId)
+				}
+				readTime = strVal(d.Reader.ReadTime)
+			}
+			slog.Info("feishu: 消息已读",
+				"reader_open_id", readerID,
+				"read_time", readTime,
+				"message_ids", d.MessageIdList,
+			)
+			return nil
+		}).
+		OnP2MessageReactionCreatedV1(func(_ context.Context, event *larkim.P2MessageReactionCreatedV1) error {
+			if event == nil || event.Event == nil {
+				return nil
+			}
+			d := event.Event
+			var emoji string
+			if d.ReactionType != nil {
+				emoji = strVal(d.ReactionType.EmojiType)
+			}
+			slog.Info("feishu: 消息被 Reaction",
+				"message_id", strVal(d.MessageId),
+				"emoji", emoji,
+				"operator_type", strVal(d.OperatorType),
+				"action_time", strVal(d.ActionTime),
+			)
+			return nil
+		}).
+		OnP2MessageReactionDeletedV1(func(_ context.Context, event *larkim.P2MessageReactionDeletedV1) error {
+			if event == nil || event.Event == nil {
+				return nil
+			}
+			d := event.Event
+			var emoji string
+			if d.ReactionType != nil {
+				emoji = strVal(d.ReactionType.EmojiType)
+			}
+			slog.Info("feishu: 消息取消 Reaction",
+				"message_id", strVal(d.MessageId),
+				"emoji", emoji,
+				"operator_type", strVal(d.OperatorType),
+				"action_time", strVal(d.ActionTime),
+			)
+			return nil
+		}).
+		OnP2MessageRecalledV1(func(_ context.Context, event *larkim.P2MessageRecalledV1) error {
+			if event == nil || event.Event == nil {
+				return nil
+			}
+			d := event.Event
+			slog.Info("feishu: 消息撤回",
+				"message_id", strVal(d.MessageId),
+				"chat_id", strVal(d.ChatId),
+				"recall_time", strVal(d.RecallTime),
+				"recall_type", strVal(d.RecallType),
+			)
+			return nil
+		}).
+		OnP2ChatAccessEventBotP2pChatEnteredV1(func(_ context.Context, event *larkim.P2ChatAccessEventBotP2pChatEnteredV1) error {
+			if event == nil || event.Event == nil {
+				return nil
+			}
+			d := event.Event
+			var operatorID string
+			if d.OperatorId != nil {
+				operatorID = strVal(d.OperatorId.OpenId)
+			}
+			slog.Info("feishu: 用户进入机器人会话",
+				"chat_id", strVal(d.ChatId),
+				"operator_open_id", operatorID,
+				"last_message_id", strVal(d.LastMessageId),
+			)
+			return nil
+		}).
 		OnP2CardActionTrigger(h.onCardAction)
 }
 
