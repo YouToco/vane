@@ -166,7 +166,7 @@ func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (id int64, 
 		     title      = COALESCE(NULLIF(EXCLUDED.title, ''), sources.title),
 		     config     = EXCLUDED.config,
 		     updated_at = now()
-		 RETURNING id, xmax`,
+		 RETURNING id, xmax::bigint`,
 		src.Platform, src.Capability, src.URL, src.Title, cfg).Scan(&id, &xmax)
 	if err != nil {
 		return 0, false, types.NewAppError(types.CodeDatabase,
