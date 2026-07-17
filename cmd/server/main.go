@@ -37,7 +37,7 @@ import (
 
 // vaneVersion 是服务版本串（进 A2A AgentCard.version，a2a-contract §7）。
 // 值 = CHANGELOG 最上方已发布版本号，随发版手动同步；不为此新增 ldflags 基建。
-const vaneVersion = "0.5.0"
+const vaneVersion = "0.5.1"
 
 func main() {
 	if err := run(); err != nil {

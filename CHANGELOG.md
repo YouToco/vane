@@ -15,6 +15,35 @@
 - 卡片回调回写是异步旁路：工具执行的 ~30s 窗口内用户抢先发消息，该条消息可能暂看不到
   「[卡片回调]」通告（下一条自愈，有界最终一致）。
 
+### 待办（跟进项）
+- api/ratelimit.go 的 clientIP 取 X-Forwarded-For 最左段（同 A2A HIGH 的 CWE-348）——
+  dashboard 登录限流可被伪造 XFF 绕过，待按 a2a/auth.go 的单跳可信反代逻辑修。
+- 主域 vane.zhuoqidev.com/.well-known/ 未生效：后端部署未 reload 运行中的 Caddy，
+  Caddyfile 改动悬空（api 子域正常，A2A 不阻塞）。
+
+## [0.5.1] - 2026-07-17 — A2A server 上线 + M7 数据面
+
+**A2A server（第一期 content.query）自用上线**：Gate ①-⑥⑧ 生产实测全过（enabled=true）——
+① card 发现（api 子域）② 无 token 401 ③ 带 token 返真实库内内容（防空转，独立查库命中）
+④ GetTask 轮询 COMPLETED ⑤ 终态 Cancel/拒收 ⑥ 错误文案无内部链 ⑧ 重启后 taskId 可查（DB 持久化）。
+
+### Added
+- **A2A server（#46，a2a-contract PR-3）**：`a2a/` 包（Deps/窄接口 + Bearer 认证 + Agent Card +
+  content.query executor + SDK taskstore 适配 + 错误卫生）+ config A2AConfig（Enabled 默认 false /
+  VANE_A2A_TOKEN / BaseURL）+ main.go enabled 门控装配 + 探针 P-A2A。SDK 钉 a2a-go/v2 v2.3.1，
+  仅 JSON-RPC binding；确定性检索不经 LLM（零注入面、零 token）；不暴露画像/个性化分（§8 红线）
+- **M7 只读数据端点**：`GET /api/deliveries` 推送历史（#43，功能 6.4 数据面）、
+  `GET /api/admin/runstats` 运行统计（#47，功能 6.5 数据面，基于 llm_calls）
+
+### Fixed
+- 探针假击穿（首采后 24h）：§16.4 注入统计（#44）、§16.5 保尾统计（#45）窗口起点钳到画像创建时刻——
+  画像存在前的打分写「暂无」/不含负面句是正确行为，不再误判红线
+- A2A 对抗审查修复（随 #46）：X-Forwarded-For 最左段信任（CWE-348，改单跳可信反代取最右段）、
+  taskstore 错误未消毒（SDK 把 Error() 逐字进 JSON-RPC response）、适配层 DB 超时、装配守卫
+
+### 版本一致性
+- `cmd/server/main.go` 的 `vaneVersion` 同步为 0.5.1，A2A AgentCard.version 与发布版本一致。
+
 ## [0.5.0] - 2026-07-17 — M5 画像+反馈闭环（越用越准）
 
 **Gate：八项真人实测全过（2026-07-17）**——①画像采集 ②态度翻转 ③误判（👎+form 填原因，
