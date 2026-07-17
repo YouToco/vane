@@ -3,6 +3,7 @@ package a2a
 
 import (
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"iter"
@@ -16,6 +17,13 @@ import (
 	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/types"
 )
+
+// SDK 内部对 artifact 做 gob DeepCopy：data part 接口位里的具体类型必须注册，
+// 否则拷贝失败整任务转 FAILED（v2.3.1 httptest 实测："gob: type not registered
+// for interface: []map[string]interface {}"）。
+func init() {
+	gob.Register([]map[string]any{})
+}
 
 // 入参缺省与钳制（契约 §5.4/§5.7）。
 const (

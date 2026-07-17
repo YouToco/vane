@@ -332,6 +332,24 @@ func sanitize(err error) string
 
 skill 粒度 = 一个可独立授权的能力边界，不按内部函数枚举。
 
+**SDK 序列化实测形态（PR-3 回填，v2.3.1，card_test.go 留档）**——与草案的语义差异逐条：
+- `capabilities` 全 false 时输出 `{}`（三 bool 均 omitempty，符合草案注记预期）；
+- `securityRequirements` 实际形态 `[{"schemes":{"bearer":[]}}]`（SecurityRequirementsOptions
+  自定义 Marshaler 包一层 `schemes` 键）；
+- `securitySchemes` 实际形态 `{"bearer":{"httpAuthSecurityScheme":{"scheme":"Bearer"}}}`
+  （NamedSecuritySchemes 按方案类型包裹）；
+- 顶层无 `extendedAgentCard` 独立字段（归 capabilities）。Gate ① 按本节实测形态语义等价比对。
+
+**PR-3 实现期 SDK 实测勘误（以源码为准，契约草案对应表述不再生效）**：
+- v2 executor 是迭代器风格：`AgentExecutor.Execute/Cancel(ctx, *ExecutorContext) iter.Seq2[a2a.Event, error]`，
+  无 RequestContext/eventqueue 参数（§5.2 骨架里的 `NewJSONRPCHandler(rh)` 形态不变）；
+- `a2a.Task` 序列化是标准库 encoding/json（SDK 全库无 protojson）；§2"ProtoJSON 权威载荷"里的
+  ProtoJSON 指 status 枚举的 `TASK_STATE_*` 字符串形态，task 列实存 encoding/json 输出；
+- SDK 内部 artifact 深拷贝用 gob：executor data part 的具体类型须 `gob.Register`
+  （executor.go init 注册 `[]map[string]any{}`，httptest 实测不注册整任务转 FAILED）；
+- `go list -deps ./a2a/` 实测第三方依赖面：SDK 自身 + `github.com/google/uuid` +
+  `golang.org/x/sync/errgroup`（与 §1.5 预期一致，附 PR 描述）。
+
 ### 5.9 taskstore 适配（`a2a/taskstore.go`）——SDK 哨兵错误映射（完整表）
 
 SDK `taskstore.Store` 的接口文档（v2.3.1 逐方法核实）对返回错误有明确语义要求，适配层是
