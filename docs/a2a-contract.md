@@ -2,7 +2,7 @@
 
 > 本文件是 A2A 集成并行实现的**唯一契约**。所有签名/JSON/表结构以此为准，实现中发现契约错误不得自行变更——记录到交付报告，由主控裁决。
 > 事实基准：worktree @ ada0f6e（origin/main，2026-07-16 重新核实全部代码事实——方案定稿后 main 又前进，migration 编号与 wantTables 欠账均与方案原文不同，见 §2/§9.5）。2026-07-17 复核 @ e2136d5：012 已被 kind_backfill 占用，A2A migration 顺延为 **013**（§2）；wantTables 欠账清单不变（012 为纯回填不建表）。
-> 设计过程：多 agent 调研 → 双怀疑者对抗审查（2×CRITICAL+12×MINOR 全处置）→ Boss 拍板 8 项（§13）→ 契约起草期双怀疑者再审（5×CRITICAL+7×MINOR，全部处置，见 §14）。方案全文在 workmemory `work/2026/2026-07-16-自研-见微Vane-A2A协议集成调研/a2a-integration-plan.md`。
+> 设计过程：多 agent 调研 → 双怀疑者对抗审查（2×CRITICAL+12×MINOR 全处置）→ Boss 拍板 8 项（§13）→ 契约起草期双怀疑者再审（5×CRITICAL+7×MINOR，全部处置，见 §14）。方案全文原引用 workmemory `work/2026/2026-07-16-自研-见微Vane-A2A协议集成调研/a2a-integration-plan.md`，经 2026-07-17 双机核查（Windows 本地含未跟踪/stash + 远端）**该文件从未落盘**——设计过程的存档以本契约与 workmemory `journal/2026/2026-07-16.md`、`journal/2026/2026-07-17.md` 的记录为准。
 
 ## 0. 背景与范围
 
