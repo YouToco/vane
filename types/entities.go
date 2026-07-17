@@ -64,15 +64,15 @@ type ContentItem struct {
 	CanonicalKey string `json:"canonical_key"`
 	Kind         Kind   `json:"kind"` // 内容种类，决定 Dedup/scorer 怎么对待它
 
-	URL          string     `json:"url"`
-	Title        string     `json:"title"`
-	Content      string     `json:"content"`
-	Author       string     `json:"author"`
-	PublishedAt  *time.Time `json:"published_at,omitempty"` // 源未提供发布时间时为 NULL
-	ContentHash  string     `json:"content_hash"`           // NOT NULL
-	Simhash      *int64     `json:"simhash,omitempty"`      // BIGINT，可空（未计算时为 NULL）
-	FetchedAt    time.Time  `json:"fetched_at"`
-	CreatedAt    time.Time  `json:"created_at"`
+	URL         string     `json:"url"`
+	Title       string     `json:"title"`
+	Content     string     `json:"content"`
+	Author      string     `json:"author"`
+	PublishedAt *time.Time `json:"published_at,omitempty"` // 源未提供发布时间时为 NULL
+	ContentHash string     `json:"content_hash"`           // NOT NULL
+	Simhash     *int64     `json:"simhash,omitempty"`      // BIGINT，可空（未计算时为 NULL）
+	FetchedAt   time.Time  `json:"fetched_at"`
+	CreatedAt   time.Time  `json:"created_at"`
 }
 
 // PageSnapshot page_watch 的页面快照（page_snapshots 表）。
@@ -80,8 +80,8 @@ type ContentItem struct {
 type PageSnapshot struct {
 	ID            int64           `json:"id"`
 	SourceID      int64           `json:"source_id"`
-	CanonicalKey  string          `json:"canonical_key"`  // watchKey(url, prevHash, newHash)
-	ContentHash   string          `json:"content_hash"`   // sha256(extracted_text)
+	CanonicalKey  string          `json:"canonical_key"` // watchKey(url, prevHash, newHash)
+	ContentHash   string          `json:"content_hash"`  // sha256(extracted_text)
 	ExtractedText string          `json:"extracted_text"`
 	Verdict       SnapshotVerdict `json:"verdict"`
 	FirstSeenAt   time.Time       `json:"first_seen_at"`
@@ -289,4 +289,30 @@ type PendingAction struct {
 	ExpiresAt  time.Time           `json:"expires_at"`            // 超过后不可再领取
 	ExecutedAt *time.Time          `json:"executed_at,omitempty"` // 未执行时为 NULL
 	CreatedAt  time.Time           `json:"created_at"`
+}
+
+// A2ATask 是 A2A server 任务（a2a_tasks 表，migration 013）。Task 列是 SDK a2a.Task 的
+// ProtoJSON 权威载荷（store 层不解析）；ID/ContextID/Status 是提取列。SDK 类型不出 a2a/ 包
+//（隔离原则，同 agent.Store 窄接口先例），store 层只见本类型。
+type A2ATask struct {
+	ID        string          `json:"id"` // 服务端生成 taskId
+	ContextID string          `json:"context_id"`
+	Status    string          `json:"status"`  // TASK_STATE_* 原文
+	Task      json.RawMessage `json:"task"`    // JSONB，完整 a2a.Task ProtoJSON
+	Version   int64           `json:"version"` // 乐观并发版本，从 1 起
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
+}
+
+// A2ATaskQuery 是 ListA2ATasks（a2a-contract §4.1）的过滤条件，字段面对齐 SDK
+// a2a.ListTasksRequest（v2.3.1 已核实：Tenant/ContextID/Status/PageSize/PageToken/
+// HistoryLength/StatusTimestampAfter/IncludeArtifacts）。Tenant 单租户恒空不映射；
+// HistoryLength/IncludeArtifacts 是 task JSONB 裁剪语义，归 a2a/taskstore.go 适配层
+//（契约 §5.9），store 不感知。
+type A2ATaskQuery struct {
+	ContextID            string    // 空串 = 不过滤
+	Status               string    // TASK_STATE_* 原文；空串 = 不过滤
+	StatusTimestampAfter time.Time // 零值 = 不过滤
+	PageSize             int       // <=0 → 50；钳上限 200
+	PageToken            string    // (created_at,id) 键集游标，store 包编解码，调用方视为不透明串
 }

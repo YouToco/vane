@@ -4,16 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// wantTables 是 Step 5 schema 的 9 张业务表 + M2 settings 表 + M3 schedules 表，
-// 迁移完成后必须全部存在。
+// wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
+// 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
 var wantTables = []string{
+	// 001 Step 5 schema 九张业务表
 	"users",
 	"sources",
 	"subscriptions",
@@ -23,8 +27,61 @@ var wantTables = []string{
 	"feedbacks",
 	"profiles",
 	"llm_calls",
+	// 002 M2 settings / 003 M3 schedules
 	"settings",
 	"schedules",
+	// 005 M4 agent（欠账补记，a2a-contract §9.5）
+	"agent_sessions",
+	"pending_actions",
+	// 007 内容身份关联表（欠账补记）
+	"content_sources",
+	// 011 M6 page_watch（欠账补记）
+	"page_snapshots",
+	// 013 A2A server 任务持久化
+	"a2a_tasks",
+}
+
+// TestMigrationsCoverWantTables 是对账守卫（a2a-contract §9.5）：扫 migrations/*.sql 的
+// CREATE TABLE 表名集合，与 wantTables 双向比对。守卫自 M4 起失守——005/007/011 三批
+// 新表都没进 wantTables，TestMigrate 的存在性断言对它们形同虚设——本测试把"加表忘补账"
+// 变成 CI 红灯。纯读 embed FS，无需数据库。
+func TestMigrationsCoverWantTables(t *testing.T) {
+	// 行首（含缩进）的 CREATE TABLE 才算数：SQL 注释行以 -- 开头，不会误匹配。
+	re := regexp.MustCompile(`(?mi)^\s*CREATE TABLE\s+(?:IF NOT EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)`)
+
+	files, err := fs.Glob(migrationsFS, "migrations/*.sql")
+	if err != nil {
+		t.Fatalf("枚举迁移文件失败: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("embed FS 里没有任何迁移文件（go:embed 路径变了？）")
+	}
+
+	created := make(map[string]string) // 表名 → 建它的迁移文件
+	for _, name := range files {
+		data, err := fs.ReadFile(migrationsFS, name)
+		if err != nil {
+			t.Fatalf("读迁移文件 %s 失败: %v", name, err)
+		}
+		for _, m := range re.FindAllStringSubmatch(string(data), -1) {
+			created[strings.ToLower(m[1])] = name
+		}
+	}
+
+	want := make(map[string]bool, len(wantTables))
+	for _, tbl := range wantTables {
+		want[tbl] = true
+	}
+	for tbl, file := range created {
+		if !want[tbl] {
+			t.Errorf("%s 建了表 %s，但 wantTables 没记账", file, tbl)
+		}
+	}
+	for tbl := range want {
+		if _, ok := created[tbl]; !ok {
+			t.Errorf("wantTables 记了表 %s，但没有任何迁移建它", tbl)
+		}
+	}
 }
 
 // TestMigrate 是集成测试：依赖真实 Postgres（CI 的 test job 提供 service 与 DATABASE_URL）。

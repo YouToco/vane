@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -283,4 +284,68 @@ func (s *Store) ListUnpushedByUser(ctx context.Context, userID int64, limit, per
 		return nil, types.NewAppError(types.CodeDatabase, "遍历 content_item 结果集", err)
 	}
 	return out, nil
+}
+
+// SearchContentItems 按关键词 + 时间窗检索内容，content.query 的唯一数据面
+//（a2a-contract §4.2）。语义：
+//
+//	(title ILIKE '%kw%' OR content ILIKE '%kw%')     -- kw 空串时省略该谓词
+//	AND COALESCE(published_at, fetched_at) >= $since -- published_at 可空（001:76），NULL 回退
+//	                                                 -- fetched_at，不静默丢无发布时间的整类源
+//	ORDER BY COALESCE(published_at, fetched_at) DESC, id DESC LIMIT $limit
+//
+// keyword 中的 %、_、\ 经 escapeLike 转义后再拼 '%..%'：入站文本不可信，裸拼会让外部
+// 输入携带 LIKE 通配符打穿检索语义（参数化仍守住 SQL 注入，被劫持的是语义与性能）。
+// limit 由调用方（executor）钳制后传入，本方法防御性处理 limit<=0 → 20。
+// 第一期刻意 ILIKE 不引分词：中文 tsvector 无效、pg_jieba/zhparser 不在默认镜像
+//（拍板 §13.8）；真实库量基准慢了再补表达式索引或 pg_trgm。
+func (s *Store) SearchContentItems(ctx context.Context, keyword string, since time.Time, limit int) ([]types.ContentItem, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	query := `SELECT id, source_id, external_id, canonical_key, url, title, content, author,
+	                 published_at, content_hash, simhash, fetched_at, created_at, kind
+	          FROM content_items
+	          WHERE COALESCE(published_at, fetched_at) >= $1`
+	args := []any{since}
+	if keyword != "" {
+		args = append(args, "%"+escapeLike(keyword)+"%")
+		query += ` AND (title ILIKE $2 OR content ILIKE $2)`
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(` ORDER BY COALESCE(published_at, fetched_at) DESC, id DESC LIMIT $%d`, len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("检索内容条目（keyword=%q）", keyword), err)
+	}
+	defer rows.Close()
+
+	var out []types.ContentItem
+	for rows.Next() {
+		var ci types.ContentItem
+		if err := rows.Scan(
+			&ci.ID, &ci.SourceID, &ci.ExternalID, &ci.CanonicalKey, &ci.URL, &ci.Title, &ci.Content,
+			&ci.Author, &ci.PublishedAt, &ci.ContentHash, &ci.Simhash, &ci.FetchedAt, &ci.CreatedAt,
+			&ci.Kind,
+		); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "扫描 content_item 行", err)
+		}
+		out = append(out, ci)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "遍历 content_item 结果集", err)
+	}
+	return out, nil
+}
+
+// escapeLike 把 s 中的 \、%、_ 依序替换为 \\、\%、\_ 后返回（a2a-contract §4.2）。
+// SQL 侧依赖 Postgres 默认转义符 ESCAPE '\'（标准默认行为，不显式写 ESCAPE 子句）。
+// 替换顺序必须 \ 在先：先转义通配符再转义反斜杠会把刚产出的转义符再翻一遍。
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
 }
