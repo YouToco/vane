@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strings"
 
@@ -37,7 +38,11 @@ type Config struct {
 
 // ServerConfig 是 HTTP 服务配置。
 type ServerConfig struct {
-	// Addr 是 HTTP 监听地址，默认 ":8080"。
+	// Addr 是 HTTP 监听地址，默认 "127.0.0.1:8080"——只绑本机 loopback、不对公网暴露。
+	// 生产由 Caddy（host 网络）经 127.0.0.1 反代；若绑 0.0.0.0，8080 一旦公网可达即可被
+	// 直连绕过 Caddy（绕 TLS、绕反代加固，且 Caddy 追加真实 peer 的 XFF 链路失效——见
+	// api/ratelimit.go clientIP）。确需对外监听时用 VANE_SERVER_ADDR 或配置文件显式覆盖
+	// （如 "0.0.0.0:8080"，并自行收好防火墙）。
 	Addr string `mapstructure:"addr"`
 }
 
@@ -175,7 +180,9 @@ func Load(path string) (*Config, error) {
 
 // setDefaults 注册与 config.example.yaml 一致的非敏感默认值。
 func setDefaults(v *viper.Viper) {
-	v.SetDefault("server.addr", ":8080")
+	// 默认只绑 loopback：生产走 Caddy(host 网络)反代 127.0.0.1:8080，8080 不该对公网可达。
+	// 需对外监听时用 VANE_SERVER_ADDR / 配置文件显式覆盖（见 ServerConfig.Addr）。
+	v.SetDefault("server.addr", "127.0.0.1:8080")
 
 	v.SetDefault("temporal.host", "127.0.0.1:7233")
 	v.SetDefault("temporal.namespace", "default")
@@ -234,7 +241,15 @@ func readConfigFile(v *viper.Viper, path string) error {
 // 允许在 Unmarshal 后单独调用（如配置热更新场景）。
 func (c *Config) Validate() error {
 	if c.Server.Addr == "" {
-		c.Server.Addr = ":8080"
+		c.Server.Addr = "127.0.0.1:8080" // 与 setDefaults 一致：空值回退也只绑 loopback
+	}
+	// 绑定非 loopback（含 ":8080" 这种全网卡形态，host 为空）时高声告警：8080 可能对公网
+	// 暴露、被直连绕过 Caddy。捕捉两类事故——逃生阀 VANE_SERVER_ADDR 误设，或 VPS 残留
+	// 旧 config.yaml(addr: ":8080") 静默覆盖新默认值致本纵深加固失效。
+	if host, _, err := net.SplitHostPort(c.Server.Addr); err == nil {
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			slog.Warn("config: server.addr 绑定非 loopback，8080 可能对公网可达——请确认仅经 Caddy 反代并已配防火墙", "addr", c.Server.Addr)
+		}
 	}
 	if c.DB.URL == "" {
 		return errors.New("config: db.url 必填（可通过环境变量 VANE_DB_URL 设置）")

@@ -5,6 +5,7 @@ package api
 import (
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -59,38 +60,29 @@ func (l *loginLimiter) prune(ip string, now time.Time) {
 	l.fails[ip] = kept
 }
 
-// clientIP 取请求的客户端 IP。Caddy 反代会带 X-Forwarded-For，
-// 取其首段（最初的客户端）；缺失则回退 RemoteAddr。
+// clientIP 取用于限流的客户端 IP（CWE-348：绝不能信任 X-Forwarded-For 最左段——
+// 那是攻击者可完全伪造的值，取它等于把登录爆破限流的键交给攻击者，每请求换一个"新 IP"
+// 即可绕过，或伪造受害者 IP 打满其失败额度做定向 429 锁定）。
+// 部署拓扑是**单跳可信反代**（Caddy network_mode:host 反代 127.0.0.1:8080）：
+//   - 直连来自本机 loopback（即经 Caddy）→ 采信 XFF **最右段**：Caddy 把真实 peer IP
+//     追加到客户端已带的 XFF 之后，最右一跳才是 Caddy 亲自记录的真实来源，客户端伪造的
+//     值只能落在左侧、被忽略；
+//   - 直连非 loopback（如 8080 意外暴露公网被直击）→ 一律用 RemoteAddr、无视 XFF。
+//
+// 与 a2a/auth.go 的 clientIP 同源同逻辑（两处 auth 零交集、各自持一份）：A2A PR-3 审查
+// 在 a2a 侧修复时标注了本处存量同缺陷待跟进，此次一并修平。
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := indexComma(xff); i >= 0 {
-			return trimSpace(xff[:i])
-		}
-		return trimSpace(xff)
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
 	}
-	return host
-}
-
-func indexComma(s string) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == ',' {
-			return i
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			if last := strings.TrimSpace(parts[len(parts)-1]); last != "" {
+				return last
+			}
 		}
 	}
-	return -1
-}
-
-func trimSpace(s string) string {
-	start, end := 0, len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
-		end--
-	}
-	return s[start:end]
+	return host
 }

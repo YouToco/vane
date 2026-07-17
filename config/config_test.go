@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/spf13/viper"
 )
 
 // clearVaneEnv 清掉本进程可能残留的 VANE_ 环境变量，保证测试相互隔离。
@@ -203,7 +205,7 @@ func TestDefaults(t *testing.T) {
 		got  any
 		want any
 	}{
-		{"server.addr", cfg.Server.Addr, ":8080"},
+		{"server.addr", cfg.Server.Addr, "127.0.0.1:8080"},
 		{"temporal.host", cfg.Temporal.Host, "127.0.0.1:7233"},
 		{"temporal.namespace", cfg.Temporal.Namespace, "default"},
 		{"temporal.task_queue", cfg.Temporal.TaskQueue, "vane-push"},
@@ -242,7 +244,7 @@ func TestMissingDBURL(t *testing.T) {
 	}
 }
 
-// TestServerAddrDefaultAfterEmpty 验证配置文件显式置空 server.addr 时回退到 ":8080"。
+// TestServerAddrDefaultAfterEmpty 验证配置文件显式置空 server.addr 时回退到默认 loopback 地址。
 func TestServerAddrDefaultAfterEmpty(t *testing.T) {
 	clearVaneEnv(t)
 	path := writeTempConfig(t, `
@@ -256,8 +258,39 @@ db:
 	if err != nil {
 		t.Fatalf("Load 失败: %v", err)
 	}
-	if cfg.Server.Addr != ":8080" {
-		t.Errorf("server.addr = %q, 期望回退默认值 %q", cfg.Server.Addr, ":8080")
+	if cfg.Server.Addr != "127.0.0.1:8080" {
+		t.Errorf("server.addr = %q, 期望回退默认值 %q", cfg.Server.Addr, "127.0.0.1:8080")
+	}
+}
+
+// TestServerAddrDefaultBindsLoopback 安全回归（纵深加固）：默认监听地址必须只绑本机
+// loopback，不得回退成 ":8080" / "0.0.0.0:8080"——绑全网卡会让 8080 一旦公网可达即被
+// 直连绕过 Caddy 反代与 TLS（并使 clientIP 的 XFF 可信链路失效）。
+// 直接断言 setDefaults 注册的默认值、绕过配置文件探测：本安全护栏必须永远执行，不能
+// 因宿主机存在 /opt/vane/config/config.yaml 而被 skipIfSystemConfigExists 静默跳过。
+func TestServerAddrDefaultBindsLoopback(t *testing.T) {
+	v := viper.New()
+	setDefaults(v)
+	if got := v.GetString("server.addr"); got != "127.0.0.1:8080" {
+		t.Fatalf("默认监听地址必须只绑 loopback，实际 %q——绑 0.0.0.0 会让 8080 公网直连绕过 Caddy", got)
+	}
+}
+
+// TestServerAddrEnvOverride 验证逃生阀：确需对外监听时可用 VANE_SERVER_ADDR 覆盖默认
+// loopback 绑定（ServerConfig.Addr 注释与 deploy/README 都指向这条路径，必须真的生效）。
+func TestServerAddrEnvOverride(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("VANE_DB_URL", "postgres://env")
+	t.Setenv("VANE_SERVER_ADDR", "0.0.0.0:8080")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.Server.Addr != "0.0.0.0:8080" {
+		t.Fatalf("VANE_SERVER_ADDR 应覆盖默认 loopback 绑定，实际 %q", cfg.Server.Addr)
 	}
 }
 
