@@ -219,7 +219,8 @@ func TestCanonicalKey_NoNormalization(t *testing.T) {
 // 留给 store 或调用方补算就会出现"有的行有键、有的行没键"。
 func TestFinalize_AssignsCanonicalKey(t *testing.T) {
 	src := rssSource(1)
-	item := types.ContentItem{SourceID: 1, ExternalID: bbcGUIDOld, URL: bbcURL, Title: "t", Content: "c"}
+	item := types.ContentItem{SourceID: 1, ExternalID: bbcGUIDOld, URL: bbcURL, Title: "t", Content: "c",
+		Kind: types.KindArticle}
 
 	if !finalize(src, &item) {
 		t.Fatal("有 url 的 rss 条目不该被丢弃")
@@ -269,7 +270,8 @@ func TestFinalize_CanonicalKeyPrecedesExternalIDFallback(t *testing.T) {
 // （external_id 不得为空串），只是降级为留档字段、不再参与身份。
 func TestFinalize_ExternalIDFallbackStillApplies(t *testing.T) {
 	src := rssSource(1)
-	item := types.ContentItem{SourceID: 1, URL: bbcURL, Title: "有 link 无 guid", Content: "正文"}
+	item := types.ContentItem{SourceID: 1, URL: bbcURL, Title: "有 link 无 guid", Content: "正文",
+		Kind: types.KindArticle}
 
 	if !finalize(src, &item) {
 		t.Fatal("有 url 的条目不该被丢弃")

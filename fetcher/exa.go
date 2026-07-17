@@ -218,6 +218,7 @@ func mapExaResults(src types.Source, results []exaResult) []types.ContentItem {
 			Author:      r.Author,
 			PublishedAt: parseExaDate(r.PublishedDate),
 			FetchedAt:   now,
+			Kind:        types.KindArticle, // 搜索结果是"一篇内容"（M6 契约 §7.2(b)：构造处赋值，finalize 只校验）
 		}
 		// finalize 据 src.Platform 定身份：exa 与 rss 同属 web 平台、url 派——这正是
 		// "Exa 搜到用户 RSS 源里的同一篇文章"能被识别成一份的原因。
