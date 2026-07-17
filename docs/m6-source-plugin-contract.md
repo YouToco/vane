@@ -1146,6 +1146,45 @@ Entities json.RawMessage `json:"entities"`
 // 现有 fetcher.go:143 给 RSS 设的 "Vane/0.3" **不可照搬到 page_watch**。
 ```
 
+### 10.1.1 抓取方式的另一选项：Exa `/contents`（2026-07-17 补充，Boss 拍板方向）
+
+**拍板方向**：无需登录态的公开页面，不维护自己的 SSRF 防护 + `http.Client` 抓取代码，
+直接用 Exa 的 `/contents` 工具抓；需要登录会话的页面（若未来接入）仍走 §10.1 自建客户端
+——两者不是互斥关系，是按"要不要认证"分流。
+
+**实测依据**（2026-07-17，对比目标 `platform.claude.com/docs/en/about-claude/pricing`，
+即 §10.3 选定的正确 URL，真表格 14 个 `<table>` / 95 个 `<tr>`）：
+
+- **⚠️ 致命坑，必须写死**：Exa `/contents` **默认（不传 `maxAgeHours`）优先吃缓存**
+  ——实测 `statuses[].source == "cached"`，0.4s 返回。**必须显式传 `maxAgeHours: 0`**
+  才会强制活抓（实测 `source == "crawled"`，3–4s）。漏了这一行，page_watch 会拿旧快照
+  跟上次快照比较，**变化监控静默失效**且不报错——比 §10.2 那条 go-readability 的坑更隐蔽，
+  因为**请求本身 200 成功、没有任何错误信号**。
+- **确定性**：同一 URL 相隔数秒两次独立 `maxAgeHours:0` 活抓，返回文本**逐字节相同**
+  （sha256 一致，25943 字符）。对基于 hash 的变化检测（§10.4）没有引入噪声——
+  但这是 Exa 内部实现细节，不受 Vane 控制版本，**将来 Exa 若改抽取算法，此结论需要重测**。
+- **结构保留优于预期**：真表格页上，Exa 把 `<table>` 转成 markdown 表格行，
+  且实测**没有 `CellPaddingBehaviorAligned` 那种对齐填充**（各行分隔符统一是单空格
+  `| 单元格 | 单元格 |`，不因单元格长度补空格），单元格值变化理论上仍是单行 diff——
+  **和 §10.2 goquery 压平表格行想要的效果基本等价**，且自带表头 `| Model | ... |`
+  免去 §10.2 提到的"Google 模型名在表外要手动拼接"那类特殊处理。
+  未验证项：markdown 转换是否在所有目标站点都稳定保留"一行一模型"粒度
+  （§10.2 的 goquery 方案是 Vane 自己的代码、行为可测试锁定；Exa 的转换逻辑不透明，
+  没有 SLA，需要在正式接入前对 §10.3 列出的三个目标站点都跑一遍这个粒度检查）。
+- **成本**：两次测试（26K/28K 字符页面）`costDollars.total` 均为 $0.001/次。
+  按当前唯一在跑源 `fetch_interval_seconds=1800` 折算约 $0.05/天/源，量级可忽略，
+  但客户量上来后要按源数重新估算，不能假设一直是这个数量级。
+- **不适用场景**：§10.1 的 SSRF 防护栈是防**用户提供的任意 URL**打 Vane 自己的内网；
+  换成 Exa 抓取后，请求源变成 Exa 的基础设施而不是 Vane 服务器，**Vane 侧 SSRF 风险归零**，
+  但没有做过滥用测试的前提下，不代表可以对 Exa 不做任何 URL 校验就透传——仍需和 §10.1
+  一样做 scheme/host 层面的基本合法性检查，只是不再需要 `lookupIP`/`isBlocked` 那层。
+
+**顺带发现（与本节决策无关，但同一次实测暴露）**：生产库当前唯一在跑的 page_watch 源
+（`sources.id=11`，`https://www.anthropic.com/pricing`）用的正是 §10.3 表格里明确标了
+❌ 的那个 marketing 页——零 `<table>`/`<tr>`，只能靠 `body.Text()` 兜底，抽取质量远低于
+本契约设计的目标。**这是本契约 §10.3 结论尚未回填到生产配置的独立遗留问题，建议单独修，
+不要和这次 Exa 抓取方式的决策混在一次改动里。**
+
 ### 10.2 抽取：**goquery 压平表格行**，**不用 readability**
 
 **实测：`go-readability` 在 Anthropic 价格页静默失败**——返回 `err == nil`、
