@@ -340,8 +340,9 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 	}
 	verb, actionID := parseCardActionValue(event.Event.Action.Value)
 	fbAction, deliveryID, isFeedback := parseFeedbackValue(event.Event.Action.Value)
-	// 三类 value 之外（含 value 结构不识别）静默忽略，不弹错误打扰。
-	if !isFeedback && (actionID == "" || (verb != cardActionConfirm && verb != cardActionCancel)) {
+	reasonDeliveryID, isReasonSubmit := parseFeedbackReasonValue(event.Event.Action.Value)
+	// 四类 value 之外（含 value 结构不识别）静默忽略，不弹错误打扰。
+	if !isFeedback && !isReasonSubmit && (actionID == "" || (verb != cardActionConfirm && verb != cardActionCancel)) {
 		return &callback.CardActionTriggerResponse{}, nil
 	}
 
@@ -366,6 +367,15 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 			return toastResponse("error", "内部数据错误，请稍后重试"), nil
 		}
 		return h.onFeedbackAction(user.ID, fbAction, deliveryID), nil
+	}
+	if isReasonSubmit {
+		user, err := h.m.st.UpsertUserByOpenID(h.ctx, operatorID, "")
+		if err != nil {
+			slog.Error("feishu: 反馈原因回调 upsert 用户失败", "err", err, "open_id", operatorID)
+			return toastResponse("error", "内部数据错误，请稍后重试"), nil
+		}
+		reason, _ := event.Event.Action.FormValue["reason"].(string)
+		return h.onFeedbackReasonSubmit(user.ID, reasonDeliveryID, reason), nil
 	}
 
 	runner := h.m.agentRunner()
@@ -490,6 +500,68 @@ func parseFeedbackValue(value map[string]interface{}) (action types.FeedbackActi
 		return "", 0, false
 	}
 	return action, id, true
+}
+
+// parseFeedbackReasonValue 解析 form 提交的"fbr" value：只需 delivery_id，
+// 原因文本在 FormValue 里（由调用方提取）。
+func parseFeedbackReasonValue(value map[string]interface{}) (deliveryID int64, ok bool) {
+	if verb, _ := value["vane_action"].(string); verb != cardActionFeedbackReason {
+		return 0, false
+	}
+	idStr, _ := value["delivery_id"].(string)
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return id, true
+}
+
+// onFeedbackReasonSubmit 处理 👎 后 form 提交的反馈原因。
+func (h *handler) onFeedbackReasonSubmit(userID, deliveryID int64, reason string) *callback.CardActionTriggerResponse {
+	fb := h.m.feedbackRunner()
+	if fb == nil {
+		return toastResponse("error", "反馈功能尚未就绪，请稍后重试")
+	}
+
+	done := make(chan feedback.ClickResult, 1)
+	go func() {
+		execCtx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), cardActionExecBudget)
+		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("feishu: 反馈原因处理 panic", "recover", r, "delivery_id", deliveryID)
+				done <- feedback.ClickResult{Toast: "内部错误，请稍后重试"}
+			}
+		}()
+		res, err := fb.HandleReasonSubmit(execCtx, userID, feedback.ReasonSubmit{
+			DeliveryID: deliveryID, Reason: reason,
+		})
+		if err != nil {
+			slog.Error("feishu: 反馈原因处理失败", "err", err, "delivery_id", deliveryID)
+			done <- feedback.ClickResult{Toast: "处理失败，请稍后重试"}
+			return
+		}
+		done <- res
+	}()
+
+	timer := time.NewTimer(cardActionSyncBudget)
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		toastType := "error"
+		if res.ToastOK {
+			toastType = "success"
+		}
+		resp := &callback.CardActionTriggerResponse{
+			Toast: &callback.Toast{Type: toastType, Content: res.Toast},
+		}
+		if res.CardJSON != "" {
+			resp.Card = &callback.Card{Type: "raw", Data: json.RawMessage(res.CardJSON)}
+		}
+		return resp
+	case <-timer.C:
+		return toastResponse("info", "处理中，可稍后重新点击")
+	}
 }
 
 // onFeedbackAction 处理推送卡反馈按钮点击（M5 契约 §10.3）。

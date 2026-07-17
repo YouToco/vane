@@ -265,6 +265,10 @@ func (f *fakeStore) GetContentItem(_ context.Context, id int64) (*types.ContentI
 	return &cp, nil
 }
 
+func (f *fakeStore) GetSource(_ context.Context, id int64) (*types.Source, error) {
+	return &types.Source{ID: id, Title: "fake-source", Platform: "rss"}, nil
+}
+
 func (f *fakeStore) GetProfile(_ context.Context, userID int64) (*types.Profile, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -380,16 +384,16 @@ type fakeCards struct {
 	calls []cardCall
 }
 
-func (c *fakeCards) build(bodyMD string, deliveryID int64, st CardState) string {
+func (c *fakeCards) build(input CardInput) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.calls = append(c.calls, cardCall{bodyMD: bodyMD, deliveryID: deliveryID, state: st})
+	c.calls = append(c.calls, cardCall{bodyMD: input.BodyMD, deliveryID: input.DeliveryID, state: input.State})
 	b, err := json.Marshal(map[string]any{
-		"body_md":     bodyMD,
-		"delivery_id": deliveryID,
-		"pref":        string(st.Preference),
-		"misjudged":   st.Misjudged,
-		"deep_dive":   st.DeepDiveRequested,
+		"body_md":     input.BodyMD,
+		"delivery_id": input.DeliveryID,
+		"pref":        string(input.State.Preference),
+		"misjudged":   input.State.Misjudged,
+		"deep_dive":   input.State.DeepDiveRequested,
 	})
 	if err != nil {
 		panic(err)

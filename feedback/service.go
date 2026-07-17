@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/YouToco/vane/llm"
@@ -27,6 +28,7 @@ type Store interface {
 	HasFeedback(ctx context.Context, deliveryID int64, action types.FeedbackAction) (bool, error)
 	GetFeedbackDetail(ctx context.Context, deliveryID int64, action types.FeedbackAction) (string, error)
 	GetContentItem(ctx context.Context, id int64) (*types.ContentItem, error)
+	GetSource(ctx context.Context, id int64) (*types.Source, error)
 	GetProfile(ctx context.Context, userID int64) (*types.Profile, error)
 }
 
@@ -45,7 +47,8 @@ type SessionNotifier interface {
 // CardBuilder 构造带按钮与状态行的推送卡 JSON（生产实现 feishu.BuildDeliveryCard）。
 // 函数注入而非 import feishu：feishu 反向引用本包（Click/ClickResult/CardState），
 // import 环由此封死（契约 §10.4 依赖边界）。
-type CardBuilder func(bodyMD string, deliveryID int64, st CardState) string
+// 卡片改版后签名从 (bodyMD, deliveryID, state) 扩展为 CardInput 单参。
+type CardBuilder func(input CardInput) string
 
 // Click 一次反馈按钮点击（feishu 回调解析后的规范化形态）。
 type Click struct {
@@ -161,6 +164,44 @@ func (s *Service) handleMisjudged(ctx context.Context, userID int64, d *types.De
 	return s.rebuilt(ctx, d, "已标记误判，将用于修正推送判断", true, nil), nil
 }
 
+// ReasonSubmit 表示 form 提交的反馈原因（点 👎 后出现的输入框）。
+type ReasonSubmit struct {
+	DeliveryID int64
+	Reason     string // 用户填写的文字，可为空（"可跳过"）
+}
+
+// HandleReasonSubmit 处理 👎 后的 form 提交：记录 misjudged + detail。
+// 用户已点过 👎（not_interested 已落库），form 是可选的补充——空 reason 也算
+// 有效提交（语义：确认误判，但不想说原因）。
+func (s *Service) HandleReasonSubmit(ctx context.Context, userID int64, submit ReasonSubmit) (ClickResult, error) {
+	d, err := s.deps.Store.GetDeliveryForUser(ctx, submit.DeliveryID, userID)
+	if err != nil {
+		if errors.Is(err, types.ErrNotFound) {
+			return ClickResult{Toast: "找不到这条推送或不属于你"}, nil
+		}
+		return ClickResult{}, err
+	}
+	has, err := s.deps.Store.HasFeedback(ctx, d.ID, types.FeedbackActionMisjudged)
+	if err != nil {
+		return ClickResult{}, err
+	}
+	if has {
+		return s.rebuilt(ctx, d, "已标记过误判", true, nil), nil
+	}
+	reason := promptguard.TruncateRunes(strings.TrimSpace(submit.Reason), 500)
+	if _, err := s.deps.Store.InsertFeedback(ctx, &types.Feedback{
+		UserID: userID, DeliveryID: d.ID, Action: types.FeedbackActionMisjudged, Detail: reason,
+	}); err != nil {
+		return ClickResult{}, err
+	}
+	suffix := ""
+	if reason != "" {
+		suffix = "（附原因）"
+	}
+	s.notifyClick(ctx, userID, d.ID, s.contentTitle(ctx, d), "误判"+suffix, "")
+	return s.rebuilt(ctx, d, "已标记误判，将用于修正推送判断", true, nil), nil
+}
+
 // rebuilt 组装"toast + 重建卡"的返回：每次点击都按库内状态重建整卡
 // （契约 §10.2 最终一致）。force 非 nil 时在查得的状态上强制覆盖——
 // deep_dive 启动路径此刻行尚未插入，DeepDiveRequested 必须人为置真。
@@ -175,7 +216,24 @@ func (s *Service) rebuilt(ctx context.Context, d *types.Delivery, toast string, 
 	if force != nil {
 		force(&st)
 	}
-	res.CardJSON = s.deps.BuildCard(d.BodyMD, d.ID, st)
+	input := CardInput{
+		BodyMD:     d.BodyMD,
+		DeliveryID: d.ID,
+		State:      st,
+		Score:      int(d.Score),
+	}
+	if d.ContentItemID != nil {
+		if ci, err := s.deps.Store.GetContentItem(ctx, *d.ContentItemID); err == nil {
+			input.Title = ci.Title
+			input.URL = ci.URL
+			input.PublishedAt = ci.PublishedAt
+			if src, err := s.deps.Store.GetSource(ctx, ci.SourceID); err == nil {
+				input.SourceTitle = src.Title
+				input.Platform = src.Platform
+			}
+		}
+	}
+	res.CardJSON = s.deps.BuildCard(input)
 	return res
 }
 

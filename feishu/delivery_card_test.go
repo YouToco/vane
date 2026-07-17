@@ -97,10 +97,10 @@ func decodeButtonColumns(t *testing.T, raw json.RawMessage) []deliveryCardButton
 	if colSet.Tag != "column_set" {
 		t.Fatalf("按钮容器 tag = %q, 期望 \"column_set\"", colSet.Tag)
 	}
-	if len(colSet.Columns) != 4 {
-		t.Fatalf("columns 长度 = %d, 期望 4（四个反馈按钮）", len(colSet.Columns))
+	if len(colSet.Columns) != 3 {
+		t.Fatalf("columns 长度 = %d, 期望 3（三个反馈按钮）", len(colSet.Columns))
 	}
-	btns := make([]deliveryCardButton, 0, 4)
+	btns := make([]deliveryCardButton, 0, 3)
 	for i, col := range colSet.Columns {
 		if col.Tag != "column" {
 			t.Errorf("columns[%d].tag = %q, 期望 \"column\"", i, col.Tag)
@@ -123,7 +123,7 @@ func TestBuildDeliveryCardStructure(t *testing.T) {
 	// 刻意含引号、换行、Markdown 语法与中文：验证 JSON 转义不破坏解读正文
 	// ——正文永不丢失是契约 §0 的红线。
 	const bodyMD = "**AI 芯片新政**\n\n一句话摘要：\"出口管制\" 再收紧。\n\n[阅读原文](https://example.com/a?x=1&y=2)"
-	raw := BuildDeliveryCard(bodyMD, 42, feedback.CardState{})
+	raw := BuildDeliveryCard(feedback.CardInput{BodyMD: bodyMD, DeliveryID: 42, State: feedback.CardState{}})
 	card := decodeDeliveryCard(t, raw)
 
 	// 零值 state 无状态行：首发卡与 M5 之前的观感一致，只多一排按钮。
@@ -137,15 +137,14 @@ func TestBuildDeliveryCardStructure(t *testing.T) {
 	}
 
 	btns := decodeButtonColumns(t, card.Body.Elements[1])
-	// 顺序即卡片上的左右顺序（契约 §10.2：两个 P0 态度在前，两个 P1 在后）。
+	// 顺序即卡片上的左右顺序（契约 §10.2：两个 P0 态度在前，P1 深挖在后）。
 	want := []struct {
 		label  string
 		action types.FeedbackAction
 	}{
-		{"感兴趣", types.FeedbackActionInterested},
-		{"不感兴趣", types.FeedbackActionNotInterested},
-		{"误判", types.FeedbackActionMisjudged},
-		{"深度解读", types.FeedbackActionDeepDive},
+		{"👍", types.FeedbackActionInterested},
+		{"👎", types.FeedbackActionNotInterested},
+		{"🔍 深挖", types.FeedbackActionDeepDive},
 	}
 	for i, w := range want {
 		btn := btns[i]
@@ -194,7 +193,7 @@ func TestBuildDeliveryCardStructure(t *testing.T) {
 // 则逐位无损。用 2^53+1 这个"float64 表示不出来"的确切值定向验证。
 func TestBuildDeliveryCardDeliveryIDPrecision(t *testing.T) {
 	const bigID = int64(9007199254740993) // 2^53+1：float64 会把它舍成 ...992
-	raw := BuildDeliveryCard("正文", bigID, feedback.CardState{})
+	raw := BuildDeliveryCard(feedback.CardInput{BodyMD: "正文", DeliveryID: bigID, State: feedback.CardState{}})
 
 	if !strings.Contains(raw, `"delivery_id":"9007199254740993"`) {
 		t.Errorf("delivery_id 未以字符串原样承载 %d，卡片 JSON: %s", bigID, raw)
@@ -222,12 +221,12 @@ func TestFeedbackStateLine(t *testing.T) {
 		{
 			name:  "仅感兴趣",
 			state: feedback.CardState{Preference: types.FeedbackActionInterested},
-			want:  "✅ 已反馈：感兴趣",
+			want:  "✅ 已记录：感兴趣",
 		},
 		{
 			name:  "仅不感兴趣",
 			state: feedback.CardState{Preference: types.FeedbackActionNotInterested},
-			want:  "🚫 已反馈：不感兴趣",
+			want:  "🚫 已记录：不感兴趣",
 		},
 		{
 			name:  "仅误判（误判独立于态度，可单独存在）",
@@ -242,12 +241,12 @@ func TestFeedbackStateLine(t *testing.T) {
 		{
 			name:  "感兴趣 + 误判",
 			state: feedback.CardState{Preference: types.FeedbackActionInterested, Misjudged: true},
-			want:  "✅ 已反馈：感兴趣 · ⚠️ 已标记误判",
+			want:  "✅ 已记录：感兴趣 · ⚠️ 已标记误判",
 		},
 		{
 			name:  "感兴趣 + 深度解读",
 			state: feedback.CardState{Preference: types.FeedbackActionInterested, DeepDiveRequested: true},
-			want:  "✅ 已反馈：感兴趣 · 📖 已请求深度解读（结果以回复消息送达）",
+			want:  "✅ 已记录：感兴趣 · 📖 已请求深度解读（结果以回复消息送达）",
 		},
 		{
 			name:  "误判 + 深度解读（无态度）",
@@ -261,11 +260,11 @@ func TestFeedbackStateLine(t *testing.T) {
 				Misjudged:         true,
 				DeepDiveRequested: true,
 			},
-			want: "🚫 已反馈：不感兴趣 · ⚠️ 已标记误判 · 📖 已请求深度解读（结果以回复消息送达）",
+			want: "🚫 已记录：不感兴趣 · ⚠️ 已标记误判 · 📖 已请求深度解读（结果以回复消息送达）",
 		},
 		{
 			// 纵深兜底：Preference 的合法取值只有 ""/interested/not_interested
-			// （契约 §10.2），库里冒出别的值时不得渲染出"已反馈：deep_dive"这类
+			// （契约 §10.2），库里冒出别的值时不得渲染出"已记录：deep_dive"这类
 			// 泄漏内部枚举的文案，只能当作未表态。
 			name:  "非态度值落在 Preference 上不渲染态度段",
 			state: feedback.CardState{Preference: types.FeedbackActionDeepDive},
@@ -296,7 +295,7 @@ func TestBuildDeliveryCardStateLinePlacement(t *testing.T) {
 	const bodyMD = "**标题**\n摘要"
 
 	t.Run("零值 state 不追加状态行", func(t *testing.T) {
-		card := decodeDeliveryCard(t, BuildDeliveryCard(bodyMD, 7, feedback.CardState{}))
+		card := decodeDeliveryCard(t, BuildDeliveryCard(feedback.CardInput{BodyMD: bodyMD, DeliveryID: 7, State: feedback.CardState{}}))
 		if len(card.Body.Elements) != 2 {
 			t.Fatalf("body.elements 长度 = %d, 期望 2（无状态行）", len(card.Body.Elements))
 		}
@@ -308,9 +307,9 @@ func TestBuildDeliveryCardStateLinePlacement(t *testing.T) {
 			Misjudged:         true,
 			DeepDiveRequested: true,
 		}
-		card := decodeDeliveryCard(t, BuildDeliveryCard(bodyMD, 7, st))
-		if len(card.Body.Elements) != 3 {
-			t.Fatalf("body.elements 长度 = %d, 期望 3（markdown + column_set + 状态行）",
+		card := decodeDeliveryCard(t, BuildDeliveryCard(feedback.CardInput{BodyMD: bodyMD, DeliveryID: 7, State: st}))
+		if len(card.Body.Elements) != 4 {
+			t.Fatalf("body.elements 长度 = %d, 期望 4（markdown + column_set + 状态行 + 误判表单）",
 				len(card.Body.Elements))
 		}
 		// 正文原样保留：点按钮后重建的是"同一张卡的新版本"，不是替换成结果文本。
@@ -318,8 +317,8 @@ func TestBuildDeliveryCardStateLinePlacement(t *testing.T) {
 			t.Errorf("状态行版本的正文 = %q, 期望原样 %q", got, bodyMD)
 		}
 		// 按钮常驻。
-		if btns := decodeButtonColumns(t, card.Body.Elements[1]); len(btns) != 4 {
-			t.Errorf("状态行版本的按钮数 = %d, 期望 4（按钮常驻）", len(btns))
+		if btns := decodeButtonColumns(t, card.Body.Elements[1]); len(btns) != 3 {
+			t.Errorf("状态行版本的按钮数 = %d, 期望 3（按钮常驻）", len(btns))
 		}
 		got := decodeMarkdownElement(t, card.Body.Elements[2], "状态行")
 		if want := feedbackStateLine(st); got != want {

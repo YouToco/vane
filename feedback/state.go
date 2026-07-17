@@ -4,7 +4,11 @@
 // FeedbackRunner），import 环由这条边界封死。
 package feedback
 
-import "github.com/YouToco/vane/types"
+import (
+	"time"
+
+	"github.com/YouToco/vane/types"
+)
 
 // CardState 推送卡状态行的渲染输入（契约 §10.2），由 feishu.BuildDeliveryCard 消费。
 // 三字段均以库内查询为准、最终一致：同卡并发点击时两版卡片以飞书到达序为准，
@@ -18,4 +22,19 @@ type CardState struct {
 	Misjudged bool
 	// DeepDiveRequested 是否已请求深度解读（此行定格后不再变，生成失败也不回退）。
 	DeepDiveRequested bool
+}
+
+// CardInput 构卡函数的全量输入（卡片改版扩展签名，替代原 (bodyMD, deliveryID, state)
+// 三参数）。反馈重建路径按 best-effort 查库填充：内容/源查不到时字段为零值，
+// 构卡函数据此降级渲染（标题空则 header 回退默认、subtitle 缺字段则省略对应段）。
+type CardInput struct {
+	BodyMD      string
+	DeliveryID  int64
+	State       CardState
+	Title       string         // content_items.title → header title
+	Score       int            // round(deliveries.score) → ⚡ tag
+	URL         string         // content_items.url → 阅读原文按钮
+	SourceTitle string         // sources.title → subtitle 栏目
+	Platform    types.Platform // sources.platform → subtitle emoji
+	PublishedAt *time.Time     // content_items.published_at → subtitle 相对时间
 }

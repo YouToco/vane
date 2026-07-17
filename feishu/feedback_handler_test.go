@@ -63,6 +63,15 @@ func (f *fakeFeedbackRunner) HandleClick(_ context.Context, userID int64, click 
 	return res, err
 }
 
+func (f *fakeFeedbackRunner) HandleReasonSubmit(_ context.Context, userID int64, submit feedback.ReasonSubmit) (feedback.ClickResult, error) {
+	f.mu.Lock()
+	f.clicks = append(f.clicks, feedback.Click{Action: types.FeedbackActionMisjudged, DeliveryID: submit.DeliveryID})
+	f.clickUsers = append(f.clickUsers, userID)
+	res, err := f.result, f.err
+	f.mu.Unlock()
+	return res, err
+}
+
 func (f *fakeFeedbackRunner) WrapQuestion(_ context.Context, userID int64, parentMsgID, rootMsgID, text string) (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -284,13 +293,12 @@ func TestParseFeedbackValue(t *testing.T) {
 // 而不是等到用户点了按钮没反应。
 func TestBuildDeliveryCardValueRoundTrip(t *testing.T) {
 	const deliveryID = int64(9007199254740993) // 顺带覆盖大 id 的端到端无损
-	card := decodeDeliveryCard(t, BuildDeliveryCard("正文", deliveryID, feedback.CardState{}))
+	card := decodeDeliveryCard(t, BuildDeliveryCard(feedback.CardInput{BodyMD: "正文", DeliveryID: deliveryID, State: feedback.CardState{}}))
 	btns := decodeButtonColumns(t, card.Body.Elements[1])
 
 	wantActions := []types.FeedbackAction{
 		types.FeedbackActionInterested,
 		types.FeedbackActionNotInterested,
-		types.FeedbackActionMisjudged,
 		types.FeedbackActionDeepDive,
 	}
 	for i, btn := range btns {
@@ -437,8 +445,8 @@ func TestOnFeedbackActionNotReady(t *testing.T) {
 // 卡片更新用 feedback 服务返回的**整卡 JSON**（正文原样保留），
 // 而非 M4 那样把卡片替换成结果文本——推送卡是长期驻留的内容本身。
 func TestOnFeedbackActionSuccess(t *testing.T) {
-	cardJSON := BuildDeliveryCard("**解读正文**", 42,
-		feedback.CardState{Preference: types.FeedbackActionInterested})
+	cardJSON := BuildDeliveryCard(feedback.CardInput{BodyMD: "**解读正文**", DeliveryID: 42,
+		State: feedback.CardState{Preference: types.FeedbackActionInterested}})
 
 	m := NewManager(nil, nil, nil)
 	fb := &fakeFeedbackRunner{
@@ -785,8 +793,8 @@ func TestOnCardActionFeedbackRoute(t *testing.T) {
 		t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
 	}
 
-	cardJSON := BuildDeliveryCard("**正文**", 42,
-		feedback.CardState{Preference: types.FeedbackActionNotInterested})
+	cardJSON := BuildDeliveryCard(feedback.CardInput{BodyMD: "**正文**", DeliveryID: 42,
+		State: feedback.CardState{Preference: types.FeedbackActionNotInterested}})
 	m := NewManager(st, nil, nil)
 	m.setOwner(owner, "测试")
 	fb := &fakeFeedbackRunner{

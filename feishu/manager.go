@@ -40,6 +40,7 @@ type AgentRunner interface {
 // （构卡与发送都靠注入），依赖单向、无环。
 type FeedbackRunner interface {
 	HandleClick(ctx context.Context, userID int64, click feedback.Click) (feedback.ClickResult, error)
+	HandleReasonSubmit(ctx context.Context, userID int64, submit feedback.ReasonSubmit) (feedback.ClickResult, error)
 	// WrapQuestion 尝试把"回复推送卡"的消息识别为追问并包装上下文；
 	// matched=false 时调用方按普通消息原样处理。
 	WrapQuestion(ctx context.Context, userID int64, parentMsgID, rootMsgID, text string) (wrapped string, matched bool)
