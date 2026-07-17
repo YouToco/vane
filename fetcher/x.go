@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/YouToco/vane/config"
@@ -20,6 +21,11 @@ const (
 	twitterFetchPath = "/api/v1/twitter/web/fetch_user_post_tweet"
 	// Twitter 原生时间格式（§9.5）——第三种时间表示（RSS=RFC3339, XHS=Unix秒）。
 	twitterTimeLayout = "Mon Jan 02 15:04:05 -0700 2006"
+	// twitterErrBodyMax 是非 200 响应记入日志/错误信息的 body 截断上限。
+	// 2026-07-17 生产 400 断供时日志只有状态码没有 body，根因（TikHub 上游故障
+	// vs 参数/鉴权/余额）全靠本地重放才定位到——body 前几百字节足以直接分辨。
+	// body 是上游响应数据，不含请求侧凭证（key 只在请求头），截断只为控制日志体积。
+	twitterErrBodyMax = 200
 )
 
 // TwitterFetcher 调用 TikHub 的 Twitter Web API。
@@ -110,7 +116,9 @@ func (f *TwitterFetcher) Fetch(ctx context.Context, src types.Source) ([]types.C
 			fmt.Sprintf("x/user_posts 缺少 screen_name（source_id=%d）", src.ID), nil)
 	}
 
-	reqURL := f.baseURL + twitterFetchPath + "?screen_name=" + sc.ScreenName
+	// QueryEscape 防御 config 里带 &/=/空格 等字符的 screen_name 污染 query
+	// （同 tikhub.go detailDesc 的教训：裸拼参数出错时表现诡异且白花钱）。
+	reqURL := f.baseURL + twitterFetchPath + "?screen_name=" + url.QueryEscape(sc.ScreenName)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, types.NewAppError(types.CodeInternal, "构造 X 请求失败", err)
@@ -129,10 +137,28 @@ func (f *TwitterFetcher) Fetch(ctx context.Context, src types.Source) ([]types.C
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		// body 摘要进日志与错误信息：上游 4xx/5xx 的 body 通常直接写明原因
+		// （参数错/鉴权失效/上游故障），没有它每次断供都要本地重放才能定位。
+		bodyPreview := truncateUTF8(string(body), twitterErrBodyMax)
 		slog.Warn("x/user_posts: 非 200 响应",
-			"source_id", src.ID, "status", resp.StatusCode, "screen_name", sc.ScreenName)
-		return nil, types.NewAppError(types.CodeFetchTimeout,
-			fmt.Sprintf("X API 返回 HTTP %d（source_id=%d）", resp.StatusCode, src.ID), nil)
+			"source_id", src.ID, "status", resp.StatusCode,
+			"screen_name", sc.ScreenName, "body", bodyPreview)
+
+		// 错误分类对齐契约 §6 与 tikhub.go 现状：429→限流（可重试）、
+		// 401/403→鉴权/配置问题（确定性，不可重试）、其余按 5xx/4xx 定 Retryable。
+		switch resp.StatusCode {
+		case http.StatusTooManyRequests:
+			return nil, types.NewAppError(types.CodeFetchRateLimit,
+				fmt.Sprintf("X API 被限流(429)（source_id=%d）", src.ID), nil)
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return nil, types.NewAppError(types.CodeValidation,
+				fmt.Sprintf("X API 鉴权失败（HTTP %d，source_id=%d），请检查 API key 与 scopes: %s",
+					resp.StatusCode, src.ID, bodyPreview), nil)
+		}
+		ae := types.NewAppError(types.CodeFetchTimeout,
+			fmt.Sprintf("X API 返回 HTTP %d（source_id=%d）: %s", resp.StatusCode, src.ID, bodyPreview), nil)
+		ae.Retryable = resp.StatusCode >= 500 // 5xx 瞬态可重试，4xx 确定性不可重试。
+		return nil, ae
 	}
 
 	var envelope twitterResponse
