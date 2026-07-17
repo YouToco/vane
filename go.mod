@@ -2,7 +2,13 @@ module github.com/YouToco/vane
 
 go 1.26
 
+// SDK v3.9.9 WS 模式静默丢弃 MessageTypeCard，卡片回调永远到达不了应用层。
+// 本地 patch：third_party/oapi-sdk-go/v3/ws/client.go 将 card 消息路由到 eventHandler.Do()。
+// SDK 修复后移除此 replace 和 third_party/ 目录。
+replace github.com/larksuite/oapi-sdk-go/v3 => ./third_party/oapi-sdk-go/v3
+
 require (
+	github.com/PuerkitoBio/goquery v1.12.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/larksuite/oapi-sdk-go/v3 v3.9.9
@@ -14,7 +20,6 @@ require (
 )
 
 require (
-	github.com/PuerkitoBio/goquery v1.12.0 // indirect
 	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/facebookgo/clock v0.0.0-20150410010913-600d898af40a // indirect
