@@ -9,3 +9,4 @@ dist/
 Thumbs.db
 .idea/
 .vscode/
+tsconfig.tsbuildinfo
