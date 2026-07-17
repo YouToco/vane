@@ -37,6 +37,7 @@ type fakeStore struct {
 	// 回声位：记录 Run 实际传下来的参数，用于断言窗口与期望串没接反。
 	gotSince      time.Time
 	gotInjSince   time.Time
+	gotNegSince   time.Time
 	gotMinN       int
 	gotTail       string
 	gotBatchSince time.Time
@@ -61,7 +62,8 @@ func (f *fakeStore) GetProfileInjectionStat(_ context.Context, since time.Time) 
 	return f.inj, nil
 }
 
-func (f *fakeStore) GetNegTailStat(_ context.Context, _ time.Time, expectedTail string) (types.NegTailStat, error) {
+func (f *fakeStore) GetNegTailStat(_ context.Context, since time.Time, expectedTail string) (types.NegTailStat, error) {
+	f.gotNegSince = since
 	f.gotTail = expectedTail
 	n := f.neg
 	n.ExpectedTail = expectedTail
@@ -702,6 +704,11 @@ func TestRun_InjectionWindowClampedToProfileCreation(t *testing.T) {
 	}
 	if !f.gotInjSince.Equal(created) {
 		t.Errorf("注入统计 since 应钳到画像创建时刻 %v，实际 %v", created, f.gotInjSince)
+	}
+	// 保尾统计（⑤）与注入同病同治：画像创建前的调用不含负面句同样是正确行为
+	//（2026-07-17 同一批 142 条历史调用先后击穿 §16.4 与 §16.5）。
+	if !f.gotNegSince.Equal(created) {
+		t.Errorf("保尾统计 since 应钳到画像创建时刻 %v，实际 %v", created, f.gotNegSince)
 	}
 	// 其余统计不受钳窗影响，仍用公共 since。
 	if want := now.Add(-DefaultWindow); !f.gotSince.Equal(want) {

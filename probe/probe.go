@@ -159,10 +159,16 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 	if rep.ScoreDistribution, err = st.ListScoreDistribution(ctx, since); err != nil {
 		return rep, err
 	}
-	// 注入统计的窗口起点钳到画像创建时刻：画像存在**之前**的打分写「暂无」是
-	// 正确行为，计入 Absent 会让首采后的头 24h 恒报假击穿（2026-07-17 生产实锤：
-	// 画像 02:37 UTC 建立，探针把 18:53–00:30 的 142 条历史「暂无」判成红线击穿，
-	// 而画像建立后 52 条全部注入正常、profilehint WARN 零条）。
+	// 注入（④）与保尾（⑤）统计的窗口起点钳到画像创建时刻：画像存在**之前**的
+	// 打分既写「暂无」也不含负面句，都是正确行为，计入失败会让首采后的头 24h 恒报
+	// 假击穿（2026-07-17 生产实锤，两针先后被同一批数据击穿：画像 02:37 UTC 建立，
+	// 24h 窗口把 18:53–00:30 的 142 条历史调用分别判成 §16.4 与 §16.5 红线，
+	// 而画像建立后 52 条注入与保尾全部正常）。
+	//
+	// 已知限制：⑤ 的严格基准是"当前负面句进入画像的时刻"——演化改写负面句后，
+	// 改写前的调用含旧句、期望串是新句，钳 CreatedAt 挡不住这档假红。profiles
+	// 无历史表无法定位改写时刻（同 judgeEvolve 的超集不可验证限制），出现时以
+	// Detail 里的期望串人工比对窗口内 prompt 即可辨认。
 	injSince := since
 	if prof != nil && prof.CreatedAt.After(injSince) {
 		injSince = prof.CreatedAt
@@ -171,7 +177,7 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 		return rep, err
 	}
 	// 期望负面句必须由 profilehint 亲自算（见 profilehint.NegTail 的注释）。
-	if rep.NegTail, err = st.GetNegTailStat(ctx, since, profilehint.NegTail(prof)); err != nil {
+	if rep.NegTail, err = st.GetNegTailStat(ctx, injSince, profilehint.NegTail(prof)); err != nil {
 		return rep, err
 	}
 	if rep.Costs, err = st.ListSpanDayCosts(ctx, since); err != nil {
