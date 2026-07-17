@@ -200,8 +200,14 @@ func BuildDeliveryCard(input feedback.CardInput) string {
 				},
 				map[string]any{
 					"tag":  "button",
-					"text": map[string]any{"tag": "plain_text", "content": "提交"},
-					"type": "primary",
+					// form 内的交互组件必须有 name（缺失报 200530）；且 form 容器要求
+					// 至少一个 form_action_type=submit 的提交按钮——缺失时整卡非法：
+					// 发消息被拒（300123），作为回调响应返回则客户端报 200673
+					//（"返回了错误的卡片"），按钮永久转圈且回调被重推。
+					"name":             "submit_reason",
+					"form_action_type": "submit",
+					"text":             map[string]any{"tag": "plain_text", "content": "提交"},
+					"type":             "primary",
 					"behaviors": []any{map[string]any{
 						"type": "callback",
 						"value": map[string]any{

@@ -326,3 +326,51 @@ func TestBuildDeliveryCardStateLinePlacement(t *testing.T) {
 		}
 	})
 }
+
+// TestBuildDeliveryCardFormSubmitButton 钉死 👎 后误判表单的提交按钮合法性
+// （2026-07-17 实测定位的 200673 根因）：飞书要求 form 容器内至少有一个
+// form_action_type=submit 的提交按钮，且 form 内交互组件必须有非空 name
+// （缺 name 报 200530）。缺失时整卡非法——发消息被拒（300123 "there is no
+// submit button in the form container"），作为回调响应返回则客户端报
+// 200673「返回了错误的卡片」，按钮永久转圈、回调被飞书重推。
+func TestBuildDeliveryCardFormSubmitButton(t *testing.T) {
+	raw := BuildDeliveryCard(feedback.CardInput{
+		BodyMD: "正文", DeliveryID: 7,
+		State: feedback.CardState{Preference: types.FeedbackActionNotInterested},
+	})
+	card := decodeDeliveryCard(t, raw)
+	if len(card.Body.Elements) != 4 {
+		t.Fatalf("body.elements 长度 = %d, 期望 4（markdown + column_set + 状态行 + 误判表单）",
+			len(card.Body.Elements))
+	}
+
+	var form struct {
+		Tag      string `json:"tag"`
+		Name     string `json:"name"`
+		Elements []struct {
+			Tag            string `json:"tag"`
+			Name           string `json:"name"`
+			FormActionType string `json:"form_action_type"`
+		} `json:"elements"`
+	}
+	if err := json.Unmarshal(card.Body.Elements[3], &form); err != nil {
+		t.Fatalf("解析 form 元素失败: %v", err)
+	}
+	if form.Tag != "form" || form.Name == "" {
+		t.Fatalf("form 元素 = {tag:%q, name:%q}, 期望 tag=\"form\" 且 name 非空", form.Tag, form.Name)
+	}
+
+	var hasSubmit bool
+	for _, el := range form.Elements {
+		// form 内所有交互组件（input/button）都必须有非空 name（200530）。
+		if el.Name == "" {
+			t.Errorf("form 内 %q 组件缺 name", el.Tag)
+		}
+		if el.Tag == "button" && el.FormActionType == "submit" {
+			hasSubmit = true
+		}
+	}
+	if !hasSubmit {
+		t.Errorf("form 内没有 form_action_type=\"submit\" 的提交按钮（整卡会被飞书判非法）")
+	}
+}
