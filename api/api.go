@@ -83,6 +83,9 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	// M7 推送历史端点（功能 6.4）：只读，回溯每条推送的打分、状态与反馈。
 	inner.HandleFunc("GET /api/deliveries", s.handleListDeliveries)
 
+	// M7 运行统计端点（功能 6.5）：只读，成本/token/延迟/缓存按 span 聚合。
+	inner.HandleFunc("GET /api/admin/runstats", s.handleRunstats)
+
 	mux.Handle("/api/", s.requireSession(inner))
 }
 
