@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -33,6 +34,8 @@ import (
 	"github.com/YouToco/vane/dedup"
 	"github.com/YouToco/vane/types"
 )
+
+var htmlTagRe = regexp.MustCompile(`<[a-zA-Z/!]`)
 
 // errBlockedDial 是连接阶段命中私网地址时 Dialer.Control 返回的哨兵。
 // 之所以单独定义：Control 触发时机在 http.Client 内部，只能通过 error 冒泡，
@@ -393,6 +396,12 @@ func finalize(src types.Source, item *types.ContentItem) bool {
 	if item.CanonicalKey == "" {
 		slog.Warn("fetcher: 内容缺少身份字段，跳过该条",
 			"source_id", src.ID, "platform", src.Platform, "url", item.URL, "title", item.Title)
+		return false
+	}
+
+	if htmlTagRe.MatchString(item.Content) {
+		slog.Warn("fetcher: 正文含裸 HTML，抽取未在指纹之前完成（契约 §12.3），跳过该条",
+			"source_id", src.ID, "url", item.URL, "title", item.Title)
 		return false
 	}
 

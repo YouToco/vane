@@ -206,3 +206,50 @@ func TestBuildLegacy_UnknownType(t *testing.T) {
 		t.Error("未知 type 应被拒绝")
 	}
 }
+
+func TestBuild_WebPageWatch(t *testing.T) {
+	src, msg := Build(Spec{
+		Platform:   "web",
+		Capability: "page_watch",
+		Params:     map[string]string{"url": "https://example.com/pricing"},
+	})
+	if msg != "" {
+		t.Fatalf("合法 web/page_watch 请求不应报错: %s", msg)
+	}
+	if src.Platform != types.PlatformWeb || src.Capability != types.CapPageWatch {
+		t.Errorf("应为 web/page_watch，实际 %s/%s", src.Platform, src.Capability)
+	}
+	if src.URL != "https://example.com/pricing" {
+		t.Errorf("URL 应为原始地址: %q", src.URL)
+	}
+	if src.Title != "监控: example.com/pricing" {
+		t.Errorf("默认 Title 不符: %q", src.Title)
+	}
+}
+
+func TestBuild_WebPageWatchRejectsBadURL(t *testing.T) {
+	for _, u := range []string{"", "ftp://x.com/page", "not-a-url"} {
+		if _, msg := Build(Spec{
+			Platform:   "web",
+			Capability: "page_watch",
+			Params:     map[string]string{"url": u},
+		}); msg == "" {
+			t.Errorf("URL %q 应被拒绝", u)
+		}
+	}
+}
+
+func TestBuild_WebPageWatchCustomTitle(t *testing.T) {
+	src, msg := Build(Spec{
+		Platform:   "web",
+		Capability: "page_watch",
+		Params:     map[string]string{"url": "https://example.com/pricing"},
+		Title:      "竞品定价",
+	})
+	if msg != "" {
+		t.Fatalf("不应报错: %s", msg)
+	}
+	if src.Title != "竞品定价" {
+		t.Errorf("自定义 Title 未生效: %q", src.Title)
+	}
+}

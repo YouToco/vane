@@ -75,6 +75,18 @@ type ContentItem struct {
 	CreatedAt    time.Time  `json:"created_at"`
 }
 
+// PageSnapshot page_watch 的页面快照（page_snapshots 表）。
+// 仅在 content_hash 变化时插入新行，verdict 标识门判结果。
+type PageSnapshot struct {
+	ID            int64           `json:"id"`
+	SourceID      int64           `json:"source_id"`
+	CanonicalKey  string          `json:"canonical_key"`  // watchKey(url, prevHash, newHash)
+	ContentHash   string          `json:"content_hash"`   // sha256(extracted_text)
+	ExtractedText string          `json:"extracted_text"`
+	Verdict       SnapshotVerdict `json:"verdict"`
+	FirstSeenAt   time.Time       `json:"first_seen_at"`
+}
+
 // PipelineCounts 是一次 pipeline 的漏斗快照（push_batches.stage_counts，JSONB）：
 // 每一步**跑完之后还剩几条**。它把"抓到 20 条但全被去重掉"与"压根没抓到新内容"
 // 这两种在库里此前完全同形（都是零行）的结局区分开。

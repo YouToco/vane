@@ -149,10 +149,10 @@ func (s *Store) GetContentItem(ctx context.Context, id int64) (*types.ContentIte
 	var ci types.ContentItem
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, source_id, external_id, canonical_key, url, title, content, author,
-		        published_at, content_hash, simhash, fetched_at, created_at
+		        published_at, content_hash, simhash, fetched_at, created_at, kind
 		 FROM content_items WHERE id = $1`, id).Scan(
 		&ci.ID, &ci.SourceID, &ci.ExternalID, &ci.CanonicalKey, &ci.URL, &ci.Title, &ci.Content,
-		&ci.Author, &ci.PublishedAt, &ci.ContentHash, &ci.Simhash, &ci.FetchedAt, &ci.CreatedAt,
+		&ci.Author, &ci.PublishedAt, &ci.ContentHash, &ci.Simhash, &ci.FetchedAt, &ci.CreatedAt, &ci.Kind,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
