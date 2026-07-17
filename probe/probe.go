@@ -159,7 +159,15 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 	if rep.ScoreDistribution, err = st.ListScoreDistribution(ctx, since); err != nil {
 		return rep, err
 	}
-	if rep.Injection, err = st.GetProfileInjectionStat(ctx, since); err != nil {
+	// 注入统计的窗口起点钳到画像创建时刻：画像存在**之前**的打分写「暂无」是
+	// 正确行为，计入 Absent 会让首采后的头 24h 恒报假击穿（2026-07-17 生产实锤：
+	// 画像 02:37 UTC 建立，探针把 18:53–00:30 的 142 条历史「暂无」判成红线击穿，
+	// 而画像建立后 52 条全部注入正常、profilehint WARN 零条）。
+	injSince := since
+	if prof != nil && prof.CreatedAt.After(injSince) {
+		injSince = prof.CreatedAt
+	}
+	if rep.Injection, err = st.GetProfileInjectionStat(ctx, injSince); err != nil {
 		return rep, err
 	}
 	// 期望负面句必须由 profilehint 亲自算（见 profilehint.NegTail 的注释）。
@@ -321,6 +329,7 @@ func judgeInjection(in types.ProfileInjectionStat, hasProfile bool) Result {
 		r.Status = StatusRed
 		r.Summary = fmt.Sprintf("owner 有画像，却有 %d/%d 条打分拿到「暂无」", in.Absent, in.Total)
 		r.Detail = "画像注入在这些调用上失效了——打分退化成通用资讯价值判断。" +
+			"（统计窗口已钳到画像创建时刻之后，这些「暂无」不是首采前的历史遗留。）" +
 			"配套查降级 WARN：journalctl -u vane --since … | grep 'profilehint: 画像读取失败'。" +
 			"注意 WARN 每 trace 最多一条（画像按 traceID 锁内只取一次），" +
 			"50 条降级的打分只会产生 1 行日志，别指望条数对得上。" +
