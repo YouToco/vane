@@ -32,6 +32,7 @@ type Config struct {
 	Log      LogConfig      `mapstructure:"log"`
 
 	Dashboard DashboardConfig `mapstructure:"dashboard"`
+	A2A       A2AConfig       `mapstructure:"a2a"`
 }
 
 // ServerConfig 是 HTTP 服务配置。
@@ -110,6 +111,17 @@ type DashboardConfig struct {
 	Password string `mapstructure:"password"`
 }
 
+// A2AConfig 是 A2A server 配置（a2a-contract §6）。
+type A2AConfig struct {
+	// Enabled 默认 false：未显式开启时 main.go 不 Mount，零新增暴露面。
+	Enabled bool `mapstructure:"enabled"`
+	// Token 环境变量 VANE_A2A_TOKEN；本体存 YouToco/my-credentials，绝不入库。
+	// 为空时照常挂载、auth 恒 401、Mount 时 slog.Warn 一次（Dashboard Password 先例）。
+	Token string `mapstructure:"token"`
+	// BaseURL 是对外 A2A endpoint，进 AgentCard supportedInterfaces。
+	BaseURL string `mapstructure:"base_url"`
+}
+
 // sensitiveKeys 需要显式 BindEnv：Viper 的 AutomaticEnv 只对"已知键"
 // （有默认值或出现在配置文件中）生效，纯环境变量运行时嵌套敏感键会漏读。
 var sensitiveKeys = []string{
@@ -120,6 +132,7 @@ var sensitiveKeys = []string{
 	"fetch.tikhub_api_key",
 	"fetch.exa_api_key",
 	"dashboard.password",
+	"a2a.token",
 }
 
 // Load 加载配置并校验。
@@ -187,6 +200,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("agent.session_ttl_minutes", 30)
 
 	v.SetDefault("log.level", "info")
+
+	// a2a：enabled/base_url 有默认值使 AutomaticEnv 认识对应环境变量；
+	// token 无默认值，走 sensitiveKeys 显式 BindEnv（契约 §6"三处缺一不可"）。
+	v.SetDefault("a2a.enabled", false)
+	v.SetDefault("a2a.base_url", "https://api.vane.zhuoqidev.com/a2a")
 }
 
 // readConfigFile 按 Load 的规则定位并读取配置文件。

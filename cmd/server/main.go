@@ -17,6 +17,7 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 
+	"github.com/YouToco/vane/a2a"
 	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/api"
 	"github.com/YouToco/vane/cardgen"
@@ -33,6 +34,10 @@ import (
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/workflow"
 )
+
+// vaneVersion 是服务版本串（进 A2A AgentCard.version，a2a-contract §7）。
+// 值 = CHANGELOG 最上方已发布版本号，随发版手动同步；不为此新增 ldflags 基建。
+const vaneVersion = "0.5.0"
 
 func main() {
 	if err := run(); err != nil {
@@ -179,6 +184,20 @@ func run() error {
 		Scheduler: sched,
 		Password:  cfg.Dashboard.Password,
 	})
+
+	// A2A server（a2a-contract §7）：enabled=false 时不 Mount——/a2a 与
+	// agent-card 路径在 mux 上根本不存在（404），零新增暴露面。
+	if cfg.A2A.Enabled {
+		if err := a2a.Mount(mux, a2a.Deps{
+			Storage: st,
+			Content: st,
+			Token:   cfg.A2A.Token,
+			BaseURL: cfg.A2A.BaseURL,
+			Version: vaneVersion,
+		}); err != nil {
+			return fmt.Errorf("挂载 A2A server: %w", err)
+		}
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,

@@ -34,6 +34,10 @@ type fakeStore struct {
 	batches []types.PushBatchSummary
 	profile *types.Profile
 
+	// P-A2A（a2a-contract §10）：计数与注入错误位。
+	a2aCount int64
+	a2aErr   error
+
 	// 回声位：记录 Run 实际传下来的参数，用于断言窗口与期望串没接反。
 	gotSince      time.Time
 	gotInjSince   time.Time
@@ -93,6 +97,13 @@ func (f *fakeStore) GetProfile(context.Context, int64) (*types.Profile, error) {
 		return nil, types.ErrNotFound
 	}
 	return f.profile, nil
+}
+
+func (f *fakeStore) CountA2ATasks(context.Context) (int64, error) {
+	if f.a2aErr != nil {
+		return 0, f.a2aErr
+	}
+	return f.a2aCount, nil
 }
 
 // checkStatus 断言判定状态，失败时连 Summary 一起打印——Summary 是给 Boss 看的人话，
@@ -598,9 +609,10 @@ func TestRun_WiringAndWindows(t *testing.T) {
 		t.Errorf("UserID 应回填 7，实际 %d", rep.UserID)
 	}
 
-	// 7 条判定齐全且 ID 唯一——看板与 cmd/gate 都按 ID 索引。
-	if len(rep.Results) != 7 {
-		t.Fatalf("应产出 7 条判定，实际 %d", len(rep.Results))
+	// 8 条判定齐全且 ID 唯一——看板与 cmd/gate 都按 ID 索引
+	//（M5 七条 + P-A2A，a2a-contract §10）。
+	if len(rep.Results) != 8 {
+		t.Fatalf("应产出 8 条判定，实际 %d", len(rep.Results))
 	}
 	seen := map[string]bool{}
 	for _, r := range rep.Results {

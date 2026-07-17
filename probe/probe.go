@@ -59,6 +59,7 @@ type Store interface {
 	GetEvolveCallStat(ctx context.Context, userID int64, since time.Time) (types.EvolveCallStat, error)
 	ListPushBatchSummaries(ctx context.Context, userID int64, since time.Time, limit int) ([]types.PushBatchSummary, error)
 	GetProfile(ctx context.Context, userID int64) (*types.Profile, error)
+	CountA2ATasks(ctx context.Context) (int64, error)
 }
 
 // 契约 §16 固化的阈值。改这里等于改契约——改之前先改文档。
@@ -211,8 +212,32 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 		judgeNegTail(rep.NegTail),
 		judgeCost(rep.Costs),
 		judgeEvolve(rep.Evolve),
+		judgeA2ATasks(ctx, st),
 	}
 	return rep, nil
+}
+
+// judgeA2ATasks 探针 P-A2A（a2a-contract §10）：CountA2ATasks 查询成功（含 0 行）
+// = green（migration 013 落位、表可读）；查询报错 = red。无 yellow——表存在性与
+// 数据量无关。**刻意偏离既有模式**：其余探针的 Store 报错会 return (rep, err) 中断
+// 整轮（cmd/gate 计 exit 2 = "探针坏了"）；本探针的报错就地记 StatusRed（exit 1）——
+// 表缺失/不可读正是本探针要报告的产品事实，不是探针自身故障。
+func judgeA2ATasks(ctx context.Context, st Store) Result {
+	res := Result{
+		ID:          "P-A2A",
+		Name:        "A2A 任务表可读",
+		ContractRef: "a2a-contract §10",
+	}
+	n, err := st.CountA2ATasks(ctx)
+	if err != nil {
+		res.Status = StatusRed
+		res.Summary = "a2a_tasks 查询失败"
+		res.Detail = fmt.Sprintf("CountA2ATasks 报错：%v——检查 migration 013 是否落位、表是否可读", err)
+		return res
+	}
+	res.Status = StatusGreen
+	res.Summary = fmt.Sprintf("a2a_tasks 可读，现存 %d 条任务", n)
+	return res
 }
 
 // judgeDiscrimination 探针 ①：任一批 n≥5 且 distinct=1 → 立即回滚排查。
