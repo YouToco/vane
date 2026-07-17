@@ -27,7 +27,26 @@ const SCOPES: { scope: string; desc: string }[] = [
   { scope: "im:message.p2p_msg:readonly", desc: "接收单聊消息" },
   { scope: "im:message.group_at_msg:readonly", desc: "接收群 @ 消息" },
   { scope: "im:message:send_as_bot", desc: "以应用身份发消息（含卡片）" },
+  { scope: "im:message:readonly", desc: "获取单聊/群组消息（引用消息等）" },
+  { scope: "im:message", desc: "获取与发送消息（已读状态等）" },
+  { scope: "im:message.reactions:read", desc: "查看消息表情回复" },
+  { scope: "im:message.reactions:write_only", desc: "发送/删除表情回复" },
+  { scope: "im:chat.access_event.bot_p2p_chat:read", desc: "订阅机器人会话事件" },
 ];
+
+const EVENTS: { event: string; desc: string }[] = [
+  { event: "im.message.receive_v1", desc: "接收消息" },
+  { event: "im.message.message_read_v1", desc: "消息已读" },
+  { event: "im.message.reaction.created_v1", desc: "消息被 Reaction" },
+  { event: "im.message.reaction.deleted_v1", desc: "消息被取消 Reaction" },
+  { event: "im.message.recalled_v1", desc: "消息撤回" },
+  { event: "im.chat.access_event.bot_p2p_chat_entered_v1", desc: "用户进入机器人会话" },
+];
+
+function buildPermissionUrl(appId: string): string {
+  const scopes = SCOPES.map((s) => s.scope).join(",");
+  return `https://open.feishu.cn/app/${appId}/auth?q=${encodeURIComponent(scopes)}&token_type=tenant&op_from=openapi`;
+}
 
 // 复制到剪贴板：优先 Clipboard API（生产是 HTTPS，可用），
 // 本地 http 开发等非安全上下文降级到 execCommand
@@ -250,12 +269,40 @@ export default function FeishuSetup() {
       </StepCard>
 
       <StepCard index={2} title="开通权限" done={done[2]} open={isOpen(2)} onToggle={() => toggle(2)}>
-        <p>在应用的「权限管理」页面，逐条搜索并添加以下权限（点右侧按钮复制）：</p>
-        <div className="copy-list">
-          {SCOPES.map((s) => (
-            <CopyRow key={s.scope} text={s.scope} desc={s.desc} />
-          ))}
-        </div>
+        {appId.trim().startsWith("cli_") ? (
+          <>
+            <p>
+              点击下方按钮一键打开权限配置页，在弹出的对话框中全选后点「确认开通权限」：
+            </p>
+            <div className="btn-row">
+              <a
+                className="btn btn-primary"
+                href={buildPermissionUrl(appId.trim())}
+                target="_blank"
+                rel="noreferrer"
+              >
+                一键配置全部权限
+              </a>
+            </div>
+            <details className="scope-details">
+              <summary className="muted">需要开通的 {SCOPES.length} 项权限</summary>
+              <div className="copy-list">
+                {SCOPES.map((s) => (
+                  <CopyRow key={s.scope} text={s.scope} desc={s.desc} />
+                ))}
+              </div>
+            </details>
+          </>
+        ) : (
+          <>
+            <p>请先在第 3 步填入 App ID（cli_ 开头），即可生成一键配置链接。也可手动逐条搜索添加：</p>
+            <div className="copy-list">
+              {SCOPES.map((s) => (
+                <CopyRow key={s.scope} text={s.scope} desc={s.desc} />
+              ))}
+            </div>
+          </>
+        )}
         <button
           type="button"
           className={"btn " + (done[2] ? "btn-ghost" : "btn-primary")}
@@ -329,7 +376,9 @@ export default function FeishuSetup() {
           <li>在「已添加事件」中添加以下事件：</li>
         </ol>
         <div className="copy-list">
-          <CopyRow text="im.message.receive_v1" desc="接收消息事件" />
+          {EVENTS.map((e) => (
+            <CopyRow key={e.event} text={e.event} desc={e.desc} />
+          ))}
         </div>
         <ol className="step-list" start={4}>
           <li>进入「版本管理与发布」，创建版本并发布（企业自建应用一般即时生效）。</li>
