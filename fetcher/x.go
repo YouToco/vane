@@ -190,6 +190,7 @@ func tweetToItem(tw twitterTweet, fallbackScreenName string) *types.ContentItem 
 			URL:         "https://x.com/" + author + "/status/" + rt.TweetID,
 			Author:      author,
 			PublishedAt: parseTwitterTime(rt.CreatedAt),
+			Kind:        types.KindArticle, // 一条推文是"一篇内容"（M6 契约 §7.2(b)：构造处赋值，finalize 只校验）
 		}
 	}
 
@@ -205,6 +206,7 @@ func tweetToItem(tw twitterTweet, fallbackScreenName string) *types.ContentItem 
 		URL:         "https://x.com/" + author + "/status/" + tw.TweetID,
 		Author:      author,
 		PublishedAt: parseTwitterTime(tw.CreatedAt),
+		Kind:        types.KindArticle, // 同上：原创/引用/回复同样是"一篇内容"
 	}
 }
 
