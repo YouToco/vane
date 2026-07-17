@@ -1334,3 +1334,44 @@ a:hover {
     flex-direction: column;
   }
 }
+
+/* ---------- 推送历史页（M7 功能 6.4） ---------- */
+
+/* 正向反馈徽标：绿只给"用户明确说了喜欢"这类事实陈述，不用于系统状态
+   （状态列的绿灯纪律见 History.tsx 的 statusBadge 注释）。 */
+.badge-ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+/* 标题列限宽截断：正文头回退的标题可长达 200 字符，不限宽会把表格挤瘫。
+   截断套在内层 a/span 而非 td：table-layout:auto 下 td 的 max-width 被表格
+   布局算法忽略（实测第二行 200 字符正文头把整表撑出横向滚动），
+   inline-block 的内层元素才真正受 max-width 约束。 */
+.hist-title-cell a,
+.hist-title-cell span {
+  display: inline-block;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+/* 一条投递可有多个反馈动作（👎 → 误判 → 翻转 👍 是真实序列），横排可换行 */
+.hist-feedbacks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+/* 误判原因等文字反馈内嵌在徽标里，与动作标签用间距区分；完整时间戳在 title 提示 */
+.hist-fb-detail {
+  margin-left: 4px;
+  font-weight: 400;
+  opacity: 0.85;
+}
+.hist-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}

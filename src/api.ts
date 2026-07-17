@@ -207,6 +207,37 @@ export interface ObservabilityReport {
   batches: PushBatchSummary[];
 }
 
+// ---- M7 推送历史（功能 6.4）----
+// 字段逐字对齐后端 store.DeliveryHistoryItem / api.deliveriesResp 的 json tag。
+
+// 一条投递上的一次反馈动作。action 是后端 FeedbackAction 原文。
+export interface DeliveryFeedback {
+  action: string; // interested / not_interested / misjudged / deep_dive / question
+  detail: string; // 文字反馈原文，按钮反馈为空串
+  created_at: string; // UTC
+}
+
+// 推送历史一行：投递本体 + 内容摘要 + 全部反馈。
+// title 后端已做空标题回退（正文头 200 字符），前端不需要再兜底；
+// content_item 被删时 title/url 均为空串。
+export interface DeliveryHistoryItem {
+  id: number;
+  batch_id: number;
+  score: number;
+  status: string; // pending / sent / failed
+  sent_at?: string; // UTC；未发送时缺席
+  created_at: string; // UTC
+  title: string;
+  url: string;
+  feedbacks: DeliveryFeedback[];
+}
+
+export interface DeliveriesResp {
+  items: DeliveryHistoryItem[];
+  total: number;
+  next_page_token?: string;
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -337,6 +368,21 @@ export const api = {
     post<{ source_id: number }>("/api/subscriptions", req),
   removeSubscription: (sourceId: number) =>
     request<{ ok: boolean }>(`/api/subscriptions/${sourceId}`, { method: "DELETE" }),
+
+  // ---- M7 推送历史（功能 6.4）----
+  // 键集分页：pageToken 是后端不透明游标，前端只负责原样带回。
+  // items/feedbacks 用 arr 收敛 Go nil-slice 的 null（后端首页为空时 items 已保证 []，
+  // 但防御性收敛零成本，与全站策略一致）。
+  listDeliveries: (pageSize?: number, pageToken?: string) => {
+    const params = new URLSearchParams();
+    if (pageSize) params.set("page_size", String(pageSize));
+    if (pageToken) params.set("page_token", pageToken);
+    const qs = params.toString();
+    return request<DeliveriesResp>(`/api/deliveries${qs ? "?" + qs : ""}`).then((r) => ({
+      ...r,
+      items: arr(r.items).map((it) => ({ ...it, feedbacks: arr(it.feedbacks) })),
+    }));
+  },
 
   // ---- M5 Gate 可观测性（契约 §16）----
   // 只读端点，窗口由前端固化档位给（见 Observability.tsx 的 WINDOW_OPTIONS），

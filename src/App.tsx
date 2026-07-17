@@ -6,6 +6,7 @@ import FeishuSetup from "./pages/FeishuSetup";
 import Schedules from "./pages/Schedules";
 import Sources from "./pages/Sources";
 import Observability from "./pages/Observability";
+import History from "./pages/History";
 
 // hash 微型路由：不引 react-router（契约禁止新依赖），
 // 两三个页面用 hashchange 监听足够，还天然兼容静态托管的 SPA 回退。
@@ -30,6 +31,8 @@ function renderPage(hash: string) {
       return <Sources />;
     case "#/observability":
       return <Observability />;
+    case "#/history":
+      return <History />;
     default:
       return <Home />;
   }
@@ -85,6 +88,9 @@ function Shell({ hash }: { hash: string }) {
           </a>
           <a className={hash === "#/sources" ? "nav-link nav-active" : "nav-link"} href="#/sources">
             信源
+          </a>
+          <a className={hash === "#/history" ? "nav-link nav-active" : "nav-link"} href="#/history">
+            推送历史
           </a>
           <a className={hash === "#/setup" ? "nav-link nav-active" : "nav-link"} href="#/setup">
             飞书接入
