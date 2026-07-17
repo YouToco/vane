@@ -200,6 +200,8 @@ func extractTableText(html []byte) (string, error) {
 		return "", err
 	}
 
+	doc.Find("script, style, noscript").Remove()
+
 	var lines []string
 	doc.Find("tr").Each(func(_ int, tr *goquery.Selection) {
 		var cells []string

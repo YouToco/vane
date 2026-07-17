@@ -74,6 +74,24 @@ func TestExtractTableText_NoTable(t *testing.T) {
 	}
 }
 
+func TestExtractTableText_StripsScriptStyleNoscript(t *testing.T) {
+	html := []byte(`<html><head><style>body{color:red}</style></head><body>
+		<script>alert("xss")</script>
+		<noscript>Enable JS</noscript>
+		<p>Visible content</p>
+	</body></html>`)
+	got, err := extractTableText(html)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if strings.Contains(got, "color:red") || strings.Contains(got, "alert") || strings.Contains(got, "Enable JS") {
+		t.Errorf("应剥离 script/style/noscript 内容: %q", got)
+	}
+	if !strings.Contains(got, "Visible content") {
+		t.Errorf("应保留可见内容: %q", got)
+	}
+}
+
 func TestSimpleDiff(t *testing.T) {
 	old := "Plan | Price\nFree | $0\nPro | $20"
 	new := "Plan | Price\nFree | $0\nPro | $25"
