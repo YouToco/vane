@@ -238,6 +238,33 @@ export interface DeliveriesResp {
   next_page_token?: string;
 }
 
+// ---- M7 成本与运行监控（功能 6.5）----
+// 字段逐字对齐后端 store.SpanRunStat / api.runstatsResp 的 json tag。
+
+// 一个 span 的窗口运行统计。cache_known 是缓存命中率的分母
+// （prefix_cache_hit 非 NULL 的行数）——NULL 行既不算命中也不算未命中，
+// 用 calls 当分母会把"不支持缓存的调用"算成未命中，凭空压低命中率。
+export interface SpanRunStat {
+  span_name: string;
+  calls: number;
+  errors: number;
+  cost_usd: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  avg_latency_ms: number;
+  p95_latency_ms: number;
+  cache_hits: number;
+  cache_known: number;
+}
+
+export interface RunstatsResp {
+  generated_at: string; // UTC
+  window_hours: number;
+  spans: SpanRunStat[];
+  days: SpanDayCost[];
+  models: ModelUsage[];
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -383,6 +410,13 @@ export const api = {
       items: arr(r.items).map((it) => ({ ...it, feedbacks: arr(it.feedbacks) })),
     }));
   },
+
+  // ---- M7 成本与运行监控（功能 6.5）----
+  // 窗口由前端固化档位给（Costs.tsx 的 WINDOW_OPTIONS），与 observability 同策略。
+  runstats: (windowHours: number) =>
+    request<RunstatsResp>(
+      `/api/admin/runstats?window_hours=${encodeURIComponent(windowHours)}`,
+    ).then((r) => ({ ...r, spans: arr(r.spans), days: arr(r.days), models: arr(r.models) })),
 
   // ---- M5 Gate 可观测性（契约 §16）----
   // 只读端点，窗口由前端固化档位给（见 Observability.tsx 的 WINDOW_OPTIONS），

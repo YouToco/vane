@@ -6,6 +6,7 @@ import FeishuSetup from "./pages/FeishuSetup";
 import Schedules from "./pages/Schedules";
 import Sources from "./pages/Sources";
 import Observability from "./pages/Observability";
+import Costs from "./pages/Costs";
 import History from "./pages/History";
 
 // hash 微型路由：不引 react-router（契约禁止新依赖），
@@ -33,6 +34,8 @@ function renderPage(hash: string) {
       return <Observability />;
     case "#/history":
       return <History />;
+    case "#/costs":
+      return <Costs />;
     default:
       return <Home />;
   }
@@ -100,6 +103,9 @@ function Shell({ hash }: { hash: string }) {
             href="#/observability"
           >
             可观测
+          </a>
+          <a className={hash === "#/costs" ? "nav-link nav-active" : "nav-link"} href="#/costs">
+            成本
           </a>
         </nav>
         <button type="button" className="btn btn-mini btn-ghost" onClick={onLogout}>
