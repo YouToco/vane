@@ -1,7 +1,7 @@
 # A2A 契约：vane 作为 Agent2Agent Server（第一期 content.query）
 
 > 本文件是 A2A 集成并行实现的**唯一契约**。所有签名/JSON/表结构以此为准，实现中发现契约错误不得自行变更——记录到交付报告，由主控裁决。
-> 事实基准：worktree @ ada0f6e（origin/main，2026-07-16 重新核实全部代码事实——方案定稿后 main 又前进，migration 编号与 wantTables 欠账均与方案原文不同，见 §2/§9.5）。
+> 事实基准：worktree @ ada0f6e（origin/main，2026-07-16 重新核实全部代码事实——方案定稿后 main 又前进，migration 编号与 wantTables 欠账均与方案原文不同，见 §2/§9.5）。2026-07-17 复核 @ e2136d5：012 已被 kind_backfill 占用，A2A migration 顺延为 **013**（§2）；wantTables 欠账清单不变（012 为纯回填不建表）。
 > 设计过程：多 agent 调研 → 双怀疑者对抗审查（2×CRITICAL+12×MINOR 全处置）→ Boss 拍板 8 项（§13）→ 契约起草期双怀疑者再审（5×CRITICAL+7×MINOR，全部处置，见 §14）。方案全文在 workmemory `work/2026/2026-07-16-自研-见微Vane-A2A协议集成调研/a2a-integration-plan.md`。
 
 ## 0. 背景与范围
@@ -33,12 +33,12 @@ A2A（Agent2Agent，LF 治理）是 agent 间互操作协议：server 发布 Age
   4. 升级流程：读 release notes → 全量测试 + a2aclient 互通 smoke（§9.4）→ 才合并；须 pin main commit 时在 go.mod 注释注明原因与回钉计划；
   5. PR-2 引入依赖时跑 `go list -deps ./a2a/...` 实测 JSON-RPC 路径依赖面，结果记入 PR 描述（方案预期第三方仅 google/uuid，待实证）。
 
-## 2. migration `store/migrations/012_a2a.sql`
+## 2. migration `store/migrations/013_a2a.sql`
 
-编号 **012**：worktree 现状为 001-009 + 011（010 空缺、011 已被 page_snapshots 占用——方案原文"011_a2a"已过时）。合并前再核目录取最大号 +1。
+编号 **013**：origin/main @ e2136d5 现状为 001-009 + 011 + 012（010 空缺；011=page_snapshots、012=kind_backfill——方案原文"011_a2a"与契约初稿"012_a2a"均已被占）。**合并前再核目录取最大号 +1**：goose provider 默认拒绝乱序迁移（低于库内已应用最大版本号的新迁移会让启动迁移直接报错，012_kind_backfill.sql 头注释先例），空缺号 010 不可回填。
 
 ```sql
--- 012: A2A server 任务持久化（a2a-contract §2）
+-- 013: A2A server 任务持久化（a2a-contract §2）
 -- +goose Up
 CREATE TABLE a2a_tasks (
     id         TEXT PRIMARY KEY,           -- 服务端生成 taskId（SDK uuid），不可由客户端指定
@@ -61,7 +61,7 @@ DROP TABLE a2a_tasks;
 ## 3. types 新实体（`types/entities.go` 追加，仿 AgentSession 注释风格）
 
 ```go
-// A2ATask 是 A2A server 任务（a2a_tasks 表，migration 012）。Task 列是 SDK a2a.Task 的
+// A2ATask 是 A2A server 任务（a2a_tasks 表，migration 013）。Task 列是 SDK a2a.Task 的
 // ProtoJSON 权威载荷（store 层不解析）；ID/ContextID/Status 是提取列。SDK 类型不出 a2a/ 包
 //（隔离原则，同 agent.Store 窄接口先例），store 层只见本类型。
 type A2ATask struct {
@@ -424,7 +424,7 @@ if cfg.A2A.Enabled {
 
 ### 9.5 守卫层
 
-- **wantTables 补账**（store/migrate_test.go 现停在 11 张表，实际欠 4 张——比方案原文多出 007 的 content_sources）：补 `agent_sessions`、`pending_actions`（005）、`content_sources`（007）、`page_snapshots`（011），并加 `a2a_tasks`（012）；**加对账守卫**：扫 store/migrations/*.sql 的 `CREATE TABLE` 名集合与 wantTables 集合比对，漏一张 CI 红——守卫自 M4 起失守，一次性堵死。
+- **wantTables 补账**（store/migrate_test.go 现停在 11 张表，实际欠 4 张——比方案原文多出 007 的 content_sources）：补 `agent_sessions`、`pending_actions`（005）、`content_sources`（007）、`page_snapshots`（011），并加 `a2a_tasks`（013；012=kind_backfill 纯回填不建表）；**加对账守卫**：扫 store/migrations/*.sql 的 `CREATE TABLE` 名集合与 wantTables 集合比对，漏一张 CI 红——守卫自 M4 起失守，一次性堵死。
 - probe/literals_test.go 模式：正则钉 card skill id 与 executor 的 skill 比较常量（§5.4 REJECTED 判定用的 `content.query` 字面量）一致。
 - enabled=false 的 404 断言 + 装配项守卫（workflow/registration_test.go 反射守卫先例）。
 
@@ -455,7 +455,7 @@ if cfg.A2A.Enabled {
 | PR | 范围 | 验收标准 | 对抗审查 |
 |---|---|---|---|
 | **PR-1 契约** | 本文档 | changelog 核对结论在案（§1）；全部签名级接口就位；拍板记录在案（§13） | **是**（契约级，仿 M5 双怀疑者） |
-| **PR-2 存储** | migration 012 + types.A2ATask + store/a2a_tasks.go + SearchContentItems + 基准 + wantTables 补账（4 张欠账 + a2a_tasks + 对账守卫）+ §9.3 门控测试 | 门控测试全绿；基准数据附 PR；**纯 store 层，零 SDK import**；无公网面变化 | 否（常规 review） |
+| **PR-2 存储** | migration 013 + types.A2ATask + store/a2a_tasks.go + SearchContentItems + 基准 + wantTables 补账（4 张欠账 + a2a_tasks + 对账守卫）+ §9.3 门控测试 | 门控测试全绿；基准数据附 PR；**纯 store 层，零 SDK import**；无公网面变化 | 否（常规 review） |
 | **PR-3 服务端** | a2a/ 包全部（含 taskstore.go 适配）+ config 段 + main.go 装配 + probe P-A2A + `go list -deps` 实测记录 | §9.1/9.2/9.4/9.5 全绿；enabled=false 时 `/a2a` 与 card 404 + 守卫绿 + 既有测试全绿；enabled=true 验证窗口：VPS 部署后探针绿 + 真人 ①-⑥⑧ 过 | **是**（公网暴露面 + 认证 + 错误卫生） |
 | **PR-infra Caddyfile** | 主域 vane.zhuoqidev.com 块内、SPA handle 之前加 `handle /.well-known/* { reverse_proxy localhost:8080 }`（现状 try_files 把该路径回落 index.html） | 合并后主域 card 可达、SPA 路由不回归；CI 自动上传 infra、合并即生效，不与代码 PR 搭车 | 否 |
 | **PR-4 agent 桥接** | **暂缓**（拍板 §13.2）：assistant.chat + agent 中等重构 + M4 契约修订，范围见 §12 | P1 连通后再议 | **是**（触碰 M4 契约核心） |
