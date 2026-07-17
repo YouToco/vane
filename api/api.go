@@ -80,6 +80,9 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	// M5 Gate 探针端点（契约 §16）：只读体检，与 cmd/gate 共用 probe 包同一份判定。
 	inner.HandleFunc("GET /api/admin/observability", s.handleObservability)
 
+	// M7 推送历史端点（功能 6.4）：只读，回溯每条推送的打分、状态与反馈。
+	inner.HandleFunc("GET /api/deliveries", s.handleListDeliveries)
+
 	mux.Handle("/api/", s.requireSession(inner))
 }
 
