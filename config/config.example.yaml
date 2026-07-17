@@ -3,7 +3,9 @@
 # 敏感值一律走环境变量（/opt/vane/.env），本文件不放密钥。
 
 server:
-  addr: ":8080"
+  # 只绑本机 loopback：生产由 Caddy(host 网络)反代 127.0.0.1:8080，8080 不对公网暴露。
+  # 确需对外监听改 "0.0.0.0:8080" 或用 VANE_SERVER_ADDR 覆盖（记得同时收好防火墙）。
+  addr: "127.0.0.1:8080"
 
 db:
   url: "" # VANE_DB_URL
