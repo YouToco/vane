@@ -1185,6 +1185,24 @@ Entities json.RawMessage `json:"entities"`
 本契约设计的目标。**这是本契约 §10.3 结论尚未回填到生产配置的独立遗留问题，建议单独修，
 不要和这次 Exa 抓取方式的决策混在一次改动里。**
 
+#### §10.1.2 拍板追加（2026-07-17）：与 Exa 重复的自建代码——删除范围
+
+Boss 拍板：不再手动维护与 Exa `/contents` 功能重复的抓取/解析代码。全局核查后
+（`grep os/exec` 全仓 0 命中、goquery 唯一使用方是 pagewatch）划定边界如下：
+
+| 代码 | 处置 | 理由 |
+|---|---|---|
+| `pagewatch.go` HTTP 抓取段（UA/403/塌缩前的 body 读取，§10.1） | **删，换 Exa `/contents`** | 与 Exa 抓取完全重复 |
+| `pagewatch.go` `extractTableText`（goquery 压平，§10.2） | **删，用 Exa 的 markdown 表格输出** | 实测输出粒度等价（§10.1.1），且免 Google 拼 heading 的特殊处理 |
+| `go.mod` 的 `PuerkitoBio/goquery` 依赖 | **删** | 全仓唯一使用方就是上一行 |
+| `pagewatch.go` 快照对比 / 塌缩检测 / `simpleDiff` / `watchKey` / `min_rows` 闸门 | **留** | Vane 业务逻辑，Exa 不提供；闸门改为作用在 Exa 返回文本上 |
+| `fetcher.go` SSRF 栈（`lookupIP`/`isBlocked`/`Dialer.Control`） | **留** | RSS 仍自建抓取（Exa `/contents` 返回正文 markdown、给不了原始 XML feed），SSRF 栈的第一用户是 RSS 不是 page_watch |
+| `exa.go`（search 能力） | **留** | 是 search 信源本体，与 /contents 抓取是两回事 |
+| `tikhub.go` / `x.go` | **留** | 平台 API 通道，Exa 不可替代 |
+
+实现时机：**M5 收官优先的主线决策（2026-07-16）不变**，本节实现随 M6 落地，
+不插队。落地时按 §10.1.1 的待验证项先跑三站点粒度检查。
+
 ### 10.2 抽取：**goquery 压平表格行**，**不用 readability**
 
 **实测：`go-readability` 在 Anthropic 价格页静默失败**——返回 `err == nil`、
