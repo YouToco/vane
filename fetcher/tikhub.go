@@ -509,6 +509,7 @@ func mapTikhubNotes(src types.Source, items []tikhubSearchItem) []types.ContentI
 			Author:      n.User.Nickname,
 			PublishedAt: parseUnixSeconds(n.Timestamp),
 			FetchedAt:   now,
+			Kind:        types.KindArticle, // 一篇笔记是"一篇内容"（M6 契约 §7.2(b)：构造处赋值，finalize 只校验）
 		}
 		// 上面的 n.ID == "" 已挡掉无身份的笔记，这里是同一判定的第二道
 		// （身份规则只写在 finalize 一处，此处不重复表达）。

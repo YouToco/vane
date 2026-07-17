@@ -25,6 +25,15 @@ const (
 // Kind 内容种类（content_items.kind）。决定下游 pipeline 怎么对待它——
 // Dedup 的 simhash 近似去重对 change 是灾难性的（设计目的「改动少量文字仍判重复」
 // 与 change 的信号「改动少量文字」直接对立）。
+//
+// 【强制语义，M6 契约 §3.3.1】Kind 必须活着走完 DB 往返：
+// **任何返回 []types.ContentItem 或 *types.ContentItem 的 store 方法，
+// 其 SELECT 列清单与 Scan 都必须带 kind。** 漏一处的后果不是编译错误、不是运行时
+// 错误，而是 Dedup/scorer 读回零值 "" → 按 article 处理 → 页面变化被 simhash
+// 静默丢弃，且查 content_items 的探针照样是绿的（那些行在 Dedup 之前就已写入）。
+// 写入侧对偶的坑同样真实发生过（2026-07-16，012 回填）：INSERT 显式带 kind 列，
+// 但抓取器忘了赋值 → Go 零值 "" 覆盖 DB 的 DEFAULT 'article'。故抓取器必须在
+// 构造 item 处显式赋 Kind，fetcher.finalize 对空 Kind 一律拒绝（契约 §7.2(b)）。
 type Kind string
 
 const (
@@ -135,6 +144,18 @@ const (
 	RefTypeFeedback    RefType = "feedback"     // 关联文字反馈解读
 	RefTypeContentItem RefType = "content_item" // 关联单条内容（摘要等）
 	RefTypeProfile     RefType = "profile"      // 关联用户画像（画像演化记账）
+	RefTypeSource      RefType = "source"       // 关联信源（page_watch LLM 门记账）
+)
+
+// SnapshotVerdict page_snapshots 行的判定状态（§10.4）。
+// pending = 门尚未判定；baseline = 首次建基线；suppressed = 门判"不重要"。
+// 没有 reported——那个状态由 content_items 行的存在性证明。
+type SnapshotVerdict string
+
+const (
+	SnapshotVerdictPending    SnapshotVerdict = "pending"
+	SnapshotVerdictBaseline   SnapshotVerdict = "baseline"
+	SnapshotVerdictSuppressed SnapshotVerdict = "suppressed"
 )
 
 // AgentSessionStatus agent 会话状态（agent_sessions.status，M4 契约 §3）。

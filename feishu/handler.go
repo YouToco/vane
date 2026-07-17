@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
+	larkapplication "github.com/larksuite/oapi-sdk-go/v3/service/application/v6"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/YouToco/vane/feedback"
@@ -149,6 +150,13 @@ func (h *handler) eventDispatcher() *dispatcher.EventDispatcher {
 			)
 			return nil
 		}).
+		OnP2BotMenuV6(func(_ context.Context, event *larkapplication.P2BotMenuV6) error {
+			if event == nil || event.Event == nil {
+				return nil
+			}
+			go h.handleBotMenu(h.ctx, event)
+			return nil
+		}).
 		OnP2CardActionTrigger(h.onCardAction)
 }
 
@@ -233,6 +241,9 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 		return
 	}
 
+	reactionID := h.addTypingIndicator(ctx, msgID)
+	defer h.removeTypingIndicator(ctx, msgID, reactionID)
+
 	// agent 已注入时消息交给 agent loop（M4）；未注入（如装配阶段配置不全）
 	// 回退下方 chat_reply 直连——保证任何装配形态下消息都有回应而非崩/沉默。
 	if runner := h.m.agentRunner(); runner != nil {
@@ -298,6 +309,114 @@ func (h *handler) handleWithAgent(ctx context.Context, runner AgentRunner, msgID
 		// 确认卡丢失意味着动作永远无法被确认（24h 后过期），必须明确告知用户。
 		slog.Error("feishu: 发送确认卡失败", "err", err, "action_id", out.Confirm.ActionID)
 		h.reply(ctx, msgID, BuildReplyCard("确认卡发送失败，本次操作未生效，请稍后重试。"))
+	}
+}
+
+// typingEmoji 是打字指示器使用的表情类型。处理消息期间在用户消息上展示，
+// 回复完成后移除——让用户知道机器人正在工作而非失灵。
+const typingEmoji = "OneSecond"
+
+// addTypingIndicator 在消息上添加"正在输入"表情。返回 reactionID 供移除用；
+// 失败静默降级（打字指示器是锦上添花，不能阻断消息处理）。
+func (h *handler) addTypingIndicator(ctx context.Context, msgID string) string {
+	client := h.m.api()
+	if client == nil {
+		return ""
+	}
+	resp, err := client.Im.MessageReaction.Create(ctx, larkim.NewCreateMessageReactionReqBuilder().
+		MessageId(msgID).
+		Body(larkim.NewCreateMessageReactionReqBodyBuilder().
+			ReactionType(larkim.NewEmojiBuilder().EmojiType(typingEmoji).Build()).
+			Build()).
+		Build())
+	if err != nil {
+		return ""
+	}
+	if !resp.Success() || resp.Data == nil {
+		return ""
+	}
+	return strVal(resp.Data.ReactionId)
+}
+
+// removeTypingIndicator 移除之前添加的打字指示器表情。
+func (h *handler) removeTypingIndicator(ctx context.Context, msgID, reactionID string) {
+	if reactionID == "" {
+		return
+	}
+	client := h.m.api()
+	if client == nil {
+		return
+	}
+	_, _ = client.Im.MessageReaction.Delete(ctx, larkim.NewDeleteMessageReactionReqBuilder().
+		MessageId(msgID).
+		ReactionId(reactionID).
+		Build())
+}
+
+// botMenuCommands 将菜单 event_key 映射到交给 agent 的合成指令。
+// 菜单项在飞书开发者后台「机器人 → 机器人菜单」配置，event_key 需一致。
+var botMenuCommands = map[string]string{
+	"push_now":     "请立即执行一次推送",
+	"list_sources": "请列出当前所有订阅源的状态",
+}
+
+// handleBotMenu 处理机器人菜单点击事件：将菜单 event_key 转换为合成消息，
+// 交给 agent loop 统一处理，结果以新消息送达。
+func (h *handler) handleBotMenu(ctx context.Context, event *larkapplication.P2BotMenuV6) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("feishu: 菜单处理 panic", "recover", r)
+		}
+	}()
+
+	d := event.Event
+	eventKey := strVal(d.EventKey)
+	var openID string
+	if d.Operator != nil && d.Operator.OperatorId != nil {
+		openID = strVal(d.Operator.OperatorId.OpenId)
+	}
+	if openID == "" || eventKey == "" {
+		return
+	}
+
+	if owner := h.m.ownerID(); owner == "" || openID != owner {
+		h.m.SendCard(ctx, openID, BuildReplyCard("抱歉，我目前只为我的主人服务。"))
+		return
+	}
+
+	text, known := botMenuCommands[eventKey]
+	if !known {
+		slog.Info("feishu: 未识别的菜单事件", "event_key", eventKey)
+		return
+	}
+
+	runner := h.m.agentRunner()
+	if runner == nil {
+		h.m.SendCard(ctx, openID, BuildReplyCard("助手尚未就绪，请稍后再试。"))
+		return
+	}
+
+	user, err := h.m.st.UpsertUserByOpenID(ctx, openID, "")
+	if err != nil {
+		slog.Error("feishu: 菜单处理 upsert 用户失败", "err", err, "open_id", openID)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, agentMessageBudget)
+	defer cancel()
+
+	out, err := runner.HandleMessage(ctx, user.ID, text)
+	if err != nil {
+		slog.Error("feishu: 菜单 agent 处理失败", "err", err, "event_key", eventKey)
+		h.m.SendCard(ctx, openID, BuildReplyCard("处理失败："+humanizeLLMError(err)))
+		return
+	}
+	h.m.SendCard(ctx, openID, BuildReplyCard(out.Reply))
+	if out.Confirm != nil {
+		card := BuildConfirmCard(out.Confirm.Summary, out.Confirm.ActionID)
+		if _, err := h.m.SendCard(ctx, openID, card); err != nil {
+			slog.Error("feishu: 菜单确认卡发送失败", "err", err, "action_id", out.Confirm.ActionID)
+		}
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -33,6 +34,8 @@ import (
 	"github.com/YouToco/vane/dedup"
 	"github.com/YouToco/vane/types"
 )
+
+var htmlTagRe = regexp.MustCompile(`<[a-zA-Z/!]`)
 
 // errBlockedDial 是连接阶段命中私网地址时 Dialer.Control 返回的哨兵。
 // 之所以单独定义：Control 触发时机在 http.Client 内部，只能通过 error 冒泡，
@@ -327,6 +330,7 @@ func mapItems(src types.Source, items []*gofeed.Item) []types.ContentItem {
 			Author:      authorName(it),
 			PublishedAt: it.PublishedParsed,
 			FetchedAt:   now,
+			Kind:        types.KindArticle, // rss 产出的是"一篇内容"（M6 契约 §7.2(b)：构造处赋值，finalize 只校验）
 		}
 		// 无 link 的条目在此被丢弃：rss 的身份就是 url，没有 url 就没有身份。
 		if !finalize(src, &item) {
@@ -393,6 +397,24 @@ func finalize(src types.Source, item *types.ContentItem) bool {
 	if item.CanonicalKey == "" {
 		slog.Warn("fetcher: 内容缺少身份字段，跳过该条",
 			"source_id", src.ID, "platform", src.Platform, "url", item.URL, "title", item.Title)
+		return false
+	}
+
+	// Kind 必须非空（M6 契约 §7.2(b)）——做成"写不出来"而非注释提醒。零值 "" 会被
+	// UpsertContentItem 显式 INSERT、覆盖 DB 列的 DEFAULT 'article'，下游 Dedup 拿到
+	// 空 Kind 按 article 处理 → 页面变化被 simhash 静默吞掉，且无任何错误信号
+	// （2026-07-16 生产实证：008 上线后全部新内容 kind 落成空串，012 回填）。
+	// 这里只校验不兜底：Kind 是"这条内容是什么"的事实，只有构造 item 的抓取器知道；
+	// 在此补默认值会把"抓取器忘了赋值"这个 bug 永久藏起来。
+	if item.Kind == "" {
+		slog.Warn("fetcher: 内容缺少 kind，跳过该条",
+			"source_id", src.ID, "platform", src.Platform, "url", item.URL, "title", item.Title)
+		return false
+	}
+
+	if htmlTagRe.MatchString(item.Content) {
+		slog.Warn("fetcher: 正文含裸 HTML，抽取未在指纹之前完成（契约 §12.3），跳过该条",
+			"source_id", src.ID, "url", item.URL, "title", item.Title)
 		return false
 	}
 
