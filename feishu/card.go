@@ -183,8 +183,9 @@ func BuildDeliveryCard(input feedback.CardInput) string {
 		elements = append(elements, map[string]any{"tag": "markdown", "content": line})
 	}
 
-	// 点 👎 后出现 form（可跳过的原因收集）
-	if input.State.Preference == types.FeedbackActionNotInterested {
+	// 点 👎 后出现 form（可跳过的原因收集）；误判落库后收起——
+	// 状态行已有「⚠️ 已标记误判」，form 留着会让人以为还能再提。
+	if input.State.Preference == types.FeedbackActionNotInterested && !input.State.Misjudged {
 		elements = append(elements, map[string]any{
 			"tag":  "form",
 			"name": "feedback_reason",

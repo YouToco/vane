@@ -308,8 +308,8 @@ func TestBuildDeliveryCardStateLinePlacement(t *testing.T) {
 			DeepDiveRequested: true,
 		}
 		card := decodeDeliveryCard(t, BuildDeliveryCard(feedback.CardInput{BodyMD: bodyMD, DeliveryID: 7, State: st}))
-		if len(card.Body.Elements) != 4 {
-			t.Fatalf("body.elements 长度 = %d, 期望 4（markdown + column_set + 状态行 + 误判表单）",
+		if len(card.Body.Elements) != 3 {
+			t.Fatalf("body.elements 长度 = %d, 期望 3（markdown + column_set + 状态行；已误判则表单收起）",
 				len(card.Body.Elements))
 		}
 		// 正文原样保留：点按钮后重建的是"同一张卡的新版本"，不是替换成结果文本。
@@ -372,5 +372,41 @@ func TestBuildDeliveryCardFormSubmitButton(t *testing.T) {
 	}
 	if !hasSubmit {
 		t.Errorf("form 内没有 form_action_type=\"submit\" 的提交按钮（整卡会被飞书判非法）")
+	}
+}
+
+// TestBuildDeliveryCardFormHiddenAfterMisjudged 钉死 form 的收起时机
+// （2026-07-17 Gate ③ 实测发现）：误判落库后重建的卡片不得再渲染原因表单，
+// 否则用户以为还能重复提交（服务端幂等只回「已标记过误判」toast，卡片不变）。
+// 状态行的「⚠️ 已标记误判」是提交成功后的唯一可见反馈。
+func TestBuildDeliveryCardFormHiddenAfterMisjudged(t *testing.T) {
+	raw := BuildDeliveryCard(feedback.CardInput{
+		BodyMD: "正文", DeliveryID: 7,
+		State: feedback.CardState{
+			Preference: types.FeedbackActionNotInterested,
+			Misjudged:  true,
+		},
+	})
+	card := decodeDeliveryCard(t, raw)
+	if len(card.Body.Elements) != 3 {
+		t.Fatalf("body.elements 长度 = %d, 期望 3（markdown + column_set + 状态行，无表单）",
+			len(card.Body.Elements))
+	}
+	for i, el := range card.Body.Elements {
+		var probe struct {
+			Tag string `json:"tag"`
+		}
+		if err := json.Unmarshal(el, &probe); err != nil {
+			t.Fatalf("解析 elements[%d] 失败: %v", i, err)
+		}
+		if probe.Tag == "form" {
+			t.Errorf("误判后卡片仍含 form 元素（elements[%d]），应收起", i)
+		}
+	}
+	got := decodeMarkdownElement(t, card.Body.Elements[2], "状态行")
+	if want := feedbackStateLine(feedback.CardState{
+		Preference: types.FeedbackActionNotInterested, Misjudged: true,
+	}); got != want {
+		t.Errorf("状态行 = %q, 期望 %q", got, want)
 	}
 }
