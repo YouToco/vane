@@ -14,6 +14,7 @@ import (
 
 	"github.com/mmcdole/gofeed"
 
+	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/types"
 )
 
@@ -88,6 +89,66 @@ func TestTweetToItem_ProducesKindArticle(t *testing.T) {
 				t.Errorf("Kind 应为 %q，实际 %q", types.KindArticle, item.Kind)
 			}
 		})
+	}
+}
+
+// TestCatalogKindMatchesFetcherEmittedKind 是 sourcecatalog 登记的 Kind 与各抓取器**实际
+// 产出**的 Kind 之间的一致性锁（sourcecatalog.go 的 Entry.Kind 注释所承诺的那把锁）。
+//
+// 为什么单靠 requireAllKindArticle + sourcecatalog_test 的"非空"断言不够（对抗审查 CONFIRMED）：
+// 前者把 fetcher 产出钉在硬编码的 KindArticle，后者只查 catalog 里 Kind 非空——两头各自钉在
+// 同一个常量上，却从不互相比对。有人把某个 article 能力的 catalog Kind 误改成 change，两处测试
+// 照样全绿，catalog 与真实产出静默漂移。本用例对每个 article 能力跑其 map 函数、拿产出的 Kind
+// 与 sourcecatalog.KindOf 逐条比，把这条漂移路径焊死。
+func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
+	cases := []struct {
+		platform   types.Platform
+		capability types.Capability
+		items      []types.ContentItem
+	}{
+		{types.PlatformWeb, types.CapFeed, mapItems(rssSource(1),
+			[]*gofeed.Item{{Link: bbcURL, Title: "标题", Content: "正文"}})},
+		{types.PlatformWeb, types.CapSearch, mapExaResults(exaSource(1),
+			[]exaResult{{ID: "exa-1", URL: "https://news.example/a", Title: "标题", Text: "正文"}})},
+		{types.PlatformXHS, types.CapSearch, mapTikhubNotes(xhsSource(1),
+			[]tikhubSearchItem{{ModelType: "note", Note: &tikhubNote{ID: xhsNoteID, Title: "笔记", Desc: "正文"}}})},
+		{types.PlatformXHS, types.CapUserPosts, mapXHSUserNotes(
+			types.Source{ID: 1, Platform: types.PlatformXHS, Capability: types.CapUserPosts}, "u1",
+			[]xhsUserNote{{ID: xhsNoteID, Title: "笔记", Desc: "正文", User: xhsUserAuthor{UserID: "u1"}}})},
+	}
+	for _, tc := range cases {
+		want, ok := sourcecatalog.KindOf(tc.platform, tc.capability)
+		if !ok {
+			t.Errorf("%s/%s 在 sourcecatalog 里不可用，无从比对 Kind", tc.platform, tc.capability)
+			continue
+		}
+		if len(tc.items) == 0 {
+			t.Fatalf("%s/%s 的 fixture 未产出 item，断言空洞", tc.platform, tc.capability)
+		}
+		for i, it := range tc.items {
+			if it.Kind != want {
+				t.Errorf("%s/%s 第 %d 条产出 Kind=%q，但 sourcecatalog.KindOf=%q，二者漂移",
+					tc.platform, tc.capability, i, it.Kind, want)
+			}
+		}
+	}
+
+	// x/user_posts 走 tweetToItem（无独立 map 函数），单独比对。
+	tw := tweetToItem(twitterTweet{
+		TweetID: "1", Text: "推文", CreatedAt: "Thu Jul 16 12:00:00 +0000 2026",
+		Author: twitterAuthor{ScreenName: "a"},
+	}, "a")
+	wantX, ok := sourcecatalog.KindOf(types.PlatformX, types.CapUserPosts)
+	if tw == nil {
+		t.Fatal("fixture 推文不该被丢弃")
+	} else if !ok || tw.Kind != wantX {
+		t.Errorf("x/user_posts 产出 Kind=%q，sourcecatalog.KindOf=%q(ok=%v)，二者漂移", tw.Kind, wantX, ok)
+	}
+
+	// web/page_watch 的发射侧由 pagewatch 用例覆盖；此处锁登记侧必须是 change
+	// （若被误改成 article，simhash 近似去重会把页面变化静默吞掉——契约 §1.1）。
+	if k, ok := sourcecatalog.KindOf(types.PlatformWeb, types.CapPageWatch); !ok || k != types.KindChange {
+		t.Errorf("sourcecatalog web/page_watch 应登记为 change，实际 %q(ok=%v)", k, ok)
 	}
 }
 
