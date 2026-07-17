@@ -76,17 +76,27 @@ func (l *authFailLimiter) prune(ip string, now time.Time) {
 	l.fails[ip] = kept
 }
 
-// clientIP 取客户端 IP：Caddy 反代带 X-Forwarded-For 取首段，缺失回退 RemoteAddr。
+// clientIP 取用于限流的客户端 IP（审查 CONFIRMED HIGH：不能信任 XFF 最左段）。
+// 部署拓扑是**单跳可信反代**（Caddy network_mode:host 反代 localhost:8080）：
+//   - 直连来自本机 loopback（即经 Caddy）→ 采信 XFF **最右段**：Caddy 把真实 peer IP
+//     追加到客户端已带的 XFF 之后，最右一跳是 Caddy 亲自记录的真实来源，客户端伪造的值
+//     只能落在左侧、被忽略；
+//   - 直连非 loopback（如 8080 意外暴露公网被直击）→ 一律用 RemoteAddr、无视 XFF：
+//     否则攻击者自带任意 XFF 即可让每个请求都成"新 IP"，把唯一的 Bearer 暴力限流冲垮，
+//     或伪造受害 peer 的 IP 打满其失败额度做定向 429 锁定。
+// （api/ratelimit.go 的 clientIP 有同源缺陷——存量 dashboard 限流，已另立 task 跟进。）
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			if last := strings.TrimSpace(parts[len(parts)-1]); last != "" {
+				return last
+			}
+		}
 	}
 	return host
 }
