@@ -27,13 +27,22 @@ function statusBadge(status: string): string {
 
 // 反馈动作 → 中文标签 + 徽标配色。未知枚举原样显示英文串（后端加了新动作
 // 而前端没跟上时让"没跟上"露出来，与 Observability 的闸门列同一策略）。
-const FEEDBACK_META: Record<string, { label: string; badge: string }> = {
-  interested: { label: "👍 感兴趣", badge: "badge-ok" },
-  not_interested: { label: "👎 不感兴趣", badge: "badge-muted" },
-  misjudged: { label: "⚠️ 误判", badge: "badge-bad" },
-  deep_dive: { label: "🔍 深入", badge: "badge-type" },
-  question: { label: "💬 追问", badge: "badge-type" },
+// showDetail：detail 是否内嵌进徽标——只有**用户亲手输入**的短文本才内嵌
+// （misjudged 原因 / question 提问）；deep_dive 的 detail 是 AI 生成的解读
+// markdown 全文（生产实测数百字符，内嵌直接把徽标撑爆），只进 title 提示。
+const FEEDBACK_META: Record<string, { label: string; badge: string; showDetail: boolean }> = {
+  interested: { label: "👍 感兴趣", badge: "badge-ok", showDetail: false },
+  not_interested: { label: "👎 不感兴趣", badge: "badge-muted", showDetail: false },
+  misjudged: { label: "⚠️ 误判", badge: "badge-bad", showDetail: true },
+  deep_dive: { label: "🔍 深入", badge: "badge-type", showDetail: false },
+  question: { label: "💬 追问", badge: "badge-type", showDetail: true },
 };
+
+// title 提示里的 detail 截断：浏览器原生 tooltip 放几百字 markdown 同样不可读。
+function clipDetail(s: string, max = 120): string {
+  const runes = Array.from(s);
+  return runes.length <= max ? s : runes.slice(0, max).join("") + "…";
+}
 
 export default function History() {
   const [items, setItems] = useState<DeliveryHistoryItem[]>([]);
@@ -160,10 +169,12 @@ export default function History() {
                               <span
                                 key={i}
                                 className={"badge " + (meta?.badge ?? "badge-muted")}
-                                title={fmtBeijing(fb.created_at) + (fb.detail ? ` · ${fb.detail}` : "")}
+                                title={fmtBeijing(fb.created_at) + (fb.detail ? ` · ${clipDetail(fb.detail)}` : "")}
                               >
                                 {meta?.label ?? fb.action}
-                                {fb.detail && <span className="hist-fb-detail">{fb.detail}</span>}
+                                {meta?.showDetail && fb.detail && (
+                                  <span className="hist-fb-detail">{clipDetail(fb.detail, 30)}</span>
+                                )}
                               </span>
                             );
                           })}
