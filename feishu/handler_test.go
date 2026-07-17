@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
@@ -349,11 +350,15 @@ func TestHandleMessageRouting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.New() 建池失败: %v", err)
 	}
-	defer st.Close()
+	registerStoreClose(t, st)
 
 	// owner 预置为发送者本人：白名单放行，且 captureOwnerIfFirst 因缓存
 	// 已捕获而跳过写库，不污染共享测试库的 feishu_owner 设置。
-	const owner = "ou_test_post_routing"
+	//
+	// open_id 带 uuid 后缀（同 store 包）：handle 必经 UpsertUserByOpenID 写 users，
+	// 固定 open_id 会让并行打同一个测试库的两条流水线互删对方正在用的行。
+	owner := "ou_test_post_routing_" + uuid.NewString()
+	cleanupTestUser(t, dbURL, owner)
 
 	cases := []struct {
 		name    string

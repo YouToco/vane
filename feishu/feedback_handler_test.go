@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
@@ -641,11 +642,15 @@ func TestHandleQuestionWrapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.New() 建池失败: %v", err)
 	}
-	defer st.Close()
+	registerStoreClose(t, st)
 
 	// owner 预置为发送者本人：白名单放行，且 captureOwnerIfFirst 因缓存已捕获
 	// 而跳过写库，不污染共享测试库的 feishu_owner 设置。
-	const owner = "ou_test_question_wrap"
+	//
+	// open_id 带 uuid 后缀（同 store 包）：handle 必经 UpsertUserByOpenID 写 users，
+	// 固定 open_id 会让并行打同一个测试库的两条流水线互删对方正在用的行。
+	owner := "ou_test_question_wrap_" + uuid.NewString()
+	cleanupTestUser(t, dbURL, owner)
 	const wrapped = "[追问上下文] 用户正在追问一条历史推送（delivery_id=42）…\n[追问上下文结束]\n用户的追问：这篇原文说了什么"
 
 	t.Run("命中追问时 agent 收到包装后文本", func(t *testing.T) {
@@ -770,9 +775,11 @@ func TestOnCardActionFeedbackRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.New() 建池失败: %v", err)
 	}
-	defer st.Close()
+	registerStoreClose(t, st)
 
-	const owner = "ou_test_fb_route"
+	// open_id 带 uuid 后缀，理由同 TestHandleQuestionWrapping。
+	owner := "ou_test_fb_route_" + uuid.NewString()
+	cleanupTestUser(t, dbURL, owner)
 	user, err := st.UpsertUserByOpenID(ctx, owner, "测试")
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
