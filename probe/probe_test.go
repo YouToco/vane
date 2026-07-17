@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,10 @@ type fakeStore struct {
 	evolve  types.EvolveCallStat
 	batches []types.PushBatchSummary
 	profile *types.Profile
+
+	// P-A2A（a2a-contract §10）：计数与注入错误位。
+	a2aCount int64
+	a2aErr   error
 
 	// 回声位：记录 Run 实际传下来的参数，用于断言窗口与期望串没接反。
 	gotSince      time.Time
@@ -93,6 +98,13 @@ func (f *fakeStore) GetProfile(context.Context, int64) (*types.Profile, error) {
 		return nil, types.ErrNotFound
 	}
 	return f.profile, nil
+}
+
+func (f *fakeStore) CountA2ATasks(context.Context) (int64, error) {
+	if f.a2aErr != nil {
+		return 0, f.a2aErr
+	}
+	return f.a2aCount, nil
 }
 
 // checkStatus 断言判定状态，失败时连 Summary 一起打印——Summary 是给 Boss 看的人话，
@@ -598,9 +610,10 @@ func TestRun_WiringAndWindows(t *testing.T) {
 		t.Errorf("UserID 应回填 7，实际 %d", rep.UserID)
 	}
 
-	// 7 条判定齐全且 ID 唯一——看板与 cmd/gate 都按 ID 索引。
-	if len(rep.Results) != 7 {
-		t.Fatalf("应产出 7 条判定，实际 %d", len(rep.Results))
+	// 8 条判定齐全且 ID 唯一——看板与 cmd/gate 都按 ID 索引
+	//（M5 七条 + P-A2A，a2a-contract §10）。
+	if len(rep.Results) != 8 {
+		t.Fatalf("应产出 8 条判定，实际 %d", len(rep.Results))
 	}
 	seen := map[string]bool{}
 	for _, r := range rep.Results {
@@ -714,4 +727,47 @@ func TestRun_InjectionWindowClampedToProfileCreation(t *testing.T) {
 	if want := now.Add(-DefaultWindow); !f.gotSince.Equal(want) {
 		t.Errorf("公共 since 应保持 %v，实际 %v", want, f.gotSince)
 	}
+}
+
+// TestJudgeA2ATasks P-A2A 两分支（a2a-contract §10）：查询成功（含 0 行）= green；
+// 报错 = 就地 StatusRed 且 **Run 不中断**（对既有"Store 报错中断整轮"模式的刻意偏离——
+// 表缺失/不可读是产品事实不是探针故障）。
+func TestJudgeA2ATasks(t *testing.T) {
+	now := time.Date(2026, 7, 17, 8, 30, 0, 0, time.UTC)
+
+	t.Run("查询报错red且Run不中断", func(t *testing.T) {
+		f := &fakeStore{a2aErr: errors.New(`relation "a2a_tasks" does not exist`)}
+		rep, err := Run(t.Context(), f, 7, now, 24*time.Hour)
+		if err != nil {
+			t.Fatalf("P-A2A 报错不得中断 Run（应就地记 red），实际 err=%v", err)
+		}
+		res := findResult(t, rep, "P-A2A")
+		if res.Status != StatusRed {
+			t.Fatalf("查询报错应 red，实际 %s", res.Status)
+		}
+	})
+
+	t.Run("零行green", func(t *testing.T) {
+		f := &fakeStore{a2aCount: 0}
+		rep, err := Run(t.Context(), f, 7, now, 24*time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res := findResult(t, rep, "P-A2A")
+		if res.Status != StatusGreen {
+			t.Fatalf("表可读（0 行）应 green，实际 %s: %s", res.Status, res.Summary)
+		}
+	})
+}
+
+// findResult 按 ID 取判定结果。
+func findResult(t *testing.T, rep Report, id string) Result {
+	t.Helper()
+	for _, r := range rep.Results {
+		if r.ID == id {
+			return r
+		}
+	}
+	t.Fatalf("Results 里没有 %s", id)
+	return Result{}
 }
