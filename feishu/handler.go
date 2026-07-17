@@ -314,7 +314,7 @@ func (h *handler) handleWithAgent(ctx context.Context, runner AgentRunner, msgID
 
 // typingEmoji 是打字指示器使用的表情类型。处理消息期间在用户消息上展示，
 // 回复完成后移除——让用户知道机器人正在工作而非失灵。
-const typingEmoji = "Typing"
+const typingEmoji = "OneSecond"
 
 // addTypingIndicator 在消息上添加"正在输入"表情。返回 reactionID 供移除用；
 // 失败静默降级（打字指示器是锦上添花，不能阻断消息处理）。
