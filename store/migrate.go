@@ -10,6 +10,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib" // 注册 database/sql 的 "pgx" 驱动，供 goose 使用
 	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 )
 
 // migrationsFS 把迁移 SQL 打进二进制，部署时无需携带 migrations 目录。
@@ -42,7 +43,18 @@ func Migrate(ctx context.Context, dbURL string) error {
 		return fmt.Errorf("store: 定位迁移目录: %w", err)
 	}
 
-	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
+	// go test 按包并行：store/evolver/feishu 的测试进程会对同一全新库并发
+	// Migrate，后到者在先到者的迁移事务提交前读到空版本表、重复应用同一迁移
+	// 而报错（TestMigrateConcurrentFreshDB 复现此形态）。用 Postgres 会话级
+	// advisory lock 串行化，后进者拿锁后重读版本表即 no-op，幂等语义不变。
+	// 重试间隔取最小 1s（默认 5s，对毫秒级的迁移临界区太粗），总超时 5 分钟。
+	sessionLocker, err := lock.NewPostgresSessionLocker(lock.WithLockTimeout(1, 300))
+	if err != nil {
+		return fmt.Errorf("store: 初始化迁移会话锁: %w", err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir,
+		goose.WithSessionLocker(sessionLocker),
+	)
 	if err != nil {
 		return fmt.Errorf("store: 初始化 goose provider: %w", err)
 	}
