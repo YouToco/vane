@@ -110,6 +110,9 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 			[]*gofeed.Item{{Link: bbcURL, Title: "标题", Content: "正文"}})},
 		{types.PlatformWeb, types.CapSearch, mapExaResults(exaSource(1),
 			[]exaResult{{ID: "exa-1", URL: "https://news.example/a", Title: "标题", Text: "正文"}})},
+		{types.PlatformWeb, types.CapContents, contentsItems(
+			types.Source{ID: 1, Platform: types.PlatformWeb, Capability: types.CapContents},
+			[]exaContentsResult{{ID: "c1", URL: "https://x.example/pricing", Title: "定价", Text: "正文"}})},
 		{types.PlatformXHS, types.CapSearch, mapTikhubNotes(xhsSource(1),
 			[]tikhubSearchItem{{ModelType: "note", Note: &tikhubNote{ID: xhsNoteID, Title: "笔记", Desc: "正文"}}})},
 		{types.PlatformXHS, types.CapUserPosts, mapXHSUserNotes(
@@ -159,4 +162,13 @@ func TestFinalize_DropsItemWithoutKind(t *testing.T) {
 	if item.CanonicalKey == "" {
 		t.Error("拒绝应发生在 Kind 校验（身份校验之后）——canonical_key 为空说明死在了身份校验，用例没测到目标分支")
 	}
+}
+
+// contentsItems 把 mapExaContents 的 (item, ok) 适配成切片，供 kind 一致性锁复用。
+func contentsItems(src types.Source, results []exaContentsResult) []types.ContentItem {
+	it, ok := mapExaContents(src, "https://x.example/pricing", "", results)
+	if !ok {
+		return nil
+	}
+	return []types.ContentItem{it}
 }

@@ -192,9 +192,10 @@ type Profile struct {
 //
 // span_name 的真实取值恰好六个，没有共享常量——每个写入方把字面量硬编码在自己的
 // CallMeta 里，故此处是清单副本，按 span 过滤时以写入方源码为准：
-//   score(scorer/scorer.go:131) / cardgen(cardgen/cardgen.go:77) /
-//   profile_evolve(evolver/evolver.go:116) / deep_dive(feedback/deepdive.go:218) /
-//   chat_reply(feishu/handler.go:174) / agent(agent/loop.go:206)
+//
+//	score(scorer/scorer.go:131) / cardgen(cardgen/cardgen.go:77) /
+//	profile_evolve(evolver/evolver.go:116) / deep_dive(feedback/deepdive.go:218) /
+//	chat_reply(feishu/handler.go:174) / agent(agent/loop.go:206)
 //
 // 注意一个 trace_id 会横跨多个 span（PushPipelineWorkflow 把同一 traceID 依次传给
 // profile_evolve/score/cardgen 三步），故按 trace 聚合打分指标时 span_name 必须进 WHERE，
@@ -328,7 +329,7 @@ type PendingAction struct {
 
 // A2ATask 是 A2A server 任务（a2a_tasks 表，migration 013）。Task 列是 SDK a2a.Task 的
 // ProtoJSON 权威载荷（store 层不解析）；ID/ContextID/Status 是提取列。SDK 类型不出 a2a/ 包
-//（隔离原则，同 agent.Store 窄接口先例），store 层只见本类型。
+// （隔离原则，同 agent.Store 窄接口先例），store 层只见本类型。
 type A2ATask struct {
 	ID        string          `json:"id"` // 服务端生成 taskId
 	ContextID string          `json:"context_id"`
@@ -343,7 +344,7 @@ type A2ATask struct {
 // a2a.ListTasksRequest（v2.3.1 已核实：Tenant/ContextID/Status/PageSize/PageToken/
 // HistoryLength/StatusTimestampAfter/IncludeArtifacts）。Tenant 单租户恒空不映射；
 // HistoryLength/IncludeArtifacts 是 task JSONB 裁剪语义，归 a2a/taskstore.go 适配层
-//（契约 §5.9），store 不感知。
+// （契约 §5.9），store 不感知。
 type A2ATaskQuery struct {
 	ContextID            string    // 空串 = 不过滤
 	Status               string    // TASK_STATE_* 原文；空串 = 不过滤

@@ -67,20 +67,20 @@ type twitterResponse struct {
 }
 
 type twitterData struct {
-	Status   string           `json:"status"`
-	Timeline []twitterTweet   `json:"timeline"`
-	Pinned   json.RawMessage  `json:"pinned"`
-	User     json.RawMessage  `json:"user"`
+	Status   string          `json:"status"`
+	Timeline []twitterTweet  `json:"timeline"`
+	Pinned   json.RawMessage `json:"pinned"`
+	User     json.RawMessage `json:"user"`
 }
 
 type twitterTweet struct {
-	TweetID        string          `json:"tweet_id"`
-	Text           string          `json:"text"`
-	CreatedAt      string          `json:"created_at"`
-	ConversationID string          `json:"conversation_id"`
-	Views          string          `json:"views"`
-	Source         string          `json:"source,omitempty"`
-	Author         twitterAuthor   `json:"author"`
+	TweetID        string        `json:"tweet_id"`
+	Text           string        `json:"text"`
+	CreatedAt      string        `json:"created_at"`
+	ConversationID string        `json:"conversation_id"`
+	Views          string        `json:"views"`
+	Source         string        `json:"source,omitempty"`
+	Author         twitterAuthor `json:"author"`
 	// 以下全部多态（§9.5 + 生产实测）：可能是 bool/string/对象/数组/null。
 	Retweeted      json.RawMessage `json:"retweeted"`
 	RetweetedTweet json.RawMessage `json:"retweeted_tweet"`

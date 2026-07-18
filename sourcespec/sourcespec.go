@@ -121,8 +121,36 @@ func buildWeb(cap types.Capability, params map[string]string, title string) (*ty
 			Status:     types.SourceStatusActive,
 		}, ""
 
+	case types.CapContents:
+		rawURL := strings.TrimSpace(params["url"])
+		u, err := url.Parse(rawURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, "web/contents 必须提供合法的 http/https 页面地址（url）"
+		}
+		cfgMap := map[string]string{"url": rawURL}
+		if t := strings.TrimSpace(params["title"]); t != "" {
+			cfgMap["title"] = t
+		}
+		cfg, err := json.Marshal(cfgMap)
+		if err != nil {
+			return nil, "构造信源配置失败"
+		}
+		if title == "" {
+			title = "页面监控: " + rawURL
+		}
+		// 幂等键含 url（一个页面一个监控源）；rawURL 本身是 http(s)://，与 contents:// 前缀
+		// 的内容 canonical_key 不同命名空间，互不干扰。
+		return &types.Source{
+			Platform:   types.PlatformWeb,
+			Capability: types.CapContents,
+			URL:        "vane://web/contents?url=" + url.QueryEscape(rawURL),
+			Title:      title,
+			Config:     cfg,
+			Status:     types.SourceStatusActive,
+		}, ""
+
 	default:
-		return nil, "web 平台仅支持 feed / search 能力"
+		return nil, "web 平台仅支持 feed / search / contents 能力"
 	}
 }
 

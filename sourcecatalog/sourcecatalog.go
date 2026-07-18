@@ -66,7 +66,9 @@ type key struct {
 //
 // 状态依据（契约 §2.1 / §2.2）：
 //   - web/feed、web/search：迁移自 rss/exa，均已实现。
-//     （web/page_watch 页面监控已下线——改由 Exa fetch 覆盖，见 CHANGELOG / M6 契约 §10）
+//   - web/contents：监控指定 URL 的内容变化，用 Exa /contents 抓取（fetcher/exa_contents.go）。
+//     这是 page_watch 下线时声称的"改由 Exa /contents 覆盖"的实际落地——极简变化检测
+//     （canonical_key=contents://url#hash，无基线表、无 LLM 门），不重蹈 page_watch 的复杂度。
 //   - x/user_posts：追 X 官号，已实现（fetcher/x.go）。
 //   - x/search：**Unavailable**——上游 search_type=Latest 排序不可靠，无法追新（见 Reason）。
 //   - xhs/search：小红书关键词搜索，已实现（fetcher/tikhub.go）。
@@ -78,6 +80,10 @@ var catalog = map[key]Entry{
 	},
 	{types.PlatformWeb, types.CapSearch}: {
 		Platform: types.PlatformWeb, Capability: types.CapSearch,
+		Kind: types.KindArticle, Status: StatusAvailable,
+	},
+	{types.PlatformWeb, types.CapContents}: {
+		Platform: types.PlatformWeb, Capability: types.CapContents,
 		Kind: types.KindArticle, Status: StatusAvailable,
 	},
 	{types.PlatformX, types.CapUserPosts}: {

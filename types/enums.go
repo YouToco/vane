@@ -19,6 +19,7 @@ const (
 	CapFeed      Capability = "feed"       // 订阅 RSS/Atom feed
 	CapSearch    Capability = "search"     // 关键词/语义搜索
 	CapUserPosts Capability = "user_posts" // 某账号的新发布
+	CapContents  Capability = "contents"   // 监控指定 URL 的内容变化（Exa /contents 抓取）
 )
 
 // Kind 内容种类（content_items.kind）。当前只有 article 一种——page_watch 的
@@ -94,7 +95,7 @@ const (
 // 塞进 status 会让每个现有 status 消费方都要认识 5 个新值，且"empty"这个结局
 // 本身反而没法一句话查（得 IN 五个值）。
 //
-// 空串 = 没有提前退出（跑到了 Push）。009 之前的历史行全部如此，故列默认 ''
+// 空串 = 没有提前退出（跑到了 Push）。009 之前的历史行全部如此，故列默认 ”
 // 恰好就是它们的真实语义，无需回填。
 //
 // 取值与 workflow/workflow.go 的五处提前退出一一对应；顺序即 pipeline 顺序，
