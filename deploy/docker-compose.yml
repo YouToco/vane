@@ -51,8 +51,6 @@ services:
     network_mode: host
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      # 前端静态产物：vane-web CI scp 到宿主机 /opt/vane/web，只读挂给 Caddy 做 file_server
-      - ./web:/srv/vane-web:ro
       - caddy_data:/data
       - caddy_config:/config
 

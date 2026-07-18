@@ -1,25 +1,12 @@
 # 后端 API 永久入口
 # 上游写 127.0.0.1 而非 localhost：vane 只绑 IPv4 loopback（127.0.0.1:8080，见
 # config server.addr），显式 127.0.0.1 避免 localhost 先解析到 ::1 再回退的抖动。
+#
+# 主域 vane.zhuoqidev.com 自 2026-07-18 起不再由本 Caddy 服务：前端迁 OSS+CDN 双线
+# （国内线阿里 CDN→OSS、境外线 Cloudflare Pages，DNS 分线 CNAME，见 vane-web ci.yml），
+# 主域 /.well-known/* 由两线静态层 302 到 api 子域（a2a-contract §5.2 口径备注）。
+# 若需回滚到 VPS 托管：恢复 vane A 记录 → 188.253.125.238，并从 git 历史找回主域 site block
+# （本文件 2026-07-18 前版本）+ compose 的 ./web 卷 + vane-web CI 的 scp 三步。
 api.vane.zhuoqidev.com {
 	reverse_proxy 127.0.0.1:8080
-}
-
-# 主站：Dashboard SPA 静态托管 + /api 反代到本机 vane 进程。
-# /srv/vane-web 由 compose 卷映射到宿主机 /opt/vane/web（vane-web CI 部署产物落这里）。
-# try_files 回落 index.html 是 SPA 刷新/直达路由不 404 的关键。
-vane.zhuoqidev.com {
-	handle /api/* {
-		reverse_proxy 127.0.0.1:8080
-	}
-	# A2A agent card 发现端点走后端（a2a-contract §11 PR-infra；拍板：card 放主域）。
-	# Caddy 的 handle 按最长路径前缀匹配，不受声明顺序影响；A2A 未启用时后端对该路径 404。
-	handle /.well-known/* {
-		reverse_proxy 127.0.0.1:8080
-	}
-	handle {
-		root * /srv/vane-web
-		try_files {path} /index.html
-		file_server
-	}
 }
