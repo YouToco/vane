@@ -650,7 +650,7 @@ func TestValidateScheduleSpecFields_共用(t *testing.T) {
 // 等于不存在（loop 只认注册过的名字）。
 func TestBuildTools_包含update_schedule(t *testing.T) {
 	names := map[string]bool{}
-	for _, tl := range BuildTools(nil, nil, nil, nil) {
+	for _, tl := range BuildTools(nil, nil, nil, nil, nil) {
 		names[tl.Name()] = true
 	}
 	for _, want := range []string{"create_schedule", "update_schedule", "remove_schedule", "list_schedules", "view_task_playbook", "edit_task_playbook"} {
@@ -675,6 +675,12 @@ type fakePlaybookStore struct {
 		userID     int64
 		scheduleID string
 		content    string
+	}
+	setPlanErr error
+	plans      []struct {
+		userID     int64
+		scheduleID string
+		plan       string
 	}
 }
 
@@ -710,6 +716,46 @@ func (f *fakePlaybookStore) UpsertSchedulePlaybook(_ context.Context, userID int
 	return true, nil
 }
 
+// SetFetchPlan 模拟 store 的 UPDATE … FROM schedules 语义：需已存在手册行 + 归属命中才写。
+func (f *fakePlaybookStore) SetFetchPlan(_ context.Context, userID int64, scheduleID string, plan json.RawMessage) (bool, error) {
+	f.plans = append(f.plans, struct {
+		userID     int64
+		scheduleID string
+		plan       string
+	}{userID, scheduleID, string(plan)})
+	if f.setPlanErr != nil {
+		return false, f.setPlanErr
+	}
+	if o, ok := f.owner[scheduleID]; ok && o != userID {
+		return false, nil // 非本人：归属未命中。
+	}
+	pb, ok := f.books[scheduleID]
+	if !ok {
+		return false, nil // 无手册行：计划依附不上。
+	}
+	pb.FetchPlan = plan
+	return true, nil
+}
+
+// fakeTranslator 是 playbookTranslator 的假实现：返回预设计划 / err，并记录调用入参。
+type fakeTranslator struct {
+	plan    json.RawMessage
+	err     error
+	calls   int
+	gotUser int64
+	gotText string
+}
+
+func (f *fakeTranslator) Translate(_ context.Context, userID int64, content string) (json.RawMessage, error) {
+	f.calls++
+	f.gotUser = userID
+	f.gotText = content
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.plan, nil
+}
+
 func TestViewTaskPlaybookTool(t *testing.T) {
 	if (&viewTaskPlaybookTool{}).Mutating() {
 		t.Fatal("view_task_playbook 必须是读工具（Mutating=false），否则查手册要人点确认卡")
@@ -733,6 +779,28 @@ func TestViewTaskPlaybookTool(t *testing.T) {
 		got, _ := (&viewTaskPlaybookTool{st: fs}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":"s1"}`))
 		if !strings.Contains(got, "手册为空") {
 			t.Fatalf("空手册应给引导文案: %q", got)
+		}
+	})
+	t.Run("有抓取计划时一并渲染（P1 编译层）", func(t *testing.T) {
+		fs := newFakePlaybookStore()
+		fs.books["s1"] = &types.SchedulePlaybook{
+			ScheduleID: "s1",
+			Content:    "AI 官方新闻",
+			FetchPlan:  json.RawMessage(`{"sources":[{"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=ai"}]}`),
+		}
+		fs.owner["s1"] = 7
+		got, _ := (&viewTaskPlaybookTool{st: fs}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":"s1"}`))
+		if !strings.Contains(got, "抓取计划（1 个源）") || !strings.Contains(got, "[web/search]") {
+			t.Fatalf("应渲染抓取计划: %q", got)
+		}
+	})
+	t.Run("空 fetch_plan 不赘述计划", func(t *testing.T) {
+		fs := newFakePlaybookStore()
+		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1", Content: "x", FetchPlan: json.RawMessage(`{"sources":[]}`)}
+		fs.owner["s1"] = 7
+		got, _ := (&viewTaskPlaybookTool{st: fs}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":"s1"}`))
+		if strings.Contains(got, "抓取计划") {
+			t.Fatalf("零源不该出现计划段: %q", got)
 		}
 	})
 	t.Run("NotFound 回文案不报错", func(t *testing.T) {
@@ -1062,6 +1130,163 @@ func TestScheduleTools_接线透传(t *testing.T) {
 		}
 		if f.gotID != "push-1-xyz" {
 			t.Errorf("schedule_id 透传错: %q", f.gotID)
+		}
+	})
+}
+
+// TestCreateScheduleTool_CompilesPlan 守 P1 编译层：create 初始化手册后，用同一份 content
+// 调翻译器编译计划并落库（best-effort，绝不影响调度主效果）。
+func TestCreateScheduleTool_CompilesPlan(t *testing.T) {
+	args := json.RawMessage(`{"spec":{"cron":"0 30 8 * * *"},"nl_description":"每天早八 AI 官方新闻"}`)
+
+	t.Run("初始化手册后据此编译计划落库", func(t *testing.T) {
+		sc := &fakeScheduleCreator{schedID: "push-7-abc"}
+		pb := newFakePlaybookStore()
+		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=ai"}]}`)}
+		tool := &createScheduleTool{sched: sc, st: pb, tr: tr}
+		if _, err := tool.Execute(context.Background(), 7, args); err != nil {
+			t.Fatalf("意外报错: %v", err)
+		}
+		if tr.calls != 1 || tr.gotUser != 7 || tr.gotText != "每天早八 AI 官方新闻" {
+			t.Fatalf("翻译器入参不符: calls=%d user=%d text=%q", tr.calls, tr.gotUser, tr.gotText)
+		}
+		if len(pb.plans) != 1 || pb.plans[0].scheduleID != "push-7-abc" || pb.plans[0].userID != 7 {
+			t.Fatalf("应把计划落库到刚建的任务: %+v", pb.plans)
+		}
+	})
+
+	t.Run("翻译失败不影响调度（best-effort）", func(t *testing.T) {
+		sc := &fakeScheduleCreator{schedID: "push-7-x"}
+		pb := newFakePlaybookStore()
+		tr := &fakeTranslator{err: errors.New("llm 超时")}
+		tool := &createScheduleTool{sched: sc, st: pb, tr: tr}
+		got, err := tool.Execute(context.Background(), 7, args)
+		if err != nil {
+			t.Fatalf("翻译失败不应上抛: %v", err)
+		}
+		if !strings.Contains(got, "push-7-x") {
+			t.Fatalf("调度仍应回成功: %q", got)
+		}
+		if len(pb.plans) != 0 {
+			t.Fatalf("翻译失败不该落计划: %+v", pb.plans)
+		}
+	})
+
+	t.Run("手册初始化失败则根本不调翻译器", func(t *testing.T) {
+		sc := &fakeScheduleCreator{schedID: "push-7-y"}
+		pb := newFakePlaybookStore()
+		pb.upsertErr = types.NewAppError(types.CodeDatabase, "写入失败", nil)
+		tr := &fakeTranslator{plan: emptyPlanJSON()}
+		tool := &createScheduleTool{sched: sc, st: pb, tr: tr}
+		if _, err := tool.Execute(context.Background(), 7, args); err != nil {
+			t.Fatalf("best-effort 不应上抛: %v", err)
+		}
+		if tr.calls != 0 {
+			t.Fatalf("手册没存成不该编译计划, calls=%d", tr.calls)
+		}
+	})
+}
+
+// TestEditTaskPlaybookTool_CompilesPlan 守 P1 编译层：edit 存下正文后据此重编译计划，
+// 回执按编译出的源数分档，翻译失败静默降级为普通成功。
+func TestEditTaskPlaybookTool_CompilesPlan(t *testing.T) {
+	setup := func(tr playbookTranslator) (*fakePlaybookStore, *editTaskPlaybookTool) {
+		fs := newFakePlaybookStore()
+		fs.owner["s1"] = 7
+		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1"}
+		return fs, &editTaskPlaybookTool{st: fs, tr: tr}
+	}
+	args := json.RawMessage(`{"schedule_id":"s1","content":"只要 Anthropic 官方"}`)
+
+	t.Run("编译出源时回执带源数", func(t *testing.T) {
+		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=a"},{"platform":"web","capability":"feed","url":"https://a.com/rss"}]}`)}
+		fs, tool := setup(tr)
+		got, err := tool.Execute(context.Background(), 7, args)
+		if err != nil {
+			t.Fatalf("意外报错: %v", err)
+		}
+		if tr.gotText != "只要 Anthropic 官方" {
+			t.Fatalf("翻译器应收到手册正文: %q", tr.gotText)
+		}
+		if len(fs.plans) != 1 {
+			t.Fatalf("应落库计划一次: %+v", fs.plans)
+		}
+		if !strings.Contains(got, "2 个抓取源") {
+			t.Fatalf("回执应含编译出的源数: %q", got)
+		}
+	})
+
+	t.Run("零源计划回执不提计划", func(t *testing.T) {
+		tr := &fakeTranslator{plan: emptyPlanJSON()}
+		_, tool := setup(tr)
+		got, _ := tool.Execute(context.Background(), 7, args)
+		if strings.Contains(got, "抓取源") {
+			t.Fatalf("零源不该提计划: %q", got)
+		}
+		if !strings.Contains(got, "已更新定时任务") {
+			t.Fatalf("仍应回更新成功: %q", got)
+		}
+	})
+
+	t.Run("翻译失败降级为普通成功、不落计划", func(t *testing.T) {
+		tr := &fakeTranslator{err: errors.New("boom")}
+		fs, tool := setup(tr)
+		got, err := tool.Execute(context.Background(), 7, args)
+		if err != nil {
+			t.Fatalf("翻译失败不应上抛: %v", err)
+		}
+		if len(fs.plans) != 0 {
+			t.Fatalf("翻译失败不该落计划: %+v", fs.plans)
+		}
+		if !strings.Contains(got, "已更新定时任务") || strings.Contains(got, "抓取源") {
+			t.Fatalf("应降级为普通成功文案: %q", got)
+		}
+	})
+
+	t.Run("content 归属未命中就不编译计划", func(t *testing.T) {
+		tr := &fakeTranslator{plan: emptyPlanJSON()}
+		fs := newFakePlaybookStore()
+		fs.owner["s1"] = 99 // 属别人
+		tool := &editTaskPlaybookTool{st: fs, tr: tr}
+		got, _ := tool.Execute(context.Background(), 7, args)
+		if tr.calls != 0 {
+			t.Fatalf("content upsert 未命中就不该翻译, calls=%d", tr.calls)
+		}
+		if !strings.Contains(got, "没找到你的定时任务") {
+			t.Fatalf("应回归属未命中文案: %q", got)
+		}
+	})
+
+	t.Run("计划落库报基础设施错误被吞、不污染主效果", func(t *testing.T) {
+		// best-effort 铁律：手册正文已存成，SetFetchPlan 报 CodeDatabase 时工具仍回普通成功、
+		// 绝不上抛（守 compilePlaybookPlan 的 serr!=nil 分支）。
+		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=a"}]}`)}
+		fs, tool := setup(tr)
+		fs.setPlanErr = types.NewAppError(types.CodeDatabase, "连接池耗尽", nil)
+		got, err := tool.Execute(context.Background(), 7, args)
+		if err != nil {
+			t.Fatalf("计划落库失败不应上抛（best-effort）: %v", err)
+		}
+		if !strings.Contains(got, "已更新定时任务") || strings.Contains(got, "抓取源") {
+			t.Fatalf("应降级为普通成功文案（计划没落成不提源数）: %q", got)
+		}
+	})
+
+	t.Run("翻译器收到的是 cap 截断后的正文（与落库正文一致）", func(t *testing.T) {
+		// 超限手册：翻译器必须收到 capPlaybookContent 截断后的正文，且与 Upsert 落库的正文一致，
+		// 否则会把未设边界的超长文本整体发给 LLM（token/成本失控）且编译源与库内正文漂移。
+		tr := &fakeTranslator{plan: emptyPlanJSON()}
+		fs, tool := setup(tr)
+		long := strings.Repeat("字", maxPlaybookContentRunes+50)
+		if _, err := tool.Execute(context.Background(), 7,
+			json.RawMessage(`{"schedule_id":"s1","content":"`+long+`"}`)); err != nil {
+			t.Fatalf("超限应截断而非报错: %v", err)
+		}
+		if n := len([]rune(tr.gotText)); n != maxPlaybookContentRunes {
+			t.Fatalf("翻译器应收到截断到 %d rune 的正文, 实得 %d", maxPlaybookContentRunes, n)
+		}
+		if tr.gotText != fs.upserts[0].content {
+			t.Fatalf("翻译器输入与落库正文必须逐字一致（否则计划与库内正文漂移）")
 		}
 	})
 }
