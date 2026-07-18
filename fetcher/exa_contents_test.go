@@ -60,8 +60,8 @@ func TestExaContents_产出与身份(t *testing.T) {
 	if !strings.HasPrefix(it.CanonicalKey, "contents://https://x.com/pricing#") {
 		t.Errorf("canonical_key 应为 contents://<url>#<hash>，实得 %q", it.CanonicalKey)
 	}
-	if it.Title != "Pricing" || it.Kind != types.KindArticle || it.URL != "https://x.com/pricing" {
-		t.Errorf("字段映射不符: %+v", it)
+	if it.Title != "Pricing" || it.Kind != types.KindPageContent || it.URL != "https://x.com/pricing" {
+		t.Errorf("字段映射不符（Kind 必须是 page_content，否则 Dedup 会吞掉变化）: %+v", it)
 	}
 	// 请求体：maxAgeHours:0 强制活抓（漏了它监控会静默失效）。
 	if !strings.Contains(gotReq, `"maxAgeHours":0`) {

@@ -494,6 +494,21 @@ func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem
 	kept := make([]types.ContentItem, 0, len(in.Items))
 	for _, item := range in.Items {
 		sh := dedup.Simhash(item.Title + " " + item.Content)
+
+		// KindPageContent（web/contents 页面监控）豁免近似去重：同一 URL 的相邻版本
+		// 正文几乎相同（定价页只几个价格数字变），simhash 距离必 ≤ simhashThreshold，
+		// 无条件近似去重会把"变化"当重复吞掉——这正是 page_watch 当年的事故（契约 §1.1）。
+		// 精确去重由 canonical_key（contents://url#textHash）的 UNIQUE 承担：内容没变
+		// 撞键、在 UpsertContentItem 就被去重，根本进不到本批；能到这里的都是真的新版本。
+		// 仍回填 simhash（Push 建 Delivery 要用）；但**不进 batchSeen**——一个页面的
+		// 版本不该成为别人的近重复判据。
+		if item.Kind == types.KindPageContent {
+			s := sh
+			item.Simhash = &s
+			kept = append(kept, item)
+			continue
+		}
+
 		// 候选集 = 用户级历史 simhash ∪ 全局批内已保留 simhash。
 		candidates := append(append([]int64{}, hist...), batchSeen...)
 		if dedup.IsNearDup(sh, candidates, simhashThreshold) {

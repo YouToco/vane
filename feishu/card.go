@@ -200,7 +200,7 @@ func BuildDeliveryCard(input feedback.CardInput) string {
 					"max_length": 500,
 				},
 				map[string]any{
-					"tag":  "button",
+					"tag": "button",
 					// form 内的交互组件必须有 name（缺失报 200530）；且 form 容器要求
 					// 至少一个 form_action_type=submit 的提交按钮——缺失时整卡非法：
 					// 发消息被拒（300123），作为回调响应返回则客户端报 200673

@@ -2527,8 +2527,6 @@ func NewDepartmentIdBuilder() *DepartmentIdBuilder {
 	return builder
 }
 
-//
-//
 // 示例值：
 func (builder *DepartmentIdBuilder) DepartmentId(departmentId string) *DepartmentIdBuilder {
 	builder.departmentId = departmentId
@@ -2536,8 +2534,6 @@ func (builder *DepartmentIdBuilder) DepartmentId(departmentId string) *Departmen
 	return builder
 }
 
-//
-//
 // 示例值：
 func (builder *DepartmentIdBuilder) OpenDepartmentId(openDepartmentId string) *DepartmentIdBuilder {
 	builder.openDepartmentId = openDepartmentId
@@ -7279,8 +7275,6 @@ func NewUserIdBuilder() *UserIdBuilder {
 	return builder
 }
 
-//
-//
 // 示例值：
 func (builder *UserIdBuilder) UserId(userId string) *UserIdBuilder {
 	builder.userId = userId
@@ -7288,8 +7282,6 @@ func (builder *UserIdBuilder) UserId(userId string) *UserIdBuilder {
 	return builder
 }
 
-//
-//
 // 示例值：
 func (builder *UserIdBuilder) OpenId(openId string) *UserIdBuilder {
 	builder.openId = openId
@@ -7297,8 +7289,6 @@ func (builder *UserIdBuilder) OpenId(openId string) *UserIdBuilder {
 	return builder
 }
 
-//
-//
 // 示例值：
 func (builder *UserIdBuilder) UnionId(unionId string) *UserIdBuilder {
 	builder.unionId = unionId
@@ -7793,7 +7783,7 @@ func NewCreateChatReqBodyBuilder() *CreateChatReqBodyBuilder {
 
 // 群头像对应的 Image Key，可通过[上传图片](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/image/create)获取（注意：上传图片的 ==image_type== 需要指定为 ==avatar==）
 //
-//示例值：default-avatar_44ae0ca3-e140-494b-956f-78091e348435
+// 示例值：default-avatar_44ae0ca3-e140-494b-956f-78091e348435
 func (builder *CreateChatReqBodyBuilder) Avatar(avatar string) *CreateChatReqBodyBuilder {
 	builder.avatar = avatar
 	builder.avatarSet = true
@@ -7802,7 +7792,7 @@ func (builder *CreateChatReqBodyBuilder) Avatar(avatar string) *CreateChatReqBod
 
 // 群名称;; **注意：** ;- 公开群名称的长度不得少于2个字符;- 私有群若未填写群名称，群名称默认设置为 ”`(无主题)`“
 //
-//示例值：测试群名称
+// 示例值：测试群名称
 func (builder *CreateChatReqBodyBuilder) Name(name string) *CreateChatReqBodyBuilder {
 	builder.name = name
 	builder.nameSet = true
@@ -7811,7 +7801,7 @@ func (builder *CreateChatReqBodyBuilder) Name(name string) *CreateChatReqBodyBui
 
 // 群描述
 //
-//示例值：测试群描述
+// 示例值：测试群描述
 func (builder *CreateChatReqBodyBuilder) Description(description string) *CreateChatReqBodyBuilder {
 	builder.description = description
 	builder.descriptionSet = true
@@ -7820,7 +7810,7 @@ func (builder *CreateChatReqBodyBuilder) Description(description string) *Create
 
 // 群国际化名称
 //
-//示例值：
+// 示例值：
 func (builder *CreateChatReqBodyBuilder) I18nNames(i18nNames *I18nNames) *CreateChatReqBodyBuilder {
 	builder.i18nNames = i18nNames
 	builder.i18nNamesSet = true
@@ -7829,7 +7819,7 @@ func (builder *CreateChatReqBodyBuilder) I18nNames(i18nNames *I18nNames) *Create
 
 // 创建群时指定的群主，不填时指定建群的机器人为群主。群主 ID值应与查询参数中的 ==user_id_type== 对应；当ID类型为`open_id`时，可参考[如何获取 Open ID？](https://open.feishu.cn/document/uAjLw4CM/ugTN1YjL4UTN24CO1UjN/trouble-shooting/how-to-obtain-openid)来获取用户的Open ID
 //
-//示例值：4d7a3c6g
+// 示例值：4d7a3c6g
 func (builder *CreateChatReqBodyBuilder) OwnerId(ownerId string) *CreateChatReqBodyBuilder {
 	builder.ownerId = ownerId
 	builder.ownerIdSet = true
@@ -7838,7 +7828,7 @@ func (builder *CreateChatReqBodyBuilder) OwnerId(ownerId string) *CreateChatReqB
 
 // 创建群时邀请的群成员，ID 类型在查询参数 ==user_id_type== 中指定；当ID类型为`open_id`时，可参考[如何获取 Open ID？](https://open.feishu.cn/document/uAjLw4CM/ugTN1YjL4UTN24CO1UjN/trouble-shooting/how-to-obtain-openid)来获取用户的Open ID;;**注意**：;- 最多同时邀请 50 个用户;- 为便于在客户端查看效果，建议调试接口时加入开发者自身ID
 //
-//示例值：["4d7a3c6g"]
+// 示例值：["4d7a3c6g"]
 func (builder *CreateChatReqBodyBuilder) UserIdList(userIdList []string) *CreateChatReqBodyBuilder {
 	builder.userIdList = userIdList
 	builder.userIdListSet = true
@@ -7847,7 +7837,7 @@ func (builder *CreateChatReqBodyBuilder) UserIdList(userIdList []string) *Create
 
 // 创建群时邀请的群机器人；可参考[如何获取应用的 App ID？](https://open.feishu.cn/document/uAjLw4CM/ugTN1YjL4UTN24CO1UjN/trouble-shooting/how-to-obtain-app-id)来获取应用的App ID; ;**注意：** ;- 拉机器人入群请使用`app_id`;- 最多同时邀请5个机器人，并且群组最多容纳 15 个机器人
 //
-//示例值：["cli_a10fbf7e94b8d01d"]
+// 示例值：["cli_a10fbf7e94b8d01d"]
 func (builder *CreateChatReqBodyBuilder) BotIdList(botIdList []string) *CreateChatReqBodyBuilder {
 	builder.botIdList = botIdList
 	builder.botIdListSet = true
@@ -7856,7 +7846,7 @@ func (builder *CreateChatReqBodyBuilder) BotIdList(botIdList []string) *CreateCh
 
 // 群消息模式
 //
-//示例值：chat
+// 示例值：chat
 func (builder *CreateChatReqBodyBuilder) GroupMessageType(groupMessageType string) *CreateChatReqBodyBuilder {
 	builder.groupMessageType = groupMessageType
 	builder.groupMessageTypeSet = true
@@ -7865,7 +7855,7 @@ func (builder *CreateChatReqBodyBuilder) GroupMessageType(groupMessageType strin
 
 // 群模式;;**可选值有**：;- `group`：群组
 //
-//示例值：group
+// 示例值：group
 func (builder *CreateChatReqBodyBuilder) ChatMode(chatMode string) *CreateChatReqBodyBuilder {
 	builder.chatMode = chatMode
 	builder.chatModeSet = true
@@ -7874,7 +7864,7 @@ func (builder *CreateChatReqBodyBuilder) ChatMode(chatMode string) *CreateChatRe
 
 // 群类型;;**可选值有**：;- `private`：私有群;- `public`：公开群
 //
-//示例值：private
+// 示例值：private
 func (builder *CreateChatReqBodyBuilder) ChatType(chatType string) *CreateChatReqBodyBuilder {
 	builder.chatType = chatType
 	builder.chatTypeSet = true
@@ -7883,7 +7873,7 @@ func (builder *CreateChatReqBodyBuilder) ChatType(chatType string) *CreateChatRe
 
 // 入群消息可见性;;**可选值有**：;- `only_owner`：仅群主和管理员可见;- `all_members`：所有成员可见;- `not_anyone`：任何人均不可见
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *CreateChatReqBodyBuilder) JoinMessageVisibility(joinMessageVisibility string) *CreateChatReqBodyBuilder {
 	builder.joinMessageVisibility = joinMessageVisibility
 	builder.joinMessageVisibilitySet = true
@@ -7892,7 +7882,7 @@ func (builder *CreateChatReqBodyBuilder) JoinMessageVisibility(joinMessageVisibi
 
 // 退群消息可见性;;**可选值有**：;- `only_owner`：仅群主和管理员可见;- `all_members`：所有成员可见;- `not_anyone`：任何人均不可见
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *CreateChatReqBodyBuilder) LeaveMessageVisibility(leaveMessageVisibility string) *CreateChatReqBodyBuilder {
 	builder.leaveMessageVisibility = leaveMessageVisibility
 	builder.leaveMessageVisibilitySet = true
@@ -7901,7 +7891,7 @@ func (builder *CreateChatReqBodyBuilder) LeaveMessageVisibility(leaveMessageVisi
 
 // 加群审批;;**可选值有**：;- `no_approval_required`：无需审批;- `approval_required`：需要审批
 //
-//示例值：no_approval_required
+// 示例值：no_approval_required
 func (builder *CreateChatReqBodyBuilder) MembershipApproval(membershipApproval string) *CreateChatReqBodyBuilder {
 	builder.membershipApproval = membershipApproval
 	builder.membershipApprovalSet = true
@@ -7910,7 +7900,7 @@ func (builder *CreateChatReqBodyBuilder) MembershipApproval(membershipApproval s
 
 // 防泄密模式设置
 //
-//示例值：
+// 示例值：
 func (builder *CreateChatReqBodyBuilder) RestrictedModeSetting(restrictedModeSetting *RestrictedModeSetting) *CreateChatReqBodyBuilder {
 	builder.restrictedModeSetting = restrictedModeSetting
 	builder.restrictedModeSettingSet = true
@@ -7919,7 +7909,7 @@ func (builder *CreateChatReqBodyBuilder) RestrictedModeSetting(restrictedModeSet
 
 // 谁可以加急
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *CreateChatReqBodyBuilder) UrgentSetting(urgentSetting string) *CreateChatReqBodyBuilder {
 	builder.urgentSetting = urgentSetting
 	builder.urgentSettingSet = true
@@ -7928,7 +7918,7 @@ func (builder *CreateChatReqBodyBuilder) UrgentSetting(urgentSetting string) *Cr
 
 // 谁可以发起视频会议
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *CreateChatReqBodyBuilder) VideoConferenceSetting(videoConferenceSetting string) *CreateChatReqBodyBuilder {
 	builder.videoConferenceSetting = videoConferenceSetting
 	builder.videoConferenceSettingSet = true
@@ -7937,7 +7927,7 @@ func (builder *CreateChatReqBodyBuilder) VideoConferenceSetting(videoConferenceS
 
 // 谁可以编辑群信息
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *CreateChatReqBodyBuilder) EditPermission(editPermission string) *CreateChatReqBodyBuilder {
 	builder.editPermission = editPermission
 	builder.editPermissionSet = true
@@ -7946,7 +7936,7 @@ func (builder *CreateChatReqBodyBuilder) EditPermission(editPermission string) *
 
 // 隐藏群成员人数设置
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *CreateChatReqBodyBuilder) HideMemberCountSetting(hideMemberCountSetting string) *CreateChatReqBodyBuilder {
 	builder.hideMemberCountSetting = hideMemberCountSetting
 	builder.hideMemberCountSettingSet = true
@@ -8630,7 +8620,7 @@ func NewLinkChatReqBodyBuilder() *LinkChatReqBodyBuilder {
 
 // 群分享链接有效时长，可选值week、year、permanently，分别表示7天、1年以及永久有效
 //
-//示例值：week
+// 示例值：week
 func (builder *LinkChatReqBodyBuilder) ValidityPeriod(validityPeriod string) *LinkChatReqBodyBuilder {
 	builder.validityPeriod = validityPeriod
 	builder.validityPeriodSet = true
@@ -8983,7 +8973,7 @@ func NewUpdateChatReqBodyBuilder() *UpdateChatReqBodyBuilder {
 
 // 群头像对应的 Image Key，可通过[上传图片](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/image/create)获取（注意：上传图片的 ==image_type== 需要指定为 ==avatar==）
 //
-//示例值：default-avatar_44ae0ca3-e140-494b-956f-78091e348435
+// 示例值：default-avatar_44ae0ca3-e140-494b-956f-78091e348435
 func (builder *UpdateChatReqBodyBuilder) Avatar(avatar string) *UpdateChatReqBodyBuilder {
 	builder.avatar = avatar
 	builder.avatarSet = true
@@ -8992,7 +8982,7 @@ func (builder *UpdateChatReqBodyBuilder) Avatar(avatar string) *UpdateChatReqBod
 
 // 群名称
 //
-//示例值：群聊
+// 示例值：群聊
 func (builder *UpdateChatReqBodyBuilder) Name(name string) *UpdateChatReqBodyBuilder {
 	builder.name = name
 	builder.nameSet = true
@@ -9001,7 +8991,7 @@ func (builder *UpdateChatReqBodyBuilder) Name(name string) *UpdateChatReqBodyBui
 
 // 群描述
 //
-//示例值：测试群描述
+// 示例值：测试群描述
 func (builder *UpdateChatReqBodyBuilder) Description(description string) *UpdateChatReqBodyBuilder {
 	builder.description = description
 	builder.descriptionSet = true
@@ -9010,7 +9000,7 @@ func (builder *UpdateChatReqBodyBuilder) Description(description string) *Update
 
 // 群国际化名称
 //
-//示例值：
+// 示例值：
 func (builder *UpdateChatReqBodyBuilder) I18nNames(i18nNames *I18nNames) *UpdateChatReqBodyBuilder {
 	builder.i18nNames = i18nNames
 	builder.i18nNamesSet = true
@@ -9019,7 +9009,7 @@ func (builder *UpdateChatReqBodyBuilder) I18nNames(i18nNames *I18nNames) *Update
 
 // 邀请用户或机器人入群权限;;注意：;- 若值设置为`only_owner`，则share_card_permission只能设置为`not_allowed`;- 若值设置为`all_members`，则share_card_permission只能设置为`allowed`;;**可选值有**：;- `only_owner`：仅群主和管理员;- `all_members`：所有成员
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *UpdateChatReqBodyBuilder) AddMemberPermission(addMemberPermission string) *UpdateChatReqBodyBuilder {
 	builder.addMemberPermission = addMemberPermission
 	builder.addMemberPermissionSet = true
@@ -9028,7 +9018,7 @@ func (builder *UpdateChatReqBodyBuilder) AddMemberPermission(addMemberPermission
 
 // 群分享权限;;**可选值有**：;- `allowed`：允许;- `not_allowed`：不允许
 //
-//示例值：allowed
+// 示例值：allowed
 func (builder *UpdateChatReqBodyBuilder) ShareCardPermission(shareCardPermission string) *UpdateChatReqBodyBuilder {
 	builder.shareCardPermission = shareCardPermission
 	builder.shareCardPermissionSet = true
@@ -9037,7 +9027,7 @@ func (builder *UpdateChatReqBodyBuilder) ShareCardPermission(shareCardPermission
 
 // at 所有人权限;;**可选值有**：;- `only_owner`：仅群主和管理员;- `all_members`：所有成员
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *UpdateChatReqBodyBuilder) AtAllPermission(atAllPermission string) *UpdateChatReqBodyBuilder {
 	builder.atAllPermission = atAllPermission
 	builder.atAllPermissionSet = true
@@ -9046,7 +9036,7 @@ func (builder *UpdateChatReqBodyBuilder) AtAllPermission(atAllPermission string)
 
 // 群编辑权限;;**可选值有**：;- `only_owner`：仅群主和管理员;- `all_members`：所有成员
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *UpdateChatReqBodyBuilder) EditPermission(editPermission string) *UpdateChatReqBodyBuilder {
 	builder.editPermission = editPermission
 	builder.editPermissionSet = true
@@ -9055,7 +9045,7 @@ func (builder *UpdateChatReqBodyBuilder) EditPermission(editPermission string) *
 
 // 新群主 ID
 //
-//示例值：4d7a3c6g
+// 示例值：4d7a3c6g
 func (builder *UpdateChatReqBodyBuilder) OwnerId(ownerId string) *UpdateChatReqBodyBuilder {
 	builder.ownerId = ownerId
 	builder.ownerIdSet = true
@@ -9064,7 +9054,7 @@ func (builder *UpdateChatReqBodyBuilder) OwnerId(ownerId string) *UpdateChatReqB
 
 // 入群消息可见性;;**可选值有**：;- `only_owner`：仅群主和管理员可见;- `all_members`：所有成员可见;- `not_anyone`：任何人均不可见
 //
-//示例值：only_owner
+// 示例值：only_owner
 func (builder *UpdateChatReqBodyBuilder) JoinMessageVisibility(joinMessageVisibility string) *UpdateChatReqBodyBuilder {
 	builder.joinMessageVisibility = joinMessageVisibility
 	builder.joinMessageVisibilitySet = true
@@ -9073,7 +9063,7 @@ func (builder *UpdateChatReqBodyBuilder) JoinMessageVisibility(joinMessageVisibi
 
 // 出群消息可见性;;**可选值有**：;- `only_owner`：仅群主和管理员可见;- `all_members`：所有成员可见;- `not_anyone`：任何人均不可见
 //
-//示例值：only_owner
+// 示例值：only_owner
 func (builder *UpdateChatReqBodyBuilder) LeaveMessageVisibility(leaveMessageVisibility string) *UpdateChatReqBodyBuilder {
 	builder.leaveMessageVisibility = leaveMessageVisibility
 	builder.leaveMessageVisibilitySet = true
@@ -9082,7 +9072,7 @@ func (builder *UpdateChatReqBodyBuilder) LeaveMessageVisibility(leaveMessageVisi
 
 // 加群审批;;**可选值有**：;- `no_approval_required`：无需审批;- `approval_required`：需要审批
 //
-//示例值：no_approval_required
+// 示例值：no_approval_required
 func (builder *UpdateChatReqBodyBuilder) MembershipApproval(membershipApproval string) *UpdateChatReqBodyBuilder {
 	builder.membershipApproval = membershipApproval
 	builder.membershipApprovalSet = true
@@ -9091,7 +9081,7 @@ func (builder *UpdateChatReqBodyBuilder) MembershipApproval(membershipApproval s
 
 // 防泄密模式设置
 //
-//示例值：
+// 示例值：
 func (builder *UpdateChatReqBodyBuilder) RestrictedModeSetting(restrictedModeSetting *RestrictedModeSetting) *UpdateChatReqBodyBuilder {
 	builder.restrictedModeSetting = restrictedModeSetting
 	builder.restrictedModeSettingSet = true
@@ -9100,7 +9090,7 @@ func (builder *UpdateChatReqBodyBuilder) RestrictedModeSetting(restrictedModeSet
 
 // 群类型;;**可选值有**：;- `private`：私有群;- `public`：公开群
 //
-//示例值：private
+// 示例值：private
 func (builder *UpdateChatReqBodyBuilder) ChatType(chatType string) *UpdateChatReqBodyBuilder {
 	builder.chatType = chatType
 	builder.chatTypeSet = true
@@ -9109,7 +9099,7 @@ func (builder *UpdateChatReqBodyBuilder) ChatType(chatType string) *UpdateChatRe
 
 // 群消息模式
 //
-//示例值：chat
+// 示例值：chat
 func (builder *UpdateChatReqBodyBuilder) GroupMessageType(groupMessageType string) *UpdateChatReqBodyBuilder {
 	builder.groupMessageType = groupMessageType
 	builder.groupMessageTypeSet = true
@@ -9118,7 +9108,7 @@ func (builder *UpdateChatReqBodyBuilder) GroupMessageType(groupMessageType strin
 
 // 谁可以加急
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *UpdateChatReqBodyBuilder) UrgentSetting(urgentSetting string) *UpdateChatReqBodyBuilder {
 	builder.urgentSetting = urgentSetting
 	builder.urgentSettingSet = true
@@ -9127,7 +9117,7 @@ func (builder *UpdateChatReqBodyBuilder) UrgentSetting(urgentSetting string) *Up
 
 // 谁可以发起视频会议
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *UpdateChatReqBodyBuilder) VideoConferenceSetting(videoConferenceSetting string) *UpdateChatReqBodyBuilder {
 	builder.videoConferenceSetting = videoConferenceSetting
 	builder.videoConferenceSettingSet = true
@@ -9136,7 +9126,7 @@ func (builder *UpdateChatReqBodyBuilder) VideoConferenceSetting(videoConferenceS
 
 // 隐藏群成员人数设置
 //
-//示例值：all_members
+// 示例值：all_members
 func (builder *UpdateChatReqBodyBuilder) HideMemberCountSetting(hideMemberCountSetting string) *UpdateChatReqBodyBuilder {
 	builder.hideMemberCountSetting = hideMemberCountSetting
 	builder.hideMemberCountSettingSet = true
@@ -9660,7 +9650,7 @@ func NewPatchChatAnnouncementReqBodyBuilder() *PatchChatAnnouncementReqBodyBuild
 
 // 文档当前版本号 int64 类型，[获取群公告信息](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/chat-announcement/get)接口会返回
 //
-//示例值：12
+// 示例值：12
 func (builder *PatchChatAnnouncementReqBodyBuilder) Revision(revision string) *PatchChatAnnouncementReqBodyBuilder {
 	builder.revision = revision
 	builder.revisionSet = true
@@ -9669,7 +9659,7 @@ func (builder *PatchChatAnnouncementReqBodyBuilder) Revision(revision string) *P
 
 // 修改文档请求的序列化字段;;更新公告信息的格式和更新[云文档](https://open.feishu.cn/document/ukTMukTMukTM/uYDM2YjL2AjN24iNwYjN)格式相同
 //
-//示例值：{\"requestType\":\"InsertBlocksRequestType\",\"insertBlocksRequest\":{\"payload\":\"{\\\"blocks\\\":[{\\\"type\\\":\\\"paragraph\\\",\\\"paragraph\\\":{\\\"elements\\\":[{\\\"type\\\":\\\"textRun\\\",\\\"textRun\\\":{\\\"text\\\":\\\"ylyyyyyDocs API Sample Content\\\",\\\"style\\\":{}}}],\\\"style\\\":{}}}]}\",\"location\":{\"zoneId\":\"0\",\"index\":0, \"endOfZone\": true}}}
+// 示例值：{\"requestType\":\"InsertBlocksRequestType\",\"insertBlocksRequest\":{\"payload\":\"{\\\"blocks\\\":[{\\\"type\\\":\\\"paragraph\\\",\\\"paragraph\\\":{\\\"elements\\\":[{\\\"type\\\":\\\"textRun\\\",\\\"textRun\\\":{\\\"text\\\":\\\"ylyyyyyDocs API Sample Content\\\",\\\"style\\\":{}}}],\\\"style\\\":{}}}]}\",\"location\":{\"zoneId\":\"0\",\"index\":0, \"endOfZone\": true}}}
 func (builder *PatchChatAnnouncementReqBodyBuilder) Requests(requests []string) *PatchChatAnnouncementReqBodyBuilder {
 	builder.requests = requests
 	builder.requestsSet = true
@@ -9796,7 +9786,7 @@ func NewAddManagersChatManagersReqBodyBuilder() *AddManagersChatManagersReqBodyB
 
 // 要增加的 manager_id;;**注意**：;- 对于普通群，最多指定 10 个管理员;- 对于超大群，最多指定 20 个管理员;- 每次请求最多指定 50 个用户或者 5 个机器人
 //
-//示例值：["ou_9204a37300b3700d61effaa439f34295"]
+// 示例值：["ou_9204a37300b3700d61effaa439f34295"]
 func (builder *AddManagersChatManagersReqBodyBuilder) ManagerIds(managerIds []string) *AddManagersChatManagersReqBodyBuilder {
 	builder.managerIds = managerIds
 	builder.managerIdsSet = true
@@ -9920,7 +9910,7 @@ func NewDeleteManagersChatManagersReqBodyBuilder() *DeleteManagersChatManagersRe
 
 // 要删除的 manager_id;;**注意**：每次请求最多指定 50 个用户或者 5 个机器人
 //
-//示例值：["ou_9204a37300b3700d61effaa439f34295"]
+// 示例值：["ou_9204a37300b3700d61effaa439f34295"]
 func (builder *DeleteManagersChatManagersReqBodyBuilder) ManagerIds(managerIds []string) *DeleteManagersChatManagersReqBodyBuilder {
 	builder.managerIds = managerIds
 	builder.managerIdsSet = true
@@ -10044,7 +10034,7 @@ func NewCreateChatMembersReqBodyBuilder() *CreateChatMembersReqBodyBuilder {
 
 // 成员ID列表，获取ID请参见[如何获得 User ID、Open ID 和 Union ID？](https://open.feishu.cn/document/home/user-identity-introduction/how-to-get);;**注意**：;- 成员列表不可为空;- 每次请求最多拉50个用户或者5个机器人，并且群组最多容纳15个机器人;- 列表中填写的成员ID类型应与 ==member_id_type== 参数中选择的类型相对应;- 对于已认证企业的飞书的群人数默认上限：普通群5000人，会议群3000人，话题群5000人。若租户管理员配置了群人数上限，则群人数上限为该人数上限。
 //
-//示例值：["ou_9204a37300b3700d61effaa439f34295"]
+// 示例值：["ou_9204a37300b3700d61effaa439f34295"]
 func (builder *CreateChatMembersReqBodyBuilder) IdList(idList []string) *CreateChatMembersReqBodyBuilder {
 	builder.idList = idList
 	builder.idListSet = true
@@ -10178,7 +10168,7 @@ func NewDeleteChatMembersReqBodyBuilder() *DeleteChatMembersReqBodyBuilder {
 
 // 成员列表;;**注意**：;- 成员列表不可为空;- 列表中填写的成员ID类型应与 ==member_id_type== 参数中选择的类型相对应
 //
-//示例值：["ou_9204a37300b3700d61effaa439f34295"]
+// 示例值：["ou_9204a37300b3700d61effaa439f34295"]
 func (builder *DeleteChatMembersReqBodyBuilder) IdList(idList []string) *DeleteChatMembersReqBodyBuilder {
 	builder.idList = idList
 	builder.idListSet = true
@@ -10489,7 +10479,7 @@ func NewPatchChatMenuItemReqBodyBuilder() *PatchChatMenuItemReqBodyBuilder {
 
 // 要修改的字段
 //
-//示例值：["ICON"]
+// 示例值：["ICON"]
 func (builder *PatchChatMenuItemReqBodyBuilder) UpdateFields(updateFields []string) *PatchChatMenuItemReqBodyBuilder {
 	builder.updateFields = updateFields
 	builder.updateFieldsSet = true
@@ -10498,7 +10488,7 @@ func (builder *PatchChatMenuItemReqBodyBuilder) UpdateFields(updateFields []stri
 
 // 元信息
 //
-//示例值：
+// 示例值：
 func (builder *PatchChatMenuItemReqBodyBuilder) ChatMenuItem(chatMenuItem *ChatMenuItem) *PatchChatMenuItemReqBodyBuilder {
 	builder.chatMenuItem = chatMenuItem
 	builder.chatMenuItemSet = true
@@ -10638,7 +10628,7 @@ func NewCreateChatMenuTreeReqBodyBuilder() *CreateChatMenuTreeReqBodyBuilder {
 
 // 要向群内追加的菜单
 //
-//示例值：
+// 示例值：
 func (builder *CreateChatMenuTreeReqBodyBuilder) MenuTree(menuTree *ChatMenuTree) *CreateChatMenuTreeReqBodyBuilder {
 	builder.menuTree = menuTree
 	builder.menuTreeSet = true
@@ -10751,7 +10741,7 @@ func NewDeleteChatMenuTreeReqBodyBuilder() *DeleteChatMenuTreeReqBodyBuilder {
 
 // 群内要删除的一级菜单ID。通过 [获取群菜单](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/chat-menu_tree/get) 接口获取群内菜单详情。
 //
-//示例值：7156553273518882844
+// 示例值：7156553273518882844
 func (builder *DeleteChatMenuTreeReqBodyBuilder) ChatMenuTopLevelIds(chatMenuTopLevelIds []string) *DeleteChatMenuTreeReqBodyBuilder {
 	builder.chatMenuTopLevelIds = chatMenuTopLevelIds
 	builder.chatMenuTopLevelIdsSet = true
@@ -10910,7 +10900,7 @@ func NewSortChatMenuTreeReqBodyBuilder() *SortChatMenuTreeReqBodyBuilder {
 
 // 新的一级菜单的顺序，进行排序ID列表需要跟群内目前存在的一级菜单ID列表对齐。通过 [获取群菜单](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/chat-menu_tree/get) 接口获取群内菜单详情。
 //
-//示例值：7156553273518882844
+// 示例值：7156553273518882844
 func (builder *SortChatMenuTreeReqBodyBuilder) ChatMenuTopLevelIds(chatMenuTopLevelIds []string) *SortChatMenuTreeReqBodyBuilder {
 	builder.chatMenuTopLevelIds = chatMenuTopLevelIds
 	builder.chatMenuTopLevelIdsSet = true
@@ -11116,7 +11106,7 @@ func NewUpdateChatModerationReqBodyBuilder() *UpdateChatModerationReqBodyBuilder
 
 // 群发言模式（all_members/only_owner/moderator_list，其中 moderator_list 表示部分用户可发言的模式）
 //
-//示例值：moderator_list
+// 示例值：moderator_list
 func (builder *UpdateChatModerationReqBodyBuilder) ModerationSetting(moderationSetting string) *UpdateChatModerationReqBodyBuilder {
 	builder.moderationSetting = moderationSetting
 	builder.moderationSettingSet = true
@@ -11125,7 +11115,7 @@ func (builder *UpdateChatModerationReqBodyBuilder) ModerationSetting(moderationS
 
 // 选择部分用户可发言模式时，添加的可发言用户列表（自动过滤不在群内的用户）
 //
-//示例值：["4d7a3c6g"]
+// 示例值：["4d7a3c6g"]
 func (builder *UpdateChatModerationReqBodyBuilder) ModeratorAddedList(moderatorAddedList []string) *UpdateChatModerationReqBodyBuilder {
 	builder.moderatorAddedList = moderatorAddedList
 	builder.moderatorAddedListSet = true
@@ -11134,7 +11124,7 @@ func (builder *UpdateChatModerationReqBodyBuilder) ModeratorAddedList(moderatorA
 
 // 选择部分用户可发言模式时，移除的可发言用户列表（自动过滤不在群内的用户）
 //
-//示例值：["4d7a3ih6"]
+// 示例值：["4d7a3ih6"]
 func (builder *UpdateChatModerationReqBodyBuilder) ModeratorRemovedList(moderatorRemovedList []string) *UpdateChatModerationReqBodyBuilder {
 	builder.moderatorRemovedList = moderatorRemovedList
 	builder.moderatorRemovedListSet = true
@@ -11289,7 +11279,7 @@ func NewCreateChatTabReqBodyBuilder() *CreateChatTabReqBodyBuilder {
 
 // 会话标签页;;**注意**：一个群内最多只允许添加20个自定义会话标签页
 //
-//示例值：
+// 示例值：
 func (builder *CreateChatTabReqBodyBuilder) ChatTabs(chatTabs []*ChatTab) *CreateChatTabReqBodyBuilder {
 	builder.chatTabs = chatTabs
 	builder.chatTabsSet = true
@@ -11402,7 +11392,7 @@ func NewDeleteTabsChatTabReqBodyBuilder() *DeleteTabsChatTabReqBodyBuilder {
 
 // 会话标签页ID列表，Tab ID可以在[添加会话标签页](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/chat-tab/create)与[拉取会话标签页](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/chat-tab/list_tabs)的返回值中获取
 //
-//示例值：["7101214603622940671", "7101214603622940672"]
+// 示例值：["7101214603622940671", "7101214603622940672"]
 func (builder *DeleteTabsChatTabReqBodyBuilder) TabIds(tabIds []string) *DeleteTabsChatTabReqBodyBuilder {
 	builder.tabIds = tabIds
 	builder.tabIdsSet = true
@@ -11561,7 +11551,7 @@ func NewSortTabsChatTabReqBodyBuilder() *SortTabsChatTabReqBodyBuilder {
 
 // 会话标签页ID列表，Tab ID可以在[添加会话标签页](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/chat-tab/create)与[拉取会话标签页](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/chat-tab/list_tabs)的返回值中获取;;**注意**：必须包含该会话中全部的Tab ID
 //
-//示例值：["7101214603622940671", "7101214603622940672"]
+// 示例值：["7101214603622940671", "7101214603622940672"]
 func (builder *SortTabsChatTabReqBodyBuilder) TabIds(tabIds []string) *SortTabsChatTabReqBodyBuilder {
 	builder.tabIds = tabIds
 	builder.tabIdsSet = true
@@ -11674,7 +11664,7 @@ func NewUpdateTabsChatTabReqBodyBuilder() *UpdateTabsChatTabReqBodyBuilder {
 
 // 会话标签页
 //
-//示例值：
+// 示例值：
 func (builder *UpdateTabsChatTabReqBodyBuilder) ChatTabs(chatTabs []*ChatTab) *UpdateTabsChatTabReqBodyBuilder {
 	builder.chatTabs = chatTabs
 	builder.chatTabsSet = true
@@ -11828,7 +11818,7 @@ func NewPutTopNoticeChatTopNoticeReqBodyBuilder() *PutTopNoticeChatTopNoticeReqB
 
 // 要进行发布的群置顶
 //
-//示例值：
+// 示例值：
 func (builder *PutTopNoticeChatTopNoticeReqBodyBuilder) ChatTopNotice(chatTopNotice []*ChatTopNotice) *PutTopNoticeChatTopNoticeReqBodyBuilder {
 	builder.chatTopNotice = chatTopNotice
 	builder.chatTopNoticeSet = true
@@ -11945,7 +11935,7 @@ func NewCreateFileReqBodyBuilder() *CreateFileReqBodyBuilder {
 
 // 文件类型
 //
-//示例值：mp4
+// 示例值：mp4
 func (builder *CreateFileReqBodyBuilder) FileType(fileType string) *CreateFileReqBodyBuilder {
 	builder.fileType = fileType
 	builder.fileTypeSet = true
@@ -11954,7 +11944,7 @@ func (builder *CreateFileReqBodyBuilder) FileType(fileType string) *CreateFileRe
 
 // 带后缀的文件名
 //
-//示例值：测试视频.mp4
+// 示例值：测试视频.mp4
 func (builder *CreateFileReqBodyBuilder) FileName(fileName string) *CreateFileReqBodyBuilder {
 	builder.fileName = fileName
 	builder.fileNameSet = true
@@ -11963,7 +11953,7 @@ func (builder *CreateFileReqBodyBuilder) FileName(fileName string) *CreateFileRe
 
 // 文件的时长（视频、音频），单位:毫秒。不填充时无法显示具体时长。
 //
-//示例值：3000
+// 示例值：3000
 func (builder *CreateFileReqBodyBuilder) Duration(duration int) *CreateFileReqBodyBuilder {
 	builder.duration = duration
 	builder.durationSet = true
@@ -11972,7 +11962,7 @@ func (builder *CreateFileReqBodyBuilder) Duration(duration int) *CreateFileReqBo
 
 // 文件内容
 //
-//示例值：二进制文件
+// 示例值：二进制文件
 func (builder *CreateFileReqBodyBuilder) File(file io.Reader) *CreateFileReqBodyBuilder {
 	builder.file = file
 	builder.fileSet = true
@@ -12196,7 +12186,7 @@ func NewCreateImageReqBodyBuilder() *CreateImageReqBodyBuilder {
 
 // 图片类型
 //
-//示例值：message
+// 示例值：message
 func (builder *CreateImageReqBodyBuilder) ImageType(imageType string) *CreateImageReqBodyBuilder {
 	builder.imageType = imageType
 	builder.imageTypeSet = true
@@ -12205,7 +12195,7 @@ func (builder *CreateImageReqBodyBuilder) ImageType(imageType string) *CreateIma
 
 // 图片内容;; **注意：** 上传的图片大小不能超过10MB
 //
-//示例值：二进制文件
+// 示例值：二进制文件
 func (builder *CreateImageReqBodyBuilder) Image(image io.Reader) *CreateImageReqBodyBuilder {
 	builder.image = image
 	builder.imageSet = true
@@ -12397,7 +12387,7 @@ func NewCreateMessageReqBodyBuilder() *CreateMessageReqBodyBuilder {
 
 // 消息接收者的ID，ID类型应与查询参数==receive_id_type== 对应；当ID类型为`open_id`时，可参考[如何获取 Open ID？](https://open.feishu.cn/document/uAjLw4CM/ugTN1YjL4UTN24CO1UjN/trouble-shooting/how-to-obtain-openid)来获取消息接收者的Open ID
 //
-//示例值：ou_7d8a6e6df7621556ce0d21922b676706ccs
+// 示例值：ou_7d8a6e6df7621556ce0d21922b676706ccs
 func (builder *CreateMessageReqBodyBuilder) ReceiveId(receiveId string) *CreateMessageReqBodyBuilder {
 	builder.receiveId = receiveId
 	builder.receiveIdSet = true
@@ -12406,7 +12396,7 @@ func (builder *CreateMessageReqBodyBuilder) ReceiveId(receiveId string) *CreateM
 
 // 消息类型 包括：text、post、image、file、audio、media、sticker、interactive、share_chat、share_user等，类型定义请参考[发送消息Content](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/im-v1/message/create_json)
 //
-//示例值：text
+// 示例值：text
 func (builder *CreateMessageReqBodyBuilder) MsgType(msgType string) *CreateMessageReqBodyBuilder {
 	builder.msgType = msgType
 	builder.msgTypeSet = true
@@ -12415,7 +12405,7 @@ func (builder *CreateMessageReqBodyBuilder) MsgType(msgType string) *CreateMessa
 
 // 消息内容，json结构序列化后的字符串。不同msg_type对应不同内容。消息类型 包括：text、post、image、file、audio、media、sticker、interactive、share_chat、share_user等，具体格式说明参考：[发送消息Content](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/im-v1/message/create_json);;<b>请求体大小限制</b>：;- 文本消息请求体最大不能超过150KB;- 卡片及富文本消息请求体最大不能超过30KB
 //
-//示例值：{\"text\":\"<at user_id=\\\"ou_155184d1e73cbfb8973e5a9e698e74f2\\\">Tom</at> test content\"}
+// 示例值：{\"text\":\"<at user_id=\\\"ou_155184d1e73cbfb8973e5a9e698e74f2\\\">Tom</at> test content\"}
 func (builder *CreateMessageReqBodyBuilder) Content(content string) *CreateMessageReqBodyBuilder {
 	builder.content = content
 	builder.contentSet = true
@@ -12424,7 +12414,7 @@ func (builder *CreateMessageReqBodyBuilder) Content(content string) *CreateMessa
 
 // 由开发者生成的唯一字符串序列，用于发送消息请求去重；持有相同uuid的请求1小时内至多成功执行一次
 //
-//示例值：a0d69e20-1dd1-458b-k525-dfeca4015204
+// 示例值：a0d69e20-1dd1-458b-k525-dfeca4015204
 func (builder *CreateMessageReqBodyBuilder) Uuid(uuid string) *CreateMessageReqBodyBuilder {
 	builder.uuid = uuid
 	builder.uuidSet = true
@@ -12667,7 +12657,7 @@ func NewForwardMessageReqBodyBuilder() *ForwardMessageReqBodyBuilder {
 
 // 依据receive_id_type的值，填写对应的转发目标的ID
 //
-//示例值：oc_a0553eda9014c201e6969b478895c230
+// 示例值：oc_a0553eda9014c201e6969b478895c230
 func (builder *ForwardMessageReqBodyBuilder) ReceiveId(receiveId string) *ForwardMessageReqBodyBuilder {
 	builder.receiveId = receiveId
 	builder.receiveIdSet = true
@@ -13019,7 +13009,7 @@ func NewMergeForwardMessageReqBodyBuilder() *MergeForwardMessageReqBodyBuilder {
 
 // 依据receive_id_type的值，填写对应的转发目标的ID
 //
-//示例值：oc_a0553eda9014c201e6969b478895c230
+// 示例值：oc_a0553eda9014c201e6969b478895c230
 func (builder *MergeForwardMessageReqBodyBuilder) ReceiveId(receiveId string) *MergeForwardMessageReqBodyBuilder {
 	builder.receiveId = receiveId
 	builder.receiveIdSet = true
@@ -13028,7 +13018,7 @@ func (builder *MergeForwardMessageReqBodyBuilder) ReceiveId(receiveId string) *M
 
 // 要转发的消息ID列表
 //
-//示例值：
+// 示例值：
 func (builder *MergeForwardMessageReqBodyBuilder) MessageIdList(messageIdList []string) *MergeForwardMessageReqBodyBuilder {
 	builder.messageIdList = messageIdList
 	builder.messageIdListSet = true
@@ -13170,7 +13160,7 @@ func NewPatchMessageReqBodyBuilder() *PatchMessageReqBodyBuilder {
 
 // 消息内容 json 格式，[发送消息 content 说明](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/im-v1/message/create_json)，参考文档中的卡片格式
 //
-//示例值：参考链接
+// 示例值：参考链接
 func (builder *PatchMessageReqBodyBuilder) Content(content string) *PatchMessageReqBodyBuilder {
 	builder.content = content
 	builder.contentSet = true
@@ -13278,7 +13268,7 @@ func NewPushFollowUpMessageReqBodyBuilder() *PushFollowUpMessageReqBodyBuilder {
 
 // follow up列表
 //
-//示例值：
+// 示例值：
 func (builder *PushFollowUpMessageReqBodyBuilder) FollowUps(followUps []*FollowUp) *PushFollowUpMessageReqBodyBuilder {
 	builder.followUps = followUps
 	builder.followUpsSet = true
@@ -13342,7 +13332,6 @@ func (builder *PushFollowUpMessageReqBuilder) MessageId(messageId string) *PushF
 	return builder
 }
 
-//
 func (builder *PushFollowUpMessageReqBuilder) Body(body *PushFollowUpMessageReqBody) *PushFollowUpMessageReqBuilder {
 	builder.body = body
 	return builder
@@ -13470,7 +13459,7 @@ func NewReplyMessageReqBodyBuilder() *ReplyMessageReqBodyBuilder {
 
 // 消息内容 json 格式，格式说明参考: [发送消息Content](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/im-v1/message/create_json)
 //
-//示例值：{\"text\":\"<at user_id=\\\"ou_155184d1e73cbfb8973e5a9e698e74f2\\\">Tom </at> test content\"}
+// 示例值：{\"text\":\"<at user_id=\\\"ou_155184d1e73cbfb8973e5a9e698e74f2\\\">Tom </at> test content\"}
 func (builder *ReplyMessageReqBodyBuilder) Content(content string) *ReplyMessageReqBodyBuilder {
 	builder.content = content
 	builder.contentSet = true
@@ -13479,7 +13468,7 @@ func (builder *ReplyMessageReqBodyBuilder) Content(content string) *ReplyMessage
 
 // 消息类型，包括：text、post、image、file、audio、media、sticker、interactive、share_card、share_user
 //
-//示例值：text
+// 示例值：text
 func (builder *ReplyMessageReqBodyBuilder) MsgType(msgType string) *ReplyMessageReqBodyBuilder {
 	builder.msgType = msgType
 	builder.msgTypeSet = true
@@ -13488,7 +13477,7 @@ func (builder *ReplyMessageReqBodyBuilder) MsgType(msgType string) *ReplyMessage
 
 // 是否以话题形式回复；若群聊已经是话题模式，则自动回复该条消息所在的话题
 //
-//示例值：false
+// 示例值：false
 func (builder *ReplyMessageReqBodyBuilder) ReplyInThread(replyInThread bool) *ReplyMessageReqBodyBuilder {
 	builder.replyInThread = replyInThread
 	builder.replyInThreadSet = true
@@ -13497,7 +13486,7 @@ func (builder *ReplyMessageReqBodyBuilder) ReplyInThread(replyInThread bool) *Re
 
 // 由开发者生成的唯一字符串序列，用于回复消息请求去重；持有相同uuid的请求1小时内至多成功执行一次
 //
-//示例值：a0d69e20-1dd1-458b-k525-dfeca4015204
+// 示例值：a0d69e20-1dd1-458b-k525-dfeca4015204
 func (builder *ReplyMessageReqBodyBuilder) Uuid(uuid string) *ReplyMessageReqBodyBuilder {
 	builder.uuid = uuid
 	builder.uuidSet = true
@@ -13702,7 +13691,7 @@ func NewUpdateMessageReqBodyBuilder() *UpdateMessageReqBodyBuilder {
 
 // 消息的类型，仅支持文本(text)和富文本(post)类型
 //
-//示例值：text
+// 示例值：text
 func (builder *UpdateMessageReqBodyBuilder) MsgType(msgType string) *UpdateMessageReqBodyBuilder {
 	builder.msgType = msgType
 	builder.msgTypeSet = true
@@ -13711,7 +13700,7 @@ func (builder *UpdateMessageReqBodyBuilder) MsgType(msgType string) *UpdateMessa
 
 // 消息内容，JSON 格式
 //
-//示例值：{"text":"test content"}
+// 示例值：{"text":"test content"}
 func (builder *UpdateMessageReqBodyBuilder) Content(content string) *UpdateMessageReqBodyBuilder {
 	builder.content = content
 	builder.contentSet = true
@@ -14073,7 +14062,7 @@ func NewBatchQueryMessageReactionReqBodyBuilder() *BatchQueryMessageReactionReqB
 
 // 要查询的消息
 //
-//示例值：
+// 示例值：
 func (builder *BatchQueryMessageReactionReqBodyBuilder) Queries(queries []*MessageQuery) *BatchQueryMessageReactionReqBodyBuilder {
 	builder.queries = queries
 	builder.queriesSet = true
@@ -14082,7 +14071,7 @@ func (builder *BatchQueryMessageReactionReqBodyBuilder) Queries(queries []*Messa
 
 // 每个消息最多返回多少个表情
 //
-//示例值：10
+// 示例值：10
 func (builder *BatchQueryMessageReactionReqBodyBuilder) PageSizePerMessage(pageSizePerMessage int) *BatchQueryMessageReactionReqBodyBuilder {
 	builder.pageSizePerMessage = pageSizePerMessage
 	builder.pageSizePerMessageSet = true
@@ -14091,7 +14080,7 @@ func (builder *BatchQueryMessageReactionReqBodyBuilder) PageSizePerMessage(pageS
 
 // 表情类型
 //
-//示例值：LAUGH
+// 示例值：LAUGH
 func (builder *BatchQueryMessageReactionReqBodyBuilder) ReactionType(reactionType string) *BatchQueryMessageReactionReqBodyBuilder {
 	builder.reactionType = reactionType
 	builder.reactionTypeSet = true
@@ -14246,7 +14235,7 @@ func NewCreateMessageReactionReqBodyBuilder() *CreateMessageReactionReqBodyBuild
 
 // reaction资源类型
 //
-//示例值：
+// 示例值：
 func (builder *CreateMessageReactionReqBodyBuilder) ReactionType(reactionType *Emoji) *CreateMessageReactionReqBodyBuilder {
 	builder.reactionType = reactionType
 	builder.reactionTypeSet = true
@@ -14591,7 +14580,7 @@ func NewCreatePinReqBodyBuilder() *CreatePinReqBodyBuilder {
 
 // 待Pin的消息ID，详情参见[消息ID说明](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message/intro#ac79c1c2)
 //
-//示例值：om_dc13264520392913993dd051dba21dcf
+// 示例值：om_dc13264520392913993dd051dba21dcf
 func (builder *CreatePinReqBodyBuilder) MessageId(messageId string) *CreatePinReqBodyBuilder {
 	builder.messageId = messageId
 	builder.messageIdSet = true
@@ -14828,7 +14817,7 @@ func NewForwardThreadReqBodyBuilder() *ForwardThreadReqBodyBuilder {
 
 // 依据receive_id_type的值，填写对应的转发目标的ID
 //
-//示例值：oc_a0553eda9014c201e6969b478895c230
+// 示例值：oc_a0553eda9014c201e6969b478895c230
 func (builder *ForwardThreadReqBodyBuilder) ReceiveId(receiveId string) *ForwardThreadReqBodyBuilder {
 	builder.receiveId = receiveId
 	builder.receiveIdSet = true

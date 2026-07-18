@@ -22,9 +22,8 @@ const (
 	CapContents  Capability = "contents"   // 监控指定 URL 的内容变化（Exa /contents 抓取）
 )
 
-// Kind 内容种类（content_items.kind）。当前只有 article 一种——page_watch 的
-// change 已下线（改由 Exa fetch 覆盖）。仍保留 typed 枚举与 kind 列：将来若再引入
-// 非 article 的内容种类（下游 pipeline 需要区别对待），这套承载不必重建。
+// Kind 内容种类（content_items.kind）。决定**下游 pipeline 怎么对待它**，
+// 目前唯一有区别的下游是 workflow.Dedup 的近似去重豁免（见 KindPageContent）。
 //
 // 【强制语义，M6 契约 §3.3.1，仍生效】Kind 必须活着走完 DB 往返：
 // **任何返回 []types.ContentItem 或 *types.ContentItem 的 store 方法，
@@ -34,7 +33,13 @@ const (
 type Kind string
 
 const (
-	KindArticle Kind = "article" // 一篇内容（当前唯一种类）
+	KindArticle Kind = "article" // 一篇内容（默认；文章/推文/笔记/搜索结果均属此）
+	// KindPageContent 是 web/contents 页面监控产出的"某页某版本的正文"。它必须与
+	// article 区分，因为**同一 URL 的相邻版本正文几乎相同**（定价页只有几个价格数字变），
+	// simhash 近似去重会把它们当重复吞掉——这正是 page_watch 当年的事故（M6 契约 §1.1：
+	// 降价 diff 汉明距离 0-1，必 ≤ simhashThreshold=3）。workflow.Dedup 对本 Kind 豁免
+	// 近似去重；精确去重由 canonical_key（contents://url#hash）的 UNIQUE 承担。
+	KindPageContent Kind = "page_content"
 )
 
 // SourceType 旧信源类型枚举，008 迁移后 DB 不再有 type 列。

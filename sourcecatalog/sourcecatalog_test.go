@@ -35,9 +35,10 @@ func TestLookup(t *testing.T) {
 	if e, ok := Lookup(types.PlatformXHS, types.CapUserPosts); !ok || !e.Available() {
 		t.Errorf("xhs/user_posts 应可用，实际 ok=%v entry=%+v", ok, e)
 	}
-	// web/contents（页面内容监控，Exa /contents）应可用且产出 article。
-	if e, ok := Lookup(types.PlatformWeb, types.CapContents); !ok || !e.Available() || e.Kind != types.KindArticle {
-		t.Errorf("web/contents 应可用且 Kind=article，实际 ok=%v entry=%+v", ok, e)
+	// web/contents（页面内容监控，Exa /contents）应可用且产出 page_content
+	//（Kind 必须区别于 article，否则 Dedup 的近似去重会吞掉页面变化）。
+	if e, ok := Lookup(types.PlatformWeb, types.CapContents); !ok || !e.Available() || e.Kind != types.KindPageContent {
+		t.Errorf("web/contents 应可用且 Kind=page_content，实际 ok=%v entry=%+v", ok, e)
 	}
 	// 已知不可用组合（在表里，但 Unavailable）。
 	e, ok := Lookup(types.PlatformX, types.CapSearch)

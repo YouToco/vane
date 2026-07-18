@@ -234,8 +234,8 @@ func mapExaContents(src types.Source, pageURL, titleOverride string, results []e
 		Content:      truncateUTF8(r.Text, exaContentsMaxTextBytes),
 		PublishedAt:  nil, // 页面内容无发布时间，展示回退 fetched_at。
 		FetchedAt:    time.Now().UTC(),
-		CanonicalKey: canonicalKey,      // 自填，承载"内容变→新身份"。
-		Kind:         types.KindArticle, // 页面内容当一篇内容（当前唯一 Kind）。
+		CanonicalKey: canonicalKey,          // 自填，承载"内容变→新身份"。
+		Kind:         types.KindPageContent, // 页面内容——Dedup 据此豁免近似去重（否则变化被 simhash 吞）。
 	}
 	if !finalize(src, &item) {
 		return types.ContentItem{}, false

@@ -66,11 +66,11 @@ type ClickResult struct {
 
 // Deps 注入（main.go 装配，契约 §10.4）。
 type Deps struct {
-	Store    Store
-	Client   *llm.Client
-	Recorder *llm.Recorder
-	Sender   Sender
-	Notifier SessionNotifier
+	Store     Store
+	Client    *llm.Client
+	Recorder  *llm.Recorder
+	Sender    Sender
+	Notifier  SessionNotifier
 	BuildCard CardBuilder
 	// DeepDiveModel deep_dive 生成用模型（cfg.LLM.AgentModel——Boss 拍板③：
 	// 深度解读值得 v4-pro，与打分/出卡的默认档分开）。
