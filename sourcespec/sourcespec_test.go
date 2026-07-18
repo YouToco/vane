@@ -48,8 +48,12 @@ func TestBuild_WebFeedWithCategories(t *testing.T) {
 	if msg != "" {
 		t.Fatalf("合法请求不应报错: %s", msg)
 	}
-	if src.URL != "https://openai.com/news/rss.xml" {
-		t.Errorf("URL 应为原始地址（categories 不入键）: %q", src.URL)
+	// 2026-07-18 起 categories **入键**，承载于 URL fragment（契约 §5.2【死结已解开】）：
+	// 原设计让同一 feed 的不同过滤共用一行 source，后订阅者会静默改掉先订阅者的过滤条件；
+	// 单 owner 下靠"回报配置变更"缓解，多租户下回报够不着受害者（被告知的是覆盖者）。
+	// fragment 承载判别位，既进幂等键、又不破坏前端 <a href> 与 fetcher 抓取。
+	if src.URL != "https://openai.com/news/rss.xml#vane-categories=product,research" {
+		t.Errorf("URL 应为原始地址 + categories 判别位: %q", src.URL)
 	}
 	var cfg struct {
 		Categories []string `json:"categories"`
@@ -57,17 +61,28 @@ func TestBuild_WebFeedWithCategories(t *testing.T) {
 	if err := json.Unmarshal(src.Config, &cfg); err != nil {
 		t.Fatalf("config 应包含 categories: %v", err)
 	}
-	if len(cfg.Categories) != 2 || cfg.Categories[0] != "Product" || cfg.Categories[1] != "Research" {
-		t.Errorf("categories 不符: %v", cfg.Categories)
+	// 归一化为小写+升序，与 fetcher.applyCategories 的匹配口径（ToLower+TrimSpace）对齐。
+	if len(cfg.Categories) != 2 || cfg.Categories[0] != "product" || cfg.Categories[1] != "research" {
+		t.Errorf("categories 应归一化为小写+升序: %v", cfg.Categories)
 	}
 }
 
-func TestBuild_WebFeedCategoriesNotInKey(t *testing.T) {
+// TestBuild_WebFeedCategoriesInKey 取代原 TestBuild_WebFeedCategoriesNotInKey。
+//
+// 原用例断言 categories **不**入键——那是契约 §5.2 记录在案的【结构性死结】的产物，
+// 2026-07-18 推翻：该取舍在单 owner 下成立，多租户下 B 会静默改掉 A 的过滤条件，
+// 而当时用以缓解的"回报配置变更"只到得了覆盖者、到不了受害者。原取舍权衡的两条代价
+// （前端死链、fetcher 需另取地址）都只针对合成 vane:// url，fragment 方案两条都不沾。
+func TestBuild_WebFeedCategoriesInKey(t *testing.T) {
 	catJSON, _ := json.Marshal([]string{"Product"})
 	a, _ := Build(Spec{Platform: "web", Capability: "feed", Params: map[string]string{"url": "https://openai.com/rss.xml"}})
 	b, _ := Build(Spec{Platform: "web", Capability: "feed", Params: map[string]string{"url": "https://openai.com/rss.xml", "categories": string(catJSON)}})
-	if a.URL != b.URL {
-		t.Errorf("categories 不应影响幂等键: %q vs %q", a.URL, b.URL)
+	if a.URL == b.URL {
+		t.Errorf("categories 必须影响幂等键，否则两份过滤器共用一行 source、后写者赢: %q", a.URL)
+	}
+	// 判别位之外的部分必须仍是那个真实地址：前端 <a href> 不能变死链，fetcher 照抓。
+	if got, want := a.URL, "https://openai.com/rss.xml"; got != want {
+		t.Errorf("无 categories 时 url 必须逐字节保持原样（存量源幂等键不得漂移）: %q", got)
 	}
 }
 

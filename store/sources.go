@@ -112,6 +112,22 @@ func (s *Store) ListSubscribedSourcesByUser(ctx context.Context, userID int64) (
 //   - title 用 COALESCE(NULLIF(...))：重复添加不带 title 时保留既有展示名，而非静默
 //     清成空串（代价是无法通过传空串清除 title，可接受）。
 //
+// config 用 `EXCLUDED.config || sources.config`（既有值胜出，只补缺键），不是替换。
+// 原先写的是 `config = EXCLUDED.config`，那是一处真实的数据损坏面，两类受害者：
+//
+//  1. **带外调优字段被重置**（单用户今天就能踩到）。lookback_days / num_results 被
+//     fetcher 读取，却从来不由 sourcespec 写入——它们是人工调过的。于是任何人重新添加
+//     同一个源（agent 加源、前端再订阅一次），config 就被一个不含这些键的新对象整个替换，
+//     调优被抹回默认。生产上 id=2/9 两个搜索源正带着这样的值。
+//  2. **跨用户改写**（多租户下的安全面）。A 与 B 订阅同一个源时共用一行，后写者能改掉
+//     前写者的配置。source 是跨租户共享的客观事实（不变量 I-T1），共享行上的"后写者赢"
+//     等于把一个用户的意图交给另一个用户支配。
+//
+// 先到先得是安全的，因为 UpsertSource 的两个调用方（agent 加源、API 订阅）**都是创建
+// 路径**，没有任何"更新信源配置"的合法流程依赖这里做更新；真要改配置应当走独立的 UPDATE。
+// 且影响抓取行为的字段一律编码进 url 幂等键（不变量 I-S2），命中既有行时它们本就相同，
+// 先到先得对它们是 no-op——真正被保护的正是上面那两类不在键里的字段。
+//
 // 新插入时 status / fetch_interval_seconds / next_fetch_at / fail_count 走 001 的 DB
 // 默认值（active / 1800 / now() / 0），调用方无需关心冷启动细节。
 func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (id int64, updated bool, err error) {
@@ -132,7 +148,7 @@ func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (id int64, 
 		 SET platform   = EXCLUDED.platform,
 		     capability = EXCLUDED.capability,
 		     title      = COALESCE(NULLIF(EXCLUDED.title, ''), sources.title),
-		     config     = EXCLUDED.config,
+		     config     = EXCLUDED.config || sources.config,
 		     updated_at = now()
 		 RETURNING id, xmax::text::bigint`,
 		src.Platform, src.Capability, src.URL, src.Title, cfg).Scan(&id, &xmax)

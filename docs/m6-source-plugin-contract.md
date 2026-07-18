@@ -634,7 +634,7 @@ func IdemKey(platform types.Platform, cap types.Capability, params map[string]st
 
 | capability | 入键参数（按此序） | 不入键 | 理由 |
 |---|---|---|---|
-| `web/feed` | （键 = 原始 url） | `lookback_days`、`categories` | **见下方死结** |
+| `web/feed` | （键 = 原始 url）+ `categories`（fragment 判别位，2026-07-18 起） | `lookback_days` | 见下方【死结已解开】 |
 | `web/search` | `q`, `category`, **`include_domains`**（排序后逗号 join） | `num_results` | 前三个改变**结果集**；`num_results` 只改条数不改语义 |
 | `web/page_watch` | `url`, **`selector`** | `min_rows`, `min_prices` | selector 改变**抽取什么**；闸门阈值只改灵敏度 |
 | `x/user_posts` | `screen_name` | `include_retweets`, `include_replies`, `lookback_days` | 后三者是**同一条流上的过滤器**，不是不同的流 |
@@ -653,7 +653,7 @@ Boss 先订 `openai.com/news/rss.xml` + `categories:["Product","Research"]`，
 三周后说"也想看政策动态" → agent 调 `add_source` 带 `categories:["Global Affairs"]`
 → 同一个 url → `ON CONFLICT (url) DO UPDATE SET config` → **前一份过滤器被覆盖**。
 
-**取舍（刻意，非疏忽）**：
+**原取舍（刻意，非疏忽）**：
 - 把 `categories` 塞进键 ⇒ 键变成 `vane://web/feed?url=…&categories=…`
   ⇒ 前端 `Sources.tsx` 的 RSS 分支 `<a href={s.url}>` **变成死链**（已复验的真实回归）
   ⇒ 且 fetcher 要 GET 的地址得从 config 另取。**代价大于收益。**
@@ -663,13 +663,46 @@ Boss 先订 `openai.com/news/rss.xml` + `categories:["Product","Research"]`，
   `add_source` 命中既有源时必须回报「已**更新**既有源的配置（原 categories: X → 新: Y）」
   而不是「已添加」。§17.3 ⑪ 真人验这一条。
 
+> #### 【2026-07-18 推翻】死结已解开——`categories` 改为**入键**（承载于 URL fragment）
+>
+> 上面那段取舍在**单 owner** 前提下成立，多租户下**结构性失效**，且它据以权衡的代价
+> 已被一个当时没考虑到的第三选项消除。两点分别说明：
+>
+> **1. 缓解措施在多租户下够不着受害者。** "消除静默"是把配置变更回报给**写入者**。
+> 单 owner 时写入者与受害者是同一个人（Boss 覆盖了自己的过滤器、被告知），成立；
+> 多租户下是 B 覆盖 A 的过滤器、而被告知的是 **B**——A 的信源从此抓回别人要的东西，
+> 且 A 永远不会收到任何提示。回报机制在结构上到不了受害者，因此不再构成缓解。
+> （况且它本就只落实了一半：agent 只说"已更新既有信源"、从未回报「原 X → 新 Y」；
+> API 订阅路径 `api/subscriptions.go` 直接丢弃 `updated`，那条路完全静默。）
+>
+> **2. 两条代价都只针对"合成 vane:// url"，fragment 方案不沾。**
+> 键写成 `https://openai.com/news/rss.xml#vane-categories=ai,research`：
+> - 前端 `<a href={s.url}>` 点开仍是真实 RSS 地址，**不是死链**（fragment 只是锚点）；
+> - fetcher **零改动**：Go 的 http 客户端不把 fragment 发到线上
+>   （`(*url.URL).RequestURI()` 不含 Fragment，已实测），`src.URL` 照抓不误。
+>
+> 于是「想要同一个 feed 的两种过滤 = 想要两个源」这句语义判断被**如实实现**了：
+> 两种过滤真的得到两行 source，各自抓各自的。内容层面仍由 canonical_key 去重，
+> 同一篇文章不会因此存两份；多出的成本只是同一个 RSS 多抓一次（RSS 抓取不计费）。
+>
+> **归一化口径**（与 `fetcher.applyCategories` 的匹配口径逐字对齐，两边不一致会
+> 让行为相同的两组分类建出两行源、或让行为不同的两组共用一行）：
+> `TrimSpace + 小写 + 去空 + 去重 + 升序`，逐项 `QueryEscape` 后逗号 join。
+> 排序是幂等键正确性的关键——分类是无序集合，集合相同、顺序不同必须是同一个源。
+>
+> **无 `categories` 时 url 逐字节保持原始地址**，存量 feed 源的幂等键不漂移。
+>
+> 守卫：`sourcespec/invariant_test.go`（不变量 I-S2）。
+> 遗留（不阻塞）：前端展示 `s.url` 时会连 `#vane-categories=…` 一起显示，属观感问题，
+> 待 vane-web 侧在渲染时剥掉判别位。
+
 ### 5.3 config schema —— **`lookback_days` 显式拒绝跨能力统一**（§0.4）
 
 | Platform/Capability | 字段 | 类型 | 默认 | 必填 | 入键 |
 |---|---|---|---|---|---|
 | **web/feed** | `url` | string | — | **是** | 键即它 |
 | | `lookback_days` | int | 7（0=默认，<0=不限） | 否 | 否 |
-| | `categories` | []string | nil（不限） | 否 ← 新增 | 否（**死结，见 §5.2**） |
+| | `categories` | []string | nil（不限） | 否 | **✓**（fragment 判别位，见 §5.2【死结已解开】） |
 | **web/search** | `query` | string | — | **是** | ✓ |
 | | `include_domains` | []string | nil | 否 ← **§0.3 的解药** | **✓ 必须** |
 | | `num_results` | int | 10（上限 100） | 否 | 否 |

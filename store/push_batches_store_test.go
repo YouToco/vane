@@ -50,6 +50,7 @@ func TestEmptyPushBatchStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
 	}
+	attachTenant(t, st, u.ID)
 	t.Cleanup(func() {
 		// **不能用上面那个 ctx**：t.Context() 返回的 context 在 Cleanup 执行**之前**
 		// 就被取消了（Go 1.24 起的既定语义），拿它发 DELETE 必然 context canceled。

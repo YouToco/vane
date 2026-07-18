@@ -40,9 +40,9 @@ func (s *Store) InsertDelivery(ctx context.Context, d *types.Delivery) (int64, e
 	var id int64
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO deliveries (
-			batch_id, user_id, content_item_id, score, body_md, card_json,
+			tenant_id, batch_id, user_id, content_item_id, score, body_md, card_json,
 			feishu_message_id, status
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		) VALUES (`+tenantOfUser+`$2), $1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id`,
 		d.BatchID, d.UserID, d.ContentItemID, d.Score, d.BodyMD, card,
 		d.FeishuMessageID, status,
@@ -74,9 +74,9 @@ func (s *Store) InsertDeliveryIdempotent(ctx context.Context, d *types.Delivery)
 	}
 	err = s.pool.QueryRow(ctx,
 		`INSERT INTO deliveries (
-			batch_id, user_id, content_item_id, score, body_md, card_json,
+			tenant_id, batch_id, user_id, content_item_id, score, body_md, card_json,
 			feishu_message_id, status
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		) VALUES (`+tenantOfUser+`$2), $1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (batch_id, content_item_id) WHERE content_item_id IS NOT NULL DO NOTHING
 		RETURNING id`,
 		d.BatchID, d.UserID, d.ContentItemID, d.Score, d.BodyMD, card,

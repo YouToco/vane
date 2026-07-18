@@ -73,7 +73,7 @@ func (s *Store) GetActiveAgentSession(ctx context.Context, userID int64, since t
 func (s *Store) CreateAgentSession(ctx context.Context, userID int64) (*types.AgentSession, error) {
 	var as types.AgentSession
 	err := scanAgentSession(s.pool.QueryRow(ctx,
-		`INSERT INTO agent_sessions (user_id) VALUES ($1)
+		`INSERT INTO agent_sessions (tenant_id, user_id) VALUES (`+tenantOfUser+`$1), $1)
 		 RETURNING `+agentSessionColumns, userID), &as)
 	if err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
@@ -150,8 +150,8 @@ func (s *Store) CreatePendingAction(ctx context.Context, a *types.PendingAction)
 	}
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO pending_actions
-		     (id, user_id, session_id, tool_name, args, summary, status, expires_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		     (id, tenant_id, user_id, session_id, tool_name, args, summary, status, expires_at)
+		 VALUES ($1, `+tenantOfUser+`$2), $2, $3, $4, $5, $6, $7, $8)`,
 		a.ID, a.UserID, a.SessionID, a.ToolName, args, a.Summary, status, a.ExpiresAt)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,

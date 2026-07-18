@@ -39,6 +39,7 @@ func TestProfileStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
 	}
+	attachTenant(t, st, u.ID)
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
 		defer cancel()
@@ -234,6 +235,7 @@ func TestProfileStore(t *testing.T) {
 		if err != nil {
 			t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
 		}
+		attachTenant(t, st, uRM.ID)
 		t.Cleanup(func() {
 			ctx, cancel := cleanupContext()
 			defer cancel()
@@ -328,11 +330,13 @@ func TestFeedbackStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
 	}
+	attachTenant(t, st, u.ID)
 	// u2 供负面清单与归属校验用例：其反馈与 u 完全隔离，互不污染 per-user 查询。
 	u2, err := st.UpsertUserByOpenID(ctx, "test_feedback2_"+uuid.NewString(), "feedback-test-2")
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID() u2 失败: %v", err)
 	}
+	attachTenant(t, st, u2.ID)
 	userIDs := []int64{u.ID, u2.ID}
 
 	srcID, _, err := st.UpsertSource(ctx, &types.Source{
@@ -646,6 +650,7 @@ func TestFeedbackStore(t *testing.T) {
 		if err != nil {
 			t.Fatalf("UpsertUserByOpenID() u3 失败: %v", err)
 		}
+		attachTenant(t, st, u3.ID)
 		batchID3, err := st.CreatePushBatch(ctx, u3.ID)
 		if err != nil {
 			t.Fatalf("CreatePushBatch() u3 失败: %v", err)

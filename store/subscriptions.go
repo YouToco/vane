@@ -11,9 +11,9 @@ import (
 // ON CONFLICT DO NOTHING 而非报冲突——"再点一次订阅"应静默成功而非报错。
 func (s *Store) AddSubscription(ctx context.Context, userID, sourceID int64) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO subscriptions (user_id, source_id)
-		 VALUES ($1, $2)
-		 ON CONFLICT (user_id, source_id) DO NOTHING`,
+		`INSERT INTO subscriptions (tenant_id, user_id, source_id)
+		 VALUES (`+tenantOfUser+`$1), $1, $2)
+		 ON CONFLICT (tenant_id, user_id, source_id) DO NOTHING`,
 		userID, sourceID)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,

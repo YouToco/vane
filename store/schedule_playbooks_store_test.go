@@ -34,10 +34,12 @@ func TestSchedulePlaybookStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建 owner 失败: %v", err)
 	}
+	attachTenant(t, st, u.ID)
 	u2, err := st.UpsertUserByOpenID(ctx, "test_playbook_stranger_"+uuid.NewString(), "playbook-stranger")
 	if err != nil {
 		t.Fatalf("建 stranger 失败: %v", err)
 	}
+	attachTenant(t, st, u2.ID)
 	schedID := "push-test-" + uuid.NewString()
 	if err := st.InsertSchedule(ctx, &types.Schedule{
 		ID: schedID, UserID: u.ID,

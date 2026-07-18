@@ -683,3 +683,31 @@ func TestSec_PlatformEndpointsGatedToOwner(t *testing.T) {
 		})
 	}
 }
+
+// TestSec_MultiTenantLoginFailsLoudly：用户属于多个租户时，登录必须**报错**而非
+// 静默登进第一个。
+//
+// 原实现 `return ms[0].TenantID` 会让这样的人进入「碰巧排在前面」的租户——
+// 他看到一份陌生的信源与推送历史，却没有任何提示说明发生了什么。
+// 与写入侧（store 的推导子查询报「多行」）和 a2a/gate（ownerResolver）三处对齐。
+func TestSec_MultiTenantLoginFailsLoudly(t *testing.T) {
+	mux, fake := newAuthTestServer(t)
+	u := fake.addUser(t, "multi@example.com", "multi-password-123", 11)
+	// 再给同一个人加一条别的租户成员关系。
+	fake.mu.Lock()
+	fake.members[u.ID] = append(fake.members[u.ID],
+		types.Membership{TenantID: 22, UserID: u.ID, Role: types.MembershipRoleOwner})
+	fake.mu.Unlock()
+
+	rec := postJSON(t, mux, "/api/auth/login",
+		map[string]string{"email": "multi@example.com", "password": "multi-password-123"}, nil)
+	if rec.Code == http.StatusOK {
+		t.Fatal("属于多个租户时不应登录成功 —— 会静默进入某一个租户")
+	}
+	if fake.sessionCount() != 0 {
+		t.Error("失败路径不得签发会话")
+	}
+	if !strings.Contains(errMsgOf(t, rec), "多个租户") {
+		t.Errorf("错误文案应点明多租户，实得 %q", errMsgOf(t, rec))
+	}
+}

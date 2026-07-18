@@ -73,8 +73,8 @@ func (s *Store) UpsertProfileFields(ctx context.Context, userID int64, industry,
 	// 使黑名单顺序确定，便于测试与人读。
 	var p types.Profile
 	err := scanProfile(s.pool.QueryRow(ctx,
-		`INSERT INTO profiles (user_id, industry, occupation, tags, updated_at)
-		 VALUES ($1, COALESCE($2, ''), COALESCE($3, ''), COALESCE($4::text[], '{}'), now())
+		`INSERT INTO profiles (tenant_id, user_id, industry, occupation, tags, updated_at)
+		 VALUES (`+tenantOfUser+`$1), $1, COALESCE($2, ''), COALESCE($3, ''), COALESCE($4::text[], '{}'), now())
 		 ON CONFLICT (user_id) DO UPDATE SET
 		     industry     = COALESCE($2, profiles.industry),
 		     occupation   = COALESCE($3, profiles.occupation),

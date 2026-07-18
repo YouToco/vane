@@ -17,7 +17,7 @@ import (
 func (s *Store) CreatePushBatch(ctx context.Context, userID int64) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO push_batches (user_id) VALUES ($1) RETURNING id`, userID).Scan(&id)
+		`INSERT INTO push_batches (tenant_id, user_id) VALUES (`+tenantOfUser+`$1), $1) RETURNING id`, userID).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("创建推送批次（user=%d）", userID), err)
@@ -55,7 +55,7 @@ func (s *Store) CreatePushBatch(ctx context.Context, userID int64) (int64, error
 func (s *Store) CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey, scheduleID string) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO push_batches (user_id, idempotency_key, schedule_id) VALUES ($1, $2, $3)
+		`INSERT INTO push_batches (tenant_id, user_id, idempotency_key, schedule_id) VALUES (`+tenantOfUser+`$1), $1, $2, $3)
 		 ON CONFLICT (idempotency_key) WHERE idempotency_key <> ''
 		 DO UPDATE SET user_id = EXCLUDED.user_id, exit_gate = '', stage_counts = '{}'
 		 RETURNING id`, userID, idempKey, nullableText(scheduleID)).Scan(&id)
@@ -126,8 +126,8 @@ func (s *Store) RecordEmptyPushBatch(ctx context.Context, userID int64, idempKey
 	}
 
 	err = s.pool.QueryRow(ctx,
-		`INSERT INTO push_batches (user_id, status, exit_gate, stage_counts, idempotency_key, schedule_id)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO push_batches (tenant_id, user_id, status, exit_gate, stage_counts, idempotency_key, schedule_id)
+		 VALUES (`+tenantOfUser+`$1), $1, $2, $3, $4, $5, $6)
 		 ON CONFLICT (idempotency_key) WHERE idempotency_key <> ''
 		 DO UPDATE SET exit_gate = EXCLUDED.exit_gate, stage_counts = EXCLUDED.stage_counts
 		 WHERE push_batches.status = $2

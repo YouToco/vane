@@ -39,8 +39,8 @@ func (s *Store) InsertSchedule(ctx context.Context, sc *types.Schedule) error {
 		status = types.ScheduleStatusActive
 	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO schedules (id, user_id, nl_description, spec_json, scope_json, status)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		`INSERT INTO schedules (id, tenant_id, user_id, nl_description, spec_json, scope_json, status)
+		 VALUES ($1, `+tenantOfUser+`$2), $2, $3, $4, $5, $6)`,
 		sc.ID, sc.UserID, sc.NLDescription, spec, scope, status)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,

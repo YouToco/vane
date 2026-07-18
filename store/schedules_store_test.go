@@ -36,6 +36,7 @@ func TestUpdateScheduleSpecStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
 	}
+	attachTenant(t, st, u.ID)
 	schedID := "push-test-" + uuid.NewString()
 	t.Cleanup(func() {
 		// 同 push_batches 测试：t.Context() 在 Cleanup 前已取消，必须另起 context，

@@ -47,6 +47,7 @@ type PrincipalResolver interface {
 type OwnerStore interface {
 	GetSetting(ctx context.Context, key string) (json.RawMessage, error)
 	UpsertUserByOpenID(ctx context.Context, openID, name string) (*types.User, error)
+	ListMembershipsByUser(ctx context.Context, userID int64) ([]types.Membership, error)
 }
 
 // ownerRecord 对应 owner 设置项的 value 结构。
@@ -109,5 +110,28 @@ func (r *ownerResolver) FromContext(ctx context.Context) (Principal, error) {
 	if err != nil {
 		return Principal{}, err
 	}
-	return Principal{TenantID: types.SingleTenantID, UserID: u.ID}, nil
+
+	// 租户**从 memberships 真查**，不写死 SingleTenantID。
+	//
+	// 写死曾经是对的（迁移把 owner 放进租户 1），但它是个会静默变错的假设：
+	// owner 若因任何原因换到别的租户，a2a 与 gate（两条走本解析器的轨）会继续
+	// 以租户 1 的身份读写——操作的是别人的数据，且没有任何报错。
+	//
+	// 多成员时同样响亮失败，与 HTTP 登录路径（api/auth.go 的 resolveTenant）
+	// 和写入路径（store/tenantderive.go 的推导子查询）三处对齐：
+	// 「尚未支持选择租户」这件事，必须处处都拦住，不能有一处替用户猜。
+	ms, err := r.store.ListMembershipsByUser(ctx, u.ID)
+	if err != nil {
+		return Principal{}, err
+	}
+	switch len(ms) {
+	case 0:
+		return Principal{}, types.NewAppError(types.CodeConflict,
+			"owner 尚未归属任何租户", nil)
+	case 1:
+		return Principal{TenantID: types.TenantID(ms[0].TenantID), UserID: u.ID}, nil
+	default:
+		return Principal{}, types.NewAppError(types.CodeConflict,
+			"owner 属于多个租户，当前版本无法确定应使用哪一个", nil)
+	}
 }
