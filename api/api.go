@@ -90,6 +90,9 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	// M7 运行统计端点（功能 6.5）：只读，成本/token/延迟/缓存按 span 聚合。
 	inner.HandleFunc("GET /api/admin/runstats", s.handleRunstats)
 
+	// M7 画像查看端点（功能 6.3）：只读，展示结构化标签 + 摘要画像（含负偏好尾句）；编辑写回留二期。
+	inner.HandleFunc("GET /api/profile", s.handleProfile)
+
 	mux.Handle("/api/", s.cors(s.requireSession(inner)))
 }
 
