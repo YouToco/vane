@@ -307,7 +307,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(0, "网络错误，请确认后端服务在线后重试");
   }
   // 会话失效统一踢回登录页；登录接口自身的 401 要留给登录页展示"密码错误"，不能跳
-  if (res.status === 401 && path !== "/api/auth/login") {
+  if (res.status === 401 && path !== "/api/auth/login" && path !== "/api/auth/register") {
     location.hash = "#/login";
     throw new ApiError(401, "登录已失效，请重新登录");
   }
@@ -386,7 +386,20 @@ function normalizeReport(raw: ObservabilityReport): ObservabilityReport {
 }
 
 export const api = {
-  login: (password: string) => post<{ ok: boolean }>("/api/auth/login", { password }),
+  // 认证改为邮箱+密码（后端决议 D2′，vane#73）。
+  //
+  // **必须与后端同批上线**：后端合并后旧的 {password} 形态会一律 401，
+  // 而这个 bundle 是线上 Dashboard 的唯一入口——前后端脱节就是全量登不进去。
+  login: (email: string, password: string) =>
+    post<{ ok: boolean; tenant_id: number }>("/api/auth/login", { email, password }),
+
+  // 注册需邀请码（后端决议 D4：邀请制是平台垫付第三方 API 成本的财务闸门）。
+  register: (email: string, password: string, inviteCode: string) =>
+    post<{ ok: boolean; tenant_id: number }>("/api/auth/register", {
+      email,
+      password,
+      invite_code: inviteCode,
+    }),
   logout: () => post<{ ok: boolean }>("/api/auth/logout"),
   me: () => request<{ ok: boolean }>("/api/auth/me"),
   feishuStatus: () => request<FeishuStatus>("/api/feishu/status"),

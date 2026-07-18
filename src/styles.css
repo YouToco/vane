@@ -322,6 +322,27 @@ a:hover {
   margin-top: 0;
 }
 
+/* 登录/注册模式切换：做成文字按钮而非另起一页——邀请制下注册是低频动作，
+   为它单开一个路由不值得，而切换本身要一眼可见，否则拿到邀请码的人找不到入口。 */
+.login-switch {
+  margin-top: 2px;
+  padding: 6px;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.login-switch:hover:not(:disabled) {
+  color: var(--primary);
+}
+
+.login-switch:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 /* ---------- 总览：状态大卡片 ---------- */
 
 .status-card {
