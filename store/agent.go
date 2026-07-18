@@ -84,7 +84,7 @@ func (s *Store) CreateAgentSession(ctx context.Context, userID int64) (*types.Ag
 
 // UpdateAgentSession 覆盖写 messages、turn_count 与 activated_tools，并刷新
 // updated_at（即续 TTL）。messages/activatedTools 列 NOT NULL，nil/空归一为 '[]'
-//（与 InsertSchedule 对 JSONB 列的处理一致）。
+// （与 InsertSchedule 对 JSONB 列的处理一致）。
 // 目标行不存在返回 CodeNotFound：调用方持有的 id 来自 Get/Create，更新不到行
 // 说明会话已被并发清理，静默成功会掩盖 bug。
 func (s *Store) UpdateAgentSession(ctx context.Context, id int64, messages json.RawMessage, turnCount int, activatedTools json.RawMessage) error {

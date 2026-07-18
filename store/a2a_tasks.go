@@ -200,6 +200,26 @@ func (s *Store) CountA2ATasks(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
+// FailStaleA2ATasks 把非终态（SUBMITTED/WORKING）且 updated_at 早于 olderThan 的任务
+// 批量置为 FAILED，返回受影响行数（对抗审查 A-1）。
+//
+// 为什么需要：assistant.chat 的执行跑在 SDK 后台 goroutine（不随 HTTP Shutdown 取消），
+// 进程重启/被 SIGKILL 时在飞任务被硬杀，DB 里永久停在 WORKING——轮询终态的对端 agent
+// 永久挂起。启动时调用一次即可清账（此刻进程刚起、无活任务，任何非终态都是上次的遗留）；
+// 只更新 status 提取列不改 task JSONB 的内部 status（GetTask 返回的 task.status 仍是旧值，
+// 但对端主要看不到——它轮询靠的是 List/status 列，且这是止血非精确重放）。
+// olderThan 传一个明显超过单任务预算的阈值（如 15min），避免多实例部署时误杀他机在飞任务。
+func (s *Store) FailStaleA2ATasks(ctx context.Context, olderThan time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE a2a_tasks SET status='TASK_STATE_FAILED', version=version+1, updated_at=now()
+		 WHERE status IN ('TASK_STATE_SUBMITTED','TASK_STATE_WORKING') AND updated_at < $1`,
+		olderThan)
+	if err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "清理滞留的 A2A 任务", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // clampA2APageSize 钳制 ListA2ATasks 页大小到 [1,200]：<=0 → 50（契约 §3 缺省）。
 func clampA2APageSize(n int) int {
 	switch {

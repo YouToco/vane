@@ -24,14 +24,14 @@ type DeliveryHistoryQuery struct {
 // Title 在 SQL 层做过空标题回退（COALESCE 到正文头 200 字符，同 PR#40 快通道口径），
 // 前端不需要再兜底。
 type DeliveryHistoryItem struct {
-	ID        int64      `json:"id"`
-	BatchID   int64      `json:"batch_id"`
-	Score     float64    `json:"score"`
-	Status    string     `json:"status"`
-	SentAt    *time.Time `json:"sent_at,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-	Title     string     `json:"title"` // 展示标题（空标题已回退正文头）
-	URL       string     `json:"url"`   // 原文链接；content_item 被删时为空串
+	ID        int64              `json:"id"`
+	BatchID   int64              `json:"batch_id"`
+	Score     float64            `json:"score"`
+	Status    string             `json:"status"`
+	SentAt    *time.Time         `json:"sent_at,omitempty"`
+	CreatedAt time.Time          `json:"created_at"`
+	Title     string             `json:"title"` // 展示标题（空标题已回退正文头）
+	URL       string             `json:"url"`   // 原文链接；content_item 被删时为空串
 	Feedbacks []DeliveryFeedback `json:"feedbacks"`
 }
 

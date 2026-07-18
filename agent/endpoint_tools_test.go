@@ -525,7 +525,7 @@ func BuildTools2Static(ep *EndpointTools) []Tool {
 }
 
 // TestEndpointTool_BigIntArgPrecision：大 ID 参数经 UseNumber 全链路保真到上游
-//（对抗审查 HIGH 缺陷）——validateEndpointArgs 不再用 float64 舍掉低位。
+// （对抗审查 HIGH 缺陷）——validateEndpointArgs 不再用 float64 舍掉低位。
 func TestEndpointTool_BigIntArgPrecision(t *testing.T) {
 	inv := &fakeInvoker{body: `{}`}
 	ep := newTestEndpointTools(inv, &fakeCounter{}, 10, 200)

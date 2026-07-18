@@ -143,11 +143,11 @@ func TestKindRoundtrip(t *testing.T) {
 // TestMigration012KindBackfill 验证 012 在**有空串污染**的库上的回填结果。
 //
 // 与 TestMigration007ContentIdentity 同理另建一次性库：必须先停在 012 之前才能
-// 人为造出 kind='' 的行（复刻生产污染的形态——008 之后 INSERT 显式写入 Go 零值
+// 人为造出 kind=” 的行（复刻生产污染的形态——008 之后 INSERT 显式写入 Go 零值
 // ""，覆盖列 DEFAULT），在共享测试库上做这件事会污染并行包的用例。
 //
 // 顺带钉死两件事：
-//   - WHERE kind='' 的选择性：非空值（change/article）一行都不许动；
+//   - WHERE kind=” 的选择性：非空值（change/article）一行都不许动；
 //   - 012 的 Down 段真的可执行——它是刻意的空段（纯数据回填无从回滚），而 008
 //     恰恰因 goose 注解问题炸过部署，"空 Down 段能被 goose 解析并执行"必须真跑
 //     一次 down 来证明，不能停留在纸面。

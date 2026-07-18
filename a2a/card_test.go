@@ -21,10 +21,12 @@ func TestBuildCard(t *testing.T) {
 	}
 	t.Logf("SDK 序列化实测形态（契约 §5.8 回填依据）: %s", raw)
 
-	// skill id 与 supportedInterfaces url。
+	// skill id 与 supportedInterfaces url（PR-4 起两个 skill，顺序固定）。
 	skills := m["skills"].([]any)
-	if len(skills) != 1 || skills[0].(map[string]any)["id"] != skillContentQuery {
-		t.Errorf("应恰有一个 skill %q，实际 %v", skillContentQuery, skills)
+	if len(skills) != 2 ||
+		skills[0].(map[string]any)["id"] != skillContentQuery ||
+		skills[1].(map[string]any)["id"] != skillAssistantChat {
+		t.Errorf("应恰有两个 skill [%q, %q]，实际 %v", skillContentQuery, skillAssistantChat, skills)
 	}
 	ifaces := m["supportedInterfaces"].([]any)
 	iface := ifaces[0].(map[string]any)

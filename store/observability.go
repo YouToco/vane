@@ -54,8 +54,8 @@ const (
 // ListScoreTraceStats 返回窗口内每个 trace 的打分区分度（探针 ①）。
 // minN 是"批"的最小规模（契约取 5）：样本太小时同分不能说明问题。
 //
-// error='' 过滤是必须的：失败行 completion 恒为 ''（llm/do.go 只在成功分支赋值），
-// 混进来会让 distinct 既可能虚高（多一个 ''）也可能虚低（整批失败时 distinct=1），
+// error=” 过滤是必须的：失败行 completion 恒为 ”（llm/do.go 只在成功分支赋值），
+// 混进来会让 distinct 既可能虚高（多一个 ”）也可能虚低（整批失败时 distinct=1），
 // 两个方向都是误判。
 func (s *Store) ListScoreTraceStats(ctx context.Context, since time.Time, minN int) ([]types.ScoreTraceStat, error) {
 	rows, err := s.pool.Query(ctx,
@@ -88,9 +88,9 @@ func (s *Store) ListScoreTraceStats(ctx context.Context, since time.Time, minN i
 // GetScoreQualityStat 返回窗口内的打分质量四联计数（探针 ②③）。
 //
 // 四个 FILTER 的边界即 llm/do.go 的真值表，不可随意增删：
-//   - error<>''            → 调用失败，条目被跳过，**没发分**（不是回退）
-//   - error='' 且无数字    → 静默回退中位分 50（含空 completion）
-//   - error='' 且 completion=''→ M3 事故的精确形状（DisableThinking 回归）
+//   - error<>”            → 调用失败，条目被跳过，**没发分**（不是回退）
+//   - error=” 且无数字    → 静默回退中位分 50（含空 completion）
+//   - error=” 且 completion=”→ M3 事故的精确形状（DisableThinking 回归）
 func (s *Store) GetScoreQualityStat(ctx context.Context, since time.Time) (types.ScoreQualityStat, error) {
 	var st types.ScoreQualityStat
 	err := s.pool.QueryRow(ctx,
