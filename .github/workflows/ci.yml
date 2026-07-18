@@ -62,7 +62,10 @@ jobs:
 
       - name: Install aliyun CLI
         run: |
-          curl -fsSL -o /tmp/aliyun.tgz https://github.com/aliyun/aliyun-cli/releases/latest/download/aliyun-cli-linux-latest-amd64.tgz
+          # release 资产名含版本号（无 latest 别名），从 API 取真实下载地址
+          url=$(curl -fsSL https://api.github.com/repos/aliyun/aliyun-cli/releases/latest \
+            | jq -r '.assets[] | select(.name | test("linux-.*-amd64\\.tgz$")) | .browser_download_url')
+          curl -fsSL -o /tmp/aliyun.tgz "$url"
           tar -xzf /tmp/aliyun.tgz -C /tmp
           sudo mv /tmp/aliyun /usr/local/bin/aliyun
 
