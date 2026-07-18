@@ -144,12 +144,6 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 	} else if !ok || tw.Kind != wantX {
 		t.Errorf("x/user_posts 产出 Kind=%q，sourcecatalog.KindOf=%q(ok=%v)，二者漂移", tw.Kind, wantX, ok)
 	}
-
-	// web/page_watch 的发射侧由 pagewatch 用例覆盖；此处锁登记侧必须是 change
-	// （若被误改成 article，simhash 近似去重会把页面变化静默吞掉——契约 §1.1）。
-	if k, ok := sourcecatalog.KindOf(types.PlatformWeb, types.CapPageWatch); !ok || k != types.KindChange {
-		t.Errorf("sourcecatalog web/page_watch 应登记为 change，实际 %q(ok=%v)", k, ok)
-	}
 }
 
 // TestFinalize_DropsItemWithoutKind 固定契约 §7.2(b)：Kind 空即拒，粒度是**单条**

@@ -35,12 +35,19 @@ var wantTables = []string{
 	"pending_actions",
 	// 007 内容身份关联表（欠账补记）
 	"content_sources",
-	// 011 M6 page_watch（欠账补记）
-	"page_snapshots",
 	// 013 A2A server 任务持久化
 	"a2a_tasks",
 	// 015 agent 工具调用记账（TikHub 端点注册表契约 §6）
 	"tool_calls",
+}
+
+// droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的
+// CREATE TABLE 集合里，但迁移跑完后不该存在，故不进 wantTables。
+// 单独列出而非默默忽略，是为了让"建了表却没记账"的守卫（下方双向对账）依然对
+// 真正的漏账生效——只豁免这里显式声明的、有意下线的表。
+//   - page_snapshots：011 为 page_watch 建，015 随 page_watch 下线删除。
+var droppedTables = map[string]bool{
+	"page_snapshots": true,
 }
 
 // TestMigrationsCoverWantTables 是对账守卫（a2a-contract §9.5）：扫 migrations/*.sql 的
@@ -75,7 +82,7 @@ func TestMigrationsCoverWantTables(t *testing.T) {
 		want[tbl] = true
 	}
 	for tbl, file := range created {
-		if !want[tbl] {
+		if !want[tbl] && !droppedTables[tbl] {
 			t.Errorf("%s 建了表 %s，但 wantTables 没记账", file, tbl)
 		}
 	}

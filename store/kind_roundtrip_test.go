@@ -12,13 +12,11 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-// TestKindRoundtrip 是 M6 契约 §16 的端到端往返用例（🔴，§3.3.1 头号致命缺陷的守卫）：
-// UpsertContentItem(Kind=change) → ListUnpushedByUser → 读回的 Kind 必须还是 change。
-//
-// 它抓的是"契约漏掉了 store 层 SQL"这件事本身——INSERT 列清单漏 kind 则 DB 落
-// DEFAULT 'article'，SELECT/Scan 漏 kind 则 Go 读回零值 ""；任一方向漏掉，下游
-// Dedup 的 change 豁免就恒不触发、页面变化被 simhash 静默吞掉，而查 content_items
-// 的探针照样是绿的（那些行在 Dedup 之前就已写入）。两个方向本用例都判红。
+// TestKindRoundtrip 是 M6 契约 §16 Kind 往返用例的收敛版：page_watch/change 下线后
+// kind 只剩 'article' 一种，无法再用"change vs article"验值区分，但仍守着一件事——
+// kind 列必须活着走完 DB 往返（SELECT/Scan 漏了 kind 则 Go 读回零值 "" ≠ 'article'，
+// 本用例判红）。将来若再引入非 article 的内容种类，应把当年的"两值对照"版本找回来
+// （git history: refactor/drop-page-watch 之前），以恢复对"读侧把 kind 写死成常量"的守护。
 // DB 门控（无 DATABASE_URL 跳过，CI 带 postgres 真跑）。
 func TestKindRoundtrip(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
@@ -65,26 +63,6 @@ func TestKindRoundtrip(t *testing.T) {
 		t.Fatalf("AddSubscription() 失败: %v", err)
 	}
 
-	// change 条目（I4 的主角）+ article 对照组：两种值都得原样活着走完往返，
-	// 只测 change 挡不住"读侧把 kind 写死成常量"这类退化。
-	changeKey := "watch://example.com/pricing#h1->h2-" + uuid.NewString()
-	change := &types.ContentItem{
-		SourceID:     srcID,
-		ExternalID:   "chg-" + uuid.NewString(),
-		CanonicalKey: changeKey,
-		URL:          "https://example.com/pricing",
-		Title:        "页面变化事件",
-		Content:      "价格行从 302 变为 298",
-		ContentHash:  "khash-" + uuid.NewString(),
-		Kind:         types.KindChange,
-	}
-	changeID, isNew, err := st.UpsertContentItem(ctx, change)
-	if err != nil {
-		t.Fatalf("UpsertContentItem(change) 失败: %v", err)
-	}
-	if !isNew {
-		t.Fatal("change 条目首插应 isNew=true（fixture 撞了库里已有身份，用例失去意义）")
-	}
 	articleKey := "https://example.com/article-" + uuid.NewString()
 	article := &types.ContentItem{
 		SourceID:     srcID,
@@ -96,25 +74,26 @@ func TestKindRoundtrip(t *testing.T) {
 		ContentHash:  "khash-" + uuid.NewString(),
 		Kind:         types.KindArticle,
 	}
-	articleID, _, err := st.UpsertContentItem(ctx, article)
+	articleID, isNew, err := st.UpsertContentItem(ctx, article)
 	if err != nil {
 		t.Fatalf("UpsertContentItem(article) 失败: %v", err)
 	}
+	if !isNew {
+		t.Fatal("article 条目首插应 isNew=true（fixture 撞了库里已有身份，用例失去意义）")
+	}
 
-	// 写侧真值：DB 列里存的必须是 'change' 本身，不是 DEFAULT 兜出来的 'article'
-	// 也不是空串。核对行数只认 count(*)（红线 7）。
+	// 写侧真值：DB 列里存的必须是 'article' 本身（不是空串）。核对行数只认 count(*)（红线 7）。
 	var stored int
 	if err := st.pool.QueryRow(ctx,
-		`SELECT count(*) FROM content_items WHERE canonical_key = $1 AND kind = 'change'`,
-		changeKey).Scan(&stored); err != nil {
-		t.Fatalf("核对 change 行的 kind 列失败: %v", err)
+		`SELECT count(*) FROM content_items WHERE canonical_key = $1 AND kind = 'article'`,
+		articleKey).Scan(&stored); err != nil {
+		t.Fatalf("核对 article 行的 kind 列失败: %v", err)
 	}
 	if stored != 1 {
-		t.Errorf("INSERT 后 DB 里 kind='change' 的该行应恰好 1 行，实际 %d（INSERT 漏写 kind 列或值被改写）", stored)
+		t.Errorf("INSERT 后 DB 里 kind='article' 的该行应恰好 1 行，实际 %d（INSERT 漏写 kind 列或值被改写）", stored)
 	}
 
-	// 读侧往返：workflow.Fetch 返回的正是 ListUnpushedByUser 的结果（不是本次抓到的
-	// items），所以 Dedup 看到的 Kind 只能来自这条 SELECT——它漏 kind，豁免就死。
+	// 读侧往返：SELECT/Scan 漏了 kind 列则读回零值 "" ≠ 'article'，本断言判红。
 	got, err := st.ListUnpushedByUser(ctx, u.ID, 100, 100)
 	if err != nil {
 		t.Fatalf("ListUnpushedByUser() 失败: %v", err)
@@ -123,20 +102,12 @@ func TestKindRoundtrip(t *testing.T) {
 	for _, ci := range got {
 		kinds[ci.ID] = ci.Kind
 	}
-	gotChange, ok := kinds[changeID]
-	if !ok {
-		t.Fatalf("change 条目 id=%d 未出现在未投递列表里（共 %d 条）", changeID, len(got))
-	}
-	if gotChange != types.KindChange {
-		t.Errorf("change 条目读回 Kind 应为 %q，实际 %q（SELECT/Scan 漏了 kind 列）",
-			types.KindChange, gotChange)
-	}
 	gotArticle, ok := kinds[articleID]
 	if !ok {
 		t.Fatalf("article 条目 id=%d 未出现在未投递列表里（共 %d 条）", articleID, len(got))
 	}
 	if gotArticle != types.KindArticle {
-		t.Errorf("article 条目读回 Kind 应为 %q，实际 %q", types.KindArticle, gotArticle)
+		t.Errorf("article 条目读回 Kind 应为 %q，实际 %q（SELECT/Scan 漏了 kind 列）", types.KindArticle, gotArticle)
 	}
 }
 

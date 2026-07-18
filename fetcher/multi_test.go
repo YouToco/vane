@@ -41,7 +41,7 @@ func TestMulti_DispatchesByType(t *testing.T) {
 	m := NewMulti(config.FetchConfig{
 		TimeoutSeconds: 10, MaxResponseMB: 1,
 		ExaAPIKey: "k", TikhubAPIKey: "k",
-	}, nil, nil)
+	}, nil)
 	// 子抓取器分别指向对应假服务端；RSS 放行环回（httptest 监听 127.0.0.1）。
 	m.rss = newTestFetcher()
 	m.exa.searchURL = exaSrv.URL
@@ -71,7 +71,7 @@ func TestMulti_DispatchesByType(t *testing.T) {
 }
 
 func TestMulti_UnknownPlatform(t *testing.T) {
-	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil, nil)
+	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil)
 	_, err := m.Fetch(context.Background(), types.Source{ID: 1, Platform: "carrier_pigeon"})
 	if !errors.Is(err, types.ErrValidation) {
 		t.Errorf("未知平台应判 ErrValidation，实际 %v", err)
@@ -85,7 +85,7 @@ func TestMulti_UnknownPlatform(t *testing.T) {
 // 被抓取时返回 CodeValidation，且**报错里带得出 sourcecatalog 的 Reason**——这正是契约 §2.2
 // 要的"机器可读的不可用原因"，让 agent 能解释为何不支持，而不是静默改道。
 func TestMulti_UnavailableCapabilityCarriesReason(t *testing.T) {
-	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil, nil)
+	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil)
 	_, err := m.Fetch(context.Background(), types.Source{
 		ID: 9, Platform: types.PlatformX, Capability: types.CapSearch,
 	})
@@ -112,14 +112,14 @@ func TestMulti_UnavailableCapabilityCarriesReason(t *testing.T) {
 //  2. 兜底离线：把所有**有 baseURL/searchURL 字段的联网 provider**指到一个**已关闭**的
 //     本地服务端——即便某 provider 跳过校验直接发请求，也是本地"连接被拒"秒失败，绝不打外网。
 //
-// rss/pageWatch 无远端 baseURL 字段（走 URL 参数 + 私网拦截），空 URL 在拨号前即校验失败。
+// rss 无远端 baseURL 字段（走 URL 参数 + 私网拦截），空 URL 在拨号前即校验失败。
 // 将来新增一个自带远端 baseURL 的 provider，请在下方 offline 覆盖里加一行。
 func TestMulti_EveryAvailableCapabilityIsWired(t *testing.T) {
 	// 已关闭的本地服务端：拿到 URL 后立即 Close，后续连接立刻 connection refused（本地、无外网）。
 	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	dead.Close()
 
-	m := NewMulti(config.FetchConfig{TimeoutSeconds: 5, MaxResponseMB: 1, ExaAPIKey: "k", TikhubAPIKey: "k"}, nil, nil)
+	m := NewMulti(config.FetchConfig{TimeoutSeconds: 5, MaxResponseMB: 1, ExaAPIKey: "k", TikhubAPIKey: "k"}, nil)
 	// 兜底把联网 provider 全指向死服务端（防将来 provider 跳过校验直接发请求时打外网）。
 	m.exa.searchURL = dead.URL
 	m.tikhub.baseURL = dead.URL

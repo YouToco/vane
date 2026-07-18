@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+### Removed
+- **下线 `web/page_watch` 页面变化监控能力**（`refactor/drop-page-watch`）：改由 Exa `/contents`
+  fetch API 覆盖，不再在 Go 侧自建抓取 + 基线 diff + LLM 重要性门。移除范围——
+  `fetcher/pagewatch.go`、`store/pagesnapshots.go`、`fetcher.SnapshotStore` 接口、
+  `types.CapPageWatch/KindChange/SnapshotVerdict/RefTypeSource/PageSnapshot`、scorer 的
+  change 打分 prompt、workflow Dedup 的 change 豁免、sourcecatalog 的 `web/page_watch` 条目、
+  agent `add_source` 工具对 `page_watch` 的暴露；迁移 015 DROP `page_snapshots` 表。
+  `kind` 列与 `KindArticle` 保留（承载全内容；当前唯一种类）。M6 契约 §10 标注为已下线的历史设计记录。
+  连带消解审计发现的 3 项（page_watch 幂等键裸 URL 源劫持、LLM 门 SettleSnapshot 死路径、
+  PageWatchFetcher.Fetch 主流程零测试）。`go vet`/全量单测（23 包）绿。
+
 ### 已知取舍（M2 审查记录，后续里程碑处理）
 - logout 仅清 cookie，无状态 HMAC token 到期前（30 天）理论上仍有效——泄漏 token 无法即时吊销。
   收紧方案：缩短 TTL 或签名里混入服务端 "valid-after" 时间戳。

@@ -212,11 +212,11 @@ func TestScore_SystemPromptPenalizesThinContent(t *testing.T) {
 	system := captured()[0].Messages[0].Content
 
 	for _, want := range []string{
-		"正文信息过少",            // 规则主语
+		"正文信息过少", // 规则主语
 		"为空、仅有话题标签、或短到看不出实质内容", // 点名 delivery 48 的实际形态
-		"给低分（0-20）",         // 明确分档，与"不感兴趣"同档
+		"给低分（0-20）", // 明确分档，与"不感兴趣"同档
 		"不要凭标题或话题标签想象正文可能写了什么", // 堵死编造原料
-		"无法判断价值的内容不该占用推送位",   // 给出理由（推送位是稀缺资源）
+		"无法判断价值的内容不该占用推送位",     // 给出理由（推送位是稀缺资源）
 	} {
 		if !strings.Contains(system, want) {
 			t.Errorf("scoreSystemPrompt 缺少信息过少压分规则 %q\n实得: %q", want, system)
@@ -382,35 +382,6 @@ func TestBuildScoreUserSanitizesContent(t *testing.T) {
 	// 最大的攻击面：一段自带终结符的 RSS 正文能把注入文字顶到定界块之外。
 	if n := strings.Count(got, "【待评估内容结束】"); n != 1 {
 		t.Errorf("内容里的伪造终结符应被消毒，实际出现 %d 次\n%s", n, got)
-	}
-}
-
-func TestScore_KindChangeUsesChangePrompt(t *testing.T) {
-	sc, captured := newCapturingScorer(t, http.StatusOK, "75", nil)
-	item := types.ContentItem{
-		ID:      99,
-		Kind:    types.KindChange,
-		Title:   "pricing changed",
-		Content: "+ Pro | $25\n- Pro | $20",
-	}
-	if _, err := sc.Score(context.Background(), 1, item, "trace-kc"); err != nil {
-		t.Fatalf("Score 意外报错: %v", err)
-	}
-	reqs := captured()
-	if len(reqs) != 1 {
-		t.Fatalf("请求数 = %d, 期望 1", len(reqs))
-	}
-	sys := ""
-	for _, m := range reqs[0].Messages {
-		if m.Role == "system" {
-			sys = m.Content
-		}
-	}
-	if !strings.Contains(sys, "页面变化的 diff") {
-		t.Errorf("KindChange 应使用 scoreChangeSystemPrompt，实际 system: %s", sys[:min(len(sys), 100)])
-	}
-	if strings.Contains(sys, "正文信息过少") {
-		t.Errorf("KindChange 不应包含「正文信息过少」惩罚规则")
 	}
 }
 
