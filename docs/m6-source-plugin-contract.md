@@ -674,7 +674,7 @@ Boss 先订 `openai.com/news/rss.xml` + `categories:["Product","Research"]`，
 | | `include_domains` | []string | nil | 否 ← **§0.3 的解药** | **✓ 必须** |
 | | `num_results` | int | 10（上限 100） | 否 | 否 |
 | | `provider_hints` | object | `{}` | 否 ← **见下** | ✓（`category` 项） |
-| | ~~`lookback_days`~~ | — | **不支持** | **见下** | — |
+| | `lookback_days` | int | **0=关闭（默认）**；>0=逃生阀 | 否（**逃生阀·手册强烈不建议**，见下） | 否 |
 | **web/page_watch** | `url` | string | — | **是** | ✓ |
 | | `selector` | string | ""（全页 `<tr>` 压平） | 否 | **✓ 必须** |
 | | `min_rows` / `min_prices` | int | 5 / 3（§10.5） | 否 | 否 |
@@ -713,28 +713,34 @@ Boss 先订 `openai.com/news/rss.xml` + `categories:["Product","Research"]`，
 - **这是诚实的泄漏，不是消除的泄漏**：I2 的真实表述是
   「**config 的顶层不出现供应商专属字段；供应商专属的一律进 `provider_hints` 并接受它会随供应商失效**」
 
-**`web/search` 不支持 `lookback_days`**（本契约的核心决定之一）：
+**`web/search` 的 `lookback_days` 默认关闭、仅作显式逃生阀、手册强烈不建议**（本契约的核心决定之一；追新以 `include_domains` 为准）：
 
 ```go
-// web/search 刻意**不提供** lookback_days。
+// web/search 的 lookback_days **默认关闭（0 或 <0 = 不发 startPublishedDate），
+// 仅作显式逃生阀，手册强烈不建议**。追新以 include_domains 为准
+// （§0.3 实测：无日期过滤 13/15 官方站，再加域名白名单 15/15）。
 //
 // 理由（2026-07-16 实测，见契约 §0.3）：Exa 的 publishedDate 是「从 HTML 内容解析出的
 // 创建日期**估计值**」（官方 OpenAPI spec 原文），而官方页普遍解析不出——
 // openai.com 系列 8 个官方页全部为 None；搜 Anthropic 时 25 条里 11 条为空，
 // 而这 11 条恰恰是最权威的页。故 startPublishedDate 会**精准地删掉你最想要的东西**：
-// 消融实验里加日期过滤后官方站占比 0/15，去掉后 13/15。
+// 消融实验里加日期过滤后官方站占比 0/15，去掉后 13/15。**因此默认必须关闭**——
+// 已落地：exa.go 的毒药 exaDefaultLookbackDays 已删，lookback_days<=0 时不发
+// startPublishedDate。**但保留字段作显式逃生阀**：用户明确写 lookback_days>0 时仍生效
+// （少数场景：追一个自身 publishedDate 可靠的窄域），这是下策，手册不主动建议。
 //
-// 这与 web/feed 的 lookback_days **语义相反**：feed 的 pubDate 是结构化必填字段，
-// 过滤它是对的（PR #13）。**同名概念在两个能力下含义不同——刻意不统一。**
+// 这与 web/feed 的 lookback_days **默认语义相反**：feed 的 pubDate 是结构化必填字段，
+// 默认过滤（7 天）是对的（PR #13）；Exa 的 publishedDate 是从 HTML 猜的，默认必须关。
+// **同名概念在两个能力下的默认含义不同——刻意不统一默认值，但两边都保留字段。**
 //
 // fetcher.go:196-199 现有注释声称"同一个 config 键在不同源类型下含义相同"——那个"统一"是错的。
 // 但注意它**不是**病因（git log -S 已复验）：该注释来自 7321efd(2026-07-16)，
 // 而毒药 exaDefaultLookbackDays 来自 83fc3a8(2026-07-14)，**晚两天**。
 // 它是症状（事后把错误的统一写成了规范），病因是 exa.go 的默认值本身。见契约 §0.4。
-// 落地时**顺手删掉 fetcher.go 那句"语义与 exaSourceConfig.LookbackDays 一致"**，
-// 换成"本键只对 web/feed 有意义，web/search 刻意不提供，见 m6 契约 §5.3"。
+// 可选清理：把 fetcher.go 那句"语义与 exaSourceConfig.LookbackDays 一致"改为
+// "本键对 web/feed 默认开启（7 天）、对 web/search 默认关闭仅作逃生阀，见 m6 契约 §5.3"。
 //
-// 存量 config 里若出现 lookback_days（source id=2/9 目前没有），忽略并记 WARN。
+// 存量 config 里若出现 lookback_days（source id=2/9 目前没有）：>0 按逃生阀生效，<=0 忽略。
 ```
 
 **`web/feed` 新增 `categories`**（实测支撑）：`openai.com/news/rss.xml` 的 item 带 `<category>`
@@ -1462,7 +1468,7 @@ ORDER BY ps.id DESC LIMIT 1;
 
 ## 11. `web/search` 修复（`fetcher/exa.go`）
 
-1. **删除 `lookback_days` / `startPublishedDate`**（§0.3、§5.3）
+1. **删除 lookback 的默认值（毒药 exaDefaultLookbackDays）**，改默认关闭；`lookback_days`>0 时仍产出 `startPublishedDate`（显式逃生阀，手册不建议，§0.3、§5.3）
 2. **新增 `include_domains` → `includeDomains`**（上限 1200 域名）
    - **绝不能与 `startPublishedDate` 并用**：实测两者并用返回 9/9 官方却全是边角料
      （`ben-bernanke`、`hard-questions`），**恰恰漏掉 `claude-sonnet-5` / `opus-4-8`**
@@ -2094,7 +2100,7 @@ smolvm），形态为**每任务新建、用完即毁**（ephemeral，不做长�
 -- 零部署止血：Boss 每天都在被推传闻站
 UPDATE sources SET config = config || '{"lookback_days":-1}'::jsonb WHERE id = 9;
 ```
-代码侧的正解（删 `web/search` 的 lookback + 加 `include_domains`）随 P2 落地。
+代码侧的正解（删 `web/search` 的 lookback **默认** + 加 `include_domains`）随 P2 落地。
 > 按 CLAUDE.md「对抗审查按风险分级」，`fetcher/exa.go` 属核心抓取路径 → 该修改上全流程审查。
 
 ### 19.1 分期（**已按对抗审查的诘问重排**）

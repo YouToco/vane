@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/YouToco/vane/scheduler"
@@ -36,6 +37,22 @@ type profileStore interface {
 	UpsertProfileFields(ctx context.Context, userID int64, industry, occupation *string, tags []string) (*types.Profile, error)
 }
 
+// playbookStore 是任务手册三条路径（view/edit_task_playbook + create_schedule 初始化）
+// 依赖的窄接口（*store.Store 已实现）。收窄理由同 profileStore：Execute 分支（rune 截断、
+// 归属未命中处理）可用内存假实现覆盖；归属校验的 SQL WHERE 本身只由 store 集成测试覆盖
+// （enable_source 先例）。Upsert 返回 ok bool（同 EnableSource 的 enabled bool）：
+// false=任务不存在/非本人，未写任何行。
+type playbookStore interface {
+	GetSchedulePlaybook(ctx context.Context, userID int64, scheduleID string) (*types.SchedulePlaybook, error)
+	UpsertSchedulePlaybook(ctx context.Context, userID int64, scheduleID, content string) (ok bool, err error)
+}
+
+// scheduleCreator 收窄 create_schedule 依赖的 scheduler 能力（*scheduler.Scheduler 已实现），
+// 使 Execute（含决策 D2 的手册初始化胶水）可用假实现单测，不必起真 Temporal。
+type scheduleCreator interface {
+	CreatePush(ctx context.Context, userID int64, spec scheduler.ScheduleSpec, scope workflow.PushScope, nlDesc string) (string, error)
+}
+
 // BuildTools 装配 agent 全部可用工具。返回的切片即工具白名单的静态部分（契约 §10）：
 // loop 只认这里注册的名字 + 会话已激活的 TikHub 端点（端点注册表契约 §4），
 // 模型编造的其余工具名一律拒绝。
@@ -48,12 +65,14 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger,
 		&removeSourceTool{st: st},
 		&enableSourceTool{st: st},
 		&listSchedulesTool{st: st},
-		&createScheduleTool{sched: sched},
+		&createScheduleTool{sched: sched, st: st}, // 加 st：创建即初始化手册（决策 D2）
 		&updateScheduleTool{sched: sched},
 		&removeScheduleTool{sched: sched},
 		&pushNowTool{pusher: pusher},
 		&viewProfileTool{st: st},
 		&updateProfileTool{st: st},
+		&viewTaskPlaybookTool{st: st}, // 情报任务手册（Task Playbook P0）
+		&editTaskPlaybookTool{st: st},
 	}
 	if endpoints != nil {
 		tools = append(tools, endpoints.SearchTool())
@@ -122,17 +141,18 @@ func (t *listSourcesTool) Summarize(json.RawMessage) string { return "" }
 // M6 契约 §13.1【硬约束】：legacy type 垫片只服务 HTTP api（vane-web 兼容窗口），
 // 绝不进 agent 面，否则等于给模型两条重叠表达路（曾让 Boss 听见「已添加 tikhub_xhs 源」）。
 type addSourceArgs struct {
-	Platform   string   `json:"platform"`
-	Capability string   `json:"capability"`
-	URL        string   `json:"url"`
-	Query      string   `json:"query"`
-	Keyword    string   `json:"keyword"`
-	ScreenName string   `json:"screen_name"`
-	UserID     string   `json:"user_id"`     // xhs/user_posts：小红书用户 ID
-	ProfileURL string   `json:"profile_url"` // xhs/user_posts：小红书用户主页链接（可替代 user_id）
-	Title      string   `json:"title"`
-	Category   string   `json:"category"`
-	Categories []string `json:"categories"`
+	Platform       string   `json:"platform"`
+	Capability     string   `json:"capability"`
+	URL            string   `json:"url"`
+	Query          string   `json:"query"`
+	Keyword        string   `json:"keyword"`
+	ScreenName     string   `json:"screen_name"`
+	UserID         string   `json:"user_id"`     // xhs/user_posts：小红书用户 ID
+	ProfileURL     string   `json:"profile_url"` // xhs/user_posts：小红书用户主页链接（可替代 user_id）
+	Title          string   `json:"title"`
+	Category       string   `json:"category"`
+	Categories     []string `json:"categories"`
+	IncludeDomains []string `json:"include_domains"` // 仅 web/search：Exa 域名白名单（追新解药）
 }
 
 // addSourceSchema 对齐 M6 信源插件化契约：只有新 schema（platform + capability + params）。
@@ -160,7 +180,8 @@ const addSourceSchema = `{
     "profile_url": {"type": "string", "description": "小红书用户主页链接（如 https://www.xiaohongshu.com/user/profile/<id>），platform=xhs capability=user_posts 时可替代 user_id"},
     "title": {"type": "string", "description": "可选：展示名，缺省按类型自动生成"},
     "category": {"type": "string", "description": "可选：Exa 结果类别（如 news），仅 web/search 生效"},
-    "categories": {"type": "array", "items": {"type": "string"}, "description": "可选：RSS 分类过滤（如 [\"Product\",\"Research\"]），仅 web/feed 生效；不传=不限"}
+    "categories": {"type": "array", "items": {"type": "string"}, "description": "可选：RSS 分类过滤（如 [\"Product\",\"Research\"]），仅 web/feed 生效；不传=不限"},
+    "include_domains": {"type": "array", "items": {"type": "string"}, "description": "可选：限定 Exa 搜索只返回这些域名的结果（如 [\"anthropic.com\",\"claude.com\"]），仅 web/search 生效；追新优先用它、避免日期过滤把无发布日期的官方页删光；不传=不限"}
   }
 }`
 
@@ -219,6 +240,12 @@ func specFromArgs(a addSourceArgs) sourcespec.Spec {
 		catJSON, _ := json.Marshal(a.Categories)
 		params["categories"] = string(catJSON)
 	}
+	// include_domains：[]string → JSON 字符串数组进 params（与 categories 同一序列化路径），
+	// sourcespec 反序列化后归一化 + 入 config/幂等键（D-2 修复）。
+	if len(a.IncludeDomains) > 0 {
+		domJSON, _ := json.Marshal(a.IncludeDomains)
+		params["include_domains"] = string(domJSON)
+	}
 	return sourcespec.Spec{
 		Platform:   a.Platform,
 		Capability: a.Capability,
@@ -271,6 +298,9 @@ func (t *addSourceTool) Summarize(args json.RawMessage) string {
 		fmt.Fprintf(&b, "添加搜索信源：搜索词「%s」", strings.TrimSpace(a.Query))
 		if a.Category != "" {
 			fmt.Fprintf(&b, "，类别「%s」", a.Category)
+		}
+		if len(a.IncludeDomains) > 0 {
+			fmt.Fprintf(&b, "，限定域名 %s", strings.Join(a.IncludeDomains, "、"))
 		}
 	case "xhs/search":
 		fmt.Fprintf(&b, "添加小红书关键词信源：「%s」", strings.TrimSpace(a.Keyword))
@@ -482,7 +512,8 @@ type createScheduleArgs struct {
 }
 
 type createScheduleTool struct {
-	sched *scheduler.Scheduler
+	sched scheduleCreator
+	st    playbookStore // 创建即初始化任务手册（决策 D2）
 }
 
 func (t *createScheduleTool) Name() string { return "create_schedule" }
@@ -519,6 +550,15 @@ func (t *createScheduleTool) Execute(ctx context.Context, userID int64, args jso
 			return ae.Message, nil
 		}
 		return "", err
+	}
+	// 决策 D2：一个定时任务 = 一份自带手册的情报简报。调度建成后随即用用户的自然语言
+	// 意图原文初始化手册（P0 只存、不翻译成 fetch_plan、不影响抓取）。best-effort：手册写
+	// 失败不回滚已建成的调度——调度是主效果、P0 手册尚不参与抓取，为非功能性的手册写失败去
+	// 补偿删 Temporal 调度得不偿失；仅 slog 供对账（与 DeletePush 镜像删除失败只 slog 同原则）。
+	if ok, perr := t.st.UpsertSchedulePlaybook(ctx, userID, schedID, capPlaybookContent(a.NLDescription)); perr != nil {
+		slog.Error("agent: create_schedule 初始化任务手册失败（调度已创建）", "schedule_id", schedID, "err", perr)
+	} else if !ok {
+		slog.Warn("agent: create_schedule 初始化任务手册未命中刚建的调度（异常）", "schedule_id", schedID)
 	}
 	return fmt.Sprintf("已创建定时推送任务（id=%s）：%s", schedID, formatScheduleSpec(spec)), nil
 }
@@ -911,4 +951,144 @@ func orUnset(s string) string {
 		return "（未设置）"
 	}
 	return s
+}
+
+// ============================================================
+// 情报任务手册（Task Playbook P0）：每个定时任务 1:1 绑一份自然语言手册。
+// P0 只做存取——view（读）/ edit（写，走确认卡）/ create_schedule 创建即初始化。
+// 手册不影响任何抓取/打分/出卡（那是 P1）。
+// ============================================================
+
+// maxPlaybookContentRunes 手册内容 rune 上限：超出截断（不报错，同 capProfileTags 策略），
+// 防超长手册撑爆确认卡与 DB 行。playbookSummaryPreviewRunes 是确认卡摘要预览的更短上限。
+const (
+	maxPlaybookContentRunes     = 4000
+	playbookSummaryPreviewRunes = 80
+)
+
+// capPlaybookContent 超上限截前 N rune（不加省略号——落库内容要干净）。
+func capPlaybookContent(s string) string {
+	r := []rune(s)
+	if len(r) > maxPlaybookContentRunes {
+		return string(r[:maxPlaybookContentRunes])
+	}
+	return s
+}
+
+const viewTaskPlaybookSchema = `{
+  "type": "object",
+  "properties": {
+    "schedule_id": {"type": "string", "description": "要查看手册的定时任务 id（先用 list_schedules 查询）"}
+  },
+  "required": ["schedule_id"]
+}`
+
+type viewTaskPlaybookTool struct {
+	st playbookStore
+}
+
+func (t *viewTaskPlaybookTool) Name() string { return "view_task_playbook" }
+func (t *viewTaskPlaybookTool) Description() string {
+	return "查看某个定时推送任务的情报手册（描述这个任务要抓什么、关注哪些主题、偏好哪些来源）。schedule_id 可先用 list_schedules 查询。修改手册前应先调用本工具取现有内容。"
+}
+func (t *viewTaskPlaybookTool) Parameters() json.RawMessage {
+	return json.RawMessage(viewTaskPlaybookSchema)
+}
+func (t *viewTaskPlaybookTool) Mutating() bool { return false }
+
+// Execute NotFound 回引导文案而非报错：手册不存在（老任务未迁移）或任务非本人，
+// 对模型都是"没有可看的手册"，回自纠文案让它引导用户；基础设施错误上抛。
+func (t *viewTaskPlaybookTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
+	var a struct {
+		ScheduleID string `json:"schedule_id"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return "参数不是合法 JSON，请修正后重试", nil
+	}
+	schedID := strings.TrimSpace(a.ScheduleID)
+	if schedID == "" {
+		return "schedule_id 必须是非空字符串（可先用 list_schedules 查询）", nil
+	}
+	pb, err := t.st.GetSchedulePlaybook(ctx, userID, schedID)
+	if err != nil {
+		if errors.Is(err, types.ErrNotFound) {
+			return fmt.Sprintf("没找到你的定时任务（id=%s），或它还没有手册。用 list_schedules 查一下。", schedID), nil
+		}
+		return "", err
+	}
+	return renderPlaybook(pb), nil
+}
+
+func (t *viewTaskPlaybookTool) Summarize(json.RawMessage) string { return "" }
+
+// renderPlaybook 把手册渲染成给模型/用户看的中文文本。P0 不渲染 fetch_plan（恒 '{}'）；
+// content 为空时给引导文案，让模型知道该采集什么。
+func renderPlaybook(pb *types.SchedulePlaybook) string {
+	content := strings.TrimSpace(pb.Content)
+	if content == "" {
+		content = "（手册为空——可以告诉我这个任务要抓什么、关注哪些主题、偏好哪些来源。）"
+	}
+	return fmt.Sprintf("任务手册（id=%s）：\n%s", pb.ScheduleID, content)
+}
+
+const editTaskPlaybookSchema = `{
+  "type": "object",
+  "properties": {
+    "schedule_id": {"type": "string", "description": "要修改手册的定时任务 id（先用 list_schedules 查询）"},
+    "content": {"type": "string", "description": "手册全文（自然语言，整体替换现有手册）：描述这个情报任务要抓什么、关注哪些主题、偏好哪些来源。提交前先用 view_task_playbook 取现有内容并合并。最多约 4000 字，超出自动截断。"}
+  },
+  "required": ["schedule_id", "content"]
+}`
+
+type editTaskPlaybookArgs struct {
+	ScheduleID string `json:"schedule_id"`
+	Content    string `json:"content"`
+}
+
+type editTaskPlaybookTool struct {
+	st playbookStore
+}
+
+func (t *editTaskPlaybookTool) Name() string { return "edit_task_playbook" }
+func (t *editTaskPlaybookTool) Description() string {
+	return "修改某个定时推送任务的情报手册（整体替换现有内容）：用自然语言描述这个任务要抓什么、关注哪些主题、偏好哪些来源。提交前先用 view_task_playbook 查看现有内容并合并；省略会丢掉现有内容。schedule_id 可先用 list_schedules 查询。"
+}
+func (t *editTaskPlaybookTool) Parameters() json.RawMessage {
+	return json.RawMessage(editTaskPlaybookSchema)
+}
+func (t *editTaskPlaybookTool) Mutating() bool { return true }
+
+// Execute（确认后执行）：空 schedule_id / 空 content 是确定性可自纠失败，回文案不触库；
+// content 超上限截断后落库；UpsertSchedulePlaybook 归属未命中（ok=false）回自纠文案不上抛
+// （与 enable_source 越权处理一致），基础设施错误上抛。
+func (t *editTaskPlaybookTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
+	var a editTaskPlaybookArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return "参数不是合法 JSON，请修正后重试", nil
+	}
+	schedID := strings.TrimSpace(a.ScheduleID)
+	if schedID == "" {
+		return "schedule_id 必须是非空字符串（可先用 list_schedules 查询）", nil
+	}
+	if strings.TrimSpace(a.Content) == "" {
+		return "手册内容不能为空。请描述这个任务要抓什么、关注哪些主题、偏好哪些来源。", nil
+	}
+	ok, err := t.st.UpsertSchedulePlaybook(ctx, userID, schedID, capPlaybookContent(a.Content))
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return fmt.Sprintf("没找到你的定时任务（id=%s），可能 id 有误或已删除。用 list_schedules 查一下。", schedID), nil
+	}
+	return fmt.Sprintf("已更新定时任务（id=%s）的情报手册。", schedID), nil
+}
+
+// Summarize 展示截断后的实际生效内容预览（卡面列超上限文本而只落截断值是对用户撒谎）。
+func (t *editTaskPlaybookTool) Summarize(args json.RawMessage) string {
+	var a editTaskPlaybookArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return summarizeFallback("修改任务手册", args)
+	}
+	preview := truncateRunes(strings.TrimSpace(capPlaybookContent(a.Content)), playbookSummaryPreviewRunes)
+	return fmt.Sprintf("修改定时任务手册（id=%s）：新内容「%s」", strings.TrimSpace(a.ScheduleID), preview)
 }

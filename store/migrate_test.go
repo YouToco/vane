@@ -39,6 +39,8 @@ var wantTables = []string{
 	"a2a_tasks",
 	// 015 agent 工具调用记账（TikHub 端点注册表契约 §6）
 	"tool_calls",
+	// 017 情报任务手册（Task Playbook P0）
+	"schedule_playbooks",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的
