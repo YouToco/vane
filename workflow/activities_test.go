@@ -954,3 +954,47 @@ func TestPush_部分失败可重试(t *testing.T) {
 		}
 	}
 }
+
+// TestNotifyEmptyResult 空结果通知（2026-07-18：Boss 点"立即推送"等不到回音来查
+// 服务器——空结果与故障在用户侧必须可区分）。
+func TestNotifyEmptyResult(t *testing.T) {
+	n := func(v int) *int { return &v }
+
+	t.Run("dedup 闸门带抓取数", func(t *testing.T) {
+		push := &fakePusher{msgID: "om_n"}
+		var noticed []string
+		buildNotice := func(md string) string { noticed = append(noticed, md); return `{"notice":true}` }
+		a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, &fakeStore{}, fakeFeishu{}, nil, buildNotice, nil, nil)
+		if err := a.NotifyEmptyResult(context.Background(), NotifyEmptyIn{
+			UserID: 1, Gate: types.BatchExitGateDedup, Counts: types.PipelineCounts{Fetched: n(7)},
+		}); err != nil {
+			t.Fatalf("意外报错: %v", err)
+		}
+		if len(noticed) != 1 || !strings.Contains(noticed[0], "7 条") || !strings.Contains(noticed[0], "都已推送过") {
+			t.Errorf("dedup 文案应含抓取数与原因，实得 %v", noticed)
+		}
+		if len(push.sentCards()) != 1 {
+			t.Errorf("应发一张通知卡，实得 %d", len(push.sentCards()))
+		}
+	})
+
+	t.Run("buildNotice 未注入静默跳过", func(t *testing.T) {
+		push := &fakePusher{}
+		a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil)
+		if err := a.NotifyEmptyResult(context.Background(), NotifyEmptyIn{Gate: types.BatchExitGateFetch}); err != nil {
+			t.Fatalf("未注入应为 no-op，实得 %v", err)
+		}
+		if len(push.sentCards()) != 0 {
+			t.Error("未注入不该发卡")
+		}
+	})
+
+	t.Run("发送失败不上抛", func(t *testing.T) {
+		push := &fakePusher{failCalls: map[int]error{1: errors.New("feishu down")}}
+		a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, &fakeStore{}, fakeFeishu{}, nil,
+			func(string) string { return "{}" }, nil, nil)
+		if err := a.NotifyEmptyResult(context.Background(), NotifyEmptyIn{Gate: types.BatchExitGateFetch}); err != nil {
+			t.Fatalf("通知失败必须吞掉（空批次是正常终态），实得 %v", err)
+		}
+	})
+}

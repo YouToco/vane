@@ -136,6 +136,7 @@ func run() error {
 	w.RegisterActivity(activities.Select)
 	w.RegisterActivity(activities.CardGen)
 	w.RegisterActivity(activities.RecordEmptyBatch)
+	w.RegisterActivity(activities.NotifyEmptyResult)
 	w.RegisterActivity(activities.Push)
 	if err := w.Start(); err != nil {
 		temporalClient.Close()
