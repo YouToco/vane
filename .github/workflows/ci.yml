@@ -26,11 +26,11 @@ jobs:
       - name: Build
         run: npm run build
 
-  # 双线部署（M7，2026-07-18 起）：与主站 zhuoqidev.com 同款模式——
-  #   国内线：DNS default 线路 → 阿里 CDN → OSS（zhuoqidev-vane-web，私有桶+oss_auth 回源）
+  # 双线部署（M7，2026-07-18 切流，Boss 浏览器验收通过）：与主站 zhuoqidev.com 同款模式——
+  #   国内线：DNS default 线路 → 阿里 CDN → OSS（zhuoqidev-vane-web，public-read）
   #   境外线：DNS oversea 线路 → Cloudflare Pages（vane-web.pages.dev）
   # 生产构建注入 VITE_API_BASE（静态托管与 API 不同源，后端 CORS 见 vane#54）。
-  # scp 到 VPS 为过渡期保留（DNS 未切/回滚时 Caddy 仍能服务），切流验证通过后移除。
+  # VPS scp 兜底已随验收移除（回滚路径见 vane 仓 deploy/Caddyfile 头注释）。
   deploy:
     needs: build
     runs-on: ubuntu-latest
@@ -56,8 +56,8 @@ jobs:
       - name: Build
         run: npm run build
         env:
-          # 绝对 API 基址：三个部署目标（CDN/Pages/VPS）都用同一份产物，
-          # 跨源由后端 CORS 放行；本地 dev 不设此变量走 vite 代理。
+          # 绝对 API 基址：两线（CDN/Pages）用同一份产物，跨源由后端 CORS 放行；
+          # 本地 dev 不设此变量走 vite 代理。
           VITE_API_BASE: https://api.vane.zhuoqidev.com
 
       - name: Install aliyun CLI
@@ -76,7 +76,6 @@ jobs:
             --access-key-secret "${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}" \
             --region cn-shenzhen
           # sync --delete = 镜像语义：清掉桶里已不在 dist 的旧 hash 产物
-          # （与下方 VPS "先清空再传"同一个卫生要求）
           aliyun oss sync dist/ oss://zhuoqidev-vane-web/ --delete --force
           # index.html 无 hash 会被边缘缓存，必须主动刷新目录让新版立即生效
           aliyun cdn RefreshObjectCaches --ObjectPath "https://vane.zhuoqidev.com/" --ObjectType Directory
@@ -86,42 +85,3 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-
-      # ——以下 VPS scp 为过渡期保留（DNS 未切流/回滚场景），切流验证后移除——
-      # 先清空再传：避免旧构建的 hash 文件无限堆积、以及删除页面后残留可访问
-      - name: Prepare web directory
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          port: ${{ secrets.VPS_PORT }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            mkdir -p /opt/vane/web
-            # 只清目录内容不删目录本身，Caddy 容器挂载的是该目录的 inode
-            find /opt/vane/web -mindepth 1 -delete
-
-      # strip_components: 1 去掉 dist/ 前缀，确保落盘为 /opt/vane/web/index.html
-      # 而不是 /opt/vane/web/dist/index.html（scp-action 内部走 tar，支持该参数）
-      - name: Upload dist
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          port: ${{ secrets.VPS_PORT }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          source: "dist/*"
-          target: "/opt/vane/web"
-          strip_components: 1
-
-      - name: Verify
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          port: ${{ secrets.VPS_PORT }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            # 部署后必须能直接看到 index.html，否则说明前缀/路径出了问题，CI 该红就红
-            test -f /opt/vane/web/index.html
-            echo "deploy verified: /opt/vane/web/index.html present"
