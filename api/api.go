@@ -33,9 +33,7 @@ type Manager interface {
 type Scheduler interface {
 	CreatePush(ctx context.Context, userID int64, spec scheduler.ScheduleSpec, scope workflow.PushScope, nlDesc string) (schedID string, err error)
 	PushNow(ctx context.Context, userID int64, scope workflow.PushScope) (runID string, err error)
-	UpdatePushSpec(ctx context.Context, schedID string, spec scheduler.ScheduleSpec) error
 	DeletePush(ctx context.Context, schedID string) error
-	TriggerNow(ctx context.Context, schedID string) error
 }
 
 // Deps 是 Mount 所需的全部依赖，由 main.go 注入。

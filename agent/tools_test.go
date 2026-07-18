@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/YouToco/vane/sourcecatalog"
+	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/types"
 )
 
@@ -393,4 +394,115 @@ func TestAddSourceDescriptionDerivesUnavailableFromCatalog(t *testing.T) {
 	if !strings.Contains(desc, "x/search") {
 		t.Errorf("工具说明应点名 x/search，实际：%q", desc)
 	}
+}
+
+// TestSpecFromArgs_ParamMapping 守住 add_source 的 **agent 独有映射层**（审计 M-3）：
+// 每个 capability 的入参必须落到 sourcespec.Build 认得的 param 键上。addSourceTool.Execute
+// 持具体 *store.Store 不可 fake，此前这层「8 字段 → params」的翻译零测试——拼错键名
+// （screen_name→screenname）不会被 sourcespec 自己的用例发现，只会在生产里产出错误的
+// 确认卡预填。抽出纯函数 specFromArgs 后逐 capability 断言：映射产出的 spec 能被 Build 成
+// 合法 Source，且关键入参进了幂等键（键名映错则 Build 因缺必填参数而拒绝，本用例即红）。
+func TestSpecFromArgs_ParamMapping(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     addSourceArgs
+		platform types.Platform
+		cap      types.Capability
+		wantIn   string // 关键入参必须出现在产出 Source 的 URL（幂等键）里
+	}{
+		{"web/feed", addSourceArgs{Platform: "web", Capability: "feed", URL: "https://example.com/feed.xml"}, types.PlatformWeb, types.CapFeed, "example.com/feed.xml"},
+		{"web/search", addSourceArgs{Platform: "web", Capability: "search", Query: "OpenAI"}, types.PlatformWeb, types.CapSearch, "OpenAI"},
+		{"xhs/search", addSourceArgs{Platform: "xhs", Capability: "search", Keyword: "meizhuang"}, types.PlatformXHS, types.CapSearch, "meizhuang"},
+		{"xhs/user_posts", addSourceArgs{Platform: "xhs", Capability: "user_posts", UserID: "6a5578b3000000000e03cc00"}, types.PlatformXHS, types.CapUserPosts, "6a5578b3000000000e03cc00"},
+		{"x/user_posts", addSourceArgs{Platform: "x", Capability: "user_posts", ScreenName: "OpenAI"}, types.PlatformX, types.CapUserPosts, "OpenAI"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src, msg := sourcespec.Build(specFromArgs(tc.args))
+			if msg != "" {
+				t.Fatalf("映射后 Build 应成功（键名拼错会在此暴露）, 实得拒绝: %s", msg)
+			}
+			if src.Platform != tc.platform || src.Capability != tc.cap {
+				t.Fatalf("平台/能力不符: %s/%s, 期望 %s/%s", src.Platform, src.Capability, tc.platform, tc.cap)
+			}
+			if !strings.Contains(src.URL, tc.wantIn) {
+				t.Fatalf("关键入参未进入幂等键（疑似映射到错误 param 键）: URL=%q 期望含 %q", src.URL, tc.wantIn)
+			}
+		})
+	}
+}
+
+// TestSpecFromArgs_CategoriesMarshaled 单独守 categories 的 JSON 序列化分支
+// （唯一非直传的映射：[]string → JSON 字符串进 params["categories"]）。
+func TestSpecFromArgs_CategoriesMarshaled(t *testing.T) {
+	spec := specFromArgs(addSourceArgs{
+		Platform: "web", Capability: "feed", URL: "https://example.com/feed.xml",
+		Categories: []string{"Product", "Research"},
+	})
+	if got := spec.Params["categories"]; got != `["Product","Research"]` {
+		t.Fatalf("categories 应序列化为 JSON 数组字符串, 实得 %q", got)
+	}
+}
+
+// TestAddSourceTool_Summarize 覆盖确认卡文案的每个 capability 分支（审计 M-3）：
+// 预填错内容用户照点即加错源，故每条分支都逐字钉住。
+func TestAddSourceTool_Summarize(t *testing.T) {
+	tool := &addSourceTool{}
+	cases := []struct{ name, args, want string }{
+		{"web/feed", `{"platform":"web","capability":"feed","url":"https://x.com/feed"}`, "添加 RSS 信源：https://x.com/feed"},
+		{"web/search", `{"platform":"web","capability":"search","query":"AI"}`, "添加搜索信源：搜索词「AI」"},
+		{"web/search 带类别", `{"platform":"web","capability":"search","query":"AI","category":"news"}`, "添加搜索信源：搜索词「AI」，类别「news」"},
+		{"xhs/search", `{"platform":"xhs","capability":"search","keyword":"美妆"}`, "添加小红书关键词信源：「美妆」"},
+		{"xhs/user_posts", `{"platform":"xhs","capability":"user_posts","user_id":"abc123"}`, "添加小红书博主信源：abc123"},
+		{"x/user_posts", `{"platform":"x","capability":"user_posts","screen_name":"OpenAI"}`, "添加 X 用户时间线信源：@OpenAI"},
+		{"带展示名", `{"platform":"web","capability":"feed","url":"https://x.com/feed","title":"某博客"}`, "添加 RSS 信源：https://x.com/feed，展示名「某博客」"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tool.Summarize(json.RawMessage(tc.args)); got != tc.want {
+				t.Fatalf("Summarize 不符:\n实得 %q\n期望 %q", got, tc.want)
+			}
+		})
+	}
+	t.Run("非法 JSON 走兜底不 panic", func(t *testing.T) {
+		if got := tool.Summarize(json.RawMessage(`{"platform":`)); !strings.Contains(got, "添加信源") {
+			t.Fatalf("应走 summarizeFallback, 实得 %q", got)
+		}
+	})
+}
+
+// TestOtherTools_Summarize 覆盖此前零测试的三个写工具 Summarize（审计 M-3）。
+func TestOtherTools_Summarize(t *testing.T) {
+	t.Run("remove_source", func(t *testing.T) {
+		got := (&removeSourceTool{}).Summarize(json.RawMessage(`{"source_id":42}`))
+		if got != "取消订阅信源（id=42）" {
+			t.Fatalf("实得 %q", got)
+		}
+	})
+	t.Run("remove_schedule", func(t *testing.T) {
+		got := (&removeScheduleTool{}).Summarize(json.RawMessage(`{"schedule_id":"sched-7"}`))
+		if got != "删除定时推送任务（id=sched-7）" {
+			t.Fatalf("实得 %q", got)
+		}
+	})
+	t.Run("create_schedule cron", func(t *testing.T) {
+		got := (&createScheduleTool{}).Summarize(json.RawMessage(
+			`{"spec":{"cron":"0 30 8 * * *"},"nl_description":"每天早八"}`))
+		want := "创建定时推送任务：按 cron「0 30 8 * * *」触发（时区 Asia/Shanghai），描述「每天早八」"
+		if got != want {
+			t.Fatalf("实得 %q\n期望 %q", got, want)
+		}
+	})
+	t.Run("create_schedule every_seconds", func(t *testing.T) {
+		got := (&createScheduleTool{}).Summarize(json.RawMessage(`{"spec":{"every_seconds":3600}}`))
+		if got != "创建定时推送任务：每 3600 秒触发一次（时区 Asia/Shanghai）" {
+			t.Fatalf("实得 %q", got)
+		}
+	})
+	// Summarize 无 error 通道：非法参数必须兜底成可读文案而非 panic/空串。
+	t.Run("非法 JSON 兜底", func(t *testing.T) {
+		if got := (&removeSourceTool{}).Summarize(json.RawMessage(`{`)); !strings.Contains(got, "取消订阅信源") {
+			t.Fatalf("应走 summarizeFallback, 实得 %q", got)
+		}
+	})
 }

@@ -116,12 +116,12 @@ func (t *listSourcesTool) Summarize(json.RawMessage) string { return "" }
 // add_source：写工具，校验/构造复用 sourcespec（与 API 加订阅同一份规则）。
 // ============================================================
 
-// addSourceArgs 与工具 schema 对应。优先用 Platform+Capability（M6 新），
-// 若 Type 非空则走 BuildLegacy 兼容旧前端。
+// addSourceArgs 与工具 schema 对应。只认新 schema（platform + capability）——
+// M6 契约 §13.1【硬约束】：legacy type 垫片只服务 HTTP api（vane-web 兼容窗口），
+// 绝不进 agent 面，否则等于给模型两条重叠表达路（曾让 Boss 听见「已添加 tikhub_xhs 源」）。
 type addSourceArgs struct {
 	Platform   string   `json:"platform"`
 	Capability string   `json:"capability"`
-	Type       string   `json:"type"` // 旧字段，兼容 M6 前调用方（走 BuildLegacy）
 	URL        string   `json:"url"`
 	Query      string   `json:"query"`
 	Keyword    string   `json:"keyword"`
@@ -133,8 +133,8 @@ type addSourceArgs struct {
 	Categories []string `json:"categories"`
 }
 
-// addSourceSchema 对齐 M6 信源插件化契约：优先 platform + capability，
-// 同时保留旧 type 字段走 BuildLegacy 兼容窗口。
+// addSourceSchema 对齐 M6 信源插件化契约：只有新 schema（platform + capability + params）。
+// M6 §13.1【硬约束】：legacy type 不进 agent 面（那是 HTTP api 给 vane-web 的兼容窗口）。
 // url/query/keyword 的条件必填（随 platform/capability 而定）写进 description 由模型遵循，
 // 权威校验在 sourcespec.Build（与 POST /api/subscriptions 完全一致）。
 const addSourceSchema = `{
@@ -149,11 +149,6 @@ const addSourceSchema = `{
       "type": "string",
       "enum": ["feed", "search", "user_posts"],
       "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主）。当前不支持的能力及原因见本工具说明（Description）。"
-    },
-    "type": {
-      "type": "string",
-      "enum": ["rss", "exa", "tikhub_xhs"],
-      "description": "（兼容旧版）信源类型：rss→web/feed；exa→web/search；tikhub_xhs→xhs/search。优先用 platform+capability"
     },
     "url": {"type": "string", "description": "RSS 源地址（http/https），platform=web capability=feed 时必填"},
     "query": {"type": "string", "description": "Exa 搜索词，platform=web capability=search 时必填"},
@@ -173,7 +168,7 @@ type addSourceTool struct {
 
 func (t *addSourceTool) Name() string { return "add_source" }
 func (t *addSourceTool) Description() string {
-	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts），或传旧版 type 字段兼容。" +
+	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts）。" +
 		unavailableCapabilitiesNote()
 }
 
@@ -200,49 +195,45 @@ func unavailableCapabilitiesNote() string {
 func (t *addSourceTool) Parameters() json.RawMessage { return json.RawMessage(addSourceSchema) }
 func (t *addSourceTool) Mutating() bool              { return true }
 
+// specFromArgs 把模型给的扁平入参映射为 sourcespec.Spec 的 params map。
+// 抽成纯函数是为了让「哪个字段进哪个 param 键」这层 **agent 独有**的映射可被单测：
+// Execute 持具体 *store.Store（不可 fake），而拼错键名（如 screen_name→screenname）
+// 不会被 sourcespec 自己的用例发现——只会在生产里产出错误的确认卡预填（审计 M-3）。
+func specFromArgs(a addSourceArgs) sourcespec.Spec {
+	params := make(map[string]string)
+	set := func(k, v string) {
+		if v != "" {
+			params[k] = v
+		}
+	}
+	set("url", a.URL)
+	set("query", a.Query)
+	set("keyword", a.Keyword)
+	set("category", a.Category)
+	set("screen_name", a.ScreenName)
+	set("user_id", a.UserID)
+	set("profile_url", a.ProfileURL)
+	if len(a.Categories) > 0 {
+		catJSON, _ := json.Marshal(a.Categories)
+		params["categories"] = string(catJSON)
+	}
+	return sourcespec.Spec{
+		Platform:   a.Platform,
+		Capability: a.Capability,
+		Params:     params,
+		Title:      a.Title,
+	}
+}
+
 func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
 	var a addSourceArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "参数不是合法 JSON，请修正后重试", nil
 	}
-	var src *types.Source
-	var msg string
-	if a.Platform != "" {
-		params := make(map[string]string)
-		if a.URL != "" {
-			params["url"] = a.URL
-		}
-		if a.Query != "" {
-			params["query"] = a.Query
-		}
-		if a.Keyword != "" {
-			params["keyword"] = a.Keyword
-		}
-		if a.Category != "" {
-			params["category"] = a.Category
-		}
-		if a.ScreenName != "" {
-			params["screen_name"] = a.ScreenName
-		}
-		if a.UserID != "" {
-			params["user_id"] = a.UserID
-		}
-		if a.ProfileURL != "" {
-			params["profile_url"] = a.ProfileURL
-		}
-		if len(a.Categories) > 0 {
-			catJSON, _ := json.Marshal(a.Categories)
-			params["categories"] = string(catJSON)
-		}
-		src, msg = sourcespec.Build(sourcespec.Spec{
-			Platform:   a.Platform,
-			Capability: a.Capability,
-			Params:     params,
-			Title:      a.Title,
-		})
-	} else {
-		src, msg = sourcespec.BuildLegacy(a.Type, a.URL, a.Query, a.Keyword, a.Title, a.Category)
+	if a.Platform == "" {
+		return "请指定 platform（web/xhs/x）与 capability（feed/search/user_posts）", nil
 	}
+	src, msg := sourcespec.Build(specFromArgs(a))
 	if msg != "" {
 		return msg, nil
 	}
@@ -271,16 +262,6 @@ func (t *addSourceTool) Summarize(args json.RawMessage) string {
 	}
 	var b strings.Builder
 	p, c := a.Platform, a.Capability
-	if p == "" {
-		switch types.SourceType(a.Type) {
-		case types.SourceTypeRSS, "":
-			p, c = "web", "feed"
-		case types.SourceTypeExa:
-			p, c = "web", "search"
-		case types.SourceTypeTikHubXHS:
-			p, c = "xhs", "search"
-		}
-	}
 	switch p + "/" + c {
 	case "web/feed":
 		fmt.Fprintf(&b, "添加 RSS 信源：%s", a.URL)
