@@ -33,6 +33,9 @@ type Manager interface {
 type Scheduler interface {
 	CreatePush(ctx context.Context, userID int64, spec scheduler.ScheduleSpec, scope workflow.PushScope, nlDesc string) (schedID string, err error)
 	PushNow(ctx context.Context, userID int64, scope workflow.PushScope) (runID string, err error)
+	// UpdatePush 原地改已有调度的触发频率（不换 schedule_id、不中断调度）。
+	// nlDesc 为 nil 表示不改描述。
+	UpdatePush(ctx context.Context, schedID string, spec scheduler.ScheduleSpec, nlDesc *string) error
 	DeletePush(ctx context.Context, schedID string) error
 }
 
@@ -73,6 +76,7 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	// M3 推送管道端点（契约 B8）：全部走会话中间件，是"人与未来 AI 同一出口"的确定性 API。
 	inner.HandleFunc("GET /api/schedules", s.handleListSchedules)
 	inner.HandleFunc("POST /api/schedules", s.handleCreateSchedule)
+	inner.HandleFunc("PATCH /api/schedules/{id}", s.handleUpdateSchedule)
 	inner.HandleFunc("DELETE /api/schedules/{id}", s.handleDeleteSchedule)
 	inner.HandleFunc("POST /api/push/now", s.handlePushNow)
 	inner.HandleFunc("GET /api/subscriptions", s.handleListSubscriptions)
@@ -116,7 +120,10 @@ func (s *server) cors(next http.Handler) http.Handler {
 			// 缓存（CDN/浏览器）必须按 Origin 区分响应，否则放行头可能被错误复用。
 			h.Add("Vary", "Origin")
 			if r.Method == http.MethodOptions {
-				h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE")
+				// 这里漏一个方法，跨源前端就调不通对应端点——预检不放行，浏览器
+				// 连请求都不发（fetch 拿到的是网络错误，不是状态码）。新增写端点时
+				// 必须同步这一行（PATCH 是随 update_schedule 端点加的）。
+				h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE")
 				h.Set("Access-Control-Allow-Headers", "Content-Type")
 				h.Set("Access-Control-Max-Age", "600")
 				w.WriteHeader(http.StatusNoContent)

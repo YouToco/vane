@@ -75,6 +75,37 @@ func (s *Store) ListSchedulesByUser(ctx context.Context, userID int64) ([]types.
 	return out, nil
 }
 
+// UpdateScheduleSpec 原地更新调度镜像的 spec_json（可选连带 nl_description），并推进
+// updated_at。scheduler 在 Temporal Update 成功后调用，使镜像与 Temporal 保持一致。
+//
+// nlDesc 为 nil 表示"不改描述"（COALESCE 保留原值）；指向空串表示显式清空。
+//
+// 与 DeleteSchedule 的幂等语义**刻意不同**：这里 0 行受影响返回 CodeNotFound 而不是
+// 静默成功。删一个不存在的调度是无害的终态；而更新一个镜像里不存在的调度意味着
+// **Temporal 有、镜像没有**——调用方（scheduler）刚刚在 Temporal 侧改成功了，镜像却
+// 没这行，这是必须出声的漂移，不能当成功咽掉。
+func (s *Store) UpdateScheduleSpec(ctx context.Context, id string, spec json.RawMessage, nlDesc *string) error {
+	if len(spec) == 0 {
+		spec = json.RawMessage("{}")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE schedules
+		    SET spec_json = $2,
+		        nl_description = COALESCE($3, nl_description),
+		        updated_at = now()
+		  WHERE id = $1`,
+		id, spec, nlDesc)
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("更新调度镜像（id=%s）", id), err)
+	}
+	if tag.RowsAffected() == 0 {
+		return types.NewAppError(types.CodeNotFound,
+			fmt.Sprintf("调度 id=%s 不存在（镜像与 Temporal 漂移）", id), nil)
+	}
+	return nil
+}
+
 // DeleteSchedule 删除调度镜像行。scheduler 在 Temporal Delete 成功后调用；
 // 幂等：删不存在的 id 不报错（无行受影响）。
 func (s *Store) DeleteSchedule(ctx context.Context, id string) error {

@@ -99,6 +99,47 @@ func (s *server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"schedule_id": schedID})
 }
 
+// updateScheduleReq 是 PATCH /api/schedules/{id} 的请求体。
+//
+// 只收 spec 与 nl_description：scope（推哪些源）不在本端点的职责内——改频率与改范围
+// 是两件事，混在一个 PATCH 里会让"只想改时间"的请求不小心把 scope 覆盖成零值。
+// nl_description 用指针：省略=不改，显式 "" =清空（与 store 层 nil 语义一致）。
+type updateScheduleReq struct {
+	Spec          scheduleSpecDTO `json:"spec"`
+	NLDescription *string         `json:"nl_description"`
+}
+
+// handleUpdateSchedule 原地改一个调度的触发频率（Temporal Update + 镜像同步）。
+// PATCH /api/schedules/{id} {spec, nl_description?} → 200 {ok}
+//
+// 为什么是 PATCH 而不是 PUT：请求体只承载调度的一部分字段（频率、描述），
+// scope/status 等不在其中，PUT 的"整体替换"语义会误导调用方。
+//
+// 与 DELETE 一致，M3 单 owner 不逐条校验归属（Dashboard 有密码门）。
+func (s *server) handleUpdateSchedule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "缺少 schedule id")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	var req updateScheduleReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	spec, err := req.Spec.toScheduleSpec()
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	if err := s.deps.Scheduler.UpdatePush(r.Context(), id, spec, req.NLDescription); err != nil {
+		writeAppError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // handleDeleteSchedule 删除一个调度（Temporal + 镜像）。
 // DELETE /api/schedules/{id} → 200 {ok}
 //

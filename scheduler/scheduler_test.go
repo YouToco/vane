@@ -2,11 +2,13 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	enums "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 
@@ -119,7 +121,12 @@ type fakeTemporalClient struct {
 	gotOptions client.StartWorkflowOptions
 	retRun     client.WorkflowRun
 	retErr     error
+	// sched 供 UpdatePush 一组用例注入 ScheduleClient 替身；
+	// 既有 TriggerPushNow 用例不设它（那条路径不碰 ScheduleClient）。
+	sched *fakeScheduleClient
 }
+
+func (f *fakeTemporalClient) ScheduleClient() client.ScheduleClient { return f.sched }
 
 func (f *fakeTemporalClient) ExecuteWorkflow(_ context.Context, options client.StartWorkflowOptions, _ interface{}, _ ...interface{}) (client.WorkflowRun, error) {
 	f.gotOptions = options
@@ -200,5 +207,239 @@ func TestTriggerPushNow_OtherError(t *testing.T) {
 	}
 	if types.CodeOf(err) != types.CodeInternal {
 		t.Errorf("Code=%s，期望 %s", types.CodeOf(err), types.CodeInternal)
+	}
+}
+
+// ============================================================
+// UpdatePush：ScheduleClient / ScheduleHandle 双层 fake（二者都是接口）。
+// 这组替身让本包第一次能测到「Temporal 成功但镜像失败」的补偿分支——
+// 那是最需要验证、又最不可能在真库上自然发生的路径。
+// ============================================================
+
+// fakeScheduleClient 只拦截 GetHandle，返回同一个 handle 供断言。
+type fakeScheduleClient struct {
+	client.ScheduleClient
+	handle *fakeScheduleHandle
+	gotID  string
+}
+
+func (f *fakeScheduleClient) GetHandle(_ context.Context, id string) client.ScheduleHandle {
+	f.gotID = id
+	return f.handle
+}
+
+// fakeScheduleHandle 模拟服务端持有的当前 Schedule：Update 时真的调用 DoUpdate 回调，
+// 把返回的 Schedule 落成新的当前值——这样才能断言"只有 Spec 变了、Action/Policy 没丢"。
+type fakeScheduleHandle struct {
+	client.ScheduleHandle
+	current   client.Schedule
+	updateErr error             // 非 nil = 模拟 Temporal Update 失败
+	history   []client.Schedule // 每次成功 Update 后的快照（用于验回滚发生过）
+}
+
+func (h *fakeScheduleHandle) Update(_ context.Context, o client.ScheduleUpdateOptions) error {
+	if h.updateErr != nil {
+		return h.updateErr
+	}
+	upd, err := o.DoUpdate(client.ScheduleUpdateInput{
+		Description: client.ScheduleDescription{Schedule: h.current},
+	})
+	if err != nil {
+		return err
+	}
+	h.current = *upd.Schedule
+	h.history = append(h.history, h.current)
+	return nil
+}
+
+// fakeScheduleStore 按预设让镜像写成功/失败，并记录收到的参数。
+type fakeScheduleStore struct {
+	scheduleStore
+	updateErr  error
+	gotID      string
+	gotSpec    json.RawMessage
+	gotNLDesc  *string
+	updateCall int
+}
+
+func (f *fakeScheduleStore) UpdateScheduleSpec(_ context.Context, id string, spec json.RawMessage, nlDesc *string) error {
+	f.updateCall++
+	f.gotID, f.gotSpec, f.gotNLDesc = id, spec, nlDesc
+	return f.updateErr
+}
+
+// baseSchedule 造一个"服务端已有"的调度：cron 频率 + 完整 Action/Policy/State。
+// Action/Policy 是本组用例的核心断言对象——更新频率绝不能把它们弄丢。
+func baseSchedule() client.Schedule {
+	return client.Schedule{
+		Action: &client.ScheduleWorkflowAction{
+			ID:        "wf-push-1-abc",
+			TaskQueue: "vane-tq",
+			Args:      []any{"preserved"},
+		},
+		Spec: &client.ScheduleSpec{
+			CronExpressions: []string{"0 8 * * *"},
+			TimeZoneName:    "Asia/Shanghai",
+		},
+		Policy: &client.SchedulePolicies{Overlap: enums.SCHEDULE_OVERLAP_POLICY_SKIP},
+		State:  &client.ScheduleState{Note: "原始状态"},
+	}
+}
+
+func newUpdateFixture(mirrorErr error) (*Scheduler, *fakeScheduleHandle, *fakeScheduleStore) {
+	h := &fakeScheduleHandle{current: baseSchedule()}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
+	st := &fakeScheduleStore{updateErr: mirrorErr}
+	return New(fc, "tq", st), h, st
+}
+
+// TestUpdatePush_只换Spec保留Action与Overlap 是本能力的头号不变量：
+// DoUpdate 回调必须在**当前 Schedule 之上**改 Spec，而不是新建一个 Schedule——
+// 后者会静默丢掉 Action（跑哪个 workflow / 哪个 TaskQueue）与 Overlap=SKIP
+// （推送堆叠护栏），表现是调度还在、却再也不推送或开始堆叠。
+func TestUpdatePush_只换Spec保留Action与Overlap(t *testing.T) {
+	s, h, st := newUpdateFixture(nil)
+
+	err := s.UpdatePush(context.Background(), "push-1-abc", ScheduleSpec{Cron: "30 9 * * *"}, nil)
+	if err != nil {
+		t.Fatalf("UpdatePush 失败: %v", err)
+	}
+
+	// Spec 换成了新 cron。
+	if got := h.current.Spec.CronExpressions; len(got) != 1 || got[0] != "30 9 * * *" {
+		t.Errorf("Spec 应更新为新 cron，实得 %v", got)
+	}
+	// Action 必须原样保留。
+	act, ok := h.current.Action.(*client.ScheduleWorkflowAction)
+	if !ok || act.ID != "wf-push-1-abc" || act.TaskQueue != "vane-tq" {
+		t.Errorf("Action 必须原样保留（丢了就再也不推送），实得 %+v", h.current.Action)
+	}
+	// Overlap 策略必须原样保留。
+	if h.current.Policy == nil || h.current.Policy.Overlap != enums.SCHEDULE_OVERLAP_POLICY_SKIP {
+		t.Errorf("Overlap=SKIP 必须保留（丢了会推送堆叠），实得 %+v", h.current.Policy)
+	}
+	// State 也不该被动。
+	if h.current.State == nil || h.current.State.Note != "原始状态" {
+		t.Errorf("State 应原样保留，实得 %+v", h.current.State)
+	}
+	// 镜像同步跟上，且 spec_json 是新频率。
+	if st.updateCall != 1 || st.gotID != "push-1-abc" {
+		t.Errorf("应同步一次镜像，实得 call=%d id=%s", st.updateCall, st.gotID)
+	}
+	if !strings.Contains(string(st.gotSpec), "30 9 * * *") {
+		t.Errorf("镜像 spec_json 应含新 cron，实得 %s", st.gotSpec)
+	}
+}
+
+// TestUpdatePush_cron与interval互切 验证换频率类型时旧的那一组被清空——
+// 否则 Temporal 会同时看到 cron 与 interval，触发时刻变成两者并集。
+func TestUpdatePush_cron与interval互切(t *testing.T) {
+	s, h, _ := newUpdateFixture(nil)
+
+	// cron → interval
+	if err := s.UpdatePush(context.Background(), "id", ScheduleSpec{EverySeconds: 21600}, nil); err != nil {
+		t.Fatalf("改成 interval 失败: %v", err)
+	}
+	if len(h.current.Spec.CronExpressions) != 0 {
+		t.Errorf("改成 interval 后 CronExpressions 必须清空，实得 %v", h.current.Spec.CronExpressions)
+	}
+	if len(h.current.Spec.Intervals) != 1 || h.current.Spec.Intervals[0].Every != 6*time.Hour {
+		t.Errorf("Intervals 应为 6h，实得 %+v", h.current.Spec.Intervals)
+	}
+
+	// interval → cron
+	if err := s.UpdatePush(context.Background(), "id", ScheduleSpec{Cron: "0 7 * * *"}, nil); err != nil {
+		t.Fatalf("改回 cron 失败: %v", err)
+	}
+	if len(h.current.Spec.Intervals) != 0 {
+		t.Errorf("改回 cron 后 Intervals 必须清空，实得 %+v", h.current.Spec.Intervals)
+	}
+}
+
+// TestUpdatePush_镜像失败回滚Temporal 钉死原子性：Temporal 改成功但镜像写失败时，
+// 必须把 Temporal 回滚到旧 Spec 并上抛错误——否则会留下"真按新时间推、列表显示旧时间"
+// 的静默漂移，用户以为没改成、实际已经改了。
+func TestUpdatePush_镜像失败回滚Temporal(t *testing.T) {
+	mirrorErr := types.NewAppError(types.CodeDatabase, "模拟镜像写失败", nil)
+	s, h, _ := newUpdateFixture(mirrorErr)
+
+	err := s.UpdatePush(context.Background(), "id", ScheduleSpec{Cron: "30 9 * * *"}, nil)
+	if err == nil {
+		t.Fatal("镜像失败必须上抛错误，不能让调用方以为改成了")
+	}
+	// 回滚后 Temporal 应回到旧 cron。
+	if got := h.current.Spec.CronExpressions; len(got) != 1 || got[0] != "0 8 * * *" {
+		t.Errorf("镜像失败后应回滚到旧 Spec，实得 %v", got)
+	}
+	// 两次 Update：一次改、一次回滚。
+	if len(h.history) != 2 {
+		t.Errorf("应发生 2 次 Update（改 + 回滚），实得 %d", len(h.history))
+	}
+	// 回滚也不能把 Action 弄丢。
+	if act, ok := h.current.Action.(*client.ScheduleWorkflowAction); !ok || act.ID != "wf-push-1-abc" {
+		t.Errorf("回滚同样必须保留 Action，实得 %+v", h.current.Action)
+	}
+}
+
+// TestUpdatePush_校验失败不碰Temporal 确保非法 spec 在进 Temporal 之前就被拒。
+func TestUpdatePush_校验失败不碰Temporal(t *testing.T) {
+	for name, spec := range map[string]ScheduleSpec{
+		"两者都给":     {Cron: "0 8 * * *", EverySeconds: 7200},
+		"都不给":      {},
+		"间隔低于地板":   {EverySeconds: 1800},
+		"cron分钟过细": {Cron: "*/30 * * * *"},
+		"cron六段带秒": {Cron: "0 30 8 * * *"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, h, st := newUpdateFixture(nil)
+			err := s.UpdatePush(context.Background(), "id", spec, nil)
+			if err == nil {
+				t.Fatal("非法 spec 应被拒")
+			}
+			if !errors.Is(err, types.ErrValidation) {
+				t.Errorf("应是 CodeValidation，实得 %v", err)
+			}
+			if len(h.history) != 0 || st.updateCall != 0 {
+				t.Error("校验失败绝不能碰 Temporal 或镜像")
+			}
+		})
+	}
+}
+
+// TestUpdatePush_NotFound 目标调度不存在时应翻成 CodeNotFound（而非笼统 Internal），
+// 让 API 回 404、agent 把「任务不存在」作为可自纠文案回给模型。
+func TestUpdatePush_NotFound(t *testing.T) {
+	s, _, st := newUpdateFixture(nil)
+	s.c.(*fakeTemporalClient).sched.handle.updateErr = serviceerror.NewNotFound("schedule not found")
+
+	err := s.UpdatePush(context.Background(), "missing", ScheduleSpec{Cron: "0 8 * * *"}, nil)
+	if err == nil {
+		t.Fatal("不存在的调度应报错")
+	}
+	if !errors.Is(err, types.ErrNotFound) {
+		t.Errorf("应是 CodeNotFound，实得 %v", err)
+	}
+	if st.updateCall != 0 {
+		t.Error("Temporal 都没改成，不该去写镜像")
+	}
+}
+
+// TestUpdatePush_nlDesc透传 nil=不改描述、非 nil=改，指针语义必须原样传到 store。
+func TestUpdatePush_nlDesc透传(t *testing.T) {
+	s, _, st := newUpdateFixture(nil)
+	if err := s.UpdatePush(context.Background(), "id", ScheduleSpec{Cron: "0 8 * * *"}, nil); err != nil {
+		t.Fatalf("失败: %v", err)
+	}
+	if st.gotNLDesc != nil {
+		t.Error("nil 应原样透传（表示不改描述）")
+	}
+
+	desc := "每天早上 8 点半"
+	s2, _, st2 := newUpdateFixture(nil)
+	if err := s2.UpdatePush(context.Background(), "id", ScheduleSpec{Cron: "30 8 * * *"}, &desc); err != nil {
+		t.Fatalf("失败: %v", err)
+	}
+	if st2.gotNLDesc == nil || *st2.gotNLDesc != desc {
+		t.Errorf("描述应透传，实得 %v", st2.gotNLDesc)
 	}
 }
