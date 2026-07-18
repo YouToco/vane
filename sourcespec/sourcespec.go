@@ -6,14 +6,21 @@ package sourcespec
 import (
 	"encoding/json"
 	"net/url"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/types"
 )
 
 // maxSourceParamRunes 是 query/keyword/title 的长度上限（字符数）。
 const maxSourceParamRunes = 256
+
+// xhsProfileRe 从小红书用户主页链接里抽 user_id：形如
+// https://www.xiaohongshu.com/user/profile/6a5578b3000000000e03cc00 。
+// user_id 恒为 24 位小写十六进制（实测），据此锚定，避免把 query 串里别的段误当 id。
+var xhsProfileRe = regexp.MustCompile(`/user/profile/([0-9a-f]{24})`)
 
 // Spec 是信源构造入参。Platform + Capability 决定必填 Params。
 type Spec struct {
@@ -40,6 +47,13 @@ func Build(spec Spec) (*types.Source, string) {
 
 	p := types.Platform(spec.Platform)
 	c := types.Capability(spec.Capability)
+
+	// 能力门禁（契约 §2）：组合在注册表里但标记为不可用（如 x/search）时，直接把
+	// sourcecatalog 的 Reason 回给用户/agent，绝不构造一个注定静默失败的坏源。
+	// 不在表里的组合（如 xhs/feed）不在此拦——交给下面各 build* 的 default 给出更贴切的提示。
+	if entry, ok := sourcecatalog.Lookup(p, c); ok && !entry.Available() {
+		return nil, entry.Reason
+	}
 
 	switch p {
 	case types.PlatformWeb:
@@ -181,9 +195,53 @@ func buildXHS(cap types.Capability, params map[string]string, title string) (*ty
 			Status:     types.SourceStatusActive,
 		}, ""
 
+	case types.CapUserPosts:
+		// 接受 user_id（24 位 hex）直填，或从用户主页链接 profile_url/url 里抽取——
+		// 后者对人更友好（没人记得住 24 位 hex），两种输入都归一到同一个 user_id，
+		// 故同一个博主无论怎么加，幂等键 vane://xhs/user_posts?user_id=<id> 都相同。
+		userID := extractXHSUserID(params)
+		if userID == "" {
+			return nil, "xhs/user_posts 必须提供 user_id（小红书用户 ID，24 位十六进制）或 profile_url（用户主页链接）"
+		}
+		cfg, err := json.Marshal(map[string]string{"user_id": userID})
+		if err != nil {
+			return nil, "构造信源配置失败"
+		}
+		if title == "" {
+			title = "小红书用户: " + userID
+		}
+		return &types.Source{
+			Platform:   types.PlatformXHS,
+			Capability: types.CapUserPosts,
+			URL:        "vane://xhs/user_posts?user_id=" + url.QueryEscape(userID),
+			Title:      title,
+			Config:     cfg,
+			Status:     types.SourceStatusActive,
+		}, ""
+
 	default:
-		return nil, "xhs 平台仅支持 search 能力"
+		return nil, "xhs 平台仅支持 search / user_posts 能力"
 	}
+}
+
+// extractXHSUserID 从 params 里解析小红书 user_id：优先 user_id 直填，其次从
+// profile_url / url 里按 /user/profile/<24hex> 抽取。都拿不到返回空串。
+func extractXHSUserID(params map[string]string) string {
+	if uid := strings.TrimSpace(params["user_id"]); uid != "" {
+		// 若误把整条主页链接填进了 user_id，也从中抽一次，容错。
+		if m := xhsProfileRe.FindStringSubmatch(uid); m != nil {
+			return m[1]
+		}
+		return uid
+	}
+	for _, k := range []string{"profile_url", "url"} {
+		if raw := strings.TrimSpace(params[k]); raw != "" {
+			if m := xhsProfileRe.FindStringSubmatch(raw); m != nil {
+				return m[1]
+			}
+		}
+	}
+	return ""
 }
 
 // BuildLegacy 接受 M6 前的扁平入参（type + url/query/keyword/category），
