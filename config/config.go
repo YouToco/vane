@@ -114,6 +114,11 @@ type DashboardConfig struct {
 	// Password 是 Dashboard 登录密码，环境变量 VANE_DASHBOARD_PASSWORD。
 	// 为空时不 fail（允许无 Dashboard 场景），api 层对登录一律 401。
 	Password string `mapstructure:"password"`
+	// Origin 是 Dashboard 前端的部署源（scheme+host），环境变量 VANE_DASHBOARD_ORIGIN。
+	// 前端迁 OSS+CDN 后与 API 不再同源（vane.* 静态托管、api.* 后端），浏览器跨源
+	// fetch 需要后端应答 CORS 头；本值是唯一放行的 Origin。为空时不放行任何跨源请求
+	// （同源部署场景 CORS 头本就多余）。凭证跨源要求 Allow-Origin 不能是通配符，故必须显式。
+	Origin string `mapstructure:"origin"`
 }
 
 // A2AConfig 是 A2A server 配置（a2a-contract §6）。
@@ -183,6 +188,9 @@ func setDefaults(v *viper.Viper) {
 	// 默认只绑 loopback：生产走 Caddy(host 网络)反代 127.0.0.1:8080，8080 不该对公网可达。
 	// 需对外监听时用 VANE_SERVER_ADDR / 配置文件显式覆盖（见 ServerConfig.Addr）。
 	v.SetDefault("server.addr", "127.0.0.1:8080")
+	// Dashboard 前端生产源。设默认值兼有两个作用：生产零配置即放行正确源；
+	// 让 dashboard.origin 成为 Viper 的"已知键"，VANE_DASHBOARD_ORIGIN 可覆盖（见 sensitiveKeys 注释）。
+	v.SetDefault("dashboard.origin", "https://vane.zhuoqidev.com")
 
 	v.SetDefault("temporal.host", "127.0.0.1:7233")
 	v.SetDefault("temporal.namespace", "default")
