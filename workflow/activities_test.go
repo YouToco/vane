@@ -44,16 +44,30 @@ type fakePusher struct {
 	mu    sync.Mutex
 	msgID string
 	sent  []string // 每次 Push 收到的卡片 JSON
+	// perCallID=true 时每次调用返回 msgID+"#序号"——聚合分块用例靠它断言
+	// "各块的投递回填各自块的 msgID"（跨块错记 msgID 的变异体曾全绿存活）。
+	perCallID bool
+	// failCalls 里列出的调用序号（1 起）返回错误——部分失败矩阵用。
+	failCalls map[int]error
+	calls     int
 }
 
 func (p *fakePusher) Push(_ context.Context, _, cardJSON string) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.sent = append(p.sent, cardJSON)
-	if p.msgID == "" {
-		return "om_test", nil
+	p.calls++
+	if err := p.failCalls[p.calls]; err != nil {
+		return "", err
 	}
-	return p.msgID, nil
+	p.sent = append(p.sent, cardJSON)
+	id := p.msgID
+	if id == "" {
+		id = "om_test"
+	}
+	if p.perCallID {
+		id = fmt.Sprintf("%s#%d", id, p.calls)
+	}
+	return id, nil
 }
 
 func (p *fakePusher) sentCards() []string {
@@ -121,6 +135,7 @@ type fakeStore struct {
 	// updateFetchErr 模拟 UpdateSourceFetchState 落库失败（验"状态没落库不告警"）。
 	dueSources     []types.Source
 	updateFetchErr error
+	statusSet      []types.BatchStatus // UpdatePushBatchStatus 调用记录（部分失败矩阵用）
 	// 自动停用测试用（功能 5.2）：disableResult 是 DisableSourceIfActive 的返回
 	// （true=本次真从 active 翻成 disabled），disableErr 模拟落库失败，disableCalls 记录入参。
 	disableResult bool
@@ -195,8 +210,17 @@ func (s *fakeStore) InsertDeliveryIdempotent(_ context.Context, d *types.Deliver
 	return s.nextDelID, false, false, nil
 }
 
-func (s *fakeStore) UpdatePushBatchStatus(context.Context, int64, types.BatchStatus) error {
+func (s *fakeStore) UpdatePushBatchStatus(_ context.Context, _ int64, st types.BatchStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statusSet = append(s.statusSet, st)
 	return nil
+}
+
+func (s *fakeStore) statusCalls() []types.BatchStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]types.BatchStatus(nil), s.statusSet...)
 }
 
 func (s *fakeStore) MarkDeliverySent(_ context.Context, id int64, msgID string, cardJSON json.RawMessage, _ time.Time) error {
@@ -848,5 +872,85 @@ func TestPush_ByteSplitting(t *testing.T) {
 	}
 	if got := len(st.markedCalls()); got != 2 {
 		t.Errorf("两条投递都应送达（无静默截断），实得 %d", got)
+	}
+}
+
+// TestPush_各块msgID归属 跨块错记 msgID 的变异体曾存活（对抗审查 #9）：
+// 每块独立推送得独立 msgID，块内投递必须回填**本块**的 msgID——重建按 msgID
+// 找兄弟，错记会把条目并进错误的卡。
+func TestPush_各块msgID归属(t *testing.T) {
+	st := &fakeStore{nextDelID: 0}
+	push := &fakePusher{msgID: "om", perCallID: true}
+	buildAgg := func(in feedback.AggregateCardInput) string { return "{}" }
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, buildAgg, nil)
+
+	cards := make([]GeneratedCard, aggMaxItemsPerCard+3) // [8,3] 两块
+	for i := range cards {
+		cards[i] = GeneratedCard{Scored: types.ScoredItem{Item: types.ContentItem{ID: int64(200 + i)}, Score: 50}, BodyMD: "x"}
+	}
+	if err := a.Push(context.Background(), PushIn{UserID: 1, TraceID: "tr-m", Cards: cards}); err != nil {
+		t.Fatalf("Push 意外报错: %v", err)
+	}
+	marked := st.markedCalls()
+	if len(marked) != 11 {
+		t.Fatalf("应回填 11 条，实得 %d", len(marked))
+	}
+	for i, m := range marked {
+		want := "om#1"
+		if i >= aggMaxItemsPerCard {
+			want = "om#2"
+		}
+		if m.msgID != want {
+			t.Errorf("第 %d 条应回填 %s（本块 msgID），实得 %s", i, want, m.msgID)
+		}
+	}
+}
+
+// TestPush_单条超限硬发不丢 单条构卡即超 28KB 时硬发（可能被飞书拒，但绝不静默
+// 丢弃）——静默丢弃条目的变异体曾存活（对抗审查 #11）。
+func TestPush_单条超限硬发不丢(t *testing.T) {
+	st := &fakeStore{nextDelID: 0}
+	push := &fakePusher{msgID: "om_big"}
+	buildAgg := func(in feedback.AggregateCardInput) string {
+		return strings.Repeat("x", aggMaxCardBytes+1) // 单条也超限
+	}
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, buildAgg, nil)
+
+	if err := a.Push(context.Background(), PushIn{UserID: 1, TraceID: "tr-h", Cards: []GeneratedCard{
+		{Scored: types.ScoredItem{Item: types.ContentItem{ID: 1}, Score: 50}, BodyMD: "x"},
+	}}); err != nil {
+		t.Fatalf("Push 意外报错: %v", err)
+	}
+	if len(push.sentCards()) != 1 || len(st.markedCalls()) != 1 {
+		t.Errorf("单条超限应硬发送达，实得 sent=%d marked=%d", len(push.sentCards()), len(st.markedCalls()))
+	}
+}
+
+// TestPush_部分失败可重试 对抗审查 HIGH：块 2 推送失败时不得结算 done——
+// 必须返回可重试错误让 Temporal 重试补发，否则失败块的条目永久搁浅 pending
+// 且（候选查询按 deliveries 任意状态排除）永不再成为候选。
+func TestPush_部分失败可重试(t *testing.T) {
+	st := &fakeStore{nextDelID: 0}
+	push := &fakePusher{msgID: "om", failCalls: map[int]error{2: errors.New("feishu 拒收")}}
+	buildAgg := func(in feedback.AggregateCardInput) string { return "{}" }
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, buildAgg, nil)
+
+	cards := make([]GeneratedCard, aggMaxItemsPerCard+3)
+	for i := range cards {
+		cards[i] = GeneratedCard{Scored: types.ScoredItem{Item: types.ContentItem{ID: int64(300 + i)}, Score: 50}, BodyMD: "x"}
+	}
+	err := a.Push(context.Background(), PushIn{UserID: 1, TraceID: "tr-p", Cards: cards})
+	if err == nil {
+		t.Fatal("部分块失败必须返回错误（触发重试补发），不能静默记 done")
+	}
+	// 成功块正常送达。
+	if got := len(st.markedCalls()); got != aggMaxItemsPerCard {
+		t.Errorf("成功块 %d 条应送达，实得 %d", aggMaxItemsPerCard, got)
+	}
+	// 批次不得被结算为 done（终态留待重试收敛）。
+	for _, sc := range st.statusCalls() {
+		if sc == types.BatchStatusDone {
+			t.Error("部分失败时批次不得记 done（失败块条目会永久搁浅）")
+		}
 	}
 }

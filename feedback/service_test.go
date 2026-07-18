@@ -387,3 +387,35 @@ func TestRebuilt_单投递message仍走单条构卡(t *testing.T) {
 		t.Error("单条路径仍应重建卡片")
 	}
 }
+
+// TestRebuildAggregate_force只作用被点条 force 误伤全部兄弟的变异体曾存活
+// （对抗审查 #16）：deep_dive 等 force 语义只能落在被点的那条上。
+func TestRebuildAggregate_force只作用被点条(t *testing.T) {
+	h := newHarness(t)
+	sibID := testDeliveryID + 1
+	sibItem := testItemID
+	h.st.deliveries[sibID] = &types.Delivery{
+		ID: sibID, UserID: testUserID, ContentItemID: &sibItem,
+		Score: 70, BodyMD: "兄弟", FeishuMessageID: testMsgID,
+		Status: types.DeliveryStatusSent, CreatedAt: time.Now(),
+	}
+	var got *AggregateCardInput
+	h.svc.deps.BuildAggCard = func(in AggregateCardInput) string { got = &in; return "{}" }
+
+	clicked := h.delivery()
+	_, err := h.svc.rebuildAggregate(context.Background(), clicked, []types.Delivery{*clicked, *h.st.deliveries[sibID]},
+		func(st *CardState) { st.DeepDiveRequested = true })
+	if err != nil {
+		t.Fatalf("rebuildAggregate 失败: %v", err)
+	}
+	if got == nil || len(got.Items) != 2 {
+		t.Fatalf("应含 2 条，实得 %+v", got)
+	}
+	for _, it := range got.Items {
+		want := it.DeliveryID == clicked.ID
+		if it.State.DeepDiveRequested != want {
+			t.Errorf("delivery %d 的 force 态应为 %v（force 只作用被点条），实得 %v",
+				it.DeliveryID, want, it.State.DeepDiveRequested)
+		}
+	}
+}

@@ -203,24 +203,13 @@ func aggReasonForm(idStr string) map[string]any {
 	}
 }
 
-// ParseAggHeader 从库存 card_json 解析 header 的标题与色名（重建路径用；
-// 解析失败返回空串，构卡函数会落兜底）。
-func ParseAggHeader(cardJSON []byte) (title, template string) {
-	var c struct {
-		Header struct {
-			Title struct {
-				Content string `json:"content"`
-			} `json:"title"`
-			Template string `json:"template"`
-		} `json:"header"`
-	}
-	if err := json.Unmarshal(cardJSON, &c); err != nil {
-		return "", ""
-	}
-	return c.Header.Title.Content, c.Header.Template
-}
-
-// escapeMarkdown 把标题里可能破坏 markdown 加粗语法的字符做最小转义。
+// escapeMarkdown 中和标题里能改变 markdown/HTML 结构的字符（对抗审查：外部标题
+// 含 `[x](恶意url)` 或 `<font>` 会在卡上渲染成假链接/样式注入）。方括号与尖括号
+// 替换为全角同形字符——飞书 markdown 不认反斜杠转义，全角在视觉上近似且语法惰性。
 func escapeMarkdown(s string) string {
-	return strings.NewReplacer("**", "\\*\\*", "\n", " ").Replace(s)
+	return strings.NewReplacer(
+		"**", "＊＊", "\n", " ",
+		"[", "［", "]", "］",
+		"<", "＜", ">", "＞",
+	).Replace(s)
 }

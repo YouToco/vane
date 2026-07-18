@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -132,6 +133,9 @@ func (f *fakeStore) ListDeliveriesByFeishuMessage(_ context.Context, userID int6
 			out = append(out, *d)
 		}
 	}
+	// 与真 store 同序（id ASC）：map 遍历序随机，不排序会让条目顺序断言 flaky，
+	// 且掩盖"重建序≠首发序"一类真错位。
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
 }
 

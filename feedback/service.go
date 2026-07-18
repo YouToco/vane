@@ -218,6 +218,10 @@ func (s *Service) rebuilt(ctx context.Context, d *types.Delivery, toast string, 
 
 	// 聚合卡分流（附录 A）：同一 feishu_message_id 承载多个 delivery 时走聚合重建。
 	// 历史单条卡查回恰好 1 行（每卡独立 message_id），自然落回单条路径——旧卡外观零变化。
+	//
+	// 已知取舍（对抗审查 #5/#6，单 owner 容忍）：推送后 MarkDeliverySent 逐条回填
+	// msgID 的毫秒级窗口内点击，兄弟查询可能少行 → 重建出的卡短暂缺条目；回填完成后
+	// 下一次点击按库内全量自愈。根治需批量回填或事务，不值当前复杂度。
 	if d.FeishuMessageID != "" {
 		siblings, serr := s.deps.Store.ListDeliveriesByFeishuMessage(ctx, d.UserID, d.FeishuMessageID)
 		if serr != nil {
@@ -225,6 +229,11 @@ func (s *Service) rebuilt(ctx context.Context, d *types.Delivery, toast string, 
 			return res
 		}
 		if len(siblings) > 1 {
+			// toast 带被点条标题回显（附录 A.4 吸收项）：聚合卡 N 条并排，toast 是
+			// 用户确认"系统记到了我点的那条"的最后一道人眼防线。
+			if ci, cerr := s.contentOf(ctx, d); cerr == nil && ci != nil && ci.Title != "" {
+				res.Toast = toast + "《" + promptguard.TruncateRunes(ci.Title, 20) + "》"
+			}
 			if cardJSON, aerr := s.rebuildAggregate(ctx, d, siblings, force); aerr != nil {
 				slog.Warn("feedback: 聚合卡重建失败，本次不更新卡片", "delivery_id", d.ID, "err", aerr)
 			} else {
@@ -347,9 +356,10 @@ func (s *Service) rebuildAggregate(ctx context.Context, clicked *types.Delivery,
 		sib := &siblings[i]
 		st, err := s.cardState(ctx, sib.ID)
 		if err != nil {
-			// 单条状态查失败不整卡放弃：该条按零值渲染（按钮仍在），下次点击自愈。
-			slog.Warn("feedback: 聚合重建单条状态查询失败，按零值渲染", "delivery_id", sib.ID, "err", err)
-			st = CardState{}
+			// 中止整卡重建（对抗审查：零值渲染=用已知错误的"未表态"覆盖用户已提交的
+			// 表态上屏，与单条路径"查失败不更新卡片"的既有裁决相反）。主操作已成功，
+			// 卡片保持旧版本，下次点击自愈。
+			return "", fmt.Errorf("查兄弟条目 %d 状态失败: %w", sib.ID, err)
 		}
 		if force != nil && sib.ID == clicked.ID {
 			force(&st)
@@ -394,4 +404,12 @@ func parseAggHeader(cardJSON []byte) (title, template string) {
 		return "", ""
 	}
 	return c.Header.Title.Content, c.Header.Template
+}
+
+// contentOf 取投递对应的内容行（toast 标题回显用）；无内容或查失败返回 nil。
+func (s *Service) contentOf(ctx context.Context, d *types.Delivery) (*types.ContentItem, error) {
+	if d.ContentItemID == nil {
+		return nil, nil
+	}
+	return s.deps.Store.GetContentItem(ctx, *d.ContentItemID)
 }
