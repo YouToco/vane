@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/YouToco/vane/auth"
 	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/store"
@@ -44,6 +45,9 @@ type Deps struct {
 	Store     *store.Store
 	Manager   Manager
 	Scheduler Scheduler
+	// Principal 是全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
+	// 生产由 main.go 注入 auth.NewOwnerResolver；单测可注入假实现。
+	Principal auth.PrincipalResolver
 	// Password 是 Dashboard 登录密码（VANE_DASHBOARD_PASSWORD）；
 	// 为空时登录一律 401——见 handleLogin。
 	Password string

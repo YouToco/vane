@@ -16,6 +16,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv/limiter"
 
 	"github.com/YouToco/vane/agent"
+	"github.com/YouToco/vane/auth"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/types"
 )
@@ -60,23 +61,17 @@ type ChatRunner interface {
 	RunOnce(ctx context.Context, userID int64, history []llm.ChatMessage, text string) (agent.Outcome, []llm.ChatMessage, error)
 }
 
-// OwnerStore 是 owner 解析窄接口（*store.Store 满足；语义对齐 api/owner.go：
-// settings.feishu_owner → open_id → users 主键）。A2A 轨以 owner 身份执行只读
-// 工具（数据边界已随契约拍板 §13.2 确认）。
-type OwnerStore interface {
-	GetSetting(ctx context.Context, key string) (json.RawMessage, error)
-	UpsertUserByOpenID(ctx context.Context, openID, name string) (*types.User, error)
-}
-
 // Deps 由 cmd/server/main.go 装配（契约 §7）。
 type Deps struct {
 	Storage TaskStorage  // 生产 = *store.Store
 	Content ContentStore // 生产 = *store.Store
 	Chat    ChatRunner   // 生产 = A2A 轨 agent.Loop；nil = assistant.chat 未启用（REJECTED）
-	Owner   OwnerStore   // 生产 = *store.Store；与 Chat 同生共死
-	Token   string       // cfg.A2A.Token；空值 = 挂载但 auth 恒 401（§6）
-	BaseURL string       // cfg.A2A.BaseURL，进 AgentCard supportedInterfaces 的 url
-	Version string       // 服务版本串，进 AgentCard.version
+	// Principal 是全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）；
+	// 生产 = auth.NewOwnerResolver(*store.Store, feishu.SettingKeyOwner)；与 Chat 同生共死。
+	Principal auth.PrincipalResolver
+	Token     string // cfg.A2A.Token；空值 = 挂载但 auth 恒 401（§6）
+	BaseURL   string // cfg.A2A.BaseURL，进 AgentCard supportedInterfaces 的 url
+	Version   string // 服务版本串，进 AgentCard.version
 }
 
 // Mount 把 A2A 端点挂到根 mux。cfg.A2A.Enabled=false 时 main.go 不调用本函数（零暴露面）。
