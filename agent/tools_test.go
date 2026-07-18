@@ -8,9 +8,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/workflow"
 )
 
 // fakePushTrigger 是 PushTrigger 的可编程假实现。
@@ -444,6 +446,25 @@ func TestSpecFromArgs_CategoriesMarshaled(t *testing.T) {
 	}
 }
 
+// TestSpecFromArgs_IncludeDomainsMarshaled 守 D-2 的 include_domains 映射分支
+// （[]string → JSON 字符串进 params，与 categories 同路径），并端到端进幂等键。
+func TestSpecFromArgs_IncludeDomainsMarshaled(t *testing.T) {
+	spec := specFromArgs(addSourceArgs{
+		Platform: "web", Capability: "search", Query: "Claude release",
+		IncludeDomains: []string{"anthropic.com", "claude.com"},
+	})
+	if got := spec.Params["include_domains"]; got != `["anthropic.com","claude.com"]` {
+		t.Fatalf("include_domains 应序列化为 JSON 数组字符串, 实得 %q", got)
+	}
+	src, msg := sourcespec.Build(spec)
+	if msg != "" {
+		t.Fatalf("Build 应成功: %s", msg)
+	}
+	if !strings.Contains(src.URL, "include_domains=") {
+		t.Fatalf("include_domains 未进幂等键: %q", src.URL)
+	}
+}
+
 // TestAddSourceTool_Summarize 覆盖确认卡文案的每个 capability 分支（审计 M-3）：
 // 预填错内容用户照点即加错源，故每条分支都逐字钉住。
 func TestAddSourceTool_Summarize(t *testing.T) {
@@ -630,9 +651,269 @@ func TestBuildTools_包含update_schedule(t *testing.T) {
 	for _, tl := range BuildTools(nil, nil, nil, nil) {
 		names[tl.Name()] = true
 	}
-	for _, want := range []string{"create_schedule", "update_schedule", "remove_schedule", "list_schedules"} {
+	for _, want := range []string{"create_schedule", "update_schedule", "remove_schedule", "list_schedules", "view_task_playbook", "edit_task_playbook"} {
 		if !names[want] {
 			t.Errorf("BuildTools 应包含 %s", want)
 		}
 	}
+}
+
+// ============================================================
+// 任务手册工具（Task Playbook P0）
+// ============================================================
+
+// fakePlaybookStore 满足 playbookStore：books 存内容，owner 存归属。
+// Get 未命中/非本人 → types.ErrNotFound；Upsert 校归属返回 ok，记录入参供断言。
+type fakePlaybookStore struct {
+	books     map[string]*types.SchedulePlaybook
+	owner     map[string]int64
+	getErr    error
+	upsertErr error
+	upserts   []struct {
+		userID     int64
+		scheduleID string
+		content    string
+	}
+}
+
+func newFakePlaybookStore() *fakePlaybookStore {
+	return &fakePlaybookStore{books: map[string]*types.SchedulePlaybook{}, owner: map[string]int64{}}
+}
+
+func (f *fakePlaybookStore) GetSchedulePlaybook(_ context.Context, userID int64, scheduleID string) (*types.SchedulePlaybook, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	pb, ok := f.books[scheduleID]
+	if !ok || f.owner[scheduleID] != userID {
+		return nil, types.NewAppError(types.CodeNotFound, "无手册或非本人", nil)
+	}
+	return pb, nil
+}
+
+func (f *fakePlaybookStore) UpsertSchedulePlaybook(_ context.Context, userID int64, scheduleID, content string) (bool, error) {
+	f.upserts = append(f.upserts, struct {
+		userID     int64
+		scheduleID string
+		content    string
+	}{userID, scheduleID, content})
+	if f.upsertErr != nil {
+		return false, f.upsertErr
+	}
+	if o, ok := f.owner[scheduleID]; ok && o != userID {
+		return false, nil // 非本人：归属未命中
+	}
+	f.owner[scheduleID] = userID
+	f.books[scheduleID] = &types.SchedulePlaybook{ScheduleID: scheduleID, Content: content}
+	return true, nil
+}
+
+func TestViewTaskPlaybookTool(t *testing.T) {
+	if (&viewTaskPlaybookTool{}).Mutating() {
+		t.Fatal("view_task_playbook 必须是读工具（Mutating=false），否则查手册要人点确认卡")
+	}
+	t.Run("有手册逐字返回", func(t *testing.T) {
+		fs := newFakePlaybookStore()
+		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1", Content: "每天早八 AI 官方新闻"}
+		fs.owner["s1"] = 7
+		got, err := (&viewTaskPlaybookTool{st: fs}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":"s1"}`))
+		if err != nil {
+			t.Fatalf("意外报错: %v", err)
+		}
+		if got != "任务手册（id=s1）：\n每天早八 AI 官方新闻" {
+			t.Fatalf("渲染不符: %q", got)
+		}
+	})
+	t.Run("空内容给引导文案", func(t *testing.T) {
+		fs := newFakePlaybookStore()
+		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1", Content: ""}
+		fs.owner["s1"] = 7
+		got, _ := (&viewTaskPlaybookTool{st: fs}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":"s1"}`))
+		if !strings.Contains(got, "手册为空") {
+			t.Fatalf("空手册应给引导文案: %q", got)
+		}
+	})
+	t.Run("NotFound 回文案不报错", func(t *testing.T) {
+		got, err := (&viewTaskPlaybookTool{st: newFakePlaybookStore()}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":"nope"}`))
+		if err != nil {
+			t.Fatalf("NotFound 不应上抛: %v", err)
+		}
+		if !strings.Contains(got, "没找到你的定时任务") {
+			t.Fatalf("应回引导文案: %q", got)
+		}
+	})
+	t.Run("空 schedule_id 自纠不触库", func(t *testing.T) {
+		got, err := (&viewTaskPlaybookTool{st: newFakePlaybookStore()}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":""}`))
+		if err != nil || !strings.Contains(got, "schedule_id 必须是非空") {
+			t.Fatalf("应回自纠文案, got=%q err=%v", got, err)
+		}
+	})
+	t.Run("DB 错误上抛不伪装", func(t *testing.T) {
+		fs := newFakePlaybookStore()
+		fs.getErr = types.NewAppError(types.CodeDatabase, "连接池耗尽", nil)
+		got, err := (&viewTaskPlaybookTool{st: fs}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":"s1"}`))
+		if err == nil || got != "" {
+			t.Fatalf("基础设施错误应上抛（不得伪装成无手册）, got=%q err=%v", got, err)
+		}
+	})
+}
+
+func TestEditTaskPlaybookTool(t *testing.T) {
+	if !(&editTaskPlaybookTool{}).Mutating() {
+		t.Fatal("edit_task_playbook 必须是写工具（Mutating=true），否则绕过确认卡")
+	}
+	t.Run("正常写入", func(t *testing.T) {
+		fs := newFakePlaybookStore()
+		fs.owner["s1"] = 7 // 已存在且属本人
+		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1"}
+		got, err := (&editTaskPlaybookTool{st: fs}).Execute(context.Background(), 7,
+			json.RawMessage(`{"schedule_id":"s1","content":"只要官方源"}`))
+		if err != nil {
+			t.Fatalf("意外报错: %v", err)
+		}
+		if len(fs.upserts) != 1 || fs.upserts[0].content != "只要官方源" || fs.upserts[0].userID != 7 {
+			t.Fatalf("upsert 入参不符: %+v", fs.upserts)
+		}
+		if !strings.Contains(got, "已更新定时任务") {
+			t.Fatalf("回执不符: %q", got)
+		}
+	})
+	t.Run("空 content 自纠不触库", func(t *testing.T) {
+		fs := newFakePlaybookStore()
+		got, err := (&editTaskPlaybookTool{st: fs}).Execute(context.Background(), 7,
+			json.RawMessage(`{"schedule_id":"s1","content":"  "}`))
+		if err != nil || !strings.Contains(got, "手册内容不能为空") {
+			t.Fatalf("应回自纠文案, got=%q err=%v", got, err)
+		}
+		if len(fs.upserts) != 0 {
+			t.Fatalf("空内容不得触库: %+v", fs.upserts)
+		}
+	})
+	t.Run("content 超上限截断", func(t *testing.T) {
+		fs := newFakePlaybookStore()
+		fs.owner["s1"] = 7
+		long := strings.Repeat("字", maxPlaybookContentRunes+50)
+		if _, err := (&editTaskPlaybookTool{st: fs}).Execute(context.Background(), 7,
+			json.RawMessage(`{"schedule_id":"s1","content":"`+long+`"}`)); err != nil {
+			t.Fatalf("超限应截断而非报错: %v", err)
+		}
+		if got := len([]rune(fs.upserts[0].content)); got != maxPlaybookContentRunes {
+			t.Fatalf("content 应截到 %d rune, 实得 %d", maxPlaybookContentRunes, got)
+		}
+	})
+	t.Run("归属未命中回文案不报错", func(t *testing.T) {
+		fs := newFakePlaybookStore()
+		fs.owner["s1"] = 99 // 属别人
+		got, err := (&editTaskPlaybookTool{st: fs}).Execute(context.Background(), 7,
+			json.RawMessage(`{"schedule_id":"s1","content":"x"}`))
+		if err != nil {
+			t.Fatalf("归属未命中不应上抛: %v", err)
+		}
+		if !strings.Contains(got, "没找到你的定时任务") {
+			t.Fatalf("应回自纠文案: %q", got)
+		}
+	})
+	t.Run("DB 错误上抛", func(t *testing.T) {
+		fs := newFakePlaybookStore()
+		fs.upsertErr = types.NewAppError(types.CodeDatabase, "写入失败", nil)
+		got, err := (&editTaskPlaybookTool{st: fs}).Execute(context.Background(), 7,
+			json.RawMessage(`{"schedule_id":"s1","content":"x"}`))
+		if err == nil || got != "" {
+			t.Fatalf("基础设施错误应上抛, got=%q err=%v", got, err)
+		}
+	})
+}
+
+func TestEditTaskPlaybookTool_Summarize(t *testing.T) {
+	tool := &editTaskPlaybookTool{}
+	t.Run("正常展示内容片段", func(t *testing.T) {
+		got := tool.Summarize(json.RawMessage(`{"schedule_id":"s1","content":"只要官方源"}`))
+		if got != "修改定时任务手册（id=s1）：新内容「只要官方源」" {
+			t.Fatalf("摘要不符: %q", got)
+		}
+	})
+	t.Run("超预览上限截断带省略号", func(t *testing.T) {
+		long := strings.Repeat("字", playbookSummaryPreviewRunes+20)
+		got := tool.Summarize(json.RawMessage(`{"schedule_id":"s1","content":"` + long + `"}`))
+		if !strings.Contains(got, "…") {
+			t.Fatalf("超预览上限应截断带省略号: %q", got)
+		}
+	})
+	t.Run("非法 JSON 走兜底", func(t *testing.T) {
+		if got := tool.Summarize(json.RawMessage(`{`)); !strings.Contains(got, "修改任务手册") {
+			t.Fatalf("应走 summarizeFallback: %q", got)
+		}
+	})
+}
+
+// fakeScheduleCreator 是 scheduleCreator 的假实现：返回预设 schedID / err，
+// 并记录 CreatePush 收到的 nlDesc（用于验证手册初始化用它作内容）。
+type fakeScheduleCreator struct {
+	schedID   string
+	err       error
+	gotNLDesc string
+	calls     int
+}
+
+func (f *fakeScheduleCreator) CreatePush(_ context.Context, _ int64, _ scheduler.ScheduleSpec, _ workflow.PushScope, nlDesc string) (string, error) {
+	f.calls++
+	f.gotNLDesc = nlDesc
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.schedID, nil
+}
+
+// TestCreateScheduleTool_InitializesPlaybook 守决策 D2 的胶水（创建即初始化手册）：
+// CreatePush 成功后，用 nl_description 初始化 schedID 对应的手册；best-effort——
+// 手册写失败不回滚调度、仍回成功。此前这条接线零测试（Execute 依赖真 Temporal）。
+func TestCreateScheduleTool_InitializesPlaybook(t *testing.T) {
+	args := json.RawMessage(`{"spec":{"cron":"0 30 8 * * *"},"nl_description":"每天早八 AI 官方新闻"}`)
+
+	t.Run("成功时用 nl 意图初始化手册", func(t *testing.T) {
+		sc := &fakeScheduleCreator{schedID: "push-7-abc"}
+		pb := newFakePlaybookStore()
+		tool := &createScheduleTool{sched: sc, st: pb}
+		got, err := tool.Execute(context.Background(), 7, args)
+		if err != nil {
+			t.Fatalf("意外报错: %v", err)
+		}
+		if !strings.Contains(got, "push-7-abc") {
+			t.Fatalf("回执应含 schedID: %q", got)
+		}
+		if len(pb.upserts) != 1 {
+			t.Fatalf("应恰好初始化一次手册, 实得 %d", len(pb.upserts))
+		}
+		u := pb.upserts[0]
+		if u.userID != 7 || u.scheduleID != "push-7-abc" || u.content != "每天早八 AI 官方新闻" {
+			t.Fatalf("手册初始化入参不符: %+v", u)
+		}
+	})
+
+	t.Run("手册写失败仍回成功（best-effort，不回滚调度）", func(t *testing.T) {
+		sc := &fakeScheduleCreator{schedID: "push-7-def"}
+		pb := newFakePlaybookStore()
+		pb.upsertErr = types.NewAppError(types.CodeDatabase, "写入失败", nil)
+		tool := &createScheduleTool{sched: sc, st: pb}
+		got, err := tool.Execute(context.Background(), 7, args)
+		if err != nil {
+			t.Fatalf("手册写失败不应让 create_schedule 上抛（best-effort）: %v", err)
+		}
+		if !strings.Contains(got, "push-7-def") {
+			t.Fatalf("调度是主效果，仍应回成功: %q", got)
+		}
+	})
+
+	t.Run("CreatePush 失败则不建手册", func(t *testing.T) {
+		sc := &fakeScheduleCreator{err: types.NewAppError(types.CodeValidation, "频率过高", nil)}
+		pb := newFakePlaybookStore()
+		tool := &createScheduleTool{sched: sc, st: pb}
+		got, _ := tool.Execute(context.Background(), 7, args)
+		if !strings.Contains(got, "频率过高") {
+			t.Fatalf("CodeValidation 应回文案: %q", got)
+		}
+		if len(pb.upserts) != 0 {
+			t.Fatalf("调度没建成不该初始化手册, 实得 %+v", pb.upserts)
+		}
+	})
 }

@@ -293,6 +293,17 @@ type Schedule struct {
 	UpdatedAt     time.Time       `json:"updated_at"`
 }
 
+// SchedulePlaybook 情报任务手册（schedule_playbooks 表，migration 017）。
+// 与 Schedule 一对一（ScheduleID 既是主键又是外键 → schedules(id) ON DELETE CASCADE，
+// 删定时任务连带删手册）。P0：Content 为手册正文，建任务时以用户 nl 意图原文初始化，
+// 只做存取、不驱动抓取。FetchPlan 为 P1 预留（NL→结构化抓取计划），P0 恒为 '{}'。
+type SchedulePlaybook struct {
+	ScheduleID string          `json:"schedule_id"`
+	Content    string          `json:"content"`
+	FetchPlan  json.RawMessage `json:"fetch_plan"` // JSONB，P1 预留，P0 为 {}
+	UpdatedAt  time.Time       `json:"updated_at"`
+}
+
 // AgentSession agent 对话会话（agent_sessions 表，M4 migration 005）。
 // 单 owner MVP：同一用户 TTL 窗口（默认 30 分钟）内的消息共享一个会话，
 // 超时由读取路径惰性置 expired。Messages 存 OpenAI 兼容消息数组 JSON

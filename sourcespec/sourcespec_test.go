@@ -93,6 +93,76 @@ func TestBuild_WebSearchCategoryInIdempotencyKey(t *testing.T) {
 	}
 }
 
+// TestBuild_WebSearchIncludeDomains 守 D-2：include_domains 进 config（JSON 数组，与
+// exa.go 消费端对齐）+ 进幂等键（§5.2 规则 B）；集合语义（排序/去重/大小写归一）。
+func TestBuild_WebSearchIncludeDomains(t *testing.T) {
+	mk := func(domainsJSON string) *types.Source {
+		p := map[string]string{"query": "Claude release"}
+		if domainsJSON != "" {
+			p["include_domains"] = domainsJSON
+		}
+		src, msg := Build(Spec{Platform: "web", Capability: "search", Params: p})
+		if msg != "" {
+			t.Fatalf("意外报错: %s", msg)
+		}
+		return src
+	}
+
+	// (a) config 含 include_domains 数组（供 exa.go 消费）+ 进幂等键。
+	src := mk(`["anthropic.com","claude.com"]`)
+	var cfg struct {
+		Query          string   `json:"query"`
+		IncludeDomains []string `json:"include_domains"`
+	}
+	if err := json.Unmarshal(src.Config, &cfg); err != nil {
+		t.Fatalf("config 解析失败: %v", err)
+	}
+	if len(cfg.IncludeDomains) != 2 || cfg.IncludeDomains[0] != "anthropic.com" || cfg.IncludeDomains[1] != "claude.com" {
+		t.Errorf("config.include_domains 不符（应排序）: %v", cfg.IncludeDomains)
+	}
+	if !strings.Contains(src.URL, "include_domains=") {
+		t.Errorf("幂等键应含 include_domains: %q", src.URL)
+	}
+
+	// (b) 有域名 vs 无域名 = 不同源。
+	if none := mk(""); none.URL == src.URL {
+		t.Errorf("有/无 include_domains 应产出不同幂等键: %q vs %q", none.URL, src.URL)
+	}
+
+	// (c) 同 query 不同域名集 = 不同源（解药不会被静默抹掉）。
+	if other := mk(`["openai.com"]`); other.URL == src.URL {
+		t.Errorf("不同 include_domains 应产出不同幂等键: %q vs %q", other.URL, src.URL)
+	}
+
+	// (d) 集合语义：顺序不同 + 大小写不同 + 重复项 → 同一幂等键。
+	if reordered := mk(`["Claude.com","ANTHROPIC.com","claude.com"]`); reordered.URL != src.URL {
+		t.Errorf("域名集合相同（乱序/大小写/去重后）应产出同一幂等键: %q vs %q", reordered.URL, src.URL)
+	}
+
+	// (e) 参数顺序：q < category < include_domains（§5.2 规则 B 不可重排）。
+	full, msg := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{
+		"query": "AI", "category": "news", "include_domains": `["anthropic.com"]`,
+	}})
+	if msg != "" {
+		t.Fatalf("意外报错: %s", msg)
+	}
+	qi := strings.Index(full.URL, "q=")
+	ci := strings.Index(full.URL, "category=")
+	di := strings.Index(full.URL, "include_domains=")
+	if !(qi >= 0 && ci > qi && di > ci) {
+		t.Errorf("幂等键参数顺序应为 q<category<include_domains: %q", full.URL)
+	}
+}
+
+// TestBuild_WebSearchIncludeDomainsRejectsBadJSON 守非法入参可见拒绝（不静默丢解药）。
+func TestBuild_WebSearchIncludeDomainsRejectsBadJSON(t *testing.T) {
+	if _, msg := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{
+		"query": "AI", "include_domains": "anthropic.com", // 裸串非 JSON 数组
+	}}); msg == "" {
+		t.Error("非 JSON 数组的 include_domains 应被拒绝")
+	}
+}
+
 func TestBuild_TrimsWhitespace(t *testing.T) {
 	a, _ := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": "AI"}})
 	b, _ := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": "  AI  "}})

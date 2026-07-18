@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -96,10 +97,22 @@ func buildWeb(cap types.Capability, params map[string]string, title string) (*ty
 		if query == "" {
 			return nil, "web/search 必须提供 query（搜索词）"
 		}
-		cfgMap := map[string]string{"query": query}
+		// include_domains（D-2 修复 / §0.3 追新的解药）：入参是 JSON 字符串数组（与
+		// categories 入参格式一致），归一化为「TrimSpace + 小写 + 去空 + 去重 + 升序」。
+		// 排序是幂等键正确性的关键：域名是无序集合，集合相同、顺序不同必须是同一个源。
+		domains, derr := parseIncludeDomains(params["include_domains"])
+		if derr != "" {
+			return nil, derr
+		}
+		// config 用 map[string]any：include_domains 要以 JSON 数组落库，与
+		// fetcher/exa.go 的 exaSourceConfig.IncludeDomains []string 逐字节对齐。
+		cfgMap := map[string]any{"query": query}
 		category := strings.TrimSpace(params["category"])
 		if category != "" {
 			cfgMap["category"] = category
+		}
+		if len(domains) > 0 {
+			cfgMap["include_domains"] = domains
 		}
 		cfg, err := json.Marshal(cfgMap)
 		if err != nil {
@@ -108,9 +121,15 @@ func buildWeb(cap types.Capability, params map[string]string, title string) (*ty
 		if title == "" {
 			title = "搜索: " + query
 		}
+		// 幂等键参数顺序（M6 §5.2 规则 B，不可重排）：q → category → include_domains。
+		// include_domains 已排序，逗号 join 后整体 QueryEscape；手工拼接，绝不用
+		// url.Values.Encode()（它按字母序重排，破坏 008 回填一致性）。
 		syntheticURL := "vane://web/search?q=" + url.QueryEscape(query)
 		if category != "" {
 			syntheticURL += "&category=" + url.QueryEscape(category)
+		}
+		if len(domains) > 0 {
+			syntheticURL += "&include_domains=" + url.QueryEscape(strings.Join(domains, ","))
 		}
 		return &types.Source{
 			Platform:   types.PlatformWeb,
@@ -253,6 +272,42 @@ func extractXHSUserID(params map[string]string) string {
 		}
 	}
 	return ""
+}
+
+// parseIncludeDomains 解析 web/search 的 include_domains 入参（JSON 字符串数组，与
+// categories 入参格式对齐），归一化为「逐项 TrimSpace + ToLower + 去空 + 去重 + 升序」。
+// 空串 / 空数组 / 全空项 → (nil, "")；非法 JSON → (nil, 中文自纠文案)。
+//
+// 排序 + 去重是幂等键正确性的保证（§5.2 规则 B）：include_domains 是无序集合，
+// ["b.com","a.com"] 与 ["a.com","b.com"] 必须产出同一个源；小写化避免 A.com/a.com
+// 撞成两个源（域名大小写不敏感）。此归一化结果同时写进 config 与幂等键，二者恒一致。
+func parseIncludeDomains(raw string) ([]string, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, ""
+	}
+	var arr []string
+	if err := json.Unmarshal([]byte(raw), &arr); err != nil {
+		return nil, `include_domains 必须是 JSON 字符串数组（如 ["anthropic.com","claude.com"]）`
+	}
+	seen := make(map[string]struct{}, len(arr))
+	out := make([]string, 0, len(arr))
+	for _, d := range arr {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d == "" {
+			continue
+		}
+		if _, dup := seen[d]; dup {
+			continue
+		}
+		seen[d] = struct{}{}
+		out = append(out, d)
+	}
+	if len(out) == 0 {
+		return nil, ""
+	}
+	sort.Strings(out)
+	return out, ""
 }
 
 // BuildLegacy 接受 M6 前的扁平入参（type + url/query/keyword/category），

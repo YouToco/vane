@@ -42,8 +42,10 @@ var htmlTagRe = regexp.MustCompile(`<[a-zA-Z/!]`)
 // FetchRSS 再据此判定为 CodeValidation（与抓取前 LookupIP 预检的语义一致）。
 var errBlockedDial = errors.New("fetcher: 目标解析到私网/环回地址，已拒绝连接")
 
-// rssDefaultLookbackDays 是 RSS 源默认只收最近 N 天发布的条目，与
-// exaDefaultLookbackDays 取同一个值：跨源类型的"最新"语义应当一致。
+// rssDefaultLookbackDays 是 RSS 源默认只收最近 N 天发布的条目。
+// 注意 lookback_days 在两个能力下**默认语义刻意不同**（m6 契约 §5.3）：RSS 的 pubDate
+// 是结构化必填字段，默认过滤（7 天）是对的；而 web/search 的 Exa publishedDate 是从 HTML
+// 猜的，默认必须关闭（否则删光无日期的官方页，§0.3 实测 0/15）。故此默认只属 RSS。
 // 之所以要有默认而非默认全量，见 applyLookback 的注释。
 const rssDefaultLookbackDays = 7
 
@@ -198,9 +200,10 @@ func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.Conte
 
 // rssSourceConfig 是 RSS 信源的 config JSONB 结构。
 type rssSourceConfig struct {
-	// LookbackDays 只收最近 N 天发布的条目：0（含字段缺省）用默认 rssDefaultLookbackDays；
-	// <0 表示不限（全量）。语义与 exaSourceConfig.LookbackDays 一致——同一个 config 键
-	// 在不同源类型下含义相同，配源的人不必记住例外。
+	// LookbackDays 只收最近 N 天发布的条目：0（含字段缺省）用默认 rssDefaultLookbackDays（7 天）；
+	// <0 表示不限（全量）。**与 web/search 默认语义相反**——web/search 的 lookback 默认关闭、
+	// 仅作逃生阀（Exa 的 publishedDate 从 HTML 猜、官方页普遍猜不出，m6 契约 §5.3/§0.3）。
+	// 本键对 web/feed 默认开启、对 web/search 默认关闭，不是"跨源统一"。
 	LookbackDays int      `json:"lookback_days,omitempty"`
 	Categories   []string `json:"categories,omitempty"`
 }
