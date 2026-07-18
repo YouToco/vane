@@ -106,9 +106,9 @@ func (a *storeAdapter) Get(ctx context.Context, taskID a2a.TaskID) (*taskstore.S
 
 // Update 乐观并发更新。无行 → a2a.ErrTaskNotFound；版本已前进 →
 // taskstore.ErrConcurrentModification（接口文档 MUST）。成功返回 PrevVersion+1
-//（store UPDATE 语句保证恒成立，契约 §4.1）。
+// （store UPDATE 语句保证恒成立，契约 §4.1）。
 // PrevVersion==TaskVersionMissing（SDK "不跟踪版本"哨兵）时先回读当前版本再条件更新
-//（InMemory 同语义：跳过乐观锁检查；回读窗口内的并发前进会得 Conflict，语义仍正确）。
+// （InMemory 同语义：跳过乐观锁检查；回读窗口内的并发前进会得 Conflict，语义仍正确）。
 func (a *storeAdapter) Update(ctx context.Context, update *taskstore.UpdateRequest) (taskstore.TaskVersion, error) {
 	ctx, cancel := opCtx(ctx)
 	defer cancel()

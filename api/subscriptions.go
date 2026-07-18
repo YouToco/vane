@@ -19,7 +19,7 @@ import (
 type addSubscriptionReq struct {
 	// 新格式（M6 起）
 	Platform   string            `json:"platform"`   // web / x / xhs
-	Capability string            `json:"capability"` // feed / search / user_posts / page_watch
+	Capability string            `json:"capability"` // feed / search / user_posts
 	Params     map[string]string `json:"params"`     // 随 platform+capability 而定
 	// 旧格式（vane-web 兼容窗口）
 	Type     string `json:"type"`     // rss / exa / tikhub_xhs

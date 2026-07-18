@@ -407,4 +407,48 @@ func TestA2ATaskStore(t *testing.T) {
 			t.Errorf("CountA2ATasks()=%d 小于本测试自建的 %d 行", n, mine)
 		}
 	})
+
+	t.Run("FailStale只清超龄非终态", func(t *testing.T) {
+		// 三行：超龄 WORKING（应清）、超龄 SUBMITTED（应清）、超龄 COMPLETED（终态，不动）。
+		mk := func(name, status string, age time.Duration) string {
+			id := newID(name)
+			if _, err := st.pool.Exec(ctx,
+				`INSERT INTO a2a_tasks (id, context_id, status, task, updated_at)
+				 VALUES ($1,$2,$3,$4, now() - $5::interval)`,
+				id, prefix+"ctx-stale", status,
+				json.RawMessage(`{"id":"`+id+`","status":{"state":"`+status+`"}}`),
+				fmt.Sprintf("%d seconds", int(age.Seconds()))); err != nil {
+				t.Fatalf("插入 %s 失败: %v", name, err)
+			}
+			return id
+		}
+		working := mk("stale_working", "TASK_STATE_WORKING", 20*time.Minute)
+		submitted := mk("stale_submitted", "TASK_STATE_SUBMITTED", 20*time.Minute)
+		completed := mk("stale_completed", "TASK_STATE_COMPLETED", 20*time.Minute)
+		fresh := mk("fresh_working", "TASK_STATE_WORKING", 1*time.Minute) // 未超龄，不动
+
+		n, err := st.FailStaleA2ATasks(ctx, time.Now().Add(-15*time.Minute))
+		if err != nil {
+			t.Fatalf("FailStaleA2ATasks() 失败: %v", err)
+		}
+		if n != 2 {
+			t.Errorf("应恰清 2 行（超龄 WORKING+SUBMITTED），实得 %d", n)
+		}
+		statusOf := func(id string) string {
+			g, err := st.GetA2ATask(ctx, id)
+			if err != nil {
+				t.Fatalf("GetA2ATask(%s) 失败: %v", id, err)
+			}
+			return g.Status
+		}
+		if statusOf(working) != "TASK_STATE_FAILED" || statusOf(submitted) != "TASK_STATE_FAILED" {
+			t.Error("超龄 WORKING/SUBMITTED 应被置 FAILED")
+		}
+		if statusOf(completed) != "TASK_STATE_COMPLETED" {
+			t.Error("终态 COMPLETED 不得被动")
+		}
+		if statusOf(fresh) != "TASK_STATE_WORKING" {
+			t.Error("未超龄的 WORKING 不得被动（防误杀多实例在飞任务）")
+		}
+	})
 }

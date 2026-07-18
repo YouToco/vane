@@ -84,6 +84,7 @@ func (l *authFailLimiter) prune(ip string, now time.Time) {
 //   - 直连非 loopback（如 8080 意外暴露公网被直击）→ 一律用 RemoteAddr、无视 XFF：
 //     否则攻击者自带任意 XFF 即可让每个请求都成"新 IP"，把唯一的 Bearer 暴力限流冲垮，
 //     或伪造受害 peer 的 IP 打满其失败额度做定向 429 锁定。
+//
 // （api/ratelimit.go 的 clientIP 有同源缺陷——存量 dashboard 限流，已另立 task 跟进。）
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -102,7 +103,7 @@ func clientIP(r *http.Request) string {
 }
 
 // requireBearer 校验 Authorization: Bearer <token>。比对用 subtle.ConstantTimeCompare
-//（防时序侧信道）；失败 401 + WWW-Authenticate: Bearer。token 空串 → 恒 401（不认可
+// （防时序侧信道）；失败 401 + WWW-Authenticate: Bearer。token 空串 → 恒 401（不认可
 // 任何请求，对齐 api/session.go 的 disabled 语义）。card 端点不经过本中间件（Mount 分路由）。
 func requireBearer(token string, next http.Handler) http.Handler {
 	lim := newAuthFailLimiter()

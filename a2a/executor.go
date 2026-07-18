@@ -55,11 +55,20 @@ type queryParams struct {
 
 // rawParams 是首个 text part 的 JSON 对象形态（契约 §5.4）。指针字段区分
 // "未给"与"给了零值"：skill 键存在与否是 REJECTED 判定 ① 的依据。
+// Text 仅 assistant.chat 使用（自然语言输入）。
 type rawParams struct {
 	Skill   *string `json:"skill"`
 	Keyword string  `json:"keyword"`
 	Days    *int    `json:"days"`
 	Limit   *int    `json:"limit"`
+	Text    string  `json:"text"`
+}
+
+// parsedInput 是分派后的入参：skill 决定走哪条执行路径。
+type parsedInput struct {
+	skill    string      // skillContentQuery | skillAssistantChat
+	query    queryParams // skill == skillContentQuery 时有效
+	chatText string      // skill == skillAssistantChat 时有效
 }
 
 // firstTextPart 取消息首个 text part 的文本。第二返回值=false 表示消息不含
@@ -79,11 +88,18 @@ func firstTextPart(msg *a2a.Message) (string, bool) {
 	return "", false
 }
 
-// parseParams 按契约 §5.4 解析入参：文本若为 JSON 对象则取 {skill,keyword,days,limit}，
-// 解析失败整段文本 = keyword。返回 rejectReason 非空 = REJECTED 判定 ①（显式 skill
-// ≠ content.query）。缺省与钳制：days 3/[1,30]、limit 10/[1,25]、keyword 允许空。
-func parseParams(text string) (queryParams, string) {
-	out := queryParams{keyword: strings.TrimSpace(text), days: defaultDays, limit: defaultLimit}
+// parseInput 按契约 §5.4 解析并分派入参：
+//   - 纯文本 / 非法 JSON → content.query，整段文本 = keyword（缺省语义不变）；
+//   - JSON 对象且 skill 缺省或 = content.query → content.query，取 {keyword,days,limit}；
+//   - JSON 对象且 skill = assistant.chat → assistant.chat，取 text（必须非空）；
+//   - 其余显式 skill → REJECTED 判定 ①。
+//
+// 缺省与钳制：days 3/[1,30]、limit 10/[1,25]、keyword 允许空。
+func parseInput(text string) (parsedInput, string) {
+	out := parsedInput{
+		skill: skillContentQuery,
+		query: queryParams{keyword: strings.TrimSpace(text), days: defaultDays, limit: defaultLimit},
+	}
 	trimmed := strings.TrimSpace(text)
 	if !strings.HasPrefix(trimmed, "{") {
 		return out, ""
@@ -93,15 +109,22 @@ func parseParams(text string) (queryParams, string) {
 		// 非法 JSON：按纯文本语义整段作 keyword（契约"解析失败则整段文本 = keyword"）。
 		return out, ""
 	}
-	if raw.Skill != nil && *raw.Skill != skillContentQuery {
-		return out, fmt.Sprintf("不支持的 skill %q：本服务只提供 %s", *raw.Skill, skillContentQuery)
+	if raw.Skill != nil && *raw.Skill == skillAssistantChat {
+		chatText := strings.TrimSpace(raw.Text)
+		if chatText == "" {
+			return out, fmt.Sprintf("%s 需要非空 text 字段（自然语言输入）", skillAssistantChat)
+		}
+		return parsedInput{skill: skillAssistantChat, chatText: chatText}, ""
 	}
-	out.keyword = strings.TrimSpace(raw.Keyword)
+	if raw.Skill != nil && *raw.Skill != skillContentQuery {
+		return out, fmt.Sprintf("不支持的 skill %q：本服务提供 %s / %s", *raw.Skill, skillContentQuery, skillAssistantChat)
+	}
+	out.query.keyword = strings.TrimSpace(raw.Keyword)
 	if raw.Days != nil {
-		out.days = clamp(*raw.Days, minDays, maxDays)
+		out.query.days = clamp(*raw.Days, minDays, maxDays)
 	}
 	if raw.Limit != nil {
-		out.limit = clamp(*raw.Limit, minLimit, maxLimit)
+		out.query.limit = clamp(*raw.Limit, minLimit, maxLimit)
 	}
 	return out, ""
 }
@@ -117,7 +140,7 @@ func clamp(v, lo, hi int) int {
 }
 
 // Execute 实现 a2asrv.AgentExecutor：SendMessage 请求生命周期内同步完成
-//（确定性查询阻塞返终态，无自有后台 goroutine——关停语义见契约 §5.2）。
+// （确定性查询阻塞返终态，无自有后台 goroutine——关停语义见契约 §5.2）。
 func (e *executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {
 		if execCtx.StoredTask == nil {
@@ -129,16 +152,23 @@ func (e *executor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 		text, hasText := firstTextPart(execCtx.Message)
 		if !hasText {
 			yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateRejected,
-				agentMessage(execCtx, "消息不含 text part，content.query 无从取参")), nil)
+				agentMessage(execCtx, "消息不含 text part，无从取参")), nil)
 			return
 		}
-		params, rejectReason := parseParams(text)
+		input, rejectReason := parseInput(text)
 		if rejectReason != "" {
 			yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateRejected,
 				agentMessage(execCtx, rejectReason)), nil)
 			return
 		}
 
+		// assistant.chat 分派（契约 §12 P2）：LLM 轨，与下方确定性检索路径互斥。
+		if input.skill == skillAssistantChat {
+			e.executeChat(ctx, execCtx, input.chatText, yield)
+			return
+		}
+
+		params := input.query
 		if !yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateWorking, nil), nil) {
 			return
 		}
@@ -210,7 +240,7 @@ func textPart(items []types.ContentItem, params queryParams) *a2a.Part {
 }
 
 // dataPart 产物之二：机器可读 JSON 列表。不含 score、不含 summary、不含画像信号
-//（契约 §8.3——数据面窄接口本身就取不到这些列）。
+// （契约 §8.3——数据面窄接口本身就取不到这些列）。
 func dataPart(items []types.ContentItem) *a2a.Part {
 	rows := make([]map[string]any, 0, len(items))
 	for _, ci := range items {

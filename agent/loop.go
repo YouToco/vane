@@ -79,6 +79,11 @@ const (
 	// appendCallbackTimeout 卡片回调回写的 DB 预算，在拿到 userMu 之后才起算——
 	// 锁等待可达对端整条消息预算（分钟级），不能占用回写自己的超时窗口。
 	appendCallbackTimeout = 5 * time.Second
+
+	// toolResultPreviewMaxRunes 是 tool_calls.result_preview 的截断上限（契约 §6）：
+	// 元数据全量、内容截断——全文（上游可重取）不是本库资产，行式存储塞大 blob
+	// 只会拖慢分析查询。8K rune 覆盖绝大多数结果全文与排查所需上下文。
+	toolResultPreviewMaxRunes = 8192
 )
 
 // Tool 是 agent 可用工具。Mutating=true 的工具不由 loop 直接执行，走确认卡。
@@ -99,7 +104,7 @@ type Tool interface {
 type Store interface {
 	GetActiveAgentSession(ctx context.Context, userID int64, since time.Time) (*types.AgentSession, error)
 	CreateAgentSession(ctx context.Context, userID int64) (*types.AgentSession, error)
-	UpdateAgentSession(ctx context.Context, id int64, messages json.RawMessage, turnCount int) error
+	UpdateAgentSession(ctx context.Context, id int64, messages json.RawMessage, turnCount int, activatedTools json.RawMessage) error
 	AppendAgentSessionMessages(ctx context.Context, sessionID int64, msgs json.RawMessage) error
 	CreatePendingAction(ctx context.Context, a *types.PendingAction) error
 	ClaimPendingAction(ctx context.Context, id string, userID int64) (*types.PendingAction, error)
@@ -123,6 +128,16 @@ type Deps struct {
 	Model      string        // cfg.LLM.AgentModel
 	MaxTurns   int           // cfg.Agent.MaxTurns
 	SessionTTL time.Duration // cfg.Agent.SessionTTLMinutes
+	// Endpoints TikHub 端点工具面（端点注册表契约 §3/§4）。nil = 未装配
+	// （key 缺失），agent 退化为纯静态工具面，行为与该特性上线前一致。
+	Endpoints *EndpointTools
+	// ToolCalls 工具调用记账（契约 §6，全量工具都记）。nil 安全（测试免装配）。
+	ToolCalls *ToolCallRecorder
+	// SystemPrompt 覆盖默认 system 常量（M4 契约 §7.1，A2A 轨用）。零值回落包内
+	// systemPrompt 常量——飞书轨装配不传本字段，行为零变化。默认常量写死了飞书语境
+	//（确认卡/卡片回调/画像引导），A2A 轨的对端是外部 agent，语境完全不同。
+	// 非零值时视为"非飞书轨"：不渲染 [用户画像] 段（画像是 A2A 非目标）。
+	SystemPrompt string
 }
 
 // Outcome 是一次 HandleMessage 的产物。
@@ -142,14 +157,18 @@ type Confirm struct {
 // 可安全被多个 goroutine（并发消息）共享。
 type Loop struct {
 	// chatFn 是模型调用入口（契约 §7）：默认包一层 DoChat，测试注入假实现。
-	chatFn     func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
-	store      Store
-	profiles   ProfileReader
-	tools      map[string]Tool // 按 Name 索引的白名单注册表
-	toolDefs   []llm.ToolDef   // 预构建的请求侧工具声明，每轮复用
-	model      string
-	maxTurns   int
-	sessionTTL time.Duration
+	chatFn        func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
+	store         Store
+	profiles      ProfileReader
+	tools         map[string]Tool // 按 Name 索引的白名单注册表（静态部分）
+	toolDefs      []llm.ToolDef   // 预构建的静态工具声明；动态端点声明按会话追加在其后
+	endpoints     *EndpointTools  // 动态端点工具面，nil = 未装配
+	toolCalls     *ToolCallRecorder
+	sys           string // system prompt（含端点检索能力说明段，装配时定型）
+	renderProfile bool   // 是否渲染 [用户画像] 段：默认飞书轨 true，自定义 prompt 的 A2A 轨 false
+	model         string
+	maxTurns      int
+	sessionTTL    time.Duration
 
 	// userMu 按 userID 串行化 HandleMessage（审查 #并发盲覆盖）：feishu 对每条消息
 	// 起独立 goroutine，而 HandleMessage 是 load→append→save 的读改写、
@@ -193,14 +212,31 @@ func New(d Deps) *Loop {
 		})
 	}
 
+	// system prompt：自定义（A2A 轨）优先，零值回落默认飞书常量。
+	sys := d.SystemPrompt
+	renderProfile := false
+	if sys == "" {
+		sys = systemPrompt
+		renderProfile = true // 只有默认飞书 prompt 渲染 [用户画像] 段（其文本自身引用该段）
+	}
+	if d.Endpoints != nil {
+		// 能力说明只在真装配了端点工具面时注入：没有 search_endpoints 工具却教模型
+		// 去用它，只会制造白名单拒绝循环。
+		sys += endpointSystemNote()
+	}
+
 	l := &Loop{
-		store:      d.Store,
-		profiles:   d.Profiles,
-		tools:      tools,
-		toolDefs:   defs,
-		model:      d.Model,
-		maxTurns:   maxTurns,
-		sessionTTL: ttl,
+		store:         d.Store,
+		profiles:      d.Profiles,
+		tools:         tools,
+		toolDefs:      defs,
+		endpoints:     d.Endpoints,
+		toolCalls:     d.ToolCalls,
+		sys:           sys,
+		renderProfile: renderProfile,
+		model:         d.Model,
+		maxTurns:      maxTurns,
+		sessionTTL:    ttl,
 	}
 	l.chatFn = func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
 		meta := llm.CallMeta{TraceID: uuid.NewString(), SpanName: "agent"}
@@ -241,16 +277,68 @@ func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Ou
 	msgs := append(decodeMessages(sess), llm.ChatMessage{Role: "user", Content: text})
 	msgs = truncateMessages(msgs)
 
-	// 同一条消息内的多轮模型调用共享 trace_id，llm_calls 里可按 trace 回放整个 loop。
+	// 同一条消息内的多轮模型调用共享 trace_id，llm_calls/tool_calls 里可按 trace
+	// 回放整个 loop。
 	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{traceID: uuid.NewString(), userID: userID})
+
+	// 端点注册表契约 §4：激活集随会话持久化，本条消息的工具运行状态经 ctx 旁路
+	// 传给工具 Execute（工具是全局单例，不能携带 per-message 状态）。
+	state := &toolRunState{activation: decodeActivation(sess.ActivatedTools)}
+
+	sid := sess.ID
+	outcome, msgs, turns, err := l.converse(ctx, userID, &sid, msgs, hint, state)
+	if err != nil {
+		return Outcome{}, err
+	}
+	l.saveSession(ctx, sess, msgs, turns, state)
+	return outcome, nil
+}
+
+// RunOnce 在给定历史上执行一轮多轮 FC（M4 契约 §7.1，A2A 轨 / a2a-contract §12 P2）：
+// 不读写会话存储、不持 userMu 锁、不注入画像——历史与并发语义完全由调用方管理
+// （A2A 侧按 contextId 重建历史；外部 agent 的会话不该与 owner 飞书轨互相排队）。
+// 返回更新后的完整历史（含本轮 user/assistant/tool 消息），供调用方按自己的语义留存。
+//
+// 写操作红线：所属 Loop 实例必须只注册只读工具（a2a 装配用显式白名单）。模型仍产出
+// 写工具调用时走"工具不存在"自纠（该工具在本实例未注册），不建 pending_action；万一
+// 实例被错误装配进写工具，Confirm 出口在此转错误——外部 agent 点不了飞书确认卡，
+// 挂起等确认 = 任务永久悬空。sessionID 传 nil：A2A 轨工具记账 session_id 落 NULL
+// （不污染 tool_calls 的会话维度），且端点激活不持久化（空 state 每次重建）。
+func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMessage, text string) (Outcome, []llm.ChatMessage, error) {
+	msgs := make([]llm.ChatMessage, 0, len(history)+1)
+	msgs = append(msgs, history...)
+	msgs = append(msgs, llm.ChatMessage{Role: "user", Content: text})
+	msgs = truncateMessages(msgs)
+
+	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{traceID: uuid.NewString(), userID: userID})
+	state := &toolRunState{activation: &activationState{}}
+
+	outcome, msgs, _, err := l.converse(ctx, userID, nil, msgs, "", state)
+	if err != nil {
+		return Outcome{}, nil, err
+	}
+	if outcome.Confirm != nil {
+		// 防御出口（正常装配不可达）：A2A 轨没有确认卡通道，挂起即悬空。
+		return Outcome{}, nil, fmt.Errorf("agent: RunOnce 实例被装配了写工具（%s），A2A 轨只允许只读工具", outcome.Confirm.Summary)
+	}
+	return outcome, msgs, nil
+}
+
+// converse 是两轨共享的多轮 FC 核心（契约 §7）：不碰会话存储，输入完整历史、
+// 返回追加了本轮交换的历史与模型调用次数。ctx 须已挂 chatMeta。sessionID 用于
+// 写工具 pending_action 与工具记账归属：飞书轨传 &sess.ID，A2A 轨传 nil（记 NULL）。
+func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msgs []llm.ChatMessage, hint string, state *toolRunState) (Outcome, []llm.ChatMessage, int, error) {
+	ctx = context.WithValue(ctx, toolRunKey{}, state)
 
 	turns := 0
 	for turns < l.maxTurns {
 		turns++
 		resp, err := l.chatFn(ctx, llm.ChatRequest{
-			Model:     l.model,
-			Messages:  withSystem(msgs, hint),
-			Tools:     l.toolDefs,
+			Model:    l.model,
+			Messages: withSystem(l.sys, msgs, hint, l.renderProfile),
+			// 每轮现算工具面：静态声明 + 会话已激活端点声明（search_endpoints 本轮
+			// 激活的端点，下一轮就出现在这里——检索后注入的核心闭环）。
+			Tools:     l.requestTools(state),
 			MaxTokens: iptr(replyMaxTokens),
 			// 关思维链（审查 #思维链吃预算，覆盖契约 §7 原定值）：与打分/出卡策略统一。
 			// 依据 2026-07-14 实测：v4-pro 关思维链后多轮 FC 无退化（两轮工具全选对），
@@ -260,14 +348,13 @@ func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Ou
 			DisableThinking: true,
 		})
 		if err != nil {
-			return Outcome{}, err
+			return Outcome{}, nil, 0, err
 		}
 
 		// 无 tool_calls 即收敛：模型给出了最终文字回复。
 		if len(resp.ToolCalls) == 0 {
 			msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: resp.Content})
-			l.saveSession(ctx, sess, msgs, turns)
-			return Outcome{Reply: nonEmptyReply(resp.Content)}, nil
+			return Outcome{Reply: nonEmptyReply(resp.Content)}, msgs, turns, nil
 		}
 
 		// assistant 历史消息必须原样携带 tool_calls 字段回传（契约 §4 线协议）。
@@ -277,10 +364,10 @@ func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Ou
 			ToolCalls: resp.ToolCalls,
 		})
 
-		pending, toolMsgs, err := l.runToolCalls(ctx, userID, sess.ID, resp.ToolCalls)
+		pending, toolMsgs, err := l.runToolCalls(ctx, userID, sessionID, resp.ToolCalls)
 		msgs = append(msgs, toolMsgs...)
 		if err != nil {
-			return Outcome{}, err
+			return Outcome{}, nil, 0, err
 		}
 		if pending == nil {
 			continue // 本轮全是读工具/自纠回执，结果已回填，进入下一轮。
@@ -289,33 +376,60 @@ func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Ou
 		// 出确认卡路径：再调一次模型拿收尾文案，不带 tools 防再触发工具调用。
 		final, err := l.chatFn(ctx, llm.ChatRequest{
 			Model:           l.model,
-			Messages:        withSystem(msgs, hint),
+			Messages:        withSystem(l.sys, msgs, hint, l.renderProfile),
 			MaxTokens:       iptr(replyMaxTokens),
 			DisableThinking: true, // 同主循环：关思维链防预算被 CoT 吃光。
 		})
 		if err != nil {
-			return Outcome{}, err
+			return Outcome{}, nil, 0, err
 		}
 		turns++
 		msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: final.Content})
-		l.saveSession(ctx, sess, msgs, turns)
 		return Outcome{
 			Reply:   nonEmptyReply(final.Content),
 			Confirm: &Confirm{ActionID: pending.ID, Summary: confirmSummary(pending)},
-		}, nil
+		}, msgs, turns, nil
 	}
 
-	// MaxTurns 内未收敛：兜底文案也写进会话，保持历史里"每条 user 都有回应"。
+	// MaxTurns 内未收敛：兜底文案也写进历史，保持"每条 user 都有回应"。
 	msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: replyMaxTurns})
-	l.saveSession(ctx, sess, msgs, turns)
-	return Outcome{Reply: replyMaxTurns}, nil
+	return Outcome{Reply: replyMaxTurns}, msgs, turns, nil
+}
+
+// requestTools 组装本轮请求的工具声明：静态声明在前（进程内恒定），已激活端点
+// 声明按激活顺序追加在后。顺序纪律的意义见 activationState 注释（缓存前缀稳定）。
+func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
+	if l.endpoints == nil {
+		return l.toolDefs
+	}
+	dyn := l.endpoints.Defs(state.activation)
+	if len(dyn) == 0 {
+		return l.toolDefs
+	}
+	out := make([]llm.ToolDef, 0, len(l.toolDefs)+len(dyn))
+	out = append(out, l.toolDefs...)
+	return append(out, dyn...)
+}
+
+// resolveTool 按扩展白名单解析工具（M4 契约 §10 + 端点注册表契约 §4）：
+// 静态注册表优先，未命中再查「会话已激活端点」。两者都未命中 = 模型编造，拒绝。
+func (l *Loop) resolveTool(name string, state *toolRunState) (Tool, bool) {
+	if tool, ok := l.tools[name]; ok {
+		return tool, ok
+	}
+	if l.endpoints != nil && state != nil {
+		return l.endpoints.Resolve(name, state.activation)
+	}
+	return nil, false
 }
 
 // runToolCalls 顺序处理一轮 tool_calls（契约 §7）：读工具直接执行并回结果；
 // 遇到首个写工具则建 pending_action（24h 过期）并挂起本轮——其后所有未处理调用
 // （含读工具）各补一条占位 tool 消息，保证每个 tool_call 都有对应回执。
 // 返回值 pending 非 nil 表示本轮出确认卡。
-func (l *Loop) runToolCalls(ctx context.Context, userID, sessionID int64, calls []llm.ToolCall) (*types.PendingAction, []llm.ChatMessage, error) {
+// sessionID 为 nil 时（A2A 轨）工具记账 session_id 落 NULL；写工具路径在该轨不可达
+// （只读白名单 + Confirm 出口报错）。
+func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64, calls []llm.ToolCall) (*types.PendingAction, []llm.ChatMessage, error) {
 	var pending *types.PendingAction
 	out := make([]llm.ChatMessage, 0, len(calls))
 	for _, tc := range calls {
@@ -324,9 +438,9 @@ func (l *Loop) runToolCalls(ctx context.Context, userID, sessionID int64, calls 
 			continue
 		}
 
-		tool, ok := l.tools[tc.Name]
+		tool, ok := l.resolveTool(tc.Name, runStateFrom(ctx))
 		if !ok {
-			// 白名单红线（契约 §10）：未注册工具名一律拒绝，
+			// 白名单红线（契约 §10）：未注册/未激活工具名一律拒绝，
 			// 以错误文本回给模型自纠，继续循环。
 			out = append(out, toolMsg(tc.ID, fmt.Sprintf("工具 %s 不存在", tc.Name)))
 			continue
@@ -334,11 +448,14 @@ func (l *Loop) runToolCalls(ctx context.Context, userID, sessionID int64, calls 
 
 		args := json.RawMessage(tc.Arguments)
 		if !tool.Mutating() {
-			result, err := tool.Execute(ctx, userID, args)
+			result, err := l.execRecorded(ctx, userID, sessionID, tool, args)
 			if err != nil {
-				// 读工具失败不判整轮死刑：错误文本回给模型，
-				// 由它决定换参数重试还是向用户解释。
-				result = "工具执行失败：" + err.Error()
+				// 读工具失败不判整轮死刑：错误文本回给模型，由它决定换参数重试
+				// 还是向用户解释。只取 AppError.Message（人话），**不用 err.Error()**
+				//（对抗审查 B-F2）：Cause 可能携带 pgx 连接串/SQL 上下文，进模型上下文
+				// 就可能被复述——A2A 轨对端是外部 agent，等于内部错误链外泄（契约 §8.1）。
+				// 与 ExecuteAction 的失败回写同口径。
+				result = "工具执行失败：" + toolErrText(err)
 			}
 			out = append(out, toolMsg(tc.ID, result))
 			continue
@@ -349,7 +466,7 @@ func (l *Loop) runToolCalls(ctx context.Context, userID, sessionID int64, calls 
 		pa := &types.PendingAction{
 			ID:        uuid.NewString(),
 			UserID:    userID,
-			SessionID: &sessionID,
+			SessionID: sessionID,
 			ToolName:  tc.Name,
 			Args:      args,
 			Summary:   tool.Summarize(args),
@@ -390,7 +507,7 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 		return reply, nil
 	}
 
-	result, err := tool.Execute(ctx, userID, pa.Args)
+	result, err := l.execRecorded(ctx, userID, pa.SessionID, tool, pa.Args)
 	if err != nil {
 		// 失败同样回写：模型该知道动作已被消耗且未成功，而不是继续等确认。
 		// 只落 AppError.Message 不落完整错误链——Cause 可能携带连接串、SQL
@@ -513,18 +630,104 @@ func (l *Loop) loadOrCreateSession(ctx context.Context, userID int64) (*types.Ag
 }
 
 // saveSession 持久化会话（system 不入库；契约 §7：每次 HandleMessage 结束都要写，
-// 含出确认卡路径）。turn_count 记会话累计模型调用次数。
+// 含出确认卡路径）。turn_count 记会话累计模型调用次数；激活端点集随行写回
+// （端点注册表契约 §4：激活在 TTL 内跨消息有效）。
 // 持久化失败只记日志不上抛：回复已经生成，宁可下一轮丢上下文，
 // 也不把已成功的对话放大成用户可见的失败（与 llm.Recorder 的旁路原则一致）。
-func (l *Loop) saveSession(ctx context.Context, sess *types.AgentSession, msgs []llm.ChatMessage, turns int) {
+func (l *Loop) saveSession(ctx context.Context, sess *types.AgentSession, msgs []llm.ChatMessage, turns int, state *toolRunState) {
 	raw, err := json.Marshal(msgs)
 	if err != nil {
 		slog.Error("agent: 会话 messages 序列化失败", "session_id", sess.ID, "err", err)
 		return
 	}
-	if err := l.store.UpdateAgentSession(ctx, sess.ID, raw, sess.TurnCount+turns); err != nil {
+	if err := l.store.UpdateAgentSession(ctx, sess.ID, raw, sess.TurnCount+turns, state.activation.encode()); err != nil {
 		slog.Error("agent: 会话持久化失败", "session_id", sess.ID, "err", err)
 	}
+}
+
+// execRecorded 是全部工具执行的唯一入口（读工具直执与确认后执行两条路径共用），
+// 在 Execute 前后完成 tool_calls 记账（端点注册表契约 §6）：
+//   - 单点拦截而不是改 9 个工具：记账口径唯一，新工具自动被覆盖；
+//   - 记录先建、经 ctx 传入工具：search/endpoint 工具回填专属字段（检索词/候选/
+//     HTTP 状态/上游体量），静态工具无感；
+//   - Execute 的 (result, err) 原样透传，记账不改变任何既有错误语义。
+func (l *Loop) execRecorded(ctx context.Context, userID int64, sessionID *int64, tool Tool, args json.RawMessage) (string, error) {
+	rec := &types.ToolCall{
+		ToolName:  tool.Name(),
+		ToolKind:  types.ToolCallKindStatic,
+		UserID:    &userID,
+		SessionID: sessionID,
+		Arguments: normalizeArgsJSON(args),
+	}
+	if k, ok := tool.(interface{ toolKind() types.ToolCallKind }); ok {
+		rec.ToolKind = k.toolKind()
+	}
+	if m, ok := ctx.Value(chatMetaKey{}).(chatMeta); ok {
+		rec.TraceID = m.traceID // 与 llm_calls 同一 trace，可 JOIN 回放整条消息链路
+	}
+	ctx = context.WithValue(ctx, toolCallRecKey{}, rec)
+
+	start := time.Now()
+	result, err := tool.Execute(ctx, userID, args)
+	rec.DurationMs = int(time.Since(start).Milliseconds())
+
+	// 净化外部数据（对抗审查 缺陷）：TikHub 端点结果原样透传上游响应，可能含非法
+	// UTF-8（GBK 错误页/二进制残片）或 NUL——两者都会让 tool_calls.result_preview
+	// 的 TEXT 列与 agent_sessions.messages 的 JSONB 列**整行插入失败**（Postgres 22021/
+	// 22P05），Boss「每次调用必须有记录」被数据内容静默击穿，限额还随之漏计。
+	// 在这唯一汇聚点净化 result：它同时流向返给模型的会话消息与 result_preview，
+	// 一处修复覆盖两个 sink。ResultSize 已由端点工具记为上游原始体量，不受净化影响。
+	result = sanitizeForDB(result)
+	if err != nil {
+		if rec.ErrorType == "" {
+			rec.ErrorType = types.ToolErrInternal
+		}
+		if rec.Error == "" {
+			rec.Error = err.Error()
+		}
+	}
+	rec.Error = sanitizeForDB(rec.Error)
+	rec.RetrievalQuery = sanitizeForDB(rec.RetrievalQuery)
+	for i, c := range rec.CandidateTools {
+		rec.CandidateTools[i] = sanitizeForDB(c)
+	}
+	rec.ResultPreview = truncateRunes(result, toolResultPreviewMaxRunes)
+	if rec.ResultSize == 0 {
+		rec.ResultSize = len(result)
+	}
+	l.toolCalls.Record(ctx, rec)
+	return result, err
+}
+
+// sanitizeForDB 把任意来源的文本净化成 Postgres TEXT/JSONB 能接受的形态：剔除 NUL
+// （0x00 在两种列里都非法）+ 用 U+FFFD 替换非法 UTF-8 序列。空串快速返回。
+func sanitizeForDB(s string) string {
+	if s == "" {
+		return s
+	}
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
+	}
+	return strings.ToValidUTF8(s, "�")
+}
+
+// normalizeArgsJSON 保证入库参数是合法且 JSONB 可接受的 JSON：模型产出的 arguments
+// 偶发残缺（截断/转义错误）或含 NUL，直接写 JSONB 列会让整条记账失败——非法时降级为
+// JSON 字符串原样保存（排查恰恰最需要看到这种残缺原文）。先剔 NUL：字面 NUL 字节让
+// JSON 非法、\u0000 转义又被 JSONB 拒收，两者都得在入库前清掉。
+func normalizeArgsJSON(args json.RawMessage) json.RawMessage {
+	if len(args) == 0 {
+		return nil
+	}
+	clean := json.RawMessage(sanitizeForDB(string(args)))
+	if json.Valid(clean) {
+		return clean
+	}
+	wrapped, err := json.Marshal(string(clean))
+	if err != nil {
+		return nil
+	}
+	return wrapped
 }
 
 // decodeMessages 解析库中会话消息。损坏的 JSON 不能让会话永久卡死：
@@ -590,16 +793,33 @@ func (l *Loop) profileHint(ctx context.Context, userID int64) string {
 	return profilehint.Build(p)
 }
 
-// withSystem 在请求前动态前置 system 消息（system 不入库，契约 §7），并在其末尾
-// 追加 [用户画像] 段（M5 契约 §12.2 两态文案）。
-func withSystem(msgs []llm.ChatMessage, profileHint string) []llm.ChatMessage {
-	sys := systemPrompt + profileSectionEmpty
-	if profileHint != "" {
-		sys = systemPrompt + profileSectionPrefix + profileHint
+// withSystem 在请求前动态前置 system 消息（system 不入库，契约 §7）。base 是 Loop
+// 定型的 system prompt（含按装配态决定的端点检索能力说明段）。renderProfile 为真时
+// 在末尾追加 [用户画像] 段（M5 契约 §12.2 两态文案）——只有默认飞书 prompt 渲染它
+// （该 prompt 文本自身引用了该段）；A2A 轨自定义 prompt 传 false，画像是其非目标。
+func withSystem(base string, msgs []llm.ChatMessage, profileHint string, renderProfile bool) []llm.ChatMessage {
+	sys := base
+	if renderProfile {
+		if profileHint != "" {
+			sys = base + profileSectionPrefix + profileHint
+		} else {
+			sys = base + profileSectionEmpty
+		}
 	}
 	out := make([]llm.ChatMessage, 0, len(msgs)+1)
 	out = append(out, llm.ChatMessage{Role: "system", Content: sys})
 	return append(out, msgs...)
+}
+
+// toolErrText 提取可安全回给模型的工具错误文案：AppError 取其 Message（人话），
+// 非 AppError 给固定文案。**绝不用 err.Error()**——它会展开 Cause（pgx 连接串、
+// SQL 上下文），进模型上下文即内部错误链外泄（契约 §8.1，对抗审查 B-F2）。
+func toolErrText(err error) string {
+	var ae *types.AppError
+	if errors.As(err, &ae) && ae.Message != "" {
+		return ae.Message
+	}
+	return "内部错误"
 }
 
 // confirmSummary 拼确认卡正文：工具名 + 参数摘要（契约 §7 Confirm.Summary 注释）。

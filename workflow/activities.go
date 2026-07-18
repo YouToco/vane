@@ -429,16 +429,6 @@ func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem
 
 	kept := make([]types.ContentItem, 0, len(in.Items))
 	for _, item := range in.Items {
-		// change 类内容豁免 simhash 近似去重（契约 §8.1）。
-		// simhash 的设计目的「改动少量文字仍判为重复」与 change 的信号直接对立；
-		// change 的精确去重由 canonical_key 的 UNIQUE 承担（§10.4）。
-		if item.Kind == types.KindChange {
-			s := dedup.Simhash(item.Title + " " + item.Content)
-			item.Simhash = &s
-			kept = append(kept, item)
-			continue
-		}
-
 		sh := dedup.Simhash(item.Title + " " + item.Content)
 		// 候选集 = 用户级历史 simhash ∪ 全局批内已保留 simhash。
 		candidates := append(append([]int64{}, hist...), batchSeen...)

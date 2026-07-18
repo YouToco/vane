@@ -287,7 +287,7 @@ func (s *Store) ListUnpushedByUser(ctx context.Context, userID int64, limit, per
 }
 
 // SearchContentItems 按关键词 + 时间窗检索内容，content.query 的唯一数据面
-//（a2a-contract §4.2）。语义：
+// （a2a-contract §4.2）。语义：
 //
 //	(title ILIKE '%kw%' OR content ILIKE '%kw%')     -- kw 空串时省略该谓词
 //	AND COALESCE(published_at, fetched_at) >= $since -- published_at 可空（001:76），NULL 回退
@@ -298,7 +298,7 @@ func (s *Store) ListUnpushedByUser(ctx context.Context, userID int64, limit, per
 // 输入携带 LIKE 通配符打穿检索语义（参数化仍守住 SQL 注入，被劫持的是语义与性能）。
 // limit 由调用方（executor）钳制后传入，本方法防御性处理 limit<=0 → 20。
 // 第一期刻意 ILIKE 不引分词：中文 tsvector 无效、pg_jieba/zhparser 不在默认镜像
-//（拍板 §13.8）；真实库量基准慢了再补表达式索引或 pg_trgm。
+// （拍板 §13.8）；真实库量基准慢了再补表达式索引或 pg_trgm。
 func (s *Store) SearchContentItems(ctx context.Context, keyword string, since time.Time, limit int) ([]types.ContentItem, error) {
 	if limit <= 0 {
 		limit = 20

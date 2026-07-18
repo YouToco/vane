@@ -13,13 +13,13 @@ import (
 )
 
 // agentSessionColumns 是 agent_sessions 表全列，SELECT 与 scanAgentSession 一一对应。
-const agentSessionColumns = `id, user_id, status, messages, turn_count, created_at, updated_at`
+const agentSessionColumns = `id, user_id, status, messages, turn_count, activated_tools, created_at, updated_at`
 
 // scanAgentSession 把一行 agent_sessions 扫进 types.AgentSession（复用于单行与 RETURNING）。
 func scanAgentSession(row pgx.Row, as *types.AgentSession) error {
 	return row.Scan(
 		&as.ID, &as.UserID, &as.Status, &as.Messages,
-		&as.TurnCount, &as.CreatedAt, &as.UpdatedAt,
+		&as.TurnCount, &as.ActivatedTools, &as.CreatedAt, &as.UpdatedAt,
 	)
 }
 
@@ -82,19 +82,23 @@ func (s *Store) CreateAgentSession(ctx context.Context, userID int64) (*types.Ag
 	return &as, nil
 }
 
-// UpdateAgentSession 覆盖写 messages 与 turn_count，并刷新 updated_at（即续 TTL）。
-// messages 列 NOT NULL，nil/空归一为 '[]'（与 InsertSchedule 对 JSONB 列的处理一致）。
+// UpdateAgentSession 覆盖写 messages、turn_count 与 activated_tools，并刷新
+// updated_at（即续 TTL）。messages/activatedTools 列 NOT NULL，nil/空归一为 '[]'
+// （与 InsertSchedule 对 JSONB 列的处理一致）。
 // 目标行不存在返回 CodeNotFound：调用方持有的 id 来自 Get/Create，更新不到行
 // 说明会话已被并发清理，静默成功会掩盖 bug。
-func (s *Store) UpdateAgentSession(ctx context.Context, id int64, messages json.RawMessage, turnCount int) error {
+func (s *Store) UpdateAgentSession(ctx context.Context, id int64, messages json.RawMessage, turnCount int, activatedTools json.RawMessage) error {
 	if len(messages) == 0 {
 		messages = json.RawMessage("[]")
 	}
+	if len(activatedTools) == 0 {
+		activatedTools = json.RawMessage("[]")
+	}
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE agent_sessions
-		 SET messages = $2, turn_count = $3, updated_at = now()
+		 SET messages = $2, turn_count = $3, activated_tools = $4, updated_at = now()
 		 WHERE id = $1`,
-		id, messages, turnCount)
+		id, messages, turnCount, activatedTools)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("更新 agent 会话（id=%d）", id), err)
