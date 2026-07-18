@@ -1375,3 +1375,24 @@ a:hover {
   padding: 10px 14px;
   border-top: 1px solid var(--border);
 }
+
+/* 画像页（功能 6.3）：标签云 + 摘要块 */
+.tag-cloud {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+/* 摘要是中文散文（非代码），保留换行但用正文字体，不套等宽 */
+.profile-summary {
+  margin: 0;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* 黑名单标签：删除线弱化，一眼看出是"被移除的" */
+.profile-tag-removed {
+  text-decoration: line-through;
+  opacity: 0.75;
+}

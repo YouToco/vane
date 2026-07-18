@@ -265,6 +265,25 @@ export interface RunstatsResp {
   models: ModelUsage[];
 }
 
+// 用户画像（M7 功能 6.3）。字段对齐后端 types.Profile 的 json tag。
+// summary 尾部含演化写入的负偏好句式（「不感兴趣：…」），不单列字段。
+// token 三件套与演化游标是内部计量，画像页不主推，仅按需展示。
+export interface Profile {
+  id: number;
+  user_id: number;
+  industry: string;
+  occupation: string;
+  tags: string[];
+  removed_tags: string[];
+  summary: string;
+  token_budget_daily: number;
+  tokens_used_today: number;
+  token_reset_at: string;
+  last_evolved_feedback_id: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -430,4 +449,14 @@ export const api = {
     request<ObservabilityReport>(
       `/api/admin/observability?window_hours=${encodeURIComponent(windowHours)}`,
     ).then(normalizeReport),
+
+  // ---- M7 画像查看（功能 6.3，只读）----
+  // 单次取数；tags/removed_tags 用 arr 收敛 Go nil-slice 的 null。
+  // 画像未生成时后端回 404，调用方（Profile.tsx）按空态处理而非报错。
+  profile: () =>
+    request<Profile>("/api/profile").then((p) => ({
+      ...p,
+      tags: arr(p.tags),
+      removed_tags: arr(p.removed_tags),
+    })),
 };
