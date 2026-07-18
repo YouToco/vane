@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/types"
 )
@@ -305,5 +306,116 @@ func TestHandleClick_CardStateQueryFailureDegradesToNoCard(t *testing.T) {
 	}
 	if got := len(h.st.allRows()); got != 1 {
 		t.Fatalf("反馈仍应落行, 实得 %d", got)
+	}
+}
+
+// ============================================================
+// 聚合卡重建（附录 A.4）
+// ============================================================
+
+// TestRebuilt_聚合分流与状态隔离 同一 message 承载两条投递时点击走聚合重建：
+// ① 兄弟条目各查各的状态、互不串染（force 只作用被点的那条）；
+// ② header 从库存 card_json 原样解析回填（不随点击漂移）；
+// ③ 历史单条卡（message 只有 1 条投递）仍走单条构卡，外观零变化。
+func TestRebuilt_聚合分流与状态隔离(t *testing.T) {
+	h := newHarness(t)
+	// 兄弟投递：同 message、不同 delivery。
+	sibID := testDeliveryID + 1
+	sibItem := testItemID
+	h.st.deliveries[sibID] = &types.Delivery{
+		ID: sibID, UserID: testUserID, ContentItemID: &sibItem,
+		Score: 70, BodyMD: "兄弟正文", FeishuMessageID: testMsgID,
+		Status: types.DeliveryStatusSent, CreatedAt: time.Now(),
+	}
+	// 库存卡 JSON 带聚合 header（重建应原样解析回填）。
+	h.delivery().CardJSON = []byte(`{"header":{"title":{"content":"🔮 测试任务 · 今日 2 条"},"template":"purple"}}`)
+
+	var gotAgg *AggregateCardInput
+	h.svc.deps.BuildAggCard = func(in AggregateCardInput) string {
+		gotAgg = &in
+		return `{"agg":"rebuilt"}`
+	}
+
+	res := h.click(t, types.FeedbackActionInterested)
+	if res.CardJSON != `{"agg":"rebuilt"}` {
+		t.Fatalf("双投递 message 应走聚合重建，实得 %q", res.CardJSON)
+	}
+	if gotAgg == nil {
+		t.Fatal("BuildAggCard 未被调用")
+	}
+	if gotAgg.HeaderTitle != "🔮 测试任务 · 今日 2 条" || gotAgg.HeaderTemplate != "purple" {
+		t.Errorf("header 应从库存 card_json 原样回填，实得 %q/%q", gotAgg.HeaderTitle, gotAgg.HeaderTemplate)
+	}
+	if len(gotAgg.Items) != 2 {
+		t.Fatalf("聚合重建应含全部兄弟条目，实得 %d", len(gotAgg.Items))
+	}
+	// 被点的 42 状态应为 interested；兄弟 43 未表态（零值）——状态不串染。
+	var clicked, sibling *CardInput
+	for i := range gotAgg.Items {
+		switch gotAgg.Items[i].DeliveryID {
+		case testDeliveryID:
+			clicked = &gotAgg.Items[i]
+		case sibID:
+			sibling = &gotAgg.Items[i]
+		}
+	}
+	if clicked == nil || sibling == nil {
+		t.Fatalf("聚合条目缺失: %+v", gotAgg.Items)
+	}
+	if clicked.State.Preference != types.FeedbackActionInterested {
+		t.Errorf("被点条目状态应为 interested，实得 %q", clicked.State.Preference)
+	}
+	if sibling.State.Preference != "" || sibling.State.Misjudged {
+		t.Errorf("兄弟条目状态不得被串染，实得 %+v", sibling.State)
+	}
+}
+
+// TestRebuilt_单投递message仍走单条构卡 历史卡兼容：message 只有 1 条投递时
+// 走原 BuildCard，聚合构卡不掺和——旧卡外观与行为零变化。
+func TestRebuilt_单投递message仍走单条构卡(t *testing.T) {
+	h := newHarness(t)
+	aggCalled := false
+	h.svc.deps.BuildAggCard = func(in AggregateCardInput) string {
+		aggCalled = true
+		return "{}"
+	}
+	res := h.click(t, types.FeedbackActionInterested)
+	if aggCalled {
+		t.Error("单投递 message 不该走聚合构卡（历史卡外观必须零变化）")
+	}
+	if res.CardJSON == "" {
+		t.Error("单条路径仍应重建卡片")
+	}
+}
+
+// TestRebuildAggregate_force只作用被点条 force 误伤全部兄弟的变异体曾存活
+// （对抗审查 #16）：deep_dive 等 force 语义只能落在被点的那条上。
+func TestRebuildAggregate_force只作用被点条(t *testing.T) {
+	h := newHarness(t)
+	sibID := testDeliveryID + 1
+	sibItem := testItemID
+	h.st.deliveries[sibID] = &types.Delivery{
+		ID: sibID, UserID: testUserID, ContentItemID: &sibItem,
+		Score: 70, BodyMD: "兄弟", FeishuMessageID: testMsgID,
+		Status: types.DeliveryStatusSent, CreatedAt: time.Now(),
+	}
+	var got *AggregateCardInput
+	h.svc.deps.BuildAggCard = func(in AggregateCardInput) string { got = &in; return "{}" }
+
+	clicked := h.delivery()
+	_, err := h.svc.rebuildAggregate(context.Background(), clicked, []types.Delivery{*clicked, *h.st.deliveries[sibID]},
+		func(st *CardState) { st.DeepDiveRequested = true })
+	if err != nil {
+		t.Fatalf("rebuildAggregate 失败: %v", err)
+	}
+	if got == nil || len(got.Items) != 2 {
+		t.Fatalf("应含 2 条，实得 %+v", got)
+	}
+	for _, it := range got.Items {
+		want := it.DeliveryID == clicked.ID
+		if it.State.DeepDiveRequested != want {
+			t.Errorf("delivery %d 的 force 态应为 %v（force 只作用被点条），实得 %v",
+				it.DeliveryID, want, it.State.DeepDiveRequested)
+		}
 	}
 }

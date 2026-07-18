@@ -38,3 +38,17 @@ type CardInput struct {
 	Platform    types.Platform // sources.platform → subtitle emoji
 	PublishedAt *time.Time     // content_items.published_at → subtitle 相对时间
 }
+
+// AggregateCardInput 聚合卡（一个任务一张卡，卡内 N 条情报）的构卡全量输入
+// （card-redesign-spec.md 附录 A，2026-07-18 定稿）。
+//
+// HeaderTitle/HeaderTemplate 由两条路径填充，语义刻意不同：
+//   - 首发（Push 活动）：由任务名派生（"{emoji} {任务名} · 今日 N 条" + 哈希取色）；
+//   - 点击重建（feedback.rebuilt）：从库存 card_json 的 header **原样解析回填**——
+//     重建时拿不到任务名（deliveries 不存它），而 header 在卡的生命周期内不该变，
+//     解析存量比再传一遍任务名少一条数据通路，也不会因任务改名而让老卡 header 漂移。
+type AggregateCardInput struct {
+	HeaderTitle    string      // 完整标题串；空则构卡函数用兜底"📮 今日推送 · N 条"
+	HeaderTemplate string      // 飞书 header template 色名；空则 "blue"
+	Items          []CardInput // 按分数降序；每项的 DeliveryID/State 各自独立
+}

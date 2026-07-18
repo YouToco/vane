@@ -9,7 +9,7 @@ import (
 
 // attachTenant 把用户挂进平台租户（id=1）。
 //
-// migration 020 起，业务表的 tenant_id 由「该用户所在的租户」推导（见 tenantderive.go），
+// migration 021 起，业务表的 tenant_id 由「该用户所在的租户」推导（见 tenantderive.go），
 // 没有 memberships 行的用户**写不进任何业务数据**——NOT NULL 会拦住。
 // 这是刻意的：生产里租户归属只有两个来源（注册流、迁移回填），
 // 「给机器人发过消息」不构成归属，否则任何陌生人发一条消息就有了租户。
@@ -41,7 +41,7 @@ func testUserWithTenant(t *testing.T, st *Store, prefix string) int64 {
 	return u.ID
 }
 
-// TestInvariant_TenantDerivedOnWrite 钉住 migration 020 的核心承诺：
+// TestInvariant_TenantDerivedOnWrite 钉住 migration 021 的核心承诺：
 // **每一行业务数据的 tenant_id 都等于其所有者所在的租户**。
 //
 // 这条不变量靠 tenantOfUser 子查询在写入时保证（见 tenantderive.go）。

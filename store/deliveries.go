@@ -169,3 +169,38 @@ func (s *Store) GetDeliveryByFeishuMessageID(ctx context.Context, userID int64, 
 	}
 	return &d, nil
 }
+
+// ListDeliveriesByFeishuMessage 返回同一条飞书消息承载的全部投递，按 id 升序——
+// id 序 = 插入序 = 首发时聚合卡的条目序（Push 按 in.Cards 顺序逐条 Insert），
+// 重建整卡时条目不换位。**不能按 score 排**：首发序来自 selector 的新鲜度衰减
+// 有效分，与原始 score 不同序，按 score 重排会让第一次点击就把条目洗牌。聚合卡（2026-07-18）一条消息承载 N 个 delivery，
+// 点击重建整卡时需要全部兄弟条目；历史单条卡查回恰好 1 行，调用方据 len 分流。
+// 空 msgID 返回空切片（历史 delivery 发送失败时 message_id 为空串，不该匹配彼此）。
+func (s *Store) ListDeliveriesByFeishuMessage(ctx context.Context, userID int64, msgID string) ([]types.Delivery, error) {
+	if msgID == "" {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+deliveryColumns+`
+		 FROM deliveries
+		 WHERE user_id = $1 AND feishu_message_id = $2
+		 ORDER BY id ASC`,
+		userID, msgID)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("按消息 id 列投递（user=%d）", userID), err)
+	}
+	defer rows.Close()
+	var out []types.Delivery
+	for rows.Next() {
+		var d types.Delivery
+		if err := scanDelivery(rows, &d); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "扫描 delivery 行", err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "遍历 delivery 结果集", err)
+	}
+	return out, nil
+}

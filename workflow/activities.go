@@ -48,6 +48,14 @@ const maxPerSourceCandidates = 20
 // 或给告警加幂等键。
 const alertFetchFailThreshold = 3
 
+// aggMaxItemsPerCard / aggMaxCardBytes 聚合卡的两道体积护栏（附录 A）：
+// 条数封顶防一屏塞爆；字节上限对齐飞书卡片 ~30KB 限制留余量，超限对半拆卡，
+// 绝不静默截断条目。
+const (
+	aggMaxItemsPerCard = 8
+	aggMaxCardBytes    = 28 << 10
+)
+
 // disableFetchFailThreshold 是"连续失败达此值自动停用"的阈值（功能 5.2，Boss 拍板
 // 「告警后再宽限」）。刻意远高于告警阈值：先在 3 次发预警卡给 owner 一个人工介入窗口，
 // 短暂宕机的站点在 3→10 次之间恢复即清零、不会被误停；持续失败到 10 次才判定失效自动停用，
@@ -121,7 +129,7 @@ type Store interface {
 	ListUnpushedByUser(ctx context.Context, userID int64, limit, perSourceCap int) ([]types.ContentItem, error)
 	// 幂等推送地基（FIX-A 新增实现）：重试时复用同一 batch、跳过已发条目，杜绝重复发卡（#1 CRITICAL）。
 	// 取代原 CreatePushBatch / InsertDelivery（store 仍保留其实现，只是 Activity 不再用）。
-	CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey string) (int64, error)
+	CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey, scheduleID string) (int64, error)
 	// RecordEmptyPushBatch 记录"跑完了但没东西可推"的空批次（009）。与上面那条幂等
 	// 地基共用 idempotency_key，但**写入路径完全独立**——空批次与真实推送在同一次
 	// 运行里互斥，刻意不去动 CreatePushBatchIdempotent 的签名（改它就得改这个窄接口
@@ -129,7 +137,7 @@ type Store interface {
 	//
 	// skipped=true 表示 store 侧防覆写护栏拦下了本次写入（该 traceID 已有真实批次），
 	// 此时 id=0、err=nil——**不是错误，但必须出声**（见 RecordEmptyBatch 的处理）。
-	RecordEmptyPushBatch(ctx context.Context, userID int64, idempKey string,
+	RecordEmptyPushBatch(ctx context.Context, userID int64, idempKey, scheduleID string,
 		gate types.BatchExitGate, counts types.PipelineCounts) (id int64, skipped bool, err error)
 	InsertDeliveryIdempotent(ctx context.Context, d *types.Delivery) (id int64, existed bool, sentAlready bool, err error)
 	UpdatePushBatchStatus(ctx context.Context, batchID int64, status types.BatchStatus) error
@@ -151,10 +159,14 @@ type Activities struct {
 	store   Store
 	feishu  FeishuManager
 	evolver ProfileEvolver // nil = EvolveProfile 退化 no-op（灰度装配开关）
-	// buildCard 构造带反馈按钮的最终卡（生产装配传 feishu.BuildDeliveryCard）。
+	// buildAggCard 构造聚合推送卡（生产装配传 feishu.BuildAggregateCard）；
+	// aggHeader 由任务名派生 header（生产装配传 feishu.AggHeaderForTask）。
 	// 函数注入而非 import feishu：feishu→agent→workflow 依赖链已存在，
 	// 本包直接依赖 feishu 即成 import 环（契约 §8.2 CRITICAL）。
-	buildCard func(input feedback.CardInput) string
+	// （原单条 buildCard 注入已随聚合卡改版删除：Push 不再逐条构卡，
+	// 单条构卡函数只活在 feedback 重建路径——历史卡的原地更新仍用它。）
+	buildAggCard func(in feedback.AggregateCardInput) string
+	aggHeader    func(task string, n int) (title, template string)
 	// buildNotice 构造无按钮的普通通知卡（生产装配传 feishu.BuildReplyCard），
 	// 用于抓取失败主动告警（功能 5.2）。同理走注入避开 import 环。刻意与 buildCard
 	// 分开：告警卡不带任何反馈按钮/回调，绝不复用 M5 的 delivery 卡结构（5.2 不碰
@@ -166,10 +178,12 @@ type Activities struct {
 // cardgen/pusher/store/feishuMgr"一致；ev 可为 nil（演化灰度关闭）；
 // buildNotice 可为 nil（抓取失败告警退化为 no-op）。
 func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, fs FeishuManager,
-	ev ProfileEvolver, buildCard func(input feedback.CardInput) string,
-	buildNotice func(markdown string) string) *Activities {
+	ev ProfileEvolver, buildNotice func(markdown string) string,
+	buildAggCard func(in feedback.AggregateCardInput) string,
+	aggHeader func(task string, n int) (title, template string)) *Activities {
 	return &Activities{fetcher: f, scorer: sc, cardgen: cg, pusher: p, store: st, feishu: fs,
-		evolver: ev, buildCard: buildCard, buildNotice: buildNotice}
+		evolver: ev, buildNotice: buildNotice,
+		buildAggCard: buildAggCard, aggHeader: aggHeader}
 }
 
 // ============================================================
@@ -214,15 +228,20 @@ type CardGenIn struct {
 
 // PushIn 是 Push Activity 的入参。
 type PushIn struct {
-	UserID  int64           `json:"user_id"`
-	TraceID string          `json:"trace_id"`
-	Cards   []GeneratedCard `json:"cards"`
+	UserID     int64           `json:"user_id"`
+	ScheduleID string          `json:"schedule_id,omitempty"` // 触发本批的任务 id（P1b），空=即时/老任务
+	TraceID    string          `json:"trace_id"`
+	Cards      []GeneratedCard `json:"cards"`
+	// TaskTitle 任务名（调度的 nl_description），聚合卡 header 用。
+	// 空串合法（存量调度/即时推送无任务名），构卡落兜底标题。
+	TaskTitle string `json:"task_title,omitempty"`
 }
 
 // RecordEmptyIn 是 RecordEmptyBatch Activity 的入参（009 / 契约 §16「空批次缺口」）。
 type RecordEmptyIn struct {
-	UserID  int64  `json:"user_id"`
-	TraceID string `json:"trace_id"` // = 幂等键，与 Push 建批次用的是同一个
+	UserID     int64  `json:"user_id"`
+	ScheduleID string `json:"schedule_id,omitempty"` // 触发本批的任务 id（P1b），空=即时/老任务
+	TraceID    string `json:"trace_id"`              // = 幂等键，与 Push 建批次用的是同一个
 	// Gate 从哪个闸门退出。恒非空——五个调用点各自传死值（workflow.go）。
 	Gate types.BatchExitGate `json:"gate"`
 	// Counts 截至退出时刻的漏斗快照；未跑到的阶段字段为 nil（见 types.PipelineCounts）。
@@ -581,7 +600,7 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 // 让它立刻失败并在 Warn 里露出来）。
 func (a *Activities) RecordEmptyBatch(ctx context.Context, in RecordEmptyIn) error {
 	// 返回的 batch_id 刻意丢弃：空批次底下没有 deliveries，没有任何后续写入需要它。
-	_, skipped, err := a.store.RecordEmptyPushBatch(ctx, in.UserID, in.TraceID, in.Gate, in.Counts)
+	_, skipped, err := a.store.RecordEmptyPushBatch(ctx, in.UserID, in.TraceID, in.ScheduleID, in.Gate, in.Counts)
 	if err != nil {
 		return retryableOrNot(err)
 	}
@@ -610,12 +629,23 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	}
 
 	// 用确定性 traceID 作幂等键：Temporal 重试 Push 时复用同一 batch，不再每次新建批次（修 #1 CRITICAL 地基）。
-	batchID, err := a.store.CreatePushBatchIdempotent(ctx, in.UserID, in.TraceID)
+	batchID, err := a.store.CreatePushBatchIdempotent(ctx, in.UserID, in.TraceID, in.ScheduleID)
 	if err != nil {
 		return err
 	}
 
+	// 聚合卡改版（card-redesign-spec.md 附录 A，2026-07-18）：一批一张聚合卡，
+	// 不再一条内容一张卡。deliveries 仍 per-content（数据模型不变），
+	// 同批各 delivery 共享同一 feishu_message_id——重建路径靠它找兄弟条目。
+	//
+	// 幂等语义相应调整：先为全部候选建 delivery（幂等），已 sent 的条目不再进新卡
+	// （它们已在上次重试成功发出的那张卡里）；只有存在未发条目时才推一张新聚合卡。
 	anySent := false
+	type pendingItem struct {
+		delID int64
+		input feedback.CardInput
+	}
+	var pending []pendingItem
 	for _, card := range in.Cards {
 		d := &types.Delivery{
 			BatchID: batchID,
@@ -637,12 +667,11 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			continue
 		}
 		if existed && sentAlready {
-			// 重试时该 (batch, content) 已发过：直接跳过，绝不重复推卡——幂等核心，修 #1 CRITICAL 重复发卡。
+			// 重试时该 (batch, content) 已发过：不进新卡，绝不重复推——幂等核心（#1 CRITICAL）。
 			anySent = true
 			continue
 		}
 
-		// 构卡元数据：标题/分数/URL 从 pipeline 上下文取，源信息 best-effort 查库。
 		ci := feedback.CardInput{
 			BodyMD:      card.BodyMD,
 			DeliveryID:  delID,
@@ -658,28 +687,77 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 				ci.Platform = src.Platform
 			}
 		}
-		cardJSON := a.buildCard(ci)
-		msgID, perr := a.pusher.Push(ctx, owner, cardJSON)
-		if perr != nil {
-			slog.Warn("push: 单卡推送失败，跳过", "delivery_id", delID, "trace_id", in.TraceID, "err", perr)
-			continue
-		}
-		if merr := a.store.MarkDeliverySent(ctx, delID, msgID, json.RawMessage(cardJSON), time.Now()); merr != nil {
-			// 已发出但回执标记失败：记录不阻断，靠对账补偿（避免重复推送）。
-			slog.Warn("push: 标记已发失败（消息已送达）", "delivery_id", delID, "feishu_message_id", msgID, "err", merr)
-		}
-		anySent = true
+		pending = append(pending, pendingItem{delID: delID, input: ci})
 	}
 
-	status := types.BatchStatusDone
-	if !anySent {
-		status = types.BatchStatusFailed
+	// 分块发送：每卡条数封顶 + 构卡后字节硬校验（附录 A 吸收自被否方案的两点之一）。
+	// 超限拆卡而非静默截断——静默丢条目会让"已打分未送达"的内容永远消失。
+	//
+	// 拆分用显式 size 内环收敛（初版把对半结果写进 end 再 continue，外层循环顶部
+	// 重算 end 会丢弃拆分——超大块死循环；size 单调递减到 1 保证必然终止）。
+	failedItems := 0
+	buildChunk := func(chunk []pendingItem) string {
+		items := make([]feedback.CardInput, len(chunk))
+		for i, p := range chunk {
+			items[i] = p.input
+		}
+		var title, tmpl string
+		if a.aggHeader != nil {
+			title, tmpl = a.aggHeader(in.TaskTitle, len(items))
+		}
+		return a.buildAggCard(feedback.AggregateCardInput{
+			HeaderTitle: title, HeaderTemplate: tmpl, Items: items,
+		})
 	}
-	if err := a.store.UpdatePushBatchStatus(ctx, batchID, status); err != nil {
-		return err
+	for start := 0; start < len(pending); {
+		size := min(aggMaxItemsPerCard, len(pending)-start)
+		cardJSON := buildChunk(pending[start : start+size])
+		for len(cardJSON) > aggMaxCardBytes && size > 1 {
+			size = max(size/2, 1)
+			cardJSON = buildChunk(pending[start : start+size])
+		}
+		chunk := pending[start : start+size]
+		if len(cardJSON) > aggMaxCardBytes {
+			slog.Warn("push: 单条内容构卡即超字节上限，硬发（可能被飞书拒）",
+				"delivery_id", chunk[0].delID, "bytes", len(cardJSON))
+		}
+
+		msgID, perr := a.pusher.Push(ctx, owner, cardJSON)
+		if perr != nil {
+			slog.Warn("push: 聚合卡推送失败，跳过该块", "trace_id", in.TraceID,
+				"items", len(chunk), "err", perr)
+			failedItems += len(chunk)
+			start += size
+			continue
+		}
+		for _, p := range chunk {
+			if merr := a.store.MarkDeliverySent(ctx, p.delID, msgID, json.RawMessage(cardJSON), time.Now()); merr != nil {
+				// 已发出但回执标记失败：记录不阻断，靠对账补偿（避免重复推送）。
+				slog.Warn("push: 标记已发失败（消息已送达）", "delivery_id", p.delID,
+					"feishu_message_id", msgID, "err", merr)
+			}
+		}
+		anySent = true
+		start += size
 	}
+
 	if !anySent {
+		if err := a.store.UpdatePushBatchStatus(ctx, batchID, types.BatchStatusFailed); err != nil {
+			return err
+		}
 		return types.NewAppError(types.CodePushFailed, "本批次全部推送失败", nil)
+	}
+	// 部分块失败（对抗审查 HIGH）：**不结算 done、返回可重试错误**。批次终态留待重试
+	// 收敛——sentAlready 幂等保证重试不重发成功块，只补失败块；若记 done 并吞掉错误，
+	// 失败块的条目会永久搁浅 pending 且（ListUnpushedByUser 按 deliveries 任意状态排除）
+	// 永不再成为候选，正是上方注释声称要消灭的"已打分未送达永远消失"。
+	// 重试耗尽时批次停在 pending——作为可见异常留给探针，而非谎报 done。
+	if failedItems > 0 {
+		return types.NewAppError(types.CodePushFailed,
+			fmt.Sprintf("部分推送失败（%d 条未送达），等待重试补发", failedItems), nil)
+	}
+	if err := a.store.UpdatePushBatchStatus(ctx, batchID, types.BatchStatusDone); err != nil {
+		return err
 	}
 	return nil
 }
@@ -697,4 +775,62 @@ func filterSources(sources []types.Source, want []int64) []types.Source {
 		}
 	}
 	return out
+}
+
+// NotifyEmptyIn 是 NotifyEmptyResult Activity 的入参。
+type NotifyEmptyIn struct {
+	UserID  int64                `json:"user_id"`
+	TraceID string               `json:"trace_id"`
+	Gate    types.BatchExitGate  `json:"gate"`
+	Counts  types.PipelineCounts `json:"counts"`
+}
+
+// NotifyEmptyResult 给用户发一张"本次没有新内容"的通知卡。
+//
+// 只服务**用户主动触发**的推送（"现在推"按钮 / agent push_now）——用户明确要了
+// 一次推送，管道跑完却一声不吭，空结果和故障在用户侧不可区分（2026-07-18 Boss
+// 点了立即推送等不到任何回音，来查"服务器是不是坏了"——服务其实完全正常）。
+// 定时任务的空批次保持静默：每天早上收一条"今天没新闻"是噪音不是信息。
+// 是否用户触发由 workflow 侧按 workflow ID 前缀判定（见 workflow.go），本活动不判。
+//
+// best-effort：通知失败只记日志不返回错误——空批次是正常终态（红线），
+// 不能让一张通知卡的失败把它变成 workflow 失败。
+func (a *Activities) NotifyEmptyResult(ctx context.Context, in NotifyEmptyIn) error {
+	if a.buildNotice == nil {
+		return nil // 灰度/测试装配未注入通知构卡：静默跳过。
+	}
+	owner := a.feishu.OwnerOpenID()
+	if owner == "" {
+		return nil
+	}
+	md := emptyResultMarkdown(in.Gate, in.Counts)
+	if _, err := a.pusher.Push(ctx, owner, a.buildNotice(md)); err != nil {
+		slog.Warn("push: 空结果通知发送失败（不阻断）", "trace_id", in.TraceID, "err", err)
+	}
+	return nil
+}
+
+// emptyResultMarkdown 按退出闸门生成人话说明——"为什么这次没有卡片"。
+// 文案与 exit_gate 语义一一对应（enums.go BatchExitGate）。
+func emptyResultMarkdown(gate types.BatchExitGate, c types.PipelineCounts) string {
+	nz := func(p *int) int {
+		if p == nil {
+			return 0
+		}
+		return *p
+	}
+	switch gate {
+	case types.BatchExitGateFetch:
+		return "📭 本次推送没有新内容：所有信源都没有产出新条目。有新内容时定时任务会照常送达。"
+	case types.BatchExitGateDedup:
+		return fmt.Sprintf("📭 本次推送没有新内容：抓到 %d 条，但都已推送过（去重后 0 条）。有新内容时定时任务会照常送达。", nz(c.Fetched))
+	case types.BatchExitGateScore:
+		return fmt.Sprintf("📭 本次推送没有新内容：%d 条候选打分后没有达标的。", nz(c.Deduped))
+	case types.BatchExitGateSelect:
+		return fmt.Sprintf("📭 本次推送没有新内容：%d 条打分内容择优后没有入选的。", nz(c.Scored))
+	case types.BatchExitGateCardGen:
+		return "📭 本次推送没有新内容：卡片生成后无可推条目。"
+	default:
+		return "📭 本次推送没有新内容。"
+	}
 }

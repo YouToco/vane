@@ -47,6 +47,8 @@ var wantTables = []string{
 	"tool_calls",
 	// 017 情报任务手册（Task Playbook P0）
 	"schedule_playbooks",
+	// 020 任务手册 P1b：「任务 ↔ 源」软范围绑定
+	"schedule_sources",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的

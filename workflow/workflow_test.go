@@ -184,7 +184,7 @@ func TestPushPipelineWorkflow_EmptyBatchExitGates(t *testing.T) {
 			g := gateStubs{out: tc.out}
 			g.register(env)
 
-			env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{UserID: 7})
+			env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{UserID: 7, ScheduleID: "push-7-x"})
 
 			if !env.IsWorkflowCompleted() {
 				t.Fatal("workflow 未结束")
@@ -211,6 +211,10 @@ func TestPushPipelineWorkflow_EmptyBatchExitGates(t *testing.T) {
 			if got.UserID != 7 {
 				t.Errorf("user_id 应透传，want 7, got %d", got.UserID)
 			}
+			// P1b b1：schedule_id 也须经编排层穿到空批次记账（PushParams→RecordEmptyIn）。
+			if got.ScheduleID != "push-7-x" {
+				t.Errorf("schedule_id 应透传到空批次，want push-7-x, got %q", got.ScheduleID)
+			}
 			// 幂等键即 workflow 的确定性 traceID（workflow.go:37-40 的 SideEffect）。
 			// 它非空是 store 侧幂等的前提：空键落在 004 部分唯一索引之外
 			// （WHERE idempotency_key <> ''），重试会长出第二行。
@@ -232,7 +236,7 @@ func TestPushPipelineWorkflow_FullRunRecordsNothing(t *testing.T) {
 	}}
 	g.register(env)
 
-	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{UserID: 7})
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{UserID: 7, ScheduleID: "push-7-x"})
 
 	if err := env.GetWorkflowError(); err != nil {
 		t.Fatalf("正常推送 workflow 意外失败: %v", err)
@@ -243,6 +247,10 @@ func TestPushPipelineWorkflow_FullRunRecordsNothing(t *testing.T) {
 	}
 	if len(pushed) != 1 || len(pushed[0].Cards) != 5 {
 		t.Fatalf("应恰好推一次、带 5 张卡，实得: %+v", pushed)
+	}
+	// P1b b1：schedule_id 须经编排层穿到 Push（PushParams→PushIn），b3 据此按任务隔离。
+	if pushed[0].ScheduleID != "push-7-x" {
+		t.Errorf("schedule_id 应透传到 Push，want push-7-x, got %q", pushed[0].ScheduleID)
 	}
 	// Push 与空批次记账共用同一个 traceID 作幂等键；两者在一次运行里互斥，
 	// 故一个 traceID 在 push_batches 里恒只对应一行（store 侧护栏据此成立）。
