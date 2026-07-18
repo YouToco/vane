@@ -120,7 +120,10 @@ func (s *server) cors(next http.Handler) http.Handler {
 			// 缓存（CDN/浏览器）必须按 Origin 区分响应，否则放行头可能被错误复用。
 			h.Add("Vary", "Origin")
 			if r.Method == http.MethodOptions {
-				h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE")
+				// 这里漏一个方法，跨源前端就调不通对应端点——预检不放行，浏览器
+				// 连请求都不发（fetch 拿到的是网络错误，不是状态码）。新增写端点时
+				// 必须同步这一行（PATCH 是随 update_schedule 端点加的）。
+				h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE")
 				h.Set("Access-Control-Allow-Headers", "Content-Type")
 				h.Set("Access-Control-Max-Age", "600")
 				w.WriteHeader(http.StatusNoContent)
