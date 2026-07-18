@@ -62,7 +62,7 @@ func (s *Store) ListFeedbacksForEvolution(ctx context.Context, userID int64, aft
 //
 // JOIN content_items 取标题（INNER）：内容已清理（content_item_id NULL）的行
 // 自然丢弃——无标题即无从注入打分 prompt。空标题回退正文前 200 字符
-// （X 官号类无标题内容整批 title=''，2026-07-17 实测其负反馈对打分 prompt
+// （X 官号类无标题内容整批 title=”，2026-07-17 实测其负反馈对打分 prompt
 // 完全不可见——Gate ⑥ 盲区；200 与演化通道 ListFeedbacksForEvolution 的
 // excerpt 同宽，scorer 侧 SingleLine+TruncateRunes 负责渲染收窄）；
 // 标题与正文都空才在 Go 侧跳过。

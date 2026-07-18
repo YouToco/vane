@@ -199,9 +199,42 @@ func run() error {
 	// A2A server（a2a-contract §7）：enabled=false 时不 Mount——/a2a 与
 	// agent-card 路径在 mux 上根本不存在（404），零新增暴露面。
 	if cfg.A2A.Enabled {
+		// 启动时清理上次进程遗留的滞留任务（对抗审查 A-1）：assistant.chat 跑在 SDK
+		// 后台 goroutine，重启硬杀会让在飞任务永久停在 WORKING，轮询终态的对端挂死。
+		// 此刻无活任务，把超过 15min（远超单任务 120s 预算）的非终态置 FAILED。
+		// 失败只记日志不拒启动：清账是尽力而为，不该拖垮服务拉起。
+		if n, err := st.FailStaleA2ATasks(ctx, time.Now().Add(-15*time.Minute)); err != nil {
+			slog.Warn("a2a: 清理滞留任务失败（不阻塞启动）", "err", err)
+		} else if n > 0 {
+			slog.Info("a2a: 已清理上次进程遗留的滞留任务", "count", n)
+		}
+
+		// assistant.chat 的 A2A 轨 agent 实例（契约 §12 P2）：与飞书轨完全隔离——
+		// 工具用**显式只读白名单**（不是 !Mutating() 过滤：push_now 虽标记非 mutating
+		// 但有触发推送的副作用、view_profile 涉画像，都是 A2A 非目标）；
+		// system prompt 换 A2A 语境；Store/Profiles 不注入（RunOnce 不碰会话与画像，
+		// 误用 HandleMessage 会在 loadOrCreateSession 处 nil panic——响亮的装配错误）。
+		var a2aTools []agent.Tool
+		for _, t := range tools {
+			switch t.Name() {
+			case "list_sources", "list_schedules":
+				a2aTools = append(a2aTools, t)
+			}
+		}
+		a2aLoop := agent.New(agent.Deps{
+			Client:       llmClient,
+			Recorder:     recorder,
+			Tools:        a2aTools,
+			Model:        cfg.LLM.AgentModel,
+			MaxTurns:     cfg.Agent.MaxTurns,
+			SystemPrompt: a2a.ChatSystemPrompt,
+			ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
+		})
 		if err := a2a.Mount(mux, a2a.Deps{
 			Storage: st,
 			Content: st,
+			Chat:    a2aLoop,
+			Owner:   st,
 			Token:   cfg.A2A.Token,
 			BaseURL: cfg.A2A.BaseURL,
 			Version: vaneVersion,

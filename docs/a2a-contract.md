@@ -14,7 +14,7 @@ A2A（Agent2Agent，LF 治理）是 agent 间互操作协议：server 发布 Age
 
 **能力面为什么这么窄（数据盘点结论）**：content_items（001_init.sql:66-83，007 加 canonical_key、008 加 kind）只有原始字段，无 score/summary 列；唯一持久化的分数是 deliveries.score（001_init.sql:115），且是按 owner 画像打的**个性化分**（main.go:98-99 hints 注入 scorer）——暴露它即泄露画像偏好，撞 §8 红线。故第一期诚实降级为纯内容检索。
 
-**非目标（第一期不做）**：vane 作为 A2A client；streaming（SSE）与 push notification（card 声明 false 且 handler 显式拒绝，启用前置见 §12）；gRPC/REST binding（只做 JSON-RPC 一种即合规）；extended card / card JWS 签名 / 多 peer 差异化授权；任何 Mutating 能力（确认卡语义无法映射给外部 agent）；画像与个性化分；`assistant.chat`（P2 暂缓，§12）。
+**非目标（第一期不做）**：vane 作为 A2A client；streaming（SSE）与 push notification（card 声明 false 且 handler 显式拒绝，启用前置见 §12）；gRPC/REST binding（只做 JSON-RPC 一种即合规）；extended card / card JWS 签名 / 多 peer 差异化授权；任何 Mutating 能力（确认卡语义无法映射给外部 agent）；画像与个性化分。（原列于此的 `assistant.chat` 已于 2026-07-18 随 PR-4 实施——只读工具白名单 + RunOnce 无会话形态，见 §12）
 
 **第一个对接方**：Boss 本机 Claude Code。Claude Code 无原生 A2A client（官方互操作只有 MCP），走官方 `a2a` CLI（`go install github.com/a2aproject/a2a-go/v2/cmd/a2a@latest`）+ 本机 skill 封装，token 走 my-credentials，零开发当天可用。注意：CLI 与 server 同源 SDK，**不构成 Gate ⑦ 的"异构客户端"验证**（§10）。
 
@@ -493,7 +493,7 @@ if cfg.A2A.Enabled {
 | **PR-2 存储** | migration 013 + types.A2ATask + store/a2a_tasks.go + SearchContentItems + 基准 + wantTables 补账（4 张欠账 + a2a_tasks + 对账守卫）+ §9.3 门控测试 | 门控测试全绿；基准数据附 PR；**纯 store 层，零 SDK import**；无公网面变化 | 否（常规 review） |
 | **PR-3 服务端** | a2a/ 包全部（含 taskstore.go 适配）+ config 段 + main.go 装配 + probe P-A2A + `go list -deps` 实测记录 | §9.1/9.2/9.4/9.5 全绿；enabled=false 时 `/a2a` 与 card 404 + 守卫绿 + 既有测试全绿；enabled=true 验证窗口：VPS 部署后探针绿 + 真人 ①-⑥⑧ 过 | **是**（公网暴露面 + 认证 + 错误卫生） |
 | **PR-infra Caddyfile** | 主域 vane.zhuoqidev.com 块内、SPA handle 之前加 `handle /.well-known/* { reverse_proxy 127.0.0.1:8080 }`（上游写 127.0.0.1 与 vane 的 loopback 绑定精确配对，见 deploy/Caddyfile 注释；现状 try_files 把该路径回落 index.html） | 合并后主域 card 可达、SPA 路由不回归；CI 自动上传 infra、合并即生效，不与代码 PR 搭车 | 否 |
-| **PR-4 agent 桥接** | **暂缓**（拍板 §13.2）：assistant.chat + agent 中等重构 + M4 契约修订，范围见 §12 | P1 连通后再议 | **是**（触碰 M4 契约核心） |
+| **PR-4 agent 桥接** | ✅ **已实施（2026-07-18，Boss 拍板启动）**：assistant.chat + agent RunOnce 重构 + M4 契约 §7.1 修订，实现形态见 §12 | — | **是**（触碰 M4 契约核心） |
 
 PR-2 与 PR-3 无同包文件耦合可真并行（SDK 触点全在 PR-3）；PR-3 合并依赖 PR-2。**PR-infra 须在 PR-3 的 enabled=true 验证窗口开启前合并**——真人 ① 的主域 curl 依赖它（Caddyfile 现状 try_files 把 `/.well-known/*` 回落 index.html，deploy/Caddyfile:13-17）；若届时未合并，① 按其判定列的降级方式代跑。PR-4 砍掉不影响前三个的价值闭环。
 
@@ -502,7 +502,7 @@ PR-2 与 PR-3 无同包文件耦合可真并行（SDK 触点全在 PR-3）；PR-
 - **streaming 启用前置**：仅需 `/a2a` 路由用 `http.ResponseController.SetWriteDeadline` 逐路由放宽 WriteTimeout=30s（main.go:188，唯一服务端障碍）+ 补 streaming 测试。**Caddy 零工作**：当前 Caddy 对 text/event-stream 自动逐段直通。
 - **push notification 启用前置**（三条全满足才解禁）：SDK 升级到含 #373/#374 的 release + 自建 webhook 域名白名单 + 拒 RFC1918/localhost/云 metadata。启用时补 push 配置表（凭证入库问题届时正面处理）。
 - **INPUT_REQUIRED 启用前置**：先给 agent.Outcome 定义结构化澄清字段（"这是澄清问句"的判定来源），无它则映射不可实现（§5.5）。
-- **P2 `assistant.chat`（暂缓，连通后再议）**：不复用 agent_sessions、不共享 owner Loop 实例（写工具挂起等确认卡外部 agent 点不了；GetActiveAgentSession 会把 A2A 消息混进 owner 飞书上下文；userMu 让两轨互相排队）。改造范围（触碰 M4 契约 §7 签名面，PR-4 时修订 M4 契约）：
+- **P2 `assistant.chat`（✅ 2026-07-18 已实施，PR-4）**——实现与下述设计的对照：RunOnce 已落地（签名同下，M4 §7.1）；system prompt 参数化已落地（Deps.SystemPrompt 零值回落）；工具白名单收紧为显式 list_sources/list_schedules（比"只读子集"更严：push_now 有副作用、view_profile 涉画像，均排除）；多轮历史按 contextId 跨任务重建（终态不可续写 ⇒ 追问=同 context 新任务，每任务折叠一对 user/assistant、上限 8 对）；同步返回靠 /a2a 路由级写超时放宽（150s>chatBudget 120s），超预算走 GetTask 兜底。原设计记录如下：不复用 agent_sessions、不共享 owner Loop 实例（写工具挂起等确认卡外部 agent 点不了；GetActiveAgentSession 会把 A2A 消息混进 owner 飞书上下文；userMu 让两轨互相排队）。改造范围（触碰 M4 契约 §7 签名面，PR-4 时修订 M4 契约）：
   ```go
   // agent 包新增（HandleMessage 签名不变，内部改为 load→RunOnce→save）：
   // RunOnce 在给定历史上执行一轮多轮 FC，不碰 store 会话。userID 必须入参（Tool.Execute 带
@@ -557,3 +557,24 @@ probe.Run 报错中断模式、cmd/gate 退出码语义、CHANGELOG 最新已发
 | B-M5 | MINOR | Gate ① 依赖 PR-infra 但 §11 依赖关系缺失 | [已修复] §11 增"PR-infra 须在 PR-3 验证窗口前合并"；Gate ① 增未合并时的降级跑法（api 子域代跑、主域补验） |
 
 无驳回项：12 条意见的事实基础全部复核属实。
+
+## 15. PR-4 对抗审查处置记录（2026-07-18）
+
+按 CLAUDE.md「核心路径/跨包契约变更上全流程」，PR-4（assistant.chat）经两怀疑者对抗审查（视角：A=并发/生命周期，B=安全/协议）。真发现全部已修，逐条：
+
+| 编号 | 严重度 | 问题 | 处置 |
+|---|---|---|---|
+| B-F1 | HIGH | owner 解析失败的 AppError.Message 内嵌真实 open_id（`store.UpsertUserByOpenID` 的 "upsert 用户（open_id=…）"）与 settings key 名，`sanitize` 对 AppError 放行 Message → 送外部 agent | `a2a/chat.go` owner 错误改走 `ownerErrText` 固定文案（区分未初始化/笼统失败），不透传 Message；原始错误只落 slog。测试 `TestChatFailedSanitized/owner open_id 不外泄` |
+| A-2 | HIGH | RunOnce 错误可能源自 llm 层，`llm.mapHTTPError` 把上游响应体全文（provider 原文/request id/内容过滤引用）拼进 Message，`sanitize` 放行 → 外泄。content.query 无 LLM 故此前不可达，PR-4 首次把 llm 错误接进对外出口 | `a2a/chat.go` RunOnce 错误改走 `chatFailText` 固定文案。测试 `.../RunOnce 内部/llm 错误不外泄` |
+| B-F2 | HIGH | `agent/loop.go` 读工具失败用 `err.Error()`（展开 Cause：pgx 连接串/SQL）拼进 tool 消息 → 进模型上下文 → 可能被复述进 A2A artifact | 改用 `toolErrText`（只取 AppError.Message，非 AppError 给固定文案），与 ExecuteAction 失败回写同口径。两轨共用，飞书轨行为等价 |
+| A-1 | HIGH | assistant.chat 跑在 SDK 后台 goroutine（`WithoutCancel`），不随 HTTP Shutdown 取消；进程重启硬杀 → 在飞任务永久停 WORKING，轮询终态的对端挂死 | `store.FailStaleA2ATasks` + main.go 启动时清理超 15min 的非终态任务（此刻无活任务）。DB 门控测试 `FailStale只清超龄非终态`（终态/未超龄不动） |
+| A-3 | MEDIUM | `maxConcurrentExecutions=4` 上线后被 content.query 与 120s chat 共享，慢 chat 占满则新请求立即被拒（自伤）；注释仍说"无 LLM 争抢"失真 | 提到 8 并注释记录已知取舍（多对端或饥饿再按 skill 分池）；`a2a/a2a.go` |
+| A-4 | MEDIUM | 与 #56（端点注册表）合并：机械解冲突会让 A2A 轨工具记账落 `session_id=0`；#56 的 `toolRunState` 需空构造且不持久化 | RunOnce 传 `sessionID=nil`（记 NULL）；空 `toolRunState`（activation 空、不 saveSession）。converse 抽取两轨共享，逐行核对飞书轨零行为变化 |
+
+**记录为遗留（单 token 单对端下非漏洞，多对端接入前处理）**：
+- **B-F3**：`contextId` 客户端可控，`chatHistory` 仅按 contextId 取历史、无 per-caller 隔离。若一枚 token 被多个外部 agent 共用，agent A 复用 B 的 contextId 可把 B 的既往对话读进自己这轮 LLM 历史。与 §1「多 peer 升级前复查 #351 IDOR」同族——加第二个 token / 多对端前必须给 contextId 绑定调用方身份或强制服务端生成。
+- **B-F6/A-7**：`/a2a` 无 `MaxBytesReader`（既存，content.query 时代就在）；chat 的 text 直送 LLM、contextId 无界入库放大滥用面。多对端前补 body 上限。
+- **A-7(hist)**：`chatHistory` 只扫首页（≤50 行），同 context 混大量 content.query 任务时 chat 轮次可能被挤出窗口——与「历史是增强不是门槛」一致，可接受。
+- **B-F5**：`list_sources` 在 title 空时打印 source URL，若 URL 内嵌鉴权 query 参数会回给外部 agent（凭证主载体 Config JSONB 未输出，数据边界主体干净）。
+
+**攻过未破（明确排除）**：A2A 轨产生写操作/pending_action（显式白名单 + 未注册自纠 + Confirm 出口报错，三重）；REJECTED/FAILED 任务折叠进历史（DB 层 Status=COMPLETED 过滤 + 双校验）；converse 抽取后飞书轨行为变化（逐行核对零变化）；取消/断连场景兜底（detached 继续、终态落库、GetTask 可取）。

@@ -35,7 +35,7 @@ func (s *Store) CreatePushBatch(ctx context.Context, userID int64) (int64, error
 // ON CONFLICT 的 WHERE 谓词必须与 004 的部分唯一索引 uq_push_batches_idem 一致，
 // Postgres 才能推断到该索引作为 arbiter。idempKey 恒非空，故一定命中该部分索引。
 //
-// DO UPDATE 里的 `exit_gate = '', stage_counts = '{}'` 是 009 加的**反向复位**，
+// DO UPDATE 里的 `exit_gate = ”, stage_counts = '{}'` 是 009 加的**反向复位**，
 // 与 RecordEmptyPushBatch 的防覆写护栏成镜像，两者缺一不可：
 //
 //	护栏挡的是「空批次盖掉真实批次」（empty 写在 done 之后）；

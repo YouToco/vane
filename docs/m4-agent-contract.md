@@ -209,6 +209,12 @@ type Confirm struct {
 // HandleMessage 完整 agent loop：取/建会话 → 多轮 FC → 读工具直接执行、
 // 首个写工具建 pending_action 并终止本轮 → 持久化会话 → 返回。
 func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Outcome, error)
+// RunOnce 在给定历史上执行一轮多轮 FC（§7.1，2026-07-18 随 A2A PR-4 增补）：
+// 不读写会话存储、不持 userMu 锁、不注入画像——历史与并发语义由调用方管理
+//（A2A 侧按 contextId 重建历史，a2a-contract §12 P2）。返回追加了本轮交换的完整历史。
+// 所属实例必须只注册只读工具（a2a 装配显式白名单 list_sources/list_schedules）；
+// Confirm 出口在此转为错误（外部 agent 点不了确认卡，挂起即悬空）——agent/runonce_test.go 钉死。
+func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMessage, text string) (Outcome, []llm.ChatMessage, error)
 // ExecuteAction 确认卡回调入口：ClaimPendingAction（原子幂等）→ 找到工具 Execute →
 // 返回结果文本（用于更新卡片）。已执行/过期/不存在返回人话错误文本 + nil error。
 func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string) (string, error)
@@ -218,6 +224,8 @@ func (l *Loop) CancelAction(ctx context.Context, userID int64, actionID string) 
 Loop 行为细则：
 - system prompt 常量（中文）：声明角色=见微 Vane 助理、只在需要时调工具、写操作会出确认卡由用户确认、
   无关问题直接回答。外部内容注入防护措辞对齐 scorer 的写法。
+  **§7.1 增补（2026-07-18 PR-4）**：`Deps.SystemPrompt` 可覆盖该常量（零值回落，飞书轨零行为变化）；
+  [用户画像] 段只跟随默认 prompt 渲染（自定义 prompt 的 A2A 轨不渲染——画像是 A2A 非目标）。
 - 会话消息即 []llm.ChatMessage 的 JSON；system 消息**不入库**，每次调用时动态前置。
 - 模型调用：DoChat，SpanName="agent"，DisableThinking=**false**（agent 决策需要推理；
   MaxTokens 2048），Temperature nil（默认）。

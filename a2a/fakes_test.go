@@ -3,6 +3,7 @@ package a2a
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"sync"
 	"time"
 
@@ -33,11 +34,11 @@ func (f *fakeContent) SearchContentItems(_ context.Context, keyword string, sinc
 }
 
 // fakeTaskStorage 是 TaskStorage 替身：内存 map + 与 store 层相同的版本语义
-//（Create 版本 1；Update 条件版本匹配否则 CodeConflict；无行 CodeNotFound），
+// （Create 版本 1；Update 条件版本匹配否则 CodeConflict；无行 CodeNotFound），
 // 让 SDK handler 的完整任务生命周期能在 httptest 层走通。
 type fakeTaskStorage struct {
-	mu    sync.Mutex
-	rows  map[string]*types.A2ATask
+	mu   sync.Mutex
+	rows map[string]*types.A2ATask
 	// 错误注入位：非 nil 时对应方法直接返回该错误。
 	createErr, getErr, updateErr, listErr error
 }
@@ -115,5 +116,12 @@ func (f *fakeTaskStorage) ListA2ATasks(_ context.Context, q types.A2ATaskQuery) 
 		cp := *row
 		out = append(out, cp)
 	}
+	// 对齐 store 契约的 ORDER BY created_at DESC, id DESC（chatHistory 依赖此序）。
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID > out[j].ID
+	})
 	return out, int64(len(out)), "", nil
 }

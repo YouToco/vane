@@ -1107,7 +1107,9 @@ func TestNotifyEvent(t *testing.T) {
 
 // F14 定向用例（"挪一行就静默失效"的不变式）：HandleMessage 持 userMu 期间来的事件通告，
 // ① GetActiveAgentSession 现查必须发生在锁内——锁外查到的会话可能在抢锁期间被换代
-//    （TTL 边界上 HandleMessage 新开会话），通告会写进过期会话；
+//
+//	（TTL 边界上 HandleMessage 新开会话），通告会写进过期会话；
+//
 // ② 通告必须排在 saveSession 之后落地，否则被 UpdateAgentSession 的全量覆盖写吞掉。
 // 断言 ① 靠"锁被对端持有期间 GetActiveAgentSession 一次都不能被调到"，
 // 把现查挪到 mu.Lock() 之前（无论移进 NotifyEvent 本体还是 goroutine 开头）即变红。
