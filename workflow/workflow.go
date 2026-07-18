@@ -6,7 +6,6 @@ import (
 
 	"github.com/google/uuid"
 	"go.temporal.io/sdk/temporal"
-	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 
 	"github.com/YouToco/vane/types"
@@ -174,14 +173,6 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 
 	log.Info("push pipeline 完成", "user_id", p.UserID, "trace_id", traceID, "pushed", len(cards))
 	return nil
-}
-
-// Register 把 workflow 与全部 Activity 注册进 worker。注册结构体实例即注册其
-// 所有导出方法（Fetch/Dedup/…/Push），与 workflow 内 a.Fetch 的名字一一对应。
-// 供 cmd/server 装配时调用，避免各处重复逐个注册漏掉某个 Activity。
-func Register(w worker.Registry, a *Activities) {
-	w.RegisterWorkflow(PushPipelineWorkflow)
-	w.RegisterActivity(a)
 }
 
 // nonRetryableCodes 是确定性失败错误码：这类错误重试无意义（重试只是重复失败），

@@ -23,14 +23,9 @@ llm:
   agent_model: "deepseek-v4-pro"   # agent loop（function calling，M4）
   max_concurrent: 5
 
-feishu:
-  app_id: ""     # VANE_FEISHU_APP_ID
-  app_secret: "" # VANE_FEISHU_APP_SECRET
-  rate_interval_ms: 750
+# 注：飞书凭证不在配置文件——由 Dashboard 向导写入 settings 表，运行时从 store 读取。
 
 fetch:
-  rss_concurrency: 10
-  tikhub_concurrency: 3
   tikhub_api_key: "" # VANE_FETCH_TIKHUB_API_KEY
   exa_api_key: ""    # VANE_FETCH_EXA_API_KEY
   timeout_seconds: 20
@@ -38,7 +33,7 @@ fetch:
 
 agent:
   max_turns: 20
-  token_budget_daily: 100000
+  token_budget_daily: 100000 # 预留，当前未接线（无代码按它拦截）；实际护栏是 max_turns + endpoint_*_cap
   session_ttl_minutes: 30 # 同一 owner 会话闲置过期窗口（M4）
 
 log:

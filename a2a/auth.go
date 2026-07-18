@@ -85,7 +85,8 @@ func (l *authFailLimiter) prune(ip string, now time.Time) {
 //     否则攻击者自带任意 XFF 即可让每个请求都成"新 IP"，把唯一的 Bearer 暴力限流冲垮，
 //     或伪造受害 peer 的 IP 打满其失败额度做定向 429 锁定。
 //
-// （api/ratelimit.go 的 clientIP 有同源缺陷——存量 dashboard 限流，已另立 task 跟进。）
+// （api/ratelimit.go 的 clientIP 同源同逻辑，已在 #49 一并修平；两处 auth 零交集、
+// 各自持一份未导出实现以保持 api↔a2a 解耦，故未抽公共包。）
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

@@ -1,11 +1,9 @@
 // Package selector 负责在打分之后做 Top-N 选择。
 //
-// 两个入口：SelectTopN 是纯分数降序（M3，同分依赖稳定排序保持上游序）；
-// RankTopN 叠加新鲜度衰减与全键同分裁决（M5 契约 §6，Select Activity 的
-// 生产入口）。均设计为纯函数（无 I/O、无状态），便于 workflow 的 Select
-// Activity 直接调用并单测。作用于 types.ScoredItem —— 该类型由 types 包
-// 统一定义并被 scorer / selector / cardgen 共享（见 types/scored_item.go
-// 的设计说明），selector 只依赖 types，不会与下游包形成 import 环。
+// 生产入口 RankTopN：分数叠加新鲜度衰减与全键同分裁决（M5 契约 §6，Select Activity 用它）。
+// 设计为纯函数（无 I/O、无状态），便于 workflow 的 Select Activity 直接调用并单测。
+// 作用于 types.ScoredItem —— 该类型由 types 包统一定义并被 scorer / selector / cardgen
+// 共享（见 types/scored_item.go 的设计说明），selector 只依赖 types，不会与下游包形成 import 环。
 package selector
 
 import (
@@ -23,29 +21,6 @@ const (
 	freshnessPenaltyCap     = 12.0
 )
 
-// SelectTopN 按 Score 降序返回前 n 条。纯函数：不修改入参切片。
-//
-// 边界：n <= 0 或输入为空 → 返回空切片（非 nil，便于调用方直接 range 与 JSON 序列化）；
-// n 大于可选数量 → 返回全部（已排序）。同分保持输入原有相对顺序（稳定排序），
-// 使结果在同分场景下可复现。
-func SelectTopN(scored []types.ScoredItem, n int) []types.ScoredItem {
-	if n <= 0 || len(scored) == 0 {
-		return []types.ScoredItem{}
-	}
-
-	// 拷贝后排序，避免对调用方持有的切片产生副作用。
-	out := make([]types.ScoredItem, len(scored))
-	copy(out, scored)
-	sort.SliceStable(out, func(i, j int) bool {
-		return out[i].Score > out[j].Score
-	})
-
-	if n > len(out) {
-		n = len(out)
-	}
-	return out[:n]
-}
-
 // RankTopN 按有效分排序并返回前 n 条（M5 契约 §6）。纯函数：不修改入参切片，
 // 也不改写 ScoredItem.Score——有效分只用于排序，deliveries.score 落库仍是 LLM
 // 原始相关分（有效分随 now 漂移，落库会让分数跨期不可比）。
@@ -57,10 +32,8 @@ func SelectTopN(scored []types.ScoredItem, n int) []types.ScoredItem {
 //
 //	有效分 desc → PublishedAt desc（nil 最后）→ FetchedAt desc → Item.ID desc
 //
-// 注意：SelectTopN 的同分序隐式继承上游 SQL（fetched_at DESC 无次键），本函数
-// 把 PublishedAt 提前且全键确定化——同分顺序可能与旧隐式序不同，不声称"行为
-// 不变"。末键 ID 保证全序确定，无需稳定排序。边界语义与 SelectTopN 一致：
-// n <= 0 或输入为空 → 非 nil 空切片；n 超长 → 返回全部（已排序）。
+// 同分裁决把 PublishedAt 提前且全键确定化，末键 ID 保证全序确定，无需稳定排序。
+// 边界语义：n <= 0 或输入为空 → 非 nil 空切片；n 超长 → 返回全部（已排序）。
 func RankTopN(scored []types.ScoredItem, n int, now time.Time) []types.ScoredItem {
 	if n <= 0 || len(scored) == 0 {
 		return []types.ScoredItem{}

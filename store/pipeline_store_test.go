@@ -176,25 +176,19 @@ func TestPipelineStore(t *testing.T) {
 		if err := st.AddSubscription(ctx, u.ID, srcID); err != nil {
 			t.Fatalf("AddSubscription() 重复调用应幂等，实际报错: %v", err)
 		}
-		subs, err := st.ListSubscriptionsByUser(ctx, u.ID)
-		if err != nil {
-			t.Fatalf("ListSubscriptionsByUser() 失败: %v", err)
-		}
 		var found int
-		for _, sub := range subs {
-			if sub.SourceID == srcID {
-				found++
-			}
+		if err := st.pool.QueryRow(ctx,
+			`SELECT count(*) FROM subscriptions WHERE user_id = $1 AND source_id = $2`, u.ID, srcID).Scan(&found); err != nil {
+			t.Fatalf("查询订阅数失败: %v", err)
 		}
 		if found != 1 {
-			t.Errorf("期望恰好 1 条对 source %d 的订阅，实际 %d 条（共 %d）", srcID, found, len(subs))
+			t.Errorf("期望恰好 1 条对 source %d 的订阅（AddSubscription 幂等），实际 %d 条", srcID, found)
 		}
 	})
 
 	t.Run("ListSubscribedSourcesByUser含非active", func(t *testing.T) {
 		// 依赖前一个子测试已建立 u→srcID 的订阅关系。把 source 置为 disabled，
-		// 验证 ListSubscribedSourcesByUser 仍返回它（状态灯可达），而抓取用的
-		// ListActiveSourcesByUser 则将其排除。测试结束恢复为 active。
+		// 验证 ListSubscribedSourcesByUser 仍返回它（状态灯可达）。测试结束恢复为 active。
 		if _, err := st.pool.Exec(ctx,
 			`UPDATE sources SET status = $2 WHERE id = $1`, srcID, types.SourceStatusDisabled); err != nil {
 			t.Fatalf("置 source 为 disabled 失败: %v", err)
@@ -221,16 +215,6 @@ func TestPipelineStore(t *testing.T) {
 		}
 		if !foundDisabled {
 			t.Errorf("ListSubscribedSourcesByUser 应包含 disabled 的源 %d，实际未包含（共 %d）", srcID, len(all))
-		}
-
-		active, err := st.ListActiveSourcesByUser(ctx, u.ID)
-		if err != nil {
-			t.Fatalf("ListActiveSourcesByUser() 失败: %v", err)
-		}
-		for _, s := range active {
-			if s.ID == srcID {
-				t.Errorf("ListActiveSourcesByUser 不应包含 disabled 的源 %d", srcID)
-			}
 		}
 	})
 

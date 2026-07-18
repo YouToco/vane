@@ -7,33 +7,6 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-// ListSubscriptionsByUser 返回该用户的全部订阅记录（含非 active，供管理页展示）。
-func (s *Store) ListSubscriptionsByUser(ctx context.Context, userID int64) ([]types.Subscription, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, user_id, source_id, status, created_at
-		 FROM subscriptions
-		 WHERE user_id = $1
-		 ORDER BY created_at DESC`, userID)
-	if err != nil {
-		return nil, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("查询用户 %d 的订阅", userID), err)
-	}
-	defer rows.Close()
-
-	var out []types.Subscription
-	for rows.Next() {
-		var sub types.Subscription
-		if err := rows.Scan(&sub.ID, &sub.UserID, &sub.SourceID, &sub.Status, &sub.CreatedAt); err != nil {
-			return nil, types.NewAppError(types.CodeDatabase, "扫描 subscription 行", err)
-		}
-		out = append(out, sub)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "遍历 subscription 结果集", err)
-	}
-	return out, nil
-}
-
 // AddSubscription 幂等添加订阅：重复订阅同一源是空操作（命中 uq_subscriptions_user_source）。
 // ON CONFLICT DO NOTHING 而非报冲突——"再点一次订阅"应静默成功而非报错。
 func (s *Store) AddSubscription(ctx context.Context, userID, sourceID int64) error {
