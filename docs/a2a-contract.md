@@ -217,6 +217,12 @@ func Mount(mux *http.ServeMux, deps Deps) error {
 ```
 
 **card 公开是设计选择非规范强制**：规范 §8.1 的 MUST 是"必须提供卡片"，well-known 免认证公开是生态默认实践——未来加访问控制不违规；卡片内无内部 URL/密钥/owner 信息。
+
+> **主域口径备注（2026-07-18 前端迁 OSS+CDN 后）**：主域 `vane.zhuoqidev.com/.well-known/agent-card.json`
+> 自迁移起由静态托管层（国内线 OSS RoutingRules / 境外线 Pages `_redirects`）**302 到
+> `api.vane.zhuoqidev.com` 同路径**——发现 URL 仍是主域（「card 放主域」拍板语义保留），
+> 真相源仍是本节的后端动态端点（version 与部署一致，不存在静态副本漂移）。A2A 客户端的
+> HTTP 栈默认跟随重定向；deploy 探针以 `-L` 终点为 json 为准（ci.yml Restart and verify）。
 **关停语义**：P1 的 Execute 在 SendMessage 请求生命周期内同步完成（确定性查询，阻塞返终态），HTTP Shutdown（5s 预算，main.go:216-219）天然覆盖，无自有后台 goroutine。executor 内 DB 查询自带请求级超时（§5.7）——pgxpool.Close 阻塞等借出连接（main.go:226-228 明文警告）。
 
 ### 5.3 auth（`a2a/auth.go`）
