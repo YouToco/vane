@@ -144,7 +144,28 @@ func (s *Store) UpdatePasswordHash(ctx context.Context, userID int64, passwordHa
 
 // CreateSession 落库一条会话。tokenHash 由 auth.NewSessionToken 产出，
 // **明文 token 绝不入库**。
+// maxSessionsPerUser 是每用户活跃会话数上限。
+//
+// 存在的理由（安全审查 CRITICAL 的一半）：CreateSession 原本是无条件 INSERT，
+// 每次登录新增一条 30 天 TTL 的行，**没有任何上限**——持一份有效凭据反复登录
+// 即可无限撑大会话表。上限配合下面的「超限删最旧」，让表大小有界。
+// 10 个足够覆盖「手机+电脑+几个浏览器」的正常用法。
+const maxSessionsPerUser = 10
+
 func (s *Store) CreateSession(ctx context.Context, tokenHash []byte, userID int64, tenantID int64, expiresAt time.Time) error {
+	// 超限则删最旧的几条（FIFO 逐出）。与插入放在同一条语句序列里，
+	// 并发登录最坏只是短暂超出上限一两条，不影响有界性。
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM user_sessions
+		  WHERE user_id = $1
+		    AND token_hash NOT IN (
+		      SELECT token_hash FROM user_sessions
+		       WHERE user_id = $1
+		       ORDER BY created_at DESC
+		       LIMIT $2
+		    )`, userID, maxSessionsPerUser-1); err != nil {
+		return types.NewAppError(types.CodeDatabase, "清理超限会话", err)
+	}
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO user_sessions (token_hash, user_id, tenant_id, expires_at)
 		 VALUES ($1, $2, $3, $4)`, tokenHash, userID, tenantID, expiresAt)
@@ -161,10 +182,20 @@ func (s *Store) CreateSession(ctx context.Context, tokenHash []byte, userID int6
 // 误用「取到了但过期」的机会；也避免应用与数据库时钟不一致导致的边界分歧。
 func (s *Store) LookupSession(ctx context.Context, tokenHash []byte) (*types.Session, error) {
 	var sess types.Session
+	// 租户状态一并校验（安全审查 HIGH）：租户被停用/软删除后，已签发的会话
+	// **必须立即失效**。原实现只看会话本身，导致「注销了但还能用」——
+	// 而注销的动机往往正是「这个租户不该再有访问权」。
+	// 判定放在 SQL 里与会话查询同一条语句：应用层再查一次会有 TOCTOU 窗口，
+	// 且容易在某条分支上漏判。
 	err := s.pool.QueryRow(ctx,
-		`UPDATE user_sessions SET last_seen_at = now()
-		  WHERE token_hash = $1 AND expires_at > now()
-		RETURNING token_hash, user_id, tenant_id, created_at, expires_at, last_seen_at`,
+		`UPDATE user_sessions us SET last_seen_at = now()
+		   FROM tenants t
+		  WHERE us.token_hash = $1
+		    AND us.expires_at > now()
+		    AND t.id = us.tenant_id
+		    AND t.status = 'active'
+		    AND t.deleted_at IS NULL
+		RETURNING us.token_hash, us.user_id, us.tenant_id, us.created_at, us.expires_at, us.last_seen_at`,
 		tokenHash).Scan(&sess.TokenHash, &sess.UserID, &sess.TenantID,
 		&sess.CreatedAt, &sess.ExpiresAt, &sess.LastSeenAt)
 	if err != nil {
@@ -203,4 +234,63 @@ func (s *Store) DeleteExpiredSessions(ctx context.Context) (int64, error) {
 		return 0, types.NewAppError(types.CodeDatabase, "清理过期会话", err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// SetUserCredentials 给**已存在的用户**挂上邮箱+密码身份。
+//
+// 存在的唯一理由是**存量 owner 的接管**：改造前 Dashboard 用共享密码登录，
+// 换成账号体系后，那位 owner 已经带着租户 1 与全部历史数据存在于 users 表，
+// 却没有邮箱和密码——若让他重新注册，会得到一个空的新租户，历史数据全留在原处
+// 看不见。本方法把身份挂到既有行上，租户归属与数据一概不动。
+//
+// 与 RegisterWithInvite 的分工：那个是「建新人」，这个是「给老人补身份」。
+// 刻意不做成 HTTP 端点——它能给任意用户设密码，是纯粹的管理员操作，
+// 只应由能登上 VPS 的人在本机执行（见 cmd/useradmin）。
+func (s *Store) SetUserCredentials(ctx context.Context, userID int64, email, passwordHash string) error {
+	email = NormalizeEmail(email)
+	if email == "" || passwordHash == "" {
+		return types.NewAppError(types.CodeValidation, "邮箱与密码哈希都不能为空", nil)
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE users SET email = $2, password_hash = $3 WHERE id = $1`,
+		userID, email, passwordHash)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+			return types.NewAppError(types.CodeConflict, "该邮箱已被其他账号占用", err)
+		}
+		return types.NewAppError(types.CodeDatabase, "设置用户凭据", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return types.NewAppError(types.CodeNotFound,
+			fmt.Sprintf("用户 %d 不存在", userID), nil)
+	}
+	return nil
+}
+
+// InviteUsable 廉价预检一个邀请码当前是否可用（只读，不消费）。
+//
+// 存在的理由是**成本过滤**（安全审查 CRITICAL）：注册要先算 19MiB 的 argon2
+// 才能拿到 password_hash 去调 RegisterWithInvite。若不预检，匿名攻击者用伪造
+// 邀请码即可反复触发昂贵计算，把未鉴权端点变成内存 DoS 放大器。
+//
+// **不承担正确性**：预检与真正消费之间存在竞态（码可能在这中间被别人用掉），
+// 但那由 RegisterWithInvite 事务内的原子 UPDATE 兜住。这里只负责把明显无效的
+// 请求在花钱之前挡掉。
+func (s *Store) InviteUsable(ctx context.Context, code string) (bool, error) {
+	if code == "" {
+		return false, nil
+	}
+	var ok bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+		   SELECT 1 FROM invites
+		    WHERE code = $1
+		      AND used_count < max_uses
+		      AND (expires_at IS NULL OR expires_at > now())
+		 )`, code).Scan(&ok)
+	if err != nil {
+		return false, types.NewAppError(types.CodeDatabase, "预检邀请码", err)
+	}
+	return ok, nil
 }

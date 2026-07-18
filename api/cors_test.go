@@ -11,7 +11,7 @@ import (
 // 本包测试纪律：Deps.Store 是具体类型不 mock，触库行为靠真库或生产验收）。
 func corsMux(origin string) *http.ServeMux {
 	mux := http.NewServeMux()
-	Mount(mux, Deps{Password: "pw", Origin: origin})
+	Mount(mux, Deps{Origin: origin})
 	return mux
 }
 

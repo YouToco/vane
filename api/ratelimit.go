@@ -1,5 +1,15 @@
-// 登录限流：公网单密码 Dashboard 的 /api/auth/login 是唯一未鉴权入口，
-// 需要防在线暴力破解。这里用极简的 per-IP 滑动窗口计数（无外部依赖）。
+// 认证限流：/api/auth/login 与 /api/auth/register 是仅有的未鉴权入口，
+// 需要同时防「在线暴力破解」与「昂贵计算被当作 DoS 放大器」。
+//
+// 本文件在对抗式安全审查后重写，修掉三处 fail-open（审查员用真实实验实证）：
+//  1. **只计失败不计成功** → 持一份有效凭据即可无限次登录，每次跑一遍 19MiB 的
+//     argon2；实测 200 并发≈2.8-3.8 GiB 常驻，而同机还跑着 Postgres/Temporal/Caddy。
+//     限流器全程返回 allow=true，一个 429 都不会发。现改为**计入所有尝试**。
+//  2. **按完整 IP 计数** → 持有一个 IPv6 /64 的攻击者有 2^64 个源地址，
+//     每个都享有独立额度，限流形同虚设（审查员实测 500 个源地址放行 5000 次猜测）。
+//     现按 /64（v6）与 /32（v4）归一。
+//  3. **prune 只清当前键、无全局回收** → 每个出现过的 IP 永久驻留一条 map 项，
+//     实测约 172 B/条，千万次尝试≈1.7 GB 且只能靠重启释放。现加全局清扫。
 package api
 
 import (
@@ -10,67 +20,120 @@ import (
 	"time"
 )
 
-// loginLimiter 按客户端 IP 统计最近窗口内的失败次数，超阈值即拒绝。
-// 只在登录失败时计数，成功不计——正常用户输错几次仍可继续，攻击者的
-// 高频尝试会被挡下。窗口内存态，进程重启即清零（对 MVP 足够）。
-type loginLimiter struct {
+// authLimiter 按「限流键」统计最近窗口内的尝试次数，超阈值即拒绝。
+//
+// 计**所有尝试**而非只计失败：成本攻击不需要猜对密码，它需要的只是让服务器
+// 反复执行 argon2；只计失败等于给「已知正确凭据」开了一条无限带宽的放大通道。
+type authLimiter struct {
 	mu       sync.Mutex
-	fails    map[string][]time.Time
+	attempts map[string][]time.Time
 	window   time.Duration
-	maxFails int
+	max      int
+	lastSwep time.Time
 }
 
-func newLoginLimiter() *loginLimiter {
-	return &loginLimiter{
-		fails:    make(map[string][]time.Time),
+func newAuthLimiter() *authLimiter {
+	return &authLimiter{
+		attempts: make(map[string][]time.Time),
 		window:   time.Minute,
-		maxFails: 10, // 每 IP 每分钟最多 10 次失败尝试
+		max:      20, // 每键每分钟 20 次尝试（含成功）；正常人远低于此
 	}
 }
 
-// allow 报告该 IP 当前是否还允许尝试登录。
-func (l *loginLimiter) allow(ip string, now time.Time) bool {
+// allowAndRecord 原子地「判定 + 记账」。
+//
+// 合并成一个方法是刻意的：分开的 allow()/record() 之间存在窗口——高并发下
+// N 个请求可以同时通过 allow() 再各自记账，实测原限流器曾一次性放行 200 个并发。
+// 合并后每次调用都占一个额度，并发洪水在第 max+1 个就被拒。
+func (l *authLimiter) allowAndRecord(key string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.prune(ip, now)
-	return len(l.fails[ip]) < l.maxFails
+	l.sweepLocked(now)
+	l.pruneKeyLocked(key, now)
+	if len(l.attempts[key]) >= l.max {
+		return false
+	}
+	l.attempts[key] = append(l.attempts[key], now)
+	return true
 }
 
-// recordFailure 记一次失败；顺便清理过期条目防止 map 无界增长。
-func (l *loginLimiter) recordFailure(ip string, now time.Time) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.prune(ip, now)
-	l.fails[ip] = append(l.fails[ip], now)
-}
-
-// prune 丢弃窗口外的失败记录；清空后删除键，避免 map 随 IP 无限膨胀。
-func (l *loginLimiter) prune(ip string, now time.Time) {
+// pruneKeyLocked 丢弃该键窗口外的记录；清空即删键。
+func (l *authLimiter) pruneKeyLocked(key string, now time.Time) {
 	cutoff := now.Add(-l.window)
-	kept := l.fails[ip][:0]
-	for _, t := range l.fails[ip] {
+	kept := l.attempts[key][:0]
+	for _, t := range l.attempts[key] {
 		if t.After(cutoff) {
 			kept = append(kept, t)
 		}
 	}
 	if len(kept) == 0 {
-		delete(l.fails, ip)
+		delete(l.attempts, key)
 		return
 	}
-	l.fails[ip] = kept
+	l.attempts[key] = kept
+}
+
+// sweepLocked 周期性全表清扫。
+//
+// 原实现只在「该键被再次触碰」时才清理——而攻击者每次换一个新源地址，
+// 旧键永远不会被再次触碰，于是永久驻留。全局清扫是唯一能回收它们的机制。
+// 每窗口最多扫一次，摊薄到每次调用的成本可忽略。
+func (l *authLimiter) sweepLocked(now time.Time) {
+	if now.Sub(l.lastSwep) < l.window {
+		return
+	}
+	l.lastSwep = now
+	cutoff := now.Add(-l.window)
+	for k, ts := range l.attempts {
+		if len(ts) == 0 || !ts[len(ts)-1].After(cutoff) {
+			delete(l.attempts, k)
+		}
+	}
+}
+
+// ipLimitKey 是「来源」维度的限流键：IP 前缀（v6 /64、v4 /32）。
+// 挡的是「一个来源猜很多账号」。
+//
+// 为什么按 /64 而不是完整 IPv6 地址：IPv6 的最小分配单位通常就是 /64，
+// 一个普通 VPS 用户即持有 2^64 个可用源地址。按完整地址计数等于每个攻击者
+// 自带无限额度——审查员在本项目的真实 VPS 上实测确认了 IPv6 可达性
+// （直连 IPv6 字面量 + SNI，绕过缺失的 AAAA 记录）。
+func ipLimitKey(r *http.Request) string {
+	return ipPrefix(clientIP(r))
+}
+
+// accountLimitKey 是「账号」维度的限流键，**只按账号、不掺 IP**。
+//
+// 掺了 IP 就等于没做（这是我第一版写错、被自己的用例抓到的地方）：
+// 键若是 "IP|账号"，攻击者换个 IP 就得到一份全新额度，分布式猜同一个账号
+// 依旧无上限。两个维度必须真正正交——来源维度挡「一个源猜很多号」，
+// 账号维度挡「很多源猜一个号」。
+func accountLimitKey(account string) string {
+	return "acct|" + strings.ToLower(strings.TrimSpace(account))
+}
+
+// ipPrefix 把 IP 归一到限流前缀：IPv6 取 /64，IPv4 取完整地址（/32）。
+func ipPrefix(host string) string {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return host
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 // clientIP 取用于限流的客户端 IP（CWE-348：绝不能信任 X-Forwarded-For 最左段——
-// 那是攻击者可完全伪造的值，取它等于把登录爆破限流的键交给攻击者，每请求换一个"新 IP"
-// 即可绕过，或伪造受害者 IP 打满其失败额度做定向 429 锁定）。
+// 那是攻击者可完全伪造的值，取它等于把限流的键交给攻击者，每请求换一个"新 IP"
+// 即可绕过，或伪造受害者 IP 打满其额度做定向锁定）。
 // 部署拓扑是**单跳可信反代**（Caddy network_mode:host 反代 127.0.0.1:8080）：
 //   - 直连来自本机 loopback（即经 Caddy）→ 采信 XFF **最右段**：Caddy 把真实 peer IP
 //     追加到客户端已带的 XFF 之后，最右一跳才是 Caddy 亲自记录的真实来源，客户端伪造的
 //     值只能落在左侧、被忽略；
 //   - 直连非 loopback（如 8080 意外暴露公网被直击）→ 一律用 RemoteAddr、无视 XFF。
 //
-// 与 a2a/auth.go 的 clientIP 同源同逻辑（两处 auth 零交集、各自持一份）：A2A PR-3 审查
-// 在 a2a 侧修复时标注了本处存量同缺陷待跟进，此次一并修平。
+// 与 a2a/auth.go 的 clientIP 同源同逻辑（两处 auth 零交集、各自持一份）。
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

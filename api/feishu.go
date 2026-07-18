@@ -34,13 +34,19 @@ func decodeCredentials(w http.ResponseWriter, r *http.Request) (feishuCredential
 
 // handleFeishuStatus 返回当前连接状态。
 // GET /api/feishu/status → 200 feishu.Status JSON
-func (s *server) handleFeishuStatus(w http.ResponseWriter, _ *http.Request) {
+func (s *server) handleFeishuStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePlatformOwner(w, r) {
+		return
+	}
 	writeJSON(w, http.StatusOK, s.deps.Manager.Status())
 }
 
 // handleFeishuVerify 只校验凭证，不保存（向导第 3 步的[检测]按钮）。
 // POST /api/feishu/verify → 200 feishu.VerifyResult
 func (s *server) handleFeishuVerify(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePlatformOwner(w, r) {
+		return
+	}
 	creds, ok := decodeCredentials(w, r)
 	if !ok {
 		return
@@ -55,6 +61,9 @@ func (s *server) handleFeishuVerify(w http.ResponseWriter, r *http.Request) {
 // 但 BotOK=false（如应用尚未发布版本，activate_status=3）不阻塞保存——
 // 向导第 4 步发布后自然就绪（契约 §8 明确此取舍）。
 func (s *server) handleFeishuConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePlatformOwner(w, r) {
+		return
+	}
 	creds, ok := decodeCredentials(w, r)
 	if !ok {
 		return
@@ -98,6 +107,9 @@ func (s *server) handleFeishuConfig(w http.ResponseWriter, r *http.Request) {
 // handleFeishuTest 给 owner 发测试卡片（向导第 5 步）。
 // POST /api/feishu/test → 200 {"ok":true} / 409 尚无 owner
 func (s *server) handleFeishuTest(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePlatformOwner(w, r) {
+		return
+	}
 	if err := s.deps.Manager.SendTestCard(r.Context()); err != nil {
 		// 无 owner 是"流程未走到"而非故障，用 409 引导用户先发一条消息。
 		if errors.Is(err, types.ErrNotFound) {

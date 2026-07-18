@@ -119,7 +119,7 @@ type updateScheduleReq struct {
 // 为什么是 PATCH 而不是 PUT：请求体只承载调度的一部分字段（频率、描述），
 // scope/status 等不在其中，PUT 的"整体替换"语义会误导调用方。
 //
-// 与 DELETE 一致，M3 单 owner 不逐条校验归属（Dashboard 有密码门）。
+// 归属校验在 scheduler.UpdatePush 内、动 Temporal 之前完成（D2′ 起真多用户）。
 func (s *server) handleUpdateSchedule(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -137,7 +137,12 @@ func (s *server) handleUpdateSchedule(w http.ResponseWriter, r *http.Request) {
 		writeAppError(w, err)
 		return
 	}
-	if err := s.deps.Scheduler.UpdatePush(r.Context(), id, spec, req.NLDescription); err != nil {
+	userID, err := s.ownerUserID(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	if err := s.deps.Scheduler.UpdatePush(r.Context(), id, userID, spec, req.NLDescription); err != nil {
 		writeAppError(w, err)
 		return
 	}
@@ -154,7 +159,12 @@ func (s *server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "缺少 schedule id")
 		return
 	}
-	if err := s.deps.Scheduler.DeletePush(r.Context(), id); err != nil {
+	userID, err := s.ownerUserID(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	if err := s.deps.Scheduler.DeletePush(r.Context(), id, userID); err != nil {
 		writeAppError(w, err)
 		return
 	}

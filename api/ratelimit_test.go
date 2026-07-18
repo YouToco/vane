@@ -9,28 +9,30 @@ import (
 	"time"
 )
 
-func TestLoginLimiter(t *testing.T) {
-	l := newLoginLimiter()
+// TestAuthLimiter 覆盖新语义：**计所有尝试**（不再区分成功/失败）。
+//
+// 语义变更的理由见 ratelimit.go 头注：只计失败等于给「已知正确凭据」
+// 开了一条无限带宽的 argon2 放大通道。
+func TestAuthLimiter(t *testing.T) {
+	l := newAuthLimiter()
 	now := time.Now()
-	ip := "1.2.3.4"
+	key := "1.2.3.4"
 
-	// 前 maxFails 次尝试都应放行，逐次记失败。
-	for i := 0; i < l.maxFails; i++ {
-		if !l.allow(ip, now) {
+	// 前 max 次尝试放行，每次占一个额度。
+	for i := 0; i < l.max; i++ {
+		if !l.allowAndRecord(key, now) {
 			t.Fatalf("第 %d 次尝试应放行", i+1)
 		}
-		l.recordFailure(ip, now)
 	}
-	// 达到阈值后拒绝。
-	if l.allow(ip, now) {
-		t.Fatal("达到失败上限后应拒绝")
+	if l.allowAndRecord(key, now) {
+		t.Fatal("达到上限后应拒绝")
 	}
-	// 另一个 IP 不受影响（per-IP 隔离）。
-	if !l.allow("5.6.7.8", now) {
-		t.Fatal("不同 IP 不应被牵连")
+	// 另一个键不受影响。
+	if !l.allowAndRecord("5.6.7.8", now) {
+		t.Fatal("不同键不应被牵连")
 	}
 	// 窗口滑过后恢复。
-	if !l.allow(ip, now.Add(2*time.Minute)) {
+	if !l.allowAndRecord(key, now.Add(2*time.Minute)) {
 		t.Fatal("窗口过期后应恢复放行")
 	}
 }
@@ -72,9 +74,8 @@ func TestClientIP(t *testing.T) {
 // 但 Caddy 追加的真实 peer 恒定在最右，限流按最右段计数，连续失败仍被封成 429。
 func TestLoginLimiterNotBypassedBySpoofedXFF(t *testing.T) {
 	s := &server{
-		deps:     Deps{Password: "correct-horse-battery-staple"},
-		sessions: newSessions("correct-horse-battery-staple"),
-		limiter:  newLoginLimiter(),
+		deps:    Deps{Auth: newFakeAuthStore()},
+		limiter: newAuthLimiter(),
 	}
 	do := func(spoofLeft string) int {
 		body := strings.NewReader(`{"password":"wrong"}`)
@@ -87,7 +88,7 @@ func TestLoginLimiterNotBypassedBySpoofedXFF(t *testing.T) {
 		return rec.Code
 	}
 	// 前 maxFails 次失败尝试（各带不同伪造最左段）都应是普通的 401。
-	for i := 0; i < s.limiter.maxFails; i++ {
+	for i := 0; i < s.limiter.max; i++ {
 		if got := do(fmt.Sprintf("10.0.0.%d", i)); got != http.StatusUnauthorized {
 			t.Fatalf("第 %d 次失败应 401，实际 %d", i+1, got)
 		}

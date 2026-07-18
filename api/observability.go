@@ -59,6 +59,9 @@ func parseWindowHours(q url.Values) (time.Duration, string) {
 // 校验参数在解析 owner 之前：越界的 window_hours 无论有没有 owner 都是 400，
 // 先查 owner 只会让参数错误偶尔伪装成 409。
 func (s *server) handleObservability(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePlatformOwner(w, r) {
+		return
+	}
 	window, errMsg := parseWindowHours(r.URL.Query())
 	if errMsg != "" {
 		writeError(w, http.StatusBadRequest, errMsg)

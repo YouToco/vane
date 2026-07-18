@@ -87,9 +87,9 @@ func newObsMux(t *testing.T) (*http.ServeMux, *http.Cookie) {
 	t.Helper()
 	const pw = "obs-test-password"
 	mux := http.NewServeMux()
-	Mount(mux, Deps{Password: pw})
-	token, exp := newSessions(pw).issue(time.Now())
-	return mux, &http.Cookie{Name: sessionCookieName, Value: token, Expires: exp}
+	deps, cookie := authedDeps(t, Deps{})
+	Mount(mux, deps)
+	return mux, cookie
 }
 
 // TestObservabilityBadWindowHours 端到端验证越界参数回 400 + 人话错误体，

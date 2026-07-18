@@ -202,10 +202,12 @@ func run() error {
 
 	api.Mount(mux, api.Deps{
 		Store:     st,
+		Auth:      st,
 		Manager:   manager,
 		Scheduler: sched,
-		Principal: principals,
-		Password:  cfg.Dashboard.Password,
+		// HTTP 面的 principal 来自会话中间件注入的 ctx（企业级契约 §1.1 的最终形态）；
+		// a2a/gate 无 HTTP 会话，仍用 owner 回退——这正是把 principal 做成接口的价值。
+		Principal: auth.NewContextResolver(),
 		Origin:    cfg.Dashboard.Origin,
 	})
 
@@ -264,6 +266,12 @@ func run() error {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second, // 不设则空闲 keep-alive 连接永不回收
 	}
+
+	// 过期会话清理（安全审查发现：migration 019 为「清理任务」专门建了
+	// idx_user_sessions_expires 索引，而那个任务从未接线——DeleteExpiredSessions
+	// 全树只有测试在调，生产里过期行永不回收）。
+	// 用最朴素的 ticker：清理是幂等的纯删除，不值得为它引入 Temporal workflow。
+	go runSessionCleanup(ctx, st)
 
 	serveErr := make(chan error, 1)
 	go func() {
@@ -348,4 +356,35 @@ func writeJSON(w http.ResponseWriter, status int, body string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	io.WriteString(w, body) //nolint:errcheck // 响应写失败无从补救
+}
+
+// sessionCleanupInterval 是过期会话清理周期。
+// 1 小时足够：会话 TTL 是 30 天，过期行多留一小时无害，而更频繁的全表扫描
+// 对一台还跑着 Postgres/Temporal 的单 VPS 是纯浪费。
+const sessionCleanupInterval = time.Hour
+
+// runSessionCleanup 周期性删除过期会话，直到 ctx 取消。
+//
+// 失败只记日志不退出：清理是旁路维护，一次失败下轮再来；
+// 让它把进程带崩才是真的坏事。
+func runSessionCleanup(ctx context.Context, st *store.Store) {
+	t := time.NewTicker(sessionCleanupInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			n, err := st.DeleteExpiredSessions(cctx)
+			cancel()
+			if err != nil {
+				slog.Warn("清理过期会话失败（下轮重试）", "err", err)
+				continue
+			}
+			if n > 0 {
+				slog.Info("清理过期会话", "deleted", n)
+			}
+		}
+	}
 }

@@ -30,6 +30,9 @@ type runstatsResp struct {
 // 不解析 owner：llm_calls 的成本/延迟统计是系统级的（含无 user_id 的行），
 // 单用户阶段全库即 owner 视角；窗口校验复用 parseWindowHours（1h–30 天）。
 func (s *server) handleRunstats(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePlatformOwner(w, r) {
+		return
+	}
 	window, errMsg := parseWindowHours(r.URL.Query())
 	if errMsg != "" {
 		writeError(w, http.StatusBadRequest, errMsg)

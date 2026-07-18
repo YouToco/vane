@@ -111,7 +111,12 @@ type LogConfig struct {
 
 // DashboardConfig 是 Web Dashboard 配置。
 type DashboardConfig struct {
-	// Password 是 Dashboard 登录密码，环境变量 VANE_DASHBOARD_PASSWORD。
+	// Password 是**已废弃**的 Dashboard 共享密码（D2′ 换成邮箱+密码账号体系）。
+	//
+	// 保留字段而不直接删：生产环境仍设着 VANE_DASHBOARD_PASSWORD，
+	// viper 遇到未知键不报错、但留着字段能让「这个环境变量已无作用」这件事
+	// 在代码里可见。部署侧移除该变量后本字段即可删。
+	// Deprecated: 不再被任何代码读取，见 api/auth.go。
 	// 为空时不 fail（允许无 Dashboard 场景），api 层对登录一律 401。
 	Password string `mapstructure:"password"`
 	// Origin 是 Dashboard 前端的部署源（scheme+host），环境变量 VANE_DASHBOARD_ORIGIN。
@@ -257,11 +262,6 @@ func (c *Config) Validate() error {
 	}
 	if c.DB.URL == "" {
 		return errors.New("config: db.url 必填（可通过环境变量 VANE_DB_URL 设置）")
-	}
-	// 密码为空只告警不拒启动：允许纯后端（无 Dashboard）场景；
-	// api 层会在密码为空时对登录一律 401，不会形成裸奔入口。
-	if c.Dashboard.Password == "" {
-		slog.Warn("config: dashboard.password 未配置，Dashboard 登录将不可用（可通过环境变量 VANE_DASHBOARD_PASSWORD 设置）")
 	}
 	return nil
 }

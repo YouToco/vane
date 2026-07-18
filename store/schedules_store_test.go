@@ -67,7 +67,7 @@ func TestUpdateScheduleSpecStore(t *testing.T) {
 		if err := st.UpdateScheduleSpec(ctx, schedID, newSpec, nil); err != nil {
 			t.Fatalf("UpdateScheduleSpec() 失败: %v", err)
 		}
-		got, err := st.GetSchedule(ctx, schedID)
+		got, err := st.GetSchedule(ctx, schedID, u.ID)
 		if err != nil {
 			t.Fatalf("GetSchedule() 失败: %v", err)
 		}
@@ -92,7 +92,7 @@ func TestUpdateScheduleSpecStore(t *testing.T) {
 			json.RawMessage(`{"cron":"30 9 * * *"}`), &desc); err != nil {
 			t.Fatalf("UpdateScheduleSpec() 失败: %v", err)
 		}
-		got, err := st.GetSchedule(ctx, schedID)
+		got, err := st.GetSchedule(ctx, schedID, u.ID)
 		if err != nil {
 			t.Fatalf("GetSchedule() 失败: %v", err)
 		}

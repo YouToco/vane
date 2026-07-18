@@ -82,7 +82,8 @@ type scheduleStore interface {
 	ListSchedulesByUser(ctx context.Context, userID int64) ([]types.Schedule, error)
 	InsertSchedule(ctx context.Context, sc *types.Schedule) error
 	UpdateScheduleSpec(ctx context.Context, id string, spec json.RawMessage, nlDesc *string) error
-	DeleteSchedule(ctx context.Context, id string) error
+	DeleteSchedule(ctx context.Context, id string, userID int64) error
+	GetSchedule(ctx context.Context, id string, userID int64) (*types.Schedule, error)
 }
 
 // Scheduler 持有 Temporal client、任务队列名与 store（镜像用）。
@@ -250,8 +251,12 @@ func (s *Scheduler) TriggerPushNow(ctx context.Context, userID int64) (string, e
 //
 // 并发注意：Temporal SDK 明确警告并行 Update 同一 schedule 有竞态。单 owner MVP 下
 // 改调度是低频人工操作，不额外加锁；多用户/自动化改调度前需要补乐观锁（ConflictToken）。
-func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, spec ScheduleSpec, nlDesc *string) error {
+func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64, spec ScheduleSpec, nlDesc *string) error {
 	if err := validateSpec(spec); err != nil {
+		return err
+	}
+	// 归属校验先行，理由同 DeletePush（Temporal Update 同样先于镜像发生）。
+	if _, err := s.st.GetSchedule(ctx, schedID, userID); err != nil {
 		return err
 	}
 	sdkSpec, err := translateSpec(spec)
@@ -302,13 +307,22 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, spec Schedul
 	return nil
 }
 
-// DeletePush 删除调度：先 Temporal Delete，再删镜像（镜像删除失败只 slog）。
-func (s *Scheduler) DeletePush(ctx context.Context, schedID string) error {
+// DeletePush 删除调度：**先校验归属**，再 Temporal Delete，最后删镜像
+// （镜像删除失败只 slog）。
+//
+// 归属校验必须在动 Temporal 之前——Temporal 的删除不可逆，
+// 「先删后校验」等于校验失败时对方的调度已经没了，校验形同虚设。
+func (s *Scheduler) DeletePush(ctx context.Context, schedID string, userID int64) error {
+	// GetSchedule 带 user_id 谓词：不存在与不属于你归一为 NotFound，
+	// 不给调用方枚举他人调度 id 的机会。
+	if _, err := s.st.GetSchedule(ctx, schedID, userID); err != nil {
+		return err
+	}
 	h := s.c.ScheduleClient().GetHandle(ctx, schedID)
 	if err := h.Delete(ctx); err != nil {
 		return types.NewAppError(types.CodeInternal, "删除定时任务失败", err)
 	}
-	if err := s.st.DeleteSchedule(ctx, schedID); err != nil {
+	if err := s.st.DeleteSchedule(ctx, schedID, userID); err != nil {
 		slog.Error("scheduler: schedules 镜像删除失败（Temporal 已删除）", "schedule_id", schedID, "err", err)
 	}
 	return nil
