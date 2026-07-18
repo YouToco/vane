@@ -215,12 +215,29 @@ func (s *server) resolveTenant(r *http.Request, userID int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len(ms) == 0 {
+	switch len(ms) {
+	case 0:
 		// 有账号却无任何租户归属：数据不一致（注册流保证二者同事务产生）。
 		return 0, types.NewAppError(types.CodeConflict,
 			"账号尚未归属任何租户，请联系管理员", nil)
+	case 1:
+		return ms[0].TenantID, nil
+	default:
+		// **多租户成员：响亮失败，绝不替用户猜**。
+		//
+		// 原实现是 `return ms[0].TenantID`——静默选列表里的第一条。那意味着一个属于
+		// 两个租户的人会登进「碰巧排在前面」的那个，而且毫不知情：他看到的是一份
+		// 陌生的信源与推送历史，却没有任何提示告诉他「你在另一个租户里」。
+		//
+		// 这与写入侧的行为对齐（store/tenantderive.go）：那里的推导子查询在用户属于
+		// 多个租户时会因「returned more than one row」直接报错。同一件「尚未支持」的事，
+		// 两处必须都拦住，不能一处拦、一处骗。
+		//
+		// 解除条件：登录流支持「选择要进入哪个租户」（前端出选择页、会话记录选定值）。
+		// 届时本分支替换为「按请求参数选租户，并校验该用户确实是其成员」。
+		return 0, types.NewAppError(types.CodeConflict,
+			"该账号属于多个租户，当前版本尚不支持在登录时选择，请联系管理员", nil)
 	}
-	return ms[0].TenantID, nil
 }
 
 // issueSession 签发会话并下发 cookie。

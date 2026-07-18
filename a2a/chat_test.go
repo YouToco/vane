@@ -55,6 +55,10 @@ func (f *fakeOwner) GetSetting(_ context.Context, key string) (json.RawMessage, 
 	return json.RawMessage(`{"open_id":"ou_owner","name":"Boss"}`), nil
 }
 
+func (f *fakeOwner) ListMembershipsByUser(_ context.Context, userID int64) ([]types.Membership, error) {
+	return []types.Membership{{TenantID: 1, UserID: userID}}, nil
+}
+
 func (f *fakeOwner) UpsertUserByOpenID(_ context.Context, openID, name string) (*types.User, error) {
 	if f.upsertErr != nil {
 		return nil, f.upsertErr
