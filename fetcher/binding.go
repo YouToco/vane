@@ -50,7 +50,10 @@ type bindingSpec struct {
 	VerifyParam *verifyParam // 可选：条目字段与 config 参数对照，不符即丢（串号防御）
 	Fields      bindingFields
 	Kind        types.Kind
-	OrderCheck  bool // probe 时断言 Time 序列非增（仅模板语义承诺时序时开，见契约 §2.2）
+	OrderCheck  bool // probe + fetch 每轮断言 Time 序列非增（仅模板语义承诺时序时开，契约 §2.2/§4）
+	// MaxContentBytes 正文字节上限（0=不截断）。xhs 族沿用 4000（成本护栏）；
+	// x 不截断——旧 x.go 存推文全文，长文推被截是迁移回归（对抗审查 parity-4）。
+	MaxContentBytes int
 
 	Enrich *enrichSpec // 可选：付费详情补全
 }
@@ -71,7 +74,7 @@ type envelopeCheck struct{ Path, Want string }
 type fieldEquals struct{ Path, Want string }
 
 // verifyParam 把条目字段与 config 参数对照：字段非空且不等 → 丢弃该条
-//（xhs/user_posts 串号防御的通用化；字段为空宽容保留，靠身份兜底）。
+// （xhs/user_posts 串号防御的通用化；字段为空宽容保留，靠身份兜底）。
 type verifyParam struct {
 	Path      string
 	ConfigKey string
@@ -92,7 +95,7 @@ type bindingFields struct {
 }
 
 // urlQueryParam 是 URL 的条件查询组：组内任一 FromField 解析为空 → 整组略去
-//（xhs 直链的 xsec_token 语义：没有 token 时连 xsec_source 也不拼）。
+// （xhs 直链的 xsec_token 语义：没有 token 时连 xsec_source 也不拼）。
 // 按声明顺序手拼（不走 url.Values.Encode 的字典序），与旧 fetcher 逐字节一致。
 type urlQueryParam struct {
 	Key       string
@@ -107,7 +110,7 @@ const (
 )
 
 // enrichSpec 付费详情补全（契约 §3.6）。全部行为引擎实现：触发条件、计费闸门
-//（SeenChecker）、实例级限速、预算、串号校验、空值保旧。
+// （SeenChecker）、实例级限速、预算、串号校验、空值保旧。
 type enrichSpec struct {
 	Endpoint   string            // 详情端点 Entry.Name（同样每轮 Lookup + 参数校验）
 	KeyParam   string            // 接收条目 ID 的请求参数名
@@ -170,21 +173,22 @@ var bindingTemplates = map[bindingKey]bindingSpec{
 			Time:       []string{"timestamp"},
 			TimeFormat: tfUnixS,
 		},
-		Kind: types.KindArticle,
+		Kind:            types.KindArticle,
+		MaxContentBytes: tikhubMaxDescBytes,
 		Enrich: &enrichSpec{
 			// 只用 web_v3 这一个详情端点：app_v2 get_video_note_detail 对图文笔记会
 			// **静默返回别人的笔记**（200+success=true 照常计费，实测）——拿错比报错
 			// 危险得多。即便如此仍要 VerifyIDPath 校验返回的 note_id。
-			Endpoint:      "xiaohongshu_web_v3_fetch_note_detail",
-			KeyParam:      "note_id",
-			ItemParams:    map[string]string{"xsec_token": "xsec_token"},
-			Envelope:      xhsEnvelope,
-			MsgPath:       "data.msg",
-			RespItemsPath: "data.data.items",
-			RespRoot:      "note_card",
-			VerifyIDPath:  "note_id",
-			DescPath:      "desc",
-			MinRunes:      60, // 上游正截到 60 rune，「恰好 60」就是被截断的信号
+			Endpoint:         "xiaohongshu_web_v3_fetch_note_detail",
+			KeyParam:         "note_id",
+			ItemParams:       map[string]string{"xsec_token": "xsec_token"},
+			Envelope:         xhsEnvelope,
+			MsgPath:          "data.msg",
+			RespItemsPath:    "data.data.items",
+			RespRoot:         "note_card",
+			VerifyIDPath:     "note_id",
+			DescPath:         "desc",
+			MinRunes:         60, // 上游正截到 60 rune，「恰好 60」就是被截断的信号
 			RequireItemField: "xsec_token",
 			RateMs:           1100,
 			BudgetMs:         40000,
@@ -215,7 +219,8 @@ var bindingTemplates = map[bindingKey]bindingSpec{
 			Time:        []string{"create_time"},
 			TimeFormat:  tfUnixS,
 		},
-		Kind: types.KindArticle,
+		Kind:            types.KindArticle,
+		MaxContentBytes: tikhubMaxDescBytes,
 	},
 
 	// ── 迁移自 fetcher/x.go（响应结构契约 §9，多态字段实测）──
@@ -230,10 +235,10 @@ var bindingTemplates = map[bindingKey]bindingSpec{
 		// tweet_id → 同一原创推经多号转发只落一行 content_item。
 		Unwrap: []string{"retweeted_tweet", "retweeted"},
 		Fields: bindingFields{
-			ID:      []string{"tweet_id"},
-			Title:   nil, // 推文无标题
-			Content: []string{"text"},
-			Author:  []string{"author.screen_name", "$screen_name"}, // 作者缺失时回退所订账号
+			ID:          []string{"tweet_id"},
+			Title:       nil, // 推文无标题
+			Content:     []string{"text"},
+			Author:      []string{"author.screen_name", "$screen_name"}, // 作者缺失时回退所订账号
 			URLTemplate: "https://x.com/{author}/status/{id}",
 			Time:        []string{"created_at"},
 			TimeFormat:  tfRubyDate,
@@ -244,7 +249,7 @@ var bindingTemplates = map[bindingKey]bindingSpec{
 	// ── 首批新能力（2026-07-18 实测准入，契约 §7）──
 	{types.PlatformXHS, types.CapHotList}: {
 		Endpoint:  "xiaohongshu_web_v3_fetch_hot_list",
-		Params:    nil, // 无参数：全局一份热榜
+		Params:    nil,                                          // 无参数：全局一份热榜
 		Envelope:  []envelopeCheck{{Path: "code", Want: "200"}}, // web_v3 外壳无 data.success
 		ItemsPath: "data.items",
 		Fields: bindingFields{
@@ -255,7 +260,8 @@ var bindingTemplates = map[bindingKey]bindingSpec{
 			URLPaths: []string{"url"}, // 上游给的搜索落地页链接
 			// 无 Time：data.updated_at 实测坏值（滞后 date 字段 41 天），禁用。
 		},
-		Kind: types.KindArticle,
+		Kind:            types.KindArticle,
+		MaxContentBytes: tikhubMaxDescBytes,
 	},
 	{types.PlatformXHS, types.CapTopicFeed}: {
 		Endpoint: "xiaohongshu_app_v2_get_topic_feed",
@@ -275,8 +281,9 @@ var bindingTemplates = map[bindingKey]bindingSpec{
 			Time:        []string{"create_time"},
 			TimeFormat:  tfUnixMS, // 顶层 create_time 是毫秒（note_time.create_time 才是秒）
 		},
-		Kind:       types.KindArticle,
-		OrderCheck: true, // sort=time 承诺降序，probe 可检可拒（2026-07-18 实测严格降序）
+		Kind:            types.KindArticle,
+		OrderCheck:      true, // sort=time 承诺降序，probe+每轮 fetch 均断言（2026-07-18 实测严格降序）
+		MaxContentBytes: tikhubMaxDescBytes,
 	},
 	{types.PlatformXHS, types.CapFavedNotes}: {
 		Endpoint: "xiaohongshu_app_v2_get_user_faved_notes",
@@ -296,12 +303,13 @@ var bindingTemplates = map[bindingKey]bindingSpec{
 			TimeFormat:  tfUnixS,
 			// OrderCheck 关：收藏序≠创建序，实测非单调（契约 §7），检了必误拒。
 		},
-		Kind: types.KindArticle,
+		Kind:            types.KindArticle,
+		MaxContentBytes: tikhubMaxDescBytes,
 	},
 }
 
 // IsBindingBacked 报告 (platform, capability) 是否由绑定引擎承载
-//（agent 的试跑准入只对绑定能力生效，rss/exa 路径行为不变）。
+// （agent 的试跑准入只对绑定能力生效，rss/exa 路径行为不变）。
 func IsBindingBacked(p types.Platform, c types.Capability) bool {
 	_, ok := bindingTemplates[bindingKey{p, c}]
 	return ok
@@ -330,9 +338,10 @@ func WithBindingTrace(ctx context.Context, traceID string) context.Context {
 
 // BindingFetcher 执行绑定模板。除 enrich 限速状态外无可变状态，可并发复用。
 type BindingFetcher struct {
-	inv      *tikhubinvoke.Invoker
-	seen     SeenChecker
-	rec      BindingCallRecorder
+	inv       *tikhubinvoke.Invoker
+	seen      SeenChecker
+	rec       BindingCallRecorder
+	maxBody   int64 // 响应体上限（invoke 读 cap+1，超出即显式报错）
 	apiKeySet bool
 
 	// enrich 限速是**实例级**闸门（跨源、跨 Fetch 调用共享）：Multi 只持有一个
@@ -347,11 +356,27 @@ type BindingFetcher struct {
 
 // NewBinding 构造绑定引擎。seen 为 nil 时跳过 enrich（无从判断新旧就不重复付费）；
 // rec 为 nil 时不记账。invOpts 供测试注入 baseURL（生产不传）。
+// 超时/响应上限对齐旧抓取器口径（cfg 可配，兜底 20s / 5MB——对抗审查 parity-5：
+// 不能静默降为 lookup 面的 2MiB 且超限必须显式报错而非截断喂给 JSON 解码器）。
 func NewBinding(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorder, invOpts ...tikhubinvoke.Option) *BindingFetcher {
+	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	maxMB := cfg.MaxResponseMB
+	if maxMB <= 0 {
+		maxMB = 5
+	}
+	maxBody := int64(maxMB) * 1024 * 1024
+	opts := append([]tikhubinvoke.Option{
+		tikhubinvoke.WithTimeout(timeout),
+		tikhubinvoke.WithBodyCap(maxBody),
+	}, invOpts...)
 	return &BindingFetcher{
-		inv:       tikhubinvoke.New(cfg, invOpts...),
+		inv:       tikhubinvoke.New(cfg, opts...),
 		seen:      seen,
 		rec:       rec,
+		maxBody:   maxBody,
 		apiKeySet: cfg.TikhubAPIKey != "",
 	}
 }
@@ -364,9 +389,23 @@ func (b *BindingFetcher) Fetch(ctx context.Context, src types.Source) ([]types.C
 
 // ProbeReport 是试跑结果摘要（进确认回执，用户看得见首批统计——契约 §2.2）。
 type ProbeReport struct {
-	Extracted    int        // 提取并通过身份校验的条目数
-	Newest       *time.Time // 最新一条时间（模板无 Time 时为 nil）
-	SampleTitles []string   // 标题样例（≤3，可能为空串列表——推文无标题）
+	Extracted       int        // 提取并通过身份校验的条目数
+	IdentityMissing int        // 身份字段为空被丢弃的条目数（契约 §2.2 计数项）
+	Newest          *time.Time // 最新一条时间（模板无 Time 时为 nil）
+	SampleTitles    []string   // 标题样例（≤3，可能为空串列表——推文无标题）
+}
+
+// ProbeRejection 标记「给用户看的准入拒绝」（红线 3 的实现载体，对抗审查 HIGH-3）：
+// 只有带此标记的错误，其 Message 才允许原样进用户/模型面；其余错误（漂移/网络/
+// 鉴权——内嵌端点名、上游 body、内部 id）一律由调用方按错误码映射固定话术，
+// 原文只进 slog 与 tool_calls。errors.Is/As 经 Unwrap 照常穿透。
+type ProbeRejection struct{ AE *types.AppError }
+
+func (p *ProbeRejection) Error() string { return p.AE.Error() }
+func (p *ProbeRejection) Unwrap() error { return p.AE }
+
+func probeReject(msg string) error {
+	return &ProbeRejection{AE: types.NewAppError(types.CodeValidation, msg, nil)}
 }
 
 // Probe 试跑一次绑定源（真调上游，计费且记账）。任何准入检查不过都返回
@@ -403,6 +442,14 @@ func (b *BindingFetcher) run(ctx context.Context, src types.Source, probe bool) 
 	}
 	params, err := resolveParams(spec.Params, cfgMap, src)
 	if err != nil {
+		// 缺参数的话术本就是给人看的（「信源缺少必填参数 user_id」）——probe 面
+		// 标记为可透出（其余错误在 probe 面一律映射固定话术，见 ProbeRejection）。
+		if probe {
+			var ae *types.AppError
+			if errors.As(err, &ae) {
+				err = &ProbeRejection{AE: ae}
+			}
+		}
 		return nil, nil, err
 	}
 	if err := validateAgainstEntry(entry, params, src); err != nil {
@@ -424,14 +471,16 @@ func (b *BindingFetcher) run(ctx context.Context, src types.Source, probe bool) 
 
 	type extracted struct {
 		item    types.ContentItem
-		raw     any    // 条目原始对象（enrich 的 ItemParams / RequireItemField 从这取）
+		raw     any // 条目原始对象（enrich 的 ItemParams / RequireItemField 从这取）
 		id      string
 		content string
 	}
 	var (
-		cands        []extracted
-		filtered     int
-		timeFailures int
+		cands           []extracted
+		filtered        int // 仅 ItemFilter 不匹配（多态流合法形态，不是漂移）
+		rootMisses      int // ItemRoot 下钻失败（过滤已通过——这是结构漂移信号，对抗审查 HIGH-1）
+		identityMissing int // 身份字段为空的条目（契约 §3.5 要求计数可见）
+		timeFailures    int
 	)
 	now := time.Now().UTC()
 	for _, ri := range rawItems {
@@ -447,7 +496,9 @@ func (b *BindingFetcher) run(ctx context.Context, src types.Source, probe bool) 
 		if spec.ItemRoot != "" {
 			sub, ok := resolvePath(it, spec.ItemRoot)
 			if !ok || sub == nil {
-				filtered++
+				// 过滤已通过却下钻失败：不是多态流，是「note 子对象改名」级的结构
+				// 漂移信号——**不并入 filtered**，否则候选全灭防线被整体绕过。
+				rootMisses++
 				continue
 			}
 			it = sub
@@ -478,7 +529,8 @@ func (b *BindingFetcher) run(ctx context.Context, src types.Source, probe bool) 
 
 		id := strings.TrimSpace(chainString(it, spec.Fields.ID, cfgMap))
 		if id == "" {
-			continue // 无身份的条目由 finalize 统一拒绝口径，这里早退省事（计入候选差额）。
+			identityMissing++ // 无身份的条目由 finalize 统一拒绝口径，这里早退省事。
+			continue
 		}
 		content := chainString(it, spec.Fields.Content, cfgMap)
 		author := chainString(it, spec.Fields.Author, cfgMap)
@@ -520,23 +572,47 @@ func (b *BindingFetcher) run(ctx context.Context, src types.Source, probe bool) 
 	}
 
 	// 反漂移防线 3：有条目但候选全灭 = 身份/结构漂移，不是安静的空轮（契约 §3.5）。
-	// 全部被 ItemFilter 挡掉不算（一屏全是广告位是多态流的合法形态）。
+	// **只有** ItemFilter 挡掉的不算（一屏全是广告位是多态流的合法形态）；
+	// rootMisses/identityMissing 都是漂移证据，必须触发防线而非豁免。
 	if len(rawItems) > 0 && len(cands) == 0 && filtered < len(rawItems) {
 		return nil, nil, types.NewAppError(types.CodeValidation,
-			fmt.Sprintf("条目全部无法提取身份（%d 条，endpoint=%s，source_id=%d）——疑似响应结构漂移",
-				len(rawItems), spec.Endpoint, src.ID), nil)
+			fmt.Sprintf("条目全部无法提取（%d 条：下钻失败 %d、身份缺失 %d，endpoint=%s，source_id=%d）——疑似响应结构漂移",
+				len(rawItems), rootMisses, identityMissing, spec.Endpoint, src.ID), nil)
+	}
+	if identityMissing > 0 {
+		slog.Warn("binding: 部分条目身份字段为空已丢弃",
+			"source_id", src.ID, "endpoint", spec.Endpoint, "identity_missing", identityMissing)
 	}
 	if len(spec.Fields.Time) > 0 && len(cands) > 0 && timeFailures == len(cands) {
 		return nil, nil, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("时间字段 %q 全部解析失败（格式 %s，endpoint=%s，source_id=%d）——疑似响应结构漂移",
 				spec.Fields.Time[0], spec.Fields.TimeFormat, spec.Endpoint, src.ID), nil)
 	}
-
 	if probe {
-		report, err := buildProbeReport(spec, len(cands), func(i int) (*time.Time, string) {
+		report, err := buildProbeReport(spec, len(cands), identityMissing, func(i int) (*time.Time, string) {
 			return cands[i].item.PublishedAt, cands[i].item.Title
 		})
 		return nil, report, err
+	}
+
+	// 运行期时序断言（契约 §4 表第 4 行，对抗审查 HIGH-2）：OrderCheck 模板的
+	// sort=time 语义承诺降序；准入后上游排序腐坏（x/search 教训本尊：probe 单次
+	// 全绿、多轮才暴露）唯一可检面就是每轮这条——失败走 fail_count 告警链。
+	// probe 路径由 buildProbeReport 做同一断言（用户话术版），此处只管 fetch 轮次。
+	if spec.OrderCheck && len(spec.Fields.Time) > 0 {
+		var prev *time.Time
+		for i := range cands {
+			t := cands[i].item.PublishedAt
+			if t == nil {
+				continue
+			}
+			if prev != nil && t.After(*prev) {
+				return nil, nil, types.NewAppError(types.CodeValidation,
+					fmt.Sprintf("条目时间序列非降序（endpoint=%s，source_id=%d）——上游排序疑似腐坏，无法继续追新",
+						spec.Endpoint, src.ID), nil)
+			}
+			prev = t
+		}
 	}
 
 	// enrich 在指纹计算（finalize）之前：content_hash/simhash 必须基于全文，
@@ -556,7 +632,10 @@ func (b *BindingFetcher) run(ctx context.Context, src types.Source, probe bool) 
 	out := make([]types.ContentItem, 0, len(cands))
 	for i := range cands {
 		item := cands[i].item
-		item.Content = truncateUTF8(cands[i].content, tikhubMaxDescBytes)
+		item.Content = cands[i].content
+		if spec.MaxContentBytes > 0 {
+			item.Content = truncateUTF8(item.Content, spec.MaxContentBytes)
+		}
 		if !finalize(src, &item) {
 			continue
 		}
@@ -569,12 +648,13 @@ func (b *BindingFetcher) run(ctx context.Context, src types.Source, probe bool) 
 }
 
 // buildProbeReport 执行准入检查并汇总试跑摘要（契约 §2.2）。
-func buildProbeReport(spec bindingSpec, n int, get func(int) (*time.Time, string)) (*ProbeReport, error) {
+// 拒绝一律走 probeReject（用户话术，可透出）；不含端点名/上游原文。
+func buildProbeReport(spec bindingSpec, n, identityMissing int, get func(int) (*time.Time, string)) (*ProbeReport, error) {
 	if n == 0 {
-		return nil, types.NewAppError(types.CodeValidation,
-			"试跑返回 0 条内容：请检查参数是否正确（话题 page_id / 用户 user_id），或目标（如收藏列表）可能未公开", nil)
+		return nil, probeReject(
+			"试跑返回 0 条内容：请检查参数是否正确（话题 page_id / 用户 user_id），或目标（如收藏列表）可能未公开")
 	}
-	report := &ProbeReport{Extracted: n}
+	report := &ProbeReport{Extracted: n, IdentityMissing: identityMissing}
 	var prev *time.Time
 	orderOK := true
 	for i := 0; i < n; i++ {
@@ -595,8 +675,7 @@ func buildProbeReport(spec bindingSpec, n int, get func(int) (*time.Time, string
 	if spec.OrderCheck && !orderOK {
 		// x/search 教训：端点 200、条目像样，但时序乱掉的源做不了追新——
 		// 单次试跑对顺序病唯一可检的就是这条，检不过宁可拒。
-		return nil, types.NewAppError(types.CodeValidation,
-			"试跑内容的时间序列不是降序，该端点当前不适合做追新订阅（上游排序异常）", nil)
+		return nil, probeReject("试跑内容的时间序列不是降序，该端点当前不适合做追新订阅（上游排序异常）")
 	}
 	return report, nil
 }
@@ -638,6 +717,11 @@ func (b *BindingFetcher) callAndDecode(ctx context.Context, entry tikhubcatalog.
 		return nil, ae
 	}
 
+	if int64(len(res.Body)) > b.maxBody {
+		return nil, types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("TikHub 端点 %s 响应体超过 %d 字节上限", entry.Name, b.maxBody), nil)
+	}
+
 	root, err := decodeUseNumber(res.Body)
 	if err != nil {
 		ae := types.NewAppError(types.CodeFetchTimeout,
@@ -665,12 +749,24 @@ func (b *BindingFetcher) callAndDecode(ctx context.Context, entry tikhubcatalog.
 }
 
 // record 写一行 tool_calls（契约 §5）。失败只记日志，绝不放大成抓取失败。
+// 两处加固（对抗审查 parity-7 / cs-13）：
+//   - WithoutCancel：超时/取消的调用恰恰最该记账，不能因业务 ctx 已死而丢行；
+//   - 参数净化：config 值可能带 NUL（Postgres JSONB 拒收 \x00），落库前剥离。
 func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, params map[string]any, res *tikhubinvoke.Result, callErr error, src types.Source) {
 	if b.rec == nil {
 		return
 	}
+	ctx = context.WithoutCancel(ctx)
 	trace, _ := ctx.Value(bindingTraceKey).(string)
-	args, _ := json.Marshal(params)
+	clean := make(map[string]any, len(params))
+	for k, v := range params {
+		if s, isStr := v.(string); isStr {
+			clean[k] = strings.ToValidUTF8(strings.ReplaceAll(s, "\x00", ""), "�")
+		} else {
+			clean[k] = v
+		}
+	}
+	args, _ := json.Marshal(clean)
 	rec := &types.ToolCall{
 		TraceID:      trace,
 		ToolName:     "binding:" + entry.Name,
@@ -694,7 +790,7 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 		} else {
 			rec.ErrorType = types.ToolErrInternal
 		}
-		rec.Error = truncateUTF8(callErr.Error(), 500)
+		rec.Error = strings.ToValidUTF8(strings.ReplaceAll(truncateUTF8(callErr.Error(), 500), "\x00", ""), "�")
 	}
 	b.rec.RecordBindingCall(ctx, rec)
 }
@@ -711,6 +807,17 @@ func (b *BindingFetcher) enrich(ctx context.Context, src types.Source, es *enric
 	if !ok {
 		slog.Warn("binding: 详情端点已从注册表移除，跳过本轮补全",
 			"source_id", src.ID, "endpoint", es.Endpoint)
+		return
+	}
+	// 与主调用同一道反漂移防线（契约 §3.6「同样每轮 Lookup + 参数校验」）：
+	// re-gen 改了详情端点参数名时显式跳过（降级不失败），而不是静默丢参白花钱。
+	nameProbe := map[string]any{es.KeyParam: ""}
+	for k := range es.ItemParams {
+		nameProbe[k] = ""
+	}
+	if err := validateAgainstEntry(entry, nameProbe, src); err != nil {
+		slog.Warn("binding: 详情端点参数与注册表不符（re-gen 漂移？），跳过本轮补全",
+			"source_id", src.ID, "endpoint", es.Endpoint, "err", err)
 		return
 	}
 
@@ -804,7 +911,7 @@ func (b *BindingFetcher) waitDetailSlot(ctx context.Context, interval time.Durat
 }
 
 // fetchDetail 取单条详情正文。任何异常返回 error 交调用方降级，不重试
-//（补全尽力而为，重试只会加剧限流并翻倍成本）。
+// （补全尽力而为，重试只会加剧限流并翻倍成本）。
 func (b *BindingFetcher) fetchDetail(ctx context.Context, src types.Source, entry tikhubcatalog.Entry, es *enrichSpec, id string, raw any) (string, error) {
 	params := map[string]any{es.KeyParam: id}
 	for k, path := range es.ItemParams {
@@ -924,7 +1031,12 @@ func resolvePath(root any, path string) (any, bool) {
 func resolveList(root any, path string) ([]any, bool) {
 	v, ok := resolvePath(root, path)
 	if !ok {
-		return nil, false
+		return nil, false // 键不存在：字段被改名/移除，是结构漂移
+	}
+	if v == nil {
+		// 显式 JSON null：字段还在、这轮没有内容（X 静默账号的 timeline 实测形态，
+		// 旧 x.go 对此返回空成功）。与「键缺失」严格区分——null 合法，缺失才是漂移。
+		return nil, true
 	}
 	l, ok := v.([]any)
 	return l, ok
@@ -995,7 +1107,7 @@ func renderTemplate(tmpl string, item any) string {
 }
 
 // buildURLQuery 拼条件查询组：任一 FromField 为空 → 整组略去。按声明顺序手拼
-//（不走 url.Values.Encode 的字典序），与旧 fetcher 的 URL 逐字节一致。
+// （不走 url.Values.Encode 的字典序），与旧 fetcher 的 URL 逐字节一致。
 func buildURLQuery(item any, qs []urlQueryParam) string {
 	if len(qs) == 0 {
 		return ""
@@ -1069,7 +1181,7 @@ func parseBindingTime(v any, format string) (*time.Time, error) {
 }
 
 // parseUnixSeconds 把 Unix 秒转为 *time.Time；0 或负值视为未提供（列可空）。
-//（迁移自原 tikhub.go，xhs 族与 enrich 判据共用。）
+// （迁移自原 tikhub.go，xhs 族与 enrich 判据共用。）
 func parseUnixSeconds(sec int64) *time.Time {
 	if sec <= 0 {
 		return nil
@@ -1091,7 +1203,7 @@ const tikhubMaxDescBytes = 4000
 // 跳过，一次瞬时 429 就让它终身停在摘要且再无自愈路径。
 // 按 canonical_key（全局身份）而非 (source_id, external_id) 查是 M5 多用户重构的
 // 关键：跨源命中同一篇时第一个源补全、其余全部跳过，不重复付费。
-//（迁移自原 tikhub.go，语义原样。）
+// （迁移自原 tikhub.go，语义原样。）
 type SeenChecker interface {
 	EnrichedCanonicalKeys(ctx context.Context, keys []string, minRunes int) (map[string]struct{}, error)
 }

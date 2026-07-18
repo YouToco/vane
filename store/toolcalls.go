@@ -1,8 +1,9 @@
 package store
 
 import (
-	"log/slog"
 	"context"
+	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/YouToco/vane/types"
@@ -63,6 +64,10 @@ func (s *Store) CountTikHubEndpointCallsSince(ctx context.Context, since time.Ti
 // 调用同步落一行 tool_calls（endpoint-binding-contract.md §5）。失败只记日志——
 // 记账是旁路可观测性，绝不放大成抓取失败（与 agent ToolCallRecorder 同一纪律）。
 func (s *Store) RecordBindingCall(ctx context.Context, rec *types.ToolCall) {
+	// 兜底净化（引擎侧已净化参数，此处双保险）：上游错误文案可能带 NUL/非法 UTF-8，
+	// Postgres TEXT 拒收会让整行记账丢失——恰好丢掉最该记账的失败调用。
+	rec.Error = strings.ToValidUTF8(strings.ReplaceAll(rec.Error, "\x00", ""), "�")
+	rec.ResultPreview = strings.ToValidUTF8(strings.ReplaceAll(rec.ResultPreview, "\x00", ""), "�")
 	if _, err := s.InsertToolCall(ctx, rec); err != nil {
 		slog.Warn("tool_calls 绑定抓取记账失败（旁路，不影响抓取）",
 			"tool", rec.ToolName, "endpoint", rec.EndpointPath, "err", err)

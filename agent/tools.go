@@ -229,7 +229,8 @@ const probeBudget = 10 * time.Second
 
 func (t *addSourceTool) Name() string { return "add_source" }
 func (t *addSourceTool) Description() string {
-	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts/contents）。" +
+	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts/contents/hot_list/topic_feed/faved_notes）。" +
+		"绑定类能力（xhs 的 hot_list/topic_feed/faved_notes 等）在确认后会先真实试跑一次，通过才落库。" +
 		unavailableCapabilitiesNote()
 }
 
@@ -307,17 +308,29 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 		return msg, nil
 	}
 
-	// 试跑=准入（契约 §2.2）：绑定能力先真调一次上游，全过才落库；失败不落任何行，
-	// 拒绝话术是给用户的人话（AppError.Message，红线 3：原始错误链不进用户面）。
+	// 试跑=准入（契约 §2.2）：绑定能力先真调一次上游，全过才落库；失败不落任何行。
+	// 红线 3（对抗审查 HIGH-3）：只有 ProbeRejection（准入话术）可原样透出；其余错误
+	// （漂移/网络/鉴权——内嵌端点名、上游 body）按错误码映射固定人话，原文只进 slog
+	// 与 tool_calls（记账在引擎内完成）。
 	var probeNote string
 	if fetcher.IsBindingBacked(src.Platform, src.Capability) && t.prober != nil {
 		probeCtx, cancel := context.WithTimeout(ctx, probeBudget)
+		// 记账 trace = 会话 trace（契约 §5）：probe 的计费调用可关联回发起会话。
+		if m, ok := ctx.Value(chatMetaKey{}).(chatMeta); ok {
+			probeCtx = fetcher.WithBindingTrace(probeCtx, m.traceID)
+		}
 		report, perr := t.prober.Probe(probeCtx, *src)
 		cancel()
 		if perr != nil {
+			slog.Warn("add_source: 试跑未通过",
+				"platform", src.Platform, "capability", src.Capability, "err", perr)
+			var pr *fetcher.ProbeRejection
+			if errors.As(perr, &pr) {
+				return "试跑未通过，未添加信源：" + pr.AE.Message, nil
+			}
 			var ae *types.AppError
 			if errors.As(perr, &ae) {
-				return "试跑未通过，未添加信源：" + ae.Message, nil
+				return "试跑未通过，未添加信源：" + probeUserText(ae), nil
 			}
 			return "", perr
 		}
@@ -353,6 +366,19 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 
 // cstZone 回执时间用东八区（Boss 在国内看卡片，UTC 时间读起来像穿越）。
 func cstZone() *time.Location { return time.FixedZone("CST", 8*3600) }
+
+// probeUserText 把非准入类的试跑失败映射成固定人话（红线 3）：这些错误的 Message
+// 是为管理员 fail_count 通道写的，内嵌端点名/上游 body/内部 id，不得进用户/模型面。
+func probeUserText(ae *types.AppError) string {
+	switch ae.Code {
+	case types.CodeFetchRateLimit:
+		return "上游暂时限流，请稍后再试"
+	case types.CodeFetchTimeout:
+		return "上游暂时不可达或响应异常，请稍后再试"
+	default:
+		return "参数可能有误或该能力暂时不可用，请检查后重试；若反复失败请联系管理员"
+	}
+}
 
 func (t *addSourceTool) Summarize(args json.RawMessage) string {
 	var a addSourceArgs

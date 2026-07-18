@@ -41,15 +41,35 @@ type Invoker struct {
 	hc      *http.Client
 	baseURL string
 	apiKey  string
+	bodyCap int64 // 响应体读取上限；读到 cap+1 截止（见 WithBodyCap）
 }
 
-// Option 构造选项。目前唯一用途是测试注入 httptest.Server 地址
-//（绑定引擎的测试在 fetcher 包，够不到本包私有字段）。
+// Option 构造选项：测试注入 baseURL；绑定引擎（fetcher）对齐旧抓取器的
+// 超时/响应上限配置（agent lookup 面不传，保持 20s/2MiB 默认不变）。
 type Option func(*Invoker)
 
 // WithBaseURL 覆盖上游地址（仅测试）。
 func WithBaseURL(u string) Option {
 	return func(v *Invoker) { v.baseURL = u }
+}
+
+// WithTimeout 覆盖单次调用超时（绑定引擎：cfg.Fetch.TimeoutSeconds）。
+func WithTimeout(d time.Duration) Option {
+	return func(v *Invoker) {
+		if d > 0 {
+			v.hc.Timeout = d
+		}
+	}
+}
+
+// WithBodyCap 覆盖响应体读取上限（绑定引擎：cfg.Fetch.MaxResponseMB）。
+// 读取按 cap+1 截止，调用方可据 len(Body)>cap 显式判超限而非静默截断。
+func WithBodyCap(n int64) Option {
+	return func(v *Invoker) {
+		if n > 0 {
+			v.bodyCap = n
+		}
+	}
 }
 
 // New 构造调用器，复用抓取配置里的 TikHub key（同一账号同一计费池）。
@@ -62,6 +82,7 @@ func New(cfg config.FetchConfig, opts ...Option) *Invoker {
 		}},
 		baseURL: defaultBaseURL,
 		apiKey:  cfg.TikhubAPIKey,
+		bodyCap: maxBodyBytes,
 	}
 	for _, o := range opts {
 		o(inv)
@@ -107,7 +128,11 @@ func (v *Invoker) Invoke(ctx context.Context, entry tikhubcatalog.Entry, params 
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	cap := v.bodyCap
+	if cap <= 0 {
+		cap = maxBodyBytes // 零值兜底：结构体直构（含旧测试）不经 New 的默认赋值
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, cap+1))
 	if err != nil {
 		return nil, types.NewAppError(types.CodeInternal,
 			fmt.Sprintf("TikHub 端点 %s 响应读取失败", entry.Name), err)

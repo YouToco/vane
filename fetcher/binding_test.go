@@ -708,3 +708,135 @@ func TestBinding_RecorderLogsHTTPError(t *testing.T) {
 		t.Errorf("HTTP 错误应记账为 http_error: %+v", rec.rows)
 	}
 }
+
+// ────────── 对抗审查修复的回归锁定（2026-07-18 两怀疑者审查）──────────
+
+func TestBinding_Drift_ItemRootRenamed(t *testing.T) {
+	// HIGH-1：过滤通过但 ItemRoot 下钻全部失败（上游改名 note 子对象）必须触发
+	// 防线 3，绝不能被并进 filtered 豁免成静默空成功。
+	body := `{"code":200,"data":{"success":true,"msg":null,"data":{"items":[
+	  {"model_type":"note","note_v2":{"id":"aaaaaaaaaaaaaaaaaaaaaaaa"}},
+	  {"model_type":"note","note_v2":{"id":"bbbbbbbbbbbbbbbbbbbbbbbb"}}
+	]}}}`
+	up := newFakeUpstream()
+	up.bodies[pathSearch] = body
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	_, err := b.Fetch(context.Background(), bindingSrc(types.CapSearch, `{"keyword":"k"}`))
+	if !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("ItemRoot 全灭应 CodeValidation（结构漂移），实际 %v", err)
+	}
+}
+
+func TestBinding_Fetch_OrderCheckEveryRound(t *testing.T) {
+	// HIGH-2：OrderCheck 模板的时序断言必须在 fetch 每轮生效（准入后排序腐坏可检），
+	// 不只是 probe 一次性。
+	body := `{"code":200,"data":{"success":true,"msg":null,"data":{"items":[
+	  {"id":"aaaaaaaaaaaaaaaaaaaaaaaa","title":"旧","desc":"x","create_time":1000000000000,"user":{"nickname":"n"}},
+	  {"id":"bbbbbbbbbbbbbbbbbbbbbbbb","title":"新","desc":"x","create_time":2000000000000,"user":{"nickname":"n"}}
+	]}}}`
+	up := newFakeUpstream()
+	up.bodies[pathTopic] = body
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	_, err := b.Fetch(context.Background(), bindingSrc(types.CapTopicFeed, `{"page_id":"x"}`))
+	if !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("fetch 轮次时序违例应 CodeValidation 走告警链，实际 %v", err)
+	}
+	// faved（OrderCheck 关）不受影响由 TestBinding_FavedNotes（非单调 fixture）保证。
+}
+
+func TestBinding_Twitter_NullTimelineIsQuietRound(t *testing.T) {
+	// 分票核实：安静的 X 账号 timeline 可能为 JSON null——是合法空轮（旧 x.go 行为），
+	// 不是结构漂移；键整个缺失才是漂移。
+	up := newFakeUpstream()
+	up.bodies[pathTwitter] = `{"code":200,"data":{"status":"ok","timeline":null}}`
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	items, err := b.Fetch(context.Background(), types.Source{
+		ID: 7, Platform: types.PlatformX, Capability: types.CapUserPosts,
+		Config: json.RawMessage(`{"screen_name":"quiet"}`),
+	})
+	if err != nil || len(items) != 0 {
+		t.Fatalf("timeline=null 应为空成功，实际 err=%v items=%d", err, len(items))
+	}
+
+	up.bodies[pathTwitter] = `{"code":200,"data":{"status":"ok"}}`
+	if _, err := b.Fetch(context.Background(), types.Source{
+		ID: 7, Platform: types.PlatformX, Capability: types.CapUserPosts,
+		Config: json.RawMessage(`{"screen_name":"quiet"}`),
+	}); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("timeline 键缺失应判结构漂移，实际 %v", err)
+	}
+}
+
+func TestBinding_Twitter_LongContentNotTruncated(t *testing.T) {
+	// 分票核实（parity）：旧 x.go 存推文全文，长文推不得被 xhs 族的 4000 字节截断。
+	long := strings.Repeat("a", 6000)
+	body := `{"code":200,"data":{"status":"ok","timeline":[
+	  {"tweet_id":"t1","text":"` + long + `","created_at":"Wed Jul 15 17:30:00 +0000 2026","author":{"screen_name":"OpenAI"}}
+	]}}`
+	up := newFakeUpstream()
+	up.bodies[pathTwitter] = body
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	items, err := b.Fetch(context.Background(), types.Source{
+		ID: 7, Platform: types.PlatformX, Capability: types.CapUserPosts,
+		Config: json.RawMessage(`{"screen_name":"OpenAI"}`),
+	})
+	if err != nil || len(items) != 1 {
+		t.Fatal(err)
+	}
+	if len(items[0].Content) != 6000 {
+		t.Errorf("推文全文被截断: %d 字节", len(items[0].Content))
+	}
+}
+
+func TestBinding_XHSContentTruncatedAt4000(t *testing.T) {
+	long := strings.Repeat("b", 6000)
+	body := `{"code":200,"data":{"success":true,"msg":null,"data":{"notes":[
+	  {"id":"aaaaaaaaaaaaaaaaaaaaaaaa","title":"t","desc":"` + long + `","create_time":1,"user":{"nickname":"n"}}
+	]}}}`
+	up := newFakeUpstream()
+	up.bodies[pathFaved] = body
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	items, err := b.Fetch(context.Background(), bindingSrc(types.CapFavedNotes, `{"user_id":"u"}`))
+	if err != nil || len(items) != 1 {
+		t.Fatal(err)
+	}
+	if len(items[0].Content) != 4000 {
+		t.Errorf("xhs 正文应截断到 4000 字节（成本护栏），实际 %d", len(items[0].Content))
+	}
+}
+
+func TestBinding_ProbeRejectionMarksUserFacing(t *testing.T) {
+	// HIGH-3 的机制锁定：准入拒绝带 ProbeRejection 标记（可透出）；
+	// 漂移类错误不带标记（调用方必须映射固定话术）。
+	up := newFakeUpstream()
+	up.bodies[pathFaved] = `{"code":200,"data":{"success":true,"msg":null,"data":{"notes":[]}}}`
+	up.bodies[pathHotList] = `{"code":200,"data":{"renamed":[]}}`
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	var pr *ProbeRejection
+	_, err := b.Probe(context.Background(), bindingSrc(types.CapFavedNotes, `{"user_id":"u"}`))
+	if !errors.As(err, &pr) {
+		t.Errorf("0 条拒绝应带 ProbeRejection 标记（用户话术可透出）: %v", err)
+	}
+	_, err = b.Probe(context.Background(), bindingSrc(types.CapHotList, `{}`))
+	if errors.As(err, &pr) {
+		t.Errorf("结构漂移不该带 ProbeRejection 标记（含内部端点名，须映射固定话术）: %v", err)
+	}
+}

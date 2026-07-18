@@ -40,11 +40,14 @@ type FieldMap struct {
 这是行为集中可审的架构约束，不只是 agent 红线）：
 字段回退链（title→display_title、author→$screen_name）、条目过滤+下钻
 （model_type=="note" → 进 note 子对象）、URL 模板+条件查询组（xsec_token 空则整组略去）、
-enrich 触发条件（MinRunes+必备字段）+计费闸门+实例级限速+预算+串号校验+空值保旧、
+enrich 触发条件（MinRunes+必备字段）+计费闸门+实例级限速+预算+串号校验+空值保旧
+（enrich 端点同样每轮 Lookup+参数校验，漂移时降级跳过不静默丢参）、
 unwrap 尝试链（retweeted_tweet→retweeted，取到含 id 的对象才替换）、param 对照校验
 （user.userid vs $user_id，空则宽容）、信封断言表（code==200；xhs 族加 data.success）、
-参数规格（config 引用/默认值/常量/omit-empty）。表达力仍不够的端点就写 bespoke fetcher
-（本清单之外不再扩>——扩前先改本契约）。
+参数规格（config 引用/默认值/常量/omit-empty）、正文截断上限 MaxContentBytes
+（xhs 族 4000 字节成本护栏；**x 恒 0 不截断**——旧实现存推文全文，迁移等价）。
+超时与响应上限对齐旧抓取器口径（cfg 可配，兜底 20s/5MB，超限显式报错非静默截断）。
+表达力仍不够的端点就写 bespoke fetcher（本清单之外不再扩——扩前先改本契约）。
 
 1. **映射语言 sub-Turing（M6 §12.4 红线）**：只允许点路径（`a.b.c`，无索引、无谓词）、
    URL/Content 常量模板（`{id}`/`{title}` 等字段占位替换）、时间格式**枚举**。
@@ -67,7 +70,10 @@ unwrap 尝试链（retweeted_tweet→retweeted，取到含 id 的对象才替换
    本契约首批三能力的实测证据见 §7。实测口径升级为可复跑：每个绑定能力的
    fixture 单测（真实响应样本）+ 时序单调检查（若声明 Time）。
 2. **源实例级准入（试跑）**：绑定能力的 `add_source` 在确认后的 Execute 里先**真调一次
-   上游**（probe），全过才 `UpsertSource`+`AddSubscription`：
+   上游**（probe），全过才 `UpsertSource`+`AddSubscription`。拒绝话术分两类出口（红线 3
+   的实现，ProbeRejection 标记）：**准入拒绝**（0 条/时序/缺参数）话术为人话、原样透出；
+   **其余失败**（漂移/网络/鉴权——内嵌端点名与上游 body）按错误码映射固定话术，
+   原文只进 slog 与 tool_calls：
    - 非 2xx / 超时 → 拒，AppError.Message 给人话（红线 3：原始错误链不进模型/用户面）；
    - ItemsPath 解析不到或 0 条 → 拒（提示参数可能有误 / 收藏可能未公开）；
    - 身份槽为空的条目 >0 → 计数；**全部**为空 → 拒（否则 finalize 静默全丢，
@@ -105,9 +111,12 @@ unwrap 尝试链（retweeted_tweet→retweeted，取到含 id 的对象才替换
    最后过 `finalize`（既有守卫复用）。平台内撞击分析：热榜 item_id 为十进制数字串，
    与 24-hex note_id 形状不相交（2026-07-18 实测结论，经验性而非结构性——新绑定能力
    的身份形状对照写进 §7 表格，是准入检查项）。
-5. **提取失败语义（M6 §10.5：静默空是最坏失败）**：ItemsPath 解析失败 → `CodeValidation`
-   （fail_count++），不是空成功；条目级身份缺失 → drop + slog 计数；**提取到条目但全部
-   drop → `CodeValidation`**。注意区分：提取为 0 是失败，**去重后**入库 0 是正常（追新无新条目）。
+5. **提取失败语义（M6 §10.5：静默空是最坏失败）**：ItemsPath **键缺失** → `CodeValidation`
+   （fail_count++），不是空成功；键在但值为 JSON null、或数组为空 → 合法静默轮
+   （X 静默账号实测形态，旧 x.go 同语义——null 与缺键严格区分）；条目级身份缺失 →
+   drop + slog 计数（probe 报告携带该计数）；**提取到条目但候选全灭 → `CodeValidation`**，
+   其中「全部被 ItemFilter 挡掉」豁免（多态流合法），ItemRoot 下钻失败与身份缺失**不豁免**
+   （都是漂移证据）。已知盲区：faved 收藏转私密后表现为持续合法空轮，管理员视图观察（§9.3）。
 6. **enrich 阶段**（xhs/search 迁移）：声明式 `{Endpoint, KeyParam, Fields, RateMs, BudgetMs}`；
    计费闸门语义照旧（SeenChecker 已见即跳过）、实例级限速与预算照旧；enrich 响应的
    条目 id 与请求 id 对照（串号防御引擎级通用化）。
@@ -121,7 +130,7 @@ unwrap 尝试链（retweeted_tweet→retweeted，取到含 id 的对象才替换
 | re-gen 后端点消失/改名 | §3.1 Lookup 每轮校验 + **模板引用完整性测试**（CI：所有模板 Endpoint 必须 Lookup 命中，re-gen 破坏绑定直接红） | CodeValidation，告警链 |
 | re-gen 改参数名/必填 | §3.2 每轮参数校验 | CodeValidation，告警链 |
 | 上游响应结构变化 | §3.5 提取失败=失败；身份/时间字段解析失败计数 | CodeValidation，告警链 |
-| 上游 200 但语义腐坏（乱序等） | 声明 Time 的绑定每轮做时序降序断言（失败→CodeValidation） | 告警链 |
+| 上游 200 但语义腐坏（乱序等） | **声明 OrderCheck 的模板**（topic_feed）probe + fetch 每轮做时序非增断言（失败→CodeValidation）；Time 有但序无承诺的（faved）不检 | 告警链 |
 | 慢性零产出（提取正常、恒无新内容） | 既有 next_fetch_at/fail_count 不覆盖此形态；**本期不加棘轮**，依赖管理员视图观察（探针 ⑪ 风格楔子留二期） | 记录为已知缺口 |
 
 ## §5 记账（Boss 硬需求：每次调用有记录）
