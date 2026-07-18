@@ -50,18 +50,29 @@ func (s *Store) CreatePushBatch(ctx context.Context, userID int64) (int64, error
 //
 // 复位不动幂等地基：arbiter、WHERE 谓词、RETURNING id 一字未改，新增的只是
 // SET 里两个赋值。正常 Push 重试时这两列本就是空值，写空是等值空更新。
-func (s *Store) CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey string) (int64, error) {
+// scheduleID 记录触发本批的定时任务（P1b，可空："" → NULL，即 push_now/老任务的用户级语义）。
+// 冲突路径（Temporal 重试复用批次）刻意不更新 schedule_id：首次插入已定，归属不因重试改变。
+func (s *Store) CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey, scheduleID string) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO push_batches (user_id, idempotency_key) VALUES ($1, $2)
+		`INSERT INTO push_batches (user_id, idempotency_key, schedule_id) VALUES ($1, $2, $3)
 		 ON CONFLICT (idempotency_key) WHERE idempotency_key <> ''
 		 DO UPDATE SET user_id = EXCLUDED.user_id, exit_gate = '', stage_counts = '{}'
-		 RETURNING id`, userID, idempKey).Scan(&id)
+		 RETURNING id`, userID, idempKey, nullableText(scheduleID)).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("幂等创建批次（user=%d, key=%s）", userID, idempKey), err)
 	}
 	return id, nil
+}
+
+// nullableText 把空串归一为 SQL NULL：pgx 写 Go "" 是空串而非 NULL，而可空列
+// （如 push_batches.schedule_id）要用 NULL 表达"无归属任务"（push_now/老任务）。
+func nullableText(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // RecordEmptyPushBatch 记录一次"跑完了但没东西可推"的空批次（009 / 契约 §16
@@ -95,7 +106,7 @@ func (s *Store) CreatePushBatchIdempotent(ctx context.Context, userID int64, ide
 // 要么有人 reset 了运行，要么出现了第三个写 push_batches 的路径。调用方据此打一条
 // 日志，让它响一声。多返回值表达幂等结局是本包既有惯例（见 InsertDeliveryIdempotent
 // 的 existed/sentAlready）。
-func (s *Store) RecordEmptyPushBatch(ctx context.Context, userID int64, idempKey string,
+func (s *Store) RecordEmptyPushBatch(ctx context.Context, userID int64, idempKey, scheduleID string,
 	gate types.BatchExitGate, counts types.PipelineCounts) (id int64, skipped bool, err error) {
 	// 闸门必须有值：status='empty' 且 exit_gate='' 的行说的是"没推，但不知道为什么"，
 	// 正是本功能要消灭的那种记录。宁可不写（调用方 Warn 后照常走正常终态），
@@ -115,13 +126,13 @@ func (s *Store) RecordEmptyPushBatch(ctx context.Context, userID int64, idempKey
 	}
 
 	err = s.pool.QueryRow(ctx,
-		`INSERT INTO push_batches (user_id, status, exit_gate, stage_counts, idempotency_key)
-		 VALUES ($1, $2, $3, $4, $5)
+		`INSERT INTO push_batches (user_id, status, exit_gate, stage_counts, idempotency_key, schedule_id)
+		 VALUES ($1, $2, $3, $4, $5, $6)
 		 ON CONFLICT (idempotency_key) WHERE idempotency_key <> ''
 		 DO UPDATE SET exit_gate = EXCLUDED.exit_gate, stage_counts = EXCLUDED.stage_counts
 		 WHERE push_batches.status = $2
 		 RETURNING id`,
-		userID, types.BatchStatusEmpty, gate, countsJSON, idempKey).Scan(&id)
+		userID, types.BatchStatusEmpty, gate, countsJSON, idempKey, nullableText(scheduleID)).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, true, nil // 护栏拦下：该 traceID 已有真实批次，不覆写。
 	}

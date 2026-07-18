@@ -82,11 +82,61 @@ func TestEmptyPushBatchStore(t *testing.T) {
 		return status, gate, stageCounts
 	}
 
+	t.Run("schedule_id 写入：有值落库、空串落 NULL（P1b b1）", func(t *testing.T) {
+		schedOf := func(t *testing.T, batchID int64) (val string, isNull bool) {
+			t.Helper()
+			var s *string
+			if err := st.pool.QueryRow(ctx, `SELECT schedule_id FROM push_batches WHERE id = $1`, batchID).Scan(&s); err != nil {
+				t.Fatalf("回查 schedule_id 失败: %v", err)
+			}
+			if s == nil {
+				return "", true
+			}
+			return *s, false
+		}
+		k1 := "tr-sched-" + uuid.NewString()
+		id1, err := st.CreatePushBatchIdempotent(ctx, u.ID, k1, "push-9-xyz")
+		if err != nil {
+			t.Fatalf("CreatePushBatchIdempotent(带 schedule) 失败: %v", err)
+		}
+		if v, isNull := schedOf(t, id1); isNull || v != "push-9-xyz" {
+			t.Errorf("带归属任务应写 schedule_id=push-9-xyz，实得 %q isNull=%v", v, isNull)
+		}
+		// ON CONFLICT 复用路径不改归属：Temporal 重试同一 idempotency_key 复用批次时，
+		// 就算传了不同 scheduleID 也不该覆写首次的值（DO UPDATE SET 不含 schedule_id）。
+		// 守卫：日后若有人把 schedule_id 误加进 DO UPDATE SET，重试会静默改写归属。
+		id1b, err := st.CreatePushBatchIdempotent(ctx, u.ID, k1, "push-9-DIFFERENT")
+		if err != nil {
+			t.Fatalf("CreatePushBatchIdempotent(同键重放) 失败: %v", err)
+		}
+		if id1b != id1 {
+			t.Fatalf("同幂等键应复用同一批次，want %d got %d", id1, id1b)
+		}
+		if v, isNull := schedOf(t, id1); isNull || v != "push-9-xyz" {
+			t.Errorf("重试复用批次不得改写 schedule_id，应仍为 push-9-xyz，实得 %q isNull=%v", v, isNull)
+		}
+		id2, err := st.CreatePushBatchIdempotent(ctx, u.ID, "tr-nosched-"+uuid.NewString(), "")
+		if err != nil {
+			t.Fatalf("CreatePushBatchIdempotent(空 schedule) 失败: %v", err)
+		}
+		if _, isNull := schedOf(t, id2); !isNull {
+			t.Error("空 schedule_id 应落 NULL（即时/老任务的用户级语义），实得非 NULL")
+		}
+		id3, _, err := st.RecordEmptyPushBatch(ctx, u.ID, "tr-empty-sched-"+uuid.NewString(), "push-9-empty",
+			types.BatchExitGateFetch, types.PipelineCounts{}.WithFetched(0))
+		if err != nil {
+			t.Fatalf("RecordEmptyPushBatch(带 schedule) 失败: %v", err)
+		}
+		if v, isNull := schedOf(t, id3); isNull || v != "push-9-empty" {
+			t.Errorf("空批次路径也应透传 schedule_id=push-9-empty，实得 %q isNull=%v", v, isNull)
+		}
+	})
+
 	t.Run("闸门与漏斗往返", func(t *testing.T) {
 		key := "tr-roundtrip-" + uuid.NewString()
 		// dedup 闸门的招牌形状：抓到 20 条、去重后 0 条、下游三步没跑。
 		counts := types.PipelineCounts{}.WithFetched(20).WithDeduped(0)
-		id, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, types.BatchExitGateDedup, counts)
+		id, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, "", types.BatchExitGateDedup, counts)
 		if err != nil {
 			t.Fatalf("RecordEmptyPushBatch() 失败: %v", err)
 		}
@@ -143,11 +193,11 @@ func TestEmptyPushBatchStore(t *testing.T) {
 		// 不报错、只是幂等静默失效，正是必须用真库验的原因。
 		key := "tr-idem-" + uuid.NewString()
 		counts := types.PipelineCounts{}.WithFetched(0)
-		id1, _, err := st.RecordEmptyPushBatch(ctx, u.ID, key, types.BatchExitGateFetch, counts)
+		id1, _, err := st.RecordEmptyPushBatch(ctx, u.ID, key, "", types.BatchExitGateFetch, counts)
 		if err != nil {
 			t.Fatalf("首次记账失败: %v", err)
 		}
-		id2, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, types.BatchExitGateFetch, counts)
+		id2, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, "", types.BatchExitGateFetch, counts)
 		if err != nil {
 			t.Fatalf("重试记账失败: %v", err)
 		}
@@ -175,7 +225,7 @@ func TestEmptyPushBatchStore(t *testing.T) {
 		// 场景真实：Temporal reset 一个已完成的推送运行时，traceID 由 SideEffect
 		// 从历史重放为同一个值，而重放这趟因内容已投递会在 fetch 闸门空退。
 		key := "tr-guard-done-" + uuid.NewString()
-		realID, err := st.CreatePushBatchIdempotent(ctx, u.ID, key)
+		realID, err := st.CreatePushBatchIdempotent(ctx, u.ID, key, "")
 		if err != nil {
 			t.Fatalf("CreatePushBatchIdempotent() 失败: %v", err)
 		}
@@ -183,7 +233,7 @@ func TestEmptyPushBatchStore(t *testing.T) {
 			t.Fatalf("UpdatePushBatchStatus() 失败: %v", err)
 		}
 
-		id, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, types.BatchExitGateFetch,
+		id, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, "", types.BatchExitGateFetch,
 			types.PipelineCounts{}.WithFetched(0))
 		// 护栏拦下不是错误：该 traceID 已有真实批次，本就不该记空批次，拦对了。
 		if err != nil {
@@ -214,12 +264,12 @@ func TestEmptyPushBatchStore(t *testing.T) {
 		// 记账若覆写它，就把一次进行中/半途而废的真实推送谎报成"没东西可推"。
 		// 护栏写的是 status='empty' 而不是 status<>'done'，正是为了连这种中间态也挡住。
 		key := "tr-guard-pending-" + uuid.NewString()
-		realID, err := st.CreatePushBatchIdempotent(ctx, u.ID, key)
+		realID, err := st.CreatePushBatchIdempotent(ctx, u.ID, key, "")
 		if err != nil {
 			t.Fatalf("CreatePushBatchIdempotent() 失败: %v", err)
 		}
 
-		id, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, types.BatchExitGateDedup,
+		id, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, "", types.BatchExitGateDedup,
 			types.PipelineCounts{}.WithFetched(20).WithDeduped(0))
 		if err != nil {
 			t.Fatalf("护栏跳过不该报错，实得: %v", err)
@@ -245,7 +295,7 @@ func TestEmptyPushBatchStore(t *testing.T) {
 		// 与护栏要防的那条一样自相矛盾，只是从另一个方向到达。
 		key := "tr-reset-empty-then-push-" + uuid.NewString()
 
-		emptyID, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, types.BatchExitGateFetch,
+		emptyID, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, "", types.BatchExitGateFetch,
 			types.PipelineCounts{}.WithFetched(0))
 		if err != nil || skipped {
 			t.Fatalf("首次空批次记账应成功，实得 err=%v skipped=%v", err, skipped)
@@ -255,7 +305,7 @@ func TestEmptyPushBatchStore(t *testing.T) {
 		}
 
 		// reset 重跑，这次有内容 → Push 走 CreatePushBatchIdempotent 复用同一行。
-		pushID, err := st.CreatePushBatchIdempotent(ctx, u.ID, key)
+		pushID, err := st.CreatePushBatchIdempotent(ctx, u.ID, key, "")
 		if err != nil {
 			t.Fatalf("CreatePushBatchIdempotent() 失败: %v", err)
 		}
@@ -285,7 +335,7 @@ func TestEmptyPushBatchStore(t *testing.T) {
 		// 同一 traceID 的重试会恒返回 ErrNoRows→静默丢记录，等于用一个新的静默失败
 		// 换掉旧的静默失败。
 		key := "tr-guard-empty-" + uuid.NewString()
-		id1, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, types.BatchExitGateFetch,
+		id1, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, "", types.BatchExitGateFetch,
 			types.PipelineCounts{}.WithFetched(0))
 		if err != nil {
 			t.Fatalf("首次记账失败: %v", err)
@@ -293,7 +343,7 @@ func TestEmptyPushBatchStore(t *testing.T) {
 		if skipped {
 			t.Fatal("首次记账不该被拦")
 		}
-		id2, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, types.BatchExitGateDedup,
+		id2, skipped, err := st.RecordEmptyPushBatch(ctx, u.ID, key, "", types.BatchExitGateDedup,
 			types.PipelineCounts{}.WithFetched(20).WithDeduped(0))
 		if err != nil {
 			t.Fatalf("覆写失败: %v", err)
@@ -313,13 +363,13 @@ func TestEmptyPushBatchStore(t *testing.T) {
 	t.Run("校验：闸门与幂等键不得为空", func(t *testing.T) {
 		// status='empty' 且 exit_gate='' 的行等于"没推，但不知道为什么"——
 		// 正是本功能要消灭的形状，宁可不写。
-		if _, _, err := st.RecordEmptyPushBatch(ctx, u.ID, "tr-x", "",
+		if _, _, err := st.RecordEmptyPushBatch(ctx, u.ID, "tr-x", "", "",
 			types.PipelineCounts{}); !isAppCode(err, types.CodeValidation) {
 			t.Errorf("空闸门应报 VALIDATION，实得: %v", err)
 		}
 		// 空键会落在 004 部分唯一索引之外（WHERE idempotency_key <> ''），
 		// 每次重试新插一行 —— 幂等静默失效，必须挡住。
-		if _, _, err := st.RecordEmptyPushBatch(ctx, u.ID, "", types.BatchExitGateFetch,
+		if _, _, err := st.RecordEmptyPushBatch(ctx, u.ID, "", "", types.BatchExitGateFetch,
 			types.PipelineCounts{}); !isAppCode(err, types.CodeValidation) {
 			t.Errorf("空幂等键应报 VALIDATION，实得: %v", err)
 		}
