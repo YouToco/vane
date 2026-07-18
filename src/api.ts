@@ -419,6 +419,9 @@ export const api = {
     post<{ source_id: number }>("/api/subscriptions", req),
   removeSubscription: (sourceId: number) =>
     request<{ ok: boolean }>(`/api/subscriptions/${sourceId}`, { method: "DELETE" }),
+  // 重新启用一个因连续抓取失败被自动停用的信源（功能 5.2）。后端清零 fail_count、立即恢复抓取。
+  enableSource: (sourceId: number) =>
+    request<{ ok: boolean }>(`/api/sources/${sourceId}/enable`, { method: "POST" }),
 
   // ---- M7 推送历史（功能 6.4）----
   // 键集分页：pageToken 是后端不透明游标，前端只负责原样带回。

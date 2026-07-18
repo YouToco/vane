@@ -102,6 +102,7 @@ export default function Sources() {
   const [keyword, setKeyword] = useState(""); // 小红书关键词
   const [adding, setAdding] = useState(false);
   const [removingId, setRemovingId] = useState<number | null>(null);
+  const [enablingId, setEnablingId] = useState<number | null>(null);
   const [toast, setToast] = useState<Toast>(null);
   const toastTimer = useRef<number | undefined>(undefined);
 
@@ -185,6 +186,20 @@ export default function Sources() {
       flash({ kind: "err", text: err instanceof ApiError ? err.message : "移除失败" });
     } finally {
       setRemovingId(null);
+    }
+  }
+
+  // 重新启用被自动停用的信源（功能 5.2）：后端清零 fail_count 并立即恢复抓取。
+  async function onEnable(id: number) {
+    setEnablingId(id);
+    try {
+      await api.enableSource(id);
+      await load();
+      flash({ kind: "ok", text: "已重新启用" });
+    } catch (err) {
+      flash({ kind: "err", text: err instanceof ApiError ? err.message : "启用失败" });
+    } finally {
+      setEnablingId(null);
     }
   }
 
@@ -312,6 +327,17 @@ export default function Sources() {
                   )}
                 </div>
               </div>
+              {s.status === "disabled" && (
+                <button
+                  type="button"
+                  className="btn btn-mini btn-primary"
+                  onClick={() => onEnable(s.id)}
+                  disabled={enablingId === s.id}
+                  title="连续抓取失败被自动停用，修复来源后点此恢复抓取"
+                >
+                  {enablingId === s.id ? <span className="spinner" /> : "重新启用"}
+                </button>
+              )}
               <button
                 type="button"
                 className="btn btn-mini btn-danger"
