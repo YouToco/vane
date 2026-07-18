@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/tikhubcatalog"
@@ -308,11 +309,24 @@ func TestEndpointTool_DailyCapEnforcedAndFailClosed(t *testing.T) {
 		t.Fatal("每日限额拦截不应打上游")
 	}
 
-	// 限额判定不可用：fail-closed，拒绝调用（护栏失效即放开计费面）。
-	ep2 := newTestEndpointTools(inv, &fakeCounter{err: fmt.Errorf("db down")}, 10, 200)
+	// 限额判定不可用：fail-closed，拒绝调用（护栏失效即放开计费面）。三条纪律：
+	// ① 回自纠文案而非裸 err（错误链不进模型上下文）；② rec 记 budget_exceeded
+	// 而非 internal（没打上游、零计费，不进限额 COUNT）；③ 不打上游。
+	ep2 := newTestEndpointTools(inv, &fakeCounter{err: fmt.Errorf("db down: host=secret user=admin")}, 10, 200)
 	tool2, _ := ep2.Resolve(entry.Name, &activationState{names: []string{entry.Name}})
-	if _, err := tool2.Execute(ctxWithRunState(&toolRunState{activation: &activationState{}}, nil), 1, args); err == nil {
-		t.Fatal("限额判定失败应上抛错误（fail-closed），不得放行")
+	rec := &types.ToolCall{}
+	out, err = tool2.Execute(ctxWithRunState(&toolRunState{activation: &activationState{}}, rec), 1, args)
+	if err != nil {
+		t.Fatalf("fail-closed 应回文案而非上抛错误（错误链不进模型上下文），实得 err=%v", err)
+	}
+	if !strings.Contains(out, "限额检查暂时不可用") {
+		t.Errorf("fail-closed 应回固定自纠文案，实得 %q", out)
+	}
+	if strings.Contains(out, "host=secret") || strings.Contains(out, "db down") {
+		t.Errorf("fail-closed 文案不得泄漏 DB 错误链，实得 %q", out)
+	}
+	if rec.ErrorType != types.ToolErrBudgetExceeded {
+		t.Errorf("fail-closed 记账应为 budget_exceeded（不进限额 COUNT），实得 %q", rec.ErrorType)
 	}
 	if len(inv.calls) != 0 {
 		t.Fatal("fail-closed 不应打上游")
@@ -508,6 +522,110 @@ func TestHandleMessage_EndpointSearchInjectInvoke(t *testing.T) {
 // BuildTools2Static 测试装配：只装 search_endpoints（其余静态工具与本特性无关）。
 func BuildTools2Static(ep *EndpointTools) []Tool {
 	return []Tool{ep.SearchTool()}
+}
+
+// TestEndpointTool_BigIntArgPrecision：大 ID 参数经 UseNumber 全链路保真到上游
+//（对抗审查 HIGH 缺陷）——validateEndpointArgs 不再用 float64 舍掉低位。
+func TestEndpointTool_BigIntArgPrecision(t *testing.T) {
+	inv := &fakeInvoker{body: `{}`}
+	ep := newTestEndpointTools(inv, &fakeCounter{}, 10, 200)
+	entry := testEndpoint(t)
+	tool, _ := ep.Resolve(entry.Name, &activationState{names: []string{entry.Name}})
+	// keyword 必填占位 + 一个大整数值（模拟模型照抄上游响应里的 uid）。
+	args := json.RawMessage(`{"keyword":"x","page":6829164342857171974}`)
+	if _, err := tool.Execute(ctxWithRunState(&toolRunState{activation: &activationState{}}, nil), 1, args); err != nil {
+		t.Fatal(err)
+	}
+	if len(inv.calls) != 1 {
+		t.Fatalf("应调用上游 1 次，实得 %d", len(inv.calls))
+	}
+	got := inv.calls[0].params["page"]
+	num, ok := got.(json.Number)
+	if !ok {
+		t.Fatalf("大整数参数应保持 json.Number，实得 %T(%v)", got, got)
+	}
+	if num.String() != "6829164342857171974" {
+		t.Errorf("大整数应逐位保真，实得 %s", num.String())
+	}
+}
+
+// TestExecRecorded_SanitizesNonUTF8AndNUL：非 UTF-8/NUL 响应体经 execRecorded 净化后
+// 才入库与回模型（对抗审查缺陷）——否则整行记账被 Postgres 拒收、限额漏计。
+func TestExecRecorded_SanitizesNonUTF8AndNUL(t *testing.T) {
+	fs := newFakeStore()
+	inserter := &fakeToolCallInserter{}
+	// GBK「你好」0xC4E3BAC3 是非法 UTF-8；夹一个 NUL。rune 数 < 截断阈值，走原样透传分支。
+	dirty := "ok\xc4\xe3\xba\xc3mid\x00end"
+	inv := &fakeInvoker{body: dirty}
+	ep := newTestEndpointTools(inv, &fakeCounter{}, 10, 200)
+	entry := testEndpoint(t)
+
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "search_endpoints", Arguments: `{"query":"小红书 搜索 笔记"}`}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{ID: "c2", Name: entry.Name, Arguments: `{"keyword":"x"}`}}, FinishReason: "tool_calls"},
+		{Content: "done", FinishReason: "stop"},
+	}}
+	l := New(Deps{
+		Store: fs, Profiles: fs, Tools: BuildTools2Static(ep),
+		Model: "m", MaxTurns: 5, SessionTTL: 30 * time.Minute,
+		Endpoints: ep, ToolCalls: NewToolCallRecorder(inserter),
+	})
+	l.chatFn = chat.fn
+
+	if _, err := l.HandleMessage(context.Background(), 1, "查小红书"); err != nil {
+		t.Fatal(err)
+	}
+	// 端点记账行的 result_preview 必须是合法 UTF-8 且无 NUL（否则真库 INSERT 会失败）。
+	var endpointRec *types.ToolCall
+	for _, c := range inserter.calls {
+		if c.ToolKind == types.ToolCallKindTikHubEndpoint {
+			endpointRec = c
+		}
+	}
+	if endpointRec == nil {
+		t.Fatal("缺端点记账行")
+	}
+	if !utf8.ValidString(endpointRec.ResultPreview) {
+		t.Errorf("result_preview 含非法 UTF-8: %q", endpointRec.ResultPreview)
+	}
+	if strings.ContainsRune(endpointRec.ResultPreview, 0) {
+		t.Errorf("result_preview 含 NUL: %q", endpointRec.ResultPreview)
+	}
+	// 会话消息里的端点结果同样必须净化（agent_sessions.messages JSONB 也拒 NUL）。
+	sess := fs.sessions[1]
+	if strings.ContainsRune(string(sess.Messages), 0) {
+		t.Error("会话 messages 含 NUL")
+	}
+	if !utf8.ValidString(string(sess.Messages)) {
+		t.Error("会话 messages 含非法 UTF-8")
+	}
+}
+
+// TestSearchEndpoints_ResultIncludesDescription：检索结果文本含端点 description
+// 全文（对抗审查 MEDIUM 漂移缺陷）——注入的工具定义只保留 300 rune 摘要，其前提
+// 是「更全说明已在检索结果给过」，必须真给。
+func TestSearchEndpoints_ResultIncludesDescription(t *testing.T) {
+	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
+	// 找一个 description 明显长于 summary 的端点做断言。
+	hits := tikhubcatalog.Search("小红书 搜索 笔记", "xiaohongshu", 5)
+	var target tikhubcatalog.Entry
+	for _, h := range hits {
+		if len([]rune(h.Entry.Description)) > len([]rune(h.Entry.Summary))+20 {
+			target = h.Entry
+			break
+		}
+	}
+	if target.Name == "" {
+		t.Skip("样本里没有 description 显著长于 summary 的端点")
+	}
+	out, _ := ep.SearchTool().Execute(
+		ctxWithRunState(&toolRunState{activation: &activationState{}}, nil), 1,
+		json.RawMessage(`{"query":"小红书 搜索 笔记","platform":"xiaohongshu"}`))
+	// 取 description 前 30 rune 作为存在性探针（避免整串匹配受换行影响）。
+	probe := string([]rune(strings.TrimSpace(target.Description))[:30])
+	if !strings.Contains(out, probe) {
+		t.Errorf("检索结果应含端点 %s 的 description 片段 %q", target.Name, probe)
+	}
 }
 
 // TestHandleMessage_UnactivatedEndpointRejected：模型跳过检索直呼注册表端点名

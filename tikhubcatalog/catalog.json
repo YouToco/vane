@@ -983,37 +983,6 @@
   ]
  },
  {
-  "name": "douyin_app_v3_add_video_play_count",
-  "method": "GET",
-  "path": "/api/v1/douyin/app/v3/add_video_play_count",
-  "tag": "Douyin-App-V3-API",
-  "platform": "douyin",
-  "summary": "根据视频ID来增加作品的播放数/Increase the number of plays of the work according to the video ID",
-  "description": "# [中文]\n### 用途:\n- 根据视频ID来增加作品的播放数\n- 该接口默认使用游客Cookie，如果需要使用登录用户的Cookie，请在参数中传入。\n- 单一作品每次调用增加1次播放数，请求约 `1000` 次后会被抖音限制，需要等待一段时间（如：2小时后）后再继续调用。\n- 该限制是针对作品的，不是针对接口的，在未登录的情况下，使用不同IP的浏览器或在APP中浏览作品，该作品的播放数也不会增加。\n- 可以携带抖音网页端的Cookie来请求此接口，但是不保证一定有效，需要自行测试。\n- 上述的限制是根据测试结果得出的，具体限制可能会有所不同，仅供参考。\n### 参数:\n- aweme_type: 作品类型，0:视频 1:图文，可以从单一作品数据接口中获取。\n- item_id: 作品id，别名为aweme_id\n- cookie: 可选，默认使用游客Cookie\n### 返回:\n- 当前时间戳和状态码，状态码为200时表示成功，否则为失败，可以尝试更换一个作品id再次调用，或者等待一段时间后再次调用。\n\n# [English]\n### Purpose:\n- Increase the number of plays of the work according to the video ID\n- This interface uses guest Cookie by defaul…",
-  "params": [
-   {
-    "name": "aweme_type",
-    "in": "query",
-    "required": true,
-    "type": "integer",
-    "desc": "作品类型/Video type"
-   },
-   {
-    "name": "item_id",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "作品id/Video id"
-   },
-   {
-    "name": "cookie",
-    "in": "query",
-    "type": "string",
-    "desc": "可选，默认使用游客Cookie/Optional, use guest Cookie by default"
-   }
-  ]
- },
- {
   "name": "douyin_app_v3_fetch_brand_hot_search_list",
   "method": "GET",
   "path": "/api/v1/douyin/app/v3/fetch_brand_hot_search_list",
@@ -1839,24 +1808,6 @@
     "required": true,
     "type": "string",
     "desc": "作品id/Video id"
-   }
-  ]
- },
- {
-  "name": "douyin_app_v3_register_device",
-  "method": "GET",
-  "path": "/api/v1/douyin/app/v3/register_device",
-  "tag": "Douyin-App-V3-API",
-  "platform": "douyin",
-  "summary": "抖音APP注册设备/Douyin APP register device",
-  "description": "# [中文]\n### 用途:\n- 抖音APP注册设备，获取设备信息以及设备的Cookie信息。\n\n### 参数:\n- proxy: 代理，要带http://或https://，仅支持http代理。\n  - 格式: username:password@ip:port\n\n### 返回:\n- 设备信息以及设备的Cookie信息。\n\n# [English]\n### Purpose:\n- Register device in Douyin APP, retrieve device information and device cookies.\n\n### Parameters:\n- proxy: Proxy, with http:// or https://, only supports http proxies.\n  - Format: username:password@ip:port\n\n### Return:\n- Device information and device cookies.\n\n# [示例/Example]\nproxy = \"http://username:password@ip:port\"\n\n# [响应/Response]\n```json\n{\n    \"code\": 200,\n    \"router\": \"/api/v1/douyin/app/v3/register_de…",
-  "params": [
-   {
-    "name": "proxy",
-    "in": "query",
-    "type": "string",
-    "desc": "代理/Proxy",
-    "default": ""
    }
   ]
  },
@@ -15479,31 +15430,6 @@
   "description": "# [中文]\n### 用途:\n- 获取热搜词条数据。\n### 返回:\n- 热搜词条数据\n\n# [English]\n### Purpose:\n- Get hot search words data.\n### Return:\n- Hot search words data\n\n# [示例/Example]\n无/None"
  },
  {
-  "name": "pipixia_app_fetch_increase_post_view_count",
-  "method": "GET",
-  "path": "/api/v1/pipixia/app/fetch_increase_post_view_count",
-  "tag": "PiPiXia-App-API",
-  "platform": "pipixia",
-  "summary": "增加作品浏览数/Increase post view count",
-  "description": "# [中文]\n### 用途:\n- 增加作品浏览数。\n### 参数:\n- cell_id: 作品id，可以从分享链接中获取。\n- cell_type: 作品类型，1为视频，多大数保持默认值即可。\n### 返回:\n- 执行结果\n\n# [English]\n### Purpose:\n- Increase post view count.\n### Parameters:\n- cell_id: AKA video id, can be obtained from the share link.\n- cell_type: Video type, 1 for video, keep the default value for other types.\n### Return:\n- Execution result\n\n# [示例/Example]\ncell_id = \"7411193113223371043\"\ncell_type = 1",
-  "params": [
-   {
-    "name": "cell_id",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "作品id/Video id"
-   },
-   {
-    "name": "cell_type",
-    "in": "query",
-    "type": "integer",
-    "desc": "作品类型/Video type",
-    "default": 1
-   }
-  ]
- },
- {
   "name": "pipixia_app_fetch_post_comment_list",
   "method": "GET",
   "path": "/api/v1/pipixia/app/fetch_post_comment_list",
@@ -17655,31 +17581,6 @@
     "type": "string",
     "desc": "需要加密的URL/URL to be encrypted",
     "default": "https://api16-normal-useast5.tiktokv.us/tiktok/v1/upvote/item/list?user_id=6726034365602628610\u0026offset=0\u0026count=21\u0026scene=0\u0026iid=7425045478163400491\u0026device_id=7349721034012280362\u0026ac=WIFI\u0026channel=googleplay\u0026aid=1233\u0026app_name=musical_ly\u0026version_code=360704\u0026version_name=36.7.4\u0026device_platform=android\u0026os=android\u0026ab_version=36.7.4\u0026ssmix=a\u0026device_type=Pixel+6+Pro\u0026device_brand=google\u0026language=zh\u0026os_api=33\u0026os_version=13\u0026openudid=711192517a8bbf03\u0026manifest_version_code=2023607040\u0026resolution=1440*2891\u0026dpi=560\u0026update_version_code=2023607040\u0026_rticket=1728977220468\u0026is_pad=0\u0026app_type=normal\u0026sys_region=CN\u0026last_install_time=1728977141\u0026timezone_name=America%2FLos_Angeles\u0026app_language=zh-Hans\u0026ac2=wifi5g\u0026uoo=0\u0026op_region=CN\u0026timezone_offset=-28800\u0026build_number=36.7.4\u0026host_abi=arm64-v8a\u0026locale=zh-Hans\u0026region=CN\u0026content_language=en%2C\u0026ts=1728977220\u0026cdid=aa21524b-8633-49ca-8e6e-3275fe1672db"
-   }
-  ]
- },
- {
-  "name": "tiktok_app_v3_add_video_play_count",
-  "method": "GET",
-  "path": "/api/v1/tiktok/app/v3/add_video_play_count",
-  "tag": "TikTok-App-V3-API",
-  "platform": "tiktok",
-  "summary": "根据视频ID来增加作品的播放数/Increase the number of plays of the work according to the video ID",
-  "description": "# [中文]\n### 用途:\n- 根据视频ID来增加作品的播放数\n### 参数:\n- aweme_type: 作品类型，0:视频 1:图文，可以从单一作品数据接口中获取。\n- item_id: 作品id，别名为aweme_id\n- invite_code: 邀请码，此接口需要邀请码才能使用。\n### 返回:\n- 当前时间戳和状态码，状态码为200时表示成功，否则为失败，可以尝试更换一个作品id再次调用，或者等待一段时间后再次调用。\n\n# [English]\n### Purpose:\n- Increase the number of plays of the work according to the video ID\n### Parameters:\n- aweme_type: Video type, 0: Video 1: Graphic and text, can be obtained from the single work data interface.\n- item_id: Video id, alias aweme_id\n- invite_code: Invite code, this interface requires an invite code to use.\n### Return:\n- The current timestamp and status code…",
-  "params": [
-   {
-    "name": "aweme_type",
-    "in": "query",
-    "required": true,
-    "type": "integer",
-    "desc": "作品类型/Video type"
-   },
-   {
-    "name": "item_id",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "作品id/Video id"
    }
   ]
  },
@@ -20891,15 +20792,6 @@
     "desc": "加密后的strData字符串/Encrypted strData string"
    }
   ]
- },
- {
-  "name": "tiktok_web_device_register",
-  "method": "GET",
-  "path": "/api/v1/tiktok/web/device_register",
-  "tag": "TikTok-Web-API",
-  "platform": "tiktok",
-  "summary": "设备注册/Register device for TikTok Web",
-  "description": "# [中文]\n### 用途:\n- 设备注册，为TikTok Web生成设备ID和游客Cookie\n### 参数:\n- 无\n### 返回:\n- 设备注册信息，包括设备ID和游客Cookie\n\n# [English]\n### Purpose:\n- Register device to generate device ID and guest Cookie for TikTok Web\n### Parameters:\n- None\n### Return:\n- Device registration information, including device ID and guest Cookie\n# [响应/Response]:\n```json\n{\n    \"deviceId\": \"7556227929396708877\",\n    \"cookie\": \"tt_chain_token=wBqjjz5I8m1bt96uxA1s8A==\",\n    \"user_agent\": \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36\"\n}\n```"
  },
  {
   "name": "tiktok_web_encrypt_strData",

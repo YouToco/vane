@@ -2,7 +2,7 @@
 //
 //   - search_endpoints 检索元工具：在 tikhubcatalog（1002 端点）上 BM25 检索，
 //     命中的端点**激活**进会话（动态注入为一等 FC 工具，业内 Tool Search /
-//     retrieve-then-inject 模式，Boss 拍板 2026-07-17 选注入而非通用转发）。
+//     retrieve-then-inject 模式，Boss 拍板 2026-07-18 选注入而非通用转发）。
 //   - endpointTool 动态端点工具：按 catalog Entry 即时构造，参数 schema 从注册表
 //     生成，Execute 走 tikhubinvoke 通用调用器，结果原文（截断）回给模型阅读。
 //
@@ -17,10 +17,12 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -355,6 +357,13 @@ func (t *searchEndpointsTool) Execute(ctx context.Context, _ int64, args json.Ra
 	for _, h := range hits {
 		e := h.Entry
 		fmt.Fprintf(&b, "\n## %s\n%s %s [%s]\n%s\n", e.Name, e.Method, e.Path, e.Platform, e.Summary)
+		// description 全文（gen 已截 600 rune）只在检索结果里给一次（对抗审查 MEDIUM
+		// 漂移缺陷）：注入的工具定义只保留 300 rune 摘要以省每轮预算，其"更全的说明已在
+		// 检索结果给过"的前提，正靠这里成立。summary 已单独一行，description 与其重复
+		// 时省略，不刷屏。
+		if d := strings.TrimSpace(e.Description); d != "" && d != strings.TrimSpace(e.Summary) {
+			b.WriteString(d + "\n")
+		}
 		if len(e.Params) > 0 {
 			b.WriteString("参数：")
 			for i, p := range e.Params {
@@ -421,7 +430,19 @@ func (t *endpointTool) Execute(ctx context.Context, _ int64, args json.RawMessag
 		if err != nil {
 			// 限额判定不可用时**拒绝调用**而不是放行：护栏失效即放开计费面，
 			// 故障期间宁可少查（fail-closed），与免确认的前提互为代价。
-			return "", err
+			// 三条纪律（对抗审查 MEDIUM/LOW 缺陷）：
+			//  ① 回固定文案而非裸 err——err.Error() 含 AppError.Cause（pgx/DB 内部
+			//     细节），经 runToolCalls 的「工具执行失败：」进模型上下文，与本文件
+			//     Invoke 分支「只透 Message」的纪律相悖；
+			//  ② 记为 budget_exceeded 而非 internal——这次拒绝没打上游、零计费，
+			//     计入每日限额 COUNT 会把限额越顶越死（契约 §7 排除条款正为此设）；
+			//  ③ 记日志留排查线索（错误链只进日志不进模型）。
+			slog.Warn("agent: TikHub 端点每日限额判定失败，fail-closed 拒绝本次调用", "err", err)
+			if rec != nil {
+				rec.ErrorType = types.ToolErrBudgetExceeded
+				rec.Error = err.Error()
+			}
+			return "端点调用限额检查暂时不可用，本次调用已跳过，请稍后再试。", nil
 		}
 		if n >= t.ep.dailyCap {
 			if rec != nil {
@@ -487,10 +508,17 @@ func (s *toolRunState) countEndpointCall() {
 
 // validateEndpointArgs 校验模型产出的参数：未知参数与必填缺失都给出确定性
 // 自纠文案（列出合法参数集），类型宽松放行（invoker 字符串化，语义校验交上游 422）。
+//
+// UseNumber（对抗审查 HIGH 缺陷）：社媒 ID 多为雪花级大整数（TikTok uid ~6.8e18 >
+// 2^53），普通 json.Unmarshal 落 float64 会静默丢精度 → 向上游查错对象。用 UseNumber
+// 让数字保持 json.Number（原始十进制串），invoker 的 toString 原样透传、body 侧
+// json.Marshal 天然保真。
 func validateEndpointArgs(entry tikhubcatalog.Entry, args json.RawMessage) (map[string]any, string) {
 	params := map[string]any{}
 	if len(args) > 0 {
-		if err := json.Unmarshal(args, &params); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(args))
+		dec.UseNumber()
+		if err := dec.Decode(&params); err != nil {
 			return nil, "参数不是合法 JSON，请修正后重试"
 		}
 	}

@@ -13,7 +13,7 @@ type toolCallInserter interface {
 }
 
 // ToolCallRecorder 把每次工具调用同步写入 tool_calls 表（端点注册表契约 §6，
-// Boss 拍板 2026-07-17：全部 agent 工具调用都记）。与 llm.Recorder 同构同纪律：
+// Boss 拍板 2026-07-18：全部 agent 工具调用都记）。与 llm.Recorder 同构同纪律：
 // 记账是旁路可观测性，写失败只记日志、绝不向调用方返回错误——记账故障不能把
 // 已成功的工具调用放大成业务失败。
 type ToolCallRecorder struct {

@@ -611,6 +611,14 @@ func (l *Loop) execRecorded(ctx context.Context, userID int64, sessionID *int64,
 	start := time.Now()
 	result, err := tool.Execute(ctx, userID, args)
 	rec.DurationMs = int(time.Since(start).Milliseconds())
+
+	// 净化外部数据（对抗审查 缺陷）：TikHub 端点结果原样透传上游响应，可能含非法
+	// UTF-8（GBK 错误页/二进制残片）或 NUL——两者都会让 tool_calls.result_preview
+	// 的 TEXT 列与 agent_sessions.messages 的 JSONB 列**整行插入失败**（Postgres 22021/
+	// 22P05），Boss「每次调用必须有记录」被数据内容静默击穿，限额还随之漏计。
+	// 在这唯一汇聚点净化 result：它同时流向返给模型的会话消息与 result_preview，
+	// 一处修复覆盖两个 sink。ResultSize 已由端点工具记为上游原始体量，不受净化影响。
+	result = sanitizeForDB(result)
 	if err != nil {
 		if rec.ErrorType == "" {
 			rec.ErrorType = types.ToolErrInternal
@@ -618,6 +626,11 @@ func (l *Loop) execRecorded(ctx context.Context, userID int64, sessionID *int64,
 		if rec.Error == "" {
 			rec.Error = err.Error()
 		}
+	}
+	rec.Error = sanitizeForDB(rec.Error)
+	rec.RetrievalQuery = sanitizeForDB(rec.RetrievalQuery)
+	for i, c := range rec.CandidateTools {
+		rec.CandidateTools[i] = sanitizeForDB(c)
 	}
 	rec.ResultPreview = truncateRunes(result, toolResultPreviewMaxRunes)
 	if rec.ResultSize == 0 {
@@ -627,17 +640,31 @@ func (l *Loop) execRecorded(ctx context.Context, userID int64, sessionID *int64,
 	return result, err
 }
 
-// normalizeArgsJSON 保证入库参数是合法 JSON：模型产出的 arguments 偶发残缺
-// （截断/转义错误），直接写 JSONB 列会让整条记账失败——非法时降级为 JSON 字符串
-// 原样保存（排查恰恰最需要看到这种残缺原文）。
+// sanitizeForDB 把任意来源的文本净化成 Postgres TEXT/JSONB 能接受的形态：剔除 NUL
+// （0x00 在两种列里都非法）+ 用 U+FFFD 替换非法 UTF-8 序列。空串快速返回。
+func sanitizeForDB(s string) string {
+	if s == "" {
+		return s
+	}
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
+	}
+	return strings.ToValidUTF8(s, "�")
+}
+
+// normalizeArgsJSON 保证入库参数是合法且 JSONB 可接受的 JSON：模型产出的 arguments
+// 偶发残缺（截断/转义错误）或含 NUL，直接写 JSONB 列会让整条记账失败——非法时降级为
+// JSON 字符串原样保存（排查恰恰最需要看到这种残缺原文）。先剔 NUL：字面 NUL 字节让
+// JSON 非法、\u0000 转义又被 JSONB 拒收，两者都得在入库前清掉。
 func normalizeArgsJSON(args json.RawMessage) json.RawMessage {
 	if len(args) == 0 {
 		return nil
 	}
-	if json.Valid(args) {
-		return args
+	clean := json.RawMessage(sanitizeForDB(string(args)))
+	if json.Valid(clean) {
+		return clean
 	}
-	wrapped, err := json.Marshal(string(args))
+	wrapped, err := json.Marshal(string(clean))
 	if err != nil {
 		return nil
 	}

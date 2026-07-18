@@ -1,6 +1,6 @@
 -- 015: agent 工具调用记录表 + 会话激活端点列表（TikHub 端点注册表契约 §5/§6）
 --
--- tool_calls 是 agent 全部工具调用的记账表（Boss 拍板 2026-07-17：全量工具都记，
+-- tool_calls 是 agent 全部工具调用的记账表（Boss 拍板 2026-07-18：全量工具都记，
 -- 不只 TikHub 元工具）。定位与 llm_calls 同构：旁路可观测性，记账失败不放大成
 -- 业务失败；字段语义对齐 OTel GenAI 的 execute_tool span 约定（gen_ai.tool.name /
 -- error.type 低基数 / duration），未来接任何 OTel 兼容后端零翻译。

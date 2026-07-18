@@ -52,7 +52,7 @@ func TestInvariant_CatalogWellFormed(t *testing.T) {
 }
 
 // TestInvariant_ExcludedTagsAbsent：平台管理类 tag 不得出现在注册表
-//（Boss 拍板 2026-07-17：排除 TikHub 账户/下载器/Demo/临时邮箱/健康检查/iOS 快捷指令）。
+// （Boss 拍板 2026-07-18：排除 TikHub 账户/下载器/Demo/临时邮箱/健康检查/iOS 快捷指令）。
 func TestInvariant_ExcludedTagsAbsent(t *testing.T) {
 	excluded := []string{"TikHub-User-API", "TikHub-Downloader-API", "Demo-API", "Health-Check", "Temp-Mail-API", "iOS-Shortcut"}
 	for _, e := range entries {
@@ -60,6 +60,24 @@ func TestInvariant_ExcludedTagsAbsent(t *testing.T) {
 			if e.Tag == x {
 				t.Errorf("%s: 平台管理类 tag %s 不应入表", e.Name, x)
 			}
+		}
+	}
+}
+
+// TestInvariant_SideEffectEndpointsAbsent：会改变第三方平台状态的写端点（刷播放/
+// 刷浏览/注册设备）不得进只读查询目录（对抗审查 HIGH 缺陷）。lookup 层免确认直调，
+// 这些写端点混进来 = agent 可无确认刷量，必须在 gen 里精确排除。
+func TestInvariant_SideEffectEndpointsAbsent(t *testing.T) {
+	banned := []string{
+		"douyin_app_v3_add_video_play_count",
+		"tiktok_app_v3_add_video_play_count",
+		"pipixia_app_fetch_increase_post_view_count",
+		"douyin_app_v3_register_device",
+		"tiktok_web_device_register",
+	}
+	for _, name := range banned {
+		if _, ok := Lookup(name); ok {
+			t.Errorf("副作用写端点 %s 不应入只读查询目录", name)
 		}
 	}
 }

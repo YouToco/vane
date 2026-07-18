@@ -113,6 +113,31 @@ func TestInvoke_POSTBodyAndMixedParams(t *testing.T) {
 	}
 }
 
+// TestInvoke_BigIntIDPrecision：雪花级大 ID（>2^53）经 json.Number 原样透传，
+// 不被 float64 舍入（对抗审查 HIGH 缺陷）。TikTok/抖音 uid 都是这个量级。
+func TestInvoke_BigIntIDPrecision(t *testing.T) {
+	var gotReq *http.Request
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotReq = r.Clone(context.Background())
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	entry := tikhubcatalog.Entry{
+		Name: "t", Method: "GET", Path: "/p",
+		Params: []tikhubcatalog.Param{{Name: "user_id", In: "query", Required: true, Type: "integer"}},
+	}
+	// 模拟 agent 侧 UseNumber 解析后传入的 json.Number（十进制原串）。
+	_, err := newTestInvoker(srv.URL).Invoke(context.Background(), entry, map[string]any{
+		"user_id": json.Number("6829164342857171974"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gotReq.URL.Query().Get("user_id"); got != "6829164342857171974" {
+		t.Errorf("大 ID 应逐位保真，实得 %q（float64 会舍成 ...171968）", got)
+	}
+}
+
 // TestInvoke_POSTAlwaysSendsBody：无参数 POST 也发 {}——FastAPI 对声明了
 // requestBody 的端点收到空 body 回 422。
 func TestInvoke_POSTAlwaysSendsBody(t *testing.T) {

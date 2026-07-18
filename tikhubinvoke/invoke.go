@@ -5,7 +5,7 @@
 // 与 fetcher 各 TikHub 抓取器的分界：fetcher 是订阅信源管道（归一化进 content_items，
 // 逐端点手写、实测准入）；本包是 lookup 面（1002 端点共用一个装配器，零归一化），
 // 二者只共享 config 里的同一个 API key。目标恒为固定可信主机 api.tikhub.io
-//（URL 非用户可控），与 fetcher/tikhub.go 同理不需要 SSRF 拦截。
+// （URL 非用户可控），与 fetcher/tikhub.go 同理不需要 SSRF 拦截。
 package tikhubinvoke
 
 import (
@@ -168,12 +168,18 @@ func isClientTimeout(err error) bool {
 	return errors.As(err, &ue) && ue.Timeout()
 }
 
-// toString 把模型产出的标量参数转为字符串。JSON 数字统一是 float64：整数值去掉
-// 小数点（上游的 id/page 参数收到 "1.000000" 会解析失败），真小数保留。
+// toString 把模型产出的标量参数转为字符串。
+//
+// json.Number（agent 侧用 UseNumber 解析，对抗审查 HIGH 缺陷）原样透传其十进制串：
+// 社媒雪花 ID（如 TikTok uid ~6.8e18 > 2^53）经 float64 会丢精度查错对象，保原串是
+// 唯一正确解。float64 分支保留兜底（非 agent 调用方或未过 UseNumber 的路径）：
+// 整数值去小数点（上游 id/page 收到 "1.000000" 会解析失败），真小数保留。
 func toString(v any) string {
 	switch t := v.(type) {
 	case string:
 		return t
+	case json.Number:
+		return t.String()
 	case float64:
 		if t == float64(int64(t)) {
 			return strconv.FormatInt(int64(t), 10)

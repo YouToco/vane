@@ -37,12 +37,9 @@ const (
 	maxDescRunes = 600
 	// maxParamDescRunes 参数 description 截断上限。
 	maxParamDescRunes = 200
-	// maxToolNameLen 是 DeepSeek FC 工具名长度上限（64），生成时硬校验：
-	// 超长直接报错让人处理，绝不静默截断（截断可能制造重名）。
-	maxToolNameLen = 64
 )
 
-// excludedTags 平台管理类 tag：与「社媒信源数据」无关，不进注册表（Boss 拍板 2026-07-17）。
+// excludedTags 平台管理类 tag：与「社媒信源数据」无关，不进注册表（Boss 拍板 2026-07-18）。
 var excludedTags = map[string]bool{
 	"TikHub-User-API":       true, // TikHub 账户管理
 	"TikHub-Downloader-API": true, // 下载器版本检查
@@ -50,6 +47,20 @@ var excludedTags = map[string]bool{
 	"Health-Check":          true, // 健康检查
 	"Temp-Mail-API":         true, // 临时邮箱
 	"iOS-Shortcut":          true, // iOS 快捷指令
+}
+
+// sideEffectEndpoints 是**会改变第三方平台状态的写端点**，按 path-slug 精确排除
+// （对抗审查 HIGH 缺陷）。lookup 层的免确认前提是「查询不改系统状态」（契约 §0.3/§3），
+// 而这些端点会真实涨播放/涨浏览/注册设备——被刷量灰产利用的写操作，绝不能进一个
+// agent 免确认直调的信源查询目录。它们本就不属于 lookup 层；若确有需要，另走确认卡
+// 路径单独实现。精确匹配而非关键词：避免误伤「获取点赞列表」「获取关注列表」这类
+// 内容涉及点赞/关注但本身只读的 fetch_ 端点。
+var sideEffectEndpoints = map[string]bool{
+	"douyin_app_v3_add_video_play_count":         true, // 增加作品播放数（刷量写）
+	"tiktok_app_v3_add_video_play_count":         true, // 增加作品播放数（刷量写）
+	"pipixia_app_fetch_increase_post_view_count": true, // 增加作品浏览数（刷量写）
+	"douyin_app_v3_register_device":              true, // 注册设备（产生真实设备指纹）
+	"tiktok_web_device_register":                 true, // 注册设备（产生真实设备指纹）
 }
 
 // toolNameRe 是 FC 工具名的合法字符集（DeepSeek/OpenAI 兼容面）。
@@ -181,6 +192,9 @@ func buildEntries(sp *spec) ([]outEntry, error) {
 			}
 
 			name := toolName(path)
+			if sideEffectEndpoints[name] {
+				continue // 会改变第三方平台状态的写端点，不进只读查询目录（见 sideEffectEndpoints）
+			}
 			if !toolNameRe.MatchString(name) {
 				return nil, fmt.Errorf("生成的工具名 %q（来自 %s）不符合 FC 命名约束，需人工处理", name, path)
 			}
@@ -214,7 +228,7 @@ func buildEntries(sp *spec) ([]outEntry, error) {
 
 // toolName 从 path 生成 FC 工具名：/api/v1/tiktok/web/fetch_post_detail →
 // tiktok_web_fetch_post_detail。不用 operationId：FastAPI 生成的 operationId
-// 过半超 64 字符（实测 561/1024），而 path-slug 全量唯一且最长 61（2026-07-17 实测）。
+// 过半超 64 字符（实测 561/1024），而 path-slug 全量唯一且最长 61（2026-07-18 实测）。
 func toolName(path string) string {
 	s := strings.TrimPrefix(path, "/api/v1/")
 	s = strings.TrimPrefix(s, "/api/")

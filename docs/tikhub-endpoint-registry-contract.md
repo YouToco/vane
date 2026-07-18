@@ -1,6 +1,6 @@
 # TikHub 端点注册表契约 — 检索式工具发现 + 动态注入 + 全量调用记账
 
-> 定稿 2026-07-17。决策链：Boss 四项拍板（架构分层征询后改判动态注入）＋业内调研
+> 定稿 2026-07-18。决策链：Boss 四项拍板（架构分层征询后改判动态注入）＋业内调研
 > （Anthropic Tool Search Tool / OpenAI tool_search / langgraph-bigtool / RAG-MCP 等，
 > 全部关键论断经二次核验，来源见 §0.2）。
 > 实现：`tikhubcatalog/` + `tikhubinvoke/` + `agent/endpoint_tools.go` + migration 015。
@@ -15,7 +15,7 @@ Instagram/Twitter 等 20 平台）。Boss 要求"全支持弄成 tool，agent �
 
 ### §0.2 为什么是「注册表 + 搜索 + 动态注入」
 
-业内已收敛的结论（2026-07-17 调研，关键数字均经打开原文二次核验）：
+业内已收敛的结论（2026-07-18 调研，关键数字均经打开原文二次核验）：
 
 - 工具数量直接打击选择准确率：候选 <30 时成功率 >90%，>100 急剧衰减；全量塞入
   1000 工具 ≈ 20 万 token 且成功率跌到 ~14%（RAG-MCP, arXiv 2505.03275）。
@@ -47,7 +47,11 @@ content_items；某端点若证明适合做订阅信源，走 sourcecatalog 实�
   不做运行时拉取，上游一次发布不得静默改变 agent 能调什么。
 - **收录范围**（Boss 拍板）：排除平台管理类 6 个 tag（TikHub-User/Downloader/Demo/
   Health-Check/Temp-Mail/iOS-Shortcut），其余全收（含星图/DouPlus/广告等营销数据类
-  ——对行业情报有用）。当前 1002 个端点、20 平台。
+  ——对行业情报有用）。**另按 path-slug 精确排除会改变第三方平台状态的写端点**
+  （刷播放 add_video_play_count ×2、刷浏览 increase_post_view_count、注册设备 ×2，
+  见 gen 的 sideEffectEndpoints）：lookup 层免确认直调，这类写操作混进来 = agent
+  可无确认刷量，与 §3 的「查询不改系统状态」前提冲突。精确匹配而非关键词，避免误伤
+  「获取点赞/关注/收藏列表」这类只读 fetch_ 端点。当前 997 个端点、20 平台。
 - **工具命名**：path-slug（`/api/v1/tiktok/web/fetch_post_detail` →
   `tiktok_web_fetch_post_detail`）。不用 operationId：FastAPI 生成的 operationId
   561/1024 超 FC 64 字符上限；path-slug 全量唯一且最长 61（实测）。gen 硬校验
@@ -112,6 +116,9 @@ Tool 接口签名由 M4 契约固定且工具实例是全局单例，per-message
 - 按 Entry 元数据装配请求：path 参数替换、query 参数（数组重复键展开、整数不带
   小数点）、POST 恒发 JSON body（空参发 `{}`——FastAPI 对声明了 body 的端点收空
   body 回 422）。未提供的可选参数**不发送**（让上游用自己的默认值，不做默认值快照）。
+- **大整数保真**：社媒雪花 ID（TikTok/抖音 uid ~6.8e18 > 2^53）。agent 侧
+  validateEndpointArgs 用 `json.Number`（UseNumber）解析、invoker toString 原样透传
+  其十进制串——普通 float64 会静默丢低位精度，向上游查错对象。
 - 错误分层：key 未配置/装配失败 → CodeValidation；超时 → CodeFetchTimeout；
   其余传输失败 → CodeInternal。**非 2xx 不是 error**：状态码与原文随 Result 返回，
   由端点工具带状态码回给模型（4xx 原文是模型自纠的关键输入）。
@@ -129,6 +136,11 @@ Tool 接口签名由 M4 契约固定且工具实例是全局单例，per-message
 - **元数据全量、内容截断**：arguments 全存（非法 JSON 降级为字符串保存——排查
   恰恰需要看残缺原文）；result_preview 截 8K rune + result_size 存真实体量。
   上游响应可重取，不是本库资产，不入全文。
+- **入库前净化**（sanitizeForDB）：上游响应可能含非法 UTF-8（GBK 错误页/二进制残片）
+  或 NUL，两者都会让 result_preview 的 TEXT 列与 messages 的 JSONB 列**整行插入失败**
+  （Postgres 22021/22P05），Boss「每次调用必须有记录」被数据内容静默击穿、限额随之
+  漏计。净化在 execRecorded 这唯一汇聚点做（result 同时流向会话消息与 result_preview，
+  一处覆盖两 sink）：剔 NUL + 非法 UTF-8 换 U+FFFD；arguments 侧 normalizeArgsJSON 同办。
 - **检索留痕**（优化检索的唯一数据源）：retrieval_query + candidate_tools，
   零命中也记。端点调用另记 endpoint_path + http_status。
 - 记账纪律与 llm.Recorder 完全一致：同步写、失败只记日志，绝不放大成业务失败。
