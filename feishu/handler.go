@@ -1,3 +1,12 @@
+// 本文件同时出现 owner 设置键与 UpsertUserByOpenID 调用，但**不是** principal
+// 解析链——故对不变量 I-A1 的守卫（auth/invariant_test.go）显式豁免：
+//   - captureOwnerIfFirst 是 owner 的**首次捕获**（写入），不是读取当前 principal；
+//   - 多处 UpsertUserByOpenID 用的是**消息发送者的** open_id（为入站消息建 user 行），
+//     而非 owner 记录里的 open_id。
+//
+// 要读「当前请求以谁的身份执行」，一律走 auth.PrincipalResolver，不要在此另起一份。
+//
+//go:principal-exempt
 package feishu
 
 import (

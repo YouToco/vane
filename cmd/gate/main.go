@@ -34,6 +34,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/YouToco/vane/auth"
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/probe"
@@ -179,45 +180,29 @@ type ownerRecord struct {
 	Name   string `json:"name"`
 }
 
-// resolveOwnerUserID 把 settings.feishu_owner 解析成 users 表主键，复述 api.ownerUserID
-// 的逻辑（那是 api 包的未导出方法，cmd 拿不到）。
+// resolveOwnerUserID 把「当前 principal」解析成 users 表主键。
 //
-// 取舍——本工具是只读探针，这里却写了一次库：store 目前没有"按 open_id 纯读用户"的方法，
-// store/users.go 只有 UpsertUserByOpenID。评估后仍然用它：
-//  1. 恒为幂等命中，不改数据：owner 记录只在 owner 给机器人发过消息之后才存在
-//     （feishu/handler.go:497 捕获），而那条消息路径先做过 UpsertUserByOpenID
-//     （handler.go:137）——user 行必已存在。这次 upsert 不新增行、不动 created_at，
-//     只 SET name = EXCLUDED.name。
-//  2. 不引入新的写入形状：与 api.ownerUserID 逐字一致，Dashboard 每次建调度都在做同一件事，
-//     风险面等同既有调用，而非 gate 新造的。
+// 逻辑本体已收敛到 auth 包（企业级契约 §1.1，不变量 I-A1）——收敛前这里是
+// api.ownerUserID 的第三份逐字副本（因为那是 api 包的未导出方法，cmd 拿不到）。
 //
-// 已知瑕疵（同样继承自 api/owner.go，不是本工具引入）：settings.feishu_owner 只在首次捕获时
-// 写入（handler.go:480 已捕获即返回），users.name 却每条消息刷新——owner 事后改昵称会让两者漂移，
-// 此时这次 upsert 会把 users.name 写回捕获时的旧昵称。只影响展示字段，不碰任何探针指标。
-// 要彻底零写入就用 -user 显式指定 userID。若日后 store 补上只读的按 open_id 查询，此处应立刻换过去。
+// 本函数保留的唯一职责：把「尚无 owner」的文案替换成 gate 专属版本（提示 -user 参数）。
+// auth 包给的是面向 Dashboard 用户的通用文案，对命令行操作者要多给一条出路。
+// 其余错误原样透传。
+//
+// 继承自 auth 包的已知取舍（不是本工具引入）：解析会写一次库（UpsertUserByOpenID），
+// 但恒为幂等命中——owner 记录只在 owner 给机器人发过消息后才存在，而那条路径已建好
+// user 行。要彻底零写入就用 -user 显式指定 userID。
 func resolveOwnerUserID(ctx context.Context, st *store.Store) (int64, error) {
-	raw, err := st.GetSetting(ctx, feishu.SettingKeyOwner)
+	p, err := auth.NewOwnerResolver(st, feishu.SettingKeyOwner).FromContext(ctx)
 	if err != nil {
-		// 尚无 owner 是"流程未走到"而非故障，给出下一步动作而不是报错文案。
-		if errors.Is(err, types.ErrNotFound) {
+		var ae *types.AppError
+		if errors.As(err, &ae) && ae.Code == types.CodeConflict {
 			return 0, types.NewAppError(types.CodeConflict,
-				"尚未捕获 owner，请先在飞书给机器人发一条消息，或用 -user 显式指定 userID", nil)
+				"尚未捕获 owner，请先在飞书给机器人发一条消息，或用 -user 显式指定 userID", err)
 		}
 		return 0, err
 	}
-	var rec ownerRecord
-	if err := json.Unmarshal(raw, &rec); err != nil {
-		return 0, types.NewAppError(types.CodeInternal, "owner 设置格式异常", err)
-	}
-	if rec.OpenID == "" {
-		return 0, types.NewAppError(types.CodeConflict, "owner 记录缺少 open_id，请重新完成飞书向导", nil)
-	}
-	// 传 rec.Name（非空串）：与 api.ownerUserID 一致，避免把已有昵称覆盖成空。
-	u, err := st.UpsertUserByOpenID(ctx, rec.OpenID, rec.Name)
-	if err != nil {
-		return 0, err
-	}
-	return u.ID, nil
+	return p.UserID, nil
 }
 
 // userMessage 从错误链里取 AppError.Message 作为给人看的文案（红线 3）：

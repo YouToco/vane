@@ -20,6 +20,7 @@ import (
 	"github.com/YouToco/vane/a2a"
 	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/api"
+	"github.com/YouToco/vane/auth"
 	"github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/evolver"
@@ -191,10 +192,16 @@ func run() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /readyz", handleReadyz(st))
+	// principal 解析器：全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
+	// 过渡期实现是「全局 owner 回退 + 租户恒为 1」，行为与收敛前逐字一致；
+	// 真实认证落地后只换这一处构造，api/a2a/gate 三处调用点零改动。
+	principals := auth.NewOwnerResolver(st, feishu.SettingKeyOwner)
+
 	api.Mount(mux, api.Deps{
 		Store:     st,
 		Manager:   manager,
 		Scheduler: sched,
+		Principal: principals,
 		Password:  cfg.Dashboard.Password,
 		Origin:    cfg.Dashboard.Origin,
 	})
@@ -234,13 +241,13 @@ func run() error {
 			ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
 		})
 		if err := a2a.Mount(mux, a2a.Deps{
-			Storage: st,
-			Content: st,
-			Chat:    a2aLoop,
-			Owner:   st,
-			Token:   cfg.A2A.Token,
-			BaseURL: cfg.A2A.BaseURL,
-			Version: vaneVersion,
+			Storage:   st,
+			Content:   st,
+			Chat:      a2aLoop,
+			Principal: principals,
+			Token:     cfg.A2A.Token,
+			BaseURL:   cfg.A2A.BaseURL,
+			Version:   vaneVersion,
 		}); err != nil {
 			return fmt.Errorf("挂载 A2A server: %w", err)
 		}

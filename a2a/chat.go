@@ -15,7 +15,6 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 
-	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/types"
 )
@@ -33,7 +32,7 @@ const chatHistoryTasks = 8
 // goroutine（taskstore 适配层注释），超预算时 HTTP 响应可能先断，任务经
 // GetTask 兜底可取。
 func (e *executor) executeChat(ctx context.Context, execCtx *a2asrv.ExecutorContext, text string, yield func(a2a.Event, error) bool) {
-	if e.deps.Chat == nil || e.deps.Owner == nil {
+	if e.deps.Chat == nil || e.deps.Principal == nil {
 		yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateRejected,
 			agentMessage(execCtx, skillAssistantChat+" 未启用（服务端未装配 agent 轨）")), nil)
 		return
@@ -91,32 +90,20 @@ func ownerErrText(err error) string {
 // chatFailText 是 assistant.chat 执行失败的对外固定文案（A-2：不透传 llm 层 Message）。
 func chatFailText() string { return "对话处理失败，请稍后重试" }
 
-// resolveOwner 把"当前 owner"解析成 users 主键（语义对齐 api/owner.go：
-// settings.feishu_owner → open_id → UpsertUserByOpenID）。A2A 轨以 owner 身份
-// 执行只读工具（数据边界拍板 §13.2）。错误的对外文案由 ownerErrText 收窄（B-F1）。
+// resolveOwner 把「当前 principal」解析成 users 主键。
+//
+// 逻辑本体已收敛到 auth 包（企业级契约 §1.1，不变量 I-A1）；本函数只剩两层适配：
+// ① 加 dbQueryTimeout（A2A 特有的预算，auth 包不该替调用方决定超时）；
+// ② 收窄成 userID——A2A 轨以 owner 身份执行只读工具（数据边界拍板 §13.2）。
+// 错误的对外文案仍由 ownerErrText 按错误码收窄（B-F1），内层 Message 永不外露。
 func (e *executor) resolveOwner(ctx context.Context) (int64, error) {
 	octx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
-	raw, err := e.deps.Owner.GetSetting(octx, feishu.SettingKeyOwner)
-	if err != nil {
-		if errors.Is(err, types.ErrNotFound) {
-			return 0, types.NewAppError(types.CodeConflict,
-				"服务尚未完成 owner 初始化，暂无法对话", nil)
-		}
-		return 0, err
-	}
-	var rec struct {
-		OpenID string `json:"open_id"`
-		Name   string `json:"name"`
-	}
-	if err := json.Unmarshal(raw, &rec); err != nil || rec.OpenID == "" {
-		return 0, types.NewAppError(types.CodeInternal, "owner 记录异常", err)
-	}
-	u, err := e.deps.Owner.UpsertUserByOpenID(octx, rec.OpenID, rec.Name)
+	p, err := e.deps.Principal.FromContext(octx)
 	if err != nil {
 		return 0, err
 	}
-	return u.ID, nil
+	return p.UserID, nil
 }
 
 // chatHistory 按 contextId 重建多轮历史。A2A 的多轮语义：任务终态后不可续写
