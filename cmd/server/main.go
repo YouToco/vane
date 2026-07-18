@@ -202,10 +202,12 @@ func run() error {
 
 	api.Mount(mux, api.Deps{
 		Store:     st,
+		Auth:      st,
 		Manager:   manager,
 		Scheduler: sched,
-		Principal: principals,
-		Password:  cfg.Dashboard.Password,
+		// HTTP 面的 principal 来自会话中间件注入的 ctx（企业级契约 §1.1 的最终形态）；
+		// a2a/gate 无 HTTP 会话，仍用 owner 回退——这正是把 principal 做成接口的价值。
+		Principal: auth.NewContextResolver(),
 		Origin:    cfg.Dashboard.Origin,
 	})
 

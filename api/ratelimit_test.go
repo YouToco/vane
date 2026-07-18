@@ -72,9 +72,8 @@ func TestClientIP(t *testing.T) {
 // 但 Caddy 追加的真实 peer 恒定在最右，限流按最右段计数，连续失败仍被封成 429。
 func TestLoginLimiterNotBypassedBySpoofedXFF(t *testing.T) {
 	s := &server{
-		deps:     Deps{Password: "correct-horse-battery-staple"},
-		sessions: newSessions("correct-horse-battery-staple"),
-		limiter:  newLoginLimiter(),
+		deps:    Deps{Auth: newFakeAuthStore()},
+		limiter: newLoginLimiter(),
 	}
 	do := func(spoofLeft string) int {
 		body := strings.NewReader(`{"password":"wrong"}`)

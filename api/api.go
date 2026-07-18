@@ -40,17 +40,32 @@ type Scheduler interface {
 	DeletePush(ctx context.Context, schedID string) error
 }
 
+// AuthStore 是认证路径所需的窄接口（生产实现 *store.Store）。
+//
+// 单独收窄而不直接用 Deps.Store（具体类型 *store.Store）：认证中间件在每个请求上
+// 查会话，若依赖具体类型，**api 包的任何鉴权测试都必须连真数据库**——
+// 而鉴权正是最该用大量廉价用例覆盖的地方（枚举、爆破、越权、会话固定…）。
+// 与 Manager / Scheduler 的窄接口同一惯例。
+type AuthStore interface {
+	RegisterWithInvite(ctx context.Context, email, passwordHash, code string) (*types.User, *types.Tenant, error)
+	GetUserByEmail(ctx context.Context, email string) (*types.User, error)
+	UpdatePasswordHash(ctx context.Context, userID int64, passwordHash string) error
+	ListMembershipsByUser(ctx context.Context, userID int64) ([]types.Membership, error)
+	CreateSession(ctx context.Context, tokenHash []byte, userID, tenantID int64, expiresAt time.Time) error
+	LookupSession(ctx context.Context, tokenHash []byte) (*types.Session, error)
+	DeleteSession(ctx context.Context, tokenHash []byte) error
+}
+
 // Deps 是 Mount 所需的全部依赖，由 main.go 注入。
 type Deps struct {
-	Store     *store.Store
+	Store *store.Store
+	// Auth 是认证路径的窄接口；生产与 Store 同为 *store.Store。
+	Auth      AuthStore
 	Manager   Manager
 	Scheduler Scheduler
 	// Principal 是全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
 	// 生产由 main.go 注入 auth.NewOwnerResolver；单测可注入假实现。
 	Principal auth.PrincipalResolver
-	// Password 是 Dashboard 登录密码（VANE_DASHBOARD_PASSWORD）；
-	// 为空时登录一律 401——见 handleLogin。
-	Password string
 	// Origin 是唯一放行 CORS 的前端源（VANE_DASHBOARD_ORIGIN，默认生产 Dashboard 域）。
 	// 前端迁 OSS+CDN 后与 API 跨源（vane.* → api.*），凭证请求要求逐字匹配的
 	// Allow-Origin + Allow-Credentials，不允许通配符。为空 = 不放行任何跨源。
@@ -58,17 +73,17 @@ type Deps struct {
 }
 
 type server struct {
-	deps     Deps
-	sessions *sessions
-	limiter  *loginLimiter
+	deps    Deps
+	limiter *loginLimiter
 }
 
 // Mount 把 /api/* 路由挂到 mux。除 /api/auth/login 外全部要求会话 cookie；
 // /healthz /readyz 不在 /api 前缀下，不受本中间件影响。
 func Mount(mux *http.ServeMux, deps Deps) {
-	s := &server{deps: deps, sessions: newSessions(deps.Password), limiter: newLoginLimiter()}
+	s := &server{deps: deps, limiter: newLoginLimiter()}
 
 	inner := http.NewServeMux()
+	inner.HandleFunc("POST /api/auth/register", s.handleRegister)
 	inner.HandleFunc("POST /api/auth/login", s.handleLogin)
 	inner.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	inner.HandleFunc("GET /api/auth/me", s.handleMe)
@@ -133,22 +148,6 @@ func (s *server) cors(next http.Handler) http.Handler {
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// requireSession 是 /api/* 的会话中间件。login 必须豁免，否则永远无法登录。
-func (s *server) requireSession(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/auth/login" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		c, err := r.Cookie(sessionCookieName)
-		if err != nil || !s.sessions.verify(c.Value, time.Now()) {
-			writeError(w, http.StatusUnauthorized, "未登录或会话已过期")
-			return
 		}
 		next.ServeHTTP(w, r)
 	})

@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/types"
@@ -37,18 +36,25 @@ func (f *fakeScheduler) UpdatePush(_ context.Context, id string, spec scheduler.
 	return f.retErr
 }
 
-const schedTestPassword = "sched-test-password"
+// schedSession 存放当前用例的会话 cookie，由 newScheduleMux 设置。
+// 包级变量在此可接受：api 包的用例不并行（无 t.Parallel）。
+var schedSession *http.Cookie
 
-func newScheduleMux(sched Scheduler) *http.ServeMux {
+func newScheduleMux(t *testing.T, sched Scheduler) *http.ServeMux {
+	t.Helper()
 	mux := http.NewServeMux()
-	Mount(mux, Deps{Password: schedTestPassword, Scheduler: sched})
+	deps, cookie := authedDeps(t, Deps{Scheduler: sched})
+	schedSession = cookie
+	Mount(mux, deps)
 	return mux
 }
 
 func schedCookie(t *testing.T) *http.Cookie {
 	t.Helper()
-	token, exp := newSessions(schedTestPassword).issue(time.Now())
-	return &http.Cookie{Name: sessionCookieName, Value: token, Expires: exp}
+	if schedSession == nil {
+		t.Fatal("请先用 newScheduleMux 建 mux")
+	}
+	return schedSession
 }
 
 func patchSchedule(t *testing.T, mux *http.ServeMux, id, body string) *httptest.ResponseRecorder {
@@ -64,7 +70,7 @@ func patchSchedule(t *testing.T, mux *http.ServeMux, id, body string) *httptest.
 // 路径参数取到 id、nl_description 的指针语义原样传下去。
 func TestUpdateSchedule_成功透传(t *testing.T) {
 	f := &fakeScheduler{}
-	w := patchSchedule(t, newScheduleMux(f), "push-1-abc",
+	w := patchSchedule(t, newScheduleMux(t, f), "push-1-abc",
 		`{"spec":{"cron":"30 9 * * *","tz":"Asia/Shanghai"},"nl_description":"改成九点半"}`)
 
 	if w.Code != http.StatusOK {
@@ -85,7 +91,7 @@ func TestUpdateSchedule_成功透传(t *testing.T) {
 // 否则会把用户原来的描述静默清空。
 func TestUpdateSchedule_省略描述传nil(t *testing.T) {
 	f := &fakeScheduler{}
-	w := patchSchedule(t, newScheduleMux(f), "s1", `{"spec":{"every_seconds":7200}}`)
+	w := patchSchedule(t, newScheduleMux(t, f), "s1", `{"spec":{"every_seconds":7200}}`)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("状态码 = %d, 期望 200", w.Code)
@@ -125,7 +131,7 @@ func TestUpdateSchedule_非法spec回400(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := &fakeScheduler{}
-			w := patchSchedule(t, newScheduleMux(f), "s1", body)
+			w := patchSchedule(t, newScheduleMux(t, f), "s1", body)
 			if w.Code != http.StatusBadRequest {
 				t.Errorf("状态码 = %d, 期望 400（body=%s）", w.Code, w.Body.String())
 			}
@@ -140,7 +146,7 @@ func TestUpdateSchedule_非法spec回400(t *testing.T) {
 // 而不是 500——"改一个不存在的任务"是客户端问题。
 func TestUpdateSchedule_NotFound回404(t *testing.T) {
 	f := &fakeScheduler{retErr: types.NewAppError(types.CodeNotFound, "定时任务不存在", nil)}
-	w := patchSchedule(t, newScheduleMux(f), "missing", `{"spec":{"cron":"0 8 * * *"}}`)
+	w := patchSchedule(t, newScheduleMux(t, f), "missing", `{"spec":{"cron":"0 8 * * *"}}`)
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("状态码 = %d, 期望 404（body=%s）", w.Code, w.Body.String())
@@ -152,7 +158,7 @@ func TestUpdateSchedule_未登录401(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPatch, "/api/schedules/s1",
 		strings.NewReader(`{"spec":{"cron":"0 8 * * *"}}`))
 	w := httptest.NewRecorder()
-	newScheduleMux(&fakeScheduler{}).ServeHTTP(w, r)
+	newScheduleMux(t, &fakeScheduler{}).ServeHTTP(w, r)
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("未登录状态码 = %d, 期望 401", w.Code)

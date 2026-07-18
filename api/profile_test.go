@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 )
 
 const profilePath = "/api/profile"
@@ -14,18 +13,19 @@ const profilePath = "/api/profile"
 // handleProfile 在 requireSession 放行后才碰 Store，故只测未授权被挡住的分支，
 // 带真 owner+画像的 200/404 路径需真 Postgres，按本包既定纪律不 mock（见
 // observability_test.go 头注释：Deps.Store 是具体类型，不为测试改成接口）。
-func newProfileMux(t *testing.T) *http.ServeMux {
+func newProfileMux(t *testing.T) (*http.ServeMux, *http.Cookie) {
 	t.Helper()
 	mux := http.NewServeMux()
-	Mount(mux, Deps{Password: "profile-test-password"})
-	return mux
+	deps, cookie := authedDeps(t, Deps{})
+	Mount(mux, deps)
+	return mux, cookie
 }
 
 // TestProfileRequiresSession 验证 GET /api/profile 受会话中间件保护，
 // 并顺带证明路由确实挂上了（没挂 ServeMux 会回 404 而非 401）。
 // 画像页是"零新增鉴权面"，前提就是它老实待在 /api/ 前缀下继承会话中间件。
 func TestProfileRequiresSession(t *testing.T) {
-	mux := newProfileMux(t)
+	mux, _ := newProfileMux(t)
 
 	// 无 cookie：requireSession 在碰 Store 前就回 401。
 	r := httptest.NewRequest(http.MethodGet, profilePath, nil)
@@ -50,9 +50,7 @@ func TestProfileRequiresSession(t *testing.T) {
 // 故用 recover 捕获——能 panic 恰恰说明已过中间件、进了 handleProfile；
 // 若路由没挂，ServeMux 会回 404 且不 panic，测试据此失败。
 func TestProfileRouteMounted(t *testing.T) {
-	mux := newProfileMux(t)
-	token, exp := newSessions("profile-test-password").issue(time.Now())
-	cookie := &http.Cookie{Name: sessionCookieName, Value: token, Expires: exp}
+	mux, cookie := newProfileMux(t)
 
 	defer func() {
 		if recover() == nil {

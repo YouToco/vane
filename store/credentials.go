@@ -204,3 +204,35 @@ func (s *Store) DeleteExpiredSessions(ctx context.Context) (int64, error) {
 	}
 	return tag.RowsAffected(), nil
 }
+
+// SetUserCredentials 给**已存在的用户**挂上邮箱+密码身份。
+//
+// 存在的唯一理由是**存量 owner 的接管**：改造前 Dashboard 用共享密码登录，
+// 换成账号体系后，那位 owner 已经带着租户 1 与全部历史数据存在于 users 表，
+// 却没有邮箱和密码——若让他重新注册，会得到一个空的新租户，历史数据全留在原处
+// 看不见。本方法把身份挂到既有行上，租户归属与数据一概不动。
+//
+// 与 RegisterWithInvite 的分工：那个是「建新人」，这个是「给老人补身份」。
+// 刻意不做成 HTTP 端点——它能给任意用户设密码，是纯粹的管理员操作，
+// 只应由能登上 VPS 的人在本机执行（见 cmd/useradmin）。
+func (s *Store) SetUserCredentials(ctx context.Context, userID int64, email, passwordHash string) error {
+	email = NormalizeEmail(email)
+	if email == "" || passwordHash == "" {
+		return types.NewAppError(types.CodeValidation, "邮箱与密码哈希都不能为空", nil)
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE users SET email = $2, password_hash = $3 WHERE id = $1`,
+		userID, email, passwordHash)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+			return types.NewAppError(types.CodeConflict, "该邮箱已被其他账号占用", err)
+		}
+		return types.NewAppError(types.CodeDatabase, "设置用户凭据", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return types.NewAppError(types.CodeNotFound,
+			fmt.Sprintf("用户 %d 不存在", userID), nil)
+	}
+	return nil
+}

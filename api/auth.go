@@ -1,26 +1,104 @@
-// 登录 / 登出 / 会话自检（契约 §5）。
+// 注册 / 登录 / 登出 / 会话自检（企业级契约 §1.1，决议 D2′/D4）。
+//
+// 本文件在 D2′ 落地时**整体重写**：改造前是「一个共享密码 + 无状态 HMAC token」，
+// 没有用户概念——密码即凭据，谁知道谁就是主人。真 SaaS 下每个租户有自己的账号，
+// 故改为「邮箱+密码 + 服务端会话表」。共享密码路径已彻底移除，不保留兼容窗口
+// （Boss 拍板：直接换掉；存量 owner 的接管路径见 cmd/gate 的 set-password）。
 package api
 
 import (
-	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/YouToco/vane/auth"
+	"github.com/YouToco/vane/types"
 )
 
-// handleLogin 校验密码并签发会话 cookie。
-// POST /api/auth/login {"password":"xxx"} → 200 {"ok":true} + Set-Cookie / 401
+const (
+	sessionCookieName = "vane_session"
+	sessionTTL        = 30 * 24 * time.Hour
+	// authBodyLimit 是认证端点的请求体上限。这些端点**无需鉴权**即可访问，
+	// 不设上限等于给出免费的内存 DoS 面。4KB 远超任何合法的邮箱+密码+邀请码。
+	authBodyLimit = 4 << 10
+	// uniformAuthDelay 是认证失败的固定延迟，压低在线爆破速率。
+	uniformAuthDelay = 200 * time.Millisecond
+)
+
+// authFailMsg 是**所有**认证失败的统一文案。
+//
+// 不区分「邮箱不存在」与「密码错误」是硬性要求，不是含糊其辞:一旦区分，
+// 登录接口就成了账号枚举器——攻击者批量试邮箱，按回哪种错即可确认哪些邮箱
+// 注册过本站，拿去做撞库、钓鱼、或仅仅是泄漏用户名单本身。
+const authFailMsg = "邮箱或密码不正确"
+
+// handleRegister 邀请码注册。
+// POST /api/auth/register {"email","password","invite_code"} → 200 + Set-Cookie
+func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if !s.limiter.allow(ip, time.Now()) {
+		writeError(w, http.StatusTooManyRequests, "操作过于频繁，请稍后再试")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, authBodyLimit)
+
+	var req struct {
+		Email      string `json:"email"`
+		Password   string `json:"password"`
+		InviteCode string `json:"invite_code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	req.Email = strings.TrimSpace(req.Email)
+	if req.Email == "" || !strings.Contains(req.Email, "@") {
+		writeError(w, http.StatusBadRequest, "请填写合法邮箱")
+		return
+	}
+	// 密码强度在哈希**之前**校验：既给用户明确反馈，也避免为不合规输入白跑一次
+	// argon2（19MiB 内存 × 每次请求）。
+	if err := auth.ValidatePassword(req.Password); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	hash, err := auth.HashPassword(req.Password)
+	if err != nil {
+		slog.Error("api: 密码哈希失败", "err", err)
+		writeError(w, http.StatusInternalServerError, "服务器内部错误，请稍后重试")
+		return
+	}
+
+	u, tenant, err := s.deps.Auth.RegisterWithInvite(r.Context(), req.Email, hash, req.InviteCode)
+	if err != nil {
+		s.limiter.recordFailure(ip, time.Now())
+		// 邀请码无效与邮箱已注册都如实告知：前者用户需要拿到有效码才能继续，
+		// 后者是用户自己的邮箱、不构成他人信息泄漏（且注册接口天然可被用于
+		// 探测邮箱是否已注册，业界通行做法是靠限流而非含糊文案来控制）。
+		writeAppError(w, err)
+		return
+	}
+
+	s.issueSession(w, r, u.ID, tenant.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tenant_id": tenant.ID})
+}
+
+// handleLogin 邮箱+密码登录。
+// POST /api/auth/login {"email","password"} → 200 + Set-Cookie / 401
 func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	// 这是唯一未鉴权入口：限流挡在线爆破，MaxBytesReader 挡超大 body 内存 DoS。
 	ip := clientIP(r)
 	if !s.limiter.allow(ip, time.Now()) {
 		writeError(w, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 4<<10) // 密码请求体 4KB 足够
+	r.Body = http.MaxBytesReader(w, r.Body, authBodyLimit)
 
 	var req struct {
+		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -28,43 +106,114 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.deps.Password == "" {
-		// 密码未配置时不给任何人开门（包括空密码尝试）：提示运维配置而不是放行。
-		slog.Warn("dashboard 密码未配置，登录被拒绝（请设置 VANE_DASHBOARD_PASSWORD）")
-		writeError(w, http.StatusUnauthorized, "服务端未配置 Dashboard 密码")
+	u, err := s.deps.Auth.GetUserByEmail(r.Context(), req.Email)
+	if err != nil {
+		// **不区分「用户不存在」**——统一走失败路径，含固定延迟，
+		// 使响应时间与内容都不泄漏该邮箱是否注册过。
+		s.authFail(w, ip)
+		return
+	}
+	if u.PasswordHash == nil {
+		// 纯飞书身份的用户没有密码（存量 owner 未接管前即是此态）。
+		s.authFail(w, ip)
+		return
+	}
+	if err := auth.VerifyPassword(*u.PasswordHash, req.Password); err != nil {
+		if !errors.Is(err, auth.ErrPasswordMismatch) {
+			// 哈希串损坏是数据问题，不是用户输错——落日志供排查，对外仍统一文案。
+			slog.Error("api: 密码哈希损坏", "user_id", u.ID, "err", err)
+		}
+		s.authFail(w, ip)
 		return
 	}
 
-	// 常数时间对比防时序侧信道（契约 §5 明确要求 subtle.ConstantTimeCompare）。
-	if subtle.ConstantTimeCompare([]byte(req.Password), []byte(s.deps.Password)) != 1 {
-		s.limiter.recordFailure(ip, time.Now())
-		// 失败固定小延迟：进一步压低爆破速率，对正常用户无感。
-		time.Sleep(200 * time.Millisecond)
-		writeError(w, http.StatusUnauthorized, "密码错误")
+	tenantID, err := s.resolveTenant(r, u.ID)
+	if err != nil {
+		writeAppError(w, err)
 		return
 	}
 
-	token, exp := s.sessions.issue(time.Now())
+	// 登录成功后按当前参数无感升级旧哈希（参数调高后的平滑迁移）。
+	if auth.NeedsRehash(*u.PasswordHash) {
+		if nh, herr := auth.HashPassword(req.Password); herr == nil {
+			if uerr := s.deps.Auth.UpdatePasswordHash(r.Context(), u.ID, nh); uerr != nil {
+				slog.Warn("api: 密码哈希升级失败（不影响本次登录）", "user_id", u.ID, "err", uerr)
+			}
+		}
+	}
+
+	s.issueSession(w, r, u.ID, tenantID)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tenant_id": tenantID})
+}
+
+// authFail 是统一的认证失败出口：固定延迟 + 统一文案 + 计入限流。
+// 三者缺一，账号枚举或爆破就有了缝隙。
+func (s *server) authFail(w http.ResponseWriter, ip string) {
+	s.limiter.recordFailure(ip, time.Now())
+	time.Sleep(uniformAuthDelay)
+	writeError(w, http.StatusUnauthorized, authFailMsg)
+}
+
+// resolveTenant 取用户所属租户。当前每用户恒 1 个（D8：初期每租户 1 人），
+// 多租户成员出现后这里要改成「按请求选租户」，届时会话仍钉住选定的那个。
+func (s *server) resolveTenant(r *http.Request, userID int64) (int64, error) {
+	ms, err := s.deps.Auth.ListMembershipsByUser(r.Context(), userID)
+	if err != nil {
+		return 0, err
+	}
+	if len(ms) == 0 {
+		// 有账号却无任何租户归属：数据不一致（注册流保证二者同事务产生）。
+		return 0, types.NewAppError(types.CodeConflict,
+			"账号尚未归属任何租户，请联系管理员", nil)
+	}
+	return ms[0].TenantID, nil
+}
+
+// issueSession 签发会话并下发 cookie。
+//
+// **每次登录都签发全新 token**（而非复用），这是防会话固定攻击的关键：
+// 攻击者若能预先把一个已知 token 塞进受害者浏览器，登录后该 token 依然有效
+// 的话，攻击者就直接持有了已认证会话。新签发让预置的 token 永远停留在未认证态。
+func (s *server) issueSession(w http.ResponseWriter, r *http.Request, userID, tenantID int64) {
+	token, hash, err := auth.NewSessionToken()
+	if err != nil {
+		slog.Error("api: 生成会话 token 失败", "err", err)
+		writeError(w, http.StatusInternalServerError, "服务器内部错误，请稍后重试")
+		return
+	}
+	exp := time.Now().Add(sessionTTL)
+	if err := s.deps.Auth.CreateSession(r.Context(), hash, userID, tenantID, exp); err != nil {
+		slog.Error("api: 会话落库失败", "user_id", userID, "err", err)
+		writeError(w, http.StatusInternalServerError, "服务器内部错误，请稍后重试")
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
 		Path:     "/",
 		Expires:  exp,
-		HttpOnly: true,
-		Secure:   true,
+		HttpOnly: true, // 挡 XSS 窃取会话
+		Secure:   true, // 只走 HTTPS
 		SameSite: http.SameSiteLaxMode,
 	})
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handleLogout 清除会话 cookie。token 无状态、服务端无会话表，
-// 清 cookie 即完成"登出"；token 本身到期前理论上仍有效，MVP 接受。
-func (s *server) handleLogout(w http.ResponseWriter, _ *http.Request) {
+// handleLogout 登出：**删库里的会话**（而非仅清 cookie）。
+//
+// 改造前只清 cookie、token 到期前理论上仍有效——那意味着「登出」在被窃取
+// token 的场景下毫无作用，而那恰恰是最需要登出生效的场景。现在服务端删除，
+// 即刻失效。
+func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+		if err := s.deps.Auth.DeleteSession(r.Context(), auth.HashSessionToken(c.Value)); err != nil {
+			slog.Warn("api: 删除会话失败", "err", err)
+		}
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
-		MaxAge:   -1, // 立即删除
+		MaxAge:   -1,
 		HttpOnly: true,
 		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
@@ -72,7 +221,51 @@ func (s *server) handleLogout(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handleMe 供前端探测登录态：能走到这里说明中间件已放行。
-func (s *server) handleMe(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+// handleMe 返回当前登录身份，供前端探测登录态。
+func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
+	p, err := auth.PrincipalFromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "user_id": p.UserID, "tenant_id": int64(p.TenantID),
+	})
+}
+
+// requireSession 是 /api/* 的认证中间件：校验会话 cookie → 把 principal 注入 ctx。
+//
+// 注入 ctx 是整条链路的关键：下游 handler 一律走 auth.PrincipalFromContext，
+// 不再有任何「全局 owner」的回退（不变量 I-A1）。中间件漏挂时下游拿不到
+// principal 而直接报错，不会静默降级成主人身份。
+func (s *server) requireSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isPublicAuthPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		c, err := r.Cookie(sessionCookieName)
+		if err != nil || c.Value == "" {
+			writeError(w, http.StatusUnauthorized, "未登录或会话已过期")
+			return
+		}
+		sess, err := s.deps.Auth.LookupSession(r.Context(), auth.HashSessionToken(c.Value))
+		if err != nil {
+			// 过期与不存在在 store 层已归一，这里一律按未登录处理。
+			writeError(w, http.StatusUnauthorized, "未登录或会话已过期")
+			return
+		}
+		ctx := auth.WithPrincipal(r.Context(), auth.Principal{
+			TenantID: types.TenantID(sess.TenantID),
+			UserID:   sess.UserID,
+		})
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// isPublicAuthPath 列出**唯二**无需会话即可访问的路径。
+// 写成显式白名单而非前缀匹配：`/api/auth/` 前缀会连 logout/me 一起放行，
+// 而那两个需要会话。
+func isPublicAuthPath(p string) bool {
+	return p == "/api/auth/login" || p == "/api/auth/register"
 }
