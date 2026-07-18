@@ -30,6 +30,21 @@ type PushTrigger interface {
 	TriggerPushNow(ctx context.Context, userID int64) (runID string, err error)
 }
 
+// scheduleUpdater / scheduleDeleter 收窄 update/remove_schedule 依赖的 scheduler 能力
+// （与 scheduleCreator 同风格，*scheduler.Scheduler 都已实现）。
+//
+// 收窄的理由不只是"能起假实现"：Execute 把工具入参翻译成 scheduler.ScheduleSpec 的
+// 那几行是**纯接线**，漏传一个字段不报错、只让该能力静默失效——本 PR 的对抗审查实测，
+// 删掉 `AnchorAt: a.Spec.AnchorAt` 后全仓测试照样绿。有了接口，替身才能捕获真正传下去
+// 的 spec，把"工具面广告的字段真的到达了 scheduler"钉进单测，而不是只断言 schema 有这个 key。
+type scheduleUpdater interface {
+	UpdatePush(ctx context.Context, schedID string, spec scheduler.ScheduleSpec, nlDesc *string) error
+}
+
+type scheduleDeleter interface {
+	DeletePush(ctx context.Context, schedID string) error
+}
+
 // profileStore 是画像两工具依赖的窄接口（M5 契约 §12.3，*store.Store 已实现），
 // 收窄后 Execute 分支可用内存假实现覆盖，不依赖数据库。
 type profileStore interface {
@@ -648,14 +663,15 @@ type updateScheduleArgs struct {
 }
 
 type updateScheduleTool struct {
-	sched *scheduler.Scheduler
+	sched scheduleUpdater
 }
 
 func (t *updateScheduleTool) Name() string { return "update_schedule" }
 func (t *updateScheduleTool) Description() string {
 	return "修改已有定时推送任务的触发频率（原地改，schedule_id 不变，不会中断调度）。" +
 		"要改推送时间用本工具，不要用「删除再新建」——那会换掉 id 且中间有空窗。" +
-		"频率用 cron（5 段，按墙上时间）或 every_seconds（固定间隔，epoch 对齐）二选一，不得高于每小时一次。"
+		"频率用 cron（5 段，按墙上时间）或 every_seconds（固定间隔；配 anchor_at 可指定从哪个时刻起，" +
+		"不配则按 epoch 对齐）二选一，不得高于每小时一次。"
 }
 func (t *updateScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(updateScheduleSchema)
@@ -702,6 +718,7 @@ func (t *updateScheduleTool) Summarize(args json.RawMessage) string {
 		formatScheduleSpec(scheduler.ScheduleSpec{
 			Cron:         a.Spec.Cron,
 			EverySeconds: a.Spec.EverySeconds,
+			AnchorAt:     a.Spec.AnchorAt, // 漏了它，卡面会说"按 epoch 对齐"而实际锚定——主动说反话
 			TZ:           a.Spec.TZ,
 		}))
 	// 描述只在显式提供时上卡：省略=不改，卡面不能让人以为描述会被动。
@@ -728,7 +745,7 @@ const removeScheduleSchema = `{
 }`
 
 type removeScheduleTool struct {
-	sched *scheduler.Scheduler
+	sched scheduleDeleter
 }
 
 func (t *removeScheduleTool) Name() string { return "remove_schedule" }
