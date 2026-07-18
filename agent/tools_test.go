@@ -682,10 +682,46 @@ type fakePlaybookStore struct {
 		scheduleID string
 		plan       string
 	}
+	// P1b b2：材料化 + 链接同步的捕获。
+	srcByURL   map[string]int64 // url → 分配的 source id（模拟 GetOrCreateSource 幂等）
+	nextSrcID  int64
+	gotSrcURLs []string           // GetOrCreateSource 收到的 url（按序）
+	links      map[string][]int64 // scheduleID → 最后一次 ReplaceScheduleSources 的 sourceIDs
+	srcErr     error              // 非 nil = GetOrCreateSource 失败
+	linkErr    error              // 非 nil = ReplaceScheduleSources 失败
+	linkCalls  int
 }
 
 func newFakePlaybookStore() *fakePlaybookStore {
-	return &fakePlaybookStore{books: map[string]*types.SchedulePlaybook{}, owner: map[string]int64{}}
+	return &fakePlaybookStore{
+		books: map[string]*types.SchedulePlaybook{}, owner: map[string]int64{},
+		srcByURL: map[string]int64{}, links: map[string][]int64{},
+	}
+}
+
+func (f *fakePlaybookStore) GetOrCreateSource(_ context.Context, src *types.Source) (int64, bool, error) {
+	f.gotSrcURLs = append(f.gotSrcURLs, src.URL)
+	if f.srcErr != nil {
+		return 0, false, f.srcErr
+	}
+	if id, ok := f.srcByURL[src.URL]; ok {
+		return id, false, nil // 已存在：原样返回，不覆写。
+	}
+	f.nextSrcID++
+	f.srcByURL[src.URL] = f.nextSrcID
+	return f.nextSrcID, true, nil
+}
+
+func (f *fakePlaybookStore) ReplaceScheduleSources(_ context.Context, userID int64, scheduleID string, sourceIDs []int64) error {
+	f.linkCalls++
+	if f.linkErr != nil {
+		return f.linkErr
+	}
+	if o, ok := f.owner[scheduleID]; ok && o != userID {
+		return nil // 非本人：归属未命中，不动链接（真 store 靠 SQL EXISTS 门禁）。
+	}
+	f.links[scheduleID] = append([]int64(nil), sourceIDs...)
+	return nil
 }
 
 func (f *fakePlaybookStore) GetSchedulePlaybook(_ context.Context, userID int64, scheduleID string) (*types.SchedulePlaybook, error) {
@@ -1153,6 +1189,10 @@ func TestCreateScheduleTool_CompilesPlan(t *testing.T) {
 		if len(pb.plans) != 1 || pb.plans[0].scheduleID != "push-7-abc" || pb.plans[0].userID != 7 {
 			t.Fatalf("应把计划落库到刚建的任务: %+v", pb.plans)
 		}
+		// b2：create 路径也经 syncPlaybookSources 材料化源 + 填链接（与 edit 共用同一 helper）。
+		if len(pb.gotSrcURLs) != 1 || len(pb.links["push-7-abc"]) != 1 {
+			t.Fatalf("create 路径应材料化 1 源并链接: urls=%v links=%v", pb.gotSrcURLs, pb.links["push-7-abc"])
+		}
 	})
 
 	t.Run("翻译失败不影响调度（best-effort）", func(t *testing.T) {
@@ -1287,6 +1327,103 @@ func TestEditTaskPlaybookTool_CompilesPlan(t *testing.T) {
 		}
 		if tr.gotText != fs.upserts[0].content {
 			t.Fatalf("翻译器输入与落库正文必须逐字一致（否则计划与库内正文漂移）")
+		}
+	})
+}
+
+// TestPlaybookB2_MaterializesSourcesAndLinks 守 P1b b2：改手册编译出计划后，把计划里的源
+// 材料化成真源行（GetOrCreateSource）并把本任务的 schedule_sources 链接整体替换为这些源。
+func TestPlaybookB2_MaterializesSourcesAndLinks(t *testing.T) {
+	setup := func(tr playbookTranslator) (*fakePlaybookStore, *editTaskPlaybookTool) {
+		fs := newFakePlaybookStore()
+		fs.owner["s1"] = 7
+		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1"}
+		return fs, &editTaskPlaybookTool{st: fs, tr: tr}
+	}
+	args := json.RawMessage(`{"schedule_id":"s1","content":"c"}`)
+
+	t.Run("两源都材料化 + 链接到其 id", func(t *testing.T) {
+		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[
+			{"platform":"web","capability":"search","url":"vane://web/search?q=a"},
+			{"platform":"web","capability":"feed","url":"https://x.com/rss"}
+		]}`)}
+		fs, tool := setup(tr)
+		if _, err := tool.Execute(context.Background(), 7, args); err != nil {
+			t.Fatalf("edit 失败: %v", err)
+		}
+		if len(fs.gotSrcURLs) != 2 {
+			t.Fatalf("应材料化 2 个源, 实得 %d: %v", len(fs.gotSrcURLs), fs.gotSrcURLs)
+		}
+		if got := fs.links["s1"]; len(got) != 2 {
+			t.Fatalf("schedule_sources 应链接 2 个源, 实得 %v", got)
+		}
+	})
+
+	t.Run("改手册减少源 → 链接整体替换", func(t *testing.T) {
+		fs, _ := setup(nil)
+		// 先编译出 2 源。
+		e2 := &editTaskPlaybookTool{st: fs, tr: &fakeTranslator{plan: json.RawMessage(`{"sources":[
+			{"platform":"web","capability":"search","url":"vane://web/search?q=a"},
+			{"platform":"web","capability":"feed","url":"https://x.com/rss"}
+		]}`)}}
+		if _, err := e2.Execute(context.Background(), 7, args); err != nil {
+			t.Fatalf("首次 edit 失败: %v", err)
+		}
+		if len(fs.links["s1"]) != 2 {
+			t.Fatalf("首次应链接 2 源, 实得 %v", fs.links["s1"])
+		}
+		// 再编译成 1 源：链接整体替换为 1。
+		e1 := &editTaskPlaybookTool{st: fs, tr: &fakeTranslator{plan: json.RawMessage(`{"sources":[
+			{"platform":"web","capability":"search","url":"vane://web/search?q=a"}
+		]}`)}}
+		if _, err := e1.Execute(context.Background(), 7, args); err != nil {
+			t.Fatalf("二次 edit 失败: %v", err)
+		}
+		if got := fs.links["s1"]; len(got) != 1 {
+			t.Fatalf("减少源后链接应整体替换为 1, 实得 %v", got)
+		}
+	})
+
+	t.Run("材料化失败则跳过链接同步、不半更新（保留既有链接）", func(t *testing.T) {
+		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[
+			{"platform":"web","capability":"search","url":"vane://web/search?q=a"},
+			{"platform":"web","capability":"feed","url":"https://x.com/rss"}
+		]}`)}
+		fs, tool := setup(tr)
+		fs.links["s1"] = []int64{99} // 预置既有链接（上次成功编译的结果）
+		fs.srcErr = errors.New("建源挂了")
+		got, err := tool.Execute(context.Background(), 7, args)
+		if err != nil {
+			t.Fatalf("材料化失败不应上抛（best-effort）: %v", err)
+		}
+		if !strings.Contains(got, "已更新定时任务") {
+			t.Fatalf("手册仍应更新成功: %q", got)
+		}
+		// 关键：材料化失败 → **不调 Replace**（不半更新）→ 既有链接原样保留，不与 fetch_plan 分叉。
+		if fs.linkCalls != 0 {
+			t.Fatalf("材料化失败应跳过链接同步，实得 linkCalls=%d", fs.linkCalls)
+		}
+		if got := fs.links["s1"]; len(got) != 1 || got[0] != 99 {
+			t.Fatalf("材料化失败不得改动既有链接，应仍为 [99]，实得 %v", got)
+		}
+	})
+
+	t.Run("链接同步失败不影响主效果（best-effort，fetch_plan 已落库）", func(t *testing.T) {
+		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=a"}]}`)}
+		fs, tool := setup(tr)
+		fs.linkErr = errors.New("写链接挂了") // ReplaceScheduleSources 失败
+		got, err := tool.Execute(context.Background(), 7, args)
+		if err != nil {
+			t.Fatalf("链接同步失败不应上抛（best-effort）: %v", err)
+		}
+		if !strings.Contains(got, "已更新定时任务") {
+			t.Fatalf("手册仍应更新成功: %q", got)
+		}
+		if fs.linkCalls != 1 {
+			t.Fatalf("材料化成功应调一次 Replace（它才返回错误）, 实得 %d", fs.linkCalls)
+		}
+		if len(fs.plans) != 1 {
+			t.Fatalf("fetch_plan 应已落库、不受链接同步失败影响, 实得 %+v", fs.plans)
 		}
 	})
 }

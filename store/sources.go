@@ -159,6 +159,41 @@ func (s *Store) UpsertSource(ctx context.Context, src *types.Source) (id int64, 
 	return id, xmax != 0, nil
 }
 
+// GetOrCreateSource 按 url（幂等键）取源：不存在就按传入字段建，**已存在则原样返回其 id、
+// 绝不改动既有行**（config/title/status 一律不碰）。与 UpsertSource 的关键区别正是"不覆写"：
+// 任务手册材料化 plan 源时（P1b b2），plan 源可能与用户 add_source 的源撞同一 url（幂等键
+// 全局一份、共享抓取），此时若像 UpsertSource 那样覆写 config，就会把用户源的配置（如 RSS
+// 的 categories）改掉——"引用一个源"不该改动它。也不 re-enable 被自动停用的源（M-1 语义）。
+//
+// created=true 表示本次真的新建。实现同 UpsertContentItem：ON CONFLICT DO NOTHING（冲突不
+// 返回行）+ 命中时回查一次拿既有 id。
+func (s *Store) GetOrCreateSource(ctx context.Context, src *types.Source) (id int64, created bool, err error) {
+	cfg := src.Config
+	if len(cfg) == 0 {
+		cfg = json.RawMessage("{}")
+	}
+	created = true
+	err = s.pool.QueryRow(ctx,
+		`INSERT INTO sources (platform, capability, url, title, config)
+		 VALUES ($1, $2, $3, $4, $5)
+		 ON CONFLICT (url) DO NOTHING
+		 RETURNING id`,
+		src.Platform, src.Capability, src.URL, src.Title, cfg).Scan(&id)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("建信源（url=%s）", src.URL), err)
+		}
+		// 命中既有 url：不改动它，只回查 id。
+		created = false
+		if qerr := s.pool.QueryRow(ctx, `SELECT id FROM sources WHERE url = $1`, src.URL).Scan(&id); qerr != nil {
+			return 0, false, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("回查既有信源（url=%s）", src.URL), qerr)
+		}
+	}
+	return id, created, nil
+}
+
 // UpdateSourceFetchState 抓取完成后同步写 last_fetched_at / next_fetch_at / fail_count。
 // next_fetch_at 是 001 的预计算列（调度靠它命中 (status, next_fetch_at) 索引），
 // 由抓取方按 interval 算好后传入，store 层只负责落库。
