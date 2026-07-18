@@ -1,25 +1,26 @@
 package auth_test
 
 import (
-	"bytes"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
-	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-// exemptMarker 是文件级豁免标记。带此标记的文件跳过本守卫。
+// exemptMarker 是文件级豁免标记，必须写成注释。带此标记的文件跳过本守卫。
 //
 // **豁免不是免罪牌，是一处必须写明理由的例外**：标记要求写在被豁免文件自身
-// （见下方 Walk 里的说明），且约定后面跟一句为什么。当前唯一的豁免是
-// feishu/handler.go——它同时出现两个标识符是因为「owner 首次捕获」与
-// 「入站消息为发信人建 user 行」两件事恰好都在那里，二者用的是**消息发送者的**
-// open_id 而非 owner 记录里的，不构成 principal 解析链。
+// （而不是攒在本测试的白名单里），谁将来想在该文件加 principal 解析，一眼就能
+// 看见豁免存在及其理由，而不是改完提交才被 CI 拦——或更糟，因为文件恰好在
+// 白名单里而根本不被拦。当前唯一豁免是 feishu/handler.go，理由见该文件头部。
 //
-// 已知残留局限（诚实记录，不假装守住了）：正则看不到数据流，因此**无法**分辨
-// 豁免文件里将来新增的代码是不是真的 principal 复述。豁免文件是本守卫的盲区，
-// 加豁免要慎重。
+// 已知残留局限（诚实记录，不假装守住了）：本守卫做的是语法级判定，看不到数据流，
+// 因此**无法**分辨豁免文件里将来新增的代码是不是真的 principal 复述。
+// 豁免文件是本守卫的盲区，加豁免要慎重。
 const exemptMarker = "//go:principal-exempt"
 
 // TestInvariant_SinglePrincipalSource 是不变量 I-A1 的守卫（企业级契约 §1.1）。
@@ -28,25 +29,29 @@ const exemptMarker = "//go:principal-exempt"
 // （加租户、换真实登录），要同时改三处且极易漏改，而漏改的后果是「某条入口仍以
 // 全局 owner 身份执行」，即越权。本测试把「又冒出第四份副本」变成 CI 红灯。
 //
-// 判据：除 auth 包自身外，任何 .go 文件都不得同时出现「owner 设置键」与
-// 「**调用** UpsertUserByOpenID」——两者并存正是 principal 解析链的指纹。
+// 判据：除 auth 包与显式豁免文件外，任何 .go 文件都不得同时出现
+// ① 对 owner 设置键的引用（标识符 SettingKeyOwner/settingKeyOwner，或**任何**
+// 字面量其值含 feishu_owner）与 ② 对 UpsertUserByOpenID 的**调用**。二者并存
+// 正是 principal 解析链的指纹。
 //
-// 判据经过两次收紧（首版误报两个，收紧后为零）：
-//   - **剥掉注释再匹配**：cmd/gate/main.go 的注释里提到 UpsertUserByOpenID
-//     以说明「解析会写一次库」的取舍，那是文档不是实现。
-//   - **只认调用形式 `.UpsertUserByOpenID(`，不认方法定义**：a2a/chat_test.go 的
-//     测试替身要实现这个方法，那是替身不是第二个 principal 来源。
+// # 为什么是 AST 而不是正则
 //
-// 反过来，真要复述解析链就必然写出 `store.UpsertUserByOpenID(ctx, ...)` 这样的调用，
-// 仍会被抓住——收紧的是误报，不是漏报。
+// 首版用「剥注释 + 正则」，被对抗审查用实证打穿两次，两次都是 fail-open（静默放行）：
+//
+//  1. 剥注释器不认字符串字面量：字符串里出现 `/*` 而无闭合时，它会**丢弃文件剩余
+//     全部内容**。审查实测本仓库当日就有两个文件被静默截断——fetcher/fetcher.go
+//     的 Accept 头含 `*/*;q=0.5`（丢掉 87% 字节）、store/migrate_test.go 的
+//     `"migrations/*.sql"`。任何加在截断点之后的复述都能 CI 全绿。
+//     首版注释还断言「误剥字符串不会造成漏报」——恰好说反了。
+//  2. 正则写死双引号 "feishu_owner"，而 store 包里最自然的复述写法是原生 SQL
+//     单引号 `WHERE key = 'feishu_owner'`，直接绕过。（且 feishu 导入 store、
+//     反向成环，未来 store/owner.go 只能硬编码 key，必然落进这个盲区。）
+//
+// AST 从根上消掉这两类问题：字面量与标识符由解析器区分，引号形式无关；
+// 方法**调用**（CallExpr+SelectorExpr）与方法**定义**（FuncDecl）天然是不同节点。
 func TestInvariant_SinglePrincipalSource(t *testing.T) {
 	root := repoRoot(t)
-	// (?i) 大小写不敏感：feishu 包同时定义了导出常量 SettingKeyOwner 与未导出别名
-	// settingKeyOwner（manager.go），只匹配大写会被小写别名整个绕过——对抗审查用
-	// A/B 实证抓到过：同一份复述代码，用小写别名守卫放行、改大写就变红。
-	ownerKeyRe := regexp.MustCompile(`(?i)settingkeyowner|"feishu_owner"`)
-	// 调用形式：<接收者>.UpsertUserByOpenID( —— 与 `func (f *x) UpsertUserByOpenID(` 区分开。
-	upsertCallRe := regexp.MustCompile(`\w\.UpsertUserByOpenID\(`)
+	fset := token.NewFileSet()
 
 	var offenders []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -54,8 +59,9 @@ func TestInvariant_SinglePrincipalSource(t *testing.T) {
 			return err
 		}
 		if info.IsDir() {
-			// 跳过 vendor 化的第三方 SDK 与 .git：不是我们的代码，不受本不变量约束。
-			if name := info.Name(); name == "third_party" || name == ".git" || name == "node_modules" {
+			// 跳过 vendor 化的第三方 SDK 与非源码目录：不是我们的代码，不受本不变量约束。
+			switch info.Name() {
+			case "third_party", ".git", "node_modules", "web":
 				return filepath.SkipDir
 			}
 			return nil
@@ -64,22 +70,24 @@ func TestInvariant_SinglePrincipalSource(t *testing.T) {
 			return nil
 		}
 		rel, _ := filepath.Rel(root, path)
-		// auth 包是唯一合法的 principal 来源；本测试自身也豁免。
+		// auth 包是唯一合法的 principal 来源；本测试自身也在其中。
 		if strings.HasPrefix(rel, "auth"+string(filepath.Separator)) {
 			return nil
 		}
-		src, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		// 豁免标记刻意要求写在**被豁免的文件自身**，而不是攒在本测试的白名单里：
-		// 谁将来想在该文件里加一份 principal 解析，一眼就能看见豁免存在及其理由，
-		// 而不是改完提交才被 CI 拦（或更糟——因为文件恰好在白名单里而根本没被拦）。
-		if bytes.Contains(src, []byte(exemptMarker)) {
+
+		f, perr := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		if perr != nil {
+			// **解析失败必须响亮失败，不能静默跳过**——静默跳过正是首版被打穿的
+			// 那种 fail-open 姿势：一个永远不报警的守卫等于没有守卫。
+			t.Errorf("守卫无法解析 %s（无法判定是否违反 I-A1）: %v", rel, perr)
 			return nil
 		}
-		text := stripComments(string(src))
-		if ownerKeyRe.MatchString(text) && upsertCallRe.MatchString(text) {
+		// 豁免标记按注释节点判定，不按裸文本搜索：否则字符串字面量里出现该标记
+		// 就能骗过豁免——那是首版同一类 bug 的翻版。
+		if hasExemptComment(f) {
+			return nil
+		}
+		if refsOwnerKey(f) && callsUpsert(f) {
 			offenders = append(offenders, rel)
 		}
 		return nil
@@ -90,42 +98,82 @@ func TestInvariant_SinglePrincipalSource(t *testing.T) {
 
 	if len(offenders) > 0 {
 		t.Errorf("不变量 I-A1 被破坏——以下文件疑似复述了 principal 解析链"+
-			"（同时出现 owner 设置键与 UpsertUserByOpenID）：\n  %s\n"+
-			"principal 只能有一个来源：auth.PrincipalResolver。"+
-			"若确需读取 owner 设置做别的事，请拆分该文件或在此显式豁免并说明理由。",
-			strings.Join(offenders, "\n  "))
+			"（同时引用 owner 设置键与调用 UpsertUserByOpenID）：\n  %s\n"+
+			"principal 只能有一个来源：auth.PrincipalResolver。若该文件确有正当理由"+
+			"同时出现二者（如 owner 捕获路径），请在文件头加 %s 并写明理由。",
+			strings.Join(offenders, "\n  "), exemptMarker)
 	}
 }
 
-// stripComments 去掉 Go 源码里的行注释与块注释，避免「注释里提到某个方法名」
-// 被误判成实现。不做完整词法分析：字符串字面量里的 "//" 会被误剥，但本守卫只
-// 关心两个标识符是否并存，误剥字符串不会造成漏报（标识符不会藏在被剥掉的片段里
-// 却又不出现在别处）。
-func stripComments(src string) string {
-	var b strings.Builder
-	b.Grow(len(src))
-	for i := 0; i < len(src); {
-		switch {
-		case strings.HasPrefix(src[i:], "//"):
-			j := strings.IndexByte(src[i:], '\n')
-			if j < 0 {
-				return b.String()
+// hasExemptComment 判定文件是否带豁免标记（只认注释节点）。
+func hasExemptComment(f *ast.File) bool {
+	for _, cg := range f.Comments {
+		for _, c := range cg.List {
+			if strings.Contains(c.Text, exemptMarker) {
+				return true
 			}
-			b.WriteByte('\n')
-			i += j + 1
-		case strings.HasPrefix(src[i:], "/*"):
-			j := strings.Index(src[i+2:], "*/")
-			if j < 0 {
-				return b.String()
-			}
-			b.WriteByte(' ')
-			i += 2 + j + 2
-		default:
-			b.WriteByte(src[i])
-			i++
 		}
 	}
-	return b.String()
+	return false
+}
+
+// refsOwnerKey 判定文件是否引用了 owner 设置键。覆盖三种写法：
+//   - 标识符 SettingKeyOwner / settingKeyOwner（含 feishu.SettingKeyOwner 选择器）
+//   - 任何字符串字面量，其**值**含 feishu_owner——引号形式无关，
+//     故 "feishu_owner"、`… WHERE key = 'feishu_owner'` 都能命中
+func refsOwnerKey(f *ast.File) bool {
+	found := false
+	ast.Inspect(f, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.Ident:
+			if strings.EqualFold(x.Name, "SettingKeyOwner") {
+				found = true
+			}
+		case *ast.SelectorExpr:
+			if strings.EqualFold(x.Sel.Name, "SettingKeyOwner") {
+				found = true
+			}
+		case *ast.BasicLit:
+			if x.Kind != token.STRING {
+				return true
+			}
+			// Unquote 同时处理解释型字符串与反引号原生字符串；失败则退回原文匹配，
+			// 宁可多报也不漏报。
+			s, uerr := strconv.Unquote(x.Value)
+			if uerr != nil {
+				s = x.Value
+			}
+			if strings.Contains(s, "feishu_owner") {
+				found = true
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// callsUpsert 判定文件是否**调用**了 UpsertUserByOpenID。
+// 只认 CallExpr 上的 SelectorExpr——方法定义是 FuncDecl，天然不会命中，
+// 故测试替身实现该方法不算违规（首版正则要靠特判才能区分，AST 免费得到）。
+func callsUpsert(f *ast.File) bool {
+	found := false
+	ast.Inspect(f, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "UpsertUserByOpenID" {
+			found = true
+		}
+		return true
+	})
+	return found
 }
 
 // repoRoot 从当前包目录（auth/）上溯到含 go.mod 的仓库根。
