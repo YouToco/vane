@@ -11,7 +11,7 @@
   `fetcher/pagewatch.go`、`store/pagesnapshots.go`、`fetcher.SnapshotStore` 接口、
   `types.CapPageWatch/KindChange/SnapshotVerdict/RefTypeSource/PageSnapshot`、scorer 的
   change 打分 prompt、workflow Dedup 的 change 豁免、sourcecatalog 的 `web/page_watch` 条目、
-  agent `add_source` 工具对 `page_watch` 的暴露；迁移 015 DROP `page_snapshots` 表。
+  agent `add_source` 工具对 `page_watch` 的暴露；迁移 016 DROP `page_snapshots` 表。
   `kind` 列与 `KindArticle` 保留（承载全内容；当前唯一种类）。M6 契约 §10 标注为已下线的历史设计记录。
   连带消解审计发现的 3 项（page_watch 幂等键裸 URL 源劫持、LLM 门 SettleSnapshot 死路径、
   PageWatchFetcher.Fetch 主流程零测试）。`go vet`/全量单测（23 包）绿。
