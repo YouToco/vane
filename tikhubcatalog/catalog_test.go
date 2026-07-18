@@ -64,20 +64,23 @@ func TestInvariant_ExcludedTagsAbsent(t *testing.T) {
 	}
 }
 
-// TestInvariant_SideEffectEndpointsAbsent：会改变第三方平台状态的写端点（刷播放/
-// 刷浏览/注册设备）不得进只读查询目录（对抗审查 HIGH 缺陷）。lookup 层免确认直调，
-// 这些写端点混进来 = agent 可无确认刷量，必须在 gen 里精确排除。
-func TestInvariant_SideEffectEndpointsAbsent(t *testing.T) {
+// TestInvariant_ExcludedEndpointsAbsent：精确排除的端点不得进只读查询目录。
+// 两类（对抗审查 HIGH + Boss 拍板 2026-07-18）：① 改第三方平台状态的写端点（刷播放/
+// 刷浏览/注册设备）——lookup 层免确认直调，混进来 = agent 可无确认刷量；② 越界/社工
+// 风险端点（生成发私信唤起链接）。
+func TestInvariant_ExcludedEndpointsAbsent(t *testing.T) {
 	banned := []string{
 		"douyin_app_v3_add_video_play_count",
 		"tiktok_app_v3_add_video_play_count",
 		"pipixia_app_fetch_increase_post_view_count",
 		"douyin_app_v3_register_device",
 		"tiktok_web_device_register",
+		"douyin_app_v3_open_douyin_app_to_send_private_message",
+		"tiktok_app_v3_open_tiktok_app_to_send_private_message",
 	}
 	for _, name := range banned {
 		if _, ok := Lookup(name); ok {
-			t.Errorf("副作用写端点 %s 不应入只读查询目录", name)
+			t.Errorf("排除端点 %s 不应入只读查询目录", name)
 		}
 	}
 }

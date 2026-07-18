@@ -49,18 +49,27 @@ var excludedTags = map[string]bool{
 	"iOS-Shortcut":          true, // iOS 快捷指令
 }
 
-// sideEffectEndpoints 是**会改变第三方平台状态的写端点**，按 path-slug 精确排除
-// （对抗审查 HIGH 缺陷）。lookup 层的免确认前提是「查询不改系统状态」（契约 §0.3/§3），
-// 而这些端点会真实涨播放/涨浏览/注册设备——被刷量灰产利用的写操作，绝不能进一个
-// agent 免确认直调的信源查询目录。它们本就不属于 lookup 层；若确有需要，另走确认卡
-// 路径单独实现。精确匹配而非关键词：避免误伤「获取点赞列表」「获取关注列表」这类
-// 内容涉及点赞/关注但本身只读的 fetch_ 端点。
-var sideEffectEndpoints = map[string]bool{
+// excludedEndpoints 按 path-slug 精确排除单个端点（两类原因，见各条注释）：
+//
+//  1. 会改变第三方平台状态的**写端点**（对抗审查 HIGH 缺陷）：lookup 层的免确认前提
+//     是「查询不改系统状态」（契约 §0.3/§3），而这些端点会真实涨播放/涨浏览/注册
+//     设备——被刷量灰产利用的写操作，绝不能进 agent 免确认直调的信源查询目录。
+//  2. 越界/有社工风险的能力（Boss 拍板 2026-07-18）：生成「唤起 APP 给指定用户发私信」
+//     链接的端点本身只读（只返回链接），但对信源查询产品偏门，且 agent 生成「点此
+//     私信某人」链接有社工风险，排除。
+//
+// 精确匹配而非关键词：避免误伤「获取点赞列表」「获取关注列表」这类内容涉及点赞/关注
+// 但本身只读的 fetch_ 端点。二类端点若确有需要，另走专门路径单独实现。
+var excludedEndpoints = map[string]bool{
+	// —— 写端点（改第三方平台状态）——
 	"douyin_app_v3_add_video_play_count":         true, // 增加作品播放数（刷量写）
 	"tiktok_app_v3_add_video_play_count":         true, // 增加作品播放数（刷量写）
 	"pipixia_app_fetch_increase_post_view_count": true, // 增加作品浏览数（刷量写）
 	"douyin_app_v3_register_device":              true, // 注册设备（产生真实设备指纹）
 	"tiktok_web_device_register":                 true, // 注册设备（产生真实设备指纹）
+	// —— 越界/社工风险（只读但排除）——
+	"douyin_app_v3_open_douyin_app_to_send_private_message": true, // 生成私信唤起链接
+	"tiktok_app_v3_open_tiktok_app_to_send_private_message": true, // 生成私信唤起链接
 }
 
 // toolNameRe 是 FC 工具名的合法字符集（DeepSeek/OpenAI 兼容面）。
@@ -192,8 +201,8 @@ func buildEntries(sp *spec) ([]outEntry, error) {
 			}
 
 			name := toolName(path)
-			if sideEffectEndpoints[name] {
-				continue // 会改变第三方平台状态的写端点，不进只读查询目录（见 sideEffectEndpoints）
+			if excludedEndpoints[name] {
+				continue // 端点级精确排除（写端点/越界能力，见 excludedEndpoints）
 			}
 			if !toolNameRe.MatchString(name) {
 				return nil, fmt.Errorf("生成的工具名 %q（来自 %s）不符合 FC 命名约束，需人工处理", name, path)

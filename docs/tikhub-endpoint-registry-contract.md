@@ -47,11 +47,12 @@ content_items；某端点若证明适合做订阅信源，走 sourcecatalog 实�
   不做运行时拉取，上游一次发布不得静默改变 agent 能调什么。
 - **收录范围**（Boss 拍板）：排除平台管理类 6 个 tag（TikHub-User/Downloader/Demo/
   Health-Check/Temp-Mail/iOS-Shortcut），其余全收（含星图/DouPlus/广告等营销数据类
-  ——对行业情报有用）。**另按 path-slug 精确排除会改变第三方平台状态的写端点**
-  （刷播放 add_video_play_count ×2、刷浏览 increase_post_view_count、注册设备 ×2，
-  见 gen 的 sideEffectEndpoints）：lookup 层免确认直调，这类写操作混进来 = agent
-  可无确认刷量，与 §3 的「查询不改系统状态」前提冲突。精确匹配而非关键词，避免误伤
-  「获取点赞/关注/收藏列表」这类只读 fetch_ 端点。当前 997 个端点、20 平台。
+  ——对行业情报有用；营销类多需广告主账号授权，Boss 拍板先全留、靠调用日志实证哪些
+  真能用）。**另按 path-slug 精确排除单个端点**（gen 的 excludedEndpoints）两类：
+  ① 改第三方平台状态的写端点（刷播放 ×2、刷浏览、注册设备 ×2）——lookup 层免确认直调，
+  混进来 = agent 可无确认刷量，与 §3「查询不改系统状态」冲突；② 越界/社工风险端点
+  （生成发私信唤起链接 ×2，只读但偏门+风险，Boss 拍板排除）。精确匹配而非关键词，避免
+  误伤「获取点赞/关注/收藏列表」这类只读 fetch_ 端点。当前 995 个端点、20 平台。
 - **工具命名**：path-slug（`/api/v1/tiktok/web/fetch_post_detail` →
   `tiktok_web_fetch_post_detail`）。不用 operationId：FastAPI 生成的 operationId
   561/1024 超 FC 64 字符上限；path-slug 全量唯一且最长 61（实测）。gen 硬校验

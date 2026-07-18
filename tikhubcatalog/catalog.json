@@ -1744,31 +1744,6 @@
   ]
  },
  {
-  "name": "douyin_app_v3_open_douyin_app_to_send_private_message",
-  "method": "GET",
-  "path": "/api/v1/douyin/app/v3/open_douyin_app_to_send_private_message",
-  "tag": "Douyin-App-V3-API",
-  "platform": "douyin",
-  "summary": "生成抖音分享链接，唤起抖音APP，给指定用户发送私信/Generate Douyin share link, call Douyin APP, and send private messages to specified users",
-  "description": "# [中文]\n### 用途:\n- 生成抖音分享链接，唤起抖音APP，给指定用户发送私信。\n\n### 参数:\n- uid: 用户id\n- sec_uid: 用户sec_uid\n- 注意: 请确保user_id和sec_uid都有值，否则无法发送私信给指定用户。\n\n### 返回:\n- 分享链接\n\n# [English]\n### Purpose:\n- Generate Douyin share link, call Douyin APP, and send private messages to specified users\n\n### Parameters:\n- uid: User id\n- sec_uid: User sec_uid\n- Note: Please make sure that both user_id and sec_uid have values, otherwise you cannot send private messages to the specified user.\n\n### Return:\n- Share link\n\n# [示例/Example]\nuid = \"96874812426\"\nsec_uid = \"MS4wLjABAAAA9y04iBlVdeMQqTJbqsQZKb-tqWqWW29jPVJqideHT70\"",
-  "params": [
-   {
-    "name": "uid",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "用户id/User id"
-   },
-   {
-    "name": "sec_uid",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "用户sec_uid/User sec_uid"
-   }
-  ]
- },
- {
   "name": "douyin_app_v3_open_douyin_app_to_user_profile",
   "method": "GET",
   "path": "/api/v1/douyin/app/v3/open_douyin_app_to_user_profile",
@@ -19706,24 +19681,6 @@
     "required": true,
     "type": "string",
     "desc": "关键词/Keyword"
-   }
-  ]
- },
- {
-  "name": "tiktok_app_v3_open_tiktok_app_to_send_private_message",
-  "method": "GET",
-  "path": "/api/v1/tiktok/app/v3/open_tiktok_app_to_send_private_message",
-  "tag": "TikTok-App-V3-API",
-  "platform": "tiktok",
-  "summary": "生成TikTok分享链接，唤起TikTok APP，给指定用户发送私信/Generate TikTok share link, call TikTok APP, and send private messages to specified users",
-  "description": "# [中文]\n### 用途:\n- 生成TikTok分享链接，唤起TikTok APP，给指定用户发送私信。\n\n### 参数:\n- uid: 用户id，从用户主页接口中获取。\n- 注意: 如果未能跳转，请确保APP已经在后台运行。\n\n### 返回:\n- 分享链接\n\n# [English]\n### Purpose:\n- Generate TikTok share link, call TikTok APP, and send private messages to specified users\n\n### Parameters:\n- uid: User id, obtained from the user profile interface.\n- Note: If you cannot jump, please make sure that the APP is running in the background.\n\n### Return:\n- Share link\n\n# [示例/Example]\nuid = \"7059867056504407087\"",
-  "params": [
-   {
-    "name": "uid",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "用户id/User id"
    }
   ]
  },

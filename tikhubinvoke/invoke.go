@@ -3,7 +3,7 @@
 // body / path 替换），结果原样返回给调用方（agent 端点工具）。
 //
 // 与 fetcher 各 TikHub 抓取器的分界：fetcher 是订阅信源管道（归一化进 content_items，
-// 逐端点手写、实测准入）；本包是 lookup 面（1002 端点共用一个装配器，零归一化），
+// 逐端点手写、实测准入）；本包是 lookup 面（约 1000 端点共用一个装配器，零归一化），
 // 二者只共享 config 里的同一个 API key。目标恒为固定可信主机 api.tikhub.io
 // （URL 非用户可控），与 fetcher/tikhub.go 同理不需要 SSRF 拦截。
 package tikhubinvoke
