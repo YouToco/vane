@@ -36,10 +36,13 @@ type profileStore interface {
 	UpsertProfileFields(ctx context.Context, userID int64, industry, occupation *string, tags []string) (*types.Profile, error)
 }
 
-// BuildTools 装配 agent 全部可用工具。返回的切片即工具白名单（契约 §10）：
-// loop 只认这里注册的名字，模型编造的工具名一律拒绝。
-func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger) []Tool {
-	return []Tool{
+// BuildTools 装配 agent 全部可用工具。返回的切片即工具白名单的静态部分（契约 §10）：
+// loop 只认这里注册的名字 + 会话已激活的 TikHub 端点（端点注册表契约 §4），
+// 模型编造的其余工具名一律拒绝。
+// endpoints 为 nil（TikHub key 未配置）时不装配 search_endpoints，工具面与
+// 该特性上线前完全一致。
+func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger, endpoints *EndpointTools) []Tool {
+	tools := []Tool{
 		&listSourcesTool{st: st},
 		&addSourceTool{st: st},
 		&removeSourceTool{st: st},
@@ -50,6 +53,10 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger)
 		&viewProfileTool{st: st},
 		&updateProfileTool{st: st},
 	}
+	if endpoints != nil {
+		tools = append(tools, endpoints.SearchTool())
+	}
+	return tools
 }
 
 // emptyParamsSchema 是无参工具的 JSON schema：仍须是合法 object schema，

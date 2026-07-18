@@ -32,6 +32,7 @@ import (
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/scorer"
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/tikhubinvoke"
 	"github.com/YouToco/vane/workflow"
 )
 
@@ -144,7 +145,14 @@ func run() error {
 	// manager 注入）：push_now 工具依赖 scheduler（TriggerPushNow 即 PushTrigger 窄接口），
 	// 故装配在 scheduler 之后；注入须在 manager.Start 之前，保证 WS 连接建立时
 	// 消息链已能走 agent 而非回退 chat_reply。
-	tools := agent.BuildTools(st, sched, sched)
+	// TikHub 端点工具面（端点注册表契约 §3）：key 未配置则不装配（endpoints=nil），
+	// agent 退化为纯静态工具面——比装一个恒报"key 缺失"的检索工具干净。
+	var endpoints *agent.EndpointTools
+	if cfg.Fetch.TikhubAPIKey != "" {
+		endpoints = agent.NewEndpointTools(tikhubinvoke.New(cfg.Fetch), st,
+			cfg.Agent.EndpointMsgCap, cfg.Agent.EndpointDailyCap)
+	}
+	tools := agent.BuildTools(st, sched, sched, endpoints)
 	agentLoop := agent.New(agent.Deps{
 		Client:     llmClient,
 		Recorder:   recorder,
@@ -154,6 +162,8 @@ func run() error {
 		Model:      cfg.LLM.AgentModel,
 		MaxTurns:   cfg.Agent.MaxTurns,
 		SessionTTL: time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
+		Endpoints:  endpoints,
+		ToolCalls:  agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
 	})
 	manager.SetAgent(agentLoop)
 

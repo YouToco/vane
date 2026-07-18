@@ -69,7 +69,7 @@ func TestAgentStore(t *testing.T) {
 		}
 
 		msgs := json.RawMessage(`[{"role":"user","content":"你好"},{"role":"assistant","content":"你好，我是见微"}]`)
-		if err := st.UpdateAgentSession(ctx, created.ID, msgs, 1); err != nil {
+		if err := st.UpdateAgentSession(ctx, created.ID, msgs, 1, nil); err != nil {
 			t.Fatalf("UpdateAgentSession() 失败: %v", err)
 		}
 
@@ -94,7 +94,7 @@ func TestAgentStore(t *testing.T) {
 		}
 
 		// 更新不存在的会话应返回 NotFound（防拿着被清理的 id 静默丢消息）。
-		if err := st.UpdateAgentSession(ctx, -1, msgs, 2); !errors.Is(err, types.ErrNotFound) {
+		if err := st.UpdateAgentSession(ctx, -1, msgs, 2, nil); !errors.Is(err, types.ErrNotFound) {
 			t.Errorf("更新不存在会话应 ErrNotFound，实际: %v", err)
 		}
 	})
@@ -293,7 +293,7 @@ func TestAgentStore(t *testing.T) {
 			t.Fatalf("CreateAgentSession() 失败: %v", err)
 		}
 		base := json.RawMessage(`[{"role":"user","content":"帮我加个源"}]`)
-		if err := st.UpdateAgentSession(ctx, sess.ID, base, 1); err != nil {
+		if err := st.UpdateAgentSession(ctx, sess.ID, base, 1, nil); err != nil {
 			t.Fatalf("UpdateAgentSession() 失败: %v", err)
 		}
 		before, err := st.GetActiveAgentSession(ctx, u.ID, time.Now().Add(-30*time.Minute))

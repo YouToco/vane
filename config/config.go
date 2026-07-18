@@ -102,6 +102,12 @@ type AgentConfig struct {
 	// SessionTTLMinutes 是会话闲置过期窗口（分钟）：同一 owner 在窗口内的
 	// 消息共享一个多轮会话（上下文连续），超时后新开会话（契约 §0）。
 	SessionTTLMinutes int `mapstructure:"session_ttl_minutes"`
+	// TikHub 端点调用护栏（端点注册表契约 §7，Boss 拍板 2026-07-17：免确认 + 双重限额）。
+	// EndpointMsgCap 单条用户消息内的端点调用上限（一条消息最多 20 模型轮，不设限
+	// 一轮循环就能烧几十次按次计费调用）；EndpointDailyCap 滚动 24h 窗口的调用总量
+	// 上限（从 tool_calls 表 COUNT，含失败调用——失败同样计费）。
+	EndpointMsgCap   int `mapstructure:"endpoint_msg_cap"`
+	EndpointDailyCap int `mapstructure:"endpoint_daily_cap"`
 }
 
 // LogConfig 是日志配置。
@@ -205,6 +211,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("agent.max_turns", 20)
 	v.SetDefault("agent.token_budget_daily", 100000)
 	v.SetDefault("agent.session_ttl_minutes", 30)
+	v.SetDefault("agent.endpoint_msg_cap", 10)
+	v.SetDefault("agent.endpoint_daily_cap", 200)
 
 	v.SetDefault("log.level", "info")
 
