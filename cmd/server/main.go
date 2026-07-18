@@ -156,7 +156,10 @@ func run() error {
 		endpoints = agent.NewEndpointTools(tikhubinvoke.New(cfg.Fetch), st,
 			cfg.Agent.EndpointMsgCap, cfg.Agent.EndpointDailyCap)
 	}
-	tools := agent.BuildTools(st, sched, sched, endpoints)
+	// 任务手册翻译器（P1 编译层）：create/edit 手册后据此把正文编译成 fetch_plan。
+	// 用 client 默认模型（同 scorer/cardgen），走 recorder 记账；一次 llm.Do、DisableThinking。
+	playbookTr := agent.NewPlaybookTranslator(llmClient, recorder)
+	tools := agent.BuildTools(st, sched, sched, playbookTr, endpoints)
 	agentLoop := agent.New(agent.Deps{
 		Client:     llmClient,
 		Recorder:   recorder,

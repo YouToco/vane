@@ -60,6 +60,8 @@ type profileStore interface {
 type playbookStore interface {
 	GetSchedulePlaybook(ctx context.Context, userID int64, scheduleID string) (*types.SchedulePlaybook, error)
 	UpsertSchedulePlaybook(ctx context.Context, userID int64, scheduleID, content string) (ok bool, err error)
+	// SetFetchPlan 只改 fetch_plan（P1 编译层），归属同 Upsert 进 SQL；ok=false=任务不存在/非本人/无手册行。
+	SetFetchPlan(ctx context.Context, userID int64, scheduleID string, plan json.RawMessage) (ok bool, err error)
 }
 
 // scheduleCreator 收窄 create_schedule 依赖的 scheduler 能力（*scheduler.Scheduler 已实现），
@@ -73,21 +75,23 @@ type scheduleCreator interface {
 // 模型编造的其余工具名一律拒绝。
 // endpoints 为 nil（TikHub key 未配置）时不装配 search_endpoints，工具面与
 // 该特性上线前完全一致。
-func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger, endpoints *EndpointTools) []Tool {
+// tr 是任务手册翻译器（P1 编译层）：create/edit 手册后据此把正文编译成 fetch_plan。
+// 允许为 nil（未装配 LLM 的路径/测试）——此时手册仍可存取，只是不编译计划（best-effort）。
+func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger, tr playbookTranslator, endpoints *EndpointTools) []Tool {
 	tools := []Tool{
 		&listSourcesTool{st: st},
 		&addSourceTool{st: st},
 		&removeSourceTool{st: st},
 		&enableSourceTool{st: st},
 		&listSchedulesTool{st: st},
-		&createScheduleTool{sched: sched, st: st}, // 加 st：创建即初始化手册（决策 D2）
+		&createScheduleTool{sched: sched, st: st, tr: tr}, // st：创建即初始化手册（D2）；tr：并编译计划（P1）
 		&updateScheduleTool{sched: sched},
 		&removeScheduleTool{sched: sched},
 		&pushNowTool{pusher: pusher},
 		&viewProfileTool{st: st},
 		&updateProfileTool{st: st},
-		&viewTaskPlaybookTool{st: st}, // 情报任务手册（Task Playbook P0）
-		&editTaskPlaybookTool{st: st},
+		&viewTaskPlaybookTool{st: st}, // 情报任务手册（Task Playbook）
+		&editTaskPlaybookTool{st: st, tr: tr},
 	}
 	if endpoints != nil {
 		tools = append(tools, endpoints.SearchTool())
@@ -535,7 +539,8 @@ type createScheduleArgs struct {
 
 type createScheduleTool struct {
 	sched scheduleCreator
-	st    playbookStore // 创建即初始化任务手册（决策 D2）
+	st    playbookStore      // 创建即初始化任务手册（决策 D2）
+	tr    playbookTranslator // 并把手册意图编译成 fetch_plan（P1 编译层；nil=跳过）
 }
 
 func (t *createScheduleTool) Name() string { return "create_schedule" }
@@ -578,10 +583,14 @@ func (t *createScheduleTool) Execute(ctx context.Context, userID int64, args jso
 	// 意图原文初始化手册（P0 只存、不翻译成 fetch_plan、不影响抓取）。best-effort：手册写
 	// 失败不回滚已建成的调度——调度是主效果、P0 手册尚不参与抓取，为非功能性的手册写失败去
 	// 补偿删 Temporal 调度得不偿失；仅 slog 供对账（与 DeletePush 镜像删除失败只 slog 同原则）。
-	if ok, perr := t.st.UpsertSchedulePlaybook(ctx, userID, schedID, capPlaybookContent(a.NLDescription)); perr != nil {
+	content := capPlaybookContent(a.NLDescription)
+	if ok, perr := t.st.UpsertSchedulePlaybook(ctx, userID, schedID, content); perr != nil {
 		slog.Error("agent: create_schedule 初始化任务手册失败（调度已创建）", "schedule_id", schedID, "err", perr)
 	} else if !ok {
 		slog.Warn("agent: create_schedule 初始化任务手册未命中刚建的调度（异常）", "schedule_id", schedID)
+	} else {
+		// 手册已初始化 → 据此编译抓取计划（P1 编译层，best-effort：失败只 slog、不影响调度）。
+		compilePlaybookPlan(ctx, t.st, t.tr, userID, schedID, content)
 	}
 	return fmt.Sprintf("已创建定时推送任务（id=%s）：%s", schedID, formatScheduleSpec(spec)), nil
 }
@@ -1050,14 +1059,61 @@ func (t *viewTaskPlaybookTool) Execute(ctx context.Context, userID int64, args j
 
 func (t *viewTaskPlaybookTool) Summarize(json.RawMessage) string { return "" }
 
-// renderPlaybook 把手册渲染成给模型/用户看的中文文本。P0 不渲染 fetch_plan（恒 '{}'）；
-// content 为空时给引导文案，让模型知道该采集什么。
+// renderPlaybook 把手册渲染成给模型/用户看的中文文本：手册正文 +（P1 编译层）据此编译出的
+// 抓取计划摘要。content 为空时给引导文案，让模型知道该采集什么；fetch_plan 无源时不赘述。
 func renderPlaybook(pb *types.SchedulePlaybook) string {
 	content := strings.TrimSpace(pb.Content)
 	if content == "" {
 		content = "（手册为空——可以告诉我这个任务要抓什么、关注哪些主题、偏好哪些来源。）"
 	}
-	return fmt.Sprintf("任务手册（id=%s）：\n%s", pb.ScheduleID, content)
+	out := fmt.Sprintf("任务手册（id=%s）：\n%s", pb.ScheduleID, content)
+	if plan := renderFetchPlan(pb.FetchPlan); plan != "" {
+		out += "\n\n" + plan
+	}
+	return out
+}
+
+// renderFetchPlan 渲染 fetch_plan 里已编译的源；无源/不合法时返回空串（渲染方不赘述）。
+func renderFetchPlan(raw json.RawMessage) string {
+	var plan FetchPlan
+	if len(raw) == 0 || json.Unmarshal(raw, &plan) != nil || len(plan.Sources) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "据此编译出的抓取计划（%d 个源）：", len(plan.Sources))
+	for _, s := range plan.Sources {
+		title := s.Title
+		if title == "" {
+			title = s.URL
+		}
+		fmt.Fprintf(&b, "\n- [%s/%s] %s", s.Platform, s.Capability, title)
+	}
+	return b.String()
+}
+
+// compilePlaybookPlan 把手册正文翻译成 fetch_plan 并落库（P1 编译层的工具侧胶水）。
+// **best-effort**：翻译器未装配（tr==nil）或任何一步失败都只 slog、绝不影响主效果
+// （调度已建 / 手册正文已存）。返回成功落库的计划源数（>=0），供 edit 回执展示。
+func compilePlaybookPlan(ctx context.Context, st playbookStore, tr playbookTranslator, userID int64, scheduleID, content string) int {
+	if tr == nil {
+		return 0 // 未装配 LLM 翻译器（部分测试/降级路径）：手册仍可用，只是不编译计划。
+	}
+	plan, err := tr.Translate(ctx, userID, content)
+	if err != nil {
+		// 翻译失败（LLM 调用错误 / 输出取不出 JSON）：保留既有计划不动，只记日志。
+		slog.Warn("agent: 手册编译成抓取计划失败（手册已存，本次不更新计划）", "schedule_id", scheduleID, "err", err)
+		return 0
+	}
+	ok, serr := st.SetFetchPlan(ctx, userID, scheduleID, plan)
+	if serr != nil {
+		slog.Error("agent: 抓取计划落库失败", "schedule_id", scheduleID, "err", serr)
+		return 0
+	}
+	if !ok {
+		slog.Warn("agent: 抓取计划落库未命中手册行（任务不存在/非本人/无手册行）", "schedule_id", scheduleID)
+		return 0
+	}
+	return countPlanSources(plan)
 }
 
 const editTaskPlaybookSchema = `{
@@ -1076,6 +1132,7 @@ type editTaskPlaybookArgs struct {
 
 type editTaskPlaybookTool struct {
 	st playbookStore
+	tr playbookTranslator // 改手册后据此重新编译 fetch_plan（P1 编译层；nil=跳过）
 }
 
 func (t *editTaskPlaybookTool) Name() string { return "edit_task_playbook" }
@@ -1102,12 +1159,18 @@ func (t *editTaskPlaybookTool) Execute(ctx context.Context, userID int64, args j
 	if strings.TrimSpace(a.Content) == "" {
 		return "手册内容不能为空。请描述这个任务要抓什么、关注哪些主题、偏好哪些来源。", nil
 	}
-	ok, err := t.st.UpsertSchedulePlaybook(ctx, userID, schedID, capPlaybookContent(a.Content))
+	content := capPlaybookContent(a.Content)
+	ok, err := t.st.UpsertSchedulePlaybook(ctx, userID, schedID, content)
 	if err != nil {
 		return "", err
 	}
 	if !ok {
 		return fmt.Sprintf("没找到你的定时任务（id=%s），可能 id 有误或已删除。用 list_schedules 查一下。", schedID), nil
+	}
+	// 手册已更新 → 据此重新编译抓取计划（P1 编译层，best-effort）。回执带上编译出的源数，
+	// 让用户/模型看见手册确实转成了可执行的抓取计划；编译失败/零源则回执不提计划，静默降级。
+	if n := compilePlaybookPlan(ctx, t.st, t.tr, userID, schedID, content); n > 0 {
+		return fmt.Sprintf("已更新定时任务（id=%s）的情报手册，并据此编译出 %d 个抓取源的计划。", schedID, n), nil
 	}
 	return fmt.Sprintf("已更新定时任务（id=%s）的情报手册。", schedID), nil
 }

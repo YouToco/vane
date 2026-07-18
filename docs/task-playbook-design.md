@@ -1,10 +1,13 @@
 # 任务手册（Task Playbook）设计方案 · RFC
 
-> 状态：**RFC 已定稿（6 个开放问题全部拍板，见 §10）· P0 + D-2 + D-5 契约提级已实现**
-> （迁移 017 `schedule_playbooks`、store DAO、`view/edit_task_playbook` 工具、`create_schedule`
-> 创建即初始化、`include_domains` 接进 sourcespec 配置+幂等键、M6 §5.3 lookback 提级）。
-> **P1 待做**：`create_schedule`/`edit_task_playbook` 的 NL→`fetch_plan` LLM 翻译、Fetch 按本任务
-> 计划抓、打分/出卡的 M5 注入（见 §4 需对齐 M5 红线）。
+> 状态：**RFC 已定稿（6 个开放问题全部拍板，见 §10）· P0 + D-2 + D-5 已实现 · P1「编译层」已实现**。
+> - **P0 + D-2 + D-5**：迁移 017 `schedule_playbooks`、store DAO、`view/edit_task_playbook` 工具、
+>   `create_schedule` 创建即初始化、`include_domains` 接进 sourcespec 配置+幂等键、M6 §5.3 lookback 提级。
+> - **P1 编译层**（本轮，Boss 拍板「压缩版只做编译层」）：`create_schedule`/`edit_task_playbook`
+>   在存下手册正文后各发一次 LLM 调用，把正文**编译**成结构化 `fetch_plan`（逐源经 sourcespec 校验、
+>   归一化落库），`view_task_playbook` 渲染计划。运行时**按计划抓**与打分/出卡的 M5 注入**本轮不做**（见下）。
+> **P1 剩余（待后续轮）**：① Fetch 运行时消费 `fetch_plan`（按本任务计划抓，需先解决"候选池按 schedule
+> 归属"才能真正「情报任务互不干扰」——碰内容/候选模型深水区）；② 打分/出卡的 M5 注入（§4，碰 M5 红线）。
 > 关联审计项：D-2（include_domains 半实现）、D-5（lookback_days 契约分歧）。
 > 提出背景：Boss 希望「每个定时任务绑一份可编辑手册，任务跑时 AI 先读手册，据此决定
 > 从哪些信源抓什么内容；agent 有工具能用自然语言改手册；删任务时连带删手册」。
@@ -167,11 +170,26 @@ CREATE TABLE schedule_playbooks (
 
 ## 9. 分期建议
 
-| 阶段 | 内容 | 价值 / 风险 |
-|---|---|---|
-| **P0** | 迁移建表 + `view/edit_task_playbook` 工具 + `create_schedule` 创建即初始化手册（决策 D2）+ 手册存取（暂不影响抓取） | 能建情报任务并带手册、能改能看，零运行时风险 |
-| **P1（方案 A）** | 编辑/创建时把意图翻译成 `fetch_plan` + Fetch 按本任务计划抓（决策 D2/§10#3）+ Exa 参数入 sourcespec（修 D-2）+ 改 M6 §5.3（定 D-5） | 拿到主要价值：情报任务按自己的手册决定抓什么；确定性、低成本 |
-| **P2（方案 B，可选）** | 运行时 `PlanFetch` agentic 抓取 | 动态热点类需求；成本/复杂度显著上升 |
+| 阶段 | 内容 | 价值 / 风险 | 状态 |
+|---|---|---|---|
+| **P0** | 迁移建表 + `view/edit_task_playbook` 工具 + `create_schedule` 创建即初始化手册（决策 D2）+ 手册存取（暂不影响抓取） | 能建情报任务并带手册、能改能看，零运行时风险 | ✅ 已实现（#68） |
+| **P1a 编译层** | create/edit 时把手册正文一次 LLM 翻译成 `fetch_plan`（逐源 sourcespec 校验+归一化落库）+ `view` 渲染计划 + Exa 参数入 sourcespec（修 D-2）+ 改 M6 §5.3（定 D-5） | "AI 读手册出计划"的可见落点；零 M5/Temporal 风险；后续接抓取的地基 | ✅ 已实现（本轮） |
+| **P1b 运行时消费** | `PushParams` 带 `schedule_id` + Fetch 按本任务 `fetch_plan` 抓（决策 §10#3）+ 候选池按 schedule 归属（真正「互不干扰」） | 情报任务真正按自己的手册决定抓什么；碰内容/候选模型 | ⏳ 待后续轮 |
+| **P1c 打分/出卡注入** | 手册的"想要什么/怎么呈现"注入 scorer/cardgen（§4，锁定 prompt 外追加任务级指令 + 无手册=逐字节一致的黄金测试） | 手册管全三层 | ⏳ 待后续轮（碰 M5 红线） |
+| **P2（方案 B，可选）** | 运行时 `PlanFetch` agentic 抓取 | 动态热点类需求；成本/复杂度显著上升 | ⏳ 未排期 |
+
+**P1a 编译层实现要点**（本轮，代码见 `agent/playbook_translate.go`）：
+- **翻译**：一次 `llm.Do`（`DisableThinking:true`、温度 0，client 默认模型，走 recorder 记账），
+  system prompt 锚定可用 platform/capability 词汇（严格对齐 sourcespec 消费面）+ D-5 追新用
+  `include_domains` 不用日期过滤的铁律 + 宁缺毋滥不编造。
+- **校验+落库形态**：模型输出的线形态复用 `addSourceArgs`（与 add_source/sourcespec 三者同源词汇），
+  逐源经 `specFromArgs`→`sourcespec.Build` 校验，**坏源丢弃并 warn**；落库存**归一化后**的
+  `PlannedSource{platform,capability,title,url(幂等键),config}`（即将来运行时抓取要消费的形态）。
+- **best-effort 铁律**：翻译/落库任何失败只 slog、绝不影响主效果（调度已建 / 手册正文已存）；
+  `SetFetchPlan` 只改 `fetch_plan` 列不动 `content`，且用 `UPDATE…FROM schedules` 依附**已存在**手册行
+  （不建"有计划无正文"的孤儿行），归属+存在性进 SQL WHERE。
+- **纯函数核心** `compilePlan`（解析+校验，不碰 LLM/DB）单测覆盖全部分支；`SetFetchPlan` 归属/归一化/
+  依附由 store 集成测试覆盖。
 
 ---
 

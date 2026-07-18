@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -32,6 +33,33 @@ func (s *Store) UpsertSchedulePlaybook(ctx context.Context, userID int64, schedu
 	if err != nil {
 		return false, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("写入任务手册（schedule_id=%s）", scheduleID), err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// SetFetchPlan 写入某任务手册编译出的结构化抓取计划（P1 编译层）。与 UpsertSchedulePlaybook
+// 只改 content 对称：本方法**只改 fetch_plan 与 updated_at，不触碰 content**——两者各管一列，
+// 编译计划失败也绝不会把手册正文冲掉。
+//
+// 用 UPDATE … FROM schedules 而非 upsert：fetch_plan 依附于**已存在**的手册行（create 创建即
+// 初始化、edit 先 Upsert 了 content），计划不该凭空建手册行。归属+存在性一并进 WHERE
+// （schedules.user_id 谓词，沿用 UpsertSchedulePlaybook/EnableSource 先例）：目标任务不存在、
+// 非本人、或还没有手册行 → 匹配 0 行 → ok=false（未写任何行）。err 只在基础设施失败时非 nil。
+//
+// plan 为空/nil 时归一化为规范零源计划 '{"sources":[]}'（列非空约束 + 语义明确）。
+func (s *Store) SetFetchPlan(ctx context.Context, userID int64, scheduleID string, plan json.RawMessage) (ok bool, err error) {
+	if len(plan) == 0 {
+		plan = json.RawMessage(`{"sources":[]}`)
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE schedule_playbooks p
+		    SET fetch_plan = $3, updated_at = now()
+		   FROM schedules s
+		  WHERE p.schedule_id = $1 AND s.id = $1 AND s.user_id = $2`,
+		scheduleID, userID, []byte(plan))
+	if err != nil {
+		return false, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("写入任务抓取计划（schedule_id=%s）", scheduleID), err)
 	}
 	return tag.RowsAffected() > 0, nil
 }
