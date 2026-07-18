@@ -122,6 +122,19 @@ func (f *fakeStore) GetDeliveryForUser(_ context.Context, id, userID int64) (*ty
 	return &cp, nil
 }
 
+func (f *fakeStore) ListDeliveriesByFeishuMessage(_ context.Context, userID int64, msgID string) ([]types.Delivery, error) {
+	if msgID == "" {
+		return nil, nil
+	}
+	var out []types.Delivery
+	for _, d := range f.deliveries {
+		if d.UserID == userID && d.FeishuMessageID == msgID {
+			out = append(out, *d)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeStore) GetDeliveryByFeishuMessageID(ctx context.Context, userID int64, msgID string) (*types.Delivery, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

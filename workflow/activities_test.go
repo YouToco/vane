@@ -223,7 +223,7 @@ func (s *fakeStore) insertedRows() []types.Delivery {
 // ============================================================
 
 func TestEvolveProfile_NilEvolverNoop(t *testing.T) {
-	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil)
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil)
 	if err := a.EvolveProfile(context.Background(), EvolveIn{UserID: 1, TraceID: "tr"}); err != nil {
 		t.Fatalf("evolver 未注入时 EvolveProfile 应 no-op 成功: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestEvolveProfile_NilEvolverNoop(t *testing.T) {
 
 func TestEvolveProfile_DelegatesArgsAndError(t *testing.T) {
 	ev := &fakeEvolver{err: errors.New("演化失败")}
-	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, &fakeStore{}, fakeFeishu{}, ev, nil, nil)
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, &fakeStore{}, fakeFeishu{}, ev, nil, nil, nil)
 
 	err := a.EvolveProfile(context.Background(), EvolveIn{UserID: 5, TraceID: "tr-5"})
 	if err == nil || err.Error() != "演化失败" {
@@ -246,7 +246,7 @@ func TestEvolveProfile_DelegatesArgsAndError(t *testing.T) {
 // 闸门与漏斗原样下传 store（009）。
 func TestRecordEmptyBatch_DelegatesArgs(t *testing.T) {
 	st := &fakeStore{}
-	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil, nil)
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil, nil, nil)
 
 	counts := types.PipelineCounts{}.WithFetched(20).WithDeduped(0)
 	in := RecordEmptyIn{UserID: 5, TraceID: "tr-empty", Gate: types.BatchExitGateDedup, Counts: counts}
@@ -286,7 +286,7 @@ func TestRecordEmptyBatch_DelegatesArgs(t *testing.T) {
 // 代码审查保证——日志断言的性价比在此低于它引入的耦合。
 func TestRecordEmptyBatch_SkipIsNotAnError(t *testing.T) {
 	st := &fakeStore{emptySkipped: true} // 模拟真 store 的 (0, true, nil)
-	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil, nil)
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil, nil, nil)
 
 	in := RecordEmptyIn{UserID: 1, TraceID: "tr", Gate: types.BatchExitGateFetch}
 	if err := a.RecordEmptyBatch(context.Background(), in); err != nil {
@@ -302,7 +302,7 @@ func TestRecordEmptyBatch_SkipIsNotAnError(t *testing.T) {
 // 必须包成不可重试，否则 RetryPolicy 会把同一个 bug 重试到上限才罢休。
 func TestRecordEmptyBatch_ValidationIsNonRetryable(t *testing.T) {
 	st := &fakeStore{emptyErr: types.NewAppError(types.CodeValidation, "空批次必须带退出闸门", nil)}
-	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil, nil)
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil, nil, nil)
 
 	err := a.RecordEmptyBatch(context.Background(), RecordEmptyIn{UserID: 1, TraceID: "tr"})
 	if err == nil {
@@ -328,7 +328,7 @@ func TestRecordEmptyBatch_ValidationIsNonRetryable(t *testing.T) {
 func TestRecordEmptyBatch_DBErrorMessageIsClean(t *testing.T) {
 	raw := errors.New("failed to connect to `host=10.0.0.5 user=vane password=hunter2`")
 	st := &fakeStore{emptyErr: types.NewAppError(types.CodeDatabase, "记录空批次（user=1, gate=fetch）", raw)}
-	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil, nil)
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil, nil, nil)
 
 	err := a.RecordEmptyBatch(context.Background(), RecordEmptyIn{
 		UserID: 1, TraceID: "tr", Gate: types.BatchExitGateFetch})
@@ -342,7 +342,7 @@ func TestRecordEmptyBatch_DBErrorMessageIsClean(t *testing.T) {
 // 不该被误包成不可重试——那会让一次瞬时抖动直接丢掉这行记录。
 func TestRecordEmptyBatch_DBErrorStaysRetryable(t *testing.T) {
 	st := &fakeStore{emptyErr: types.NewAppError(types.CodeDatabase, "记录空批次", errors.New("conn reset"))}
-	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil, nil)
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, nil, nil, nil)
 
 	err := a.RecordEmptyBatch(context.Background(), RecordEmptyIn{
 		UserID: 1, TraceID: "tr", Gate: types.BatchExitGateFetch})
@@ -355,73 +355,81 @@ func TestRecordEmptyBatch_DBErrorStaysRetryable(t *testing.T) {
 	}
 }
 
-// TestPush_BuildCardInjectedAndPersisted Push 四步重排（契约 §8.2）：
-// 建投递（body_md 入库、card_json 留空）→ 经注入 buildCard 用真实 delivery id
-// 构最终卡 → 推送 → MarkDeliverySent 回填同一张最终卡。
-func TestPush_BuildCardInjectedAndPersisted(t *testing.T) {
+// TestPush_AggregateCardBuiltAndPersisted 聚合卡改版（附录 A）：一批一张聚合卡。
+// 建 N 条投递（body_md 入库、card_json 留空）→ buildAggCard 拿全部条目与真实
+// delivery id 构一张卡 → 一次推送 → 每条投递 MarkDeliverySent 回填同一 msgID 同一卡。
+func TestPush_AggregateCardBuiltAndPersisted(t *testing.T) {
 	st := &fakeStore{nextDelID: 41} // 首条投递 id=42
-	push := &fakePusher{msgID: "om_42"}
+	push := &fakePusher{msgID: "om_agg"}
 
-	type buildArgs struct {
-		bodyMD     string
-		deliveryID int64
-		state      feedback.CardState
+	var gotAgg []feedback.AggregateCardInput
+	buildAgg := func(in feedback.AggregateCardInput) string {
+		gotAgg = append(gotAgg, in)
+		return `{"agg":true}`
 	}
-	var mu sync.Mutex
-	var builds []buildArgs
-	buildCard := func(input feedback.CardInput) string {
-		mu.Lock()
-		defer mu.Unlock()
-		builds = append(builds, buildArgs{input.BodyMD, input.DeliveryID, input.State})
-		return fmt.Sprintf(`{"final_card":true,"delivery_id":%d}`, input.DeliveryID)
+	aggHeader := func(task string, n int) (string, string) {
+		return "📮 " + task + " · 今日 2 条", "blue"
 	}
-	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, buildCard, nil)
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, buildAgg, aggHeader)
 
-	bodyMD := "**正文**\n\n[阅读原文](https://e.com/1)"
-	in := PushIn{UserID: 1, TraceID: "tr-1", Cards: []GeneratedCard{{
-		Scored: types.ScoredItem{Item: types.ContentItem{ID: 11}, Score: 80},
-		BodyMD: bodyMD,
-	}}}
+	in := PushIn{UserID: 1, TraceID: "tr-1", TaskTitle: "Anthropic 动态", Cards: []GeneratedCard{
+		{Scored: types.ScoredItem{Item: types.ContentItem{ID: 11, Title: "A"}, Score: 90}, BodyMD: "**甲**"},
+		{Scored: types.ScoredItem{Item: types.ContentItem{ID: 12, Title: "B"}, Score: 80}, BodyMD: "**乙**"},
+	}}
 	if err := a.Push(context.Background(), in); err != nil {
 		t.Fatalf("Push 意外报错: %v", err)
 	}
 
-	if len(builds) != 1 {
-		t.Fatalf("buildCard 应恰好调用一次，实得 %d", len(builds))
+	// 一批 → 恰好一张聚合卡、一次推送。
+	if len(gotAgg) != 1 {
+		t.Fatalf("buildAggCard 应恰好调用一次（一批一卡），实得 %d", len(gotAgg))
 	}
-	if builds[0].bodyMD != bodyMD || builds[0].deliveryID != 42 || builds[0].state != (feedback.CardState{}) {
-		t.Errorf("buildCard 实参不符（应为 bodyMD + 真实 delivery id + 零值状态行）: %+v", builds[0])
+	agg := gotAgg[0]
+	if agg.HeaderTitle != "📮 Anthropic 动态 · 今日 2 条" || agg.HeaderTemplate != "blue" {
+		t.Errorf("header 应由任务名派生，实得 %q/%q", agg.HeaderTitle, agg.HeaderTemplate)
+	}
+	if len(agg.Items) != 2 || agg.Items[0].DeliveryID != 42 || agg.Items[1].DeliveryID != 43 {
+		t.Fatalf("聚合卡应含全部条目且携带真实 delivery id，实得 %+v", agg.Items)
+	}
+	if agg.Items[0].BodyMD != "**甲**" || agg.Items[1].BodyMD != "**乙**" {
+		t.Errorf("各条 BodyMD 应原样入卡，实得 %+v", agg.Items)
 	}
 
 	rows := st.insertedRows()
-	if len(rows) != 1 || rows[0].BodyMD != bodyMD {
-		t.Fatalf("投递行应携带 body_md，实得: %+v", rows)
+	if len(rows) != 2 {
+		t.Fatalf("应建 2 条投递，实得 %d", len(rows))
 	}
-	if len(rows[0].CardJSON) != 0 {
-		t.Errorf("建投递时 card_json 应留空待 MarkDeliverySent 回填，实得: %s", rows[0].CardJSON)
+	for _, r := range rows {
+		if len(r.CardJSON) != 0 {
+			t.Errorf("建投递时 card_json 应留空待回填，实得 %s", r.CardJSON)
+		}
 	}
-
-	wantCard := `{"final_card":true,"delivery_id":42}`
-	if sent := push.sentCards(); len(sent) != 1 || sent[0] != wantCard {
-		t.Errorf("推送出去的应是 buildCard 构造的最终卡，实得: %v", sent)
+	if sent := push.sentCards(); len(sent) != 1 || sent[0] != `{"agg":true}` {
+		t.Errorf("应恰好推一张聚合卡，实得 %v", sent)
 	}
+	// 每条投递都回填同一 msgID 与同一张卡——重建路径靠共享 message_id 找兄弟条目。
 	marked := st.markedCalls()
-	if len(marked) != 1 || marked[0] != (markSentCall{deliveryID: 42, msgID: "om_42", cardJSON: wantCard}) {
-		t.Errorf("MarkDeliverySent 应收到 (delID, msgID, 最终卡)，实得: %+v", marked)
+	if len(marked) != 2 {
+		t.Fatalf("两条投递都应 MarkDeliverySent，实得 %d", len(marked))
+	}
+	for _, m := range marked {
+		if m.msgID != "om_agg" || m.cardJSON != `{"agg":true}` {
+			t.Errorf("投递应共享同一 msgID 与卡 JSON，实得 %+v", m)
+		}
 	}
 }
 
-// TestPush_SentAlreadySkipsBuildAndSend 幂等分支不变：重试时已发过的投递
-// 不构卡、不重推、不重复回填。
+// TestPush_SentAlreadySkipsBuildAndSend 幂等分支：重试时全部已发过 →
+// 不构卡、不重推、不重复回填（聚合版语义与单条版一致）。
 func TestPush_SentAlreadySkipsBuildAndSend(t *testing.T) {
 	st := &fakeStore{sentAlready: true}
 	push := &fakePusher{}
-	buildCalls := 0
-	buildCard := func(feedback.CardInput) string {
-		buildCalls++
+	aggCalls := 0
+	buildAgg := func(feedback.AggregateCardInput) string {
+		aggCalls++
 		return "{}"
 	}
-	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, buildCard, nil)
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, buildAgg, nil)
 
 	in := PushIn{UserID: 1, TraceID: "tr-2", Cards: []GeneratedCard{{
 		Scored: types.ScoredItem{Item: types.ContentItem{ID: 11}, Score: 80},
@@ -430,9 +438,36 @@ func TestPush_SentAlreadySkipsBuildAndSend(t *testing.T) {
 	if err := a.Push(context.Background(), in); err != nil {
 		t.Fatalf("已发过的投递应算成功，实得: %v", err)
 	}
-	if buildCalls != 0 || len(push.sentCards()) != 0 || len(st.markedCalls()) != 0 {
+	if aggCalls != 0 || len(push.sentCards()) != 0 || len(st.markedCalls()) != 0 {
 		t.Errorf("已发过的投递不得构卡/重推/重复回填: builds=%d sent=%d marked=%d",
-			buildCalls, len(push.sentCards()), len(st.markedCalls()))
+			aggCalls, len(push.sentCards()), len(st.markedCalls()))
+	}
+}
+
+// TestPush_ChunkSplitting 体积护栏：条数超 aggMaxItemsPerCard 拆多张卡；
+// 字节超上限对半拆。绝不静默截断条目——每条投递都必须被某张卡送达。
+func TestPush_ChunkSplitting(t *testing.T) {
+	st := &fakeStore{nextDelID: 0}
+	push := &fakePusher{msgID: "om_chunk"}
+	var sizes []int
+	buildAgg := func(in feedback.AggregateCardInput) string {
+		sizes = append(sizes, len(in.Items))
+		return `{"n":true}`
+	}
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, buildAgg, nil)
+
+	cards := make([]GeneratedCard, aggMaxItemsPerCard+3) // 8+3=11 → 8 + 3 两张
+	for i := range cards {
+		cards[i] = GeneratedCard{Scored: types.ScoredItem{Item: types.ContentItem{ID: int64(100 + i)}, Score: 50}, BodyMD: "x"}
+	}
+	if err := a.Push(context.Background(), PushIn{UserID: 1, TraceID: "tr-3", Cards: cards}); err != nil {
+		t.Fatalf("Push 意外报错: %v", err)
+	}
+	if len(sizes) != 2 || sizes[0] != aggMaxItemsPerCard || sizes[1] != 3 {
+		t.Errorf("11 条应拆成 [8,3] 两张卡，实得 %v", sizes)
+	}
+	if got := len(st.markedCalls()); got != 11 {
+		t.Errorf("全部 11 条投递都应送达（无静默截断），实得 %d", got)
 	}
 }
 
@@ -498,7 +533,7 @@ func TestFetch_AlertsExactlyOnThresholdCrossing(t *testing.T) {
 		2: types.NewAppError(types.CodeFetchTimeout, "解析失败", nil),
 		// 3 不在 map：抓成功
 	}}
-	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, idNotice)
+	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
 
 	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
 		t.Fatalf("Fetch 意外报错: %v", err)
@@ -538,7 +573,7 @@ func TestFetch_NoAlertBelowOrAboveThreshold(t *testing.T) {
 			push := &fakePusher{}
 			st := &fakeStore{dueSources: []types.Source{fetchSrc(1, c.failCount, "坏源")}}
 			fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "超时", nil)}}
-			a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, idNotice)
+			a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
 			if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
 				t.Fatalf("Fetch 意外报错: %v", err)
 			}
@@ -558,7 +593,7 @@ func TestFetch_NoAlertWhenStateWriteFails(t *testing.T) {
 		updateFetchErr: errors.New("db 挂了"),
 	}
 	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "超时", nil)}}
-	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, idNotice)
+	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
 	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
 		t.Fatalf("Fetch 意外报错: %v", err)
 	}
@@ -577,7 +612,7 @@ func TestFetch_SilentWithoutOwnerOrBuilder(t *testing.T) {
 
 	t.Run("无owner", func(t *testing.T) {
 		push := &fakePusher{}
-		a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, mkStore(), noOwnerFeishu{}, nil, nil, idNotice)
+		a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, mkStore(), noOwnerFeishu{}, nil, idNotice, nil, nil)
 		if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
 			t.Fatalf("Fetch 意外报错: %v", err)
 		}
@@ -587,7 +622,7 @@ func TestFetch_SilentWithoutOwnerOrBuilder(t *testing.T) {
 	})
 	t.Run("未注入构卡器", func(t *testing.T) {
 		push := &fakePusher{}
-		a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, mkStore(), fakeFeishu{}, nil, nil, nil)
+		a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, mkStore(), fakeFeishu{}, nil, nil, nil, nil)
 		if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
 			t.Fatalf("Fetch 意外报错: %v", err)
 		}
@@ -635,7 +670,7 @@ func TestFetch_AlertDeferredThenSentAfterStateRecovers(t *testing.T) {
 		dueSources:     []types.Source{fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源")},
 		updateFetchErr: errors.New("db 挂了"),
 	}
-	a1 := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push1, st1, fakeFeishu{}, nil, nil, idNotice)
+	a1 := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push1, st1, fakeFeishu{}, nil, idNotice, nil, nil)
 	if _, err := a1.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
 		t.Fatalf("第一轮 Fetch 意外报错: %v", err)
 	}
@@ -646,7 +681,7 @@ func TestFetch_AlertDeferredThenSentAfterStateRecovers(t *testing.T) {
 	// 第二轮：上轮未推进，源仍是同一 fail_count；这次落库成功 → 补发一次告警。
 	push2 := &fakePusher{}
 	st2 := &fakeStore{dueSources: []types.Source{fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源")}}
-	a2 := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push2, st2, fakeFeishu{}, nil, nil, idNotice)
+	a2 := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push2, st2, fakeFeishu{}, nil, idNotice, nil, nil)
 	if _, err := a2.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
 		t.Fatalf("第二轮 Fetch 意外报错: %v", err)
 	}
@@ -668,7 +703,7 @@ func TestFetch_AutoDisablesAtThreshold(t *testing.T) {
 		disableResult: true, // DisableSourceIfActive 真从 active 翻成 disabled。
 	}
 	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "域名解析失败", nil)}}
-	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, idNotice)
+	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
 
 	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
 		t.Fatalf("Fetch 意外报错: %v", err)
@@ -701,7 +736,7 @@ func TestFetch_NoDisableAlertWhenNotTransitioned(t *testing.T) {
 		disableResult: false,                                                           // WHERE status='active' 命不中：未翻转。
 	}
 	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "超时", nil)}}
-	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, idNotice)
+	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
 	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
 		t.Fatalf("Fetch 意外报错: %v", err)
 	}
@@ -716,7 +751,7 @@ func TestFetch_NoDisableBelowThreshold(t *testing.T) {
 	push := &fakePusher{}
 	st := &fakeStore{dueSources: []types.Source{fetchSrc(1, disableFetchFailThreshold-2, "还在宽限窗口的源")}}
 	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "超时", nil)}}
-	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, idNotice)
+	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
 	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
 		t.Fatalf("Fetch 意外报错: %v", err)
 	}
@@ -745,7 +780,7 @@ func TestRenderSourcesDisabledAlert(t *testing.T) {
 // 距离必 ≤ 阈值，"价格变化"会被当近重复吞掉、永远推不出去——这正是 page_watch 当年的事故。
 // 对照子测试证明 simhash 确实会吞掉相同正文的 article，豁免不是空操作。
 func TestDedup_PageContentExemptFromSimhash(t *testing.T) {
-	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil)
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil)
 	mk := func(kind types.Kind, ck string) types.ContentItem {
 		// 两条正文逐字相同 → simhash 距离 0 → 必触发近似去重（除非豁免）。
 		return types.ContentItem{Title: "定价页", Content: "gpt-5 价格 30 输出 60 缓存 3", Kind: kind, CanonicalKey: ck}

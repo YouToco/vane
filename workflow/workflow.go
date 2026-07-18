@@ -167,7 +167,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 
 	// 6. Push —— 网络 I/O，主动推送飞书卡片。
 	pushCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
-	if err := workflow.ExecuteActivity(pushCtx, a.Push, PushIn{UserID: p.UserID, TraceID: traceID, Cards: cards}).Get(pushCtx, nil); err != nil {
+	if err := workflow.ExecuteActivity(pushCtx, a.Push, PushIn{UserID: p.UserID, TraceID: traceID, Cards: cards, TaskTitle: p.NLDesc}).Get(pushCtx, nil); err != nil {
 		return err
 	}
 

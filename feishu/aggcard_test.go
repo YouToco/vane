@@ -1,0 +1,224 @@
+package feishu
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/YouToco/vane/feedback"
+	"github.com/YouToco/vane/types"
+)
+
+// xhsTokenURL 带 xsec_token 访问票据的真实形状小红书 URL。规格 A.3 硬约束：
+// **测这类 bug 必须用带票据的 URL**——RSS/文档链接丢掉 query 照样能打开，
+// href 被截断污染也测不出来（恒真）；只有票据丢了就打不开的链接才能证伪。
+const xhsTokenURL = "https://www.xiaohongshu.com/explore/6a5258e9000000020803b20b?xsec_token=YBtt4_e0N5QbjAdXWnOfWUVNUcvmI0IcVFRQ2xeWTMOmA%3D&xsec_source=pc_search"
+
+func TestDisplayURL_结构截断(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"带 query 截成问号省略", xhsTokenURL, "https://www.xiaohongshu.com/explore/6a5258e9000000020803b20b?…"},
+		{"无 query 一字不动", "https://platform.claude.com/docs/en/about-claude/pricing",
+			"https://platform.claude.com/docs/en/about-claude/pricing"},
+		{"空串", "", ""},
+		{"路径超硬上限按字符截", "https://e.com/" + strings.Repeat("p/", 60),
+			("https://e.com/" + strings.Repeat("p/", 60))[:100] + "…"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := DisplayURL(c.in); got != c.want {
+				t.Errorf("DisplayURL(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestAggregateCard_href逐字符保留 规格 A.3 的第一条硬约束：显示截断、href 完整。
+// 断言构出的卡 JSON 里 markdown 链接的 () 内是逐字符的原始 URL（含票据）。
+func TestAggregateCard_href逐字符保留(t *testing.T) {
+	card := BuildAggregateCard(feedback.AggregateCardInput{Items: []feedback.CardInput{
+		{DeliveryID: 1, Title: "小红书笔记", BodyMD: "正文", URL: xhsTokenURL},
+	}})
+	// 断言必须打在 JSON **解码后**的字符串上：json.Marshal 会把 & 转义成 \u0026
+	//（JSON 层合法转义，飞书解码后还原），生码字符串比对会假阴性。
+	contents := markdownContents(t, card)
+	joined := strings.Join(contents, "\n")
+	if !strings.Contains(joined, "("+xhsTokenURL+")") {
+		t.Fatalf("解码后的 markdown 里 href 必须逐字符保留原始 URL（票据不可丢）：%s", joined)
+	}
+	// 显示文本是截断形（票据不出现在显示段）。
+	if !strings.Contains(joined, "[https://www.xiaohongshu.com/explore/6a5258e9000000020803b20b?…]") {
+		t.Errorf("显示文本应为结构截断形：%s", joined)
+	}
+	// 卡内不得出现裸的截断 URL 文本（不在 [] 里的 `?…` 结尾串会被飞书识别成无效链接）。
+	if strings.Contains(joined, "：https://") {
+		t.Errorf("疑似出现裸 URL 文本（v3 原型点不动的真因）：%s", joined)
+	}
+}
+
+// TestAggregateCard_双form名互异 规格 A.4：两条同时待填时 form/input/submit 的 name
+// 必须按 delivery_id 互异——单条卡的硬编码 name 在 N 条 form 并存时必然重名，
+// 正是"对 B 条说推错、记到 A 条"的物理路径。
+func TestAggregateCard_双form名互异(t *testing.T) {
+	nin := feedback.CardState{Preference: types.FeedbackActionNotInterested}
+	card := BuildAggregateCard(feedback.AggregateCardInput{Items: []feedback.CardInput{
+		{DeliveryID: 101, Title: "甲", State: nin},
+		{DeliveryID: 102, Title: "乙", State: nin},
+	}})
+	for _, want := range []string{
+		`"name":"fbr_101"`, `"name":"reason_101"`, `"name":"submit_101"`,
+		`"name":"fbr_102"`, `"name":"reason_102"`, `"name":"submit_102"`,
+	} {
+		if !strings.Contains(card, want) {
+			t.Errorf("双 form 卡应含唯一化 name %s，卡：%s", want, card)
+		}
+	}
+	// 旧世界的硬编码 name 绝不能出现在聚合卡里。
+	for _, bad := range []string{`"name":"feedback_reason"`, `"name":"reason"`, `"name":"submit_reason"`} {
+		if strings.Contains(card, bad) {
+			t.Errorf("聚合卡不得出现硬编码 form name %s（串条物理路径），卡：%s", bad, card)
+		}
+	}
+}
+
+// TestAggregateCard_form硬约束 历史事故 200530/300123/200673：form 内交互组件必须有
+// name，且必须含 form_action_type=submit 的提交按钮——结构性校验防整卡被拒。
+func TestAggregateCard_form硬约束(t *testing.T) {
+	card := BuildAggregateCard(feedback.AggregateCardInput{Items: []feedback.CardInput{
+		{DeliveryID: 7, Title: "x", State: feedback.CardState{Preference: types.FeedbackActionNotInterested}},
+	}})
+	var c struct {
+		Body struct {
+			Elements []map[string]any `json:"elements"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(card), &c); err != nil {
+		t.Fatalf("卡不是合法 JSON: %v", err)
+	}
+	var form map[string]any
+	for _, el := range c.Body.Elements {
+		if el["tag"] == "form" {
+			form = el
+			break
+		}
+	}
+	if form == nil {
+		t.Fatal("not_interested 未误判时应渲染 form")
+	}
+	els, _ := form["elements"].([]any)
+	hasSubmit := false
+	for _, e := range els {
+		m, _ := e.(map[string]any)
+		if m["tag"] == "button" && m["form_action_type"] == "submit" && m["name"] != "" {
+			hasSubmit = true
+		}
+		if m["tag"] == "input" && (m["name"] == nil || m["name"] == "") {
+			t.Error("form 内 input 必须有 name（200530）")
+		}
+	}
+	if !hasSubmit {
+		t.Error("form 必须含 form_action_type=submit 且带 name 的提交按钮（300123/200673）")
+	}
+}
+
+// TestAggregateCard_状态门控 form 只在该条 not_interested 且未 misjudged 时出现；
+// 兄弟条目的状态互不串染。深挖按钮不得出现在聚合卡。
+func TestAggregateCard_状态门控(t *testing.T) {
+	card := BuildAggregateCard(feedback.AggregateCardInput{Items: []feedback.CardInput{
+		{DeliveryID: 1, Title: "未表态"},
+		{DeliveryID: 2, Title: "已误判", State: feedback.CardState{
+			Preference: types.FeedbackActionNotInterested, Misjudged: true}},
+		{DeliveryID: 3, Title: "待填原因", State: feedback.CardState{
+			Preference: types.FeedbackActionNotInterested}},
+	}})
+	if strings.Contains(card, `"name":"fbr_1"`) || strings.Contains(card, `"name":"fbr_2"`) {
+		t.Error("未表态/已误判的条目不该渲染 form")
+	}
+	if !strings.Contains(card, `"name":"fbr_3"`) {
+		t.Error("not_interested 未误判的条目应渲染 form")
+	}
+	if strings.Contains(card, "深挖") {
+		t.Error("深挖按钮不得出现在聚合卡面（附录 A.2）")
+	}
+}
+
+// TestAggHeaderForTask_确定性 同名恒同色同 emoji；空名落兜底。
+func TestAggHeaderForTask_确定性(t *testing.T) {
+	t1, c1 := AggHeaderForTask("Anthropic 动态", 3)
+	t2, c2 := AggHeaderForTask("Anthropic 动态", 3)
+	if t1 != t2 || c1 != c2 {
+		t.Errorf("同任务名应恒定: %q/%q vs %q/%q", t1, c1, t2, c2)
+	}
+	if !strings.Contains(t1, "Anthropic 动态") || !strings.Contains(t1, "今日 3 条") {
+		t.Errorf("标题应含任务名与条数: %q", t1)
+	}
+	te, ce := AggHeaderForTask("", 2)
+	if !strings.Contains(te, "今日推送") || ce == "" {
+		t.Errorf("空任务名应落兜底: %q/%q", te, ce)
+	}
+}
+
+// TestExtractReasonFromForm_三重对齐 附录 A.4 的串条闸门。
+func TestExtractReasonFromForm_三重对齐(t *testing.T) {
+	cases := []struct {
+		name       string
+		actionName string
+		fv         map[string]interface{}
+		deliveryID int64
+		want       string
+		wantErr    bool
+	}{
+		{"历史卡", "submit_reason", map[string]interface{}{"reason": "太水"}, 5, "太水", false},
+		{"聚合卡对齐", "submit_101", map[string]interface{}{"reason_101": "不相关"}, 101, "不相关", false},
+		{"聚合卡对齐但原因跳过", "submit_101", map[string]interface{}{}, 101, "", false},
+		{"对齐失败_name指向别的条目", "submit_102", map[string]interface{}{"reason_102": "x"}, 101, "", true},
+		{"对齐失败_乱name", "submit_evil", map[string]interface{}{"reason_101": "x"}, 101, "", true},
+		{"空name_纯历史形状", "", map[string]interface{}{"reason": "旧"}, 5, "旧", false},
+		{"空name_但含聚合键_拒绝", "", map[string]interface{}{"reason_9": "x"}, 9, "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := extractReasonFromForm(c.actionName, c.fv, c.deliveryID)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, c.wantErr)
+			}
+			if got != c.want {
+				t.Errorf("reason = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// markdownContents 解码卡 JSON，收集全部 markdown 元素的 content（含 form 内嵌套）。
+func markdownContents(t *testing.T, card string) []string {
+	t.Helper()
+	var c struct {
+		Body struct {
+			Elements []json.RawMessage `json:"elements"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(card), &c); err != nil {
+		t.Fatalf("卡不是合法 JSON: %v", err)
+	}
+	var out []string
+	var walk func(raw json.RawMessage)
+	walk = func(raw json.RawMessage) {
+		var el struct {
+			Tag      string            `json:"tag"`
+			Content  string            `json:"content"`
+			Elements []json.RawMessage `json:"elements"`
+		}
+		if json.Unmarshal(raw, &el) != nil {
+			return
+		}
+		if el.Tag == "markdown" {
+			out = append(out, el.Content)
+		}
+		for _, sub := range el.Elements {
+			walk(sub)
+		}
+	}
+	for _, e := range c.Body.Elements {
+		walk(e)
+	}
+	return out
+}

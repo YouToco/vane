@@ -1,0 +1,226 @@
+// 聚合推送卡（card-redesign-spec.md 附录 A，2026-07-18 定稿）：一个任务一张卡，
+// 卡内 N 条情报，每条挂各自的 [👍][👎] 与条件 form。与单条卡（card.go）的三处实质差异：
+//   - 🔍 深挖不上卡面（生产 21 条反馈里仅 2 次点击，却是最重的动作；能力保留在 agent 侧）；
+//   - 「阅读原文」按钮 → 可见的原文链接文本（Boss：「看不到 url 从哪来会没有安全感」）；
+//   - form/input/submit 的 name 按 delivery_id 唯一化——单条卡的硬编码 name 在
+//     N 条 form 并存时必然重名，正是"对 B 条说推错、记到 A 条"的物理路径。
+//
+// 历史单条卡（聊天里已发出的）不受影响：BuildDeliveryCard 原样保留，
+// 重建路径按"同 feishu_message_id 的 delivery 数量"分流（见 feedback.rebuilt）。
+package feishu
+
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"strconv"
+	"strings"
+
+	"github.com/YouToco/vane/feedback"
+	"github.com/YouToco/vane/types"
+)
+
+const (
+	// aggDefaultTitle 无任务名时的 header 兜底（存量调度的 PushParams 没有 NLDesc）。
+	aggDefaultTitle = "📮 今日推送"
+	// aggURLPathHardLimit 原文链接展示的路径硬上限：截断规则是"路径全留、query 省略成 ?…"
+	// （附录 A.2 实测定稿——域名与路径是判断来源的唯一依据必须完整；被省的 query 要么是
+	// 追踪垃圾要么是读不了的票据）。路径本身超长才走这个硬上限。
+	aggURLPathHardLimit = 100
+)
+
+// aggHeaderTemplates 任务名哈希取色的调色板。蓝在首位：兜底与单任务期的默认色。
+var aggHeaderTemplates = []string{"blue", "wathet", "turquoise", "green", "orange", "purple", "carmine"}
+
+// aggTaskEmojis 任务名哈希取 emoji 的候选集（人工挑选，避免任意 emoji 观感随机）。
+var aggTaskEmojis = []string{"🔮", "📮", "🗞️", "📡", "🧭", "🛰️"}
+
+// AggHeaderForTask 由任务名派生聚合卡 header（Push 首发路径用）。
+// 任务名为空返回兜底标题与默认色。同名恒同色同 emoji（fnv 哈希，确定性）。
+func AggHeaderForTask(taskName string, n int) (title, template string) {
+	taskName = strings.TrimSpace(taskName)
+	if taskName == "" {
+		return fmt.Sprintf("%s · 今日 %d 条", aggDefaultTitle, n), aggHeaderTemplates[0]
+	}
+	h := fnv.New32a()
+	h.Write([]byte(taskName))
+	sum := h.Sum32()
+	emoji := aggTaskEmojis[sum%uint32(len(aggTaskEmojis))]
+	tmpl := aggHeaderTemplates[(sum/7)%uint32(len(aggHeaderTemplates))]
+	return fmt.Sprintf("%s %s · 今日 %d 条", emoji, taskName, n), tmpl
+}
+
+// DisplayURL 按结构截断 URL 用于展示：路径全留、query 省略成 "?…"；
+// 无 query 的干净 URL 一字不动；路径本身超硬上限才按字符截。
+// 点击跳转恒用完整原 URL（href 逐字符保留）——展示与跳转分离是本函数存在的全部意义。
+func DisplayURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	base, _, hasQ := strings.Cut(raw, "?")
+	if len(base) > aggURLPathHardLimit {
+		return base[:aggURLPathHardLimit] + "…"
+	}
+	if hasQ {
+		return base + "?…"
+	}
+	return base
+}
+
+// BuildAggregateCard 构造聚合推送卡 JSON（schema 2.0）。首发与点击重建共用：
+// 同一构卡函数 + 各条各自的 CardState = 同一张卡的不同版本，正文永远原样保留。
+func BuildAggregateCard(in feedback.AggregateCardInput) string {
+	title := strings.TrimSpace(in.HeaderTitle)
+	if title == "" {
+		title, _ = AggHeaderForTask("", len(in.Items))
+	}
+	tmpl := in.HeaderTemplate
+	if tmpl == "" {
+		tmpl = aggHeaderTemplates[0]
+	}
+
+	elements := make([]any, 0, len(in.Items)*6)
+	for i, item := range in.Items {
+		if i > 0 {
+			elements = append(elements, map[string]any{"tag": "hr"})
+		}
+		elements = append(elements, aggItemElements(item)...)
+	}
+
+	card := map[string]any{
+		"schema": "2.0",
+		"config": map[string]any{},
+		"header": map[string]any{
+			"title":    map[string]any{"tag": "plain_text", "content": title},
+			"subtitle": map[string]any{"tag": "plain_text", "content": "见微 Vane · 按相关度排序"},
+			"template": tmpl,
+		},
+		"body": map[string]any{"elements": elements},
+	}
+	raw, _ := json.Marshal(card)
+	return string(raw)
+}
+
+// aggItemElements 渲染卡内单条情报：标题行 / 来源行 / 解读 / 原文链接 / 按钮 / 状态行 / 条件 form。
+func aggItemElements(input feedback.CardInput) []any {
+	idStr := strconv.FormatInt(input.DeliveryID, 10)
+	els := make([]any, 0, 7)
+
+	// 标题 + ⚡分数（header 已被任务名占用，标题降级为条内首行加粗）。
+	titleLine := "**" + escapeMarkdown(input.Title) + "**"
+	if input.Title == "" {
+		titleLine = "**（无标题）**"
+	}
+	if input.Score > 0 {
+		titleLine += fmt.Sprintf("　<font color='orange'>⚡%d</font>", input.Score)
+	}
+	els = append(els, map[string]any{"tag": "markdown", "content": titleLine})
+
+	// 来源行：{平台emoji} {栏目} · {域名} · {相对时间}（复用单条卡 subtitle 逻辑）。
+	if sub := buildSubtitle(input); sub != "" {
+		els = append(els, map[string]any{"tag": "markdown", "content": "<font color='grey'>" + sub + "</font>"})
+	}
+
+	if input.BodyMD != "" {
+		els = append(els, map[string]any{"tag": "markdown", "content": input.BodyMD})
+	}
+
+	// 原文链接：截断显示 + 完整 href。附录 A.3 硬约束——绝不能出现裸的截断 URL 文本
+	//（飞书会把它自动识别成无效链接），必须包在 markdown 链接语法里。
+	if u := strings.TrimSpace(input.URL); u != "" {
+		els = append(els, map[string]any{"tag": "markdown",
+			"content": fmt.Sprintf("<font color='grey'>原文链接：</font>[%s](%s)", DisplayURL(u), u)})
+	}
+
+	// 反馈按钮：仅 👍👎（深挖不上聚合卡面）。value 结构与单条卡完全一致
+	//（vane_action=fb + fb + delivery_id），handler 的按钮路由零改动。
+	btnColumns := make([]any, 0, 2)
+	for _, b := range feedbackButtons[:2] {
+		btnColumns = append(btnColumns, map[string]any{
+			"tag": "column", "width": "auto",
+			"elements": []any{map[string]any{
+				"tag": "button", "type": "default", "width": "default",
+				"text": map[string]any{"tag": "plain_text", "content": b.label},
+				"behaviors": []any{map[string]any{
+					"type": "callback",
+					"value": map[string]any{
+						"vane_action": cardActionFeedback,
+						"fb":          string(b.action),
+						"delivery_id": idStr,
+					},
+				}},
+			}},
+		})
+	}
+	els = append(els, map[string]any{"tag": "column_set", "columns": btnColumns})
+
+	if line := feedbackStateLine(input.State); line != "" {
+		els = append(els, map[string]any{"tag": "markdown", "content": line})
+	}
+
+	// 条件 form：仅该条 not_interested 且未 misjudged 时渲染，且**渲染在该条自己的
+	// 元素块内**（需求 (b)）。name 三件套按 delivery_id 唯一化——这是三重对齐断言
+	//（handler 侧）的产生端：form=fbr_{id} / input=reason_{id} / submit=submit_{id}，
+	// 提交回调靠 Action.Name 后缀与 value.delivery_id 互验。
+	if input.State.Preference == types.FeedbackActionNotInterested && !input.State.Misjudged {
+		els = append(els, aggReasonForm(idStr))
+	}
+	return els
+}
+
+// aggReasonForm 该条专属的误判原因 form。结构与单条卡 form 相同，仅 name 唯一化。
+// form 硬约束（历史事故 200530/300123/200673）：form 内交互组件必须有 name；
+// 必须含 form_action_type=submit 的提交按钮，缺失整卡非法。
+func aggReasonForm(idStr string) map[string]any {
+	return map[string]any{
+		"tag":  "form",
+		"name": "fbr_" + idStr,
+		"elements": []any{
+			map[string]any{
+				"tag":  "input",
+				"name": "reason_" + idStr,
+				"placeholder": map[string]any{
+					"tag":     "plain_text",
+					"content": "哪里不对？说一句，下次就准了（可跳过）",
+				},
+				"max_length": 500,
+			},
+			map[string]any{
+				"tag":              "button",
+				"name":             "submit_" + idStr,
+				"form_action_type": "submit",
+				"text":             map[string]any{"tag": "plain_text", "content": "提交"},
+				"type":             "primary",
+				"behaviors": []any{map[string]any{
+					"type": "callback",
+					"value": map[string]any{
+						"vane_action": cardActionFeedbackReason,
+						"delivery_id": idStr,
+					},
+				}},
+			},
+		},
+	}
+}
+
+// ParseAggHeader 从库存 card_json 解析 header 的标题与色名（重建路径用；
+// 解析失败返回空串，构卡函数会落兜底）。
+func ParseAggHeader(cardJSON []byte) (title, template string) {
+	var c struct {
+		Header struct {
+			Title struct {
+				Content string `json:"content"`
+			} `json:"title"`
+			Template string `json:"template"`
+		} `json:"header"`
+	}
+	if err := json.Unmarshal(cardJSON, &c); err != nil {
+		return "", ""
+	}
+	return c.Header.Title.Content, c.Header.Template
+}
+
+// escapeMarkdown 把标题里可能破坏 markdown 加粗语法的字符做最小转义。
+func escapeMarkdown(s string) string {
+	return strings.NewReplacer("**", "\\*\\*", "\n", " ").Replace(s)
+}
