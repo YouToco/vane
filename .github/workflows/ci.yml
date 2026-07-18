@@ -26,14 +26,21 @@ jobs:
       - name: Build
         run: npm run build
 
-  # MVP 阶段直接 scp 到 VPS 由 Caddy 托管（/opt/vane/web，见 vane 仓库 deploy/）。
-  # M7 再切双线 CDN：
-  #   deploy-oss:   aliyun CLI 上传 dist/ 到 OSS + CDN 刷新（国内线路）
-  #   deploy-pages: wrangler pages deploy dist/（境外线路）
+  # 双线部署（M7，2026-07-18 起）：与主站 zhuoqidev.com 同款模式——
+  #   国内线：DNS default 线路 → 阿里 CDN → OSS（zhuoqidev-vane-web，私有桶+oss_auth 回源）
+  #   境外线：DNS oversea 线路 → Cloudflare Pages（vane-web.pages.dev）
+  # 生产构建注入 VITE_API_BASE（静态托管与 API 不同源，后端 CORS 见 vane#54）。
+  # scp 到 VPS 为过渡期保留（DNS 未切/回滚时 Caddy 仍能服务），切流验证通过后移除。
   deploy:
     needs: build
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    # 串行化部署（vane 仓库 deploy-vps 同理）：并行的两次 push 谁晚完成谁覆盖，
+    # 与 git 顺序无关，可能把旧构建静默推上线。
+    concurrency:
+      group: deploy-frontend
+      cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v7
@@ -48,7 +55,36 @@ jobs:
 
       - name: Build
         run: npm run build
+        env:
+          # 绝对 API 基址：三个部署目标（CDN/Pages/VPS）都用同一份产物，
+          # 跨源由后端 CORS 放行；本地 dev 不设此变量走 vite 代理。
+          VITE_API_BASE: https://api.vane.zhuoqidev.com
 
+      - name: Install aliyun CLI
+        run: |
+          curl -fsSL -o /tmp/aliyun.tgz https://github.com/aliyun/aliyun-cli/releases/latest/download/aliyun-cli-linux-latest-amd64.tgz
+          tar -xzf /tmp/aliyun.tgz -C /tmp
+          sudo mv /tmp/aliyun /usr/local/bin/aliyun
+
+      - name: Deploy OSS + 刷新 CDN（国内线）
+        run: |
+          aliyun configure set --profile default --mode AK \
+            --access-key-id "${{ secrets.ALIYUN_ACCESS_KEY_ID }}" \
+            --access-key-secret "${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}" \
+            --region cn-shenzhen
+          # sync --delete = 镜像语义：清掉桶里已不在 dist 的旧 hash 产物
+          # （与下方 VPS "先清空再传"同一个卫生要求）
+          aliyun oss sync dist/ oss://zhuoqidev-vane-web/ --delete --force
+          # index.html 无 hash 会被边缘缓存，必须主动刷新目录让新版立即生效
+          aliyun cdn RefreshObjectCaches --ObjectPath "https://vane.zhuoqidev.com/" --ObjectType Directory
+
+      - name: Deploy Cloudflare Pages（境外线）
+        run: npx --yes wrangler@4 pages deploy dist --project-name vane-web --branch main
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # ——以下 VPS scp 为过渡期保留（DNS 未切流/回滚场景），切流验证后移除——
       # 先清空再传：避免旧构建的 hash 文件无限堆积、以及删除页面后残留可访问
       - name: Prepare web directory
         uses: appleboy/ssh-action@v1

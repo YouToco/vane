@@ -273,10 +273,15 @@ export class ApiError extends Error {
   }
 }
 
+// API 基址：静态托管（OSS+CDN 国内线 / Pages 境外线）与后端不同源，生产构建注入
+// 绝对地址（api.vane.zhuoqidev.com，后端已配 CORS + 凭证放行，vane#54）；
+// 本地 dev 留空走 vite 代理（同源相对路径，vite.config.ts）。
+const API_BASE: string = import.meta.env.VITE_API_BASE ?? "";
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(path, { credentials: "include", ...init });
+    res = await fetch(API_BASE + path, { credentials: "include", ...init });
   } catch {
     // fetch 本身抛错说明网络层失败（后端没起/断网），统一转成人话，
     // 避免各页面还要单独处理 TypeError
