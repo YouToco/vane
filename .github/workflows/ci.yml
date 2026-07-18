@@ -146,8 +146,9 @@ jobs:
             sleep 5
             systemctl is-active vane
             curl -fsS --max-time 5 http://127.0.0.1:8080/readyz
-            # Caddy 路由生效验证：主域 well-known 必须由后端应答（json/404），
-            # 返回 SPA html ⇒ Caddyfile 的 well-known 反代没在跑 ⇒ 部署失败要响。
-            ctype=$(curl -sS -o /dev/null -w '%{content_type}' --max-time 5 https://vane.zhuoqidev.com/.well-known/agent-card.json)
-            case "$ctype" in *text/html*) echo "well-known 返回 SPA（$ctype），Caddy 配置未生效"; exit 1;; esac
+            # 主域 well-known 验证：终点必须是后端应答的 json（-L 跟随重定向——
+            # 前端迁 OSS+CDN 后主域此路径按拍板 302 到 api 子域，跟完仍应是 json；
+            # 迁移前 Caddy 直接反代后端，同样是 json）。返回 SPA html ⇒ 路由断了要响。
+            ctype=$(curl -sSL -o /dev/null -w '%{content_type}' --max-time 10 https://vane.zhuoqidev.com/.well-known/agent-card.json)
+            case "$ctype" in *json*) : ;; *) echo "主域 well-known 终点不是 json（$ctype），well-known 路由断了"; exit 1;; esac
             echo "deploy verified: readyz OK"
