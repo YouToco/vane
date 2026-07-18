@@ -390,7 +390,7 @@ func finalize(src types.Source, item *types.ContentItem) bool {
 	item.Simhash = &sh
 
 	// 全局身份：落库前就必须定好。M5 起内容按 canonical_key 全局唯一。
-	// 若调用方已预填 CanonicalKey（如 page_watch 的 watchKey），不覆盖。
+	// 若调用方已预填 CanonicalKey，不覆盖。
 	if item.CanonicalKey == "" {
 		item.CanonicalKey = CanonicalKey(src, *item)
 	}

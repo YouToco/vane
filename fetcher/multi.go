@@ -19,12 +19,11 @@ import (
 
 // Multi 持有各类型抓取器。零外部状态，多 goroutine 可并发复用。
 type Multi struct {
-	rss       *Fetcher
-	exa       *ExaFetcher
-	tikhub    *TikHubFetcher
-	xhsUser   *XHSUserFetcher
-	twitter   *TwitterFetcher
-	pageWatch *PageWatchFetcher
+	rss     *Fetcher
+	exa     *ExaFetcher
+	tikhub  *TikHubFetcher
+	xhsUser *XHSUserFetcher
+	twitter *TwitterFetcher
 }
 
 // NewMulti 按抓取配置构造全部抓取器。未配置 key 的信源类型仍会构造
@@ -33,15 +32,13 @@ type Multi struct {
 // seen 只被 TikHub 搜索抓取器用于"这条笔记是否已入库"，从而只为新笔记调用按次计费的
 // 详情接口（见 SeenChecker）。传 nil 合法：详情补全会被跳过，小红书搜索正文退回 60 字
 // 摘要——不改善，但也不比补全上线前更差。xhs/user_posts 不做详情补全，不受 seen 影响。
-func NewMulti(cfg config.FetchConfig, seen SeenChecker, snaps SnapshotStore) *Multi {
-	rss := New(cfg)
+func NewMulti(cfg config.FetchConfig, seen SeenChecker) *Multi {
 	return &Multi{
-		rss:       rss,
-		exa:       NewExa(cfg),
-		tikhub:    NewTikHub(cfg, seen),
-		xhsUser:   NewXHSUser(cfg),
-		twitter:   NewTwitter(cfg),
-		pageWatch: NewPageWatch(rss, snaps),
+		rss:     New(cfg),
+		exa:     NewExa(cfg),
+		tikhub:  NewTikHub(cfg, seen),
+		xhsUser: NewXHSUser(cfg),
+		twitter: NewTwitter(cfg),
 	}
 }
 
@@ -70,8 +67,6 @@ func (m *Multi) Fetch(ctx context.Context, src types.Source) ([]types.ContentIte
 			return m.rss.FetchRSS(ctx, src)
 		case types.CapSearch:
 			return m.exa.Fetch(ctx, src)
-		case types.CapPageWatch:
-			return m.pageWatch.Fetch(ctx, src)
 		}
 
 	case types.PlatformXHS:

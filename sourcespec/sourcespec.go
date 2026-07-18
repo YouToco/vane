@@ -121,25 +121,8 @@ func buildWeb(cap types.Capability, params map[string]string, title string) (*ty
 			Status:     types.SourceStatusActive,
 		}, ""
 
-	case types.CapPageWatch:
-		rawURL := strings.TrimSpace(params["url"])
-		u, err := url.Parse(rawURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return nil, "url 必须是合法的 http/https 地址"
-		}
-		if title == "" {
-			title = "监控: " + u.Host + u.Path
-		}
-		return &types.Source{
-			Platform:   types.PlatformWeb,
-			Capability: types.CapPageWatch,
-			URL:        rawURL,
-			Title:      title,
-			Status:     types.SourceStatusActive,
-		}, ""
-
 	default:
-		return nil, "web 平台仅支持 feed / search / page_watch 能力"
+		return nil, "web 平台仅支持 feed / search 能力"
 	}
 }
 

@@ -216,7 +216,7 @@ Boss 列的能力：「关键词搜索、**用户搜索**、用户新文章详�
 |---|---|---|---|---|---|
 | `web` | `feed` | `article` | `direct`（gofeed） | 迁移自 `rss` | — |
 | `web` | `search` | `article` | `exa` | 迁移自 `exa`，**必须同时修 §0.3 毒药 + 加 `include_domains`** | §0.3 |
-| `web` | `page_watch` | **`change`** | `direct` | **新增** | §10 |
+| ~~`web`~~ | ~~`page_watch`~~ | ~~`change`~~ | ~~`direct`~~ | **已下线**（改用 Exa fetch，见 §10 顶部） | §10 |
 | `x` | `user_posts` | `article` | `tikhub` | **新增** | §9 |
 | `x` | `search` | — | — | **`Unavailable`** | 见下 |
 | `xhs` | `search` | `article` | `tikhub` | 迁移自 `tikhub_xhs` | — |
@@ -1132,6 +1132,15 @@ Entities json.RawMessage `json:"entities"`
 ---
 
 ## 10. `web/page_watch` 实现（`fetcher/pagewatch.go`）
+
+> **⚠️ 本节整节已下线（`refactor/drop-page-watch`）。** `web/page_watch` 能力、
+> `fetcher/pagewatch.go`、`store/pagesnapshots.go`、`page_snapshots` 表（迁移 015 DROP）、
+> `types.CapPageWatch/KindChange/SnapshotVerdict/RefTypeSource/PageSnapshot` 均已从代码移除。
+> 页面变化监控改由 **Exa `/contents` fetch API** 覆盖（§10.1.1 早已给出这条方向），不再在
+> Go 侧自建抓取+基线 diff+LLM 门。**本节以下内容保留为历史设计记录**（解释当初为何这样设计、
+> 以及那些至今仍成立的通用不变量如 SSRF 栈、转移键思路），但不再对应任何在库代码。
+> 下游连带影响：§8.1 的 Kind 豁免、§8.2 的 change 打分 prompt 一并移除；`kind` 列与
+> `KindArticle` 保留（承载全内容，将来若引入新内容种类可复用）。
 
 ### 10.1 抓取
 

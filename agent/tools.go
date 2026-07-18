@@ -140,15 +140,15 @@ const addSourceSchema = `{
     },
     "capability": {
       "type": "string",
-      "enum": ["feed", "search", "user_posts", "page_watch"],
-      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主）；page_watch=页面变化监控（仅 web）。当前不支持的能力及原因见本工具说明（Description）。"
+      "enum": ["feed", "search", "user_posts"],
+      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主）。当前不支持的能力及原因见本工具说明（Description）。"
     },
     "type": {
       "type": "string",
       "enum": ["rss", "exa", "tikhub_xhs"],
       "description": "（兼容旧版）信源类型：rss→web/feed；exa→web/search；tikhub_xhs→xhs/search。优先用 platform+capability"
     },
-    "url": {"type": "string", "description": "RSS 源地址或监控页面地址（http/https），platform=web capability=feed/page_watch 时必填"},
+    "url": {"type": "string", "description": "RSS 源地址（http/https），platform=web capability=feed 时必填"},
     "query": {"type": "string", "description": "Exa 搜索词，platform=web capability=search 时必填"},
     "keyword": {"type": "string", "description": "小红书搜索关键词，platform=xhs capability=search 时必填"},
     "screen_name": {"type": "string", "description": "X 用户名（如 OpenAI），platform=x capability=user_posts 时必填"},
@@ -166,7 +166,7 @@ type addSourceTool struct {
 
 func (t *addSourceTool) Name() string { return "add_source" }
 func (t *addSourceTool) Description() string {
-	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts/page_watch），或传旧版 type 字段兼容。" +
+	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts），或传旧版 type 字段兼容。" +
 		unavailableCapabilitiesNote()
 }
 
@@ -292,8 +292,6 @@ func (t *addSourceTool) Summarize(args json.RawMessage) string {
 		fmt.Fprintf(&b, "添加小红书博主信源：%s", who)
 	case "x/user_posts":
 		fmt.Fprintf(&b, "添加 X 用户时间线信源：@%s", strings.TrimSpace(a.ScreenName))
-	case "web/page_watch":
-		fmt.Fprintf(&b, "添加页面监控信源：%s", a.URL)
 	default:
 		fmt.Fprintf(&b, "添加信源（%s/%s，确认后校验）", p, c)
 	}

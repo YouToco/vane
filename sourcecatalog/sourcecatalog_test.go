@@ -53,9 +53,6 @@ func TestKindOf(t *testing.T) {
 	if k, ok := KindOf(types.PlatformXHS, types.CapUserPosts); !ok || k != types.KindArticle {
 		t.Errorf("xhs/user_posts 应产 article，实际 ok=%v kind=%q", ok, k)
 	}
-	if k, ok := KindOf(types.PlatformWeb, types.CapPageWatch); !ok || k != types.KindChange {
-		t.Errorf("web/page_watch 应产 change，实际 ok=%v kind=%q", ok, k)
-	}
 	// 不可用能力无 Kind。
 	if _, ok := KindOf(types.PlatformX, types.CapSearch); ok {
 		t.Error("x/search 不可用，KindOf 应返回 ok=false")

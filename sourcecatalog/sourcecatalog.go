@@ -43,8 +43,7 @@ type Entry struct {
 	// （契约 §1：kind 由 capability 推导）；实际写入 content_items 的 Kind 仍由 fetcher
 	// 在构造 item 处显式赋值（契约 §7.2(b)，刻意不从本表反查——见该处注释）。
 	// 本字段与 fetcher 实际产出的 Kind 的一致性，由 fetcher/kind_test.go 的
-	// TestCatalogKindMatchesFetcherEmittedKind 对每个 article 能力逐条比对锁定
-	// （web/page_watch 的 change 由 pagewatch 用例覆盖发射侧、本表 KindOf 覆盖登记侧）；
+	// TestCatalogKindMatchesFetcherEmittedKind 对每个 article 能力逐条比对锁定；
 	// 改了这里的 Kind 而没同步 fetcher，该测试会红。Status != Available 时 Kind 无意义，留空。
 	Kind types.Kind
 	// Status 见上。
@@ -66,7 +65,8 @@ type key struct {
 // catalog 是全系统唯一的能力事实来源。新增/下线能力只改这里。
 //
 // 状态依据（契约 §2.1 / §2.2）：
-//   - web/feed、web/search、web/page_watch：迁移自 rss/exa + 页面监控，均已实现。
+//   - web/feed、web/search：迁移自 rss/exa，均已实现。
+//     （web/page_watch 页面监控已下线——改由 Exa fetch 覆盖，见 CHANGELOG / M6 契约 §10）
 //   - x/user_posts：追 X 官号，已实现（fetcher/x.go）。
 //   - x/search：**Unavailable**——上游 search_type=Latest 排序不可靠，无法追新（见 Reason）。
 //   - xhs/search：小红书关键词搜索，已实现（fetcher/tikhub.go）。
@@ -79,10 +79,6 @@ var catalog = map[key]Entry{
 	{types.PlatformWeb, types.CapSearch}: {
 		Platform: types.PlatformWeb, Capability: types.CapSearch,
 		Kind: types.KindArticle, Status: StatusAvailable,
-	},
-	{types.PlatformWeb, types.CapPageWatch}: {
-		Platform: types.PlatformWeb, Capability: types.CapPageWatch,
-		Kind: types.KindChange, Status: StatusAvailable,
 	},
 	{types.PlatformX, types.CapUserPosts}: {
 		Platform: types.PlatformX, Capability: types.CapUserPosts,
