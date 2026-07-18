@@ -256,3 +256,39 @@ func TestRLS_PoliciesCoverAllTenantTables(t *testing.T) {
 		}
 	}
 }
+
+// TestRLS_SystemLevelRowsWritableWithoutTenant 钉住可空租户列的语义。
+//
+// 这条是「想清楚怎么激活 RLS」时发现的缺陷：llm_calls / tool_calls 的 tenant_id
+// 可空（系统级调用无归属租户），而策略若写成 `tenant_id = 当前租户`，NULL 恒不匹配
+// ——**系统级记账的写入会被 WITH CHECK 拒绝**，一旦激活，后台任务的记账全线失败。
+// 已在真库复现过。改用 IS NOT DISTINCT FROM 后 NULL 匹配 NULL，语义才对。
+func TestRLS_SystemLevelRowsWritableWithoutTenant(t *testing.T) {
+	st := tenantTestStore(t)
+	ctx := t.Context()
+
+	// 无租户上下文（系统路径）写一条无归属的记账行：必须成功。
+	asTenant(t, st, 0, func(tx pgx.Tx) {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO llm_calls (span_name, provider, model) VALUES ('rls-sys-test', 'x', 'y')`); err != nil {
+			t.Errorf("系统级记账（tenant_id 为 NULL）应可写入，实得: %v", err)
+		}
+	})
+	t.Cleanup(func() {
+		_, _ = st.pool.Exec(context.WithoutCancel(ctx),
+			`DELETE FROM llm_calls WHERE span_name = 'rls-sys-test'`)
+	})
+
+	// 但租户上下文里**看不到**系统级行——它不属于任何租户。
+	tA, _, _, _ := seedTwoTenants(t, st)
+	var n int
+	asTenant(t, st, tA, func(tx pgx.Tx) {
+		if err := tx.QueryRow(ctx,
+			`SELECT count(*) FROM llm_calls WHERE span_name = 'rls-sys-test'`).Scan(&n); err != nil {
+			t.Fatalf("查询失败: %v", err)
+		}
+	})
+	if n != 0 {
+		t.Errorf("租户不应看到系统级记账行，实得 %d 行", n)
+	}
+}

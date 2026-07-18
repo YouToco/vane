@@ -57,9 +57,19 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vane_app;
 -- 三个签名级细节（缺任何一个都会让策略静默失效或退化）：
 --
 --   a. `current_setting('app.tenant_id', true)` 的第二参 missing_ok=true：
---      未设置该 GUC 时返回 NULL 而不是抛错。NULL 与任何值比较都是 NULL（非真），
---      于是**没设租户上下文 = 什么都看不到**——fail-closed，正是想要的。
---      若用 missing_ok=false，未设置时会抛异常，行为同样安全但错误信息难懂。
+--      未设置该 GUC 时返回 NULL 而不是抛错。
+--
+--   a'. 比较用 `IS NOT DISTINCT FROM` 而非 `=`。这一条是「想清楚怎么激活」时才发现的：
+--      llm_calls / tool_calls 的 tenant_id 可空（系统级调用无归属租户），而 `=` 对 NULL
+--      恒为非真——于是**系统级调用的记账写入会被 WITH CHECK 拒绝**，一旦激活 RLS，
+--      后台任务的记账会全线失败（已在真库复现：ERROR new row violates row-level
+--      security policy）。IS NOT DISTINCT FROM 让 NULL 匹配 NULL，语义正好对上：
+--        · 无租户上下文 + 行无租户 → 可见可写（系统路径正常）
+--        · 无租户上下文 + 行有租户 → 不可见（fail-closed 不变）
+--        · 有租户上下文 + 行是本租户 → 可见
+--        · 有租户上下文 + 行无租户 → 不可见（租户看不到系统级记录）
+--      对 8 张 NOT NULL 的表行为不变：无上下文时 `非空 IS NOT DISTINCT FROM NULL`
+--      恒为假，依然 fail-closed。
 --
 --   b. `(SELECT ...)` 包一层：不包的话表达式被当作 SubPlan **逐行求值**；
 --      包了会被 planner 提升为 InitPlan，整个查询只求值一次。
@@ -83,15 +93,15 @@ BEGIN
             'CREATE POLICY tenant_visible ON %I FOR ALL USING (true) WITH CHECK (true)', t);
         EXECUTE format(
             'CREATE POLICY tenant_isolation ON %I AS RESTRICTIVE FOR ALL '
-            'USING (tenant_id = (SELECT current_setting(''app.tenant_id'', true))::bigint) '
-            'WITH CHECK (tenant_id = (SELECT current_setting(''app.tenant_id'', true))::bigint)', t);
+            'USING (tenant_id IS NOT DISTINCT FROM (SELECT current_setting(''app.tenant_id'', true))::bigint) '
+            'WITH CHECK (tenant_id IS NOT DISTINCT FROM (SELECT current_setting(''app.tenant_id'', true))::bigint)', t);
     END LOOP;
 END $$;
 -- +goose StatementEnd
 
 -- llm_calls / tool_calls 的 tenant_id 可空（系统级调用无归属租户）。
--- 谓词允许 NULL 行对**所有**租户不可见（NULL = x 恒为 NULL），
--- 平台侧统计走 owner 连接绕过 RLS，不受影响。
+-- 正因如此才必须用 IS NOT DISTINCT FROM（见上方细节 a′）——用 = 的话，
+-- 系统级记账在 RLS 下会全线写入失败。
 -- +goose StatementBegin
 DO $$
 DECLARE t TEXT;
@@ -102,8 +112,8 @@ BEGIN
             'CREATE POLICY tenant_visible ON %I FOR ALL USING (true) WITH CHECK (true)', t);
         EXECUTE format(
             'CREATE POLICY tenant_isolation ON %I AS RESTRICTIVE FOR ALL '
-            'USING (tenant_id = (SELECT current_setting(''app.tenant_id'', true))::bigint) '
-            'WITH CHECK (tenant_id = (SELECT current_setting(''app.tenant_id'', true))::bigint)', t);
+            'USING (tenant_id IS NOT DISTINCT FROM (SELECT current_setting(''app.tenant_id'', true))::bigint) '
+            'WITH CHECK (tenant_id IS NOT DISTINCT FROM (SELECT current_setting(''app.tenant_id'', true))::bigint)', t);
     END LOOP;
 END $$;
 -- +goose StatementEnd
