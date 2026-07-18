@@ -328,6 +328,7 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 // 两级阈值（Boss 拍板「告警后再宽限」）：
 //   - failCount==alertFetchFailThreshold(3) → crossedAlertThreshold：发一次预警卡（人工窗口）。
 //   - failCount>=disableFetchFailThreshold(10) 且当前仍 active → justDisabled：自动停用 + 发停用卡。
+//
 // 两个返回值互斥地驱动两种告警卡（3 与 10 不重叠）。停用经 DisableSourceIfActive 幂等完成，
 // justDisabled 仅在"这一刻从 active 翻成 disabled"时为 true，据此只发一次停用告警。
 func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok bool) (crossedAlertThreshold, justDisabled bool) {

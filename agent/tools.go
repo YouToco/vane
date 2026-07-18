@@ -49,6 +49,7 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger,
 		&enableSourceTool{st: st},
 		&listSchedulesTool{st: st},
 		&createScheduleTool{sched: sched},
+		&updateScheduleTool{sched: sched},
 		&removeScheduleTool{sched: sched},
 		&pushNowTool{pusher: pusher},
 		&viewProfileTool{st: st},
@@ -538,18 +539,128 @@ func (t *createScheduleTool) Summarize(args json.RawMessage) string {
 	return s
 }
 
-// validateScheduleArgs 前置校验，与 api/schedules.go 的 toScheduleSpec 逐条对齐：
-// cron 与 every_seconds 恰好提供其一；every_seconds 不低于 1h 地板。文案同 api。
-func validateScheduleArgs(a createScheduleArgs) string {
-	hasCron := a.Spec.Cron != ""
-	hasEvery := a.Spec.EverySeconds > 0
+// validateScheduleSpecFields 是 create_schedule / update_schedule 共用的 spec 前置校验，
+// 与 api/schedules.go 的 toScheduleSpec 逐条对齐：cron 与 every_seconds 恰好提供其一；
+// every_seconds 不低于 1h 地板。文案同 api。
+//
+// 抽成共用函数而不是两处各写一遍：两个工具对同一个 spec 结构给出不同的拒绝理由，
+// 就等于同一条规则在系统里有两个版本，改地板时必漏一处。cron 频率的权威校验仍在
+// scheduler.validateCronMinInterval（这里只做能尽早给出清晰文案的那部分）。
+func validateScheduleSpecFields(cron string, everySeconds int) string {
+	hasCron := strings.TrimSpace(cron) != ""
+	hasEvery := everySeconds > 0
 	if hasCron == hasEvery {
 		return "spec 必须且只能提供 cron 或 every_seconds 之一"
 	}
-	if hasEvery && a.Spec.EverySeconds < minEverySeconds {
+	if hasEvery && everySeconds < minEverySeconds {
 		return "推送间隔不得小于 1 小时"
 	}
 	return ""
+}
+
+// validateScheduleArgs 是 create_schedule 的入口（保留原名，语义不变）。
+func validateScheduleArgs(a createScheduleArgs) string {
+	return validateScheduleSpecFields(a.Spec.Cron, a.Spec.EverySeconds)
+}
+
+// ============================================================
+// update_schedule：写工具，原地改已有调度的触发频率（不删重建，schedule_id 不变）。
+// ============================================================
+
+const updateScheduleSchema = `{
+  "type": "object",
+  "properties": {
+    "schedule_id": {"type": "string", "description": "要修改的定时任务 id（先用 list_schedules 查）"},
+    "spec": {
+      "type": "object",
+      "description": "新的触发频率：cron 与 every_seconds 必须且只能提供一个",
+      "properties": {
+        "cron": {"type": "string", "description": "5 段 cron（分 时 日 月 周），按时区的墙上时间触发，分钟字段必须是 0-59 的整数，如 \"30 8 * * *\"=每天 8:30。要「每天某个具体时刻」一律用 cron"},
+        "every_seconds": {"type": "integer", "description": "固定间隔秒数，不低于 3600。注意触发点按 Unix epoch 对齐（21600=6 小时会落在 00/06/12/18 点整），不是从现在起每 N 秒；想要具体时刻请改用 cron"},
+        "tz": {"type": "string", "description": "可选：IANA 时区名，缺省 Asia/Shanghai"}
+      }
+    },
+    "nl_description": {"type": "string", "description": "可选：同时更新该任务的自然语言描述（如\"每天早上 8 点半推送\"）；省略则保持原描述不变"}
+  },
+  "required": ["schedule_id", "spec"]
+}`
+
+type updateScheduleArgs struct {
+	ScheduleID string `json:"schedule_id"`
+	Spec       struct {
+		Cron         string `json:"cron"`
+		EverySeconds int    `json:"every_seconds"`
+		TZ           string `json:"tz"`
+	} `json:"spec"`
+	// 指针区分「省略=不改描述」与「显式置空」，与 store.UpdateScheduleSpec 的 nil 语义对应。
+	NLDescription *string `json:"nl_description"`
+}
+
+type updateScheduleTool struct {
+	sched *scheduler.Scheduler
+}
+
+func (t *updateScheduleTool) Name() string { return "update_schedule" }
+func (t *updateScheduleTool) Description() string {
+	return "修改已有定时推送任务的触发频率（原地改，schedule_id 不变，不会中断调度）。" +
+		"要改推送时间用本工具，不要用「删除再新建」——那会换掉 id 且中间有空窗。" +
+		"频率用 cron（5 段，按墙上时间）或 every_seconds（固定间隔，epoch 对齐）二选一，不得高于每小时一次。"
+}
+func (t *updateScheduleTool) Parameters() json.RawMessage {
+	return json.RawMessage(updateScheduleSchema)
+}
+func (t *updateScheduleTool) Mutating() bool { return true }
+
+func (t *updateScheduleTool) Execute(ctx context.Context, _ int64, args json.RawMessage) (string, error) {
+	var a updateScheduleArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return "参数不是合法 JSON，请修正后重试", nil
+	}
+	schedID := strings.TrimSpace(a.ScheduleID)
+	if schedID == "" {
+		return "schedule_id 必须是非空字符串（可先用 list_schedules 查询）", nil
+	}
+	if msg := validateScheduleSpecFields(a.Spec.Cron, a.Spec.EverySeconds); msg != "" {
+		return msg, nil
+	}
+	spec := scheduler.ScheduleSpec{
+		Cron:         a.Spec.Cron,
+		EverySeconds: a.Spec.EverySeconds,
+		TZ:           a.Spec.TZ,
+	}
+	if err := t.sched.UpdatePush(ctx, schedID, spec, a.NLDescription); err != nil {
+		// 与 create_schedule 同约定：确定性、用户可修正的失败（cron 过细、任务不存在）
+		// 转成文案回给模型自纠；基础设施错误上抛。
+		var ae *types.AppError
+		if errors.As(err, &ae) && (ae.Code == types.CodeValidation || ae.Code == types.CodeNotFound) {
+			return ae.Message, nil
+		}
+		return "", err
+	}
+	return fmt.Sprintf("已修改定时推送任务（id=%s）：%s", schedID, formatScheduleSpec(spec)), nil
+}
+
+func (t *updateScheduleTool) Summarize(args json.RawMessage) string {
+	var a updateScheduleArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return summarizeFallback("修改定时推送任务", args)
+	}
+	s := fmt.Sprintf("修改定时推送任务（id=%s）：触发频率改为 %s",
+		strings.TrimSpace(a.ScheduleID),
+		formatScheduleSpec(scheduler.ScheduleSpec{
+			Cron:         a.Spec.Cron,
+			EverySeconds: a.Spec.EverySeconds,
+			TZ:           a.Spec.TZ,
+		}))
+	// 描述只在显式提供时上卡：省略=不改，卡面不能让人以为描述会被动。
+	if a.NLDescription != nil {
+		if desc := strings.TrimSpace(*a.NLDescription); desc != "" {
+			s += fmt.Sprintf("，描述改为「%s」", desc)
+		} else {
+			s += "，并清空描述"
+		}
+	}
+	return s
 }
 
 // ============================================================

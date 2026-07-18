@@ -515,10 +515,124 @@ func TestOtherTools_Summarize(t *testing.T) {
 			t.Fatalf("实得 %q", got)
 		}
 	})
+	t.Run("update_schedule 只改频率", func(t *testing.T) {
+		got := (&updateScheduleTool{}).Summarize(json.RawMessage(
+			`{"schedule_id":"push-1-abc","spec":{"cron":"30 8 * * *"}}`))
+		want := "修改定时推送任务（id=push-1-abc）：触发频率改为 按 cron「30 8 * * *」触发（时区 Asia/Shanghai）"
+		if got != want {
+			t.Fatalf("实得 %q\n期望 %q", got, want)
+		}
+	})
+	// 省略 nl_description = 不改描述，卡面绝不能提它——否则用户以为描述会被动。
+	t.Run("update_schedule 省略描述不上卡", func(t *testing.T) {
+		got := (&updateScheduleTool{}).Summarize(json.RawMessage(
+			`{"schedule_id":"s1","spec":{"every_seconds":7200}}`))
+		if strings.Contains(got, "描述") {
+			t.Fatalf("省略 nl_description 时卡面不该提描述，实得 %q", got)
+		}
+	})
+	t.Run("update_schedule 显式改描述", func(t *testing.T) {
+		got := (&updateScheduleTool{}).Summarize(json.RawMessage(
+			`{"schedule_id":"s1","spec":{"cron":"0 9 * * *"},"nl_description":"改成九点"}`))
+		if !strings.Contains(got, "描述改为「改成九点」") {
+			t.Fatalf("实得 %q", got)
+		}
+	})
+	t.Run("update_schedule 显式清空描述", func(t *testing.T) {
+		got := (&updateScheduleTool{}).Summarize(json.RawMessage(
+			`{"schedule_id":"s1","spec":{"cron":"0 9 * * *"},"nl_description":""}`))
+		if !strings.Contains(got, "清空描述") {
+			t.Fatalf("显式空串应显示为清空（与省略可区分），实得 %q", got)
+		}
+	})
 	// Summarize 无 error 通道：非法参数必须兜底成可读文案而非 panic/空串。
 	t.Run("非法 JSON 兜底", func(t *testing.T) {
 		if got := (&removeSourceTool{}).Summarize(json.RawMessage(`{`)); !strings.Contains(got, "取消订阅信源") {
 			t.Fatalf("应走 summarizeFallback, 实得 %q", got)
 		}
 	})
+}
+
+// TestUpdateScheduleTool_契约 钉死 update_schedule 的工具面契约：
+// 它是写工具（必须走确认卡）、参数校验与 create_schedule 同源、
+// 且**不在 A2A 只读白名单里**（写工具漏进 A2A 就是越权）。
+func TestUpdateScheduleTool_契约(t *testing.T) {
+	tool := &updateScheduleTool{}
+
+	if tool.Name() != "update_schedule" {
+		t.Errorf("工具名不符: %s", tool.Name())
+	}
+	if !tool.Mutating() {
+		t.Error("改调度是写操作，Mutating 必须为 true（否则绕过确认卡）")
+	}
+	// schema 必须是合法 JSON object schema，且把两个必填项声明出来。
+	var schema map[string]any
+	if err := json.Unmarshal(tool.Parameters(), &schema); err != nil {
+		t.Fatalf("schema 不是合法 JSON: %v", err)
+	}
+	req, _ := schema["required"].([]any)
+	if len(req) != 2 {
+		t.Errorf("schedule_id 与 spec 都应必填，实得 %v", req)
+	}
+	// 工具描述必须点明"原地改、不要删了重建"——这正是它存在的理由，
+	// 模型看不到这句就会退回 remove+create 的老路。
+	if !strings.Contains(tool.Description(), "原地改") {
+		t.Errorf("Description 应说明原地改，实得 %q", tool.Description())
+	}
+	// every_seconds 的 epoch 对齐语义必须写进 schema，否则模型会把它当"从现在起每 N 秒"。
+	if !strings.Contains(string(tool.Parameters()), "epoch") {
+		t.Error("schema 应说明 every_seconds 的 epoch 对齐语义")
+	}
+}
+
+// TestValidateScheduleSpecFields_共用 验证 create 与 update 走的是同一套 spec 判据——
+// 两处各写一份就等于同一条规则有两个版本，改地板时必漏一处。
+func TestValidateScheduleSpecFields_共用(t *testing.T) {
+	cases := []struct {
+		name  string
+		cron  string
+		every int
+		bad   bool
+	}{
+		{"只给 cron", "0 8 * * *", 0, false},
+		{"只给 every", "", 3600, false},
+		{"都给", "0 8 * * *", 3600, true},
+		{"都不给", "", 0, true},
+		{"every 低于地板", "", 1800, true},
+		{"cron 只有空白等于没给", "   ", 0, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			msg := validateScheduleSpecFields(c.cron, c.every)
+			if c.bad && msg == "" {
+				t.Error("应被拒绝")
+			}
+			if !c.bad && msg != "" {
+				t.Errorf("不应被拒绝，实得 %q", msg)
+			}
+			// create 的入口必须与共用函数结论一致。
+			viaCreate := validateScheduleArgs(createScheduleArgs{Spec: struct {
+				Cron         string `json:"cron"`
+				EverySeconds int    `json:"every_seconds"`
+				TZ           string `json:"tz"`
+			}{Cron: c.cron, EverySeconds: c.every}})
+			if (viaCreate == "") != (msg == "") {
+				t.Errorf("create 入口与共用校验结论漂移: create=%q shared=%q", viaCreate, msg)
+			}
+		})
+	}
+}
+
+// TestBuildTools_包含update_schedule 防装配漏注册：工具写了但没进 BuildTools
+// 等于不存在（loop 只认注册过的名字）。
+func TestBuildTools_包含update_schedule(t *testing.T) {
+	names := map[string]bool{}
+	for _, tl := range BuildTools(nil, nil, nil, nil) {
+		names[tl.Name()] = true
+	}
+	for _, want := range []string{"create_schedule", "update_schedule", "remove_schedule", "list_schedules"} {
+		if !names[want] {
+			t.Errorf("BuildTools 应包含 %s", want)
+		}
+	}
 }

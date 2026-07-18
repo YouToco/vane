@@ -21,7 +21,6 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 
-	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
@@ -40,21 +39,50 @@ const (
 
 // ScheduleSpec 是 Vane 侧中立的调度频率描述：cron 与 every_seconds 二选一。
 // 前端时间选择器编译出结构化 spec 后经 API 传入，内部翻译成 client.ScheduleSpec。
+//
+// 两条路径的语义**不等价**，选哪条会影响触发时刻，不是同一件事的两种写法：
+//   - Cron 是**日历语义**：按 tz 的墙上时间匹配（"每天 8:30"、"每周一 9:00"），
+//     夏令时切换按该时区规则走。精度到分钟——validateCronMinInterval 只收 5 段
+//     （分 时 日 月 周），带秒的 6 段 cron 会被拒；且分钟字段必须是固定整数，
+//     这正是 1 小时频率地板的实现方式（分钟固定 ⇒ 每小时至多触发一次）。
+//   - EverySeconds 是**固定间隔语义**，且触发点按 Unix epoch 对齐：Temporal 的
+//     ScheduleIntervalSpec 匹配 `Epoch + n*Every + Offset`。vane 不设 Offset（恒 0），
+//     所以 every_seconds=21600（6h）落在 00/06/12/18 点整（按 tz），**不是**"从创建
+//     那一刻起每 6 小时"。想要"每天某个非整点时刻"请用 cron，不要用 every_seconds。
+//
+// 精度不对等是已知取舍：every_seconds 能表达秒级偏移（如 3601），cron 表达不了；
+// cron 能表达"每周一"，every_seconds 表达不了。推送场景不需要秒级，故不放开 cron
+// 到 6 段——那会同时把 1 小时地板的实现基础（分钟字段固定）一起打开。
 type ScheduleSpec struct {
 	Cron         string `json:"cron,omitempty"`          // 5 段 cron，如 "0 8 * * *"
-	EverySeconds int    `json:"every_seconds,omitempty"` // 固定间隔秒数，如 86400
+	EverySeconds int    `json:"every_seconds,omitempty"` // 固定间隔秒数（epoch 对齐），如 86400
 	TZ           string `json:"tz,omitempty"`            // 时区名，空则用 defaultTZ
+}
+
+// scheduleStore 是本包用到的 store 子集（镜像读写）。
+//
+// 收窄成接口而非直接持 *store.Store 的理由：Create/Update/Delete 三条路径的
+// **补偿分支只在镜像写失败时才走到**，而那是最需要测、又最不可能在真库上自然发生的
+// 分支——拿具体类型就只能把它们留成永不执行的注释（本包 CreatePush/DeletePush 至今
+// 零测试正是这个原因）。有了接口，替身可以精确模拟"Temporal 成功但镜像失败"，
+// 把回滚是否真的发生钉死在单测里。*store.Store 隐式满足本接口，装配处零改动。
+type scheduleStore interface {
+	ListSchedulesByUser(ctx context.Context, userID int64) ([]types.Schedule, error)
+	InsertSchedule(ctx context.Context, sc *types.Schedule) error
+	UpdateScheduleSpec(ctx context.Context, id string, spec json.RawMessage, nlDesc *string) error
+	DeleteSchedule(ctx context.Context, id string) error
 }
 
 // Scheduler 持有 Temporal client、任务队列名与 store（镜像用）。
 type Scheduler struct {
 	c  client.Client
 	tq string
-	st *store.Store
+	st scheduleStore
 }
 
-// New 构造 Scheduler。client 由 cmd/server 用 client.Dial 建好后注入。
-func New(c client.Client, taskQueue string, st *store.Store) *Scheduler {
+// New 构造 Scheduler。client 由 cmd/server 用 client.Dial 建好后注入；
+// st 传 *store.Store（隐式满足 scheduleStore）。
+func New(c client.Client, taskQueue string, st scheduleStore) *Scheduler {
 	return &Scheduler{c: c, tq: taskQueue, st: st}
 }
 
@@ -192,6 +220,77 @@ func (s *Scheduler) TriggerPushNow(ctx context.Context, userID int64) (string, e
 }
 
 // DeletePush 删除调度：先 Temporal Delete，再删镜像（镜像删除失败只 slog）。
+// UpdatePush 原地改一个已存在调度的触发频率（可选连带 nl_description）。
+//
+// 为什么要有它、而不是让调用方 Delete+Create（本方法存在的全部理由）：删重建会
+// **换掉 schedule_id**（用户记的 id、前端列表里的行、外部引用全部失效）、在两次调用
+// 之间留下一段没有调度的窗口，且 Create 失败时旧调度已经删了——非原子，改个时间
+// 却可能把定时推送弄丢。原地 Update 由 Temporal 服务端做单次原子替换。
+//
+// **只替换 Spec，其余原样交回**：DoUpdate 回调拿到的 in.Description.Schedule 是当前
+// 完整调度（Action=跑哪个 workflow/哪个 TaskQueue、Policy=Overlap SKIP 推送堆叠护栏、
+// State）。这里值拷贝它、只覆盖 Spec 字段再返回——**绝不能自己 new 一个 Schedule**，
+// 那会静默丢掉 Action 与 Overlap 策略，表现是调度还在、却再也不推送或开始堆叠。
+//
+// 原子性（CreatePush 那条铁律的 update 版）：先 Temporal Update 成功、再更新 Postgres
+// 镜像；镜像失败则把 Temporal 补偿回旧 Spec，使二者不漂移，并把镜像错误上抛（调用方
+// 会看到失败，不会以为改成了）。补偿本身也失败时只能留漂移（Temporal 新、镜像旧）
+// 并 slog.Error——此时列表页显示的频率是假的，必须有日志可查。
+//
+// 并发注意：Temporal SDK 明确警告并行 Update 同一 schedule 有竞态。单 owner MVP 下
+// 改调度是低频人工操作，不额外加锁；多用户/自动化改调度前需要补乐观锁（ConflictToken）。
+func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, spec ScheduleSpec, nlDesc *string) error {
+	if err := validateSpec(spec); err != nil {
+		return err
+	}
+	sdkSpec, err := translateSpec(spec)
+	if err != nil {
+		return err
+	}
+
+	h := s.c.ScheduleClient().GetHandle(ctx, schedID)
+	// 捕获旧 Spec 供镜像失败时补偿回滚（回调内是唯一能拿到服务端当前 Spec 的地方）。
+	var oldSpec *client.ScheduleSpec
+	err = h.Update(ctx, client.ScheduleUpdateOptions{
+		DoUpdate: func(in client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
+			sch := in.Description.Schedule // 值拷贝：Action/Policy/State 随之带走
+			oldSpec = sch.Spec
+			sch.Spec = &sdkSpec
+			return &client.ScheduleUpdate{Schedule: &sch}, nil
+		},
+	})
+	if err != nil {
+		var nf *serviceerror.NotFound
+		if errors.As(err, &nf) {
+			return types.NewAppError(types.CodeNotFound,
+				fmt.Sprintf("定时任务 %s 不存在", schedID), err)
+		}
+		return types.NewAppError(types.CodeInternal, "更新定时任务失败", err)
+	}
+
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		return types.NewAppError(types.CodeInternal, "序列化调度 spec 失败", err)
+	}
+	if mirrorErr := s.st.UpdateScheduleSpec(ctx, schedID, specJSON, nlDesc); mirrorErr != nil {
+		if oldSpec != nil {
+			rbErr := h.Update(ctx, client.ScheduleUpdateOptions{
+				DoUpdate: func(in client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
+					sch := in.Description.Schedule
+					sch.Spec = oldSpec
+					return &client.ScheduleUpdate{Schedule: &sch}, nil
+				},
+			})
+			if rbErr != nil {
+				slog.Error("scheduler: 镜像更新失败且 Temporal 回滚也失败，调度已漂移（Temporal 新/镜像旧）",
+					"schedule_id", schedID, "mirror_err", mirrorErr, "rollback_err", rbErr)
+			}
+		}
+		return mirrorErr
+	}
+	return nil
+}
+
 func (s *Scheduler) DeletePush(ctx context.Context, schedID string) error {
 	h := s.c.ScheduleClient().GetHandle(ctx, schedID)
 	if err := h.Delete(ctx); err != nil {
