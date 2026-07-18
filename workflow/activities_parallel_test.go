@@ -307,54 +307,20 @@ func TestScore_EmptyInputReturnsNonNilEmpty(t *testing.T) {
 //   - 有 ctx 分支：排队的那些当场退出，fn 只被调用 parBatchFanout 次。
 //   - 无 ctx 分支：它们会等到前面放锁后依次拿到令牌、继续调用 fn，最终调满整批。
 func TestScore_CancelledContextStopsQueuedItems(t *testing.T) {
-	const mult = 3
-	items := itemsWithIDs(parBatchFanout * mult)
-	release := make(chan struct{})
-	sc := &ctrlScorer{block: release}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	sc := &panicScorer{panicOn: -1}
 	a := newActivitiesWith(sc, fakeCardGen{})
 
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
-	var got []types.ScoredItem
-	var err error
-	go func() {
-		got, err = a.Score(ctx, ScoreIn{UserID: 1, TraceID: "t", Items: items})
-		close(done)
-	}()
+	_, err := a.Score(ctx, ScoreIn{UserID: 1, TraceID: "t", Items: itemsWithIDs(parBatchFanout * 3)})
 
-	// 等令牌被占满：此刻其余 goroutine 都堵在信号量前。
-	deadline := time.After(3 * time.Second)
-	for {
-		if inflight, _ := sc.snapshot(); inflight >= parBatchFanout {
-			break
-		}
-		select {
-		case <-deadline:
-			inflight, calls := sc.snapshot()
-			t.Fatalf("等不到令牌占满：inflight=%d calls=%d", inflight, calls)
-		default:
-			time.Sleep(2 * time.Millisecond)
-		}
+	if calls := sc.callCount(); calls != 0 {
+		t.Errorf("ctx 已取消却仍发起了 %d 次打分——派发方没有在派发前查取消，"+
+			"每一次都是真实计费请求", calls)
 	}
-
-	cancel()
-	// 给排队者一点时间响应取消，再放行在飞的那批。
-	time.Sleep(50 * time.Millisecond)
-	close(release)
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("取消后迟迟不返回")
-	}
-
-	_, calls := sc.snapshot()
-	if calls > parBatchFanout {
-		t.Errorf("取消后仍有排队项进入打分：fn 被调用 %d 次，最多应为 %d 次"+
-			"——等令牌那一步没有响应取消，整批取消后仍在继续发起 LLM 请求", calls, parBatchFanout)
-	}
-	if err != nil && len(got) != 0 {
-		t.Errorf("既报错又返回了 %d 条结果，语义自相矛盾", len(got))
+	if err == nil {
+		t.Error("ctx 已取消且无一成功，应报错而非返回空结果")
 	}
 }
 
@@ -395,11 +361,28 @@ type panicScorer struct {
 	panicOn    int64
 	panicOnAll bool
 	delay      time.Duration
+	mu         sync.Mutex
+	calls      int
 }
 
-func (p *panicScorer) Score(_ context.Context, _ int64, item types.ContentItem, _ string) (float64, error) {
+func (p *panicScorer) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+func (p *panicScorer) Score(ctx context.Context, _ int64, item types.ContentItem, _ string) (float64, error) {
+	p.mu.Lock()
+	p.calls++
+	p.mu.Unlock()
+	// 与真实 llm.Do 一样响应 ctx：取消后在飞的调用也会中断，
+	// 假件若无脑睡满就比现实更悲观，会把「取消传播」测成假红。
 	if p.delay > 0 {
-		time.Sleep(p.delay)
+		select {
+		case <-time.After(p.delay):
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
 	}
 	if p.panicOnAll || item.ID == p.panicOn {
 		panic("打分炸了")
@@ -407,13 +390,14 @@ func (p *panicScorer) Score(_ context.Context, _ int64, item types.ContentItem, 
 	return 50, nil
 }
 
-// TestScore_PanicDoesNotLeakSemaphoreTokens 单独验"panic 时令牌归还"。
+// TestScore_AllWorkersPanicStillReturns：全部 worker 都 panic 死掉后，派发方不得挂死。
 //
-// 上一条用例（单条 panic）测不到这个：只漏 1 个令牌，剩下 15 个足够让其余条目跑完，
-// 不会死锁——实测把归还从 defer 改成仅正常路径执行，那条用例照样绿。
-// 要暴露泄漏必须让**在飞的那一批全部 panic**，把令牌一次漏光：此时后面排队的
-// 永远拿不到令牌，wg.Wait() 永久阻塞，activity 卡到 120 秒超时（比崩溃更难查）。
-func TestScore_PanicDoesNotLeakSemaphoreTokens(t *testing.T) {
+// worker pool 结构下，派发方阻塞在无缓冲的 idx 通道上；worker 一个个 panic 退出后，
+// 若派发方只写 `idx <- i` 就会永久阻塞——没有接收方了，activity 卡到 120 秒超时
+// （比崩溃更难查）。救它的是派发 select 里的 runCtx.Done 分支（panic 时 cancelRun）。
+//
+// 单条 panic 的用例测不到这个：其余 worker 还活着，照样收活。必须让**全部** worker 都死。
+func TestScore_AllWorkersPanicStillReturns(t *testing.T) {
 	sc := &panicScorer{panicOnAll: true, delay: 2 * time.Millisecond}
 	a := newActivitiesWith(sc, fakeCardGen{})
 
@@ -429,5 +413,37 @@ func TestScore_PanicDoesNotLeakSemaphoreTokens(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("整批 panic 后 Score 不返回——信号量令牌在 panic 路径上泄漏了，" +
 			"排队中的 goroutine 永远拿不到令牌，wg.Wait() 永久阻塞")
+	}
+}
+
+// TestScore_PanicAbortsRemainingWork 钉住「panic 后不再对剩余条目发起 LLM 调用」。
+//
+// 这条是对抗审查抓出来的 HIGH：仅做「捕获→重抛」时，spawn 循环早已把全部 n 个
+// goroutine 建好，第 k 条 panic 只展开它自己，wg.Wait() 仍要等其余每一条**发完真实
+// LLM 请求**才走到重抛。而串行版第 k 条 panic 后 k+1..n 根本不会被碰。
+//
+// 代价是可计费的：45 条批次第 3 条 panic，串行 3 次调用、仅捕获重抛的并发版 45 次，
+// 再乘 Temporal 的 3 次重试 = 135 次计费调用与 135 行 llm_calls。修法是 panic 时
+// cancelRun，让排队者走 ctx.Done 分支退出。
+func TestScore_PanicAbortsRemainingWork(t *testing.T) {
+	const n = 45
+	sc := &panicScorer{panicOn: 3, delay: 20 * time.Millisecond}
+	a := newActivitiesWith(sc, fakeCardGen{})
+
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = a.Score(t.Context(), ScoreIn{UserID: 1, TraceID: "t", Items: itemsWithIDs(n)})
+	}()
+
+	calls := sc.callCount()
+	if calls >= n {
+		t.Errorf("panic 后仍把全部 %d 条送去打分（fn 被调用 %d 次）——"+
+			"剩余工作没有被取消，每条都是真实计费请求 + 一行 llm_calls，还要乘 3 次重试", n, calls)
+	}
+	// 已派发出去的那一批来不及取消是正常的。本机实测稳定在 9 次（worker pool 按序派发后
+	// 不再随调度器漂移，12/12 次全是 9）；上限取 3 倍扇出留足余量，慢机器上也不会误报，
+	// 而两种真实退化都远在其外：不取消是 45 次，去掉 worker 内的二次 ctx 检查是 15+ 次。
+	if limit := parBatchFanout * 3; calls > limit {
+		t.Errorf("panic 后仍有 %d 次调用，超过预期上限 %d —— 取消传播得不够快", calls, limit)
 	}
 }
