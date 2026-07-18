@@ -8,6 +8,7 @@ go 1.26
 replace github.com/larksuite/oapi-sdk-go/v3 => ./third_party/oapi-sdk-go/v3
 
 require (
+	golang.org/x/crypto v0.53.0
 	github.com/PuerkitoBio/goquery v1.12.0
 	github.com/a2aproject/a2a-go/v2 v2.3.1
 	github.com/google/uuid v1.6.0

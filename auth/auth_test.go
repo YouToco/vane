@@ -40,7 +40,7 @@ func (f *fakeOwnerStore) UpsertUserByOpenID(_ context.Context, openID, name stri
 	if f.upsertErr != nil {
 		return nil, f.upsertErr
 	}
-	return &types.User{ID: f.userID, FeishuOpenID: openID, Name: name}, nil
+	return &types.User{ID: f.userID, FeishuOpenID: &openID, Name: name}, nil
 }
 
 func TestFromContext_Success(t *testing.T) {
@@ -145,7 +145,7 @@ func (k *keyCapturingStore) GetSetting(_ context.Context, key string) (json.RawM
 	return json.RawMessage(`{"open_id":"ou_x","name":"n"}`), nil
 }
 func (k *keyCapturingStore) UpsertUserByOpenID(_ context.Context, openID, name string) (*types.User, error) {
-	return &types.User{ID: 1, FeishuOpenID: openID, Name: name}, nil
+	return &types.User{ID: 1, FeishuOpenID: &openID, Name: name}, nil
 }
 
 func assertCode(t *testing.T, err error, want types.ErrCode) {

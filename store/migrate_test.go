@@ -41,6 +41,8 @@ var wantTables = []string{
 	"tenants",
 	"memberships",
 	"invites",
+	// 019 邮箱+密码身份与会话（决议 D2′）
+	"user_sessions",
 	// 015 agent 工具调用记账（TikHub 端点注册表契约 §6）
 	"tool_calls",
 	// 017 情报任务手册（Task Playbook P0）
