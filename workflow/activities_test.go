@@ -121,6 +121,18 @@ type fakeStore struct {
 	// updateFetchErr 模拟 UpdateSourceFetchState 落库失败（验"状态没落库不告警"）。
 	dueSources     []types.Source
 	updateFetchErr error
+	// 自动停用测试用（功能 5.2）：disableResult 是 DisableSourceIfActive 的返回
+	// （true=本次真从 active 翻成 disabled），disableErr 模拟落库失败，disableCalls 记录入参。
+	disableResult bool
+	disableErr    error
+	disableCalls  []int64
+}
+
+func (s *fakeStore) DisableSourceIfActive(_ context.Context, id int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.disableCalls = append(s.disableCalls, id)
+	return s.disableResult, s.disableErr
 }
 
 func (s *fakeStore) RecordEmptyPushBatch(_ context.Context, userID int64, idempKey string,
@@ -478,7 +490,7 @@ func TestFetch_AlertsExactlyOnThresholdCrossing(t *testing.T) {
 	push := &fakePusher{}
 	st := &fakeStore{dueSources: []types.Source{
 		fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源"), // 失败后 = 阈值 → 告警
-		fetchSrc(2, 0, "刚开始失败的源"),                 // 失败后 = 1 < 阈值 → 不告警
+		fetchSrc(2, 0, "刚开始失败的源"),                       // 失败后 = 1 < 阈值 → 不告警
 		fetchSrc(3, alertFetchFailThreshold-1, "抓成功的源"), // 抓成功 → 清零，不告警
 	}}
 	fetcher := scriptedFetcher{errByID: map[int64]error{
@@ -518,7 +530,7 @@ func TestFetch_NoAlertBelowOrAboveThreshold(t *testing.T) {
 		name      string
 		failCount int
 	}{
-		{"低于阈值", 0},                         // 失败后 =1 < 阈值
+		{"低于阈值", 0},                        // 失败后 =1 < 阈值
 		{"已越过阈值", alertFetchFailThreshold}, // 失败后 =阈值+1 > 阈值（跨阈那轮早发过）
 	}
 	for _, c := range cases {
@@ -640,5 +652,90 @@ func TestFetch_AlertDeferredThenSentAfterStateRecovers(t *testing.T) {
 	}
 	if n := len(push2.sentCards()); n != 1 {
 		t.Fatalf("第二轮落库成功应补发告警一次，实得 %d 张", n)
+	}
+}
+
+// ============================================================
+// 连续失败自动停用（功能 5.2，「告警后再宽限」）
+// ============================================================
+
+// TestFetch_AutoDisablesAtThreshold：连续失败达停用阈值 → 调 DisableSourceIfActive 停用
+// 该源，并发一张「已暂停 + 如何重新启用」卡（措辞与预警卡不同）。
+func TestFetch_AutoDisablesAtThreshold(t *testing.T) {
+	push := &fakePusher{}
+	st := &fakeStore{
+		dueSources:    []types.Source{fetchSrc(1, disableFetchFailThreshold-1, "长期失效的源")},
+		disableResult: true, // DisableSourceIfActive 真从 active 翻成 disabled。
+	}
+	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "域名解析失败", nil)}}
+	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, idNotice)
+
+	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+		t.Fatalf("Fetch 意外报错: %v", err)
+	}
+	if len(st.disableCalls) != 1 || st.disableCalls[0] != 1 {
+		t.Fatalf("达阈值应对 source 1 调一次 DisableSourceIfActive，实得 %+v", st.disableCalls)
+	}
+	cards := push.sentCards()
+	if len(cards) != 1 {
+		t.Fatalf("应恰好发一张停用卡，实得 %d 张", len(cards))
+	}
+	card := cards[0]
+	for _, want := range []string{"已自动暂停", "长期失效的源", "域名解析失败", "重新启用"} {
+		if !strings.Contains(card, want) {
+			t.Errorf("停用卡应含 %q，实得:\n%s", want, card)
+		}
+	}
+	// 停用卡措辞必须与预警卡区分（不是「建议检查」而是「已停止」）。
+	if strings.Contains(card, "建议检查") {
+		t.Errorf("停用卡不应复用预警卡措辞「建议检查」:\n%s", card)
+	}
+}
+
+// TestFetch_NoDisableAlertWhenNotTransitioned：DisableSourceIfActive 返回 false（已是
+// disabled，未翻转）时不重复发停用卡——幂等，避免每轮刷屏。
+func TestFetch_NoDisableAlertWhenNotTransitioned(t *testing.T) {
+	push := &fakePusher{}
+	st := &fakeStore{
+		dueSources:    []types.Source{fetchSrc(1, disableFetchFailThreshold, "已停用的源")}, // 失败后 > 阈值
+		disableResult: false,                                                           // WHERE status='active' 命不中：未翻转。
+	}
+	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "超时", nil)}}
+	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, idNotice)
+	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+		t.Fatalf("Fetch 意外报错: %v", err)
+	}
+	if n := len(push.sentCards()); n != 0 {
+		t.Errorf("未翻转（已停用）不应再发停用卡，却发了 %d 张", n)
+	}
+}
+
+// TestFetch_NoDisableBelowThreshold：告警阈值(3)与停用阈值(10)之间的源继续被抓取、
+// 不停用——「告警后再宽限」的核心，短暂宕机的站点在这个窗口内恢复即清零。
+func TestFetch_NoDisableBelowThreshold(t *testing.T) {
+	push := &fakePusher{}
+	st := &fakeStore{dueSources: []types.Source{fetchSrc(1, disableFetchFailThreshold-2, "还在宽限窗口的源")}}
+	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "超时", nil)}}
+	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, idNotice)
+	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+		t.Fatalf("Fetch 意外报错: %v", err)
+	}
+	if len(st.disableCalls) != 0 {
+		t.Errorf("未达停用阈值不该调 DisableSourceIfActive，实得 %+v", st.disableCalls)
+	}
+	if n := len(push.sentCards()); n != 0 {
+		t.Errorf("宽限窗口内不该发停用卡，却发了 %d 张", n)
+	}
+}
+
+// TestRenderSourcesDisabledAlert：停用卡正文含阈值/源信息/两条恢复路径（信源页 + 对 AI 说）。
+func TestRenderSourcesDisabledAlert(t *testing.T) {
+	md := renderSourcesDisabledAlert([]fetchFailure{
+		{src: types.Source{Title: "某站", Platform: "web", Capability: "feed", URL: "https://s/feed"}, failCount: disableFetchFailThreshold, reason: "连续超时"},
+	})
+	for _, want := range []string{"已自动暂停", "某站", "连续超时", "信源管理", "重新启用信源"} {
+		if !strings.Contains(md, want) {
+			t.Errorf("停用卡正文应含 %q，实得:\n%s", want, md)
+		}
 	}
 }

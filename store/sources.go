@@ -191,6 +191,42 @@ func (s *Store) UpdateSourceFetchState(ctx context.Context, id int64, lastFetche
 	return nil
 }
 
+// DisableSourceIfActive 把信源置为 disabled，仅当它当前是 active（幂等 + 一次性告警）。
+// 返回 disabled=true 表示本次调用真的把它从 active 翻成了 disabled（rows affected>0）——
+// 调用方据此判断"这一刻刚被停用"，只在真翻转时发一次停用告警。已是 disabled 的源
+// 再次调用返回 false（WHERE status='active' 命不中），天然幂等。
+// 停用后 ListDueSourcesByUser（双重 active 过滤）不再返回它，抓取自然停止。
+func (s *Store) DisableSourceIfActive(ctx context.Context, id int64) (disabled bool, err error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE sources SET status = $2, updated_at = now()
+		 WHERE id = $1 AND status = $3`,
+		id, types.SourceStatusDisabled, types.SourceStatusActive)
+	if err != nil {
+		return false, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("自动停用信源（id=%d）", id), err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// EnableSource 重新启用一个被停用的信源：置回 active、清零 fail_count、next_fetch_at=now()
+// （立即重新纳入抓取），**且仅当调用者是该源的 active 订阅者**（归属校验进 WHERE，
+// 单语句原子完成，杜绝启用未订阅的源）。清零 fail_count 是关键：否则启用后一次失败
+// 就又跨过停用阈值被立刻停掉，用户的"重新启用"形同虚设。
+// 返回 enabled=true 表示确实启用了一行（存在且是本人订阅）；false=找不到或未订阅。
+func (s *Store) EnableSource(ctx context.Context, userID, sourceID int64) (enabled bool, err error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE sources SET status = $2, fail_count = 0, next_fetch_at = now(), updated_at = now()
+		 WHERE id = $1
+		   AND EXISTS (SELECT 1 FROM subscriptions
+		               WHERE source_id = $1 AND user_id = $3 AND status = $4)`,
+		sourceID, types.SourceStatusActive, userID, types.SubscriptionStatusActive)
+	if err != nil {
+		return false, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("重新启用信源（id=%d, user=%d）", sourceID, userID), err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // GetSource 按 id 读取单个信源；不存在时返回 CodeNotFound 的 AppError，
 // 调用方可用 errors.Is(err, types.ErrNotFound) 区分"不存在"与数据库故障。
 func (s *Store) GetSource(ctx context.Context, id int64) (*types.Source, error) {
