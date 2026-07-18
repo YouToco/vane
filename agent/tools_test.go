@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/types"
 )
 
@@ -372,4 +373,24 @@ func tagsArgs(n int) string {
 		panic(err)
 	}
 	return string(raw)
+}
+
+// TestAddSourceDescriptionDerivesUnavailableFromCatalog 锁住审计修复：add_source 工具说明里
+// 「不支持的能力及原因」必须**派生自 sourcecatalog**，而非手抄进 schema 的会漂移的副本。
+// 这是「注册表被 fetcher/sourcespec/agent 三处共用」中 agent 那一处的真接线证明——
+// 若有人把 x/search 的 Reason 改回硬编码、或 Description 不再读注册表，本用例会红。
+func TestAddSourceDescriptionDerivesUnavailableFromCatalog(t *testing.T) {
+	desc := (&addSourceTool{}).Description()
+
+	entry, ok := sourcecatalog.Lookup(types.PlatformX, types.CapSearch)
+	if !ok || entry.Available() {
+		t.Fatal("前提失效：x/search 应是 sourcecatalog 里的 Unavailable 条目")
+	}
+	// 说明必须逐字包含注册表里的 Reason（派生而非改写），且点名该能力。
+	if !strings.Contains(desc, entry.Reason) {
+		t.Errorf("工具说明未含注册表派生的 x/search Reason（疑似硬编码/未读注册表）。\ndesc=%q\nreason=%q", desc, entry.Reason)
+	}
+	if !strings.Contains(desc, "x/search") {
+		t.Errorf("工具说明应点名 x/search，实际：%q", desc)
+	}
 }

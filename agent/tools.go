@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/YouToco/vane/scheduler"
+	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -140,7 +141,7 @@ const addSourceSchema = `{
     "capability": {
       "type": "string",
       "enum": ["feed", "search", "user_posts", "page_watch"],
-      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主）；page_watch=页面变化监控（仅 web）。注意 x/search（X 关键词搜索）暂不支持——上游排序不可靠无法追新，追 X 账号请用 x/user_posts。"
+      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主）；page_watch=页面变化监控（仅 web）。当前不支持的能力及原因见本工具说明（Description）。"
     },
     "type": {
       "type": "string",
@@ -165,7 +166,29 @@ type addSourceTool struct {
 
 func (t *addSourceTool) Name() string { return "add_source" }
 func (t *addSourceTool) Description() string {
-	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts/page_watch），或传旧版 type 字段兼容。"
+	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts/page_watch），或传旧版 type 字段兼容。" +
+		unavailableCapabilitiesNote()
+}
+
+// unavailableCapabilitiesNote 从 sourcecatalog 派生「当前不支持的能力及原因」附到工具说明里。
+//
+// 存在的理由（契约 §2.2 + 本次审计缺陷）：让模型能主动回答"X 关键词搜索为何不支持"，
+// 而不是静默改用别的能力。关键是**原因取自注册表单一事实来源**（sourcecatalog.List），
+// 不再是手抄进 schema 的副本——审计发现旧写法把 x/search 的 Reason 硬编码复制到 schema
+// 里，注册表一改这里就漂移。改成派生后，注册表与 agent 工具面自动同步，
+// 「注册表被三处共用」这句话（fetcher 分发 / sourcespec 构造 / agent 描述）才真正成立。
+func unavailableCapabilitiesNote() string {
+	var lines []string
+	for _, e := range sourcecatalog.List() {
+		if e.Available() {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s/%s：%s", e.Platform, e.Capability, e.Reason))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "\n\n当前不支持的能力（请勿尝试添加，会被拒绝）：\n- " + strings.Join(lines, "\n- ")
 }
 func (t *addSourceTool) Parameters() json.RawMessage { return json.RawMessage(addSourceSchema) }
 func (t *addSourceTool) Mutating() bool              { return true }
