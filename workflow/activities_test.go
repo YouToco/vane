@@ -111,15 +111,18 @@ type markSentCall struct {
 
 // emptyBatchCall 记录 RecordEmptyPushBatch 收到的实参，供空批次闸门断言。
 type emptyBatchCall struct {
-	userID   int64
-	idempKey string
-	gate     types.BatchExitGate
-	counts   types.PipelineCounts
+	userID     int64
+	idempKey   string
+	scheduleID string
+	gate       types.BatchExitGate
+	counts     types.PipelineCounts
 }
 
 type fakeStore struct {
-	mu          sync.Mutex
-	unpushed    []types.ContentItem
+	mu                 sync.Mutex
+	gotBatchScheduleID string // Push 建批次时收到的 schedule_id（P1b 穿参断言）
+	unpushed           []types.ContentItem
+
 	nextDelID   int64
 	sentAlready bool // true = 模拟重试时该 (batch, content) 已发过
 	inserted    []types.Delivery
@@ -150,11 +153,11 @@ func (s *fakeStore) DisableSourceIfActive(_ context.Context, id int64) (bool, er
 	return s.disableResult, s.disableErr
 }
 
-func (s *fakeStore) RecordEmptyPushBatch(_ context.Context, userID int64, idempKey string,
+func (s *fakeStore) RecordEmptyPushBatch(_ context.Context, userID int64, idempKey, scheduleID string,
 	gate types.BatchExitGate, counts types.PipelineCounts) (int64, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.emptyCalls = append(s.emptyCalls, emptyBatchCall{userID, idempKey, gate, counts})
+	s.emptyCalls = append(s.emptyCalls, emptyBatchCall{userID, idempKey, scheduleID, gate, counts})
 	if s.emptyErr != nil {
 		return 0, false, s.emptyErr
 	}
@@ -195,7 +198,10 @@ func (s *fakeStore) ListUnpushedByUser(context.Context, int64, int, int) ([]type
 	return s.unpushed, nil
 }
 
-func (s *fakeStore) CreatePushBatchIdempotent(context.Context, int64, string) (int64, error) {
+func (s *fakeStore) CreatePushBatchIdempotent(_ context.Context, _ int64, _, scheduleID string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gotBatchScheduleID = scheduleID // 供断言 PushIn.ScheduleID 穿到建批次（P1b）
 	return 7, nil
 }
 
@@ -440,6 +446,29 @@ func TestPush_AggregateCardBuiltAndPersisted(t *testing.T) {
 		if m.msgID != "om_agg" || m.cardJSON != `{"agg":true}` {
 			t.Errorf("投递应共享同一 msgID 与卡 JSON，实得 %+v", m)
 		}
+	}
+}
+
+// TestPush_ThreadsScheduleID 守 P1b b1：PushIn.ScheduleID 一路穿到建批次
+// （push_batches.schedule_id 的写入锚点）；空串（即时/老任务触发）也如实透传。
+func TestPush_ThreadsScheduleID(t *testing.T) {
+	run := func(schedID string) string {
+		st := &fakeStore{nextDelID: 41}
+		a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{msgID: "om_1"}, st, fakeFeishu{}, nil, nil,
+			func(feedback.AggregateCardInput) string { return "{}" }, nil)
+		in := PushIn{UserID: 1, ScheduleID: schedID, TraceID: "tr-" + schedID + "-x", Cards: []GeneratedCard{{
+			Scored: types.ScoredItem{Item: types.ContentItem{ID: 11}, Score: 80}, BodyMD: "x",
+		}}}
+		if err := a.Push(context.Background(), in); err != nil {
+			t.Fatalf("Push 意外报错: %v", err)
+		}
+		return st.gotBatchScheduleID
+	}
+	if got := run("push-7-abc"); got != "push-7-abc" {
+		t.Errorf("定时触发应把 schedule_id 穿到建批次，实得 %q", got)
+	}
+	if got := run(""); got != "" {
+		t.Errorf("即时触发应透传空 schedule_id（用户级语义），实得 %q", got)
 	}
 }
 

@@ -75,7 +75,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	recordEmpty := func(gate types.BatchExitGate) {
 		// 用 quick 档：纯一条 INSERT，且它无论如何都不该拖长一次"其实没事干"的运行。
 		recCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
-		in := RecordEmptyIn{UserID: p.UserID, TraceID: traceID, Gate: gate, Counts: counts}
+		in := RecordEmptyIn{UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID, Gate: gate, Counts: counts}
 		if err := workflow.ExecuteActivity(recCtx, a.RecordEmptyBatch, in).Get(recCtx, nil); err != nil {
 			log.Warn("空批次记账失败，本次仍按正常终态结束",
 				"user_id", p.UserID, "trace_id", traceID, "gate", gate, "err", err)
@@ -185,7 +185,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 
 	// 6. Push —— 网络 I/O，主动推送飞书卡片。
 	pushCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
-	if err := workflow.ExecuteActivity(pushCtx, a.Push, PushIn{UserID: p.UserID, TraceID: traceID, Cards: cards, TaskTitle: p.NLDesc}).Get(pushCtx, nil); err != nil {
+	if err := workflow.ExecuteActivity(pushCtx, a.Push, PushIn{UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID, Cards: cards, TaskTitle: p.NLDesc}).Get(pushCtx, nil); err != nil {
 		return err
 	}
 

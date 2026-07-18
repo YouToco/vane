@@ -129,7 +129,7 @@ type Store interface {
 	ListUnpushedByUser(ctx context.Context, userID int64, limit, perSourceCap int) ([]types.ContentItem, error)
 	// 幂等推送地基（FIX-A 新增实现）：重试时复用同一 batch、跳过已发条目，杜绝重复发卡（#1 CRITICAL）。
 	// 取代原 CreatePushBatch / InsertDelivery（store 仍保留其实现，只是 Activity 不再用）。
-	CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey string) (int64, error)
+	CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey, scheduleID string) (int64, error)
 	// RecordEmptyPushBatch 记录"跑完了但没东西可推"的空批次（009）。与上面那条幂等
 	// 地基共用 idempotency_key，但**写入路径完全独立**——空批次与真实推送在同一次
 	// 运行里互斥，刻意不去动 CreatePushBatchIdempotent 的签名（改它就得改这个窄接口
@@ -137,7 +137,7 @@ type Store interface {
 	//
 	// skipped=true 表示 store 侧防覆写护栏拦下了本次写入（该 traceID 已有真实批次），
 	// 此时 id=0、err=nil——**不是错误，但必须出声**（见 RecordEmptyBatch 的处理）。
-	RecordEmptyPushBatch(ctx context.Context, userID int64, idempKey string,
+	RecordEmptyPushBatch(ctx context.Context, userID int64, idempKey, scheduleID string,
 		gate types.BatchExitGate, counts types.PipelineCounts) (id int64, skipped bool, err error)
 	InsertDeliveryIdempotent(ctx context.Context, d *types.Delivery) (id int64, existed bool, sentAlready bool, err error)
 	UpdatePushBatchStatus(ctx context.Context, batchID int64, status types.BatchStatus) error
@@ -228,9 +228,10 @@ type CardGenIn struct {
 
 // PushIn 是 Push Activity 的入参。
 type PushIn struct {
-	UserID  int64           `json:"user_id"`
-	TraceID string          `json:"trace_id"`
-	Cards   []GeneratedCard `json:"cards"`
+	UserID     int64           `json:"user_id"`
+	ScheduleID string          `json:"schedule_id,omitempty"` // 触发本批的任务 id（P1b），空=即时/老任务
+	TraceID    string          `json:"trace_id"`
+	Cards      []GeneratedCard `json:"cards"`
 	// TaskTitle 任务名（调度的 nl_description），聚合卡 header 用。
 	// 空串合法（存量调度/即时推送无任务名），构卡落兜底标题。
 	TaskTitle string `json:"task_title,omitempty"`
@@ -238,8 +239,9 @@ type PushIn struct {
 
 // RecordEmptyIn 是 RecordEmptyBatch Activity 的入参（009 / 契约 §16「空批次缺口」）。
 type RecordEmptyIn struct {
-	UserID  int64  `json:"user_id"`
-	TraceID string `json:"trace_id"` // = 幂等键，与 Push 建批次用的是同一个
+	UserID     int64  `json:"user_id"`
+	ScheduleID string `json:"schedule_id,omitempty"` // 触发本批的任务 id（P1b），空=即时/老任务
+	TraceID    string `json:"trace_id"`              // = 幂等键，与 Push 建批次用的是同一个
 	// Gate 从哪个闸门退出。恒非空——五个调用点各自传死值（workflow.go）。
 	Gate types.BatchExitGate `json:"gate"`
 	// Counts 截至退出时刻的漏斗快照；未跑到的阶段字段为 nil（见 types.PipelineCounts）。
@@ -598,7 +600,7 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 // 让它立刻失败并在 Warn 里露出来）。
 func (a *Activities) RecordEmptyBatch(ctx context.Context, in RecordEmptyIn) error {
 	// 返回的 batch_id 刻意丢弃：空批次底下没有 deliveries，没有任何后续写入需要它。
-	_, skipped, err := a.store.RecordEmptyPushBatch(ctx, in.UserID, in.TraceID, in.Gate, in.Counts)
+	_, skipped, err := a.store.RecordEmptyPushBatch(ctx, in.UserID, in.TraceID, in.ScheduleID, in.Gate, in.Counts)
 	if err != nil {
 		return retryableOrNot(err)
 	}
@@ -627,7 +629,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	}
 
 	// 用确定性 traceID 作幂等键：Temporal 重试 Push 时复用同一 batch，不再每次新建批次（修 #1 CRITICAL 地基）。
-	batchID, err := a.store.CreatePushBatchIdempotent(ctx, in.UserID, in.TraceID)
+	batchID, err := a.store.CreatePushBatchIdempotent(ctx, in.UserID, in.TraceID, in.ScheduleID)
 	if err != nil {
 		return err
 	}

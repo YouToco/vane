@@ -129,7 +129,9 @@ func (s *Scheduler) CreatePush(ctx context.Context, userID int64, spec ScheduleS
 	}
 
 	schedID := fmt.Sprintf("push-%d-%s", userID, uuid.NewString())
-	params := workflow.PushParams{UserID: userID, Scope: scope, NLDesc: strings.TrimSpace(nlDesc)}
+	// ScheduleID=schedID：定时触发带上归属任务 id，供 Fetch/候选按本任务的源隔离（P1b）。
+	// NLDesc：调度的自然语言描述，聚合卡 header 的任务名（#75）。
+	params := workflow.PushParams{UserID: userID, ScheduleID: schedID, Scope: scope, NLDesc: strings.TrimSpace(nlDesc)}
 
 	_, err = s.c.ScheduleClient().Create(ctx, client.ScheduleOptions{
 		ID:   schedID,

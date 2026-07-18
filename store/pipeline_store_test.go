@@ -589,11 +589,11 @@ func TestPipelineStore(t *testing.T) {
 		// 004 幂等地基核心行为一：同一 idempKey（= workflow traceID）两次调用返回同一 batch_id，
 		// 使 Temporal 重试 Push Activity 时复用同一批次而非重复建批。
 		idempKey := "trace-" + uuid.NewString()
-		batchID1, err := st.CreatePushBatchIdempotent(ctx, u.ID, idempKey)
+		batchID1, err := st.CreatePushBatchIdempotent(ctx, u.ID, idempKey, "")
 		if err != nil {
 			t.Fatalf("CreatePushBatchIdempotent() 首次失败: %v", err)
 		}
-		batchID2, err := st.CreatePushBatchIdempotent(ctx, u.ID, idempKey)
+		batchID2, err := st.CreatePushBatchIdempotent(ctx, u.ID, idempKey, "")
 		if err != nil {
 			t.Fatalf("CreatePushBatchIdempotent() 二次失败: %v", err)
 		}
