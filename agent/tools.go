@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/YouToco/vane/scheduler"
+	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -118,6 +119,8 @@ type addSourceArgs struct {
 	Query      string   `json:"query"`
 	Keyword    string   `json:"keyword"`
 	ScreenName string   `json:"screen_name"`
+	UserID     string   `json:"user_id"`     // xhs/user_posts：小红书用户 ID
+	ProfileURL string   `json:"profile_url"` // xhs/user_posts：小红书用户主页链接（可替代 user_id）
 	Title      string   `json:"title"`
 	Category   string   `json:"category"`
 	Categories []string `json:"categories"`
@@ -138,7 +141,7 @@ const addSourceSchema = `{
     "capability": {
       "type": "string",
       "enum": ["feed", "search", "user_posts", "page_watch"],
-      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索；user_posts=用户时间线（仅 x）；page_watch=页面变化监控（仅 web）"
+      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主）；page_watch=页面变化监控（仅 web）。当前不支持的能力及原因见本工具说明（Description）。"
     },
     "type": {
       "type": "string",
@@ -147,8 +150,10 @@ const addSourceSchema = `{
     },
     "url": {"type": "string", "description": "RSS 源地址或监控页面地址（http/https），platform=web capability=feed/page_watch 时必填"},
     "query": {"type": "string", "description": "Exa 搜索词，platform=web capability=search 时必填"},
-    "keyword": {"type": "string", "description": "小红书搜索关键词，platform=xhs 时必填"},
+    "keyword": {"type": "string", "description": "小红书搜索关键词，platform=xhs capability=search 时必填"},
     "screen_name": {"type": "string", "description": "X 用户名（如 OpenAI），platform=x capability=user_posts 时必填"},
+    "user_id": {"type": "string", "description": "小红书用户 ID（24 位十六进制），platform=xhs capability=user_posts 时必填（或改用 profile_url）"},
+    "profile_url": {"type": "string", "description": "小红书用户主页链接（如 https://www.xiaohongshu.com/user/profile/<id>），platform=xhs capability=user_posts 时可替代 user_id"},
     "title": {"type": "string", "description": "可选：展示名，缺省按类型自动生成"},
     "category": {"type": "string", "description": "可选：Exa 结果类别（如 news），仅 web/search 生效"},
     "categories": {"type": "array", "items": {"type": "string"}, "description": "可选：RSS 分类过滤（如 [\"Product\",\"Research\"]），仅 web/feed 生效；不传=不限"}
@@ -161,7 +166,29 @@ type addSourceTool struct {
 
 func (t *addSourceTool) Name() string { return "add_source" }
 func (t *addSourceTool) Description() string {
-	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts/page_watch），或传旧版 type 字段兼容。"
+	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts/page_watch），或传旧版 type 字段兼容。" +
+		unavailableCapabilitiesNote()
+}
+
+// unavailableCapabilitiesNote 从 sourcecatalog 派生「当前不支持的能力及原因」附到工具说明里。
+//
+// 存在的理由（契约 §2.2 + 本次审计缺陷）：让模型能主动回答"X 关键词搜索为何不支持"，
+// 而不是静默改用别的能力。关键是**原因取自注册表单一事实来源**（sourcecatalog.List），
+// 不再是手抄进 schema 的副本——审计发现旧写法把 x/search 的 Reason 硬编码复制到 schema
+// 里，注册表一改这里就漂移。改成派生后，注册表与 agent 工具面自动同步，
+// 「注册表被三处共用」这句话（fetcher 分发 / sourcespec 构造 / agent 描述）才真正成立。
+func unavailableCapabilitiesNote() string {
+	var lines []string
+	for _, e := range sourcecatalog.List() {
+		if e.Available() {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s/%s：%s", e.Platform, e.Capability, e.Reason))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "\n\n当前不支持的能力（请勿尝试添加，会被拒绝）：\n- " + strings.Join(lines, "\n- ")
 }
 func (t *addSourceTool) Parameters() json.RawMessage { return json.RawMessage(addSourceSchema) }
 func (t *addSourceTool) Mutating() bool              { return true }
@@ -189,6 +216,12 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 		}
 		if a.ScreenName != "" {
 			params["screen_name"] = a.ScreenName
+		}
+		if a.UserID != "" {
+			params["user_id"] = a.UserID
+		}
+		if a.ProfileURL != "" {
+			params["profile_url"] = a.ProfileURL
 		}
 		if len(a.Categories) > 0 {
 			catJSON, _ := json.Marshal(a.Categories)
@@ -251,6 +284,12 @@ func (t *addSourceTool) Summarize(args json.RawMessage) string {
 		}
 	case "xhs/search":
 		fmt.Fprintf(&b, "添加小红书关键词信源：「%s」", strings.TrimSpace(a.Keyword))
+	case "xhs/user_posts":
+		who := strings.TrimSpace(a.UserID)
+		if who == "" {
+			who = strings.TrimSpace(a.ProfileURL)
+		}
+		fmt.Fprintf(&b, "添加小红书博主信源：%s", who)
 	case "x/user_posts":
 		fmt.Fprintf(&b, "添加 X 用户时间线信源：@%s", strings.TrimSpace(a.ScreenName))
 	case "web/page_watch":

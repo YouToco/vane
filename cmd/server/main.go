@@ -183,6 +183,7 @@ func run() error {
 		Manager:   manager,
 		Scheduler: sched,
 		Password:  cfg.Dashboard.Password,
+		Origin:    cfg.Dashboard.Origin,
 	})
 
 	// A2A server（a2a-contract §7）：enabled=false 时不 Mount——/a2a 与

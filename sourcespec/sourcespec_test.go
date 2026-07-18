@@ -50,7 +50,9 @@ func TestBuild_WebFeedWithCategories(t *testing.T) {
 	if src.URL != "https://openai.com/news/rss.xml" {
 		t.Errorf("URL 应为原始地址（categories 不入键）: %q", src.URL)
 	}
-	var cfg struct{ Categories []string `json:"categories"` }
+	var cfg struct {
+		Categories []string `json:"categories"`
+	}
 	if err := json.Unmarshal(src.Config, &cfg); err != nil {
 		t.Fatalf("config 应包含 categories: %v", err)
 	}
@@ -152,6 +154,56 @@ func TestBuild_XUserPosts(t *testing.T) {
 	}
 	if _, msg := Build(Spec{Platform: "x", Capability: "user_posts", Params: map[string]string{}}); msg == "" {
 		t.Error("缺 screen_name 应被拒绝")
+	}
+}
+
+func TestBuild_XHSUserPosts(t *testing.T) {
+	const uid = "6a5578b3000000000e03cc00"
+	src, msg := Build(Spec{Platform: "xhs", Capability: "user_posts", Params: map[string]string{"user_id": uid}})
+	if msg != "" {
+		t.Fatalf("意外报错: %s", msg)
+	}
+	if src.Platform != types.PlatformXHS || src.Capability != types.CapUserPosts {
+		t.Errorf("应为 xhs/user_posts，实际 %s/%s", src.Platform, src.Capability)
+	}
+	if src.URL != "vane://xhs/user_posts?user_id="+uid {
+		t.Errorf("合成 URL 不符: %q", src.URL)
+	}
+	if src.Title != "小红书用户: "+uid {
+		t.Errorf("默认 Title 不符: %q", src.Title)
+	}
+	// config 里应存归一化后的 user_id。
+	if !strings.Contains(string(src.Config), uid) {
+		t.Errorf("config 未含 user_id: %s", src.Config)
+	}
+
+	// profile_url 应能抽出同一个 user_id，且幂等键与直填 user_id 完全相同
+	// （契约 §5.2：同一博主无论怎么加，键必须相同）。
+	src2, msg := Build(Spec{Platform: "xhs", Capability: "user_posts", Params: map[string]string{
+		"profile_url": "https://www.xiaohongshu.com/user/profile/" + uid + "?xsec_token=abc",
+	}})
+	if msg != "" {
+		t.Fatalf("profile_url 意外报错: %s", msg)
+	}
+	if src2.URL != src.URL {
+		t.Errorf("profile_url 与 user_id 应产出同一幂等键，实际 %q vs %q", src2.URL, src.URL)
+	}
+
+	// 两者皆缺 → 拒绝。
+	if _, msg := Build(Spec{Platform: "xhs", Capability: "user_posts", Params: map[string]string{}}); msg == "" {
+		t.Error("缺 user_id / profile_url 应被拒绝")
+	}
+}
+
+// TestBuild_XSearchUnavailable：x/search 在 sourcecatalog 里标记 Unavailable，
+// Build 应直接回其 Reason 而非构造坏源，且 Reason 里应指路到 user_posts。
+func TestBuild_XSearchUnavailable(t *testing.T) {
+	_, msg := Build(Spec{Platform: "x", Capability: "search", Params: map[string]string{"query": "AI"}})
+	if msg == "" {
+		t.Fatal("x/search 应被拒绝（Unavailable）")
+	}
+	if !strings.Contains(msg, "user_posts") {
+		t.Errorf("拒绝理由应指路 user_posts，实际: %s", msg)
 	}
 }
 

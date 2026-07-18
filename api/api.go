@@ -46,6 +46,10 @@ type Deps struct {
 	// Password 是 Dashboard 登录密码（VANE_DASHBOARD_PASSWORD）；
 	// 为空时登录一律 401——见 handleLogin。
 	Password string
+	// Origin 是唯一放行 CORS 的前端源（VANE_DASHBOARD_ORIGIN，默认生产 Dashboard 域）。
+	// 前端迁 OSS+CDN 后与 API 跨源（vane.* → api.*），凭证请求要求逐字匹配的
+	// Allow-Origin + Allow-Credentials，不允许通配符。为空 = 不放行任何跨源。
+	Origin string
 }
 
 type server struct {
@@ -89,7 +93,39 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	// M7 画像查看端点（功能 6.3）：只读，展示结构化标签 + 摘要画像（含负偏好尾句）；编辑写回留二期。
 	inner.HandleFunc("GET /api/profile", s.handleProfile)
 
-	mux.Handle("/api/", s.requireSession(inner))
+	mux.Handle("/api/", s.cors(s.requireSession(inner)))
+}
+
+// cors 处理 Dashboard 前端的跨源请求（前端在 vane.*、API 在 api.*，同站不同源）。
+//
+// 套在 requireSession 外层是必须的：预检 OPTIONS 是浏览器自动发起的，不带 cookie，
+// 落进会话中间件会 401，浏览器随即判定跨源失败——真请求根本发不出来。
+//
+// 只放行 deps.Origin 一个源：带凭证（cookie）的 CORS 规范禁止 Allow-Origin 通配符，
+// 且回显任意 Origin 等于把带 cookie 的 API 开放给全网页面。非放行源不加任何 CORS 头，
+// 浏览器侧按同源策略拒绝（curl / A2A 等非浏览器客户端不受影响，语义不变）。
+//
+// 会话 cookie 是 SameSite=Lax（auth.go）：vane.* 与 api.* 同注册域即同站，
+// Lax 不拦同站请求，故跨源 fetch(credentials:"include") 能带上 cookie，无需放宽 cookie 属性。
+func (s *server) cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if s.deps.Origin != "" && origin == s.deps.Origin {
+			h := w.Header()
+			h.Set("Access-Control-Allow-Origin", origin)
+			h.Set("Access-Control-Allow-Credentials", "true")
+			// 缓存（CDN/浏览器）必须按 Origin 区分响应，否则放行头可能被错误复用。
+			h.Add("Vary", "Origin")
+			if r.Method == http.MethodOptions {
+				h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE")
+				h.Set("Access-Control-Allow-Headers", "Content-Type")
+				h.Set("Access-Control-Max-Age", "600")
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // requireSession 是 /api/* 的会话中间件。login 必须豁免，否则永远无法登录。
