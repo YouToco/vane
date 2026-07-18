@@ -232,12 +232,19 @@ func (s *Store) DisableSourceIfActive(ctx context.Context, id int64) (disabled b
 // 单语句原子完成，杜绝启用未订阅的源）。清零 fail_count 是关键：否则启用后一次失败
 // 就又跨过停用阈值被立刻停掉，用户的"重新启用"形同虚设。
 // 返回 enabled=true 表示确实启用了一行（存在且是本人订阅）；false=找不到或未订阅。
+// 归属放宽（P1b b3）：既接受"用户 active 订阅了该源"，也接受"用户的某个定时任务经
+// schedule_sources 绑定了该源"。理由：b3 让任务手册的 plan 源真正被抓取，它们会命中 M-1
+// 自动停用，但 plan 源可能只经 schedule_sources 绑定、**无订阅**（任务私有）。若只认订阅，
+// 停用卡让 owner「重新启用」却恒 no-op、源永久失活——这条 OR 分支让 plan 源也能被其属主重启用。
 func (s *Store) EnableSource(ctx context.Context, userID, sourceID int64) (enabled bool, err error) {
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE sources SET status = $2, fail_count = 0, next_fetch_at = now(), updated_at = now()
 		 WHERE id = $1
-		   AND EXISTS (SELECT 1 FROM subscriptions
-		               WHERE source_id = $1 AND user_id = $3 AND status = $4)`,
+		   AND (EXISTS (SELECT 1 FROM subscriptions
+		                WHERE source_id = $1 AND user_id = $3 AND status = $4)
+		        OR EXISTS (SELECT 1 FROM schedule_sources ss
+		                   JOIN schedules sc ON sc.id = ss.schedule_id
+		                   WHERE ss.source_id = $1 AND sc.user_id = $3))`,
 		sourceID, types.SourceStatusActive, userID, types.SubscriptionStatusActive)
 	if err != nil {
 		return false, types.NewAppError(types.CodeDatabase,

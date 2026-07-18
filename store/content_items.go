@@ -286,6 +286,68 @@ func (s *Store) ListUnpushedByUser(ctx context.Context, userID int64, limit, per
 	return out, nil
 }
 
+// ListUnpushedBySchedule 是 ListUnpushedByUser 的**按任务隔离**版本（P1b b3）：候选只在
+// 本任务的软范围源（schedule_sources）见过的内容里挑，且只排除**本任务自己**投过的
+// （deliveries → push_batches.schedule_id 那条按任务的投递账本），而非用户全局。这就是决策 #3
+// 「情报任务自包含、互不干扰」的落地——任务 A 的推送再也不会挑到/吃掉任务 B 的内容。
+//
+// 与用户级版的两处差异：
+//   - EXISTS 从 `content_sources JOIN subscriptions（用户订阅）` 换成
+//     `content_sources JOIN schedule_sources（本任务的源）`；
+//   - NOT EXISTS 从 `deliveries WHERE user_id` 换成 `deliveries JOIN push_batches WHERE schedule_id`
+//     （每个任务一本独立投递账本；b1 已把 schedule_id 写进 push_batches）。
+//
+// perSourceCap 仍按 source_id 分区（同用户级版，防高产源饿死低产源）。纯 scheduleID 锚定范围，
+// scheduleID 由 PushParams 经 scheduler 可信下传，无注入面。
+func (s *Store) ListUnpushedBySchedule(ctx context.Context, scheduleID string, limit, perSourceCap int) ([]types.ContentItem, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, source_id, external_id, canonical_key, url, title, content, author,
+		        published_at, content_hash, simhash, fetched_at, created_at, kind
+		 FROM (
+		     SELECT ci.id, ci.source_id, ci.external_id, ci.canonical_key, ci.url, ci.title,
+		            ci.content, ci.author, ci.published_at, ci.content_hash, ci.simhash,
+		            ci.fetched_at, ci.created_at, ci.kind,
+		            ROW_NUMBER() OVER (PARTITION BY ci.source_id ORDER BY ci.fetched_at DESC, ci.id DESC) AS rn
+		     FROM content_items ci
+		     WHERE EXISTS (
+		         SELECT 1 FROM content_sources cs
+		         JOIN schedule_sources ss ON ss.source_id = cs.source_id
+		         WHERE cs.content_item_id = ci.id AND ss.schedule_id = $1
+		     )
+		       AND NOT EXISTS (
+		           SELECT 1 FROM deliveries d
+		           JOIN push_batches b ON b.id = d.batch_id
+		           WHERE b.schedule_id = $1 AND d.content_item_id = ci.id
+		       )
+		 ) t
+		 WHERE t.rn <= $3
+		 ORDER BY fetched_at DESC
+		 LIMIT $2`,
+		scheduleID, limit, perSourceCap)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询任务 %s 未投递内容", scheduleID), err)
+	}
+	defer rows.Close()
+
+	var out []types.ContentItem
+	for rows.Next() {
+		var ci types.ContentItem
+		if err := rows.Scan(
+			&ci.ID, &ci.SourceID, &ci.ExternalID, &ci.CanonicalKey, &ci.URL, &ci.Title, &ci.Content,
+			&ci.Author, &ci.PublishedAt, &ci.ContentHash, &ci.Simhash, &ci.FetchedAt, &ci.CreatedAt,
+			&ci.Kind,
+		); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "扫描 content_item 行", err)
+		}
+		out = append(out, ci)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "遍历 content_item 结果集", err)
+	}
+	return out, nil
+}
+
 // SearchContentItems 按关键词 + 时间窗检索内容，content.query 的唯一数据面
 // （a2a-contract §4.2）。语义：
 //

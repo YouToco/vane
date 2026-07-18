@@ -127,6 +127,11 @@ type Store interface {
 	// 幂等）；disabled=true 表示本次真的翻转，用于只发一次停用告警（功能 5.2）。
 	DisableSourceIfActive(ctx context.Context, id int64) (disabled bool, err error)
 	ListUnpushedByUser(ctx context.Context, userID int64, limit, perSourceCap int) ([]types.ContentItem, error)
+	// 任务手册 P1b b3 —— 按本任务的软范围源隔离抓取与候选（决策 #3「情报任务自包含」）。
+	// ScheduleHasSources 是分流开关：有链接才走隔离路径，否则退回用户级（决策 #4 老任务不变）。
+	ScheduleHasSources(ctx context.Context, scheduleID string) (bool, error)
+	ListDueSourcesBySchedule(ctx context.Context, scheduleID string) ([]types.Source, error)
+	ListUnpushedBySchedule(ctx context.Context, scheduleID string, limit, perSourceCap int) ([]types.ContentItem, error)
 	// 幂等推送地基（FIX-A 新增实现）：重试时复用同一 batch、跳过已发条目，杜绝重复发卡（#1 CRITICAL）。
 	// 取代原 CreatePushBatch / InsertDelivery（store 仍保留其实现，只是 Activity 不再用）。
 	CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey, scheduleID string) (int64, error)
@@ -274,9 +279,38 @@ func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error {
 //   - #7 抓取状态死代码：每源抓取后调 markFetchResult 真正推进 fail_count / 时间戳。
 //   - #6 成本护栏：返回时用 maxScoreCandidates 截断候选，避免积压内容一次性打爆 LLM。
 func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentItem, error) {
+	// 任务手册 P1b b3 的分流开关：本次触发绑定的定时任务若已编译出源（schedule_sources 非空），
+	// 则「只按本任务的源抓/挑」（决策 #3 自包含）；否则退回用户级（决策 #4 老任务不变，push_now
+	// 的 ScheduleID 为空也走这里）。生产里没建过带源手册的任务时 planScoped 恒 false，b3 休眠。
+	//
+	// 用"有无 schedule_sources 链接"当开关（而非"有无 playbook"）是刻意的：所有 create_schedule
+	// 任务都带 P0 空 playbook，若以 playbook 分流，存量任务会全部转隔离、其空计划→抓 0 源→生产
+	// 推送全断。故只有真编译出源的任务才隔离。副作用（已知、可接受）：一个原本有源的 plan 任务
+	// 若手册被改成零源（schedule_sources 被清空），会退回用户级抓全部订阅，而非"什么都不抓"——
+	// 这是安全默认（不因清空手册而静默停推），代价是"清空手册的取材范围"语义偏softly。
+	//
+	// b3 只隔离**抓取 + 候选选材**两层；**去重（Dedup）仍是用户级**（ListRecentSimhashesByUser
+	// 按用户全部订阅源的 72h simhash 历史）——plan 内容会与用户订阅内容跨任务近似去重。这是本轮
+	// 刻意留的 scope 边界（完整"自包含"需按 schedule 隔离 simhash 历史，留后续）；打分/出卡的
+	// 按任务注入是 P1c。
+	planScoped := false
+	if p.ScheduleID != "" {
+		has, herr := a.store.ScheduleHasSources(ctx, p.ScheduleID)
+		if herr != nil {
+			return nil, herr
+		}
+		planScoped = has
+	}
+
 	// 只抓到期源（next_fetch_at <= now()）：重试不重复计费，详见接口注释。
-	// 未到期源被跳过不影响推送——其已入库内容仍由下方 ListUnpushedByUser 捞出。
-	sources, err := a.store.ListDueSourcesByUser(ctx, p.UserID)
+	// 未到期源被跳过不影响推送——其已入库内容仍由下方候选查询捞出。
+	var sources []types.Source
+	var err error
+	if planScoped {
+		sources, err = a.store.ListDueSourcesBySchedule(ctx, p.ScheduleID) // 只抓本任务的源
+	} else {
+		sources, err = a.store.ListDueSourcesByUser(ctx, p.UserID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -331,6 +365,10 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 
 	// 返回"未投递候选"而非"本次新入库"，让 Fetch 重试幂等可续（修 #3）；
 	// 全局上限 + 每源配额双重截断，控制单批打分规模且防高产源饿死低产源（修 #6）。
+	// planScoped：只在本任务的源见过、且本任务未投过的内容里挑（决策 #3 互不干扰，P1b b3）。
+	if planScoped {
+		return a.store.ListUnpushedBySchedule(ctx, p.ScheduleID, maxScoreCandidates, maxPerSourceCandidates)
+	}
 	return a.store.ListUnpushedByUser(ctx, p.UserID, maxScoreCandidates, maxPerSourceCandidates)
 }
 
