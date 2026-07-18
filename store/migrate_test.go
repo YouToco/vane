@@ -37,6 +37,10 @@ var wantTables = []string{
 	"content_sources",
 	// 013 A2A server 任务持久化
 	"a2a_tasks",
+	// 018 租户地基（企业级契约 §1.2）
+	"tenants",
+	"memberships",
+	"invites",
 	// 015 agent 工具调用记账（TikHub 端点注册表契约 §6）
 	"tool_calls",
 	// 017 情报任务手册（Task Playbook P0）
