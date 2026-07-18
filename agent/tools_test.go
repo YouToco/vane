@@ -31,12 +31,12 @@ func (f *fakePushTrigger) TriggerPushNow(_ context.Context, _ int64) (string, er
 // 自纠而不是上抛——该分支在 TriggerPushNow 加 WorkflowExecutionErrorWhenAlreadyStarted
 // 之前是死代码，专门补消费端覆盖，防契约在 scheduler 与 tools 两端各自漂移。
 func TestPushNowTool_Execute(t *testing.T) {
-	t.Run("成功触发返回runID文案", func(t *testing.T) {
+	t.Run("成功触发返回用户友好文案", func(t *testing.T) {
 		ft := &fakePushTrigger{runID: "push-agent-7"}
 		tool := &pushNowTool{pusher: ft}
 		got, err := tool.Execute(context.Background(), 7, json.RawMessage("{}"))
-		if err != nil || !strings.Contains(got, "push-agent-7") || !strings.Contains(got, "已触发") {
-			t.Fatalf("成功触发应返回含 runID 的文案, 实得 got=%q err=%v", got, err)
+		if err != nil || !strings.Contains(got, "已触发") || strings.Contains(got, "push-agent") {
+			t.Fatalf("成功触发应返回用户友好文案且不暴露 run_id, 实得 got=%q err=%v", got, err)
 		}
 		if ft.calls != 1 {
 			t.Fatalf("应恰好触发 1 次, 实得 %d", ft.calls)

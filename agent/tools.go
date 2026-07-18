@@ -811,7 +811,7 @@ func (t *pushNowTool) Parameters() json.RawMessage { return json.RawMessage(empt
 func (t *pushNowTool) Mutating() bool              { return false }
 
 func (t *pushNowTool) Execute(ctx context.Context, userID int64, _ json.RawMessage) (string, error) {
-	runID, err := t.pusher.TriggerPushNow(ctx, userID)
+	_, err := t.pusher.TriggerPushNow(ctx, userID)
 	if err != nil {
 		// 确定性拒绝（并发护栏"已有推送在进行"）走自纠通道：文案回给模型，
 		// 由它向用户解释而不是重复触发；基础设施错误仍上抛。
@@ -826,7 +826,7 @@ func (t *pushNowTool) Execute(ctx context.Context, userID int64, _ json.RawMessa
 		}
 		return "", err
 	}
-	return fmt.Sprintf("已触发一次立即推送（run_id=%s），推送卡片稍后送达飞书。", runID), nil
+	return "已触发一次立即推送，系统正在汇总你所有订阅信源的最新内容，推送卡片稍后会送达飞书，请留意。", nil
 }
 
 func (t *pushNowTool) Summarize(json.RawMessage) string { return "" }
