@@ -18,7 +18,10 @@ import (
 type scheduleSpecDTO struct {
 	Cron         string `json:"cron"`
 	EverySeconds int    `json:"every_seconds"`
-	TZ           string `json:"tz"`
+	// AnchorAt 只对 every_seconds 有效：把固定间隔的相位对齐到该绝对时刻，
+	// 触发点变成 anchor、anchor+every…。空则相位为 0（Unix epoch 对齐）。
+	AnchorAt string `json:"anchor_at"`
+	TZ       string `json:"tz"`
 }
 
 // createScheduleReq 是 POST /api/schedules 的请求体。
@@ -48,6 +51,7 @@ func (d scheduleSpecDTO) toScheduleSpec() (scheduler.ScheduleSpec, error) {
 	return scheduler.ScheduleSpec{
 		Cron:         d.Cron,
 		EverySeconds: d.EverySeconds,
+		AnchorAt:     d.AnchorAt,
 		TZ:           d.TZ,
 	}, nil
 }

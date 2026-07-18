@@ -471,7 +471,12 @@ func formatScheduleSpec(spec scheduler.ScheduleSpec) string {
 		tz = "Asia/Shanghai"
 	}
 	if spec.EverySeconds > 0 {
-		return fmt.Sprintf("每 %d 秒触发一次（时区 %s）", spec.EverySeconds, tz)
+		// 有锚点时必须说出来：同样是"每 259200 秒"，有没有锚点决定了它落在
+		// epoch 对齐点还是用户指定的时刻，卡面不提等于让用户无从判断对不对。
+		if anchor := strings.TrimSpace(spec.AnchorAt); anchor != "" {
+			return fmt.Sprintf("从 %s 起每 %d 秒触发一次（时区 %s）", anchor, spec.EverySeconds, tz)
+		}
+		return fmt.Sprintf("每 %d 秒触发一次（时区 %s，按 epoch 对齐）", spec.EverySeconds, tz)
 	}
 	return fmt.Sprintf("按 cron「%s」触发（时区 %s）", spec.Cron, tz)
 }
@@ -493,6 +498,7 @@ const createScheduleSchema = `{
       "properties": {
         "cron": {"type": "string", "description": "5 段 cron（分 时 日 月 周），分钟字段必须是 0-59 的整数，如 \"0 8 * * *\""},
         "every_seconds": {"type": "integer", "description": "固定间隔秒数，不低于 3600（1 小时）"},
+        "anchor_at": {"type": "string", "description": "可选：RFC3339 绝对时刻（如 \"2026-07-19T20:00:00+08:00\"），只能与 every_seconds 搭配。给了它触发点就从该时刻起按间隔推进（每 3 天的晚上 8 点 = every_seconds:259200 + 该时刻）；不给则按 Unix epoch 对齐（21600 会落在 00/06/12/18 点整，通常不是用户想要的）"},
         "tz": {"type": "string", "description": "可选：IANA 时区名，缺省 Asia/Shanghai"}
       }
     },
@@ -506,6 +512,7 @@ type createScheduleArgs struct {
 	Spec struct {
 		Cron         string `json:"cron"`
 		EverySeconds int    `json:"every_seconds"`
+		AnchorAt     string `json:"anchor_at"`
 		TZ           string `json:"tz"`
 	} `json:"spec"`
 	NLDescription string `json:"nl_description"`
@@ -538,6 +545,7 @@ func (t *createScheduleTool) Execute(ctx context.Context, userID int64, args jso
 	spec := scheduler.ScheduleSpec{
 		Cron:         a.Spec.Cron,
 		EverySeconds: a.Spec.EverySeconds,
+		AnchorAt:     a.Spec.AnchorAt,
 		TZ:           a.Spec.TZ,
 	}
 	schedID, err := t.sched.CreatePush(ctx, userID, spec, workflow.PushScope{}, a.NLDescription)
@@ -571,6 +579,7 @@ func (t *createScheduleTool) Summarize(args json.RawMessage) string {
 	s := "创建定时推送任务：" + formatScheduleSpec(scheduler.ScheduleSpec{
 		Cron:         a.Spec.Cron,
 		EverySeconds: a.Spec.EverySeconds,
+		AnchorAt:     a.Spec.AnchorAt,
 		TZ:           a.Spec.TZ,
 	})
 	if desc := strings.TrimSpace(a.NLDescription); desc != "" {
@@ -616,7 +625,8 @@ const updateScheduleSchema = `{
       "description": "新的触发频率：cron 与 every_seconds 必须且只能提供一个",
       "properties": {
         "cron": {"type": "string", "description": "5 段 cron（分 时 日 月 周），按时区的墙上时间触发，分钟字段必须是 0-59 的整数，如 \"30 8 * * *\"=每天 8:30。要「每天某个具体时刻」一律用 cron"},
-        "every_seconds": {"type": "integer", "description": "固定间隔秒数，不低于 3600。注意触发点按 Unix epoch 对齐（21600=6 小时会落在 00/06/12/18 点整），不是从现在起每 N 秒；想要具体时刻请改用 cron"},
+        "every_seconds": {"type": "integer", "description": "固定间隔秒数，不低于 3600。不配 anchor_at 时触发点按 Unix epoch 对齐（21600=6 小时落在 00/06/12/18 点整），要指定从哪个时刻起请配 anchor_at"},
+        "anchor_at": {"type": "string", "description": "可选：RFC3339 绝对时刻（如 \"2026-07-19T20:00:00+08:00\"），只能与 every_seconds 搭配。给了它触发点就从该时刻起按间隔推进（每 3 天的晚上 8 点 = every_seconds:259200 + 该时刻）；不给则按 Unix epoch 对齐（21600 会落在 00/06/12/18 点整，通常不是用户想要的）"},
         "tz": {"type": "string", "description": "可选：IANA 时区名，缺省 Asia/Shanghai"}
       }
     },
@@ -630,6 +640,7 @@ type updateScheduleArgs struct {
 	Spec       struct {
 		Cron         string `json:"cron"`
 		EverySeconds int    `json:"every_seconds"`
+		AnchorAt     string `json:"anchor_at"`
 		TZ           string `json:"tz"`
 	} `json:"spec"`
 	// 指针区分「省略=不改描述」与「显式置空」，与 store.UpdateScheduleSpec 的 nil 语义对应。
@@ -666,6 +677,7 @@ func (t *updateScheduleTool) Execute(ctx context.Context, _ int64, args json.Raw
 	spec := scheduler.ScheduleSpec{
 		Cron:         a.Spec.Cron,
 		EverySeconds: a.Spec.EverySeconds,
+		AnchorAt:     a.Spec.AnchorAt,
 		TZ:           a.Spec.TZ,
 	}
 	if err := t.sched.UpdatePush(ctx, schedID, spec, a.NLDescription); err != nil {

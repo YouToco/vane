@@ -532,7 +532,8 @@ func TestOtherTools_Summarize(t *testing.T) {
 	})
 	t.Run("create_schedule every_seconds", func(t *testing.T) {
 		got := (&createScheduleTool{}).Summarize(json.RawMessage(`{"spec":{"every_seconds":3600}}`))
-		if got != "创建定时推送任务：每 3600 秒触发一次（时区 Asia/Shanghai）" {
+		// 文案刻意点明 epoch 对齐：不说的话用户会以为是"从现在起每小时"。
+		if got != "创建定时推送任务：每 3600 秒触发一次（时区 Asia/Shanghai，按 epoch 对齐）" {
 			t.Fatalf("实得 %q", got)
 		}
 	})
@@ -635,6 +636,7 @@ func TestValidateScheduleSpecFields_共用(t *testing.T) {
 			viaCreate := validateScheduleArgs(createScheduleArgs{Spec: struct {
 				Cron         string `json:"cron"`
 				EverySeconds int    `json:"every_seconds"`
+				AnchorAt     string `json:"anchor_at"`
 				TZ           string `json:"tz"`
 			}{Cron: c.cron, EverySeconds: c.every}})
 			if (viaCreate == "") != (msg == "") {
@@ -916,4 +918,45 @@ func TestCreateScheduleTool_InitializesPlaybook(t *testing.T) {
 			t.Fatalf("调度没建成不该初始化手册, 实得 %+v", pb.upserts)
 		}
 	})
+}
+
+// TestFormatScheduleSpec_锚点上卡 确认卡必须说出锚点：同样是"每 259200 秒"，
+// 有没有锚点决定触发点落在 epoch 对齐点还是用户指定的时刻，卡面不提=用户无从判断对错。
+func TestFormatScheduleSpec_锚点上卡(t *testing.T) {
+	withAnchor := formatScheduleSpec(scheduler.ScheduleSpec{
+		EverySeconds: 259200, AnchorAt: "2026-07-19T20:00:00+08:00",
+	})
+	if !strings.Contains(withAnchor, "2026-07-19T20:00:00+08:00") || !strings.Contains(withAnchor, "起") {
+		t.Errorf("有锚点时卡面应说明从何时起，实得 %q", withAnchor)
+	}
+	noAnchor := formatScheduleSpec(scheduler.ScheduleSpec{EverySeconds: 259200})
+	if !strings.Contains(noAnchor, "epoch") {
+		t.Errorf("无锚点时应点明是 epoch 对齐（否则用户以为从现在起），实得 %q", noAnchor)
+	}
+	if withAnchor == noAnchor {
+		t.Error("有无锚点的文案必须可区分")
+	}
+}
+
+// TestScheduleSchemas_含anchor_at 防"底层支持了但工具面没暴露"：create 与 update
+// 两个 schema 都要有 anchor_at，否则模型根本用不上这个能力。
+func TestScheduleSchemas_含anchor_at(t *testing.T) {
+	for name, raw := range map[string]json.RawMessage{
+		"create_schedule": (&createScheduleTool{}).Parameters(),
+		"update_schedule": (&updateScheduleTool{}).Parameters(),
+	} {
+		var schema struct {
+			Properties struct {
+				Spec struct {
+					Properties map[string]any `json:"properties"`
+				} `json:"spec"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("%s schema 不是合法 JSON: %v", name, err)
+		}
+		if _, ok := schema.Properties.Spec.Properties["anchor_at"]; !ok {
+			t.Errorf("%s 的 spec 应暴露 anchor_at", name)
+		}
+	}
 }
