@@ -62,6 +62,10 @@ type playbookStore interface {
 	UpsertSchedulePlaybook(ctx context.Context, userID int64, scheduleID, content string) (ok bool, err error)
 	// SetFetchPlan 只改 fetch_plan（P1 编译层），归属同 Upsert 进 SQL；ok=false=任务不存在/非本人/无手册行。
 	SetFetchPlan(ctx context.Context, userID int64, scheduleID string, plan json.RawMessage) (ok bool, err error)
+	// GetOrCreateSource 材料化 plan 源（P1b b2）：不存在就建、已存在原样返回不覆写（不改用户既有源配置）。
+	GetOrCreateSource(ctx context.Context, src *types.Source) (id int64, created bool, err error)
+	// ReplaceScheduleSources 把本任务的「任务↔源」软范围链接整体替换为 sourceIDs（P1b b2），归属进 SQL。
+	ReplaceScheduleSources(ctx context.Context, userID int64, scheduleID string, sourceIDs []int64) error
 }
 
 // scheduleCreator 收窄 create_schedule 依赖的 scheduler 能力（*scheduler.Scheduler 已实现），
@@ -1116,7 +1120,46 @@ func compilePlaybookPlan(ctx context.Context, st playbookStore, tr playbookTrans
 		slog.Warn("agent: 抓取计划落库未命中手册行（任务不存在/非本人/无手册行）", "schedule_id", scheduleID)
 		return 0
 	}
+	// b2：把计划里的源材料化成真源行 + 同步「任务↔源」软范围链接（schedule_sources）。
+	// best-effort、不改回执：链接同步失败不影响已落库的 fetch_plan，也不改用户看到的源数。
+	// 软范围≠硬闸门：只圈定本任务取材范围，不建订阅、不碰 agent 的配源/搜索工具面。
+	syncPlaybookSources(ctx, st, userID, scheduleID, plan)
 	return countPlanSources(plan)
+}
+
+// syncPlaybookSources 把 fetch_plan 里的每个源材料化成真 sources 行（GetOrCreateSource：
+// 已存在不覆写），再把本任务的 schedule_sources 链接整体替换为这些源（P1b b2）。best-effort：
+// 单源材料化失败跳过并 warn；链接同步失败只记 error。b2 阶段这些链接尚无人消费（b3 才读）。
+func syncPlaybookSources(ctx context.Context, st playbookStore, userID int64, scheduleID string, planJSON json.RawMessage) {
+	var plan FetchPlan
+	if len(planJSON) == 0 || json.Unmarshal(planJSON, &plan) != nil {
+		return
+	}
+	ids := make([]int64, 0, len(plan.Sources))
+	for _, ps := range plan.Sources {
+		src := &types.Source{
+			Platform:   types.Platform(ps.Platform),
+			Capability: types.Capability(ps.Capability),
+			URL:        ps.URL,
+			Title:      ps.Title,
+			Config:     ps.Config,
+		}
+		id, _, err := st.GetOrCreateSource(ctx, src)
+		if err != nil {
+			// 有源没材料化成：**不半更新链接**。ReplaceScheduleSources 是整体替换，
+			// 若拿"成功子集"去替换，会把 fetch_plan 里仍列出、只是本次瞬时建源失败的那些源的
+			// 旧链接误删——fetch_plan 与 schedule_sources 就分叉了。保留既有链接不动，下次
+			// 改手册（或重试）自愈，比"因一次 DB 抖动静默丢一条正确链接"安全。
+			slog.Warn("agent: 部分计划源材料化失败，跳过本次链接同步（保留既有链接，避免与 fetch_plan 分叉）",
+				"schedule_id", scheduleID, "url", ps.URL, "err", err)
+			return
+		}
+		ids = append(ids, id)
+	}
+	// 全部材料化成功（含"计划本就零源"→ ids 空 → 清空该任务链接，正当）才整体替换链接。
+	if err := st.ReplaceScheduleSources(ctx, userID, scheduleID, ids); err != nil {
+		slog.Error("agent: 同步任务源链接失败", "schedule_id", scheduleID, "err", err)
+	}
 }
 
 const editTaskPlaybookSchema = `{
