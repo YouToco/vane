@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -65,6 +66,12 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 废话。同款先例：下方 EvolveProfile 步骤的 log.Warn、cmd/gate 里 config.Load 失败的 slog.Error。
 	// 真正受红线 3 约束的是 activities.go 的 retryableOrNot——它只放 AppError.Message
 	// 进 ApplicationError，那才是会被展示/喂进上下文的那一层（activities_test.go 有钉）。
+	// userTriggered：本次运行是否用户主动触发（"现在推"按钮 push-adhoc-* / agent 工具
+	// push-agent-*）。定时调度的 workflow ID 是 wf-push-{schedule_id}-{ts}，不命中。
+	// workflow ID 在重放中恒定，据此分支是确定性的。
+	wfID := workflow.GetInfo(ctx).WorkflowExecution.ID
+	userTriggered := strings.HasPrefix(wfID, "push-agent-") || strings.HasPrefix(wfID, "push-adhoc-")
+
 	recordEmpty := func(gate types.BatchExitGate) {
 		// 用 quick 档：纯一条 INSERT，且它无论如何都不该拖长一次"其实没事干"的运行。
 		recCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
@@ -72,6 +79,17 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 		if err := workflow.ExecuteActivity(recCtx, a.RecordEmptyBatch, in).Get(recCtx, nil); err != nil {
 			log.Warn("空批次记账失败，本次仍按正常终态结束",
 				"user_id", p.UserID, "trace_id", traceID, "gate", gate, "err", err)
+		}
+		// 用户主动触发时补一张"本次没有新内容"通知卡（2026-07-18：Boss 点了立即推送
+		// 等不到任何回音来查服务器——空结果和故障在用户侧必须可区分）。定时任务保持
+		// 静默（每天"今天没新闻"是噪音）。失败同样只 Warn：通知是附加信息，
+		// 不能把正常空终态变成失败。
+		if userTriggered {
+			ntCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
+			nin := NotifyEmptyIn{UserID: p.UserID, TraceID: traceID, Gate: gate, Counts: counts}
+			if err := workflow.ExecuteActivity(ntCtx, a.NotifyEmptyResult, nin).Get(ntCtx, nil); err != nil {
+				log.Warn("空结果通知失败（不阻断）", "trace_id", traceID, "err", err)
+			}
 		}
 	}
 

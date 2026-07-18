@@ -774,3 +774,61 @@ func filterSources(sources []types.Source, want []int64) []types.Source {
 	}
 	return out
 }
+
+// NotifyEmptyIn 是 NotifyEmptyResult Activity 的入参。
+type NotifyEmptyIn struct {
+	UserID  int64                `json:"user_id"`
+	TraceID string               `json:"trace_id"`
+	Gate    types.BatchExitGate  `json:"gate"`
+	Counts  types.PipelineCounts `json:"counts"`
+}
+
+// NotifyEmptyResult 给用户发一张"本次没有新内容"的通知卡。
+//
+// 只服务**用户主动触发**的推送（"现在推"按钮 / agent push_now）——用户明确要了
+// 一次推送，管道跑完却一声不吭，空结果和故障在用户侧不可区分（2026-07-18 Boss
+// 点了立即推送等不到任何回音，来查"服务器是不是坏了"——服务其实完全正常）。
+// 定时任务的空批次保持静默：每天早上收一条"今天没新闻"是噪音不是信息。
+// 是否用户触发由 workflow 侧按 workflow ID 前缀判定（见 workflow.go），本活动不判。
+//
+// best-effort：通知失败只记日志不返回错误——空批次是正常终态（红线），
+// 不能让一张通知卡的失败把它变成 workflow 失败。
+func (a *Activities) NotifyEmptyResult(ctx context.Context, in NotifyEmptyIn) error {
+	if a.buildNotice == nil {
+		return nil // 灰度/测试装配未注入通知构卡：静默跳过。
+	}
+	owner := a.feishu.OwnerOpenID()
+	if owner == "" {
+		return nil
+	}
+	md := emptyResultMarkdown(in.Gate, in.Counts)
+	if _, err := a.pusher.Push(ctx, owner, a.buildNotice(md)); err != nil {
+		slog.Warn("push: 空结果通知发送失败（不阻断）", "trace_id", in.TraceID, "err", err)
+	}
+	return nil
+}
+
+// emptyResultMarkdown 按退出闸门生成人话说明——"为什么这次没有卡片"。
+// 文案与 exit_gate 语义一一对应（enums.go BatchExitGate）。
+func emptyResultMarkdown(gate types.BatchExitGate, c types.PipelineCounts) string {
+	nz := func(p *int) int {
+		if p == nil {
+			return 0
+		}
+		return *p
+	}
+	switch gate {
+	case types.BatchExitGateFetch:
+		return "📭 本次推送没有新内容：所有信源都没有产出新条目。有新内容时定时任务会照常送达。"
+	case types.BatchExitGateDedup:
+		return fmt.Sprintf("📭 本次推送没有新内容：抓到 %d 条，但都已推送过（去重后 0 条）。有新内容时定时任务会照常送达。", nz(c.Fetched))
+	case types.BatchExitGateScore:
+		return fmt.Sprintf("📭 本次推送没有新内容：%d 条候选打分后没有达标的。", nz(c.Deduped))
+	case types.BatchExitGateSelect:
+		return fmt.Sprintf("📭 本次推送没有新内容：%d 条打分内容择优后没有入选的。", nz(c.Scored))
+	case types.BatchExitGateCardGen:
+		return "📭 本次推送没有新内容：卡片生成后无可推条目。"
+	default:
+		return "📭 本次推送没有新内容。"
+	}
+}
