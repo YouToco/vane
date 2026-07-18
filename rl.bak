@@ -43,8 +43,8 @@ func newAuthLimiter() *authLimiter {
 // allowAndRecord 原子地「判定 + 记账」。
 //
 // 合并成一个方法是刻意的：分开的 allow()/record() 之间存在窗口——高并发下
-// N 个请求可以同时通过 allow() 再各自记账，实测原限流器曾一次性放行 200 个并发。
-// 合并后每次调用都占一个额度，并发洪水在第 max+1 个就被拒。
+// N 个请求可以同时通过 allow() 再各自记账，实测 maxFails=10 的限流器曾一次性
+// 放行 200 个并发。合并后每次调用都占一个额度，并发洪水在第 max+1 个就被拒。
 func (l *authLimiter) allowAndRecord(key string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()

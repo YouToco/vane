@@ -51,6 +51,7 @@ type AuthStore interface {
 	GetUserByEmail(ctx context.Context, email string) (*types.User, error)
 	UpdatePasswordHash(ctx context.Context, userID int64, passwordHash string) error
 	ListMembershipsByUser(ctx context.Context, userID int64) ([]types.Membership, error)
+	InviteUsable(ctx context.Context, code string) (bool, error)
 	CreateSession(ctx context.Context, tokenHash []byte, userID, tenantID int64, expiresAt time.Time) error
 	LookupSession(ctx context.Context, tokenHash []byte) (*types.Session, error)
 	DeleteSession(ctx context.Context, tokenHash []byte) error
@@ -74,13 +75,13 @@ type Deps struct {
 
 type server struct {
 	deps    Deps
-	limiter *loginLimiter
+	limiter *authLimiter
 }
 
 // Mount 把 /api/* 路由挂到 mux。除 /api/auth/login 外全部要求会话 cookie；
 // /healthz /readyz 不在 /api 前缀下，不受本中间件影响。
 func Mount(mux *http.ServeMux, deps Deps) {
-	s := &server{deps: deps, limiter: newLoginLimiter()}
+	s := &server{deps: deps, limiter: newAuthLimiter()}
 
 	inner := http.NewServeMux()
 	inner.HandleFunc("POST /api/auth/register", s.handleRegister)

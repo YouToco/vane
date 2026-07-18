@@ -70,11 +70,11 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	// **邀请码先于哈希校验**（安全审查 CRITICAL）：HashPassword 每次要 19MiB argon2，
 	// 若放在邀请码校验之前，匿名攻击者用伪造邀请码即可反复触发昂贵计算——
-	// 未鉴权端点就成了内存 DoS 放大器。这里先做一次廉价只读预检把明显无效的挡掉；
+	// 未鉴权端点就成了内存 DoS 放大器。这里先做一次廉价的只读预检把明显无效的挡掉；
 	// 真正的原子消费仍在 RegisterWithInvite 的事务里（预检与消费之间的竞态由事务兜住，
-	// 预检只做成本过滤、不承担正确性）。
-	if ok, ierr := s.deps.Auth.InviteUsable(r.Context(), req.InviteCode); ierr != nil {
-		writeAppError(w, ierr)
+	// 预检只是成本过滤，不承担正确性）。
+	if ok, err := s.deps.Auth.InviteUsable(r.Context(), req.InviteCode); err != nil {
+		writeAppError(w, err)
 		return
 	} else if !ok {
 		writeError(w, http.StatusBadRequest, "邀请码无效或已失效")
@@ -118,8 +118,8 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 双维度限流：来源维度挡「一个源猜很多号」，账号维度挡「很多源猜一个号」。
-	// 只有前者时，换 IP 即可无限猜同一个账号的密码。
+	// 双维度限流：IP 前缀维度挡「一个来源猜很多账号」，
+	// 账号维度挡「很多来源猜同一个账号」——只有前者时换 IP 即可无限猜单个账号。
 	now := time.Now()
 	if !s.limiter.allowAndRecord(ipLimitKey(r), now) ||
 		!s.limiter.allowAndRecord(accountLimitKey(req.Email), now) {
@@ -128,16 +128,16 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// **时序对齐**（安全审查 HIGH）：固定延迟原本是「失败后再睡 200ms」，
-	// 而「邮箱不存在」走不到 argon2（省下约 30ms）、「密码错」要跑完 argon2——
-	// 两条路径总耗时因此可区分，构成账号枚举的时序旁路。
+	// 而「邮箱不存在」走不到 argon2（省下 ~30ms）、「密码错」要跑完 argon2——
+	// 两条路径的总耗时因此可区分，构成账号枚举的时序旁路。
 	// 改为记录起点、在统一出口**对齐到同一截止时刻**，抹平路径差异。
 	deadline := now.Add(uniformAuthDelay)
 
 	u, err := s.deps.Auth.GetUserByEmail(r.Context(), req.Email)
 	if err != nil {
 		// **不区分「用户不存在」**——统一走失败路径，使响应内容与耗时都不泄漏
-		// 该邮箱是否注册过。这里仍要跑一次等价的 argon2（对着固定假哈希），
-		// 否则「不存在」会比「密码错」少花一次 argon2 的时间。
+		// 该邮箱是否注册过。这里仍要跑一次 argon2（对着固定的假哈希），
+		// 否则「不存在」会比「密码错」快一个 argon2 的时间。
 		auth.DummyVerify(r.Context(), req.Password)
 		s.authFail(w, deadline)
 		return
@@ -165,7 +165,7 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// 登录成功后按当前参数无感升级旧哈希（参数调高后的平滑迁移）。
 	if auth.NeedsRehash(*u.PasswordHash) {
-		if nh, herr := auth.HashPasswordCtx(r.Context(), req.Password); herr == nil {
+		if nh, herr := auth.HashPassword(req.Password); herr == nil {
 			if uerr := s.deps.Auth.UpdatePasswordHash(r.Context(), u.ID, nh); uerr != nil {
 				slog.Warn("api: 密码哈希升级失败（不影响本次登录）", "user_id", u.ID, "err", uerr)
 			}
@@ -178,9 +178,9 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 // authFail 是统一的认证失败出口：**对齐到同一截止时刻** + 统一文案。
 //
-// 睡到 deadline 而不是「再睡固定时长」：后者把各路径的固有耗时差原样保留
+// 睡到 deadline 而不是「再睡固定时长」：后者会把各路径的固有耗时差原样保留下来
 // （不存在的邮箱省掉一次 argon2，比密码错快约 30ms），构成账号枚举的时序旁路。
-// 对齐后所有失败路径的总耗时收敛到同一个值。
+// 对齐后所有失败路径的总耗时都收敛到同一个值。
 // 限流已在入口处 allowAndRecord 计过，此处不再重复计数。
 func (s *server) authFail(w http.ResponseWriter, deadline time.Time) {
 	if d := time.Until(deadline); d > 0 {
@@ -191,14 +191,14 @@ func (s *server) authFail(w http.ResponseWriter, deadline time.Time) {
 
 // checkOrigin 是未鉴权端点的 CSRF 防线（安全审查 HIGH：登录 CSRF）。
 //
-// 攻击场景：攻击者诱导受害者浏览器 POST /api/auth/login（表单可跨站提交，
+// 攻击场景：攻击者诱导受害者的浏览器 POST /api/auth/login（表单可跨站提交，
 // 无需读响应），把受害者**静默登进攻击者的账号**——此后受害者的一切操作
 // （加信源、改画像）都记在攻击者账号下，攻击者随后登录即可全部读走。
 //
 // 防线：状态变更请求必须带可信 Origin。浏览器**不允许**页面伪造 Origin 头，
 // 而跨站表单提交必然带上发起页的 Origin，故按 Origin 判定可靠。
-// 无 Origin 头的请求（curl / 服务端调用）放行——它们不是 CSRF 的载体，
-// CSRF 的前提是受害者浏览器自动携带 cookie。
+// 无 Origin 头的请求（curl / 服务端调用 / 同源老浏览器）放行——它们不是
+// CSRF 的载体（CSRF 的前提是受害者浏览器自动带 cookie）。
 func (s *server) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" || (s.deps.Origin != "" && origin == s.deps.Origin) {

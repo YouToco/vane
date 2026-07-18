@@ -10,27 +10,27 @@ import (
 )
 
 func TestLoginLimiter(t *testing.T) {
-	l := newLoginLimiter()
+	l := newAuthLimiter()
 	now := time.Now()
 	ip := "1.2.3.4"
 
 	// 前 maxFails 次尝试都应放行，逐次记失败。
-	for i := 0; i < l.maxFails; i++ {
-		if !l.allow(ip, now) {
+	for i := 0; i < l.max; i++ {
+		if !l.allowAndRecord(ip, now) {
 			t.Fatalf("第 %d 次尝试应放行", i+1)
 		}
-		l.recordFailure(ip, now)
+		l.allowAndRecord(ip, now)
 	}
 	// 达到阈值后拒绝。
-	if l.allow(ip, now) {
+	if l.allowAndRecord(ip, now) {
 		t.Fatal("达到失败上限后应拒绝")
 	}
 	// 另一个 IP 不受影响（per-IP 隔离）。
-	if !l.allow("5.6.7.8", now) {
+	if !l.allowAndRecord("5.6.7.8", now) {
 		t.Fatal("不同 IP 不应被牵连")
 	}
 	// 窗口滑过后恢复。
-	if !l.allow(ip, now.Add(2*time.Minute)) {
+	if !l.allowAndRecord(ip, now.Add(2*time.Minute)) {
 		t.Fatal("窗口过期后应恢复放行")
 	}
 }
@@ -73,7 +73,7 @@ func TestClientIP(t *testing.T) {
 func TestLoginLimiterNotBypassedBySpoofedXFF(t *testing.T) {
 	s := &server{
 		deps:    Deps{Auth: newFakeAuthStore()},
-		limiter: newLoginLimiter(),
+		limiter: newAuthLimiter(),
 	}
 	do := func(spoofLeft string) int {
 		body := strings.NewReader(`{"password":"wrong"}`)
@@ -86,7 +86,7 @@ func TestLoginLimiterNotBypassedBySpoofedXFF(t *testing.T) {
 		return rec.Code
 	}
 	// 前 maxFails 次失败尝试（各带不同伪造最左段）都应是普通的 401。
-	for i := 0; i < s.limiter.maxFails; i++ {
+	for i := 0; i < s.limiter.max; i++ {
 		if got := do(fmt.Sprintf("10.0.0.%d", i)); got != http.StatusUnauthorized {
 			t.Fatalf("第 %d 次失败应 401，实际 %d", i+1, got)
 		}

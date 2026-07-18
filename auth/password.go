@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -151,4 +152,75 @@ func decodeHash(encoded string) (argonParams, []byte, []byte, error) {
 		return p, nil, nil, errors.New("auth: 密码哈希摘要为空")
 	}
 	return p, salt, sum, nil
+}
+
+// ---- 并发闸门 ----
+
+// hashSlots 限制**同时**进行的 argon2 计算数，把内存占用封顶。
+//
+// 为什么必须有这道闸（对抗式安全审查的 CRITICAL 发现，审查员实测复现）：
+// argon2id 每次计算独占 argonMemory（19 MiB）。未鉴权端点若允许无限并发，
+// 200 个并发请求 ≈ 3.8 GiB 常驻——而本项目同机还跑着 Postgres/Temporal/Caddy，
+// OOM killer 一介入就是全站停摆。**限流器挡不住这个**：限流是按时间窗口计次，
+// 而内存峰值取决于**瞬时并发**，一秒内涌入的 200 个请求在任何窗口计数器眼里
+// 都还没超额。
+//
+// 8 × 19 MiB ≈ 152 MiB 封顶，对单台 VPS 是可接受的常驻上限；超出的请求排队等待，
+// 而不是各自申请内存。排队比拒绝更合适：正常登录只需几十毫秒，排队几乎无感，
+// 而拒绝会把「服务器忙」变成用户可见的登录失败。
+var hashSlots = make(chan struct{}, 8)
+
+// acquireHashSlot 取一个计算槽位，ctx 取消时放弃等待。
+func acquireHashSlot(ctx context.Context) error {
+	select {
+	case hashSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseHashSlot() { <-hashSlots }
+
+// HashPasswordCtx 是 HashPassword 的带闸门版本，供 HTTP 路径使用。
+// 无闸门的 HashPassword 保留给 CLI 等单次调用场景。
+func HashPasswordCtx(ctx context.Context, password string) (string, error) {
+	if err := acquireHashSlot(ctx); err != nil {
+		return "", err
+	}
+	defer releaseHashSlot()
+	return HashPassword(password)
+}
+
+// VerifyPasswordCtx 是 VerifyPassword 的带闸门版本，供 HTTP 路径使用。
+func VerifyPasswordCtx(ctx context.Context, encoded, password string) error {
+	if err := acquireHashSlot(ctx); err != nil {
+		return err
+	}
+	defer releaseHashSlot()
+	return VerifyPassword(encoded, password)
+}
+
+// dummyHash 是一个真实的 argon2id 哈希（口令为随机串，无人知晓），
+// 专供 DummyVerify 用。包级初始化一次，避免每次请求重算。
+var dummyHash = func() string {
+	h, err := HashPassword("dummy-password-for-timing-alignment-only")
+	if err != nil {
+		// HashPassword 只在密码长度不合规或 rand 失败时报错，二者在此都不可能；
+		// 真出错就让进程起不来，而不是留一个会泄漏时序的空串。
+		panic("auth: 初始化 dummy 哈希失败: " + err.Error())
+	}
+	return h
+}()
+
+// DummyVerify 对固定假哈希跑一次 argon2，用于**时序对齐**。
+//
+// 存在的理由（安全审查 HIGH）：登录时若邮箱不存在就直接返回，会比「邮箱存在但
+// 密码错」少跑一次 argon2（约 30ms）。这个耗时差可被测量，构成账号枚举的时序旁路
+// ——统一文案挡住了内容泄漏，却挡不住时间泄漏。让不存在的路径也跑一次等价计算，
+// 两条路径的耗时才真正不可区分。
+//
+// 返回值刻意丢弃：调用方无论如何都要走失败路径。
+func DummyVerify(ctx context.Context, password string) {
+	_ = VerifyPasswordCtx(ctx, dummyHash, password)
 }

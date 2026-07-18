@@ -29,6 +29,9 @@ type fakeAuthStore struct {
 
 	registerErr error
 	createErr   error
+
+	inviteChecked bool
+	onInviteCheck func()
 }
 
 func newFakeAuthStore() *fakeAuthStore {
@@ -78,6 +81,17 @@ func (f *fakeAuthStore) RegisterWithInvite(_ context.Context, email, passwordHas
 	tn := &types.Tenant{ID: f.nextUID * 10}
 	f.members[u.ID] = []types.Membership{{TenantID: tn.ID, UserID: u.ID, Role: types.MembershipRoleOwner}}
 	return u, tn, nil
+}
+
+func (f *fakeAuthStore) InviteUsable(_ context.Context, code string) (bool, error) {
+	f.mu.Lock()
+	f.inviteChecked = true
+	cb := f.onInviteCheck
+	f.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+	return code != "" && !strings.HasPrefix(code, "bad"), nil
 }
 
 func (f *fakeAuthStore) GetUserByEmail(_ context.Context, email string) (*types.User, error) {
@@ -524,5 +538,148 @@ func TestSec_LoginRateLimited(t *testing.T) {
 	}
 	if !got429 {
 		t.Error("连续失败登录未触发限流 —— 在线爆破无阻拦")
+	}
+}
+
+// ============================================================
+// 对抗式安全审查后补的用例（审查员实测发现的攻击面）
+// ============================================================
+
+// TestSec_SuccessfulLoginIsRateLimited 钉住 CRITICAL 发现的核心：
+// **登录成功也必须计入限流**。
+//
+// 原实现只在失败时记账，于是持一份有效凭据即可无限次登录，
+// 每次跑一遍 19MiB 的 argon2——限流器全程放行，一个 429 都不会发。
+// 这不是猜密码攻击，是把认证端点当成内存 DoS 放大器。
+func TestSec_SuccessfulLoginIsRateLimited(t *testing.T) {
+	mux, fake := newAuthTestServer(t)
+	fake.addUser(t, "flood@example.com", "flood-password-123", 1)
+
+	var got429 bool
+	for i := 0; i < 60; i++ {
+		rec := postJSON(t, mux, "/api/auth/login",
+			map[string]string{"email": "flood@example.com", "password": "flood-password-123"}, nil)
+		if rec.Code == http.StatusTooManyRequests {
+			got429 = true
+			break
+		}
+	}
+	if !got429 {
+		t.Error("连续成功登录未触发限流 —— 有效凭据即可无限触发 argon2，构成内存 DoS 放大器")
+	}
+}
+
+// TestSec_RateLimitNotBypassedByIPv6Rotation：限流键按 IPv6 /64 归一。
+// 一个普通 VPS 用户即持有 2^64 个源地址，按完整地址计数等于人人自带无限额度。
+func TestSec_RateLimitNotBypassedByIPv6Rotation(t *testing.T) {
+	l := newAuthLimiter()
+	now := time.Now()
+	// 同一 /64 内换 200 个源地址。
+	var allowed int
+	for i := 0; i < 200; i++ {
+		r := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+		r.RemoteAddr = fmt.Sprintf("[2001:db8:1:1::%x]:443", i+1)
+		if l.allowAndRecord(ipLimitKey(r), now) {
+			allowed++
+		}
+	}
+	if allowed > l.max {
+		t.Errorf("同一 /64 内轮换源地址放行了 %d 次（上限应为 %d）—— 限流可被 IPv6 轮换绕过", allowed, l.max)
+	}
+	// 不同 /64 之间必须仍然独立计数（不能误伤正常用户）。
+	r := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+	r.RemoteAddr = "[2001:db8:2:2::1]:443"
+	if !l.allowAndRecord(ipLimitKey(r), now) {
+		t.Error("不同 /64 应独立计数，不应被别人的额度连累")
+	}
+}
+
+// TestSec_PerAccountRateLimit：分布式来源对**单个账号**的猜测同样要有上限。
+func TestSec_PerAccountRateLimit(t *testing.T) {
+	l := newAuthLimiter()
+	now := time.Now()
+	var allowed int
+	for i := 0; i < 100; i++ {
+		r := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+		r.RemoteAddr = fmt.Sprintf("10.%d.%d.%d:443", i/256, i%256, i%251+1) // 每次换 IP
+		if l.allowAndRecord(accountLimitKey("victim@example.com"), now) {
+			allowed++
+		}
+	}
+	if allowed > l.max {
+		t.Errorf("换 IP 对同一账号猜了 %d 次（上限 %d）—— 只按 IP 限流挡不住分布式猜测", allowed, l.max)
+	}
+}
+
+// TestSec_LimiterSweepsStaleKeys：限流器必须能全局回收过期键。
+// 原实现只在「该键被再次触碰」时清理，而攻击者每次换新地址，旧键永久驻留。
+func TestSec_LimiterSweepsStaleKeys(t *testing.T) {
+	l := newAuthLimiter()
+	base := time.Now()
+	for i := 0; i < 500; i++ {
+		r := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+		r.RemoteAddr = fmt.Sprintf("10.1.%d.%d:443", i/256, i%256)
+		l.allowAndRecord(ipLimitKey(r), base)
+	}
+	if len(l.attempts) < 400 {
+		t.Fatalf("脚手架异常：应积累约 500 个键，实得 %d", len(l.attempts))
+	}
+	// 窗口之后来一个无关请求，触发全局清扫。
+	r := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+	r.RemoteAddr = "10.99.99.99:443"
+	l.allowAndRecord(ipLimitKey(r), base.Add(2*time.Minute))
+	if len(l.attempts) > 10 {
+		t.Errorf("过期键未被回收，仍驻留 %d 条 —— map 会随攻击者轮换地址无限膨胀", len(l.attempts))
+	}
+}
+
+// TestSec_RegisterValidatesInviteBeforeHashing 钉住 CRITICAL 的匿名可达面：
+// 注册必须**先验邀请码再算 argon2**，否则匿名攻击者用伪造码即可反复触发
+// 19MiB 的昂贵计算，把未鉴权端点变成内存 DoS 放大器。
+func TestSec_RegisterValidatesInviteBeforeHashing(t *testing.T) {
+	mux, fake := newAuthTestServer(t)
+	var hashedBefore int
+	fake.onInviteCheck = func() { hashedBefore = 0 } // 预检发生时哈希还没做
+
+	rec := postJSON(t, mux, "/api/auth/register", map[string]string{
+		"email": "x@example.com", "password": "valid-password-123", "invite_code": "bad-code",
+	}, nil)
+	if rec.Code == http.StatusOK {
+		t.Fatal("无效邀请码不应注册成功")
+	}
+	if hashedBefore != 0 {
+		t.Error("邀请码预检应先于密码哈希")
+	}
+	if !fake.inviteChecked {
+		t.Error("未调用邀请码预检 —— 无效码会白跑一次 19MiB argon2")
+	}
+}
+
+// TestSec_PlatformEndpointsGatedToOwner 钉住 CRITICAL：
+// 平台级端点（全局飞书凭证、全库统计）不得对普通租户开放。
+//
+// 原状态下，任一受邀用户即可 POST /api/feishu/config 覆写全局飞书凭证，
+// 把机器人指向自己的应用 —— **劫持所有租户的推送通道**，跨租户完全沦陷。
+func TestSec_PlatformEndpointsGatedToOwner(t *testing.T) {
+	platformOnly := []struct{ method, path string }{
+		{http.MethodGet, "/api/feishu/status"},
+		{http.MethodPost, "/api/feishu/config"},
+		{http.MethodPost, "/api/feishu/verify"},
+		{http.MethodPost, "/api/feishu/test"},
+		{http.MethodGet, "/api/admin/observability"},
+		{http.MethodGet, "/api/admin/runstats"},
+	}
+	// 普通租户（非平台 owner）：一律不可见。
+	mux, cookie := authzMux(t, 555, 555, nil)
+	for _, p := range platformOnly {
+		t.Run("普通租户 "+p.path, func(t *testing.T) {
+			r := httptest.NewRequest(p.method, p.path, strings.NewReader("{}"))
+			r.AddCookie(cookie)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, r)
+			if w.Code != http.StatusNotFound {
+				t.Errorf("普通租户访问平台端点应 404，实得 %d —— 可劫持全局配置或读走全平台数据", w.Code)
+			}
+		})
 	}
 }
