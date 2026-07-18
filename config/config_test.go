@@ -195,7 +195,7 @@ func TestDefaults(t *testing.T) {
 		{"llm.base_url", cfg.LLM.BaseURL, "https://api.deepseek.com"},
 		{"llm.model", cfg.LLM.Model, "deepseek-v4-flash"},
 		{"llm.agent_model", cfg.LLM.AgentModel, "deepseek-v4-pro"},
-		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 5},
+		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 32},
 		{"fetch.timeout_seconds", cfg.Fetch.TimeoutSeconds, 20},
 		{"fetch.max_response_mb", cfg.Fetch.MaxResponseMB, 5},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},

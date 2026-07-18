@@ -21,7 +21,7 @@ llm:
   api_key: "" # VANE_LLM_API_KEY
   model: "deepseek-v4-flash"       # pipeline 打分/出卡（便宜档）
   agent_model: "deepseek-v4-pro"   # agent loop（function calling，M4）
-  max_concurrent: 5
+  max_concurrent: 32            # 实测定值：45 条批次 5 并发 5.7s → 32 并发 1.25s（v4-flash 官方限额 2500）
 
 # 注：飞书凭证不在配置文件——由 Dashboard 向导写入 settings 表，运行时从 store 读取。
 

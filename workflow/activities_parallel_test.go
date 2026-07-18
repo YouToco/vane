@@ -375,6 +375,12 @@ func (p *panicScorer) Score(ctx context.Context, _ int64, item types.ContentItem
 	p.mu.Lock()
 	p.calls++
 	p.mu.Unlock()
+	// panic 判定放在延迟**之前**：若先睡再炸，第一波会睡满、同时完成、再放出一整波，
+	// 取消还没生效就多派发了一倍，断言余量被吃光（实测 63/96，上限 64，只剩 1）。
+	// 先炸则取消在第一波还在睡时就传播出去，省下的量稳定且可断言。
+	if p.panicOnAll || item.ID == p.panicOn {
+		panic("打分炸了")
+	}
 	// 与真实 llm.Do 一样响应 ctx：取消后在飞的调用也会中断，
 	// 假件若无脑睡满就比现实更悲观，会把「取消传播」测成假红。
 	if p.delay > 0 {
@@ -383,9 +389,6 @@ func (p *panicScorer) Score(ctx context.Context, _ int64, item types.ContentItem
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
-	}
-	if p.panicOnAll || item.ID == p.panicOn {
-		panic("打分炸了")
 	}
 	return 50, nil
 }
@@ -422,11 +425,16 @@ func TestScore_AllWorkersPanicStillReturns(t *testing.T) {
 // goroutine 建好，第 k 条 panic 只展开它自己，wg.Wait() 仍要等其余每一条**发完真实
 // LLM 请求**才走到重抛。而串行版第 k 条 panic 后 k+1..n 根本不会被碰。
 //
-// 代价是可计费的：45 条批次第 3 条 panic，串行 3 次调用、仅捕获重抛的并发版 45 次，
-// 再乘 Temporal 的 3 次重试 = 135 次计费调用与 135 行 llm_calls。修法是 panic 时
-// cancelRun，让排队者走 ctx.Done 分支退出。
+// 代价是可计费的：整批每条都是真实请求 + 一行 llm_calls，再乘 Temporal 的 3 次重试。
+// 修法是 panic 时 cancelRun 停止派发，让尚未开工的条目根本不被触及。
+//
+// **批次规模刻意取 3 倍扇出**。生产批次上限是 maxScoreCandidates=50、扇出 32，
+// 两者接近意味着现实中一次 panic 多半仍会暴露整批——那是并发本身的代价，且已经很小
+// （50 次调用约 $0.0008，乘 3 次重试仍不到一分钱，耗时 1.25 秒/批）。
+// 但用 45 条来测就会让断言恒真、测不出任何东西。这里用 96 条压出"批次远大于扇出"的
+// 区间，守的是机制本身：将来若放宽 maxScoreCandidates，这条仍然拦得住。
 func TestScore_PanicAbortsRemainingWork(t *testing.T) {
-	const n = 45
+	n := parBatchFanout * 3
 	sc := &panicScorer{panicOn: 3, delay: 20 * time.Millisecond}
 	a := newActivitiesWith(sc, fakeCardGen{})
 
@@ -440,10 +448,9 @@ func TestScore_PanicAbortsRemainingWork(t *testing.T) {
 		t.Errorf("panic 后仍把全部 %d 条送去打分（fn 被调用 %d 次）——"+
 			"剩余工作没有被取消，每条都是真实计费请求 + 一行 llm_calls，还要乘 3 次重试", n, calls)
 	}
-	// 已派发出去的那一批来不及取消是正常的。本机实测稳定在 9 次（worker pool 按序派发后
-	// 不再随调度器漂移，12/12 次全是 9）；上限取 3 倍扇出留足余量，慢机器上也不会误报，
-	// 而两种真实退化都远在其外：不取消是 45 次，去掉 worker 内的二次 ctx 检查是 15+ 次。
-	if limit := parBatchFanout * 3; calls > limit {
+	// 已派发出去的那一批来不及取消是正常的，所以下限就是扇出；留半倍余量吸收调度抖动。
+	// 真实退化远在其外：不取消时会跑满整批（3 倍扇出）。
+	if limit := parBatchFanout + parBatchFanout/2; calls > limit {
 		t.Errorf("panic 后仍有 %d 次调用，超过预期上限 %d —— 取消传播得不够快", calls, limit)
 	}
 }

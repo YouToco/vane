@@ -204,7 +204,17 @@ func setDefaults(v *viper.Viper) {
 	// deepseek-chat/deepseek-reasoner 为旧别名，2026-07-24 起废弃；默认用便宜档 v4-flash。
 	v.SetDefault("llm.model", "deepseek-v4-flash")
 	v.SetDefault("llm.agent_model", "deepseek-v4-pro")
-	v.SetDefault("llm.max_concurrent", 5)
+	// max_concurrent 32：真实 API 受控实验定的值（2026-07-18），不是拍脑袋。
+	// 45 条批次（生产实测批次规模）在并发 5 下 5.7 秒、并发 32 下 1.25 秒，零错误零 429。
+	// 上限侧余量极大——打分/出卡走 deepseek-v4-flash，官方并发限额 2500；
+	// 32 只是取"单批 45 条两波跑完"的性价比点，再往上收益递减。
+	// 同一实验还推翻了一条曾以为成立的优化：给 http.Client 调
+	// MaxIdleConnsPerHost 毫无作用（api.deepseek.com 走 HTTP/2，一条连接多路复用几十个
+	// 并发请求，连接数根本不是瓶颈；公平对照下两批次都是新建连接 0 次、握手 0 次）。
+	// 故此处**只调并发、不动 Transport**。
+	//
+	// 改这个值时 workflow 的 parBatchFanout 要同步跟上（两者刻意齐平，理由见那里）。
+	v.SetDefault("llm.max_concurrent", 32)
 
 	v.SetDefault("fetch.timeout_seconds", 20)
 	v.SetDefault("fetch.max_response_mb", 5)

@@ -554,14 +554,16 @@ func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem
 // 此后到达的交互请求要排在它们全部之后。而超出部分对吞吐**一点贡献都没有**
 // （吞吐本就被信号量卡在 5），纯粹是拿交互延迟换零收益。原值 16 正是这个错误。
 //
-// 也就是说这里刻意与 llm.max_concurrent 取同值。不做成配置项读取是因为 NewActivities
-// 已有 10 个参数、32 处调用点，为此加参数不划算；代价是若把 llm.max_concurrent 调高，
-// 批处理不会自动跟进（只是用不满，不会变慢也不会不公平）——真要调高时把这里一并改。
+// 也就是说这里刻意与 llm.max_concurrent 取同值（2026-07-18 起两者同为 32，
+// 依据是真实 API 受控实验：45 条批次并发 5 → 5.7 秒、并发 32 → 1.25 秒，零 429；
+// v4-flash 官方并发限额 2500，上限侧余量极大）。不做成配置项读取是因为 NewActivities
+// 已有 10 个参数、32 处调用点，为此加参数不划算；代价是调 llm.max_concurrent 时
+// 必须记得把这里一并改——两处注释互相指认，改一处漏另一处会在 review 时露出来。
 //
 // **它不限制 goroutine 数量**。每条输入无条件起一个 goroutine，数量等于批次条数；
 // 真正的上限是上游的 maxScoreCandidates（50）。早先注释声称本常量"防止凭空拉起几千个
 // goroutine"是错的——审查指出后更正。
-const parBatchFanout = 5
+const parBatchFanout = 32
 
 // mapConcurrent 并发映射 in，返回成功项，**保持输入顺序**；单项失败调 onErr 后跳过。
 //
