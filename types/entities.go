@@ -234,6 +234,49 @@ type LLMCall struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
+// ToolCallKind 工具调用分类（tool_calls.tool_kind），区分三个调用面，
+// 限额统计与坏端点分析按此过滤。
+type ToolCallKind string
+
+const (
+	ToolCallKindStatic         ToolCallKind = "static"          // 静态白名单工具（add_source/push_now/…）
+	ToolCallKindTikHubSearch   ToolCallKind = "tikhub_search"   // search_endpoints 检索元工具
+	ToolCallKindTikHubEndpoint ToolCallKind = "tikhub_endpoint" // 动态注入的 TikHub 端点工具（按次计费面）
+)
+
+// 工具调用错误分类（tool_calls.error_type）。低基数硬枚举：per-tool 错误率
+// 视图按它 GROUP BY，自由文本会让统计不可聚合（OTel error.type 的低基数要求）。
+const (
+	ToolErrTimeout        = "timeout"         // 上游超时/ctx 到期
+	ToolErrHTTP           = "http_error"      // 上游非 2xx
+	ToolErrInvalidArgs    = "invalid_args"    // 参数校验不过（模型可自纠）
+	ToolErrBudgetExceeded = "budget_exceeded" // 单消息/每日限额拦截
+	ToolErrInternal       = "internal"        // 其余基础设施错误
+)
+
+// ToolCall 一条 agent 工具调用记录（tool_calls 表，migration 015）。
+// 与 LLMCall 同定位：旁路可观测性；字段语义对齐 OTel execute_tool span
+// （tool_name / error_type / duration），检索留痕字段的存在理由见 015 头注。
+type ToolCall struct {
+	ID             int64           `json:"id"`
+	TraceID        string          `json:"trace_id"`
+	UserID         *int64          `json:"user_id,omitempty"`
+	SessionID      *int64          `json:"session_id,omitempty"` // 可空：确认卡回调等无会话来源
+	ToolName       string          `json:"tool_name"`
+	ToolKind       ToolCallKind    `json:"tool_kind"`
+	EndpointPath   string          `json:"endpoint_path"`         // 仅 tikhub_endpoint
+	Arguments      json.RawMessage `json:"arguments,omitempty"`   // 模型产出的参数原文
+	ResultPreview  string          `json:"result_preview"`        // 截断版结果（8K rune）
+	ResultSize     int             `json:"result_size"`           // 截断前字节数
+	HTTPStatus     *int            `json:"http_status,omitempty"` // 仅 tikhub_endpoint；非 HTTP 工具 NULL
+	ErrorType      string          `json:"error_type"`            // 低基数分类，成功为空串
+	Error          string          `json:"error"`                 // 详情，成功为空串
+	DurationMs     int             `json:"duration_ms"`
+	RetrievalQuery string          `json:"retrieval_query"`           // 仅 tikhub_search
+	CandidateTools []string        `json:"candidate_tools,omitempty"` // 仅 tikhub_search
+	CreatedAt      time.Time       `json:"created_at"`
+}
+
 // ScheduleStatus 调度状态（schedules.status）。
 // 说明：本项目枚举通常集中在 enums.go，但 M3 store 扩展仅获准改动 entities.go，
 // 故与 Schedule 结构体就近定义于此；若后续 scheduler 包也需该类型，应统一
@@ -271,8 +314,11 @@ type AgentSession struct {
 	Status    AgentSessionStatus `json:"status"`
 	Messages  json.RawMessage    `json:"messages"` // JSONB，[]llm.ChatMessage 序列化
 	TurnCount int                `json:"turn_count"`
-	CreatedAt time.Time          `json:"created_at"`
-	UpdatedAt time.Time          `json:"updated_at"` // 最后活跃时间，TTL 过期判定依据
+	// ActivatedTools 会话内已激活（动态注入）的 TikHub 端点名（JSONB []string，
+	// migration 015）。激活顺序即注入顺序——append-only，保 FC 请求的缓存前缀稳定。
+	ActivatedTools json.RawMessage `json:"activated_tools"`
+	CreatedAt      time.Time       `json:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at"` // 最后活跃时间，TTL 过期判定依据
 }
 
 // PendingAction 待确认的写工具动作（pending_actions 表，M4 migration 005）。

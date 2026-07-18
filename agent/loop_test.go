@@ -155,7 +155,7 @@ func (f *fakeStore) CreateAgentSession(_ context.Context, userID int64) (*types.
 	return &cp, nil
 }
 
-func (f *fakeStore) UpdateAgentSession(_ context.Context, id int64, messages json.RawMessage, turnCount int) error {
+func (f *fakeStore) UpdateAgentSession(_ context.Context, id int64, messages json.RawMessage, turnCount int, activatedTools json.RawMessage) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	s, ok := f.sessions[id]
@@ -164,6 +164,7 @@ func (f *fakeStore) UpdateAgentSession(_ context.Context, id int64, messages jso
 	}
 	s.Messages = messages
 	s.TurnCount = turnCount
+	s.ActivatedTools = activatedTools
 	s.UpdatedAt = time.Now()
 	f.updateCalls++
 	f.lastMessages = messages

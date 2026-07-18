@@ -39,6 +39,8 @@ var wantTables = []string{
 	"page_snapshots",
 	// 013 A2A server 任务持久化
 	"a2a_tasks",
+	// 015 agent 工具调用记账（TikHub 端点注册表契约 §6）
+	"tool_calls",
 }
 
 // TestMigrationsCoverWantTables 是对账守卫（a2a-contract §9.5）：扫 migrations/*.sql 的
