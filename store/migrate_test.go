@@ -45,7 +45,7 @@ var wantTables = []string{
 // CREATE TABLE 集合里，但迁移跑完后不该存在，故不进 wantTables。
 // 单独列出而非默默忽略，是为了让"建了表却没记账"的守卫（下方双向对账）依然对
 // 真正的漏账生效——只豁免这里显式声明的、有意下线的表。
-//   - page_snapshots：011 为 page_watch 建，015 随 page_watch 下线删除。
+//   - page_snapshots：011 为 page_watch 建，016 随 page_watch 下线删除。
 var droppedTables = map[string]bool{
 	"page_snapshots": true,
 }

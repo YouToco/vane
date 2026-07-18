@@ -1,4 +1,5 @@
--- 015: 下线 page_watch —— 删除 page_snapshots 表
+-- 016: 下线 page_watch —— 删除 page_snapshots 表
+--   （原编号 015 与并行合并的 015_tool_calls 撞号，改 016；010 空缺同因，见 011 注释）
 --
 -- page_watch 页面监控能力已从代码移除（改由 Exa fetch 覆盖，见 CHANGELOG / M6 契约 §10）。
 -- 011 建的 page_snapshots 表随之成为无人读写的孤儿表，本迁移把它删除。

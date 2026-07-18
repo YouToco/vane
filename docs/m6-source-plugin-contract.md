@@ -1134,7 +1134,7 @@ Entities json.RawMessage `json:"entities"`
 ## 10. `web/page_watch` 实现（`fetcher/pagewatch.go`）
 
 > **⚠️ 本节整节已下线（`refactor/drop-page-watch`）。** `web/page_watch` 能力、
-> `fetcher/pagewatch.go`、`store/pagesnapshots.go`、`page_snapshots` 表（迁移 015 DROP）、
+> `fetcher/pagewatch.go`、`store/pagesnapshots.go`、`page_snapshots` 表（迁移 016 DROP）、
 > `types.CapPageWatch/KindChange/SnapshotVerdict/RefTypeSource/PageSnapshot` 均已从代码移除。
 > 页面变化监控改由 **Exa `/contents` fetch API** 覆盖（§10.1.1 早已给出这条方向），不再在
 > Go 侧自建抓取+基线 diff+LLM 门。**本节以下内容保留为历史设计记录**（解释当初为何这样设计、
