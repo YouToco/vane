@@ -2231,8 +2231,6 @@ func NewDepartmentIdBuilder() *DepartmentIdBuilder {
 	return builder
 }
 
-//
-//
 // 示例值：
 func (builder *DepartmentIdBuilder) DepartmentId(departmentId string) *DepartmentIdBuilder {
 	builder.departmentId = departmentId
@@ -2240,8 +2238,6 @@ func (builder *DepartmentIdBuilder) DepartmentId(departmentId string) *Departmen
 	return builder
 }
 
-//
-//
 // 示例值：
 func (builder *DepartmentIdBuilder) OpenDepartmentId(openDepartmentId string) *DepartmentIdBuilder {
 	builder.openDepartmentId = openDepartmentId
@@ -2391,7 +2387,7 @@ func NewCreateAppAvatarUploadReqBodyBuilder() *CreateAppAvatarUploadReqBodyBuild
 
 // 图片
 //
-//示例值：
+// 示例值：
 func (builder *CreateAppAvatarUploadReqBodyBuilder) Avatar(avatar io.Reader) *CreateAppAvatarUploadReqBodyBuilder {
 	builder.avatar = avatar
 	builder.avatarSet = true
@@ -2451,7 +2447,6 @@ func NewCreateAppAvatarUploadReqBuilder() *CreateAppAvatarUploadReqBuilder {
 	return builder
 }
 
-//
 func (builder *CreateAppAvatarUploadReqBuilder) Body(body *CreateAppAvatarUploadReqBody) *CreateAppAvatarUploadReqBuilder {
 	builder.body = body
 	return builder
@@ -2502,7 +2497,7 @@ func NewPatchApplicationAbilityReqBodyBuilder() *PatchApplicationAbilityReqBodyB
 
 // 网页应用
 //
-//示例值：
+// 示例值：
 func (builder *PatchApplicationAbilityReqBodyBuilder) WebApp(webApp *AppAbilityWeb) *PatchApplicationAbilityReqBodyBuilder {
 	builder.webApp = webApp
 	builder.webAppSet = true
@@ -2511,7 +2506,7 @@ func (builder *PatchApplicationAbilityReqBodyBuilder) WebApp(webApp *AppAbilityW
 
 // 机器人
 //
-//示例值：
+// 示例值：
 func (builder *PatchApplicationAbilityReqBodyBuilder) Bot(bot *AppAbilityBot) *PatchApplicationAbilityReqBodyBuilder {
 	builder.bot = bot
 	builder.botSet = true
@@ -2592,7 +2587,6 @@ func (builder *PatchApplicationAbilityReqBuilder) AppId(appId string) *PatchAppl
 	return builder
 }
 
-//
 func (builder *PatchApplicationAbilityReqBuilder) Body(body *PatchApplicationAbilityReqBody) *PatchApplicationAbilityReqBuilder {
 	builder.body = body
 	return builder
@@ -2644,7 +2638,7 @@ func NewPatchApplicationBaseReqBodyBuilder() *PatchApplicationBaseReqBodyBuilder
 
 // 应用名称描述多语种
 //
-//示例值：
+// 示例值：
 func (builder *PatchApplicationBaseReqBodyBuilder) I18ns(i18ns []*AppI18nInfo) *PatchApplicationBaseReqBodyBuilder {
 	builder.i18ns = i18ns
 	builder.i18nsSet = true
@@ -2653,7 +2647,7 @@ func (builder *PatchApplicationBaseReqBodyBuilder) I18ns(i18ns []*AppI18nInfo) *
 
 // 应用icon图片链接
 //
-//示例值：https://s3-imfile.feishucdn.com/static-resource/v1/v2_953a8fc1-50bd-4b2e-87e2-b09e47dba23g
+// 示例值：https://s3-imfile.feishucdn.com/static-resource/v1/v2_953a8fc1-50bd-4b2e-87e2-b09e47dba23g
 func (builder *PatchApplicationBaseReqBodyBuilder) AvatarUrl(avatarUrl string) *PatchApplicationBaseReqBodyBuilder {
 	builder.avatarUrl = avatarUrl
 	builder.avatarUrlSet = true
@@ -2662,7 +2656,7 @@ func (builder *PatchApplicationBaseReqBodyBuilder) AvatarUrl(avatarUrl string) *
 
 // 应用管理后台url链接
 //
-//示例值：https://open.feishu.cn/
+// 示例值：https://open.feishu.cn/
 func (builder *PatchApplicationBaseReqBodyBuilder) HomepageUrl(homepageUrl string) *PatchApplicationBaseReqBodyBuilder {
 	builder.homepageUrl = homepageUrl
 	builder.homepageUrlSet = true
@@ -2760,7 +2754,6 @@ func (builder *PatchApplicationBaseReqBuilder) AppId(appId string) *PatchApplica
 	return builder
 }
 
-//
 func (builder *PatchApplicationBaseReqBuilder) Body(body *PatchApplicationBaseReqBody) *PatchApplicationBaseReqBuilder {
 	builder.body = body
 	return builder
@@ -2826,7 +2819,7 @@ func NewPatchApplicationConfigReqBodyBuilder() *PatchApplicationConfigReqBodyBui
 
 // 权限配置
 //
-//示例值：
+// 示例值：
 func (builder *PatchApplicationConfigReqBodyBuilder) Scope(scope *AppConfigScope) *PatchApplicationConfigReqBodyBuilder {
 	builder.scope = scope
 	builder.scopeSet = true
@@ -2835,7 +2828,7 @@ func (builder *PatchApplicationConfigReqBodyBuilder) Scope(scope *AppConfigScope
 
 // 事件配置
 //
-//示例值：
+// 示例值：
 func (builder *PatchApplicationConfigReqBodyBuilder) Event(event *AppConfigEvent) *PatchApplicationConfigReqBodyBuilder {
 	builder.event = event
 	builder.eventSet = true
@@ -2844,7 +2837,7 @@ func (builder *PatchApplicationConfigReqBodyBuilder) Event(event *AppConfigEvent
 
 // 安全配置
 //
-//示例值：
+// 示例值：
 func (builder *PatchApplicationConfigReqBodyBuilder) Security(security *AppConfigSecurity) *PatchApplicationConfigReqBodyBuilder {
 	builder.security = security
 	builder.securitySet = true
@@ -2853,7 +2846,7 @@ func (builder *PatchApplicationConfigReqBodyBuilder) Security(security *AppConfi
 
 // 可见性范围配置
 //
-//示例值：
+// 示例值：
 func (builder *PatchApplicationConfigReqBodyBuilder) Visibility(visibility *AppConfigVisibility) *PatchApplicationConfigReqBodyBuilder {
 	builder.visibility = visibility
 	builder.visibilitySet = true
@@ -2862,7 +2855,7 @@ func (builder *PatchApplicationConfigReqBodyBuilder) Visibility(visibility *AppC
 
 // 通讯录权限范围配置
 //
-//示例值：
+// 示例值：
 func (builder *PatchApplicationConfigReqBodyBuilder) Contacts(contacts *AppConfigContactsRange) *PatchApplicationConfigReqBodyBuilder {
 	builder.contacts = contacts
 	builder.contactsSet = true
@@ -2871,7 +2864,7 @@ func (builder *PatchApplicationConfigReqBodyBuilder) Contacts(contacts *AppConfi
 
 // 事件与回调加密策略
 //
-//示例值：
+// 示例值：
 func (builder *PatchApplicationConfigReqBodyBuilder) EventAndCallbackEncryptStrategy(eventAndCallbackEncryptStrategy *EventAndCallbackEncryptStrategy) *PatchApplicationConfigReqBodyBuilder {
 	builder.eventAndCallbackEncryptStrategy = eventAndCallbackEncryptStrategy
 	builder.eventAndCallbackEncryptStrategySet = true
@@ -2880,7 +2873,7 @@ func (builder *PatchApplicationConfigReqBodyBuilder) EventAndCallbackEncryptStra
 
 // 回调配置
 //
-//示例值：
+// 示例值：
 func (builder *PatchApplicationConfigReqBodyBuilder) Callback(callback *AppConfigCallback) *PatchApplicationConfigReqBodyBuilder {
 	builder.callback = callback
 	builder.callbackSet = true
@@ -3062,7 +3055,6 @@ func (builder *PatchApplicationConfigReqBuilder) UserIdType(userIdType string) *
 	return builder
 }
 
-//
 func (builder *PatchApplicationConfigReqBuilder) Body(body *PatchApplicationConfigReqBody) *PatchApplicationConfigReqBuilder {
 	builder.body = body
 	return builder
@@ -3131,7 +3123,7 @@ func NewCreateApplicationPublishReqBodyBuilder() *CreateApplicationPublishReqBod
 
 // 移动端默认能力
 //
-//示例值：gadget
+// 示例值：gadget
 func (builder *CreateApplicationPublishReqBodyBuilder) MobileDefaultAbility(mobileDefaultAbility string) *CreateApplicationPublishReqBodyBuilder {
 	builder.mobileDefaultAbility = mobileDefaultAbility
 	builder.mobileDefaultAbilitySet = true
@@ -3140,7 +3132,7 @@ func (builder *CreateApplicationPublishReqBodyBuilder) MobileDefaultAbility(mobi
 
 // PC端默认能力
 //
-//示例值：gadget
+// 示例值：gadget
 func (builder *CreateApplicationPublishReqBodyBuilder) PcDefaultAbility(pcDefaultAbility string) *CreateApplicationPublishReqBodyBuilder {
 	builder.pcDefaultAbility = pcDefaultAbility
 	builder.pcDefaultAbilitySet = true
@@ -3149,7 +3141,7 @@ func (builder *CreateApplicationPublishReqBodyBuilder) PcDefaultAbility(pcDefaul
 
 // 申请理由
 //
-//示例值：更新了移动端默认应用能力
+// 示例值：更新了移动端默认应用能力
 func (builder *CreateApplicationPublishReqBodyBuilder) Remark(remark string) *CreateApplicationPublishReqBodyBuilder {
 	builder.remark = remark
 	builder.remarkSet = true
@@ -3158,7 +3150,7 @@ func (builder *CreateApplicationPublishReqBodyBuilder) Remark(remark string) *Cr
 
 // 更新描述
 //
-//示例值：更新了小程序的头像
+// 示例值：更新了小程序的头像
 func (builder *CreateApplicationPublishReqBodyBuilder) Changelog(changelog string) *CreateApplicationPublishReqBodyBuilder {
 	builder.changelog = changelog
 	builder.changelogSet = true
@@ -3167,7 +3159,7 @@ func (builder *CreateApplicationPublishReqBodyBuilder) Changelog(changelog strin
 
 // 应用版本号
 //
-//示例值：1.1.1
+// 示例值：1.1.1
 func (builder *CreateApplicationPublishReqBodyBuilder) Version(version string) *CreateApplicationPublishReqBodyBuilder {
 	builder.version = version
 	builder.versionSet = true
@@ -3299,7 +3291,6 @@ func (builder *CreateApplicationPublishReqBuilder) AppId(appId string) *CreateAp
 	return builder
 }
 
-//
 func (builder *CreateApplicationPublishReqBuilder) Body(body *CreateApplicationPublishReqBody) *CreateApplicationPublishReqBuilder {
 	builder.body = body
 	return builder

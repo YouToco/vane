@@ -17,11 +17,11 @@ import (
 // runstatsResp 是 GET /api/admin/runstats 的响应体。
 // days/models 复用探针 ⑥ 的两个既有聚合（同一份 SQL，不做平行实现）。
 type runstatsResp struct {
-	GeneratedAt time.Time            `json:"generated_at"` // UTC
-	WindowHours int                  `json:"window_hours"`
-	Spans       []store.SpanRunStat  `json:"spans"`
-	Days        []types.SpanDayCost  `json:"days"`
-	Models      []types.ModelUsage   `json:"models"`
+	GeneratedAt time.Time           `json:"generated_at"` // UTC
+	WindowHours int                 `json:"window_hours"`
+	Spans       []store.SpanRunStat `json:"spans"`
+	Days        []types.SpanDayCost `json:"days"`
+	Models      []types.ModelUsage  `json:"models"`
 }
 
 // handleRunstats 返回窗口内的运行统计。

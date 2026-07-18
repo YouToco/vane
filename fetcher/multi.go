@@ -19,11 +19,12 @@ import (
 
 // Multi 持有各类型抓取器。零外部状态，多 goroutine 可并发复用。
 type Multi struct {
-	rss     *Fetcher
-	exa     *ExaFetcher
-	tikhub  *TikHubFetcher
-	xhsUser *XHSUserFetcher
-	twitter *TwitterFetcher
+	rss         *Fetcher
+	exa         *ExaFetcher
+	exaContents *ExaContentsFetcher
+	tikhub      *TikHubFetcher
+	xhsUser     *XHSUserFetcher
+	twitter     *TwitterFetcher
 }
 
 // NewMulti 按抓取配置构造全部抓取器。未配置 key 的信源类型仍会构造
@@ -34,11 +35,12 @@ type Multi struct {
 // 摘要——不改善，但也不比补全上线前更差。xhs/user_posts 不做详情补全，不受 seen 影响。
 func NewMulti(cfg config.FetchConfig, seen SeenChecker) *Multi {
 	return &Multi{
-		rss:     New(cfg),
-		exa:     NewExa(cfg),
-		tikhub:  NewTikHub(cfg, seen),
-		xhsUser: NewXHSUser(cfg),
-		twitter: NewTwitter(cfg),
+		rss:         New(cfg),
+		exa:         NewExa(cfg),
+		exaContents: NewExaContents(cfg),
+		tikhub:      NewTikHub(cfg, seen),
+		xhsUser:     NewXHSUser(cfg),
+		twitter:     NewTwitter(cfg),
 	}
 }
 
@@ -67,6 +69,8 @@ func (m *Multi) Fetch(ctx context.Context, src types.Source) ([]types.ContentIte
 			return m.rss.FetchRSS(ctx, src)
 		case types.CapSearch:
 			return m.exa.Fetch(ctx, src)
+		case types.CapContents:
+			return m.exaContents.Fetch(ctx, src)
 		}
 
 	case types.PlatformXHS:

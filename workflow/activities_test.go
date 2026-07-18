@@ -739,3 +739,41 @@ func TestRenderSourcesDisabledAlert(t *testing.T) {
 		}
 	}
 }
+
+// TestDedup_PageContentExemptFromSimhash 钉死 web/contents 的核心正确性（对抗审查 CRITICAL）：
+// KindPageContent 内容豁免 simhash 近似去重。否则同一定价页相邻版本正文几乎相同、simhash
+// 距离必 ≤ 阈值，"价格变化"会被当近重复吞掉、永远推不出去——这正是 page_watch 当年的事故。
+// 对照子测试证明 simhash 确实会吞掉相同正文的 article，豁免不是空操作。
+func TestDedup_PageContentExemptFromSimhash(t *testing.T) {
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil)
+	mk := func(kind types.Kind, ck string) types.ContentItem {
+		// 两条正文逐字相同 → simhash 距离 0 → 必触发近似去重（除非豁免）。
+		return types.ContentItem{Title: "定价页", Content: "gpt-5 价格 30 输出 60 缓存 3", Kind: kind, CanonicalKey: ck}
+	}
+
+	t.Run("page_content 豁免近似去重", func(t *testing.T) {
+		out, err := a.Dedup(context.Background(), DedupIn{UserID: 1, Items: []types.ContentItem{
+			mk(types.KindArticle, "a1"),                  // 首个 article：kept + 进 batchSeen
+			mk(types.KindPageContent, "contents://u#v2"), // 与前者 simhash 距离 0，但 page_content 豁免
+		}})
+		if err != nil {
+			t.Fatalf("Dedup 失败: %v", err)
+		}
+		if len(out) != 2 {
+			t.Fatalf("page_content 应豁免、两条都保留，实得 %d 条：%+v", len(out), out)
+		}
+	})
+
+	t.Run("对照_相同正文的article被吞", func(t *testing.T) {
+		out, err := a.Dedup(context.Background(), DedupIn{UserID: 1, Items: []types.ContentItem{
+			mk(types.KindArticle, "a1"),
+			mk(types.KindArticle, "a2"), // 与前者正文逐字相同 → 被首个吞
+		}})
+		if err != nil {
+			t.Fatalf("Dedup 失败: %v", err)
+		}
+		if len(out) != 1 {
+			t.Fatalf("相同正文的 article 应被近似去重吞掉、只剩 1 条（证明豁免非空操作），实得 %d 条", len(out))
+		}
+	})
+}

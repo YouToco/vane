@@ -62,12 +62,12 @@ func NewExa(cfg config.FetchConfig) *ExaFetcher {
 
 // exaSourceConfig 是 Exa 信源的 config JSONB 结构。query 必填，其余可选。
 type exaSourceConfig struct {
-	Query          string   `json:"query"`                      // 搜索词，必填
-	Category       string   `json:"category,omitempty"`         // 结果类别，如 "news"（留空则不限）
-	Type           string   `json:"type,omitempty"`             // 搜索模式，默认 "auto"
-	NumResults     int      `json:"num_results,omitempty"`      // 取回条数，默认 10、上限 100
-	LookbackDays   int      `json:"lookback_days,omitempty"`    // >0 时只取最近 N 天；0 或 <0 不过滤
-	IncludeDomains []string `json:"include_domains,omitempty"`  // 限定结果域名白名单
+	Query          string   `json:"query"`                     // 搜索词，必填
+	Category       string   `json:"category,omitempty"`        // 结果类别，如 "news"（留空则不限）
+	Type           string   `json:"type,omitempty"`            // 搜索模式，默认 "auto"
+	NumResults     int      `json:"num_results,omitempty"`     // 取回条数，默认 10、上限 100
+	LookbackDays   int      `json:"lookback_days,omitempty"`   // >0 时只取最近 N 天；0 或 <0 不过滤
+	IncludeDomains []string `json:"include_domains,omitempty"` // 限定结果域名白名单
 }
 
 // exaRequest 是 POST /search 请求体（字段名对齐 Exa API）。

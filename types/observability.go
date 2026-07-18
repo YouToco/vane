@@ -33,10 +33,10 @@ type ScoreTraceStat struct {
 // ScoreQualityStat 是打分质量的窗口统计（探针 ②③）。
 //
 // 四个计数的关系（llm/do.go 的真值表，缺一不可）：
-//   - OKTotal   = error='' 的行，即"模型确实答了"。它是回退率的分母。
+//   - OKTotal   = error=” 的行，即"模型确实答了"。它是回退率的分母。
 //   - NoDigit   ⊂ OKTotal：答了但没数字 → parseScore 失败 → 静默回退中位分 50。
 //   - EmptyNoError ⊂ NoDigit：答了但完全为空 → M3 事故的精确形状（thinking 吃光预算）。
-//   - Errored   = error<>'' 的行，与上面三者互斥：调用本身失败，
+//   - Errored   = error<>” 的行，与上面三者互斥：调用本身失败，
 //     该条目被 Score 活动的"单条打分失败，跳过"分支直接跳过，**没有发出任何分数**。
 //
 // 契约 §16 原文"completion 无数字占比"未限定 error，会把 Errored 也算成回退——

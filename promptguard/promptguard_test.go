@@ -68,7 +68,11 @@ func TestSanitizeExactOutput(t *testing.T) {
 }
 
 func TestTruncateRunes(t *testing.T) {
-	cases := []struct{ in string; n int; want string }{
+	cases := []struct {
+		in   string
+		n    int
+		want string
+	}{
 		{"中文内容测试", 3, "中文内"},
 		{"短", 10, "短"},
 		{"", 5, ""},

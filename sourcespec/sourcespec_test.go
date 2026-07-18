@@ -2,6 +2,7 @@ package sourcespec
 
 import (
 	"encoding/json"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -210,6 +211,32 @@ func TestBuild_XSearchUnavailable(t *testing.T) {
 func TestBuild_UnknownPlatform(t *testing.T) {
 	if _, msg := Build(Spec{Platform: "carrier_pigeon", Capability: "user_posts"}); msg == "" {
 		t.Error("未知 platform 应被拒绝")
+	}
+}
+
+func TestBuild_WebContents(t *testing.T) {
+	src, msg := Build(Spec{Platform: "web", Capability: "contents",
+		Params: map[string]string{"url": "https://x.com/pricing", "title": "定价监控"}})
+	if msg != "" {
+		t.Fatalf("合法 web/contents 请求不应报错: %s", msg)
+	}
+	if src.Platform != types.PlatformWeb || src.Capability != types.CapContents {
+		t.Errorf("应映射到 web/contents，实际 %s/%s", src.Platform, src.Capability)
+	}
+	if src.URL != "vane://web/contents?url="+url.QueryEscape("https://x.com/pricing") {
+		t.Errorf("幂等键不符: %s", src.URL)
+	}
+	var cfg map[string]string
+	if json.Unmarshal(src.Config, &cfg); cfg["url"] != "https://x.com/pricing" || cfg["title"] != "定价监控" {
+		t.Errorf("config 不符: %s", src.Config)
+	}
+	// 缺 url 应报错。
+	if _, msg := Build(Spec{Platform: "web", Capability: "contents", Params: map[string]string{}}); msg == "" {
+		t.Error("web/contents 缺 url 应被拒绝")
+	}
+	// 非法 url 应报错。
+	if _, msg := Build(Spec{Platform: "web", Capability: "contents", Params: map[string]string{"url": "not-a-url"}}); msg == "" {
+		t.Error("web/contents 非法 url 应被拒绝")
 	}
 }
 

@@ -148,10 +148,10 @@ const addSourceSchema = `{
     },
     "capability": {
       "type": "string",
-      "enum": ["feed", "search", "user_posts"],
-      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主）。当前不支持的能力及原因见本工具说明（Description）。"
+      "enum": ["feed", "search", "user_posts", "contents"],
+      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主）；contents=监控指定网页内容变化（仅 web，如产品定价页——内容变了才推送）。当前不支持的能力及原因见本工具说明（Description）。"
     },
-    "url": {"type": "string", "description": "RSS 源地址（http/https），platform=web capability=feed 时必填"},
+    "url": {"type": "string", "description": "网页地址（http/https）：platform=web capability=feed 时是 RSS 源地址，capability=contents 时是要监控变化的页面地址，均必填"},
     "query": {"type": "string", "description": "Exa 搜索词，platform=web capability=search 时必填"},
     "keyword": {"type": "string", "description": "小红书搜索关键词，platform=xhs capability=search 时必填"},
     "screen_name": {"type": "string", "description": "X 用户名（如 OpenAI），platform=x capability=user_posts 时必填"},
@@ -169,7 +169,7 @@ type addSourceTool struct {
 
 func (t *addSourceTool) Name() string { return "add_source" }
 func (t *addSourceTool) Description() string {
-	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts）。" +
+	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts/contents）。" +
 		unavailableCapabilitiesNote()
 }
 

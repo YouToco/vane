@@ -946,7 +946,7 @@ var postTextTags = map[string]bool{"text": true, "md": true, "code_block": true,
 // 以换行分隔，title 非空时作首行；段落内部空白原样保留（粘贴代码的缩进
 // 有意义），仅对拼接结果做一次首尾 TrimSpace——与 text 路径的
 // parseTextContent 对整条消息的归一化一致。post 的 @ 是结构化 at 节点
-//（占位符在其 user_id 字段），正文不会出现 "@_user_N"，因此不做 text
+// （占位符在其 user_id 字段），正文不会出现 "@_user_N"，因此不做 text
 // 消息那样的 mentionRe 剥离——粘贴内容恰好含该字样时不能误删。
 // 没有任何文字（纯图片等）返回空串，由调用方回退提示文案。
 func parsePostContent(raw string) string {
