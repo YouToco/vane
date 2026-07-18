@@ -3,7 +3,10 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/YouToco/vane/dedup"
@@ -28,6 +31,22 @@ const maxScoreCandidates = 50
 // 全局窗口按 fetched_at DESC 截断时，高产源（tikhub 单页 20 条/轮 + exa 10 条/轮）
 // 会把先抓的低产 RSS 源永远挤出窗口；按源限额保证每源都有配额进入打分。
 const maxPerSourceCandidates = 20
+
+// alertFetchFailThreshold 是"连续失败几次触发一次主动告警"的阈值（功能 5.2）。
+// sources.fail_count 每个包含该源的调度轮 +1、任一次抓成清零，故它就是"连续失败
+// streak"。只在 fail_count 恰好等于本阈值那一轮发一次告警（见 markFetchResult 返回值）：
+// 跨阈后每轮恒真，若"≥阈值就发"会每轮刷屏；"恰好等于"让每个失败 streak 只告警一次，
+// 源恢复（fail_count 归零）后再坏可再次告警。取 3：滤掉单次瞬时抖动，又不至于坏太久
+// 才通知。5.2 定为仅告警 MVP——不顺带做 status=disabled 自动停用（那要配套重启用入口）。
+// 单用户 MVP 用常量；将来要按源/按用户可调再提到 config。
+//
+// 已知局限（单用户 MVP 容忍）：fail_count 是读-改-写（markFetchResult 读 src.FailCount
+// 再 SET +1，非 DB 侧原子自增），故若两条 pipeline run 并发重叠（如"现在推"按钮 run 与
+// 定时轮同时——定时用 SKIP overlap、agent 用确定性 ID 都互斥，唯 adhoc 按钮无并发护栏），
+// 可能各自读到同值、各算到阈值、各发一张卡 → 同一 streak 多一张告警（不损数据、不漏报）。
+// 多用户/高频触发前根治：把跨阈判定下沉为 DB 侧原子 `UPDATE ... RETURNING fail_count`，
+// 或给告警加幂等键。
+const alertFetchFailThreshold = 3
 
 // ============================================================
 // 消费方接口：本包只依赖这些窄接口，具体实现（fetcher/scorer/cardgen/
@@ -126,14 +145,21 @@ type Activities struct {
 	// 函数注入而非 import feishu：feishu→agent→workflow 依赖链已存在，
 	// 本包直接依赖 feishu 即成 import 环（契约 §8.2 CRITICAL）。
 	buildCard func(input feedback.CardInput) string
+	// buildNotice 构造无按钮的普通通知卡（生产装配传 feishu.BuildReplyCard），
+	// 用于抓取失败主动告警（功能 5.2）。同理走注入避开 import 环。刻意与 buildCard
+	// 分开：告警卡不带任何反馈按钮/回调，绝不复用 M5 的 delivery 卡结构（5.2 不碰
+	// 卡片反馈路径）。nil = 抓取失败告警退化为静默 no-op（灰度/测试装配）。
+	buildNotice func(markdown string) string
 }
 
 // NewActivities 装配 Activities。前六参顺序与规格 B6"持有 fetcher/scorer/
-// cardgen/pusher/store/feishuMgr"一致；ev 可为 nil（演化灰度关闭）。
+// cardgen/pusher/store/feishuMgr"一致；ev 可为 nil（演化灰度关闭）；
+// buildNotice 可为 nil（抓取失败告警退化为 no-op）。
 func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, fs FeishuManager,
-	ev ProfileEvolver, buildCard func(input feedback.CardInput) string) *Activities {
+	ev ProfileEvolver, buildCard func(input feedback.CardInput) string,
+	buildNotice func(markdown string) string) *Activities {
 	return &Activities{fetcher: f, scorer: sc, cardgen: cg, pusher: p, store: st, feishu: fs,
-		evolver: ev, buildCard: buildCard}
+		evolver: ev, buildCard: buildCard, buildNotice: buildNotice}
 }
 
 // ============================================================
@@ -233,13 +259,23 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	// TikHub 详情补全的付费闸门查的是库里已补全的 canonical_key（fetcher.SeenChecker）。
 	// 同一 run 内源 A 补全的笔记当场入库，源 B 抓到同一篇时闸门才命中、跳过付费；
 	// 若把入库推迟到循环之后，源 B 查库时 A 的内容还没落地，同一篇笔记会被重复付费。
+	var alertable []fetchFailure // 本轮"恰好"连续失败达告警阈值的源，循环后批量告警一次（功能 5.2）。
 	for _, src := range sources {
 		items, ferr := a.fetcher.Fetch(ctx, src)
 		if ferr != nil {
 			// 单源失败不拖垮整批：某个源挂了不该让当次推送整体失败；
 			// 同时自增 fail_count 并推进 next_fetch_at，避免调度紧循环重试。
-			a.markFetchResult(ctx, src, false)
+			crossed := a.markFetchResult(ctx, src, false)
 			slog.Warn("fetch: 单源抓取失败，跳过", "source_id", src.ID, "platform", src.Platform, "capability", src.Capability, "url", src.URL, "err", ferr)
+			if crossed {
+				// 恰好连续失败达阈值这一轮：收集，循环后合并成一张卡告警（功能 5.2）。
+				// src.FailCount 此刻仍是旧值，新计数=src.FailCount+1（=阈值）。
+				alertable = append(alertable, fetchFailure{
+					src:       src,
+					failCount: src.FailCount + 1,
+					reason:    fetchFailureReason(ferr),
+				})
+			}
 			continue
 		}
 		for i := range items {
@@ -257,6 +293,11 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 		a.markFetchResult(ctx, src, true) // 成功：清零 fail_count、推进 last/next_fetch_at。
 	}
 
+	// 本轮有源恰好连续失败达阈值 → 给 owner 发一张汇总告警卡（功能 5.2）。
+	// 放在返回候选之前、与推送早退无关：即便本轮全源挂掉（下方候选为空、workflow
+	// 走空批次早退），告警也已在此发出。best-effort，失败只 warn 不拖垮推送。
+	a.alertFetchFailures(ctx, alertable)
+
 	// 返回"未投递候选"而非"本次新入库"，让 Fetch 重试幂等可续（修 #3）；
 	// 全局上限 + 每源配额双重截断，控制单批打分规模且防高产源饿死低产源（修 #6）。
 	return a.store.ListUnpushedByUser(ctx, p.UserID, maxScoreCandidates, maxPerSourceCandidates)
@@ -267,9 +308,14 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 //   - ok=false：fail_count 自增，保留上次 last_fetched_at（本次没抓成不算"抓过"），
 //     next_fetch_at 仍推进一个 interval——否则调度下一 tick 会立刻重试，形成紧循环。
 //
-// M3 先不做"fail_count 达阈值自动 disabled"：UpdateSourceFetchState 签名不含 status，
-// 留待后续扩参或另走一条更新路径（见 TODO），当前只保证抓取状态被真实推进。
-func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok bool) {
+// 返回 crossedAlertThreshold=本轮 fail_count 恰好跨过告警阈值（功能 5.2）：仅失败分支
+// 且 failCount==alertFetchFailThreshold 且状态成功落库时为 true——调用方据此发一次告警。
+// gate 在落库成功之上：若 UpdateSourceFetchState 失败，fail_count 没推进，下轮会再次算到
+// 阈值，此时告警会错乱重复，故落库失败一律不告警（保持"恰好一次"不变量）。
+//
+// 5.2 定为仅告警 MVP，不做"fail_count 达阈值自动 disabled"（那要配套重启用入口）：
+// UpdateSourceFetchState 签名不含 status，保留原样，只在跨阈时向 owner 告警。
+func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok bool) (crossedAlertThreshold bool) {
 	now := time.Now()
 	nextFetch := now.Add(time.Duration(src.FetchIntervalSeconds) * time.Second)
 
@@ -282,11 +328,71 @@ func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok b
 		if src.LastFetchedAt != nil {
 			lastFetched = *src.LastFetchedAt // 保留上次成功抓取时间（从未抓过则为零值）。
 		}
-		// TODO(M3+): failCount 达阈值时置 status=disabled（需扩 UpdateSourceFetchState 或另一路径）。
+		crossedAlertThreshold = failCount == alertFetchFailThreshold
 	}
 	if err := a.store.UpdateSourceFetchState(ctx, src.ID, lastFetched, nextFetch, failCount); err != nil {
 		slog.Warn("fetch: 更新抓取状态失败", "source_id", src.ID, "err", err)
+		return false // 状态未落库：不告警，避免下轮重复算到阈值再报。
 	}
+	return crossedAlertThreshold
+}
+
+// fetchFailure 承载一个"连续失败恰好达告警阈值"的信源及其对 owner 可见的失败原因（功能 5.2）。
+type fetchFailure struct {
+	src       types.Source
+	failCount int    // 本轮跨阈后的连续失败次数（= src.FailCount+1，等于阈值）。
+	reason    string // 面向 owner 的可读原因（已按红线3 从 AppError.Message 提取）。
+}
+
+// fetchFailureReason 从抓取错误里提取面向 owner 的可读原因（红线3：不外泄裸错误链）。
+// 取 AppError.Message（各 fetcher 在自己的转换点写的人读描述），无 AppError 时给中性兜底。
+func fetchFailureReason(err error) string {
+	var ae *types.AppError
+	if errors.As(err, &ae) && ae.Message != "" {
+		return ae.Message
+	}
+	return "抓取失败（未知原因）"
+}
+
+// alertFetchFailures 给 owner 发一张汇总告警卡，列出本轮连续失败达阈值的信源（功能 5.2）。
+// best-effort：无失败源 / 未注入构卡器 / 未捕获 owner / 发送失败，一律静默或只 warn，
+// 绝不让告警把抓取或推送管道拖挂（与 EvolveProfile warn-only、"不制造假失败告警"同一红线）。
+// 走 pusher.Push（= feishu SendCard 主动新消息）+ 注入的 buildNotice（= BuildReplyCard，
+// 无按钮卡），与 M5 卡片反馈路径完全隔离。
+func (a *Activities) alertFetchFailures(ctx context.Context, failures []fetchFailure) {
+	if len(failures) == 0 {
+		return
+	}
+	if a.buildNotice == nil {
+		return // 未注入告警卡构造器（灰度/测试）：静默 no-op。
+	}
+	owner := a.feishu.OwnerOpenID()
+	if owner == "" {
+		return // 尚未捕获 owner：无收件人，静默跳过（同 Push 对无 owner 的处理）。
+	}
+	card := a.buildNotice(renderFetchFailureAlert(failures))
+	if _, err := a.pusher.Push(ctx, owner, card); err != nil {
+		slog.Warn("fetch: 抓取失败告警发送失败（不影响推送）", "count", len(failures), "err", err)
+	}
+}
+
+// renderFetchFailureAlert 把失败源列表渲染成告警卡的 markdown 正文（功能 5.2）。
+func renderFetchFailureAlert(failures []fetchFailure) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**⚠️ 信源抓取失败告警**\n\n以下信源已连续失败达 %d 次，可能已失效，建议检查：\n", alertFetchFailThreshold)
+	for _, f := range failures {
+		title := f.src.Title
+		if title == "" {
+			title = f.src.URL // 没标题的源（如裸 RSS）退回用 URL 指代。
+		}
+		fmt.Fprintf(&b, "\n**%s**（%s / %s）· 连续失败 %d 次\n原因：%s\n",
+			title, f.src.Platform, f.src.Capability, f.failCount, f.reason)
+		if f.src.URL != "" {
+			fmt.Fprintf(&b, "链接：%s\n", f.src.URL)
+		}
+	}
+	b.WriteString("\n修复来源后会在下次抓取自动恢复；持续失败不影响其它信源正常推送。")
+	return b.String()
 }
 
 // Dedup 做近似去重：精确去重（canonical_key）已在 Fetch 的 UpsertContentItem

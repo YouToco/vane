@@ -107,7 +107,10 @@ func run() error {
 	// 构卡函数注入而非 workflow 直接 import feishu：feishu→agent→workflow 依赖链
 	// 已存在，直接调用会成环（M5 契约 §8.2）。
 	ev := evolver.New(llmClient, recorder, st)
-	activities := workflow.NewActivities(fetch, score, cards, push, st, manager, ev, feishu.BuildDeliveryCard)
+	// buildNotice=feishu.BuildReplyCard：抓取失败告警走无按钮的普通卡（功能 5.2），
+	// 与 buildCard（带反馈按钮的 delivery 卡）分开注入，不碰 M5 卡片反馈路径。
+	activities := workflow.NewActivities(fetch, score, cards, push, st, manager, ev,
+		feishu.BuildDeliveryCard, feishu.BuildReplyCard)
 
 	// worker：非阻塞 Start，关停时 Stop()（见下方顺序关停）。
 	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, worker.Options{})
