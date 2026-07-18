@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+### Changed
+- **代码审计整改批次一**（`chore/audit-cleanup-batch`）：
+  - **D-3** 移除 agent `add_source` 的 legacy `type` enum（`rss/exa/tikhub_xhs`）与相随的
+    BuildLegacy/SourceType 分支——违反 M6 §13.1【硬约束】（legacy 只服务 HTTP api 的
+    vane-web 兼容，绝不进 agent，否则模型会说「已添加 tikhub_xhs 源」）。HTTP 侧 BuildLegacy 保留。
+  - **D-4** 修正 `PushScope.SourceIDs` 注释：诚实说明它只约束抓取、不过滤候选（非「只推这些源」）。
+  - **R-5** 删除死方法 `scheduler.UpdatePushSpec` / `TriggerNow` 及 `api.Scheduler` 接口对应声明
+    （无路由无调用，且 UpdatePushSpec 埋着「只改 Temporal 不回写镜像」的漂移隐患）。
+  - **M-3** 补 agent 工具测试：抽出纯函数 `specFromArgs` 并逐 capability 守住入参→params 映射
+    （此前 `add_source` 持具体 store 不可 fake、映射零测试），另补 6 个工具的 Summarize 覆盖。
+
 ### Removed
 - **下线 `web/page_watch` 页面变化监控能力**（`refactor/drop-page-watch`）：改由 Exa `/contents`
   fetch API 覆盖，不再在 Go 侧自建抓取 + 基线 diff + LLM 重要性门。移除范围——

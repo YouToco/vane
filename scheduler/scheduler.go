@@ -191,34 +191,6 @@ func (s *Scheduler) TriggerPushNow(ctx context.Context, userID int64) (string, e
 	return run.GetID(), nil
 }
 
-// UpdatePushSpec 更新已有调度的触发频率。逐字段改写 Spec（而非整体替换）：
-// 无论 SDK 里 Schedule.Spec 是值还是指针，字段赋值都自动解引用；同时把 cron
-// 与 interval 两组字段都写入（互斥、另一组置空），实现 cron⇄interval 切换。
-func (s *Scheduler) UpdatePushSpec(ctx context.Context, schedID string, spec ScheduleSpec) error {
-	if err := validateSpec(spec); err != nil {
-		return err
-	}
-	sdkSpec, err := translateSpec(spec)
-	if err != nil {
-		return err
-	}
-
-	h := s.c.ScheduleClient().GetHandle(ctx, schedID)
-	err = h.Update(ctx, client.ScheduleUpdateOptions{
-		DoUpdate: func(in client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
-			sched := in.Description.Schedule
-			sched.Spec.CronExpressions = sdkSpec.CronExpressions
-			sched.Spec.Intervals = sdkSpec.Intervals
-			sched.Spec.TimeZoneName = sdkSpec.TimeZoneName
-			return &client.ScheduleUpdate{Schedule: &sched}, nil
-		},
-	})
-	if err != nil {
-		return types.NewAppError(types.CodeInternal, "更新定时任务失败", err)
-	}
-	return nil
-}
-
 // DeletePush 删除调度：先 Temporal Delete，再删镜像（镜像删除失败只 slog）。
 func (s *Scheduler) DeletePush(ctx context.Context, schedID string) error {
 	h := s.c.ScheduleClient().GetHandle(ctx, schedID)
@@ -227,15 +199,6 @@ func (s *Scheduler) DeletePush(ctx context.Context, schedID string) error {
 	}
 	if err := s.st.DeleteSchedule(ctx, schedID); err != nil {
 		slog.Error("scheduler: schedules 镜像删除失败（Temporal 已删除）", "schedule_id", schedID, "err", err)
-	}
-	return nil
-}
-
-// TriggerNow 让一个已存在的定时任务立即跑一次（不影响其后续排期）。
-func (s *Scheduler) TriggerNow(ctx context.Context, schedID string) error {
-	h := s.c.ScheduleClient().GetHandle(ctx, schedID)
-	if err := h.Trigger(ctx, client.ScheduleTriggerOptions{}); err != nil {
-		return types.NewAppError(types.CodeInternal, "触发定时任务失败", err)
 	}
 	return nil
 }

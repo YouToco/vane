@@ -29,9 +29,16 @@ type PushParams struct {
 	Scope  PushScope `json:"scope"`
 }
 
-// PushScope 推送范围过滤。SourceIDs 为空表示该用户全部 active 订阅。
+// PushScope 推送范围过滤。
+//
+// ⚠️ SourceIDs 目前只约束「本轮去抓哪些源」（Fetch Activity 的 filterSources），
+// 不约束候选检索——候选一律走 ListUnpushedByUser 捞该用户全部订阅的未投递内容。
+// 即：非空 SourceIDs = 只抓这些源，但推的是所有源的积压，不是「只推这些源」。
+// 当前生产调用方（agent push_now、前端）都传零值 scope，故此语义差异未暴露；
+// 若将来要「真正只推指定源」，需给 ListUnpushedByUser 加 sourceIDs 过滤参数，
+// 别指望改这里的注释就够（见代码审计 D-4）。
 type PushScope struct {
-	SourceIDs []int64 `json:"source_ids,omitempty"` // 空=全部订阅；非空=只推这些源
+	SourceIDs []int64 `json:"source_ids,omitempty"` // 空=全部订阅；非空=只【抓取】这些源（见上：不过滤候选）
 	TopN      int     `json:"top_n,omitempty"`      // 每批最多推几条；0=defaultTopN
 }
 
