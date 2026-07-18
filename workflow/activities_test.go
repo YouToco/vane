@@ -812,3 +812,41 @@ func TestDedup_PageContentExemptFromSimhash(t *testing.T) {
 		}
 	})
 }
+
+// TestPush_ByteSplitting 字节护栏：构出的卡超 aggMaxCardBytes 时对半拆直到放得下；
+// 单条仍超限硬发不丢。初版实现在这里死循环（对半结果被循环顶部重算丢弃）——
+// 本用例同时是终止性回归锁。
+func TestPush_ByteSplitting(t *testing.T) {
+	st := &fakeStore{nextDelID: 0}
+	push := &fakePusher{msgID: "om_bytes"}
+	var chunkSizes []int
+	// 假构卡：体积正比于条数——2 条 30KB 超限，1 条 15KB 放得下。
+	buildAgg := func(in feedback.AggregateCardInput) string {
+		chunkSizes = append(chunkSizes, len(in.Items))
+		return strings.Repeat("x", len(in.Items)*15*1024)
+	}
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil, buildAgg, nil)
+
+	cards := []GeneratedCard{
+		{Scored: types.ScoredItem{Item: types.ContentItem{ID: 1}, Score: 90}, BodyMD: "a"},
+		{Scored: types.ScoredItem{Item: types.ContentItem{ID: 2}, Score: 80}, BodyMD: "b"},
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.Push(context.Background(), PushIn{UserID: 1, TraceID: "tr-b", Cards: cards}) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Push 意外报错: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Push 未在 5s 内返回——拆分循环疑似死循环（初版真实 bug）")
+	}
+
+	// 构卡序列：先试 2 条（超限）→ 拆成 1 条（放得下）→ 下一块再 1 条。
+	if len(push.sentCards()) != 2 {
+		t.Errorf("2 条超限内容应拆成 2 张单条卡发出，实得 %d 张", len(push.sentCards()))
+	}
+	if got := len(st.markedCalls()); got != 2 {
+		t.Errorf("两条投递都应送达（无静默截断），实得 %d", got)
+	}
+}

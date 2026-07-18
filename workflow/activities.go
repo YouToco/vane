@@ -690,10 +690,10 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 
 	// 分块发送：每卡条数封顶 + 构卡后字节硬校验（附录 A 吸收自被否方案的两点之一）。
 	// 超限拆卡而非静默截断——静默丢条目会让"已打分未送达"的内容永远消失。
-	for start := 0; start < len(pending); {
-		end := min(start+aggMaxItemsPerCard, len(pending))
-		chunk := pending[start:end]
-
+	//
+	// 拆分用显式 size 内环收敛（初版把对半结果写进 end 再 continue，外层循环顶部
+	// 重算 end 会丢弃拆分——超大块死循环；size 单调递减到 1 保证必然终止）。
+	buildChunk := func(chunk []pendingItem) string {
 		items := make([]feedback.CardInput, len(chunk))
 		for i, p := range chunk {
 			items[i] = p.input
@@ -702,15 +702,18 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 		if a.aggHeader != nil {
 			title, tmpl = a.aggHeader(in.TaskTitle, len(items))
 		}
-		cardJSON := a.buildAggCard(feedback.AggregateCardInput{
+		return a.buildAggCard(feedback.AggregateCardInput{
 			HeaderTitle: title, HeaderTemplate: tmpl, Items: items,
 		})
-		// 字节硬校验：超上限且还能再拆就对半拆重试；单条仍超限只能硬发（记录告警）。
-		if len(cardJSON) > aggMaxCardBytes && len(chunk) > 1 {
-			half := len(chunk) / 2
-			end = start + half
-			continue
+	}
+	for start := 0; start < len(pending); {
+		size := min(aggMaxItemsPerCard, len(pending)-start)
+		cardJSON := buildChunk(pending[start : start+size])
+		for len(cardJSON) > aggMaxCardBytes && size > 1 {
+			size = max(size/2, 1)
+			cardJSON = buildChunk(pending[start : start+size])
 		}
+		chunk := pending[start : start+size]
 		if len(cardJSON) > aggMaxCardBytes {
 			slog.Warn("push: 单条内容构卡即超字节上限，硬发（可能被飞书拒）",
 				"delivery_id", chunk[0].delID, "bytes", len(cardJSON))
@@ -720,7 +723,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 		if perr != nil {
 			slog.Warn("push: 聚合卡推送失败，跳过该块", "trace_id", in.TraceID,
 				"items", len(chunk), "err", perr)
-			start = end
+			start += size
 			continue
 		}
 		for _, p := range chunk {
@@ -731,7 +734,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			}
 		}
 		anySent = true
-		start = end
+		start += size
 	}
 
 	status := types.BatchStatusDone
