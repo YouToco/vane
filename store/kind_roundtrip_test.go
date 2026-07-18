@@ -38,6 +38,7 @@ func TestKindRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
 	}
+	attachTenant(t, st, u.ID)
 	srcID, _, err := st.UpsertSource(ctx, &types.Source{
 		Platform:   types.PlatformWeb,
 		Capability: types.CapFeed,

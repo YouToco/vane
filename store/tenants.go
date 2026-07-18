@@ -168,3 +168,21 @@ func (s *Store) ListMembershipsByUser(ctx context.Context, userID int64) ([]type
 	}
 	return out, nil
 }
+
+// AddMembership 把用户加入租户。
+//
+// 生产用途：将来做「邀请他人加入我的租户」时的落库入口（D8 预留的多人租户）。
+// 当前唯一的租户归属来源仍是注册流（RegisterWithInvite 在同一事务里建成员关系），
+// 本方法是那条路之外的显式补充——**刻意不做成 HTTP 端点**：谁能把谁加进哪个租户
+// 是权限问题，得等 D8 的角色模型落地再开放。
+//
+// 幂等：重复加入同一租户不报错。
+func (s *Store) AddMembership(ctx context.Context, tenantID, userID int64, role types.MembershipRole) error {
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO memberships (tenant_id, user_id, role) VALUES ($1, $2, $3)
+		 ON CONFLICT (tenant_id, user_id) DO NOTHING`,
+		tenantID, userID, role); err != nil {
+		return types.NewAppError(types.CodeDatabase, "加入租户", err)
+	}
+	return nil
+}

@@ -36,6 +36,7 @@ func TestAgentStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
 	}
+	attachTenant(t, st, u.ID)
 
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()

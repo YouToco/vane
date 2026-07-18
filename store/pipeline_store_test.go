@@ -53,6 +53,7 @@ func TestPipelineStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
 	}
+	attachTenant(t, st, u.ID)
 
 	srcURL := "https://example.com/test-pipeline-" + uuid.NewString()
 	srcID, _, err := st.UpsertSource(ctx, &types.Source{

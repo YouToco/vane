@@ -33,10 +33,12 @@ func TestSourceDisableEnable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建 owner 失败: %v", err)
 	}
+	attachTenant(t, st, owner.ID)
 	stranger, err := st.UpsertUserByOpenID(ctx, "test_disable_stranger_"+uuid.NewString(), "disable-stranger")
 	if err != nil {
 		t.Fatalf("建 stranger 失败: %v", err)
 	}
+	attachTenant(t, st, stranger.ID)
 	srcID, _, err := st.UpsertSource(ctx, &types.Source{
 		Platform:   types.PlatformWeb,
 		Capability: types.CapFeed,

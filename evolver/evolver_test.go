@@ -403,6 +403,13 @@ func TestEvolveIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("UpsertUserByOpenID() 失败: %v", err)
 		}
+
+		// migration 020 起业务表 tenant_id NOT NULL 且由所有者的租户推导，
+		// 没有 memberships 行的用户写不进任何业务数据——这正是「租户归属只能来自
+		// 注册流或迁移回填」的数据层体现，测试要显式表达归属。
+		if err := st.AddMembership(ctx, 1, u.ID, types.MembershipRoleOwner); err != nil {
+			t.Fatalf("挂载租户失败: %v", err)
+		}
 		userIDs = append(userIDs, u.ID)
 		b, err := st.CreatePushBatch(ctx, u.ID)
 		if err != nil {

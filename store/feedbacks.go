@@ -31,8 +31,8 @@ func (s *Store) InsertFeedback(ctx context.Context, f *types.Feedback) (int64, e
 	}
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO feedbacks (user_id, delivery_id, action, detail)
-		 VALUES ($1, $2, $3, $4)
+		`INSERT INTO feedbacks (tenant_id, user_id, delivery_id, action, detail)
+		 VALUES (`+tenantOfUser+`$1), $1, $2, $3, $4)
 		 RETURNING id`,
 		f.UserID, f.DeliveryID, f.Action, f.Detail).Scan(&id)
 	if err != nil {
@@ -57,8 +57,8 @@ func (s *Store) InsertDeepDiveFeedback(ctx context.Context, f *types.Feedback) (
 			fmt.Sprintf("InsertDeepDiveFeedback 只接受 deep_dive，实际 %q", f.Action), nil)
 	}
 	err = s.pool.QueryRow(ctx,
-		`INSERT INTO feedbacks (user_id, delivery_id, action, detail)
-		 VALUES ($1, $2, 'deep_dive', $3)
+		`INSERT INTO feedbacks (tenant_id, user_id, delivery_id, action, detail)
+		 VALUES (`+tenantOfUser+`$1), $1, $2, 'deep_dive', $3)
 		 ON CONFLICT (delivery_id) WHERE action = 'deep_dive' DO NOTHING
 		 RETURNING id`,
 		f.UserID, f.DeliveryID, f.Detail).Scan(&id)

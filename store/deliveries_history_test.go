@@ -76,10 +76,12 @@ func TestListDeliveryHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID(owner) 失败: %v", err)
 	}
+	attachTenant(t, st, owner.ID)
 	other, err := st.UpsertUserByOpenID(ctx, "ou_hist_"+uuid.NewString(), "history-other")
 	if err != nil {
 		t.Fatalf("UpsertUserByOpenID(other) 失败: %v", err)
 	}
+	attachTenant(t, st, other.ID)
 
 	srcID, _, err := st.UpsertSource(ctx, &types.Source{
 		Platform:   types.PlatformWeb,
