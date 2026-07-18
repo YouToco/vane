@@ -1,12 +1,26 @@
 package auth_test
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
+
+// exemptMarker 是文件级豁免标记。带此标记的文件跳过本守卫。
+//
+// **豁免不是免罪牌，是一处必须写明理由的例外**：标记要求写在被豁免文件自身
+// （见下方 Walk 里的说明），且约定后面跟一句为什么。当前唯一的豁免是
+// feishu/handler.go——它同时出现两个标识符是因为「owner 首次捕获」与
+// 「入站消息为发信人建 user 行」两件事恰好都在那里，二者用的是**消息发送者的**
+// open_id 而非 owner 记录里的，不构成 principal 解析链。
+//
+// 已知残留局限（诚实记录，不假装守住了）：正则看不到数据流，因此**无法**分辨
+// 豁免文件里将来新增的代码是不是真的 principal 复述。豁免文件是本守卫的盲区，
+// 加豁免要慎重。
+const exemptMarker = "//go:principal-exempt"
 
 // TestInvariant_SinglePrincipalSource 是不变量 I-A1 的守卫（企业级契约 §1.1）。
 //
@@ -27,7 +41,10 @@ import (
 // 仍会被抓住——收紧的是误报，不是漏报。
 func TestInvariant_SinglePrincipalSource(t *testing.T) {
 	root := repoRoot(t)
-	ownerKeyRe := regexp.MustCompile(`SettingKeyOwner|"feishu_owner"`)
+	// (?i) 大小写不敏感：feishu 包同时定义了导出常量 SettingKeyOwner 与未导出别名
+	// settingKeyOwner（manager.go），只匹配大写会被小写别名整个绕过——对抗审查用
+	// A/B 实证抓到过：同一份复述代码，用小写别名守卫放行、改大写就变红。
+	ownerKeyRe := regexp.MustCompile(`(?i)settingkeyowner|"feishu_owner"`)
 	// 调用形式：<接收者>.UpsertUserByOpenID( —— 与 `func (f *x) UpsertUserByOpenID(` 区分开。
 	upsertCallRe := regexp.MustCompile(`\w\.UpsertUserByOpenID\(`)
 
@@ -54,6 +71,12 @@ func TestInvariant_SinglePrincipalSource(t *testing.T) {
 		src, err := os.ReadFile(path)
 		if err != nil {
 			return err
+		}
+		// 豁免标记刻意要求写在**被豁免的文件自身**，而不是攒在本测试的白名单里：
+		// 谁将来想在该文件里加一份 principal 解析，一眼就能看见豁免存在及其理由，
+		// 而不是改完提交才被 CI 拦（或更糟——因为文件恰好在白名单里而根本没被拦）。
+		if bytes.Contains(src, []byte(exemptMarker)) {
+			return nil
 		}
 		text := stripComments(string(src))
 		if ownerKeyRe.MatchString(text) && upsertCallRe.MatchString(text) {
