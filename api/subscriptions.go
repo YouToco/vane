@@ -142,3 +142,29 @@ func (s *server) handleRemoveSubscription(w http.ResponseWriter, r *http.Request
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
+
+// handleEnableSource 重新启用一个因连续抓取失败被自动暂停的信源（功能 5.2）。
+// 归属校验（本人 active 订阅）在 store.EnableSource 的 SQL 内完成；启用后失败计数清零、
+// next_fetch_at=now() 立即恢复抓取。POST /api/sources/{source_id}/enable → 200 {ok:true}。
+func (s *server) handleEnableSource(w http.ResponseWriter, r *http.Request) {
+	sourceID, err := strconv.ParseInt(r.PathValue("source_id"), 10, 64)
+	if err != nil || sourceID <= 0 {
+		writeError(w, http.StatusBadRequest, "source_id 必须是正整数")
+		return
+	}
+	userID, err := s.ownerUserID(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	enabled, err := s.deps.Store.EnableSource(r.Context(), userID, sourceID)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	if !enabled {
+		writeError(w, http.StatusNotFound, "没找到你订阅的该信源（可能已取消订阅或 id 有误）")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}

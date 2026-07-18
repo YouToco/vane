@@ -48,6 +48,13 @@ const maxPerSourceCandidates = 20
 // 或给告警加幂等键。
 const alertFetchFailThreshold = 3
 
+// disableFetchFailThreshold 是"连续失败达此值自动停用"的阈值（功能 5.2，Boss 拍板
+// 「告警后再宽限」）。刻意远高于告警阈值：先在 3 次发预警卡给 owner 一个人工介入窗口，
+// 短暂宕机的站点在 3→10 次之间恢复即清零、不会被误停；持续失败到 10 次才判定失效自动停用，
+// 并发一张"已暂停 + 如何重新启用"的卡。停用后 ListDueSourcesByUser 不再返回它（抓取停止），
+// 直到用户经 enable_source 工具或信源页按钮重新启用。
+const disableFetchFailThreshold = 10
+
 // ============================================================
 // 消费方接口：本包只依赖这些窄接口，具体实现（fetcher/scorer/cardgen/
 // pusher/store/feishu）由 cmd/server 装配时注入。方法签名对齐各业务包
@@ -108,6 +115,9 @@ type Store interface {
 	// UpdateSourceFetchState / ListUnpushedByUser 在 store 里 M3 就已实现，但此前没进本接口，
 	// 于是 UpdateSourceFetchState 从没被 Activity 调用过（抓取状态死代码 #7）；Fetch 重构后启用。
 	UpdateSourceFetchState(ctx context.Context, id int64, lastFetched, nextFetch time.Time, failCount int) error
+	// DisableSourceIfActive 连续失败达停用阈值时把源置 disabled（仅当前 active 才翻转，
+	// 幂等）；disabled=true 表示本次真的翻转，用于只发一次停用告警（功能 5.2）。
+	DisableSourceIfActive(ctx context.Context, id int64) (disabled bool, err error)
 	ListUnpushedByUser(ctx context.Context, userID int64, limit, perSourceCap int) ([]types.ContentItem, error)
 	// 幂等推送地基（FIX-A 新增实现）：重试时复用同一 batch、跳过已发条目，杜绝重复发卡（#1 CRITICAL）。
 	// 取代原 CreatePushBatch / InsertDelivery（store 仍保留其实现，只是 Activity 不再用）。
@@ -260,21 +270,21 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	// 同一 run 内源 A 补全的笔记当场入库，源 B 抓到同一篇时闸门才命中、跳过付费；
 	// 若把入库推迟到循环之后，源 B 查库时 A 的内容还没落地，同一篇笔记会被重复付费。
 	var alertable []fetchFailure // 本轮"恰好"连续失败达告警阈值的源，循环后批量告警一次（功能 5.2）。
+	var disabled []fetchFailure  // 本轮达停用阈值、刚被自动停用的源，循环后单发一张停用卡（功能 5.2）。
 	for _, src := range sources {
 		items, ferr := a.fetcher.Fetch(ctx, src)
 		if ferr != nil {
 			// 单源失败不拖垮整批：某个源挂了不该让当次推送整体失败；
 			// 同时自增 fail_count 并推进 next_fetch_at，避免调度紧循环重试。
-			crossed := a.markFetchResult(ctx, src, false)
+			crossed, justDisabled := a.markFetchResult(ctx, src, false)
 			slog.Warn("fetch: 单源抓取失败，跳过", "source_id", src.ID, "platform", src.Platform, "capability", src.Capability, "url", src.URL, "err", ferr)
+			// src.FailCount 此刻仍是旧值，新计数=src.FailCount+1。
+			f := fetchFailure{src: src, failCount: src.FailCount + 1, reason: fetchFailureReason(ferr)}
 			if crossed {
-				// 恰好连续失败达阈值这一轮：收集，循环后合并成一张卡告警（功能 5.2）。
-				// src.FailCount 此刻仍是旧值，新计数=src.FailCount+1（=阈值）。
-				alertable = append(alertable, fetchFailure{
-					src:       src,
-					failCount: src.FailCount + 1,
-					reason:    fetchFailureReason(ferr),
-				})
+				alertable = append(alertable, f) // 恰好达告警阈值：预警卡。
+			}
+			if justDisabled {
+				disabled = append(disabled, f) // 刚被自动停用：停用卡。
 			}
 			continue
 		}
@@ -297,6 +307,8 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	// 放在返回候选之前、与推送早退无关：即便本轮全源挂掉（下方候选为空、workflow
 	// 走空批次早退），告警也已在此发出。best-effort，失败只 warn 不拖垮推送。
 	a.alertFetchFailures(ctx, alertable)
+	// 本轮有源达停用阈值被自动停用 → 单发一张"已暂停 + 如何重新启用"卡（功能 5.2）。
+	a.alertSourcesDisabled(ctx, disabled)
 
 	// 返回"未投递候选"而非"本次新入库"，让 Fetch 重试幂等可续（修 #3）；
 	// 全局上限 + 每源配额双重截断，控制单批打分规模且防高产源饿死低产源（修 #6）。
@@ -313,9 +325,12 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 // gate 在落库成功之上：若 UpdateSourceFetchState 失败，fail_count 没推进，下轮会再次算到
 // 阈值，此时告警会错乱重复，故落库失败一律不告警（保持"恰好一次"不变量）。
 //
-// 5.2 定为仅告警 MVP，不做"fail_count 达阈值自动 disabled"（那要配套重启用入口）：
-// UpdateSourceFetchState 签名不含 status，保留原样，只在跨阈时向 owner 告警。
-func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok bool) (crossedAlertThreshold bool) {
+// 两级阈值（Boss 拍板「告警后再宽限」）：
+//   - failCount==alertFetchFailThreshold(3) → crossedAlertThreshold：发一次预警卡（人工窗口）。
+//   - failCount>=disableFetchFailThreshold(10) 且当前仍 active → justDisabled：自动停用 + 发停用卡。
+// 两个返回值互斥地驱动两种告警卡（3 与 10 不重叠）。停用经 DisableSourceIfActive 幂等完成，
+// justDisabled 仅在"这一刻从 active 翻成 disabled"时为 true，据此只发一次停用告警。
+func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok bool) (crossedAlertThreshold, justDisabled bool) {
 	now := time.Now()
 	nextFetch := now.Add(time.Duration(src.FetchIntervalSeconds) * time.Second)
 
@@ -332,9 +347,18 @@ func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok b
 	}
 	if err := a.store.UpdateSourceFetchState(ctx, src.ID, lastFetched, nextFetch, failCount); err != nil {
 		slog.Warn("fetch: 更新抓取状态失败", "source_id", src.ID, "err", err)
-		return false // 状态未落库：不告警，避免下轮重复算到阈值再报。
+		return false, false // 状态未落库：不告警、不停用，避免下轮重复算到阈值再报。
 	}
-	return crossedAlertThreshold
+	// 达停用阈值：自动停用（幂等，只翻转仍 active 的源）。停用失败不影响抓取，下轮会再试。
+	if !ok && failCount >= disableFetchFailThreshold {
+		disabled, derr := a.store.DisableSourceIfActive(ctx, src.ID)
+		if derr != nil {
+			slog.Warn("fetch: 自动停用失败（不影响抓取）", "source_id", src.ID, "err", derr)
+		} else {
+			justDisabled = disabled
+		}
+	}
+	return crossedAlertThreshold, justDisabled
 }
 
 // fetchFailure 承载一个"连续失败恰好达告警阈值"的信源及其对 owner 可见的失败原因（功能 5.2）。
@@ -392,6 +416,46 @@ func renderFetchFailureAlert(failures []fetchFailure) string {
 		}
 	}
 	b.WriteString("\n修复来源后会在下次抓取自动恢复；持续失败不影响其它信源正常推送。")
+	return b.String()
+}
+
+// alertSourcesDisabled 给 owner 发一张"已自动暂停"卡，列出本轮达停用阈值被停用的信源，
+// 并告知如何重新启用（功能 5.2）。与 alertFetchFailures 同为 best-effort：无失败源 /
+// 未注入构卡器 / 未捕获 owner / 发送失败一律静默或只 warn，绝不拖挂抓取或推送管道。
+func (a *Activities) alertSourcesDisabled(ctx context.Context, disabled []fetchFailure) {
+	if len(disabled) == 0 {
+		return
+	}
+	if a.buildNotice == nil {
+		return
+	}
+	owner := a.feishu.OwnerOpenID()
+	if owner == "" {
+		return
+	}
+	card := a.buildNotice(renderSourcesDisabledAlert(disabled))
+	if _, err := a.pusher.Push(ctx, owner, card); err != nil {
+		slog.Warn("fetch: 信源停用告警发送失败（不影响推送）", "count", len(disabled), "err", err)
+	}
+}
+
+// renderSourcesDisabledAlert 渲染"已暂停"卡正文：与预警卡措辞不同——预警是"建议检查"，
+// 本卡是"已停止抓取，需你重新启用"，并给出两条恢复路径（信源页按钮 / 对 AI 说重新启用）。
+func renderSourcesDisabledAlert(disabled []fetchFailure) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**⛔ 信源已自动暂停**\n\n以下信源连续失败达 %d 次，已判定失效并停止抓取：\n", disableFetchFailThreshold)
+	for _, f := range disabled {
+		title := f.src.Title
+		if title == "" {
+			title = f.src.URL
+		}
+		fmt.Fprintf(&b, "\n**%s**（%s / %s）· 连续失败 %d 次\n原因：%s\n",
+			title, f.src.Platform, f.src.Capability, f.failCount, f.reason)
+		if f.src.URL != "" {
+			fmt.Fprintf(&b, "链接：%s\n", f.src.URL)
+		}
+	}
+	b.WriteString("\n修复来源后可重新启用：在「信源管理」页点该源的『重新启用』，或直接对我说「重新启用信源 <id>」。启用后失败计数清零、立即恢复抓取。")
 	return b.String()
 }
 

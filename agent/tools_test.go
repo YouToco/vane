@@ -471,6 +471,22 @@ func TestAddSourceTool_Summarize(t *testing.T) {
 	})
 }
 
+// TestEnableSourceTool 覆盖 enable_source（功能 5.2 重启用入口）：写工具须走确认卡，
+// Summarize 如实展示会启用哪个源。Execute 的归属校验（EnableSource 的 SQL WHERE）由
+// store 集成测试覆盖（enable_source 持具体 *store.Store 不可 fake）。
+func TestEnableSourceTool(t *testing.T) {
+	if !(&enableSourceTool{}).Mutating() {
+		t.Fatal("enable_source 必须是写工具（Mutating=true），否则可绕过确认卡直接改源状态")
+	}
+	got := (&enableSourceTool{}).Summarize(json.RawMessage(`{"source_id":7}`))
+	if got != "重新启用信源（id=7）" {
+		t.Fatalf("Summarize 实得 %q", got)
+	}
+	if fb := (&enableSourceTool{}).Summarize(json.RawMessage(`{`)); !strings.Contains(fb, "重新启用信源") {
+		t.Fatalf("非法 JSON 应走 summarizeFallback, 实得 %q", fb)
+	}
+}
+
 // TestOtherTools_Summarize 覆盖此前零测试的三个写工具 Summarize（审计 M-3）。
 func TestOtherTools_Summarize(t *testing.T) {
 	t.Run("remove_source", func(t *testing.T) {

@@ -5,6 +5,16 @@
 
 ## [Unreleased]
 
+### Added
+- **信源连续失败自动停用 + 重新启用**（功能 5.2 补全，`feat/source-auto-disable`）：在既有
+  「连续失败 3 次发预警卡」之上，新增连续失败达 `disableFetchFailThreshold=10` 次自动置
+  `disabled`（停止抓取），并发一张与预警卡区分的「已暂停 + 如何重新启用」卡。Boss 拍板
+  「告警后再宽限」：3→10 之间继续抓取，短暂宕机的站点恢复即清零、不误停。重新启用两条入口
+  （Boss 拍板「两者都要」）——① agent 工具 `enable_source`（飞书里对 AI 说「重新启用信源 X」，
+  走确认卡）；② 后端 `POST /api/sources/{id}/enable`（供前端信源页「重新启用」按钮，前端 PR 另提）。
+  store 新增 `DisableSourceIfActive`（仅 active→disabled 幂等翻转，一次性告警）与 `EnableSource`
+  （归属校验进 SQL WHERE + 清零 fail_count + `next_fetch_at=now()` 立即恢复）。
+
 ### Changed
 - **代码审计整改批次一**（`chore/audit-cleanup-batch`）：
   - **D-3** 移除 agent `add_source` 的 legacy `type` enum（`rss/exa/tikhub_xhs`）与相随的

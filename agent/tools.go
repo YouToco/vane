@@ -46,6 +46,7 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger,
 		&listSourcesTool{st: st},
 		&addSourceTool{st: st},
 		&removeSourceTool{st: st},
+		&enableSourceTool{st: st},
 		&listSchedulesTool{st: st},
 		&createScheduleTool{sched: sched},
 		&removeScheduleTool{sched: sched},
@@ -335,6 +336,54 @@ func (t *removeSourceTool) Summarize(args json.RawMessage) string {
 		return summarizeFallback("取消订阅信源", args)
 	}
 	return fmt.Sprintf("取消订阅信源（id=%d）", a.SourceID)
+}
+
+const enableSourceSchema = `{
+  "type": "object",
+  "properties": {
+    "source_id": {"type": "integer", "description": "要重新启用的信源 id（连续抓取失败被自动暂停的源，可先用 list_sources 查看状态）"}
+  },
+  "required": ["source_id"]
+}`
+
+type enableSourceTool struct {
+	st *store.Store
+}
+
+func (t *enableSourceTool) Name() string { return "enable_source" }
+func (t *enableSourceTool) Description() string {
+	return "重新启用一个因连续抓取失败被自动暂停的信源：置回正常、清零失败计数、立即恢复抓取。source_id 可先用 list_sources 查看状态。"
+}
+func (t *enableSourceTool) Parameters() json.RawMessage { return json.RawMessage(enableSourceSchema) }
+func (t *enableSourceTool) Mutating() bool              { return true }
+
+// Execute 复用 store.EnableSource：归属校验（本人 active 订阅）进 SQL 的 WHERE，
+// 启用未订阅的源 enabled=false，回自纠文案而不上抛（与 remove_source 的越权处理一致）。
+func (t *enableSourceTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
+	var a struct {
+		SourceID int64 `json:"source_id"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil || a.SourceID <= 0 {
+		return "source_id 必须是正整数", nil
+	}
+	enabled, err := t.st.EnableSource(ctx, userID, a.SourceID)
+	if err != nil {
+		return "", err
+	}
+	if !enabled {
+		return fmt.Sprintf("没找到你订阅的信源（id=%d），可能已取消订阅或 id 有误。用 list_sources 查一下。", a.SourceID), nil
+	}
+	return fmt.Sprintf("已重新启用信源（id=%d），失败计数已清零，将在下次抓取时恢复。", a.SourceID), nil
+}
+
+func (t *enableSourceTool) Summarize(args json.RawMessage) string {
+	var a struct {
+		SourceID int64 `json:"source_id"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return summarizeFallback("重新启用信源", args)
+	}
+	return fmt.Sprintf("重新启用信源（id=%d）", a.SourceID)
 }
 
 // ============================================================
