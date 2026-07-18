@@ -134,6 +134,13 @@ type fakeStore struct {
 	emptySkipped bool
 	emptyBatchN  int64 // 递增出 batch_id；0 值起步即从 1 开始
 	emptyCalls   []emptyBatchCall
+	// P1b b3 分流捕获：hasSchedSources 决定走隔离还是用户级；两个 bySchedule 是隔离路径的返回；
+	// gotSchedDueID/gotSchedUnpushedID 记录隔离路径收到的 scheduleID，供断言"确实走了本任务隔离"。
+	hasSchedSources    bool
+	dueBySchedule      []types.Source
+	unpushedBySchedule []types.ContentItem
+	gotSchedDueID      string
+	gotSchedUnpushedID string
 	// 抓取失败告警测试用（功能 5.2）：dueSources 供 ListDueSourcesByUser 返回，
 	// updateFetchErr 模拟 UpdateSourceFetchState 落库失败（验"状态没落库不告警"）。
 	dueSources     []types.Source
@@ -196,6 +203,24 @@ func (s *fakeStore) UpdateSourceFetchState(context.Context, int64, time.Time, ti
 
 func (s *fakeStore) ListUnpushedByUser(context.Context, int64, int, int) ([]types.ContentItem, error) {
 	return s.unpushed, nil
+}
+
+func (s *fakeStore) ScheduleHasSources(_ context.Context, _ string) (bool, error) {
+	return s.hasSchedSources, nil
+}
+
+func (s *fakeStore) ListDueSourcesBySchedule(_ context.Context, scheduleID string) ([]types.Source, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gotSchedDueID = scheduleID
+	return s.dueBySchedule, nil
+}
+
+func (s *fakeStore) ListUnpushedBySchedule(_ context.Context, scheduleID string, _, _ int) ([]types.ContentItem, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gotSchedUnpushedID = scheduleID
+	return s.unpushedBySchedule, nil
 }
 
 func (s *fakeStore) CreatePushBatchIdempotent(_ context.Context, _ int64, _, scheduleID string) (int64, error) {
@@ -570,6 +595,62 @@ func fetchSrc(id int64, failCount int, title string) types.Source {
 		URL:       fmt.Sprintf("https://example.com/%d", id),
 		FailCount: failCount, FetchIntervalSeconds: 1800,
 	}
+}
+
+// TestFetch_ScheduleScoped 守 P1b b3 的分流：有源手册任务走本任务隔离
+// （ListDueSourcesBySchedule + ListUnpushedBySchedule），无源任务/push_now 退回用户级。
+func TestFetch_ScheduleScoped(t *testing.T) {
+	mk := func(st *fakeStore) *Activities {
+		return NewActivities(scriptedFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, idNotice, nil, nil)
+	}
+
+	t.Run("有源手册任务：只抓/挑本任务的源", func(t *testing.T) {
+		st := &fakeStore{
+			hasSchedSources:    true,
+			dueBySchedule:      []types.Source{fetchSrc(1, 0, "本任务源")},
+			unpushedBySchedule: []types.ContentItem{{ID: 77}},
+			dueSources:         []types.Source{fetchSrc(2, 0, "用户级源")}, // 走错路径才会用它
+			unpushed:           []types.ContentItem{{ID: 88}},
+		}
+		got, err := mk(st).Fetch(context.Background(), PushParams{UserID: 7, ScheduleID: "push-7-x"})
+		if err != nil {
+			t.Fatalf("Fetch 报错: %v", err)
+		}
+		if st.gotSchedDueID != "push-7-x" || st.gotSchedUnpushedID != "push-7-x" {
+			t.Errorf("应走本任务隔离路径, 实得 due=%q unpushed=%q", st.gotSchedDueID, st.gotSchedUnpushedID)
+		}
+		if len(got) != 1 || got[0].ID != 77 {
+			t.Errorf("应返回本任务候选(77)而非用户级(88), 实得 %+v", got)
+		}
+	})
+
+	t.Run("无源手册任务：退回用户级（决策#4 老任务不变）", func(t *testing.T) {
+		st := &fakeStore{hasSchedSources: false, unpushed: []types.ContentItem{{ID: 88}}}
+		got, err := mk(st).Fetch(context.Background(), PushParams{UserID: 7, ScheduleID: "push-7-x"})
+		if err != nil {
+			t.Fatalf("Fetch 报错: %v", err)
+		}
+		if st.gotSchedDueID != "" {
+			t.Errorf("无源手册不该走隔离抓取, 实得 %q", st.gotSchedDueID)
+		}
+		if len(got) != 1 || got[0].ID != 88 {
+			t.Errorf("应返回用户级候选(88), 实得 %+v", got)
+		}
+	})
+
+	t.Run("push_now 空 ScheduleID：连开关都不查、直接用户级", func(t *testing.T) {
+		st := &fakeStore{hasSchedSources: true, unpushed: []types.ContentItem{{ID: 88}}}
+		got, err := mk(st).Fetch(context.Background(), PushParams{UserID: 7}) // ScheduleID=""
+		if err != nil {
+			t.Fatalf("Fetch 报错: %v", err)
+		}
+		if st.gotSchedDueID != "" || st.gotSchedUnpushedID != "" {
+			t.Errorf("空 ScheduleID 应完全不碰隔离路径, 实得 due=%q unpushed=%q", st.gotSchedDueID, st.gotSchedUnpushedID)
+		}
+		if len(got) != 1 || got[0].ID != 88 {
+			t.Errorf("应用户级候选(88), 实得 %+v", got)
+		}
+	})
 }
 
 // TestFetch_AlertsExactlyOnThresholdCrossing 是 5.2 去重的核心保证：一轮里只有"恰好

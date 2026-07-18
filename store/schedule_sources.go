@@ -49,6 +49,53 @@ func (s *Store) ReplaceScheduleSources(ctx context.Context, userID int64, schedu
 	return nil
 }
 
+// ScheduleHasSources 判断某任务是否已绑定「任务↔源」链接（P1b b3 的分流开关）：
+// 有链接=手册编译出了源的情报任务 → Fetch/候选按本任务的源隔离；无链接=老任务/空手册任务
+// → 退回用户级语义（决策 #4「老任务暂保持现状」）。生产里没有带源手册的任务时本方法恒 false，
+// b3 的行为切换对存量推送**休眠不生效**（只有真建了带源的情报任务才走隔离路径）。
+func (s *Store) ScheduleHasSources(ctx context.Context, scheduleID string) (bool, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM schedule_sources WHERE schedule_id = $1)`, scheduleID).Scan(&exists); err != nil {
+		return false, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("判断任务是否有源链接（schedule_id=%s）", scheduleID), err)
+	}
+	return exists, nil
+}
+
+// ListDueSourcesBySchedule 返回本任务链接的、且信源 active、已到抓取时间的源（P1b b3）：
+// 与 ListDueSourcesByUser 同款 due 过滤（重复计费护栏），只是把 JOIN subscriptions（用户订阅）
+// 换成 JOIN schedule_sources（本任务的软范围源）。这就是「只按本任务手册抓」的抓取侧落地。
+// 无归属 userID 参数：schedule_sources 已把范围锚死在该任务，任务归属由调用链（PushParams）保证。
+func (s *Store) ListDueSourcesBySchedule(ctx context.Context, scheduleID string) ([]types.Source, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+sourceColumns+`
+		 FROM sources s
+		 JOIN schedule_sources ss ON ss.source_id = s.id
+		 WHERE ss.schedule_id = $1 AND s.status = $2
+		   AND s.next_fetch_at <= now()
+		 ORDER BY s.id`,
+		scheduleID, types.SourceStatusActive)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询任务到期源（schedule_id=%s）", scheduleID), err)
+	}
+	defer rows.Close()
+
+	var out []types.Source
+	for rows.Next() {
+		var src types.Source
+		if err := scanSource(rows, &src); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "扫描 source 行", err)
+		}
+		out = append(out, src)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "遍历 source 结果集", err)
+	}
+	return out, nil
+}
+
 // ListScheduleSourceIDs 返回某任务当前绑定的源 id 列表（归属校验进 WHERE）。
 // b2 供测试与 view 渲染用；b3 的 Fetch/候选隔离会据此取本任务的源。
 func (s *Store) ListScheduleSourceIDs(ctx context.Context, userID int64, scheduleID string) ([]int64, error) {
