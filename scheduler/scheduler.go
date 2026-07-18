@@ -45,18 +45,30 @@ const (
 //     夏令时切换按该时区规则走。精度到分钟——validateCronMinInterval 只收 5 段
 //     （分 时 日 月 周），带秒的 6 段 cron 会被拒；且分钟字段必须是固定整数，
 //     这正是 1 小时频率地板的实现方式（分钟固定 ⇒ 每小时至多触发一次）。
-//   - EverySeconds 是**固定间隔语义**，且触发点按 Unix epoch 对齐：Temporal 的
-//     ScheduleIntervalSpec 匹配 `Epoch + n*Every + Offset`。vane 不设 Offset（恒 0），
-//     所以 every_seconds=21600（6h）落在 00/06/12/18 点整（按 tz），**不是**"从创建
-//     那一刻起每 6 小时"。想要"每天某个非整点时刻"请用 cron，不要用 every_seconds。
+//   - EverySeconds 是**固定间隔语义**：Temporal 的 ScheduleIntervalSpec 匹配
+//     `Epoch + n*Every + Offset`（proto 里叫 phase），基准是 **UTC Unix epoch**。
+//     不给 AnchorAt 时 Offset=0，故 every_seconds=21600（6h）落在 00/06/12/18 点整（UTC），
+//     **不是**"从创建那一刻起每 6 小时"——这个 epoch 对齐曾是本类型最容易误解的地方。
+//     给了 AnchorAt 就能把相位挪到任意时刻（见下）。
 //
-// 精度不对等是已知取舍：every_seconds 能表达秒级偏移（如 3601），cron 表达不了；
-// cron 能表达"每周一"，every_seconds 表达不了。推送场景不需要秒级，故不放开 cron
-// 到 6 段——那会同时把 1 小时地板的实现基础（分钟字段固定）一起打开。
+// AnchorAt 解决的正是"我要从某个具体时刻起、每 N 秒一次"：cron 表达不了 every 不整除
+// 24 小时的周期（每 7 小时、每 3 天），而不带相位的 interval 又只能落在 epoch 对齐点上。
+// 例：每 3 天的晚上 8 点 → EverySeconds=259200 + AnchorAt="2026-07-19T20:00:00+08:00"。
+//
+// 精度取舍（保留记录，2026-07-18 复核）：cron 只到分钟（分钟字段必须固定整数——这正是
+// 1 小时地板的实现方式），every_seconds 则可到秒。**这不是因为秒级危险**：7 段 cron
+// `15 30 8 * * * *`（每天 8:30:15）间隔 24h 完全合规，它被拒纯粹是 5 段校验的副作用。
+// 不补 7 段 cron 的真实理由只有"推送场景无用例"，不是技术限制（Temporal 支持 5/6/7 段，
+// 注意第 6 段是 Year 不是 Second，秒要写 7 段）。
 type ScheduleSpec struct {
 	Cron         string `json:"cron,omitempty"`          // 5 段 cron，如 "0 8 * * *"
-	EverySeconds int    `json:"every_seconds,omitempty"` // 固定间隔秒数（epoch 对齐），如 86400
-	TZ           string `json:"tz,omitempty"`            // 时区名，空则用 defaultTZ
+	EverySeconds int    `json:"every_seconds,omitempty"` // 固定间隔秒数，如 86400
+	// AnchorAt 是 RFC3339 绝对时刻，只对 EverySeconds 有效：把 interval 的相位对齐到
+	// 该时刻，触发点变成 anchor、anchor+every、anchor+2*every…。留空则相位为 0
+	//（epoch 对齐）。存的是用户给的原始时刻而非算出的相位——列表页要显示"从 X 起每 N"，
+	// 存相位就只剩一个没人看得懂的秒数。
+	AnchorAt string `json:"anchor_at,omitempty"`
+	TZ       string `json:"tz,omitempty"` // 时区名，空则用 defaultTZ
 }
 
 // scheduleStore 是本包用到的 store 子集（镜像读写）。
@@ -319,7 +331,16 @@ func validateSpec(spec ScheduleSpec) error {
 			return types.NewAppError(types.CodeValidation,
 				fmt.Sprintf("触发间隔 %ds 小于 1 小时硬地板（%ds）", spec.EverySeconds, minIntervalSeconds), nil)
 		}
+		if _, err := parseAnchor(spec.AnchorAt); err != nil {
+			return err
+		}
 		return nil
+	}
+	// anchor_at 只对 interval 有意义：cron 本身就指定了墙上时刻，再给个相位锚点是
+	// 两套互相矛盾的时间表达。静默忽略会让用户以为锚点生效了，故显式拒绝。
+	if strings.TrimSpace(spec.AnchorAt) != "" {
+		return types.NewAppError(types.CodeValidation,
+			"anchor_at 只能与 every_seconds 搭配（cron 已经指定了触发时刻，无需锚点）", nil)
 	}
 	return validateCronMinInterval(spec.Cron)
 }
@@ -328,6 +349,39 @@ func validateSpec(spec ScheduleSpec) error {
 // 判据：分钟字段必须是单一整数（0-59）——此时每小时至多触发一次，间隔 ≥3600s。
 // 含 '*' / '/'（步长）/ ',' （列表）/ '-'（区间）的分钟字段都可能 sub-hourly，拒绝。
 // 前端固化组件只产出整点档位，正常不会触发此拒绝；这是防御性白名单。
+// parseAnchor 解析 AnchorAt。空串返回零值 time（表示不设锚点，相位为 0）。
+// 必须带时区信息（RFC3339 要求），否则"晚上 8 点"是哪个时区的 8 点无从谈起。
+func parseAnchor(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("anchor_at 必须是 RFC3339 时刻（如 2026-07-19T20:00:00+08:00），实得 %q", s), err)
+	}
+	return t, nil
+}
+
+// intervalOffset 由锚点算出 Temporal 的相位（proto 里的 phase）。
+//
+// Temporal 匹配 `epoch + n*interval + offset`，基准是 **UTC Unix epoch**（proto 文档的
+// 例子全是 Z 时刻）。锚点是绝对时刻，其 Unix 秒对 interval 取模就是相位——**这个算法
+// 与时区无关**：AnchorAt 带的时区只影响它解析成哪个绝对时刻，之后一切都在 Unix 秒上做。
+//
+// 取模用 `((x % n) + n) % n` 而非裸 `%`：Go 的 % 对负数返回负值（1969 年之前的锚点会
+// 产生负 Unix 秒），而 Temporal 要求 phase 非负（proto: "Both interval and phase must
+// be non-negative"），裸取模会让服务端拒绝整个调度。
+func intervalOffset(anchor time.Time, everySeconds int) time.Duration {
+	if anchor.IsZero() || everySeconds <= 0 {
+		return 0
+	}
+	n := int64(everySeconds)
+	off := ((anchor.Unix() % n) + n) % n
+	return time.Duration(off) * time.Second
+}
+
 func validateCronMinInterval(cron string) error {
 	fields := strings.Fields(cron)
 	if len(fields) != 5 {
@@ -365,8 +419,15 @@ func translateSpec(spec ScheduleSpec) (client.ScheduleSpec, error) {
 		tz = defaultTZ
 	}
 	if spec.EverySeconds > 0 {
+		anchor, err := parseAnchor(spec.AnchorAt)
+		if err != nil {
+			return client.ScheduleSpec{}, err
+		}
 		return client.ScheduleSpec{
-			Intervals:    []client.ScheduleIntervalSpec{{Every: time.Duration(spec.EverySeconds) * time.Second}},
+			Intervals: []client.ScheduleIntervalSpec{{
+				Every:  time.Duration(spec.EverySeconds) * time.Second,
+				Offset: intervalOffset(anchor, spec.EverySeconds),
+			}},
 			TimeZoneName: tz,
 		}, nil
 	}

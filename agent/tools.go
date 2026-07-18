@@ -30,6 +30,21 @@ type PushTrigger interface {
 	TriggerPushNow(ctx context.Context, userID int64) (runID string, err error)
 }
 
+// scheduleUpdater / scheduleDeleter 收窄 update/remove_schedule 依赖的 scheduler 能力
+// （与 scheduleCreator 同风格，*scheduler.Scheduler 都已实现）。
+//
+// 收窄的理由不只是"能起假实现"：Execute 把工具入参翻译成 scheduler.ScheduleSpec 的
+// 那几行是**纯接线**，漏传一个字段不报错、只让该能力静默失效——本 PR 的对抗审查实测，
+// 删掉 `AnchorAt: a.Spec.AnchorAt` 后全仓测试照样绿。有了接口，替身才能捕获真正传下去
+// 的 spec，把"工具面广告的字段真的到达了 scheduler"钉进单测，而不是只断言 schema 有这个 key。
+type scheduleUpdater interface {
+	UpdatePush(ctx context.Context, schedID string, spec scheduler.ScheduleSpec, nlDesc *string) error
+}
+
+type scheduleDeleter interface {
+	DeletePush(ctx context.Context, schedID string) error
+}
+
 // profileStore 是画像两工具依赖的窄接口（M5 契约 §12.3，*store.Store 已实现），
 // 收窄后 Execute 分支可用内存假实现覆盖，不依赖数据库。
 type profileStore interface {
@@ -471,7 +486,12 @@ func formatScheduleSpec(spec scheduler.ScheduleSpec) string {
 		tz = "Asia/Shanghai"
 	}
 	if spec.EverySeconds > 0 {
-		return fmt.Sprintf("每 %d 秒触发一次（时区 %s）", spec.EverySeconds, tz)
+		// 有锚点时必须说出来：同样是"每 259200 秒"，有没有锚点决定了它落在
+		// epoch 对齐点还是用户指定的时刻，卡面不提等于让用户无从判断对不对。
+		if anchor := strings.TrimSpace(spec.AnchorAt); anchor != "" {
+			return fmt.Sprintf("从 %s 起每 %d 秒触发一次（时区 %s）", anchor, spec.EverySeconds, tz)
+		}
+		return fmt.Sprintf("每 %d 秒触发一次（时区 %s，按 epoch 对齐）", spec.EverySeconds, tz)
 	}
 	return fmt.Sprintf("按 cron「%s」触发（时区 %s）", spec.Cron, tz)
 }
@@ -493,6 +513,7 @@ const createScheduleSchema = `{
       "properties": {
         "cron": {"type": "string", "description": "5 段 cron（分 时 日 月 周），分钟字段必须是 0-59 的整数，如 \"0 8 * * *\""},
         "every_seconds": {"type": "integer", "description": "固定间隔秒数，不低于 3600（1 小时）"},
+        "anchor_at": {"type": "string", "description": "可选：RFC3339 绝对时刻（如 \"2026-07-19T20:00:00+08:00\"），只能与 every_seconds 搭配。给了它触发点就从该时刻起按间隔推进（每 3 天的晚上 8 点 = every_seconds:259200 + 该时刻）；不给则按 Unix epoch 对齐（21600 会落在 00/06/12/18 点整，通常不是用户想要的）"},
         "tz": {"type": "string", "description": "可选：IANA 时区名，缺省 Asia/Shanghai"}
       }
     },
@@ -506,6 +527,7 @@ type createScheduleArgs struct {
 	Spec struct {
 		Cron         string `json:"cron"`
 		EverySeconds int    `json:"every_seconds"`
+		AnchorAt     string `json:"anchor_at"`
 		TZ           string `json:"tz"`
 	} `json:"spec"`
 	NLDescription string `json:"nl_description"`
@@ -538,6 +560,7 @@ func (t *createScheduleTool) Execute(ctx context.Context, userID int64, args jso
 	spec := scheduler.ScheduleSpec{
 		Cron:         a.Spec.Cron,
 		EverySeconds: a.Spec.EverySeconds,
+		AnchorAt:     a.Spec.AnchorAt,
 		TZ:           a.Spec.TZ,
 	}
 	schedID, err := t.sched.CreatePush(ctx, userID, spec, workflow.PushScope{}, a.NLDescription)
@@ -571,6 +594,7 @@ func (t *createScheduleTool) Summarize(args json.RawMessage) string {
 	s := "创建定时推送任务：" + formatScheduleSpec(scheduler.ScheduleSpec{
 		Cron:         a.Spec.Cron,
 		EverySeconds: a.Spec.EverySeconds,
+		AnchorAt:     a.Spec.AnchorAt,
 		TZ:           a.Spec.TZ,
 	})
 	if desc := strings.TrimSpace(a.NLDescription); desc != "" {
@@ -616,7 +640,8 @@ const updateScheduleSchema = `{
       "description": "新的触发频率：cron 与 every_seconds 必须且只能提供一个",
       "properties": {
         "cron": {"type": "string", "description": "5 段 cron（分 时 日 月 周），按时区的墙上时间触发，分钟字段必须是 0-59 的整数，如 \"30 8 * * *\"=每天 8:30。要「每天某个具体时刻」一律用 cron"},
-        "every_seconds": {"type": "integer", "description": "固定间隔秒数，不低于 3600。注意触发点按 Unix epoch 对齐（21600=6 小时会落在 00/06/12/18 点整），不是从现在起每 N 秒；想要具体时刻请改用 cron"},
+        "every_seconds": {"type": "integer", "description": "固定间隔秒数，不低于 3600。不配 anchor_at 时触发点按 Unix epoch 对齐（21600=6 小时落在 00/06/12/18 点整），要指定从哪个时刻起请配 anchor_at"},
+        "anchor_at": {"type": "string", "description": "可选：RFC3339 绝对时刻（如 \"2026-07-19T20:00:00+08:00\"），只能与 every_seconds 搭配。给了它触发点就从该时刻起按间隔推进（每 3 天的晚上 8 点 = every_seconds:259200 + 该时刻）；不给则按 Unix epoch 对齐（21600 会落在 00/06/12/18 点整，通常不是用户想要的）"},
         "tz": {"type": "string", "description": "可选：IANA 时区名，缺省 Asia/Shanghai"}
       }
     },
@@ -630,6 +655,7 @@ type updateScheduleArgs struct {
 	Spec       struct {
 		Cron         string `json:"cron"`
 		EverySeconds int    `json:"every_seconds"`
+		AnchorAt     string `json:"anchor_at"`
 		TZ           string `json:"tz"`
 	} `json:"spec"`
 	// 指针区分「省略=不改描述」与「显式置空」，与 store.UpdateScheduleSpec 的 nil 语义对应。
@@ -637,14 +663,15 @@ type updateScheduleArgs struct {
 }
 
 type updateScheduleTool struct {
-	sched *scheduler.Scheduler
+	sched scheduleUpdater
 }
 
 func (t *updateScheduleTool) Name() string { return "update_schedule" }
 func (t *updateScheduleTool) Description() string {
 	return "修改已有定时推送任务的触发频率（原地改，schedule_id 不变，不会中断调度）。" +
 		"要改推送时间用本工具，不要用「删除再新建」——那会换掉 id 且中间有空窗。" +
-		"频率用 cron（5 段，按墙上时间）或 every_seconds（固定间隔，epoch 对齐）二选一，不得高于每小时一次。"
+		"频率用 cron（5 段，按墙上时间）或 every_seconds（固定间隔；配 anchor_at 可指定从哪个时刻起，" +
+		"不配则按 epoch 对齐）二选一，不得高于每小时一次。"
 }
 func (t *updateScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(updateScheduleSchema)
@@ -666,6 +693,7 @@ func (t *updateScheduleTool) Execute(ctx context.Context, _ int64, args json.Raw
 	spec := scheduler.ScheduleSpec{
 		Cron:         a.Spec.Cron,
 		EverySeconds: a.Spec.EverySeconds,
+		AnchorAt:     a.Spec.AnchorAt,
 		TZ:           a.Spec.TZ,
 	}
 	if err := t.sched.UpdatePush(ctx, schedID, spec, a.NLDescription); err != nil {
@@ -690,6 +718,7 @@ func (t *updateScheduleTool) Summarize(args json.RawMessage) string {
 		formatScheduleSpec(scheduler.ScheduleSpec{
 			Cron:         a.Spec.Cron,
 			EverySeconds: a.Spec.EverySeconds,
+			AnchorAt:     a.Spec.AnchorAt, // 漏了它，卡面会说"按 epoch 对齐"而实际锚定——主动说反话
 			TZ:           a.Spec.TZ,
 		}))
 	// 描述只在显式提供时上卡：省略=不改，卡面不能让人以为描述会被动。
@@ -716,7 +745,7 @@ const removeScheduleSchema = `{
 }`
 
 type removeScheduleTool struct {
-	sched *scheduler.Scheduler
+	sched scheduleDeleter
 }
 
 func (t *removeScheduleTool) Name() string { return "remove_schedule" }

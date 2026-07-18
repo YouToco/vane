@@ -532,7 +532,8 @@ func TestOtherTools_Summarize(t *testing.T) {
 	})
 	t.Run("create_schedule every_seconds", func(t *testing.T) {
 		got := (&createScheduleTool{}).Summarize(json.RawMessage(`{"spec":{"every_seconds":3600}}`))
-		if got != "创建定时推送任务：每 3600 秒触发一次（时区 Asia/Shanghai）" {
+		// 文案刻意点明 epoch 对齐：不说的话用户会以为是"从现在起每小时"。
+		if got != "创建定时推送任务：每 3600 秒触发一次（时区 Asia/Shanghai，按 epoch 对齐）" {
 			t.Fatalf("实得 %q", got)
 		}
 	})
@@ -635,6 +636,7 @@ func TestValidateScheduleSpecFields_共用(t *testing.T) {
 			viaCreate := validateScheduleArgs(createScheduleArgs{Spec: struct {
 				Cron         string `json:"cron"`
 				EverySeconds int    `json:"every_seconds"`
+				AnchorAt     string `json:"anchor_at"`
 				TZ           string `json:"tz"`
 			}{Cron: c.cron, EverySeconds: c.every}})
 			if (viaCreate == "") != (msg == "") {
@@ -914,6 +916,152 @@ func TestCreateScheduleTool_InitializesPlaybook(t *testing.T) {
 		}
 		if len(pb.upserts) != 0 {
 			t.Fatalf("调度没建成不该初始化手册, 实得 %+v", pb.upserts)
+		}
+	})
+}
+
+// TestSummarize_锚点上卡 打在**真实调用点**（两个工具的 Summarize），而不是内部的
+// formatScheduleSpec——对抗审查实测：只测格式化函数时，updateScheduleTool.Summarize
+// 漏传 AnchorAt 的真 bug 照样全绿，卡面对用户说"按 epoch 对齐"而实际锚定，主动说反话。
+// 确认卡是写操作的人类同意闸门，它说的必须是即将发生的事。
+func TestSummarize_锚点上卡(t *testing.T) {
+	const anchored = `{"schedule_id":"push-1-abc","spec":{"every_seconds":259200,"anchor_at":"2026-07-19T20:00:00+08:00"}}`
+	const plain = `{"schedule_id":"push-1-abc","spec":{"every_seconds":259200}}`
+
+	for name, sum := range map[string]func(json.RawMessage) string{
+		"create": (&createScheduleTool{}).Summarize,
+		"update": (&updateScheduleTool{}).Summarize,
+	} {
+		t.Run(name+" 有锚点说出锚点", func(t *testing.T) {
+			got := sum(json.RawMessage(anchored))
+			if !strings.Contains(got, "2026-07-19T20:00:00+08:00") || !strings.Contains(got, "起") {
+				t.Errorf("卡面应说明从何时起，实得 %q", got)
+			}
+			if strings.Contains(got, "epoch") {
+				t.Errorf("有锚点却说 epoch 对齐＝对用户说反话，实得 %q", got)
+			}
+		})
+		t.Run(name+" 无锚点点明 epoch", func(t *testing.T) {
+			got := sum(json.RawMessage(plain))
+			if !strings.Contains(got, "epoch") {
+				t.Errorf("无锚点应点明 epoch 对齐（否则用户以为从现在起），实得 %q", got)
+			}
+		})
+	}
+}
+
+// TestScheduleSchemas_含anchor_at 防"底层支持了但工具面没暴露"：create 与 update
+// 两个 schema 都要有 anchor_at，否则模型根本用不上这个能力。
+func TestScheduleSchemas_含anchor_at(t *testing.T) {
+	for name, raw := range map[string]json.RawMessage{
+		"create_schedule": (&createScheduleTool{}).Parameters(),
+		"update_schedule": (&updateScheduleTool{}).Parameters(),
+	} {
+		var schema struct {
+			Properties struct {
+				Spec struct {
+					Properties map[string]any `json:"properties"`
+				} `json:"spec"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("%s schema 不是合法 JSON: %v", name, err)
+		}
+		if _, ok := schema.Properties.Spec.Properties["anchor_at"]; !ok {
+			t.Errorf("%s 的 spec 应暴露 anchor_at", name)
+		}
+	}
+}
+
+// fakeSchedulePusher 捕获工具真正传给 scheduler 的 spec（schedulePusher 收窄成接口就是为了它）。
+type fakeSchedulePusher struct {
+	gotSpec   scheduler.ScheduleSpec
+	gotID     string
+	gotNLDesc *string
+	calls     int
+}
+
+func (f *fakeSchedulePusher) CreatePush(_ context.Context, _ int64, spec scheduler.ScheduleSpec,
+	_ workflow.PushScope, _ string) (string, error) {
+	f.calls++
+	f.gotSpec = spec
+	return "push-1-created", nil
+}
+
+func (f *fakeSchedulePusher) UpdatePush(_ context.Context, id string, spec scheduler.ScheduleSpec,
+	nlDesc *string) error {
+	f.calls++
+	f.gotID, f.gotSpec, f.gotNLDesc = id, spec, nlDesc
+	return nil
+}
+
+func (f *fakeSchedulePusher) DeletePush(_ context.Context, id string) error {
+	f.calls++
+	f.gotID = id
+	return nil
+}
+
+// TestScheduleTools_接线透传 钉死"工具面广告的字段真的到达 scheduler"。
+//
+// 为什么必须断言在**捕获到的 spec** 上而不是 schema 里有没有那个 key（对抗审查实测）：
+// 删掉 Execute 里的 `AnchorAt: a.Spec.AnchorAt`、或把 DTO 的 json tag 拼错，
+// 全仓测试照样绿——用户/模型给了 anchor_at，后端 200 正常返回，调度却静默按 epoch
+// 触发，无任何错误信号。这类"接线漏一行"的 bug 只有捕获真实入参才抓得到。
+func TestScheduleTools_接线透传(t *testing.T) {
+	const anchor = "2026-07-19T20:00:00+08:00"
+
+	t.Run("create 透传 anchor_at", func(t *testing.T) {
+		f := &fakeSchedulePusher{}
+		_, err := (&createScheduleTool{sched: f, st: newFakePlaybookStore()}).Execute(context.Background(), 1,
+			json.RawMessage(`{"spec":{"every_seconds":259200,"anchor_at":"`+anchor+`","tz":"Asia/Shanghai"}}`))
+		if err != nil {
+			t.Fatalf("Execute 失败: %v", err)
+		}
+		if f.calls != 1 {
+			t.Fatalf("应调用一次 CreatePush，实得 %d", f.calls)
+		}
+		if f.gotSpec.AnchorAt != anchor {
+			t.Errorf("anchor_at 没到达 scheduler（能力静默失效），实得 %q", f.gotSpec.AnchorAt)
+		}
+		if f.gotSpec.EverySeconds != 259200 || f.gotSpec.TZ != "Asia/Shanghai" {
+			t.Errorf("spec 透传不全: %+v", f.gotSpec)
+		}
+	})
+
+	t.Run("update 透传 anchor_at", func(t *testing.T) {
+		f := &fakeSchedulePusher{}
+		_, err := (&updateScheduleTool{sched: f}).Execute(context.Background(), 1,
+			json.RawMessage(`{"schedule_id":"push-1-abc","spec":{"every_seconds":259200,"anchor_at":"`+anchor+`"}}`))
+		if err != nil {
+			t.Fatalf("Execute 失败: %v", err)
+		}
+		if f.gotID != "push-1-abc" {
+			t.Errorf("schedule_id 透传错: %q", f.gotID)
+		}
+		if f.gotSpec.AnchorAt != anchor {
+			t.Errorf("anchor_at 没到达 scheduler（能力静默失效），实得 %q", f.gotSpec.AnchorAt)
+		}
+	})
+
+	t.Run("无锚点时不得凭空造出锚点", func(t *testing.T) {
+		f := &fakeSchedulePusher{}
+		if _, err := (&createScheduleTool{sched: f, st: newFakePlaybookStore()}).Execute(context.Background(), 1,
+			json.RawMessage(`{"spec":{"every_seconds":7200}}`)); err != nil {
+			t.Fatalf("Execute 失败: %v", err)
+		}
+		if f.gotSpec.AnchorAt != "" {
+			t.Errorf("未给锚点时应为空（保持 epoch 对齐语义），实得 %q", f.gotSpec.AnchorAt)
+		}
+	})
+
+	t.Run("remove 透传 id", func(t *testing.T) {
+		f := &fakeSchedulePusher{}
+		if _, err := (&removeScheduleTool{sched: f}).Execute(context.Background(), 1,
+			json.RawMessage(`{"schedule_id":"push-1-xyz"}`)); err != nil {
+			t.Fatalf("Execute 失败: %v", err)
+		}
+		if f.gotID != "push-1-xyz" {
+			t.Errorf("schedule_id 透传错: %q", f.gotID)
 		}
 	})
 }

@@ -98,6 +98,23 @@ func TestUpdateSchedule_省略描述传nil(t *testing.T) {
 	}
 }
 
+// TestUpdateSchedule_锚点透传 守 DTO 接线：json tag 拼错或 toScheduleSpec 漏一行，
+// 都会让 anchor_at 静默丢失（后端仍回 200，调度却按 epoch 触发）——对抗审查实测
+// 这两个变异体在补本断言前都是存活的。
+func TestUpdateSchedule_锚点透传(t *testing.T) {
+	const anchor = "2026-07-19T20:00:00+08:00"
+	f := &fakeScheduler{}
+	w := patchSchedule(t, newScheduleMux(f), "s1",
+		`{"spec":{"every_seconds":259200,"anchor_at":"`+anchor+`"}}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200（body=%s）", w.Code, w.Body.String())
+	}
+	if f.gotSpec.AnchorAt != anchor {
+		t.Errorf("anchor_at 应透传到 scheduler（丢了则相位静默失效），实得 %q", f.gotSpec.AnchorAt)
+	}
+}
+
 // TestUpdateSchedule_非法spec回400 校验在进 scheduler 之前拦住。
 func TestUpdateSchedule_非法spec回400(t *testing.T) {
 	for name, body := range map[string]string{
