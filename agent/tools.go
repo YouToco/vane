@@ -298,7 +298,10 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 	}
 	verb := "已添加并订阅"
 	if updated {
-		verb = "已更新既有"
+		// 措辞是"订阅"而非"更新"：config 现在是先到先得（既有值胜出、只补缺键），
+		// 命中既有行时并不会改动它的配置，说"已更新"是假陈述。会改变抓取行为的入参
+		// 一律进幂等键（不变量 I-S2），因此命中既有行 ⇒ 这确实就是同一个源。
+		verb = "已订阅既有"
 	}
 	return fmt.Sprintf("%s信源（id=%d）：[%s/%s] %s", verb, sourceID, src.Platform, src.Capability, title), nil
 }

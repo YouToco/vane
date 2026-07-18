@@ -76,6 +76,10 @@ func buildWeb(cap types.Capability, params map[string]string, title string) (*ty
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return nil, "url 必须是合法的 http/https 地址"
 		}
+		cats, cerr := parseCategories(params["categories"])
+		if cerr != "" {
+			return nil, cerr
+		}
 		src := &types.Source{
 			Platform:   types.PlatformWeb,
 			Capability: types.CapFeed,
@@ -83,11 +87,33 @@ func buildWeb(cap types.Capability, params map[string]string, title string) (*ty
 			Title:      title,
 			Status:     types.SourceStatusActive,
 		}
-		if catJSON := params["categories"]; catJSON != "" {
-			var cats []string
-			if json.Unmarshal([]byte(catJSON), &cats) == nil && len(cats) > 0 {
-				cfg, _ := json.Marshal(map[string]interface{}{"categories": cats})
-				src.Config = cfg
+		if len(cats) > 0 {
+			cfg, err := json.Marshal(map[string]any{"categories": cats})
+			if err != nil {
+				return nil, "构造信源配置失败"
+			}
+			src.Config = cfg
+			// 分类过滤会改变抓取结果集，因此**必须进入幂等键**（不变量 I-S2）。
+			// 否则 A 订阅 [AI]、B 订阅同一 RSS 要 [区块链]，两人共用一行 source，
+			// 后写者把前写者的过滤条件改掉——A 的信源从此抓的是别人要的东西。
+			//
+			// 用 URL fragment 承载判别位：Go 的 http 客户端**不会把 fragment 发到线上**
+			// （(*url.URL).RequestURI() 不含 Fragment，已实测），所以 url 列既是幂等键、
+			// 又仍是可直接抓取的真实地址，fetcher 零改动。
+			//
+			// cats 已归一化（trim+小写+去重+升序，与 applyCategories 的匹配口径逐字对齐），
+			// 排序是幂等键正确性的关键：分类是无序集合，集合相同、顺序不同必须是同一个源。
+			// 逐个 QueryEscape 再 join，避免分类名里含 "," / "#" 时判别位产生歧义。
+			esc := make([]string, len(cats))
+			for i, c := range cats {
+				esc[i] = url.QueryEscape(c)
+			}
+			marker := "vane-categories=" + strings.Join(esc, ",")
+			// 无分类时 URL 保持逐字节不变——存量 feed 源的幂等键不受本次改动影响。
+			if strings.Contains(rawURL, "#") {
+				src.URL = rawURL + "&" + marker
+			} else {
+				src.URL = rawURL + "#" + marker
 			}
 		}
 		return src, ""
@@ -302,6 +328,43 @@ func parseIncludeDomains(raw string) ([]string, string) {
 		}
 		seen[d] = struct{}{}
 		out = append(out, d)
+	}
+	if len(out) == 0 {
+		return nil, ""
+	}
+	sort.Strings(out)
+	return out, ""
+}
+
+// parseCategories 解析 web/feed 的 categories 入参（JSON 字符串数组），
+// 归一化为「TrimSpace + 小写 + 去空 + 去重 + 升序」。
+//
+// 归一化口径与 fetcher.applyCategories 的匹配口径（ToLower(TrimSpace(c))）逐字对齐：
+// 两边不一致的话，幂等键会把行为相同的两组分类判成不同的源。
+//
+// 与旧实现的一个行为差异：JSON 解析失败**不再静默忽略**。旧代码 `if Unmarshal(...) == nil`
+// 把打错的 categories 当成「不过滤」，用户以为设了过滤、实际收到全量，且没有任何提示。
+func parseCategories(raw string) ([]string, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, ""
+	}
+	var arr []string
+	if err := json.Unmarshal([]byte(raw), &arr); err != nil {
+		return nil, `categories 必须是 JSON 字符串数组（如 ["Product","Research"]）`
+	}
+	seen := make(map[string]struct{}, len(arr))
+	out := make([]string, 0, len(arr))
+	for _, c := range arr {
+		c = strings.ToLower(strings.TrimSpace(c))
+		if c == "" {
+			continue
+		}
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		out = append(out, c)
 	}
 	if len(out) == 0 {
 		return nil, ""
