@@ -157,3 +157,49 @@ func TestExaContents_title覆盖(t *testing.T) {
 		t.Errorf("config.title 应覆盖 Exa 标题，实得 %q", items[0].Title)
 	}
 }
+
+// TestExaContents_HTML净化不被拒 正文含 "<字母"（比较符/代码）不该被 finalize 的
+// htmlTagRe 静默拒收（对抗审查发现 3）——净化成 "< 字母" 后正常产出。
+func TestExaContents_HTML净化不被拒(t *testing.T) {
+	// "<div"、"</table" 会命中 htmlTagRe（< 紧跟字母/斜杠）→ 未净化则 finalize 静默拒收。
+	// "<10ms"（< 紧跟数字）本就不命中，不需净化、也不该被拒。
+	body := `{"results":[{"id":"i","url":"https://x.com/p","title":"P","text":"延迟 <10ms，代码 <div>x</table> 示例，价格 30"}],"statuses":[{"status":"success","source":"crawled"}]}`
+	srv := contentsServer(t, 200, body, nil)
+	defer srv.Close()
+	items, err := newTestExaContents(srv.URL).Fetch(context.Background(), contentsSource(`{"url":"https://x.com/p"}`))
+	if err != nil {
+		t.Fatalf("含 < 的正文不应报错: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("含 <字母 的正文应净化后产出 1 条（不被 htmlTagRe 静默拒），实得 %d", len(items))
+	}
+	if strings.Contains(items[0].Content, "<div") || strings.Contains(items[0].Content, "</table") {
+		t.Errorf("< 紧跟字母/斜杠应被净化成 < X，实得 %q", items[0].Content)
+	}
+}
+
+// TestExaContents_身份只随监控区变 截断区（前 N 字节）之外的尾部噪音变化不翻转
+// canonical_key（对抗审查发现 2）——hash 用截断+净化后的同一份文本，只随监控区变。
+func TestExaContents_身份只随监控区变(t *testing.T) {
+	head := strings.Repeat("价格表 gpt-5 30 60 缓存 3。", 300) // 远超 4000 字节，构成监控区主体
+	keyFor := func(tail string) string {
+		text := head + " 页脚：" + tail // 尾部噪音在截断区之外
+		body := `{"results":[{"id":"i","url":"https://x.com/p","title":"P","text":` +
+			mustJSON(text) + `}],"statuses":[{"status":"success","source":"crawled"}]}`
+		srv := contentsServer(t, 200, body, nil)
+		defer srv.Close()
+		items, err := newTestExaContents(srv.URL).Fetch(context.Background(), contentsSource(`{"url":"https://x.com/p"}`))
+		if err != nil || len(items) != 1 {
+			t.Fatalf("Fetch 异常: %v len=%d", err, len(items))
+		}
+		return items[0].CanonicalKey
+	}
+	if keyFor("最后更新 10:00") != keyFor("最后更新 20:00") {
+		t.Error("截断区之外的尾部噪音变化不应翻转 canonical_key（否则页脚每变都推送）")
+	}
+}
+
+func mustJSON(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}

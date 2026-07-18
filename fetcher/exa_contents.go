@@ -25,7 +25,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -186,6 +188,13 @@ func (e *ExaContentsFetcher) Fetch(ctx context.Context, src types.Source) ([]typ
 			ae.Retryable = true // 抓取瞬态（目标站 5xx/challenge），可重试。
 			return nil, ae
 		}
+		// 显式传了 maxAgeHours:0 却返回缓存（对抗审查发现 4）：Exa 无视了强制活抓，
+		// 拿到的可能是旧正文——其 hash 与上次相同则被当"没变化"，会漏报一次真实变化。
+		// 不阻塞（缓存也是内容，下轮活抓能补），但记 WARN 让这种漏报可见。
+		if s.Source == "cached" {
+			slog.Warn("fetcher: web/contents Exa 无视 maxAgeHours:0 返回缓存，可能漏报一次页面变化",
+				"source_id", src.ID, "url", pageURL)
+		}
 	}
 
 	item, ok := mapExaContents(src, pageURL, sc.Title, cr.Results)
@@ -219,10 +228,21 @@ func mapExaContents(src types.Source, pageURL, titleOverride string, results []e
 		title = "页面内容: " + pageURL
 	}
 
+	// 监控文本 = 截断 + 净化，一份到底：canonical_key 的 hash、存储的 Content、finalize
+	// 的 simhash/content_hash 全用它，杜绝"身份对全文、存储对截断"的不一致（对抗审查
+	// 发现 2）。两个后果被这一步同时消除：
+	//   ① 截断区（前 N 字节，监控意图所在）之外的尾部噪音（"最后更新于…"、"N 人在看"、
+	//      A/B 文案）不再翻转身份——否则页脚每轮变都产出新 content_item，且 Dedup 对
+	//      KindPageContent 豁免后这些噪音会被直接推给用户。
+	//   ② `<` 紧跟字母（正文比较符 "x<y"、代码片段、Exa 对复杂 <table> 的降级输出）本会
+	//      命中 finalize 的 htmlTagRe（`<[a-zA-Z/!]`）被静默拒收 → 监控永久失效无信号
+	//      （发现 3）。sanitizeContentsText 把这种 `<X` 改成 `< X`，破坏标签形态、保留可读。
+	text := sanitizeContentsText(truncateUTF8(r.Text, exaContentsMaxTextBytes))
+
 	// canonical_key 自填（finalize 不覆盖已填值）：contents://<url>#<textHash>。
 	// 用 config 里的 pageURL（稳定）而非 Exa 回显的 r.URL（可能带归一化差异），
-	// 保证同一源的键前缀逐轮稳定，只有 textHash 随内容变。
-	sum := sha256.Sum256([]byte(r.Text))
+	// 保证同一源的键前缀逐轮稳定，只有 textHash 随监控文本变。
+	sum := sha256.Sum256([]byte(text))
 	textHash := hex.EncodeToString(sum[:])[:exaContentsHashLen]
 	canonicalKey := "contents://" + pageURL + "#" + textHash
 
@@ -231,14 +251,24 @@ func mapExaContents(src types.Source, pageURL, titleOverride string, results []e
 		ExternalID:   r.ID, // Exa 结果 id；为空时 finalize 用 content_hash 兜底。
 		URL:          pageURL,
 		Title:        title,
-		Content:      truncateUTF8(r.Text, exaContentsMaxTextBytes),
+		Content:      text,
 		PublishedAt:  nil, // 页面内容无发布时间，展示回退 fetched_at。
 		FetchedAt:    time.Now().UTC(),
-		CanonicalKey: canonicalKey,          // 自填，承载"内容变→新身份"。
+		CanonicalKey: canonicalKey,          // 自填，承载"监控文本变→新身份"。
 		Kind:         types.KindPageContent, // 页面内容——Dedup 据此豁免近似去重（否则变化被 simhash 吞）。
 	}
 	if !finalize(src, &item) {
 		return types.ContentItem{}, false
 	}
 	return item, true
+}
+
+// contentsHTMLLikeRe 匹配"< 紧跟字母/斜杠/感叹号"——与 fetcher.htmlTagRe 同形。
+var contentsHTMLLikeRe = regexp.MustCompile(`<([a-zA-Z/!])`)
+
+// sanitizeContentsText 把会被 finalize.htmlTagRe 误判为裸 HTML 的 `<X` 改成 `< X`：
+// web/contents 抓的是 Exa 已抽取的页面正文，其中的 `<` 是内容（比较符/代码）而非"未抽取
+// 的 HTML"，htmlTagRe 对它是误伤。加空格破坏标签形态、保留可读（价格数字不受影响）。
+func sanitizeContentsText(s string) string {
+	return contentsHTMLLikeRe.ReplaceAllString(s, "< $1")
 }
