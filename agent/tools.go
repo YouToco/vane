@@ -38,11 +38,11 @@ type PushTrigger interface {
 // 删掉 `AnchorAt: a.Spec.AnchorAt` 后全仓测试照样绿。有了接口，替身才能捕获真正传下去
 // 的 spec，把"工具面广告的字段真的到达了 scheduler"钉进单测，而不是只断言 schema 有这个 key。
 type scheduleUpdater interface {
-	UpdatePush(ctx context.Context, schedID string, spec scheduler.ScheduleSpec, nlDesc *string) error
+	UpdatePush(ctx context.Context, schedID string, userID int64, spec scheduler.ScheduleSpec, nlDesc *string) error
 }
 
 type scheduleDeleter interface {
-	DeletePush(ctx context.Context, schedID string) error
+	DeletePush(ctx context.Context, schedID string, userID int64) error
 }
 
 // profileStore 是画像两工具依赖的窄接口（M5 契约 §12.3，*store.Store 已实现），

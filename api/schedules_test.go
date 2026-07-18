@@ -110,7 +110,7 @@ func TestUpdateSchedule_省略描述传nil(t *testing.T) {
 func TestUpdateSchedule_锚点透传(t *testing.T) {
 	const anchor = "2026-07-19T20:00:00+08:00"
 	f := &fakeScheduler{}
-	w := patchSchedule(t, newScheduleMux(f), "s1",
+	w := patchSchedule(t, newScheduleMux(t, f), "s1",
 		`{"spec":{"every_seconds":259200,"anchor_at":"`+anchor+`"}}`)
 
 	if w.Code != http.StatusOK {

@@ -1056,14 +1056,14 @@ func (f *fakeSchedulePusher) CreatePush(_ context.Context, _ int64, spec schedul
 	return "push-1-created", nil
 }
 
-func (f *fakeSchedulePusher) UpdatePush(_ context.Context, id string, spec scheduler.ScheduleSpec,
+func (f *fakeSchedulePusher) UpdatePush(_ context.Context, id string, _ int64, spec scheduler.ScheduleSpec,
 	nlDesc *string) error {
 	f.calls++
 	f.gotID, f.gotSpec, f.gotNLDesc = id, spec, nlDesc
 	return nil
 }
 
-func (f *fakeSchedulePusher) DeletePush(_ context.Context, id string) error {
+func (f *fakeSchedulePusher) DeletePush(_ context.Context, id string, _ int64) error {
 	f.calls++
 	f.gotID = id
 	return nil
