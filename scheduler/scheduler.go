@@ -219,7 +219,6 @@ func (s *Scheduler) TriggerPushNow(ctx context.Context, userID int64) (string, e
 	return run.GetID(), nil
 }
 
-// DeletePush 删除调度：先 Temporal Delete，再删镜像（镜像删除失败只 slog）。
 // UpdatePush 原地改一个已存在调度的触发频率（可选连带 nl_description）。
 //
 // 为什么要有它、而不是让调用方 Delete+Create（本方法存在的全部理由）：删重建会
@@ -291,6 +290,7 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, spec Schedul
 	return nil
 }
 
+// DeletePush 删除调度：先 Temporal Delete，再删镜像（镜像删除失败只 slog）。
 func (s *Scheduler) DeletePush(ctx context.Context, schedID string) error {
 	h := s.c.ScheduleClient().GetHandle(ctx, schedID)
 	if err := h.Delete(ctx); err != nil {
