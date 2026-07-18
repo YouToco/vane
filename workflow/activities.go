@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/YouToco/vane/dedup"
@@ -543,18 +545,123 @@ func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem
 	return kept, nil
 }
 
-// Score 逐条打分。同一 TraceID 串起整批的 llm_calls 便于事后追踪。
-// 单条失败跳过；整批全失败（大概率 LLM 不可用）返回错误触发重试。
-func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem, error) {
-	scored := make([]types.ScoredItem, 0, len(in.Items))
-	for _, item := range in.Items {
-		s, err := a.scorer.Score(ctx, in.UserID, item, in.TraceID)
-		if err != nil {
-			slog.Warn("score: 单条打分失败，跳过", "content_item_id", item.ID, "trace_id", in.TraceID, "err", err)
-			continue
-		}
-		scored = append(scored, types.ScoredItem{Item: item, Score: s})
+// parBatchFanout 是逐条 LLM 活动（Score / CardGen）的 goroutine 扇出上限。
+//
+// **它不是对外并发闸门**。真正的闸门在 llm.Client 的信号量（config `llm.max_concurrent`，
+// 默认 5），那里是对外压力的唯一真相源；本上限只防批次异常大时凭空拉起几千个 goroutine。
+// 取值高于 LLM 并发上限即可——多出来的 goroutine 只是排在信号量前面等，不产生额外请求。
+// 刻意不读配置：读了就变成第二个"并发上限"，两个值一旦漂移，排查时无从判断哪个在生效。
+const parBatchFanout = 16
+
+// mapConcurrent 并发映射 in，返回成功项，**保持输入顺序**；单项失败调 onErr 后跳过。
+//
+// 顺序保持不是可有可无的装饰：结果写进按下标预留的槽位、最后按序压紧，于是同一批输入
+// 无论 goroutine 怎么交错，产出都与串行版逐字节相同——这让并发化成为**可证明的等价改写**，
+// 而不是"大概也一样"。（RankTopN 的同分裁决本身落在 Item.ID 上、与顺序无关，
+// 所以即便乱序也选得出同一批；但那是下游的性质，不该被上游拿来当免责理由。）
+//
+// 各 goroutine 只写自己下标的槽位，互不重叠；wg.Wait() 建立 happens-before 边，
+// 读取时无需再加锁。onErr 用锁串起来——slog 本身并发安全，但 onErr 是调用方传进来的，
+// 不能替它假设。
+func mapConcurrent[T, R any](
+	ctx context.Context,
+	in []T,
+	fanout int,
+	fn func(context.Context, T) (R, error),
+	onErr func(T, error),
+) []R {
+	// 非 nil 空切片：与串行版的 make([]R, 0, n) 对齐。Temporal 会把结果序列化成
+	// JSON 交给下一个活动，nil 编成 null、空切片编成 []——这个差别会穿过进程边界。
+	out := make([]R, 0, len(in))
+	if len(in) == 0 {
+		return out
 	}
+	if fanout < 1 {
+		fanout = 1
+	}
+
+	type slot struct {
+		val R
+		ok  bool
+	}
+	slots := make([]slot, len(in))
+	sem := make(chan struct{}, fanout)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+
+	// panic 必须捕获后在 Wait 之后原样重抛，**不能就地让它飞**。
+	// 串行版里 fn 的 panic 沿 activity 自己的栈上抛，由 Temporal SDK 接住转成
+	// activity 错误（可重试）；而 goroutine 里未捕获的 panic 是**直接终止整个进程**的
+	// ——同一个空指针，串行下只是这批推送失败重试，并发下会把 vane 打挂由 systemd 重拉。
+	// 捕获→重抛让爆炸半径与改造前逐字一致：仍是 activity 级失败，不是进程级。
+	var panicOnce sync.Once
+	var panicVal any
+	var panicStack []byte
+
+	for i, item := range in {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					stack := debug.Stack()
+					panicOnce.Do(func() { panicVal, panicStack = r, stack })
+				}
+			}()
+			// 等令牌时也要能被取消：否则整批取消后仍要排队排到自己才发现 ctx 已死。
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				errMu.Lock()
+				onErr(item, ctx.Err())
+				errMu.Unlock()
+				return
+			}
+			v, err := fn(ctx, item)
+			if err != nil {
+				errMu.Lock()
+				onErr(item, err)
+				errMu.Unlock()
+				return
+			}
+			slots[i] = slot{val: v, ok: true}
+		}()
+	}
+	wg.Wait()
+
+	// 重抛带上原始栈：直接 panic(panicVal) 会把现场换成这一行，
+	// 排查时只看得见"某个 goroutine 挂了"，看不见挂在哪。
+	if panicVal != nil {
+		panic(fmt.Sprintf("%v\n\n原始 goroutine 栈:\n%s", panicVal, panicStack))
+	}
+
+	for _, s := range slots {
+		if s.ok {
+			out = append(out, s.val)
+		}
+	}
+	return out
+}
+
+// Score 逐条打分（并发扇出，见 mapConcurrent）。同一 TraceID 串起整批的 llm_calls
+// 便于事后追踪。单条失败跳过；整批全失败（大概率 LLM 不可用）返回错误触发重试。
+//
+// 改并发的理由是实测：生产批次 33–45 条、单条平均 709ms，串行即 32 秒纯排队等网络，
+// 而 llm.Client 早已配好 5 路并发闸门却只被喂进 1 个。顺带也把 activity 的
+// StartToCloseTimeout=120s 从"正在变薄的余量"拉回安全区（45 条 × 最坏 1372ms 已达 62 秒）。
+func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem, error) {
+	scored := mapConcurrent(ctx, in.Items, parBatchFanout,
+		func(ctx context.Context, item types.ContentItem) (types.ScoredItem, error) {
+			s, err := a.scorer.Score(ctx, in.UserID, item, in.TraceID)
+			if err != nil {
+				return types.ScoredItem{}, err
+			}
+			return types.ScoredItem{Item: item, Score: s}, nil
+		},
+		func(item types.ContentItem, err error) {
+			slog.Warn("score: 单条打分失败，跳过", "content_item_id", item.ID, "trace_id", in.TraceID, "err", err)
+		})
 	if len(scored) == 0 && len(in.Items) > 0 {
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "整批打分全部失败", nil)
 	}
@@ -571,17 +678,24 @@ func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredIte
 	return selector.RankTopN(in.Scored, n, time.Now()), nil
 }
 
-// CardGen 逐条生成解读正文。单条失败跳过；整批全失败返回错误触发重试。
+// CardGen 逐条生成解读正文（并发扇出，见 mapConcurrent）。
+// 单条失败跳过；整批全失败返回错误触发重试。
+//
+// 顺序保持在这里比 Score 更要紧：cards 的顺序**直接决定聚合卡里条目的排列**
+// （Push 按本切片顺序拼卡），而 Score 的产出还要过一遍 RankTopN 重排。
+// 换句话说，这里若按完成先后收集，同一批内容每次推送的卡面顺序都会不一样。
 func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard, error) {
-	cards := make([]GeneratedCard, 0, len(in.Items))
-	for _, si := range in.Items {
-		body, err := a.cardgen.Generate(ctx, in.UserID, si, in.TraceID)
-		if err != nil {
+	cards := mapConcurrent(ctx, in.Items, parBatchFanout,
+		func(ctx context.Context, si types.ScoredItem) (GeneratedCard, error) {
+			body, err := a.cardgen.Generate(ctx, in.UserID, si, in.TraceID)
+			if err != nil {
+				return GeneratedCard{}, err
+			}
+			return GeneratedCard{Scored: si, BodyMD: body}, nil
+		},
+		func(si types.ScoredItem, err error) {
 			slog.Warn("cardgen: 单条生成失败，跳过", "content_item_id", si.Item.ID, "trace_id", in.TraceID, "err", err)
-			continue
-		}
-		cards = append(cards, GeneratedCard{Scored: si, BodyMD: body})
-	}
+		})
 	if len(cards) == 0 && len(in.Items) > 0 {
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "整批卡片生成全部失败", nil)
 	}
