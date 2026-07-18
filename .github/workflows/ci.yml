@@ -109,8 +109,16 @@ jobs:
             systemctl daemon-reload
             # compose 幂等：service 定义或卷有变更才重建，无变更是 no-op
             cd /opt/vane && docker compose up -d
-            # Caddyfile 是 bind mount，改内容不触发容器重建，需显式 reload
-            docker exec -w /etc/caddy vane-caddy-1 caddy reload || docker restart vane-caddy-1
+            # Caddyfile 是单文件 bind mount，按 inode 钉死：scp 替换文件会换 inode，
+            # 此后容器里永远是旧内容——reload 会"成功"地重载旧文件，|| 兜底因 reload
+            # 不报错而永不触发，且 docker restart 本就不刷新 bind mount，三层全静默
+            # （2026-07-18 主域 well-known 悬空 3 天的根因）。
+            # 判据直接比内容：容器视图 ≠ 宿主机文件 ⇒ mount 已脱钩 ⇒ 唯有重建容器能重新挂载。
+            if docker exec vane-caddy-1 cat /etc/caddy/Caddyfile | cmp -s - /opt/vane/Caddyfile; then
+              docker exec vane-caddy-1 caddy reload --config /etc/caddy/Caddyfile
+            else
+              docker compose up -d --force-recreate caddy
+            fi
 
       - name: Restart and verify
         uses: appleboy/ssh-action@v1
@@ -127,4 +135,8 @@ jobs:
             sleep 5
             systemctl is-active vane
             curl -fsS --max-time 5 http://127.0.0.1:8080/readyz
+            # Caddy 路由生效验证：主域 well-known 必须由后端应答（json/404），
+            # 返回 SPA html ⇒ Caddyfile 的 well-known 反代没在跑 ⇒ 部署失败要响。
+            ctype=$(curl -sS -o /dev/null -w '%{content_type}' --max-time 5 https://vane.zhuoqidev.com/.well-known/agent-card.json)
+            case "$ctype" in *text/html*) echo "well-known 返回 SPA（$ctype），Caddy 配置未生效"; exit 1;; esac
             echo "deploy verified: readyz OK"
