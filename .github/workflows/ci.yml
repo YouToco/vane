@@ -51,6 +51,17 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
+    # 串行化对同一台 VPS 的部署。无此 group 时，相近时间 push main（如一个 release
+    # commit + 一个 fix PR）会并行跑两个 deploy，各自 scp 二进制 + restart vane，谁晚
+    # 完成谁覆盖、与 git 顺序无关，可能静默把旧二进制推上线（2026-07-17 PR #49 与
+    # v0.5.1 并发的真实隐患：靠 #49 恰好晚 1m24s 完成才侥幸上对版本）。放在 job 级只
+    # 串行部署、不碰 PR test 的并发度。cancel-in-progress: false：不打断正在 restart
+    # 的部署（半路取消可能留下半吊子状态）；排队时新 pending 会取代旧 pending，故最终
+    # 仍以最新 main 为准。
+    concurrency:
+      group: deploy-vps
+      cancel-in-progress: false
+
     steps:
       - uses: actions/checkout@v7
 
