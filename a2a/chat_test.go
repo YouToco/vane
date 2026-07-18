@@ -59,7 +59,7 @@ func (f *fakeOwner) UpsertUserByOpenID(_ context.Context, openID, name string) (
 	if f.upsertErr != nil {
 		return nil, f.upsertErr
 	}
-	return &types.User{ID: f.userID, FeishuOpenID: openID, Name: name}, nil
+	return &types.User{ID: f.userID, FeishuOpenID: &openID, Name: name}, nil
 }
 
 // ownerResolver 把 OwnerStore 替身包成 auth.PrincipalResolver。

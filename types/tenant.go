@@ -68,3 +68,15 @@ func (i Invite) Exhausted() bool { return i.UsedCount >= i.MaxUses }
 func (i Invite) Expired(now time.Time) bool {
 	return i.ExpiresAt != nil && !i.ExpiresAt.After(now)
 }
+
+// Session 登录会话（user_sessions 表，migration 019）。
+//
+// TokenHash 是会话 token 的 sha256——**库里没有明文 token**（见 auth/session.go）。
+type Session struct {
+	TokenHash  []byte     `json:"-"`
+	UserID     int64      `json:"user_id"`
+	TenantID   int64      `json:"tenant_id"`
+	CreatedAt  time.Time  `json:"created_at"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+}

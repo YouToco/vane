@@ -14,10 +14,19 @@ import (
 
 // User 用户（users 表）。MVP 阶段用户即飞书用户。
 type User struct {
-	ID           int64     `json:"id"`
-	FeishuOpenID string    `json:"feishu_open_id"` // 飞书 open_id，UNIQUE NOT NULL
+	ID int64 `json:"id"`
+	// FeishuOpenID 飞书身份。migration 019 起**可空**：邮箱注册的用户没有 open_id。
+	// Postgres 的 UNIQUE 视多个 NULL 为互不相同，故多行空值不冲突。
+	FeishuOpenID *string   `json:"feishu_open_id,omitempty"`
 	Name         string    `json:"name"`
 	CreatedAt    time.Time `json:"created_at"`
+	// Email / PasswordHash 是邮箱身份（migration 019，决议 D2′）。
+	// 二者同生共死（DB 约束 ck_users_email_has_password）：有邮箱必有密码。
+	// **PasswordHash 绝不可出现在任何对外响应里**——它有 json tag 仅为库内扫描方便。
+	Email        *string `json:"email,omitempty"`
+	PasswordHash *string `json:"-"`
+	// EmailVerified 邀请制下首版恒 false（邀请码即把关），为将来接发信服务预留。
+	EmailVerified bool `json:"email_verified"`
 }
 
 // Source 信源（sources 表）。
