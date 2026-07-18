@@ -367,7 +367,11 @@ func TestScore_CancelledContextStopsQueuedItems(t *testing.T) {
 // 本用例断言两件事：panic 仍然从 Score 调用点抛出（Temporal 接得住），
 // 且携带原始 goroutine 栈（否则现场只剩重抛的那一行，排查时看不见挂在哪）。
 func TestScore_PanicSurfacesAsActivityPanicNotProcessCrash(t *testing.T) {
-	sc := &panicScorer{panicOn: 3}
+	// 条数刻意取 3 倍扇出：必须有 goroutine 真的在等令牌，才能测到
+	// 「panic 时令牌是否归还」。若不归还，等令牌的那些会永久阻塞、wg.Wait() 挂死，
+	// 表现为 activity 卡到 120 秒超时——比崩溃更难查。
+	// （defer 是 LIFO：归还令牌那个 defer 注册最晚、跑得最早，先于 recover 与 wg.Done。）
+	sc := &panicScorer{panicOn: 3, delay: 5 * time.Millisecond}
 	a := newActivitiesWith(sc, fakeCardGen{})
 
 	defer func() {
@@ -384,14 +388,46 @@ func TestScore_PanicSurfacesAsActivityPanicNotProcessCrash(t *testing.T) {
 		}
 	}()
 
-	_, _ = a.Score(t.Context(), ScoreIn{UserID: 1, TraceID: "t", Items: itemsWithIDs(8)})
+	_, _ = a.Score(t.Context(), ScoreIn{UserID: 1, TraceID: "t", Items: itemsWithIDs(parBatchFanout * 3)})
 }
 
-type panicScorer struct{ panicOn int64 }
+type panicScorer struct {
+	panicOn    int64
+	panicOnAll bool
+	delay      time.Duration
+}
 
 func (p *panicScorer) Score(_ context.Context, _ int64, item types.ContentItem, _ string) (float64, error) {
-	if item.ID == p.panicOn {
+	if p.delay > 0 {
+		time.Sleep(p.delay)
+	}
+	if p.panicOnAll || item.ID == p.panicOn {
 		panic("打分炸了")
 	}
 	return 50, nil
+}
+
+// TestScore_PanicDoesNotLeakSemaphoreTokens 单独验"panic 时令牌归还"。
+//
+// 上一条用例（单条 panic）测不到这个：只漏 1 个令牌，剩下 15 个足够让其余条目跑完，
+// 不会死锁——实测把归还从 defer 改成仅正常路径执行，那条用例照样绿。
+// 要暴露泄漏必须让**在飞的那一批全部 panic**，把令牌一次漏光：此时后面排队的
+// 永远拿不到令牌，wg.Wait() 永久阻塞，activity 卡到 120 秒超时（比崩溃更难查）。
+func TestScore_PanicDoesNotLeakSemaphoreTokens(t *testing.T) {
+	sc := &panicScorer{panicOnAll: true, delay: 2 * time.Millisecond}
+	a := newActivitiesWith(sc, fakeCardGen{})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() { _ = recover() }()
+		_, _ = a.Score(t.Context(), ScoreIn{UserID: 1, TraceID: "t", Items: itemsWithIDs(parBatchFanout * 3)})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("整批 panic 后 Score 不返回——信号量令牌在 panic 路径上泄漏了，" +
+			"排队中的 goroutine 永远拿不到令牌，wg.Wait() 永久阻塞")
+	}
 }
