@@ -89,11 +89,24 @@ Dashboard 只有一个共享密码（`api/auth.go:38`），无用户表参与鉴
 
 **契约（与实现方式无关的不变量）**:
 
-principal 解析收敛为**唯一一处**，无论认证由谁实现:
+principal 解析收敛为**唯一一处**，无论认证由谁实现。**已落地**（`auth` 包，2026-07-18）:
 ```go
-func PrincipalFromContext(ctx context.Context) (Principal, error)
-type Principal struct { TenantID TenantID; UserID int64 }
+// package auth
+type Principal struct { TenantID types.TenantID; UserID int64 }
+
+type PrincipalResolver interface {                      // 接缝：api/a2a/gate 依赖它
+    FromContext(ctx context.Context) (Principal, error)
+}
+
+func NewOwnerResolver(store OwnerStore, settingKey string) PrincipalResolver  // 过渡期实现
 ```
+**为什么是接口方法而非契约原写的包级 `PrincipalFromContext`**:过渡期实现要查库
+（owner 存在 settings 里），做不成无依赖的包级函数。真实认证落地后 principal 由认证中间件
+注入 ctx、store 依赖消失，届时可退化为纯 ctx 读取——**接口形状不变，上层不受影响**。
+
+`settingKey` 由装配方传入而非包内硬编码:**auth 不 import feishu**——地基层不该知道
+任何推送渠道的存在（§3 要把飞书降为一个 channel），也让「owner 来自飞书设置」
+显式成为一处过渡期装配细节。
 三份复述全部删除。**这是零风险的第一刀**——过渡期该函数可先返回固定
 `{1, ownerUserID}`，行为完全不变，但调用点从此拿的是「上下文里的 principal」
 而非「全局 owner」。
