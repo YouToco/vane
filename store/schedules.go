@@ -108,21 +108,32 @@ func (s *Store) UpdateScheduleSpec(ctx context.Context, id string, spec json.Raw
 
 // DeleteSchedule 删除调度镜像行。scheduler 在 Temporal Delete 成功后调用；
 // 幂等：删不存在的 id 不报错（无行受影响）。
-func (s *Store) DeleteSchedule(ctx context.Context, id string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM schedules WHERE id = $1`, id)
+// DeleteSchedule 删除调度镜像。**归属校验在 WHERE 谓词内完成**——
+// 越权请求完全无副作用，而不是先查再判（那有 TOCTOU 窗口，且容易漏判）。
+// 范式取自 store/agent.go 的 ClaimPendingAction，是全仓归属校验做得最好的一处。
+//
+// 找不到行时返回 CodeNotFound 而非「无权限」：不区分「不存在」与「不属于你」，
+// 否则调用方可用它枚举他人调度 id 是否存在。
+func (s *Store) DeleteSchedule(ctx context.Context, id string, userID int64) error {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM schedules WHERE id = $1 AND user_id = $2`, id, userID)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("删除调度镜像（id=%s）", id), err)
+	}
+	if tag.RowsAffected() == 0 {
+		return types.NewAppError(types.CodeNotFound,
+			fmt.Sprintf("调度 id=%s 不存在", id), nil)
 	}
 	return nil
 }
 
 // GetSchedule 按 id 读取单个调度镜像；不存在时返回 CodeNotFound 的 AppError，
 // 调用方可用 errors.Is(err, types.ErrNotFound) 命中。
-func (s *Store) GetSchedule(ctx context.Context, id string) (*types.Schedule, error) {
+func (s *Store) GetSchedule(ctx context.Context, id string, userID int64) (*types.Schedule, error) {
 	var sc types.Schedule
 	err := scanSchedule(
-		s.pool.QueryRow(ctx, `SELECT `+scheduleColumns+` FROM schedules WHERE id = $1`, id),
+		s.pool.QueryRow(ctx, `SELECT `+scheduleColumns+` FROM schedules WHERE id = $1 AND user_id = $2`, id, userID),
 		&sc)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

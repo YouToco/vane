@@ -565,7 +565,7 @@ func TestPipelineStore(t *testing.T) {
 			t.Errorf("新建的调度 %s 未出现在列表中（共 %d 条）", schedID, len(list))
 		}
 
-		got, err := st.GetSchedule(ctx, schedID)
+		got, err := st.GetSchedule(ctx, schedID, u.ID)
 		if err != nil {
 			t.Fatalf("GetSchedule() 失败: %v", err)
 		}
@@ -573,10 +573,10 @@ func TestPipelineStore(t *testing.T) {
 			t.Errorf("GetSchedule() 回读不一致：%+v", got)
 		}
 
-		if err := st.DeleteSchedule(ctx, schedID); err != nil {
+		if err := st.DeleteSchedule(ctx, schedID, u.ID); err != nil {
 			t.Fatalf("DeleteSchedule() 失败: %v", err)
 		}
-		_, err = st.GetSchedule(ctx, schedID)
+		_, err = st.GetSchedule(ctx, schedID, u.ID)
 		if err == nil {
 			t.Fatal("删除后 GetSchedule() 应返回错误")
 		}

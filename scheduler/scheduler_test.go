@@ -262,6 +262,12 @@ type fakeScheduleStore struct {
 	updateCall int
 }
 
+// GetSchedule 一律放行：本组用例聚焦「更新 Spec 时不弄丢 Action/Policy」，
+// 归属校验由 TestOwnershipCheckedBeforeTemporal 专门覆盖，不在此重复。
+func (f *fakeScheduleStore) GetSchedule(_ context.Context, id string, userID int64) (*types.Schedule, error) {
+	return &types.Schedule{ID: id, UserID: userID}, nil
+}
+
 func (f *fakeScheduleStore) UpdateScheduleSpec(_ context.Context, id string, spec json.RawMessage, nlDesc *string) error {
 	f.updateCall++
 	f.gotID, f.gotSpec, f.gotNLDesc = id, spec, nlDesc
@@ -300,7 +306,7 @@ func newUpdateFixture(mirrorErr error) (*Scheduler, *fakeScheduleHandle, *fakeSc
 func TestUpdatePush_只换Spec保留Action与Overlap(t *testing.T) {
 	s, h, st := newUpdateFixture(nil)
 
-	err := s.UpdatePush(context.Background(), "push-1-abc", ScheduleSpec{Cron: "30 9 * * *"}, nil)
+	err := s.UpdatePush(context.Background(), "push-1-abc", 1, ScheduleSpec{Cron: "30 9 * * *"}, nil)
 	if err != nil {
 		t.Fatalf("UpdatePush 失败: %v", err)
 	}
@@ -337,7 +343,7 @@ func TestUpdatePush_cron与interval互切(t *testing.T) {
 	s, h, _ := newUpdateFixture(nil)
 
 	// cron → interval
-	if err := s.UpdatePush(context.Background(), "id", ScheduleSpec{EverySeconds: 21600}, nil); err != nil {
+	if err := s.UpdatePush(context.Background(), "id", 1, ScheduleSpec{EverySeconds: 21600}, nil); err != nil {
 		t.Fatalf("改成 interval 失败: %v", err)
 	}
 	if len(h.current.Spec.CronExpressions) != 0 {
@@ -348,7 +354,7 @@ func TestUpdatePush_cron与interval互切(t *testing.T) {
 	}
 
 	// interval → cron
-	if err := s.UpdatePush(context.Background(), "id", ScheduleSpec{Cron: "0 7 * * *"}, nil); err != nil {
+	if err := s.UpdatePush(context.Background(), "id", 1, ScheduleSpec{Cron: "0 7 * * *"}, nil); err != nil {
 		t.Fatalf("改回 cron 失败: %v", err)
 	}
 	if len(h.current.Spec.Intervals) != 0 {
@@ -363,7 +369,7 @@ func TestUpdatePush_镜像失败回滚Temporal(t *testing.T) {
 	mirrorErr := types.NewAppError(types.CodeDatabase, "模拟镜像写失败", nil)
 	s, h, _ := newUpdateFixture(mirrorErr)
 
-	err := s.UpdatePush(context.Background(), "id", ScheduleSpec{Cron: "30 9 * * *"}, nil)
+	err := s.UpdatePush(context.Background(), "id", 1, ScheduleSpec{Cron: "30 9 * * *"}, nil)
 	if err == nil {
 		t.Fatal("镜像失败必须上抛错误，不能让调用方以为改成了")
 	}
@@ -392,7 +398,7 @@ func TestUpdatePush_校验失败不碰Temporal(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, h, st := newUpdateFixture(nil)
-			err := s.UpdatePush(context.Background(), "id", spec, nil)
+			err := s.UpdatePush(context.Background(), "id", 1, spec, nil)
 			if err == nil {
 				t.Fatal("非法 spec 应被拒")
 			}
@@ -412,7 +418,7 @@ func TestUpdatePush_NotFound(t *testing.T) {
 	s, _, st := newUpdateFixture(nil)
 	s.c.(*fakeTemporalClient).sched.handle.updateErr = serviceerror.NewNotFound("schedule not found")
 
-	err := s.UpdatePush(context.Background(), "missing", ScheduleSpec{Cron: "0 8 * * *"}, nil)
+	err := s.UpdatePush(context.Background(), "missing", 1, ScheduleSpec{Cron: "0 8 * * *"}, nil)
 	if err == nil {
 		t.Fatal("不存在的调度应报错")
 	}
@@ -427,7 +433,7 @@ func TestUpdatePush_NotFound(t *testing.T) {
 // TestUpdatePush_nlDesc透传 nil=不改描述、非 nil=改，指针语义必须原样传到 store。
 func TestUpdatePush_nlDesc透传(t *testing.T) {
 	s, _, st := newUpdateFixture(nil)
-	if err := s.UpdatePush(context.Background(), "id", ScheduleSpec{Cron: "0 8 * * *"}, nil); err != nil {
+	if err := s.UpdatePush(context.Background(), "id", 1, ScheduleSpec{Cron: "0 8 * * *"}, nil); err != nil {
 		t.Fatalf("失败: %v", err)
 	}
 	if st.gotNLDesc != nil {
@@ -436,7 +442,7 @@ func TestUpdatePush_nlDesc透传(t *testing.T) {
 
 	desc := "每天早上 8 点半"
 	s2, _, st2 := newUpdateFixture(nil)
-	if err := s2.UpdatePush(context.Background(), "id", ScheduleSpec{Cron: "30 8 * * *"}, &desc); err != nil {
+	if err := s2.UpdatePush(context.Background(), "id", 1, ScheduleSpec{Cron: "30 8 * * *"}, &desc); err != nil {
 		t.Fatalf("失败: %v", err)
 	}
 	if st2.gotNLDesc == nil || *st2.gotNLDesc != desc {
@@ -551,5 +557,55 @@ func TestValidateSpec_锚点约束(t *testing.T) {
 		if err := validateSpec(ScheduleSpec{EverySeconds: 7200, AnchorAt: bad}); err == nil {
 			t.Errorf("非 RFC3339 锚点 %q 应被拒", bad)
 		}
+	}
+}
+
+// ownershipStore 让 GetSchedule 按 (id, userID) 判定归属，并记录 Temporal 是否被动过。
+type ownershipStore struct {
+	scheduleStore
+	ownerUserID int64
+	getCalls    int
+	deleteCalls int
+}
+
+func (o *ownershipStore) GetSchedule(_ context.Context, id string, userID int64) (*types.Schedule, error) {
+	o.getCalls++
+	if userID != o.ownerUserID {
+		// 与生产同语义：不属于你 = 查不到（不给枚举他人 id 的机会）。
+		return nil, types.NewAppError(types.CodeNotFound, "调度不存在", nil)
+	}
+	return &types.Schedule{ID: id, UserID: userID}, nil
+}
+
+func (o *ownershipStore) DeleteSchedule(_ context.Context, _ string, _ int64) error {
+	o.deleteCalls++
+	return nil
+}
+
+// TestOwnershipCheckedBeforeTemporal 钉住本次修复最关键的一条：
+// **归属校验必须发生在动 Temporal 之前**。
+//
+// Temporal 的删除不可逆——若实现写成「先 h.Delete(ctx) 再校验」，那么校验失败时
+// 受害者的调度已经被销毁，校验形同虚设。本用例用一个必然 panic 的 Temporal client
+// 反证：越权请求若真到达 Temporal，就会 panic；能干净地拿到 NotFound，
+// 恰恰证明它在此之前就被拦下了。
+func TestOwnershipCheckedBeforeTemporal(t *testing.T) {
+	st := &ownershipStore{ownerUserID: 1}
+	// c 为 nil：任何触碰 Temporal 的操作都会 panic。
+	s := &Scheduler{st: st}
+
+	err := s.DeletePush(context.Background(), "push-1-victim", 999) // 攻击者 999
+	if err == nil {
+		t.Fatal("越权删除应被拒")
+	}
+	var ae *types.AppError
+	if !errors.As(err, &ae) || ae.Code != types.CodeNotFound {
+		t.Errorf("应回 NotFound（不泄漏他人调度存在性），实得 %v", err)
+	}
+	if st.getCalls != 1 {
+		t.Errorf("应先查归属一次，实得 %d", st.getCalls)
+	}
+	if st.deleteCalls != 0 {
+		t.Error("越权请求不得删除镜像")
 	}
 }

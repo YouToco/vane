@@ -36,8 +36,8 @@ type Scheduler interface {
 	PushNow(ctx context.Context, userID int64, scope workflow.PushScope) (runID string, err error)
 	// UpdatePush 原地改已有调度的触发频率（不换 schedule_id、不中断调度）。
 	// nlDesc 为 nil 表示不改描述。
-	UpdatePush(ctx context.Context, schedID string, spec scheduler.ScheduleSpec, nlDesc *string) error
-	DeletePush(ctx context.Context, schedID string) error
+	UpdatePush(ctx context.Context, schedID string, userID int64, spec scheduler.ScheduleSpec, nlDesc *string) error
+	DeletePush(ctx context.Context, schedID string, userID int64) error
 }
 
 // AuthStore 是认证路径所需的窄接口（生产实现 *store.Store）。

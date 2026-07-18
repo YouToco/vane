@@ -29,8 +29,8 @@ func (f *fakeScheduler) CreatePush(context.Context, int64, scheduler.ScheduleSpe
 func (f *fakeScheduler) PushNow(context.Context, int64, workflow.PushScope) (string, error) {
 	return "", nil
 }
-func (f *fakeScheduler) DeletePush(context.Context, string) error { return nil }
-func (f *fakeScheduler) UpdatePush(_ context.Context, id string, spec scheduler.ScheduleSpec, nlDesc *string) error {
+func (f *fakeScheduler) DeletePush(context.Context, string, int64) error { return nil }
+func (f *fakeScheduler) UpdatePush(_ context.Context, id string, _ int64, spec scheduler.ScheduleSpec, nlDesc *string) error {
 	f.calls++
 	f.gotID, f.gotSpec, f.gotNLDesc = id, spec, nlDesc
 	return f.retErr

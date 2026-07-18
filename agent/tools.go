@@ -687,7 +687,7 @@ func (t *updateScheduleTool) Parameters() json.RawMessage {
 }
 func (t *updateScheduleTool) Mutating() bool { return true }
 
-func (t *updateScheduleTool) Execute(ctx context.Context, _ int64, args json.RawMessage) (string, error) {
+func (t *updateScheduleTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
 	var a updateScheduleArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "参数不是合法 JSON，请修正后重试", nil
@@ -705,7 +705,7 @@ func (t *updateScheduleTool) Execute(ctx context.Context, _ int64, args json.Raw
 		AnchorAt:     a.Spec.AnchorAt,
 		TZ:           a.Spec.TZ,
 	}
-	if err := t.sched.UpdatePush(ctx, schedID, spec, a.NLDescription); err != nil {
+	if err := t.sched.UpdatePush(ctx, schedID, userID, spec, a.NLDescription); err != nil {
 		// 与 create_schedule 同约定：确定性、用户可修正的失败（cron 过细、任务不存在）
 		// 转成文案回给模型自纠；基础设施错误上抛。
 		var ae *types.AppError
@@ -776,7 +776,7 @@ func (t *removeScheduleTool) Execute(ctx context.Context, userID int64, args jso
 		return "schedule_id 必须是非空字符串", nil
 	}
 	schedID := strings.TrimSpace(a.ScheduleID)
-	if err := t.sched.DeletePush(ctx, schedID); err != nil {
+	if err := t.sched.DeletePush(ctx, schedID, userID); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("已删除定时推送任务（id=%s）。", schedID), nil
