@@ -2,6 +2,7 @@ package feedback
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,9 @@ const noticeTitleRunes = 100
 type Store interface {
 	GetDeliveryForUser(ctx context.Context, id, userID int64) (*types.Delivery, error)
 	GetDeliveryByFeishuMessageID(ctx context.Context, userID int64, msgID string) (*types.Delivery, error)
+	// ListDeliveriesByFeishuMessage 同一条飞书消息承载的全部投递（聚合卡重建用），
+	// 按分数降序；历史单条卡查回 1 行，重建路径据 len 分流。
+	ListDeliveriesByFeishuMessage(ctx context.Context, userID int64, msgID string) ([]types.Delivery, error)
 	InsertFeedback(ctx context.Context, f *types.Feedback) (int64, error)
 	InsertDeepDiveFeedback(ctx context.Context, f *types.Feedback) (id int64, existingDetail string, existed bool, err error)
 	LatestFeedbackAction(ctx context.Context, deliveryID int64, actions []types.FeedbackAction) (types.FeedbackAction, error)
@@ -72,6 +76,9 @@ type Deps struct {
 	Sender    Sender
 	Notifier  SessionNotifier
 	BuildCard CardBuilder
+	// BuildAggCard 聚合卡构造（生产装配传 feishu.BuildAggregateCard）。
+	// nil 时聚合重建退化为"不更新卡片"（toast 仍达）——灰度/测试装配安全。
+	BuildAggCard func(in AggregateCardInput) string
 	// DeepDiveModel deep_dive 生成用模型（cfg.LLM.AgentModel——Boss 拍板③：
 	// 深度解读值得 v4-pro，与打分/出卡的默认档分开）。
 	DeepDiveModel string
@@ -208,6 +215,34 @@ func (s *Service) HandleReasonSubmit(ctx context.Context, userID int64, submit R
 // 状态重查失败只降级为不更新卡片：主操作已成功，不能把它报成失败。
 func (s *Service) rebuilt(ctx context.Context, d *types.Delivery, toast string, ok bool, force func(*CardState)) ClickResult {
 	res := ClickResult{Toast: toast, ToastOK: ok}
+
+	// 聚合卡分流（附录 A）：同一 feishu_message_id 承载多个 delivery 时走聚合重建。
+	// 历史单条卡查回恰好 1 行（每卡独立 message_id），自然落回单条路径——旧卡外观零变化。
+	//
+	// 已知取舍（对抗审查 #5/#6，单 owner 容忍）：推送后 MarkDeliverySent 逐条回填
+	// msgID 的毫秒级窗口内点击，兄弟查询可能少行 → 重建出的卡短暂缺条目；回填完成后
+	// 下一次点击按库内全量自愈。根治需批量回填或事务，不值当前复杂度。
+	if d.FeishuMessageID != "" {
+		siblings, serr := s.deps.Store.ListDeliveriesByFeishuMessage(ctx, d.UserID, d.FeishuMessageID)
+		if serr != nil {
+			slog.Warn("feedback: 查兄弟投递失败，本次不更新卡片", "delivery_id", d.ID, "err", serr)
+			return res
+		}
+		if len(siblings) > 1 {
+			// toast 带被点条标题回显（附录 A.4 吸收项）：聚合卡 N 条并排，toast 是
+			// 用户确认"系统记到了我点的那条"的最后一道人眼防线。
+			if ci, cerr := s.contentOf(ctx, d); cerr == nil && ci != nil && ci.Title != "" {
+				res.Toast = toast + "《" + promptguard.TruncateRunes(ci.Title, 20) + "》"
+			}
+			if cardJSON, aerr := s.rebuildAggregate(ctx, d, siblings, force); aerr != nil {
+				slog.Warn("feedback: 聚合卡重建失败，本次不更新卡片", "delivery_id", d.ID, "err", aerr)
+			} else {
+				res.CardJSON = cardJSON
+			}
+			return res
+		}
+	}
+
 	st, err := s.cardState(ctx, d.ID)
 	if err != nil {
 		slog.Warn("feedback: 重查卡片状态失败，本次不更新卡片", "delivery_id", d.ID, "err", err)
@@ -307,4 +342,74 @@ func actionLabel(a types.FeedbackAction) string {
 		return "深度解读"
 	}
 	return string(a)
+}
+
+// rebuildAggregate 按库内状态重建聚合卡：每个兄弟条目各查各的 CardState 与内容元数据，
+// header 从库存 card_json 原样解析回填（重建时拿不到任务名，且 header 不该随点击变）。
+// clicked/force 只作用于被点的那一条——deep_dive 启动等 force 语义不能误伤兄弟条目。
+func (s *Service) rebuildAggregate(ctx context.Context, clicked *types.Delivery, siblings []types.Delivery, force func(*CardState)) (string, error) {
+	if s.deps.BuildAggCard == nil {
+		return "", errors.New("BuildAggCard 未装配")
+	}
+	items := make([]CardInput, 0, len(siblings))
+	for i := range siblings {
+		sib := &siblings[i]
+		st, err := s.cardState(ctx, sib.ID)
+		if err != nil {
+			// 中止整卡重建（对抗审查：零值渲染=用已知错误的"未表态"覆盖用户已提交的
+			// 表态上屏，与单条路径"查失败不更新卡片"的既有裁决相反）。主操作已成功，
+			// 卡片保持旧版本，下次点击自愈。
+			return "", fmt.Errorf("查兄弟条目 %d 状态失败: %w", sib.ID, err)
+		}
+		if force != nil && sib.ID == clicked.ID {
+			force(&st)
+		}
+		input := CardInput{
+			BodyMD:     sib.BodyMD,
+			DeliveryID: sib.ID,
+			State:      st,
+			Score:      int(sib.Score),
+		}
+		if sib.ContentItemID != nil {
+			if ci, err := s.deps.Store.GetContentItem(ctx, *sib.ContentItemID); err == nil {
+				input.Title = ci.Title
+				input.URL = ci.URL
+				input.PublishedAt = ci.PublishedAt
+				if src, err := s.deps.Store.GetSource(ctx, ci.SourceID); err == nil {
+					input.SourceTitle = src.Title
+					input.Platform = src.Platform
+				}
+			}
+		}
+		items = append(items, input)
+	}
+	title, tmpl := parseAggHeader(clicked.CardJSON)
+	return s.deps.BuildAggCard(AggregateCardInput{
+		HeaderTitle: title, HeaderTemplate: tmpl, Items: items,
+	}), nil
+}
+
+// parseAggHeader 从库存 card_json 解析 header 标题与色名；失败返回空串（构卡落兜底）。
+// 本地实现而非引 feishu 包：feishu→(agent)→…→feedback 的依赖方向不可倒转。
+func parseAggHeader(cardJSON []byte) (title, template string) {
+	var c struct {
+		Header struct {
+			Title struct {
+				Content string `json:"content"`
+			} `json:"title"`
+			Template string `json:"template"`
+		} `json:"header"`
+	}
+	if err := json.Unmarshal(cardJSON, &c); err != nil {
+		return "", ""
+	}
+	return c.Header.Title.Content, c.Header.Template
+}
+
+// contentOf 取投递对应的内容行（toast 标题回显用）；无内容或查失败返回 nil。
+func (s *Service) contentOf(ctx context.Context, d *types.Delivery) (*types.ContentItem, error) {
+	if d.ContentItemID == nil {
+		return nil, nil
+	}
+	return s.deps.Store.GetContentItem(ctx, *d.ContentItemID)
 }

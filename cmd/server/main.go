@@ -112,7 +112,8 @@ func run() error {
 	// buildNotice=feishu.BuildReplyCard：抓取失败告警走无按钮的普通卡（功能 5.2），
 	// 与 buildCard（带反馈按钮的 delivery 卡）分开注入，不碰 M5 卡片反馈路径。
 	activities := workflow.NewActivities(fetch, score, cards, push, st, manager, ev,
-		feishu.BuildDeliveryCard, feishu.BuildReplyCard)
+		feishu.BuildReplyCard,
+		feishu.BuildAggregateCard, feishu.AggHeaderForTask)
 
 	// worker：非阻塞 Start，关停时 Stop()（见下方顺序关停）。
 	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, worker.Options{})
@@ -185,6 +186,7 @@ func run() error {
 		Sender:        manager,
 		Notifier:      agentLoop,
 		BuildCard:     feishu.BuildDeliveryCard,
+		BuildAggCard:  feishu.BuildAggregateCard,
 		DeepDiveModel: cfg.LLM.AgentModel,
 	})
 	manager.SetFeedback(fbSvc)

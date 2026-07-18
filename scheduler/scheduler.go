@@ -129,7 +129,7 @@ func (s *Scheduler) CreatePush(ctx context.Context, userID int64, spec ScheduleS
 	}
 
 	schedID := fmt.Sprintf("push-%d-%s", userID, uuid.NewString())
-	params := workflow.PushParams{UserID: userID, Scope: scope}
+	params := workflow.PushParams{UserID: userID, Scope: scope, NLDesc: strings.TrimSpace(nlDesc)}
 
 	_, err = s.c.ScheduleClient().Create(ctx, client.ScheduleOptions{
 		ID:   schedID,

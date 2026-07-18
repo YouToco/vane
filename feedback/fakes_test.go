@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -120,6 +121,22 @@ func (f *fakeStore) GetDeliveryForUser(_ context.Context, id, userID int64) (*ty
 	}
 	cp := *d
 	return &cp, nil
+}
+
+func (f *fakeStore) ListDeliveriesByFeishuMessage(_ context.Context, userID int64, msgID string) ([]types.Delivery, error) {
+	if msgID == "" {
+		return nil, nil
+	}
+	var out []types.Delivery
+	for _, d := range f.deliveries {
+		if d.UserID == userID && d.FeishuMessageID == msgID {
+			out = append(out, *d)
+		}
+	}
+	// 与真 store 同序（id ASC）：map 遍历序随机，不排序会让条目顺序断言 flaky，
+	// 且掩盖"重建序≠首发序"一类真错位。
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 func (f *fakeStore) GetDeliveryByFeishuMessageID(ctx context.Context, userID int64, msgID string) (*types.Delivery, error) {

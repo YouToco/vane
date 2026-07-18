@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strconv"
@@ -502,7 +503,14 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 			slog.Error("feishu: 反馈原因回调 upsert 用户失败", "err", err, "open_id", operatorID)
 			return toastResponse("error", "内部数据错误，请稍后重试"), nil
 		}
-		reason, _ := event.Event.Action.FormValue["reason"].(string)
+		reason, rerr := extractReasonFromForm(event.Event.Action.Name, event.Event.Action.FormValue, reasonDeliveryID)
+		if rerr != nil {
+			// 三重对齐失败 = 提交按钮与 value 指向的条目对不上。绝不猜、绝不静默落库
+			// ——错误归属的 misjudged 不可撤销且会毒化画像演化（附录 A.4 红线）。
+			slog.Error("feishu: 反馈原因表单对齐校验失败，拒绝落库",
+				"action_name", event.Event.Action.Name, "delivery_id", reasonDeliveryID, "err", rerr)
+			return toastResponse("error", "表单数据异常，请重新点击 👎 后再试"), nil
+		}
 		return h.onFeedbackReasonSubmit(user.ID, reasonDeliveryID, reason), nil
 	}
 
@@ -1015,4 +1023,40 @@ func strVal(p *string) string {
 		return ""
 	}
 	return *p
+}
+
+// extractReasonFromForm 从 form 提交事件里取误判原因文本，带三重对齐校验（附录 A.4）。
+//
+// 两代卡片两条路径，靠提交按钮的 Action.Name 分流：
+//   - 历史单条卡：submit 按钮 name 恒为 "submit_reason"，原因在 FormValue["reason"]；
+//   - 聚合卡：name 三件套按 delivery_id 唯一化（submit_{id} / reason_{id}），
+//     **Action.Name 的后缀必须与 value 里的 delivery_id 一致**——form 归属（name）与
+//     按钮携带（value）两条独立通道互验，任何一条被串改/漂移都会在此对不上。
+//
+// 对齐通过后 key 缺失按空串处理（原因本就可跳过），不回退旧 key——回退等于把
+// "取错 form 的数据"重新变成静默路径。Name 为空的兜底只服务极老事件形状：仅当
+// FormValue 里只有旧世界的 "reason" 键时才按历史卡处理。
+func extractReasonFromForm(actionName string, formValue map[string]interface{}, deliveryID int64) (string, error) {
+	idStr := strconv.FormatInt(deliveryID, 10)
+	switch {
+	case actionName == "submit_reason":
+		// 历史单条卡：一卡一 form，无串条面。
+		reason, _ := formValue["reason"].(string)
+		return reason, nil
+	case actionName == "submit_"+idStr:
+		// 聚合卡且对齐成立：只认该条自己的 keyed input。
+		reason, _ := formValue["reason_"+idStr].(string)
+		return reason, nil
+	case actionName == "":
+		// 极老事件形状兜底：只在毫无聚合痕迹（无任何 reason_ 前缀键）时按历史卡处理。
+		for k := range formValue {
+			if strings.HasPrefix(k, "reason_") {
+				return "", fmt.Errorf("事件缺 action name 但含聚合键，无法安全归属")
+			}
+		}
+		reason, _ := formValue["reason"].(string)
+		return reason, nil
+	default:
+		return "", fmt.Errorf("提交按钮 name %q 与 delivery_id %s 不对齐", actionName, idStr)
+	}
 }

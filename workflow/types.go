@@ -27,6 +27,10 @@ const defaultTopN = 5
 type PushParams struct {
 	UserID int64     `json:"user_id"`
 	Scope  PushScope `json:"scope"`
+	// NLDesc 触发本次推送的调度的自然语言描述（聚合卡 header 的任务名）。
+	// 存量调度的 Temporal Action 里没有本字段，解出零值空串——聚合卡落兜底标题，
+	// 行为安全；新建调度由 scheduler.CreatePush 填入。
+	NLDesc string `json:"nl_desc,omitempty"`
 }
 
 // PushScope 推送范围过滤。
