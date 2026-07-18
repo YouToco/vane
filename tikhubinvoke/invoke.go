@@ -43,13 +43,30 @@ type Invoker struct {
 	apiKey  string
 }
 
+// Option 构造选项。目前唯一用途是测试注入 httptest.Server 地址
+//（绑定引擎的测试在 fetcher 包，够不到本包私有字段）。
+type Option func(*Invoker)
+
+// WithBaseURL 覆盖上游地址（仅测试）。
+func WithBaseURL(u string) Option {
+	return func(v *Invoker) { v.baseURL = u }
+}
+
 // New 构造调用器，复用抓取配置里的 TikHub key（同一账号同一计费池）。
-func New(cfg config.FetchConfig) *Invoker {
-	return &Invoker{
-		hc:      &http.Client{Timeout: requestTimeout},
+func New(cfg config.FetchConfig, opts ...Option) *Invoker {
+	inv := &Invoker{
+		// 禁跟随重定向：与 fetcher 各抓取器一致，防 Bearer key 被 30x 外带到别的主机
+		//（2026-07-18 绑定引擎迁移时补齐——lookup 面此前缺这道防线，同样受益）。
+		hc: &http.Client{Timeout: requestTimeout, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
 		baseURL: defaultBaseURL,
 		apiKey:  cfg.TikhubAPIKey,
 	}
+	for _, o := range opts {
+		o(inv)
+	}
+	return inv
 }
 
 // Result 一次端点调用的结果。Body 是上游响应原文（读到 maxBodyBytes 截止）。

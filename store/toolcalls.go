@@ -1,6 +1,7 @@
 package store
 
 import (
+	"log/slog"
 	"context"
 	"time"
 
@@ -56,4 +57,14 @@ func (s *Store) CountTikHubEndpointCallsSince(ctx context.Context, since time.Ti
 		return 0, types.NewAppError(types.CodeDatabase, "统计 TikHub 端点调用量", err)
 	}
 	return n, nil
+}
+
+// RecordBindingCall 实现 fetcher.BindingCallRecorder：绑定引擎（调度面）的每次上游
+// 调用同步落一行 tool_calls（endpoint-binding-contract.md §5）。失败只记日志——
+// 记账是旁路可观测性，绝不放大成抓取失败（与 agent ToolCallRecorder 同一纪律）。
+func (s *Store) RecordBindingCall(ctx context.Context, rec *types.ToolCall) {
+	if _, err := s.InsertToolCall(ctx, rec); err != nil {
+		slog.Warn("tool_calls 绑定抓取记账失败（旁路，不影响抓取）",
+			"tool", rec.ToolName, "endpoint", rec.EndpointPath, "err", err)
+	}
 }

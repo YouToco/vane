@@ -26,27 +26,22 @@ func TestMulti_DispatchesByType(t *testing.T) {
 		_, _ = w.Write([]byte(sampleExaResponse))
 	}))
 	defer exaSrv.Close()
-	// TikHub 小红书搜索假服务端。
-	xhsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(sampleTikhubResponse))
-	}))
-	defer xhsSrv.Close()
-	// TikHub 小红书用户笔记假服务端。
-	xhsUserSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(sampleXHSUserResponse))
-	}))
-	defer xhsUserSrv.Close()
+	// TikHub 假服务端：绑定引擎按端点路径路由（一个引擎、一个 baseURL、多能力）。
+	up := newFakeUpstream()
+	up.bodies[pathSearch] = sampleTikhubResponse
+	up.bodies[pathUserPost] = sampleXHSUserResponse
+	tikSrv := httptest.NewServer(up.handler())
+	defer tikSrv.Close()
 
 	// seen 传 nil：本用例只验证按类型分发，不涉及详情补全（nil 会跳过补全）。
 	m := NewMulti(config.FetchConfig{
 		TimeoutSeconds: 10, MaxResponseMB: 1,
 		ExaAPIKey: "k", TikhubAPIKey: "k",
-	}, nil)
+	}, nil, nil)
 	// 子抓取器分别指向对应假服务端；RSS 放行环回（httptest 监听 127.0.0.1）。
 	m.rss = newTestFetcher()
 	m.exa.searchURL = exaSrv.URL
-	m.tikhub.baseURL = xhsSrv.URL
-	m.xhsUser.baseURL = xhsUserSrv.URL
+	m.binding = newTestBinding(tikSrv.URL, nil, nil)
 
 	cases := []struct {
 		name string
@@ -71,7 +66,7 @@ func TestMulti_DispatchesByType(t *testing.T) {
 }
 
 func TestMulti_UnknownPlatform(t *testing.T) {
-	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil)
+	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil, nil)
 	_, err := m.Fetch(context.Background(), types.Source{ID: 1, Platform: "carrier_pigeon"})
 	if !errors.Is(err, types.ErrValidation) {
 		t.Errorf("未知平台应判 ErrValidation，实际 %v", err)
@@ -85,7 +80,7 @@ func TestMulti_UnknownPlatform(t *testing.T) {
 // 被抓取时返回 CodeValidation，且**报错里带得出 sourcecatalog 的 Reason**——这正是契约 §2.2
 // 要的"机器可读的不可用原因"，让 agent 能解释为何不支持，而不是静默改道。
 func TestMulti_UnavailableCapabilityCarriesReason(t *testing.T) {
-	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil)
+	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil, nil)
 	_, err := m.Fetch(context.Background(), types.Source{
 		ID: 9, Platform: types.PlatformX, Capability: types.CapSearch,
 	})
@@ -119,12 +114,12 @@ func TestMulti_EveryAvailableCapabilityIsWired(t *testing.T) {
 	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	dead.Close()
 
-	m := NewMulti(config.FetchConfig{TimeoutSeconds: 5, MaxResponseMB: 1, ExaAPIKey: "k", TikhubAPIKey: "k"}, nil)
+	m := NewMulti(config.FetchConfig{TimeoutSeconds: 5, MaxResponseMB: 1, ExaAPIKey: "k", TikhubAPIKey: "k"}, nil, nil)
 	// 兜底把联网 provider 全指向死服务端（防将来 provider 跳过校验直接发请求时打外网）。
+	// 注意 hot_list 无必填参数，空 config 会**真的发起调用**——死服务端保证它只会
+	// 本地秒失败（引擎把传输失败归 CodeFetchTimeout 而非 CodeInternal，见 callAndDecode）。
 	m.exa.searchURL = dead.URL
-	m.tikhub.baseURL = dead.URL
-	m.xhsUser.baseURL = dead.URL
-	m.twitter.baseURL = dead.URL
+	m.binding = newTestBinding(dead.URL, nil, nil)
 
 	for _, e := range sourcecatalog.List() {
 		if !e.Available() {

@@ -35,8 +35,9 @@ import (
 
 const (
 	// maxActivatedEndpoints 会话内同时激活（注入 FC tools 数组）的端点上限。
-	// 15 = 30（业内共识的在场工具数安全线：RAG-MCP 压测 <30 成功率 >90%）
-	// 减去静态工具（10 个）再留余量。满了 FIFO 逐出最早激活的。
+	// 在场工具数安全线是 30（RAG-MCP 压测 <30 成功率 >90%）：当前静态面是
+	// 13 工具 + search_endpoints，15 个激活位正好顶到 29——**再加静态工具前
+	// 必须先降本上限**（2026-07-18 修正：原注释写"静态 10 个"已长期失真）。
 	maxActivatedEndpoints = 15
 	// searchTopK 每次检索返回并激活的端点数（Anthropic Tool Search 默认值同为 5）。
 	searchTopK = 5

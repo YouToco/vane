@@ -650,7 +650,7 @@ func TestValidateScheduleSpecFields_共用(t *testing.T) {
 // 等于不存在（loop 只认注册过的名字）。
 func TestBuildTools_包含update_schedule(t *testing.T) {
 	names := map[string]bool{}
-	for _, tl := range BuildTools(nil, nil, nil, nil, nil) {
+	for _, tl := range BuildTools(nil, nil, nil, nil, nil, nil) {
 		names[tl.Name()] = true
 	}
 	for _, want := range []string{"create_schedule", "update_schedule", "remove_schedule", "list_schedules", "view_task_playbook", "edit_task_playbook"} {

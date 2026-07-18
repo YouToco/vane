@@ -14,7 +14,9 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
+	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/sourcespec"
@@ -77,10 +79,12 @@ type scheduleCreator interface {
 // 该特性上线前完全一致。
 // tr 是任务手册翻译器（P1 编译层）：create/edit 手册后据此把正文编译成 fetch_plan。
 // 允许为 nil（未装配 LLM 的路径/测试）——此时手册仍可存取，只是不编译计划（best-effort）。
-func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger, tr playbookTranslator, endpoints *EndpointTools) []Tool {
+// prober 是绑定引擎的试跑入口（*fetcher.BindingFetcher，生产传 multi.Binding()）；
+// nil 合法（测试/未装配）——绑定能力退回不试跑直接落库。
+func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger, tr playbookTranslator, endpoints *EndpointTools, prober sourceProber) []Tool {
 	tools := []Tool{
 		&listSourcesTool{st: st},
-		&addSourceTool{st: st},
+		&addSourceTool{st: st, prober: prober},
 		&removeSourceTool{st: st},
 		&enableSourceTool{st: st},
 		&listSchedulesTool{st: st},
@@ -166,8 +170,10 @@ type addSourceArgs struct {
 	Query          string   `json:"query"`
 	Keyword        string   `json:"keyword"`
 	ScreenName     string   `json:"screen_name"`
-	UserID         string   `json:"user_id"`     // xhs/user_posts：小红书用户 ID
-	ProfileURL     string   `json:"profile_url"` // xhs/user_posts：小红书用户主页链接（可替代 user_id）
+	UserID         string   `json:"user_id"`     // xhs/user_posts、xhs/faved_notes：小红书用户 ID
+	ProfileURL     string   `json:"profile_url"` // xhs/user_posts、xhs/faved_notes：小红书用户主页链接（可替代 user_id）
+	PageID         string   `json:"page_id"`     // xhs/topic_feed：话题页面 ID（24 位十六进制）
+	TopicURL       string   `json:"topic_url"`   // xhs/topic_feed：话题链接/深链（可替代 page_id，自动抽 ID）
 	Title          string   `json:"title"`
 	Category       string   `json:"category"`
 	Categories     []string `json:"categories"`
@@ -188,15 +194,17 @@ const addSourceSchema = `{
     },
     "capability": {
       "type": "string",
-      "enum": ["feed", "search", "user_posts", "contents"],
-      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主）；contents=监控指定网页内容变化（仅 web，如产品定价页——内容变了才推送）。当前不支持的能力及原因见本工具说明（Description）。"
+      "enum": ["feed", "search", "user_posts", "contents", "hot_list", "topic_feed", "faved_notes"],
+      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主）；contents=监控指定网页内容变化（仅 web，如产品定价页——内容变了才推送）；hot_list=平台热榜追新（仅 xhs，无参数）；topic_feed=某话题下的新笔记（仅 xhs，需 page_id 或 topic_url）；faved_notes=某账号公开收藏的新笔记（仅 xhs，需 user_id 或 profile_url，对方收藏须公开）。当前不支持的能力及原因见本工具说明（Description）。"
     },
     "url": {"type": "string", "description": "网页地址（http/https）：platform=web capability=feed 时是 RSS 源地址，capability=contents 时是要监控变化的页面地址，均必填"},
     "query": {"type": "string", "description": "Exa 搜索词，platform=web capability=search 时必填"},
     "keyword": {"type": "string", "description": "小红书搜索关键词，platform=xhs capability=search 时必填"},
     "screen_name": {"type": "string", "description": "X 用户名（如 OpenAI），platform=x capability=user_posts 时必填"},
-    "user_id": {"type": "string", "description": "小红书用户 ID（24 位十六进制），platform=xhs capability=user_posts 时必填（或改用 profile_url）"},
-    "profile_url": {"type": "string", "description": "小红书用户主页链接（如 https://www.xiaohongshu.com/user/profile/<id>），platform=xhs capability=user_posts 时可替代 user_id"},
+    "user_id": {"type": "string", "description": "小红书用户 ID（24 位十六进制），platform=xhs 且 capability=user_posts/faved_notes 时必填（或改用 profile_url）"},
+    "profile_url": {"type": "string", "description": "小红书用户主页链接（如 https://www.xiaohongshu.com/user/profile/<id>），platform=xhs 且 capability=user_posts/faved_notes 时可替代 user_id"},
+    "page_id": {"type": "string", "description": "小红书话题页面 ID（24 位十六进制），platform=xhs capability=topic_feed 时必填（或改用 topic_url）。可从笔记正文话题标签的深链（xhsdiscover://…topic/normal?id=…）或话题页链接中获得"},
+    "topic_url": {"type": "string", "description": "小红书话题链接或深链，platform=xhs capability=topic_feed 时可替代 page_id（自动从中抽取 24 位十六进制 ID）"},
     "title": {"type": "string", "description": "可选：展示名，缺省按类型自动生成"},
     "category": {"type": "string", "description": "可选：Exa 结果类别（如 news），仅 web/search 生效"},
     "categories": {"type": "array", "items": {"type": "string"}, "description": "可选：RSS 分类过滤（如 [\"Product\",\"Research\"]），仅 web/feed 生效；不传=不限"},
@@ -204,9 +212,20 @@ const addSourceSchema = `{
   }
 }`
 
-type addSourceTool struct {
-	st *store.Store
+// sourceProber 收窄绑定引擎的试跑能力（*fetcher.BindingFetcher 已实现），可 fake 单测。
+// 试跑=准入（endpoint-binding-contract.md §2.2）：真调一次上游，全过才落库。
+type sourceProber interface {
+	Probe(ctx context.Context, src types.Source) (*fetcher.ProbeReport, error)
 }
+
+type addSourceTool struct {
+	st     *store.Store
+	prober sourceProber // nil = 不试跑（测试/未装配路径），绑定能力直接落库
+}
+
+// probeBudget 单次试跑的独立超时：卡片回调的执行预算 30s（feishu cardActionExecBudget），
+// 超 2.5s 会自动转异步补发结果，10s 足够一次上游调用且给回执留余量。
+const probeBudget = 10 * time.Second
 
 func (t *addSourceTool) Name() string { return "add_source" }
 func (t *addSourceTool) Description() string {
@@ -255,6 +274,8 @@ func specFromArgs(a addSourceArgs) sourcespec.Spec {
 	set("screen_name", a.ScreenName)
 	set("user_id", a.UserID)
 	set("profile_url", a.ProfileURL)
+	set("page_id", a.PageID)
+	set("topic_url", a.TopicURL)
 	if len(a.Categories) > 0 {
 		catJSON, _ := json.Marshal(a.Categories)
 		params["categories"] = string(catJSON)
@@ -285,6 +306,30 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 	if msg != "" {
 		return msg, nil
 	}
+
+	// 试跑=准入（契约 §2.2）：绑定能力先真调一次上游，全过才落库；失败不落任何行，
+	// 拒绝话术是给用户的人话（AppError.Message，红线 3：原始错误链不进用户面）。
+	var probeNote string
+	if fetcher.IsBindingBacked(src.Platform, src.Capability) && t.prober != nil {
+		probeCtx, cancel := context.WithTimeout(ctx, probeBudget)
+		report, perr := t.prober.Probe(probeCtx, *src)
+		cancel()
+		if perr != nil {
+			var ae *types.AppError
+			if errors.As(perr, &ae) {
+				return "试跑未通过，未添加信源：" + ae.Message, nil
+			}
+			return "", perr
+		}
+		probeNote = fmt.Sprintf("；试跑通过：提取 %d 条", report.Extracted)
+		if report.Newest != nil {
+			probeNote += fmt.Sprintf("，最新 %s", report.Newest.In(cstZone()).Format("2006-01-02 15:04"))
+		}
+		if len(report.SampleTitles) > 0 {
+			probeNote += fmt.Sprintf("，如「%s」", report.SampleTitles[0])
+		}
+	}
+
 	sourceID, updated, err := t.st.UpsertSource(ctx, src)
 	if err != nil {
 		return "", err
@@ -303,8 +348,11 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 		// 一律进幂等键（不变量 I-S2），因此命中既有行 ⇒ 这确实就是同一个源。
 		verb = "已订阅既有"
 	}
-	return fmt.Sprintf("%s信源（id=%d）：[%s/%s] %s", verb, sourceID, src.Platform, src.Capability, title), nil
+	return fmt.Sprintf("%s信源（id=%d）：[%s/%s] %s%s", verb, sourceID, src.Platform, src.Capability, title, probeNote), nil
 }
+
+// cstZone 回执时间用东八区（Boss 在国内看卡片，UTC 时间读起来像穿越）。
+func cstZone() *time.Location { return time.FixedZone("CST", 8*3600) }
 
 func (t *addSourceTool) Summarize(args json.RawMessage) string {
 	var a addSourceArgs
@@ -334,6 +382,20 @@ func (t *addSourceTool) Summarize(args json.RawMessage) string {
 		fmt.Fprintf(&b, "添加小红书博主信源：%s", who)
 	case "x/user_posts":
 		fmt.Fprintf(&b, "添加 X 用户时间线信源：@%s", strings.TrimSpace(a.ScreenName))
+	case "xhs/hot_list":
+		b.WriteString("添加小红书热榜信源（全站热榜追新，确认后先试跑一次）")
+	case "xhs/topic_feed":
+		topic := strings.TrimSpace(a.PageID)
+		if topic == "" {
+			topic = strings.TrimSpace(a.TopicURL)
+		}
+		fmt.Fprintf(&b, "添加小红书话题信源：%s（确认后先试跑一次）", topic)
+	case "xhs/faved_notes":
+		who := strings.TrimSpace(a.UserID)
+		if who == "" {
+			who = strings.TrimSpace(a.ProfileURL)
+		}
+		fmt.Fprintf(&b, "添加小红书收藏流信源：%s（需对方收藏公开，确认后先试跑一次）", who)
 	default:
 		fmt.Fprintf(&b, "添加信源（%s/%s，确认后校验）", p, c)
 	}

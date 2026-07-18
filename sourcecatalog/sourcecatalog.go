@@ -106,6 +106,21 @@ var catalog = map[key]Entry{
 		Platform: types.PlatformXHS, Capability: types.CapUserPosts,
 		Kind: types.KindArticle, Status: StatusAvailable,
 	},
+
+	// ── 绑定引擎承载的新能力（endpoint-binding-contract.md §7，2026-07-18 实测准入）──
+	// 实测口径可复跑：fetcher/binding_test.go 用真实响应样本锁定提取与时序。
+	{types.PlatformXHS, types.CapHotList}: {
+		Platform: types.PlatformXHS, Capability: types.CapHotList,
+		Kind: types.KindArticle, Status: StatusAvailable,
+	},
+	{types.PlatformXHS, types.CapTopicFeed}: {
+		Platform: types.PlatformXHS, Capability: types.CapTopicFeed,
+		Kind: types.KindArticle, Status: StatusAvailable,
+	},
+	{types.PlatformXHS, types.CapFavedNotes}: {
+		Platform: types.PlatformXHS, Capability: types.CapFavedNotes,
+		Kind: types.KindArticle, Status: StatusAvailable,
+	},
 }
 
 // Lookup 返回 (平台, 能力) 对应的条目。ok=false 表示这个组合根本不在注册表里

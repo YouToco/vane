@@ -275,10 +275,88 @@ func buildXHS(cap types.Capability, params map[string]string, title string) (*ty
 			Status:     types.SourceStatusActive,
 		}, ""
 
+	// ── 绑定引擎承载的能力（endpoint-binding-contract.md §7）。IdemKey 规则不变：
+	// vane:// 手拼定序，全部改变抓取语义的用户参数进键（I-S2）；模板内部固定值
+	// （如 topic_feed 恒 sort=time）是能力语义、随代码版本化，不进键。──
+	case types.CapHotList:
+		// 无参数：热榜全局一份，全部订阅者共享同一行 sources。
+		if title == "" {
+			title = "小红书热榜"
+		}
+		return &types.Source{
+			Platform:   types.PlatformXHS,
+			Capability: types.CapHotList,
+			URL:        "vane://xhs/hot_list",
+			Title:      title,
+			Config:     json.RawMessage(`{}`),
+			Status:     types.SourceStatusActive,
+		}, ""
+
+	case types.CapTopicFeed:
+		pageID := extractXHSPageID(params)
+		if pageID == "" {
+			return nil, "xhs/topic_feed 必须提供 page_id（话题页面 ID，24 位十六进制；" +
+				"可从笔记的话题深链 xhsdiscover://…topic/normal?id=… 或话题页链接中获取）"
+		}
+		cfg, err := json.Marshal(map[string]string{"page_id": pageID})
+		if err != nil {
+			return nil, "构造信源配置失败"
+		}
+		if title == "" {
+			title = "小红书话题: " + pageID
+		}
+		return &types.Source{
+			Platform:   types.PlatformXHS,
+			Capability: types.CapTopicFeed,
+			URL:        "vane://xhs/topic_feed?page_id=" + url.QueryEscape(pageID),
+			Title:      title,
+			Config:     cfg,
+			Status:     types.SourceStatusActive,
+		}, ""
+
+	case types.CapFavedNotes:
+		// 与 user_posts 同一套 user_id 归一（直填 24hex 或主页链接抽取）：
+		// 同一个账号无论怎么加，faved_notes 的幂等键都相同。
+		userID := extractXHSUserID(params)
+		if userID == "" {
+			return nil, "xhs/faved_notes 必须提供 user_id（小红书用户 ID，24 位十六进制）或 profile_url（用户主页链接）；注意对方的收藏需公开可见"
+		}
+		cfg, err := json.Marshal(map[string]string{"user_id": userID})
+		if err != nil {
+			return nil, "构造信源配置失败"
+		}
+		if title == "" {
+			title = "小红书收藏: " + userID
+		}
+		return &types.Source{
+			Platform:   types.PlatformXHS,
+			Capability: types.CapFavedNotes,
+			URL:        "vane://xhs/faved_notes?user_id=" + url.QueryEscape(userID),
+			Title:      title,
+			Config:     cfg,
+			Status:     types.SourceStatusActive,
+		}, ""
+
 	default:
-		return nil, "xhs 平台仅支持 search / user_posts 能力"
+		return nil, "xhs 平台仅支持 search / user_posts / hot_list / topic_feed / faved_notes 能力"
 	}
 }
+
+// extractXHSPageID 解析话题 page_id：优先 page_id 直填（24 位 hex），否则从
+// topic_url / url / page_id 的任意链接形态里抽第一个 24 位 hex（话题深链
+// xhsdiscover://…?id=<hex> 与话题页 URL 都命中）。都拿不到返回空串。
+func extractXHSPageID(params map[string]string) string {
+	for _, k := range []string{"page_id", "topic_url", "url"} {
+		if v := strings.TrimSpace(params[k]); v != "" {
+			if m := xhsHex24Re.FindString(strings.ToLower(v)); m != "" {
+				return m
+			}
+		}
+	}
+	return ""
+}
+
+var xhsHex24Re = regexp.MustCompile(`[0-9a-f]{24}`)
 
 // extractXHSUserID 从 params 里解析小红书 user_id：优先 user_id 直填，其次从
 // profile_url / url 里按 /user/profile/<24hex> 抽取。都拿不到返回空串。
