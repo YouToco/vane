@@ -29,46 +29,14 @@ func scanSource(row pgx.Row, src *types.Source) error {
 	)
 }
 
-// ListActiveSourcesByUser 返回该用户 active 订阅、且信源本身 active 的所有信源。
-// 双重 active 过滤的原因：被连续失败自动 disabled 的信源不该再进入抓取；
-// 已取消（非 active）的订阅也不该被扇出。Fetch Activity 触发时刻现查用它。
-func (s *Store) ListActiveSourcesByUser(ctx context.Context, userID int64) ([]types.Source, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT `+sourceColumns+`
-		 FROM sources s
-		 JOIN subscriptions sub ON sub.source_id = s.id
-		 WHERE sub.user_id = $1 AND sub.status = $2 AND s.status = $3
-		 ORDER BY s.id`,
-		userID, types.SubscriptionStatusActive, types.SourceStatusActive)
-	if err != nil {
-		return nil, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("查询用户 %d 的 active 信源", userID), err)
-	}
-	defer rows.Close()
-
-	var out []types.Source
-	for rows.Next() {
-		var src types.Source
-		if err := scanSource(rows, &src); err != nil {
-			return nil, types.NewAppError(types.CodeDatabase, "扫描 source 行", err)
-		}
-		out = append(out, src)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "遍历 source 结果集", err)
-	}
-	return out, nil
-}
-
 // ListDueSourcesByUser 返回该用户 active 订阅、信源 active、且已到抓取时间
 // （next_fetch_at <= now()）的信源——这就是 001 注释里承诺的 ListDueForFetch 语义，
-// 命中 (status, next_fetch_at) 索引。
+// 命中 (status, next_fetch_at) 索引。这是抓取扇出的唯一入口。
 //
-// Fetch Activity 用它而非 ListActiveSourcesByUser 的原因（审查 #重复计费）：
-// markFetchResult 成功后会推进 next_fetch_at，Activity 超时重试时已抓成功的源
-// 自然被跳过——否则每次重试都重跑全部源，已成功的 Exa/TikHub 付费调用重复计费。
-// 刚添加的源 next_fetch_at DEFAULT now()，立即 due；刚抓过的源虽被跳过，
-// 但其已入库内容仍会被 ListUnpushedByUser 捞出，不影响推送结果。
+// 为什么要 due 过滤（审查 #重复计费）：markFetchResult 成功后会推进 next_fetch_at，
+// Activity 超时重试时已抓成功的源自然被跳过——否则每次重试都重跑全部源，已成功的
+// Exa/TikHub 付费调用重复计费。刚添加的源 next_fetch_at DEFAULT now()，立即 due；
+// 刚抓过的源虽被跳过，但其已入库内容仍会被 ListUnpushedByUser 捞出，不影响推送结果。
 func (s *Store) ListDueSourcesByUser(ctx context.Context, userID int64) ([]types.Source, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT `+sourceColumns+`
@@ -99,9 +67,9 @@ func (s *Store) ListDueSourcesByUser(ctx context.Context, userID int64) ([]types
 }
 
 // ListSubscribedSourcesByUser 返回该用户 active 订阅的所有信源，**不过滤 source.status**。
-// 与 ListActiveSourcesByUser 的区别：这里保留 disabled/paused 的信源，供 API 的
+// 与抓取扇出用的 ListDueSourcesByUser 的区别：这里保留 disabled/paused 的信源，供 API 的
 // GET /api/subscriptions 把订阅列表连同状态（含被自动 disabled / 暂停的源）一并回给
-// 前端，使 Sources.tsx 的状态灯可达。抓取扇出仍用双重 active 过滤的 ListActiveSourcesByUser。
+// 前端，使 Sources.tsx 的状态灯可达。抓取扇出则用双重 active + due 过滤的 ListDueSourcesByUser。
 func (s *Store) ListSubscribedSourcesByUser(ctx context.Context, userID int64) ([]types.Source, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT `+sourceColumns+`

@@ -355,21 +355,3 @@ func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Ch
 	rec.Record(context.WithoutCancel(ctx), call)
 	return resp, err
 }
-
-// truncateUTF8 按字节上限截断且保证结果是合法 UTF-8：直接 s[:max] 可能
-// 把多字节字符切一半，Postgres TEXT 会拒收非法 UTF-8，导致记账写库失败。
-func truncateUTF8(s string, maxBytes int) string {
-	if len(s) <= maxBytes {
-		return s
-	}
-	cut := s[:maxBytes]
-	// 末尾若是被切断的多字节序列，逐字节回退（最多 utf8.UTFMax-1 次）。
-	for len(cut) > 0 {
-		r, size := utf8.DecodeLastRuneInString(cut)
-		if r != utf8.RuneError || size > 1 {
-			break
-		}
-		cut = cut[:len(cut)-1]
-	}
-	return cut
-}

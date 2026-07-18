@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
-	"unicode/utf8"
 
 	"github.com/YouToco/vane/types"
 )
@@ -333,25 +331,6 @@ func TestDoChatErrorPropagates(t *testing.T) {
 	}
 	if code := types.CodeOf(err); code != types.CodeLLMUnavailable {
 		t.Errorf("错误码 = %s, 期望 %s", code, types.CodeLLMUnavailable)
-	}
-}
-
-// TestTruncateUTF8 截断必须落在 rune 边界：中文（3 字节/字）截到 8 字节
-// 应回退到 6 字节，结果始终是合法 UTF-8（否则 Postgres TEXT 拒收）。
-func TestTruncateUTF8(t *testing.T) {
-	s := strings.Repeat("微", 10) // 30 字节
-	got := truncateUTF8(s, 8)
-	if got != "微微" {
-		t.Errorf("truncateUTF8 = %q, 期望 微微（8 字节回退到 6）", got)
-	}
-	if !utf8.ValidString(got) {
-		t.Errorf("截断结果不是合法 UTF-8: %q", got)
-	}
-	if got := truncateUTF8("abc", 8); got != "abc" {
-		t.Errorf("未超限时应原样返回, 实际 %q", got)
-	}
-	if got := truncateUTF8("abcdefgh", 8); got != "abcdefgh" {
-		t.Errorf("恰好等于上限时应原样返回, 实际 %q", got)
 	}
 }
 

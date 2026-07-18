@@ -27,7 +27,6 @@ type Config struct {
 	DB       DBConfig       `mapstructure:"db"`
 	Temporal TemporalConfig `mapstructure:"temporal"`
 	LLM      LLMConfig      `mapstructure:"llm"`
-	Feishu   FeishuConfig   `mapstructure:"feishu"`
 	Fetch    FetchConfig    `mapstructure:"fetch"`
 	Agent    AgentConfig    `mapstructure:"agent"`
 	Log      LogConfig      `mapstructure:"log"`
@@ -73,20 +72,11 @@ type LLMConfig struct {
 	MaxConcurrent int    `mapstructure:"max_concurrent"`
 }
 
-// FeishuConfig 是飞书推送渠道配置。
-type FeishuConfig struct {
-	// AppID 环境变量 VANE_FEISHU_APP_ID。
-	AppID string `mapstructure:"app_id"`
-	// AppSecret 环境变量 VANE_FEISHU_APP_SECRET。
-	AppSecret string `mapstructure:"app_secret"`
-	// RateIntervalMS 是消息发送的最小间隔（毫秒），用于限流。
-	RateIntervalMS int `mapstructure:"rate_interval_ms"`
-}
-
 // FetchConfig 是内容抓取配置。
+//
+// 注：飞书凭证不在此配置——AppID/AppSecret 由 Dashboard 向导写入 settings 表、
+// feishu/manager.go 每次连接前从 store 重读（见其注释），config 侧无 FeishuConfig。
 type FetchConfig struct {
-	RSSConcurrency    int `mapstructure:"rss_concurrency"`
-	TikhubConcurrency int `mapstructure:"tikhub_concurrency"`
 	// TikhubAPIKey 环境变量 VANE_FETCH_TIKHUB_API_KEY。
 	TikhubAPIKey string `mapstructure:"tikhub_api_key"`
 	// ExaAPIKey 环境变量 VANE_FETCH_EXA_API_KEY。
@@ -97,7 +87,11 @@ type FetchConfig struct {
 
 // AgentConfig 是 agent loop 运行约束配置。
 type AgentConfig struct {
-	MaxTurns         int `mapstructure:"max_turns"`
+	MaxTurns int `mapstructure:"max_turns"`
+	// TokenBudgetDaily 预留、**当前未接线**：无任何代码按它拦截、也不递增 profiles 表的
+	// tokens_used_today（那三列恒为建表默认值）。agent 现有的按次护栏是 MaxTurns 与
+	// EndpointMsgCap/EndpointDailyCap（后两者是活的、从 tool_calls 表 COUNT 强制）。
+	// 别把这个键当作可调旋钮——设了不生效。
 	TokenBudgetDaily int `mapstructure:"token_budget_daily"`
 	// SessionTTLMinutes 是会话闲置过期窗口（分钟）：同一 owner 在窗口内的
 	// 消息共享一个多轮会话（上下文连续），超时后新开会话（契约 §0）。
@@ -143,8 +137,6 @@ type A2AConfig struct {
 var sensitiveKeys = []string{
 	"db.url",
 	"llm.api_key",
-	"feishu.app_id",
-	"feishu.app_secret",
 	"fetch.tikhub_api_key",
 	"fetch.exa_api_key",
 	"dashboard.password",
@@ -209,10 +201,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("llm.agent_model", "deepseek-v4-pro")
 	v.SetDefault("llm.max_concurrent", 5)
 
-	v.SetDefault("feishu.rate_interval_ms", 750)
-
-	v.SetDefault("fetch.rss_concurrency", 10)
-	v.SetDefault("fetch.tikhub_concurrency", 3)
 	v.SetDefault("fetch.timeout_seconds", 20)
 	v.SetDefault("fetch.max_response_mb", 5)
 

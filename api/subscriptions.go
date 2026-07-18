@@ -77,9 +77,9 @@ func (s *server) handleAddSubscription(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleListSubscriptions 返回当前 owner 的全部订阅源，含 disabled/paused。
-// 用 ListSubscribedSourcesByUser（不过滤 source.status）而非 ListActiveSourcesByUser：
-// 否则被自动 disabled 或暂停的源在列表里直接消失，前端状态灯永远点不亮、用户
-// 也无从知道某源为何不再推送。抓取扇出才用 active-only 的 ListActiveSourcesByUser。
+// 用 ListSubscribedSourcesByUser（不过滤 source.status）：否则被自动 disabled 或暂停的源
+// 在列表里直接消失，前端状态灯永远点不亮、用户也无从知道某源为何不再推送。抓取扇出则用
+// 双重 active + due 过滤的 ListDueSourcesByUser。
 // GET /api/subscriptions → 200 [Source...]
 func (s *server) handleListSubscriptions(w http.ResponseWriter, r *http.Request) {
 	userID, err := s.ownerUserID(r.Context())

@@ -68,13 +68,7 @@ llm:
   api_key: "yaml-llm-key"
   model: "gpt-x"
   max_concurrent: 9
-feishu:
-  app_id: "cli_yaml"
-  app_secret: "yaml-secret"
-  rate_interval_ms: 500
 fetch:
-  rss_concurrency: 7
-  tikhub_concurrency: 2
   tikhub_api_key: "yaml-tikhub"
   timeout_seconds: 30
   max_response_mb: 8
@@ -105,11 +99,6 @@ log:
 		{"llm.api_key", cfg.LLM.APIKey, "yaml-llm-key"},
 		{"llm.model", cfg.LLM.Model, "gpt-x"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 9},
-		{"feishu.app_id", cfg.Feishu.AppID, "cli_yaml"},
-		{"feishu.app_secret", cfg.Feishu.AppSecret, "yaml-secret"},
-		{"feishu.rate_interval_ms", cfg.Feishu.RateIntervalMS, 500},
-		{"fetch.rss_concurrency", cfg.Fetch.RSSConcurrency, 7},
-		{"fetch.tikhub_concurrency", cfg.Fetch.TikhubConcurrency, 2},
 		{"fetch.tikhub_api_key", cfg.Fetch.TikhubAPIKey, "yaml-tikhub"},
 		{"fetch.timeout_seconds", cfg.Fetch.TimeoutSeconds, 30},
 		{"fetch.max_response_mb", cfg.Fetch.MaxResponseMB, 8},
@@ -132,9 +121,6 @@ db:
   url: "postgres://from-yaml"
 llm:
   api_key: "yaml-key"
-feishu:
-  app_id: "yaml-app-id"
-  app_secret: "yaml-app-secret"
 fetch:
   tikhub_api_key: "yaml-tikhub-key"
 log:
@@ -143,8 +129,6 @@ log:
 
 	t.Setenv("VANE_DB_URL", "postgres://from-env")
 	t.Setenv("VANE_LLM_API_KEY", "env-key")
-	t.Setenv("VANE_FEISHU_APP_ID", "env-app-id")
-	t.Setenv("VANE_FEISHU_APP_SECRET", "env-app-secret")
 	t.Setenv("VANE_FETCH_TIKHUB_API_KEY", "env-tikhub-key")
 	t.Setenv("VANE_LOG_LEVEL", "warn") // 非敏感键走 AutomaticEnv + 默认值注册
 
@@ -160,8 +144,6 @@ log:
 	}{
 		{"db.url", cfg.DB.URL, "postgres://from-env"},
 		{"llm.api_key", cfg.LLM.APIKey, "env-key"},
-		{"feishu.app_id", cfg.Feishu.AppID, "env-app-id"},
-		{"feishu.app_secret", cfg.Feishu.AppSecret, "env-app-secret"},
 		{"fetch.tikhub_api_key", cfg.Fetch.TikhubAPIKey, "env-tikhub-key"},
 		{"log.level", cfg.Log.Level, "warn"},
 	}
@@ -214,9 +196,6 @@ func TestDefaults(t *testing.T) {
 		{"llm.model", cfg.LLM.Model, "deepseek-v4-flash"},
 		{"llm.agent_model", cfg.LLM.AgentModel, "deepseek-v4-pro"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 5},
-		{"feishu.rate_interval_ms", cfg.Feishu.RateIntervalMS, 750},
-		{"fetch.rss_concurrency", cfg.Fetch.RSSConcurrency, 10},
-		{"fetch.tikhub_concurrency", cfg.Fetch.TikhubConcurrency, 3},
 		{"fetch.timeout_seconds", cfg.Fetch.TimeoutSeconds, 20},
 		{"fetch.max_response_mb", cfg.Fetch.MaxResponseMB, 5},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},

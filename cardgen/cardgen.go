@@ -1,9 +1,8 @@
 // Package cardgen 用 DeepSeek 为单条内容生成"标题 + 一句话摘要 +
-// 为什么与你有关"的解读正文 markdown（bodyMD，含阅读原文行）。
-//
-// M3 设计取舍：原文链接由本包**确定性拼接**，不依赖模型输出里带上它。
-// 模型经常漏链接或把链接写错，而链接是推送卡片能不能点开原文的命门，
-// 所以把"生成解读"交给模型、把"挂链接"留给代码，各干各擅长的。
+// 为什么与你有关"的解读正文 markdown（bodyMD）。**bodyMD 不含阅读原文链接**：
+// system prompt 明令模型不要输出链接（"由系统自动添加"），链接由 Push 阶段的构卡函数
+// （feishu/card.go）作为按钮/URL 确定性添加——模型经常漏链接或写错，而链接是卡片能否
+// 点开原文的命门，所以把"生成解读"交给模型、把"挂链接"留给代码，各干各擅长的。
 //
 // 依赖边界（契约 §7/§8.2）：本包不包飞书卡片、不 import feishu——最终卡的
 // 按钮 value 携带 delivery_id，只能在 Push 拿到 id 后经注入的构卡函数生成。
@@ -61,9 +60,9 @@ func New(cli *llm.Client, rec *llm.Recorder, hints *profilehint.Cache) *CardGen 
 	return &CardGen{cli: cli, rec: rec, hints: hints}
 }
 
-// Generate 为一条已打分内容生成解读正文 markdown（bodyMD，含阅读原文行）。
-// LLM 失败向上抛给 Temporal 重试；成功但正文为空时用标题兜底，
-// 保证正文始终可读且带原文链接。
+// Generate 为一条已打分内容生成解读正文 markdown（bodyMD，不含阅读原文链接）。
+// LLM 失败向上抛给 Temporal 重试；成功但正文为空时用标题兜底，保证正文始终可读
+// （阅读原文链接由 Push 阶段的构卡函数添加，见包注释）。
 func (cg *CardGen) Generate(ctx context.Context, userID int64, item types.ScoredItem, traceID string) (string, error) {
 	req := llm.Request{
 		System:      cardSystemPrompt,

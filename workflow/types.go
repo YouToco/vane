@@ -11,7 +11,7 @@
 // 跨包类型（PushParams/PushScope/GeneratedCard）放本文件；打分后的条目统一用
 // types.ScoredItem（定义在 types 包，无 import 环）——scorer/cardgen/selector 与
 // workflow 都 import types，彼此不直接依赖，从根上避免了环，也让 Select Activity
-// 能直接复用 selector.SelectTopN 而非各写一份 TopN。
+// 能直接复用 selector.RankTopN 而非各写一份 TopN。
 package workflow
 
 import (
@@ -46,7 +46,7 @@ type PushScope struct {
 // 保留 Scored 是因为 Push 建 Delivery 时要回填 score 与 content_item_id。
 type GeneratedCard struct {
 	Scored types.ScoredItem `json:"scored"`
-	// BodyMD 解读正文 markdown（含阅读原文行）。最终卡片 JSON 由 Push 在拿到
+	// BodyMD 解读正文 markdown（不含阅读原文链接，由构卡函数加）。最终卡片 JSON 由 Push 在拿到
 	// delivery_id 后经注入的 buildCard 构造。json tag 沿用 "card_json"：换 tag
 	// 会让停在 CardGen 之后的 in-flight workflow 重放时解出空正文、静默推空卡
 	// （契约 §8.2 重放兼容）。
