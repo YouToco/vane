@@ -73,9 +73,9 @@ func TestSelect_TaskStrictnessRaisesFloor(t *testing.T) {
 		strictness types.PushStrictness
 		wantIDs    []int64
 	}{
-		{types.StrictnessLoose, []int64{2, 3, 4}},  // ≥21：39/40/60
-		{types.StrictnessNormal, []int64{3, 4}},    // ≥40：40/60
-		{types.StrictnessStrict, []int64{4}},       // ≥60：60
+		{types.StrictnessLoose, []int64{2, 3, 4}}, // ≥21：39/40/60
+		{types.StrictnessNormal, []int64{3, 4}},   // ≥40：40/60
+		{types.StrictnessStrict, []int64{4}},      // ≥60：60
 	}
 	for _, tc := range tests {
 		t.Run(string(tc.strictness), func(t *testing.T) {

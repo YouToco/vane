@@ -67,6 +67,9 @@ var purgeOrder = []purgeStep{
 	{"tool_calls", "tenant_id = $1"},
 	{"user_sessions", "tenant_id = $1"},
 
+	// tenant_quota 与 memberships 一样是纯租户所有的行，无子表引用它，位置随意；
+	// 放在 memberships 前只是为了让"归属类"的几张挨在一起。
+	{"tenant_quota", "tenant_id = $1"},
 	{"memberships", "tenant_id = $1"},
 	{"invites", "consumed_by_tenant = $1"},
 }

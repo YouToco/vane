@@ -50,6 +50,11 @@ const (
 	CodeLLMRateLimit   ErrCode = "LLM_RATE_LIMIT"
 	CodeLLMBadRequest  ErrCode = "LLM_BAD_REQUEST"
 	CodeLLMUnavailable ErrCode = "LLM_UNAVAILABLE"
+	// CodeQuotaExceeded 租户额度用尽（企业级契约 §2.7，D3 财务护栏）。
+	// **必须是不可重试的**：额度按秒缓慢补充，而 Temporal 的重试在秒级内完成——
+	// 重试三次只会失败三次，白白制造噪音，还把"额度用尽"这个明确原因
+	// 埋在一串重试错误里。
+	CodeQuotaExceeded ErrCode = "QUOTA_EXCEEDED"
 
 	// 抓取细分
 	CodeFetchTimeout   ErrCode = "FETCH_TIMEOUT"
@@ -112,6 +117,10 @@ var retryableByDefault = map[ErrCode]bool{
 	CodeFetchRateLimit: true,
 
 	CodePushFailed: true,
+
+	// 额度按秒补充，而重试在秒级内完成——重试只是把同一个失败重复三遍。
+	// 显式写 false 而非依赖 map 缺省：缺省下"漏填"和"故意 false"长得一模一样。
+	CodeQuotaExceeded: false,
 }
 
 // ============================================================

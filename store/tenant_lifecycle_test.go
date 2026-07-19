@@ -60,6 +60,7 @@ func newLifecycleTenant(t *testing.T, st *Store) (int64, int64) {
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(ctx, t, st, `DELETE FROM tenant_quota WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM invites WHERE code = $1`, code)
 		cleanupExec(ctx, t, st, `DELETE FROM tenants WHERE id = $1`, tn.ID)

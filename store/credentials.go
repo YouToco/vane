@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -102,6 +103,13 @@ func (s *Store) RegisterWithInvite(ctx context.Context, email, passwordHash, cod
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, nil, types.NewAppError(types.CodeDatabase, "提交事务失败", err)
+	}
+	// 配额 seed 在事务外、失败只记日志——理由同 CreateTenantWithInvite：
+	// 缺配额行 = 无额度（安全的失败方向），而把它塞进事务会让 seed 失败
+	// 升级成整个注册失败。
+	if err := s.SeedTenantQuota(ctx, t.ID); err != nil {
+		slog.Error("注册后初始化配额失败，该租户暂无可用额度",
+			"tenant_id", t.ID, "user_id", u.ID, "err", err)
 	}
 	return &u, &t, nil
 }

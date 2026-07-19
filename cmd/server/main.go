@@ -158,6 +158,25 @@ func run() error {
 		}
 	}()
 
+	// 配额 reconcile（契约 §2.7）：给缺配额行的租户补齐默认额度。同样后台跑、幂等。
+	//
+	// 两种缺行都要靠它兜住，而且两种都是**静默的**：
+	//   · 建租户时 seed 失败——那条路径刻意只记日志（塞进事务会让一次 seed 失败
+	//     升级成整个注册失败），代价是用户注册"成功"却什么都用不了；
+	//   · 迁移漏回填——025 第一版就漏了存量租户，配合"缺行即拒绝"上线即锁死推送，
+	//     而下游把额度用尽当正常终态，Temporal 一片绿、零告警。
+	// 缺行的后果是"这个租户什么都用不了"，它不该靠谁记得手工补。
+	go func() {
+		n, err := st.ReconcileTenantQuota(ctx)
+		if err != nil {
+			slog.Error("配额 reconcile 整体失败（不影响启动）", "err", err)
+			return
+		}
+		if n > 0 {
+			slog.Info("配额 reconcile 完成", "seeded_tenants", n)
+		}
+	}()
+
 	// agent loop（M4 契约 §9 装配序：store → llm → scheduler → tools → agent.New →
 	// manager 注入）：push_now 工具依赖 scheduler（TriggerPushNow 即 PushTrigger 窄接口），
 	// 故装配在 scheduler 之后；注入须在 manager.Start 之前，保证 WS 连接建立时

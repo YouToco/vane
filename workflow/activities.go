@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.temporal.io/sdk/activity"
@@ -282,6 +283,13 @@ type RecordEmptyIn struct {
 // 只 warn 并跳过；只有"整批全军覆没"才返回错误触发 Temporal 重试。
 // ============================================================
 
+// isQuotaErr 判定一个错误是否为额度用尽。
+// 用 AppError 的 Code 而非字符串匹配：文案会改，错误码不会。
+func isQuotaErr(err error) bool {
+	var ae *types.AppError
+	return errors.As(err, &ae) && ae.Code == types.CodeQuotaExceeded
+}
+
 // refuseIfTenantGone 是 D9 软删除的**执行面**：注销若不落到这一层，
 // 「已注销」就只是数据库里的一个标记——定时调度照跑、Exa/TikHub/LLM 照花钱、
 // 推送照发到对方手机上。落库只是记账，这里才是真的停下来。
@@ -317,7 +325,11 @@ func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error {
 	if a.refuseIfTenantGone(ctx, in.UserID, "evolve_profile") {
 		return nil // 正常终态，不报错——报错会触发重试，而重试同样会被拒。
 	}
-	return a.evolver.Evolve(ctx, in.UserID, in.TraceID)
+	// retryableOrNot：Evolve 内部会经 llm.Do 撞上配额，而裸 *AppError 跨 activity
+	// 边界后 Temporal 取的 Type 是 Go 类型名 "AppError"，NonRetryableErrorTypes
+	// 匹配不到 —— 于是额度用尽会被白重试三次（额度按秒补，三次必然都失败），
+	// 徒增噪音还把明确原因埋进一串重试错误里。
+	return retryableOrNot(a.evolver.Evolve(ctx, in.UserID, in.TraceID))
 }
 
 // Fetch 现查用户的 active 订阅源，逐源抓取入库并推进各源抓取状态，最后返回
@@ -794,6 +806,8 @@ feed:
 // 而 llm.Client 早已配好 5 路并发闸门却只被喂进 1 个。顺带也把 activity 的
 // StartToCloseTimeout=120s 从"正在变薄的余量"拉回安全区（45 条 × 最坏 1372ms 已达 62 秒）。
 func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem, error) {
+	// 并发扇出里各 goroutine 都可能撞到配额，用原子标记而非普通 bool。
+	var quotaHit atomic.Bool
 	scored := mapConcurrent(ctx, in.Items, parBatchFanout,
 		func(ctx context.Context, item types.ContentItem) (types.ScoredItem, error) {
 			s, err := a.scorer.Score(ctx, in.UserID, item, in.TraceID)
@@ -803,9 +817,24 @@ func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem,
 			return types.ScoredItem{Item: item, Score: s}, nil
 		},
 		func(item types.ContentItem, err error) {
+			if isQuotaErr(err) {
+				quotaHit.Store(true)
+			}
 			slog.Warn("score: 单条打分失败，跳过", "content_item_id", item.ID, "trace_id", in.TraceID, "err", err)
 		})
 	if len(scored) == 0 && len(in.Items) > 0 {
+		// 额度用尽与"LLM 挂了"必须分开报。混在一起的代价很具体：走 LLMUnavailable
+		// 会被 Temporal 重试三次（而额度按秒补充，秒级重试必然三次都失败），
+		// 且最终用户收到的是「打分后没有达标的」——那是假话，会让人以为是内容质量
+		// 问题、跑去改画像或换信源，而真相是额度用完了。
+		if quotaHit.Load() {
+			// 必须经 nonRetryable 包装：Activity 直接返回裸 *AppError 时，
+			// Temporal 取 Go 类型名 "AppError" 作 Type，于是 ① NonRetryableErrorTypes
+			// 匹配不到（被白重试三次）② 编排层 isQuotaFailure 也认不出来（当成一般
+			// 故障让 workflow 失败，用户收不到任何提示）。包装后 Type 恰为错误码。
+			return nil, nonRetryable(types.NewAppError(types.CodeQuotaExceeded,
+				"本租户 LLM 额度已用尽，本轮跳过打分", nil))
+		}
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "整批打分全部失败", nil)
 	}
 	return scored, nil
@@ -859,6 +888,7 @@ func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredIte
 // （Push 按本切片顺序拼卡），而 Score 的产出还要过一遍 RankTopN 重排。
 // 换句话说，这里若按完成先后收集，同一批内容每次推送的卡面顺序都会不一样。
 func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard, error) {
+	var quotaHit atomic.Bool
 	cards := mapConcurrent(ctx, in.Items, parBatchFanout,
 		func(ctx context.Context, si types.ScoredItem) (GeneratedCard, error) {
 			body, err := a.cardgen.Generate(ctx, in.UserID, si, in.TraceID)
@@ -868,9 +898,16 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 			return GeneratedCard{Scored: si, BodyMD: body}, nil
 		},
 		func(si types.ScoredItem, err error) {
+			if isQuotaErr(err) {
+				quotaHit.Store(true)
+			}
 			slog.Warn("cardgen: 单条生成失败，跳过", "content_item_id", si.Item.ID, "trace_id", in.TraceID, "err", err)
 		})
 	if len(cards) == 0 && len(in.Items) > 0 {
+		if quotaHit.Load() {
+			return nil, nonRetryable(types.NewAppError(types.CodeQuotaExceeded,
+				"本租户 LLM 额度已用尽，本轮跳过出卡", nil))
+		}
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "整批卡片生成全部失败", nil)
 	}
 	return cards, nil
@@ -1152,6 +1189,22 @@ func emptyResultMarkdown(in NotifyEmptyIn, strictness types.PushStrictness) stri
 		// "是真没好内容，还是我门槛设太狠"。
 		return fmt.Sprintf("📭 本次推送没有新内容：%d 条内容打分后最高 %.0f 分，均未达到%s——不够相关的内容不值得打扰你。想放宽就在对话里说「这个任务松一点」。",
 			nz(c.Scored), in.MaxScore, strictnessPhrase(strictness))
+	case types.BatchExitGateQuota:
+		// 刻意不说"没有新内容"——内容很可能是有的，只是没额度去处理它。
+		// 说成"没内容"会让人去改画像、换信源，白折腾一圈还找不到原因。
+		//
+		// 三件事必须都说到，缺一件用户就只能干等：**发生了什么**（额度用尽，
+		// 不是没内容）、**会不会自己好**（会，按时间恢复）、**要不要做什么**
+		// （持续出现才需要找管理员）。只说前两件会让反复撞额度的人一直等下去。
+		msg := "⏳ 本次推送暂停：AI 额度已用尽，本轮内容没有处理。\n\n" +
+			"额度按时间自动恢复，通常下一轮定时推送即可恢复正常，无需操作。\n" +
+			"若连续多轮都收到本提示，说明用量持续超出配额，请联系管理员调整额度。"
+		if n := nz(c.Fetched); n > 0 {
+			// 报出抓到多少条，是为了让"内容是有的、只是没能处理"这句话可被验证，
+			// 而不是一句需要用户信任的断言。
+			msg += fmt.Sprintf("\n\n（本轮已抓取 %d 条内容，额度恢复后会重新参与筛选）", n)
+		}
+		return msg
 	case types.BatchExitGateCardGen:
 		return "📭 本次推送没有新内容：卡片生成后无可推条目。"
 	default:

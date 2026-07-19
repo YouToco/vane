@@ -83,13 +83,20 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 				"user_id", p.UserID, "trace_id", traceID, "gate", gate, "err", err)
 		}
 		// 用户主动触发时补一张"本次没有新内容"通知卡（2026-07-18：Boss 点了立即推送
-		// 等不到任何回音来查服务器——空结果和故障在用户侧必须可区分）。定时任务对
-		// fetch/dedup 等"世界上没新东西"的空保持静默（每天"今天没新闻"是噪音）；
-		// **门槛过滤致空（Select gate）恒通知**（Boss 拍板 2026-07-19）：内容明明有、
-		// 是门槛把它们全滤了——这是门槛机制的反馈面，用户须知道门槛在工作、且能调松，
-		// 否则"系统没坏、只是都不相关"与 31 小时静默停摆在用户侧长得一模一样。
+		// 等不到任何回音来查服务器——空结果和故障在用户侧必须可区分）。
+		//
+		// 定时任务对 fetch/dedup 等"世界上没新东西"的空保持静默（每天"今天没新闻"
+		// 是噪音）。两个例外**恒通知**，它们是同一条道理的两个实例——
+		// 「系统正常但没东西给你」和「系统坏了」在用户侧长得一模一样，
+		// 而分辨它们所需的信息只有服务端有：
+		//   · 门槛过滤致空（Select，Boss 拍板 2026-07-19）：内容明明有、是门槛把它们
+		//     全滤了。这是门槛机制的反馈面，用户须知道门槛在工作、且能调松。
+		//   · 额度用尽（Quota）：系统这条路走不通了，且要人处理。它主要就发生在
+		//     定时批上（定时批是最大的一笔消耗），门控恰好把最需要通知的场景全挡住；
+		//     挡住的结果是早报无声消失，用户无从判断是没新闻、服务挂了、还是自己欠费。
+		//
 		// 失败同样只 Warn：通知是附加信息，不能把正常空终态变成失败。
-		if userTriggered || gate == types.BatchExitGateSelect {
+		if userTriggered || gate == types.BatchExitGateSelect || gate == types.BatchExitGateQuota {
 			ntCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
 			nin := NotifyEmptyIn{UserID: p.UserID, TraceID: traceID, Gate: gate, Counts: counts}
 			if gate == types.BatchExitGateSelect && maxScore >= 0 {
@@ -139,6 +146,15 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	var scored []types.ScoredItem
 	scoreCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
 	if err := workflow.ExecuteActivity(scoreCtx, a.Score, ScoreIn{UserID: p.UserID, TraceID: traceID, Items: deduped}).Get(scoreCtx, &scored); err != nil {
+		// 额度用尽不是故障，是**正常终态**——和"没有新内容"同一类，只是原因不同。
+		// 让它走 workflow 失败会：① 在 Temporal 里堆一串红色的失败记录，
+		// ② 用户什么提示都收不到（失败路径不发通知），只能干等着纳闷。
+		// 导向空批次 + 专属闸门，用户会收到「额度用尽、会自动恢复」的人话。
+		if isQuotaFailure(err) {
+			recordEmpty(types.BatchExitGateQuota, -1)
+			log.Info("额度用尽，本轮跳过打分", "trace_id", traceID)
+			return nil
+		}
 		return err
 	}
 	// 本闸门当前**够不着**（core review 时核实，不是猜的）：Score 只在
@@ -190,6 +206,11 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	var cards []GeneratedCard
 	cardCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
 	if err := workflow.ExecuteActivity(cardCtx, a.CardGen, CardGenIn{UserID: p.UserID, TraceID: traceID, Items: selected}).Get(cardCtx, &cards); err != nil {
+		if isQuotaFailure(err) {
+			recordEmpty(types.BatchExitGateQuota, -1)
+			log.Info("额度用尽，本轮跳过出卡", "trace_id", traceID)
+			return nil
+		}
 		return err
 	}
 	// 同 Score：CardGen 整批全失败走 CodeLLMUnavailable 错误分支，空切片只在
@@ -211,10 +232,23 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	return nil
 }
 
+// isQuotaFailure 判定 activity 错误是否为额度用尽。
+//
+// 跨 activity 边界后错误已被 Temporal 包成 ApplicationError，原始类型丢失，
+// 只剩 Type 字符串——而 nonRetryable 正是把 AppError.Code 放进 Type 的。
+// 所以这里比对的是 Type，不是 errors.As。
+func isQuotaFailure(err error) bool {
+	var ae *temporal.ApplicationError
+	return errors.As(err, &ae) && ae.Type() == string(types.CodeQuotaExceeded)
+}
+
 // nonRetryableCodes 是确定性失败错误码：这类错误重试无意义（重试只是重复失败），
 // 交给 Temporal 的 NonRetryableErrorTypes 直接终止。要生效需 Activity 侧把
 // AppError 的 Code 作为 ApplicationError 的 Type 抛出（见报告"待主控复核"）。
 var nonRetryableCodes = []string{
+	// 额度按秒缓慢补充，而 Temporal 的重试在秒级内完成——重试三次只会失败三次，
+	// 白白制造噪音，还把"额度用尽"这个明确原因埋进一串重试错误里。
+	string(types.CodeQuotaExceeded),
 	string(types.CodeValidation),
 	string(types.CodeNotFound),
 	string(types.CodeConflict),

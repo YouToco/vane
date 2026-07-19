@@ -108,7 +108,7 @@ func TestResultCache_LRUEviction(t *testing.T) {
 
 // 时间戳并列逐出回归（2026-07-19 Windows 实 bug）：时钟粒度粗（Windows tick
 // 0.5–15.6ms）时同 tick 连续 put 的 at 完全相同，按 at 扫描要么选不出牺牲者
-//（严格 Before + time.Now() 初值 → delete("") 静默无效、缓存越限），要么随机
+// （严格 Before + time.Now() 初值 → delete("") 静默无效、缓存越限），要么随机
 // 逐出（map 迭代序）。注入统一的未来时刻钉死并列形态——未来值保证「无条目
 // 严格早于扫描时刻」，是同 tick 相等的确定性等价物，不依赖平台时钟粒度；
 // 上面的 TestResultCache_LRUEviction 则保留真实时钟路径（正是抓住 bug 的那个）。

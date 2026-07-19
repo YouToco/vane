@@ -26,7 +26,7 @@ func TestDeriveInlineLimits_LadderAndCap(t *testing.T) {
 		wantPerCall int
 	}{
 		{8_000, int(8_000 * maxWindowShare * charsPerToken)}, // 小窗口被 30% 封顶咬住
-		{64_000, 16_000},                                     // 兜底档
+		{64_000, 16_000}, // 兜底档
 		{128_000, 32_000},
 		{200_000, 64_000},
 		{1_000_000, 100_000},
