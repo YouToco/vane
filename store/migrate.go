@@ -54,6 +54,7 @@ func Migrate(ctx context.Context, dbURL string) error {
 	}
 	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir,
 		goose.WithSessionLocker(sessionLocker),
+		goose.WithAllowOutofOrder(true),
 	)
 	if err != nil {
 		return fmt.Errorf("store: 初始化 goose provider: %w", err)
