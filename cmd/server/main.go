@@ -148,6 +148,16 @@ func run() error {
 	// scheduler 是唯一直接碰 SDK client 的调度封装（供 API 建/删/触发调度）。
 	sched := scheduler.New(temporalClient, cfg.Temporal.TaskQueue, st)
 
+	// 存量调度 Action reconcile（任务手册 P1b 收尾）：给 b1 之前建的老调度补上 schedule_id，
+	// 使已编译手册的任务真正走 b3 隔离（详见 scheduler.ReconcileActions）。后台跑、不阻塞
+	// 启动——reconcile 是幂等自愈维护，单条失败已在内部 slog，不该因 Temporal 抖动而拒绝
+	// 服务就绪；worker 已在上方 Start，此刻 Temporal 连通性已确立。
+	go func() {
+		if err := sched.ReconcileActions(ctx); err != nil {
+			slog.Error("scheduler: 存量调度 Action reconcile 整体失败（不影响启动）", "err", err)
+		}
+	}()
+
 	// agent loop（M4 契约 §9 装配序：store → llm → scheduler → tools → agent.New →
 	// manager 注入）：push_now 工具依赖 scheduler（TriggerPushNow 即 PushTrigger 窄接口），
 	// 故装配在 scheduler 之后；注入须在 manager.Start 之前，保证 WS 连接建立时

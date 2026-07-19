@@ -17,9 +17,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	commonpb "go.temporal.io/api/common/v1"
 	enums "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
@@ -80,6 +82,7 @@ type ScheduleSpec struct {
 // 把回滚是否真的发生钉死在单测里。*store.Store 隐式满足本接口，装配处零改动。
 type scheduleStore interface {
 	ListSchedulesByUser(ctx context.Context, userID int64) ([]types.Schedule, error)
+	ListActiveSchedules(ctx context.Context) ([]types.Schedule, error)
 	InsertSchedule(ctx context.Context, sc *types.Schedule) error
 	UpdateScheduleSpec(ctx context.Context, id string, spec json.RawMessage, nlDesc *string) error
 	DeleteSchedule(ctx context.Context, id string, userID int64) error
@@ -129,9 +132,10 @@ func (s *Scheduler) CreatePush(ctx context.Context, userID int64, spec ScheduleS
 	}
 
 	schedID := fmt.Sprintf("push-%d-%s", userID, uuid.NewString())
-	// ScheduleID=schedID：定时触发带上归属任务 id，供 Fetch/候选按本任务的源隔离（P1b）。
-	// NLDesc：调度的自然语言描述，聚合卡 header 的任务名（#75）。
-	params := workflow.PushParams{UserID: userID, ScheduleID: schedID, Scope: scope, NLDesc: strings.TrimSpace(nlDesc)}
+	// makePushParams 统一构造 Action 入参：ScheduleID=schedID 让定时触发带上归属任务 id，
+	// 供 Fetch/候选按本任务的源隔离（P1b b3）；NLDesc 是聚合卡 header 的任务名（#75）。
+	// 与 ReconcileActions 共用同一构造器，杜绝"新建"与"补齐"两条路径的 params 漂移。
+	params := makePushParams(userID, schedID, scope, nlDesc)
 
 	_, err = s.c.ScheduleClient().Create(ctx, client.ScheduleOptions{
 		ID:   schedID,
@@ -175,6 +179,122 @@ func (s *Scheduler) CreatePush(ctx context.Context, userID int64, spec ScheduleS
 		return "", types.NewAppError(types.CodeDatabase, "创建定时任务镜像失败，已回滚 Temporal 调度", err)
 	}
 	return schedID, nil
+}
+
+// makePushParams 构造 PushPipelineWorkflow 的入参（= Schedule.Action.Args[0]）。
+// CreatePush 建调度、ReconcileActions 补齐存量调度都经此构造，保证两条路径逐字一致。
+func makePushParams(userID int64, schedID string, scope workflow.PushScope, nlDesc string) workflow.PushParams {
+	return workflow.PushParams{
+		UserID:     userID,
+		ScheduleID: schedID,
+		Scope:      scope,
+		NLDesc:     strings.TrimSpace(nlDesc),
+	}
+}
+
+// ReconcileActions 把存量 active 调度的 Temporal Action 入参补齐到当前代码构造的 params
+// （含 ScheduleID / NLDesc）。**由 cmd/server 在启动时调用一次**。
+//
+// 为什么需要（P1b 上线才暴露的断裂）：Temporal 在**建调度那一刻**就把 workflow 启动入参
+// 冻结进 schedule spec，b1 只在 CreatePush 时把 ScheduleID 写进 Action.Args。b1 之前建的
+// 存量调度（如 07-14 建的早报任务）Action.Args 里没有 schedule_id，每次定时触发 workflow
+// 都拿到空 ScheduleID → b3 的 planScoped 恒 false → 隔离永不激活。于是决策 #4 的"老任务
+// 补手册→自包含"迁移成了死胡同：手册编译写了 schedule_sources，调度触发却照旧抓全部订阅。
+// 本方法在启动时给存量调度补上 schedule_id，让已编译手册的任务真正走隔离；**b3 仍以
+// ScheduleHasSources 门禁把关**——无手册任务的 schedule_id 到了 workflow 也因 schedule_sources
+// 为空而回落用户级，决策 #4「无手册老任务抓全部订阅」不破。
+//
+// best-effort：单条失败只 slog、继续下一条（不因个别调度 reconcile 失败而中断启动）；
+// 幂等：先 Describe 看 Action.Args 是否已带正确 schedule_id，已带则跳过、不写 Temporal
+// （新建调度、以及上次已 reconcile 过的调度，重启时都命中跳过）。
+func (s *Scheduler) ReconcileActions(ctx context.Context) error {
+	schedules, err := s.st.ListActiveSchedules(ctx)
+	if err != nil {
+		return err
+	}
+	var updated, skipped, failed int
+	for _, sc := range schedules {
+		didUpdate, rerr := s.reconcileOne(ctx, sc)
+		switch {
+		case rerr != nil:
+			failed++
+			slog.Error("scheduler: reconcile 调度 Action 失败（跳过，不影响其它调度与启动）",
+				"schedule_id", sc.ID, "err", rerr)
+		case didUpdate:
+			updated++
+			slog.Info("scheduler: 已给存量调度补齐 schedule_id（隔离将于下次触发生效）",
+				"schedule_id", sc.ID)
+		default:
+			skipped++
+		}
+	}
+	slog.Info("scheduler: 存量调度 Action reconcile 完成",
+		"total", len(schedules), "updated", updated, "skipped", skipped, "failed", failed)
+	return nil
+}
+
+// reconcileOne 补齐单个调度的 Action.Args。返回 didUpdate=true 表示确实写了 Temporal。
+func (s *Scheduler) reconcileOne(ctx context.Context, sc types.Schedule) (bool, error) {
+	h := s.c.ScheduleClient().GetHandle(ctx, sc.ID)
+	desc, err := h.Describe(ctx)
+	if err != nil {
+		return false, err
+	}
+	has, err := actionHasScheduleID(desc.Schedule.Action, sc.ID)
+	if err != nil {
+		return false, err
+	}
+	if has {
+		return false, nil // 已带正确 schedule_id，无需重写
+	}
+
+	var scope workflow.PushScope
+	if len(sc.ScopeJSON) > 0 {
+		if err := json.Unmarshal(sc.ScopeJSON, &scope); err != nil {
+			return false, fmt.Errorf("解析 scope_json（id=%s）: %w", sc.ID, err)
+		}
+	}
+	params := makePushParams(sc.UserID, sc.ID, scope, sc.NLDescription)
+
+	// 只替换 Action.Args，其余（Workflow 类型名、ID、TaskQueue、超时、Spec、Overlap、State）
+	// 一律原样带走——照抄 UpdatePush 的值拷贝纪律：自己 new 一个 Action 会静默丢掉这些字段。
+	err = h.Update(ctx, client.ScheduleUpdateOptions{
+		DoUpdate: func(in client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
+			sch := in.Description.Schedule
+			wf, ok := sch.Action.(*client.ScheduleWorkflowAction)
+			if !ok {
+				return nil, fmt.Errorf("调度 %s 的 Action 非 workflow 类型，无法 reconcile", sc.ID)
+			}
+			na := *wf                       // 值拷贝 Action 结构体
+			na.Args = []interface{}{params} // 只换入参
+			sch.Action = &na
+			return &client.ScheduleUpdate{Schedule: &sch}, nil
+		},
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// actionHasScheduleID 判断一个 Schedule Action 的入参是否已带指定 schedule_id。
+// Describe/Update 返回的 Action.Args 是 *commonpb.Payload（未解码原始态，见 SDK 注释），
+// 故解出首个入参为 PushParams 再比对。非 workflow-action / 空入参 / 首参非 Payload 一律
+// 视为"未带"（返回 false）——让 reconcile 走重建分支自愈，而非报错卡住。
+func actionHasScheduleID(action client.ScheduleAction, want string) (bool, error) {
+	wf, ok := action.(*client.ScheduleWorkflowAction)
+	if !ok || len(wf.Args) == 0 {
+		return false, nil
+	}
+	pl, ok := wf.Args[0].(*commonpb.Payload)
+	if !ok {
+		return false, nil
+	}
+	var params workflow.PushParams
+	if err := converter.GetDefaultDataConverter().FromPayload(pl, &params); err != nil {
+		return false, fmt.Errorf("解码调度 Action 入参: %w", err)
+	}
+	return params.ScheduleID == want, nil
 }
 
 // PushNow 立即触发一次推送（不建调度），供"现在推"按钮用。

@@ -75,6 +75,34 @@ func (s *Store) ListSchedulesByUser(ctx context.Context, userID int64) ([]types.
 	return out, nil
 }
 
+// ListActiveSchedules 返回全部 active 调度镜像（跨用户），按创建时间正序。
+// 无 user 谓词是刻意的：唯一调用方是启动时的 scheduler.ReconcileActions，它要把
+// **所有**存量调度的 Temporal Action 入参补齐（决策 #4 的"补手册→自包含"迁移路径），
+// 是系统级维护而非用户请求。单 owner MVP 下活跃调度 ≤20，无分页压力。
+func (s *Store) ListActiveSchedules(ctx context.Context) ([]types.Schedule, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+scheduleColumns+`
+		 FROM schedules WHERE status = $1
+		 ORDER BY created_at`, types.ScheduleStatusActive)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "查询全部 active 调度", err)
+	}
+	defer rows.Close()
+
+	var out []types.Schedule
+	for rows.Next() {
+		var sc types.Schedule
+		if err := scanSchedule(rows, &sc); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "扫描 schedule 行", err)
+		}
+		out = append(out, sc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "遍历 schedule 结果集", err)
+	}
+	return out, nil
+}
+
 // UpdateScheduleSpec 原地更新调度镜像的 spec_json（可选连带 nl_description），并推进
 // updated_at。scheduler 在 Temporal Update 成功后调用，使镜像与 Temporal 保持一致。
 //
