@@ -347,13 +347,40 @@ func TestObservabilityStore(t *testing.T) {
 		insertLLMCall(ctx, t, st, llmRow{
 			UserPrompt: "用户画像：暂无，按通用资讯价值判断。\n【待评估内容】\n标题：Z\n【待评估内容结束】",
 			CreatedAt:  at})
+		// ④ **F1 失效的真形状**：负面句在画像行里，但被截断了——省略号落在它内部。
+		//    保尾若正常，省略号只会出现在 negPrefix **之前**（截的是 front）。
+		//    有 negPrefix 故计入 WithTail，但不算 Intact，这一条独力把探针拉红。
+		insertLLMCall(ctx, t, st, llmRow{
+			UserPrompt: "用户画像：行业：软件；摘要：关注 AI。不感兴趣：股市、明星八……" +
+				"\n【待评估内容】\n标题：W\n【待评估内容结束】",
+			CreatedAt: at})
+		// ⑤ **本次修复的核心形状**：负面句完整，但内容与当前画像的不同——
+		//    这是画像演化前写的历史行（演化把「股市、明星八卦」改成了别的组合）。
+		//    它一个字都没被剪，必须算 Intact。旧实现拿 tail 字面比对会把它判成失败，
+		//    于是画像每演化一次，演化前的存量调用就集体假红（2026-07-19 生产实况）。
+		insertLLMCall(ctx, t, st, llmRow{
+			UserPrompt: "用户画像：行业：软件；摘要：关注 AI。不感兴趣：加密货币。" +
+				"\n【待评估内容】\n标题：V\n【待评估内容结束】",
+			CreatedAt: at})
+		// ⑥ 前段被截但负面句完好——保尾**正常工作**时的典型形状：
+		//    省略号在 negPrefix 之前，负面句原样附在其后。必须算 Intact，
+		//    否则"截断过的画像"会被一律误判成保尾失效。
+		insertLLMCall(ctx, t, st, llmRow{
+			UserPrompt: "用户画像：行业：软件；摘要：关注 AI 与很长很长的一段描述……" + tail +
+				"\n【待评估内容】\n标题：U\n【待评估内容结束】",
+			CreatedAt: at})
 
 		got, err := st.GetNegTailStat(ctx, base, tail)
 		if err != nil {
 			t.Fatalf("GetNegTailStat() 失败: %v", err)
 		}
-		if got.Total != 3 || got.Intact != 1 {
-			t.Errorf("期望 Total=3 Intact=1（第二行之后的同串不算），实际 %+v", got)
+		// Total 数全部打分；WithTail 只数画像行里有 negPrefix 的（①④⑤⑥，排除②③）；
+		// Intact 只数其中未被截断的（①⑤⑥，排除④）。
+		if got.Total != 6 || got.WithTail != 4 || got.Intact != 3 {
+			t.Errorf("期望 Total=6 WithTail=4 Intact=3，实际 %+v\n"+
+				"（WithTail 漏了说明第一行锚定或 negPrefix 匹配有问题；"+
+				"Intact 若为 4 说明截断没被识别出来——F1 验证已失效；"+
+				"Intact 若为 2 说明又在拿当前画像字面比对，⑤ 被误杀）", got)
 		}
 		if got.ExpectedTail != tail {
 			t.Errorf("ExpectedTail 应回填期望串，实际 %q", got.ExpectedTail)

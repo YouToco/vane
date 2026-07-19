@@ -34,6 +34,18 @@ const negPrefix = "不感兴趣："
 // ellipsis 截断标记。截断预算均不含它：前段满预算后追加，让模型知道前文有省略。
 const ellipsis = "……"
 
+// NegPrefix / EllipsisRune 导出给 Gate 探针 ⑤ 构造 SQL 判据（store.GetNegTailStat）。
+//
+// 为什么必须从这里导出、而不是让探针侧自己写字面量：理由与 NegTail 的导出完全相同
+// ——判据里的字面量与保尾逻辑一旦分处两地，就会各自漂移，而漂移的探针不会报错，
+// 只会安静地测错东西。这两个常量是保尾形状的定义者，探针只能引用不能重述。
+const (
+	NegPrefix = negPrefix
+	// EllipsisRune 是截断标记的**单个**字符。ellipsis 本身是它重复两次（中文省略号
+	// 惯例），而探针要的是正则字符类 [^…] 里的排除项，用单字符才是正确的语义。
+	EllipsisRune = "…"
+)
+
 // Build 纯函数：把画像渲染成单行提示。空字段跳过，"；"连接，全空返回 ""。
 // 格式：行业：{industry}；职业：{occupation}；关注标签：{tags[:10] 顿号连}；摘要：{summary'}
 //
