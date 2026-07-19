@@ -1,4 +1,4 @@
-package main
+package auth
 
 import (
 	"go/parser"
@@ -23,7 +23,7 @@ func TestNewInviteCode_Unguessable(t *testing.T) {
 	const n = 500
 	seen := make(map[string]struct{}, n)
 	for range n {
-		c, err := newInviteCode()
+		c, err := NewInviteCode()
 		if err != nil {
 			t.Fatalf("生成失败: %v", err)
 		}
@@ -62,7 +62,7 @@ func TestNewInviteCode_NoLookalikeChars(t *testing.T) {
 			t.Errorf("字母表含形近字符 %q —— 人工转抄时会产生查不出原因的「邀请码无效」", bad)
 		}
 	}
-	c, err := newInviteCode()
+	c, err := NewInviteCode()
 	if err != nil {
 		t.Fatalf("生成失败: %v", err)
 	}
@@ -79,17 +79,18 @@ func TestNewInviteCode_NoLookalikeChars(t *testing.T) {
 // 一旦流出（截图、转发、离职员工的聊天记录）就是一张永久有效的注册白条，
 // 而 D4 准入闸门存在的全部意义正是「财务敞口由发出的邀请数封顶」。
 func TestInviteDefaults_ExpiryIsNotForever(t *testing.T) {
-	if inviteDefaultExpireDays <= 0 {
+	if DefaultInviteExpireDays <= 0 {
 		t.Errorf("默认有效期为 %d 天（≤0 意味着永不过期）——默认值不该把财务敞口敞开，"+
-			"要永久应当由运维显式写 -expires-days 0", inviteDefaultExpireDays)
+			"要永久应当由调用方显式选择", DefaultInviteExpireDays)
 	}
 }
 
-// TestInviteCode_NoWeakRandomImport 是上一条测不到的那一半。
+// TestInviteCode_NoWeakRandomImport 是随机性用例测不到的那一半。
 //
 // crypto/rand 与 math/rand 的产物在统计上无法区分，所以只能从**来源**上拦：
-// 本包一旦导入 math/rand，就意味着某处的随机数可被预测——而邀请码是 I-A2 的唯一载体，
-// 可预测 = 把按次计费的 API 敞口对公网开放。
+// 本包一旦导入 math/rand，就意味着某处的随机数可被预测。auth 包里的随机量
+// 全是凭证级——邀请码（I-A2 的唯一载体）、密码盐、会话 token——任何一个
+// 可预测都等于把对应闸门对公网开放，所以守卫扫的是**整个包**而非单个文件。
 //
 // 用 go/ast 而非文本 grep：注释、字符串里的 "math/rand" 不该误报，
 // 而 `mrand "math/rand"` 这类改名导入不该漏报（探针实测过：改名导入能骗过 grep）。
@@ -110,8 +111,8 @@ func TestInviteCode_NoWeakRandomImport(t *testing.T) {
 					continue
 				}
 				if path == "math/rand" || path == "math/rand/v2" {
-					t.Errorf("%s 导入了 %s —— 邀请码是不变量 I-A2 的唯一载体，"+
-						"可预测的随机数等于把按次计费的 API 敞口对公网开放；请用 crypto/rand",
+					t.Errorf("%s 导入了 %s —— auth 包的随机量全是凭证级（邀请码/密码盐/会话 token），"+
+						"可预测的随机数等于把对应闸门对公网开放；请用 crypto/rand",
 						name, path)
 				}
 			}
