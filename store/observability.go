@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/YouToco/vane/profilehint"
 	"github.com/YouToco/vane/types"
 )
 
@@ -182,19 +183,28 @@ func (s *Store) GetProfileInjectionStat(ctx context.Context, since time.Time) (t
 	return st, nil
 }
 
-// GetNegTailStat 统计窗口内有多少次打分的画像行完整含有 expectedTail（探针 ⑤）。
+// GetNegTailStat 统计窗口内打分调用的负面句保尾情况（探针 ⑤）。
 //
 // 锚定第一行是本探针的关键：画像 hint 是**硬约束单行**（profilehint.go 的 singleLine
 // 把换行也折成空格），而 buildScoreUser 写完画像行紧跟一个 '\n'（scorer.go:209）——
 // 故 hint 可证明就是 user_prompt 的**整个第一行**。
 //
-// 为什么不能图省事用 LIKE '%不感兴趣：%' 全文通配：scorer.go:223 的快通道区块头
-// 【近期不感兴趣·…】里也有"不感兴趣"，且区块内嵌的是用户内容标题——一条标题里
-// 恰好含"不感兴趣："就能让探针在**尾巴已被切掉**时照样 PASS，正好废掉 F1 验证。
+// 为什么不能图省事用全文通配：scorer.go:223 的快通道区块头【近期不感兴趣·…】里
+// 也有"不感兴趣"，且区块内嵌的是用户内容标题——一条标题里恰好含"不感兴趣："
+// 就能让探针在**尾巴已被切掉**时照样 PASS，正好废掉 F1 验证。第一行锚定挡住了它。
 //
-// expectedTail 由调用方从 profiles.summary 取出并折叠空白后传入：hint 侧的负面句
-// 是 singleLine 之后的产物（profilehint.go:59→70→99），与库里 summary 的原文
-// 可能差在空白上，两边都折叠才能逐字比对。
+// 判据为什么不比对 expectedTail（2026-07-19 改）：原实现拿**当前画像**的负面句
+// 去逐字比对窗口内所有调用，而画像会演化。07-19 15:11 演化把负面句从 2 项加到
+// 3 项，之前写的 70 条立刻全部"不匹配"→ 报红，可生产库实证那 70 条的负面句
+// 完整收尾、一个字没被剪。期望值取自会漂移的外部状态，判据就测不准被测性质。
+//
+// 现在验的是每条自包含的不变量：负面句从「不感兴趣：」到行尾**不含省略号**。
+// 这正是 F1 承诺的形状——buildSummary/capHint 只在 neg 之前放省略号，neg 整段原样
+// 附加（profilehint.go:74/93）。保尾一旦失效，截断必然在 neg 里或其后留下省略号标记
+// （truncateEllipsis 恒追加），故本判据既充分又与画像版本无关。
+//
+// 刻意**不**要求以句号收尾：句号来自演化 prompt 规则 2 的格式约定，是模型的合规行为，
+// 模型偶尔漏写就会让探针假红——而那是格式问题，不是 F1 要管的截断。判据只该反映被测性质。
 func (s *Store) GetNegTailStat(ctx context.Context, since time.Time, expectedTail string) (types.NegTailStat, error) {
 	st := types.NegTailStat{ExpectedTail: expectedTail}
 	if expectedTail == "" {
@@ -203,10 +213,12 @@ func (s *Store) GetNegTailStat(ctx context.Context, since time.Time, expectedTai
 	err := s.pool.QueryRow(ctx,
 		`SELECT
 		     count(*)::int,
-		     count(*) FILTER (WHERE position($3 IN split_part(user_prompt, E'\n', 1)) > 0)::int
+		     count(*) FILTER (WHERE split_part(user_prompt, E'\n', 1) LIKE '%' || $3 || '%')::int,
+		     count(*) FILTER (WHERE split_part(user_prompt, E'\n', 1) ~ ($3 || '[^' || $4 || ']*$'))::int
 		 FROM llm_calls
 		 WHERE span_name = $1 AND created_at >= $2`,
-		scoreSpan, since, expectedTail).Scan(&st.Total, &st.Intact)
+		scoreSpan, since, profilehint.NegPrefix, profilehint.EllipsisRune).
+		Scan(&st.Total, &st.WithTail, &st.Intact)
 	if err != nil {
 		return st, types.NewAppError(types.CodeDatabase, "查询负面清单保尾统计", err)
 	}

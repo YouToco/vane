@@ -79,11 +79,22 @@ type ProfileInjectionStat struct {
 }
 
 // NegTailStat 是负面清单保尾统计（探针 ⑤，F1 的线上验证）。
-// Intact 统计"画像行里完整出现了负面句"的打分次数。
+//
+// 判据是**每条调用自包含**的：看它自己那条负面句有没有被截断，而不是拿它跟
+// 「当前画像」的负面句字面比对。后者曾让本探针在 2026-07-19 假红——画像演化
+// 把负面句从 2 项改成 3 项后，演化前写的 70 条全都"不匹配"，可它们一个字都没被剪。
+// 期望值取自会随时间变的外部状态，判据就不可能只反映被测性质。
 type NegTailStat struct {
-	Total  int `json:"total"`
+	// Total 是窗口内的打分调用总数。
+	Total int `json:"total"`
+	// WithTail 是画像行里带「不感兴趣：」句的调用数。
+	// 小于 Total 说明有些调用注入时画像还没有负面句（演化前的历史），
+	// 这不是 F1 失效——F1 管的是"有负面句时不许剪断它"。
+	WithTail int `json:"with_tail"`
+	// Intact 是这些负面句里**完整收尾**的条数（到行尾无省略号且以句号结束）。
+	// Intact < WithTail 才是保尾真失效。
 	Intact int `json:"intact"`
-	// ExpectedTail 是比对用的期望负面句（取自 profiles.summary，已折叠空白）。
+	// ExpectedTail 是当前画像的负面句，**仅供报告里作参照展示**，不参与判定。
 	// 为空表示当前画像没有负面句，探针不适用。
 	ExpectedTail string `json:"expected_tail"`
 }

@@ -328,14 +328,32 @@ func TestJudgeNegTail(t *testing.T) {
 			types.NegTailStat{ExpectedTail: "", Total: 50, Intact: 0}, StatusYellow},
 		{"有负面句但窗口内无调用是数据不足",
 			types.NegTailStat{ExpectedTail: "不感兴趣：股市。", Total: 0}, StatusYellow},
-		{"1 条尾巴丢失即红",
-			types.NegTailStat{ExpectedTail: "不感兴趣：股市。", Total: 50, Intact: 49}, StatusRed},
-		{"整窗口尾巴全丢",
-			types.NegTailStat{ExpectedTail: "不感兴趣：股市。", Total: 50, Intact: 0}, StatusRed},
+		{"1 条尾巴被截断即红",
+			types.NegTailStat{ExpectedTail: "不感兴趣：股市。", Total: 50, WithTail: 50, Intact: 49}, StatusRed},
+		{"整窗口尾巴全被截断",
+			types.NegTailStat{ExpectedTail: "不感兴趣：股市。", Total: 50, WithTail: 50, Intact: 0}, StatusRed},
 		{"全部完整",
-			types.NegTailStat{ExpectedTail: "不感兴趣：股市。", Total: 50, Intact: 50}, StatusGreen},
+			types.NegTailStat{ExpectedTail: "不感兴趣：股市。", Total: 50, WithTail: 50, Intact: 50}, StatusGreen},
 		{"单条完整",
-			types.NegTailStat{ExpectedTail: "不感兴趣：股市。", Total: 1, Intact: 1}, StatusGreen},
+			types.NegTailStat{ExpectedTail: "不感兴趣：股市。", Total: 1, WithTail: 1, Intact: 1}, StatusGreen},
+
+		// ↓ 本次修复的核心：画像演化后，早于演化的调用带的是**旧的但完整的**负面句。
+		// 判据只看「有没有被截断」，故它们照样算完整——这正是 2026-07-19 假红的形状。
+		{"演化后早期调用带旧负面句，未被截断即绿",
+			types.NegTailStat{ExpectedTail: "不感兴趣：股市、加密货币、明星八卦。",
+				Total: 95, WithTail: 95, Intact: 95}, StatusGreen},
+		// 窗口跨越「负面句首次产生」的时刻：之前的调用压根没有负面句，
+		// 它们不该被算成失败（没有可剪的东西），但也不该拉低完整率。
+		{"部分调用注入时画像还没负面句，不计入判定",
+			types.NegTailStat{ExpectedTail: "不感兴趣：股市。",
+				Total: 80, WithTail: 30, Intact: 30}, StatusGreen},
+		{"没有负面句的那部分不掩盖真截断",
+			types.NegTailStat{ExpectedTail: "不感兴趣：股市。",
+				Total: 80, WithTail: 30, Intact: 29}, StatusRed},
+		// WithTail=0 但当前画像有负面句：不是保尾失效，是注入本身没生效，
+		// 报红会把人引去查 profilehint 白忙一天，故给黄并指向探针 ④。
+		{"当前有负面句但一条都没注入是注入问题不是保尾问题",
+			types.NegTailStat{ExpectedTail: "不感兴趣：股市。", Total: 50, WithTail: 0}, StatusYellow},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -344,17 +362,22 @@ func TestJudgeNegTail(t *testing.T) {
 	}
 }
 
-// 红/绿两侧的 Detail 都要带上期望串：比对失败时人得能一眼看出探针在找什么，
-// 否则无从判断是"尾巴真丢了"还是"期望串本身算错了"。
+// 红/绿两侧的 Detail 都要带上当前画像的负面句作参照：判据虽然不再比对它，
+// 但人在排查时需要知道"现在的负面句长什么样"才能对着日志看。
+// 措辞里必须写明它只是参照——否则下一个读报告的人会以为判据仍在字面比对，
+// 又走回"演化了就该红"的误解。
 func TestJudgeNegTail_DetailCarriesExpectedTail(t *testing.T) {
 	tail := "不感兴趣：加密货币、明星八卦。"
 	for _, in := range []types.NegTailStat{
-		{ExpectedTail: tail, Total: 50, Intact: 3},
-		{ExpectedTail: tail, Total: 50, Intact: 50},
+		{ExpectedTail: tail, Total: 50, WithTail: 50, Intact: 3},
+		{ExpectedTail: tail, Total: 50, WithTail: 50, Intact: 50},
 	} {
 		got := judgeNegTail(in)
 		if !strings.Contains(got.Detail, tail) {
-			t.Errorf("Intact=%d 时 Detail 应带期望串，实际 %q", in.Intact, got.Detail)
+			t.Errorf("Intact=%d 时 Detail 应带当前负面句，实际 %q", in.Intact, got.Detail)
+		}
+		if !strings.Contains(got.Detail, "参照") {
+			t.Errorf("Intact=%d 时 Detail 应写明该串只是参照、不参与判定，实际 %q", in.Intact, got.Detail)
 		}
 	}
 }

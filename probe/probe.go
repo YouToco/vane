@@ -386,17 +386,35 @@ func judgeNegTail(n types.NegTailStat) Result {
 		r.Summary = "窗口内无打分调用，无从判定"
 		return r
 	}
-	if n.Intact < n.Total {
+	if n.WithTail == 0 {
+		r.Status = StatusYellow
+		r.Summary = fmt.Sprintf("当前画像有负面句，但窗口内 %d 条打分都没注入它", n.Total)
+		r.Detail = "不是保尾失效（没有可剪的东西），更像画像注入本身出了问题——" +
+			"先看探针 ④「画像注入生效性」，那边红了这里才有意义。" +
+			"也可能是窗口整个落在负面句首次产生之前。"
+		return r
+	}
+	if n.Intact < n.WithTail {
 		r.Status = StatusRed
-		r.Summary = fmt.Sprintf("%d/%d 条打分的画像行里负面句不完整", n.Total-n.Intact, n.Total)
-		r.Detail = fmt.Sprintf("保尾逻辑（审查 F1）失效：negTail 应原样穿过 buildSummary 与 capHint 的截断。"+
-			"期望串：%q", n.ExpectedTail)
+		r.Summary = fmt.Sprintf("%d/%d 条打分的负面句被截断了", n.WithTail-n.Intact, n.WithTail)
+		r.Detail = fmt.Sprintf("保尾逻辑（审查 F1）失效：negTail 应原样穿过 buildSummary 与 capHint 的截断，"+
+			"故「%s」之后到行尾不该出现省略号「%s」，现在出现了。"+
+			"排查从 profilehint.go 的 buildSummary:74 / capHint:93 两条路径入手。"+
+			"（当前画像的负面句是 %q，仅供参照——判据不比对它，见下条说明。）",
+			profilehint.NegPrefix, profilehint.EllipsisRune, n.ExpectedTail)
 		return r
 	}
 	r.Status = StatusGreen
-	r.Summary = fmt.Sprintf("%d/%d 条打分均完整含负面句", n.Intact, n.Total)
-	r.Detail = fmt.Sprintf("期望串：%q（比对锚定 user_prompt 第一行——画像 hint 是硬约束单行，"+
-		"故可证明它就是整个第一行；全文通配会被快通道区块头「近期不感兴趣」误命中而假绿）。", n.ExpectedTail)
+	r.Summary = fmt.Sprintf("%d/%d 条打分的负面句均完整未截断", n.Intact, n.WithTail)
+	r.Detail = fmt.Sprintf("判据是每条自包含的：画像行（=user_prompt 第一行）里「%s」之后到行尾无省略号。"+
+		"**不**与当前画像逐字比对——画像会演化，2026-07-19 那次把负面句从 2 项加到 3 项，"+
+		"字面比对让演化前写的 70 条全部假红，而它们一个字都没被剪。"+
+		"锚定第一行同样关键：全文通配会被快通道区块头「近期不感兴趣」误命中而假绿。"+
+		"当前画像的负面句：%q（参照用）。", profilehint.NegPrefix, n.ExpectedTail)
+	if n.WithTail < n.Total {
+		r.Detail += fmt.Sprintf("另：%d/%d 条打分注入时画像还没有负面句（演化前的历史），未计入判定。",
+			n.Total-n.WithTail, n.Total)
+	}
 	return r
 }
 
