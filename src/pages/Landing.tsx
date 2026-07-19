@@ -1,11 +1,9 @@
-import { useEffect, useRef } from "react";
+import { lazy, Suspense, useEffect, useRef } from "react";
 import { motion, useReducedMotion, type Variants } from "motion/react";
 import {
   ArrowDown,
   ArrowRight,
-  Check,
   Eye,
-  Globe,
   MessageSquare,
   Radar,
   Search,
@@ -15,19 +13,17 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { LocaleSwitch } from "@/components/LocaleSwitch";
 import { LogoMark } from "@/components/brand/Logo";
 import { TypewriterDemo } from "@/components/landing/TypewriterDemo";
 import { FilterShowcase } from "@/components/landing/FilterShowcase";
-import { LOCALES, useI18n } from "@/i18n";
+import { useI18n } from "@/i18n";
 
 export const EXAMPLE_ICONS: readonly LucideIcon[] = [User, Zap, Search, Eye] as const;
 const STEP_ICONS: readonly LucideIcon[] = [MessageSquare, Radar, ThumbsUp] as const;
+
+// 3D 吉祥物按需加载（three.js 独立 chunk，不拖累首屏）
+const VaneMascot = lazy(() => import("@/components/landing/VaneMascot"));
 
 const fadeUp: Variants = {
   hidden: { opacity: 0, y: 26, filter: "blur(6px)" },
@@ -72,29 +68,6 @@ function MouseGlow() {
   }, [reduced]);
 
   return <div ref={ref} aria-hidden className="pointer-events-none fixed inset-0 -z-10" />;
-}
-
-function LocaleSwitch() {
-  const { locale, setLocale } = useI18n();
-  const current = LOCALES.find((l) => l.code === locale) ?? LOCALES[0];
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        render={<Button variant="ghost" size="sm" className="gap-1.5 text-muted-foreground" />}
-      >
-        <Globe className="size-3.5" />
-        <span className="hidden sm:inline">{current.native}</span>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-36">
-        {LOCALES.map((l) => (
-          <DropdownMenuItem key={l.code} onClick={() => setLocale(l.code)}>
-            {l.native}
-            {l.code === locale && <Check className="ml-auto size-3.5 text-brand-strong" />}
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
 }
 
 export default function Landing() {
@@ -172,7 +145,15 @@ export default function Landing() {
             {L.heroSub}
           </motion.p>
 
-          <motion.div variants={fadeUp} className="w-full">
+          <motion.div variants={fadeUp} className="relative w-full">
+            {/* 3D 吉祥物坐在输入框右上沿（鼠标是风，点击有随机小动作）；小屏/reduced-motion 不挂载 */}
+            {!reduced && (
+              <div className="absolute -top-[6.6rem] right-0 z-10 hidden h-28 w-28 sm:block md:right-[8%]">
+                <Suspense fallback={null}>
+                  <VaneMascot />
+                </Suspense>
+              </div>
+            )}
             {/* key=locale：切语言整体重挂载，避免打字机状态/AnimatePresence 卡在旧语言的过渡边缘态 */}
             <TypewriterDemo key={locale} />
           </motion.div>
