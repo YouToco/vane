@@ -273,3 +273,62 @@ func TestEnrich_SanitizesFetchedText(t *testing.T) {
 		t.Errorf("净化不该破坏内容本身（<10ms 里的数字），实得：%q", items[0].Content)
 	}
 }
+
+// TestEnrich_AlreadySeenItemsDoNotTriggerAllDropped 复刻 2026-07-19 生产抓到的误报。
+//
+// 现场：Gemini 官方博客（source 8）的 description 是 251 字符的 `<img src="...">`——
+// 够长（不触发"过短"）、含裸 HTML（触发补全）。但它的 canonical_key 早已在库里且正文
+// 达标，SeenChecker 正确地跳过、不重复付费。于是本轮条目仍是原样的裸 HTML、被 §12.3
+// 丢弃、"全灭"成立 → fail_count++。生产实测已经走到 fail_count=2：再一轮发告警卡，
+// 八轮后把一个**完全健康**的源自动停用。
+//
+// 两个机制各自都对，踩在一起就错了：成本闸门不该重复付费，全灭防线不该把
+// 「我们本来就有的内容」算进损失。修法是把跳过的条目从分母里扣掉——
+// 分母的正确语义是「这一轮真正指望它产出的条目数」。
+func TestEnrich_AlreadySeenItemsDoNotTriggerAllDropped(t *testing.T) {
+	// 单条条目：够长、含裸 HTML（与 Gemini 现场同形），且已在库里补全过。
+	body := `<title>已有的文章</title><link>https://example.com/known</link>` +
+		`<description>&lt;img src="https://cdn.example/pic.png"&gt;` + longBody + `</description>`
+	url := serveFeed(t, feedWithItems(body))
+	src := feedSource(url)
+
+	seen := &enrichSeen{enriched: map[string]struct{}{
+		CanonicalKey(src, types.ContentItem{URL: "https://example.com/known"}): {},
+	}}
+	en := &fakeEnricher{text: longBody}
+
+	items, err := enrichFetcher(t, en, seen).FetchRSS(context.Background(), src)
+
+	if err != nil {
+		t.Fatalf("全部条目都是「库里已有」时不得报全灭——那会让一个健康信源走向自动停用：%v", err)
+	}
+	if len(items) != 0 {
+		t.Errorf("该条本轮仍被护栏丢弃（内容已在库里，不重取），应产出 0 条，实得 %d", len(items))
+	}
+	if en.count() != 0 {
+		t.Errorf("库里已有正文的条目不得重复付费，实得 %d 次调用", en.count())
+	}
+}
+
+// TestEnrich_MixedSeenAndBrokenStillAlerts：扣分母不能把真故障也一起扣没了。
+// 一半已有、另一半是真的补不回来 —— 后者仍应触发全灭，否则这道防线就被掏空了。
+func TestEnrich_MixedSeenAndBrokenStillAlerts(t *testing.T) {
+	url := serveFeed(t, feedWithItems(
+		`<title>已有</title><link>https://example.com/known</link>`+
+			`<description>&lt;img src="x"&gt;`+longBody+`</description>`,
+		`<title>坏的</title><link>https://example.com/broken</link>`+
+			`<description>&lt;img src="y"&gt;`+longBody+`</description>`,
+	))
+	src := feedSource(url)
+
+	seen := &enrichSeen{enriched: map[string]struct{}{
+		CanonicalKey(src, types.ContentItem{URL: "https://example.com/known"}): {},
+	}}
+	// 补全对第二条也失败（目标站反爬之类）→ 它仍是裸 HTML → 被丢弃。
+	en := &fakeEnricher{err: errors.New("目标站拒绝（测试构造）")}
+
+	_, err := enrichFetcher(t, en, seen).FetchRSS(context.Background(), src)
+	if err == nil {
+		t.Error("仍有一条真的补不回来且被丢弃，全灭防线应触发——扣分母不该把真故障一起扣没")
+	}
+}
