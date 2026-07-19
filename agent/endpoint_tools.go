@@ -42,10 +42,31 @@ const (
 	maxActivatedEndpoints = 14
 	// searchTopK 每次检索返回并激活的端点数（Anthropic Tool Search 默认值同为 5）。
 	searchTopK = 5
-	// endpointResultMaxRunes 端点结果回给模型的截断上限（rune）。上游响应动辄
-	// 100KB+ JSON，全文进上下文一次就吃掉几万 token；6000 rune 足够模型读懂
-	// 数据结构与核心内容，完整原文有 tool_calls.result_size 佐证体量。
-	endpointResultMaxRunes = 6000
+	// endpointResultMaxRunes 单次端点结果内联回模型的上限（rune）。
+	//
+	// 【2026-07-18 由 6000 提到 40000】原值是「无取回通道」时代的保守值：被截即丢，
+	// 只能靠小上限少丢点。业界横比（源码级，契约 §3.5）我们当时是最小的，而
+	// deepseek-v4-pro 是**1M 上下文**——全场最大的窗口配全场最小的上限：
+	//   Claude Code MCP 25k tokens(≈100k chars) / Bash 30k chars / 落盘线 50k chars
+	//   Pi 50KB          OpenClaw 按窗口分档 16k/32k/64k chars（≤窗口 30%）
+	//   Codex 10k tokens(≈40k bytes)          vane 旧值 6000 rune ← 差一个数量级
+	// 40000 rune 的依据：对齐 Claude Code 的 MCP 档（同为「工具返回任意 JSON」场景，
+	// 中文 JSON 约 1.5–2 char/token → ≈20–27k token），仍只占 1M 窗口的 ~2.5%。
+	//
+	// 敢放大的前提是句柄取回已存在（§3.5）：超出部分不再丢失，上限从「数据生死线」
+	// 降级为「首屏预算」。真正的护栏改由下面的每消息累计预算承担。
+	endpointResultMaxRunes = 40000
+	// endpointResultMsgBudget 单条消息内**全部**端点结果内联字符的累计预算。
+	//
+	// 存在的理由是单次上限管不住的那笔账：msgCap 允许一条消息调 10 次端点，
+	// 10×40000 = 400k rune 会把窗口吃掉近半；更贵的是 FC 多轮——历史每轮重发，
+	// MaxTurns=20 时 N 字符要按 N×轮数计入输入成本（DeepSeek 前缀缓存能打折，
+	// 但打不掉数量级）。故按「前几次给满、后续降级到 floor」的曲线分配：
+	// 先调的通常是主查询、值得看全，后调的多是补充，读摘要+按需句柄取回即可。
+	endpointResultMsgBudget = 120000
+	// endpointResultMinRunes 预算耗尽后每次仍保证的最小内联量：够看清结构与首屏
+	// 内容，剩余走 read_endpoint_result。给 0 会让模型「看不见任何东西」而瞎猜。
+	endpointResultMinRunes = 4000
 	// endpointDefDescMaxRunes 动态工具 Description 的截断上限。激活的每个工具
 	// 定义每轮都随请求发送，600 rune 全文 ×15 个会持续吃预算；检索结果文本里
 	// 已给过更全的说明，注入定义只保留摘要级描述。
@@ -74,6 +95,24 @@ type toolRunState struct {
 	// 校验通过之后、发请求之前：打到上游才算（含 HTTP 错误——失败同样计费），
 	// 参数校验失败没打上游、不计费，不吃限额。
 	endpointCalls int
+	// inlinedRunes 本条消息内已内联进上下文的端点结果字符数（累计预算，
+	// 见 endpointResultMsgBudget）。只统计真正回给模型的部分，不含缓存全量。
+	inlinedRunes int
+}
+
+// inlineBudget 返回本次调用可内联的字符数：预算未尽给满额，尽了给保底
+// （保底仍有句柄可取回，故不是数据丢失，只是首屏变窄）。
+func (s *toolRunState) inlineBudget() int {
+	if s == nil {
+		return endpointResultMaxRunes
+	}
+	if left := endpointResultMsgBudget - s.inlinedRunes; left < endpointResultMaxRunes {
+		if left < endpointResultMinRunes {
+			return endpointResultMinRunes
+		}
+		return left
+	}
+	return endpointResultMaxRunes
 }
 
 func runStateFrom(ctx context.Context) *toolRunState {
@@ -497,12 +536,16 @@ func (t *endpointTool) Execute(ctx context.Context, userID int64, args json.RawM
 	}
 
 	raw := string(res.Body)
-	body := truncateRunes(raw, endpointResultMaxRunes)
+	limit := state.inlineBudget() // 每消息累计预算下的本次额度（见 endpointResultMsgBudget）
+	body := truncateRunes(raw, limit)
+	if state != nil {
+		state.inlinedRunes += utf8.RuneCountInString(body)
+	}
 	if body != raw {
 		// 超限：全量进缓存、给句柄——被截部分从此有取回通道（契约 §3.5，
 		// 此前只截不给取回是 Boss 实测撞上的死路，也是 Codex 至今被诟病的形态）。
 		handle := t.ep.results.put(userID, t.entry.Name, res.Body)
-		body += buildTruncationNote(handle, len(res.Body), res.Body, res.Truncated)
+		body += buildTruncationNote(handle, len(res.Body), res.Body, res.Truncated, limit)
 	}
 	return body, nil
 }

@@ -331,7 +331,7 @@ func sliceRunes(s string, offset, limit int) (piece string, total int, hasMore b
 // buildTruncationNote 组装截断提示：大小 + 句柄 + 结构摘要 + 强命令式取回指引。
 // 措辞三要素缺一不可（调研结论）：句柄可兑现（有取回工具）、结构摘要（免读全文
 // 直接写路径）、显式压制「拿预览当全文」。
-func buildTruncationNote(handle string, totalBytes int, body []byte, upstreamTruncated bool) string {
+func buildTruncationNote(handle string, totalBytes int, body []byte, upstreamTruncated bool, shownRunes int) string {
 	var b strings.Builder
 	// 缓存完整性必须诚实（对抗审查 MEDIUM）：上游响应超 2MiB 读取上限时缓存的
 	// 也只是前缀，宣称「完整数据已缓存」会让模型读完前缀却以为拿到了全量。
@@ -341,13 +341,15 @@ func buildTruncationNote(handle string, totalBytes int, body []byte, upstreamTru
 			"需要全量请缩小查询范围或用分页参数重查）", totalBytes, totalBytes)
 	}
 	fmt.Fprintf(&b, "\n（响应共 %d 字节，仅展示前 %d 字符。%s：句柄 %s，最长 30 分钟内有效（缓存紧张时可能提前失效）。",
-		totalBytes, endpointResultMaxRunes, scope, handle)
+		totalBytes, shownRunes, scope, handle)
 	if shape := summarizeJSONStructure(body); shape != "" {
 		fmt.Fprintf(&b, "\n结构摘要：%s", truncateRunes(shape, 400))
 	}
+	// 续读 offset 必须是**本次实际展示量**而非常量上限：累计预算降级后展示量会变小，
+	// 用常量会让模型从错误的位置续读、跳过中间一段（预算曲线引入的新坑）。
 	fmt.Fprintf(&b, "\n剩余内容必须用 read_endpoint_result 工具获取——优先按路径取子树（最省）："+
-		"{\"handle\":%q,\"path\":\"data.data.items[0]\"}；或分页续读：{\"handle\":%q,\"offset\":%d}。"+
-		"不要把上面的预览当作完整数据回答。）", handle, handle, endpointResultMaxRunes)
+		"{\"handle\":%q,\"path\":\"<按上面的结构摘要写>\"}；或分页续读：{\"handle\":%q,\"offset\":%d}。"+
+		"不要把上面的预览当作完整数据回答。）", handle, handle, shownRunes)
 	return b.String()
 }
 

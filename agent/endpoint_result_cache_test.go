@@ -56,7 +56,7 @@ func TestResultCache_OffsetPaging(t *testing.T) {
 	tool := &readEndpointResultTool{cache: c}
 
 	first := execRead(t, tool, 1, fmt.Sprintf(`{"handle":%q}`, h))
-	if !strings.Contains(first, `"offset":6000`) {
+	if !strings.Contains(first, fmt.Sprintf(`"offset":%d`, endpointResultMaxRunes)) {
 		t.Errorf("超限续读应给下一步 offset: %s", first[len(first)-160:])
 	}
 	rest := execRead(t, tool, 1, fmt.Sprintf(`{"handle":%q,"offset":%d}`, h, endpointResultMaxRunes))
@@ -131,11 +131,11 @@ func TestTruncationNote_HonestAboutIncompleteCache(t *testing.T) {
 	// MEDIUM：上游响应本身被 2MiB 上限截断时，缓存的也只是前缀——提示绝不能
 	// 宣称「完整数据已缓存」，否则模型读完前缀会以为拿到了全量。
 	body := []byte(`{"data":{"items":[1,2,3]}}`)
-	full := buildTruncationNote("res-1", len(body), body, false)
+	full := buildTruncationNote("res-1", len(body), body, false, endpointResultMaxRunes)
 	if !strings.Contains(full, "完整数据已缓存") {
 		t.Errorf("未截断时应声明完整: %s", full)
 	}
-	partial := buildTruncationNote("res-1", len(body), body, true)
+	partial := buildTruncationNote("res-1", len(body), body, true, endpointResultMaxRunes)
 	if strings.Contains(partial, "完整数据已缓存") || !strings.Contains(partial, "数据不完整") {
 		t.Errorf("上游超限时必须声明不完整: %s", partial)
 	}
@@ -177,5 +177,34 @@ func TestRenderShape_ArrayConsumesDepth(t *testing.T) {
 	shape := summarizeJSONStructure([]byte(`[[[["deep"]]]]`))
 	if strings.Count(shape, "array[") > 3 {
 		t.Errorf("嵌套数组穿透了深度限制: %s", shape)
+	}
+}
+
+// TestInlineBudget_PerMessageCurve 钉死每消息累计预算曲线（契约 §3.5）：
+// 前几次给满额、预算耗尽后降到保底，绝不给 0（模型看不见任何内容会瞎猜）。
+// 这是单次上限从 6000 放大到 40000 的安全网——没有它，msgCap=10 次调用
+// 最坏能内联 400k 字符，且 FC 多轮历史重发会把这笔账乘以轮数。
+func TestInlineBudget_PerMessageCurve(t *testing.T) {
+	s := &toolRunState{}
+	var total, calls int
+	for i := 0; i < 10; i++ {
+		got := s.inlineBudget()
+		if got < endpointResultMinRunes {
+			t.Fatalf("第 %d 次预算 %d 低于保底 %d", i+1, got, endpointResultMinRunes)
+		}
+		if i < 3 && got != endpointResultMaxRunes {
+			t.Errorf("第 %d 次应给满额 %d，实得 %d", i+1, endpointResultMaxRunes, got)
+		}
+		s.inlinedRunes += got
+		total += got
+		calls++
+	}
+	// 10 次（msgCap 上限）累计不得失控：预算 + 保底×剩余次数是硬上界。
+	if max := endpointResultMsgBudget + endpointResultMinRunes*calls; total > max {
+		t.Errorf("累计内联 %d 超硬上界 %d", total, max)
+	}
+	// nil state（RunOnce/A2A 等无状态轨）不 panic 且给满额。
+	if (*toolRunState)(nil).inlineBudget() != endpointResultMaxRunes {
+		t.Error("nil state 应给满额")
 	}
 }
