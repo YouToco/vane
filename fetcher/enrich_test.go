@@ -19,7 +19,7 @@ type fakeEnricher struct {
 	err   error
 }
 
-func (f *fakeEnricher) pageResults(_ context.Context, pageURL string, _ int) ([]exaContentsResult, bool, error) {
+func (f *fakeEnricher) pageResults(_ context.Context, pageURL string, _ int, _ *types.Source) ([]exaContentsResult, bool, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, pageURL)
 	f.mu.Unlock()

@@ -29,16 +29,17 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 			trace_id, user_id, session_id, tool_name, tool_kind,
 			endpoint_path, arguments, result_preview, result_size, http_status,
 			error_type, error, duration_ms, retrieval_query, candidate_tools,
-			tenant_id
+			cost_usd, source_id, tenant_id
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10,
 			$11, $12, $13, $14, $15,
-			`+tenantOfUser+`$2)
+			$16, $17, `+tenantOfUser+`$2)
 		) RETURNING id`,
 		c.TraceID, c.UserID, c.SessionID, c.ToolName, c.ToolKind,
 		c.EndpointPath, c.Arguments, c.ResultPreview, c.ResultSize, c.HTTPStatus,
 		c.ErrorType, c.Error, c.DurationMs, c.RetrievalQuery, cands,
+		c.CostUSD, c.SourceID,
 	).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "写入 tool_calls 记录", err)

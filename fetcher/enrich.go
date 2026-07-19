@@ -73,7 +73,7 @@ const enrichCacheHours = 24
 // 收窄成接口而非直接依赖具体类型：RSS 抓取器的单测全是纯 httptest，不该为了补全
 // 被迫拖进一个 Exa 客户端。
 type pageTextFetcher interface {
-	pageResults(ctx context.Context, pageURL string, maxAgeHours int) ([]exaContentsResult, bool, error)
+	pageResults(ctx context.Context, pageURL string, maxAgeHours int, src *types.Source) ([]exaContentsResult, bool, error)
 }
 
 // needsEnrichment 判断一条 feed 条目是否需要跟着链接去读原文。
@@ -158,7 +158,7 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 			skippedSeen++
 			continue // 闸门①命中：库里已有补全正文，不重复付费。
 		}
-		results, _, err := f.enricher.pageResults(ctx, c.it.Link, enrichCacheHours)
+		results, _, err := f.enricher.pageResults(ctx, c.it.Link, enrichCacheHours, &src)
 		if err != nil {
 			slog.Warn("fetcher: 单条正文补全失败，保留原样",
 				"source_id", src.ID, "url", c.it.Link, "err", err)
