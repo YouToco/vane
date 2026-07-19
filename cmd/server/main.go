@@ -290,6 +290,13 @@ func run() error {
 	// 用最朴素的 ticker：清理是幂等的纯删除，不值得为它引入 Temporal workflow。
 	go runSessionCleanup(ctx, st)
 
+	// gate 探针每日巡检（2026-07-19 Boss 拍板做进服务内）：每天 01:30 UTC（北京 09:30，
+	// 窗口覆盖 00:30 UTC 早报批次）+ 每次启动后 3 分钟各跑一轮 probe.Run，红灯或探针
+	// 自身故障时给 owner 发飞书告警卡——§16.1 曾挂红半天没人知道，靠人工 SSH 跑 gate
+	// 才发现。同上：只读旁路巡检不值得引入 Temporal，丢一轮无害（次日自动再跑）。
+	// push 复用推送管道的 Pusher 出口，principals 与 gate CLI 同走 owner 回退解析。
+	go newProbeWatcher(st, principals, manager, push, feishu.BuildReplyCard).run(ctx)
+
 	serveErr := make(chan error, 1)
 	go func() {
 		slog.Info("HTTP 服务启动", "addr", cfg.Server.Addr)
