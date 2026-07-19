@@ -216,15 +216,26 @@ func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.Conte
 	//   - 之后：不为一条马上要被 lookback/categories 滤掉的条目付费。
 	//   - 之前：补回来的正文要参与 finalize 的指纹与 §12.3 护栏判定；放到映射之后，
 	//     链接型条目会先被护栏丢掉，补全永远等不到执行。
-	f.enrichItems(ctx, src, items)
+	skippedSeen := f.enrichItems(ctx, src, items)
 
 	// 全灭判定必须在此处、比较**映射函数的入参与产出**——不能拿 feed.Items 当分母。
 	// applyLookback / applyCategories 是用户声明的正常过滤（B 类），它们在这一行之前
 	// 就把条目摘掉了；若拿过滤前的条数当分母，一次寻常的「博客 8 天没更新、RSS 里全是
 	// 7 天窗口外的旧闻」就会被判成抓取失败，每轮误告警、10 轮后还会把健康的源自动停用。
 	mapped, tally := mapItems(src, items)
-	if len(items) > 0 && len(mapped) == 0 {
-		return nil, allDroppedErr(src, len(items), tally)
+
+	// 分母要扣掉「因为库里已有其正文而刻意跳过补全」的条目（2026-07-19 生产实测抓到的
+	// 误报）：成本闸门与全灭防线会互相踩——闸门正确地不重复付费，但被跳过的条目本轮
+	// 仍是原样（含裸 HTML），照旧被 §12.3 丢弃，于是"全灭"成立、信源被判成故障。
+	//
+	// 而那些内容**我们本来就有**，什么都没丢。生产上 Gemini 官方博客正因此走到
+	// fail_count=2：再一轮告警、八轮后一个完全健康的源会被自动停用。
+	//
+	// 扣掉之后语义才对：分母是「这一轮真正指望它产出的条目数」。全都是已有内容时
+	// 分母为 0，回到「合法空轮」，与 feed 本来就没新东西同等对待——事实上也确实如此。
+	denom := len(items) - skippedSeen
+	if denom > 0 && len(mapped) == 0 {
+		return nil, allDroppedErr(src, denom, tally)
 	}
 	return mapped, nil
 }

@@ -100,9 +100,11 @@ func needsEnrichment(link, content string) bool {
 // 全程 best-effort：任何一条补全失败只记日志、保留原样，让它继续走后面的护栏
 // （补不到正文的链接型条目仍会被 §12.3 丢弃，与改造前一致——补全只增不减）。
 // 一条补不到不该拖垮整批，更不该让整个信源被判成故障。
-func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*gofeed.Item) {
+// 返回值是「因为库里已有其正文而**刻意跳过**补全」的条目数。调用方必须把它从
+// 「全灭」判定的分母里扣掉——见 FetchRSS 里的用法与下方说明。
+func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*gofeed.Item) (skippedSeen int) {
 	if f.enricher == nil || len(items) == 0 {
-		return // 未装配补全能力（测试/灰度）：退化为不补，行为与改造前一致。
+		return 0 // 未装配补全能力（测试/灰度）：退化为不补，行为与改造前一致。
 	}
 
 	// 先挑出候选，再一次性问 SeenChecker——逐条查会把一次批量查询放大成 N 次往返。
@@ -124,7 +126,7 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 		cands = append(cands, cand{it: it, key: key})
 	}
 	if len(cands) == 0 {
-		return
+		return 0
 	}
 
 	// 闸门①：已入库且正文已补全的直接跳过（跨源命中同一篇时只有第一个源付费）。
@@ -140,7 +142,7 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 			// （下轮再补，内容不丢），也不要在数据库抖动时打出一批付费调用。
 			slog.Warn("fetcher: 补全闸门查询失败，本轮跳过正文补全",
 				"source_id", src.ID, "candidates", len(cands), "err", err)
-			return
+			return 0
 		}
 		skip = got
 	}
@@ -153,6 +155,7 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 			break
 		}
 		if _, ok := skip[c.key]; ok {
+			skippedSeen++
 			continue // 闸门①命中：库里已有补全正文，不重复付费。
 		}
 		results, _, err := f.enricher.pageResults(ctx, c.it.Link, enrichCacheHours)
@@ -173,10 +176,11 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 		c.it.Description = "" // 正文已由 Content 承载，避免 itemContent 回退到旧的链接片段。
 		done++
 	}
-	if done > 0 {
+	if done > 0 || skippedSeen > 0 {
 		slog.Info("fetcher: RSS 正文补全完成",
-			"source_id", src.ID, "enriched", done, "candidates", len(cands), "skipped_seen", len(skip))
+			"source_id", src.ID, "enriched", done, "candidates", len(cands), "skipped_seen", skippedSeen)
 	}
+	return skippedSeen
 }
 
 // firstNonEmptyText 取第一条有正文的结果（与 mapExaContents 的挑法一致）。
