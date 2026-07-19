@@ -170,7 +170,9 @@ func (pw *probeWatcher) runOnce(ctx context.Context) {
 }
 
 // alert 发卡并在成功后记录指纹；发送失败不记指纹，下一轮（次日或下次部署）重试再发。
-// 用外层 ctx 而非 runOnce 的 rctx：探针查询可以超时放弃，但已产出的告警值得完整送达。
+// 用外层 ctx 而非 runOnce 的 rctx，是不让 probeRunTimeout 的剩余预算截断发送
+// （查询吃掉 55s 时只剩 5s 发卡）——不是送达保证：关停时外层 ctx 同样取消，
+// 本轮告警丢弃，与"丢一轮无害"的整体取舍一致（下次启动的首轮会重新告警）。
 func (pw *probeWatcher) alert(ctx context.Context, openID, fingerprint, markdown string) {
 	if fingerprint == pw.lastFingerprint {
 		slog.Info("probewatch: 同一故障本进程内已告警过，不重发")
