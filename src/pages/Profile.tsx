@@ -1,15 +1,16 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import type { Profile as ProfileData } from "../api";
-
-// 画像查看页（M7 功能 6.3，只读版）：展示当前 owner 的结构化标签 + 摘要画像。
-// 只读——画像的产生与修正入口在飞书对话（首采 2.1 / 修正 2.3）与反馈演化（2.2），
-// 这里是系统性回看的地方，不是第二个编辑入口。编辑写回涉及演化恒赢逻辑
-// （removed_tags 黑名单，Gate ⑧），留二期，故本页不做任何写操作。
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Separator } from "@/components/ui/separator";
+import { RefreshCw, Loader2, Tag, FileText, Ban } from "lucide-react";
 
 const BEIJING_TZ = "Asia/Shanghai";
 
-// 后端全 UTC，换算只在展示层做（与 History.tsx / Observability.tsx 同策略）。
 function fmtBeijing(iso?: string | null): string {
   if (!iso) return "—";
   const d = new Date(iso);
@@ -21,7 +22,6 @@ export default function Profile() {
   const [profile, setProfile] = useState<ProfileData | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
-  // 画像尚未生成（owner 从未走首采）后端回 404——这是正常空态，与加载失败区分开。
   const [notGenerated, setNotGenerated] = useState(false);
   const [nonce, setNonce] = useState(0);
 
@@ -57,96 +57,159 @@ export default function Profile() {
   }, [nonce]);
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <h2 className="page-title">用户画像</h2>
-        <button
-          type="button"
-          className="btn btn-ghost btn-mini"
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-xl font-semibold tracking-tight">用户画像</h2>
+          <p className="text-sm text-muted-foreground mt-1">
+            机器人对你的理解：结构化标签 + 摘要画像。画像由对话首采与反馈演化维护——
+            要修改请在飞书对话里进行，这里只做查看。
+          </p>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
           onClick={() => setNonce((n) => n + 1)}
           disabled={loading}
         >
-          {loading ? <span className="spinner spinner-dark" /> : "刷新"}
-        </button>
+          {loading ? (
+            <Loader2 className="size-4 animate-spin" />
+          ) : (
+            <RefreshCw className="size-4" />
+          )}
+        </Button>
       </div>
-      <p className="muted src-intro">
-        机器人对你的理解：结构化标签 + 摘要画像。画像由对话首采与反馈演化维护——
-        要修改请在飞书对话里进行（如「帮我把关注领域改成…」），这里只做查看。
-      </p>
 
-      {loadError && <div className="alert alert-error">{loadError}</div>}
+      {loadError && (
+        <Alert variant="destructive">
+          <AlertDescription>{loadError}</AlertDescription>
+        </Alert>
+      )}
 
       {loading ? (
-        <div className="page-loading">
-          <span className="spinner spinner-dark" /> 加载中…
-        </div>
-      ) : notGenerated ? (
-        <div className="empty-hint">
-          画像尚未生成。在飞书对话里向机器人做一次自我介绍（行业 / 职业 / 关注领域），
-          它会自动建立你的画像。
-        </div>
-      ) : profile ? (
-        <>
-          <section className="card">
-            <dl className="kv-grid">
-              <div>
-                <dt>行业</dt>
-                <dd>{profile.industry || <span className="muted">未填写</span>}</dd>
-              </div>
-              <div>
-                <dt>职业</dt>
-                <dd>{profile.occupation || <span className="muted">未填写</span>}</dd>
-              </div>
-              <div>
-                <dt>更新时间（北京）</dt>
-                <dd>{fmtBeijing(profile.updated_at)}</dd>
-              </div>
-            </dl>
-          </section>
-
-          <h3 className="section-title">兴趣标签</h3>
-          <section className="card">
-            {profile.tags.length === 0 ? (
-              <div className="empty-hint">还没有兴趣标签。</div>
-            ) : (
-              <div className="tag-cloud">
-                {profile.tags.map((t) => (
-                  <span key={t} className="badge badge-type">
-                    {t}
-                  </span>
+        <div className="space-y-4">
+          <Card>
+            <CardContent className="py-6 space-y-4">
+              <div className="grid grid-cols-3 gap-4">
+                {Array.from({ length: 3 }).map((_, i) => (
+                  <div key={i} className="space-y-2">
+                    <Skeleton className="h-3 w-16" />
+                    <Skeleton className="h-5 w-24" />
+                  </div>
                 ))}
               </div>
-            )}
-          </section>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="py-6 space-y-3">
+              <Skeleton className="h-4 w-20" />
+              <div className="flex gap-2">
+                {Array.from({ length: 5 }).map((_, i) => (
+                  <Skeleton key={i} className="h-6 w-16 rounded-full" />
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      ) : notGenerated ? (
+        <Card>
+          <CardContent className="py-12 text-center text-muted-foreground">
+            画像尚未生成。在飞书对话里向机器人做一次自我介绍（行业 / 职业 / 关注领域），
+            它会自动建立你的画像。
+          </CardContent>
+        </Card>
+      ) : profile ? (
+        <>
+          <Card>
+            <CardContent className="py-6">
+              <div className="grid grid-cols-3 gap-6">
+                <div>
+                  <p className="text-xs text-muted-foreground mb-1">行业</p>
+                  <p className="text-sm font-medium">
+                    {profile.industry || <span className="text-muted-foreground">未填写</span>}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-muted-foreground mb-1">职业</p>
+                  <p className="text-sm font-medium">
+                    {profile.occupation || <span className="text-muted-foreground">未填写</span>}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-muted-foreground mb-1">更新时间</p>
+                  <p className="text-sm font-medium">{fmtBeijing(profile.updated_at)}</p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
 
-          <h3 className="section-title">摘要画像</h3>
-          <section className="card">
-            {profile.summary ? (
-              <pre className="profile-summary">{profile.summary}</pre>
-            ) : (
-              <div className="empty-hint">摘要画像还没生成（需累积几轮反馈后由演化写入）。</div>
-            )}
-            <p className="muted chart-note">
-              负偏好（不感兴趣的内容）由演化写在摘要末尾的「不感兴趣：」句式里，不单列。
-            </p>
-          </section>
-
-          {profile.removed_tags.length > 0 && (
-            <>
-              <h3 className="section-title">已移除标签（黑名单）</h3>
-              <section className="card">
-                <p className="muted chart-note">
-                  你亲手删过的标签，演化不会再把它们加回来（Gate ⑧ 人工修正恒赢）。
-                </p>
-                <div className="tag-cloud">
-                  {profile.removed_tags.map((t) => (
-                    <span key={t} className="badge badge-muted profile-tag-removed">
+          <Card>
+            <CardHeader className="pb-3">
+              <CardTitle className="text-base flex items-center gap-2">
+                <Tag className="size-4" />
+                兴趣标签
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {profile.tags.length === 0 ? (
+                <p className="text-sm text-muted-foreground">还没有兴趣标签。</p>
+              ) : (
+                <div className="flex flex-wrap gap-2">
+                  {profile.tags.map((t) => (
+                    <Badge key={t} variant="secondary">
                       {t}
-                    </span>
+                    </Badge>
                   ))}
                 </div>
-              </section>
-            </>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="pb-3">
+              <CardTitle className="text-base flex items-center gap-2">
+                <FileText className="size-4" />
+                摘要画像
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {profile.summary ? (
+                <pre className="text-sm leading-relaxed whitespace-pre-wrap font-sans">
+                  {profile.summary}
+                </pre>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  摘要画像还没生成（需累积几轮反馈后由演化写入）。
+                </p>
+              )}
+              <Separator className="my-3" />
+              <p className="text-xs text-muted-foreground">
+                负偏好（不感兴趣的内容）由演化写在摘要末尾的「不感兴趣：」句式里，不单列。
+              </p>
+            </CardContent>
+          </Card>
+
+          {profile.removed_tags.length > 0 && (
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base flex items-center gap-2">
+                  <Ban className="size-4" />
+                  已移除标签（黑名单）
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="text-xs text-muted-foreground mb-3">
+                  你亲手删过的标签，演化不会再把它们加回来（Gate ⑧ 人工修正恒赢）。
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {profile.removed_tags.map((t) => (
+                    <Badge key={t} variant="outline" className="text-muted-foreground line-through">
+                      {t}
+                    </Badge>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
           )}
         </>
       ) : null}
