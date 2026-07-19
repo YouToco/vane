@@ -37,8 +37,9 @@ const (
 	// maxActivatedEndpoints 会话内同时激活（注入 FC tools 数组）的端点上限。
 	// 在场工具数安全线是 30（RAG-MCP 压测 <30 成功率 >90%）：当前静态面是
 	// 13 工具 + search_endpoints，15 个激活位正好顶到 29——**再加静态工具前
-	// 必须先降本上限**（2026-07-18 修正：原注释写"静态 10 个"已长期失真）。
-	maxActivatedEndpoints = 15
+	// 必须先降本上限**（2026-07-18 修正：原注释写"静态 10 个"已长期失真；
+	// 同日 read_endpoint_result 入列静态面，13+2 静态 + 14 激活 = 29，压线内）。
+	maxActivatedEndpoints = 14
 	// searchTopK 每次检索返回并激活的端点数（Anthropic Tool Search 默认值同为 5）。
 	searchTopK = 5
 	// endpointResultMaxRunes 端点结果回给模型的截断上限（rune）。上游响应动辄
@@ -164,6 +165,7 @@ type EndpointTools struct {
 	counter  endpointCallCounter
 	msgCap   int
 	dailyCap int
+	results  *resultCache // 大结果缓存（契约 §3.5：截断句柄 + read_endpoint_result 取回）
 }
 
 // NewEndpointTools 构造端点工具面。caps ≤0 时兜底为保守默认（装配疏漏不能变成无限额）。
@@ -174,11 +176,15 @@ func NewEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, 
 	if dailyCap <= 0 {
 		dailyCap = 200
 	}
-	return &EndpointTools{inv: inv, counter: counter, msgCap: msgCap, dailyCap: dailyCap}
+	return &EndpointTools{inv: inv, counter: counter, msgCap: msgCap, dailyCap: dailyCap,
+		results: newResultCache()}
 }
 
 // SearchTool 返回检索元工具（进静态白名单，BuildTools 装配）。
 func (e *EndpointTools) SearchTool() Tool { return &searchEndpointsTool{ep: e} }
+
+// ReadResultTool 返回大结果取回工具（进静态白名单，BuildTools 装配；契约 §3.5）。
+func (e *EndpointTools) ReadResultTool() Tool { return &readEndpointResultTool{cache: e.results} }
 
 // Resolve 按白名单语义解析动态端点工具：必须**已激活**且仍在注册表里。
 // 注册表里存在但未激活 → 不解析（见文件头注第二条硬边界）；
@@ -412,7 +418,7 @@ func (t *endpointTool) Mutating() bool                   { return false }
 func (t *endpointTool) Summarize(json.RawMessage) string { return "" }
 func (t *endpointTool) toolKind() types.ToolCallKind     { return types.ToolCallKindTikHubEndpoint }
 
-func (t *endpointTool) Execute(ctx context.Context, _ int64, args json.RawMessage) (string, error) {
+func (t *endpointTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
 	rec := recFrom(ctx)
 	if rec != nil {
 		rec.EndpointPath = t.entry.Path
@@ -493,7 +499,10 @@ func (t *endpointTool) Execute(ctx context.Context, _ int64, args json.RawMessag
 	raw := string(res.Body)
 	body := truncateRunes(raw, endpointResultMaxRunes)
 	if body != raw {
-		body += fmt.Sprintf("\n（响应共 %d 字节，已截断展示）", len(res.Body))
+		// 超限：全量进缓存、给句柄——被截部分从此有取回通道（契约 §3.5，
+		// 此前只截不给取回是 Boss 实测撞上的死路，也是 Codex 至今被诟病的形态）。
+		handle := t.ep.results.put(userID, t.entry.Name, res.Body)
+		body += buildTruncationNote(handle, len(res.Body), res.Body)
 	}
 	return body, nil
 }

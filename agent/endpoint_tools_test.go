@@ -366,11 +366,15 @@ func TestEndpointTool_ResultTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "已截断") {
-		t.Error("超限结果应标注截断")
+	// 契约 §3.5：截断提示必须带可兑现的句柄 + 取回工具指引 + 预览混淆压制。
+	if !strings.Contains(out, "res-") || !strings.Contains(out, "read_endpoint_result") {
+		t.Errorf("超限结果应给缓存句柄与取回指引: %s", out[len(out)-200:])
 	}
-	if got := len([]rune(out)); got > endpointResultMaxRunes+100 {
-		t.Errorf("截断后仍有 %d rune", got)
+	if !strings.Contains(out, "不要把上面的预览当作完整数据回答") {
+		t.Error("缺预览混淆压制话术")
+	}
+	if got := len([]rune(out)); got > endpointResultMaxRunes+600 {
+		t.Errorf("截断后（含提示）仍有 %d rune，提示开销超预算", got)
 	}
 }
 
