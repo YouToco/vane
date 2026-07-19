@@ -34,10 +34,18 @@ type Multi struct {
 //
 // rec 是绑定引擎的调用记账（tool_calls，契约 §5）；nil 合法（只是不记账）。
 func NewMulti(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorder) *Multi {
+	// RSS 抓取器接上正文补全：链接型聚合器（HN/Lobsters/Reddit）的条目只给标题和
+	// 链接、不带正文，不补的话整批被 §12.3 护栏丢弃（2026-07-18 生产实证）。
+	// 复用已经构造好的 exaContents 取正文、复用 seen 做付费闸门，不新增装配参数。
+	rss := New(cfg)
+	exaContents := NewExaContents(cfg)
+	rss.enricher = exaContents
+	rss.seen = seen
+
 	return &Multi{
-		rss:         New(cfg),
+		rss:         rss,
 		exa:         NewExa(cfg),
-		exaContents: NewExaContents(cfg),
+		exaContents: exaContents,
 		binding:     NewBinding(cfg, seen, rec),
 	}
 }
