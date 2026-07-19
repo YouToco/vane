@@ -36,14 +36,32 @@ import (
 func main() { os.Exit(run()) }
 
 func run() int {
-	if len(os.Args) < 2 || os.Args[1] != "set-password" {
-		fmt.Fprintln(os.Stderr, "用法: useradmin set-password -email <邮箱> [-user <id>]（密码从 stdin 读）")
+	if len(os.Args) < 2 {
+		usage()
 		return 2
 	}
+	switch os.Args[1] {
+	case "set-password":
+		return runSetPassword(os.Args[2:])
+	case "invite":
+		return runInvite(os.Args[2:])
+	default:
+		usage()
+		return 2
+	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, "用法:")
+	fmt.Fprintln(os.Stderr, "  useradmin set-password -email <邮箱> [-user <id>]   （密码从 stdin 读）")
+	fmt.Fprintln(os.Stderr, "  useradmin invite [-uses N] [-expires-days D] [-code CODE]")
+}
+
+func runSetPassword(args []string) int {
 	fs := flag.NewFlagSet("set-password", flag.ExitOnError)
 	email := fs.String("email", "", "要绑定的邮箱")
 	userID := fs.Int64("user", 0, "目标用户 ID；0 表示解析当前 owner")
-	_ = fs.Parse(os.Args[2:])
+	_ = fs.Parse(args)
 
 	if strings.TrimSpace(*email) == "" {
 		fmt.Fprintln(os.Stderr, "useradmin: 必须提供 -email")
