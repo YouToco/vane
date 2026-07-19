@@ -151,6 +151,9 @@ type fakeStore struct {
 	disableResult bool
 	disableErr    error
 	disableCalls  []int64
+	// #8 卡片源归属：schedSrcForContent 映射 content_item_id→本任务命中源 id；
+	// 命中即 ScheduleSourceForContent 返回 (id,true)，缺失返回 (0,false) 让调用方回退首发源。
+	schedSrcForContent map[int64]int64
 }
 
 func (s *fakeStore) DisableSourceIfActive(_ context.Context, id int64) (bool, error) {
@@ -182,7 +185,17 @@ func (s *fakeStore) emptyBatchCalls() []emptyBatchCall {
 }
 
 func (s *fakeStore) GetSource(_ context.Context, id int64) (*types.Source, error) {
-	return &types.Source{ID: id, Title: "fake-source", Platform: "rss"}, nil
+	// Title 编码 id（src-<id>），便于断言构卡用了哪个源（首发源 vs 任务命中源）。
+	return &types.Source{ID: id, Title: fmt.Sprintf("src-%d", id), Platform: "rss"}, nil
+}
+
+func (s *fakeStore) ScheduleSourceForContent(_ context.Context, contentItemID int64, _ string) (int64, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sid, ok := s.schedSrcForContent[contentItemID]; ok {
+		return sid, true, nil
+	}
+	return 0, false, nil
 }
 
 func (s *fakeStore) ListDueSourcesByUser(context.Context, int64) ([]types.Source, error) {
@@ -494,6 +507,40 @@ func TestPush_ThreadsScheduleID(t *testing.T) {
 	}
 	if got := run(""); got != "" {
 		t.Errorf("即时触发应透传空 schedule_id（用户级语义），实得 %q", got)
+	}
+}
+
+// TestPush_IsolatedCardSourceAttribution 守 #8：隔离任务（ScheduleID 非空）构卡时源归属
+// 取 content_sources ∩ schedule_sources 的命中源，而非全局首发源 content_items.source_id；
+// 非隔离 / 无交集时回退首发源。
+func TestPush_IsolatedCardSourceAttribution(t *testing.T) {
+	run := func(schedID string, itemFirstSrc int64, mapping map[int64]int64) string {
+		st := &fakeStore{nextDelID: 41, schedSrcForContent: mapping}
+		var got []feedback.AggregateCardInput
+		buildAgg := func(in feedback.AggregateCardInput) string { got = append(got, in); return "{}" }
+		a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{msgID: "om_1"}, st, fakeFeishu{}, nil, nil, buildAgg, nil)
+		in := PushIn{UserID: 1, ScheduleID: schedID, TraceID: "tr-" + schedID + "-src", Cards: []GeneratedCard{{
+			Scored: types.ScoredItem{Item: types.ContentItem{ID: 11, SourceID: itemFirstSrc}, Score: 80}, BodyMD: "x",
+		}}}
+		if err := a.Push(context.Background(), in); err != nil {
+			t.Fatalf("Push 意外报错: %v", err)
+		}
+		if len(got) != 1 || len(got[0].Items) != 1 {
+			t.Fatalf("应构一张含一条目的卡，实得 %+v", got)
+		}
+		return got[0].Items[0].SourceTitle
+	}
+	// 隔离任务：内容 11 的首发源是 7，但本任务通过源 99 命中它 → 卡应标任务命中源 src-99。
+	if got := run("push-1-x", 7, map[int64]int64{11: 99}); got != "src-99" {
+		t.Errorf("隔离任务应标任务命中源 src-99，实得 %q", got)
+	}
+	// 非隔离（即时/老任务，ScheduleID 空）→ 用首发源 src-7。
+	if got := run("", 7, nil); got != "src-7" {
+		t.Errorf("非隔离应标首发源 src-7，实得 %q", got)
+	}
+	// 隔离但无交集（理论上不该发生）→ 回退首发源 src-7。
+	if got := run("push-1-x", 7, nil); got != "src-7" {
+		t.Errorf("无交集应回退首发源 src-7，实得 %q", got)
 	}
 }
 

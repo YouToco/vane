@@ -477,4 +477,54 @@ func TestScheduleSourcesStore(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("ScheduleSourceForContent 取任务命中源而非全局首发源（#8）", func(t *testing.T) {
+		// 本任务只绑 s1（任务源）；s2、s3 是非任务源。
+		if err := st.ReplaceScheduleSources(ctx, u.ID, schedID, []int64{s1}); err != nil {
+			t.Fatalf("Replace [s1] 失败: %v", err)
+		}
+		// 内容 c 先经 s2 入库（首发源=s2，非任务），再经 s1 登记 → content_sources: c↔{s2,s1}。
+		ck := "https://example.com/attr-" + uuid.NewString()
+		cID, _, err := st.UpsertContentItem(ctx, &types.ContentItem{
+			SourceID: s2, ExternalID: "ext-" + uuid.NewString(), CanonicalKey: ck,
+			URL: ck, Title: "归属测试", ContentHash: "h-" + uuid.NewString(),
+		})
+		if err != nil {
+			t.Fatalf("Upsert(c via s2) 失败: %v", err)
+		}
+		if _, _, err := st.UpsertContentItem(ctx, &types.ContentItem{
+			SourceID: s1, ExternalID: "ext2-" + uuid.NewString(), CanonicalKey: ck,
+			URL: ck, Title: "归属测试", ContentHash: "h2-" + uuid.NewString(),
+		}); err != nil {
+			t.Fatalf("Upsert(c via s1) 失败: %v", err)
+		}
+		// 另一内容 c2 只经 s3（非任务源）入库——与本任务源无交集。
+		ck2 := "https://example.com/attr-nomatch-" + uuid.NewString()
+		c2ID, _, err := st.UpsertContentItem(ctx, &types.ContentItem{
+			SourceID: s3, ExternalID: "ext3-" + uuid.NewString(), CanonicalKey: ck2,
+			URL: ck2, Title: "无交集", ContentHash: "h3-" + uuid.NewString(),
+		})
+		if err != nil {
+			t.Fatalf("Upsert(c2 via s3) 失败: %v", err)
+		}
+		defer func() {
+			c, cancel := cleanupContext()
+			defer cancel()
+			cleanupExec(c, t, st, `DELETE FROM content_sources WHERE content_item_id = ANY($1)`, []int64{cID, c2ID})
+			cleanupExec(c, t, st, `DELETE FROM content_items WHERE id = ANY($1)`, []int64{cID, c2ID})
+		}()
+
+		// 命中：c 经任务源 s1 出现 → 返回 s1，而非全局首发源 s2。
+		sid, ok, err := st.ScheduleSourceForContent(ctx, cID, schedID)
+		if err != nil {
+			t.Fatalf("ScheduleSourceForContent(c) 失败: %v", err)
+		}
+		if !ok || sid != s1 {
+			t.Errorf("应返回任务命中源 s1=%d（非首发源 s2=%d），实得 ok=%v sid=%d", s1, s2, ok, sid)
+		}
+		// 无交集：c2 只在非任务源 s3 下 → (0,false)，调用方回退首发源。
+		if sid, ok, err := st.ScheduleSourceForContent(ctx, c2ID, schedID); err != nil || ok || sid != 0 {
+			t.Errorf("无交集应返回 (0,false)，实得 sid=%d ok=%v err=%v", sid, ok, err)
+		}
+	})
 }

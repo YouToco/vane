@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/YouToco/vane/types"
 )
@@ -94,6 +97,37 @@ func (s *Store) ListDueSourcesBySchedule(ctx context.Context, scheduleID string)
 		return nil, types.NewAppError(types.CodeDatabase, "遍历 source 结果集", err)
 	}
 	return out, nil
+}
+
+// ScheduleSourceForContent 返回某内容在本任务源集里的实际出现源——content_sources ∩
+// schedule_sources 的交集（P1b #8 卡片源归属修复）。
+//
+// 为什么需要：content_items.source_id 是**全局首发源**（谁先发现这条内容，插入后 ON CONFLICT
+// DO NOTHING 永不更新），与「本任务通过哪个源看到它」无关。隔离任务候选走 content_sources ∩
+// schedule_sources 选出，但构卡若用首发源标名，会给隔离任务的卡打上一个该任务根本不含的源名
+// （如任务经私有 Exa 源命中，卡却标用户订阅的另一个源），违背隔离对用户呈现的一致性。构卡时改
+// 用本方法取命中源。
+//
+// 无交集返回 (0,false)：理论上不该发生（候选正是这么选出来的），调用方回退首发源即可。
+// 多个命中取 source_id 最小，保证确定性。
+func (s *Store) ScheduleSourceForContent(ctx context.Context, contentItemID int64, scheduleID string) (int64, bool, error) {
+	var sid int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT cs.source_id
+		   FROM content_sources cs
+		   JOIN schedule_sources ss ON ss.source_id = cs.source_id
+		  WHERE cs.content_item_id = $1 AND ss.schedule_id = $2
+		  ORDER BY cs.source_id
+		  LIMIT 1`,
+		contentItemID, scheduleID).Scan(&sid)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询内容在任务源集的命中源（content_item=%d, schedule_id=%s）", contentItemID, scheduleID), err)
+	}
+	return sid, true, nil
 }
 
 // ListScheduleSourceIDs 返回某任务当前绑定的源 id 列表（归属校验进 WHERE）。
