@@ -95,6 +95,10 @@ type Result struct {
 	Status     int
 	Body       []byte
 	DurationMs int
+	// Truncated 表示上游响应超过读取上限、Body 只是前缀。调用方**必须**据此调整
+	// 措辞与行为：agent 面不得宣称「完整数据已缓存」（对抗审查 MEDIUM：假陈述会
+	// 让模型把不完整的缓存当全量分页读完还以为读全了）；绑定引擎按超限显式报错。
+	Truncated bool
 }
 
 // Invoke 调用一个注册表端点。params 是模型产出的平铺参数（已经 agent 侧校验）。
@@ -137,10 +141,16 @@ func (v *Invoker) Invoke(ctx context.Context, entry tikhubcatalog.Entry, params 
 		return nil, types.NewAppError(types.CodeInternal,
 			fmt.Sprintf("TikHub 端点 %s 响应读取失败", entry.Name), err)
 	}
+	// 多读的那 1 字节只用于判超限，不进 Body（否则末尾多一个截半的字节）。
+	truncated := int64(len(body)) > cap
+	if truncated {
+		body = body[:cap]
+	}
 	return &Result{
 		Status:     resp.StatusCode,
 		Body:       body,
 		DurationMs: int(time.Since(start).Milliseconds()),
+		Truncated:  truncated,
 	}, nil
 }
 

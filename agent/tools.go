@@ -102,7 +102,7 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger,
 		&editTaskPlaybookTool{st: st, tr: tr},
 	}
 	if endpoints != nil {
-		tools = append(tools, endpoints.SearchTool())
+		tools = append(tools, endpoints.SearchTool(), endpoints.ReadResultTool())
 	}
 	return tools
 }

@@ -140,7 +140,8 @@ func TestActivationState_EncodeDecodeRoundTrip(t *testing.T) {
 // ============================================================
 
 func newTestEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, dailyCap int) *EndpointTools {
-	return NewEndpointTools(inv, counter, msgCap, dailyCap)
+	// 测试按 1M 窗口（生产 agent 模型 deepseek-v4-pro 同档）派生上限。
+	return NewEndpointTools(inv, counter, msgCap, dailyCap, 1_000_000)
 }
 
 func TestSearchEndpointsTool_ActivatesAndRecords(t *testing.T) {
@@ -358,7 +359,7 @@ func TestEndpointTool_UpstreamErrorAndHTTPError(t *testing.T) {
 }
 
 func TestEndpointTool_ResultTruncation(t *testing.T) {
-	big := strings.Repeat("数", endpointResultMaxRunes+100)
+	big := strings.Repeat("数", testLimits.PerCall+100)
 	ep := newTestEndpointTools(&fakeInvoker{body: big}, &fakeCounter{}, 10, 200)
 	entry := testEndpoint(t)
 	tool, _ := ep.Resolve(entry.Name, &activationState{names: []string{entry.Name}})
@@ -366,11 +367,15 @@ func TestEndpointTool_ResultTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "已截断") {
-		t.Error("超限结果应标注截断")
+	// 契约 §3.5：截断提示必须带可兑现的句柄 + 取回工具指引 + 预览混淆压制。
+	if !strings.Contains(out, "res-") || !strings.Contains(out, "read_endpoint_result") {
+		t.Errorf("超限结果应给缓存句柄与取回指引: %s", out[len(out)-200:])
 	}
-	if got := len([]rune(out)); got > endpointResultMaxRunes+100 {
-		t.Errorf("截断后仍有 %d rune", got)
+	if !strings.Contains(out, "不要把上面的预览当作完整数据回答") {
+		t.Error("缺预览混淆压制话术")
+	}
+	if got := len([]rune(out)); got > testLimits.PerCall+600 {
+		t.Errorf("截断后（含提示）仍有 %d rune，提示开销超预算", got)
 	}
 }
 

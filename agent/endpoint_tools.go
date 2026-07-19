@@ -37,14 +37,19 @@ const (
 	// maxActivatedEndpoints 会话内同时激活（注入 FC tools 数组）的端点上限。
 	// 在场工具数安全线是 30（RAG-MCP 压测 <30 成功率 >90%）：当前静态面是
 	// 13 工具 + search_endpoints，15 个激活位正好顶到 29——**再加静态工具前
-	// 必须先降本上限**（2026-07-18 修正：原注释写"静态 10 个"已长期失真）。
-	maxActivatedEndpoints = 15
+	// 必须先降本上限**（2026-07-18 修正：原注释写"静态 10 个"已长期失真；
+	// 同日 read_endpoint_result 入列静态面，13+2 静态 + 14 激活 = 29，压线内）。
+	maxActivatedEndpoints = 14
 	// searchTopK 每次检索返回并激活的端点数（Anthropic Tool Search 默认值同为 5）。
 	searchTopK = 5
-	// endpointResultMaxRunes 端点结果回给模型的截断上限（rune）。上游响应动辄
-	// 100KB+ JSON，全文进上下文一次就吃掉几万 token；6000 rune 足够模型读懂
-	// 数据结构与核心内容，完整原文有 tool_calls.result_size 佐证体量。
-	endpointResultMaxRunes = 6000
+	// 端点结果的内联上限**不再是常量**：由 agent 模型声明的上下文窗口派生
+	// （llm.DeriveInlineLimits，OpenClaw 同款分档 + 窗口 30% 封顶），随
+	// EndpointTools 注入。写死过一次的教训见 llm/context.go 头注——6000 rune
+	// 是 64K 窗口时代拍的值，模型换到 1M 后没人记得改，直到 Boss 在生产撞见截断。
+	//
+	// endpointResultFallbackRunes 仅用于装配缺失时的兜底（NewEndpointTools 收到
+	// 非法窗口值），不参与正常路径。
+	endpointResultFallbackRunes = 16000
 	// endpointDefDescMaxRunes 动态工具 Description 的截断上限。激活的每个工具
 	// 定义每轮都随请求发送，600 rune 全文 ×15 个会持续吃预算；检索结果文本里
 	// 已给过更全的说明，注入定义只保留摘要级描述。
@@ -73,6 +78,25 @@ type toolRunState struct {
 	// 校验通过之后、发请求之前：打到上游才算（含 HTTP 错误——失败同样计费），
 	// 参数校验失败没打上游、不计费，不吃限额。
 	endpointCalls int
+	// inlinedRunes 本条消息内已内联进上下文的端点结果字符数（累计预算，
+	// 见 llm.InlineLimits.MsgBudget）。只统计真正回给模型的部分，不含缓存全量。
+	inlinedRunes int
+}
+
+// inlineBudget 返回本次调用可内联的字符数：预算未尽给满额，尽了给保底
+// （保底仍有句柄可取回，故不是数据丢失，只是首屏变窄）。
+// s 为 nil（RunOnce/A2A 无状态轨）时按单次满额，不累计。
+func (s *toolRunState) inlineBudget(lim llm.InlineLimits) int {
+	if s == nil {
+		return lim.PerCall
+	}
+	if left := lim.MsgBudget - s.inlinedRunes; left < lim.PerCall {
+		if left < lim.MinPerCall {
+			return lim.MinPerCall
+		}
+		return left
+	}
+	return lim.PerCall
 }
 
 func runStateFrom(ctx context.Context) *toolRunState {
@@ -164,21 +188,41 @@ type EndpointTools struct {
 	counter  endpointCallCounter
 	msgCap   int
 	dailyCap int
+	results  *resultCache // 大结果缓存（契约 §3.5：截断句柄 + read_endpoint_result 取回）
+	// limits 由 agent 模型的上下文窗口派生（llm.DeriveInlineLimits）：内联多少
+	// 内容是模型属性不是代码常量，模型换代时自动跟随，无需有人记得改这里。
+	limits llm.InlineLimits
 }
 
 // NewEndpointTools 构造端点工具面。caps ≤0 时兜底为保守默认（装配疏漏不能变成无限额）。
-func NewEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, dailyCap int) *EndpointTools {
+// contextTokens 是 agent 模型声明的上下文窗口（llm.ContextWindowTokens）；
+// ≤0 时按保守兜底档派生，绝不因装配疏漏放大内联量。
+func NewEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, dailyCap, contextTokens int) *EndpointTools {
 	if msgCap <= 0 {
 		msgCap = 10
 	}
 	if dailyCap <= 0 {
 		dailyCap = 200
 	}
-	return &EndpointTools{inv: inv, counter: counter, msgCap: msgCap, dailyCap: dailyCap}
+	limits := llm.DeriveInlineLimits(contextTokens)
+	if contextTokens <= 0 {
+		limits = llm.InlineLimits{
+			PerCall:    endpointResultFallbackRunes,
+			MsgBudget:  endpointResultFallbackRunes * 3,
+			MinPerCall: endpointResultFallbackRunes / 4,
+		}
+	}
+	return &EndpointTools{inv: inv, counter: counter, msgCap: msgCap, dailyCap: dailyCap,
+		results: newResultCache(), limits: limits}
 }
 
 // SearchTool 返回检索元工具（进静态白名单，BuildTools 装配）。
 func (e *EndpointTools) SearchTool() Tool { return &searchEndpointsTool{ep: e} }
+
+// ReadResultTool 返回大结果取回工具（进静态白名单，BuildTools 装配；契约 §3.5）。
+func (e *EndpointTools) ReadResultTool() Tool {
+	return &readEndpointResultTool{cache: e.results, perRead: e.limits.PerCall}
+}
 
 // Resolve 按白名单语义解析动态端点工具：必须**已激活**且仍在注册表里。
 // 注册表里存在但未激活 → 不解析（见文件头注第二条硬边界）；
@@ -412,7 +456,7 @@ func (t *endpointTool) Mutating() bool                   { return false }
 func (t *endpointTool) Summarize(json.RawMessage) string { return "" }
 func (t *endpointTool) toolKind() types.ToolCallKind     { return types.ToolCallKindTikHubEndpoint }
 
-func (t *endpointTool) Execute(ctx context.Context, _ int64, args json.RawMessage) (string, error) {
+func (t *endpointTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
 	rec := recFrom(ctx)
 	if rec != nil {
 		rec.EndpointPath = t.entry.Path
@@ -491,9 +535,16 @@ func (t *endpointTool) Execute(ctx context.Context, _ int64, args json.RawMessag
 	}
 
 	raw := string(res.Body)
-	body := truncateRunes(raw, endpointResultMaxRunes)
+	limit := state.inlineBudget(t.ep.limits) // 每消息累计预算下的本次额度（由窗口派生）
+	body := truncateRunes(raw, limit)
+	if state != nil {
+		state.inlinedRunes += utf8.RuneCountInString(body)
+	}
 	if body != raw {
-		body += fmt.Sprintf("\n（响应共 %d 字节，已截断展示）", len(res.Body))
+		// 超限：全量进缓存、给句柄——被截部分从此有取回通道（契约 §3.5，
+		// 此前只截不给取回是 Boss 实测撞上的死路，也是 Codex 至今被诟病的形态）。
+		handle := t.ep.results.put(userID, t.entry.Name, res.Body)
+		body += buildTruncationNote(handle, len(res.Body), res.Body, res.Truncated, limit)
 	}
 	return body, nil
 }
