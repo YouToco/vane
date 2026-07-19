@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -37,7 +39,11 @@ func TestMigration024BackfillsCallTables(t *testing.T) {
 		t.Fatalf("建租户失败: %v", err)
 	}
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO users (email, password_hash) VALUES ('backfill024@test.local', 'x') RETURNING id`).
+		// 邮箱必须唯一：uq_users_email_lower 是 lower(email) 上的唯一约束，
+		// 硬编码值会让这个测试**一个数据库只能跑一次**——CI 每次新库所以绿，
+		// 本地重跑必红（2026-07-19 实测撞上）。与本包其它用例一样用时间戳后缀。
+		`INSERT INTO users (email, password_hash) VALUES ($1, 'x') RETURNING id`,
+		fmt.Sprintf("backfill024-%d@test.local", time.Now().UnixNano())).
 		Scan(&userID); err != nil {
 		t.Fatalf("建用户失败: %v", err)
 	}

@@ -207,7 +207,7 @@ func (s *Store) SoftDeleteTenant(ctx context.Context, tenantID int64) (*types.Te
 		`UPDATE tenants
 		    SET status = 'deleting',
 		        deleted_at = COALESCE(deleted_at, now()),
-		        purge_after = COALESCE(purge_after, now() + ($2 || ' days')::interval)
+		        purge_after = COALESCE(purge_after, now() + make_interval(days => $2))
 		  WHERE id = $1
 		RETURNING `+tenantColumns,
 		tenantID, tenantRetentionDays).Scan(
