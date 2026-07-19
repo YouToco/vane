@@ -324,23 +324,15 @@ export default function FeishuSetup() {
               <p className="text-sm">
                 点击下方按钮一键打开权限配置页，在弹出的对话框中全选后点「确认开通权限」：
               </p>
-              <Button asChild>
-                <a
-                  href={buildPermissionUrl(appId.trim())}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  <Shield className="size-4 mr-1.5" />
-                  一键配置全部权限
-                  <ExternalLink className="size-3 ml-1" />
-                </a>
+              <Button render={<a href={buildPermissionUrl(appId.trim())} target="_blank" rel="noreferrer" />}>
+                <Shield className="size-4 mr-1.5" />
+                一键配置全部权限
+                <ExternalLink className="size-3 ml-1" />
               </Button>
               <Collapsible>
-                <CollapsibleTrigger asChild>
-                  <Button variant="ghost" size="sm" className="text-muted-foreground">
-                    <ChevronDown className="size-4 mr-1" />
-                    需要开通的 {SCOPES.length} 项权限
-                  </Button>
+                <CollapsibleTrigger render={<Button variant="ghost" size="sm" className="text-muted-foreground" />}>
+                  <ChevronDown className="size-4 mr-1" />
+                  需要开通的 {SCOPES.length} 项权限
                 </CollapsibleTrigger>
                 <CollapsibleContent>
                   <div className="mt-2 space-y-1">

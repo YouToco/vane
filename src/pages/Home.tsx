@@ -66,11 +66,9 @@ export default function Home() {
               <p className="text-sm text-muted-foreground mb-6 max-w-sm">
                 完成飞书机器人接入后，即可在飞书里直接与 见微 Vane 对话。
               </p>
-              <Button asChild>
-                <a href="#/setup">
-                  前往接入向导
-                  <ArrowRight className="ml-2 size-4" />
-                </a>
+              <Button render={<a href="#/setup" />}>
+                前往接入向导
+                <ArrowRight className="ml-2 size-4" />
               </Button>
             </div>
           )}
@@ -123,11 +121,9 @@ export default function Home() {
                 </Alert>
               )}
               {!status.connected && (
-                <Button variant="outline" asChild>
-                  <a href="#/setup">
-                    去接入向导排查
-                    <ArrowRight className="ml-2 size-4" />
-                  </a>
+                <Button variant="outline" render={<a href="#/setup" />}>
+                  去接入向导排查
+                  <ArrowRight className="ml-2 size-4" />
                 </Button>
               )}
             </div>

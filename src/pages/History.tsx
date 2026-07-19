@@ -211,17 +211,15 @@ export default function History() {
                               (fb.detail ? ` · ${clipDetail(fb.detail)}` : "");
                             return (
                               <Tooltip key={i}>
-                                <TooltipTrigger asChild>
-                                  <span>
-                                    <Badge variant={meta?.variant ?? "secondary"}>
-                                      {meta?.label ?? fb.action}
-                                      {meta?.showDetail && fb.detail && (
-                                        <span className="ml-1 opacity-75">
-                                          {clipDetail(fb.detail, 30)}
-                                        </span>
-                                      )}
-                                    </Badge>
-                                  </span>
+                                <TooltipTrigger render={<span />}>
+                                  <Badge variant={meta?.variant ?? "secondary"}>
+                                    {meta?.label ?? fb.action}
+                                    {meta?.showDetail && fb.detail && (
+                                      <span className="ml-1 opacity-75">
+                                        {clipDetail(fb.detail, 30)}
+                                      </span>
+                                    )}
+                                  </Badge>
                                 </TooltipTrigger>
                                 <TooltipContent>
                                   <p className="max-w-xs">{tooltipText}</p>

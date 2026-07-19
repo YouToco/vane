@@ -105,11 +105,9 @@ function AppSidebar({ hash, onLogout }: { hash: string; onLogout: () => void }) 
             <SidebarMenu>
               {NAV_ITEMS.map((item) => (
                 <SidebarMenuItem key={item.hash}>
-                  <SidebarMenuButton asChild isActive={hash === item.hash}>
-                    <a href={item.hash}>
-                      <item.icon />
-                      <span>{item.label}</span>
-                    </a>
+                  <SidebarMenuButton render={<a href={item.hash} />} isActive={hash === item.hash}>
+                    <item.icon />
+                    <span>{item.label}</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               ))}
@@ -122,11 +120,9 @@ function AppSidebar({ hash, onLogout }: { hash: string; onLogout: () => void }) 
             <SidebarMenu>
               {ADMIN_ITEMS.map((item) => (
                 <SidebarMenuItem key={item.hash}>
-                  <SidebarMenuButton asChild isActive={hash === item.hash}>
-                    <a href={item.hash}>
-                      <item.icon />
-                      <span>{item.label}</span>
-                    </a>
+                  <SidebarMenuButton render={<a href={item.hash} />} isActive={hash === item.hash}>
+                    <item.icon />
+                    <span>{item.label}</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               ))}

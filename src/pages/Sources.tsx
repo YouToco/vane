@@ -233,7 +233,7 @@ export default function Sources() {
                   }}
                   autoComplete="off"
                 />
-                <Select value={category} onValueChange={setCategory}>
+                <Select value={category} onValueChange={(v) => setCategory(v ?? "")}>
                   <SelectTrigger className="w-36">
                     <SelectValue placeholder="类别不限" />
                   </SelectTrigger>

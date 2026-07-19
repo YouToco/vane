@@ -12,8 +12,6 @@ import type {
 import {
   Card,
   CardContent,
-  CardHeader,
-  CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -167,20 +165,18 @@ function ProbeCard({ r }: { r: ProbeResult }) {
       {r.detail && (
         <Collapsible open={open} onOpenChange={setOpen}>
           <div className="px-4 pb-1">
-            <CollapsibleTrigger asChild>
-              <Button variant="ghost" size="sm" className="text-xs text-muted-foreground h-7">
-                {open ? (
-                  <>
-                    <ChevronUp className="size-3 mr-1" />
-                    收起说明
-                  </>
-                ) : (
-                  <>
-                    <ChevronDown className="size-3 mr-1" />
-                    展开说明
-                  </>
-                )}
-              </Button>
+            <CollapsibleTrigger render={<Button variant="ghost" size="sm" className="text-xs text-muted-foreground h-7" />}>
+              {open ? (
+                <>
+                  <ChevronUp className="size-3 mr-1" />
+                  收起说明
+                </>
+              ) : (
+                <>
+                  <ChevronDown className="size-3 mr-1" />
+                  展开说明
+                </>
+              )}
             </CollapsibleTrigger>
           </div>
           <CollapsibleContent>
