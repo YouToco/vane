@@ -129,75 +129,19 @@ func (e *ExaContentsFetcher) Fetch(ctx context.Context, src types.Source) ([]typ
 			fmt.Sprintf("web/contents 信源缺少 url（source_id=%d）", src.ID), nil)
 	}
 
-	reqBody := exaContentsRequest{URLs: []string{pageURL}, Text: true, MaxAgeHours: 0}
-	payload, err := json.Marshal(reqBody)
+	results, cached, err := e.pageResults(ctx, pageURL, 0)
 	if err != nil {
-		return nil, types.NewAppError(types.CodeValidation, "构造 Exa /contents 请求体失败", err)
+		return nil, err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.contentURL, bytes.NewReader(payload))
-	if err != nil {
-		return nil, types.NewAppError(types.CodeValidation, "构造 Exa /contents 请求失败", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", e.apiKey)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := e.client.Do(req)
-	if err != nil {
-		return nil, classifyDoError(e.contentURL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, types.NewAppError(types.CodeFetchRateLimit, "Exa /contents 被限流(429)", nil)
-	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, types.NewAppError(types.CodeValidation,
-			fmt.Sprintf("Exa 鉴权失败（HTTP %d），请检查 VANE_FETCH_EXA_API_KEY", resp.StatusCode), nil)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		ae := types.NewAppError(types.CodeFetchTimeout,
-			fmt.Sprintf("Exa /contents 返回非 2xx 状态 %d", resp.StatusCode), nil)
-		ae.Retryable = resp.StatusCode >= 500
-		return nil, ae
-	}
-
-	data, err := io.ReadAll(io.LimitReader(resp.Body, e.maxBytes+1))
-	if err != nil {
-		return nil, classifyDoError(e.contentURL, err)
-	}
-	if int64(len(data)) > e.maxBytes {
-		return nil, types.NewAppError(types.CodeValidation,
-			fmt.Sprintf("Exa /contents 响应体超过 %d 字节上限", e.maxBytes), nil)
-	}
-
-	var cr exaContentsResponse
-	if err := json.Unmarshal(data, &cr); err != nil {
-		ae := types.NewAppError(types.CodeFetchTimeout, "解析 Exa /contents 响应失败", err)
-		ae.Retryable = false
-		return nil, ae
-	}
-
-	// statuses[] 检查（审计 D6）：抓取失败是 HTTP 200 + status="error"，绝不能当成
-	// "内容为空"静默返回 0 条——那会让监控在页面挂掉时误判"没变化"。
-	for _, s := range cr.Statuses {
-		if s.Status == "error" {
-			ae := types.NewAppError(types.CodeFetchTimeout,
-				fmt.Sprintf("Exa /contents 抓取失败（url=%s，status=error）", pageURL), nil)
-			ae.Retryable = true // 抓取瞬态（目标站 5xx/challenge），可重试。
-			return nil, ae
-		}
+	if cached {
 		// 显式传了 maxAgeHours:0 却返回缓存（对抗审查发现 4）：Exa 无视了强制活抓，
 		// 拿到的可能是旧正文——其 hash 与上次相同则被当"没变化"，会漏报一次真实变化。
 		// 不阻塞（缓存也是内容，下轮活抓能补），但记 WARN 让这种漏报可见。
-		if s.Source == "cached" {
-			slog.Warn("fetcher: web/contents Exa 无视 maxAgeHours:0 返回缓存，可能漏报一次页面变化",
-				"source_id", src.ID, "url", pageURL)
-		}
+		slog.Warn("fetcher: web/contents Exa 无视 maxAgeHours:0 返回缓存，可能漏报一次页面变化",
+			"source_id", src.ID, "url", pageURL)
 	}
 
-	item, dr := mapExaContents(src, pageURL, sc.Title, cr.Results)
+	item, dr := mapExaContents(src, pageURL, sc.Title, results)
 	switch dr {
 	case dropNone:
 		return []types.ContentItem{item}, nil
@@ -212,6 +156,87 @@ func (e *ExaContentsFetcher) Fetch(ctx context.Context, src types.Source) ([]typ
 		t.add(dr)
 		return nil, allDroppedErr(src, 1, t)
 	}
+}
+
+// pageResults 向 Exa /contents 取一个 URL 的抓取结果，是 Fetch 与「RSS 正文补全」
+// 共用的那一段——原先整段埋在 Fetch 里，只能服务页面监控一条路径。
+//
+// maxAgeHours 是刻意外提的参数，两个调用方的诉求相反：
+//   - 页面监控传 0（强制活抓）：吃到缓存就可能拿到旧正文，其 hash 与上次相同 →
+//     被当成"没变化" → **漏报一次真实变化**。
+//   - RSS 正文补全传 >0（允许缓存）：它只是要这篇文章写了什么，不关心"变没变"，
+//     吃缓存既更快也更省钱。
+//
+// 把它写死成 0 会让补全路径为一个自己不需要的性质付费。
+//
+// 第二个返回值 cached 报告 Exa 是否返回了缓存，由调用方按自己的语义处理
+// （监控要为此记 WARN，补全不需要）。
+func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, maxAgeHours int) ([]exaContentsResult, bool, error) {
+	reqBody := exaContentsRequest{URLs: []string{pageURL}, Text: true, MaxAgeHours: maxAgeHours}
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, false, types.NewAppError(types.CodeValidation, "构造 Exa /contents 请求体失败", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.contentURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, false, types.NewAppError(types.CodeValidation, "构造 Exa /contents 请求失败", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", e.apiKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return nil, false, classifyDoError(e.contentURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, false, types.NewAppError(types.CodeFetchRateLimit, "Exa /contents 被限流(429)", nil)
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, false, types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("Exa 鉴权失败（HTTP %d），请检查 VANE_FETCH_EXA_API_KEY", resp.StatusCode), nil)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		ae := types.NewAppError(types.CodeFetchTimeout,
+			fmt.Sprintf("Exa /contents 返回非 2xx 状态 %d", resp.StatusCode), nil)
+		ae.Retryable = resp.StatusCode >= 500
+		return nil, false, ae
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, e.maxBytes+1))
+	if err != nil {
+		return nil, false, classifyDoError(e.contentURL, err)
+	}
+	if int64(len(data)) > e.maxBytes {
+		return nil, false, types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("Exa /contents 响应体超过 %d 字节上限", e.maxBytes), nil)
+	}
+
+	var cr exaContentsResponse
+	if err := json.Unmarshal(data, &cr); err != nil {
+		ae := types.NewAppError(types.CodeFetchTimeout, "解析 Exa /contents 响应失败", err)
+		ae.Retryable = false
+		return nil, false, ae
+	}
+
+	// statuses[] 检查（审计 D6）：抓取失败是 HTTP 200 + status="error"，绝不能当成
+	// "内容为空"静默返回 0 条——那会让监控在页面挂掉时误判"没变化"。
+	cached := false
+	for _, st := range cr.Statuses {
+		if st.Status == "error" {
+			ae := types.NewAppError(types.CodeFetchTimeout,
+				fmt.Sprintf("Exa /contents 抓取失败（url=%s，status=error）", pageURL), nil)
+			ae.Retryable = true // 抓取瞬态（目标站 5xx/challenge），可重试。
+			return nil, false, ae
+		}
+		if st.Source == "cached" {
+			cached = true
+		}
+	}
+	return cr.Results, cached, nil
 }
 
 // mapExaContents 把 /contents 结果映射为一条 ContentItem，并自填 canonical_key

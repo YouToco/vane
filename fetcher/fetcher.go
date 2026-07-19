@@ -65,6 +65,22 @@ type Fetcher struct {
 	// 才能让带固定 pubDate 的 fixture 不随真实时间流逝而漂出窗口（否则用例会在
 	// 未来某天无故变红）。生产路径用 time.Now。
 	now func() time.Time
+
+	// 正文补全依赖（nil = 不补全，行为与改造前一致）。
+	// 只在 NewMulti 装配时注入：RSS 抓取器的单测全是纯 httptest，不该为了这条能力
+	// 被迫拖进 Exa 客户端与数据库替身。
+	enricher pageTextFetcher
+	seen     SeenChecker
+}
+
+// itemContent 取条目正文：优先 Content，空则回退 Description（与 mapItems 一致）。
+// 抽成函数是为了让补全判定与真正落库的那份正文用同一口径——两处不一致会让
+// 「判定说需要补、映射时其实有正文」这类错配无声发生。
+func itemContent(it *gofeed.Item) string {
+	if it.Content != "" {
+		return it.Content
+	}
+	return it.Description
 }
 
 // New 按抓取配置构造 Fetcher。TimeoutSeconds / MaxResponseMB 为非正数时回退到
@@ -195,6 +211,12 @@ func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.Conte
 		return nil, err
 	}
 	items = f.applyCategories(src, items)
+
+	// 正文补全放在**正常过滤之后、映射之前**（见 enrich.go）：
+	//   - 之后：不为一条马上要被 lookback/categories 滤掉的条目付费。
+	//   - 之前：补回来的正文要参与 finalize 的指纹与 §12.3 护栏判定；放到映射之后，
+	//     链接型条目会先被护栏丢掉，补全永远等不到执行。
+	f.enrichItems(ctx, src, items)
 
 	// 全灭判定必须在此处、比较**映射函数的入参与产出**——不能拿 feed.Items 当分母。
 	// applyLookback / applyCategories 是用户声明的正常过滤（B 类），它们在这一行之前
@@ -330,10 +352,7 @@ func mapItems(src types.Source, items []*gofeed.Item) ([]types.ContentItem, drop
 			externalID = it.Link
 		}
 		// content 优先取全文 Content，缺失则退回摘要 Description。
-		content := it.Content
-		if content == "" {
-			content = it.Description
-		}
+		content := itemContent(it)
 
 		item := types.ContentItem{
 			SourceID:    src.ID,
