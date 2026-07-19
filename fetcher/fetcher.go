@@ -42,6 +42,12 @@ var htmlTagRe = regexp.MustCompile(`<[a-zA-Z/!]`)
 // FetchRSS 再据此判定为 CodeValidation（与抓取前 LookupIP 预检的语义一致）。
 var errBlockedDial = errors.New("fetcher: 目标解析到私网/环回地址，已拒绝连接")
 
+// errNotFeed 标记「抓到了响应但内容解析不出 RSS/Atom feed」。
+// 试跑准入（probe.go）据此触发兜底解析：再抓一次页面嗅探 autodiscovery 声明的
+// feed 地址，把「不是 feed」从干巴巴的拒绝变成带替代建议的话术（功能清单 1.5）。
+// 周期抓取路径不感知它——错误面貌（Code/Message/Retryable）与引入前逐字节相同。
+var errNotFeed = errors.New("响应内容不是 RSS/Atom feed")
+
 // rssDefaultLookbackDays 是 RSS 源默认只收最近 N 天发布的条目。
 // 注意 lookback_days 在两个能力下**默认语义刻意不同**（m6 契约 §5.3）：RSS 的 pubDate
 // 是结构化必填字段，默认过滤（7 天）是对的；而 web/search 的 Exa publishedDate 是从 HTML
@@ -139,66 +145,17 @@ func New(cfg config.FetchConfig) *Fetcher {
 // CodeFetchTimeout；HTTP 429 → CodeFetchRateLimit；其余（非 2xx、超限、解析失败）
 // 归入 fetch 类但按确定性/瞬态区分 Retryable。解析失败只返回 error，绝不 panic。
 func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.ContentItem, error) {
-	u, err := url.Parse(src.URL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return nil, types.NewAppError(types.CodeValidation,
-			fmt.Sprintf("非法 RSS URL: %q", src.URL), err)
-	}
-
-	// 抓取前 IP 预检：把明显的私网/环回目标挡在发请求之前，
-	// 并以 CodeValidation 明确告知调用方（这是配置/输入问题，非瞬态故障）。
-	host := u.Hostname()
-	if ips, lerr := f.lookupIP(host); lerr == nil {
-		for _, ip := range ips {
-			if f.isBlocked(ip) {
-				return nil, types.NewAppError(types.CodeValidation,
-					fmt.Sprintf("RSS 源 %q 解析到私网/环回地址 %s，已拒绝", host, ip), nil)
-			}
-		}
-	}
-	// LookupIP 失败不在此拦截：交给后续请求，由 Dialer.Control 兜底并归类为 fetch 错误。
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.URL, nil)
+	data, err := f.fetchBody(ctx, src.URL)
 	if err != nil {
-		return nil, types.NewAppError(types.CodeValidation, "构造抓取请求失败", err)
-	}
-	req.Header.Set("User-Agent", "Vane/0.3 (+https://vane.zhuoqidev.com)")
-	req.Header.Set("Accept", "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5")
-
-	resp, err := f.client.Do(req)
-	if err != nil {
-		return nil, classifyDoError(src.URL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, types.NewAppError(types.CodeFetchRateLimit,
-			fmt.Sprintf("抓取 %s 被限流(429)", src.URL), nil)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		ae := types.NewAppError(types.CodeFetchTimeout,
-			fmt.Sprintf("抓取 %s 返回非 2xx 状态 %d", src.URL, resp.StatusCode), nil)
-		// 5xx 视为瞬态可重试，4xx 视为确定性不可重试（覆盖默认的 true）。
-		ae.Retryable = resp.StatusCode >= 500
-		return nil, ae
-	}
-
-	// 读到 maxBytes+1 字节以便判断是否超限：LimitReader 会静默截断，
-	// 只有多读 1 字节才能区分"恰好等于上限"与"超过上限"。
-	data, err := io.ReadAll(io.LimitReader(resp.Body, f.maxBytes+1))
-	if err != nil {
-		return nil, classifyDoError(src.URL, err)
-	}
-	if int64(len(data)) > f.maxBytes {
-		return nil, types.NewAppError(types.CodeValidation,
-			fmt.Sprintf("抓取 %s 响应体超过 %d 字节上限", src.URL, f.maxBytes), nil)
+		return nil, err
 	}
 
 	feed, err := f.parser.Parse(bytes.NewReader(data))
 	if err != nil {
 		// 解析失败是确定性错误（同一份内容重试仍会失败），标记不可重试。
+		// Cause 链带 errNotFeed 哨兵供 probe 路径触发兜底解析（见该哨兵注释）。
 		ae := types.NewAppError(types.CodeFetchTimeout,
-			fmt.Sprintf("解析 %s 的 RSS 失败", src.URL), err)
+			fmt.Sprintf("解析 %s 的 RSS 失败", src.URL), fmt.Errorf("%w: %v", errNotFeed, err))
 		ae.Retryable = false
 		return nil, ae
 	}
@@ -238,6 +195,71 @@ func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.Conte
 		return nil, allDroppedErr(src, denom, tally)
 	}
 	return mapped, nil
+}
+
+// fetchBody 对用户提交的 URL 做一次受安全边界约束的 GET（包 SSRF 双重校验、超时、
+// 响应大小上限），返回完整响应体。FetchRSS 与 probe 的兜底解析（resolve.go 嗅探
+// autodiscovery）共用这一段——嗅探若自己 new http.Client 就是绕开 SSRF 栈开洞。
+//
+// 失败语义（原 FetchRSS 头部逻辑原样搬入，错误面貌零变化）：非法 URL / 私网 / 超限
+// → CodeValidation（不可重试）；429 → CodeFetchRateLimit；非 2xx 按 5xx/4xx 定
+// Retryable；连接期错误经 classifyDoError 归类。
+func (f *Fetcher) fetchBody(ctx context.Context, rawURL string) ([]byte, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("非法 RSS URL: %q", rawURL), err)
+	}
+
+	// 抓取前 IP 预检：把明显的私网/环回目标挡在发请求之前，
+	// 并以 CodeValidation 明确告知调用方（这是配置/输入问题，非瞬态故障）。
+	host := u.Hostname()
+	if ips, lerr := f.lookupIP(host); lerr == nil {
+		for _, ip := range ips {
+			if f.isBlocked(ip) {
+				return nil, types.NewAppError(types.CodeValidation,
+					fmt.Sprintf("RSS 源 %q 解析到私网/环回地址 %s，已拒绝", host, ip), nil)
+			}
+		}
+	}
+	// LookupIP 失败不在此拦截：交给后续请求，由 Dialer.Control 兜底并归类为 fetch 错误。
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeValidation, "构造抓取请求失败", err)
+	}
+	req.Header.Set("User-Agent", "Vane/0.3 (+https://vane.zhuoqidev.com)")
+	req.Header.Set("Accept", "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5")
+
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, classifyDoError(rawURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, types.NewAppError(types.CodeFetchRateLimit,
+			fmt.Sprintf("抓取 %s 被限流(429)", rawURL), nil)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		ae := types.NewAppError(types.CodeFetchTimeout,
+			fmt.Sprintf("抓取 %s 返回非 2xx 状态 %d", rawURL, resp.StatusCode), nil)
+		// 5xx 视为瞬态可重试，4xx 视为确定性不可重试（覆盖默认的 true）。
+		ae.Retryable = resp.StatusCode >= 500
+		return nil, ae
+	}
+
+	// 读到 maxBytes+1 字节以便判断是否超限：LimitReader 会静默截断，
+	// 只有多读 1 字节才能区分"恰好等于上限"与"超过上限"。
+	data, err := io.ReadAll(io.LimitReader(resp.Body, f.maxBytes+1))
+	if err != nil {
+		return nil, classifyDoError(rawURL, err)
+	}
+	if int64(len(data)) > f.maxBytes {
+		return nil, types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("抓取 %s 响应体超过 %d 字节上限", rawURL, f.maxBytes), nil)
+	}
+	return data, nil
 }
 
 // rssSourceConfig 是 RSS 信源的 config JSONB 结构。

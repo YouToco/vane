@@ -83,8 +83,8 @@ type scheduleCreator interface {
 // 该特性上线前完全一致。
 // tr 是任务手册翻译器（P1 编译层）：create/edit 手册后据此把正文编译成 fetch_plan。
 // 允许为 nil（未装配 LLM 的路径/测试）——此时手册仍可存取，只是不编译计划（best-effort）。
-// prober 是绑定引擎的试跑入口（*fetcher.BindingFetcher，生产传 multi.Binding()）；
-// nil 合法（测试/未装配）——绑定能力退回不试跑直接落库。
+// prober 是试跑=准入入口（*fetcher.Multi，生产直接传 multi；1.5 起统一分派绑定能力
+// 与 URL 类 web 能力的试跑）；nil 合法（测试/未装配）——退回不试跑直接落库。
 func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger, tr playbookTranslator, endpoints *EndpointTools, prober sourceProber) []Tool {
 	tools := []Tool{
 		&listSourcesTool{st: st},
@@ -217,8 +217,10 @@ const addSourceSchema = `{
   }
 }`
 
-// sourceProber 收窄绑定引擎的试跑能力（*fetcher.BindingFetcher 已实现），可 fake 单测。
-// 试跑=准入（endpoint-binding-contract.md §2.2）：真调一次上游，全过才落库。
+// sourceProber 收窄试跑能力（*fetcher.Multi 已实现），可 fake 单测。
+// 试跑=准入（endpoint-binding-contract.md §2.2，1.5 起推广到 URL 类 web 能力）：
+// 真调一次上游，全过才落库。返回 (nil, nil) 表示该能力无试跑门（如 web/search），
+// 直接落库——「哪些能力要试跑」是 fetcher 层知识，agent 不感知清单。
 type sourceProber interface {
 	Probe(ctx context.Context, src types.Source) (*fetcher.ProbeReport, error)
 }
@@ -235,7 +237,11 @@ const probeBudget = 10 * time.Second
 func (t *addSourceTool) Name() string { return "add_source" }
 func (t *addSourceTool) Description() string {
 	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts/contents/hot_list/topic_feed/faved_notes）。" +
-		"绑定类能力（xhs 的 hot_list/topic_feed/faved_notes 等）在确认后会先真实试跑一次，通过才落库。" +
+		"绑定类能力与 URL 类 web 能力（feed/contents）在确认后会先真实试跑一次，通过才落库。" +
+		"用户给了一个网址但不确定是什么来源时：先按 web/feed 尝试（免费、增量语义最好）；" +
+		"若试跑被拒，拒绝话术会给出解析结果与替代建议（页面声明的真实 feed 地址、或改用 " +
+		"web/contents 监控页面变化、或改用 web/search 关键词订阅）——把建议转述给用户确认后按建议重新添加，" +
+		"不要不经用户同意就换成别的能力或地址。" +
 		unavailableCapabilitiesNote()
 }
 
@@ -313,12 +319,15 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 		return msg, nil
 	}
 
-	// 试跑=准入（契约 §2.2）：绑定能力先真调一次上游，全过才落库；失败不落任何行。
-	// 红线 3（对抗审查 HIGH-3）：只有 ProbeRejection（准入话术）可原样透出；其余错误
-	// （漂移/网络/鉴权——内嵌端点名、上游 body）按错误码映射固定人话，原文只进 slog
-	// 与 tool_calls（记账在引擎内完成）。
+	// 试跑=准入（契约 §2.2，1.5 起覆盖绑定能力 + web/feed + web/contents）：确认后先
+	// 真调一次上游，全过才落库；失败不落任何行——消除「添加了一个永远抓不到内容的源、
+	// 用户却被告知已订阅」的假装成功。哪些能力要试跑由 fetcher.Multi.Probe 决定
+	// （返回 nil report = 无试跑门，直接落库）。
+	// 红线 3（对抗审查 HIGH-3）：只有 ProbeRejection（准入话术，1.5 起自带替代建议）
+	// 可原样透出；其余错误（漂移/网络/鉴权——内嵌端点名、上游 body）按错误码映射
+	// 固定人话，原文只进 slog 与 tool_calls（记账在引擎内完成）。
 	var probeNote string
-	if fetcher.IsBindingBacked(src.Platform, src.Capability) && t.prober != nil {
+	if t.prober != nil {
 		probeCtx, cancel := context.WithTimeout(ctx, probeBudget)
 		// 记账 trace = 会话 trace（契约 §5）：probe 的计费调用可关联回发起会话。
 		if m, ok := ctx.Value(chatMetaKey{}).(chatMeta); ok {
@@ -339,12 +348,20 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 			}
 			return "", perr
 		}
-		probeNote = fmt.Sprintf("；试跑通过：提取 %d 条", report.Extracted)
-		if report.Newest != nil {
-			probeNote += fmt.Sprintf("，最新 %s", report.Newest.In(cstZone()).Format("2006-01-02 15:04"))
-		}
-		if len(report.SampleTitles) > 0 {
-			probeNote += fmt.Sprintf("，如「%s」", report.SampleTitles[0])
+		if report != nil {
+			if report.Extracted == 0 {
+				// 只有 web/feed 会以 0 条通过（lookback 把旧条目全滤掉是合法的）；
+				// 不解释会让用户以为订了个空源。
+				probeNote = "；试跑通过：feed 有效，当前窗口内无新内容（新文章发布后会自动进入推送）"
+			} else {
+				probeNote = fmt.Sprintf("；试跑通过：提取 %d 条", report.Extracted)
+				if report.Newest != nil {
+					probeNote += fmt.Sprintf("，最新 %s", report.Newest.In(cstZone()).Format("2006-01-02 15:04"))
+				}
+				if len(report.SampleTitles) > 0 {
+					probeNote += fmt.Sprintf("，如「%s」", report.SampleTitles[0])
+				}
+			}
 		}
 	}
 

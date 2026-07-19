@@ -6,6 +6,16 @@
 ## [Unreleased]
 
 ### Added
+- **通用来源兜底解析**（功能清单 1.5，`feat/generic-fallback-fetcher`）：「试跑=准入」从绑定能力
+  推广到 URL 类 web 能力（web/feed、web/contents）——`add_source` 确认后先真调一次，全过才落库，
+  消除「冷门 URL 解析失败却回『已添加』、用户误以为已订阅」的假装成功。web/feed 试跑失败于
+  「不是 feed」时走兜底解析（`fetcher/resolve.go`）：从页面 HTML 嗅探 autodiscovery 声明
+  （`<link rel="alternate" type="application/rss+xml">`），发现真实 feed 地址则进拒绝话术建议
+  改用它；未发现则建议 web/contents 页面监控或 web/search 关键词订阅。只建议、不静默改道
+  （M6 §2.2；确认卡上是什么 URL 就订什么 URL）。试跑分派收敛在 `fetcher.Multi.Probe`
+  （web/search 无试跑门返回 nil——入参是关键词无「来源解析」概念）；拒绝话术为 ProbeRejection
+  人话（红线 3），瞬态失败不翻译（保持「稍后再试」语义）。运行期「不无限重试」由既有
+  fail_count 链承载（3 次告警/10 次自动停用），零新增。
 - **信源连续失败自动停用 + 重新启用**（功能 5.2 补全，`feat/source-auto-disable`）：在既有
   「连续失败 3 次发预警卡」之上，新增连续失败达 `disableFetchFailThreshold=10` 次自动置
   `disabled`（停止抓取），并发一张与预警卡区分的「已暂停 + 如何重新启用」卡。Boss 拍板
