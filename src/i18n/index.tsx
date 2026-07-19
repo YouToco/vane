@@ -86,3 +86,8 @@ export function useI18n(): I18nValue {
   if (!ctx) throw new Error("useI18n must be used within I18nProvider");
   return ctx;
 }
+
+/** 极简模板插值：fmt("已显示 {shown} / {total} 条", { shown: 20, total: 98 }) */
+export function fmt(tpl: string, vars: Record<string, string | number>): string {
+  return tpl.replace(/\{(\w+)\}/g, (_, k: string) => String(vars[k] ?? ""));
+}

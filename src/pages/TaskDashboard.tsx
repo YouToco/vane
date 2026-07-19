@@ -6,20 +6,44 @@ import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { api } from "../api";
-import type { Schedule } from "../api";
-import { describeSpec } from "./Schedules";
+import type { Schedule, ScheduleSpec } from "../api";
+import { fmt, useI18n, type Dict } from "@/i18n";
+
+// describeSpec 的 i18n 版：文案走字典（admin 的 Schedules.tsx 保留原中文版，
+// 那是平台 owner 专用页；这里是用户面，必须随语言走）。
+function describeSpecI18n(spec: ScheduleSpec, s: Dict["app"]["schedule"]): string {
+  if (typeof spec.every_seconds === "number" && spec.every_seconds > 0) {
+    const h = Math.round(spec.every_seconds / 3600);
+    return h % 24 === 0 && h >= 24 ? fmt(s.everyDays, { n: h / 24 }) : fmt(s.everyHours, { n: h });
+  }
+  if (spec.cron) {
+    const parts = spec.cron.trim().split(/\s+/);
+    if (parts.length === 5) {
+      const [mm, hh, , , dow] = parts;
+      const clock = `${(hh ?? "0").padStart(2, "0")}:${(mm ?? "0").padStart(2, "0")}`;
+      if (dow === "*") return fmt(s.dailyAt, { time: clock });
+      const days = (dow ?? "")
+        .split(",")
+        .map((d) => s.weekdays[Number(d)] ?? d)
+        .join(s.daySep);
+      return fmt(s.weeklyAt, { days, time: clock });
+    }
+  }
+  return s.custom;
+}
 
 // 任务卡读的是真实 schedules：schedules.nl_description 本来就是用户当初
 // 用自然语言描述的意图，schedule 就是「任务」在当前后端的载体。
 // 不另造 mock 任务——首页的「运行中任务」数也来自同一份数据，两处口径必须一致。
 function StatusBadge({ status }: { status: string }) {
+  const { t } = useI18n();
   if (status === "active") {
     return (
       <Badge
         variant="outline"
         className="text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-950/30 dark:border-emerald-800"
       >
-        运行中
+        {t.app.tasks.running}
       </Badge>
     );
   }
@@ -28,26 +52,29 @@ function StatusBadge({ status }: { status: string }) {
       variant="outline"
       className="text-amber-600 border-amber-200 bg-amber-50 dark:bg-amber-950/30 dark:border-amber-800"
     >
-      已暂停
+      {t.app.tasks.paused}
     </Badge>
   );
 }
 
 function TaskCard({ task }: { task: Schedule }) {
+  const { t } = useI18n();
+  const specText = describeSpecI18n(task.spec, t.app.schedule);
   return (
     <Card className="hover:border-border transition-colors">
       <CardContent className="p-5">
         <div className="flex items-start justify-between gap-3 mb-2">
           <div className="min-w-0 flex-1">
-            <h3 className="font-medium text-sm">{task.nl_description || describeSpec(task.spec)}</h3>
-            <p className="text-xs text-muted-foreground mt-0.5">{describeSpec(task.spec)}</p>
+            <h3 className="font-medium text-sm">{task.nl_description || specText}</h3>
+            <p className="text-xs text-muted-foreground mt-0.5">{specText}</p>
           </div>
           <StatusBadge status={task.status} />
         </div>
         {task.next_run && (
           <div className="flex items-center gap-1 mt-3 text-xs text-muted-foreground">
             <Clock className="size-3" />
-            下次 {new Date(task.next_run).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}
+            {t.app.tasks.nextRun}{" "}
+            {new Date(task.next_run).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}
           </div>
         )}
       </CardContent>
@@ -60,33 +87,31 @@ function TaskCard({ task }: { task: Schedule }) {
 // 但入口是飞书 agent 工具（create_schedule），没有 HTTP 出口。
 // 接线属于 P2，这里先不给假的成功反馈。
 function CreateTaskDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const { t } = useI18n();
+  const T = t.app.tasks;
   const [input, setInput] = useState("");
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>新建任务</DialogTitle>
+          <DialogTitle>{T.newTask}</DialogTitle>
         </DialogHeader>
         <div className="space-y-4 pt-2">
-          <p className="text-sm text-muted-foreground">
-            用一句话告诉我你想追踪什么，AI 会帮你生成任务手册。
-          </p>
+          <p className="text-sm text-muted-foreground">{T.dialogDesc}</p>
           <div className="flex gap-2">
             <Input
-              placeholder="例：帮我盯着 AI 圈大佬的动态，有重要观点就推给我"
+              placeholder={T.dialogPlaceholder}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               className="flex-1"
               autoFocus
             />
-            <Button disabled size="sm" title="待接后端 interpret 接口（P2）">
-              发送
+            <Button disabled size="sm" title={T.sendPendingTitle}>
+              {T.send}
             </Button>
           </div>
-          <p className="text-xs text-muted-foreground">
-            网页端建任务还没接通，目前请在飞书里对机器人说这句话。
-          </p>
+          <p className="text-xs text-muted-foreground">{T.dialogNote}</p>
         </div>
       </DialogContent>
     </Dialog>
@@ -94,6 +119,8 @@ function CreateTaskDialog({ open, onClose }: { open: boolean; onClose: () => voi
 }
 
 export default function TaskDashboard() {
+  const { t } = useI18n();
+  const T = t.app.tasks;
   const [showCreate, setShowCreate] = useState(false);
   const [tasks, setTasks] = useState<Schedule[]>([]);
   const [loading, setLoading] = useState(true);
@@ -113,25 +140,25 @@ export default function TaskDashboard() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-xl font-semibold">我的任务</h1>
+        <h1 className="text-xl font-semibold">{T.title}</h1>
         <Button size="sm" onClick={() => setShowCreate(true)}>
           <Plus className="size-4 mr-1" />
-          新建任务
+          {T.newTask}
         </Button>
       </div>
 
       {loading ? (
         <div className="flex items-center justify-center py-12 text-muted-foreground">
           <Loader2 className="size-4 animate-spin mr-2" />
-          <span className="text-sm">加载中…</span>
+          <span className="text-sm">{t.app.common.loading}</span>
         </div>
       ) : tasks.length === 0 ? (
         <div className="text-center py-16">
           <Clock className="size-10 mx-auto text-muted-foreground/50 mb-3" />
-          <p className="text-sm text-muted-foreground mb-4">还没有任务，说一句话就能创建</p>
+          <p className="text-sm text-muted-foreground mb-4">{T.empty}</p>
           <Button onClick={() => setShowCreate(true)}>
             <Plus className="size-4 mr-1" />
-            创建第一个任务
+            {T.createFirst}
           </Button>
         </div>
       ) : (

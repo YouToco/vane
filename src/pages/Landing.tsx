@@ -146,12 +146,18 @@ export default function Landing() {
           </motion.p>
 
           <motion.div variants={fadeUp} className="relative w-full">
-            {/* 3D 吉祥物坐在输入框右上沿（鼠标是风，点击有随机小动作）；小屏/reduced-motion 不挂载 */}
+            {/* 3D 吉祥物坐在输入框右上沿。定位层与卡片同宽（max-w-xl 居中）——
+                锚定卡片右上角而非全宽容器，任何视口下都贴着输入框，不悬空 */}
             {!reduced && (
-              <div className="absolute -top-[6.6rem] right-0 z-10 hidden h-28 w-28 sm:block md:right-[8%]">
-                <Suspense fallback={null}>
-                  <VaneMascot />
-                </Suspense>
+              <div
+                aria-hidden
+                className="pointer-events-none absolute inset-x-0 -top-[6.6rem] z-10 mx-auto hidden h-28 w-full max-w-xl sm:block"
+              >
+                <div className="pointer-events-auto absolute -right-3 top-0 h-28 w-28">
+                  <Suspense fallback={null}>
+                    <VaneMascot />
+                  </Suspense>
+                </div>
               </div>
             )}
             {/* key=locale：切语言整体重挂载，避免打字机状态/AnimatePresence 卡在旧语言的过渡边缘态 */}

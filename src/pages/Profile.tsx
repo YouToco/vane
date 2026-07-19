@@ -8,6 +8,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Separator } from "@/components/ui/separator";
 import { RefreshCw, Loader2, Tag, FileText, Ban } from "lucide-react";
+import { useI18n } from "@/i18n";
 
 const BEIJING_TZ = "Asia/Shanghai";
 
@@ -19,6 +20,8 @@ function fmtBeijing(iso?: string | null): string {
 }
 
 export default function Profile() {
+  const { t } = useI18n();
+  const P = t.app.profile;
   const [profile, setProfile] = useState<ProfileData | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -44,7 +47,7 @@ export default function Profile() {
           setLoadError("");
           return;
         }
-        setLoadError(err instanceof ApiError ? err.message : "加载失败");
+        setLoadError(err instanceof ApiError ? err.message : t.app.common.loadFailed);
         setProfile(null);
         setNotGenerated(false);
       })
@@ -60,11 +63,8 @@ export default function Profile() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-xl font-semibold tracking-tight">用户画像</h2>
-          <p className="text-sm text-muted-foreground mt-1">
-            机器人对你的理解：结构化标签 + 摘要画像。画像由对话首采与反馈演化维护——
-            要修改请在飞书对话里进行，这里只做查看。
-          </p>
+          <h2 className="text-xl font-semibold tracking-tight">{P.title}</h2>
+          <p className="text-sm text-muted-foreground mt-1">{P.desc}</p>
         </div>
         <Button
           variant="outline"
@@ -114,8 +114,7 @@ export default function Profile() {
       ) : notGenerated ? (
         <Card>
           <CardContent className="py-12 text-center text-muted-foreground">
-            画像尚未生成。在飞书对话里向机器人做一次自我介绍（行业 / 职业 / 关注领域），
-            它会自动建立你的画像。
+            {P.notGenerated}
           </CardContent>
         </Card>
       ) : profile ? (
@@ -124,19 +123,23 @@ export default function Profile() {
             <CardContent className="py-6">
               <div className="grid grid-cols-3 gap-6">
                 <div>
-                  <p className="text-xs text-muted-foreground mb-1">行业</p>
+                  <p className="text-xs text-muted-foreground mb-1">{P.industry}</p>
                   <p className="text-sm font-medium">
-                    {profile.industry || <span className="text-muted-foreground">未填写</span>}
+                    {profile.industry || (
+                      <span className="text-muted-foreground">{t.app.common.notFilled}</span>
+                    )}
                   </p>
                 </div>
                 <div>
-                  <p className="text-xs text-muted-foreground mb-1">职业</p>
+                  <p className="text-xs text-muted-foreground mb-1">{P.occupation}</p>
                   <p className="text-sm font-medium">
-                    {profile.occupation || <span className="text-muted-foreground">未填写</span>}
+                    {profile.occupation || (
+                      <span className="text-muted-foreground">{t.app.common.notFilled}</span>
+                    )}
                   </p>
                 </div>
                 <div>
-                  <p className="text-xs text-muted-foreground mb-1">更新时间</p>
+                  <p className="text-xs text-muted-foreground mb-1">{P.updatedAt}</p>
                   <p className="text-sm font-medium">{fmtBeijing(profile.updated_at)}</p>
                 </div>
               </div>
@@ -147,12 +150,12 @@ export default function Profile() {
             <CardHeader className="pb-3">
               <CardTitle className="text-base flex items-center gap-2">
                 <Tag className="size-4" />
-                兴趣标签
+                {P.tags}
               </CardTitle>
             </CardHeader>
             <CardContent>
               {profile.tags.length === 0 ? (
-                <p className="text-sm text-muted-foreground">还没有兴趣标签。</p>
+                <p className="text-sm text-muted-foreground">{P.noTags}</p>
               ) : (
                 <div className="flex flex-wrap gap-2">
                   {profile.tags.map((t) => (
@@ -169,7 +172,7 @@ export default function Profile() {
             <CardHeader className="pb-3">
               <CardTitle className="text-base flex items-center gap-2">
                 <FileText className="size-4" />
-                摘要画像
+                {P.summary}
               </CardTitle>
             </CardHeader>
             <CardContent>
@@ -178,14 +181,10 @@ export default function Profile() {
                   {profile.summary}
                 </pre>
               ) : (
-                <p className="text-sm text-muted-foreground">
-                  摘要画像还没生成（需累积几轮反馈后由演化写入）。
-                </p>
+                <p className="text-sm text-muted-foreground">{P.noSummary}</p>
               )}
               <Separator className="my-3" />
-              <p className="text-xs text-muted-foreground">
-                负偏好（不感兴趣的内容）由演化写在摘要末尾的「不感兴趣：」句式里，不单列。
-              </p>
+              <p className="text-xs text-muted-foreground">{P.negNote}</p>
             </CardContent>
           </Card>
 
@@ -194,13 +193,11 @@ export default function Profile() {
               <CardHeader className="pb-3">
                 <CardTitle className="text-base flex items-center gap-2">
                   <Ban className="size-4" />
-                  已移除标签（黑名单）
+                  {P.removedTags}
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <p className="text-xs text-muted-foreground mb-3">
-                  你亲手删过的标签，演化不会再把它们加回来（Gate ⑧ 人工修正恒赢）。
-                </p>
+                <p className="text-xs text-muted-foreground mb-3">{P.removedNote}</p>
                 <div className="flex flex-wrap gap-2">
                   {profile.removed_tags.map((t) => (
                     <Badge key={t} variant="outline" className="text-muted-foreground line-through">

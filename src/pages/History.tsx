@@ -20,6 +20,7 @@ import {
   TooltipContent,
 } from "@/components/ui/tooltip";
 import { RefreshCw, Loader2, ExternalLink } from "lucide-react";
+import { fmt, useI18n, type Dict } from "@/i18n";
 
 const PAGE_SIZE = 20;
 
@@ -37,13 +38,20 @@ function statusBadge(status: string): "destructive" | "secondary" | "outline" {
   return "secondary";
 }
 
-const FEEDBACK_META: Record<string, { label: string; variant: "default" | "secondary" | "outline" | "destructive"; showDetail: boolean }> = {
-  interested: { label: "👍 感兴趣", variant: "default", showDetail: false },
-  not_interested: { label: "👎 不感兴趣", variant: "secondary", showDetail: false },
-  misjudged: { label: "⚠️ 误判", variant: "destructive", showDetail: true },
-  deep_dive: { label: "🔍 深入", variant: "outline", showDetail: false },
-  question: { label: "💬 追问", variant: "outline", showDetail: true },
-};
+type FeedbackMeta = Record<
+  string,
+  { label: string; variant: "default" | "secondary" | "outline" | "destructive"; showDetail: boolean }
+>;
+
+function feedbackMeta(h: Dict["app"]["history"]): FeedbackMeta {
+  return {
+    interested: { label: h.fbInterested, variant: "default", showDetail: false },
+    not_interested: { label: h.fbNotInterested, variant: "secondary", showDetail: false },
+    misjudged: { label: h.fbMisjudged, variant: "destructive", showDetail: true },
+    deep_dive: { label: h.fbDeepDive, variant: "outline", showDetail: false },
+    question: { label: h.fbQuestion, variant: "outline", showDetail: true },
+  };
+}
 
 function clipDetail(s: string, max = 120): string {
   const runes = Array.from(s);
@@ -51,6 +59,9 @@ function clipDetail(s: string, max = 120): string {
 }
 
 export default function History() {
+  const { t } = useI18n();
+  const H = t.app.history;
+  const FEEDBACK_META = feedbackMeta(H);
   const [items, setItems] = useState<DeliveryHistoryItem[]>([]);
   const [total, setTotal] = useState(0);
   const [nextToken, setNextToken] = useState("");
@@ -73,7 +84,7 @@ export default function History() {
       })
       .catch((err) => {
         if (!alive) return;
-        setLoadError(err instanceof ApiError ? err.message : "加载失败");
+        setLoadError(err instanceof ApiError ? err.message : t.app.common.loadFailed);
         setItems([]);
         setTotal(0);
         setNextToken("");
@@ -96,7 +107,7 @@ export default function History() {
       setNextToken(r.next_page_token ?? "");
       setLoadError("");
     } catch (err) {
-      setLoadError(err instanceof ApiError ? err.message : "加载失败");
+      setLoadError(err instanceof ApiError ? err.message : t.app.common.loadFailed);
     } finally {
       setLoadingMore(false);
     }
@@ -106,9 +117,7 @@ export default function History() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <p className="text-sm text-muted-foreground">
-            每条推送的打分、发送状态与你在飞书卡片上的反馈。反馈请在卡片上操作，这里只做回看。
-          </p>
+          <p className="text-sm text-muted-foreground">{H.desc}</p>
         </div>
         <Button
           variant="outline"
@@ -147,7 +156,7 @@ export default function History() {
         !loadError && (
           <Card>
             <CardContent className="py-12 text-center text-muted-foreground">
-              还没有推送记录。
+              {H.empty}
             </CardContent>
           </Card>
         )
@@ -157,11 +166,11 @@ export default function History() {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>推送时间（北京）</TableHead>
-                  <TableHead>内容</TableHead>
-                  <TableHead className="text-right">分数</TableHead>
-                  <TableHead>状态</TableHead>
-                  <TableHead>反馈</TableHead>
+                  <TableHead>{H.colTime}</TableHead>
+                  <TableHead>{H.colContent}</TableHead>
+                  <TableHead className="text-right">{H.colScore}</TableHead>
+                  <TableHead>{H.colStatus}</TableHead>
+                  <TableHead>{H.colFeedback}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -184,12 +193,12 @@ export default function History() {
                           rel="noreferrer"
                           className="inline-flex items-center gap-1 text-primary hover:underline"
                         >
-                          {it.title || "（无内容）"}
+                          {it.title || H.noContent}
                           <ExternalLink className="size-3 shrink-0" />
                         </a>
                       ) : (
                         <span className="text-muted-foreground">
-                          {it.title || "（内容已删除）"}
+                          {it.title || H.contentDeleted}
                         </span>
                       )}
                     </TableCell>
@@ -237,7 +246,7 @@ export default function History() {
           </div>
           <div className="flex items-center justify-between border-t px-4 py-3">
             <span className="text-sm text-muted-foreground">
-              已显示 {items.length} / {total} 条
+              {fmt(H.shown, { shown: items.length, total })}
             </span>
             {nextToken && (
               <Button
@@ -249,10 +258,10 @@ export default function History() {
                 {loadingMore ? (
                   <>
                     <Loader2 className="mr-2 size-4 animate-spin" />
-                    加载中…
+                    {t.app.common.loading}
                   </>
                 ) : (
-                  "加载更多"
+                  t.app.common.loadMore
                 )}
               </Button>
             )}

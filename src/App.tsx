@@ -35,6 +35,8 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { LogoMark } from "@/components/brand/Logo";
+import { LocaleSwitch } from "@/components/LocaleSwitch";
+import { useI18n } from "@/i18n";
 
 function useHash(): string {
   const [hash, setHash] = useState(location.hash || "#/");
@@ -54,28 +56,33 @@ interface NavItem {
 
 // 侧边栏按「这是谁的东西」分组，而不是按「这是什么功能」。
 // 我的情报 = 日常要看的产出；账号 = 影响产出的自身设置。
-const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
-  {
-    label: "我的情报",
-    items: [
-      { hash: "#/", label: "首页", icon: HomeIcon },
-      { hash: "#/tasks", label: "任务", icon: ListTodo },
-      { hash: "#/history", label: "推送记录", icon: Send },
-    ],
-  },
-  {
-    label: "账号",
-    items: [
-      { hash: "#/settings", label: "我的画像", icon: User },
-      { hash: "#/settings/channel", label: "推送通道", icon: MessageSquare },
-    ],
-  },
-];
-
-const ALL_NAV: NavItem[] = [
-  ...NAV_GROUPS.flatMap((g) => g.items),
-  { hash: "#/admin", label: "管理后台", icon: ShieldCheck },
-];
+// 文案来自 i18n 字典，导航结构随语言重建（结构轻，无需 memo 精调）。
+function useNav() {
+  const { t } = useI18n();
+  const N = t.app.nav;
+  const groups: { label: string; items: NavItem[] }[] = [
+    {
+      label: N.groupIntel,
+      items: [
+        { hash: "#/", label: N.home, icon: HomeIcon },
+        { hash: "#/tasks", label: N.tasks, icon: ListTodo },
+        { hash: "#/history", label: N.history, icon: Send },
+      ],
+    },
+    {
+      label: N.groupAccount,
+      items: [
+        { hash: "#/settings", label: N.profile, icon: User },
+        { hash: "#/settings/channel", label: N.channel, icon: MessageSquare },
+      ],
+    },
+  ];
+  const all: NavItem[] = [
+    ...groups.flatMap((g) => g.items),
+    { hash: "#/admin", label: N.admin, icon: ShieldCheck },
+  ];
+  return { groups, all };
+}
 
 function renderPage(hash: string, isPlatformOwner: boolean) {
   switch (hash) {
@@ -104,19 +111,21 @@ function AppSidebar({
   isPlatformOwner: boolean;
   onLogout: () => void;
 }) {
+  const { t } = useI18n();
+  const { groups } = useNav();
   return (
     <Sidebar>
       <SidebarHeader>
         <a href="#/" className="flex items-center gap-2 px-2 py-1">
           <LogoMark />
           <div className="flex flex-col leading-tight">
-            <span className="text-sm font-semibold">见微 Vane</span>
-            <span className="text-[11px] text-muted-foreground">AI 情报系统</span>
+            <span className="text-sm font-semibold">{t.brandName}</span>
+            <span className="text-[11px] text-muted-foreground">{t.app.nav.tagline}</span>
           </div>
         </a>
       </SidebarHeader>
       <SidebarContent>
-        {NAV_GROUPS.map((group) => (
+        {groups.map((group) => (
           <SidebarGroup key={group.label}>
             <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
             <SidebarGroupContent>
@@ -140,14 +149,14 @@ function AppSidebar({
             <SidebarMenuItem>
               <SidebarMenuButton render={<a href="#/admin" />} isActive={hash === "#/admin"}>
                 <ShieldCheck />
-                <span>管理后台</span>
+                <span>{t.app.nav.admin}</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
           )}
           <SidebarMenuItem>
             <SidebarMenuButton onClick={onLogout}>
               <LogOut />
-              <span>退出登录</span>
+              <span>{t.app.nav.logout}</span>
             </SidebarMenuButton>
           </SidebarMenuItem>
         </SidebarMenu>
@@ -157,6 +166,8 @@ function AppSidebar({
 }
 
 function Shell({ hash, isPlatformOwner }: { hash: string; isPlatformOwner: boolean }) {
+  const { t } = useI18n();
+  const { all } = useNav();
   async function onLogout() {
     try {
       await api.logout();
@@ -172,8 +183,11 @@ function Shell({ hash, isPlatformOwner }: { hash: string; isPlatformOwner: boole
           <SidebarTrigger className="-ml-1" />
           <Separator orientation="vertical" className="mr-2 !h-4" />
           <span className="text-sm text-muted-foreground">
-            {ALL_NAV.find((i) => i.hash === hash)?.label ?? "首页"}
+            {all.find((i) => i.hash === hash)?.label ?? t.app.nav.home}
           </span>
+          <div className="ml-auto">
+            <LocaleSwitch />
+          </div>
         </header>
         <main className="flex-1 overflow-y-auto">
           <div className="mx-auto max-w-5xl p-6">{renderPage(hash, isPlatformOwner)}</div>

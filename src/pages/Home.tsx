@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { api } from "../api";
 import type { DeliveryHistoryItem } from "../api";
+import { useI18n } from "@/i18n";
 
 const BEIJING_TZ = "Asia/Shanghai";
 // 后端 parseHistoryQuery 规定 page_size ∈ [1,100]，越界直接 400。
@@ -34,6 +35,8 @@ interface Stats {
 }
 
 export default function Home() {
+  const { t } = useI18n();
+  const H = t.app.home;
   const [stats, setStats] = useState<Stats | null>(null);
   const [items, setItems] = useState<DeliveryHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -65,20 +68,20 @@ export default function Home() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-xl font-semibold">首页</h1>
+        <h1 className="text-xl font-semibold">{H.title}</h1>
         <Button size="sm" onClick={() => (location.hash = "#/tasks")}>
           <Plus className="size-4 mr-1" />
-          新建任务
+          {H.newTask}
         </Button>
       </div>
 
       <div className="grid grid-cols-2 gap-3">
         <div className="rounded-lg bg-muted/50 p-4">
-          <p className="text-xs text-muted-foreground mb-1">运行中任务</p>
+          <p className="text-xs text-muted-foreground mb-1">{H.runningTasks}</p>
           <p className="text-2xl font-semibold">{stats ? stats.running : "—"}</p>
         </div>
         <div className="rounded-lg bg-muted/50 p-4">
-          <p className="text-xs text-muted-foreground mb-1">今日推送</p>
+          <p className="text-xs text-muted-foreground mb-1">{H.todayPush}</p>
           <p className="text-2xl font-semibold">{stats ? stats.todayPush : "—"}</p>
         </div>
       </div>
@@ -86,21 +89,21 @@ export default function Home() {
       <div>
         <div className="flex items-center gap-2 mb-3">
           <Send className="size-4 text-muted-foreground" />
-          <h2 className="text-base font-medium">最近推送</h2>
+          <h2 className="text-base font-medium">{H.recentPush}</h2>
         </div>
 
         {loading ? (
           <div className="flex items-center justify-center py-8 text-muted-foreground">
             <Loader2 className="size-4 animate-spin mr-2" />
-            <span className="text-sm">加载中…</span>
+            <span className="text-sm">{t.app.common.loading}</span>
           </div>
         ) : failed ? (
           <div className="flex items-center justify-center gap-2 py-6 text-sm text-destructive">
             <AlertCircle className="size-4" />
-            <span>加载失败，请刷新重试</span>
+            <span>{t.app.common.loadFailedRetry}</span>
           </div>
         ) : items.length === 0 ? (
-          <p className="text-sm text-muted-foreground text-center py-6">还没有推送记录。</p>
+          <p className="text-sm text-muted-foreground text-center py-6">{H.empty}</p>
         ) : (
           <div className="space-y-2">
             {items.map((it) => (
@@ -116,13 +119,16 @@ export default function Home() {
                       rel="noreferrer"
                       className="text-primary hover:underline"
                     >
-                      {it.title || "(无标题)"}
+                      {it.title || H.untitled}
                     </a>
                   ) : (
-                    <span className="text-muted-foreground">{it.title || "(内容已删除)"}</span>
+                    <span className="text-muted-foreground">{it.title || H.contentDeleted}</span>
                   )}
                 </span>
-                <span className="text-xs text-muted-foreground font-mono">{it.score}分</span>
+                <span className="text-xs text-muted-foreground font-mono">
+                  {it.score}
+                  {H.scoreSuffix}
+                </span>
                 {it.feedbacks.length > 0 && (
                   <Badge variant="secondary" className="text-xs">
                     {it.feedbacks[0].action === "interested"
@@ -141,7 +147,7 @@ export default function Home() {
                 className="text-xs px-0"
                 onClick={() => (location.hash = "#/history")}
               >
-                查看全部推送记录 →
+                {H.viewAll}
               </Button>
             </div>
           </div>
