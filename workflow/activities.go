@@ -9,8 +9,11 @@ import (
 	"strings"
 	"time"
 
+	"go.temporal.io/sdk/activity"
+
 	"github.com/YouToco/vane/dedup"
 	"github.com/YouToco/vane/feedback"
+	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/selector"
 	"github.com/YouToco/vane/types"
 )
@@ -316,6 +319,14 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	}
 	if len(p.Scope.SourceIDs) > 0 {
 		sources = filterSources(sources, p.Scope.SourceIDs)
+	}
+
+	// 绑定引擎记账的 trace 锚点（endpoint-binding-contract.md §5）：用 workflow
+	// execution ID 而非管线 traceID——后者在 PushParams 里没有，为它改活动入参
+	// 会碰在途 run 的确定性；执行 ID 同样稳定可查（wf-push-… 关联到调度与批次）。
+	// 在真实 activity 外（单测直调）GetInfo 会 panic，故判一下。
+	if activity.IsActivity(ctx) {
+		ctx = fetcher.WithBindingTrace(ctx, activity.GetInfo(ctx).WorkflowExecution.ID)
 	}
 
 	// 逐源"抓取→立刻入库"的顺序是**有成本含义**的，别改成"先抓完所有源再统一入库"：

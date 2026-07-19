@@ -240,6 +240,10 @@ const (
 	ToolCallKindStatic         ToolCallKind = "static"          // 静态白名单工具（add_source/push_now/…）
 	ToolCallKindTikHubSearch   ToolCallKind = "tikhub_search"   // search_endpoints 检索元工具
 	ToolCallKindTikHubEndpoint ToolCallKind = "tikhub_endpoint" // 动态注入的 TikHub 端点工具（按次计费面）
+	// ToolCallKindBindingFetch 绑定引擎（调度面）的上游调用：list/enrich/probe 每次
+	// 计费调用一行（endpoint-binding-contract.md §5）。user/session/tenant 均 NULL——
+	// 源是跨租户共享客观事实（I-T1），其抓取是系统行为。不占 agent 免确认双限额。
+	ToolCallKindBindingFetch ToolCallKind = "binding_fetch"
 )
 
 // 工具调用错误分类（tool_calls.error_type）。低基数硬枚举：per-tool 错误率

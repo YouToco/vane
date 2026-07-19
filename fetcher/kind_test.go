@@ -1,15 +1,20 @@
 package fetcher
 
-// 本文件守卫 M6 契约 §7.2(b) 的 Kind 语义：Kind 由各抓取器在**构造 item 处**显式
+// 本文件守卫 M6 契约 §7.2(b) 的 Kind 语义：Kind 由抓取器在**构造 item 处**显式
 // 赋值，finalize 只校验不兜底。钉死两件事：
-//   1. 四个 article 抓取器（rss/exa/tikhub_xhs/x）产出的每条 item 都是 Kind=article；
+//   1. 每个 Available 能力实际产出的 Kind 与 sourcecatalog 登记一致（一致性锁）；
 //   2. finalize 对空 Kind 一律拒绝（单条跳过，不炸整批）。
 // 背景是 2026-07-16 生产事故：008 加列后全链路无人赋值，Go 零值 "" 被显式 INSERT
 // 覆盖 DB 的 DEFAULT 'article'，全部新内容 kind 落成空串（存量由 012 回填）。
-// 这组用例保证同类污染在单测层就变红，而不是等 DB 里长出脏数据才被发现。
+//
+// 绑定引擎迁移（2026-07-18）后，TikHub 系能力的产出统一走 BindingFetcher：一致性锁
+// 对这些能力改为「模板 Kind vs 登记 Kind」（TestBindingTemplates_Integrity 已锁）+
+// 「引擎真产出 vs 登记 Kind」（本文件，走 fixture 全链路，防模板对了引擎丢字段）。
 
 import (
+	"context"
 	"encoding/json"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/mmcdole/gofeed"
@@ -47,105 +52,84 @@ func TestMapExaResults_ProducesKindArticle(t *testing.T) {
 	requireAllKindArticle(t, items)
 }
 
-func TestMapTikhubNotes_ProducesKindArticle(t *testing.T) {
-	items := mapTikhubNotes(xhsSource(1), []tikhubSearchItem{
-		{ModelType: "note", Note: &tikhubNote{ID: xhsNoteID, Title: "笔记", Desc: "正文"}},
-	})
-	requireAllKindArticle(t, items)
-}
-
-// TestTweetToItem_ProducesKindArticle 覆盖 tweetToItem 的**两个**构造分支：
-// 转推拆包分支与原创分支各有一个独立的 ContentItem 字面量，漏赋任何一个都会让
-// 那一类推文带着空 Kind 入库。
-func TestTweetToItem_ProducesKindArticle(t *testing.T) {
-	original := twitterTweet{
-		TweetID:   "1001",
-		Text:      "原创推文",
-		CreatedAt: "Thu Jul 16 12:00:00 +0000 2026",
-		Author:    twitterAuthor{ScreenName: "someone"},
-	}
-	retweet := twitterTweet{
-		TweetID:   "1002",
-		Text:      "RT @orig: 截断的 140 字",
-		CreatedAt: "Thu Jul 16 12:00:01 +0000 2026",
-		Author:    twitterAuthor{ScreenName: "reposter"},
-		RetweetedTweet: json.RawMessage(
-			`{"tweet_id":"2001","text":"被转推的全文","created_at":"Thu Jul 16 11:00:00 +0000 2026","author":{"screen_name":"orig"}}`),
-	}
-
-	for _, tc := range []struct {
-		name string
-		tw   twitterTweet
-	}{
-		{"原创分支", original},
-		{"转推拆包分支", retweet},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			item := tweetToItem(tc.tw, "fallback")
-			if item == nil {
-				t.Fatal("fixture 推文不该被丢弃")
-			}
-			if item.Kind != types.KindArticle {
-				t.Errorf("Kind 应为 %q，实际 %q", types.KindArticle, item.Kind)
-			}
-		})
-	}
-}
-
-// TestCatalogKindMatchesFetcherEmittedKind 是 sourcecatalog 登记的 Kind 与各抓取器**实际
-// 产出**的 Kind 之间的一致性锁（sourcecatalog.go 的 Entry.Kind 注释所承诺的那把锁）。
-//
-// 为什么单靠 requireAllKindArticle + sourcecatalog_test 的"非空"断言不够（对抗审查 CONFIRMED）：
-// 前者把 fetcher 产出钉在硬编码的 KindArticle，后者只查 catalog 里 Kind 非空——两头各自钉在
-// 同一个常量上，却从不互相比对。有人把某个 article 能力的 catalog Kind 误改成 change，两处测试
-// 照样全绿，catalog 与真实产出静默漂移。本用例对每个 article 能力跑其 map 函数、拿产出的 Kind
-// 与 sourcecatalog.KindOf 逐条比，把这条漂移路径焊死。
+// TestCatalogKindMatchesFetcherEmittedKind 是 sourcecatalog 登记的 Kind 与各抓取器
+// **实际产出**的 Kind 之间的一致性锁。手写 map 函数的能力（rss/exa/contents）直接调
+// map 函数；绑定能力走引擎全链路（fixture 假服务端），确保「模板声明的 Kind」真的
+// 落到了产出条目上，而不是只在声明层一致。
 func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
+	up := newFakeUpstream()
+	up.bodies[pathSearch] = sampleTikhubResponse
+	up.bodies[pathUserPost] = sampleXHSUserResponse
+	up.bodies[pathTwitter] = sampleTwitterResponse
+	up.bodies[pathHotList] = sampleHotListResponse
+	up.bodies[pathTopic] = sampleTopicFeedResponse
+	up.bodies[pathFaved] = sampleFavedNotesResponse
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+	b := newTestBinding(srv.URL, nil, nil)
+
 	cases := []struct {
 		platform   types.Platform
 		capability types.Capability
-		items      []types.ContentItem
+		items      func(t *testing.T) []types.ContentItem
 	}{
-		{types.PlatformWeb, types.CapFeed, mapItems(rssSource(1),
-			[]*gofeed.Item{{Link: bbcURL, Title: "标题", Content: "正文"}})},
-		{types.PlatformWeb, types.CapSearch, mapExaResults(exaSource(1),
-			[]exaResult{{ID: "exa-1", URL: "https://news.example/a", Title: "标题", Text: "正文"}})},
-		{types.PlatformWeb, types.CapContents, contentsItems(
-			types.Source{ID: 1, Platform: types.PlatformWeb, Capability: types.CapContents},
-			[]exaContentsResult{{ID: "c1", URL: "https://x.example/pricing", Title: "定价", Text: "正文"}})},
-		{types.PlatformXHS, types.CapSearch, mapTikhubNotes(xhsSource(1),
-			[]tikhubSearchItem{{ModelType: "note", Note: &tikhubNote{ID: xhsNoteID, Title: "笔记", Desc: "正文"}}})},
-		{types.PlatformXHS, types.CapUserPosts, mapXHSUserNotes(
-			types.Source{ID: 1, Platform: types.PlatformXHS, Capability: types.CapUserPosts}, "u1",
-			[]xhsUserNote{{ID: xhsNoteID, Title: "笔记", Desc: "正文", User: xhsUserAuthor{UserID: "u1"}}})},
+		{types.PlatformWeb, types.CapFeed, func(*testing.T) []types.ContentItem {
+			return mapItems(rssSource(1), []*gofeed.Item{{Link: bbcURL, Title: "标题", Content: "正文"}})
+		}},
+		{types.PlatformWeb, types.CapSearch, func(*testing.T) []types.ContentItem {
+			return mapExaResults(exaSource(1), []exaResult{{ID: "exa-1", URL: "https://news.example/a", Title: "标题", Text: "正文"}})
+		}},
+		{types.PlatformWeb, types.CapContents, func(*testing.T) []types.ContentItem {
+			return contentsItems(
+				types.Source{ID: 1, Platform: types.PlatformWeb, Capability: types.CapContents},
+				[]exaContentsResult{{ID: "c1", URL: "https://x.example/pricing", Title: "定价", Text: "正文"}})
+		}},
+		{types.PlatformXHS, types.CapSearch, bindingItems(b, types.PlatformXHS, types.CapSearch, `{"keyword":"k"}`)},
+		{types.PlatformXHS, types.CapUserPosts, bindingItems(b, types.PlatformXHS, types.CapUserPosts, `{"user_id":"6a5578b3000000000e03cc00"}`)},
+		{types.PlatformX, types.CapUserPosts, bindingItems(b, types.PlatformX, types.CapUserPosts, `{"screen_name":"OpenAI"}`)},
+		{types.PlatformXHS, types.CapHotList, bindingItems(b, types.PlatformXHS, types.CapHotList, `{}`)},
+		{types.PlatformXHS, types.CapTopicFeed, bindingItems(b, types.PlatformXHS, types.CapTopicFeed, `{"page_id":"6301c499df9bea0001dc6f47"}`)},
+		{types.PlatformXHS, types.CapFavedNotes, bindingItems(b, types.PlatformXHS, types.CapFavedNotes, `{"user_id":"69bfda630000000034019ee8"}`)},
 	}
+	covered := map[string]bool{}
 	for _, tc := range cases {
+		covered[string(tc.platform)+"/"+string(tc.capability)] = true
 		want, ok := sourcecatalog.KindOf(tc.platform, tc.capability)
 		if !ok {
 			t.Errorf("%s/%s 在 sourcecatalog 里不可用，无从比对 Kind", tc.platform, tc.capability)
 			continue
 		}
-		if len(tc.items) == 0 {
+		items := tc.items(t)
+		if len(items) == 0 {
 			t.Fatalf("%s/%s 的 fixture 未产出 item，断言空洞", tc.platform, tc.capability)
 		}
-		for i, it := range tc.items {
+		for i, it := range items {
 			if it.Kind != want {
 				t.Errorf("%s/%s 第 %d 条产出 Kind=%q，但 sourcecatalog.KindOf=%q，二者漂移",
 					tc.platform, tc.capability, i, it.Kind, want)
 			}
 		}
 	}
+	// 完备性：sourcecatalog 每个 Available 能力都必须有比对用例——新增能力忘了配
+	// fixture 时在此变红，而不是让一致性锁静默漏一个能力。
+	for _, e := range sourcecatalog.List() {
+		if e.Available() && !covered[string(e.Platform)+"/"+string(e.Capability)] {
+			t.Errorf("Available 能力 %s/%s 没有 Kind 一致性比对用例", e.Platform, e.Capability)
+		}
+	}
+}
 
-	// x/user_posts 走 tweetToItem（无独立 map 函数），单独比对。
-	tw := tweetToItem(twitterTweet{
-		TweetID: "1", Text: "推文", CreatedAt: "Thu Jul 16 12:00:00 +0000 2026",
-		Author: twitterAuthor{ScreenName: "a"},
-	}, "a")
-	wantX, ok := sourcecatalog.KindOf(types.PlatformX, types.CapUserPosts)
-	if tw == nil {
-		t.Fatal("fixture 推文不该被丢弃")
-	} else if !ok || tw.Kind != wantX {
-		t.Errorf("x/user_posts 产出 Kind=%q，sourcecatalog.KindOf=%q(ok=%v)，二者漂移", tw.Kind, wantX, ok)
+// bindingItems 用引擎全链路产出条目（fixture 假服务端）。
+func bindingItems(b *BindingFetcher, p types.Platform, c types.Capability, cfg string) func(t *testing.T) []types.ContentItem {
+	return func(t *testing.T) []types.ContentItem {
+		t.Helper()
+		items, err := b.Fetch(context.Background(), types.Source{
+			ID: 1, Platform: p, Capability: c, Config: json.RawMessage(cfg),
+		})
+		if err != nil {
+			t.Fatalf("%s/%s 引擎抓取失败: %v", p, c, err)
+		}
+		return items
 	}
 }
 

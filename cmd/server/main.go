@@ -101,7 +101,8 @@ func run() error {
 	// 同一份画像快照——卡片"为什么与你有关"与打分依据必须是同一个画像。
 	// st 作为 fetcher.SeenChecker 注入：TikHub 详情补全按次计费，只为未入库的新笔记
 	// 付费（见 fetcher.SeenChecker）。传真实 store 而非 nil，否则补全整体被跳过。
-	fetch := fetcher.NewMulti(cfg.Fetch, st)
+	// st 同时作为 BindingCallRecorder：绑定引擎每次上游调用落 tool_calls（契约 §5）。
+	fetch := fetcher.NewMulti(cfg.Fetch, st, st)
 	hints := profilehint.NewCache(st)
 	score := scorer.New(llmClient, recorder, st, hints)
 	cards := cardgen.New(llmClient, recorder, hints)
@@ -161,7 +162,7 @@ func run() error {
 	// 任务手册翻译器（P1 编译层）：create/edit 手册后据此把正文编译成 fetch_plan。
 	// 用 client 默认模型（同 scorer/cardgen），走 recorder 记账；一次 llm.Do、DisableThinking。
 	playbookTr := agent.NewPlaybookTranslator(llmClient, recorder)
-	tools := agent.BuildTools(st, sched, sched, playbookTr, endpoints)
+	tools := agent.BuildTools(st, sched, sched, playbookTr, endpoints, fetch.Binding())
 	agentLoop := agent.New(agent.Deps{
 		Client:     llmClient,
 		Recorder:   recorder,

@@ -381,3 +381,79 @@ func TestBuild_WebPageWatchRemoved(t *testing.T) {
 		t.Error("page_watch 已下线，web/page_watch 请求应被拒绝")
 	}
 }
+
+// ────────── 绑定能力（endpoint-binding-contract.md §7）──────────
+
+// TestBuild_XHSBindingCapabilities 金串锁定三个绑定能力的幂等键与 config 键名
+// （I-S2 / 契约 §1.4）：键是手拼定序的字节事实，任何"顺手重构"改一个字节都会让
+// 生产 sources 行整体重复（008 教训）。
+func TestBuild_XHSBindingCapabilities(t *testing.T) {
+	cases := []struct {
+		name    string
+		spec    Spec
+		wantURL string
+		wantCfg string
+	}{
+		{"hot_list 无参数", Spec{Platform: "xhs", Capability: "hot_list"},
+			"vane://xhs/hot_list", `{}`},
+		{"topic_feed 直填 page_id", Spec{Platform: "xhs", Capability: "topic_feed",
+			Params: map[string]string{"page_id": "6301c499df9bea0001dc6f47"}},
+			"vane://xhs/topic_feed?page_id=6301c499df9bea0001dc6f47",
+			`{"page_id":"6301c499df9bea0001dc6f47"}`},
+		{"topic_feed 从深链抽取", Spec{Platform: "xhs", Capability: "topic_feed",
+			Params: map[string]string{"topic_url": "xhsdiscover://rn/sns-discover/topic/normal?id=6301c499df9bea0001dc6f47&page_source=note_feed"}},
+			"vane://xhs/topic_feed?page_id=6301c499df9bea0001dc6f47",
+			`{"page_id":"6301c499df9bea0001dc6f47"}`},
+		{"faved_notes 直填 user_id", Spec{Platform: "xhs", Capability: "faved_notes",
+			Params: map[string]string{"user_id": "69bfda630000000034019ee8"}},
+			"vane://xhs/faved_notes?user_id=69bfda630000000034019ee8",
+			`{"user_id":"69bfda630000000034019ee8"}`},
+		{"faved_notes 主页链接抽取", Spec{Platform: "xhs", Capability: "faved_notes",
+			Params: map[string]string{"profile_url": "https://www.xiaohongshu.com/user/profile/69bfda630000000034019ee8"}},
+			"vane://xhs/faved_notes?user_id=69bfda630000000034019ee8",
+			`{"user_id":"69bfda630000000034019ee8"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src, msg := Build(tc.spec)
+			if msg != "" {
+				t.Fatalf("Build 拒绝: %s", msg)
+			}
+			if src.URL != tc.wantURL {
+				t.Errorf("幂等键漂移:\n got %q\nwant %q", src.URL, tc.wantURL)
+			}
+			if string(src.Config) != tc.wantCfg {
+				t.Errorf("config 漂移: got %s want %s", src.Config, tc.wantCfg)
+			}
+		})
+	}
+}
+
+func TestBuild_XHSBindingRejections(t *testing.T) {
+	if _, msg := Build(Spec{Platform: "xhs", Capability: "topic_feed"}); msg == "" {
+		t.Error("topic_feed 缺 page_id 应拒绝")
+	}
+	if _, msg := Build(Spec{Platform: "xhs", Capability: "faved_notes"}); msg == "" {
+		t.Error("faved_notes 缺 user_id 应拒绝")
+	}
+	// 非 hex 输入抽不出 page_id。
+	if _, msg := Build(Spec{Platform: "xhs", Capability: "topic_feed",
+		Params: map[string]string{"page_id": "打工人翻身"}}); msg == "" {
+		t.Error("非 24hex 的 page_id 应拒绝")
+	}
+}
+
+// TestBuild_BindingKeyNamespacesDisjoint 同一 user_id 在 user_posts 与 faved_notes
+// 下必须是**不同的键**（capability 段承担区分）——I-S2 规则 A 在新能力上的显式核验。
+func TestBuild_BindingKeyNamespacesDisjoint(t *testing.T) {
+	a, _ := Build(Spec{Platform: "xhs", Capability: "user_posts",
+		Params: map[string]string{"user_id": "69bfda630000000034019ee8"}})
+	b, _ := Build(Spec{Platform: "xhs", Capability: "faved_notes",
+		Params: map[string]string{"user_id": "69bfda630000000034019ee8"}})
+	if a == nil || b == nil {
+		t.Fatal("Build 失败")
+	}
+	if a.URL == b.URL {
+		t.Errorf("user_posts 与 faved_notes 的键不该相同: %q", a.URL)
+	}
+}

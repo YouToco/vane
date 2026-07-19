@@ -222,6 +222,13 @@ Boss 列的能力：「关键词搜索、**用户搜索**、用户新文章详�
 | `xhs` | `search` | `article` | `tikhub` | 迁移自 `tikhub_xhs` | — |
 | `xhs` | `user_posts` | `article` | — | **未实现**（registry 缺席） | — |
 
+> 【2026-07-18 增补】表格快照滞后于代码（xhs/user_posts 早已 Available）。新增绑定
+> 能力 xhs/hot_list、xhs/topic_feed、xhs/faved_notes 经 2026-07-18 真实测准入
+> （证据与 config schema：endpoint-binding-contract.md §7/§10）；绑定能力的实测口径
+> 升级为可复跑（fixture 单测 + 时序检查），准入与运行护栏以该契约为准。
+> tikhub Provider 的三能力（xhs/search、xhs/user_posts、x/user_posts）自同日起由
+> 绑定引擎模板承载，bespoke fetcher 删除（等价义务：该契约 §6）。
+
 ### 2.2 `Unavailable` 是一等条目，不是缺席 —— registry 唯一严格优于最小方案的地方
 
 ```go
@@ -2004,7 +2011,10 @@ VPS 打包产物复验含 4 处 ``===`rss`` + 4 处 `tikhub_xhs`。
 - **I1**：`canonical_key` 只依赖 **platform + 内容本身**，**绝不依赖 provider**。
   → Gate ⑨ 可执行验证。
 - **I2**：`sources.config` 的**顶层**不出现供应商专属字段；供应商专属的一律进 `provider_hints`，
-  并**接受它会随供应商失效**（§5.3）。这是**诚实的泄漏，不是消除的泄漏**——
+  并**接受它会随供应商失效**（§5.3）。
+  【2026-07-18 增补】绑定能力（endpoint-binding-contract.md）把供应商专属信息（端点名、
+  字段映射）留在**代码内模板**、config 只存平台语义参数——I2 对模板绑定源自动成立；
+  二期 config.binding 落地时按该契约 §1.3 单独修订。这是**诚实的泄漏，不是消除的泄漏**——
   初稿的 I2 表述是「config 里不出现供应商专属字段」，而初稿自己的 schema 就把 Exa 的
   `category`/`type` 摆在顶层，**违反了自己的不变量**（对抗审查抓到）。
   （`sort_type` 是 xhs **平台**语义不是 TikHub 语义，留在顶层是对的。）

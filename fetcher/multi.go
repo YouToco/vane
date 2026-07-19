@@ -22,27 +22,28 @@ type Multi struct {
 	rss         *Fetcher
 	exa         *ExaFetcher
 	exaContents *ExaContentsFetcher
-	tikhub      *TikHubFetcher
-	xhsUser     *XHSUserFetcher
-	twitter     *TwitterFetcher
+	binding     *BindingFetcher
 }
 
 // NewMulti 按抓取配置构造全部抓取器。未配置 key 的信源类型仍会构造
 // （构造零成本），等真有该类型的源被抓取时才在 Fetch 返回配置缺失错误。
 //
-// seen 只被 TikHub 搜索抓取器用于"这条笔记是否已入库"，从而只为新笔记调用按次计费的
-// 详情接口（见 SeenChecker）。传 nil 合法：详情补全会被跳过，小红书搜索正文退回 60 字
-// 摘要——不改善，但也不比补全上线前更差。xhs/user_posts 不做详情补全，不受 seen 影响。
-func NewMulti(cfg config.FetchConfig, seen SeenChecker) *Multi {
+// seen 只被绑定引擎的 enrich 用于"这条笔记正文是否已补全"，从而只为新笔记调用
+// 按次计费的详情接口（见 SeenChecker）。传 nil 合法：详情补全会被跳过，
+// 小红书搜索正文退回 60 字摘要——不改善，但也不比补全上线前更差。
+//
+// rec 是绑定引擎的调用记账（tool_calls，契约 §5）；nil 合法（只是不记账）。
+func NewMulti(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorder) *Multi {
 	return &Multi{
 		rss:         New(cfg),
 		exa:         NewExa(cfg),
 		exaContents: NewExaContents(cfg),
-		tikhub:      NewTikHub(cfg, seen),
-		xhsUser:     NewXHSUser(cfg),
-		twitter:     NewTwitter(cfg),
+		binding:     NewBinding(cfg, seen, rec),
 	}
 }
+
+// Binding 暴露绑定引擎（agent 的试跑准入用 Probe，见 endpoint-binding-contract.md §2.2）。
+func (m *Multi) Binding() *BindingFetcher { return m.binding }
 
 // Fetch 按 (Platform, Capability) 分发。
 //
@@ -75,16 +76,14 @@ func (m *Multi) Fetch(ctx context.Context, src types.Source) ([]types.ContentIte
 
 	case types.PlatformXHS:
 		switch src.Capability {
-		case types.CapSearch:
-			return m.tikhub.Fetch(ctx, src)
-		case types.CapUserPosts:
-			return m.xhsUser.Fetch(ctx, src)
+		case types.CapSearch, types.CapUserPosts, types.CapHotList, types.CapTopicFeed, types.CapFavedNotes:
+			return m.binding.Fetch(ctx, src)
 		}
 
 	case types.PlatformX:
 		switch src.Capability {
 		case types.CapUserPosts:
-			return m.twitter.Fetch(ctx, src)
+			return m.binding.Fetch(ctx, src)
 		}
 	}
 

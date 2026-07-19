@@ -214,6 +214,9 @@ const translateSystemPrompt = `你是「见微 Vane」情报任务的抓取计�
 - x + user_posts：订阅某 X(Twitter) 账号的新发布。必填 screen_name（如 "OpenAI"，不带 @）。
 - xhs + search：小红书关键词搜索。必填 keyword。
 - xhs + user_posts：订阅某小红书博主。必填 user_id（24 位十六进制）或 profile_url（用户主页链接）。
+- xhs + hot_list：小红书全站热榜追新。无参数。
+- xhs + topic_feed：订阅某小红书话题下的新笔记。必填 page_id（24 位十六进制）或 topic_url（话题链接/深链）。手册没给话题 ID/链接就不要臆造。
+- xhs + faved_notes：订阅某小红书账号公开收藏的新笔记。必填 user_id（24 位十六进制）或 profile_url（用户主页链接）。
 
 关键规则：
 1. 【追新用 include_domains，绝不用日期过滤】想要某个官方/权威来源的最新内容时，用 web+search 并把 include_domains 限定到该域名（例：只要 Anthropic 官方最新动态 → query 写主题、include_domains 填 ["anthropic.com"]）。绝不要试图靠"发布日期"来"只要最近的"——Exa 的发布日期是从网页猜的，官方站常常猜不出、按日期过滤会把它们连带删光。
