@@ -45,6 +45,8 @@ func run() int {
 		return runSetPassword(os.Args[2:])
 	case "invite":
 		return runInvite(os.Args[2:])
+	case "tenant":
+		return runTenant(os.Args[2:])
 	default:
 		usage()
 		return 2
@@ -55,6 +57,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "用法:")
 	fmt.Fprintln(os.Stderr, "  useradmin set-password -email <邮箱> [-user <id>]   （密码从 stdin 读）")
 	fmt.Fprintln(os.Stderr, "  useradmin invite [-uses N] [-expires-days D] [-code CODE]")
+	fmt.Fprintln(os.Stderr, "  useradmin tenant delete|restore <租户ID>")
 }
 
 func runSetPassword(args []string) int {

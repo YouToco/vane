@@ -119,6 +119,8 @@ type emptyBatchCall struct {
 }
 
 type fakeStore struct {
+	tenantGone         bool  // true = 模拟租户已注销
+	tenantLiveErr      error // 非 nil = 模拟状态查询失败
 	mu                 sync.Mutex
 	gotBatchScheduleID string // Push 建批次时收到的 schedule_id（P1b 穿参断言）
 	unpushed           []types.ContentItem
@@ -154,6 +156,18 @@ type fakeStore struct {
 	// #8 卡片源归属：schedSrcForContent 映射 content_item_id→本任务命中源 id；
 	// 命中即 ScheduleSourceForContent 返回 (id,true)，缺失返回 (0,false) 让调用方回退首发源。
 	schedSrcForContent map[int64]int64
+}
+
+// tenantGone 让用例模拟「租户已注销」（D9）。零值 false = 租户在服务中，
+// 既有用例因此不受影响。
+func (f *fakeStore) TenantLiveForUser(context.Context, int64) (bool, error) {
+	if f.tenantGone {
+		return false, nil
+	}
+	if f.tenantLiveErr != nil {
+		return false, f.tenantLiveErr
+	}
+	return true, nil
 }
 
 func (s *fakeStore) DisableSourceIfActive(_ context.Context, id int64) (bool, error) {
@@ -1154,4 +1168,69 @@ func TestNotifyEmptyResult(t *testing.T) {
 			t.Fatalf("通知失败必须吞掉（空批次是正常终态），实得 %v", err)
 		}
 	})
+}
+
+// TestActivities_RefusesSpendingForDeletedTenant 钉住 D9 软删除的**执行面**。
+//
+// 注销若只落到数据库，「已注销」就是个标记：定时调度照跑、Exa/TikHub/LLM 照花钱、
+// 推送照发到对方手机上。这条用例守的是"真的停下来"。
+//
+// 两个活动分别是两类钱的起点：EvolveProfile 花 LLM，Fetch 花 Exa/TikHub。
+func TestActivities_RefusesSpendingForDeletedTenant(t *testing.T) {
+	ev := &countingEvolver{}
+	fetcher := &countingFetcher{}
+	// **必须给假 store 一个到期源**：否则去掉 Fetch 闸门也没有源可抓，calls 照样是 0，
+	// 用例看着在测、其实测不出闸门有没有生效（探针实测确认过这一点）。
+	st := &fakeStore{
+		tenantGone: true,
+		dueSources: []types.Source{{ID: 1, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: "https://x.example/rss"}},
+	}
+	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, ev, nil, nil, nil)
+
+	if err := a.EvolveProfile(t.Context(), EvolveIn{UserID: 1, TraceID: "t"}); err != nil {
+		t.Errorf("已注销租户应正常终态返回（报错会触发重试，而重试同样被拒）：%v", err)
+	}
+	if ev.calls != 0 {
+		t.Errorf("已注销租户不得跑画像演化（花 LLM 的钱），实得 %d 次", ev.calls)
+	}
+
+	items, err := a.Fetch(t.Context(), PushParams{UserID: 1})
+	if err != nil {
+		t.Errorf("已注销租户应返回空候选而非报错：%v", err)
+	}
+	if len(items) != 0 {
+		t.Errorf("已注销租户不应产出候选，实得 %d 条", len(items))
+	}
+	if fetcher.calls != 0 {
+		t.Errorf("已注销租户不得抓取（Exa/TikHub 按次计费），实得 %d 次", fetcher.calls)
+	}
+}
+
+// TestActivities_TenantCheckFailureDoesNotBlock：状态查询失败时**放行**。
+//
+// 这是一道旁路闸门。数据库抖一下就让全部用户停止推送，比"注销租户多跑一轮"糟糕得多
+// ——真正的兜底在登录层（LookupSession 拒绝已注销租户的会话）。
+// 失败方向选错的代价是全局停服，而不是多花一点点钱。
+func TestActivities_TenantCheckFailureDoesNotBlock(t *testing.T) {
+	ev := &countingEvolver{}
+	st := &fakeStore{tenantLiveErr: errors.New("数据库抖动（测试构造）")}
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, ev, nil, nil, nil)
+
+	if err := a.EvolveProfile(t.Context(), EvolveIn{UserID: 1, TraceID: "t"}); err != nil {
+		t.Errorf("查询失败不应报错：%v", err)
+	}
+	if ev.calls != 1 {
+		t.Errorf("旁路闸门查询失败时应放行（否则 DB 抖动=全局停服），实得 %d 次调用", ev.calls)
+	}
+}
+
+type countingEvolver struct{ calls int }
+
+func (c *countingEvolver) Evolve(context.Context, int64, string) error { c.calls++; return nil }
+
+type countingFetcher struct{ calls int }
+
+func (c *countingFetcher) Fetch(context.Context, types.Source) ([]types.ContentItem, error) {
+	c.calls++
+	return nil, nil
 }

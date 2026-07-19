@@ -186,3 +186,85 @@ func (s *Store) AddMembership(ctx context.Context, tenantID, userID int64, role 
 	}
 	return nil
 }
+
+// tenantRetentionDays 是软删除后的保留期（D9）：到期前可无损恢复，到期后由硬删任务清除。
+// 30 天是契约 §1.3 定的数——给"手滑注销"和"注销后反悔"留出足够的回旋余地，
+// 同时不让已注销租户的数据无限期占着库。
+const tenantRetentionDays = 30
+
+// SoftDeleteTenant 注销租户（D9 软删除）：置 deleting 状态并设定硬删期限。
+//
+// **软删除必须立刻让租户从产品面消失**，否则「已注销」只是个标记：调度照跑、
+// Exa/TikHub/LLM 照花钱、推送照发到对方手机上。落库只是第一步，真正的停止靠
+// 两处闸门——LookupSession 拒绝登录（既有），以及 pipeline 首个花钱的活动拒绝开工
+// （见 workflow.Activities）。
+//
+// 幂等：已在 deleting 状态时原样返回，不刷新 purge_after——否则反复注销会把硬删期限
+// 一路往后推，数据永远删不掉。
+func (s *Store) SoftDeleteTenant(ctx context.Context, tenantID int64) (*types.Tenant, error) {
+	var t types.Tenant
+	err := s.pool.QueryRow(ctx,
+		`UPDATE tenants
+		    SET status = 'deleting',
+		        deleted_at = COALESCE(deleted_at, now()),
+		        purge_after = COALESCE(purge_after, now() + ($2 || ' days')::interval)
+		  WHERE id = $1
+		RETURNING `+tenantColumns,
+		tenantID, tenantRetentionDays).Scan(
+		&t.ID, &t.Status, &t.Plan, &t.DeletedAt, &t.PurgeAfter, &t.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, types.NewAppError(types.CodeNotFound, fmt.Sprintf("租户 %d 不存在", tenantID), nil)
+	}
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "注销租户", err)
+	}
+	return &t, nil
+}
+
+// RestoreTenant 在保留期内恢复被注销的租户（D9）：清空三个字段回到 active。
+//
+// 只对 deleting 状态生效：对 active 租户调用是无操作而非报错（幂等），
+// 但**已过 purge_after 的不给恢复**——那时硬删任务随时可能动手，
+// 让用户以为恢复成功、几分钟后数据消失，比直接拒绝糟糕得多。
+func (s *Store) RestoreTenant(ctx context.Context, tenantID int64) (*types.Tenant, error) {
+	var t types.Tenant
+	err := s.pool.QueryRow(ctx,
+		`UPDATE tenants
+		    SET status = 'active', deleted_at = NULL, purge_after = NULL
+		  WHERE id = $1
+		    AND (purge_after IS NULL OR purge_after > now())
+		RETURNING `+tenantColumns,
+		tenantID).Scan(&t.ID, &t.Status, &t.Plan, &t.DeletedAt, &t.PurgeAfter, &t.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// 两种情况归一为一条消息：不存在，或已过保留期。
+		return nil, types.NewAppError(types.CodeNotFound,
+			fmt.Sprintf("租户 %d 不存在，或已过保留期无法恢复", tenantID), nil)
+	}
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "恢复租户", err)
+	}
+	return &t, nil
+}
+
+// TenantLiveForUser 报告该用户所属租户是否仍在服务中（active 且未注销）。
+//
+// 供 pipeline 在**开始花钱之前**自查：软删除若不落到这一层，一个已注销的租户
+// 会继续跑定时推送、继续调用 Exa/TikHub/LLM——账单照涨，推送照发到对方手机上。
+//
+// 用户不属于任何租户时返回 false：那是数据异常（注册流保证每人恰好一个），
+// 此时"不开工"比"当作正常"安全——真出了异常，宁可停也不要在无归属的状态下花钱。
+func (s *Store) TenantLiveForUser(ctx context.Context, userID int64) (bool, error) {
+	var live bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+		   SELECT 1 FROM memberships m
+		     JOIN tenants t ON t.id = m.tenant_id
+		    WHERE m.user_id = $1
+		      AND t.status = 'active'
+		      AND t.deleted_at IS NULL
+		 )`, userID).Scan(&live)
+	if err != nil {
+		return false, types.NewAppError(types.CodeDatabase, "查询租户服务状态", err)
+	}
+	return live, nil
+}
