@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
-import { Plus, Loader2, Send } from "lucide-react";
+import { Plus, Loader2, Send, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { api } from "../api";
 import type { DeliveryHistoryItem } from "../api";
 
 const BEIJING_TZ = "Asia/Shanghai";
-const RECENT_WINDOW = 200;
+// 后端 parseHistoryQuery 规定 page_size ∈ [1,100]，越界直接 400。
+// 这里取满 100：既是「今日推送」计数能拿到的最大窗口，也是合法上限。
+const RECENT_WINDOW = 100;
 
 function fmtBeijing(iso?: string | null): string {
   if (!iso) return "";
@@ -35,16 +37,15 @@ export default function Home() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [items, setItems] = useState<DeliveryHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let alive = true;
-    Promise.all([
-      api.listSchedules().catch(() => []),
-      // 取 RECENT_WINDOW 条来数「今日推送」：后端没有按日计数的接口，只能从
-      // 最近一页里数。窗口取够大以免静默截断——真按天推送量算，单日跑满 200 条
-      // 说明推送策略已经出问题了，那种情况下计数偏低不是最要紧的事。
-      api.listDeliveries(RECENT_WINDOW).catch(() => ({ items: [] as DeliveryHistoryItem[] })),
-    ])
+    // 取 RECENT_WINDOW 条来数「今日推送」：后端没有按日计数的接口，只能从最近一页里数。
+    // 刻意不 catch 成空数组——曾经 page_size 越界拿了 400，被吞成 items:[] 后页面显示
+    // 「还没有推送记录」，和真的没数据长得一模一样，线上错了一整天没人发现。
+    // 加载失败必须和「确实没有」分开呈现。
+    Promise.all([api.listSchedules(), api.listDeliveries(RECENT_WINDOW)])
       .then(([schedules, deliveries]) => {
         if (!alive) return;
         setItems(deliveries.items.slice(0, 5));
@@ -54,6 +55,7 @@ export default function Home() {
             .length,
         });
       })
+      .catch(() => alive && setFailed(true))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
@@ -91,6 +93,11 @@ export default function Home() {
           <div className="flex items-center justify-center py-8 text-muted-foreground">
             <Loader2 className="size-4 animate-spin mr-2" />
             <span className="text-sm">加载中…</span>
+          </div>
+        ) : failed ? (
+          <div className="flex items-center justify-center gap-2 py-6 text-sm text-destructive">
+            <AlertCircle className="size-4" />
+            <span>加载失败，请刷新重试</span>
           </div>
         ) : items.length === 0 ? (
           <p className="text-sm text-muted-foreground text-center py-6">还没有推送记录。</p>
