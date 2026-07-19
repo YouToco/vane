@@ -124,3 +124,58 @@ func TestToolCountBudget(t *testing.T) {
 			got, static, maxActivatedEndpoints)
 	}
 }
+
+// ────────── 对抗审查修复的回归锁定（2026-07-18）──────────
+
+func TestTruncationNote_HonestAboutIncompleteCache(t *testing.T) {
+	// MEDIUM：上游响应本身被 2MiB 上限截断时，缓存的也只是前缀——提示绝不能
+	// 宣称「完整数据已缓存」，否则模型读完前缀会以为拿到了全量。
+	body := []byte(`{"data":{"items":[1,2,3]}}`)
+	full := buildTruncationNote("res-1", len(body), body, false)
+	if !strings.Contains(full, "完整数据已缓存") {
+		t.Errorf("未截断时应声明完整: %s", full)
+	}
+	partial := buildTruncationNote("res-1", len(body), body, true)
+	if strings.Contains(partial, "完整数据已缓存") || !strings.Contains(partial, "数据不完整") {
+		t.Errorf("上游超限时必须声明不完整: %s", partial)
+	}
+	if !strings.Contains(partial, "缩小查询范围") {
+		t.Error("不完整时应给出下一步（缩小范围/分页重查）")
+	}
+	// LOW：TTL 措辞不能把 LRU 逐出说成保证。
+	if !strings.Contains(full, "最长 30 分钟") || !strings.Contains(full, "提前失效") {
+		t.Errorf("TTL 措辞应承认可能提前失效: %s", full)
+	}
+}
+
+func TestSliceRunes(t *testing.T) {
+	s := "一二三四五"
+	for _, tc := range []struct {
+		offset, limit int
+		want          string
+		wantMore      bool
+	}{
+		{0, 2, "一二", true},
+		{2, 2, "三四", true},
+		{4, 2, "五", false},
+		{0, 99, "一二三四五", false},
+	} {
+		got, total, more := sliceRunes(s, tc.offset, tc.limit)
+		if got != tc.want || more != tc.wantMore || total != 5 {
+			t.Errorf("sliceRunes(%d,%d) = %q,%d,%v；want %q,5,%v",
+				tc.offset, tc.limit, got, total, more, tc.want, tc.wantMore)
+		}
+	}
+	// 越界：空片段 + 正确总数，调用方据此给终止文案。
+	if got, total, more := sliceRunes(s, 99, 10); got != "" || total != 5 || more {
+		t.Errorf("越界应返回空片段: %q,%d,%v", got, total, more)
+	}
+}
+
+func TestRenderShape_ArrayConsumesDepth(t *testing.T) {
+	// LOW：嵌套数组不得穿透深度预算。
+	shape := summarizeJSONStructure([]byte(`[[[["deep"]]]]`))
+	if strings.Count(shape, "array[") > 3 {
+		t.Errorf("嵌套数组穿透了深度限制: %s", shape)
+	}
+}

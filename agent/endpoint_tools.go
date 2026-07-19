@@ -502,7 +502,7 @@ func (t *endpointTool) Execute(ctx context.Context, userID int64, args json.RawM
 		// 超限：全量进缓存、给句柄——被截部分从此有取回通道（契约 §3.5，
 		// 此前只截不给取回是 Boss 实测撞上的死路，也是 Codex 至今被诟病的形态）。
 		handle := t.ep.results.put(userID, t.entry.Name, res.Body)
-		body += buildTruncationNote(handle, len(res.Body), res.Body)
+		body += buildTruncationNote(handle, len(res.Body), res.Body, res.Truncated)
 	}
 	return body, nil
 }

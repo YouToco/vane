@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -129,8 +130,10 @@ func renderShape(v any, depth int) string {
 		}
 		return "{" + strings.Join(parts, ",") + suffix + "}"
 	case []any:
-		if len(t) == 0 {
-			return "array[0]"
+		// 数组同样消耗深度预算：不减深度的话嵌套数组会穿透「深度 2」承诺，
+		// 巨型响应的摘要能长到几 KB（对抗审查 LOW）。
+		if len(t) == 0 || depth <= 0 {
+			return fmt.Sprintf("array[%d]", len(t))
 		}
 		return fmt.Sprintf("array[%d]，元素%s", len(t), renderShape(t[0], depth-1))
 	case string:
@@ -271,21 +274,19 @@ func (t *readEndpointResultTool) Execute(_ context.Context, userID int64, args j
 	if limit <= 0 || limit > endpointResultMaxRunes {
 		limit = endpointResultMaxRunes
 	}
-	runes := []rune(text)
 	offset := a.Offset
 	if offset < 0 {
 		offset = 0
 	}
-	if offset >= len(runes) {
-		return fmt.Sprintf("offset=%d 已超出内容长度（共 %d 字符），没有更多内容。", offset, len(runes)), nil
+	// 按 rune 顺序走出字节区间，不物化 []rune（2MiB 响应会分配 8MB，且分页
+	// 每页都重来一次——对抗审查 LOW 的性能形态）。
+	out, total, hasMore := sliceRunes(text, offset, limit)
+	if offset >= total {
+		return fmt.Sprintf("offset=%d 已超出内容长度（共 %d 字符），没有更多内容。", offset, total), nil
 	}
-	end := offset + limit
-	if end > len(runes) {
-		end = len(runes)
-	}
-	out := string(runes[offset:end])
-	if end < len(runes) {
-		out += fmt.Sprintf("\n（第 %d-%d 字符，共 %d。续读：{\"handle\":%q", offset, end, len(runes), a.Handle)
+	end := offset + utf8.RuneCountInString(out)
+	if hasMore {
+		out += fmt.Sprintf("\n（第 %d-%d 字符，共 %d。续读：{\"handle\":%q", offset, end, total, a.Handle)
 		if a.Path != "" {
 			out += fmt.Sprintf(",\"path\":%q", a.Path)
 		}
@@ -300,13 +301,47 @@ func (t *readEndpointResultTool) Summarize(args json.RawMessage) string {
 	return "读取端点结果缓存 " + a.Handle
 }
 
+// sliceRunes 取 s 的 [offset, offset+limit) rune 区间，返回该片段、总 rune 数、
+// 是否还有后续。单次顺序扫描、零大对象分配（对比 []rune(s) 对 2MiB 文本的 8MB 分配）。
+func sliceRunes(s string, offset, limit int) (piece string, total int, hasMore bool) {
+	startByte, endByte := -1, len(s)
+	n := 0
+	for i := range s {
+		if n == offset {
+			startByte = i
+		}
+		if n == offset+limit {
+			endByte = i
+		}
+		n++
+	}
+	if n == offset {
+		startByte = len(s)
+	}
+	total = n
+	if startByte < 0 {
+		return "", total, false // offset 越界，调用方按 total 给终止文案
+	}
+	if endByte < startByte {
+		endByte = startByte
+	}
+	return s[startByte:endByte], total, endByte < len(s)
+}
+
 // buildTruncationNote 组装截断提示：大小 + 句柄 + 结构摘要 + 强命令式取回指引。
 // 措辞三要素缺一不可（调研结论）：句柄可兑现（有取回工具）、结构摘要（免读全文
 // 直接写路径）、显式压制「拿预览当全文」。
-func buildTruncationNote(handle string, totalBytes int, body []byte) string {
+func buildTruncationNote(handle string, totalBytes int, body []byte, upstreamTruncated bool) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n（响应共 %d 字节，仅展示前 %d 字符。完整数据已缓存：句柄 %s，30 分钟内有效。",
-		totalBytes, endpointResultMaxRunes, handle)
+	// 缓存完整性必须诚实（对抗审查 MEDIUM）：上游响应超 2MiB 读取上限时缓存的
+	// 也只是前缀，宣称「完整数据已缓存」会让模型读完前缀却以为拿到了全量。
+	scope := "完整数据已缓存"
+	if upstreamTruncated {
+		scope = fmt.Sprintf("上游响应超过 %d 字节读取上限，仅缓存了前 %d 字节（**数据不完整**，"+
+			"需要全量请缩小查询范围或用分页参数重查）", totalBytes, totalBytes)
+	}
+	fmt.Fprintf(&b, "\n（响应共 %d 字节，仅展示前 %d 字符。%s：句柄 %s，最长 30 分钟内有效（缓存紧张时可能提前失效）。",
+		totalBytes, endpointResultMaxRunes, scope, handle)
 	if shape := summarizeJSONStructure(body); shape != "" {
 		fmt.Fprintf(&b, "\n结构摘要：%s", truncateRunes(shape, 400))
 	}
