@@ -84,7 +84,14 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 		// 等不到任何回音来查服务器——空结果和故障在用户侧必须可区分）。定时任务保持
 		// 静默（每天"今天没新闻"是噪音）。失败同样只 Warn：通知是附加信息，
 		// 不能把正常空终态变成失败。
-		if userTriggered {
+		// 额度用尽**无视 userTriggered 门控**：上面那条"定时任务保持静默"的规则
+		// 是对着「今天没新闻」定的——每天一条确实是噪音。但额度用尽是另一类东西：
+		//   · 它不是"今天恰好没内容"，是系统这条路走不通了，且要人处理；
+		//   · 它主要就发生在定时批上（定时批是最大的一笔消耗），门控恰好把它全挡住；
+		//   · 挡住的结果是早报**无声消失**，用户完全无从判断是没新闻、是服务挂了、
+		//     还是自己欠费——三种情况在他那里长得一模一样。
+		// 2026-07-19 审查点出这一条时，我写的"诚实文案"在最需要它的场景一次也送不到人。
+		if userTriggered || gate == types.BatchExitGateQuota {
 			ntCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
 			nin := NotifyEmptyIn{UserID: p.UserID, TraceID: traceID, Gate: gate, Counts: counts}
 			if err := workflow.ExecuteActivity(ntCtx, a.NotifyEmptyResult, nin).Get(ntCtx, nil); err != nil {

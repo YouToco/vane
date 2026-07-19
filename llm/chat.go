@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"github.com/YouToco/vane/store"
 	"io"
 	"log/slog"
 	"net/http"
@@ -292,12 +294,51 @@ func truncateUTF8Tail(s string, max int) string {
 	return "…(前文截断)" + s[start:]
 }
 
+// chatPromptRunes 统计一次 Chat 请求里全部输入文本的字符数——
+// 多轮消息、工具定义（它们同样进 prompt 且往往不短）都要算进去，
+// 漏算工具定义会让 agent 这条路径的估算系统性偏低。
+func chatPromptRunes(req ChatRequest) int {
+	n := 0
+	for _, m := range req.Messages {
+		n += utf8.RuneCountInString(m.Content)
+	}
+	for _, t := range req.Tools {
+		n += utf8.RuneCountInString(t.Name) + utf8.RuneCountInString(t.Description)
+	}
+	return n
+}
+
 // DoChat = Chat + 记账，行为对齐 do.go 的 Do：失败也记账、记账用
 // WithoutCancel 剥离取消信号、成本按缓存三段单价计算。
 // 与 Do 的差异只在 prompt/completion 的落库形态：UserPrompt 记 messages
 // 数组 JSON（截断到 8KB）；Completion 记 Content，若有 ToolCalls 则记
 // "tool_calls: <json>"（FC 响应的 content 通常为空，工具调用才是有效输出）。
 func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req ChatRequest) (*ChatResponse, error) {
+	// 配额闸门（契约 §2.7）。理由与 Do 相同，见 do.go 的说明。
+	//
+	// 这条路径**比 Do 更需要它**：多轮对话把历史累积进 prompt，生产 7 天实测
+	// agent 的 prompt 均值 4381、峰值 44871，是打分的 10 倍与 42 倍；而且 agent
+	// 循环里一次用户消息会触发多轮调用，单次交互的总量还要再乘一个轮数。
+	// 第一版把这条漏了，却在 Do 的注释里断言"唯一咽喉"——错得最贵的那种。
+	estimate := estimateTokens(chatPromptRunes(req), req.MaxTokens)
+	if err := rec.CheckQuota(ctx, meta.UserID, estimate); err != nil {
+		switch {
+		case errors.Is(err, store.ErrQuotaExceeded):
+			return nil, types.NewAppError(types.CodeQuotaExceeded,
+				"本租户的 LLM 额度已用尽，稍后会随时间自动恢复", nil)
+		case errors.Is(err, store.ErrAmbiguousTenant):
+			// 归属不明 ⇒ 拒绝。此刻根本不知道该记谁的账，而花一笔无法归属的钱
+			// 正是这道护栏存在的理由；且它是确定性的，放行等于给该用户无限额度。
+			slog.Error("llm: 用户归属多个租户，无法判定配额归属，拒绝调用", "user_id", *meta.UserID)
+			return nil, types.NewAppError(types.CodeInternal,
+				"账号归属异常，暂时无法处理，请联系管理员", err)
+		default:
+			// 其余（数据库抖动等）放行：让 DB 抖动升级成全局 LLM 停摆，比超额一点糟糕得多。
+			// 用 Error 而非 Warn——护栏此刻是失效的，这件事必须在日志里显眼。
+			slog.Error("llm: 配额查询失败，本次放行（护栏此刻失效）", "err", err)
+		}
+	}
+
 	start := time.Now()
 	resp, err := c.Chat(ctx, req)
 
@@ -353,5 +394,6 @@ func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Ch
 	// 失败路径的 ctx 往往已经超时/取消，记账用 WithoutCancel 剥离取消信号
 	// （与 Do 相同：否则"失败也要记账"必然落空）。
 	rec.Record(context.WithoutCancel(ctx), call)
+	rec.ReconcileQuota(context.WithoutCancel(ctx), meta.UserID, estimate, call.PromptTokens+call.CompletionTokens)
 	return resp, err
 }

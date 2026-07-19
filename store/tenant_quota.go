@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/types"
 )
@@ -78,7 +80,12 @@ func (b QuotaBucket) IsFinancial() bool { return financialBuckets[b] }
 //     要接线得先让抓取携带触发者身份，那是接缝②的活。
 //   - push / fetch：DoS 面，不花钱，优先级低于财务面。
 var enforcedBuckets = map[QuotaBucket]string{
-	QuotaLLMTokens:   "llm.Do（全部 LLM 调用的唯一咽喉）",
+	// 值是**包名**，不是自由文案：守卫测试拿它去源码里核实那个包真的调用了
+	// TryConsumeForUser/TryConsume。前一版这里写的是一句人类可读的描述，
+	// 于是守卫只能校验"字符串非空"——把空串改成任意一句话就能谎称已接线，
+	// 而测试全绿（2026-07-19 审查实测）。自证式的守卫比没有守卫更糟，
+	// 因为它让人以为这件事有人在看。
+	QuotaLLMTokens:   "llm",
 	QuotaExaCalls:    "",
 	QuotaTikHubCalls: "",
 	QuotaPush:        "",
@@ -87,6 +94,18 @@ var enforcedBuckets = map[QuotaBucket]string{
 
 // IsEnforced 报告该桶是否真的有代码在扣它。
 func (b QuotaBucket) IsEnforced() bool { return enforcedBuckets[b] != "" }
+
+// ErrAmbiguousTenant 是"这个用户属于多个租户，无法判定该扣谁的额度"。
+//
+// **必须与一般数据库错误分开**，因为两者的正确处置相反：
+//   - DB 抖动是暂时的 ⇒ 放行（让抖动升级成全局 LLM 停摆，比超支一点糟糕得多）
+//   - 归属不明是确定性的 ⇒ 拒绝（重试一万次还是多行；而且此刻我们**根本不知道
+//     该记谁的账**，花一笔无法归属的钱正是这道护栏存在的理由）
+//
+// tenantderive.go 的设计说明里写着，用户加入多个租户时子查询会"在正确的时刻
+// 响亮失败"。若把它混进 CodeDatabase 走放行分支，那句承诺在花钱路径上就被消音了：
+// 该用户获得无限额度，而现场只留下一行 WARN。
+var ErrAmbiguousTenant = errors.New("用户归属多个租户，无法判定配额归属")
 
 // ErrQuotaExceeded 是配额不足。**刻意是哨兵错误而非 AppError**：
 // 调用方需要能 errors.Is 判定并走各自的降级路径（打分跳过、抓取推迟、推送延后），
@@ -117,20 +136,31 @@ func (s *Store) TryConsume(ctx context.Context, tenantID int64, bucket QuotaBuck
 		    AND LEAST(burst, tokens + rate * EXTRACT(EPOCH FROM (now() - updated_at))) >= $3
 		RETURNING tokens`,
 		tenantID, string(bucket), n).Scan(&remaining)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// 两种情况都走这里，且**都必须拒绝**：
-		//   - 余额不足（WHERE 的第二个条件没过）
-		//   - 桶不存在（租户没被 seed 过）
-		// 后者尤其重要：没有配额行 = 没有额度，而不是"无限额度"。
-		// 反过来（缺行即放行）会让"忘了 seed"变成一个静默的无限额度洞——
-		// 而它恰恰最可能发生在新租户身上，也就是最需要设防的那一刻。
-		return ErrQuotaExceeded
-	}
+	// 缺行即拒绝（余额不足或桶不存在）：没有配额行 = 没有额度，而不是"无限额度"。
+	// 反过来会让"忘了 seed"变成静默的无限额度洞——而它恰恰最可能发生在新租户身上，
+	// 也就是最需要设防的那一刻。
 	if err != nil {
-		return types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("扣减配额（tenant=%d bucket=%s）", tenantID, bucket), err)
+		return classifyQuotaErr(err, fmt.Sprintf("扣减配额（tenant=%d bucket=%s）", tenantID, bucket))
 	}
 	return nil
+}
+
+// classifyQuotaErr 把底层错误翻译成配额层的语义。
+//
+// 单列出来是因为两条扣减路径（TryConsume / TryConsumeForUser）必须给出一致的
+// 判定——判据分散在两处迟早漂移，而漂移的表现是"同一种故障在两条路径上一个
+// 拒绝一个放行"，极难发现。
+func classifyQuotaErr(err error, what string) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		// 两种情况都走这里，且都必须拒绝：余额不足、或桶不存在（租户没被 seed）。
+		return ErrQuotaExceeded
+	}
+	// 21000 cardinality_violation：子查询返回多行 ⇒ 用户归属多个租户。
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "21000" {
+		return ErrAmbiguousTenant
+	}
+	return types.NewAppError(types.CodeDatabase, what, err)
 }
 
 // QuotaDefault 是一个桶的初始参数。
@@ -235,12 +265,149 @@ func (s *Store) TryConsumeForUser(ctx context.Context, userID int64, bucket Quot
 		    AND LEAST(burst, tokens + rate * EXTRACT(EPOCH FROM (now() - updated_at))) >= $3
 		RETURNING tokens`,
 		userID, string(bucket), n).Scan(&remaining)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrQuotaExceeded
-	}
 	if err != nil {
-		return types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("扣减配额（user=%d bucket=%s）", userID, bucket), err)
+		return classifyQuotaErr(err, fmt.Sprintf("扣减配额（user=%d bucket=%s）", userID, bucket))
+	}
+	return nil
+}
+
+// AdjustForUser 按 delta **无条件**调整余额（正数=退还，负数=补扣），允许扣成负数。
+//
+// 这是"事前预扣估算、事后对账实际"里的事后那一半，与 TryConsumeForUser 配对使用。
+// 三个设计点，每一个都是从一种具体的失效方式反推出来的：
+//
+//  1. **无条件**（WHERE 里没有余额判据）。带判据的版本在余额不足时整条 UPDATE
+//     不匹配任何行，于是超出的用量被永久丢弃——桶显示还有余额，钱却已经花了。
+//     2026-07-19 审查实测：桶余额一旦低于单次用量，事后扣减每次都失败，
+//     只有事前那点预扣生效，而补充速率反超消耗速率，**桶不降反升**，
+//     放行 4.9 倍日额度且无上界。
+//  2. **允许为负**（迁移 025 刻意不加 tokens >= 0）。负数就是欠账。欠账被如实
+//     记下，下一次事前预扣就过不了，直到时间把余额补回正数——护栏因此自愈。
+//  3. **不封顶到 burst**。退还（delta>0）时若封顶，估算偏高的那部分就退不回来，
+//     长期使用会把桶系统性地压低。封顶只属于"按时间补充"，不属于对账。
+//
+// 桶不存在时静默无操作：这条路径跑在调用**之后**，此时拦截已无意义，
+// 而报错只会把一次成功的调用变成失败。缺行的拦截职责在事前那一半。
+func (s *Store) AdjustForUser(ctx context.Context, userID int64, bucket QuotaBucket, delta float64) error {
+	if delta == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE tenant_quota
+		    SET tokens = LEAST(burst, tokens + rate * EXTRACT(EPOCH FROM (now() - updated_at))) + $3,
+		        updated_at = now()
+		  WHERE tenant_id = `+tenantOfUser+`$1)
+		    AND bucket = $2`,
+		userID, string(bucket), delta)
+	if err != nil {
+		return classifyQuotaErr(err, fmt.Sprintf("对账配额（user=%d bucket=%s）", userID, bucket))
+	}
+	return nil
+}
+
+// TestQuota_DebtIsAllowedBySchema 在 store 侧单独钉住"表允许负余额"这条 schema 性质。
+//
+// 为什么它值得一条独立守卫：ReconcileQuota 把对账失败降级成一行 Warn（刻意的——
+// 调用已经发生，报错只会把成功的回复变成失败）。于是**如果表上还有 tokens >= 0
+// 的 CHECK，负债写入会被约束拒绝、被 Warn 吞掉，整个欠账机制静默失效**，
+// 而上层行为测试只会看到"余额没变负"，很容易被误判成代码逻辑写错。
+//
+// 2026-07-19 实测过这个误导：本地库因迁移已应用而保留着旧 CHECK，行为测试变红，
+// 现象与"AdjustForUser 写错了"完全一致。这条守卫直接对着 schema 断言，一眼分清。
+
+// ReconcileTenantQuota 给所有缺配额行的租户补齐默认额度，返回补齐的租户数。
+//
+// 为什么需要它（而不是只靠建租户时 seed 一次）：
+//
+//  1. **seed 失败是静默的**。CreateTenantWithInvite / RegisterWithPassword 都把
+//     SeedTenantQuota 的错误降级成一行日志——那是对的，把它塞进事务会让一次
+//     seed 失败升级成整个注册失败。代价是用户注册"成功"却什么都用不了，
+//     而且他和管理员都看不出为什么。启动 reconcile 把这个代价收了回来。
+//  2. **迁移可能漏回填**。025 第一版就漏了：只 CREATE TABLE，没给 018 建的存量
+//     租户（生产租户本人）建行，配合"缺行即拒绝"上线即锁死推送，而且下游把
+//     额度用尽当正常终态处理——Temporal 一片绿、零告警。回填已补，
+//     但"下一个迁移会不会再漏"不该靠记性。
+//
+// 与本仓 scheduler.ReconcileActions 同一个模式：启动时把存量对象补齐到当前代码
+// 期望的形状，幂等且 best-effort。
+//
+// 刻意**不做懒加载**（在 TryConsume 里发现缺行就补）：那会让"缺行即拒绝"这条
+// 失败方向失效——而它防的是"新增了桶却忘了 seed"变成静默的无限额度洞。
+// 启动时补齐是一次可观测的批量动作，懒加载是每次调用都可能悄悄放行。
+func (s *Store) ReconcileTenantQuota(ctx context.Context) (int, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT t.id FROM tenants t
+		  WHERE t.status <> 'deleting'
+		    AND NOT EXISTS (SELECT 1 FROM tenant_quota q WHERE q.tenant_id = t.id)
+		  ORDER BY t.id`)
+	if err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "查询缺配额的租户", err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, types.NewAppError(types.CodeDatabase, "扫描缺配额的租户", err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "遍历缺配额的租户", err)
+	}
+
+	n := 0
+	for _, id := range ids {
+		if err := s.SeedTenantQuota(ctx, id); err != nil {
+			// best-effort：一个租户补不上不该挡住其余租户，更不该挡住服务启动。
+			slog.Error("补齐租户配额失败", "tenant_id", id, "err", err)
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
+// SetQuota 调整某个桶的每日额度（同时改速率与容量），余额按比例保留。
+//
+// 按比例而非重置：管理员调额度时，"已经用掉多少"这个事实不该被抹掉——
+// 重置成满格会让"调高额度"变成一条绕过配额的免费通道（用完了就调一下）。
+func (s *Store) SetQuota(ctx context.Context, tenantID int64, bucket QuotaBucket, perDay float64) error {
+	if perDay < 0 {
+		return types.NewAppError(types.CodeValidation, "每日额度不能为负", nil)
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE tenant_quota
+		    SET tokens = CASE WHEN burst > 0 THEN LEAST($3, tokens / burst * $3) ELSE $3 END,
+		        rate   = $3 / 86400,
+		        burst  = $3,
+		        updated_at = now()
+		  WHERE tenant_id = $1 AND bucket = $2`,
+		tenantID, string(bucket), perDay)
+	if err != nil {
+		return classifyQuotaErr(err, fmt.Sprintf("设置配额（tenant=%d bucket=%s）", tenantID, bucket))
+	}
+	if tag.RowsAffected() == 0 {
+		return types.NewAppError(types.CodeNotFound,
+			fmt.Sprintf("租户 %d 没有 %s 桶", tenantID, bucket), nil)
+	}
+	return nil
+}
+
+// RefillQuota 把余额直接补满到桶容量。救援用：额度用尽时立刻恢复服务，
+// 不必等按秒补充，也不必为了救急而永久调高额度。
+func (s *Store) RefillQuota(ctx context.Context, tenantID int64, bucket QuotaBucket) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE tenant_quota SET tokens = burst, updated_at = now()
+		  WHERE tenant_id = $1 AND bucket = $2`,
+		tenantID, string(bucket))
+	if err != nil {
+		return classifyQuotaErr(err, fmt.Sprintf("补满配额（tenant=%d bucket=%s）", tenantID, bucket))
+	}
+	if tag.RowsAffected() == 0 {
+		return types.NewAppError(types.CodeNotFound,
+			fmt.Sprintf("租户 %d 没有 %s 桶", tenantID, bucket), nil)
 	}
 	return nil
 }

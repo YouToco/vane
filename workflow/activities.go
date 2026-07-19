@@ -311,7 +311,11 @@ func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error {
 	if a.refuseIfTenantGone(ctx, in.UserID, "evolve_profile") {
 		return nil // 正常终态，不报错——报错会触发重试，而重试同样会被拒。
 	}
-	return a.evolver.Evolve(ctx, in.UserID, in.TraceID)
+	// retryableOrNot：Evolve 内部会经 llm.Do 撞上配额，而裸 *AppError 跨 activity
+	// 边界后 Temporal 取的 Type 是 Go 类型名 "AppError"，NonRetryableErrorTypes
+	// 匹配不到 —— 于是额度用尽会被白重试三次（额度按秒补，三次必然都失败），
+	// 徒增噪音还把明确原因埋进一串重试错误里。
+	return retryableOrNot(a.evolver.Evolve(ctx, in.UserID, in.TraceID))
 }
 
 // Fetch 现查用户的 active 订阅源，逐源抓取入库并推进各源抓取状态，最后返回
@@ -1117,8 +1121,19 @@ func emptyResultMarkdown(gate types.BatchExitGate, c types.PipelineCounts) strin
 	case types.BatchExitGateQuota:
 		// 刻意不说"没有新内容"——内容很可能是有的，只是没额度去处理它。
 		// 说成"没内容"会让人去改画像、换信源，白折腾一圈还找不到原因。
-		return "⏳ 本次推送暂停：本租户的 AI 额度已用尽。额度会随时间自动恢复，" +
-			"恢复后定时任务会照常送达；如需更高额度请联系管理员。"
+		//
+		// 三件事必须都说到，缺一件用户就只能干等：**发生了什么**（额度用尽，
+		// 不是没内容）、**会不会自己好**（会，按时间恢复）、**要不要做什么**
+		// （持续出现才需要找管理员）。只说前两件会让反复撞额度的人一直等下去。
+		msg := "⏳ 本次推送暂停：AI 额度已用尽，本轮内容没有处理。\n\n" +
+			"额度按时间自动恢复，通常下一轮定时推送即可恢复正常，无需操作。\n" +
+			"若连续多轮都收到本提示，说明用量持续超出配额，请联系管理员调整额度。"
+		if n := nz(c.Fetched); n > 0 {
+			// 报出抓到多少条，是为了让"内容是有的、只是没能处理"这句话可被验证，
+			// 而不是一句需要用户信任的断言。
+			msg += fmt.Sprintf("\n\n（本轮已抓取 %d 条内容，额度恢复后会重新参与筛选）", n)
+		}
+		return msg
 	case types.BatchExitGateCardGen:
 		return "📭 本次推送没有新内容：卡片生成后无可推条目。"
 	default:

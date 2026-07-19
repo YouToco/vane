@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go.temporal.io/sdk/client"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"go.temporal.io/sdk/activity"
@@ -363,5 +365,63 @@ func TestEmptyResultMarkdown_QuotaIsHonest(t *testing.T) {
 	}
 	if !strings.Contains(txt, "恢复") {
 		t.Errorf("必须说明会自动恢复，否则用户以为坏了会去反复重试：%q", txt)
+	}
+}
+
+// TestPushPipelineWorkflow_QuotaNotifiesEvenOnScheduledRun 守住"额度用尽必须通知"，
+// 尤其是**定时批**——而定时批恰恰是被 userTriggered 门控挡掉的那一类。
+//
+// 这条防的是一个完全静默的故障：额度用尽 → 空批次正常终态 → 通知被门控挡掉 →
+// 用户的早报无声消失。他无从判断是没新闻、服务挂了、还是自己欠费，
+// 三种情况在他那里长得一模一样。而额度用尽主要就发生在定时批上（它是最大的一笔消耗），
+// 也就是说门控恰好把最需要通知的场景全挡住了。
+func TestPushPipelineWorkflow_QuotaNotifiesEvenOnScheduledRun(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		wfID       string
+		gate       types.BatchExitGate
+		wantNotify bool
+	}{
+		{"定时批撞额度必须通知", "wf-push-1-abc-2026-07-20T00:30:00Z", types.BatchExitGateQuota, true},
+		{"定时批没新内容保持静默", "wf-push-1-abc-2026-07-20T00:30:00Z", types.BatchExitGateFetch, false},
+		{"用户触发没新内容也通知", "push-adhoc-1-xyz", types.BatchExitGateFetch, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var suite testsuite.WorkflowTestSuite
+			env := suite.NewTestWorkflowEnvironment()
+			env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: tc.wfID})
+
+			var notified atomic.Int64
+			g := gateStubs{}
+			if tc.gate == types.BatchExitGateQuota {
+				// 撞额度：给足前置数据，让流程走到 Score 才失败。
+				g.out = gateOut{items: make([]types.ContentItem, 5), deduped: make([]types.ContentItem, 5)}
+			}
+			g.register(env)
+			env.RegisterActivityWithOptions(
+				func(context.Context, NotifyEmptyIn) error { notified.Add(1); return nil },
+				activity.RegisterOptions{Name: "NotifyEmptyResult"})
+			if tc.gate == types.BatchExitGateQuota {
+				env.RegisterActivityWithOptions(
+					func(context.Context, ScoreIn) ([]types.ScoredItem, error) {
+						return nil, nonRetryable(types.NewAppError(types.CodeQuotaExceeded, "额度用尽", nil))
+					}, activity.RegisterOptions{Name: "Score"})
+			}
+
+			env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{UserID: 7, ScheduleID: "s1"})
+			if err := env.GetWorkflowError(); err != nil {
+				t.Fatalf("应为正常终态: %v", err)
+			}
+
+			got := notified.Load() > 0
+			if got != tc.wantNotify {
+				if tc.wantNotify {
+					t.Errorf("闸门 %s 必须通知用户，实际静默 —— "+
+						"早报无声消失，用户分不清是没新闻、服务挂了、还是欠费", tc.gate)
+				} else {
+					t.Errorf("闸门 %s 在定时批上应保持静默（每天一条「今天没新闻」是噪音），实际发了通知", tc.gate)
+				}
+			}
+		})
 	}
 }
