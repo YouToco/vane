@@ -159,6 +159,8 @@ type Store interface {
 	// ScheduleSourceForContent 取内容在本任务源集里的命中源（content_sources ∩ schedule_sources）。
 	// 隔离任务构卡时用它标源，而非全局首发源 content_items.source_id（#8 卡片源归属）。
 	ScheduleSourceForContent(ctx context.Context, contentItemID int64, scheduleID string) (int64, bool, error)
+	// TenantLiveForUser 报告该用户所属租户是否仍在服务中（D9 软删除的执行面）。
+	TenantLiveForUser(ctx context.Context, userID int64) (bool, error)
 }
 
 // Activities 持有 6 步 pipeline 的全部依赖，方法即 Temporal Activity。
@@ -266,12 +268,40 @@ type RecordEmptyIn struct {
 // 只 warn 并跳过；只有"整批全军覆没"才返回错误触发 Temporal 重试。
 // ============================================================
 
+// refuseIfTenantGone 是 D9 软删除的**执行面**：注销若不落到这一层，
+// 「已注销」就只是数据库里的一个标记——定时调度照跑、Exa/TikHub/LLM 照花钱、
+// 推送照发到对方手机上。落库只是记账，这里才是真的停下来。
+//
+// 装在**每个开始花钱的活动**开头（EvolveProfile 花 LLM、Fetch 花 Exa/TikHub），
+// 而不是只装在 workflow 入口：新增 workflow 步骤会改变 Temporal 的执行历史，
+// 在途 workflow 重放时解不出新命令（契约 §8.2）；装进既有活动则零重放风险。
+//
+// 查询失败时**放行**而不是拦截：这是一道旁路闸门，数据库抖一下就让全部用户停推
+// 是更坏的失败方向。真正的兜底在登录层（LookupSession 拒绝已注销租户的会话）。
+func (a *Activities) refuseIfTenantGone(ctx context.Context, userID int64, stage string) bool {
+	live, err := a.store.TenantLiveForUser(ctx, userID)
+	if err != nil {
+		slog.Warn("租户服务状态查询失败，本次放行（旁路闸门不阻塞主流程）",
+			"user_id", userID, "stage", stage, "err", err)
+		return false
+	}
+	if !live {
+		slog.Info("租户已注销，跳过本步骤——不为已注销租户花钱",
+			"user_id", userID, "stage", stage)
+		return true
+	}
+	return false
+}
+
 // EvolveProfile 画像演化前置步（契约 §8.1）。evolver 未注入时 no-op：统编阶段
 // 可先不传 evolver 灰度上线，pipeline 行为与 M4 完全一致。错误原样上抛交给
 // RetryPolicy；重试耗尽后由 workflow 侧吞掉——演化失败永不阻断推送（红线）。
 func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error {
 	if a.evolver == nil {
 		return nil
+	}
+	if a.refuseIfTenantGone(ctx, in.UserID, "evolve_profile") {
+		return nil // 正常终态，不报错——报错会触发重试，而重试同样会被拒。
 	}
 	return a.evolver.Evolve(ctx, in.UserID, in.TraceID)
 }
@@ -287,6 +317,12 @@ func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error {
 //   - #7 抓取状态死代码：每源抓取后调 markFetchResult 真正推进 fail_count / 时间戳。
 //   - #6 成本护栏：返回时用 maxScoreCandidates 截断候选，避免积压内容一次性打爆 LLM。
 func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentItem, error) {
+	// D9：已注销租户不抓取——Exa/TikHub 按次计费，这里是花钱的起点。
+	// 返回空候选而非报错：空候选走 workflow 既有的空批次早退路径（正常终态、不推送），
+	// 报错则会重试三次、每次都被同样拒绝，白白制造噪音。
+	if a.refuseIfTenantGone(ctx, p.UserID, "fetch") {
+		return nil, nil
+	}
 	// 任务手册 P1b b3 的分流开关：本次触发绑定的定时任务若已编译出源（schedule_sources 非空），
 	// 则「只按本任务的源抓/挑」（决策 #3 自包含）；否则退回用户级（决策 #4 老任务不变，push_now
 	// 的 ScheduleID 为空也走这里）。生产里没建过带源手册的任务时 planScoped 恒 false，b3 休眠。
