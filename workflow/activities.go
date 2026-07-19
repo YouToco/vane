@@ -156,6 +156,9 @@ type Store interface {
 	MarkDeliverySent(ctx context.Context, id int64, feishuMessageID string, cardJSON json.RawMessage, sentAt time.Time) error
 	// GetSource 按 id 查信源（卡片改版：subtitle 需要 source.Title 和 Platform）。
 	GetSource(ctx context.Context, id int64) (*types.Source, error)
+	// ScheduleSourceForContent 取内容在本任务源集里的命中源（content_sources ∩ schedule_sources）。
+	// 隔离任务构卡时用它标源，而非全局首发源 content_items.source_id（#8 卡片源归属）。
+	ScheduleSourceForContent(ctx context.Context, contentItemID int64, scheduleID string) (int64, bool, error)
 }
 
 // Activities 持有 6 步 pipeline 的全部依赖，方法即 Temporal Activity。
@@ -885,8 +888,18 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			URL:         card.Scored.Item.URL,
 			PublishedAt: card.Scored.Item.PublishedAt,
 		}
-		if card.Scored.Item.SourceID != 0 {
-			if src, serr := a.store.GetSource(ctx, card.Scored.Item.SourceID); serr == nil {
+		// 源归属（#8）：默认用全局首发源 content_items.source_id；隔离任务（ScheduleID 非空）
+		// 改用「本任务通过哪个源看到它」——content_sources ∩ schedule_sources 的命中源，否则会给
+		// 隔离任务的卡打上一个该任务根本不含的源名（首发源可能是用户订阅的另一个源）。无交集/查询
+		// 失败静默回退首发源（不因源归属这一显示细节而中断推送）。
+		displaySourceID := card.Scored.Item.SourceID
+		if in.ScheduleID != "" && card.Scored.Item.ID != 0 {
+			if tsid, ok, terr := a.store.ScheduleSourceForContent(ctx, card.Scored.Item.ID, in.ScheduleID); terr == nil && ok {
+				displaySourceID = tsid
+			}
+		}
+		if displaySourceID != 0 {
+			if src, serr := a.store.GetSource(ctx, displaySourceID); serr == nil {
 				ci.SourceTitle = src.Title
 				ci.Platform = src.Platform
 			}
