@@ -106,6 +106,36 @@ func TestResultCache_LRUEviction(t *testing.T) {
 	}
 }
 
+// 时间戳并列逐出回归（2026-07-19 Windows 实 bug）：时钟粒度粗（Windows tick
+// 0.5–15.6ms）时同 tick 连续 put 的 at 完全相同，按 at 扫描要么选不出牺牲者
+//（严格 Before + time.Now() 初值 → delete("") 静默无效、缓存越限），要么随机
+// 逐出（map 迭代序）。注入统一的未来时刻钉死并列形态——未来值保证「无条目
+// 严格早于扫描时刻」，是同 tick 相等的确定性等价物，不依赖平台时钟粒度；
+// 上面的 TestResultCache_LRUEviction 则保留真实时钟路径（正是抓住 bug 的那个）。
+func TestResultCache_EvictOldest_TimestampTie(t *testing.T) {
+	c := newResultCache()
+	h1 := c.put(1, "ep", []byte(`{}`))
+	h2 := c.put(1, "ep", []byte(`{}`))
+	h3 := c.put(1, "ep", []byte(`{}`))
+	tie := time.Now().Add(time.Hour)
+	c.mu.Lock()
+	for _, e := range c.entries {
+		e.at = tie
+	}
+	c.evictOldestLocked()
+	_, has1 := c.entries[h1]
+	_, has2 := c.entries[h2]
+	_, has3 := c.entries[h3]
+	n := len(c.entries)
+	c.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("全员同时间戳时逐出失效：len=%d，want 2", n)
+	}
+	if has1 || !has2 || !has3 {
+		t.Errorf("并列时应按存入序号逐出最早的 %s：has1=%v has2=%v has3=%v", h1, has1, has2, has3)
+	}
+}
+
 func TestSummarizeJSONStructure(t *testing.T) {
 	shape := summarizeJSONStructure([]byte(`{"code":200,"data":{"items":[{"id":"a","user":{"n":1}}],"cursor":"x"}}`))
 	for _, want := range []string{"code:num", "array[1]", "cursor:str"} {
