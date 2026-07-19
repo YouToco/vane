@@ -252,3 +252,104 @@ func TestInvariant_EveryBucketIsClassified(t *testing.T) {
 		}
 	}
 }
+
+// TestQuota_TryConsumeForUser_DerivesTenant：按 userID 扣减必须落到他的租户上。
+// 这条路径是给 llm/fetcher 这些拿不到 tenant_id 的层用的，推导错了会扣到别人头上。
+func TestQuota_TryConsumeForUser_DerivesTenant(t *testing.T) {
+	st := quotaStore(t)
+	ctx := t.Context()
+
+	u, err := st.UpsertUserByOpenID(ctx, "quota_derive_"+uuid.NewString(), "推导测试")
+	if err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	code := uniqueCode(t, "qderive")
+	if _, err := st.IssueInvite(ctx, code, nil, 1, nil); err != nil {
+		t.Fatalf("签发邀请码失败: %v", err)
+	}
+	tn, err := st.CreateTenantWithInvite(ctx, code, u.ID)
+	if err != nil {
+		t.Fatalf("建租户失败: %v", err)
+	}
+	t.Cleanup(func() {
+		c, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(c, t, st, `DELETE FROM tenant_quota WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM memberships WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM invites WHERE code = $1`, code)
+		cleanupExec(c, t, st, `DELETE FROM tenants WHERE id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM users WHERE id = $1`, u.ID)
+	})
+
+	setBucket(t, st, tn.ID, QuotaLLMTokens, 100, 0, 1000)
+	if err := st.TryConsumeForUser(ctx, u.ID, QuotaLLMTokens, 30); err != nil {
+		t.Fatalf("按 userID 扣减应成功: %v", err)
+	}
+	sts, err := st.ListQuota(ctx, tn.ID)
+	if err != nil {
+		t.Fatalf("查配额失败: %v", err)
+	}
+	for _, s := range sts {
+		if s.Bucket == QuotaLLMTokens && (s.Tokens < 69.9 || s.Tokens > 70.1) {
+			t.Errorf("扣减应落到该用户的租户上（100-30=70），实得 %.1f —— 推导错了会扣到别人头上", s.Tokens)
+		}
+	}
+}
+
+// TestQuota_NoMembershipIsDenied：用户不属于任何租户时拒绝，而不是不受限。
+// 与"桶不存在即拒绝"同一个失败方向：没有归属就没有额度。
+func TestQuota_NoMembershipIsDenied(t *testing.T) {
+	st := quotaStore(t)
+	ctx := t.Context()
+	u, err := st.UpsertUserByOpenID(ctx, "quota_orphan_"+uuid.NewString(), "无归属")
+	if err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	t.Cleanup(func() {
+		c, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(c, t, st, `DELETE FROM users WHERE id = $1`, u.ID)
+	})
+
+	if err := st.TryConsumeForUser(ctx, u.ID, QuotaLLMTokens, 1); !errors.Is(err, ErrQuotaExceeded) {
+		t.Errorf("无租户归属的用户必须被拒（没有归属=没有额度），实得 %v", err)
+	}
+}
+
+// TestInvariant_EnforcementStatusIsExplicit：每个桶都必须在 enforcedBuckets 里
+// 有一条记录（哪怕是空串"未接线"）。
+//
+// 守的是一个很容易犯、且完全静默的错：新增一个桶、seed 上去、在管理页显示出来，
+// 但从没写扣减代码。此后它看起来像一道护栏，实际一次也拦不住——
+// 而"看起来有护栏"比"知道没护栏"更危险，因为后者至少还会有人去看账单。
+func TestInvariant_EnforcementStatusIsExplicit(t *testing.T) {
+	for _, q := range defaultQuotas {
+		if _, ok := enforcedBuckets[q.Bucket]; !ok {
+			t.Errorf("桶 %s 没有在 enforcedBuckets 里声明接线状态 —— "+
+				"新增桶必须显式说明它在哪扣，或显式承认尚未接线（空串）。"+
+				"漏声明会让一个从不扣减的桶看起来像一道护栏", q.Bucket)
+		}
+	}
+	for b := range enforcedBuckets {
+		found := false
+		for _, q := range defaultQuotas {
+			if q.Bucket == b {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("enforcedBuckets 里的 %s 不在 defaultQuotas 中 —— "+
+				"新租户不会有这个桶，而「缺行即拒绝」会让它直接拦死业务", b)
+		}
+	}
+}
+
+// TestInvariant_LLMBucketIsEnforced 单独把 LLM 桶钉住。
+// 它是当前唯一真正接线的桶，也是花钱最多的一个：这条声明若被改成空串
+// （比如接线被回退了却忘了改状态表），必须立刻可见。
+func TestInvariant_LLMBucketIsEnforced(t *testing.T) {
+	if !QuotaLLMTokens.IsEnforced() {
+		t.Error("llm_tokens 是当前唯一接线的桶，也是最费钱的一个 —— " +
+			"它若变成未接线，配额系统就只剩一张好看的表")
+	}
+}

@@ -2,6 +2,9 @@ package llm
 
 import (
 	"context"
+	"errors"
+	"github.com/YouToco/vane/store"
+	"log/slog"
 	"time"
 
 	"github.com/YouToco/vane/types"
@@ -20,6 +23,20 @@ type CallMeta struct {
 // 失败也要记账（error 字段填原因），否则限流/超时这类最需要观测的
 // 失败反而在 llm_calls 里不可见。
 func Do(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Request) (*Response, error) {
+	// 配额闸门在**发请求之前**（契约 §2.7，D3 财务护栏）。放这里而不是各业务层，
+	// 是因为 llm.Do 是全部 LLM 调用的唯一咽喉——打分、出卡、agent、深挖、演化、A2A
+	// 都从这过。装在业务层则每加一条新调用路径就要记得加一次闸门，而"忘了加"
+	// 不会有任何报错，只会表现为某条路径不受限。
+	if err := rec.CheckQuota(ctx, meta.UserID); err != nil {
+		if errors.Is(err, store.ErrQuotaExceeded) {
+			return nil, types.NewAppError(types.CodeQuotaExceeded,
+				"本租户的 LLM 额度已用尽，稍后会随时间自动恢复", nil)
+		}
+		// 配额查询本身出错（数据库抖动等）：**放行**。
+		// 这是旁路闸门，让 DB 抖动升级成全局 LLM 停摆，比"超额一点"糟糕得多。
+		slog.Warn("llm: 配额查询失败，本次放行", "err", err)
+	}
+
 	start := time.Now()
 	resp, err := c.Complete(ctx, req)
 
@@ -67,5 +84,8 @@ func Do(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Reques
 	// 失败路径的 ctx 往往已经超时/取消，直接用它写库必然失败，
 	// 与"失败也要记账"矛盾——记账用 WithoutCancel 剥离取消信号。
 	rec.Record(context.WithoutCancel(ctx), call)
+	// 扣实际用量：用 WithoutCancel，理由同记账——调用已完成，不该因为上游 ctx
+	// 被取消就漏扣，那会让取消变成一条绕过配额的免费通道。
+	rec.ConsumeQuota(context.WithoutCancel(ctx), meta.UserID, call.PromptTokens+call.CompletionTokens)
 	return resp, err
 }

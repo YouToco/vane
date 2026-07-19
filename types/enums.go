@@ -114,10 +114,14 @@ const (
 type BatchExitGate string
 
 const (
-	BatchExitGateFetch   BatchExitGate = "fetch"   // 抓取后无候选：压根没抓到新内容
-	BatchExitGateDedup   BatchExitGate = "dedup"   // 去重后无候选：抓到了但全是重复
-	BatchExitGateScore   BatchExitGate = "score"   // 打分后无候选
-	BatchExitGateSelect  BatchExitGate = "select"  // 择优后无候选
+	BatchExitGateFetch  BatchExitGate = "fetch"  // 抓取后无候选：压根没抓到新内容
+	BatchExitGateDedup  BatchExitGate = "dedup"  // 去重后无候选：抓到了但全是重复
+	BatchExitGateScore  BatchExitGate = "score"  // 打分后无候选
+	BatchExitGateSelect BatchExitGate = "select" // 择优后无候选
+	// BatchExitGateQuota 额度用尽而非"没内容"。**必须与其它闸门区分开**：
+	// 走 score 闸门会告诉用户"打分后没有达标的"，而真相是根本没打分——
+	// 那是假话，且会让人以为是内容质量问题、跑去改画像或换信源。
+	BatchExitGateQuota   BatchExitGate = "quota"
 	BatchExitGateCardGen BatchExitGate = "cardgen" // 卡片生成后无候选
 )
 

@@ -65,6 +65,29 @@ var financialBuckets = map[QuotaBucket]bool{
 // IsFinancial 报告该桶是否属于财务面。
 func (b QuotaBucket) IsFinancial() bool { return financialBuckets[b] }
 
+// enforcedBuckets 记录**每个桶实际在哪里被扣减**。空串 = 尚未接线：
+// 桶已建好、有余额、能查询，但没有任何代码去扣它，因此它拦不住任何东西。
+//
+// 单列这张表的唯一理由是：**半接的配额比完全不接更危险**——桶存在、
+// ListQuota 查得到数字、看起来一切就绪，于是没人会再去想"Exa 到底受不受限"。
+// 把未接线写成代码里的显式空串，比写在 PR 描述里可靠：PR 会沉底，代码不会。
+//
+// 未接线的三个各自卡在什么地方（2026-07-19）：
+//   - exa_calls / tikhub_calls：Fetcher.Fetch(ctx, src) 拿不到 user_id——
+//     source 是跨租户共享的，"谁触发了这次抓取"这个信息在抓取层根本不存在。
+//     要接线得先让抓取携带触发者身份，那是接缝②的活。
+//   - push / fetch：DoS 面，不花钱，优先级低于财务面。
+var enforcedBuckets = map[QuotaBucket]string{
+	QuotaLLMTokens:   "llm.Do（全部 LLM 调用的唯一咽喉）",
+	QuotaExaCalls:    "",
+	QuotaTikHubCalls: "",
+	QuotaPush:        "",
+	QuotaFetch:       "",
+}
+
+// IsEnforced 报告该桶是否真的有代码在扣它。
+func (b QuotaBucket) IsEnforced() bool { return enforcedBuckets[b] != "" }
+
 // ErrQuotaExceeded 是配额不足。**刻意是哨兵错误而非 AppError**：
 // 调用方需要能 errors.Is 判定并走各自的降级路径（打分跳过、抓取推迟、推送延后），
 // 而不是把它当成一般数据库错误一路上抛。
@@ -188,4 +211,36 @@ func (s *Store) ListQuota(ctx context.Context, tenantID int64) ([]QuotaStatus, e
 		out = append(out, st)
 	}
 	return out, rows.Err()
+}
+
+// TryConsumeForUser 按 user_id 扣减配额——租户在 SQL 里推导，调用方不必知道 tenant。
+//
+// 这是给 llm / fetcher 这些**拿不到 tenant_id 的层**准备的。它们只知道 userID，
+// 而把 tenantID 一路穿下去要改一串签名与替身。记账路径（InsertLLMCall）早就用
+// 同一个 tenantOfUser 子查询解决了这个问题，配额沿用它，两处口径也因此天然一致。
+//
+// 用户不属于任何租户时子查询返回 NULL，WHERE 不成立 ⇒ 拒绝。与"桶不存在即拒绝"
+// 同一个失败方向：**没有归属就没有额度**，而不是"没有归属就不受限"。
+func (s *Store) TryConsumeForUser(ctx context.Context, userID int64, bucket QuotaBucket, n float64) error {
+	if n <= 0 {
+		return nil
+	}
+	var remaining float64
+	err := s.pool.QueryRow(ctx,
+		`UPDATE tenant_quota
+		    SET tokens = LEAST(burst, tokens + rate * EXTRACT(EPOCH FROM (now() - updated_at))) - $3,
+		        updated_at = now()
+		  WHERE tenant_id = `+tenantOfUser+`$1)
+		    AND bucket = $2
+		    AND LEAST(burst, tokens + rate * EXTRACT(EPOCH FROM (now() - updated_at))) >= $3
+		RETURNING tokens`,
+		userID, string(bucket), n).Scan(&remaining)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrQuotaExceeded
+	}
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("扣减配额（user=%d bucket=%s）", userID, bucket), err)
+	}
+	return nil
 }

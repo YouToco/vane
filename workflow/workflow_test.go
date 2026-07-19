@@ -285,3 +285,83 @@ func TestPushPipelineWorkflow_RecordFailureDoesNotBreakNormalExit(t *testing.T) 
 		t.Fatal("记账活动应被调用过（哪怕注定失败）")
 	}
 }
+
+// TestPushPipelineWorkflow_QuotaExitsAsNormalTerminal：额度用尽必须走**正常终态 +
+// 专属闸门**，而不是 workflow 失败。
+//
+// 这条用例守的是一个用户直接能感受到的谎：额度用尽若混进 CodeLLMUnavailable，
+// workflow 会失败（用户什么提示都收不到，只能干等）；若混进 BatchExitGateScore，
+// 用户收到的是「打分后没有达标的」——那会让人跑去改画像、换信源，白折腾一圈还找不到原因。
+// 真相是额度用完了，而且会自动恢复。
+func TestPushPipelineWorkflow_QuotaExitsAsNormalTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stage string // 在哪个 activity 上撞额度
+	}{
+		{"打分阶段撞额度", "Score"},
+		{"出卡阶段撞额度", "CardGen"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var suite testsuite.WorkflowTestSuite
+			env := suite.NewTestWorkflowEnvironment()
+			g := gateStubs{out: gateOut{
+				items:    make([]types.ContentItem, 20),
+				deduped:  make([]types.ContentItem, 18),
+				scored:   make([]types.ScoredItem, 18),
+				selected: make([]types.ScoredItem, 5),
+			}}
+			g.register(env)
+			// 覆盖目标 activity，让它返回额度错误——与 activities.go 里
+			// 「整批全因配额失败」时返回的是同一个错误码。
+			// 与 activities.go 里真实返回的形态一致：经 nonRetryable 包装，
+			// Type 为错误码。桩若返回裸 AppError，测的就是一个生产中不存在的形态。
+			quotaErr := nonRetryable(types.NewAppError(types.CodeQuotaExceeded, "本租户 LLM 额度已用尽", nil))
+			switch tc.stage {
+			case "Score":
+				env.RegisterActivityWithOptions(
+					func(context.Context, ScoreIn) ([]types.ScoredItem, error) { return nil, quotaErr },
+					activity.RegisterOptions{Name: "Score"})
+			case "CardGen":
+				env.RegisterActivityWithOptions(
+					func(context.Context, CardGenIn) ([]GeneratedCard, error) { return nil, quotaErr },
+					activity.RegisterOptions{Name: "CardGen"})
+			}
+
+			env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{UserID: 7, ScheduleID: "push-7-x"})
+
+			if !env.IsWorkflowCompleted() {
+				t.Fatal("workflow 未结束")
+			}
+			if err := env.GetWorkflowError(); err != nil {
+				t.Fatalf("额度用尽是正常终态而非故障，实得错误: %v —— "+
+					"走失败路径用户收不到任何提示，只能干等着纳闷", err)
+			}
+			recorded, pushed := g.snapshot()
+			if len(pushed) != 0 {
+				t.Errorf("额度用尽不得走到 Push，实得 %d 次", len(pushed))
+			}
+			if len(recorded) != 1 {
+				t.Fatalf("应恰好记一行空批次，实得 %d 行", len(recorded))
+			}
+			if got := recorded[0].Gate; got != types.BatchExitGateQuota {
+				t.Errorf("闸门必须是 quota，实得 %q —— 记成 score 会让用户收到"+
+					"「打分后没有达标的」这句假话，跑去改画像换信源也找不到原因", got)
+			}
+		})
+	}
+}
+
+// TestEmptyResultMarkdown_QuotaIsHonest：额度闸门的文案不得说"没有新内容"。
+// 内容很可能是有的，只是没额度去处理它。
+func TestEmptyResultMarkdown_QuotaIsHonest(t *testing.T) {
+	txt := emptyResultMarkdown(types.BatchExitGateQuota, types.PipelineCounts{})
+	if strings.Contains(txt, "没有新内容") {
+		t.Errorf("额度文案不得说「没有新内容」——内容可能是有的，只是没额度处理：%q", txt)
+	}
+	if !strings.Contains(txt, "额度") {
+		t.Errorf("额度文案必须点明原因，否则用户无从判断该做什么：%q", txt)
+	}
+	if !strings.Contains(txt, "恢复") {
+		t.Errorf("必须说明会自动恢复，否则用户以为坏了会去反复重试：%q", txt)
+	}
+}

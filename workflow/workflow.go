@@ -130,6 +130,15 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	var scored []types.ScoredItem
 	scoreCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
 	if err := workflow.ExecuteActivity(scoreCtx, a.Score, ScoreIn{UserID: p.UserID, TraceID: traceID, Items: deduped}).Get(scoreCtx, &scored); err != nil {
+		// 额度用尽不是故障，是**正常终态**——和"没有新内容"同一类，只是原因不同。
+		// 让它走 workflow 失败会：① 在 Temporal 里堆一串红色的失败记录，
+		// ② 用户什么提示都收不到（失败路径不发通知），只能干等着纳闷。
+		// 导向空批次 + 专属闸门，用户会收到「额度用尽、会自动恢复」的人话。
+		if isQuotaFailure(err) {
+			recordEmpty(types.BatchExitGateQuota)
+			log.Info("额度用尽，本轮跳过打分", "trace_id", traceID)
+			return nil
+		}
 		return err
 	}
 	// 本闸门当前**够不着**（core review 时核实，不是猜的）：Score 只在
@@ -172,6 +181,11 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	var cards []GeneratedCard
 	cardCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
 	if err := workflow.ExecuteActivity(cardCtx, a.CardGen, CardGenIn{UserID: p.UserID, TraceID: traceID, Items: selected}).Get(cardCtx, &cards); err != nil {
+		if isQuotaFailure(err) {
+			recordEmpty(types.BatchExitGateQuota)
+			log.Info("额度用尽，本轮跳过出卡", "trace_id", traceID)
+			return nil
+		}
 		return err
 	}
 	// 同 Score：CardGen 整批全失败走 CodeLLMUnavailable 错误分支，空切片只在
@@ -193,10 +207,23 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	return nil
 }
 
+// isQuotaFailure 判定 activity 错误是否为额度用尽。
+//
+// 跨 activity 边界后错误已被 Temporal 包成 ApplicationError，原始类型丢失，
+// 只剩 Type 字符串——而 nonRetryable 正是把 AppError.Code 放进 Type 的。
+// 所以这里比对的是 Type，不是 errors.As。
+func isQuotaFailure(err error) bool {
+	var ae *temporal.ApplicationError
+	return errors.As(err, &ae) && ae.Type() == string(types.CodeQuotaExceeded)
+}
+
 // nonRetryableCodes 是确定性失败错误码：这类错误重试无意义（重试只是重复失败），
 // 交给 Temporal 的 NonRetryableErrorTypes 直接终止。要生效需 Activity 侧把
 // AppError 的 Code 作为 ApplicationError 的 Type 抛出（见报告"待主控复核"）。
 var nonRetryableCodes = []string{
+	// 额度按秒缓慢补充，而 Temporal 的重试在秒级内完成——重试三次只会失败三次，
+	// 白白制造噪音，还把"额度用尽"这个明确原因埋进一串重试错误里。
+	string(types.CodeQuotaExceeded),
 	string(types.CodeValidation),
 	string(types.CodeNotFound),
 	string(types.CodeConflict),

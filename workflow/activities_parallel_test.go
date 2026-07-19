@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go.temporal.io/sdk/temporal"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,9 @@ type ctrlScorer struct {
 	calls       int
 	delay       func(id int64) time.Duration
 	fail        func(id int64) bool
+	// failErr 非 nil 时，fail 命中返回它而不是通用错误——
+	// 用来构造"因配额而失败"这一类**带错误码**的失败。
+	failErr error
 	// block 非 nil 时，每次调用都阻塞到它被关闭，且**刻意不理会 ctx**——
 	// 用来把 goroutine 钉在信号量后面，制造「令牌被占满、其余都在排队」的局面。
 	block chan struct{}
@@ -52,6 +56,9 @@ func (s *ctrlScorer) Score(ctx context.Context, _ int64, item types.ContentItem,
 		}
 	}
 	if s.fail != nil && s.fail(item.ID) {
+		if s.failErr != nil {
+			return 0, s.failErr
+		}
 		return 0, errors.New("打分失败（测试构造）")
 	}
 	return float64(item.ID), nil
@@ -76,6 +83,7 @@ type ctrlCardGen struct {
 	maxInflight int
 	delay       func(id int64) time.Duration
 	fail        func(id int64) bool
+	failErr     error // 同 ctrlScorer.failErr
 }
 
 func (g *ctrlCardGen) Generate(ctx context.Context, _ int64, si types.ScoredItem, _ string) (string, error) {
@@ -99,6 +107,9 @@ func (g *ctrlCardGen) Generate(ctx context.Context, _ int64, si types.ScoredItem
 		}
 	}
 	if g.fail != nil && g.fail(si.Item.ID) {
+		if g.failErr != nil {
+			return "", g.failErr
+		}
 		return "", errors.New("生成失败（测试构造）")
 	}
 	return fmt.Sprintf("body-%d", si.Item.ID), nil
@@ -452,5 +463,63 @@ func TestScore_PanicAbortsRemainingWork(t *testing.T) {
 	// 真实退化远在其外：不取消时会跑满整批（3 倍扇出）。
 	if limit := parBatchFanout + parBatchFanout/2; calls > limit {
 		t.Errorf("panic 后仍有 %d 次调用，超过预期上限 %d —— 取消传播得不够快", calls, limit)
+	}
+}
+
+// TestScore_AllFailByQuotaIsNonRetryableQuotaError 守的是**跨 activity 边界后
+// 错误还认不认得出来**——这一段是 workflow 测试盖不到的。
+//
+// 为什么必须单独测：workflow 那侧用的是自己构造好的桩错误，因此它验证的是
+// 「编排层收到一个规范的配额错误后处理得对不对」，**碰不到 activities.go
+// 真正返回的是什么**。把这里的 nonRetryable 包装删掉，workflow 用例照样全绿——
+// 这正是本次会话反复吃亏的那类"夹具不含被测特征"。
+//
+// 而少了那层包装的后果很实：Temporal 取 Go 类型名 "AppError" 作 Type，于是
+// ① NonRetryableErrorTypes 匹配不到 → 白重试三次（额度按秒补，三次必然都失败）
+// ② 编排层 isQuotaFailure 认不出 → workflow 直接失败 → 用户什么提示都收不到。
+func TestScore_AllFailByQuotaIsNonRetryableQuotaError(t *testing.T) {
+	quota := types.NewAppError(types.CodeQuotaExceeded, "额度用尽（测试构造）", nil)
+	sc := &ctrlScorer{fail: func(int64) bool { return true }, failErr: quota}
+	a := newActivitiesWith(sc, fakeCardGen{})
+
+	_, err := a.Score(t.Context(), ScoreIn{UserID: 1, TraceID: "t", Items: itemsWithIDs(5)})
+	assertQuotaAppError(t, err, "Score")
+}
+
+// TestCardGen_AllFailByQuotaIsNonRetryableQuotaError：出卡一侧同一条。
+func TestCardGen_AllFailByQuotaIsNonRetryableQuotaError(t *testing.T) {
+	quota := types.NewAppError(types.CodeQuotaExceeded, "额度用尽（测试构造）", nil)
+	cg := &ctrlCardGen{fail: func(int64) bool { return true }, failErr: quota}
+	a := newActivitiesWith(fakeScorer{}, cg)
+
+	_, err := a.CardGen(t.Context(), CardGenIn{UserID: 1, TraceID: "t", Items: scoredWithIDs(4)})
+	assertQuotaAppError(t, err, "CardGen")
+}
+
+// assertQuotaAppError 断言错误是「Temporal 认得的、不可重试的配额错误」。
+// 断言 Type 而非 errors.As(*AppError)：Type 才是 Temporal 实际用来匹配
+// NonRetryableErrorTypes 和编排层用来判定的东西。
+func assertQuotaAppError(t *testing.T, err error, stage string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s 整批因配额失败必须报错", stage)
+	}
+	var ae *temporal.ApplicationError
+	if !errors.As(err, &ae) {
+		t.Fatalf("%s 应返回 ApplicationError（否则 Temporal 取 Go 类型名作 Type），实得 %T: %v", stage, err, err)
+	}
+	if ae.Type() != string(types.CodeQuotaExceeded) {
+		t.Errorf("%s 的错误 Type 应为 %q，实得 %q —— Type 不对则不可重试策略与"+
+			"编排层的配额识别同时失效：白重试三次，且 workflow 直接失败、用户收不到任何提示",
+			stage, types.CodeQuotaExceeded, ae.Type())
+	}
+	if !ae.NonRetryable() {
+		t.Errorf("%s 的配额错误必须不可重试 —— 额度按秒补充，而重试在秒级内完成，"+
+			"三次重试只是把同一个失败重复三遍", stage)
+	}
+	// 整批因配额失败不得被报成"LLM 挂了"：那会让排查方向完全跑偏。
+	var app *types.AppError
+	if errors.As(err, &app) && app.Code == types.CodeLLMUnavailable {
+		t.Errorf("%s 把配额失败报成了 LLM_UNAVAILABLE", stage)
 	}
 }

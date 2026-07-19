@@ -1213,7 +1213,7 @@ const tikhubMaxDescBytes = 4000
 // XHS app_v2 族 $0.010/req，web_v3 详情 $0.010，web_v3 热榜 $0.001，Twitter $0.001。
 // 未登记的端点**按最贵档**兜底（宁可多算不能少算——少算让预算看起来够、实际不够）。
 var tikhubEndpointPrice = map[string]float64{
-	"xiaohongshu_app_v2_search_notes":         0.010,
+	"xiaohongshu_app_v2_search_notes":          0.010,
 	"xiaohongshu_app_v2_get_user_posted_notes": 0.010,
 	"xiaohongshu_app_v2_get_topic_feed":        0.010,
 	"xiaohongshu_app_v2_get_user_faved_notes":  0.010,
