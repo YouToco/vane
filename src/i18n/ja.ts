@@ -1,0 +1,73 @@
+import type { Dict } from "./index";
+
+export const ja: Dict = {
+  brandName: "Vane",
+  landing: {
+    badge: "AI パーソナル・インテリジェンス · 招待制ベータ",
+    login: "ログイン",
+    heroL1: "ひとこと伝えるだけで、",
+    heroL2Pre: "あなたの",
+    heroL2Brand: "情報システム",
+    heroSub:
+      "何をウォッチしたいか伝えるだけ——AI が見張り、ノイズを取り除き、本当に重要なものだけを届けます。",
+    ctaStart: "はじめる",
+    ctaHow: "仕組みを見る",
+    demoPrompt: "Vane に伝える",
+    examples: [
+      {
+        label: "クリエイター追跡",
+        text: "あのクリエイターの RED 新着投稿をプッシュして",
+        result: "タスク作成済み · クリエイター1名 · リアルタイム",
+      },
+      {
+        label: "業界デイリー",
+        text: "毎朝 AI 業界の動向を、宣伝記事は抜きで",
+        result: "タスク作成済み · 3ソース · 毎日 08:30",
+      },
+      {
+        label: "単発リサーチ",
+        text: "AI 開発ツールをレビューするブロガーを5人探して",
+        result: "単発タスク · アプリ内 + Lark で受け取り",
+      },
+      {
+        label: "競合ウォッチ",
+        text: "競合 A/B/C に動きがあれば教えて、週次まとめも",
+        result: "タスク作成済み · 3ターゲット · 週次ダイジェスト",
+      },
+    ],
+    showcaseTitlePre: "100件のうち、届くのは",
+    showcaseTitleBrand: "3件",
+    showcaseTitlePost: "だけ",
+    showcaseSub:
+      "Vane はあなたの全ソースを見張り、ノイズを門前で止める——それが存在理由のすべてです。",
+    feedIn: "流入",
+    feedOut: "あなたに届く",
+    unit: "件",
+    justNow: "たった今",
+    filterName: "Vane フィルター",
+    filterDesc: "理解 · 採点 · ノイズ除去",
+    sources: ["RSS", "RED", "X", "Web", "Podcast"],
+    tags: ["高関連", "重要更新", "読む価値あり"],
+    scenesTitle: "こんな使い方",
+    scenesSub: "ひとことが、ひとつの情報タスクに。",
+    stepsTitle: "仕組み",
+    steps: [
+      {
+        title: "ひとこと伝える",
+        desc: "ウォッチしたいことを Vane に。「ソース」「スケジュール」の知識は不要、翻訳はお任せ。",
+      },
+      {
+        title: "AI が見張る",
+        desc: "継続的に取得・理解・採点。宣伝記事と重複は門前でシャットアウト。",
+      },
+      {
+        title: "使うほど賢く",
+        desc: "👍と👎のひとつひとつが好みを学習。配信はフィードバックで進化し続けます。",
+      },
+    ],
+    ctaCardTitle: "「見張る」仕事を、手放そう",
+    ctaCardSub: "現在は招待制。招待されたら、ひとことで始められます。",
+    footerLine1: "Vane · 小さな兆しから、大きな流れを",
+    footerLine2: "AI パーソナル・インテリジェンス · 招待制ベータ",
+  },
+};

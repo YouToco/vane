@@ -1,0 +1,70 @@
+// 中文字典（source of truth）。en.ts 以 `Dict = typeof zh` 约束键齐全。
+export const zh = {
+  brandName: "见微 Vane",
+  landing: {
+    badge: "AI 个性化情报推送 · 邀请制内测中",
+    login: "登录",
+    heroL1: "说一句话，",
+    heroL2Pre: "建你的",
+    heroL2Brand: "情报系统",
+    heroSub: "告诉 AI 你想盯什么——它替你盯着、滤掉噪音，只推真正重要的。",
+    ctaStart: "开始使用",
+    ctaHow: "看看它怎么工作",
+    demoPrompt: "对 Vane 说",
+    examples: [
+      {
+        label: "博主追踪",
+        text: "帮我盯着 XX 的小红书，有新内容就推给我",
+        result: "已生成任务 · 盯 1 位博主 · 实时推送",
+      },
+      {
+        label: "行业日报",
+        text: "每天早上 AI 行业动态，过滤掉营销软文",
+        result: "已生成任务 · 3 个信源 · 每天 08:30",
+      },
+      {
+        label: "一次性调研",
+        text: "帮我找 5 个做 AI 开发工具评测的博主",
+        result: "一次性任务 · 结果页 + 飞书两路交付",
+      },
+      {
+        label: "竞品监控",
+        text: "竞品 A/B/C 有新动态时提醒我，一周一汇总",
+        result: "已生成任务 · 3 个目标 · 每周汇总",
+      },
+    ],
+    showcaseTitlePre: "100 条里，只推你 ",
+    showcaseTitleBrand: "3 条",
+    showcaseTitlePost: "",
+    showcaseSub: "Vane 盯着你的所有信源，把噪音留在门外——这就是它存在的全部理由。",
+    feedIn: "信息流入",
+    feedOut: "推送给你",
+    unit: "条",
+    justNow: "刚刚",
+    filterName: "Vane 过滤器",
+    filterDesc: "理解 · 打分 · 去噪",
+    sources: ["RSS", "小红书", "X", "网页", "播客"],
+    tags: ["高相关", "重要更新", "值得一读"],
+    scenesTitle: "你可以这样用",
+    scenesSub: "一句话，就是一个情报任务。",
+    stepsTitle: "它怎么工作",
+    steps: [
+      {
+        title: "说一句话",
+        desc: "把想盯的事告诉 Vane。不用懂「信源」「调度」，剩下的它来翻译。",
+      },
+      {
+        title: "AI 替你盯",
+        desc: "持续抓取、理解、打分。营销软文和重复信息，被挡在门外。",
+      },
+      {
+        title: "越用越准",
+        desc: "每一次👍和👎都在教它更懂你，推送随反馈持续进化。",
+      },
+    ],
+    ctaCardTitle: "把「盯着」这件事，交出去",
+    ctaCardSub: "目前邀请制开放。受邀后，一句话就能开工。",
+    footerLine1: "见微 Vane · 见微知著",
+    footerLine2: "AI 个性化情报推送 · 邀请制内测中",
+  },
+};

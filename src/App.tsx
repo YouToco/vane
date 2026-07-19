@@ -32,9 +32,9 @@ import {
   ShieldCheck,
   LogOut,
   Loader2,
-  Zap,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { LogoMark } from "@/components/brand/Logo";
 
 function useHash(): string {
   const [hash, setHash] = useState(location.hash || "#/");
@@ -108,9 +108,7 @@ function AppSidebar({
     <Sidebar>
       <SidebarHeader>
         <a href="#/" className="flex items-center gap-2 px-2 py-1">
-          <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <Zap className="size-4" />
-          </div>
+          <LogoMark />
           <div className="flex flex-col leading-tight">
             <span className="text-sm font-semibold">见微 Vane</span>
             <span className="text-[11px] text-muted-foreground">AI 情报系统</span>

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
-import { Loader2, Zap, Lock, Mail, Ticket } from "lucide-react";
+import { Loader2, Lock, Mail, Ticket } from "lucide-react";
+import { LogoMark } from "@/components/brand/Logo";
 import { api, ApiError } from "../api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -57,12 +58,10 @@ export default function Login() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 via-white to-slate-100 dark:from-slate-950 dark:via-slate-900 dark:to-slate-800 px-4">
+    <div className="min-h-screen flex items-center justify-center bg-background px-4">
       <div className="w-full max-w-sm">
         <div className="flex flex-col items-center mb-8 gap-3">
-          <div className="flex items-center justify-center w-12 h-12 rounded-2xl bg-primary shadow-lg">
-            <Zap className="w-6 h-6 text-primary-foreground" strokeWidth={2.5} />
-          </div>
+          <LogoMark className="size-12 rounded-xl shadow-lg" />
           <div className="text-center">
             <h1 className="text-2xl font-bold tracking-tight text-foreground">见微 Vane</h1>
             <p className="text-sm text-muted-foreground mt-0.5">AI 情报系统</p>

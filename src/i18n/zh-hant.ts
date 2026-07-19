@@ -1,0 +1,71 @@
+import type { Dict } from "./index";
+
+export const zhHant: Dict = {
+  brandName: "見微 Vane",
+  landing: {
+    badge: "AI 個人化情報推播 · 邀請制內測中",
+    login: "登入",
+    heroL1: "說一句話，",
+    heroL2Pre: "建你的",
+    heroL2Brand: "情報系統",
+    heroSub: "告訴 AI 你想盯什麼——它替你盯著、濾掉雜訊，只推真正重要的。",
+    ctaStart: "開始使用",
+    ctaHow: "看看它怎麼運作",
+    demoPrompt: "對 Vane 說",
+    examples: [
+      {
+        label: "創作者追蹤",
+        text: "幫我盯著 XX 的小紅書，有新內容就推播給我",
+        result: "已建立任務 · 盯 1 位創作者 · 即時推播",
+      },
+      {
+        label: "產業日報",
+        text: "每天早上 AI 產業動態，過濾掉業配文",
+        result: "已建立任務 · 3 個訊源 · 每天 08:30",
+      },
+      {
+        label: "一次性調查",
+        text: "幫我找 5 位評測 AI 開發工具的創作者",
+        result: "一次性任務 · 結果頁 + Lark 雙路交付",
+      },
+      {
+        label: "競品監控",
+        text: "競品 A/B/C 有新動態時提醒我，一週一彙整",
+        result: "已建立任務 · 3 個目標 · 每週彙整",
+      },
+    ],
+    showcaseTitlePre: "100 條裡，只推你 ",
+    showcaseTitleBrand: "3 條",
+    showcaseTitlePost: "",
+    showcaseSub: "Vane 盯著你的所有訊源，把雜訊留在門外——這就是它存在的全部理由。",
+    feedIn: "訊息流入",
+    feedOut: "推播給你",
+    unit: "條",
+    justNow: "剛剛",
+    filterName: "Vane 過濾器",
+    filterDesc: "理解 · 打分 · 去噪",
+    sources: ["RSS", "小紅書", "X", "網頁", "Podcast"],
+    tags: ["高相關", "重要更新", "值得一讀"],
+    scenesTitle: "你可以這樣用",
+    scenesSub: "一句話，就是一個情報任務。",
+    stepsTitle: "它怎麼運作",
+    steps: [
+      {
+        title: "說一句話",
+        desc: "把想盯的事告訴 Vane。不用懂「訊源」「排程」，剩下的它來翻譯。",
+      },
+      {
+        title: "AI 替你盯",
+        desc: "持續抓取、理解、打分。業配文和重複訊息，被擋在門外。",
+      },
+      {
+        title: "越用越準",
+        desc: "每一次👍和👎都在教它更懂你，推播隨回饋持續進化。",
+      },
+    ],
+    ctaCardTitle: "把「盯著」這件事，交出去",
+    ctaCardSub: "目前邀請制開放。受邀後，一句話就能開工。",
+    footerLine1: "見微 Vane · 見微知著",
+    footerLine2: "AI 個人化情報推播 · 邀請制內測中",
+  },
+};

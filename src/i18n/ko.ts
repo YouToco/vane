@@ -1,0 +1,73 @@
+import type { Dict } from "./index";
+
+export const ko: Dict = {
+  brandName: "Vane",
+  landing: {
+    badge: "AI 개인 인텔리전스 · 초대제 베타",
+    login: "로그인",
+    heroL1: "한 마디면 충분합니다,",
+    heroL2Pre: "당신의 ",
+    heroL2Brand: "정보 시스템",
+    heroSub:
+      "무엇을 지켜볼지 말해 주세요 — AI가 대신 지켜보고, 소음을 걸러내고, 정말 중요한 것만 보냅니다.",
+    ctaStart: "시작하기",
+    ctaHow: "작동 방식 보기",
+    demoPrompt: "Vane에게 말하기",
+    examples: [
+      {
+        label: "크리에이터 추적",
+        text: "그 크리에이터의 RED 새 글이 올라오면 바로 알려줘",
+        result: "작업 생성됨 · 크리에이터 1명 · 실시간",
+      },
+      {
+        label: "업계 데일리",
+        text: "매일 아침 AI 업계 동향, 광고성 글은 빼고",
+        result: "작업 생성됨 · 소스 3개 · 매일 08:30",
+      },
+      {
+        label: "일회성 리서치",
+        text: "AI 개발 도구를 리뷰하는 블로거 5명 찾아줘",
+        result: "일회성 작업 · 앱 내 결과 + Lark 전달",
+      },
+      {
+        label: "경쟁사 모니터링",
+        text: "경쟁사 A/B/C에 새 소식이 있으면 알려주고, 주간 요약도",
+        result: "작업 생성됨 · 대상 3곳 · 주간 다이제스트",
+      },
+    ],
+    showcaseTitlePre: "100건 중 ",
+    showcaseTitleBrand: "3건",
+    showcaseTitlePost: "만 도착합니다",
+    showcaseSub:
+      "Vane은 당신의 모든 소스를 지켜보며 소음을 문밖에 세워 둡니다 — 그것이 존재 이유의 전부입니다.",
+    feedIn: "유입",
+    feedOut: "당신에게 전달",
+    unit: "건",
+    justNow: "방금",
+    filterName: "Vane 필터",
+    filterDesc: "이해 · 채점 · 노이즈 제거",
+    sources: ["RSS", "RED", "X", "웹", "팟캐스트"],
+    tags: ["높은 관련성", "중요 업데이트", "읽을 가치"],
+    scenesTitle: "이렇게 쓸 수 있어요",
+    scenesSub: "한 마디가 곧 하나의 정보 작업.",
+    stepsTitle: "작동 방식",
+    steps: [
+      {
+        title: "한 마디 하기",
+        desc: "지켜보고 싶은 것을 Vane에게 말하세요. '소스'나 '스케줄'을 몰라도 알아서 번역합니다.",
+      },
+      {
+        title: "AI가 지켜보기",
+        desc: "지속적으로 수집·이해·채점. 광고성 글과 중복은 문밖에서 차단됩니다.",
+      },
+      {
+        title: "쓸수록 정확하게",
+        desc: "👍와 👎 하나하나가 취향을 학습시켜, 푸시가 피드백과 함께 진화합니다.",
+      },
+    ],
+    ctaCardTitle: "'지켜보는 일'을 맡겨 보세요",
+    ctaCardSub: "현재는 초대제입니다. 초대받으면 한 마디로 시작할 수 있어요.",
+    footerLine1: "Vane · 작은 조짐에서 큰 흐름을",
+    footerLine2: "AI 개인 인텔리전스 · 초대제 베타",
+  },
+};
