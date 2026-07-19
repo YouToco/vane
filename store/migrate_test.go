@@ -49,7 +49,7 @@ var wantTables = []string{
 	"schedule_playbooks",
 	// 020 任务手册 P1b：「任务 ↔ 源」软范围绑定
 	"schedule_sources",
-	// 025 per-tenant 配额（企业级契约 §2.7，D3 下的财务护栏）
+	// 026 per-tenant 配额（企业级契约 §2.7，D3 下的财务护栏）
 	"tenant_quota",
 }
 

@@ -491,13 +491,13 @@ func TestInvariant_SchemaAllowsDebt(t *testing.T) {
 	}
 }
 
-// TestInvariant_MigrationBackfillMatchesDefaults：025 的回填参数必须与 defaultQuotas 一致。
+// TestInvariant_MigrationBackfillMatchesDefaults：026 的回填参数必须与 defaultQuotas 一致。
 //
 // 两处各写一份是不得已（迁移是 SQL、代码是 Go），但漂移的后果不对称且隐蔽：
 // 存量租户拿到一套额度、新租户拿到另一套，而两者都"有配额行"，任何冒烟测试都发现不了。
 func TestInvariant_MigrationBackfillMatchesDefaults(t *testing.T) {
 	st := quotaStore(t)
-	// tenant 1 由迁移 018 建、025 回填；新租户由 SeedTenantQuota 建。两者应完全一致。
+	// tenant 1 由迁移 018 建、026 回填；新租户由 SeedTenantQuota 建。两者应完全一致。
 	migrated, err := st.ListQuota(t.Context(), 1)
 	if err != nil {
 		t.Fatalf("查 tenant 1 配额失败: %v", err)
