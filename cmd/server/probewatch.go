@@ -182,6 +182,10 @@ func (pw *probeWatcher) alert(ctx context.Context, openID, fingerprint, markdown
 		slog.Warn("probewatch: 告警卡发送失败（下轮重试）", "err", err)
 		return
 	}
+	// 成功也要留痕（2026-07-19 部署验证实证）：此前成功路径零日志，"发出去了"与
+	// "goroutine 压根没跑"在 journalctl 里不可区分，验证部署只能反向排除法 +
+	// 去飞书搜卡。巡检自身必须可观测——这行日志就是首轮巡检的存在证明。
+	slog.Info("probewatch: 告警卡已发送", "fingerprint", fingerprint)
 	pw.lastFingerprint = fingerprint
 }
 
