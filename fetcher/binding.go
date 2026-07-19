@@ -771,19 +771,27 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 		}
 	}
 	args, _ := json.Marshal(clean)
+	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
 		ToolName:     "binding:" + entry.Name,
 		ToolKind:     types.ToolCallKindBindingFetch,
 		EndpointPath: entry.Path,
 		Arguments:    args,
+		SourceID:     &srcID,
 	}
 	if res != nil {
 		status := res.Status
 		rec.HTTPStatus = &status
 		rec.DurationMs = res.DurationMs
 		rec.ResultSize = len(res.Body)
-		if res.Status < 200 || res.Status >= 300 {
+		if res.Status >= 200 && res.Status < 300 {
+			cost, ok := tikhubEndpointPrice[entry.Name]
+			if !ok {
+				cost = tikhubFallbackPrice
+			}
+			rec.CostUSD = &cost
+		} else {
 			rec.ErrorType = types.ToolErrHTTP
 		}
 	}
@@ -1200,6 +1208,21 @@ const twitterTimeLayout = "Mon Jan 02 15:04:05 -0700 2006"
 // tikhubMaxDescBytes 正文字节上限，防超长内容打爆打分 token（成本护栏）。
 // 截断按 rune 边界回退（truncateUTF8），绝不产生非法 UTF-8。（迁移自原 tikhub.go。）
 const tikhubMaxDescBytes = 4000
+
+// tikhubEndpointPrice 按端点查 TikHub 单价（tikhub.io 使用日志实查，非 200 不计费）。
+// XHS app_v2 族 $0.010/req，web_v3 详情 $0.010，web_v3 热榜 $0.001，Twitter $0.001。
+// 未登记的端点**按最贵档**兜底（宁可多算不能少算——少算让预算看起来够、实际不够）。
+var tikhubEndpointPrice = map[string]float64{
+	"xiaohongshu_app_v2_search_notes":         0.010,
+	"xiaohongshu_app_v2_get_user_posted_notes": 0.010,
+	"xiaohongshu_app_v2_get_topic_feed":        0.010,
+	"xiaohongshu_app_v2_get_user_faved_notes":  0.010,
+	"xiaohongshu_web_v3_fetch_note_detail":     0.010, // enrich 详情
+	"xiaohongshu_web_v3_fetch_hot_list":        0.001,
+	"twitter_web_fetch_user_post_tweet":        0.001,
+}
+
+const tikhubFallbackPrice = 0.010
 
 // SeenChecker 报告哪些 canonical_key **已入库且正文已补全**（生产实现是 *store.Store）。
 // 详情接口按次计费，已拿到全文的笔记不该每轮重复付费；判据是**正文长度**而非

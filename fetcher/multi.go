@@ -38,13 +38,13 @@ func NewMulti(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorder)
 	// 链接、不带正文，不补的话整批被 §12.3 护栏丢弃（2026-07-18 生产实证）。
 	// 复用已经构造好的 exaContents 取正文、复用 seen 做付费闸门，不新增装配参数。
 	rss := New(cfg)
-	exaContents := NewExaContents(cfg)
+	exaContents := NewExaContents(cfg, rec)
 	rss.enricher = exaContents
 	rss.seen = seen
 
 	return &Multi{
 		rss:         rss,
-		exa:         NewExa(cfg),
+		exa:         NewExa(cfg, rec),
 		exaContents: exaContents,
 		binding:     NewBinding(cfg, seen, rec),
 	}
