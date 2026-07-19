@@ -1,14 +1,12 @@
 import { useEffect, useState } from "react";
-import { api } from "./api";
+import { api, PLATFORM_OWNER_TENANT_ID } from "./api";
+import Landing from "./pages/Landing";
 import Login from "./pages/Login";
 import Home from "./pages/Home";
-import FeishuSetup from "./pages/FeishuSetup";
-import Schedules from "./pages/Schedules";
-import Sources from "./pages/Sources";
-import Observability from "./pages/Observability";
-import Costs from "./pages/Costs";
+import TaskDashboard from "./pages/TaskDashboard";
 import History from "./pages/History";
-import Profile from "./pages/Profile";
+import Settings from "./pages/Settings";
+import Admin from "./pages/Admin";
 import {
   Sidebar,
   SidebarContent,
@@ -26,18 +24,17 @@ import {
 } from "@/components/ui/sidebar";
 import { Separator } from "@/components/ui/separator";
 import {
-  LayoutDashboard,
-  Clock,
-  Rss,
-  History as HistoryIcon,
+  Home as HomeIcon,
+  ListTodo,
+  Send,
   User,
   MessageSquare,
-  Activity,
-  DollarSign,
+  ShieldCheck,
   LogOut,
   Loader2,
   Zap,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 
 function useHash(): string {
   const [hash, setHash] = useState(location.hash || "#/");
@@ -49,42 +46,64 @@ function useHash(): string {
   return hash;
 }
 
-const NAV_ITEMS = [
-  { hash: "#/", label: "总览", icon: LayoutDashboard },
-  { hash: "#/schedules", label: "定时任务", icon: Clock },
-  { hash: "#/sources", label: "信源", icon: Rss },
-  { hash: "#/history", label: "推送历史", icon: HistoryIcon },
-  { hash: "#/profile", label: "画像", icon: User },
-] as const;
+interface NavItem {
+  hash: string;
+  label: string;
+  icon: LucideIcon;
+}
 
-const ADMIN_ITEMS = [
-  { hash: "#/setup", label: "飞书接入", icon: MessageSquare },
-  { hash: "#/observability", label: "可观测", icon: Activity },
-  { hash: "#/costs", label: "成本", icon: DollarSign },
-] as const;
+// 侧边栏按「这是谁的东西」分组，而不是按「这是什么功能」。
+// 我的情报 = 日常要看的产出；账号 = 影响产出的自身设置。
+const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
+  {
+    label: "我的情报",
+    items: [
+      { hash: "#/", label: "首页", icon: HomeIcon },
+      { hash: "#/tasks", label: "任务", icon: ListTodo },
+      { hash: "#/history", label: "推送记录", icon: Send },
+    ],
+  },
+  {
+    label: "账号",
+    items: [
+      { hash: "#/settings", label: "我的画像", icon: User },
+      { hash: "#/settings/channel", label: "推送通道", icon: MessageSquare },
+    ],
+  },
+];
 
-function renderPage(hash: string) {
+const ALL_NAV: NavItem[] = [
+  ...NAV_GROUPS.flatMap((g) => g.items),
+  { hash: "#/admin", label: "管理后台", icon: ShieldCheck },
+];
+
+function renderPage(hash: string, isPlatformOwner: boolean) {
   switch (hash) {
-    case "#/setup":
-      return <FeishuSetup />;
-    case "#/schedules":
-      return <Schedules />;
-    case "#/sources":
-      return <Sources />;
-    case "#/observability":
-      return <Observability />;
+    case "#/tasks":
+      return <TaskDashboard />;
     case "#/history":
       return <History />;
-    case "#/profile":
-      return <Profile />;
-    case "#/costs":
-      return <Costs />;
+    case "#/settings":
+    case "#/settings/channel":
+      return <Settings hash={hash} />;
+    case "#/admin":
+      // 前端兜底：非平台 owner 直接落回首页。真正的拦截在后端
+      // requirePlatformOwner，这里只是避免渲染一个注定 404 的页面。
+      return isPlatformOwner ? <Admin /> : <Home />;
     default:
       return <Home />;
   }
 }
 
-function AppSidebar({ hash, onLogout }: { hash: string; onLogout: () => void }) {
+function AppSidebar({
+  hash,
+  isPlatformOwner,
+  onLogout,
+}: {
+  hash: string;
+  isPlatformOwner: boolean;
+  onLogout: () => void;
+}) {
   return (
     <Sidebar>
       <SidebarHeader>
@@ -94,44 +113,39 @@ function AppSidebar({ hash, onLogout }: { hash: string; onLogout: () => void }) 
           </div>
           <div className="flex flex-col leading-tight">
             <span className="text-sm font-semibold">见微 Vane</span>
-            <span className="text-[11px] text-muted-foreground">AI 信息推送</span>
+            <span className="text-[11px] text-muted-foreground">AI 情报系统</span>
           </div>
         </a>
       </SidebarHeader>
       <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupLabel>主要功能</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {NAV_ITEMS.map((item) => (
-                <SidebarMenuItem key={item.hash}>
-                  <SidebarMenuButton render={<a href={item.hash} />} isActive={hash === item.hash}>
-                    <item.icon />
-                    <span>{item.label}</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-        <SidebarGroup>
-          <SidebarGroupLabel>设置与监控</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {ADMIN_ITEMS.map((item) => (
-                <SidebarMenuItem key={item.hash}>
-                  <SidebarMenuButton render={<a href={item.hash} />} isActive={hash === item.hash}>
-                    <item.icon />
-                    <span>{item.label}</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        {NAV_GROUPS.map((group) => (
+          <SidebarGroup key={group.label}>
+            <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {group.items.map((item) => (
+                  <SidebarMenuItem key={item.hash}>
+                    <SidebarMenuButton render={<a href={item.hash} />} isActive={hash === item.hash}>
+                      <item.icon />
+                      <span>{item.label}</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ))}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ))}
       </SidebarContent>
       <SidebarFooter>
         <SidebarMenu>
+          {isPlatformOwner && (
+            <SidebarMenuItem>
+              <SidebarMenuButton render={<a href="#/admin" />} isActive={hash === "#/admin"}>
+                <ShieldCheck />
+                <span>管理后台</span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          )}
           <SidebarMenuItem>
             <SidebarMenuButton onClick={onLogout}>
               <LogOut />
@@ -144,49 +158,27 @@ function AppSidebar({ hash, onLogout }: { hash: string; onLogout: () => void }) 
   );
 }
 
-function Shell({ hash }: { hash: string }) {
-  const [checked, setChecked] = useState(false);
-
-  useEffect(() => {
-    let alive = true;
-    api
-      .me()
-      .then(() => alive && setChecked(true))
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, []);
-
+function Shell({ hash, isPlatformOwner }: { hash: string; isPlatformOwner: boolean }) {
   async function onLogout() {
     try {
       await api.logout();
     } catch {}
-    location.hash = "#/login";
-  }
-
-  if (!checked) {
-    return (
-      <div className="flex h-screen items-center justify-center gap-2 text-muted-foreground">
-        <Loader2 className="size-5 animate-spin" />
-        <span>加载中…</span>
-      </div>
-    );
+    location.reload();
   }
 
   return (
     <SidebarProvider>
-      <AppSidebar hash={hash} onLogout={onLogout} />
+      <AppSidebar hash={hash} isPlatformOwner={isPlatformOwner} onLogout={onLogout} />
       <SidebarInset>
         <header className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger className="-ml-1" />
           <Separator orientation="vertical" className="mr-2 !h-4" />
           <span className="text-sm text-muted-foreground">
-            {[...NAV_ITEMS, ...ADMIN_ITEMS].find((i) => i.hash === hash)?.label ?? "总览"}
+            {ALL_NAV.find((i) => i.hash === hash)?.label ?? "首页"}
           </span>
         </header>
         <main className="flex-1 overflow-y-auto">
-          <div className="mx-auto max-w-5xl p-6">{renderPage(hash)}</div>
+          <div className="mx-auto max-w-5xl p-6">{renderPage(hash, isPlatformOwner)}</div>
         </main>
       </SidebarInset>
     </SidebarProvider>
@@ -195,6 +187,27 @@ function Shell({ hash }: { hash: string }) {
 
 export default function App() {
   const hash = useHash();
+  const [authed, setAuthed] = useState<boolean | null>(null);
+  const [isPlatformOwner, setIsPlatformOwner] = useState(false);
+
+  useEffect(() => {
+    api
+      .me()
+      .then((me) => {
+        setIsPlatformOwner(me.tenant_id === PLATFORM_OWNER_TENANT_ID);
+        setAuthed(true);
+      })
+      .catch(() => setAuthed(false));
+  }, []);
+
   if (hash === "#/login") return <Login />;
-  return <Shell hash={hash} />;
+  if (authed === null) {
+    return (
+      <div className="flex h-screen items-center justify-center gap-2 text-muted-foreground">
+        <Loader2 className="size-5 animate-spin" />
+      </div>
+    );
+  }
+  if (!authed) return <Landing />;
+  return <Shell hash={hash} isPlatformOwner={isPlatformOwner} />;
 }

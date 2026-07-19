@@ -1,135 +1,145 @@
 import { useEffect, useState } from "react";
-import { api, ApiError } from "../api";
-import type { FeishuStatus } from "../api";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Plus, Loader2, Send } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Bot, ArrowRight, Wifi, WifiOff } from "lucide-react";
+import { api } from "../api";
+import type { DeliveryHistoryItem } from "../api";
+
+const BEIJING_TZ = "Asia/Shanghai";
+const RECENT_WINDOW = 200;
+
+function fmtBeijing(iso?: string | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString("zh-CN", { timeZone: BEIJING_TZ, hour12: false });
+}
+
+// 判定「今天」用北京时区的日历日，而不是 UTC 或浏览器本地时区：
+// 推送记录页展示的就是北京时间，两处口径必须一致，否则用户会看到
+// 「今日推送 0」但列表里明明有今天的记录。
+function isTodayBeijing(iso?: string | null): boolean {
+  if (!iso) return false;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return false;
+  const fmt = (x: Date) => x.toLocaleDateString("zh-CN", { timeZone: BEIJING_TZ });
+  return fmt(d) === fmt(new Date());
+}
+
+interface Stats {
+  running: number;
+  todayPush: number;
+}
 
 export default function Home() {
-  const [status, setStatus] = useState<FeishuStatus | null>(null);
-  const [error, setError] = useState("");
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [items, setItems] = useState<DeliveryHistoryItem[]>([]);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let alive = true;
-    const load = async () => {
-      try {
-        const s = await api.feishuStatus();
-        if (alive) {
-          setStatus(s);
-          setError("");
-        }
-      } catch (err) {
-        if (alive) setError(err instanceof ApiError ? err.message : "加载失败");
-      }
-    };
-    load();
-    const timer = setInterval(load, 5000);
+    Promise.all([
+      api.listSchedules().catch(() => []),
+      // 取 RECENT_WINDOW 条来数「今日推送」：后端没有按日计数的接口，只能从
+      // 最近一页里数。窗口取够大以免静默截断——真按天推送量算，单日跑满 200 条
+      // 说明推送策略已经出问题了，那种情况下计数偏低不是最要紧的事。
+      api.listDeliveries(RECENT_WINDOW).catch(() => ({ items: [] as DeliveryHistoryItem[] })),
+    ])
+      .then(([schedules, deliveries]) => {
+        if (!alive) return;
+        setItems(deliveries.items.slice(0, 5));
+        setStats({
+          running: schedules.filter((s) => s.status === "active").length,
+          todayPush: deliveries.items.filter((d) => isTodayBeijing(d.sent_at ?? d.created_at))
+            .length,
+        });
+      })
+      .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
-      clearInterval(timer);
     };
   }, []);
 
   return (
     <div className="space-y-6">
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">飞书连接状态</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {status === null && !error && (
-            <div className="space-y-3">
-              <Skeleton className="h-4 w-48" />
-              <Skeleton className="h-4 w-64" />
-              <Skeleton className="h-4 w-32" />
-            </div>
-          )}
-          {error && (
-            <Alert variant="destructive">
-              <AlertDescription>{error}</AlertDescription>
-            </Alert>
-          )}
-          {status !== null && !status.configured && (
-            <div className="flex flex-col items-center py-8 text-center">
-              <div className="flex size-16 items-center justify-center rounded-full bg-muted mb-4">
-                <Bot className="size-8 text-muted-foreground" />
-              </div>
-              <h3 className="text-lg font-semibold mb-1">尚未接入飞书</h3>
-              <p className="text-sm text-muted-foreground mb-6 max-w-sm">
-                完成飞书机器人接入后，即可在飞书里直接与 见微 Vane 对话。
-              </p>
-              <Button render={<a href="#/setup" />}>
-                前往接入向导
-                <ArrowRight className="ml-2 size-4" />
-              </Button>
-            </div>
-          )}
-          {status !== null && status.configured && (
-            <div className="space-y-4">
-              <div className="flex items-center gap-3">
-                {status.connected ? (
-                  <>
-                    <span className="flex size-3 rounded-full bg-emerald-500" />
-                    <div className="flex items-center gap-2">
-                      <Wifi className="size-4 text-emerald-600" />
-                      <span className="font-medium">飞书已连接</span>
-                    </div>
-                    <Badge variant="secondary" className="ml-auto">在线</Badge>
-                  </>
-                ) : (
-                  <>
-                    <span className="flex size-3 rounded-full bg-red-500" />
-                    <div className="flex items-center gap-2">
-                      <WifiOff className="size-4 text-red-600" />
-                      <span className="font-medium">飞书未连接</span>
-                    </div>
-                    <Badge variant="destructive" className="ml-auto">离线</Badge>
-                  </>
+      <div className="flex items-center justify-between">
+        <h1 className="text-xl font-semibold">首页</h1>
+        <Button size="sm" onClick={() => (location.hash = "#/tasks")}>
+          <Plus className="size-4 mr-1" />
+          新建任务
+        </Button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div className="rounded-lg bg-muted/50 p-4">
+          <p className="text-xs text-muted-foreground mb-1">运行中任务</p>
+          <p className="text-2xl font-semibold">{stats ? stats.running : "—"}</p>
+        </div>
+        <div className="rounded-lg bg-muted/50 p-4">
+          <p className="text-xs text-muted-foreground mb-1">今日推送</p>
+          <p className="text-2xl font-semibold">{stats ? stats.todayPush : "—"}</p>
+        </div>
+      </div>
+
+      <div>
+        <div className="flex items-center gap-2 mb-3">
+          <Send className="size-4 text-muted-foreground" />
+          <h2 className="text-base font-medium">最近推送</h2>
+        </div>
+
+        {loading ? (
+          <div className="flex items-center justify-center py-8 text-muted-foreground">
+            <Loader2 className="size-4 animate-spin mr-2" />
+            <span className="text-sm">加载中…</span>
+          </div>
+        ) : items.length === 0 ? (
+          <p className="text-sm text-muted-foreground text-center py-6">还没有推送记录。</p>
+        ) : (
+          <div className="space-y-2">
+            {items.map((it) => (
+              <div key={it.id} className="flex items-center gap-3 py-2 text-sm">
+                <span className="text-xs text-muted-foreground whitespace-nowrap min-w-[120px]">
+                  {fmtBeijing(it.sent_at ?? it.created_at)}
+                </span>
+                <span className="flex-1 truncate">
+                  {it.url ? (
+                    <a
+                      href={it.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-primary hover:underline"
+                    >
+                      {it.title || "(无标题)"}
+                    </a>
+                  ) : (
+                    <span className="text-muted-foreground">{it.title || "(内容已删除)"}</span>
+                  )}
+                </span>
+                <span className="text-xs text-muted-foreground font-mono">{it.score}分</span>
+                {it.feedbacks.length > 0 && (
+                  <Badge variant="secondary" className="text-xs">
+                    {it.feedbacks[0].action === "interested"
+                      ? "👍"
+                      : it.feedbacks[0].action === "not_interested"
+                        ? "👎"
+                        : "💬"}
+                  </Badge>
                 )}
               </div>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 rounded-lg border p-4">
-                <div>
-                  <p className="text-xs text-muted-foreground mb-1">机器人</p>
-                  <p className="text-sm font-medium">{status.bot_name || "—"}</p>
-                </div>
-                <div>
-                  <p className="text-xs text-muted-foreground mb-1">Owner</p>
-                  <p className="text-sm font-medium">
-                    {status.owner_name || (status.owner_open_id ? status.owner_open_id : "未捕获")}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-muted-foreground mb-1">连接时间</p>
-                  <p className="text-sm font-medium">
-                    {status.connected_at
-                      ? new Date(status.connected_at).toLocaleString("zh-CN")
-                      : "—"}
-                  </p>
-                </div>
-              </div>
-              {!status.connected && status.last_error && (
-                <Alert variant="destructive">
-                  <AlertDescription>最近错误：{status.last_error}</AlertDescription>
-                </Alert>
-              )}
-              {!status.connected && (
-                <Button variant="outline" render={<a href="#/setup" />}>
-                  去接入向导排查
-                  <ArrowRight className="ml-2 size-4" />
-                </Button>
-              )}
+            ))}
+            <div className="pt-2">
+              <Button
+                variant="link"
+                size="sm"
+                className="text-xs px-0"
+                onClick={() => (location.hash = "#/history")}
+              >
+                查看全部推送记录 →
+              </Button>
             </div>
-          )}
-        </CardContent>
-      </Card>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

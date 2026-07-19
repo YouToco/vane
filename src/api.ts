@@ -2,6 +2,18 @@
 // 为什么集中封装：所有请求都要带 cookie（credentials:'include'），且 401 需要统一踢回登录页，
 // 分散在各页面写会漏；错误统一转成后端约定的 {"error":"人话"} 文案，页面只管展示。
 
+// PLATFORM_OWNER_TENANT_ID 必须与后端 types.SingleTenantID 保持一致：
+// 后端 api/platformadmin.go 的 requirePlatformOwner 就是用 tenant_id==1 判定平台 owner，
+// 前端据此决定是否显示管理面入口。判据同源，不另造一套角色标记——
+// 前端猜错只会多显示/少显示入口，真正的拦截始终在后端那道闸门。
+export const PLATFORM_OWNER_TENANT_ID = 1;
+
+export interface MeResponse {
+  ok: boolean;
+  user_id: number;
+  tenant_id: number;
+}
+
 export interface FeishuStatus {
   configured: boolean;
   connected: boolean;
@@ -307,7 +319,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(0, "网络错误，请确认后端服务在线后重试");
   }
   // 会话失效统一踢回登录页；登录接口自身的 401 要留给登录页展示"密码错误"，不能跳
-  if (res.status === 401 && path !== "/api/auth/login" && path !== "/api/auth/register") {
+  if (res.status === 401 && path !== "/api/auth/login" && path !== "/api/auth/register" && path !== "/api/auth/me") {
     location.hash = "#/login";
     throw new ApiError(401, "登录已失效，请重新登录");
   }
@@ -401,7 +413,7 @@ export const api = {
       invite_code: inviteCode,
     }),
   logout: () => post<{ ok: boolean }>("/api/auth/logout"),
-  me: () => request<{ ok: boolean }>("/api/auth/me"),
+  me: () => request<MeResponse>("/api/auth/me"),
   feishuStatus: () => request<FeishuStatus>("/api/feishu/status"),
   feishuVerify: (appId: string, appSecret: string) =>
     post<VerifyResult>("/api/feishu/verify", { app_id: appId, app_secret: appSecret }),

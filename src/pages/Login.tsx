@@ -48,6 +48,7 @@ export default function Login() {
         await api.login(email.trim(), password);
       }
       location.hash = "#/";
+      location.reload();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : isRegister ? "注册失败，请重试" : "登录失败，请重试");
     } finally {
@@ -64,17 +65,17 @@ export default function Login() {
           </div>
           <div className="text-center">
             <h1 className="text-2xl font-bold tracking-tight text-foreground">见微 Vane</h1>
-            <p className="text-sm text-muted-foreground mt-0.5">AI 个性化信息推送 · 控制台</p>
+            <p className="text-sm text-muted-foreground mt-0.5">AI 情报系统</p>
           </div>
         </div>
 
         <Card className="shadow-xl border-border/50">
           <CardHeader className="space-y-1 pb-4">
             <CardTitle className="text-lg font-semibold">
-              {isRegister ? "注册账号" : "控制台登录"}
+              {isRegister ? "注册账号" : "登录"}
             </CardTitle>
             <CardDescription>
-              {isRegister ? "输入邀请码创建新账号" : "输入邮箱和密码以进入控制台"}
+              {isRegister ? "输入邀请码创建新账号" : "登录你的情报系统"}
             </CardDescription>
           </CardHeader>
 
