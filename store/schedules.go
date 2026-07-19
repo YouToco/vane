@@ -173,3 +173,48 @@ func (s *Store) GetSchedule(ctx context.Context, id string, userID int64) (*type
 	}
 	return &sc, nil
 }
+
+// GetScheduleStrictness 读取任务的推送门槛档位（migration 025）。
+//
+// 独立窄方法而非并入 scheduleColumns/scanSchedule：唯一消费方是推送管道的
+// Select Activity（热路径上一次单列点查），把列并进全列扫描会迫使所有列表 API
+// 一起感知这个纯推送侧的字段。NULL（未设置）返回空串，由调用方按
+// types.DefaultStrictness 兜底——"没设"与"要宽松"的区分保留到最后一刻。
+// 不校验归属（无 userID 谓词）：调用方是 workflow 内部路径，schedule_id 来自
+// Temporal 入参而非用户输入；返回的也只是一个档位枚举，无泄露面。
+// 行不存在返回空串同样走兜底：对已删调度的迟到触发，放行到兜底比报错中断推送更对。
+func (s *Store) GetScheduleStrictness(ctx context.Context, scheduleID string) (types.PushStrictness, error) {
+	var v *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT push_strictness FROM schedules WHERE id = $1`, scheduleID).Scan(&v)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询调度门槛档位（id=%s）", scheduleID), err)
+	}
+	if v == nil {
+		return "", nil
+	}
+	return types.PushStrictness(*v), nil
+}
+
+// SetScheduleStrictness 设置任务的推送门槛档位（agent 工具 set_task_strictness 用）。
+// 归属校验在 WHERE 谓词内（同 DeleteSchedule 范式）；找不到行返回 CodeNotFound，
+// 不区分"不存在"与"不属于你"。档位合法性由调用方（工具层 + DB CHECK 约束）双守，
+// 这里不再重复校验——真穿透到这层，CHECK 约束会以 CodeDatabase 拒绝。
+func (s *Store) SetScheduleStrictness(ctx context.Context, scheduleID string, userID int64, v types.PushStrictness) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE schedules SET push_strictness = $1, updated_at = now() WHERE id = $2 AND user_id = $3`,
+		string(v), scheduleID, userID)
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("更新调度门槛档位（id=%s）", scheduleID), err)
+	}
+	if tag.RowsAffected() == 0 {
+		return types.NewAppError(types.CodeNotFound,
+			fmt.Sprintf("调度 id=%s 不存在", scheduleID), nil)
+	}
+	return nil
+}

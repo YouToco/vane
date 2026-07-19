@@ -92,9 +92,10 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger,
 		&removeSourceTool{st: st},
 		&enableSourceTool{st: st},
 		&listSchedulesTool{st: st},
-		&createScheduleTool{sched: sched, st: st, tr: tr}, // st：创建即初始化手册（D2）；tr：并编译计划（P1）
+		&createScheduleTool{sched: sched, st: st, tr: tr, strict: st}, // st：创建即初始化手册（D2）；tr：并编译计划（P1）；strict：落初始门槛档位
 		&updateScheduleTool{sched: sched},
 		&removeScheduleTool{sched: sched},
+		&setTaskStrictnessTool{st: st}, // 任务级推送门槛档位（2026-07-19 拍板）
 		&pushNowTool{pusher: pusher},
 		&viewProfileTool{st: st},
 		&updateProfileTool{st: st},
@@ -616,7 +617,8 @@ const createScheduleSchema = `{
         "tz": {"type": "string", "description": "可选：IANA 时区名，缺省 Asia/Shanghai"}
       }
     },
-    "nl_description": {"type": "string", "description": "可选：该任务的自然语言描述（如\"每天早上 8 点推送\"），用于列表展示"}
+    "nl_description": {"type": "string", "description": "可选：该任务的自然语言描述（如\"每天早上 8 点推送\"），用于列表展示"},
+    "strictness": {"type": "string", "enum": ["loose", "normal", "strict"], "description": "可选：推送门槛档位，从用户对相关度的要求推断——「只要非常相关的/重大更新才推」→ strict（仅 ≥60 分高相关才推）；「一般相关就行」→ normal（≥40 分）；「都推来看看/宽松点」→ loose（只过滤与画像无关的内容）。用户没表态就不传（按系统兜底，等价 loose）"}
   },
   "required": ["spec"]
 }`
@@ -630,12 +632,20 @@ type createScheduleArgs struct {
 		TZ           string `json:"tz"`
 	} `json:"spec"`
 	NLDescription string `json:"nl_description"`
+	Strictness    string `json:"strictness"`
+}
+
+// strictnessStore 收窄门槛档位的写依赖（*store.Store 已实现）：create_schedule
+// 建任务时落初始档位、set_task_strictness 后续调整共用。
+type strictnessStore interface {
+	SetScheduleStrictness(ctx context.Context, scheduleID string, userID int64, v types.PushStrictness) error
 }
 
 type createScheduleTool struct {
-	sched scheduleCreator
-	st    playbookStore      // 创建即初始化任务手册（决策 D2）
-	tr    playbookTranslator // 并把手册意图编译成 fetch_plan（P1 编译层；nil=跳过）
+	sched  scheduleCreator
+	st     playbookStore      // 创建即初始化任务手册（决策 D2）
+	tr     playbookTranslator // 并把手册意图编译成 fetch_plan（P1 编译层；nil=跳过）
+	strict strictnessStore    // 建成后落初始门槛档位（2026-07-19 拍板；nil=跳过）
 }
 
 func (t *createScheduleTool) Name() string { return "create_schedule" }
@@ -656,6 +666,11 @@ func (t *createScheduleTool) Execute(ctx context.Context, userID int64, args jso
 	}
 	if msg := validateScheduleArgs(a); msg != "" {
 		return msg, nil
+	}
+	// 档位在建调度**之前**校验：schema enum 只是软约束，模型乱传时要在产生任何
+	// 副作用前拒绝——建完调度再发现档位非法，就只剩"带错档位继续"或"回滚调度"两个坏选项。
+	if a.Strictness != "" && !types.PushStrictness(a.Strictness).Valid() {
+		return "strictness 只能是 loose / normal / strict 之一（或不传）", nil
 	}
 	spec := scheduler.ScheduleSpec{
 		Cron:         a.Spec.Cron,
@@ -687,7 +702,42 @@ func (t *createScheduleTool) Execute(ctx context.Context, userID int64, args jso
 		// 手册已初始化 → 据此编译抓取计划（P1 编译层，best-effort：失败只 slog、不影响调度）。
 		compilePlaybookPlan(ctx, t.st, t.tr, userID, schedID, content)
 	}
-	return fmt.Sprintf("已创建定时推送任务（id=%s）：%s", schedID, formatScheduleSpec(spec)), nil
+	// 初始门槛档位（2026-07-19 拍板）：best-effort 同手册先例——档位写失败不回滚
+	// 已建成的调度，Select 会按全局兜底档过滤，用户随时可用 set_task_strictness 补设。
+	reply := fmt.Sprintf("已创建定时推送任务（id=%s）：%s", schedID, formatScheduleSpec(spec))
+	if a.Strictness != "" && t.strict != nil {
+		v := types.PushStrictness(a.Strictness)
+		if serr := t.strict.SetScheduleStrictness(ctx, schedID, userID, v); serr != nil {
+			slog.Error("agent: create_schedule 落初始门槛档位失败（调度已创建，按兜底档运行）",
+				"schedule_id", schedID, "strictness", v, "err", serr)
+		} else {
+			reply += fmt.Sprintf("，推送门槛「%s」（%s）", strictnessLabel(v), strictnessDesc(v))
+		}
+	}
+	return reply, nil
+}
+
+// strictnessLabel / strictnessDesc 档位的人话名与一句话说明（工具回执/摘要共用）。
+func strictnessLabel(v types.PushStrictness) string {
+	switch v {
+	case types.StrictnessStrict:
+		return "严格"
+	case types.StrictnessNormal:
+		return "标准"
+	default:
+		return "宽松"
+	}
+}
+
+func strictnessDesc(v types.PushStrictness) string {
+	switch v {
+	case types.StrictnessStrict:
+		return fmt.Sprintf("仅 ≥%d 分的高相关内容才推送", v.MinKeepScore())
+	case types.StrictnessNormal:
+		return fmt.Sprintf("≥%d 分才推送，弱相关不打扰", v.MinKeepScore())
+	default:
+		return "只过滤与你画像无关的内容"
+	}
 }
 
 func (t *createScheduleTool) Summarize(args json.RawMessage) string {
@@ -1323,4 +1373,67 @@ func (t *editTaskPlaybookTool) Summarize(args json.RawMessage) string {
 	}
 	preview := truncateRunes(strings.TrimSpace(capPlaybookContent(a.Content)), playbookSummaryPreviewRunes)
 	return fmt.Sprintf("修改定时任务手册（id=%s）：新内容「%s」", strings.TrimSpace(a.ScheduleID), preview)
+}
+
+// ────────── set_task_strictness：调整任务推送门槛档位（2026-07-19 拍板） ──────────
+
+const setTaskStrictnessSchema = `{
+  "type": "object",
+  "properties": {
+    "schedule_id": {"type": "string", "description": "要调整的定时任务 id，可先用 list_schedules 查询"},
+    "strictness": {"type": "string", "enum": ["loose", "normal", "strict"], "description": "推送门槛档位：loose=宽松（只过滤与画像无关的内容）；normal=标准（≥40 分才推，弱相关不打扰）；strict=严格（仅 ≥60 分高相关才推）"}
+  },
+  "required": ["schedule_id", "strictness"]
+}`
+
+type setTaskStrictnessTool struct {
+	st strictnessStore
+}
+
+func (t *setTaskStrictnessTool) Name() string { return "set_task_strictness" }
+func (t *setTaskStrictnessTool) Description() string {
+	return "调整某个定时任务的推送门槛档位。用户说「这个任务严一点 / 松一点 / 只要非常相关的 / 别漏掉边缘消息」这类对推送相关度要求的表态时使用。档位含义：loose 宽松（只滤与画像无关的内容）、normal 标准（弱相关不推）、strict 严格（仅高度相关才推）。"
+}
+func (t *setTaskStrictnessTool) Parameters() json.RawMessage {
+	return json.RawMessage(setTaskStrictnessSchema)
+}
+func (t *setTaskStrictnessTool) Mutating() bool { return true }
+
+// Execute 归属校验在 store 层 WHERE 谓词内（SetScheduleStrictness 同 DeleteSchedule
+// 范式）：schedule_id 来自模型生成的入参、模型输入里混着不可信外部内容，越权改他人
+// 任务的门槛必须在数据层就删不动（同 remove_schedule 的威胁模型注释）。
+func (t *setTaskStrictnessTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
+	var a struct {
+		ScheduleID string `json:"schedule_id"`
+		Strictness string `json:"strictness"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil || strings.TrimSpace(a.ScheduleID) == "" {
+		return "schedule_id 必须是非空字符串", nil
+	}
+	v := types.PushStrictness(strings.TrimSpace(a.Strictness))
+	if !v.Valid() {
+		return "strictness 只能是 loose / normal / strict 之一", nil
+	}
+	schedID := strings.TrimSpace(a.ScheduleID)
+	if err := t.st.SetScheduleStrictness(ctx, schedID, userID, v); err != nil {
+		var ae *types.AppError
+		if errors.As(err, &ae) && ae.Code == types.CodeNotFound {
+			return fmt.Sprintf("没有找到定时任务 %s（可先用 list_schedules 查看现有任务）", schedID), nil
+		}
+		return "", err
+	}
+	return fmt.Sprintf("已把任务 %s 的推送门槛调整为「%s」（%s）。下次推送起生效。",
+		schedID, strictnessLabel(v), strictnessDesc(v)), nil
+}
+
+func (t *setTaskStrictnessTool) Summarize(args json.RawMessage) string {
+	var a struct {
+		ScheduleID string `json:"schedule_id"`
+		Strictness string `json:"strictness"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return summarizeFallback("调整任务推送门槛", args)
+	}
+	return fmt.Sprintf("把任务 %s 的推送门槛调整为「%s」",
+		a.ScheduleID, strictnessLabel(types.PushStrictness(a.Strictness)))
 }

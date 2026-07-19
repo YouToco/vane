@@ -72,7 +72,9 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	wfID := workflow.GetInfo(ctx).WorkflowExecution.ID
 	userTriggered := strings.HasPrefix(wfID, "push-agent-") || strings.HasPrefix(wfID, "push-adhoc-")
 
-	recordEmpty := func(gate types.BatchExitGate) {
+	// maxScore 携带门槛上下文（仅 Select gate 过滤致空时 >=0，其余闸门传 -1）：
+	// 由 workflow 从 scored 纯计算（确定性），档位由 NotifyEmptyResult 自行查库。
+	recordEmpty := func(gate types.BatchExitGate, maxScore float64) {
 		// 用 quick 档：纯一条 INSERT，且它无论如何都不该拖长一次"其实没事干"的运行。
 		recCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
 		in := RecordEmptyIn{UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID, Gate: gate, Counts: counts}
@@ -81,12 +83,19 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 				"user_id", p.UserID, "trace_id", traceID, "gate", gate, "err", err)
 		}
 		// 用户主动触发时补一张"本次没有新内容"通知卡（2026-07-18：Boss 点了立即推送
-		// 等不到任何回音来查服务器——空结果和故障在用户侧必须可区分）。定时任务保持
-		// 静默（每天"今天没新闻"是噪音）。失败同样只 Warn：通知是附加信息，
-		// 不能把正常空终态变成失败。
-		if userTriggered {
+		// 等不到任何回音来查服务器——空结果和故障在用户侧必须可区分）。定时任务对
+		// fetch/dedup 等"世界上没新东西"的空保持静默（每天"今天没新闻"是噪音）；
+		// **门槛过滤致空（Select gate）恒通知**（Boss 拍板 2026-07-19）：内容明明有、
+		// 是门槛把它们全滤了——这是门槛机制的反馈面，用户须知道门槛在工作、且能调松，
+		// 否则"系统没坏、只是都不相关"与 31 小时静默停摆在用户侧长得一模一样。
+		// 失败同样只 Warn：通知是附加信息，不能把正常空终态变成失败。
+		if userTriggered || gate == types.BatchExitGateSelect {
 			ntCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
 			nin := NotifyEmptyIn{UserID: p.UserID, TraceID: traceID, Gate: gate, Counts: counts}
+			if gate == types.BatchExitGateSelect && maxScore >= 0 {
+				nin.ScheduleID = p.ScheduleID
+				nin.MaxScore = maxScore
+			}
 			if err := workflow.ExecuteActivity(ntCtx, a.NotifyEmptyResult, nin).Get(ntCtx, nil); err != nil {
 				log.Warn("空结果通知失败（不阻断）", "trace_id", traceID, "err", err)
 			}
@@ -108,7 +117,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	}
 	counts = counts.WithFetched(len(items))
 	if len(items) == 0 {
-		recordEmpty(types.BatchExitGateFetch)
+		recordEmpty(types.BatchExitGateFetch, -1)
 		log.Info("无新内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
@@ -121,7 +130,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	}
 	counts = counts.WithDeduped(len(deduped))
 	if len(deduped) == 0 {
-		recordEmpty(types.BatchExitGateDedup)
+		recordEmpty(types.BatchExitGateDedup, -1)
 		log.Info("去重后无内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
@@ -144,27 +153,36 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 就有记录，而不是等到出事后再回来补。
 	counts = counts.WithScored(len(scored))
 	if len(scored) == 0 {
-		recordEmpty(types.BatchExitGateScore)
+		recordEmpty(types.BatchExitGateScore, -1)
 		log.Info("打分后无内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
 
-	// 4. Select —— 纯排序取 TopN。
+	// 4. Select —— 门槛过滤 + 排序取 TopN（契约 §6 修订）。返回类型保持裸切片
+	// 是重放兼容性钉死的（见 Select 注释与 replay_test 基线）。
 	topN := p.Scope.TopN
 	if topN <= 0 {
 		topN = defaultTopN
 	}
 	var selected []types.ScoredItem
 	selectCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
-	if err := workflow.ExecuteActivity(selectCtx, a.Select, SelectIn{UserID: p.UserID, TraceID: traceID, TopN: topN, Scored: scored}).Get(selectCtx, &selected); err != nil {
+	if err := workflow.ExecuteActivity(selectCtx, a.Select,
+		SelectIn{UserID: p.UserID, TraceID: traceID, TopN: topN, Scored: scored, ScheduleID: p.ScheduleID}).Get(selectCtx, &selected); err != nil {
 		return err
 	}
-	// 同样够不着：selector.RankTopN 只在 n<=0 或输入为空时返回空切片
-	// （selector.go:65-67），而 topN 上面刚归一到 >=1、scored 刚校验非空。
+	// 本闸门自门槛过滤落地起是**热路径**（此前纯 TopN 时够不着，见 git 史）：
+	// 整批低于任务门槛 → 全滤 → 空。上方 recordEmpty 对本闸门恒发通知卡；
+	// maxScore 在 workflow 内从 scored 纯计算（确定性），空批卡靠它回答"最高才几分"。
 	counts = counts.WithSelected(len(selected))
 	if len(selected) == 0 {
-		recordEmpty(types.BatchExitGateSelect)
-		log.Info("择优后无内容，pipeline 结束", "trace_id", traceID)
+		maxScore := 0.0
+		for _, si := range scored {
+			if si.Score > maxScore {
+				maxScore = si.Score
+			}
+		}
+		recordEmpty(types.BatchExitGateSelect, maxScore)
+		log.Info("门槛过滤后无内容，pipeline 结束", "trace_id", traceID, "max_score", maxScore)
 		return nil
 	}
 
@@ -178,7 +196,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 入参为空时出现，而 selected 刚校验非空。
 	counts = counts.WithCards(len(cards))
 	if len(cards) == 0 {
-		recordEmpty(types.BatchExitGateCardGen)
+		recordEmpty(types.BatchExitGateCardGen, -1)
 		log.Info("卡片生成后无内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
