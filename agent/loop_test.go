@@ -1181,3 +1181,24 @@ func TestNotifyEvent_QueriesInsideLockAndSerializesWithHandleMessage(t *testing.
 		t.Fatalf("通告应排在 saveSession 之后落地, 实得 %+v", last)
 	}
 }
+
+// TestAsyncSessionWritePanicRecovered：旁路回写 goroutine 上的 panic 必须被兜住
+// （bug 狩猎 2026-07-19 MEDIUM）——独立 goroutine 无上层 recover，不兜住会带崩
+// 整个进程。断言两件事：panic 不炸测试进程；同一用户的后续回写照常执行
+// （per-user 锁串行保证第二次在第一次之后跑）。
+func TestAsyncSessionWritePanicRecovered(t *testing.T) {
+	l := &Loop{}
+	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
+		panic("boom（测试构造）")
+	})
+	done := make(chan struct{})
+	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
+		close(done)
+	})
+	select {
+	case <-done:
+		// panic 被兜住且后续回写正常——目标行为。
+	case <-time.After(5 * time.Second):
+		t.Fatal("panic 后同用户的后续旁路回写未执行（锁可能未释放或 goroutine 死亡）")
+	}
+}

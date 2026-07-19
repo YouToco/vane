@@ -1244,3 +1244,62 @@ func (c *countingFetcher) Fetch(context.Context, types.Source) ([]types.ContentI
 	c.calls++
 	return nil, nil
 }
+
+// countingScorer / countingCardGen：D9 闸门断言用（同 countingEvolver 模式）——
+// 闸门生效 = 下游一次都没被调。
+type countingScorer struct{ calls int }
+
+func (c *countingScorer) Score(context.Context, int64, types.ContentItem, string) (float64, error) {
+	c.calls++
+	return 80, nil
+}
+
+type countingCardGen struct{ calls int }
+
+func (c *countingCardGen) Generate(context.Context, int64, types.ScoredItem, string) (string, error) {
+	c.calls++
+	return "md", nil
+}
+
+// TestActivities_RefusesSpendingForDeletedTenant_LateStages 补齐 D9 闸门的后三步
+// （bug 狩猎 2026-07-19 HIGH：此前只有 EvolveProfile/Fetch 有闸，Fetch 之后软删的
+// 租户仍会被 Score 烧 LLM、CardGen 烧 LLM、Push 发卡到已注销用户的手机上）。
+// 三步的入参都刻意给真实载荷：没有载荷时去掉闸门下游也不会被调，用例就测不出
+// 闸门存在与否（同上方 dueSources 的教训）。
+func TestActivities_RefusesSpendingForDeletedTenant_LateStages(t *testing.T) {
+	sc := &countingScorer{}
+	cg := &countingCardGen{}
+	push := &fakePusher{}
+	st := &fakeStore{tenantGone: true}
+	a := NewActivities(fakeFetcher{}, sc, cg, push, st, fakeFeishu{}, nil, nil, nil, nil)
+
+	items := []types.ContentItem{{ID: 1, Title: "t", Content: "c"}}
+	scored, err := a.Score(t.Context(), ScoreIn{UserID: 1, TraceID: "t", Items: items})
+	if err != nil {
+		t.Errorf("已注销租户 Score 应正常终态返回：%v", err)
+	}
+	if len(scored) != 0 || sc.calls != 0 {
+		t.Errorf("已注销租户不得打分（花 LLM 的钱），产出 %d 条、调用 %d 次", len(scored), sc.calls)
+	}
+
+	cards, err := a.CardGen(t.Context(), CardGenIn{UserID: 1, TraceID: "t",
+		Items: []types.ScoredItem{{Item: items[0], Score: 80}}})
+	if err != nil {
+		t.Errorf("已注销租户 CardGen 应正常终态返回：%v", err)
+	}
+	if len(cards) != 0 || cg.calls != 0 {
+		t.Errorf("已注销租户不得生成解读（花 LLM 的钱），产出 %d 张、调用 %d 次", len(cards), cg.calls)
+	}
+
+	err = a.Push(t.Context(), PushIn{UserID: 1, TraceID: "t",
+		Cards: []GeneratedCard{{Scored: types.ScoredItem{Item: items[0], Score: 80}, BodyMD: "md"}}})
+	if err != nil {
+		t.Errorf("已注销租户 Push 应正常终态返回：%v", err)
+	}
+	push.mu.Lock()
+	sent := len(push.sent)
+	push.mu.Unlock()
+	if sent != 0 {
+		t.Errorf("已注销租户不得收到推送卡片，实发 %d 张", sent)
+	}
+}

@@ -286,11 +286,36 @@ func domainFromURL(rawURL string) string {
 	return host
 }
 
-// relativeTime 格式化相对时间（今天/昨天/N 天前）。
+// cardTZ 是卡片相对日期的用户时区。产品面向中文用户、调度默认同为 Asia/Shanghai
+// （scheduler.ScheduleSpec.TZ 缺省值）；LoadLocation 失败回退 UTC 只是防御，
+// 该 IANA 名内置于 Go 的 tzdata，正常不会失败。
+var cardTZ = func() *time.Location {
+	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+		return loc
+	}
+	return time.UTC
+}()
+
+// relativeTime 格式化相对时间（今天/昨天/N 天前），按**用户时区的日历日**计算。
+//
+// bug 狩猎 2026-07-19 MEDIUM 修复：原实现 time.Since(t)/24h 是"流逝时长"语义——
+// 北京 23:00 发布的文章，用户次日 01:00 看卡片流逝仅 2h 仍标"今天"，但用户感知
+// 已跨日。红线 6 说"换算只在前端"，而飞书卡片没有前端层：这里生成的就是终端
+// 展示文本，时区换算必须在此完成。
 func relativeTime(t time.Time) string {
-	days := int(time.Since(t).Hours() / 24)
+	return relativeTimeAt(t, time.Now())
+}
+
+// relativeTimeAt 是 relativeTime 的可测内核：now 由调用方注入，单测能钉死跨日边界
+// （23:59 发布 vs 00:01 观看必须是"昨天"——正是本次修复的那条 bug 的形状）。
+func relativeTimeAt(t, now time.Time) string {
+	now = now.In(cardTZ)
+	tt := t.In(cardTZ)
+	nowDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, cardTZ)
+	tDay := time.Date(tt.Year(), tt.Month(), tt.Day(), 0, 0, 0, 0, cardTZ)
+	days := int(nowDay.Sub(tDay).Hours() / 24)
 	switch {
-	case days <= 0:
+	case days <= 0: // 同日；未来时间戳（脏数据）也归"今天"，不显示负数天
 		return "今天"
 	case days == 1:
 		return "昨天"

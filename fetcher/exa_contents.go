@@ -198,34 +198,44 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 	defer resp.Body.Close()
 	elapsed := time.Since(start)
 
+	// 错误路径也记账（同 exa.go，bug 狩猎 2026-07-19 MEDIUM）：限流/鉴权失败/解析
+	// 失败此前不进 tool_calls，账本上 Exa 故障隐形。src 为 nil（enrich 补全路径的
+	// 无源调用）时 recordCall 本就不落账，闭包同样短路。
+	fail := func(status, bodySize int, ae error) error {
+		if src != nil {
+			e.recordCall(ctx, *src, status, elapsed, bodySize, 0, ae)
+		}
+		return ae
+	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, false, types.NewAppError(types.CodeFetchRateLimit, "Exa /contents 被限流(429)", nil)
+		return nil, false, fail(resp.StatusCode, 0,
+			types.NewAppError(types.CodeFetchRateLimit, "Exa /contents 被限流(429)", nil))
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, false, types.NewAppError(types.CodeValidation,
-			fmt.Sprintf("Exa 鉴权失败（HTTP %d），请检查 VANE_FETCH_EXA_API_KEY", resp.StatusCode), nil)
+		return nil, false, fail(resp.StatusCode, 0, types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("Exa 鉴权失败（HTTP %d），请检查 VANE_FETCH_EXA_API_KEY", resp.StatusCode), nil))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		ae := types.NewAppError(types.CodeFetchTimeout,
 			fmt.Sprintf("Exa /contents 返回非 2xx 状态 %d", resp.StatusCode), nil)
 		ae.Retryable = resp.StatusCode >= 500
-		return nil, false, ae
+		return nil, false, fail(resp.StatusCode, 0, ae)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, e.maxBytes+1))
 	if err != nil {
-		return nil, false, classifyDoError(e.contentURL, err)
+		return nil, false, fail(resp.StatusCode, 0, classifyDoError(e.contentURL, err))
 	}
 	if int64(len(data)) > e.maxBytes {
-		return nil, false, types.NewAppError(types.CodeValidation,
-			fmt.Sprintf("Exa /contents 响应体超过 %d 字节上限", e.maxBytes), nil)
+		return nil, false, fail(resp.StatusCode, len(data), types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("Exa /contents 响应体超过 %d 字节上限", e.maxBytes), nil))
 	}
 
 	var cr exaContentsResponse
 	if err := json.Unmarshal(data, &cr); err != nil {
 		ae := types.NewAppError(types.CodeFetchTimeout, "解析 Exa /contents 响应失败", err)
 		ae.Retryable = false
-		return nil, false, ae
+		return nil, false, fail(resp.StatusCode, len(data), ae)
 	}
 
 	if src != nil {

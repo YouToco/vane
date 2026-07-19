@@ -5,6 +5,8 @@
 *.so
 *.dylib
 /vane
+/useradmin
+/gate
 /bin/
 
 # Test

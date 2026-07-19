@@ -304,3 +304,57 @@ func TestExaFetch_TruncatesCJKAtRuneBoundary(t *testing.T) {
 		t.Errorf("截断不应回退超过一个 rune（%d 字节），实际 %d", utf8.UTFMax, len(got))
 	}
 }
+
+// fakeCallRecorder 收集 RecordBindingCall 的入参（错误路径记账断言用）。
+type fakeCallRecorder struct{ calls []*types.ToolCall }
+
+func (f *fakeCallRecorder) RecordBindingCall(_ context.Context, rec *types.ToolCall) {
+	f.calls = append(f.calls, rec)
+}
+
+// TestExaFetch_ErrorPathsRecordToolCall：429/非 2xx 也必须进 tool_calls
+// （bug 狩猎 2026-07-19 MEDIUM，两路独立发现）：此前只有成功路径记账，
+// Exa 限流一整天账本零行、故障在 tool_calls 上隐形。与 TikHub 成败都记对齐。
+func TestExaFetch_ErrorPathsRecordToolCall(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		body       string
+		wantErrTyp string
+	}{
+		{"429 限流", http.StatusTooManyRequests, `{"error":"rate limited"}`, types.ToolErrInternal},
+		{"500 服务端错误", http.StatusInternalServerError, `boom`, types.ToolErrInternal},
+		{"200 但 JSON 非法", http.StatusOK, `{not-json`, types.ToolErrInternal},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			rec := &fakeCallRecorder{}
+			e := NewExa(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "k"}, rec)
+			e.searchURL = srv.URL
+
+			_, err := e.Fetch(context.Background(), exaSrc(9, `{"query":"q"}`))
+			if err == nil {
+				t.Fatal("错误路径应返回 error")
+			}
+			if len(rec.calls) != 1 {
+				t.Fatalf("错误路径应记恰好 1 条 tool_call，实得 %d", len(rec.calls))
+			}
+			c := rec.calls[0]
+			if c.HTTPStatus == nil || *c.HTTPStatus != tt.status {
+				t.Errorf("HTTPStatus 应为 %d，实为 %v", tt.status, c.HTTPStatus)
+			}
+			if c.Error == "" {
+				t.Error("错误路径的 tool_call 应携带错误文本")
+			}
+			if c.CostUSD != nil {
+				t.Errorf("错误路径不得记成本，实为 %v", *c.CostUSD)
+			}
+		})
+	}
+}

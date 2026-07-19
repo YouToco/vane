@@ -3,6 +3,7 @@ package feishu
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 // TestBuildReplyCard 断言卡片符合飞书 JSON 2.0 schema 的结构约定：
@@ -172,4 +173,49 @@ func TestBuildConfirmCard(t *testing.T) {
 	}
 	assertButton("确认按钮", 0, "primary", "确认", cardActionConfirm)
 	assertButton("取消按钮", 1, "default", "取消", cardActionCancel)
+}
+
+// TestRelativeTimeAt 钉死日历日语义（bug 狩猎 2026-07-19 MEDIUM 修复）：
+// 判据是用户时区（Asia/Shanghai）的日界，不是流逝时长/24——跨日两小时也是"昨天"，
+// 同日二十小时也是"今天"。
+func TestRelativeTimeAt(t *testing.T) {
+	sh := func(y int, m time.Month, d, hh, mm int) time.Time {
+		return time.Date(y, m, d, hh, mm, 0, 0, cardTZ)
+	}
+	now := sh(2026, 7, 19, 1, 0) // 北京 2026-07-19 01:00
+	tests := []struct {
+		name string
+		t    time.Time
+		want string
+	}{
+		{"昨晚 23:00（流逝仅 2h）→ 昨天", sh(2026, 7, 18, 23, 0), "昨天"},
+		{"当日 00:30（同日）→ 今天", sh(2026, 7, 19, 0, 30), "今天"},
+		{"未来时间戳（脏数据）→ 今天", sh(2026, 7, 20, 12, 0), "今天"},
+		{"前天 → 2 天前", sh(2026, 7, 17, 23, 59), "2 天前"},
+		{"UTC 表示的昨天下午（北京昨晚）→ 昨天", time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC), "昨天"},
+		{"35 天前 → 1 月前", sh(2026, 6, 14, 1, 0), "1 月前"},
+		{"400 天前 → 1 年前", sh(2025, 6, 14, 1, 0), "1 年前"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := relativeTimeAt(tt.t, now); got != tt.want {
+				t.Errorf("relativeTimeAt(%v, %v) = %q, want %q", tt.t, now, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPermanentRejection 钉死确定性拒收清单（bug 狩猎 2026-07-19 MAJOR 修复）：
+// 卡片结构非法/收件人非法重试必然同败，不得烧 Temporal 重试预算；未知码保持可重试。
+func TestPermanentRejection(t *testing.T) {
+	for code, want := range map[int]bool{
+		200673: true,  // 卡片结构非法（2026-07-17 生产实锤）
+		230002: true,  // 收件人 open_id 非法
+		230020: false, // 限流类：可重试
+		0:      false, // 未知：可重试
+	} {
+		if got := permanentRejection(code); got != want {
+			t.Errorf("permanentRejection(%d) = %v, want %v", code, got, want)
+		}
+	}
 }

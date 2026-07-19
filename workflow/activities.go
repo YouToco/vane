@@ -806,6 +806,13 @@ feed:
 // 而 llm.Client 早已配好 5 路并发闸门却只被喂进 1 个。顺带也把 activity 的
 // StartToCloseTimeout=120s 从"正在变薄的余量"拉回安全区（45 条 × 最坏 1372ms 已达 62 秒）。
 func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem, error) {
+	// D9 闸门（bug 狩猎 2026-07-19 HIGH：此前只有 EvolveProfile/Fetch 有闸，
+	// Fetch 之后软删的租户仍会在这里烧一整批 LLM 打分钱）。返回空切片走
+	// score 闸门的空批正常终态，与 EvolveProfile 的处理同一条理由：报错会重试，
+	// 而重试同样会被拒。
+	if a.refuseIfTenantGone(ctx, in.UserID, "score") {
+		return nil, nil
+	}
 	// 并发扇出里各 goroutine 都可能撞到配额，用原子标记而非普通 bool。
 	var quotaHit atomic.Bool
 	scored := mapConcurrent(ctx, in.Items, parBatchFanout,
@@ -888,6 +895,10 @@ func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredIte
 // （Push 按本切片顺序拼卡），而 Score 的产出还要过一遍 RankTopN 重排。
 // 换句话说，这里若按完成先后收集，同一批内容每次推送的卡面顺序都会不一样。
 func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard, error) {
+	// D9 闸门（同 Score，bug 狩猎 2026-07-19 HIGH）：不为已注销租户生成解读正文。
+	if a.refuseIfTenantGone(ctx, in.UserID, "cardgen") {
+		return nil, nil
+	}
 	var quotaHit atomic.Bool
 	cards := mapConcurrent(ctx, in.Items, parBatchFanout,
 		func(ctx context.Context, si types.ScoredItem) (GeneratedCard, error) {
@@ -946,6 +957,11 @@ func (a *Activities) RecordEmptyBatch(ctx context.Context, in RecordEmptyIn) err
 // 收件人是飞书 owner（M3 单用户）；无 owner 直接失败。单卡推送失败跳过，
 // 只要有一张成功就算 done，全失败则 failed 并返回错误。
 func (a *Activities) Push(ctx context.Context, in PushIn) error {
+	// D9 闸门（同 Score/CardGen，bug 狩猎 2026-07-19 HIGH）：卡片不发给已注销
+	// 租户的用户——这是整条管道最后也最用户可见的一道；返回 nil 是正常终态。
+	if a.refuseIfTenantGone(ctx, in.UserID, "push") {
+		return nil
+	}
 	owner := a.feishu.OwnerOpenID()
 	if owner == "" {
 		// 无 owner 是"还没人给机器人发过消息"，属确定性前置条件缺失，重试只是重复失败——

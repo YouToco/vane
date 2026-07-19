@@ -606,6 +606,14 @@ func (l *Loop) NotifyEvent(ctx context.Context, userID int64, notice string) {
 //   - write 内部自行落日志、不上抛：旁路回写失败不放大成用户可见错误。
 func (l *Loop) asyncSessionWrite(ctx context.Context, userID int64, write func(dbCtx context.Context)) {
 	go func() {
+		// 独立 goroutine 上的 panic 没有任何上层 recover，会直接带崩整个进程
+		// （bug 狩猎 2026-07-19 MEDIUM）——旁路回写丢一条可忍，带崩服务不可忍。
+		// 兜住只丢本条，与 feishu/handler.go 的 WS 回调链同一条纪律。
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("agent: 会话旁路回写 panic（已兜住，仅丢本条）", "user_id", userID, "recover", r)
+			}
+		}()
 		muVal, _ := l.userMu.LoadOrStore(userID, &sync.Mutex{})
 		mu := muVal.(*sync.Mutex)
 		mu.Lock()
