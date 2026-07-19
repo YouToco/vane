@@ -217,6 +217,9 @@ func resolveResultPath(body []byte, path string) (any, error) {
 // 不占端点限额（msgCap/dailyCap 只数真实上游调用）。
 type readEndpointResultTool struct {
 	cache *resultCache
+	// perRead 单次取回的字符上限，与端点内联同源（由模型窗口派生）：
+	// 取回读的是同一个上下文，凭什么比首屏更小或更大。
+	perRead int
 }
 
 const readEndpointResultSchema = `{
@@ -225,7 +228,7 @@ const readEndpointResultSchema = `{
     "handle": {"type": "string", "description": "截断提示里给出的句柄（如 res-7）"},
     "path": {"type": "string", "description": "可选：点路径取子树（如 data.data.items[3] 或 data.items[0:5]），比分页读全文省得多，优先用"},
     "offset": {"type": "integer", "description": "可选：按字符续读的起点（不带 path 时对原文、带 path 时对子树 JSON 文本生效）"},
-    "limit": {"type": "integer", "description": "可选：本次返回的最大字符数，默认与上限同为 6000"}
+    "limit": {"type": "integer", "description": "可选：本次返回的最大字符数；不传或超上限时按系统上限（由模型上下文窗口派生）"}
   },
   "required": ["handle"]
 }`
@@ -271,8 +274,8 @@ func (t *readEndpointResultTool) Execute(_ context.Context, userID int64, args j
 	}
 
 	limit := a.Limit
-	if limit <= 0 || limit > endpointResultMaxRunes {
-		limit = endpointResultMaxRunes
+	if limit <= 0 || limit > t.perRead {
+		limit = t.perRead
 	}
 	offset := a.Offset
 	if offset < 0 {

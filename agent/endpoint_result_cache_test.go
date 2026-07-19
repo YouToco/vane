@@ -9,7 +9,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/YouToco/vane/llm"
 )
+
+// testLimits 与生产同源：按 agent 模型（deepseek-v4-pro，1M 窗口）派生。
+var testLimits = llm.DeriveInlineLimits(1_000_000)
 
 func execRead(t *testing.T, tool Tool, userID int64, args string) string {
 	t.Helper()
@@ -24,7 +29,7 @@ func TestResultCache_PathExtraction(t *testing.T) {
 	body := []byte(`{"code":200,"data":{"items":[{"id":"a","text":"第一条"},{"id":"b","text":"第二条"},{"id":"c","text":"第三条"}],"total":707}}`)
 	c := newResultCache()
 	h := c.put(1, "ep", body)
-	tool := &readEndpointResultTool{cache: c}
+	tool := &readEndpointResultTool{cache: c, perRead: testLimits.PerCall}
 
 	out := execRead(t, tool, 1, fmt.Sprintf(`{"handle":%q,"path":"data.items[1].text"}`, h))
 	if out != `"第二条"` {
@@ -50,16 +55,16 @@ func TestResultCache_PathExtraction(t *testing.T) {
 }
 
 func TestResultCache_OffsetPaging(t *testing.T) {
-	long := strings.Repeat("字", endpointResultMaxRunes+500)
+	long := strings.Repeat("字", testLimits.PerCall+500)
 	c := newResultCache()
 	h := c.put(1, "ep", []byte(`"`+long+`"`)) // 合法 JSON 字符串
-	tool := &readEndpointResultTool{cache: c}
+	tool := &readEndpointResultTool{cache: c, perRead: testLimits.PerCall}
 
 	first := execRead(t, tool, 1, fmt.Sprintf(`{"handle":%q}`, h))
-	if !strings.Contains(first, fmt.Sprintf(`"offset":%d`, endpointResultMaxRunes)) {
+	if !strings.Contains(first, fmt.Sprintf(`"offset":%d`, testLimits.PerCall)) {
 		t.Errorf("超限续读应给下一步 offset: %s", first[len(first)-160:])
 	}
-	rest := execRead(t, tool, 1, fmt.Sprintf(`{"handle":%q,"offset":%d}`, h, endpointResultMaxRunes))
+	rest := execRead(t, tool, 1, fmt.Sprintf(`{"handle":%q,"offset":%d}`, h, testLimits.PerCall))
 	if strings.Contains(rest, `"offset"`) && strings.Contains(rest, "续读") {
 		t.Errorf("第二页应已读完，不该再给续读提示: %s", rest[len(rest)-160:])
 	}
@@ -72,7 +77,7 @@ func TestResultCache_OffsetPaging(t *testing.T) {
 func TestResultCache_OwnerAndExpiry(t *testing.T) {
 	c := newResultCache()
 	h := c.put(1, "ep", []byte(`{}`))
-	tool := &readEndpointResultTool{cache: c}
+	tool := &readEndpointResultTool{cache: c, perRead: testLimits.PerCall}
 
 	// 换个 userID 读不到（句柄可猜，多租户下不绑定就是跨用户读取面）。
 	if out := execRead(t, tool, 2, fmt.Sprintf(`{"handle":%q}`, h)); !strings.Contains(out, "不存在或已过期") {
@@ -131,11 +136,11 @@ func TestTruncationNote_HonestAboutIncompleteCache(t *testing.T) {
 	// MEDIUM：上游响应本身被 2MiB 上限截断时，缓存的也只是前缀——提示绝不能
 	// 宣称「完整数据已缓存」，否则模型读完前缀会以为拿到了全量。
 	body := []byte(`{"data":{"items":[1,2,3]}}`)
-	full := buildTruncationNote("res-1", len(body), body, false, endpointResultMaxRunes)
+	full := buildTruncationNote("res-1", len(body), body, false, testLimits.PerCall)
 	if !strings.Contains(full, "完整数据已缓存") {
 		t.Errorf("未截断时应声明完整: %s", full)
 	}
-	partial := buildTruncationNote("res-1", len(body), body, true, endpointResultMaxRunes)
+	partial := buildTruncationNote("res-1", len(body), body, true, testLimits.PerCall)
 	if strings.Contains(partial, "完整数据已缓存") || !strings.Contains(partial, "数据不完整") {
 		t.Errorf("上游超限时必须声明不完整: %s", partial)
 	}
@@ -188,23 +193,23 @@ func TestInlineBudget_PerMessageCurve(t *testing.T) {
 	s := &toolRunState{}
 	var total, calls int
 	for i := 0; i < 10; i++ {
-		got := s.inlineBudget()
-		if got < endpointResultMinRunes {
-			t.Fatalf("第 %d 次预算 %d 低于保底 %d", i+1, got, endpointResultMinRunes)
+		got := s.inlineBudget(testLimits)
+		if got < testLimits.MinPerCall {
+			t.Fatalf("第 %d 次预算 %d 低于保底 %d", i+1, got, testLimits.MinPerCall)
 		}
-		if i < 3 && got != endpointResultMaxRunes {
-			t.Errorf("第 %d 次应给满额 %d，实得 %d", i+1, endpointResultMaxRunes, got)
+		if i < 3 && got != testLimits.PerCall {
+			t.Errorf("第 %d 次应给满额 %d，实得 %d", i+1, testLimits.PerCall, got)
 		}
 		s.inlinedRunes += got
 		total += got
 		calls++
 	}
 	// 10 次（msgCap 上限）累计不得失控：预算 + 保底×剩余次数是硬上界。
-	if max := endpointResultMsgBudget + endpointResultMinRunes*calls; total > max {
+	if max := testLimits.MsgBudget + testLimits.MinPerCall*calls; total > max {
 		t.Errorf("累计内联 %d 超硬上界 %d", total, max)
 	}
 	// nil state（RunOnce/A2A 等无状态轨）不 panic 且给满额。
-	if (*toolRunState)(nil).inlineBudget() != endpointResultMaxRunes {
+	if (*toolRunState)(nil).inlineBudget(testLimits) != testLimits.PerCall {
 		t.Error("nil state 应给满额")
 	}
 }

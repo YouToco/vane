@@ -42,31 +42,14 @@ const (
 	maxActivatedEndpoints = 14
 	// searchTopK 每次检索返回并激活的端点数（Anthropic Tool Search 默认值同为 5）。
 	searchTopK = 5
-	// endpointResultMaxRunes 单次端点结果内联回模型的上限（rune）。
+	// 端点结果的内联上限**不再是常量**：由 agent 模型声明的上下文窗口派生
+	// （llm.DeriveInlineLimits，OpenClaw 同款分档 + 窗口 30% 封顶），随
+	// EndpointTools 注入。写死过一次的教训见 llm/context.go 头注——6000 rune
+	// 是 64K 窗口时代拍的值，模型换到 1M 后没人记得改，直到 Boss 在生产撞见截断。
 	//
-	// 【2026-07-18 由 6000 提到 40000】原值是「无取回通道」时代的保守值：被截即丢，
-	// 只能靠小上限少丢点。业界横比（源码级，契约 §3.5）我们当时是最小的，而
-	// deepseek-v4-pro 是**1M 上下文**——全场最大的窗口配全场最小的上限：
-	//   Claude Code MCP 25k tokens(≈100k chars) / Bash 30k chars / 落盘线 50k chars
-	//   Pi 50KB          OpenClaw 按窗口分档 16k/32k/64k chars（≤窗口 30%）
-	//   Codex 10k tokens(≈40k bytes)          vane 旧值 6000 rune ← 差一个数量级
-	// 40000 rune 的依据：对齐 Claude Code 的 MCP 档（同为「工具返回任意 JSON」场景，
-	// 中文 JSON 约 1.5–2 char/token → ≈20–27k token），仍只占 1M 窗口的 ~2.5%。
-	//
-	// 敢放大的前提是句柄取回已存在（§3.5）：超出部分不再丢失，上限从「数据生死线」
-	// 降级为「首屏预算」。真正的护栏改由下面的每消息累计预算承担。
-	endpointResultMaxRunes = 40000
-	// endpointResultMsgBudget 单条消息内**全部**端点结果内联字符的累计预算。
-	//
-	// 存在的理由是单次上限管不住的那笔账：msgCap 允许一条消息调 10 次端点，
-	// 10×40000 = 400k rune 会把窗口吃掉近半；更贵的是 FC 多轮——历史每轮重发，
-	// MaxTurns=20 时 N 字符要按 N×轮数计入输入成本（DeepSeek 前缀缓存能打折，
-	// 但打不掉数量级）。故按「前几次给满、后续降级到 floor」的曲线分配：
-	// 先调的通常是主查询、值得看全，后调的多是补充，读摘要+按需句柄取回即可。
-	endpointResultMsgBudget = 120000
-	// endpointResultMinRunes 预算耗尽后每次仍保证的最小内联量：够看清结构与首屏
-	// 内容，剩余走 read_endpoint_result。给 0 会让模型「看不见任何东西」而瞎猜。
-	endpointResultMinRunes = 4000
+	// endpointResultFallbackRunes 仅用于装配缺失时的兜底（NewEndpointTools 收到
+	// 非法窗口值），不参与正常路径。
+	endpointResultFallbackRunes = 16000
 	// endpointDefDescMaxRunes 动态工具 Description 的截断上限。激活的每个工具
 	// 定义每轮都随请求发送，600 rune 全文 ×15 个会持续吃预算；检索结果文本里
 	// 已给过更全的说明，注入定义只保留摘要级描述。
@@ -96,23 +79,24 @@ type toolRunState struct {
 	// 参数校验失败没打上游、不计费，不吃限额。
 	endpointCalls int
 	// inlinedRunes 本条消息内已内联进上下文的端点结果字符数（累计预算，
-	// 见 endpointResultMsgBudget）。只统计真正回给模型的部分，不含缓存全量。
+	// 见 llm.InlineLimits.MsgBudget）。只统计真正回给模型的部分，不含缓存全量。
 	inlinedRunes int
 }
 
 // inlineBudget 返回本次调用可内联的字符数：预算未尽给满额，尽了给保底
 // （保底仍有句柄可取回，故不是数据丢失，只是首屏变窄）。
-func (s *toolRunState) inlineBudget() int {
+// s 为 nil（RunOnce/A2A 无状态轨）时按单次满额，不累计。
+func (s *toolRunState) inlineBudget(lim llm.InlineLimits) int {
 	if s == nil {
-		return endpointResultMaxRunes
+		return lim.PerCall
 	}
-	if left := endpointResultMsgBudget - s.inlinedRunes; left < endpointResultMaxRunes {
-		if left < endpointResultMinRunes {
-			return endpointResultMinRunes
+	if left := lim.MsgBudget - s.inlinedRunes; left < lim.PerCall {
+		if left < lim.MinPerCall {
+			return lim.MinPerCall
 		}
 		return left
 	}
-	return endpointResultMaxRunes
+	return lim.PerCall
 }
 
 func runStateFrom(ctx context.Context) *toolRunState {
@@ -205,25 +189,40 @@ type EndpointTools struct {
 	msgCap   int
 	dailyCap int
 	results  *resultCache // 大结果缓存（契约 §3.5：截断句柄 + read_endpoint_result 取回）
+	// limits 由 agent 模型的上下文窗口派生（llm.DeriveInlineLimits）：内联多少
+	// 内容是模型属性不是代码常量，模型换代时自动跟随，无需有人记得改这里。
+	limits llm.InlineLimits
 }
 
 // NewEndpointTools 构造端点工具面。caps ≤0 时兜底为保守默认（装配疏漏不能变成无限额）。
-func NewEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, dailyCap int) *EndpointTools {
+// contextTokens 是 agent 模型声明的上下文窗口（llm.ContextWindowTokens）；
+// ≤0 时按保守兜底档派生，绝不因装配疏漏放大内联量。
+func NewEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, dailyCap, contextTokens int) *EndpointTools {
 	if msgCap <= 0 {
 		msgCap = 10
 	}
 	if dailyCap <= 0 {
 		dailyCap = 200
 	}
+	limits := llm.DeriveInlineLimits(contextTokens)
+	if contextTokens <= 0 {
+		limits = llm.InlineLimits{
+			PerCall:    endpointResultFallbackRunes,
+			MsgBudget:  endpointResultFallbackRunes * 3,
+			MinPerCall: endpointResultFallbackRunes / 4,
+		}
+	}
 	return &EndpointTools{inv: inv, counter: counter, msgCap: msgCap, dailyCap: dailyCap,
-		results: newResultCache()}
+		results: newResultCache(), limits: limits}
 }
 
 // SearchTool 返回检索元工具（进静态白名单，BuildTools 装配）。
 func (e *EndpointTools) SearchTool() Tool { return &searchEndpointsTool{ep: e} }
 
 // ReadResultTool 返回大结果取回工具（进静态白名单，BuildTools 装配；契约 §3.5）。
-func (e *EndpointTools) ReadResultTool() Tool { return &readEndpointResultTool{cache: e.results} }
+func (e *EndpointTools) ReadResultTool() Tool {
+	return &readEndpointResultTool{cache: e.results, perRead: e.limits.PerCall}
+}
 
 // Resolve 按白名单语义解析动态端点工具：必须**已激活**且仍在注册表里。
 // 注册表里存在但未激活 → 不解析（见文件头注第二条硬边界）；
@@ -536,7 +535,7 @@ func (t *endpointTool) Execute(ctx context.Context, userID int64, args json.RawM
 	}
 
 	raw := string(res.Body)
-	limit := state.inlineBudget() // 每消息累计预算下的本次额度（见 endpointResultMsgBudget）
+	limit := state.inlineBudget(t.ep.limits) // 每消息累计预算下的本次额度（由窗口派生）
 	body := truncateRunes(raw, limit)
 	if state != nil {
 		state.inlinedRunes += utf8.RuneCountInString(body)

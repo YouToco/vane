@@ -156,8 +156,11 @@ func run() error {
 	// agent 退化为纯静态工具面——比装一个恒报"key 缺失"的检索工具干净。
 	var endpoints *agent.EndpointTools
 	if cfg.Fetch.TikhubAPIKey != "" {
+		// 内联上限由 agent 模型声明的上下文窗口派生（llm/context.go）：模型换代
+		// 时上限自动跟随，不再依赖有人记得改常量（6000 rune 失真一年的教训）。
 		endpoints = agent.NewEndpointTools(tikhubinvoke.New(cfg.Fetch), st,
-			cfg.Agent.EndpointMsgCap, cfg.Agent.EndpointDailyCap)
+			cfg.Agent.EndpointMsgCap, cfg.Agent.EndpointDailyCap,
+			llm.ContextWindowTokens(cfg.LLM.AgentModel))
 	}
 	// 任务手册翻译器（P1 编译层）：create/edit 手册后据此把正文编译成 fetch_plan。
 	// 用 client 默认模型（同 scorer/cardgen），走 recorder 记账；一次 llm.Do、DisableThinking。
