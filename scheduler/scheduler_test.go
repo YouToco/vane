@@ -11,8 +11,10 @@ import (
 	enums "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 
 	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/workflow"
 )
 
 // TestValidateSpec 覆盖中立 spec 校验：cron/every 互斥、1 小时硬地板。
@@ -216,15 +218,22 @@ func TestTriggerPushNow_OtherError(t *testing.T) {
 // 那是最需要验证、又最不可能在真库上自然发生的路径。
 // ============================================================
 
-// fakeScheduleClient 只拦截 GetHandle，返回同一个 handle 供断言。
+// fakeScheduleClient 只拦截 GetHandle。默认返回同一个 handle（UpdatePush 单调度用例）；
+// 设了 handles 映射则按 id 返回对应 handle（ReconcileActions 多调度用例）。
 type fakeScheduleClient struct {
 	client.ScheduleClient
-	handle *fakeScheduleHandle
-	gotID  string
+	handle  *fakeScheduleHandle
+	handles map[string]*fakeScheduleHandle // 非 nil 时按 id 查；缺失回退 handle
+	gotID   string
 }
 
 func (f *fakeScheduleClient) GetHandle(_ context.Context, id string) client.ScheduleHandle {
 	f.gotID = id
+	if f.handles != nil {
+		if h, ok := f.handles[id]; ok {
+			return h
+		}
+	}
 	return f.handle
 }
 
@@ -232,9 +241,18 @@ func (f *fakeScheduleClient) GetHandle(_ context.Context, id string) client.Sche
 // 把返回的 Schedule 落成新的当前值——这样才能断言"只有 Spec 变了、Action/Policy 没丢"。
 type fakeScheduleHandle struct {
 	client.ScheduleHandle
-	current   client.Schedule
-	updateErr error             // 非 nil = 模拟 Temporal Update 失败
-	history   []client.Schedule // 每次成功 Update 后的快照（用于验回滚发生过）
+	current     client.Schedule
+	updateErr   error             // 非 nil = 模拟 Temporal Update 失败
+	describeErr error             // 非 nil = 模拟 Temporal Describe 失败（reconcile 用例）
+	history     []client.Schedule // 每次成功 Update 后的快照（用于验回滚发生过）
+}
+
+// Describe 返回当前持有的 Schedule 快照，供 ReconcileActions 判断是否已带 schedule_id。
+func (h *fakeScheduleHandle) Describe(_ context.Context) (*client.ScheduleDescription, error) {
+	if h.describeErr != nil {
+		return nil, h.describeErr
+	}
+	return &client.ScheduleDescription{Schedule: h.current}, nil
 }
 
 func (h *fakeScheduleHandle) Update(_ context.Context, o client.ScheduleUpdateOptions) error {
@@ -260,6 +278,13 @@ type fakeScheduleStore struct {
 	gotSpec    json.RawMessage
 	gotNLDesc  *string
 	updateCall int
+	active     []types.Schedule // ReconcileActions 用例：ListActiveSchedules 返回值
+	activeErr  error
+}
+
+// ListActiveSchedules 供 ReconcileActions 用例注入存量调度集合。
+func (f *fakeScheduleStore) ListActiveSchedules(_ context.Context) ([]types.Schedule, error) {
+	return f.active, f.activeErr
 }
 
 // GetSchedule 一律放行：本组用例聚焦「更新 Spec 时不弄丢 Action/Policy」，
@@ -607,5 +632,135 @@ func TestOwnershipCheckedBeforeTemporal(t *testing.T) {
 	}
 	if st.deleteCalls != 0 {
 		t.Error("越权请求不得删除镜像")
+	}
+}
+
+// ============================================================
+// ReconcileActions：给 b1 之前建的存量调度补齐 Action.Args 里的 schedule_id。
+// 复用 UpdatePush 那套 ScheduleClient/Handle 替身，额外让 Handle 支持 Describe。
+// ============================================================
+
+// payloadArg 把一个 PushParams 编码成 Describe 返回的原始态（*commonpb.Payload），
+// 塞进 Action.Args——模拟 Temporal 服务端持有的冻结入参。
+func payloadArg(t *testing.T, p workflow.PushParams) interface{} {
+	t.Helper()
+	pl, err := converter.GetDefaultDataConverter().ToPayload(p)
+	if err != nil {
+		t.Fatalf("编码 PushParams 失败: %v", err)
+	}
+	return pl
+}
+
+// reconcileSchedule 造一个"服务端已有"的完整调度：Action.Args 由调用方指定，
+// 其余字段（Workflow 类型名 / TaskQueue / Spec / Overlap / State）是本组用例断言的保留对象。
+func reconcileSchedule(actionID string, args []interface{}) client.Schedule {
+	return client.Schedule{
+		Action: &client.ScheduleWorkflowAction{
+			ID:        actionID,
+			Workflow:  "PushPipelineWorkflow",
+			TaskQueue: "vane-tq",
+			Args:      args,
+		},
+		Spec:   &client.ScheduleSpec{CronExpressions: []string{"30 8 * * *"}, TimeZoneName: "Asia/Shanghai"},
+		Policy: &client.SchedulePolicies{Overlap: enums.SCHEDULE_OVERLAP_POLICY_SKIP},
+		State:  &client.ScheduleState{Note: "原始状态"},
+	}
+}
+
+// TestReconcileActions_补齐缺失的scheduleID 是本能力的头号不变量：
+// 存量调度 Action.Args 冻结着 b1 之前的旧入参（无 schedule_id），reconcile 后必须带上
+// schedule_id 与 NLDesc，且**只换 Args**——Workflow/TaskQueue/Spec/Overlap/State 全保留。
+func TestReconcileActions_补齐缺失的scheduleID(t *testing.T) {
+	frozen := []interface{}{payloadArg(t, workflow.PushParams{UserID: 1})} // 无 ScheduleID
+	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-old", frozen)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{"push-1-old": h},
+	}}
+	st := &fakeScheduleStore{active: []types.Schedule{{
+		ID: "push-1-old", UserID: 1, NLDescription: "每天早上 8:30 推送今日精选",
+		ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
+	}}}
+	s := New(fc, "tq", st)
+
+	if err := s.ReconcileActions(context.Background()); err != nil {
+		t.Fatalf("ReconcileActions 失败: %v", err)
+	}
+	if len(h.history) != 1 {
+		t.Fatalf("缺 id 的调度应被 Update 一次，实得 %d", len(h.history))
+	}
+	act, ok := h.current.Action.(*client.ScheduleWorkflowAction)
+	if !ok {
+		t.Fatalf("Action 类型错: %T", h.current.Action)
+	}
+	got, ok := act.Args[0].(workflow.PushParams)
+	if !ok {
+		t.Fatalf("Args[0] 应为 PushParams，实得 %T", act.Args[0])
+	}
+	if got.ScheduleID != "push-1-old" {
+		t.Errorf("应补上 schedule_id=push-1-old，实得 %q", got.ScheduleID)
+	}
+	if got.UserID != 1 {
+		t.Errorf("UserID 应保留 1，实得 %d", got.UserID)
+	}
+	if got.NLDesc != "每天早上 8:30 推送今日精选" {
+		t.Errorf("NLDesc 应从镜像补上任务名，实得 %q", got.NLDesc)
+	}
+	// 只换 Args：其余字段原样保留（丢了会让调度再也不推送 / 推送堆叠）。
+	if act.ID != "wf-push-1-old" || act.TaskQueue != "vane-tq" || act.Workflow != "PushPipelineWorkflow" {
+		t.Errorf("Action 其余字段必须保留，实得 %+v", act)
+	}
+	if len(h.current.Spec.CronExpressions) != 1 || h.current.Spec.CronExpressions[0] != "30 8 * * *" {
+		t.Errorf("Spec 不该被动，实得 %+v", h.current.Spec)
+	}
+	if h.current.Policy == nil || h.current.Policy.Overlap != enums.SCHEDULE_OVERLAP_POLICY_SKIP {
+		t.Errorf("Overlap=SKIP 不该被动")
+	}
+	if h.current.State == nil || h.current.State.Note != "原始状态" {
+		t.Errorf("State 不该被动")
+	}
+}
+
+// TestReconcileActions_已带id则跳过 守幂等：Action.Args 已带正确 schedule_id 的调度
+// （新建的、或上次已 reconcile 过的）重启时不得再写 Temporal。走真 payload 解码路径。
+func TestReconcileActions_已带id则跳过(t *testing.T) {
+	good := []interface{}{payloadArg(t, makePushParams(1, "push-1-new", workflow.PushScope{}, "任务名"))}
+	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-new", good)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{"push-1-new": h},
+	}}
+	st := &fakeScheduleStore{active: []types.Schedule{{
+		ID: "push-1-new", UserID: 1, ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
+	}}}
+	s := New(fc, "tq", st)
+
+	if err := s.ReconcileActions(context.Background()); err != nil {
+		t.Fatalf("ReconcileActions 失败: %v", err)
+	}
+	if len(h.history) != 0 {
+		t.Errorf("已带正确 schedule_id 的调度不应再 Update，实得 %d 次", len(h.history))
+	}
+}
+
+// TestReconcileActions_单条失败不中断 守 best-effort：一个调度 Describe 失败只跳过它，
+// 不阻断其它调度，整体仍返回 nil（不因个别 reconcile 失败而拒绝启动）。
+func TestReconcileActions_单条失败不中断(t *testing.T) {
+	bad := &fakeScheduleHandle{describeErr: errors.New("temporal 抖动")}
+	goodFrozen := []interface{}{payloadArg(t, workflow.PushParams{UserID: 2})}
+	good := &fakeScheduleHandle{current: reconcileSchedule("wf-push-2-ok", goodFrozen)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handles: map[string]*fakeScheduleHandle{
+		"push-1-bad": bad,
+		"push-2-ok":  good,
+	}}}
+	st := &fakeScheduleStore{active: []types.Schedule{
+		{ID: "push-1-bad", UserID: 1, ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive},
+		{ID: "push-2-ok", UserID: 2, ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive},
+	}}
+	s := New(fc, "tq", st)
+
+	if err := s.ReconcileActions(context.Background()); err != nil {
+		t.Fatalf("best-effort 应返回 nil，实得 %v", err)
+	}
+	if len(good.history) != 1 {
+		t.Errorf("失败调度不该阻断后续，good 应被 Update 一次，实得 %d", len(good.history))
 	}
 }
