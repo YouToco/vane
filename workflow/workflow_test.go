@@ -55,6 +55,7 @@ type gateStubs struct {
 	mu       sync.Mutex
 	recorded []RecordEmptyIn
 	pushed   []PushIn
+	notified []NotifyEmptyIn // NotifyEmptyResult 实际收到的入参（select 闸门恒通知断言用）
 }
 
 func (g *gateStubs) register(env *testsuite.TestWorkflowEnvironment) {
@@ -79,12 +80,27 @@ func (g *gateStubs) register(env *testsuite.TestWorkflowEnvironment) {
 		g.recorded = append(g.recorded, in)
 		return g.out.recErr
 	})
+	// 此前刻意不注册：非用户触发的路径永远走不到它，未注册的失败被 workflow 吞掉
+	// 恰好证明这一点。门槛过滤落地后 select 闸门**恒通知**（含定时触发），
+	// 桩转为记录入参供断言——"恒通知"不能再靠"没注册也没炸"来间接证明。
+	reg("NotifyEmptyResult", func(_ context.Context, in NotifyEmptyIn) error {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.notified = append(g.notified, in)
+		return nil
+	})
 }
 
 func (g *gateStubs) snapshot() (recorded []RecordEmptyIn, pushed []PushIn) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return append([]RecordEmptyIn(nil), g.recorded...), append([]PushIn(nil), g.pushed...)
+}
+
+func (g *gateStubs) notifiedCalls() []NotifyEmptyIn {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]NotifyEmptyIn(nil), g.notified...)
 }
 
 // countsStr 把漏斗渲染成可读串，**nil 字段直接不出现**——这正是要断言的语义边界：
@@ -223,6 +239,22 @@ func TestPushPipelineWorkflow_EmptyBatchExitGates(t *testing.T) {
 			if got.TraceID == "" {
 				t.Error("空批次必须带 traceID 作幂等键，实得空串")
 			}
+			// 门槛过滤落地（契约 §6.1）：select 闸门**恒通知**（本测试 workflow ID 是
+			// default-test-workflow-id，非用户触发——通知发生即证明"恒"），其余闸门
+			// 非用户触发保持静默。通知须带门槛上下文：ScheduleID 供活动查档位、
+			// MaxScore=过滤前最高分（scoredItems 全 80 分）。
+			notified := g.notifiedCalls()
+			if tc.wantGate == types.BatchExitGateSelect {
+				if len(notified) != 1 {
+					t.Fatalf("select 闸门应恒发空批通知（含定时触发），实得 %d 次", len(notified))
+				}
+				n := notified[0]
+				if n.Gate != types.BatchExitGateSelect || n.ScheduleID != "push-7-x" || n.MaxScore != 80 {
+					t.Errorf("空批通知上下文不符: gate=%q schedule_id=%q max_score=%v", n.Gate, n.ScheduleID, n.MaxScore)
+				}
+			} else if len(notified) != 0 {
+				t.Errorf("非用户触发的 %s 闸门不该发通知，实得 %d 次", tc.wantGate, len(notified))
+			}
 		})
 	}
 }
@@ -356,7 +388,9 @@ func TestPushPipelineWorkflow_QuotaExitsAsNormalTerminal(t *testing.T) {
 // TestEmptyResultMarkdown_QuotaIsHonest：额度闸门的文案不得说"没有新内容"。
 // 内容很可能是有的，只是没额度去处理它。
 func TestEmptyResultMarkdown_QuotaIsHonest(t *testing.T) {
-	txt := emptyResultMarkdown(types.BatchExitGateQuota, types.PipelineCounts{})
+	txt := emptyResultMarkdown(
+		NotifyEmptyIn{Gate: types.BatchExitGateQuota, Counts: types.PipelineCounts{}},
+		types.StrictnessNormal)
 	if strings.Contains(txt, "没有新内容") {
 		t.Errorf("额度文案不得说「没有新内容」——内容可能是有的，只是没额度处理：%q", txt)
 	}

@@ -42,6 +42,7 @@ type cachedResult struct {
 	body     []byte
 	endpoint string
 	userID   int64
+	seq      int64 // put 序号（nextID），逐出时序的权威——见 evictOldestLocked
 	at       time.Time
 }
 
@@ -57,24 +58,34 @@ func newResultCache() *resultCache {
 	return &resultCache{entries: map[string]*cachedResult{}}
 }
 
-// put 存入完整响应体，返回句柄。超量时逐出最旧条目（LRU by 存入时间——
+// put 存入完整响应体，返回句柄。超量时逐出最旧条目（LRU by 存入序号——
 // 取回不刷新时序：句柄的生命周期语义是「这次调用后的 30 分钟」，不是活跃度）。
 func (c *resultCache) put(userID int64, endpoint string, body []byte) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.nextID++
 	handle := "res-" + strconv.FormatInt(c.nextID, 10)
-	c.entries[handle] = &cachedResult{body: body, endpoint: endpoint, userID: userID, at: time.Now()}
+	c.entries[handle] = &cachedResult{body: body, endpoint: endpoint, userID: userID, seq: c.nextID, at: time.Now()}
 	if len(c.entries) > resultCacheMaxEntries {
-		oldest, oldestAt := "", time.Now()
-		for h, e := range c.entries {
-			if e.at.Before(oldestAt) {
-				oldest, oldestAt = h, e.at
-			}
-		}
-		delete(c.entries, oldest)
+		c.evictOldestLocked()
 	}
 	return handle
+}
+
+// evictOldestLocked 逐出最早存入的一条（调用方须持锁）。按 put 序号而非 at 比较：
+// 时钟粒度粗时（Windows tick 0.5–15.6ms）同 tick 连续 put 的 at 完全相同，旧实现
+// 「严格 Before + time.Now() 初值」在全员并列时选不出牺牲者，delete("") 静默无效、
+// 缓存越限（2026-07-19 实 bug）；且并列下按 at 选谁都是 map 随机序，序号才是
+// 插入次序的无损全序。
+func (c *resultCache) evictOldestLocked() {
+	var oldest string
+	var oldestSeq int64
+	for h, e := range c.entries {
+		if oldest == "" || e.seq < oldestSeq {
+			oldest, oldestSeq = h, e.seq
+		}
+	}
+	delete(c.entries, oldest)
 }
 
 // get 取句柄；过期/不存在/非本人一律 miss（不区分口径，防句柄探测）。

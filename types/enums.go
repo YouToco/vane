@@ -125,6 +125,52 @@ const (
 	BatchExitGateCardGen BatchExitGate = "cardgen" // 卡片生成后无候选
 )
 
+// PushStrictness 任务级推送门槛档位（schedules.push_strictness，migration 025）。
+//
+// 为什么是档位不是分数：打分器输出 0-100，但中段分（45 vs 55）是模型主观、无校准
+// 意义（Boss 2026-07-19 质疑实录），唯一有语义锚点的是 prompt 显式指令的 0-20
+// "不该推"档（scorer/scorer.go：不感兴趣主题 / 正文过少 → 给 0-20）。档位制只让
+// 用户在"多严"这个语义维度上表态（agent 对话里"这个任务严一点"即可调），数字映射
+// 收敛在 MinKeepScore 一处。空串 = 未设置（Select 按 DefaultStrictness 兜底）——
+// 与 NULL 列对应，"没说"≠"要宽松"。
+type PushStrictness string
+
+const (
+	StrictnessLoose  PushStrictness = "loose"  // 宽松：只滤"模型已分类为不相关"的 0-20 档（全局兜底同档）
+	StrictnessNormal PushStrictness = "normal" // 标准：弱相关（<40）也不推
+	StrictnessStrict PushStrictness = "strict" // 严格：仅高相关（≥60）才推
+)
+
+// DefaultStrictness 是未设置档位（含 user-global 立即推送这类无任务路径）的全局兜底：
+// 0-20 语义档在任何路径都不推——2026-07-19 的 5 张 0 分卡就是没有这道兜底的直接后果。
+const DefaultStrictness = StrictnessLoose
+
+// Valid 报告 s 是否为三档之一（空串不算：空串是"未设置"，由调用方先行归一）。
+func (s PushStrictness) Valid() bool {
+	switch s {
+	case StrictnessLoose, StrictnessNormal, StrictnessStrict:
+		return true
+	}
+	return false
+}
+
+// MinKeepScore 返回该档位的最低保留分（Score >= 此值才可进入推送）。
+// loose=21 的来由：0-20 是打分 prompt 的"不该推"语义档（含 20 本身），过滤它
+// = 保留 Score >= 21（打分器输出整数分时等价"保留 >20"；万一出现 20.x 的小数分，
+// >=21 会把它滤掉——贴着语义档的保守边界）——这里消费的是"模型做过不相关分类"
+// 这个信号，不是分数的精确性。未设置/非法值按 DefaultStrictness 兜底，恒有下限，
+// 不存在"档位坏了就放行一切"的 fail-open。
+func (s PushStrictness) MinKeepScore() int {
+	switch s {
+	case StrictnessNormal:
+		return 40
+	case StrictnessStrict:
+		return 60
+	default: // loose / 空串 / 非法值 → 全局兜底
+		return 21
+	}
+}
+
 // DeliveryStatus 单条投递状态（deliveries.status）。
 type DeliveryStatus string
 
