@@ -151,9 +151,10 @@ func (s PushStrictness) Valid() bool {
 }
 
 // MinKeepScore 返回该档位的最低保留分（Score >= 此值才可进入推送）。
-// loose=21 的来由：0-20 是打分 prompt 的"不该推"语义档（含 20 本身），
-// 过滤它 = 保留 >20 = 下限 21——这里消费的是"模型做过不相关分类"这个信号，
-// 不是分数的精确性。未设置/非法值按 DefaultStrictness 兜底，恒有下限，
+// loose=21 的来由：0-20 是打分 prompt 的"不该推"语义档（含 20 本身），过滤它
+// = 保留 Score >= 21（打分器输出整数分时等价"保留 >20"；万一出现 20.x 的小数分，
+// >=21 会把它滤掉——贴着语义档的保守边界）——这里消费的是"模型做过不相关分类"
+// 这个信号，不是分数的精确性。未设置/非法值按 DefaultStrictness 兜底，恒有下限，
 // 不存在"档位坏了就放行一切"的 fail-open。
 func (s PushStrictness) MinKeepScore() int {
 	switch s {
