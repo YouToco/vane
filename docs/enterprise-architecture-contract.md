@@ -332,9 +332,22 @@ CREATE TABLE tenant_quota (
 
 ### §2.8 已知越权洞（接缝②打开当天即生效，必须同批修）
 
-- `api/schedules.go:102-118` `handleDeleteSchedule` —— 注释「单 owner：所有调度同属一人」，
-  `DeletePush(id)` 无归属过滤。
-- `agent/tools.go:552-566` `removeScheduleTool` —— 同源注释，同样无过滤。
+- ~~`api/schedules.go` `handleDeleteSchedule`~~ —— **2026-07-19 核实已修**：
+  handler 传 userID，`Scheduler.DeletePush` 内 `GetSchedule(id, userID)` 归属校验先行。
+- ~~`agent/tools.go` `removeScheduleTool`~~ —— **同上已修**，同一条校验路径。
+
+> **2026-07-19 复查记录**：两处洞在多租户改造中已补上校验，但当时**没有回归测试锁住**
+> ——而同期的 `ClaimPendingAction`、`EnableSource`、卡片回调 delivery 都有越权用例，
+> 唯独契约点名的这两处没有。修好而无守卫只等于「这一版是对的」，不等于「以后也对」。
+> 现由 `store/schedule_ownership_test.go` 守住（`GetSchedule` / `DeleteSchedule` 的
+> 归属谓词各有一条反向验证：摘掉谓词即变红）。
+>
+> 同批清理了两处**说假话的注释**：`api/schedules.go` 与 `agent/tools.go` 里
+> 「单 owner，故不逐条校验归属」在代码已校验后仍留在原地。代码在校验、注释说不校验，
+> 后来的人会据此把 userID 参数当冗余删掉——那一刀下去才是真的越权洞。
+>
+> 同期排查的其余用户可传 id 的入口（调度更新、信源退订/启用、卡片回调 delivery）
+> **均已带归属谓词**，无新增洞。
 
 **范式（做得最好的一处）**:`store/agent.go` 的 `ClaimPendingAction`/`CancelPendingAction`
 把归属校验放进 WHERE 谓词内，越权请求完全无副作用。

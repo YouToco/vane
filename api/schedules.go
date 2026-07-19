@@ -152,7 +152,13 @@ func (s *server) handleUpdateSchedule(w http.ResponseWriter, r *http.Request) {
 // handleDeleteSchedule 删除一个调度（Temporal + 镜像）。
 // DELETE /api/schedules/{id} → 200 {ok}
 //
-// M3 单 owner：所有调度同属一人，且 Dashboard 有密码门，故不再逐条校验归属。
+// 归属校验由 Scheduler.DeletePush 内的 GetSchedule(id, userID) 承担：
+// 「不存在」与「不属于你」归一为 NotFound，不给调用方枚举他人调度 id 的机会。
+//
+// 此处原注释写着「单 owner：所有调度同属一人，故不再逐条校验归属」——那是 M3 的实情，
+// 契约 §2.8 曾据此把本处列为已知越权洞。多租户改造时校验已经补上，但注释留在了原地，
+// **代码在校验、注释说不校验**。留着它的风险很具体：后来的人会据此把 userID 参数
+// 当作冗余优化掉，而那一刀下去就是真的越权洞。
 func (s *server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
