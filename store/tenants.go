@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -82,6 +83,14 @@ func (s *Store) CreateTenantWithInvite(ctx context.Context, code string, userID 
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase, "提交事务失败", err)
+	}
+	// 配额 seed 放在事务**之外**、且失败只记日志：没有配额行的租户会被 TryConsume
+	// 一律拒绝（缺行 = 无额度，见 tenant_quota.go），所以 seed 失败的后果是
+	// 「这个租户暂时什么都用不了」——难受，但安全。反过来把它塞进事务里，
+	// 一次 seed 失败就会让整个注册回滚，把一个可恢复的问题升级成注册失败。
+	if err := s.SeedTenantQuota(ctx, t.ID); err != nil {
+		slog.Error("建租户后初始化配额失败，该租户暂无可用额度",
+			"tenant_id", t.ID, "err", err)
 	}
 	return &t, nil
 }
