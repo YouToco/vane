@@ -39,14 +39,14 @@ func requireAllKindArticle(t *testing.T, items []types.ContentItem) {
 }
 
 func TestMapItems_RSSProducesKindArticle(t *testing.T) {
-	items := mapItems(rssSource(1), []*gofeed.Item{
+	items, _ := mapItems(rssSource(1), []*gofeed.Item{
 		{Link: bbcURL, Title: "标题", Content: "正文"},
 	})
 	requireAllKindArticle(t, items)
 }
 
 func TestMapExaResults_ProducesKindArticle(t *testing.T) {
-	items := mapExaResults(exaSource(1), []exaResult{
+	items, _ := mapExaResults(exaSource(1), []exaResult{
 		{ID: "exa-1", URL: "https://news.example/a", Title: "标题", Text: "正文"},
 	})
 	requireAllKindArticle(t, items)
@@ -74,10 +74,12 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 		items      func(t *testing.T) []types.ContentItem
 	}{
 		{types.PlatformWeb, types.CapFeed, func(*testing.T) []types.ContentItem {
-			return mapItems(rssSource(1), []*gofeed.Item{{Link: bbcURL, Title: "标题", Content: "正文"}})
+			items, _ := mapItems(rssSource(1), []*gofeed.Item{{Link: bbcURL, Title: "标题", Content: "正文"}})
+			return items
 		}},
 		{types.PlatformWeb, types.CapSearch, func(*testing.T) []types.ContentItem {
-			return mapExaResults(exaSource(1), []exaResult{{ID: "exa-1", URL: "https://news.example/a", Title: "标题", Text: "正文"}})
+			items, _ := mapExaResults(exaSource(1), []exaResult{{ID: "exa-1", URL: "https://news.example/a", Title: "标题", Text: "正文"}})
+			return items
 		}},
 		{types.PlatformWeb, types.CapContents, func(*testing.T) []types.ContentItem {
 			return contentsItems(
@@ -140,18 +142,19 @@ func TestFinalize_DropsItemWithoutKind(t *testing.T) {
 	src := rssSource(1)
 	item := types.ContentItem{SourceID: 1, URL: bbcURL, Title: "有身份没 kind", Content: "正文"}
 
-	if finalize(src, &item) {
-		t.Fatalf("空 Kind 的条目必须被拒绝（否则空串覆盖 DB DEFAULT，重演 012 回填的污染），实得 Kind=%q", item.Kind)
+	if r := finalize(src, &item); r != dropNoKind {
+		t.Fatalf("空 Kind 的条目必须被拒绝且原因为 %q（否则空串覆盖 DB DEFAULT，重演 012 回填的污染），实得原因 %q、Kind=%q",
+			dropNoKind, r, item.Kind)
 	}
 	if item.CanonicalKey == "" {
 		t.Error("拒绝应发生在 Kind 校验（身份校验之后）——canonical_key 为空说明死在了身份校验，用例没测到目标分支")
 	}
 }
 
-// contentsItems 把 mapExaContents 的 (item, ok) 适配成切片，供 kind 一致性锁复用。
+// contentsItems 把 mapExaContents 的 (item, dropReason) 适配成切片，供 kind 一致性锁复用。
 func contentsItems(src types.Source, results []exaContentsResult) []types.ContentItem {
-	it, ok := mapExaContents(src, "https://x.example/pricing", "", results)
-	if !ok {
+	it, dr := mapExaContents(src, "https://x.example/pricing", "", results)
+	if dr != dropNone {
 		return nil
 	}
 	return []types.ContentItem{it}

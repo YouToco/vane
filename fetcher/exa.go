@@ -197,16 +197,25 @@ func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Conte
 		return nil, ae
 	}
 
-	return mapExaResults(src, er.Results), nil
+	// 全灭防线：Exa 的 lookback 是服务端过滤（请求里的 startPublishedDate），
+	// 客户端**没有**正常过滤，所以「收到结果却一条都没能入库」直接就是不兼容/漂移的确证。
+	mapped, tally := mapExaResults(src, er.Results)
+	if len(er.Results) > 0 && len(mapped) == 0 {
+		return nil, allDroppedErr(src, len(er.Results), tally)
+	}
+	return mapped, nil
 }
 
 // mapExaResults 把 Exa 结果映射为 ContentItem，正文过长时截断，指纹由 finalize 统一补齐。
-func mapExaResults(src types.Source, results []exaResult) []types.ContentItem {
+// 第二个返回值是本轮各原因的丢弃计数，供调用方判定「全灭」（见 drop.go）。
+func mapExaResults(src types.Source, results []exaResult) ([]types.ContentItem, dropTally) {
 	now := time.Now().UTC()
+	var tally dropTally
 	out := make([]types.ContentItem, 0, len(results))
 	for _, r := range results {
 		if r.URL == "" && r.Title == "" {
-			continue // 无 URL 又无标题的空结果跳过。
+			tally.add(dropEmptyResult) // 无 URL 又无标题的空结果跳过。
+			continue
 		}
 		content := truncateUTF8(r.Text, exaMaxTextBytes)
 		item := types.ContentItem{
@@ -223,12 +232,13 @@ func mapExaResults(src types.Source, results []exaResult) []types.ContentItem {
 		// finalize 据 src.Platform 定身份：exa 与 rss 同属 web 平台、url 派——这正是
 		// "Exa 搜到用户 RSS 源里的同一篇文章"能被识别成一份的原因。
 		// 上面只挡了"url 与 title 双空"，有 title 无 url 的结果在此被丢弃（无身份）。
-		if !finalize(src, &item) {
+		if r := finalize(src, &item); r != dropNone {
+			tally.add(r)
 			continue
 		}
 		out = append(out, item)
 	}
-	return out
+	return out, tally
 }
 
 // parseExaDate 解析 Exa 的 ISO 8601 发布时间；解析失败或为空返回 nil（列可空）。

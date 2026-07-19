@@ -195,7 +195,16 @@ func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.Conte
 		return nil, err
 	}
 	items = f.applyCategories(src, items)
-	return mapItems(src, items), nil
+
+	// 全灭判定必须在此处、比较**映射函数的入参与产出**——不能拿 feed.Items 当分母。
+	// applyLookback / applyCategories 是用户声明的正常过滤（B 类），它们在这一行之前
+	// 就把条目摘掉了；若拿过滤前的条数当分母，一次寻常的「博客 8 天没更新、RSS 里全是
+	// 7 天窗口外的旧闻」就会被判成抓取失败，每轮误告警、10 轮后还会把健康的源自动停用。
+	mapped, tally := mapItems(src, items)
+	if len(items) > 0 && len(mapped) == 0 {
+		return nil, allDroppedErr(src, len(items), tally)
+	}
+	return mapped, nil
 }
 
 // rssSourceConfig 是 RSS 信源的 config JSONB 结构。
@@ -303,8 +312,10 @@ func matchesCategory(itemCats []string, want map[string]struct{}) bool {
 // 与 simhash（近似指纹）——原设计把这步留给 dedup 环节，但 dedup 只在内存回填、
 // 从不写回 content_items，导致两列恒为空、跨批去重全失效（审查 CRITICAL 数据链）。
 // 在此落库前算好，才能让 ListRecentSimhashes 拿到历史、UNIQUE 精确去重生效。
-func mapItems(src types.Source, items []*gofeed.Item) []types.ContentItem {
+// 第二个返回值是本轮各原因的丢弃计数，供调用方判定「全灭」（见 drop.go）。
+func mapItems(src types.Source, items []*gofeed.Item) ([]types.ContentItem, dropTally) {
 	now := time.Now().UTC()
+	var tally dropTally
 	out := make([]types.ContentItem, 0, len(items))
 	for _, it := range items {
 		if it == nil {
@@ -336,12 +347,13 @@ func mapItems(src types.Source, items []*gofeed.Item) []types.ContentItem {
 			Kind:        types.KindArticle, // rss 产出的是"一篇内容"（M6 契约 §7.2(b)：构造处赋值，finalize 只校验）
 		}
 		// 无 link 的条目在此被丢弃：rss 的身份就是 url，没有 url 就没有身份。
-		if !finalize(src, &item) {
+		if r := finalize(src, &item); r != dropNone {
+			tally.add(r)
 			continue
 		}
 		out = append(out, item)
 	}
-	return out
+	return out, tally
 }
 
 // truncateUTF8 把 s 截到至多 max 字节，并回退到最近的 rune 边界，保证结果是
@@ -382,7 +394,10 @@ func noRedirect(_ *http.Request, _ []*http.Request) error {
 // 顺序有依赖，不能重排：content_hash 先算（external_id 兜底要用它）；canonical_key
 // 必须在 external_id 兜底**之前**算，否则 xhs 缺 note_id 时会拿到 content_hash 兜底
 // 出来的假身份——正文一改就变，同一笔记长出 N 份，而判空分支永远不触发。
-func finalize(src types.Source, item *types.ContentItem) bool {
+// 返回 dropNone 表示该条可以入库；否则返回丢弃原因，供调用方累计成 dropTally
+// 并在「全灭」时组装用户可读的诊断（见 drop.go）。原先返回 bool，只够决定去留、
+// 不够回答「为什么一条都没剩下」——而那正是 HN 静默零产出事故里唯一缺的信息。
+func finalize(src types.Source, item *types.ContentItem) dropReason {
 	if item.FetchedAt.IsZero() {
 		item.FetchedAt = time.Now().UTC()
 	}
@@ -400,7 +415,7 @@ func finalize(src types.Source, item *types.ContentItem) bool {
 	if item.CanonicalKey == "" {
 		slog.Warn("fetcher: 内容缺少身份字段，跳过该条",
 			"source_id", src.ID, "platform", src.Platform, "url", item.URL, "title", item.Title)
-		return false
+		return dropNoIdentity
 	}
 
 	// Kind 必须非空（M6 契约 §7.2(b)）——做成"写不出来"而非注释提醒。零值 "" 会被
@@ -412,13 +427,13 @@ func finalize(src types.Source, item *types.ContentItem) bool {
 	if item.Kind == "" {
 		slog.Warn("fetcher: 内容缺少 kind，跳过该条",
 			"source_id", src.ID, "platform", src.Platform, "url", item.URL, "title", item.Title)
-		return false
+		return dropNoKind
 	}
 
 	if htmlTagRe.MatchString(item.Content) {
 		slog.Warn("fetcher: 正文含裸 HTML，抽取未在指纹之前完成（契约 §12.3），跳过该条",
 			"source_id", src.ID, "url", item.URL, "title", item.Title)
-		return false
+		return dropBareHTML
 	}
 
 	// 无自然外部 ID 时用 content_hash 派生稳定键，避免空串在源内唯一约束上
@@ -427,7 +442,7 @@ func finalize(src types.Source, item *types.ContentItem) bool {
 	if item.ExternalID == "" {
 		item.ExternalID = item.ContentHash
 	}
-	return true
+	return dropNone
 }
 
 // authorName 从 gofeed 条目提取作者名。Author 已被 gofeed 标记 deprecated，

@@ -197,18 +197,34 @@ func (e *ExaContentsFetcher) Fetch(ctx context.Context, src types.Source) ([]typ
 		}
 	}
 
-	item, ok := mapExaContents(src, pageURL, sc.Title, cr.Results)
-	if !ok {
-		// results 为空但 statuses 无 error：Exa 返回了成功却没正文，按空结果处理
-		//（不报错，下一轮再抓）。
+	item, dr := mapExaContents(src, pageURL, sc.Title, cr.Results)
+	switch dr {
+	case dropNone:
+		return []types.ContentItem{item}, nil
+	case dropEmptyResult:
+		// Exa 返回了成功却没正文：合法空轮，不报错，下一轮再抓。
+		// 「无内容可推必须仍是正常终态」是红线。
 		return nil, nil
+	default:
+		// 拿到了正文却没能入库 —— 页面格式与解析器不兼容，监控已经永久失效。
+		// 这条路径此前与上面的空轮共用一个静默 return，是本文件注释早就点名过的缺陷。
+		var t dropTally
+		t.add(dr)
+		return nil, allDroppedErr(src, 1, t)
 	}
-	return []types.ContentItem{item}, nil
 }
 
 // mapExaContents 把 /contents 结果映射为一条 ContentItem，并自填 canonical_key
-// （含 textHash，承载变化检测）。ok=false 表示无可用正文。
-func mapExaContents(src types.Source, pageURL, titleOverride string, results []exaContentsResult) (types.ContentItem, bool) {
+// （含 textHash，承载变化检测）。
+//
+// 返回 dropNone 表示映射成功；否则返回丢弃原因。第二个返回值原先是 bool，把两种
+// **性质完全不同**的失败压成了同一个 false：
+//   - Exa 压根没给正文（合法空轮，下一轮再抓即可）
+//   - 给了正文但 finalize 拒收（页面格式与解析器不兼容 —— 监控从此永久失效）
+//
+// 两者都退化成静默的 `return nil, nil`，正是本文件上方注释警告过的
+// 「被静默拒收 → 监控永久失效无信号」。分开才能只对后者报警。
+func mapExaContents(src types.Source, pageURL, titleOverride string, results []exaContentsResult) (types.ContentItem, dropReason) {
 	var r exaContentsResult
 	for i := range results {
 		if strings.TrimSpace(results[i].Text) != "" {
@@ -217,7 +233,7 @@ func mapExaContents(src types.Source, pageURL, titleOverride string, results []e
 		}
 	}
 	if strings.TrimSpace(r.Text) == "" {
-		return types.ContentItem{}, false
+		return types.ContentItem{}, dropEmptyResult
 	}
 
 	title := strings.TrimSpace(titleOverride)
@@ -257,10 +273,10 @@ func mapExaContents(src types.Source, pageURL, titleOverride string, results []e
 		CanonicalKey: canonicalKey,          // 自填，承载"监控文本变→新身份"。
 		Kind:         types.KindPageContent, // 页面内容——Dedup 据此豁免近似去重（否则变化被 simhash 吞）。
 	}
-	if !finalize(src, &item) {
-		return types.ContentItem{}, false
+	if dr := finalize(src, &item); dr != dropNone {
+		return types.ContentItem{}, dr
 	}
-	return item, true
+	return item, dropNone
 }
 
 // contentsHTMLLikeRe 匹配"< 紧跟字母/斜杠/感叹号"——与 fetcher.htmlTagRe 同形。
