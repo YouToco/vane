@@ -186,3 +186,102 @@ func TestDropTally_NoneIsNotCounted(t *testing.T) {
 		t.Errorf("无丢弃时摘要应为空，实得 %q", s)
 	}
 }
+
+// ---- Exa 搜索路径的全灭防线 ----
+//
+// 这一组是**对抗审查抓出来的漏洞**：原提交声称把防线推广到「RSS 与 Exa 两条路径」，
+// 并列举了 6 条反向验证，但**没有一条落在 Exa search 上**——把 exa.go 的守卫整段删掉，
+// 测试照样全绿。声称做过而实际没做，比没做更糟：它让后来的人以为那里有守卫。
+//
+// 这条路径在生产完全可达：净化（sanitizeContentsText）只存在于 exa_contents.go，
+// exa.go 的 search 分支对 r.Text 只做截断不做净化，Exa 一旦返回带 HTML 的正文，
+// 整批命中 htmlTagRe → 全灭。**HN 事故在 Exa 侧的同构形态。**
+
+func serveExa(t *testing.T, body string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// TestExaFetch_AllDroppedIsAnError：Exa 返回了结果却一条都没能入库 → 必须报错。
+func TestExaFetch_AllDroppedIsAnError(t *testing.T) {
+	body := `{"results":[
+		{"id":"a","url":"https://x.example/1","title":"一","text":"<div>正文</div>"},
+		{"id":"b","url":"https://x.example/2","title":"二","text":"<p>正文</p>"}
+	]}`
+	items, err := newTestExa(serveExa(t, body)).Fetch(context.Background(), exaSrc(9, `{"query":"q"}`))
+	if err == nil {
+		t.Fatalf("2 条结果全被裸 HTML 护栏丢弃却没报错——Exa 侧的静默零产出（实得 %d 条）", len(items))
+	}
+	var ae *types.AppError
+	if !errors.As(err, &ae) {
+		t.Fatalf("应返回 AppError，实得 %T", err)
+	}
+	if !strings.Contains(ae.Message, string(dropBareHTML)) {
+		t.Errorf("告警文案应点明丢弃原因，实得：%s", ae.Message)
+	}
+}
+
+// TestExaFetch_EmptyResultsIsNotAnError 是 Exa 侧的**防误报**守卫。
+//
+// 缺它的代价具体而严重：把守卫的 `len(er.Results) > 0` 前置去掉后测试依然全绿，
+// 而那个版本会让一个窄查询的搜索源（Exa 正常返回 `{"results":[]}`）每轮都报错
+// → fail_count++ → 第 3 轮告警「条目全部无法入库（0 条：，source_id=N）」
+// → 第 10 轮把一个**完全健康**的源自动停用。
+func TestExaFetch_EmptyResultsIsNotAnError(t *testing.T) {
+	items, err := newTestExa(serveExa(t, `{"results":[]}`)).Fetch(context.Background(), exaSrc(9, `{"query":"窄查询"}`))
+	if err != nil {
+		t.Fatalf("Exa 返回空结果集是合法空轮（窄查询、服务端时间过滤后没命中都会这样），"+
+			"报错会导致每轮误告警、10 轮后自动停用健康的搜索源：%v", err)
+	}
+	if len(items) != 0 {
+		t.Errorf("空结果集应产出 0 条，实得 %d", len(items))
+	}
+}
+
+// TestExaFetch_PartialDropIsNotAnError：只要还剩一条就不是"源坏了"。
+func TestExaFetch_PartialDropIsNotAnError(t *testing.T) {
+	body := `{"results":[
+		{"id":"a","url":"https://x.example/1","title":"坏的","text":"<div>x</div>"},
+		{"id":"b","url":"https://x.example/2","title":"好的","text":"干净正文"}
+	]}`
+	items, err := newTestExa(serveExa(t, body)).Fetch(context.Background(), exaSrc(9, `{"query":"q"}`))
+	if err != nil {
+		t.Fatalf("尚有条目存活时不得报错：%v", err)
+	}
+	if len(items) != 1 {
+		t.Errorf("应留下 1 条干净结果，实得 %d", len(items))
+	}
+}
+
+// TestDropEmptyResult_两条路径语义相反且都被钉住
+//
+// dropEmptyResult 在两条路径上**含义是相反的**，这是刻意的、但此前无人守：
+//   - exa_contents（页面监控）：Exa 还没抓到页面正文 → 合法空轮，放行
+//   - exa search：一条既无 url 又无标题的结果 → 是残缺数据，计入全灭分子
+//
+// 差异合理（"页面还没爬到" vs "搜索结果本身是残的"），但**两侧都无用例锁住**时，
+// 任何一侧的改动都不会变红。这里把两侧同时钉死。
+func TestDropEmptyResult_两条路径语义相反且都被钉住(t *testing.T) {
+	// search 侧：全是残缺结果 → 计入分子 → 报错，且**文案里要点明原因**。
+	// 只断言"报错了"是不够的：残缺结果即使不进 tally 也照样 continue、mapped 仍为 0、
+	// 照样报错——只是文案变成「条目全部无法入库（1 条：，source_id=9）」，原因栏是空的。
+	// 那样的告警卡等于没说，用户看不出源坏在哪。所以必须断言原因真的被记进去了。
+	body := `{"results":[{"id":"a","url":"","title":"","text":"有正文但无身份"}]}`
+	_, err := newTestExa(serveExa(t, body)).Fetch(context.Background(), exaSrc(9, `{"query":"q"}`))
+	if err == nil {
+		t.Fatal("search 侧：结果既无 url 又无标题是残缺数据，全是这种时应报错")
+	}
+	var ae *types.AppError
+	if !errors.As(err, &ae) {
+		t.Fatalf("应返回 AppError，实得 %T", err)
+	}
+	if !strings.Contains(ae.Message, string(dropEmptyResult)) {
+		t.Errorf("告警文案必须点明是 %q，否则原因栏为空、用户看不出源坏在哪：%s", dropEmptyResult, ae.Message)
+	}
+	// contents 侧由 TestExaContents_映射拒收会带出原因 守住（dropEmptyResult 放行为空轮）。
+}
