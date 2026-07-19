@@ -861,8 +861,14 @@ func (t *removeScheduleTool) Parameters() json.RawMessage {
 }
 func (t *removeScheduleTool) Mutating() bool { return true }
 
-// Execute 不逐条校验调度归属：单 owner MVP 所有调度同属一人，与
-// DELETE /api/schedules/{id} 的既有策略一致（api/schedules.go 注释）。
+// Execute 的归属校验由 Scheduler.DeletePush 内的 GetSchedule(id, userID) 承担：
+// 「不存在」与「不属于你」归一为 NotFound，agent 拿到伪造的 schedule_id 也删不动别人的。
+//
+// 原注释写着「不逐条校验调度归属：单 owner MVP 所有调度同属一人」——契约 §2.8 曾据此
+// 把本处列为已知越权洞。校验后来补上了，注释却留在原地。**这条路径尤其危险**：
+// schedule_id 直接来自模型生成的工具入参，而模型的输入里混着不可信的外部内容
+// （抓来的正文、用户消息），提示注入完全可能让它去删一个别人的 id。
+// 守卫见 store/schedule_ownership_test.go。
 func (t *removeScheduleTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
 	var a struct {
 		ScheduleID string `json:"schedule_id"`
