@@ -203,3 +203,35 @@ func mustJSON(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }
+
+// TestExaContents_映射拒收会带出原因 守住本文件注释早就点名、却一直没有守卫的那条路径。
+//
+// 上方 sanitizeContentsText 的注释写着「命中 finalize 的 htmlTagRe 被静默拒收 →
+// **监控永久失效无信号**」——问题被识别过，但只就地打了净化补丁，"静默"本身没解决。
+//
+// 修法是把两种性质完全不同的失败分开（此前共用一个 `return nil, nil`）：
+//   - Exa 没给正文 → 合法空轮，不报错（TestExaContents_空正文 守这条）
+//   - 给了正文却没能入库 → 格式不兼容，报错走告警链路
+//
+// **诚实说明**：Fetch 里那条报错分支当前**构造不出来**——config 校验拦掉空 url、
+// 净化覆盖了裸 HTML、Kind 由抓取器恒赋值，三条拒收原因在这条路径上都够不着。
+// 它是防御性的：任何将来新增的拒收原因都会**报警而不是静默**，而"静默"正是本次要修的东西。
+// 所以这里直接单测映射函数的返回契约，不假装测到了那条不可达分支。
+func TestExaContents_映射拒收会带出原因(t *testing.T) {
+	src := contentsSource(`{"url":"https://x.example/p"}`)
+
+	// 有正文 → 映射成功，原因为 dropNone。
+	if _, dr := mapExaContents(src, "https://x.example/p", "", []exaContentsResult{
+		{ID: "i", URL: "https://x.example/p", Title: "P", Text: "正文"},
+	}); dr != dropNone {
+		t.Errorf("正常正文应映射成功，实得丢弃原因 %q", dr)
+	}
+
+	// 无正文 → dropEmptyResult。**这个原因必须与其它拒收原因可区分**：
+	// Fetch 只对它放行成空轮，对其余一律报错。两者若共用一个 false 就回到了缺陷本身。
+	if _, dr := mapExaContents(src, "https://x.example/p", "", []exaContentsResult{
+		{ID: "i", URL: "https://x.example/p", Title: "P", Text: "   "},
+	}); dr != dropEmptyResult {
+		t.Errorf("空正文的原因应为 %q（Fetch 据此判定合法空轮），实得 %q", dropEmptyResult, dr)
+	}
+}

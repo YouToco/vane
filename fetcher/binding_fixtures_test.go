@@ -170,7 +170,6 @@ const sampleHotListResponse = `{
  }
 }`
 
-
 // sampleTopicFeedResponse 取自 2026-07-18 真实响应（裁剪 3 条）：create_time 毫秒、sort=time 降序。
 const sampleTopicFeedResponse = `{
  "code": 200,
@@ -213,7 +212,6 @@ const sampleTopicFeedResponse = `{
   }
  }
 }`
-
 
 // sampleFavedNotesResponse 取自 2026-07-18 真实响应（裁剪 3 条）：create_time 秒、序列非单调（收藏序≠创建序）。
 const sampleFavedNotesResponse = `{
@@ -258,4 +256,3 @@ const sampleFavedNotesResponse = `{
   }
  }
 }`
-

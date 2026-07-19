@@ -636,7 +636,11 @@ func (b *BindingFetcher) run(ctx context.Context, src types.Source, probe bool) 
 		if spec.MaxContentBytes > 0 {
 			item.Content = truncateUTF8(item.Content, spec.MaxContentBytes)
 		}
-		if !finalize(src, &item) {
+		// 刻意不在此累计 dropTally、也不加全灭防线：binding 路径已有「反漂移防线 3」
+		// （见上方 len(rawItems)>0 && len(cands)==0 的判断），它的语义比通用版更细
+		// ——额外排除了 ItemFilter 挡掉的条目（一屏全是广告位是多态流的合法形态）。
+		// 套通用防线会对同一故障双重报错，且会把 ItemFilter 的正常过滤误判成漂移。
+		if finalize(src, &item) != dropNone {
 			continue
 		}
 		out = append(out, item)

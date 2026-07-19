@@ -222,8 +222,8 @@ func TestFinalize_AssignsCanonicalKey(t *testing.T) {
 	item := types.ContentItem{SourceID: 1, ExternalID: bbcGUIDOld, URL: bbcURL, Title: "t", Content: "c",
 		Kind: types.KindArticle}
 
-	if !finalize(src, &item) {
-		t.Fatal("有 url 的 rss 条目不该被丢弃")
+	if r := finalize(src, &item); r != dropNone {
+		t.Fatalf("有 url 的 rss 条目不该被丢弃，实得原因 %q", r)
 	}
 	if item.CanonicalKey != bbcURL {
 		t.Errorf("CanonicalKey 未被 finalize 赋值或与直算不符：%q", item.CanonicalKey)
@@ -241,8 +241,9 @@ func TestFinalize_DropsItemWithoutIdentity(t *testing.T) {
 	src := rssSource(1)
 	item := types.ContentItem{SourceID: 1, Title: "无 guid 无 link", Content: "正文"}
 
-	if finalize(src, &item) {
-		t.Fatalf("无 url 的 rss 条目必须被丢弃，实得 canonical_key=%q", item.CanonicalKey)
+	if r := finalize(src, &item); r != dropNoIdentity {
+		t.Fatalf("无 url 的 rss 条目必须以 %q 被丢弃，实得原因 %q、canonical_key=%q",
+			dropNoIdentity, r, item.CanonicalKey)
 	}
 	if item.CanonicalKey != "" {
 		t.Errorf("被丢弃的条目不该带上任何身份：%q", item.CanonicalKey)
@@ -257,8 +258,9 @@ func TestFinalize_CanonicalKeyPrecedesExternalIDFallback(t *testing.T) {
 	src := xhsSource(1)
 	item := types.ContentItem{SourceID: 1, Title: "没有 note_id 的笔记", Content: "正文"}
 
-	if finalize(src, &item) {
-		t.Fatalf("缺 note_id 的 xhs 笔记必须被丢弃，实得 canonical_key=%q", item.CanonicalKey)
+	if r := finalize(src, &item); r != dropNoIdentity {
+		t.Fatalf("缺 note_id 的 xhs 笔记必须以 %q 被丢弃，实得原因 %q、canonical_key=%q",
+			dropNoIdentity, r, item.CanonicalKey)
 	}
 	// 反向保险：若 external_id 兜底跑在了前面，key 会等于 content_hash 而非空串。
 	if item.CanonicalKey != "" {
@@ -273,8 +275,8 @@ func TestFinalize_ExternalIDFallbackStillApplies(t *testing.T) {
 	item := types.ContentItem{SourceID: 1, URL: bbcURL, Title: "有 link 无 guid", Content: "正文",
 		Kind: types.KindArticle}
 
-	if !finalize(src, &item) {
-		t.Fatal("有 url 的条目不该被丢弃")
+	if r := finalize(src, &item); r != dropNone {
+		t.Fatalf("有 url 的条目不该被丢弃，实得原因 %q", r)
 	}
 	if item.ExternalID != item.ContentHash {
 		t.Errorf("external_id 应兜底为 content_hash，实得 %q", item.ExternalID)
