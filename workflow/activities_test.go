@@ -1303,3 +1303,44 @@ func TestActivities_RefusesSpendingForDeletedTenant_LateStages(t *testing.T) {
 		t.Errorf("已注销租户不得收到推送卡片，实发 %d 张", sent)
 	}
 }
+
+// TestPush_AllPermanentFailuresNonRetryable：全部块失败且全为确定性拒收
+// （SendCard 层 Retryable=false，如 200673 卡片非法）时，Push 必须把整活动包成
+// Temporal 不可重试——审查发现原先聚合成新 AppError 时把下层 Retryable=false
+// 丢了，卡片非法照样烧满 3 次重试。对照组：可重试失败保持普通 AppError。
+func TestPush_AllPermanentFailuresNonRetryable(t *testing.T) {
+	perm := types.NewAppError(types.CodePushFailed, "卡片结构非法（测试构造）", nil)
+	perm.Retryable = false
+
+	push := &fakePusher{failCalls: map[int]error{1: perm}}
+	st := &fakeStore{}
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil,
+		func(feedback.AggregateCardInput) string { return "{}" },
+		func(string, int) (string, string) { return "t", "tpl" })
+
+	err := a.Push(t.Context(), PushIn{UserID: 1, TraceID: "t-perm",
+		Cards: []GeneratedCard{{Scored: types.ScoredItem{Item: types.ContentItem{ID: 1}, Score: 80}, BodyMD: "md"}}})
+	if err == nil {
+		t.Fatal("全灭应返回错误")
+	}
+	var appErr *temporal.ApplicationError
+	if !errors.As(err, &appErr) || !appErr.NonRetryable() {
+		t.Fatalf("全为确定性拒收时应为不可重试 ApplicationError，实得 %T: %v", err, err)
+	}
+
+	// 对照组：可重试失败（瞬态）→ 普通 AppError，交给 RetryPolicy。
+	retryable := types.NewAppError(types.CodePushFailed, "飞书 5xx（测试构造）", nil)
+	push2 := &fakePusher{failCalls: map[int]error{1: retryable}}
+	a2 := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push2, &fakeStore{}, fakeFeishu{}, nil, nil,
+		func(feedback.AggregateCardInput) string { return "{}" },
+		func(string, int) (string, string) { return "t", "tpl" })
+	err2 := a2.Push(t.Context(), PushIn{UserID: 1, TraceID: "t-transient",
+		Cards: []GeneratedCard{{Scored: types.ScoredItem{Item: types.ContentItem{ID: 2}, Score: 80}, BodyMD: "md"}}})
+	if err2 == nil {
+		t.Fatal("全灭应返回错误")
+	}
+	var appErr2 *temporal.ApplicationError
+	if errors.As(err2, &appErr2) && appErr2.NonRetryable() {
+		t.Fatal("瞬态失败不得被包成不可重试（会让飞书抖动直接杀掉批次）")
+	}
+}

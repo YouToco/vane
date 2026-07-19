@@ -287,14 +287,11 @@ func domainFromURL(rawURL string) string {
 }
 
 // cardTZ 是卡片相对日期的用户时区。产品面向中文用户、调度默认同为 Asia/Shanghai
-// （scheduler.ScheduleSpec.TZ 缺省值）；LoadLocation 失败回退 UTC 只是防御，
-// 该 IANA 名内置于 Go 的 tzdata，正常不会失败。
-var cardTZ = func() *time.Location {
-	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
-		return loc
-	}
-	return time.UTC
-}()
+// （scheduler.ScheduleSpec.TZ 缺省值）。用 FixedZone 而非 LoadLocation("Asia/Shanghai")：
+// 中国标准时间自 1991 年起恒为 UTC+8 无 DST，二者语义等价，而 FixedZone 零 tzdata
+// 依赖——LoadLocation 在无 zoneinfo 的最小容器里会失败回退，日期悄悄偏 8 小时
+// （审查 UNCHECKED 项收编为结构性免疫）。
+var cardTZ = time.FixedZone("UTC+8", 8*3600)
 
 // relativeTime 格式化相对时间（今天/昨天/N 天前），按**用户时区的日历日**计算。
 //

@@ -1047,6 +1047,11 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	// 拆分用显式 size 内环收敛（初版把对半结果写进 end 再 continue，外层循环顶部
 	// 重算 end 会丢弃拆分——超大块死循环；size 单调递减到 1 保证必然终止）。
 	failedItems := 0
+	// anyRetryableFail：本轮是否有**可重试**的块失败。全部失败都是确定性错误
+	//（如 200673 卡片非法）时整活动包成不可重试——SendCard 层的 Retryable=false
+	// 若只在这里被聚合成新 AppError 就会丢失（bug 狩猎批审查发现），Temporal
+	// 会白重试三次必然同败的卡。
+	anyRetryableFail := false
 	buildChunk := func(chunk []pendingItem) string {
 		items := make([]feedback.CardInput, len(chunk))
 		for i, p := range chunk {
@@ -1078,6 +1083,9 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			slog.Warn("push: 聚合卡推送失败，跳过该块", "trace_id", in.TraceID,
 				"items", len(chunk), "err", perr)
 			failedItems += len(chunk)
+			if types.IsRetryable(perr) {
+				anyRetryableFail = true
+			}
 			start += size
 			continue
 		}
@@ -1096,7 +1104,13 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 		if err := a.store.UpdatePushBatchStatus(ctx, batchID, types.BatchStatusFailed); err != nil {
 			return err
 		}
-		return types.NewAppError(types.CodePushFailed, "本批次全部推送失败", nil)
+		ae := types.NewAppError(types.CodePushFailed, "本批次全部推送失败", nil)
+		if !anyRetryableFail {
+			// 全部失败且全为确定性拒收：重试必然逐字复演，包成不可重试让 Temporal
+			// 立即终止（批次已标 failed，探针/看板可见），而不是烧满重试预算。
+			return nonRetryable(ae)
+		}
+		return ae
 	}
 	// 部分块失败（对抗审查 HIGH）：**不结算 done、返回可重试错误**。批次终态留待重试
 	// 收敛——sentAlready 幂等保证重试不重发成功块，只补失败块；若记 done 并吞掉错误，
@@ -1104,8 +1118,14 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	// 永不再成为候选，正是上方注释声称要消灭的"已打分未送达永远消失"。
 	// 重试耗尽时批次停在 pending——作为可见异常留给探针，而非谎报 done。
 	if failedItems > 0 {
-		return types.NewAppError(types.CodePushFailed,
+		ae := types.NewAppError(types.CodePushFailed,
 			fmt.Sprintf("部分推送失败（%d 条未送达），等待重试补发", failedItems), nil)
+		if !anyRetryableFail {
+			// 失败块全为确定性拒收：重试补发不可能成功，立即终止。
+			// 成功块已送达并标记，失败块留 pending 由探针暴露（与重试耗尽同终态）。
+			return nonRetryable(ae)
+		}
+		return ae
 	}
 	if err := a.store.UpdatePushBatchStatus(ctx, batchID, types.BatchStatusDone); err != nil {
 		return err
