@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"go.temporal.io/sdk/activity"
@@ -592,18 +594,164 @@ func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem
 	return kept, nil
 }
 
-// Score 逐条打分。同一 TraceID 串起整批的 llm_calls 便于事后追踪。
-// 单条失败跳过；整批全失败（大概率 LLM 不可用）返回错误触发重试。
-func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem, error) {
-	scored := make([]types.ScoredItem, 0, len(in.Items))
-	for _, item := range in.Items {
-		s, err := a.scorer.Score(ctx, in.UserID, item, in.TraceID)
-		if err != nil {
-			slog.Warn("score: 单条打分失败，跳过", "content_item_id", item.ID, "trace_id", in.TraceID, "err", err)
-			continue
-		}
-		scored = append(scored, types.ScoredItem{Item: item, Score: s})
+// parBatchFanout 是逐条 LLM 活动（Score / CardGen）**同时在飞的条数**上限。
+//
+// 取值必须 ≤ `llm.max_concurrent`（默认 5），原因不是节流，而是**排队公平性**：
+// llm.Client 的信号量是全进程单例，Complete（打分/出卡）与 Chat（飞书对话）共用同一个
+// `c.sem`（llm/client.go:138 与 llm/chat.go:148）。Go 的 channel sendq 是 FIFO——
+// 扇出超过信号量容量时，多出来的 goroutine 不是"闲着等"，而是**占住队头**：
+// 此后到达的交互请求要排在它们全部之后。而超出部分对吞吐**一点贡献都没有**
+// （吞吐本就被信号量卡在 5），纯粹是拿交互延迟换零收益。原值 16 正是这个错误。
+//
+// 也就是说这里刻意与 llm.max_concurrent 取同值（2026-07-18 起两者同为 32，
+// 依据是真实 API 受控实验：45 条批次并发 5 → 5.7 秒、并发 32 → 1.25 秒，零 429；
+// v4-flash 官方并发限额 2500，上限侧余量极大）。不做成配置项读取是因为 NewActivities
+// 已有 10 个参数、32 处调用点，为此加参数不划算；代价是调 llm.max_concurrent 时
+// 必须记得把这里一并改——两处注释互相指认，改一处漏另一处会在 review 时露出来。
+//
+// **它不限制 goroutine 数量**。每条输入无条件起一个 goroutine，数量等于批次条数；
+// 真正的上限是上游的 maxScoreCandidates（50）。早先注释声称本常量"防止凭空拉起几千个
+// goroutine"是错的——审查指出后更正。
+const parBatchFanout = 32
+
+// mapConcurrent 并发映射 in，返回成功项，**保持输入顺序**；单项失败调 onErr 后跳过。
+//
+// 顺序保持不是可有可无的装饰：结果写进按下标预留的槽位、最后按序压紧，于是同一批输入
+// 无论 goroutine 怎么交错，产出都与串行版逐字节相同——这让并发化成为**可证明的等价改写**，
+// 而不是"大概也一样"。（RankTopN 的同分裁决本身落在 Item.ID 上、与顺序无关，
+// 所以即便乱序也选得出同一批；但那是下游的性质，不该被上游拿来当免责理由。）
+//
+// 各 goroutine 只写自己下标的槽位，互不重叠；wg.Wait() 建立 happens-before 边，
+// 读取时无需再加锁。onErr 用锁串起来——slog 本身并发安全，但 onErr 是调用方传进来的，
+// 不能替它假设。
+func mapConcurrent[T, R any](
+	ctx context.Context,
+	in []T,
+	fanout int,
+	fn func(context.Context, T) (R, error),
+	onErr func(T, error),
+) []R {
+	// 非 nil 空切片：与串行版的 make([]R, 0, n) 对齐。Temporal 会把结果序列化成
+	// JSON 交给下一个活动，nil 编成 null、空切片编成 []——这个差别会穿过进程边界。
+	out := make([]R, 0, len(in))
+	if len(in) == 0 {
+		return out
 	}
+	if fanout < 1 {
+		fanout = 1
+	}
+
+	type slot struct {
+		val R
+		ok  bool
+	}
+	slots := make([]slot, len(in))
+	if fanout > len(in) {
+		fanout = len(in)
+	}
+
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
+	var panicOnce sync.Once
+	var panicVal any
+	var panicStack []byte
+	var errMu sync.Mutex
+
+	// worker pool 而非"每条一个 goroutine + 信号量"。后者写起来更短，但有两处真问题：
+	//   1. goroutine 数等于批次条数，扇出常量根本不限制它（真正的上限在上游
+	//      maxScoreCandidates=50）——早先注释把这份功劳记错了地方，审查指出后更正。
+	//   2. **panic 后取消不可靠**。一次性建好的 goroutine 抢令牌的顺序由调度器决定、
+	//      与输入顺序无关；panic 的那条若恰好被排到最后才跑，前面全部早已发完请求。
+	//      实测 45 条批次第 3 条 panic：12 次运行里 7 次省到 10 次调用，但 2 次是满打满算
+	//      45 次、另有 40/35/30 各一次——省不省全看调度器心情。
+	// worker pool 按输入顺序派发，panic 后派发立即停止，省下的量不再依赖运气。
+	idx := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < fanout; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// panic 必须捕获后在 Wait 之后原样重抛，**不能就地让它飞**：goroutine 里
+			// 未捕获的 panic 会直接终止整个进程，而串行版里 fn 的 panic 沿 activity
+			// 自己的栈上抛、由 Temporal SDK 接住转成可重试的 activity 错误。
+			// 同一个空指针，串行下只是这批推送重试，不捕获就会把 vane 打挂由 systemd 重拉。
+			// cancelRun 让派发停下——只捕获不取消的话，其余条目仍会全部发出真实计费请求
+			// （审查实测：45 条批次第 3 条 panic，串行 3 次调用、只捕获重抛的并发版 45 次，
+			// 再乘 Temporal 的 3 次重试 = 135 次计费调用与 135 行 llm_calls）。
+			defer func() {
+				if r := recover(); r != nil {
+					stack := debug.Stack()
+					panicOnce.Do(func() { panicVal, panicStack = r, stack })
+					cancelRun()
+				}
+			}()
+			for i := range idx {
+				v, err := fn(runCtx, in[i])
+				if err != nil {
+					errMu.Lock()
+					onErr(in[i], err)
+					errMu.Unlock()
+					continue
+				}
+				slots[i] = slot{val: v, ok: true}
+			}
+		}()
+	}
+
+	// 按输入顺序派发；一旦取消就停止派发，**剩余条目从不被触及**——
+	// 与串行版"第 k 条 panic 后 k+1..n 根本不会被碰"对齐。
+feed:
+	for i := range in {
+		// 先查一次再进 select。只靠 select 也**碰巧**能工作——刚 spawn 的 worker 往往
+		// 还没跑到 range idx，发送 case 未就绪，于是 Done 分支必胜（本机 15/15 如此）。
+		// 但那是调度时序的运气，不是保证：worker 起得快一点，select 两个 case 同时就绪时
+		// 是随机挑的，取消后就会漏派发若干条，每条都是一次真实计费请求。
+		// 一次比较换掉这份运气依赖。
+		if runCtx.Err() != nil {
+			break feed
+		}
+		select {
+		case idx <- i:
+		case <-runCtx.Done():
+			break feed
+		}
+	}
+	close(idx)
+	wg.Wait()
+
+	// 重抛带上原始栈：直接 panic(panicVal) 会把现场换成这一行，
+	// 排查时只看得见"某个 goroutine 挂了"，看不见挂在哪。
+	if panicVal != nil {
+		panic(fmt.Sprintf("%v\n\n原始 goroutine 栈:\n%s", panicVal, panicStack))
+	}
+
+	for _, s := range slots {
+		if s.ok {
+			out = append(out, s.val)
+		}
+	}
+	return out
+}
+
+// Score 逐条打分（并发扇出，见 mapConcurrent）。同一 TraceID 串起整批的 llm_calls
+// 便于事后追踪。单条失败跳过；整批全失败（大概率 LLM 不可用）返回错误触发重试。
+//
+// 改并发的理由是实测：生产批次 33–45 条、单条平均 709ms，串行即 32 秒纯排队等网络，
+// 而 llm.Client 早已配好 5 路并发闸门却只被喂进 1 个。顺带也把 activity 的
+// StartToCloseTimeout=120s 从"正在变薄的余量"拉回安全区（45 条 × 最坏 1372ms 已达 62 秒）。
+func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem, error) {
+	scored := mapConcurrent(ctx, in.Items, parBatchFanout,
+		func(ctx context.Context, item types.ContentItem) (types.ScoredItem, error) {
+			s, err := a.scorer.Score(ctx, in.UserID, item, in.TraceID)
+			if err != nil {
+				return types.ScoredItem{}, err
+			}
+			return types.ScoredItem{Item: item, Score: s}, nil
+		},
+		func(item types.ContentItem, err error) {
+			slog.Warn("score: 单条打分失败，跳过", "content_item_id", item.ID, "trace_id", in.TraceID, "err", err)
+		})
 	if len(scored) == 0 && len(in.Items) > 0 {
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "整批打分全部失败", nil)
 	}
@@ -620,17 +768,24 @@ func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredIte
 	return selector.RankTopN(in.Scored, n, time.Now()), nil
 }
 
-// CardGen 逐条生成解读正文。单条失败跳过；整批全失败返回错误触发重试。
+// CardGen 逐条生成解读正文（并发扇出，见 mapConcurrent）。
+// 单条失败跳过；整批全失败返回错误触发重试。
+//
+// 顺序保持在这里比 Score 更要紧：cards 的顺序**直接决定聚合卡里条目的排列**
+// （Push 按本切片顺序拼卡），而 Score 的产出还要过一遍 RankTopN 重排。
+// 换句话说，这里若按完成先后收集，同一批内容每次推送的卡面顺序都会不一样。
 func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard, error) {
-	cards := make([]GeneratedCard, 0, len(in.Items))
-	for _, si := range in.Items {
-		body, err := a.cardgen.Generate(ctx, in.UserID, si, in.TraceID)
-		if err != nil {
+	cards := mapConcurrent(ctx, in.Items, parBatchFanout,
+		func(ctx context.Context, si types.ScoredItem) (GeneratedCard, error) {
+			body, err := a.cardgen.Generate(ctx, in.UserID, si, in.TraceID)
+			if err != nil {
+				return GeneratedCard{}, err
+			}
+			return GeneratedCard{Scored: si, BodyMD: body}, nil
+		},
+		func(si types.ScoredItem, err error) {
 			slog.Warn("cardgen: 单条生成失败，跳过", "content_item_id", si.Item.ID, "trace_id", in.TraceID, "err", err)
-			continue
-		}
-		cards = append(cards, GeneratedCard{Scored: si, BodyMD: body})
-	}
+		})
 	if len(cards) == 0 && len(in.Items) > 0 {
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "整批卡片生成全部失败", nil)
 	}
