@@ -460,3 +460,49 @@ func TestFetchRSS_CategoriesEmpty_NoFilter(t *testing.T) {
 		t.Fatalf("无 categories 应返回全部 5 条，实际 %d", len(items))
 	}
 }
+
+// TestFetchRSS_FuturePubDateClampedToNow：未来 pubDate（时区错配/站点乱填）必须被
+// 钳到抓取时刻（bug 狩猎 2026-07-19 MEDIUM）——selector 只把负龄钳为 0，零衰减
+// 本身就是持续的排名优势（同分下最多 +12 分），钳到 now 保留条目、只消除优势。
+func TestFetchRSS_FuturePubDateClampedToNow(t *testing.T) {
+	feed := `<?xml version="1.0"?><rss version="2.0"><channel><title>f</title>
+<item><title>Future Post</title><link>https://x.example/future</link><description>far future body long enough to keep</description><pubDate>Mon, 01 Jan 2091 00:00:00 +0000</pubDate></item>
+<item><title>Normal Post</title><link>https://x.example/normal</link><description>normal body long enough to keep here</description><pubDate>Tue, 14 Jul 2026 12:00:00 +0000</pubDate></item>
+</channel></rss>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/rss+xml")
+		_, _ = w.Write([]byte(feed))
+	}))
+	defer srv.Close()
+
+	f := newTestFetcher()
+	items, err := f.FetchRSS(context.Background(),
+		types.Source{ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL})
+	if err != nil {
+		t.Fatalf("FetchRSS 意外失败: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("未来条目应保留（钳制不是丢弃），期望 2 条实得 %d：%v", len(items), titlesOf(items))
+	}
+	var future *types.ContentItem
+	for i := range items {
+		if items[i].Title == "Future Post" {
+			future = &items[i]
+		}
+	}
+	if future == nil {
+		t.Fatal("未来条目不见了")
+	}
+	if future.PublishedAt == nil {
+		t.Fatal("钳制应保留 PublishedAt（= 抓取时刻），实为 nil")
+	}
+	if !future.PublishedAt.Equal(testNow) {
+		t.Errorf("未来 pubDate 应钳到 f.now()（%v），实为 %v", testNow, future.PublishedAt)
+	}
+	// 钳制不许反向殃及正常条目。
+	for i := range items {
+		if items[i].Title == "Normal Post" && !items[i].PublishedAt.Equal(time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)) {
+			t.Errorf("正常条目的 PublishedAt 不得被改动，实为 %v", items[i].PublishedAt)
+		}
+	}
+}

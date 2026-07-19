@@ -1244,3 +1244,103 @@ func (c *countingFetcher) Fetch(context.Context, types.Source) ([]types.ContentI
 	c.calls++
 	return nil, nil
 }
+
+// countingScorer / countingCardGen：D9 闸门断言用（同 countingEvolver 模式）——
+// 闸门生效 = 下游一次都没被调。
+type countingScorer struct{ calls int }
+
+func (c *countingScorer) Score(context.Context, int64, types.ContentItem, string) (float64, error) {
+	c.calls++
+	return 80, nil
+}
+
+type countingCardGen struct{ calls int }
+
+func (c *countingCardGen) Generate(context.Context, int64, types.ScoredItem, string) (string, error) {
+	c.calls++
+	return "md", nil
+}
+
+// TestActivities_RefusesSpendingForDeletedTenant_LateStages 补齐 D9 闸门的后三步
+// （bug 狩猎 2026-07-19 HIGH：此前只有 EvolveProfile/Fetch 有闸，Fetch 之后软删的
+// 租户仍会被 Score 烧 LLM、CardGen 烧 LLM、Push 发卡到已注销用户的手机上）。
+// 三步的入参都刻意给真实载荷：没有载荷时去掉闸门下游也不会被调，用例就测不出
+// 闸门存在与否（同上方 dueSources 的教训）。
+func TestActivities_RefusesSpendingForDeletedTenant_LateStages(t *testing.T) {
+	sc := &countingScorer{}
+	cg := &countingCardGen{}
+	push := &fakePusher{}
+	st := &fakeStore{tenantGone: true}
+	a := NewActivities(fakeFetcher{}, sc, cg, push, st, fakeFeishu{}, nil, nil, nil, nil)
+
+	items := []types.ContentItem{{ID: 1, Title: "t", Content: "c"}}
+	scored, err := a.Score(t.Context(), ScoreIn{UserID: 1, TraceID: "t", Items: items})
+	if err != nil {
+		t.Errorf("已注销租户 Score 应正常终态返回：%v", err)
+	}
+	if len(scored) != 0 || sc.calls != 0 {
+		t.Errorf("已注销租户不得打分（花 LLM 的钱），产出 %d 条、调用 %d 次", len(scored), sc.calls)
+	}
+
+	cards, err := a.CardGen(t.Context(), CardGenIn{UserID: 1, TraceID: "t",
+		Items: []types.ScoredItem{{Item: items[0], Score: 80}}})
+	if err != nil {
+		t.Errorf("已注销租户 CardGen 应正常终态返回：%v", err)
+	}
+	if len(cards) != 0 || cg.calls != 0 {
+		t.Errorf("已注销租户不得生成解读（花 LLM 的钱），产出 %d 张、调用 %d 次", len(cards), cg.calls)
+	}
+
+	err = a.Push(t.Context(), PushIn{UserID: 1, TraceID: "t",
+		Cards: []GeneratedCard{{Scored: types.ScoredItem{Item: items[0], Score: 80}, BodyMD: "md"}}})
+	if err != nil {
+		t.Errorf("已注销租户 Push 应正常终态返回：%v", err)
+	}
+	push.mu.Lock()
+	sent := len(push.sent)
+	push.mu.Unlock()
+	if sent != 0 {
+		t.Errorf("已注销租户不得收到推送卡片，实发 %d 张", sent)
+	}
+}
+
+// TestPush_AllPermanentFailuresNonRetryable：全部块失败且全为确定性拒收
+// （SendCard 层 Retryable=false，如 200673 卡片非法）时，Push 必须把整活动包成
+// Temporal 不可重试——审查发现原先聚合成新 AppError 时把下层 Retryable=false
+// 丢了，卡片非法照样烧满 3 次重试。对照组：可重试失败保持普通 AppError。
+func TestPush_AllPermanentFailuresNonRetryable(t *testing.T) {
+	perm := types.NewAppError(types.CodePushFailed, "卡片结构非法（测试构造）", nil)
+	perm.Retryable = false
+
+	push := &fakePusher{failCalls: map[int]error{1: perm}}
+	st := &fakeStore{}
+	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, nil,
+		func(feedback.AggregateCardInput) string { return "{}" },
+		func(string, int) (string, string) { return "t", "tpl" })
+
+	err := a.Push(t.Context(), PushIn{UserID: 1, TraceID: "t-perm",
+		Cards: []GeneratedCard{{Scored: types.ScoredItem{Item: types.ContentItem{ID: 1}, Score: 80}, BodyMD: "md"}}})
+	if err == nil {
+		t.Fatal("全灭应返回错误")
+	}
+	var appErr *temporal.ApplicationError
+	if !errors.As(err, &appErr) || !appErr.NonRetryable() {
+		t.Fatalf("全为确定性拒收时应为不可重试 ApplicationError，实得 %T: %v", err, err)
+	}
+
+	// 对照组：可重试失败（瞬态）→ 普通 AppError，交给 RetryPolicy。
+	retryable := types.NewAppError(types.CodePushFailed, "飞书 5xx（测试构造）", nil)
+	push2 := &fakePusher{failCalls: map[int]error{1: retryable}}
+	a2 := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push2, &fakeStore{}, fakeFeishu{}, nil, nil,
+		func(feedback.AggregateCardInput) string { return "{}" },
+		func(string, int) (string, string) { return "t", "tpl" })
+	err2 := a2.Push(t.Context(), PushIn{UserID: 1, TraceID: "t-transient",
+		Cards: []GeneratedCard{{Scored: types.ScoredItem{Item: types.ContentItem{ID: 2}, Score: 80}, BodyMD: "md"}}})
+	if err2 == nil {
+		t.Fatal("全灭应返回错误")
+	}
+	var appErr2 *temporal.ApplicationError
+	if errors.As(err2, &appErr2) && appErr2.NonRetryable() {
+		t.Fatal("瞬态失败不得被包成不可重试（会让飞书抖动直接杀掉批次）")
+	}
+}

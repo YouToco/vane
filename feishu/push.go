@@ -41,8 +41,18 @@ func (m *Manager) SendCard(ctx context.Context, openID, cardJSON string) (string
 		return "", types.NewAppError(types.CodePushFailed, "主动推送卡片失败", err)
 	}
 	if !resp.Success() {
-		return "", types.NewAppError(types.CodePushFailed,
+		ae := types.NewAppError(types.CodePushFailed,
 			fmt.Sprintf("主动推送卡片被飞书拒绝（code %d：%s）", resp.Code, resp.Msg), nil)
+		// 确定性拒收不可重试（bug 狩猎 2026-07-19 MAJOR：此前一律按 CodePushFailed
+		// 默认可重试，卡片 JSON 非法这类怎么重试都非法的错误会白烧满 Temporal 重试
+		// 预算、把真实原因埋进一串重试噪音里）。清单只收实锤过语义的码，按需扩充：
+		//   200673 卡片结构非法（2026-07-17 生产实锤：form 缺 name 整卡被拒）；
+		//   230002 收件人 open_id 非法（收件人错重试不会变对）。
+		// 其余（限流/内部错误/未知码）保持默认可重试——瞬态居多，宁可多试。
+		if permanentRejection(resp.Code) {
+			ae.Retryable = false
+		}
+		return "", ae
 	}
 	// message_id 回填 deliveries.feishu_message_id，用于后续追溯/撤回。
 	// resp.Data 恒非 nil（Success 已判真），但 MessageId 是 *string，仍做空指针防护。
@@ -57,4 +67,17 @@ func (m *Manager) SendCard(ctx context.Context, openID, cardJSON string) (string
 // 调用方（Push activity / pusher）据空串判定为"尚无收件人"。
 func (m *Manager) OwnerOpenID() string {
 	return m.ownerID()
+}
+
+// permanentRejection 报告一个飞书拒收 code 是否为确定性失败（重试必然同样失败）。
+// 清单只收实锤过语义的码，按需扩充：
+//   200673 卡片结构非法（2026-07-17 生产实锤：form 缺 name 整卡被拒）；
+//   230002 收件人 open_id 非法（收件人错重试不会变对）。
+// 其余（限流/内部错误/未知码）按可重试处理——瞬态居多，宁可多试。
+func permanentRejection(code int) bool {
+	switch code {
+	case 200673, 230002:
+		return true
+	}
+	return false
 }

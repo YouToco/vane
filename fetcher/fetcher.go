@@ -272,6 +272,21 @@ func (f *Fetcher) applyLookback(src types.Source, items []*gofeed.Item) ([]*gofe
 		}
 	}
 
+	// 未来时间戳钳制（bug 狩猎 2026-07-19 MEDIUM）：RSS 偶见未来 pubDate（时区错配 /
+	// 站点乱填，极端如 2099 年）。selector.effectiveScore 只把负龄钳为 0（防反向加分），
+	// 但"零衰减"本身就是排名优势——同分下比正常内容最多多 12 分（衰减封顶），且持续
+	// 到条目被清理。钳到"现在"保留条目、只消除优势。放在 lookback 开关之前：
+	// 禁用 lookback（<0）的源同样要钳。
+	now := f.now().UTC()
+	for _, it := range items {
+		if it != nil && it.PublishedParsed != nil && it.PublishedParsed.After(now) {
+			slog.Debug("RSS 未来时间戳钳制为当前时刻",
+				"source_id", src.ID, "url", it.Link, "pub", it.PublishedParsed)
+			clamped := now
+			it.PublishedParsed = &clamped
+		}
+	}
+
 	lookback := sc.LookbackDays
 	if lookback == 0 {
 		lookback = rssDefaultLookbackDays
@@ -280,7 +295,7 @@ func (f *Fetcher) applyLookback(src types.Source, items []*gofeed.Item) ([]*gofe
 		return items, nil
 	}
 
-	cutoff := f.now().UTC().Add(-time.Duration(lookback) * 24 * time.Hour)
+	cutoff := now.Add(-time.Duration(lookback) * 24 * time.Hour)
 	out := make([]*gofeed.Item, 0, len(items))
 	dropped := 0
 	for _, it := range items {

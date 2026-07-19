@@ -176,36 +176,45 @@ func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Conte
 	defer resp.Body.Close()
 	elapsed := time.Since(start)
 
+	// 错误路径也记账（bug 狩猎 2026-07-19 MEDIUM，两路独立发现）：此前 recordCall
+	// 只在 JSON 解析成功后调用，429 限流一整天 tool_calls 里零行 Exa 记录——故障在
+	// 账本上隐形，只能翻应用日志。与 TikHub（binding.go 成败都记）对齐：拿到 HTTP
+	// 响应即记，cost 只在成功路径填。fail 闭包统一"记账后返回该错误"。
+	fail := func(status, bodySize int, ae error) error {
+		e.recordCall(ctx, src, status, elapsed, bodySize, 0, ae)
+		return ae
+	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, types.NewAppError(types.CodeFetchRateLimit, "Exa 搜索被限流(429)", nil)
+		return nil, fail(resp.StatusCode, 0,
+			types.NewAppError(types.CodeFetchRateLimit, "Exa 搜索被限流(429)", nil))
 	}
 	// 401/403 归 CodeValidation（与 TikHub 对齐）：key 配错是本方配置问题，
 	// 需要可诊断的错误信息而非笼统的"非 2xx"。
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, types.NewAppError(types.CodeValidation,
-			fmt.Sprintf("Exa 鉴权失败（HTTP %d），请检查 VANE_FETCH_EXA_API_KEY", resp.StatusCode), nil)
+		return nil, fail(resp.StatusCode, 0, types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("Exa 鉴权失败（HTTP %d），请检查 VANE_FETCH_EXA_API_KEY", resp.StatusCode), nil))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		ae := types.NewAppError(types.CodeFetchTimeout,
 			fmt.Sprintf("Exa 搜索返回非 2xx 状态 %d", resp.StatusCode), nil)
 		ae.Retryable = resp.StatusCode >= 500 // 5xx 瞬态可重试，4xx 确定性不可重试。
-		return nil, ae
+		return nil, fail(resp.StatusCode, 0, ae)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, e.maxBytes+1))
 	if err != nil {
-		return nil, classifyDoError(e.searchURL, err)
+		return nil, fail(resp.StatusCode, 0, classifyDoError(e.searchURL, err))
 	}
 	if int64(len(data)) > e.maxBytes {
-		return nil, types.NewAppError(types.CodeValidation,
-			fmt.Sprintf("Exa 响应体超过 %d 字节上限", e.maxBytes), nil)
+		return nil, fail(resp.StatusCode, len(data), types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("Exa 响应体超过 %d 字节上限", e.maxBytes), nil))
 	}
 
 	var er exaResponse
 	if err := json.Unmarshal(data, &er); err != nil {
 		ae := types.NewAppError(types.CodeFetchTimeout, "解析 Exa 响应失败", err)
 		ae.Retryable = false // 解析失败是确定性错误，重试无益。
-		return nil, ae
+		return nil, fail(resp.StatusCode, len(data), ae)
 	}
 
 	e.recordCall(ctx, src, resp.StatusCode, elapsed, len(data), er.CostDollars.Total, nil)
