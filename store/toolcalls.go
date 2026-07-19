@@ -12,6 +12,12 @@ import (
 // InsertToolCall 写入一条工具调用记录，返回新 id。
 // 列清单与 015_tool_calls.sql 全列对齐（id/created_at 除外，理由同 InsertLLMCall）。
 // candidate_tools 为 nil 时写空数组：列 NOT NULL DEFAULT '{}'，nil 直传 pgx 会写 NULL。
+//
+// tenant_id 同 InsertLLMCall：021 只回填存量、没改 INSERT，上线后全是 NULL
+// （生产实证 13 行有值全在部署前、28 行 NULL 全在部署后）。用 tenantOfUser 反查
+// 的理由见 tenantderive.go。llm_calls 与 tool_calls 是 021 加了 tenant_id 却
+// **没设 NOT NULL** 的仅有两张表——其余 8 张漏写会被 NOT NULL 当场拦下，
+// 这两张因可空而静默漏了整整一个部署周期。
 func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, error) {
 	cands := c.CandidateTools
 	if cands == nil {
@@ -22,11 +28,13 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 		`INSERT INTO tool_calls (
 			trace_id, user_id, session_id, tool_name, tool_kind,
 			endpoint_path, arguments, result_preview, result_size, http_status,
-			error_type, error, duration_ms, retrieval_query, candidate_tools
+			error_type, error, duration_ms, retrieval_query, candidate_tools,
+			tenant_id
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10,
-			$11, $12, $13, $14, $15
+			$11, $12, $13, $14, $15,
+			`+tenantOfUser+`$2)
 		) RETURNING id`,
 		c.TraceID, c.UserID, c.SessionID, c.ToolName, c.ToolKind,
 		c.EndpointPath, c.Arguments, c.ResultPreview, c.ResultSize, c.HTTPStatus,
