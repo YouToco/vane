@@ -161,6 +161,9 @@ type Store interface {
 	ScheduleSourceForContent(ctx context.Context, contentItemID int64, scheduleID string) (int64, bool, error)
 	// TenantLiveForUser 报告该用户所属租户是否仍在服务中（D9 软删除的执行面）。
 	TenantLiveForUser(ctx context.Context, userID int64) (bool, error)
+	// GetScheduleStrictness 读任务的推送门槛档位（migration 025，Select 过滤用）。
+	// 空串 = 未设置/行不存在 → 调用方按 types.DefaultStrictness 兜底。
+	GetScheduleStrictness(ctx context.Context, scheduleID string) (types.PushStrictness, error)
 }
 
 // Activities 持有 6 步 pipeline 的全部依赖，方法即 Temporal Activity。
@@ -232,7 +235,18 @@ type SelectIn struct {
 	TraceID string             `json:"trace_id"`
 	TopN    int                `json:"top_n"`
 	Scored  []types.ScoredItem `json:"scored"`
+	// ScheduleID 触发本次推送的任务 id（空=即时/老任务触发）：Select 据此查任务的
+	// 门槛档位（schedules.push_strictness）；空或未设置一律走 types.DefaultStrictness
+	// 全局兜底——0-20"不该推"档在任何路径都不推（2026-07-19 五张 0 分卡的修复）。
+	ScheduleID string `json:"schedule_id,omitempty"`
 }
+
+// Select 的返回**保持** []types.ScoredItem 不升级成结构体，是重放兼容性逼出来的
+// （replay_test.TestPushPipelineWorkflow_ReplayBaselineHappyPath 钉死）：发布时停在
+// CardGen/Push 上的 in-flight workflow 重放旧历史，Select 结果 payload 是数组，
+// 新代码若按结构体解码直接炸历史。门槛过滤致空时通知卡要的上下文走别的通道：
+// MaxScore 由 workflow 从 scored 纯计算（确定性），档位由 NotifyEmptyResult
+// 自己查库（activity 内 I/O 合法）。
 
 // CardGenIn 是 CardGen Activity 的入参。
 type CardGenIn struct {
@@ -804,7 +818,38 @@ func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredIte
 	if n <= 0 {
 		n = defaultTopN
 	}
-	return selector.RankTopN(in.Scored, n, time.Now()), nil
+
+	// 任务门槛档位：有 ScheduleID 才查库；查库失败**降级兜底而非中断推送**——
+	// 与画像读取失败降级空画像同一条先例（profilehint）：门槛是过滤器不是闸门，
+	// DB 抖一下就把整批推送打死，比偶尔按兜底档放行几条弱相关内容伤害大得多。
+	// 空串（未设置/行不存在/即时触发无任务）由 MinKeepScore 按 DefaultStrictness 兜底。
+	strictness := types.PushStrictness("")
+	if in.ScheduleID != "" {
+		v, err := a.store.GetScheduleStrictness(ctx, in.ScheduleID)
+		if err != nil {
+			slog.Warn("select: 查询任务门槛档位失败，按全局兜底档过滤",
+				"schedule_id", in.ScheduleID, "trace_id", in.TraceID, "err", err)
+		} else {
+			strictness = v
+		}
+	}
+	threshold := strictness.MinKeepScore()
+
+	// 门槛过滤在 RankTopN 之前（契约 §6 修订）：低于最低保留分的条目不参与择优——
+	// 纯 TopN 会在"这批全不相关"时硬凑满员（2026-07-19 deliveries 155-159 五张
+	// 0 分卡实锤）。
+	kept := make([]types.ScoredItem, 0, len(in.Scored))
+	for _, si := range in.Scored {
+		if si.Score >= float64(threshold) {
+			kept = append(kept, si)
+		}
+	}
+	if dropped := len(in.Scored) - len(kept); dropped > 0 {
+		slog.Info("select: 门槛过滤",
+			"trace_id", in.TraceID, "schedule_id", in.ScheduleID, "strictness", strictness,
+			"threshold", threshold, "in", len(in.Scored), "kept", len(kept))
+	}
+	return selector.RankTopN(kept, n, time.Now()), nil
 }
 
 // CardGen 逐条生成解读正文（并发扇出，见 mapConcurrent）。
@@ -1036,6 +1081,13 @@ type NotifyEmptyIn struct {
 	TraceID string               `json:"trace_id"`
 	Gate    types.BatchExitGate  `json:"gate"`
 	Counts  types.PipelineCounts `json:"counts"`
+	// 门槛上下文（仅 Gate=select 时有值）：空批轻量卡要能回答"抓了多少、最高几分、
+	// 门槛多高、怎么调"（Boss 拍板 2026-07-19——31 小时静默停摆史之后，"没内容"
+	// 必须与"系统死了"可区分且可解释）。MaxScore 由 workflow 从 scored 纯计算；
+	// 档位由本 Activity 按 ScheduleID 自行查库（Select 的返回类型被重放兼容性钉死
+	// 为裸切片，带不回来，见 Select 注释）。
+	ScheduleID string  `json:"schedule_id,omitempty"`
+	MaxScore   float64 `json:"max_score,omitempty"`
 }
 
 // NotifyEmptyResult 给用户发一张"本次没有新内容"的通知卡。
@@ -1056,7 +1108,20 @@ func (a *Activities) NotifyEmptyResult(ctx context.Context, in NotifyEmptyIn) er
 	if owner == "" {
 		return nil
 	}
-	md := emptyResultMarkdown(in.Gate, in.Counts)
+	// 门槛过滤致空时补查任务档位（渲染"标准/严格门槛（≥N 分）"）：Select 的返回
+	// 类型被重放兼容性钉死为裸切片带不回档位（见 Select 注释）。查库失败降级
+	// 空档位 → 文案落"推送底线"通用话术，通知本身照发——同 Select 的降级取舍。
+	strictness := types.PushStrictness("")
+	if in.Gate == types.BatchExitGateSelect && in.ScheduleID != "" {
+		v, err := a.store.GetScheduleStrictness(ctx, in.ScheduleID)
+		if err != nil {
+			slog.Warn("push: 空批通知查询门槛档位失败，按通用话术渲染",
+				"schedule_id", in.ScheduleID, "trace_id", in.TraceID, "err", err)
+		} else {
+			strictness = v
+		}
+	}
+	md := emptyResultMarkdown(in, strictness)
 	if _, err := a.pusher.Push(ctx, owner, a.buildNotice(md)); err != nil {
 		slog.Warn("push: 空结果通知发送失败（不阻断）", "trace_id", in.TraceID, "err", err)
 	}
@@ -1065,14 +1130,16 @@ func (a *Activities) NotifyEmptyResult(ctx context.Context, in NotifyEmptyIn) er
 
 // emptyResultMarkdown 按退出闸门生成人话说明——"为什么这次没有卡片"。
 // 文案与 exit_gate 语义一一对应（enums.go BatchExitGate）。
-func emptyResultMarkdown(gate types.BatchExitGate, c types.PipelineCounts) string {
+// strictness 仅 select 闸门消费（空串 = 未设置/查询降级 → 通用话术）。
+func emptyResultMarkdown(in NotifyEmptyIn, strictness types.PushStrictness) string {
+	c := in.Counts
 	nz := func(p *int) int {
 		if p == nil {
 			return 0
 		}
 		return *p
 	}
-	switch gate {
+	switch in.Gate {
 	case types.BatchExitGateFetch:
 		return "📭 本次推送没有新内容：所有信源都没有产出新条目。有新内容时定时任务会照常送达。"
 	case types.BatchExitGateDedup:
@@ -1080,10 +1147,27 @@ func emptyResultMarkdown(gate types.BatchExitGate, c types.PipelineCounts) strin
 	case types.BatchExitGateScore:
 		return fmt.Sprintf("📭 本次推送没有新内容：%d 条候选打分后没有达标的。", nz(c.Deduped))
 	case types.BatchExitGateSelect:
-		return fmt.Sprintf("📭 本次推送没有新内容：%d 条打分内容择优后没有入选的。", nz(c.Scored))
+		// 门槛过滤致空（契约 §6 修订）：这张轻量卡是门槛机制的用户反馈面——
+		// 说清"内容有、但都不够相关"，并给出调松的出口。最高分帮用户判断
+		// "是真没好内容，还是我门槛设太狠"。
+		return fmt.Sprintf("📭 本次推送没有新内容：%d 条内容打分后最高 %.0f 分，均未达到%s——不够相关的内容不值得打扰你。想放宽就在对话里说「这个任务松一点」。",
+			nz(c.Scored), in.MaxScore, strictnessPhrase(strictness))
 	case types.BatchExitGateCardGen:
 		return "📭 本次推送没有新内容：卡片生成后无可推条目。"
 	default:
 		return "📭 本次推送没有新内容。"
+	}
+}
+
+// strictnessPhrase 把档位渲染成空批文案里的人话片段（下限由 MinKeepScore 派生，
+// 不另传参——两处各算一遍迟早漂）。
+func strictnessPhrase(s types.PushStrictness) string {
+	switch s {
+	case types.StrictnessNormal:
+		return fmt.Sprintf("本任务的「标准」门槛（≥%d 分）", s.MinKeepScore())
+	case types.StrictnessStrict:
+		return fmt.Sprintf("本任务的「严格」门槛（≥%d 分）", s.MinKeepScore())
+	default:
+		return "推送底线（不推与你画像无关的内容）"
 	}
 }

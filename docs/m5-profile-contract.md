@@ -289,6 +289,31 @@ func RankTopN(scored []types.ScoredItem, n int, now time.Time) []types.ScoredIte
 //（Select 是 Activity，activity 内取 now 合法，不违反 workflow 确定性——审查已核实）
 ```
 
+### 6.1 任务门槛过滤（2026-07-19 修订，Boss 拍板）
+
+> 修订背景：纯 TopN 在"整批与画像不相关"时会硬凑满员——2026-07-19 07:26 UTC
+> 一批 5 条 HN 内容全部 0 分照样出卡（deliveries 155-159），"不相关的不推"被击穿。
+
+- **Select Activity 在 RankTopN 之前按任务门槛过滤**：`Score >= strictness.MinKeepScore()`
+  才参与择优。档位存 `schedules.push_strictness`（migration 025，NULL=未设置）：
+  `loose`→21 / `normal`→40 / `strict`→60。**loose=21 的语义是过滤 §5 打分 prompt 显式
+  指令的 0-20"不该推"档（含 20）**——消费的是"模型做过不相关分类"这个信号，不是分数
+  精确性（中段分无校准意义，Boss 拍板刻意不消费）。
+- **全局兜底**：ScheduleID 为空（push_now / 即时触发）、档位未设置、或档位查询失败
+  （降级 + WARN，同画像读取失败降级先例）一律按 `types.DefaultStrictness`（loose）——
+  0-20 档在任何路径都不推。
+- **过滤致空 = Select 闸门**（复用 `BatchExitGateSelect`，不加新枚举）：记空批次外
+  **恒发轻量通知卡**（`NotifyEmptyResult`，不限用户触发——门槛机制的反馈面必须可见，
+  否则与静默停摆不可区分），文案含「N 条内容最高 X 分未达门槛 + 调松指引」。
+  MaxScore 由 workflow 从 scored 纯计算；档位由 NotifyEmptyResult 查库
+  （**Select 返回类型被重放兼容钉死为 []ScoredItem**，见 replay_test 基线，带不回结构）。
+- **档位管理**：agent 工具 `create_schedule` 可选 `strictness` 参数（建任务时从用户
+  表态推断）+ `set_task_strictness`（后续"严一点/松一点"）；归属校验在 store WHERE
+  谓词。scorer/RankTopN 本体零改动——门槛是 Select 的过滤前置，不动打分与排序语义。
+- **探针交互**：整批不相关全 0 分的批不再出卡，但 llm_calls 打分行仍在，§16.1 区分度
+  照红——其 Detail 已加自诊断（completion="0"×N + tokens=1 ≠ M3 回归，人工核内容后
+  可不回滚）。
+
 ## 7. cardgen 改造（`cardgen/cardgen.go`：bodyMD 返回 + 画像注入）
 
 - `Generate` 返回值从完整卡片 JSON 改为 **bodyMD**（现 buildMarkdown 产物，含阅读原文行）；

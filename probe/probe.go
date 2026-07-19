@@ -260,7 +260,13 @@ func judgeDiscrimination(traces []types.ScoreTraceStat) Result {
 		r.Summary = fmt.Sprintf("%d/%d 个批次整批同分——M3 事故形状", len(flat), len(traces))
 		r.Detail = fmt.Sprintf("首个：trace %s（%d 次打分，输出只有 1 种）。"+
 			"按契约立即回滚排查。先查 DisableThinking 是否仍生效（CLAUDE.md 红线 1）："+
-			"SELECT completion, completion_tokens FROM llm_calls WHERE trace_id='%s' AND span_name='score' LIMIT 5;",
+			"SELECT completion, completion_tokens FROM llm_calls WHERE trace_id='%s' AND span_name='score' LIMIT 5;"+
+			"【自诊断】若查出 completion 全为「0」（或同一低分）且 completion_tokens=1，"+
+			"这不是 M3 回归——M3 的形状是 completion 空、tokens 反而不低（思维链吃光预算）。"+
+			"整批内容与画像全不相关时模型正确地全打 0 分也长「整批同分」这个样子"+
+			"（2026-07-19 生产实锤：5 篇 HN 长文全 0 分），本探针无法从 DB 区分这两种成因，"+
+			"先人工看内容再定回滚。任务门槛过滤（契约 §6）落地后这类批次不再出卡，"+
+			"但打分行仍在 llm_calls 里，本探针照红——红灯 + 上述查询结果 = 可以不回滚。",
 			flat[0].TraceID, flat[0].N, flat[0].TraceID)
 		return r
 	}

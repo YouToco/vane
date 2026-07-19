@@ -125,6 +125,9 @@ type fakeStore struct {
 	gotBatchScheduleID string // Push 建批次时收到的 schedule_id（P1b 穿参断言）
 	unpushed           []types.ContentItem
 
+	strictness    types.PushStrictness // GetScheduleStrictness 返回值（零值=未设置）
+	strictnessErr error                // 非 nil = 模拟门槛档位查询失败（Select 应降级兜底）
+
 	nextDelID   int64
 	sentAlready bool // true = 模拟重试时该 (batch, content) 已发过
 	inserted    []types.Delivery
@@ -156,6 +159,13 @@ type fakeStore struct {
 	// #8 卡片源归属：schedSrcForContent 映射 content_item_id→本任务命中源 id；
 	// 命中即 ScheduleSourceForContent 返回 (id,true)，缺失返回 (0,false) 让调用方回退首发源。
 	schedSrcForContent map[int64]int64
+}
+
+func (f *fakeStore) GetScheduleStrictness(context.Context, string) (types.PushStrictness, error) {
+	if f.strictnessErr != nil {
+		return "", f.strictnessErr
+	}
+	return f.strictness, nil
 }
 
 // tenantGone 让用例模拟「租户已注销」（D9）。零值 false = 租户在服务中，

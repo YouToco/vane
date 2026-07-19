@@ -35,11 +35,12 @@ import (
 
 const (
 	// maxActivatedEndpoints 会话内同时激活（注入 FC tools 数组）的端点上限。
-	// 在场工具数安全线是 30（RAG-MCP 压测 <30 成功率 >90%）：当前静态面是
-	// 13 工具 + search_endpoints，15 个激活位正好顶到 29——**再加静态工具前
-	// 必须先降本上限**（2026-07-18 修正：原注释写"静态 10 个"已长期失真；
-	// 同日 read_endpoint_result 入列静态面，13+2 静态 + 14 激活 = 29，压线内）。
-	maxActivatedEndpoints = 14
+	// 在场工具数安全线是 30（RAG-MCP 压测 <30 成功率 >90%）：**再加静态工具前
+	// 必须先降本上限**（TestToolCountBudget 是账单）。账目沿革：2026-07-18
+	// read_endpoint_result 入列 15→14（14 静态 + 2 端点工具 + 14 激活 = 29 顶线）；
+	// 2026-07-19 set_task_strictness 入列（任务门槛档位拍板）14→13，
+	// 15 静态 + 2 端点工具* + 13 激活 = 29 压线内（*端点工具计入 BuildTools 返回值）。
+	maxActivatedEndpoints = 13
 	// searchTopK 每次检索返回并激活的端点数（Anthropic Tool Search 默认值同为 5）。
 	searchTopK = 5
 	// 端点结果的内联上限**不再是常量**：由 agent 模型声明的上下文窗口派生
