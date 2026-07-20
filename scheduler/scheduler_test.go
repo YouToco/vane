@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	commonpb "go.temporal.io/api/common/v1"
 	enums "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
@@ -412,6 +413,108 @@ func TestUpdatePush_镜像失败回滚Temporal(t *testing.T) {
 	}
 }
 
+// TestUpdatePush_改名即时回写Action 钉住 #3 修复：连带改名（nlDesc != nil）时，
+// 同一次原子 Update 必须连 Action.Args 的任务名一起换——NLDesc 冻结在建调度时的
+// 入参里，只换 Spec 会让聚合卡 header 永久显示旧任务名。
+func TestUpdatePush_改名即时回写Action(t *testing.T) {
+	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-abc",
+		[]interface{}{payloadArg(t, makePushParams(1, "push-1-abc", workflow.PushScope{}, "旧任务名"))})}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
+	st := &fakeScheduleStore{}
+	s := New(fc, "tq", st)
+
+	newName := "新任务名"
+	err := s.UpdatePush(context.Background(), "push-1-abc", 1, ScheduleSpec{Cron: "30 9 * * *"}, &newName)
+	if err != nil {
+		t.Fatalf("UpdatePush 失败: %v", err)
+	}
+
+	// Spec 与任务名在同一次 Update 里换掉。
+	if got := h.current.Spec.CronExpressions; len(got) != 1 || got[0] != "30 9 * * *" {
+		t.Errorf("Spec 应更新为新 cron，实得 %v", got)
+	}
+	act := h.current.Action.(*client.ScheduleWorkflowAction)
+	got, ok := act.Args[0].(workflow.PushParams)
+	if !ok {
+		t.Fatalf("Args[0] 应为 PushParams，实得 %T", act.Args[0])
+	}
+	if got.NLDesc != "新任务名" {
+		t.Errorf("Action 入参任务名应即时回写，实得 %q", got.NLDesc)
+	}
+	if got.ScheduleID != "push-1-abc" || got.UserID != 1 {
+		t.Errorf("schedule_id/user_id 应正确，实得 %+v", got)
+	}
+	// Action 其余字段与 Policy 原样保留。
+	if act.ID != "wf-push-1-abc" || act.TaskQueue != "vane-tq" {
+		t.Errorf("Action 其余字段必须保留，实得 %+v", act)
+	}
+	if h.current.Policy == nil || h.current.Policy.Overlap != enums.SCHEDULE_OVERLAP_POLICY_SKIP {
+		t.Error("Overlap=SKIP 必须保留")
+	}
+	// 镜像同步收到新名。
+	if st.gotNLDesc == nil || *st.gotNLDesc != "新任务名" {
+		t.Errorf("镜像应收到新任务名，实得 %v", st.gotNLDesc)
+	}
+}
+
+// TestUpdatePush_改名镜像失败回滚Action与Spec 钉住：改名+改频的复合 Update 在镜像
+// 失败时，Spec 与 Action 入参要一起回到旧值——只回 Spec 会留下「镜像旧名 / Action
+// 新名」的反向漂移（与原来「镜像新名 / Action 旧名」同样坏）。
+func TestUpdatePush_改名镜像失败回滚Action与Spec(t *testing.T) {
+	oldArgs := []interface{}{payloadArg(t, makePushParams(1, "push-1-abc", workflow.PushScope{}, "旧任务名"))}
+	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-abc", oldArgs)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
+	st := &fakeScheduleStore{updateErr: types.NewAppError(types.CodeDatabase, "模拟镜像写失败", nil)}
+	s := New(fc, "tq", st)
+
+	newName := "新任务名"
+	err := s.UpdatePush(context.Background(), "push-1-abc", 1, ScheduleSpec{Cron: "30 9 * * *"}, &newName)
+	if err == nil {
+		t.Fatal("镜像失败必须上抛错误，不能让调用方以为改成了")
+	}
+	// 两次 Update：一次改、一次回滚。
+	if len(h.history) != 2 {
+		t.Fatalf("应发生 2 次 Update（改 + 回滚），实得 %d", len(h.history))
+	}
+	// Spec 回到旧 cron。
+	if got := h.current.Spec.CronExpressions; len(got) != 1 || got[0] != "30 8 * * *" {
+		t.Errorf("Spec 应回滚到旧 cron，实得 %v", got)
+	}
+	// Action 入参回到旧任务名（回滚恢复的是原始 payload，需解码验证）。
+	act := h.current.Action.(*client.ScheduleWorkflowAction)
+	pl, ok := act.Args[0].(*commonpb.Payload)
+	if !ok {
+		t.Fatalf("回滚后 Args[0] 应为原始 payload，实得 %T", act.Args[0])
+	}
+	var got workflow.PushParams
+	if err := converter.GetDefaultDataConverter().FromPayload(pl, &got); err != nil {
+		t.Fatalf("解码回滚后的入参失败: %v", err)
+	}
+	if got.NLDesc != "旧任务名" {
+		t.Errorf("回滚后任务名应恢复旧值，实得 %q", got.NLDesc)
+	}
+}
+
+// TestUpdatePush_改名回滚旧入参为空也恢复 钉住回滚守卫用 wantArgs（写入侧标记）而非
+// oldArgs：旧 Action 入参为 nil（坏调度）时，回滚同样必须把已写入的新入参清回去——
+// 用 oldArgs != nil 当守卫会在此漏恢复，留下「镜像旧名 / Action 新名」漂移。
+func TestUpdatePush_改名回滚旧入参为空也恢复(t *testing.T) {
+	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-nil", nil)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
+	st := &fakeScheduleStore{updateErr: types.NewAppError(types.CodeDatabase, "模拟镜像写失败", nil)}
+	s := New(fc, "tq", st)
+
+	newName := "新任务名"
+	err := s.UpdatePush(context.Background(), "push-1-nil", 1, ScheduleSpec{Cron: "30 9 * * *"}, &newName)
+	if err == nil {
+		t.Fatal("镜像失败必须上抛错误")
+	}
+	act := h.current.Action.(*client.ScheduleWorkflowAction)
+	if len(act.Args) != 0 {
+		t.Errorf("回滚后入参应恢复为空（旧值），实得 %d 个", len(act.Args))
+	}
+}
+
 // TestUpdatePush_校验失败不碰Temporal 确保非法 spec 在进 Temporal 之前就被拒。
 func TestUpdatePush_校验失败不碰Temporal(t *testing.T) {
 	for name, spec := range map[string]ScheduleSpec{
@@ -720,8 +823,9 @@ func TestReconcileActions_补齐缺失的scheduleID(t *testing.T) {
 	}
 }
 
-// TestReconcileActions_已带id则跳过 守幂等：Action.Args 已带正确 schedule_id 的调度
-// （新建的、或上次已 reconcile 过的）重启时不得再写 Temporal。走真 payload 解码路径。
+// TestReconcileActions_已带id则跳过 守幂等：Action.Args 已与期望 params 一致
+// （schedule_id + 任务名）的调度——新建的、或上次已 reconcile 过且未改名的——
+// 重启时不得再写 Temporal。走真 payload 解码路径。
 func TestReconcileActions_已带id则跳过(t *testing.T) {
 	good := []interface{}{payloadArg(t, makePushParams(1, "push-1-new", workflow.PushScope{}, "任务名"))}
 	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-new", good)}
@@ -729,7 +833,8 @@ func TestReconcileActions_已带id则跳过(t *testing.T) {
 		handles: map[string]*fakeScheduleHandle{"push-1-new": h},
 	}}
 	st := &fakeScheduleStore{active: []types.Schedule{{
-		ID: "push-1-new", UserID: 1, ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
+		ID: "push-1-new", UserID: 1, NLDescription: "任务名",
+		ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
 	}}}
 	s := New(fc, "tq", st)
 
@@ -737,7 +842,45 @@ func TestReconcileActions_已带id则跳过(t *testing.T) {
 		t.Fatalf("ReconcileActions 失败: %v", err)
 	}
 	if len(h.history) != 0 {
-		t.Errorf("已带正确 schedule_id 的调度不应再 Update，实得 %d 次", len(h.history))
+		t.Errorf("入参已一致的调度不应再 Update，实得 %d 次", len(h.history))
+	}
+}
+
+// TestReconcileActions_任务名漂移回写 守 #3：镜像 nl_description 新、Action.NLDesc 旧
+// （改名发生在 UpdatePush 即时回写能力上线之前、或即时回写失败过的调度），
+// reconcile 必须把 Action 刷回新名——否则聚合卡 header 永久显示旧任务名。
+func TestReconcileActions_任务名漂移回写(t *testing.T) {
+	stale := []interface{}{payloadArg(t, makePushParams(1, "push-1-ren", workflow.PushScope{}, "旧任务名"))}
+	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-ren", stale)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{"push-1-ren": h},
+	}}
+	st := &fakeScheduleStore{active: []types.Schedule{{
+		ID: "push-1-ren", UserID: 1, NLDescription: "新任务名",
+		ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
+	}}}
+	s := New(fc, "tq", st)
+
+	if err := s.ReconcileActions(context.Background()); err != nil {
+		t.Fatalf("ReconcileActions 失败: %v", err)
+	}
+	if len(h.history) != 1 {
+		t.Fatalf("任务名漂移的调度应被 Update 一次，实得 %d", len(h.history))
+	}
+	act := h.current.Action.(*client.ScheduleWorkflowAction)
+	got := act.Args[0].(workflow.PushParams)
+	if got.NLDesc != "新任务名" {
+		t.Errorf("NLDesc 应回写为新任务名，实得 %q", got.NLDesc)
+	}
+	if got.ScheduleID != "push-1-ren" || got.UserID != 1 {
+		t.Errorf("schedule_id/user_id 应保持，实得 %+v", got)
+	}
+	// 只换 Args：Spec/Overlap/State 原样保留。
+	if len(h.current.Spec.CronExpressions) != 1 || h.current.Spec.CronExpressions[0] != "30 8 * * *" {
+		t.Errorf("Spec 不该被动，实得 %+v", h.current.Spec)
+	}
+	if h.current.Policy == nil || h.current.Policy.Overlap != enums.SCHEDULE_OVERLAP_POLICY_SKIP {
+		t.Error("Overlap=SKIP 不该被动")
 	}
 }
 

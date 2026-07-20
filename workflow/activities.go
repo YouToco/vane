@@ -443,7 +443,8 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 
 	// 返回"未投递候选"而非"本次新入库"，让 Fetch 重试幂等可续（修 #3）；
 	// 全局上限 + 每源配额双重截断，控制单批打分规模且防高产源饿死低产源（修 #6）。
-	// planScoped：只在本任务的源见过、且本任务未投过的内容里挑（决策 #3 互不干扰，P1b b3）。
+	// planScoped：只在本任务的源见过、且用户未读过的内容里挑——取材按任务隔离（决策 #3，
+	// P1b b3），去重按用户级（决策 A：用户已读的内容任何路径都不再重推）。
 	if planScoped {
 		return a.store.ListUnpushedBySchedule(ctx, p.ScheduleID, maxScoreCandidates, maxPerSourceCandidates)
 	}
