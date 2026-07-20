@@ -346,6 +346,9 @@ func TestSec_ProtectedEndpointsRequireSession(t *testing.T) {
 		{http.MethodGet, "/api/profile"},
 		{http.MethodGet, "/api/admin/observability"},
 		{http.MethodGet, "/api/admin/runstats"},
+		{http.MethodGet, "/api/admin/invites"},
+		{http.MethodPost, "/api/admin/invites"},
+		{http.MethodDelete, "/api/admin/invites/SOMECODE"},
 		{http.MethodGet, "/api/feishu/status"},
 		{http.MethodPost, "/api/feishu/config"},
 	}
@@ -668,6 +671,11 @@ func TestSec_PlatformEndpointsGatedToOwner(t *testing.T) {
 		{http.MethodPost, "/api/feishu/test"},
 		{http.MethodGet, "/api/admin/observability"},
 		{http.MethodGet, "/api/admin/runstats"},
+		// 邀请码管理：能发码 = 能凭空创造「注册并消耗平台预算的资格」（I-A2），
+		// 比读统计的危害更直接，绝不能漏出平台 owner 闸门。
+		{http.MethodGet, "/api/admin/invites"},
+		{http.MethodPost, "/api/admin/invites"},
+		{http.MethodDelete, "/api/admin/invites/SOMECODE"},
 	}
 	// 普通租户（非平台 owner）：一律不可见。
 	mux, cookie := authzMux(t, 555, 555, nil)

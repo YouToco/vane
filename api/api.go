@@ -116,6 +116,12 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	// M7 画像查看端点（功能 6.3）：只读，展示结构化标签 + 摘要画像（含负偏好尾句）；编辑写回留二期。
 	inner.HandleFunc("GET /api/profile", s.handleProfile)
 
+	// 邀请码管理端点（D4 准入闸门的管理面）：替代 SSH 跑 useradmin invite。
+	// 全部锁 requirePlatformOwner（handler 内第一行，非 owner 404）。
+	inner.HandleFunc("GET /api/admin/invites", s.handleListInvites)
+	inner.HandleFunc("POST /api/admin/invites", s.handleCreateInvite)
+	inner.HandleFunc("DELETE /api/admin/invites/{code}", s.handleDeleteInvite)
+
 	mux.Handle("/api/", s.cors(s.requireSession(inner)))
 }
 
