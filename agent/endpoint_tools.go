@@ -88,6 +88,15 @@ type toolRunState struct {
 	// inlinedRunes 本条消息内已内联进上下文的端点结果字符数（累计预算，
 	// 见 llm.InlineLimits.MsgBudget）。只统计真正回给模型的部分，不含缓存全量。
 	inlinedRunes int
+	// untrustedExternalResult 表示本条用户消息已把外部网页结果放进模型上下文。
+	// 此后直到下一条用户消息，全部工具一律 fail-closed：外部内容可影响回答，
+	// 不能借提示注入生成 pending action，也不能用 URL/query 外带上下文。
+	// 状态不持久化，下一条明确用户请求重新开始。
+	untrustedExternalResult bool
+	// allowedLocalResultHandles 只登记本条消息的动态端点刚生成的截断句柄。
+	// 句柄 res-N 可猜且缓存按 user 共享；仅用 bool 会让恶意端点枚举同用户
+	// 其他会话的旧结果。taint 后 read_endpoint_result 必须命中这个集合。
+	allowedLocalResultHandles map[string]struct{}
 }
 
 // inlineBudget 返回本次调用可内联的字符数：预算未尽给满额，尽了给保底
@@ -243,6 +252,11 @@ func (e *EndpointTools) Resolve(name string, act *activationState) (Tool, bool) 
 		return nil, false
 	}
 	return &endpointTool{ep: e, entry: entry}, true
+}
+
+func isRegisteredEndpoint(name string) bool {
+	_, ok := tikhubcatalog.Lookup(name)
+	return ok
 }
 
 // Defs 渲染激活端点的 FC 工具声明，顺序 = 激活顺序（前缀稳定性见 activationState）。
@@ -460,6 +474,7 @@ func (t *endpointTool) Parameters() json.RawMessage {
 	return endpointParamsSchema(t.entry)
 }
 func (t *endpointTool) Mutating() bool                   { return false }
+func (t *endpointTool) untrustedResult() bool            { return true }
 func (t *endpointTool) Summarize(json.RawMessage) string { return "" }
 func (t *endpointTool) toolKind() types.ToolCallKind     { return types.ToolCallKindTikHubEndpoint }
 
@@ -551,6 +566,9 @@ func (t *endpointTool) Execute(ctx context.Context, userID int64, args json.RawM
 		// 超限：全量进缓存、给句柄——被截部分从此有取回通道（契约 §3.5，
 		// 此前只截不给取回是 Boss 实测撞上的死路，也是 Codex 至今被诟病的形态）。
 		handle := t.ep.results.put(userID, t.entry.Name, res.Body)
+		if state != nil {
+			state.allowLocalResultHandle(handle)
+		}
 		body += buildTruncationNote(handle, len(res.Body), res.Body, res.Truncated, limit)
 	}
 	return body, nil
@@ -563,6 +581,28 @@ func (s *toolRunState) countEndpointCall() {
 	if s != nil {
 		s.endpointCalls++
 	}
+}
+
+func (s *toolRunState) allowLocalResultHandle(handle string) {
+	if s == nil || handle == "" {
+		return
+	}
+	if s.allowedLocalResultHandles == nil {
+		s.allowedLocalResultHandles = make(map[string]struct{})
+	}
+	s.allowedLocalResultHandles[handle] = struct{}{}
+}
+
+func (s *toolRunState) allowsLocalResultHandle(handle string) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.allowedLocalResultHandles[handle]
+	return ok
+}
+
+func (s *toolRunState) hasLocalResultHandles() bool {
+	return s != nil && len(s.allowedLocalResultHandles) > 0
 }
 
 // validateEndpointArgs 校验模型产出的参数：未知参数与必填缺失都给出确定性

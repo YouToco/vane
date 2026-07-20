@@ -3,9 +3,12 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/YouToco/vane/types"
 )
+
+const toolCallRecordTimeout = 5 * time.Second
 
 // toolCallInserter 是记账所需的唯一 store 方法（生产实现 *store.Store）。
 type toolCallInserter interface {
@@ -30,7 +33,11 @@ func (r *ToolCallRecorder) Record(ctx context.Context, c *types.ToolCall) {
 	if r == nil || r.st == nil || c == nil {
 		return
 	}
-	if _, err := r.st.InsertToolCall(ctx, c); err != nil {
+	// 工具调用已经发生后，调用方取消不能只抹掉 Agent 外层账本而留下上游账本；
+	// 但裸 WithoutCancel 会让连接池故障无限阻塞业务返回，因此重新加有界预算。
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), toolCallRecordTimeout)
+	defer cancel()
+	if _, err := r.st.InsertToolCall(recordCtx, c); err != nil {
 		slog.Error("tool 记账写库失败",
 			"trace_id", c.TraceID,
 			"tool_name", c.ToolName,

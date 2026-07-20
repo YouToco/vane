@@ -200,7 +200,7 @@ func (s *Service) generateDeepDive(ctx context.Context, userID int64, d *types.D
 			"delivery_id", d.ID, "err", err)
 		return
 	}
-	s.notifyClick(ctx, userID, d.ID, item.Title, "深度解读", "，长文结果将以新消息送达")
+	s.notifyClick(ctx, userID, d.ID, "深度解读", "，长文结果将以新消息送达")
 }
 
 // callDeepDive 调模型出长文。走 DoChat 而非 Complete：单轮 Request 没有 Model

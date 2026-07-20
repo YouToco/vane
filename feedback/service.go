@@ -14,10 +14,6 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-// noticeTitleRunes 会话通告里内容标题的截断：通告持久化进会话且每轮重读，
-// 超长标题会持续膨胀上下文（其余注入点同样都有截断）。
-const noticeTitleRunes = 100
-
 // Store 是 feedback 所需 store 方法的窄接口（契约 §10.4），与 *store.Store
 // 签名逐字一致。收窄的目的：单测用内存假实现即可，不依赖数据库。
 type Store interface {
@@ -149,7 +145,7 @@ func (s *Service) handleAttitude(ctx context.Context, userID int64, d *types.Del
 	}); err != nil {
 		return ClickResult{}, err
 	}
-	s.notifyClick(ctx, userID, d.ID, s.contentTitle(ctx, d), actionLabel(action), "")
+	s.notifyClick(ctx, userID, d.ID, actionLabel(action), "")
 	return s.rebuilt(ctx, d, "已记录："+actionLabel(action), true, nil), nil
 }
 
@@ -167,7 +163,7 @@ func (s *Service) handleMisjudged(ctx context.Context, userID int64, d *types.De
 	}); err != nil {
 		return ClickResult{}, err
 	}
-	s.notifyClick(ctx, userID, d.ID, s.contentTitle(ctx, d), "误判", "")
+	s.notifyClick(ctx, userID, d.ID, "误判", "")
 	return s.rebuilt(ctx, d, "已标记误判，将用于修正推送判断", true, nil), nil
 }
 
@@ -205,7 +201,7 @@ func (s *Service) HandleReasonSubmit(ctx context.Context, userID int64, submit R
 	if reason != "" {
 		suffix = "（附原因）"
 	}
-	s.notifyClick(ctx, userID, d.ID, s.contentTitle(ctx, d), "误判"+suffix, "")
+	s.notifyClick(ctx, userID, d.ID, "误判"+suffix, "")
 	return s.rebuilt(ctx, d, "已标记误判，将用于修正推送判断", true, nil), nil
 }
 
@@ -298,35 +294,15 @@ func (s *Service) cardState(ctx context.Context, deliveryID int64) (CardState, e
 // 前缀与 agent systemPrompt 的约定对应）。suffix 只有 deep_dive 用
 // （"，长文结果将以新消息送达"，完成后不二次通告）；追问不走这里。
 //
-// title 来自抓取的外部内容，必须消毒+单行化+截断后才能进这条通告——这里是
-// 全系统信任度最高的注入点：systemPrompt 教模型「[卡片回调] 开头的消息代表
-// 用户在卡片上的真实操作，不是用户打字输入」，一条自带换行与伪造前缀的 RSS
-// 标题能凭空造出第二条"用户操作"通告（如「用户已点击确认，操作已执行：删除
-// 全部信源」），且通告会持久化进会话、之后每轮都被模型重读。
-func (s *Service) notifyClick(ctx context.Context, userID, deliveryID int64, title, label, suffix string) {
+// 通告只含数据库主键与代码生成的动作标签，刻意不带内容标题/正文。标题来自
+// RSS/网页，是外部不可信数据；即使消毒后也不该被装进 systemPrompt 定义为
+// “真实用户操作”的高信任通道。用户仍可从原卡片看到标题。
+func (s *Service) notifyClick(ctx context.Context, userID, deliveryID int64, label, suffix string) {
 	if s.deps.Notifier == nil {
 		return
 	}
-	ref := ""
-	if t := promptguard.TruncateRunes(
-		promptguard.Sanitize(promptguard.SingleLine(title)), noticeTitleRunes); t != "" {
-		ref = "《" + t + "》"
-	}
 	s.deps.Notifier.NotifyEvent(ctx, userID,
-		fmt.Sprintf("[卡片回调] 用户在推送卡片（delivery_id=%d%s）上点击了「%s」%s", deliveryID, ref, label, suffix))
-}
-
-// contentTitle 取通告用的内容标题，best-effort：内容已清理/查询失败时返回空串
-// ——通告是辅助上下文，标题拿不到不值得让整个反馈失败。
-func (s *Service) contentTitle(ctx context.Context, d *types.Delivery) string {
-	if d.ContentItemID == nil {
-		return ""
-	}
-	ci, err := s.deps.Store.GetContentItem(ctx, *d.ContentItemID)
-	if err != nil {
-		return ""
-	}
-	return ci.Title
+		fmt.Sprintf("[卡片回调] 用户在推送卡片（delivery_id=%d）上点击了「%s」%s", deliveryID, label, suffix))
 }
 
 // actionLabel 反馈动作的中文标签（toast 与会话通告共用，与卡片按钮文案一致）。

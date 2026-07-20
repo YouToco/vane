@@ -3,11 +3,14 @@ package feishu
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
 	"testing"
 
 	"github.com/google/uuid"
+	lark "github.com/larksuite/oapi-sdk-go/v3"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
@@ -288,17 +291,27 @@ func TestParseInteractiveContent(t *testing.T) {
 	}
 }
 
-// fakeRunner 是 AgentRunner 的假实现：记录 HandleMessage 收到的文本，
-// 供 handle 入口路由测试断言"哪些消息进了 agent loop、进去的文本是什么"。
+// fakeRunner 是 AgentRunner 的假实现：记录消息文本及其显式信任类型，供
+// handle 入口路由测试断言外部卡片/引用正文不会误走普通消息入口。
 type fakeRunner struct {
-	mu    sync.Mutex
-	texts []string
+	mu       sync.Mutex
+	texts    []string
+	external []bool
 }
 
 func (f *fakeRunner) HandleMessage(_ context.Context, _ int64, text string) (agent.Outcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.texts = append(f.texts, text)
+	f.external = append(f.external, false)
+	return agent.Outcome{Reply: "ok"}, nil
+}
+
+func (f *fakeRunner) HandleExternalContextMessage(_ context.Context, _ int64, text string) (agent.Outcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.texts = append(f.texts, text)
+	f.external = append(f.external, true)
 	return agent.Outcome{Reply: "ok"}, nil
 }
 
@@ -314,6 +327,58 @@ func (f *fakeRunner) received() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.texts...)
+}
+
+func (f *fakeRunner) receivedExternal() []bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]bool(nil), f.external...)
+}
+
+func newQuotedMessageTestClient(t *testing.T, parentID, quotedText string) (*lark.Client, func()) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/oauth/v3/token":
+			fmt.Fprint(w, `{"access_token":"test-token","token_type":"Bearer","expires_in":7200}`)
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			// 兼容 SDK 旧 token 路径；当前 v3.9.9 走上面的 OAuth v3。
+			fmt.Fprint(w, `{"code":0,"tenant_access_token":"test-token","expire":7200}`)
+		case "/open-apis/im/v1/messages/" + parentID:
+			fmt.Fprint(w, `{"code":0,"msg":"success","data":{"items":[`+
+				`{"message_id":"`+parentID+`","msg_type":"text","body":{"content":"{\"text\":\"`+quotedText+`\"}"}}]}}`)
+		default:
+			// handler 端到端测试还会发 typing reaction 与 reply；这些不是
+			// 本测试断言面，返回通用成功即可。
+			fmt.Fprint(w, `{"code":0,"msg":"success","data":{}}`)
+		}
+	}))
+	client := lark.NewClient("app-id-"+uuid.NewString(), "app-secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	return client, server.Close
+}
+
+func TestPrependQuotedMessage_MarksFetchedTextAsExternalContext(t *testing.T) {
+	const parentID = "om_parent_external"
+	client, closeServer := newQuotedMessageTestClient(t, parentID, "引用里的外部正文")
+	defer closeServer()
+
+	m := NewManager(nil, nil, nil)
+	m.apiClient = client
+	h := newHandler(m, context.Background())
+
+	got, external := h.prependQuotedMessage(context.Background(), parentID, "用户自己的回复")
+	if !external {
+		t.Fatal("成功拉取并拼入引用正文后必须返回 external-context=true")
+	}
+	want := "[用户引用的消息]\n引用里的外部正文\n[用户的回复]\n用户自己的回复"
+	if got != want {
+		t.Fatalf("prependQuotedMessage=%q，期望 %q", got, want)
+	}
 }
 
 // receiveEvent 构造一条 P2 消息接收事件（handle 的最小输入形态）。

@@ -178,6 +178,7 @@ func (t *webSearchTool) Description() string {
 }
 func (t *webSearchTool) Parameters() json.RawMessage { return json.RawMessage(webSearchSchema) }
 func (t *webSearchTool) Mutating() bool              { return false }
+func (t *webSearchTool) untrustedResult() bool       { return true }
 func (t *webSearchTool) toolKind() types.ToolCallKind {
 	return types.ToolCallKindExaFetch
 }
@@ -188,7 +189,7 @@ type webSearchArgs struct {
 	IncludeDomains []string `json:"include_domains"`
 }
 
-func (t *webSearchTool) Execute(ctx context.Context, _ int64, args json.RawMessage) (string, error) {
+func (t *webSearchTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
 	// 限额判定先于一切上游动作（双重限额，见文件头成本纪律）。
 	if msg := t.et.checkBudget(ctx); msg != "" {
 		return msg, nil
@@ -218,6 +219,7 @@ func (t *webSearchTool) Execute(ctx context.Context, _ int64, args json.RawMessa
 		num = webSearchMaxResults
 	}
 	t.et.countCall(ctx)
+	ctx = withExaAttribution(ctx, userID)
 	results, err := t.et.searcher.Search(ctx, a.Query, num, a.IncludeDomains)
 	if err != nil {
 		return exaToolError(err)
@@ -283,6 +285,7 @@ func (t *readPageTool) Description() string {
 }
 func (t *readPageTool) Parameters() json.RawMessage { return json.RawMessage(readPageSchema) }
 func (t *readPageTool) Mutating() bool              { return false }
+func (t *readPageTool) untrustedResult() bool       { return true }
 func (t *readPageTool) toolKind() types.ToolCallKind {
 	return types.ToolCallKindExaFetch
 }
@@ -291,7 +294,7 @@ type readPageArgs struct {
 	URL string `json:"url"`
 }
 
-func (t *readPageTool) Execute(ctx context.Context, _ int64, args json.RawMessage) (string, error) {
+func (t *readPageTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
 	// 限额判定先于一切上游动作（双重限额，见文件头成本纪律）。
 	if msg := t.et.checkBudget(ctx); msg != "" {
 		return msg, nil
@@ -315,6 +318,7 @@ func (t *readPageTool) Execute(ctx context.Context, _ int64, args json.RawMessag
 		return fmt.Sprintf("url 过长（上限 %d 字符）。", exaURLMaxRunes), nil
 	}
 	t.et.countCall(ctx)
+	ctx = withExaAttribution(ctx, userID)
 	title, text, cached, err := t.et.reader.ReadPage(ctx, u)
 	if err != nil {
 		// 页面抓不到（ErrPageUnreachable）：URL 打错/需登录/拦抓取是主流原因，
@@ -337,3 +341,14 @@ func (t *readPageTool) Execute(ctx context.Context, _ int64, args json.RawMessag
 }
 
 func (t *readPageTool) Summarize(json.RawMessage) string { return "" }
+
+// withExaAttribution 让 fetcher 层的真实上游行与 Agent/LLM 行共享 trace/user，
+// store 据 user 推导 tenant。上下文只承载本地记账元数据；Exa 请求体仍只有显式
+// query/url 参数，不会携带 system prompt、画像或会话历史。
+func withExaAttribution(ctx context.Context, userID int64) context.Context {
+	var traceID string
+	if m, ok := ctx.Value(chatMetaKey{}).(chatMeta); ok {
+		traceID = m.traceID
+	}
+	return fetcher.WithBindingAttribution(ctx, traceID, userID)
+}

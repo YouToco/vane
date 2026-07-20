@@ -3,8 +3,11 @@ package fetcher
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -14,14 +17,18 @@ import (
 
 // mockRecorder captures tool_calls written by the Exa fetchers.
 type mockRecorder struct {
-	mu    sync.Mutex
-	calls []*types.ToolCall
+	mu          sync.Mutex
+	calls       []*types.ToolCall
+	contextErr  error
+	hasDeadline bool
 }
 
-func (m *mockRecorder) RecordBindingCall(_ context.Context, rec *types.ToolCall) {
+func (m *mockRecorder) RecordBindingCall(ctx context.Context, rec *types.ToolCall) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls = append(m.calls, rec)
+	m.contextErr = ctx.Err()
+	_, m.hasDeadline = ctx.Deadline()
 }
 
 func (m *mockRecorder) last() *types.ToolCall {
@@ -31,6 +38,12 @@ func (m *mockRecorder) last() *types.ToolCall {
 		return nil
 	}
 	return m.calls[len(m.calls)-1]
+}
+
+func (m *mockRecorder) contextState() (error, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.contextErr, m.hasDeadline
 }
 
 // ────────── Exa /search cost recording ──────────
@@ -210,6 +223,110 @@ func TestExaContents_NilRecorder_NoPanic(t *testing.T) {
 	_, err := e.Fetch(context.Background(), types.Source{ID: 1, Platform: types.PlatformWeb, Capability: types.CapContents, Config: json.RawMessage(`{"url":"https://x.com/p"}`)})
 	if err != nil {
 		t.Fatalf("recorder 为 nil 时不应影响 Fetch: %v", err)
+	}
+}
+
+// TestExaAdHoc_RecordsAttributionWithoutSendingContext H-1 双账本金丝雀：
+// Agent 注入的 trace/user 要进入本地上游账本，但不得被序列化到 Exa 请求体/请求头。
+func TestExaAdHoc_RecordsAttributionWithoutSendingContext(t *testing.T) {
+	const traceID = "private-context-sentinel"
+	ctx := WithBindingAttribution(context.Background(), traceID, 7007)
+
+	assertAttribution := func(t *testing.T, got *types.ToolCall) {
+		t.Helper()
+		if got == nil {
+			t.Fatal("recorder 未收到调用记录")
+		}
+		if got.TraceID != traceID || got.UserID == nil || *got.UserID != 7007 {
+			t.Fatalf("上游账本归属不完整: trace=%q user=%v", got.TraceID, got.UserID)
+		}
+		if got.SourceID == nil || *got.SourceID != 0 {
+			t.Fatalf("ad-hoc 调用必须是 source_id=0，实得 %v", got.SourceID)
+		}
+	}
+
+	t.Run("search", func(t *testing.T) {
+		var outbound string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			outbound = string(body) + "\n" + fmt.Sprint(r.Header)
+			_, _ = w.Write([]byte(sampleExaResponseWithCost))
+		}))
+		defer srv.Close()
+
+		rec := &mockRecorder{}
+		e := NewExa(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "k"}, rec)
+		e.searchURL = srv.URL
+		if _, err := e.Search(ctx, "Vane H-1", 1, nil); err != nil {
+			t.Fatal(err)
+		}
+		assertAttribution(t, rec.last())
+		if strings.Contains(outbound, traceID) || strings.Contains(outbound, "7007") {
+			t.Fatalf("本地归属不得泄露给 Exa: %s", outbound)
+		}
+	})
+
+	t.Run("contents", func(t *testing.T) {
+		var outbound string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			outbound = string(body) + "\n" + fmt.Sprint(r.Header)
+			_, _ = w.Write([]byte(sampleExaContentsWithCost))
+		}))
+		defer srv.Close()
+
+		rec := &mockRecorder{}
+		e := NewExaContents(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "k"}, rec)
+		e.contentURL = srv.URL
+		if _, _, _, err := e.ReadPage(ctx, "https://x.com/pricing"); err != nil {
+			t.Fatal(err)
+		}
+		assertAttribution(t, rec.last())
+		if strings.Contains(outbound, traceID) || strings.Contains(outbound, "7007") {
+			t.Fatalf("本地归属不得泄露给 Exa: %s", outbound)
+		}
+	})
+}
+
+func TestExaRecordCall_DetachesCancellationWithBoundedDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(WithBindingAttribution(context.Background(), "trace-cancel", 7))
+	cancel()
+
+	rec := &mockRecorder{}
+	e := NewExa(config.FetchConfig{}, rec)
+	e.recordCall(ctx, types.Source{}, 200, 0, 0, 0, nil)
+
+	got := rec.last()
+	if got == nil || got.TraceID != "trace-cancel" || got.UserID == nil || *got.UserID != 7 {
+		t.Fatalf("取消后仍应保留归属并写上游账本: %+v", got)
+	}
+	if ctxErr, hasDeadline := rec.contextState(); ctxErr != nil || !hasDeadline {
+		t.Fatalf("上游记账应脱离取消且保持有界: err=%v hasDeadline=%v", ctxErr, hasDeadline)
+	}
+}
+
+func TestExaContents_StatusErrorRecordedAsFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"results":[],
+			"statuses":[{"status":"error","source":"crawled"}],
+			"costDollars":{"total":0.003}
+		}`))
+	}))
+	defer srv.Close()
+
+	rec := &mockRecorder{}
+	e := NewExaContents(config.FetchConfig{
+		TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "k",
+	}, rec)
+	e.contentURL = srv.URL
+	_, _, _, err := e.ReadPage(context.Background(), "https://example.com/unreachable")
+	if err == nil {
+		t.Fatal("statuses.error 必须返回错误")
+	}
+	got := rec.last()
+	if got == nil || got.ErrorType != types.ToolErrInternal || got.CostUSD == nil || *got.CostUSD != 0.003 {
+		t.Fatalf("上游账本必须同时记录失败与真实成本: %+v", got)
 	}
 }
 

@@ -136,6 +136,10 @@ type listSourcesTool struct {
 }
 
 func (t *listSourcesTool) Name() string { return "list_sources" }
+
+// 信源标题可能来自 RSS/网页等外部元数据；即使列表本身来自本地数据库，返回给
+// 模型的文本仍不能被当作可信指令。
+func (t *listSourcesTool) untrustedResult() bool { return true }
 func (t *listSourcesTool) Description() string {
 	return "列出用户当前订阅的全部信源（含 id、类型、标题、状态）。"
 }
@@ -247,6 +251,10 @@ type addSourceTool struct {
 const probeBudget = 25 * time.Second
 
 func (t *addSourceTool) Name() string { return "add_source" }
+
+// 确认执行期会真实 Probe 外部源，结果可能含上游声明 URL/样例标题。
+// ExecuteAction 会把详细结果展示给用户，但用固定回执写入模型历史。
+func (t *addSourceTool) untrustedResult() bool { return true }
 func (t *addSourceTool) Description() string {
 	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts/contents/hot_list/topic_feed/faved_notes）。" +
 		"绑定类能力与 URL 类 web 能力（feed/contents）在确认后会先真实试跑一次，通过才落库。" +
@@ -341,10 +349,13 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 	var probeNote string
 	if t.prober != nil {
 		probeCtx, cancel := context.WithTimeout(ctx, probeBudget)
-		// 记账 trace = 会话 trace（契约 §5）：probe 的计费调用可关联回发起会话。
+		// 记账 trace/user = 会话归属（契约 §5）：probe 的计费调用可关联回发起
+		// 会话，store 再由 user 推导 tenant；确认卡回调无会话 trace 时仍保留 user。
+		var traceID string
 		if m, ok := ctx.Value(chatMetaKey{}).(chatMeta); ok {
-			probeCtx = fetcher.WithBindingTrace(probeCtx, m.traceID)
+			traceID = m.traceID
 		}
+		probeCtx = fetcher.WithBindingAttribution(probeCtx, traceID, userID)
 		report, perr := t.prober.Probe(probeCtx, *src)
 		cancel()
 		if perr != nil {

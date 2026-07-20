@@ -220,6 +220,9 @@ func TestEndpointTool_InvokeSuccessAndRecord(t *testing.T) {
 	if !ok {
 		t.Fatal("已激活端点应可解析")
 	}
+	if !isUntrustedResultTool(tool) {
+		t.Fatal("动态端点返回第三方内容，必须进入 untrusted-result 边界")
+	}
 
 	state := &toolRunState{activation: &activationState{}}
 	rec := &types.ToolCall{}
@@ -521,6 +524,166 @@ func TestHandleMessage_EndpointSearchInjectInvoke(t *testing.T) {
 	}
 	if search.TraceID == "" || search.TraceID != endpoint.TraceID {
 		t.Errorf("两条记账应共享同一 trace_id: %q vs %q", search.TraceID, endpoint.TraceID)
+	}
+}
+
+func TestHandleMessage_TaintedEndpointAllowsOnlyCurrentLocalCacheContinuation(t *testing.T) {
+	fs := newFakeStore()
+	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
+	entry := testEndpoint(t)
+	const victimSecret = "VICTIM-OTHER-SESSION-CANARY"
+	victimHandle := ep.results.put(1, entry.Name, []byte(victimSecret))
+	if victimHandle != "res-1" {
+		t.Fatalf("测试前置句柄=%q，期望 res-1", victimHandle)
+	}
+	largeBody := strings.Repeat("x", ep.limits.PerCall+10) + "CURRENT-PRIVATE-TAIL"
+	ep.inv = &fakeInvoker{body: largeBody}
+
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{ID: "search", Name: "search_endpoints",
+			Arguments: `{"query":"小红书 搜索 笔记"}`}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{ID: "endpoint", Name: entry.Name,
+			Arguments: `{"keyword":"AI"}`}}, FinishReason: "tool_calls"},
+		// 恶意端点结果猜同用户旧句柄：即使 cache.get 的 userID 会通过，也必须
+		// 被本消息 allowed handle 集合挡住。
+		{ToolCalls: []llm.ToolCall{{ID: "victim-page", Name: "read_endpoint_result",
+			Arguments: `{"handle":"res-1","limit":100}`}}, FinishReason: "tool_calls"},
+		// 当前端点刚生成的是 res-2，允许从被截断位置续读。
+		{ToolCalls: []llm.ToolCall{{ID: "current-page", Name: "read_endpoint_result",
+			Arguments: fmt.Sprintf(`{"handle":"res-2","offset":%d,"limit":100}`, ep.limits.PerCall+10)}}, FinishReason: "tool_calls"},
+		{Content: "已基于本地缓存结果回答", FinishReason: "stop"},
+	}}
+	l := New(Deps{
+		Store: fs, Profiles: fs,
+		Tools: []Tool{ep.SearchTool(), ep.ReadResultTool()},
+		Model: "m", MaxTurns: 5, SessionTTL: 30 * time.Minute,
+		Endpoints: ep,
+	})
+	l.chatFn = chat.fn
+
+	if _, err := l.HandleMessage(context.Background(), 1, "查小红书大结果"); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.requests) != 5 {
+		t.Fatalf("期望检索、端点、越权拒绝、当前缓存续读、收敛五轮，实得 %d", len(chat.requests))
+	}
+	for _, idx := range []int{2, 3, 4} {
+		defs := chat.requests[idx].Tools
+		if len(defs) != 1 || defs[0].Name != "read_endpoint_result" {
+			t.Fatalf("taint 后第 %d 轮只能声明本地缓存续读，实得 %+v", idx+1, defs)
+		}
+	}
+	afterVictim, _ := json.Marshal(chat.requests[3].Messages)
+	if strings.Contains(string(afterVictim), victimSecret) {
+		t.Fatalf("taint 后不得读取同用户其他会话句柄: %s", afterVictim)
+	}
+	var victimReply string
+	for _, m := range chat.requests[3].Messages {
+		if m.Role == "tool" && m.ToolCallID == "victim-page" {
+			victimReply = m.Content
+		}
+	}
+	if victimReply != toolMsgUntrustedBoundary {
+		t.Fatalf("旧句柄应命中固定权限屏障，实得 %q", victimReply)
+	}
+	afterCurrent, _ := json.Marshal(chat.requests[4].Messages)
+	if !strings.Contains(string(afterCurrent), "CURRENT-PRIVATE-TAIL") {
+		t.Fatalf("本消息刚生成的句柄应可续读，实得 %s", afterCurrent)
+	}
+	// 不是动态端点产生的 taint 不得凭空取得旧缓存读取能力。
+	state := &toolRunState{activation: &activationState{}, untrustedExternalResult: true}
+	if defs := l.requestTools(state); len(defs) != 0 {
+		t.Fatalf("没有本轮缓存句柄时不得声明 read_endpoint_result，实得 %+v", defs)
+	}
+}
+
+func TestRunToolCalls_TaintedAllowsOnlyOneCurrentCacheReadPerBatch(t *testing.T) {
+	fs := newFakeStore()
+	ep := newTestEndpointTools(&fakeInvoker{}, &fakeCounter{}, 10, 200)
+	h1 := ep.results.put(1, "ep", []byte("CURRENT-ONE"))
+	h2 := ep.results.put(1, "ep", []byte("CURRENT-TWO"))
+	state := &toolRunState{
+		activation:              &activationState{},
+		untrustedExternalResult: true,
+	}
+	state.allowLocalResultHandle(h1)
+	state.allowLocalResultHandle(h2)
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn, ep.ReadResultTool())
+	ctx := context.WithValue(context.Background(), toolRunKey{}, state)
+
+	pending, replies, err := l.runToolCalls(ctx, 1, nil, []llm.ToolCall{
+		{ID: "first", Name: "read_endpoint_result", Arguments: fmt.Sprintf(`{"handle":%q}`, h1)},
+		{ID: "second", Name: "read_endpoint_result", Arguments: fmt.Sprintf(`{"handle":%q}`, h2)},
+	})
+	if err != nil || pending != nil {
+		t.Fatalf("runToolCalls: pending=%+v err=%v", pending, err)
+	}
+	if len(replies) != 2 || !strings.Contains(replies[0].Content, "CURRENT-ONE") ||
+		replies[1].Content != toolMsgUntrustedBoundary ||
+		strings.Contains(replies[1].Content, "CURRENT-TWO") {
+		t.Fatalf("同批只能续读一个当前句柄，实得 %+v", replies)
+	}
+}
+
+func TestHandleMessage_SearchAndUnactivatedEndpointSameBatchAreBothRejected(t *testing.T) {
+	fs := newFakeStore()
+	inv := &fakeInvoker{body: `{"code":200,"data":"ok"}`}
+	ep := newTestEndpointTools(inv, &fakeCounter{}, 10, 200)
+	entry := testEndpoint(t)
+	searchArgs := `{"query":"小红书 搜索 笔记","platform":"xiaohongshu"}`
+	endpointArgs := `{"keyword":"AI"}`
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		// 端点在预扫描时尚未激活；若先执行 search 再顺序 Resolve，旧实现会让
+		// 同批付费调用穿透。整批必须零执行。
+		{ToolCalls: []llm.ToolCall{
+			{ID: "search-batch", Name: "search_endpoints", Arguments: searchArgs},
+			{ID: "endpoint-batch", Name: entry.Name, Arguments: endpointArgs},
+		}, FinishReason: "tool_calls"},
+		// 按固定回执要求拆成两轮后才允许各自执行。
+		{ToolCalls: []llm.ToolCall{{
+			ID: "search-only", Name: "search_endpoints", Arguments: searchArgs,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "endpoint-only", Name: entry.Name, Arguments: endpointArgs,
+		}}, FinishReason: "tool_calls"},
+		{Content: "查到了", FinishReason: "stop"},
+	}}
+	l := New(Deps{
+		Store: fs, Profiles: fs,
+		Tools:      BuildTools2Static(ep),
+		Model:      "deepseek-v4-pro",
+		MaxTurns:   6,
+		SessionTTL: 30 * time.Minute,
+		Endpoints:  ep,
+	})
+	l.chatFn = chat.fn
+
+	out, err := l.HandleMessage(context.Background(), 1, "查小红书 AI")
+	if err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if out.Reply != "查到了" {
+		t.Fatalf("Reply=%q", out.Reply)
+	}
+	if len(inv.calls) != 1 {
+		t.Fatalf("同批未激活端点不得提前付费调用；拆分后才应调用 1 次，实得 %d", len(inv.calls))
+	}
+	if len(chat.requests) != 4 {
+		t.Fatalf("期望批拒+检索+端点+收敛共 4 次请求，实得 %d", len(chat.requests))
+	}
+	if defs := chat.requests[1].Tools; len(defs) != 1 || defs[0].Name != "search_endpoints" {
+		t.Fatalf("整批拒绝后 activation 必须仍为空，第二轮只能声明 search_endpoints，实得 %+v", defs)
+	}
+	replies := map[string]string{}
+	for _, m := range chat.requests[1].Messages {
+		if m.Role == "tool" {
+			replies[m.ToolCallID] = m.Content
+		}
+	}
+	for _, id := range []string{"search-batch", "endpoint-batch"} {
+		if replies[id] != toolMsgExternalBatch {
+			t.Fatalf("%s 应命中整批固定拒绝，实得 %q", id, replies[id])
+		}
 	}
 }
 

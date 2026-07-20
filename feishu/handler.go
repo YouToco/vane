@@ -27,6 +27,7 @@ import (
 	larkapplication "github.com/larksuite/oapi-sdk-go/v3/service/application/v6"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
+	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/types"
@@ -260,17 +261,20 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 		// 追问识别（M5 契约 §11）：用户回复某张推送卡时，把原文与解读摘要作为
 		// 定界上下文并入本条消息。只在 agent 链路做——回退路径无会话语义，
 		// 包装无意义。未命中（回复的是普通消息/聊天卡）原样按普通消息处理。
-		wrapped := false
+		externalContext := false
 		if fb := h.m.feedbackRunner(); fb != nil {
 			if w, ok := fb.WrapQuestion(ctx, user.ID, strVal(msg.ParentId), strVal(msg.RootId), text); ok {
 				text = w
-				wrapped = true
+				externalContext = true
 			}
 		}
-		if !wrapped {
-			text = h.prependQuotedMessage(ctx, strVal(msg.ParentId), text)
+		if !externalContext {
+			if quoted, ok := h.prependQuotedMessage(ctx, strVal(msg.ParentId), text); ok {
+				text = quoted
+				externalContext = true
+			}
 		}
-		h.handleWithAgent(ctx, runner, msgID, openID, user.ID, text)
+		h.handleWithAgent(ctx, runner, msgID, openID, user.ID, text, externalContext)
 		return
 	}
 
@@ -297,14 +301,20 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 // handleWithAgent 把消息交给 agent loop 并回复 Outcome.Reply；Confirm 非 nil
 // 时追加发一张确认卡。确认卡走 SendCard 新消息而非 reply：它有独立生命周期
 // （按钮回调后原地更新为结果），挂在原消息的回复串里会把两种语义搅在一起。
-func (h *handler) handleWithAgent(ctx context.Context, runner AgentRunner, msgID, openID string, userID int64, text string) {
+func (h *handler) handleWithAgent(ctx context.Context, runner AgentRunner, msgID, openID string, userID int64, text string, externalContext bool) {
 	// 整条消息的总预算（审查 #信号量瘫痪的纵深防御）：agent 单次模型调用已有
 	// 120s 超时，这里再兜住工具执行/DB 调用同类挂死——连接级 ctx 无 deadline，
 	// 没有这层预算时任何一环黑洞都会让 goroutine 永久滞留。
 	ctx, cancel := context.WithTimeout(ctx, agentMessageBudget)
 	defer cancel()
 
-	out, err := runner.HandleMessage(ctx, userID, text)
+	var out agent.Outcome
+	var err error
+	if externalContext {
+		out, err = runner.HandleExternalContextMessage(ctx, userID, text)
+	} else {
+		out, err = runner.HandleMessage(ctx, userID, text)
+	}
 	if err != nil {
 		slog.Error("feishu: agent 处理消息失败", "err", err, "user_id", userID)
 		h.reply(ctx, msgID, BuildReplyCard("这条消息我处理失败了："+humanizeLLMError(err)))
@@ -833,14 +843,15 @@ func (h *handler) reply(ctx context.Context, messageID, cardJSON string) {
 
 // prependQuotedMessage 在用户引用/回复某条消息时，用飞书 API 拉取被引用消息
 // 的内容并拼到用户文本前面，让 LLM 看到完整上下文。parentID 为空时原样返回。
-// 拉取失败静默降级（只记日志），不影响正常消息处理。
-func (h *handler) prependQuotedMessage(ctx context.Context, parentID, text string) string {
+// 拉取失败静默降级（只记日志），不影响正常消息处理。第二个返回值是显式
+// 信任标签：true 表示结果已经混入引用正文，调用方必须走外部上下文入口。
+func (h *handler) prependQuotedMessage(ctx context.Context, parentID, text string) (string, bool) {
 	if parentID == "" {
-		return text
+		return text, false
 	}
 	client := h.m.api()
 	if client == nil {
-		return text
+		return text, false
 	}
 	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -849,18 +860,18 @@ func (h *handler) prependQuotedMessage(ctx context.Context, parentID, text strin
 		Build())
 	if err != nil {
 		slog.Warn("feishu: 拉取引用消息网络失败", "parent_id", parentID, "err", err)
-		return text
+		return text, false
 	}
 	if !resp.Success() {
 		slog.Warn("feishu: 拉取引用消息被拒", "parent_id", parentID, "code", resp.Code, "msg", resp.Msg)
-		return text
+		return text, false
 	}
 	if resp.Data == nil || len(resp.Data.Items) == 0 {
-		return text
+		return text, false
 	}
 	quoted := resp.Data.Items[0]
 	if quoted.Body == nil || quoted.Body.Content == nil {
-		return text
+		return text, false
 	}
 	var quotedText string
 	switch strVal(quoted.MsgType) {
@@ -871,12 +882,12 @@ func (h *handler) prependQuotedMessage(ctx context.Context, parentID, text strin
 	case "interactive":
 		quotedText = parseInteractiveContent(*quoted.Body.Content)
 	default:
-		return text
+		return text, false
 	}
 	if quotedText == "" {
-		return text
+		return text, false
 	}
-	return "[用户引用的消息]\n" + quotedText + "\n[用户的回复]\n" + text
+	return "[用户引用的消息]\n" + quotedText + "\n[用户的回复]\n" + text, true
 }
 
 // parseInteractiveContent 从交互卡片的 JSON 中提取可读文本（卡片标题 + 文本元素）。

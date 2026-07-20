@@ -2,7 +2,6 @@ package store
 
 import (
 	"encoding/json"
-	"os"
 	"testing"
 	"time"
 
@@ -15,19 +14,8 @@ import (
 //  2. CountTikHubEndpointCallsSince 的口径——只数打到上游的端点调用：
 //     排除 static/search kind、排除 invalid_args/budget_exceeded、排除窗口外。
 func TestToolCalls_InsertAndCount(t *testing.T) {
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		t.Skip("未设置 DATABASE_URL，跳过 tool_calls 集成测试")
-	}
 	ctx := t.Context()
-	if err := Migrate(ctx, dbURL); err != nil {
-		t.Fatalf("Migrate() 失败: %v", err)
-	}
-	st, err := New(ctx, dbURL)
-	if err != nil {
-		t.Fatalf("New() 失败: %v", err)
-	}
-	defer st.Close()
+	st := tenantTestStore(t)
 
 	// 基线：测试可能跑在有存量数据的库上，计数断言用差值。
 	base, err := st.CountTikHubEndpointCallsSince(ctx, time.Now().Add(-24*time.Hour))
@@ -35,7 +23,14 @@ func TestToolCalls_InsertAndCount(t *testing.T) {
 		t.Fatalf("基线计数失败: %v", err)
 	}
 
-	uid := int64(1)
+	uid := testUserWithTenant(t, st, "toolcalls")
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(cleanupCtx, t, st, `DELETE FROM tool_calls WHERE user_id = $1`, uid)
+		cleanupExec(cleanupCtx, t, st, `DELETE FROM memberships WHERE user_id = $1`, uid)
+		cleanupExec(cleanupCtx, t, st, `DELETE FROM users WHERE id = $1`, uid)
+	})
 	status := 200
 	full := &types.ToolCall{
 		TraceID: "trace-tc-1", UserID: &uid,
@@ -53,14 +48,18 @@ func TestToolCalls_InsertAndCount(t *testing.T) {
 	// 回读全字段（含数组与 NULL 语义）。
 	var got types.ToolCall
 	var cands []string
+	var gotTenantID, membershipTenantID int64
 	err = st.pool.QueryRow(ctx,
-		`SELECT trace_id, user_id, tool_name, tool_kind, endpoint_path, arguments,
+		`SELECT trace_id, tc.user_id, tool_name, tool_kind, endpoint_path, arguments,
 		        result_preview, result_size, http_status, error_type, duration_ms,
-		        retrieval_query, candidate_tools
-		 FROM tool_calls WHERE id = $1`, id).Scan(
+		        retrieval_query, candidate_tools, tc.tenant_id, m.tenant_id
+		 FROM tool_calls tc
+		 JOIN memberships m ON m.user_id = tc.user_id
+		 WHERE tc.id = $1`, id).Scan(
 		&got.TraceID, &got.UserID, &got.ToolName, &got.ToolKind, &got.EndpointPath,
 		&got.Arguments, &got.ResultPreview, &got.ResultSize, &got.HTTPStatus,
-		&got.ErrorType, &got.DurationMs, &got.RetrievalQuery, &cands)
+		&got.ErrorType, &got.DurationMs, &got.RetrievalQuery, &cands,
+		&gotTenantID, &membershipTenantID)
 	if err != nil {
 		t.Fatalf("回读失败: %v", err)
 	}
@@ -70,6 +69,10 @@ func TestToolCalls_InsertAndCount(t *testing.T) {
 	}
 	if len(cands) != 0 {
 		t.Errorf("未提供 candidate_tools 应为空数组，实际 %v", cands)
+	}
+	if gotTenantID != membershipTenantID {
+		t.Errorf("tenant 归属应由 user membership 推导：tool_call=%d membership=%d",
+			gotTenantID, membershipTenantID)
 	}
 
 	// search 记录带候选数组。

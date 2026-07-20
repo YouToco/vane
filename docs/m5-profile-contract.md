@@ -534,9 +534,12 @@ WrapQuestion：① 双 id 空 → false ② GetDeliveryByFeishuMessageID(Parent)
 用户的追问：{原始消息文本}
 ```
 
-**结论：不做工具**——追问指代消解是确定性的，交给工具=多一轮 FC+失败面+成本。包装消息作为
-普通 user 消息进会话持久化（truncateMessages 按消息粒度截断，定界块只会整条保留或整条丢弃——
-审查已核实无"半个定界块"风险）。旧卡兼容：无按钮但追问可用（反查不依赖新列，摘要为空串）。
+**结论：不做工具**——追问指代消解是确定性的，交给工具=多一轮 FC+失败面+成本。包装消息必须
+调用 `AgentRunner.HandleExternalContextMessage`，从首轮起零画像读取、零工具声明/执行；本轮回答
+照常给用户，既有 session 历史不进入本轮模型请求（只在结束后重新合并保存）；外部正文、用户
+问题和模型派生回答在 session 中只留固定边界占位，不能读取旧私聊，也不能在下一条消息与画像/
+完整工具面重新同屏。`[用户引用的消息]` 同样走该入口；拉取引用失败才降级普通消息。
+旧版已持久化的两种包装在加载时清洗。旧卡兼容：无按钮但追问可用（反查不依赖新列，摘要为空串）。
 
 ## 12. agent 扩展（loop.go / tools.go）
 
@@ -581,8 +584,10 @@ Summarize 只列提供的字段。
 func (l *Loop) NotifyEvent(ctx context.Context, userID int64, notice string)
 ```
 
-文案：`[卡片回调] 用户在推送卡片（delivery_id=42《标题》）上点击了「不感兴趣」`；deep_dive 为
-`…点击了「深度解读」，长文结果将以新消息送达`（完成不二次通告）。追问不通告。
+文案：`[卡片回调] 用户在推送卡片（delivery_id=42）上点击了「不感兴趣」`；deep_dive 为
+`…点击了「深度解读」，长文结果将以新消息送达`（完成不二次通告）。标题/正文来自外部内容，
+不得进入这条被 system prompt 视为真实用户操作的高信任通告；旧版带 `《标题》` 通告加载时
+删除标题但保留 delivery/action 语义。追问不通告。
 
 ## 13. 装配（cmd/server/main.go）与 config
 
@@ -639,7 +644,8 @@ negFeedbackMax 置 0 重编部署，或删 feedbacks 负反馈行。完整回滚
   审查 F8 定向用例）**；**同 delivery 重复态度行在 prompt 输入中去重保最新（审查 F10）**。
 - feedback：态度切换/重复幂等（**interested→not_interested→interested 三连击第三次必须插行**，
   审查 F5 定向用例）/误判一次性；deep_dive 幂等三层 + **行在时重发 detail**（审查 F4）+ 失败
-  不插行可重试 + 内容已清理；WrapQuestion Parent/Root 回退/双 miss 降级/空 id 不查库/5s 预算。
+  不插行可重试 + 内容已清理；反馈通告断言恶意外部标题不入 session；WrapQuestion
+  Parent/Root 回退/双 miss 降级/空 id 不查库/5s 预算，命中后必须走 external-context 入口。
 - feishu：BuildDeliveryCard 结构断言（value 三字段、id 字符串、状态行组合、bodyMD 原样）；
   parseFeedbackValue 容错；fb 路由 + owner 拒绝。
 - agent：画像注入两态；NotifyEvent 无会话跳过 + 锁内现查；update_profile 全缺省自纠 /

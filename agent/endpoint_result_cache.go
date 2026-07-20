@@ -254,6 +254,18 @@ func (t *readEndpointResultTool) Parameters() json.RawMessage {
 }
 func (t *readEndpointResultTool) Mutating() bool { return false }
 
+// 缓存只保存 TikHub 第三方原文：读取后仍保持 taint；但它不访问网络、不读画像/
+// 任务等内部状态，允许作为 taint 后唯一的本地分页续读能力。
+func (t *readEndpointResultTool) untrustedResult() bool    { return true }
+func (t *readEndpointResultTool) safeAfterUntrusted() bool { return true }
+func (t *readEndpointResultTool) allowedAfterUntrusted(state *toolRunState, args json.RawMessage) bool {
+	var a readEndpointResultArgs
+	if json.Unmarshal(args, &a) != nil {
+		return false
+	}
+	return state.allowsLocalResultHandle(strings.TrimSpace(a.Handle))
+}
+
 type readEndpointResultArgs struct {
 	Handle string `json:"handle"`
 	Path   string `json:"path"`
