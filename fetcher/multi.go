@@ -53,6 +53,11 @@ func NewMulti(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorder)
 // Binding 暴露绑定引擎（agent 的试跑准入用 Probe，见 endpoint-binding-contract.md §2.2）。
 func (m *Multi) Binding() *BindingFetcher { return m.binding }
 
+// Exa / ExaContents 暴露 Exa 两个抓取器（agent 的 web_search/read_page ad-hoc 工具用）：
+// 与信源周期抓取共享同一实例——同一 http.Client、同一记账通道（tool_calls）。
+func (m *Multi) Exa() *ExaFetcher                 { return m.exa }
+func (m *Multi) ExaContents() *ExaContentsFetcher { return m.exaContents }
+
 // Fetch 按 (Platform, Capability) 分发。
 //
 //   - 组合不在 sourcecatalog 里          → CodeValidation（"未知能力"，数据问题，不可重试）

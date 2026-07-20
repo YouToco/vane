@@ -193,15 +193,22 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 
 	start := time.Now()
 	resp, err := e.client.Do(req)
+	elapsed := time.Since(start)
 	if err != nil {
-		return nil, false, classifyDoError(e.contentURL, err)
+		ae := classifyDoError(e.contentURL, err)
+		// Do 失败（超时/连接拒绝）也记账（对抗审查 F1，同 exa.go）：真实发起了
+		// 上游尝试，不记则网络层故障在账本上隐形。status=0 表示未拿到 HTTP 响应。
+		if src != nil {
+			e.recordCall(ctx, *src, 0, elapsed, 0, 0, ae)
+		}
+		return nil, false, ae
 	}
 	defer resp.Body.Close()
-	elapsed := time.Since(start)
 
 	// 错误路径也记账（同 exa.go，bug 狩猎 2026-07-19 MEDIUM）：限流/鉴权失败/解析
-	// 失败此前不进 tool_calls，账本上 Exa 故障隐形。src 为 nil（enrich 补全路径的
-	// 无源调用）时 recordCall 本就不落账，闭包同样短路。
+	// 失败此前不进 tool_calls，账本上 Exa 故障隐形。src 为 nil 时 recordCall
+	// 不落账（保留给未来真正的无源调用；当前 enrich 与 ad-hoc 都传非 nil src——
+	// enrich 传真实源按 source_id 记账，ad-hoc 传零值 Source 记 SourceID=0）。
 	fail := func(status, bodySize int, ae error) error {
 		if src != nil {
 			e.recordCall(ctx, *src, status, elapsed, bodySize, 0, ae)
@@ -248,11 +255,11 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 	var cached bool
 	for _, st := range cr.Statuses {
 		if st.Status == "error" {
-			// Cause 带 errPageUnreachable 哨兵：probe 路径（probe.go）据此把「Exa 抓不到
+			// Cause 带 ErrPageUnreachable 哨兵：probe 路径（probe.go）据此把「Exa 抓不到
 			// 该页」翻译成「请检查 URL」而非「稍后再试」——试跑时这多半是 URL 打错或
 			// 页面需要登录，不是瞬态故障。周期抓取路径不感知（Retryable 语义不变）。
 			ae := types.NewAppError(types.CodeFetchTimeout,
-				fmt.Sprintf("Exa /contents 抓取失败（url=%s，status=error）", pageURL), errPageUnreachable)
+				fmt.Sprintf("Exa /contents 抓取失败（url=%s，status=error）", pageURL), ErrPageUnreachable)
 			ae.Retryable = true
 			return nil, false, ae
 		}
@@ -263,8 +270,39 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 	return cr.Results, cached, nil
 }
 
-// errPageUnreachable 标记「Exa 报告目标页面抓取失败」（HTTP 200 + statuses[].status=error）。
-var errPageUnreachable = errors.New("目标页面抓取失败")
+// ErrPageUnreachable 标记「Exa 报告目标页面抓取失败」（HTTP 200 + statuses[].status=error）。
+var ErrPageUnreachable = errors.New("目标页面抓取失败")
+
+// ReadPage 一次性读取指定 URL 的正文（agent read_page 工具）：maxAgeHours:0 强制活抓，
+// 不建信源、不写入内容库，正文截断到 exaContentsMaxTextBytes（与监控路径同一成本护栏）。
+// cached=true 表示 Exa 无视活抓要求返回了缓存（内容可能不是最新，由调用方决定是否告知）。
+// 失败语义对齐 Fetch：缺 key/鉴权 → CodeValidation；页面抓不到（statuses error）→
+// CodeFetchTimeout + ErrPageUnreachable（工具层据此给「检查 URL」话术，同 probe）；
+// 成功但无正文 → CodeFetchTimeout 不可重试（空页/纯前端渲染/需登录，重试无意义）。
+func (e *ExaContentsFetcher) ReadPage(ctx context.Context, pageURL string) (title, text string, cached bool, err error) {
+	if e.apiKey == "" {
+		return "", "", false, types.NewAppError(types.CodeValidation,
+			"读取页面需要配置 VANE_FETCH_EXA_API_KEY，当前为空", nil)
+	}
+	pageURL = strings.TrimSpace(pageURL)
+	if pageURL == "" {
+		return "", "", false, types.NewAppError(types.CodeValidation, "url 不能为空", nil)
+	}
+	results, cached, err := e.pageResults(ctx, pageURL, 0, &types.Source{})
+	if err != nil {
+		return "", "", false, err
+	}
+	for _, r := range results {
+		if strings.TrimSpace(r.Text) == "" {
+			continue
+		}
+		return r.Title, sanitizeContentsText(truncateUTF8(r.Text, exaContentsMaxTextBytes)), cached, nil
+	}
+	ae := types.NewAppError(types.CodeFetchTimeout,
+		"页面抓取成功但没有可读取的正文（可能是空页、纯前端渲染或需要登录）", nil)
+	ae.Retryable = false
+	return "", "", cached, ae
+}
 
 // mapExaContents 把 /contents 结果映射为一条 ContentItem，并自填 canonical_key
 // （含 textHash，承载变化检测）。

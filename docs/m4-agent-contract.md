@@ -249,6 +249,20 @@ Loop 行为细则：
 | create_schedule | **yes** | scheduler.CreatePush | {spec:{cron?, every_seconds?, tz?}, nl_description?}；校验对齐 api/schedules.go（cron/every 二选一、every≥3600） |
 | remove_schedule | **yes** | scheduler.DeletePush | {schedule_id:string} |
 | push_now | no（低危） | PushTrigger 接口（api push/now 同款触发） | 返回 run_id 文本 |
+| web_search | no | fetcher.ExaFetcher.Search（Exa /search，按次计费） | {query, num_results?(默认5/上限20), include_domains?}；一次性语义搜索，不建信源、不写内容库，结果只回当前对话（2026-07-20 增，见修订记录） |
+| read_page | no | fetcher.ExaContentsFetcher.ReadPage（Exa /contents，maxAgeHours:0 活抓，按次计费） | {url}；一次性读取指定页面正文，不建信源、不写内容库（2026-07-20 增，见修订记录） |
+
+**§8 增补（2026-07-20，Boss 拍板）**：web_search / read_page 解决「临时查一下」被迫
+add_source 的形态（信源固定点反模式——一次性需求不该走订阅设施）。两工具按次计费，
+经 fetcher 层 recordCall 落 tool_calls（SourceID=0 无源口径）；**双重限额**（与端点
+工具同模板，对抗审查 HIGH 补齐）：单条消息 `agent.exa_msg_cap`（默认 5，消息内计数，
+超限回文案）+ 滚动 24h `agent.exa_daily_cap`（默认 100，从 tool_calls 表按
+tool_name IN ('web_search','read_page') COUNT，排除 invalid_args/budget_exceeded，
+判定失败 fail-closed）；不进 A2A 只读白名单（显式名单仍为
+list_sources/list_schedules——对外部 agent 暴露付费面是另一个决策）；
+Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的分流引导行同样
+条件注入（工具不在场不广告）；maxActivatedEndpoints 同步 13→11（16 基础 + 2 端点
+工具 + 11 激活 = 29 < 30 安全线）。
 
 `PushTrigger` 是窄接口 `TriggerPushNow(ctx, userID int64) (runID string, err error)`——查明 api/push.go
 现有触发实现的真实归属（scheduler 或 api 内部），把可复用的触发逻辑收敛为 scheduler 上的导出方法后包一层；

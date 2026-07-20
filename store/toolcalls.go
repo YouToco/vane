@@ -69,11 +69,32 @@ func (s *Store) CountTikHubEndpointCallsSince(ctx context.Context, since time.Ti
 	return n, nil
 }
 
+// CountExaAdHocCallsSince 统计 since 以来 Exa ad-hoc 工具（web_search/read_page）
+// 的调用次数，供每日限额判定（滚动 24h 窗口，见 agent/exa_tools.go 头注）。
+//
+// 按 agent 层记账的 tool_name 计数而非 tool_kind='exa_fetch'：fetcher 层记账
+// （exa:search/exa:contents）含信源周期抓取与 enrich 补全——那些不是 ad-hoc 对话
+// 调用，混进来会把对话限额误顶爆。系统级不分用户（同 TikHub 限额：Exa 计费是全局
+// 成本，单 owner MVP 下二者等价）。
+// 口径同 CountTikHubEndpointCallsSince：打到上游的调用都计入（含失败——失败同样
+// 计费）；排除 invalid_args 与 budget_exceeded（没打上游的拒绝不越顶越死）。
+func (s *Store) CountExaAdHocCallsSince(ctx context.Context, since time.Time) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM tool_calls
+		 WHERE tool_name IN ('web_search', 'read_page') AND created_at >= $1
+		   AND error_type NOT IN ($2, $3)`,
+		since, types.ToolErrInvalidArgs, types.ToolErrBudgetExceeded).Scan(&n)
+	if err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "统计 Exa ad-hoc 调用量", err)
+	}
+	return n, nil
+}
+
 // RecordBindingCall 实现 fetcher.BindingCallRecorder：绑定引擎（调度面）的每次上游
 // 调用同步落一行 tool_calls（endpoint-binding-contract.md §5）。失败只记日志——
 // 记账是旁路可观测性，绝不放大成抓取失败（与 agent ToolCallRecorder 同一纪律）。
-func (s *Store) RecordBindingCall(ctx context.Context, rec *types.ToolCall) {
-	// 兜底净化（引擎侧已净化参数，此处双保险）：上游错误文案可能带 NUL/非法 UTF-8，
+func (s *Store) RecordBindingCall(ctx context.Context, rec *types.ToolCall) {	// 兜底净化（引擎侧已净化参数，此处双保险）：上游错误文案可能带 NUL/非法 UTF-8，
 	// Postgres TEXT 拒收会让整行记账丢失——恰好丢掉最该记账的失败调用。
 	rec.Error = strings.ToValidUTF8(strings.ReplaceAll(rec.Error, "\x00", ""), "�")
 	rec.ResultPreview = strings.ToValidUTF8(strings.ReplaceAll(rec.ResultPreview, "\x00", ""), "�")

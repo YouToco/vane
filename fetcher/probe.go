@@ -184,7 +184,7 @@ func (m *Multi) translateFeedProbeErr(ctx context.Context, src types.Source, err
 func (m *Multi) probeContents(ctx context.Context, src types.Source) (*ProbeReport, error) {
 	items, err := m.exaContents.Fetch(ctx, src)
 	if err != nil {
-		if errors.Is(err, errPageUnreachable) {
+		if errors.Is(err, ErrPageUnreachable) {
 			return nil, probeReject(
 				"无法抓取该页面（可能不存在、需要登录或阻止了抓取）。请检查 URL 是否正确、" +
 					"页面是否公开可访问；确认无误可稍后重试。")

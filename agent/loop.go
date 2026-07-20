@@ -43,6 +43,12 @@ const (
 	profileSectionPrefix = "\n\n[用户画像] "
 )
 
+// exaAdHocSystemNote 是 Exa ad-hoc 工具对（web_search/read_page）在场时才注入的
+// 一次性/周期性分流引导（条件装配对齐工具注册，见 New）。放常量而非写进
+// systemPrompt：Exa key 缺失的环境不注册这两个工具，prompt 不得广告它们。
+const exaAdHocSystemNote = `
+- 用户想「看一下/查一下」某个页面或主题（一次性需求）：直接调 web_search 或 read_page 拿到结果回答，**不要为一次性需求新建信源**。只有周期性、持续性的关注（每天盯某类信息、某页面有变化就告诉我）才用 add_source 订阅或 create_schedule 建定时任务，建任务时把用户要什么写进任务手册。`
+
 // 契约 §7 固定的回复/占位文案。
 const (
 	// replyMaxTurns 是 MaxTurns 内未收敛时的兜底回复（契约原文，勿改）。
@@ -223,6 +229,12 @@ func New(d Deps) *Loop {
 		// 能力说明只在真装配了端点工具面时注入：没有 search_endpoints 工具却教模型
 		// 去用它，只会制造白名单拒绝循环。
 		sys += endpointSystemNote()
+	}
+	if _, ok := tools["web_search"]; ok {
+		// 同 endpointSystemNote 原则：Exa ad-hoc 工具对（web_search/read_page）是条件
+		// 装配（Exa key 缺失时不注册），分流引导行只在工具真在场时注入——否则模型
+		// 按 prompt 调一个白名单里不存在的工具，浪费一轮还向用户食言。
+		sys += exaAdHocSystemNote
 	}
 
 	l := &Loop{

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/YouToco/vane/config"
@@ -155,6 +156,24 @@ func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Conte
 		reqBody.StartPublishedDate = start.Format(time.RFC3339)
 	}
 
+	er, err := e.doSearch(ctx, reqBody, src)
+	if err != nil {
+		return nil, err
+	}
+
+	// 全灭防线：Exa 的 lookback 是服务端过滤（请求里的 startPublishedDate），
+	// 客户端**没有**正常过滤，所以「收到结果却一条都没能入库」直接就是不兼容/漂移的确证。
+	mapped, tally := mapExaResults(src, er.Results)
+	if len(er.Results) > 0 && len(mapped) == 0 {
+		return nil, allDroppedErr(src, len(er.Results), tally)
+	}
+	return mapped, nil
+}
+
+// doSearch 是 POST /search 的 HTTP 核心：请求→错误语义→记账，Fetch（信源周期抓取）
+// 与 Search（agent ad-hoc 一次性搜索）共用。src 只用于记账（tool_calls 的 source_id），
+// ad-hoc 调用传零值 Source（SourceID=0 无源口径）。
+func (e *ExaFetcher) doSearch(ctx context.Context, reqBody exaRequest, src types.Source) (*exaResponse, error) {
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, types.NewAppError(types.CodeValidation, "构造 Exa 请求体失败", err)
@@ -170,11 +189,15 @@ func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Conte
 
 	start := time.Now()
 	resp, err := e.client.Do(req)
+	elapsed := time.Since(start)
 	if err != nil {
-		return nil, classifyDoError(e.searchURL, err)
+		ae := classifyDoError(e.searchURL, err)
+		// Do 失败（超时/连接拒绝）也记账（对抗审查 F1）：真实发起了上游尝试，
+		// 不记则网络层故障在账本上隐形。status=0 表示未拿到 HTTP 响应。
+		e.recordCall(ctx, src, 0, elapsed, 0, 0, ae)
+		return nil, ae
 	}
 	defer resp.Body.Close()
-	elapsed := time.Since(start)
 
 	// 错误路径也记账（bug 狩猎 2026-07-19 MEDIUM，两路独立发现）：此前 recordCall
 	// 只在 JSON 解析成功后调用，429 限流一整天 tool_calls 里零行 Exa 记录——故障在
@@ -218,14 +241,62 @@ func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Conte
 	}
 
 	e.recordCall(ctx, src, resp.StatusCode, elapsed, len(data), er.CostDollars.Total, nil)
+	return &er, nil
+}
 
-	// 全灭防线：Exa 的 lookback 是服务端过滤（请求里的 startPublishedDate），
-	// 客户端**没有**正常过滤，所以「收到结果却一条都没能入库」直接就是不兼容/漂移的确证。
-	mapped, tally := mapExaResults(src, er.Results)
-	if len(er.Results) > 0 && len(mapped) == 0 {
-		return nil, allDroppedErr(src, len(er.Results), tally)
+// SearchResult 是 ad-hoc 搜索的一条结果（agent web_search 工具）。
+// 与信源路径（mapExaResults→ContentItem）分开：一次性搜索不进内容库、不需要身份指纹。
+type SearchResult struct {
+	Title         string
+	URL           string
+	PublishedDate string
+	Author        string
+	Text          string // 已按 exaMaxTextBytes 截断（与信源路径同一护栏）
+}
+
+// Search 一次性语义搜索（agent web_search 工具）：不建信源、不写入内容库，
+// 结果只回给调用方。numResults 越界收敛到 [1, exaMaxNumResults]；记账 SourceID=0
+// （无源 ad-hoc 调用）。失败语义与 Fetch 一致（缺 key/鉴权 → CodeValidation，
+// 429 → CodeFetchRateLimit，超时 → CodeFetchTimeout）。
+func (e *ExaFetcher) Search(ctx context.Context, query string, numResults int, includeDomains []string) ([]SearchResult, error) {
+	if e.apiKey == "" {
+		return nil, types.NewAppError(types.CodeValidation,
+			"Exa 搜索需要配置 VANE_FETCH_EXA_API_KEY，当前为空", nil)
 	}
-	return mapped, nil
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, types.NewAppError(types.CodeValidation, "搜索词不能为空", nil)
+	}
+	if numResults <= 0 {
+		numResults = exaDefaultNumResults
+	}
+	if numResults > exaMaxNumResults {
+		numResults = exaMaxNumResults
+	}
+	er, err := e.doSearch(ctx, exaRequest{
+		Query:          query,
+		Type:           "auto",
+		NumResults:     numResults,
+		IncludeDomains: includeDomains,
+		Contents:       exaContentsReq{Text: true},
+	}, types.Source{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SearchResult, 0, len(er.Results))
+	for _, r := range er.Results {
+		if r.URL == "" && r.Title == "" {
+			continue // 无 URL 又无标题的空结果跳过（同 mapExaResults 的丢弃判据）
+		}
+		out = append(out, SearchResult{
+			Title:         r.Title,
+			URL:           r.URL,
+			PublishedDate: r.PublishedDate,
+			Author:        r.Author,
+			Text:          truncateUTF8(r.Text, exaMaxTextBytes),
+		})
+	}
+	return out, nil
 }
 
 // mapExaResults 把 Exa 结果映射为 ContentItem，正文过长时截断，指纹由 finalize 统一补齐。

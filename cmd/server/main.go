@@ -196,7 +196,14 @@ func run() error {
 	playbookTr := agent.NewPlaybookTranslator(llmClient, recorder)
 	// prober 传 fetch（*fetcher.Multi）而非 fetch.Binding()：1.5 起试跑=准入统一由
 	// Multi.Probe 分派（绑定能力走绑定引擎，web/feed 与 web/contents 走各自 provider）。
-	tools := agent.BuildTools(st, sched, sched, playbookTr, endpoints, fetch)
+	// Exa ad-hoc 工具对（web_search/read_page）：key 未配置则不装配（exaTools=nil），
+	// 与 endpoints 同语义——不广告用不了的工具。
+	var exaTools *agent.ExaTools
+	if cfg.Fetch.ExaAPIKey != "" {
+		exaTools = agent.NewExaTools(fetch.Exa(), fetch.ExaContents(), st,
+			cfg.Agent.ExaMsgCap, cfg.Agent.ExaDailyCap)
+	}
+	tools := agent.BuildTools(st, sched, sched, playbookTr, endpoints, fetch, exaTools)
 	agentLoop := agent.New(agent.Deps{
 		Client:     llmClient,
 		Recorder:   recorder,
