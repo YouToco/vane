@@ -122,3 +122,17 @@ func allDroppedErr(src types.Source, received int, t dropTally) error {
 			"或上游结构已漂移；本源将持续零产出直到格式恢复或改用其它源",
 			received, t.summary(), src.ID), errAllDropped)
 }
+
+// enrichAllFailedErr 是全灭的**瞬态**变体（对抗审查 A-F1）：条目全被丢弃，但这一轮
+// 有正文补全尝试且失败——全灭的成因更可能是补全上游（Exa）临时故障，而非源本身格式
+// 不兼容。故用 CodeFetchTimeout + Retryable=true（与 allDroppedErr 的确定性 CodeValidation
+// 相对），让 probe 走「稍后再试」（translateFeedProbeErr 不翻译瞬态错误，交 agent 层
+// 给固定话术）、让 §86 告警措辞说「补全上游暂时不可用」而非「格式不兼容」。
+// **不带 errAllDropped 哨兵**，故 probe 的 errors.Is(errAllDropped) 分支不会误吃它。
+func enrichAllFailedErr(src types.Source, failed int) error {
+	ae := types.NewAppError(types.CodeFetchTimeout,
+		fmt.Sprintf("条目需抓取全文才能入库，但本轮 %d 条全文补全全部失败（补全上游暂时不可用，source_id=%d）",
+			failed, src.ID), nil)
+	ae.Retryable = true
+	return ae
+}

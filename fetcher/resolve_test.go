@@ -35,28 +35,75 @@ func TestSniffFeedLinks_标准声明(t *testing.T) {
 	}
 }
 
-// TestSniffFeedLinks_大小写与去重 真实网页里 rel="Alternate"、type 全大写都出现过；
-// cascadia 属性值匹配大小写敏感，所以实现必须手工 EqualFold——本用例锁住这一点。
-// 同地址声明两次只返回一次。
-func TestSniffFeedLinks_大小写与去重(t *testing.T) {
-	body := `<html><head>
-		<link rel="Alternate" type="APPLICATION/RSS+XML" href="/feed.xml">
-		<link rel="alternate" type="application/rss+xml" href="/feed.xml">
-	</head></html>`
+// TestSniffFeedLinks_JSONFeed 对抗审查 A-F7：gofeed v1.4.0 实测支持 JSON Feed，
+// application/feed+json 声明应被收（此前被错误排除、引向付费的 web/contents）。
+func TestSniffFeedLinks_JSONFeed(t *testing.T) {
+	body := `<html><head><link rel="alternate" type="application/feed+json" href="/feed.json"></head></html>`
 	got := sniffFeedLinks([]byte(body), mustParse(t, "https://example.com/"))
-	if len(got) != 1 || got[0] != "https://example.com/feed.xml" {
-		t.Fatalf("大小写变体应命中且去重为 1 条，实得 %v", got)
+	if len(got) != 1 || got[0] != "https://example.com/feed.json" {
+		t.Fatalf("JSON Feed 声明应被收，实得 %v", got)
 	}
 }
 
-// TestSniffFeedLinks_上限与非法项 超过 sniffFeedMax 截断；javascript: 伪协议、
-// 空 href、JSON Feed（gofeed 订不上，建议了也是假建议）一律不收。
-func TestSniffFeedLinks_上限与非法项(t *testing.T) {
+// TestSniffFeedLinks_宽松匹配 对抗审查 A-F6：rel 是空白分隔 token 列表、type 可带
+// MIME 参数——真实网页里两者都出现过，精确串比较会漏识别有声明的站点。
+func TestSniffFeedLinks_宽松匹配(t *testing.T) {
+	body := `<html><head>
+		<link rel="alternate stylesheet" type="application/rss+xml; charset=utf-8" href="/a.xml">
+		<link rel="Alternate" type="APPLICATION/ATOM+XML" href="/b.xml">
+	</head></html>`
+	got := sniffFeedLinks([]byte(body), mustParse(t, "https://example.com/"))
+	want := []string{"https://example.com/a.xml", "https://example.com/b.xml"}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("rel 多 token / type 带参数应命中，实得 %v", got)
+	}
+}
+
+// TestSniffFeedLinks_去重 同地址声明两次只返回一次。
+func TestSniffFeedLinks_去重(t *testing.T) {
+	body := `<html><head>
+		<link rel="alternate" type="application/rss+xml" href="/feed.xml">
+		<link rel="alternate" type="application/rss+xml" href="/feed.xml">
+	</head></html>`
+	got := sniffFeedLinks([]byte(body), mustParse(t, "https://example.com/"))
+	if len(got) != 1 {
+		t.Fatalf("应去重为 1 条，实得 %v", got)
+	}
+}
+
+// TestSniffFeedLinks_base覆盖 对抗审查 A-F2：<base href> 存在时相对 href 以它为基准。
+func TestSniffFeedLinks_base覆盖(t *testing.T) {
+	body := `<html><head>
+		<base href="https://cdn.example.com/blog/">
+		<link rel="alternate" type="application/rss+xml" href="feed.xml">
+	</head></html>`
+	got := sniffFeedLinks([]byte(body), mustParse(t, "https://example.com/posts/"))
+	if len(got) != 1 || got[0] != "https://cdn.example.com/blog/feed.xml" {
+		t.Fatalf("<base href> 应覆盖相对基准，实得 %v", got)
+	}
+}
+
+// TestSniffFeedLinks_安全过滤 对抗审查 B-HIGH/B-LOW：javascript:/data: 伪协议、
+// 空 href、带 userinfo（可信域伪装）、超长（DoS 载荷）一律不收。
+func TestSniffFeedLinks_安全过滤(t *testing.T) {
+	longURL := "https://example.com/" + strings.Repeat("a", maxFeedURLBytes)
+	body := `<html><head>` +
+		`<link rel="alternate" type="application/rss+xml" href="javascript:alert(1)">` +
+		`<link rel="alternate" type="application/rss+xml" href="">` +
+		`<link rel="alternate" type="application/rss+xml" href="https://user:pass@evil.com/feed.xml">` +
+		`<link rel="alternate" type="application/rss+xml" href="` + longURL + `">` +
+		`<link rel="alternate" type="application/rss+xml" href="/ok.xml">` +
+		`</head></html>`
+	got := sniffFeedLinks([]byte(body), mustParse(t, "https://example.com/"))
+	if len(got) != 1 || got[0] != "https://example.com/ok.xml" {
+		t.Fatalf("伪协议/空/userinfo/超长应全部拒收，只剩 ok.xml，实得 %v", got)
+	}
+}
+
+// TestSniffFeedLinks_上限 超过 sniffFeedMax 截断。
+func TestSniffFeedLinks_上限(t *testing.T) {
 	var b strings.Builder
 	b.WriteString(`<html><head>`)
-	b.WriteString(`<link rel="alternate" type="application/rss+xml" href="javascript:alert(1)">`)
-	b.WriteString(`<link rel="alternate" type="application/rss+xml" href="">`)
-	b.WriteString(`<link rel="alternate" type="application/feed+json" href="/feed.json">`)
 	for _, p := range []string{"/a.xml", "/b.xml", "/c.xml", "/d.xml"} {
 		b.WriteString(`<link rel="alternate" type="application/rss+xml" href="` + p + `">`)
 	}
@@ -64,9 +111,6 @@ func TestSniffFeedLinks_上限与非法项(t *testing.T) {
 	got := sniffFeedLinks([]byte(b.String()), mustParse(t, "https://example.com/"))
 	if len(got) != sniffFeedMax {
 		t.Fatalf("期望截断到 %d 条，实得 %v", sniffFeedMax, got)
-	}
-	if got[0] != "https://example.com/a.xml" {
-		t.Errorf("非法项应被跳过、从 a.xml 开始，实得 %v", got)
 	}
 }
 

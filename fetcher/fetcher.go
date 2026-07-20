@@ -145,7 +145,13 @@ func New(cfg config.FetchConfig) *Fetcher {
 // CodeFetchTimeout；HTTP 429 → CodeFetchRateLimit；其余（非 2xx、超限、解析失败）
 // 归入 fetch 类但按确定性/瞬态区分 Retryable。解析失败只返回 error，绝不 panic。
 func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.ContentItem, error) {
-	data, err := f.fetchBody(ctx, src.URL)
+	return f.fetchRSS(ctx, src, enrichMaxPerRound)
+}
+
+// fetchRSS 是 FetchRSS 的内部实现，多一个补全上限参数：周期抓取用 enrichMaxPerRound，
+// probe 用 probeEnrichCap（对抗审查 A-F3）。除补全条数外行为完全一致（含全灭防线）。
+func (f *Fetcher) fetchRSS(ctx context.Context, src types.Source, enrichCap int) ([]types.ContentItem, error) {
+	data, _, err := f.fetchBody(ctx, src.URL)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +179,7 @@ func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.Conte
 	//   - 之后：不为一条马上要被 lookback/categories 滤掉的条目付费。
 	//   - 之前：补回来的正文要参与 finalize 的指纹与 §12.3 护栏判定；放到映射之后，
 	//     链接型条目会先被护栏丢掉，补全永远等不到执行。
-	skippedSeen := f.enrichItems(ctx, src, items)
+	skippedSeen, enrichFailed := f.enrichItems(ctx, src, items, enrichCap)
 
 	// 全灭判定必须在此处、比较**映射函数的入参与产出**——不能拿 feed.Items 当分母。
 	// applyLookback / applyCategories 是用户声明的正常过滤（B 类），它们在这一行之前
@@ -192,33 +198,48 @@ func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.Conte
 	// 分母为 0，回到「合法空轮」，与 feed 本来就没新东西同等对待——事实上也确实如此。
 	denom := len(items) - skippedSeen
 	if denom > 0 && len(mapped) == 0 {
+		// 全灭。若这一轮有正文补全**尝试且失败**，全灭更可能是补全上游（Exa）瞬态
+		// 故障（宕机/全 429/key 缺失）而非源格式不兼容——报可重试错误，别把「Exa 挂了」
+		// 诬告成「该源格式不兼容、持续零产出」（对抗审查 A-F1）。这也让 §86 告警链的
+		// 措辞更准，且 probe 路径据此走「稍后再试」而非确定性拒绝。
+		if enrichFailed > 0 {
+			return nil, enrichAllFailedErr(src, enrichFailed)
+		}
 		return nil, allDroppedErr(src, denom, tally)
 	}
 	return mapped, nil
 }
 
 // fetchBody 对用户提交的 URL 做一次受安全边界约束的 GET（包 SSRF 双重校验、超时、
-// 响应大小上限），返回完整响应体。FetchRSS 与 probe 的兜底解析（resolve.go 嗅探
-// autodiscovery）共用这一段——嗅探若自己 new http.Client 就是绕开 SSRF 栈开洞。
+// 响应大小上限），返回完整响应体与**重定向后的最终 URL**。FetchRSS 与 probe 的兜底
+// 解析（resolve.go 嗅探 autodiscovery）共用这一段——嗅探若自己 new http.Client 就是
+// 绕开 SSRF 栈开洞。
+//
+// 返回 finalURL（= resp.Request.URL，跟随重定向后的终点）：嗅探相对 href 必须以它为
+// 基准解析，否则尾斜杠 301 / 跨域重定向会让「建议的 feed 地址」指向错误目录或主机
+// （对抗审查 A-F2/B-LOW）。SSRF 栈对重定向目标同样生效：client 未设 noRedirect（RSS
+// 允许重定向），但每一跳的 Dialer.Control 都按解析后 IP 逐个校验，重定向到内网仍被拦。
 //
 // 失败语义（原 FetchRSS 头部逻辑原样搬入，错误面貌零变化）：非法 URL / 私网 / 超限
 // → CodeValidation（不可重试）；429 → CodeFetchRateLimit；非 2xx 按 5xx/4xx 定
 // Retryable；连接期错误经 classifyDoError 归类。
-func (f *Fetcher) fetchBody(ctx context.Context, rawURL string) ([]byte, error) {
+func (f *Fetcher) fetchBody(ctx context.Context, rawURL string) ([]byte, *url.URL, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return nil, types.NewAppError(types.CodeValidation,
+		return nil, nil, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("非法 RSS URL: %q", rawURL), err)
 	}
 
 	// 抓取前 IP 预检：把明显的私网/环回目标挡在发请求之前，
 	// 并以 CodeValidation 明确告知调用方（这是配置/输入问题，非瞬态故障）。
+	// 话术只说「解析到私网/环回地址」不带具体 IP（对抗审查 B-LOW）：probe 会把该
+	// Message 透出到用户/模型面，回显解析到的内网 IP 会把被阻断的 SSRF 从盲变非盲。
 	host := u.Hostname()
 	if ips, lerr := f.lookupIP(host); lerr == nil {
 		for _, ip := range ips {
 			if f.isBlocked(ip) {
-				return nil, types.NewAppError(types.CodeValidation,
-					fmt.Sprintf("RSS 源 %q 解析到私网/环回地址 %s，已拒绝", host, ip), nil)
+				return nil, nil, types.NewAppError(types.CodeValidation,
+					fmt.Sprintf("RSS 源 %q 解析到私网/环回地址，已拒绝", host), nil)
 			}
 		}
 	}
@@ -226,19 +247,19 @@ func (f *Fetcher) fetchBody(ctx context.Context, rawURL string) ([]byte, error) 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, types.NewAppError(types.CodeValidation, "构造抓取请求失败", err)
+		return nil, nil, types.NewAppError(types.CodeValidation, "构造抓取请求失败", err)
 	}
 	req.Header.Set("User-Agent", "Vane/0.3 (+https://vane.zhuoqidev.com)")
 	req.Header.Set("Accept", "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5")
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return nil, classifyDoError(rawURL, err)
+		return nil, nil, classifyDoError(rawURL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, types.NewAppError(types.CodeFetchRateLimit,
+		return nil, nil, types.NewAppError(types.CodeFetchRateLimit,
 			fmt.Sprintf("抓取 %s 被限流(429)", rawURL), nil)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -246,20 +267,25 @@ func (f *Fetcher) fetchBody(ctx context.Context, rawURL string) ([]byte, error) 
 			fmt.Sprintf("抓取 %s 返回非 2xx 状态 %d", rawURL, resp.StatusCode), nil)
 		// 5xx 视为瞬态可重试，4xx 视为确定性不可重试（覆盖默认的 true）。
 		ae.Retryable = resp.StatusCode >= 500
-		return nil, ae
+		return nil, nil, ae
 	}
 
 	// 读到 maxBytes+1 字节以便判断是否超限：LimitReader 会静默截断，
 	// 只有多读 1 字节才能区分"恰好等于上限"与"超过上限"。
 	data, err := io.ReadAll(io.LimitReader(resp.Body, f.maxBytes+1))
 	if err != nil {
-		return nil, classifyDoError(rawURL, err)
+		return nil, nil, classifyDoError(rawURL, err)
 	}
 	if int64(len(data)) > f.maxBytes {
-		return nil, types.NewAppError(types.CodeValidation,
+		return nil, nil, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("抓取 %s 响应体超过 %d 字节上限", rawURL, f.maxBytes), nil)
 	}
-	return data, nil
+	// finalURL = 跟随重定向后的实际 URL；resp.Request 在有/无重定向下都非 nil。
+	finalURL := u
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL
+	}
+	return data, finalURL, nil
 }
 
 // rssSourceConfig 是 RSS 信源的 config JSONB 结构。

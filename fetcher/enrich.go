@@ -50,6 +50,13 @@ import (
 // 「未补全」并继续补。
 const enrichMaxPerRound = 10
 
+// probeEnrichCap 是**试跑轮**的补全上限（对抗审查 A-F3/A-F4）：远小于 enrichMaxPerRound。
+// probe 只需补够几条证明「这个链接型源补全管用、能产出内容」即可判定准入，无谓为未落库
+// 的判定付满额详情费（首轮正式抓取会按 enrichMaxPerRound 正常补），也把 probeFeed 的耗时
+// 压在 probeBudget 内（5 条 × ~3s + GET ≈ 17s < 25s）。取 5 而非更小：留冗余，避免恰好
+// 头几条补全瞬态失败就误判全灭（虽然那也只是「稍后再试」的可重试拒绝，非永久拒）。
+const probeEnrichCap = 5
+
 // enrichMinRunes 一个常量同时承担两件事，**这是刻意的**：
 //   - 触发线：正文短于它 ⇒ 判定为摘要/存根，需要跟着链接补全。
 //   - 已补全线：传给 SeenChecker，正文达到它 ⇒ 视为已补全，不再付费。
@@ -100,11 +107,22 @@ func needsEnrichment(link, content string) bool {
 // 全程 best-effort：任何一条补全失败只记日志、保留原样，让它继续走后面的护栏
 // （补不到正文的链接型条目仍会被 §12.3 丢弃，与改造前一致——补全只增不减）。
 // 一条补不到不该拖垮整批，更不该让整个信源被判成故障。
-// 返回值是「因为库里已有其正文而**刻意跳过**补全」的条目数。调用方必须把它从
-// 「全灭」判定的分母里扣掉——见 FetchRSS 里的用法与下方说明。
-func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*gofeed.Item) (skippedSeen int) {
+//
+// 返回：
+//   - skippedSeen：因库里已有其正文而**刻意跳过**补全的条目数。调用方必须把它从
+//     「全灭」判定的分母里扣掉——见 FetchRSS 里的用法与下方说明。
+//   - enrichFailed：**尝试补全但失败**（上游报错或取回空正文）的条目数。它区分
+//     「源格式与解析器不兼容」（确定性）与「补全上游 Exa 瞬态故障」（可重试）——
+//     链接型源在 Exa 宕机/全 429/key 缺失时会全体补全失败 → 全部保持裸 HTML → 全灭，
+//     但这**不是源坏了**。调用方据此在全灭时报可重试错误而非确定性拒绝
+//     （对抗审查 A-F1：否则「Exa 挂了」会被诬告成「该源格式不兼容、持续零产出」，
+//     用户再也不会重试一个实际健康的源）。
+// maxEnrich 是本轮补全条数上限：周期抓取传 enrichMaxPerRound（10），probe 传更小的
+// probeEnrichCap（5）——试跑只需补够几条证明「补全管用、能产出内容」，无谓为一个未落库
+// 的准入判定付满额详情费，也让 probe 在 probeBudget 内稳定完成（对抗审查 A-F3/A-F4）。
+func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*gofeed.Item, maxEnrich int) (skippedSeen, enrichFailed int) {
 	if f.enricher == nil || len(items) == 0 {
-		return 0 // 未装配补全能力（测试/灰度）：退化为不补，行为与改造前一致。
+		return 0, 0 // 未装配补全能力（测试/灰度）：退化为不补，行为与改造前一致。
 	}
 
 	// 先挑出候选，再一次性问 SeenChecker——逐条查会把一次批量查询放大成 N 次往返。
@@ -126,7 +144,7 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 		cands = append(cands, cand{it: it, key: key})
 	}
 	if len(cands) == 0 {
-		return 0
+		return 0, 0
 	}
 
 	// 闸门①：已入库且正文已补全的直接跳过（跨源命中同一篇时只有第一个源付费）。
@@ -142,14 +160,14 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 			// （下轮再补，内容不丢），也不要在数据库抖动时打出一批付费调用。
 			slog.Warn("fetcher: 补全闸门查询失败，本轮跳过正文补全",
 				"source_id", src.ID, "candidates", len(cands), "err", err)
-			return 0
+			return 0, 0
 		}
 		skip = got
 	}
 
 	done := 0
 	for _, c := range cands {
-		if done >= enrichMaxPerRound {
+		if done >= maxEnrich {
 			slog.Info("fetcher: 正文补全达本轮上限，其余条目留待下轮",
 				"source_id", src.ID, "enriched", done, "remaining", len(cands)-done)
 			break
@@ -162,12 +180,14 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 		if err != nil {
 			slog.Warn("fetcher: 单条正文补全失败，保留原样",
 				"source_id", src.ID, "url", c.it.Link, "err", err)
+			enrichFailed++ // 尝试了但上游报错（对抗审查 A-F1：全灭时据此判瞬态 vs 确定性）。
 			continue
 		}
 		text := firstNonEmptyText(results)
 		if strings.TrimSpace(text) == "" {
 			slog.Warn("fetcher: 正文补全取回空正文，保留原样",
 				"source_id", src.ID, "url", c.it.Link)
+			enrichFailed++ // 尝试了但取回空正文，同样计入补全失败。
 			continue
 		}
 		// 与 web/contents 用同一套净化：Exa 抽出的正文里 `<` 是内容（比较符/代码）
@@ -176,11 +196,12 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 		c.it.Description = "" // 正文已由 Content 承载，避免 itemContent 回退到旧的链接片段。
 		done++
 	}
-	if done > 0 || skippedSeen > 0 {
+	if done > 0 || skippedSeen > 0 || enrichFailed > 0 {
 		slog.Info("fetcher: RSS 正文补全完成",
-			"source_id", src.ID, "enriched", done, "candidates", len(cands), "skipped_seen", skippedSeen)
+			"source_id", src.ID, "enriched", done, "candidates", len(cands),
+			"skipped_seen", skippedSeen, "failed", enrichFailed)
 	}
-	return skippedSeen
+	return skippedSeen, enrichFailed
 }
 
 // firstNonEmptyText 取第一条有正文的结果（与 mapExaContents 的挑法一致）。

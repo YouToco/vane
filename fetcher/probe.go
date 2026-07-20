@@ -22,12 +22,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 
+	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/types"
 )
+
+// suggestedURLMaxRunes 单条建议 URL 进话术的 rune 上限（sniffFeedLinks 已按字节限过，
+// 这里是文本层的二道闸，与 promptguard 消毒同处）。
+const suggestedURLMaxRunes = 256
+
+// sanitizeSuggested 消毒嗅探出的建议 feed 地址再拼进话术（对抗审查 B-HIGH）。
+//
+// 这些 URL 由**攻击者可控的页面**声明，会经 add_source 回执写进 agent 的 [卡片回调]
+// 上下文——而 agent 路径此前无 promptguard（全仓其余「抓取内容→模型」处都有）。逐条施加
+// 与打分/画像同款的定界符消毒（Sanitize：中和 [卡片回调] 等定界前缀伪造）+ 剥隐藏字符
+// （StripInvisible）+ 折行（SingleLine）+ rune 截断，杜绝：定界符伪造假动作、零宽字符
+// token 注入、超长载荷。sniffFeedLinks 已挡掉 userinfo/非 http(s)/超 512 字节，两层互补。
+func sanitizeSuggested(links []string) string {
+	out := make([]string, 0, len(links))
+	for _, l := range links {
+		s := promptguard.SingleLine(promptguard.StripInvisible(l))
+		s = promptguard.TruncateRunes(promptguard.Sanitize(s), suggestedURLMaxRunes)
+		out = append(out, s)
+	}
+	return strings.Join(out, " 、 ")
+}
 
 // Probe 试跑一个待添加的源（真调一次上游，计费调用照常记账 tool_calls）。
 //
@@ -67,13 +88,19 @@ func (m *Multi) Probe(ctx context.Context, src types.Source) (*ProbeReport, erro
 // probeFeed 试跑 web/feed：跑完整抓取路径（含 lookback/categories/正文补全/全灭防线），
 // 不是只验证「能 GET」——试跑通过必须意味着周期运行也能通过（试跑=准入的诚实边界；
 // HN 那种「feed 合法但 30 条全被裸 HTML 护栏丢弃」的源必须在这里就被拒掉，
-// 而不是 probe 绿、生产死）。正文补全在试跑轮的花费与正常轮同量级（封顶 10 条），
-// 是准入判定正确性的必要成本。
+// 而不是 probe 绿、生产死）。
+//
+// 成本（对抗审查 A-F4，诚实记录）：链接型源的试跑会补全 ≤probeEnrichCap（5）条正文
+// （各一次 Exa /contents，~$0.001），且这些 probe 内容**不落库**——首轮正式抓取时
+// SeenChecker 查不到，会对同批条目再补一次。即试跑+首轮对重叠条目两次付费，量级
+// ~$0.005+$0.01/源一次性，可接受；这是「试跑通过=运行能通过」诚实边界的必要代价。
 //
 // 试跑成功且 0 条是合法的（8 天没更新的博客，lookback 把旧条目全滤掉）：
 // feed 本身有效，新文章发布后自然进入推送，不拒。
 func (m *Multi) probeFeed(ctx context.Context, src types.Source) (*ProbeReport, error) {
-	items, err := m.rss.FetchRSS(ctx, src)
+	// probeEnrichCap（5）而非 enrichMaxPerRound（10）：试跑只需补够几条判定准入，省钱且
+	// 在 probeBudget 内稳定完成（对抗审查 A-F3/A-F4）。
+	items, err := m.rss.fetchRSS(ctx, src, probeEnrichCap)
 	if err != nil {
 		return nil, m.translateFeedProbeErr(ctx, src, err)
 	}
@@ -98,19 +125,31 @@ func (m *Multi) translateFeedProbeErr(ctx context.Context, src types.Source, err
 	// 再抓一次页面做 autodiscovery 嗅探：FetchRSS 失败时响应体已随错误路径丢弃，
 	// 这次 GET 只发生在一次性的试跑上（周期抓取路径零嗅探开销），RSS 抓取不计费。
 	if errors.Is(err, errNotFeed) {
+		// 再抓一次页面做 autodiscovery 嗅探：FetchRSS 失败时响应体已随错误路径丢弃，
+		// 这次 GET 只发生在一次性的试跑上（周期抓取路径零嗅探开销），RSS 抓取不计费。
+		// base 用 fetchBody 返回的**重定向终点**而非原始 URL（对抗审查 A-F2）。
 		var links []string
-		if u, perr := url.Parse(src.URL); perr == nil {
-			if data, ferr := m.rss.fetchBody(ctx, src.URL); ferr == nil {
-				links = sniffFeedLinks(data, u)
-			}
+		sniffed := false
+		if data, finalURL, ferr := m.rss.fetchBody(ctx, src.URL); ferr == nil {
+			sniffed = true
+			links = sniffFeedLinks(data, finalURL)
 		}
 		if len(links) > 0 {
+			// links 由攻击者可控的页面声明，将经 add_source 回执进 agent 的 [卡片回调]
+			// 上下文——消毒后再拼（对抗审查 B-HIGH，见 sanitizeSuggested）。
 			return probeReject(fmt.Sprintf(
 				"该地址返回的内容不是 RSS/Atom feed，但页面声明了 feed 地址：%s。建议把 url 换成该地址重新添加（web/feed）。",
-				strings.Join(links, " 、 ")))
+				sanitizeSuggested(links)))
 		}
+		if sniffed {
+			return probeReject(
+				"该地址返回的内容不是 RSS/Atom feed，页面上也未发现 feed 声明。替代方案：" +
+					"用 web/contents 监控该页面的内容变化（url 原样），或用 web/search 以关键词订阅相关主题。")
+		}
+		// 二次 GET 失败（预算耗尽/瞬态网络/超上限）：根本没看到页面，不能谎称「未发现
+		// feed 声明」（对抗审查 A-F5）——那对声明了 feed 的站点是假陈述。
 		return probeReject(
-			"该地址返回的内容不是 RSS/Atom feed，页面上也未发现 feed 声明。替代方案：" +
+			"该地址返回的内容不是 RSS/Atom feed，且未能进一步解析该页面。替代方案：" +
 				"用 web/contents 监控该页面的内容变化（url 原样），或用 web/search 以关键词订阅相关主题。")
 	}
 

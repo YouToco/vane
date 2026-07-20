@@ -230,9 +230,16 @@ type addSourceTool struct {
 	prober sourceProber // nil = 不试跑（测试/未装配路径），绑定能力直接落库
 }
 
-// probeBudget 单次试跑的独立超时：卡片回调的执行预算 30s（feishu cardActionExecBudget），
-// 超 2.5s 会自动转异步补发结果，10s 足够一次上游调用且给回执留余量。
-const probeBudget = 10 * time.Second
+// probeBudget 单次试跑的独立超时。卡片回调的执行预算 30s（feishu cardActionExecBudget），
+// 超 2.5s 自动转异步补发结果，故 probe 拉长不阻塞用户。
+//
+// 取 25s 而非 10s（对抗审查 A-F3）：web/feed 试跑不是「一次上游调用」——它跑完整抓取路径
+// 含正文补全（probeEnrichCap=5 条 × Exa /contents，每条含一次 GET），加上 feed 本体 GET 与
+// 兜底嗅探的二次 GET。10s 会被慢源或 Exa 抖动打穿：部分条目未补全 → 报告条数系统性偏低，
+// 或响应 10-20s 的慢源（RSS client 超时 20s，周期抓取能成）在添加期结构性误拒。25s > client
+// 20s 超时，让真正的慢源以 CodeFetchTimeout（可重试）落「稍后再试」而非被拒，且 < 30s 执行
+// 预算留回写余量。
+const probeBudget = 25 * time.Second
 
 func (t *addSourceTool) Name() string { return "add_source" }
 func (t *addSourceTool) Description() string {
