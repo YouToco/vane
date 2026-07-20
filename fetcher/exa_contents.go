@@ -246,10 +246,6 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 		return nil, false, fail(resp.StatusCode, len(data), ae)
 	}
 
-	if src != nil {
-		e.recordCall(ctx, *src, resp.StatusCode, elapsed, len(data), cr.CostDollars.Total, nil)
-	}
-
 	// statuses[] 检查（审计 D6）：抓取失败是 HTTP 200 + status="error"，绝不能当成
 	// "内容为空"静默返回 0 条——那会让监控在页面挂掉时误判"没变化"。
 	var cached bool
@@ -261,11 +257,17 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 			ae := types.NewAppError(types.CodeFetchTimeout,
 				fmt.Sprintf("Exa /contents 抓取失败（url=%s，status=error）", pageURL), ErrPageUnreachable)
 			ae.Retryable = true
+			if src != nil {
+				e.recordCall(ctx, *src, resp.StatusCode, elapsed, len(data), cr.CostDollars.Total, ae)
+			}
 			return nil, false, ae
 		}
 		if st.Source == "cached" {
 			cached = true
 		}
+	}
+	if src != nil {
+		e.recordCall(ctx, *src, resp.StatusCode, elapsed, len(data), cr.CostDollars.Total, nil)
 	}
 	return cr.Results, cached, nil
 }
@@ -384,11 +386,13 @@ func (e *ExaContentsFetcher) recordCall(ctx context.Context, src types.Source, s
 	if e.rec == nil {
 		return
 	}
-	ctx = context.WithoutCancel(ctx)
-	trace, _ := ctx.Value(bindingTraceKey).(string)
+	ctx, cancel := detachedBindingRecordContext(ctx)
+	defer cancel()
+	trace, userID := bindingAttribution(ctx)
 	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
+		UserID:       userID,
 		ToolName:     "exa:contents",
 		ToolKind:     types.ToolCallKindExaFetch,
 		EndpointPath: "/contents",

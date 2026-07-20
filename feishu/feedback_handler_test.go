@@ -680,6 +680,9 @@ func TestHandleQuestionWrapping(t *testing.T) {
 		if got[0] != wrapped {
 			t.Errorf("agent loop 收到 %q, 期望包装后文本 %q", got[0], wrapped)
 		}
+		if trust := runner.receivedExternal(); len(trust) != 1 || !trust[0] {
+			t.Fatalf("追问包装含外部推送正文，必须走 external-context 入口，实得 %v", trust)
+		}
 
 		// WrapQuestion 拿到的必须是飞书事件里的 ParentId/RootId 与原始文本。
 		wraps := fb.recordedWraps()
@@ -717,6 +720,35 @@ func TestHandleQuestionWrapping(t *testing.T) {
 		if got[0] != "今天天气如何" {
 			t.Errorf("agent loop 收到 %q, 期望原样 %q", got[0], "今天天气如何")
 		}
+		if trust := runner.receivedExternal(); len(trust) != 1 || trust[0] {
+			t.Fatalf("未命中且引用拉取降级时应走普通入口，实得 %v", trust)
+		}
+	})
+
+	t.Run("未命中但引用 API 成功时走 external-context 入口", func(t *testing.T) {
+		const parentID = "om_parent_quote_success"
+		client, closeServer := newQuotedMessageTestClient(t, parentID, "引用卡片里的外部正文")
+		defer closeServer()
+
+		m := NewManager(st, nil, nil)
+		m.setOwner(owner, "测试")
+		m.apiClient = client
+		runner := &fakeRunner{}
+		m.SetAgent(runner)
+		m.SetFeedback(&fakeFeedbackRunner{wrapMatched: false})
+		h := newHandler(m, context.Background())
+
+		h.handle(context.Background(), replyEvent(
+			"om_test_quote_success", "请解释一下", owner, parentID, ""))
+
+		got := runner.received()
+		want := "[用户引用的消息]\n引用卡片里的外部正文\n[用户的回复]\n请解释一下"
+		if len(got) != 1 || got[0] != want {
+			t.Fatalf("agent loop 收到 %q，期望 %q", got, want)
+		}
+		if trust := runner.receivedExternal(); len(trust) != 1 || !trust[0] {
+			t.Fatalf("引用 API 成功混入外部正文后必须走 external-context，实得 %v", trust)
+		}
 	})
 
 	t.Run("FeedbackRunner 未注入时不 panic 且走普通路径", func(t *testing.T) {
@@ -736,6 +768,9 @@ func TestHandleQuestionWrapping(t *testing.T) {
 		}
 		if got[0] != "你好" {
 			t.Errorf("agent loop 收到 %q, 期望原样 %q", got[0], "你好")
+		}
+		if trust := runner.receivedExternal(); len(trust) != 1 || trust[0] {
+			t.Fatalf("无反馈包装且引用拉取降级时应走普通入口，实得 %v", trust)
 		}
 	})
 
@@ -762,6 +797,9 @@ func TestHandleQuestionWrapping(t *testing.T) {
 		}
 		if got := runner.received(); len(got) != 1 || got[0] != "随便聊聊" {
 			t.Errorf("agent loop 收到 %q, 期望原样 [\"随便聊聊\"]", got)
+		}
+		if trust := runner.receivedExternal(); len(trust) != 1 || trust[0] {
+			t.Fatalf("普通文本不应被标成 external-context，实得 %v", trust)
 		}
 	})
 }

@@ -19,32 +19,40 @@ import (
 // ============================================================
 
 type fakeWebSearcher struct {
-	calls      int
-	gotQuery   string
-	gotNum     int
-	gotDomains []string
-	results    []fetcher.SearchResult
-	err        error
+	calls          int
+	gotQuery       string
+	gotNum         int
+	gotDomains     []string
+	gotTrace       string
+	gotUserID      int64
+	gotAttribution bool
+	results        []fetcher.SearchResult
+	err            error
 }
 
-func (f *fakeWebSearcher) Search(_ context.Context, q string, n int, d []string) ([]fetcher.SearchResult, error) {
+func (f *fakeWebSearcher) Search(ctx context.Context, q string, n int, d []string) ([]fetcher.SearchResult, error) {
 	f.calls++
 	f.gotQuery, f.gotNum, f.gotDomains = q, n, d
+	f.gotTrace, f.gotUserID, f.gotAttribution = fetcher.BindingAttributionFromContext(ctx)
 	return f.results, f.err
 }
 
 type fakePageReader struct {
-	calls  int
-	gotURL string
-	title  string
-	text   string
-	cached bool
-	err    error
+	calls          int
+	gotURL         string
+	gotTrace       string
+	gotUserID      int64
+	gotAttribution bool
+	title          string
+	text           string
+	cached         bool
+	err            error
 }
 
-func (f *fakePageReader) ReadPage(_ context.Context, u string) (string, string, bool, error) {
+func (f *fakePageReader) ReadPage(ctx context.Context, u string) (string, string, bool, error) {
 	f.calls++
 	f.gotURL = u
+	f.gotTrace, f.gotUserID, f.gotAttribution = fetcher.BindingAttributionFromContext(ctx)
 	return f.title, f.text, f.cached, f.err
 }
 
@@ -98,10 +106,10 @@ func TestWebSearch_参数校验不打上游不计费(t *testing.T) {
 	fs := &fakeWebSearcher{}
 	tl := &webSearchTool{et: newTestExaTools(fs, nil)}
 	for name, args := range map[string]string{
-		"空 query":          `{"query":"  "}`,
-		"缺 query":          `{}`,
-		"坏 JSON":       `{`,
-		"query 超长":        `{"query":"` + strings.Repeat("字", exaQueryMaxRunes+1) + `"}`,
+		"空 query":            `{"query":"  "}`,
+		"缺 query":            `{}`,
+		"坏 JSON":             `{`,
+		"query 超长":           `{"query":"` + strings.Repeat("字", exaQueryMaxRunes+1) + `"}`,
 		"include_domains 超数": `{"query":"x","include_domains":[` + strings.Repeat(`"a.com",`, exaMaxIncludeDomains) + `"b.com"]}`,
 	} {
 		rec := &types.ToolCall{}
@@ -207,6 +215,34 @@ func TestReadPage_HappyPath(t *testing.T) {
 	}
 }
 
+// TestExaTools_UpstreamAttribution 钉住 H-1 的跨包接缝：Agent 层已有的
+// trace/user 必须注入 fetcher 上游调用；只测 fetcher 自己“收到就会写”会让调用方
+// 漏注入时仍假绿。tenant_id 由 store 按该 userID 的 membership 推导。
+func TestExaTools_UpstreamAttribution(t *testing.T) {
+	const traceID = "h1-trace-sentinel"
+	ctx := context.WithValue(context.Background(), chatMetaKey{}, chatMeta{traceID: traceID, userID: 7})
+
+	fs := &fakeWebSearcher{}
+	search := &webSearchTool{et: newTestExaTools(fs, nil)}
+	if _, err := search.Execute(ctx, 7, json.RawMessage(`{"query":"Vane H-1"}`)); err != nil {
+		t.Fatalf("web_search: %v", err)
+	}
+	if !fs.gotAttribution || fs.gotTrace != traceID || fs.gotUserID != 7 {
+		t.Fatalf("web_search 上游归属丢失: trace=%q user=%d hasUser=%v",
+			fs.gotTrace, fs.gotUserID, fs.gotAttribution)
+	}
+
+	fr := &fakePageReader{text: "正文"}
+	read := &readPageTool{et: newTestExaTools(nil, fr)}
+	if _, err := read.Execute(ctx, 7, json.RawMessage(`{"url":"https://example.com/h1"}`)); err != nil {
+		t.Fatalf("read_page: %v", err)
+	}
+	if !fr.gotAttribution || fr.gotTrace != traceID || fr.gotUserID != 7 {
+		t.Fatalf("read_page 上游归属丢失: trace=%q user=%d hasUser=%v",
+			fr.gotTrace, fr.gotUserID, fr.gotAttribution)
+	}
+}
+
 func TestReadPage_缓存提示(t *testing.T) {
 	fr := &fakePageReader{title: "t", text: "正文", cached: true}
 	tl := &readPageTool{et: newTestExaTools(nil, fr)}
@@ -220,9 +256,9 @@ func TestReadPage_参数校验不打上游不计费(t *testing.T) {
 	fr := &fakePageReader{}
 	tl := &readPageTool{et: newTestExaTools(nil, fr)}
 	for name, args := range map[string]string{
-		"空 url":   `{"url":" "}`,
+		"空 url":  `{"url":" "}`,
 		"非 http": `{"url":"ftp://a.b/c"}`,
-		"缺协议":   `{"url":"www.kimi.com/pricing"}`,
+		"缺协议":    `{"url":"www.kimi.com/pricing"}`,
 		"url 超长": `{"url":"https://a.b/` + strings.Repeat("p", exaURLMaxRunes) + `"}`,
 	} {
 		rec := &types.ToolCall{}

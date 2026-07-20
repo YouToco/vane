@@ -209,6 +209,9 @@ type Confirm struct {
 // HandleMessage 完整 agent loop：取/建会话 → 多轮 FC → 读工具直接执行、
 // 首个写工具建 pending_action 并终止本轮 → 持久化会话 → 返回。
 func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Outcome, error)
+// HandleExternalContextMessage 处理已经拼入推送正文/引用消息的输入：从首轮起不读画像、
+// 不声明/执行工具；用户本轮可见回答照常返回，但原始外部上下文与派生回答不持久化。
+func (l *Loop) HandleExternalContextMessage(ctx context.Context, userID int64, text string) (Outcome, error)
 // RunOnce 在给定历史上执行一轮多轮 FC（§7.1，2026-07-18 随 A2A PR-4 增补）：
 // 不读写会话存储、不持 userMu 锁、不注入画像——历史与并发语义由调用方管理
 //（A2A 侧按 contextId 重建历史，a2a-contract §12 P2）。返回追加了本轮交换的完整历史。
@@ -227,14 +230,45 @@ Loop 行为细则：
   **§7.1 增补（2026-07-18 PR-4）**：`Deps.SystemPrompt` 可覆盖该常量（零值回落，飞书轨零行为变化）；
   [用户画像] 段只跟随默认 prompt 渲染（自定义 prompt 的 A2A 轨不渲染——画像是 A2A 非目标）。
 - 会话消息即 []llm.ChatMessage 的 JSON；system 消息**不入库**，每次调用时动态前置。
-- 模型调用：DoChat，SpanName="agent"，DisableThinking=**false**（agent 决策需要推理；
-  MaxTokens 2048），Temperature nil（默认）。
+- 模型调用：DoChat，SpanName="agent"，DisableThinking=**true**（实测思维链会与 content
+  共享 MaxTokens 并导致复杂 FC 空输出；工具选择在关闭后无退化），MaxTokens 2048，
+  Temperature nil（默认）。
 - 模型返回未注册工具名：以 role=tool 回错误文本"工具 X 不存在"，继续循环（模型自纠）。
 - 一轮多个 tool_calls：顺序处理；读工具执行并回结果；遇到**首个**写工具：建 pending_action
   （24h 过期，summary=tool.Summarize(args)），该 tool_call 的 role=tool 结果写
   "已生成确认卡，等待用户确认"，**其后未处理的 tool_calls 也各回一条 role=tool
   "本轮已挂起，等待用户确认后再操作"**（协议要求每个 tool_call 必须有对应 tool 消息），
   然后再调一次模型拿收尾文案（不带 tools，防再触发），Outcome.Reply=收尾文案、Confirm 非 nil，结束。
+- `web_search`、`read_page`、动态 TikHub 端点、`read_endpoint_result` 和含外部标题的
+  `list_sources` 把外部结果送入模型后，本条用户消息进入 **untrusted-result 边界**：
+  后续模型请求不再附加动态画像，且不声明网络、内部数据或写工具；只有本轮动态端点确实
+  生成截断句柄时，才保留本地 `read_endpoint_result` 分页能力；权限绑定到本消息实际产生的
+  handle 集合（不是可猜句柄共用的一位 bool），每个 assistant 批次最多续读一次。模型即使幻觉调用画像/
+  任务/信源/写工具，或尝试把上下文编码进第二个 URL/query，也只收到固定拒绝回执，
+  不执行工具、不访问外网、不创建 pending_action。该边界是确定性 Go 代码，不以模型
+  是否遵守 prompt 为前提。若同一个 assistant 响应并列多个 tool_call，只要批内含可执行
+  的外部读取，执行前先整体分类并整批拒绝，要求下一轮把一个外部读取单独发起；不能只拦
+  其他调用的执行，因为其 assistant content/arguments 仍会进入历史。单个外部读取执行后，
+  下一次请求的消息重建成最小隔离上下文：仅保留当前 user、去掉 content/arguments 的
+  tool_call 协议壳及 tool result，此前会话、画像派生文本和被拒调用全部不再同屏。
+  `search_endpoints` 也必须独占批次：它会在执行期激活动态端点，预扫描时尚不可解析的
+  同批付费端点否则会在顺序执行中穿透。
+- 飞书追问包装与引用消息在**第一次**模型请求前就已混入外部正文，必须走类型化的
+  `HandleExternalContextMessage`，不能等工具返回后才 taint。该入口从数据访问层就不读画像，
+  首轮即不声明工具，也不加载既有 agent session 历史；即使模型幻觉调用网络、内部读取或
+  写工具，运行时二次门仍固定拒绝。既有历史只在本轮结束后与固定占位重新合并保存，
+  防群聊引用/恶意卡片直接要求复述旧私聊。普通消息与外部上下文的分流由 `AgentRunner`
+  两个独立方法表达，不靠检查正文文案猜测。
+- 含外部结果的整段 user turn 在写入 `agent_sessions` 前压成「原 user + 固定安全占位」，
+  原始结果不留在 `agent_sessions`；仍可能存在于有界的 `tool_calls.result_preview` 与
+  `llm_calls.user_prompt` 审计记录。加载会话时同样清洗部署前存量，防旧网页结果在
+  下一条消息与画像、完整工具面重新同屏。`add_source` 确认执行期的外部 Probe 详情仍展示
+  给用户，但成功与失败写回会话的都是各自固定回执（失败 Message 也可能含页面声明 URL）。
+  外部上下文入口把整段合成 user turn 与模型派生回答
+  一并换成固定占位；旧版追问/引用、带外部标题的反馈回调、中文 add_source Probe 回执
+  在加载时迁移清洗。历史判定不依赖当前工具是否装配或仍在目录中；同时只有出现真实
+  `role=tool` 外部回执才压平，单纯生成 add_source pending 确认卡不误删。清洗完成后，
+  下一条明确用户消息才恢复正常工具面。
 - turn 达 MaxTurns：Reply="这个请求步骤太多，我先停下来了，请把需求拆小一点再试"。
 - 全部 LLM 错误向上抛（feishu 层 humanize）。
 
@@ -254,7 +288,12 @@ Loop 行为细则：
 
 **§8 增补（2026-07-20，Boss 拍板）**：web_search / read_page 解决「临时查一下」被迫
 add_source 的形态（信源固定点反模式——一次性需求不该走订阅设施）。两工具按次计费，
-经 fetcher 层 recordCall 落 tool_calls（SourceID=0 无源口径）；**双重限额**（与端点
+Agent 工具行与 fetcher 上游行共享同一 trace_id/user_id，tenant_id 由 membership 推导；
+普通对话复用本条消息 trace，确认卡执行入口在真实执行前生成独立非空 trace；
+fetcher 层上游行按 `SourceID=0` 无源口径落 tool_calls，归属元数据只在本地 context 传递，
+不得进入 Exa 请求体或请求头；两层旁路记账都脱离调用方取消并重新施加 5 秒 deadline，
+避免取消窗口撕裂双账本或连接池故障无限阻塞；两条路径均不创建
+source/content/content_sources。**双重限额**（与端点
 工具同模板，对抗审查 HIGH 补齐）：单条消息 `agent.exa_msg_cap`（默认 5，消息内计数，
 超限回文案）+ 滚动 24h `agent.exa_daily_cap`（默认 100，从 tool_calls 表按
 tool_name IN ('web_search','read_page') COUNT，排除 invalid_args/budget_exceeded，
@@ -301,5 +340,6 @@ Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的
 - llm/chat_test.go：httptest 断言请求体 tools/messages/tool 消息序列化、tool_calls 解析、Model 覆盖、thinking 缺省不携带。
 - store：DB 门控子测试（agent_sessions CRUD、ClaimPendingAction 幂等/过期）。
 - sourcespec：迁移原 buildSource 全部用例。
-- agent：mock Client？——llm.Client 是具体类型，Loop 依赖收窄：Loop 内部通过 `chatFn func(ctx, llm.ChatRequest) (*llm.ChatResponse, error)` 字段调用（默认包 DoChat），测试注入假实现。覆盖：纯聊天、读工具单轮、写工具确认卡、未知工具自纠、maxTurns 兜底、ExecuteAction 幂等。
+- agent：mock Client？——llm.Client 是具体类型，Loop 依赖收窄：Loop 内部通过 `chatFn func(ctx, llm.ChatRequest) (*llm.ChatResponse, error)` 字段调用（默认包 DoChat），测试注入假实现。覆盖：纯聊天、读工具单轮、写工具确认卡、未知工具自纠、maxTurns 兜底、ExecuteAction 幂等；恶意外部结果必须用真实外部工具分类反向证明画像读取、写 pending action 与 URL/query 上下文外带均被确定性拒绝，并覆盖跨消息、部署前存量会话、外部 Probe 成功/失败回调、本地缓存分页、同批“内部读→外部读→写”乱序及 `search_endpoints+未激活动态端点`；外部上下文测试必须证明首轮零画像读取/零工具/零既有历史、原文零持久化且旧历史保留，add_source 只建 pending 或整批拒绝后重试写工具时不会被误判为已执行外部查询。
+- fetcher：Exa ad-hoc 上游账本必须断言 trace/user 归属与 `source_id=0`，反向断言这些本地归属元数据没有出现在第三方请求体/请求头；取消后的记账 context 仍可用且有 deadline，`statuses[].status=error` 必须在账本标为失败而不是 HTTP 200 成功。
 - feishu：BuildConfirmCard JSON 结构断言；回调 owner 校验单测（能 mock 的部分）。

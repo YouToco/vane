@@ -324,14 +324,51 @@ type BindingCallRecorder interface {
 	RecordBindingCall(ctx context.Context, rec *types.ToolCall)
 }
 
-// bindingTraceKey 从 ctx 取调度运行的 trace（workflow 层塞入，fetcher 不依赖 temporal）。
+// bindingTraceKey / bindingUserIDKey 从 ctx 取本次上游调用的账本归属。
+// workflow 层只塞 trace；Agent ad-hoc 调用同时塞 trace + userID。fetcher 不依赖
+// temporal/agent，store 再由 userID 推导 tenant_id，避免上游账本变成无租户孤儿行。
 type bindingTraceKeyT struct{}
+type bindingUserIDKeyT struct{}
 
 var bindingTraceKey bindingTraceKeyT
+var bindingUserIDKey bindingUserIDKeyT
+
+const bindingRecordTimeout = 5 * time.Second
 
 // WithBindingTrace 把本轮抓取的 trace_id 注入 ctx（Fetch Activity 调用）。
 func WithBindingTrace(ctx context.Context, traceID string) context.Context {
 	return context.WithValue(ctx, bindingTraceKey, traceID)
+}
+
+// WithBindingAttribution 把 Agent 发起的上游调用归到同一会话 trace 与用户。
+// userID 显式必填；tenant_id 不在 fetcher 猜，由 store.InsertToolCall 按 memberships
+// 的唯一规则推导。只作为本地记账元数据，不会被 HTTP 客户端序列化给第三方。
+func WithBindingAttribution(ctx context.Context, traceID string, userID int64) context.Context {
+	ctx = WithBindingTrace(ctx, traceID)
+	return context.WithValue(ctx, bindingUserIDKey, userID)
+}
+
+// BindingAttributionFromContext 读取上游账本归属。hasUser=false 是合法的系统/调度
+// 调用形态；Agent ad-hoc 调用必须为 true。导出是为了让跨包调用方的行为测试能钉住
+// “确实注入了归属”，而不是只测 fetcher 收到归属后会使用。
+func BindingAttributionFromContext(ctx context.Context) (traceID string, userID int64, hasUser bool) {
+	traceID, _ = ctx.Value(bindingTraceKey).(string)
+	userID, hasUser = ctx.Value(bindingUserIDKey).(int64)
+	return traceID, userID, hasUser
+}
+
+func bindingAttribution(ctx context.Context) (traceID string, userID *int64) {
+	traceID, uid, ok := BindingAttributionFromContext(ctx)
+	if ok {
+		userID = &uid
+	}
+	return traceID, userID
+}
+
+// detachedBindingRecordContext 让“已经打到上游”的调用即使随后被调用方取消也能
+// 留下账本，同时重新加 5s 上限，避免裸 WithoutCancel 在连接池故障时无限阻塞。
+func detachedBindingRecordContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), bindingRecordTimeout)
 }
 
 // ────────── 引擎 ──────────
@@ -760,8 +797,9 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 	if b.rec == nil {
 		return
 	}
-	ctx = context.WithoutCancel(ctx)
-	trace, _ := ctx.Value(bindingTraceKey).(string)
+	ctx, cancel := detachedBindingRecordContext(ctx)
+	defer cancel()
+	trace, userID := bindingAttribution(ctx)
 	clean := make(map[string]any, len(params))
 	for k, v := range params {
 		if s, isStr := v.(string); isStr {
@@ -774,6 +812,7 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
+		UserID:       userID,
 		ToolName:     "binding:" + entry.Name,
 		ToolKind:     types.ToolCallKindBindingFetch,
 		EndpointPath: entry.Path,

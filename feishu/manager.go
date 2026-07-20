@@ -31,6 +31,9 @@ import (
 // （agent 不 import feishu，依赖单向）。
 type AgentRunner interface {
 	HandleMessage(ctx context.Context, userID int64, text string) (agent.Outcome, error)
+	// HandleExternalContextMessage 用于已经拼入推送正文/引用消息的输入。它与
+	// 普通用户文本是不同的信任类型，agent 从首轮就关闭画像与工具面。
+	HandleExternalContextMessage(ctx context.Context, userID int64, text string) (agent.Outcome, error)
 	ExecuteAction(ctx context.Context, userID int64, actionID string) (string, error)
 	CancelAction(ctx context.Context, userID int64, actionID string) (string, error)
 }

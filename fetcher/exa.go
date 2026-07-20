@@ -339,11 +339,13 @@ func (e *ExaFetcher) recordCall(ctx context.Context, src types.Source, status in
 	if e.rec == nil {
 		return
 	}
-	ctx = context.WithoutCancel(ctx)
-	trace, _ := ctx.Value(bindingTraceKey).(string)
+	ctx, cancel := detachedBindingRecordContext(ctx)
+	defer cancel()
+	trace, userID := bindingAttribution(ctx)
 	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
+		UserID:       userID,
 		ToolName:     "exa:search",
 		ToolKind:     types.ToolCallKindExaFetch,
 		EndpointPath: "/search",

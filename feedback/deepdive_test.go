@@ -91,10 +91,13 @@ func TestHandleDeepDive_GenerateInsertSendNotify(t *testing.T) {
 	if len(all) != 1 {
 		t.Fatalf("deep_dive 应恰好通告 1 条, 实得 %d: %+v", len(all), all)
 	}
-	for _, want := range []string{"[卡片回调]", "delivery_id=42", "《" + testTitle + "》", "「深度解读」", "长文结果将以新消息送达"} {
+	for _, want := range []string{"[卡片回调]", "delivery_id=42", "「深度解读」", "长文结果将以新消息送达"} {
 		if !strings.Contains(all[0].text, want) {
 			t.Fatalf("通告应含 %q, 实得 %q", want, all[0].text)
 		}
+	}
+	if strings.Contains(all[0].text, testTitle) || strings.Contains(all[0].text, "《") {
+		t.Fatalf("外部标题不得进入 deep_dive 会话通告, 实得 %q", all[0].text)
 	}
 }
 
