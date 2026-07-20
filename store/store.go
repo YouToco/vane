@@ -6,13 +6,15 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Store 持有数据库连接池，是所有数据访问方法的接收者。
 // 零值不可用，必须通过 New 构造。
 type Store struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	beginTx func(context.Context, pgx.TxOptions) (pgx.Tx, error)
 }
 
 // New 解析连接串、建立连接池并做一次连通性检查。
@@ -39,7 +41,7 @@ func New(ctx context.Context, dbURL string) (*Store, error) {
 		return nil, fmt.Errorf("store: 数据库连通性检查: %w", err)
 	}
 
-	return &Store{pool: pool}, nil
+	return &Store{pool: pool, beginTx: pool.BeginTx}, nil
 }
 
 // Ping 检查数据库连通性，供 /readyz 就绪探针使用。

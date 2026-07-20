@@ -1,0 +1,310 @@
+package store
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/YouToco/vane/types"
+)
+
+const compiledTaskRollbackTimeout = 5 * time.Second
+
+// compiledFetchPlan 是 schedule_playbooks.fetch_plan 在数据边界上的最小稳定形态。
+// agent 包拥有编译过程；store 不反向依赖 agent，只消费其持久化 wire contract。
+type compiledFetchPlan struct {
+	Sources []compiledPlanSource `json:"sources"`
+}
+
+type compiledPlanSource struct {
+	Platform   string          `json:"platform"`
+	Capability string          `json:"capability"`
+	Title      string          `json:"title,omitempty"`
+	URL        string          `json:"url"`
+	Config     json.RawMessage `json:"config,omitempty"`
+}
+
+// InsertPausedCompiledTaskDefinition 原子写入一份已编译的稳定监控任务。
+//
+// Temporal 前置条件：同 TaskID 的 Schedule 已存在，且调用方刚通过 Describe 确认它仍
+// paused。A-2 刻意不接 Temporal，也不接受一个可伪造的 paused 布尔值；A-3 将提供创建、
+// Describe 与指纹核对原语。这里把 Postgres 镜像状态硬编码为 paused，绝不激活任务。
+//
+// fetch_plan 是任务源集合的唯一真相源：本方法从计划材料化全局 sources，再写出精确相等的
+// schedule_sources 集合并在提交前反向核对。命中既有 URL 只引用原行，绝不覆盖其元数据或
+// 抓取状态，也不会创建 subscriptions。TaskID 冲突返回 CodeConflict，且不会采用或改写
+// 原聚合；digest/adopt/任务上限及生产接线属于后续 saga。
+//
+// Commit 返回错误时本方法会用独立短 context 尝试 Rollback 并把错误上抛。若错误来自网络
+// 断连，服务端是否已经提交可能不可判定；该“ambiguous commit”只能由 A-3～A-5 的确定性
+// TaskID、冲突采用与 reconcile 收敛，A-2 不做无法兑现的跨系统确定性承诺。
+func (s *Store) InsertPausedCompiledTaskDefinition(
+	ctx context.Context,
+	def types.PausedCompiledTaskDefinition,
+) error {
+	plan, err := validatePausedCompiledTaskDefinition(def)
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("开始写入编译任务事务（task_id=%s）", def.TaskID), err)
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+
+	if err := lockValidMembership(ctx, tx, def.TenantID, def.UserID); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO schedules
+			(id, tenant_id, user_id, nl_description, spec_json, scope_json, status, push_strictness)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		def.TaskID, def.TenantID, def.UserID, def.NLDescription,
+		[]byte(def.SpecJSON), []byte(def.ScopeJSON),
+		types.ScheduleStatusPaused, nullableStrictness(def.Strictness)); err != nil {
+		if isUniqueViolation(err) {
+			return types.NewAppError(types.CodeConflict,
+				fmt.Sprintf("任务 id=%s 已存在", def.TaskID), err)
+		}
+		return compiledTaskDatabaseError("写入 paused 调度镜像", def.TaskID, err)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO schedule_playbooks (schedule_id, content, fetch_plan)
+		 VALUES ($1, $2, $3)`,
+		def.TaskID, def.PlaybookContent, []byte(def.FetchPlan)); err != nil {
+		return compiledTaskDatabaseError("写入任务手册与抓取计划", def.TaskID, err)
+	}
+
+	sourceIDs := make([]int64, 0, len(plan.Sources))
+	planURLs := make([]string, 0, len(plan.Sources))
+	for _, planned := range plan.Sources {
+		sourceID, err := getOrCreateCompiledPlanSource(ctx, tx, planned)
+		if err != nil {
+			return compiledTaskDatabaseError(
+				fmt.Sprintf("材料化计划信源（url=%s）", planned.URL), def.TaskID, err)
+		}
+		sourceIDs = append(sourceIDs, sourceID)
+		planURLs = append(planURLs, planned.URL)
+	}
+
+	for _, sourceID := range sourceIDs {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO schedule_sources (schedule_id, source_id) VALUES ($1, $2)`,
+			def.TaskID, sourceID); err != nil {
+			return compiledTaskDatabaseError("写入任务信源链接", def.TaskID, err)
+		}
+	}
+
+	exact, err := compiledPlanLinksExact(ctx, tx, def.TaskID, planURLs)
+	if err != nil {
+		return compiledTaskDatabaseError("核对抓取计划与任务信源链接", def.TaskID, err)
+	}
+	if !exact {
+		return types.NewAppError(types.CodeInternal,
+			fmt.Sprintf("抓取计划与任务信源链接不一致（task_id=%s）", def.TaskID), nil)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return compiledTaskDatabaseError("提交编译任务事务", def.TaskID, err)
+	}
+	return nil
+}
+
+func validatePausedCompiledTaskDefinition(
+	def types.PausedCompiledTaskDefinition,
+) (*compiledFetchPlan, error) {
+	if strings.TrimSpace(def.TaskID) == "" || strings.TrimSpace(def.TaskID) != def.TaskID {
+		return nil, compiledTaskValidationError("task_id 必须是无首尾空白的非空字符串", nil)
+	}
+	if def.TenantID <= 0 {
+		return nil, compiledTaskValidationError("tenant_id 必须为正整数", nil)
+	}
+	if def.UserID <= 0 {
+		return nil, compiledTaskValidationError("user_id 必须为正整数", nil)
+	}
+	if err := validateJSONObject(def.SpecJSON, "spec_json"); err != nil {
+		return nil, err
+	}
+	if err := validateJSONObject(def.ScopeJSON, "scope_json"); err != nil {
+		return nil, err
+	}
+	if def.Strictness != "" && !def.Strictness.Valid() {
+		return nil, compiledTaskValidationError(
+			"push_strictness 必须为空（未设置）或 loose、normal、strict", nil)
+	}
+
+	raw := bytes.TrimSpace(def.FetchPlan)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil, compiledTaskValidationError("fetch_plan 不得缺失或为 null", nil)
+	}
+	var plan *compiledFetchPlan
+	if err := json.Unmarshal(raw, &plan); err != nil {
+		return nil, compiledTaskValidationError("fetch_plan 必须是合法 JSON 对象", err)
+	}
+	if plan == nil || len(plan.Sources) == 0 {
+		return nil, compiledTaskValidationError("fetch_plan.sources 不得缺失、为 null 或为空", nil)
+	}
+
+	seenURLs := make(map[string]struct{}, len(plan.Sources))
+	for i := range plan.Sources {
+		src := &plan.Sources[i]
+		if strings.TrimSpace(src.Platform) == "" || strings.TrimSpace(src.Platform) != src.Platform {
+			return nil, compiledTaskValidationError(
+				fmt.Sprintf("fetch_plan.sources[%d].platform 必须是无首尾空白的非空字符串", i), nil)
+		}
+		if strings.TrimSpace(src.Capability) == "" || strings.TrimSpace(src.Capability) != src.Capability {
+			return nil, compiledTaskValidationError(
+				fmt.Sprintf("fetch_plan.sources[%d].capability 必须是无首尾空白的非空字符串", i), nil)
+		}
+		if strings.TrimSpace(src.URL) == "" || strings.TrimSpace(src.URL) != src.URL {
+			return nil, compiledTaskValidationError(
+				fmt.Sprintf("fetch_plan.sources[%d].url 必须是无首尾空白的非空字符串", i), nil)
+		}
+		if _, duplicate := seenURLs[src.URL]; duplicate {
+			return nil, compiledTaskValidationError(
+				fmt.Sprintf("fetch_plan 含重复 URL：%s", src.URL), nil)
+		}
+		seenURLs[src.URL] = struct{}{}
+
+		if len(bytes.TrimSpace(src.Config)) == 0 {
+			src.Config = json.RawMessage("{}")
+			continue
+		}
+		if err := validateJSONObject(src.Config,
+			fmt.Sprintf("fetch_plan.sources[%d].config", i)); err != nil {
+			return nil, err
+		}
+	}
+	return plan, nil
+}
+
+func validateJSONObject(raw json.RawMessage, field string) error {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return compiledTaskValidationError(field+" 必须是非 null JSON 对象", nil)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return compiledTaskValidationError(field+" 必须是合法 JSON 对象", err)
+	}
+	if object == nil {
+		return compiledTaskValidationError(field+" 必须是非 null JSON 对象", nil)
+	}
+	return nil
+}
+
+func lockValidMembership(ctx context.Context, tx pgx.Tx, tenantID, userID int64) error {
+	var valid bool
+	err := tx.QueryRow(ctx,
+		`SELECT true
+		   FROM memberships m
+		   JOIN tenants t ON t.id = m.tenant_id
+		  WHERE m.tenant_id = $1
+		    AND m.user_id = $2
+		    AND t.status = 'active'
+		    AND t.deleted_at IS NULL
+		  FOR SHARE OF m, t`,
+		tenantID, userID).Scan(&valid)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return compiledTaskValidationError(
+				fmt.Sprintf("tenant_id=%d 与 user_id=%d 不构成有效成员关系", tenantID, userID), nil)
+		}
+		return types.NewAppError(types.CodeDatabase, "锁定并校验租户成员关系", err)
+	}
+	if !valid {
+		return compiledTaskValidationError(
+			fmt.Sprintf("tenant_id=%d 与 user_id=%d 不构成有效成员关系", tenantID, userID), nil)
+	}
+	return nil
+}
+
+func getOrCreateCompiledPlanSource(
+	ctx context.Context,
+	tx pgx.Tx,
+	src compiledPlanSource,
+) (int64, error) {
+	var id int64
+	err := tx.QueryRow(ctx,
+		`INSERT INTO sources (platform, capability, url, title, config)
+		 VALUES ($1, $2, $3, $4, $5)
+		 ON CONFLICT (url) DO NOTHING
+		 RETURNING id`,
+		src.Platform, src.Capability, src.URL, src.Title, []byte(src.Config)).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, err
+	}
+
+	// 同 URL 已存在：只取 id，不更新任何全局源字段或抓取状态。
+	if err := tx.QueryRow(ctx, `SELECT id FROM sources WHERE url = $1`, src.URL).Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func compiledPlanLinksExact(
+	ctx context.Context,
+	tx pgx.Tx,
+	taskID string,
+	planURLs []string,
+) (bool, error) {
+	var exact bool
+	err := tx.QueryRow(ctx,
+		`SELECT
+		    (SELECT count(*) FROM schedule_sources WHERE schedule_id = $1)
+		      = cardinality($2::text[])
+		    AND NOT EXISTS (
+		        (SELECT planned_url FROM unnest($2::text[]) AS planned(planned_url))
+		        EXCEPT
+		        (SELECT s.url
+		           FROM schedule_sources ss
+		           JOIN sources s ON s.id = ss.source_id
+		          WHERE ss.schedule_id = $1)
+		    )
+		    AND NOT EXISTS (
+		        (SELECT s.url
+		           FROM schedule_sources ss
+		           JOIN sources s ON s.id = ss.source_id
+		          WHERE ss.schedule_id = $1)
+		        EXCEPT
+		        (SELECT planned_url FROM unnest($2::text[]) AS planned(planned_url))
+		    )`,
+		taskID, planURLs).Scan(&exact)
+	return exact, err
+}
+
+func rollbackCompiledTaskTx(parent context.Context, tx pgx.Tx) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), compiledTaskRollbackTimeout)
+	defer cancel()
+	_ = tx.Rollback(ctx)
+}
+
+func nullableStrictness(strictness types.PushStrictness) *string {
+	if strictness == "" {
+		return nil
+	}
+	value := string(strictness)
+	return &value
+}
+
+func compiledTaskValidationError(message string, cause error) error {
+	return types.NewAppError(types.CodeValidation, message, cause)
+}
+
+func compiledTaskDatabaseError(action, taskID string, cause error) error {
+	return types.NewAppError(types.CodeDatabase,
+		fmt.Sprintf("%s（task_id=%s）", action, taskID), cause)
+}
