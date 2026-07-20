@@ -1,5 +1,11 @@
-// cmd/gate 是 Gate / CI 的一键探针入口：把 M5 契约 §16 的服务端探针跑一遍，
-// 人话表格或 JSON 输出，红灯以退出码 1 阻断流水线。
+// cmd/gate 是 Gate 探针的命令行入口：把 M5 契约 §16 的服务端探针跑一遍，
+// 人话表格或 JSON 输出。定位是**部署验证与红灯后的人工深查工具**——日常告警
+// 由服务内 probewatch 承担（每日 01:30 UTC + 每次启动后 3 分钟自动跑，红灯发
+// 飞书卡），本工具是人主动来查时用的。
+//
+// 退出码 1 供脚本判红。注意：deploy CI 目前只分发本二进制、并不执行它（红灯
+// **不会**阻断部署）——要不要接线是部署语义决策（接了 = 部署后有红灯就挡住
+// 流水线），拍板前本注释如实记录现状，不许诺没接的行为。
 //
 // 为什么走 DB 直连（store.New）而不打 /api/admin/observability：
 // post-deploy 在 VPS 上执行，本来就有库权限（与 vane.service 同宿主、同 VANE_DB_URL），
@@ -11,10 +17,11 @@
 //
 // 用法：
 //
-//	gate                    # 24h 窗口，人话输出
-//	gate -window 48h        # 契约 §16 要求部署当天与次日复跑，跨天时放宽窗口
-//	gate -json              # JSON 输出（stdout 只有 JSON，可直接 | jq）
-//	gate -user 1            # 显式指定 userID，跳过 owner 解析（全程零写入）
+//	gate                            # 24h 窗口，人话输出
+//	gate -env /opt/vane/.env        # 先从 env 文件补齐环境变量（VPS 上手动跑的标配）
+//	gate -window 48h                # 契约 §16 要求部署当天与次日复跑，跨天时放宽窗口
+//	gate -json                      # JSON 输出（stdout 只有 JSON，可直接 | jq）
+//	gate -user 1                    # 显式指定 userID，跳过 owner 解析（全程零写入）
 //
 // 退出码：0 = 全绿或仅有黄；1 = 有红（按契约回滚排查）；2 = 工具自身没跑起来
 // （配置 / 连库 / 查询失败）。2 与 1 刻意分开：红是产品坏了，2 是探针坏了，
@@ -61,7 +68,16 @@ func run() int {
 	window := flag.Duration("window", probe.DefaultWindow, "统计窗口（如 24h、48h）；<=0 时回退默认 24h")
 	asJSON := flag.Bool("json", false, "输出 JSON 而非人话表格（stdout 只含 JSON）")
 	userID := flag.Int64("user", 0, "显式指定 userID，跳过 owner 解析；0 表示解析 owner")
+	envFile := flag.String("env", "", "先从该 env 文件（KEY=VALUE）补齐缺失的环境变量，如 /opt/vane/.env")
 	flag.Parse()
+
+	if *envFile != "" {
+		if err := loadEnvFile(*envFile); err != nil {
+			// 路径是操作者刚敲的参数，不算敏感，直接说清哪里没读到。
+			fmt.Fprintf(os.Stderr, "gate: 读取 env 文件失败（%s）：%v\n", *envFile, err)
+			return exitFailure
+		}
+	}
 
 	// path 传空：与 cmd/server 同一套来源与优先级（./config.yaml →
 	// /opt/vane/config/config.yaml → VANE_ 环境变量覆盖）。刻意不自己 os.Getenv：
@@ -129,6 +145,42 @@ func run() int {
 		return exitRed
 	}
 	return exitOK
+}
+
+// loadEnvFile 把 KEY=VALUE 形式的 env 文件补进进程环境（已存在的变量不覆盖——
+// 显式 export 的值优先于文件）。存在的意义：VPS 上手动跑 gate 时环境是裸 shell，
+// 而 /opt/vane/.env 混有 CRLF（生产实锤），`source` 会把 `\r` 带进值里报
+// 莫名其妙的连接错误，systemd 的 EnvironmentFile 容忍它、shell 不容忍——
+// 本函数按 systemd 的宽松度解析：剥 CRLF、跳过注释与空行、剥一层对称引号。
+func loadEnvFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue // 与 systemd 一致：解析不出的行跳过，不因一行坏格式拒绝整个文件
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		if len(val) >= 2 && (val[0] == '"' || val[0] == '\'') && val[len(val)-1] == val[0] {
+			val = val[1 : len(val)-1]
+		}
+		if key == "" {
+			continue
+		}
+		if _, exists := os.LookupEnv(key); !exists {
+			if err := os.Setenv(key, val); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // initLogger 与 cmd/server 同构，但输出到 stderr 而非 stdout：

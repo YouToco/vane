@@ -28,6 +28,27 @@ type ScoreTraceStat struct {
 	// 而 M3 的真实形状（整批逐字节相同的 "50"）依然 distinct=1。
 	DistinctCompletions int       `json:"distinct_completions"`
 	StartedAt           time.Time `json:"started_at"`
+	// MinCompletion 是该批 completion 的字典序最小值（原始文本）。
+	// DistinctCompletions==1 时它就是整批唯一的输出——§16.1 良性同分判别
+	// （2026-07-20 修订）只在该前提下消费它，其余场景仅供展示。
+	MinCompletion string `json:"min_completion"`
+	// MaxCompletionTokens 是该批 completion_tokens 的最大值。用途同上：
+	// 区分"干净的单数字回答"（1-2 token）与 M3 形状（思维链吃满预算，tokens 反而高）。
+	MaxCompletionTokens int `json:"max_completion_tokens"`
+}
+
+// ScoreLivenessStat 是"高分存在性"统计（探针 §16.8，2026-07-20 新增）。
+//
+// 它是 §16.1 良性同分判别的 cover property：§16.1 把「整批同一低分」判为良性
+// 依赖一个假设——打分器仍能对相关内容给出高分。若 prompt 坏掉致模型恒输出低分，
+// §16.1 会把每一批都判成"良性"，而本探针在窗口内找不到任何一条高于"不该推"档
+// 的输出，就会把这个假设的破裂变成红灯（vacuous pass 的规定解法：
+// 给"所有 X 满足 P"配一条"至少存在一个 X"）。
+type ScoreLivenessStat struct {
+	// Parsable 是窗口内 completion 含数字的成功打分数（与 ListScoreDistribution 同口径）。
+	Parsable int `json:"parsable"`
+	// AboveFloor 是解析分高于"不该推"语义档（>20）的条数。
+	AboveFloor int `json:"above_floor"`
 }
 
 // ScoreQualityStat 是打分质量的窗口统计（探针 ②③）。

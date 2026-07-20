@@ -73,6 +73,9 @@ func (f *fakeProbeStore) GetScoreQualityStat(context.Context, time.Time) (types.
 func (f *fakeProbeStore) ListScoreDistribution(context.Context, time.Time) ([]types.ScoreBucket, error) {
 	return nil, nil
 }
+func (f *fakeProbeStore) GetScoreLivenessStat(context.Context, time.Time, int) (types.ScoreLivenessStat, error) {
+	return types.ScoreLivenessStat{}, nil
+}
 func (f *fakeProbeStore) GetProfileInjectionStat(context.Context, time.Time) (types.ProfileInjectionStat, error) {
 	return types.ProfileInjectionStat{}, nil
 }
@@ -109,6 +112,31 @@ type fakeOwner struct{ openID string }
 
 func (f *fakeOwner) OwnerOpenID() string { return f.openID }
 
+// fakeFPStore 是 fingerprintStore 的替身：fp 模拟落盘值（migration 027 的单行表），
+// getErr/setErr 注入读写失败验证 best-effort 降级。
+type fakeFPStore struct {
+	fp       string
+	getErr   error
+	setErr   error
+	setCalls []string // 记录每次写入，断言复位（""）与成功指纹都真的落了盘
+}
+
+func (f *fakeFPStore) GetProbewatchFingerprint(context.Context) (string, error) {
+	if f.getErr != nil {
+		return "", f.getErr
+	}
+	return f.fp, nil
+}
+
+func (f *fakeFPStore) SetProbewatchFingerprint(_ context.Context, fp string) error {
+	f.setCalls = append(f.setCalls, fp)
+	if f.setErr != nil {
+		return f.setErr
+	}
+	f.fp = fp
+	return nil
+}
+
 type fakePusher struct {
 	cards []string
 	err   error
@@ -128,7 +156,13 @@ func redQuality() types.ScoreQualityStat {
 }
 
 func newTestWatcher(st probe.Store, pr principalSource, owner ownerOpenIDProvider, push cardPusher) *probeWatcher {
-	return newProbeWatcher(st, pr, owner, push, func(md string) string { return md })
+	return newProbeWatcher(st, &fakeFPStore{}, pr, owner, push, func(md string) string { return md })
+}
+
+// newTestWatcherFP 同上但共享外部指纹盘——模拟重启（新 watcher、旧盘）的用例用它。
+func newTestWatcherFP(st probe.Store, fps fingerprintStore, push cardPusher) *probeWatcher {
+	return newProbeWatcher(st, fps, &fakePrincipal{}, &fakeOwner{openID: "ou_x"}, push,
+		func(md string) string { return md })
 }
 
 func TestRunOnceRedAlertsOnceUntilChange(t *testing.T) {
@@ -249,11 +283,94 @@ func TestRunOncePushFailureRetriesNextRound(t *testing.T) {
 	}
 }
 
-// 编译期钉死生产装配的接口匹配（零运行时成本）：*store.Store 满足 probe.Store，
-// *feishu.Manager / *pusher.Pusher / auth resolver 满足本文件的窄接口。
-// 装配点在 main.go 的 go 语句里，不匹配要到改 main 时才炸；这里让测试编译先炸。
+// ---------- 指纹落盘（migration 027，探针实现债 P2） ----------
+
+// 落盘的核心承诺：同一红灯集合跨重启不重发。2026-07-19 一天 6 次部署对同一
+// §16.1 红灯重发 5 张卡——修的就是这个。用两个 watcher 共享同一块"盘"模拟重启。
+func TestFingerprintPersistsAcrossRestart(t *testing.T) {
+	fps := &fakeFPStore{}
+	push := &fakePusher{}
+	pw1 := newTestWatcherFP(&fakeProbeStore{quality: redQuality()}, fps, push)
+	pw1.runOnce(context.Background())
+	if len(push.cards) != 1 {
+		t.Fatalf("首轮红灯应发 1 张卡，实发 %d", len(push.cards))
+	}
+	if fps.fp == "" {
+		t.Fatal("发送成功后指纹应已落盘")
+	}
+
+	// "重启"：新 watcher（进程内存清零），同一块盘、同一红灯集合。
+	pw2 := newTestWatcherFP(&fakeProbeStore{quality: redQuality()}, fps, push)
+	pw2.runOnce(context.Background())
+	if len(push.cards) != 1 {
+		t.Fatalf("重启后同一红灯集合不应重发（落盘去重），实发 %d 张", len(push.cards))
+	}
+
+	// 但红灯集合变化时（新故障）照发——「部署后复跑」的告警语义保留。
+	pw3 := newTestWatcherFP(&fakeProbeStore{failListTraces: errors.New("db down")}, fps, push)
+	pw3.runOnce(context.Background())
+	if len(push.cards) != 2 {
+		t.Fatalf("重启后新故障指纹不同，应告警，实发 %d 张", len(push.cards))
+	}
+}
+
+// 转绿必须把复位（空串）也写穿到盘上：只清内存的话，重启后盘上还是旧红灯指纹，
+// "红→绿→重启→又红（同一条）"会被误去重成静默。
+func TestFingerprintResetPersisted(t *testing.T) {
+	fps := &fakeFPStore{}
+	push := &fakePusher{}
+	st := &fakeProbeStore{quality: redQuality()}
+	pw := newTestWatcherFP(st, fps, push)
+	pw.runOnce(context.Background())
+	if fps.fp == "" {
+		t.Fatal("前置：红灯指纹应已落盘")
+	}
+
+	st.quality = types.ScoreQualityStat{OKTotal: 10}
+	pw.runOnce(context.Background())
+	if fps.fp != "" {
+		t.Fatalf("转绿后盘上指纹应复位为空串，实际 %q", fps.fp)
+	}
+	if len(fps.setCalls) != 2 || fps.setCalls[1] != "" {
+		t.Fatalf("复位应真的写盘（第二次 Set 为空串），实际写入序列 %v", fps.setCalls)
+	}
+}
+
+// 读盘失败按"没告警过"降级：宁可对现存红灯多发一张，不能让指纹读不到挡住告警。
+func TestFingerprintLoadFailureFailsOpen(t *testing.T) {
+	fps := &fakeFPStore{fp: "red:empty_completion", getErr: errors.New("db flaky")}
+	push := &fakePusher{}
+	pw := newTestWatcherFP(&fakeProbeStore{quality: redQuality()}, fps, push)
+	pw.runOnce(context.Background())
+	if len(push.cards) != 1 {
+		t.Fatalf("读盘失败应按空指纹继续并发卡，实发 %d 张", len(push.cards))
+	}
+}
+
+// 写盘失败不影响本轮：内存指纹仍生效（本进程内不重发），代价只是重启后可能多发一张。
+func TestFingerprintSaveFailureDoesNotBlock(t *testing.T) {
+	fps := &fakeFPStore{setErr: errors.New("disk full")}
+	push := &fakePusher{}
+	pw := newTestWatcherFP(&fakeProbeStore{quality: redQuality()}, fps, push)
+	pw.runOnce(context.Background())
+	if len(push.cards) != 1 {
+		t.Fatalf("写盘失败不应挡发卡，实发 %d 张", len(push.cards))
+	}
+	if pw.lastFingerprint == "" {
+		t.Fatal("写盘失败时内存指纹仍应更新（本进程内去重不受影响）")
+	}
+	pw.runOnce(context.Background())
+	if len(push.cards) != 1 {
+		t.Fatalf("内存指纹仍应挡住本进程内重发，实发 %d 张", len(push.cards))
+	}
+}
+
+// 编译期钉死生产装配的接口匹配（零运行时成本）：*store.Store 满足 probe.Store
+// 与 fingerprintStore，*feishu.Manager / *pusher.Pusher / auth resolver 满足本文件
+// 的窄接口。装配点在 main.go 的 go 语句里，不匹配要到改 main 时才炸；这里让测试编译先炸。
 var (
 	_ probe.Store         = (*store.Store)(nil)
+	_ fingerprintStore    = (*store.Store)(nil)
 	_ ownerOpenIDProvider = (*feishu.Manager)(nil)
 	_ cardPusher          = (*pusher.Pusher)(nil)
 )

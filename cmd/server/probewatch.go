@@ -59,25 +59,41 @@ type cardPusher interface {
 	Push(ctx context.Context, ownerOpenID, cardJSON string) (string, error)
 }
 
+// fingerprintStore 是告警指纹的持久化面（生产实现 *store.Store，migration 027）。
+// 与 probe.Store 分开注入而非合并成大接口：巡检的"读指标"与"记告警状态"是两个
+// 独立职责，测试时经常只想替换其中一个。
+type fingerprintStore interface {
+	GetProbewatchFingerprint(ctx context.Context) (string, error)
+	SetProbewatchFingerprint(ctx context.Context, fp string) error
+}
+
 // probeWatcher 持有巡检所需的窄依赖。字段全部接口/函数，便于单测注入替身
 // （与 workflow.Activities 的依赖收窄同一约定）。
 type probeWatcher struct {
 	st        probe.Store
+	fps       fingerprintStore
 	principal principalSource
 	owner     ownerOpenIDProvider
 	push      cardPusher
 	buildCard func(markdown string) string
 
-	// lastFingerprint 是进程内的告警去重指纹：相同红灯集合（或持续的探针故障）
-	// 只在首次出现时发卡，恢复（非红）时清空，让"红→绿→又红"再次告警。
-	// 刻意不持久化：重启后首轮会对当前红灯重新告警一次——这不是缺陷，恰是契约
-	// §16"部署后复跑探针"的行为化（每次部署后把现存红灯重新摆到 owner 面前）。
+	// lastFingerprint 是告警去重指纹：相同红灯集合（或持续的探针故障）只在首次
+	// 出现时发卡，恢复（非红）时清空，让"红→绿→又红"再次告警。
+	//
+	// 持久化语义（2026-07-20 修订，探针实现债 P2）：发送成功/复位时写库，首轮
+	// 巡检前从库惰性加载——同一红灯集合跨重启不再重发（修订前指纹只在进程内存，
+	// 红灯存续期间每次部署重启都重发一张同内容卡，2026-07-19 一天 6 次部署
+	// 5 张同卡的生产实锤）。「部署后复跑」保留：启动后 3 分钟那轮照跑，红灯集合
+	// **变化**时（新红灯出现、红灯换了一批）照发。读写都是 best-effort：
+	// 读失败按空串处理（宁可多发一张也不漏发），写失败只记日志（下轮至多重发一张）。
 	lastFingerprint string
+	// fpLoaded 标记 lastFingerprint 是否已从库加载过。单 goroutine 顺序消费，无需锁。
+	fpLoaded bool
 }
 
-func newProbeWatcher(st probe.Store, principal principalSource, owner ownerOpenIDProvider,
-	push cardPusher, buildCard func(string) string) *probeWatcher {
-	return &probeWatcher{st: st, principal: principal, owner: owner, push: push, buildCard: buildCard}
+func newProbeWatcher(st probe.Store, fps fingerprintStore, principal principalSource,
+	owner ownerOpenIDProvider, push cardPusher, buildCard func(string) string) *probeWatcher {
+	return &probeWatcher{st: st, fps: fps, principal: principal, owner: owner, push: push, buildCard: buildCard}
 }
 
 // run 阻塞循环：启动延迟后跑首轮，此后每天 probeDailyHourUTC:probeDailyMinuteUTC 跑一轮，
@@ -122,6 +138,8 @@ func (pw *probeWatcher) runOnce(ctx context.Context) {
 	rctx, cancel := context.WithTimeout(ctx, probeRunTimeout)
 	defer cancel()
 
+	pw.loadFingerprintOnce(rctx)
+
 	openID := pw.owner.OwnerOpenID()
 	if openID == "" {
 		slog.Info("probewatch: 尚未捕获 owner，本轮巡检跳过（飞书向导完成后自动恢复）")
@@ -151,6 +169,7 @@ func (pw *probeWatcher) runOnce(ctx context.Context) {
 	if len(reds) == 0 {
 		if pw.lastFingerprint != "" {
 			slog.Info("probewatch: 红灯已清除，告警指纹复位", "worst", rep.Worst())
+			pw.storeFingerprint(ctx, "")
 		}
 		pw.lastFingerprint = ""
 		slog.Info("probewatch: 巡检完成，无红灯", "worst", rep.Worst())
@@ -187,6 +206,31 @@ func (pw *probeWatcher) alert(ctx context.Context, openID, fingerprint, markdown
 	// 去飞书搜卡。巡检自身必须可观测——这行日志就是首轮巡检的存在证明。
 	slog.Info("probewatch: 告警卡已发送", "fingerprint", fingerprint)
 	pw.lastFingerprint = fingerprint
+	pw.storeFingerprint(ctx, fingerprint)
+}
+
+// loadFingerprintOnce 首轮巡检前从库加载指纹（进程生命周期内只加载一次）。
+// 读失败按空串继续：空串语义是"没告警过"，最坏结果是对现存红灯多发一张卡——
+// 与漏发相比是安全的方向；且此时库多半有更大的问题，探针查询自己会报出来。
+func (pw *probeWatcher) loadFingerprintOnce(ctx context.Context) {
+	if pw.fpLoaded {
+		return
+	}
+	pw.fpLoaded = true
+	fp, err := pw.fps.GetProbewatchFingerprint(ctx)
+	if err != nil {
+		slog.Warn("probewatch: 读取落盘指纹失败，按未告警过处理", "err", err)
+		return
+	}
+	pw.lastFingerprint = fp
+}
+
+// storeFingerprint 把指纹写库（best-effort）。写失败只记日志不影响本轮结果：
+// 内存里的指纹仍然有效，代价只是下次重启后可能对同一红灯多发一张卡。
+func (pw *probeWatcher) storeFingerprint(ctx context.Context, fp string) {
+	if err := pw.fps.SetProbewatchFingerprint(ctx, fp); err != nil {
+		slog.Warn("probewatch: 落盘告警指纹失败（重启后可能重发一张卡）", "err", err)
+	}
 }
 
 // renderProbeAlert 渲染红灯告警卡正文。只放 Summary 不放 Detail：Detail 是排查手册
@@ -197,7 +241,8 @@ func renderProbeAlert(reds []probe.Result) string {
 	for _, r := range reds {
 		fmt.Fprintf(&b, "\n**%s**（%s）\n%s\n", r.Name, r.ContractRef, r.Summary)
 	}
-	b.WriteString("\n红灯按 M5 契约 §16 处置；完整报告见管理后台可观测页，或 SSH 跑 /opt/vane/bin/gate。")
+	b.WriteString("\n红灯按 M5 契约 §16 处置；完整报告见管理后台可观测页，" +
+		"或 SSH 跑 /opt/vane/bin/gate -env /opt/vane/.env。")
 	return b.String()
 }
 
