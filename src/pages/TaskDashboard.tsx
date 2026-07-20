@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { api } from "../api";
 import type { Schedule, ScheduleSpec } from "../api";
 import { fmt, useI18n, type Dict } from "@/i18n";
+import { fmtBeijing } from "@/lib/time";
 
 // describeSpec 的 i18n 版：文案走字典（admin 的 Schedules.tsx 保留原中文版，
 // 那是平台 owner 专用页；这里是用户面，必须随语言走）。
@@ -74,7 +75,7 @@ function TaskCard({ task }: { task: Schedule }) {
           <div className="flex items-center gap-1 mt-3 text-xs text-muted-foreground">
             <Clock className="size-3" />
             {t.app.tasks.nextRun}{" "}
-            {new Date(task.next_run).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}
+            {fmtBeijing(task.next_run)}
           </div>
         )}
       </CardContent>

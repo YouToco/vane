@@ -5,18 +5,11 @@ import { Badge } from "@/components/ui/badge";
 import { api } from "../api";
 import type { DeliveryHistoryItem } from "../api";
 import { useI18n } from "@/i18n";
+import { BEIJING_TZ, fmtBeijing } from "@/lib/time";
 
-const BEIJING_TZ = "Asia/Shanghai";
 // 后端 parseHistoryQuery 规定 page_size ∈ [1,100]，越界直接 400。
 // 这里取满 100：既是「今日推送」计数能拿到的最大窗口，也是合法上限。
 const RECENT_WINDOW = 100;
-
-function fmtBeijing(iso?: string | null): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "";
-  return d.toLocaleString("zh-CN", { timeZone: BEIJING_TZ, hour12: false });
-}
 
 // 判定「今天」用北京时区的日历日，而不是 UTC 或浏览器本地时区：
 // 推送记录页展示的就是北京时间，两处口径必须一致，否则用户会看到

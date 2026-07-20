@@ -21,17 +21,9 @@ import {
 } from "@/components/ui/tooltip";
 import { RefreshCw, Loader2, ExternalLink } from "lucide-react";
 import { fmt, useI18n, type Dict } from "@/i18n";
+import { fmtBeijing } from "@/lib/time";
 
 const PAGE_SIZE = 20;
-
-const BEIJING_TZ = "Asia/Shanghai";
-
-function fmtBeijing(iso?: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleString("zh-CN", { timeZone: BEIJING_TZ, hour12: false });
-}
 
 function statusBadge(status: string): "destructive" | "secondary" | "outline" {
   if (status === "failed" || status === "pending") return "destructive";

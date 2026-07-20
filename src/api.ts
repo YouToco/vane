@@ -296,6 +296,29 @@ export interface Profile {
   updated_at: string;
 }
 
+// ---- 平台管理：邀请码 ----
+// 字段逐字对齐后端 api/invites.go 的 DTO（vane#104 的接口文档）。这不是
+// types.Invite 直出：used/expired 是**服务端按其口径算好的状态**——
+// used = 用满（used_count >= max_uses，多用码部分使用时为 false）、
+// expired 按服务端当前时刻算——前端不要自己从 used_count/expires_at 重算，
+// 两边口径漂移时以服务端为准。
+//
+// omitempty 语义（别补默认值，缺席本身是信息）：
+//   expires_at 缺席 = 永不过期（useradmin CLI 可发这种码；网页签发恒 7 天）；
+//   used_by / used_at 是最近一次消费租户的 owner 邮箱与时刻，未消费、或
+//   owner 是纯飞书用户（无邮箱）时缺席。
+export interface Invite {
+  code: string;
+  created_at: string; // UTC
+  expires_at?: string; // UTC
+  max_uses: number;
+  used_count: number;
+  used: boolean;
+  expired: boolean;
+  used_by?: string;
+  used_at?: string; // UTC
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -487,4 +510,22 @@ export const api = {
       tags: arr(p.tags),
       removed_tags: arr(p.removed_tags),
     })),
+
+  // ---- 平台管理：邀请码（requirePlatformOwner 门控，非 owner 一律 404）----
+  // 接口对齐 vane#104（feat/invite-admin-api）的文档，后端未合并前这三个请求
+  // 会 404——Invites.tsx 按普通错误态展示即可，不需要特判。
+  //   GET    /api/admin/invites          → {invites: Invite[]}，created_at 降序；
+  //                                        后端保证空列表是 [] 不是 null，arr 只是零成本防御
+  //   POST   /api/admin/invites → 201    → 新签发的 Invite（无请求体：一次性、7 天有效；
+  //                                        多次使用/自定义有效期是运维特例，留在 useradmin CLI）
+  //   DELETE /api/admin/invites/{code}   → {ok}。只删**从未使用**的码；已使用（含部分
+  //                                        使用的多用码）后端 409——错误文案要如实展示，
+  //                                        「以为码废了、实际还能用」比报错糟糕
+  adminListInvites: () =>
+    request<{ invites: Invite[] }>("/api/admin/invites").then((r) => arr(r.invites)),
+  adminCreateInvite: () => post<Invite>("/api/admin/invites"),
+  adminRevokeInvite: (code: string) =>
+    request<{ ok: boolean }>(`/api/admin/invites/${encodeURIComponent(code)}`, {
+      method: "DELETE",
+    }),
 };

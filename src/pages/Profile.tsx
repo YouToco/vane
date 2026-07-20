@@ -9,15 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Separator } from "@/components/ui/separator";
 import { RefreshCw, Loader2, Tag, FileText, Ban } from "lucide-react";
 import { useI18n } from "@/i18n";
-
-const BEIJING_TZ = "Asia/Shanghai";
-
-function fmtBeijing(iso?: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleString("zh-CN", { timeZone: BEIJING_TZ, hour12: false });
-}
+import { fmtBeijing } from "@/lib/time";
 
 export default function Profile() {
   const { t } = useI18n();

@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
 import type { ReactNode } from "react";
+import { fmtBeijing } from "@/lib/time";
 import { api, ApiError } from "../api";
 import type {
   ObservabilityReport,
@@ -79,15 +80,6 @@ const WORST_META: Record<ProbeStatus, string> = {
   yellow: "有探针未验到——不是通过，请按说明补跑",
   red: "有红线被击穿——按契约应回滚排查",
 };
-
-const BEIJING_TZ = "Asia/Shanghai";
-
-function fmtBeijing(iso?: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleString("zh-CN", { timeZone: BEIJING_TZ, hour12: false });
-}
 
 function fmtUTCDay(iso: string): string {
   const d = new Date(iso);
