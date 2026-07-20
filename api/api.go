@@ -49,6 +49,7 @@ type Scheduler interface {
 type AuthStore interface {
 	RegisterWithInvite(ctx context.Context, email, passwordHash, code string) (*types.User, *types.Tenant, error)
 	GetUserByEmail(ctx context.Context, email string) (*types.User, error)
+	GetUserEmailByID(ctx context.Context, userID int64) (string, error)
 	UpdatePasswordHash(ctx context.Context, userID int64, passwordHash string) error
 	ListMembershipsByUser(ctx context.Context, userID int64) ([]types.Membership, error)
 	InviteUsable(ctx context.Context, code string) (bool, error)

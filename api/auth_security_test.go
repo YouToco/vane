@@ -104,6 +104,20 @@ func (f *fakeAuthStore) GetUserByEmail(_ context.Context, email string) (*types.
 	return u, nil
 }
 
+func (f *fakeAuthStore) GetUserEmailByID(_ context.Context, userID int64) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, u := range f.users {
+		if u.ID == userID {
+			if u.Email != nil {
+				return *u.Email, nil
+			}
+			return "", nil
+		}
+	}
+	return "", types.NewAppError(types.CodeNotFound, "用户不存在", nil)
+}
+
 func (f *fakeAuthStore) UpdatePasswordHash(_ context.Context, userID int64, h string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
