@@ -24,16 +24,17 @@ import (
 
 // fakeStore 是 probe.Store 的测试替身，兼作接线回声位。
 type fakeStore struct {
-	traces  []types.ScoreTraceStat
-	quality types.ScoreQualityStat
-	dist    []types.ScoreBucket
-	inj     types.ProfileInjectionStat
-	neg     types.NegTailStat
-	costs   []types.SpanDayCost
-	models  []types.ModelUsage
-	evolve  types.EvolveCallStat
-	batches []types.PushBatchSummary
-	profile *types.Profile
+	traces   []types.ScoreTraceStat
+	quality  types.ScoreQualityStat
+	dist     []types.ScoreBucket
+	liveness types.ScoreLivenessStat
+	inj      types.ProfileInjectionStat
+	neg      types.NegTailStat
+	costs    []types.SpanDayCost
+	models   []types.ModelUsage
+	evolve   types.EvolveCallStat
+	batches  []types.PushBatchSummary
+	profile  *types.Profile
 
 	// P-A2A（a2a-contract §10）：计数与注入错误位。
 	a2aCount int64
@@ -44,6 +45,7 @@ type fakeStore struct {
 	gotInjSince   time.Time
 	gotNegSince   time.Time
 	gotMinN       int
+	gotFloor      int
 	gotTail       string
 	gotBatchSince time.Time
 	gotBatchLimit int
@@ -60,6 +62,11 @@ func (f *fakeStore) GetScoreQualityStat(context.Context, time.Time) (types.Score
 
 func (f *fakeStore) ListScoreDistribution(context.Context, time.Time) ([]types.ScoreBucket, error) {
 	return f.dist, nil
+}
+
+func (f *fakeStore) GetScoreLivenessStat(_ context.Context, _ time.Time, floor int) (types.ScoreLivenessStat, error) {
+	f.gotFloor = floor
+	return f.liveness, nil
 }
 
 func (f *fakeStore) GetProfileInjectionStat(_ context.Context, since time.Time) (types.ProfileInjectionStat, error) {
@@ -125,6 +132,11 @@ func TestJudgeDiscrimination(t *testing.T) {
 	tr := func(id string, n, distinct int) types.ScoreTraceStat {
 		return types.ScoreTraceStat{TraceID: id, N: n, DistinctCompletions: distinct}
 	}
+	// flat 造一个整批同分批：MinCompletion 即整批唯一输出，maxTok 是 tokens 峰值。
+	flat := func(id string, n int, completion string, maxTok int) types.ScoreTraceStat {
+		return types.ScoreTraceStat{TraceID: id, N: n, DistinctCompletions: 1,
+			MinCompletion: completion, MaxCompletionTokens: maxTok}
+	}
 	tests := []struct {
 		name string
 		in   []types.ScoreTraceStat
@@ -134,15 +146,86 @@ func TestJudgeDiscrimination(t *testing.T) {
 		// "窗口内没跑过批次"和"跑了且有区分度"是两件事，前者什么都没证明。
 		{"零批次是数据不足而非通过", nil, StatusYellow},
 		{"空切片同样是数据不足", []types.ScoreTraceStat{}, StatusYellow},
-		{"整批同分即 M3 事故形状", []types.ScoreTraceStat{tr("t1", 5, 1)}, StatusRed},
-		{"大批次整批同分", []types.ScoreTraceStat{tr("t1", 50, 1)}, StatusRed},
+		// tr() 不填 MinCompletion（零值空串）——整批输出为空正是 M3 的精确形状。
+		{"整批同一空输出即 M3 事故形状", []types.ScoreTraceStat{tr("t1", 5, 1)}, StatusRed},
+		{"大批次整批同一空输出", []types.ScoreTraceStat{tr("t1", 50, 1)}, StatusRed},
 		{"distinct=2 即有区分度", []types.ScoreTraceStat{tr("t1", 5, 2)}, StatusGreen},
 		{"多批次全部有区分度", []types.ScoreTraceStat{tr("t1", 50, 12), tr("t2", 8, 3)}, StatusGreen},
-		{"混入任一同分批次即红", []types.ScoreTraceStat{tr("t1", 50, 12), tr("t2", 5, 1)}, StatusRed},
+		{"混入任一可疑同分批次即红", []types.ScoreTraceStat{tr("t1", 50, 12), tr("t2", 5, 1)}, StatusRed},
+
+		// ---- 良性同分判别（2026-07-20 修订，契约 §16.1）----
+		// 2026-07-19 生产实锤形状：5 篇不相关长文全部真实输出 "0"、tokens=1。
+		{"整批同一低分且 tokens 正常是良性（黄）",
+			[]types.ScoreTraceStat{flat("t1", 5, "0", 1)}, StatusYellow},
+		{"低分档上界 20 也良性",
+			[]types.ScoreTraceStat{flat("t1", 5, "20", 2)}, StatusYellow},
+		{"tokens 恰在良性上界内也良性",
+			[]types.ScoreTraceStat{flat("t1", 5, "0", benignMaxCompletionTokens)}, StatusYellow},
+		// M3 事故正是整批 "50"——21+ 段同分绝不良性。
+		{"整批同一 50 分维持红（M3 事故的真实形状）",
+			[]types.ScoreTraceStat{flat("t1", 5, "50", 1)}, StatusRed},
+		{"低分档外的 21 同分维持红",
+			[]types.ScoreTraceStat{flat("t1", 5, "21", 1)}, StatusRed},
+		// tokens 高于单数字量级 = 思维链泄漏之类的异常，证据不齐按可疑。
+		{"低分但 tokens 异常高维持红",
+			[]types.ScoreTraceStat{flat("t1", 5, "0", benignMaxCompletionTokens + 1)}, StatusRed},
+		{"tokens=0 记账不完整按可疑处理",
+			[]types.ScoreTraceStat{flat("t1", 5, "0", 0)}, StatusRed},
+		{"带解释文字的同分不良性",
+			[]types.ScoreTraceStat{flat("t1", 5, "0 分，均不相关", 8)}, StatusRed},
+		{"负数同分不良性",
+			[]types.ScoreTraceStat{flat("t1", 5, "-1", 1)}, StatusRed},
+		// 混合场景：可疑压过良性；良性压过绿。
+		{"良性批与可疑批并存时红优先",
+			[]types.ScoreTraceStat{flat("t1", 5, "0", 1), flat("t2", 5, "50", 1)}, StatusRed},
+		{"良性批与正常批并存时黄（可见但不告警）",
+			[]types.ScoreTraceStat{tr("t1", 50, 12), flat("t2", 5, "0", 1)}, StatusYellow},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			checkStatus(t, judgeDiscrimination(tc.in), tc.want)
+		})
+	}
+}
+
+// 良性同分的黄灯 Detail 必须给出复核 SQL 与 §16.8 前提校验的指引——
+// 机判降级不等于免除人工可复核性（探针的可信度恰恰建立在"你可以不信它"上）。
+func TestJudgeDiscrimination_BenignDetailIsSelfServiceable(t *testing.T) {
+	got := judgeDiscrimination([]types.ScoreTraceStat{
+		{TraceID: "benign-trace", N: 5, DistinctCompletions: 1, MinCompletion: "0", MaxCompletionTokens: 1},
+	})
+	checkStatus(t, got, StatusYellow)
+	for _, want := range []string{"benign-trace", "llm_calls", "§16.8"} {
+		if !strings.Contains(got.Detail, want) {
+			t.Errorf("良性黄灯 Detail 应含 %q，实际 %q", want, got.Detail)
+		}
+	}
+	if !strings.Contains(got.Summary, "良性") {
+		t.Errorf("Summary 应标明良性判定，实际 %q", got.Summary)
+	}
+}
+
+// ---------- 探针 §16.8 高分存在性 ----------
+
+func TestJudgeLiveness(t *testing.T) {
+	tests := []struct {
+		name string
+		in   types.ScoreLivenessStat
+		want Status
+	}{
+		// 零样本必须黄：这条探针自己就是为堵 vacuous pass 而生的，
+		// 它要是把"没数据"算成绿，就成了自己要防的那种探针。
+		{"零可解析输出是数据不足", types.ScoreLivenessStat{}, StatusYellow},
+		{"存在一条高分即绿", types.ScoreLivenessStat{Parsable: 100, AboveFloor: 1}, StatusGreen},
+		{"高分很多自然绿", types.ScoreLivenessStat{Parsable: 50, AboveFloor: 40}, StatusGreen},
+		// 红线要求样本 ≥ livenessMinN：一两批真不相关就能凑出全低分。
+		{"样本充足且全低分才红", types.ScoreLivenessStat{Parsable: livenessMinN, AboveFloor: 0}, StatusRed},
+		{"大样本全低分红", types.ScoreLivenessStat{Parsable: 200, AboveFloor: 0}, StatusRed},
+		{"样本不足的全低分只黄", types.ScoreLivenessStat{Parsable: livenessMinN - 1, AboveFloor: 0}, StatusYellow},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			checkStatus(t, judgeLiveness(tc.in), tc.want)
 		})
 	}
 }
@@ -633,10 +716,14 @@ func TestRun_WiringAndWindows(t *testing.T) {
 		t.Errorf("UserID 应回填 7，实际 %d", rep.UserID)
 	}
 
-	// 8 条判定齐全且 ID 唯一——看板与 cmd/gate 都按 ID 索引
-	//（M5 七条 + P-A2A，a2a-contract §10）。
-	if len(rep.Results) != 8 {
-		t.Fatalf("应产出 8 条判定，实际 %d", len(rep.Results))
+	// 9 条判定齐全且 ID 唯一——看板与 cmd/gate 都按 ID 索引
+	//（M5 七条 + §16.8 高分存在性 + P-A2A，a2a-contract §10）。
+	if len(rep.Results) != 9 {
+		t.Fatalf("应产出 9 条判定，实际 %d", len(rep.Results))
+	}
+	// §16.8 的档位地板必须从 types 的档位语义推出（=20），不许探针第二次写死。
+	if want := types.DefaultStrictness.MinKeepScore() - 1; f.gotFloor != want {
+		t.Errorf("liveness floor 应为 MinKeepScore()-1=%d，实际 %d", want, f.gotFloor)
 	}
 	seen := map[string]bool{}
 	for _, r := range rep.Results {

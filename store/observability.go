@@ -60,7 +60,8 @@ const (
 // 两个方向都是误判。
 func (s *Store) ListScoreTraceStats(ctx context.Context, since time.Time, minN int) ([]types.ScoreTraceStat, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT trace_id, count(*)::int, count(DISTINCT completion)::int, min(created_at)
+		`SELECT trace_id, count(*)::int, count(DISTINCT completion)::int, min(created_at),
+		        min(completion), max(completion_tokens)::int
 		 FROM llm_calls
 		 WHERE span_name = $1 AND error = '' AND created_at >= $2
 		 GROUP BY trace_id
@@ -75,7 +76,8 @@ func (s *Store) ListScoreTraceStats(ctx context.Context, since time.Time, minN i
 	var out []types.ScoreTraceStat
 	for rows.Next() {
 		var st types.ScoreTraceStat
-		if err := rows.Scan(&st.TraceID, &st.N, &st.DistinctCompletions, &st.StartedAt); err != nil {
+		if err := rows.Scan(&st.TraceID, &st.N, &st.DistinctCompletions, &st.StartedAt,
+			&st.MinCompletion, &st.MaxCompletionTokens); err != nil {
 			return nil, types.NewAppError(types.CodeDatabase, "扫描打分批次统计行", err)
 		}
 		out = append(out, st)
@@ -155,6 +157,32 @@ func (s *Store) ListScoreDistribution(ctx context.Context, since time.Time) ([]t
 		return nil, types.NewAppError(types.CodeDatabase, "遍历分数分布结果集", err)
 	}
 	return buckets, nil
+}
+
+// GetScoreLivenessStat 返回窗口内"高分存在性"计数（探针 §16.8）。
+//
+// floor 是"不该推"语义档的上界（由 probe 层从 types.DefaultStrictness.MinKeepScore()
+// 推出并传入，不在这里第二次定义档位）。AboveFloor 统计解析分**严格大于** floor 的条数。
+//
+// 提数表达式与 ListScoreDistribution 逐字相同（含"正则零括号"的取舍，见其注释）：
+// 两个查询消费同一个 parseScore 语义，表达式分叉等于探针之间口径漂移。
+func (s *Store) GetScoreLivenessStat(ctx context.Context, since time.Time, floor int) (types.ScoreLivenessStat, error) {
+	var st types.ScoreLivenessStat
+	err := s.pool.QueryRow(ctx,
+		`SELECT count(*)::int,
+		        count(*) FILTER (WHERE sc > $3)::int
+		 FROM (
+		     SELECT LEAST(100, GREATEST(0,
+		         substring(completion from '-?[0-9]+\.?[0-9]*')::numeric)) AS sc
+		     FROM llm_calls
+		     WHERE span_name = $1 AND error = '' AND created_at >= $2
+		       AND completion ~ '[0-9]'
+		 ) t`,
+		scoreSpan, since, floor).Scan(&st.Parsable, &st.AboveFloor)
+	if err != nil {
+		return st, types.NewAppError(types.CodeDatabase, "查询高分存在性统计", err)
+	}
+	return st, nil
 }
 
 // GetProfileInjectionStat 返回窗口内画像注入生效性统计（探针 ④）。

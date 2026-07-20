@@ -316,7 +316,9 @@ func run() error {
 	// 自身故障时给 owner 发飞书告警卡——§16.1 曾挂红半天没人知道，靠人工 SSH 跑 gate
 	// 才发现。同上：只读旁路巡检不值得引入 Temporal，丢一轮无害（次日自动再跑）。
 	// push 复用推送管道的 Pusher 出口，principals 与 gate CLI 同走 owner 回退解析。
-	go newProbeWatcher(st, principals, manager, push, feishu.BuildReplyCard).run(ctx)
+	// st 传两次：第一份是 probe.Store（读指标），第二份是 fingerprintStore（告警
+	// 指纹落盘，migration 027）——两个独立职责窄接口，生产实现恰好都是 *store.Store。
+	go newProbeWatcher(st, st, principals, manager, push, feishu.BuildReplyCard).run(ctx)
 
 	serveErr := make(chan error, 1)
 	go func() {

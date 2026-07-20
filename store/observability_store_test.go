@@ -61,15 +61,16 @@ func obsWindow(ctx context.Context, t *testing.T, st *Store, slot int) time.Time
 
 // llmRow 是一条合成 llm_calls 行。零值即安全默认：score span、无错、零成本。
 type llmRow struct {
-	TraceID    string
-	SpanName   string // 空 → score
-	UserID     *int64
-	Model      string // 空 → 占位模型名
-	UserPrompt string
-	Completion string
-	Error      string
-	CostUSD    float64
-	CreatedAt  time.Time
+	TraceID          string
+	SpanName         string // 空 → score
+	UserID           *int64
+	Model            string // 空 → 占位模型名
+	UserPrompt       string
+	Completion       string
+	CompletionTokens int
+	Error            string
+	CostUSD          float64
+	CreatedAt        time.Time
 }
 
 func insertLLMCall(ctx context.Context, t *testing.T, st *Store, r llmRow) {
@@ -82,9 +83,10 @@ func insertLLMCall(ctx context.Context, t *testing.T, st *Store, r llmRow) {
 	}
 	_, err := st.pool.Exec(ctx,
 		`INSERT INTO llm_calls
-		     (trace_id, span_name, user_id, model, user_prompt, completion, error, cost_usd, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		r.TraceID, r.SpanName, r.UserID, r.Model, r.UserPrompt, r.Completion,
+		     (trace_id, span_name, user_id, model, user_prompt, completion, completion_tokens,
+		      error, cost_usd, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		r.TraceID, r.SpanName, r.UserID, r.Model, r.UserPrompt, r.Completion, r.CompletionTokens,
 		r.Error, r.CostUSD, r.CreatedAt)
 	if err != nil {
 		t.Fatalf("插入合成 llm_calls 行失败: %v", err)
@@ -117,8 +119,15 @@ func TestObservabilityStore(t *testing.T) {
 		at := base.Add(time.Hour)
 
 		// 批 A：5 次成功且整批同分 → M3 事故形状（N=5, distinct=1）。
-		for range 5 {
-			insertLLMCall(ctx, t, st, llmRow{TraceID: "obs-flat", Completion: "50", CreatedAt: at})
+		// tokens 混 3/16 两档：max() 应取 16——良性判别（probe 层）靠它区分
+		// "单数字回答"与"思维链吃满预算"，取错聚合函数会把 M3 形状漂白成良性。
+		for i := range 5 {
+			tok := 3
+			if i == 0 {
+				tok = 16
+			}
+			insertLLMCall(ctx, t, st, llmRow{TraceID: "obs-flat", Completion: "50",
+				CompletionTokens: tok, CreatedAt: at})
 		}
 		// 同批混一条失败行：error<>'' 的 completion 恒为 ''（llm/do.go 只在成功分支赋值），
 		// 混进来会让 distinct 虚高成 2 —— 整批同分反而变绿，正是要防的假绿。
@@ -156,6 +165,12 @@ func TestObservabilityStore(t *testing.T) {
 			t.Errorf("obs-flat 期望 N=5 distinct=1（失败行与 cardgen 行都不该进统计），实际 N=%d distinct=%d",
 				s.N, s.DistinctCompletions)
 		}
+		// 良性同分判别（§16.1 修订）的两个输入列：distinct=1 时 min(completion)
+		// 即整批唯一输出；tokens 取 max——批里最高的那条才代表最坏形状。
+		if s := byTrace["obs-flat"]; s.MinCompletion != "50" || s.MaxCompletionTokens != 16 {
+			t.Errorf("obs-flat 期望 MinCompletion=%q MaxCompletionTokens=16，实际 %q/%d",
+				"50", s.MinCompletion, s.MaxCompletionTokens)
+		}
 		if s := byTrace["obs-varied"]; s.N != 5 || s.DistinctCompletions != 5 {
 			t.Errorf("obs-varied 期望 N=5 distinct=5（\"85\" 与 \"85分\" 算两种），实际 N=%d distinct=%d",
 				s.N, s.DistinctCompletions)
@@ -166,6 +181,65 @@ func TestObservabilityStore(t *testing.T) {
 		// ORDER BY min(created_at) DESC：晚的批次在前。
 		if got[0].TraceID != "obs-varied" {
 			t.Errorf("应按批次起始时刻倒序，实际首个为 %s", got[0].TraceID)
+		}
+	})
+
+	t.Run("高分存在性", func(t *testing.T) {
+		base := obsWindow(ctx, t, st, 7)
+		at := base.Add(time.Hour)
+
+		// floor 边界（探针传 20）：恰好 20 属"不该推"档不算高分，21 才算——
+		// 边界搞反的话"全窗口卡在 20 分"会被误判成打分器还活着。
+		insertLLMCall(ctx, t, st, llmRow{Completion: "20", CreatedAt: at})
+		insertLLMCall(ctx, t, st, llmRow{Completion: "21", CreatedAt: at})
+		insertLLMCall(ctx, t, st, llmRow{Completion: "0", CreatedAt: at})
+		// 提数语义与 ListScoreDistribution 同款（取首个数字）："85分" 解析成 85。
+		insertLLMCall(ctx, t, st, llmRow{Completion: "85分", CreatedAt: at})
+		// 无数字行不进 Parsable（那是 §16.2 回退率的地盘）。
+		insertLLMCall(ctx, t, st, llmRow{Completion: "好的", CreatedAt: at})
+		// 失败行与 cardgen 行照例排除。
+		insertLLMCall(ctx, t, st, llmRow{Completion: "95", Error: "429", CreatedAt: at})
+		insertLLMCall(ctx, t, st, llmRow{SpanName: cardgenSpan, Completion: "99", CreatedAt: at})
+
+		got, err := st.GetScoreLivenessStat(ctx, base, 20)
+		if err != nil {
+			t.Fatalf("GetScoreLivenessStat() 失败: %v", err)
+		}
+		want := types.ScoreLivenessStat{Parsable: 4, AboveFloor: 2}
+		if got != want {
+			t.Errorf("存在性计数不匹配\n期望 %+v\n实际 %+v（21 与 85 应计入高分，20 不计）", want, got)
+		}
+	})
+
+	t.Run("巡检告警指纹往返", func(t *testing.T) {
+		// probewatch_state 是全局单行表（migration 027），没有时间轴可隔离——
+		// 保存并恢复原值，把对共享测试库的扰动收敛到本子测试内。
+		orig, err := st.GetProbewatchFingerprint(ctx)
+		if err != nil {
+			t.Fatalf("GetProbewatchFingerprint() 初读失败: %v", err)
+		}
+		defer func() {
+			if err := st.SetProbewatchFingerprint(ctx, orig); err != nil {
+				t.Errorf("恢复原指纹失败: %v", err)
+			}
+		}()
+
+		if err := st.SetProbewatchFingerprint(ctx, "red:score_discrimination"); err != nil {
+			t.Fatalf("SetProbewatchFingerprint() 失败: %v", err)
+		}
+		got, err := st.GetProbewatchFingerprint(ctx)
+		if err != nil {
+			t.Fatalf("GetProbewatchFingerprint() 失败: %v", err)
+		}
+		if got != "red:score_discrimination" {
+			t.Errorf("写后读期望 %q，实际 %q", "red:score_discrimination", got)
+		}
+		// 复位语义：空串是合法值（"没告警过"），必须能写穿。
+		if err := st.SetProbewatchFingerprint(ctx, ""); err != nil {
+			t.Fatalf("复位写入失败: %v", err)
+		}
+		if got, err = st.GetProbewatchFingerprint(ctx); err != nil || got != "" {
+			t.Errorf("复位后应读回空串，实际 %q err=%v", got, err)
 		}
 	})
 

@@ -51,6 +51,8 @@ var wantTables = []string{
 	"schedule_sources",
 	// 026 per-tenant 配额（企业级契约 §2.7，D3 下的财务护栏）
 	"tenant_quota",
+	// 027 probewatch 告警指纹落盘（M5 契约 §16 修订，探针实现债 P2）
+	"probewatch_state",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的
