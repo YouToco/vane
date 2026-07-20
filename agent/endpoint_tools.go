@@ -40,8 +40,10 @@ const (
 	// 上一版注释就把基数写错了一个）。账目沿革：2026-07-18 read_endpoint_result
 	// 入列 15→14（13 基础 + 2 端点工具 + 14 激活 = 29 顶线）；2026-07-19
 	// set_task_strictness 入列（任务门槛档位拍板）14→13：14 基础 + 2 端点工具
-	// + 13 激活 = 29 压线内（基础/端点工具均计入 BuildTools 返回值）。
-	maxActivatedEndpoints = 13
+	// + 13 激活 = 29 压线内；2026-07-20 web_search/read_page 入列（Exa ad-hoc
+	// 工具对拍板）13→11：16 基础 + 2 端点工具 + 11 激活 = 29 压线内
+	// （基础/端点工具均计入 BuildTools 返回值）。
+	maxActivatedEndpoints = 11
 	// searchTopK 每次检索返回并激活的端点数（Anthropic Tool Search 默认值同为 5）。
 	searchTopK = 5
 	// 端点结果的内联上限**不再是常量**：由 agent 模型声明的上下文窗口派生

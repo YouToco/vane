@@ -248,11 +248,11 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 	var cached bool
 	for _, st := range cr.Statuses {
 		if st.Status == "error" {
-			// Cause 带 errPageUnreachable 哨兵：probe 路径（probe.go）据此把「Exa 抓不到
+			// Cause 带 ErrPageUnreachable 哨兵：probe 路径（probe.go）据此把「Exa 抓不到
 			// 该页」翻译成「请检查 URL」而非「稍后再试」——试跑时这多半是 URL 打错或
 			// 页面需要登录，不是瞬态故障。周期抓取路径不感知（Retryable 语义不变）。
 			ae := types.NewAppError(types.CodeFetchTimeout,
-				fmt.Sprintf("Exa /contents 抓取失败（url=%s，status=error）", pageURL), errPageUnreachable)
+				fmt.Sprintf("Exa /contents 抓取失败（url=%s，status=error）", pageURL), ErrPageUnreachable)
 			ae.Retryable = true
 			return nil, false, ae
 		}
@@ -263,8 +263,39 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 	return cr.Results, cached, nil
 }
 
-// errPageUnreachable 标记「Exa 报告目标页面抓取失败」（HTTP 200 + statuses[].status=error）。
-var errPageUnreachable = errors.New("目标页面抓取失败")
+// ErrPageUnreachable 标记「Exa 报告目标页面抓取失败」（HTTP 200 + statuses[].status=error）。
+var ErrPageUnreachable = errors.New("目标页面抓取失败")
+
+// ReadPage 一次性读取指定 URL 的正文（agent read_page 工具）：maxAgeHours:0 强制活抓，
+// 不建信源、不写入内容库，正文截断到 exaContentsMaxTextBytes（与监控路径同一成本护栏）。
+// cached=true 表示 Exa 无视活抓要求返回了缓存（内容可能不是最新，由调用方决定是否告知）。
+// 失败语义对齐 Fetch：缺 key/鉴权 → CodeValidation；页面抓不到（statuses error）→
+// CodeFetchTimeout + ErrPageUnreachable（工具层据此给「检查 URL」话术，同 probe）；
+// 成功但无正文 → CodeFetchTimeout 不可重试（空页/纯前端渲染/需登录，重试无意义）。
+func (e *ExaContentsFetcher) ReadPage(ctx context.Context, pageURL string) (title, text string, cached bool, err error) {
+	if e.apiKey == "" {
+		return "", "", false, types.NewAppError(types.CodeValidation,
+			"读取页面需要配置 VANE_FETCH_EXA_API_KEY，当前为空", nil)
+	}
+	pageURL = strings.TrimSpace(pageURL)
+	if pageURL == "" {
+		return "", "", false, types.NewAppError(types.CodeValidation, "url 不能为空", nil)
+	}
+	results, cached, err := e.pageResults(ctx, pageURL, 0, &types.Source{})
+	if err != nil {
+		return "", "", false, err
+	}
+	for _, r := range results {
+		if strings.TrimSpace(r.Text) == "" {
+			continue
+		}
+		return r.Title, sanitizeContentsText(truncateUTF8(r.Text, exaContentsMaxTextBytes)), cached, nil
+	}
+	ae := types.NewAppError(types.CodeFetchTimeout,
+		"页面抓取成功但没有可读取的正文（可能是空页、纯前端渲染或需要登录）", nil)
+	ae.Retryable = false
+	return "", "", cached, ae
+}
 
 // mapExaContents 把 /contents 结果映射为一条 ContentItem，并自填 canonical_key
 // （含 textHash，承载变化检测）。

@@ -85,7 +85,9 @@ type scheduleCreator interface {
 // 允许为 nil（未装配 LLM 的路径/测试）——此时手册仍可存取，只是不编译计划（best-effort）。
 // prober 是试跑=准入入口（*fetcher.Multi，生产直接传 multi；1.5 起统一分派绑定能力
 // 与 URL 类 web 能力的试跑）；nil 合法（测试/未装配）——退回不试跑直接落库。
-func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger, tr playbookTranslator, endpoints *EndpointTools, prober sourceProber) []Tool {
+// exa 是 Exa ad-hoc 工具对（web_search/read_page）；nil（Exa key 未配置）时不装配，
+// 工具面与该特性上线前完全一致（同 endpoints 的 nil 语义）。
+func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger, tr playbookTranslator, endpoints *EndpointTools, prober sourceProber, exa *ExaTools) []Tool {
 	tools := []Tool{
 		&listSourcesTool{st: st},
 		&addSourceTool{st: st, prober: prober},
@@ -104,6 +106,9 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger,
 	}
 	if endpoints != nil {
 		tools = append(tools, endpoints.SearchTool(), endpoints.ReadResultTool())
+	}
+	if exa != nil {
+		tools = append(tools, exa.SearchTool(), exa.ReadPageTool())
 	}
 	return tools
 }
