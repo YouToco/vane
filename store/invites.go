@@ -5,10 +5,7 @@ package store
 
 import (
 	"context"
-	"errors"
 	"fmt"
-
-	"github.com/jackc/pgx/v5"
 
 	"github.com/YouToco/vane/types"
 )
@@ -83,21 +80,28 @@ func (s *Store) DeleteUnusedInvite(ctx context.Context, code string) error {
 	// 外层再看该码在语句快照里是否存在，区分「不存在」与「已使用」。
 	// 拆成 DELETE + 补查两条语句会有 TOCTOU 窗口（间隙里码被注册流消费），
 	// 这里守的是财务闸门的账本，不留这种窗口。
+	//
+	// SELECT EXISTS(...), EXISTS(...) 无 FROM 限制、恒返回一行，故 QueryRow 不会
+	// 返回 pgx.ErrNoRows——只需判普通错误。
 	var deleted, existed bool
-	err := s.pool.QueryRow(ctx,
+	if err := s.pool.QueryRow(ctx,
 		`WITH del AS (
 		   DELETE FROM invites WHERE code = $1 AND used_count = 0 RETURNING code
 		 )
 		 SELECT EXISTS(SELECT 1 FROM del),
 		        EXISTS(SELECT 1 FROM invites WHERE code = $1)`,
-		code).Scan(&deleted, &existed)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		code).Scan(&deleted, &existed); err != nil {
 		return types.NewAppError(types.CodeDatabase, fmt.Sprintf("作废邀请码 %q", code), err)
 	}
 	switch {
 	case deleted:
 		return nil
 	case existed:
+		// 已消费的码走这里（used_count > 0、行仍在）。
+		// 已知边界：两个 DELETE 并发删同一「未用」码时，READ COMMITTED 下后到者的
+		// DELETE 命中 0 行，而外层 EXISTS 用语句开始时的旧快照仍看得到该行，会把这条
+		// 误报成「已被使用」——但码其实是被并发删掉的。结果无害（行确已删、账本无损），
+		// 仅文案失真；管理员双击删除属极窄触发，不值得为它多查一次 used_count。
 		return types.NewAppError(types.CodeConflict, "邀请码已被使用，不可作废", nil)
 	default:
 		return types.NewAppError(types.CodeNotFound, "邀请码不存在", nil)
