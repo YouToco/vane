@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, PLATFORM_OWNER_TENANT_ID } from "./api";
+import type { MeResponse } from "./api";
 import Landing from "./pages/Landing";
 import Login from "./pages/Login";
 import Home from "./pages/Home";
@@ -32,8 +33,16 @@ import {
   ShieldCheck,
   LogOut,
   Loader2,
+  ChevronsUpDown,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { LogoMark } from "@/components/brand/Logo";
 import { LocaleSwitch } from "@/components/LocaleSwitch";
 import { useI18n } from "@/i18n";
@@ -102,12 +111,63 @@ function renderPage(hash: string, isPlatformOwner: boolean) {
   }
 }
 
+// NavUser：sidebar 底部的当前用户块（SaaS 惯例）——首字母头像 + 邮箱 +
+// owner 徽章，下拉收纳退出登录。email 为空（存量飞书用户）时退化显示 #user_id。
+function NavUser({
+  me,
+  isPlatformOwner,
+  onLogout,
+}: {
+  me: MeResponse;
+  isPlatformOwner: boolean;
+  onLogout: () => void;
+}) {
+  const { t } = useI18n();
+  const email = me.email?.trim() ?? "";
+  const display = email || `#${me.user_id}`;
+  const initial = (email[0] ?? "V").toUpperCase();
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <SidebarMenuButton
+            size="lg"
+            className="data-[popup-open]:bg-sidebar-accent data-[popup-open]:text-sidebar-accent-foreground"
+          />
+        }
+      >
+        <Avatar className="size-8 rounded-lg">
+          <AvatarFallback className="rounded-lg bg-brand/15 text-brand-strong text-sm font-semibold">
+            {initial}
+          </AvatarFallback>
+        </Avatar>
+        <div className="flex min-w-0 flex-col leading-tight">
+          <span className="truncate text-sm font-medium">{display}</span>
+          {isPlatformOwner && (
+            <span className="text-[10px] font-medium text-brand-strong">Owner</span>
+          )}
+        </div>
+        <ChevronsUpDown className="ml-auto size-4 text-muted-foreground" />
+      </DropdownMenuTrigger>
+      {/* Popup 基类自带 w-(--anchor-width) 等宽，无需额外宽度类 */}
+      <DropdownMenuContent side="top" align="start">
+        <DropdownMenuItem onClick={onLogout}>
+          <LogOut />
+          {t.app.nav.logout}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 function AppSidebar({
   hash,
+  me,
   isPlatformOwner,
   onLogout,
 }: {
   hash: string;
+  me: MeResponse;
   isPlatformOwner: boolean;
   onLogout: () => void;
 }) {
@@ -154,10 +214,7 @@ function AppSidebar({
             </SidebarMenuItem>
           )}
           <SidebarMenuItem>
-            <SidebarMenuButton onClick={onLogout}>
-              <LogOut />
-              <span>{t.app.nav.logout}</span>
-            </SidebarMenuButton>
+            <NavUser me={me} isPlatformOwner={isPlatformOwner} onLogout={onLogout} />
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>
@@ -165,9 +222,10 @@ function AppSidebar({
   );
 }
 
-function Shell({ hash, isPlatformOwner }: { hash: string; isPlatformOwner: boolean }) {
+function Shell({ hash, me }: { hash: string; me: MeResponse }) {
   const { t } = useI18n();
   const { all } = useNav();
+  const isPlatformOwner = me.tenant_id === PLATFORM_OWNER_TENANT_ID;
   async function onLogout() {
     try {
       await api.logout();
@@ -177,7 +235,7 @@ function Shell({ hash, isPlatformOwner }: { hash: string; isPlatformOwner: boole
 
   return (
     <SidebarProvider>
-      <AppSidebar hash={hash} isPlatformOwner={isPlatformOwner} onLogout={onLogout} />
+      <AppSidebar hash={hash} me={me} isPlatformOwner={isPlatformOwner} onLogout={onLogout} />
       <SidebarInset>
         <header className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger className="-ml-1" />
@@ -199,27 +257,24 @@ function Shell({ hash, isPlatformOwner }: { hash: string; isPlatformOwner: boole
 
 export default function App() {
   const hash = useHash();
-  const [authed, setAuthed] = useState<boolean | null>(null);
-  const [isPlatformOwner, setIsPlatformOwner] = useState(false);
+  // me 三态：undefined=探测中，null=未登录，对象=已登录（含用户块所需 email）。
+  const [me, setMe] = useState<MeResponse | null | undefined>(undefined);
 
   useEffect(() => {
     api
       .me()
-      .then((me) => {
-        setIsPlatformOwner(me.tenant_id === PLATFORM_OWNER_TENANT_ID);
-        setAuthed(true);
-      })
-      .catch(() => setAuthed(false));
+      .then(setMe)
+      .catch(() => setMe(null));
   }, []);
 
   if (hash === "#/login") return <Login />;
-  if (authed === null) {
+  if (me === undefined) {
     return (
       <div className="flex h-screen items-center justify-center gap-2 text-muted-foreground">
         <Loader2 className="size-5 animate-spin" />
       </div>
     );
   }
-  if (!authed) return <Landing />;
-  return <Shell hash={hash} isPlatformOwner={isPlatformOwner} />;
+  if (me === null) return <Landing />;
+  return <Shell hash={hash} me={me} />;
 }

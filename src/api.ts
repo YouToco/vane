@@ -12,6 +12,8 @@ export interface MeResponse {
   ok: boolean;
   user_id: number;
   tenant_id: number;
+  /** 用户邮箱，供界面用户块展示；无邮箱的存量飞书用户为空串（后端 COALESCE 保证）。 */
+  email?: string;
 }
 
 export interface FeishuStatus {
