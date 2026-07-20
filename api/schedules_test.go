@@ -143,6 +143,41 @@ func TestCreateSchedule_未登录不调用Scheduler(t *testing.T) {
 	}
 }
 
+// TestCreateSchedule_未登录先于请求体校验 刻画真实 HTTP 入口的现有顺序：
+// requireSession 包在 handler 外层，故未登录请求在 JSON 解码和 DTO/spec 校验前返回 401。
+func TestCreateSchedule_未登录先于请求体校验(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "malformed JSON",
+			body: `{`,
+		},
+		{
+			name: "合法 JSON 但 spec 同时提供 cron 与 every",
+			body: `{"spec":{"cron":"0 8 * * *","every_seconds":3600}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeScheduler{}
+			w := postSchedule(t, newScheduleMux(t, f), nil, tt.body)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("状态码 = %d, 期望请求体校验前鉴权返回 401（body=%s）", w.Code, w.Body.String())
+			}
+			if got, want := w.Body.String(), "{\"error\":\"未登录或会话已过期\"}\n"; got != want {
+				t.Errorf("响应体 = %q, 期望 %q", got, want)
+			}
+			if f.createCalls != 0 {
+				t.Errorf("未登录请求仍调用 CreatePush %d 次", f.createCalls)
+			}
+		})
+	}
+}
+
 // TestCreateSchedule_请求体校验发生在Scheduler之前 刻画 JSON 上限与 DTO 前置校验。
 func TestCreateSchedule_请求体校验发生在Scheduler之前(t *testing.T) {
 	oversized := `{"spec":{"cron":"0 8 * * *"},"nl_description":"` +

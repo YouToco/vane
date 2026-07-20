@@ -1732,6 +1732,34 @@ func TestCreateScheduleTool_CurrentFailureStages(t *testing.T) {
 	}
 }
 
+// A0 hardening：合法非空门槛不只要“调用过”，还必须逐值透传。
+// strict 主路径之外再用 normal 锁住映射，防重构把所有合法值静默写成 strict。
+func TestCreateScheduleTool_CurrentNormalStrictnessPassthrough(t *testing.T) {
+	deps := &createScheduleCharacterizationDeps{}
+	tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+	args := json.RawMessage(
+		`{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
+			`"nl_description":"每天看两个官方源","strictness":"normal"}`,
+	)
+
+	got, err := tool.Execute(t.Context(), 7, args)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	const want = "已创建定时推送任务（id=push-7-current）：" +
+		"按 cron「0 8 * * *」触发（时区 Asia/Shanghai），" +
+		"推送门槛「标准」（≥40 分才推送，弱相关不打扰）"
+	if got != want {
+		t.Fatalf("Execute() = %q, want %q", got, want)
+	}
+	if deps.strictAttempt != (characterizationStrictnessCall{
+		userID: 7, scheduleID: "push-7-current", value: types.StrictnessNormal,
+	}) || !deps.strictCommitted {
+		t.Fatalf("normal 门槛未精确落到目标任务: attempt=%+v committed=%v",
+			deps.strictAttempt, deps.strictCommitted)
+	}
+}
+
 // TestEditTaskPlaybookTool_CompilesPlan 守 P1 编译层：edit 存下正文后据此重编译计划，
 // 回执按编译出的源数分档，翻译失败静默降级为普通成功。
 func TestEditTaskPlaybookTool_CompilesPlan(t *testing.T) {

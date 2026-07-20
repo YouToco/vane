@@ -280,6 +280,20 @@ func TestCreatePush_CurrentBehavior(t *testing.T) {
 			wantMessage: "活跃定时任务已达上限（20 个）",
 		},
 		{
+			name: "paused schedule does not consume active limit",
+			spec: validSpec,
+			schedules: append(
+				activeScheduleFixtures(maxActiveSchedules-1),
+				types.Schedule{Status: types.ScheduleStatusPaused},
+			),
+			wantCalls:   []string{"store.list", "temporal.create", "store.insert"},
+			wantSuccess: true,
+			wantSDKSpec: client.ScheduleSpec{
+				CronExpressions: []string{"15 8 * * *"},
+				TimeZoneName:    "Asia/Shanghai",
+			},
+		},
+		{
 			name:        "Temporal create failure stops before mirror insert",
 			spec:        validSpec,
 			createErr:   createErr,
