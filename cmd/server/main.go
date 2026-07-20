@@ -33,6 +33,7 @@ import (
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/scorer"
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/tikhubinvoke"
 	"github.com/YouToco/vane/workflow"
 )
@@ -203,7 +204,13 @@ func run() error {
 		exaTools = agent.NewExaTools(fetch.Exa(), fetch.ExaContents(), st,
 			cfg.Agent.ExaMsgCap, cfg.Agent.ExaDailyCap)
 	}
-	tools := agent.BuildTools(st, sched, sched, playbookTr, endpoints, fetch, exaTools)
+	taskSvc := task.New(task.Deps{
+		Schedules:  sched,
+		Playbooks:  st,
+		Compiler:   agent.NewTaskPlaybookCompiler(st, playbookTr),
+		Strictness: st,
+	})
+	tools := agent.BuildTools(st, sched, taskSvc, sched, playbookTr, endpoints, fetch, exaTools)
 	agentLoop := agent.New(agent.Deps{
 		Client:     llmClient,
 		Recorder:   recorder,

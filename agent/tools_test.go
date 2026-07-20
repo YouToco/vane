@@ -14,6 +14,7 @@ import (
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/sourcespec"
+	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
@@ -701,13 +702,71 @@ func TestValidateScheduleSpecFields_共用(t *testing.T) {
 // 等于不存在（loop 只认注册过的名字）。
 func TestBuildTools_包含update_schedule(t *testing.T) {
 	names := map[string]bool{}
-	for _, tl := range BuildTools(nil, nil, nil, nil, nil, nil, nil) {
+	for _, tl := range BuildTools(nil, nil, nil, nil, nil, nil, nil, nil) {
 		names[tl.Name()] = true
 	}
 	for _, want := range []string{"create_schedule", "update_schedule", "remove_schedule", "list_schedules", "view_task_playbook", "edit_task_playbook"} {
 		if !names[want] {
 			t.Errorf("BuildTools 应包含 %s", want)
 		}
+	}
+}
+
+type recordingTaskCreator struct {
+	calls int
+	input task.CreateInput
+}
+
+func (f *recordingTaskCreator) Create(
+	_ context.Context,
+	input task.CreateInput,
+) (task.CreateResult, error) {
+	f.calls++
+	f.input = input
+	return task.CreateResult{
+		ScheduleID:        "push-7-via-build-tools",
+		StrictnessApplied: true,
+	}, nil
+}
+
+// TestBuildTools_CreateSchedule委托注入服务 防组合根到工具白名单之间的接线假绿：
+// 只检查工具名无法发现 tasks 被漏填/填成 nil；必须从 BuildTools 取出真实工具并执行一次。
+func TestBuildTools_CreateSchedule委托注入服务(t *testing.T) {
+	tasks := &recordingTaskCreator{}
+	var create Tool
+	for _, tl := range BuildTools(nil, nil, tasks, nil, nil, nil, nil, nil) {
+		if tl.Name() == "create_schedule" {
+			create = tl
+			break
+		}
+	}
+	if create == nil {
+		t.Fatal("BuildTools 未注册 create_schedule")
+	}
+
+	got, err := create.Execute(t.Context(), 7, json.RawMessage(
+		`{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},`+
+			`"nl_description":"每日 AI 情报","strictness":"normal"}`,
+	))
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if tasks.calls != 1 {
+		t.Fatalf("注入的 task service 调用次数 = %d, want 1", tasks.calls)
+	}
+	wantSpec := scheduler.ScheduleSpec{Cron: "0 8 * * *", TZ: "Asia/Shanghai"}
+	if tasks.input.UserID != 7 ||
+		tasks.input.Spec != wantSpec ||
+		tasks.input.NLDescription != "每日 AI 情报" ||
+		tasks.input.PlaybookContent != "每日 AI 情报" ||
+		tasks.input.Strictness != types.StrictnessNormal {
+		t.Fatalf("BuildTools 委托入参漂移: %+v", tasks.input)
+	}
+	const wantReply = "已创建定时推送任务（id=push-7-via-build-tools）：" +
+		"按 cron「0 8 * * *」触发（时区 Asia/Shanghai），" +
+		"推送门槛「标准」（≥40 分才推送，弱相关不打扰）"
+	if got != wantReply {
+		t.Fatalf("Execute() = %q, want %q", got, wantReply)
 	}
 }
 
@@ -1003,7 +1062,27 @@ func TestEditTaskPlaybookTool_Summarize(t *testing.T) {
 	})
 }
 
-// fakeScheduleCreator 是 scheduleCreator 的假实现：返回预设 schedID / err，
+// newCreateScheduleToolForTest 让 A0 的行为刻画继续贯穿真实 task.Service，
+// 避免重构后 golden matrix 只测到 Agent 的参数外壳。
+func newCreateScheduleToolForTest(
+	schedules task.ScheduleCreator,
+	playbooks playbookStore,
+	translator playbookTranslator,
+	strictness task.StrictnessWriter,
+) *createScheduleTool {
+	var compiler task.PlaybookCompiler
+	if playbooks != nil {
+		compiler = NewTaskPlaybookCompiler(playbooks, translator)
+	}
+	return &createScheduleTool{tasks: task.New(task.Deps{
+		Schedules:  schedules,
+		Playbooks:  playbooks,
+		Compiler:   compiler,
+		Strictness: strictness,
+	})}
+}
+
+// fakeScheduleCreator 是 task.ScheduleCreator 的假实现：返回预设 schedID / err，
 // 并记录 CreatePush 收到的 nlDesc（用于验证手册初始化用它作内容）。
 type fakeScheduleCreator struct {
 	schedID   string
@@ -1030,7 +1109,7 @@ func TestCreateScheduleTool_InitializesPlaybook(t *testing.T) {
 	t.Run("成功时用 nl 意图初始化手册", func(t *testing.T) {
 		sc := &fakeScheduleCreator{schedID: "push-7-abc"}
 		pb := newFakePlaybookStore()
-		tool := &createScheduleTool{sched: sc, st: pb}
+		tool := newCreateScheduleToolForTest(sc, pb, nil, nil)
 		got, err := tool.Execute(context.Background(), 7, args)
 		if err != nil {
 			t.Fatalf("意外报错: %v", err)
@@ -1047,11 +1126,30 @@ func TestCreateScheduleTool_InitializesPlaybook(t *testing.T) {
 		}
 	})
 
+	t.Run("调度保留原文而手册按独立上限截断", func(t *testing.T) {
+		sc := &fakeScheduleCreator{schedID: "push-7-long"}
+		pb := newFakePlaybookStore()
+		long := strings.Repeat("字", maxPlaybookContentRunes+50)
+		raw := json.RawMessage(`{"spec":{"cron":"0 8 * * *"},"nl_description":"` + long + `"}`)
+
+		if _, err := newCreateScheduleToolForTest(sc, pb, nil, nil).
+			Execute(context.Background(), 7, raw); err != nil {
+			t.Fatalf("意外报错: %v", err)
+		}
+		if sc.gotNLDesc != long {
+			t.Fatalf("scheduler 应收到未截断原文: got=%d rune want=%d",
+				len([]rune(sc.gotNLDesc)), len([]rune(long)))
+		}
+		if got := len([]rune(pb.upserts[0].content)); got != maxPlaybookContentRunes {
+			t.Fatalf("playbook content = %d rune, want %d", got, maxPlaybookContentRunes)
+		}
+	})
+
 	t.Run("手册写失败仍回成功（best-effort，不回滚调度）", func(t *testing.T) {
 		sc := &fakeScheduleCreator{schedID: "push-7-def"}
 		pb := newFakePlaybookStore()
 		pb.upsertErr = types.NewAppError(types.CodeDatabase, "写入失败", nil)
-		tool := &createScheduleTool{sched: sc, st: pb}
+		tool := newCreateScheduleToolForTest(sc, pb, nil, nil)
 		got, err := tool.Execute(context.Background(), 7, args)
 		if err != nil {
 			t.Fatalf("手册写失败不应让 create_schedule 上抛（best-effort）: %v", err)
@@ -1064,7 +1162,7 @@ func TestCreateScheduleTool_InitializesPlaybook(t *testing.T) {
 	t.Run("CreatePush 失败则不建手册", func(t *testing.T) {
 		sc := &fakeScheduleCreator{err: types.NewAppError(types.CodeValidation, "频率过高", nil)}
 		pb := newFakePlaybookStore()
-		tool := &createScheduleTool{sched: sc, st: pb}
+		tool := newCreateScheduleToolForTest(sc, pb, nil, nil)
 		got, _ := tool.Execute(context.Background(), 7, args)
 		if !strings.Contains(got, "频率过高") {
 			t.Fatalf("CodeValidation 应回文案: %q", got)
@@ -1167,7 +1265,7 @@ func TestScheduleTools_接线透传(t *testing.T) {
 
 	t.Run("create 透传 anchor_at", func(t *testing.T) {
 		f := &fakeSchedulePusher{}
-		_, err := (&createScheduleTool{sched: f, st: newFakePlaybookStore()}).Execute(context.Background(), 1,
+		_, err := newCreateScheduleToolForTest(f, newFakePlaybookStore(), nil, nil).Execute(context.Background(), 1,
 			json.RawMessage(`{"spec":{"every_seconds":259200,"anchor_at":"`+anchor+`","tz":"Asia/Shanghai"}}`))
 		if err != nil {
 			t.Fatalf("Execute 失败: %v", err)
@@ -1200,7 +1298,7 @@ func TestScheduleTools_接线透传(t *testing.T) {
 
 	t.Run("无锚点时不得凭空造出锚点", func(t *testing.T) {
 		f := &fakeSchedulePusher{}
-		if _, err := (&createScheduleTool{sched: f, st: newFakePlaybookStore()}).Execute(context.Background(), 1,
+		if _, err := newCreateScheduleToolForTest(f, newFakePlaybookStore(), nil, nil).Execute(context.Background(), 1,
 			json.RawMessage(`{"spec":{"every_seconds":7200}}`)); err != nil {
 			t.Fatalf("Execute 失败: %v", err)
 		}
@@ -1230,7 +1328,7 @@ func TestCreateScheduleTool_CompilesPlan(t *testing.T) {
 		sc := &fakeScheduleCreator{schedID: "push-7-abc"}
 		pb := newFakePlaybookStore()
 		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=ai"}]}`)}
-		tool := &createScheduleTool{sched: sc, st: pb, tr: tr}
+		tool := newCreateScheduleToolForTest(sc, pb, tr, nil)
 		if _, err := tool.Execute(context.Background(), 7, args); err != nil {
 			t.Fatalf("意外报错: %v", err)
 		}
@@ -1250,7 +1348,7 @@ func TestCreateScheduleTool_CompilesPlan(t *testing.T) {
 		sc := &fakeScheduleCreator{schedID: "push-7-x"}
 		pb := newFakePlaybookStore()
 		tr := &fakeTranslator{err: errors.New("llm 超时")}
-		tool := &createScheduleTool{sched: sc, st: pb, tr: tr}
+		tool := newCreateScheduleToolForTest(sc, pb, tr, nil)
 		got, err := tool.Execute(context.Background(), 7, args)
 		if err != nil {
 			t.Fatalf("翻译失败不应上抛: %v", err)
@@ -1268,7 +1366,7 @@ func TestCreateScheduleTool_CompilesPlan(t *testing.T) {
 		pb := newFakePlaybookStore()
 		pb.upsertErr = types.NewAppError(types.CodeDatabase, "写入失败", nil)
 		tr := &fakeTranslator{plan: emptyPlanJSON()}
-		tool := &createScheduleTool{sched: sc, st: pb, tr: tr}
+		tool := newCreateScheduleToolForTest(sc, pb, tr, nil)
 		if _, err := tool.Execute(context.Background(), 7, args); err != nil {
 			t.Fatalf("best-effort 不应上抛: %v", err)
 		}
@@ -1625,7 +1723,7 @@ func TestCreateScheduleTool_CurrentFailureStages(t *testing.T) {
 			deps := &createScheduleCharacterizationDeps{
 				failAt: tt.failAt, translatedPlan: tt.translatedPlan,
 			}
-			tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+			tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
 			testArgs := tt.args
 			if testArgs == "" {
 				testArgs = args
@@ -1736,7 +1834,7 @@ func TestCreateScheduleTool_CurrentFailureStages(t *testing.T) {
 // strict 主路径之外再用 normal 锁住映射，防重构把所有合法值静默写成 strict。
 func TestCreateScheduleTool_CurrentNormalStrictnessPassthrough(t *testing.T) {
 	deps := &createScheduleCharacterizationDeps{}
-	tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+	tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
 	args := json.RawMessage(
 		`{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
 			`"nl_description":"每天看两个官方源","strictness":"normal"}`,
