@@ -361,6 +361,23 @@ func TestScheduleSourcesStore(t *testing.T) {
 			t.Error("A 投过的 c 用户已读，B 也不该再看到（决策 A：同一条永不重复轰炸用户）")
 		}
 
+		// 多用户隔离：u 的投递只按属主去重，不抑制**别的用户**的任务候选
+		//（user_id 反查谓词的定向用例——谓词写错成固定用户或丢失时这里立刻红）。
+		schedU2 := "push-schedsrc-dedup-u2-" + uuid.NewString()
+		if err := st.InsertSchedule(ctx, &types.Schedule{
+			ID: schedU2, UserID: u2.ID, SpecJSON: json.RawMessage("{}"), ScopeJSON: json.RawMessage("{}"),
+			Status: types.ScheduleStatusActive,
+		}); err != nil {
+			t.Fatalf("InsertSchedule u2 失败: %v", err)
+		}
+		defer cleanupExec(t.Context(), t, st, `DELETE FROM schedules WHERE id = $1`, schedU2)
+		if err := st.ReplaceScheduleSources(ctx, u2.ID, schedU2, []int64{sShared}); err != nil {
+			t.Fatalf("Replace u2: %v", err)
+		}
+		if l, _ := st.ListUnpushedBySchedule(ctx, schedU2, 50, 50); !has(l, cID) {
+			t.Error("u 投过 c 不该影响 u2 的任务候选（去重按属主，不是全局）")
+		}
+
 		// 决策 A 的直接动机：全局推送（push_now，NULL schedule_id 批次）投过的内容，
 		// 隔离任务不得重推——转隔离首日 47 条候选里 40 条是用户已读的事故形状。
 		batchNull, err := st.CreatePushBatchIdempotent(ctx, u.ID, "tr-null-"+uuid.NewString(), "") // schedule_id=NULL

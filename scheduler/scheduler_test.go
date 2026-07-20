@@ -495,6 +495,26 @@ func TestUpdatePush_改名镜像失败回滚Action与Spec(t *testing.T) {
 	}
 }
 
+// TestUpdatePush_改名回滚旧入参为空也恢复 钉住回滚守卫用 wantArgs（写入侧标记）而非
+// oldArgs：旧 Action 入参为 nil（坏调度）时，回滚同样必须把已写入的新入参清回去——
+// 用 oldArgs != nil 当守卫会在此漏恢复，留下「镜像旧名 / Action 新名」漂移。
+func TestUpdatePush_改名回滚旧入参为空也恢复(t *testing.T) {
+	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-nil", nil)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
+	st := &fakeScheduleStore{updateErr: types.NewAppError(types.CodeDatabase, "模拟镜像写失败", nil)}
+	s := New(fc, "tq", st)
+
+	newName := "新任务名"
+	err := s.UpdatePush(context.Background(), "push-1-nil", 1, ScheduleSpec{Cron: "30 9 * * *"}, &newName)
+	if err == nil {
+		t.Fatal("镜像失败必须上抛错误")
+	}
+	act := h.current.Action.(*client.ScheduleWorkflowAction)
+	if len(act.Args) != 0 {
+		t.Errorf("回滚后入参应恢复为空（旧值），实得 %d 个", len(act.Args))
+	}
+}
+
 // TestUpdatePush_校验失败不碰Temporal 确保非法 spec 在进 Temporal 之前就被拒。
 func TestUpdatePush_校验失败不碰Temporal(t *testing.T) {
 	for name, spec := range map[string]ScheduleSpec{

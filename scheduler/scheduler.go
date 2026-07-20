@@ -457,9 +457,11 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64
 				DoUpdate: func(in client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
 					sch := in.Description.Schedule
 					sch.Spec = oldSpec
-					if oldArgs != nil {
+					if wantArgs != nil {
 						// 改名被回滚：Action 入参一并恢复旧任务名，不留
 						// 「镜像旧名 / Action 新名」的反向漂移。
+						// 守卫用 wantArgs（写入侧标记）而非 oldArgs：旧入参为 nil
+						// 时也必须把新入参清回去，否则漂移照旧发生。
 						if wf, ok := sch.Action.(*client.ScheduleWorkflowAction); ok {
 							na := *wf
 							na.Args = oldArgs
