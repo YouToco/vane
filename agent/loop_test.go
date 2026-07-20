@@ -1022,7 +1022,7 @@ func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testin
 	t.Run("确认前零副作用确认后按现有顺序执行", func(t *testing.T) {
 		fs := newFakeStore()
 		deps := &createScheduleCharacterizationDeps{}
-		tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+		tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
 		chat := &scriptedChat{responses: []*llm.ChatResponse{
 			{
 				ToolCalls: []llm.ToolCall{{
@@ -1112,7 +1112,7 @@ func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testin
 		t.Run("非法参数也先被 claim 且不可二次执行/"+tc.name, func(t *testing.T) {
 			fs := newFakeStore()
 			deps := &createScheduleCharacterizationDeps{}
-			tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+			tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
 			chat := &scriptedChat{responses: []*llm.ChatResponse{
 				{
 					ToolCalls: []llm.ToolCall{{
@@ -1161,7 +1161,7 @@ func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *tes
 		fs := newFakeStore()
 		fs.createActionErr = types.NewAppError(types.CodeDatabase, "pending write failed", nil)
 		deps := &createScheduleCharacterizationDeps{}
-		tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+		tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
 		chat := &scriptedChat{responses: []*llm.ChatResponse{
 			{ToolCalls: []llm.ToolCall{toolCall}, FinishReason: "tool_calls"},
 			{Content: "不应调用", FinishReason: "stop"},
@@ -1181,7 +1181,7 @@ func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *tes
 	t.Run("pending 已写但收尾 LLM 失败会留下 pending", func(t *testing.T) {
 		fs := newFakeStore()
 		deps := &createScheduleCharacterizationDeps{}
-		tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+		tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
 		calls := 0
 		chat := func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
 			calls++
@@ -1212,7 +1212,7 @@ func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *tes
 	t.Run("claim 基础设施失败不消费动作且可重试", func(t *testing.T) {
 		fs := newFakeStore()
 		deps := &createScheduleCharacterizationDeps{}
-		tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+		tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
 		chat := &scriptedChat{responses: []*llm.ChatResponse{
 			{ToolCalls: []llm.ToolCall{toolCall}, FinishReason: "tool_calls"},
 			{Content: "请确认", FinishReason: "stop"},
@@ -1245,7 +1245,7 @@ func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *tes
 	t.Run("scheduler 错误发生在 claim 后会永久消费动作", func(t *testing.T) {
 		fs := newFakeStore()
 		deps := &createScheduleCharacterizationDeps{failAt: "schedule"}
-		tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+		tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
 		chat := &scriptedChat{responses: []*llm.ChatResponse{
 			{ToolCalls: []llm.ToolCall{toolCall}, FinishReason: "tool_calls"},
 			{Content: "请确认", FinishReason: "stop"},

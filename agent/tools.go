@@ -21,8 +21,8 @@ import (
 	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
 )
 
 // PushTrigger 是 push_now 工具依赖的窄接口（契约 §8）：只暴露 userID 一个入参，
@@ -33,7 +33,7 @@ type PushTrigger interface {
 }
 
 // scheduleUpdater / scheduleDeleter 收窄 update/remove_schedule 依赖的 scheduler 能力
-// （与 scheduleCreator 同风格，*scheduler.Scheduler 都已实现）。
+// （*scheduler.Scheduler 都已实现）。
 //
 // 收窄的理由不只是"能起假实现"：Execute 把工具入参翻译成 scheduler.ScheduleSpec 的
 // 那几行是**纯接线**，漏传一个字段不报错、只让该能力静默失效——本 PR 的对抗审查实测，
@@ -70,31 +70,26 @@ type playbookStore interface {
 	ReplaceScheduleSources(ctx context.Context, userID int64, scheduleID string, sourceIDs []int64) error
 }
 
-// scheduleCreator 收窄 create_schedule 依赖的 scheduler 能力（*scheduler.Scheduler 已实现），
-// 使 Execute（含决策 D2 的手册初始化胶水）可用假实现单测，不必起真 Temporal。
-type scheduleCreator interface {
-	CreatePush(ctx context.Context, userID int64, spec scheduler.ScheduleSpec, scope workflow.PushScope, nlDesc string) (string, error)
-}
-
 // BuildTools 装配 agent 全部可用工具。返回的切片即工具白名单的静态部分（契约 §10）：
 // loop 只认这里注册的名字 + 会话已激活的 TikHub 端点（端点注册表契约 §4），
 // 模型编造的其余工具名一律拒绝。
 // endpoints 为 nil（TikHub key 未配置）时不装配 search_endpoints，工具面与
 // 该特性上线前完全一致。
-// tr 是任务手册翻译器（P1 编译层）：create/edit 手册后据此把正文编译成 fetch_plan。
-// 允许为 nil（未装配 LLM 的路径/测试）——此时手册仍可存取，只是不编译计划（best-effort）。
+// tasks 是根级任务控制面：create_schedule 只委托它，不再自行编排调度与聚合写入。
+// tr 是 edit_task_playbook 使用的翻译器（P1 编译层）：编辑手册后据此把正文编译成
+// fetch_plan。允许为 nil（未装配 LLM 的路径/测试）——此时手册仍可存取，只是不编译计划。
 // prober 是试跑=准入入口（*fetcher.Multi，生产直接传 multi；1.5 起统一分派绑定能力
 // 与 URL 类 web 能力的试跑）；nil 合法（测试/未装配）——退回不试跑直接落库。
 // exa 是 Exa ad-hoc 工具对（web_search/read_page）；nil（Exa key 未配置）时不装配，
 // 工具面与该特性上线前完全一致（同 endpoints 的 nil 语义）。
-func BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger, tr playbookTranslator, endpoints *EndpointTools, prober sourceProber, exa *ExaTools) []Tool {
+func BuildTools(st *store.Store, sched *scheduler.Scheduler, tasks taskCreator, pusher PushTrigger, tr playbookTranslator, endpoints *EndpointTools, prober sourceProber, exa *ExaTools) []Tool {
 	tools := []Tool{
 		&listSourcesTool{st: st},
 		&addSourceTool{st: st, prober: prober},
 		&removeSourceTool{st: st},
 		&enableSourceTool{st: st},
 		&listSchedulesTool{st: st},
-		&createScheduleTool{sched: sched, st: st, tr: tr, strict: st}, // st：创建即初始化手册（D2）；tr：并编译计划（P1）；strict：落初始门槛档位
+		&createScheduleTool{tasks: tasks},
 		&updateScheduleTool{sched: sched},
 		&removeScheduleTool{sched: sched},
 		&setTaskStrictnessTool{st: st}, // 任务级推送门槛档位（2026-07-19 拍板）
@@ -681,11 +676,14 @@ type strictnessStore interface {
 	SetScheduleStrictness(ctx context.Context, scheduleID string, userID int64, v types.PushStrictness) error
 }
 
+// taskCreator 是 create_schedule 消费的任务控制面接缝。Agent 只负责把模型参数翻译成
+// 已校验的 CreateInput；调度创建及其 best-effort 聚合步骤由根级 task.Service 编排。
+type taskCreator interface {
+	Create(ctx context.Context, input task.CreateInput) (task.CreateResult, error)
+}
+
 type createScheduleTool struct {
-	sched  scheduleCreator
-	st     playbookStore      // 创建即初始化任务手册（决策 D2）
-	tr     playbookTranslator // 并把手册意图编译成 fetch_plan（P1 编译层；nil=跳过）
-	strict strictnessStore    // 建成后落初始门槛档位（2026-07-19 拍板；nil=跳过）
+	tasks taskCreator
 }
 
 func (t *createScheduleTool) Name() string { return "create_schedule" }
@@ -718,7 +716,13 @@ func (t *createScheduleTool) Execute(ctx context.Context, userID int64, args jso
 		AnchorAt:     a.Spec.AnchorAt,
 		TZ:           a.Spec.TZ,
 	}
-	schedID, err := t.sched.CreatePush(ctx, userID, spec, workflow.PushScope{}, a.NLDescription)
+	result, err := t.tasks.Create(ctx, task.CreateInput{
+		UserID:          userID,
+		Spec:            spec,
+		NLDescription:   a.NLDescription,
+		PlaybookContent: capPlaybookContent(a.NLDescription),
+		Strictness:      types.PushStrictness(a.Strictness),
+	})
 	if err != nil {
 		// CreatePush 的 CodeValidation（cron 分钟字段过细、活跃上限等）是确定性、
 		// 用户可修正的失败：转成文案返回而非向上抛，模型/卡片能给出可读提示；
@@ -729,30 +733,10 @@ func (t *createScheduleTool) Execute(ctx context.Context, userID int64, args jso
 		}
 		return "", err
 	}
-	// 决策 D2：一个定时任务 = 一份自带手册的情报简报。调度建成后随即用用户的自然语言
-	// 意图原文初始化手册（P0 只存、不翻译成 fetch_plan、不影响抓取）。best-effort：手册写
-	// 失败不回滚已建成的调度——调度是主效果、P0 手册尚不参与抓取，为非功能性的手册写失败去
-	// 补偿删 Temporal 调度得不偿失；仅 slog 供对账（与 DeletePush 镜像删除失败只 slog 同原则）。
-	content := capPlaybookContent(a.NLDescription)
-	if ok, perr := t.st.UpsertSchedulePlaybook(ctx, userID, schedID, content); perr != nil {
-		slog.Error("agent: create_schedule 初始化任务手册失败（调度已创建）", "schedule_id", schedID, "err", perr)
-	} else if !ok {
-		slog.Warn("agent: create_schedule 初始化任务手册未命中刚建的调度（异常）", "schedule_id", schedID)
-	} else {
-		// 手册已初始化 → 据此编译抓取计划（P1 编译层，best-effort：失败只 slog、不影响调度）。
-		compilePlaybookPlan(ctx, t.st, t.tr, userID, schedID, content)
-	}
-	// 初始门槛档位（2026-07-19 拍板）：best-effort 同手册先例——档位写失败不回滚
-	// 已建成的调度，Select 会按全局兜底档过滤，用户随时可用 set_task_strictness 补设。
-	reply := fmt.Sprintf("已创建定时推送任务（id=%s）：%s", schedID, formatScheduleSpec(spec))
-	if a.Strictness != "" && t.strict != nil {
+	reply := fmt.Sprintf("已创建定时推送任务（id=%s）：%s", result.ScheduleID, formatScheduleSpec(spec))
+	if a.Strictness != "" && result.StrictnessApplied {
 		v := types.PushStrictness(a.Strictness)
-		if serr := t.strict.SetScheduleStrictness(ctx, schedID, userID, v); serr != nil {
-			slog.Error("agent: create_schedule 落初始门槛档位失败（调度已创建，按兜底档运行）",
-				"schedule_id", schedID, "strictness", v, "err", serr)
-		} else {
-			reply += fmt.Sprintf("，推送门槛「%s」（%s）", strictnessLabel(v), strictnessDesc(v))
-		}
+		reply += fmt.Sprintf("，推送门槛「%s」（%s）", strictnessLabel(v), strictnessDesc(v))
 	}
 	return reply, nil
 }
