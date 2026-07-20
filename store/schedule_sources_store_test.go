@@ -202,7 +202,7 @@ func TestScheduleSourcesStore(t *testing.T) {
 		}
 	})
 
-	t.Run("b3 隔离：只见本任务源的内容 + 本任务独立投递账本 + 任务间互不干扰", func(t *testing.T) {
+	t.Run("b3 隔离：取材按任务隔离（只见本任务源的内容）+ 用户级去重", func(t *testing.T) {
 		// schedID 绑 sA；另建 schedID2 绑 sB。内容 c 只经 sA 出现。
 		sA := mkSource(t, `{"query":"A"}`)
 		sB := mkSource(t, `{"query":"B"}`)
@@ -253,15 +253,15 @@ func TestScheduleSourcesStore(t *testing.T) {
 		if !has(aList, cID) {
 			t.Errorf("任务 A 应看到自己源的内容 %d", cID)
 		}
-		// **互不干扰**：任务 B（绑 sB，没绑 sA）看不到 c。
+		// **取材隔离**：任务 B（绑 sB，没绑 sA）看不到 c。
 		bList, err := st.ListUnpushedBySchedule(ctx, schedID2, 50, 50)
 		if err != nil {
 			t.Fatalf("ListUnpushedBySchedule(B) 失败: %v", err)
 		}
 		if has(bList, cID) {
-			t.Errorf("任务 B 不该看到任务 A 源的内容 %d（互不干扰破了）", cID)
+			t.Errorf("任务 B 不该看到任务 A 源的内容 %d（取材隔离破了）", cID)
 		}
-		// 本任务独立投递账本：A 把 c 投了 → A 再也看不到 c，但 B 的可见性本就不含 c（不受影响）。
+		// 用户级去重（决策 A）：A 把 c 投了 → A 再也看不到 c（用户已读，任何路径都不再重推）。
 		batchID, err := st.CreatePushBatchIdempotent(ctx, u.ID, "tr-iso-"+uuid.NewString(), schedID)
 		if err != nil {
 			t.Fatalf("CreatePushBatchIdempotent 失败: %v", err)
@@ -276,7 +276,7 @@ func TestScheduleSourcesStore(t *testing.T) {
 			t.Fatalf("ListUnpushedBySchedule(A 投递后) 失败: %v", err)
 		}
 		if has(aList2, cID) {
-			t.Errorf("任务 A 投过 c 后不该再看到它（本任务投递账本）")
+			t.Errorf("任务 A 投过 c 后不该再看到它（用户级去重：用户已读不重推）")
 		}
 		// ScheduleHasSources 分流开关。
 		if ok, _ := st.ScheduleHasSources(ctx, schedID); !ok {
@@ -295,11 +295,11 @@ func TestScheduleSourcesStore(t *testing.T) {
 		}
 	})
 
-	t.Run("b3 投递账本按 schedule 隔离：共享源下 A 投过 B 仍能看到（反证不是源隔离在起作用）", func(t *testing.T) {
+	t.Run("b3 去重用户级（决策 A）：共享源下 A 投过 B 也看不到——同一条永不重复轰炸用户", func(t *testing.T) {
 		// 一个源 sShared 同时绑给 A(schedID) 和 B(schedID2)，内容 c 经它入库。
 		sShared := mkSource(t, `{"query":"shared"}`)
 		defer cleanupExec(t.Context(), t, st, `DELETE FROM sources WHERE id = $1`, sShared)
-		schedB := "push-schedsrc-ledger-" + uuid.NewString()
+		schedB := "push-schedsrc-dedup-" + uuid.NewString()
 		if err := st.InsertSchedule(ctx, &types.Schedule{
 			ID: schedB, UserID: u.ID, SpecJSON: json.RawMessage("{}"), ScopeJSON: json.RawMessage("{}"),
 			Status: types.ScheduleStatusActive,
@@ -313,7 +313,7 @@ func TestScheduleSourcesStore(t *testing.T) {
 		if err := st.ReplaceScheduleSources(ctx, u.ID, schedB, []int64{sShared}); err != nil {
 			t.Fatalf("Replace B: %v", err)
 		}
-		ck := "https://example.com/ledger-" + uuid.NewString()
+		ck := "https://example.com/dedup-" + uuid.NewString()
 		cID, _, err := st.UpsertContentItem(ctx, &types.ContentItem{
 			SourceID: sShared, ExternalID: "ext-" + uuid.NewString(), CanonicalKey: ck, URL: ck,
 			Title: "共享内容", ContentHash: "h-" + uuid.NewString(),
@@ -335,7 +335,7 @@ func TestScheduleSourcesStore(t *testing.T) {
 			}
 			return false
 		}
-		// 初始：A、B 都看得到 c（共享源）。
+		// 初始：A、B 都看得到 c（共享源，取材面都覆盖）。
 		if a, _ := st.ListUnpushedBySchedule(ctx, schedID, 50, 50); !has(a, cID) {
 			t.Fatal("初始 A 应看到共享内容")
 		}
@@ -343,7 +343,7 @@ func TestScheduleSourcesStore(t *testing.T) {
 			t.Fatal("初始 B 应看到共享内容")
 		}
 		// A 投递 c（A 的 batch）。
-		batchA, err := st.CreatePushBatchIdempotent(ctx, u.ID, "tr-ledgerA-"+uuid.NewString(), schedID)
+		batchA, err := st.CreatePushBatchIdempotent(ctx, u.ID, "tr-dedupA-"+uuid.NewString(), schedID)
 		if err != nil {
 			t.Fatalf("建 A 批次: %v", err)
 		}
@@ -352,15 +352,17 @@ func TestScheduleSourcesStore(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("A 投递: %v", err)
 		}
-		// **账本隔离的关键**：A 投过 → A 看不到；但 **B 仍能看到**（B 有自己的账本，A 的投递与它无关）。
+		// **用户级去重的关键（决策 A）**：A 投过 → 用户已读 → A 看不到，**B 也看不到**。
+		// 代价（已知、接受）：共享源的两个任务不再各推一遍同一条。
 		if a, _ := st.ListUnpushedBySchedule(ctx, schedID, 50, 50); has(a, cID) {
-			t.Error("A 投过 c 后不该再看到（本任务账本）")
+			t.Error("A 投过 c 后不该再看到（用户级去重）")
 		}
-		if b, _ := st.ListUnpushedBySchedule(ctx, schedB, 50, 50); !has(b, cID) {
-			t.Error("A 投的不该影响 B——B 仍应看到 c（证明账本按 schedule 而非 user 隔离）")
+		if b, _ := st.ListUnpushedBySchedule(ctx, schedB, 50, 50); has(b, cID) {
+			t.Error("A 投过的 c 用户已读，B 也不该再看到（决策 A：同一条永不重复轰炸用户）")
 		}
 
-		// b3 NULL schedule_id 历史批次不误命中：push_now（NULL 批次）投过 c，不该让 B 看不到 c。
+		// 决策 A 的直接动机：全局推送（push_now，NULL schedule_id 批次）投过的内容，
+		// 隔离任务不得重推——转隔离首日 47 条候选里 40 条是用户已读的事故形状。
 		batchNull, err := st.CreatePushBatchIdempotent(ctx, u.ID, "tr-null-"+uuid.NewString(), "") // schedule_id=NULL
 		if err != nil {
 			t.Fatalf("建 NULL 批次: %v", err)
@@ -370,7 +372,7 @@ func TestScheduleSourcesStore(t *testing.T) {
 			t.Fatalf("push_now 批次 schedule_id 应为 NULL, isNull=%v err=%v", isNull, err)
 		}
 		// 造第二条内容 c2 经共享源，用 NULL 批次投它。
-		ck2 := "https://example.com/ledger2-" + uuid.NewString()
+		ck2 := "https://example.com/dedup2-" + uuid.NewString()
 		c2ID, _, err := st.UpsertContentItem(ctx, &types.ContentItem{
 			SourceID: sShared, ExternalID: "ext-" + uuid.NewString(), CanonicalKey: ck2, URL: ck2,
 			Title: "共享内容2", ContentHash: "h2-" + uuid.NewString(),
@@ -389,9 +391,9 @@ func TestScheduleSourcesStore(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("NULL 批次投递: %v", err)
 		}
-		// B 是 schedule 级任务：NULL 批次（push_now）投过 c2 不该让 B 看不到 c2（账本按 schedule_id 匹配，NULL≠B）。
-		if b, _ := st.ListUnpushedBySchedule(ctx, schedB, 50, 50); !has(b, c2ID) {
-			t.Error("push_now 的 NULL 批次投递不该命中 schedule 任务的账本，B 仍应看到 c2")
+		// push_now 全局推送投过 c2 = 用户已读 → B（schedule 任务）不得再把 c2 当候选。
+		if b, _ := st.ListUnpushedBySchedule(ctx, schedB, 50, 50); has(b, c2ID) {
+			t.Error("push_now 全局推送投过的 c2 用户已读，B 不该再看到（决策 A 的核心场景）")
 		}
 	})
 

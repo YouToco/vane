@@ -287,18 +287,23 @@ func (s *Store) ListUnpushedByUser(ctx context.Context, userID int64, limit, per
 }
 
 // ListUnpushedBySchedule 是 ListUnpushedByUser 的**按任务隔离**版本（P1b b3）：候选只在
-// 本任务的软范围源（schedule_sources）见过的内容里挑，且只排除**本任务自己**投过的
-// （deliveries → push_batches.schedule_id 那条按任务的投递账本），而非用户全局。这就是决策 #3
-// 「情报任务自包含、互不干扰」的落地——任务 A 的推送再也不会挑到/吃掉任务 B 的内容。
+// 本任务的软范围源（schedule_sources）见过的内容里挑。
 //
-// 与用户级版的两处差异：
-//   - EXISTS 从 `content_sources JOIN subscriptions（用户订阅）` 换成
-//     `content_sources JOIN schedule_sources（本任务的源）`；
-//   - NOT EXISTS 从 `deliveries WHERE user_id` 换成 `deliveries JOIN push_batches WHERE schedule_id`
-//     （每个任务一本独立投递账本；b1 已把 schedule_id 写进 push_batches）。
+// 与用户级版**只差一处**——EXISTS 从 `content_sources JOIN subscriptions（用户订阅）` 换成
+// `content_sources JOIN schedule_sources（本任务的源）`，即**取材范围**按任务隔离。
+// **去重不隔离**：NOT EXISTS 与用户级版一致，排除该用户**已投递过的全部内容**（任意批次/
+// 任意状态），而非只排除本任务自己投过的。
 //
-// perSourceCap 仍按 source_id 分区（同用户级版，防高产源饿死低产源）。纯 scheduleID 锚定范围，
-// scheduleID 由 PushParams 经 scheduler 可信下传，无注入面。
+// 为什么去重用用户级而非 per-schedule 账本（决策 A，2026-07-19 Boss 拍板改）：早期用
+// per-schedule 账本（deliveries JOIN push_batches WHERE schedule_id）追求「自包含互不干扰」，
+// 但任务从用户级转隔离时该账本为空 → 本任务源里用户**早已在全局推送里看过**的存量积压全被
+// 当成「没推过」重推一遍（实测：转隔离首日 47 条候选里 40 条是用户已读）。改成用户级去重后，
+// 隔离任务永不把用户看过的内容再推一遍（无论经本任务、别的任务还是全局）。代价（已知、接受）：
+// 两个任务共享同一源时，同一内容只会被先触发的那个推给用户一次——轻微弱化「任务自包含」，
+// 换来「同一条永不重复轰炸用户」，对单用户产品是更优权衡。
+//
+// perSourceCap 仍按 source_id 分区（同用户级版，防高产源饿死低产源）。scheduleID 由 PushParams
+// 经 scheduler 可信下传，无注入面；用户由 scheduleID 反查（schedule 属主唯一）。
 func (s *Store) ListUnpushedBySchedule(ctx context.Context, scheduleID string, limit, perSourceCap int) ([]types.ContentItem, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, source_id, external_id, canonical_key, url, title, content, author,
@@ -316,8 +321,8 @@ func (s *Store) ListUnpushedBySchedule(ctx context.Context, scheduleID string, l
 		     )
 		       AND NOT EXISTS (
 		           SELECT 1 FROM deliveries d
-		           JOIN push_batches b ON b.id = d.batch_id
-		           WHERE b.schedule_id = $1 AND d.content_item_id = ci.id
+		           WHERE d.content_item_id = ci.id
+		             AND d.user_id = (SELECT user_id FROM schedules WHERE id = $1)
 		       )
 		 ) t
 		 WHERE t.rn <= $3
