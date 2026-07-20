@@ -292,15 +292,21 @@ func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handleMe 返回当前登录身份，供前端探测登录态。
+// handleMe 返回当前登录身份，供前端探测登录态与展示用户块（头像/邮箱）。
 func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 	p, err := auth.PrincipalFromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
+	// email 仅供界面展示；查询失败降级为空，不阻断登录态探测（me 的首要职责）。
+	email, eerr := s.deps.Auth.GetUserEmailByID(r.Context(), p.UserID)
+	if eerr != nil {
+		slog.Warn("me: 查询用户邮箱失败，降级为空", "user_id", p.UserID, "err", eerr)
+		email = ""
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "user_id": p.UserID, "tenant_id": int64(p.TenantID),
+		"ok": true, "user_id": p.UserID, "tenant_id": int64(p.TenantID), "email": email,
 	})
 }
 

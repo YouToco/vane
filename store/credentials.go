@@ -134,6 +134,21 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (*types.User, 
 	return &u, nil
 }
 
+// GetUserEmailByID 按用户 ID 取邮箱（/api/auth/me 界面展示用，最小面查询）。
+// 飞书时代的存量用户没有邮箱（列可空），返回空串而非错——调用方按「无邮箱」展示。
+func (s *Store) GetUserEmailByID(ctx context.Context, userID int64) (string, error) {
+	var email string
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(email, '') FROM users WHERE id = $1`, userID).Scan(&email)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", types.NewAppError(types.CodeNotFound, "用户不存在", err)
+		}
+		return "", types.NewAppError(types.CodeDatabase, "按 ID 查询用户邮箱", err)
+	}
+	return email, nil
+}
+
 // UpdatePasswordHash 更新用户密码哈希（改密码、或登录后按新参数无感重算）。
 func (s *Store) UpdatePasswordHash(ctx context.Context, userID int64, passwordHash string) error {
 	tag, err := s.pool.Exec(ctx,
