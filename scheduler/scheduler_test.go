@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -84,8 +85,8 @@ func TestTranslateSpec_Cron(t *testing.T) {
 	if len(got.Intervals) != 0 {
 		t.Errorf("cron spec 不应产出 Intervals，实际 %v", got.Intervals)
 	}
-	if got.TimeZoneName != defaultTZ {
-		t.Errorf("默认时区应为 %s，实际 %s", defaultTZ, got.TimeZoneName)
+	if got.TimeZoneName != "Asia/Shanghai" {
+		t.Errorf("默认时区应为 Asia/Shanghai，实际 %s", got.TimeZoneName)
 	}
 }
 
@@ -110,6 +111,398 @@ func TestTranslateSpec_Interval(t *testing.T) {
 func TestTranslateSpec_RejectsInvalid(t *testing.T) {
 	if _, err := translateSpec(ScheduleSpec{EverySeconds: 60}); err == nil {
 		t.Error("低于硬地板的 interval 应在 translateSpec 被拒")
+	}
+}
+
+// ============================================================
+// CreatePush：行为刻画（A0）。
+//
+// 这组测试只钉住当前入口的可观察行为，不为后续 task.Service / paused saga
+// 预写新语义。故障替身共享一条调用轨迹，使每个失败注入能精确证明停在哪一阶段。
+// ============================================================
+
+type createPushTrace struct {
+	calls []string
+}
+
+func (tr *createPushTrace) add(call string) {
+	tr.calls = append(tr.calls, call)
+}
+
+type createPushStore struct {
+	scheduleStore
+	trace       *createPushTrace
+	schedules   []types.Schedule
+	listErr     error
+	insertErr   error
+	listCalls   int
+	listUserID  int64
+	insertCalls int
+	inserted    *types.Schedule
+}
+
+func (st *createPushStore) ListSchedulesByUser(_ context.Context, userID int64) ([]types.Schedule, error) {
+	st.trace.add("store.list")
+	st.listCalls++
+	st.listUserID = userID
+	return st.schedules, st.listErr
+}
+
+func (st *createPushStore) InsertSchedule(_ context.Context, sc *types.Schedule) error {
+	st.trace.add("store.insert")
+	st.insertCalls++
+	if sc != nil {
+		copied := *sc
+		copied.SpecJSON = append(json.RawMessage(nil), sc.SpecJSON...)
+		copied.ScopeJSON = append(json.RawMessage(nil), sc.ScopeJSON...)
+		st.inserted = &copied
+	}
+	return st.insertErr
+}
+
+type createPushTemporalClient struct {
+	client.Client
+	schedules *createPushScheduleClient
+}
+
+func (fc *createPushTemporalClient) ScheduleClient() client.ScheduleClient {
+	return fc.schedules
+}
+
+type createPushScheduleClient struct {
+	client.ScheduleClient
+	trace       *createPushTrace
+	handle      *createPushScheduleHandle
+	createErr   error
+	createCalls int
+	createOpts  client.ScheduleOptions
+	handleCalls int
+	handleID    string
+}
+
+func (fc *createPushScheduleClient) Create(_ context.Context, opts client.ScheduleOptions) (client.ScheduleHandle, error) {
+	fc.trace.add("temporal.create")
+	fc.createCalls++
+	fc.createOpts = opts
+	if fc.createErr != nil {
+		return nil, fc.createErr
+	}
+	return fc.handle, nil
+}
+
+func (fc *createPushScheduleClient) GetHandle(_ context.Context, id string) client.ScheduleHandle {
+	fc.trace.add("temporal.get_handle")
+	fc.handleCalls++
+	fc.handleID = id
+	fc.handle.id = id
+	return fc.handle
+}
+
+type createPushScheduleHandle struct {
+	client.ScheduleHandle
+	trace       *createPushTrace
+	id          string
+	deleteErr   error
+	deleteCalls int
+}
+
+func (h *createPushScheduleHandle) GetID() string {
+	return h.id
+}
+
+func (h *createPushScheduleHandle) Delete(_ context.Context) error {
+	h.trace.add("temporal.delete")
+	h.deleteCalls++
+	return h.deleteErr
+}
+
+func activeScheduleFixtures(n int) []types.Schedule {
+	out := make([]types.Schedule, n)
+	for i := range out {
+		out[i].Status = types.ScheduleStatusActive
+	}
+	return out
+}
+
+// TestCreatePush_CurrentBehavior 锁定当前 Scheduler.CreatePush 的阶段顺序、
+// 错误映射与补偿边界。后续 A1 迁移到 task.Service 时应复用同一组 golden 行为；
+// 在此之前不得把 create 改成 paused，也不得改变用户可见错误文案。
+func TestCreatePush_CurrentBehavior(t *testing.T) {
+	listCause := errors.New("list failed")
+	listErr := types.NewAppError(types.CodeDatabase, "读取调度镜像失败", listCause)
+	createErr := errors.New("temporal unavailable")
+	insertErr := errors.New("insert failed")
+	deleteErr := errors.New("delete failed")
+
+	validSpec := ScheduleSpec{Cron: "15 8 * * *"}
+	scope := workflow.PushScope{SourceIDs: []int64{11, 22}, TopN: 3}
+
+	tests := []struct {
+		name          string
+		spec          ScheduleSpec
+		schedules     []types.Schedule
+		listErr       error
+		createErr     error
+		insertErr     error
+		deleteErr     error
+		wantCalls     []string
+		wantCode      types.ErrCode
+		wantMessage   string
+		wantCause     error
+		wantExactErr  error
+		wantDeleteErr bool
+		wantSuccess   bool
+		wantSDKSpec   client.ScheduleSpec
+	}{
+		{
+			name:        "validation failure stops before I/O",
+			spec:        ScheduleSpec{},
+			wantCalls:   nil,
+			wantCode:    types.CodeValidation,
+			wantMessage: "spec 必须且只能提供 cron 或 every_seconds 之一",
+		},
+		{
+			name:         "list failure is returned without touching Temporal",
+			spec:         validSpec,
+			listErr:      listErr,
+			wantCalls:    []string{"store.list"},
+			wantCode:     types.CodeDatabase,
+			wantMessage:  "读取调度镜像失败",
+			wantCause:    listCause,
+			wantExactErr: listErr,
+		},
+		{
+			name:        "active limit stops after list",
+			spec:        validSpec,
+			schedules:   activeScheduleFixtures(maxActiveSchedules),
+			wantCalls:   []string{"store.list"},
+			wantCode:    types.CodeValidation,
+			wantMessage: "活跃定时任务已达上限（20 个）",
+		},
+		{
+			name:        "Temporal create failure stops before mirror insert",
+			spec:        validSpec,
+			createErr:   createErr,
+			wantCalls:   []string{"store.list", "temporal.create"},
+			wantCode:    types.CodeInternal,
+			wantMessage: "创建 Temporal 定时任务失败",
+			wantCause:   createErr,
+		},
+		{
+			name:        "mirror insert failure deletes the created Temporal schedule",
+			spec:        validSpec,
+			insertErr:   insertErr,
+			wantCalls:   []string{"store.list", "temporal.create", "store.insert", "temporal.get_handle", "temporal.delete"},
+			wantCode:    types.CodeDatabase,
+			wantMessage: "创建定时任务镜像失败，已回滚 Temporal 调度",
+			wantCause:   insertErr,
+		},
+		{
+			name:          "compensation delete failure still returns the mirror error",
+			spec:          validSpec,
+			insertErr:     insertErr,
+			deleteErr:     deleteErr,
+			wantCalls:     []string{"store.list", "temporal.create", "store.insert", "temporal.get_handle", "temporal.delete"},
+			wantCode:      types.CodeDatabase,
+			wantMessage:   "创建定时任务镜像失败，已回滚 Temporal 调度",
+			wantCause:     insertErr,
+			wantDeleteErr: true,
+		},
+		{
+			name: "success creates active Temporal and mirror with the same ID",
+			spec: validSpec,
+			schedules: []types.Schedule{
+				{Status: types.ScheduleStatusPaused},
+			},
+			wantCalls:   []string{"store.list", "temporal.create", "store.insert"},
+			wantSuccess: true,
+			wantSDKSpec: client.ScheduleSpec{
+				CronExpressions: []string{"15 8 * * *"},
+				TimeZoneName:    "Asia/Shanghai",
+			},
+		},
+		{
+			name: "anchored interval success preserves every and phase",
+			spec: ScheduleSpec{
+				EverySeconds: 6 * 3600,
+				AnchorAt:     "2026-07-19T15:00:00+08:00",
+			},
+			wantCalls:   []string{"store.list", "temporal.create", "store.insert"},
+			wantSuccess: true,
+			wantSDKSpec: client.ScheduleSpec{
+				Intervals: []client.ScheduleIntervalSpec{{
+					Every:  6 * time.Hour,
+					Offset: time.Hour,
+				}},
+				TimeZoneName: "Asia/Shanghai",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trace := &createPushTrace{}
+			handle := &createPushScheduleHandle{trace: trace, deleteErr: tt.deleteErr}
+			scheduleClient := &createPushScheduleClient{
+				trace:     trace,
+				handle:    handle,
+				createErr: tt.createErr,
+			}
+			store := &createPushStore{
+				trace:     trace,
+				schedules: tt.schedules,
+				listErr:   tt.listErr,
+				insertErr: tt.insertErr,
+			}
+			s := New(&createPushTemporalClient{schedules: scheduleClient}, "vane-create-tq", store)
+
+			gotID, err := s.CreatePush(t.Context(), 42, tt.spec, scope, "每日 AI 情报")
+
+			if !reflect.DeepEqual(trace.calls, tt.wantCalls) {
+				t.Errorf("阶段顺序 = %v，期望 %v", trace.calls, tt.wantCalls)
+			}
+			if store.listCalls > 0 && store.listUserID != 42 {
+				t.Errorf("ListSchedulesByUser userID = %d，期望 42", store.listUserID)
+			}
+			if tt.wantSuccess {
+				if err != nil {
+					t.Fatalf("CreatePush() 意外失败: %v", err)
+				}
+				assertCreatePushSuccess(t, gotID, tt.spec, tt.wantSDKSpec, scope, scheduleClient, store, handle)
+				return
+			}
+
+			if err == nil {
+				t.Fatal("CreatePush() 应失败")
+			}
+			if gotID != "" {
+				t.Errorf("失败时返回 ID = %q，期望空串", gotID)
+			}
+			if got := types.CodeOf(err); got != tt.wantCode {
+				t.Errorf("错误码 = %s，期望 %s（err=%v）", got, tt.wantCode, err)
+			}
+			var appErr *types.AppError
+			if !errors.As(err, &appErr) {
+				t.Fatalf("错误类型 = %T，期望 *types.AppError", err)
+			}
+			if appErr.Message != tt.wantMessage {
+				t.Errorf("错误文案 = %q，期望 %q", appErr.Message, tt.wantMessage)
+			}
+			if tt.wantCause != nil && !errors.Is(err, tt.wantCause) {
+				t.Errorf("错误链未保留阶段根因 %v：%v", tt.wantCause, err)
+			}
+			if tt.wantExactErr != nil && err != tt.wantExactErr {
+				t.Errorf("list 失败应原样返回，实得 %T %v", err, err)
+			}
+			if tt.wantDeleteErr && errors.Is(err, deleteErr) {
+				t.Errorf("当前行为只记录补偿删除错误，不应以它覆盖镜像错误：%v", err)
+			}
+			if tt.insertErr != nil {
+				if scheduleClient.handleID != scheduleClient.createOpts.ID {
+					t.Errorf("补偿删除 ID = %q，期望刚创建的 %q", scheduleClient.handleID, scheduleClient.createOpts.ID)
+				}
+				if handle.deleteCalls != 1 {
+					t.Errorf("镜像失败应补偿删除一次，实得 %d", handle.deleteCalls)
+				}
+			}
+		})
+	}
+}
+
+func assertCreatePushSuccess(
+	t *testing.T,
+	gotID string,
+	wantSpec ScheduleSpec,
+	wantSDKSpec client.ScheduleSpec,
+	wantScope workflow.PushScope,
+	scheduleClient *createPushScheduleClient,
+	store *createPushStore,
+	handle *createPushScheduleHandle,
+) {
+	t.Helper()
+
+	const prefix = "push-42-"
+	if !strings.HasPrefix(gotID, prefix) || len(strings.TrimPrefix(gotID, prefix)) != 36 {
+		t.Errorf("schedule ID = %q，期望 %s<uuid>", gotID, prefix)
+	}
+	if scheduleClient.createCalls != 1 {
+		t.Errorf("Temporal Create 调用 %d 次，期望 1", scheduleClient.createCalls)
+	}
+	opts := scheduleClient.createOpts
+	if opts.ID != gotID {
+		t.Errorf("Temporal ID = %q，返回 ID = %q", opts.ID, gotID)
+	}
+	if opts.Paused {
+		t.Error("当前 CreatePush 应创建 active Temporal schedule（Paused=false）")
+	}
+	if opts.Overlap != enums.SCHEDULE_OVERLAP_POLICY_SKIP {
+		t.Errorf("Overlap = %s，期望 SKIP", opts.Overlap)
+	}
+	if !reflect.DeepEqual(opts.Spec, wantSDKSpec) {
+		t.Errorf("Temporal spec = %+v，期望 %+v", opts.Spec, wantSDKSpec)
+	}
+
+	action, ok := opts.Action.(*client.ScheduleWorkflowAction)
+	if !ok {
+		t.Fatalf("Action 类型 = %T，期望 *client.ScheduleWorkflowAction", opts.Action)
+	}
+	if action.ID != "wf-"+gotID {
+		t.Errorf("workflow ID = %q，期望 wf-%s", action.ID, gotID)
+	}
+	if action.TaskQueue != "vane-create-tq" {
+		t.Errorf("TaskQueue = %q，期望 vane-create-tq", action.TaskQueue)
+	}
+	gotWorkflow := reflect.ValueOf(action.Workflow)
+	wantWorkflow := reflect.ValueOf(workflow.PushPipelineWorkflow)
+	if gotWorkflow.Kind() != reflect.Func || gotWorkflow.Pointer() != wantWorkflow.Pointer() {
+		t.Errorf("Workflow = %T，期望 workflow.PushPipelineWorkflow", action.Workflow)
+	}
+	if len(action.Args) != 1 {
+		t.Fatalf("Action Args 数量 = %d，期望 1", len(action.Args))
+	}
+	params, ok := action.Args[0].(workflow.PushParams)
+	if !ok {
+		t.Fatalf("Action Args[0] 类型 = %T，期望 workflow.PushParams", action.Args[0])
+	}
+	wantParams := workflow.PushParams{
+		UserID:     42,
+		ScheduleID: gotID,
+		Scope:      wantScope,
+		NLDesc:     "每日 AI 情报",
+	}
+	if !reflect.DeepEqual(params, wantParams) {
+		t.Errorf("Action params = %+v，期望 %+v", params, wantParams)
+	}
+
+	if store.listCalls != 1 || store.insertCalls != 1 {
+		t.Errorf("镜像调用次数 list=%d insert=%d，期望各 1", store.listCalls, store.insertCalls)
+	}
+	if store.inserted == nil {
+		t.Fatal("成功路径应写入 schedule 镜像")
+	}
+	mirror := store.inserted
+	if mirror.ID != gotID || mirror.UserID != 42 || mirror.NLDescription != "每日 AI 情报" {
+		t.Errorf("镜像身份字段 = %+v，期望与 Temporal/调用入参一致", mirror)
+	}
+	if mirror.Status != types.ScheduleStatusActive {
+		t.Errorf("镜像 status = %q，期望 active", mirror.Status)
+	}
+	var gotSpec ScheduleSpec
+	if err := json.Unmarshal(mirror.SpecJSON, &gotSpec); err != nil {
+		t.Fatalf("解析镜像 spec_json: %v", err)
+	}
+	if !reflect.DeepEqual(gotSpec, wantSpec) {
+		t.Errorf("镜像 spec = %+v，期望 %+v", gotSpec, wantSpec)
+	}
+	var gotScope workflow.PushScope
+	if err := json.Unmarshal(mirror.ScopeJSON, &gotScope); err != nil {
+		t.Fatalf("解析镜像 scope_json: %v", err)
+	}
+	if !reflect.DeepEqual(gotScope, wantScope) {
+		t.Errorf("镜像 scope = %+v，期望 %+v", gotScope, wantScope)
+	}
+	if scheduleClient.handleCalls != 0 || handle.deleteCalls != 0 {
+		t.Errorf("成功路径不应补偿删除：GetHandle=%d Delete=%d", scheduleClient.handleCalls, handle.deleteCalls)
 	}
 }
 

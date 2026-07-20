@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -22,9 +23,11 @@ import (
 // （Get 按 since 过滤、Claim 原子幂等、Cancel 仅 pending 可取消），
 // 同时充当 ProfileReader / profileStore（M5 画像面）的假实现。
 type fakeStore struct {
-	nextSessionID int64
-	sessions      map[int64]*types.AgentSession
-	actions       map[string]*types.PendingAction
+	nextSessionID   int64
+	sessions        map[int64]*types.AgentSession
+	actions         map[string]*types.PendingAction
+	createActionErr error
+	claimActionErr  error
 
 	profiles      map[int64]*types.Profile
 	profileGetErr error                 // 注入 GetProfile 的非 NotFound 失败
@@ -234,12 +237,18 @@ func (f *fakeStore) sessionMessages(id int64) *types.AgentSession {
 }
 
 func (f *fakeStore) CreatePendingAction(_ context.Context, a *types.PendingAction) error {
+	if f.createActionErr != nil {
+		return f.createActionErr
+	}
 	cp := *a
 	f.actions[a.ID] = &cp
 	return nil
 }
 
 func (f *fakeStore) ClaimPendingAction(_ context.Context, id string, userID int64) (*types.PendingAction, error) {
+	if f.claimActionErr != nil {
+		return nil, f.claimActionErr
+	}
 	a, ok := f.actions[id]
 	if !ok || a.UserID != userID || a.Status != types.PendingActionStatusPending || !a.ExpiresAt.After(time.Now()) {
 		return nil, notFoundErr("fake: 动作不可领取")
@@ -1001,6 +1010,268 @@ func TestHandleMessage_MutatingToolConfirmCard(t *testing.T) {
 	if fs.updateCalls != 1 {
 		t.Fatalf("确认卡路径应持久化会话 1 次, 实得 %d", fs.updateCalls)
 	}
+}
+
+// A0：用真实 createScheduleTool 贯穿“模型提出写操作 → pending → 用户确认 →
+// 当前 best-effort 创建链”。这是 legacy/current behavior 的 golden；A1 只允许换接缝，
+// 不得悄悄改变确认摘要、调用顺序、最终回复或 claim-before-execute 语义。
+func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testing.T) {
+	const args = `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
+		`"nl_description":"每天看两个官方源","strictness":"strict"}`
+
+	t.Run("确认前零副作用确认后按现有顺序执行", func(t *testing.T) {
+		fs := newFakeStore()
+		deps := &createScheduleCharacterizationDeps{}
+		tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+		chat := &scriptedChat{responses: []*llm.ChatResponse{
+			{
+				ToolCalls: []llm.ToolCall{{
+					ID: "create-1", Name: "create_schedule", Arguments: args,
+				}},
+				FinishReason: "tool_calls",
+			},
+			{Content: "请确认创建这个任务。", FinishReason: "stop"},
+		}}
+		l := newTestLoop(t, fs, chat.fn, tool)
+
+		out, err := l.HandleMessage(t.Context(), 7, "每天看两个官方源")
+		if err != nil {
+			t.Fatalf("HandleMessage() error = %v", err)
+		}
+		if out.Reply != "请确认创建这个任务。" || out.Confirm == nil {
+			t.Fatalf("确认出口不符: %+v", out)
+		}
+		if len(deps.events) != 0 {
+			t.Fatalf("确认前不得执行 create_schedule，实得阶段 %v", deps.events)
+		}
+		pa := fs.actions[out.Confirm.ActionID]
+		if pa == nil || pa.Status != types.PendingActionStatusPending ||
+			pa.ToolName != "create_schedule" || string(pa.Args) != args {
+			t.Fatalf("pending action 不符: %+v", pa)
+		}
+		const wantSummary = "待确认操作：create_schedule\n" +
+			"创建定时推送任务：按 cron「0 8 * * *」触发（时区 Asia/Shanghai），" +
+			"描述「每天看两个官方源」"
+		if out.Confirm.Summary != wantSummary {
+			t.Fatalf("确认摘要 = %q, want %q", out.Confirm.Summary, wantSummary)
+		}
+
+		deps.onSchedule = func() {
+			if got := fs.actions[out.Confirm.ActionID].Status; got != types.PendingActionStatusExecuted {
+				t.Fatalf("CreatePush 调用时 action 状态 = %s，want executed（当前先 claim 后执行）", got)
+			}
+		}
+		got, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID)
+		if err != nil {
+			t.Fatalf("ExecuteAction() error = %v", err)
+		}
+		const wantReply = "已创建定时推送任务（id=push-7-current）：" +
+			"按 cron「0 8 * * *」触发（时区 Asia/Shanghai），" +
+			"推送门槛「严格」（仅 ≥60 分的高相关内容才推送）"
+		if got != wantReply {
+			t.Fatalf("ExecuteAction() = %q, want %q", got, wantReply)
+		}
+		wantEvents := []string{
+			"schedule", "playbook", "translate", "plan",
+			"source_0", "source_1", "links", "strictness",
+		}
+		if !slices.Equal(deps.events, wantEvents) {
+			t.Fatalf("确认后阶段序列 = %v, want %v", deps.events, wantEvents)
+		}
+		waitAppends(t, fs, 1)
+
+		again, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID)
+		if err != nil || again == got || len(deps.events) != len(wantEvents) {
+			t.Fatalf("重复确认不得重跑: reply=%q err=%v events=%v", again, err, deps.events)
+		}
+		waitAppends(t, fs, 1)
+	})
+
+	invalidCases := []struct {
+		name      string
+		args      string
+		wantReply string
+	}{
+		{
+			name:      "cron 与 interval 互斥失败",
+			args:      `{"spec":{"cron":"0 8 * * *","every_seconds":3600}}`,
+			wantReply: "spec 必须且只能提供 cron 或 every_seconds 之一",
+		},
+		{
+			name:      "JSON 类型错误",
+			args:      `[]`,
+			wantReply: "参数不是合法 JSON，请修正后重试",
+		},
+		{
+			name:      "非法 strictness",
+			args:      `{"spec":{"cron":"0 8 * * *"},"strictness":"extreme"}`,
+			wantReply: "strictness 只能是 loose / normal / strict 之一（或不传）",
+		},
+	}
+	for _, tc := range invalidCases {
+		t.Run("非法参数也先被 claim 且不可二次执行/"+tc.name, func(t *testing.T) {
+			fs := newFakeStore()
+			deps := &createScheduleCharacterizationDeps{}
+			tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+			chat := &scriptedChat{responses: []*llm.ChatResponse{
+				{
+					ToolCalls: []llm.ToolCall{{
+						ID: "create-invalid", Name: "create_schedule", Arguments: tc.args,
+					}},
+					FinishReason: "tool_calls",
+				},
+				{Content: "请确认。", FinishReason: "stop"},
+			}}
+			l := newTestLoop(t, fs, chat.fn, tool)
+
+			out, err := l.HandleMessage(t.Context(), 7, "建一个任务")
+			if err != nil || out.Confirm == nil {
+				t.Fatalf("非法工具参数仍会先生成确认卡: out=%+v err=%v", out, err)
+			}
+			if string(fs.actions[out.Confirm.ActionID].Args) != tc.args {
+				t.Fatalf("pending action 参数漂移: got=%s want=%s",
+					fs.actions[out.Confirm.ActionID].Args, tc.args)
+			}
+			got, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID)
+			if err != nil || got != tc.wantReply {
+				t.Fatalf("确认后参数校验语义不符: got=%q err=%v", got, err)
+			}
+			if len(deps.events) != 0 ||
+				fs.actions[out.Confirm.ActionID].Status != types.PendingActionStatusExecuted {
+				t.Fatalf("非法参数不得碰 scheduler，但 action 当前会被消耗: events=%v action=%+v",
+					deps.events, fs.actions[out.Confirm.ActionID])
+			}
+			waitAppends(t, fs, 1)
+
+			again, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID)
+			if err != nil || again == got || len(deps.events) != 0 {
+				t.Fatalf("已消耗的非法动作不得二次尝试: got=%q err=%v events=%v",
+					again, err, deps.events)
+			}
+			waitAppends(t, fs, 1)
+		})
+	}
+}
+
+func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *testing.T) {
+	const args = `{"spec":{"cron":"0 8 * * *"},"nl_description":"每天看官方源"}`
+	toolCall := llm.ToolCall{ID: "create-failure", Name: "create_schedule", Arguments: args}
+
+	t.Run("pending 写失败时不做收尾调用且无创建副作用", func(t *testing.T) {
+		fs := newFakeStore()
+		fs.createActionErr = types.NewAppError(types.CodeDatabase, "pending write failed", nil)
+		deps := &createScheduleCharacterizationDeps{}
+		tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+		chat := &scriptedChat{responses: []*llm.ChatResponse{
+			{ToolCalls: []llm.ToolCall{toolCall}, FinishReason: "tool_calls"},
+			{Content: "不应调用", FinishReason: "stop"},
+		}}
+		l := newTestLoop(t, fs, chat.fn, tool)
+
+		out, err := l.HandleMessage(t.Context(), 7, "建任务")
+		if err == nil || out.Confirm != nil {
+			t.Fatalf("pending 写失败应上抛且无确认出口: out=%+v err=%v", out, err)
+		}
+		if len(chat.requests) != 1 || len(fs.actions) != 0 || len(deps.events) != 0 {
+			t.Fatalf("pending 写失败应停在首轮: requests=%d actions=%d events=%v",
+				len(chat.requests), len(fs.actions), deps.events)
+		}
+	})
+
+	t.Run("pending 已写但收尾 LLM 失败会留下 pending", func(t *testing.T) {
+		fs := newFakeStore()
+		deps := &createScheduleCharacterizationDeps{}
+		tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+		calls := 0
+		chat := func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+			calls++
+			if calls == 1 {
+				return &llm.ChatResponse{
+					ToolCalls: []llm.ToolCall{toolCall}, FinishReason: "tool_calls",
+				}, nil
+			}
+			return nil, types.NewAppError(types.CodeLLMUnavailable, "final reply failed", nil)
+		}
+		l := newTestLoop(t, fs, chat, tool)
+
+		out, err := l.HandleMessage(t.Context(), 7, "建任务")
+		if err == nil || out.Confirm != nil {
+			t.Fatalf("收尾 LLM 失败应上抛且无可见确认出口: out=%+v err=%v", out, err)
+		}
+		if calls != 2 || len(fs.actions) != 1 || len(deps.events) != 0 {
+			t.Fatalf("当前会留下未执行 pending: calls=%d actions=%d events=%v",
+				calls, len(fs.actions), deps.events)
+		}
+		for _, action := range fs.actions {
+			if action.Status != types.PendingActionStatusPending {
+				t.Fatalf("遗留 action 状态 = %s, want pending", action.Status)
+			}
+		}
+	})
+
+	t.Run("claim 基础设施失败不消费动作且可重试", func(t *testing.T) {
+		fs := newFakeStore()
+		deps := &createScheduleCharacterizationDeps{}
+		tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+		chat := &scriptedChat{responses: []*llm.ChatResponse{
+			{ToolCalls: []llm.ToolCall{toolCall}, FinishReason: "tool_calls"},
+			{Content: "请确认", FinishReason: "stop"},
+		}}
+		l := newTestLoop(t, fs, chat.fn, tool)
+		out, err := l.HandleMessage(t.Context(), 7, "建任务")
+		if err != nil || out.Confirm == nil {
+			t.Fatalf("准备确认动作失败: out=%+v err=%v", out, err)
+		}
+
+		fs.claimActionErr = types.NewAppError(types.CodeDatabase, "claim failed", nil)
+		if got, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID); err == nil || got != "" {
+			t.Fatalf("claim 基础设施错误应上抛: got=%q err=%v", got, err)
+		}
+		waitAppends(t, fs, 0)
+		if fs.actions[out.Confirm.ActionID].Status != types.PendingActionStatusPending ||
+			len(deps.events) != 0 {
+			t.Fatalf("claim 失败不得消费/执行: action=%+v events=%v",
+				fs.actions[out.Confirm.ActionID], deps.events)
+		}
+
+		fs.claimActionErr = nil
+		if got, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID); err != nil ||
+			!strings.Contains(got, "push-7-current") {
+			t.Fatalf("claim 恢复后当前允许重试: got=%q err=%v", got, err)
+		}
+		waitAppends(t, fs, 1)
+	})
+
+	t.Run("scheduler 错误发生在 claim 后会永久消费动作", func(t *testing.T) {
+		fs := newFakeStore()
+		deps := &createScheduleCharacterizationDeps{failAt: "schedule"}
+		tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+		chat := &scriptedChat{responses: []*llm.ChatResponse{
+			{ToolCalls: []llm.ToolCall{toolCall}, FinishReason: "tool_calls"},
+			{Content: "请确认", FinishReason: "stop"},
+		}}
+		l := newTestLoop(t, fs, chat.fn, tool)
+		out, err := l.HandleMessage(t.Context(), 7, "建任务")
+		if err != nil || out.Confirm == nil {
+			t.Fatalf("准备确认动作失败: out=%+v err=%v", out, err)
+		}
+
+		if got, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID); err == nil || got != "" {
+			t.Fatalf("scheduler 错误应上抛: got=%q err=%v", got, err)
+		}
+		waitAppends(t, fs, 1)
+		if fs.actions[out.Confirm.ActionID].Status != types.PendingActionStatusExecuted ||
+			!slices.Equal(deps.events, []string{"schedule"}) {
+			t.Fatalf("scheduler 错误当前发生在永久 claim 后: action=%+v events=%v",
+				fs.actions[out.Confirm.ActionID], deps.events)
+		}
+		again, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID)
+		if err != nil || len(deps.events) != 1 || again == "" {
+			t.Fatalf("第二次确认不得重试 scheduler: got=%q err=%v events=%v",
+				again, err, deps.events)
+		}
+		waitAppends(t, fs, 1)
+	})
 }
 
 // 用例 4：未知工具自纠——以 role=tool 回"工具 X 不存在"，模型下一轮自纠收敛。
