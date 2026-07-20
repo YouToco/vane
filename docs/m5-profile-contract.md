@@ -906,6 +906,10 @@ Gate ⑧ 真人实测 **FAIL**：Boss 13:26 手动删掉演化新加的标签「
   从未执行它，接线与否是待拍板的部署语义决策；新增 `-env <file>` flag（KEY=VALUE、
   容忍 CRLF、进程环境优先），`/opt/vane/.env` 混 CRLF 致 shell source 报错的实锤
   由此收口，告警卡尾行命令同步为 `gate -env /opt/vane/.env`。
+  **2026-07-20 Boss 拍板：接线**（同日落地）——deploy 的 post-deploy 步骤在 VPS 上
+  执行 `gate -env /opt/vane/.env`，红灯（exit 1）与探针自身失败（exit 2）均打红
+  流水线；黄不阻断。窗口 24h 覆盖部署前数据是刻意语义：上一版制造的红灯不被
+  下一次部署静默滚过。服务无自动回滚，流水线红=「部署已生效但体检不过」的强信号。
 
 ## 17. 已知取舍与遗留（记录在案）
 
