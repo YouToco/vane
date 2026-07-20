@@ -6,6 +6,32 @@
 ## [Unreleased]
 
 ### Added
+- **通用来源兜底解析**（功能清单 1.5，`feat/generic-fallback-fetcher`）：「试跑=准入」从绑定能力
+  推广到 URL 类 web 能力（web/feed、web/contents）——`add_source` 确认后先真调一次，全过才落库，
+  消除「冷门 URL 解析失败却回『已添加』、用户误以为已订阅」的假装成功。web/feed 试跑失败于
+  「不是 feed」时走兜底解析（`fetcher/resolve.go`）：从页面 HTML 嗅探 autodiscovery 声明
+  （`<link rel="alternate" type="application/rss+xml">`），发现真实 feed 地址则进拒绝话术建议
+  改用它；未发现则建议 web/contents 页面监控或 web/search 关键词订阅。只建议、不静默改道
+  （M6 §2.2；确认卡上是什么 URL 就订什么 URL）。试跑分派收敛在 `fetcher.Multi.Probe`
+  （web/search 无试跑门返回 nil——入参是关键词无「来源解析」概念）；拒绝话术为 ProbeRejection
+  人话（红线 3），瞬态失败不翻译（保持「稍后再试」语义）。运行期「不无限重试」由既有
+  fail_count 链承载（3 次告警/10 次自动停用），零新增。
+  - **双怀疑者对抗审查（正确性 + 安全/红线两视角）修复 10 项**：
+    ① 嗅探出的 feed URL 由攻击者可控页面声明、经回执进 agent 的 `[卡片回调]` 上下文——
+    该路径此前无 promptguard（全仓其余「抓取内容→模型」处都有）；拼进话术前施加
+    `StripInvisible+Sanitize+SingleLine+TruncateRunes`（中和定界符伪造 + 剥隐藏字符 + 限长），
+    并在 `sniffFeedLinks` 层拒收 userinfo/非 http(s)/超 512 字节 URL、嗅探 body 限 512KB（防内存放大）。
+    ② 链接型源在补全上游 Exa 瞬态全失败时全灭，原会被诬告成「格式不兼容、持续零产出」的
+    **确定性**拒绝——`enrichItems` 带出补全失败计数，全灭且有补全失败时改报可重试错误
+    （走「稍后再试」），周期路径 §86 告警措辞同时变准。③ 嗅探 base 用重定向终点 + `<base href>`
+    （原用原始 URL，尾斜杠/跨域 301 后建议地址失真）。④ 二次 GET 失败不再谎称「未发现 feed 声明」。
+    ⑤ `rel` 按 token 拆、`type` 去 MIME 参数（原精确串比较漏识别真实网页）。⑥ `probeBudget`
+    10s→25s + 试跑轮补全封顶降至 5（原 10s 打不住 feed+补全+嗅探，慢源结构性误拒）。⑦ 私网
+    IP 不进 probe 话术（SSRF 盲→非盲）。⑧ JSON Feed（`application/feed+json`）实测 gofeed 支持、
+    收进白名单（原错误排除、引向付费 web/contents）。新增/改造 8 个测试用例锁定。
+    已知边界（诚实记录，不在本 PR 扩）：probe 的 Exa/TikHub 抓取花费无配额前置门禁
+    （§2.7 配额仅接 LLM 花钱路径，binding probe 同样无，add_source 人在环）；试跑与首轮抓取
+    对重叠条目两次付费（~$0.005+$0.01/源一次性）。
 - **信源连续失败自动停用 + 重新启用**（功能 5.2 补全，`feat/source-auto-disable`）：在既有
   「连续失败 3 次发预警卡」之上，新增连续失败达 `disableFetchFailThreshold=10` 次自动置
   `disabled`（停止抓取），并发一张与预警卡区分的「已暂停 + 如何重新启用」卡。Boss 拍板

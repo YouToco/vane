@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -247,8 +248,11 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 	var cached bool
 	for _, st := range cr.Statuses {
 		if st.Status == "error" {
+			// Cause 带 errPageUnreachable 哨兵：probe 路径（probe.go）据此把「Exa 抓不到
+			// 该页」翻译成「请检查 URL」而非「稍后再试」——试跑时这多半是 URL 打错或
+			// 页面需要登录，不是瞬态故障。周期抓取路径不感知（Retryable 语义不变）。
 			ae := types.NewAppError(types.CodeFetchTimeout,
-				fmt.Sprintf("Exa /contents 抓取失败（url=%s，status=error）", pageURL), nil)
+				fmt.Sprintf("Exa /contents 抓取失败（url=%s，status=error）", pageURL), errPageUnreachable)
 			ae.Retryable = true
 			return nil, false, ae
 		}
@@ -258,6 +262,9 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 	}
 	return cr.Results, cached, nil
 }
+
+// errPageUnreachable 标记「Exa 报告目标页面抓取失败」（HTTP 200 + statuses[].status=error）。
+var errPageUnreachable = errors.New("目标页面抓取失败")
 
 // mapExaContents 把 /contents 结果映射为一条 ContentItem，并自填 canonical_key
 // （含 textHash，承载变化检测）。

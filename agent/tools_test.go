@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/sourcespec"
@@ -395,6 +396,54 @@ func TestAddSourceDescriptionDerivesUnavailableFromCatalog(t *testing.T) {
 	}
 	if !strings.Contains(desc, "x/search") {
 		t.Errorf("工具说明应点名 x/search，实际：%q", desc)
+	}
+}
+
+// fakeProber 是 sourceProber 的测试替身。
+type fakeProber struct {
+	rep *fetcher.ProbeReport
+	err error
+}
+
+func (f *fakeProber) Probe(context.Context, types.Source) (*fetcher.ProbeReport, error) {
+	return f.rep, f.err
+}
+
+// TestAddSource_ProbeRejectionReachesUserVerbatim 锁 1.5 的「解析失败诚实告知 + 替代建议」：
+// ProbeRejection 的话术（含替代建议）必须原样进回执，且**绝不落库**——st 传 nil，
+// 若 Execute 在拒绝后仍去碰 store 会直接 panic，本用例即红。web/feed 此前不试跑直接
+// 落库（「假装成功，用户误以为已订阅」），这里同时守住门禁已从 IsBindingBacked 扩到
+// URL 类 web 能力。
+func TestAddSource_ProbeRejectionReachesUserVerbatim(t *testing.T) {
+	rejection := &fetcher.ProbeRejection{AE: types.NewAppError(types.CodeValidation,
+		"该地址返回的内容不是 RSS/Atom feed，但页面声明了 feed 地址：https://e.com/rss.xml。建议把 url 换成该地址重新添加（web/feed）。", nil)}
+	tool := &addSourceTool{st: nil, prober: &fakeProber{err: rejection}}
+
+	out, err := tool.Execute(context.Background(), 1,
+		json.RawMessage(`{"platform":"web","capability":"feed","url":"https://e.com/blog"}`))
+	if err != nil {
+		t.Fatalf("准入拒绝应作为回执文本返回而非 error: %v", err)
+	}
+	for _, want := range []string{"未添加信源", "https://e.com/rss.xml", "web/feed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("回执缺少 %q：%s", want, out)
+		}
+	}
+}
+
+// TestAddSource_TransientProbeErrorGetsFixedText 瞬态失败（超时/限流）不透出原始
+// Message（红线 3），映射固定人话；同样不落库（st=nil 不 panic 即证明）。
+func TestAddSource_TransientProbeErrorGetsFixedText(t *testing.T) {
+	tool := &addSourceTool{st: nil, prober: &fakeProber{
+		err: types.NewAppError(types.CodeFetchRateLimit, "上游 429 raw body: {...}", nil)}}
+
+	out, err := tool.Execute(context.Background(), 1,
+		json.RawMessage(`{"platform":"web","capability":"contents","url":"https://e.com/pricing"}`))
+	if err != nil {
+		t.Fatalf("瞬态失败应作为回执文本返回而非 error: %v", err)
+	}
+	if !strings.Contains(out, "限流") || strings.Contains(out, "raw body") {
+		t.Errorf("瞬态失败应映射固定人话且不泄漏原始错误：%s", out)
 	}
 }
 
