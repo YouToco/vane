@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1274,6 +1276,460 @@ func TestCreateScheduleTool_CompilesPlan(t *testing.T) {
 			t.Fatalf("手册没存成不该编译计划, calls=%d", tr.calls)
 		}
 	})
+}
+
+// createScheduleCharacterizationDeps 是 A0 的阶段化替身：同一事件序列同时刻画
+// create_schedule 当前的调用顺序、best-effort 截断点和已经发生的部分副作用。
+// 这些是 legacy/current behavior，不代表 A3+ 创建 saga 的目标语义。
+type characterizationTargetCall struct {
+	userID     int64
+	scheduleID string
+	content    string
+}
+
+type characterizationPlanCall struct {
+	userID     int64
+	scheduleID string
+	plan       json.RawMessage
+}
+
+type characterizationLinksCall struct {
+	userID     int64
+	scheduleID string
+	sourceIDs  []int64
+}
+
+type characterizationStrictnessCall struct {
+	userID     int64
+	scheduleID string
+	value      types.PushStrictness
+}
+
+const characterizationDefaultPlan = `{"sources":[` +
+	`{"platform":"web","capability":"feed","title":"One Official","url":"https://one.example/rss","config":{"etag":"one"}},` +
+	`{"platform":"web","capability":"feed","title":"Two Official","url":"https://two.example/rss","config":{"etag":"two"}}` +
+	`]}`
+
+type createScheduleCharacterizationDeps struct {
+	failAt         string
+	events         []string
+	materialized   int
+	translatedPlan json.RawMessage
+	onSchedule     func()
+	gotUserID      int64
+	gotSpec        scheduler.ScheduleSpec
+	gotScope       workflow.PushScope
+	gotNLDesc      string
+
+	playbookAttempt   characterizationTargetCall
+	playbookCommitted bool
+	translateAttempt  characterizationTargetCall
+	planAttempt       characterizationPlanCall
+	planCommitted     bool
+	sourceAttempts    []types.Source
+	linksAttempt      characterizationLinksCall
+	linksCommitted    bool
+	committedLinks    []int64
+	strictAttempt     characterizationStrictnessCall
+	strictCommitted   bool
+}
+
+func (f *createScheduleCharacterizationDeps) stage(name string) error {
+	f.events = append(f.events, name)
+	if f.failAt == name {
+		return errors.New("injected " + name)
+	}
+	return nil
+}
+
+func (f *createScheduleCharacterizationDeps) CreatePush(_ context.Context, userID int64,
+	spec scheduler.ScheduleSpec, scope workflow.PushScope, nlDesc string) (string, error) {
+	if f.onSchedule != nil {
+		f.onSchedule()
+	}
+	f.gotUserID, f.gotSpec, f.gotScope, f.gotNLDesc = userID, spec, scope, nlDesc
+	if f.failAt == "schedule_validation" {
+		f.events = append(f.events, "schedule")
+		return "", types.NewAppError(types.CodeValidation, "legacy validation", nil)
+	}
+	if err := f.stage("schedule"); err != nil {
+		return "", types.NewAppError(types.CodeInternal, "legacy scheduler failure", err)
+	}
+	return "push-7-current", nil
+}
+
+func (f *createScheduleCharacterizationDeps) GetSchedulePlaybook(
+	context.Context, int64, string,
+) (*types.SchedulePlaybook, error) {
+	return nil, types.NewAppError(types.CodeNotFound, "unused", nil)
+}
+
+func (f *createScheduleCharacterizationDeps) UpsertSchedulePlaybook(
+	_ context.Context, userID int64, scheduleID, content string,
+) (bool, error) {
+	f.playbookAttempt = characterizationTargetCall{
+		userID: userID, scheduleID: scheduleID, content: content,
+	}
+	if err := f.stage("playbook"); err != nil {
+		return false, err
+	}
+	if f.failAt == "playbook_miss" ||
+		userID != 7 || scheduleID != "push-7-current" {
+		return false, nil
+	}
+	f.playbookCommitted = true
+	return true, nil
+}
+
+func (f *createScheduleCharacterizationDeps) Translate(
+	_ context.Context, userID int64, content string,
+) (json.RawMessage, error) {
+	f.translateAttempt = characterizationTargetCall{userID: userID, content: content}
+	if err := f.stage("translate"); err != nil {
+		return nil, err
+	}
+	if f.translatedPlan != nil {
+		return append(json.RawMessage(nil), f.translatedPlan...), nil
+	}
+	return json.RawMessage(characterizationDefaultPlan), nil
+}
+
+func (f *createScheduleCharacterizationDeps) SetFetchPlan(
+	_ context.Context, userID int64, scheduleID string, plan json.RawMessage,
+) (bool, error) {
+	f.planAttempt = characterizationPlanCall{
+		userID: userID, scheduleID: scheduleID,
+		plan: append(json.RawMessage(nil), plan...),
+	}
+	if err := f.stage("plan"); err != nil {
+		return false, err
+	}
+	if f.failAt == "plan_miss" ||
+		userID != 7 || scheduleID != "push-7-current" {
+		return false, nil
+	}
+	f.planCommitted = true
+	return true, nil
+}
+
+func (f *createScheduleCharacterizationDeps) GetOrCreateSource(
+	_ context.Context, src *types.Source,
+) (int64, bool, error) {
+	got := *src
+	got.Config = append(json.RawMessage(nil), src.Config...)
+	f.sourceAttempts = append(f.sourceAttempts, got)
+	stage := fmt.Sprintf("source_%d", f.materialized)
+	if err := f.stage(stage); err != nil {
+		return 0, false, err
+	}
+	f.materialized++
+	return 100 + int64(f.materialized), true, nil
+}
+
+func (f *createScheduleCharacterizationDeps) ReplaceScheduleSources(
+	_ context.Context, userID int64, scheduleID string, sourceIDs []int64,
+) error {
+	f.linksAttempt = characterizationLinksCall{
+		userID: userID, scheduleID: scheduleID,
+		sourceIDs: append([]int64(nil), sourceIDs...),
+	}
+	if err := f.stage("links"); err != nil {
+		return err
+	}
+	if userID != 7 || scheduleID != "push-7-current" {
+		return types.NewAppError(types.CodeNotFound, "wrong characterization target", nil)
+	}
+	f.linksCommitted = true
+	f.committedLinks = append([]int64(nil), sourceIDs...)
+	return nil
+}
+
+func (f *createScheduleCharacterizationDeps) SetScheduleStrictness(
+	_ context.Context, scheduleID string, userID int64, v types.PushStrictness,
+) error {
+	f.strictAttempt = characterizationStrictnessCall{
+		userID: userID, scheduleID: scheduleID, value: v,
+	}
+	if err := f.stage("strictness"); err != nil {
+		return err
+	}
+	if userID != 7 || scheduleID != "push-7-current" {
+		return types.NewAppError(types.CodeNotFound, "wrong characterization target", nil)
+	}
+	f.strictCommitted = true
+	return nil
+}
+
+type characterizationCommittedState struct {
+	playbook       bool
+	plan           bool
+	sourceAttempts int
+	materialized   int
+	links          bool
+	strictness     bool
+	linkIDs        []int64
+}
+
+func TestCreateScheduleTool_CurrentFailureStages(t *testing.T) {
+	const (
+		args = `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
+			`"nl_description":"每天看两个官方源","strictness":"strict"}`
+		argsWithoutStrictness = `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
+			`"nl_description":"每天看两个官方源"}`
+		invalidStrictnessArgs = `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
+			`"nl_description":"每天看两个官方源","strictness":"extreme"}`
+		baseReply = "已创建定时推送任务（id=push-7-current）：" +
+			"按 cron「0 8 * * *」触发（时区 Asia/Shanghai）"
+		strictReply = baseReply + "，推送门槛「严格」（仅 ≥60 分的高相关内容才推送）"
+	)
+	successEvents := []string{
+		"schedule", "playbook", "translate", "plan",
+		"source_0", "source_1", "links", "strictness",
+	}
+	tests := []struct {
+		name           string
+		args           string
+		failAt         string
+		translatedPlan json.RawMessage
+		wantEvents     []string
+		wantReply      string
+		wantErr        bool
+		wantState      characterizationCommittedState
+	}{
+		{
+			name:       "全部成功",
+			wantEvents: successEvents,
+			wantReply:  strictReply,
+			wantState: characterizationCommittedState{
+				playbook: true, plan: true, sourceAttempts: 2, materialized: 2,
+				links: true, strictness: true, linkIDs: []int64{101, 102},
+			},
+		},
+		{
+			name:      "参数不是 JSON 对象时副作用为零",
+			args:      `[]`,
+			wantReply: "参数不是合法 JSON，请修正后重试",
+		},
+		{
+			name:      "非法门槛在创建调度前拒绝",
+			args:      invalidStrictnessArgs,
+			wantReply: "strictness 只能是 loose / normal / strict 之一（或不传）",
+		},
+		{
+			name:       "省略门槛不写默认值",
+			args:       argsWithoutStrictness,
+			wantEvents: successEvents[:len(successEvents)-1],
+			wantReply:  baseReply,
+			wantState: characterizationCommittedState{
+				playbook: true, plan: true, sourceAttempts: 2, materialized: 2,
+				links: true, linkIDs: []int64{101, 102},
+			},
+		},
+		{
+			name:           "合法零源计划仍以空列表替换链接",
+			translatedPlan: json.RawMessage(`{"sources":[]}`),
+			wantEvents:     []string{"schedule", "playbook", "translate", "plan", "links", "strictness"},
+			wantReply:      strictReply,
+			wantState: characterizationCommittedState{
+				playbook: true, plan: true, links: true, strictness: true,
+			},
+		},
+		{
+			name:       "scheduler validation 转成人话且无后置调用",
+			failAt:     "schedule_validation",
+			wantEvents: []string{"schedule"},
+			wantReply:  "legacy validation",
+		},
+		{
+			name:       "scheduler 基础设施错误上抛且无后置调用",
+			failAt:     "schedule",
+			wantEvents: []string{"schedule"},
+			wantErr:    true,
+		},
+		{
+			name:       "手册写失败仍设门槛并回成功",
+			failAt:     "playbook",
+			wantEvents: []string{"schedule", "playbook", "strictness"},
+			wantReply:  strictReply,
+			wantState:  characterizationCommittedState{strictness: true},
+		},
+		{
+			name:       "手册归属未命中不编译仍回成功",
+			failAt:     "playbook_miss",
+			wantEvents: []string{"schedule", "playbook", "strictness"},
+			wantReply:  strictReply,
+			wantState:  characterizationCommittedState{strictness: true},
+		},
+		{
+			name:       "翻译失败保留调度仍设门槛",
+			failAt:     "translate",
+			wantEvents: []string{"schedule", "playbook", "translate", "strictness"},
+			wantReply:  strictReply,
+			wantState:  characterizationCommittedState{playbook: true, strictness: true},
+		},
+		{
+			name:       "计划写失败不材料化仍设门槛",
+			failAt:     "plan",
+			wantEvents: []string{"schedule", "playbook", "translate", "plan", "strictness"},
+			wantReply:  strictReply,
+			wantState:  characterizationCommittedState{playbook: true, strictness: true},
+		},
+		{
+			name:       "计划写未命中不材料化仍设门槛",
+			failAt:     "plan_miss",
+			wantEvents: []string{"schedule", "playbook", "translate", "plan", "strictness"},
+			wantReply:  strictReply,
+			wantState:  characterizationCommittedState{playbook: true, strictness: true},
+		},
+		{
+			name:       "第一个源失败不替换链接仍设门槛",
+			failAt:     "source_0",
+			wantEvents: []string{"schedule", "playbook", "translate", "plan", "source_0", "strictness"},
+			wantReply:  strictReply,
+			wantState: characterizationCommittedState{
+				playbook: true, plan: true, sourceAttempts: 1, strictness: true,
+			},
+		},
+		{
+			name:       "第二个源失败保留第一个全局源但不替换链接",
+			failAt:     "source_1",
+			wantEvents: []string{"schedule", "playbook", "translate", "plan", "source_0", "source_1", "strictness"},
+			wantReply:  strictReply,
+			wantState: characterizationCommittedState{
+				playbook: true, plan: true, sourceAttempts: 2, materialized: 1, strictness: true,
+			},
+		},
+		{
+			name:       "链接替换失败时计划与全局源已写仍回成功",
+			failAt:     "links",
+			wantEvents: successEvents,
+			wantReply:  strictReply,
+			wantState: characterizationCommittedState{
+				playbook: true, plan: true, sourceAttempts: 2, materialized: 2, strictness: true,
+			},
+		},
+		{
+			name:       "门槛写失败回成功但回复省略门槛",
+			failAt:     "strictness",
+			wantEvents: successEvents,
+			wantReply:  baseReply,
+			wantState: characterizationCommittedState{
+				playbook: true, plan: true, sourceAttempts: 2, materialized: 2,
+				links: true, linkIDs: []int64{101, 102},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deps := &createScheduleCharacterizationDeps{
+				failAt: tt.failAt, translatedPlan: tt.translatedPlan,
+			}
+			tool := &createScheduleTool{sched: deps, st: deps, tr: deps, strict: deps}
+			testArgs := tt.args
+			if testArgs == "" {
+				testArgs = args
+			}
+
+			got, err := tool.Execute(t.Context(), 7, json.RawMessage(testArgs))
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Execute() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.wantReply {
+				t.Fatalf("Execute() reply = %q, want %q", got, tt.wantReply)
+			}
+			if !slices.Equal(deps.events, tt.wantEvents) {
+				t.Fatalf("阶段序列 = %v, want %v", deps.events, tt.wantEvents)
+			}
+			gotState := characterizationCommittedState{
+				playbook:       deps.playbookCommitted,
+				plan:           deps.planCommitted,
+				sourceAttempts: len(deps.sourceAttempts),
+				materialized:   deps.materialized,
+				links:          deps.linksCommitted,
+				strictness:     deps.strictCommitted,
+				linkIDs:        deps.committedLinks,
+			}
+			if gotState.playbook != tt.wantState.playbook ||
+				gotState.plan != tt.wantState.plan ||
+				gotState.sourceAttempts != tt.wantState.sourceAttempts ||
+				gotState.materialized != tt.wantState.materialized ||
+				gotState.links != tt.wantState.links ||
+				gotState.strictness != tt.wantState.strictness ||
+				!slices.Equal(gotState.linkIDs, tt.wantState.linkIDs) {
+				t.Fatalf("最终持久化状态 = %+v, want %+v", gotState, tt.wantState)
+			}
+
+			if slices.Contains(tt.wantEvents, "schedule") {
+				wantSpec := scheduler.ScheduleSpec{Cron: "0 8 * * *", TZ: "Asia/Shanghai"}
+				if deps.gotUserID != 7 || deps.gotSpec != wantSpec ||
+					deps.gotNLDesc != "每天看两个官方源" ||
+					len(deps.gotScope.SourceIDs) != 0 || deps.gotScope.TopN != 0 {
+					t.Fatalf("Scheduler 透传不符: %+v", deps)
+				}
+			}
+			if slices.Contains(tt.wantEvents, "playbook") {
+				if deps.playbookAttempt != (characterizationTargetCall{
+					userID: 7, scheduleID: "push-7-current", content: "每天看两个官方源",
+				}) {
+					t.Fatalf("手册目标/正文不符: %+v", deps.playbookAttempt)
+				}
+			}
+			if slices.Contains(tt.wantEvents, "translate") {
+				if deps.translateAttempt != (characterizationTargetCall{
+					userID: 7, content: "每天看两个官方源",
+				}) {
+					t.Fatalf("翻译身份/正文不符: %+v", deps.translateAttempt)
+				}
+			}
+			if slices.Contains(tt.wantEvents, "plan") {
+				wantPlan := characterizationDefaultPlan
+				if tt.translatedPlan != nil {
+					wantPlan = string(tt.translatedPlan)
+				}
+				if deps.planAttempt.userID != 7 ||
+					deps.planAttempt.scheduleID != "push-7-current" ||
+					string(deps.planAttempt.plan) != wantPlan {
+					t.Fatalf("计划目标/内容不符: %+v", deps.planAttempt)
+				}
+			}
+			wantSources := []types.Source{
+				{
+					Platform: types.PlatformWeb, Capability: types.CapFeed,
+					Title: "One Official", URL: "https://one.example/rss",
+					Config: json.RawMessage(`{"etag":"one"}`),
+				},
+				{
+					Platform: types.PlatformWeb, Capability: types.CapFeed,
+					Title: "Two Official", URL: "https://two.example/rss",
+					Config: json.RawMessage(`{"etag":"two"}`),
+				},
+			}
+			for i, source := range deps.sourceAttempts {
+				if i >= len(wantSources) || !reflect.DeepEqual(source, wantSources[i]) {
+					t.Fatalf("材料化源[%d] = %+v, want %+v", i, source, wantSources[i])
+				}
+			}
+			if slices.Contains(tt.wantEvents, "links") {
+				wantAttemptIDs := []int64{101, 102}
+				if tt.translatedPlan != nil {
+					wantAttemptIDs = nil
+				}
+				if deps.linksAttempt.userID != 7 ||
+					deps.linksAttempt.scheduleID != "push-7-current" ||
+					!slices.Equal(deps.linksAttempt.sourceIDs, wantAttemptIDs) {
+					t.Fatalf("链接目标/入参不符: %+v", deps.linksAttempt)
+				}
+			}
+			if slices.Contains(tt.wantEvents, "strictness") {
+				if deps.strictAttempt != (characterizationStrictnessCall{
+					userID: 7, scheduleID: "push-7-current", value: types.StrictnessStrict,
+				}) {
+					t.Fatalf("门槛目标/入参不符: %+v", deps.strictAttempt)
+				}
+			}
+		})
+	}
 }
 
 // TestEditTaskPlaybookTool_CompilesPlan 守 P1 编译层：edit 存下正文后据此重编译计划，
