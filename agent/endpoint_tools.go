@@ -82,6 +82,9 @@ type toolRunState struct {
 	// 校验通过之后、发请求之前：打到上游才算（含 HTTP 错误——失败同样计费），
 	// 参数校验失败没打上游、不计费，不吃限额。
 	endpointCalls int
+	// exaCalls 本条消息内已发起的 Exa ad-hoc 调用（web_search/read_page）次数，
+	// 计数时机与 endpointCalls 相同（双重限额的消息内一重，见 exa_tools.go 头注）。
+	exaCalls int
 	// inlinedRunes 本条消息内已内联进上下文的端点结果字符数（累计预算，
 	// 见 llm.InlineLimits.MsgBudget）。只统计真正回给模型的部分，不含缓存全量。
 	inlinedRunes int

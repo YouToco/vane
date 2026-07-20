@@ -102,6 +102,12 @@ type AgentConfig struct {
 	// 上限（从 tool_calls 表 COUNT，含失败调用——失败同样计费）。
 	EndpointMsgCap   int `mapstructure:"endpoint_msg_cap"`
 	EndpointDailyCap int `mapstructure:"endpoint_daily_cap"`
+	// Exa ad-hoc 工具护栏（web_search/read_page，2026-07-20 对抗审查 HIGH 补齐）：
+	// 与端点工具同模板的双重限额——按次计费 + 免确认就必须有频率护栏，否则模型
+	// 一轮并行 N 个调用或注入诱导就能把 Exa 账单烧穿。ExaMsgCap 单条消息上限
+	// （默认 5）；ExaDailyCap 滚动 24h 上限（默认 100，从 tool_calls 表 COUNT）。
+	ExaMsgCap   int `mapstructure:"exa_msg_cap"`
+	ExaDailyCap int `mapstructure:"exa_daily_cap"`
 }
 
 // LogConfig 是日志配置。
@@ -224,6 +230,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("agent.session_ttl_minutes", 30)
 	v.SetDefault("agent.endpoint_msg_cap", 10)
 	v.SetDefault("agent.endpoint_daily_cap", 200)
+	v.SetDefault("agent.exa_msg_cap", 5)
+	v.SetDefault("agent.exa_daily_cap", 100)
 
 	v.SetDefault("log.level", "info")
 

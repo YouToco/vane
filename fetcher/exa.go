@@ -172,7 +172,7 @@ func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Conte
 
 // doSearch 是 POST /search 的 HTTP 核心：请求→错误语义→记账，Fetch（信源周期抓取）
 // 与 Search（agent ad-hoc 一次性搜索）共用。src 只用于记账（tool_calls 的 source_id），
-// ad-hoc 调用传零值 Source（SourceID=0，与 enrich 无源调用同口径）。
+// ad-hoc 调用传零值 Source（SourceID=0 无源口径）。
 func (e *ExaFetcher) doSearch(ctx context.Context, reqBody exaRequest, src types.Source) (*exaResponse, error) {
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
@@ -189,11 +189,15 @@ func (e *ExaFetcher) doSearch(ctx context.Context, reqBody exaRequest, src types
 
 	start := time.Now()
 	resp, err := e.client.Do(req)
+	elapsed := time.Since(start)
 	if err != nil {
-		return nil, classifyDoError(e.searchURL, err)
+		ae := classifyDoError(e.searchURL, err)
+		// Do 失败（超时/连接拒绝）也记账（对抗审查 F1）：真实发起了上游尝试，
+		// 不记则网络层故障在账本上隐形。status=0 表示未拿到 HTTP 响应。
+		e.recordCall(ctx, src, 0, elapsed, 0, 0, ae)
+		return nil, ae
 	}
 	defer resp.Body.Close()
-	elapsed := time.Since(start)
 
 	// 错误路径也记账（bug 狩猎 2026-07-19 MEDIUM，两路独立发现）：此前 recordCall
 	// 只在 JSON 解析成功后调用，429 限流一整天 tool_calls 里零行 Exa 记录——故障在

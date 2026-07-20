@@ -193,15 +193,22 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 
 	start := time.Now()
 	resp, err := e.client.Do(req)
+	elapsed := time.Since(start)
 	if err != nil {
-		return nil, false, classifyDoError(e.contentURL, err)
+		ae := classifyDoError(e.contentURL, err)
+		// Do 失败（超时/连接拒绝）也记账（对抗审查 F1，同 exa.go）：真实发起了
+		// 上游尝试，不记则网络层故障在账本上隐形。status=0 表示未拿到 HTTP 响应。
+		if src != nil {
+			e.recordCall(ctx, *src, 0, elapsed, 0, 0, ae)
+		}
+		return nil, false, ae
 	}
 	defer resp.Body.Close()
-	elapsed := time.Since(start)
 
 	// 错误路径也记账（同 exa.go，bug 狩猎 2026-07-19 MEDIUM）：限流/鉴权失败/解析
-	// 失败此前不进 tool_calls，账本上 Exa 故障隐形。src 为 nil（enrich 补全路径的
-	// 无源调用）时 recordCall 本就不落账，闭包同样短路。
+	// 失败此前不进 tool_calls，账本上 Exa 故障隐形。src 为 nil 时 recordCall
+	// 不落账（保留给未来真正的无源调用；当前 enrich 与 ad-hoc 都传非 nil src——
+	// enrich 传真实源按 source_id 记账，ad-hoc 传零值 Source 记 SourceID=0）。
 	fail := func(status, bodySize int, ae error) error {
 		if src != nil {
 			e.recordCall(ctx, *src, status, elapsed, bodySize, 0, ae)

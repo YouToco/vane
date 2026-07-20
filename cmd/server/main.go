@@ -200,7 +200,8 @@ func run() error {
 	// 与 endpoints 同语义——不广告用不了的工具。
 	var exaTools *agent.ExaTools
 	if cfg.Fetch.ExaAPIKey != "" {
-		exaTools = agent.NewExaTools(fetch.Exa(), fetch.ExaContents())
+		exaTools = agent.NewExaTools(fetch.Exa(), fetch.ExaContents(), st,
+			cfg.Agent.ExaMsgCap, cfg.Agent.ExaDailyCap)
 	}
 	tools := agent.BuildTools(st, sched, sched, playbookTr, endpoints, fetch, exaTools)
 	agentLoop := agent.New(agent.Deps{

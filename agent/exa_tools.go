@@ -5,9 +5,14 @@
 // 信源再抓——一次性需求被迫走订阅设施（信源成了"固定点"）。两个工具把 Exa /search
 // 与 /contents 接成即时能力：**不建信源、不写内容库、结果只回给当前对话**。
 //
-// 成本纪律：按次计费（Exa 上游），每次真实调用经 fetcher 层 recordCall 落 tool_calls
-// （SourceID=0 无源口径，与 enrich 补全一致），agent 层 ToolCallRecorder 另记一行
-// 工具调用（契约 §6 全量工具口径）。参数校验失败不打上游、不计费。
+// 成本纪律（双重限额，端点工具同模板——按次计费 + 免确认就必须有频率护栏）：
+//   - 单条消息上限（ExaMsgCap，默认 5）：消息内计数，超限回文案；
+//   - 滚动 24h 上限（ExaDailyCap，默认 100）：从 tool_calls 表 COUNT（排除
+//     invalid_args/budget_exceeded——没打上游的拒绝不把限额越顶越死），
+//     判定失败 fail-closed 拒绝（护栏失效即放开计费面，宁可少查）；
+//   - 每次真实上游调用经 fetcher 层 recordCall 落 tool_calls（SourceID=0 无源口径），
+//     agent 层 ToolCallRecorder 另记一行工具调用（契约 §6 全量工具口径）。
+//   - 参数校验失败不打上游、不计费、不吃限额。
 package agent
 
 import (
@@ -15,7 +20,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/types"
@@ -32,25 +39,85 @@ type pageReader interface {
 	ReadPage(ctx context.Context, pageURL string) (title, text string, cached bool, err error)
 }
 
+// exaCallCounter 是每日限额判定依赖的计数面（*store.Store 已实现）。
+// 与 endpointCallCounter 同模式：限额判定读记账表，拦截口径与账本天然同源。
+type exaCallCounter interface {
+	CountExaAdHocCallsSince(ctx context.Context, since time.Time) (int, error)
+}
+
 // ExaTools 是 web_search / read_page 的装配句柄（与 EndpointTools 同风格）：
 // key 未配置时不装配（nil），agent 工具面与上线前一致，而不是装两个恒报「缺 key」的工具。
+// counter 为 nil 时不查日限额（单消息上限仍生效）；msgCap/dailyCap ≤0 视为不设限
+// （生产由 config 默认值兜底，见 config.AgentConfig）。
 type ExaTools struct {
 	searcher webSearcher
 	reader   pageReader
+	counter  exaCallCounter
+	msgCap   int
+	dailyCap int
 }
 
 // NewExaTools 构造 Exa ad-hoc 工具对。searcher/reader 生产传 *fetcher.ExaFetcher /
 // *fetcher.ExaContentsFetcher（经 Multi.Exa()/Multi.ExaContents() 取出，与信源抓取
-// 共享同一实例与记账通道）。
-func NewExaTools(searcher webSearcher, reader pageReader) *ExaTools {
-	return &ExaTools{searcher: searcher, reader: reader}
+// 共享同一实例与记账通道）；counter 生产传 *store.Store。
+func NewExaTools(searcher webSearcher, reader pageReader, counter exaCallCounter, msgCap, dailyCap int) *ExaTools {
+	return &ExaTools{searcher: searcher, reader: reader, counter: counter, msgCap: msgCap, dailyCap: dailyCap}
 }
 
 // SearchTool 返回 web_search（进静态白名单，BuildTools 装配）。
-func (e *ExaTools) SearchTool() Tool { return &webSearchTool{searcher: e.searcher} }
+func (e *ExaTools) SearchTool() Tool { return &webSearchTool{et: e} }
 
 // ReadPageTool 返回 read_page（进静态白名单，BuildTools 装配）。
-func (e *ExaTools) ReadPageTool() Tool { return &readPageTool{reader: e.reader} }
+func (e *ExaTools) ReadPageTool() Tool { return &readPageTool{et: e} }
+
+// checkBudget 双重限额判定（契约 §8 增补；模板照 endpointTool.Execute 的限额段）。
+// 返回 "" = 放行；非空 = 拒绝文案（记 budget_exceeded——没打上游，不计入日限额 COUNT，
+// 否则被拒绝的调用会把限额越顶越死）。判定顺序：先消息内计数（零 I/O），后日限额（DB）。
+func (e *ExaTools) checkBudget(ctx context.Context) string {
+	rec := recFrom(ctx)
+	if state := runStateFrom(ctx); state != nil && e.msgCap > 0 && state.exaCalls >= e.msgCap {
+		if rec != nil {
+			rec.ErrorType = types.ToolErrBudgetExceeded
+		}
+		return fmt.Sprintf("本条消息的网页查询已达上限（%d 次）。请基于已有结果回答，或让用户再发一条消息继续。", e.msgCap)
+	}
+	if e.counter != nil && e.dailyCap > 0 {
+		n, err := e.counter.CountExaAdHocCallsSince(ctx, time.Now().Add(-dailyCapWindow))
+		if err != nil {
+			// fail-closed（同端点工具三纪律）：回固定文案不泄错误链、记 budget_exceeded
+			// 不计入 COUNT、错误链只进日志。
+			slog.Warn("agent: Exa ad-hoc 每日限额判定失败，fail-closed 拒绝本次调用", "err", err)
+			if rec != nil {
+				rec.ErrorType = types.ToolErrBudgetExceeded
+				rec.Error = err.Error()
+			}
+			return "网页查询限额检查暂时不可用，本次调用已跳过，请稍后再试。"
+		}
+		if n >= e.dailyCap {
+			if rec != nil {
+				rec.ErrorType = types.ToolErrBudgetExceeded
+			}
+			return fmt.Sprintf("过去 24 小时网页查询已达上限（%d 次），为控制成本暂停调用。请明天再试或让用户调整限额。", e.dailyCap)
+		}
+	}
+	return ""
+}
+
+// countCall 在参数校验通过、即将打上游时计数（与端点工具同一时机：打到上游才算，
+// 校验失败没发请求不吃限额）。
+func (e *ExaTools) countCall(ctx context.Context) {
+	if state := runStateFrom(ctx); state != nil {
+		state.exaCalls++
+	}
+}
+
+// markInvalidArgs 标记参数校验失败（没打上游）：日限额 COUNT 排除此项，
+// 与端点工具的 invalid_args 口径一致。
+func markInvalidArgs(ctx context.Context) {
+	if rec := recFrom(ctx); rec != nil {
+		rec.ErrorType = types.ToolErrInvalidArgs
+	}
+}
 
 // exaToolError 把 fetcher 层错误翻译成给模型的工具结果文案（返回 nil error 走
 // 「模型可读、可自纠」通道，同包错误分层约定）。AppError.Message 是本包自己拼的中文
@@ -67,14 +134,27 @@ func exaToolError(err error) (string, error) {
 // web_search：一次性语义搜索（不建信源）。
 // ============================================================
 
-// webSearchMaxResults 是工具层的条数上限（低于 Exa 硬上限 100）：每条结果带正文
-// 摘要，条数越多回给模型的文本越长，20 条已到对话可读性边界。
-const webSearchMaxResults = 20
-
-// webSearchTextMaxRunes 是单条结果正文在工具输出里的截断长度。fetcher 层已按
-// exaMaxTextBytes=4000 截断（那是给打分管道的预算）；对话场景模型只需要判断
-// 「这条相关吗」，1200 rune 足够且不挤爆上下文。
-const webSearchTextMaxRunes = 1200
+const (
+	// webSearchMaxResults 是工具层的条数上限（低于 Exa 硬上限 100）：每条结果带正文
+	// 摘要，条数越多回给模型的文本越长，20 条已到对话可读性边界。
+	webSearchMaxResults = 20
+	// webSearchTextMaxRunes 是单条结果正文在工具输出里的截断长度。fetcher 层已按
+	// exaMaxTextBytes=4000 截断（那是给打分管道的预算）；对话场景模型只需要判断
+	// 「这条相关吗」，1200 rune 足够且不挤爆上下文。
+	webSearchTextMaxRunes = 1200
+	// exaOutMetaMaxRunes 是标题/作者等上游可控短字段的截断上限（对抗审查 F3）：
+	// 恶意页面可构造数百 KB 的 <title>，20 条叠加足以撑爆对话上下文——
+	// 上游可控文本进模型上下文一律要截断，不只正文。
+	exaOutMetaMaxRunes = 200
+	// exaOutURLMaxRunes 是 URL 的截断上限（同上）。
+	exaOutURLMaxRunes = 500
+	// exaQueryMaxRunes / exaMaxIncludeDomains / exaURLMaxRunes 是入参上限
+	//（对抗审查 F4）：原样进 Exa 请求体的字段必须有界——超限走与空参相同的
+	// 自拼中文报错（不打上游、不计费）。
+	exaQueryMaxRunes     = 2000
+	exaMaxIncludeDomains = 50
+	exaURLMaxRunes       = 2048
+)
 
 const webSearchSchema = `{
   "type": "object",
@@ -88,7 +168,7 @@ const webSearchSchema = `{
 }`
 
 type webSearchTool struct {
-	searcher webSearcher
+	et *ExaTools
 }
 
 func (t *webSearchTool) Name() string { return "web_search" }
@@ -98,6 +178,9 @@ func (t *webSearchTool) Description() string {
 }
 func (t *webSearchTool) Parameters() json.RawMessage { return json.RawMessage(webSearchSchema) }
 func (t *webSearchTool) Mutating() bool              { return false }
+func (t *webSearchTool) toolKind() types.ToolCallKind {
+	return types.ToolCallKindExaFetch
+}
 
 type webSearchArgs struct {
 	Query          string   `json:"query"`
@@ -106,12 +189,26 @@ type webSearchArgs struct {
 }
 
 func (t *webSearchTool) Execute(ctx context.Context, _ int64, args json.RawMessage) (string, error) {
+	// 限额判定先于一切上游动作（双重限额，见文件头成本纪律）。
+	if msg := t.et.checkBudget(ctx); msg != "" {
+		return msg, nil
+	}
 	var a webSearchArgs
 	if err := json.Unmarshal(args, &a); err != nil {
+		markInvalidArgs(ctx)
 		return "参数不是合法 JSON，请按 schema 重试。", nil
 	}
 	if strings.TrimSpace(a.Query) == "" {
+		markInvalidArgs(ctx)
 		return "query 不能为空。", nil
+	}
+	if len([]rune(a.Query)) > exaQueryMaxRunes {
+		markInvalidArgs(ctx)
+		return fmt.Sprintf("query 过长（上限 %d 字符），请精简后重试。", exaQueryMaxRunes), nil
+	}
+	if len(a.IncludeDomains) > exaMaxIncludeDomains {
+		markInvalidArgs(ctx)
+		return fmt.Sprintf("include_domains 过多（上限 %d 个），请精简后重试。", exaMaxIncludeDomains), nil
 	}
 	num := a.NumResults
 	if num <= 0 {
@@ -120,7 +217,8 @@ func (t *webSearchTool) Execute(ctx context.Context, _ int64, args json.RawMessa
 	if num > webSearchMaxResults {
 		num = webSearchMaxResults
 	}
-	results, err := t.searcher.Search(ctx, a.Query, num, a.IncludeDomains)
+	t.et.countCall(ctx)
+	results, err := t.et.searcher.Search(ctx, a.Query, num, a.IncludeDomains)
 	if err != nil {
 		return exaToolError(err)
 	}
@@ -130,13 +228,15 @@ func (t *webSearchTool) Execute(ctx context.Context, _ int64, args json.RawMessa
 	var b strings.Builder
 	fmt.Fprintf(&b, "搜到 %d 条结果：\n", len(results))
 	for i, r := range results {
-		fmt.Fprintf(&b, "\n[%d] %s\n%s\n", i+1, oneLine(r.Title, r.URL), r.URL)
+		fmt.Fprintf(&b, "\n[%d] %s\n%s\n", i+1,
+			oneLine(truncateRunes(r.Title, exaOutMetaMaxRunes), truncateRunes(r.URL, exaOutURLMaxRunes)),
+			truncateRunes(r.URL, exaOutURLMaxRunes))
 		var meta []string
 		if r.PublishedDate != "" {
 			meta = append(meta, "发布: "+r.PublishedDate)
 		}
 		if r.Author != "" {
-			meta = append(meta, "作者: "+r.Author)
+			meta = append(meta, "作者: "+truncateRunes(r.Author, exaOutMetaMaxRunes))
 		}
 		if len(meta) > 0 {
 			fmt.Fprintf(&b, "%s\n", strings.Join(meta, " · "))
@@ -172,7 +272,7 @@ const readPageSchema = `{
 }`
 
 type readPageTool struct {
-	reader pageReader
+	et *ExaTools
 }
 
 func (t *readPageTool) Name() string { return "read_page" }
@@ -183,24 +283,39 @@ func (t *readPageTool) Description() string {
 }
 func (t *readPageTool) Parameters() json.RawMessage { return json.RawMessage(readPageSchema) }
 func (t *readPageTool) Mutating() bool              { return false }
+func (t *readPageTool) toolKind() types.ToolCallKind {
+	return types.ToolCallKindExaFetch
+}
 
 type readPageArgs struct {
 	URL string `json:"url"`
 }
 
 func (t *readPageTool) Execute(ctx context.Context, _ int64, args json.RawMessage) (string, error) {
+	// 限额判定先于一切上游动作（双重限额，见文件头成本纪律）。
+	if msg := t.et.checkBudget(ctx); msg != "" {
+		return msg, nil
+	}
 	var a readPageArgs
 	if err := json.Unmarshal(args, &a); err != nil {
+		markInvalidArgs(ctx)
 		return "参数不是合法 JSON，请按 schema 重试。", nil
 	}
 	u := strings.TrimSpace(a.URL)
 	if u == "" {
+		markInvalidArgs(ctx)
 		return "url 不能为空。", nil
 	}
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		markInvalidArgs(ctx)
 		return "url 必须是 http(s) 地址（如 https://example.com/page）。", nil
 	}
-	title, text, cached, err := t.reader.ReadPage(ctx, u)
+	if len([]rune(u)) > exaURLMaxRunes {
+		markInvalidArgs(ctx)
+		return fmt.Sprintf("url 过长（上限 %d 字符）。", exaURLMaxRunes), nil
+	}
+	t.et.countCall(ctx)
+	title, text, cached, err := t.et.reader.ReadPage(ctx, u)
 	if err != nil {
 		// 页面抓不到（ErrPageUnreachable）：URL 打错/需登录/拦抓取是主流原因，
 		// 给「检查 URL」话术（对齐 probe 准入的翻译，不只说「稍后再试」）。
@@ -212,7 +327,7 @@ func (t *readPageTool) Execute(ctx context.Context, _ int64, args json.RawMessag
 	}
 	var b strings.Builder
 	if strings.TrimSpace(title) != "" {
-		fmt.Fprintf(&b, "页面标题：%s\n", oneLine(title, u))
+		fmt.Fprintf(&b, "页面标题：%s\n", oneLine(truncateRunes(title, exaOutMetaMaxRunes), u))
 	}
 	if cached {
 		b.WriteString("（注意：上游返回的是缓存副本，可能不是页面最新状态）\n")
