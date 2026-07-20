@@ -3,9 +3,10 @@
 // 由服务内 probewatch 承担（每日 01:30 UTC + 每次启动后 3 分钟自动跑，红灯发
 // 飞书卡），本工具是人主动来查时用的。
 //
-// 退出码 1 供脚本判红。注意：deploy CI 目前只分发本二进制、并不执行它（红灯
-// **不会**阻断部署）——要不要接线是部署语义决策（接了 = 部署后有红灯就挡住
-// 流水线），拍板前本注释如实记录现状，不许诺没接的行为。
+// 退出码 1 供脚本判红。deploy CI 的 post-deploy 步骤（ci.yml「Gate probes」）会在
+// VPS 上执行本工具（Boss 2026-07-20 拍板接线）：红灯（exit 1）与探针自身失败
+// （exit 2）都会把 deploy job 打红——服务此刻已在跑新代码（无自动回滚），流水线红
+// 是"部署已生效但体检不过"的强信号，与 probewatch 的飞书告警卡双通道。
 //
 // 为什么走 DB 直连（store.New）而不打 /api/admin/observability：
 // post-deploy 在 VPS 上执行，本来就有库权限（与 vane.service 同宿主、同 VANE_DB_URL），

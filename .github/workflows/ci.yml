@@ -73,7 +73,8 @@ jobs:
       #   vane      —— 主服务
       #   useradmin —— 账号管理（**部署 D2′ 认证后必须有它**，否则 owner 接管不了
       #                 账号，Dashboard 直接登不进去且无法自救）
-      #   gate      —— Gate 探针，此前只在本地跑，一并带上省得下次再补
+      #   gate      —— Gate 探针（下方「Gate probes」post-deploy 步骤执行它，
+      #                 红灯打红流水线——2026-07-20 拍板接线）
       - name: Build linux binaries
         run: |
           GOOS=linux GOARCH=amd64 go build -o bin/vane ./cmd/server
@@ -160,3 +161,19 @@ jobs:
             ctype=$(curl -sSL -o /dev/null -w '%{content_type}' --max-time 10 https://vane.zhuoqidev.com/.well-known/agent-card.json)
             case "$ctype" in *json*) : ;; *) echo "主域 well-known 终点不是 json（$ctype），well-known 路由断了"; exit 1;; esac
             echo "deploy verified: readyz OK"
+
+      # Gate 探针 post-deploy 验证（Boss 2026-07-20 拍板接线）：部署完成后在 VPS 上跑一轮
+      # M5 契约 §16 全量探针。红灯（exit 1）或探针自身跑不动（exit 2，此刻线上健康是盲区，
+      # 比红灯更危险）都让本 job 红。语义是"部署已生效但体检不过"：服务已在跑新代码、
+      # 无自动回滚，流水线红是给人的强信号，与 probewatch 的飞书告警卡双通道。
+      # 黄灯不阻断（exit 0——数据不足/需人工确认，部署当天几乎必然有黄，见 cmd/gate 头注释）。
+      # 窗口 24h 覆盖部署前数据是刻意语义："上一版制造的红灯"不该被下一次部署静默滚过。
+      - name: Gate probes
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          port: ${{ secrets.VPS_PORT }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            /opt/vane/bin/gate -env /opt/vane/.env
