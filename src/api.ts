@@ -451,12 +451,6 @@ export const api = {
     request<Record<string, unknown>[]>("/api/schedules").then((rows) =>
       (rows ?? []).map(normalizeSchedule),
     ),
-  createSchedule: (spec: ScheduleSpec, scope: PushScope, nlDescription: string) =>
-    post<{ schedule_id: string }>("/api/schedules", {
-      spec,
-      scope,
-      nl_description: nlDescription,
-    }),
   deleteSchedule: (id: string) =>
     request<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}`, { method: "DELETE" }),
   // push/now 的 body 是 {scope?}（B8）；固化"现在推一次"默认不带 scope = 推全部订阅

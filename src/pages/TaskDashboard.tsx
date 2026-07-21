@@ -10,8 +10,7 @@ import type { Schedule, ScheduleSpec } from "../api";
 import { fmt, useI18n, type Dict } from "@/i18n";
 import { fmtBeijing } from "@/lib/time";
 
-// describeSpec 的 i18n 版：文案走字典（admin 的 Schedules.tsx 保留原中文版，
-// 那是平台 owner 专用页；这里是用户面，必须随语言走）。
+// describeSpec 的 i18n 版：用户面所有任务文案都必须随语言走。
 function describeSpecI18n(spec: ScheduleSpec, s: Dict["app"]["schedule"]): string {
   if (typeof spec.every_seconds === "number" && spec.every_seconds > 0) {
     const h = Math.round(spec.every_seconds / 3600);
