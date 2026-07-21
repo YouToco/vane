@@ -43,7 +43,7 @@ type purgeStep struct {
 //
 //	schedule_playbooks / schedule_sources → schedules
 //	feedbacks                             → deliveries
-//	pending_actions                       → agent_sessions
+//	task_creation_receipts               → pending_actions → agent_sessions
 //	deliveries                            → push_batches
 //	其余                                   → tenants / users
 //
@@ -55,6 +55,7 @@ var purgeOrder = []purgeStep{
 	{"schedule_sources", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
 
 	{"feedbacks", "tenant_id = $1"},
+	{"task_creation_receipts", "tenant_id = $1"},
 	{"pending_actions", "tenant_id = $1"},
 	{"deliveries", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},

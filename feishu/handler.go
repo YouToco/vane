@@ -30,6 +30,7 @@ import (
 	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 )
 
@@ -49,6 +50,10 @@ var mentionRe = regexp.MustCompile(`@_user_\d+\s*`)
 // 丢掉旧去重表最多造成一次重复回复，可接受。
 type handler struct {
 	m *Manager
+	// appID is captured with this WS generation. Card callbacks from an old
+	// connection must keep the identity of the app that emitted the card even
+	// if Dashboard reconfiguration installs a different current client.
+	appID string
 	// ctx 是本连接的生命周期 ctx：异步处理挂在它上面，
 	// Reconfigure 断开连接时未完成的处理随之取消。
 	ctx context.Context
@@ -58,7 +63,11 @@ type handler struct {
 }
 
 func newHandler(m *Manager, ctx context.Context) *handler {
-	return &handler{m: m, ctx: ctx, seen: make(map[string]time.Time)}
+	return newHandlerForApp(m, ctx, "")
+}
+
+func newHandlerForApp(m *Manager, ctx context.Context, appID string) *handler {
+	return &handler{m: m, ctx: ctx, appID: strings.TrimSpace(appID), seen: make(map[string]time.Time)}
 }
 
 // eventDispatcher 构造 WS 客户端所需的事件分发器。
@@ -450,8 +459,8 @@ func (h *handler) handleBotMenu(ctx context.Context, event *larkapplication.P2Bo
 }
 
 // cardActionSyncBudget 是卡片回调的同步等待预算。飞书要求回调 3 秒内响应，
-// 否则重推事件；预留网络与前置查库的余量后取 2.5s，超时转异步补发结果消息
-// （契约 §9 降级路径：SDK 的 Token 延迟更新卡片要另走 cardkit API，MVP 不引入）。
+// 否则重推事件；预留网络与前置查库的余量后取 2.5s。v1 超时只回 toast，
+// 终态由耐久 outbox 原地 Patch；历史 v0 仍走有界异步补发。
 const cardActionSyncBudget = 2500 * time.Millisecond
 
 // agentMessageBudget 是一条 agent 消息端到端的硬预算（多轮模型调用 + 工具执行）。
@@ -462,21 +471,22 @@ const agentMessageBudget = 5 * time.Minute
 // 必须有自己的上限，防工具内 DB/Temporal 调用无限阻塞。
 const cardActionExecBudget = 30 * time.Second
 
-// cardActionLifecycleBudget 覆盖动作执行及同步预算超时后的结果补发。两段各自
-// 仍有独立 deadline；多留 1 秒只用于 goroutine 调度与阶段切换，不扩大外部调用预算。
+// cardActionLifecycleBudget 覆盖动作执行及历史 v0 的超时结果补发。两段各自
+// 仍有独立 deadline；多留 1 秒只用于 goroutine 调度与阶段切换。
 const cardActionLifecycleBudget = cardActionExecBudget + 15*time.Second + time.Second
 
 // cardActionResult 是确认/取消动作的执行结果：text 恒为可直接展示的人话
 // （含失败话术），ok 仅用于区分 toast 的成功/失败样式。
 type cardActionResult struct {
-	text string
-	ok   bool
+	text     string
+	ok       bool
+	durable  bool
+	preserve bool
 }
 
-// onCardAction 处理确认卡按钮回调（契约 §9）：owner 校验 → confirm/cancel
-// 分发 → 预算内完成则原地把卡片更新为结果文本，超时先回「执行中」toast、
-// 完成后补发结果消息。恒返回 nil error：返回 error 只会让飞书反复重推回调，
-// 对用户没有任何额外价值。
+// onCardAction 处理确认卡按钮回调（契约 §9）：owner 校验 → confirm/cancel。
+// v1 在接受动作的同一事务中绑定原卡 message ID，终态仅由 outbox Patch；v0
+// 保留原同步更新/超时补发行为。恒返回 nil error，避免飞书无意义重推。
 func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTriggerEvent) (resp *callback.CardActionTriggerResponse, _ error) {
 	finish, accepted := h.m.beginCallback()
 	if !accepted {
@@ -547,6 +557,25 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 	if runner == nil {
 		return toastResponse("error", "助手尚未就绪，请稍后重试"), nil
 	}
+	durableRunner, durableCapable := runner.(DurableAgentRunner)
+	var openMessageID string
+	if event.Event.Context != nil {
+		openMessageID = strings.TrimSpace(event.Event.Context.OpenMessageID)
+	}
+	if durableCapable && openMessageID == "" {
+		// A v1 click without the exact original card resource cannot acquire the
+		// saga: accepting it would recreate A5's "operation finished but no
+		// durable place to report it" failure mode. Legacy test runners keep the
+		// old seam; the production Loop always implements DurableAgentRunner.
+		return toastResponse("error", "确认卡身份缺失，请在原卡片上重试"), nil
+	}
+	receiptTarget := task.CreationReceiptTarget{
+		Provider: task.FeishuCardPatchReceiptProviderForApp(h.appID),
+		Target:   openMessageID,
+	}
+	if durableCapable && receiptTarget.Provider == "" {
+		return toastResponse("error", "确认卡通道身份缺失，请在重新连接后重试"), nil
+	}
 
 	// 拿内部 user.ID：ExecuteAction/CancelAction 还会用它比对
 	// pending_action.user_id（服务端二次校验，契约 §10）。
@@ -572,21 +601,41 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 			defer func() {
 				if recovered := recover(); recovered != nil {
 					slog.Error("feishu: 卡片动作执行 panic", "recover", recovered, "action_id", actionID)
-					res = cardActionResult{text: "内部错误，请稍后重试。"}
+					// A durable-capable production runner may have panicked either
+					// before or after binding the provider target. In both cases the
+					// only safe callback response is a toast: replacing the card would
+					// remove the user's retry path or race a terminal outbox PATCH.
+					res = cardActionResult{
+						text: "内部错误，请稍后重试。", preserve: durableCapable,
+					}
 				}
 			}()
-			var text string
+			var outcome agent.CardActionOutcome
 			var actionErr error
-			if verb == cardActionConfirm {
-				text, actionErr = runner.ExecuteAction(execCtx, user.ID, actionID)
+			if durableCapable && verb == cardActionConfirm {
+				outcome, actionErr = durableRunner.ExecuteActionWithReceipt(
+					execCtx, user.ID, actionID, receiptTarget,
+				)
+			} else if durableCapable {
+				outcome, actionErr = durableRunner.CancelActionWithReceipt(
+					execCtx, user.ID, actionID, receiptTarget,
+				)
+			} else if verb == cardActionConfirm {
+				outcome.Text, actionErr = runner.ExecuteAction(execCtx, user.ID, actionID)
 			} else {
-				text, actionErr = runner.CancelAction(execCtx, user.ID, actionID)
+				outcome.Text, actionErr = runner.CancelAction(execCtx, user.ID, actionID)
 			}
 			if actionErr != nil {
 				slog.Error("feishu: 卡片动作执行失败", "err", actionErr, "action_id", actionID, "vane_action", verb)
-				return cardActionResult{text: "执行失败：" + humanizeLLMError(actionErr)}
+				return cardActionResult{
+					text:    "执行失败：" + humanizeLLMError(actionErr),
+					durable: outcome.DurableReceipt, preserve: outcome.PreserveCard,
+				}
 			}
-			return cardActionResult{text: text, ok: true}
+			return cardActionResult{
+				text: outcome.Text, ok: true,
+				durable: outcome.DurableReceipt, preserve: outcome.PreserveCard,
+			}
 		}()
 
 		done <- res
@@ -599,8 +648,14 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 			return
 		}
 
-		// 补发仍属于同一项已接纳工作，避免动作 worker 完成后另起一个无法等待的
-		// goroutine。A6 才会提供进程崩溃后的耐久回执；这里不作该承诺。
+		if res.durable || res.preserve {
+			// Durable v1 results are delivered by the fenced outbox. PreserveCard
+			// is a pre-accept failure: no mutation was promised and the user must
+			// retain the original buttons for retry. Neither path may create a new
+			// message here.
+			return
+		}
+		// Historical v0 tools retain their bounded best-effort follow-up.
 		sendCtx, cancel := context.WithTimeout(workCtx, 15*time.Second)
 		defer cancel()
 		if _, sendErr := h.m.SendCard(sendCtx, operatorID, BuildReplyCard(res.text)); sendErr != nil {
@@ -615,6 +670,26 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 	select {
 	case res := <-done:
 		followUp <- false
+		if res.preserve {
+			toastType := "error"
+			if res.ok {
+				toastType = "success"
+			}
+			return toastResponse(toastType, res.text), nil
+		}
+		if res.durable {
+			// Besides immediate feedback, this upgrades any pre-A6 confirmation
+			// card to update_multi=true before the delayed REST PATCH. A replayed
+			// terminal callback sets preserve above, so it can never overwrite an
+			// already-final card with this processing state.
+			return &callback.CardActionTriggerResponse{
+				Toast: &callback.Toast{Type: "success", Content: res.text},
+				Card: &callback.Card{
+					Type: "raw",
+					Data: json.RawMessage(BuildReplyCard("正在可靠处理，最终结果会更新在这张卡片上。")),
+				},
+			}, nil
+		}
 		toastType, toastText := "success", "已处理"
 		if !res.ok {
 			toastType, toastText = "error", "执行失败"
@@ -630,6 +705,13 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 		}, nil
 	case <-timer.C:
 		followUp <- true
+		if durableCapable {
+			// Do not replace the card in the callback response. A terminal PATCH
+			// may already have succeeded when this callback is retried; returning a
+			// processing card here could overwrite that final state. The outbox is
+			// first due after the callback response window.
+			return toastResponse("info", "正在受理；若卡片未更新，请重试"), nil
+		}
 		// Toast + 撤下按钮（审查 #二次点击误导）：只回 toast 时按钮仍在，用户再点会
 		// 命中 Claim 幂等拒绝、卡片被替换成"已处理过"的三义文案，随后真结果又以新消息
 		// 到达——顺序错乱像失败。原地把卡片换成"执行中"说明，消除整个二次点击窗口。

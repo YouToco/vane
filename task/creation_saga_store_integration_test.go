@@ -26,6 +26,18 @@ type completeResponseLossStore struct {
 	completeCalls int
 }
 
+type postgresReceiptSessionRecorder struct{ store *store.Store }
+
+func (r postgresReceiptSessionRecorder) RecordCreationReceiptSession(
+	ctx context.Context,
+	receipt types.TaskCreationReceipt,
+	messages json.RawMessage,
+) error {
+	return r.store.RecordTaskCreationReceiptSessionMessages(
+		ctx, receipt.Lease(), messages,
+	)
+}
+
 func (s *completeResponseLossStore) CompleteTaskCreationOperation(
 	ctx context.Context,
 	lease types.TaskCreationLease,
@@ -85,7 +97,7 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 			t.Fatalf("persisted args changed meaning: %s", persisted.Args)
 		}
 
-		result, err := coordinator.Confirm(t.Context(), userID, actionID)
+		result, err := coordinator.Confirm(t.Context(), userID, actionID, testCreationReceiptTarget)
 		if err != nil {
 			t.Fatalf("Confirm() through PostgreSQL: %v", err)
 		}
@@ -109,7 +121,7 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 		}
 
 		schedulerEvents := len(schedules.events)
-		replayed, err := coordinator.Confirm(t.Context(), userID, actionID)
+		replayed, err := coordinator.Confirm(t.Context(), userID, actionID, testCreationReceiptTarget)
 		if err != nil {
 			t.Fatalf("Confirm() terminal replay: %v", err)
 		}
@@ -120,6 +132,56 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 		if len(schedules.events) != schedulerEvents {
 			t.Fatalf("terminal replay touched scheduler: before=%d after=%d events=%v",
 				schedulerEvents, len(schedules.events), schedules.events)
+		}
+
+		// A6 cross-package proof: the same terminal transaction produced one
+		// delayed outbox row. Once callback response time has elapsed, a real
+		// Store + dispatcher freezes payload/history, patches one provider
+		// resource, and commits sent without any live request state.
+		receipt, err := st.LoadTaskCreationReceiptByOperation(
+			t.Context(), actionID, tenantID, userID,
+		)
+		if err != nil {
+			t.Fatalf("load terminal receipt: %v", err)
+		}
+		if delay := time.Until(receipt.NextAttemptAt) + 50*time.Millisecond; delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-t.Context().Done():
+				timer.Stop()
+				t.Fatal(t.Context().Err())
+			}
+		}
+		sender := &receiptDispatcherFakeSender{}
+		dispatcher, err := NewCreationReceiptDispatcher(CreationReceiptDispatcherDeps{
+			Store: st, Sender: sender,
+			Sessions: postgresReceiptSessionRecorder{store: st},
+			BuildCard: func(markdown string) string {
+				raw, _ := json.Marshal(map[string]any{
+					"schema": "2.0",
+					"config": map[string]any{"update_multi": true},
+					"body":   map[string]any{"text": markdown},
+				})
+				return string(raw)
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := dispatcher.dispatchReceipt(t.Context(), *receipt); err != nil {
+			t.Fatalf("dispatch terminal receipt through PostgreSQL: %v", err)
+		}
+		receipt, err = st.LoadTaskCreationReceiptByOperation(
+			t.Context(), actionID, tenantID, userID,
+		)
+		if err != nil || receipt.Status != types.TaskCreationReceiptStatusSent ||
+			receipt.SessionRecordedAt == nil || receipt.ProviderMessageID != testCreationReceiptTarget.Target {
+			t.Fatalf("terminal receipt did not converge: receipt=%+v err=%v", receipt, err)
+		}
+		if calls, resources := sender.snapshot(); calls != 1 || len(resources) != 1 ||
+			resources[testCreationReceiptTarget.Target] == "" {
+			t.Fatalf("provider state calls=%d resources=%v", calls, resources)
 		}
 	})
 
@@ -139,7 +201,7 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 			t.Fatalf("Propose(): %v", err)
 		}
 
-		result, err := coordinator.Confirm(ctx, userID, actionID)
+		result, err := coordinator.Confirm(ctx, userID, actionID, testCreationReceiptTarget)
 		if err != nil {
 			t.Fatalf("Confirm() should adopt committed terminal row: %v", err)
 		}
@@ -152,7 +214,7 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 			t.Fatalf("result=%+v complete_calls=%d", result, responseLoss.completeCalls)
 		}
 
-		replayed, err := coordinator.Confirm(t.Context(), userID, actionID)
+		replayed, err := coordinator.Confirm(t.Context(), userID, actionID, testCreationReceiptTarget)
 		if err != nil {
 			t.Fatalf("Confirm() after adopted response loss: %v", err)
 		}

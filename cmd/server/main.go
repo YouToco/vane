@@ -265,6 +265,29 @@ func run() error {
 	})
 	manager.SetFeedback(fbSvc)
 
+	receiptDispatcher, err := task.NewCreationReceiptDispatcher(
+		task.CreationReceiptDispatcherDeps{
+			Store: st, Sender: manager, Sessions: agentLoop,
+			BuildCard: feishu.BuildReplyCard, Logger: slog.Default(),
+		},
+	)
+	if err != nil {
+		stop()
+		maintenanceCtx, cancelMaintenance := context.WithTimeout(context.Background(), 30*time.Second)
+		maintenanceErr := waitMaintenance(maintenanceCtx)
+		cancelMaintenance()
+		if maintenanceErr != nil {
+			return errors.Join(
+				fmt.Errorf("装配任务创建耐久回执: %w", err),
+				fmt.Errorf("排空启动维护任务: %w", maintenanceErr),
+			)
+		}
+		w.Stop()
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("装配任务创建耐久回执: %w", err)
+	}
+
 	// A5 创建恢复器在飞书 WS/HTTP 接收新确认之前启动。首次扫描与周期扫描都
 	// 在后台执行，不阻塞 readyz；关停时必须先等它退出，再释放 Temporal/DB。
 	creationRecoveryCtx, cancelCreationRecovery := context.WithCancel(ctx)
@@ -283,12 +306,33 @@ func run() error {
 		}
 	}
 
+	// A6 outbox starts before the first new callback is admitted. A terminal
+	// operation and its receipt are one database transaction; this runner can
+	// therefore recover work left by any prior process without reconstructing
+	// user-facing content from live configuration.
+	receiptDispatchCtx, cancelReceiptDispatch := context.WithCancel(ctx)
+	receiptDispatchDone := make(chan struct{})
+	go func() {
+		defer close(receiptDispatchDone)
+		receiptDispatcher.Run(receiptDispatchCtx)
+	}()
+	stopReceiptDispatch := func() error {
+		cancelReceiptDispatch()
+		select {
+		case <-receiptDispatchDone:
+			return nil
+		case <-time.After(30 * time.Second):
+			return errors.New("task creation receipt dispatcher 关停超时")
+		}
+	}
+
 	// 依赖就绪后再拉飞书 WS 连接：无配置静默待命，ctx 取消时断开。
 	manager.Start(ctx)
 
 	// Stop ingress first, then drain every nested background layer before the
-	// resources they use. A6 will make user receipts durable across process
-	// death; these waits only guarantee safe in-process shutdown.
+	// resources they use. Agent session writes are drained separately after the
+	// A6 receipt dispatcher, because the dispatcher deliberately shares the
+	// same per-user conversation lock.
 	drainIngress := func() error {
 		var drainErrs []error
 		managerCtx, cancelManager := context.WithTimeout(context.Background(), 50*time.Second)
@@ -305,13 +349,15 @@ func run() error {
 			drainErrs = append(drainErrs, fmt.Errorf("排空反馈后台任务: %w", feedbackErr))
 		}
 
-		sessionCtx, cancelSessions := context.WithTimeout(context.Background(), 10*time.Second)
-		sessionErr := agentLoop.DrainSessionWrites(sessionCtx)
-		cancelSessions()
-		if sessionErr != nil {
-			drainErrs = append(drainErrs, fmt.Errorf("排空 Agent 会话回写: %w", sessionErr))
-		}
 		return errors.Join(drainErrs...)
+	}
+	drainAgentSessions := func() error {
+		sessionCtx, cancelSessions := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelSessions()
+		if err := agentLoop.DrainSessionWrites(sessionCtx); err != nil {
+			return fmt.Errorf("排空 Agent 会话回写: %w", err)
+		}
+		return nil
 	}
 
 	mux := http.NewServeMux()
@@ -385,14 +431,17 @@ func run() error {
 			stop()
 			drainErr := drainIngress()
 			recoveryErr := stopCreationRecovery()
+			receiptErr := stopReceiptDispatch()
+			sessionErr := drainAgentSessions()
 			maintenanceCtx, cancelMaintenance := context.WithTimeout(context.Background(), 30*time.Second)
 			maintenanceErr := waitMaintenance(maintenanceCtx)
 			cancelMaintenance()
-			if drainErr != nil || recoveryErr != nil || maintenanceErr != nil {
+			if drainErr != nil || recoveryErr != nil || receiptErr != nil ||
+				sessionErr != nil || maintenanceErr != nil {
 				// An admitted callback may still own DB/Temporal work. Do not close
 				// those resources underneath it; returning exits the process.
 				return errors.Join(fmt.Errorf("挂载 A2A server: %w", err),
-					drainErr, recoveryErr, maintenanceErr)
+					drainErr, recoveryErr, receiptErr, sessionErr, maintenanceErr)
 			}
 			w.Stop()
 			temporalClient.Close()
@@ -479,6 +528,15 @@ func run() error {
 	// 停创建恢复器：不再发 Temporal/DB 请求，等在途 operation 收束或超时。
 	if err := stopCreationRecovery(); err != nil {
 		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空创建恢复器: %w", err))
+	}
+	// No producer remains after callback + creation recovery drains. Now stop
+	// the receipt consumer, wait for its fenced session/PATCH checkpoint, then
+	// close admission for legacy best-effort session writes.
+	if err := stopReceiptDispatch(); err != nil {
+		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空任务创建耐久回执: %w", err))
+	}
+	if err := drainAgentSessions(); err != nil {
+		shutdownErrs = append(shutdownErrs, err)
 	}
 	// 等所有进程级维护任务退出；它们也共享 DB/Temporal/飞书发送端。
 	maintenanceCtx, cancelMaintenance := context.WithTimeout(context.Background(), 30*time.Second)

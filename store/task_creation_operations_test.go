@@ -91,6 +91,8 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM task_creation_receipts WHERE user_id IN ($1, $2)`, userID, otherUserID)
+		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM schedules WHERE user_id IN ($1, $2)`, userID, otherUserID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM pending_actions WHERE user_id IN ($1, $2)`, userID, otherUserID)
@@ -670,6 +672,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 			completed.TakeoverNotBefore != nil || completed.TaskID != "task-prepared" {
 			t.Fatalf("完成 tombstone 不完整: %+v", completed)
 		}
+		assertTaskCreationReceiptExactlyOne(t, st, completeID)
 		if _, err := st2.AcquireTaskCreationOperation(ctx,
 			acquireParams(completeID, userID, "resurrect-worker")); !errors.Is(err, types.ErrTaskCreationTerminal) {
 			t.Fatalf("completed 不得重领，实际 %v", err)
@@ -710,6 +713,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		if blockedFinal.TaskID != "reserved-before-side-effect" {
 			t.Fatalf("Block 覆盖了 ensure 的 immutable taskID: %+v", blockedFinal)
 		}
+		assertTaskCreationReceiptExactlyOne(t, st, blockedID)
 		if _, err := st.AcquireTaskCreationOperation(ctx,
 			acquireParams(blockedID, userID, "resurrect-worker")); !errors.Is(err, types.ErrTaskCreationTerminal) {
 			t.Fatalf("blocked 不得重领，实际 %v", err)
@@ -738,6 +742,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		if failedFinal.TaskID != "reserved-before-side-effect" {
 			t.Fatalf("Fail 覆盖了 ensure 的 immutable taskID: %+v", failedFinal)
 		}
+		assertTaskCreationReceiptExactlyOne(t, st, failedID)
 
 		sideEffectID := checkpointedOperation(t, st, userID, "cleanup-required-worker")
 		sideEffect, err := st.LoadTaskCreationOperation(ctx, sideEffectID, 1, userID)
@@ -901,11 +906,13 @@ func insertTaskCreationTestAction(
 
 func acquireParams(id string, userID int64, owner string) types.AcquireTaskCreationOperationParams {
 	return types.AcquireTaskCreationOperationParams{
-		ID:            id,
-		TenantID:      1,
-		UserID:        userID,
-		LeaseOwner:    owner,
-		LeaseDuration: 5 * time.Minute,
+		ID:              id,
+		TenantID:        1,
+		UserID:          userID,
+		LeaseOwner:      owner,
+		LeaseDuration:   5 * time.Minute,
+		ReceiptProvider: "feishu_message_patch",
+		ReceiptTarget:   "om-test-" + id,
 	}
 }
 

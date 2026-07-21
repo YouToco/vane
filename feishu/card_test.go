@@ -28,6 +28,9 @@ func TestBuildReplyCard(t *testing.T) {
 
 	var card struct {
 		Schema string `json:"schema"`
+		Config struct {
+			UpdateMulti bool `json:"update_multi"`
+		} `json:"config"`
 		Header struct {
 			Title struct {
 				Tag     string `json:"tag"`
@@ -47,6 +50,9 @@ func TestBuildReplyCard(t *testing.T) {
 
 	if card.Schema != "2.0" {
 		t.Errorf("schema = %q, 期望 \"2.0\"", card.Schema)
+	}
+	if !card.Config.UpdateMulti {
+		t.Error("config.update_multi = false，终态回执必须允许同资源 Patch 重试")
 	}
 	if card.Header.Title.Tag != "plain_text" {
 		t.Errorf("header.title.tag = %q, 期望 \"plain_text\"", card.Header.Title.Tag)
@@ -94,6 +100,9 @@ func TestBuildConfirmCard(t *testing.T) {
 
 	var card struct {
 		Schema string `json:"schema"`
+		Config struct {
+			UpdateMulti bool `json:"update_multi"`
+		} `json:"config"`
 		Header struct {
 			Title struct {
 				Content string `json:"content"`
@@ -108,6 +117,9 @@ func TestBuildConfirmCard(t *testing.T) {
 	}
 	if card.Schema != "2.0" {
 		t.Errorf("schema = %q, 期望 \"2.0\"", card.Schema)
+	}
+	if !card.Config.UpdateMulti {
+		t.Error("config.update_multi = false，确认卡必须允许后续原地更新")
 	}
 	if card.Header.Title.Content != cardTitle {
 		t.Errorf("header.title.content = %q, 期望 %q", card.Header.Title.Content, cardTitle)

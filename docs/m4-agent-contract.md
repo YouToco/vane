@@ -343,3 +343,31 @@ Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的
 - agent：mock Client？——llm.Client 是具体类型，Loop 依赖收窄：Loop 内部通过 `chatFn func(ctx, llm.ChatRequest) (*llm.ChatResponse, error)` 字段调用（默认包 DoChat），测试注入假实现。覆盖：纯聊天、读工具单轮、写工具确认卡、未知工具自纠、maxTurns 兜底、ExecuteAction 幂等；恶意外部结果必须用真实外部工具分类反向证明画像读取、写 pending action 与 URL/query 上下文外带均被确定性拒绝，并覆盖跨消息、部署前存量会话、外部 Probe 成功/失败回调、本地缓存分页、同批“内部读→外部读→写”乱序及 `search_endpoints+未激活动态端点`；外部上下文测试必须证明首轮零画像读取/零工具/零既有历史、原文零持久化且旧历史保留，add_source 只建 pending 或整批拒绝后重试写工具时不会被误判为已执行外部查询。
 - fetcher：Exa ad-hoc 上游账本必须断言 trace/user 归属与 `source_id=0`，反向断言这些本地归属元数据没有出现在第三方请求体/请求头；取消后的记账 context 仍可用且有 deadline，`statuses[].status=error` 必须在账本标为失败而不是 HTTP 200 成功。
 - feishu：BuildConfirmCard JSON 结构断言；回调 owner 校验单测（能 mock 的部分）。
+
+## 12. `create_schedule` A5/A6 耐久特化（2026-07-21，覆盖本契约旧路径）
+
+本节只覆盖 `create_schedule`；其他历史写工具仍按 §7/§9 的 v0 行为。旧 HTTP
+调度创建入口已退役，Agent 是新任务创建的唯一生产入口。
+
+- v1 `pending_actions` 是 lease/fence/checkpoint 创建 saga。准备结果不可变，按
+  `paused Temporal Schedule → 数据库完整定义 → Activate → terminal` 收敛；进程退出后
+  recovery 复用原 checkpoint，不重新编译、不创建第二个 TaskID。
+- 确认/取消回调必须携带原卡 `OpenMessageID`，并在接受动作的同一数据库事务中绑定
+  `receipt_provider/receipt_target`。provider 含发出原卡的飞书 App 身份指纹：同 App
+  换 secret 可继续，禁用或切换 App 不得沿用旧权限、也不得用新 App 修改旧卡。
+- 所有新确认卡与回执卡固定 `config.update_multi=true`。终态 operation 与
+  `task_creation_receipts` outbox 同事务提交；回调只给即时 toast/处理中反馈，最终结果
+  由 dispatcher 对原 `message_id` 执行幂等 `Message.Patch`，禁止另发结果消息。
+- outbox 使用数据库时钟、lease/fence、不可变 payload+SHA-256、会话 checkpoint 和
+  sent checkpoint。Patch 超时视为结果未知：重试同一 target+同一字节，因此最多只有
+  一张可见资源；进程可在任一 checkpoint 后退出并由下一实例接管。
+- Agent 会话只追加固定结构化终态事实，不得写入任务 summary、信源 title/URL/config、
+  provider error 或卡片正文；这些字段可能含外部内容，不能借 `[卡片回调]` 身份升级为
+  下一轮模型的可信指令。会话与普通消息共用 per-user 锁，锁忙立即释放 outbox 等待重试，
+  不得阻塞全局回执扫描或停机。
+- terminal replay 不得用“处理中”覆盖已经 Patch 的最终卡；接受前错误或 panic 只回 toast，
+  保留原卡重试能力。执行中的创建收到取消时必须明确告知“无法再取消”，但仍绑定原卡，
+  以便最终成功/安全回滚结果耐久送达。
+- 验证至少覆盖：终态+outbox 原子回滚、跨 Tenant/User/Task、双击/竞争、stale takeover、
+  会话提交响应丢失、Patch 成功但响应丢失、sent checkpoint 前崩溃、跨 App 拒发、渠道撤销、
+  外部摘要注入、panic 保卡、忙 user 锁不阻塞，以及真实 PostgreSQL `-race`。
