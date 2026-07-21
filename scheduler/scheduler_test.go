@@ -480,6 +480,7 @@ func assertCreatePushSuccess(
 	}
 	wantParams := workflow.PushParams{
 		UserID:     42,
+		RunKind:    workflow.PushRunKindScheduled,
 		ScheduleID: gotID,
 		Scope:      wantScope,
 		NLDesc:     "每日 AI 情报",
@@ -529,6 +530,7 @@ func assertCreatePushSuccess(
 type fakeTemporalClient struct {
 	client.Client
 	gotOptions client.StartWorkflowOptions
+	gotArgs    []interface{}
 	retRun     client.WorkflowRun
 	retErr     error
 	// sched 供 UpdatePush 一组用例注入 ScheduleClient 替身；
@@ -538,8 +540,9 @@ type fakeTemporalClient struct {
 
 func (f *fakeTemporalClient) ScheduleClient() client.ScheduleClient { return f.sched }
 
-func (f *fakeTemporalClient) ExecuteWorkflow(_ context.Context, options client.StartWorkflowOptions, _ interface{}, _ ...interface{}) (client.WorkflowRun, error) {
+func (f *fakeTemporalClient) ExecuteWorkflow(_ context.Context, options client.StartWorkflowOptions, _ interface{}, args ...interface{}) (client.WorkflowRun, error) {
 	f.gotOptions = options
+	f.gotArgs = append([]interface{}(nil), args...)
 	if f.retErr != nil {
 		return nil, f.retErr
 	}
@@ -572,6 +575,28 @@ func TestTriggerPushNow_Success(t *testing.T) {
 	}
 	if !fc.gotOptions.WorkflowExecutionErrorWhenAlreadyStarted {
 		t.Error("WorkflowExecutionErrorWhenAlreadyStarted 必须为 true，否则同 ID 在跑时 SDK 静默 attach")
+	}
+	if len(fc.gotArgs) != 1 {
+		t.Fatalf("workflow 参数数 = %d, 期望 1", len(fc.gotArgs))
+	}
+	params, ok := fc.gotArgs[0].(workflow.PushParams)
+	if !ok || params.RunKind != workflow.PushRunKindAdHoc || params.ScheduleID != "" {
+		t.Fatalf("TriggerPushNow params = %#v, 期望显式 ad_hoc 且无 schedule_id", fc.gotArgs[0])
+	}
+}
+
+func TestPushNowMarksExplicitAdHocRun(t *testing.T) {
+	fc := &fakeTemporalClient{retRun: &fakeWorkflowRun{id: "push-adhoc-42-run"}}
+	s := New(fc, "tq", nil)
+	if _, err := s.PushNow(t.Context(), 42, workflow.PushScope{TopN: 3}); err != nil {
+		t.Fatalf("PushNow 出错: %v", err)
+	}
+	if len(fc.gotArgs) != 1 {
+		t.Fatalf("workflow 参数数 = %d, 期望 1", len(fc.gotArgs))
+	}
+	params, ok := fc.gotArgs[0].(workflow.PushParams)
+	if !ok || params.RunKind != workflow.PushRunKindAdHoc || params.ScheduleID != "" || params.Scope.TopN != 3 {
+		t.Fatalf("PushNow params = %#v, 期望显式 ad_hoc 且保留 scope", fc.gotArgs[0])
 	}
 }
 
@@ -1209,6 +1234,9 @@ func TestReconcileActions_补齐缺失的scheduleID(t *testing.T) {
 	if got.ScheduleID != "push-1-old" {
 		t.Errorf("应补上 schedule_id=push-1-old，实得 %q", got.ScheduleID)
 	}
+	if got.RunKind != workflow.PushRunKindScheduled {
+		t.Errorf("应补上 run_kind=scheduled，实得 %q", got.RunKind)
+	}
 	if got.UserID != 1 {
 		t.Errorf("UserID 应保留 1，实得 %d", got.UserID)
 	}
@@ -1227,6 +1255,33 @@ func TestReconcileActions_补齐缺失的scheduleID(t *testing.T) {
 	}
 	if h.current.State == nil || h.current.State.Note != "原始状态" {
 		t.Errorf("State 不该被动")
+	}
+}
+
+// 已有 schedule_id/NLDesc 但缺 run_kind 也是旧冻结入参。若只比前两者会误判
+// 为已同步，AuthorizeRun 随后按 unknown fail-closed，使任务永久不执行。
+func TestReconcileActions_补齐显式ScheduledRunKind(t *testing.T) {
+	legacy := workflow.PushParams{
+		UserID: 1, ScheduleID: "push-1-kind", NLDesc: "任务名", Scope: workflow.PushScope{},
+	}
+	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-kind", []interface{}{payloadArg(t, legacy)})}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{"push-1-kind": h},
+	}}
+	st := &fakeScheduleStore{active: []types.Schedule{{
+		ID: "push-1-kind", UserID: 1, NLDescription: "任务名",
+		ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
+	}}}
+
+	if err := New(fc, "tq", st).ReconcileActions(t.Context()); err != nil {
+		t.Fatalf("ReconcileActions 失败: %v", err)
+	}
+	if len(h.history) != 1 {
+		t.Fatalf("缺 run_kind 的调度应被 Update 一次，实得 %d", len(h.history))
+	}
+	got := h.current.Action.(*client.ScheduleWorkflowAction).Args[0].(workflow.PushParams)
+	if got.RunKind != workflow.PushRunKindScheduled || got.ScheduleID != legacy.ScheduleID || got.NLDesc != legacy.NLDesc {
+		t.Fatalf("reconciled params = %+v", got)
 	}
 }
 

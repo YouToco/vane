@@ -105,6 +105,23 @@ func TestOnCardActionOwnerCheck(t *testing.T) {
 	})
 }
 
+// TestOnCardActionRejectsDuringShutdown 钉死停机准入关闭后的用户可见行为：
+// 不进入查库/Agent，也不让飞书重推，而是明确提示稍后重试。
+func TestOnCardActionRejectsDuringShutdown(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.setOwner("ou_owner", "主人")
+	if err := m.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() = %v", err)
+	}
+	h := newHandler(m, context.Background())
+
+	resp, err := h.onCardAction(context.Background(), cardEvent("ou_owner", confirmValue()))
+	if err != nil {
+		t.Fatalf("onCardAction 不应返回 error（避免飞书重推），实际: %v", err)
+	}
+	assertToast(t, resp, "服务正在重启，请稍后重试")
+}
+
 // TestOnCardActionIgnoresForeignCallback 验证非 Vane 确认卡的回调（value 里
 // 没有 vane_action/action_id，或取值不识别）被静默忽略：返回空响应而非错误
 // toast——同一机器人后续可能有其他交互卡片，误弹错误会打扰用户。

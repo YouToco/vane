@@ -198,10 +198,11 @@ func (s *Store) ClaimPendingAction(ctx context.Context, id string, userID int64)
 	return &pa, nil
 }
 
-// CancelPendingAction pending → cancelled，RETURNING 全列（调用方回写会话通告
+// CancelPendingAction 只允许历史 v0 pending → cancelled，RETURNING 全列（调用方回写会话通告
 // 需要 Summary 等字段）；非 pending（已执行/已取消/不存在）或归属不符返回
 // CodeNotFound 的 AppError。与 Claim 同样用单条条件 UPDATE 保证原子性，
-// userID 同样进 WHERE（安全红线 §10）。
+// userID 与 execution_version=0 同样进 WHERE（安全红线 §10）。v1 取消必须
+// 由 CreationCoordinator 写完整 phase/tombstone；旧 SQL 碰它会留下不可恢复的半墓碑。
 // 刻意不校验 expires_at：已超时但 status 仍为 pending 的动作允许取消——
 // 语义无害，且用户点"取消"永远能得到明确反馈而非"动作不存在"。
 func (s *Store) CancelPendingAction(ctx context.Context, id string, userID int64) (*types.PendingAction, error) {
@@ -209,6 +210,7 @@ func (s *Store) CancelPendingAction(ctx context.Context, id string, userID int64
 	err := scanPendingAction(s.pool.QueryRow(ctx,
 		`UPDATE pending_actions SET status = $2
 		 WHERE id = $1 AND user_id = $4 AND status = $3
+		   AND execution_version = 0
 		 RETURNING `+pendingActionColumns,
 		id, types.PendingActionStatusCancelled, types.PendingActionStatusPending, userID), &pa)
 	if err != nil {

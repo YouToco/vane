@@ -11,9 +11,11 @@ import (
 	"math/big"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/types"
 )
 
@@ -29,6 +31,13 @@ const (
 	taskCreationTakeoverSafetyGrace = 30 * time.Second
 	maxTaskCreationErrorCode        = 64
 	maxTaskCreationErrorText        = 512
+	maxTaskCreationArgsBytes        = 64 << 10
+	maxTaskCreationSummaryBytes     = 4 << 10
+	maxTaskCreationCommandBytes     = 64 << 10
+	maxTaskCreationDefinitionBytes  = 1 << 20
+	maxTaskCreationPreparedBytes    = 256 << 10
+	maxTaskCreationReceiptBytes     = 256 << 10
+	maxTaskCreationResultBytes      = 64 << 10
 	taskCreationRollbackLimit       = 2 * time.Second
 )
 
@@ -42,6 +51,168 @@ func scanTaskCreationOperation(row pgx.Row, op *types.TaskCreationOperation) err
 		&op.EnsureReceipt, &op.TaskID, &op.Result, &op.ErrorCode,
 		&op.ErrorMessage, &op.UpdatedAt, &op.TombstonedAt,
 	)
+}
+
+// CreateTaskCreationOperation inserts a v1 create_schedule confirmation under
+// an explicit active tenant membership. Legacy CreatePendingAction remains v0
+// and is intentionally untouched. Store owns every protocol field so callers
+// cannot smuggle an already-claimed phase, fence, or terminal status into the
+// durable saga.
+func (s *Store) CreateTaskCreationOperation(
+	ctx context.Context,
+	p types.CreateTaskCreationOperationParams,
+) (*types.TaskCreationOperation, error) {
+	if err := validateCreateTaskCreationParams(p); err != nil {
+		return nil, err
+	}
+
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, taskCreationDatabaseError("begin operation creation", err)
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
+
+	if err := lockValidMembership(ctx, tx, p.TenantID, p.UserID); err != nil {
+		return nil, err
+	}
+	if p.SessionID != nil {
+		var valid bool
+		err := tx.QueryRow(ctx,
+			`SELECT true
+			   FROM agent_sessions
+			  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
+			  FOR SHARE`,
+			*p.SessionID, p.TenantID, p.UserID,
+		).Scan(&valid)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, taskCreationValidation("agent session is outside operation scope")
+			}
+			return nil, taskCreationDatabaseError("validate operation session", err)
+		}
+	}
+	databaseNow, err := taskCreationDatabaseClock(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if !databaseNow.Before(p.ExpiresAt) {
+		return nil, taskCreationValidation("operation expiry is not in the future")
+	}
+
+	var op types.TaskCreationOperation
+	err = scanTaskCreationOperation(tx.QueryRow(ctx,
+		`INSERT INTO pending_actions
+			(id, tenant_id, user_id, session_id, tool_name, args, summary, status,
+			 expires_at, execution_version)
+		 VALUES ($1, $2, $3, $4, 'create_schedule', $5, $6, $7, $8, $9)
+		 ON CONFLICT (id) DO NOTHING
+		 RETURNING `+taskCreationOperationColumns,
+		p.ID, p.TenantID, p.UserID, p.SessionID, []byte(p.Args), p.Summary,
+		types.PendingActionStatusPending, p.ExpiresAt,
+		types.TaskCreationExecutionVersionV1,
+	), &op)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = scanTaskCreationOperation(tx.QueryRow(ctx,
+				`SELECT `+taskCreationOperationColumns+`
+				   FROM pending_actions WHERE id = $1 FOR SHARE`, p.ID,
+			), &op)
+			if err != nil {
+				return nil, taskCreationDatabaseError("load conflicting operation", err)
+			}
+			if !taskCreationCreationRequestEqual(&op, p) {
+				return nil, taskCreationConflict("operation id already exists")
+			}
+			return &op, nil
+		}
+		return nil, taskCreationDatabaseError("insert operation", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, taskCreationDatabaseError("commit operation creation", err)
+	}
+	return &op, nil
+}
+
+// CancelTaskCreationOperation linearizes a user's pre-claim cancellation with
+// Acquire on the same v1 row. It never touches a legacy/v0 pending action. An
+// exact replay adopts the durable cancelled tombstone (including after a lost
+// commit response); an executing operation is Busy and any other completed
+// operation is Terminal.
+func (s *Store) CancelTaskCreationOperation(
+	ctx context.Context,
+	id string,
+	tenantID int64,
+	userID int64,
+) (*types.TaskCreationOperation, error) {
+	if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) ||
+		len(id) > 255 || tenantID <= 0 || userID <= 0 {
+		return nil, taskCreationValidation("invalid cancellation scope")
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, taskCreationDatabaseError("begin operation cancellation", err)
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
+
+	var op types.TaskCreationOperation
+	err = scanTaskCreationOperation(tx.QueryRow(ctx,
+		`SELECT `+taskCreationOperationColumns+`
+		   FROM pending_actions
+		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
+		    AND tool_name = 'create_schedule' AND execution_version = $4
+		  FOR UPDATE`,
+		id, tenantID, userID, types.TaskCreationExecutionVersionV1,
+	), &op)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, taskCreationNotFound()
+		}
+		return nil, taskCreationDatabaseError("load cancellation target", err)
+	}
+	switch op.Status {
+	case types.PendingActionStatusCancelled:
+		if !cancelledTaskCreationOperationComplete(&op) {
+			return nil, taskCreationConflict("cancelled operation tombstone is incomplete")
+		}
+		return &op, nil
+	case types.PendingActionStatusExecuting:
+		return nil, taskCreationBusy()
+	case types.PendingActionStatusPending:
+		if !pendingTaskCreationOperationPristine(&op) {
+			return nil, taskCreationConflict("pending operation already has saga state")
+		}
+	default:
+		if taskCreationStatusIsTerminal(op.Status) {
+			return nil, taskCreationTerminal()
+		}
+		return nil, taskCreationConflict("operation status cannot be cancelled")
+	}
+
+	err = scanTaskCreationOperation(tx.QueryRow(ctx,
+		`UPDATE pending_actions
+		    SET status = $5, phase = $6,
+		        lease_owner = '', lease_until = NULL, takeover_not_before = NULL,
+		        result = NULL, error_code = '', error_message = '', executed_at = NULL,
+		        tombstoned_at = clock_timestamp(), updated_at = clock_timestamp()
+		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
+		    AND tool_name = 'create_schedule' AND execution_version = $4
+		    AND status = $7 AND phase = '' AND tombstoned_at IS NULL
+		    AND lease_owner = '' AND lease_until IS NULL AND takeover_not_before IS NULL
+		  RETURNING `+taskCreationOperationColumns,
+		id, tenantID, userID, types.TaskCreationExecutionVersionV1,
+		types.PendingActionStatusCancelled, types.TaskCreationPhaseCancelled,
+		types.PendingActionStatusPending,
+	), &op)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, taskCreationConflict("operation changed during cancellation")
+		}
+		return nil, taskCreationDatabaseError("write cancellation tombstone", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, taskCreationDatabaseError("commit operation cancellation", err)
+	}
+	return &op, nil
 }
 
 // AcquireTaskCreationOperation atomically claims a v1 create_schedule action.
@@ -89,15 +260,13 @@ func (s *Store) AcquireTaskCreationOperation(
 	if op.TombstonedAt != nil || taskCreationStatusIsTerminal(op.Status) {
 		return nil, taskCreationTerminal()
 	}
-
 	switch op.Status {
 	case types.PendingActionStatusPending:
-		if !databaseNow.Before(op.ExpiresAt) {
-			return nil, taskCreationTerminal()
-		}
-		if op.Phase != "" || op.LeaseOwner != "" || op.LeaseUntil != nil ||
-			op.TakeoverNotBefore != nil {
+		if !pendingTaskCreationOperationPristine(&op) {
 			return nil, taskCreationConflict("pending operation has saga state")
+		}
+		if !databaseNow.Before(op.ExpiresAt) {
+			return expirePendingTaskCreationOperation(ctx, tx, p, op.Fence)
 		}
 		return s.acquirePendingTaskCreation(ctx, tx, p, op.Fence)
 
@@ -115,7 +284,7 @@ func (s *Store) AcquireTaskCreationOperation(
 
 		// A just-expired worker gets a bounded grace period for an in-flight
 		// external RPC to return. This cannot fence a request already sent to
-		// Temporal/LLM, so takeover before the grace would create duplicates.
+		// Temporal or another remote system, so an early takeover could duplicate it.
 		if databaseNow.Before(*op.TakeoverNotBefore) {
 			return nil, taskCreationBusy()
 		}
@@ -124,6 +293,39 @@ func (s *Store) AcquireTaskCreationOperation(
 	default:
 		return nil, taskCreationTerminal()
 	}
+}
+
+func expirePendingTaskCreationOperation(
+	ctx context.Context,
+	tx pgx.Tx,
+	p types.AcquireTaskCreationOperationParams,
+	oldFence int64,
+) (*types.TaskCreationOperation, error) {
+	tag, err := tx.Exec(ctx,
+		`UPDATE pending_actions
+		    SET status = $5, phase = $6,
+		        lease_owner = '', lease_until = NULL, takeover_not_before = NULL,
+		        result = NULL, error_code = '', error_message = '', executed_at = NULL,
+		        tombstoned_at = clock_timestamp(), updated_at = clock_timestamp()
+		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
+		    AND tool_name = 'create_schedule' AND execution_version = $4
+		    AND status = $7 AND phase = '' AND tombstoned_at IS NULL
+		    AND lease_owner = '' AND lease_until IS NULL AND takeover_not_before IS NULL
+		    AND fence = $8 AND expires_at <= clock_timestamp()`,
+		p.ID, p.TenantID, p.UserID, types.TaskCreationExecutionVersionV1,
+		types.PendingActionStatusExpired, types.TaskCreationPhaseExpired,
+		types.PendingActionStatusPending, oldFence,
+	)
+	if err != nil {
+		return nil, taskCreationDatabaseError("write expiry tombstone", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, taskCreationConflict("operation changed during expiry")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, taskCreationDatabaseError("commit expiry tombstone", err)
+	}
+	return nil, taskCreationTerminal()
 }
 
 func (s *Store) acquirePendingTaskCreation(
@@ -227,6 +429,37 @@ func (s *Store) LoadTaskCreationOperation(
 	return &op, nil
 }
 
+// LoadTaskCreationOperationByUser resolves the durable tenant scope from the
+// v1 operation itself. It deliberately does not route through the user's
+// current/active memberships: a suspended or multi-membership user must still
+// be able to resume, cancel, or clean up the exact operation they confirmed.
+// Wrong-user, v0, wrong-tool and missing rows are indistinguishable.
+func (s *Store) LoadTaskCreationOperationByUser(
+	ctx context.Context,
+	id string,
+	userID int64,
+) (*types.TaskCreationOperation, error) {
+	if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) ||
+		len(id) > 255 || userID <= 0 {
+		return nil, taskCreationValidation("invalid operation lookup scope")
+	}
+	var op types.TaskCreationOperation
+	err := scanTaskCreationOperation(s.pool.QueryRow(ctx,
+		`SELECT `+taskCreationOperationColumns+`
+		   FROM pending_actions
+		  WHERE id = $1 AND user_id = $2
+		    AND tool_name = 'create_schedule' AND execution_version = $3`,
+		id, userID, types.TaskCreationExecutionVersionV1,
+	), &op)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, taskCreationNotFound()
+		}
+		return nil, taskCreationDatabaseError("load operation by user", err)
+	}
+	return &op, nil
+}
+
 // RenewTaskCreationLease extends only a still-active lease with the exact
 // tenant/user/owner/fence identity. An expired lease cannot be resurrected;
 // callers must reacquire it (and receive a new fence) after takeover grace.
@@ -276,16 +509,16 @@ func (s *Store) RenewTaskCreationLease(
 	return nil
 }
 
-// SealTaskCreationCommand freezes the normalized user command before any paid
-// translation. Same-byte replay is success; different bytes can never replace
-// the command that the user approved.
+// SealTaskCreationCommand freezes the normalized approved command before the
+// deterministic definition build. Same-byte replay is success; different bytes
+// can never replace the command that the user approved.
 func (s *Store) SealTaskCreationCommand(
 	ctx context.Context,
 	lease types.TaskCreationLease,
 	command []byte,
 ) error {
-	if len(command) == 0 {
-		return taskCreationValidation("normalized command is empty")
+	if len(command) == 0 || len(command) > maxTaskCreationCommandBytes {
+		return taskCreationValidation("normalized command size is invalid")
 	}
 	return s.checkpointTaskCreationBytes(ctx, lease, command, taskCreationCheckpoint{
 		from: types.TaskCreationPhaseClaimed,
@@ -301,10 +534,11 @@ func (s *Store) SealTaskCreationCommand(
 	})
 }
 
-// BeginTaskCreationTranslation is the paid-call intent checkpoint. Exactly the
-// caller that observes started=true may invoke the compiler. A replay after a
-// lost response returns started=false, forcing fail-closed recovery instead of
-// charging for a second translation whose first outcome is ambiguous.
+// BeginTaskCreationTranslation keeps the historical phase/API name but now
+// marks the start of a deterministic definition build from approved_fetch_plan.
+// started=true means this call advanced the phase; started=false means recovery
+// should load the existing compiled checkpoint or safely rebuild if it is not
+// present. No paid model authorization is represented by this method.
 func (s *Store) BeginTaskCreationTranslation(
 	ctx context.Context,
 	lease types.TaskCreationLease,
@@ -353,23 +587,23 @@ func (s *Store) BeginTaskCreationTranslation(
 		return false, taskCreationLeaseLost()
 	}
 	if err := tx.Commit(ctx); err != nil {
-		// A commit error is intentionally never reported as started=true: the
-		// database may have committed, so the only safe choice is no paid call.
+		// A commit error is intentionally never reported as started=true because
+		// the database may have committed. Recovery reloads the durable phase.
 		return false, taskCreationDatabaseError("commit translation checkpoint", err)
 	}
 	return true, nil
 }
 
-// CheckpointTaskCreationDefinition freezes the compiled A2 definition and its
-// SHA-256 digest after the one authorized translation call.
+// CheckpointTaskCreationDefinition freezes the deterministically compiled A2
+// definition and its SHA-256 digest.
 func (s *Store) CheckpointTaskCreationDefinition(
 	ctx context.Context,
 	lease types.TaskCreationLease,
 	definition []byte,
 	digest string,
 ) error {
-	if len(definition) == 0 {
-		return taskCreationValidation("compiled definition is empty")
+	if len(definition) == 0 || len(definition) > maxTaskCreationDefinitionBytes {
+		return taskCreationValidation("compiled definition size is invalid")
 	}
 	if !validSHA256Digest(digest) {
 		return taskCreationValidation("compiled digest is invalid")
@@ -389,8 +623,8 @@ func (s *Store) CheckpointTaskCreationSchedule(
 	lease types.TaskCreationLease,
 	prepared []byte,
 ) error {
-	if len(prepared) == 0 {
-		return taskCreationValidation("prepared schedule is empty")
+	if len(prepared) == 0 || len(prepared) > maxTaskCreationPreparedBytes {
+		return taskCreationValidation("prepared schedule size is invalid")
 	}
 	return s.checkpointTaskCreationBytes(ctx, lease, prepared, taskCreationCheckpoint{
 		from: types.TaskCreationPhaseDefinitionCompiled,
@@ -415,7 +649,8 @@ func (s *Store) CheckpointTaskCreationEnsureReceipt(
 	receipt []byte,
 	taskID string,
 ) error {
-	if len(receipt) == 0 || strings.TrimSpace(taskID) == "" || taskID != strings.TrimSpace(taskID) {
+	if len(receipt) == 0 || len(receipt) > maxTaskCreationReceiptBytes ||
+		strings.TrimSpace(taskID) == "" || taskID != strings.TrimSpace(taskID) {
 		return taskCreationValidation("ensure receipt is incomplete")
 	}
 	if len(taskID) > 255 {
@@ -424,9 +659,9 @@ func (s *Store) CheckpointTaskCreationEnsureReceipt(
 	return s.checkpointTaskCreationEnsureReceipt(ctx, lease, receipt, taskID)
 }
 
-// BlockTaskCreationOperation is the fail-closed terminal for an ambiguous paid
-// translation. Failed and completed operations use the same fenced tombstone
-// transition; none can ever be acquired or scanned again.
+// BlockTaskCreationOperation is the fail-closed terminal for an operation whose
+// outcome cannot be proven safe. Failed and completed operations use the same
+// fenced tombstone transition; none can ever be acquired or scanned again.
 func (s *Store) BlockTaskCreationOperation(
 	ctx context.Context,
 	lease types.TaskCreationLease,
@@ -467,7 +702,8 @@ func (s *Store) CompleteTaskCreationOperation(
 	if strings.TrimSpace(taskID) == "" || taskID != strings.TrimSpace(taskID) || len(taskID) > 255 {
 		return taskCreationValidation("task id is invalid")
 	}
-	if len(result) == 0 || !json.Valid(result) {
+	if len(result) == 0 || len(result) > maxTaskCreationResultBytes ||
+		strictjson.Validate(result) != nil {
 		return taskCreationValidation("operation result is invalid")
 	}
 	return s.terminateTaskCreationOperation(ctx, lease, taskCreationTermination{
@@ -478,9 +714,61 @@ func (s *Store) CompleteTaskCreationOperation(
 	})
 }
 
+// ListStaleTaskCreationTenantIDs enumerates tenant shards which contain at
+// least one truly takeover-safe v1 operation. afterTenantID is an exclusive,
+// stable keyset cursor; the coordinator wraps it to zero at the end. Ordering
+// by tenant identity (rather than repeatedly taking the oldest top-N page)
+// guarantees that a permanently failing early shard cannot starve later ones.
+// The caller-supplied boundary is clamped to the database clock, so a
+// skewed/future process clock cannot make a still-owned operation recoverable
+// early.
+func (s *Store) ListStaleTaskCreationTenantIDs(
+	ctx context.Context,
+	before time.Time,
+	afterTenantID int64,
+	limit int,
+) ([]int64, error) {
+	if before.IsZero() || afterTenantID < 0 || limit <= 0 || limit > 1000 {
+		return nil, taskCreationValidation("invalid stale tenant query")
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT tenant_id
+		   FROM pending_actions
+		  WHERE tool_name = 'create_schedule'
+		    AND execution_version = $1 AND status = $2
+		    AND tenant_id > $4
+		    AND tombstoned_at IS NULL
+		    AND lease_owner <> '' AND fence > 0 AND attempt > 0
+		    AND lease_until IS NOT NULL AND takeover_not_before IS NOT NULL
+		    AND lease_until <= clock_timestamp()
+		    AND takeover_not_before <= LEAST($3, clock_timestamp())
+		  ORDER BY tenant_id
+		  LIMIT $5`,
+		types.TaskCreationExecutionVersionV1,
+		types.PendingActionStatusExecuting, before, afterTenantID, limit,
+	)
+	if err != nil {
+		return nil, taskCreationDatabaseError("list stale tenant shards", err)
+	}
+	defer rows.Close()
+
+	tenantIDs := make([]int64, 0)
+	for rows.Next() {
+		var tenantID int64
+		if err := rows.Scan(&tenantID); err != nil {
+			return nil, taskCreationDatabaseError("scan stale tenant shard", err)
+		}
+		tenantIDs = append(tenantIDs, tenantID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, taskCreationDatabaseError("iterate stale tenant shards", err)
+	}
+	return tenantIDs, nil
+}
+
 // ListStaleTaskCreationOperations returns only recoverable v1 operations for a
-// single tenant. Terminal/tombstoned rows and all historical v0 actions are
-// excluded both by the query and the migration's partial index.
+// single tenant. Terminal/tombstoned rows, incomplete/corrupt lease rows, and
+// all historical v0 actions are excluded.
 func (s *Store) ListStaleTaskCreationOperations(
 	ctx context.Context,
 	tenantID int64,
@@ -495,7 +783,10 @@ func (s *Store) ListStaleTaskCreationOperations(
 		   FROM pending_actions
 		  WHERE tenant_id = $1 AND tool_name = 'create_schedule'
 		    AND execution_version = $2 AND status = $3
-		    AND tombstoned_at IS NULL AND takeover_not_before IS NOT NULL
+		    AND tombstoned_at IS NULL
+		    AND lease_owner <> '' AND fence > 0 AND attempt > 0
+		    AND lease_until IS NOT NULL AND takeover_not_before IS NOT NULL
+		    AND lease_until <= clock_timestamp()
 		    AND takeover_not_before <= LEAST($4, clock_timestamp())
 		  ORDER BY takeover_not_before, id
 		  LIMIT $5`,
@@ -743,6 +1034,16 @@ func (s *Store) terminateTaskCreationOperation(
 	if err := validateTaskCreationTerminationPhase(op.Phase, termination.status); err != nil {
 		return err
 	}
+	if termination.status == types.PendingActionStatusExecuted {
+		row, found, err := loadCreationScheduleForUpdate(ctx, tx, termination.taskID)
+		if err != nil {
+			return err
+		}
+		if !found || row.tenantID != lease.TenantID || row.userID != lease.UserID ||
+			row.status != types.ScheduleStatusActive {
+			return taskCreationConflict("completed operation has no exact active aggregate")
+		}
+	}
 	if termination.status == types.PendingActionStatusExecuted &&
 		op.TaskID != "" && op.TaskID != termination.taskID {
 		return taskCreationConflict("completed task id differs from ensure checkpoint")
@@ -870,6 +1171,55 @@ func validateAcquireTaskCreationParams(p types.AcquireTaskCreationOperationParam
 	return nil
 }
 
+func validateCreateTaskCreationParams(p types.CreateTaskCreationOperationParams) error {
+	if strings.TrimSpace(p.ID) == "" || p.ID != strings.TrimSpace(p.ID) ||
+		len(p.ID) > 255 || !utf8.ValidString(p.ID) {
+		return taskCreationValidation("operation id is invalid")
+	}
+	if p.TenantID <= 0 || p.UserID <= 0 {
+		return taskCreationValidation("operation tenant/user scope is invalid")
+	}
+	if p.SessionID != nil && *p.SessionID <= 0 {
+		return taskCreationValidation("operation session id is invalid")
+	}
+	if p.ExpiresAt.IsZero() {
+		return taskCreationValidation("operation expiry is missing")
+	}
+	if len(p.Args) == 0 || len(p.Args) > maxTaskCreationArgsBytes || !utf8.Valid(p.Args) {
+		return taskCreationValidation("operation args size or encoding is invalid")
+	}
+	if strings.TrimSpace(p.Summary) == "" || p.Summary != strings.TrimSpace(p.Summary) ||
+		len(p.Summary) > maxTaskCreationSummaryBytes || !utf8.ValidString(p.Summary) {
+		return taskCreationValidation("operation summary size or encoding is invalid")
+	}
+	var args map[string]json.RawMessage
+	if err := strictjson.Decode(p.Args, &args); err != nil || args == nil {
+		return types.NewAppError(types.CodeValidation,
+			"task creation: args must be a strict JSON object", err)
+	}
+	return nil
+}
+
+func taskCreationCreationRequestEqual(
+	op *types.TaskCreationOperation,
+	p types.CreateTaskCreationOperationParams,
+) bool {
+	if op == nil || op.ID != p.ID || op.TenantID != p.TenantID || op.UserID != p.UserID ||
+		op.ToolName != "create_schedule" ||
+		op.ExecutionVersion != types.TaskCreationExecutionVersionV1 ||
+		op.Status != types.PendingActionStatusPending || op.Phase != "" ||
+		op.LeaseOwner != "" || op.LeaseUntil != nil || op.TakeoverNotBefore != nil ||
+		op.Fence != 0 || op.Attempt != 0 || op.TombstonedAt != nil ||
+		op.Summary != p.Summary || !op.ExpiresAt.Equal(p.ExpiresAt.Truncate(time.Microsecond)) ||
+		!taskCreationJSONEqual(op.Args, p.Args) {
+		return false
+	}
+	if op.SessionID == nil || p.SessionID == nil {
+		return op.SessionID == nil && p.SessionID == nil
+	}
+	return *op.SessionID == *p.SessionID
+}
+
 func validateTaskCreationLease(lease types.TaskCreationLease) error {
 	if lease.ID == "" || lease.TenantID <= 0 || lease.UserID <= 0 ||
 		strings.TrimSpace(lease.LeaseOwner) == "" ||
@@ -898,7 +1248,7 @@ func validateTaskCreationTerminationPhase(
 	case types.PendingActionStatusBlocked, types.PendingActionStatusFailed:
 		rank := taskCreationPhaseRank(phase)
 		if rank < taskCreationPhaseRank(types.TaskCreationPhaseClaimed) ||
-			rank > taskCreationPhaseRank(types.TaskCreationPhaseSchedulePrepared) {
+			rank > taskCreationPhaseRank(types.TaskCreationPhaseDefinitionCompiled) {
 			return taskCreationConflict("operation requires side-effect cleanup")
 		}
 	default:
@@ -1014,6 +1364,28 @@ func taskCreationStatusIsTerminal(status types.PendingActionStatus) bool {
 	}
 }
 
+func pendingTaskCreationOperationPristine(op *types.TaskCreationOperation) bool {
+	return op != nil && op.Status == types.PendingActionStatusPending &&
+		op.Phase == "" && op.LeaseOwner == "" && op.LeaseUntil == nil &&
+		op.TakeoverNotBefore == nil && op.Fence == 0 && op.Attempt == 0 &&
+		len(op.NormalizedCommand) == 0 && len(op.CompiledDefinition) == 0 &&
+		op.CompiledDigest == "" && len(op.PreparedSchedule) == 0 &&
+		len(op.EnsureReceipt) == 0 && op.TaskID == "" && len(op.Result) == 0 &&
+		op.ErrorCode == "" && op.ErrorMessage == "" && op.ExecutedAt == nil &&
+		op.TombstonedAt == nil
+}
+
+func cancelledTaskCreationOperationComplete(op *types.TaskCreationOperation) bool {
+	return op != nil && op.Status == types.PendingActionStatusCancelled &&
+		op.Phase == types.TaskCreationPhaseCancelled &&
+		op.LeaseOwner == "" && op.LeaseUntil == nil && op.TakeoverNotBefore == nil &&
+		op.Fence == 0 && op.Attempt == 0 && len(op.NormalizedCommand) == 0 &&
+		len(op.CompiledDefinition) == 0 && op.CompiledDigest == "" &&
+		len(op.PreparedSchedule) == 0 && len(op.EnsureReceipt) == 0 &&
+		op.TaskID == "" && len(op.Result) == 0 && op.ErrorCode == "" &&
+		op.ErrorMessage == "" && op.ExecutedAt == nil && op.TombstonedAt != nil
+}
+
 func taskCreationPhaseAtLeast(current, target types.TaskCreationPhase) bool {
 	return taskCreationPhaseRank(current) >= taskCreationPhaseRank(target)
 }
@@ -1041,6 +1413,8 @@ func taskCreationPhaseRank(phase types.TaskCreationPhase) int {
 	case types.TaskCreationPhaseCleanupPending:
 		return 10
 	case types.TaskCreationPhaseCompleted,
+		types.TaskCreationPhaseCancelled,
+		types.TaskCreationPhaseExpired,
 		types.TaskCreationPhaseBlocked,
 		types.TaskCreationPhaseFailed:
 		return 11

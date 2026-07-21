@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -134,13 +135,22 @@ func TestValidatePausedCompiledTaskDefinition(t *testing.T) {
 	}{
 		{"空 task id", func(d *types.PausedCompiledTaskDefinition) { d.TaskID = "" }},
 		{"task id 首尾空白", func(d *types.PausedCompiledTaskDefinition) { d.TaskID = " push-a2 " }},
+		{"task id 过长", func(d *types.PausedCompiledTaskDefinition) {
+			d.TaskID = strings.Repeat("x", 256)
+		}},
 		{"tenant 非正数", func(d *types.PausedCompiledTaskDefinition) { d.TenantID = 0 }},
 		{"user 非正数", func(d *types.PausedCompiledTaskDefinition) { d.UserID = -1 }},
 		{"spec 缺失", func(d *types.PausedCompiledTaskDefinition) { d.SpecJSON = nil }},
 		{"spec null", func(d *types.PausedCompiledTaskDefinition) { d.SpecJSON = json.RawMessage(`null`) }},
 		{"spec 非对象", func(d *types.PausedCompiledTaskDefinition) { d.SpecJSON = json.RawMessage(`[]`) }},
+		{"spec 重复 key", func(d *types.PausedCompiledTaskDefinition) {
+			d.SpecJSON = json.RawMessage(`{"cron":"a","cron":"b"}`)
+		}},
 		{"scope 非法 JSON", func(d *types.PausedCompiledTaskDefinition) { d.ScopeJSON = json.RawMessage(`{`) }},
 		{"strictness 非法", func(d *types.PausedCompiledTaskDefinition) { d.Strictness = "extreme" }},
+		{"playbook 过大", func(d *types.PausedCompiledTaskDefinition) {
+			d.PlaybookContent = strings.Repeat("x", maxCompiledTaskPlaybookBytes+1)
+		}},
 		{"计划缺失", func(d *types.PausedCompiledTaskDefinition) { d.FetchPlan = nil }},
 		{"计划 null", func(d *types.PausedCompiledTaskDefinition) { d.FetchPlan = json.RawMessage(`null`) }},
 		{"计划非对象", func(d *types.PausedCompiledTaskDefinition) { d.FetchPlan = json.RawMessage(`[]`) }},
@@ -150,6 +160,22 @@ func TestValidatePausedCompiledTaskDefinition(t *testing.T) {
 		}},
 		{"sources 空", func(d *types.PausedCompiledTaskDefinition) {
 			d.FetchPlan = json.RawMessage(`{"sources":[]}`)
+		}},
+		{"sources 过多", func(d *types.PausedCompiledTaskDefinition) {
+			sources := make([]compiledPlanSource, maxCompiledTaskSources+1)
+			for i := range sources {
+				sources[i] = compiledPlanSource{
+					Platform: "web", Capability: "feed", URL: fmt.Sprintf("vane://many/%d", i),
+				}
+			}
+			raw, err := json.Marshal(compiledFetchPlan{Sources: sources})
+			if err != nil {
+				panic(err)
+			}
+			d.FetchPlan = raw
+		}},
+		{"计划重复 sources key", func(d *types.PausedCompiledTaskDefinition) {
+			d.FetchPlan = json.RawMessage(`{"sources":[],"sources":[]}`)
 		}},
 		{"URL 重复", func(d *types.PausedCompiledTaskDefinition) {
 			d.FetchPlan = json.RawMessage(`{"sources":[
@@ -185,6 +211,11 @@ func TestValidatePausedCompiledTaskDefinition(t *testing.T) {
 		{"config 非对象", func(d *types.PausedCompiledTaskDefinition) {
 			d.FetchPlan = json.RawMessage(`{"sources":[
 				{"platform":"web","capability":"search","url":"vane://one","config":[]}
+			]}`)
+		}},
+		{"config 嵌套重复 key", func(d *types.PausedCompiledTaskDefinition) {
+			d.FetchPlan = json.RawMessage(`{"sources":[
+				{"platform":"web","capability":"search","url":"vane://one","config":{"query":"a","query":"b"}}
 			]}`)
 		}},
 	}
@@ -264,6 +295,54 @@ func TestInsertPausedCompiledTaskDefinition_RejectsInvalidInputBeforeBegin(t *te
 				t.Fatalf("非法输入必须在事务前拒绝，BeginTx 调用了 %d 次", beginCalls)
 			}
 		})
+	}
+}
+
+func TestInsertPausedCompiledTaskDefinition_CanonicalizesGlobalSourceLockOrder(t *testing.T) {
+	st := tenantTestStore(t)
+	left := newCompiledTaskFixture(t, st)
+	right := newCompiledTaskFixture(t, st)
+	ctx := t.Context()
+	st2, err := New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, st2)
+
+	urls := make([]string, 48)
+	for i := range urls {
+		urls[i] = left.url(fmt.Sprintf("inverse-lock-%02d", i))
+	}
+	reversed := append([]string(nil), urls...)
+	slices.Reverse(reversed)
+	leftDef := left.definition(left.taskID(), types.StrictnessNormal, urls...)
+	rightDef := right.definition(right.taskID(), types.StrictnessNormal, reversed...)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		<-start
+		results <- st.InsertPausedCompiledTaskDefinition(ctx, leftDef)
+	}()
+	go func() {
+		<-start
+		results <- st2.InsertPausedCompiledTaskDefinition(ctx, rightDef)
+	}()
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("inverse source order must not deadlock: %v", err)
+		}
+	}
+	for _, def := range []types.PausedCompiledTaskDefinition{leftDef, rightDef} {
+		var stored []byte
+		if err := st.pool.QueryRow(ctx,
+			`SELECT fetch_plan FROM schedule_playbooks WHERE schedule_id = $1`, def.TaskID,
+		).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if !taskCreationJSONEqual(stored, def.FetchPlan) {
+			t.Fatalf("lock ordering must not change approved fetch_plan for %s", def.TaskID)
+		}
 	}
 }
 

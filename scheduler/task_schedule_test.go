@@ -2145,6 +2145,9 @@ func TestEnsurePausedTask_RejectsDescriptionMismatchesWithoutWrites(t *testing.T
 		{"arg_user", func(t *testing.T, d *client.ScheduleDescription) {
 			replaceParams(t, d, func(p *workflow.PushParams) { p.UserID++ })
 		}},
+		{"arg_run_kind", func(t *testing.T, d *client.ScheduleDescription) {
+			replaceParams(t, d, func(p *workflow.PushParams) { p.RunKind = workflow.PushRunKindAdHoc })
+		}},
 		{"arg_schedule", func(t *testing.T, d *client.ScheduleDescription) {
 			replaceParams(t, d, func(p *workflow.PushParams) { p.ScheduleID = "other" })
 		}},
@@ -3337,11 +3340,11 @@ func TestTaskScheduleError_AllKindsSupportIsAndAs(t *testing.T) {
 	}
 }
 
-// TestTaskSchedulePrimitives_HaveZeroProductionCallPoints 是 A3 的安全停靠守卫：
-// A4 lease/fence/checkpoint 与 A5 恢复器完成前，任何生产入口都不得提前调用这些
-// Temporal 原语。方法值、函数值和 selector 引用也算接线，不能只盯 CallExpr；
-// provider 文件内部为了响应丢失收敛而互调不算生产接线。
-func TestTaskSchedulePrimitives_HaveZeroProductionCallPoints(t *testing.T) {
+// TestTaskSchedulePrimitives_AreOnlyUsedByCreationSaga 是 A5 的接线守卫：
+// 所有生产入口必须经 task.CreationCoordinator 驱动创建 Saga，不能绕过它直接
+// 调用 Temporal 原语。方法值、函数值和 selector 引用也算接线，不能只盯
+// CallExpr；provider 文件内部为了响应丢失收敛而互调不算外部接线。
+func TestTaskSchedulePrimitives_AreOnlyUsedByCreationSaga(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller 无法定位测试文件")
@@ -3349,6 +3352,7 @@ func TestTaskSchedulePrimitives_HaveZeroProductionCallPoints(t *testing.T) {
 	schedulerDir := filepath.Dir(thisFile)
 	repoRoot := filepath.Dir(schedulerDir)
 	provider := filepath.Join(schedulerDir, "task_schedule.go")
+	creationSaga := filepath.Join(repoRoot, "task", "creation_saga.go")
 	watched := map[string]struct{}{
 		"TaskIDForOperation":  {},
 		"PrepareTaskSchedule": {},
@@ -3370,7 +3374,9 @@ func TestTaskSchedulePrimitives_HaveZeroProductionCallPoints(t *testing.T) {
 			}
 			return nil
 		}
-		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") || path == provider {
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") ||
+			filepath.Clean(path) == filepath.Clean(provider) ||
+			filepath.Clean(path) == filepath.Clean(creationSaga) {
 			return nil
 		}
 		file, parseErr := parser.ParseFile(fset, path, nil, 0)
@@ -3390,10 +3396,10 @@ func TestTaskSchedulePrimitives_HaveZeroProductionCallPoints(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("扫描 A3 生产调用点: %v", err)
+		t.Fatalf("扫描任务调度原语生产调用点: %v", err)
 	}
 	if len(references) != 0 {
-		t.Fatalf("A3～A5 完整前必须保持零生产引用，发现 %v", references)
+		t.Fatalf("任务调度原语必须只由创建 Saga 调用，发现旁路引用 %v", references)
 	}
 }
 

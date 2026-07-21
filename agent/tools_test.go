@@ -577,7 +577,8 @@ func TestOtherTools_Summarize(t *testing.T) {
 	t.Run("create_schedule cron", func(t *testing.T) {
 		got := (&createScheduleTool{}).Summarize(json.RawMessage(
 			`{"spec":{"cron":"0 30 8 * * *"},"nl_description":"每天早八"}`))
-		want := "创建定时推送任务：按 cron「0 30 8 * * *」触发（时区 Asia/Shanghai），描述「每天早八」"
+		want := "创建定时推送任务：按 cron「0 30 8 * * *」触发（时区 Asia/Shanghai），描述「每天早八」\n" +
+			"推送门槛：宽松（只过滤与你画像无关的内容）"
 		if got != want {
 			t.Fatalf("实得 %q\n期望 %q", got, want)
 		}
@@ -585,8 +586,30 @@ func TestOtherTools_Summarize(t *testing.T) {
 	t.Run("create_schedule every_seconds", func(t *testing.T) {
 		got := (&createScheduleTool{}).Summarize(json.RawMessage(`{"spec":{"every_seconds":3600}}`))
 		// 文案刻意点明 epoch 对齐：不说的话用户会以为是"从现在起每小时"。
-		if got != "创建定时推送任务：每 3600 秒触发一次（时区 Asia/Shanghai，按 epoch 对齐）" {
+		if got != "创建定时推送任务：每 3600 秒触发一次（时区 Asia/Shanghai，按 epoch 对齐）\n"+
+			"推送门槛：宽松（只过滤与你画像无关的内容）" {
 			t.Fatalf("实得 %q", got)
+		}
+	})
+	t.Run("create_schedule 展示批准意图门槛和完整信源", func(t *testing.T) {
+		got := (&createScheduleTool{}).Summarize(json.RawMessage(`{
+			"spec":{"cron":"0 8 * * *"},
+			"intent":"只监控 Anthropic 官方状态故障",
+			"strictness":"strict",
+			"approved_fetch_plan":{"sources":[{
+				"platform":"web","capability":"feed","title":"Anthropic Status",
+				"url":"https://status.anthropic.com/history.rss","config":{"format":"rss"}
+			}]}
+		}`))
+		for _, want := range []string{
+			"监控意图：只监控 Anthropic 官方状态故障",
+			"推送门槛：严格（仅 ≥60 分的高相关内容才推送）",
+			"批准信源（1）",
+			"Anthropic Status [web/feed] https://status.anthropic.com/history.rss；参数 {\"format\":\"rss\"}",
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("确认摘要缺少 %q：%s", want, got)
+			}
 		}
 	})
 	t.Run("update_schedule 只改频率", func(t *testing.T) {
@@ -1222,6 +1245,42 @@ func TestScheduleSchemas_含anchor_at(t *testing.T) {
 		}
 		if _, ok := schema.Properties.Spec.Properties["anchor_at"]; !ok {
 			t.Errorf("%s 的 spec 应暴露 anchor_at", name)
+		}
+	}
+}
+
+func TestCreateScheduleSchema_RequiresApprovedIntentAndFetchPlan(t *testing.T) {
+	var schema struct {
+		Required   []string `json:"required"`
+		Properties struct {
+			ApprovedFetchPlan struct {
+				Required   []string `json:"required"`
+				Properties struct {
+					Sources struct {
+						MinItems int `json:"minItems"`
+						Items    struct {
+							Required []string `json:"required"`
+						} `json:"items"`
+					} `json:"sources"`
+				} `json:"properties"`
+			} `json:"approved_fetch_plan"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal((&createScheduleTool{}).Parameters(), &schema); err != nil {
+		t.Fatalf("create_schedule schema 不是合法 JSON: %v", err)
+	}
+	for _, required := range []string{"spec", "intent", "approved_fetch_plan"} {
+		if !slices.Contains(schema.Required, required) {
+			t.Fatalf("create_schedule 缺少根必填字段 %q：%v", required, schema.Required)
+		}
+	}
+	plan := schema.Properties.ApprovedFetchPlan
+	if !slices.Contains(plan.Required, "sources") || plan.Properties.Sources.MinItems != 1 {
+		t.Fatalf("approved_fetch_plan.sources 必须存在且非空：%+v", plan)
+	}
+	for _, required := range []string{"platform", "capability", "url", "config"} {
+		if !slices.Contains(plan.Properties.Sources.Items.Required, required) {
+			t.Fatalf("批准信源缺少必填字段 %q：%v", required, plan.Properties.Sources.Items.Required)
 		}
 	}
 }

@@ -62,6 +62,7 @@ func (g *gateStubs) register(env *testsuite.TestWorkflowEnvironment) {
 	reg := func(name string, fn any) {
 		env.RegisterActivityWithOptions(fn, activity.RegisterOptions{Name: name})
 	}
+	reg("AuthorizeRun", func(context.Context, PushParams) (bool, error) { return true, nil })
 	reg("EvolveProfile", func(context.Context, EvolveIn) error { return nil })
 	reg("Fetch", func(context.Context, PushParams) ([]types.ContentItem, error) { return g.out.items, nil })
 	reg("Dedup", func(context.Context, DedupIn) ([]types.ContentItem, error) { return g.out.deduped, nil })
@@ -101,6 +102,43 @@ func (g *gateStubs) notifiedCalls() []NotifyEmptyIn {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return append([]NotifyEmptyIn(nil), g.notified...)
+}
+
+func TestPushPipelineWorkflow_UnauthorizedScheduleStopsBeforeAllSideEffects(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	g := gateStubs{out: gateOut{items: []types.ContentItem{{ID: 1}}}}
+	g.register(env)
+	var evolveCalls atomic.Int32
+	var fetchCalls atomic.Int32
+	env.RegisterActivityWithOptions(
+		func(context.Context, PushParams) (bool, error) { return false, nil },
+		activity.RegisterOptions{Name: "AuthorizeRun"},
+	)
+	env.RegisterActivityWithOptions(
+		func(context.Context, EvolveIn) error { evolveCalls.Add(1); return nil },
+		activity.RegisterOptions{Name: "EvolveProfile"},
+	)
+	env.RegisterActivityWithOptions(
+		func(context.Context, PushParams) ([]types.ContentItem, error) {
+			fetchCalls.Add(1)
+			return g.out.items, nil
+		},
+		activity.RegisterOptions{Name: "Fetch"},
+	)
+
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
+		UserID: 7, ScheduleID: "provisioning-task",
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("unauthorized run should converge normally: %v", err)
+	}
+	recorded, pushed := g.snapshot()
+	if evolveCalls.Load() != 0 || fetchCalls.Load() != 0 ||
+		len(recorded) != 0 || len(pushed) != 0 {
+		t.Fatalf("unauthorized run leaked side effects: evolve=%d fetch=%d record=%d push=%d",
+			evolveCalls.Load(), fetchCalls.Load(), len(recorded), len(pushed))
+	}
 }
 
 // countsStr 把漏斗渲染成可读串，**nil 字段直接不出现**——这正是要断言的语义边界：

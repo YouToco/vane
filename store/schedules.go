@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -13,6 +14,19 @@ import (
 
 // scheduleColumns 是 schedules 表全列，SELECT 与 scanSchedule 一一对应。
 const scheduleColumns = `id, user_id, nl_description, spec_json, scope_json, status, created_at, updated_at`
+
+// matureSchedulePredicate requires the outer schedules table to use alias s.
+// A v1 aggregate is user-manageable only after its operation is both
+// executed/completed; v0/legacy schedules have no matching versioned row and
+// therefore remain visible.
+const matureSchedulePredicate = `NOT EXISTS (
+	SELECT 1
+	  FROM pending_actions p
+	 WHERE p.task_id = s.id
+	   AND p.tenant_id = s.tenant_id AND p.user_id = s.user_id
+	   AND p.tool_name = 'create_schedule' AND p.execution_version = 1
+	   AND NOT (p.status = 'executed' AND p.phase = 'completed')
+)`
 
 // scanSchedule 把一行 schedules 扫进 types.Schedule（复用于单行与多行）。
 func scanSchedule(row pgx.Row, sc *types.Schedule) error {
@@ -26,6 +40,9 @@ func scanSchedule(row pgx.Row, sc *types.Schedule) error {
 // 使 Postgres 侧持有一份可供 /api/schedules 列表读取与对账的副本。
 // spec_json / scope_json NOT NULL DEFAULT '{}'，nil 归一为 '{}'；status 默认 active。
 func (s *Store) InsertSchedule(ctx context.Context, sc *types.Schedule) error {
+	if sc == nil || sc.UserID <= 0 {
+		return types.NewAppError(types.CodeValidation, "调度镜像与用户归属不得为空", nil)
+	}
 	spec := sc.SpecJSON
 	if len(spec) == 0 {
 		spec = json.RawMessage("{}")
@@ -38,7 +55,41 @@ func (s *Store) InsertSchedule(ctx context.Context, sc *types.Schedule) error {
 	if status == "" {
 		status = types.ScheduleStatusActive
 	}
-	_, err := s.pool.Exec(ctx,
+	if status != types.ScheduleStatusActive {
+		_, err := s.pool.Exec(ctx,
+			`INSERT INTO schedules (id, tenant_id, user_id, nl_description, spec_json, scope_json, status)
+			 VALUES ($1, `+tenantOfUser+`$2), $2, $3, $4, $5, $6)`,
+			sc.ID, sc.UserID, sc.NLDescription, spec, scope, status)
+		if err != nil {
+			return types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("插入调度镜像（id=%s）", sc.ID), err)
+		}
+		return nil
+	}
+
+	// Legacy Scheduler.CreatePush still reaches this method while A5 is being
+	// rolled out. Its preflight list cannot serialize with an A5 reservation, so
+	// enforce the same user-wide limit again at the final database write. If the
+	// race is lost, Scheduler's existing compensation deletes its Temporal row.
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("开始插入调度镜像事务（id=%s）", sc.ID), err)
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
+	if err := lockTaskCapacityUser(ctx, tx, sc.UserID); err != nil {
+		return err
+	}
+	used, err := countTaskCreationCapacity(ctx, tx, sc.UserID)
+	if err != nil {
+		return err
+	}
+	if used >= maxActiveTasksPerUser {
+		return types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("活跃定时任务已达上限（%d 个）", maxActiveTasksPerUser),
+			types.ErrTaskCreationLimit)
+	}
+	_, err = tx.Exec(ctx,
 		`INSERT INTO schedules (id, tenant_id, user_id, nl_description, spec_json, scope_json, status)
 		 VALUES ($1, `+tenantOfUser+`$2), $2, $3, $4, $5, $6)`,
 		sc.ID, sc.UserID, sc.NLDescription, spec, scope, status)
@@ -46,15 +97,24 @@ func (s *Store) InsertSchedule(ctx context.Context, sc *types.Schedule) error {
 		return types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("插入调度镜像（id=%s）", sc.ID), err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("提交调度镜像事务（id=%s）", sc.ID), err)
+	}
 	return nil
 }
 
-// ListSchedulesByUser 返回该用户的全部调度镜像，按创建时间倒序。
+// ListSchedulesByUser 返回该用户已兑现的调度镜像，按创建时间倒序。
+// A5 在 Temporal paused Ensure 与最终激活之间会短暂写入 provisioning
+// aggregate；只有关联 v1 operation 同时 reached executed/completed 才向用户
+// 可见。Legacy/v0 行没有该关联，普通用户主动 paused 的成熟任务也照常显示。
 func (s *Store) ListSchedulesByUser(ctx context.Context, userID int64) ([]types.Schedule, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT `+scheduleColumns+`
-		 FROM schedules WHERE user_id = $1
-		 ORDER BY created_at DESC`, userID)
+		 FROM schedules s
+		 WHERE s.user_id = $1
+		   AND `+matureSchedulePredicate+`
+		 ORDER BY s.created_at DESC`, userID)
 	if err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("查询用户 %d 的调度", userID), err)
@@ -73,6 +133,41 @@ func (s *Store) ListSchedulesByUser(ctx context.Context, userID int64) ([]types.
 		return nil, types.NewAppError(types.CodeDatabase, "遍历 schedule 结果集", err)
 	}
 	return out, nil
+}
+
+// AuthorizeScheduledRun is the final database gate before a scheduled
+// workflow may spend money or touch the network. It proves that the exact
+// schedule is active, user-manageable (including completed A5 provisioning),
+// and still belongs to an active tenant membership. Missing/revoked/paused
+// rows are a normal false result; infrastructure failures are retryable errors.
+func (s *Store) AuthorizeScheduledRun(
+	ctx context.Context,
+	scheduleID string,
+	userID int64,
+) (bool, error) {
+	if strings.TrimSpace(scheduleID) == "" || scheduleID != strings.TrimSpace(scheduleID) ||
+		len(scheduleID) > 255 || userID <= 0 {
+		return false, types.NewAppError(types.CodeValidation,
+			"调度运行授权参数无效", types.ErrValidation)
+	}
+	var authorized bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+		    SELECT 1
+		      FROM schedules s
+		      JOIN tenants t ON t.id = s.tenant_id
+		      JOIN memberships m
+		        ON m.tenant_id = s.tenant_id AND m.user_id = s.user_id
+		     WHERE s.id = $1 AND s.user_id = $2 AND s.status = $3
+		       AND t.status = 'active' AND t.deleted_at IS NULL
+		       AND `+matureSchedulePredicate+`
+		)`,
+		scheduleID, userID, types.ScheduleStatusActive,
+	).Scan(&authorized); err != nil {
+		return false, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("校验调度运行授权（id=%s）", scheduleID), err)
+	}
+	return authorized, nil
 }
 
 // ListActiveSchedules 返回全部 active 调度镜像（跨用户），按创建时间正序。
@@ -117,11 +212,12 @@ func (s *Store) UpdateScheduleSpec(ctx context.Context, id string, spec json.Raw
 		spec = json.RawMessage("{}")
 	}
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE schedules
+		`UPDATE schedules s
 		    SET spec_json = $2,
 		        nl_description = COALESCE($3, nl_description),
 		        updated_at = now()
-		  WHERE id = $1`,
+		  WHERE id = $1
+		    AND `+matureSchedulePredicate,
 		id, spec, nlDesc)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,
@@ -144,7 +240,9 @@ func (s *Store) UpdateScheduleSpec(ctx context.Context, id string, spec json.Raw
 // 否则调用方可用它枚举他人调度 id 是否存在。
 func (s *Store) DeleteSchedule(ctx context.Context, id string, userID int64) error {
 	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM schedules WHERE id = $1 AND user_id = $2`, id, userID)
+		`DELETE FROM schedules s
+		  WHERE s.id = $1 AND s.user_id = $2
+		    AND `+matureSchedulePredicate, id, userID)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("删除调度镜像（id=%s）", id), err)
@@ -161,7 +259,12 @@ func (s *Store) DeleteSchedule(ctx context.Context, id string, userID int64) err
 func (s *Store) GetSchedule(ctx context.Context, id string, userID int64) (*types.Schedule, error) {
 	var sc types.Schedule
 	err := scanSchedule(
-		s.pool.QueryRow(ctx, `SELECT `+scheduleColumns+` FROM schedules WHERE id = $1 AND user_id = $2`, id, userID),
+		s.pool.QueryRow(ctx,
+			`SELECT `+scheduleColumns+`
+			   FROM schedules s
+			  WHERE s.id = $1 AND s.user_id = $2
+			    AND `+matureSchedulePredicate,
+			id, userID),
 		&sc)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -206,7 +309,10 @@ func (s *Store) GetScheduleStrictness(ctx context.Context, scheduleID string) (t
 // 这里不再重复校验——真穿透到这层，CHECK 约束会以 CodeDatabase 拒绝。
 func (s *Store) SetScheduleStrictness(ctx context.Context, scheduleID string, userID int64, v types.PushStrictness) error {
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE schedules SET push_strictness = $1, updated_at = now() WHERE id = $2 AND user_id = $3`,
+		`UPDATE schedules s
+		    SET push_strictness = $1, updated_at = now()
+		  WHERE s.id = $2 AND s.user_id = $3
+		    AND `+matureSchedulePredicate,
 		string(v), scheduleID, userID)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,

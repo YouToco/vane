@@ -76,7 +76,12 @@ func (h *handler) eventDispatcher() *dispatcher.EventDispatcher {
 				return nil
 			}
 			// 刻意不用回调入参 ctx（回调返回后可能失效），改用连接级 ctx。
-			go h.handle(h.ctx, event)
+			// 由 Manager 准入并跟踪，停机时先拒绝新消息，再等待/取消在途处理。
+			if !h.m.startAsync(h.ctx, agentMessageBudget, false, "message", func(ctx context.Context) {
+				h.handle(ctx, event)
+			}) {
+				slog.Info("feishu: Manager 正在关闭，忽略新消息", "message_id", msgID)
+			}
 			return nil
 		}).
 		OnP2MessageReadV1(func(_ context.Context, event *larkim.P2MessageReadV1) error {
@@ -165,7 +170,11 @@ func (h *handler) eventDispatcher() *dispatcher.EventDispatcher {
 			if event == nil || event.Event == nil {
 				return nil
 			}
-			go h.handleBotMenu(h.ctx, event)
+			if !h.m.startAsync(h.ctx, agentMessageBudget, false, "bot_menu", func(ctx context.Context) {
+				h.handleBotMenu(ctx, event)
+			}) {
+				slog.Info("feishu: Manager 正在关闭，忽略菜单事件")
+			}
 			return nil
 		}).
 		OnP2CardActionTrigger(h.onCardAction)
@@ -453,6 +462,10 @@ const agentMessageBudget = 5 * time.Minute
 // 必须有自己的上限，防工具内 DB/Temporal 调用无限阻塞。
 const cardActionExecBudget = 30 * time.Second
 
+// cardActionLifecycleBudget 覆盖动作执行及同步预算超时后的结果补发。两段各自
+// 仍有独立 deadline；多留 1 秒只用于 goroutine 调度与阶段切换，不扩大外部调用预算。
+const cardActionLifecycleBudget = cardActionExecBudget + 15*time.Second + time.Second
+
 // cardActionResult 是确认/取消动作的执行结果：text 恒为可直接展示的人话
 // （含失败话术），ok 仅用于区分 toast 的成功/失败样式。
 type cardActionResult struct {
@@ -465,6 +478,12 @@ type cardActionResult struct {
 // 完成后补发结果消息。恒返回 nil error：返回 error 只会让飞书反复重推回调，
 // 对用户没有任何额外价值。
 func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTriggerEvent) (resp *callback.CardActionTriggerResponse, _ error) {
+	finish, accepted := h.m.beginCallback()
+	if !accepted {
+		return toastResponse("error", "服务正在重启，请稍后重试"), nil
+	}
+	defer finish()
+
 	// 与 handle 相同的 panic 兜底：WS 回调链上的 panic 会带崩整个进程。
 	// 命名返回值让 recover 后仍能给用户一个失败 toast 而非静默。
 	defer func() {
@@ -537,41 +556,65 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 		return toastResponse("error", "内部数据错误，请稍后重试"), nil
 	}
 
-	// 动作放 goroutine 执行：既是 2.5s 预算的实现载体，也保证超时后结果
-	// 不丢——同一 goroutine 跑完把结果送进 done，由补发分支接手。
+	// 动作放受 Manager 跟踪的 goroutine 执行：既是 2.5s 预算的实现载体，
+	// 也让优雅停机先等待已接纳动作，不在 DB/Temporal 仍被使用时关闭资源。
 	// ctx 与连接生命周期解耦（审查 #Reconfigure 丢执行）：Claim 一旦成功动作即被
 	// 置为 executed 且不可再领取，此后的执行不能随 WS 换代（Dashboard 保存配置触发
 	// Reconfigure → h.ctx 取消）被中断，否则动作永久标记已执行但实际没执行、
-	// 结果也无处送达。WithoutCancel 摆脱连接取消，WithTimeout 自带 30s 上限防挂死。
+	// 结果也无处送达。startAsync 的 detachParent 摆脱连接取消，但动作与补发各自
+	// 仍有 deadline，并在 Manager 停机宽限耗尽时收到取消。
 	done := make(chan cardActionResult, 1)
-	go func() {
-		execCtx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), cardActionExecBudget)
-		defer cancel()
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("feishu: 卡片动作执行 panic", "recover", r, "action_id", actionID)
-				done <- cardActionResult{text: "内部错误，请稍后重试。"}
+	followUp := make(chan bool, 1)
+	if !h.m.startAsync(h.ctx, cardActionLifecycleBudget, true, "card_action", func(workCtx context.Context) {
+		res := func() (res cardActionResult) {
+			execCtx, cancel := context.WithTimeout(workCtx, cardActionExecBudget)
+			defer cancel()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					slog.Error("feishu: 卡片动作执行 panic", "recover", recovered, "action_id", actionID)
+					res = cardActionResult{text: "内部错误，请稍后重试。"}
+				}
+			}()
+			var text string
+			var actionErr error
+			if verb == cardActionConfirm {
+				text, actionErr = runner.ExecuteAction(execCtx, user.ID, actionID)
+			} else {
+				text, actionErr = runner.CancelAction(execCtx, user.ID, actionID)
 			}
+			if actionErr != nil {
+				slog.Error("feishu: 卡片动作执行失败", "err", actionErr, "action_id", actionID, "vane_action", verb)
+				return cardActionResult{text: "执行失败：" + humanizeLLMError(actionErr)}
+			}
+			return cardActionResult{text: text, ok: true}
 		}()
-		var text string
-		var aerr error
-		if verb == cardActionConfirm {
-			text, aerr = runner.ExecuteAction(execCtx, user.ID, actionID)
-		} else {
-			text, aerr = runner.CancelAction(execCtx, user.ID, actionID)
-		}
-		if aerr != nil {
-			slog.Error("feishu: 卡片动作执行失败", "err", aerr, "action_id", actionID, "vane_action", verb)
-			done <- cardActionResult{text: "执行失败：" + humanizeLLMError(aerr)}
+
+		done <- res
+		select {
+		case shouldSend := <-followUp:
+			if !shouldSend {
+				return
+			}
+		case <-workCtx.Done():
 			return
 		}
-		done <- cardActionResult{text: text, ok: true}
-	}()
+
+		// 补发仍属于同一项已接纳工作，避免动作 worker 完成后另起一个无法等待的
+		// goroutine。A6 才会提供进程崩溃后的耐久回执；这里不作该承诺。
+		sendCtx, cancel := context.WithTimeout(workCtx, 15*time.Second)
+		defer cancel()
+		if _, sendErr := h.m.SendCard(sendCtx, operatorID, BuildReplyCard(res.text)); sendErr != nil {
+			slog.Error("feishu: 补发卡片动作结果失败", "err", sendErr, "action_id", actionID)
+		}
+	}) {
+		return toastResponse("error", "服务正在重启，请稍后重试"), nil
+	}
 
 	timer := time.NewTimer(cardActionSyncBudget)
 	defer timer.Stop()
 	select {
 	case res := <-done:
+		followUp <- false
 		toastType, toastText := "success", "已处理"
 		if !res.ok {
 			toastType, toastText = "error", "执行失败"
@@ -586,15 +629,7 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 			},
 		}, nil
 	case <-timer.C:
-		go func() {
-			res := <-done
-			// 补发同样脱离连接 ctx（执行都熬过 Reconfigure 了，结果不能死在最后一步）。
-			sendCtx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), 15*time.Second)
-			defer cancel()
-			if _, serr := h.m.SendCard(sendCtx, operatorID, BuildReplyCard(res.text)); serr != nil {
-				slog.Error("feishu: 补发卡片动作结果失败", "err", serr, "action_id", actionID)
-			}
-		}()
+		followUp <- true
 		// Toast + 撤下按钮（审查 #二次点击误导）：只回 toast 时按钮仍在，用户再点会
 		// 命中 Claim 幂等拒绝、卡片被替换成"已处理过"的三义文案，随后真结果又以新消息
 		// 到达——顺序错乱像失败。原地把卡片换成"执行中"说明，消除整个二次点击窗口。
@@ -670,25 +705,27 @@ func (h *handler) onFeedbackReasonSubmit(userID, deliveryID int64, reason string
 	}
 
 	done := make(chan feedback.ClickResult, 1)
-	go func() {
-		execCtx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), cardActionExecBudget)
-		defer cancel()
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("feishu: 反馈原因处理 panic", "recover", r, "delivery_id", deliveryID)
-				done <- feedback.ClickResult{Toast: "内部错误，请稍后重试"}
+	if !h.m.startAsync(h.ctx, cardActionExecBudget, true, "feedback_reason", func(execCtx context.Context) {
+		res := func() (res feedback.ClickResult) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					slog.Error("feishu: 反馈原因处理 panic", "recover", recovered, "delivery_id", deliveryID)
+					res = feedback.ClickResult{Toast: "内部错误，请稍后重试"}
+				}
+			}()
+			result, err := fb.HandleReasonSubmit(execCtx, userID, feedback.ReasonSubmit{
+				DeliveryID: deliveryID, Reason: reason,
+			})
+			if err != nil {
+				slog.Error("feishu: 反馈原因处理失败", "err", err, "delivery_id", deliveryID)
+				return feedback.ClickResult{Toast: "处理失败，请稍后重试"}
 			}
+			return result
 		}()
-		res, err := fb.HandleReasonSubmit(execCtx, userID, feedback.ReasonSubmit{
-			DeliveryID: deliveryID, Reason: reason,
-		})
-		if err != nil {
-			slog.Error("feishu: 反馈原因处理失败", "err", err, "delivery_id", deliveryID)
-			done <- feedback.ClickResult{Toast: "处理失败，请稍后重试"}
-			return
-		}
 		done <- res
-	}()
+	}) {
+		return toastResponse("error", "服务正在重启，请稍后重试")
+	}
 
 	timer := time.NewTimer(cardActionSyncBudget)
 	defer timer.Stop()
@@ -724,25 +761,27 @@ func (h *handler) onFeedbackAction(userID int64, action types.FeedbackAction, de
 	}
 
 	done := make(chan feedback.ClickResult, 1)
-	go func() {
+	if !h.m.startAsync(h.ctx, cardActionExecBudget, true, "feedback", func(execCtx context.Context) {
 		// 与连接生命周期解耦（同 M4 卡片动作）：deep_dive 会在 HandleClick 内再起
 		// 生成 goroutine，回调链结束不能中断它。
-		execCtx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), cardActionExecBudget)
-		defer cancel()
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("feishu: 反馈处理 panic", "recover", r, "delivery_id", deliveryID)
-				done <- feedback.ClickResult{Toast: "内部错误，请稍后重试"}
+		res := func() (res feedback.ClickResult) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					slog.Error("feishu: 反馈处理 panic", "recover", recovered, "delivery_id", deliveryID)
+					res = feedback.ClickResult{Toast: "内部错误，请稍后重试"}
+				}
+			}()
+			result, err := fb.HandleClick(execCtx, userID, feedback.Click{Action: action, DeliveryID: deliveryID})
+			if err != nil {
+				slog.Error("feishu: 反馈处理失败", "err", err, "delivery_id", deliveryID, "fb", action)
+				return feedback.ClickResult{Toast: "处理失败：" + humanizeLLMError(err)}
 			}
+			return result
 		}()
-		res, err := fb.HandleClick(execCtx, userID, feedback.Click{Action: action, DeliveryID: deliveryID})
-		if err != nil {
-			slog.Error("feishu: 反馈处理失败", "err", err, "delivery_id", deliveryID, "fb", action)
-			done <- feedback.ClickResult{Toast: "处理失败：" + humanizeLLMError(err)}
-			return
-		}
 		done <- res
-	}()
+	}) {
+		return toastResponse("error", "服务正在重启，请稍后重试")
+	}
 
 	timer := time.NewTimer(cardActionSyncBudget)
 	defer timer.Stop()

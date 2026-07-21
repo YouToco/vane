@@ -32,7 +32,6 @@ type Manager interface {
 // 入参用 scheduler.ScheduleSpec / workflow.PushScope 具体类型：这两个是全链路
 // 共享的中立结构，API 只做"HTTP DTO → 中立结构"的翻译，不自造平行类型。
 type Scheduler interface {
-	CreatePush(ctx context.Context, userID int64, spec scheduler.ScheduleSpec, scope workflow.PushScope, nlDesc string) (schedID string, err error)
 	PushNow(ctx context.Context, userID int64, scope workflow.PushScope) (runID string, err error)
 	// UpdatePush 原地改已有调度的触发频率（不换 schedule_id、不中断调度）。
 	// nlDesc 为 nil 表示不改描述。
@@ -96,7 +95,6 @@ func Mount(mux *http.ServeMux, deps Deps) {
 
 	// M3 推送管道端点（契约 B8）：全部走会话中间件，是"人与未来 AI 同一出口"的确定性 API。
 	inner.HandleFunc("GET /api/schedules", s.handleListSchedules)
-	inner.HandleFunc("POST /api/schedules", s.handleCreateSchedule)
 	inner.HandleFunc("PATCH /api/schedules/{id}", s.handleUpdateSchedule)
 	inner.HandleFunc("DELETE /api/schedules/{id}", s.handleDeleteSchedule)
 	inner.HandleFunc("POST /api/push/now", s.handlePushNow)

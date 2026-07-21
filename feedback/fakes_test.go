@@ -336,16 +336,29 @@ type sentReply struct{ parentID, markdown string }
 
 // fakeSender 记录每次回复；err 非 nil 时仍记录后再报错（要能断言"确实尝试发过"）。
 type fakeSender struct {
-	mu      sync.Mutex
-	replies []sentReply
-	err     error
+	mu       sync.Mutex
+	replies  []sentReply
+	err      error
+	gate     chan struct{}
+	canceled int
 }
 
-func (s *fakeSender) ReplyMarkdown(_ context.Context, parentMessageID, markdown string) error {
+func (s *fakeSender) ReplyMarkdown(ctx context.Context, parentMessageID, markdown string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.replies = append(s.replies, sentReply{parentID: parentMessageID, markdown: markdown})
-	return s.err
+	gate, err := s.gate, s.err
+	s.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			s.mu.Lock()
+			s.canceled++
+			s.mu.Unlock()
+			return ctx.Err()
+		}
+	}
+	return err
 }
 
 func (s *fakeSender) count() int {
@@ -364,6 +377,18 @@ func (s *fakeSender) setErr(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.err = err
+}
+
+func (s *fakeSender) setGate(gate chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gate = gate
+}
+
+func (s *fakeSender) canceledCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.canceled
 }
 
 type notice struct {
@@ -466,11 +491,12 @@ type llmRequest struct {
 // fakeLLM 仿上游：按到达序记录请求；gate 非 nil 时 handler 阻塞在其上
 // （用于把生成钉在"进行中"，测 in-flight 幂等层）。
 type fakeLLM struct {
-	mu      sync.Mutex
-	reqs    []llmRequest
-	status  int
-	content string
-	gate    chan struct{}
+	mu       sync.Mutex
+	reqs     []llmRequest
+	status   int
+	content  string
+	gate     chan struct{}
+	canceled int
 }
 
 func newFakeLLM(t *testing.T) (*fakeLLM, *llm.Client) {
@@ -487,7 +513,14 @@ func newFakeLLM(t *testing.T) (*fakeLLM, *llm.Client) {
 		f.mu.Unlock()
 
 		if gate != nil {
-			<-gate // 卡住生成，模拟"正在生成"
+			select {
+			case <-gate: // 卡住生成，模拟"正在生成"
+			case <-r.Context().Done():
+				f.mu.Lock()
+				f.canceled++
+				f.mu.Unlock()
+				return
+			}
 		}
 		if status != http.StatusOK {
 			w.WriteHeader(status)
@@ -526,6 +559,12 @@ func (f *fakeLLM) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.reqs)
+}
+
+func (f *fakeLLM) canceledCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.canceled
 }
 
 func (f *fakeLLM) setStatus(s int) {
@@ -592,6 +631,13 @@ func newHarness(t *testing.T) *harness {
 		Notifier:      h.notifier,
 		BuildCard:     h.cards.build,
 		DeepDiveModel: "deepseek-v4-pro",
+	})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := h.svc.Shutdown(ctx); err != nil {
+			t.Errorf("feedback Service 测试清理未排空: %v", err)
+		}
 	})
 	return h
 }

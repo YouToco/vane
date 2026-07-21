@@ -434,20 +434,35 @@ func TestA2ATaskStore(t *testing.T) {
 		if n != 2 {
 			t.Errorf("应恰清 2 行（超龄 WORKING+SUBMITTED），实得 %d", n)
 		}
-		statusOf := func(id string) string {
+		statusOf := func(id string) (string, string, string) {
 			g, err := st.GetA2ATask(ctx, id)
 			if err != nil {
 				t.Fatalf("GetA2ATask(%s) 失败: %v", id, err)
 			}
-			return g.Status
+			var payload struct {
+				Status struct {
+					State     string `json:"state"`
+					Timestamp string `json:"timestamp"`
+				} `json:"status"`
+			}
+			if err := json.Unmarshal(g.Task, &payload); err != nil {
+				t.Fatalf("解析 task JSONB(%s) 失败: %v", id, err)
+			}
+			return g.Status, payload.Status.State, payload.Status.Timestamp
 		}
-		if statusOf(working) != "TASK_STATE_FAILED" || statusOf(submitted) != "TASK_STATE_FAILED" {
-			t.Error("超龄 WORKING/SUBMITTED 应被置 FAILED")
+		for _, id := range []string{working, submitted} {
+			column, embedded, timestamp := statusOf(id)
+			if column != "TASK_STATE_FAILED" || embedded != "TASK_STATE_FAILED" || timestamp == "" {
+				t.Errorf("超龄任务 %s 应在提取列/JSONB 同时置 FAILED 并带时间，实得 column=%q embedded=%q timestamp=%q",
+					id, column, embedded, timestamp)
+			}
 		}
-		if statusOf(completed) != "TASK_STATE_COMPLETED" {
+		completedColumn, completedEmbedded, _ := statusOf(completed)
+		if completedColumn != "TASK_STATE_COMPLETED" || completedEmbedded != "TASK_STATE_COMPLETED" {
 			t.Error("终态 COMPLETED 不得被动")
 		}
-		if statusOf(fresh) != "TASK_STATE_WORKING" {
+		freshColumn, freshEmbedded, _ := statusOf(fresh)
+		if freshColumn != "TASK_STATE_WORKING" || freshEmbedded != "TASK_STATE_WORKING" {
 			t.Error("未超龄的 WORKING 不得被动（防误杀多实例在飞任务）")
 		}
 	})

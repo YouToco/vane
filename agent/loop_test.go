@@ -3,14 +3,17 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 )
 
@@ -28,6 +31,9 @@ type fakeStore struct {
 	actions         map[string]*types.PendingAction
 	createActionErr error
 	claimActionErr  error
+	onCreateAction  func()
+	createCalls     int
+	claimCalls      int
 
 	profiles      map[int64]*types.Profile
 	profileGetErr error                 // 注入 GetProfile 的非 NotFound 失败
@@ -237,6 +243,10 @@ func (f *fakeStore) sessionMessages(id int64) *types.AgentSession {
 }
 
 func (f *fakeStore) CreatePendingAction(_ context.Context, a *types.PendingAction) error {
+	f.createCalls++
+	if f.onCreateAction != nil {
+		f.onCreateAction()
+	}
 	if f.createActionErr != nil {
 		return f.createActionErr
 	}
@@ -246,6 +256,7 @@ func (f *fakeStore) CreatePendingAction(_ context.Context, a *types.PendingActio
 }
 
 func (f *fakeStore) ClaimPendingAction(_ context.Context, id string, userID int64) (*types.PendingAction, error) {
+	f.claimCalls++
 	if f.claimActionErr != nil {
 		return nil, f.claimActionErr
 	}
@@ -258,6 +269,70 @@ func (f *fakeStore) ClaimPendingAction(_ context.Context, id string, userID int6
 	a.ExecutedAt = &now
 	cp := *a
 	return &cp, nil
+}
+
+type fakeCreationController struct {
+	proposeCalls  []task.CreationProposalInput
+	confirmCalls  []fakeCreationConfirmCall
+	cancelCalls   []fakeCreationConfirmCall
+	proposeResult task.CreationProposal
+	proposeErr    error
+	confirmResult task.CreationResult
+	confirmErr    error
+	cancelResult  task.CreationResult
+	cancelErr     error
+	legacyStore   *fakeStore
+	legacyTool    Tool
+}
+
+type fakeCreationConfirmCall struct {
+	userID   int64
+	actionID string
+}
+
+func (f *fakeCreationController) Propose(_ context.Context, in task.CreationProposalInput) (task.CreationProposal, error) {
+	f.proposeCalls = append(f.proposeCalls, in)
+	if f.proposeErr != nil {
+		return task.CreationProposal{}, f.proposeErr
+	}
+	if f.legacyStore != nil {
+		summary := "测试任务方案"
+		if f.legacyTool != nil {
+			summary = f.legacyTool.Summarize(in.RawArgs)
+		}
+		if err := f.legacyStore.CreatePendingAction(context.Background(), &types.PendingAction{
+			ID: in.ActionID, UserID: in.UserID, SessionID: in.SessionID,
+			ToolName: "create_schedule", Args: in.RawArgs, Summary: summary,
+			Status: types.PendingActionStatusPending, ExpiresAt: in.ExpiresAt,
+		}); err != nil {
+			return task.CreationProposal{}, err
+		}
+		return task.CreationProposal{ID: in.ActionID, Summary: summary}, nil
+	}
+	result := f.proposeResult
+	if result.ID == "" {
+		result.ID = in.ActionID
+	}
+	if result.Summary == "" {
+		result.Summary = "测试任务方案"
+	}
+	return result, nil
+}
+
+func (f *fakeCreationController) Confirm(_ context.Context, userID int64, actionID string) (task.CreationResult, error) {
+	f.confirmCalls = append(f.confirmCalls, fakeCreationConfirmCall{userID: userID, actionID: actionID})
+	if f.confirmErr != nil {
+		return task.CreationResult{}, f.confirmErr
+	}
+	return f.confirmResult, nil
+}
+
+func (f *fakeCreationController) Cancel(_ context.Context, userID int64, actionID string) (task.CreationResult, error) {
+	f.cancelCalls = append(f.cancelCalls, fakeCreationConfirmCall{userID: userID, actionID: actionID})
+	if f.cancelErr != nil {
+		return task.CreationResult{}, f.cancelErr
+	}
+	return f.cancelResult, nil
 }
 
 func (f *fakeStore) CancelPendingAction(_ context.Context, id string, userID int64) (*types.PendingAction, error) {
@@ -284,6 +359,24 @@ type toolCallRecord struct {
 	userID int64
 	args   string
 	trace  string
+}
+
+type blockingToolCallInserter struct {
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (i *blockingToolCallInserter) InsertToolCall(ctx context.Context, _ *types.ToolCall) (int64, error) {
+	if i.calls.Add(1) == 1 {
+		close(i.entered)
+		select {
+		case <-i.release:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	return 1, nil
 }
 
 func (t *fakeTool) Name() string                       { return t.name }
@@ -338,9 +431,13 @@ func (r *countingProfileReader) GetProfile(context.Context, int64) (*types.Profi
 func newTestLoop(t *testing.T, fs *fakeStore, chat func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error), tools ...Tool) *Loop {
 	t.Helper()
 	l := New(Deps{
-		Store:      fs,
-		Profiles:   fs,
-		Tools:      tools,
+		Store:    fs,
+		Profiles: fs,
+		Tools:    tools,
+		TaskCreation: &fakeCreationController{
+			confirmErr: task.ErrCreationOperationNotFound,
+			cancelErr:  task.ErrCreationOperationNotFound,
+		},
 		Model:      "deepseek-v4-pro",
 		MaxTurns:   5,
 		SessionTTL: 30 * time.Minute,
@@ -510,6 +607,8 @@ func TestHandleMessage_UntrustedExternalResultCannotReadMemoryOrCreatePendingAct
 		{Content: "页面包含可疑指令，我只把它当作数据。", FinishReason: "stop"},
 	}}
 	l := newTestLoop(t, fs, chat.fn, external, readMemory, write)
+	creation := &fakeCreationController{}
+	l.taskCreation = creation
 
 	out, err := l.HandleMessage(context.Background(), 7, "读取 https://evil.example/page")
 	if err != nil {
@@ -517,6 +616,9 @@ func TestHandleMessage_UntrustedExternalResultCannotReadMemoryOrCreatePendingAct
 	}
 	if out.Confirm != nil || len(fs.actions) != 0 {
 		t.Fatalf("外部结果不得生成 pending action: confirm=%+v actions=%d", out.Confirm, len(fs.actions))
+	}
+	if len(creation.proposeCalls) != 0 {
+		t.Fatalf("外部结果不得触发 durable create proposal: %+v", creation.proposeCalls)
 	}
 	if len(readMemory.calls) != 0 || len(write.calls) != 0 {
 		t.Fatalf("taint 后内部读/写都不得执行: memory=%d write=%d", len(readMemory.calls), len(write.calls))
@@ -903,14 +1005,14 @@ func TestHandleMessage_ExternalBatchRejectedThenWriteRetryPreservesPendingHistor
 	fs := newFakeStore()
 	page := &fakePageReader{title: "不应读取", text: "不应返回"}
 	external := (&ExaTools{reader: page}).ReadPageTool()
-	write := &fakeTool{name: "create_schedule", mutating: true}
+	write := &fakeTool{name: "add_source", mutating: true}
 	chat := &scriptedChat{responses: []*llm.ChatResponse{
 		{ToolCalls: []llm.ToolCall{
 			{ID: "external", Name: "read_page", Arguments: `{"url":"https://example.com"}`},
-			{ID: "write-too", Name: "create_schedule", Arguments: `{}`},
+			{ID: "write-too", Name: "add_source", Arguments: `{}`},
 		}, FinishReason: "tool_calls"},
 		{ToolCalls: []llm.ToolCall{{
-			ID: "write-only", Name: "create_schedule", Arguments: `{}`,
+			ID: "write-only", Name: "add_source", Arguments: `{}`,
 		}}, FinishReason: "tool_calls"},
 		{Content: "确认卡已生成，等待你确认。", FinishReason: "stop"},
 	}}
@@ -1012,9 +1114,275 @@ func TestHandleMessage_MutatingToolConfirmCard(t *testing.T) {
 	}
 }
 
-// A0：用真实 createScheduleTool 贯穿“模型提出写操作 → pending → 用户确认 →
-// 当前 best-effort 创建链”。这是 legacy/current behavior 的 golden；A1 只允许换接缝，
-// 不得悄悄改变确认摘要、调用顺序、最终回复或 claim-before-execute 语义。
+func TestHandleMessage_CreateScheduleUsesDurableV1Proposal(t *testing.T) {
+	const args = `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
+		`"intent":"只监控 Anthropic 官方状态故障",` +
+		`"approved_fetch_plan":{"sources":[{"platform":"web","capability":"feed",` +
+		`"title":"Anthropic Status","url":"https://status.anthropic.com/history.rss","config":{}}]},` +
+		`"strictness":"strict"}`
+	const durableSummary = "创建定时推送任务：每天 08:00（Asia/Shanghai）\n" +
+		"监控意图：只监控 Anthropic 官方状态故障\n" +
+		"推送门槛：严格\n" +
+		"批准信源（1）：Anthropic Status [web/feed] https://status.anthropic.com/history.rss；参数 {}"
+
+	fs := newFakeStore()
+	legacyTool := &fakeTool{name: "create_schedule", mutating: true, result: "legacy 不得执行"}
+	creation := &fakeCreationController{
+		proposeResult: task.CreationProposal{Summary: durableSummary},
+		confirmResult: task.CreationResult{
+			TaskID: "task-v1", Message: "任务已创建。", Status: types.PendingActionStatusExecuted,
+		},
+	}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		ToolCalls:    []llm.ToolCall{{ID: "create-v1", Name: "create_schedule", Arguments: args}},
+		FinishReason: "tool_calls",
+	}}}
+	l := newTestLoop(t, fs, chat.fn, legacyTool)
+	l.taskCreation = creation
+
+	out, err := l.HandleMessage(t.Context(), 7, "每天监控 Anthropic 状态")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm {
+		t.Fatalf("v1 proposal 应直接得到固定确认出口: %+v", out)
+	}
+	if got, want := out.Confirm.Summary, "待确认操作：create_schedule\n"+durableSummary; got != want {
+		t.Fatalf("确认卡必须逐字采用 durable summary:\n got %q\nwant %q", got, want)
+	}
+	if len(chat.requests) != 1 {
+		t.Fatalf("proposal 后不得再调收尾 LLM: requests=%d", len(chat.requests))
+	}
+	if len(creation.proposeCalls) != 1 {
+		t.Fatalf("Propose 调用次数=%d, want 1", len(creation.proposeCalls))
+	}
+	proposal := creation.proposeCalls[0]
+	if proposal.ActionID != out.Confirm.ActionID || proposal.UserID != 7 ||
+		proposal.SessionID == nil || string(proposal.RawArgs) != args {
+		t.Fatalf("durable proposal scope/args 漂移: %+v", proposal)
+	}
+	if until := time.Until(proposal.ExpiresAt); until < 23*time.Hour || until > 25*time.Hour {
+		t.Fatalf("proposal 应约 24h 过期: %v", until)
+	}
+	if fs.createCalls != 0 || fs.claimCalls != 0 || len(fs.actions) != 0 || len(legacyTool.calls) != 0 {
+		t.Fatalf("v1 proposal 不得碰 legacy store/tool: create=%d claim=%d actions=%d execute=%d",
+			fs.createCalls, fs.claimCalls, len(fs.actions), len(legacyTool.calls))
+	}
+
+	// 即使同 ID 下存在一张可领取的 v0 卡，也必须由 v1 result 截住，不能误回退。
+	fs.actions[out.Confirm.ActionID] = newPendingAction(
+		out.Confirm.ActionID, 7, proposal.SessionID, "create_schedule", "legacy",
+	)
+	result, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID)
+	if err != nil || result != creation.confirmResult.Message {
+		t.Fatalf("v1 Confirm() = %q, %v", result, err)
+	}
+	if len(creation.confirmCalls) != 1 || fs.claimCalls != 0 || len(legacyTool.calls) != 0 {
+		t.Fatalf("v1 confirm 不得 Claim/Execute: confirms=%+v claim=%d execute=%d",
+			creation.confirmCalls, fs.claimCalls, len(legacyTool.calls))
+	}
+	if len(chat.requests) != 1 {
+		t.Fatalf("卡片确认不得产生 LLM 调用: requests=%d", len(chat.requests))
+	}
+}
+
+func TestExecuteAction_ReplayedV1RepairsConversationReceiptAndRecordsAudit(t *testing.T) {
+	fs := newFakeStore()
+	sess, err := fs.CreateAgentSession(t.Context(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := "已批准任务"
+	args := json.RawMessage(`{"spec":{"cron":"0 8 * * *"}}`)
+	creation := &fakeCreationController{confirmResult: task.CreationResult{
+		OperationID: "action", TaskID: "task-v1", Message: "任务已创建并开始监控。",
+		Status: types.PendingActionStatusExecuted, Replayed: true,
+		SessionID: &sess.ID, Summary: summary, Arguments: args,
+	}}
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn)
+	l.taskCreation = creation
+	inserter := &fakeToolCallInserter{}
+	l.toolCalls = NewToolCallRecorder(inserter)
+
+	got, err := l.ExecuteAction(t.Context(), 7, "action")
+	if err != nil || got != creation.confirmResult.Message {
+		t.Fatalf("ExecuteAction()=%q err=%v", got, err)
+	}
+	waitAppends(t, fs, 1)
+	if len(inserter.calls) != 1 || inserter.calls[0].ToolName != "create_schedule" ||
+		inserter.calls[0].TraceID == "" || string(inserter.calls[0].Arguments) != string(args) {
+		t.Fatalf("durable confirmation audit missing or drifted: %+v", inserter.calls)
+	}
+	callback := decodeMessages(fs.sessions[sess.ID])
+	if len(callback) != 1 || !strings.Contains(callback[0].Content, "任务已创建") {
+		t.Fatalf("replayed terminal must repair conversation receipt: %+v", callback)
+	}
+}
+
+func TestCancelAction_UsesDurableV1BeforeLegacy(t *testing.T) {
+	fs := newFakeStore()
+	sess, err := fs.CreateAgentSession(t.Context(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.actions["action"] = newPendingAction("action", 7, &sess.ID, "add_source", "legacy")
+	creation := &fakeCreationController{cancelResult: task.CreationResult{
+		OperationID: "action", Status: types.PendingActionStatusCancelled,
+		Message: "已取消本次任务创建。", SessionID: &sess.ID, Summary: "任务方案",
+	}}
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn)
+	l.taskCreation = creation
+
+	got, err := l.CancelAction(t.Context(), 7, "action")
+	if err != nil || got != creation.cancelResult.Message {
+		t.Fatalf("CancelAction()=%q err=%v", got, err)
+	}
+	if len(creation.cancelCalls) != 1 || fs.actions["action"].Status != types.PendingActionStatusPending {
+		t.Fatalf("v1 cancel must not touch legacy row: calls=%+v legacy=%+v",
+			creation.cancelCalls, fs.actions["action"])
+	}
+	waitAppends(t, fs, 1)
+	callback := decodeMessages(fs.sessions[sess.ID])
+	if len(callback) != 1 || !strings.Contains(callback[0].Content, "点击「取消」") ||
+		strings.Contains(callback[0].Content, "点击「确认」") {
+		t.Fatalf("cancel callback must preserve the user's verb: %+v", callback)
+	}
+}
+
+func TestCancelAction_FallsBackOnlyOnExplicitV1NotFound(t *testing.T) {
+	fs := newFakeStore()
+	fs.actions["action"] = newPendingAction("action", 7, nil, "add_source", "legacy")
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn)
+	l.taskCreation = &fakeCreationController{cancelErr: errors.New("database unavailable")}
+	if got, err := l.CancelAction(t.Context(), 7, "action"); err == nil || got != "" {
+		t.Fatalf("infrastructure error must not fall back: got=%q err=%v", got, err)
+	}
+	if fs.actions["action"].Status != types.PendingActionStatusPending {
+		t.Fatalf("legacy action was mutated on ambiguous v1 error: %+v", fs.actions["action"])
+	}
+}
+
+func TestHandleMessage_CreateScheduleValidationFailureDoesNotCreateLegacyAction(t *testing.T) {
+	tests := []struct {
+		name string
+		args string
+		msg  string
+	}{
+		{name: "missing intent", args: `{"spec":{"cron":"0 8 * * *"},"approved_fetch_plan":{"sources":[{}]}}`, msg: "intent 必填"},
+		{name: "missing approved plan", args: `{"spec":{"cron":"0 8 * * *"},"intent":"监控官方状态"}`, msg: "approved_fetch_plan 必填"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := newFakeStore()
+			legacyTool := &fakeTool{name: "create_schedule", mutating: true, result: "不得执行"}
+			creation := &fakeCreationController{proposeErr: types.NewAppError(types.CodeValidation, tt.msg, nil)}
+			chat := &scriptedChat{responses: []*llm.ChatResponse{
+				{ToolCalls: []llm.ToolCall{{ID: "invalid", Name: "create_schedule", Arguments: tt.args}}, FinishReason: "tool_calls"},
+				{Content: "还缺少完整任务方案，请补充。", FinishReason: "stop"},
+			}}
+			l := newTestLoop(t, fs, chat.fn, legacyTool)
+			l.taskCreation = creation
+
+			out, err := l.HandleMessage(t.Context(), 7, "建任务")
+			if err != nil || out.Confirm != nil || out.Reply != "还缺少完整任务方案，请补充。" {
+				t.Fatalf("validation 应供模型自纠且不出卡: out=%+v err=%v", out, err)
+			}
+			if len(creation.proposeCalls) != 1 || fs.createCalls != 0 || fs.claimCalls != 0 ||
+				len(fs.actions) != 0 || len(legacyTool.calls) != 0 {
+				t.Fatalf("缺字段不得落 v0/执行: proposals=%d create=%d claim=%d actions=%d execute=%d",
+					len(creation.proposeCalls), fs.createCalls, fs.claimCalls, len(fs.actions), len(legacyTool.calls))
+			}
+			if len(chat.requests) != 2 {
+				t.Fatalf("validation 自纠应有两轮 LLM: %d", len(chat.requests))
+			}
+			var found bool
+			for _, message := range chat.requests[1].Messages {
+				if message.Role == "tool" && message.ToolCallID == "invalid" && message.Content == tt.msg {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("第二轮没有安全 validation 回执: %+v", chat.requests[1].Messages)
+			}
+		})
+	}
+}
+
+func TestExecuteAction_TaskCreationFallsBackOnlyOnExplicitV1NotFound(t *testing.T) {
+	nonFallbackErrors := []struct {
+		name string
+		err  error
+	}{
+		{name: "busy", err: types.ErrTaskCreationBusy},
+		{name: "terminal", err: types.ErrTaskCreationTerminal},
+		{name: "generic not found", err: types.ErrNotFound},
+		{name: "infrastructure", err: errors.New("database unavailable")},
+	}
+	for _, tt := range nonFallbackErrors {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := newFakeStore()
+			legacyTool := &fakeTool{name: "add_source", mutating: true, result: "legacy 不得执行"}
+			fs.actions["action"] = newPendingAction("action", 7, nil, "add_source", "legacy")
+			creation := &fakeCreationController{confirmErr: tt.err}
+			l := newTestLoop(t, fs, (&scriptedChat{}).fn, legacyTool)
+			l.taskCreation = creation
+
+			if got, err := l.ExecuteAction(t.Context(), 7, "action"); err == nil || got != "" {
+				t.Fatalf("非 v1 NotFound 必须原样失败: got=%q err=%v", got, err)
+			}
+			if fs.claimCalls != 0 || len(legacyTool.calls) != 0 {
+				t.Fatalf("%s 不得误回退 v0: claim=%d execute=%d", tt.name, fs.claimCalls, len(legacyTool.calls))
+			}
+		})
+	}
+
+	t.Run("wrapped explicit v1 not found drains historical v0 card", func(t *testing.T) {
+		fs := newFakeStore()
+		legacyTool := &fakeTool{name: "add_source", mutating: true, result: "历史卡已执行"}
+		fs.actions["legacy"] = newPendingAction("legacy", 7, nil, "add_source", "legacy")
+		creation := &fakeCreationController{
+			confirmErr: fmt.Errorf("lookup v1 operation: %w", task.ErrCreationOperationNotFound),
+		}
+		l := newTestLoop(t, fs, (&scriptedChat{}).fn, legacyTool)
+		l.taskCreation = creation
+
+		got, err := l.ExecuteAction(t.Context(), 7, "legacy")
+		if err != nil || got != legacyTool.result {
+			t.Fatalf("历史 v0 card 应兼容: got=%q err=%v", got, err)
+		}
+		if len(creation.confirmCalls) != 1 || fs.claimCalls != 1 || len(legacyTool.calls) != 1 {
+			t.Fatalf("fallback 次数不符: confirm=%d claim=%d execute=%d",
+				len(creation.confirmCalls), fs.claimCalls, len(legacyTool.calls))
+		}
+	})
+}
+
+func TestTaskCreationControllerMissingBlocksNewProposalButKeepsLegacyNonCreation(t *testing.T) {
+	fs := newFakeStore()
+	create := &fakeTool{name: "create_schedule", mutating: true, result: "create legacy 不得执行"}
+	legacy := &fakeTool{name: "add_source", mutating: true, result: "历史加源卡已执行"}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		ToolCalls:    []llm.ToolCall{{ID: "create", Name: "create_schedule", Arguments: `{}`}},
+		FinishReason: "tool_calls",
+	}}}
+	l := newTestLoop(t, fs, chat.fn, create, legacy)
+	l.taskCreation = nil
+
+	if out, err := l.HandleMessage(t.Context(), 7, "建任务"); err == nil || out.Confirm != nil {
+		t.Fatalf("未装配 controller 不得静默写 v0: out=%+v err=%v", out, err)
+	}
+	fs.actions["legacy"] = newPendingAction("legacy", 7, nil, "add_source", "legacy")
+	if got, err := l.ExecuteAction(t.Context(), 7, "legacy"); err != nil || got != legacy.result {
+		t.Fatalf("未装配 controller 不应误伤非创建类历史 v0 卡: got=%q err=%v", got, err)
+	}
+	if fs.createCalls != 0 || fs.claimCalls != 1 || len(create.calls) != 0 || len(legacy.calls) != 1 {
+		t.Fatalf("边界副作用不符: create=%d claim=%d create_exec=%d legacy_exec=%d",
+			fs.createCalls, fs.claimCalls, len(create.calls), len(legacy.calls))
+	}
+}
+
+// A0 legacy 夹具在 A5 后只用于证明历史 create_schedule 卡被原子消费但绝不
+// 进入 active-first 创建链；用户必须重新描述需求生成完整 v1 定义。
 func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testing.T) {
 	const args = `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
 		`"nl_description":"每天看两个官方源","strictness":"strict"}`
@@ -1033,12 +1401,16 @@ func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testin
 			{Content: "请确认创建这个任务。", FinishReason: "stop"},
 		}}
 		l := newTestLoop(t, fs, chat.fn, tool)
+		l.taskCreation = &fakeCreationController{
+			legacyStore: fs, legacyTool: tool,
+			confirmErr: task.ErrCreationOperationNotFound,
+		}
 
 		out, err := l.HandleMessage(t.Context(), 7, "每天看两个官方源")
 		if err != nil {
 			t.Fatalf("HandleMessage() error = %v", err)
 		}
-		if out.Reply != "请确认创建这个任务。" || out.Confirm == nil {
+		if out.Reply != replyTaskCreationConfirm || out.Confirm == nil {
 			t.Fatalf("确认出口不符: %+v", out)
 		}
 		if len(deps.events) != 0 {
@@ -1051,7 +1423,8 @@ func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testin
 		}
 		const wantSummary = "待确认操作：create_schedule\n" +
 			"创建定时推送任务：按 cron「0 8 * * *」触发（时区 Asia/Shanghai），" +
-			"描述「每天看两个官方源」"
+			"描述「每天看两个官方源」\n" +
+			"推送门槛：严格（仅 ≥60 分的高相关内容才推送）"
 		if out.Confirm.Summary != wantSummary {
 			t.Fatalf("确认摘要 = %q, want %q", out.Confirm.Summary, wantSummary)
 		}
@@ -1065,16 +1438,11 @@ func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testin
 		if err != nil {
 			t.Fatalf("ExecuteAction() error = %v", err)
 		}
-		const wantReply = "已创建定时推送任务（id=push-7-current）：" +
-			"按 cron「0 8 * * *」触发（时区 Asia/Shanghai），" +
-			"推送门槛「严格」（仅 ≥60 分的高相关内容才推送）"
+		const wantReply = "这张旧版任务确认已失效，请重新描述需求以生成完整任务。"
 		if got != wantReply {
 			t.Fatalf("ExecuteAction() = %q, want %q", got, wantReply)
 		}
-		wantEvents := []string{
-			"schedule", "playbook", "translate", "plan",
-			"source_0", "source_1", "links", "strictness",
-		}
+		var wantEvents []string
 		if !slices.Equal(deps.events, wantEvents) {
 			t.Fatalf("确认后阶段序列 = %v, want %v", deps.events, wantEvents)
 		}
@@ -1088,24 +1456,20 @@ func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testin
 	})
 
 	invalidCases := []struct {
-		name      string
-		args      string
-		wantReply string
+		name string
+		args string
 	}{
 		{
-			name:      "cron 与 interval 互斥失败",
-			args:      `{"spec":{"cron":"0 8 * * *","every_seconds":3600}}`,
-			wantReply: "spec 必须且只能提供 cron 或 every_seconds 之一",
+			name: "cron 与 interval 互斥失败",
+			args: `{"spec":{"cron":"0 8 * * *","every_seconds":3600}}`,
 		},
 		{
-			name:      "JSON 类型错误",
-			args:      `[]`,
-			wantReply: "参数不是合法 JSON，请修正后重试",
+			name: "JSON 类型错误",
+			args: `[]`,
 		},
 		{
-			name:      "非法 strictness",
-			args:      `{"spec":{"cron":"0 8 * * *"},"strictness":"extreme"}`,
-			wantReply: "strictness 只能是 loose / normal / strict 之一（或不传）",
+			name: "非法 strictness",
+			args: `{"spec":{"cron":"0 8 * * *"},"strictness":"extreme"}`,
 		},
 	}
 	for _, tc := range invalidCases {
@@ -1123,6 +1487,10 @@ func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testin
 				{Content: "请确认。", FinishReason: "stop"},
 			}}
 			l := newTestLoop(t, fs, chat.fn, tool)
+			l.taskCreation = &fakeCreationController{
+				legacyStore: fs, legacyTool: tool,
+				confirmErr: task.ErrCreationOperationNotFound,
+			}
 
 			out, err := l.HandleMessage(t.Context(), 7, "建一个任务")
 			if err != nil || out.Confirm == nil {
@@ -1133,8 +1501,8 @@ func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testin
 					fs.actions[out.Confirm.ActionID].Args, tc.args)
 			}
 			got, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID)
-			if err != nil || got != tc.wantReply {
-				t.Fatalf("确认后参数校验语义不符: got=%q err=%v", got, err)
+			if err != nil || got != "这张旧版任务确认已失效，请重新描述需求以生成完整任务。" {
+				t.Fatalf("旧版任务卡应安全失效: got=%q err=%v", got, err)
 			}
 			if len(deps.events) != 0 ||
 				fs.actions[out.Confirm.ActionID].Status != types.PendingActionStatusExecuted {
@@ -1167,6 +1535,10 @@ func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *tes
 			{Content: "不应调用", FinishReason: "stop"},
 		}}
 		l := newTestLoop(t, fs, chat.fn, tool)
+		l.taskCreation = &fakeCreationController{
+			legacyStore: fs, legacyTool: tool,
+			confirmErr: task.ErrCreationOperationNotFound,
+		}
 
 		out, err := l.HandleMessage(t.Context(), 7, "建任务")
 		if err == nil || out.Confirm != nil {
@@ -1178,7 +1550,7 @@ func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *tes
 		}
 	})
 
-	t.Run("pending 已写但收尾 LLM 失败会留下 pending", func(t *testing.T) {
+	t.Run("proposal 落库后直接出卡不再调用收尾 LLM", func(t *testing.T) {
 		fs := newFakeStore()
 		deps := &createScheduleCharacterizationDeps{}
 		tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
@@ -1193,13 +1565,17 @@ func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *tes
 			return nil, types.NewAppError(types.CodeLLMUnavailable, "final reply failed", nil)
 		}
 		l := newTestLoop(t, fs, chat, tool)
+		l.taskCreation = &fakeCreationController{
+			legacyStore: fs, legacyTool: tool,
+			confirmErr: task.ErrCreationOperationNotFound,
+		}
 
 		out, err := l.HandleMessage(t.Context(), 7, "建任务")
-		if err == nil || out.Confirm != nil {
-			t.Fatalf("收尾 LLM 失败应上抛且无可见确认出口: out=%+v err=%v", out, err)
+		if err != nil || out.Confirm == nil || out.Reply != replyTaskCreationConfirm {
+			t.Fatalf("耐久 proposal 应直接得到确定性确认出口: out=%+v err=%v", out, err)
 		}
-		if calls != 2 || len(fs.actions) != 1 || len(deps.events) != 0 {
-			t.Fatalf("当前会留下未执行 pending: calls=%d actions=%d events=%v",
+		if calls != 1 || len(fs.actions) != 1 || len(deps.events) != 0 {
+			t.Fatalf("proposal 后不得再调 LLM/执行旧创建链: calls=%d actions=%d events=%v",
 				calls, len(fs.actions), deps.events)
 		}
 		for _, action := range fs.actions {
@@ -1218,6 +1594,10 @@ func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *tes
 			{Content: "请确认", FinishReason: "stop"},
 		}}
 		l := newTestLoop(t, fs, chat.fn, tool)
+		l.taskCreation = &fakeCreationController{
+			legacyStore: fs, legacyTool: tool,
+			confirmErr: task.ErrCreationOperationNotFound,
+		}
 		out, err := l.HandleMessage(t.Context(), 7, "建任务")
 		if err != nil || out.Confirm == nil {
 			t.Fatalf("准备确认动作失败: out=%+v err=%v", out, err)
@@ -1236,13 +1616,13 @@ func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *tes
 
 		fs.claimActionErr = nil
 		if got, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID); err != nil ||
-			!strings.Contains(got, "push-7-current") {
-			t.Fatalf("claim 恢复后当前允许重试: got=%q err=%v", got, err)
+			got != "这张旧版任务确认已失效，请重新描述需求以生成完整任务。" {
+			t.Fatalf("claim 恢复后应消费但不执行旧创建链: got=%q err=%v", got, err)
 		}
 		waitAppends(t, fs, 1)
 	})
 
-	t.Run("scheduler 错误发生在 claim 后会永久消费动作", func(t *testing.T) {
+	t.Run("旧版卡不会再触达 scheduler", func(t *testing.T) {
 		fs := newFakeStore()
 		deps := &createScheduleCharacterizationDeps{failAt: "schedule"}
 		tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
@@ -1251,22 +1631,27 @@ func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *tes
 			{Content: "请确认", FinishReason: "stop"},
 		}}
 		l := newTestLoop(t, fs, chat.fn, tool)
+		l.taskCreation = &fakeCreationController{
+			legacyStore: fs, legacyTool: tool,
+			confirmErr: task.ErrCreationOperationNotFound,
+		}
 		out, err := l.HandleMessage(t.Context(), 7, "建任务")
 		if err != nil || out.Confirm == nil {
 			t.Fatalf("准备确认动作失败: out=%+v err=%v", out, err)
 		}
 
-		if got, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID); err == nil || got != "" {
-			t.Fatalf("scheduler 错误应上抛: got=%q err=%v", got, err)
+		if got, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID); err != nil ||
+			got != "这张旧版任务确认已失效，请重新描述需求以生成完整任务。" {
+			t.Fatalf("旧版任务卡应安全失效: got=%q err=%v", got, err)
 		}
 		waitAppends(t, fs, 1)
 		if fs.actions[out.Confirm.ActionID].Status != types.PendingActionStatusExecuted ||
-			!slices.Equal(deps.events, []string{"schedule"}) {
-			t.Fatalf("scheduler 错误当前发生在永久 claim 后: action=%+v events=%v",
+			len(deps.events) != 0 {
+			t.Fatalf("旧版卡不得触达 scheduler: action=%+v events=%v",
 				fs.actions[out.Confirm.ActionID], deps.events)
 		}
 		again, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID)
-		if err != nil || len(deps.events) != 1 || again == "" {
+		if err != nil || len(deps.events) != 0 || again == "" {
 			t.Fatalf("第二次确认不得重试 scheduler: got=%q err=%v events=%v",
 				again, err, deps.events)
 		}
@@ -2030,7 +2415,7 @@ func TestNotifyEvent_QueriesInsideLockAndSerializesWithHandleMessage(t *testing.
 // 整个进程。断言两件事：panic 不炸测试进程；同一用户的后续回写照常执行
 // （per-user 锁串行保证第二次在第一次之后跑）。
 func TestAsyncSessionWritePanicRecovered(t *testing.T) {
-	l := &Loop{}
+	l := &Loop{sessionWriteAccepting: true}
 	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
 		panic("boom（测试构造）")
 	})
@@ -2043,5 +2428,143 @@ func TestAsyncSessionWritePanicRecovered(t *testing.T) {
 		// panic 被兜住且后续回写正常——目标行为。
 	case <-time.After(5 * time.Second):
 		t.Fatal("panic 后同用户的后续旁路回写未执行（锁可能未释放或 goroutine 死亡）")
+	}
+}
+
+func TestDrainSessionWritesClosesAdmissionAndWaits(t *testing.T) {
+	l := New(Deps{})
+	mu := &sync.Mutex{}
+	mu.Lock()
+	l.userMu.Store(int64(42), mu)
+	firstRan := make(chan struct{})
+	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
+		close(firstRan)
+	})
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	drained := make(chan error, 1)
+	go func() { drained <- l.DrainSessionWrites(drainCtx) }()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		l.sessionWriteMu.Lock()
+		accepting := l.sessionWriteAccepting
+		l.sessionWriteMu.Unlock()
+		if !accepting {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	var rejected atomic.Bool
+	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
+		rejected.Store(true)
+	})
+	select {
+	case err := <-drained:
+		t.Fatalf("drain returned before accepted write: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	mu.Unlock()
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("drain did not finish after accepted writer was released")
+	}
+	select {
+	case <-firstRan:
+	default:
+		t.Fatal("accepted writer did not run")
+	}
+	if rejected.Load() {
+		t.Fatal("writer submitted after drain admission closed must not run")
+	}
+}
+
+func TestCancellationStopsUnstartedToolCallsAndNextModelTurn(t *testing.T) {
+	fs := newFakeStore()
+	first := &fakeTool{name: "first_read", result: "first"}
+	second := &fakeTool{name: "second_read", result: "second"}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{
+			{ID: "call-1", Name: first.Name(), Arguments: `{}`},
+			{ID: "call-2", Name: second.Name(), Arguments: `{}`},
+		}},
+		{Content: "must not be called", FinishReason: "stop"},
+	}}
+	l := newTestLoop(t, fs, chat.fn, first, second)
+	inserter := &blockingToolCallInserter{entered: make(chan struct{}), release: make(chan struct{})}
+	l.toolCalls = NewToolCallRecorder(inserter)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := l.RunOnce(ctx, 7, nil, "run two tools")
+		done <- err
+	}()
+	select {
+	case <-inserter.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first tool ledger write did not start")
+	}
+	cancel()
+	close(inserter.release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunOnce error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunOnce did not stop after canceled tool ledger tail")
+	}
+	if len(first.calls) != 1 || len(second.calls) != 0 {
+		t.Fatalf("tool calls after cancellation: first=%d second=%d", len(first.calls), len(second.calls))
+	}
+	if got := inserter.calls.Load(); got != 1 {
+		t.Fatalf("tool ledger writes = %d, want only already-executed first call", got)
+	}
+	if len(chat.requests) != 1 {
+		t.Fatalf("model calls = %d, want no next turn after cancellation", len(chat.requests))
+	}
+}
+
+func TestCancellationBeforeConversationDoesNotStartModel(t *testing.T) {
+	fs := newFakeStore()
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{Content: "must not run"}}}
+	l := newTestLoop(t, fs, chat.fn)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, _, err := l.RunOnce(ctx, 7, nil, "canceled")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunOnce error = %v, want context.Canceled", err)
+	}
+	if len(chat.requests) != 0 {
+		t.Fatalf("model calls = %d, want zero", len(chat.requests))
+	}
+}
+
+func TestCancellationAfterPendingWriteSkipsFinalModelCall(t *testing.T) {
+	fs := newFakeStore()
+	ctx, cancel := context.WithCancel(t.Context())
+	fs.onCreateAction = cancel
+	writeTool := &fakeTool{name: "add_source", mutating: true}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{FinishReason: "tool_calls", ToolCalls: []llm.ToolCall{
+			{ID: "write-1", Name: writeTool.Name(), Arguments: `{}`},
+		}},
+		{Content: "must not be called", FinishReason: "stop"},
+	}}
+	l := newTestLoop(t, fs, chat.fn, writeTool)
+	_, err := l.HandleMessage(ctx, 7, "create something")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("HandleMessage error = %v, want context.Canceled", err)
+	}
+	if fs.createCalls != 1 {
+		t.Fatalf("pending writes = %d, want one completed write", fs.createCalls)
+	}
+	if len(chat.requests) != 1 {
+		t.Fatalf("model calls = %d, want no final call after cancellation", len(chat.requests))
 	}
 }

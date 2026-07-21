@@ -99,14 +99,11 @@ func Do(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Reques
 		call.CostUSD = CostUSD(resp.Model, hitTokens, missTokens, resp.CompletionTokens)
 	}
 
-	// 失败路径的 ctx 往往已经超时/取消，直接用它写库必然失败，
-	// 与"失败也要记账"矛盾——记账用 WithoutCancel 剥离取消信号。
-	rec.Record(context.WithoutCancel(ctx), call)
-	// 对账实际用量：用 WithoutCancel，理由同记账——调用已完成，不该因为上游 ctx
-	// 被取消就漏账，那会让取消变成一条绕过配额的免费通道。
+	// 失败路径的 ctx 往往已经超时/取消；记账与配额对账共享一个有硬上限的
+	// detached tail。调用已完成，不该漏账，也不能让 DB stall 无限拖住 Activity。
 	// 失败/取消时 call.*Tokens 为 0，于是这里把预扣的估算**全额退还**——
 	// 这是刻意的：上游若真的计了费，我们也没有任何字段能知道，凭空扣一笔
 	// 猜出来的量会让账目更不可信。
-	rec.ReconcileQuota(context.WithoutCancel(ctx), meta.UserID, estimate, call.PromptTokens+call.CompletionTokens)
+	rec.finishCallAccounting(ctx, call, meta.UserID, estimate, call.PromptTokens+call.CompletionTokens)
 	return resp, err
 }

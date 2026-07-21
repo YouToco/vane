@@ -194,6 +194,7 @@ func (s *Scheduler) CreatePush(ctx context.Context, userID int64, spec ScheduleS
 func makePushParams(userID int64, schedID string, scope workflow.PushScope, nlDesc string) workflow.PushParams {
 	return workflow.PushParams{
 		UserID:     userID,
+		RunKind:    workflow.PushRunKindScheduled,
 		ScheduleID: schedID,
 		Scope:      scope,
 		NLDesc:     strings.TrimSpace(nlDesc),
@@ -311,13 +312,13 @@ func actionMatchesParams(action client.ScheduleAction, want workflow.PushParams)
 	if err := converter.GetDefaultDataConverter().FromPayload(pl, &got); err != nil {
 		return false, fmt.Errorf("解码调度 Action 入参: %w", err)
 	}
-	return got.ScheduleID == want.ScheduleID && got.NLDesc == want.NLDesc, nil
+	return got.RunKind == want.RunKind && got.ScheduleID == want.ScheduleID && got.NLDesc == want.NLDesc, nil
 }
 
 // PushNow 立即触发一次推送（不建调度），供"现在推"按钮用。
 // 返回 workflow ID（含 uuid，唯一），调用方可据此在 Temporal 查该次执行。
 func (s *Scheduler) PushNow(ctx context.Context, userID int64, scope workflow.PushScope) (string, error) {
-	params := workflow.PushParams{UserID: userID, Scope: scope}
+	params := workflow.PushParams{UserID: userID, RunKind: workflow.PushRunKindAdHoc, Scope: scope}
 	run, err := s.c.ExecuteWorkflow(ctx,
 		client.StartWorkflowOptions{
 			ID:        fmt.Sprintf("push-adhoc-%d-%s", userID, uuid.NewString()),
@@ -346,7 +347,7 @@ func (s *Scheduler) PushNow(ctx context.Context, userID int64, scope workflow.Pu
 // WorkflowExecutionErrorWhenAlreadyStarted:true 才会抛出（sdk v1.46.0 internal/client.go），
 // 否则下方拒绝分支永远走不到，重复触发会返回与成功相同的文案。
 func (s *Scheduler) TriggerPushNow(ctx context.Context, userID int64) (string, error) {
-	params := workflow.PushParams{UserID: userID, Scope: workflow.PushScope{}}
+	params := workflow.PushParams{UserID: userID, RunKind: workflow.PushRunKindAdHoc, Scope: workflow.PushScope{}}
 	run, err := s.c.ExecuteWorkflow(ctx,
 		client.StartWorkflowOptions{
 			ID:        fmt.Sprintf("push-agent-%d", userID),

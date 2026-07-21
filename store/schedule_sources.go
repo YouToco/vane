@@ -30,7 +30,11 @@ func (s *Store) ReplaceScheduleSources(ctx context.Context, userID int64, schedu
 		`DELETE FROM schedule_sources
 		  WHERE schedule_id = $1
 		    AND source_id <> ALL($2)
-		    AND EXISTS (SELECT 1 FROM schedules WHERE id = $1 AND user_id = $3)`,
+		    AND EXISTS (
+		        SELECT 1 FROM schedules s
+		         WHERE s.id = $1 AND s.user_id = $3
+		           AND `+matureSchedulePredicate+`
+		    )`,
 		scheduleID, sourceIDs, userID); err != nil {
 		return types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("清理任务源链接（schedule_id=%s）", scheduleID), err)
@@ -43,7 +47,11 @@ func (s *Store) ReplaceScheduleSources(ctx context.Context, userID int64, schedu
 		`INSERT INTO schedule_sources (schedule_id, source_id)
 		 SELECT $1, sid
 		   FROM unnest($2::bigint[]) AS sid
-		  WHERE EXISTS (SELECT 1 FROM schedules WHERE id = $1 AND user_id = $3)
+		  WHERE EXISTS (
+		      SELECT 1 FROM schedules s
+		       WHERE s.id = $1 AND s.user_id = $3
+		         AND `+matureSchedulePredicate+`
+		  )
 		 ON CONFLICT (schedule_id, source_id) DO NOTHING`,
 		scheduleID, sourceIDs, userID); err != nil {
 		return types.NewAppError(types.CodeDatabase,
@@ -136,8 +144,9 @@ func (s *Store) ListScheduleSourceIDs(ctx context.Context, userID int64, schedul
 	rows, err := s.pool.Query(ctx,
 		`SELECT ss.source_id
 		   FROM schedule_sources ss
-		   JOIN schedules sc ON sc.id = ss.schedule_id
-		  WHERE ss.schedule_id = $1 AND sc.user_id = $2
+		   JOIN schedules s ON s.id = ss.schedule_id
+		  WHERE ss.schedule_id = $1 AND s.user_id = $2
+		    AND `+matureSchedulePredicate+`
 		  ORDER BY ss.source_id`,
 		scheduleID, userID)
 	if err != nil {

@@ -11,7 +11,7 @@ import (
 // callers must opt a create_schedule action into this protocol explicitly.
 const TaskCreationExecutionVersionV1 int16 = 1
 
-// A4 terminal/lease errors are deliberately separate from the broad AppError
+// Task-creation terminal/lease errors are deliberately separate from the broad AppError
 // codes. Callers must be able to distinguish "another worker owns this", "the
 // operation is permanently over", and "my fencing token is stale" without
 // parsing a message. Scope mismatches still use ErrNotFound and immutable-CAS
@@ -20,6 +20,7 @@ var (
 	ErrTaskCreationBusy      = errors.New("vane: task creation busy")
 	ErrTaskCreationTerminal  = errors.New("vane: task creation terminal")
 	ErrTaskCreationLeaseLost = errors.New("vane: task creation lease lost")
+	ErrTaskCreationLimit     = errors.New("vane: task creation limit reached")
 )
 
 const (
@@ -45,6 +46,8 @@ const (
 	TaskCreationPhaseActivated           TaskCreationPhase = "activated"
 	TaskCreationPhaseCleanupPending      TaskCreationPhase = "cleanup_pending"
 	TaskCreationPhaseCompleted           TaskCreationPhase = "completed"
+	TaskCreationPhaseCancelled           TaskCreationPhase = "cancelled"
+	TaskCreationPhaseExpired             TaskCreationPhase = "expired"
 	TaskCreationPhaseBlocked             TaskCreationPhase = "blocked"
 	TaskCreationPhaseFailed              TaskCreationPhase = "failed"
 )
@@ -73,10 +76,36 @@ type AcquireTaskCreationOperationParams struct {
 	LeaseDuration time.Duration
 }
 
+// CreateTaskCreationOperationParams is the explicit tenant/user boundary for
+// creating a v1 create_schedule confirmation. Status, tool name, execution
+// version, and all saga fields are Store-owned and cannot be supplied by a
+// caller. Args must be a strict JSON object (duplicate keys are rejected).
+type CreateTaskCreationOperationParams struct {
+	ID        string
+	TenantID  int64
+	UserID    int64
+	SessionID *int64
+	Args      json.RawMessage
+	Summary   string
+	ExpiresAt time.Time
+}
+
+// CommitPausedCompiledTaskDefinitionForCreationParams binds the A2 aggregate
+// write to every immutable proof produced by the same fenced operation. The
+// Store does not interpret PreparedSchedule or EnsureReceipt; byte identity is
+// the authorization boundary.
+type CommitPausedCompiledTaskDefinitionForCreationParams struct {
+	Lease            TaskCreationLease
+	Definition       PausedCompiledTaskDefinition
+	CompiledDigest   string
+	PreparedSchedule []byte
+	EnsureReceipt    []byte
+}
+
 // TaskCreationOperation is the durable v1 view of one create_schedule pending
-// action. Exact paid/remote-work checkpoints are []byte because PostgreSQL
-// BYTEA preserves their identity; Result is JSON because only its semantics are
-// consumed after the operation has become a permanent tombstone.
+// action. Exact definition/remote-work checkpoints are []byte because
+// PostgreSQL BYTEA preserves their identity; Result is JSON because only its
+// semantics are consumed after the operation has become a permanent tombstone.
 type TaskCreationOperation struct {
 	ID         string
 	TenantID   int64

@@ -101,6 +101,16 @@ type Manager struct {
 	cli *llm.Client
 	rec *llm.Recorder
 
+	// asyncMu + asyncWG 是所有飞书回调异步工作的生命周期闸门。Add/Go 与
+	// Shutdown 关闭准入必须在同一把锁下裁决；关闸后才 Wait，避免 Wait 与首次
+	// Add 并发导致 Shutdown 提前返回。已接纳工作各自仍有硬超时；Shutdown 先停止
+	// 新准入并等待，只有调用方给的停机宽限耗尽才取消 asyncCtx 强制收敛。
+	asyncMu        sync.Mutex
+	asyncAccepting bool
+	asyncCtx       context.Context
+	asyncCancel    context.CancelFunc
+	asyncWG        sync.WaitGroup
+
 	// agent 是消息链的 agent loop 入口（SetAgent 注入）；nil 时消息链
 	// 回退 chat_reply 直连 LLM——保证 agent 配置不全时通道仍可用。
 	// 由 mu 保护：注入发生在 main 装配期，但 handler goroutine 并发读。
@@ -140,7 +150,116 @@ type Manager struct {
 // NewManager 构造 Manager。llm 客户端与记账器由 main 注入，
 // 消息处理链（chat_reply）复用它们。
 func NewManager(st *store.Store, cli *llm.Client, rec *llm.Recorder) *Manager {
-	return &Manager{st: st, cli: cli, rec: rec}
+	asyncCtx, asyncCancel := context.WithCancel(context.Background())
+	return &Manager{
+		st:             st,
+		cli:            cli,
+		rec:            rec,
+		asyncAccepting: true,
+		asyncCtx:       asyncCtx,
+		asyncCancel:    asyncCancel,
+	}
+}
+
+// startAsync 接纳一项有界异步工作，并让 Shutdown 能等待它完成。
+// detachParent=true 只移除连接/回调 ctx 的取消信号（保留 trace 等 values）：
+// 已经开始的确认与反馈不能因 Dashboard 重连被截断；Manager 自己的停机取消
+// 仍通过 asyncCtx 生效。false 用于普通消息/菜单，它们应随 WS 换代停止。
+func (m *Manager) startAsync(
+	parent context.Context,
+	timeout time.Duration,
+	detachParent bool,
+	name string,
+	fn func(context.Context),
+) bool {
+	if parent == nil {
+		parent = context.TODO()
+	}
+
+	m.asyncMu.Lock()
+	defer m.asyncMu.Unlock()
+	if !m.asyncAccepting {
+		return false
+	}
+	lifecycle := m.asyncCtx
+	m.asyncWG.Go(func() {
+		base := parent
+		if detachParent {
+			base = context.WithoutCancel(parent)
+		}
+		ctx, cancel := context.WithTimeout(base, timeout)
+		stopLifecycleCancel := context.AfterFunc(lifecycle, cancel)
+		defer func() {
+			stopLifecycleCancel()
+			cancel()
+			if recovered := recover(); recovered != nil {
+				slog.Error("feishu: 异步工作 panic", "work", name, "recover", recovered)
+			}
+		}()
+		fn(ctx)
+	})
+	return true
+}
+
+// beginCallback 把 SDK 同步执行的卡片回调本身也纳入 WaitGroup。回调在启动
+// worker 前会查库；若只跟踪 worker，Shutdown 可能在这段查库尚未返回时误以为
+// 已排空并关闭 DB。Add 与准入裁决同样在 asyncMu 下完成，返回的 finish 必须 defer。
+func (m *Manager) beginCallback() (finish func(), ok bool) {
+	m.asyncMu.Lock()
+	defer m.asyncMu.Unlock()
+	if !m.asyncAccepting {
+		return nil, false
+	}
+	m.asyncWG.Add(1)
+	return m.asyncWG.Done, true
+}
+
+// Shutdown 停止接纳新回调、断开当前 WS，并等待所有已接纳的 Manager 工作结束。
+// API 发送客户端刻意保留到进程退出：Manager 回调结束后，feedback deep-dive 与
+// Temporal Push Activity 仍可能在各自的 drain 阶段发送最后一条消息。lark.Client
+// 没有需要显式关闭的资源，提前置 nil 只会把一次可完成的送达变成确定性失败。
+// 跨进程耐久送达属于 A6，不在此承诺。
+func (m *Manager) Shutdown(ctx context.Context) error {
+	m.asyncMu.Lock()
+	m.asyncAccepting = false
+	m.asyncMu.Unlock()
+
+	// 先取消连接，让消息/菜单工作收到取消；确认/反馈使用 detachParent，仍可在
+	// 调用方给出的停机宽限内完成并发送结果。
+	m.cancelWebSocket()
+
+	done := make(chan struct{})
+	go func() {
+		m.asyncWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		m.asyncCancel()
+		// 启动 reload 可能与第一次 cancel 并发并在稍后装好新连接；等它进入
+		// asyncWG 终态后再取消一次，关闭这个窗口。
+		m.cancelWebSocket()
+		return nil
+	case <-ctx.Done():
+		// 宽限耗尽后才强制取消脱离 WS 的确认/反馈工作。若下游无视 ctx，
+		// Shutdown 仍按调用方 deadline 有界返回；Wait goroutine 会在其终止后退出。
+		m.asyncCancel()
+		m.cancelWebSocket()
+		return ctx.Err()
+	}
+}
+
+// cancelWebSocket 只取消入站 WS；发送端由下游 drain 共用，不能在这里释放。
+func (m *Manager) cancelWebSocket() {
+	m.mu.Lock()
+	if m.wsCancel != nil {
+		m.wsCancel()
+		m.wsCancel = nil
+	}
+	m.connected = false
+	m.connectedAt = nil
+	m.mu.Unlock()
 }
 
 // SetAgent 注入 agent loop（main 装配期、Start 之前调用）。
@@ -207,16 +326,23 @@ func (m *Manager) Start(ctx context.Context) {
 	m.baseCtx = ctx
 	m.mu.Unlock()
 
-	go func() {
+	if !m.startAsync(ctx, 30*time.Second, false, "startup_reload", func(ctx context.Context) {
 		if err := m.reload(ctx); err != nil {
 			slog.Error("feishu: 启动时连接失败（可在 Dashboard 重新配置）", "err", err)
 		}
-	}()
+	}) {
+		slog.Warn("feishu: Manager 正在关闭，跳过启动重载")
+	}
 }
 
 // Reconfigure 在 API 层保存新配置后调用：断开旧连接 → 重读 settings → 重连。
 // 与 Start 不同，这里同步返回错误，让 POST /api/feishu/config 能把失败告诉用户。
 func (m *Manager) Reconfigure(ctx context.Context) error {
+	finish, accepted := m.beginCallback()
+	if !accepted {
+		return types.NewAppError(types.CodeConflict, "服务正在重启，请稍后重试", types.ErrConflict)
+	}
+	defer finish()
 	return m.reload(ctx)
 }
 
@@ -369,7 +495,9 @@ func (m *Manager) reload(ctx context.Context) error {
 		// wsCtx 取消只能终止连接循环，goroutine 本身会永远停在 select{}
 		// 上——因此每次 Reconfigure 都会泄漏一个 parked goroutine。
 		// MVP 已知并接受：重配置是极低频操作，泄漏量恒定为个位数
-		//（M2 事实基准明确此为 SDK 行为）。
+		//（M2 事实基准明确此为 SDK 行为）。这条 SDK parked goroutine 刻意不
+		// 加入 asyncWG：它无法返回，Shutdown 只能 cancel 连接，等待它会让
+		// 每次停机永久卡死。其余回调与启动工作全部走 startAsync。
 		err := wsCli.Start(wsCtx)
 		if err == nil {
 			return

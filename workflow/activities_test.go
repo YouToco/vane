@@ -119,11 +119,13 @@ type emptyBatchCall struct {
 }
 
 type fakeStore struct {
-	tenantGone         bool  // true = 模拟租户已注销
-	tenantLiveErr      error // 非 nil = 模拟状态查询失败
-	mu                 sync.Mutex
-	gotBatchScheduleID string // Push 建批次时收到的 schedule_id（P1b 穿参断言）
-	unpushed           []types.ContentItem
+	runAuthorized       bool
+	runAuthorizationErr error
+	tenantGone          bool  // true = 模拟租户已注销
+	tenantLiveErr       error // 非 nil = 模拟状态查询失败
+	mu                  sync.Mutex
+	gotBatchScheduleID  string // Push 建批次时收到的 schedule_id（P1b 穿参断言）
+	unpushed            []types.ContentItem
 
 	strictness    types.PushStrictness // GetScheduleStrictness 返回值（零值=未设置）
 	strictnessErr error                // 非 nil = 模拟门槛档位查询失败（Select 应降级兜底）
@@ -159,6 +161,56 @@ type fakeStore struct {
 	// #8 卡片源归属：schedSrcForContent 映射 content_item_id→本任务命中源 id；
 	// 命中即 ScheduleSourceForContent 返回 (id,true)，缺失返回 (0,false) 让调用方回退首发源。
 	schedSrcForContent map[int64]int64
+}
+
+func (f *fakeStore) AuthorizeScheduledRun(context.Context, string, int64) (bool, error) {
+	if f.runAuthorizationErr != nil {
+		return false, f.runAuthorizationErr
+	}
+	return f.runAuthorized, nil
+}
+
+func TestAuthorizeRun_FailClosedScheduledAndBypassesAdHoc(t *testing.T) {
+	t.Run("scheduled uses exact store decision", func(t *testing.T) {
+		st := &fakeStore{runAuthorized: true}
+		a := &Activities{store: st}
+		params := PushParams{UserID: 7, RunKind: PushRunKindScheduled, ScheduleID: "task-7"}
+		ok, err := a.AuthorizeRun(t.Context(), params)
+		if err != nil || !ok {
+			t.Fatalf("ok=%v err=%v", ok, err)
+		}
+		st.runAuthorizationErr = errors.New("db unavailable")
+		if ok, err := a.AuthorizeRun(t.Context(), params); err == nil || ok {
+			t.Fatalf("DB error must fail closed: ok=%v err=%v", ok, err)
+		}
+	})
+
+	t.Run("ad hoc does not require a schedule row", func(t *testing.T) {
+		st := &fakeStore{runAuthorizationErr: errors.New("must not be consulted")}
+		a := &Activities{store: st}
+		ok, err := a.AuthorizeRun(t.Context(), PushParams{UserID: 7, RunKind: PushRunKindAdHoc})
+		if err != nil || !ok {
+			t.Fatalf("ok=%v err=%v", ok, err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		params PushParams
+	}{
+		{name: "legacy unknown kind cannot impersonate ad hoc", params: PushParams{UserID: 7}},
+		{name: "scheduled kind requires schedule id", params: PushParams{UserID: 7, RunKind: PushRunKindScheduled}},
+		{name: "ad hoc kind rejects schedule id", params: PushParams{UserID: 7, RunKind: PushRunKindAdHoc, ScheduleID: "task-7"}},
+		{name: "user id must be positive", params: PushParams{RunKind: PushRunKindAdHoc}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &fakeStore{runAuthorizationErr: errors.New("must not be consulted")}
+			ok, err := (&Activities{store: st}).AuthorizeRun(t.Context(), tc.params)
+			if err != nil || ok {
+				t.Fatalf("ok=%v err=%v, want fail-closed without store call", ok, err)
+			}
+		})
+	}
 }
 
 func (f *fakeStore) GetScheduleStrictness(context.Context, string) (types.PushStrictness, error) {
@@ -722,6 +774,57 @@ func TestFetch_ScheduleScoped(t *testing.T) {
 			t.Errorf("应用户级候选(88), 实得 %+v", got)
 		}
 	})
+}
+
+type cancelBlockingFetcher struct {
+	mu      sync.Mutex
+	started chan struct{}
+	calls   int
+}
+
+func (f *cancelBlockingFetcher) Fetch(ctx context.Context, _ types.Source) ([]types.ContentItem, error) {
+	f.mu.Lock()
+	f.calls++
+	call := f.calls
+	f.mu.Unlock()
+	if call == 1 {
+		close(f.started)
+		<-ctx.Done()
+	}
+	return nil, ctx.Err()
+}
+
+func TestFetchCancellationDoesNotStartAnotherPaidSource(t *testing.T) {
+	st := &fakeStore{dueSources: []types.Source{
+		fetchSrc(1, 0, "first"), fetchSrc(2, 0, "second"), fetchSrc(3, 0, "third"),
+	}}
+	fetcher := &cancelBlockingFetcher{started: make(chan struct{})}
+	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, idNotice, nil, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Fetch(ctx, PushParams{UserID: 7})
+		done <- err
+	}()
+	select {
+	case <-fetcher.started:
+	case <-time.After(time.Second):
+		t.Fatal("first source fetch did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Fetch error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Fetch did not stop after cancellation")
+	}
+	fetcher.mu.Lock()
+	defer fetcher.mu.Unlock()
+	if fetcher.calls != 1 {
+		t.Fatalf("paid source calls after cancellation = %d, want exactly first call", fetcher.calls)
+	}
 }
 
 // TestFetch_AlertsExactlyOnThresholdCrossing 是 5.2 去重的核心保证：一轮里只有"恰好
