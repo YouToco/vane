@@ -301,7 +301,7 @@ func judgeDiscrimination(traces []types.ScoreTraceStat) Result {
 		r.Status = StatusRed
 		r.Summary = fmt.Sprintf("%d/%d 个批次整批同分且非良性形状——M3 事故形状", len(suspect), len(traces))
 		r.Detail = fmt.Sprintf("首个：trace %s（%d 次打分，输出只有 1 种，tokens 峰值 %d）。"+
-			"按契约立即回滚排查。先查 DisableThinking 是否仍生效（CLAUDE.md 红线 1）："+
+			"按契约立即回滚排查。先查 DisableThinking 是否仍生效（AGENTS.md 红线 1）："+
 			"SELECT completion, completion_tokens FROM llm_calls WHERE trace_id='%s' AND span_name='score' LIMIT 5;"+
 			"「整批同一 0-20 整数分且 tokens≤%d」的良性形状（内容真不相关）已被本探针自动分流为黄，"+
 			"走到红意味着：输出为空（M3 精确形状）、或同分卡在 21+ 段（M3 事故正是整批「50」）、"+
@@ -438,7 +438,7 @@ func judgeEmptyOutput(q types.ScoreQualityStat) Result {
 		r.Status = StatusRed
 		r.Summary = fmt.Sprintf("%d 次打分返回空内容却无报错——M3 事故的精确形状", q.EmptyNoError)
 		r.Detail = "零容忍红线。这些调用每次都静默回退中位分 50 并照常推送。" +
-			"立即查 scorer 的 DisableThinking 是否被改动（CLAUDE.md 红线 1：V4 默认 reasoning " +
+			"立即查 scorer 的 DisableThinking 是否被改动（AGENTS.md 红线 1：V4 默认 reasoning " +
 			"会吃光 16 token 预算致 content 恒空）。佐证：这些行的 completion_tokens 应非 0。"
 		return r
 	}

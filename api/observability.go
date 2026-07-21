@@ -22,7 +22,7 @@ import (
 // window_hours 的合法区间。
 //
 // 下界 1h：再小连一个打分批次都框不住，探针只会全 yellow，纯属误导。
-// 上界 30 天：llm_calls 无 TTL、只增不减（CLAUDE.md 红线 5 数据不清理），
+// 上界 30 天：llm_calls 无 TTL、只增不减（AGENTS.md 红线 5 数据不清理），
 // 窗口不封顶等于放任按时间线性变慢的全表聚合；且契约 §16 的红线本就以 24h
 // 为准（probe.DefaultWindow），更长的窗口是看趋势而非判定，30 天足够。
 const (

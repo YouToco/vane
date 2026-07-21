@@ -13,7 +13,7 @@ import (
 // Gate 服务端探针的数据面查询（M5 契约 §16）。只读、只聚合，不写任何表。
 //
 // 表名纪律：LLM 明细表是 **llm_calls**（001_init.sql:172），不是 llm_traces。
-// CLAUDE.md 曾误记为后者（本 PR 已订正）——照那个名字写的 SQL 会报
+// 当时的协作入口曾误记为后者（本 PR 已订正）——照那个名字写的 SQL 会报
 // relation does not exist，而那读起来像"没数据"，正是红线 6 警告的失败模式。
 //
 // 正则纪律：Go 侧 parseScore 用 `-?\d+(?:\.\d+)?`（scorer.go:81），RE2 的 \d

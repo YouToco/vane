@@ -241,7 +241,7 @@ func TestJudgeDiscrimination_RedDetailNamesTrace(t *testing.T) {
 	if !strings.Contains(got.Detail, "flat-trace") {
 		t.Errorf("Detail 应点名同分的 trace，实际 %q", got.Detail)
 	}
-	// 表名纪律：真实表是 llm_calls，不是 llm_traces（CLAUDE.md:19 的笔误，本 PR 订正）。
+	// 表名纪律：真实表是 llm_calls，不是 llm_traces（当时协作入口的笔误，本 PR 订正）。
 	// 照笔误写的 SQL 报 relation does not exist，读起来像"没数据"（红线 6 的失败模式）。
 	if !strings.Contains(got.Detail, "llm_calls") {
 		t.Errorf("Detail 的排查 SQL 应查 llm_calls 表，实际 %q", got.Detail)
@@ -338,7 +338,7 @@ func TestJudgeEmptyOutput(t *testing.T) {
 	}
 }
 
-// M3 事故的成因是 DisableThinking 回归（CLAUDE.md 红线 1），红灯必须直接把这条指过去。
+// M3 事故的成因是 DisableThinking 回归（AGENTS.md 红线 1），红灯必须直接把这条指过去。
 func TestJudgeEmptyOutput_RedDetailPointsAtDisableThinking(t *testing.T) {
 	got := judgeEmptyOutput(types.ScoreQualityStat{OKTotal: 50, NoDigit: 50, EmptyNoError: 50})
 	checkStatus(t, got, StatusRed)

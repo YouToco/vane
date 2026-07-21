@@ -771,7 +771,7 @@ negFeedbackMax 置 0 重编部署，或删 feedbacks 负反馈行。完整回滚
   去重后空 / 打分后空 / 择优后空 / 卡片生成后空）都在 Push 之前 `return nil`，此时
   push_batches **零行**。
   即"今早无新内容"这件事**在库里根本不存在**，不是查询查不到——看板与探针都无从区分"没跑"与
-  "跑了但没内容"。归 PR2（核心路径写入变更，按 CLAUDE.md 流程约定走全流程对抗审查）。
+  "跑了但没内容"。归 PR2（核心路径写入变更，按 AGENTS.md 流程约定走全流程对抗审查）。
   **↑ 已由 PR2 关闭，处置见下节。**
 - **探针已固化为代码**：判定与阈值在 `probe/` 包（`probe.Run` 返回 `Report`，含 7 条
   `Result{ID,Name,ContractRef,Status,Summary,Detail}`，`Report.Worst()` 取最严重态）；SQL 在
