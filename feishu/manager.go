@@ -22,6 +22,7 @@ import (
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 )
 
@@ -36,6 +37,20 @@ type AgentRunner interface {
 	HandleExternalContextMessage(ctx context.Context, userID int64, text string) (agent.Outcome, error)
 	ExecuteAction(ctx context.Context, userID int64, actionID string) (string, error)
 	CancelAction(ctx context.Context, userID int64, actionID string) (string, error)
+}
+
+// DurableAgentRunner is the A6 extension implemented by the production Agent
+// loop. Keeping it separate preserves the narrow legacy runner seam for v0
+// tests while making provider-target binding explicit on the real path.
+type DurableAgentRunner interface {
+	ExecuteActionWithReceipt(
+		ctx context.Context, userID int64, actionID string,
+		receipt task.CreationReceiptTarget,
+	) (agent.CardActionOutcome, error)
+	CancelActionWithReceipt(
+		ctx context.Context, userID int64, actionID string,
+		receipt task.CreationReceiptTarget,
+	) (agent.CardActionOutcome, error)
 }
 
 // FeedbackRunner 是 feishu 对 feedback 服务的窄依赖面（M5 契约 §10.4）：
@@ -138,6 +153,7 @@ type Manager struct {
 	// 状态前先比对代数，避免"旧连接的尸体"覆盖新连接的健康状态。
 	gen         int64
 	apiClient   *lark.Client // 发消息用的 API 客户端，与 WS 客户端分离
+	apiAppID    string       // 与 apiClient 同代；A6 用其防止跨 App 修改旧卡
 	configured  bool
 	connected   bool
 	botName     string
@@ -218,7 +234,8 @@ func (m *Manager) beginCallback() (finish func(), ok bool) {
 // API 发送客户端刻意保留到进程退出：Manager 回调结束后，feedback deep-dive 与
 // Temporal Push Activity 仍可能在各自的 drain 阶段发送最后一条消息。lark.Client
 // 没有需要显式关闭的资源，提前置 nil 只会把一次可完成的送达变成确定性失败。
-// 跨进程耐久送达属于 A6，不在此承诺。
+// A6 的跨进程耐久送达由独立 receipt dispatcher 承担；它在 Manager ingress
+// 排空后仍复用这里保留的同代 API 客户端，直到 dispatcher 自己完成停机。
 func (m *Manager) Shutdown(ctx context.Context) error {
 	m.asyncMu.Lock()
 	m.asyncAccepting = false
@@ -425,6 +442,11 @@ func (m *Manager) reload(ctx context.Context) error {
 	m.connected = false
 	m.connectedAt = nil
 	m.lastError = ""
+	// Reconfiguration is an immediate outbound permission boundary. Keeping the
+	// old client while a disabled/invalid/new setting is evaluated would let
+	// background senders continue using credentials the user just revoked.
+	m.apiClient = nil
+	m.apiAppID = ""
 	base := m.baseCtx
 	m.mu.Unlock()
 	if base == nil {
@@ -473,7 +495,7 @@ func (m *Manager) reload(ctx context.Context) error {
 	// 用户回控制台保存"长连接"订阅方式并发布版本后自然就绪。
 
 	wsCtx, cancel := context.WithCancel(base)
-	h := newHandler(m, wsCtx)
+	h := newHandlerForApp(m, wsCtx, cfg.AppID)
 	wsCli := larkws.NewClient(cfg.AppID, cfg.AppSecret,
 		larkws.WithEventHandler(h.eventDispatcher()),
 		larkws.WithLogLevel(larkcore.LogLevelInfo),
@@ -483,6 +505,7 @@ func (m *Manager) reload(ctx context.Context) error {
 	m.mu.Lock()
 	m.wsCancel = cancel
 	m.apiClient = lark.NewClient(cfg.AppID, cfg.AppSecret)
+	m.apiAppID = cfg.AppID
 	m.botName = vr.BotName
 	// 乐观置位：凭证刚通过校验，连接大概率成功；若 Start 立刻失败，
 	// 下方 goroutine 会（在同一代数下）把状态改回 false 并记录原因。

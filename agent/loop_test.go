@@ -288,6 +288,28 @@ type fakeCreationController struct {
 type fakeCreationConfirmCall struct {
 	userID   int64
 	actionID string
+	receipt  task.CreationReceiptTarget
+}
+
+type receiptSessionStore struct {
+	*fakeStore
+	mu       sync.Mutex
+	calls    int
+	lease    types.TaskCreationReceiptLease
+	messages json.RawMessage
+}
+
+func (s *receiptSessionStore) RecordTaskCreationReceiptSessionMessages(
+	_ context.Context,
+	lease types.TaskCreationReceiptLease,
+	messages json.RawMessage,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	s.lease = lease
+	s.messages = append(s.messages[:0], messages...)
+	return nil
 }
 
 func (f *fakeCreationController) Propose(_ context.Context, in task.CreationProposalInput) (task.CreationProposal, error) {
@@ -319,16 +341,20 @@ func (f *fakeCreationController) Propose(_ context.Context, in task.CreationProp
 	return result, nil
 }
 
-func (f *fakeCreationController) Confirm(_ context.Context, userID int64, actionID string) (task.CreationResult, error) {
-	f.confirmCalls = append(f.confirmCalls, fakeCreationConfirmCall{userID: userID, actionID: actionID})
+func (f *fakeCreationController) Confirm(_ context.Context, userID int64, actionID string, receipt task.CreationReceiptTarget) (task.CreationResult, error) {
+	f.confirmCalls = append(f.confirmCalls, fakeCreationConfirmCall{
+		userID: userID, actionID: actionID, receipt: receipt,
+	})
 	if f.confirmErr != nil {
 		return task.CreationResult{}, f.confirmErr
 	}
 	return f.confirmResult, nil
 }
 
-func (f *fakeCreationController) Cancel(_ context.Context, userID int64, actionID string) (task.CreationResult, error) {
-	f.cancelCalls = append(f.cancelCalls, fakeCreationConfirmCall{userID: userID, actionID: actionID})
+func (f *fakeCreationController) Cancel(_ context.Context, userID int64, actionID string, receipt task.CreationReceiptTarget) (task.CreationResult, error) {
+	f.cancelCalls = append(f.cancelCalls, fakeCreationConfirmCall{
+		userID: userID, actionID: actionID, receipt: receipt,
+	})
 	if f.cancelErr != nil {
 		return task.CreationResult{}, f.cancelErr
 	}
@@ -1219,6 +1245,94 @@ func TestExecuteAction_ReplayedV1RepairsConversationReceiptAndRecordsAudit(t *te
 	}
 }
 
+func TestExecuteActionWithReceipt_DurableV1DelegatesAllTerminalSideEffects(t *testing.T) {
+	fs := newFakeStore()
+	sess, err := fs.CreateAgentSession(t.Context(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	creation := &fakeCreationController{confirmResult: task.CreationResult{
+		OperationID: "action", TaskID: "task-v1", Message: "任务已创建并开始监控。",
+		Status: types.PendingActionStatusExecuted, ReceiptBound: true,
+		SessionID: &sess.ID, Summary: "已批准任务",
+	}}
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn)
+	l.taskCreation = creation
+	target := task.CreationReceiptTarget{
+		Provider: task.FeishuCardPatchReceiptProviderForApp("cli_agent_test"),
+		Target:   "om_original_confirmation",
+	}
+
+	out, err := l.ExecuteActionWithReceipt(t.Context(), 7, "action", target)
+	if err != nil || !out.DurableReceipt || out.PreserveCard ||
+		out.Text != "任务创建已受理，最终结果会更新在这张卡片上。" {
+		t.Fatalf("outcome=%+v err=%v", out, err)
+	}
+	if len(creation.confirmCalls) != 1 || creation.confirmCalls[0].receipt != target {
+		t.Fatalf("receipt target not forwarded exactly: %+v", creation.confirmCalls)
+	}
+	// The dispatcher owns the single durable session append. The click path
+	// must not race it with the historical best-effort goroutine.
+	time.Sleep(20 * time.Millisecond)
+	if got := fs.appendCount(); got != 0 {
+		t.Fatalf("best-effort session append still ran: %d", got)
+	}
+	creation.confirmResult.Replayed = true
+	replayed, err := l.ExecuteActionWithReceipt(t.Context(), 7, "action", target)
+	if err != nil || !replayed.DurableReceipt || !replayed.PreserveCard {
+		t.Fatalf("terminal replay must preserve the already-final card: out=%+v err=%v",
+			replayed, err)
+	}
+}
+
+func TestExecuteActionWithReceipt_PreAcceptFailurePreservesCard(t *testing.T) {
+	fs := newFakeStore()
+	creation := &fakeCreationController{confirmErr: errors.New("database unavailable")}
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn)
+	l.taskCreation = creation
+	target := task.CreationReceiptTarget{
+		Provider: task.FeishuCardPatchReceiptProviderForApp("cli_agent_test"),
+		Target:   "om_original_confirmation",
+	}
+	out, err := l.ExecuteActionWithReceipt(t.Context(), 7, "action", target)
+	if err == nil || !out.PreserveCard || out.DurableReceipt {
+		t.Fatalf("outcome=%+v err=%v", out, err)
+	}
+}
+
+func TestRecordCreationReceiptSessionUsesAgentUserLock(t *testing.T) {
+	base := newFakeStore()
+	st := &receiptSessionStore{fakeStore: base}
+	l := newTestLoop(t, base, (&scriptedChat{}).fn)
+	l.store = st
+	receipt := types.TaskCreationReceipt{
+		ID: 1, TenantID: 2, UserID: 7,
+		LeaseOwner: "receipt-worker", Fence: 3,
+	}
+	messages := json.RawMessage(`[{"role":"user","content":"[卡片回调] done"}]`)
+	muVal, _ := l.userMu.LoadOrStore(int64(7), &sync.Mutex{})
+	userMu := muVal.(*sync.Mutex)
+	userMu.Lock()
+	started := time.Now()
+	err := l.RecordCreationReceiptSession(t.Context(), receipt, messages)
+	if !errors.Is(err, errCreationReceiptSessionBusy) {
+		t.Fatalf("busy user lock error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("receipt recorder blocked dispatcher for %v", elapsed)
+	}
+	userMu.Unlock()
+	if err := l.RecordCreationReceiptSession(t.Context(), receipt, messages); err != nil {
+		t.Fatal(err)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.calls != 1 || st.lease != receipt.Lease() ||
+		string(st.messages) != string(messages) {
+		t.Fatalf("calls=%d lease=%+v messages=%s", st.calls, st.lease, st.messages)
+	}
+}
+
 func TestCancelAction_UsesDurableV1BeforeLegacy(t *testing.T) {
 	fs := newFakeStore()
 	sess, err := fs.CreateAgentSession(t.Context(), 7)
@@ -1246,6 +1360,26 @@ func TestCancelAction_UsesDurableV1BeforeLegacy(t *testing.T) {
 	if len(callback) != 1 || !strings.Contains(callback[0].Content, "点击「取消」") ||
 		strings.Contains(callback[0].Content, "点击「确认」") {
 		t.Fatalf("cancel callback must preserve the user's verb: %+v", callback)
+	}
+}
+
+func TestCancelActionWithReceipt_ExecutingTaskDoesNotClaimCancellation(t *testing.T) {
+	fs := newFakeStore()
+	const message = "任务已经开始创建，无法再取消；系统会自动完成或安全回滚。"
+	creation := &fakeCreationController{cancelResult: task.CreationResult{
+		OperationID: "action", Status: types.PendingActionStatusExecuting,
+		Recovering: true, ReceiptBound: true, Message: message,
+	}}
+	l := newTestLoop(t, fs, (&scriptedChat{}).fn)
+	l.taskCreation = creation
+	target := task.CreationReceiptTarget{
+		Provider: task.FeishuCardPatchReceiptProviderForApp("cli_agent_test"),
+		Target:   "om_cancel_busy",
+	}
+
+	out, err := l.CancelActionWithReceipt(t.Context(), 7, "action", target)
+	if err != nil || out.Text != message || !out.DurableReceipt || out.PreserveCard {
+		t.Fatalf("outcome=%+v err=%v", out, err)
 	}
 }
 

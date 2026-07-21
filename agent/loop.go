@@ -140,8 +140,8 @@ type Store interface {
 // 都封装在 task 包内，Agent 无权自行拼装或绕过。
 type CreationController interface {
 	Propose(ctx context.Context, in task.CreationProposalInput) (task.CreationProposal, error)
-	Confirm(ctx context.Context, userID int64, actionID string) (task.CreationResult, error)
-	Cancel(ctx context.Context, userID int64, actionID string) (task.CreationResult, error)
+	Confirm(ctx context.Context, userID int64, actionID string, receipt task.CreationReceiptTarget) (task.CreationResult, error)
+	Cancel(ctx context.Context, userID int64, actionID string, receipt task.CreationReceiptTarget) (task.CreationResult, error)
 }
 
 // ProfileReader 是画像读取的窄接口（M5 契约 §12.2，生产实现 *store.Store）。
@@ -182,6 +182,36 @@ type Outcome struct {
 	Confirm *Confirm // 非 nil 时 feishu 层追加发确认卡
 }
 
+type creationReceiptSessionStore interface {
+	RecordTaskCreationReceiptSessionMessages(
+		ctx context.Context,
+		lease types.TaskCreationReceiptLease,
+		msgs json.RawMessage,
+	) error
+}
+
+var errCreationReceiptSessionBusy = errors.New("agent: user session is busy")
+
+// CardActionOutcome supplements the historical string result with the two A6
+// delivery decisions the Feishu boundary needs. DurableReceipt means the
+// provider target was atomically bound and the terminal outbox now owns the
+// visible result. PreserveCard means either acceptance failed before that
+// guarantee (buttons must remain retryable) or this is a terminal replay (an
+// already-final card must not be overwritten by a processing response).
+type CardActionOutcome struct {
+	Text           string
+	DurableReceipt bool
+	PreserveCard   bool
+}
+
+type cardActionReceiptState struct {
+	target   task.CreationReceiptTarget
+	durable  bool
+	preserve bool
+}
+
+type cardActionReceiptStateKey struct{}
+
 // Confirm 是确认卡所需的最小信息。卡片按钮 value 只携带 ActionID，
 // 参数以库中 pending_actions 为准，杜绝客户端篡改（契约 §10）。
 type Confirm struct {
@@ -218,8 +248,8 @@ type Loop struct {
 	// sessionWriteMu closes admission before shutdown and serializes WaitGroup.Add
 	// with DrainSessionWrites.Wait. Without this gate a card callback can return,
 	// spawn a best-effort session append, and then race the process closing its DB
-	// pool. A6 will make the user receipt durable; this only makes the current
-	// best-effort side write resource-safe.
+	// pool. A6 v1 creation receipts no longer use this path; legacy actions and
+	// feedback notices still need the resource-safety boundary.
 	sessionWriteMu        sync.Mutex
 	sessionWriteAccepting bool
 	sessionWriteWG        sync.WaitGroup
@@ -775,26 +805,55 @@ func (l *Loop) batchMayProduceExternalResult(calls []llm.ToolCall, state *toolRu
 // ErrCreationOperationNotFound 才进入历史 v0 的 ClaimPendingAction → Tool.Execute。
 // v0 已执行/已过期/不存在/非本人返回人话错误文本 + nil error；工具执行失败向上抛。
 // 两条路径都在持久层校验归属，feishu owner 校验只是第一道纵深防御。
+func (l *Loop) ExecuteActionWithReceipt(
+	ctx context.Context,
+	userID int64,
+	actionID string,
+	receipt task.CreationReceiptTarget,
+) (CardActionOutcome, error) {
+	state := &cardActionReceiptState{target: receipt}
+	ctx = context.WithValue(ctx, cardActionReceiptStateKey{}, state)
+	text, err := l.ExecuteAction(ctx, userID, actionID)
+	return CardActionOutcome{
+		Text: text, DurableReceipt: state.durable, PreserveCard: state.preserve,
+	}, err
+}
+
 func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string) (string, error) {
 	if l.taskCreation != nil {
+		receiptState, _ := ctx.Value(cardActionReceiptStateKey{}).(*cardActionReceiptState)
+		var receiptTarget task.CreationReceiptTarget
+		if receiptState != nil {
+			receiptTarget = receiptState.target
+		}
 		ctx = ensureCardActionTrace(ctx, userID)
 		started := time.Now()
 		// v1 必须先判定。只有 controller 明确证明该 ID 不是 v1 operation，才允许
 		// 进入历史 v0 Claim+Tool.Execute；busy/terminal/基础设施错误都不得误降级。
-		creationResult, err := l.taskCreation.Confirm(ctx, userID, actionID)
+		creationResult, err := l.taskCreation.Confirm(ctx, userID, actionID, receiptTarget)
 		if err == nil {
 			message := creationResultMessage(creationResult)
 			l.recordCreationConfirmation(ctx, userID, actionID, creationResult, message,
 				time.Since(started), nil)
-			// Replayed means the saga result already existed, not that its
-			// best-effort conversation receipt was delivered. Recovery can finish
-			// without a live card request, so a later click must still repair the
-			// conversation history. A6 will replace this with a durable outbox/CAS.
+			if creationResult.ReceiptBound && receiptState != nil {
+				receiptState.durable = true
+				receiptState.preserve = creationResult.Replayed
+				// The terminal outbox owns both provider delivery and conversation
+				// history. Returning a final value here would create a second,
+				// non-durable path and could overwrite a later replayed PATCH.
+				return "任务创建已受理，最终结果会更新在这张卡片上。", nil
+			}
+			// A terminal A5 row migrated without a provider target already used
+			// the old synchronous callback. Preserve that replay behavior only;
+			// every newly accepted v1 click is bound and takes the branch above.
 			l.appendCardCallback(ctx, userID, creationResult.SessionID,
 				creationResultCallback(creationResult, message))
 			return message, nil
 		}
 		if !errors.Is(err, task.ErrCreationOperationNotFound) {
+			if receiptState != nil {
+				receiptState.preserve = true
+			}
 			l.recordCreationConfirmation(ctx, userID, actionID, task.CreationResult{}, "",
 				time.Since(started), err)
 			return "", fmt.Errorf("confirm durable task creation: %w", err)
@@ -961,16 +1020,46 @@ func creationResultMessage(result task.CreationResult) string {
 
 // CancelAction 取消按钮回调。取消结果回写会话后返回用于更新卡片的文本。
 // 归属校验（契约 §10）同样在 Cancel 的 WHERE 谓词内完成。
+func (l *Loop) CancelActionWithReceipt(
+	ctx context.Context,
+	userID int64,
+	actionID string,
+	receipt task.CreationReceiptTarget,
+) (CardActionOutcome, error) {
+	state := &cardActionReceiptState{target: receipt}
+	ctx = context.WithValue(ctx, cardActionReceiptStateKey{}, state)
+	text, err := l.CancelAction(ctx, userID, actionID)
+	return CardActionOutcome{
+		Text: text, DurableReceipt: state.durable, PreserveCard: state.preserve,
+	}, err
+}
+
 func (l *Loop) CancelAction(ctx context.Context, userID int64, actionID string) (string, error) {
 	if l.taskCreation != nil {
-		result, err := l.taskCreation.Cancel(ctx, userID, actionID)
+		receiptState, _ := ctx.Value(cardActionReceiptStateKey{}).(*cardActionReceiptState)
+		var receiptTarget task.CreationReceiptTarget
+		if receiptState != nil {
+			receiptTarget = receiptState.target
+		}
+		result, err := l.taskCreation.Cancel(ctx, userID, actionID, receiptTarget)
 		if err == nil {
 			message := creationResultMessage(result)
+			if result.ReceiptBound && receiptState != nil {
+				receiptState.durable = true
+				receiptState.preserve = result.Replayed
+				// Keep the coordinator's exact cancellation semantics. In particular,
+				// an already-executing creation cannot be cancelled even though its
+				// final receipt is now durably bound to this card.
+				return message, nil
+			}
 			l.appendCardCallback(ctx, userID, result.SessionID,
 				creationCancelResultCallback(result, message))
 			return message, nil
 		}
 		if !errors.Is(err, task.ErrCreationOperationNotFound) {
+			if receiptState != nil {
+				receiptState.preserve = true
+			}
 			return "", fmt.Errorf("cancel durable task creation: %w", err)
 		}
 	}
@@ -1012,6 +1101,40 @@ func (l *Loop) appendCardCallback(ctx context.Context, userID int64, sessionID *
 			slog.Error("agent: 卡片回调回写会话失败", "session_id", sid, "err", err)
 		}
 	})
+}
+
+// RecordCreationReceiptSession is the A6 synchronous conversation checkpoint.
+// The database method atomically appends messages and marks the outbox row;
+// taking the same userMu as HandleMessage prevents its later full-session
+// UpdateAgentSession from overwriting that append.
+func (l *Loop) RecordCreationReceiptSession(
+	ctx context.Context,
+	receipt types.TaskCreationReceipt,
+	messages json.RawMessage,
+) error {
+	store, ok := l.store.(creationReceiptSessionStore)
+	if !ok {
+		return errors.New("agent: task creation receipt session store is unavailable")
+	}
+	muVal, _ := l.userMu.LoadOrStore(receipt.UserID, &sync.Mutex{})
+	mu := muVal.(*sync.Mutex)
+	// A normal Agent turn may hold this lock for its full model/tool budget.
+	// The receipt dispatcher must not block an entire tenant scan (or shutdown)
+	// behind that turn. A busy lock is a retryable outbox outcome; the immutable
+	// session checkpoint will be retried after the turn releases the lock.
+	if !mu.TryLock() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return errCreationReceiptSessionBusy
+	}
+	defer mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return store.RecordTaskCreationReceiptSessionMessages(
+		ctx, receipt.Lease(), messages,
+	)
 }
 
 // NotifyEvent 把外部事件（推送卡反馈按钮点击，M5 契约 §12.4）以「[卡片回调]」user

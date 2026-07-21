@@ -27,6 +27,8 @@ func TestCreateTaskCreationOperation_V1Boundary(t *testing.T) {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM task_creation_receipts WHERE tenant_id = $1`, f.tenantID)
+		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM pending_actions WHERE tenant_id = $1`, f.tenantID)
 	})
 
@@ -119,6 +121,8 @@ func TestCreateTaskCreationOperation_V1Boundary(t *testing.T) {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM task_creation_receipts WHERE tenant_id = $1`, f.tenantID)
+		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM agent_sessions WHERE user_id = $1`, sessionOwner)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
@@ -210,7 +214,7 @@ func TestTaskCreationLookupAndCancel_V1IsolationAndLinearization(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.CancelTaskCreationOperation(
-		ctx, legacyID, f.tenantID, f.userID); !errors.Is(err, types.ErrNotFound) {
+		ctx, taskCreationCancelParams(legacyID, f.tenantID, f.userID, "om-legacy")); !errors.Is(err, types.ErrNotFound) {
 		t.Fatalf("v0 action 不得被 v1 cancel 触碰: %v", err)
 	}
 	var legacyStatus types.PendingActionStatus
@@ -232,7 +236,7 @@ func TestTaskCreationLookupAndCancel_V1IsolationAndLinearization(t *testing.T) {
 		t.Fatalf("lookup 不得泄露给其他 user: %v", err)
 	}
 	if _, err := st.CancelTaskCreationOperation(
-		ctx, created.ID, f.tenantID+9999, f.userID); !errors.Is(err, types.ErrNotFound) {
+		ctx, taskCreationCancelParams(created.ID, f.tenantID+9999, f.userID, "om-wrong-tenant")); !errors.Is(err, types.ErrNotFound) {
 		t.Fatalf("cancel 跨 tenant 必须 NotFound: %v", err)
 	}
 
@@ -250,6 +254,8 @@ func TestTaskCreationLookupAndCancel_V1IsolationAndLinearization(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM task_creation_receipts WHERE tenant_id = $1`, secondTenantID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
 			secondTenantID, f.userID)
@@ -269,14 +275,13 @@ func TestTaskCreationLookupAndCancel_V1IsolationAndLinearization(t *testing.T) {
 	if err != nil || lookedUp.TenantID != f.tenantID {
 		t.Fatalf("suspended+multi-membership lookup 必须采用 durable tenant: op=%+v err=%v", lookedUp, err)
 	}
-	cancelled, err := st.CancelTaskCreationOperation(ctx, created.ID, f.tenantID, f.userID)
+	cancelParams := taskCreationCancelParams(created.ID, f.tenantID, f.userID, "om-cancelled")
+	cancelled, err := st.CancelTaskCreationOperation(ctx, cancelParams)
 	if err != nil || cancelled.Status != types.PendingActionStatusCancelled ||
 		cancelled.Phase != types.TaskCreationPhaseCancelled || cancelled.TombstonedAt == nil {
 		t.Fatalf("v1 cancel tombstone 错误: op=%+v err=%v", cancelled, err)
 	}
-	if replay, err := st.CancelTaskCreationOperation(
-		ctx, created.ID, f.tenantID, f.userID,
-	); err != nil || replay.ID != created.ID {
+	if replay, err := st.CancelTaskCreationOperation(ctx, cancelParams); err != nil || replay.ID != created.ID {
 		t.Fatalf("cancel exact replay: op=%+v err=%v", replay, err)
 	}
 
@@ -290,13 +295,11 @@ func TestTaskCreationLookupAndCancel_V1IsolationAndLinearization(t *testing.T) {
 		t.Fatal(err)
 	}
 	lostStore := storeWithCommitResponseLost(st)
-	if _, err := lostStore.CancelTaskCreationOperation(
-		ctx, lostParams.ID, f.tenantID, f.userID); !errors.Is(err, types.ErrDatabase) {
+	lostCancel := taskCreationCancelParams(lostParams.ID, f.tenantID, f.userID, "om-lost")
+	if _, err := lostStore.CancelTaskCreationOperation(ctx, lostCancel); !errors.Is(err, types.ErrDatabase) {
 		t.Fatalf("cancel response lost 应返回 database: %v", err)
 	}
-	if replay, err := st.CancelTaskCreationOperation(
-		ctx, lostParams.ID, f.tenantID, f.userID,
-	); err != nil || replay.Status != types.PendingActionStatusCancelled {
+	if replay, err := st.CancelTaskCreationOperation(ctx, lostCancel); err != nil || replay.Status != types.PendingActionStatusCancelled {
 		t.Fatalf("cancel response-lost readback/adopt: op=%+v err=%v", replay, err)
 	}
 }
@@ -328,7 +331,8 @@ func TestTaskCreationCancelRacesAcquire(t *testing.T) {
 	acquired := make(chan acquireOutcome, 1)
 	go func() {
 		<-start
-		op, err := st.CancelTaskCreationOperation(ctx, p.ID, f.tenantID, f.userID)
+		op, err := st.CancelTaskCreationOperation(ctx,
+			taskCreationCancelParams(p.ID, f.tenantID, f.userID, "om-race"))
 		cancelled <- cancelOutcome{op: op, err: err}
 	}()
 	go func() {
@@ -336,6 +340,7 @@ func TestTaskCreationCancelRacesAcquire(t *testing.T) {
 		op, err := st2.AcquireTaskCreationOperation(ctx, types.AcquireTaskCreationOperationParams{
 			ID: p.ID, TenantID: f.tenantID, UserID: f.userID,
 			LeaseOwner: "cancel-race-" + uuid.NewString(), LeaseDuration: time.Minute,
+			ReceiptProvider: "feishu_message_patch", ReceiptTarget: "om-race",
 		})
 		acquired <- acquireOutcome{op: op, err: err}
 	}()
@@ -378,6 +383,7 @@ func TestTaskCreationAcquire_ExpiresDurablyAtDatabaseClock(t *testing.T) {
 	acquire := types.AcquireTaskCreationOperationParams{
 		ID: params.ID, TenantID: f.tenantID, UserID: f.userID,
 		LeaseOwner: "expiry-" + uuid.NewString(), LeaseDuration: time.Minute,
+		ReceiptProvider: "feishu_message_patch", ReceiptTarget: "om-expiry",
 	}
 	lostStore := storeWithCommitResponseLost(st)
 	if _, err := lostStore.AcquireTaskCreationOperation(ctx, acquire); !errors.Is(err, types.ErrDatabase) {
@@ -395,6 +401,7 @@ func TestTaskCreationAcquire_ExpiresDurablyAtDatabaseClock(t *testing.T) {
 		op.LeaseUntil != nil || op.TakeoverNotBefore != nil {
 		t.Fatalf("expiry 未耐久线性化: %+v", op)
 	}
+	assertTaskCreationReceiptExactlyOne(t, st, params.ID)
 }
 
 func TestTaskCreationRecoveryTenantEnumeration_OnlyTrulyStale(t *testing.T) {
@@ -469,6 +476,7 @@ func TestTaskCreationRecoveryTenantEnumeration_OnlyTrulyStale(t *testing.T) {
 	if _, err := st.AcquireTaskCreationOperation(ctx, types.AcquireTaskCreationOperationParams{
 		ID: stale.ID, TenantID: f.tenantID, UserID: f.userID,
 		LeaseOwner: "suspended-recovery-" + uuid.NewString(), LeaseDuration: time.Minute,
+		ReceiptProvider: stale.ReceiptProvider, ReceiptTarget: stale.ReceiptTarget,
 	}); err != nil {
 		t.Fatalf("suspended tenant 的 recovery takeover 必须可收敛: %v", err)
 	}
@@ -1119,6 +1127,7 @@ func TestTaskCreationCleanup_FencedAtomicAndReplayable(t *testing.T) {
 		ctx, p.Lease, p.Definition.TaskID, types.PendingActionStatusBlocked); err != nil {
 		t.Fatalf("cleanup exact replay: %v", err)
 	}
+	assertTaskCreationReceiptExactlyOne(t, st, p.Lease.ID)
 	for _, table := range []string{"schedules", "schedule_playbooks", "schedule_sources"} {
 		column := "id"
 		if table != "schedules" {
@@ -1423,6 +1432,7 @@ func TestBlockTaskCreationOperationAfterSideEffect_QuarantinesWithoutDeletion(t 
 			t.Fatalf("quarantine 不得删除证据: status=%s phase=%s schedules=%d",
 				status, phase, scheduleCount)
 		}
+		assertTaskCreationReceiptExactlyOne(t, st, p.Lease.ID)
 		assertScheduleVisibility(t, st, f.userID, p.Definition.TaskID, false)
 	})
 
@@ -1614,6 +1624,7 @@ func createAndAcquireA5Operation(
 	op, err := st.AcquireTaskCreationOperation(t.Context(), types.AcquireTaskCreationOperationParams{
 		ID: created.ID, TenantID: f.tenantID, UserID: f.userID,
 		LeaseOwner: owner + "-" + uuid.NewString(), LeaseDuration: 10 * time.Minute,
+		ReceiptProvider: "feishu_message_patch", ReceiptTarget: "om-a5-" + created.ID,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1734,6 +1745,8 @@ func cleanupA5Fixture(t *testing.T, st *Store, f *compiledTaskFixture) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM task_creation_receipts WHERE tenant_id = $1`, f.tenantID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM pending_actions WHERE tenant_id = $1`, f.tenantID)
 	})

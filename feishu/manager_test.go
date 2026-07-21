@@ -2,13 +2,16 @@ package feishu
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 
+	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
 
@@ -145,6 +148,7 @@ func TestManagerShutdownRetainsSenderForDownstreamDrain(t *testing.T) {
 	want := lark.NewClient("test-app", "test-secret")
 	m.mu.Lock()
 	m.apiClient = want
+	m.apiAppID = "test-app"
 	m.mu.Unlock()
 
 	if err := m.Shutdown(t.Context()); err != nil {
@@ -152,5 +156,68 @@ func TestManagerShutdownRetainsSenderForDownstreamDrain(t *testing.T) {
 	}
 	if got := m.api(); got != want {
 		t.Fatal("Manager 排空后必须保留发送客户端，供 feedback/worker 后续 drain")
+	}
+	m.mu.Lock()
+	gotAppID := m.apiAppID
+	m.mu.Unlock()
+	if gotAppID != "test-app" {
+		t.Fatalf("Manager 排空后发送身份=%q, want test-app", gotAppID)
+	}
+}
+
+func TestManagerReloadDisabledRevokesOutboundClient(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("DATABASE_URL 未设置，跳过飞书权限撤销真库测试")
+	}
+	ctx := t.Context()
+	if err := store.Migrate(ctx, dbURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.New(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, st)
+	old, oldErr := st.GetSetting(ctx, settingKeyFeishu)
+	if oldErr != nil && !errors.Is(oldErr, types.ErrNotFound) {
+		t.Fatal(oldErr)
+	}
+	cleanupCtx, cancelCleanup := cleanupContext()
+	t.Cleanup(cancelCleanup)
+	t.Cleanup(func() {
+		if oldErr == nil {
+			cleanupExec(cleanupCtx, t, dbURL, `
+				INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now())
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+				settingKeyFeishu, old)
+			return
+		}
+		cleanupExec(cleanupCtx, t, dbURL, `DELETE FROM settings WHERE key = $1`, settingKeyFeishu)
+	})
+	raw, err := json.Marshal(feishuSetting{
+		AppID: "test-app", AppSecret: "revoked-secret", Enabled: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutSetting(ctx, settingKeyFeishu, raw); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewManager(st, nil, nil)
+	m.mu.Lock()
+	m.baseCtx = context.Background()
+	m.apiClient = lark.NewClient("old-app", "old-secret")
+	m.apiAppID = "old-app"
+	m.mu.Unlock()
+	if err := m.reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	client, appID := m.apiClient, m.apiAppID
+	m.mu.Unlock()
+	if client != nil || appID != "" {
+		t.Fatalf("disabled reconfigure retained outbound authority: client=%v app_id=%q", client != nil, appID)
 	}
 }

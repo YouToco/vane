@@ -32,7 +32,7 @@ func TestMigration028RefusesStatefulDowngrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("初始化 goose provider 失败: %v", err)
 	}
-	if _, err := provider.Up(ctx); err != nil {
+	if _, err := provider.UpTo(ctx, 28); err != nil {
 		t.Fatalf("迁移到 028 失败: %v", err)
 	}
 

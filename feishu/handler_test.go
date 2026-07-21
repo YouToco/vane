@@ -2,6 +2,8 @@ package feishu
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/task"
 )
 
 // confirmValue 构造一个合法确认按钮的回调 value（契约 §9 形态）。
@@ -29,6 +32,7 @@ func cardEvent(operatorOpenID string, value map[string]interface{}) *callback.Ca
 		Event: &callback.CardActionTriggerRequest{
 			Operator: &callback.Operator{OpenID: operatorOpenID},
 			Action:   &callback.CallBackAction{Value: value},
+			Context:  &callback.Context{OpenMessageID: "om_confirmation_card"},
 		},
 	}
 }
@@ -316,6 +320,43 @@ type fakeRunner struct {
 	external []bool
 }
 
+type fakeDurableRunner struct {
+	*fakeRunner
+	mu       sync.Mutex
+	outcome  agent.CardActionOutcome
+	err      error
+	panicNow bool
+	calls    int
+	userID   int64
+	actionID string
+	target   task.CreationReceiptTarget
+}
+
+func (f *fakeDurableRunner) ExecuteActionWithReceipt(
+	_ context.Context,
+	userID int64,
+	actionID string,
+	target task.CreationReceiptTarget,
+) (agent.CardActionOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.userID, f.actionID, f.target = userID, actionID, target
+	if f.panicNow {
+		panic("injected durable action panic")
+	}
+	return f.outcome, f.err
+}
+
+func (f *fakeDurableRunner) CancelActionWithReceipt(
+	ctx context.Context,
+	userID int64,
+	actionID string,
+	target task.CreationReceiptTarget,
+) (agent.CardActionOutcome, error) {
+	return f.ExecuteActionWithReceipt(ctx, userID, actionID, target)
+}
+
 func (f *fakeRunner) HandleMessage(_ context.Context, _ int64, text string) (agent.Outcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -498,6 +539,141 @@ func TestHandleMessageRouting(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOnCardAction_DurableReceiptBindsOriginalMessageBeforeAccepting(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("未设置 DATABASE_URL，跳过 durable card action 集成测试")
+	}
+	ctx := t.Context()
+	if err := store.Migrate(ctx, dbURL); err != nil {
+		t.Fatalf("Migrate() 执行失败: %v", err)
+	}
+	st, err := store.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("store.New() 建池失败: %v", err)
+	}
+	registerStoreClose(t, st)
+	owner := "ou_test_durable_action_" + uuid.NewString()
+	cleanupTestUser(t, dbURL, owner)
+
+	newSubject := func() (*handler, *fakeDurableRunner) {
+		const appID = "cli_durable_handler_test"
+		m := NewManager(st, nil, nil)
+		m.setOwner(owner, "测试")
+		runner := &fakeDurableRunner{
+			fakeRunner: &fakeRunner{},
+			outcome: agent.CardActionOutcome{
+				Text:           "任务创建已受理，最终结果会更新在这张卡片上。",
+				DurableReceipt: true,
+			},
+		}
+		m.SetAgent(runner)
+		return newHandlerForApp(m, context.Background(), appID), runner
+	}
+
+	t.Run("exact open message id is forwarded and callback does not overwrite card", func(t *testing.T) {
+		h, runner := newSubject()
+		ev := cardEvent(owner, confirmValue())
+		ev.Event.Context.OpenMessageID = "om_exact_confirmation"
+		resp, err := h.onCardAction(context.Background(), ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp == nil || resp.Toast == nil ||
+			resp.Toast.Content != "任务创建已受理，最终结果会更新在这张卡片上。" ||
+			resp.Card == nil || resp.Card.Type != "raw" {
+			t.Fatalf("new durable click must install a retryable processing card: %+v", resp)
+		}
+		var card struct {
+			Config struct {
+				UpdateMulti bool `json:"update_multi"`
+			} `json:"config"`
+		}
+		raw, ok := resp.Card.Data.(json.RawMessage)
+		if !ok {
+			t.Fatalf("processing card data type=%T, want json.RawMessage", resp.Card.Data)
+		}
+		if err := json.Unmarshal(raw, &card); err != nil || !card.Config.UpdateMulti {
+			t.Fatalf("processing card is not Patch-capable: card=%s err=%v", raw, err)
+		}
+		runner.mu.Lock()
+		defer runner.mu.Unlock()
+		if runner.calls != 1 || runner.actionID != "act-1" || runner.userID <= 0 ||
+			runner.target.Provider != task.FeishuCardPatchReceiptProviderForApp("cli_durable_handler_test") ||
+			runner.target.Target != "om_exact_confirmation" {
+			t.Fatalf("durable target drifted: calls=%d user=%d action=%q target=%+v",
+				runner.calls, runner.userID, runner.actionID, runner.target)
+		}
+	})
+
+	t.Run("terminal callback replay never overwrites the final card", func(t *testing.T) {
+		h, runner := newSubject()
+		runner.outcome.PreserveCard = true
+		resp, err := h.onCardAction(context.Background(), cardEvent(owner, confirmValue()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertToast(t, resp, runner.outcome.Text)
+	})
+
+	t.Run("missing open message id fails before agent mutation", func(t *testing.T) {
+		h, runner := newSubject()
+		ev := cardEvent(owner, confirmValue())
+		ev.Event.Context = nil
+		resp, err := h.onCardAction(context.Background(), ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertToast(t, resp, "确认卡身份缺失，请在原卡片上重试")
+		runner.mu.Lock()
+		defer runner.mu.Unlock()
+		if runner.calls != 0 {
+			t.Fatalf("agent called without a durable target: %d", runner.calls)
+		}
+	})
+
+	t.Run("missing app identity fails before agent mutation", func(t *testing.T) {
+		h, runner := newSubject()
+		h.appID = ""
+		resp, err := h.onCardAction(context.Background(), cardEvent(owner, confirmValue()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertToast(t, resp, "确认卡通道身份缺失，请在重新连接后重试")
+		runner.mu.Lock()
+		defer runner.mu.Unlock()
+		if runner.calls != 0 {
+			t.Fatalf("agent called without app-bound receipt provider: %d", runner.calls)
+		}
+	})
+
+	t.Run("pre-accept failure leaves original card retryable", func(t *testing.T) {
+		h, runner := newSubject()
+		runner.outcome = agent.CardActionOutcome{PreserveCard: true}
+		runner.err = errors.New("database unavailable")
+		resp, err := h.onCardAction(context.Background(), cardEvent(owner, confirmValue()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp == nil || resp.Toast == nil || resp.Toast.Type != "error" || resp.Card != nil {
+			t.Fatalf("pre-accept failure must preserve original card: %+v", resp)
+		}
+	})
+
+	t.Run("durable runner panic leaves original card retryable", func(t *testing.T) {
+		h, runner := newSubject()
+		runner.panicNow = true
+		resp, err := h.onCardAction(context.Background(), cardEvent(owner, confirmValue()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp == nil || resp.Toast == nil || resp.Toast.Type != "error" ||
+			resp.Toast.Content != "内部错误，请稍后重试。" || resp.Card != nil {
+			t.Fatalf("durable panic must preserve the original card: %+v", resp)
+		}
+	})
 }
 
 // TestOnCardActionMissingEvent 验证事件结构缺失时的兜底 toast（不 panic）。

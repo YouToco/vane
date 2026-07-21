@@ -53,6 +53,8 @@ var wantTables = []string{
 	"tenant_quota",
 	// 027 probewatch 告警指纹落盘（M5 契约 §16 修订，探针实现债 P2）
 	"probewatch_state",
+	// 029 create_schedule v1 耐久用户回执 outbox（A6）
+	"task_creation_receipts",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的

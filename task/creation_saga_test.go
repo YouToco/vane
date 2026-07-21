@@ -15,6 +15,11 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+var testCreationReceiptTarget = CreationReceiptTarget{
+	Provider: FeishuCardPatchReceiptProviderForApp("cli_task_test"),
+	Target:   "om_task_creation_test",
+}
+
 type creationSagaFakeStore struct {
 	creationPrepareFakeStore
 	tenant types.Tenant
@@ -84,21 +89,33 @@ func (s *creationSagaFakeStore) CreateTaskCreationOperation(
 
 func (s *creationSagaFakeStore) CancelTaskCreationOperation(
 	_ context.Context,
-	id string,
-	tenantID int64,
-	userID int64,
+	p types.CancelTaskCreationOperationParams,
 ) (*types.TaskCreationOperation, error) {
-	if s.op.ID != id || s.op.TenantID != tenantID || s.op.UserID != userID ||
+	if s.op.ID != p.ID || s.op.TenantID != p.TenantID || s.op.UserID != p.UserID ||
 		s.op.ExecutionVersion != types.TaskCreationExecutionVersionV1 {
 		return nil, types.ErrNotFound
+	}
+	if s.op.ReceiptProvider != "" &&
+		(s.op.ReceiptProvider != p.ReceiptProvider || s.op.ReceiptTarget != p.ReceiptTarget) {
+		return nil, types.ErrConflict
 	}
 	switch s.op.Status {
 	case types.PendingActionStatusCancelled:
 		clone := s.op
 		return &clone, nil
 	case types.PendingActionStatusExecuting:
-		return nil, types.ErrTaskCreationBusy
+		if s.op.ReceiptProvider == "" && s.op.ReceiptTarget == "" {
+			s.op.ReceiptProvider = p.ReceiptProvider
+			s.op.ReceiptTarget = p.ReceiptTarget
+		} else if s.op.ReceiptProvider != p.ReceiptProvider ||
+			s.op.ReceiptTarget != p.ReceiptTarget {
+			return nil, types.ErrConflict
+		}
+		clone := s.op
+		return &clone, types.ErrTaskCreationBusy
 	case types.PendingActionStatusPending:
+		s.op.ReceiptProvider = p.ReceiptProvider
+		s.op.ReceiptTarget = p.ReceiptTarget
 		s.op.Status = types.PendingActionStatusCancelled
 		s.op.Phase = types.TaskCreationPhaseCancelled
 		now := time.Now()
@@ -124,18 +141,28 @@ func (s *creationSagaFakeStore) AcquireTaskCreationOperation(
 	}
 	switch s.op.Status {
 	case types.PendingActionStatusPending:
+		s.op.ReceiptProvider = p.ReceiptProvider
+		s.op.ReceiptTarget = p.ReceiptTarget
 		s.op.Status = types.PendingActionStatusExecuting
 		s.op.Phase = types.TaskCreationPhaseClaimed
 		s.op.LeaseOwner = p.LeaseOwner
 		s.op.Fence++
 		s.op.Attempt++
 	case types.PendingActionStatusExecuting:
+		if s.op.ReceiptProvider == "" && s.op.ReceiptTarget == "" &&
+			p.ReceiptProvider != "" && p.ReceiptTarget != "" {
+			s.op.ReceiptProvider = p.ReceiptProvider
+			s.op.ReceiptTarget = p.ReceiptTarget
+		} else if s.op.ReceiptProvider != p.ReceiptProvider || s.op.ReceiptTarget != p.ReceiptTarget {
+			return nil, types.ErrConflict
+		}
 		if s.op.LeaseOwner == p.LeaseOwner && s.op.Fence > 0 {
 			clone := s.op
 			return &clone, nil
 		}
 		if !s.allowTakeover {
-			return nil, types.ErrTaskCreationBusy
+			clone := s.op
+			return &clone, types.ErrTaskCreationBusy
 		}
 		s.allowTakeover = false
 		s.op.LeaseOwner = p.LeaseOwner
@@ -522,11 +549,11 @@ func TestCreationCoordinator_ConfirmHappyPathAndTerminalReplay(t *testing.T) {
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-happy")
 
-	result, err := coordinator.Confirm(t.Context(), 11, "action-happy")
+	result, err := coordinator.Confirm(t.Context(), 11, "action-happy", testCreationReceiptTarget)
 	if err != nil {
 		t.Fatalf("Confirm: %v", err)
 	}
-	if result.Status != types.PendingActionStatusExecuted || result.Recovering ||
+	if result.Status != types.PendingActionStatusExecuted || result.Recovering || !result.ReceiptBound ||
 		store.op.Phase != types.TaskCreationPhaseCompleted || schedules.activateCalls != 1 {
 		t.Fatalf("result=%+v phase=%q activate=%d", result, store.op.Phase, schedules.activateCalls)
 	}
@@ -536,9 +563,42 @@ func TestCreationCoordinator_ConfirmHappyPathAndTerminalReplay(t *testing.T) {
 		t.Fatalf("final plan=%s", store.definition.FetchPlan)
 	}
 	events := append([]string(nil), store.events...)
-	replayed, err := coordinator.Confirm(t.Context(), 11, "action-happy")
+	replayed, err := coordinator.Confirm(t.Context(), 11, "action-happy", testCreationReceiptTarget)
 	if err != nil || replayed.TaskID != result.TaskID || !bytes.Equal(mustMarshal(t, events), mustMarshal(t, store.events)) {
 		t.Fatalf("terminal replay=%+v err=%v before=%v after=%v", replayed, err, events, store.events)
+	}
+	differentTarget := testCreationReceiptTarget
+	differentTarget.Target = "om_forwarded_copy"
+	if _, err := coordinator.Confirm(t.Context(), 11, "action-happy", differentTarget); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("terminal replay on a different provider resource must conflict: %v", err)
+	}
+}
+
+func TestCreationCoordinator_BusyLegacyOperationBindsDurableReceipt(t *testing.T) {
+	store := newCreationSagaFakeStore()
+	schedules := &creationSagaFakeScheduler{}
+	coordinator := NewCreationCoordinator(store, schedules, nil)
+	mustProposeCreation(t, coordinator, "action-busy-legacy")
+
+	store.op.Status = types.PendingActionStatusExecuting
+	store.op.Phase = types.TaskCreationPhaseClaimed
+	store.op.LeaseOwner = "pre-a6-worker"
+	store.op.Fence = 1
+	store.op.Attempt = 1
+	leaseUntil := time.Now().Add(time.Minute)
+	store.op.LeaseUntil = &leaseUntil
+
+	result, err := coordinator.Confirm(
+		t.Context(), 11, "action-busy-legacy", testCreationReceiptTarget,
+	)
+	if err != nil || !result.Recovering || !result.ReceiptBound ||
+		result.Status != types.PendingActionStatusExecuting {
+		t.Fatalf("busy result=%+v err=%v", result, err)
+	}
+	if store.op.ReceiptProvider != testCreationReceiptTarget.Provider ||
+		store.op.ReceiptTarget != testCreationReceiptTarget.Target ||
+		len(schedules.events) != 0 {
+		t.Fatalf("op=%+v scheduler_events=%v", store.op, schedules.events)
 	}
 }
 
@@ -550,12 +610,12 @@ func TestCreationCoordinator_ActivationResponseLossAdoptsWithoutSecondWrite(t *t
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-recover")
 
-	first, err := coordinator.Confirm(t.Context(), 11, "action-recover")
+	first, err := coordinator.Confirm(t.Context(), 11, "action-recover", testCreationReceiptTarget)
 	if err != nil || !first.Recovering || store.op.Phase != types.TaskCreationPhaseActivationStarted {
 		t.Fatalf("first=%+v phase=%q err=%v", first, store.op.Phase, err)
 	}
 	store.allowTakeover = true
-	second, err := coordinator.Confirm(t.Context(), 11, "action-recover")
+	second, err := coordinator.Confirm(t.Context(), 11, "action-recover", testCreationReceiptTarget)
 	if err != nil || second.Status != types.PendingActionStatusExecuted || schedules.activateCalls != 1 {
 		t.Fatalf("second=%+v activate_calls=%d err=%v", second, schedules.activateCalls, err)
 	}
@@ -571,7 +631,7 @@ func TestCreationCoordinator_TaskLimitDeletesPausedTaskAndFails(t *testing.T) {
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-limit")
 
-	result, err := coordinator.Confirm(t.Context(), 11, "action-limit")
+	result, err := coordinator.Confirm(t.Context(), 11, "action-limit", testCreationReceiptTarget)
 	if err != nil || result.Status != types.PendingActionStatusFailed ||
 		schedules.deleteCalls != 1 || schedules.activateCalls != 0 {
 		t.Fatalf("result=%+v delete=%d activate=%d err=%v",
@@ -585,7 +645,7 @@ func TestCreationCoordinator_DeterministicEnsureFailureDoesNotLoop(t *testing.T)
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-ensure-conflict")
 
-	result, err := coordinator.Confirm(t.Context(), 11, "action-ensure-conflict")
+	result, err := coordinator.Confirm(t.Context(), 11, "action-ensure-conflict", testCreationReceiptTarget)
 	if err != nil || result.Status != types.PendingActionStatusFailed ||
 		schedules.deleteCalls != 1 || containsString(schedules.events, "activate") {
 		t.Fatalf("result=%+v events=%v delete=%d err=%v",
@@ -601,7 +661,7 @@ func TestCreationCoordinator_CleanupFinalizationConflictQuarantines(t *testing.T
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-cleanup-finalize-conflict")
 
-	result, err := coordinator.Confirm(t.Context(), 11, store.op.ID)
+	result, err := coordinator.Confirm(t.Context(), 11, store.op.ID, testCreationReceiptTarget)
 	if err != nil || result.Status != types.PendingActionStatusBlocked ||
 		store.op.Status != types.PendingActionStatusBlocked ||
 		store.op.ErrorCode != "cleanup_finalization_invalid" || schedules.deleteCalls != 1 {
@@ -618,7 +678,7 @@ func TestCreationCoordinator_CleanupCheckpointConflictQuarantinesWithoutDelete(t
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-cleanup-checkpoint-conflict")
 
-	result, err := coordinator.Confirm(t.Context(), 11, store.op.ID)
+	result, err := coordinator.Confirm(t.Context(), 11, store.op.ID, testCreationReceiptTarget)
 	if err != nil || result.Status != types.PendingActionStatusBlocked ||
 		store.op.Status != types.PendingActionStatusBlocked ||
 		store.op.ErrorCode != "cleanup_checkpoint_invalid" || schedules.deleteCalls != 0 {
@@ -634,7 +694,7 @@ func TestCreationCoordinator_DeleteBlockedQuarantinesCleanup(t *testing.T) {
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-delete-blocked")
 
-	result, err := coordinator.Confirm(t.Context(), 11, store.op.ID)
+	result, err := coordinator.Confirm(t.Context(), 11, store.op.ID, testCreationReceiptTarget)
 	if err != nil || result.Status != types.PendingActionStatusBlocked ||
 		store.op.Status != types.PendingActionStatusBlocked || schedules.deleteCalls != 1 {
 		t.Fatalf("result=%+v op=%+v delete=%d err=%v",
@@ -649,7 +709,7 @@ func TestCreationCoordinator_ActivationCommitValidationDeletesActiveTask(t *test
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-activation-commit")
 
-	result, err := coordinator.Confirm(t.Context(), 11, "action-activation-commit")
+	result, err := coordinator.Confirm(t.Context(), 11, "action-activation-commit", testCreationReceiptTarget)
 	if err != nil || result.Status != types.PendingActionStatusFailed ||
 		schedules.activateCalls != 1 || schedules.deleteCalls != 1 ||
 		schedules.state != scheduler.TaskScheduleStateUnknown {
@@ -665,7 +725,7 @@ func TestCreationCoordinator_CompletionConflictQuarantinesActivatedTask(t *testi
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-complete-conflict")
 
-	result, err := coordinator.Confirm(t.Context(), 11, "action-complete-conflict")
+	result, err := coordinator.Confirm(t.Context(), 11, "action-complete-conflict", testCreationReceiptTarget)
 	if err != nil || result.Status != types.PendingActionStatusBlocked ||
 		schedules.activateCalls != 1 || schedules.deleteCalls != 0 ||
 		store.op.Phase != types.TaskCreationPhaseBlocked {
@@ -679,17 +739,17 @@ func TestCreationCoordinator_CancelV1IsScopedAndLinearized(t *testing.T) {
 	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
 	mustProposeCreation(t, coordinator, "action-cancel")
 
-	result, err := coordinator.Cancel(t.Context(), 11, "action-cancel")
+	result, err := coordinator.Cancel(t.Context(), 11, "action-cancel", testCreationReceiptTarget)
 	if err != nil || result.Status != types.PendingActionStatusCancelled ||
 		store.op.Status != types.PendingActionStatusCancelled ||
 		store.op.Phase != types.TaskCreationPhaseCancelled {
 		t.Fatalf("cancel result=%+v op=%+v err=%v", result, store.op, err)
 	}
-	replayed, err := coordinator.Cancel(t.Context(), 11, "action-cancel")
+	replayed, err := coordinator.Cancel(t.Context(), 11, "action-cancel", testCreationReceiptTarget)
 	if err != nil || replayed.Status != types.PendingActionStatusCancelled || !replayed.Replayed {
 		t.Fatalf("cancel replay=%+v err=%v", replayed, err)
 	}
-	if _, err := coordinator.Cancel(t.Context(), 12, "action-cancel"); !errors.Is(err, ErrCreationOperationNotFound) {
+	if _, err := coordinator.Cancel(t.Context(), 12, "action-cancel", testCreationReceiptTarget); !errors.Is(err, ErrCreationOperationNotFound) {
 		t.Fatalf("foreign user must get exact v1-not-found sentinel, got %v", err)
 	}
 }
@@ -701,13 +761,40 @@ func TestCreationCoordinator_CancelRacingAcquireDoesNotUndoCreation(t *testing.T
 	if _, err := store.AcquireTaskCreationOperation(t.Context(), types.AcquireTaskCreationOperationParams{
 		ID: store.op.ID, TenantID: store.op.TenantID, UserID: store.op.UserID,
 		LeaseOwner: "worker", LeaseDuration: time.Minute,
+		ReceiptProvider: testCreationReceiptTarget.Provider,
+		ReceiptTarget:   testCreationReceiptTarget.Target,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	result, err := coordinator.Cancel(t.Context(), 11, "action-cancel-busy")
+	result, err := coordinator.Cancel(t.Context(), 11, "action-cancel-busy", testCreationReceiptTarget)
 	if err != nil || !result.Recovering || result.Status != types.PendingActionStatusExecuting ||
 		store.op.Status != types.PendingActionStatusExecuting {
 		t.Fatalf("busy cancel result=%+v op=%+v err=%v", result, store.op, err)
+	}
+}
+
+func TestCreationCoordinator_CancelBusyLegacyOperationBindsDurableReceipt(t *testing.T) {
+	store := newCreationSagaFakeStore()
+	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+	mustProposeCreation(t, coordinator, "action-cancel-busy-legacy")
+	store.op.Status = types.PendingActionStatusExecuting
+	store.op.Phase = types.TaskCreationPhaseClaimed
+	store.op.LeaseOwner = "pre-a6-worker"
+	store.op.Fence = 1
+	store.op.Attempt = 1
+	leaseUntil := time.Now().Add(time.Minute)
+	store.op.LeaseUntil = &leaseUntil
+
+	result, err := coordinator.Cancel(
+		t.Context(), 11, "action-cancel-busy-legacy", testCreationReceiptTarget,
+	)
+	if err != nil || !result.Recovering || !result.ReceiptBound ||
+		result.Status != types.PendingActionStatusExecuting {
+		t.Fatalf("busy cancel result=%+v err=%v", result, err)
+	}
+	if store.op.ReceiptProvider != testCreationReceiptTarget.Provider ||
+		store.op.ReceiptTarget != testCreationReceiptTarget.Target {
+		t.Fatalf("busy cancel did not retain receipt target: %+v", store.op)
 	}
 }
 
@@ -748,7 +835,7 @@ func TestCreationCoordinator_AdoptsPreparationTerminalAfterCancelledResponseLoss
 			store.honorLoadContext = true
 			tt.configure(store)
 
-			result, err := coordinator.Confirm(ctx, 11, store.op.ID)
+			result, err := coordinator.Confirm(ctx, 11, store.op.ID, testCreationReceiptTarget)
 			if err != nil || result.Status != tt.wantStatus || store.op.Status != tt.wantStatus {
 				t.Fatalf("result=%+v op=%+v err=%v", result, store.op, err)
 			}
@@ -766,7 +853,7 @@ func TestCreationCoordinator_AdoptsCompletedTerminalAfterCancelledResponseLoss(t
 	store.completeErr = errors.New("commit applied but response lost")
 	store.completeApplyBeforeError = true
 
-	result, err := coordinator.Confirm(ctx, 11, store.op.ID)
+	result, err := coordinator.Confirm(ctx, 11, store.op.ID, testCreationReceiptTarget)
 	if err != nil || result.Status != types.PendingActionStatusExecuted ||
 		store.op.Status != types.PendingActionStatusExecuted {
 		t.Fatalf("result=%+v op=%+v err=%v", result, store.op, err)
@@ -780,6 +867,8 @@ func TestCreationCoordinator_RecoveryAdoptsAcquireResponseLossSamePass(t *testin
 	stale, err := store.AcquireTaskCreationOperation(t.Context(), types.AcquireTaskCreationOperationParams{
 		ID: store.op.ID, TenantID: store.op.TenantID, UserID: store.op.UserID,
 		LeaseOwner: "dead-worker", LeaseDuration: time.Minute,
+		ReceiptProvider: testCreationReceiptTarget.Provider,
+		ReceiptTarget:   testCreationReceiptTarget.Target,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -917,6 +1006,8 @@ func TestCreationCoordinator_LateCheckpointCorruptionCleansOrQuarantines(t *test
 		op, err := store.AcquireTaskCreationOperation(t.Context(), types.AcquireTaskCreationOperationParams{
 			ID: store.op.ID, TenantID: store.op.TenantID, UserID: store.op.UserID,
 			LeaseOwner: "seed", LeaseDuration: time.Minute,
+			ReceiptProvider: testCreationReceiptTarget.Provider,
+			ReceiptTarget:   testCreationReceiptTarget.Target,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -944,6 +1035,8 @@ func TestCreationCoordinator_LateCheckpointCorruptionCleansOrQuarantines(t *test
 		op, err := store.AcquireTaskCreationOperation(t.Context(), types.AcquireTaskCreationOperationParams{
 			ID: store.op.ID, TenantID: store.op.TenantID, UserID: store.op.UserID,
 			LeaseOwner: "seed", LeaseDuration: time.Minute,
+			ReceiptProvider: testCreationReceiptTarget.Provider,
+			ReceiptTarget:   testCreationReceiptTarget.Target,
 		})
 		if err != nil {
 			t.Fatal(err)

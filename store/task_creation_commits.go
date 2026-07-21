@@ -368,7 +368,8 @@ func (s *Store) BlockTaskCreationOperationAfterSideEffect(
 			op.TakeoverNotBefore == nil && markerOK &&
 			marker.TaskIDKnown == (taskID != "") &&
 			(!marker.TaskIDKnown || op.TaskID == taskID) {
-			return nil
+			return verifyTaskCreationReceiptForTerminal(
+				ctx, tx, lease.ID, lease.TenantID, lease.UserID)
 		}
 		return taskCreationConflict("side-effect quarantine tombstone differs")
 	}
@@ -448,6 +449,10 @@ func (s *Store) BlockTaskCreationOperationAfterSideEffect(
 	}
 	if tag.RowsAffected() != 1 {
 		return taskCreationLeaseLost()
+	}
+	if err := insertTaskCreationReceiptForTerminal(
+		ctx, tx, lease.ID, lease.TenantID, lease.UserID); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return taskCreationDatabaseError("commit side-effect quarantine", err)
@@ -613,7 +618,8 @@ func (s *Store) FinishTaskCreationCleanup(
 		if found {
 			return taskCreationConflict("cleanup tombstone retained an aggregate")
 		}
-		return nil
+		return verifyTaskCreationReceiptForTerminal(
+			ctx, tx, lease.ID, lease.TenantID, lease.UserID)
 	}
 	if op.Status != types.PendingActionStatusExecuting ||
 		op.Phase != types.TaskCreationPhaseCleanupPending ||
@@ -673,6 +679,10 @@ func (s *Store) FinishTaskCreationCleanup(
 	}
 	if tag.RowsAffected() != 1 {
 		return taskCreationLeaseLost()
+	}
+	if err := insertTaskCreationReceiptForTerminal(
+		ctx, tx, lease.ID, lease.TenantID, lease.UserID); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return taskCreationDatabaseError("commit cleanup finish", err)

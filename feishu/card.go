@@ -22,7 +22,10 @@ const cardTitle = "见微 Vane"
 func BuildReplyCard(markdown string) string {
 	card := map[string]any{
 		"schema": "2.0",
-		"config": map[string]any{},
+		// A6 的耐久创建回执会通过 Im.Message.Patch 原地兑现最终结果。
+		// 飞书只允许更新显式声明为共享卡片的消息；第一次 Patch 已在服务端
+		// 成功、但响应丢失时，dispatcher 还必须能对同一消息安全重试。
+		"config": map[string]any{"update_multi": true},
 		"header": map[string]any{
 			"title": map[string]any{"tag": "plain_text", "content": cardTitle},
 		},
@@ -78,7 +81,9 @@ func BuildConfirmCard(summary, actionID string) string {
 	}
 	card := map[string]any{
 		"schema": "2.0",
-		"config": map[string]any{},
+		// 确认后最终结果原地更新这张卡，故首发时就必须声明 update_multi。
+		// 该能力不能等到终态卡才补：未声明的原卡根本不可 Patch。
+		"config": map[string]any{"update_multi": true},
 		"header": map[string]any{
 			"title": map[string]any{"tag": "plain_text", "content": cardTitle},
 		},

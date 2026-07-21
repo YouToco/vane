@@ -241,6 +241,7 @@ func TestAgentStore(t *testing.T) {
 		acquired, err := st.AcquireTaskCreationOperation(ctx, types.AcquireTaskCreationOperationParams{
 			ID: id, TenantID: int64(types.SingleTenantID), UserID: u.ID,
 			LeaseOwner: "agent-store-v1", LeaseDuration: time.Minute,
+			ReceiptProvider: "feishu_message_patch", ReceiptTarget: "om-agent-store-" + id,
 		})
 		if err != nil {
 			t.Fatalf("v1 动作应仍可由新领取路径消费: %v", err)

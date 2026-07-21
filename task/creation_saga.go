@@ -59,6 +59,14 @@ type CreationProposal struct {
 	Summary string
 }
 
+// CreationReceiptTarget is the immutable provider resource on which A6 will
+// converge the terminal user receipt. Confirm/Cancel bind it in the same
+// transaction that accepts the click; a different target on replay conflicts.
+type CreationReceiptTarget struct {
+	Provider string
+	Target   string
+}
+
 // CreationResult is safe to render at the callback boundary. Recovering means
 // the operation owns durable checkpoints but did not finish inside this HTTP
 // callback; the background runner will continue it without a second task.
@@ -69,9 +77,14 @@ type CreationResult struct {
 	Status      types.PendingActionStatus
 	Recovering  bool
 	Replayed    bool
-	SessionID   *int64
-	Summary     string
-	Arguments   json.RawMessage
+	// ReceiptBound is true only after the callback's provider resource was
+	// durably accepted with this operation. The Feishu handler may replace the
+	// buttons with a processing card only in this state; legacy A5 tombstones
+	// migrated without a target keep their historical synchronous response.
+	ReceiptBound bool
+	SessionID    *int64
+	Summary      string
+	Arguments    json.RawMessage
 }
 
 // CreationSagaStore is the complete A5 persistence boundary. Keeping it narrow
@@ -84,7 +97,7 @@ type CreationSagaStore interface {
 	GetTenant(ctx context.Context, id int64) (*types.Tenant, error)
 	LoadTaskCreationOperationByUser(ctx context.Context, id string, userID int64) (*types.TaskCreationOperation, error)
 	CreateTaskCreationOperation(ctx context.Context, p types.CreateTaskCreationOperationParams) (*types.TaskCreationOperation, error)
-	CancelTaskCreationOperation(ctx context.Context, id string, tenantID, userID int64) (*types.TaskCreationOperation, error)
+	CancelTaskCreationOperation(ctx context.Context, p types.CancelTaskCreationOperationParams) (*types.TaskCreationOperation, error)
 	AcquireTaskCreationOperation(ctx context.Context, p types.AcquireTaskCreationOperationParams) (*types.TaskCreationOperation, error)
 	CheckpointTaskCreationEnsureReceipt(ctx context.Context, lease types.TaskCreationLease, receipt []byte, taskID string) error
 	CommitPausedCompiledTaskDefinitionForCreation(ctx context.Context, p types.CommitPausedCompiledTaskDefinitionForCreationParams) error
@@ -230,6 +243,7 @@ func (c *CreationCoordinator) Confirm(
 	ctx context.Context,
 	userID int64,
 	actionID string,
+	receiptTarget CreationReceiptTarget,
 ) (CreationResult, error) {
 	if err := ctx.Err(); err != nil {
 		return CreationResult{}, err
@@ -244,6 +258,9 @@ func (c *CreationCoordinator) Confirm(
 		}
 		return CreationResult{}, err
 	}
+	if err := validateCreationReceiptTarget(op, receiptTarget); err != nil {
+		return CreationResult{}, err
+	}
 	tenantID := op.TenantID
 	if result, done, err := creationTerminalResult(op); done || err != nil {
 		result.Replayed = done && err == nil
@@ -254,11 +271,22 @@ func (c *CreationCoordinator) Confirm(
 	op, err = c.acquireCreationOperation(ctx, types.AcquireTaskCreationOperationParams{
 		ID: actionID, TenantID: tenantID, UserID: userID,
 		LeaseOwner: owner, LeaseDuration: creationLeaseDuration,
+		ReceiptProvider: receiptTarget.Provider, ReceiptTarget: receiptTarget.Target,
 	})
 	if err != nil {
 		switch {
 		case errors.Is(err, types.ErrTaskCreationBusy):
-			return attachCreationAudit(recoveringCreationResult(actionID, opTaskID(approved)), approved), nil
+			// Store may have atomically attached the first A6 provider target to
+			// a pre-A6 in-flight operation before reporting its still-live owner.
+			// Prefer that returned row so the callback knows the durable receipt
+			// boundary is now armed; ordinary busy paths may return nil.
+			auditOp := op
+			if auditOp == nil {
+				auditOp = approved
+			}
+			return attachCreationAudit(
+				recoveringCreationResult(actionID, opTaskID(auditOp)), auditOp,
+			), nil
 		case errors.Is(err, types.ErrTaskCreationTerminal):
 			loaded, loadErr := c.loadCreationOperationConvergent(
 				ctx, actionID, tenantID, userID,
@@ -299,6 +327,7 @@ func (c *CreationCoordinator) Cancel(
 	ctx context.Context,
 	userID int64,
 	actionID string,
+	receiptTarget CreationReceiptTarget,
 ) (CreationResult, error) {
 	if err := ctx.Err(); err != nil {
 		return CreationResult{}, err
@@ -313,14 +342,19 @@ func (c *CreationCoordinator) Cancel(
 		}
 		return CreationResult{}, err
 	}
+	if err := validateCreationReceiptTarget(op, receiptTarget); err != nil {
+		return CreationResult{}, err
+	}
 	if result, done, terminalErr := creationTerminalResult(op); done || terminalErr != nil {
 		result.Replayed = done && terminalErr == nil
 		return result, terminalErr
 	}
 
-	cancelled, cancelErr := c.store.CancelTaskCreationOperation(
-		ctx, actionID, op.TenantID, userID,
-	)
+	cancelled, cancelErr := c.store.CancelTaskCreationOperation(ctx,
+		types.CancelTaskCreationOperationParams{
+			ID: actionID, TenantID: op.TenantID, UserID: userID,
+			ReceiptProvider: receiptTarget.Provider, ReceiptTarget: receiptTarget.Target,
+		})
 	if cancelErr == nil {
 		result, done, resultErr := creationTerminalResult(cancelled)
 		if !done && resultErr == nil {
@@ -329,8 +363,12 @@ func (c *CreationCoordinator) Cancel(
 		return result, resultErr
 	}
 	if errors.Is(cancelErr, types.ErrTaskCreationBusy) {
+		auditOp := cancelled
+		if auditOp == nil {
+			auditOp = op
+		}
 		result := attachCreationAudit(
-			recoveringCreationResult(actionID, opTaskID(op)), op,
+			recoveringCreationResult(actionID, opTaskID(auditOp)), auditOp,
 		)
 		result.Message = "任务已经开始创建，无法再取消；系统会自动完成或安全回滚。"
 		return result, nil
@@ -997,6 +1035,7 @@ func (c *CreationCoordinator) recoverOperation(
 	op, err := c.acquireCreationOperation(ctx, types.AcquireTaskCreationOperationParams{
 		ID: stale.ID, TenantID: stale.TenantID, UserID: stale.UserID,
 		LeaseOwner: owner, LeaseDuration: creationLeaseDuration,
+		ReceiptProvider: stale.ReceiptProvider, ReceiptTarget: stale.ReceiptTarget,
 	})
 	if err != nil {
 		if errors.Is(err, types.ErrTaskCreationBusy) ||
@@ -1014,6 +1053,27 @@ func (c *CreationCoordinator) recoverOperation(
 	c.logger.InfoContext(ctx, "task creation recovery converged",
 		"operation_id", stale.ID, "tenant_id", stale.TenantID,
 		"user_id", stale.UserID, "status", result.Status, "task_id", result.TaskID)
+	return nil
+}
+
+func validateCreationReceiptTarget(
+	op *types.TaskCreationOperation,
+	target CreationReceiptTarget,
+) error {
+	if strings.TrimSpace(target.Provider) == "" ||
+		target.Provider != strings.TrimSpace(target.Provider) ||
+		strings.TrimSpace(target.Target) == "" ||
+		target.Target != strings.TrimSpace(target.Target) {
+		return creationValidation("任务回执目标缺失，请重新点击原确认卡。", nil)
+	}
+	if !validFeishuCardPatchReceiptProvider(target.Provider) {
+		return creationValidation("任务回执通道不受支持，请重新点击原确认卡。", nil)
+	}
+	if op != nil && (op.ReceiptProvider != "" || op.ReceiptTarget != "") &&
+		(op.ReceiptProvider != target.Provider || op.ReceiptTarget != target.Target) {
+		return types.NewAppError(types.CodeConflict,
+			"任务确认卡与已接受的回执目标不一致。", nil)
+	}
 	return nil
 }
 
@@ -1362,6 +1422,7 @@ func attachCreationAudit(
 	}
 	result.Summary = op.Summary
 	result.Arguments = bytes.Clone(op.Args)
+	result.ReceiptBound = op.ReceiptProvider != "" && op.ReceiptTarget != ""
 	if op.SessionID != nil {
 		sessionID := *op.SessionID
 		result.SessionID = &sessionID

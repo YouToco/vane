@@ -74,6 +74,20 @@ type AcquireTaskCreationOperationParams struct {
 	UserID        int64
 	LeaseOwner    string
 	LeaseDuration time.Duration
+	// ReceiptProvider/ReceiptTarget are required for a pristine operation. Both
+	// may be empty only while recovering an already-executing pre-A6 row; that
+	// row converges to an audit-only target_unbound receipt unless a later user
+	// click atomically binds the original provider resource during takeover.
+	ReceiptProvider string
+	ReceiptTarget   string
+}
+
+type CancelTaskCreationOperationParams struct {
+	ID              string
+	TenantID        int64
+	UserID          int64
+	ReceiptProvider string
+	ReceiptTarget   string
 }
 
 // CreateTaskCreationOperationParams is the explicit tenant/user boundary for
@@ -135,6 +149,8 @@ type TaskCreationOperation struct {
 	Result             json.RawMessage
 	ErrorCode          string
 	ErrorMessage       string
+	ReceiptProvider    string
+	ReceiptTarget      string
 	UpdatedAt          time.Time
 	TombstonedAt       *time.Time
 }
