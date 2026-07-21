@@ -91,15 +91,23 @@ type scheduleStore interface {
 
 // Scheduler 持有 Temporal client、任务队列名与 store（镜像用）。
 type Scheduler struct {
-	c  client.Client
-	tq string
-	st scheduleStore
+	c                 client.Client
+	tq                string
+	st                scheduleStore
+	taskScheduleGates taskScheduleGateSet
+	taskScheduleEnv   taskScheduleEnvironment
 }
 
 // New 构造 Scheduler。client 由 cmd/server 用 client.Dial 建好后注入；
 // st 传 *store.Store（隐式满足 scheduleStore）。
-func New(c client.Client, taskQueue string, st scheduleStore) *Scheduler {
-	return &Scheduler{c: c, tq: taskQueue, st: st}
+func New(c client.Client, taskQueue string, st scheduleStore, opts ...SchedulerOption) *Scheduler {
+	s := &Scheduler{c: c, tq: taskQueue, st: st}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
 }
 
 // CreatePush 创建一个定时推送调度：校验 spec → 校验活跃上限 → Temporal Create →
