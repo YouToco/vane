@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,51 @@ import (
 
 	"github.com/YouToco/vane/types"
 )
+
+func TestTaskCreationCheckpointBoundsRejectBeforeDatabase(t *testing.T) {
+	var st Store
+	lease := types.TaskCreationLease{
+		ID: "size-limit", TenantID: 1, UserID: 1, LeaseOwner: "test", Fence: 1,
+	}
+	cases := []struct {
+		name string
+		call func() error
+	}{
+		{"normalized command", func() error {
+			return st.SealTaskCreationCommand(
+				t.Context(), lease, make([]byte, maxTaskCreationCommandBytes+1))
+		}},
+		{"compiled definition", func() error {
+			return st.CheckpointTaskCreationDefinition(
+				t.Context(), lease, make([]byte, maxTaskCreationDefinitionBytes+1),
+				strings.Repeat("0", 64))
+		}},
+		{"prepared schedule", func() error {
+			return st.CheckpointTaskCreationSchedule(
+				t.Context(), lease, make([]byte, maxTaskCreationPreparedBytes+1))
+		}},
+		{"ensure receipt", func() error {
+			return st.CheckpointTaskCreationEnsureReceipt(
+				t.Context(), lease, make([]byte, maxTaskCreationReceiptBytes+1), "task")
+		}},
+		{"terminal result", func() error {
+			result := json.RawMessage(`{"x":"` +
+				strings.Repeat("x", maxTaskCreationResultBytes) + `"}`)
+			return st.CompleteTaskCreationOperation(t.Context(), lease, "task", result)
+		}},
+		{"terminal result duplicate key", func() error {
+			return st.CompleteTaskCreationOperation(
+				t.Context(), lease, "task", json.RawMessage(`{"x":1,"x":2}`))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.call(); !errors.Is(err, types.ErrValidation) {
+				t.Fatalf("oversized/ambiguous checkpoint 必须在 DB 前拒绝: %v", err)
+			}
+		})
+	}
+}
 
 // TestTaskCreationOperationStore uses two independent pgx pools against real
 // PostgreSQL. The lease/fence protocol exists specifically for process races;
@@ -44,6 +90,8 @@ func TestTaskCreationOperationStore(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM schedules WHERE user_id IN ($1, $2)`, userID, otherUserID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM pending_actions WHERE user_id IN ($1, $2)`, userID, otherUserID)
 		cleanupExec(cleanupCtx, t, st,
@@ -465,12 +513,21 @@ func TestTaskCreationOperationStore(t *testing.T) {
 			acquireParams(id, userID, "scope-worker")); !errors.Is(err, types.ErrTaskCreationTerminal) {
 			t.Fatalf("已到期 v1 应 Terminal，实际 %v", err)
 		}
-		var status types.PendingActionStatus
-		if err := st.pool.QueryRow(ctx, `SELECT status FROM pending_actions WHERE id=$1`, id).Scan(&status); err != nil {
+		var (
+			status     types.PendingActionStatus
+			phase      types.TaskCreationPhase
+			tombstoned bool
+		)
+		if err := st.pool.QueryRow(ctx,
+			`SELECT status, phase, tombstoned_at IS NOT NULL
+			   FROM pending_actions WHERE id=$1`, id,
+		).Scan(&status, &phase, &tombstoned); err != nil {
 			t.Fatal(err)
 		}
-		if status != types.PendingActionStatusPending {
-			t.Fatalf("拒绝 scope/expiry 不得产生副作用，status=%q", status)
+		if status != types.PendingActionStatusExpired ||
+			phase != types.TaskCreationPhaseExpired || !tombstoned {
+			t.Fatalf("expiry 必须耐久 tombstone，status=%q phase=%q tombstone=%v",
+				status, phase, tombstoned)
 		}
 	})
 
@@ -580,6 +637,13 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := st.pool.Exec(ctx,
+			`INSERT INTO schedules
+			    (id, tenant_id, user_id, spec_json, scope_json, status)
+			 VALUES ('task-prepared', 1, $1, '{}', '{}', 'active')`,
+			userID); err != nil {
+			t.Fatal(err)
+		}
 		if err := st.CompleteTaskCreationOperation(ctx, lease, "task-prepared", result); err != nil {
 			t.Fatal(err)
 		}
@@ -624,13 +688,19 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := st.BlockTaskCreationOperation(ctx, blocked.Lease(), "TRANSLATION_AMBIGUOUS", "manual retry required"); err != nil {
+		if err := st.BlockTaskCreationOperationAfterSideEffect(
+			ctx, blocked.Lease(), "reserved-before-side-effect",
+			"TRANSLATION_AMBIGUOUS", "manual retry required"); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.BlockTaskCreationOperation(ctx, blocked.Lease(), "TRANSLATION_AMBIGUOUS", "manual retry required"); err != nil {
+		if err := st.BlockTaskCreationOperationAfterSideEffect(
+			ctx, blocked.Lease(), "reserved-before-side-effect",
+			"TRANSLATION_AMBIGUOUS", "manual retry required"); err != nil {
 			t.Fatalf("Block 同结果重放应 exact-adopt: %v", err)
 		}
-		if err := st.BlockTaskCreationOperation(ctx, blocked.Lease(), "OTHER", "manual retry required"); !errors.Is(err, types.ErrConflict) {
+		if err := st.BlockTaskCreationOperationAfterSideEffect(
+			ctx, blocked.Lease(), "reserved-before-side-effect",
+			"OTHER", "manual retry required"); !errors.Is(err, types.ErrConflict) {
 			t.Fatalf("Block 异结果应 Conflict，实际 %v", err)
 		}
 		blockedFinal, err := st.LoadTaskCreationOperation(ctx, blockedID, 1, userID)
@@ -647,7 +717,10 @@ func TestTaskCreationOperationStore(t *testing.T) {
 
 		failedID := preparedOperation(t, st, userID, "fail-worker")
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions SET task_id='reserved-before-side-effect' WHERE id=$1`, failedID,
+			`UPDATE pending_actions
+			    SET task_id='reserved-before-side-effect', phase='definition_compiled',
+			        prepared_schedule=NULL
+			  WHERE id=$1`, failedID,
 		); err != nil {
 			t.Fatal(err)
 		}

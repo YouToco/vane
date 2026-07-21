@@ -205,13 +205,23 @@ func (s *Store) CountA2ATasks(ctx context.Context) (int64, error) {
 //
 // 为什么需要：assistant.chat 的执行跑在 SDK 后台 goroutine（不随 HTTP Shutdown 取消），
 // 进程重启/被 SIGKILL 时在飞任务被硬杀，DB 里永久停在 WORKING——轮询终态的对端 agent
-// 永久挂起。启动时调用一次即可清账（此刻进程刚起、无活任务，任何非终态都是上次的遗留）；
-// 只更新 status 提取列不改 task JSONB 的内部 status（GetTask 返回的 task.status 仍是旧值，
-// 但对端主要看不到——它轮询靠的是 List/status 列，且这是止血非精确重放）。
-// olderThan 传一个明显超过单任务预算的阈值（如 15min），避免多实例部署时误杀他机在飞任务。
+// 永久挂起。启动时调用一次即可清账（当前单实例进程刚起、无活任务，任何非终态都是
+// 上次的遗留）。提取列和 JSONB 权威任务必须在同一 UPDATE 里一起变为 FAILED：SDK
+// Get/List 从 JSONB 反序列化，二者漂移会让筛选命中 FAILED 却向对端返回 WORKING。
+// olderThan 仍由调用方决定；单实例启动传当前时刻，多实例部署前须改成 execution owner/generation。
 func (s *Store) FailStaleA2ATasks(ctx context.Context, olderThan time.Time) (int64, error) {
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE a2a_tasks SET status='TASK_STATE_FAILED', version=version+1, updated_at=now()
+		`UPDATE a2a_tasks
+		 SET status='TASK_STATE_FAILED',
+		     task=jsonb_set(
+		       task,
+		       '{status}',
+		       (CASE WHEN jsonb_typeof(task->'status')='object' THEN task->'status' ELSE '{}'::jsonb END)
+		         || jsonb_build_object('state','TASK_STATE_FAILED','timestamp',now()),
+		       true
+		     ),
+		     version=version+1,
+		     updated_at=now()
 		 WHERE status IN ('TASK_STATE_SUBMITTED','TASK_STATE_WORKING') AND updated_at < $1`,
 		olderThan)
 	if err != nil {

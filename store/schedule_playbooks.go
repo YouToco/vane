@@ -25,8 +25,9 @@ func (s *Store) UpsertSchedulePlaybook(ctx context.Context, userID int64, schedu
 	tag, err := s.pool.Exec(ctx,
 		`INSERT INTO schedule_playbooks (schedule_id, content, updated_at)
 		 SELECT $1, $2, now()
-		   FROM schedules
-		  WHERE id = $1 AND user_id = $3
+		   FROM schedules s
+		  WHERE s.id = $1 AND s.user_id = $3
+		    AND `+matureSchedulePredicate+`
 		 ON CONFLICT (schedule_id)
 		 DO UPDATE SET content = EXCLUDED.content, updated_at = now()`,
 		scheduleID, content, userID)
@@ -55,7 +56,8 @@ func (s *Store) SetFetchPlan(ctx context.Context, userID int64, scheduleID strin
 		`UPDATE schedule_playbooks p
 		    SET fetch_plan = $3, updated_at = now()
 		   FROM schedules s
-		  WHERE p.schedule_id = $1 AND s.id = $1 AND s.user_id = $2`,
+		  WHERE p.schedule_id = $1 AND s.id = $1 AND s.user_id = $2
+		    AND `+matureSchedulePredicate,
 		scheduleID, userID, []byte(plan))
 	if err != nil {
 		return false, types.NewAppError(types.CodeDatabase,
@@ -73,7 +75,8 @@ func (s *Store) GetSchedulePlaybook(ctx context.Context, userID int64, scheduleI
 		`SELECT p.schedule_id, p.content, p.fetch_plan, p.updated_at
 		   FROM schedule_playbooks p
 		   JOIN schedules s ON s.id = p.schedule_id
-		  WHERE p.schedule_id = $1 AND s.user_id = $2`,
+		  WHERE p.schedule_id = $1 AND s.user_id = $2
+		    AND `+matureSchedulePredicate,
 		scheduleID, userID).Scan(&pb.ScheduleID, &pb.Content, &pb.FetchPlan, &pb.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

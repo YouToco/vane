@@ -25,13 +25,25 @@ const defaultTopN = 5
 // 铁律：只放稳定标识符（UserID+ScheduleID+Scope），绝不放候选内容 / batch_id——每次触发时
 // 由 Fetch Activity 在"触发时刻"现查订阅源，否则定时任务会反复推送陈旧内容。
 //
+// RunKind 显式区分定时与即时执行。不能再用 ScheduleID=="" 推断即时执行：存量
+// Temporal Schedule 的冻结 Action 在 reconcile 前同样可能缺 ScheduleID，把它当即时
+// 执行会绕过 A5 激活门并产生付费/推送副作用。未知零值一律 fail-closed；历史 workflow
+// replay 由 workflow.go 的 GetVersion 分支兼容。
+type PushRunKind string
+
+const (
+	PushRunKindScheduled PushRunKind = "scheduled"
+	PushRunKindAdHoc     PushRunKind = "ad_hoc"
+)
+
 // ScheduleID 是触发本次推送的定时任务 id（任务手册 P1b）：定时触发时由 scheduler 填入其
-// schedule id，据此让"按任务的源抓/挑/投"成为可能（b3 消费）。**push_now / 即时触发为空串**
-// ——无归属任务，退化为用户级语义（向后兼容，决策 #4「老任务暂保持现状」）。
+// schedule id，据此让"按任务的源抓/挑/投"成为可能（b3 消费）。push_now / 即时触发为空串，
+// 但其身份由 RunKind=ad_hoc 明确声明，而不是从空串猜测。
 type PushParams struct {
-	UserID     int64     `json:"user_id"`
-	ScheduleID string    `json:"schedule_id,omitempty"` // 空=即时/老任务触发，用户级语义
-	Scope      PushScope `json:"scope"`
+	UserID     int64       `json:"user_id"`
+	RunKind    PushRunKind `json:"run_kind,omitempty"`
+	ScheduleID string      `json:"schedule_id,omitempty"`
+	Scope      PushScope   `json:"scope"`
 	// NLDesc 触发本次推送的调度的自然语言描述（聚合卡 header 的任务名）。
 	// 存量调度的 Temporal Action 里没有本字段，解出零值空串——聚合卡落兜底标题，
 	// 行为安全；新建调度由 scheduler.CreatePush 填入。

@@ -26,7 +26,7 @@ func newTestServer(t *testing.T, content *fakeContent) (*httptest.Server, *fakeT
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	if err := Mount(mux, Deps{
+	if _, err := Mount(mux, Deps{
 		Storage: storage,
 		Content: content,
 		Token:   testToken,

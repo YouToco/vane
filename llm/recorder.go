@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -12,13 +13,29 @@ import (
 // 单独成类型而不是让 Client 直接持有 store：调用与记账解耦，
 // 单测 Client 时不需要数据库。
 type Recorder struct {
-	st *store.Store
+	st recorderStore
+}
+
+type recorderStore interface {
+	InsertLLMCall(context.Context, *types.LLMCall) (int64, error)
+	TryConsumeForUser(context.Context, int64, store.QuotaBucket, float64) error
+	AdjustForUser(context.Context, int64, store.QuotaBucket, float64) error
 }
 
 // NewRecorder 构造记账器。
 func NewRecorder(st *store.Store) *Recorder {
+	// Do not box a typed nil *store.Store into recorderStore: a non-nil
+	// interface would bypass every nil guard and panic on the first call.
+	if st == nil {
+		return &Recorder{}
+	}
 	return &Recorder{st: st}
 }
+
+// postCallAccountingTimeout bounds the detached durability tail after an LLM
+// request. The caller context may already be canceled, but bare WithoutCancel
+// would let a database stall keep a Temporal Activity alive past worker stop.
+const postCallAccountingTimeout = 10 * time.Second
 
 // Record 同步写库。写失败只记日志、绝不向调用方返回错误：
 // 记账是旁路可观测性，记账故障不能放大成业务调用失败
@@ -115,4 +132,18 @@ func (r *Recorder) ReconcileQuota(ctx context.Context, userID *int64, estimate f
 		slog.Warn("llm: 配额对账失败（调用已完成，不影响结果）",
 			"user_id", *userID, "estimate", estimate, "actual", actualTokens, "err", err)
 	}
+}
+
+// finishCallAccounting records the call and reconciles quota under one bounded
+// context detached from the already-finished request. Sharing one deadline
+// prevents two sequential 10s tails while preserving failure/cancel accounting.
+func (r *Recorder) finishCallAccounting(ctx context.Context, call *types.LLMCall, userID *int64, estimate float64, actualTokens int) {
+	r.finishCallAccountingWithin(ctx, call, userID, estimate, actualTokens, postCallAccountingTimeout)
+}
+
+func (r *Recorder) finishCallAccountingWithin(ctx context.Context, call *types.LLMCall, userID *int64, estimate float64, actualTokens int, timeout time.Duration) {
+	tailCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	r.Record(tailCtx, call)
+	r.ReconcileQuota(tailCtx, userID, estimate, actualTokens)
 }

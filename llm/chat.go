@@ -391,9 +391,8 @@ func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Ch
 		call.CostUSD = CostUSD(resp.Model, hitTokens, missTokens, resp.CompletionTokens)
 	}
 
-	// 失败路径的 ctx 往往已经超时/取消，记账用 WithoutCancel 剥离取消信号
-	// （与 Do 相同：否则"失败也要记账"必然落空）。
-	rec.Record(context.WithoutCancel(ctx), call)
-	rec.ReconcileQuota(context.WithoutCancel(ctx), meta.UserID, estimate, call.PromptTokens+call.CompletionTokens)
+	// 与 Do 共用一个有硬上限的 detached tail：既不能因请求取消漏记，
+	// 也不能让同步 DB 写无限拖住 Activity/进程关停。
+	rec.finishCallAccounting(ctx, call, meta.UserID, estimate, call.PromptTokens+call.CompletionTokens)
 	return resp, err
 }

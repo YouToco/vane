@@ -2,8 +2,11 @@ package feedback
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"net/http"
 
@@ -737,5 +740,136 @@ func TestHandleDeepDive_InsertFailureDropsSend(t *testing.T) {
 	}
 	if rows := deepDiveRows(h); len(rows) != 0 {
 		t.Fatalf("落库失败自然无行, 实得 %+v", rows)
+	}
+}
+
+// ============================================================
+// A5 生命周期：停止准入 + 排空已接纳的后台工作
+// ============================================================
+
+func TestServiceShutdown_WaitsForAcceptedDeepDiveAndRejectsNew(t *testing.T) {
+	h := newHarness(t)
+
+	// 让 LLM 和落库都已完成，只把最后的 ReplyMarkdown 卡住。如果
+	// WaitGroup 只包住模型调用而没有包住送达，Shutdown 会错误地早退。
+	sendGate := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseSend := func() { releaseOnce.Do(func() { close(sendGate) }) }
+	t.Cleanup(releaseSend)
+	h.sender.setGate(sendGate)
+
+	res := h.click(t, types.FeedbackActionDeepDive)
+	if res.Toast != "深度解读生成中，结果将回复在这条推送下" {
+		t.Fatalf("首次点击未被受理: %q", res.Toast)
+	}
+	waitFor(t, "深度解读已进入 ReplyMarkdown", func() bool { return h.sender.count() == 1 })
+	if rows := deepDiveRows(h); len(rows) != 1 {
+		t.Fatalf("进入送达前应已完成 LLM 与落库, 实得 %+v", rows)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- h.svc.Shutdown(shutdownCtx) }()
+	waitFor(t, "Shutdown 已停止 deep_dive 准入", func() bool {
+		h.svc.deepDiveMu.Lock()
+		defer h.svc.deepDiveMu.Unlock()
+		return !h.svc.deepDiveAccepting
+	})
+
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("ReplyMarkdown 仍在途时 Shutdown 不得早退: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	rejected := h.click(t, types.FeedbackActionDeepDive)
+	if rejected.Toast != "服务正在关停，请稍后重试" || rejected.ToastOK {
+		t.Fatalf("关停后新深挖应被拒绝, 实得 %+v", rejected)
+	}
+	if got := h.llm.callCount(); got != 1 {
+		t.Fatalf("被拒绝的新点击不得增加 LLM 调用, 实得 %d", got)
+	}
+
+	releaseSend()
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("排空已接纳深挖失败: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("放行 ReplyMarkdown 后 Shutdown 仍未返回")
+	}
+	waitInflightReleased(t, h.svc, testDeliveryID)
+}
+
+func TestServiceShutdown_DeadlineOrCancellationBoundsInflightDeepDive(t *testing.T) {
+	tests := []struct {
+		name    string
+		makeCtx func() (context.Context, context.CancelFunc)
+		wantErr error
+	}{
+		{
+			name: "deadline",
+			makeCtx: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 40*time.Millisecond)
+			},
+			wantErr: context.DeadlineExceeded,
+		},
+		{
+			name: "explicit cancellation",
+			makeCtx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+			wantErr: context.Canceled,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			_ = gateLLM(t, h) // 上游只会因 Service 生命周期取消而退出。
+			h.click(t, types.FeedbackActionDeepDive)
+			waitFor(t, "深度解读已进入 LLM", func() bool { return h.llm.callCount() == 1 })
+
+			ctx, cancel := tt.makeCtx()
+			defer cancel()
+			started := time.Now()
+			err := h.svc.Shutdown(ctx)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Shutdown() error = %v, 期望 %v", err, tt.wantErr)
+			}
+			if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+				t.Fatalf("Shutdown 未受 ctx 有界控制, 耗时 %v", elapsed)
+			}
+
+			waitFor(t, "LLM HTTP 请求已收到关停取消", func() bool {
+				return h.llm.canceledCount() == 1
+			})
+			waitInflightReleased(t, h.svc, testDeliveryID)
+
+			// 强制取消后工作已真正退出；第二次 Shutdown 可观察地已排空。
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), time.Second)
+			defer drainCancel()
+			if err := h.svc.Shutdown(drainCtx); err != nil {
+				t.Fatalf("取消后的二次排空失败: %v", err)
+			}
+		})
+	}
+}
+
+func TestServiceShutdown_BackgroundPanicReleasesAdmission(t *testing.T) {
+	h := newHarness(t)
+	h.st.hookInsertDeepDive = func() { panic("test deep-dive panic") }
+
+	h.click(t, types.FeedbackActionDeepDive)
+	waitInflightReleased(t, h.svc, testDeliveryID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := h.svc.Shutdown(ctx); err != nil {
+		t.Fatalf("后台 panic 不得泄漏 admission/WaitGroup: %v", err)
 	}
 }

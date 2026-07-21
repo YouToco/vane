@@ -103,7 +103,7 @@ func TestInvariant_EveryUpstreamEntryIsGuarded(t *testing.T) {
 			gateAt := firstCallPos(fn.Body, "CheckQuota")
 			upAt := firstCallPos(fn.Body, e.upstream)
 			estAt := firstCallPos(fn.Body, e.estimator)
-			recAt := firstCallPos(fn.Body, "ReconcileQuota")
+			recAt := firstCallPos(fn.Body, "finishCallAccounting")
 
 			if !gateAt.IsValid() {
 				t.Fatalf("%s 没有调用 CheckQuota —— 这条路径不受配额约束。用途：%s", e.fn, e.why)
@@ -120,7 +120,7 @@ func TestInvariant_EveryUpstreamEntryIsGuarded(t *testing.T) {
 					"而象征性的小额预扣正是第一版超发 4.9 倍的成因", e.fn, e.estimator)
 			}
 			if !recAt.IsValid() || recAt < upAt {
-				t.Errorf("%s 必须在调用后 ReconcileQuota 对账实际用量。"+
+				t.Errorf("%s 必须在调用后 finishCallAccounting 记账并对账实际用量。"+
 					"只预扣估算而不对账，桶里记的永远是猜测值", e.fn)
 			}
 		})

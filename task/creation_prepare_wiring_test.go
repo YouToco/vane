@@ -7,49 +7,56 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 )
 
-// TestTaskCreationSaga_HasZeroProductionCallPoints keeps A4 parked safely.
-// The providers and protocol types may exist, but no API, agent, worker, or
-// startup path may construct or call them until A5 supplies the cross-system
-// recovery loop. Identifier references count too, so method values and DI
-// wiring cannot bypass the guard merely by avoiding a direct CallExpr.
-func TestTaskCreationSaga_HasZeroProductionCallPoints(t *testing.T) {
+// TestTaskCreationSaga_LowLevelLifecycleIsControllerPrivate replaces A4's
+// zero-call-point parking guard. A5 intentionally has one production caller,
+// but Agent/API/startup may depend only on CreationCoordinator; no package may
+// stitch lease, checkpoint, Temporal, or aggregate steps into a second saga.
+func TestTaskCreationSaga_LowLevelLifecycleIsControllerPrivate(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
-		t.Fatal("runtime.Caller could not locate the A4 wiring guard")
+		t.Fatal("runtime.Caller could not locate the A5 wiring guard")
 	}
 	taskDir := filepath.Dir(thisFile)
 	repoRoot := filepath.Dir(taskDir)
 	allowedProviders := map[string]struct{}{
-		filepath.Clean(filepath.Join(taskDir, "creation_prepare.go")):                   {},
-		filepath.Clean(filepath.Join(repoRoot, "store", "task_creation_operations.go")): {},
-		filepath.Clean(filepath.Join(repoRoot, "types", "task_creation.go")):            {},
+		filepath.Clean(filepath.Join(taskDir, "creation_prepare.go")):                    {},
+		filepath.Clean(filepath.Join(taskDir, "creation_saga.go")):                       {},
+		filepath.Clean(filepath.Join(repoRoot, "store", "task_creation_operations.go")):  {},
+		filepath.Clean(filepath.Join(repoRoot, "store", "task_creation_commits.go")):     {},
+		filepath.Clean(filepath.Join(repoRoot, "store", "compiled_task_definitions.go")): {},
+		filepath.Clean(filepath.Join(repoRoot, "store", "schedules.go")):                 {},
+		filepath.Clean(filepath.Join(repoRoot, "types", "task_creation.go")):             {},
 	}
 	watched := map[string]struct{}{
-		"TaskCreationExecutionVersionV1":      {},
-		"CreationPreparer":                    {},
-		"NewCreationPreparer":                 {},
-		"AcquireTaskCreationOperation":        {},
-		"RenewTaskCreationLease":              {},
-		"SealTaskCreationCommand":             {},
-		"BeginTaskCreationTranslation":        {},
-		"CheckpointTaskCreationDefinition":    {},
-		"CheckpointTaskCreationSchedule":      {},
-		"CheckpointTaskCreationEnsureReceipt": {},
-		"BlockTaskCreationOperation":          {},
-		"FailTaskCreationOperation":           {},
-		"CompleteTaskCreationOperation":       {},
-		"ListStaleTaskCreationOperations":     {},
+		"CreateTaskCreationOperation":                   {},
+		"AcquireTaskCreationOperation":                  {},
+		"RenewTaskCreationLease":                        {},
+		"SealTaskCreationCommand":                       {},
+		"BeginTaskCreationTranslation":                  {},
+		"CheckpointTaskCreationDefinition":              {},
+		"CheckpointTaskCreationSchedule":                {},
+		"CheckpointTaskCreationEnsureReceipt":           {},
+		"BlockTaskCreationOperation":                    {},
+		"FailTaskCreationOperation":                     {},
+		"CompleteTaskCreationOperation":                 {},
+		"CommitPausedCompiledTaskDefinitionForCreation": {},
+		"BeginTaskCreationActivation":                   {},
+		"CommitTaskCreationActivation":                  {},
+		"BeginTaskCreationCleanup":                      {},
+		"FinishTaskCreationCleanup":                     {},
+		"BlockTaskCreationOperationAfterSideEffect":     {},
+		"ListStaleTaskCreationTenantIDs":                {},
+		"ListStaleTaskCreationOperations":               {},
 	}
 
 	fset := token.NewFileSet()
 	var references []string
-	v1SQL := regexp.MustCompile(`(?i)execution_version\s*=\s*1`)
+	var controllerWiring []string
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -67,9 +74,6 @@ func TestTaskCreationSaga_HasZeroProductionCallPoints(t *testing.T) {
 		source, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return readErr
-		}
-		if v1SQL.Match(source) {
-			references = append(references, path+":literal execution_version=1")
 		}
 		file, parseErr := parser.ParseFile(fset, path, source, 0)
 		if parseErr != nil {
@@ -96,14 +100,26 @@ func TestTaskCreationSaga_HasZeroProductionCallPoints(t *testing.T) {
 				references = append(references,
 					fmt.Sprintf("%s:%d:%s", position.Filename, position.Line, identifier.Name))
 			}
+			if identifier.Name == "NewCreationCoordinator" {
+				position := fset.Position(identifier.Pos())
+				controllerWiring = append(controllerWiring,
+					fmt.Sprintf("%s:%d", position.Filename, position.Line))
+			}
 			return true
 		})
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("scan A4 production call points: %v", err)
+		t.Fatalf("scan A5 production call points: %v", err)
 	}
 	if len(references) != 0 {
-		t.Fatalf("A4 must retain zero production call points until A5; found %v", references)
+		t.Fatalf("A5 low-level creation lifecycle escaped CreationCoordinator: %v", references)
+	}
+	mainFile := filepath.Clean(filepath.Join(repoRoot, "cmd", "server", "main.go"))
+	if len(controllerWiring) != 1 || !strings.HasPrefix(
+		filepath.Clean(controllerWiring[0]), mainFile+":",
+	) {
+		t.Fatalf("A5 must have exactly one production coordinator wiring in cmd/server/main.go: %v",
+			controllerWiring)
 	}
 }

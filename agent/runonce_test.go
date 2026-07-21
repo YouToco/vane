@@ -116,7 +116,8 @@ func TestRunOnce_未注册写工具自纠(t *testing.T) {
 }
 
 // TestRunOnce_写工具装配防御 万一实例被错误装配进写工具（正常装配不可达）：
-// Confirm 出口转为错误——外部 agent 点不了飞书确认卡，挂起即任务悬空。
+// 必须在写 pending/v1 proposal 前报错——外部 agent 没有确认卡通道，先落库再拒绝
+// 会制造无人能处理的悬空动作。
 func TestRunOnce_写工具装配防御(t *testing.T) {
 	fs := newFakeStore()
 	tool := &fakeTool{name: "add_source", mutating: true}
@@ -134,6 +135,10 @@ func TestRunOnce_写工具装配防御(t *testing.T) {
 	_, _, err := l.RunOnce(context.Background(), 7, nil, "加个信源")
 	if err == nil || !strings.Contains(err.Error(), "只读") {
 		t.Fatalf("写工具装配必须报错（含'只读'），实得 %v", err)
+	}
+	if len(fs.actions) != 0 || len(tool.calls) != 0 {
+		t.Fatalf("只读防御必须发生在任何写副作用前: actions=%d execute=%d",
+			len(fs.actions), len(tool.calls))
 	}
 }
 

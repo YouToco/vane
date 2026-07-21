@@ -1185,7 +1185,8 @@ func ValidatePreparedTaskScheduleRequest(
 		return errors.New("prepared schedule timing differs from the request")
 	}
 	params := prepared.Action.Params
-	if params.UserID != req.UserID || params.ScheduleID != taskID ||
+	if params.UserID != req.UserID || params.RunKind != workflow.PushRunKindScheduled ||
+		params.ScheduleID != taskID ||
 		params.NLDesc != strings.TrimSpace(req.NLDescription) ||
 		params.Scope.TopN != req.Scope.TopN ||
 		!slices.Equal(params.Scope.SourceIDs, req.Scope.SourceIDs) {
@@ -1280,7 +1281,8 @@ func validatePreparedTaskSchedule(prepared PreparedTaskSchedule) error {
 		return errors.New("task_id does not match its tenant, user, operation, and ID scheme")
 	}
 	params := prepared.Action.Params
-	if params.UserID != prepared.UserID || params.ScheduleID != prepared.TaskID {
+	if params.UserID != prepared.UserID || params.RunKind != workflow.PushRunKindScheduled ||
+		params.ScheduleID != prepared.TaskID {
 		return errors.New("workflow params do not match the prepared owner and task ID")
 	}
 	if params.Scope.TopN < 0 {
@@ -1859,7 +1861,8 @@ func verifyTaskScheduleProtoAction(
 	if err := actionDC.FromPayload(inputs[0], &got); err != nil {
 		return taskScheduleFingerprint{}, fmt.Errorf("decode workflow args: %w", err)
 	}
-	if got.UserID != expected.params.UserID || got.ScheduleID != expected.params.ScheduleID ||
+	if got.UserID != expected.params.UserID || got.RunKind != expected.params.RunKind ||
+		got.ScheduleID != expected.params.ScheduleID ||
 		got.NLDesc != expected.params.NLDesc || got.Scope.TopN != expected.params.Scope.TopN ||
 		!slices.Equal(got.Scope.SourceIDs, expected.params.Scope.SourceIDs) {
 		return taskScheduleFingerprint{}, errors.New("workflow args do not match request")

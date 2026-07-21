@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -117,8 +118,9 @@ func run() error {
 		feishu.BuildReplyCard,
 		feishu.BuildAggregateCard, feishu.AggHeaderForTask)
 
-	// worker：非阻塞 Start，关停时 Stop()（见下方顺序关停）。
-	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, worker.Options{})
+	// worker：非阻塞 Start，关停时 Stop()（见下方顺序关停）。显式 stop timeout
+	// 保证 Stop 不会采用 SDK 的 0 秒默认值、在 Activity 仍收尾时就释放 DB/Temporal。
+	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, temporalWorkerOptions())
 	w.RegisterWorkflow(workflow.PushPipelineWorkflow)
 	// 逐个注册（非整体 Register）：漏注册不会启动失败，而是每批推送在该活动上
 	// 重试到超时——EvolveProfile 的错误被 workflow 刻意吞掉，漏注册只会表现为
@@ -131,6 +133,7 @@ func run() error {
 	// 现已由 workflow/registration_test.go 钉死：它反射 *Activities 的全部
 	// Activity 方法并逐字比对本清单，漏一个 CI 就红。**新增 Activity 时改这里即可，
 	// 那个测试会告诉你漏没漏。**
+	w.RegisterActivity(activities.AuthorizeRun)
 	w.RegisterActivity(activities.EvolveProfile)
 	w.RegisterActivity(activities.Fetch)
 	w.RegisterActivity(activities.Dedup)
@@ -147,17 +150,40 @@ func run() error {
 	}
 
 	// scheduler 是唯一直接碰 SDK client 的调度封装（供 API 建/删/触发调度）。
-	sched := scheduler.New(temporalClient, cfg.Temporal.TaskQueue, st)
+	sched := scheduler.New(temporalClient, cfg.Temporal.TaskQueue, st,
+		scheduler.WithTaskScheduleNamespace(cfg.Temporal.Namespace))
+	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
+	var maintenanceWG sync.WaitGroup
+	runMaintenance := func(fn func()) {
+		maintenanceWG.Add(1)
+		go func() {
+			defer maintenanceWG.Done()
+			fn()
+		}()
+	}
+	waitMaintenance := func(ctx context.Context) error {
+		done := make(chan struct{})
+		go func() {
+			maintenanceWG.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 
 	// 存量调度 Action reconcile（任务手册 P1b 收尾）：给 b1 之前建的老调度补上 schedule_id，
 	// 使已编译手册的任务真正走 b3 隔离（详见 scheduler.ReconcileActions）。后台跑、不阻塞
 	// 启动——reconcile 是幂等自愈维护，单条失败已在内部 slog，不该因 Temporal 抖动而拒绝
 	// 服务就绪；worker 已在上方 Start，此刻 Temporal 连通性已确立。
-	go func() {
+	runMaintenance(func() {
 		if err := sched.ReconcileActions(ctx); err != nil {
 			slog.Error("scheduler: 存量调度 Action reconcile 整体失败（不影响启动）", "err", err)
 		}
-	}()
+	})
 
 	// 配额 reconcile（契约 §2.7）：给缺配额行的租户补齐默认额度。同样后台跑、幂等。
 	//
@@ -167,7 +193,7 @@ func run() error {
 	//   · 迁移漏回填——025 第一版就漏了存量租户，配合"缺行即拒绝"上线即锁死推送，
 	//     而下游把额度用尽当正常终态，Temporal 一片绿、零告警。
 	// 缺行的后果是"这个租户什么都用不了"，它不该靠谁记得手工补。
-	go func() {
+	runMaintenance(func() {
 		n, err := st.ReconcileTenantQuota(ctx)
 		if err != nil {
 			slog.Error("配额 reconcile 整体失败（不影响启动）", "err", err)
@@ -176,7 +202,7 @@ func run() error {
 		if n > 0 {
 			slog.Info("配额 reconcile 完成", "seeded_tenants", n)
 		}
-	}()
+	})
 
 	// agent loop（M4 契约 §9 装配序：store → llm → scheduler → tools → agent.New →
 	// manager 注入）：push_now 工具依赖 scheduler（TriggerPushNow 即 PushTrigger 窄接口），
@@ -204,24 +230,22 @@ func run() error {
 		exaTools = agent.NewExaTools(fetch.Exa(), fetch.ExaContents(), st,
 			cfg.Agent.ExaMsgCap, cfg.Agent.ExaDailyCap)
 	}
-	taskSvc := task.New(task.Deps{
-		Schedules:  sched,
-		Playbooks:  st,
-		Compiler:   agent.NewTaskPlaybookCompiler(st, playbookTr),
-		Strictness: st,
-	})
-	tools := agent.BuildTools(st, sched, taskSvc, sched, playbookTr, endpoints, fetch, exaTools)
+	// Legacy v0 create_schedule cards are deliberately drained without execution
+	// in Loop.ExecuteAction. Passing no legacy creator makes the old active-first
+	// CreatePush path unreachable even if that guard regresses.
+	tools := agent.BuildTools(st, sched, nil, sched, playbookTr, endpoints, fetch, exaTools)
 	agentLoop := agent.New(agent.Deps{
-		Client:     llmClient,
-		Recorder:   recorder,
-		Store:      st,
-		Profiles:   st,
-		Tools:      tools,
-		Model:      cfg.LLM.AgentModel,
-		MaxTurns:   cfg.Agent.MaxTurns,
-		SessionTTL: time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
-		Endpoints:  endpoints,
-		ToolCalls:  agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
+		Client:       llmClient,
+		Recorder:     recorder,
+		Store:        st,
+		Profiles:     st,
+		Tools:        tools,
+		Model:        cfg.LLM.AgentModel,
+		MaxTurns:     cfg.Agent.MaxTurns,
+		SessionTTL:   time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
+		Endpoints:    endpoints,
+		ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
+		TaskCreation: creationCoordinator,
 	})
 	manager.SetAgent(agentLoop)
 
@@ -241,8 +265,54 @@ func run() error {
 	})
 	manager.SetFeedback(fbSvc)
 
+	// A5 创建恢复器在飞书 WS/HTTP 接收新确认之前启动。首次扫描与周期扫描都
+	// 在后台执行，不阻塞 readyz；关停时必须先等它退出，再释放 Temporal/DB。
+	creationRecoveryCtx, cancelCreationRecovery := context.WithCancel(ctx)
+	creationRecoveryDone := make(chan struct{})
+	go func() {
+		defer close(creationRecoveryDone)
+		creationCoordinator.RunRecovery(creationRecoveryCtx)
+	}()
+	stopCreationRecovery := func() error {
+		cancelCreationRecovery()
+		select {
+		case <-creationRecoveryDone:
+			return nil
+		case <-time.After(30 * time.Second):
+			return errors.New("task creation recovery 关停超时")
+		}
+	}
+
 	// 依赖就绪后再拉飞书 WS 连接：无配置静默待命，ctx 取消时断开。
 	manager.Start(ctx)
+
+	// Stop ingress first, then drain every nested background layer before the
+	// resources they use. A6 will make user receipts durable across process
+	// death; these waits only guarantee safe in-process shutdown.
+	drainIngress := func() error {
+		var drainErrs []error
+		managerCtx, cancelManager := context.WithTimeout(context.Background(), 50*time.Second)
+		managerErr := manager.Shutdown(managerCtx)
+		cancelManager()
+		if managerErr != nil {
+			drainErrs = append(drainErrs, fmt.Errorf("排空飞书回调: %w", managerErr))
+		}
+
+		feedbackCtx, cancelFeedback := context.WithTimeout(context.Background(), feedbackShutdownTimeout)
+		feedbackErr := fbSvc.Shutdown(feedbackCtx)
+		cancelFeedback()
+		if feedbackErr != nil {
+			drainErrs = append(drainErrs, fmt.Errorf("排空反馈后台任务: %w", feedbackErr))
+		}
+
+		sessionCtx, cancelSessions := context.WithTimeout(context.Background(), 10*time.Second)
+		sessionErr := agentLoop.DrainSessionWrites(sessionCtx)
+		cancelSessions()
+		if sessionErr != nil {
+			drainErrs = append(drainErrs, fmt.Errorf("排空 Agent 会话回写: %w", sessionErr))
+		}
+		return errors.Join(drainErrs...)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
@@ -265,13 +335,18 @@ func run() error {
 
 	// A2A server（a2a-contract §7）：enabled=false 时不 Mount——/a2a 与
 	// agent-card 路径在 mux 上根本不存在（404），零新增暴露面。
+	var a2aRuntime *a2a.Runtime
 	if cfg.A2A.Enabled {
 		// 启动时清理上次进程遗留的滞留任务（对抗审查 A-1）：assistant.chat 跑在 SDK
 		// 后台 goroutine，重启硬杀会让在飞任务永久停在 WORKING，轮询终态的对端挂死。
-		// 此刻无活任务，把超过 15min（远超单任务 120s 预算）的非终态置 FAILED。
+		// 此刻本进程尚未接流量，因此数据库里所有非终态任务都属于上个进程，
+		// 无论只遗留 1 秒还是 15 分钟都已没有执行者，必须立即置 FAILED。
 		// 失败只记日志不拒启动：清账是尽力而为，不该拖垮服务拉起。
-		if n, err := st.FailStaleA2ATasks(ctx, time.Now().Add(-15*time.Minute)); err != nil {
-			slog.Warn("a2a: 清理滞留任务失败（不阻塞启动）", "err", err)
+		cleanupCtx, cancelCleanup := context.WithTimeout(ctx, a2aStartupCleanupTimeout)
+		n, cleanupErr := st.FailStaleA2ATasks(cleanupCtx, time.Now())
+		cancelCleanup()
+		if cleanupErr != nil {
+			slog.Warn("a2a: 清理滞留任务失败（不阻塞启动）", "err", cleanupErr)
 		} else if n > 0 {
 			slog.Info("a2a: 已清理上次进程遗留的滞留任务", "count", n)
 		}
@@ -297,7 +372,7 @@ func run() error {
 			SystemPrompt: a2a.ChatSystemPrompt,
 			ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
 		})
-		if err := a2a.Mount(mux, a2a.Deps{
+		a2aRuntime, err = a2a.Mount(mux, a2a.Deps{
 			Storage:   st,
 			Content:   st,
 			Chat:      a2aLoop,
@@ -305,7 +380,23 @@ func run() error {
 			Token:     cfg.A2A.Token,
 			BaseURL:   cfg.A2A.BaseURL,
 			Version:   vaneVersion,
-		}); err != nil {
+		})
+		if err != nil {
+			stop()
+			drainErr := drainIngress()
+			recoveryErr := stopCreationRecovery()
+			maintenanceCtx, cancelMaintenance := context.WithTimeout(context.Background(), 30*time.Second)
+			maintenanceErr := waitMaintenance(maintenanceCtx)
+			cancelMaintenance()
+			if drainErr != nil || recoveryErr != nil || maintenanceErr != nil {
+				// An admitted callback may still own DB/Temporal work. Do not close
+				// those resources underneath it; returning exits the process.
+				return errors.Join(fmt.Errorf("挂载 A2A server: %w", err),
+					drainErr, recoveryErr, maintenanceErr)
+			}
+			w.Stop()
+			temporalClient.Close()
+			st.Close()
 			return fmt.Errorf("挂载 A2A server: %w", err)
 		}
 	}
@@ -323,7 +414,7 @@ func run() error {
 	// idx_user_sessions_expires 索引，而那个任务从未接线——DeleteExpiredSessions
 	// 全树只有测试在调，生产里过期行永不回收）。
 	// 用最朴素的 ticker：清理是幂等的纯删除，不值得为它引入 Temporal workflow。
-	go runSessionCleanup(ctx, st)
+	runMaintenance(func() { runSessionCleanup(ctx, st) })
 
 	// gate 探针每日巡检（2026-07-19 Boss 拍板做进服务内）：每天 01:30 UTC（北京 09:30，
 	// 窗口覆盖 00:30 UTC 早报批次）+ 每次启动后 3 分钟各跑一轮 probe.Run，红灯或探针
@@ -332,7 +423,9 @@ func run() error {
 	// push 复用推送管道的 Pusher 出口，principals 与 gate CLI 同走 owner 回退解析。
 	// st 传两次：第一份是 probe.Store（读指标），第二份是 fingerprintStore（告警
 	// 指纹落盘，migration 027）——两个独立职责窄接口，生产实现恰好都是 *store.Store。
-	go newProbeWatcher(st, st, principals, manager, push, feishu.BuildReplyCard).run(ctx)
+	runMaintenance(func() {
+		newProbeWatcher(st, st, principals, manager, push, feishu.BuildReplyCard).run(ctx)
+	})
 
 	serveErr := make(chan error, 1)
 	go func() {
@@ -342,38 +435,83 @@ func run() error {
 		}
 	}()
 
+	var serveFailure error
 	select {
 	case <-ctx.Done():
 		slog.Info("收到关停信号，开始优雅关停")
 	case err := <-serveErr:
-		// 先取消 ctx 让飞书 Manager 断开 WS、停止使用连接池，再按依赖逆序拆栈。
+		serveFailure = err
+		// 统一进入下方逆序拆栈，不在错误分支绕过 Manager/Agent drain。
 		stop()
-		w.Stop()
-		temporalClient.Close()
-		st.Close()
-		return fmt.Errorf("HTTP 服务异常退出: %w", err)
 	}
 
-	// 顺序关停（契约 B10）：HTTP Shutdown → worker.Stop() → Temporal client.Close()
-	// → 飞书 Manager（随顶层 ctx 取消自行断 WS）→ DB 连接池。
-	// 逆装配序拆栈：先停对外入口，再停后台执行器，最后放连接类资源。
-	// 1) HTTP Shutdown（5s 预算）停止接新请求、等在途请求完成；
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Warn("HTTP 关停超时，放弃等待在途请求", "err", err)
+	// 顺序关停（契约 B10）：HTTP 关准入 → 独立入口并行排空 → 创建恢复器/
+	// 维护任务 → worker → Temporal client → DB。任一排空没有得到肯定结果，
+	// 都不得主动释放共享依赖。
+	var shutdownErrs []error
+	// Shutdown closes listeners before waiting. Run it concurrently so a valid
+	// 120s synchronous A2A handler can be canceled/drained by its runtime rather
+	// than turning the initial 5s wait into a latched shutdown failure.
+	httpShutdown := beginHTTPShutdown(srv, httpInitialShutdownTimeout)
+
+	// A2A SDK 会把 ReturnImmediately/CancelTask 执行脱离 HTTP request context。
+	// Runtime 在 HTTP 关准入后独立关闸并排空；与飞书/反馈并行，避免把 120s
+	// chat 预算串加到总关停时长。Cleaner 返回前 task-store 终态写仍未完成。
+	var a2aDrain <-chan error
+	if a2aRuntime != nil {
+		done := make(chan error, 1)
+		a2aDrain = done
+		go func() {
+			a2aCtx, cancelA2A := context.WithTimeout(context.Background(), a2aShutdownTimeout)
+			defer cancelA2A()
+			done <- a2aRuntime.Shutdown(a2aCtx)
+		}()
 	}
-	// 2) 停 worker：阻塞等待在跑的 activity 收尾，之后不再拉新任务；
-	w.Stop()
-	// 3) 关 Temporal 客户端：worker 已停，scheduler 不再被调用，可安全释放连接；
-	temporalClient.Close()
-	// 4) 关 DB 连接池——此时已无正在执行的 DB 操作。
-	// 注意：pgxpool.Close 会阻塞等待借出连接归还——所有走 DB 的 handler
-	// 必须自带请求级超时（readyz 是 2s），否则关停可能挂住。
-	st.Close()
+
+	if err := drainIngress(); err != nil {
+		shutdownErrs = append(shutdownErrs, err)
+	}
+	if a2aDrain != nil {
+		if err := <-a2aDrain; err != nil {
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("排空 A2A 后台执行: %w", err))
+		}
+	}
+	// 停创建恢复器：不再发 Temporal/DB 请求，等在途 operation 收束或超时。
+	if err := stopCreationRecovery(); err != nil {
+		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空创建恢复器: %w", err))
+	}
+	// 等所有进程级维护任务退出；它们也共享 DB/Temporal/飞书发送端。
+	maintenanceCtx, cancelMaintenance := context.WithTimeout(context.Background(), 30*time.Second)
+	maintenanceErr := waitMaintenance(maintenanceCtx)
+	cancelMaintenance()
+	if maintenanceErr != nil {
+		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空维护任务: %w", maintenanceErr))
+	}
+	if err := completeHTTPShutdown(srv, httpShutdown, httpDrainProofTimeout); err != nil {
+		shutdownErrs = append(shutdownErrs, fmt.Errorf("停止 HTTP 接入: %w", err))
+	}
+
+	drainErr := errors.Join(shutdownErrs...)
+	if err := releaseAfterSafeDrain(drainErr, func() {
+		// WorkerStopTimeout 让 Stop 等在跑 Activity 收尾；之后才释放 Temporal/DB。
+		w.Stop()
+		temporalClient.Close()
+		// pgxpool.Close 会等借出连接归还；到这里所有入口、SDK detached work、
+		// recovery、maintenance 与 Activity 都已确认退出。
+		st.Close()
+	}); err != nil {
+		unsafeErr := fmt.Errorf("优雅关停未能安全排空，共享依赖保持打开: %w", err)
+		if serveFailure != nil {
+			return errors.Join(fmt.Errorf("HTTP 服务异常退出: %w", serveFailure), unsafeErr)
+		}
+		return unsafeErr
+	}
 
 	// 信号与 ListenAndServe 失败同时发生时 select 可能选中信号分支，
 	// 这里补捞一次真实的服务错误，避免启动失败被伪装成正常关停（退出码 0）。
+	if serveFailure != nil {
+		return fmt.Errorf("HTTP 服务异常退出: %w", serveFailure)
+	}
 	select {
 	case err := <-serveErr:
 		return fmt.Errorf("HTTP 服务异常退出: %w", err)

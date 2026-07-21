@@ -113,6 +113,10 @@ type FeishuManager interface {
 // Store 是 Activity 需要的数据访问子集（规格 B3 的相关方法）。
 // 收窄成接口而非直接依赖 *store.Store：便于 Activity 单测注入替身。
 type Store interface {
+	// AuthorizeScheduledRun is the fail-closed activation mirror gate. A newly
+	// unpaused Temporal schedule must not spend money or push until the exact
+	// DB task is active, mature, and still belongs to an active tenant/member.
+	AuthorizeScheduledRun(ctx context.Context, scheduleID string, userID int64) (bool, error)
 	// ListDueSourcesByUser 只返回 next_fetch_at <= now() 的到期源（审查 #重复计费）：
 	// markFetchResult 成功后推进 next_fetch_at，Activity 超时重试时已抓成功的
 	// Exa/TikHub 付费调用自然被跳过，不重复计费。
@@ -332,6 +336,27 @@ func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error {
 	return retryableOrNot(a.evolver.Evolve(ctx, in.UserID, in.TraceID))
 }
 
+// AuthorizeRun is the first Activity in every pipeline. Scheduled runs fail
+// closed until Postgres confirms the exact task is active. Ad-hoc runs must be
+// explicitly labelled: an empty ScheduleID is also the frozen shape of a
+// legacy schedule before reconcile and must never silently bypass this gate.
+func (a *Activities) AuthorizeRun(ctx context.Context, p PushParams) (bool, error) {
+	if p.UserID <= 0 {
+		return false, nil
+	}
+	switch p.RunKind {
+	case PushRunKindAdHoc:
+		return p.ScheduleID == "", nil
+	case PushRunKindScheduled:
+		if p.ScheduleID == "" {
+			return false, nil
+		}
+		return a.store.AuthorizeScheduledRun(ctx, p.ScheduleID, p.UserID)
+	default:
+		return false, nil
+	}
+}
+
 // Fetch 现查用户的 active 订阅源，逐源抓取入库并推进各源抓取状态，最后返回
 // 该用户"未投递候选"（带条数上限）。TraceID 由 workflow 生成后经后续 Activity
 // 入参下传，Fetch 本身无 LLM 调用故不需要。
@@ -403,6 +428,11 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	var alertable []fetchFailure // 本轮"恰好"连续失败达告警阈值的源，循环后批量告警一次（功能 5.2）。
 	var disabled []fetchFailure  // 本轮达停用阈值、刚被自动停用的源，循环后单发一张停用卡（功能 5.2）。
 	for _, src := range sources {
+		// Fetcher 应尊重 ctx，但单个 provider 可能只在自己的网络超时后才返回。
+		// 一旦 Activity 已取消，绝不能继续启动后续按次计费的源调用。
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		items, ferr := a.fetcher.Fetch(ctx, src)
 		if ferr != nil {
 			// 单源失败不拖垮整批：某个源挂了不该让当次推送整体失败；

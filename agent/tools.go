@@ -75,7 +75,8 @@ type playbookStore interface {
 // 模型编造的其余工具名一律拒绝。
 // endpoints 为 nil（TikHub key 未配置）时不装配 search_endpoints，工具面与
 // 该特性上线前完全一致。
-// tasks 是根级任务控制面：create_schedule 只委托它，不再自行编排调度与聚合写入。
+// tasks 仅保留给历史测试夹具。生产传 nil：遗留 v0 create_schedule 卡由 Loop
+// 安全消费并要求用户重发，不再冒险走 active-first 补偿路径。
 // tr 是 edit_task_playbook 使用的翻译器（P1 编译层）：编辑手册后据此把正文编译成
 // fetch_plan。允许为 nil（未装配 LLM 的路径/测试）——此时手册仍可存取，只是不编译计划。
 // prober 是试跑=准入入口（*fetcher.Multi，生产直接传 multi；1.5 起统一分派绑定能力
@@ -652,10 +653,38 @@ const createScheduleSchema = `{
         "tz": {"type": "string", "description": "可选：IANA 时区名，缺省 Asia/Shanghai"}
       }
     },
+    "intent": {"type": "string", "minLength": 1, "description": "用户已经确认的持续监控目标与筛选范围。必须完整、自包含；它会成为任务手册，确认后不得由系统自行扩大主题或范围。"},
+    "approved_fetch_plan": {
+      "type": "object",
+      "description": "待用户确认的完整长期抓取计划。只能放已经通过只读发现得到、且属于注册能力的材料化信源；确认后系统会逐字采用，不会再让模型换源。",
+      "properties": {
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "description": "至少一个长期信源；每项必须给出可执行的 platform/capability/url/config。",
+          "items": {
+            "type": "object",
+            "properties": {
+              "platform": {"type": "string", "minLength": 1, "description": "注册平台名，如 web"},
+              "capability": {"type": "string", "minLength": 1, "description": "注册的只读能力名，如 feed、contents 或 search"},
+              "title": {"type": "string", "description": "可选的人类可读信源名"},
+              "url": {"type": "string", "minLength": 1, "description": "材料化后的 canonical http(s) 或 vane:// URL，不得含凭证"},
+              "config": {"type": "object", "description": "与 platform/capability/url 精确对应的完整能力参数"}
+            },
+            "required": ["platform", "capability", "url", "config"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["sources"],
+      "additionalProperties": false
+    },
     "nl_description": {"type": "string", "description": "可选：该任务的自然语言描述（如\"每天早上 8 点推送\"），用于列表展示"},
     "strictness": {"type": "string", "enum": ["loose", "normal", "strict"], "description": "可选：推送门槛档位，从用户对相关度的要求推断——「只要非常相关的/重大更新才推」→ strict（仅 ≥60 分高相关才推）；「一般相关就行」→ normal（≥40 分）；「都推来看看/宽松点」→ loose（只过滤与画像无关的内容）。用户没表态就不传（按系统兜底，等价 loose）"}
   },
-  "required": ["spec"]
+  "required": ["spec", "intent", "approved_fetch_plan"],
+  "additionalProperties": false
 }`
 
 // createScheduleArgs 与工具 schema 对应；spec 结构与 api 的 scheduleSpecDTO 一致。
@@ -666,8 +695,22 @@ type createScheduleArgs struct {
 		AnchorAt     string `json:"anchor_at"`
 		TZ           string `json:"tz"`
 	} `json:"spec"`
-	NLDescription string `json:"nl_description"`
-	Strictness    string `json:"strictness"`
+	Intent            string          `json:"intent"`
+	ApprovedFetchPlan json.RawMessage `json:"approved_fetch_plan"`
+	NLDescription     string          `json:"nl_description"`
+	Strictness        string          `json:"strictness"`
+}
+
+type approvedFetchPlanSummary struct {
+	Sources []approvedFetchSourceSummary `json:"sources"`
+}
+
+type approvedFetchSourceSummary struct {
+	Platform   string          `json:"platform"`
+	Capability string          `json:"capability"`
+	Title      string          `json:"title"`
+	URL        string          `json:"url"`
+	Config     json.RawMessage `json:"config"`
 }
 
 // strictnessStore 收窄门槛档位的写依赖（*store.Store 已实现）：create_schedule
@@ -676,8 +719,7 @@ type strictnessStore interface {
 	SetScheduleStrictness(ctx context.Context, scheduleID string, userID int64, v types.PushStrictness) error
 }
 
-// taskCreator 是 create_schedule 消费的任务控制面接缝。Agent 只负责把模型参数翻译成
-// 已校验的 CreateInput；调度创建及其 best-effort 聚合步骤由根级 task.Service 编排。
+// taskCreator 是历史 v0 create_schedule 行为刻画的兼容接缝；生产不再装配。
 type taskCreator interface {
 	Create(ctx context.Context, input task.CreateInput) (task.CreateResult, error)
 }
@@ -688,16 +730,19 @@ type createScheduleTool struct {
 
 func (t *createScheduleTool) Name() string { return "create_schedule" }
 func (t *createScheduleTool) Description() string {
-	return "创建定时推送任务。触发频率用 cron（5 段，分钟字段须为整数）或 every_seconds（固定间隔秒数，不低于 3600）二选一，频率不得高于每小时一次。"
+	return "创建定时推送任务。必须同时提交用户批准的监控意图与完整长期抓取计划；确认后系统逐字采用该计划，不会再自动换源。触发频率用 cron 或 every_seconds 二选一，频率不得高于每小时一次。"
 }
 func (t *createScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(createScheduleSchema)
 }
 func (t *createScheduleTool) Mutating() bool { return true }
 
-// Execute scope 固定为零值（该用户全部 active 订阅）：契约 §8 的工具参数只有
-// spec 与 nl_description，按源筛选的定向推送不在 agent 工具面。
+// Execute 只服务历史 v0 卡片，保留其原有 best-effort 语义。新 v1 动作在 Loop 中
+// 进入 durable controller，绝不会调用这里或在确认后重新选择长期信源。
 func (t *createScheduleTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
+	if t.tasks == nil {
+		return "这张旧版任务确认已失效，请重新描述需求以生成完整任务。", nil
+	}
 	var a createScheduleArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "参数不是合法 JSON，请修正后重试", nil
@@ -777,6 +822,30 @@ func (t *createScheduleTool) Summarize(args json.RawMessage) string {
 	})
 	if desc := strings.TrimSpace(a.NLDescription); desc != "" {
 		s += fmt.Sprintf("，描述「%s」", desc)
+	}
+	if intent := strings.TrimSpace(a.Intent); intent != "" {
+		s += "\n监控意图：" + intent
+	}
+	strictness := types.PushStrictness(a.Strictness)
+	if strictness == "" {
+		strictness = types.StrictnessLoose
+	}
+	s += fmt.Sprintf("\n推送门槛：%s（%s）", strictnessLabel(strictness), strictnessDesc(strictness))
+	var plan approvedFetchPlanSummary
+	if err := json.Unmarshal(a.ApprovedFetchPlan, &plan); err == nil && len(plan.Sources) > 0 {
+		s += fmt.Sprintf("\n批准信源（%d）：", len(plan.Sources))
+		for _, source := range plan.Sources {
+			label := strings.TrimSpace(source.Title)
+			if label == "" {
+				label = source.Platform + "/" + source.Capability
+			}
+			config := strings.TrimSpace(string(source.Config))
+			if config == "" {
+				config = "{}"
+			}
+			s += fmt.Sprintf("\n- %s [%s/%s] %s；参数 %s",
+				label, source.Platform, source.Capability, source.URL, config)
+		}
 	}
 	return s
 }

@@ -6,15 +6,26 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/types"
 )
 
-const compiledTaskRollbackTimeout = 5 * time.Second
+const (
+	compiledTaskRollbackTimeout     = 5 * time.Second
+	maxCompiledTaskJSONBytes        = 256 << 10
+	maxCompiledTaskPlaybookBytes    = 256 << 10
+	maxCompiledTaskDescriptionBytes = 16 << 10
+	maxCompiledTaskSources          = 64
+	maxCompiledTaskSourceURLBytes   = 4096
+	maxCompiledTaskSourceTextBytes  = 4096
+)
 
 // compiledFetchPlan 是 schedule_playbooks.fetch_plan 在数据边界上的最小稳定形态。
 // agent 包拥有编译过程；store 不反向依赖 agent，只消费其持久化 wire contract。
@@ -63,6 +74,26 @@ func (s *Store) InsertPausedCompiledTaskDefinition(
 	if err := lockValidMembership(ctx, tx, def.TenantID, def.UserID); err != nil {
 		return err
 	}
+	if err := insertPausedCompiledTaskDefinitionTx(ctx, tx, def, plan); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return compiledTaskDatabaseError("提交编译任务事务", def.TaskID, err)
+	}
+	return nil
+}
+
+// insertPausedCompiledTaskDefinitionTx is the A2 aggregate writer without
+// transaction ownership. A2 calls it after a membership lock; A5 calls it
+// while holding the exact creation lease plus the stronger per-user lock, so
+// the aggregate and the saga phase can commit atomically.
+func insertPausedCompiledTaskDefinitionTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	def types.PausedCompiledTaskDefinition,
+	plan *compiledFetchPlan,
+) error {
 
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO schedules
@@ -85,9 +116,17 @@ func (s *Store) InsertPausedCompiledTaskDefinition(
 		return compiledTaskDatabaseError("写入任务手册与抓取计划", def.TaskID, err)
 	}
 
-	sourceIDs := make([]int64, 0, len(plan.Sources))
-	planURLs := make([]string, 0, len(plan.Sources))
-	for _, planned := range plan.Sources {
+	// Global source URLs are unique across every tenant. Different users can
+	// commit inverse plan orders concurrently, so always acquire those unique
+	// index/row locks in canonical URL order. The stored fetch_plan itself keeps
+	// its approved order; schedule_sources is a set.
+	materializationSources := append([]compiledPlanSource(nil), plan.Sources...)
+	sort.Slice(materializationSources, func(i, j int) bool {
+		return materializationSources[i].URL < materializationSources[j].URL
+	})
+	sourceIDs := make([]int64, 0, len(materializationSources))
+	planURLs := make([]string, 0, len(materializationSources))
+	for _, planned := range materializationSources {
 		sourceID, err := getOrCreateCompiledPlanSource(ctx, tx, planned)
 		if err != nil {
 			return compiledTaskDatabaseError(
@@ -113,17 +152,14 @@ func (s *Store) InsertPausedCompiledTaskDefinition(
 		return types.NewAppError(types.CodeInternal,
 			fmt.Sprintf("抓取计划与任务信源链接不一致（task_id=%s）", def.TaskID), nil)
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return compiledTaskDatabaseError("提交编译任务事务", def.TaskID, err)
-	}
 	return nil
 }
 
 func validatePausedCompiledTaskDefinition(
 	def types.PausedCompiledTaskDefinition,
 ) (*compiledFetchPlan, error) {
-	if strings.TrimSpace(def.TaskID) == "" || strings.TrimSpace(def.TaskID) != def.TaskID {
+	if strings.TrimSpace(def.TaskID) == "" || strings.TrimSpace(def.TaskID) != def.TaskID ||
+		len(def.TaskID) > 255 || !utf8.ValidString(def.TaskID) {
 		return nil, compiledTaskValidationError("task_id 必须是无首尾空白的非空字符串", nil)
 	}
 	if def.TenantID <= 0 {
@@ -131,6 +167,14 @@ func validatePausedCompiledTaskDefinition(
 	}
 	if def.UserID <= 0 {
 		return nil, compiledTaskValidationError("user_id 必须为正整数", nil)
+	}
+	if len(def.NLDescription) > maxCompiledTaskDescriptionBytes ||
+		!utf8.ValidString(def.NLDescription) {
+		return nil, compiledTaskValidationError("nl_description 大小或编码非法", nil)
+	}
+	if len(def.PlaybookContent) > maxCompiledTaskPlaybookBytes ||
+		!utf8.ValidString(def.PlaybookContent) {
+		return nil, compiledTaskValidationError("playbook_content 大小或编码非法", nil)
 	}
 	if err := validateJSONObject(def.SpecJSON, "spec_json"); err != nil {
 		return nil, err
@@ -144,20 +188,33 @@ func validatePausedCompiledTaskDefinition(
 	}
 
 	raw := bytes.TrimSpace(def.FetchPlan)
-	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+	if len(raw) == 0 || len(raw) > maxCompiledTaskJSONBytes ||
+		bytes.Equal(raw, []byte("null")) {
 		return nil, compiledTaskValidationError("fetch_plan 不得缺失或为 null", nil)
 	}
 	var plan *compiledFetchPlan
-	if err := json.Unmarshal(raw, &plan); err != nil {
+	if err := strictjson.Decode(raw, &plan); err != nil {
 		return nil, compiledTaskValidationError("fetch_plan 必须是合法 JSON 对象", err)
 	}
 	if plan == nil || len(plan.Sources) == 0 {
 		return nil, compiledTaskValidationError("fetch_plan.sources 不得缺失、为 null 或为空", nil)
 	}
+	if len(plan.Sources) > maxCompiledTaskSources {
+		return nil, compiledTaskValidationError(
+			fmt.Sprintf("fetch_plan.sources 不得超过 %d 个", maxCompiledTaskSources), nil)
+	}
 
 	seenURLs := make(map[string]struct{}, len(plan.Sources))
 	for i := range plan.Sources {
 		src := &plan.Sources[i]
+		if len(src.Platform) > maxCompiledTaskSourceTextBytes ||
+			len(src.Capability) > maxCompiledTaskSourceTextBytes ||
+			len(src.Title) > maxCompiledTaskSourceTextBytes ||
+			!utf8.ValidString(src.Platform) || !utf8.ValidString(src.Capability) ||
+			!utf8.ValidString(src.Title) || !utf8.ValidString(src.URL) {
+			return nil, compiledTaskValidationError(
+				fmt.Sprintf("fetch_plan.sources[%d] 文本大小或编码非法", i), nil)
+		}
 		if strings.TrimSpace(src.Platform) == "" || strings.TrimSpace(src.Platform) != src.Platform {
 			return nil, compiledTaskValidationError(
 				fmt.Sprintf("fetch_plan.sources[%d].platform 必须是无首尾空白的非空字符串", i), nil)
@@ -166,7 +223,8 @@ func validatePausedCompiledTaskDefinition(
 			return nil, compiledTaskValidationError(
 				fmt.Sprintf("fetch_plan.sources[%d].capability 必须是无首尾空白的非空字符串", i), nil)
 		}
-		if strings.TrimSpace(src.URL) == "" || strings.TrimSpace(src.URL) != src.URL {
+		if strings.TrimSpace(src.URL) == "" || strings.TrimSpace(src.URL) != src.URL ||
+			len(src.URL) > maxCompiledTaskSourceURLBytes {
 			return nil, compiledTaskValidationError(
 				fmt.Sprintf("fetch_plan.sources[%d].url 必须是无首尾空白的非空字符串", i), nil)
 		}
@@ -190,11 +248,12 @@ func validatePausedCompiledTaskDefinition(
 
 func validateJSONObject(raw json.RawMessage, field string) error {
 	raw = bytes.TrimSpace(raw)
-	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+	if len(raw) == 0 || len(raw) > maxCompiledTaskJSONBytes ||
+		bytes.Equal(raw, []byte("null")) {
 		return compiledTaskValidationError(field+" 必须是非 null JSON 对象", nil)
 	}
 	var object map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &object); err != nil {
+	if err := strictjson.Decode(raw, &object); err != nil {
 		return compiledTaskValidationError(field+" 必须是合法 JSON 对象", err)
 	}
 	if object == nil {

@@ -1,12 +1,20 @@
 package a2a
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	vanestore "github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/types"
 )
 
 func newTask(id string, state a2a.TaskState) *a2a.Task {
@@ -182,5 +190,83 @@ func TestListQueryMapping(t *testing.T) {
 	}
 	if resp.PageSize != 50 {
 		t.Errorf("缺省 PageSize 应回填 50，实际 %d", resp.PageSize)
+	}
+}
+
+// TestRecoveredTaskStatusVisibleThroughAdapter catches a two-ledger split that
+// row-level store tests cannot see: List filters on the extracted status column,
+// while Get/List responses are deserialized from task JSONB.
+func TestRecoveredTaskStatusVisibleThroughAdapter(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("DATABASE_URL 未设置，跳过 A2A 恢复适配层真库测试")
+	}
+	ctx := t.Context()
+	if err := vanestore.Migrate(ctx, dbURL); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	st, err := vanestore.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	t.Cleanup(st.Close)
+	rawDB, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(rawDB.Close)
+
+	id := "test_a2a_recovery_" + uuid.NewString()
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := rawDB.Exec(cleanupCtx, `DELETE FROM a2a_tasks WHERE id=$1`, id); err != nil {
+			t.Errorf("cleanup A2A task: %v", err)
+		}
+	})
+	task := newTask(id, a2a.TaskStateWorking)
+	payload, err := json.Marshal(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateA2ATask(ctx, &types.A2ATask{
+		ID: id, ContextID: task.ContextID, Status: string(task.Status.State), Task: payload,
+	}); err != nil {
+		t.Fatalf("CreateA2ATask: %v", err)
+	}
+	ancientUpdatedAt := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	cutoff := ancientUpdatedAt.Add(time.Hour)
+	if _, err := rawDB.Exec(ctx, `UPDATE a2a_tasks SET updated_at=$2 WHERE id=$1`, id, ancientUpdatedAt); err != nil {
+		t.Fatalf("age task: %v", err)
+	}
+	// Use an ancient cutoff so this package cannot sweep contemporary WORKING
+	// fixtures owned by a concurrently running store test process.
+	if n, err := st.FailStaleA2ATasks(ctx, cutoff); err != nil || n < 1 {
+		t.Fatalf("FailStaleA2ATasks n=%d err=%v", n, err)
+	}
+
+	adapter := newTaskStore(st)
+	got, err := adapter.Get(ctx, a2a.TaskID(id))
+	if err != nil {
+		t.Fatalf("adapter.Get: %v", err)
+	}
+	if got.Task.Status.State != a2a.TaskStateFailed || got.Task.Status.Timestamp == nil {
+		t.Fatalf("Get public status = %+v, want FAILED with timestamp", got.Task.Status)
+	}
+	listed, err := adapter.List(ctx, &a2a.ListTasksRequest{Status: a2a.TaskStateFailed, PageSize: 200})
+	if err != nil {
+		t.Fatalf("adapter.List: %v", err)
+	}
+	found := false
+	for _, listedTask := range listed.Tasks {
+		if listedTask.ID == a2a.TaskID(id) {
+			found = true
+			if listedTask.Status.State != a2a.TaskStateFailed {
+				t.Fatalf("List filtered FAILED but returned embedded state %s", listedTask.Status.State)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("List(Status=FAILED) did not return recovered task")
 	}
 }

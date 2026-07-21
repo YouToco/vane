@@ -87,11 +87,95 @@ type Service struct {
 	// key=delivery_id。进程重启丢失即半途生成作废，由第一层（feedbacks 行 +
 	// detail 重发）与第三层（部分唯一索引）兜底，重点一次可恢复。
 	inflight sync.Map
+
+	// deepDiveMu 把“停止接纳”与 WaitGroup.Add 串行化。这条锁是
+	// WaitGroup 的生命周期边界：Shutdown 持锁把 accepting 改为 false 后，
+	// 才可以安全 Wait，因为之后不会再有 Add 与 Wait 竞态。
+	deepDiveMu        sync.Mutex
+	deepDiveAccepting bool
+	deepDiveWG        sync.WaitGroup
+	deepDiveStop      context.CancelFunc
+	deepDiveStopCtx   context.Context
+	deepDiveDrainOnce sync.Once
+	deepDiveDrained   chan struct{}
 }
 
 // New 构造 Service。
 func New(deps Deps) *Service {
-	return &Service{deps: deps}
+	stopCtx, stop := context.WithCancel(context.Background())
+	return &Service{
+		deps:              deps,
+		deepDiveAccepting: true,
+		deepDiveStop:      stop,
+		deepDiveStopCtx:   stopCtx,
+		deepDiveDrained:   make(chan struct{}),
+	}
+}
+
+// Shutdown 停止接纳新的深度解读，并等待已接纳的预检、模型、
+// 落库与回复全部退出。正常优雅关停不会中断已接纳工作；只有调用方
+// 的 ctx 取消/超时时才撤销它们的服务级 context，从而给 DB、LLM 和发送
+// 调用一个明确退出信号。
+//
+// 返回 ctx.Err() 表示调用方的排空预算已用尽；此时上游应视为“未完全
+// 排空”，不应继续关闭 Store/LLM/Sender 依赖。A6 的耐久回执不在本方法
+// 保证范围内。
+func (s *Service) Shutdown(ctx context.Context) error {
+	s.deepDiveMu.Lock()
+	s.deepDiveAccepting = false
+	s.deepDiveDrainOnce.Do(func() {
+		go func() {
+			s.deepDiveWG.Wait()
+			close(s.deepDiveDrained)
+		}()
+	})
+	drained := s.deepDiveDrained
+	s.deepDiveMu.Unlock()
+
+	// 无在途任务时即使 ctx 恰好同时取消，也优先报告已排空。
+	select {
+	case <-drained:
+		s.deepDiveStop()
+		return nil
+	default:
+	}
+
+	select {
+	case <-drained:
+		s.deepDiveStop()
+		return nil
+	case <-ctx.Done():
+		s.deepDiveStop()
+		return ctx.Err()
+	}
+}
+
+// admitDeepDive 在同一把锁下完成准入检查与 WaitGroup.Add。返回的
+// done 必须恰好调用一次；对于异步生成，所有权由 HandleClick 转交给
+// 生成 goroutine。
+func (s *Service) admitDeepDive() (done func(), ok bool) {
+	s.deepDiveMu.Lock()
+	defer s.deepDiveMu.Unlock()
+	if !s.deepDiveAccepting {
+		return nil, false
+	}
+	s.deepDiveWG.Add(1)
+	return s.deepDiveWG.Done, true
+}
+
+// deepDiveContext 保留请求的 values，但可由服务关停主动取消。detach
+// 用于已受理的后台生成：它不跟随 2.5s 卡片回调取消，但仍受
+// deepDiveGenBudget 和 Service.Shutdown 约束。
+func (s *Service) deepDiveContext(parent context.Context, detach bool) (context.Context, context.CancelFunc) {
+	if detach {
+		parent = context.WithoutCancel(parent)
+	}
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(s.deepDiveStopCtx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 // attitudeActions 是态度语义的动作集合。查询最新态度**恒传这个双值集合**——

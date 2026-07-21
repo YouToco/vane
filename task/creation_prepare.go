@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -34,16 +36,13 @@ const (
 )
 
 var (
-	// ErrTranslationOutcomeAmbiguous marks the fail-closed state where a paid
-	// compiler call may have happened but no immutable result was checkpointed.
-	ErrTranslationOutcomeAmbiguous = errors.New("task: translation outcome is ambiguous")
 	// ErrCreationCheckpointInvalid marks a corrupt, cross-scope, or internally
 	// inconsistent durable checkpoint. Such bytes are never repaired in place.
 	ErrCreationCheckpointInvalid = errors.New("task: creation checkpoint is invalid")
 )
 
 // CreationPrepareStore is the smallest durable operation surface needed by
-// A4 preparation. The caller acquires the lease; this service never reads a
+// task-creation preparation. The caller acquires the lease; this service never reads a
 // lease token from storage and acts as its owner.
 type CreationPrepareStore interface {
 	LoadTaskCreationOperation(ctx context.Context, id string, tenantID, userID int64) (*types.TaskCreationOperation, error)
@@ -55,47 +54,28 @@ type CreationPrepareStore interface {
 	FailTaskCreationOperation(ctx context.Context, lease types.TaskCreationLease, errorCode, errorMessage string) error
 }
 
-// TaskDefinitionCompileRequest is explicit about the scope of the one paid
-// compiler call. Implementations must not infer identity from context values.
-type TaskDefinitionCompileRequest struct {
-	TenantID        int64
-	UserID          int64
-	OperationID     string
-	PlaybookContent string
-}
-
-// TaskDefinitionCompiler translates one bounded playbook into an already
-// materializable fetch_plan. It is intentionally independent from the legacy
-// agent translator so A4 can enforce a single-authorization, fail-closed
-// checkpoint protocol around a provider that has no idempotency key.
-type TaskDefinitionCompiler interface {
-	CompileTaskDefinition(ctx context.Context, req TaskDefinitionCompileRequest) (json.RawMessage, error)
-}
-
-// TaskSchedulePreparer is an unconnected adapter seam over A3. Its deliberately
-// generic method name keeps the A3 zero-production-call-point guard intact;
-// A5 owns the concrete scheduler adapter and production wiring.
+// TaskSchedulePreparer is the narrow adapter seam over the schedule control
+// plane. CreationCoordinator owns its sole production wiring.
 type TaskSchedulePreparer interface {
 	DeriveID(tenantID, userID int64, operationID string) (string, error)
 	Prepare(ctx context.Context, req scheduler.TaskScheduleRequest) (scheduler.PreparedTaskSchedule, error)
 }
 
-// CreationPreparer performs the paid translation and the two immutable A4
-// preparation checkpoints. It does not create a Temporal schedule and does not
-// call InsertPausedCompiledTaskDefinition.
+// CreationPreparer deterministically validates and freezes the user-approved
+// fetch plan into two immutable preparation checkpoints. It never calls
+// an LLM, discovers a source, creates a Temporal schedule, or writes the A2
+// aggregate. Discovery must happen before the confirmation action is created.
 type CreationPreparer struct {
 	store     CreationPrepareStore
-	compiler  TaskDefinitionCompiler
 	schedules TaskSchedulePreparer
 }
 
-// NewCreationPreparer constructs the zero-production-call-point A4 service.
+// NewCreationPreparer constructs the deterministic preparation service.
 func NewCreationPreparer(
 	store CreationPrepareStore,
-	compiler TaskDefinitionCompiler,
 	schedules TaskSchedulePreparer,
 ) *CreationPreparer {
-	return &CreationPreparer{store: store, compiler: compiler, schedules: schedules}
+	return &CreationPreparer{store: store, schedules: schedules}
 }
 
 // CreationPrepareInput binds the exact leased operation. The user-approved
@@ -108,8 +88,8 @@ type CreationPrepareInput struct {
 	Lease       types.TaskCreationLease
 }
 
-// CreationPrepareResult is the complete handoff from A4 to A5. Definition is
-// the A2 aggregate with the pre-translation deterministic TaskID; A3's result
+// CreationPrepareResult is the complete handoff to the creation saga. Definition is
+// the A2 aggregate with the deterministic TaskID; the schedule-control result
 // must prove it derived the same ID before this value is returned.
 type CreationPrepareResult struct {
 	Definition       types.PausedCompiledTaskDefinition
@@ -118,10 +98,11 @@ type CreationPrepareResult struct {
 }
 
 type createScheduleCommandArgs struct {
-	Spec          *createScheduleCommandSpec `json:"spec"`
-	Intent        string                     `json:"intent"`
-	NLDescription string                     `json:"nl_description"`
-	Strictness    types.PushStrictness       `json:"strictness"`
+	Spec              *createScheduleCommandSpec `json:"spec"`
+	Intent            string                     `json:"intent"`
+	NLDescription     string                     `json:"nl_description"`
+	Strictness        types.PushStrictness       `json:"strictness"`
+	ApprovedFetchPlan json.RawMessage            `json:"approved_fetch_plan"`
 }
 
 type createScheduleCommandSpec struct {
@@ -132,26 +113,28 @@ type createScheduleCommandSpec struct {
 }
 
 type normalizedCreateScheduleCommand struct {
-	Version       string                 `json:"version"`
-	Spec          scheduler.ScheduleSpec `json:"spec"`
-	Intent        string                 `json:"intent"`
-	NLDescription string                 `json:"nl_description"`
-	Strictness    types.PushStrictness   `json:"strictness,omitempty"`
+	Version           string                 `json:"version"`
+	Spec              scheduler.ScheduleSpec `json:"spec"`
+	Intent            string                 `json:"intent"`
+	NLDescription     string                 `json:"nl_description"`
+	Strictness        types.PushStrictness   `json:"strictness,omitempty"`
+	ApprovedFetchPlan json.RawMessage        `json:"approved_fetch_plan"`
 }
 
 type compiledTaskDefinitionCheckpoint struct {
-	Version         string                 `json:"version"`
-	TaskID          string                 `json:"task_id"`
-	TenantID        int64                  `json:"tenant_id"`
-	UserID          int64                  `json:"user_id"`
-	OperationID     string                 `json:"operation_id"`
-	CommandDigest   string                 `json:"command_digest"`
-	Spec            scheduler.ScheduleSpec `json:"spec"`
-	Scope           workflow.PushScope     `json:"scope"`
-	NLDescription   string                 `json:"nl_description"`
-	PlaybookContent string                 `json:"playbook_content"`
-	FetchPlan       json.RawMessage        `json:"fetch_plan"`
-	Strictness      types.PushStrictness   `json:"strictness,omitempty"`
+	Version          string                 `json:"version"`
+	DefinitionDigest string                 `json:"definition_digest"`
+	TaskID           string                 `json:"task_id"`
+	TenantID         int64                  `json:"tenant_id"`
+	UserID           int64                  `json:"user_id"`
+	OperationID      string                 `json:"operation_id"`
+	CommandDigest    string                 `json:"command_digest"`
+	Spec             scheduler.ScheduleSpec `json:"spec"`
+	Scope            workflow.PushScope     `json:"scope"`
+	NLDescription    string                 `json:"nl_description"`
+	PlaybookContent  string                 `json:"playbook_content"`
+	FetchPlan        json.RawMessage        `json:"fetch_plan"`
+	Strictness       types.PushStrictness   `json:"strictness,omitempty"`
 }
 
 type compiledFetchPlan struct {
@@ -166,8 +149,8 @@ type compiledFetchSource struct {
 	Config     json.RawMessage `json:"config"`
 }
 
-// Prepare seals the canonical command, invokes the compiler at most once, and
-// checkpoints both the compiled definition and A3 prepared schedule. Every
+// Prepare seals the canonical command, materializes only the user-approved
+// plan, and checkpoints both the definition and prepared schedule. Every
 // recovery path validates exact scope, digest, canonical bytes, and TaskID.
 func (p *CreationPreparer) Prepare(
 	ctx context.Context,
@@ -176,7 +159,7 @@ func (p *CreationPreparer) Prepare(
 	if err := ctx.Err(); err != nil {
 		return CreationPrepareResult{}, err
 	}
-	if p == nil || p.store == nil || p.compiler == nil || p.schedules == nil {
+	if p == nil || p.store == nil || p.schedules == nil {
 		return CreationPrepareResult{}, errors.New("task: creation preparer dependencies are incomplete")
 	}
 	if err := validateCreationPrepareIdentity(in); err != nil {
@@ -223,15 +206,6 @@ func (p *CreationPreparer) Prepare(
 	if len(op.PreparedSchedule) != 0 || len(op.CompiledDefinition) != 0 || op.CompiledDigest != "" {
 		return p.resumeFromCheckpoints(ctx, in, command, commandBytes, op)
 	}
-	if op.Phase == types.TaskCreationPhaseTranslationStarted {
-		if op.Attempt <= 1 {
-			return CreationPrepareResult{}, fmt.Errorf(
-				"%w: task definition translation may still be running",
-				types.ErrTaskCreationBusy,
-			)
-		}
-		return CreationPrepareResult{}, p.blockAmbiguous(ctx, in.Lease, nil)
-	}
 	if creationPhaseAtLeast(op.Phase, types.TaskCreationPhaseDefinitionCompiled) {
 		return CreationPrepareResult{}, p.blockInvalidCheckpoint(
 			ctx, in.Lease, op.Phase,
@@ -254,8 +228,8 @@ func (p *CreationPreparer) Prepare(
 
 	started, err := p.store.BeginTaskCreationTranslation(ctx, in.Lease)
 	if err != nil {
-		// A commit error has an unknowable outcome. Calling the paid compiler
-		// here would make an applied-but-response-lost Begin charge twice.
+		// This checkpoint has no external effect. A response loss is retried by
+		// recovery, which replays the same approved bytes under a fresh fence.
 		return CreationPrepareResult{}, fmt.Errorf("begin task definition translation: %w", err)
 	}
 	if !started {
@@ -266,36 +240,16 @@ func (p *CreationPreparer) Prepare(
 		if len(op.CompiledDefinition) != 0 || len(op.PreparedSchedule) != 0 {
 			return p.resumeFromCheckpoints(ctx, in, command, commandBytes, op)
 		}
-		if op.Phase == types.TaskCreationPhaseTranslationStarted && op.Attempt <= 1 {
-			return CreationPrepareResult{}, fmt.Errorf(
-				"%w: task definition translation may still be running",
-				types.ErrTaskCreationBusy,
+		if op.Phase != types.TaskCreationPhaseTranslationStarted {
+			return CreationPrepareResult{}, p.blockInvalidCheckpoint(
+				ctx, in.Lease, op.Phase,
+				errors.New("definition checkpoint is missing after translation phase"),
 			)
 		}
-		return CreationPrepareResult{}, p.blockAmbiguous(ctx, in.Lease, nil)
 	}
 
 	playbook := command.Intent
-	plan, err := p.compiler.CompileTaskDefinition(ctx, TaskDefinitionCompileRequest{
-		TenantID: in.TenantID, UserID: in.UserID, OperationID: in.OperationID,
-		PlaybookContent: playbook,
-	})
-	if err != nil {
-		// The compiler interface has no proof that an error happened before the
-		// provider accepted and charged the request. Treat every missing result
-		// as ambiguous; the same OperationID is never automatically translated
-		// again, even for a timeout or cancellation.
-		return CreationPrepareResult{}, p.blockAmbiguous(
-			ctx, in.Lease, fmt.Errorf("compile task definition: %w", err),
-		)
-	}
-	canonicalPlan, err := canonicalizeFetchPlan(plan)
-	if err != nil {
-		cause := fmt.Errorf("validate compiled fetch plan: %w", err)
-		return CreationPrepareResult{}, p.failKnownFailure(
-			ctx, in.Lease, "compiled_definition_invalid", "编译结果未通过安全校验，未创建任务", cause,
-		)
-	}
+	canonicalPlan := bytes.Clone(command.ApprovedFetchPlan)
 
 	compiled := compiledTaskDefinitionCheckpoint{
 		Version:         compiledDefinitionVersion,
@@ -310,6 +264,20 @@ func (p *CreationPreparer) Prepare(
 		PlaybookContent: playbook,
 		FetchPlan:       canonicalPlan,
 		Strictness:      command.Strictness,
+	}
+	materialized, err := pausedDefinitionFromCompiled(compiled)
+	if err != nil {
+		return CreationPrepareResult{}, p.failKnownFailure(
+			ctx, in.Lease, "compiled_definition_invalid",
+			"已批准任务定义无法规范化，未创建任务", err,
+		)
+	}
+	compiled.DefinitionDigest, err = types.DigestPausedCompiledTaskDefinition(materialized)
+	if err != nil {
+		return CreationPrepareResult{}, p.failKnownFailure(
+			ctx, in.Lease, "compiled_definition_invalid",
+			"已批准任务定义无法生成完整性摘要，未创建任务", err,
+		)
 	}
 	compiledBytes, err := json.Marshal(compiled)
 	if err != nil {
@@ -530,9 +498,15 @@ func normalizeCreateScheduleCommand(
 		return normalizedCreateScheduleCommand{}, nil,
 			fmt.Errorf("task: nl_description exceeds %d characters", maxCreationDescriptionRunes)
 	}
+	approvedPlan, err := canonicalizeFetchPlan(args.ApprovedFetchPlan)
+	if err != nil {
+		return normalizedCreateScheduleCommand{}, nil,
+			fmt.Errorf("task: approved_fetch_plan is invalid: %w", err)
+	}
 	command := normalizedCreateScheduleCommand{
 		Version: creationCommandVersion, Spec: spec,
 		Intent: intent, NLDescription: description, Strictness: args.Strictness,
+		ApprovedFetchPlan: approvedPlan,
 	}
 	canonical, err := json.Marshal(command)
 	if err != nil {
@@ -623,6 +597,9 @@ func canonicalizeFetchPlan(raw json.RawMessage) (json.RawMessage, error) {
 		if message := sourcespec.ValidateMaterialized(candidate); message != "" {
 			return nil, fmt.Errorf("fetch_plan.sources[%d] is not materializable: %s", i, message)
 		}
+		if err := validateApprovedSourceNetworkBoundary(candidate); err != nil {
+			return nil, fmt.Errorf("fetch_plan.sources[%d] violates network policy: %w", i, err)
+		}
 	}
 	canonical, err := json.Marshal(plan)
 	if err != nil {
@@ -632,6 +609,58 @@ func canonicalizeFetchPlan(raw json.RawMessage) (json.RawMessage, error) {
 		return nil, errors.New("canonical fetch_plan exceeds the size limit")
 	}
 	return canonical, nil
+}
+
+func validateApprovedSourceNetworkBoundary(source *types.Source) error {
+	var rawURL string
+	switch {
+	case source.Platform == types.PlatformWeb && source.Capability == types.CapFeed:
+		rawURL = source.URL
+	case source.Platform == types.PlatformWeb && source.Capability == types.CapContents:
+		var config struct {
+			URL string `json:"url"`
+		}
+		if err := decodeStrictJSON(source.Config, &config); err != nil {
+			return errors.New("contents URL config is invalid")
+		}
+		rawURL = config.URL
+	default:
+		return nil
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Hostname() == "" {
+		return errors.New("external URL is invalid")
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") ||
+		strings.HasSuffix(host, ".local") {
+		return errors.New("local hostnames are forbidden")
+	}
+	if ip := net.ParseIP(host); ip != nil && approvedSourceIPBlocked(ip) {
+		return errors.New("private or special-use IP addresses are forbidden")
+	}
+	return nil
+}
+
+func approvedSourceIPBlocked(ip net.IP) bool {
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	for _, cidr := range []string{
+		"100.64.0.0/10",
+		"192.0.0.0/24",
+		"198.18.0.0/15",
+		"192.0.2.0/24",
+		"198.51.100.0/24",
+		"203.0.113.0/24",
+	} {
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func canonicalJSONObject(raw json.RawMessage) (json.RawMessage, error) {
@@ -691,6 +720,17 @@ func validateCompiledCheckpoint(
 	if err != nil || !bytes.Equal(plan, compiled.FetchPlan) {
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled fetch_plan is not canonical and valid")
 	}
+	if !bytes.Equal(compiled.FetchPlan, command.ApprovedFetchPlan) {
+		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled fetch_plan differs from approved command")
+	}
+	materialized, err := pausedDefinitionFromCompiled(*compiled)
+	if err != nil {
+		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled materialized definition is invalid")
+	}
+	digest, err := types.DigestPausedCompiledTaskDefinition(materialized)
+	if err != nil || !validLowerSHA256(compiled.DefinitionDigest) || digest != compiled.DefinitionDigest {
+		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled materialized definition digest differs")
+	}
 	return *compiled, nil
 }
 
@@ -730,44 +770,35 @@ func makeCreationPrepareResult(
 	digest string,
 	prepared scheduler.PreparedTaskSchedule,
 ) (CreationPrepareResult, error) {
-	specJSON, err := json.Marshal(compiled.Spec)
+	definition, err := pausedDefinitionFromCompiled(compiled)
 	if err != nil {
-		return CreationPrepareResult{}, fmt.Errorf("marshal compiled schedule spec: %w", err)
-	}
-	scopeJSON, err := json.Marshal(workflow.PushScope{})
-	if err != nil {
-		return CreationPrepareResult{}, fmt.Errorf("marshal compiled task scope: %w", err)
+		return CreationPrepareResult{}, err
 	}
 	return CreationPrepareResult{
-		Definition: types.PausedCompiledTaskDefinition{
-			TaskID: compiled.TaskID, TenantID: compiled.TenantID, UserID: compiled.UserID,
-			NLDescription:   compiled.NLDescription,
-			SpecJSON:        append(json.RawMessage(nil), specJSON...),
-			ScopeJSON:       append(json.RawMessage(nil), scopeJSON...),
-			PlaybookContent: compiled.PlaybookContent,
-			FetchPlan:       append(json.RawMessage(nil), compiled.FetchPlan...),
-			Strictness:      compiled.Strictness,
-		},
-		DefinitionDigest: digest,
-		Schedule:         prepared,
+		Definition: definition, DefinitionDigest: digest, Schedule: prepared,
 	}, nil
 }
 
-func (p *CreationPreparer) blockAmbiguous(
-	ctx context.Context,
-	lease types.TaskCreationLease,
-	cause error,
-) error {
-	if cause == nil {
-		cause = ErrTranslationOutcomeAmbiguous
-	} else {
-		cause = errors.Join(ErrTranslationOutcomeAmbiguous, cause)
+func pausedDefinitionFromCompiled(
+	compiled compiledTaskDefinitionCheckpoint,
+) (types.PausedCompiledTaskDefinition, error) {
+	specJSON, err := json.Marshal(compiled.Spec)
+	if err != nil {
+		return types.PausedCompiledTaskDefinition{}, fmt.Errorf("marshal compiled schedule spec: %w", err)
 	}
-	return p.blockKnownFailure(
-		ctx, lease, "translation_outcome_ambiguous",
-		"任务定义翻译结果不确定，已停止创建以避免重复扣费",
-		cause,
-	)
+	scopeJSON, err := json.Marshal(workflow.PushScope{})
+	if err != nil {
+		return types.PausedCompiledTaskDefinition{}, fmt.Errorf("marshal compiled task scope: %w", err)
+	}
+	return types.PausedCompiledTaskDefinition{
+		TaskID: compiled.TaskID, TenantID: compiled.TenantID, UserID: compiled.UserID,
+		NLDescription:   compiled.NLDescription,
+		SpecJSON:        append(json.RawMessage(nil), specJSON...),
+		ScopeJSON:       append(json.RawMessage(nil), scopeJSON...),
+		PlaybookContent: compiled.PlaybookContent,
+		FetchPlan:       append(json.RawMessage(nil), compiled.FetchPlan...),
+		Strictness:      compiled.Strictness,
+	}, nil
 }
 
 func (p *CreationPreparer) blockInvalidCheckpoint(
@@ -777,9 +808,11 @@ func (p *CreationPreparer) blockInvalidCheckpoint(
 	cause error,
 ) error {
 	wrapped := fmt.Errorf("%w: %w", ErrCreationCheckpointInvalid, cause)
-	if creationPhaseAtLeast(phase, types.TaskCreationPhaseScheduleEnsured) {
-		// A5 may already own a paused Temporal object. Only its cleanup path may
-		// tombstone this operation; blocking here would strand that object.
+	if creationPhaseAtLeast(phase, types.TaskCreationPhaseSchedulePrepared) {
+		// Once the immutable schedule has been prepared, a prior Ensure RPC may
+		// have committed while its response/checkpoint was lost. Only the A5
+		// cleanup/quarantine path may tombstone the operation from this boundary;
+		// blocking here could strand an unaccounted Temporal object.
 		return wrapped
 	}
 	return p.blockKnownFailure(

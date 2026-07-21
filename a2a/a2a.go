@@ -77,17 +77,20 @@ type Deps struct {
 // Mount 把 A2A 端点挂到根 mux。cfg.A2A.Enabled=false 时 main.go 不调用本函数（零暴露面）。
 // Token 为空 → slog.Warn 一次并照常挂载（auth 恒 401），与 config 对 dashboard.password
 // 的"只告警不拒启动"语义一致。
-func Mount(mux *http.ServeMux, deps Deps) error {
+func Mount(mux *http.ServeMux, deps Deps) (*Runtime, error) {
 	if deps.Token == "" {
 		slog.Warn("a2a: token 未配置（VANE_A2A_TOKEN），/a2a 将拒绝所有请求（恒 401）")
 	}
-	rh := a2asrv.NewHandler(newExecutor(deps),
+	runtime := newRuntime()
+	executor := &lifecycleExecutor{inner: newExecutor(deps), runtime: runtime}
+	rh := a2asrv.NewHandler(executor,
 		a2asrv.WithTaskStore(newTaskStore(deps.Storage)),
 		// 显式传入 capabilities：SDK 对 streaming 方法按它拒绝（ErrUnsupportedOperation），
 		// 与 buildCard 共用同一包级变量，杜绝"卡片说不支持、handler 却放行"的分裂。
 		a2asrv.WithCapabilityChecks(&capabilities),
 		a2asrv.WithConcurrencyConfig(limiter.ConcurrencyConfig{MaxExecutions: maxConcurrentExecutions}),
 		a2asrv.WithLogger(slog.Default()))
+	rh = &lifecycleRequestHandler{RequestHandler: rh, runtime: runtime}
 	a2aHandler := requireBearer(deps.Token, a2asrv.NewJSONRPCHandler(rh))
 	mux.Handle("POST /a2a", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 逐路由放宽写超时（契约 §12 的既定杠杆，不动 server 级 WriteTimeout=30s）：
@@ -103,5 +106,5 @@ func Mount(mux *http.ServeMux, deps Deps) error {
 	// card 端点公开无认证（设计选择非规范强制，契约 §5.2）：卡片内无内部 URL/密钥/owner
 	// 信息。路径用 SDK 常量不硬编码；handler 自带 GET/OPTIONS 方法过滤。
 	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(buildCard(deps)))
-	return nil
+	return runtime, nil
 }

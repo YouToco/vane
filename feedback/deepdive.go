@@ -91,6 +91,24 @@ const deepDiveSystemPrompt = `你是"见微 Vane"的深度解读助手。针对�
 // 同步段只做预检与启动，立即返回"生成中"：生成要几十秒，而卡片回调的同步
 // 预算只有 2.5s。
 func (s *Service) handleDeepDive(ctx context.Context, userID int64, d *types.Delivery) (ClickResult, error) {
+	// 准入与 Shutdown.Wait 共用同一把锁：一旦关停开始，新点击不得
+	// 再进入 Store/LLM/Sender。已准入的同步预检/重发由本调用持有
+	// done，启动异步生成后再把它转交给 goroutine。
+	done, admitted := s.admitDeepDive()
+	if !admitted {
+		return ClickResult{Toast: "服务正在关停，请稍后重试"}, nil
+	}
+	backgroundOwnsAdmission := false
+	defer func() {
+		if !backgroundOwnsAdmission {
+			done()
+		}
+	}()
+
+	requestCtx := ctx
+	ctx, cancelOperation := s.deepDiveContext(requestCtx, false)
+	defer cancelOperation()
+
 	// 第一层：行已存在 = 当初生成成功。detail 里存着正文——重发它。
 	// 不能简单拒绝："行在但当初发送失败"会变成钱已烧、结果永久不可达的死锁态。
 	detail, err := s.deps.Store.GetFeedbackDetail(ctx, d.ID, types.FeedbackActionDeepDive)
@@ -146,10 +164,14 @@ func (s *Service) handleDeepDive(ctx context.Context, userID int64, d *types.Del
 	}
 
 	// ctx 与回调链解耦：回调马上就返回了，生成不能跟着被取消（同 M4 卡片动作
-	// 执行的 WithoutCancel 纪律）；WithTimeout 自带上限防挂死。
-	genCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deepDiveGenBudget)
+	// 执行的 WithoutCancel 纪律）；WithTimeout 自带上限防挂死。同时挂到
+	// Service 生命周期 context，强制关停时能取消 Store/LLM/Sender 在途调用。
+	genBaseCtx, cancelService := s.deepDiveContext(requestCtx, true)
+	genCtx, cancelBudget := context.WithTimeout(genBaseCtx, deepDiveGenBudget)
 	go func() {
-		defer cancel()
+		defer done()
+		defer cancelBudget()
+		defer cancelService()
 		defer s.inflight.Delete(d.ID)
 		defer func() {
 			if r := recover(); r != nil {
@@ -158,6 +180,7 @@ func (s *Service) handleDeepDive(ctx context.Context, userID int64, d *types.Del
 		}()
 		s.generateDeepDive(genCtx, userID, d, item)
 	}()
+	backgroundOwnsAdmission = true
 
 	// 状态行此刻要显示"已请求"，但行还没插——force 覆盖查询结果。
 	return s.rebuilt(ctx, d, "深度解读生成中，结果将回复在这条推送下", true, func(st *CardState) {

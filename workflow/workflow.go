@@ -23,11 +23,9 @@ import (
 // 完全不同的结局在库里塌缩成同一个"什么都没有"——"今早为什么没推送"这件事
 // 不是查询查不到，是数据不存在。记账仍不改变终态：**空批次依然是成功**。
 //
-// Temporal 兼容（契约 §8.2）：EvolveProfile 插入、Push 入参变更、以及本次在五处
-// 闸门插入 RecordEmptyBatch，对 in-flight workflow 都是非确定性变更（重放到闸门处
-// 会发现历史里没有这个 Activity）。沿用既有先例：推送是秒级短工作流，发布窗口
-// 避开 08:30 定时任务即可，刻意不做版本化（不引入 workflow.GetVersion——
-// 版本分支一旦种下就永远删不掉，为一个秒级工作流背这个包袱不划算）。
+// Temporal 兼容（契约 §8.2）：新增命令必须通过 replay baseline。运行授权 Activity
+// 由 GetVersion 保护：历史执行重放走 DefaultVersion，不期待不存在的 Activity；新执行
+// 记录版本 marker 后先授权。这个分支必须保留到所有旧历史超过 retention。
 func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	log := workflow.GetLogger(ctx)
 
@@ -51,6 +49,23 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 都只是"没有行"。未跑到的阶段保持 nil，不是 0（见 types.PipelineCounts：
 	// "没跑"和"跑了得 0"是两种不同的事故，用零值记录等于重造一次本 PR 要修的混淆）。
 	var counts types.PipelineCounts
+
+	// Activation safety gate: Temporal Unpause and the Postgres active mirror
+	// cannot share a transaction. A run may start in that narrow window (or
+	// after membership revocation), so the first DB Activity must authorize the
+	// exact schedule before profile LLM, fetch, scoring, cards, or push can run.
+	if workflow.GetVersion(ctx, "scheduled-run-authorization", workflow.DefaultVersion, 1) >= 1 {
+		var authorized bool
+		authorizeCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
+		if err := workflow.ExecuteActivity(authorizeCtx, a.AuthorizeRun, p).Get(authorizeCtx, &authorized); err != nil {
+			return err
+		}
+		if !authorized {
+			log.Warn("push pipeline 未获任务运行授权，零外部副作用退出",
+				"user_id", p.UserID, "schedule_id", p.ScheduleID, "trace_id", traceID)
+			return nil
+		}
+	}
 
 	// recordEmpty 把一次"跑完了但没东西可推"落库。闭包而非方法：Activities 的方法
 	// 值只用于解析 Activity 名，编排逻辑属于 workflow 函数体。
