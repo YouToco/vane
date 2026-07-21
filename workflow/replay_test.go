@@ -160,6 +160,41 @@ func (b *historyBuilder) sideEffect(id int64, value any) {
 	})
 }
 
+// versionWithSearchAttributes 复刻 GetVersion 新执行的正常双事件：Version marker
+// 后紧跟 TemporalChangeVersion upsert。IndexedFields 里的键不可省；Go SDK 用它把
+// upsert 识别为 marker 的伴生事件并一起跳过命令序号。
+func (b *historyBuilder) versionWithSearchAttributes(changeID string, version int) {
+	b.t.Helper()
+	b.add(&historypb.HistoryEvent{
+		EventType: enumspb.EVENT_TYPE_MARKER_RECORDED,
+		Attributes: &historypb.HistoryEvent_MarkerRecordedEventAttributes{
+			MarkerRecordedEventAttributes: &historypb.MarkerRecordedEventAttributes{
+				MarkerName: "Version",
+				Details: map[string]*commonpb.Payloads{
+					"change-id": b.payloads(changeID),
+					"version":   b.payloads(version),
+				},
+			},
+		},
+	})
+	changeVersion, err := converter.GetDefaultDataConverter().ToPayload(
+		[]string{changeID + "-" + strconv.Itoa(version)},
+	)
+	if err != nil {
+		b.t.Fatalf("编码 TemporalChangeVersion: %v", err)
+	}
+	b.add(&historypb.HistoryEvent{
+		EventType: enumspb.EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES,
+		Attributes: &historypb.HistoryEvent_UpsertWorkflowSearchAttributesEventAttributes{
+			UpsertWorkflowSearchAttributesEventAttributes: &historypb.UpsertWorkflowSearchAttributesEventAttributes{
+				SearchAttributes: &commonpb.SearchAttributes{IndexedFields: map[string]*commonpb.Payload{
+					"TemporalChangeVersion": changeVersion,
+				}},
+			},
+		},
+	})
+}
+
 // activity 追加一个跑完的 Activity（Scheduled→Started→Completed）及其后的 WorkflowTask。
 func (b *historyBuilder) activity(name string, input, result any) {
 	attrs := &historypb.ActivityTaskScheduledEventAttributes{
@@ -249,6 +284,129 @@ func baselineHappyPathHistory(t *testing.T) *historypb.History {
 func TestPushPipelineWorkflow_ReplayBaselineHappyPath(t *testing.T) {
 	if err := replay(t, baselineHappyPathHistory(t)); err != nil {
 		t.Fatalf("009 之前的成功推送历史必须能被当前 workflow 无损重放，实得: %v", err)
+	}
+}
+
+// preP1cScoreIn / preP1cCardGenIn 必须是历史年代自己的 wire schema，不能拿
+// 当前类型填零值再依赖 omitempty：后者会被未来的 json tag 或默认值改动悄悄改写，
+// 让所谓“旧历史”其实跟着新代码漂移。
+type preP1cScoreIn struct {
+	UserID  int64               `json:"user_id"`
+	TraceID string              `json:"trace_id"`
+	Items   []types.ContentItem `json:"items"`
+}
+
+type preP1cCardGenIn struct {
+	UserID  int64              `json:"user_id"`
+	TraceID string             `json:"trace_id"`
+	Items   []types.ScoredItem `json:"items"`
+}
+
+// postP1bPreP1cScheduledHappyPathHistory 是 P1b 已上线、P1c 尚未开发时的一份
+// 完整定时任务历史。它与上面的 009 基线守不同的发布边界：
+//
+//   - PushParams 已有非空 ScheduleID，Fetch / Select / Push 都消费任务身份；
+//   - ScoreIn / CardGenIn 仍是 P1c 之前的旧载荷，不含任务身份。
+//
+// 这份历史刻意取 P1b→A5 之间的真实形状（没有 scheduled-run-authorization
+// Version marker）；当前 workflow 重放时 GetVersion 返回 DefaultVersion，故不会凭空
+// 期待 AuthorizeRun。P1c 给现有 Activity input 增字段也不需要再套 GetVersion：Go SDK
+// v1.46 的 ScheduleActivity replay matcher 比对 ActivityID+Type，不比 input。已经调度的
+// Activity 继续收到历史旧载荷；尚未调度的 Activity 由新代码生成含任务身份的新载荷。
+func postP1bPreP1cScheduledHappyPathHistory(t *testing.T) *historypb.History {
+	t.Helper()
+	p := PushParams{
+		UserID:     7,
+		ScheduleID: "push-7-playbook",
+		NLDesc:     "每日 AI 情报",
+	}
+	const traceID = "9f1d6c5e-0000-4000-8000-prep1chistory0"
+
+	b := newHistoryBuilder(t, p)
+	b.sideEffect(1, traceID)
+	b.activity("EvolveProfile", EvolveIn{UserID: p.UserID, TraceID: traceID}, nil)
+	b.activity("Fetch", p, items(20))
+	b.activity("Dedup", DedupIn{UserID: p.UserID, TraceID: traceID, Items: items(20)}, items(18))
+	// P1c 前这两个载荷刻意没有 ScheduleID；这不是漏写，是本基线的核心。
+	b.activity("Score", preP1cScoreIn{UserID: p.UserID, TraceID: traceID, Items: items(18)}, scoredItems(18))
+	b.activity("Select", SelectIn{
+		UserID: p.UserID, TraceID: traceID, TopN: defaultTopN,
+		Scored: scoredItems(18), ScheduleID: p.ScheduleID,
+	}, scoredItems(5))
+	b.activity("CardGen", preP1cCardGenIn{UserID: p.UserID, TraceID: traceID, Items: scoredItems(5)}, cardsOf(5))
+	b.activity("Push", PushIn{
+		UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID,
+		Cards: cardsOf(5), TaskTitle: p.NLDesc,
+	}, nil)
+	return b.complete()
+}
+
+func TestPushPipelineWorkflow_ReplayPostP1bPreP1cScheduledHappyPath(t *testing.T) {
+	if err := replay(t, postP1bPreP1cScheduledHappyPathHistory(t)); err != nil {
+		t.Fatalf("P1b 后、P1c 前的定时任务历史必须能被当前 workflow 无损重放，实得: %v", err)
+	}
+}
+
+// postA5PreP1cScheduledHappyPathHistory 覆盖 P1c 发布前最近的一代历史：A5 已加入
+// 授权 marker/Activity，但 Score/CardGen 仍使用物理上没有 ScheduleID 的旧 schema。
+// 与 pre-A5 夹具并存，是为了同时守住存量 retention 尾部和真实发布窗口。
+func postA5PreP1cScheduledHappyPathHistory(t *testing.T) *historypb.History {
+	t.Helper()
+	p := PushParams{
+		UserID:     7,
+		RunKind:    PushRunKindScheduled,
+		ScheduleID: "push-7-playbook-a5",
+		NLDesc:     "每日 AI 情报",
+	}
+	const traceID = "9f1d6c5e-0000-4000-8000-posta5history0"
+
+	b := newHistoryBuilder(t, p)
+	b.sideEffect(1, traceID)
+	b.versionWithSearchAttributes("scheduled-run-authorization", 1)
+	b.activity("AuthorizeRun", p, true)
+	b.activity("EvolveProfile", EvolveIn{UserID: p.UserID, TraceID: traceID}, nil)
+	b.activity("Fetch", p, items(20))
+	b.activity("Dedup", DedupIn{UserID: p.UserID, TraceID: traceID, Items: items(20)}, items(18))
+	b.activity("Score", preP1cScoreIn{UserID: p.UserID, TraceID: traceID, Items: items(18)}, scoredItems(18))
+	b.activity("Select", SelectIn{
+		UserID: p.UserID, TraceID: traceID, TopN: defaultTopN,
+		Scored: scoredItems(18), ScheduleID: p.ScheduleID,
+	}, scoredItems(5))
+	b.activity("CardGen", preP1cCardGenIn{UserID: p.UserID, TraceID: traceID, Items: scoredItems(5)}, cardsOf(5))
+	b.activity("Push", PushIn{
+		UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID,
+		Cards: cardsOf(5), TaskTitle: p.NLDesc,
+	}, nil)
+	return b.complete()
+}
+
+func TestPushPipelineWorkflow_ReplayPostA5PreP1cScheduledHappyPath(t *testing.T) {
+	if err := replay(t, postA5PreP1cScheduledHappyPathHistory(t)); err != nil {
+		t.Fatalf("A5 后、P1c 前的定时任务历史必须能被当前 workflow 无损重放，实得: %v", err)
+	}
+}
+
+// TestPushPipelineWorkflow_ReplayPostP1bRejectsActivityTypeMutation 是上条历史的
+// 校准器：Activity input 漂移在本 SDK 版本合法，但类型/命令序列漂移仍必须被咬住。
+// 若本用例变绿，上面那个 PASS 只说明重放器失效，不能再作为发布证据。
+func TestPushPipelineWorkflow_ReplayPostP1bRejectsActivityTypeMutation(t *testing.T) {
+	h := postP1bPreP1cScheduledHappyPathHistory(t)
+	mutated := false
+	for _, event := range h.Events {
+		attrs := event.GetActivityTaskScheduledEventAttributes()
+		if attrs.GetActivityType().GetName() == "Score" {
+			attrs.ActivityType.Name = "ScoreBeforeP1c"
+			mutated = true
+			break
+		}
+	}
+	if !mutated {
+		t.Fatal("校准夹具中没有找到 Score Activity")
+	}
+	if err := replay(t, h); err == nil {
+		t.Fatal("篡改历史 Activity Type 后重放应失败；未失败说明 replay 夹具没有约束命令身份")
+	} else {
+		t.Logf("符合预期的 Activity Type 非确定性错误: %v", err)
 	}
 }
 

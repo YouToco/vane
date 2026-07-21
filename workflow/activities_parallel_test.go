@@ -30,7 +30,7 @@ type ctrlScorer struct {
 	block chan struct{}
 }
 
-func (s *ctrlScorer) Score(ctx context.Context, _ int64, item types.ContentItem, _ string) (float64, error) {
+func (s *ctrlScorer) Score(ctx context.Context, _ int64, item types.ContentItem, _, _ string) (float64, error) {
 	s.mu.Lock()
 	s.calls++
 	s.inflight++
@@ -86,7 +86,7 @@ type ctrlCardGen struct {
 	failErr     error // 同 ctrlScorer.failErr
 }
 
-func (g *ctrlCardGen) Generate(ctx context.Context, _ int64, si types.ScoredItem, _ string) (string, error) {
+func (g *ctrlCardGen) Generate(ctx context.Context, _ int64, si types.ScoredItem, _, _ string) (string, error) {
 	g.mu.Lock()
 	g.inflight++
 	if g.inflight > g.maxInflight {
@@ -382,7 +382,7 @@ func (p *panicScorer) callCount() int {
 	return p.calls
 }
 
-func (p *panicScorer) Score(ctx context.Context, _ int64, item types.ContentItem, _ string) (float64, error) {
+func (p *panicScorer) Score(ctx context.Context, _ int64, item types.ContentItem, _, _ string) (float64, error) {
 	p.mu.Lock()
 	p.calls++
 	p.mu.Unlock()
