@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"strconv"
@@ -344,6 +345,42 @@ func postP1bPreP1cScheduledHappyPathHistory(t *testing.T) *historypb.History {
 func TestPushPipelineWorkflow_ReplayPostP1bPreP1cScheduledHappyPath(t *testing.T) {
 	if err := replay(t, postP1bPreP1cScheduledHappyPathHistory(t)); err != nil {
 		t.Fatalf("P1b 后、P1c 前的定时任务历史必须能被当前 workflow 无损重放，实得: %v", err)
+	}
+}
+
+func TestPreP1cReplayFixturesPhysicallyOmitScheduleID(t *testing.T) {
+	for name, history := range map[string]*historypb.History{
+		"post P1b pre A5": postP1bPreP1cScheduledHappyPathHistory(t),
+		"post A5":         postA5PreP1cScheduledHappyPathHistory(t),
+	} {
+		t.Run(name, func(t *testing.T) {
+			seen := map[string]bool{"Score": false, "CardGen": false}
+			for _, event := range history.Events {
+				attrs := event.GetActivityTaskScheduledEventAttributes()
+				activityType := attrs.GetActivityType().GetName()
+				if _, relevant := seen[activityType]; !relevant {
+					continue
+				}
+				payloads := attrs.GetInput().GetPayloads()
+				if len(payloads) != 1 {
+					t.Fatalf("%s 历史输入 payload 数 = %d，期望 1", activityType, len(payloads))
+				}
+				var wire map[string]json.RawMessage
+				if err := json.Unmarshal(payloads[0].GetData(), &wire); err != nil {
+					t.Fatalf("解析 %s 历史输入 JSON: %v", activityType, err)
+				}
+				if _, exists := wire["schedule_id"]; exists {
+					t.Fatalf("%s 的 pre-P1c 历史物理上不得含 schedule_id: %s",
+						activityType, payloads[0].GetData())
+				}
+				seen[activityType] = true
+			}
+			for activityType, ok := range seen {
+				if !ok {
+					t.Fatalf("历史中未找到 %s Activity", activityType)
+				}
+			}
+		})
 	}
 }
 

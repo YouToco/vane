@@ -8,12 +8,15 @@ package scorer
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/profilehint"
@@ -111,14 +114,17 @@ func New(cli *llm.Client, rec *llm.Recorder, st *store.Store, hints *profilehint
 // Score 对单条内容打 0-100 相关分。
 // LLM 调用本身失败（超时/限流/上游错误）向上抛，交给 Temporal 重试；
 // 只有"调用成功但输出无法解析"才回退中位分——前者是瞬态故障值得重试，
-// 后者是模型语义问题重试也是同样结果。
-func (sc *Scorer) Score(ctx context.Context, userID int64, item types.ContentItem, traceID string) (float64, error) {
+// 后者是模型语义问题重试也是同样结果。taskInstruction 为空时保持旧请求逐字节
+// 不变；非空时由 promptguard 消毒新定界符并追加到已构造好的 user prompt 尾部。
+
+func (sc *Scorer) Score(ctx context.Context, userID int64, item types.ContentItem, traceID, taskInstruction string) (float64, error) {
+	userPrompt := buildScoreUser(
+		sc.hints.Hint(ctx, userID, traceID),
+		sc.negTitles(ctx, userID, traceID),
+		item)
 	req := llm.Request{
-		System: scoreSystemPrompt,
-		User: buildScoreUser(
-			sc.hints.Hint(ctx, userID, traceID),
-			sc.negTitles(ctx, userID, traceID),
-			item),
+		System:      scoreSystemPrompt,
+		User:        promptguard.AppendTaskInstruction(userPrompt, taskInstruction),
 		Temperature: f32ptr(0), // 打分要稳定可复现，温度取 0
 		MaxTokens:   iptr(16),  // 只需一个数字，压满上限省 token
 		// 必须关思维链：V4 默认 reasoning 会把 16 token 预算全部吃光、content 恒空，
@@ -146,10 +152,12 @@ func (sc *Scorer) Score(ctx context.Context, userID int64, item types.ContentIte
 
 	score, ok := parseScore(resp.Content)
 	if !ok {
-		slog.Warn("scorer: 模型输出无法解析为分数，回退中位分",
+		digest := sha256.Sum256([]byte(resp.Content))
+		slog.WarnContext(ctx, "scorer: 模型输出无法解析为分数，回退中位分",
 			"trace_id", traceID,
 			"content_item_id", item.ID,
-			"raw", resp.Content)
+			"completion_runes", utf8.RuneCountInString(resp.Content),
+			"completion_sha256", fmt.Sprintf("%x", digest[:8]))
 		return medianScore, nil
 	}
 	return score, nil

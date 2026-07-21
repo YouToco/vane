@@ -118,6 +118,11 @@ type emptyBatchCall struct {
 	counts     types.PipelineCounts
 }
 
+type playbookReadCall struct {
+	userID     int64
+	scheduleID string
+}
+
 type fakeStore struct {
 	runAuthorized       bool
 	runAuthorizationErr error
@@ -132,6 +137,7 @@ type fakeStore struct {
 	playbook      *types.SchedulePlaybook
 	playbookErr   error
 	playbookCalls int
+	playbookReads []playbookReadCall
 
 	nextDelID   int64
 	sentAlready bool // true = 模拟重试时该 (batch, content) 已发过
@@ -223,10 +229,11 @@ func (f *fakeStore) GetScheduleStrictness(context.Context, string) (types.PushSt
 	return f.strictness, nil
 }
 
-func (f *fakeStore) GetSchedulePlaybook(context.Context, int64, string) (*types.SchedulePlaybook, error) {
+func (f *fakeStore) GetSchedulePlaybook(_ context.Context, userID int64, scheduleID string) (*types.SchedulePlaybook, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.playbookCalls++
+	f.playbookReads = append(f.playbookReads, playbookReadCall{userID: userID, scheduleID: scheduleID})
 	if f.playbookErr != nil {
 		return nil, f.playbookErr
 	}

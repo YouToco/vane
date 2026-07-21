@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -185,6 +186,32 @@ func TestComplete429RateLimit(t *testing.T) {
 	}
 	if !errors.Is(err, types.ErrLLM) {
 		t.Error("429 错误应匹配 ErrLLM 哨兵")
+	}
+}
+
+func TestCompleteHTTPErrorDoesNotExposeUpstreamBody(t *testing.T) {
+	const secret = "PLAYBOOK-PROMPT-MUST-NOT-LEAK"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"` + secret + `"}`))
+	}))
+	defer srv.Close()
+
+	_, err := newTestClient(srv.URL, 1).Complete(t.Context(), Request{User: secret})
+	if err == nil {
+		t.Fatal("期望上游 HTTP 错误")
+	}
+	got := err.Error()
+	if strings.Contains(got, secret) {
+		t.Fatalf("错误链泄露上游响应体: %q", got)
+	}
+	for _, want := range []string{"HTTP 502", "捕获响应体", "sha256="} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("安全错误摘要缺少 %q: %q", want, got)
+		}
+	}
+	if code := types.CodeOf(err); code != types.CodeLLMUnavailable {
+		t.Fatalf("安全摘要不得改变错误映射，实际 %s", code)
 	}
 }
 

@@ -160,7 +160,9 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 3. Score —— LLM 调用，超时给足。
 	var scored []types.ScoredItem
 	scoreCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
-	if err := workflow.ExecuteActivity(scoreCtx, a.Score, ScoreIn{UserID: p.UserID, TraceID: traceID, Items: deduped}).Get(scoreCtx, &scored); err != nil {
+	if err := workflow.ExecuteActivity(scoreCtx, a.Score, ScoreIn{
+		UserID: p.UserID, TraceID: traceID, Items: deduped, ScheduleID: p.ScheduleID,
+	}).Get(scoreCtx, &scored); err != nil {
 		// 额度用尽不是故障，是**正常终态**——和"没有新内容"同一类，只是原因不同。
 		// 让它走 workflow 失败会：① 在 Temporal 里堆一串红色的失败记录，
 		// ② 用户什么提示都收不到（失败路径不发通知），只能干等着纳闷。
@@ -220,7 +222,9 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 5. CardGen —— LLM 调用。
 	var cards []GeneratedCard
 	cardCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
-	if err := workflow.ExecuteActivity(cardCtx, a.CardGen, CardGenIn{UserID: p.UserID, TraceID: traceID, Items: selected}).Get(cardCtx, &cards); err != nil {
+	if err := workflow.ExecuteActivity(cardCtx, a.CardGen, CardGenIn{
+		UserID: p.UserID, TraceID: traceID, Items: selected, ScheduleID: p.ScheduleID,
+	}).Get(cardCtx, &cards); err != nil {
 		if isQuotaFailure(err) {
 			recordEmpty(types.BatchExitGateQuota, -1)
 			log.Info("额度用尽，本轮跳过出卡", "trace_id", traceID)

@@ -72,6 +72,10 @@ fetch:
   tikhub_api_key: "yaml-tikhub"
   timeout_seconds: 30
   max_response_mb: 8
+pipeline:
+  playbook_prompts_enabled: true
+  playbook_prompt_canary_schedule_id: "schedule-yaml"
+  playbook_prompts_allow_all: false
 agent:
   max_turns: 15
   token_budget_daily: 50000
@@ -102,6 +106,9 @@ log:
 		{"fetch.tikhub_api_key", cfg.Fetch.TikhubAPIKey, "yaml-tikhub"},
 		{"fetch.timeout_seconds", cfg.Fetch.TimeoutSeconds, 30},
 		{"fetch.max_response_mb", cfg.Fetch.MaxResponseMB, 8},
+		{"pipeline.playbook_prompts_enabled", cfg.Pipeline.PlaybookPromptsEnabled, true},
+		{"pipeline.playbook_prompt_canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID, "schedule-yaml"},
+		{"pipeline.playbook_prompts_allow_all", cfg.Pipeline.PlaybookPromptsAllowAll, false},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 15},
 		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 50000},
 		{"log.level", cfg.Log.Level, "debug"},
@@ -123,6 +130,10 @@ llm:
   api_key: "yaml-key"
 fetch:
   tikhub_api_key: "yaml-tikhub-key"
+pipeline:
+  playbook_prompts_enabled: false
+  playbook_prompt_canary_schedule_id: "schedule-yaml"
+  playbook_prompts_allow_all: true
 log:
   level: "info"
 `)
@@ -130,6 +141,9 @@ log:
 	t.Setenv("VANE_DB_URL", "postgres://from-env")
 	t.Setenv("VANE_LLM_API_KEY", "env-key")
 	t.Setenv("VANE_FETCH_TIKHUB_API_KEY", "env-tikhub-key")
+	t.Setenv("VANE_PIPELINE_PLAYBOOK_PROMPTS_ENABLED", "true")
+	t.Setenv("VANE_PIPELINE_PLAYBOOK_PROMPT_CANARY_SCHEDULE_ID", "schedule-env")
+	t.Setenv("VANE_PIPELINE_PLAYBOOK_PROMPTS_ALLOW_ALL", "false")
 	t.Setenv("VANE_LOG_LEVEL", "warn") // 非敏感键走 AutomaticEnv + 默认值注册
 
 	cfg, err := Load(path)
@@ -139,19 +153,62 @@ log:
 
 	checks := []struct {
 		name string
-		got  string
-		want string
+		got  any
+		want any
 	}{
 		{"db.url", cfg.DB.URL, "postgres://from-env"},
 		{"llm.api_key", cfg.LLM.APIKey, "env-key"},
 		{"fetch.tikhub_api_key", cfg.Fetch.TikhubAPIKey, "env-tikhub-key"},
+		{"pipeline.playbook_prompts_enabled", cfg.Pipeline.PlaybookPromptsEnabled, true},
+		{"pipeline.playbook_prompt_canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID, "schedule-env"},
+		{"pipeline.playbook_prompts_allow_all", cfg.Pipeline.PlaybookPromptsAllowAll, false},
 		{"log.level", cfg.Log.Level, "warn"},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
-			t.Errorf("%s = %q, 期望环境变量覆盖为 %q", c.name, c.got, c.want)
+			t.Errorf("%s = %v, 期望环境变量覆盖为 %v", c.name, c.got, c.want)
 		}
 	}
+}
+
+func TestLoadPlaybookPromptsExplicitAllowAll(t *testing.T) {
+	t.Run("yaml", func(t *testing.T) {
+		clearVaneEnv(t)
+		path := writeTempConfig(t, `
+db:
+  url: "postgres://yaml"
+pipeline:
+  playbook_prompts_enabled: true
+  playbook_prompt_canary_schedule_id: ""
+  playbook_prompts_allow_all: true
+`)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("YAML 显式全量配置应能启动: %v", err)
+		}
+		if !cfg.Pipeline.PlaybookPromptsEnabled || !cfg.Pipeline.PlaybookPromptsAllowAll ||
+			cfg.Pipeline.PlaybookPromptCanaryScheduleID != "" {
+			t.Fatalf("YAML 全量配置未接通: %+v", cfg.Pipeline)
+		}
+	})
+
+	t.Run("environment", func(t *testing.T) {
+		clearVaneEnv(t)
+		skipIfSystemConfigExists(t)
+		t.Chdir(t.TempDir())
+		t.Setenv("VANE_DB_URL", "postgres://env")
+		t.Setenv("VANE_PIPELINE_PLAYBOOK_PROMPTS_ENABLED", "true")
+		t.Setenv("VANE_PIPELINE_PLAYBOOK_PROMPTS_ALLOW_ALL", "true")
+
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatalf("环境变量显式全量配置应能启动: %v", err)
+		}
+		if !cfg.Pipeline.PlaybookPromptsEnabled || !cfg.Pipeline.PlaybookPromptsAllowAll ||
+			cfg.Pipeline.PlaybookPromptCanaryScheduleID != "" {
+			t.Fatalf("环境变量全量配置未接通: %+v", cfg.Pipeline)
+		}
+	})
 }
 
 // TestEnvOnlyNoFile 验证没有任何配置文件时，纯环境变量也能跑通。
@@ -198,6 +255,9 @@ func TestDefaults(t *testing.T) {
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 32},
 		{"fetch.timeout_seconds", cfg.Fetch.TimeoutSeconds, 20},
 		{"fetch.max_response_mb", cfg.Fetch.MaxResponseMB, 5},
+		{"pipeline.playbook_prompts_enabled", cfg.Pipeline.PlaybookPromptsEnabled, false},
+		{"pipeline.playbook_prompt_canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID, ""},
+		{"pipeline.playbook_prompts_allow_all", cfg.Pipeline.PlaybookPromptsAllowAll, false},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
 		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 100000},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},
@@ -207,6 +267,44 @@ func TestDefaults(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s = %v, 期望默认值 %v", c.name, c.got, c.want)
 		}
+	}
+}
+
+func TestValidate_NormalizesPlaybookPromptCanaryScheduleID(t *testing.T) {
+	tests := []struct {
+		name     string
+		enabled  bool
+		allowAll bool
+		input    string
+		want     string
+		wantErr  bool
+	}{
+		{name: "empty without explicit all is rejected", enabled: true, wantErr: true},
+		{name: "explicit all allows empty canary", enabled: true, allowAll: true},
+		{name: "surrounding whitespace is trimmed", enabled: true, input: "  task-canary  ", want: "task-canary"},
+		{name: "enabled whitespace only is rejected", enabled: true, input: " \t\n ", wantErr: true},
+		{name: "canary and all are ambiguous", enabled: true, allowAll: true, input: "task-canary", wantErr: true},
+		{name: "disabled remains a rollback even with whitespace", allowAll: true, input: " \t\n "},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				DB: DBConfig{URL: "postgres://test"},
+				Pipeline: PipelineConfig{
+					PlaybookPromptsEnabled:         tt.enabled,
+					PlaybookPromptCanaryScheduleID: tt.input,
+					PlaybookPromptsAllowAll:        tt.allowAll,
+				},
+			}
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v，wantErr=%v", err, tt.wantErr)
+			}
+			if !tt.wantErr && cfg.Pipeline.PlaybookPromptCanaryScheduleID != tt.want {
+				t.Fatalf("canary schedule id = %q，期望 %q", cfg.Pipeline.PlaybookPromptCanaryScheduleID, tt.want)
+			}
+		})
 	}
 }
 

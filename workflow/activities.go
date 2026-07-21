@@ -17,6 +17,7 @@ import (
 	"github.com/YouToco/vane/dedup"
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/fetcher"
+	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/selector"
 	"github.com/YouToco/vane/types"
 )
@@ -83,14 +84,14 @@ type Fetcher interface {
 
 // Scorer 给单条内容打分（scorer.Score，0-100）。traceID 贯穿 llm 记账。
 type Scorer interface {
-	Score(ctx context.Context, userID int64, item types.ContentItem, traceID string) (float64, error)
+	Score(ctx context.Context, userID int64, item types.ContentItem, traceID, taskInstruction string) (float64, error)
 }
 
 // CardGenerator 为单条打分内容生成解读正文 markdown（cardgen.Generate 的
 // bodyMD，含阅读原文行）。最终卡片 JSON 由 Push 内经注入的 buildCard 构造——
 // 按钮 value 携带 delivery_id，只能在拿到 id 后生成（契约 §8.2）。
 type CardGenerator interface {
-	Generate(ctx context.Context, userID int64, item types.ScoredItem, traceID string) (string, error)
+	Generate(ctx context.Context, userID int64, item types.ScoredItem, traceID, taskInstruction string) (string, error)
 }
 
 // ProfileEvolver 画像演化器（生产实现 evolver.Evolver）：推送前批量消费该用户
@@ -169,6 +170,9 @@ type Store interface {
 	// GetScheduleStrictness 读任务的推送门槛档位（migration 025，Select 过滤用）。
 	// 空串 = 未设置/行不存在 → 调用方按 types.DefaultStrictness 兜底。
 	GetScheduleStrictness(ctx context.Context, scheduleID string) (types.PushStrictness, error)
+	// GetSchedulePlaybook supplies the user-approved task instruction consumed
+	// by Score and CardGen. Both Activities read it once before their fan-out.
+	GetSchedulePlaybook(ctx context.Context, userID int64, scheduleID string) (*types.SchedulePlaybook, error)
 }
 
 // Activities 持有 6 步 pipeline 的全部依赖，方法即 Temporal Activity。
@@ -195,6 +199,27 @@ type Activities struct {
 	// 分开：告警卡不带任何反馈按钮/回调，绝不复用 M5 的 delivery 卡结构（5.2 不碰
 	// 卡片反馈路径）。nil = 抓取失败告警退化为静默 no-op（灰度/测试装配）。
 	buildNotice func(markdown string) string
+	// playbookPromptsEnabled is the P1c rollout switch. A non-empty canary ID
+	// narrows injection to one real schedule; empty means all schedules once
+	// the canary has passed. Both are immutable after worker construction.
+	playbookPromptsEnabled         bool
+	playbookPromptCanaryScheduleID string
+}
+
+// ActivitiesOption configures rollout-only Activity behavior without adding
+// another positional constructor parameter to every test and composition root.
+type ActivitiesOption func(*Activities)
+
+// WithPlaybookPromptPolicy controls P1c prompt injection. enabled=false is an
+// exact rollback switch. When canaryScheduleID is non-empty, only that one task
+// may load a playbook; all other tasks stay on the byte-identical legacy path.
+// The composition root validates a separate explicit allow-all key before it
+// may call this with enabled=true and an empty canary ID.
+func WithPlaybookPromptPolicy(enabled bool, canaryScheduleID string) ActivitiesOption {
+	return func(a *Activities) {
+		a.playbookPromptsEnabled = enabled
+		a.playbookPromptCanaryScheduleID = strings.TrimSpace(canaryScheduleID)
+	}
 }
 
 // NewActivities 装配 Activities。前六参顺序与规格 B6"持有 fetcher/scorer/
@@ -203,10 +228,16 @@ type Activities struct {
 func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, fs FeishuManager,
 	ev ProfileEvolver, buildNotice func(markdown string) string,
 	buildAggCard func(in feedback.AggregateCardInput) string,
-	aggHeader func(task string, n int) (title, template string)) *Activities {
-	return &Activities{fetcher: f, scorer: sc, cardgen: cg, pusher: p, store: st, feishu: fs,
+	aggHeader func(task string, n int) (title, template string), opts ...ActivitiesOption) *Activities {
+	a := &Activities{fetcher: f, scorer: sc, cardgen: cg, pusher: p, store: st, feishu: fs,
 		evolver: ev, buildNotice: buildNotice,
 		buildAggCard: buildAggCard, aggHeader: aggHeader}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(a)
+		}
+	}
+	return a
 }
 
 // ============================================================
@@ -229,9 +260,10 @@ type DedupIn struct {
 
 // ScoreIn 是 Score Activity 的入参。
 type ScoreIn struct {
-	UserID  int64               `json:"user_id"`
-	TraceID string              `json:"trace_id"`
-	Items   []types.ContentItem `json:"items"`
+	UserID     int64               `json:"user_id"`
+	TraceID    string              `json:"trace_id"`
+	Items      []types.ContentItem `json:"items"`
+	ScheduleID string              `json:"schedule_id,omitempty"`
 }
 
 // SelectIn 是 Select Activity 的入参。
@@ -255,9 +287,10 @@ type SelectIn struct {
 
 // CardGenIn 是 CardGen Activity 的入参。
 type CardGenIn struct {
-	UserID  int64              `json:"user_id"`
-	TraceID string             `json:"trace_id"`
-	Items   []types.ScoredItem `json:"items"`
+	UserID     int64              `json:"user_id"`
+	TraceID    string             `json:"trace_id"`
+	Items      []types.ScoredItem `json:"items"`
+	ScheduleID string             `json:"schedule_id,omitempty"`
 }
 
 // PushIn 是 Push Activity 的入参。
@@ -830,6 +863,77 @@ feed:
 	return out
 }
 
+// loadTaskInstruction reads the approved playbook once for one Activity batch.
+// Missing/empty/error all fail open to an empty instruction so pre-playbook
+// tasks retain the exact legacy LLM request. Logs expose only state and size;
+// the content reaches only the downstream LLM request and its existing audit
+// ledger, never Temporal history or application logs.
+func (a *Activities) loadTaskInstruction(
+	ctx context.Context,
+	userID int64,
+	scheduleID, traceID, stage string,
+) string {
+	if scheduleID == "" || a.store == nil {
+		return ""
+	}
+	if !a.playbookPromptsEnabled {
+		slog.DebugContext(ctx, "task playbook: prompt injection disabled; using legacy prompt",
+			"stage", stage,
+			"user_id", userID,
+			"schedule_id", scheduleID,
+			"trace_id", traceID,
+			"status", "disabled")
+		return ""
+	}
+	if canaryID := a.playbookPromptCanaryScheduleID; canaryID != "" && canaryID != scheduleID {
+		slog.DebugContext(ctx, "task playbook: schedule outside canary; using legacy prompt",
+			"stage", stage,
+			"user_id", userID,
+			"schedule_id", scheduleID,
+			"trace_id", traceID,
+			"status", "not_canary")
+		return ""
+	}
+	pb, err := a.store.GetSchedulePlaybook(ctx, userID, scheduleID)
+	if err != nil {
+		if errors.Is(err, types.ErrNotFound) {
+			slog.DebugContext(ctx, "task playbook: no instruction loaded; using legacy prompt",
+				"stage", stage,
+				"user_id", userID,
+				"schedule_id", scheduleID,
+				"trace_id", traceID,
+				"status", "not_found")
+		} else {
+			slog.WarnContext(ctx, "task playbook: instruction read failed; using legacy prompt",
+				"stage", stage,
+				"user_id", userID,
+				"schedule_id", scheduleID,
+				"trace_id", traceID,
+				"status", "error",
+				"err", err)
+		}
+		return ""
+	}
+	if pb == nil || strings.TrimSpace(pb.Content) == "" {
+		slog.DebugContext(ctx, "task playbook: no instruction loaded; using legacy prompt",
+			"stage", stage,
+			"user_id", userID,
+			"schedule_id", scheduleID,
+			"trace_id", traceID,
+			"status", "empty")
+		return ""
+	}
+	slog.InfoContext(ctx, "task playbook: instruction loaded",
+		"stage", stage,
+		"user_id", userID,
+		"schedule_id", scheduleID,
+		"trace_id", traceID,
+		"status", "loaded",
+		"stored_runes", len([]rune(pb.Content)),
+		"injection_cap_runes", promptguard.TaskInstructionMaxRunes)
+	return pb.Content
+}
+
 // Score 逐条打分（并发扇出，见 mapConcurrent）。同一 TraceID 串起整批的 llm_calls
 // 便于事后追踪。单条失败跳过；整批全失败（大概率 LLM 不可用）返回错误触发重试。
 //
@@ -844,11 +948,12 @@ func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem,
 	if a.refuseIfTenantGone(ctx, in.UserID, "score") {
 		return nil, nil
 	}
+	taskInstruction := a.loadTaskInstruction(ctx, in.UserID, in.ScheduleID, in.TraceID, "score")
 	// 并发扇出里各 goroutine 都可能撞到配额，用原子标记而非普通 bool。
 	var quotaHit atomic.Bool
 	scored := mapConcurrent(ctx, in.Items, parBatchFanout,
 		func(ctx context.Context, item types.ContentItem) (types.ScoredItem, error) {
-			s, err := a.scorer.Score(ctx, in.UserID, item, in.TraceID)
+			s, err := a.scorer.Score(ctx, in.UserID, item, in.TraceID, taskInstruction)
 			if err != nil {
 				return types.ScoredItem{}, err
 			}
@@ -858,7 +963,7 @@ func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem,
 			if isQuotaErr(err) {
 				quotaHit.Store(true)
 			}
-			slog.Warn("score: 单条打分失败，跳过", "content_item_id", item.ID, "trace_id", in.TraceID, "err", err)
+			logPipelineItemFailure(ctx, "score: 单条打分失败，跳过", item.ID, in.TraceID, err)
 		})
 	if len(scored) == 0 && len(in.Items) > 0 {
 		// 额度用尽与"LLM 挂了"必须分开报。混在一起的代价很具体：走 LLMUnavailable
@@ -930,10 +1035,11 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 	if a.refuseIfTenantGone(ctx, in.UserID, "cardgen") {
 		return nil, nil
 	}
+	taskInstruction := a.loadTaskInstruction(ctx, in.UserID, in.ScheduleID, in.TraceID, "cardgen")
 	var quotaHit atomic.Bool
 	cards := mapConcurrent(ctx, in.Items, parBatchFanout,
 		func(ctx context.Context, si types.ScoredItem) (GeneratedCard, error) {
-			body, err := a.cardgen.Generate(ctx, in.UserID, si, in.TraceID)
+			body, err := a.cardgen.Generate(ctx, in.UserID, si, in.TraceID, taskInstruction)
 			if err != nil {
 				return GeneratedCard{}, err
 			}
@@ -943,7 +1049,7 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 			if isQuotaErr(err) {
 				quotaHit.Store(true)
 			}
-			slog.Warn("cardgen: 单条生成失败，跳过", "content_item_id", si.Item.ID, "trace_id", in.TraceID, "err", err)
+			logPipelineItemFailure(ctx, "cardgen: 单条生成失败，跳过", si.Item.ID, in.TraceID, err)
 		})
 	if len(cards) == 0 && len(in.Items) > 0 {
 		if quotaHit.Load() {
@@ -953,6 +1059,19 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "整批卡片生成全部失败", nil)
 	}
 	return cards, nil
+}
+
+// logPipelineItemFailure keeps arbitrary downstream error strings out of app
+// logs. LLM/provider errors can echo the complete prompt; structured code,
+// concrete Go type and retryability are enough to triage before consulting the
+// llm_calls audit ledger by trace ID.
+func logPipelineItemFailure(ctx context.Context, message string, contentItemID int64, traceID string, err error) {
+	slog.WarnContext(ctx, message,
+		"content_item_id", contentItemID,
+		"trace_id", traceID,
+		"error_code", types.CodeOf(err),
+		"error_type", fmt.Sprintf("%T", err),
+		"retryable", types.IsRetryable(err))
 }
 
 // RecordEmptyBatch 把一次"无内容可推"的正常终态落进 push_batches（009 /

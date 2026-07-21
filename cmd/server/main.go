@@ -116,7 +116,13 @@ func run() error {
 	// 与 buildCard（带反馈按钮的 delivery 卡）分开注入，不碰 M5 卡片反馈路径。
 	activities := workflow.NewActivities(fetch, score, cards, push, st, manager, ev,
 		feishu.BuildReplyCard,
-		feishu.BuildAggregateCard, feishu.AggHeaderForTask)
+		feishu.BuildAggregateCard, feishu.AggHeaderForTask,
+		workflow.WithPlaybookPromptPolicy(cfg.Pipeline.PlaybookPromptsEnabled,
+			cfg.Pipeline.PlaybookPromptCanaryScheduleID))
+	slog.Info("task playbook prompt policy configured",
+		"enabled", cfg.Pipeline.PlaybookPromptsEnabled,
+		"canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID,
+		"allow_all", cfg.Pipeline.PlaybookPromptsAllowAll)
 
 	// worker：非阻塞 Start，关停时 Stop()（见下方顺序关停）。显式 stop timeout
 	// 保证 Stop 不会采用 SDK 的 0 秒默认值、在 Activity 仍收尾时就释放 DB/Temporal。

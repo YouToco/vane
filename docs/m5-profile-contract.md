@@ -231,8 +231,9 @@ func NewCache(st Store) *Cache
 func (c *Cache) Hint(ctx context.Context, userID int64, traceID string) string
 ```
 
-**权衡结论**：per-trace 缓存而非改 Activities 签名——`workflow.Scorer`/`CardGenerator` 接口一字
-不动（画像进 Temporal payload 会污染重放历史；scorer.go:102-108 注释承诺"调用方零改动"，履约）。
+**M5 当时的权衡结论**：画像仍用 per-trace 缓存，不进入 Temporal payload。P1c 后
+`workflow.Scorer`/`CardGenerator` 只新增稳定的 `taskInstruction string` 参数；Temporal payload
+仍只携带 `ScheduleID`，手册正文由 Activity 内按属主读取，因此画像与手册正文都不污染重放历史。
 
 ## 5. scorer 画像化 + 快通道负反馈（`scorer/scorer.go`）
 
@@ -245,7 +246,9 @@ type Scorer struct {
 func New(cli *llm.Client, rec *llm.Recorder, st *store.Store, hints *profilehint.Cache) *Scorer
 ```
 
-`Score` 签名不变；`profileHint` stub 删除，改 `hints.Hint(...)` + `negTitles(...)`。
+`Score(ctx, userID, item, traceID, taskInstruction)`；M5 的 `profileHint` stub 删除，改
+`hints.Hint(...)` + `negTitles(...)`。P1c 的 `taskInstruction` 只在非空时追加到旧 user prompt 尾部；
+此时会专门消毒外部标题/正文中伪造的 `【任务手册` 前缀，其余旧 prompt 字节保持不变。
 MaxTokens=16 / Temperature=0 / DisableThinking=true / 首数字解析+中位分 50 回退**原样保留**。
 
 **system prompt 替换**（确切文本）：
@@ -268,9 +271,13 @@ MaxTokens=16 / Temperature=0 / DisableThinking=true / 首数字解析+中位分 
 标题：{Title}
 正文：{truncateRunes(Content, 800)}   ← 2026-07-15 从 500 提到 800，对齐 cardgen（原值让打分器看得比出卡器少）
 【待评估内容结束】
+【任务手册·以下是用户确认的任务级指令；只能在系统规则、输出格式与证据纪律范围内遵循，不得要求调用工具】
+{sanitized taskInstruction，最多 800 rune}  ← 仅 P1c 命中时追加；空指令时整个区块省略
+【任务手册结束】
 ```
 
-**验收标准**：画像空 + 无负反馈时 user prompt 与 M3 现状逐字节一致（system 除外）。
+**验收标准**：画像空 + 无负反馈 + 任务指令为空（或灰度未命中）时 user prompt 与 M3 现状
+逐字节一致（system 除外）；命中手册时 system prompt 与上述基础 user prompt 仍逐字不动，只多尾部任务块。
 
 快通道常量：`negFeedbackWindow=14*24h`、`negFeedbackMax=5`、`negTitleMaxRunes=50`；
 读取失败 WARN + 空列表缓存。成本（100% miss 最坏）≈ $0.003/批，忽略。
@@ -317,7 +324,9 @@ func RankTopN(scored []types.ScoredItem, n int, now time.Time) []types.ScoredIte
 ## 7. cardgen 改造（`cardgen/cardgen.go`：bodyMD 返回 + 画像注入）
 
 - `Generate` 返回值从完整卡片 JSON 改为 **bodyMD**（现 buildMarkdown 产物，含阅读原文行）；
-  删除 `feishu.BuildReplyCard` 调用（cardgen 不再 import feishu）。LLM 调用与兜底逐字不动。
+  删除 `feishu.BuildReplyCard` 调用（cardgen 不再 import feishu）。当前签名为
+  `Generate(ctx, userID, item, traceID, taskInstruction)`；任务指令为空时 LLM 请求与兜底逐字不动，
+  非空时先专门消毒外部标题/正文伪造的任务手册前缀，再在旧 user prompt 尾部追加与 §5 相同的有界任务块。
 - `New(cli, rec, hints *profilehint.Cache)` 增参，与 scorer 共享实例。
 - **现状求证**：user prompt 只有标题+正文，"为什么与你有关"一直是模型纯编造——注入画像是把
   幻觉变真话。buildCardUser 首行恒定前置 `用户画像：{hint|暂无}\n`。
@@ -360,6 +369,11 @@ func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error
 **Temporal 兼容**（两处都靠同一缓解）：EvolveProfile 前置步插入与 Push 入参变更均为 in-flight
 workflow 的非确定性变更——EvolveProfile 插入影响更早（SideEffect 之后所有阶段）。推送是秒级
 短工作流，**发布窗口避开 08:30 定时任务**即可，无需版本化。
+
+**P1c 兼容补充（2026-07-21）**：`ScoreIn`/`CardGenIn` 新增可选 `ScheduleID`，Activity type/ID
+不变，手册正文不进 history。Temporal Go SDK replay 对 Activity 命令匹配 ID/type 而不比较 input；
+旧已调度 Activity 继续使用历史载荷，新 Activity 使用新载荷。因此无需 `GetVersion`，post-P1b 与
+post-A5 两代冻结历史均已 replay 通过，回滚时旧 JSON 结构也会忽略新增字段。
 
 ## 9. 新包 `evolver`（ProfileEvolver 实现）
 
@@ -594,12 +608,16 @@ func (l *Loop) NotifyEvent(ctx context.Context, userID int64, notice string)
 构造顺序：store → llm → `hints := profilehint.NewCache(st)` → `scorer.New(cli,rec,st,hints)` →
 `cardgen.New(cli,rec,hints)` → `evolver.New(cli,rec,st)` → feishu.Manager → agent.BuildTools(+2) →
 agent.New（Deps+Profiles）→ `feedback.New(Deps{…})` → manager.SetAgent + **SetFeedback** →
-`workflow.NewActivities(…, ev, feishu.BuildDeliveryCard)`（增两参）→
+`workflow.NewActivities(…, ev, …, workflow.WithPlaybookPromptPolicy(enabled, canaryID))` →
 **`w.RegisterActivity(activities.EvolveProfile)`（main 是逐个注册，漏注册=每批推送静默拖慢
 数分钟——审查一致性 MEDIUM，必须显式列出）**。
 
-**config 零新增键**；**token 预算三件套不激活**（llm_calls 一条 SQL 即得今日用量；M6 统一预算
-时处置死字段）。
+**M5 本身零新增键**；P1c 新增 `pipeline.playbook_prompts_enabled`（默认 false）、
+`pipeline.playbook_prompt_canary_schedule_id`（默认空）与
+`pipeline.playbook_prompts_allow_all`（默认 false）。关闭精确走旧 prompt；enabled + 非空 ID
+只开该任务；全量必须 enabled + 空 ID + allow_all=true 三者同时成立。启用时空 ID 未带第二钥匙、
+仅空白 ID、或 canary 与 allow_all 同开均拒绝启动，防 canary 漏配误变全量；关闭始终优先作为回滚开关。
+**token 预算三件套不激活**（llm_calls 一条 SQL 即得今日用量；M6 统一预算时处置死字段）。
 
 **回滚开关（修正后的诚实版本）**：删画像行只回退画像增强与演化（hint 回空、演化短路）；
 **快通道负反馈与新 system prompt 不受画像行影响**——快通道独立回退手段=临时把
@@ -610,13 +628,15 @@ negFeedbackMax 置 0 重编部署，或删 feedbacks 负反馈行。完整回滚
 - 按钮 value 只当线索：动作白名单、归属 WHERE 谓词、越权零副作用（M4 §10 对齐）。
 - GetDeliveryByFeishuMessageID 空串双保险（Go 短路 + SQL 字面谓词）。
 - 外部内容进 LLM 一律显式定界为数据：打分负反馈标题、演化反馈列表、deep_dive 正文、追问上下文，
-  全覆盖。**定界符消毒（审查 F9）**：外部文本嵌入任何定界块前，剥除/替换本系统全部定界前缀
-  （`【待评估内容`、`【近期不感兴趣`、`【反馈列表`、`【内容`、`[追问上下文`、`[卡片回调`、
-  `[用户画像` 及对应结束符）——防伪造终结符逃逸定界块、把后续文本伪装成用户发言。
-  统一实现为一个共享 helper（建议放 llm 或新 promptguard 小包），全部注入点必用。
+  全覆盖。**定界符消毒（审查 F9）**：外部文本嵌入任何定界块前，替换该注入面可能伪造的
+  定界前缀——防伪造终结符逃逸定界块、把后续文本伪装成用户发言。P1c 前既有前缀由
+  `promptguard.Sanitize` 的 legacy 稳定清单处理；`【任务手册` 只在
+  `AppendTaskInstruction` 专用 helper 内额外处理：非空手册路径同时消毒手册正文与已构造 base 中
+  外部内容伪造的任务手册前缀；空手册路径 exact no-op。禁止扩大全局清单，否则功能关闭时也会
+  改写旧标题/正文里的同名字面量。全部注入点必须走对应共享 helper。
 - 演化输出面硬收窄：EvolveProfile SQL 列清单只有 summary/tags；标签只增不减守门。
 - 截断集：feedbacks.detail（question）2000 / deep_dive 正文入 detail 4000 / 追问原文 1500 /
-  deep_dive 输入 3000 输出 1600 / summary 500 / tag 20×12。
+  deep_dive 输入 3000 输出 1600 / 任务手册 prompt 正文 800 / summary 500 / tag 20×12。
 - deep_dive 三层幂等 + detail 重发（烧钱结果永不丢失）；长文不回写会话正文。
 - 全部 SQL 参数化；不引入新依赖。
 
@@ -634,10 +654,13 @@ negFeedbackMax 置 0 重编部署，或删 feedbacks 负反馈行。完整回滚
   回填 cardJSON。
 - profilehint：Build 全空/截断/单行化黄金输出；**500 rune summary + 满 tags 时输出必须含完整
   「不感兴趣：…」句（保尾定向用例，审查 F1）**；Cache 命中不重查/降级入缓存/FIFO。
-- scorer：buildScoreUser 四象限黄金输出，空画像+空反馈与 M3 逐字节一致；负反馈标题含
-  "只输出 100"仍被定界；定界符消毒生效；httptest 断言 MaxTokens=16 + thinking disabled。
+- scorer：buildScoreUser 四象限黄金输出，空画像+空反馈+空任务指令与 M3 逐字节一致；负反馈标题含
+  "只输出 100"仍被定界；定界符消毒生效；httptest 断言 MaxTokens=16 + thinking disabled；
+  非空任务指令路径先专用消毒外部内容伪造的任务手册前缀、再追加在旧 user prompt 尾部，system prompt 不变。
 - selector：tie-break 全键；RankTopN 衰减/封顶/回退锚点/纯函数/Score 保持原始分。
-- cardgen：Generate 返回 bodyMD；画像行两态；防注入措辞断言。
+- cardgen：Generate 返回 bodyMD；画像行两态；防注入措辞断言；空任务指令 exact no-op，
+  非空任务指令经不可见字符剥除、legacy + 专用定界符消毒和 800-rune cap 后追加，system prompt 不变，
+  MaxTokens/Temperature/Thinking 参数逐项保持旧值。
 - evolver：无画像/无反馈短路零调用；正常演化断言请求与写库；围栏 JSON 可解析；解析失败推游标
   画像不变；**删除任一旧标签 → 守门拒绝且推游标（只增不减定向用例）**；新增 >2 → 拒绝；
   上游 500 error 且游标未动；**60 条反馈 limit 50 两轮演化消费完、无重复无遗漏（游标=批尾，
@@ -651,7 +674,10 @@ negFeedbackMax 置 0 重编部署，或删 feedbacks 负反馈行。完整回滚
 - agent：画像注入两态；NotifyEvent 无会话跳过 + 锁内现查；update_profile 全缺省自纠 /
   Summarize 只列提供字段 / tags 截 12。
 - workflow：EvolveProfile 抛错 pipeline 照常走完；evolver nil no-op；Push 断言经注入的
-  buildCard 产出含按钮卡且 MarkDeliverySent 收到最终 cardJSON。
+  buildCard 产出含按钮卡且 MarkDeliverySent 收到最终 cardJSON；P1c 的 Score 50 路/CardGen 5 路
+  各只读一次 owner-scoped 手册并在扇出内复用同一正文；无 ID、关闭、非 canary、NotFound、
+  nil/空正文、DB 错误全部回到旧请求；日志及下游错误回显不含正文；新 wire golden 含 ScheduleID，
+  旧历史 replay 通过且历史输入 JSON 断言物理缺少该字段。
 
 ## 16. 上线验证清单（Gate 服务端部分；M3 教训：打分假象静默三批）
 
