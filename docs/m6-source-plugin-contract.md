@@ -140,7 +140,7 @@ if dedup.IsNearDup(sh, candidates, simhashThreshold) {   // simhashThreshold = 3
 > `simhash：64-bit 局部敏感哈希，近似去重（**改动少量文字仍判为重复**）`
 
 **页面监控的信号恰恰是「改动少量文字」**（`$30.00` → `$24.00`）→ **变化被静默丢弃**，
-表现不是报错而是 pipeline「去重后无内容」早退——**与 §0.2、CLAUDE.md 红线 1 同构的静默失败**。
+表现不是报错而是 pipeline「去重后无内容」早退——**与 §0.2、AGENTS.md 红线 1 同构的静默失败**。
 
 #### 实测（用真实 `dedup` 包跑的探针，不是推理）
 
@@ -2144,7 +2144,7 @@ smolvm），形态为**每任务新建、用完即毁**（ephemeral，不做长�
 UPDATE sources SET config = config || '{"lookback_days":-1}'::jsonb WHERE id = 9;
 ```
 代码侧的正解（删 `web/search` 的 lookback **默认** + 加 `include_domains`）随 P2 落地。
-> 按 CLAUDE.md「对抗审查按风险分级」，`fetcher/exa.go` 属核心抓取路径 → 该修改上全流程审查。
+> 按 AGENTS.md「对抗审查按风险分级」，`fetcher/exa.go` 属核心抓取路径 → 该修改上全流程审查。
 
 ### 19.1 分期（**已按对抗审查的诘问重排**）
 
@@ -2167,7 +2167,7 @@ UPDATE sources SET config = config || '{"lookback_days":-1}'::jsonb WHERE id = 9
 > `provider_hints` 形态。**多一次小改动，换 Boss 少挨几天传闻站——值。**
 >
 > **P3 的 Kind 下游改动（§8.1/§8.2/§5.4.2）跨 workflow/scorer/store/types 四包**，
-> 按 CLAUDE.md 属跨包契约变更 → **上全流程对抗审查**。P1 的 migration 同理（数据面入口）。
+> 按 AGENTS.md 属跨包契约变更 → **上全流程对抗审查**。P1 的 migration 同理（数据面入口）。
 >
 > **P1/P3 开工前必须先补齐 §5.4 与 §16 的往返用例**——它们是本契约在对抗审查中真实
 > 漏掉过的东西，不是纸面要求。
@@ -2191,15 +2191,15 @@ UPDATE sources SET config = config || '{"lookback_days":-1}'::jsonb WHERE id = 9
   1. **migration 号可能撞车** → 本迁移以落地时实际空号为准（§4）。
   2. **两边都会碰 api 包的路由注册，且两个工作流同时在改 vane-web**（对方 Observability 页、
      本方 Sources 页）→ 合入顺序上先到先得，后者 rebase。
-- 顺带记录（**不在本 PR 改**）：`CLAUDE.md:19` 写「LLM 调用明细…落 DB `llm_traces` 表」，
+- 顺带记录（**不在本 PR 改**）：当时的 `CLAUDE.md:19`（现为 `AGENTS.md`）写「LLM 调用明细…落 DB `llm_traces` 表」，
   **实际表名是 `llm_calls`**（001 建表、`store/llmcalls.go`、`types.LLMCall` 全是 llm_calls；
-  全仓库 `llm_traces` 只在 CLAUDE.md 这一处）。属并行会话（可观测性）地盘，交由其修正。
+  当时全仓库 `llm_traces` 只在该协作入口一处）。属并行会话（可观测性）地盘，交由其修正。
 
 ---
 
 ## 21. 对抗审查记录（2026-07-16）
 
-按 CLAUDE.md「核心路径 / 跨包契约变更上全流程」执行。**记录在案是为了让后人知道
+按 AGENTS.md「核心路径 / 跨包契约变更上全流程」执行。**记录在案是为了让后人知道
 哪些结论是被攻击过的、哪些只是没人攻击**。
 
 | 阶段 | 规模 | 关键产出 |

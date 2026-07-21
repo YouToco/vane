@@ -8,7 +8,7 @@ import "time"
 // store 层按实体拆文件的约定对它们不适用，probe 层又只该管判定不该拼 SQL。
 // 归属 types 是为了让 store（产出）与 probe（消费）都不反向依赖对方。
 //
-// 时区纪律（CLAUDE.md 红线 6）：所有时间字段一律 UTC（DB 原生），
+// 时区纪律（AGENTS.md 红线 6）：所有时间字段一律 UTC（DB 原生），
 // 北京时间只在前端展示层换算——探针内部出现本地时区即是 bug。
 
 // ScoreTraceStat 是单个 trace 的打分区分度统计（探针 ①）。

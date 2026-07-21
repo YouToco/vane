@@ -634,7 +634,7 @@ XHS user_posts/search、Exa search。⇒ 这不是边角选项，而应是 SDK �
 |---|---|---|
 | **协调** | 飞书多维表格（功能清单 + 开发认领）、BOARD.md | 什么/谁/什么状态。高频变、非代码 |
 | **契约** | **本文 + Go interface/types（在仓库）** | 模块怎么拼。必须可 diff / PR review / CI 强制 |
-| **决策日志** | journal + CLAUDE.md 重要更迭 | 为什么这么选 |
+| **决策日志** | journal + AGENTS.md 重要更迭 | 为什么这么选 |
 
 > **让并行不撞车的是契约平面，它绝不能放多维表格**——表格不可 diff、不可 review、
 > 不可被 CI 强制、不随代码回滚。多维表格答「什么/谁」，仓库答「怎么拼」。
