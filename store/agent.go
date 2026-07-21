@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/types"
 )
 
@@ -140,9 +141,17 @@ func (s *Store) AppendAgentSessionMessages(ctx context.Context, sessionID int64,
 // CreatePendingAction 落一条待确认动作。id（uuid）与 expires_at 由调用方给定；
 // args NOT NULL DEFAULT '{}'，nil/空归一为 '{}'；status 空缺省 pending。
 func (s *Store) CreatePendingAction(ctx context.Context, a *types.PendingAction) error {
+	if a == nil {
+		return types.NewAppError(types.CodeValidation, "待确认动作不得为空", nil)
+	}
 	args := a.Args
 	if len(args) == 0 {
 		args = json.RawMessage("{}")
+	}
+	var argsObject map[string]json.RawMessage
+	if err := strictjson.Decode(args, &argsObject); err != nil || argsObject == nil {
+		return types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("待确认动作参数必须是无重复字段的 JSON 对象（tool=%s）", a.ToolName), err)
 	}
 	status := a.Status
 	if status == "" {
@@ -160,7 +169,8 @@ func (s *Store) CreatePendingAction(ctx context.Context, a *types.PendingAction)
 	return nil
 }
 
-// ClaimPendingAction 原子领取：单条 UPDATE ... WHERE status='pending' AND
+// ClaimPendingAction 原子领取历史 v0 动作：单条 UPDATE ... WHERE
+// execution_version=0 AND status='pending' AND
 // expires_at > now() ... RETURNING。并发双击时行锁保证只有一次能改到行，
 // 第二次 WHERE 不再命中（status 已 executed）走 NotFound——天然幂等，无需事务。
 // 已执行/已取消/已过期/不存在/归属不符五种情况统一返回 CodeNotFound 的 AppError，
@@ -174,6 +184,7 @@ func (s *Store) ClaimPendingAction(ctx context.Context, id string, userID int64)
 		`UPDATE pending_actions
 		 SET status = $2, executed_at = now()
 		 WHERE id = $1 AND user_id = $4 AND status = $3 AND expires_at > now()
+		   AND execution_version = 0
 		 RETURNING `+pendingActionColumns,
 		id, types.PendingActionStatusExecuted, types.PendingActionStatusPending, userID), &pa)
 	if err != nil {

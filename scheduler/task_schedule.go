@@ -1141,6 +1141,67 @@ func digestPreparedTaskSchedule(prepared PreparedTaskSchedule) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// ValidateTaskScheduleSpec validates the complete deterministic A3 timing
+// contract without consulting Temporal or any process configuration. Task
+// preparation uses it before a paid compiler call, so an invalid cron, time
+// zone, anchor, or interval cannot consume budget first and fail afterwards.
+func ValidateTaskScheduleSpec(spec ScheduleSpec) error {
+	_, _, err := buildTaskScheduleSpec(spec)
+	return err
+}
+
+// ValidatePreparedTaskScheduleRequest proves that a serialized A3 result is
+// both internally valid and derived from req. It is deliberately pure: A4 can
+// validate an immutable checkpoint after a restart without reaching Temporal
+// or rebuilding it from the current Scheduler configuration.
+func ValidatePreparedTaskScheduleRequest(
+	prepared PreparedTaskSchedule,
+	req TaskScheduleRequest,
+) error {
+	if err := validatePreparedTaskSchedule(prepared); err != nil {
+		return err
+	}
+	if prepared.TenantID != req.TenantID || prepared.UserID != req.UserID ||
+		prepared.OperationID != req.OperationID || prepared.PreparedDigest != req.PreparedDigest {
+		return errors.New("prepared schedule does not belong to the requested definition")
+	}
+	taskID, err := taskIDForOperationVersion(
+		prepared.IDSchemeVersion,
+		req.TenantID,
+		req.UserID,
+		req.OperationID,
+	)
+	if err != nil {
+		return fmt.Errorf("derive requested task ID: %w", err)
+	}
+	if prepared.TaskID != taskID {
+		return errors.New("prepared schedule task ID differs from the request")
+	}
+	_, timing, err := buildTaskScheduleSpec(req.Spec)
+	if err != nil {
+		return fmt.Errorf("validate requested schedule spec: %w", err)
+	}
+	if !preparedTaskScheduleTimingEqual(prepared.Timing, timing) {
+		return errors.New("prepared schedule timing differs from the request")
+	}
+	params := prepared.Action.Params
+	if params.UserID != req.UserID || params.ScheduleID != taskID ||
+		params.NLDesc != strings.TrimSpace(req.NLDescription) ||
+		params.Scope.TopN != req.Scope.TopN ||
+		!slices.Equal(params.Scope.SourceIDs, req.Scope.SourceIDs) {
+		return errors.New("prepared workflow parameters differ from the request")
+	}
+	return nil
+}
+
+func preparedTaskScheduleTimingEqual(a, b PreparedTaskScheduleTiming) bool {
+	if a.EveryNanos != b.EveryNanos || a.OffsetNanos != b.OffsetNanos ||
+		a.TimeZoneName != b.TimeZoneName || (a.Calendar == nil) != (b.Calendar == nil) {
+		return false
+	}
+	return a.Calendar == nil || *a.Calendar == *b.Calendar
+}
+
 func validateTaskScheduleDigest(field, digest string) error {
 	if len(digest) != sha256.Size*2 || strings.ToLower(digest) != digest {
 		return fmt.Errorf("%s must be a lowercase SHA-256 hex digest", field)

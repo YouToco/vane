@@ -4,13 +4,16 @@
 package sourcespec
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"net/url"
 	"regexp"
 	"sort"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/types"
 )
@@ -68,13 +71,213 @@ func Build(spec Spec) (*types.Source, string) {
 	}
 }
 
+// ValidateMaterialized proves that a persisted source's URL identity and its
+// runtime Config describe exactly the same registered capability. URL is the
+// global deduplication key while Config drives fetching, so accepting a pair
+// such as q=AI with config.query=crypto would make one tenant silently reuse a
+// source with different behavior. Rebuilding through Build also reuses every
+// capability availability, parameter, normalization, and length rule.
+func ValidateMaterialized(source *types.Source) string {
+	if source == nil {
+		return "信源不得为空"
+	}
+	config, err := canonicalMaterializedConfig(source.Config)
+	if err != nil {
+		return "信源 config 必须是无重复字段的 JSON 对象"
+	}
+	spec, message := specFromMaterialized(source, config)
+	if message != "" {
+		return message
+	}
+	rebuilt, message := Build(spec)
+	if message != "" || rebuilt == nil {
+		if message != "" {
+			return message
+		}
+		return "信源无法按注册能力重建"
+	}
+	rebuiltConfig, err := canonicalMaterializedConfig(rebuilt.Config)
+	if err != nil {
+		return "重建后的信源 config 非法"
+	}
+	if rebuilt.Platform != source.Platform || rebuilt.Capability != source.Capability ||
+		rebuilt.URL != source.URL || rebuilt.Title != source.Title ||
+		!bytes.Equal(rebuiltConfig, config) {
+		return "信源 URL、config、标题与注册能力的规范化结果不一致"
+	}
+	return ""
+}
+
+type materializedFeedConfig struct {
+	Categories []string `json:"categories,omitempty"`
+}
+
+type materializedSearchConfig struct {
+	Query          string   `json:"query"`
+	Category       string   `json:"category,omitempty"`
+	IncludeDomains []string `json:"include_domains,omitempty"`
+}
+
+type materializedContentsConfig struct {
+	URL   string `json:"url"`
+	Title string `json:"title,omitempty"`
+}
+
+type materializedScreenNameConfig struct {
+	ScreenName string `json:"screen_name"`
+}
+
+type materializedKeywordConfig struct {
+	Keyword string `json:"keyword"`
+}
+
+type materializedUserIDConfig struct {
+	UserID string `json:"user_id"`
+}
+
+type materializedPageIDConfig struct {
+	PageID string `json:"page_id"`
+}
+
+func specFromMaterialized(source *types.Source, config json.RawMessage) (Spec, string) {
+	params := make(map[string]string)
+	switch {
+	case source.Platform == types.PlatformWeb && source.Capability == types.CapFeed:
+		var decoded materializedFeedConfig
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "web/feed config 非法"
+		}
+		rawURL := source.URL
+		baseURL, hasCategoryMarker := stripFeedCategoryMarker(source.URL)
+		if len(decoded.Categories) > 0 {
+			if !hasCategoryMarker {
+				return Spec{}, "web/feed 分类 config 未进入 URL 幂等键"
+			}
+			rawURL = baseURL
+			encoded, err := json.Marshal(decoded.Categories)
+			if err != nil {
+				return Spec{}, "web/feed 分类 config 无法编码"
+			}
+			params["categories"] = string(encoded)
+		} else if hasCategoryMarker {
+			return Spec{}, "web/feed URL 含保留分类标记但 config 未声明分类"
+		}
+		params["url"] = rawURL
+
+	case source.Platform == types.PlatformWeb && source.Capability == types.CapSearch:
+		var decoded materializedSearchConfig
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "web/search config 非法"
+		}
+		params["query"] = decoded.Query
+		params["category"] = decoded.Category
+		if len(decoded.IncludeDomains) > 0 {
+			encoded, err := json.Marshal(decoded.IncludeDomains)
+			if err != nil {
+				return Spec{}, "web/search 域名 config 无法编码"
+			}
+			params["include_domains"] = string(encoded)
+		}
+
+	case source.Platform == types.PlatformWeb && source.Capability == types.CapContents:
+		var decoded materializedContentsConfig
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "web/contents config 非法"
+		}
+		params["url"] = decoded.URL
+		params["title"] = decoded.Title
+
+	case source.Platform == types.PlatformX && source.Capability == types.CapUserPosts:
+		var decoded materializedScreenNameConfig
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "x/user_posts config 非法"
+		}
+		params["screen_name"] = decoded.ScreenName
+
+	case source.Platform == types.PlatformXHS && source.Capability == types.CapSearch:
+		var decoded materializedKeywordConfig
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "xhs/search config 非法"
+		}
+		params["keyword"] = decoded.Keyword
+
+	case source.Platform == types.PlatformXHS && source.Capability == types.CapUserPosts:
+		var decoded materializedUserIDConfig
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "xhs/user_posts config 非法"
+		}
+		params["user_id"] = decoded.UserID
+
+	case source.Platform == types.PlatformXHS && source.Capability == types.CapHotList:
+		var decoded struct{}
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "xhs/hot_list config 必须为空对象"
+		}
+
+	case source.Platform == types.PlatformXHS && source.Capability == types.CapTopicFeed:
+		var decoded materializedPageIDConfig
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "xhs/topic_feed config 非法"
+		}
+		params["page_id"] = decoded.PageID
+
+	case source.Platform == types.PlatformXHS && source.Capability == types.CapFavedNotes:
+		var decoded materializedUserIDConfig
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "xhs/faved_notes config 非法"
+		}
+		params["user_id"] = decoded.UserID
+
+	default:
+		return Spec{}, "信源 platform/capability 未注册为可材料化能力"
+	}
+	return Spec{
+		Platform: string(source.Platform), Capability: string(source.Capability),
+		Params: params, Title: source.Title,
+	}, ""
+}
+
+// stripFeedCategoryMarker reverses only the fragment marker emitted by
+// buildWeb. Query parameters with the same spelling are part of the remote URL
+// and must not be stripped. A marker with empty config is rejected by the
+// caller because it can collide with the URL identity of a categorized feed.
+func stripFeedCategoryMarker(rawURL string) (string, bool) {
+	fragmentStart := strings.IndexByte(rawURL, '#')
+	if fragmentStart < 0 {
+		return rawURL, false
+	}
+	fragment := rawURL[fragmentStart+1:]
+	if marker := strings.LastIndex(fragment, "&vane-categories="); marker >= 0 {
+		return rawURL[:fragmentStart+1+marker], true
+	}
+	if strings.HasPrefix(fragment, "vane-categories=") {
+		return rawURL[:fragmentStart], true
+	}
+	return rawURL, false
+}
+
+func canonicalMaterializedConfig(raw json.RawMessage) (json.RawMessage, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		raw = json.RawMessage(`{}`)
+	}
+	var object map[string]any
+	if err := strictjson.Decode(raw, &object); err != nil || object == nil {
+		return nil, errors.New("materialized source config must be a JSON object")
+	}
+	return json.Marshal(object)
+}
+
 func buildWeb(cap types.Capability, params map[string]string, title string) (*types.Source, string) {
 	switch cap {
 	case types.CapFeed:
 		rawURL := strings.TrimSpace(params["url"])
 		u, err := url.Parse(rawURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+			u.User != nil {
 			return nil, "url 必须是合法的 http/https 地址"
+		}
+		if _, reserved := stripFeedCategoryMarker(rawURL); reserved {
+			return nil, "url fragment 使用了 Vane 保留的分类标记"
 		}
 		cats, cerr := parseCategories(params["categories"])
 		if cerr != "" {
@@ -169,7 +372,8 @@ func buildWeb(cap types.Capability, params map[string]string, title string) (*ty
 	case types.CapContents:
 		rawURL := strings.TrimSpace(params["url"])
 		u, err := url.Parse(rawURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+			u.User != nil {
 			return nil, "web/contents 必须提供合法的 http/https 页面地址（url）"
 		}
 		cfgMap := map[string]string{"url": rawURL}

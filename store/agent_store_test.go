@@ -206,6 +206,73 @@ func TestAgentStore(t *testing.T) {
 		}
 	})
 
+	t.Run("旧Claim不得消费v1创建动作", func(t *testing.T) {
+		id := uuid.NewString()
+		if err := st.CreatePendingAction(ctx, &types.PendingAction{
+			ID: id, UserID: u.ID, ToolName: "create_schedule",
+			Args:      json.RawMessage(`{"intent":"每天寻找全球 AI 热点"}`),
+			ExpiresAt: time.Now().Add(24 * time.Hour),
+		}); err != nil {
+			t.Fatalf("CreatePendingAction() 失败: %v", err)
+		}
+		if _, err := st.pool.Exec(ctx,
+			`UPDATE pending_actions SET execution_version = $2 WHERE id = $1`,
+			id, types.TaskCreationExecutionVersionV1,
+		); err != nil {
+			t.Fatalf("升级测试动作为 v1 失败: %v", err)
+		}
+
+		if _, err := st.ClaimPendingAction(ctx, id, u.ID); !errors.Is(err, types.ErrNotFound) {
+			t.Fatalf("旧 Claim 领取 v1 动作应 ErrNotFound，实际: %v", err)
+		}
+		var status types.PendingActionStatus
+		var executedAt *time.Time
+		var phase types.TaskCreationPhase
+		if err := st.pool.QueryRow(ctx,
+			`SELECT status, executed_at, phase FROM pending_actions WHERE id = $1`, id,
+		).Scan(&status, &executedAt, &phase); err != nil {
+			t.Fatalf("回查 v1 动作失败: %v", err)
+		}
+		if status != types.PendingActionStatusPending || executedAt != nil || phase != "" {
+			t.Fatalf("旧 Claim 改动了 v1 动作: status=%q executed_at=%v phase=%q",
+				status, executedAt, phase)
+		}
+
+		acquired, err := st.AcquireTaskCreationOperation(ctx, types.AcquireTaskCreationOperationParams{
+			ID: id, TenantID: int64(types.SingleTenantID), UserID: u.ID,
+			LeaseOwner: "agent-store-v1", LeaseDuration: time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("v1 动作应仍可由新领取路径消费: %v", err)
+		}
+		if acquired.Status != types.PendingActionStatusExecuting ||
+			acquired.Phase != types.TaskCreationPhaseClaimed {
+			t.Fatalf("新领取路径返回状态错误: status=%q phase=%q", acquired.Status, acquired.Phase)
+		}
+	})
+
+	t.Run("待确认参数在JSONB折叠前拒绝重复键", func(t *testing.T) {
+		id := uuid.NewString()
+		err := st.CreatePendingAction(ctx, &types.PendingAction{
+			ID: id, UserID: u.ID, ToolName: "create_schedule",
+			Args:      json.RawMessage(`{"spec":{"cron":"0 8 * * *","cron":"0 9 * * *"}}`),
+			ExpiresAt: time.Now().Add(24 * time.Hour),
+		})
+		var appErr *types.AppError
+		if !errors.As(err, &appErr) || appErr.Code != types.CodeValidation {
+			t.Fatalf("重复 JSON key 应 Validation，实际 %v", err)
+		}
+		var count int
+		if err := st.pool.QueryRow(ctx,
+			`SELECT count(*) FROM pending_actions WHERE id=$1`, id,
+		).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("非法参数已被 JSONB 折叠并落库，count=%d", count)
+		}
+	})
+
 	t.Run("过期claim失败", func(t *testing.T) {
 		id := uuid.NewString()
 		pa := &types.PendingAction{
