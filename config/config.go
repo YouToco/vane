@@ -28,6 +28,7 @@ type Config struct {
 	Temporal TemporalConfig `mapstructure:"temporal"`
 	LLM      LLMConfig      `mapstructure:"llm"`
 	Fetch    FetchConfig    `mapstructure:"fetch"`
+	Pipeline PipelineConfig `mapstructure:"pipeline"`
 	Agent    AgentConfig    `mapstructure:"agent"`
 	Log      LogConfig      `mapstructure:"log"`
 
@@ -83,6 +84,19 @@ type FetchConfig struct {
 	ExaAPIKey      string `mapstructure:"exa_api_key"`
 	TimeoutSeconds int    `mapstructure:"timeout_seconds"`
 	MaxResponseMB  int    `mapstructure:"max_response_mb"`
+}
+
+// PipelineConfig 是固定推送流水线的运行策略配置。
+type PipelineConfig struct {
+	// PlaybookPromptsEnabled 控制任务手册是否注入 scorer/cardgen prompt。
+	// 默认关闭；开启后可用 PlaybookPromptCanaryScheduleID 限定单任务灰度。
+	PlaybookPromptsEnabled bool `mapstructure:"playbook_prompts_enabled"`
+	// PlaybookPromptCanaryScheduleID 非空时只允许该任务注入；为空时还必须显式
+	// PlaybookPromptsAllowAll 才能全量开启。
+	PlaybookPromptCanaryScheduleID string `mapstructure:"playbook_prompt_canary_schedule_id"`
+	// PlaybookPromptsAllowAll 是全量放量的第二把钥匙。只有 Enabled=true、
+	// canary ID 为空且本值为 true 才允许全量，防止只漏配 canary 就误放量。
+	PlaybookPromptsAllowAll bool `mapstructure:"playbook_prompts_allow_all"`
 }
 
 // AgentConfig 是 agent loop 运行约束配置。
@@ -225,6 +239,12 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("fetch.timeout_seconds", 20)
 	v.SetDefault("fetch.max_response_mb", 5)
 
+	// P1c 先以暗发布落地：false 精确回退旧 prompt；true + schedule ID
+	// 单任务 canary；true + 空 ID + allow_all 才能在 canary 通过后全量开启。
+	v.SetDefault("pipeline.playbook_prompts_enabled", false)
+	v.SetDefault("pipeline.playbook_prompt_canary_schedule_id", "")
+	v.SetDefault("pipeline.playbook_prompts_allow_all", false)
+
 	v.SetDefault("agent.max_turns", 20)
 	v.SetDefault("agent.token_budget_daily", 100000)
 	v.SetDefault("agent.session_ttl_minutes", 30)
@@ -267,6 +287,21 @@ func readConfigFile(v *viper.Viper, path string) error {
 // Validate 校验必填项并补齐零值默认值。
 // 允许在 Unmarshal 后单独调用（如配置热更新场景）。
 func (c *Config) Validate() error {
+	rawCanaryID := c.Pipeline.PlaybookPromptCanaryScheduleID
+	canaryID := strings.TrimSpace(rawCanaryID)
+	if c.Pipeline.PlaybookPromptsEnabled && rawCanaryID != "" && canaryID == "" {
+		return errors.New("config: pipeline.playbook_prompt_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.PlaybookPromptCanaryScheduleID = canaryID
+	if c.Pipeline.PlaybookPromptsEnabled {
+		if canaryID == "" && !c.Pipeline.PlaybookPromptsAllowAll {
+			return errors.New("config: 全量启用任务手册 prompt 必须显式设置 pipeline.playbook_prompts_allow_all=true")
+		}
+		if canaryID != "" && c.Pipeline.PlaybookPromptsAllowAll {
+			return errors.New("config: 单任务 canary 与 pipeline.playbook_prompts_allow_all 不能同时启用")
+		}
+	}
+
 	if c.Server.Addr == "" {
 		c.Server.Addr = "127.0.0.1:8080" // 与 setDefaults 一致：空值回退也只绑 loopback
 	}

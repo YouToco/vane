@@ -10,6 +10,7 @@ package llm
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -118,7 +119,7 @@ type chatResponse struct {
 	} `json:"usage"`
 }
 
-// maxErrBodyBytes 错误响应体读取上限：只为拼错误详情，防上游异常大响应。
+// maxErrBodyBytes 错误响应体读取上限：只为生成不可逆诊断指纹，防上游异常大响应。
 const maxErrBodyBytes = 4 << 10
 
 // Complete 发起一次 chat completions 调用。
@@ -235,11 +236,13 @@ func wrapCtxErr(cause error) error {
 	return types.NewAppError(types.CodeLLMUnavailable, "llm: 请求被取消或超时", cause)
 }
 
-// mapHTTPError 按状态码映射统一错误码，错误详情附上游响应体片段
-// （通常含 DeepSeek 的 error.message，排障时省一次抓包）。
+// mapHTTPError 按状态码映射统一错误码。上游响应体可能回显 prompt、用户内容、
+// request id 或供应商内部细节，不能进入会被 API/Temporal/应用日志继续传播的错误链。
+// 仅保留截断后字节数和短 SHA-256 指纹，足以关联同类故障而不暴露正文。
 func mapHTTPError(status int, body []byte) error {
-	detail := strings.TrimSpace(string(body))
-	msg := fmt.Sprintf("llm: 上游返回 HTTP %d: %s", status, detail)
+	digest := sha256.Sum256(body)
+	msg := fmt.Sprintf("llm: 上游返回 HTTP %d（捕获响应体 %d 字节，sha256=%x）",
+		status, len(body), digest[:8])
 	switch {
 	case status == http.StatusTooManyRequests:
 		return types.NewAppError(types.CodeLLMRateLimit, msg, nil)

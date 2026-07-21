@@ -31,6 +31,13 @@ fetch:
   timeout_seconds: 20
   max_response_mb: 5
 
+pipeline:
+  # 任务手册 prompt 灰度：false=关闭；true + 非空 ID=仅该任务 canary；
+  # true + 空 ID + allow_all=true=全量开启（第二把钥匙防漏配 canary 时误放量）。
+  playbook_prompts_enabled: false
+  playbook_prompt_canary_schedule_id: ""
+  playbook_prompts_allow_all: false
+
 agent:
   max_turns: 20
   token_budget_daily: 100000 # 预留，当前未接线（无代码按它拦截）；实际护栏是 max_turns + endpoint_*_cap

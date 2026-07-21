@@ -1029,7 +1029,8 @@ for _, item := range in.Items {
 ```go
 // buildScoreUser 按 item.Kind 分派 prompt（契约 §1.1）：
 //   KindArticle → 现行 scoreSystemPrompt（**与 M5 逐字节一致，不得改动**——
-//                 M5 §15 有"空画像+空反馈与 M3 逐字节一致"的黄金用例守着）
+//                 M5 §15 有"空画像+空反馈+空任务指令与 M3 逐字节一致"的黄金用例守着；
+//                 P1c 命中时会消毒外部内容伪造的任务手册前缀，再在尾部追加任务块）
 //   KindChange  → scoreChangeSystemPrompt：把"正文信息过少给低分"替换为
 //                 "【待评估内容】是一次页面变化的 diff，短是正常的；
 //                  按**这次变化对该用户的重要性**打分"
@@ -1781,7 +1782,9 @@ VPS 打包产物复验含 4 处 ``===`rss`` + 4 处 `tikhub_xhs`。
 - 🔴 **端到端往返用例（本契约头号致命缺陷的守卫，§3.3.1）**：
   `UpsertContentItem(Kind=change)` → `ListUnpushedByUser` → **断言读回的 `item.Kind == KindChange`**。
   DB 门控。**这一条抓的是"契约漏掉了 store 层 SQL"这件事本身**——它是初稿真实犯过的错。
-- **scorer**：`KindArticle` 的 prompt 与 M5 **逐字节一致**（守住 M5 黄金用例）；`KindChange` 走新 prompt。
+- **scorer**：`KindArticle` 的 system prompt 与基础 user prompt 保持 M5 **逐字节一致**；P1c 未命中时
+  整体请求仍逐字一致，命中时会专用消毒外部内容伪造的任务手册前缀并追加尾部任务块；
+  `KindChange` 走新 prompt。
 - **promptguard**：`StripInvisible` 覆盖四类字符 + **Unicode Tags 块**；对干净文本恒等。
 - **store（DB 门控，CI 已带 postgres）**：🔴 **`Baseline` 的判别性 fixture ——
   这是杀死突变体 M4 的唯一一条断言，也是「产出后崩溃重试自愈」的真正测试位置**：

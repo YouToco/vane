@@ -29,14 +29,14 @@ func (fakeFetcher) Fetch(context.Context, types.Source) ([]types.ContentItem, er
 
 type fakeScorer struct{}
 
-func (fakeScorer) Score(context.Context, int64, types.ContentItem, string) (float64, error) {
+func (fakeScorer) Score(context.Context, int64, types.ContentItem, string, string) (float64, error) {
 	return 80, nil
 }
 
 // fakeCardGen 固定返回 body，模拟 cardgen.Generate 产出的解读正文 markdown。
 type fakeCardGen struct{ body string }
 
-func (g fakeCardGen) Generate(context.Context, int64, types.ScoredItem, string) (string, error) {
+func (g fakeCardGen) Generate(context.Context, int64, types.ScoredItem, string, string) (string, error) {
 	return g.body, nil
 }
 
@@ -118,6 +118,11 @@ type emptyBatchCall struct {
 	counts     types.PipelineCounts
 }
 
+type playbookReadCall struct {
+	userID     int64
+	scheduleID string
+}
+
 type fakeStore struct {
 	runAuthorized       bool
 	runAuthorizationErr error
@@ -129,6 +134,10 @@ type fakeStore struct {
 
 	strictness    types.PushStrictness // GetScheduleStrictness 返回值（零值=未设置）
 	strictnessErr error                // 非 nil = 模拟门槛档位查询失败（Select 应降级兜底）
+	playbook      *types.SchedulePlaybook
+	playbookErr   error
+	playbookCalls int
+	playbookReads []playbookReadCall
 
 	nextDelID   int64
 	sentAlready bool // true = 模拟重试时该 (batch, content) 已发过
@@ -218,6 +227,17 @@ func (f *fakeStore) GetScheduleStrictness(context.Context, string) (types.PushSt
 		return "", f.strictnessErr
 	}
 	return f.strictness, nil
+}
+
+func (f *fakeStore) GetSchedulePlaybook(_ context.Context, userID int64, scheduleID string) (*types.SchedulePlaybook, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.playbookCalls++
+	f.playbookReads = append(f.playbookReads, playbookReadCall{userID: userID, scheduleID: scheduleID})
+	if f.playbookErr != nil {
+		return nil, f.playbookErr
+	}
+	return f.playbook, nil
 }
 
 // tenantGone 让用例模拟「租户已注销」（D9）。零值 false = 租户在服务中，
@@ -1352,14 +1372,14 @@ func (c *countingFetcher) Fetch(context.Context, types.Source) ([]types.ContentI
 // 闸门生效 = 下游一次都没被调。
 type countingScorer struct{ calls int }
 
-func (c *countingScorer) Score(context.Context, int64, types.ContentItem, string) (float64, error) {
+func (c *countingScorer) Score(context.Context, int64, types.ContentItem, string, string) (float64, error) {
 	c.calls++
 	return 80, nil
 }
 
 type countingCardGen struct{ calls int }
 
-func (c *countingCardGen) Generate(context.Context, int64, types.ScoredItem, string) (string, error) {
+func (c *countingCardGen) Generate(context.Context, int64, types.ScoredItem, string, string) (string, error) {
 	c.calls++
 	return "md", nil
 }

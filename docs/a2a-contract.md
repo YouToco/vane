@@ -571,6 +571,9 @@ probe.Run 报错中断模式、cmd/gate 退出码语义、CHANGELOG 最新已发
 | A-3 | MEDIUM | `maxConcurrentExecutions=4` 上线后被 content.query 与 120s chat 共享，慢 chat 占满则新请求立即被拒（自伤）；注释仍说"无 LLM 争抢"失真 | 提到 8 并注释记录已知取舍（多对端或饥饿再按 skill 分池）；`a2a/a2a.go` |
 | A-4 | MEDIUM | 与 #56（端点注册表）合并：机械解冲突会让 A2A 轨工具记账落 `session_id=0`；#56 的 `toolRunState` 需空构造且不持久化 | RunOnce 传 `sessionID=nil`（记 NULL）；空 `toolRunState`（activation 空、不 saveSession）。converse 抽取两轨共享，逐行核对飞书轨零行为变化 |
 
+后续 P1c 又把通用 `llm.mapHTTPError` 收紧为仅返回状态、捕获长度与 SHA-256 短指纹，
+不再把上游响应体放入任何内部错误链；A2A 的固定失败文案仍保留为独立出口防线。
+
 **记录为遗留（单 token 单对端下非漏洞，多对端接入前处理）**：
 - **B-F3**：`contextId` 客户端可控，`chatHistory` 仅按 contextId 取历史、无 per-caller 隔离。若一枚 token 被多个外部 agent 共用，agent A 复用 B 的 contextId 可把 B 的既往对话读进自己这轮 LLM 历史。与 §1「多 peer 升级前复查 #351 IDOR」同族——加第二个 token / 多对端前必须给 contextId 绑定调用方身份或强制服务端生成。
 - **B-F6/A-7**：`/a2a` 无 `MaxBytesReader`（既存，content.query 时代就在）；chat 的 text 直送 LLM、contextId 无界入库放大滥用面。多对端前补 body 上限。

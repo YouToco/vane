@@ -62,11 +62,13 @@ func New(cli *llm.Client, rec *llm.Recorder, hints *profilehint.Cache) *CardGen 
 
 // Generate 为一条已打分内容生成解读正文 markdown（bodyMD，不含阅读原文链接）。
 // LLM 失败向上抛给 Temporal 重试；成功但正文为空时用标题兜底，保证正文始终可读
-// （阅读原文链接由 Push 阶段的构卡函数添加，见包注释）。
-func (cg *CardGen) Generate(ctx context.Context, userID int64, item types.ScoredItem, traceID string) (string, error) {
+// （阅读原文链接由 Push 阶段的构卡函数添加，见包注释）。taskInstruction 为空时
+// 保持旧请求逐字节不变；非空时由 promptguard 消毒新定界符并追加到 user prompt 尾部。
+func (cg *CardGen) Generate(ctx context.Context, userID int64, item types.ScoredItem, traceID, taskInstruction string) (string, error) {
+	userPrompt := buildCardUser(cg.hints.Hint(ctx, userID, traceID), item.Item)
 	req := llm.Request{
 		System:      cardSystemPrompt,
-		User:        buildCardUser(cg.hints.Hint(ctx, userID, traceID), item.Item),
+		User:        promptguard.AppendTaskInstruction(userPrompt, taskInstruction),
 		Temperature: f32ptr(0.7), // 解读文案要一点多样性，温度略高于打分
 		MaxTokens:   iptr(400),
 		// 关思维链：模板化摘要不需要 CoT；400 预算下 reasoning 偶发吃满会导致
