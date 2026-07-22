@@ -45,6 +45,7 @@ type purgeStep struct {
 //	feedbacks                             → deliveries
 //	task_creation_receipts               → pending_actions → agent_sessions
 //	deliveries                            → push_batches
+//	task_run_snapshots                    → tenants / users
 //	其余                                   → tenants / users
 //
 // 排错了不会静默——FK 约束会让整个事务失败，而 dry-run 就是为了在真删之前撞出这个。
@@ -60,6 +61,9 @@ var purgeOrder = []purgeStep{
 	{"deliveries", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},
 	{"agent_sessions", "tenant_id = $1"},
+	// 虽然 tenant FK 带 ON DELETE CASCADE，仍须显式删除：否则 dry-run/report
+	// 看不见这批不可变审计数据，purge schema 守卫也会把它视为漏项。
+	{"task_run_snapshots", "tenant_id = $1"},
 
 	{"subscriptions", "tenant_id = $1"},
 	{"profiles", "tenant_id = $1"},

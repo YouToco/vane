@@ -9,6 +9,7 @@
 - 内容身份与去重：[docs/content-identity-contract.md](docs/content-identity-contract.md)（身份是 canonical_key，不是 external_id）
 - M4 agent loop 契约：[docs/m4-agent-contract.md](docs/m4-agent-contract.md)（工具、确认卡、回调链路）
 - M5 画像+反馈闭环契约：[docs/m5-profile-contract.md](docs/m5-profile-contract.md)（17 节签名级；第 16 节是 Gate 验证清单）
+- 双轨 Agent Runtime：[docs/agent-runtime-contract.md](docs/agent-runtime-contract.md)（ExecutionMode、运行快照、PlanFetch、预算与发布列车）
 
 ## 构建 / 测试 / 部署
 

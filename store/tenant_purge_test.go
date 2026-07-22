@@ -144,9 +144,27 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		u.ID, tn.ID); err != nil {
 		t.Fatalf("建画像失败: %v", err)
 	}
+	if _, err := st.pool.Exec(ctx,
+		`INSERT INTO task_run_snapshots (
+			tenant_id, user_id, task_id, temporal_workflow_id, temporal_run_id,
+			run_kind, execution_mode, adaptive_version,
+			capability_catalog_digest, tool_policy_digest, prompt_policy_digest,
+			model_policy_digest, quota_policy_digest, definition_digest, plan_digest,
+			payload_digest, reference_digest, reference_schema_version, payload, budget
+		 ) VALUES (
+			$1, $2, $3, $4, $5, 'scheduled', 'compiled', 0,
+			repeat('0', 64), repeat('1', 64), repeat('2', 64), repeat('3', 64),
+			repeat('4', 64), repeat('5', 64), repeat('6', 64), repeat('7', 64),
+			repeat('8', 64), 'purge-fixture/v1', convert_to('{}', 'UTF8'), '{}'::jsonb
+		 )`,
+		tn.ID, u.ID, "purge-task-"+uuid.NewString(), "purge-workflow-"+uuid.NewString(),
+		"purge-run-"+uuid.NewString()); err != nil {
+		t.Fatalf("建运行快照清理夹具失败: %v", err)
+	}
 	t.Cleanup(func() {
 		c, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(c, t, st, `DELETE FROM task_run_snapshots WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM profiles WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM tenant_quota WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM memberships WHERE tenant_id = $1`, tn.ID)
@@ -177,6 +195,9 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	if rep.Total == 0 {
 		t.Error("试运行应报告将删除的行数，实得 0 —— 说明它什么都没执行，验不了外键顺序")
 	}
+	if rep.Rows["task_run_snapshots"] != 1 {
+		t.Errorf("试运行报告必须包含运行快照，实得 %d", rep.Rows["task_run_snapshots"])
+	}
 
 	// 租户与数据必须原封不动。
 	if _, err := st.GetTenant(ctx, tenantID); err != nil {
@@ -189,6 +210,13 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("试运行后画像应还在，实得 %d 行 —— 事务没回滚，这是不可逆的数据损失", n)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_run_snapshots WHERE tenant_id = $1`, tenantID).Scan(&n); err != nil {
+		t.Fatalf("查运行快照失败: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("试运行后运行快照应还在，实得 %d 行 —— 事务没回滚", n)
 	}
 }
 
@@ -205,6 +233,9 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 	if rep.Rows["tenants"] != 1 {
 		t.Errorf("租户行应被删除，实得 %d", rep.Rows["tenants"])
 	}
+	if rep.Rows["task_run_snapshots"] != 1 {
+		t.Errorf("清理报告必须包含运行快照，实得 %d", rep.Rows["task_run_snapshots"])
+	}
 	if _, err := st.GetTenant(ctx, tenantID); err == nil {
 		t.Error("清理后租户仍存在")
 	}
@@ -215,6 +246,13 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("租户数据应被清空，profiles 仍有 %d 行", n)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_run_snapshots WHERE tenant_id = $1`, tenantID).Scan(&n); err != nil {
+		t.Fatalf("查运行快照失败: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("租户数据应被清空，task_run_snapshots 仍有 %d 行", n)
 	}
 }
 
