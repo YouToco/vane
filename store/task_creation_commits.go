@@ -194,6 +194,9 @@ func (s *Store) BeginTaskCreationActivation(
 	if !found || row.tenantID != lease.TenantID || row.userID != lease.UserID {
 		return false, taskCreationConflict("activation target ownership differs")
 	}
+	if row.mode != types.ExecutionModeCompiled {
+		return false, taskCreationConflict("activation target is not a compiled task")
+	}
 	switch op.Phase {
 	case types.TaskCreationPhaseActivationStarted:
 		if row.status != types.ScheduleStatusPaused {
@@ -274,6 +277,9 @@ func (s *Store) CommitTaskCreationActivation(
 	if !found || row.tenantID != lease.TenantID || row.userID != lease.UserID {
 		return taskCreationConflict("activation target ownership differs")
 	}
+	if row.mode != types.ExecutionModeCompiled {
+		return taskCreationConflict("activation target is not a compiled task")
+	}
 	if op.Phase == types.TaskCreationPhaseActivated {
 		if row.status != types.ScheduleStatusActive {
 			return taskCreationConflict("activated operation has non-active aggregate")
@@ -288,9 +294,11 @@ func (s *Store) CommitTaskCreationActivation(
 	tag, err := tx.Exec(ctx,
 		`UPDATE schedules
 		    SET status = $4, updated_at = clock_timestamp()
-		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3 AND status = $5`,
+		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3 AND status = $5
+		    AND execution_mode = $6`,
 		taskID, lease.TenantID, lease.UserID,
 		types.ScheduleStatusActive, types.ScheduleStatusPaused,
+		types.ExecutionModeCompiled,
 	)
 	if err != nil {
 		return taskCreationDatabaseError("activate schedule mirror", err)
@@ -394,6 +402,10 @@ func (s *Store) BlockTaskCreationOperationAfterSideEffect(
 		row, found, err := loadCreationScheduleForUpdate(ctx, tx, op.TaskID)
 		if err != nil {
 			return err
+		}
+		if found && row.tenantID == lease.TenantID && row.userID == lease.UserID &&
+			row.mode != types.ExecutionModeCompiled {
+			return taskCreationConflict("activated aggregate is not a compiled task")
 		}
 		if found && row.tenantID == lease.TenantID && row.userID == lease.UserID &&
 			row.status == types.ScheduleStatusActive {
@@ -645,11 +657,13 @@ func (s *Store) FinishTaskCreationCleanup(
 			`DELETE FROM schedule_sources WHERE schedule_id = $1`,
 			`DELETE FROM schedule_playbooks WHERE schedule_id = $1`,
 			`DELETE FROM schedules
-			  WHERE id = $1 AND tenant_id = $2 AND user_id = $3 AND status = $4`,
+			  WHERE id = $1 AND tenant_id = $2 AND user_id = $3 AND status = $4
+			    AND execution_mode = $5`,
 		} {
 			args := []any{taskID}
 			if strings.Contains(statement, "DELETE FROM schedules") {
-				args = append(args, lease.TenantID, lease.UserID, types.ScheduleStatusPaused)
+				args = append(args, lease.TenantID, lease.UserID,
+					types.ScheduleStatusPaused, types.ExecutionModeCompiled)
 			}
 			tag, err := tx.Exec(ctx, statement, args...)
 			if err != nil {
@@ -887,20 +901,21 @@ func pausedCompiledTaskDefinitionMatches(
 		specJSON      []byte
 		scopeJSON     []byte
 		status        types.ScheduleStatus
+		executionMode string
 		strictness    *string
 		playbook      string
 		fetchPlan     []byte
 	)
 	err := tx.QueryRow(ctx,
 		`SELECT s.tenant_id, s.user_id, s.nl_description, s.spec_json, s.scope_json,
-		        s.status, s.push_strictness, p.content, p.fetch_plan
+		        s.status, s.execution_mode, s.push_strictness, p.content, p.fetch_plan
 		   FROM schedules s
 		   JOIN schedule_playbooks p ON p.schedule_id = s.id
 		  WHERE s.id = $1
 		  FOR UPDATE OF s, p`,
 		def.TaskID,
 	).Scan(&tenantID, &userID, &nlDescription, &specJSON, &scopeJSON,
-		&status, &strictness, &playbook, &fetchPlan)
+		&status, &executionMode, &strictness, &playbook, &fetchPlan)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
@@ -910,6 +925,7 @@ func pausedCompiledTaskDefinitionMatches(
 	wantStrictness := nullableStrictness(def.Strictness)
 	if tenantID != def.TenantID || userID != def.UserID ||
 		nlDescription != def.NLDescription || status != expectedStatus ||
+		executionMode != string(types.ExecutionModeCompiled) ||
 		playbook != def.PlaybookContent || !nullableStringsEqual(strictness, wantStrictness) ||
 		!taskCreationJSONEqual(specJSON, def.SpecJSON) ||
 		!taskCreationJSONEqual(scopeJSON, def.ScopeJSON) ||
@@ -931,6 +947,7 @@ type creationScheduleState struct {
 	tenantID   int64
 	userID     int64
 	status     types.ScheduleStatus
+	mode       types.ExecutionMode
 	generation string
 }
 
@@ -941,9 +958,9 @@ func loadCreationScheduleForUpdate(
 ) (creationScheduleState, bool, error) {
 	var row creationScheduleState
 	err := tx.QueryRow(ctx,
-		`SELECT tenant_id, user_id, status, xmin::text
+		`SELECT tenant_id, user_id, status, execution_mode, xmin::text
 		   FROM schedules WHERE id = $1 FOR UPDATE`, taskID,
-	).Scan(&row.tenantID, &row.userID, &row.status, &row.generation)
+	).Scan(&row.tenantID, &row.userID, &row.status, &row.mode, &row.generation)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return creationScheduleState{}, false, nil
@@ -989,6 +1006,7 @@ func validateCleanupAggregateState(
 	}
 	if row.tenantID != lease.TenantID || row.userID != lease.UserID ||
 		row.status != types.ScheduleStatusPaused ||
+		row.mode != types.ExecutionModeCompiled ||
 		row.generation != marker.AggregateGeneration {
 		return taskCreationConflict("cleanup aggregate is not the owned paused aggregate")
 	}

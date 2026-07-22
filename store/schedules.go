@@ -13,7 +13,7 @@ import (
 )
 
 // scheduleColumns 是 schedules 表全列，SELECT 与 scanSchedule 一一对应。
-const scheduleColumns = `id, tenant_id, user_id, nl_description, spec_json, scope_json, status, created_at, updated_at`
+const scheduleColumns = `id, tenant_id, user_id, nl_description, spec_json, scope_json, status, execution_mode, created_at, updated_at`
 
 // matureSchedulePredicate requires the outer schedules table to use alias s.
 // A v1 aggregate is user-manageable only after its operation is both
@@ -30,10 +30,19 @@ const matureSchedulePredicate = `NOT EXISTS (
 
 // scanSchedule 把一行 schedules 扫进 types.Schedule（复用于单行与多行）。
 func scanSchedule(row pgx.Row, sc *types.Schedule) error {
-	return row.Scan(
+	var rawMode string
+	if err := row.Scan(
 		&sc.ID, &sc.TenantID, &sc.UserID, &sc.NLDescription, &sc.SpecJSON, &sc.ScopeJSON,
-		&sc.Status, &sc.CreatedAt, &sc.UpdatedAt,
-	)
+		&sc.Status, &rawMode, &sc.CreatedAt, &sc.UpdatedAt,
+	); err != nil {
+		return err
+	}
+	mode, err := types.ParseExecutionMode(rawMode)
+	if err != nil {
+		return fmt.Errorf("store: schedule %q has invalid execution mode: %w", sc.ID, err)
+	}
+	sc.ExecutionMode = mode
+	return nil
 }
 
 // InsertSchedule 写入调度镜像。scheduler 在 Temporal Create 成功后调用本方法，
@@ -55,11 +64,19 @@ func (s *Store) InsertSchedule(ctx context.Context, sc *types.Schedule) error {
 	if status == "" {
 		status = types.ScheduleStatusActive
 	}
+	// InsertSchedule is the legacy/compatibility compiled-task mirror writer.
+	// Mapping its Go zero value is explicit at this boundary; accepting a dynamic
+	// mode here would bypass the future confirmed Approved Definition control plane.
+	if sc.ExecutionMode != "" && sc.ExecutionMode != types.ExecutionModeCompiled {
+		return types.NewAppError(types.CodeValidation,
+			"旧调度镜像入口只允许 compiled 执行模式", types.ErrValidation)
+	}
+	mode := types.ExecutionModeCompiled
 	if status != types.ScheduleStatusActive {
 		_, err := s.pool.Exec(ctx,
-			`INSERT INTO schedules (id, tenant_id, user_id, nl_description, spec_json, scope_json, status)
-			 VALUES ($1, `+tenantOfUser+`$2), $2, $3, $4, $5, $6)`,
-			sc.ID, sc.UserID, sc.NLDescription, spec, scope, status)
+			`INSERT INTO schedules (id, tenant_id, user_id, nl_description, spec_json, scope_json, status, execution_mode)
+			 VALUES ($1, `+tenantOfUser+`$2), $2, $3, $4, $5, $6, $7)`,
+			sc.ID, sc.UserID, sc.NLDescription, spec, scope, status, mode)
 		if err != nil {
 			return types.NewAppError(types.CodeDatabase,
 				fmt.Sprintf("插入调度镜像（id=%s）", sc.ID), err)
@@ -90,9 +107,9 @@ func (s *Store) InsertSchedule(ctx context.Context, sc *types.Schedule) error {
 			types.ErrTaskCreationLimit)
 	}
 	_, err = tx.Exec(ctx,
-		`INSERT INTO schedules (id, tenant_id, user_id, nl_description, spec_json, scope_json, status)
-		 VALUES ($1, `+tenantOfUser+`$2), $2, $3, $4, $5, $6)`,
-		sc.ID, sc.UserID, sc.NLDescription, spec, scope, status)
+		`INSERT INTO schedules (id, tenant_id, user_id, nl_description, spec_json, scope_json, status, execution_mode)
+		 VALUES ($1, `+tenantOfUser+`$2), $2, $3, $4, $5, $6, $7)`,
+		sc.ID, sc.UserID, sc.NLDescription, spec, scope, status, mode)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("插入调度镜像（id=%s）", sc.ID), err)

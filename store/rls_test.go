@@ -232,6 +232,7 @@ func TestRLS_PoliciesCoverAllTenantTables(t *testing.T) {
 		"subscriptions", "push_batches", "deliveries", "feedbacks",
 		"profiles", "schedules", "agent_sessions", "pending_actions",
 		"llm_calls", "tool_calls", "task_run_snapshots",
+		"task_approved_definition_versions", "task_adaptive_states",
 	}
 	for _, tbl := range want {
 		var enabled bool

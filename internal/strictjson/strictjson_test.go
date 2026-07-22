@@ -32,6 +32,28 @@ func TestValidateRejectsInvalidUTF8BeforeDecoderReplacement(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsUnpairedSurrogateEscapes(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{
+		`{"value":"\ud800"}`,
+		`{"value":"\ud801"}`,
+		`{"value":"\udfff"}`,
+		`{"value":"\ud800\u0041"}`,
+	} {
+		if err := Validate([]byte(raw)); err == nil {
+			t.Fatalf("Validate(%s) accepted an unpaired surrogate", raw)
+		}
+	}
+	for _, raw := range []string{
+		`{"value":"\ud83d\ude80"}`,
+		`{"value":"literal \\ud800"}`,
+	} {
+		if err := Validate([]byte(raw)); err != nil {
+			t.Fatalf("Validate(%s) rejected valid JSON: %v", raw, err)
+		}
+	}
+}
+
 func TestDecodeRejectsUnknownFieldsAndPreservesWideNumbers(t *testing.T) {
 	t.Parallel()
 	type envelope struct {

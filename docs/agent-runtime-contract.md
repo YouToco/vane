@@ -27,6 +27,13 @@ Vane 按用户确认的意图选择两种内部执行模式：
 动态发现的新源默认仅本次运行可用。除同一主体、同一 canonical domain 的等价端点恢复外，
 长期新增信源、订阅、主题、日程、预算、渠道、账号或任何写操作都必须重新确认；用户不在线时拒绝改变。
 
+**C2 持久化不变量**：`discover_at_run` 必须带精确的 Approved Definition head；只有
+`compiled` 可作为兼容期 headless 状态。每次 Adaptive 写入都携带其运行快照消费的 definition
+version+digest fence，并把该 basis 随行持久化；head 已变化的旧 run 一律冲突。C3 建立等价恢复
+证据前，LKG 只能等于当前 exact `approved_plan` basis，`legacy_subscriptions` 不得写 Adaptive 或
+成为 LKG。C2c 构造运行快照时必须在同一数据库事务内读取 definition、Adaptive 与 head，不能在
+内存里拼接两个独立查询。
+
 ## 3. Run Snapshot：每次运行只有一个事实版本
 
 每个 Temporal run 在任何网络、LLM、数据库写入或推送副作用前创建一次不可变运行快照，冻结：
@@ -157,7 +164,9 @@ Activity result 进入 Temporal history。首版 planner 硬上限为 8 轮、16
 | C0 | `ExecutionMode` + scheduled-only immutable `task_run_snapshots` 真库原语 | 零调用点，只部署 schema/API 地基 |
 | C1a | 强类型非敏感 policy DTO + 固定 v1 payload reader | 零调用点；先封住密钥边界与历史重解释风险 |
 | C1b | versioned `PrepareRun` + Compiled 全链按 snapshot ref 消费 | 存量仍 Compiled，行为等价且单 run 不漂移 |
-| C2 | `schedules.execution_mode` + Approved/Adaptive 分表与确认变更 | 默认 Compiled，动态模式仍 feature flag 关闭 |
+| C2a | mode + Approved/Adaptive schema、冻结 wire 与 fenced Store | 零调用点；默认 Compiled，动态模式仍关闭 |
+| C2b | 完整提案确认 + definition CAS 唯一写控制面 | 封住 HTTP/旧 pending/分段写旁路，仍不切运行读取 |
+| C2c | 存量适配、shadow 对账并切 immutable head 读取 | 动态模式仍 feature flag 关闭 |
 | C3 | RunID/StepID 检查点、LKG、bounded `PlanFetch` | 仅 shadow，无用户推送影响 |
 | C4 | 两条首批竖切的 Boss 单任务 canary | 逐步放量，可回滚 Compiled/LKG |
 

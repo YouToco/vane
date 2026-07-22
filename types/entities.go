@@ -320,8 +320,12 @@ type Schedule struct {
 	SpecJSON      json.RawMessage `json:"spec_json"`      // JSONB：{cron,tz} 或 {every_seconds}
 	ScopeJSON     json.RawMessage `json:"scope_json"`     // JSONB：PushScope 序列化
 	Status        ScheduleStatus  `json:"status"`         // active/paused
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
+	// ExecutionMode is an internal Approved Definition field. It is deliberately
+	// excluded from the current public schedule wire until the confirmed-control-
+	// plane cutover; C2a only makes the persisted compatibility mode explicit.
+	ExecutionMode ExecutionMode `json:"-"`
+	CreatedAt     time.Time     `json:"created_at"`
+	UpdatedAt     time.Time     `json:"updated_at"`
 }
 
 // SchedulePlaybook 情报任务手册（schedule_playbooks 表，migration 017）。

@@ -46,6 +46,7 @@ type purgeStep struct {
 //	task_creation_receipts               → pending_actions → agent_sessions
 //	deliveries                            → push_batches
 //	task_run_snapshots                    → tenants / users
+//	task_adaptive_states                  → task_approved_definition_versions → schedules
 //	其余                                   → tenants / users
 //
 // 排错了不会静默——FK 约束会让整个事务失败，而 dry-run 就是为了在真删之前撞出这个。
@@ -54,6 +55,11 @@ var purgeOrder = []purgeStep{
 	// 「按 tenant_id 列对账」的守卫看不见它们，必须靠外键可达性那条守卫兜住）。
 	{"schedule_playbooks", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
 	{"schedule_sources", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
+	// Adaptive 的 last-known-good 外键指向 immutable definition，因此必须先删。
+	{"task_adaptive_states", "tenant_id = $1"},
+	// 删除当前 definition 会由 FK 把 schedules 收敛为 compiled/headless，随后
+	// schedules 自己在父表位置删除；动态任务也不会短暂留下无 definition 的模式。
+	{"task_approved_definition_versions", "tenant_id = $1"},
 
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
