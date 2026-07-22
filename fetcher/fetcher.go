@@ -151,7 +151,20 @@ func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.Conte
 // fetchRSS 是 FetchRSS 的内部实现，多一个补全上限参数：周期抓取用 enrichMaxPerRound，
 // probe 用 probeEnrichCap（对抗审查 A-F3）。除补全条数外行为完全一致（含全灭防线）。
 func (f *Fetcher) fetchRSS(ctx context.Context, src types.Source, enrichCap int) ([]types.ContentItem, error) {
-	data, _, err := f.fetchBody(ctx, src.URL)
+	return f.fetchRSSWithEffectGate(ctx, src, enrichCap, nil)
+}
+
+// fetchRSSWithEffectGate is the compiled-runtime variant. beforeEffect is
+// evaluated beside every upstream call: once for the feed GET and once for
+// each optional Exa /contents enrichment. Legacy callers use fetchRSS, which
+// passes nil and therefore retains the original behavior.
+func (f *Fetcher) fetchRSSWithEffectGate(
+	ctx context.Context,
+	src types.Source,
+	enrichCap int,
+	beforeEffect func(context.Context) error,
+) ([]types.ContentItem, error) {
+	data, _, err := f.fetchBodyWithEffectGate(ctx, src.URL, beforeEffect)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +192,11 @@ func (f *Fetcher) fetchRSS(ctx context.Context, src types.Source, enrichCap int)
 	//   - 之后：不为一条马上要被 lookback/categories 滤掉的条目付费。
 	//   - 之前：补回来的正文要参与 finalize 的指纹与 §12.3 护栏判定；放到映射之后，
 	//     链接型条目会先被护栏丢掉，补全永远等不到执行。
-	skippedSeen, enrichFailed := f.enrichItems(ctx, src, items, enrichCap)
+	skippedSeen, enrichFailed, err := f.enrichItemsWithEffectGate(
+		ctx, src, items, enrichCap, beforeEffect)
+	if err != nil {
+		return nil, err
+	}
 
 	// 全灭判定必须在此处、比较**映射函数的入参与产出**——不能拿 feed.Items 当分母。
 	// applyLookback / applyCategories 是用户声明的正常过滤（B 类），它们在这一行之前
@@ -224,6 +241,14 @@ func (f *Fetcher) fetchRSS(ctx context.Context, src types.Source, enrichCap int)
 // → CodeValidation（不可重试）；429 → CodeFetchRateLimit；非 2xx 按 5xx/4xx 定
 // Retryable；连接期错误经 classifyDoError 归类。
 func (f *Fetcher) fetchBody(ctx context.Context, rawURL string) ([]byte, *url.URL, error) {
+	return f.fetchBodyWithEffectGate(ctx, rawURL, nil)
+}
+
+func (f *Fetcher) fetchBodyWithEffectGate(
+	ctx context.Context,
+	rawURL string,
+	beforeEffect func(context.Context) error,
+) ([]byte, *url.URL, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, nil, types.NewAppError(types.CodeValidation,
@@ -252,6 +277,9 @@ func (f *Fetcher) fetchBody(ctx context.Context, rawURL string) ([]byte, *url.UR
 	req.Header.Set("User-Agent", "Vane/0.3 (+https://vane.zhuoqidev.com)")
 	req.Header.Set("Accept", "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5")
 
+	if err := checkEffectGate(ctx, beforeEffect); err != nil {
+		return nil, nil, err
+	}
 	resp, err := f.client.Do(req)
 	if err != nil {
 		return nil, nil, classifyDoError(rawURL, err)

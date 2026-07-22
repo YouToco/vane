@@ -61,6 +61,8 @@ func newTaskRunSnapshotFixture(t *testing.T) *taskRunSnapshotFixture {
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM memberships WHERE tenant_id = $1`, tenantID)
 		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM tenant_quota WHERE tenant_id = $1`, tenantID)
+		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM sources WHERE url LIKE $1`, f.urlPrefix+"%")
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM users WHERE id = $1`, userID)
@@ -660,7 +662,7 @@ func TestCreateOrGetTaskRunSnapshot_FailsClosed(t *testing.T) {
 		}
 	})
 
-	t.Run("missing playbook", func(t *testing.T) {
+	t.Run("missing playbook with approved links", func(t *testing.T) {
 		f := newTaskRunSnapshotFixture(t)
 		taskID := f.taskID()
 		f.createApprovedTask(t, taskID, 1)
@@ -669,8 +671,32 @@ func TestCreateOrGetTaskRunSnapshot_FailsClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := f.st.createOrGetTaskRunSnapshot(
-			t.Context(), f.params(taskID, "run-"+uuid.NewString())); !errors.Is(err, types.ErrNotFound) {
-			t.Fatalf("缺 playbook 应 fail closed 为 NotFound，实际 %v", err)
+			t.Context(), f.params(taskID, "run-"+uuid.NewString())); !errors.Is(err, types.ErrInternal) {
+			t.Fatalf("缺 playbook 但仍有 approved links 必须 fail closed，实际 %v", err)
+		}
+	})
+
+	t.Run("legacy schedule without playbook remains runnable", func(t *testing.T) {
+		f := newTaskRunSnapshotFixture(t)
+		taskID := f.taskID()
+		sourceIDs := f.createLegacyTask(t, taskID)
+		if _, err := f.st.pool.Exec(t.Context(),
+			`DELETE FROM schedule_playbooks WHERE schedule_id=$1`, taskID); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := f.st.createOrGetTaskRunSnapshot(
+			t.Context(), f.params(taskID, "run-"+uuid.NewString()))
+		if err != nil {
+			t.Fatalf("存量无 playbook 任务应按空手册 legacy 快照继续运行: %v", err)
+		}
+		var payload taskRunSnapshotPayload
+		if err := json.Unmarshal(snapshot.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Definition.SourceScope != taskRunSourceScopeLegacy ||
+			len(payload.Definition.Sources) != 1 ||
+			payload.Definition.Sources[0].SourceID != sourceIDs[0] {
+			t.Fatalf("无 playbook legacy 快照范围错误: %+v", payload.Definition)
 		}
 	})
 
@@ -1127,7 +1153,7 @@ func TestTaskRunSnapshots_MigrationShape(t *testing.T) {
 	}
 }
 
-func TestCreateOrGetTaskRunSnapshot_HasZeroProductionCallPoints(t *testing.T) {
+func TestCreateOrGetTaskRunSnapshot_HasSinglePreparedProductionPath(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller 无法定位测试文件")
@@ -1135,6 +1161,9 @@ func TestCreateOrGetTaskRunSnapshot_HasZeroProductionCallPoints(t *testing.T) {
 	repoRoot := filepath.Dir(filepath.Dir(thisFile))
 	fset := token.NewFileSet()
 	var references []string
+	var rawCalls, typedCalls, facadeCalls int
+	typedAdapterPath := filepath.Join(repoRoot, "store", "task_run_snapshot_typed.go")
+	prepareRunPath := filepath.Join(repoRoot, "workflow", "activities.go")
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -1152,65 +1181,59 @@ func TestCreateOrGetTaskRunSnapshot_HasZeroProductionCallPoints(t *testing.T) {
 		if parseErr != nil {
 			return parseErr
 		}
-		allowedPersistenceCalls := make(map[token.Pos]struct{})
-		typedAdapterPath := filepath.Join(repoRoot, "store", "task_run_snapshot_typed.go")
-		if filepath.Clean(path) == filepath.Clean(typedAdapterPath) {
-			for _, declaration := range file.Decls {
-				function, ok := declaration.(*ast.FuncDecl)
-				if !ok || function.Name.Name != "CreateOrGetCompiledTaskRunSnapshotV1" ||
-					function.Body == nil || function.Recv == nil || len(function.Recv.List) != 1 ||
-					len(function.Recv.List[0].Names) != 1 {
-					continue
-				}
-				receiverName := function.Recv.List[0].Names[0].Name
-				star, pointerReceiver := function.Recv.List[0].Type.(*ast.StarExpr)
-				if !pointerReceiver {
-					continue
-				}
-				storeType, storeReceiver := star.X.(*ast.Ident)
-				if !storeReceiver || storeType.Name != "Store" {
-					continue
-				}
-				ast.Inspect(function.Body, func(node ast.Node) bool {
-					selector, ok := node.(*ast.SelectorExpr)
-					if !ok {
-						return true
-					}
-					receiver, receiverOK := selector.X.(*ast.Ident)
-					if receiverOK && receiver.Name == receiverName &&
-						selector.Sel.Name == "createOrGetTaskRunSnapshot" {
-						allowedPersistenceCalls[selector.Pos()] = struct{}{}
-					}
-					return true
-				})
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
 			}
-		}
-		ast.Inspect(file, func(node ast.Node) bool {
-			selector, ok := node.(*ast.SelectorExpr)
-			if !ok {
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				selector, ok := node.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				allowed := false
+				switch selector.Sel.Name {
+				case "createOrGetTaskRunSnapshot":
+					allowed = filepath.Clean(path) == filepath.Clean(typedAdapterPath) &&
+						function.Name.Name == "CreateOrGetCompiledTaskRunSnapshotV1"
+					if allowed {
+						rawCalls++
+					}
+				case "CreateOrGetCompiledTaskRunSnapshotV1":
+					allowed = filepath.Clean(path) == filepath.Clean(typedAdapterPath) &&
+						function.Name.Name == "CreateOrGetCompiledRunSnapshotV1"
+					if allowed {
+						typedCalls++
+					}
+				case "CreateOrGetCompiledRunSnapshotV1":
+					allowed = filepath.Clean(path) == filepath.Clean(prepareRunPath) &&
+						function.Name.Name == "PrepareRun"
+					if allowed {
+						facadeCalls++
+					}
+				default:
+					return true
+				}
+				if !allowed {
+					position := fset.Position(selector.Pos())
+					references = append(references,
+						fmt.Sprintf("%s:%d", position.Filename, position.Line))
+				}
 				return true
-			}
-			if selector.Sel.Name == "createOrGetTaskRunSnapshot" {
-				if _, allowed := allowedPersistenceCalls[selector.Pos()]; allowed {
-					return true
-				}
-			}
-			if selector.Sel.Name == "createOrGetTaskRunSnapshot" ||
-				selector.Sel.Name == "CreateOrGetCompiledTaskRunSnapshotV1" {
-				position := fset.Position(selector.Pos())
-				references = append(references,
-					fmt.Sprintf("%s:%d", position.Filename, position.Line))
-			}
-			return true
-		})
+			})
+		}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("扫描生产调用点: %v", err)
 	}
 	if len(references) != 0 {
-		t.Fatalf("C1a typed/raw snapshot primitives must keep zero production call points, found %v",
+		t.Fatalf("C1b snapshot persistence escaped the prepared typed path: %v",
 			references)
+	}
+	if rawCalls != 1 || typedCalls != 1 || facadeCalls != 1 {
+		t.Fatalf("C1b snapshot path calls raw=%d typed=%d facade=%d, want exactly 1 each",
+			rawCalls, typedCalls, facadeCalls)
 	}
 }
 

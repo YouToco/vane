@@ -35,19 +35,20 @@ import (
 )
 
 const (
-	taskScheduleIDSchemeVersion     = "v1"
-	taskScheduleFingerprintVersion  = "v1"
-	taskScheduleMemoKey             = "vane.task-schedule"
-	taskScheduleDefaultConverterID  = "temporal-default-json-v1"
-	taskScheduleV1WorkflowType      = "PushPipelineWorkflow"
-	taskScheduleV1CatchupWindow     = time.Minute
-	taskScheduleV1WorkflowTaskTime  = 10 * time.Second
-	taskScheduleV1ProvisioningNote  = "vane/task-schedule/v1:provisioning-paused"
-	taskScheduleV1ActivationNote    = "vane/task-schedule/v1:definition-committed"
-	taskScheduleV1PhaseProvisioning = "provisioning"
-	taskScheduleV1PhaseActive       = "active"
-	taskScheduleRecoveryTimeout     = 5 * time.Second
-	maxTaskOperationIDBytes         = 512
+	taskScheduleIDSchemeVersion      = "v1"
+	taskScheduleFingerprintVersionV1 = "v1"
+	taskScheduleFingerprintVersion   = "v2"
+	taskScheduleMemoKey              = "vane.task-schedule"
+	taskScheduleDefaultConverterID   = "temporal-default-json-v1"
+	taskScheduleV1WorkflowType       = "PushPipelineWorkflow"
+	taskScheduleV1CatchupWindow      = time.Minute
+	taskScheduleV1WorkflowTaskTime   = 10 * time.Second
+	taskScheduleV1ProvisioningNote   = "vane/task-schedule/v1:provisioning-paused"
+	taskScheduleV1ActivationNote     = "vane/task-schedule/v1:definition-committed"
+	taskScheduleV1PhaseProvisioning  = "provisioning"
+	taskScheduleV1PhaseActive        = "active"
+	taskScheduleRecoveryTimeout      = 5 * time.Second
+	maxTaskOperationIDBytes          = 512
 )
 
 // SchedulerOption configures the A3 task-schedule control plane without
@@ -1042,10 +1043,27 @@ func (s *Scheduler) buildPreparedTaskSchedule(req TaskScheduleRequest) (Prepared
 	if len(req.Scope.SourceIDs) > 0 {
 		scope.SourceIDs = slices.Clone(req.Scope.SourceIDs)
 	}
-	params := makePushParams(req.UserID, taskID, scope, name)
+	params := makePushParams(req.TenantID, req.UserID, taskID, scope, name)
+	runtimeVersion := s.compiledRuntime.runtimeVersionFor(taskID)
+	fingerprintVersion := taskScheduleFingerprintVersionV1
+	if runtimeVersion == workflow.CompiledRuntimeSnapshotV1 {
+		// A v2 checkpoint is written only for an explicitly selected C1b
+		// canary/all-task rollout. This keeps dark deployment expansion-safe:
+		// an older binary can still resume every checkpoint written before C1b
+		// is deliberately activated.
+		fingerprintVersion = taskScheduleFingerprintVersion
+		params.RuntimeVersion = runtimeVersion
+	} else {
+		// Preserve the exact semantic v1 Action envelope. buildTaskScheduleExpected
+		// upgrades it deterministically before Temporal I/O, while the durable
+		// checkpoint itself remains readable by the previous binary.
+		params.TenantID = 0
+		params.ExecutionMode = ""
+		params.RuntimeVersion = ""
+	}
 	return PreparedTaskSchedule{
 		IDSchemeVersion:    taskScheduleIDSchemeVersion,
-		FingerprintVersion: taskScheduleFingerprintVersion,
+		FingerprintVersion: fingerprintVersion,
 		Namespace:          namespace,
 		ConverterID:        converterID,
 		TaskID:             taskID,
@@ -1239,7 +1257,8 @@ func validatePreparedTaskSchedule(prepared PreparedTaskSchedule) error {
 	if prepared.IDSchemeVersion != taskScheduleIDSchemeVersion {
 		return fmt.Errorf("unsupported task ID scheme version %q", prepared.IDSchemeVersion)
 	}
-	if prepared.FingerprintVersion != taskScheduleFingerprintVersion {
+	if prepared.FingerprintVersion != taskScheduleFingerprintVersionV1 &&
+		prepared.FingerprintVersion != taskScheduleFingerprintVersion {
 		return fmt.Errorf("unsupported fingerprint version %q", prepared.FingerprintVersion)
 	}
 	for _, field := range []struct {
@@ -1284,6 +1303,26 @@ func validatePreparedTaskSchedule(prepared PreparedTaskSchedule) error {
 	if params.UserID != prepared.UserID || params.RunKind != workflow.PushRunKindScheduled ||
 		params.ScheduleID != prepared.TaskID {
 		return errors.New("workflow params do not match the prepared owner and task ID")
+	}
+	if params.Snapshot != nil {
+		return errors.New("prepared Schedule Action must not carry a run snapshot")
+	}
+	if prepared.FingerprintVersion == taskScheduleFingerprintVersionV1 {
+		// Retained v1 checkpoints predate these JSON fields. Their exact wire
+		// shape therefore decodes to the language zero values, not to the
+		// explicit "unknown" sentinel introduced later. Accept only that old
+		// shape so a forged partially-upgraded v1 checkpoint still fails closed.
+		if params.TenantID != 0 || params.ExecutionMode != "" ||
+			params.RuntimeVersion != "" {
+			return errors.New("v1 workflow params are not in the retained legacy shape")
+		}
+	} else {
+		if params.TenantID != prepared.TenantID || params.ExecutionMode != types.ExecutionModeCompiled {
+			return errors.New("v2 workflow params do not match the prepared tenant and compiled mode")
+		}
+		if params.RuntimeVersion != "" && params.RuntimeVersion != workflow.CompiledRuntimeSnapshotV1 {
+			return errors.New("prepared Schedule Action runtime version is unsupported")
+		}
 	}
 	if params.Scope.TopN < 0 {
 		return errors.New("scope.top_n must not be negative")
@@ -1394,6 +1433,14 @@ func (s *Scheduler) buildTaskScheduleExpected(
 		)
 	}
 	params := prepared.Action.Params
+	if prepared.FingerprintVersion == taskScheduleFingerprintVersionV1 {
+		// Fixed retained-reader upgrade. It never consults rollout config: v1
+		// remains the legacy Compiled implementation, but gains the explicit
+		// tenant/mode envelope before it can be activated.
+		params.TenantID = prepared.TenantID
+		params.ExecutionMode = types.ExecutionModeCompiled
+		params.RuntimeVersion = ""
+	}
 	params.Scope.SourceIDs = slices.Clone(params.Scope.SourceIDs)
 	return taskScheduleExpected{
 		taskID: prepared.TaskID,
@@ -1861,13 +1908,26 @@ func verifyTaskScheduleProtoAction(
 	if err := actionDC.FromPayload(inputs[0], &got); err != nil {
 		return taskScheduleFingerprint{}, fmt.Errorf("decode workflow args: %w", err)
 	}
-	if got.UserID != expected.params.UserID || got.RunKind != expected.params.RunKind ||
-		got.ScheduleID != expected.params.ScheduleID ||
-		got.NLDesc != expected.params.NLDesc || got.Scope.TopN != expected.params.Scope.TopN ||
-		!slices.Equal(got.Scope.SourceIDs, expected.params.Scope.SourceIDs) {
+	matches := taskScheduleParamsEqual(got, expected.params)
+	if !matches && expected.prepared.FingerprintVersion == taskScheduleFingerprintVersionV1 {
+		// A response-lost v1 Create may have committed the old tenant-less
+		// Action. It is still owned by the sealed v1 memo/request digest, and the
+		// next activation update deterministically rewrites it to expected.params.
+		matches = taskScheduleParamsEqual(got, expected.prepared.Action.Params)
+	}
+	if !matches {
 		return taskScheduleFingerprint{}, errors.New("workflow args do not match request")
 	}
 	return fingerprint, nil
+}
+
+func taskScheduleParamsEqual(got, want workflow.PushParams) bool {
+	return got.TenantID == want.TenantID && got.UserID == want.UserID &&
+		got.RunKind == want.RunKind && got.ExecutionMode == want.ExecutionMode &&
+		got.RuntimeVersion == want.RuntimeVersion && got.ScheduleID == want.ScheduleID &&
+		got.NLDesc == want.NLDesc && got.Scope.TopN == want.Scope.TopN &&
+		got.Snapshot == nil && want.Snapshot == nil &&
+		slices.Equal(got.Scope.SourceIDs, want.Scope.SourceIDs)
 }
 
 func taskScheduleProtoSpecMatches(

@@ -14,6 +14,7 @@ import (
 	"go.temporal.io/sdk/converter"
 	sdklog "go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/worker"
+	sdkworkflow "go.temporal.io/sdk/workflow"
 
 	"github.com/YouToco/vane/types"
 )
@@ -255,6 +256,18 @@ func replay(t *testing.T, h *historypb.History) error {
 	return r.ReplayWorkflowHistory(replayLogger(), h)
 }
 
+func replayWithExecution(
+	t *testing.T,
+	h *historypb.History,
+	execution sdkworkflow.Execution,
+) error {
+	t.Helper()
+	r := worker.NewWorkflowReplayer()
+	r.RegisterWorkflow(PushPipelineWorkflow)
+	return r.ReplayWorkflowHistoryWithOptions(replayLogger(), h,
+		worker.ReplayWorkflowHistoryOptions{OriginalExecution: execution})
+}
+
 // baselineHappyPathHistory 是一份 **009 之前**的历史：EvolveProfile → Fetch(20 条)
 // → Dedup(18) → Score(18) → Select(5) → CardGen(5) → Push → Completed。
 // 它里面**没有** RecordEmptyBatch —— 009 之前那个 Activity 还不存在。
@@ -420,6 +433,118 @@ func postA5PreP1cScheduledHappyPathHistory(t *testing.T) *historypb.History {
 func TestPushPipelineWorkflow_ReplayPostA5PreP1cScheduledHappyPath(t *testing.T) {
 	if err := replay(t, postA5PreP1cScheduledHappyPathHistory(t)); err != nil {
 		t.Fatalf("A5 后、P1c 前的定时任务历史必须能被当前 workflow 无损重放，实得: %v", err)
+	}
+}
+
+// compiledV1HappyPathHistory is the first C1b history generation. It pins the
+// new GetVersion marker and proves that PrepareRun replaces (rather than
+// supplements) AuthorizeRun, while every later Activity receives only one
+// sealed reference plus the existing stage payload.
+func compiledV1HappyPathHistory(
+	t *testing.T,
+	execution sdkworkflow.Execution,
+) *historypb.History {
+	t.Helper()
+	p := PushParams{
+		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
+		ExecutionMode: types.ExecutionModeCompiled, RuntimeVersion: CompiledRuntimeSnapshotV1,
+		ScheduleID: "task-c1b-replay", NLDesc: "每日冻结情报",
+	}
+	identity := types.RunIdentity{
+		TemporalWorkflowID: execution.ID,
+		TemporalRunID:      execution.RunID,
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           p.TenantID,
+		UserID:             p.UserID,
+		TaskID:             p.ScheduleID,
+	}
+	ref := mustCompiledRunRef(identity, 101)
+	run := &CompiledRunInputV1{
+		TenantID: p.TenantID, TaskID: p.ScheduleID, Snapshot: ref,
+	}
+	preparedParams := p
+	preparedParams.Snapshot = &ref
+	const traceID = "9f1d6c5e-0000-4000-8000-c1breplay000"
+
+	b := newHistoryBuilder(t, p)
+	b.sideEffect(1, traceID)
+	b.versionWithSearchAttributes("scheduled-runtime-envelope-v1", 1)
+	b.versionWithSearchAttributes("compiled-run-snapshot-v1", 1)
+	b.activity("PrepareRun", p, PrepareRunResult{Authorized: true, Snapshot: ref})
+	b.activity("EvolveProfile", EvolveIn{UserID: p.UserID, TraceID: traceID, Run: run}, nil)
+	b.activity("Fetch", preparedParams, items(20))
+	b.activity("Dedup", DedupIn{
+		UserID: p.UserID, TraceID: traceID, Items: items(20), Run: run,
+	}, items(18))
+	b.activity("Score", ScoreIn{
+		UserID: p.UserID, TraceID: traceID, Items: items(18),
+		ScheduleID: p.ScheduleID, Run: run,
+	}, scoredItems(18))
+	b.activity("Select", SelectIn{
+		UserID: p.UserID, TraceID: traceID, TopN: defaultTopN,
+		Scored: scoredItems(18), ScheduleID: p.ScheduleID, Run: run,
+	}, scoredItems(5))
+	b.activity("CardGen", CardGenIn{
+		UserID: p.UserID, TraceID: traceID, Items: scoredItems(5),
+		ScheduleID: p.ScheduleID, Run: run,
+	}, cardsOf(5))
+	b.activity("Push", PushIn{
+		UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID,
+		Cards: cardsOf(5), TaskTitle: p.NLDesc, Run: run,
+	}, nil)
+	return b.complete()
+}
+
+func TestPushPipelineWorkflow_ReplayCompiledV1HappyPath(t *testing.T) {
+	execution := sdkworkflow.Execution{
+		ID: "wf-task-c1b-replay", RunID: "00000000-0000-4000-8000-000000000101",
+	}
+	if err := replayWithExecution(t, compiledV1HappyPathHistory(t, execution), execution); err != nil {
+		t.Fatalf("C1b compiled history must replay exactly: %v", err)
+	}
+}
+
+func TestPushPipelineWorkflow_ReplayCompiledV1RejectsPrepareMutation(t *testing.T) {
+	execution := sdkworkflow.Execution{
+		ID: "wf-task-c1b-replay", RunID: "00000000-0000-4000-8000-000000000101",
+	}
+	history := compiledV1HappyPathHistory(t, execution)
+	mutated := false
+	for _, event := range history.Events {
+		attributes := event.GetActivityTaskScheduledEventAttributes()
+		if attributes.GetActivityType().GetName() == "PrepareRun" {
+			attributes.ActivityType.Name = "AuthorizeRun"
+			mutated = true
+			break
+		}
+	}
+	if !mutated {
+		t.Fatal("compiled replay fixture has no PrepareRun Activity")
+	}
+	if err := replayWithExecution(t, history, execution); err == nil {
+		t.Fatal("mutating C1b PrepareRun command identity must trigger nondeterminism")
+	}
+}
+
+func TestPushPipelineWorkflow_ReplayCompiledV1RejectsRuntimeRouteMutation(t *testing.T) {
+	execution := sdkworkflow.Execution{
+		ID: "wf-task-c1b-replay", RunID: "00000000-0000-4000-8000-000000000101",
+	}
+	history := compiledV1HappyPathHistory(t, execution)
+	started := history.Events[0].GetWorkflowExecutionStartedEventAttributes()
+	var input PushParams
+	if err := converter.GetDefaultDataConverter().FromPayloads(started.GetInput(), &input); err != nil {
+		t.Fatalf("decode compiled workflow input: %v", err)
+	}
+	input.RuntimeVersion = ""
+	payloads, err := converter.GetDefaultDataConverter().ToPayloads(input)
+	if err != nil {
+		t.Fatalf("encode mutated compiled workflow input: %v", err)
+	}
+	started.Input = payloads
+
+	if err := replayWithExecution(t, history, execution); err == nil {
+		t.Fatal("removing C1b runtime route from a compiled history must trigger nondeterminism")
 	}
 }
 

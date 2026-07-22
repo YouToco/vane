@@ -377,6 +377,38 @@ func TestCreationPreparer_RecoversPreparedCheckpointWithoutRemoteWork(t *testing
 	}
 }
 
+func TestCreationPreparer_RecoversRetainedV1PreparedCheckpointWithoutRemoteWork(t *testing.T) {
+	service, store, compiler, schedules, input := newCreationPrepareFixture(t)
+	first, err := service.Prepare(t.Context(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retained scheduler.PreparedTaskSchedule
+	mustUnmarshal(t, store.op.PreparedSchedule, &retained)
+	retained.FingerprintVersion = "v1"
+	retained.Action.Params.TenantID = 0
+	retained.Action.Params.ExecutionMode = ""
+	retained.Action.Params.RuntimeVersion = ""
+	recomputePreparedRequestDigest(&retained)
+	store.op.PreparedSchedule = mustMarshal(t, retained)
+
+	second, err := service.Prepare(t.Context(), input)
+	if err != nil {
+		t.Fatalf("recover retained v1 prepared checkpoint: %v", err)
+	}
+	if compiler.calls != 0 || schedules.calls != 1 || store.beginCalls != 1 {
+		t.Fatalf("retained recovery repeated work compiler=%d schedules=%d begin=%d",
+			compiler.calls, schedules.calls, store.beginCalls)
+	}
+	if second.Schedule.FingerprintVersion != "v1" ||
+		second.Schedule.Action.Params.TenantID != 0 ||
+		second.Schedule.Action.Params.ExecutionMode != "" ||
+		second.Schedule.RequestDigest != retained.RequestDigest ||
+		second.DefinitionDigest != first.DefinitionDigest {
+		t.Fatalf("retained recovery changed immutable checkpoint: %+v", second.Schedule)
+	}
+}
+
 func TestCreationPreparer_RecoversPreparedCheckpointFromLaterSagaPhase(t *testing.T) {
 	service, store, compiler, schedules, input := newCreationPrepareFixture(t)
 	first, err := service.Prepare(t.Context(), input)

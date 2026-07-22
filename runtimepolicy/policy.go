@@ -6,6 +6,12 @@
 package runtimepolicy
 
 const (
+	// PrimaryGenerationV1 is the first controlled resolver generation for the
+	// V1 endpoint and credential aliases. A future rotation that changes an
+	// alias's meaning must add a new generation and keep the old resolver while
+	// retained run snapshots may still consume it.
+	PrimaryGenerationV1 int64 = 1
+
 	// BundleSchemaVersionV1 identifies the complete C1 compiled policy bundle.
 	BundleSchemaVersionV1 = "vane.runtime-policy-bundle/v1"
 
@@ -19,6 +25,9 @@ const (
 	ModelPolicySchemaVersionV1 = "vane.runtime-model-policy/v1"
 	// QuotaPolicySchemaVersionV1 identifies immutable quota rules for one run.
 	QuotaPolicySchemaVersionV1 = "vane.runtime-quota-policy/v1"
+	// QuotaEnforcementLLMPrechargeV1 identifies the retained precharge plus
+	// actual-token reconciliation algorithm used by compiled LLM calls.
+	QuotaEnforcementLLMPrechargeV1 = "precharge-reconcile/v1"
 )
 
 // CapabilityImplementationIDV1 names a read-only worker implementation whose
@@ -27,7 +36,8 @@ const (
 type CapabilityImplementationIDV1 string
 
 const (
-	// CapabilityImplementationRSSV1 is the credentialless RSS/Atom reader.
+	// CapabilityImplementationRSSV1 is the credentialless RSS/Atom reader;
+	// its paid Exa enrichment route is frozen as a dependency credential.
 	CapabilityImplementationRSSV1 CapabilityImplementationIDV1 = "fetcher.rss/v1"
 	// CapabilityImplementationExaV1 is the Exa search/content reader.
 	CapabilityImplementationExaV1 CapabilityImplementationIDV1 = "fetcher.exa/v1"
@@ -117,11 +127,12 @@ type CapabilityCatalogV1 struct {
 // CapabilityV1 pins a registered read-only fetch capability and the worker
 // implementation generation that knows how to execute it.
 type CapabilityV1 struct {
-	Platform              string                       `json:"platform"`
-	Capability            string                       `json:"capability"`
-	Kind                  string                       `json:"kind"`
-	ImplementationVersion CapabilityImplementationIDV1 `json:"implementation_version"`
-	CredentialRef         CredentialRefV1              `json:"credential_ref"`
+	Platform                 string                       `json:"platform"`
+	Capability               string                       `json:"capability"`
+	Kind                     string                       `json:"kind"`
+	ImplementationVersion    CapabilityImplementationIDV1 `json:"implementation_version"`
+	CredentialRef            CredentialRefV1              `json:"credential_ref"`
+	DependencyCredentialRefs []CredentialRefV1            `json:"dependency_credential_refs"`
 }
 
 // ToolPolicyV1 is intentionally empty for compiled execution. Planner and
@@ -158,6 +169,16 @@ type ModelPolicyV1 struct {
 	Calls         []ModelCallV1     `json:"calls"`
 }
 
+// Call returns the immutable parameters for stage.
+func (p ModelPolicyV1) Call(stage string) (ModelCallV1, bool) {
+	for _, call := range p.Calls {
+		if call.Stage == stage {
+			return call, true
+		}
+	}
+	return ModelCallV1{}, false
+}
+
 // ModelCallV1 is the complete model-visible parameter set for one compiled
 // pipeline stage.
 type ModelCallV1 struct {
@@ -168,21 +189,32 @@ type ModelCallV1 struct {
 	DisableThinking bool    `json:"disable_thinking"`
 }
 
-// QuotaPolicyV1 contains immutable quota rules, not mutable balance state.
-// Available tokens and updated-at timestamps deliberately stay outside it.
+// QuotaPolicyV1 freezes the identity and enforcement generation of financial
+// gates used by a run. Mutable tenant balance, rate and burst are live
+// authorization state: freezing those values while mutating one shared bucket
+// would make concurrent policy generations mathematically inconsistent.
 type QuotaPolicyV1 struct {
 	SchemaVersion string          `json:"schema_version"`
 	Buckets       []QuotaBucketV1 `json:"buckets"`
 }
 
-// QuotaBucketV1 freezes one token-bucket rule and its enforcement algorithm
-// generation. RatePerSecond and Burst may both be zero for a disabled quota.
+// Bucket returns the immutable rule named name.
+func (p QuotaPolicyV1) Bucket(name string) (QuotaBucketV1, bool) {
+	for _, bucket := range p.Buckets {
+		if bucket.Name == name {
+			return bucket, true
+		}
+	}
+	return QuotaBucketV1{}, false
+}
+
+// QuotaBucketV1 freezes one bucket identity and its enforcement algorithm.
+// Per-call/model hard limits live in ModelPolicyV1; tenant rate/burst/tokens
+// are deliberately resolved from the exact tenant immediately before spend.
 type QuotaBucketV1 struct {
-	Name               string  `json:"name"`
-	RatePerSecond      float64 `json:"rate_per_second"`
-	Burst              float64 `json:"burst"`
-	Financial          bool    `json:"financial"`
-	EnforcementVersion string  `json:"enforcement_version"`
+	Name               string `json:"name"`
+	Financial          bool   `json:"financial"`
+	EnforcementVersion string `json:"enforcement_version"`
 }
 
 // BuildInputV1 is the explicit non-secret input boundary for BuildV1. It has

@@ -14,11 +14,18 @@ import (
 
 	"go.temporal.io/sdk/activity"
 
+	cardgenpkg "github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/dedup"
+	evolverpkg "github.com/YouToco/vane/evolver"
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/fetcher"
+	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/promptguard"
+	"github.com/YouToco/vane/runcontext"
+	"github.com/YouToco/vane/runtimepolicy"
+	scorerpkg "github.com/YouToco/vane/scorer"
 	"github.com/YouToco/vane/selector"
+	storepkg "github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
 
@@ -82,9 +89,26 @@ type Fetcher interface {
 	Fetch(ctx context.Context, src types.Source) ([]types.ContentItem, error)
 }
 
+type compiledFetcherV1 interface {
+	ValidateRuntimeFetchRouteV1(
+		runtimepolicy.CapabilityV1,
+		types.Source,
+	) error
+	FetchWithPolicyV1(
+		context.Context,
+		types.Source,
+		runtimepolicy.CapabilityV1,
+		func(context.Context) error,
+	) ([]types.ContentItem, error)
+}
+
 // Scorer 给单条内容打分（scorer.Score，0-100）。traceID 贯穿 llm 记账。
 type Scorer interface {
 	Score(ctx context.Context, userID int64, item types.ContentItem, traceID, taskInstruction string) (float64, error)
+}
+
+type compiledScorerV1 interface {
+	ScoreWithPolicyV1(context.Context, int64, int64, types.ContentItem, string, string, scorerpkg.PolicyV1, func(context.Context, float64) error) (float64, error)
 }
 
 // CardGenerator 为单条打分内容生成解读正文 markdown（cardgen.Generate 的
@@ -94,10 +118,18 @@ type CardGenerator interface {
 	Generate(ctx context.Context, userID int64, item types.ScoredItem, traceID, taskInstruction string) (string, error)
 }
 
+type compiledCardGeneratorV1 interface {
+	GenerateWithPolicyV1(context.Context, int64, int64, types.ScoredItem, string, string, cardgenpkg.PolicyV1, func(context.Context, float64) error) (string, error)
+}
+
 // ProfileEvolver 画像演化器（生产实现 evolver.Evolver）：推送前批量消费该用户
 // 的新反馈、演化画像 summary/tags（Boss 拍板①：演化随推送批量，非反馈即时）。
 type ProfileEvolver interface {
 	Evolve(ctx context.Context, userID int64, traceID string) error
+}
+
+type compiledProfileEvolverV1 interface {
+	EvolveWithPolicyV1(context.Context, int64, int64, string, evolverpkg.PolicyV1, func(context.Context, float64) error, evolverpkg.CompiledProfileWritesV1) error
 }
 
 // Pusher 主动推送一张卡片给指定 open_id（pusher.Push），返回飞书消息 ID。
@@ -175,6 +207,47 @@ type Store interface {
 	GetSchedulePlaybook(ctx context.Context, userID int64, scheduleID string) (*types.SchedulePlaybook, error)
 }
 
+// CompiledRunStore is deliberately separate from the legacy Store interface:
+// old Activity tests and ad-hoc runs need no snapshot privileges, while C1b
+// consumers receive only the immutable/ref/live-authorization operations they
+// require. The concrete production implementation is *store.Store.
+type CompiledRunStore interface {
+	LoadCompiledRunSnapshotRefV1(context.Context, types.RunIdentity) (types.RunSnapshotRef, bool, error)
+	CreateOrGetCompiledRunSnapshotV1(context.Context, types.RunIdentity, runtimepolicy.BundleV1) (types.RunSnapshotRef, error)
+	LoadCompiledTaskRunSnapshotV1(context.Context, types.RunIdentity, types.RunSnapshotRef) (runcontext.CompiledSnapshotV1, error)
+	AuthorizeTaskRunSideEffect(context.Context, types.RunIdentity, types.RunSnapshotRef) (bool, error)
+	AuthorizeAndConsumeTaskRunLLMQuotaV1(context.Context, types.RunIdentity, types.RunSnapshotRef, runtimepolicy.QuotaBucketV1, float64) error
+	UpsertContentItemForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, *types.ContentItem) (int64, bool, error)
+	UpdateSourceFetchStateForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, time.Time, time.Time, int) (bool, error)
+	DisableSourceIfActiveForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64) (bool, error)
+	ListRecentSimhashesForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, time.Time, []int64) ([]int64, error)
+	EvolveProfileForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, []string, int64, time.Time, int64) error
+	AdvanceProfileCursorForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, time.Time, int64) error
+	CreatePushBatchForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string) (int64, error)
+	CreateOrRecoverPushBatchForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string) (int64, bool, error)
+	RecordEmptyPushBatchForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, types.BatchExitGate, types.PipelineCounts) (int64, bool, error)
+	InsertDeliveryForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, *types.Delivery) (int64, bool, bool, error)
+	UpdatePushBatchStatusForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, int64, types.BatchStatus) error
+	MarkPushBatchDoneReceiptV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, int64) error
+	MarkDeliverySentForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, int64, int64, string, json.RawMessage, time.Time) error
+	ListDueSourcesByIDs(context.Context, []int64) ([]types.Source, error)
+	ListUnpushedForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, []int64, int, int) ([]types.ContentItem, error)
+	SourceForContentFromIDs(context.Context, int64, []int64) (int64, bool, error)
+}
+
+// CompiledPolicyBuilderV1 freezes the process's current non-secret runtime
+// policy. The boolean is the per-task result of the existing playbook rollout
+// decision, not a mutable pointer to configuration.
+type CompiledPolicyBuilderV1 func(
+	context.Context,
+	int64,
+	bool,
+) (runtimepolicy.BundleV1, error)
+
+type CompiledModelResolverV1 interface {
+	ResolveRuntimeModelPolicyV1(runtimepolicy.ModelPolicyV1) (*llm.Client, error)
+}
+
 // Activities 持有 6 步 pipeline 的全部依赖，方法即 Temporal Activity。
 // 字段未导出，通过 NewActivities 注入——给 cmd/server 一个稳定构造入口，
 // 避免各 Activity 直接对 *store.Store 等具体类型硬编码。
@@ -204,6 +277,9 @@ type Activities struct {
 	// the canary has passed. Both are immutable after worker construction.
 	playbookPromptsEnabled         bool
 	playbookPromptCanaryScheduleID string
+	compiledStore                  CompiledRunStore
+	buildCompiledPolicyV1          CompiledPolicyBuilderV1
+	compiledModelResolverV1        CompiledModelResolverV1
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding
@@ -219,6 +295,21 @@ func WithPlaybookPromptPolicy(enabled bool, canaryScheduleID string) ActivitiesO
 	return func(a *Activities) {
 		a.playbookPromptsEnabled = enabled
 		a.playbookPromptCanaryScheduleID = strings.TrimSpace(canaryScheduleID)
+	}
+}
+
+// WithCompiledRuntimeV1 installs C1b's typed snapshot boundary. Both
+// dependencies are required together; PrepareRun fails closed if composition
+// is incomplete, while replay/legacy paths remain byte-compatible.
+func WithCompiledRuntimeV1(
+	st CompiledRunStore,
+	builder CompiledPolicyBuilderV1,
+	modelResolver CompiledModelResolverV1,
+) ActivitiesOption {
+	return func(a *Activities) {
+		a.compiledStore = st
+		a.buildCompiledPolicyV1 = builder
+		a.compiledModelResolverV1 = modelResolver
 	}
 }
 
@@ -247,8 +338,9 @@ func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, f
 
 // EvolveIn 是 EvolveProfile Activity 的入参。
 type EvolveIn struct {
-	UserID  int64  `json:"user_id"`
-	TraceID string `json:"trace_id"`
+	UserID  int64               `json:"user_id"`
+	TraceID string              `json:"trace_id"`
+	Run     *CompiledRunInputV1 `json:"run,omitempty"`
 }
 
 // DedupIn 是 Dedup Activity 的入参。
@@ -256,6 +348,7 @@ type DedupIn struct {
 	UserID  int64               `json:"user_id"`
 	TraceID string              `json:"trace_id"`
 	Items   []types.ContentItem `json:"items"`
+	Run     *CompiledRunInputV1 `json:"run,omitempty"`
 }
 
 // ScoreIn 是 Score Activity 的入参。
@@ -264,6 +357,7 @@ type ScoreIn struct {
 	TraceID    string              `json:"trace_id"`
 	Items      []types.ContentItem `json:"items"`
 	ScheduleID string              `json:"schedule_id,omitempty"`
+	Run        *CompiledRunInputV1 `json:"run,omitempty"`
 }
 
 // SelectIn 是 Select Activity 的入参。
@@ -275,7 +369,8 @@ type SelectIn struct {
 	// ScheduleID 触发本次推送的任务 id（空=即时/老任务触发）：Select 据此查任务的
 	// 门槛档位（schedules.push_strictness）；空或未设置一律走 types.DefaultStrictness
 	// 全局兜底——0-20"不该推"档在任何路径都不推（2026-07-19 五张 0 分卡的修复）。
-	ScheduleID string `json:"schedule_id,omitempty"`
+	ScheduleID string              `json:"schedule_id,omitempty"`
+	Run        *CompiledRunInputV1 `json:"run,omitempty"`
 }
 
 // Select 的返回**保持** []types.ScoredItem 不升级成结构体，是重放兼容性逼出来的
@@ -287,10 +382,11 @@ type SelectIn struct {
 
 // CardGenIn 是 CardGen Activity 的入参。
 type CardGenIn struct {
-	UserID     int64              `json:"user_id"`
-	TraceID    string             `json:"trace_id"`
-	Items      []types.ScoredItem `json:"items"`
-	ScheduleID string             `json:"schedule_id,omitempty"`
+	UserID     int64               `json:"user_id"`
+	TraceID    string              `json:"trace_id"`
+	Items      []types.ScoredItem  `json:"items"`
+	ScheduleID string              `json:"schedule_id,omitempty"`
+	Run        *CompiledRunInputV1 `json:"run,omitempty"`
 }
 
 // PushIn 是 Push Activity 的入参。
@@ -301,7 +397,8 @@ type PushIn struct {
 	Cards      []GeneratedCard `json:"cards"`
 	// TaskTitle 任务名（调度的 nl_description），聚合卡 header 用。
 	// 空串合法（存量调度/即时推送无任务名），构卡落兜底标题。
-	TaskTitle string `json:"task_title,omitempty"`
+	TaskTitle string              `json:"task_title,omitempty"`
+	Run       *CompiledRunInputV1 `json:"run,omitempty"`
 }
 
 // RecordEmptyIn 是 RecordEmptyBatch Activity 的入参（009 / 契约 §16「空批次缺口」）。
@@ -313,6 +410,7 @@ type RecordEmptyIn struct {
 	Gate types.BatchExitGate `json:"gate"`
 	// Counts 截至退出时刻的漏斗快照；未跑到的阶段字段为 nil（见 types.PipelineCounts）。
 	Counts types.PipelineCounts `json:"counts"`
+	Run    *CompiledRunInputV1  `json:"run,omitempty"`
 }
 
 // ============================================================
@@ -356,8 +454,66 @@ func (a *Activities) refuseIfTenantGone(ctx context.Context, userID int64, stage
 // 可先不传 evolver 灰度上线，pipeline 行为与 M4 完全一致。错误原样上抛交给
 // RetryPolicy；重试耗尽后由 workflow 侧吞掉——演化失败永不阻断推送（红线）。
 func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error {
+	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	if err != nil {
+		return retryableOrNot(err)
+	}
 	if a.evolver == nil {
+		if compiled {
+			return nonRetryable(types.NewAppError(types.CodeInternal,
+				"compiled profile evolver is not configured", nil))
+		}
 		return nil
+	}
+	if compiled {
+		modelClient, err := a.resolveCompiledModelPolicyV1(snapshot.Policy.ModelPolicy)
+		if err != nil {
+			return retryableOrNot(err)
+		}
+		consumer, ok := a.evolver.(compiledProfileEvolverV1)
+		if !ok {
+			return nonRetryable(types.NewAppError(types.CodeInternal,
+				"compiled profile evolver v1 is unsupported", nil))
+		}
+		policy, err := evolverpkg.PrepareCompiledPolicyV1(
+			snapshot.Policy.PromptPolicy, snapshot.Policy.ModelPolicy,
+			snapshot.Policy.QuotaPolicy, modelClient)
+		if err != nil {
+			return nonRetryable(types.NewAppError(types.CodeValidation,
+				"compiled profile policy is invalid", err))
+		}
+		if err := a.authorizeCompiledEffectV1(ctx, in.UserID, in.Run); err != nil {
+			return retryableOrNot(err)
+		}
+		return retryableOrNot(consumer.EvolveWithPolicyV1(
+			ctx, snapshot.Definition.TenantID, in.UserID, in.TraceID, policy,
+			func(effectCtx context.Context, amount float64) error {
+				return a.consumeCompiledLLMQuotaV1(
+					effectCtx, in.UserID, in.Run, snapshot.Policy.QuotaPolicy, amount)
+			},
+			evolverpkg.CompiledProfileWritesV1{
+				Evolve: func(effectCtx context.Context, summary string, tags []string,
+					newCursor int64, expectedAt time.Time, expectedCursor int64) error {
+					expected, err := activityRunIdentityV1(effectCtx, in.UserID, in.Run)
+					if err != nil {
+						return err
+					}
+					return a.compiledStore.EvolveProfileForTaskRunV1(
+						effectCtx, expected, in.Run.Snapshot, summary, tags,
+						newCursor, expectedAt, expectedCursor)
+				},
+				AdvanceCursor: func(effectCtx context.Context, newCursor int64,
+					expectedAt time.Time, expectedCursor int64) error {
+					expected, err := activityRunIdentityV1(effectCtx, in.UserID, in.Run)
+					if err != nil {
+						return err
+					}
+					return a.compiledStore.AdvanceProfileCursorForTaskRunV1(
+						effectCtx, expected, in.Run.Snapshot, newCursor,
+						expectedAt, expectedCursor)
+				},
+			},
+		))
 	}
 	if a.refuseIfTenantGone(ctx, in.UserID, "evolve_profile") {
 		return nil // 正常终态，不报错——报错会触发重试，而重试同样会被拒。
@@ -390,6 +546,251 @@ func (a *Activities) AuthorizeRun(ctx context.Context, p PushParams) (bool, erro
 	}
 }
 
+// PrepareRun is C1b's only run-start snapshot producer. Temporal identity is
+// taken from ActivityInfo, while tenant/user/task are copied from the trusted
+// Schedule Action. An exact committed ref is recovered before rebuilding any
+// current policy, so response-lost retries remain first-writer-wins across task
+// deletion or deployment changes.
+func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunResult, error) {
+	_, compiledFetcherConfigured := a.fetcher.(compiledFetcherV1)
+	if a.compiledStore == nil || a.buildCompiledPolicyV1 == nil || a.compiledModelResolverV1 == nil ||
+		!compiledFetcherConfigured ||
+		p.Snapshot != nil || p.RunKind != PushRunKindScheduled ||
+		p.ExecutionMode != types.ExecutionModeCompiled ||
+		p.RuntimeVersion != CompiledRuntimeSnapshotV1 ||
+		p.TenantID <= 0 || p.UserID <= 0 || strings.TrimSpace(p.ScheduleID) == "" ||
+		!activity.IsActivity(ctx) {
+		return PrepareRunResult{}, nonRetryable(types.NewAppError(types.CodeValidation,
+			"compiled scheduled run input is invalid", nil))
+	}
+	info := activity.GetInfo(ctx)
+	expected := types.RunIdentity{
+		TemporalWorkflowID: info.WorkflowExecution.ID,
+		TemporalRunID:      info.WorkflowExecution.RunID,
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           p.TenantID,
+		UserID:             p.UserID,
+		TaskID:             p.ScheduleID,
+	}
+	if err := expected.Validate(); err != nil {
+		return PrepareRunResult{}, nonRetryable(err)
+	}
+
+	ref, found, err := a.compiledStore.LoadCompiledRunSnapshotRefV1(ctx, expected)
+	if err != nil {
+		return PrepareRunResult{}, retryableOrNot(err)
+	}
+	if !found {
+		policy, buildErr := a.buildCompiledPolicyV1(
+			ctx, p.TenantID, a.taskInstructionEnabled(p.ScheduleID))
+		if buildErr != nil {
+			var appErr *types.AppError
+			if errors.As(buildErr, &appErr) {
+				return PrepareRunResult{}, retryableOrNot(buildErr)
+			}
+			return PrepareRunResult{}, nonRetryable(types.NewAppError(types.CodeInternal,
+				"compiled runtime policy is invalid", buildErr))
+		}
+		if _, err := a.resolveCompiledModelPolicyV1(policy.ModelPolicy); err != nil {
+			return PrepareRunResult{}, nonRetryable(err)
+		}
+		ref, err = a.compiledStore.CreateOrGetCompiledRunSnapshotV1(ctx, expected, policy)
+		if err != nil {
+			// A task may be paused/deleted after Temporal has started the run but
+			// before its first immutable snapshot is committed. That is a normal
+			// authorization denial, not a broken workflow: expose neither the
+			// candidate policy nor a reusable reference and do not retry it.
+			if errors.Is(err, types.ErrNotFound) {
+				return PrepareRunResult{}, nil
+			}
+			return PrepareRunResult{}, retryableOrNot(err)
+		}
+	}
+	snapshot, err := a.compiledStore.LoadCompiledTaskRunSnapshotV1(ctx, expected, ref)
+	if err != nil {
+		return PrepareRunResult{}, retryableOrNot(err)
+	}
+	if err := a.validateCompiledSnapshotRoutesV1(snapshot); err != nil {
+		return PrepareRunResult{}, nonRetryable(err)
+	}
+	authorized, err := a.compiledStore.AuthorizeTaskRunSideEffect(ctx, expected, ref)
+	if err != nil {
+		return PrepareRunResult{}, retryableOrNot(err)
+	}
+	if !authorized {
+		return PrepareRunResult{}, nil
+	}
+	result := PrepareRunResult{Authorized: true, Snapshot: ref}
+	if err := result.ValidateFor(expected); err != nil {
+		return PrepareRunResult{}, nonRetryable(err)
+	}
+	return result, nil
+}
+
+func (a *Activities) taskInstructionEnabled(scheduleID string) bool {
+	if !a.playbookPromptsEnabled || scheduleID == "" {
+		return false
+	}
+	canaryID := a.playbookPromptCanaryScheduleID
+	return canaryID == "" || canaryID == scheduleID
+}
+
+func activityRunIdentityV1(ctx context.Context, userID int64, run *CompiledRunInputV1) (types.RunIdentity, error) {
+	if run == nil || run.TenantID <= 0 || userID <= 0 ||
+		strings.TrimSpace(run.TaskID) == "" || !activity.IsActivity(ctx) {
+		return types.RunIdentity{}, types.NewAppError(types.CodeValidation,
+			"compiled activity run input is invalid", nil)
+	}
+	info := activity.GetInfo(ctx)
+	expected := types.RunIdentity{
+		TemporalWorkflowID: info.WorkflowExecution.ID,
+		TemporalRunID:      info.WorkflowExecution.RunID,
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           run.TenantID,
+		UserID:             userID,
+		TaskID:             run.TaskID,
+	}
+	if err := expected.Validate(); err != nil {
+		return types.RunIdentity{}, err
+	}
+	return expected, nil
+}
+
+func (a *Activities) loadCompiledRunV1(
+	ctx context.Context,
+	userID int64,
+	run *CompiledRunInputV1,
+) (runcontext.CompiledSnapshotV1, bool, error) {
+	if run == nil {
+		return runcontext.CompiledSnapshotV1{}, false, nil
+	}
+	if a.compiledStore == nil {
+		return runcontext.CompiledSnapshotV1{}, true,
+			types.NewAppError(types.CodeInternal, "compiled runtime store is not configured", nil)
+	}
+	expected, err := activityRunIdentityV1(ctx, userID, run)
+	if err != nil {
+		return runcontext.CompiledSnapshotV1{}, true, err
+	}
+	snapshot, err := a.compiledStore.LoadCompiledTaskRunSnapshotV1(ctx, expected, run.Snapshot)
+	if err != nil {
+		return runcontext.CompiledSnapshotV1{}, true, err
+	}
+	return snapshot, true, nil
+}
+
+func (a *Activities) resolveCompiledModelPolicyV1(
+	policy runtimepolicy.ModelPolicyV1,
+) (*llm.Client, error) {
+	if a.compiledModelResolverV1 == nil {
+		return nil, types.NewAppError(types.CodeInternal,
+			"compiled model resolver v1 is not configured", nil)
+	}
+	client, err := a.compiledModelResolverV1.ResolveRuntimeModelPolicyV1(policy)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeValidation,
+			"compiled model route is unavailable", err)
+	}
+	return client, nil
+}
+
+func (a *Activities) validateCompiledSnapshotRoutesV1(snapshot runcontext.CompiledSnapshotV1) error {
+	if snapshot.Mode != types.ExecutionModeCompiled {
+		return types.NewAppError(types.CodeValidation,
+			"compiled run snapshot has an invalid execution mode", nil)
+	}
+	frozenFetcher, ok := a.fetcher.(compiledFetcherV1)
+	if !ok {
+		return types.NewAppError(types.CodeInternal,
+			"compiled fetch route resolver is not configured", nil)
+	}
+	for _, source := range snapshot.Definition.Sources {
+		capability, ok := compiledCapabilityV1(
+			snapshot.Policy.CapabilityCatalog, source.Platform, source.Capability)
+		if !ok {
+			return types.NewAppError(types.CodeValidation,
+				"compiled source capability is not allowed", nil)
+		}
+		if err := frozenFetcher.ValidateRuntimeFetchRouteV1(capability, types.Source{
+			Platform: source.Platform, Capability: source.Capability,
+		}); err != nil {
+			return types.NewAppError(types.CodeValidation,
+				"compiled source route is unavailable", err)
+		}
+	}
+	if _, err := a.resolveCompiledModelPolicyV1(snapshot.Policy.ModelPolicy); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *Activities) consumeCompiledLLMQuotaV1(
+	ctx context.Context,
+	userID int64,
+	run *CompiledRunInputV1,
+	policy runtimepolicy.QuotaPolicyV1,
+	amount float64,
+) error {
+	if run == nil || a.compiledStore == nil {
+		return types.NewAppError(types.CodeInternal,
+			"compiled runtime store is not configured", nil)
+	}
+	rule, ok := policy.Bucket("llm_tokens")
+	if !ok {
+		return types.NewAppError(types.CodeValidation,
+			"compiled llm quota policy is missing", nil)
+	}
+	expected, err := activityRunIdentityV1(ctx, userID, run)
+	if err != nil {
+		return err
+	}
+	return a.compiledStore.AuthorizeAndConsumeTaskRunLLMQuotaV1(
+		ctx, expected, run.Snapshot, rule, amount)
+}
+
+func compiledCapabilityV1(
+	catalog runtimepolicy.CapabilityCatalogV1,
+	platform types.Platform,
+	capability types.Capability,
+) (runtimepolicy.CapabilityV1, bool) {
+	for _, allowed := range catalog.Allowed {
+		if allowed.Platform == string(platform) && allowed.Capability == string(capability) {
+			return allowed, true
+		}
+	}
+	return runtimepolicy.CapabilityV1{}, false
+}
+
+// authorizeCompiledEffectV1 is called immediately before a compiled Activity
+// starts a paid/external/write effect. Unlike the legacy D9 side gate it is
+// fail-closed on database errors and binds the ref to the current Activity
+// attempt's WorkflowID/RunID every time.
+func (a *Activities) authorizeCompiledEffectV1(
+	ctx context.Context,
+	userID int64,
+	run *CompiledRunInputV1,
+) error {
+	if run == nil {
+		return nil
+	}
+	if a.compiledStore == nil {
+		return types.NewAppError(types.CodeInternal, "compiled runtime store is not configured", nil)
+	}
+	expected, err := activityRunIdentityV1(ctx, userID, run)
+	if err != nil {
+		return err
+	}
+	authorized, err := a.compiledStore.AuthorizeTaskRunSideEffect(ctx, expected, run.Snapshot)
+	if err != nil {
+		return err
+	}
+	if !authorized {
+		return types.NewAppError(types.CodeNotFound,
+			"compiled task run is no longer authorized", nil)
+	}
+	return nil
+}
+
 // Fetch 现查用户的 active 订阅源，逐源抓取入库并推进各源抓取状态，最后返回
 // 该用户"未投递候选"（带条数上限）。TraceID 由 workflow 生成后经后续 Activity
 // 入参下传，Fetch 本身无 LLM 调用故不需要。
@@ -401,10 +802,41 @@ func (a *Activities) AuthorizeRun(ctx context.Context, p PushParams) (bool, erro
 //   - #7 抓取状态死代码：每源抓取后调 markFetchResult 真正推进 fail_count / 时间戳。
 //   - #6 成本护栏：返回时用 maxScoreCandidates 截断候选，避免积压内容一次性打爆 LLM。
 func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentItem, error) {
+	var compiledInput *CompiledRunInputV1
+	if p.Snapshot != nil {
+		compiledInput = &CompiledRunInputV1{
+			TenantID: p.TenantID,
+			TaskID:   p.ScheduleID,
+			Snapshot: *p.Snapshot,
+		}
+	}
+	snapshot, compiled, err := a.loadCompiledRunV1(ctx, p.UserID, compiledInput)
+	if err != nil {
+		return nil, retryableOrNot(err)
+	}
+	var compiledIdentity types.RunIdentity
+	if compiled {
+		compiledIdentity, err = activityRunIdentityV1(ctx, p.UserID, compiledInput)
+		if err != nil {
+			return nil, nonRetryable(err)
+		}
+		if err := a.validateCompiledSnapshotRoutesV1(snapshot); err != nil {
+			return nil, nonRetryable(err)
+		}
+	}
+	var frozenFetcher compiledFetcherV1
+	if compiled {
+		var ok bool
+		frozenFetcher, ok = a.fetcher.(compiledFetcherV1)
+		if !ok {
+			return nil, nonRetryable(types.NewAppError(types.CodeInternal,
+				"compiled fetcher v1 is unsupported", nil))
+		}
+	}
 	// D9：已注销租户不抓取——Exa/TikHub 按次计费，这里是花钱的起点。
 	// 返回空候选而非报错：空候选走 workflow 既有的空批次早退路径（正常终态、不推送），
 	// 报错则会重试三次、每次都被同样拒绝，白白制造噪音。
-	if a.refuseIfTenantGone(ctx, p.UserID, "fetch") {
+	if !compiled && a.refuseIfTenantGone(ctx, p.UserID, "fetch") {
 		return nil, nil
 	}
 	// 任务手册 P1b b3 的分流开关：本次触发绑定的定时任务若已编译出源（schedule_sources 非空），
@@ -422,7 +854,7 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	// 刻意留的 scope 边界（完整"自包含"需按 schedule 隔离 simhash 历史，留后续）；打分/出卡的
 	// 按任务注入是 P1c。
 	planScoped := false
-	if p.ScheduleID != "" {
+	if !compiled && p.ScheduleID != "" {
 		has, herr := a.store.ScheduleHasSources(ctx, p.ScheduleID)
 		if herr != nil {
 			return nil, herr
@@ -433,8 +865,37 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	// 只抓到期源（next_fetch_at <= now()）：重试不重复计费，详见接口注释。
 	// 未到期源被跳过不影响推送——其已入库内容仍由下方候选查询捞出。
 	var sources []types.Source
-	var err error
-	if planScoped {
+	var frozenSourceIDs []int64
+	var frozenSources map[int64]runcontext.SourceV1
+	if compiled {
+		frozenSourceIDs = make([]int64, len(snapshot.Definition.Sources))
+		frozenSources = make(map[int64]runcontext.SourceV1, len(snapshot.Definition.Sources))
+		for i, source := range snapshot.Definition.Sources {
+			frozenSourceIDs[i] = source.SourceID
+			frozenSources[source.SourceID] = source
+		}
+		if len(frozenSourceIDs) == 0 {
+			return nil, nil
+		}
+		liveSources, loadErr := a.compiledStore.ListDueSourcesByIDs(ctx, frozenSourceIDs)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		sources = make([]types.Source, 0, len(liveSources))
+		for _, live := range liveSources {
+			frozen, ok := frozenSources[live.ID]
+			if !ok {
+				return nil, nonRetryable(types.NewAppError(types.CodeValidation,
+					"compiled source health escaped frozen scope", nil))
+			}
+			live.Platform = frozen.Platform
+			live.Capability = frozen.Capability
+			live.Title = frozen.Title
+			live.URL = frozen.URL
+			live.Config = append(json.RawMessage(nil), frozen.Config...)
+			sources = append(sources, live)
+		}
+	} else if planScoped {
 		sources, err = a.store.ListDueSourcesBySchedule(ctx, p.ScheduleID) // 只抓本任务的源
 	} else {
 		sources, err = a.store.ListDueSourcesByUser(ctx, p.UserID)
@@ -442,7 +903,16 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	if err != nil {
 		return nil, err
 	}
-	if len(p.Scope.SourceIDs) > 0 {
+	if compiled {
+		var frozenScope PushScope
+		if err := json.Unmarshal(snapshot.Definition.ScopeJSON, &frozenScope); err != nil {
+			return nil, nonRetryable(types.NewAppError(types.CodeValidation,
+				"compiled task scope is invalid", err))
+		}
+		if len(frozenScope.SourceIDs) > 0 {
+			sources = filterSources(sources, frozenScope.SourceIDs)
+		}
+	} else if len(p.Scope.SourceIDs) > 0 {
 		sources = filterSources(sources, p.Scope.SourceIDs)
 	}
 
@@ -451,7 +921,13 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	// 会碰在途 run 的确定性；执行 ID 同样稳定可查（wf-push-… 关联到调度与批次）。
 	// 在真实 activity 外（单测直调）GetInfo 会 panic，故判一下。
 	if activity.IsActivity(ctx) {
-		ctx = fetcher.WithBindingTrace(ctx, activity.GetInfo(ctx).WorkflowExecution.ID)
+		workflowID := activity.GetInfo(ctx).WorkflowExecution.ID
+		if compiled {
+			ctx = fetcher.WithBindingRunAttribution(
+				ctx, workflowID, snapshot.Definition.TenantID, snapshot.Definition.UserID)
+		} else {
+			ctx = fetcher.WithBindingTrace(ctx, workflowID)
+		}
 	}
 
 	// 逐源"抓取→立刻入库"的顺序是**有成本含义**的，别改成"先抓完所有源再统一入库"：
@@ -466,11 +942,52 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		items, ferr := a.fetcher.Fetch(ctx, src)
+		if compiled {
+			if err := a.authorizeCompiledEffectV1(ctx, p.UserID, compiledInput); err != nil {
+				return nil, retryableOrNot(err)
+			}
+		}
+		var items []types.ContentItem
+		var ferr error
+		if compiled {
+			capability, ok := compiledCapabilityV1(
+				snapshot.Policy.CapabilityCatalog, src.Platform, src.Capability)
+			if !ok {
+				return nil, nonRetryable(types.NewAppError(types.CodeValidation,
+					"compiled source capability is not allowed", nil))
+			}
+			var effectAuthorizationErr error
+			var effectAuthorizationOnce sync.Once
+			items, ferr = frozenFetcher.FetchWithPolicyV1(
+				ctx, src, capability, func(effectCtx context.Context) error {
+					authErr := a.authorizeCompiledEffectV1(
+						effectCtx, p.UserID, compiledInput)
+					if authErr != nil {
+						effectAuthorizationOnce.Do(func() {
+							effectAuthorizationErr = authErr
+						})
+					}
+					return authErr
+				})
+			if effectAuthorizationErr != nil {
+				return nil, retryableOrNot(effectAuthorizationErr)
+			}
+		} else {
+			items, ferr = a.fetcher.Fetch(ctx, src)
+		}
 		if ferr != nil {
 			// 单源失败不拖垮整批：某个源挂了不该让当次推送整体失败；
 			// 同时自增 fail_count 并推进 next_fetch_at，避免调度紧循环重试。
-			crossed, justDisabled := a.markFetchResult(ctx, src, false)
+			var crossed, justDisabled bool
+			if compiled {
+				crossed, justDisabled, err = a.markCompiledFetchResultV1(
+					ctx, compiledIdentity, compiledInput.Snapshot, src, false)
+				if err != nil {
+					return nil, retryableOrNot(err)
+				}
+			} else {
+				crossed, justDisabled = a.markFetchResult(ctx, src, false)
+			}
 			slog.Warn("fetch: 单源抓取失败，跳过", "source_id", src.ID, "platform", src.Platform, "capability", src.Capability, "url", src.URL, "err", ferr)
 			// src.FailCount 此刻仍是旧值，新计数=src.FailCount+1。
 			f := fetchFailure{src: src, failCount: src.FailCount + 1, reason: fetchFailureReason(ferr)}
@@ -489,25 +1006,66 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 			// （修 #3 时就已改成这样），所以语义变化对这里无影响：跨源重复的
 			// 第二份不新建内容行，但 UpsertContentItem 会登记 content_sources，
 			// 用户仍能经自己订阅的源关联到那唯一一份。
+			if compiled {
+				if _, _, ierr := a.compiledStore.UpsertContentItemForTaskRunV1(
+					ctx, compiledIdentity, compiledInput.Snapshot, src.ID, &items[i],
+				); ierr != nil {
+					return nil, retryableOrNot(ierr)
+				}
+				continue
+			}
 			if _, _, ierr := a.store.UpsertContentItem(ctx, &items[i]); ierr != nil {
 				// 单条入库失败只 warn：已入库的其它条目仍会被后面的 ListUnpushedByUser 捞出。
 				slog.Warn("fetch: 内容入库失败，跳过", "source_id", src.ID, "err", ierr)
 			}
 		}
-		a.markFetchResult(ctx, src, true) // 成功：清零 fail_count、推进 last/next_fetch_at。
+		if compiled {
+			if _, _, err := a.markCompiledFetchResultV1(
+				ctx, compiledIdentity, compiledInput.Snapshot, src, true,
+			); err != nil {
+				return nil, retryableOrNot(err)
+			}
+		} else {
+			a.markFetchResult(ctx, src, true) // 成功：清零 fail_count、推进 last/next_fetch_at。
+		}
 	}
 
 	// 本轮有源恰好连续失败达阈值 → 给 owner 发一张汇总告警卡（功能 5.2）。
 	// 放在返回候选之前、与推送早退无关：即便本轮全源挂掉（下方候选为空、workflow
 	// 走空批次早退），告警也已在此发出。best-effort，失败只 warn 不拖垮推送。
-	a.alertFetchFailures(ctx, alertable)
+	if len(alertable) > 0 {
+		var beforeSend func(context.Context) error
+		if compiled {
+			beforeSend = func(effectCtx context.Context) error {
+				return a.authorizeCompiledEffectV1(effectCtx, p.UserID, compiledInput)
+			}
+		}
+		if err := a.alertFetchFailures(ctx, alertable, beforeSend); err != nil {
+			return nil, retryableOrNot(err)
+		}
+	}
 	// 本轮有源达停用阈值被自动停用 → 单发一张"已暂停 + 如何重新启用"卡（功能 5.2）。
-	a.alertSourcesDisabled(ctx, disabled)
+	if len(disabled) > 0 {
+		var beforeSend func(context.Context) error
+		if compiled {
+			beforeSend = func(effectCtx context.Context) error {
+				return a.authorizeCompiledEffectV1(effectCtx, p.UserID, compiledInput)
+			}
+		}
+		if err := a.alertSourcesDisabled(ctx, disabled, beforeSend); err != nil {
+			return nil, retryableOrNot(err)
+		}
+	}
 
 	// 返回"未投递候选"而非"本次新入库"，让 Fetch 重试幂等可续（修 #3）；
 	// 全局上限 + 每源配额双重截断，控制单批打分规模且防高产源饿死低产源（修 #6）。
 	// planScoped：只在本任务的源见过、且用户未读过的内容里挑——取材按任务隔离（决策 #3，
 	// P1b b3），去重按用户级（决策 A：用户已读的内容任何路径都不再重推）。
+	if compiled {
+		return a.compiledStore.ListUnpushedForTaskRunV1(
+			ctx, compiledIdentity, compiledInput.Snapshot, frozenSourceIDs,
+			maxScoreCandidates, maxPerSourceCandidates)
+	}
 	if planScoped {
 		return a.store.ListUnpushedBySchedule(ctx, p.ScheduleID, maxScoreCandidates, maxPerSourceCandidates)
 	}
@@ -531,20 +1089,7 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 // 两个返回值互斥地驱动两种告警卡（3 与 10 不重叠）。停用经 DisableSourceIfActive 幂等完成，
 // justDisabled 仅在"这一刻从 active 翻成 disabled"时为 true，据此只发一次停用告警。
 func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok bool) (crossedAlertThreshold, justDisabled bool) {
-	now := time.Now()
-	nextFetch := now.Add(time.Duration(src.FetchIntervalSeconds) * time.Second)
-
-	var lastFetched time.Time
-	failCount := 0
-	if ok {
-		lastFetched = now
-	} else {
-		failCount = src.FailCount + 1
-		if src.LastFetchedAt != nil {
-			lastFetched = *src.LastFetchedAt // 保留上次成功抓取时间（从未抓过则为零值）。
-		}
-		crossedAlertThreshold = failCount == alertFetchFailThreshold
-	}
+	lastFetched, nextFetch, failCount, crossedAlertThreshold := fetchResultState(src, ok)
 	if err := a.store.UpdateSourceFetchState(ctx, src.ID, lastFetched, nextFetch, failCount); err != nil {
 		slog.Warn("fetch: 更新抓取状态失败", "source_id", src.ID, "err", err)
 		return false, false // 状态未落库：不告警、不停用，避免下轮重复算到阈值再报。
@@ -559,6 +1104,53 @@ func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok b
 		}
 	}
 	return crossedAlertThreshold, justDisabled
+}
+
+// markCompiledFetchResultV1 keeps the legacy alert/disable thresholds while
+// routing every global source-health mutation through the exact task-run
+// transaction. A changed source identity/config is a safe no-op: the old run
+// may finish with its frozen execution plan, but must not advance or disable
+// the newly configured shared source.
+func (a *Activities) markCompiledFetchResultV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	src types.Source,
+	ok bool,
+) (crossedAlertThreshold, justDisabled bool, err error) {
+	lastFetched, nextFetch, failCount, crossed := fetchResultState(src, ok)
+	updated, err := a.compiledStore.UpdateSourceFetchStateForTaskRunV1(
+		ctx, expected, ref, src.ID, lastFetched, nextFetch, failCount,
+	)
+	if err != nil || !updated {
+		return false, false, err
+	}
+	if !ok && failCount >= disableFetchFailThreshold {
+		disabled, err := a.compiledStore.DisableSourceIfActiveForTaskRunV1(
+			ctx, expected, ref, src.ID,
+		)
+		if err != nil {
+			return false, false, err
+		}
+		justDisabled = disabled
+	}
+	return crossed, justDisabled, nil
+}
+
+func fetchResultState(
+	src types.Source,
+	ok bool,
+) (lastFetched, nextFetch time.Time, failCount int, crossedAlertThreshold bool) {
+	now := time.Now()
+	nextFetch = now.Add(time.Duration(src.FetchIntervalSeconds) * time.Second)
+	if ok {
+		return now, nextFetch, 0, false
+	}
+	failCount = src.FailCount + 1
+	if src.LastFetchedAt != nil {
+		lastFetched = *src.LastFetchedAt
+	}
+	return lastFetched, nextFetch, failCount, failCount == alertFetchFailThreshold
 }
 
 // fetchFailure 承载一个"连续失败恰好达告警阈值"的信源及其对 owner 可见的失败原因（功能 5.2）。
@@ -583,21 +1175,35 @@ func fetchFailureReason(err error) string {
 // 绝不让告警把抓取或推送管道拖挂（与 EvolveProfile warn-only、"不制造假失败告警"同一红线）。
 // 走 pusher.Push（= feishu SendCard 主动新消息）+ 注入的 buildNotice（= BuildReplyCard，
 // 无按钮卡），与 M5 卡片反馈路径完全隔离。
-func (a *Activities) alertFetchFailures(ctx context.Context, failures []fetchFailure) {
+func (a *Activities) alertFetchFailures(
+	ctx context.Context,
+	failures []fetchFailure,
+	beforeSend func(context.Context) error,
+) error {
 	if len(failures) == 0 {
-		return
+		return nil
 	}
 	if a.buildNotice == nil {
-		return // 未注入告警卡构造器（灰度/测试）：静默 no-op。
+		return nil // 未注入告警卡构造器（灰度/测试）：静默 no-op。
 	}
 	owner := a.feishu.OwnerOpenID()
 	if owner == "" {
-		return // 尚未捕获 owner：无收件人，静默跳过（同 Push 对无 owner 的处理）。
+		return nil // 尚未捕获 owner：无收件人，静默跳过（同 Push 对无 owner 的处理）。
 	}
 	card := a.buildNotice(renderFetchFailureAlert(failures))
+	// Compiled runs revalidate after all local card/recipient preparation and
+	// immediately before the external send. Authorization failures are not a
+	// best-effort notification failure: swallowing one would let a revoked task
+	// keep writing to the user's channel.
+	if beforeSend != nil {
+		if err := beforeSend(ctx); err != nil {
+			return err
+		}
+	}
 	if _, err := a.pusher.Push(ctx, owner, card); err != nil {
 		slog.Warn("fetch: 抓取失败告警发送失败（不影响推送）", "count", len(failures), "err", err)
 	}
+	return nil
 }
 
 // renderFetchFailureAlert 把失败源列表渲染成告警卡的 markdown 正文（功能 5.2）。
@@ -622,21 +1228,31 @@ func renderFetchFailureAlert(failures []fetchFailure) string {
 // alertSourcesDisabled 给 owner 发一张"已自动暂停"卡，列出本轮达停用阈值被停用的信源，
 // 并告知如何重新启用（功能 5.2）。与 alertFetchFailures 同为 best-effort：无失败源 /
 // 未注入构卡器 / 未捕获 owner / 发送失败一律静默或只 warn，绝不拖挂抓取或推送管道。
-func (a *Activities) alertSourcesDisabled(ctx context.Context, disabled []fetchFailure) {
+func (a *Activities) alertSourcesDisabled(
+	ctx context.Context,
+	disabled []fetchFailure,
+	beforeSend func(context.Context) error,
+) error {
 	if len(disabled) == 0 {
-		return
+		return nil
 	}
 	if a.buildNotice == nil {
-		return
+		return nil
 	}
 	owner := a.feishu.OwnerOpenID()
 	if owner == "" {
-		return
+		return nil
 	}
 	card := a.buildNotice(renderSourcesDisabledAlert(disabled))
+	if beforeSend != nil {
+		if err := beforeSend(ctx); err != nil {
+			return err
+		}
+	}
 	if _, err := a.pusher.Push(ctx, owner, card); err != nil {
 		slog.Warn("fetch: 信源停用告警发送失败（不影响推送）", "count", len(disabled), "err", err)
 	}
+	return nil
 }
 
 // renderSourcesDisabledAlert 渲染"已暂停"卡正文：与预警卡措辞不同——预警是"建议检查"，
@@ -670,6 +1286,10 @@ func renderSourcesDisabledAlert(disabled []fetchFailure) string {
 // 判近重复，导致整批全删、pipeline "去重后无内容" 早退、永远推不出卡片。故先收集本批
 // 全部 ID，传给 ListRecentSimhashesByUser 排除——"历史"只含本批之外的内容。
 func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem, error) {
+	_, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	if err != nil {
+		return nil, retryableOrNot(err)
+	}
 	since := time.Now().Add(-simhashWindow)
 
 	// 本批内容自身的 ID 集合，查历史时排除（避免每条与自己刚入库的 simhash 相撞）。
@@ -682,9 +1302,20 @@ func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem
 
 	// 用户级历史一次取齐（跨该用户全部订阅源的 72h simhash），替代原 per-source
 	// 逐源查询——既堵住跨源跨批重复推送，也把 N 源 N 次查询合并为 1 次。
-	hist, err := a.store.ListRecentSimhashesByUser(ctx, in.UserID, since, batchIDs)
+	var hist []int64
+	if compiled {
+		expected, identityErr := activityRunIdentityV1(ctx, in.UserID, in.Run)
+		if identityErr != nil {
+			return nil, nonRetryable(identityErr)
+		}
+		hist, err = a.compiledStore.ListRecentSimhashesForTaskRunV1(
+			ctx, expected, in.Run.Snapshot, since, batchIDs,
+		)
+	} else {
+		hist, err = a.store.ListRecentSimhashesByUser(ctx, in.UserID, since, batchIDs)
+	}
 	if err != nil {
-		return nil, err
+		return nil, retryableOrNot(err)
 	}
 
 	// 批内已保留项的 simhash 用单一全局切片（跨源合并比对）：多源转载同一篇稿时，
@@ -941,19 +1572,79 @@ func (a *Activities) loadTaskInstruction(
 // 而 llm.Client 早已配好 5 路并发闸门却只被喂进 1 个。顺带也把 activity 的
 // StartToCloseTimeout=120s 从"正在变薄的余量"拉回安全区（45 条 × 最坏 1372ms 已达 62 秒）。
 func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem, error) {
+	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	if err != nil {
+		return nil, retryableOrNot(err)
+	}
 	// D9 闸门（bug 狩猎 2026-07-19 HIGH：此前只有 EvolveProfile/Fetch 有闸，
 	// Fetch 之后软删的租户仍会在这里烧一整批 LLM 打分钱）。返回空切片走
 	// score 闸门的空批正常终态，与 EvolveProfile 的处理同一条理由：报错会重试，
 	// 而重试同样会被拒。
-	if a.refuseIfTenantGone(ctx, in.UserID, "score") {
+	if !compiled && a.refuseIfTenantGone(ctx, in.UserID, "score") {
 		return nil, nil
 	}
-	taskInstruction := a.loadTaskInstruction(ctx, in.UserID, in.ScheduleID, in.TraceID, "score")
+	taskInstruction := ""
+	var compiledConsumer compiledScorerV1
+	var compiledPolicy scorerpkg.PolicyV1
+	if compiled {
+		modelClient, err := a.resolveCompiledModelPolicyV1(snapshot.Policy.ModelPolicy)
+		if err != nil {
+			return nil, retryableOrNot(err)
+		}
+		var ok bool
+		compiledConsumer, ok = a.scorer.(compiledScorerV1)
+		if !ok {
+			return nil, nonRetryable(types.NewAppError(types.CodeInternal,
+				"compiled scorer v1 is unsupported", nil))
+		}
+		compiledPolicy, err = scorerpkg.PrepareCompiledPolicyV1(
+			snapshot.Policy.PromptPolicy, snapshot.Policy.ModelPolicy,
+			snapshot.Policy.QuotaPolicy, modelClient)
+		if err != nil {
+			return nil, nonRetryable(types.NewAppError(types.CodeValidation,
+				"compiled score policy is invalid", err))
+		}
+		if snapshot.Policy.PromptPolicy.TaskInstructionEnabled {
+			taskInstruction = snapshot.Definition.PlaybookContent
+		}
+	} else {
+		taskInstruction = a.loadTaskInstruction(ctx, in.UserID, in.ScheduleID, in.TraceID, "score")
+	}
 	// 并发扇出里各 goroutine 都可能撞到配额，用原子标记而非普通 bool。
 	var quotaHit atomic.Bool
+	var authorizationOnce sync.Once
+	var authorizationErr error
 	scored := mapConcurrent(ctx, in.Items, parBatchFanout,
 		func(ctx context.Context, item types.ContentItem) (types.ScoredItem, error) {
-			s, err := a.scorer.Score(ctx, in.UserID, item, in.TraceID, taskInstruction)
+			authorize := func(effectCtx context.Context) error {
+				err := a.authorizeCompiledEffectV1(effectCtx, in.UserID, in.Run)
+				if err != nil {
+					authorizationOnce.Do(func() { authorizationErr = err })
+				}
+				return err
+			}
+			if compiled {
+				if err := authorize(ctx); err != nil {
+					return types.ScoredItem{}, err
+				}
+			}
+			beforeSpend := func(effectCtx context.Context, amount float64) error {
+				err := a.consumeCompiledLLMQuotaV1(
+					effectCtx, in.UserID, in.Run, snapshot.Policy.QuotaPolicy, amount)
+				if err != nil && !errors.Is(err, storepkg.ErrQuotaExceeded) {
+					authorizationOnce.Do(func() { authorizationErr = err })
+				}
+				return err
+			}
+			var s float64
+			var err error
+			if compiled {
+				s, err = compiledConsumer.ScoreWithPolicyV1(
+					ctx, snapshot.Definition.TenantID, in.UserID, item,
+					in.TraceID, taskInstruction, compiledPolicy, beforeSpend)
+			} else {
+				s, err = a.scorer.Score(ctx, in.UserID, item, in.TraceID, taskInstruction)
+			}
 			if err != nil {
 				return types.ScoredItem{}, err
 			}
@@ -966,6 +1657,9 @@ func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem,
 			logPipelineItemFailure(ctx, "score: 单条打分失败，跳过", item.ID, in.TraceID, err)
 		})
 	if len(scored) == 0 && len(in.Items) > 0 {
+		if authorizationErr != nil {
+			return nil, retryableOrNot(authorizationErr)
+		}
 		// 额度用尽与"LLM 挂了"必须分开报。混在一起的代价很具体：走 LLMUnavailable
 		// 会被 Temporal 重试三次（而额度按秒补充，秒级重试必然三次都失败），
 		// 且最终用户收到的是「打分后没有达标的」——那是假话，会让人以为是内容质量
@@ -990,13 +1684,31 @@ func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredIte
 	if n <= 0 {
 		n = defaultTopN
 	}
+	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	if err != nil {
+		return nil, retryableOrNot(err)
+	}
+	if compiled {
+		var frozenScope PushScope
+		if err := json.Unmarshal(snapshot.Definition.ScopeJSON, &frozenScope); err != nil ||
+			frozenScope.TopN < 0 {
+			return nil, nonRetryable(types.NewAppError(types.CodeValidation,
+				"compiled task scope is invalid", err))
+		}
+		n = frozenScope.TopN
+		if n <= 0 {
+			n = defaultTopN
+		}
+	}
 
 	// 任务门槛档位：有 ScheduleID 才查库；查库失败**降级兜底而非中断推送**——
 	// 与画像读取失败降级空画像同一条先例（profilehint）：门槛是过滤器不是闸门，
 	// DB 抖一下就把整批推送打死，比偶尔按兜底档放行几条弱相关内容伤害大得多。
 	// 空串（未设置/行不存在/即时触发无任务）由 MinKeepScore 按 DefaultStrictness 兜底。
 	strictness := types.PushStrictness("")
-	if in.ScheduleID != "" {
+	if compiled {
+		strictness = snapshot.Definition.Strictness
+	} else if in.ScheduleID != "" {
 		v, err := a.store.GetScheduleStrictness(ctx, in.ScheduleID)
 		if err != nil {
 			slog.Warn("select: 查询任务门槛档位失败，按全局兜底档过滤",
@@ -1031,15 +1743,75 @@ func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredIte
 // （Push 按本切片顺序拼卡），而 Score 的产出还要过一遍 RankTopN 重排。
 // 换句话说，这里若按完成先后收集，同一批内容每次推送的卡面顺序都会不一样。
 func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard, error) {
+	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	if err != nil {
+		return nil, retryableOrNot(err)
+	}
 	// D9 闸门（同 Score，bug 狩猎 2026-07-19 HIGH）：不为已注销租户生成解读正文。
-	if a.refuseIfTenantGone(ctx, in.UserID, "cardgen") {
+	if !compiled && a.refuseIfTenantGone(ctx, in.UserID, "cardgen") {
 		return nil, nil
 	}
-	taskInstruction := a.loadTaskInstruction(ctx, in.UserID, in.ScheduleID, in.TraceID, "cardgen")
+	taskInstruction := ""
+	var compiledConsumer compiledCardGeneratorV1
+	var compiledPolicy cardgenpkg.PolicyV1
+	if compiled {
+		modelClient, err := a.resolveCompiledModelPolicyV1(snapshot.Policy.ModelPolicy)
+		if err != nil {
+			return nil, retryableOrNot(err)
+		}
+		var ok bool
+		compiledConsumer, ok = a.cardgen.(compiledCardGeneratorV1)
+		if !ok {
+			return nil, nonRetryable(types.NewAppError(types.CodeInternal,
+				"compiled card generator v1 is unsupported", nil))
+		}
+		compiledPolicy, err = cardgenpkg.PrepareCompiledPolicyV1(
+			snapshot.Policy.PromptPolicy, snapshot.Policy.ModelPolicy,
+			snapshot.Policy.QuotaPolicy, modelClient)
+		if err != nil {
+			return nil, nonRetryable(types.NewAppError(types.CodeValidation,
+				"compiled card policy is invalid", err))
+		}
+		if snapshot.Policy.PromptPolicy.TaskInstructionEnabled {
+			taskInstruction = snapshot.Definition.PlaybookContent
+		}
+	} else {
+		taskInstruction = a.loadTaskInstruction(ctx, in.UserID, in.ScheduleID, in.TraceID, "cardgen")
+	}
 	var quotaHit atomic.Bool
+	var authorizationOnce sync.Once
+	var authorizationErr error
 	cards := mapConcurrent(ctx, in.Items, parBatchFanout,
 		func(ctx context.Context, si types.ScoredItem) (GeneratedCard, error) {
-			body, err := a.cardgen.Generate(ctx, in.UserID, si, in.TraceID, taskInstruction)
+			authorize := func(effectCtx context.Context) error {
+				err := a.authorizeCompiledEffectV1(effectCtx, in.UserID, in.Run)
+				if err != nil {
+					authorizationOnce.Do(func() { authorizationErr = err })
+				}
+				return err
+			}
+			if compiled {
+				if err := authorize(ctx); err != nil {
+					return GeneratedCard{}, err
+				}
+			}
+			beforeSpend := func(effectCtx context.Context, amount float64) error {
+				err := a.consumeCompiledLLMQuotaV1(
+					effectCtx, in.UserID, in.Run, snapshot.Policy.QuotaPolicy, amount)
+				if err != nil && !errors.Is(err, storepkg.ErrQuotaExceeded) {
+					authorizationOnce.Do(func() { authorizationErr = err })
+				}
+				return err
+			}
+			var body string
+			var err error
+			if compiled {
+				body, err = compiledConsumer.GenerateWithPolicyV1(
+					ctx, snapshot.Definition.TenantID, in.UserID, si,
+					in.TraceID, taskInstruction, compiledPolicy, beforeSpend)
+			} else {
+				body, err = a.cardgen.Generate(ctx, in.UserID, si, in.TraceID, taskInstruction)
+			}
 			if err != nil {
 				return GeneratedCard{}, err
 			}
@@ -1052,6 +1824,9 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 			logPipelineItemFailure(ctx, "cardgen: 单条生成失败，跳过", si.Item.ID, in.TraceID, err)
 		})
 	if len(cards) == 0 && len(in.Items) > 0 {
+		if authorizationErr != nil {
+			return nil, retryableOrNot(authorizationErr)
+		}
 		if quotaHit.Load() {
 			return nil, nonRetryable(types.NewAppError(types.CodeQuotaExceeded,
 				"本租户 LLM 额度已用尽，本轮跳过出卡", nil))
@@ -1085,6 +1860,29 @@ func logPipelineItemFailure(ctx context.Context, message string, contentItemID i
 // CodeValidation 不可重试（闸门/幂等键传空是代码 bug，重试只是重复失败，
 // 让它立刻失败并在 Warn 里露出来）。
 func (a *Activities) RecordEmptyBatch(ctx context.Context, in RecordEmptyIn) error {
+	if _, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run); compiled {
+		if err != nil {
+			return retryableOrNot(err)
+		}
+		if in.ScheduleID != in.Run.TaskID {
+			return nonRetryable(types.NewAppError(types.CodeValidation,
+				"compiled empty batch task identity does not match", nil))
+		}
+		expected, identityErr := activityRunIdentityV1(ctx, in.UserID, in.Run)
+		if identityErr != nil {
+			return retryableOrNot(identityErr)
+		}
+		_, skipped, writeErr := a.compiledStore.RecordEmptyPushBatchForTaskRunV1(
+			ctx, expected, in.Run.Snapshot, in.TraceID, in.Gate, in.Counts)
+		if writeErr != nil {
+			return retryableOrNot(writeErr)
+		}
+		if skipped {
+			slog.Info("空批次记账被护栏拦下：该 trace 已有真实批次，不覆写",
+				"user_id", in.UserID, "trace_id", in.TraceID, "gate", in.Gate)
+		}
+		return nil
+	}
 	// 返回的 batch_id 刻意丢弃：空批次底下没有 deliveries，没有任何后续写入需要它。
 	_, skipped, err := a.store.RecordEmptyPushBatch(ctx, in.UserID, in.TraceID, in.ScheduleID, in.Gate, in.Counts)
 	if err != nil {
@@ -1107,22 +1905,75 @@ func (a *Activities) RecordEmptyBatch(ctx context.Context, in RecordEmptyIn) err
 // 收件人是飞书 owner（M3 单用户）；无 owner 直接失败。单卡推送失败跳过，
 // 只要有一张成功就算 done，全失败则 failed 并返回错误。
 func (a *Activities) Push(ctx context.Context, in PushIn) error {
+	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	if err != nil {
+		return retryableOrNot(err)
+	}
+	taskTitle := in.TaskTitle
+	var compiledIdentity types.RunIdentity
+	var frozenSourceIDs []int64
+	var frozenSources map[int64]runcontext.SourceV1
+	if compiled {
+		if in.ScheduleID != in.Run.TaskID {
+			return nonRetryable(types.NewAppError(types.CodeValidation,
+				"compiled push task identity does not match", nil))
+		}
+		compiledIdentity, err = activityRunIdentityV1(ctx, in.UserID, in.Run)
+		if err != nil {
+			return retryableOrNot(err)
+		}
+		taskTitle = snapshot.Definition.NLDescription
+		frozenSourceIDs = make([]int64, len(snapshot.Definition.Sources))
+		frozenSources = make(map[int64]runcontext.SourceV1, len(snapshot.Definition.Sources))
+		for i, source := range snapshot.Definition.Sources {
+			frozenSourceIDs[i] = source.SourceID
+			frozenSources[source.SourceID] = source
+		}
+		if len(frozenSourceIDs) == 0 {
+			return nonRetryable(types.NewAppError(types.CodeValidation,
+				"compiled push has no frozen sources", nil))
+		}
+	}
 	// D9 闸门（同 Score/CardGen，bug 狩猎 2026-07-19 HIGH）：卡片不发给已注销
 	// 租户的用户——这是整条管道最后也最用户可见的一道；返回 nil 是正常终态。
-	if a.refuseIfTenantGone(ctx, in.UserID, "push") {
+	if !compiled && a.refuseIfTenantGone(ctx, in.UserID, "push") {
 		return nil
 	}
 	owner := a.feishu.OwnerOpenID()
-	if owner == "" {
+	if !compiled && owner == "" {
 		// 无 owner 是"还没人给机器人发过消息"，属确定性前置条件缺失，重试只是重复失败——
 		// 包成不可重试的 ApplicationError（Type=NOT_FOUND），让 NonRetryableErrorTypes 立即终止（修 #2）。
 		return nonRetryable(types.NewAppError(types.CodeNotFound, "尚未捕获飞书 owner，无法推送", nil))
 	}
 
 	// 用确定性 traceID 作幂等键：Temporal 重试 Push 时复用同一 batch，不再每次新建批次（修 #1 CRITICAL 地基）。
-	batchID, err := a.store.CreatePushBatchIdempotent(ctx, in.UserID, in.TraceID, in.ScheduleID)
+	var batchID int64
+	var recoveryOnly bool
+	if compiled {
+		batchID, recoveryOnly, err = a.compiledStore.CreateOrRecoverPushBatchForTaskRunV1(
+			ctx, compiledIdentity, in.Run.Snapshot, in.TraceID)
+	} else {
+		batchID, err = a.store.CreatePushBatchIdempotent(
+			ctx, in.UserID, in.TraceID, in.ScheduleID)
+	}
 	if err != nil {
 		return err
+	}
+	if recoveryOnly {
+		// A previous attempt durably recorded every delivery as sent but exited
+		// before the terminal batch receipt. Live authority may now be revoked;
+		// the store only returns this state from exact immutable sent evidence.
+		// Finish that receipt immediately and never rebuild or resend the card.
+		return retryableOrNot(a.compiledStore.MarkPushBatchDoneReceiptV1(
+			ctx, compiledIdentity, in.Run.Snapshot, in.TraceID, batchID))
+	}
+	if owner == "" {
+		// Compiled receipt-only recovery above must remain possible after the
+		// owner identity disappears: the external card is already sent and this
+		// branch only applies to a new send. Legacy keeps its original pre-batch
+		// owner check above.
+		return nonRetryable(types.NewAppError(types.CodeNotFound,
+			"尚未捕获飞书 owner，无法推送", nil))
 	}
 
 	// 聚合卡改版（card-redesign-spec.md 附录 A，2026-07-18）：一批一张聚合卡，
@@ -1132,6 +1983,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	// 幂等语义相应调整：先为全部候选建 delivery（幂等），已 sent 的条目不再进新卡
 	// （它们已在上次重试成功发出的那张卡里）；只有存在未发条目时才推一张新聚合卡。
 	anySent := false
+	sentThisAttempt := false
 	type pendingItem struct {
 		delID int64
 		input feedback.CardInput
@@ -1152,7 +2004,15 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			cid := card.Scored.Item.ID
 			d.ContentItemID = &cid
 		}
-		delID, existed, sentAlready, ierr := a.store.InsertDeliveryIdempotent(ctx, d)
+		var delID int64
+		var existed, sentAlready bool
+		var ierr error
+		if compiled {
+			delID, existed, sentAlready, ierr = a.compiledStore.InsertDeliveryForTaskRunV1(
+				ctx, compiledIdentity, in.Run.Snapshot, in.TraceID, d)
+		} else {
+			delID, existed, sentAlready, ierr = a.store.InsertDeliveryIdempotent(ctx, d)
+		}
 		if ierr != nil {
 			slog.Warn("push: 建投递记录失败，跳过", "trace_id", in.TraceID, "err", ierr)
 			continue
@@ -1172,18 +2032,30 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			URL:         card.Scored.Item.URL,
 			PublishedAt: card.Scored.Item.PublishedAt,
 		}
-		// 源归属（#8）：默认用全局首发源 content_items.source_id；隔离任务（ScheduleID 非空）
-		// 改用「本任务通过哪个源看到它」——content_sources ∩ schedule_sources 的命中源，否则会给
-		// 隔离任务的卡打上一个该任务根本不含的源名（首发源可能是用户订阅的另一个源）。无交集/查询
-		// 失败静默回退首发源（不因源归属这一显示细节而中断推送）。
+		// 源归属（#8）：legacy 默认用全局首发源，隔离任务再查当前任务命中源。
+		// compiled 运行只在冻结 source 集合里归属，并直接使用快照里的标题/平台；
+		// 任务在运行中改源或源元数据漂移都不能改变这一批卡片。
 		displaySourceID := card.Scored.Item.SourceID
-		if in.ScheduleID != "" && card.Scored.Item.ID != 0 {
+		if compiled && card.Scored.Item.ID != 0 {
+			if sourceID, ok, sourceErr := a.compiledStore.SourceForContentFromIDs(
+				ctx, card.Scored.Item.ID, frozenSourceIDs,
+			); sourceErr == nil && ok {
+				displaySourceID = sourceID
+			} else if _, frozen := frozenSources[displaySourceID]; !frozen {
+				displaySourceID = 0
+			}
+		} else if in.ScheduleID != "" && card.Scored.Item.ID != 0 {
 			if tsid, ok, terr := a.store.ScheduleSourceForContent(ctx, card.Scored.Item.ID, in.ScheduleID); terr == nil && ok {
 				displaySourceID = tsid
 			}
 		}
 		if displaySourceID != 0 {
-			if src, serr := a.store.GetSource(ctx, displaySourceID); serr == nil {
+			if compiled {
+				if source, ok := frozenSources[displaySourceID]; ok {
+					ci.SourceTitle = source.Title
+					ci.Platform = source.Platform
+				}
+			} else if src, serr := a.store.GetSource(ctx, displaySourceID); serr == nil {
 				ci.SourceTitle = src.Title
 				ci.Platform = src.Platform
 			}
@@ -1209,7 +2081,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 		}
 		var title, tmpl string
 		if a.aggHeader != nil {
-			title, tmpl = a.aggHeader(in.TaskTitle, len(items))
+			title, tmpl = a.aggHeader(taskTitle, len(items))
 		}
 		return a.buildAggCard(feedback.AggregateCardInput{
 			HeaderTitle: title, HeaderTemplate: tmpl, Items: items,
@@ -1228,6 +2100,11 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 				"delivery_id", chunk[0].delID, "bytes", len(cardJSON))
 		}
 
+		if compiled {
+			if err := a.authorizeCompiledEffectV1(ctx, in.UserID, in.Run); err != nil {
+				return retryableOrNot(err)
+			}
+		}
 		msgID, perr := a.pusher.Push(ctx, owner, cardJSON)
 		if perr != nil {
 			slog.Warn("push: 聚合卡推送失败，跳过该块", "trace_id", in.TraceID,
@@ -1239,20 +2116,52 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			start += size
 			continue
 		}
+		// MarkDeliverySent and the final batch status are the durable receipt of
+		// the just-authorized external send. Do not insert another revocation
+		// check between delivery and receipt: stopping there would make a sent
+		// card look pending and a retry could duplicate it. C3 will strengthen
+		// this remaining send/receipt window with a durable effect checkpoint.
+		var compiledReceiptErr error
 		for _, p := range chunk {
-			if merr := a.store.MarkDeliverySent(ctx, p.delID, msgID, json.RawMessage(cardJSON), time.Now()); merr != nil {
-				// 已发出但回执标记失败：记录不阻断，靠对账补偿（避免重复推送）。
+			var merr error
+			if compiled {
+				merr = a.compiledStore.MarkDeliverySentForTaskRunV1(
+					ctx, compiledIdentity, in.Run.Snapshot, in.TraceID,
+					batchID, p.delID, msgID, json.RawMessage(cardJSON), time.Now())
+			} else {
+				merr = a.store.MarkDeliverySent(
+					ctx, p.delID, msgID, json.RawMessage(cardJSON), time.Now())
+			}
+			if merr != nil {
 				slog.Warn("push: 标记已发失败（消息已送达）", "delivery_id", p.delID,
 					"feishu_message_id", msgID, "err", merr)
+				if compiled && compiledReceiptErr == nil {
+					compiledReceiptErr = merr
+				}
 			}
 		}
 		anySent = true
+		sentThisAttempt = true
 		start += size
+		if compiledReceiptErr != nil {
+			// The external send succeeded, so claiming batch=done while any
+			// delivery receipt is missing would make the loss permanent. Keep the
+			// batch pending and retry. The remaining send/receipt crash window is
+			// handled by C3's durable effect checkpoint.
+			return retryableOrNot(compiledReceiptErr)
+		}
 	}
 
 	if !anySent {
-		if err := a.store.UpdatePushBatchStatus(ctx, batchID, types.BatchStatusFailed); err != nil {
-			return err
+		if compiled {
+			err = a.compiledStore.UpdatePushBatchStatusForTaskRunV1(
+				ctx, compiledIdentity, in.Run.Snapshot, in.TraceID,
+				batchID, types.BatchStatusFailed)
+		} else {
+			err = a.store.UpdatePushBatchStatus(ctx, batchID, types.BatchStatusFailed)
+		}
+		if err != nil {
+			return retryableOrNot(err)
 		}
 		ae := types.NewAppError(types.CodePushFailed, "本批次全部推送失败", nil)
 		if !anyRetryableFail {
@@ -1277,8 +2186,20 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 		}
 		return ae
 	}
-	if err := a.store.UpdatePushBatchStatus(ctx, batchID, types.BatchStatusDone); err != nil {
-		return err
+	if compiled {
+		if sentThisAttempt {
+			err = a.compiledStore.MarkPushBatchDoneReceiptV1(
+				ctx, compiledIdentity, in.Run.Snapshot, in.TraceID, batchID)
+		} else {
+			err = a.compiledStore.UpdatePushBatchStatusForTaskRunV1(
+				ctx, compiledIdentity, in.Run.Snapshot, in.TraceID,
+				batchID, types.BatchStatusDone)
+		}
+	} else {
+		err = a.store.UpdatePushBatchStatus(ctx, batchID, types.BatchStatusDone)
+	}
+	if err != nil {
+		return retryableOrNot(err)
 	}
 	return nil
 }
@@ -1304,6 +2225,7 @@ type NotifyEmptyIn struct {
 	TraceID string               `json:"trace_id"`
 	Gate    types.BatchExitGate  `json:"gate"`
 	Counts  types.PipelineCounts `json:"counts"`
+	Run     *CompiledRunInputV1  `json:"run,omitempty"`
 	// 门槛上下文（仅 Gate=select 时有值）：空批轻量卡要能回答"抓了多少、最高几分、
 	// 门槛多高、怎么调"（Boss 拍板 2026-07-19——31 小时静默停摆史之后，"没内容"
 	// 必须与"系统死了"可区分且可解释）。MaxScore 由 workflow 从 scored 纯计算；
@@ -1324,6 +2246,10 @@ type NotifyEmptyIn struct {
 // best-effort：通知失败只记日志不返回错误——空批次是正常终态（红线），
 // 不能让一张通知卡的失败把它变成 workflow 失败。
 func (a *Activities) NotifyEmptyResult(ctx context.Context, in NotifyEmptyIn) error {
+	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	if err != nil {
+		return retryableOrNot(err)
+	}
 	if a.buildNotice == nil {
 		return nil // 灰度/测试装配未注入通知构卡：静默跳过。
 	}
@@ -1335,7 +2261,9 @@ func (a *Activities) NotifyEmptyResult(ctx context.Context, in NotifyEmptyIn) er
 	// 类型被重放兼容性钉死为裸切片带不回档位（见 Select 注释）。查库失败降级
 	// 空档位 → 文案落"推送底线"通用话术，通知本身照发——同 Select 的降级取舍。
 	strictness := types.PushStrictness("")
-	if in.Gate == types.BatchExitGateSelect && in.ScheduleID != "" {
+	if compiled {
+		strictness = snapshot.Definition.Strictness
+	} else if in.Gate == types.BatchExitGateSelect && in.ScheduleID != "" {
 		v, err := a.store.GetScheduleStrictness(ctx, in.ScheduleID)
 		if err != nil {
 			slog.Warn("push: 空批通知查询门槛档位失败，按通用话术渲染",
@@ -1345,7 +2273,13 @@ func (a *Activities) NotifyEmptyResult(ctx context.Context, in NotifyEmptyIn) er
 		}
 	}
 	md := emptyResultMarkdown(in, strictness)
-	if _, err := a.pusher.Push(ctx, owner, a.buildNotice(md)); err != nil {
+	card := a.buildNotice(md)
+	if compiled {
+		if err := a.authorizeCompiledEffectV1(ctx, in.UserID, in.Run); err != nil {
+			return retryableOrNot(err)
+		}
+	}
+	if _, err := a.pusher.Push(ctx, owner, card); err != nil {
 		slog.Warn("push: 空结果通知发送失败（不阻断）", "trace_id", in.TraceID, "err", err)
 	}
 	return nil

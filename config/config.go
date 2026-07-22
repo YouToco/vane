@@ -71,6 +71,13 @@ type LLMConfig struct {
 	//（v4-pro 实测 60/60 全过，M4 事实基准），成本按调用面分账。
 	AgentModel    string `mapstructure:"agent_model"`
 	MaxConcurrent int    `mapstructure:"max_concurrent"`
+	// CompiledEndpointGeneration and CompiledCredentialGeneration are opaque
+	// route generations for immutable task-run snapshots. Any endpoint or key
+	// rotation must bump the corresponding generation; an old snapshot then
+	// resolves an explicitly retained route or fails closed, never the current
+	// client by accident.
+	CompiledEndpointGeneration   int64 `mapstructure:"compiled_endpoint_generation"`
+	CompiledCredentialGeneration int64 `mapstructure:"compiled_credential_generation"`
 }
 
 // FetchConfig 是内容抓取配置。
@@ -81,9 +88,15 @@ type FetchConfig struct {
 	// TikhubAPIKey 环境变量 VANE_FETCH_TIKHUB_API_KEY。
 	TikhubAPIKey string `mapstructure:"tikhub_api_key"`
 	// ExaAPIKey 环境变量 VANE_FETCH_EXA_API_KEY。
-	ExaAPIKey      string `mapstructure:"exa_api_key"`
-	TimeoutSeconds int    `mapstructure:"timeout_seconds"`
-	MaxResponseMB  int    `mapstructure:"max_response_mb"`
+	ExaAPIKey string `mapstructure:"exa_api_key"`
+	// Compiled*CredentialGeneration purpose-bind the concrete retained
+	// provider clients used by immutable task-run snapshots. Rotating a key
+	// or provider endpoint requires a new generation and a separately retained
+	// client; a missing old generation fails closed.
+	CompiledExaCredentialGeneration    int64 `mapstructure:"compiled_exa_credential_generation"`
+	CompiledTikHubCredentialGeneration int64 `mapstructure:"compiled_tikhub_credential_generation"`
+	TimeoutSeconds                     int   `mapstructure:"timeout_seconds"`
+	MaxResponseMB                      int   `mapstructure:"max_response_mb"`
 }
 
 // PipelineConfig 是固定推送流水线的运行策略配置。
@@ -97,6 +110,16 @@ type PipelineConfig struct {
 	// PlaybookPromptsAllowAll 是全量放量的第二把钥匙。只有 Enabled=true、
 	// canary ID 为空且本值为 true 才允许全量，防止只漏配 canary 就误放量。
 	PlaybookPromptsAllowAll bool `mapstructure:"playbook_prompts_allow_all"`
+	// CompiledRuntimeEnabled controls the C1b immutable PrepareRun path. It is
+	// dark by default and must be narrowed to one task or explicitly allowed
+	// for all tasks; changing process config only rewrites durable Schedule
+	// Actions, so Workflow determinism never depends on mutable config.
+	CompiledRuntimeEnabled bool `mapstructure:"compiled_runtime_enabled"`
+	// CompiledRuntimeCanaryScheduleID selects the sole stable task allowed onto
+	// C1b while canarying. Empty requires CompiledRuntimeAllowAll=true.
+	CompiledRuntimeCanaryScheduleID string `mapstructure:"compiled_runtime_canary_schedule_id"`
+	// CompiledRuntimeAllowAll is the deliberate second key for broad rollout.
+	CompiledRuntimeAllowAll bool `mapstructure:"compiled_runtime_allow_all"`
 }
 
 // AgentConfig 是 agent loop 运行约束配置。
@@ -235,15 +258,24 @@ func setDefaults(v *viper.Viper) {
 	//
 	// 改这个值时 workflow 的 parBatchFanout 要同步跟上（两者刻意齐平，理由见那里）。
 	v.SetDefault("llm.max_concurrent", 32)
+	v.SetDefault("llm.compiled_endpoint_generation", 1)
+	v.SetDefault("llm.compiled_credential_generation", 1)
 
 	v.SetDefault("fetch.timeout_seconds", 20)
 	v.SetDefault("fetch.max_response_mb", 5)
+	v.SetDefault("fetch.compiled_exa_credential_generation", 1)
+	v.SetDefault("fetch.compiled_tikhub_credential_generation", 1)
 
 	// P1c 先以暗发布落地：false 精确回退旧 prompt；true + schedule ID
 	// 单任务 canary；true + 空 ID + allow_all 才能在 canary 通过后全量开启。
 	v.SetDefault("pipeline.playbook_prompts_enabled", false)
 	v.SetDefault("pipeline.playbook_prompt_canary_schedule_id", "")
 	v.SetDefault("pipeline.playbook_prompts_allow_all", false)
+	// C1b follows the same two-key rollout discipline as P1c: disabled by
+	// default, one explicit task for canary, explicit allow_all for broad use.
+	v.SetDefault("pipeline.compiled_runtime_enabled", false)
+	v.SetDefault("pipeline.compiled_runtime_canary_schedule_id", "")
+	v.SetDefault("pipeline.compiled_runtime_allow_all", false)
 
 	v.SetDefault("agent.max_turns", 20)
 	v.SetDefault("agent.token_budget_daily", 100000)
@@ -301,6 +333,20 @@ func (c *Config) Validate() error {
 			return errors.New("config: 单任务 canary 与 pipeline.playbook_prompts_allow_all 不能同时启用")
 		}
 	}
+	rawCompiledCanaryID := c.Pipeline.CompiledRuntimeCanaryScheduleID
+	compiledCanaryID := strings.TrimSpace(rawCompiledCanaryID)
+	if c.Pipeline.CompiledRuntimeEnabled && rawCompiledCanaryID != "" && compiledCanaryID == "" {
+		return errors.New("config: pipeline.compiled_runtime_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.CompiledRuntimeCanaryScheduleID = compiledCanaryID
+	if c.Pipeline.CompiledRuntimeEnabled {
+		if compiledCanaryID == "" && !c.Pipeline.CompiledRuntimeAllowAll {
+			return errors.New("config: 全量启用 compiled runtime 必须显式设置 pipeline.compiled_runtime_allow_all=true")
+		}
+		if compiledCanaryID != "" && c.Pipeline.CompiledRuntimeAllowAll {
+			return errors.New("config: compiled runtime 单任务 canary 与 allow_all 不能同时启用")
+		}
+	}
 
 	if c.Server.Addr == "" {
 		c.Server.Addr = "127.0.0.1:8080" // 与 setDefaults 一致：空值回退也只绑 loopback
@@ -315,6 +361,25 @@ func (c *Config) Validate() error {
 	}
 	if c.DB.URL == "" {
 		return errors.New("config: db.url 必填（可通过环境变量 VANE_DB_URL 设置）")
+	}
+	if c.LLM.CompiledEndpointGeneration == 0 {
+		c.LLM.CompiledEndpointGeneration = 1
+	}
+	if c.LLM.CompiledCredentialGeneration == 0 {
+		c.LLM.CompiledCredentialGeneration = 1
+	}
+	if c.LLM.CompiledEndpointGeneration < 0 || c.LLM.CompiledCredentialGeneration < 0 {
+		return errors.New("config: llm compiled route generation 必须为正数")
+	}
+	if c.Fetch.CompiledExaCredentialGeneration == 0 {
+		c.Fetch.CompiledExaCredentialGeneration = 1
+	}
+	if c.Fetch.CompiledTikHubCredentialGeneration == 0 {
+		c.Fetch.CompiledTikHubCredentialGeneration = 1
+	}
+	if c.Fetch.CompiledExaCredentialGeneration < 0 ||
+		c.Fetch.CompiledTikHubCredentialGeneration < 0 {
+		return errors.New("config: fetch compiled credential generation 必须为正数")
 	}
 	return nil
 }

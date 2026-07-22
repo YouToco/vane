@@ -14,6 +14,7 @@ import (
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/profilehint"
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
 )
 
@@ -31,6 +32,7 @@ func (f *fakeProfileStore) GetProfile(context.Context, int64) (*types.Profile, e
 // capturedRequest 记录测试服务器收到的 chat completions 请求体关键字段，
 // 用于断言打分请求的参数纪律（MaxTokens/Temperature/Thinking）与 prompt 内容。
 type capturedRequest struct {
+	Model       string   `json:"model"`
 	MaxTokens   *int     `json:"max_tokens"`
 	Temperature *float32 `json:"temperature"`
 	Thinking    *struct {
@@ -40,6 +42,138 @@ type capturedRequest struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
 	} `json:"messages"`
+}
+
+func validPolicyV1(t *testing.T, taskInstructionEnabled bool) (
+	runtimepolicy.PromptPolicyV1,
+	runtimepolicy.ModelPolicyV1,
+) {
+	t.Helper()
+	bundle, err := runtimepolicy.BuildV1(runtimepolicy.BuildInputV1{
+		AllowedCapabilities: []runtimepolicy.CapabilityV1{{
+			Platform:              "web",
+			Capability:            "feed",
+			Kind:                  "article",
+			ImplementationVersion: runtimepolicy.CapabilityImplementationRSSV1,
+			DependencyCredentialRefs: []runtimepolicy.CredentialRefV1{{
+				ID: runtimepolicy.CredentialIDExaPrimaryV1, Generation: 1,
+			}},
+		}},
+		ScorePrompt: CurrentPromptStageV1(),
+		CardGenPrompt: runtimepolicy.PromptStageV1{
+			SystemPrompt:    "card prompt",
+			RendererVersion: "cardgen.render/v1",
+		},
+		ProfileEvolvePrompt: runtimepolicy.PromptStageV1{
+			SystemPrompt:    "evolve prompt",
+			RendererVersion: "evolver.render/v1",
+		},
+		TaskInstructionEnabled: taskInstructionEnabled,
+		ModelProvider:          runtimepolicy.ModelProviderDeepSeekV1,
+		ModelEndpoint: runtimepolicy.EndpointRefV1{
+			ID:         runtimepolicy.EndpointIDDeepSeekCompatiblePrimaryV1,
+			Generation: runtimepolicy.PrimaryGenerationV1,
+		},
+		ModelCredentialRef: runtimepolicy.CredentialRefV1{
+			ID:         runtimepolicy.CredentialIDLLMPrimaryV1,
+			Generation: runtimepolicy.PrimaryGenerationV1,
+		},
+		ModelCalls: []runtimepolicy.ModelCallV1{
+			CurrentModelCallV1("snapshot-model"),
+			{
+				Stage: runtimepolicy.ModelStageCardGen, Model: "snapshot-model",
+				Temperature: 0.7, MaxTokens: 400, DisableThinking: true,
+			},
+			{
+				Stage: runtimepolicy.ModelStageProfileEvolve, Model: "snapshot-model",
+				MaxTokens: 800, DisableThinking: true,
+			},
+		},
+		QuotaBuckets: []runtimepolicy.QuotaBucketV1{{
+			Name:      "llm_tokens",
+			Financial: true, EnforcementVersion: "precharge-reconcile/v1",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("BuildV1() error = %v", err)
+	}
+	return bundle.PromptPolicy, bundle.ModelPolicy
+}
+
+func TestCurrentPolicyV1MatchesLegacyRequest(t *testing.T) {
+	prompt := CurrentPromptStageV1()
+	if prompt.SystemPrompt != scoreSystemPrompt || prompt.RendererVersion != RendererVersionV1 {
+		t.Fatalf("CurrentPromptStageV1() = %+v", prompt)
+	}
+	call := CurrentModelCallV1("model-v1")
+	if call.Stage != runtimepolicy.ModelStageScore || call.Model != "model-v1" ||
+		call.Temperature != 0 || call.MaxTokens != 16 || !call.DisableThinking {
+		t.Fatalf("CurrentModelCallV1() = %+v", call)
+	}
+}
+
+func TestPreparePolicyV1RejectsUnsupportedRenderer(t *testing.T) {
+	prompts, models := validPolicyV1(t, true)
+	prompts.Score.RendererVersion = "scorer.render/v2"
+	if _, err := PreparePolicyV1(prompts, models); !errors.Is(err, runtimepolicy.ErrInvalidPolicy) {
+		t.Fatalf("PreparePolicyV1() error = %v, want ErrInvalidPolicy", err)
+	}
+}
+
+func TestScoreWithPolicyV1UsesFrozenRequestAndInstructionDecision(t *testing.T) {
+	prompts, models := validPolicyV1(t, false)
+	prompts.Score.SystemPrompt = "frozen scorer system prompt"
+	for i := range models.Calls {
+		if models.Calls[i].Stage == runtimepolicy.ModelStageScore {
+			models.Calls[i].Model = "frozen-score-model"
+			models.Calls[i].Temperature = 1.25
+			models.Calls[i].MaxTokens = 123
+		}
+	}
+	policy, err := PreparePolicyV1(prompts, models)
+	if err != nil {
+		t.Fatalf("PreparePolicyV1() error = %v", err)
+	}
+
+	sc, captured := newCapturingScorer(t, http.StatusOK, "85", nil)
+	_, err = sc.ScoreWithPolicyV1(
+		t.Context(),
+		0,
+		1,
+		types.ContentItem{ID: 7, Title: "t"},
+		"trace-policy-v1",
+		"MUST-NOT-BE-INJECTED",
+		policy,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("ScoreWithPolicyV1() error = %v", err)
+	}
+	req := captured()[0]
+	if req.Model != "frozen-score-model" || req.MaxTokens == nil || *req.MaxTokens != 123 ||
+		req.Temperature == nil || *req.Temperature != float32(1.25) ||
+		req.Thinking == nil || req.Thinking.Type != "disabled" {
+		t.Fatalf("snapshot request parameters not consumed: %+v", req)
+	}
+	if req.Messages[0].Content != "frozen scorer system prompt" {
+		t.Fatalf("system prompt = %q", req.Messages[0].Content)
+	}
+	if strings.Contains(req.Messages[1].Content, "MUST-NOT-BE-INJECTED") {
+		t.Fatal("snapshot-disabled task instruction entered the model request")
+	}
+}
+
+func TestScoreWithPolicyV1RejectsZeroPolicyBeforeCall(t *testing.T) {
+	sc, captured := newCapturingScorer(t, http.StatusOK, "85", nil)
+	_, err := sc.ScoreWithPolicyV1(
+		t.Context(), 0, 1, types.ContentItem{ID: 7}, "trace-zero", "", PolicyV1{}, nil,
+	)
+	if !errors.Is(err, runtimepolicy.ErrInvalidPolicy) {
+		t.Fatalf("ScoreWithPolicyV1() error = %v, want ErrInvalidPolicy", err)
+	}
+	if got := len(captured()); got != 0 {
+		t.Fatalf("zero policy made %d upstream calls", got)
+	}
 }
 
 // newTestScorer 起一个仿 DeepSeek 的 httptest.Server：不论请求内容，

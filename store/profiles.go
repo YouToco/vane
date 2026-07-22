@@ -49,6 +49,28 @@ func (s *Store) GetProfile(ctx context.Context, userID int64) (*types.Profile, e
 	return &p, nil
 }
 
+// GetProfileForTenant is the compiled-runtime read path. It refuses to select
+// a profile merely because the user currently belongs to some tenant; the row
+// must be owned by the exact tenant frozen in the run snapshot.
+func (s *Store) GetProfileForTenant(ctx context.Context, tenantID, userID int64) (*types.Profile, error) {
+	if tenantID <= 0 || userID <= 0 {
+		return nil, types.NewAppError(types.CodeValidation, "画像租户范围无效", types.ErrValidation)
+	}
+	var p types.Profile
+	err := scanProfile(s.pool.QueryRow(ctx,
+		`SELECT `+profileColumns+` FROM profiles WHERE tenant_id = $1 AND user_id = $2`,
+		tenantID, userID), &p)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, types.NewAppError(types.CodeNotFound,
+				fmt.Sprintf("租户 %d 的用户 %d 无画像", tenantID, userID), err)
+		}
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("查询租户 %d 的用户 %d 画像", tenantID, userID), err)
+	}
+	return &p, nil
+}
+
 // UpsertProfileFields 人工写路径（首采 2.1 与修正 2.3 共用）：nil 字段不改，
 // tags 为 nil 不改、非 nil 整体替换（截前 12）。不触碰 summary/游标/token 三件套
 // （summary 归演化独有，全字段覆盖会清掉演化产物——主控裁决）。

@@ -201,6 +201,16 @@ type taskScheduleFakeCounts struct {
 	delete   int
 }
 
+// retainedV1PushParamsWire is the PushParams shape compiled into the binary
+// immediately before C1b added its tenant/mode/runtime envelope.
+type retainedV1PushParamsWire struct {
+	UserID     int64                `json:"user_id"`
+	RunKind    workflow.PushRunKind `json:"run_kind,omitempty"`
+	ScheduleID string               `json:"schedule_id,omitempty"`
+	Scope      workflow.PushScope   `json:"scope"`
+	NLDesc     string               `json:"nl_desc,omitempty"`
+}
+
 func (f *taskScheduleFakeClient) snapshot(id string) (client.ScheduleDescription, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1232,6 +1242,25 @@ func preparedTaskSchedule(
 	return prepared
 }
 
+func retainedV1PreparedTaskSchedule(
+	t *testing.T,
+	scheduler *taskScheduleTestScheduler,
+	req TaskScheduleRequest,
+) PreparedTaskSchedule {
+	t.Helper()
+	prepared := preparedTaskSchedule(t, scheduler, req)
+	prepared.FingerprintVersion = taskScheduleFingerprintVersionV1
+	prepared.Action.Params.TenantID = 0
+	prepared.Action.Params.ExecutionMode = ""
+	prepared.Action.Params.RuntimeVersion = ""
+	requestDigest, err := digestPreparedTaskSchedule(prepared)
+	if err != nil {
+		t.Fatalf("digest retained v1 prepared schedule: %v", err)
+	}
+	prepared.RequestDigest = requestDigest
+	return prepared
+}
+
 func expectedTaskSchedule(
 	t *testing.T,
 	scheduler *taskScheduleTestScheduler,
@@ -1377,6 +1406,7 @@ func TestTaskIDForOperation_DeterministicAndIsolating(t *testing.T) {
 func TestPrepareTaskSchedule_JSONRoundTripFreezesVersionedDefinition(t *testing.T) {
 	fake := newTaskScheduleFakeClient()
 	s := newTaskScheduleTestScheduler(fake)
+	WithCompiledRuntimeRollout(true, "", true)(s.Scheduler)
 	prepared := preparedTaskSchedule(t, s, validTaskScheduleRequest())
 	if prepared.IDSchemeVersion != taskScheduleIDSchemeVersion ||
 		prepared.FingerprintVersion != taskScheduleFingerprintVersion {
@@ -1414,6 +1444,259 @@ func TestPrepareTaskSchedule_JSONRoundTripFreezesVersionedDefinition(t *testing.
 	if fingerprint.IDSchemeVersion != prepared.IDSchemeVersion ||
 		fingerprint.FingerprintVersion != prepared.FingerprintVersion {
 		t.Fatalf("memo fingerprint versions=%+v", fingerprint)
+	}
+}
+
+func TestPrepareTaskSchedule_FingerprintVersionFollowsCompiledRuntimeRollout(t *testing.T) {
+	req := validTaskScheduleRequest()
+	taskID, err := TaskIDForOperation(req.TenantID, req.UserID, req.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name        string
+		configure   func(*Scheduler)
+		wantVersion string
+		wantRuntime string
+		wantTenant  int64
+		wantMode    types.ExecutionMode
+	}{
+		{
+			name:        "dark rollout stays v1 for old-binary recovery",
+			wantVersion: taskScheduleFingerprintVersionV1,
+		},
+		{
+			name: "matching canary writes v2",
+			configure: func(s *Scheduler) {
+				WithCompiledRuntimeRollout(true, taskID, false)(s)
+			},
+			wantVersion: taskScheduleFingerprintVersion,
+			wantRuntime: workflow.CompiledRuntimeSnapshotV1,
+			wantTenant:  req.TenantID,
+			wantMode:    types.ExecutionModeCompiled,
+		},
+		{
+			name: "nonmatching canary stays v1",
+			configure: func(s *Scheduler) {
+				WithCompiledRuntimeRollout(true, "task-v1-other", false)(s)
+			},
+			wantVersion: taskScheduleFingerprintVersionV1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTaskScheduleTestScheduler(newTaskScheduleFakeClient())
+			if tc.configure != nil {
+				tc.configure(s.Scheduler)
+			}
+			prepared := preparedTaskSchedule(t, s, req)
+			params := prepared.Action.Params
+			if prepared.FingerprintVersion != tc.wantVersion ||
+				params.RuntimeVersion != tc.wantRuntime ||
+				params.TenantID != tc.wantTenant || params.ExecutionMode != tc.wantMode {
+				t.Fatalf("prepared version/envelope = %q/%+v", prepared.FingerprintVersion, params)
+			}
+			if err := ValidatePreparedTaskScheduleRequest(prepared, req); err != nil {
+				t.Fatalf("validate prepared rollout checkpoint: %v", err)
+			}
+		})
+	}
+}
+
+func TestPreparedTaskSchedule_DarkV1RemoteActionRemainsOldWireReadableAcrossResponseLoss(t *testing.T) {
+	req := validTaskScheduleRequest()
+	fake := newTaskScheduleFakeClient()
+	fake.createCommitErr = context.DeadlineExceeded
+	s := newTaskScheduleTestScheduler(fake)
+	prepared := preparedTaskSchedule(t, s, req)
+	if prepared.FingerprintVersion != taskScheduleFingerprintVersionV1 {
+		t.Fatalf("dark prepared fingerprint = %q, want retained v1", prepared.FingerprintVersion)
+	}
+
+	assertOldVerifierView := func(stage string) {
+		t.Helper()
+		desc, ok := fake.snapshot(prepared.TaskID)
+		if !ok {
+			t.Fatalf("%s schedule disappeared", stage)
+		}
+		action := desc.Schedule.Action.(*client.ScheduleWorkflowAction)
+		payload := action.Args[0].(*commonpb.Payload)
+		var current workflow.PushParams
+		if err := converter.GetDefaultDataConverter().FromPayload(payload, &current); err != nil {
+			t.Fatalf("%s decode current Action: %v", stage, err)
+		}
+		if current.TenantID != req.TenantID || current.ExecutionMode != types.ExecutionModeCompiled ||
+			current.RuntimeVersion != "" {
+			t.Fatalf("%s current Action envelope = %+v", stage, current)
+		}
+		var old retainedV1PushParamsWire
+		if err := converter.GetDefaultDataConverter().FromPayload(payload, &old); err != nil {
+			t.Fatalf("%s retained old-wire decode: %v", stage, err)
+		}
+		want := retainedV1PushParamsWire{
+			UserID: prepared.Action.Params.UserID, RunKind: prepared.Action.Params.RunKind,
+			ScheduleID: prepared.Action.Params.ScheduleID, Scope: prepared.Action.Params.Scope,
+			NLDesc: prepared.Action.Params.NLDesc,
+		}
+		if !reflect.DeepEqual(old, want) {
+			t.Fatalf("%s old verifier view = %+v, want %+v", stage, old, want)
+		}
+	}
+
+	ensured, err := s.Scheduler.EnsurePausedTask(t.Context(), prepared)
+	if err != nil {
+		t.Fatalf("paused Create response-loss recovery: %v", err)
+	}
+	assertOldVerifierView("paused create response-loss")
+
+	fake.unpauseCommitErr = context.DeadlineExceeded
+	active, err := s.Scheduler.ActivateTask(t.Context(), prepared, ensured.Snapshot)
+	if err != nil || active.State != TaskScheduleActiveVirginExact {
+		t.Fatalf("activation response-loss recovery: snapshot=%+v err=%v", active, err)
+	}
+	assertOldVerifierView("activated checkpoint response-loss")
+}
+
+// A5 创建的持久 Schedule Action 只冻结可信归属；每轮运行的
+// snapshot 引用必须由 PrepareRun 产生，不能预写进 Action 或 Temporal history。
+func TestPreparedTaskSchedule_ActionCarriesTenantWithoutRunSnapshot(t *testing.T) {
+	req := validTaskScheduleRequest()
+	fake := newTaskScheduleFakeClient()
+	s := newTaskScheduleTestScheduler(fake)
+	WithCompiledRuntimeRollout(true, "", true)(s.Scheduler)
+	prepared := preparedTaskSchedule(t, s, req)
+
+	if prepared.FingerprintVersion != taskScheduleFingerprintVersion {
+		t.Fatalf("prepared fingerprint version = %q, want %q",
+			prepared.FingerprintVersion, taskScheduleFingerprintVersion)
+	}
+	if got := prepared.Action.Params.TenantID; got != req.TenantID {
+		t.Fatalf("prepared Action tenant_id = %d，期望 %d", got, req.TenantID)
+	}
+	if got := prepared.Action.Params.ExecutionMode; got != types.ExecutionModeCompiled {
+		t.Fatalf("prepared Action execution_mode = %q, want %q", got, types.ExecutionModeCompiled)
+	}
+	if prepared.Action.Params.Snapshot != nil {
+		t.Fatalf("prepared Action snapshot = %+v，期望 nil", prepared.Action.Params.Snapshot)
+	}
+	if _, err := s.Scheduler.EnsurePausedTask(t.Context(), prepared); err != nil {
+		t.Fatalf("EnsurePausedTask: %v", err)
+	}
+	desc, ok := fake.snapshot(prepared.TaskID)
+	if !ok {
+		t.Fatal("created schedule missing")
+	}
+	action, ok := desc.Schedule.Action.(*client.ScheduleWorkflowAction)
+	if !ok || len(action.Args) != 1 {
+		t.Fatalf("created Action = %#v，期望单个 workflow 入参", desc.Schedule.Action)
+	}
+	var got workflow.PushParams
+	if err := converter.GetDefaultDataConverter().FromPayload(
+		action.Args[0].(*commonpb.Payload), &got,
+	); err != nil {
+		t.Fatalf("解码持久 Action 入参: %v", err)
+	}
+	if got.TenantID != req.TenantID {
+		t.Fatalf("持久 Action tenant_id = %d，期望 %d", got.TenantID, req.TenantID)
+	}
+	if got.ExecutionMode != types.ExecutionModeCompiled {
+		t.Fatalf("持久 Action execution_mode = %q, want %q", got.ExecutionMode, types.ExecutionModeCompiled)
+	}
+	if got.Snapshot != nil {
+		t.Fatalf("持久 Action snapshot = %+v，期望 nil", got.Snapshot)
+	}
+}
+
+func TestPreparedTaskSchedule_RetainedV1CheckpointValidatesAndUpgradesAction(t *testing.T) {
+	req := validTaskScheduleRequest()
+	fake := newTaskScheduleFakeClient()
+	s := newTaskScheduleTestScheduler(fake)
+	prepared := retainedV1PreparedTaskSchedule(t, s, req)
+
+	if err := ValidatePreparedTaskScheduleRequest(prepared, req); err != nil {
+		t.Fatalf("retained v1 checkpoint validation: %v", err)
+	}
+	expected, err := s.Scheduler.buildTaskScheduleExpected(t.Context(), prepared, "test", false)
+	if err != nil {
+		t.Fatalf("build retained v1 expected schedule: %v", err)
+	}
+	create := taskScheduleCreateRequest(t, expected)
+	create.GetSchedule().GetAction().GetStartWorkflow().GetInput().Payloads[0] =
+		payloadForTaskScheduleTest(t, prepared.Action.Params)
+	fake.seed(create)
+
+	ensured, err := s.Scheduler.EnsurePausedTask(t.Context(), prepared)
+	if err != nil {
+		t.Fatalf("recover retained v1 paused schedule: %v", err)
+	}
+	active, err := s.Scheduler.ActivateTask(t.Context(), prepared, ensured.Snapshot)
+	if err != nil || active.State != TaskScheduleActiveVirginExact {
+		t.Fatalf("activate retained v1 schedule: snapshot=%+v err=%v", active, err)
+	}
+	desc, ok := fake.snapshot(prepared.TaskID)
+	if !ok {
+		t.Fatal("activated retained v1 schedule disappeared")
+	}
+	action := desc.Schedule.Action.(*client.ScheduleWorkflowAction)
+	var params workflow.PushParams
+	if err := converter.GetDefaultDataConverter().FromPayload(
+		action.Args[0].(*commonpb.Payload), &params,
+	); err != nil {
+		t.Fatalf("decode upgraded retained v1 Action: %v", err)
+	}
+	if params.TenantID != req.TenantID || params.ExecutionMode != types.ExecutionModeCompiled ||
+		params.RuntimeVersion != "" || params.Snapshot != nil {
+		t.Fatalf("upgraded retained v1 Action params = %+v", params)
+	}
+}
+
+func TestPreparedTaskSchedule_V1AcceptsOnlyExactMissingEnvelope(t *testing.T) {
+	req := validTaskScheduleRequest()
+	s := newTaskScheduleTestScheduler(newTaskScheduleFakeClient())
+	legacy := retainedV1PreparedTaskSchedule(t, s, req)
+
+	tests := []struct {
+		name   string
+		mutate func(*PreparedTaskSchedule)
+	}{
+		{
+			name: "explicit unknown mode is not the missing legacy field",
+			mutate: func(p *PreparedTaskSchedule) {
+				p.Action.Params.ExecutionMode = types.ExecutionModeUnknown
+			},
+		},
+		{
+			name: "tenant field is not legacy",
+			mutate: func(p *PreparedTaskSchedule) {
+				p.Action.Params.TenantID = p.TenantID
+			},
+		},
+		{
+			name: "runtime version field is not legacy",
+			mutate: func(p *PreparedTaskSchedule) {
+				p.Action.Params.RuntimeVersion = workflow.CompiledRuntimeSnapshotV1
+			},
+		},
+		{
+			name: "unknown fingerprint version",
+			mutate: func(p *PreparedTaskSchedule) {
+				p.FingerprintVersion = "v999"
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared := clonePreparedTaskSchedule(legacy)
+			tc.mutate(&prepared)
+			requestDigest, err := digestPreparedTaskSchedule(prepared)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepared.RequestDigest = requestDigest
+			if err := ValidatePreparedTaskScheduleRequest(prepared, req); err == nil {
+				t.Fatal("mutated retained checkpoint unexpectedly validated")
+			}
+		})
 	}
 }
 
@@ -1554,9 +1837,13 @@ func TestPreparedTaskSchedule_TamperAndVersionChangesFailBeforeScheduleIO(t *tes
 		{"prepared_digest", func(p *PreparedTaskSchedule) { p.PreparedDigest = strings.Repeat("b", 64) }},
 		{"task_id", func(p *PreparedTaskSchedule) { p.TaskID = "task-v1-tampered" }},
 		{"id_scheme_version", func(p *PreparedTaskSchedule) { p.IDSchemeVersion = "v2" }},
-		{"fingerprint_version", func(p *PreparedTaskSchedule) { p.FingerprintVersion = "v2" }},
+		{"fingerprint_version", func(p *PreparedTaskSchedule) { p.FingerprintVersion = "v999" }},
 		{"workflow_params", func(p *PreparedTaskSchedule) {
 			p.Action.Params.Scope.SourceIDs = append(p.Action.Params.Scope.SourceIDs, 33)
+		}},
+		{"workflow_tenant", func(p *PreparedTaskSchedule) { p.Action.Params.TenantID++ }},
+		{"workflow_snapshot", func(p *PreparedTaskSchedule) {
+			p.Action.Params.Snapshot = &workflow.RunSnapshotRef{}
 		}},
 	}
 	for _, tc := range tests {

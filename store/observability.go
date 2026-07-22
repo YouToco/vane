@@ -352,6 +352,7 @@ func (s *Store) GetEvolveCallStat(ctx context.Context, userID int64, since time.
 func (s *Store) ListPushBatchSummaries(ctx context.Context, userID int64, since time.Time, limit int) ([]types.PushBatchSummary, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT b.id, b.status, b.exit_gate, b.stage_counts, b.created_at, b.idempotency_key,
+		        b.run_snapshot_id,
 		        count(d.id)::int,
 		        count(d.id) FILTER (WHERE d.status = $4)::int,
 		        max(d.score)::float8, min(d.score)::float8
@@ -374,9 +375,18 @@ func (s *Store) ListPushBatchSummaries(ctx context.Context, userID int64, since 
 		// stage_counts 先落 []byte 再解：JSONB NOT NULL DEFAULT '{}'（009），
 		// 空对象解出全 nil 的 PipelineCounts，恰是"这些阶段没记录"的正确语义。
 		var countsJSON []byte
+		var runSnapshotID *int64
 		if err := rows.Scan(&b.ID, &b.Status, &b.ExitGate, &countsJSON, &b.CreatedAt, &b.IdempotencyKey,
-			&b.DeliveryCount, &b.SentCount, &b.MaxScore, &b.MinScore); err != nil {
+			&runSnapshotID, &b.DeliveryCount, &b.SentCount, &b.MaxScore, &b.MinScore); err != nil {
 			return nil, types.NewAppError(types.CodeDatabase, "扫描推送批次统计行", err)
+		}
+		if runSnapshotID != nil {
+			logicalKey, ok := compiledPushBatchLogicalKeyV1(*runSnapshotID, b.IdempotencyKey)
+			if !ok {
+				return nil, types.NewAppError(types.CodeDatabase,
+					fmt.Sprintf("解析批次 %d 的运行幂等键", b.ID), nil)
+			}
+			b.IdempotencyKey = logicalKey
 		}
 		if err := json.Unmarshal(countsJSON, &b.StageCounts); err != nil {
 			return nil, types.NewAppError(types.CodeDatabase,

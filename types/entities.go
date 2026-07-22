@@ -210,7 +210,11 @@ type Profile struct {
 // profile_evolve/score/cardgen 三步），故按 trace 聚合打分指标时 span_name 必须进 WHERE，
 // 否则演化与卡片生成的行会混进打分统计。
 type LLMCall struct {
-	ID               int64     `json:"id"`
+	ID int64 `json:"id"`
+	// TenantID is an internal accounting identity for prepared runs. Legacy
+	// calls leave it nil and retain membership-derived attribution; compiled
+	// calls pin the tenant authorized immediately before the paid request.
+	TenantID         *int64    `json:"-"`
 	TraceID          string    `json:"trace_id"`
 	SpanName         string    `json:"span_name"`
 	UserID           *int64    `json:"user_id,omitempty"` // 可空：系统级调用无归属用户；刻意不建 FK
@@ -241,8 +245,8 @@ const (
 	ToolCallKindTikHubSearch   ToolCallKind = "tikhub_search"   // search_endpoints 检索元工具
 	ToolCallKindTikHubEndpoint ToolCallKind = "tikhub_endpoint" // 动态注入的 TikHub 端点工具（按次计费面）
 	// ToolCallKindBindingFetch 绑定引擎（调度面）的上游调用：list/enrich/probe 每次
-	// 计费调用一行（endpoint-binding-contract.md §5）。user/session/tenant 均 NULL——
-	// 源是跨租户共享客观事实（I-T1），其抓取是系统行为。不占 agent 免确认双限额。
+	// 计费调用一行（endpoint-binding-contract.md §5）。compiled 调度明确记录冻结的
+	// tenant/user；legacy 系统抓取仍可为空。不占 agent 免确认双限额。
 	ToolCallKindBindingFetch ToolCallKind = "binding_fetch"
 	// ToolCallKindExaFetch Exa API 调用（/search 与 /contents）。按次计费，
 	// costDollars 由上游响应返回、落 cost_usd 列。source_id 归因到具体信源。
@@ -263,7 +267,12 @@ const (
 // 与 LLMCall 同定位：旁路可观测性；字段语义对齐 OTel execute_tool span
 // （tool_name / error_type / duration），检索留痕字段的存在理由见 015 头注。
 type ToolCall struct {
-	ID             int64           `json:"id"`
+	ID int64 `json:"id"`
+	// TenantID is an internal post-effect accounting identity for compiled
+	// runs. It is carried separately from UserID because one user may belong to
+	// more than one tenant. Legacy calls leave it nil and retain the historical
+	// membership-derived attribution path.
+	TenantID       *int64          `json:"-"`
 	TraceID        string          `json:"trace_id"`
 	UserID         *int64          `json:"user_id,omitempty"`
 	SessionID      *int64          `json:"session_id,omitempty"` // 可空：确认卡回调等无会话来源
@@ -301,7 +310,11 @@ const (
 // 与 001 实体一致：JSONB 列 → json.RawMessage（延迟解析），status → typed 枚举。
 // 注意主键 ID 为 TEXT（Temporal schedule_id）而非 001 的 BIGSERIAL 数值主键。
 type Schedule struct {
-	ID            string          `json:"id"`             // Temporal schedule_id：push-{user_id}-{uuid}
+	ID string `json:"id"` // Temporal schedule_id：push-{user_id}-{uuid}
+	// TenantID is an internal execution-boundary field. Public schedule APIs
+	// remain user-scoped and must not acquire a new wire field just because the
+	// worker needs an explicit tenant identity in its durable Action input.
+	TenantID      int64           `json:"-"`
 	UserID        int64           `json:"user_id"`        // 归属用户
 	NLDescription string          `json:"nl_description"` // 用户原话/展示名，DEFAULT ''
 	SpecJSON      json.RawMessage `json:"spec_json"`      // JSONB：{cron,tz} 或 {every_seconds}

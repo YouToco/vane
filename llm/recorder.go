@@ -2,9 +2,11 @@ package llm
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
@@ -20,6 +22,10 @@ type recorderStore interface {
 	InsertLLMCall(context.Context, *types.LLMCall) (int64, error)
 	TryConsumeForUser(context.Context, int64, store.QuotaBucket, float64) error
 	AdjustForUser(context.Context, int64, store.QuotaBucket, float64) error
+}
+
+type exactTenantRecorderStore interface {
+	AdjustForTenant(context.Context, int64, store.QuotaBucket, float64) error
 }
 
 // NewRecorder 构造记账器。
@@ -113,6 +119,24 @@ func estimateTokens(promptRunes int, maxTokens *int) float64 {
 // 返回 store.ErrQuotaExceeded 表示额度不足，调用方**必须终止调用**——
 // 这是整个配额系统唯一真正拦得住花钱的地方。
 func (r *Recorder) CheckQuota(ctx context.Context, userID *int64, estimate float64) error {
+	return r.CheckQuotaWithRule(ctx, nil, userID, estimate, nil)
+}
+
+// CheckQuotaWithRule uses the immutable tenant rule for compiled runs. A
+// non-nil rule can never degrade to the legacy live-rule path.
+func (r *Recorder) CheckQuotaWithRule(
+	ctx context.Context,
+	tenantID *int64,
+	userID *int64,
+	estimate float64,
+	rule *runtimepolicy.QuotaBucketV1,
+) error {
+	if rule != nil {
+		if err := validateLLMQuotaPolicyV1(*rule); err != nil {
+			return err
+		}
+		return fmt.Errorf("llm: compiled quota reservation requires an atomic task-run gate")
+	}
 	if r == nil || r.st == nil || userID == nil {
 		return nil
 	}
@@ -124,11 +148,41 @@ func (r *Recorder) CheckQuota(ctx context.Context, userID *int64, estimate float
 // **失败只记日志、不影响调用结果**：调用已经发生、钱已经花了，此时报错除了
 // 把一次成功的回复变成失败之外没有任何用处。
 func (r *Recorder) ReconcileQuota(ctx context.Context, userID *int64, estimate float64, actualTokens int) {
+	r.ReconcileQuotaWithRule(ctx, nil, userID, estimate, actualTokens, nil)
+}
+
+func (r *Recorder) ReconcileQuotaWithRule(
+	ctx context.Context,
+	tenantID *int64,
+	userID *int64,
+	estimate float64,
+	actualTokens int,
+	rule *runtimepolicy.QuotaBucketV1,
+) {
 	if r == nil || r.st == nil || userID == nil {
 		return
 	}
 	// delta > 0 = 高估，退还；delta < 0 = 低估，补扣（可把余额扣成负数=欠账）。
-	if err := r.st.AdjustForUser(ctx, *userID, store.QuotaLLMTokens, estimate-float64(actualTokens)); err != nil {
+	delta := estimate - float64(actualTokens)
+	var err error
+	if rule != nil {
+		if tenantID == nil || *tenantID <= 0 {
+			err = fmt.Errorf("llm: frozen quota v1 requires a tenant identity")
+		}
+		if err == nil {
+			err = validateLLMQuotaPolicyV1(*rule)
+		}
+		if err == nil {
+			if st, ok := r.st.(exactTenantRecorderStore); ok {
+				err = st.AdjustForTenant(ctx, *tenantID, store.QuotaLLMTokens, delta)
+			} else {
+				err = fmt.Errorf("llm: recorder store cannot reconcile frozen quota v1")
+			}
+		}
+	} else {
+		err = r.st.AdjustForUser(ctx, *userID, store.QuotaLLMTokens, delta)
+	}
+	if err != nil {
 		slog.Warn("llm: 配额对账失败（调用已完成，不影响结果）",
 			"user_id", *userID, "estimate", estimate, "actual", actualTokens, "err", err)
 	}
@@ -138,12 +192,64 @@ func (r *Recorder) ReconcileQuota(ctx context.Context, userID *int64, estimate f
 // context detached from the already-finished request. Sharing one deadline
 // prevents two sequential 10s tails while preserving failure/cancel accounting.
 func (r *Recorder) finishCallAccounting(ctx context.Context, call *types.LLMCall, userID *int64, estimate float64, actualTokens int) {
-	r.finishCallAccountingWithin(ctx, call, userID, estimate, actualTokens, postCallAccountingTimeout)
+	r.finishCallAccountingWithRule(ctx, call, nil, userID, estimate, actualTokens, nil)
+}
+
+func (r *Recorder) finishCallAccountingWithRule(
+	ctx context.Context,
+	call *types.LLMCall,
+	tenantID *int64,
+	userID *int64,
+	estimate float64,
+	actualTokens int,
+	rule *runtimepolicy.QuotaBucketV1,
+) {
+	r.finishCallAccountingWithinRule(ctx, call, tenantID, userID, estimate, actualTokens,
+		rule, postCallAccountingTimeout)
+}
+
+func (r *Recorder) finishCallAccountingWithReservation(
+	ctx context.Context,
+	call *types.LLMCall,
+	tenantID *int64,
+	userID *int64,
+	reserved float64,
+	actualTokens int,
+	rule *runtimepolicy.QuotaBucketV1,
+	reconcile bool,
+) {
+	tailCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postCallAccountingTimeout)
+	defer cancel()
+	r.Record(tailCtx, call)
+	if reconcile {
+		r.ReconcileQuotaWithRule(tailCtx, tenantID, userID, reserved, actualTokens, rule)
+	}
 }
 
 func (r *Recorder) finishCallAccountingWithin(ctx context.Context, call *types.LLMCall, userID *int64, estimate float64, actualTokens int, timeout time.Duration) {
+	r.finishCallAccountingWithinRule(ctx, call, nil, userID, estimate, actualTokens, nil, timeout)
+}
+
+func (r *Recorder) finishCallAccountingWithinRule(
+	ctx context.Context,
+	call *types.LLMCall,
+	tenantID *int64,
+	userID *int64,
+	estimate float64,
+	actualTokens int,
+	rule *runtimepolicy.QuotaBucketV1,
+	timeout time.Duration,
+) {
 	tailCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 	r.Record(tailCtx, call)
-	r.ReconcileQuota(tailCtx, userID, estimate, actualTokens)
+	r.ReconcileQuotaWithRule(tailCtx, tenantID, userID, estimate, actualTokens, rule)
+}
+
+func validateLLMQuotaPolicyV1(rule runtimepolicy.QuotaBucketV1) error {
+	if rule.Name != string(store.QuotaLLMTokens) || !rule.Financial ||
+		rule.EnforcementVersion != runtimepolicy.QuotaEnforcementLLMPrechargeV1 {
+		return fmt.Errorf("llm: frozen quota policy v1 is unsupported")
+	}
+	return nil
 }

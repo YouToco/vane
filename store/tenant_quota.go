@@ -95,6 +95,13 @@ var enforcedBuckets = map[QuotaBucket]string{
 // IsEnforced 报告该桶是否真的有代码在扣它。
 func (b QuotaBucket) IsEnforced() bool { return enforcedBuckets[b] != "" }
 
+// Valid reports whether b is a registered bucket, including buckets whose
+// enforcement is deliberately not wired yet.
+func (b QuotaBucket) Valid() bool {
+	_, ok := enforcedBuckets[b]
+	return ok
+}
+
 // ErrAmbiguousTenant 是"这个用户属于多个租户，无法判定该扣谁的额度"。
 //
 // **必须与一般数据库错误分开**，因为两者的正确处置相反：

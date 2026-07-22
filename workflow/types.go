@@ -40,14 +40,47 @@ const (
 // schedule id，据此让"按任务的源抓/挑/投"成为可能（b3 消费）。push_now / 即时触发为空串，
 // 但其身份由 RunKind=ad_hoc 明确声明，而不是从空串猜测。
 type PushParams struct {
-	UserID     int64       `json:"user_id"`
-	RunKind    PushRunKind `json:"run_kind,omitempty"`
-	ScheduleID string      `json:"schedule_id,omitempty"`
-	Scope      PushScope   `json:"scope"`
+	// TenantID is populated only by a trusted scheduled-task Action. It stays
+	// zero for ad-hoc runs and pre-C1b durable Actions, which continue through
+	// the replay-compatible legacy path. C1b never derives tenant scope from a
+	// snapshot reference or from mutable current task state.
+	TenantID int64       `json:"tenant_id,omitempty"`
+	UserID   int64       `json:"user_id"`
+	RunKind  PushRunKind `json:"run_kind,omitempty"`
+	// ExecutionMode is frozen into the durable Schedule Action by the
+	// scheduler rollout policy. Unknown preserves legacy execution; Compiled
+	// enables C1b. DiscoverAtRun remains fail-closed until C3 lands.
+	ExecutionMode types.ExecutionMode `json:"execution_mode,omitempty"`
+	// RuntimeVersion selects the implementation used for the already-approved
+	// execution mode. It is deliberately distinct from ExecutionMode: a task is
+	// still semantically Compiled while C1b is dark/canarying. Empty preserves
+	// the legacy fixed pipeline; CompiledRuntimeSnapshotV1 enables PrepareRun.
+	RuntimeVersion string    `json:"runtime_version,omitempty"`
+	ScheduleID     string    `json:"schedule_id,omitempty"`
+	Scope          PushScope `json:"scope"`
 	// NLDesc 触发本次推送的调度的自然语言描述（聚合卡 header 的任务名）。
 	// 存量调度的 Temporal Action 里没有本字段，解出零值空串——聚合卡落兜底标题，
 	// 行为安全；新建调度由 scheduler.CreatePush 填入。
 	NLDesc string `json:"nl_desc,omitempty"`
+	// Snapshot is nil in every durable Schedule Action. PrepareRun populates it
+	// in workflow memory and only the sealed reference crosses into downstream
+	// Activity inputs; prompt/source/policy bodies never enter history here.
+	Snapshot *RunSnapshotRef `json:"run_snapshot,omitempty"`
+}
+
+// CompiledRuntimeSnapshotV1 is the first immutable-snapshot implementation of
+// the Compiled execution mode. Unknown is never used as a rollout label.
+const CompiledRuntimeSnapshotV1 = "compiled-snapshot/v1"
+
+// CompiledRunInputV1 carries the trusted stable scope copied from the Schedule
+// Action plus the sealed reference returned by PrepareRun. It contains no
+// approved definition or runtime-policy body and is therefore safe for
+// Temporal history. UserID stays on each existing Activity input to preserve
+// its replay-compatible wire shape; consumers bind both values independently.
+type CompiledRunInputV1 struct {
+	TenantID int64          `json:"tenant_id"`
+	TaskID   string         `json:"task_id"`
+	Snapshot RunSnapshotRef `json:"snapshot"`
 }
 
 // PushScope 推送范围过滤。

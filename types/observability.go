@@ -189,10 +189,12 @@ type PushBatchSummary struct {
 	// CreatedAt 是批次时间锚点（UTC）。刻意不用 scheduled_at：该列从无代码写入，
 	// 恒为 NULL（store/push_batches.go 里三处 INSERT——CreatePushBatch /
 	// CreatePushBatchIdempotent / RecordEmptyPushBatch——的列清单都不含它）。
-	CreatedAt      time.Time `json:"created_at"`
-	IdempotencyKey string    `json:"idempotency_key"` // = workflow 的 traceID，可据此关联 llm_calls
-	DeliveryCount  int       `json:"delivery_count"`
-	SentCount      int       `json:"sent_count"`
+	CreatedAt time.Time `json:"created_at"`
+	// IdempotencyKey 是对外归一后的 workflow traceID。Compiled 批次在数据库内
+	// 使用 snapshot-scoped 物理键，Store reader 会在此边界恢复逻辑值。
+	IdempotencyKey string `json:"idempotency_key"`
+	DeliveryCount  int    `json:"delivery_count"`
+	SentCount      int    `json:"sent_count"`
 	// MaxScore/MinScore 是本批 deliveries.score 的极值，nil = 本批无投递。
 	// 注意这是 LLM **原始相关分**，不是排序用的有效分——有效分含时新度衰减、
 	// 只在推送时刻内存中存在，从不落库（selector/selector.go:49-51）。

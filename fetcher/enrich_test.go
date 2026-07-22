@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/YouToco/vane/types"
@@ -19,7 +20,16 @@ type fakeEnricher struct {
 	err   error
 }
 
-func (f *fakeEnricher) pageResults(_ context.Context, pageURL string, _ int, _ *types.Source) ([]exaContentsResult, bool, error) {
+func (f *fakeEnricher) pageResultsWithEffectGate(
+	ctx context.Context,
+	pageURL string,
+	_ int,
+	_ *types.Source,
+	beforeEffect func(context.Context) error,
+) ([]exaContentsResult, bool, error) {
+	if err := checkEffectGate(ctx, beforeEffect); err != nil {
+		return nil, false, err
+	}
 	f.mu.Lock()
 	f.calls = append(f.calls, pageURL)
 	f.mu.Unlock()
@@ -113,6 +123,33 @@ func TestEnrich_LinkOnlyFeedBecomesUsable(t *testing.T) {
 		if strings.Contains(it.Content, "<a href") {
 			t.Errorf("第 %d 条仍残留 feed 里的裸锚点，会被 §12.3 护栏丢掉：%q", i, it.Content)
 		}
+	}
+}
+
+func TestEnrich_EffectGateFailureIsNotSwallowed(t *testing.T) {
+	en := &fakeEnricher{text: longBody}
+	f := enrichFetcher(t, en, &enrichSeen{})
+	url := serveFeed(t, hnLikeFeed(1))
+
+	var calls atomic.Int32
+	errRevoked := errors.New("compiled task revoked")
+	beforeEffect := func(context.Context) error {
+		if calls.Add(1) == 1 {
+			return nil // RSS feed GET remains authorized.
+		}
+		return errRevoked // Revoked before the Exa enrichment call.
+	}
+
+	_, err := f.fetchRSSWithEffectGate(
+		t.Context(), feedSource(url), enrichMaxPerRound, beforeEffect)
+	if !errors.Is(err, errRevoked) {
+		t.Fatalf("Fetch error = %v, want revocation", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("effect gate calls = %d, want feed + enrichment", got)
+	}
+	if got := en.count(); got != 0 {
+		t.Fatalf("enrichment upstream calls after revocation = %d, want 0", got)
 	}
 }
 

@@ -3,21 +3,32 @@ package llm
 import (
 	"context"
 	"errors"
-	"github.com/YouToco/vane/store"
 	"log/slog"
 	"time"
 	"unicode/utf8"
 
+	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
 
 // CallMeta 是一次调用的记账元信息，由业务层（feishu handler 等）填写。
 type CallMeta struct {
-	TraceID  string
+	TraceID string
+	// TenantID is required with QuotaRule and pins both financial accounting
+	// and the llm_calls receipt to the prepared run's tenant.
+	TenantID *int64
 	SpanName string        // 调用环节，如 "chat_reply"
 	UserID   *int64        // 系统级调用可为 nil
 	RefType  types.RefType // 无关联业务对象可为空串
 	RefID    *int64
+	// QuotaRule is non-nil only for a compiled run and is copied from its
+	// immutable snapshot. Legacy/chat calls keep using the live tenant rule.
+	QuotaRule *runtimepolicy.QuotaBucketV1
+	// BeforeSpend atomically re-authorizes a compiled task run and reserves its
+	// estimated live tenant quota. Do invokes it through Request.BeforeSend,
+	// after Client's semaphore wait and immediately before upstream HTTP.
+	BeforeSpend func(context.Context, float64) error
 }
 
 // Do 调用 + 记账一体：计时 → Complete → 构造 LLMCall → Record。
@@ -32,40 +43,68 @@ func Do(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Reques
 	// agent 的 prompt 均值 4381、峰值 44871，是打分的 10 倍与 42 倍。
 	// TestInvariant_EveryUpstreamEntryHasQuotaGate 守住"新增入口必须装闸门"。
 	estimate := estimateTokens(utf8.RuneCountInString(req.System)+utf8.RuneCountInString(req.User), req.MaxTokens)
-	if err := rec.CheckQuota(ctx, meta.UserID, estimate); err != nil {
-		switch {
-		case errors.Is(err, store.ErrQuotaExceeded):
-			return nil, types.NewAppError(types.CodeQuotaExceeded,
-				"本租户的 LLM 额度已用尽，稍后会随时间自动恢复", nil)
-
-		case errors.Is(err, store.ErrAmbiguousTenant):
-			// 归属不明 ⇒ **拒绝**，不放行。此刻我们根本不知道该记谁的账，
-			// 而花一笔无法归属的钱正是这道护栏存在的理由。
-			// 且它是确定性的：重试一万次还是多行，放行等于给该用户无限额度。
-			slog.Error("llm: 用户归属多个租户，无法判定配额归属，拒绝调用",
-				"user_id", *meta.UserID)
-			return nil, types.NewAppError(types.CodeInternal,
-				"账号归属异常，暂时无法处理，请联系管理员", err)
-
-		default:
-			// 其余（数据库抖动等）：**放行**。这是旁路闸门——让 DB 抖动升级成
-			// 全局 LLM 停摆，比"超额一点"糟糕得多。用 Error 而非 Warn：
-			// 配额查询失败意味着此刻护栏是失效的，这件事必须在日志里显眼。
-			slog.Error("llm: 配额查询失败，本次放行（护栏此刻失效）", "err", err)
+	callerBeforeSend := req.BeforeSend
+	reserved := 0.0
+	reconcileQuota := false
+	req.BeforeSend = func(sendCtx context.Context) error {
+		if callerBeforeSend != nil {
+			if err := callerBeforeSend(sendCtx); err != nil {
+				return err
+			}
 		}
+		if meta.BeforeSpend != nil {
+			if meta.QuotaRule == nil || meta.TenantID == nil || *meta.TenantID <= 0 ||
+				meta.UserID == nil || rec == nil || rec.st == nil {
+				return types.NewAppError(types.CodeInternal,
+					"运行配额暂时无法校验，本次未调用模型", nil)
+			}
+			if _, ok := rec.st.(exactTenantRecorderStore); !ok {
+				return types.NewAppError(types.CodeInternal,
+					"运行配额暂时无法对账，本次未调用模型", nil)
+			}
+			if err := validateLLMQuotaPolicyV1(*meta.QuotaRule); err != nil {
+				return err
+			}
+			if err := meta.BeforeSpend(sendCtx, estimate); err != nil {
+				return mapQuotaGateError(meta.UserID, err)
+			}
+			reserved = estimate
+			reconcileQuota = true
+			return nil
+		}
+		if meta.QuotaRule != nil {
+			return types.NewAppError(types.CodeInternal,
+				"运行配额暂时无法校验，本次未调用模型", nil)
+		}
+		if err := rec.CheckQuota(sendCtx, meta.UserID, estimate); err != nil {
+			if errors.Is(err, store.ErrQuotaExceeded) || errors.Is(err, store.ErrAmbiguousTenant) {
+				return mapQuotaGateError(meta.UserID, err)
+			}
+			// Legacy calls retain their availability-first behavior. No amount
+			// was reserved, so a recovered post-call database tail charges the
+			// full actual usage (reservation=0) instead of applying a bogus refund.
+			slog.Error("llm: 配额查询失败，本次放行（护栏此刻失效）", "err", err)
+			reserved = 0
+			reconcileQuota = true
+			return nil
+		}
+		reserved = estimate
+		reconcileQuota = true
+		return nil
 	}
 
 	start := time.Now()
 	resp, err := c.Complete(ctx, req)
 
 	call := &types.LLMCall{
+		TenantID:     meta.TenantID,
 		TraceID:      meta.TraceID,
 		SpanName:     meta.SpanName,
 		UserID:       meta.UserID,
 		RefType:      meta.RefType,
 		RefID:        meta.RefID,
 		Provider:     c.provider,
-		Model:        c.model, // 成功路径下面会覆盖为上游回报的实际模型名
+		Model:        c.requestModel(req.Model), // 成功路径下面会覆盖为上游回报的实际模型名
 		SystemPrompt: req.System,
 		UserPrompt:   req.User,
 		Temperature:  req.Temperature,
@@ -104,6 +143,23 @@ func Do(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Reques
 	// 失败/取消时 call.*Tokens 为 0，于是这里把预扣的估算**全额退还**——
 	// 这是刻意的：上游若真的计了费，我们也没有任何字段能知道，凭空扣一笔
 	// 猜出来的量会让账目更不可信。
-	rec.finishCallAccounting(ctx, call, meta.UserID, estimate, call.PromptTokens+call.CompletionTokens)
+	rec.finishCallAccountingWithReservation(ctx, call, meta.TenantID, meta.UserID, reserved,
+		call.PromptTokens+call.CompletionTokens, meta.QuotaRule, reconcileQuota)
 	return resp, err
+}
+
+func mapQuotaGateError(userID *int64, err error) error {
+	if errors.Is(err, store.ErrQuotaExceeded) {
+		return types.NewAppError(types.CodeQuotaExceeded,
+			"本租户的 LLM 额度已用尽，稍后会随时间自动恢复", nil)
+	}
+	if errors.Is(err, store.ErrAmbiguousTenant) {
+		if userID != nil {
+			slog.Error("llm: 用户归属多个租户，无法判定配额归属，拒绝调用",
+				"user_id", *userID)
+		}
+		return types.NewAppError(types.CodeInternal,
+			"账号归属异常，暂时无法处理，请联系管理员", err)
+	}
+	return err
 }

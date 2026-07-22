@@ -367,14 +367,17 @@ func loadTaskRunDefinition(
 ) (taskRunDefinitionPayload, string, string, error) {
 	var definition taskRunDefinitionPayload
 	var strictness *string
+	// Pre-A2 schedules may legitimately have no playbook row; the legacy
+	// runtime treated that exactly like an empty playbook. Preserve that
+	// behavior only when schedule_sources is also empty (checked below).
 	err := tx.QueryRow(ctx,
 		`SELECT s.nl_description, s.spec_json, s.scope_json, s.push_strictness,
-		        pb.content, pb.fetch_plan
+		        COALESCE(pb.content, ''), COALESCE(pb.fetch_plan, '{}'::jsonb)
 		   FROM schedules s
-		   JOIN schedule_playbooks pb ON pb.schedule_id = s.id
+		   LEFT JOIN schedule_playbooks pb ON pb.schedule_id = s.id
 		  WHERE s.id = $1 AND s.tenant_id = $2 AND s.user_id = $3
 		    AND s.status = $4 AND `+matureSchedulePredicate+`
-		  FOR SHARE OF s, pb`,
+		  FOR SHARE OF s`,
 		p.TaskID, p.TenantID, p.UserID, types.ScheduleStatusActive,
 	).Scan(
 		&definition.NLDescription, &definition.SpecJSON, &definition.ScopeJSON,

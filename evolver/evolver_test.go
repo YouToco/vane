@@ -18,11 +18,95 @@ import (
 
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
 
 // ---------- 纯函数单测（无 DB / 无网络） ----------
+
+func validPolicyV1(t *testing.T) (
+	runtimepolicy.PromptPolicyV1,
+	runtimepolicy.ModelPolicyV1,
+) {
+	t.Helper()
+	bundle, err := runtimepolicy.BuildV1(runtimepolicy.BuildInputV1{
+		AllowedCapabilities: []runtimepolicy.CapabilityV1{{
+			Platform:              "web",
+			Capability:            "feed",
+			Kind:                  "article",
+			ImplementationVersion: runtimepolicy.CapabilityImplementationRSSV1,
+			DependencyCredentialRefs: []runtimepolicy.CredentialRefV1{{
+				ID: runtimepolicy.CredentialIDExaPrimaryV1, Generation: 1,
+			}},
+		}},
+		ScorePrompt: runtimepolicy.PromptStageV1{
+			SystemPrompt:    "score prompt",
+			RendererVersion: "scorer.render/v1",
+		},
+		CardGenPrompt: runtimepolicy.PromptStageV1{
+			SystemPrompt:    "card prompt",
+			RendererVersion: "cardgen.render/v1",
+		},
+		ProfileEvolvePrompt: CurrentPromptStageV1(),
+		ModelProvider:       runtimepolicy.ModelProviderDeepSeekV1,
+		ModelEndpoint: runtimepolicy.EndpointRefV1{
+			ID:         runtimepolicy.EndpointIDDeepSeekCompatiblePrimaryV1,
+			Generation: runtimepolicy.PrimaryGenerationV1,
+		},
+		ModelCredentialRef: runtimepolicy.CredentialRefV1{
+			ID:         runtimepolicy.CredentialIDLLMPrimaryV1,
+			Generation: runtimepolicy.PrimaryGenerationV1,
+		},
+		ModelCalls: []runtimepolicy.ModelCallV1{
+			{
+				Stage: runtimepolicy.ModelStageScore, Model: "snapshot-model",
+				MaxTokens: 16, DisableThinking: true,
+			},
+			{
+				Stage: runtimepolicy.ModelStageCardGen, Model: "snapshot-model",
+				Temperature: 0.7, MaxTokens: 400, DisableThinking: true,
+			},
+			CurrentModelCallV1("snapshot-model"),
+		},
+		QuotaBuckets: []runtimepolicy.QuotaBucketV1{{
+			Name:      "llm_tokens",
+			Financial: true, EnforcementVersion: "precharge-reconcile/v1",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("BuildV1() error = %v", err)
+	}
+	return bundle.PromptPolicy, bundle.ModelPolicy
+}
+
+func TestCurrentPolicyV1MatchesLegacyRequest(t *testing.T) {
+	prompt := CurrentPromptStageV1()
+	if prompt.SystemPrompt != evolveSystemPrompt || prompt.RendererVersion != RendererVersionV1 {
+		t.Fatalf("CurrentPromptStageV1() = %+v", prompt)
+	}
+	call := CurrentModelCallV1("model-v1")
+	if call.Stage != runtimepolicy.ModelStageProfileEvolve || call.Model != "model-v1" ||
+		call.Temperature != 0 || call.MaxTokens != 800 || !call.DisableThinking {
+		t.Fatalf("CurrentModelCallV1() = %+v", call)
+	}
+}
+
+func TestPreparePolicyV1RejectsUnsupportedRenderer(t *testing.T) {
+	prompts, models := validPolicyV1(t)
+	prompts.ProfileEvolve.RendererVersion = "evolver.render/v2"
+	if _, err := PreparePolicyV1(prompts, models); !errors.Is(err, runtimepolicy.ErrInvalidPolicy) {
+		t.Fatalf("PreparePolicyV1() error = %v, want ErrInvalidPolicy", err)
+	}
+}
+
+func TestEvolveWithPolicyV1RejectsZeroPolicyBeforeStoreRead(t *testing.T) {
+	ev := &Evolver{}
+	err := ev.EvolveWithPolicyV1(t.Context(), 0, 1, "trace-zero", PolicyV1{}, nil, CompiledProfileWritesV1{})
+	if !errors.Is(err, runtimepolicy.ErrInvalidPolicy) {
+		t.Fatalf("EvolveWithPolicyV1() error = %v, want ErrInvalidPolicy", err)
+	}
+}
 
 func TestDedupLatest(t *testing.T) {
 	mk := func(id, deliveryID int64, action types.FeedbackAction) types.FeedbackWithContent {
@@ -566,6 +650,54 @@ func TestEvolveIntegration(t *testing.T) {
 		}
 		if !got.UpdatedAt.After(before.UpdatedAt) {
 			t.Errorf("演化成功应刷新 updated_at：前 %v，后 %v", before.UpdatedAt, got.UpdatedAt)
+		}
+	})
+
+	t.Run("快照策略驱动冻结请求", func(t *testing.T) {
+		uid, bid := newUser(t)
+		newProfile(t, uid, []string{"Go"})
+		addFeedback(
+			t,
+			uid,
+			newDelivery(t, uid, bid, "快照策略内容"),
+			types.FeedbackActionInterested,
+			"",
+		)
+
+		prompts, models := validPolicyV1(t)
+		prompts.ProfileEvolve.SystemPrompt = "frozen evolver system prompt"
+		for i := range models.Calls {
+			if models.Calls[i].Stage == runtimepolicy.ModelStageProfileEvolve {
+				models.Calls[i].Model = "frozen-evolve-model"
+				models.Calls[i].Temperature = 1.25
+				models.Calls[i].MaxTokens = 321
+			}
+		}
+		policy, err := PreparePolicyV1(prompts, models)
+		if err != nil {
+			t.Fatalf("PreparePolicyV1() error = %v", err)
+		}
+		up.set(http.StatusOK, `{"summary":"按快照演化","tags":["Go"]}`)
+		writes := CompiledProfileWritesV1{
+			Evolve: func(ctx context.Context, summary string, tags []string, newCursor int64, expectedAt time.Time, expectedCursor int64) error {
+				return st.EvolveProfile(ctx, uid, summary, tags, newCursor, expectedAt, expectedCursor)
+			},
+			AdvanceCursor: func(ctx context.Context, newCursor int64, expectedAt time.Time, expectedCursor int64) error {
+				return st.AdvanceProfileCursor(ctx, uid, newCursor, expectedAt, expectedCursor)
+			},
+		}
+		if err := ev.EvolveWithPolicyV1(ctx, 0, uid, "trace-policy-v1", policy, nil, writes); err != nil {
+			t.Fatalf("EvolveWithPolicyV1() error = %v", err)
+		}
+
+		req := up.last(t)
+		if req.Model != "frozen-evolve-model" || req.MaxTokens == nil || *req.MaxTokens != 321 ||
+			req.Temperature == nil || *req.Temperature != 1.25 ||
+			req.Thinking == nil || req.Thinking.Type != "disabled" {
+			t.Fatalf("snapshot request parameters not consumed: %+v", req)
+		}
+		if len(req.Messages) != 2 || req.Messages[0].Content != "frozen evolver system prompt" {
+			t.Fatalf("snapshot prompt not consumed: %+v", req.Messages)
 		}
 	})
 

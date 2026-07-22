@@ -23,6 +23,9 @@ func validBuildInputV1() BuildInputV1 {
 			{
 				Platform: "web", Capability: "feed", Kind: "article",
 				ImplementationVersion: "fetcher.rss/v1",
+				DependencyCredentialRefs: []CredentialRefV1{{
+					ID: CredentialIDExaPrimaryV1, Generation: 2,
+				}},
 			},
 			{
 				Platform: "web", Capability: "search", Kind: "article",
@@ -68,11 +71,11 @@ func validBuildInputV1() BuildInputV1 {
 		},
 		QuotaBuckets: []QuotaBucketV1{
 			{
-				Name: "push", RatePerSecond: 200.0 / 86400, Burst: 200,
+				Name:      "push",
 				Financial: false, EnforcementVersion: "token-bucket/v1",
 			},
 			{
-				Name: "llm_tokens", RatePerSecond: 2_000_000.0 / 86400, Burst: 2_000_000,
+				Name:      "llm_tokens",
 				Financial: true, EnforcementVersion: "precharge-reconcile/v1",
 			},
 		},
@@ -217,6 +220,7 @@ func TestPolicyV1WireTagsAndFieldOrderArePinned(t *testing.T) {
 		{name: "CapabilityV1", typ: reflect.TypeFor[CapabilityV1](), fields: []wireFieldV1{
 			{"Platform", "platform"}, {"Capability", "capability"}, {"Kind", "kind"},
 			{"ImplementationVersion", "implementation_version"}, {"CredentialRef", "credential_ref"},
+			{"DependencyCredentialRefs", "dependency_credential_refs"},
 		}},
 		{name: "ToolPolicyV1", typ: reflect.TypeFor[ToolPolicyV1](), fields: []wireFieldV1{
 			{"SchemaVersion", "schema_version"}, {"AllowedTools", "allowed_tools"},
@@ -240,8 +244,8 @@ func TestPolicyV1WireTagsAndFieldOrderArePinned(t *testing.T) {
 			{"SchemaVersion", "schema_version"}, {"Buckets", "buckets"},
 		}},
 		{name: "QuotaBucketV1", typ: reflect.TypeFor[QuotaBucketV1](), fields: []wireFieldV1{
-			{"Name", "name"}, {"RatePerSecond", "rate_per_second"}, {"Burst", "burst"},
-			{"Financial", "financial"}, {"EnforcementVersion", "enforcement_version"},
+			{"Name", "name"}, {"Financial", "financial"},
+			{"EnforcementVersion", "enforcement_version"},
 		}},
 	}
 	for _, tt := range tests {
@@ -300,6 +304,9 @@ func TestPolicyV1ValidationBoundariesAreInclusive(t *testing.T) {
 		capabilityAtBoundary.Allowed[i] = CapabilityV1{
 			Platform: "web", Capability: string(bytes.Repeat([]byte{'a'}, i+1)),
 			Kind: "article", ImplementationVersion: CapabilityImplementationRSSV1,
+			DependencyCredentialRefs: []CredentialRefV1{{
+				ID: CredentialIDExaPrimaryV1, Generation: 1,
+			}},
 		}
 	}
 	if err := capabilityAtBoundary.Validate(); err != nil {
@@ -309,6 +316,9 @@ func TestPolicyV1ValidationBoundariesAreInclusive(t *testing.T) {
 	capabilityOverBoundary.Allowed = append(slices.Clone(capabilityAtBoundary.Allowed), CapabilityV1{
 		Platform: "web", Capability: "overflow", Kind: "article",
 		ImplementationVersion: CapabilityImplementationRSSV1,
+		DependencyCredentialRefs: []CredentialRefV1{{
+			ID: CredentialIDExaPrimaryV1, Generation: 1,
+		}},
 	})
 	if err := capabilityOverBoundary.Validate(); !errors.Is(err, ErrInvalidPolicy) {
 		t.Fatalf("CapabilityCatalogV1.Validate(max+1) error = %v, want ErrInvalidPolicy", err)
@@ -398,9 +408,30 @@ func TestBuildV1_RejectsCrossPurposeCredentials(t *testing.T) {
 			},
 		},
 		{
+			name: "RSS must freeze Exa enrichment credential",
+			mutate: func(input *BuildInputV1) {
+				input.AllowedCapabilities[1].DependencyCredentialRefs = nil
+			},
+		},
+		{
+			name: "RSS dependency is purpose bound to Exa",
+			mutate: func(input *BuildInputV1) {
+				input.AllowedCapabilities[1].DependencyCredentialRefs[0].ID =
+					CredentialIDTikHubPrimaryV1
+			},
+		},
+		{
 			name: "Exa cannot use TikHub credential",
 			mutate: func(input *BuildInputV1) {
 				input.AllowedCapabilities[2].CredentialRef.ID = CredentialIDTikHubPrimaryV1
+			},
+		},
+		{
+			name: "Exa cannot smuggle an auxiliary credential",
+			mutate: func(input *BuildInputV1) {
+				input.AllowedCapabilities[2].DependencyCredentialRefs = []CredentialRefV1{{
+					ID: CredentialIDTikHubPrimaryV1, Generation: 1,
+				}}
 			},
 		},
 		{
@@ -425,6 +456,19 @@ func TestBuildV1_RejectsCrossPurposeCredentials(t *testing.T) {
 				t.Fatalf("BuildV1() error = %v, want ErrInvalidPolicy", err)
 			}
 		})
+	}
+}
+
+func TestBuildV1ClonesCapabilityDependencyCredentials(t *testing.T) {
+	t.Parallel()
+	input := validBuildInputV1()
+	bundle, err := BuildV1(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle.CapabilityCatalog.Allowed[0].DependencyCredentialRefs[0].Generation = 99
+	if got := input.AllowedCapabilities[1].DependencyCredentialRefs[0].Generation; got != 2 {
+		t.Fatalf("BuildV1 aliased caller dependency credentials: generation = %d", got)
 	}
 }
 
