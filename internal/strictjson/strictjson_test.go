@@ -23,6 +23,15 @@ func TestValidateRejectsDuplicateKeysAndTrailingValues(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsInvalidUTF8BeforeDecoderReplacement(t *testing.T) {
+	t.Parallel()
+	raw := append([]byte(`{"value":"`), 0xff)
+	raw = append(raw, []byte(`"}`)...)
+	if err := Validate(raw); err == nil {
+		t.Fatal("Validate accepted invalid UTF-8 that encoding/json would replace")
+	}
+}
+
 func TestDecodeRejectsUnknownFieldsAndPreservesWideNumbers(t *testing.T) {
 	t.Parallel()
 	type envelope struct {

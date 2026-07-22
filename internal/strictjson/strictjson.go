@@ -8,12 +8,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"unicode/utf8"
 )
 
 // Validate rejects malformed input, duplicate keys at any nesting depth, and
 // multiple top-level values. Standard encoding/json otherwise accepts a
 // duplicate key by silently keeping the last value.
 func Validate(raw []byte) error {
+	if !utf8.Valid(raw) {
+		return errors.New("strictjson: input is not valid UTF-8")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	if err := consumeValue(decoder); err != nil {

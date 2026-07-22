@@ -31,6 +31,11 @@ const (
 	maxTaskRunReferenceBytes = 512
 	maxTaskRunPayloadBytes   = 2 << 20
 	maxTaskRunJSONBytes      = 256 << 10
+
+	// taskRunSnapshotLockSeed domains PostgreSQL's stable hashtextextended
+	// result for per-Temporal-Run advisory locks. Hash collisions only serialize
+	// unrelated runs; they cannot merge identities or change the unique arbiter.
+	taskRunSnapshotLockSeed int64 = 0x56414e45
 )
 
 // CreateOrGetTaskRunSnapshotParams contains the explicit run scope and the
@@ -41,7 +46,7 @@ const (
 // change. RunID additionally has a global anti-misrouting unique constraint.
 //
 // The five policy JSON values must come from C1's typed non-secret policy
-// builder. Never pass generic runtime config or credential objects here. C0 has
+// builder. Never pass generic runtime config or credential objects here. C1a has
 // zero production call points; strict JSON persistence alone cannot prove that
 // an arbitrary caller-provided object is secret-free.
 type CreateOrGetTaskRunSnapshotParams struct {
@@ -88,51 +93,6 @@ type taskRunSnapshot struct {
 	CreatedAt               time.Time
 }
 
-// safeRef returns the only Workflow-safe projection of a durable snapshot.
-// It contains no definition, playbook, URL, source config, or policy body.
-// The shared types contract validates the reference digest and all fields.
-func (s *taskRunSnapshot) safeRef() (types.RunSnapshotRef, error) {
-	if s == nil {
-		return types.RunSnapshotRef{}, taskRunIntegrityError()
-	}
-	budget, _, err := canonicalTaskRunBudget(s.BudgetJSON)
-	if err != nil {
-		return types.RunSnapshotRef{}, taskRunIntegrityError()
-	}
-	ref := s.safeRefWithBudget(budget)
-	if err := ref.ValidateFor(ref.Identity()); err != nil {
-		return types.RunSnapshotRef{}, taskRunIntegrityError()
-	}
-	return ref, nil
-}
-
-func (s *taskRunSnapshot) safeRefWithBudget(budget types.PlannerBudget) types.RunSnapshotRef {
-	return types.RunSnapshotRef{
-		SchemaVersion:      s.ReferenceSchemaVersion,
-		SnapshotID:         s.ID,
-		TemporalWorkflowID: s.TemporalWorkflowID,
-		TemporalRunID:      s.TemporalRunID,
-		RunKind:            s.RunKind,
-		TenantID:           s.TenantID,
-		UserID:             s.UserID,
-		TaskID:             s.TaskID,
-		Mode:               s.Mode,
-		DefinitionDigest:   s.DefinitionDigest,
-		PlanDigest:         s.PlanDigest,
-		AdaptiveVersion:    s.AdaptiveVersion,
-		Policy: types.RuntimePolicyDigests{
-			CapabilityCatalogDigest: s.CapabilityCatalogDigest,
-			ToolPolicyDigest:        s.ToolPolicyDigest,
-			PromptPolicyDigest:      s.PromptPolicyDigest,
-			ModelPolicyDigest:       s.ModelPolicyDigest,
-			QuotaPolicyDigest:       s.QuotaPolicyDigest,
-		},
-		PlannerBudget:   budget,
-		PayloadDigest:   s.PayloadDigest,
-		ReferenceDigest: s.ReferenceDigest,
-	}
-}
-
 const taskRunSnapshotColumns = `id, tenant_id, user_id, task_id,
 	temporal_workflow_id, temporal_run_id, run_kind, execution_mode, adaptive_version,
 	capability_catalog_digest, tool_policy_digest, prompt_policy_digest,
@@ -143,25 +103,9 @@ type taskRunSnapshotQueryer interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-// CreateOrGetTaskRunSnapshot freezes the exact database-visible definition and
-// execution-source identities for one Temporal run, but returns only the sealed
-// safe reference. Durable policy bodies and task material never leave store.
-// It has no production call point in C0.
-func (s *Store) CreateOrGetTaskRunSnapshot(
-	ctx context.Context,
-	p CreateOrGetTaskRunSnapshotParams,
-) (types.RunSnapshotRef, error) {
-	snapshot, err := s.createOrGetTaskRunSnapshot(ctx, p)
-	if err != nil {
-		return types.RunSnapshotRef{}, err
-	}
-	ref, err := snapshot.safeRef()
-	if err != nil {
-		return types.RunSnapshotRef{}, err
-	}
-	return ref, nil
-}
-
+// createOrGetTaskRunSnapshot is the package-private raw-JSON persistence
+// primitive. C1 production code must enter through the typed
+// CreateOrGetCompiledTaskRunSnapshotV1 adapter.
 func (s *Store) createOrGetTaskRunSnapshot(
 	ctx context.Context,
 	p CreateOrGetTaskRunSnapshotParams,
@@ -175,6 +119,9 @@ func (s *Store) createOrGetTaskRunSnapshot(
 		return nil, taskRunDatabaseError("begin task run snapshot transaction", err)
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockTaskRunSnapshotRun(ctx, tx, p.TemporalRunID); err != nil {
+		return nil, err
+	}
 
 	if existing, found, err := loadTaskRunSnapshot(ctx, tx, p); err != nil {
 		return nil, err
@@ -184,7 +131,7 @@ func (s *Store) createOrGetTaskRunSnapshot(
 	if err := validateNewTaskRunInput(p); err != nil {
 		return nil, err
 	}
-	policies, policyDigests, err := canonicalTaskRunPolicies(p)
+	policies, _, err := canonicalTaskRunPolicies(p)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +143,7 @@ func (s *Store) createOrGetTaskRunSnapshot(
 		return nil, err
 	}
 
-	definition, definitionDigest, planDigest, err := loadTaskRunDefinition(ctx, tx, p)
+	definition, _, _, err := loadTaskRunDefinition(ctx, tx, p)
 	if err != nil {
 		return nil, err
 	}
@@ -213,10 +160,14 @@ func (s *Store) createOrGetTaskRunSnapshot(
 		Definition:             definition,
 		ReferenceSchemaVersion: types.RunSnapshotSchemaVersion,
 	}
-	payloadJSON, err := json.Marshal(payload)
-	if err != nil || len(payloadJSON) > maxTaskRunPayloadBytes {
+	preparedPayload, err := canonicalizeTaskRunPayloadForWrite(&payload)
+	if err != nil {
 		return nil, taskRunValidationError("task run snapshot payload is invalid")
 	}
+	payloadJSON := preparedPayload.Canonical
+	definitionDigest := preparedPayload.DefinitionDigest
+	planDigest := preparedPayload.PlanDigest
+	policyDigests := preparedPayload.PolicyDigests
 	payloadDigest := sha256Hex(payloadJSON)
 	var snapshotID int64
 	if err := tx.QueryRow(ctx,
@@ -240,7 +191,13 @@ func (s *Store) createOrGetTaskRunSnapshot(
 		BudgetJSON:              budgetJSON,
 		ReferenceSchemaVersion:  types.RunSnapshotSchemaVersion,
 	}
-	sealedRef, err := candidate.safeRefWithBudget(budget).Seal()
+	sealedRef, err := sealTaskRunSnapshotReferenceV1(candidate, taskRunBudgetV1{
+		MaxPlannerRounds: budget.MaxPlannerRounds,
+		MaxToolCalls:     budget.MaxToolCalls,
+		MaxTokens:        budget.MaxTokens,
+		MaxCostMicroUSD:  budget.MaxCostMicroUSD,
+		DurationMs:       budget.DurationMs,
+	})
 	if err != nil {
 		return nil, taskRunIntegrityError()
 	}
@@ -288,6 +245,15 @@ func (s *Store) createOrGetTaskRunSnapshot(
 		return nil, taskRunDatabaseError("commit task run snapshot transaction", err)
 	}
 	return inserted, nil
+}
+
+func lockTaskRunSnapshotRun(ctx context.Context, tx pgx.Tx, temporalRunID string) error {
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, $2))`,
+		temporalRunID, taskRunSnapshotLockSeed); err != nil {
+		return taskRunDatabaseError("lock task run snapshot execution", err)
+	}
+	return nil
 }
 
 func loadTaskRunSnapshot(
@@ -647,23 +613,7 @@ func validateStoredTaskRunSnapshot(
 	snapshot *taskRunSnapshot,
 	p CreateOrGetTaskRunSnapshotParams,
 ) error {
-	if snapshot == nil || snapshot.ID <= 0 || snapshot.TenantID <= 0 ||
-		snapshot.UserID <= 0 || snapshot.CreatedAt.IsZero() ||
-		snapshot.RunKind != types.RunSnapshotKindScheduled ||
-		snapshot.ReferenceSchemaVersion != types.RunSnapshotSchemaVersion ||
-		snapshot.Mode != types.ExecutionModeCompiled || snapshot.AdaptiveVersion != 0 ||
-		!validTaskRunTaskID(snapshot.TaskID) ||
-		!validTaskRunReference(snapshot.TemporalWorkflowID) ||
-		!validTaskRunReference(snapshot.TemporalRunID) ||
-		!validSHA256Digest(snapshot.CapabilityCatalogDigest) ||
-		!validSHA256Digest(snapshot.ToolPolicyDigest) ||
-		!validSHA256Digest(snapshot.PromptPolicyDigest) ||
-		!validSHA256Digest(snapshot.ModelPolicyDigest) ||
-		!validSHA256Digest(snapshot.QuotaPolicyDigest) ||
-		!validSHA256Digest(snapshot.DefinitionDigest) ||
-		!validSHA256Digest(snapshot.PlanDigest) ||
-		!validSHA256Digest(snapshot.PayloadDigest) ||
-		!validSHA256Digest(snapshot.ReferenceDigest) {
+	if snapshot == nil || snapshot.CreatedAt.IsZero() {
 		return taskRunIntegrityError()
 	}
 	if snapshot.TenantID != p.TenantID || snapshot.UserID != p.UserID ||
@@ -676,41 +626,31 @@ func validateStoredTaskRunSnapshot(
 	if err != nil {
 		return taskRunIntegrityError()
 	}
-	expectedIdentity := types.RunIdentity{
-		TemporalWorkflowID: p.TemporalWorkflowID,
-		TemporalRunID:      p.TemporalRunID,
-		RunKind:            types.RunSnapshotKindScheduled,
-		TenantID:           p.TenantID,
-		UserID:             p.UserID,
-		TaskID:             p.TaskID,
-	}
-	if err := ref.ValidateFor(expectedIdentity); err != nil {
+	if ref.TemporalWorkflowID != p.TemporalWorkflowID ||
+		ref.TemporalRunID != p.TemporalRunID || ref.TenantID != p.TenantID ||
+		ref.UserID != p.UserID || ref.TaskID != p.TaskID {
 		return taskRunIntegrityError()
 	}
 
-	var payload *taskRunSnapshotPayload
-	if len(snapshot.Payload) == 0 || len(snapshot.Payload) > maxTaskRunPayloadBytes ||
-		strictjson.Decode(snapshot.Payload, &payload) != nil || payload == nil {
-		return taskRunIntegrityError()
-	}
-	canonicalPayload, definitionDigest, planDigest, err := canonicalizeTaskRunPayload(payload)
+	decodedPayload, err := readTaskRunSnapshotPayload(snapshot.Payload)
 	if err != nil {
 		return taskRunIntegrityError()
 	}
-	policyDigests, err := digestTaskRunPolicies(payload.Policies)
-	if err != nil {
+	payload := decodedPayload.Payload
+	canonicalPayload := decodedPayload.Canonical
+	definitionDigest := decodedPayload.DefinitionDigest
+	planDigest := decodedPayload.PlanDigest
+	policyDigests := decodedPayload.PolicyDigests
+	storedBudget, budgetJSON, err := readTaskRunBudgetV1(snapshot.BudgetJSON)
+	if err != nil || payload.Budget == nil || storedBudget != *payload.Budget {
 		return taskRunIntegrityError()
 	}
-	storedBudget, budgetJSON, err := canonicalTaskRunBudget(snapshot.BudgetJSON)
-	if err != nil || storedBudget != payload.Budget {
-		return taskRunIntegrityError()
-	}
-	if payload.SchemaVersion != taskRunSnapshotPayloadVersion ||
+	if payload.SchemaVersion != taskRunSnapshotPayloadSchemaV1 ||
 		payload.TenantID != snapshot.TenantID || payload.UserID != snapshot.UserID ||
 		payload.TaskID != snapshot.TaskID ||
-		payload.RunKind != snapshot.RunKind ||
+		payload.RunKind != string(snapshot.RunKind) ||
 		payload.ReferenceSchemaVersion != snapshot.ReferenceSchemaVersion ||
-		payload.Mode != snapshot.Mode || payload.AdaptiveVersion != snapshot.AdaptiveVersion ||
+		payload.Mode != string(snapshot.Mode) || payload.AdaptiveVersion != snapshot.AdaptiveVersion ||
 		!constantTimeDigestEqual(policyDigests.CapabilityCatalog, snapshot.CapabilityCatalogDigest) ||
 		!constantTimeDigestEqual(policyDigests.ToolPolicy, snapshot.ToolPolicyDigest) ||
 		!constantTimeDigestEqual(policyDigests.PromptPolicy, snapshot.PromptPolicyDigest) ||

@@ -206,9 +206,9 @@ func TestCreateOrGetTaskRunSnapshot_CreateRetryAndNewRun(t *testing.T) {
 		!validSHA256Digest(first.ReferenceDigest) {
 		t.Fatalf("首次 snapshot 字段不完整: id=%d mode=%q", first.ID, first.Mode)
 	}
-	safeRef, err := f.st.CreateOrGetTaskRunSnapshot(t.Context(), firstParams)
+	safeRef, err := first.safeRef()
 	if err != nil {
-		t.Fatalf("public API 应只返回 sealed safe ref: %v", err)
+		t.Fatalf("safe ref projection failed: %v", err)
 	}
 	expectedIdentity := types.RunIdentity{
 		TemporalWorkflowID: firstParams.TemporalWorkflowID,
@@ -1152,20 +1152,38 @@ func TestCreateOrGetTaskRunSnapshot_HasZeroProductionCallPoints(t *testing.T) {
 		if parseErr != nil {
 			return parseErr
 		}
-		allowedPrivateCalls := make(map[token.Pos]struct{})
-		for _, declaration := range file.Decls {
-			function, ok := declaration.(*ast.FuncDecl)
-			if !ok || function.Name.Name != "CreateOrGetTaskRunSnapshot" ||
-				function.Body == nil {
-				continue
-			}
-			ast.Inspect(function.Body, func(node ast.Node) bool {
-				selector, ok := node.(*ast.SelectorExpr)
-				if ok && selector.Sel.Name == "createOrGetTaskRunSnapshot" {
-					allowedPrivateCalls[selector.Pos()] = struct{}{}
+		allowedPersistenceCalls := make(map[token.Pos]struct{})
+		typedAdapterPath := filepath.Join(repoRoot, "store", "task_run_snapshot_typed.go")
+		if filepath.Clean(path) == filepath.Clean(typedAdapterPath) {
+			for _, declaration := range file.Decls {
+				function, ok := declaration.(*ast.FuncDecl)
+				if !ok || function.Name.Name != "CreateOrGetCompiledTaskRunSnapshotV1" ||
+					function.Body == nil || function.Recv == nil || len(function.Recv.List) != 1 ||
+					len(function.Recv.List[0].Names) != 1 {
+					continue
 				}
-				return true
-			})
+				receiverName := function.Recv.List[0].Names[0].Name
+				star, pointerReceiver := function.Recv.List[0].Type.(*ast.StarExpr)
+				if !pointerReceiver {
+					continue
+				}
+				storeType, storeReceiver := star.X.(*ast.Ident)
+				if !storeReceiver || storeType.Name != "Store" {
+					continue
+				}
+				ast.Inspect(function.Body, func(node ast.Node) bool {
+					selector, ok := node.(*ast.SelectorExpr)
+					if !ok {
+						return true
+					}
+					receiver, receiverOK := selector.X.(*ast.Ident)
+					if receiverOK && receiver.Name == receiverName &&
+						selector.Sel.Name == "createOrGetTaskRunSnapshot" {
+						allowedPersistenceCalls[selector.Pos()] = struct{}{}
+					}
+					return true
+				})
+			}
 		}
 		ast.Inspect(file, func(node ast.Node) bool {
 			selector, ok := node.(*ast.SelectorExpr)
@@ -1173,12 +1191,12 @@ func TestCreateOrGetTaskRunSnapshot_HasZeroProductionCallPoints(t *testing.T) {
 				return true
 			}
 			if selector.Sel.Name == "createOrGetTaskRunSnapshot" {
-				if _, allowed := allowedPrivateCalls[selector.Pos()]; allowed {
+				if _, allowed := allowedPersistenceCalls[selector.Pos()]; allowed {
 					return true
 				}
 			}
-			if selector.Sel.Name == "CreateOrGetTaskRunSnapshot" ||
-				selector.Sel.Name == "createOrGetTaskRunSnapshot" {
+			if selector.Sel.Name == "createOrGetTaskRunSnapshot" ||
+				selector.Sel.Name == "CreateOrGetCompiledTaskRunSnapshotV1" {
 				position := fset.Position(selector.Pos())
 				references = append(references,
 					fmt.Sprintf("%s:%d", position.Filename, position.Line))
@@ -1191,7 +1209,8 @@ func TestCreateOrGetTaskRunSnapshot_HasZeroProductionCallPoints(t *testing.T) {
 		t.Fatalf("扫描生产调用点: %v", err)
 	}
 	if len(references) != 0 {
-		t.Fatalf("C0 必须保持零生产调用点，发现 %v", references)
+		t.Fatalf("C1a typed/raw snapshot primitives must keep zero production call points, found %v",
+			references)
 	}
 }
 
