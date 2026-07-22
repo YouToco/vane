@@ -656,13 +656,19 @@ const createScheduleSchema = `{
     "intent": {"type": "string", "minLength": 1, "description": "用户已经确认的持续监控目标与筛选范围。必须完整、自包含；它会成为任务手册，确认后不得由系统自行扩大主题或范围。"},
     "approved_fetch_plan": {
       "type": "object",
-      "description": "待用户确认的完整长期抓取计划。只能放已经通过只读发现得到、且属于注册能力的材料化信源；确认后系统会逐字采用，不会再让模型换源。",
+      "description": "待用户确认的完整长期抓取计划。可以用 existing_source_ids 引用 list_sources 返回的本人现有信源，也可以在 sources 中提交新材料化信源；两者合计必须为 1-64 个。确认前系统会把引用冻结为完整计划，之后不会再让模型换源。",
       "properties": {
+        "existing_source_ids": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "description": "可选：list_sources 返回的本人 active 订阅信源 id。不要把 id 拼成 URL；系统会在提案时按当前授权解析并冻结完整值。",
+          "items": {"type": "integer", "minimum": 1}
+        },
         "sources": {
           "type": "array",
-          "minItems": 1,
           "maxItems": 64,
-          "description": "至少一个长期信源；每项必须给出可执行的 platform/capability/url/config。",
+          "description": "可选：新的长期信源；每项必须给出可执行的 platform/capability/url/config。与 existing_source_ids 合计至少一个。",
           "items": {
             "type": "object",
             "properties": {
@@ -677,7 +683,6 @@ const createScheduleSchema = `{
           }
         }
       },
-      "required": ["sources"],
       "additionalProperties": false
     },
     "nl_description": {"type": "string", "description": "可选：该任务的自然语言描述（如\"每天早上 8 点推送\"），用于列表展示"},
@@ -730,7 +735,7 @@ type createScheduleTool struct {
 
 func (t *createScheduleTool) Name() string { return "create_schedule" }
 func (t *createScheduleTool) Description() string {
-	return "创建定时推送任务。必须同时提交用户批准的监控意图与完整长期抓取计划；确认后系统逐字采用该计划，不会再自动换源。触发频率用 cron 或 every_seconds 二选一，频率不得高于每小时一次。"
+	return "创建定时推送任务。必须同时提交用户批准的监控意图与长期抓取计划；已有信源用 list_sources 返回的 id 放进 existing_source_ids，新信源放进 sources。确认前系统会冻结完整计划，之后不会再自动换源。触发频率用 cron 或 every_seconds 二选一，频率不得高于每小时一次。"
 }
 func (t *createScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(createScheduleSchema)

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/feedback"
+	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/types"
 )
 
@@ -51,14 +52,19 @@ const (
 	cardActionFeedbackReason = "fbr" // form 提交：misjudged + detail
 )
 
-// BuildConfirmCard 构造写操作确认卡（JSON 2.0 schema）：markdown 正文展示
-// 工具名+参数摘要，确认/取消两个 callback 按钮。按钮 value 只携带
+// BuildConfirmCard 构造写操作确认卡（JSON 2.0 schema）：plain_text 正文展示
+// 工具名+参数摘要，确认/取消两个 callback 按钮。摘要可能包含共享信源标题等
+// 不可信元数据，绝不能作为 Markdown 解释，否则能视觉伪造确认范围。按钮 value 只携带
 // vane_action 与 action_id——参数以服务端 pending_actions 为准，
 // 杜绝客户端篡改（契约 §10）。
 //
 // 2.0 下按钮交互挂在 behaviors（v1 的 value 直挂按钮写法不生效）；
 // 两个按钮经 column_set 并排，避免默认纵向堆叠的松散观感。
 func BuildConfirmCard(summary, actionID string) string {
+	// plain_text prevents Markdown interpretation, but Unicode bidi/Cf controls
+	// are still honored by renderers and can visually reorder trusted labels.
+	// Apply this at the final card boundary so every mutating tool is covered.
+	summary = promptguard.StripInvisible(summary)
 	confirmBtn := map[string]any{
 		"tag":   "button",
 		"type":  "primary",
@@ -89,7 +95,10 @@ func BuildConfirmCard(summary, actionID string) string {
 		},
 		"body": map[string]any{
 			"elements": []any{
-				map[string]any{"tag": "markdown", "content": summary},
+				map[string]any{
+					"tag":  "div",
+					"text": map[string]any{"tag": "plain_text", "content": summary},
+				},
 				map[string]any{
 					"tag": "column_set",
 					"columns": []any{

@@ -36,6 +36,12 @@ type creationSagaFakeStore struct {
 	acquireErr               error
 	acquireApplyBeforeError  bool
 	completeApplyBeforeError bool
+	resolveCalls             int
+	resolveTenantID          int64
+	resolveUserID            int64
+	resolveSourceIDs         []int64
+	resolveSources           map[int64]types.Source
+	resolveErr               error
 }
 
 func newCreationSagaFakeStore() *creationSagaFakeStore {
@@ -54,6 +60,32 @@ func (s *creationSagaFakeStore) ListMembershipsByUser(
 func (s *creationSagaFakeStore) GetTenant(context.Context, int64) (*types.Tenant, error) {
 	tenant := s.tenant
 	return &tenant, nil
+}
+
+func (s *creationSagaFakeStore) ResolveTaskCreationSources(
+	_ context.Context,
+	tenantID, userID int64,
+	sourceIDs []int64,
+) ([]types.Source, error) {
+	s.resolveCalls++
+	s.resolveTenantID = tenantID
+	s.resolveUserID = userID
+	s.resolveSourceIDs = append([]int64(nil), sourceIDs...)
+	if s.resolveErr != nil {
+		return nil, s.resolveErr
+	}
+	resolved := make([]types.Source, 0, len(sourceIDs))
+	for _, sourceID := range sourceIDs {
+		source, ok := s.resolveSources[sourceID]
+		if !ok {
+			return nil, types.NewAppError(
+				types.CodeNotFound, "一个或多个已有信源当前不可用", nil,
+			)
+		}
+		source.Config = bytes.Clone(source.Config)
+		resolved = append(resolved, source)
+	}
+	return resolved, nil
 }
 
 func (s *creationSagaFakeStore) LoadTaskCreationOperationByUser(
@@ -525,6 +557,326 @@ func TestCreationCoordinator_ProposalCanonicalizesBeforePersistence(t *testing.T
 		`{"sources":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"}}]}`,
 	)) {
 		t.Fatalf("durable canonical args invalid: command=%+v err=%v", command, err)
+	}
+}
+
+func TestCreationCoordinator_LegacyValidationStillPrecedesTenantLookup(t *testing.T) {
+	store := newCreationSagaFakeStore()
+	store.tenant.Status = types.TenantStatusSuspended
+	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+	raw := mustMarshal(t, map[string]any{
+		"spec":                map[string]any{"every_seconds": 1, "tz": "UTC"},
+		"intent":              "监控 AI",
+		"nl_description":      "无效频率",
+		"strictness":          "normal",
+		"approved_fetch_plan": json.RawMessage(validApprovedFetchPlan()),
+	})
+
+	_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+		ActionID: "action-invalid-legacy", UserID: 11, RawArgs: raw,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid schedule spec") ||
+		strings.Contains(err.Error(), "工作空间") || store.createCalls != 0 {
+		t.Fatalf("legacy validation order changed: err=%v create_calls=%d", err, store.createCalls)
+	}
+
+	// The new proposal decoder must not reorder two deterministic legacy
+	// failures: the original normalizer checks intent before an empty plan.
+	raw = mustMarshal(t, map[string]any{
+		"spec":                map[string]any{"every_seconds": 3600, "tz": "UTC"},
+		"intent":              "   ",
+		"nl_description":      "无效旧参数",
+		"strictness":          "normal",
+		"approved_fetch_plan": map[string]any{"sources": []any{}},
+	})
+	_, err = coordinator.Propose(t.Context(), CreationProposalInput{
+		ActionID: "action-invalid-legacy-precedence", UserID: 11, RawArgs: raw,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err == nil || !strings.Contains(err.Error(), "approved intent") ||
+		strings.Contains(err.Error(), "at least one source") {
+		t.Fatalf("legacy error precedence changed: %v", err)
+	}
+
+	longSources := make([]map[string]any, 6)
+	for i := range longSources {
+		query := fmt.Sprintf("legacy-long-%d", i)
+		longSources[i] = map[string]any{
+			"platform": "web", "capability": "search",
+			"title":  strings.Repeat("长", maxCompiledSourceRunes),
+			"url":    "vane://web/search?q=" + query,
+			"config": map[string]any{"query": query},
+		}
+	}
+	raw = mustCreateArgsWithPlan(t, "监控旧任务", "超长摘要", mustMarshal(t, map[string]any{
+		"sources": longSources,
+	}))
+	_, err = coordinator.Propose(t.Context(), CreationProposalInput{
+		ActionID: "action-invalid-legacy-summary", UserID: 11, RawArgs: raw,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err == nil || !strings.Contains(err.Error(), "confirmation summary exceeds") ||
+		strings.Contains(err.Error(), "工作空间") || store.createCalls != 0 {
+		t.Fatalf("legacy summary validation order changed: err=%v create_calls=%d",
+			err, store.createCalls)
+	}
+}
+
+func TestCreationCoordinator_ProposalFreezesExistingSourceIdentitiesByValue(t *testing.T) {
+	store := newCreationSagaFakeStore()
+	store.resolveSources = map[int64]types.Source{
+		22: {
+			ID: 22, Platform: types.PlatformWeb, Capability: types.CapSearch,
+			Title: " \n现有 \u202e**B**\u2066\t ", URL: "vane://web/search?q=existing-b",
+			Config: json.RawMessage(
+				`{"query":"existing-b","lookback_days":-1,"num_results":15,"type":"auto"}`,
+			),
+			Status: types.SourceStatusActive,
+		},
+		11: {
+			ID: 11, Platform: types.PlatformWeb, Capability: types.CapSearch,
+			Title: "", URL: "vane://web/search?q=existing-a",
+			Config: json.RawMessage(`{"query":"existing-a"}`), Status: types.SourceStatusActive,
+		},
+		33: {
+			ID: 33, Platform: types.PlatformXHS, Capability: types.CapSearch,
+			Title: "现有小红书", URL: "vane://xhs/search?keyword=AI",
+			Config: json.RawMessage(
+				`{"keyword":"AI","sort_type":"time_descending","note_type":"video"}`,
+			),
+			Status: types.SourceStatusActive,
+		},
+		44: {
+			ID: 44, Platform: types.PlatformWeb, Capability: types.CapFeed,
+			Title: "现有 RSS", URL: "https://example.com/feed#vane-categories=ai,news",
+			Config: json.RawMessage(
+				`{"categories":["ai","news"],"lookback_days":-1}`,
+			),
+			Status: types.SourceStatusActive,
+		},
+	}
+	schedules := &creationSagaFakeScheduler{}
+	coordinator := NewCreationCoordinator(store, schedules, nil)
+	plan := json.RawMessage(`{
+		"existing_source_ids":[22,11,33,44],
+		"sources":[{
+			"platform":"web","capability":"search","title":"新增 C",
+			"url":"vane://web/search?q=new-c","config":{"query":"new-c"}
+		}]
+	}`)
+	proposal, err := coordinator.Propose(t.Context(), CreationProposalInput{
+		ActionID: "action-existing-sources", UserID: 11,
+		RawArgs:   mustCreateArgsWithPlan(t, "监控三个主题", "三源任务", plan),
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	if store.resolveCalls != 1 || store.resolveTenantID != 7 || store.resolveUserID != 11 ||
+		!slices.Equal(store.resolveSourceIDs, []int64{22, 11, 33, 44}) {
+		t.Fatalf("resolver scope/calls mismatch: calls=%d tenant=%d user=%d ids=%v",
+			store.resolveCalls, store.resolveTenantID, store.resolveUserID, store.resolveSourceIDs)
+	}
+	if store.createCalls != 1 || bytes.Contains(store.op.Args, []byte("existing_source_ids")) {
+		t.Fatalf("durable args must contain only frozen sources: create=%d args=%s",
+			store.createCalls, store.op.Args)
+	}
+	for _, forbidden := range [][]byte{
+		[]byte("lookback_days"), []byte("num_results"), []byte(`"type"`),
+		[]byte("sort_type"), []byte("note_type"),
+	} {
+		if bytes.Contains(store.op.Args, forbidden) {
+			t.Fatalf("runtime tuning leaked into task identity plan: key=%s args=%s",
+				forbidden, store.op.Args)
+		}
+	}
+	if !bytes.Contains(store.op.Args, []byte(`"categories":["ai","news"]`)) {
+		t.Fatalf("feed identity config was not preserved: %s", store.op.Args)
+	}
+	command, _, err := normalizeCreateScheduleCommand(store.op.Args)
+	if err != nil {
+		t.Fatalf("normalize durable args: %v", err)
+	}
+	var frozen compiledFetchPlan
+	if err := decodeStrictJSON(command.ApprovedFetchPlan, &frozen); err != nil {
+		t.Fatalf("decode frozen plan: %v", err)
+	}
+	gotURLs := make([]string, 0, len(frozen.Sources))
+	for _, source := range frozen.Sources {
+		gotURLs = append(gotURLs, source.URL)
+	}
+	wantURLs := []string{
+		"vane://web/search?q=existing-b",
+		"vane://web/search?q=existing-a",
+		"vane://xhs/search?keyword=AI",
+		"https://example.com/feed#vane-categories=ai,news",
+		"vane://web/search?q=new-c",
+	}
+	if !slices.Equal(gotURLs, wantURLs) {
+		t.Fatalf("frozen source order=%v want=%v", gotURLs, wantURLs)
+	}
+	for _, want := range []string{
+		"信息范围（5）", "现有 **B**", "web/search [web/search]", "现有小红书", "现有 RSS", "新增 C",
+	} {
+		if !strings.Contains(proposal.Summary, want) {
+			t.Fatalf("summary missing %q: %s", want, proposal.Summary)
+		}
+	}
+	for _, bidi := range []string{"\u202e", "\u2066"} {
+		if strings.Contains(proposal.Summary, bidi) || bytes.Contains(store.op.Args, []byte(bidi)) {
+			t.Fatalf("bidi control leaked into confirmation snapshot: %q", bidi)
+		}
+	}
+
+	// Losing the live entitlement after the confirmation card was displayed
+	// must not change the approved bytes or make recovery consult the source
+	// resolver again. The proposal snapshot is the sole input from here on.
+	store.resolveSources = nil
+	result, err := coordinator.Confirm(
+		t.Context(), 11, "action-existing-sources", testCreationReceiptTarget,
+	)
+	if err != nil || result.Status != types.PendingActionStatusExecuted ||
+		store.resolveCalls != 1 || !bytes.Equal(store.definition.FetchPlan, command.ApprovedFetchPlan) {
+		t.Fatalf("confirm after entitlement loss: result=%+v err=%v resolve_calls=%d final_plan=%s",
+			result, err, store.resolveCalls, store.definition.FetchPlan)
+	}
+}
+
+func TestCreationCoordinator_ProposalRejectsInvalidExistingSourceTuning(t *testing.T) {
+	cases := []struct {
+		name       string
+		platform   types.Platform
+		capability types.Capability
+		url        string
+		config     json.RawMessage
+	}{
+		{
+			name: "integer tuning has string value", platform: types.PlatformWeb,
+			capability: types.CapSearch, url: "vane://web/search?q=broken-int",
+			config: json.RawMessage(`{"query":"broken-int","num_results":"many"}`),
+		},
+		{
+			name: "web search type is not string", platform: types.PlatformWeb,
+			capability: types.CapSearch, url: "vane://web/search?q=broken-type",
+			config: json.RawMessage(`{"query":"broken-type","type":7}`),
+		},
+		{
+			name: "xhs sort is not string", platform: types.PlatformXHS,
+			capability: types.CapSearch, url: "vane://xhs/search?keyword=broken",
+			config: json.RawMessage(`{"keyword":"broken","sort_type":{}}`),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newCreationSagaFakeStore()
+			store.resolveSources = map[int64]types.Source{7: {
+				ID: 7, Platform: tc.platform, Capability: tc.capability,
+				URL: tc.url, Config: tc.config, Status: types.SourceStatusActive,
+			}}
+			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+				ActionID: "action-broken-existing-source", UserID: 11,
+				RawArgs: mustCreateArgsWithPlan(t, "监控已有源", "已有源", json.RawMessage(
+					`{"existing_source_ids":[7]}`,
+				)),
+				ExpiresAt: time.Now().Add(time.Hour),
+			})
+			var appErr *types.AppError
+			if !errors.As(err, &appErr) || appErr.Code != types.CodeValidation ||
+				appErr.Message != "所选已有信源当前无法用于任务，请重新选择" || store.createCalls != 0 {
+				t.Fatalf("err=%v create_calls=%d", err, store.createCalls)
+			}
+		})
+	}
+}
+
+func TestCreationCoordinator_ProposalReferenceFailuresCreateNothing(t *testing.T) {
+	t.Run("unavailable reference is generic", func(t *testing.T) {
+		store := newCreationSagaFakeStore()
+		store.resolveErr = types.NewAppError(
+			types.CodeNotFound, "一个或多个已有信源当前不可用", nil,
+		)
+		coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+		_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+			ActionID: "action-missing-source", UserID: 11,
+			RawArgs: mustCreateArgsWithPlan(t, "监控已有源", "已有源", json.RawMessage(
+				`{"existing_source_ids":[999999]}`,
+			)),
+			ExpiresAt: time.Now().Add(time.Hour),
+		})
+		var appErr *types.AppError
+		if !errors.As(err, &appErr) || appErr.Code != types.CodeValidation ||
+			appErr.Message != "所选已有信源当前不可用，请重新选择" || store.createCalls != 0 {
+			t.Fatalf("err=%v create_calls=%d", err, store.createCalls)
+		}
+	})
+
+	t.Run("duplicate URL across reference and new source", func(t *testing.T) {
+		store := newCreationSagaFakeStore()
+		store.resolveSources = map[int64]types.Source{1: {
+			ID: 1, Platform: types.PlatformWeb, Capability: types.CapSearch,
+			URL: "vane://web/search?q=same", Config: json.RawMessage(`{"query":"same"}`),
+			Status: types.SourceStatusActive,
+		}}
+		coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+		plan := json.RawMessage(`{
+			"existing_source_ids":[1],
+			"sources":[{"platform":"web","capability":"search",
+				"url":"vane://web/search?q=same","config":{"query":"same"}}]
+		}`)
+		_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+			ActionID: "action-duplicate-source", UserID: 11,
+			RawArgs:   mustCreateArgsWithPlan(t, "监控重复源", "重复源", plan),
+			ExpiresAt: time.Now().Add(time.Hour),
+		})
+		if !errors.Is(err, types.ErrValidation) || store.createCalls != 0 {
+			t.Fatalf("err=%v create_calls=%d", err, store.createCalls)
+		}
+	})
+}
+
+func TestDecodeCreationProposalArgs_SourceBoundaries(t *testing.T) {
+	ids := func(n int) []int64 {
+		out := make([]int64, n)
+		for i := range out {
+			out[i] = int64(i + 1)
+		}
+		return out
+	}
+	newSource := map[string]any{
+		"platform": "web", "capability": "search",
+		"url": "vane://web/search?q=new", "config": map[string]any{"query": "new"},
+	}
+	cases := []struct {
+		name    string
+		plan    any
+		wantErr bool
+	}{
+		{name: "one reference", plan: map[string]any{"existing_source_ids": []int64{1}}},
+		{name: "one new source", plan: map[string]any{"sources": []any{newSource}}},
+		{name: "mixed maximum", plan: map[string]any{
+			"existing_source_ids": ids(maxCompiledSources - 1), "sources": []any{newSource},
+		}},
+		{name: "empty", plan: map[string]any{}, wantErr: true},
+		{name: "zero id", plan: map[string]any{"existing_source_ids": []int64{0}}, wantErr: true},
+		{name: "duplicate id", plan: map[string]any{"existing_source_ids": []int64{7, 7}}, wantErr: true},
+		{name: "combined over maximum", plan: map[string]any{
+			"existing_source_ids": ids(maxCompiledSources), "sources": []any{newSource},
+		}, wantErr: true},
+		{name: "unknown plan field", plan: map[string]any{
+			"existing_source_ids": []int64{1}, "source_ids": []int64{1},
+		}, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := mustCreateArgsWithPlan(t, "监控", "任务", mustMarshal(t, tc.plan))
+			_, err := decodeCreationProposalArgs(raw)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("decodeCreationProposalArgs() err=%v want_err=%v raw=%s",
+					err, tc.wantErr, raw)
+			}
+		})
 	}
 }
 
