@@ -144,6 +144,54 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		u.ID, tn.ID); err != nil {
 		t.Fatalf("建画像失败: %v", err)
 	}
+	taskID := "purge-task-" + uuid.NewString()
+	tx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("开启 Approved/Adaptive 夹具事务失败: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO schedules (
+			id, tenant_id, user_id, nl_description, status, execution_mode
+		) VALUES ($1, $2, $3, '清理测试任务', 'paused', 'compiled')`,
+		taskID, tn.ID, u.ID); err != nil {
+		t.Fatalf("建清理任务夹具失败: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO task_approved_definition_versions (
+			tenant_id, user_id, task_id, version, schema_version,
+			execution_mode, definition_digest, payload, approval_ref
+		) VALUES (
+			$2, $3, $1, 1, 'approved-definition/v1', 'compiled',
+			encode(sha256(convert_to('{"task":"purge"}', 'UTF8')), 'hex'),
+			convert_to('{"task":"purge"}', 'UTF8'), $4
+		)`, taskID, tn.ID, u.ID, "purge-approval-"+uuid.NewString()); err != nil {
+		t.Fatalf("建 Approved Definition 清理夹具失败: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE schedules
+		   SET approved_definition_version = 1,
+		       approved_definition_digest =
+		           encode(sha256(convert_to('{"task":"purge"}', 'UTF8')), 'hex')
+		 WHERE id = $1`, taskID); err != nil {
+		t.Fatalf("绑定 Approved Definition head 失败: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO task_adaptive_states (
+			tenant_id, user_id, task_id, version, schema_version,
+			payload_digest, payload, basis_definition_version,
+			basis_definition_digest, last_known_good_definition_version
+		) VALUES (
+			$2, $3, $1, 1, 'adaptive-state/v1',
+			encode(sha256(convert_to('{"queries":["purge"]}', 'UTF8')), 'hex'),
+			convert_to('{"queries":["purge"]}', 'UTF8'), 1,
+			encode(sha256(convert_to('{"task":"purge"}', 'UTF8')), 'hex'), 1
+		)`, taskID, tn.ID, u.ID); err != nil {
+		t.Fatalf("建 Adaptive State 清理夹具失败: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("提交 Approved/Adaptive 清理夹具失败: %v", err)
+	}
 	if _, err := st.pool.Exec(ctx,
 		`INSERT INTO task_run_snapshots (
 			tenant_id, user_id, task_id, temporal_workflow_id, temporal_run_id,
@@ -164,6 +212,9 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 	t.Cleanup(func() {
 		c, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(c, t, st, `DELETE FROM task_adaptive_states WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM task_approved_definition_versions WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM schedules WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_run_snapshots WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM profiles WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM tenant_quota WHERE tenant_id = $1`, tn.ID)
@@ -198,6 +249,12 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	if rep.Rows["task_run_snapshots"] != 1 {
 		t.Errorf("试运行报告必须包含运行快照，实得 %d", rep.Rows["task_run_snapshots"])
 	}
+	if rep.Rows["task_adaptive_states"] != 1 ||
+		rep.Rows["task_approved_definition_versions"] != 1 {
+		t.Errorf("试运行报告必须包含 Adaptive/Approved，实得 %d/%d",
+			rep.Rows["task_adaptive_states"],
+			rep.Rows["task_approved_definition_versions"])
+	}
 
 	// 租户与数据必须原封不动。
 	if _, err := st.GetTenant(ctx, tenantID); err != nil {
@@ -218,6 +275,20 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	if n != 1 {
 		t.Errorf("试运行后运行快照应还在，实得 %d 行 —— 事务没回滚", n)
 	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_adaptive_states WHERE tenant_id = $1`, tenantID).Scan(&n); err != nil {
+		t.Fatalf("查 adaptive state 失败: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("试运行后 adaptive state 应还在，实得 %d 行 —— 事务没回滚", n)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_approved_definition_versions WHERE tenant_id = $1`, tenantID).Scan(&n); err != nil {
+		t.Fatalf("查 approved definition 失败: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("试运行后 approved definition 应还在，实得 %d 行 —— 事务没回滚", n)
+	}
 }
 
 // TestPurgeTenant_RealDeleteRemovesTenantData：真删要真的删干净。
@@ -236,6 +307,12 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 	if rep.Rows["task_run_snapshots"] != 1 {
 		t.Errorf("清理报告必须包含运行快照，实得 %d", rep.Rows["task_run_snapshots"])
 	}
+	if rep.Rows["task_adaptive_states"] != 1 ||
+		rep.Rows["task_approved_definition_versions"] != 1 {
+		t.Errorf("清理报告必须包含 Adaptive/Approved，实得 %d/%d",
+			rep.Rows["task_adaptive_states"],
+			rep.Rows["task_approved_definition_versions"])
+	}
 	if _, err := st.GetTenant(ctx, tenantID); err == nil {
 		t.Error("清理后租户仍存在")
 	}
@@ -253,6 +330,20 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("租户数据应被清空，task_run_snapshots 仍有 %d 行", n)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_adaptive_states WHERE tenant_id = $1`, tenantID).Scan(&n); err != nil {
+		t.Fatalf("查 adaptive state 失败: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("租户数据应被清空，task_adaptive_states 仍有 %d 行", n)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_approved_definition_versions WHERE tenant_id = $1`, tenantID).Scan(&n); err != nil {
+		t.Fatalf("查 approved definition 失败: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("租户数据应被清空，task_approved_definition_versions 仍有 %d 行", n)
 	}
 }
 

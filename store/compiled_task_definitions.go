@@ -97,11 +97,13 @@ func insertPausedCompiledTaskDefinitionTx(
 
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO schedules
-			(id, tenant_id, user_id, nl_description, spec_json, scope_json, status, push_strictness)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			(id, tenant_id, user_id, nl_description, spec_json, scope_json, status,
+			 push_strictness, execution_mode)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		def.TaskID, def.TenantID, def.UserID, def.NLDescription,
 		[]byte(def.SpecJSON), []byte(def.ScopeJSON),
-		types.ScheduleStatusPaused, nullableStrictness(def.Strictness)); err != nil {
+		types.ScheduleStatusPaused, nullableStrictness(def.Strictness),
+		types.ExecutionModeCompiled); err != nil {
 		if isUniqueViolation(err) {
 			return types.NewAppError(types.CodeConflict,
 				fmt.Sprintf("任务 id=%s 已存在", def.TaskID), err)

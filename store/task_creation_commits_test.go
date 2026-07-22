@@ -547,6 +547,91 @@ func TestTaskCreationDefinitionActivation_AtomicAndVisibleOnlyWhenComplete(t *te
 	assertScheduleVisibility(t, st, f.userID, legacyTask, true)
 }
 
+func TestTaskCreationCompiledSagaRejectsDynamicAggregate(t *testing.T) {
+	st := tenantTestStore(t)
+	f := newCompiledTaskFixture(t, st)
+	cleanupA5Fixture(t, st, f)
+	ctx := t.Context()
+
+	setDynamic := func(t *testing.T, taskID string) {
+		t.Helper()
+		payload := []byte(`{"test":"dynamic-saga-mode-fence"}`)
+		digest := digestOf(payload)
+		tx, err := st.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO task_approved_definition_versions (
+				tenant_id, user_id, task_id, version, schema_version,
+				execution_mode, definition_digest, payload, approval_ref
+			) VALUES ($1, $2, $3, 1, 'test.dynamic/v1', $4, $5, $6, $7)`,
+			f.tenantID, f.userID, taskID, types.ExecutionModeDiscoverAtRun,
+			digest, payload, "test-dynamic:"+taskID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE schedules
+			   SET execution_mode=$2, approved_definition_version=1,
+			       approved_definition_digest=$3
+			 WHERE id=$1`, taskID, types.ExecutionModeDiscoverAtRun, digest); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("definition replay", func(t *testing.T) {
+		p := preparedA5Commit(t, st, f, "dynamic-definition-replay")
+		if err := st.CommitPausedCompiledTaskDefinitionForCreation(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+		setDynamic(t, p.Definition.TaskID)
+		if err := st.CommitPausedCompiledTaskDefinitionForCreation(
+			ctx, p); !errors.Is(err, types.ErrConflict) {
+			t.Fatalf("compiled definition replay adopted dynamic aggregate: %v", err)
+		}
+	})
+
+	t.Run("activation begin", func(t *testing.T) {
+		p := preparedA5Commit(t, st, f, "dynamic-activation-begin")
+		if err := st.CommitPausedCompiledTaskDefinitionForCreation(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+		setDynamic(t, p.Definition.TaskID)
+		if _, err := st.BeginTaskCreationActivation(
+			ctx, p.Lease, p.Definition.TaskID); !errors.Is(err, types.ErrConflict) {
+			t.Fatalf("compiled activation began on dynamic aggregate: %v", err)
+		}
+	})
+
+	t.Run("activation commit", func(t *testing.T) {
+		p := preparedA5Commit(t, st, f, "dynamic-activation-commit")
+		if err := st.CommitPausedCompiledTaskDefinitionForCreation(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+		started, err := st.BeginTaskCreationActivation(ctx, p.Lease, p.Definition.TaskID)
+		if err != nil || !started {
+			t.Fatalf("begin activation started=%v err=%v", started, err)
+		}
+		setDynamic(t, p.Definition.TaskID)
+		if err := st.CommitTaskCreationActivation(
+			ctx, p.Lease, p.Definition.TaskID); !errors.Is(err, types.ErrConflict) {
+			t.Fatalf("compiled activation committed dynamic aggregate: %v", err)
+		}
+		var status types.ScheduleStatus
+		if err := st.pool.QueryRow(ctx,
+			`SELECT status FROM schedules WHERE id=$1`, p.Definition.TaskID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != types.ScheduleStatusPaused {
+			t.Fatalf("rejected dynamic activation changed status to %q", status)
+		}
+	})
+}
+
 func TestTaskCreationActivation_ResponseLostExactAdopt(t *testing.T) {
 	st := tenantTestStore(t)
 	f := newCompiledTaskFixture(t, st)

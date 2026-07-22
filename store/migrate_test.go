@@ -57,6 +57,9 @@ var wantTables = []string{
 	"task_creation_receipts",
 	// 030 每次定时任务运行的不可变执行快照（Agent Runtime C0）
 	"task_run_snapshots",
+	// 032 Approved Definition / Adaptive State 分离（Agent Runtime C2a）
+	"task_approved_definition_versions",
+	"task_adaptive_states",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的

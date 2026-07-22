@@ -62,6 +62,32 @@ func TestUpdateScheduleSpecStore(t *testing.T) {
 	if err := st.InsertSchedule(ctx, orig); err != nil {
 		t.Fatalf("InsertSchedule() 失败: %v", err)
 	}
+	stored, err := st.GetSchedule(ctx, schedID, u.ID)
+	if err != nil {
+		t.Fatalf("GetSchedule() after insert 失败: %v", err)
+	}
+	if stored.ExecutionMode != types.ExecutionModeCompiled {
+		t.Fatalf("legacy schedule mode=%q, want explicit compiled", stored.ExecutionMode)
+	}
+
+	t.Run("旧入口拒绝动态模式且零写入", func(t *testing.T) {
+		dynamicID := "push-test-dynamic-" + uuid.NewString()
+		dynamic := *orig
+		dynamic.ID = dynamicID
+		dynamic.ExecutionMode = types.ExecutionModeDiscoverAtRun
+		err := st.InsertSchedule(ctx, &dynamic)
+		if !errors.Is(err, types.ErrValidation) {
+			t.Fatalf("dynamic legacy insert error=%v, want validation", err)
+		}
+		var n int
+		if err := st.pool.QueryRow(ctx,
+			`SELECT count(*) FROM schedules WHERE id = $1`, dynamicID).Scan(&n); err != nil {
+			t.Fatalf("count rejected dynamic schedule: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("rejected dynamic legacy insert wrote %d rows", n)
+		}
+	})
 
 	t.Run("替换 spec 且 nil 描述不改", func(t *testing.T) {
 		newSpec := json.RawMessage(`{"cron":"30 9 * * *","tz":"Asia/Shanghai"}`)
