@@ -220,3 +220,34 @@ const (
 	PendingActionStatusCancelled PendingActionStatus = "cancelled" // 用户点了取消
 	PendingActionStatusExpired   PendingActionStatus = "expired"   // 超时未确认
 )
+
+// ExecutionMode 是任务在一次运行内冻结的执行轨道。零值空串与显式 Unknown 常量
+// 都不可执行；调用方不得把缺失或未来新增的值静默降级为 Compiled。
+type ExecutionMode string
+
+const (
+	ExecutionModeUnknown       ExecutionMode = "unknown"
+	ExecutionModeCompiled      ExecutionMode = "compiled"
+	ExecutionModeDiscoverAtRun ExecutionMode = "discover_at_run"
+)
+
+// ParseExecutionMode 严格解析持久化或配置边界上的执行模式。它不 trim、折叠大小写
+// 或提供默认值：输入缺失和拼写漂移都必须在进入 Workflow 前显式失败。
+func ParseExecutionMode(raw string) (ExecutionMode, error) {
+	mode := ExecutionMode(raw)
+	if !mode.Valid() {
+		return ExecutionModeUnknown, NewAppError(
+			CodeValidation, "执行模式无效", nil,
+		)
+	}
+	return mode, nil
+}
+
+// Valid 报告 m 是否为可执行模式。Unknown 仅用于表达未设置，不能执行。
+func (m ExecutionMode) Valid() bool {
+	switch m {
+	case ExecutionModeCompiled, ExecutionModeDiscoverAtRun:
+		return true
+	}
+	return false
+}
