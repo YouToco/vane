@@ -601,6 +601,13 @@ func parseAnchor(s string) (time.Time, error) {
 // 产生负 Unix 秒），而 Temporal 要求 phase 非负（proto: "Both interval and phase must
 // be non-negative"），裸取模会让服务端拒绝整个调度。
 func intervalOffset(anchor time.Time, everySeconds int) time.Duration {
+	return taskScheduleIntervalOffsetV1(anchor, everySeconds)
+}
+
+// taskScheduleIntervalOffsetV1 is retained by durable task-schedule/v1 and
+// definition-edit/v1 compilers. A future timing wire must add a new helper
+// instead of changing this modulo contract.
+func taskScheduleIntervalOffsetV1(anchor time.Time, everySeconds int) time.Duration {
 	if anchor.IsZero() || everySeconds <= 0 {
 		return 0
 	}

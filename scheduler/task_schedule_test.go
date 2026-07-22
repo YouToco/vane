@@ -1403,6 +1403,22 @@ func TestTaskIDForOperation_DeterministicAndIsolating(t *testing.T) {
 	}
 }
 
+func TestTaskIDForOperationVersionV1_RetainsHistoricalByteLimit(t *testing.T) {
+	t.Parallel()
+	if _, err := taskIDForOperationVersion(
+		taskScheduleIDSchemeVersionV1, 7, 42,
+		strings.Repeat("x", maxTaskOperationIDBytesV1),
+	); err != nil {
+		t.Fatalf("v1 exact historical operation ID limit rejected: %v", err)
+	}
+	if _, err := taskIDForOperationVersion(
+		taskScheduleIDSchemeVersionV1, 7, 42,
+		strings.Repeat("x", maxTaskOperationIDBytesV1+1),
+	); !errors.Is(err, ErrTaskScheduleInvalid) {
+		t.Fatalf("v1 historical operation ID limit+1 error = %v, want invalid", err)
+	}
+}
+
 func TestPrepareTaskSchedule_JSONRoundTripFreezesVersionedDefinition(t *testing.T) {
 	fake := newTaskScheduleFakeClient()
 	s := newTaskScheduleTestScheduler(fake)

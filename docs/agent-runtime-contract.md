@@ -52,6 +52,82 @@ payload 确定性派生，每次写后都用 detached bounded `Describe` 严格�
 active。C2b3-1 只交付这些 raw CAS 原语并保持零生产调用点，持久 operation、确认入口与 receipt/outbox
 分别由后续子列车接线。
 
+C2b3-2 继续按故障域拆成四个不可跳级的子列车：
+
+- **C2b3-2a frozen protocol**：只新增 edit-specific operation/receipt schema、强类型状态和 frozen proposal
+  codec；每任务单一非终态约束、删除后仍保留审计、actor/target scope、base/target head、完整 Temporal
+  表示与原始 canonical definition bytes 都在这一层固化；schema 可先预留 lease/fence、schedule marker、phase
+  checkpoint 和 receipt outbox 列，但此阶段没有 Store mutation API，也没有生产调用点。
+- **C2b3-2b durable Store substrate**：实现受数据库时钟 lease/fence、schedule operation marker、逐阶段原始
+  字节 checkpoint 与 edit-specific terminal receipt outbox 约束的 Store API。定义 head/legacy projection 的推进必须与 operation
+  `definition_committed` checkpoint 在同一 PostgreSQL 事务；恢复数据库状态与 terminal/outbox 也必须同事务。
+  此阶段仍保持零生产调用点。
+- **C2b3-2c dark coordinator**：唯一允许调用 C2b3-1 raw API 的内部 coordinator，按一次 attempt 最多推进
+  一个远端 phase 的规则执行，并提供启动时和周期性的 tenant-sharded bounded recovery。只有真 PostgreSQL 18
+  与真 Temporal 的全部 kill point 收敛后才可结束本阶段；Agent、HTTP、飞书入口仍不可达。
+- **C2b3-2d authenticated wiring**：新增唯一 definition-edit Agent 工具/控制器；旧
+  `update_schedule`、`edit_task_playbook`、`set_task_strictness`、generic pending v0 与 HTTP PATCH 永久保持
+  退役。冻结票显式保存 actor tenant/user 与 target tenant/user/task，并在原卡点击时绑定 Feishu App
+  fingerprint + message ID。terminal outbox 原地 Patch 同一张卡，session 只写固定终态事实。真卡 Gate 通过前
+  默认关闭，不得声称用户编辑已恢复。
+
+持久 phase 与允许的系统状态如下；表中任一不匹配都不得猜测修复：
+
+| operation phase | PostgreSQL head | PostgreSQL status | Temporal 可接受表示 |
+|---|---|---|---|
+| `proposal_sealed` | exact base | frozen original | exact base-original |
+| `db_quiesced` | exact base | paused + exact operation marker | exact base-original；原本 active 的 RPC 结果未知时也可能已是本 operation 的 base-paused |
+| `temporal_base_paused` | exact base | paused + marker | 原本 active：exact base-paused；原本 paused：仅复核 exact base-original |
+| `definition_committed` | exact target | paused + marker | 原本 active：exact base-paused；原本 paused：exact base-original；apply 结果未知时也可能已到各自 target 表示 |
+| `temporal_target_applied` | exact target | paused + marker | 原本 active：exact target-paused；原本 paused：直接 exact target-final |
+| `temporal_target_restored` | exact target | paused + marker | exact target-final |
+| terminal completed | exact target | frozen original、marker 已清 | exact target-final |
+
+`status` 表示 pending/executing/terminal，`phase` 始终保留最后一个已持久化的 progress checkpoint；进入
+cancelled/expired/blocked/superseded 不得用同名“终态 phase”覆盖进度。每个 progress phase 必须与其
+pause/apply/restore canonical snapshot 前缀完全一致；cancelled/expired 只能停在 `proposal_sealed`，
+completed 只能停在 `temporal_target_restored`。
+
+当前生产 `DATABASE_URL` 同时承担 migration 与 runtime，连接角色是新表 owner；owner 对表有隐式 DML 且默认
+绕过 RLS。因此 2a 的 dark 保证只来自“无 Store API + AST 零引用守卫”，不能宣称数据库权限级不可写。
+在 2d authenticated wiring 前，必须完成 migration/admin 与 runtime 权限分离，或在所有 edit 事务中可靠
+激活 scoped restricted role + tenant context，并以真生产同形连接证明；033 不给 `vane_app` 显式 DML 只是
+为该切换保留最小授权面，不是当前生产安全边界。
+
+033 同时把 `schedules` 原有的 table-level INSERT/UPDATE 收窄为 legacy 列 allowlist，明确排除
+`definition_edit_operation_id/definition_edit_fence`；2b 必须用 coordinator 专用受限角色/事务路径写 marker。
+普通 runtime 仍保留产品既有的整行 DELETE；这是“用户删任务优先、marker 随行消失”的明确生命周期语义，
+不是 marker 权限级不可清除。operation 独立保存 base 与 target 两份 exact canonical definition bytes，且分别由
+base/target head digest 绑定；schedule 与 Approved history 被级联删除后，恢复仍可严格解码自身 checkpoint，
+但必须以 schedule missing/Temporal `NotFound` 进入 blocked/quarantine，绝不能重建或继续远端写。operation/receipt
+独立留存只用于审计和终态收敛，不把“字节自包含”误当成资源仍存在。
+operation 身份、proposal、target/prepared/base snapshot 可通过不授 UPDATE 固化；pause/apply/restore 位于同一行，
+其 NULL→首次写、之后只允许 exact replay 的不可变性来自带 expected phase+lease+fence 的 Store CAS，而不是普通
+SHA 或列级 grant。若未来要求 DB 权限本身证明 append-only，应把 phase receipt 拆成只授 INSERT/SELECT 的子表。
+
+每个 Temporal RPC 前须在独立短事务中重新验证 active lease/fence、expected phase、schedule marker 和对应
+head；RPC 后只允许同一 fence checkpoint exact canonical snapshot。现有 C2b-2
+`CommitApprovedDefinitionEdit` 的历史 replay 只表示“该 confirmation 曾产生过这个 immutable version”，不授予
+任何远端写权限：current head 高于 target 时必须 `superseded` 且零 Temporal mutation；同 version 不同 digest、
+foreign remote representation、损坏 checkpoint 或 Temporal NotFound 一律 blocked/quarantine，数据库保持 paused。
+
+Prepared wire 内的 creation ownership 只能来自同 scope、已经终态成功的 create-schedule v1 operation 所保存的
+`prepared_schedule`；不得从当前 legacy 行、当前配置或调用方自报字段重建。2a codec 只能证明字节内部闭包，不能
+替代 2b Store 对该 append-only provenance 的真库核验。
+
+definition-edit/v1 在 prepared wire 中分别固化 base/target canonical projection digest；Decode 只核 exact
+Approved head、projection digest、creation ownership 与 phase checkpoint，不重新执行会演进的 spec compiler。
+只有 Build/封票入口运行 current target writer，并把 current 编译出的 timing 与 prepared target 严格对照；旧 base
+使用 retained v1 compiler，因此策略收紧只会拒绝新票，不得卡死已确认 operation 的恢复。v1 还显式冻结 task ID
+scheme、operation ID 字节上限、timing reader，以及共享 `ScheduleSpec`/`PushScope`/`PushParams`/prepared schedule
+布局；这些类型演进时必须新建 wire 并保留 v1 reader，不能直接修改 guard。
+
+隐式 `temporal-default-json-v1` converter ID 由 exact PushParams payload golden 约束，且禁止用显式自定义 converter
+重绑同一 ID；SDK 升级若改变 payload，必须 bump converter ID 并注册旧 decoder。另一个部署不变量是：存在
+nonterminal edit operation 时不得直接把唯一 Scheduler namespace 从 A 切到 B；必须先 drain/终结，或先实现按 sealed
+namespace+namespace ID 路由的 retained client。namespace 同名重建仍由 ID mismatch fail closed。两项均属于 2d
+接线/部署 Gate。
+
 恢复或迟到 replay 只有在 current Approved head **恰好等于该 operation 的 target head**，且 Temporal
 仍是该 operation 的 exact base/target pre-state 时才可继续。C2b-2 返回历史成功记录不等于获得远端写
 权限；current head 已更高时旧 operation 必须 superseded，绝不能刷新 conflict token 后覆盖新版本。
@@ -191,7 +267,7 @@ Activity result 进入 Temporal history。首版 planner 硬上限为 8 轮、16
 | C2a | mode + Approved/Adaptive schema、冻结 wire 与 fenced Store | 零调用点；默认 Compiled，动态模式仍关闭 |
 | C2b-1 | 创建双写 legacy/Approved + 关闭旧编辑旁路 | 新建任务安全停靠，仍不重开编辑、不切运行读取 |
 | C2b-2 | exact base version+digest definition CAS | 零生产调用点；证明单库原子提交与 exact replay |
-| C2b-3 | authenticated frozen proposal + PostgreSQL/Temporal 可恢复编辑 saga | 全部 kill point 过 Gate 后才重开唯一编辑入口，仍不切运行读取 |
+| C2b-3 | 2a 冻结协议 → 2b fenced Store → 2c dark coordinator → 2d authenticated wiring | 全部 kill point 过 Gate 后才重开唯一编辑入口，仍不切运行读取 |
 | C2c | 存量适配、shadow 对账并切 immutable head 读取 | 动态模式仍 feature flag 关闭 |
 | C3 | RunID/StepID 检查点、LKG、bounded `PlanFetch` | 仅 shadow，无用户推送影响 |
 | C4 | 两条首批竖切的 Boss 单任务 canary | 逐步放量，可回滚 Compiled/LKG |
