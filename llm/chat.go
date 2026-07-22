@@ -142,7 +142,9 @@ func (c *Client) requestModel(override string) string {
 
 // Chat 发起一次多轮（可带 tools）chat completions 调用。
 // 错误映射与 Complete 完全一致（复用 mapHTTPError/wrapCtxErr，见 client.go
-// Complete 的映射表注释）；客户端同样不做重试。
+// Complete 的映射表注释）；客户端同样不做重试。上游 HTTP 200 但工具协议
+// 不合法时，会返回只含计费元数据的 response + error；业务调用必须按 error
+// 失败关闭，DoChat 会消费元数据完成记账后再向外隐藏 partial response。
 func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	// 与 Complete 共用同一信号量：并发上限约束的是对上游的总请求数，
 	// 不区分调用形态。排队期间 ctx 取消要能立刻退出。
@@ -156,8 +158,9 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	start := time.Now()
 	model := c.requestModel(req.Model)
 
-	messages := make([]wireChatMessage, 0, len(req.Messages))
-	for _, m := range req.Messages {
+	safeMessages, redactedHistory := redactLeakedDSMLMessages(req.Messages)
+	messages := make([]wireChatMessage, 0, len(safeMessages))
+	for _, m := range safeMessages {
 		wm := wireChatMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
 		// assistant 历史消息的 tool_calls 必须原样回传（协议要求：每个
 		// tool 消息都要能对上 assistant 侧的 tool_call_id），丢弃会 400。
@@ -169,6 +172,10 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 			})
 		}
 		messages = append(messages, wm)
+	}
+	if redactedHistory > 0 {
+		slog.Warn("llm: 已清洗历史 DSML 协议文本",
+			"model", model, "messages", redactedHistory)
 	}
 
 	// 无 tools 时不携带该字段（omitempty 靠 nil 切片）：空数组对部分兼容
@@ -251,16 +258,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 			Arguments: tc.Function.Arguments,
 		})
 	}
-
-	// FC 场景下"空 content + 有 tool_calls"是正常形态；两者皆空才是隐性故障
-	// 信号（如思维链吃光预算），沿用 Complete 的 WARN 语义留下可检索告警。
-	if msg.Content == "" && len(toolCalls) == 0 {
-		slog.Warn("llm: 上游返回空 content 且无 tool_calls",
-			"model", respModel,
-			"finish_reason", cr.Choices[0].FinishReason,
-			"completion_tokens", cr.Usage.CompletionTokens)
-	}
-	return &ChatResponse{
+	resp := &ChatResponse{
 		Content:          msg.Content,
 		ToolCalls:        toolCalls,
 		FinishReason:     cr.Choices[0].FinishReason,
@@ -270,7 +268,55 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		CacheMissTokens:  cr.Usage.PromptCacheMissTokens,
 		Model:            respModel,
 		LatencyMs:        int(time.Since(start).Milliseconds()),
-	}, nil
+	}
+	toolEnabled := len(req.Tools) > 0
+	deepSeekV4 := isDeepSeekV4(c.provider, model, respModel)
+	finishHasToolCalls := cr.Choices[0].FinishReason == "tool_calls"
+	if toolEnabled && deepSeekV4 && (len(toolCalls) > 0) != finishHasToolCalls {
+		slog.Warn("llm: 上游 tool_calls 与 finish_reason 不一致",
+			"provider", c.provider,
+			"model", respModel,
+			"finish_reason", cr.Choices[0].FinishReason,
+			"native_tool_calls", len(toolCalls))
+		resp.Content = ""
+		resp.ToolCalls = nil
+		protocolErr := types.NewAppError(types.CodeLLMUnavailable,
+			"llm: 上游工具调用格式异常", nil)
+		protocolErr.Retryable = false
+		return resp, protocolErr
+	}
+	// DeepSeek V4 DSML in message.content is an upstream protocol leak,
+	// including mixed native+DSML responses. Never promote or preserve it.
+	if isDeepSeekV4DSML(c.provider, msg.Content, model, respModel) {
+		slog.Warn("llm: 上游返回 DSML 协议文本",
+			"provider", c.provider,
+			"model", respModel,
+			"request_has_tools", len(req.Tools) > 0,
+			"native_tool_calls", len(toolCalls))
+		resp.Content = ""
+		resp.ToolCalls = nil
+		if len(req.Tools) > 0 || len(toolCalls) > 0 {
+			protocolErr := types.NewAppError(types.CodeLLMUnavailable,
+				"llm: 上游工具调用格式异常", nil)
+			protocolErr.Retryable = false
+			return resp, protocolErr
+		}
+		// Tool-free calls include the post-pending finalizer. Returning an error
+		// there would orphan an already-created confirmation card, so provide a
+		// neutral fixed display string while still removing all protocol text.
+		resp.Content = dsmlSafeContent
+		return resp, nil
+	}
+
+	// FC 场景下"空 content + 有 tool_calls"是正常形态；两者皆空才是隐性故障
+	// 信号（如思维链吃光预算），沿用 Complete 的 WARN 语义留下可检索告警。
+	if msg.Content == "" && len(toolCalls) == 0 {
+		slog.Warn("llm: 上游返回空 content 且无 tool_calls",
+			"model", respModel,
+			"finish_reason", cr.Choices[0].FinishReason,
+			"completion_tokens", cr.Usage.CompletionTokens)
+	}
+	return resp, nil
 }
 
 // userPromptMaxBytes DoChat 记账时 UserPrompt（messages 数组 JSON）的截断上限。
@@ -314,6 +360,9 @@ func chatPromptRunes(req ChatRequest) int {
 // 数组 JSON（截断到 8KB）；Completion 记 Content，若有 ToolCalls 则记
 // "tool_calls: <json>"（FC 响应的 content 通常为空，工具调用才是有效输出）。
 func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req ChatRequest) (*ChatResponse, error) {
+	// Sanitize legacy protocol text from every role before every consumer in this
+	// function: quota estimation, outbound wire request, and ledger UserPrompt.
+	req.Messages, _ = redactLeakedDSMLMessages(req.Messages)
 	// 配额闸门（契约 §2.7）。理由与 Do 相同，见 do.go 的说明。
 	//
 	// 这条路径**比 Do 更需要它**：多轮对话把历史累积进 prompt，生产 7 天实测
@@ -361,18 +410,8 @@ func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Ch
 		MaxTokens:   req.MaxTokens,
 	}
 
-	if err != nil {
-		call.Error = err.Error()
-		// Chat 失败拿不到 resp.LatencyMs，用 DoChat 自己的计时兜底。
-		call.LatencyMs = int(time.Since(start).Milliseconds())
-	} else {
+	if resp != nil {
 		call.Model = resp.Model
-		call.Completion = resp.Content
-		if len(resp.ToolCalls) > 0 {
-			if tcJSON, tErr := json.Marshal(resp.ToolCalls); tErr == nil {
-				call.Completion = "tool_calls: " + string(tcJSON)
-			}
-		}
 		call.PromptTokens = resp.PromptTokens
 		call.CompletionTokens = resp.CompletionTokens
 		call.LatencyMs = resp.LatencyMs
@@ -390,9 +429,28 @@ func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Ch
 		}
 		call.CostUSD = CostUSD(resp.Model, hitTokens, missTokens, resp.CompletionTokens)
 	}
+	if err != nil {
+		call.Error = err.Error()
+		if resp == nil {
+			// Transport/JSON failures have no response latency metadata.
+			call.LatencyMs = int(time.Since(start).Milliseconds())
+		}
+	} else {
+		call.Completion = resp.Content
+		if len(resp.ToolCalls) > 0 {
+			if tcJSON, tErr := json.Marshal(resp.ToolCalls); tErr == nil {
+				call.Completion = "tool_calls: " + string(tcJSON)
+			}
+		}
+	}
 
 	// 与 Do 共用一个有硬上限的 detached tail：既不能因请求取消漏记，
 	// 也不能让同步 DB 写无限拖住 Activity/进程关停。
 	rec.finishCallAccounting(ctx, call, meta.UserID, estimate, call.PromptTokens+call.CompletionTokens)
-	return resp, err
+	if err != nil {
+		// Chat may return a metadata-only response for accounting. Never expose
+		// that partial response to callers which could accidentally use it.
+		return nil, err
+	}
+	return resp, nil
 }
