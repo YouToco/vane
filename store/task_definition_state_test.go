@@ -492,6 +492,7 @@ func TestTaskDefinitionStateMutatorsHaveZeroProductionCallPoints(t *testing.T) {
 	repoRoot := filepath.Dir(filepath.Dir(thisFile))
 	want := map[string]struct{}{
 		"InsertInitialApprovedDefinition": {},
+		"CommitApprovedDefinitionEdit":    {},
 		"CompareAndSwapAdaptiveState":     {},
 	}
 	var references []string
@@ -514,14 +515,9 @@ func TestTaskDefinitionStateMutatorsHaveZeroProductionCallPoints(t *testing.T) {
 			return parseErr
 		}
 		ast.Inspect(file, func(node ast.Node) bool {
-			// The guarded method bodies necessarily contain their own identifiers.
-			// Skip only those declarations, not their entire source file: a helper
-			// or future production method beside them is still a call point.
-			if declaration, ok := node.(*ast.FuncDecl); ok {
-				if _, guarded := want[declaration.Name.Name]; guarded {
-					return false
-				}
-			}
+			// Method declarations expose their name as an Ident, not a
+			// SelectorExpr, so their bodies need no exemption. In particular, do
+			// not skip a same-named wrapper: it could otherwise hide a real call.
 			selector, ok := node.(*ast.SelectorExpr)
 			if !ok {
 				return true
@@ -536,10 +532,10 @@ func TestTaskDefinitionStateMutatorsHaveZeroProductionCallPoints(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("scan C2a production call points: %v", err)
+		t.Fatalf("scan task-state production call points: %v", err)
 	}
 	if !slices.Equal(references, []string{}) {
-		t.Fatalf("C2a mutators must remain dark, found %v", references)
+		t.Fatalf("task-state mutators must remain dark, found %v", references)
 	}
 }
 

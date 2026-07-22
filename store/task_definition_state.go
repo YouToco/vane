@@ -161,7 +161,7 @@ func (s *Store) InsertInitialApprovedDefinition(
 		}
 		return existing, nil
 	}
-	if err := validateInitialDefinitionProjectionTx(ctx, tx, definition, payload); err != nil {
+	if err := validateApprovedDefinitionProjectionTx(ctx, tx, definition, payload); err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
 
@@ -544,7 +544,7 @@ func loadApprovedDefinitionByApprovalRefTx(
 		tenantID, userID, taskID, approvalRef), tenantID, userID, taskID)
 }
 
-func validateInitialDefinitionProjectionTx(
+func validateApprovedDefinitionProjectionTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	definition taskstate.ApprovedDefinitionV1,
