@@ -25,6 +25,14 @@ type ApprovedDefinitionEditParams struct {
 	ApprovalRef  string
 }
 
+type approvedDefinitionEditCommand struct {
+	expectedHead ApprovedDefinitionFence
+	definition   taskstate.ApprovedDefinitionV1
+	payload      []byte
+	digest       string
+	approvalRef  string
+}
+
 // CommitApprovedDefinitionEdit atomically appends one immutable compiled
 // definition, updates every retained legacy projection, and advances the exact
 // schedule head. It intentionally has zero production call points in C2b-2.
@@ -38,32 +46,10 @@ func (s *Store) CommitApprovedDefinitionEdit(
 	ctx context.Context,
 	p ApprovedDefinitionEditParams,
 ) (ApprovedDefinitionVersionRecord, error) {
-	if p.ExpectedHead.Version <= 0 || p.ExpectedHead.Version == math.MaxInt64 ||
-		!validTaskStateDigest(p.ExpectedHead.Digest) {
-		return ApprovedDefinitionVersionRecord{}, taskStateValidation(
-			"approved definition edit base is invalid")
-	}
-	payload, digest, definition, err := encodeApprovedDefinitionForStore(p.Definition)
+	command, err := prepareApprovedDefinitionEditCurrent(p)
 	if err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
-	if definition.Intent != definition.PlaybookContent {
-		return ApprovedDefinitionVersionRecord{}, taskStateValidation(
-			"approved definition intent is not representable by the legacy projection")
-	}
-	// legacy_subscriptions is a one-way compatibility marker for old/baseline
-	// definitions, not a user-approved long-term source plan. A confirmed v2+
-	// edit must materialize the exact sources it authorizes.
-	if definition.SourceScope != taskstate.SourceScopeApprovedPlan {
-		return ApprovedDefinitionVersionRecord{}, taskStateValidation(
-			"approved definition edit requires an exact approved source plan")
-	}
-	if !validTaskStateReference(p.ApprovalRef, 1024) {
-		return ApprovedDefinitionVersionRecord{}, taskStateValidation(
-			"approved definition edit confirmation reference is invalid")
-	}
-	approvalRef := p.ApprovalRef
-	nextVersion := p.ExpectedHead.Version + 1
 
 	tx, err := s.beginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -72,27 +58,97 @@ func (s *Store) CommitApprovedDefinitionEdit(
 	}
 	defer rollbackTaskCreationTransaction(ctx, tx)
 
-	head, err := lockTaskDefinitionEditScope(ctx, tx, definition.TenantID,
-		definition.UserID, definition.TaskID)
+	head, err := lockTaskDefinitionEditScope(ctx, tx, command.definition.TenantID,
+		command.definition.UserID, command.definition.TaskID)
 	if err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
 	existing, err := loadApprovedDefinitionByApprovalRefTx(ctx, tx,
-		definition.TenantID, definition.UserID, definition.TaskID, approvalRef)
+		command.definition.TenantID, command.definition.UserID,
+		command.definition.TaskID, command.approvalRef)
 	if err == nil {
-		return replayApprovedDefinitionEdit(ctx, tx, head, p.ExpectedHead,
-			existing, definition, payload, digest)
+		record, replayErr := replayApprovedDefinitionEdit(
+			ctx, tx, head, command.expectedHead, existing,
+			command.definition, command.payload, command.digest,
+		)
+		if replayErr != nil {
+			return ApprovedDefinitionVersionRecord{}, replayErr
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return ApprovedDefinitionVersionRecord{}, taskStateDatabaseError(
+				"commit approved definition edit replay", err)
+		}
+		return record, nil
 	}
 	if !errors.Is(err, types.ErrNotFound) {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
 
+	record, err := appendApprovedDefinitionEditTx(ctx, tx, head, command)
+	if err != nil {
+		return ApprovedDefinitionVersionRecord{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ApprovedDefinitionVersionRecord{}, taskStateDatabaseError(
+			"commit approved definition edit", err)
+	}
+	return record, nil
+}
+
+func prepareApprovedDefinitionEditCurrent(
+	p ApprovedDefinitionEditParams,
+) (approvedDefinitionEditCommand, error) {
+	if p.ExpectedHead.Version <= 0 || p.ExpectedHead.Version == math.MaxInt64 ||
+		!validTaskStateDigest(p.ExpectedHead.Digest) {
+		return approvedDefinitionEditCommand{}, taskStateValidation(
+			"approved definition edit base is invalid")
+	}
+	payload, digest, definition, err := encodeApprovedDefinitionForStore(p.Definition)
+	if err != nil {
+		return approvedDefinitionEditCommand{}, err
+	}
+	if definition.Intent != definition.PlaybookContent {
+		return approvedDefinitionEditCommand{}, taskStateValidation(
+			"approved definition intent is not representable by the legacy projection")
+	}
+	// legacy_subscriptions is a one-way compatibility marker for old/baseline
+	// definitions, not a user-approved long-term source plan. A confirmed v2+
+	// edit must materialize the exact sources it authorizes.
+	if definition.SourceScope != taskstate.SourceScopeApprovedPlan {
+		return approvedDefinitionEditCommand{}, taskStateValidation(
+			"approved definition edit requires an exact approved source plan")
+	}
+	if !validTaskStateReference(p.ApprovalRef, 1024) {
+		return approvedDefinitionEditCommand{}, taskStateValidation(
+			"approved definition edit confirmation reference is invalid")
+	}
+	return approvedDefinitionEditCommand{
+		expectedHead: p.ExpectedHead,
+		definition:   definition,
+		payload:      bytes.Clone(payload),
+		digest:       digest,
+		approvalRef:  p.ApprovalRef,
+	}, nil
+}
+
+// appendApprovedDefinitionEditTx performs only the new append path. The
+// caller must already hold the schedule row lock and owns commit/rollback.
+// Historical approval-ref replay is deliberately excluded so a durable edit
+// operation can never mistake an old successful version for current write
+// authority.
+func appendApprovedDefinitionEditTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	head taskDefinitionHead,
+	command approvedDefinitionEditCommand,
+) (ApprovedDefinitionVersionRecord, error) {
+	definition := command.definition
 	if head.Version == nil || head.Digest == nil {
 		return ApprovedDefinitionVersionRecord{}, taskStateConflict(
 			"approved definition edit requires an immutable head")
 	}
-	if *head.Version != p.ExpectedHead.Version ||
-		!constantTimeTaskStateDigestEqual(*head.Digest, p.ExpectedHead.Digest) {
+	if *head.Version != command.expectedHead.Version ||
+		!constantTimeTaskStateDigestEqual(*head.Digest, command.expectedHead.Digest) {
 		return ApprovedDefinitionVersionRecord{}, taskStateConflict(
 			"approved definition head changed before the edit")
 	}
@@ -101,11 +157,11 @@ func (s *Store) CommitApprovedDefinitionEdit(
 			"approved definition edit mode differs from the current head")
 	}
 	base, err := loadApprovedDefinitionVersionTx(ctx, tx, definition.TenantID,
-		definition.UserID, definition.TaskID, p.ExpectedHead.Version)
+		definition.UserID, definition.TaskID, command.expectedHead.Version)
 	if err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
-	if !constantTimeTaskStateDigestEqual(base.Digest, p.ExpectedHead.Digest) ||
+	if !constantTimeTaskStateDigestEqual(base.Digest, command.expectedHead.Digest) ||
 		base.Definition.ExecutionMode != head.Mode {
 		return ApprovedDefinitionVersionRecord{}, taskStateIntegrity()
 	}
@@ -122,8 +178,9 @@ func (s *Store) CommitApprovedDefinitionEdit(
 	}
 
 	record := ApprovedDefinitionVersionRecord{
-		Definition: definition, Version: nextVersion, Digest: digest,
-		Payload: bytes.Clone(payload), ApprovalRef: approvalRef,
+		Definition: definition, Version: command.expectedHead.Version + 1,
+		Digest: command.digest, Payload: bytes.Clone(command.payload),
+		ApprovalRef: command.approvalRef,
 	}
 	err = tx.QueryRow(ctx,
 		`INSERT INTO task_approved_definition_versions (
@@ -164,7 +221,7 @@ func (s *Store) CommitApprovedDefinitionEdit(
 		definition.NLDescription, []byte(definition.SpecJSON),
 		[]byte(definition.ScopeJSON), string(definition.Strictness),
 		definition.ExecutionMode, record.Version, record.Digest,
-		p.ExpectedHead.Version, p.ExpectedHead.Digest, head.Mode,
+		command.expectedHead.Version, command.expectedHead.Digest, head.Mode,
 	)
 	if err != nil {
 		return ApprovedDefinitionVersionRecord{}, taskStateDatabaseError(
@@ -177,10 +234,6 @@ func (s *Store) CommitApprovedDefinitionEdit(
 	if err := validateApprovedDefinitionProjectionTx(
 		ctx, tx, definition, record.Payload); err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return ApprovedDefinitionVersionRecord{}, taskStateDatabaseError(
-			"commit approved definition edit", err)
 	}
 	return record, nil
 }
@@ -262,10 +315,6 @@ func replayApprovedDefinitionEdit(
 			ctx, tx, existing.Definition, existing.Payload); err != nil {
 			return ApprovedDefinitionVersionRecord{}, err
 		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return ApprovedDefinitionVersionRecord{}, taskStateDatabaseError(
-			"commit approved definition edit replay", err)
 	}
 	return existing, nil
 }

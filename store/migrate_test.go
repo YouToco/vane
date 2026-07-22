@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+const latestMigrationVersion int64 = 34
+
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
 var wantTables = []string{
@@ -136,6 +138,9 @@ func TestMigrate(t *testing.T) {
 	defer st.Close()
 
 	versionAfterFirst := gooseVersion(t, st)
+	if versionAfterFirst != latestMigrationVersion {
+		t.Fatalf("迁移版本=%d，want %d", versionAfterFirst, latestMigrationVersion)
+	}
 
 	// 迁移必须幂等：重复执行不报错，且不重复应用（goose 版本号不变）。
 	if err := Migrate(ctx, dbURL); err != nil {
@@ -253,8 +258,8 @@ func TestMigrateConcurrentFreshDB(t *testing.T) {
 		`SELECT COALESCE(MAX(version_id), 0) FROM goose_db_version`).Scan(&version); err != nil {
 		t.Fatalf("查询 goose_db_version 失败: %v", err)
 	}
-	if version == 0 {
-		t.Error("并发迁移后 goose_db_version 为空，迁移未生效")
+	if version != latestMigrationVersion {
+		t.Errorf("并发迁移后 goose_db_version=%d，want %d", version, latestMigrationVersion)
 	}
 	for _, table := range wantTables {
 		var exists bool

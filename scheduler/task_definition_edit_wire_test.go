@@ -353,6 +353,71 @@ func TestTaskDefinitionEditBaseSnapshotWire_RejectsWrongRevisionAndShape(t *test
 	}
 }
 
+func TestTaskDefinitionEditPhaseSnapshotWire_ExactBindings(t *testing.T) {
+	fixture := newTaskDefinitionEditFixture(t, TaskDefinitionEditOriginalStateActive)
+	prepared, _ := fixture.prepare(
+		t,
+		"edit-phase-snapshot-wire",
+		taskDefinitionEditHead(1, "a"),
+		taskDefinitionEditHead(2, "b"),
+		fixture.base,
+		changedTaskDefinitionEditDefinition(fixture.base, "phase-snapshot"),
+	)
+	tests := []struct {
+		name           string
+		phase          TaskDefinitionEditPhase
+		representation PreparedTaskDefinitionEditSchedule
+	}{
+		{name: "base original", phase: TaskDefinitionEditPhaseBaseOriginal, representation: prepared.BaseOriginal},
+		{name: "base paused", phase: TaskDefinitionEditPhaseBasePaused, representation: prepared.BasePaused},
+		{name: "target paused", phase: TaskDefinitionEditPhaseTargetPaused, representation: prepared.TargetPaused},
+		{name: "target final", phase: TaskDefinitionEditPhaseTargetFinal, representation: prepared.TargetFinal},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			snapshot := taskDefinitionEditSnapshotFromRevision(
+				prepared, testCase.phase, testCase.representation, "Ag",
+			)
+			raw, err := EncodeTaskDefinitionEditPhaseSnapshot(prepared, snapshot)
+			if err != nil {
+				t.Fatalf("EncodeTaskDefinitionEditPhaseSnapshot() error = %v", err)
+			}
+			decoded, err := DecodeTaskDefinitionEditPhaseSnapshot(prepared, raw)
+			if err != nil {
+				t.Fatalf("DecodeTaskDefinitionEditPhaseSnapshot() error = %v", err)
+			}
+			if decoded != snapshot {
+				t.Fatalf("decoded snapshot = %+v, want %+v", decoded, snapshot)
+			}
+
+			wrongRepresentation := snapshot
+			wrongRepresentation.RepresentationDigest = prepared.TargetFinal.Digest
+			if wrongRepresentation.RepresentationDigest == snapshot.RepresentationDigest {
+				wrongRepresentation.RepresentationDigest = strings.Repeat("f", 64)
+			}
+			for name, invalid := range map[string][]byte{
+				"non canonical": append(bytes.Clone(raw), '\n'),
+				"unknown field": insertTaskDefinitionEditWireField(raw, `,"future":true`),
+				"wrong representation": func() []byte {
+					encoded, marshalErr := json.Marshal(wrongRepresentation)
+					if marshalErr != nil {
+						t.Fatalf("marshal wrong representation: %v", marshalErr)
+					}
+					return encoded
+				}(),
+			} {
+				t.Run(name, func(t *testing.T) {
+					if _, err := DecodeTaskDefinitionEditPhaseSnapshot(
+						prepared, invalid,
+					); !errors.Is(err, ErrTaskScheduleInvalid) {
+						t.Fatalf("DecodeTaskDefinitionEditPhaseSnapshot() error = %v, want invalid", err)
+					}
+				})
+			}
+		})
+	}
+}
+
 func insertTaskDefinitionEditWireField(raw []byte, field string) []byte {
 	result := bytes.Clone(raw[:len(raw)-1])
 	result = append(result, field...)

@@ -71,6 +71,72 @@ type TaskDefinitionEditLease struct {
 	Fence          int64
 }
 
+// TaskDefinitionEditScope is the complete immutable identity used before an
+// operation has a fencing token. Requiring actor and target fields on every
+// lookup keeps a future team-capable protocol from weakening the owner-only V1
+// boundary by accident.
+type TaskDefinitionEditScope struct {
+	ID             string
+	TenantID       int64
+	UserID         int64
+	TargetTenantID int64
+	TargetUserID   int64
+	TaskID         string
+}
+
+// CreateTaskDefinitionEditOperationParams contains only the five canonical
+// frozen checkpoints. Store decodes them and derives every identity, digest,
+// status, and timestamp; callers cannot separately claim trusted metadata.
+type CreateTaskDefinitionEditOperationParams struct {
+	CanonicalProposal []byte
+	BaseDefinition    []byte
+	TargetDefinition  []byte
+	PreparedEdit      []byte
+	BaseSnapshot      []byte
+}
+
+// AcquireTaskDefinitionEditOperationParams confirms or recovers one exact
+// operation. LeaseOwner is generated once before the call so a response-lost
+// replay by the same owner can recover the same active fence. The Store owns
+// all database-clock deadlines and the fixed takeover grace.
+type AcquireTaskDefinitionEditOperationParams struct {
+	Scope           TaskDefinitionEditScope
+	LeaseOwner      string
+	LeaseDuration   time.Duration
+	ReceiptProvider string
+	ReceiptTarget   string
+}
+
+// CancelTaskDefinitionEditOperationParams linearizes a pre-confirmation
+// cancellation against acquisition on the same operation row.
+type CancelTaskDefinitionEditOperationParams struct {
+	Scope           TaskDefinitionEditScope
+	ReceiptProvider string
+	ReceiptTarget   string
+}
+
+// ExpireTaskDefinitionEditOperationParams tombstones an expired, unconfirmed
+// proposal. Provider and target may both be empty for an audit-only suppressed
+// receipt, or both be present when an authenticated callback supplied the
+// original confirmation resource.
+type ExpireTaskDefinitionEditOperationParams struct {
+	Scope           TaskDefinitionEditScope
+	ReceiptProvider string
+	ReceiptTarget   string
+}
+
+// TaskDefinitionEditBlockReason is a fixed, non-sensitive terminal reason.
+// Raw database, Temporal, or provider errors must never enter the durable
+// operation, user card, or Agent session.
+type TaskDefinitionEditBlockReason string
+
+const (
+	TaskDefinitionEditBlockScheduleDeleted   TaskDefinitionEditBlockReason = "schedule_deleted"
+	TaskDefinitionEditBlockTemporalNotFound  TaskDefinitionEditBlockReason = "temporal_not_found"
+	TaskDefinitionEditBlockUnsafeRemoteState TaskDefinitionEditBlockReason = "unsafe_remote_state"
+	TaskDefinitionEditBlockCheckpointInvalid TaskDefinitionEditBlockReason = "checkpoint_invalid"
+)
+
 // TaskDefinitionEditOperation is one durable edit proposal/execution. All
 // proposal and Temporal fields are exact PostgreSQL BYTEA checkpoints; their
 // sibling digest fields are database-verified SHA-256 values.
@@ -137,6 +203,17 @@ func (o TaskDefinitionEditOperation) Lease() TaskDefinitionEditLease {
 	}
 }
 
+func (o TaskDefinitionEditOperation) Scope() TaskDefinitionEditScope {
+	return TaskDefinitionEditScope{
+		ID:             o.ID,
+		TenantID:       o.TenantID,
+		UserID:         o.UserID,
+		TargetTenantID: o.TargetTenantID,
+		TargetUserID:   o.TargetUserID,
+		TaskID:         o.TaskID,
+	}
+}
+
 type TaskDefinitionEditReceiptStatus string
 
 const (
@@ -161,6 +238,20 @@ type TaskDefinitionEditReceiptLease struct {
 	UserID     int64
 	LeaseOwner string
 	Fence      int64
+}
+
+type AcquireTaskDefinitionEditReceiptParams struct {
+	ID            int64
+	TenantID      int64
+	UserID        int64
+	LeaseOwner    string
+	LeaseDuration time.Duration
+}
+
+type RecordTaskDefinitionEditReceiptSendFailureParams struct {
+	Lease      TaskDefinitionEditReceiptLease
+	Class      TaskDefinitionEditReceiptFailureClass
+	RetryAfter time.Duration
 }
 
 // TaskDefinitionEditReceipt is one durable patch of the original confirmation

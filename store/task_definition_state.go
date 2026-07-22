@@ -676,19 +676,20 @@ func validateApprovedDefinitionProjectionTx(
 	// that whole content, it is the only lossless migration surrogate. Missing or
 	// empty playbooks remain headless and are reported by C2c instead of inventing
 	// an intent from a display label.
-	candidate, err := taskstate.BuildApprovedDefinitionV1(
-		taskstate.ApprovedDefinitionInputV1{
-			TenantID: definition.TenantID, UserID: definition.UserID,
-			TaskID: definition.TaskID, Intent: playbookContent,
-			NLDescription: nlDescription, SpecJSON: specJSON, ScopeJSON: scopeJSON,
-			PlaybookContent: playbookContent, SourceScope: sourceScope,
-			FetchPlan: fetchPlan, Strictness: strictness, Sources: approvedSources,
-			ExecutionMode:  definition.ExecutionMode,
-			DeliveryPolicy: taskstate.DeliveryPolicyOwnerFeishu,
-			BudgetPolicy:   taskstate.BudgetPolicyInheritTenantQuota,
-		})
-	if err != nil {
-		return taskStateConflict("task projection cannot form an approved definition")
+	// Projection verification is a retained-reader path. Construct the frozen V1
+	// value directly instead of calling BuildApprovedDefinitionV1, whose current
+	// writer registry may intentionally reject a capability/config which was
+	// valid when an already-sealed operation was created.
+	candidate := taskstate.ApprovedDefinitionV1{
+		SchemaVersion: taskstate.ApprovedDefinitionSchemaVersionV1,
+		TenantID:      definition.TenantID, UserID: definition.UserID,
+		TaskID: definition.TaskID, Intent: playbookContent,
+		NLDescription: nlDescription, SpecJSON: specJSON, ScopeJSON: scopeJSON,
+		PlaybookContent: playbookContent, SourceScope: sourceScope,
+		FetchPlan: fetchPlan, Strictness: strictness, Sources: approvedSources,
+		ExecutionMode:  definition.ExecutionMode,
+		DeliveryPolicy: taskstate.DeliveryPolicyOwnerFeishu,
+		BudgetPolicy:   taskstate.BudgetPolicyInheritTenantQuota,
 	}
 	candidatePayload, err := taskstate.EncodeApprovedDefinitionV1(candidate)
 	if err != nil || !bytes.Equal(candidatePayload, wantPayload) {
