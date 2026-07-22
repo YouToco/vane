@@ -34,6 +34,30 @@ version+digest fence，并把该 basis 随行持久化；head 已变化的旧 ru
 成为 LKG。C2c 构造运行快照时必须在同一数据库事务内读取 definition、Adaptive 与 head，不能在
 内存里拼接两个独立查询。
 
+### 2.1 C2b 定义写控制面与跨系统编辑
+
+C2b 按不可跳级的子列车落地：C2b-1 让创建双写 legacy/Approved 并关闭危险旧编辑旁路，C2b-2 以
+exact base version+digest CAS 追加 Approved Definition，C2b-3 才把确认、PostgreSQL quiesce、定义提交和
+Temporal Schedule 更新编排成可恢复事务。确认票必须同时绑定认证 actor、Tenant/User/Task scope、
+base head、候选 definition 原始字节及 digest，以及 base/target 两份完整 Temporal 表示；确认后不得再
+调用 LLM、重新编译或按进程当前配置重建候选。旧 generic pending action、HTTP PATCH 和分段 Store 写入
+都不是合法旁路。
+
+C2b-3 编辑时先在 PostgreSQL 保存原状态并把 active task 置为 paused，阻断已派发 run 的后续付费与写
+副作用；然后用 raw Temporal `UpdateSchedule` 和刚刚 `Describe` 取得的 exact conflict token，依次完成
+base-active→base-paused、base-paused→target-paused。每个 phase 的 request ID 必须由冻结 operation 与
+payload 确定性派生，每次写后都用 detached bounded `Describe` 严格核对完整 spec/action/policy/state，
+不能把 RPC success 当成提交证明，也不能使用 SDK 的无条件 Update/Pause/Unpause。原本 paused 的任务
+保持 paused；原本 active 的任务先把 Temporal 恢复为 exact target-active，最后才 CAS 恢复 PostgreSQL
+active。C2b3-1 只交付这些 raw CAS 原语并保持零生产调用点，持久 operation、确认入口与 receipt/outbox
+分别由后续子列车接线。
+
+恢复或迟到 replay 只有在 current Approved head **恰好等于该 operation 的 target head**，且 Temporal
+仍是该 operation 的 exact base/target pre-state 时才可继续。C2b-2 返回历史成功记录不等于获得远端写
+权限；current head 已更高时旧 operation 必须 superseded，绝不能刷新 conflict token 后覆盖新版本。
+Temporal `NotFound` 表示删除胜出，禁止重建；任何不属于冻结 base/target 的远端表示都进入 blocked/
+quarantine 并保持数据库 paused，不能猜测或收养。
+
 ## 3. Run Snapshot：每次运行只有一个事实版本
 
 每个 Temporal run 在任何网络、LLM、数据库写入或推送副作用前创建一次不可变运行快照，冻结：
@@ -165,7 +189,9 @@ Activity result 进入 Temporal history。首版 planner 硬上限为 8 轮、16
 | C1a | 强类型非敏感 policy DTO + 固定 v1 payload reader | 零调用点；先封住密钥边界与历史重解释风险 |
 | C1b | versioned `PrepareRun` + Compiled 全链按 snapshot ref 消费 | 存量仍 Compiled，行为等价且单 run 不漂移 |
 | C2a | mode + Approved/Adaptive schema、冻结 wire 与 fenced Store | 零调用点；默认 Compiled，动态模式仍关闭 |
-| C2b | 完整提案确认 + definition CAS 唯一写控制面 | 封住 HTTP/旧 pending/分段写旁路，仍不切运行读取 |
+| C2b-1 | 创建双写 legacy/Approved + 关闭旧编辑旁路 | 新建任务安全停靠，仍不重开编辑、不切运行读取 |
+| C2b-2 | exact base version+digest definition CAS | 零生产调用点；证明单库原子提交与 exact replay |
+| C2b-3 | authenticated frozen proposal + PostgreSQL/Temporal 可恢复编辑 saga | 全部 kill point 过 Gate 后才重开唯一编辑入口，仍不切运行读取 |
 | C2c | 存量适配、shadow 对账并切 immutable head 读取 | 动态模式仍 feature flag 关闭 |
 | C3 | RunID/StepID 检查点、LKG、bounded `PlanFetch` | 仅 shadow，无用户推送影响 |
 | C4 | 两条首批竖切的 Boss 单任务 canary | 逐步放量，可回滚 Compiled/LKG |
