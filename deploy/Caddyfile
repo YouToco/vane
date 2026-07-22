@@ -8,5 +8,15 @@
 # 若需回滚到 VPS 托管：恢复 vane A 记录 → 188.253.125.238，并从 git 历史找回主域 site block
 # （本文件 2026-07-18 前版本）+ compose 的 ./web 卷 + vane-web CI 的 scp 三步。
 api.vane.zhuoqidev.com {
+	# clash 订阅：由 Caddy 直接从 /data 提供静态文件
+	handle /t06knmXR2nupepPf/* {
+		root * /data
+		file_server
+	}
+	handle /clash-sub.yaml {
+		root * /data
+		file_server
+	}
+	# 其余请求反代到 Vane
 	reverse_proxy 127.0.0.1:8080
 }
