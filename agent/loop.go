@@ -1410,6 +1410,12 @@ func (l *Loop) scrubUntrustedHistory(msgs []llm.ChatMessage) []llm.ChatMessage {
 	if len(msgs) == 0 {
 		return msgs
 	}
+	// 修复部署前，DeepSeek V4 曾把内部 DSML 工具协议写进会话 content，
+	// 生产还观察到它被下一层错误归类为 user 消息；它既不是用户意图/可见回复，
+	// 也绝不能在下一轮与完整工具面同屏。
+	// 这里在 load/save 共用的边界按值清洗，并保留原生 ToolCalls，避免破坏
+	// assistant/tool 的 tool_call_id 配对。llm.Chat 出站还会再做一次纵深防御。
+	msgs = redactLegacyDSMLHistory(msgs)
 	out := make([]llm.ChatMessage, 0, len(msgs))
 	for i := 0; i < len(msgs); {
 		// 正常历史以 user 开始。孤儿 tool 消息无法证明来源且可能带外部原文，
@@ -1465,6 +1471,24 @@ func (l *Loop) scrubUntrustedHistory(msgs []llm.ChatMessage) []llm.ChatMessage {
 		i = j
 	}
 	return out
+}
+
+func redactLegacyDSMLHistory(msgs []llm.ChatMessage) []llm.ChatMessage {
+	var redacted []llm.ChatMessage
+	for i, msg := range msgs {
+		safe, ok := llm.RedactLeakedDSMLContent(msg.Content)
+		if !ok {
+			continue
+		}
+		if redacted == nil {
+			redacted = append([]llm.ChatMessage(nil), msgs...)
+		}
+		redacted[i].Content = safe
+	}
+	if redacted == nil {
+		return msgs
+	}
+	return redacted
 }
 
 // redactLatestExternalInput 删除最后一个 user turn 的完整内容及模型派生输出。

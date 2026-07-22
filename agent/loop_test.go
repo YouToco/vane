@@ -964,6 +964,67 @@ func TestHandleMessage_ScrubsLegacyUntrustedHistoryBeforeModelRequest(t *testing
 	}
 }
 
+func TestHandleMessage_ScrubsLegacyDSMLHistoryBeforeRequestAndSave(t *testing.T) {
+	const leaked = `<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="create_schedule">
+<｜｜DSML｜｜parameter name="existing_source_ids" array="true">[26]</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>`
+	fs := newFakeStore()
+	sess, _ := fs.CreateAgentSession(context.Background(), 7)
+	legacy := []llm.ChatMessage{
+		{Role: "user", Content: leaked},
+		{Role: "assistant", Content: leaked},
+	}
+	raw, _ := json.Marshal(legacy)
+	fs.sessions[sess.ID].Messages = raw
+
+	var got llm.ChatRequest
+	l := newTestLoop(t, fs, func(_ context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+		got = req
+		return &llm.ChatResponse{Content: "请说明下一步。", FinishReason: "stop"}, nil
+	}, &fakeTool{name: "create_schedule", mutating: true})
+
+	if _, err := l.HandleMessage(context.Background(), 7, "继续"); err != nil {
+		t.Fatal(err)
+	}
+	requestRaw, _ := json.Marshal(got.Messages)
+	if strings.Contains(string(requestRaw), "DSML") || strings.Contains(string(requestRaw), "[26]") {
+		t.Fatalf("部署前 DSML 不得重发给模型: %s", requestRaw)
+	}
+	persistedRaw, _ := json.Marshal(persistedMessages(t, fs))
+	if strings.Contains(string(persistedRaw), "DSML") || strings.Contains(string(persistedRaw), "[26]") {
+		t.Fatalf("部署前 DSML 不得再次持久化: %s", persistedRaw)
+	}
+	if len(fs.actions) != 0 {
+		t.Fatalf("历史 DSML 不得创建 pending action: %d", len(fs.actions))
+	}
+}
+
+func TestRedactLegacyDSMLHistory_PreservesNativeToolCallPairing(t *testing.T) {
+	const leaked = `<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="list_sources">`
+	in := []llm.ChatMessage{
+		{Role: "user", Content: leaked},
+		{Role: "assistant", Content: leaked, ToolCalls: []llm.ToolCall{{
+			ID: "native-1", Name: "list_sources", Arguments: `{}`,
+		}}},
+		{Role: "tool", ToolCallID: "native-1", Content: leaked},
+	}
+	got := redactLegacyDSMLHistory(in)
+	for i, msg := range got {
+		if strings.Contains(msg.Content, "DSML") || msg.Content == "" {
+			t.Fatalf("第 %d 条历史 DSML 应替换成固定非空占位: %+v", i, msg)
+		}
+	}
+	if len(got[1].ToolCalls) != 1 || got[1].ToolCalls[0].ID != "native-1" ||
+		got[2].ToolCallID != "native-1" {
+		t.Fatalf("清洗不得破坏原生 tool_call 配对: %+v", got)
+	}
+	if in[0].Content != leaked || in[1].Content != leaked || in[2].Content != leaked {
+		t.Fatal("清洗必须按值复制，不能修改调用方历史切片")
+	}
+}
+
 func TestScrubUntrustedHistory_LegacyInputsCallbacksAndPending(t *testing.T) {
 	l := newTestLoop(t, newFakeStore(), (&scriptedChat{}).fn)
 
