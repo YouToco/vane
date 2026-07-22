@@ -1,0 +1,346 @@
+package definitioneditwire
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"os"
+	"strings"
+	"testing"
+)
+
+type componentFixtureV1 struct {
+	BaseDefinition   json.RawMessage `json:"base_definition"`
+	TargetDefinition json.RawMessage `json:"target_definition"`
+	PreparedEdit     json.RawMessage `json:"prepared_edit"`
+	BaseSnapshot     json.RawMessage `json:"base_snapshot"`
+}
+
+func TestDecodeFrozenProposal_CanonicalBindings(t *testing.T) {
+	fixture, proposal := loadFixture(t)
+	frozen, err := DecodeFrozenProposal(
+		proposal, fixture.BaseDefinition, fixture.TargetDefinition,
+		fixture.PreparedEdit, fixture.BaseSnapshot,
+	)
+	if err != nil {
+		t.Fatalf("DecodeFrozenProposal() error = %v", err)
+	}
+	if frozen.Proposal.OperationID != frozen.Prepared.OperationID ||
+		frozen.Proposal.Target.TaskID != frozen.Prepared.Creation.TaskID ||
+		frozen.BaseSnapshot.Phase != SnapshotPhaseBaseOriginal ||
+		frozen.ProposalDigest != digest(proposal) {
+		t.Fatalf("decoded frozen proposal differs: %+v", frozen.Proposal)
+	}
+	creation, err := CanonicalCreation(frozen.Prepared)
+	if err != nil {
+		t.Fatalf("CanonicalCreation() error = %v", err)
+	}
+	wantCreation, err := json.Marshal(frozen.Prepared.Creation)
+	if err != nil || !bytes.Equal(creation, wantCreation) {
+		t.Fatalf("creation provenance differs: %v", err)
+	}
+
+	fixture.PreparedEdit[0] ^= 1
+	fixture.BaseSnapshot[0] ^= 1
+	if bytes.Equal(frozen.PreparedEditBytes, fixture.PreparedEdit) ||
+		bytes.Equal(frozen.BaseSnapshotBytes, fixture.BaseSnapshot) {
+		t.Fatal("frozen proposal retained caller-owned byte aliases")
+	}
+}
+
+func TestDecodeFrozenProposal_RejectsExactAndCrossSplicedWire(t *testing.T) {
+	fixture, proposalRaw := loadFixture(t)
+	var proposal ProposalV1
+	if err := json.Unmarshal(proposalRaw, &proposal); err != nil {
+		t.Fatal(err)
+	}
+	var prepared PreparedEditV1
+	if err := json.Unmarshal(fixture.PreparedEdit, &prepared); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot SnapshotV1
+	if err := json.Unmarshal(fixture.BaseSnapshot, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	splicedPrepared := prepared
+	splicedPrepared.OperationID += "-other"
+	splicedPreparedRaw := mustMarshal(t, splicedPrepared)
+	splicedProposal := proposal
+	splicedProposal.PreparedEditDigest = digest(splicedPreparedRaw)
+
+	wrongSnapshot := snapshot
+	wrongSnapshot.Phase = SnapshotPhaseTargetFinal
+	wrongSnapshot.RepresentationDigest = prepared.TargetFinal.Digest
+	wrongSnapshotRaw := mustMarshal(t, wrongSnapshot)
+	wrongSnapshotProposal := proposal
+	wrongSnapshotProposal.BaseSnapshotDigest = digest(wrongSnapshotRaw)
+
+	unsafePrepared := prepared
+	unsafePrepared.TargetFinal.State.Paused = true
+	unsafePreparedRaw := mustMarshal(t, unsafePrepared)
+	unsafeProposal := proposal
+	unsafeProposal.PreparedEditDigest = digest(unsafePreparedRaw)
+
+	tests := []struct {
+		name         string
+		proposal     []byte
+		prepared     []byte
+		baseSnapshot []byte
+	}{
+		{
+			name: "proposal leading whitespace", proposal: append([]byte(" "), proposalRaw...),
+			prepared: fixture.PreparedEdit, baseSnapshot: fixture.BaseSnapshot,
+		},
+		{
+			name: "prepared unknown nested field", proposal: proposalRaw,
+			prepared: bytes.Replace(fixture.PreparedEdit,
+				[]byte(`"base_head":{"version"`), []byte(`"base_head":{"future":true,"version"`), 1),
+			baseSnapshot: fixture.BaseSnapshot,
+		},
+		{
+			name: "proposal prepared digest splice", proposal: proposalRaw,
+			prepared: splicedPreparedRaw, baseSnapshot: fixture.BaseSnapshot,
+		},
+		{
+			name: "prepared operation scope splice", proposal: mustMarshal(t, splicedProposal),
+			prepared: splicedPreparedRaw, baseSnapshot: fixture.BaseSnapshot,
+		},
+		{
+			name: "base snapshot is later phase", proposal: mustMarshal(t, wrongSnapshotProposal),
+			prepared: fixture.PreparedEdit, baseSnapshot: wrongSnapshotRaw,
+		},
+		{
+			name: "unsafe active restore", proposal: mustMarshal(t, unsafeProposal),
+			prepared: unsafePreparedRaw, baseSnapshot: fixture.BaseSnapshot,
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := DecodeFrozenProposal(
+				testCase.proposal, fixture.BaseDefinition, fixture.TargetDefinition,
+				testCase.prepared, testCase.baseSnapshot,
+			)
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("DecodeFrozenProposal() error = %v, want ErrInvalid", err)
+			}
+		})
+	}
+}
+
+func TestDecodePhaseSnapshotBytes_BindsExactPreparedRepresentation(t *testing.T) {
+	fixture, _ := loadFixture(t)
+	var prepared PreparedEditV1
+	if err := json.Unmarshal(fixture.PreparedEdit, &prepared); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := SnapshotV1{
+		TaskID:               prepared.Creation.TaskID,
+		RequestDigest:        prepared.RequestDigest,
+		Phase:                SnapshotPhaseTargetPaused,
+		RepresentationDigest: prepared.TargetPaused.Digest,
+		Revision:             "Aw",
+	}
+	raw := mustMarshal(t, snapshot)
+	decoded, err := DecodePhaseSnapshotBytes(fixture.PreparedEdit, raw)
+	if err != nil {
+		t.Fatalf("DecodePhaseSnapshotBytes() error = %v", err)
+	}
+	if decoded != snapshot {
+		t.Fatalf("decoded snapshot = %+v, want %+v", decoded, snapshot)
+	}
+
+	for name, invalidRaw := range map[string][]byte{
+		"non canonical": append([]byte("\n"), raw...),
+		"wrong digest": mustMarshal(t, func() SnapshotV1 {
+			value := snapshot
+			value.RepresentationDigest = prepared.BasePaused.Digest
+			return value
+		}()),
+		"padded revision": mustMarshal(t, func() SnapshotV1 {
+			value := snapshot
+			value.Revision = "Aw=="
+			return value
+		}()),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodePhaseSnapshotBytes(
+				fixture.PreparedEdit, invalidRaw,
+			); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("DecodePhaseSnapshotBytes() error = %v, want ErrInvalid", err)
+			}
+		})
+	}
+}
+
+func TestDecodeFrozenProposal_RecomputesSemanticDigests(t *testing.T) {
+	fixture, proposalRaw := loadFixture(t)
+	var proposal ProposalV1
+	if err := json.Unmarshal(proposalRaw, &proposal); err != nil {
+		t.Fatal(err)
+	}
+	var prepared PreparedEditV1
+	if err := json.Unmarshal(fixture.PreparedEdit, &prepared); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*PreparedEditV1)
+	}{
+		{
+			name: "representation digest self claim",
+			mutate: func(value *PreparedEditV1) {
+				value.TargetFinal.Digest = strings.Repeat("a", 64)
+			},
+		},
+		{
+			name: "operation digest self claim",
+			mutate: func(value *PreparedEditV1) {
+				value.OperationDigest = strings.Repeat("b", 64)
+			},
+		},
+		{
+			name: "request digest self claim",
+			mutate: func(value *PreparedEditV1) {
+				value.RequestDigest = strings.Repeat("c", 64)
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			changed := prepared
+			testCase.mutate(&changed)
+			changedRaw := mustMarshal(t, changed)
+			changedProposal := proposal
+			changedProposal.PreparedEditDigest = digest(changedRaw)
+			_, err := DecodeFrozenProposal(
+				mustMarshal(t, changedProposal), fixture.BaseDefinition,
+				fixture.TargetDefinition, changedRaw, fixture.BaseSnapshot,
+			)
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("DecodeFrozenProposal() error = %v, want ErrInvalid", err)
+			}
+		})
+	}
+}
+
+func TestValidateApprovedProjectionBindings(t *testing.T) {
+	fixture, proposal := loadFixture(t)
+	frozen, err := DecodeFrozenProposal(
+		proposal, fixture.BaseDefinition, fixture.TargetDefinition,
+		fixture.PreparedEdit, fixture.BaseSnapshot,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type approvedProjectionFields struct {
+		NLDescription string          `json:"nl_description"`
+		SpecJSON      json.RawMessage `json:"spec_json"`
+		ScopeJSON     json.RawMessage `json:"scope_json"`
+	}
+	var base, target approvedProjectionFields
+	if err := json.Unmarshal(fixture.BaseDefinition, &base); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(fixture.TargetDefinition, &target); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateApprovedProjectionBindings(
+		frozen.Prepared,
+		base.SpecJSON, base.ScopeJSON, base.NLDescription,
+		target.SpecJSON, target.ScopeJSON, target.NLDescription,
+	); err != nil {
+		t.Fatalf("valid projection bindings rejected: %v", err)
+	}
+	if err := ValidateApprovedProjectionBindings(
+		frozen.Prepared,
+		base.SpecJSON, base.ScopeJSON, base.NLDescription,
+		target.SpecJSON, target.ScopeJSON, target.NLDescription+" changed",
+	); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("changed target projection error = %v, want ErrInvalid", err)
+	}
+}
+
+func TestValidateApprovedProjectionBindings_AnchoredIntervalUsesWriterLayout(t *testing.T) {
+	specRaw := []byte(`{"anchor_at":"2026-07-21T08:00:00Z","every_seconds":7200,"tz":"UTC"}`)
+	scopeRaw := []byte(`{"source_ids":[11,22],"top_n":3}`)
+	nlDescription := "Every two hours from the approved anchor"
+	wantProjection := approvedProjectionV1{
+		Spec: ScheduleSpecV1{
+			EverySeconds: 7200,
+			AnchorAt:     "2026-07-21T08:00:00Z",
+			TZ:           "UTC",
+		},
+		Scope:         PushScopeV1{SourceIDs: []int64{11, 22}, TopN: 3},
+		NLDescription: nlDescription,
+	}
+	wantDigest, err := digestJSON(wantProjection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := PreparedEditV1{
+		BaseProjectionDigest:   wantDigest,
+		TargetProjectionDigest: wantDigest,
+		BaseOriginal: RepresentationV1{Action: PreparedActionV1{
+			Params: PushParamsV1{Scope: wantProjection.Scope, NLDesc: nlDescription},
+		}},
+		TargetFinal: RepresentationV1{Action: PreparedActionV1{
+			Params: PushParamsV1{Scope: wantProjection.Scope, NLDesc: nlDescription},
+		}},
+	}
+	if err := ValidateApprovedProjectionBindings(
+		prepared,
+		specRaw, scopeRaw, nlDescription,
+		specRaw, scopeRaw, nlDescription,
+	); err != nil {
+		t.Fatalf("anchored interval projection rejected: %v", err)
+	}
+}
+
+func loadFixture(t *testing.T) (componentFixtureV1, []byte) {
+	t.Helper()
+	raw, err := os.ReadFile("../task/testdata/definition_edit_proposal_components_v1.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var fixture componentFixtureV1
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	var prepared PreparedEditV1
+	if err := json.Unmarshal(fixture.PreparedEdit, &prepared); err != nil {
+		t.Fatalf("decode prepared fixture: %v", err)
+	}
+	proposal := ProposalV1{
+		WireVersion: proposalWireVersion,
+		OperationID: prepared.OperationID,
+		ApprovalRef: "approval-definition-edit-0001",
+		Actor: ProposalActorV1{
+			TenantID: prepared.Creation.TenantID,
+			UserID:   prepared.Creation.UserID,
+		},
+		Target: ProposalTargetV1{
+			TenantID: prepared.Creation.TenantID,
+			UserID:   prepared.Creation.UserID,
+			TaskID:   prepared.Creation.TaskID,
+		},
+		SessionID:              91,
+		ExpiresAtUnixMicros:    1_780_000_000_123_456,
+		OriginalStatus:         prepared.OriginalState,
+		BaseHead:               prepared.BaseHead,
+		TargetHead:             prepared.TargetHead,
+		TargetDefinitionDigest: digest(fixture.TargetDefinition),
+		PreparedEditDigest:     digest(fixture.PreparedEdit),
+		BaseSnapshotDigest:     digest(fixture.BaseSnapshot),
+	}
+	return fixture, mustMarshal(t, proposal)
+}
+
+func mustMarshal(t *testing.T, value any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	return raw
+}

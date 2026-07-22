@@ -142,6 +142,53 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	// 回滚兜底：dry-run 走下方显式 Rollback，真删走 Commit；两者之后这里都是 no-op。
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Definition edit transactions globally lock schedule → operation → receipt.
+	// Purge must join that order before its FK-safe child-first DELETE sequence:
+	// deleting an operation fires schedules' ON DELETE SET NULL and otherwise
+	// creates operation → schedule, the exact reverse edge of an edit worker.
+	// Drain every ordered SELECT so PostgreSQL really acquires all row locks.
+	definitionEditLocks := []struct {
+		name  string
+		query string
+	}{
+		{
+			name: "schedules",
+			query: `SELECT id FROM schedules
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge definition-edit lock order */`,
+		},
+		{
+			name: "task_definition_edit_operations",
+			query: `SELECT id FROM task_definition_edit_operations
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge definition-edit lock order */`,
+		},
+		{
+			name: "task_definition_edit_receipts",
+			query: `SELECT id FROM task_definition_edit_receipts
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge definition-edit lock order */`,
+		},
+	}
+	for _, lock := range definitionEditLocks {
+		rows, lockErr := tx.Query(ctx, lock.query, tenantID)
+		if lockErr != nil {
+			return nil, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("锁定租户 %d 的 %s", tenantID, lock.name), lockErr)
+		}
+		for rows.Next() {
+		}
+		lockErr = rows.Err()
+		rows.Close()
+		if lockErr != nil {
+			return nil, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("扫描租户 %d 的 %s 锁", tenantID, lock.name), lockErr)
+		}
+	}
+
 	rep := &PurgeReport{TenantID: tenantID, Rows: map[string]int64{}, DryRun: dryRun}
 	for _, st := range purgeOrder {
 		// #nosec G201 -- table 与 where 都来自本文件的常量表，不含任何外部输入；

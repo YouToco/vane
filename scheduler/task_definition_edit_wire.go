@@ -225,6 +225,104 @@ func DecodeTaskDefinitionEditBaseSnapshot(
 	return snapshot, nil
 }
 
+// EncodeTaskDefinitionEditPhaseSnapshot canonicalizes a post-seal Temporal
+// observation and binds it to exactly one representation in the frozen edit.
+// Unlike EncodeTaskDefinitionEditBaseSnapshot, this codec intentionally does
+// not require BaseRevision: later observations carry the conflict token for
+// the next fenced remote transition.
+func EncodeTaskDefinitionEditPhaseSnapshot(
+	prepared PreparedTaskDefinitionEdit,
+	snapshot TaskDefinitionEditSnapshot,
+) ([]byte, error) {
+	prepared = clonePreparedTaskDefinitionEdit(prepared)
+	if err := validatePreparedTaskDefinitionEdit(prepared); err != nil {
+		return nil, invalidTaskDefinitionEditWire(
+			"encode definition edit phase snapshot", err,
+		)
+	}
+	representation, err := taskDefinitionEditPhaseRepresentation(
+		prepared, snapshot.Phase,
+	)
+	if err != nil {
+		return nil, invalidTaskDefinitionEditWire(
+			"encode definition edit phase snapshot", err,
+		)
+	}
+	if err := validateTaskDefinitionEditSnapshot(
+		prepared, snapshot, snapshot.Phase, representation,
+	); err != nil {
+		return nil, invalidTaskDefinitionEditWire(
+			"encode definition edit phase snapshot", err,
+		)
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, invalidTaskDefinitionEditWire(
+			"encode definition edit phase snapshot", err,
+		)
+	}
+	if len(encoded) == 0 || len(encoded) > maxTaskDefinitionEditSnapshotWireBytes {
+		return nil, invalidTaskDefinitionEditWire(
+			"encode definition edit phase snapshot",
+			fmt.Errorf("wire size %d is outside the supported bound", len(encoded)),
+		)
+	}
+	return encoded, nil
+}
+
+// DecodeTaskDefinitionEditPhaseSnapshot is the retained reader used by the
+// durable Store. It rejects non-canonical JSON and observations which do not
+// match the exact TaskID, request digest, phase representation, or revision
+// shape frozen by PreparedTaskDefinitionEdit.
+func DecodeTaskDefinitionEditPhaseSnapshot(
+	prepared PreparedTaskDefinitionEdit,
+	raw []byte,
+) (TaskDefinitionEditSnapshot, error) {
+	if len(raw) == 0 || len(raw) > maxTaskDefinitionEditSnapshotWireBytes {
+		return TaskDefinitionEditSnapshot{}, invalidTaskDefinitionEditWire(
+			"decode definition edit phase snapshot",
+			fmt.Errorf("wire size %d is outside the supported bound", len(raw)),
+		)
+	}
+	var snapshot TaskDefinitionEditSnapshot
+	if err := strictjson.DecodeExact(raw, &snapshot); err != nil {
+		return TaskDefinitionEditSnapshot{}, invalidTaskDefinitionEditWire(
+			"decode definition edit phase snapshot", err,
+		)
+	}
+	canonical, err := EncodeTaskDefinitionEditPhaseSnapshot(prepared, snapshot)
+	if err != nil {
+		return TaskDefinitionEditSnapshot{}, err
+	}
+	if !bytes.Equal(canonical, raw) {
+		return TaskDefinitionEditSnapshot{}, invalidTaskDefinitionEditWire(
+			"decode definition edit phase snapshot",
+			errors.New("wire is not canonical"),
+		)
+	}
+	return snapshot, nil
+}
+
+func taskDefinitionEditPhaseRepresentation(
+	prepared PreparedTaskDefinitionEdit,
+	phase TaskDefinitionEditPhase,
+) (PreparedTaskDefinitionEditSchedule, error) {
+	switch phase {
+	case TaskDefinitionEditPhaseBaseOriginal:
+		return prepared.BaseOriginal, nil
+	case TaskDefinitionEditPhaseBasePaused:
+		return prepared.BasePaused, nil
+	case TaskDefinitionEditPhaseTargetPaused:
+		return prepared.TargetPaused, nil
+	case TaskDefinitionEditPhaseTargetFinal:
+		return prepared.TargetFinal, nil
+	default:
+		return PreparedTaskDefinitionEditSchedule{}, errors.New(
+			"definition edit phase snapshot has an unsupported phase",
+		)
+	}
+}
+
 func validateFrozenTaskDefinitionEditBaseSnapshot(
 	prepared PreparedTaskDefinitionEdit,
 	snapshot TaskDefinitionEditSnapshot,

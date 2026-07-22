@@ -451,6 +451,119 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 	}
 }
 
+func TestPurgeTenant_DefinitionEditLockOrderDoesNotDeadlock(t *testing.T) {
+	st := purgeStore(t)
+	tenantID := seedPurgeTenant(t, st)
+	ctx := t.Context()
+
+	var taskID, operationID string
+	if err := st.pool.QueryRow(ctx, `
+		SELECT s.id, o.id
+		  FROM schedules s
+		  JOIN task_definition_edit_operations o
+		    ON o.tenant_id=s.tenant_id AND o.user_id=s.user_id AND o.task_id=s.id
+		 WHERE s.tenant_id=$1`, tenantID).Scan(&taskID, &operationID); err != nil {
+		t.Fatalf("查 Definition Edit purge 锁序夹具失败: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx, `
+		UPDATE task_definition_edit_operations
+		   SET status='executing', phase='db_quiesced',
+		       confirmed_at=clock_timestamp(), tombstoned_at=NULL,
+		       lease_owner='purge-lock-order-worker',
+		       lease_until=clock_timestamp()+interval '10 minutes',
+		       takeover_not_before=clock_timestamp()+interval '11 minutes',
+		       fence=1, attempt=1
+		 WHERE id=$1 AND tenant_id=$2`, operationID, tenantID); err != nil {
+		t.Fatalf("激活 Definition Edit purge 锁序夹具失败: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx, `
+		UPDATE schedules
+		   SET definition_edit_operation_id=$2, definition_edit_fence=1
+		 WHERE tenant_id=$1 AND id=$3`, tenantID, operationID, taskID); err != nil {
+		t.Fatalf("安装 Definition Edit purge marker 失败: %v", err)
+	}
+
+	editTx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = editTx.Rollback(ctx) }()
+	if _, err := editTx.Exec(ctx, `SET LOCAL lock_timeout = '750ms'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := editTx.QueryRow(ctx, `
+		SELECT id FROM schedules
+		 WHERE tenant_id=$1 AND id=$2
+		 FOR UPDATE`, tenantID, taskID).Scan(&taskID); err != nil {
+		t.Fatalf("editor 锁 schedule 失败: %v", err)
+	}
+
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, purgeErr := st.PurgeTenant(ctx, tenantID, false)
+		purgeDone <- purgeResult{report: report, err: purgeErr}
+	}()
+	waitForTenantPurgeDefinitionEditLock(t, st)
+
+	var lockedOperationID string
+	lockErr := editTx.QueryRow(ctx, `
+		SELECT id FROM task_definition_edit_operations
+		 WHERE tenant_id=$1 AND id=$2
+		 FOR UPDATE`, tenantID, operationID).Scan(&lockedOperationID)
+	if rollbackErr := editTx.Rollback(ctx); rollbackErr != nil {
+		t.Fatalf("释放 editor 锁失败: %v", rollbackErr)
+	}
+
+	var result purgeResult
+	select {
+	case result = <-purgeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant purge 未在 editor 释放锁后收敛")
+	}
+	if lockErr != nil {
+		t.Fatalf("purge 反向持有 operation，editor schedule→operation 锁失败: %v", lockErr)
+	}
+	if lockedOperationID != operationID {
+		t.Fatalf("editor 锁到 operation=%q，want %q", lockedOperationID, operationID)
+	}
+	if result.err != nil {
+		t.Fatalf("tenant purge 与 Definition Edit 并发失败: %v", result.err)
+	}
+	if result.report == nil || result.report.Rows["tenants"] != 1 {
+		t.Fatalf("tenant purge 报告异常: %+v", result.report)
+	}
+}
+
+func waitForTenantPurgeDefinitionEditLock(t *testing.T, st *Store) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err := st.pool.QueryRow(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1
+				  FROM pg_stat_activity
+				 WHERE datname=current_database()
+				   AND pid<>pg_backend_pid()
+				   AND wait_event_type='Lock'
+				   AND query LIKE '%tenant purge definition-edit lock order%'
+			)`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tenant purge 未按 schedule-first 锁序等待")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestPurgeTenant_LeavesSharedFactsIntact 是红线 I-A3 的**行为级**验证。
 //
 // 前面两条守卫比对的是清单；这一条真的跑一遍清理，然后确认共享内容一条没少。
