@@ -10,9 +10,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
@@ -95,6 +97,7 @@ type CreationSagaStore interface {
 
 	ListMembershipsByUser(ctx context.Context, userID int64) ([]types.Membership, error)
 	GetTenant(ctx context.Context, id int64) (*types.Tenant, error)
+	ResolveTaskCreationSources(ctx context.Context, tenantID, userID int64, sourceIDs []int64) ([]types.Source, error)
 	LoadTaskCreationOperationByUser(ctx context.Context, id string, userID int64) (*types.TaskCreationOperation, error)
 	CreateTaskCreationOperation(ctx context.Context, p types.CreateTaskCreationOperationParams) (*types.TaskCreationOperation, error)
 	CancelTaskCreationOperation(ctx context.Context, p types.CancelTaskCreationOperationParams) (*types.TaskCreationOperation, error)
@@ -185,21 +188,68 @@ func (c *CreationCoordinator) Propose(
 		in.UserID <= 0 || in.ExpiresAt.IsZero() {
 		return CreationProposal{}, creationValidation("任务确认请求不完整", nil)
 	}
-	command, _, err := normalizeCreateScheduleCommand(in.RawArgs)
-	if err != nil {
-		return CreationProposal{}, creationValidation("任务方案未通过校验："+err.Error(), err)
+	// Preserve the A0-observed path exactly: every pre-existing sources-only
+	// command first goes through the original full normalizer, including its
+	// validation precedence and error mapping. Only if that shape fails do we
+	// inspect the new reference-bearing proposal form.
+	command, _, legacyErr := normalizeCreateScheduleCommand(in.RawArgs)
+	var proposalArgs *createScheduleProposalArgs
+	var err error
+	if legacyErr != nil {
+		if !creationProposalHasReferenceField(in.RawArgs) {
+			return CreationProposal{}, creationValidation(
+				"任务方案未通过校验："+legacyErr.Error(), legacyErr,
+			)
+		}
+		proposalArgs, err = decodeCreationProposalArgs(in.RawArgs)
+		if err != nil {
+			return CreationProposal{}, creationValidation(
+				"任务方案未通过校验："+err.Error(), err,
+			)
+		}
+		if proposalArgs.ApprovedFetchPlan.ExistingSourceIDs == nil {
+			err = errors.New("task: approved_fetch_plan.existing_source_ids must be an array")
+			return CreationProposal{}, creationValidation("任务方案未通过校验："+err.Error(), err)
+		}
 	}
-	canonicalArgs, err := canonicalCreationProposalArgs(command)
-	if err != nil {
-		return CreationProposal{}, creationValidation("任务方案无法规范化", err)
-	}
-	summary, err := summarizeCreationProposal(command)
-	if err != nil {
-		return CreationProposal{}, creationValidation("任务方案无法生成确认摘要", err)
-	}
-	tenantID, err := c.resolveActiveTenant(ctx, in.UserID)
-	if err != nil {
-		return CreationProposal{}, err
+	var tenantID int64
+	var canonicalArgs json.RawMessage
+	var summary string
+	if proposalArgs == nil {
+		// Exact legacy order: every deterministic artifact is built before the
+		// first database lookup. A0 golden tests depend on failures here winning
+		// over membership/workspace failures.
+		canonicalArgs, summary, err = finalizeCreationProposal(command)
+		if err != nil {
+			return CreationProposal{}, err
+		}
+		tenantID, err = c.resolveActiveTenant(ctx, in.UserID)
+		if err != nil {
+			return CreationProposal{}, err
+		}
+	} else {
+		tenantID, err = c.resolveActiveTenant(ctx, in.UserID)
+		if err != nil {
+			return CreationProposal{}, err
+		}
+		command, err = c.freezeCreationProposal(
+			ctx, tenantID, in.UserID, proposalArgs,
+		)
+		if err != nil {
+			if errors.Is(err, types.ErrNotFound) {
+				return CreationProposal{}, creationValidation(
+					"所选已有信源当前不可用，请重新选择", err,
+				)
+			}
+			if errors.Is(err, types.ErrValidation) {
+				return CreationProposal{}, err
+			}
+			return CreationProposal{}, fmt.Errorf("freeze task creation proposal: %w", err)
+		}
+		canonicalArgs, summary, err = finalizeCreationProposal(command)
+		if err != nil {
+			return CreationProposal{}, err
+		}
 	}
 	params := types.CreateTaskCreationOperationParams{
 		ID: in.ActionID, TenantID: tenantID, UserID: in.UserID,
@@ -228,6 +278,20 @@ func (c *CreationCoordinator) Propose(
 		)
 	}
 	return CreationProposal{ID: op.ID, Summary: op.Summary}, nil
+}
+
+func finalizeCreationProposal(
+	command normalizedCreateScheduleCommand,
+) (json.RawMessage, string, error) {
+	canonicalArgs, err := canonicalCreationProposalArgs(command)
+	if err != nil {
+		return nil, "", creationValidation("任务方案无法规范化", err)
+	}
+	summary, err := summarizeCreationProposal(command)
+	if err != nil {
+		return nil, "", creationValidation("任务方案无法生成确认摘要", err)
+	}
+	return canonicalArgs, summary, nil
 }
 
 func deterministicCreationProposalFailure(err error) bool {
@@ -1158,6 +1222,236 @@ func (c *CreationCoordinator) creationScopeActive(
 	return tenant.Status == types.TenantStatusActive && tenant.DeletedAt == nil, nil
 }
 
+// createScheduleProposalArgs is the transient model-facing shape. Durable
+// operation args deliberately use createScheduleCommandArgs instead: existing
+// ids are authorization-bearing references and must be expanded into a stable,
+// canonical source identity before a confirmation action exists.
+type createScheduleProposalArgs struct {
+	Spec              *createScheduleCommandSpec       `json:"spec"`
+	Intent            string                           `json:"intent"`
+	NLDescription     string                           `json:"nl_description"`
+	Strictness        types.PushStrictness             `json:"strictness"`
+	ApprovedFetchPlan *createScheduleProposalFetchPlan `json:"approved_fetch_plan"`
+}
+
+type createScheduleProposalFetchPlan struct {
+	ExistingSourceIDs []int64               `json:"existing_source_ids,omitempty"`
+	Sources           []compiledFetchSource `json:"sources,omitempty"`
+}
+
+func creationProposalHasReferenceField(raw json.RawMessage) bool {
+	var root map[string]json.RawMessage
+	if err := decodeStrictJSON(raw, &root); err != nil {
+		return false
+	}
+	planRaw, ok := root["approved_fetch_plan"]
+	if !ok {
+		return false
+	}
+	var plan map[string]json.RawMessage
+	if err := decodeStrictJSON(planRaw, &plan); err != nil {
+		return false
+	}
+	_, ok = plan["existing_source_ids"]
+	return ok
+}
+
+func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArgs, error) {
+	if len(raw) == 0 || len(raw) > maxCreationCommandBytes || !utf8.Valid(raw) {
+		return nil, errors.New("task: create_schedule args are invalid")
+	}
+	var args *createScheduleProposalArgs
+	if err := decodeStrictJSON(raw, &args); err != nil {
+		return nil, fmt.Errorf("task: decode create_schedule proposal: %w", err)
+	}
+	if args == nil || args.Spec == nil {
+		return nil, errors.New("task: create_schedule spec is required")
+	}
+	if args.ApprovedFetchPlan == nil {
+		return nil, errors.New("task: approved_fetch_plan is required")
+	}
+	plan := args.ApprovedFetchPlan
+	combined := len(plan.ExistingSourceIDs) + len(plan.Sources)
+	if combined == 0 {
+		return nil, errors.New("task: approved_fetch_plan must contain at least one source")
+	}
+	if combined > maxCompiledSources {
+		return nil, fmt.Errorf(
+			"task: approved_fetch_plan exceeds %d combined sources", maxCompiledSources,
+		)
+	}
+	seen := make(map[int64]struct{}, len(plan.ExistingSourceIDs))
+	for i, sourceID := range plan.ExistingSourceIDs {
+		if sourceID <= 0 {
+			return nil, fmt.Errorf(
+				"task: approved_fetch_plan.existing_source_ids[%d] must be positive", i,
+			)
+		}
+		if _, duplicate := seen[sourceID]; duplicate {
+			return nil, fmt.Errorf(
+				"task: approved_fetch_plan.existing_source_ids[%d] is duplicated", i,
+			)
+		}
+		seen[sourceID] = struct{}{}
+	}
+	return args, nil
+}
+
+// freezeCreationProposal resolves authorized references exactly once and then
+// runs the existing full-plan normalizer. The returned command contains only
+// canonical materialized identities, so Confirm and every recovery path remain
+// independent of later authorization changes. Runtime-only tuning fields are
+// deliberately excluded: globally shared source rows own those mutable knobs,
+// while the task plan owns the URL/config fields that define source identity.
+func (c *CreationCoordinator) freezeCreationProposal(
+	ctx context.Context,
+	tenantID, userID int64,
+	proposal *createScheduleProposalArgs,
+) (normalizedCreateScheduleCommand, error) {
+	if proposal == nil || proposal.ApprovedFetchPlan == nil {
+		return normalizedCreateScheduleCommand{}, creationValidation(
+			"任务方案未通过校验", nil,
+		)
+	}
+	plan := proposal.ApprovedFetchPlan
+	resolved := make([]types.Source, 0, len(plan.ExistingSourceIDs))
+	if len(plan.ExistingSourceIDs) != 0 {
+		var err error
+		resolved, err = c.store.ResolveTaskCreationSources(
+			ctx, tenantID, userID, plan.ExistingSourceIDs,
+		)
+		if err != nil {
+			return normalizedCreateScheduleCommand{}, err
+		}
+		if len(resolved) != len(plan.ExistingSourceIDs) {
+			return normalizedCreateScheduleCommand{}, types.NewAppError(
+				types.CodeInternal, "任务已有信源解析结果不完整", types.ErrInternal,
+			)
+		}
+	}
+
+	sources := make([]compiledFetchSource, 0, len(resolved)+len(plan.Sources))
+	for i, source := range resolved {
+		if source.ID != plan.ExistingSourceIDs[i] || source.Status != types.SourceStatusActive {
+			return normalizedCreateScheduleCommand{}, types.NewAppError(
+				types.CodeInternal, "任务已有信源解析结果损坏", types.ErrInternal,
+			)
+		}
+		projected, err := projectExistingSourceIdentity(source)
+		if err != nil {
+			return normalizedCreateScheduleCommand{}, creationValidation(
+				"所选已有信源当前无法用于任务，请重新选择", err,
+			)
+		}
+		sources = append(sources, projected)
+	}
+	sources = append(sources, plan.Sources...)
+	fullPlan, err := json.Marshal(compiledFetchPlan{Sources: sources})
+	if err != nil {
+		return normalizedCreateScheduleCommand{}, fmt.Errorf(
+			"marshal expanded task creation fetch plan: %w", err,
+		)
+	}
+	legacyArgs, err := json.Marshal(createScheduleCommandArgs{
+		Spec: proposal.Spec, Intent: proposal.Intent,
+		NLDescription: proposal.NLDescription, Strictness: proposal.Strictness,
+		ApprovedFetchPlan: fullPlan,
+	})
+	if err != nil {
+		return normalizedCreateScheduleCommand{}, fmt.Errorf(
+			"marshal expanded task creation command: %w", err,
+		)
+	}
+	command, _, err := normalizeCreateScheduleCommand(legacyArgs)
+	if err != nil {
+		return normalizedCreateScheduleCommand{}, creationValidation(
+			"任务方案未通过校验："+err.Error(), err,
+		)
+	}
+	return command, nil
+}
+
+// projectExistingSourceIdentity converts the wider persisted-source contract
+// into the narrower approved-plan contract. Persisted rows may legitimately
+// carry fetcher tuning that is not part of their global URL identity; feeding
+// those keys directly into the strict task compiler would make a source visible
+// in list_sources but impossible to reference. Titles are presentation metadata
+// from an untrusted shared row, so normalize whitespace and bound them before
+// they enter a confirmation summary.
+func projectExistingSourceIdentity(source types.Source) (compiledFetchSource, error) {
+	config, err := projectExistingSourceIdentityConfig(
+		source.Platform, source.Capability, source.Config,
+	)
+	if err != nil {
+		return compiledFetchSource{}, err
+	}
+	title := promptguard.SingleLine(promptguard.StripInvisible(source.Title))
+	if title == "" {
+		// Persisted title is optional metadata, while the strict task plan needs
+		// a stable display label for capabilities whose builder would otherwise
+		// synthesize one. Platform/capability is deterministic and cannot be
+		// influenced by external page metadata.
+		title = string(source.Platform) + "/" + string(source.Capability)
+	}
+	title = truncateCreationRunes(title, maxCompiledSourceRunes)
+	return compiledFetchSource{
+		Platform: string(source.Platform), Capability: string(source.Capability),
+		Title: title, URL: source.URL, Config: config,
+	}, nil
+}
+
+func projectExistingSourceIdentityConfig(
+	platform types.Platform,
+	capability types.Capability,
+	raw json.RawMessage,
+) (json.RawMessage, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		raw = json.RawMessage(`{}`)
+	}
+	var fields map[string]json.RawMessage
+	if err := decodeStrictJSON(raw, &fields); err != nil || fields == nil {
+		return nil, errors.New("task: existing source config is not a JSON object")
+	}
+
+	var runtimeIntegerKeys, runtimeStringKeys []string
+	switch {
+	case platform == types.PlatformWeb && capability == types.CapFeed:
+		runtimeIntegerKeys = []string{"lookback_days"}
+	case platform == types.PlatformWeb && capability == types.CapSearch:
+		runtimeIntegerKeys = []string{"lookback_days", "num_results"}
+		runtimeStringKeys = []string{"type"}
+	case platform == types.PlatformXHS && capability == types.CapSearch:
+		runtimeStringKeys = []string{"sort_type", "note_type"}
+	}
+	for _, key := range runtimeIntegerKeys {
+		value, ok := fields[key]
+		if !ok {
+			continue
+		}
+		var integer int64
+		if err := json.Unmarshal(value, &integer); err != nil {
+			return nil, fmt.Errorf("task: existing source %s must be an integer: %w", key, err)
+		}
+		delete(fields, key)
+	}
+	for _, key := range runtimeStringKeys {
+		value, ok := fields[key]
+		if !ok {
+			continue
+		}
+		var text string
+		if err := json.Unmarshal(value, &text); err != nil {
+			return nil, fmt.Errorf("task: existing source %s must be a string: %w", key, err)
+		}
+		delete(fields, key)
+	}
+	canonical, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("task: marshal existing source identity config: %w", err)
+	}
+	return canonical, nil
+}
+
 func canonicalCreationProposalArgs(
 	command normalizedCreateScheduleCommand,
 ) (json.RawMessage, error) {
@@ -1213,7 +1507,10 @@ func summarizeCreationProposal(command normalizedCreateScheduleCommand) (string,
 		builder.WriteString("\n- ")
 		builder.WriteString(summarizeApprovedSource(source))
 	}
-	summary := builder.String()
+	// The body is plain_text, but Unicode bidi/Cf controls can still reorder
+	// neighboring trusted labels and URLs. Strip them from the complete rendered
+	// summary so every dynamic field (not only title) shares the same boundary.
+	summary := promptguard.StripInvisible(builder.String())
 	if len(summary) > maxCreationSummaryBytes {
 		return "", fmt.Errorf("confirmation summary exceeds %d bytes", maxCreationSummaryBytes)
 	}

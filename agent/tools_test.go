@@ -1256,8 +1256,15 @@ func TestCreateScheduleSchema_RequiresApprovedIntentAndFetchPlan(t *testing.T) {
 			ApprovedFetchPlan struct {
 				Required   []string `json:"required"`
 				Properties struct {
+					ExistingSourceIDs struct {
+						MaxItems    int  `json:"maxItems"`
+						UniqueItems bool `json:"uniqueItems"`
+						Items       struct {
+							Minimum int `json:"minimum"`
+						} `json:"items"`
+					} `json:"existing_source_ids"`
 					Sources struct {
-						MinItems int `json:"minItems"`
+						MaxItems int `json:"maxItems"`
 						Items    struct {
 							Required []string `json:"required"`
 						} `json:"items"`
@@ -1275,8 +1282,15 @@ func TestCreateScheduleSchema_RequiresApprovedIntentAndFetchPlan(t *testing.T) {
 		}
 	}
 	plan := schema.Properties.ApprovedFetchPlan
-	if !slices.Contains(plan.Required, "sources") || plan.Properties.Sources.MinItems != 1 {
-		t.Fatalf("approved_fetch_plan.sources 必须存在且非空：%+v", plan)
+	if len(plan.Required) != 0 {
+		t.Fatalf("approved_fetch_plan 的两种平坦输入都应可选，组合下限由 Go 校验：%+v", plan.Required)
+	}
+	refs := plan.Properties.ExistingSourceIDs
+	if refs.MaxItems != 64 || !refs.UniqueItems || refs.Items.Minimum != 1 {
+		t.Fatalf("existing_source_ids 边界不完整：%+v", refs)
+	}
+	if plan.Properties.Sources.MaxItems != 64 {
+		t.Fatalf("sources 最大边界不完整：%+v", plan.Properties.Sources)
 	}
 	for _, required := range []string{"platform", "capability", "url", "config"} {
 		if !slices.Contains(plan.Properties.Sources.Items.Required, required) {

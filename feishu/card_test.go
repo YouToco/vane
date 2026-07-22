@@ -89,12 +89,13 @@ type confirmCardButton struct {
 	} `json:"behaviors"`
 }
 
-// TestBuildConfirmCard 钉死确认卡的 JSON 2.0 结构：markdown 摘要 +
+// TestBuildConfirmCard 钉死确认卡的 JSON 2.0 结构：plain_text 摘要 +
 // column_set 里确认/取消两个 callback 按钮。按钮结构错了不会报错、
 // 只会静默不响应回调（M4 事实基准：v1 的 value 直挂写法在 2.0 下失效），
 // 所以逐字段断言 behaviors 的 callback value。
 func TestBuildConfirmCard(t *testing.T) {
-	summary := "**add_source**\n\n类型：rss\n地址：https://example.com/feed"
+	summary := "**add_source**\n\n类型：rss\n地址：https://example.com/\u202eevil\u2066/feed"
+	wantSummary := "**add_source**\n\n类型：rss\n地址：https://example.com/evil/feed"
 	const actionID = "9b8f2a51-0000-4000-8000-123456789abc"
 	raw := BuildConfirmCard(summary, actionID)
 
@@ -125,18 +126,23 @@ func TestBuildConfirmCard(t *testing.T) {
 		t.Errorf("header.title.content = %q, 期望 %q", card.Header.Title.Content, cardTitle)
 	}
 	if len(card.Body.Elements) != 2 {
-		t.Fatalf("body.elements 长度 = %d, 期望 2（markdown + column_set）", len(card.Body.Elements))
+		t.Fatalf("body.elements 长度 = %d, 期望 2（plain_text + column_set）", len(card.Body.Elements))
 	}
 
-	var md struct {
-		Tag     string `json:"tag"`
-		Content string `json:"content"`
+	var textBlock struct {
+		Tag  string `json:"tag"`
+		Text struct {
+			Tag     string `json:"tag"`
+			Content string `json:"content"`
+		} `json:"text"`
 	}
-	if err := json.Unmarshal(card.Body.Elements[0], &md); err != nil {
-		t.Fatalf("markdown 元素解析失败: %v", err)
+	if err := json.Unmarshal(card.Body.Elements[0], &textBlock); err != nil {
+		t.Fatalf("plain_text 元素解析失败: %v", err)
 	}
-	if md.Tag != "markdown" || md.Content != summary {
-		t.Errorf("markdown 元素 = {%q, %q}, 期望 {\"markdown\", summary 原文}", md.Tag, md.Content)
+	if textBlock.Tag != "div" || textBlock.Text.Tag != "plain_text" ||
+		textBlock.Text.Content != wantSummary {
+		t.Errorf("plain_text 元素 = {%q, %q, %q}, 期望 {\"div\", \"plain_text\", 消毒后摘要}",
+			textBlock.Tag, textBlock.Text.Tag, textBlock.Text.Content)
 	}
 
 	var colSet struct {

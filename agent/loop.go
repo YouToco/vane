@@ -49,7 +49,7 @@ const (
 // systemPrompt：Exa key 缺失的环境不注册这两个工具，prompt 不得广告它们。
 const exaAdHocSystemNote = `
 - 用户想「看一下/查一下」某个页面或主题（一次性需求）：直接调 web_search 或 read_page 拿到结果回答，**不要为一次性需求新建信源**。只有周期性、持续性的关注（每天盯某类信息、某页面有变化就告诉我）才用 add_source 订阅或 create_schedule 建定时任务。
-- create_schedule 必须带完整 intent 与 approved_fetch_plan，确认卡会把触发时间、门槛和每个长期信源展示给用户；确认后系统逐字采用，不能自行扩大主题或替换长期信源。需要先上网找候选时，本轮只能做只读发现并把候选告诉用户，等用户下一条消息明确同意后才能创建任务；绝不能在读取外部结果的同一轮发起写操作。`
+- create_schedule 必须带完整 intent 与 approved_fetch_plan。若采用 list_sources 返回的本人现有信源，把它的数字 id 放入 existing_source_ids，不要把 id 编造成 URL；新信源才提交完整 sources。确认卡会展示系统冻结后的每个长期信源，确认后不能自行扩大主题或替换长期信源。需要先上网找候选时，本轮只能做只读发现并把候选告诉用户，等用户下一条消息明确同意后才能创建任务；绝不能在读取外部结果的同一轮发起写操作。`
 
 // 契约 §7 固定的回复/占位文案。
 const (
