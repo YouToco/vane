@@ -1,6 +1,7 @@
 package runtimepolicy
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"math"
@@ -137,10 +138,7 @@ func (p QuotaPolicyV1) Validate() error {
 	}
 	seen := make(map[string]struct{}, len(p.Buckets))
 	for _, bucket := range p.Buckets {
-		if !validShortText(bucket.Name) || !validShortText(bucket.EnforcementVersion) ||
-			math.IsNaN(bucket.RatePerSecond) || math.IsInf(bucket.RatePerSecond, 0) ||
-			math.IsNaN(bucket.Burst) || math.IsInf(bucket.Burst, 0) ||
-			bucket.RatePerSecond < 0 || bucket.Burst < 0 {
+		if !validShortText(bucket.Name) || !validShortText(bucket.EnforcementVersion) {
 			return invalidPolicy("quota bucket is invalid")
 		}
 		if _, duplicate := seen[bucket.Name]; duplicate {
@@ -179,10 +177,19 @@ func (c CapabilityV1) validateImplementationCredential() error {
 		if c.CredentialRef != (CredentialRefV1{}) {
 			return invalidPolicy("credentialless capability has a credential")
 		}
-		return nil
+		if len(c.DependencyCredentialRefs) != 1 {
+			return invalidPolicy("rss capability must freeze one enrichment credential")
+		}
+		return c.DependencyCredentialRefs[0].validateFor(CredentialIDExaPrimaryV1)
 	case CapabilityImplementationExaV1:
+		if len(c.DependencyCredentialRefs) != 0 {
+			return invalidPolicy("exa capability has unexpected dependency credentials")
+		}
 		return c.CredentialRef.validateFor(CredentialIDExaPrimaryV1)
 	case CapabilityImplementationBindingV1:
+		if len(c.DependencyCredentialRefs) != 0 {
+			return invalidPolicy("binding capability has unexpected dependency credentials")
+		}
 		return c.CredentialRef.validateFor(CredentialIDTikHubPrimaryV1)
 	default:
 		return invalidPolicy("capability implementation is unsupported")
@@ -225,6 +232,25 @@ func normalizeBundleV1(bundle BundleV1) (BundleV1, error) {
 
 func normalizeCapabilityCatalogV1(policy CapabilityCatalogV1) (CapabilityCatalogV1, error) {
 	policy.Allowed = slices.Clone(policy.Allowed)
+	for i := range policy.Allowed {
+		refs := slices.Clone(policy.Allowed[i].DependencyCredentialRefs)
+		if refs == nil {
+			refs = []CredentialRefV1{}
+		}
+		slices.SortFunc(refs, func(left, right CredentialRefV1) int {
+			if n := strings.Compare(string(left.ID), string(right.ID)); n != 0 {
+				return n
+			}
+			return cmp.Compare(left.Generation, right.Generation)
+		})
+		for j := 1; j < len(refs); j++ {
+			if refs[j] == refs[j-1] {
+				return CapabilityCatalogV1{}, invalidPolicy(
+					"capability dependency credential is duplicated")
+			}
+		}
+		policy.Allowed[i].DependencyCredentialRefs = refs
+	}
 	if err := policy.Validate(); err != nil {
 		return CapabilityCatalogV1{}, err
 	}

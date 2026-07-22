@@ -131,7 +131,7 @@ func testCompiledRunPolicyV1(t *testing.T) runtimepolicy.BundleV1 {
 			{Stage: runtimepolicy.ModelStageProfileEvolve, Model: "model-1", MaxTokens: 800, DisableThinking: true},
 		},
 		QuotaBuckets: []runtimepolicy.QuotaBucketV1{{
-			Name: "llm_tokens", RatePerSecond: 1, Burst: 100,
+			Name:      "llm_tokens",
 			Financial: true, EnforcementVersion: "precharge-reconcile/v1",
 		}},
 	})

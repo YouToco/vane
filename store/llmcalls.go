@@ -12,7 +12,9 @@ import (
 // user_id / ref_id / prefix_cache_hit / temperature / max_tokens 均为指针，
 // nil 时写 NULL 保留"未设置/未报告"的三态语义（001 审查裁决 2026-07-14）。
 //
-// tenant_id 由 user_id 反查 memberships 得出，而不是由调用方传入：
+// tenant_id 对 compiled runtime 由调用方显式传入冻结的租户与用户，
+// 使一个用户属于多个租户、或上游请求后成员关系被撤销时，付费回执
+// 仍精确归属到授权时的租户。legacy 调用才由 user_id 反查 memberships：
 // 迁移 021 给本表加列时只回填了存量、没改这条 INSERT，也没建触发器/默认值，
 // 于是**上线后每一行的 tenant_id 都是 NULL**（生产实证：021 部署时刻前后
 // 零重叠，883 行有值全在前、62 行 NULL 全在后）。后果有二——
@@ -20,13 +22,22 @@ import (
 // `tenant_id = current_setting('app.tenant_id')` 对 NULL 恒不成立，
 // 用户会看到自己的 LLM 调用记录**全部消失**。
 //
-// 复用 tenantOfUser 而不是给调用方加形参：本表的 7 个调用点（scorer/cardgen/
+// legacy 路径继续复用 tenantOfUser：本表的旧调用点（scorer/cardgen/
 // agent/evolver/deepdive/feishu/playbook_translate）手里都只有 userID、没有租户
 // 上下文，逐个改要动整条 Temporal 活动参数链；而 021 的回填、以及 push_batches
 // 等 8 张表的写入，用的都是这同一条规则，此处照用才不会漂移（理由详见
 // tenantderive.go）。user_id 为 NULL（系统级调用）时子查询返回 NULL——
 // 这正是 021 注释所说「一次系统级 LLM 调用确实不属于任何租户」。
 func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, error) {
+	if c == nil {
+		return 0, types.NewAppError(types.CodeValidation,
+			"llm_calls 记录不能为空", types.ErrValidation)
+	}
+	if c.TenantID != nil && (*c.TenantID <= 0 || c.UserID == nil || *c.UserID <= 0) {
+		return 0, types.NewAppError(types.CodeValidation,
+			"显式 llm_calls 租户归属必须同时包含正数 tenant_id 与 user_id",
+			types.ErrValidation)
+	}
 	var id int64
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO llm_calls (
@@ -40,12 +51,12 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 			$6, $7, $8, $9, $10,
 			$11, $12, $13, $14,
 			$15, $16, $17, $18,
-			`+tenantOfUser+`$3)
+			CASE WHEN $19::bigint IS NULL THEN `+tenantOfUser+`$3) ELSE $19 END
 		) RETURNING id`,
 		c.TraceID, c.SpanName, c.UserID, c.RefType, c.RefID,
 		c.Provider, c.Model, c.SystemPrompt, c.UserPrompt, c.Completion,
 		c.PromptTokens, c.CompletionTokens, c.LatencyMs, c.CostUSD,
-		c.PrefixCacheHit, c.Temperature, c.MaxTokens, c.Error,
+		c.PrefixCacheHit, c.Temperature, c.MaxTokens, c.Error, c.TenantID,
 	).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "写入 llm_calls 记录", err)

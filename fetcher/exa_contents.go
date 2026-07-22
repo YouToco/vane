@@ -116,6 +116,14 @@ type exaContentsStatus struct {
 // 401/403 → CodeValidation（不可重试）；超时 → CodeFetchTimeout；429 → CodeFetchRateLimit；
 // statuses[].status=="error" → CodeFetchTimeout（可重试，抓取瞬态）。
 func (e *ExaContentsFetcher) Fetch(ctx context.Context, src types.Source) ([]types.ContentItem, error) {
+	return e.fetchWithEffectGate(ctx, src, nil)
+}
+
+func (e *ExaContentsFetcher) fetchWithEffectGate(
+	ctx context.Context,
+	src types.Source,
+	beforeEffect func(context.Context) error,
+) ([]types.ContentItem, error) {
 	if e.apiKey == "" {
 		return nil, types.NewAppError(types.CodeValidation,
 			"web/contents 信源需要配置 VANE_FETCH_EXA_API_KEY，当前为空", nil)
@@ -134,7 +142,8 @@ func (e *ExaContentsFetcher) Fetch(ctx context.Context, src types.Source) ([]typ
 			fmt.Sprintf("web/contents 信源缺少 url（source_id=%d）", src.ID), nil)
 	}
 
-	results, cached, err := e.pageResults(ctx, pageURL, 0, &src)
+	results, cached, err := e.pageResultsWithEffectGate(
+		ctx, pageURL, 0, &src, beforeEffect)
 	if err != nil {
 		return nil, err
 	}
@@ -177,6 +186,16 @@ func (e *ExaContentsFetcher) Fetch(ctx context.Context, src types.Source) ([]typ
 // 第二个返回值 cached 报告 Exa 是否返回了缓存，由调用方按自己的语义处理
 // （监控要为此记 WARN，补全不需要）。
 func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, maxAgeHours int, src *types.Source) ([]exaContentsResult, bool, error) {
+	return e.pageResultsWithEffectGate(ctx, pageURL, maxAgeHours, src, nil)
+}
+
+func (e *ExaContentsFetcher) pageResultsWithEffectGate(
+	ctx context.Context,
+	pageURL string,
+	maxAgeHours int,
+	src *types.Source,
+	beforeEffect func(context.Context) error,
+) ([]exaContentsResult, bool, error) {
 	reqBody := exaContentsRequest{URLs: []string{pageURL}, Text: true, MaxAgeHours: maxAgeHours}
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
@@ -191,6 +210,9 @@ func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, ma
 	req.Header.Set("x-api-key", e.apiKey)
 	req.Header.Set("Accept", "application/json")
 
+	if err := checkEffectGate(ctx, beforeEffect); err != nil {
+		return nil, false, err
+	}
 	start := time.Now()
 	resp, err := e.client.Do(req)
 	elapsed := time.Since(start)
@@ -388,10 +410,11 @@ func (e *ExaContentsFetcher) recordCall(ctx context.Context, src types.Source, s
 	}
 	ctx, cancel := detachedBindingRecordContext(ctx)
 	defer cancel()
-	trace, userID := bindingAttribution(ctx)
+	trace, tenantID, userID := bindingAttribution(ctx)
 	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
+		TenantID:     tenantID,
 		UserID:       userID,
 		ToolName:     "exa:contents",
 		ToolKind:     types.ToolCallKindExaFetch,

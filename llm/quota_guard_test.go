@@ -31,21 +31,31 @@ import (
 
 // upstreamEntry 是一个"会向上游发请求"的函数，以及它必须调用的闸门。
 type upstreamEntry struct {
-	file      string
-	fn        string
-	upstream  string // 发请求的方法名
-	why       string
-	estimator string // 估算入参的来源函数（必须出现在闸门之前）
+	file       string
+	fn         string
+	upstream   string // 发请求的方法名
+	gate       string // 该入口必须调用的精确闸门
+	accounting string // 与闸门成对的事后对账
+	why        string
+	estimator  string // 估算入参的来源函数（必须出现在闸门之前）
 }
 
 // upstreamEntries 是全部会花钱的入口。**新增入口必须登记在这里**，
 // 否则 TestInvariant_NoUnguardedUpstreamEntry 会变红。
 var upstreamEntries = []upstreamEntry{
-	{"do.go", "Do", "Complete",
-		"单轮调用：打分 / 出卡 / 画像演化 / playbook 翻译", "estimateTokens"},
-	{"chat.go", "DoChat", "Chat",
-		"多轮 function calling：agent 循环 / 深挖 / A2A assistant.chat——" +
-			"生产实测 prompt 均值 4381、峰值 44871，是最贵的一条", "estimateTokens"},
+	{
+		file: "do.go", fn: "Do", upstream: "Complete",
+		gate: "BeforeSpend", accounting: "finishCallAccountingWithReservation",
+		why: "单轮调用：打分 / 出卡 / 画像演化 / playbook 翻译；" +
+			"compiled run 必须消费冻结规则", estimator: "estimateTokens",
+	},
+	{
+		file: "chat.go", fn: "DoChat", upstream: "Chat",
+		gate: "CheckQuota", accounting: "finishCallAccounting",
+		why: "多轮 function calling：agent 循环 / 深挖 / A2A assistant.chat——" +
+			"生产实测 prompt 均值 4381、峰值 44871，是最贵的一条",
+		estimator: "estimateTokens",
+	},
 }
 
 func parseLLMFile(t *testing.T, name string) (*token.FileSet, *ast.File) {
@@ -100,28 +110,29 @@ func TestInvariant_EveryUpstreamEntryIsGuarded(t *testing.T) {
 			_, f := parseLLMFile(t, e.file)
 			fn := findFunc(t, f, e.fn)
 
-			gateAt := firstCallPos(fn.Body, "CheckQuota")
+			gateAt := firstCallPos(fn.Body, e.gate)
 			upAt := firstCallPos(fn.Body, e.upstream)
 			estAt := firstCallPos(fn.Body, e.estimator)
-			recAt := firstCallPos(fn.Body, "finishCallAccounting")
+			recAt := firstCallPos(fn.Body, e.accounting)
 
 			if !gateAt.IsValid() {
-				t.Fatalf("%s 没有调用 CheckQuota —— 这条路径不受配额约束。用途：%s", e.fn, e.why)
+				t.Fatalf("%s 没有调用 %s —— 这条路径不受正确的配额规则约束。用途：%s",
+					e.fn, e.gate, e.why)
 			}
 			if !upAt.IsValid() {
 				t.Fatalf("%s 里找不到 %s 调用 —— 守卫的参照点没了，需重新对准", e.fn, e.upstream)
 			}
 			if gateAt > upAt {
-				t.Errorf("%s 的 CheckQuota 在 %s 之后 —— 钱已经花了才检查，闸门形同虚设",
-					e.fn, e.upstream)
+				t.Errorf("%s 的 %s 在 %s 之后 —— 钱已经花了才检查，闸门形同虚设",
+					e.fn, e.gate, e.upstream)
 			}
 			if !estAt.IsValid() || estAt > gateAt {
 				t.Errorf("%s 必须在预扣前用 %s 算出估算量。缺了它意味着预扣的是常量，"+
 					"而象征性的小额预扣正是第一版超发 4.9 倍的成因", e.fn, e.estimator)
 			}
 			if !recAt.IsValid() || recAt < upAt {
-				t.Errorf("%s 必须在调用后 finishCallAccounting 记账并对账实际用量。"+
-					"只预扣估算而不对账，桶里记的永远是猜测值", e.fn)
+				t.Errorf("%s 必须在调用后用 %s 记账并对账实际用量。"+
+					"只预扣估算而不对账，桶里记的永远是猜测值", e.fn, e.accounting)
 			}
 		})
 	}
@@ -145,7 +156,7 @@ func TestInvariant_GateResultIsHonored(t *testing.T) {
 				if !ok || ifs.Init == nil {
 					return true
 				}
-				if !firstCallPos(&ast.BlockStmt{List: []ast.Stmt{ifs.Init}}, "CheckQuota").IsValid() {
+				if !firstCallPos(&ast.BlockStmt{List: []ast.Stmt{ifs.Init}}, e.gate).IsValid() {
 					return true
 				}
 				// 该 if 的分支里必须有 return，否则拦不住下面那次调用。
@@ -159,9 +170,9 @@ func TestInvariant_GateResultIsHonored(t *testing.T) {
 			})
 
 			if !guarded {
-				t.Errorf("%s 里 CheckQuota 的返回值没有导向 return —— "+
+				t.Errorf("%s 里 %s 的返回值没有导向 return —— "+
 					"「调用了闸门」不等于「闸门起作用」。对抗审查证明过：保留调用但忽略"+
-					"返回值可以完全摘除配额而全仓测试无一变红", e.fn)
+					"返回值可以完全摘除配额而全仓测试无一变红", e.fn, e.gate)
 			}
 		})
 	}

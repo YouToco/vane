@@ -68,8 +68,12 @@ llm:
   api_key: "yaml-llm-key"
   model: "gpt-x"
   max_concurrent: 9
+  compiled_endpoint_generation: 2
+  compiled_credential_generation: 6
 fetch:
   tikhub_api_key: "yaml-tikhub"
+  compiled_exa_credential_generation: 3
+  compiled_tikhub_credential_generation: 5
   timeout_seconds: 30
   max_response_mb: 8
 pipeline:
@@ -103,7 +107,11 @@ log:
 		{"llm.api_key", cfg.LLM.APIKey, "yaml-llm-key"},
 		{"llm.model", cfg.LLM.Model, "gpt-x"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 9},
+		{"llm.compiled_endpoint_generation", cfg.LLM.CompiledEndpointGeneration, int64(2)},
+		{"llm.compiled_credential_generation", cfg.LLM.CompiledCredentialGeneration, int64(6)},
 		{"fetch.tikhub_api_key", cfg.Fetch.TikhubAPIKey, "yaml-tikhub"},
+		{"fetch.compiled_exa_credential_generation", cfg.Fetch.CompiledExaCredentialGeneration, int64(3)},
+		{"fetch.compiled_tikhub_credential_generation", cfg.Fetch.CompiledTikHubCredentialGeneration, int64(5)},
 		{"fetch.timeout_seconds", cfg.Fetch.TimeoutSeconds, 30},
 		{"fetch.max_response_mb", cfg.Fetch.MaxResponseMB, 8},
 		{"pipeline.playbook_prompts_enabled", cfg.Pipeline.PlaybookPromptsEnabled, true},
@@ -140,7 +148,11 @@ log:
 
 	t.Setenv("VANE_DB_URL", "postgres://from-env")
 	t.Setenv("VANE_LLM_API_KEY", "env-key")
+	t.Setenv("VANE_LLM_COMPILED_ENDPOINT_GENERATION", "11")
+	t.Setenv("VANE_LLM_COMPILED_CREDENTIAL_GENERATION", "13")
 	t.Setenv("VANE_FETCH_TIKHUB_API_KEY", "env-tikhub-key")
+	t.Setenv("VANE_FETCH_COMPILED_EXA_CREDENTIAL_GENERATION", "7")
+	t.Setenv("VANE_FETCH_COMPILED_TIKHUB_CREDENTIAL_GENERATION", "9")
 	t.Setenv("VANE_PIPELINE_PLAYBOOK_PROMPTS_ENABLED", "true")
 	t.Setenv("VANE_PIPELINE_PLAYBOOK_PROMPT_CANARY_SCHEDULE_ID", "schedule-env")
 	t.Setenv("VANE_PIPELINE_PLAYBOOK_PROMPTS_ALLOW_ALL", "false")
@@ -158,7 +170,11 @@ log:
 	}{
 		{"db.url", cfg.DB.URL, "postgres://from-env"},
 		{"llm.api_key", cfg.LLM.APIKey, "env-key"},
+		{"llm.compiled_endpoint_generation", cfg.LLM.CompiledEndpointGeneration, int64(11)},
+		{"llm.compiled_credential_generation", cfg.LLM.CompiledCredentialGeneration, int64(13)},
 		{"fetch.tikhub_api_key", cfg.Fetch.TikhubAPIKey, "env-tikhub-key"},
+		{"fetch.compiled_exa_credential_generation", cfg.Fetch.CompiledExaCredentialGeneration, int64(7)},
+		{"fetch.compiled_tikhub_credential_generation", cfg.Fetch.CompiledTikHubCredentialGeneration, int64(9)},
 		{"pipeline.playbook_prompts_enabled", cfg.Pipeline.PlaybookPromptsEnabled, true},
 		{"pipeline.playbook_prompt_canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID, "schedule-env"},
 		{"pipeline.playbook_prompts_allow_all", cfg.Pipeline.PlaybookPromptsAllowAll, false},
@@ -253,6 +269,10 @@ func TestDefaults(t *testing.T) {
 		{"llm.model", cfg.LLM.Model, "deepseek-v4-flash"},
 		{"llm.agent_model", cfg.LLM.AgentModel, "deepseek-v4-pro"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 32},
+		{"llm.compiled_endpoint_generation", cfg.LLM.CompiledEndpointGeneration, int64(1)},
+		{"llm.compiled_credential_generation", cfg.LLM.CompiledCredentialGeneration, int64(1)},
+		{"fetch.compiled_exa_credential_generation", cfg.Fetch.CompiledExaCredentialGeneration, int64(1)},
+		{"fetch.compiled_tikhub_credential_generation", cfg.Fetch.CompiledTikHubCredentialGeneration, int64(1)},
 		{"fetch.timeout_seconds", cfg.Fetch.TimeoutSeconds, 20},
 		{"fetch.max_response_mb", cfg.Fetch.MaxResponseMB, 5},
 		{"pipeline.playbook_prompts_enabled", cfg.Pipeline.PlaybookPromptsEnabled, false},
@@ -303,6 +323,47 @@ func TestValidate_NormalizesPlaybookPromptCanaryScheduleID(t *testing.T) {
 			}
 			if !tt.wantErr && cfg.Pipeline.PlaybookPromptCanaryScheduleID != tt.want {
 				t.Fatalf("canary schedule id = %q，期望 %q", cfg.Pipeline.PlaybookPromptCanaryScheduleID, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateCompiledRouteGenerations(t *testing.T) {
+	t.Run("zero defaults to primary generation", func(t *testing.T) {
+		cfg := Config{DB: DBConfig{URL: "postgres://test"}}
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Fetch.CompiledExaCredentialGeneration != 1 ||
+			cfg.Fetch.CompiledTikHubCredentialGeneration != 1 {
+			t.Fatalf("fetch generations = (%d, %d), want (1, 1)",
+				cfg.Fetch.CompiledExaCredentialGeneration,
+				cfg.Fetch.CompiledTikHubCredentialGeneration)
+		}
+		if cfg.LLM.CompiledEndpointGeneration != 1 ||
+			cfg.LLM.CompiledCredentialGeneration != 1 {
+			t.Fatalf("LLM generations = (%d, %d), want (1, 1)",
+				cfg.LLM.CompiledEndpointGeneration,
+				cfg.LLM.CompiledCredentialGeneration)
+		}
+	})
+
+	for _, test := range []struct {
+		name  string
+		fetch FetchConfig
+		llm   LLMConfig
+	}{
+		{name: "negative LLM endpoint", llm: LLMConfig{CompiledEndpointGeneration: -1}},
+		{name: "negative LLM credential", llm: LLMConfig{CompiledCredentialGeneration: -1}},
+		{name: "negative Exa", fetch: FetchConfig{CompiledExaCredentialGeneration: -1}},
+		{name: "negative TikHub", fetch: FetchConfig{CompiledTikHubCredentialGeneration: -1}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{
+				DB: DBConfig{URL: "postgres://test"}, LLM: test.llm, Fetch: test.fetch,
+			}
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("negative compiled route generation must be rejected")
 			}
 		})
 	}

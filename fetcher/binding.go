@@ -324,13 +324,16 @@ type BindingCallRecorder interface {
 	RecordBindingCall(ctx context.Context, rec *types.ToolCall)
 }
 
-// bindingTraceKey / bindingUserIDKey 从 ctx 取本次上游调用的账本归属。
-// workflow 层只塞 trace；Agent ad-hoc 调用同时塞 trace + userID。fetcher 不依赖
-// temporal/agent，store 再由 userID 推导 tenant_id，避免上游账本变成无租户孤儿行。
+// bindingTraceKey / bindingTenantIDKey / bindingUserIDKey 从 ctx 取本次上游
+// 调用的账本归属。Agent ad-hoc 调用塞 trace + userID，保留 membership 推导；
+// compiled workflow 塞冻结的 trace + tenantID + userID，避免多租户用户在网络调用
+// 完成后被当前 membership 重新归属。这里只传本地记账元数据，不会序列化给上游。
 type bindingTraceKeyT struct{}
+type bindingTenantIDKeyT struct{}
 type bindingUserIDKeyT struct{}
 
 var bindingTraceKey bindingTraceKeyT
+var bindingTenantIDKey bindingTenantIDKeyT
 var bindingUserIDKey bindingUserIDKeyT
 
 const bindingRecordTimeout = 5 * time.Second
@@ -348,6 +351,20 @@ func WithBindingAttribution(ctx context.Context, traceID string, userID int64) c
 	return context.WithValue(ctx, bindingUserIDKey, userID)
 }
 
+// WithBindingRunAttribution pins a compiled fetch receipt to the immutable
+// run's exact tenant and user. Values deliberately survive context.WithoutCancel
+// so an upstream call that already happened can still be durably accounted
+// after cancellation or membership revocation.
+func WithBindingRunAttribution(
+	ctx context.Context,
+	traceID string,
+	tenantID int64,
+	userID int64,
+) context.Context {
+	ctx = WithBindingAttribution(ctx, traceID, userID)
+	return context.WithValue(ctx, bindingTenantIDKey, tenantID)
+}
+
 // BindingAttributionFromContext 读取上游账本归属。hasUser=false 是合法的系统/调度
 // 调用形态；Agent ad-hoc 调用必须为 true。导出是为了让跨包调用方的行为测试能钉住
 // “确实注入了归属”，而不是只测 fetcher 收到归属后会使用。
@@ -357,12 +374,31 @@ func BindingAttributionFromContext(ctx context.Context) (traceID string, userID 
 	return traceID, userID, hasUser
 }
 
-func bindingAttribution(ctx context.Context) (traceID string, userID *int64) {
+// BindingRunAttributionFromContext additionally exposes the optional exact
+// tenant used by compiled runs. The older three-result helper above remains
+// stable for Agent callers and their tests.
+func BindingRunAttributionFromContext(
+	ctx context.Context,
+) (traceID string, tenantID int64, hasTenant bool, userID int64, hasUser bool) {
+	traceID, userID, hasUser = BindingAttributionFromContext(ctx)
+	tenantID, hasTenant = ctx.Value(bindingTenantIDKey).(int64)
+	return traceID, tenantID, hasTenant, userID, hasUser
+}
+
+func bindingAttribution(ctx context.Context) (
+	traceID string,
+	tenantID *int64,
+	userID *int64,
+) {
 	traceID, uid, ok := BindingAttributionFromContext(ctx)
 	if ok {
 		userID = &uid
 	}
-	return traceID, userID
+	tid, hasTenant := ctx.Value(bindingTenantIDKey).(int64)
+	if hasTenant {
+		tenantID = &tid
+	}
+	return traceID, tenantID, userID
 }
 
 // detachedBindingRecordContext 让“已经打到上游”的调用即使随后被调用方取消也能
@@ -420,7 +456,15 @@ func NewBinding(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorde
 
 // Fetch 实现订阅信源抓取（workflow.Fetcher 分派到此）。
 func (b *BindingFetcher) Fetch(ctx context.Context, src types.Source) ([]types.ContentItem, error) {
-	items, _, err := b.run(ctx, src, false)
+	return b.fetchWithEffectGate(ctx, src, nil)
+}
+
+func (b *BindingFetcher) fetchWithEffectGate(
+	ctx context.Context,
+	src types.Source,
+	beforeEffect func(context.Context) error,
+) ([]types.ContentItem, error) {
+	items, _, err := b.run(ctx, src, false, beforeEffect)
 	return items, err
 }
 
@@ -449,11 +493,16 @@ func probeReject(msg string) error {
 // CodeValidation 且不落任何库行；错误 Message 是给用户看的人话（红线 3）。
 // probe 跳过 enrich：准入判定不需要全文，没必要为未落库的内容付详情费。
 func (b *BindingFetcher) Probe(ctx context.Context, src types.Source) (*ProbeReport, error) {
-	_, report, err := b.run(ctx, src, true)
+	_, report, err := b.run(ctx, src, true, nil)
 	return report, err
 }
 
-func (b *BindingFetcher) run(ctx context.Context, src types.Source, probe bool) ([]types.ContentItem, *ProbeReport, error) {
+func (b *BindingFetcher) run(
+	ctx context.Context,
+	src types.Source,
+	probe bool,
+	beforeEffect func(context.Context) error,
+) ([]types.ContentItem, *ProbeReport, error) {
 	spec, ok := bindingTemplates[bindingKey{src.Platform, src.Capability}]
 	if !ok {
 		// Multi 只对模板里有的能力分派到此；走到这里是装配漂移，不是数据问题。
@@ -493,7 +542,8 @@ func (b *BindingFetcher) run(ctx context.Context, src types.Source, probe bool) 
 		return nil, nil, err
 	}
 
-	root, err := b.callAndDecode(ctx, entry, params, spec.Envelope, spec.MsgPath, src)
+	root, err := b.callAndDecode(
+		ctx, entry, params, spec.Envelope, spec.MsgPath, src, beforeEffect)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -663,7 +713,9 @@ func (b *BindingFetcher) run(ctx context.Context, src types.Source, probe bool) 
 			ids[i] = cands[i].id
 			raws[i] = cands[i].raw
 		}
-		b.enrich(ctx, src, spec.Enrich, ids, raws, contents)
+		if err := b.enrich(ctx, src, spec.Enrich, ids, raws, contents, beforeEffect); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	out := make([]types.ContentItem, 0, len(cands))
@@ -722,7 +774,18 @@ func buildProbeReport(spec bindingSpec, n, identityMissing int, get func(int) (*
 }
 
 // callAndDecode 调一次端点：记账 → 状态分类 → UseNumber 解码 → 信封断言。
-func (b *BindingFetcher) callAndDecode(ctx context.Context, entry tikhubcatalog.Entry, params map[string]any, checks []envelopeCheck, msgPath string, src types.Source) (any, error) {
+func (b *BindingFetcher) callAndDecode(
+	ctx context.Context,
+	entry tikhubcatalog.Entry,
+	params map[string]any,
+	checks []envelopeCheck,
+	msgPath string,
+	src types.Source,
+	beforeEffect func(context.Context) error,
+) (any, error) {
+	if err := checkEffectGate(ctx, beforeEffect); err != nil {
+		return nil, err
+	}
 	res, err := b.inv.Invoke(ctx, entry, params)
 	b.record(ctx, entry, params, res, err, src)
 	if err != nil {
@@ -799,7 +862,7 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 	}
 	ctx, cancel := detachedBindingRecordContext(ctx)
 	defer cancel()
-	trace, userID := bindingAttribution(ctx)
+	trace, tenantID, userID := bindingAttribution(ctx)
 	clean := make(map[string]any, len(params))
 	for k, v := range params {
 		if s, isStr := v.(string); isStr {
@@ -812,6 +875,7 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
+		TenantID:     tenantID,
 		UserID:       userID,
 		ToolName:     "binding:" + entry.Name,
 		ToolKind:     types.ToolCallKindBindingFetch,
@@ -848,17 +912,26 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 
 // ────────── enrich（付费详情补全）──────────
 
-// enrich 就地把被截断的正文替换为详情接口的全文。降级铁律与原 tikhub.go 一致：
-// **没有任何路径返回错误**——失败只是保留截断正文入库，绝不让 Fetch 失败。
-func (b *BindingFetcher) enrich(ctx context.Context, src types.Source, es *enrichSpec, ids []string, raws []any, contents []*string) {
+// enrich 就地把被截断的正文替换为详情接口的全文。普通上游失败仍按原铁律
+// best-effort 降级；唯一向上返回的是紧邻调用的 live-authorization 失败，避免
+// 撤权被误当成一条可吞的详情失败后继续调用后续付费端点。
+func (b *BindingFetcher) enrich(
+	ctx context.Context,
+	src types.Source,
+	es *enrichSpec,
+	ids []string,
+	raws []any,
+	contents []*string,
+	beforeEffect func(context.Context) error,
+) error {
 	if b.seen == nil {
-		return // 无从判断新旧就不补：宁可不补，也不为一库老笔记重复付费。
+		return nil // 无从判断新旧就不补：宁可不补，也不为一库老笔记重复付费。
 	}
 	entry, ok := tikhubcatalog.Lookup(es.Endpoint)
 	if !ok {
 		slog.Warn("binding: 详情端点已从注册表移除，跳过本轮补全",
 			"source_id", src.ID, "endpoint", es.Endpoint)
-		return
+		return nil
 	}
 	// 与主调用同一道反漂移防线（契约 §3.6「同样每轮 Lookup + 参数校验」）：
 	// re-gen 改了详情端点参数名时显式跳过（降级不失败），而不是静默丢参白花钱。
@@ -869,7 +942,7 @@ func (b *BindingFetcher) enrich(ctx context.Context, src types.Source, es *enric
 	if err := validateAgainstEntry(entry, nameProbe, src); err != nil {
 		slog.Warn("binding: 详情端点参数与注册表不符（re-gen 漂移？），跳过本轮补全",
 			"source_id", src.ID, "endpoint", es.Endpoint, "err", err)
-		return
+		return nil
 	}
 
 	// 候选：被截断（≥MinRunes 即上游截断信号）且必备字段在手。
@@ -891,7 +964,7 @@ func (b *BindingFetcher) enrich(ctx context.Context, src types.Source, es *enric
 		cands = append(cands, cand{i, ids[i]})
 	}
 	if len(cands) == 0 {
-		return
+		return nil
 	}
 
 	// 计费闸门按 canonical_key（全局身份，不带 source_id）：别的源/用户补全过的
@@ -904,7 +977,7 @@ func (b *BindingFetcher) enrich(ctx context.Context, src types.Source, es *enric
 	if err != nil {
 		slog.Warn("binding: 查询已补全 canonical_key 失败，跳过本轮详情补全",
 			"source_id", src.ID, "candidates", len(cands), "err", err)
-		return
+		return nil
 	}
 
 	interval := b.detailInterval
@@ -924,16 +997,20 @@ func (b *BindingFetcher) enrich(ctx context.Context, src types.Source, es *enric
 		if time.Now().After(deadline) {
 			slog.Warn("binding: 详情补全预算用尽，剩余条目保留截断正文待下轮",
 				"source_id", src.ID, "enriched", sent, "budget", budget)
-			return
+			return nil
 		}
 		if !b.waitDetailSlot(ctx, interval) {
 			slog.Warn("binding: 上下文取消，剩余条目保留截断正文", "source_id", src.ID, "enriched", sent)
-			return
+			return nil
 		}
 		sent++
 
-		desc, derr := b.fetchDetail(ctx, src, entry, es, c.id, raws[c.i])
+		desc, derr := b.fetchDetail(
+			ctx, src, entry, es, c.id, raws[c.i], beforeEffect)
 		if derr != nil {
+			if isEffectGateError(derr) {
+				return derr
+			}
 			slog.Warn("binding: 详情补全失败，保留截断正文",
 				"source_id", src.ID, "item_id", c.id, "err", derr)
 			continue
@@ -943,6 +1020,7 @@ func (b *BindingFetcher) enrich(ctx context.Context, src types.Source, es *enric
 		}
 		*contents[c.i] = desc
 	}
+	return nil
 }
 
 // waitDetailSlot 拿详情限速槽位；持锁跨越 sleep 是刻意的（上游限"每秒 1 次"，
@@ -963,13 +1041,22 @@ func (b *BindingFetcher) waitDetailSlot(ctx context.Context, interval time.Durat
 
 // fetchDetail 取单条详情正文。任何异常返回 error 交调用方降级，不重试
 // （补全尽力而为，重试只会加剧限流并翻倍成本）。
-func (b *BindingFetcher) fetchDetail(ctx context.Context, src types.Source, entry tikhubcatalog.Entry, es *enrichSpec, id string, raw any) (string, error) {
+func (b *BindingFetcher) fetchDetail(
+	ctx context.Context,
+	src types.Source,
+	entry tikhubcatalog.Entry,
+	es *enrichSpec,
+	id string,
+	raw any,
+	beforeEffect func(context.Context) error,
+) (string, error) {
 	params := map[string]any{es.KeyParam: id}
 	for k, path := range es.ItemParams {
 		v, _ := resolvePath(raw, path)
 		params[k] = scalarString(v)
 	}
-	root, err := b.callAndDecode(ctx, entry, params, es.Envelope, es.MsgPath, src)
+	root, err := b.callAndDecode(
+		ctx, entry, params, es.Envelope, es.MsgPath, src, beforeEffect)
 	if err != nil {
 		return "", err
 	}

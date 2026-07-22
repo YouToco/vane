@@ -96,8 +96,14 @@ type Scorer struct {
 	// 同一 pipeline 内约 50 次打分共用同一负面清单快照，既避免撕裂
 	// （前 30 条与后 20 条看到不同清单）也避免重复查询。
 	negMu    sync.Mutex
-	negCache map[string][]string
-	negOrder []string
+	negCache map[negativeCacheKey][]string
+	negOrder []negativeCacheKey
+}
+
+type negativeCacheKey struct {
+	tenantID int64
+	userID   int64
+	traceID  string
 }
 
 // New 构造 Scorer。依赖由 cmd/server 装配时注入，便于单测替换。
@@ -107,7 +113,7 @@ func New(cli *llm.Client, rec *llm.Recorder, st *store.Store, hints *profilehint
 		rec:      rec,
 		st:       st,
 		hints:    hints,
-		negCache: make(map[string][]string, negCacheMaxEntries),
+		negCache: make(map[negativeCacheKey][]string, negCacheMaxEntries),
 	}
 }
 
@@ -118,25 +124,53 @@ func New(cli *llm.Client, rec *llm.Recorder, st *store.Store, hints *profilehint
 // 不变；非空时由 promptguard 消毒新定界符并追加到已构造好的 user prompt 尾部。
 
 func (sc *Scorer) Score(ctx context.Context, userID int64, item types.ContentItem, traceID, taskInstruction string) (float64, error) {
+	return sc.score(ctx, 0, userID, item, traceID, taskInstruction, legacyScoreExecutionV1(), nil)
+}
+
+func (sc *Scorer) score(
+	ctx context.Context,
+	tenantID int64,
+	userID int64,
+	item types.ContentItem,
+	traceID string,
+	taskInstruction string,
+	execution scoreExecutionV1,
+	beforeSpend func(context.Context, float64) error,
+) (float64, error) {
+	if !execution.taskInstructionEnabled {
+		taskInstruction = ""
+	}
+	profileHint := ""
+	if tenantID > 0 {
+		profileHint = sc.hints.HintForTenant(ctx, tenantID, userID, traceID)
+	} else {
+		profileHint = sc.hints.Hint(ctx, userID, traceID)
+	}
 	userPrompt := buildScoreUser(
-		sc.hints.Hint(ctx, userID, traceID),
-		sc.negTitles(ctx, userID, traceID),
+		profileHint,
+		sc.negTitles(ctx, tenantID, userID, traceID),
 		item)
 	req := llm.Request{
-		System:      scoreSystemPrompt,
+		System:      execution.systemPrompt,
 		User:        promptguard.AppendTaskInstruction(userPrompt, taskInstruction),
-		Temperature: f32ptr(0), // 打分要稳定可复现，温度取 0
-		MaxTokens:   iptr(16),  // 只需一个数字，压满上限省 token
+		Model:       execution.model,
+		Temperature: f32ptr(execution.temperature), // 打分要稳定可复现，温度取 0
+		MaxTokens:   iptr(execution.maxTokens),     // 只需一个数字，压满上限省 token
 		// 必须关思维链：V4 默认 reasoning 会把 16 token 预算全部吃光、content 恒空，
 		// 打分全部回退中位分（2026-07-14 生产实锤：118/118 次空输出，三批全 50 分）。
-		DisableThinking: true,
+		DisableThinking: execution.disableThinking,
 	}
 
 	meta := llm.CallMeta{
-		TraceID:  traceID,
-		SpanName: "score",
-		UserID:   &userID,
-		RefType:  types.RefTypeContentItem,
+		TraceID:     traceID,
+		SpanName:    "score",
+		UserID:      &userID,
+		RefType:     types.RefTypeContentItem,
+		QuotaRule:   execution.quotaRule,
+		BeforeSpend: beforeSpend,
+	}
+	if tenantID > 0 {
+		meta.TenantID = &tenantID
 	}
 	// RefID 关联到具体内容条目，便于在 llm_calls 里回溯"这次打分打的是哪条"。
 	// item.ID 为 0（尚未落库）时不关联，避免写入无意义的 ref_id=0。
@@ -145,7 +179,11 @@ func (sc *Scorer) Score(ctx context.Context, userID int64, item types.ContentIte
 		meta.RefID = &id
 	}
 
-	resp, err := llm.Do(ctx, sc.cli, sc.rec, meta, req)
+	client := sc.cli
+	if execution.client != nil {
+		client = execution.client
+	}
+	resp, err := llm.Do(ctx, client, sc.rec, meta, req)
 	if err != nil {
 		return 0, err
 	}
@@ -167,16 +205,17 @@ func (sc *Scorer) Score(ctx context.Context, userID int64, item types.ContentIte
 // 降级铁律同画像提示：负面清单是增强不是门槛，读取失败 WARN + 空列表，
 // 空列表同样入缓存（降级结果也是本 trace 的一致快照，且避免反复打失败查询）。
 // 锁内查库与 profilehint.Cache 同构：同 trace 并发首查只打一次 DB。
-func (sc *Scorer) negTitles(ctx context.Context, userID int64, traceID string) []string {
+func (sc *Scorer) negTitles(ctx context.Context, tenantID, userID int64, traceID string) []string {
+	key := negativeCacheKey{tenantID: tenantID, userID: userID, traceID: traceID}
 	sc.negMu.Lock()
 	defer sc.negMu.Unlock()
 
-	if titles, ok := sc.negCache[traceID]; ok {
+	if titles, ok := sc.negCache[key]; ok {
 		return titles
 	}
-	titles := sc.fetchNegTitles(ctx, userID, traceID)
-	sc.negCache[traceID] = titles
-	sc.negOrder = append(sc.negOrder, traceID)
+	titles := sc.fetchNegTitles(ctx, tenantID, userID, traceID)
+	sc.negCache[key] = titles
+	sc.negOrder = append(sc.negOrder, key)
 	if len(sc.negOrder) > negCacheMaxEntries {
 		delete(sc.negCache, sc.negOrder[0])
 		copy(sc.negOrder, sc.negOrder[1:])
@@ -186,16 +225,26 @@ func (sc *Scorer) negTitles(ctx context.Context, userID int64, traceID string) [
 }
 
 // fetchNegTitles 读窗口内 per-delivery 最新态度为负的内容标题，按降级铁律吞掉所有错误。
-func (sc *Scorer) fetchNegTitles(ctx context.Context, userID int64, traceID string) []string {
+func (sc *Scorer) fetchNegTitles(ctx context.Context, tenantID, userID int64, traceID string) []string {
 	// nil store 视同无负反馈：与 llm.Recorder 对 nil store 的 no-op 约定同构，
 	// 让无数据库的单测走"空负反馈"路径而非 panic。
 	if sc.st == nil {
 		return nil
 	}
-	titles, err := sc.st.ListRecentNegativeFeedbackTitles(ctx, userID,
-		time.Now().Add(-negFeedbackWindow), negFeedbackMax)
+	var (
+		titles []string
+		err    error
+	)
+	if tenantID > 0 {
+		titles, err = sc.st.ListRecentNegativeFeedbackTitlesForTenant(
+			ctx, tenantID, userID, time.Now().Add(-negFeedbackWindow), negFeedbackMax)
+	} else {
+		titles, err = sc.st.ListRecentNegativeFeedbackTitles(
+			ctx, userID, time.Now().Add(-negFeedbackWindow), negFeedbackMax)
+	}
 	if err != nil {
 		slog.Warn("scorer: 负面反馈标题读取失败，降级为空列表",
+			"tenant_id", tenantID,
 			"user_id", userID,
 			"trace_id", traceID,
 			"err", err)

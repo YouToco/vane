@@ -13,12 +13,22 @@ import (
 	"fmt"
 
 	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/types"
 )
 
 // Multi 持有各类型抓取器。零外部状态，多 goroutine 可并发复用。
 type Multi struct {
+	rss          *Fetcher
+	exa          *ExaFetcher
+	exaContents  *ExaContentsFetcher
+	binding      *BindingFetcher
+	runtimeV1    *RuntimeFetchResolverV1
+	runtimeV1Err error
+}
+
+type runtimeFetchExecutorSetV1 struct {
 	rss         *Fetcher
 	exa         *ExaFetcher
 	exaContents *ExaContentsFetcher
@@ -34,6 +44,64 @@ type Multi struct {
 //
 // rec 是绑定引擎的调用记账（tool_calls，契约 §5）；nil 合法（只是不记账）。
 func NewMulti(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorder) *Multi {
+	multi, err := NewMultiWithRuntimeRoutesV1(cfg, seen, rec)
+	if err == nil {
+		return multi
+	}
+	// Config.Validate rejects invalid generations in production. Preserve the
+	// legacy fetch surface for direct/test construction while making compiled
+	// execution fail closed with the composition error.
+	set := newRuntimeFetchExecutorSetV1(cfg, seen, rec)
+	return &Multi{
+		rss: set.rss, exa: set.exa, exaContents: set.exaContents,
+		binding: set.binding, runtimeV1Err: err,
+	}
+}
+
+// NewMultiWithRuntimeRoutesV1 composes the current legacy executors plus an
+// immutable compiled-route registry. retainedRoutes lets a deployment keep
+// older endpoint/key generations alive during rotation; duplicate identities
+// are rejected and never replaced by the current route.
+func NewMultiWithRuntimeRoutesV1(
+	cfg config.FetchConfig,
+	seen SeenChecker,
+	rec BindingCallRecorder,
+	retainedRoutes ...RuntimeFetchRouteV1,
+) (*Multi, error) {
+	set := newRuntimeFetchExecutorSetV1(cfg, seen, rec)
+	currentRoutes, err := runtimeFetchRoutesV1(cfg, set)
+	if err != nil {
+		return nil, err
+	}
+	routes := make([]RuntimeFetchRouteV1, 0, len(currentRoutes)+len(retainedRoutes))
+	routes = append(routes, currentRoutes...)
+	routes = append(routes, retainedRoutes...)
+	resolver, err := NewRuntimeFetchResolverV1(routes...)
+	if err != nil {
+		return nil, err
+	}
+	return &Multi{
+		rss: set.rss, exa: set.exa, exaContents: set.exaContents,
+		binding: set.binding, runtimeV1: resolver,
+	}, nil
+}
+
+// NewRuntimeFetchRoutesV1 constructs one independently retained provider set.
+// The returned routes can be supplied to NewMultiWithRuntimeRoutesV1 while an
+// older generation is still allowed to finish already-prepared runs.
+func NewRuntimeFetchRoutesV1(
+	cfg config.FetchConfig,
+	seen SeenChecker,
+	rec BindingCallRecorder,
+) ([]RuntimeFetchRouteV1, error) {
+	return runtimeFetchRoutesV1(cfg, newRuntimeFetchExecutorSetV1(cfg, seen, rec))
+}
+
+func newRuntimeFetchExecutorSetV1(
+	cfg config.FetchConfig,
+	seen SeenChecker,
+	rec BindingCallRecorder,
+) runtimeFetchExecutorSetV1 {
 	// RSS 抓取器接上正文补全：链接型聚合器（HN/Lobsters/Reddit）的条目只给标题和
 	// 链接、不带正文，不补的话整批被 §12.3 护栏丢弃（2026-07-18 生产实证）。
 	// 复用已经构造好的 exaContents 取正文、复用 seen 做付费闸门，不新增装配参数。
@@ -42,12 +110,86 @@ func NewMulti(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorder)
 	rss.enricher = exaContents
 	rss.seen = seen
 
-	return &Multi{
+	return runtimeFetchExecutorSetV1{
 		rss:         rss,
 		exa:         NewExa(cfg, rec),
 		exaContents: exaContents,
 		binding:     NewBinding(cfg, seen, rec),
 	}
+}
+
+func runtimeFetchRoutesV1(
+	cfg config.FetchConfig,
+	set runtimeFetchExecutorSetV1,
+) ([]RuntimeFetchRouteV1, error) {
+	exaGeneration := cfg.CompiledExaCredentialGeneration
+	if exaGeneration == 0 {
+		exaGeneration = runtimepolicy.PrimaryGenerationV1
+	}
+	tikHubGeneration := cfg.CompiledTikHubCredentialGeneration
+	if tikHubGeneration == 0 {
+		tikHubGeneration = runtimepolicy.PrimaryGenerationV1
+	}
+	if exaGeneration < 0 || tikHubGeneration < 0 {
+		return nil, fmt.Errorf("fetcher: compiled credential generation must be positive")
+	}
+	exaRef := runtimepolicy.CredentialRefV1{
+		ID: runtimepolicy.CredentialIDExaPrimaryV1, Generation: exaGeneration,
+	}
+	tikHubRef := runtimepolicy.CredentialRefV1{
+		ID: runtimepolicy.CredentialIDTikHubPrimaryV1, Generation: tikHubGeneration,
+	}
+	routes := []RuntimeFetchRouteV1{
+		{
+			Capability: runtimepolicy.CapabilityV1{
+				Platform: string(types.PlatformWeb), Capability: string(types.CapFeed),
+				Kind:                     string(types.KindArticle),
+				ImplementationVersion:    runtimepolicy.CapabilityImplementationRSSV1,
+				DependencyCredentialRefs: []runtimepolicy.CredentialRefV1{exaRef},
+			},
+			RSS: set.rss,
+		},
+		{
+			Capability: runtimepolicy.CapabilityV1{
+				Platform: string(types.PlatformWeb), Capability: string(types.CapSearch),
+				Kind:                  string(types.KindArticle),
+				ImplementationVersion: runtimepolicy.CapabilityImplementationExaV1,
+				CredentialRef:         exaRef,
+			},
+			ExaSearch: set.exa,
+		},
+		{
+			Capability: runtimepolicy.CapabilityV1{
+				Platform: string(types.PlatformWeb), Capability: string(types.CapContents),
+				Kind:                  string(types.KindPageContent),
+				ImplementationVersion: runtimepolicy.CapabilityImplementationExaV1,
+				CredentialRef:         exaRef,
+			},
+			ExaContents: set.exaContents,
+		},
+	}
+	for _, pair := range []struct {
+		platform   types.Platform
+		capability types.Capability
+	}{
+		{types.PlatformX, types.CapUserPosts},
+		{types.PlatformXHS, types.CapSearch},
+		{types.PlatformXHS, types.CapUserPosts},
+		{types.PlatformXHS, types.CapHotList},
+		{types.PlatformXHS, types.CapTopicFeed},
+		{types.PlatformXHS, types.CapFavedNotes},
+	} {
+		routes = append(routes, RuntimeFetchRouteV1{
+			Capability: runtimepolicy.CapabilityV1{
+				Platform: string(pair.platform), Capability: string(pair.capability),
+				Kind:                  string(types.KindArticle),
+				ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
+				CredentialRef:         tikHubRef,
+			},
+			Binding: set.binding,
+		})
+	}
+	return routes, nil
 }
 
 // Binding 暴露绑定引擎（agent 的试跑准入用 Probe，见 endpoint-binding-contract.md §2.2）。

@@ -81,7 +81,25 @@ type evolveOutput struct {
 // 演化失败不阻断推送的红线由调用方（workflow 吞错只 Warn）兜底，本方法
 // 只需保证"非 nil error 时游标未动"，使上层重试不会重复消费反馈。
 func (e *Evolver) Evolve(ctx context.Context, userID int64, traceID string) error {
-	p, err := e.st.GetProfile(ctx, userID)
+	return e.evolve(ctx, 0, userID, traceID, legacyEvolveExecutionV1(), nil, nil)
+}
+
+func (e *Evolver) evolve(
+	ctx context.Context,
+	tenantID int64,
+	userID int64,
+	traceID string,
+	execution evolveExecutionV1,
+	beforeSpend func(context.Context, float64) error,
+	writes *CompiledProfileWritesV1,
+) error {
+	var p *types.Profile
+	var err error
+	if tenantID > 0 {
+		p, err = e.st.GetProfileForTenant(ctx, tenantID, userID)
+	} else {
+		p, err = e.st.GetProfile(ctx, userID)
+	}
 	if err != nil {
 		if errors.Is(err, types.ErrNotFound) {
 			// 无画像：演化以画像行存在为前提（首采后才有演化对象），静默短路。
@@ -91,7 +109,14 @@ func (e *Evolver) Evolve(ctx context.Context, userID int64, traceID string) erro
 	}
 	// UpdatedAt + LastEvolvedFeedbackID 即本轮 CAS token（双条件，审查 F6），
 	// 期间任何人工修正 / 并发演化都会使写回退让。
-	batch, err := e.st.ListFeedbacksForEvolution(ctx, userID, p.LastEvolvedFeedbackID, batchLimit)
+	var batch []types.FeedbackWithContent
+	if tenantID > 0 {
+		batch, err = e.st.ListFeedbacksForEvolutionForTenant(
+			ctx, tenantID, userID, p.LastEvolvedFeedbackID, batchLimit)
+	} else {
+		batch, err = e.st.ListFeedbacksForEvolution(
+			ctx, userID, p.LastEvolvedFeedbackID, batchLimit)
+	}
 	if err != nil {
 		return err
 	}
@@ -103,35 +128,45 @@ func (e *Evolver) Evolve(ctx context.Context, userID int64, traceID string) erro
 	newCursor := batch[len(batch)-1].ID
 
 	req := llm.Request{
-		System:      evolveSystemPrompt,
+		System:      execution.systemPrompt,
 		User:        buildEvolveUser(p, dedupLatest(batch)),
-		Temperature: f32ptr(0),
-		MaxTokens:   iptr(800),
+		Model:       execution.model,
+		Temperature: f32ptr(execution.temperature),
+		MaxTokens:   iptr(execution.maxTokens),
 		// 结构化输出必须关思维链：V4 默认 reasoning 会吃掉 max_tokens 预算
 		// 导致 content 空（2026-07-14 打分全回退中位分的同型事故）。
-		DisableThinking: true,
+		DisableThinking: execution.disableThinking,
 	}
 	profileID := p.ID
 	meta := llm.CallMeta{
-		TraceID:  traceID,
-		SpanName: "profile_evolve",
-		UserID:   &userID,
-		RefType:  types.RefTypeProfile,
-		RefID:    &profileID,
+		TraceID:     traceID,
+		SpanName:    "profile_evolve",
+		UserID:      &userID,
+		RefType:     types.RefTypeProfile,
+		QuotaRule:   execution.quotaRule,
+		BeforeSpend: beforeSpend,
+		RefID:       &profileID,
 	}
-	resp, err := llm.Do(ctx, e.cli, e.rec, meta, req)
+	if tenantID > 0 {
+		meta.TenantID = &tenantID
+	}
+	client := e.cli
+	if execution.client != nil {
+		client = execution.client
+	}
+	resp, err := llm.Do(ctx, client, e.rec, meta, req)
 	if err != nil {
 		return err
 	}
 
 	var out evolveOutput
 	if err := json.Unmarshal([]byte(stripFences(resp.Content)), &out); err != nil {
-		return e.discardBatch(ctx, p, userID, traceID, newCursor,
+		return e.discardBatch(ctx, p, userID, traceID, newCursor, writes,
 			fmt.Sprintf("输出不是合法 JSON: %v", err), resp.Content)
 	}
 	summary := strings.TrimSpace(out.Summary)
 	if summary == "" {
-		return e.discardBatch(ctx, p, userID, traceID, newCursor, "summary 为空", resp.Content)
+		return e.discardBatch(ctx, p, userID, traceID, newCursor, writes, "summary 为空", resp.Content)
 	}
 	summary = promptguard.TruncateRunes(summary, maxSummaryRunes)
 	tags := normalizeTags(out.Tags, p.Tags)
@@ -140,10 +175,14 @@ func (e *Evolver) Evolve(ctx context.Context, userID int64, traceID string) erro
 	// 新增计数看到的是最终集合。
 	tags = dropRemovedTags(tags, p.Tags, p.RemovedTags, userID, traceID)
 	if reason := checkTagGuard(p.Tags, tags); reason != "" {
-		return e.discardBatch(ctx, p, userID, traceID, newCursor, reason, resp.Content)
+		return e.discardBatch(ctx, p, userID, traceID, newCursor, writes, reason, resp.Content)
 	}
 
-	err = e.st.EvolveProfile(ctx, userID, summary, tags, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+	if writes != nil {
+		err = writes.Evolve(ctx, summary, tags, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+	} else {
+		err = e.st.EvolveProfile(ctx, userID, summary, tags, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+	}
 	if err != nil {
 		if errors.Is(err, types.ErrConflict) {
 			slog.Info("evolver: 演化写回 CAS 冲突，丢弃本轮（人工修正恒赢，游标不动）",
@@ -158,14 +197,29 @@ func (e *Evolver) Evolve(ctx context.Context, userID int64, traceID string) erro
 // discardBatch 语义失败处置（契约 §9）：AdvanceProfileCursor 标记本批已消费防死循环
 // + WARN（raw 前 500 字符可追查）+ 返回 nil。推进冲突说明画像已被并发修改，
 // 本批交给下轮在新画像上重算，同样静默；只有 DB 故障才上抛（游标未动，重试安全）。
-func (e *Evolver) discardBatch(ctx context.Context, p *types.Profile, userID int64, traceID string, newCursor int64, reason, raw string) error {
+func (e *Evolver) discardBatch(
+	ctx context.Context,
+	p *types.Profile,
+	userID int64,
+	traceID string,
+	newCursor int64,
+	writes *CompiledProfileWritesV1,
+	reason string,
+	raw string,
+) error {
 	slog.Warn("evolver: 演化语义失败，推进游标丢弃本批",
 		"user_id", userID,
 		"trace_id", traceID,
 		"new_cursor", newCursor,
 		"reason", reason,
 		"raw", promptguard.TruncateRunes(raw, maxRawWarnRunes))
-	if err := e.st.AdvanceProfileCursor(ctx, userID, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID); err != nil {
+	var err error
+	if writes != nil {
+		err = writes.AdvanceCursor(ctx, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+	} else {
+		err = e.st.AdvanceProfileCursor(ctx, userID, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+	}
+	if err != nil {
 		if errors.Is(err, types.ErrConflict) {
 			return nil
 		}

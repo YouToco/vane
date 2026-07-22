@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -88,6 +89,16 @@ func (f *fakeSeen) EnrichedCanonicalKeys(_ context.Context, _ []string, _ int) (
 		return map[string]struct{}{}, nil
 	}
 	return f.keys, nil
+}
+
+type notifyingSeen struct {
+	once   sync.Once
+	called chan struct{}
+}
+
+func (f *notifyingSeen) EnrichedCanonicalKeys(_ context.Context, _ []string, _ int) (map[string]struct{}, error) {
+	f.once.Do(func() { close(f.called) })
+	return map[string]struct{}{}, nil
 }
 
 func newTestBinding(srvURL string, seen SeenChecker, rec BindingCallRecorder) *BindingFetcher {
@@ -668,6 +679,75 @@ func TestBinding_Enrich_ShortDescNotEnriched(t *testing.T) {
 	}
 	if n := len(up.requests(pathDetail)); n != 0 {
 		t.Errorf("<60 rune 是完整正文，不该调详情（零内容损失、省一次计费），实际 %d 次", n)
+	}
+}
+
+func TestBinding_EffectGateRechecksAfterDetailLimiterWait(t *testing.T) {
+	trunc := strings.Repeat("字", 60)
+	up := newFakeUpstream()
+	up.bodies[pathSearch] = enrichSearchBody(trunc)
+	up.bodies[pathDetail] = enrichDetailBody(
+		"e1e1e1e1e1e1e1e1e1e1e1e1", "不应被调用")
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	seen := &notifyingSeen{called: make(chan struct{})}
+	b := newTestBinding(srv.URL, seen, nil)
+
+	// Hold the shared limiter while the main request completes. The compiled
+	// authorization is revoked while the detail call is waiting for this slot.
+	b.rateMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			b.rateMu.Unlock()
+		}
+	}()
+
+	var authorized atomic.Bool
+	authorized.Store(true)
+	var gateCalls atomic.Int32
+	errRevoked := errors.New("compiled task revoked")
+	beforeEffect := func(context.Context) error {
+		gateCalls.Add(1)
+		if !authorized.Load() {
+			return errRevoked
+		}
+		return nil
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.fetchWithEffectGate(
+			t.Context(), bindingSrc(types.CapSearch, `{"keyword":"k"}`), beforeEffect)
+		done <- err
+	}()
+
+	select {
+	case <-seen.called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("detail enrichment did not reach its limiter")
+	}
+	authorized.Store(false)
+	b.rateMu.Unlock()
+	locked = false
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errRevoked) {
+			t.Fatalf("Fetch error = %v, want revocation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Fetch did not return after revocation")
+	}
+	if got := len(up.requests(pathSearch)); got != 1 {
+		t.Fatalf("main requests = %d, want 1", got)
+	}
+	if got := len(up.requests(pathDetail)); got != 0 {
+		t.Fatalf("detail requests after revocation = %d, want 0", got)
+	}
+	if got := gateCalls.Load(); got != 2 {
+		t.Fatalf("effect gate calls = %d, want main + detail", got)
 	}
 }
 

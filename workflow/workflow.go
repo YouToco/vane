@@ -49,21 +49,92 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 都只是"没有行"。未跑到的阶段保持 nil，不是 0（见 types.PipelineCounts：
 	// "没跑"和"跑了得 0"是两种不同的事故，用零值记录等于重造一次本 PR 要修的混淆）。
 	var counts types.PipelineCounts
+	var compiledRun *CompiledRunInputV1
 
-	// Activation safety gate: Temporal Unpause and the Postgres active mirror
-	// cannot share a transaction. A run may start in that narrow window (or
-	// after membership revocation), so the first DB Activity must authorize the
-	// exact schedule before profile LLM, fetch, scoring, cards, or push can run.
-	if workflow.GetVersion(ctx, "scheduled-run-authorization", workflow.DefaultVersion, 1) >= 1 {
-		var authorized bool
-		authorizeCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
-		if err := workflow.ExecuteActivity(authorizeCtx, a.AuthorizeRun, p).Get(authorizeCtx, &authorized); err != nil {
+	// New-format scheduled Actions carry an explicit tenant and a rollout-
+	// approved mode. GetVersion preserves already-started histories; the exact
+	// all-zero pre-C1b envelope below also keeps the live-authorized legacy path
+	// until asynchronous Action reconciliation succeeds.
+	runtimeEnvelopeVersion := workflow.DefaultVersion
+	if p.RunKind == PushRunKindScheduled {
+		runtimeEnvelopeVersion = workflow.GetVersion(
+			ctx, "scheduled-runtime-envelope-v1", workflow.DefaultVersion, 1)
+	}
+	// A pre-C1b durable Action has all three envelope fields at their zero
+	// values. ReconcileActions upgrades it asynchronously, so a trigger may
+	// legitimately freeze that old shape during deployment or after one
+	// best-effort reconcile failure. Preserve the existing AuthorizeRun path for
+	// that exact legacy shape; it still validates schedule_id + user_id against
+	// live Postgres before any effect. Once any envelope field is present, the
+	// tuple is all-or-nothing and fails closed when partial or unknown.
+	hasRuntimeEnvelopeV1 := p.TenantID != 0 || p.ExecutionMode != "" || p.RuntimeVersion != ""
+	if runtimeEnvelopeVersion >= 1 && hasRuntimeEnvelopeV1 {
+		if p.TenantID <= 0 {
+			return types.NewAppError(types.CodeValidation,
+				"scheduled run is missing an explicit tenant", nil)
+		}
+		if p.ExecutionMode != types.ExecutionModeCompiled {
+			return types.NewAppError(types.CodeValidation,
+				"scheduled run execution mode must be compiled", nil)
+		}
+		if p.RuntimeVersion != "" && p.RuntimeVersion != CompiledRuntimeSnapshotV1 {
+			return types.NewAppError(types.CodeValidation,
+				"scheduled run runtime version is not supported", nil)
+		}
+	}
+
+	// C1b: only trusted scheduled Actions with an explicit tenant enter the
+	// immutable snapshot path. The command sequence is separately versioned;
+	// existing histories and ad-hoc/legacy inputs keep their old sequence.
+	if p.RunKind == PushRunKindScheduled && p.ExecutionMode == types.ExecutionModeCompiled &&
+		p.RuntimeVersion == CompiledRuntimeSnapshotV1 &&
+		workflow.GetVersion(ctx, "compiled-run-snapshot-v1", workflow.DefaultVersion, 1) >= 1 {
+		prepareCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
+		var prepared PrepareRunResult
+		if err := workflow.ExecuteActivity(prepareCtx, a.PrepareRun, p).Get(prepareCtx, &prepared); err != nil {
 			return err
 		}
-		if !authorized {
-			log.Warn("push pipeline 未获任务运行授权，零外部副作用退出",
-				"user_id", p.UserID, "schedule_id", p.ScheduleID, "trace_id", traceID)
+		info := workflow.GetInfo(ctx).WorkflowExecution
+		expected := types.RunIdentity{
+			TemporalWorkflowID: info.ID,
+			TemporalRunID:      info.RunID,
+			RunKind:            types.RunSnapshotKindScheduled,
+			TenantID:           p.TenantID,
+			UserID:             p.UserID,
+			TaskID:             p.ScheduleID,
+		}
+		if err := prepared.ValidateFor(expected); err != nil {
+			return err
+		}
+		if !prepared.Authorized {
+			log.Warn("push pipeline 未获快照运行授权，零外部副作用退出",
+				"tenant_id", p.TenantID, "user_id", p.UserID,
+				"schedule_id", p.ScheduleID, "trace_id", traceID)
 			return nil
+		}
+		ref := prepared.Snapshot
+		p.Snapshot = &ref
+		compiledRun = &CompiledRunInputV1{
+			TenantID: p.TenantID,
+			TaskID:   p.ScheduleID,
+			Snapshot: ref,
+		}
+	} else {
+		// Activation safety gate: Temporal Unpause and the Postgres active mirror
+		// cannot share a transaction. A run may start in that narrow window (or
+		// after membership revocation), so the first DB Activity must authorize the
+		// exact schedule before profile LLM, fetch, scoring, cards, or push can run.
+		if workflow.GetVersion(ctx, "scheduled-run-authorization", workflow.DefaultVersion, 1) >= 1 {
+			var authorized bool
+			authorizeCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
+			if err := workflow.ExecuteActivity(authorizeCtx, a.AuthorizeRun, p).Get(authorizeCtx, &authorized); err != nil {
+				return err
+			}
+			if !authorized {
+				log.Warn("push pipeline 未获任务运行授权，零外部副作用退出",
+					"user_id", p.UserID, "schedule_id", p.ScheduleID, "trace_id", traceID)
+				return nil
+			}
 		}
 	}
 
@@ -92,7 +163,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	recordEmpty := func(gate types.BatchExitGate, maxScore float64) {
 		// 用 quick 档：纯一条 INSERT，且它无论如何都不该拖长一次"其实没事干"的运行。
 		recCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
-		in := RecordEmptyIn{UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID, Gate: gate, Counts: counts}
+		in := RecordEmptyIn{UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID, Gate: gate, Counts: counts, Run: compiledRun}
 		if err := workflow.ExecuteActivity(recCtx, a.RecordEmptyBatch, in).Get(recCtx, nil); err != nil {
 			log.Warn("空批次记账失败，本次仍按正常终态结束",
 				"user_id", p.UserID, "trace_id", traceID, "gate", gate, "err", err)
@@ -113,7 +184,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 		// 失败同样只 Warn：通知是附加信息，不能把正常空终态变成失败。
 		if userTriggered || gate == types.BatchExitGateSelect || gate == types.BatchExitGateQuota {
 			ntCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
-			nin := NotifyEmptyIn{UserID: p.UserID, TraceID: traceID, Gate: gate, Counts: counts}
+			nin := NotifyEmptyIn{UserID: p.UserID, TraceID: traceID, Gate: gate, Counts: counts, Run: compiledRun}
 			if gate == types.BatchExitGateSelect && maxScore >= 0 {
 				nin.ScheduleID = p.ScheduleID
 				nin.MaxScore = maxScore
@@ -127,7 +198,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 0. EvolveProfile —— 画像演化前置步（Boss 拍板①：每次推送前批量消费反馈）。
 	// 红线：演化失败永不阻断推送——重试耗尽后错误吞掉只 Warn，pipeline 照常走。
 	evolveCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
-	if err := workflow.ExecuteActivity(evolveCtx, a.EvolveProfile, EvolveIn{UserID: p.UserID, TraceID: traceID}).Get(evolveCtx, nil); err != nil {
+	if err := workflow.ExecuteActivity(evolveCtx, a.EvolveProfile, EvolveIn{UserID: p.UserID, TraceID: traceID, Run: compiledRun}).Get(evolveCtx, nil); err != nil {
 		log.Warn("画像演化失败，继续推送", "user_id", p.UserID, "trace_id", traceID, "err", err)
 	}
 
@@ -147,7 +218,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 2. Dedup —— 纯计算 + 少量查库（simhash 窗口）。
 	var deduped []types.ContentItem
 	dedupCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
-	if err := workflow.ExecuteActivity(dedupCtx, a.Dedup, DedupIn{UserID: p.UserID, TraceID: traceID, Items: items}).Get(dedupCtx, &deduped); err != nil {
+	if err := workflow.ExecuteActivity(dedupCtx, a.Dedup, DedupIn{UserID: p.UserID, TraceID: traceID, Items: items, Run: compiledRun}).Get(dedupCtx, &deduped); err != nil {
 		return err
 	}
 	counts = counts.WithDeduped(len(deduped))
@@ -161,7 +232,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	var scored []types.ScoredItem
 	scoreCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
 	if err := workflow.ExecuteActivity(scoreCtx, a.Score, ScoreIn{
-		UserID: p.UserID, TraceID: traceID, Items: deduped, ScheduleID: p.ScheduleID,
+		UserID: p.UserID, TraceID: traceID, Items: deduped, ScheduleID: p.ScheduleID, Run: compiledRun,
 	}).Get(scoreCtx, &scored); err != nil {
 		// 额度用尽不是故障，是**正常终态**——和"没有新内容"同一类，只是原因不同。
 		// 让它走 workflow 失败会：① 在 Temporal 里堆一串红色的失败记录，
@@ -200,7 +271,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	var selected []types.ScoredItem
 	selectCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
 	if err := workflow.ExecuteActivity(selectCtx, a.Select,
-		SelectIn{UserID: p.UserID, TraceID: traceID, TopN: topN, Scored: scored, ScheduleID: p.ScheduleID}).Get(selectCtx, &selected); err != nil {
+		SelectIn{UserID: p.UserID, TraceID: traceID, TopN: topN, Scored: scored, ScheduleID: p.ScheduleID, Run: compiledRun}).Get(selectCtx, &selected); err != nil {
 		return err
 	}
 	// 本闸门自门槛过滤落地起是**热路径**（此前纯 TopN 时够不着，见 git 史）：
@@ -223,7 +294,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	var cards []GeneratedCard
 	cardCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
 	if err := workflow.ExecuteActivity(cardCtx, a.CardGen, CardGenIn{
-		UserID: p.UserID, TraceID: traceID, Items: selected, ScheduleID: p.ScheduleID,
+		UserID: p.UserID, TraceID: traceID, Items: selected, ScheduleID: p.ScheduleID, Run: compiledRun,
 	}).Get(cardCtx, &cards); err != nil {
 		if isQuotaFailure(err) {
 			recordEmpty(types.BatchExitGateQuota, -1)
@@ -243,7 +314,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 
 	// 6. Push —— 网络 I/O，主动推送飞书卡片。
 	pushCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
-	if err := workflow.ExecuteActivity(pushCtx, a.Push, PushIn{UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID, Cards: cards, TaskTitle: p.NLDesc}).Get(pushCtx, nil); err != nil {
+	if err := workflow.ExecuteActivity(pushCtx, a.Push, PushIn{UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID, Cards: cards, TaskTitle: p.NLDesc, Run: compiledRun}).Get(pushCtx, nil); err != nil {
 		return err
 	}
 

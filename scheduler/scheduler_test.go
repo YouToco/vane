@@ -139,6 +139,19 @@ type createPushStore struct {
 	listUserID  int64
 	insertCalls int
 	inserted    *types.Schedule
+	tenantID    int64
+	tenantErr   error
+}
+
+func (st *createPushStore) ResolveActiveTenantForUser(_ context.Context, _ int64) (int64, error) {
+	st.trace.add("store.tenant")
+	if st.tenantErr != nil {
+		return 0, st.tenantErr
+	}
+	if st.tenantID == 0 {
+		return int64(types.SingleTenantID), nil
+	}
+	return st.tenantID, nil
 }
 
 func (st *createPushStore) ListSchedulesByUser(_ context.Context, userID int64) ([]types.Schedule, error) {
@@ -265,7 +278,7 @@ func TestCreatePush_CurrentBehavior(t *testing.T) {
 			name:         "list failure is returned without touching Temporal",
 			spec:         validSpec,
 			listErr:      listErr,
-			wantCalls:    []string{"store.list"},
+			wantCalls:    []string{"store.tenant", "store.list"},
 			wantCode:     types.CodeDatabase,
 			wantMessage:  "读取调度镜像失败",
 			wantCause:    listCause,
@@ -275,7 +288,7 @@ func TestCreatePush_CurrentBehavior(t *testing.T) {
 			name:        "active limit stops after list",
 			spec:        validSpec,
 			schedules:   activeScheduleFixtures(maxActiveSchedules),
-			wantCalls:   []string{"store.list"},
+			wantCalls:   []string{"store.tenant", "store.list"},
 			wantCode:    types.CodeValidation,
 			wantMessage: "活跃定时任务已达上限（20 个）",
 		},
@@ -286,7 +299,7 @@ func TestCreatePush_CurrentBehavior(t *testing.T) {
 				activeScheduleFixtures(maxActiveSchedules-1),
 				types.Schedule{Status: types.ScheduleStatusPaused},
 			),
-			wantCalls:   []string{"store.list", "temporal.create", "store.insert"},
+			wantCalls:   []string{"store.tenant", "store.list", "temporal.create", "store.insert"},
 			wantSuccess: true,
 			wantSDKSpec: client.ScheduleSpec{
 				CronExpressions: []string{"15 8 * * *"},
@@ -297,7 +310,7 @@ func TestCreatePush_CurrentBehavior(t *testing.T) {
 			name:        "Temporal create failure stops before mirror insert",
 			spec:        validSpec,
 			createErr:   createErr,
-			wantCalls:   []string{"store.list", "temporal.create"},
+			wantCalls:   []string{"store.tenant", "store.list", "temporal.create"},
 			wantCode:    types.CodeInternal,
 			wantMessage: "创建 Temporal 定时任务失败",
 			wantCause:   createErr,
@@ -306,7 +319,7 @@ func TestCreatePush_CurrentBehavior(t *testing.T) {
 			name:        "mirror insert failure deletes the created Temporal schedule",
 			spec:        validSpec,
 			insertErr:   insertErr,
-			wantCalls:   []string{"store.list", "temporal.create", "store.insert", "temporal.get_handle", "temporal.delete"},
+			wantCalls:   []string{"store.tenant", "store.list", "temporal.create", "store.insert", "temporal.get_handle", "temporal.delete"},
 			wantCode:    types.CodeDatabase,
 			wantMessage: "创建定时任务镜像失败，已回滚 Temporal 调度",
 			wantCause:   insertErr,
@@ -316,7 +329,7 @@ func TestCreatePush_CurrentBehavior(t *testing.T) {
 			spec:          validSpec,
 			insertErr:     insertErr,
 			deleteErr:     deleteErr,
-			wantCalls:     []string{"store.list", "temporal.create", "store.insert", "temporal.get_handle", "temporal.delete"},
+			wantCalls:     []string{"store.tenant", "store.list", "temporal.create", "store.insert", "temporal.get_handle", "temporal.delete"},
 			wantCode:      types.CodeDatabase,
 			wantMessage:   "创建定时任务镜像失败，已回滚 Temporal 调度",
 			wantCause:     insertErr,
@@ -328,7 +341,7 @@ func TestCreatePush_CurrentBehavior(t *testing.T) {
 			schedules: []types.Schedule{
 				{Status: types.ScheduleStatusPaused},
 			},
-			wantCalls:   []string{"store.list", "temporal.create", "store.insert"},
+			wantCalls:   []string{"store.tenant", "store.list", "temporal.create", "store.insert"},
 			wantSuccess: true,
 			wantSDKSpec: client.ScheduleSpec{
 				CronExpressions: []string{"15 8 * * *"},
@@ -341,7 +354,7 @@ func TestCreatePush_CurrentBehavior(t *testing.T) {
 				EverySeconds: 6 * 3600,
 				AnchorAt:     "2026-07-19T15:00:00+08:00",
 			},
-			wantCalls:   []string{"store.list", "temporal.create", "store.insert"},
+			wantCalls:   []string{"store.tenant", "store.list", "temporal.create", "store.insert"},
 			wantSuccess: true,
 			wantSDKSpec: client.ScheduleSpec{
 				Intervals: []client.ScheduleIntervalSpec{{
@@ -478,12 +491,20 @@ func assertCreatePushSuccess(
 	if !ok {
 		t.Fatalf("Action Args[0] 类型 = %T，期望 workflow.PushParams", action.Args[0])
 	}
+	if params.TenantID != 1 {
+		t.Errorf("CreatePush tenant_id = %d，期望精确活跃租户 1", params.TenantID)
+	}
+	if params.Snapshot != nil {
+		t.Errorf("CreatePush 不应把单次 run snapshot 写入持久 Action，实得 %+v", params.Snapshot)
+	}
 	wantParams := workflow.PushParams{
-		UserID:     42,
-		RunKind:    workflow.PushRunKindScheduled,
-		ScheduleID: gotID,
-		Scope:      wantScope,
-		NLDesc:     "每日 AI 情报",
+		TenantID:      1,
+		UserID:        42,
+		RunKind:       workflow.PushRunKindScheduled,
+		ExecutionMode: types.ExecutionModeCompiled,
+		ScheduleID:    gotID,
+		Scope:         wantScope,
+		NLDesc:        "每日 AI 情报",
 	}
 	if !reflect.DeepEqual(params, wantParams) {
 		t.Errorf("Action params = %+v，期望 %+v", params, wantParams)
@@ -496,7 +517,7 @@ func assertCreatePushSuccess(
 		t.Fatal("成功路径应写入 schedule 镜像")
 	}
 	mirror := store.inserted
-	if mirror.ID != gotID || mirror.UserID != 42 || mirror.NLDescription != "每日 AI 情报" {
+	if mirror.ID != gotID || mirror.TenantID != 1 || mirror.UserID != 42 || mirror.NLDescription != "每日 AI 情报" {
 		t.Errorf("镜像身份字段 = %+v，期望与 Temporal/调用入参一致", mirror)
 	}
 	if mirror.Status != types.ScheduleStatusActive {
@@ -850,7 +871,7 @@ func TestUpdatePush_镜像失败回滚Temporal(t *testing.T) {
 // 入参里，只换 Spec 会让聚合卡 header 永久显示旧任务名。
 func TestUpdatePush_改名即时回写Action(t *testing.T) {
 	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-abc",
-		[]interface{}{payloadArg(t, makePushParams(1, "push-1-abc", workflow.PushScope{}, "旧任务名"))})}
+		[]interface{}{payloadArg(t, makePushParams(0, 1, "push-1-abc", workflow.PushScope{}, "旧任务名"))})}
 	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
 	st := &fakeScheduleStore{}
 	s := New(fc, "tq", st)
@@ -893,7 +914,7 @@ func TestUpdatePush_改名即时回写Action(t *testing.T) {
 // 失败时，Spec 与 Action 入参要一起回到旧值——只回 Spec 会留下「镜像旧名 / Action
 // 新名」的反向漂移（与原来「镜像新名 / Action 旧名」同样坏）。
 func TestUpdatePush_改名镜像失败回滚Action与Spec(t *testing.T) {
-	oldArgs := []interface{}{payloadArg(t, makePushParams(1, "push-1-abc", workflow.PushScope{}, "旧任务名"))}
+	oldArgs := []interface{}{payloadArg(t, makePushParams(0, 1, "push-1-abc", workflow.PushScope{}, "旧任务名"))}
 	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-abc", oldArgs)}
 	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
 	st := &fakeScheduleStore{updateErr: types.NewAppError(types.CodeDatabase, "模拟镜像写失败", nil)}
@@ -1285,17 +1306,49 @@ func TestReconcileActions_补齐显式ScheduledRunKind(t *testing.T) {
 	}
 }
 
+// 旧 Action 没有 tenant_id，但数据库镜像是调度归属的真相源。reconcile
+// 必须以镜像 TenantID 修正冻结入参，不能继续留在 tenant=0 的 legacy 路径。
+func TestReconcileActions_按数据库租户修正旧Action(t *testing.T) {
+	const tenantID int64 = 7
+	legacy := makePushParams(0, 1, "push-1-tenant", workflow.PushScope{}, "任务名")
+	h := &fakeScheduleHandle{current: reconcileSchedule(
+		"wf-push-1-tenant", []interface{}{payloadArg(t, legacy)},
+	)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{"push-1-tenant": h},
+	}}
+	st := &fakeScheduleStore{active: []types.Schedule{{
+		ID: "push-1-tenant", TenantID: tenantID, UserID: 1, NLDescription: "任务名",
+		ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
+	}}}
+
+	if err := New(fc, "tq", st).ReconcileActions(t.Context()); err != nil {
+		t.Fatalf("ReconcileActions 失败: %v", err)
+	}
+	if len(h.history) != 1 {
+		t.Fatalf("tenant_id 漂移的调度应被 Update 一次，实得 %d", len(h.history))
+	}
+	got := h.current.Action.(*client.ScheduleWorkflowAction).Args[0].(workflow.PushParams)
+	if got.TenantID != tenantID {
+		t.Fatalf("reconciled tenant_id = %d，期望数据库镜像值 %d", got.TenantID, tenantID)
+	}
+	if got.Snapshot != nil {
+		t.Fatalf("reconcile 不应把 run snapshot 写入持久 Action，实得 %+v", got.Snapshot)
+	}
+}
+
 // TestReconcileActions_已带id则跳过 守幂等：Action.Args 已与期望 params 一致
-// （schedule_id + 任务名）的调度——新建的、或上次已 reconcile 过且未改名的——
+// （tenant_id + run_kind + schedule_id + 任务名）的调度——新建的、或上次已
+// reconcile 过且未改名的——
 // 重启时不得再写 Temporal。走真 payload 解码路径。
 func TestReconcileActions_已带id则跳过(t *testing.T) {
-	good := []interface{}{payloadArg(t, makePushParams(1, "push-1-new", workflow.PushScope{}, "任务名"))}
+	good := []interface{}{payloadArg(t, makePushParams(7, 1, "push-1-new", workflow.PushScope{}, "任务名"))}
 	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-new", good)}
 	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
 		handles: map[string]*fakeScheduleHandle{"push-1-new": h},
 	}}
 	st := &fakeScheduleStore{active: []types.Schedule{{
-		ID: "push-1-new", UserID: 1, NLDescription: "任务名",
+		ID: "push-1-new", TenantID: 7, UserID: 1, NLDescription: "任务名",
 		ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
 	}}}
 	s := New(fc, "tq", st)
@@ -1312,7 +1365,7 @@ func TestReconcileActions_已带id则跳过(t *testing.T) {
 // （改名发生在 UpdatePush 即时回写能力上线之前、或即时回写失败过的调度），
 // reconcile 必须把 Action 刷回新名——否则聚合卡 header 永久显示旧任务名。
 func TestReconcileActions_任务名漂移回写(t *testing.T) {
-	stale := []interface{}{payloadArg(t, makePushParams(1, "push-1-ren", workflow.PushScope{}, "旧任务名"))}
+	stale := []interface{}{payloadArg(t, makePushParams(0, 1, "push-1-ren", workflow.PushScope{}, "旧任务名"))}
 	h := &fakeScheduleHandle{current: reconcileSchedule("wf-push-1-ren", stale)}
 	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
 		handles: map[string]*fakeScheduleHandle{"push-1-ren": h},

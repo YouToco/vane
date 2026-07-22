@@ -1103,6 +1103,57 @@ func TestRenderSourcesDisabledAlert(t *testing.T) {
 	}
 }
 
+func TestFetchAlertHelpersAuthorizeAfterCardBuildAndBeforeSend(t *testing.T) {
+	denied := types.NewAppError(types.CodeNotFound, "compiled run revoked", nil)
+	for _, tt := range []struct {
+		name string
+		run  func(*Activities, func(context.Context) error) error
+	}{
+		{
+			name: "failure alert",
+			run: func(a *Activities, before func(context.Context) error) error {
+				return a.alertFetchFailures(t.Context(), []fetchFailure{{
+					src: types.Source{ID: 1, Title: "source"}, failCount: 3,
+				}}, before)
+			},
+		},
+		{
+			name: "disabled alert",
+			run: func(a *Activities, before func(context.Context) error) error {
+				return a.alertSourcesDisabled(t.Context(), []fetchFailure{{
+					src: types.Source{ID: 1, Title: "source"}, failCount: 10,
+				}}, before)
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var events []string
+			push := &fakePusher{}
+			a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, push,
+				&fakeStore{}, fakeFeishu{}, nil,
+				func(string) string {
+					events = append(events, "build")
+					return `{}`
+				}, nil, nil)
+			before := func(context.Context) error {
+				events = append(events, "authorize")
+				return denied
+			}
+
+			err := tt.run(a, before)
+			if !errors.Is(err, denied) {
+				t.Fatalf("authorization error=%v, want %v", err, denied)
+			}
+			if got := strings.Join(events, ","); got != "build,authorize" {
+				t.Fatalf("event order=%q, want build,authorize", got)
+			}
+			if got := len(push.sentCards()); got != 0 {
+				t.Fatalf("revoked alert sent %d cards", got)
+			}
+		})
+	}
+}
+
 // TestDedup_PageContentExemptFromSimhash 钉死 web/contents 的核心正确性（对抗审查 CRITICAL）：
 // KindPageContent 内容豁免 simhash 近似去重。否则同一定价页相邻版本正文几乎相同、simhash
 // 距离必 ≤ 阈值，"价格变化"会被当近重复吞掉、永远推不出去——这正是 page_watch 当年的事故。

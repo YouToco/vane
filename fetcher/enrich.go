@@ -80,7 +80,13 @@ const enrichCacheHours = 24
 // 收窄成接口而非直接依赖具体类型：RSS 抓取器的单测全是纯 httptest，不该为了补全
 // 被迫拖进一个 Exa 客户端。
 type pageTextFetcher interface {
-	pageResults(ctx context.Context, pageURL string, maxAgeHours int, src *types.Source) ([]exaContentsResult, bool, error)
+	pageResultsWithEffectGate(
+		ctx context.Context,
+		pageURL string,
+		maxAgeHours int,
+		src *types.Source,
+		beforeEffect func(context.Context) error,
+	) ([]exaContentsResult, bool, error)
 }
 
 // needsEnrichment 判断一条 feed 条目是否需要跟着链接去读原文。
@@ -117,12 +123,24 @@ func needsEnrichment(link, content string) bool {
 //     但这**不是源坏了**。调用方据此在全灭时报可重试错误而非确定性拒绝
 //     （对抗审查 A-F1：否则「Exa 挂了」会被诬告成「该源格式不兼容、持续零产出」，
 //     用户再也不会重试一个实际健康的源）。
+//
 // maxEnrich 是本轮补全条数上限：周期抓取传 enrichMaxPerRound（10），probe 传更小的
 // probeEnrichCap（5）——试跑只需补够几条证明「补全管用、能产出内容」，无谓为一个未落库
 // 的准入判定付满额详情费，也让 probe 在 probeBudget 内稳定完成（对抗审查 A-F3/A-F4）。
 func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*gofeed.Item, maxEnrich int) (skippedSeen, enrichFailed int) {
+	skippedSeen, enrichFailed, _ = f.enrichItemsWithEffectGate(ctx, src, items, maxEnrich, nil)
+	return skippedSeen, enrichFailed
+}
+
+func (f *Fetcher) enrichItemsWithEffectGate(
+	ctx context.Context,
+	src types.Source,
+	items []*gofeed.Item,
+	maxEnrich int,
+	beforeEffect func(context.Context) error,
+) (skippedSeen, enrichFailed int, err error) {
 	if f.enricher == nil || len(items) == 0 {
-		return 0, 0 // 未装配补全能力（测试/灰度）：退化为不补，行为与改造前一致。
+		return 0, 0, nil // 未装配补全能力（测试/灰度）：退化为不补，行为与改造前一致。
 	}
 
 	// 先挑出候选，再一次性问 SeenChecker——逐条查会把一次批量查询放大成 N 次往返。
@@ -144,7 +162,7 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 		cands = append(cands, cand{it: it, key: key})
 	}
 	if len(cands) == 0 {
-		return 0, 0
+		return 0, 0, nil
 	}
 
 	// 闸门①：已入库且正文已补全的直接跳过（跨源命中同一篇时只有第一个源付费）。
@@ -160,7 +178,7 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 			// （下轮再补，内容不丢），也不要在数据库抖动时打出一批付费调用。
 			slog.Warn("fetcher: 补全闸门查询失败，本轮跳过正文补全",
 				"source_id", src.ID, "candidates", len(cands), "err", err)
-			return 0, 0
+			return 0, 0, nil
 		}
 		skip = got
 	}
@@ -176,10 +194,14 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 			skippedSeen++
 			continue // 闸门①命中：库里已有补全正文，不重复付费。
 		}
-		results, _, err := f.enricher.pageResults(ctx, c.it.Link, enrichCacheHours, &src)
-		if err != nil {
+		results, _, fetchErr := f.enricher.pageResultsWithEffectGate(
+			ctx, c.it.Link, enrichCacheHours, &src, beforeEffect)
+		if isEffectGateError(fetchErr) {
+			return skippedSeen, enrichFailed, fetchErr
+		}
+		if fetchErr != nil {
 			slog.Warn("fetcher: 单条正文补全失败，保留原样",
-				"source_id", src.ID, "url", c.it.Link, "err", err)
+				"source_id", src.ID, "url", c.it.Link, "err", fetchErr)
 			enrichFailed++ // 尝试了但上游报错（对抗审查 A-F1：全灭时据此判瞬态 vs 确定性）。
 			continue
 		}
@@ -201,7 +223,7 @@ func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*go
 			"source_id", src.ID, "enriched", done, "candidates", len(cands),
 			"skipped_seen", skippedSeen, "failed", enrichFailed)
 	}
-	return skippedSeen, enrichFailed
+	return skippedSeen, enrichFailed, nil
 }
 
 // firstNonEmptyText 取第一条有正文的结果（与 mapExaContents 的挑法一致）。

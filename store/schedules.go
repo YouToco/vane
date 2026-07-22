@@ -13,7 +13,7 @@ import (
 )
 
 // scheduleColumns 是 schedules 表全列，SELECT 与 scanSchedule 一一对应。
-const scheduleColumns = `id, user_id, nl_description, spec_json, scope_json, status, created_at, updated_at`
+const scheduleColumns = `id, tenant_id, user_id, nl_description, spec_json, scope_json, status, created_at, updated_at`
 
 // matureSchedulePredicate requires the outer schedules table to use alias s.
 // A v1 aggregate is user-manageable only after its operation is both
@@ -31,7 +31,7 @@ const matureSchedulePredicate = `NOT EXISTS (
 // scanSchedule 把一行 schedules 扫进 types.Schedule（复用于单行与多行）。
 func scanSchedule(row pgx.Row, sc *types.Schedule) error {
 	return row.Scan(
-		&sc.ID, &sc.UserID, &sc.NLDescription, &sc.SpecJSON, &sc.ScopeJSON,
+		&sc.ID, &sc.TenantID, &sc.UserID, &sc.NLDescription, &sc.SpecJSON, &sc.ScopeJSON,
 		&sc.Status, &sc.CreatedAt, &sc.UpdatedAt,
 	)
 }

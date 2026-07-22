@@ -57,8 +57,11 @@ func New(cfg config.LLMConfig) *Client {
 // Request 单轮对话请求。Temperature/MaxTokens 为 nil 时请求体不携带
 // 对应字段（交给上游默认值），因此用指针而非零值区分"未设置"。
 type Request struct {
-	System      string
-	User        string
+	System string
+	User   string
+	// Model overrides the client's legacy default for an immutable prepared
+	// run. Empty preserves the existing caller behavior exactly.
+	Model       string
 	Temperature *float32 // nil = 不传该字段
 	MaxTokens   *int     // nil = 不传该字段
 	// DisableThinking 显式关闭 DeepSeek V4 的思维链输出（thinking: disabled）。
@@ -67,6 +70,10 @@ type Request struct {
 	// content 恒为空（2026-07-14 生产实锤：118/118 次打分 content 空、全部回退中位分）。
 	// 格式固定的结构化输出（打分/出卡）应设 true：省 token、快、且杜绝空 content。
 	DisableThinking bool
+	// BeforeSend is an internal effect gate. Complete invokes it only after the
+	// concurrency slot is acquired and the local payload is valid, immediately
+	// before constructing/sending the HTTP request. It is never serialized.
+	BeforeSend func(context.Context) error `json:"-"`
 }
 
 // Response 单次调用结果。CacheHitTokens/CacheMissTokens 对应 DeepSeek
@@ -156,8 +163,9 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	if req.DisableThinking {
 		thinking = &thinkingConfig{Type: "disabled"}
 	}
+	requestModel := c.requestModel(req.Model)
 	payload, err := json.Marshal(chatRequest{
-		Model:       c.model,
+		Model:       requestModel,
 		Messages:    messages,
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
@@ -165,6 +173,11 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	})
 	if err != nil {
 		return nil, types.NewAppError(types.CodeLLMBadRequest, "llm: 请求体序列化失败", err)
+	}
+	if req.BeforeSend != nil {
+		if err := req.BeforeSend(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -208,7 +221,7 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 
 	model := cr.Model
 	if model == "" {
-		model = c.model
+		model = requestModel
 	}
 	// content 空是隐性故障信号（如思维链吃光 max_tokens 预算导致 finish_reason=length
 	// 且 content=""），静默返回会让上层用兜底值掩盖问题——2026-07-14 打分全回退中位分

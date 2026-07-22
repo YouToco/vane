@@ -16,6 +16,13 @@ type Store interface {
 	GetProfile(ctx context.Context, userID int64) (*types.Profile, error)
 }
 
+// TenantStore is the stricter compiled-runtime read boundary. It is kept
+// separate from Store so legacy/test callers do not silently acquire a
+// tenant-less fallback when an exact run asks for a profile.
+type TenantStore interface {
+	GetProfileForTenant(ctx context.Context, tenantID, userID int64) (*types.Profile, error)
+}
+
 const (
 	// maxTags 展示层截 10 是刻意分层（打分信号聚焦），非数据截断：库内上限 12（契约 §2）。
 	maxTags = 10

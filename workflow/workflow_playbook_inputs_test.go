@@ -70,10 +70,12 @@ func TestPushPipelineWorkflow_P1cLLMActivityInputGolden(t *testing.T) {
 	capture.register(env)
 
 	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
-		UserID:     7,
-		RunKind:    PushRunKindScheduled,
-		ScheduleID: "push-7-playbook",
-		NLDesc:     "每日 AI 情报",
+		TenantID:      1,
+		UserID:        7,
+		RunKind:       PushRunKindScheduled,
+		ExecutionMode: types.ExecutionModeCompiled,
+		ScheduleID:    "push-7-playbook",
+		NLDesc:        "每日 AI 情报",
 	})
 	if err := env.GetWorkflowError(); err != nil {
 		t.Fatalf("完整定时 pipeline 意外失败: %v", err)

@@ -81,6 +81,7 @@ type ScheduleSpec struct {
 // 零测试正是这个原因）。有了接口，替身可以精确模拟"Temporal 成功但镜像失败"，
 // 把回滚是否真的发生钉死在单测里。*store.Store 隐式满足本接口，装配处零改动。
 type scheduleStore interface {
+	ResolveActiveTenantForUser(ctx context.Context, userID int64) (int64, error)
 	ListSchedulesByUser(ctx context.Context, userID int64) ([]types.Schedule, error)
 	ListActiveSchedules(ctx context.Context) ([]types.Schedule, error)
 	InsertSchedule(ctx context.Context, sc *types.Schedule) error
@@ -96,6 +97,7 @@ type Scheduler struct {
 	st                scheduleStore
 	taskScheduleGates taskScheduleGateSet
 	taskScheduleEnv   taskScheduleEnvironment
+	compiledRuntime   compiledRuntimeRollout
 }
 
 // New 构造 Scheduler。client 由 cmd/server 用 client.Dial 建好后注入；
@@ -116,6 +118,10 @@ func New(c client.Client, taskQueue string, st scheduleStore, opts ...SchedulerO
 // 活跃上限计数（上限校验读镜像表）且对 API 不可见。补偿删除也失败才留孤儿并 slog.Error。
 func (s *Scheduler) CreatePush(ctx context.Context, userID int64, spec ScheduleSpec, scope workflow.PushScope, nlDesc string) (string, error) {
 	if err := validateSpec(spec); err != nil {
+		return "", err
+	}
+	tenantID, err := s.st.ResolveActiveTenantForUser(ctx, userID)
+	if err != nil {
 		return "", err
 	}
 
@@ -143,7 +149,11 @@ func (s *Scheduler) CreatePush(ctx context.Context, userID int64, spec ScheduleS
 	// makePushParams 统一构造 Action 入参：ScheduleID=schedID 让定时触发带上归属任务 id，
 	// 供 Fetch/候选按本任务的源隔离（P1b b3）；NLDesc 是聚合卡 header 的任务名（#75）。
 	// 与 ReconcileActions 共用同一构造器，杜绝"新建"与"补齐"两条路径的 params 漂移。
-	params := makePushParams(userID, schedID, scope, nlDesc)
+	// The legacy HTTP entry does not carry a tenant on the wire, so resolve its
+	// one active membership before creating Temporal state. A tenant-less fresh
+	// scheduled run is fail-closed and must never be created for later repair.
+	params := makePushParams(tenantID, userID, schedID, scope, nlDesc)
+	params.RuntimeVersion = s.compiledRuntime.runtimeVersionFor(schedID)
 
 	_, err = s.c.ScheduleClient().Create(ctx, client.ScheduleOptions{
 		ID:   schedID,
@@ -165,6 +175,7 @@ func (s *Scheduler) CreatePush(ctx context.Context, userID int64, spec ScheduleS
 	scopeJSON, _ := json.Marshal(scope)
 	mirror := &types.Schedule{
 		ID:            schedID,
+		TenantID:      tenantID,
 		UserID:        userID,
 		NLDescription: nlDesc,
 		SpecJSON:      json.RawMessage(specJSON),
@@ -191,18 +202,21 @@ func (s *Scheduler) CreatePush(ctx context.Context, userID int64, spec ScheduleS
 
 // makePushParams 构造 PushPipelineWorkflow 的入参（= Schedule.Action.Args[0]）。
 // CreatePush 建调度、ReconcileActions 补齐存量调度都经此构造，保证两条路径逐字一致。
-func makePushParams(userID int64, schedID string, scope workflow.PushScope, nlDesc string) workflow.PushParams {
+func makePushParams(tenantID, userID int64, schedID string, scope workflow.PushScope, nlDesc string) workflow.PushParams {
 	return workflow.PushParams{
-		UserID:     userID,
-		RunKind:    workflow.PushRunKindScheduled,
-		ScheduleID: schedID,
-		Scope:      scope,
-		NLDesc:     strings.TrimSpace(nlDesc),
+		TenantID:      tenantID,
+		UserID:        userID,
+		RunKind:       workflow.PushRunKindScheduled,
+		ExecutionMode: types.ExecutionModeCompiled,
+		ScheduleID:    schedID,
+		Scope:         scope,
+		NLDesc:        strings.TrimSpace(nlDesc),
 	}
 }
 
 // ReconcileActions 把存量 active 调度的 Temporal Action 入参补齐到当前代码构造的 params
-// （含 ScheduleID / NLDesc）。**由 cmd/server 在启动时调用一次**。
+// （含 TenantID / RunKind / ExecutionMode / RuntimeVersion / ScheduleID / NLDesc）。
+// **由 cmd/server 在启动时调用一次**。
 //
 // 为什么需要（P1b 上线才暴露的断裂）：Temporal 在**建调度那一刻**就把 workflow 启动入参
 // 冻结进 schedule spec，b1 只在 CreatePush 时把 ScheduleID 写进 Action.Args。b1 之前建的
@@ -213,12 +227,15 @@ func makePushParams(userID int64, schedID string, scope workflow.PushScope, nlDe
 // ScheduleHasSources 门禁把关**——无手册任务的 schedule_id 到了 workflow 也因 schedule_sources
 // 为空而回落用户级，决策 #4「无手册老任务抓全部订阅」不破。
 //
-// 顺带自愈任务名漂移（#3）：判据比对整套会漂移的字段（schedule_id + NLDesc），不只 schedule_id。
+// 同时以数据库镜像的 TenantID 升级旧 tenant=0 Action，并补齐显式 scheduled RunKind、
+// Compiled 语义及当前 runtime rollout 版本；未知或不完整的新信封会 fail-closed。
+//
+// 顺带自愈任务名漂移（#3）：判据比对整套会漂移的字段，不只 schedule_id。
 // UpdatePush 改任务名时只换 Spec、不碰 Action，镜像 nl_description 新而 Action.NLDesc 旧 → 聚合卡
 // header 永久显示旧任务名；本方法在下次启动时据镜像把 Action 刷回新名（UpdatePush 侧另有即时回写）。
 //
 // best-effort：单条失败只 slog、继续下一条（不因个别调度 reconcile 失败而中断启动）；
-// 幂等：先 Describe 看 Action.Args 是否已与期望 params 一致（schedule_id + 任务名），一致则跳过、
+// 幂等：先 Describe 看 Action.Args 的可漂移字段是否已与期望 params 一致，一致则跳过、
 // 不写 Temporal（新建调度、以及上次已 reconcile 过且未改名的调度，重启时都命中跳过）。
 func (s *Scheduler) ReconcileActions(ctx context.Context) error {
 	schedules, err := s.st.ListActiveSchedules(ctx)
@@ -235,7 +252,7 @@ func (s *Scheduler) ReconcileActions(ctx context.Context) error {
 				"schedule_id", sc.ID, "err", rerr)
 		case didUpdate:
 			updated++
-			slog.Info("scheduler: 已给存量调度补齐 schedule_id（隔离将于下次触发生效）",
+			slog.Info("scheduler: 已修正存量调度 Action 入参（下次触发生效）",
 				"schedule_id", sc.ID)
 		default:
 			skipped++
@@ -246,7 +263,7 @@ func (s *Scheduler) ReconcileActions(ctx context.Context) error {
 	return nil
 }
 
-// reconcileOne 把单个调度的 Action.Args 自愈到期望 params（schedule_id 补齐 + 任务名回写）。
+// reconcileOne 把单个调度的 Action.Args 自愈到期望 params。
 // 返回 didUpdate=true 表示确实写了 Temporal。
 func (s *Scheduler) reconcileOne(ctx context.Context, sc types.Schedule) (bool, error) {
 	var scope workflow.PushScope
@@ -255,7 +272,8 @@ func (s *Scheduler) reconcileOne(ctx context.Context, sc types.Schedule) (bool, 
 			return false, fmt.Errorf("解析 scope_json（id=%s）: %w", sc.ID, err)
 		}
 	}
-	want := makePushParams(sc.UserID, sc.ID, scope, sc.NLDescription)
+	want := makePushParams(sc.TenantID, sc.UserID, sc.ID, scope, sc.NLDescription)
+	want.RuntimeVersion = s.compiledRuntime.runtimeVersionFor(sc.ID)
 
 	h := s.c.ScheduleClient().GetHandle(ctx, sc.ID)
 	desc, err := h.Describe(ctx)
@@ -267,7 +285,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, sc types.Schedule) (bool, 
 		return false, err
 	}
 	if matches {
-		return false, nil // Action 入参已与期望一致（schedule_id + 任务名），无需重写
+		return false, nil // Action 的可漂移入参已与期望一致，无需重写
 	}
 
 	// 只替换 Action.Args，其余（Workflow 类型名、ID、TaskQueue、超时、Spec、Overlap、State）
@@ -296,9 +314,12 @@ func (s *Scheduler) reconcileOne(ctx context.Context, sc types.Schedule) (bool, 
 // 故解出首个入参为 PushParams 再逐字段比对。非 workflow-action / 空入参 / 首参非 Payload
 // 一律视为"不一致"（返回 false）——让 reconcile 走重建分支自愈，而非报错卡住。
 //
-// 只比 ScheduleID 与 NLDesc，不比整份（含 Scope）：这两个是当前会漂移的字段——b1 之前建的
-// 存量调度缺 schedule_id（补齐），改任务名后镜像新/Action 旧（回写，否则聚合卡 header 永久旧名）。
-// Scope 目前建后不可改，纳入比较只会因 nil/空切片等价问题诱发无谓重写；将来 Scope 可改时再纳入。
+// 只比 TenantID / RunKind / ScheduleID / NLDesc，不比整份 params：TenantID 从
+// 数据库镜像恢复任务归属；RunKind 补齐旧 Action 的未知零值；ScheduleID 激活
+// 任务级隔离；NLDesc 自愈改名后的聚合卡标题漂移。Scope 目前建后不可改，
+// 纳入比较只会因 nil/空切片等价问题诱发无谓重写；将来 Scope 可改时再纳入。
+// Snapshot 不属于漂移自愈字段：A5 构造器确保持久 Action 始终为 nil，每轮引用只能
+// 由 PrepareRun 在 workflow 内存中产生；异常非 nil 入参会在 PrepareRun 中 fail-closed。
 func actionMatchesParams(action client.ScheduleAction, want workflow.PushParams) (bool, error) {
 	wf, ok := action.(*client.ScheduleWorkflowAction)
 	if !ok || len(wf.Args) == 0 {
@@ -312,7 +333,9 @@ func actionMatchesParams(action client.ScheduleAction, want workflow.PushParams)
 	if err := converter.GetDefaultDataConverter().FromPayload(pl, &got); err != nil {
 		return false, fmt.Errorf("解码调度 Action 入参: %w", err)
 	}
-	return got.RunKind == want.RunKind && got.ScheduleID == want.ScheduleID && got.NLDesc == want.NLDesc, nil
+	return got.TenantID == want.TenantID && got.RunKind == want.RunKind &&
+		got.ExecutionMode == want.ExecutionMode && got.RuntimeVersion == want.RuntimeVersion &&
+		got.ScheduleID == want.ScheduleID && got.NLDesc == want.NLDesc, nil
 }
 
 // PushNow 立即触发一次推送（不建调度），供"现在推"按钮用。
@@ -421,7 +444,9 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64
 				return types.NewAppError(types.CodeInternal, "解析调度 scope 失败", err)
 			}
 		}
-		wantArgs = []interface{}{makePushParams(userID, schedID, scope, *nlDesc)}
+		params := makePushParams(sc.TenantID, userID, schedID, scope, *nlDesc)
+		params.RuntimeVersion = s.compiledRuntime.runtimeVersionFor(schedID)
+		wantArgs = []interface{}{params}
 	}
 
 	h := s.c.ScheduleClient().GetHandle(ctx, schedID)

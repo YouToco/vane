@@ -22,12 +22,18 @@ llm:
   model: "deepseek-v4-flash"       # pipeline 打分/出卡（便宜档）
   agent_model: "deepseek-v4-pro"   # agent loop（function calling，M4）
   max_concurrent: 32            # 实测定值：45 条批次 5 并发 5.7s → 32 并发 1.25s（v4-flash 官方限额 2500）
+  # endpoint/key 任一变更时必须分别递增；旧代未保留则旧 run 安全失败，禁止复用代号。
+  compiled_endpoint_generation: 1
+  compiled_credential_generation: 1
 
 # 注：飞书凭证不在配置文件——由 Dashboard 向导写入 settings 表，运行时从 store 读取。
 
 fetch:
   tikhub_api_key: "" # VANE_FETCH_TIKHUB_API_KEY
   exa_api_key: ""    # VANE_FETCH_EXA_API_KEY
+  # 任一 provider key/endpoint 变更时递增；旧代未保留则旧 run 安全失败。
+  compiled_exa_credential_generation: 1
+  compiled_tikhub_credential_generation: 1
   timeout_seconds: 20
   max_response_mb: 5
 
@@ -37,6 +43,10 @@ pipeline:
   playbook_prompts_enabled: false
   playbook_prompt_canary_schedule_id: ""
   playbook_prompts_allow_all: false
+  # C1b compiled runtime 同样先单任务 canary；全量需显式 allow_all。
+  compiled_runtime_enabled: false
+  compiled_runtime_canary_schedule_id: ""
+  compiled_runtime_allow_all: false
 
 agent:
   max_turns: 20

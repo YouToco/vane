@@ -138,6 +138,53 @@ func TestCompleteOptionalFields(t *testing.T) {
 	}
 }
 
+func TestCompleteRequestModelOverride(t *testing.T) {
+	tests := []struct {
+		name      string
+		request   Request
+		wantModel string
+	}{
+		{
+			name:      "empty preserves configured default",
+			request:   Request{User: "legacy"},
+			wantModel: "deepseek-v4-flash",
+		},
+		{
+			name:      "prepared run overrides default",
+			request:   Request{User: "compiled", Model: "deepseek-v4-pro"},
+			wantModel: "deepseek-v4-pro",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var gotBody chatRequest
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				// Deliberately omit response.model. Complete must report the exact
+				// model it requested, not fall back to the client's legacy default.
+				_, _ = w.Write([]byte(`{
+					"choices":[{"message":{"role":"assistant","content":"ok"}}],
+					"usage":{"prompt_tokens":1,"completion_tokens":1}
+				}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			resp, err := newTestClient(srv.URL, 1).Complete(t.Context(), test.request)
+			if err != nil {
+				t.Fatalf("Complete() error = %v", err)
+			}
+			if gotBody.Model != test.wantModel {
+				t.Errorf("upstream request model = %q, want %q", gotBody.Model, test.wantModel)
+			}
+			if resp.Model != test.wantModel {
+				t.Errorf("response fallback model = %q, want %q", resp.Model, test.wantModel)
+			}
+		})
+	}
+}
+
 // TestCompleteDisableThinking DisableThinking=true 必须序列化为
 // thinking:{type:"disabled"}——V4 默认思维链会吃光小 max_tokens 预算导致
 // content 恒空（打分全回退中位分的生产事故回归锚点）。

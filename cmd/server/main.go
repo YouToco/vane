@@ -31,6 +31,8 @@ import (
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/profilehint"
 	"github.com/YouToco/vane/pusher"
+	"github.com/YouToco/vane/runtimeconfig"
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/scorer"
 	"github.com/YouToco/vane/store"
@@ -81,6 +83,22 @@ func run() error {
 	// LLM 客户端 + 调用记账（写库失败只记日志，不影响主流程）。
 	llmClient := llm.New(cfg.LLM)
 	recorder := llm.NewRecorder(st)
+	compiledModelResolver, err := llm.NewRuntimeModelResolverV1(llm.RuntimeModelRouteV1{
+		Provider: runtimepolicy.ModelProviderDeepSeekV1,
+		Endpoint: runtimepolicy.EndpointRefV1{
+			ID:         runtimepolicy.EndpointIDDeepSeekCompatiblePrimaryV1,
+			Generation: cfg.LLM.CompiledEndpointGeneration,
+		},
+		CredentialRef: runtimepolicy.CredentialRefV1{
+			ID:         runtimepolicy.CredentialIDLLMPrimaryV1,
+			Generation: cfg.LLM.CompiledCredentialGeneration,
+		},
+		Client: llmClient,
+	})
+	if err != nil {
+		st.Close()
+		return fmt.Errorf("初始化 compiled LLM 路由: %w", err)
+	}
 
 	// 飞书 Manager：凭证存 settings 表而非 config——用户在 Dashboard 向导中填入。
 	// 先构造不 Start：推送管道（pusher）要用它做主动发卡的出口；WS 连接推迟到
@@ -118,7 +136,23 @@ func run() error {
 		feishu.BuildReplyCard,
 		feishu.BuildAggregateCard, feishu.AggHeaderForTask,
 		workflow.WithPlaybookPromptPolicy(cfg.Pipeline.PlaybookPromptsEnabled,
-			cfg.Pipeline.PlaybookPromptCanaryScheduleID))
+			cfg.Pipeline.PlaybookPromptCanaryScheduleID),
+		workflow.WithCompiledRuntimeV1(st,
+			func(ctx context.Context, tenantID int64, taskInstructionEnabled bool) (runtimepolicy.BundleV1, error) {
+				quota, err := st.LoadQuotaRule(ctx, tenantID, store.QuotaLLMTokens)
+				if err != nil {
+					return runtimepolicy.BundleV1{}, err
+				}
+				_ = quota // readiness check; rate/burst/balance remain live authorization state.
+				return runtimeconfig.BuildCurrentCompiledV1(runtimeconfig.CurrentCompiledV1Input{
+					Model:                      cfg.LLM.Model,
+					TaskInstructionEnabled:     taskInstructionEnabled,
+					ModelEndpointGeneration:    cfg.LLM.CompiledEndpointGeneration,
+					ModelCredentialGeneration:  cfg.LLM.CompiledCredentialGeneration,
+					ExaCredentialGeneration:    cfg.Fetch.CompiledExaCredentialGeneration,
+					TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
+				})
+			}, compiledModelResolver))
 	slog.Info("task playbook prompt policy configured",
 		"enabled", cfg.Pipeline.PlaybookPromptsEnabled,
 		"canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID,
@@ -140,6 +174,7 @@ func run() error {
 	// Activity 方法并逐字比对本清单，漏一个 CI 就红。**新增 Activity 时改这里即可，
 	// 那个测试会告诉你漏没漏。**
 	w.RegisterActivity(activities.AuthorizeRun)
+	w.RegisterActivity(activities.PrepareRun)
 	w.RegisterActivity(activities.EvolveProfile)
 	w.RegisterActivity(activities.Fetch)
 	w.RegisterActivity(activities.Dedup)
@@ -157,7 +192,12 @@ func run() error {
 
 	// scheduler 是唯一直接碰 SDK client 的调度封装（供 API 建/删/触发调度）。
 	sched := scheduler.New(temporalClient, cfg.Temporal.TaskQueue, st,
-		scheduler.WithTaskScheduleNamespace(cfg.Temporal.Namespace))
+		scheduler.WithTaskScheduleNamespace(cfg.Temporal.Namespace),
+		scheduler.WithCompiledRuntimeRollout(
+			cfg.Pipeline.CompiledRuntimeEnabled,
+			cfg.Pipeline.CompiledRuntimeCanaryScheduleID,
+			cfg.Pipeline.CompiledRuntimeAllowAll,
+		))
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
 	var maintenanceWG sync.WaitGroup
 	runMaintenance := func(fn func()) {

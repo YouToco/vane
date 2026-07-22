@@ -20,14 +20,28 @@ type CreateOrGetCompiledTaskRunSnapshotV1Params struct {
 	Policy   runtimepolicy.BundleV1
 }
 
+// CreateOrGetCompiledRunSnapshotV1 is the interface-friendly production
+// facade used by PrepareRun. Keeping the parameter object behind the store
+// boundary lets workflow depend on an identity+policy contract rather than a
+// concrete store request type; all persistence still enters the single typed
+// adapter below.
+func (s *Store) CreateOrGetCompiledRunSnapshotV1(
+	ctx context.Context,
+	identity types.RunIdentity,
+	policy runtimepolicy.BundleV1,
+) (types.RunSnapshotRef, error) {
+	return s.CreateOrGetCompiledTaskRunSnapshotV1(ctx,
+		CreateOrGetCompiledTaskRunSnapshotV1Params{Identity: identity, Policy: policy})
+}
+
 // CreateOrGetCompiledTaskRunSnapshotV1 freezes one compiled scheduled run from
 // typed policy input. It deliberately owns serialization of all five policy
 // bodies so a future Activity cannot bypass the DTO boundary with arbitrary
 // JSON or accidentally pass an application config containing credentials.
 //
-// C1a keeps this method at zero production call points. C1b's PrepareRun
-// Activity will be the sole caller after the snapshot consumers and live
-// authorization checks are ready together.
+// C1a kept this method at zero production call points. C1b exposes it only
+// through CreateOrGetCompiledRunSnapshotV1, whose sole production consumer is
+// PrepareRun after snapshot readers and live authorization landed together.
 func (s *Store) CreateOrGetCompiledTaskRunSnapshotV1(
 	ctx context.Context,
 	p CreateOrGetCompiledTaskRunSnapshotV1Params,

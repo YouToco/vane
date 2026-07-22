@@ -65,29 +65,61 @@ func New(cli *llm.Client, rec *llm.Recorder, hints *profilehint.Cache) *CardGen 
 // （阅读原文链接由 Push 阶段的构卡函数添加，见包注释）。taskInstruction 为空时
 // 保持旧请求逐字节不变；非空时由 promptguard 消毒新定界符并追加到 user prompt 尾部。
 func (cg *CardGen) Generate(ctx context.Context, userID int64, item types.ScoredItem, traceID, taskInstruction string) (string, error) {
-	userPrompt := buildCardUser(cg.hints.Hint(ctx, userID, traceID), item.Item)
+	return cg.generate(ctx, 0, userID, item, traceID, taskInstruction, legacyCardExecutionV1(), nil)
+}
+
+func (cg *CardGen) generate(
+	ctx context.Context,
+	tenantID int64,
+	userID int64,
+	item types.ScoredItem,
+	traceID string,
+	taskInstruction string,
+	execution cardExecutionV1,
+	beforeSpend func(context.Context, float64) error,
+) (string, error) {
+	if !execution.taskInstructionEnabled {
+		taskInstruction = ""
+	}
+	profileHint := ""
+	if tenantID > 0 {
+		profileHint = cg.hints.HintForTenant(ctx, tenantID, userID, traceID)
+	} else {
+		profileHint = cg.hints.Hint(ctx, userID, traceID)
+	}
+	userPrompt := buildCardUser(profileHint, item.Item)
 	req := llm.Request{
-		System:      cardSystemPrompt,
+		System:      execution.systemPrompt,
 		User:        promptguard.AppendTaskInstruction(userPrompt, taskInstruction),
-		Temperature: f32ptr(0.7), // 解读文案要一点多样性，温度略高于打分
-		MaxTokens:   iptr(400),
+		Model:       execution.model,
+		Temperature: f32ptr(execution.temperature), // 解读文案要一点多样性，温度略高于打分
+		MaxTokens:   iptr(execution.maxTokens),
 		// 关思维链：模板化摘要不需要 CoT；400 预算下 reasoning 偶发吃满会导致
 		// content 空 → 卡片只剩标题+链接兜底（2026-07-14 生产 1/15 次命中）。
-		DisableThinking: true,
+		DisableThinking: execution.disableThinking,
 	}
 
 	meta := llm.CallMeta{
-		TraceID:  traceID,
-		SpanName: "cardgen",
-		UserID:   &userID,
-		RefType:  types.RefTypeContentItem,
+		TraceID:     traceID,
+		SpanName:    "cardgen",
+		UserID:      &userID,
+		RefType:     types.RefTypeContentItem,
+		QuotaRule:   execution.quotaRule,
+		BeforeSpend: beforeSpend,
+	}
+	if tenantID > 0 {
+		meta.TenantID = &tenantID
 	}
 	if item.Item.ID != 0 {
 		id := item.Item.ID
 		meta.RefID = &id
 	}
 
-	resp, err := llm.Do(ctx, cg.cli, cg.rec, meta, req)
+	client := cg.cli
+	if execution.client != nil {
+		client = execution.client
+	}
+	resp, err := llm.Do(ctx, client, cg.rec, meta, req)
 	if err != nil {
 		return "", err
 	}

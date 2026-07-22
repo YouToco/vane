@@ -9,10 +9,10 @@ import (
 	"testing"
 )
 
-// TestPlaybookPromptPolicyWiring guards the composition root: leaving the
-// option off NewActivities would compile and silently keep every task on the
-// legacy prompt even when operators enable the rollout configuration.
-func TestPlaybookPromptPolicyWiring(t *testing.T) {
+// TestPipelinePolicyWiring guards both policy options at the composition root.
+// Leaving either option off NewActivities would compile and silently keep the
+// corresponding runtime behavior on its legacy path.
+func TestPipelinePolicyWiring(t *testing.T) {
 	_, self, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller 定位不到本测试文件")
@@ -38,10 +38,20 @@ func TestPlaybookPromptPolicyWiring(t *testing.T) {
 	if len(args) == 0 {
 		t.Fatal("workflow.NewActivities 缺少参数")
 	}
-	policy, ok := args[len(args)-1].(*ast.CallExpr)
-	if !ok || selectorPath(policy.Fun) != "workflow.WithPlaybookPromptPolicy" {
-		t.Fatal("NewActivities 最后一参必须是 workflow.WithPlaybookPromptPolicy")
+	options := make(map[string][]*ast.CallExpr)
+	for _, arg := range args {
+		call, ok := arg.(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+		options[selectorPath(call.Fun)] = append(options[selectorPath(call.Fun)], call)
 	}
+
+	playbookPolicies := options["workflow.WithPlaybookPromptPolicy"]
+	if len(playbookPolicies) != 1 {
+		t.Fatalf("WithPlaybookPromptPolicy 接线数 = %d，期望 1", len(playbookPolicies))
+	}
+	policy := playbookPolicies[0]
 	if len(policy.Args) != 2 {
 		t.Fatalf("WithPlaybookPromptPolicy 参数数 = %d，期望 2", len(policy.Args))
 	}
@@ -50,6 +60,24 @@ func TestPlaybookPromptPolicyWiring(t *testing.T) {
 	}
 	if got := selectorPath(policy.Args[1]); got != "cfg.Pipeline.PlaybookPromptCanaryScheduleID" {
 		t.Fatalf("canary schedule 接线 = %q，期望 cfg.Pipeline.PlaybookPromptCanaryScheduleID", got)
+	}
+
+	compiledPolicies := options["workflow.WithCompiledRuntimeV1"]
+	if len(compiledPolicies) != 1 {
+		t.Fatalf("WithCompiledRuntimeV1 接线数 = %d，期望 1", len(compiledPolicies))
+	}
+	compiled := compiledPolicies[0]
+	if len(compiled.Args) != 3 {
+		t.Fatalf("WithCompiledRuntimeV1 参数数 = %d，期望 3", len(compiled.Args))
+	}
+	if got := selectorPath(compiled.Args[0]); got != "st" {
+		t.Fatalf("snapshot store 接线 = %q，期望 st", got)
+	}
+	if _, ok := compiled.Args[1].(*ast.FuncLit); !ok {
+		t.Fatalf("compiled policy builder 接线类型 = %T，期望函数", compiled.Args[1])
+	}
+	if got := selectorPath(compiled.Args[2]); got != "compiledModelResolver" {
+		t.Fatalf("compiled LLM 接线 = %q，期望 compiledModelResolver", got)
 	}
 }
 

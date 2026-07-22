@@ -114,6 +114,14 @@ type exaResult struct {
 // （不可重试）；超时 → CodeFetchTimeout；429 → CodeFetchRateLimit；
 // 其余非 2xx 按 5xx/4xx 定可否重试。
 func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.ContentItem, error) {
+	return e.fetchWithEffectGate(ctx, src, nil)
+}
+
+func (e *ExaFetcher) fetchWithEffectGate(
+	ctx context.Context,
+	src types.Source,
+	beforeEffect func(context.Context) error,
+) ([]types.ContentItem, error) {
 	if e.apiKey == "" {
 		return nil, types.NewAppError(types.CodeValidation,
 			"Exa 信源需要配置 VANE_FETCH_EXA_API_KEY，当前为空", nil)
@@ -156,7 +164,7 @@ func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Conte
 		reqBody.StartPublishedDate = start.Format(time.RFC3339)
 	}
 
-	er, err := e.doSearch(ctx, reqBody, src)
+	er, err := e.doSearchWithEffectGate(ctx, reqBody, src, beforeEffect)
 	if err != nil {
 		return nil, err
 	}
@@ -174,6 +182,15 @@ func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.Conte
 // 与 Search（agent ad-hoc 一次性搜索）共用。src 只用于记账（tool_calls 的 source_id），
 // ad-hoc 调用传零值 Source（SourceID=0 无源口径）。
 func (e *ExaFetcher) doSearch(ctx context.Context, reqBody exaRequest, src types.Source) (*exaResponse, error) {
+	return e.doSearchWithEffectGate(ctx, reqBody, src, nil)
+}
+
+func (e *ExaFetcher) doSearchWithEffectGate(
+	ctx context.Context,
+	reqBody exaRequest,
+	src types.Source,
+	beforeEffect func(context.Context) error,
+) (*exaResponse, error) {
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, types.NewAppError(types.CodeValidation, "构造 Exa 请求体失败", err)
@@ -187,6 +204,9 @@ func (e *ExaFetcher) doSearch(ctx context.Context, reqBody exaRequest, src types
 	req.Header.Set("x-api-key", e.apiKey)
 	req.Header.Set("Accept", "application/json")
 
+	if err := checkEffectGate(ctx, beforeEffect); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	resp, err := e.client.Do(req)
 	elapsed := time.Since(start)
@@ -341,10 +361,11 @@ func (e *ExaFetcher) recordCall(ctx context.Context, src types.Source, status in
 	}
 	ctx, cancel := detachedBindingRecordContext(ctx)
 	defer cancel()
-	trace, userID := bindingAttribution(ctx)
+	trace, tenantID, userID := bindingAttribution(ctx)
 	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
+		TenantID:     tenantID,
 		UserID:       userID,
 		ToolName:     "exa:search",
 		ToolKind:     types.ToolCallKindExaFetch,
