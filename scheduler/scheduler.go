@@ -273,6 +273,11 @@ func (s *Scheduler) reconcileOne(ctx context.Context, sc types.Schedule) (bool, 
 		}
 	}
 	want := makePushParams(sc.TenantID, sc.UserID, sc.ID, scope, sc.NLDescription)
+	// The database mirror is the current control-plane routing truth. Reconcile
+	// repairs frozen Action fields; it must never silently downgrade a dynamic
+	// task to compiled merely because makePushParams is also used by legacy
+	// compiled creation paths.
+	want.ExecutionMode = sc.ExecutionMode
 	want.RuntimeVersion = s.compiledRuntime.runtimeVersionFor(sc.ID)
 
 	h := s.c.ScheduleClient().GetHandle(ctx, sc.ID)

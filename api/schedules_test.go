@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
 
@@ -84,77 +83,17 @@ func TestCreateScheduleEndpointRemoved(t *testing.T) {
 	}
 }
 
-func TestUpdateScheduleSuccess(t *testing.T) {
+func TestUpdateScheduleEndpointRemoved(t *testing.T) {
 	f := &fakeScheduler{}
 	w := patchSchedule(t, newScheduleMux(t, f), "push-1-abc",
-		`{"spec":{"cron":"30 9 * * *","tz":"Asia/Shanghai"},"nl_description":"改成九点半"}`)
+		`{"spec":{"cron":"30 9 * * *","tz":"Asia/Shanghai"}}`)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s, want 200", w.Code, w.Body.String())
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("PATCH /api/schedules/{id} status=%d body=%s, want 405",
+			w.Code, w.Body.String())
 	}
-	if f.calls != 1 || f.gotID != "push-1-abc" {
-		t.Fatalf("UpdatePush calls=%d id=%q", f.calls, f.gotID)
-	}
-	if f.gotSpec.Cron != "30 9 * * *" || f.gotSpec.TZ != "Asia/Shanghai" {
-		t.Fatalf("spec=%+v", f.gotSpec)
-	}
-	if f.gotNLDesc == nil || *f.gotNLDesc != "改成九点半" {
-		t.Fatalf("nl_description=%v", f.gotNLDesc)
-	}
-}
-
-func TestUpdateScheduleOmittedDescriptionIsNil(t *testing.T) {
-	f := &fakeScheduler{}
-	w := patchSchedule(t, newScheduleMux(t, f), "s1", `{"spec":{"every_seconds":7200}}`)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s, want 200", w.Code, w.Body.String())
-	}
-	if f.gotNLDesc != nil {
-		t.Fatalf("omitted nl_description=%q, want nil", *f.gotNLDesc)
-	}
-	if f.gotSpec.EverySeconds != 7200 {
-		t.Fatalf("every_seconds=%d", f.gotSpec.EverySeconds)
-	}
-}
-
-func TestUpdateScheduleAnchorPassesThrough(t *testing.T) {
-	const anchor = "2026-07-19T20:00:00+08:00"
-	f := &fakeScheduler{}
-	w := patchSchedule(t, newScheduleMux(t, f), "s1",
-		`{"spec":{"every_seconds":259200,"anchor_at":"`+anchor+`"}}`)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s, want 200", w.Code, w.Body.String())
-	}
-	if f.gotSpec.AnchorAt != anchor {
-		t.Fatalf("anchor_at=%q", f.gotSpec.AnchorAt)
-	}
-}
-
-func TestUpdateScheduleRejectsInvalidSpecBeforeScheduler(t *testing.T) {
-	for name, body := range map[string]string{
-		"both":     `{"spec":{"cron":"0 8 * * *","every_seconds":7200}}`,
-		"neither":  `{"spec":{}}`,
-		"too fast": `{"spec":{"every_seconds":60}}`,
-		"bad json": `{`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			f := &fakeScheduler{}
-			w := patchSchedule(t, newScheduleMux(t, f), "s1", body)
-			if w.Code != http.StatusBadRequest {
-				t.Fatalf("status=%d body=%s, want 400", w.Code, w.Body.String())
-			}
-			if f.calls != 0 {
-				t.Fatal("invalid request reached scheduler")
-			}
-		})
-	}
-}
-
-func TestUpdateScheduleNotFound(t *testing.T) {
-	f := &fakeScheduler{retErr: types.NewAppError(types.CodeNotFound, "定时任务不存在", nil)}
-	w := patchSchedule(t, newScheduleMux(t, f), "missing", `{"spec":{"cron":"0 8 * * *"}}`)
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("status=%d body=%s, want 404", w.Code, w.Body.String())
+	if f.calls != 0 {
+		t.Fatalf("retired PATCH reached scheduler %d time(s)", f.calls)
 	}
 }
 

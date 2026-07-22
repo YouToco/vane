@@ -738,7 +738,13 @@ type fakeScheduleStore struct {
 
 // ListActiveSchedules 供 ReconcileActions 用例注入存量调度集合。
 func (f *fakeScheduleStore) ListActiveSchedules(_ context.Context) ([]types.Schedule, error) {
-	return f.active, f.activeErr
+	active := append([]types.Schedule(nil), f.active...)
+	for i := range active {
+		if active[i].ExecutionMode == "" {
+			active[i].ExecutionMode = types.ExecutionModeCompiled
+		}
+	}
+	return active, f.activeErr
 }
 
 // GetSchedule 一律放行：本组用例聚焦「更新 Spec 时不弄丢 Action/Policy」，
@@ -1334,6 +1340,34 @@ func TestReconcileActions_按数据库租户修正旧Action(t *testing.T) {
 	}
 	if got.Snapshot != nil {
 		t.Fatalf("reconcile 不应把 run snapshot 写入持久 Action，实得 %+v", got.Snapshot)
+	}
+}
+
+func TestReconcileActions_保留数据库ExecutionMode(t *testing.T) {
+	const taskID = "push-1-dynamic"
+	frozen := makePushParams(7, 1, taskID, workflow.PushScope{}, "动态研究")
+	h := &fakeScheduleHandle{current: reconcileSchedule(
+		"wf-"+taskID, []interface{}{payloadArg(t, frozen)},
+	)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{taskID: h},
+	}}
+	st := &fakeScheduleStore{active: []types.Schedule{{
+		ID: taskID, TenantID: 7, UserID: 1, NLDescription: "动态研究",
+		ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
+		ExecutionMode: types.ExecutionModeDiscoverAtRun,
+	}}}
+
+	if err := New(fc, "tq", st).ReconcileActions(t.Context()); err != nil {
+		t.Fatalf("ReconcileActions failed: %v", err)
+	}
+	if len(h.history) != 1 {
+		t.Fatalf("mode drift should update once, got %d", len(h.history))
+	}
+	got := h.current.Action.(*client.ScheduleWorkflowAction).Args[0].(workflow.PushParams)
+	if got.ExecutionMode != types.ExecutionModeDiscoverAtRun {
+		t.Fatalf("reconciled execution_mode=%q, want %q",
+			got.ExecutionMode, types.ExecutionModeDiscoverAtRun)
 	}
 }
 
