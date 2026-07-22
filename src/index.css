@@ -210,6 +210,33 @@
   66% { transform: translate3d(-34px, 28px, 0) scale(0.9) rotate(-6deg); }
 }
 
+/* Chrome 自动填充不应把登录字段染成默认蓝色；保持与瓷白卡片同一材质。 */
+.auth-root {
+  --auth-field: oklch(0.985 0.004 225 / 0.92);
+}
+
+.dark .auth-root {
+  --auth-field: oklch(0.16 0.008 248 / 0.92);
+}
+
+.auth-input:-webkit-autofill,
+.auth-input:-webkit-autofill:hover {
+  -webkit-text-fill-color: var(--foreground);
+  caret-color: var(--foreground);
+  -webkit-box-shadow: 0 0 0 1000px var(--auth-field) inset;
+  box-shadow: 0 0 0 1000px var(--auth-field) inset;
+}
+
+.auth-input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--foreground);
+  -webkit-box-shadow:
+    0 0 0 1000px var(--auth-field) inset,
+    0 0 0 3px color-mix(in oklch, var(--brand-strong) 25%, transparent);
+  box-shadow:
+    0 0 0 1000px var(--auth-field) inset,
+    0 0 0 3px color-mix(in oklch, var(--brand-strong) 25%, transparent);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .landing-root [class*="animate-"],
   .auth-root [class*="animate-"] {
