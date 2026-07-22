@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-func TestDefinitionEditProposalCodecRemainsDark(t *testing.T) {
+func TestDefinitionEditProposalCodecHasOneCoordinator(t *testing.T) {
 	t.Parallel()
 
 	_, testFile, _, ok := runtime.Caller(0)
@@ -23,6 +23,7 @@ func TestDefinitionEditProposalCodecRemainsDark(t *testing.T) {
 	taskDir := filepath.Clean(filepath.Dir(testFile))
 	repoRoot := filepath.Clean(filepath.Dir(taskDir))
 	provider := filepath.Join(taskDir, "definition_edit_proposal.go")
+	coordinator := filepath.Join(taskDir, "definition_edit_coordinator.go")
 	fset := token.NewFileSet()
 	var violations []string
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, walkErr error) error {
@@ -51,6 +52,11 @@ func TestDefinitionEditProposalCodecRemainsDark(t *testing.T) {
 			if err != nil {
 				return err
 			}
+		} else if filepath.Clean(path) == coordinator {
+			allowed, err = definitionEditCoordinatorProposalAllowedReferences(file)
+			if err != nil {
+				return err
+			}
 		}
 		violations = append(violations, definitionEditDarkReferences(fset, file, allowed)...)
 		return nil
@@ -60,7 +66,8 @@ func TestDefinitionEditProposalCodecRemainsDark(t *testing.T) {
 	}
 	slices.Sort(violations)
 	if len(violations) != 0 {
-		t.Fatalf("C2b3-2a proposal codec must remain dark:\n%s", strings.Join(violations, "\n"))
+		t.Fatalf("C2b3-2c proposal codec escaped its exact coordinator calls:\n%s",
+			strings.Join(violations, "\n"))
 	}
 }
 
@@ -135,6 +142,69 @@ func definitionEditProviderAllowedReferences(file *ast.File) (map[token.Pos]stru
 	return allowed, nil
 }
 
+func definitionEditCoordinatorProposalAllowedReferences(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	type expectation struct {
+		callee   string
+		function string
+		count    int
+	}
+	expectations := []expectation{
+		{
+			callee:   "BuildFrozenTaskDefinitionEditProposal",
+			function: "prepareTaskDefinitionEditProposal",
+			count:    1,
+		},
+		{
+			callee:   "DecodeFrozenTaskDefinitionEditProposal",
+			function: "sealTaskDefinitionEditProposal",
+			count:    1,
+		},
+		{
+			callee:   "DecodeFrozenTaskDefinitionEditProposal",
+			function: "decodeTaskDefinitionEditOperation",
+			count:    1,
+		},
+	}
+	type expectationKey struct{ callee, function string }
+	want := make(map[expectationKey]int, len(expectations))
+	for _, expected := range expectations {
+		want[expectationKey{expected.callee, expected.function}] = expected.count
+	}
+	got := make(map[expectationKey]int, len(expectations))
+	allowed := make(map[token.Pos]struct{}, len(expectations))
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			identifier, ok := definitionEditProposalUnparen(call.Fun).(*ast.Ident)
+			if !ok {
+				return true
+			}
+			key := expectationKey{identifier.Name, function.Name.Name}
+			if _, expected := want[key]; expected {
+				got[key]++
+				allowed[identifier.Pos()] = struct{}{}
+			}
+			return true
+		})
+	}
+	for key, expected := range want {
+		if got[key] != expected {
+			return nil, fmt.Errorf("coordinator %s must directly call %s exactly %d time(s), got %d",
+				key.function, key.callee, expected, got[key])
+		}
+	}
+	return allowed, nil
+}
+
 func definitionEditDarkReferences(
 	fset *token.FileSet,
 	file *ast.File,
@@ -160,4 +230,14 @@ func definitionEditDarkReferences(
 		return true
 	})
 	return violations
+}
+
+func definitionEditProposalUnparen(expression ast.Expr) ast.Expr {
+	for {
+		parenthesized, ok := expression.(*ast.ParenExpr)
+		if !ok {
+			return expression
+		}
+		expression = parenthesized.X
+	}
 }

@@ -69,7 +69,14 @@ C2b3-2 继续按故障域拆成四个不可跳级的子列车：
   `update_schedule`、`edit_task_playbook`、`set_task_strictness`、generic pending v0 与 HTTP PATCH 永久保持
   退役。冻结票显式保存 actor tenant/user 与 target tenant/user/task，并在原卡点击时绑定 Feishu App
   fingerprint + message ID。terminal outbox 原地 Patch 同一张卡，session 只写固定终态事实。真卡 Gate 通过前
-  默认关闭，不得声称用户编辑已恢复。
+  默认关闭，不得声称用户编辑已恢复。开闸前还必须让 legacy `ReconcileActions` 与 edit operation 串行化：
+  reconcile 不得持有 active 快照跨过 quiesce/recovery 后再写回 Temporal；须等待首次恢复完成，或在每次写前
+  以 operation marker/status/fence 重新授权，并以并发真 Temporal Gate 证明旧 Action 不会覆盖已完成编辑。
+
+这里的 **attempt** 专指一次代码级 `runTaskDefinitionEditAttempt` 调用：它从一个已持久化 phase 开始，最多
+调用一次 Pause/Apply/Restore raw phase，并在一次本地事务推进或一次远端 checkpoint 后立即返回。同一条仍
+有效的 lease/fence 可以顺序执行多个这样的代码级 attempt。operation 行的 `attempt` 列只审计首次 acquisition
+与过期 lease takeover 的代次，不是远端 phase 预算；不得为了推进下一个 phase 主动放弃 lease 或伪造 takeover。
 
 持久 phase 与允许的系统状态如下；表中任一不匹配都不得猜测修复：
 

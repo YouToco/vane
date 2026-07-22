@@ -199,6 +199,11 @@ func run() error {
 			cfg.Pipeline.CompiledRuntimeAllowAll,
 		))
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
+	// C2b3-2c keeps definition editing dark at every ingress, but already owns
+	// recovery for durable operations left by a prior process. The coordinator is
+	// intentionally retained only in this composition root: it is not injected
+	// into Agent, HTTP, Feishu, or the receipt dispatcher.
+	definitionEditCoordinator := task.NewTaskDefinitionEditCoordinator(st, sched, slog.Default())
 	var maintenanceWG sync.WaitGroup
 	runMaintenance := func(fn func()) {
 		maintenanceWG.Add(1)
@@ -329,6 +334,25 @@ func run() error {
 		temporalClient.Close()
 		st.Close()
 		return fmt.Errorf("装配任务创建耐久回执: %w", err)
+	}
+
+	// C2b3-2c definition-edit recovery starts before any Feishu/HTTP ingress is
+	// admitted. RunRecovery performs one immediate scan and then periodic scans;
+	// no proposal, confirmation, cancellation, or receipt path is wired here.
+	definitionEditRecoveryCtx, cancelDefinitionEditRecovery := context.WithCancel(ctx)
+	definitionEditRecoveryDone := make(chan struct{})
+	go func() {
+		defer close(definitionEditRecoveryDone)
+		definitionEditCoordinator.RunRecovery(definitionEditRecoveryCtx)
+	}()
+	stopDefinitionEditRecovery := func() error {
+		cancelDefinitionEditRecovery()
+		select {
+		case <-definitionEditRecoveryDone:
+			return nil
+		case <-time.After(30 * time.Second):
+			return errors.New("task definition edit recovery 关停超时")
+		}
 	}
 
 	// A5 创建恢复器在飞书 WS/HTTP 接收新确认之前启动。首次扫描与周期扫描都
@@ -474,17 +498,20 @@ func run() error {
 			stop()
 			drainErr := drainIngress()
 			recoveryErr := stopCreationRecovery()
+			definitionEditRecoveryErr := stopDefinitionEditRecovery()
 			receiptErr := stopReceiptDispatch()
 			sessionErr := drainAgentSessions()
 			maintenanceCtx, cancelMaintenance := context.WithTimeout(context.Background(), 30*time.Second)
 			maintenanceErr := waitMaintenance(maintenanceCtx)
 			cancelMaintenance()
-			if drainErr != nil || recoveryErr != nil || receiptErr != nil ||
+			if drainErr != nil || recoveryErr != nil || definitionEditRecoveryErr != nil ||
+				receiptErr != nil ||
 				sessionErr != nil || maintenanceErr != nil {
 				// An admitted callback may still own DB/Temporal work. Do not close
 				// those resources underneath it; returning exits the process.
 				return errors.Join(fmt.Errorf("挂载 A2A server: %w", err),
-					drainErr, recoveryErr, receiptErr, sessionErr, maintenanceErr)
+					drainErr, recoveryErr, definitionEditRecoveryErr, receiptErr,
+					sessionErr, maintenanceErr)
 			}
 			w.Stop()
 			temporalClient.Close()
@@ -537,7 +564,7 @@ func run() error {
 		stop()
 	}
 
-	// 顺序关停（契约 B10）：HTTP 关准入 → 独立入口并行排空 → 创建恢复器/
+	// 顺序关停（契约 B10）：HTTP 关准入 → 独立入口并行排空 → 创建/定义编辑恢复器/
 	// 维护任务 → worker → Temporal client → DB。任一排空没有得到肯定结果，
 	// 都不得主动释放共享依赖。
 	var shutdownErrs []error
@@ -572,9 +599,15 @@ func run() error {
 	if err := stopCreationRecovery(); err != nil {
 		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空创建恢复器: %w", err))
 	}
-	// No producer remains after callback + creation recovery drains. Now stop
-	// the receipt consumer, wait for its fenced session/PATCH checkpoint, then
-	// close admission for legacy best-effort session writes.
+	// C2b3-2c 定义编辑仍无新准入，但恢复器可能正持有 Store fence
+	// 或在执行 Temporal exact-CAS；必须在关闭两个依赖前得到它的退出证明。
+	if err := stopDefinitionEditRecovery(); err != nil {
+		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空任务定义编辑恢复器: %w", err))
+	}
+	// No producer remains after callback plus both durable-operation recovery
+	// loops drain. Now stop the creation receipt consumer, wait for its fenced
+	// session/PATCH checkpoint, then close admission for legacy best-effort
+	// session writes. Definition-edit receipts deliberately remain unwired.
 	if err := stopReceiptDispatch(); err != nil {
 		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空任务创建耐久回执: %w", err))
 	}

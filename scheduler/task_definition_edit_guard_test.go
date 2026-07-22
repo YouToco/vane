@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -17,17 +18,11 @@ type taskDefinitionEditMethodSource struct {
 	position string
 }
 
-func TestTaskDefinitionEditPrimitivesRemainDarkAndRawOnly(t *testing.T) {
+func TestTaskDefinitionEditPrimitivesHaveOneRawCoordinator(t *testing.T) {
 	t.Parallel()
 
 	const providerName = "task_definition_edit.go"
-	guarded := map[string]struct{}{
-		"PrepareTaskDefinitionEdit":  {},
-		"DescribeTaskDefinitionEdit": {},
-		"PauseTaskDefinitionEdit":    {},
-		"ApplyTaskDefinitionEdit":    {},
-		"RestoreTaskDefinitionEdit":  {},
-	}
+	guarded := taskDefinitionEditGuardedMethods()
 	forbiddenProviderSelectors := map[string]struct{}{
 		"ScheduleClient": {},
 		"GetHandle":      {},
@@ -59,6 +54,9 @@ func TestTaskDefinitionEditPrimitivesRemainDarkAndRawOnly(t *testing.T) {
 	schedulerDir := filepath.Clean(filepath.Dir(testFile))
 	repoRoot := filepath.Clean(filepath.Dir(schedulerDir))
 	providerPath := filepath.Clean(filepath.Join(schedulerDir, providerName))
+	coordinatorPath := filepath.Clean(filepath.Join(
+		repoRoot, "task", "definition_edit_coordinator.go",
+	))
 	fset := token.NewFileSet()
 	productionFiles, err := taskDefinitionEditProductionFiles(repoRoot, fset)
 	if err != nil {
@@ -68,10 +66,36 @@ func TestTaskDefinitionEditPrimitivesRemainDarkAndRawOnly(t *testing.T) {
 	if !ok {
 		t.Fatalf("task definition edit provider %s is not a production Go file", providerPath)
 	}
+	coordinator, ok := productionFiles[coordinatorPath]
+	if !ok {
+		t.Fatalf("task definition edit coordinator %s is not a production Go file", coordinatorPath)
+	}
+	coordinatorCalls, err := taskDefinitionEditCoordinatorRawCalls(coordinator)
+	if err != nil {
+		t.Fatalf("validate exact coordinator raw calls: %v", err)
+	}
+	providerFunctions := taskDefinitionEditProviderFunctionSymbols()
+	transitionGraph := taskDefinitionEditTransitionGraphSymbols()
+	providerGraphAllowed, providerGraphViolations := taskDefinitionEditProviderGraphReferences(
+		provider,
+		providerFunctions,
+		transitionGraph,
+		taskDefinitionEditProviderGraphExpectations(),
+		fset,
+	)
+	schedulerAliases := taskDefinitionEditSchedulerAliases(
+		productionFiles, schedulerDir, providerPath, providerFunctions, transitionGraph,
+	)
+	rawTransportViolations := taskDefinitionEditRawTransportViolations(
+		productionFiles,
+		taskDefinitionEditRawTransportExpectations(schedulerDir),
+		fset,
+	)
 
 	nonProviderSchedulerMethods := make(map[string]struct{})
 	relatedMethods := make(map[string][]taskDefinitionEditMethodSource)
-	var violations []string
+	violations := append([]string(nil), providerGraphViolations...)
+	violations = append(violations, rawTransportViolations...)
 	for path, file := range productionFiles {
 		if filepath.Clean(filepath.Dir(path)) != schedulerDir {
 			continue
@@ -105,14 +129,557 @@ func TestTaskDefinitionEditPrimitivesRemainDarkAndRawOnly(t *testing.T) {
 
 	for path, file := range productionFiles {
 		violations = append(violations, taskDefinitionEditProductionViolations(
-			path, file, providerPath, guarded, fset,
+			path, file, providerPath, guarded, coordinatorCalls, fset,
+		)...)
+		violations = append(violations, taskDefinitionEditGraphBoundaryViolations(
+			path, file, schedulerDir, providerPath, transitionGraph,
+			providerGraphAllowed, schedulerAliases, fset,
 		)...)
 	}
 	slices.Sort(violations)
 	if len(violations) != 0 {
-		t.Fatalf("c2b3-1 must stay dark and use one raw CAS path only:\n%s",
+		t.Fatalf("c2b3-2c must keep one exact raw CAS coordinator path:\n%s",
 			strings.Join(violations, "\n"))
 	}
+}
+
+func TestTaskDefinitionEditPrimitiveGuardCatchesMethodValues(t *testing.T) {
+	t.Parallel()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "probe.go", `package probe
+func probe(s interface {
+	PauseTaskDefinitionEdit()
+	DescribeTaskDefinitionEdit()
+}) {
+	_ = s.PauseTaskDefinitionEdit
+	s.DescribeTaskDefinitionEdit()
+}
+func reflectProbe(v interface{ MethodByName(string) }) {
+	_ = v.MethodByName("PauseTaskDefinitionEdit")
+}
+`, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations := taskDefinitionEditProductionViolations(
+		"probe.go",
+		file,
+		"provider.go",
+		taskDefinitionEditGuardedMethods(),
+		nil,
+		fset,
+	)
+	if len(violations) != 3 {
+		t.Fatalf("raw method-value/direct calls escaped Scheduler guard: %v", violations)
+	}
+}
+
+func TestTaskDefinitionEditPrimitiveGuardRejectsRenamedTransitionWrapper(t *testing.T) {
+	t.Parallel()
+	fset := token.NewFileSet()
+	wrapperPath := filepath.Clean("/repo/scheduler/escape.go")
+	providerPath := filepath.Clean("/repo/scheduler/task_definition_edit.go")
+	schedulerDir := filepath.Dir(wrapperPath)
+	wrapper, err := parser.ParseFile(fset, wrapperPath, `package scheduler
+type Scheduler struct{}
+var hiddenTransition = (*Scheduler).transitionTaskDefinitionEdit
+func (s *Scheduler) AdvanceEdit() {
+	s.buildTaskDefinitionEditRuntime()
+	hiddenTransition(s)
+}
+`, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph := map[string]struct{}{
+		"buildTaskDefinitionEditRuntime": {},
+		"transitionTaskDefinitionEdit":   {},
+	}
+	aliases := taskDefinitionEditSchedulerAliases(
+		map[string]*ast.File{wrapperPath: wrapper},
+		schedulerDir,
+		providerPath,
+		nil,
+		graph,
+	)
+	for _, name := range []string{"hiddenTransition", "AdvanceEdit"} {
+		if _, ok := aliases[name]; !ok {
+			t.Fatalf("renamed transition wrapper %s escaped transitive taint", name)
+		}
+	}
+	wrapperViolations := taskDefinitionEditGraphBoundaryViolations(
+		wrapperPath, wrapper, schedulerDir, providerPath, graph, nil, aliases, fset,
+	)
+	if len(wrapperViolations) == 0 {
+		t.Fatal("non-provider Scheduler transition wrapper escaped graph guard")
+	}
+
+	consumerPath := filepath.Clean("/repo/cmd/server/main.go")
+	consumer, err := parser.ParseFile(fset, consumerPath, `package main
+import schedulerpkg "github.com/YouToco/vane/scheduler"
+func run(s *schedulerpkg.Scheduler) { s.AdvanceEdit() }
+`, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumerViolations := taskDefinitionEditGraphBoundaryViolations(
+		consumerPath, consumer, schedulerDir, providerPath, graph, nil, aliases, fset,
+	)
+	if !slices.ContainsFunc(consumerViolations, func(violation string) bool {
+		return strings.Contains(violation, "AdvanceEdit")
+	}) {
+		t.Fatalf("consumer call through renamed transition wrapper escaped guard: %v",
+			consumerViolations)
+	}
+}
+
+func TestTaskDefinitionEditPrimitiveGuardRejectsNewRawTransportCallAndAlias(t *testing.T) {
+	t.Parallel()
+	fset := token.NewFileSet()
+	path := filepath.Clean("/repo/scheduler/escape.go")
+	file, err := parser.ParseFile(fset, path, `package scheduler
+import (
+	"context"
+	workflowservice "go.temporal.io/api/workflowservice/v1"
+)
+func (s *Scheduler) AdvanceDefinitionEdit(
+	ctx context.Context,
+	req *workflowservice.UpdateScheduleRequest,
+) error {
+	_, err := s.c.WorkflowService().UpdateSchedule(ctx, req)
+	return err
+}
+func (s *Scheduler) AliasDefinitionEditTransport() {
+	update := s.c.WorkflowService().UpdateSchedule
+	_ = update
+}
+`, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	crossPath := filepath.Clean("/repo/cmd/server/backdoor.go")
+	crossPackage, err := parser.ParseFile(fset, crossPath, `package main
+func crossPackageRawWrite(c *Client, ctx, req any) {
+	_, _ = c.WorkflowService().UpdateSchedule(ctx, req)
+}
+`, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations := taskDefinitionEditRawTransportViolations(
+		map[string]*ast.File{path: file, crossPath: crossPackage},
+		nil,
+		fset,
+	)
+	for _, fragment := range []string{"AdvanceDefinitionEdit", "UpdateSchedule"} {
+		if !slices.ContainsFunc(violations, func(violation string) bool {
+			return strings.Contains(violation, fragment)
+		}) {
+			t.Fatalf("raw transport %s mutation escaped exact call-site guard: %v",
+				fragment, violations)
+		}
+	}
+	if !slices.ContainsFunc(violations, func(violation string) bool {
+		return strings.Contains(violation, crossPath) &&
+			strings.Contains(violation, "UpdateSchedule")
+	}) {
+		t.Fatalf("cross-package raw Temporal write escaped full-tree guard: %v", violations)
+	}
+}
+
+func TestTaskDefinitionEditPrimitiveGuardRejectsWrongProviderGraphEdge(t *testing.T) {
+	t.Parallel()
+	fset := token.NewFileSet()
+	provider, err := parser.ParseFile(fset, "task_definition_edit.go", `package scheduler
+type Scheduler struct{}
+func (s *Scheduler) PrepareTaskDefinitionEdit() {
+	s.PauseTaskDefinitionEdit()
+}
+func (s *Scheduler) PauseTaskDefinitionEdit() {}
+`, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	functions := map[string]struct{}{
+		"PrepareTaskDefinitionEdit": {},
+		"PauseTaskDefinitionEdit":   {},
+	}
+	graph := map[string]struct{}{
+		"PrepareTaskDefinitionEdit": {},
+		"PauseTaskDefinitionEdit":   {},
+	}
+	_, violations := taskDefinitionEditProviderGraphReferences(
+		provider,
+		functions,
+		graph,
+		nil,
+		fset,
+	)
+	if !slices.ContainsFunc(violations, func(violation string) bool {
+		return strings.Contains(violation,
+			"PrepareTaskDefinitionEdit -> PauseTaskDefinitionEdit")
+	}) {
+		t.Fatalf("wrong provider graph edge escaped exact caller/callee guard: %v",
+			violations)
+	}
+}
+
+func taskDefinitionEditGuardedMethods() map[string]struct{} {
+	return map[string]struct{}{
+		"PrepareTaskDefinitionEdit":  {},
+		"DescribeTaskDefinitionEdit": {},
+		"PauseTaskDefinitionEdit":    {},
+		"ApplyTaskDefinitionEdit":    {},
+		"RestoreTaskDefinitionEdit":  {},
+	}
+}
+
+func taskDefinitionEditProviderFunctionSymbols() map[string]struct{} {
+	names := []string{
+		"PrepareTaskDefinitionEdit",
+		"DescribeTaskDefinitionEdit",
+		"PauseTaskDefinitionEdit",
+		"ApplyTaskDefinitionEdit",
+		"RestoreTaskDefinitionEdit",
+		"transitionTaskDefinitionEdit",
+		"observeTaskDefinitionEditSource",
+		"buildTaskDefinitionEditRuntime",
+		"taskDefinitionEditEnvironment",
+		"validateTaskDefinitionEditRequest",
+		"validateTaskDefinitionEditRequestIdentityV1",
+		"validateTaskDefinitionEditScheduleSpecV1",
+		"parseTaskDefinitionEditAnchorV1",
+		"validateTaskDefinitionEditDefinition",
+		"validateTaskDefinitionEditHead",
+		"freezeTaskDefinitionEditBase",
+		"decodeTaskDefinitionEditAction",
+		"verifyTaskDefinitionEditPayloadRoundTrip",
+		"validateTaskDefinitionEditBaseFingerprint",
+		"validateTaskDefinitionEditPolicies",
+		"classifyTaskDefinitionEditDescription",
+		"taskDefinitionEditDescriptionMatches",
+		"buildTaskDefinitionEditUpdateRequest",
+		"taskDefinitionEditProtoSchedule",
+		"validatePreparedTaskDefinitionEdit",
+		"validatePreparedTaskDefinitionEditSchedule",
+		"validateTaskDefinitionEditPreparedPhases",
+		"validateTaskDefinitionEditActionParams",
+		"taskDefinitionEditSchedulesShareDefinition",
+		"taskDefinitionEditSchedulesShareExecutionEnvelope",
+		"validateTaskDefinitionEditPhaseFingerprint",
+		"validateTaskDefinitionEditSnapshot",
+		"rejectTaskDefinitionEditUnknownFields",
+		"taskDefinitionEditCoreFingerprint",
+		"taskDefinitionEditCreationFingerprint",
+		"taskDefinitionEditFingerprintFor",
+		"taskDefinitionEditNote",
+		"taskDefinitionEditOperationSeedFromPrepared",
+		"digestTaskDefinitionEditOperationSeed",
+		"digestTaskDefinitionEditProjectionV1",
+		"digestPreparedTaskDefinitionEditSchedule",
+		"digestPreparedTaskDefinitionEdit",
+		"digestTaskDefinitionEditJSON",
+		"clonePreparedTaskDefinitionEdit",
+		"clonePreparedTaskDefinitionEditSchedule",
+		"cloneTaskDefinitionEditAction",
+		"clonePreparedTaskScheduleTiming",
+		"cloneTaskDefinitionEditDefinition",
+		"cloneTaskDefinitionEditScope",
+		"taskDefinitionEditSnapshot",
+		"taskDefinitionEditSnapshotFromRevision",
+		"taskDefinitionEditRepresentation",
+		"describeTaskDefinitionEdit",
+		"classifyTaskDefinitionEditReadError",
+		"isTaskDefinitionEditScheduleNotFound",
+		"describeTaskDefinitionEditForRecovery",
+	}
+	symbols := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		symbols[name] = struct{}{}
+	}
+	return symbols
+}
+
+func taskDefinitionEditTransitionGraphSymbols() map[string]struct{} {
+	return map[string]struct{}{
+		"PrepareTaskDefinitionEdit":             {},
+		"DescribeTaskDefinitionEdit":            {},
+		"PauseTaskDefinitionEdit":               {},
+		"ApplyTaskDefinitionEdit":               {},
+		"RestoreTaskDefinitionEdit":             {},
+		"transitionTaskDefinitionEdit":          {},
+		"observeTaskDefinitionEditSource":       {},
+		"buildTaskDefinitionEditRuntime":        {},
+		"taskDefinitionEditEnvironment":         {},
+		"describeTaskDefinitionEdit":            {},
+		"describeTaskDefinitionEditForRecovery": {},
+	}
+}
+
+type taskDefinitionEditGraphExpectation struct {
+	caller string
+	callee string
+	count  int
+}
+
+func taskDefinitionEditProviderGraphExpectations() []taskDefinitionEditGraphExpectation {
+	return []taskDefinitionEditGraphExpectation{
+		{"PrepareTaskDefinitionEdit", "taskDefinitionEditEnvironment", 1},
+		{"PrepareTaskDefinitionEdit", "describeTaskDefinitionEdit", 1},
+		{"DescribeTaskDefinitionEdit", "buildTaskDefinitionEditRuntime", 1},
+		{"DescribeTaskDefinitionEdit", "describeTaskDefinitionEdit", 1},
+		{"PauseTaskDefinitionEdit", "buildTaskDefinitionEditRuntime", 1},
+		{"PauseTaskDefinitionEdit", "observeTaskDefinitionEditSource", 1},
+		{"PauseTaskDefinitionEdit", "transitionTaskDefinitionEdit", 1},
+		{"ApplyTaskDefinitionEdit", "buildTaskDefinitionEditRuntime", 1},
+		{"ApplyTaskDefinitionEdit", "transitionTaskDefinitionEdit", 1},
+		{"RestoreTaskDefinitionEdit", "buildTaskDefinitionEditRuntime", 1},
+		{"RestoreTaskDefinitionEdit", "observeTaskDefinitionEditSource", 1},
+		{"RestoreTaskDefinitionEdit", "transitionTaskDefinitionEdit", 1},
+		{"transitionTaskDefinitionEdit", "describeTaskDefinitionEdit", 1},
+		{"transitionTaskDefinitionEdit", "describeTaskDefinitionEditForRecovery", 1},
+		{"observeTaskDefinitionEditSource", "describeTaskDefinitionEdit", 1},
+		{"buildTaskDefinitionEditRuntime", "taskDefinitionEditEnvironment", 1},
+		{"describeTaskDefinitionEditForRecovery", "describeTaskDefinitionEdit", 1},
+	}
+}
+
+func taskDefinitionEditProviderGraphReferences(
+	provider *ast.File,
+	expectedFunctions map[string]struct{},
+	transitionGraph map[string]struct{},
+	expectations []taskDefinitionEditGraphExpectation,
+	fset *token.FileSet,
+) (map[token.Pos]struct{}, []string) {
+	type expectationKey struct{ caller, callee string }
+	want := make(map[expectationKey]int, len(expectations))
+	for _, expectation := range expectations {
+		key := expectationKey{expectation.caller, expectation.callee}
+		if _, duplicate := want[key]; duplicate {
+			return nil, []string{fmt.Sprintf(
+				"duplicate Scheduler provider graph expectation %s -> %s",
+				expectation.caller,
+				expectation.callee,
+			)}
+		}
+		want[key] = expectation.count
+	}
+	got := make(map[expectationKey]int, len(want))
+	declared := make(map[string]int, len(expectedFunctions))
+	allowed := make(map[token.Pos]struct{}, len(transitionGraph)*2)
+	var violations []string
+	for _, declaration := range provider.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if _, expected := expectedFunctions[function.Name.Name]; !expected {
+			violations = append(violations, fset.Position(function.Name.Pos()).String()+
+				": task-definition-edit provider has an unexpected function/method "+
+				function.Name.Name)
+			continue
+		}
+		declared[function.Name.Name]++
+		allowed[function.Name.Pos()] = struct{}{}
+	}
+	for name := range expectedFunctions {
+		if declared[name] != 1 {
+			violations = append(violations, fmt.Sprintf(
+				"task-definition-edit provider graph symbol %s must be declared exactly once, got %d",
+				name, declared[name],
+			))
+		}
+	}
+
+	for _, declaration := range provider.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			var callee *ast.Ident
+			switch typed := taskDefinitionEditUnparen(call.Fun).(type) {
+			case *ast.Ident:
+				callee = typed
+			case *ast.SelectorExpr:
+				callee = typed.Sel
+			}
+			if callee == nil {
+				return true
+			}
+			if _, sensitive := transitionGraph[callee.Name]; !sensitive {
+				return true
+			}
+			key := expectationKey{function.Name.Name, callee.Name}
+			if _, expected := want[key]; !expected {
+				violations = append(violations, fset.Position(callee.Pos()).String()+
+					": Scheduler provider graph edge is not allowlisted "+
+					function.Name.Name+" -> "+callee.Name)
+				return true
+			}
+			got[key]++
+			allowed[callee.Pos()] = struct{}{}
+			return true
+		})
+	}
+	for expected, count := range want {
+		if got[expected] != count {
+			violations = append(violations, fmt.Sprintf(
+				"Scheduler provider graph edge %s -> %s must occur exactly %d time(s), got %d",
+				expected.caller,
+				expected.callee,
+				count,
+				got[expected],
+			))
+		}
+	}
+	ast.Inspect(provider, func(node ast.Node) bool {
+		identifier, ok := node.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if _, sensitive := transitionGraph[identifier.Name]; !sensitive {
+			return true
+		}
+		if _, ok := allowed[identifier.Pos()]; ok {
+			return true
+		}
+		violations = append(violations, fset.Position(identifier.Pos()).String()+
+			": provider graph symbol must only be declared or directly called "+identifier.Name)
+		return true
+	})
+	return allowed, violations
+}
+
+func taskDefinitionEditSchedulerAliases(
+	files map[string]*ast.File,
+	schedulerDir string,
+	providerPath string,
+	providerFunctions map[string]struct{},
+	transitionGraph map[string]struct{},
+) map[string]struct{} {
+	type graphDeclaration struct {
+		node              ast.Node
+		names             []*ast.Ident
+		declaredPositions map[token.Pos]struct{}
+	}
+	declarations := make([]graphDeclaration, 0)
+	for path, file := range files {
+		if filepath.Clean(filepath.Dir(path)) != filepath.Clean(schedulerDir) {
+			continue
+		}
+		for _, declaration := range file.Decls {
+			candidate := graphDeclaration{
+				node:              declaration,
+				declaredPositions: make(map[token.Pos]struct{}),
+			}
+			switch typed := declaration.(type) {
+			case *ast.FuncDecl:
+				if filepath.Clean(path) == filepath.Clean(providerPath) {
+					if _, controlled := providerFunctions[typed.Name.Name]; controlled {
+						continue
+					}
+				}
+				candidate.names = append(candidate.names, typed.Name)
+				candidate.declaredPositions[typed.Name.Pos()] = struct{}{}
+			case *ast.GenDecl:
+				for _, specification := range typed.Specs {
+					value, ok := specification.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for _, name := range value.Names {
+						candidate.names = append(candidate.names, name)
+						candidate.declaredPositions[name.Pos()] = struct{}{}
+					}
+				}
+			}
+			if len(candidate.names) != 0 {
+				declarations = append(declarations, candidate)
+			}
+		}
+	}
+
+	aliases := make(map[string]struct{})
+	for changed := true; changed; {
+		changed = false
+		for _, declaration := range declarations {
+			tainted := false
+			ast.Inspect(declaration.node, func(node ast.Node) bool {
+				if tainted {
+					return false
+				}
+				identifier, ok := node.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				if _, declarationName := declaration.declaredPositions[identifier.Pos()]; declarationName {
+					return true
+				}
+				if _, sensitive := transitionGraph[identifier.Name]; sensitive {
+					tainted = true
+					return false
+				}
+				_, tainted = aliases[identifier.Name]
+				return !tainted
+			})
+			if !tainted {
+				continue
+			}
+			for _, name := range declaration.names {
+				if _, exists := aliases[name.Name]; exists {
+					continue
+				}
+				aliases[name.Name] = struct{}{}
+				changed = true
+			}
+		}
+	}
+	return aliases
+}
+
+func taskDefinitionEditGraphBoundaryViolations(
+	path string,
+	file *ast.File,
+	schedulerDir string,
+	providerPath string,
+	graph map[string]struct{},
+	providerAllowed map[token.Pos]struct{},
+	aliases map[string]struct{},
+	fset *token.FileSet,
+) []string {
+	cleanPath := filepath.Clean(path)
+	insideScheduler := filepath.Clean(filepath.Dir(cleanPath)) == filepath.Clean(schedulerDir)
+	var violations []string
+	ast.Inspect(file, func(node ast.Node) bool {
+		identifier, ok := node.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if _, alias := aliases[identifier.Name]; alias {
+			violations = append(violations, fset.Position(identifier.Pos()).String()+
+				": renamed task-definition-edit transition wrapper/alias "+identifier.Name)
+			return true
+		}
+		if !insideScheduler || cleanPath == filepath.Clean(providerPath) {
+			return true
+		}
+		if _, sensitive := graph[identifier.Name]; !sensitive {
+			return true
+		}
+		if _, allowed := providerAllowed[identifier.Pos()]; allowed {
+			return true
+		}
+		violations = append(violations, fset.Position(identifier.Pos()).String()+
+			": task-definition-edit private/raw graph reference outside its provider "+
+			identifier.Name)
+		return true
+	})
+	return violations
 }
 
 func taskDefinitionEditProductionFiles(
@@ -213,6 +780,133 @@ func taskDefinitionEditAPIViolations(
 		violations = append(violations,
 			"unguarded exported TaskDefinitionEdit Scheduler method "+name+" at "+
 				taskDefinitionEditMethodPositions(locations))
+	}
+	return violations
+}
+
+type taskDefinitionEditRawTransportExpectation struct {
+	path     string
+	function string
+	method   string
+	count    int
+}
+
+func taskDefinitionEditRawTransportExpectations(
+	schedulerDir string,
+) []taskDefinitionEditRawTransportExpectation {
+	return []taskDefinitionEditRawTransportExpectation{
+		{
+			filepath.Clean(filepath.Join(schedulerDir, "task_definition_edit.go")),
+			"transitionTaskDefinitionEdit",
+			"UpdateSchedule",
+			1,
+		},
+		{
+			filepath.Clean(filepath.Join(schedulerDir, "task_definition_edit.go")),
+			"describeTaskDefinitionEdit",
+			"DescribeSchedule",
+			1,
+		},
+		{
+			filepath.Clean(filepath.Join(schedulerDir, "task_schedule.go")),
+			"ActivateTask",
+			"UpdateSchedule",
+			1,
+		},
+		{
+			filepath.Clean(filepath.Join(schedulerDir, "task_schedule.go")),
+			"describeTaskSchedule",
+			"DescribeSchedule",
+			1,
+		},
+	}
+}
+
+func taskDefinitionEditRawTransportViolations(
+	files map[string]*ast.File,
+	expectations []taskDefinitionEditRawTransportExpectation,
+	fset *token.FileSet,
+) []string {
+	type expectationKey struct {
+		path, function, method string
+	}
+	want := make(map[expectationKey]int, len(expectations))
+	for _, expectation := range expectations {
+		key := expectationKey{
+			filepath.Clean(expectation.path),
+			expectation.function,
+			expectation.method,
+		}
+		if _, duplicate := want[key]; duplicate {
+			return []string{fmt.Sprintf(
+				"duplicate raw Scheduler transport expectation %s in %s",
+				expectation.method,
+				expectation.function,
+			)}
+		}
+		want[key] = expectation.count
+	}
+
+	got := make(map[expectationKey]int, len(want))
+	allowed := make(map[token.Pos]struct{})
+	var violations []string
+	for path, file := range files {
+		cleanPath := filepath.Clean(path)
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				method, raw := taskDefinitionEditRawWorkflowServiceCall(call)
+				if !raw || (method != "UpdateSchedule" && method != "DescribeSchedule") {
+					return true
+				}
+				selector := taskDefinitionEditUnparen(call.Fun).(*ast.SelectorExpr)
+				key := expectationKey{cleanPath, function.Name.Name, method}
+				if _, expected := want[key]; !expected {
+					violations = append(violations, fset.Position(selector.Sel.Pos()).String()+
+						": raw Scheduler transport call is not an exact existing site "+
+						function.Name.Name+" -> "+method)
+					return true
+				}
+				got[key]++
+				allowed[selector.Sel.Pos()] = struct{}{}
+				return true
+			})
+		}
+	}
+	for expected, count := range want {
+		if got[expected] != count {
+			violations = append(violations, fmt.Sprintf(
+				"raw Scheduler transport %s:%s -> %s must occur exactly %d time(s), got %d",
+				expected.path,
+				expected.function,
+				expected.method,
+				count,
+				got[expected],
+			))
+		}
+	}
+	for _, file := range files {
+		ast.Inspect(file, func(node ast.Node) bool {
+			selector, ok := node.(*ast.SelectorExpr)
+			if !ok || (selector.Sel.Name != "UpdateSchedule" &&
+				selector.Sel.Name != "DescribeSchedule") {
+				return true
+			}
+			if _, exact := allowed[selector.Sel.Pos()]; exact {
+				return true
+			}
+			violations = append(violations, fset.Position(selector.Sel.Pos()).String()+
+				": raw Scheduler transport selector/method value is not allowlisted "+
+				selector.Sel.Name)
+			return true
+		})
 	}
 	return violations
 }
@@ -340,6 +1034,7 @@ func taskDefinitionEditProductionViolations(
 	file *ast.File,
 	providerPath string,
 	guarded map[string]struct{},
+	coordinatorCalls map[token.Pos]struct{},
 	fset *token.FileSet,
 ) []string {
 	var violations []string
@@ -408,6 +1103,9 @@ func taskDefinitionEditProductionViolations(
 			return true
 		}
 		if _, watched := guarded[selector.Sel.Name]; watched {
+			if _, allowed := coordinatorCalls[selector.Sel.Pos()]; allowed {
+				return true
+			}
 			position := fset.Position(selector.Sel.Pos())
 			violations = append(violations,
 				position.String()+": production reference "+selector.Sel.Name)
@@ -415,6 +1113,66 @@ func taskDefinitionEditProductionViolations(
 		return true
 	})
 	return violations
+}
+
+func taskDefinitionEditCoordinatorRawCalls(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	type expectation struct {
+		method   string
+		function string
+	}
+	expectations := []expectation{
+		{"PrepareTaskDefinitionEdit", "prepareTaskDefinitionEditProposal"},
+		{"PauseTaskDefinitionEdit", "runTaskDefinitionEditPauseAttempt"},
+		{"ApplyTaskDefinitionEdit", "runTaskDefinitionEditApplyAttempt"},
+		{"RestoreTaskDefinitionEdit", "runTaskDefinitionEditRestoreAttempt"},
+	}
+	type expectationKey struct{ method, function string }
+	want := make(map[expectationKey]struct{}, len(expectations))
+	for _, expected := range expectations {
+		want[expectationKey(expected)] = struct{}{}
+	}
+	got := make(map[expectationKey]int, len(expectations))
+	allowed := make(map[token.Pos]struct{}, len(expectations))
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := taskDefinitionEditUnparen(call.Fun).(*ast.SelectorExpr)
+			if !ok || !taskDefinitionEditIsCoordinatorSchedulerSelector(selector) {
+				return true
+			}
+			key := expectationKey{selector.Sel.Name, function.Name.Name}
+			if _, expected := want[key]; expected {
+				got[key]++
+				allowed[selector.Sel.Pos()] = struct{}{}
+			}
+			return true
+		})
+	}
+	for expected := range want {
+		if got[expected] != 1 {
+			return nil, fmt.Errorf("coordinator %s must directly call c.scheduler.%s exactly once, got %d",
+				expected.function, expected.method, got[expected])
+		}
+	}
+	return allowed, nil
+}
+
+func taskDefinitionEditIsCoordinatorSchedulerSelector(selector *ast.SelectorExpr) bool {
+	schedules, ok := taskDefinitionEditUnparen(selector.X).(*ast.SelectorExpr)
+	if !ok || schedules.Sel.Name != "scheduler" {
+		return false
+	}
+	receiver, ok := taskDefinitionEditUnparen(schedules.X).(*ast.Ident)
+	return ok && receiver.Name == "c"
 }
 
 func taskDefinitionEditMethodPositions(sources []taskDefinitionEditMethodSource) string {
