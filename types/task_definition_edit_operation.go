@@ -178,15 +178,18 @@ type TaskDefinitionEditOperation struct {
 	LeaseUntil        *time.Time
 	TakeoverNotBefore *time.Time
 	Fence             int64
-	Attempt           int
-	ReceiptProvider   string
-	ReceiptTarget     string
-	Result            json.RawMessage
-	ErrorCode         string
-	ErrorMessage      string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
-	TombstonedAt      *time.Time
+	// Attempt counts lease acquisition generations (initial claim plus stale
+	// takeovers). The coordinator's one-remote-phase execution attempt is a
+	// separate code-level boundary and does not rotate a live fence.
+	Attempt         int
+	ReceiptProvider string
+	ReceiptTarget   string
+	Result          json.RawMessage
+	ErrorCode       string
+	ErrorMessage    string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	TombstonedAt    *time.Time
 }
 
 // Lease returns the complete fencing identity represented by the row.
