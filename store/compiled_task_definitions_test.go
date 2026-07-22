@@ -941,9 +941,10 @@ func planURLs(t *testing.T, raw json.RawMessage) []string {
 func assertNoCompiledTaskAggregate(t *testing.T, st *Store, taskID string) {
 	t.Helper()
 	for table, column := range map[string]string{
-		"schedules":          "id",
-		"schedule_playbooks": "schedule_id",
-		"schedule_sources":   "schedule_id",
+		"schedules":                         "id",
+		"schedule_playbooks":                "schedule_id",
+		"schedule_sources":                  "schedule_id",
+		"task_approved_definition_versions": "task_id",
 	} {
 		var count int
 		query := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s = $1`, table, column)

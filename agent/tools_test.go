@@ -14,6 +14,7 @@ import (
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/sourcespec"
+	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
@@ -721,16 +722,28 @@ func TestValidateScheduleSpecFields_共用(t *testing.T) {
 	}
 }
 
-// TestBuildTools_包含update_schedule 防装配漏注册：工具写了但没进 BuildTools
-// 等于不存在（loop 只认注册过的名字）。
-func TestBuildTools_包含update_schedule(t *testing.T) {
+// TestBuildTools_DefinitionWritesRetired keeps every pre-C2b definition writer
+// out of the Agent allowlist. Existing pending actions for these names are
+// consequently consumed by Loop's registered-tool gate without execution.
+func TestBuildTools_DefinitionWritesRetired(t *testing.T) {
 	names := map[string]bool{}
-	for _, tl := range BuildTools(nil, nil, nil, nil, nil, nil, nil, nil) {
+	// Use the same non-nil dependency shape as production. A conditional
+	// registration such as `if sched != nil` must not make this guard vacuous.
+	for _, tl := range BuildTools(&store.Store{}, &scheduler.Scheduler{}, nil, nil, nil, nil, nil) {
 		names[tl.Name()] = true
 	}
-	for _, want := range []string{"create_schedule", "update_schedule", "remove_schedule", "list_schedules", "view_task_playbook", "edit_task_playbook"} {
+	for _, retired := range []string{
+		"update_schedule", "edit_task_playbook", "set_task_strictness",
+	} {
+		if names[retired] {
+			t.Errorf("BuildTools must not register retired definition writer %s", retired)
+		}
+	}
+	for _, want := range []string{
+		"create_schedule", "remove_schedule", "list_schedules", "view_task_playbook",
+	} {
 		if !names[want] {
-			t.Errorf("BuildTools 应包含 %s", want)
+			t.Errorf("BuildTools should retain %s", want)
 		}
 	}
 }
@@ -757,7 +770,7 @@ func (f *recordingTaskCreator) Create(
 func TestBuildTools_CreateSchedule委托注入服务(t *testing.T) {
 	tasks := &recordingTaskCreator{}
 	var create Tool
-	for _, tl := range BuildTools(nil, nil, tasks, nil, nil, nil, nil, nil) {
+	for _, tl := range BuildTools(nil, nil, tasks, nil, nil, nil, nil) {
 		if tl.Name() == "create_schedule" {
 			create = tl
 			break

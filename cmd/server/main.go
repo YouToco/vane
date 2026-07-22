@@ -264,9 +264,6 @@ func run() error {
 			cfg.Agent.EndpointMsgCap, cfg.Agent.EndpointDailyCap,
 			llm.ContextWindowTokens(cfg.LLM.AgentModel))
 	}
-	// 任务手册翻译器（P1 编译层）：create/edit 手册后据此把正文编译成 fetch_plan。
-	// 用 client 默认模型（同 scorer/cardgen），走 recorder 记账；一次 llm.Do、DisableThinking。
-	playbookTr := agent.NewPlaybookTranslator(llmClient, recorder)
 	// prober 传 fetch（*fetcher.Multi）而非 fetch.Binding()：1.5 起试跑=准入统一由
 	// Multi.Probe 分派（绑定能力走绑定引擎，web/feed 与 web/contents 走各自 provider）。
 	// Exa ad-hoc 工具对（web_search/read_page）：key 未配置则不装配（exaTools=nil），
@@ -279,7 +276,7 @@ func run() error {
 	// Legacy v0 create_schedule cards are deliberately drained without execution
 	// in Loop.ExecuteAction. Passing no legacy creator makes the old active-first
 	// CreatePush path unreachable even if that guard regresses.
-	tools := agent.BuildTools(st, sched, nil, sched, playbookTr, endpoints, fetch, exaTools)
+	tools := agent.BuildTools(st, sched, nil, sched, endpoints, fetch, exaTools)
 	agentLoop := agent.New(agent.Deps{
 		Client:       llmClient,
 		Recorder:     recorder,

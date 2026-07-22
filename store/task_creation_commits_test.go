@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/sourcespec"
+	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
 
@@ -495,6 +498,7 @@ func TestTaskCreationDefinitionActivation_AtomicAndVisibleOnlyWhenComplete(t *te
 	if err := st.CommitPausedCompiledTaskDefinitionForCreation(ctx, p); err != nil {
 		t.Fatalf("definition exact replay 失败: %v", err)
 	}
+	assertTaskCreationApprovedDefinition(t, st, p)
 	assertCreationPhaseAndScheduleStatus(t, st, p.Lease.ID, p.Definition.TaskID,
 		types.TaskCreationPhaseDefinitionCommitted, types.ScheduleStatusPaused)
 	assertScheduleVisibility(t, st, f.userID, p.Definition.TaskID, false)
@@ -566,14 +570,14 @@ func TestTaskCreationCompiledSagaRejectsDynamicAggregate(t *testing.T) {
 			INSERT INTO task_approved_definition_versions (
 				tenant_id, user_id, task_id, version, schema_version,
 				execution_mode, definition_digest, payload, approval_ref
-			) VALUES ($1, $2, $3, 1, 'test.dynamic/v1', $4, $5, $6, $7)`,
+			) VALUES ($1, $2, $3, 2, 'test.dynamic/v1', $4, $5, $6, $7)`,
 			f.tenantID, f.userID, taskID, types.ExecutionModeDiscoverAtRun,
 			digest, payload, "test-dynamic:"+taskID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE schedules
-			   SET execution_mode=$2, approved_definition_version=1,
+			   SET execution_mode=$2, approved_definition_version=2,
 			       approved_definition_digest=$3
 			 WHERE id=$1`, taskID, types.ExecutionModeDiscoverAtRun, digest); err != nil {
 			t.Fatal(err)
@@ -630,6 +634,56 @@ func TestTaskCreationCompiledSagaRejectsDynamicAggregate(t *testing.T) {
 			t.Fatalf("rejected dynamic activation changed status to %q", status)
 		}
 	})
+}
+
+func TestTaskCreationDefinitionReplayRejectsApprovedHeadDrift(t *testing.T) {
+	st := tenantTestStore(t)
+	f := newCompiledTaskFixture(t, st)
+	cleanupA5Fixture(t, st, f)
+	ctx := t.Context()
+	p := preparedA5Commit(t, st, f, "approved-head-drift")
+	if err := st.CommitPausedCompiledTaskDefinitionForCreation(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	current := assertTaskCreationApprovedDefinition(t, st, p)
+	drifted := current.Definition
+	drifted.Intent += "（未由本次创建批准）"
+	payload, err := taskstate.EncodeApprovedDefinitionV1(drifted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := taskstate.DigestApprovedDefinitionV1(drifted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO task_approved_definition_versions (
+			tenant_id, user_id, task_id, version, schema_version,
+			execution_mode, definition_digest, payload, approval_ref
+		) VALUES ($1, $2, $3, 2, $4, $5, $6, $7, $8)`,
+		p.Lease.TenantID, p.Lease.UserID, p.Definition.TaskID,
+		drifted.SchemaVersion, types.ExecutionModeCompiled, digest, payload,
+		"test-approved-head-drift:"+p.Definition.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE schedules
+		   SET approved_definition_version=2, approved_definition_digest=$2
+		 WHERE id=$1`, p.Definition.TaskID, digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.CommitPausedCompiledTaskDefinitionForCreation(ctx, p); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("creation replay adopted a drifted approved head: %v", err)
+	}
 }
 
 func TestTaskCreationActivation_ResponseLostExactAdopt(t *testing.T) {
@@ -881,10 +935,51 @@ func TestTaskCreationDefinitionCommit_ResponseLostAndRollback(t *testing.T) {
 		}
 		assertCreationPhaseAndScheduleStatus(t, st, p.Lease.ID, p.Definition.TaskID,
 			types.TaskCreationPhaseDefinitionCommitted, types.ScheduleStatusPaused)
+		assertTaskCreationApprovedDefinition(t, st, p)
 		if err := st.CommitPausedCompiledTaskDefinitionForCreation(ctx, p); err != nil {
 			t.Fatalf("lost-response replay 应 exact-adopt: %v", err)
 		}
+		assertTaskCreationApprovedDefinition(t, st, p)
 	})
+}
+
+func TestTaskCreationDefinitionCommit_PreservesApprovedPlanOrderAndMaterializedIDs(t *testing.T) {
+	st := tenantTestStore(t)
+	f := newCompiledTaskFixture(t, st)
+	cleanupA5Fixture(t, st, f)
+	first := validA5PlanSource(t, "z-first-in-plan-"+uuid.NewString(), "计划源 Z")
+	second := validA5PlanSource(t, "a-second-in-plan-"+uuid.NewString(), "计划源 A")
+	p := preparedA5CommitWithSources(t, st, f, "approved-order", first, second)
+
+	if err := st.CommitPausedCompiledTaskDefinitionForCreation(t.Context(), p); err != nil {
+		t.Fatalf("CommitPausedCompiledTaskDefinitionForCreation: %v", err)
+	}
+	record := assertTaskCreationApprovedDefinition(t, st, p)
+	var plan taskstate.FetchPlanV1
+	if err := json.Unmarshal(record.Definition.FetchPlan, &plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Sources) != 2 || plan.Sources[0].URL != first.URL ||
+		plan.Sources[1].URL != second.URL {
+		t.Fatalf("approved plan order drifted: %+v", plan.Sources)
+	}
+	if len(record.Definition.Sources) != 2 ||
+		record.Definition.Sources[0].URL != second.URL ||
+		record.Definition.Sources[1].URL != first.URL {
+		t.Fatalf("approved source canonical order drifted: %+v", record.Definition.Sources)
+	}
+}
+
+func TestTaskCreationDefinitionCommit_PreservesLooseStrictness(t *testing.T) {
+	st := tenantTestStore(t)
+	f := newCompiledTaskFixture(t, st)
+	cleanupA5Fixture(t, st, f)
+	p := preparedA5CommitWithStrictness(t, st, f, "approved-loose", types.StrictnessLoose)
+
+	if err := st.CommitPausedCompiledTaskDefinitionForCreation(t.Context(), p); err != nil {
+		t.Fatalf("CommitPausedCompiledTaskDefinitionForCreation: %v", err)
+	}
+	assertTaskCreationApprovedDefinition(t, st, p)
 }
 
 func TestTaskCreationDefinitionCommit_LockOrderAvoidsCreateReplayDeadlock(t *testing.T) {
@@ -1723,10 +1818,54 @@ func preparedA5Commit(
 	f *compiledTaskFixture,
 	suffix string,
 ) types.CommitPausedCompiledTaskDefinitionForCreationParams {
+	return preparedA5CommitWithStrictness(t, st, f, suffix, types.StrictnessStrict)
+}
+
+func preparedA5CommitWithStrictness(
+	t *testing.T,
+	st *Store,
+	f *compiledTaskFixture,
+	suffix string,
+	strictness types.PushStrictness,
+) types.CommitPausedCompiledTaskDefinitionForCreationParams {
+	return preparedA5CommitWithSourcesAndStrictness(t, st, f, suffix, strictness,
+		validA5PlanSource(t, "a5-test-"+suffix+"-"+uuid.NewString(), "计划源 1"))
+}
+
+func preparedA5CommitWithSources(
+	t *testing.T,
+	st *Store,
+	f *compiledTaskFixture,
+	suffix string,
+	sources ...compiledPlanSource,
+) types.CommitPausedCompiledTaskDefinitionForCreationParams {
+	return preparedA5CommitWithSourcesAndStrictness(
+		t, st, f, suffix, types.StrictnessStrict, sources...)
+}
+
+func preparedA5CommitWithSourcesAndStrictness(
+	t *testing.T,
+	st *Store,
+	f *compiledTaskFixture,
+	suffix string,
+	strictness types.PushStrictness,
+	sources ...compiledPlanSource,
+) types.CommitPausedCompiledTaskDefinitionForCreationParams {
 	t.Helper()
 	op := createAndAcquireA5Operation(t, st, f, "a5-"+suffix)
 	lease := op.Lease()
-	def := f.definition(f.taskID(), types.StrictnessNormal, f.url(suffix))
+	plan, err := json.Marshal(compiledFetchPlan{Sources: sources})
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := types.PausedCompiledTaskDefinition{
+		TaskID: f.taskID(), TenantID: f.tenantID, UserID: f.userID,
+		NLDescription:   "每天早上监控指定主题",
+		SpecJSON:        json.RawMessage(`{"cron":"0 8 * * *","tz":"Asia/Shanghai"}`),
+		ScopeJSON:       json.RawMessage(`{"max_items":5}`),
+		PlaybookContent: "只看官方与高可信来源。", FetchPlan: plan,
+		Strictness: strictness,
+	}
 	definitionDigest, err := types.DigestPausedCompiledTaskDefinition(def)
 	if err != nil {
 		t.Fatal(err)
@@ -1772,6 +1911,129 @@ func preparedA5Commit(
 		Lease: lease, Definition: def, CompiledDigest: digest,
 		PreparedSchedule: prepared, EnsureReceipt: receipt,
 	}
+}
+
+func validA5PlanSource(t *testing.T, query, title string) compiledPlanSource {
+	t.Helper()
+	source, message := sourcespec.Build(sourcespec.Spec{
+		Platform: "web", Capability: "search", Title: title,
+		Params: map[string]string{"query": query},
+	})
+	if message != "" || source == nil {
+		t.Fatalf("build valid A5 source: source=%+v message=%q", source, message)
+	}
+	return compiledPlanSource{
+		Platform: string(source.Platform), Capability: string(source.Capability),
+		Title: source.Title, URL: source.URL,
+		Config: append(json.RawMessage(nil), source.Config...),
+	}
+}
+
+func assertTaskCreationApprovedDefinition(
+	t *testing.T,
+	st *Store,
+	p types.CommitPausedCompiledTaskDefinitionForCreationParams,
+) ApprovedDefinitionVersionRecord {
+	t.Helper()
+	record, err := st.GetCurrentApprovedDefinition(
+		t.Context(), p.Lease.TenantID, p.Lease.UserID, p.Definition.TaskID)
+	if err != nil {
+		t.Fatalf("GetCurrentApprovedDefinition: %v", err)
+	}
+	if record.Version != initialApprovedDefinitionVersion ||
+		record.ApprovalRef != taskCreationApprovalRefPrefix+p.Lease.ID ||
+		record.Definition.ExecutionMode != types.ExecutionModeCompiled ||
+		record.Definition.SourceScope != taskstate.SourceScopeApprovedPlan ||
+		record.Definition.Intent != p.Definition.PlaybookContent ||
+		record.Definition.PlaybookContent != p.Definition.PlaybookContent ||
+		record.Definition.NLDescription != p.Definition.NLDescription {
+		t.Fatalf("approved definition differs: %+v", record)
+	}
+	var plan taskstate.FetchPlanV1
+	if err := json.Unmarshal(p.Definition.FetchPlan, &plan); err != nil {
+		t.Fatalf("decode independently expected approved plan: %v", err)
+	}
+	expectedSources := make([]taskstate.ApprovedSourceV1, 0, len(plan.Sources))
+	for _, source := range plan.Sources {
+		var sourceID int64
+		if err := st.pool.QueryRow(t.Context(),
+			`SELECT src.id
+			   FROM schedule_sources ss JOIN sources src ON src.id=ss.source_id
+			  WHERE ss.schedule_id=$1 AND src.url=$2`,
+			p.Definition.TaskID, source.URL,
+		).Scan(&sourceID); err != nil {
+			t.Fatal(err)
+		}
+		expectedSources = append(expectedSources, taskstate.ApprovedSourceV1{
+			SourceID: sourceID, Platform: source.Platform, Capability: source.Capability,
+			Title: source.Title, URL: source.URL,
+			Config: append(json.RawMessage(nil), source.Config...),
+		})
+	}
+	expected, err := taskstate.BuildApprovedDefinitionV1(taskstate.ApprovedDefinitionInputV1{
+		TenantID: p.Definition.TenantID, UserID: p.Definition.UserID,
+		TaskID: p.Definition.TaskID, Intent: p.Definition.PlaybookContent,
+		NLDescription: p.Definition.NLDescription,
+		SpecJSON:      p.Definition.SpecJSON, ScopeJSON: p.Definition.ScopeJSON,
+		PlaybookContent: p.Definition.PlaybookContent,
+		SourceScope:     taskstate.SourceScopeApprovedPlan,
+		FetchPlan:       p.Definition.FetchPlan, Strictness: p.Definition.Strictness,
+		Sources: expectedSources, ExecutionMode: types.ExecutionModeCompiled,
+		DeliveryPolicy: taskstate.DeliveryPolicyOwnerFeishu,
+		BudgetPolicy:   taskstate.BudgetPolicyInheritTenantQuota,
+	})
+	if err != nil {
+		t.Fatalf("build independently expected approved definition: %v", err)
+	}
+	expectedPayload, err := taskstate.EncodeApprovedDefinitionV1(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedDigest, err := taskstate.DigestApprovedDefinitionV1(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(record.Payload, expectedPayload) || record.Digest != expectedDigest ||
+		record.Definition.Strictness != p.Definition.Strictness ||
+		record.Definition.DeliveryPolicy != taskstate.DeliveryPolicyOwnerFeishu ||
+		record.Definition.BudgetPolicy != taskstate.BudgetPolicyInheritTenantQuota {
+		t.Fatalf("approved definition exact projection differs:\n got=%s\nwant=%s",
+			record.Payload, expectedPayload)
+	}
+	var versionCount, adaptiveCount int
+	if err := st.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM task_approved_definition_versions
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`,
+		p.Lease.TenantID, p.Lease.UserID, p.Definition.TaskID,
+	).Scan(&versionCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM task_adaptive_states
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`,
+		p.Lease.TenantID, p.Lease.UserID, p.Definition.TaskID,
+	).Scan(&adaptiveCount); err != nil {
+		t.Fatal(err)
+	}
+	if versionCount != 1 || adaptiveCount != 0 {
+		t.Fatalf("definition/adaptive rows=%d/%d, want 1/0", versionCount, adaptiveCount)
+	}
+	for _, source := range record.Definition.Sources {
+		var sourceID int64
+		if err := st.pool.QueryRow(t.Context(),
+			`SELECT src.id
+			   FROM schedule_sources ss JOIN sources src ON src.id=ss.source_id
+			  WHERE ss.schedule_id=$1 AND src.url=$2`,
+			p.Definition.TaskID, source.URL,
+		).Scan(&sourceID); err != nil {
+			t.Fatal(err)
+		}
+		if source.SourceID != sourceID {
+			t.Fatalf("approved source %s id=%d, materialized id=%d",
+				source.URL, source.SourceID, sourceID)
+		}
+	}
+	return record
 }
 
 func preparedA5ScheduleOnly(

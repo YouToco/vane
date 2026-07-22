@@ -108,6 +108,14 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 		if !matches {
 			return taskCreationConflict("committed definition aggregate differs")
 		}
+		matches, err = taskCreationApprovedDefinitionMatchesTx(
+			ctx, tx, p.Definition, plan, p.Lease.ID)
+		if err != nil {
+			return err
+		}
+		if !matches {
+			return taskCreationConflict("committed approved definition differs")
+		}
 		return nil
 	case types.TaskCreationPhaseScheduleEnsured:
 		// Initial transition continues below.
@@ -126,6 +134,10 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 	}
 
 	if err := insertPausedCompiledTaskDefinitionTx(ctx, tx, p.Definition, plan); err != nil {
+		return err
+	}
+	if _, err := insertTaskCreationApprovedDefinitionTx(
+		ctx, tx, p.Definition, plan, p.Lease.ID); err != nil {
 		return err
 	}
 	tag, err := tx.Exec(ctx,

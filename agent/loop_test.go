@@ -2206,6 +2206,32 @@ func TestExecuteAction_AppendsOnFailureAndOfflineTool(t *testing.T) {
 	}
 }
 
+func TestExecuteAction_RetiredDefinitionWritesFailClosed(t *testing.T) {
+	for _, toolName := range []string{
+		"update_schedule", "edit_task_playbook", "set_task_strictness",
+	} {
+		t.Run(toolName, func(t *testing.T) {
+			fs := newFakeStore()
+			sess, _ := fs.CreateAgentSession(t.Context(), 7)
+			actionID := "retired-" + toolName
+			fs.actions[actionID] = newPendingAction(
+				actionID, 7, &sess.ID, toolName, "legacy definition write")
+			sentinel := &fakeTool{name: "remove_schedule", mutating: true}
+			l := newTestLoop(t, fs, (&scriptedChat{}).fn, sentinel)
+
+			reply, err := l.ExecuteAction(t.Context(), 7, actionID)
+			if err != nil || !strings.Contains(reply, toolName+" 已不可用") {
+				t.Fatalf("retired pending action did not fail closed: reply=%q err=%v",
+					reply, err)
+			}
+			if len(sentinel.calls) != 0 {
+				t.Fatalf("retired pending action reached another tool: %+v", sentinel.calls)
+			}
+			waitAppends(t, fs, 1)
+		})
+	}
+}
+
 // 取消成功后回写「取消」通告（含 Summary）；重复取消走幂等出口，不回写。
 func TestCancelAction_AppendsCardCallback(t *testing.T) {
 	fs := newFakeStore()

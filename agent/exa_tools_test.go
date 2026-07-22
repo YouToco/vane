@@ -399,16 +399,16 @@ func TestBuildTools_Exa装配(t *testing.T) {
 		}
 		return m
 	}
-	with := names(BuildTools(nil, nil, nil, nil, nil, nil, nil, NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)))
+	with := names(BuildTools(nil, nil, nil, nil, nil, nil, NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)))
 	if !with["web_search"] || !with["read_page"] {
 		t.Errorf("exa 非 nil 时 web_search/read_page 必须在白名单，实得 %v", with)
 	}
-	without := names(BuildTools(nil, nil, nil, nil, nil, nil, nil, nil))
+	without := names(BuildTools(nil, nil, nil, nil, nil, nil, nil))
 	if without["web_search"] || without["read_page"] {
 		t.Errorf("exa=nil 时两工具不得出现（缺 key 不广告），实得 %v", without)
 	}
 	// 两工具都是只读（免确认、不进 pending_actions）。
-	for _, tl := range BuildTools(nil, nil, nil, nil, nil, nil, nil, NewExaTools(nil, nil, nil, 0, 0)) {
+	for _, tl := range BuildTools(nil, nil, nil, nil, nil, nil, NewExaTools(nil, nil, nil, 0, 0)) {
 		if (tl.Name() == "web_search" || tl.Name() == "read_page") && tl.Mutating() {
 			t.Errorf("%s 必须是只读工具", tl.Name())
 		}

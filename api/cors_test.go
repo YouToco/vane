@@ -96,10 +96,9 @@ func TestCORS_未配置源全关(t *testing.T) {
 	}
 }
 
-// TestCORS_预检放行PATCH 防"加了端点忘了加方法"：Allow-Methods 少一个方法，
-// 跨源前端调该端点时浏览器连请求都不发（fetch 直接网络错误）。
-// PATCH 是 update_schedule（PATCH /api/schedules/{id}）需要的。
-func TestCORS_预检放行PATCH(t *testing.T) {
+// TestCORS_预检不再广告PATCH guards the retired definition-write route at
+// the browser boundary as well as at ServeMux.
+func TestCORS_预检不再广告PATCH(t *testing.T) {
 	req := httptest.NewRequest(http.MethodOptions, "/api/schedules/s1", nil)
 	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Access-Control-Request-Method", "PATCH")
@@ -110,9 +109,12 @@ func TestCORS_预检放行PATCH(t *testing.T) {
 		t.Fatalf("预检状态码 = %d, 期望 204", rec.Code)
 	}
 	allow := rec.Header().Get("Access-Control-Allow-Methods")
-	for _, m := range []string{"GET", "POST", "PATCH", "DELETE"} {
+	for _, m := range []string{"GET", "POST", "DELETE"} {
 		if !strings.Contains(allow, m) {
 			t.Errorf("Allow-Methods 缺 %s（实得 %q）——跨源该方法的端点会被浏览器挡死", m, allow)
 		}
+	}
+	if strings.Contains(allow, "PATCH") {
+		t.Errorf("Allow-Methods must not advertise retired PATCH route: %q", allow)
 	}
 }
