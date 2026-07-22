@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -30,7 +32,16 @@ import (
 
 const (
 	taskDefinitionEditWireVersion = "v1"
-	taskDefinitionEditNotePrefix  = "vane/task-definition-edit/v1"
+	// Literals by design: advancing either current task-schedule writer alias
+	// must not reinterpret or strand a frozen definition-edit/v1 operation.
+	taskDefinitionEditOwnershipIDSchemeVersion = "v1"
+	// Literal by design: advancing the current task-schedule writer must not
+	// reinterpret or strand an already frozen definition-edit/v1 checkpoint.
+	taskDefinitionEditOwnershipFingerprintVersion = "v2"
+	taskDefinitionEditNotePrefix                  = "vane/task-definition-edit/v1"
+	taskDefinitionEditV1MinIntervalSeconds        = 3600
+	taskDefinitionEditV1DefaultTimeZone           = "Asia/Shanghai"
+	taskDefinitionEditV1MaxOperationIDBytes       = 512
 )
 
 // TaskDefinitionEditOriginalState is the database schedule status that the
@@ -136,19 +147,21 @@ type PreparedTaskDefinitionEditSchedule struct {
 // opaque conflict token observed before confirmation; every phase receipt
 // supplies the only revision accepted by the next phase.
 type PreparedTaskDefinitionEdit struct {
-	WireVersion     string                             `json:"wire_version"`
-	OperationID     string                             `json:"operation_id"`
-	OperationDigest string                             `json:"operation_digest"`
-	RequestDigest   string                             `json:"request_digest"`
-	Creation        PreparedTaskSchedule               `json:"creation"`
-	BaseHead        TaskDefinitionEditHead             `json:"base_head"`
-	TargetHead      TaskDefinitionEditHead             `json:"target_head"`
-	OriginalState   TaskDefinitionEditOriginalState    `json:"original_state"`
-	BaseRevision    string                             `json:"base_revision"`
-	BaseOriginal    PreparedTaskDefinitionEditSchedule `json:"base_original"`
-	BasePaused      PreparedTaskDefinitionEditSchedule `json:"base_paused"`
-	TargetPaused    PreparedTaskDefinitionEditSchedule `json:"target_paused"`
-	TargetFinal     PreparedTaskDefinitionEditSchedule `json:"target_final"`
+	WireVersion            string                             `json:"wire_version"`
+	OperationID            string                             `json:"operation_id"`
+	OperationDigest        string                             `json:"operation_digest"`
+	RequestDigest          string                             `json:"request_digest"`
+	BaseProjectionDigest   string                             `json:"base_projection_digest"`
+	TargetProjectionDigest string                             `json:"target_projection_digest"`
+	Creation               PreparedTaskSchedule               `json:"creation"`
+	BaseHead               TaskDefinitionEditHead             `json:"base_head"`
+	TargetHead             TaskDefinitionEditHead             `json:"target_head"`
+	OriginalState          TaskDefinitionEditOriginalState    `json:"original_state"`
+	BaseRevision           string                             `json:"base_revision"`
+	BaseOriginal           PreparedTaskDefinitionEditSchedule `json:"base_original"`
+	BasePaused             PreparedTaskDefinitionEditSchedule `json:"base_paused"`
+	TargetPaused           PreparedTaskDefinitionEditSchedule `json:"target_paused"`
+	TargetFinal            PreparedTaskDefinitionEditSchedule `json:"target_final"`
 }
 
 // TaskDefinitionEditSnapshot is a durable proof of one exact remote phase.
@@ -199,25 +212,39 @@ func (s *Scheduler) PrepareTaskDefinitionEdit(
 	targetAction := cloneTaskDefinitionEditAction(baseOriginal.Action)
 	targetAction.Params.Scope = cloneTaskDefinitionEditScope(req.Target.Scope)
 	targetAction.Params.NLDesc = req.Target.NLDescription
+	baseProjectionDigest, err := digestTaskDefinitionEditProjectionV1(req.Base)
+	if err != nil {
+		return PreparedTaskDefinitionEdit{}, TaskDefinitionEditSnapshot{}, newTaskScheduleError(
+			TaskScheduleErrorInvalid, "prepare_definition_edit", req.Creation.TaskID, err,
+		)
+	}
+	targetProjectionDigest, err := digestTaskDefinitionEditProjectionV1(req.Target)
+	if err != nil {
+		return PreparedTaskDefinitionEdit{}, TaskDefinitionEditSnapshot{}, newTaskScheduleError(
+			TaskScheduleErrorInvalid, "prepare_definition_edit", req.Creation.TaskID, err,
+		)
+	}
 	operationDigest, err := digestTaskDefinitionEditOperationSeed(taskDefinitionEditOperationSeed{
-		WireVersion:           taskDefinitionEditWireVersion,
-		OperationID:           req.OperationID,
-		CreationRequestDigest: req.Creation.RequestDigest,
-		TenantID:              req.Creation.TenantID,
-		UserID:                req.Creation.UserID,
-		TaskID:                req.Creation.TaskID,
-		BaseHead:              req.BaseHead,
-		TargetHead:            req.TargetHead,
-		OriginalState:         req.OriginalState,
-		BaseTiming:            baseTiming,
-		BaseAction:            baseAction,
-		BasePolicy:            baseOriginal.Policy,
-		BaseReusePolicy:       baseOriginal.WorkflowIDReusePolicy,
-		BaseState:             baseOriginal.State,
-		TargetTiming:          targetTiming,
-		TargetAction:          targetAction,
-		TargetPolicy:          baseOriginal.Policy,
-		TargetReusePolicy:     baseOriginal.WorkflowIDReusePolicy,
+		WireVersion:            taskDefinitionEditWireVersion,
+		OperationID:            req.OperationID,
+		CreationRequestDigest:  req.Creation.RequestDigest,
+		TenantID:               req.Creation.TenantID,
+		UserID:                 req.Creation.UserID,
+		TaskID:                 req.Creation.TaskID,
+		BaseHead:               req.BaseHead,
+		TargetHead:             req.TargetHead,
+		OriginalState:          req.OriginalState,
+		BaseProjectionDigest:   baseProjectionDigest,
+		TargetProjectionDigest: targetProjectionDigest,
+		BaseTiming:             baseTiming,
+		BaseAction:             baseAction,
+		BasePolicy:             baseOriginal.Policy,
+		BaseReusePolicy:        baseOriginal.WorkflowIDReusePolicy,
+		BaseState:              baseOriginal.State,
+		TargetTiming:           targetTiming,
+		TargetAction:           targetAction,
+		TargetPolicy:           baseOriginal.Policy,
+		TargetReusePolicy:      baseOriginal.WorkflowIDReusePolicy,
 	})
 	if err != nil {
 		return PreparedTaskDefinitionEdit{}, TaskDefinitionEditSnapshot{}, newTaskScheduleError(
@@ -225,15 +252,17 @@ func (s *Scheduler) PrepareTaskDefinitionEdit(
 		)
 	}
 	prepared := PreparedTaskDefinitionEdit{
-		WireVersion:     taskDefinitionEditWireVersion,
-		OperationID:     req.OperationID,
-		OperationDigest: operationDigest,
-		Creation:        req.Creation,
-		BaseHead:        req.BaseHead,
-		TargetHead:      req.TargetHead,
-		OriginalState:   req.OriginalState,
-		BaseRevision:    taskScheduleRevision(desc.GetConflictToken()),
-		BaseOriginal:    baseOriginal,
+		WireVersion:            taskDefinitionEditWireVersion,
+		OperationID:            req.OperationID,
+		OperationDigest:        operationDigest,
+		BaseProjectionDigest:   baseProjectionDigest,
+		TargetProjectionDigest: targetProjectionDigest,
+		Creation:               req.Creation,
+		BaseHead:               req.BaseHead,
+		TargetHead:             req.TargetHead,
+		OriginalState:          req.OriginalState,
+		BaseRevision:           taskScheduleRevision(desc.GetConflictToken()),
+		BaseOriginal:           baseOriginal,
 	}
 	prepared.BasePaused = clonePreparedTaskDefinitionEditSchedule(baseOriginal)
 	prepared.TargetPaused = clonePreparedTaskDefinitionEditSchedule(baseOriginal)
@@ -628,46 +657,116 @@ func (s *Scheduler) taskDefinitionEditEnvironment(
 func validateTaskDefinitionEditRequest(
 	req TaskDefinitionEditRequest,
 ) (PreparedTaskScheduleTiming, PreparedTaskScheduleTiming, error) {
-	if err := validatePreparedTaskSchedule(req.Creation); err != nil {
-		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, fmt.Errorf("validate creation ownership: %w", err)
-	}
-	if req.Creation.FingerprintVersion != taskScheduleFingerprintVersion {
-		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, errors.New("definition edits require the current task ownership fingerprint")
-	}
-	if err := validateTaskScheduleString("operation_id", req.OperationID, true); err != nil {
+	if err := validateTaskDefinitionEditRequestIdentityV1(req); err != nil {
 		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, err
 	}
-	if len(req.OperationID) > maxTaskOperationIDBytes {
-		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, errors.New("operation_id is too long")
-	}
-	if err := validateTaskDefinitionEditHead("base_head", req.BaseHead); err != nil {
-		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, err
-	}
-	if err := validateTaskDefinitionEditHead("target_head", req.TargetHead); err != nil {
-		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, err
-	}
-	if req.BaseHead.Version == int64(^uint64(0)>>1) || req.TargetHead.Version != req.BaseHead.Version+1 {
-		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, errors.New("target head version must immediately follow base head version")
-	}
-	if req.OriginalState != TaskDefinitionEditOriginalStateActive &&
-		req.OriginalState != TaskDefinitionEditOriginalStatePaused {
-		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, errors.New("original state must be active or paused")
-	}
-	if err := validateTaskDefinitionEditDefinition("base", req.Base); err != nil {
-		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, err
-	}
-	if err := validateTaskDefinitionEditDefinition("target", req.Target); err != nil {
-		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, err
-	}
-	_, baseTiming, err := buildTaskScheduleSpec(req.Base.Spec)
+	_, baseTiming, err := buildTaskDefinitionEditScheduleSpecV1(req.Base.Spec)
 	if err != nil {
 		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, fmt.Errorf("base schedule spec: %w", err)
 	}
+	// Only the target is a new write. The base may have been valid under an
+	// older retained policy and must remain editable. Durable recovery never
+	// reaches either compiler; it trusts the exact sealed heads/checkpoints.
 	_, targetTiming, err := buildTaskScheduleSpec(req.Target.Spec)
 	if err != nil {
-		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, fmt.Errorf("target schedule spec: %w", err)
+		return PreparedTaskScheduleTiming{}, PreparedTaskScheduleTiming{}, fmt.Errorf("target schedule current writer: %w", err)
 	}
 	return baseTiming, targetTiming, nil
+}
+
+// validateTaskDefinitionEditRequestIdentityV1 validates only the frozen
+// ownership, heads, and non-compiled projections. Recovery deliberately does
+// not re-run spec compilation: proposal sealing already bound exact Approved
+// head bytes to exact prepared representations, and compiler policy evolves.
+func validateTaskDefinitionEditRequestIdentityV1(req TaskDefinitionEditRequest) error {
+	if err := validatePreparedTaskSchedule(req.Creation); err != nil {
+		return fmt.Errorf("validate creation ownership: %w", err)
+	}
+	if req.Creation.IDSchemeVersion != taskDefinitionEditOwnershipIDSchemeVersion {
+		return errors.New("definition edit v1 requires the retained v1 task ID scheme")
+	}
+	if req.Creation.FingerprintVersion != taskDefinitionEditOwnershipFingerprintVersion {
+		return errors.New("definition edit v1 requires the retained v2 task ownership fingerprint")
+	}
+	if err := validateTaskScheduleString("operation_id", req.OperationID, true); err != nil {
+		return err
+	}
+	if len(req.OperationID) > taskDefinitionEditV1MaxOperationIDBytes {
+		return errors.New("operation_id is too long")
+	}
+	if err := validateTaskDefinitionEditHead("base_head", req.BaseHead); err != nil {
+		return err
+	}
+	if err := validateTaskDefinitionEditHead("target_head", req.TargetHead); err != nil {
+		return err
+	}
+	if req.BaseHead.Version == int64(^uint64(0)>>1) || req.TargetHead.Version != req.BaseHead.Version+1 {
+		return errors.New("target head version must immediately follow base head version")
+	}
+	if req.OriginalState != TaskDefinitionEditOriginalStateActive &&
+		req.OriginalState != TaskDefinitionEditOriginalStatePaused {
+		return errors.New("original state must be active or paused")
+	}
+	if err := validateTaskDefinitionEditDefinition("base", req.Base); err != nil {
+		return err
+	}
+	if err := validateTaskDefinitionEditDefinition("target", req.Target); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateTaskDefinitionEditScheduleSpecV1 freezes the timing policy that was
+// valid when definition-edit/v1 bytes were introduced. It is used only while
+// preparing/sealing a new edit against an old base; durable Decode never
+// re-runs this compiler.
+func validateTaskDefinitionEditScheduleSpecV1(spec ScheduleSpec) error {
+	if spec.EverySeconds < 0 {
+		return errors.New("every_seconds must not be negative")
+	}
+	hasCron := strings.TrimSpace(spec.Cron) != ""
+	hasEvery := spec.EverySeconds > 0
+	if hasCron == hasEvery {
+		return errors.New("definition edit v1 spec must contain exactly one of cron or every_seconds")
+	}
+	if hasEvery {
+		if spec.EverySeconds < taskDefinitionEditV1MinIntervalSeconds {
+			return fmt.Errorf(
+				"every_seconds %d is below the definition edit v1 floor %d",
+				spec.EverySeconds, taskDefinitionEditV1MinIntervalSeconds,
+			)
+		}
+		_, err := parseTaskDefinitionEditAnchorV1(spec.AnchorAt)
+		return err
+	}
+	if strings.TrimSpace(spec.AnchorAt) != "" {
+		return errors.New("definition edit v1 anchor_at is only valid with every_seconds")
+	}
+	fields := strings.Fields(spec.Cron)
+	if len(fields) != 5 {
+		return errors.New("definition edit v1 cron must contain five fields")
+	}
+	minute := fields[0]
+	if strings.ContainsAny(minute, "*/,-") {
+		return errors.New("definition edit v1 cron minute field exceeds the hourly floor")
+	}
+	value, err := strconv.Atoi(minute)
+	if err != nil || value < 0 || value > 59 {
+		return errors.New("definition edit v1 cron minute field must be an integer from 0 through 59")
+	}
+	return nil
+}
+
+func parseTaskDefinitionEditAnchorV1(raw string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("definition edit v1 anchor_at must be RFC3339: %w", err)
+	}
+	return parsed, nil
 }
 
 func validateTaskDefinitionEditDefinition(name string, definition TaskDefinitionEditDefinition) error {
@@ -1108,19 +1207,28 @@ func validatePreparedTaskDefinitionEdit(prepared PreparedTaskDefinitionEdit) err
 	if err := validatePreparedTaskSchedule(prepared.Creation); err != nil {
 		return fmt.Errorf("validate creation ownership: %w", err)
 	}
-	if prepared.Creation.FingerprintVersion != taskScheduleFingerprintVersion {
-		return errors.New("definition edit ownership fingerprint is not current")
+	if prepared.Creation.IDSchemeVersion != taskDefinitionEditOwnershipIDSchemeVersion {
+		return errors.New("definition edit v1 ownership ID scheme is not retained v1")
+	}
+	if prepared.Creation.FingerprintVersion != taskDefinitionEditOwnershipFingerprintVersion {
+		return errors.New("definition edit v1 ownership fingerprint is not retained v2")
 	}
 	if err := validateTaskScheduleString("operation_id", prepared.OperationID, true); err != nil {
 		return err
 	}
-	if len(prepared.OperationID) > maxTaskOperationIDBytes {
+	if len(prepared.OperationID) > taskDefinitionEditV1MaxOperationIDBytes {
 		return errors.New("operation_id is too long")
 	}
 	if err := validateTaskScheduleDigest("operation_digest", prepared.OperationDigest); err != nil {
 		return err
 	}
 	if err := validateTaskScheduleDigest("request_digest", prepared.RequestDigest); err != nil {
+		return err
+	}
+	if err := validateTaskScheduleDigest("base_projection_digest", prepared.BaseProjectionDigest); err != nil {
+		return err
+	}
+	if err := validateTaskScheduleDigest("target_projection_digest", prepared.TargetProjectionDigest); err != nil {
 		return err
 	}
 	if err := validateTaskDefinitionEditHead("base_head", prepared.BaseHead); err != nil {
@@ -1189,7 +1297,7 @@ func validatePreparedTaskDefinitionEditSchedule(
 	if digest != representation.Digest {
 		return fmt.Errorf("%s digest does not match its representation", name)
 	}
-	if _, err := scheduleSpecFromPreparedTiming(representation.Timing); err != nil {
+	if _, err := scheduleSpecFromPreparedTimingV1(representation.Timing); err != nil {
 		return fmt.Errorf("%s timing: %w", name, err)
 	}
 	if representation.Action.TaskQueue != creation.Action.TaskQueue ||
@@ -1489,48 +1597,52 @@ func taskDefinitionEditNote(phase, operationDigest string) string {
 }
 
 type taskDefinitionEditOperationSeed struct {
-	WireVersion           string                          `json:"wire_version"`
-	OperationID           string                          `json:"operation_id"`
-	CreationRequestDigest string                          `json:"creation_request_digest"`
-	TenantID              int64                           `json:"tenant_id"`
-	UserID                int64                           `json:"user_id"`
-	TaskID                string                          `json:"task_id"`
-	BaseHead              TaskDefinitionEditHead          `json:"base_head"`
-	TargetHead            TaskDefinitionEditHead          `json:"target_head"`
-	OriginalState         TaskDefinitionEditOriginalState `json:"original_state"`
-	BaseTiming            PreparedTaskScheduleTiming      `json:"base_timing"`
-	BaseAction            PreparedTaskScheduleAction      `json:"base_action"`
-	BasePolicy            PreparedTaskSchedulePolicy      `json:"base_policy"`
-	BaseReusePolicy       int32                           `json:"base_reuse_policy"`
-	BaseState             TaskDefinitionEditScheduleState `json:"base_state"`
-	TargetTiming          PreparedTaskScheduleTiming      `json:"target_timing"`
-	TargetAction          PreparedTaskScheduleAction      `json:"target_action"`
-	TargetPolicy          PreparedTaskSchedulePolicy      `json:"target_policy"`
-	TargetReusePolicy     int32                           `json:"target_reuse_policy"`
+	WireVersion            string                          `json:"wire_version"`
+	OperationID            string                          `json:"operation_id"`
+	CreationRequestDigest  string                          `json:"creation_request_digest"`
+	TenantID               int64                           `json:"tenant_id"`
+	UserID                 int64                           `json:"user_id"`
+	TaskID                 string                          `json:"task_id"`
+	BaseHead               TaskDefinitionEditHead          `json:"base_head"`
+	TargetHead             TaskDefinitionEditHead          `json:"target_head"`
+	OriginalState          TaskDefinitionEditOriginalState `json:"original_state"`
+	BaseProjectionDigest   string                          `json:"base_projection_digest"`
+	TargetProjectionDigest string                          `json:"target_projection_digest"`
+	BaseTiming             PreparedTaskScheduleTiming      `json:"base_timing"`
+	BaseAction             PreparedTaskScheduleAction      `json:"base_action"`
+	BasePolicy             PreparedTaskSchedulePolicy      `json:"base_policy"`
+	BaseReusePolicy        int32                           `json:"base_reuse_policy"`
+	BaseState              TaskDefinitionEditScheduleState `json:"base_state"`
+	TargetTiming           PreparedTaskScheduleTiming      `json:"target_timing"`
+	TargetAction           PreparedTaskScheduleAction      `json:"target_action"`
+	TargetPolicy           PreparedTaskSchedulePolicy      `json:"target_policy"`
+	TargetReusePolicy      int32                           `json:"target_reuse_policy"`
 }
 
 func taskDefinitionEditOperationSeedFromPrepared(
 	prepared PreparedTaskDefinitionEdit,
 ) taskDefinitionEditOperationSeed {
 	return taskDefinitionEditOperationSeed{
-		WireVersion:           prepared.WireVersion,
-		OperationID:           prepared.OperationID,
-		CreationRequestDigest: prepared.Creation.RequestDigest,
-		TenantID:              prepared.Creation.TenantID,
-		UserID:                prepared.Creation.UserID,
-		TaskID:                prepared.Creation.TaskID,
-		BaseHead:              prepared.BaseHead,
-		TargetHead:            prepared.TargetHead,
-		OriginalState:         prepared.OriginalState,
-		BaseTiming:            clonePreparedTaskScheduleTiming(prepared.BaseOriginal.Timing),
-		BaseAction:            cloneTaskDefinitionEditAction(prepared.BaseOriginal.Action),
-		BasePolicy:            prepared.BaseOriginal.Policy,
-		BaseReusePolicy:       prepared.BaseOriginal.WorkflowIDReusePolicy,
-		BaseState:             prepared.BaseOriginal.State,
-		TargetTiming:          clonePreparedTaskScheduleTiming(prepared.TargetFinal.Timing),
-		TargetAction:          cloneTaskDefinitionEditAction(prepared.TargetFinal.Action),
-		TargetPolicy:          prepared.TargetFinal.Policy,
-		TargetReusePolicy:     prepared.TargetFinal.WorkflowIDReusePolicy,
+		WireVersion:            prepared.WireVersion,
+		OperationID:            prepared.OperationID,
+		CreationRequestDigest:  prepared.Creation.RequestDigest,
+		TenantID:               prepared.Creation.TenantID,
+		UserID:                 prepared.Creation.UserID,
+		TaskID:                 prepared.Creation.TaskID,
+		BaseHead:               prepared.BaseHead,
+		TargetHead:             prepared.TargetHead,
+		OriginalState:          prepared.OriginalState,
+		BaseProjectionDigest:   prepared.BaseProjectionDigest,
+		TargetProjectionDigest: prepared.TargetProjectionDigest,
+		BaseTiming:             clonePreparedTaskScheduleTiming(prepared.BaseOriginal.Timing),
+		BaseAction:             cloneTaskDefinitionEditAction(prepared.BaseOriginal.Action),
+		BasePolicy:             prepared.BaseOriginal.Policy,
+		BaseReusePolicy:        prepared.BaseOriginal.WorkflowIDReusePolicy,
+		BaseState:              prepared.BaseOriginal.State,
+		TargetTiming:           clonePreparedTaskScheduleTiming(prepared.TargetFinal.Timing),
+		TargetAction:           cloneTaskDefinitionEditAction(prepared.TargetFinal.Action),
+		TargetPolicy:           prepared.TargetFinal.Policy,
+		TargetReusePolicy:      prepared.TargetFinal.WorkflowIDReusePolicy,
 	}
 }
 
@@ -1540,6 +1652,23 @@ func digestTaskDefinitionEditOperationSeed(seed taskDefinitionEditOperationSeed)
 	seed.TargetTiming = clonePreparedTaskScheduleTiming(seed.TargetTiming)
 	seed.TargetAction = cloneTaskDefinitionEditAction(seed.TargetAction)
 	return digestTaskDefinitionEditJSON(seed)
+}
+
+type taskDefinitionEditProjectionV1 struct {
+	Spec          ScheduleSpec       `json:"spec"`
+	Scope         workflow.PushScope `json:"scope"`
+	NLDescription string             `json:"nl_description"`
+}
+
+func digestTaskDefinitionEditProjectionV1(definition TaskDefinitionEditDefinition) (string, error) {
+	if err := validateTaskDefinitionEditDefinition("projection", definition); err != nil {
+		return "", err
+	}
+	return digestTaskDefinitionEditJSON(taskDefinitionEditProjectionV1{
+		Spec:          definition.Spec,
+		Scope:         cloneTaskDefinitionEditScope(definition.Scope),
+		NLDescription: definition.NLDescription,
+	})
 }
 
 func digestPreparedTaskDefinitionEditSchedule(

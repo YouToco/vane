@@ -35,20 +35,31 @@ import (
 )
 
 const (
-	taskScheduleIDSchemeVersion      = "v1"
+	taskScheduleIDSchemeVersionV1 = "v1"
+	// taskScheduleIDSchemeVersion is the current writer alias. Retained
+	// readers must compare against explicit version constants so a future ID
+	// scheme cannot strand existing ownership checkpoints.
+	taskScheduleIDSchemeVersion      = taskScheduleIDSchemeVersionV1
 	taskScheduleFingerprintVersionV1 = "v1"
-	taskScheduleFingerprintVersion   = "v2"
-	taskScheduleMemoKey              = "vane.task-schedule"
-	taskScheduleDefaultConverterID   = "temporal-default-json-v1"
-	taskScheduleV1WorkflowType       = "PushPipelineWorkflow"
-	taskScheduleV1CatchupWindow      = time.Minute
-	taskScheduleV1WorkflowTaskTime   = 10 * time.Second
-	taskScheduleV1ProvisioningNote   = "vane/task-schedule/v1:provisioning-paused"
-	taskScheduleV1ActivationNote     = "vane/task-schedule/v1:definition-committed"
-	taskScheduleV1PhaseProvisioning  = "provisioning"
-	taskScheduleV1PhaseActive        = "active"
-	taskScheduleRecoveryTimeout      = 5 * time.Second
-	maxTaskOperationIDBytes          = 512
+	taskScheduleFingerprintVersionV2 = "v2"
+	// taskScheduleFingerprintVersion is the current writer alias. Retained
+	// readers must compare against explicit V1/V2 constants so advancing this
+	// alias cannot strand already checkpointed schedules or definition edits.
+	taskScheduleFingerprintVersion  = taskScheduleFingerprintVersionV2
+	taskScheduleMemoKey             = "vane.task-schedule"
+	taskScheduleDefaultConverterID  = "temporal-default-json-v1"
+	taskScheduleV1WorkflowType      = "PushPipelineWorkflow"
+	taskScheduleV1CatchupWindow     = time.Minute
+	taskScheduleV1WorkflowTaskTime  = 10 * time.Second
+	taskScheduleV1ProvisioningNote  = "vane/task-schedule/v1:provisioning-paused"
+	taskScheduleV1ActivationNote    = "vane/task-schedule/v1:definition-committed"
+	taskScheduleV1PhaseProvisioning = "provisioning"
+	taskScheduleV1PhaseActive       = "active"
+	taskScheduleRecoveryTimeout     = 5 * time.Second
+	maxTaskOperationIDBytesV1       = 512
+	// maxTaskOperationIDBytes is the current writer alias. Retained v1 readers
+	// use maxTaskOperationIDBytesV1 directly.
+	maxTaskOperationIDBytes = maxTaskOperationIDBytesV1
 )
 
 // SchedulerOption configures the A3 task-schedule control plane without
@@ -323,7 +334,7 @@ func TaskIDForOperation(tenantID, userID int64, operationID string) (string, err
 }
 
 func taskIDForOperationVersion(version string, tenantID, userID int64, operationID string) (string, error) {
-	if version != taskScheduleIDSchemeVersion {
+	if version != taskScheduleIDSchemeVersionV1 {
 		return "", newTaskScheduleError(
 			TaskScheduleErrorInvalid, "derive_id", "",
 			fmt.Errorf("unsupported task ID scheme version %q", version),
@@ -347,10 +358,10 @@ func taskIDForOperationVersion(version string, tenantID, userID int64, operation
 			errors.New("operation_id must be valid UTF-8"),
 		)
 	}
-	if len(operationID) > maxTaskOperationIDBytes {
+	if len(operationID) > maxTaskOperationIDBytesV1 {
 		return "", newTaskScheduleError(
 			TaskScheduleErrorInvalid, "derive_id", "",
-			fmt.Errorf("operation_id exceeds %d bytes", maxTaskOperationIDBytes),
+			fmt.Errorf("operation_id exceeds %d bytes", maxTaskOperationIDBytesV1),
 		)
 	}
 
@@ -1099,6 +1110,11 @@ func (s *Scheduler) taskScheduleEnvironment() (string, string, converter.DataCon
 	if converterID == "" && dc == nil {
 		converterID = taskScheduleDefaultConverterID
 		dc = converter.GetDefaultDataConverter()
+	} else if converterID == taskScheduleDefaultConverterID {
+		// This ID denotes the SDK default converter guarded by an exact payload
+		// golden. Allowing callers to bind arbitrary bytes to the same ID would
+		// make retained checkpoints ambiguous across process restarts.
+		dc = nil
 	}
 	return s.taskScheduleEnv.namespace, converterID, dc
 }
@@ -1107,6 +1123,9 @@ func (s *Scheduler) taskScheduleDecoder(id string) converter.DataConverter {
 	s.taskScheduleEnv.mu.Lock()
 	defer s.taskScheduleEnv.mu.Unlock()
 	if id == s.taskScheduleEnv.converterID {
+		if id == taskScheduleDefaultConverterID {
+			return nil
+		}
 		return s.taskScheduleEnv.dc
 	}
 	if id == taskScheduleDefaultConverterID &&
@@ -1254,11 +1273,11 @@ func clonePreparedTaskSchedule(prepared PreparedTaskSchedule) PreparedTaskSchedu
 }
 
 func validatePreparedTaskSchedule(prepared PreparedTaskSchedule) error {
-	if prepared.IDSchemeVersion != taskScheduleIDSchemeVersion {
+	if prepared.IDSchemeVersion != taskScheduleIDSchemeVersionV1 {
 		return fmt.Errorf("unsupported task ID scheme version %q", prepared.IDSchemeVersion)
 	}
 	if prepared.FingerprintVersion != taskScheduleFingerprintVersionV1 &&
-		prepared.FingerprintVersion != taskScheduleFingerprintVersion {
+		prepared.FingerprintVersion != taskScheduleFingerprintVersionV2 {
 		return fmt.Errorf("unsupported fingerprint version %q", prepared.FingerprintVersion)
 	}
 	for _, field := range []struct {
@@ -1337,7 +1356,7 @@ func validatePreparedTaskSchedule(prepared PreparedTaskSchedule) error {
 		}
 		seenSourceIDs[sourceID] = struct{}{}
 	}
-	if _, err := scheduleSpecFromPreparedTiming(prepared.Timing); err != nil {
+	if _, err := scheduleSpecFromPreparedTimingV1(prepared.Timing); err != nil {
 		return err
 	}
 	if prepared.Action.WorkflowType != taskScheduleV1WorkflowType ||
@@ -1426,7 +1445,7 @@ func (s *Scheduler) buildTaskScheduleExpected(
 			),
 		)
 	}
-	_, err = scheduleSpecFromPreparedTiming(prepared.Timing)
+	_, err = scheduleSpecFromPreparedTimingV1(prepared.Timing)
 	if err != nil {
 		return taskScheduleExpected{}, newTaskScheduleError(
 			TaskScheduleErrorInvalid, operation, prepared.TaskID, err,
@@ -1472,9 +1491,36 @@ func buildTaskScheduleSpec(spec ScheduleSpec) (client.ScheduleSpec, PreparedTask
 	if err := validateSpec(spec); err != nil {
 		return client.ScheduleSpec{}, PreparedTaskScheduleTiming{}, err
 	}
+	return buildTaskScheduleSpecV1(spec, defaultTZ, parseAnchor)
+}
+
+// buildTaskDefinitionEditScheduleSpecV1 reconstructs timing from an already
+// authenticated definition-edit/v1 checkpoint. Its validator, default zone,
+// and anchor parser are retained literals; current writer policy is applied
+// separately only when sealing a new target.
+func buildTaskDefinitionEditScheduleSpecV1(
+	spec ScheduleSpec,
+) (client.ScheduleSpec, PreparedTaskScheduleTiming, error) {
+	if err := validateTaskDefinitionEditScheduleSpecV1(spec); err != nil {
+		return client.ScheduleSpec{}, PreparedTaskScheduleTiming{}, err
+	}
+	return buildTaskScheduleSpecV1(
+		spec, taskDefinitionEditV1DefaultTimeZone, parseTaskDefinitionEditAnchorV1,
+	)
+}
+
+// buildTaskScheduleSpecV1 is the retained v1 spec-to-timing translation. New
+// schedule wire versions must add a new translator instead of changing these
+// semantics, because durable definition edits bind their Approved spec to the
+// exact timing produced here.
+func buildTaskScheduleSpecV1(
+	spec ScheduleSpec,
+	defaultTimeZone string,
+	parseV1Anchor func(string) (time.Time, error),
+) (client.ScheduleSpec, PreparedTaskScheduleTiming, error) {
 	tz := strings.TrimSpace(spec.TZ)
 	if tz == "" {
-		tz = defaultTZ
+		tz = defaultTimeZone
 	}
 	if _, err := time.LoadLocation(tz); err != nil {
 		return client.ScheduleSpec{}, PreparedTaskScheduleTiming{}, fmt.Errorf("invalid time zone %q: %w", tz, err)
@@ -1483,7 +1529,7 @@ func buildTaskScheduleSpec(spec ScheduleSpec) (client.ScheduleSpec, PreparedTask
 		if int64(spec.EverySeconds) > int64((time.Duration(1<<63-1))/time.Second) {
 			return client.ScheduleSpec{}, PreparedTaskScheduleTiming{}, errors.New("every_seconds exceeds time.Duration")
 		}
-		anchor, err := parseAnchor(spec.AnchorAt)
+		anchor, err := parseV1Anchor(spec.AnchorAt)
 		if err != nil {
 			return client.ScheduleSpec{}, PreparedTaskScheduleTiming{}, err
 		}
@@ -1492,11 +1538,11 @@ func buildTaskScheduleSpec(spec ScheduleSpec) (client.ScheduleSpec, PreparedTask
 				errors.New("anchor_at must use whole-second precision")
 		}
 		every := time.Duration(spec.EverySeconds) * time.Second
-		offset := intervalOffset(anchor, spec.EverySeconds)
+		offset := taskScheduleIntervalOffsetV1(anchor, spec.EverySeconds)
 		timing := PreparedTaskScheduleTiming{
 			EveryNanos: int64(every), OffsetNanos: int64(offset), TimeZoneName: tz,
 		}
-		sdkSpec, err := scheduleSpecFromPreparedTiming(timing)
+		sdkSpec, err := scheduleSpecFromPreparedTimingV1(timing)
 		return sdkSpec, timing, err
 	}
 
@@ -1504,14 +1550,14 @@ func buildTaskScheduleSpec(spec ScheduleSpec) (client.ScheduleSpec, PreparedTask
 	if len(fields) != 5 {
 		return client.ScheduleSpec{}, PreparedTaskScheduleTiming{}, errors.New("cron must contain five fields")
 	}
-	dayOfWeek, err := parseCronDayOfWeek(fields[4])
+	dayOfWeek, err := parseTaskScheduleCronDayOfWeekV1(fields[4])
 	if err != nil {
 		return client.ScheduleSpec{}, PreparedTaskScheduleTiming{}, fmt.Errorf("invalid cron day-of-week: %w", err)
 	}
 	// robfig/cron rejects the standard Sunday alias 7. Parse the other four
 	// fields with its proven parser and canonicalize DOW ourselves.
 	fields[4] = "*"
-	fields[3] = normalizeCronMonthNames(fields[3])
+	fields[3] = normalizeTaskScheduleCronMonthNamesV1(fields[3])
 	parsed, err := cron.ParseStandard(strings.Join(fields, " "))
 	if err != nil {
 		return client.ScheduleSpec{}, PreparedTaskScheduleTiming{}, fmt.Errorf("invalid cron: %w", err)
@@ -1521,21 +1567,24 @@ func buildTaskScheduleSpec(spec ScheduleSpec) (client.ScheduleSpec, PreparedTask
 		return client.ScheduleSpec{}, PreparedTaskScheduleTiming{}, errors.New("cron did not compile to a calendar schedule")
 	}
 	calendarBits := PreparedTaskScheduleCalendar{
-		Second:     trimCronBits(parsedSpec.Second, 0, 59),
-		Minute:     trimCronBits(parsedSpec.Minute, 0, 59),
-		Hour:       trimCronBits(parsedSpec.Hour, 0, 23),
-		DayOfMonth: trimCronBits(parsedSpec.Dom, 1, 31),
-		Month:      trimCronBits(parsedSpec.Month, 1, 12),
+		Second:     trimTaskScheduleCronBitsV1(parsedSpec.Second, 0, 59),
+		Minute:     trimTaskScheduleCronBitsV1(parsedSpec.Minute, 0, 59),
+		Hour:       trimTaskScheduleCronBitsV1(parsedSpec.Hour, 0, 23),
+		DayOfMonth: trimTaskScheduleCronBitsV1(parsedSpec.Dom, 1, 31),
+		Month:      trimTaskScheduleCronBitsV1(parsedSpec.Month, 1, 12),
 		DayOfWeek:  dayOfWeek,
 	}
 	timing := PreparedTaskScheduleTiming{
 		Calendar: &calendarBits, TimeZoneName: tz,
 	}
-	sdkSpec, err := scheduleSpecFromPreparedTiming(timing)
+	sdkSpec, err := scheduleSpecFromPreparedTimingV1(timing)
 	return sdkSpec, timing, err
 }
 
-func scheduleSpecFromPreparedTiming(timing PreparedTaskScheduleTiming) (client.ScheduleSpec, error) {
+// scheduleSpecFromPreparedTimingV1 is the retained semantic reader for every
+// persisted task-schedule/v1 timing. Current policy belongs before a new v1
+// checkpoint is written; never add current floors or allowlists here.
+func scheduleSpecFromPreparedTimingV1(timing PreparedTaskScheduleTiming) (client.ScheduleSpec, error) {
 	if err := validateTaskScheduleString("time_zone_name", timing.TimeZoneName, true); err != nil {
 		return client.ScheduleSpec{}, err
 	}
@@ -1599,7 +1648,7 @@ func scheduleBitMask(minValue, maxValue int) uint64 {
 	return mask
 }
 
-func parseCronDayOfWeek(field string) (uint64, error) {
+func parseTaskScheduleCronDayOfWeekV1(field string) (uint64, error) {
 	field = strings.TrimSpace(strings.ToLower(field))
 	if field == "" {
 		return 0, errors.New("field is empty")
@@ -1684,7 +1733,7 @@ func parseCronDayOfWeek(field string) (uint64, error) {
 	return bits, nil
 }
 
-func normalizeCronMonthNames(field string) string {
+func normalizeTaskScheduleCronMonthNamesV1(field string) string {
 	replacer := strings.NewReplacer(
 		"january", "jan", "february", "feb", "march", "mar", "april", "apr",
 		"june", "jun", "july", "jul", "august", "aug", "september", "sep",
@@ -1693,7 +1742,7 @@ func normalizeCronMonthNames(field string) string {
 	return replacer.Replace(strings.ToLower(field))
 }
 
-func trimCronBits(bits uint64, minValue, maxValue int) uint64 {
+func trimTaskScheduleCronBitsV1(bits uint64, minValue, maxValue int) uint64 {
 	var trimmed uint64
 	for value := minValue; value <= maxValue; value++ {
 		if bits&(uint64(1)<<value) != 0 {

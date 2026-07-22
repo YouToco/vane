@@ -46,11 +46,18 @@ type purgeStep struct {
 //	task_creation_receipts               → pending_actions → agent_sessions
 //	deliveries                            → push_batches
 //	task_run_snapshots                    → tenants / users
+//	task_definition_edit_receipts         → task_definition_edit_operations
+//	schedules(definition-edit marker)     → task_definition_edit_operations
 //	task_adaptive_states                  → task_approved_definition_versions → schedules
 //	其余                                   → tenants / users
 //
 // 排错了不会静默——FK 约束会让整个事务失败，而 dry-run 就是为了在真删之前撞出这个。
 var purgeOrder = []purgeStep{
+	// Edit receipts are children of the durable operation. Deleting the operation
+	// clears a surviving schedule's operation/fence marker through its scoped FK;
+	// both audit tables still need explicit rows in the purge report.
+	{"task_definition_edit_receipts", "tenant_id = $1"},
+	{"task_definition_edit_operations", "tenant_id = $1"},
 	// 无 tenant_id、经 schedules 反查的两张（正因为没有 tenant_id，
 	// 「按 tenant_id 列对账」的守卫看不见它们，必须靠外键可达性那条守卫兜住）。
 	{"schedule_playbooks", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},

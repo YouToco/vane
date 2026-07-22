@@ -145,11 +145,19 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		t.Fatalf("建画像失败: %v", err)
 	}
 	taskID := "purge-task-" + uuid.NewString()
+	editOperationID := "purge-definition-edit-" + uuid.NewString()
 	tx, err := st.pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("开启 Approved/Adaptive 夹具事务失败: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	var editSessionID int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO agent_sessions (tenant_id, user_id)
+		VALUES ($1, $2) RETURNING id`, tn.ID, u.ID,
+	).Scan(&editSessionID); err != nil {
+		t.Fatalf("建 Definition Edit session 清理夹具失败: %v", err)
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO schedules (
 			id, tenant_id, user_id, nl_description, status, execution_mode
@@ -189,6 +197,55 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		)`, taskID, tn.ID, u.ID); err != nil {
 		t.Fatalf("建 Adaptive State 清理夹具失败: %v", err)
 	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO task_definition_edit_operations (
+			id, tenant_id, user_id, target_tenant_id, target_user_id,
+				task_id, session_id, approval_ref, expires_at, original_status,
+			base_definition_version, base_definition_digest, base_definition,
+			target_definition_version, target_definition_digest,
+			target_definition,
+			canonical_proposal, proposal_digest,
+			prepared_edit, prepared_edit_digest,
+			base_snapshot, base_snapshot_digest,
+				receipt_provider, receipt_target
+			) VALUES (
+				$1, $2, $3, $2, $3, $4, $5, $6,
+				clock_timestamp()+interval '1 day', 'paused', 1,
+			encode(sha256(convert_to('{"base":"purge"}', 'UTF8')), 'hex'),
+			convert_to('{"base":"purge"}', 'UTF8'), 2,
+			encode(sha256(convert_to('{"target":"purge"}', 'UTF8')), 'hex'),
+			convert_to('{"target":"purge"}', 'UTF8'),
+			convert_to('{"proposal":"purge"}', 'UTF8'),
+			encode(sha256(convert_to('{"proposal":"purge"}', 'UTF8')), 'hex'),
+			convert_to('{"prepared":"purge"}', 'UTF8'),
+			encode(sha256(convert_to('{"prepared":"purge"}', 'UTF8')), 'hex'),
+			convert_to('{"base_snapshot":"purge"}', 'UTF8'),
+			encode(sha256(convert_to('{"base_snapshot":"purge"}', 'UTF8')), 'hex'),
+				'feishu_card_patch:purge', 'om_purge'
+			)`, editOperationID, tn.ID, u.ID, taskID, editSessionID,
+		"purge-edit-approval-"+uuid.NewString()); err != nil {
+		t.Fatalf("建 Definition Edit operation 清理夹具失败: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE task_definition_edit_operations
+		   SET status='cancelled', tombstoned_at=clock_timestamp()
+		 WHERE id=$1`, editOperationID); err != nil {
+		t.Fatalf("终态化 Definition Edit operation 清理夹具失败: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO task_definition_edit_receipts (
+			operation_id, tenant_id, user_id, session_id,
+			provider, target, provider_key, status, payload, payload_digest,
+			fence, attempt, session_recorded_at, session_messages_digest,
+			provider_message_id, sent_at
+		) VALUES (
+			$1, $2, $3, $4, 'feishu_card_patch:purge', 'om_purge', $5,
+			'sent', convert_to('{"status":"cancelled"}', 'UTF8'),
+			encode(sha256(convert_to('{"status":"cancelled"}', 'UTF8')), 'hex'),
+			1, 1, clock_timestamp(), repeat('a', 64), 'om_purge', clock_timestamp()
+		)`, editOperationID, tn.ID, u.ID, editSessionID, uuid.NewString()); err != nil {
+		t.Fatalf("建 Definition Edit receipt 清理夹具失败: %v", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("提交 Approved/Adaptive 清理夹具失败: %v", err)
 	}
@@ -212,11 +269,14 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 	t.Cleanup(func() {
 		c, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(c, t, st, `DELETE FROM task_definition_edit_receipts WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM task_definition_edit_operations WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_adaptive_states WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_approved_definition_versions WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM schedules WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_run_snapshots WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM profiles WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM agent_sessions WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM tenant_quota WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM memberships WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM invites WHERE code = $1`, code)
@@ -255,6 +315,12 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 			rep.Rows["task_adaptive_states"],
 			rep.Rows["task_approved_definition_versions"])
 	}
+	if rep.Rows["task_definition_edit_operations"] != 1 ||
+		rep.Rows["task_definition_edit_receipts"] != 1 {
+		t.Errorf("试运行报告必须包含 Definition Edit operation/receipt，实得 %d/%d",
+			rep.Rows["task_definition_edit_operations"],
+			rep.Rows["task_definition_edit_receipts"])
+	}
 
 	// 租户与数据必须原封不动。
 	if _, err := st.GetTenant(ctx, tenantID); err != nil {
@@ -289,6 +355,22 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	if n != 1 {
 		t.Errorf("试运行后 approved definition 应还在，实得 %d 行 —— 事务没回滚", n)
 	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_definition_edit_operations WHERE tenant_id = $1`, tenantID,
+	).Scan(&n); err != nil {
+		t.Fatalf("查 Definition Edit operation 失败: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("试运行后 Definition Edit operation 应还在，实得 %d 行 —— 事务没回滚", n)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_definition_edit_receipts WHERE tenant_id = $1`, tenantID,
+	).Scan(&n); err != nil {
+		t.Fatalf("查 Definition Edit receipt 失败: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("试运行后 Definition Edit receipt 应还在，实得 %d 行 —— 事务没回滚", n)
+	}
 }
 
 // TestPurgeTenant_RealDeleteRemovesTenantData：真删要真的删干净。
@@ -312,6 +394,12 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 		t.Errorf("清理报告必须包含 Adaptive/Approved，实得 %d/%d",
 			rep.Rows["task_adaptive_states"],
 			rep.Rows["task_approved_definition_versions"])
+	}
+	if rep.Rows["task_definition_edit_operations"] != 1 ||
+		rep.Rows["task_definition_edit_receipts"] != 1 {
+		t.Errorf("清理报告必须包含 Definition Edit operation/receipt，实得 %d/%d",
+			rep.Rows["task_definition_edit_operations"],
+			rep.Rows["task_definition_edit_receipts"])
 	}
 	if _, err := st.GetTenant(ctx, tenantID); err == nil {
 		t.Error("清理后租户仍存在")
@@ -344,6 +432,22 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("租户数据应被清空，task_approved_definition_versions 仍有 %d 行", n)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_definition_edit_operations WHERE tenant_id = $1`, tenantID,
+	).Scan(&n); err != nil {
+		t.Fatalf("查 Definition Edit operation 失败: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("租户数据应被清空，task_definition_edit_operations 仍有 %d 行", n)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_definition_edit_receipts WHERE tenant_id = $1`, tenantID,
+	).Scan(&n); err != nil {
+		t.Fatalf("查 Definition Edit receipt 失败: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("租户数据应被清空，task_definition_edit_receipts 仍有 %d 行", n)
 	}
 }
 

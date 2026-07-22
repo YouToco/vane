@@ -60,6 +60,9 @@ var wantTables = []string{
 	// 032 Approved Definition / Adaptive State 分离（Agent Runtime C2a）
 	"task_approved_definition_versions",
 	"task_adaptive_states",
+	// 033 Approved Definition 耐久编辑 operation + 用户回执（C2b3-2a）
+	"task_definition_edit_operations",
+	"task_definition_edit_receipts",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的
