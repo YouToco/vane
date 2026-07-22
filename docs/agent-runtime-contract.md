@@ -45,9 +45,12 @@ reference schema version 也必须随行持久化，旧快照不得被新代码�
 只允许非敏感策略和受控 secret reference/version；运行时再从既有 secret store 解析权限范围内的密钥。
 
 **C1 生产接线硬门槛**：五类 policy 必须由 typed non-secret DTO 构建，只暴露 allowlist、模型名与参数、
-配额规则和 secret reference/version，DTO 中不得存在 secret value 字段；解码使用未知字段拒绝，并以
+配额规则和 secret reference/version，DTO 中不得存在 secret value 字段；credential ref 必须与用途绑定
+（LLM/Exa/TikHub 不可互换），implementation/endpoint 只能取受控版本 ID；解码使用未知、重复、缺失字段及
+非法 `null` 拒绝，并以
 API key/token/password 注入反向测试证明其无法进入。不得把通用 config map 或凭证对象直接序列化给 C0 Store。
-C0 的通用 JSON 持久化原语保持零调用点；C1 接线前必须由五类 typed non-secret policy builder 生成输入，
+C1a 的 raw JSON 原语仅包内可见，typed adapter 也保持零生产调用点；C1 接线前必须由五类
+typed non-secret policy builder 生成输入，
 DTO 不含 secret value 字段并拒绝未知字段。禁止直接序列化应用 config，也不以不完备的敏感键 denylist
 冒充密钥泄漏证明。
 
@@ -71,6 +74,9 @@ Temporal history payload。现有固定流水线仍会把抓取内容作为 Acti
 Activity 紧邻执行前，以当前 tenant active、membership 存在、task active 做独立 fail-closed kill check；
 数据库检查失败也拒绝。定义编辑只影响下一 run，但 pause/delete、停租或撤成员必须阻止本 run 后续副作用。
 因此响应丢失重试即使在任务删除后仍可取回原审计 ref，消费步骤也不会据此继续花钱或写入。
+其中 expected WorkflowID/RunID 必须来自当前 ActivityInfo，Task/User 来自受信调度输入；不得从 ref 自身
+反推 expected，否则另一 run 的一枚合法 ref 会退化为 bearer token。ref 的授权校验也必须按其持久化
+schema version 分派到固定 reader；不得先调用 current DTO validator，避免未来规则反向拒绝历史 run。
 
 运行快照是 tenant-owned 审计数据：所有 API/索引都以 Tenant/User/Task scope 开头，应用层没有更新接口；
 删除任务不连带删除历史快照，租户到期硬删除时才随 tenant 清除。当前不凭空增加 TTL；未来保留策略须作为
@@ -149,7 +155,8 @@ Activity result 进入 Temporal history。首版 planner 硬上限为 8 轮、16
 | 阶段 | 交付 | 生产行为 |
 |---|---|---|
 | C0 | `ExecutionMode` + scheduled-only immutable `task_run_snapshots` 真库原语 | 零调用点，只部署 schema/API 地基 |
-| C1 | versioned `PrepareRun` + Compiled 全链按 snapshot ref 消费 | 存量仍 Compiled，行为等价且单 run 不漂移 |
+| C1a | 强类型非敏感 policy DTO + 固定 v1 payload reader | 零调用点；先封住密钥边界与历史重解释风险 |
+| C1b | versioned `PrepareRun` + Compiled 全链按 snapshot ref 消费 | 存量仍 Compiled，行为等价且单 run 不漂移 |
 | C2 | `schedules.execution_mode` + Approved/Adaptive 分表与确认变更 | 默认 Compiled，动态模式仍 feature flag 关闭 |
 | C3 | RunID/StepID 检查点、LKG、bounded `PlanFetch` | 仅 shadow，无用户推送影响 |
 | C4 | 两条首批竖切的 Boss 单任务 canary | 逐步放量，可回滚 Compiled/LKG |
