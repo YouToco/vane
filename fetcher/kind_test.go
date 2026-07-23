@@ -64,6 +64,9 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 	up.bodies[pathHotList] = sampleHotListResponse
 	up.bodies[pathTopic] = sampleTopicFeedResponse
 	up.bodies[pathFaved] = sampleFavedNotesResponse
+	up.bodies[pathWeiboPosts] = sampleWeiboUserPostsResponse
+	up.bodies[pathWeiboHot] = sampleWeiboHotSearchResponse
+	up.bodies[pathWechatArts] = sampleWechatArticlesResponse
 	srv := httptest.NewServer(up.handler())
 	defer srv.Close()
 	b := newTestBinding(srv.URL, nil, nil)
@@ -92,6 +95,9 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 		{types.PlatformXHS, types.CapHotList, bindingItems(b, types.PlatformXHS, types.CapHotList, `{}`)},
 		{types.PlatformXHS, types.CapTopicFeed, bindingItems(b, types.PlatformXHS, types.CapTopicFeed, `{"page_id":"6301c499df9bea0001dc6f47"}`)},
 		{types.PlatformXHS, types.CapFavedNotes, bindingItems(b, types.PlatformXHS, types.CapFavedNotes, `{"user_id":"69bfda630000000034019ee8"}`)},
+		{types.PlatformWeibo, types.CapUserPosts, bindingItems(b, types.PlatformWeibo, types.CapUserPosts, `{"uid":"2803301701"}`)},
+		{types.PlatformWeibo, types.CapHotList, bindingItems(b, types.PlatformWeibo, types.CapHotList, `{}`)},
+		{types.PlatformWechatMP, types.CapUserPosts, bindingItems(b, types.PlatformWechatMP, types.CapUserPosts, `{"username":"gh_363b924965e9"}`)},
 	}
 	covered := map[string]bool{}
 	for _, tc := range cases {

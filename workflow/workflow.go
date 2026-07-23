@@ -376,9 +376,10 @@ func retryableOrNot(err error) error {
 }
 
 // ioActivityOptions 用于网络 I/O 型 Activity（Fetch/Push）。
-// 120s：Fetch 串行抓多源、单源超时兜底 20s，60s 预算 3 个慢源就撞墙
-// （审查 #串行预算）；多源接入后源数增长，放宽到 120s。配合 due 过滤
-// （已成功源不重抓），重试也不重复计费。真正的并发扇出留到源数上百再做。
+// 120s：Fetch 串行抓多源、单源超时兜底 20s（wechat_mp 模板声明 30s，2026-07-23 起），
+// 60s 预算 3 个慢源就撞墙（审查 #串行预算）；多源接入后源数增长，放宽到 120s。
+// 按最坏 30s 推算 4 个慢公众号源即打满——当前源数下余量足，源数增长时再议提额或
+// 并行化。配合 due 过滤（已成功源不重抓），重试也不重复计费。
 func ioActivityOptions() workflow.ActivityOptions {
 	return workflow.ActivityOptions{
 		StartToCloseTimeout: 120 * time.Second,

@@ -67,8 +67,12 @@ func Build(spec Spec) (*types.Source, string) {
 		return buildX(c, spec.Params, spec.Title)
 	case types.PlatformXHS:
 		return buildXHS(c, spec.Params, spec.Title)
+	case types.PlatformWeibo:
+		return buildWeibo(c, spec.Params, spec.Title)
+	case types.PlatformWechatMP:
+		return buildWechatMP(c, spec.Params, spec.Title)
 	default:
-		return nil, "platform 仅支持 web / x / xhs"
+		return nil, "platform 仅支持 web / x / xhs / weibo / wechat_mp"
 	}
 }
 
@@ -138,6 +142,14 @@ type materializedUserIDConfig struct {
 
 type materializedPageIDConfig struct {
 	PageID string `json:"page_id"`
+}
+
+type materializedUIDConfig struct {
+	UID string `json:"uid"`
+}
+
+type materializedUsernameConfig struct {
+	Username string `json:"username"`
 }
 
 func specFromMaterialized(source *types.Source, config json.RawMessage) (Spec, string) {
@@ -228,6 +240,26 @@ func specFromMaterialized(source *types.Source, config json.RawMessage) (Spec, s
 			return Spec{}, "xhs/faved_notes config 非法"
 		}
 		params["user_id"] = decoded.UserID
+
+	case source.Platform == types.PlatformWeibo && source.Capability == types.CapUserPosts:
+		var decoded materializedUIDConfig
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "weibo/user_posts config 非法"
+		}
+		params["uid"] = decoded.UID
+
+	case source.Platform == types.PlatformWeibo && source.Capability == types.CapHotList:
+		var decoded struct{}
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "weibo/hot_list config 必须为空对象"
+		}
+
+	case source.Platform == types.PlatformWechatMP && source.Capability == types.CapUserPosts:
+		var decoded materializedUsernameConfig
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Spec{}, "wechat_mp/user_posts config 非法"
+		}
+		params["username"] = decoded.Username
 
 	default:
 		return Spec{}, "信源 platform/capability 未注册为可材料化能力"
@@ -545,6 +577,114 @@ func buildXHS(cap types.Capability, params map[string]string, title string) (*ty
 	default:
 		return nil, "xhs 平台仅支持 search / user_posts / hot_list / topic_feed / faved_notes 能力"
 	}
+}
+
+// buildWeibo 微博平台（endpoint-binding-contract.md §7 增补，2026-07-23）。
+// IdemKey 规则不变（M6 §5.2 规则 B）：vane:// 手拼定序，改变抓取语义的用户参数进键；
+// 模板内部固定值（feature=0）是能力语义、随代码版本化，不进键。
+func buildWeibo(cap types.Capability, params map[string]string, title string) (*types.Source, string) {
+	switch cap {
+	case types.CapUserPosts:
+		// 接受 uid（纯数字）直填，或从主页链接 weibo.com/u/<uid> 抽取——两种输入
+		// 归一到同一 uid，同一账号无论怎么加幂等键都相同（xhs user_id 同款容错）。
+		uid := extractWeiboUID(params)
+		if uid == "" {
+			return nil, "weibo/user_posts 必须提供 uid（微博用户数字 ID）或 profile_url（形如 https://weibo.com/u/2803301701 的主页链接）"
+		}
+		cfg, err := json.Marshal(map[string]string{"uid": uid})
+		if err != nil {
+			return nil, "构造信源配置失败"
+		}
+		if title == "" {
+			title = "微博用户: " + uid
+		}
+		return &types.Source{
+			Platform:   types.PlatformWeibo,
+			Capability: types.CapUserPosts,
+			URL:        "vane://weibo/user_posts?uid=" + url.QueryEscape(uid),
+			Title:      title,
+			Config:     cfg,
+			Status:     types.SourceStatusActive,
+		}, ""
+
+	case types.CapHotList:
+		// 无参数：热搜榜全局一份，全部订阅者共享同一行 sources（xhs/hot_list 同款）。
+		if title == "" {
+			title = "微博热搜"
+		}
+		return &types.Source{
+			Platform:   types.PlatformWeibo,
+			Capability: types.CapHotList,
+			URL:        "vane://weibo/hot_list",
+			Title:      title,
+			Config:     json.RawMessage(`{}`),
+			Status:     types.SourceStatusActive,
+		}, ""
+
+	default:
+		return nil, "weibo 平台仅支持 user_posts / hot_list 能力"
+	}
+}
+
+// buildWechatMP 微信公众号平台（endpoint-binding-contract.md §7 增补，2026-07-23）。
+func buildWechatMP(cap types.Capability, params map[string]string, title string) (*types.Source, string) {
+	switch cap {
+	case types.CapUserPosts:
+		username := strings.TrimSpace(params["username"])
+		// gh_ 原始 ID 是上游端点的唯一入参形态；公众号名称/微信号解析不了，
+		// 与其静默拿错号，不如把「从哪拿 gh_ ID」写进拒绝话术。
+		if !strings.HasPrefix(username, "gh_") || len(username) <= len("gh_") {
+			return nil, "wechat_mp/user_posts 必须提供 username（公众号原始 ID，gh_ 开头；" +
+				"可在公众号资料页查看，或用微信搜索端点按名称检索后从结果的 userName 字段获取）"
+		}
+		cfg, err := json.Marshal(map[string]string{"username": username})
+		if err != nil {
+			return nil, "构造信源配置失败"
+		}
+		if title == "" {
+			title = "公众号: " + username
+		}
+		return &types.Source{
+			Platform:   types.PlatformWechatMP,
+			Capability: types.CapUserPosts,
+			URL:        "vane://wechat_mp/user_posts?username=" + url.QueryEscape(username),
+			Title:      title,
+			Config:     cfg,
+			Status:     types.SourceStatusActive,
+		}, ""
+
+	default:
+		return nil, "wechat_mp 平台仅支持 user_posts 能力"
+	}
+}
+
+// weiboProfileRe 从微博主页链接抽 uid：形如 https://weibo.com/u/2803301701 。
+// uid 恒为纯数字（实测），锚定 /u/ 路径段避免把别的数字段误当 id。
+var weiboProfileRe = regexp.MustCompile(`weibo\.com/u/(\d+)`)
+
+// weiboUIDRe 校验直填 uid 是纯数字。
+var weiboUIDRe = regexp.MustCompile(`^\d+$`)
+
+// extractWeiboUID 从 params 解析微博 uid：优先 uid 直填（纯数字；误填主页链接也容错
+// 抽取），其次从 profile_url / url 里按 weibo.com/u/<数字> 抽取。都拿不到返回空串。
+func extractWeiboUID(params map[string]string) string {
+	if uid := strings.TrimSpace(params["uid"]); uid != "" {
+		if weiboUIDRe.MatchString(uid) {
+			return uid
+		}
+		if m := weiboProfileRe.FindStringSubmatch(uid); m != nil {
+			return m[1]
+		}
+		return ""
+	}
+	for _, k := range []string{"profile_url", "url"} {
+		if raw := strings.TrimSpace(params[k]); raw != "" {
+			if m := weiboProfileRe.FindStringSubmatch(raw); m != nil {
+				return m[1]
+			}
+		}
+	}
+	return ""
 }
 
 // extractXHSPageID 解析话题 page_id：优先 page_id 直填（24 位 hex），否则从

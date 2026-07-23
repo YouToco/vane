@@ -512,3 +512,96 @@ func TestBuild_BindingKeyNamespacesDisjoint(t *testing.T) {
 		t.Errorf("user_posts 与 faved_notes 的键不该相同: %q", a.URL)
 	}
 }
+
+// ────────── 微博 / 微信公众号（endpoint-binding-contract.md §7 增补，2026-07-23）──────────
+
+func TestBuild_WeiboUserPosts(t *testing.T) {
+	const uid = "2803301701"
+	src, msg := Build(Spec{Platform: "weibo", Capability: "user_posts",
+		Params: map[string]string{"uid": uid}})
+	if msg != "" {
+		t.Fatalf("意外报错: %s", msg)
+	}
+	if src.URL != "vane://weibo/user_posts?uid="+uid {
+		t.Errorf("幂等键漂移: %q", src.URL)
+	}
+	if string(src.Config) != `{"uid":"2803301701"}` {
+		t.Errorf("config 漂移: %s", src.Config)
+	}
+	if src.Title != "微博用户: "+uid {
+		t.Errorf("默认 Title 不符: %q", src.Title)
+	}
+
+	// 三种输入形态归一到同一幂等键（契约 §5.2：同一账号怎么加键都相同）：
+	// profile_url 抽取、误把主页链接填进 uid 的容错。
+	for name, params := range map[string]map[string]string{
+		"profile_url 抽取": {"profile_url": "https://weibo.com/u/" + uid + "?tabtype=feed"},
+		"uid 误填链接容错":     {"uid": "https://weibo.com/u/" + uid},
+	} {
+		got, msg := Build(Spec{Platform: "weibo", Capability: "user_posts", Params: params})
+		if msg != "" {
+			t.Fatalf("%s 意外报错: %s", name, msg)
+		}
+		if got.URL != src.URL {
+			t.Errorf("%s 应产出同一幂等键: %q vs %q", name, got.URL, src.URL)
+		}
+	}
+
+	// 拒绝：缺参、非数字 uid、抽不出 uid 的链接。
+	for name, params := range map[string]map[string]string{
+		"缺 uid":     {},
+		"非数字 uid":   {"uid": "人民日报"},
+		"无 /u/ 段链接": {"profile_url": "https://weibo.com/rmrb"},
+	} {
+		if _, msg := Build(Spec{Platform: "weibo", Capability: "user_posts", Params: params}); msg == "" {
+			t.Errorf("%s 应被拒绝", name)
+		}
+	}
+}
+
+func TestBuild_WeiboHotList(t *testing.T) {
+	src, msg := Build(Spec{Platform: "weibo", Capability: "hot_list"})
+	if msg != "" {
+		t.Fatalf("意外报错: %s", msg)
+	}
+	if src.URL != "vane://weibo/hot_list" || string(src.Config) != `{}` {
+		t.Errorf("热搜榜应为全局无参源: url=%q config=%s", src.URL, src.Config)
+	}
+	if src.Title != "微博热搜" {
+		t.Errorf("默认 Title 不符: %q", src.Title)
+	}
+}
+
+func TestBuild_WechatMPUserPosts(t *testing.T) {
+	const gh = "gh_363b924965e9"
+	src, msg := Build(Spec{Platform: "wechat_mp", Capability: "user_posts",
+		Params: map[string]string{"username": gh}})
+	if msg != "" {
+		t.Fatalf("意外报错: %s", msg)
+	}
+	if src.URL != "vane://wechat_mp/user_posts?username="+gh {
+		t.Errorf("幂等键漂移: %q", src.URL)
+	}
+	if string(src.Config) != `{"username":"gh_363b924965e9"}` {
+		t.Errorf("config 漂移: %s", src.Config)
+	}
+
+	// 拒绝：缺参、非 gh_ 开头（公众号名称解析不了，拒绝话术须指路 gh_ ID 来源）。
+	for name, params := range map[string]map[string]string{
+		"缺 username": {},
+		"公众号名称":      {"username": "人民日报"},
+		"裸 gh_ 前缀":   {"username": "gh_"},
+	} {
+		_, msg := Build(Spec{Platform: "wechat_mp", Capability: "user_posts", Params: params})
+		if msg == "" {
+			t.Errorf("%s 应被拒绝", name)
+		} else if !strings.Contains(msg, "gh_") {
+			t.Errorf("%s 的拒绝话术应指路 gh_ 原始 ID: %s", name, msg)
+		}
+	}
+
+	// 不支持的能力。
+	if _, msg := Build(Spec{Platform: "wechat_mp", Capability: "hot_list"}); msg == "" {
+		t.Error("wechat_mp/hot_list 应被拒绝")
+	}
+}

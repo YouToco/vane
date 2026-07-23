@@ -47,6 +47,16 @@ unwrap 尝试链（retweeted_tweet→retweeted，取到含 id 的对象才替换
 参数规格（config 引用/默认值/常量/omit-empty）、正文截断上限 MaxContentBytes
 （xhs 族 4000 字节成本护栏；**x 恒 0 不截断**——旧实现存推文全文，迁移等价）。
 超时与响应上限对齐旧抓取器口径（cfg 可配，兜底 20s/5MB，超限显式报错非静默截断）。
+【2026-07-23 增补，随 weibo/wechat_mp 三能力落地】两项引擎级扩展：
+①**每模板超时覆盖** `TimeoutSeconds`（wechat_mp 上游明示 30s，否则「已扣费但收不到
+响应」）——http.Client 级超时只设全模板最大值当保险丝，每次调用的真实预算由 ctx 按
+「模板声明值或配置默认」控制，否则声明 30s 的模板会被 client 级 20s 抢先掐断。
+已知取舍：ctx 超时只能收紧不能放宽外层 deadline——add_source 试跑面受飞书卡片执行
+预算约束（probeBudget=25s），wechat_mp probe 实际上限 25s，超时可能已扣费（probe
+话术如实告知费用面）；周期抓取（Fetch activity 120s）30s 完整生效；
+②**URL 模板任意字段占位**——`{id}`/`{author}` 之外允许 `{a.b.c}` 点路径占位从条目
+数据取值（weibo 桌面权威链接需要 `{user.idstr}/{mblogid}` 双段），仍是纯字段替换、
+sub-Turing 红线不动。
 表达力仍不够的端点就写 bespoke fetcher（本清单之外不再扩——扩前先改本契约）。
 
 1. **映射语言 sub-Turing（M6 §12.4 红线）**：只允许点路径（`a.b.c`，无索引、无谓词）、
@@ -184,6 +194,22 @@ unwrap 尝试链（retweeted_tweet→retweeted，取到含 id 的对象才替换
 - 分页拍板：三能力都**只拉首页**——增量追新首页足够，避免首次添加灌历史（RSS lookback
   同款教训）；cursor 翻页二期。
 
+### §7.4 增补能力（2026-07-23，全部 code=200 真调）
+
+| 能力 (platform/capability) | 端点 (Entry.Name) | 用户参数 | 身份槽 | 时间 | 实测发现 |
+|---|---|---|---|---|---|
+| weibo/user_posts | weibo_web_v2_fetch_user_posts | uid（纯数字；主页链接 `weibo.com/u/<uid>` 可抽取） | mblogid（base62 短串，如 `Ra1N24Tm5`） | created_at ruby_date（+0800，与 Twitter 同格式） | 转发条目 `retweeted_status` 结构与 x 同形 → unwrap 拆包（身份/作者/URL 随原帖；**刻意不设 VerifyParam**，拆包后归属是原作者）；`isLongText` 长文 text_raw 被上游截断（实测 9/20），详情补全留二期（enrich 触发语义「过长=截断」与「过短需补全」相反）；模板固定 feature=0（10 条基础档，上游文档「性能最佳」）|
+| weibo/hot_list | weibo_web_v2_fetch_hot_search | 无（全局一份，IdemKey=`vane://weibo/hot_list`） | word（热搜词本身；榜单条目无 id 字段，实测 id 仅广告条目有） | **无条目时间戳** | `data.realtime` 混入 `is_ad=1` 商业推广位（实测 1/51）→ ItemFilter 按「无 is_ad 键才保留」过滤；正文=词+榜位+热度合成（xhs/hot_list 薄正文同款，§7.1 风险同样适用） |
+| wechat_mp/user_posts | wechat_mp_v2_fetch_account_articles | username（`gh_` 原始 ID；名称解析不了，拒绝话术指路获取方式） | `{app_msg_id}_{idx}` 复合模板（文章 URL 含每次抓取会变的 chksm 签名参数，**不能当身份**） | create_time unix_s | POST JSON body 端点（invoker 既有能力）；raw=false 精简结构；digest 实测恒空（10/10）→ 正文退回标题，详情补全留二期；上游明示 timeout 30s → 模板 TimeoutSeconds=30（§1 扩展①，probe 面受卡片预算压到 25s、超时可能已扣费，见 §1 已知取舍）；**唯一在描述里标价的端点**（$0.010/次），weibo 两端点未标价按兜底最高档记账，待上游放出价目表校正 |
+
+- **跨平台撞击分析（M6 §7.3 Gate，2026-07-23 做）**：weibo mblogid 是 base62 短串
+  （含大小写字母，与 24-hex note_id / 纯十进制 tweet_id / 恒含 `://` 的 url 均不同形）；
+  weibo 热搜词是中文短语；wechat_mp 复合键恒含下划线且两段皆数字。与既有三平台
+  **互不同形**，经验结论口径与 §3.4 一致（新平台再加时须重做）。
+- probe/时序：三能力 OrderCheck 均关——weibo/user_posts 有置顶微博（置顶=旧帖排首位，
+  检了必误拒，x/user_posts 同款取舍）；hot_list 无时间戳；wechat_mp 列表实测降序但
+  上游无排序承诺，保守不检。
+
 ## §8 测试不变量（新增/改造）
 
 1. 模板引用完整性：所有 bindingTemplates.Endpoint 必须 tikhubcatalog.Lookup 命中（CI 卡 re-gen）。
@@ -198,7 +224,8 @@ unwrap 尝试链（retweeted_tweet→retweeted，取到含 id 的对象才替换
 
 1. **config.binding + agent 自主绑定工具**（bind_endpoint_source）：语义已留位（§1.2），
    工具面、注入防御（模型从 probe 响应提映射的上游可影响面）、startup reconcile 均二期。
-2. 新 Platform（douyin/tiktok/微博…）绑定：每个新平台先做 M6 §7.3 撞击分析 Gate。
+2. 新 Platform（douyin/tiktok…）绑定：每个新平台先做 M6 §7.3 撞击分析 Gate
+   （微博/微信公众号已于 2026-07-23 过 Gate 落地，见 §7.4）。
 3. cursor 翻页 / 历史回灌；慢性零产出棘轮（§4 表末行）；per-endpoint 价格表。
 4. 调度面独立调用限额（§5 留观察）。
 

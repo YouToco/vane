@@ -178,6 +178,9 @@ func runtimeFetchRoutesV1(
 		{types.PlatformXHS, types.CapHotList},
 		{types.PlatformXHS, types.CapTopicFeed},
 		{types.PlatformXHS, types.CapFavedNotes},
+		{types.PlatformWeibo, types.CapUserPosts},
+		{types.PlatformWeibo, types.CapHotList},
+		{types.PlatformWechatMP, types.CapUserPosts},
 	} {
 		routes = append(routes, RuntimeFetchRouteV1{
 			Capability: runtimepolicy.CapabilityV1{
@@ -236,6 +239,18 @@ func (m *Multi) Fetch(ctx context.Context, src types.Source) ([]types.ContentIte
 		}
 
 	case types.PlatformX:
+		switch src.Capability {
+		case types.CapUserPosts:
+			return m.binding.Fetch(ctx, src)
+		}
+
+	case types.PlatformWeibo:
+		switch src.Capability {
+		case types.CapUserPosts, types.CapHotList:
+			return m.binding.Fetch(ctx, src)
+		}
+
+	case types.PlatformWechatMP:
 		switch src.Capability {
 		case types.CapUserPosts:
 			return m.binding.Fetch(ctx, src)

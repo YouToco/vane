@@ -7,9 +7,11 @@ package types
 type Platform string
 
 const (
-	PlatformWeb Platform = "web" // 开放网页：身份=url，协议=HTTP
-	PlatformX   Platform = "x"   // X / Twitter：身份=tweet_id
-	PlatformXHS Platform = "xhs" // 小红书：身份=note_id
+	PlatformWeb      Platform = "web"       // 开放网页：身份=url，协议=HTTP
+	PlatformX        Platform = "x"         // X / Twitter：身份=tweet_id
+	PlatformXHS      Platform = "xhs"       // 小红书：身份=note_id
+	PlatformWeibo    Platform = "weibo"     // 微博：身份=mblogid（帖）/热搜词（榜）
+	PlatformWechatMP Platform = "wechat_mp" // 微信公众号：身份=app_msg_id_idx
 )
 
 // Capability 从平台取什么（sources.capability）。

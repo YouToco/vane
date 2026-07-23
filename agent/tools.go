@@ -176,9 +176,11 @@ type addSourceArgs struct {
 	Keyword        string   `json:"keyword"`
 	ScreenName     string   `json:"screen_name"`
 	UserID         string   `json:"user_id"`     // xhs/user_posts、xhs/faved_notes：小红书用户 ID
-	ProfileURL     string   `json:"profile_url"` // xhs/user_posts、xhs/faved_notes：小红书用户主页链接（可替代 user_id）
+	ProfileURL     string   `json:"profile_url"` // xhs 用户主页链接（可替代 user_id）；weibo 主页链接（可替代 uid）
 	PageID         string   `json:"page_id"`     // xhs/topic_feed：话题页面 ID（24 位十六进制）
 	TopicURL       string   `json:"topic_url"`   // xhs/topic_feed：话题链接/深链（可替代 page_id，自动抽 ID）
+	UID            string   `json:"uid"`         // weibo/user_posts：微博用户数字 ID
+	Username       string   `json:"username"`    // wechat_mp/user_posts：公众号原始 ID（gh_ 开头）
 	Title          string   `json:"title"`
 	Category       string   `json:"category"`
 	Categories     []string `json:"categories"`
@@ -194,20 +196,22 @@ const addSourceSchema = `{
   "properties": {
     "platform": {
       "type": "string",
-      "enum": ["web", "x", "xhs"],
-      "description": "内容平台：web=开放网页；x=X(Twitter)；xhs=小红书"
+      "enum": ["web", "x", "xhs", "weibo", "wechat_mp"],
+      "description": "内容平台：web=开放网页；x=X(Twitter)；xhs=小红书；weibo=微博；wechat_mp=微信公众号"
     },
     "capability": {
       "type": "string",
       "enum": ["feed", "search", "user_posts", "contents", "hot_list", "topic_feed", "faved_notes"],
-      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主）；contents=监控指定网页内容变化（仅 web，如产品定价页——内容变了才推送）；hot_list=平台热榜追新（仅 xhs，无参数）；topic_feed=某话题下的新笔记（仅 xhs，需 page_id 或 topic_url）；faved_notes=某账号公开收藏的新笔记（仅 xhs，需 user_id 或 profile_url，对方收藏须公开）。当前不支持的能力及原因见本工具说明（Description）。"
+      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主，weibo=微博账号需 uid 或 profile_url，wechat_mp=公众号需 username）；contents=监控指定网页内容变化（仅 web，如产品定价页——内容变了才推送）；hot_list=平台热榜追新（xhs=小红书热榜，weibo=微博热搜，均无参数）；topic_feed=某话题下的新笔记（仅 xhs，需 page_id 或 topic_url）；faved_notes=某账号公开收藏的新笔记（仅 xhs，需 user_id 或 profile_url，对方收藏须公开）。当前不支持的能力及原因见本工具说明（Description）。"
     },
     "url": {"type": "string", "description": "网页地址（http/https）：platform=web capability=feed 时是 RSS 源地址，capability=contents 时是要监控变化的页面地址，均必填"},
     "query": {"type": "string", "description": "Exa 搜索词，platform=web capability=search 时必填"},
     "keyword": {"type": "string", "description": "小红书搜索关键词，platform=xhs capability=search 时必填"},
     "screen_name": {"type": "string", "description": "X 用户名（如 OpenAI），platform=x capability=user_posts 时必填"},
     "user_id": {"type": "string", "description": "小红书用户 ID（24 位十六进制），platform=xhs 且 capability=user_posts/faved_notes 时必填（或改用 profile_url）"},
-    "profile_url": {"type": "string", "description": "小红书用户主页链接（如 https://www.xiaohongshu.com/user/profile/<id>），platform=xhs 且 capability=user_posts/faved_notes 时可替代 user_id"},
+    "profile_url": {"type": "string", "description": "用户主页链接：platform=xhs（如 https://www.xiaohongshu.com/user/profile/<id>）时可替代 user_id；platform=weibo（如 https://weibo.com/u/<数字>）时可替代 uid"},
+    "uid": {"type": "string", "description": "微博用户数字 ID（如 2803301701），platform=weibo capability=user_posts 时必填（或改用 profile_url）。不知道 uid 时可用微博搜索端点按昵称检索获取"},
+    "username": {"type": "string", "description": "公众号原始 ID（gh_ 开头，如 gh_363b924965e9），platform=wechat_mp capability=user_posts 时必填。可用微信搜索端点按公众号名称检索后从结果的 userName 字段获取"},
     "page_id": {"type": "string", "description": "小红书话题页面 ID（24 位十六进制），platform=xhs capability=topic_feed 时必填（或改用 topic_url）。可从笔记正文话题标签的深链（xhsdiscover://…topic/normal?id=…）或话题页链接中获得"},
     "topic_url": {"type": "string", "description": "小红书话题链接或深链，platform=xhs capability=topic_feed 时可替代 page_id（自动从中抽取 24 位十六进制 ID）"},
     "title": {"type": "string", "description": "可选：展示名，缺省按类型自动生成"},
@@ -247,7 +251,7 @@ func (t *addSourceTool) Name() string { return "add_source" }
 // ExecuteAction 会把详细结果展示给用户，但用固定回执写入模型历史。
 func (t *addSourceTool) untrustedResult() bool { return true }
 func (t *addSourceTool) Description() string {
-	return "添加一个信源并建立订阅。指定 platform（web/xhs/x）和 capability（feed/search/user_posts/contents/hot_list/topic_feed/faved_notes）。" +
+	return "添加一个信源并建立订阅。指定 platform（web/xhs/x/weibo/wechat_mp）和 capability（feed/search/user_posts/contents/hot_list/topic_feed/faved_notes）。" +
 		"绑定类能力与 URL 类 web 能力（feed/contents）在确认后会先真实试跑一次，通过才落库。" +
 		"用户给了一个网址但不确定是什么来源时：先按 web/feed 尝试（免费、增量语义最好）；" +
 		"若试跑被拒，拒绝话术会给出解析结果与替代建议（页面声明的真实 feed 地址、或改用 " +
@@ -299,6 +303,8 @@ func specFromArgs(a addSourceArgs) sourcespec.Spec {
 	set("profile_url", a.ProfileURL)
 	set("page_id", a.PageID)
 	set("topic_url", a.TopicURL)
+	set("uid", a.UID)
+	set("username", a.Username)
 	if len(a.Categories) > 0 {
 		catJSON, _ := json.Marshal(a.Categories)
 		params["categories"] = string(catJSON)
@@ -323,7 +329,7 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 		return "参数不是合法 JSON，请修正后重试", nil
 	}
 	if a.Platform == "" {
-		return "请指定 platform（web/xhs/x）与 capability（feed/search/user_posts）", nil
+		return "请指定 platform（web/xhs/x/weibo/wechat_mp）与 capability（feed/search/user_posts）", nil
 	}
 	src, msg := sourcespec.Build(specFromArgs(a))
 	if msg != "" {
@@ -358,7 +364,7 @@ func (t *addSourceTool) Execute(ctx context.Context, userID int64, args json.Raw
 			}
 			var ae *types.AppError
 			if errors.As(perr, &ae) {
-				return "试跑未通过，未添加信源：" + probeUserText(ae), nil
+				return "试跑未通过，未添加信源：" + probeUserText(ae, src.Platform), nil
 			}
 			return "", perr
 		}
@@ -405,11 +411,16 @@ func cstZone() *time.Location { return time.FixedZone("CST", 8*3600) }
 
 // probeUserText 把非准入类的试跑失败映射成固定人话（红线 3）：这些错误的 Message
 // 是为管理员 fail_count 通道写的，内嵌端点名/上游 body/内部 id，不得进用户/模型面。
-func probeUserText(ae *types.AppError) string {
+func probeUserText(ae *types.AppError, platform types.Platform) string {
 	switch ae.Code {
 	case types.CodeFetchRateLimit:
 		return "上游暂时限流，请稍后再试"
 	case types.CodeFetchTimeout:
+		// 公众号上游明示接口慢且「超时也已扣费」，而 probe 受卡片执行预算约束
+		// （probeBudget=25s < 模板 30s）——话术如实告知费用面，避免用户当无事反复重试。
+		if platform == types.PlatformWechatMP {
+			return "上游响应超时（公众号接口偏慢，本次试跑可能已产生一次调用费用），请稍后再试"
+		}
 		return "上游暂时不可达或响应异常，请稍后再试"
 	default:
 		return "参数可能有误或该能力暂时不可用，请检查后重试；若反复失败请联系管理员"

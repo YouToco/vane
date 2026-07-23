@@ -217,6 +217,9 @@ const translateSystemPrompt = `你是「见微 Vane」情报任务的抓取计�
 - xhs + hot_list：小红书全站热榜追新。无参数。
 - xhs + topic_feed：订阅某小红书话题下的新笔记。必填 page_id（24 位十六进制）或 topic_url（话题链接/深链）。手册没给话题 ID/链接就不要臆造。
 - xhs + faved_notes：订阅某小红书账号公开收藏的新笔记。必填 user_id（24 位十六进制）或 profile_url（用户主页链接）。
+- weibo + user_posts：订阅某微博账号的新发布。必填 uid（微博用户数字 ID）或 profile_url（形如 https://weibo.com/u/2803301701 的主页链接）。手册没给 uid/主页链接就不要臆造。
+- weibo + hot_list：微博热搜榜追新。无参数。
+- wechat_mp + user_posts：订阅某微信公众号的发文。必填 username（公众号原始 ID，gh_ 开头，如 gh_363b924965e9）。手册没给 gh_ ID 就不要臆造——公众号名称/微信号无法解析成 gh_ ID。
 
 关键规则：
 1. 【追新用 include_domains，绝不用日期过滤】想要某个官方/权威来源的最新内容时，用 web+search 并把 include_domains 限定到该域名（例：只要 Anthropic 官方最新动态 → query 写主题、include_domains 填 ["anthropic.com"]）。绝不要试图靠"发布日期"来"只要最近的"——Exa 的发布日期是从网页猜的，官方站常常猜不出、按日期过滤会把它们连带删光。

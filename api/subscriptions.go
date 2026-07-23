@@ -18,7 +18,7 @@ import (
 // 008 起支持新格式（platform+capability+params）和旧格式（type+url/query/keyword）。
 type addSubscriptionReq struct {
 	// 新格式（M6 起）
-	Platform   string            `json:"platform"`   // web / x / xhs
+	Platform   string            `json:"platform"`   // web / x / xhs / weibo / wechat_mp
 	Capability string            `json:"capability"` // feed / search / user_posts
 	Params     map[string]string `json:"params"`     // 随 platform+capability 而定
 	// 旧格式（vane-web 兼容窗口）
