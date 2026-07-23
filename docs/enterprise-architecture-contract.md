@@ -175,7 +175,7 @@ CREATE TABLE invites (                          -- D4：财务敞口的闸门
 - 到期由定时任务硬删**该租户所有租户所有表**的行。
 
 > **不变量 I-A3（红线）**:硬删**只删租户所有表**。
-> `sources` / `content_items` / `content_sources` / `page_snapshots` 是**跨租户客观事实**，
+> `sources` / `content_items` / `content_sources` 是**跨租户客观事实**，
 > 不随单租户注销删除——否则会摧毁其他租户的去重结果与已付费的 TikHub 补全内容。
 > 该租户与内容的**关联**（subscriptions/deliveries）被删除，内容本身留在共享池。
 
@@ -186,7 +186,7 @@ CREATE TABLE invites (                          -- D4：财务敞口的闸门
 | 类别 | 表 | tenant_id | 理由 |
 |---|---|---|---|
 | **平台级** | `tenants`、`invites` | 不适用 | 租户本身 |
-| **客观事实（共享）** | `sources`(public)、`content_items`、`content_sources`、`page_snapshots` | **不加** | 共享抓取是设计意图。`sources.url` 全局 UNIQUE（007:19-22）为「多用户加同源 → 重复抓取 + 重复付费」而设；`content_items.canonical_key` 全局 UNIQUE（007:158）承载跨源去重与 TikHub 付费闸门 |
+| **客观事实（共享）** | `sources`(public)、`content_items`、`content_sources` | **不加** | 共享抓取是设计意图。`sources.url` 全局 UNIQUE（007:19-22）为「多用户加同源 → 重复抓取 + 重复付费」而设；`content_items.canonical_key` 全局 UNIQUE（007:158）承载跨源去重与 TikHub 付费闸门 |
 | **租户所有** | `memberships`、`users`、`subscriptions`、`push_batches`、`deliveries`、`feedbacks`、`profiles`、`schedules`、`agent_sessions`、`pending_actions`、`llm_calls`、`tool_calls`、`a2a_tasks`、`tenant_credentials`、`tenant_quota`、`channel_identities` | **必须加** + RLS | |
 | **必须重构** | `settings` | 结构改造 | 现为 `(key PRIMARY KEY, value JSONB)` 全局单行 KV（002:11-15），改 `PRIMARY KEY (tenant_id, key)` |
 
@@ -619,12 +619,12 @@ XHS user_posts/search、Exa search。⇒ 这不是边角选项，而应是 SDK �
 - **`check`**:拿真配置真打一次上游。`sourcecatalog` 的 `Status`+`Reason` 现在是
   **人工实测一次写死的**；`check` 让「这个源能不能用」变成运行时可查询、可挂探针的事实。
 
-### §4.4 逃生舱:实现接口并在声明里点名，而非绕过框架
+### §4.4 页面内容监控仍走统一 data-feed 框架
 
-`web/page_watch` 完全不像「抓一列内容」（产出 `KindChange`、需 `SnapshotStore`、
-预填 `CanonicalKey`）。**任何 SDK 设计如果不能容纳 page_watch，就是在逼人绕过 SDK。**
-抄 n8n 二分法:`DeclarativeConnector` 与 `ProgrammaticConnector`，后者仍走框架的
-注册/门禁/记账。
+旧 `web/page_watch` 方案已经下线，`page_snapshots` 也由迁移 016 删除。现行
+`web/contents` 直接调用 Exa `POST /contents` 获取指定 URL 的最新正文，以
+URL + 内容哈希生成 `KindPageContent` 项并复用统一的注册、门禁、记账、去重和推送管道；
+不再维护独立快照表、`SnapshotStore` 或 `KindChange` 特例。
 
 ## §5 双机并行推进
 

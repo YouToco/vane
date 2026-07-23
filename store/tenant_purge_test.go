@@ -66,7 +66,7 @@ func TestInvariant_PurgeListCoversAllTenantTables(t *testing.T) {
 
 // TestInvariant_PurgeListNeverTouchesSharedFacts 是红线 I-A3 的**下半条**，也是更危险的那半。
 //
-// sources / content_items / content_sources / page_snapshots 是跨租户客观事实：
+// sources / content_items / content_sources 是跨租户客观事实：
 // 同一篇文章可能被多个租户的信源指向。把它们写进 purgeOrder 意味着删一个租户会
 // **删掉别的租户还在用的内容**——不可逆，且受害者毫不知情。
 //
