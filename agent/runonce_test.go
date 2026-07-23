@@ -83,6 +83,49 @@ func TestRunOnce_只读工具执行(t *testing.T) {
 	}
 }
 
+func TestRunOnce_外部只读结果使用无协议续写(t *testing.T) {
+	tool := &fakeTool{
+		name:      "list_sources",
+		untrusted: true,
+		result:    "外部标题来源",
+	}
+	call := 0
+	chat := func(_ context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+		call++
+		if call == 1 {
+			return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID: "c1", Name: "list_sources", Arguments: "{}",
+			}}}, nil
+		}
+		if len(req.Tools) != 0 || len(req.Messages) != 2 ||
+			req.Messages[0].Role != "system" || req.Messages[1].Role != "user" {
+			t.Fatalf("A2A taint 续写应为零工具 system+user，实得 %+v", req)
+		}
+		for _, msg := range req.Messages {
+			if msg.Role == "tool" || len(msg.ToolCalls) > 0 {
+				t.Fatalf("A2A taint 续写不得带原生工具协议: %+v", req.Messages)
+			}
+		}
+		if !strings.Contains(req.Messages[1].Content, untrustedContinuationPrefix) {
+			t.Fatalf("A2A taint 续写缺少不可信数据封装: %+v", req.Messages[1])
+		}
+		return &llm.ChatResponse{Content: "你订阅了一个外部信源", FinishReason: "stop"}, nil
+	}
+	l := newRunOnceLoop(t, chat, tool)
+
+	outcome, history, err := l.RunOnce(context.Background(), 7, nil, "我订了哪些信源？")
+	if err != nil {
+		t.Fatalf("RunOnce 失败: %v", err)
+	}
+	if outcome.Reply != "你订阅了一个外部信源" || call != 2 {
+		t.Fatalf("A2A 外部结果未可靠收敛: outcome=%+v calls=%d", outcome, call)
+	}
+	if len(history) != 2 || history[0].Role != "user" ||
+		history[1].Content != untrustedHistoryPlaceholder {
+		t.Fatalf("A2A 外部结果历史仍应压平: %+v", history)
+	}
+}
+
 // TestRunOnce_未注册写工具自纠 契约钉死项：A2A 轨实例只注册只读工具，模型报出
 // 写工具名（如 add_source）走"工具不存在"自纠——不执行、不建 pending_action
 // （Store=nil，任何 CreatePendingAction 都会 panic，结构性证明）。

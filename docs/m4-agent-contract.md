@@ -249,8 +249,17 @@ Loop 行为细则：
   是否遵守 prompt 为前提。若同一个 assistant 响应并列多个 tool_call，只要批内含可执行
   的外部读取，执行前先整体分类并整批拒绝，要求下一轮把一个外部读取单独发起；不能只拦
   其他调用的执行，因为其 assistant content/arguments 仍会进入历史。单个外部读取执行后，
-  下一次请求的消息重建成最小隔离上下文：仅保留当前 user、去掉 content/arguments 的
-  tool_call 协议壳及 tool result，此前会话、画像派生文本和被拒调用全部不再同屏。
+  内部消息先重建成最小隔离上下文：仅保留当前 user、去掉 content/arguments 的
+  tool_call 协议壳及 tool result，此前会话、画像派生文本和被拒调用全部不再同屏；该结构
+  只供审计、tool_call 配对与保存前清洗。若仍有本轮动态端点产生的本地缓存句柄，出站请求
+  保留原生协议以支持 `read_endpoint_result` 分页；一旦工具声明为空，出站视图必须进一步
+  投影为 `system + 单条 user`，不得携带 `assistant.tool_calls` 或 `role=tool`（2026-07-22
+  生产证实 DeepSeek v4-pro 对“零工具 + 原生工具历史”会间歇泄漏内部 DSML 协议）。
+  单条 user 以 `[外部只读结果]` 开头，后接系统生成的 JSON：
+  `{"user_request":"…","external_result":"…"}`；JSON 字符串编码不得允许外部正文伪造字段边界，
+  system 必须明确整段 `external_result` 都是不可信数据、本轮只输出文字且不能声称执行操作。
+  类型化飞书追问/引用进入该投影时，只有包装外的真实追问/回复可进入 `user_request`，
+  推送原文/引用正文必须进入 `external_result`；包装损坏时全文降为外部数据，禁止信任提升。
   `search_endpoints` 也必须独占批次：它会在执行期激活动态端点，预扫描时尚不可解析的
   同批付费端点否则会在顺序执行中穿透。
 - 飞书追问包装与引用消息在**第一次**模型请求前就已混入外部正文，必须走类型化的
@@ -340,7 +349,7 @@ Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的
 - llm/chat_test.go：httptest 断言请求体 tools/messages/tool 消息序列化、tool_calls 解析、Model 覆盖、thinking 缺省不携带。
 - store：DB 门控子测试（agent_sessions CRUD、ClaimPendingAction 幂等/过期）。
 - sourcespec：迁移原 buildSource 全部用例。
-- agent：mock Client？——llm.Client 是具体类型，Loop 依赖收窄：Loop 内部通过 `chatFn func(ctx, llm.ChatRequest) (*llm.ChatResponse, error)` 字段调用（默认包 DoChat），测试注入假实现。覆盖：纯聊天、读工具单轮、写工具确认卡、未知工具自纠、maxTurns 兜底、ExecuteAction 幂等；恶意外部结果必须用真实外部工具分类反向证明画像读取、写 pending action 与 URL/query 上下文外带均被确定性拒绝，并覆盖跨消息、部署前存量会话、外部 Probe 成功/失败回调、本地缓存分页、同批“内部读→外部读→写”乱序及 `search_endpoints+未激活动态端点`；外部上下文测试必须证明首轮零画像读取/零工具/零既有历史、原文零持久化且旧历史保留，add_source 只建 pending 或整批拒绝后重试写工具时不会被误判为已执行外部查询。
+- agent：mock Client？——llm.Client 是具体类型，Loop 依赖收窄：Loop 内部通过 `chatFn func(ctx, llm.ChatRequest) (*llm.ChatResponse, error)` 字段调用（默认包 DoChat），测试注入假实现。覆盖：纯聊天、读工具单轮、写工具确认卡、未知工具自纠、maxTurns 兜底、ExecuteAction 幂等；恶意外部结果必须用真实外部工具分类反向证明画像读取、写 pending action 与 URL/query 上下文外带均被确定性拒绝，并覆盖跨消息、部署前存量会话、外部 Probe 成功/失败回调、本地缓存分页、同批“内部读→外部读→写”乱序及 `search_endpoints+未激活动态端点`；外部结果后的零工具出站请求必须断言只有 system+user、无原生 tool protocol，JSON 字段边界不可由外部正文伪造，且内部历史仍按原 user+固定占位持久化；外部上下文测试必须证明首轮零画像读取/零工具/零既有历史、原文零持久化且旧历史保留，扁平化时真实追问与外部正文不发生信任提升；add_source 只建 pending 或整批拒绝后重试写工具时不会被误判为已执行外部查询。
 - fetcher：Exa ad-hoc 上游账本必须断言 trace/user 归属与 `source_id=0`，反向断言这些本地归属元数据没有出现在第三方请求体/请求头；取消后的记账 context 仍可用且有 deadline，`statuses[].status=error` 必须在账本标为失败而不是 HTTP 200 成功。
 - feishu：BuildConfirmCard JSON 结构断言；回调 owner 校验单测（能 mock 的部分）。
 
