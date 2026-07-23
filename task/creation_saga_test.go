@@ -966,6 +966,44 @@ func TestMaterializeCreationSourceSpecs_ValidatesXHSUserIDs(t *testing.T) {
 	}
 }
 
+func TestMaterializeCreationSourceSpecs_ValidatesXHSTopicPageID(t *testing.T) {
+	const pageID = "6301c499df9bea0001dc6f47"
+	topicURL := "xhsdiscover://rn/sns-discover/topic/normal?id=" + pageID + "&page_source=note_feed"
+	materialize := func(field, value string) ([]compiledFetchSource, error) {
+		return materializeCreationSourceSpecs(&createScheduleSourceSpecs{
+			Version: creationSourceSpecsVersion,
+			Items: []json.RawMessage{mustMarshal(t, map[string]any{
+				"kind": "xhs_topic_feed", field: value,
+			})},
+		})
+	}
+	direct, err := materialize("page_id", pageID)
+	if err != nil || len(direct) != 1 {
+		t.Fatalf("direct page_id materialization=%+v err=%v", direct, err)
+	}
+	deepLink, err := materialize("topic_url", topicURL)
+	if err != nil || len(deepLink) != 1 ||
+		direct[0].URL != deepLink[0].URL ||
+		!bytes.Equal(direct[0].Config, deepLink[0].Config) {
+		t.Fatalf("topic_url must normalize identically: direct=%+v deep_link=%+v err=%v",
+			direct, deepLink, err)
+	}
+	for _, value := range []string{
+		"abc",
+		pageID + "0",
+		" " + pageID,
+		strings.ToUpper(pageID),
+		"https://www.xiaohongshu.com/page/topics/" + pageID,
+	} {
+		t.Run(value, func(t *testing.T) {
+			_, err := materialize("page_id", value)
+			if err == nil || !strings.Contains(err.Error(), "24 lowercase hexadecimal") {
+				t.Fatalf("invalid direct page_id must be rejected: value=%q err=%v", value, err)
+			}
+		})
+	}
+}
+
 func TestCreationCoordinator_ProposalCombinesExistingSourcesAndSourceSpecs(t *testing.T) {
 	store := newCreationSagaFakeStore()
 	store.resolveSources = map[int64]types.Source{

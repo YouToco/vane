@@ -1475,7 +1475,7 @@ func materializeCreationSourceSpecs(
 	return materialized, nil
 }
 
-var creationXHSUserIDRe = regexp.MustCompile(`^[0-9a-f]{24}$`)
+var creationXHSIDRe = regexp.MustCompile(`^[0-9a-f]{24}$`)
 
 func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
@@ -1602,7 +1602,7 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 				"exactly one of user_id or profile_url is required",
 			)
 		}
-		if input.UserID != "" && !creationXHSUserIDRe.MatchString(input.UserID) {
+		if input.UserID != "" && !creationXHSIDRe.MatchString(input.UserID) {
 			return sourcespec.Spec{}, errors.New(
 				"user_id must be exactly 24 lowercase hexadecimal characters",
 			)
@@ -1643,6 +1643,11 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 			(strings.TrimSpace(input.TopicURL) == "") {
 			return sourcespec.Spec{}, errors.New(
 				"exactly one of page_id or topic_url is required",
+			)
+		}
+		if input.PageID != "" && !creationXHSIDRe.MatchString(input.PageID) {
+			return sourcespec.Spec{}, errors.New(
+				"page_id must be exactly 24 lowercase hexadecimal characters",
 			)
 		}
 		return sourcespec.Spec{
