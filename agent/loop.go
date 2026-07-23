@@ -59,7 +59,7 @@ const exaAdHocSystemNote = `
 // 且没有要求先查/核对时追加。运行时另有工具白名单二次门；prompt 只负责让模型
 // 尽快收敛到 create_schedule，而不是安全边界。
 const directTaskCreationSystemNote = `
-- 用户已明确要求直接生成任务确认卡。本轮不注入画像，也不要询问行业、职业、岗位或更新画像。不要调用 list_sources、list_schedules、web_search、read_page 或其他读取工具；只能使用本条用户消息中明确提供的信息调用 create_schedule，不得用历史或画像。新长期信源必须写入 approved_fetch_plan.source_specs，version 固定为 vane.source-specs/v1；只能提交 kind 对应的人类可读参数，绝不能编写 sources、config、selectors、vane:// URL 或 existing_source_ids。唯一允许的有界补全是：用户明确点名机构且要求官方来源时，可填写这些机构对应的官方裸域名；精确域名会在确认卡展示并由用户点击批准，不得加入未点名机构、媒体或社区。若信息确实不足，不得编造；没有实际调用 create_schedule 就绝不能声称确认卡已经或即将出现。`
+- 用户已明确要求直接生成任务确认卡。本轮不注入画像，也不要询问行业、职业、岗位或更新画像。不要调用 list_sources、list_schedules、web_search、read_page 或其他读取工具；只能使用本条用户消息中明确提供的信息调用 create_schedule，不得用历史或画像。新长期信源直接写入 approved_fetch_plan：version 固定为 vane.source-specs/v1，items 只提交 kind 对应的人类可读参数；绝不能编写 sources、source_specs、config、selectors、vane:// URL 或 existing_source_ids。唯一允许的有界补全是：用户明确点名机构且要求官方来源时，可填写这些机构对应的官方裸域名；精确域名会在确认卡展示并由用户点击批准，不得加入未点名机构、媒体或社区。若信息确实不足，不得编造；没有实际调用 create_schedule 就绝不能声称确认卡已经或即将出现。`
 
 const directTaskCreationRetrySystemNote = `
 - 系统刚刚拒绝并丢弃了一个非 create_schedule 工具调用；它没有执行，也没有产生可用结果。不要重试读取，只能调用 create_schedule 或明确追问缺失信息。`
@@ -779,15 +779,15 @@ func projectDirectTaskCreationToolDef(def llm.ToolDef) (llm.ToolDef, bool) {
 	if !ok {
 		return llm.ToolDef{}, false
 	}
-	sourceSpecsObject["description"] = "本次直接创建必填：只提交当前消息指定的新信源原始规格；系统负责生成内部 URL/config/title。不能使用 existing_source_ids 或旧式 sources。"
-	approved["properties"] = map[string]any{"source_specs": sourceSpecs}
-	approved["required"] = []string{"source_specs"}
-	approved["description"] = "直接创建模式只接受本条用户消息指定的新信源；必须使用版本化 source_specs，不能引用 existing_source_ids 或提交内部 sources。"
+	approved["properties"] = sourceSpecsObject["properties"]
+	approved["required"] = sourceSpecsObject["required"]
+	approved["additionalProperties"] = false
+	approved["description"] = "直接创建模式只接受本条用户消息指定的新信源原始规格：version 固定为 vane.source-specs/v1，items 只含人类可读参数。不能引用 existing_source_ids，也不能再嵌套 source_specs 或提交内部 sources。"
 	projected, err := json.Marshal(schema)
 	if err != nil {
 		return llm.ToolDef{}, false
 	}
-	def.Description = "按当前用户消息生成任务确认卡。新信源必须使用 source_specs；本次不允许读取或引用 existing_source_ids，点击确认卡前不会执行任务。"
+	def.Description = "按当前用户消息生成任务确认卡。新信源直接填入 approved_fetch_plan 的 version/items；本次不允许读取或引用 existing_source_ids，点击确认卡前不会执行任务。"
 	def.Parameters = projected
 	return def, true
 }
@@ -942,8 +942,18 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			if l.taskCreation == nil {
 				return nil, out, errors.New("agent: task creation controller is not configured")
 			}
-			plan, exact := inspectModelTaskCreationPlan(args)
 			state := runStateFrom(ctx)
+			if state != nil && state.directTaskCreation {
+				var normalized bool
+				args, normalized = normalizeDirectTaskCreationArgs(args)
+				if !normalized {
+					state.directTaskCreationValidationFailures++
+					out = append(out, toolMsg(tc.ID,
+						"create_schedule 字段名必须与 schema 完全一致，不能使用大小写别名、转义键或未知字段。"))
+					continue
+				}
+			}
+			plan, exact := inspectModelTaskCreationPlan(args)
 			if !exact {
 				if state != nil && state.directTaskCreation {
 					state.directTaskCreationValidationFailures++
@@ -966,7 +976,7 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 				// 进入方案。普通模式仍可在真实 list_sources 后引用。
 				state.directTaskCreationValidationFailures++
 				out = append(out, toolMsg(tc.ID,
-					"直接创建模式不能使用 existing_source_ids；请用 approved_fetch_plan.source_specs（version=vane.source-specs/v1）提交用户本条消息指定的新信源。"))
+					"直接创建模式不能使用 existing_source_ids；请直接用 approved_fetch_plan.version/items 提交用户本条消息指定的新信源。"))
 				continue
 			}
 			actionID := uuid.NewString()
@@ -1024,6 +1034,48 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 type modelTaskCreationPlanInspection struct {
 	hasExistingSourceIDs bool
 	hasSources           bool
+}
+
+// normalizeDirectTaskCreationArgs 把直建模式刻意简化的模型工具面恢复成
+// controller 的稳定内部契约。普通模式和已按旧 schema 生成的嵌套参数原样保留；
+// 只有精确匹配 {version,items} 的扁平 plan 才会被包进 source_specs。
+// 两层都用 DecodeExact，避免兼容层重新引入大小写别名、转义键或未知字段。
+func normalizeDirectTaskCreationArgs(args json.RawMessage) (json.RawMessage, bool) {
+	if _, exact := inspectModelTaskCreationPlan(args); exact {
+		return args, true
+	}
+	var envelope struct {
+		Spec              json.RawMessage `json:"spec,omitempty"`
+		Intent            json.RawMessage `json:"intent,omitempty"`
+		ApprovedFetchPlan json.RawMessage `json:"approved_fetch_plan,omitempty"`
+		NLDescription     json.RawMessage `json:"nl_description,omitempty"`
+		Strictness        json.RawMessage `json:"strictness,omitempty"`
+	}
+	if strictjson.DecodeExact(args, &envelope) != nil ||
+		len(bytes.TrimSpace(envelope.ApprovedFetchPlan)) == 0 {
+		return nil, false
+	}
+	var flatPlan struct {
+		Version json.RawMessage `json:"version"`
+		Items   json.RawMessage `json:"items"`
+	}
+	if strictjson.DecodeExact(envelope.ApprovedFetchPlan, &flatPlan) != nil {
+		return nil, false
+	}
+	wrappedPlan, err := json.Marshal(struct {
+		SourceSpecs json.RawMessage `json:"source_specs"`
+	}{
+		SourceSpecs: envelope.ApprovedFetchPlan,
+	})
+	if err != nil {
+		return nil, false
+	}
+	envelope.ApprovedFetchPlan = wrappedPlan
+	normalized, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, false
+	}
+	return normalized, true
 }
 
 func inspectModelTaskCreationPlan(

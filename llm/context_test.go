@@ -8,11 +8,14 @@ func TestContextWindowTokens_KnownAndFallback(t *testing.T) {
 	if got := ContextWindowTokens("deepseek-v4-pro"); got != 1_000_000 {
 		t.Errorf("已登记模型窗口漂移: %d", got)
 	}
+	if got := ContextWindowTokens("kimi-k2.6"); got != 256_000 {
+		t.Errorf("Kimi K2.6 窗口漂移: %d", got)
+	}
 	if got := ContextWindowTokens("some-future-model"); got != fallbackContextWindowTokens {
 		t.Errorf("未登记模型应取保守兜底 %d，实得 %d", fallbackContextWindowTokens, got)
 	}
-	// 登记表必须与 pricing 表同步覆盖生产在用的两个模型，否则派生上限会静默走兜底档。
-	for _, m := range []string{"deepseek-v4-flash", "deepseek-v4-pro"} {
+	// 生产在用模型必须显式登记，否则派生上限会静默走兜底档。
+	for _, m := range []string{"deepseek-v4-flash", "deepseek-v4-pro", "kimi-k2.6"} {
 		if _, ok := modelContextWindows[m]; !ok {
 			t.Errorf("生产在用模型 %s 未登记窗口", m)
 		}

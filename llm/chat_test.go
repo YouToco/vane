@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/types"
 )
 
@@ -182,6 +183,70 @@ func TestChatDisableThinking(t *testing.T) {
 	}
 	if th["type"] != "disabled" {
 		t.Errorf("thinking.type = %v, 期望 disabled", th["type"])
+	}
+}
+
+func TestChatKimiK26UsesStrictToolSchema(t *testing.T) {
+	const kimiToolCallBody = `{
+		"model": "kimi-k2.6",
+		"choices": [{
+			"finish_reason": "tool_calls",
+			"message": {
+				"role": "assistant",
+				"content": "",
+				"tool_calls": [{
+					"id": "call_kimi",
+					"type": "function",
+					"function": {"name": "create_schedule", "arguments": "{\"intent\":\"weekly AI updates\"}"}
+				}]
+			}
+		}],
+		"usage": {"prompt_tokens": 20, "completion_tokens": 8}
+	}`
+
+	var gotBody map[string]any
+	srv := newChatCaptureServer(t, kimiToolCallBody, &gotBody)
+	defer srv.Close()
+
+	c := New(config.LLMConfig{
+		Provider:      "kimi",
+		BaseURL:       srv.URL,
+		APIKey:        "test-key",
+		Model:         "kimi-k2.6",
+		MaxConcurrent: 1,
+	})
+	legacyTemp := float32(0.3)
+	resp, err := c.Chat(context.Background(), ChatRequest{
+		Messages: []ChatMessage{{Role: "user", Content: "create it"}},
+		Tools: []ToolDef{{
+			Name:       "create_schedule",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"],"additionalProperties":false}`),
+		}},
+		Temperature:     &legacyTemp,
+		DisableThinking: true,
+	})
+	if err != nil {
+		t.Fatalf("Chat 返回错误: %v", err)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Name != "create_schedule" {
+		t.Fatalf("ToolCalls = %+v", resp.ToolCalls)
+	}
+
+	tools, ok := gotBody["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %v", gotBody["tools"])
+	}
+	fn, _ := tools[0].(map[string]any)["function"].(map[string]any)
+	if fn["strict"] != true {
+		t.Fatalf("Kimi tool schema must set strict=true, got %v", fn["strict"])
+	}
+	thinking, _ := gotBody["thinking"].(map[string]any)
+	if thinking["type"] != "disabled" {
+		t.Fatalf("Kimi K2.6 should disable thinking for deterministic FC, got %v", gotBody["thinking"])
+	}
+	if _, present := gotBody["temperature"]; present {
+		t.Fatalf("Kimi K2.6 has a provider-fixed temperature; client must omit caller value, got %v",
+			gotBody["temperature"])
 	}
 }
 

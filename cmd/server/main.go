@@ -82,6 +82,12 @@ func run() error {
 
 	// LLM 客户端 + 调用记账（写库失败只记日志，不影响主流程）。
 	llmClient := llm.New(cfg.LLM)
+	agentLLMConfig, err := cfg.LLM.AgentClientConfig()
+	if err != nil {
+		st.Close()
+		return fmt.Errorf("初始化 Agent LLM 路由: %w", err)
+	}
+	agentLLMClient := llm.New(agentLLMConfig)
 	recorder := llm.NewRecorder(st)
 	compiledModelResolver, err := llm.NewRuntimeModelResolverV1(llm.RuntimeModelRouteV1{
 		Provider: runtimepolicy.ModelProviderDeepSeekV1,
@@ -283,7 +289,7 @@ func run() error {
 	// CreatePush path unreachable even if that guard regresses.
 	tools := agent.BuildTools(st, sched, nil, sched, endpoints, fetch, exaTools)
 	agentLoop := agent.New(agent.Deps{
-		Client:       llmClient,
+		Client:       agentLLMClient,
 		Recorder:     recorder,
 		Store:        st,
 		Profiles:     st,
@@ -303,7 +309,7 @@ func run() error {
 	// deep_dive 走质量档 AgentModel（Boss 拍板③）：用户显式请求、低频、长文质量敏感。
 	fbSvc := feedback.New(feedback.Deps{
 		Store:         st,
-		Client:        llmClient,
+		Client:        agentLLMClient,
 		Recorder:      recorder,
 		Sender:        manager,
 		Notifier:      agentLoop,
@@ -477,7 +483,7 @@ func run() error {
 			}
 		}
 		a2aLoop := agent.New(agent.Deps{
-			Client:       llmClient,
+			Client:       agentLLMClient,
 			Recorder:     recorder,
 			Tools:        a2aTools,
 			Model:        cfg.LLM.AgentModel,

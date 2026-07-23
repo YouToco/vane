@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -103,6 +104,7 @@ type wireFunctionDef struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters"`
+	Strict      *bool           `json:"strict,omitempty"`
 }
 
 type wireChatRequest struct {
@@ -181,10 +183,20 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	// 无 tools 时不携带该字段（omitempty 靠 nil 切片）：空数组对部分兼容
 	// 实现是非法请求，且"收尾文案"调用依赖不带 tools 防止再触发工具调用。
 	var tools []wireToolDef
+	var strict *bool
+	if strings.EqualFold(strings.TrimSpace(c.provider), "kimi") {
+		enabled := true
+		strict = &enabled
+	}
 	for _, td := range req.Tools {
 		tools = append(tools, wireToolDef{
-			Type:     "function",
-			Function: wireFunctionDef{Name: td.Name, Description: td.Description, Parameters: td.Parameters},
+			Type: "function",
+			Function: wireFunctionDef{
+				Name:        td.Name,
+				Description: td.Description,
+				Parameters:  td.Parameters,
+				Strict:      strict,
+			},
 		})
 	}
 
@@ -196,7 +208,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		Model:       model,
 		Messages:    messages,
 		Tools:       tools,
-		Temperature: req.Temperature,
+		Temperature: c.requestTemperature(model, req.Temperature),
 		MaxTokens:   req.MaxTokens,
 		Thinking:    thinking,
 	})

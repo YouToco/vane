@@ -1411,11 +1411,11 @@ func TestHandleMessage_ExternalBatchRejectedThenWriteRetryPreservesPendingHistor
 }
 
 func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *testing.T) {
-	const args = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
+	const modelArgs = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
 		`"intent":"只监控 OpenAI、Anthropic、Google 官方确认的重大模型、API、定价、下线与安全政策更新；无重要更新不推送",` +
-		`"approved_fetch_plan":{"source_specs":{"version":"vane.source-specs/v1","items":[{` +
+		`"approved_fetch_plan":{"version":"vane.source-specs/v1","items":[{` +
 		`"kind":"web_search","query":"major AI model API pricing deprecation security updates",` +
-		`"include_domains":["ai.google.dev","anthropic.com","blog.google","deepmind.google","openai.com"]}]}},` +
+		`"include_domains":["ai.google.dev","anthropic.com","blog.google","deepmind.google","openai.com"]}]},` +
 		`"nl_description":"每周一上午 9 点整理三家官方重大模型动态","strictness":"strict"}`
 	const userText = "确认创建，直接生成确认卡，不要再次搜索。每周一上午 9:00（Asia/Shanghai）执行。" +
 		"核心信源仅限 OpenAI、Anthropic、Google 的官方博客、公告页和 API 更新日志；" +
@@ -1468,7 +1468,7 @@ func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *t
 		},
 		{
 			ToolCalls: []llm.ToolCall{{
-				ID: "create-confirmed-task", Name: "create_schedule", Arguments: args,
+				ID: "create-confirmed-task", Name: "create_schedule", Arguments: modelArgs,
 			}},
 			FinishReason: "tool_calls",
 		},
@@ -1491,8 +1491,18 @@ func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *t
 	if profiles.calls != 0 {
 		t.Fatalf("direct-task-creation 不得读取画像，实得 %d 次", profiles.calls)
 	}
-	if len(creation.proposeCalls) != 1 || string(creation.proposeCalls[0].RawArgs) != args {
+	if len(creation.proposeCalls) != 1 {
 		t.Fatalf("create_schedule proposal 调用漂移: %+v", creation.proposeCalls)
+	}
+	var canonical struct {
+		ApprovedFetchPlan struct {
+			SourceSpecs json.RawMessage `json:"source_specs"`
+		} `json:"approved_fetch_plan"`
+	}
+	if err := json.Unmarshal(creation.proposeCalls[0].RawArgs, &canonical); err != nil ||
+		len(canonical.ApprovedFetchPlan.SourceSpecs) == 0 {
+		t.Fatalf("direct 扁平 fetch plan 必须在 controller 前规范化为 source_specs: raw=%s err=%v",
+			creation.proposeCalls[0].RawArgs, err)
 	}
 	for i, req := range chat.requests {
 		if len(req.Tools) != 1 || req.Tools[0].Name != "create_schedule" {
@@ -1510,17 +1520,18 @@ func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *t
 			t.Fatalf("第 %d 次 direct schema 非法: %v", i+1, err)
 		}
 		directPlan := directSchema.Properties.ApprovedFetchPlan
-		if !slices.Equal(directPlan.Required, []string{"source_specs"}) ||
-			len(directPlan.Properties) != 1 ||
-			len(directPlan.Properties["source_specs"]) == 0 {
-			t.Fatalf("第 %d 次 direct schema 必须只暴露且强制 source_specs: %+v",
+		if !slices.Equal(directPlan.Required, []string{"version", "items"}) ||
+			len(directPlan.Properties) != 2 ||
+			len(directPlan.Properties["version"]) == 0 ||
+			len(directPlan.Properties["items"]) == 0 {
+			t.Fatalf("第 %d 次 direct schema 必须把 source_specs 投影为 plan 本身: %+v",
 				i+1, directPlan)
 		}
-		sourceSpecsSchema := string(directPlan.Properties["source_specs"])
-		if strings.Contains(sourceSpecsSchema, "可以与 existing_source_ids 组合") ||
-			!strings.Contains(sourceSpecsSchema, "不能使用 existing_source_ids") {
-			t.Fatalf("第 %d 次 direct source_specs 文案不得诱导隐藏字段: %s",
-				i+1, sourceSpecsSchema)
+		directSchemaText := string(req.Tools[0].Parameters)
+		if strings.Contains(directSchemaText, `"existing_source_ids"`) ||
+			strings.Contains(directSchemaText, `"source_specs"`) {
+			t.Fatalf("第 %d 次 direct schema 不得再暴露额外嵌套层或 existing ids: %s",
+				i+1, directSchemaText)
 		}
 		rawReq, err := json.Marshal(req.Messages)
 		if err != nil {
