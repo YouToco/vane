@@ -252,6 +252,76 @@ export interface DeliveriesResp {
   next_page_token?: string;
 }
 
+// ---- M7 任务数据面（功能 6.6/6.7，vane#142）----
+// 字段逐字对齐后端 store/schedule_dashboard.go 与 api/task_dashboard.go 的 json tag。
+
+// 任务运行概览：列表页密度升级与详情页头部共用。
+// last_run_at 缺席 = 从未跑过批次（020 之前的历史批次不挂 schedule_id，同样不算）；
+// last_status 空串与之恒同时出现。7d 窗口是后端固化口径，前端不传窗口参数。
+export interface ScheduleRunSummary {
+  schedule_id: string;
+  last_run_at?: string; // UTC；缺席 = 无批次历史
+  last_status: string; // done/failed/empty；无批次为空串
+  last_exit_gate: string; // BatchExitGate；空串 = 没提前退出
+  batches_7d: number;
+  empty_batches_7d: number;
+  sent_pushes_7d: number;
+  source_count: number;
+}
+
+// 任务绑定的信源（schedule_sources 关联）。老任务（走账号级订阅）此列表为空，
+// 空 ≠ 坏——详情页要给「本任务未绑定专属信源」的真话空态，别渲染成加载失败。
+export interface ScheduleSourceInfo {
+  id: number;
+  platform: string;
+  capability: string;
+  url: string;
+  title: string;
+  status: string; // active/disabled/paused
+  fail_count: number;
+  last_fetched_at?: string; // UTC
+}
+
+// 单任务一次运行（push_batch）。stage_counts 语义同 PipelineCounts：
+// 缺席 = 那一步没跑，见上方 PipelineCounts 的注释——这里同样不许补零。
+export interface ScheduleBatchItem {
+  id: number;
+  status: string; // done/failed/empty
+  exit_gate: BatchExitGate;
+  stage_counts: PipelineCounts;
+  deliveries: number; // 本批投递行数（含未发成的）
+  sent: number; // 其中已发送成功的
+  created_at: string; // UTC
+}
+
+export interface ScheduleBatchesResp {
+  items: ScheduleBatchItem[];
+  total: number;
+  next_page_token?: string;
+}
+
+// 任务累计 LLM 成本。**只覆盖推送管道的 LLM 调用**：工具费（Exa/TikHub）的
+// trace 锚在写入侧尚未统一，后端刻意不归集（vane#142 审查结论）——前端文案
+// 必须写明「LLM 成本」，别标成「总成本」编造完整性。
+export interface ScheduleRunCost {
+  llm_cost_usd: number;
+  llm_calls: number;
+}
+
+export interface SchedulePlaybook {
+  content: string;
+  updated_at: string; // UTC
+}
+
+// GET /api/schedules/{id} 响应。playbook 缺席 = 老任务/无手册，不是错误。
+export interface ScheduleDetail {
+  schedule: Schedule;
+  summary: ScheduleRunSummary;
+  sources: ScheduleSourceInfo[];
+  playbook?: SchedulePlaybook;
+  cost: ScheduleRunCost;
+}
+
 // ---- M7 成本与运行监控（功能 6.5）----
 // 字段逐字对齐后端 store.SpanRunStat / api.runstatsResp 的 json tag。
 
@@ -451,6 +521,53 @@ export const api = {
     request<Record<string, unknown>[]>("/api/schedules").then((rows) =>
       (rows ?? []).map(normalizeSchedule),
     ),
+  // ---- M7 任务数据面（功能 6.6/6.7）----
+  // 详情：schedule 走与 listSchedules 相同的 normalizeSchedule（后端是 spec_json/
+  // scope_json 直出）；batches 的 stage_counts 是后端 json.RawMessage 直出，形状
+  // 用 asObject 收敛（同 normalizeSchedule 的理由：JSONB 可能内联也可能字符串）。
+  scheduleDetail: (id: string) =>
+    request<Omit<ScheduleDetail, "schedule"> & { schedule: Record<string, unknown> }>(
+      `/api/schedules/${encodeURIComponent(id)}`,
+    ).then((r) => ({
+      ...r,
+      schedule: normalizeSchedule(r.schedule),
+      sources: arr(r.sources),
+    })),
+  scheduleSummaries: () =>
+    request<{ items: ScheduleRunSummary[] }>("/api/schedules/summary").then((r) =>
+      arr(r.items),
+    ),
+  scheduleBatches: (id: string, pageSize?: number, pageToken?: string) => {
+    const params = new URLSearchParams();
+    if (pageSize) params.set("page_size", String(pageSize));
+    if (pageToken) params.set("page_token", pageToken);
+    const qs = params.toString();
+    return request<ScheduleBatchesResp>(
+      `/api/schedules/${encodeURIComponent(id)}/batches${qs ? "?" + qs : ""}`,
+    ).then((r) => ({
+      ...r,
+      items: arr(r.items).map((it) => ({
+        ...it,
+        exit_gate: it.exit_gate ?? "",
+        stage_counts: asObject<PipelineCounts>(it.stage_counts),
+      })),
+    }));
+  },
+  // 单任务推送记录与全局推送历史（listDeliveries）同形状（后端复用 deliveriesResp），
+  // 前端也复用 DeliveriesResp/DeliveryHistoryItem，渲染层两处共用组件。
+  scheduleDeliveries: (id: string, pageSize?: number, pageToken?: string) => {
+    const params = new URLSearchParams();
+    if (pageSize) params.set("page_size", String(pageSize));
+    if (pageToken) params.set("page_token", pageToken);
+    const qs = params.toString();
+    return request<DeliveriesResp>(
+      `/api/schedules/${encodeURIComponent(id)}/deliveries${qs ? "?" + qs : ""}`,
+    ).then((r) => ({
+      ...r,
+      items: arr(r.items).map((it) => ({ ...it, feedbacks: arr(it.feedbacks) })),
+    }));
+  },
+
   deleteSchedule: (id: string) =>
     request<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}`, { method: "DELETE" }),
   // push/now 的 body 是 {scope?}（B8）；固化"现在推一次"默认不带 scope = 推全部订阅

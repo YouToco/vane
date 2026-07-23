@@ -5,6 +5,7 @@ import Landing from "./pages/Landing";
 import Login from "./pages/Login";
 import Home from "./pages/Home";
 import TaskDashboard from "./pages/TaskDashboard";
+import TaskDetail from "./pages/TaskDetail";
 import History from "./pages/History";
 import Settings from "./pages/Settings";
 import Admin from "./pages/Admin";
@@ -93,7 +94,17 @@ function useNav() {
   return { groups, all };
 }
 
+// 任务详情是唯一的动态路由：#/tasks/{scheduleID}。schedule id 是后端生成的
+// push-{user}-{uuid}（无斜杠），前缀截断即可，不需要真路由库。
+function taskDetailID(hash: string): string | null {
+  if (!hash.startsWith("#/tasks/")) return null;
+  const id = decodeURIComponent(hash.slice("#/tasks/".length));
+  return id || null;
+}
+
 function renderPage(hash: string, isPlatformOwner: boolean) {
+  const detailID = taskDetailID(hash);
+  if (detailID) return <TaskDetail scheduleID={detailID} />;
   switch (hash) {
     case "#/tasks":
       return <TaskDashboard />;
@@ -192,7 +203,13 @@ function AppSidebar({
               <SidebarMenu>
                 {group.items.map((item) => (
                   <SidebarMenuItem key={item.hash}>
-                    <SidebarMenuButton render={<a href={item.hash} />} isActive={hash === item.hash}>
+                    <SidebarMenuButton
+                      render={<a href={item.hash} />}
+                      isActive={
+                        hash === item.hash ||
+                        (item.hash === "#/tasks" && Boolean(taskDetailID(hash)))
+                      }
+                    >
                       <item.icon />
                       <span>{item.label}</span>
                     </SidebarMenuButton>
@@ -241,7 +258,10 @@ function Shell({ hash, me }: { hash: string; me: MeResponse }) {
           <SidebarTrigger className="-ml-1" />
           <Separator orientation="vertical" className="mr-2 !h-4" />
           <span className="text-sm text-muted-foreground">
-            {all.find((i) => i.hash === hash)?.label ?? t.app.nav.home}
+            {/* 详情页归属「我的任务」；找不到的 hash 落回首页文案，与 renderPage 一致 */}
+            {taskDetailID(hash)
+              ? t.app.nav.tasks
+              : (all.find((i) => i.hash === hash)?.label ?? t.app.nav.home)}
           </span>
           <div className="ml-auto">
             <LocaleSwitch />
