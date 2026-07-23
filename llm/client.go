@@ -54,6 +54,21 @@ func New(cfg config.LLMConfig) *Client {
 	}
 }
 
+// requestTemperature keeps provider-fixed model parameters out of the wire
+// request. Kimi K2.6/K2.5 reject any non-fixed value and recommend omitting the
+// field so the server applies 1.0 (thinking) or 0.6 (thinking disabled).
+func (c *Client) requestTemperature(model string, requested *float32) *float32 {
+	if !strings.EqualFold(strings.TrimSpace(c.provider), "kimi") {
+		return requested
+	}
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "kimi-k2.6", "kimi-k2.5":
+		return nil
+	default:
+		return requested
+	}
+}
+
 // Request 单轮对话请求。Temperature/MaxTokens 为 nil 时请求体不携带
 // 对应字段（交给上游默认值），因此用指针而非零值区分"未设置"。
 type Request struct {
@@ -167,7 +182,7 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	payload, err := json.Marshal(chatRequest{
 		Model:       requestModel,
 		Messages:    messages,
-		Temperature: req.Temperature,
+		Temperature: c.requestTemperature(requestModel, req.Temperature),
 		MaxTokens:   req.MaxTokens,
 		Thinking:    thinking,
 	})

@@ -208,7 +208,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		Model:       model,
 		Messages:    messages,
 		Tools:       tools,
-		Temperature: req.Temperature,
+		Temperature: c.requestTemperature(model, req.Temperature),
 		MaxTokens:   req.MaxTokens,
 		Thinking:    thinking,
 	})

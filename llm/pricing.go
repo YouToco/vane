@@ -1,7 +1,8 @@
 package llm
 
-// DeepSeek V4 系列定价（USD / 1M tokens）。
+// DeepSeek V4 与 Kimi 系列定价（USD / 1M tokens）。
 // 来源：DeepSeek 官方定价页，2026-07-14 查证（M2 事实基准，M4 补 v4-pro）。
+// Kimi K2.6 来源：Kimi 官方国际站，2026-07-23 查证。
 // 注意 deepseek-chat / deepseek-reasoner 是旧别名（2026-07-24 废弃）。
 //
 // M4 起同进程双模型并存：pipeline 打分/出卡用便宜档 v4-flash，agent loop 用
@@ -15,6 +16,7 @@ type modelPrice struct {
 var modelPrices = map[string]modelPrice{
 	"deepseek-v4-flash": {cacheHitPer1M: 0.0028, cacheMissPer1M: 0.14, completionPer1M: 0.28},
 	"deepseek-v4-pro":   {cacheHitPer1M: 0.003625, cacheMissPer1M: 0.435, completionPer1M: 0.87},
+	"kimi-k2.6":         {cacheHitPer1M: 0.16, cacheMissPer1M: 0.95, completionPer1M: 4.00},
 }
 
 // CostUSD 按模型三段单价计算单次调用成本。

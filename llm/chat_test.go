@@ -215,12 +215,14 @@ func TestChatKimiK26UsesStrictToolSchema(t *testing.T) {
 		Model:         "kimi-k2.6",
 		MaxConcurrent: 1,
 	})
+	legacyTemp := float32(0.3)
 	resp, err := c.Chat(context.Background(), ChatRequest{
 		Messages: []ChatMessage{{Role: "user", Content: "create it"}},
 		Tools: []ToolDef{{
 			Name:       "create_schedule",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"],"additionalProperties":false}`),
 		}},
+		Temperature:     &legacyTemp,
 		DisableThinking: true,
 	})
 	if err != nil {
@@ -241,6 +243,10 @@ func TestChatKimiK26UsesStrictToolSchema(t *testing.T) {
 	thinking, _ := gotBody["thinking"].(map[string]any)
 	if thinking["type"] != "disabled" {
 		t.Fatalf("Kimi K2.6 should disable thinking for deterministic FC, got %v", gotBody["thinking"])
+	}
+	if _, present := gotBody["temperature"]; present {
+		t.Fatalf("Kimi K2.6 has a provider-fixed temperature; client must omit caller value, got %v",
+			gotBody["temperature"])
 	}
 }
 
