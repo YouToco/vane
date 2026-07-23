@@ -30,6 +30,7 @@ const fallbackContextWindowTokens = 64_000
 var modelContextWindows = map[string]int{
 	"deepseek-v4-flash": 1_000_000,
 	"deepseek-v4-pro":   1_000_000,
+	"kimi-k2.6":         256_000,
 }
 
 // ────────── 由窗口推导「单次可内联多少字符」──────────

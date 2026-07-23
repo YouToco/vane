@@ -66,6 +66,12 @@ type LLMConfig struct {
 	// APIKey 环境变量 VANE_LLM_API_KEY。
 	APIKey string `mapstructure:"api_key"`
 	Model  string `mapstructure:"model"`
+	// AgentProvider/AgentBaseURL/AgentAPIKey 是可选的 Agent 专用路由。三者均为空时，
+	// Agent 继承主路由；只要设置任意一项就必须三项齐全，避免把主路由凭证误发到
+	// 另一家供应商。AgentAPIKey 环境变量 VANE_LLM_AGENT_API_KEY。
+	AgentProvider string `mapstructure:"agent_provider"`
+	AgentBaseURL  string `mapstructure:"agent_base_url"`
+	AgentAPIKey   string `mapstructure:"agent_api_key"`
 	// AgentModel 是 agent loop（function calling）使用的模型，与 Model
 	//（摘要/评分等高频便宜档）分离：FC 多轮决策的质量依赖高档模型
 	//（v4-pro 实测 60/60 全过，M4 事实基准），成本按调用面分账。
@@ -185,6 +191,7 @@ type A2AConfig struct {
 var sensitiveKeys = []string{
 	"db.url",
 	"llm.api_key",
+	"llm.agent_api_key",
 	"fetch.tikhub_api_key",
 	"fetch.exa_api_key",
 	"dashboard.password",
@@ -246,6 +253,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("llm.base_url", "https://api.deepseek.com")
 	// deepseek-chat/deepseek-reasoner 为旧别名，2026-07-24 起废弃；默认用便宜档 v4-flash。
 	v.SetDefault("llm.model", "deepseek-v4-flash")
+	v.SetDefault("llm.agent_provider", "")
+	v.SetDefault("llm.agent_base_url", "")
 	v.SetDefault("llm.agent_model", "deepseek-v4-pro")
 	// max_concurrent 32：真实 API 受控实验定的值（2026-07-18），不是拍脑袋。
 	// 45 条批次（生产实测批次规模）在并发 5 下 5.7 秒、并发 32 下 1.25 秒，零错误零 429。
@@ -362,6 +371,9 @@ func (c *Config) Validate() error {
 	if c.DB.URL == "" {
 		return errors.New("config: db.url 必填（可通过环境变量 VANE_DB_URL 设置）")
 	}
+	if _, err := c.LLM.AgentClientConfig(); err != nil {
+		return err
+	}
 	if c.LLM.CompiledEndpointGeneration == 0 {
 		c.LLM.CompiledEndpointGeneration = 1
 	}
@@ -382,4 +394,26 @@ func (c *Config) Validate() error {
 		return errors.New("config: fetch compiled credential generation 必须为正数")
 	}
 	return nil
+}
+
+// AgentClientConfig 返回 Agent/DeepDive/A2A 质量档使用的独立客户端配置。
+// 旧配置零迁移：没有显式 Agent 路由时沿用主 endpoint/key，只覆盖模型。
+func (c LLMConfig) AgentClientConfig() (LLMConfig, error) {
+	provider := strings.TrimSpace(c.AgentProvider)
+	baseURL := strings.TrimSpace(c.AgentBaseURL)
+	dedicated := provider != "" || baseURL != "" || c.AgentAPIKey != ""
+	if dedicated && (provider == "" || baseURL == "" || c.AgentAPIKey == "") {
+		return LLMConfig{}, errors.New(
+			"config: llm.agent_provider、llm.agent_base_url、llm.agent_api_key 必须同时设置",
+		)
+	}
+
+	agent := c
+	agent.Model = c.AgentModel
+	if dedicated {
+		agent.Provider = provider
+		agent.BaseURL = baseURL
+		agent.APIKey = c.AgentAPIKey
+	}
+	return agent, nil
 }

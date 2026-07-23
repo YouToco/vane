@@ -67,6 +67,10 @@ llm:
   base_url: "https://api.openai.com"
   api_key: "yaml-llm-key"
   model: "gpt-x"
+  agent_provider: "kimi"
+  agent_base_url: "https://api.moonshot.cn/v1"
+  agent_api_key: "yaml-agent-key"
+  agent_model: "kimi-k2.6"
   max_concurrent: 9
   compiled_endpoint_generation: 2
   compiled_credential_generation: 6
@@ -106,6 +110,10 @@ log:
 		{"llm.base_url", cfg.LLM.BaseURL, "https://api.openai.com"},
 		{"llm.api_key", cfg.LLM.APIKey, "yaml-llm-key"},
 		{"llm.model", cfg.LLM.Model, "gpt-x"},
+		{"llm.agent_provider", cfg.LLM.AgentProvider, "kimi"},
+		{"llm.agent_base_url", cfg.LLM.AgentBaseURL, "https://api.moonshot.cn/v1"},
+		{"llm.agent_api_key", cfg.LLM.AgentAPIKey, "yaml-agent-key"},
+		{"llm.agent_model", cfg.LLM.AgentModel, "kimi-k2.6"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 9},
 		{"llm.compiled_endpoint_generation", cfg.LLM.CompiledEndpointGeneration, int64(2)},
 		{"llm.compiled_credential_generation", cfg.LLM.CompiledCredentialGeneration, int64(6)},
@@ -148,6 +156,10 @@ log:
 
 	t.Setenv("VANE_DB_URL", "postgres://from-env")
 	t.Setenv("VANE_LLM_API_KEY", "env-key")
+	t.Setenv("VANE_LLM_AGENT_PROVIDER", "kimi")
+	t.Setenv("VANE_LLM_AGENT_BASE_URL", "https://api.moonshot.cn/v1")
+	t.Setenv("VANE_LLM_AGENT_API_KEY", "env-agent-key")
+	t.Setenv("VANE_LLM_AGENT_MODEL", "kimi-k2.6")
 	t.Setenv("VANE_LLM_COMPILED_ENDPOINT_GENERATION", "11")
 	t.Setenv("VANE_LLM_COMPILED_CREDENTIAL_GENERATION", "13")
 	t.Setenv("VANE_FETCH_TIKHUB_API_KEY", "env-tikhub-key")
@@ -170,6 +182,10 @@ log:
 	}{
 		{"db.url", cfg.DB.URL, "postgres://from-env"},
 		{"llm.api_key", cfg.LLM.APIKey, "env-key"},
+		{"llm.agent_provider", cfg.LLM.AgentProvider, "kimi"},
+		{"llm.agent_base_url", cfg.LLM.AgentBaseURL, "https://api.moonshot.cn/v1"},
+		{"llm.agent_api_key", cfg.LLM.AgentAPIKey, "env-agent-key"},
+		{"llm.agent_model", cfg.LLM.AgentModel, "kimi-k2.6"},
 		{"llm.compiled_endpoint_generation", cfg.LLM.CompiledEndpointGeneration, int64(11)},
 		{"llm.compiled_credential_generation", cfg.LLM.CompiledCredentialGeneration, int64(13)},
 		{"fetch.tikhub_api_key", cfg.Fetch.TikhubAPIKey, "env-tikhub-key"},
@@ -267,6 +283,8 @@ func TestDefaults(t *testing.T) {
 		{"llm.provider", cfg.LLM.Provider, "deepseek"},
 		{"llm.base_url", cfg.LLM.BaseURL, "https://api.deepseek.com"},
 		{"llm.model", cfg.LLM.Model, "deepseek-v4-flash"},
+		{"llm.agent_provider", cfg.LLM.AgentProvider, ""},
+		{"llm.agent_base_url", cfg.LLM.AgentBaseURL, ""},
 		{"llm.agent_model", cfg.LLM.AgentModel, "deepseek-v4-pro"},
 		{"llm.max_concurrent", cfg.LLM.MaxConcurrent, 32},
 		{"llm.compiled_endpoint_generation", cfg.LLM.CompiledEndpointGeneration, int64(1)},
@@ -288,6 +306,53 @@ func TestDefaults(t *testing.T) {
 			t.Errorf("%s = %v, 期望默认值 %v", c.name, c.got, c.want)
 		}
 	}
+}
+
+func TestLLMConfigAgentClientConfig(t *testing.T) {
+	primary := LLMConfig{
+		Provider:      "deepseek",
+		BaseURL:       "https://api.deepseek.com",
+		APIKey:        "deepseek-key",
+		Model:         "deepseek-v4-flash",
+		AgentModel:    "deepseek-v4-pro",
+		MaxConcurrent: 32,
+	}
+
+	t.Run("legacy route inherits primary endpoint and key", func(t *testing.T) {
+		got, err := primary.AgentClientConfig()
+		if err != nil {
+			t.Fatalf("AgentClientConfig() error = %v", err)
+		}
+		if got.Provider != "deepseek" || got.BaseURL != "https://api.deepseek.com" ||
+			got.APIKey != "deepseek-key" || got.Model != "deepseek-v4-pro" {
+			t.Fatalf("legacy agent route = %+v", got)
+		}
+	})
+
+	t.Run("dedicated route does not reuse primary credential", func(t *testing.T) {
+		cfg := primary
+		cfg.AgentProvider = "kimi"
+		cfg.AgentBaseURL = "https://api.moonshot.cn/v1"
+		cfg.AgentAPIKey = "kimi-key"
+		cfg.AgentModel = "kimi-k2.6"
+
+		got, err := cfg.AgentClientConfig()
+		if err != nil {
+			t.Fatalf("AgentClientConfig() error = %v", err)
+		}
+		if got.Provider != "kimi" || got.BaseURL != "https://api.moonshot.cn/v1" ||
+			got.APIKey != "kimi-key" || got.Model != "kimi-k2.6" {
+			t.Fatalf("dedicated agent route = %+v", got)
+		}
+	})
+
+	t.Run("partial dedicated route fails closed", func(t *testing.T) {
+		cfg := primary
+		cfg.AgentProvider = "kimi"
+		if _, err := cfg.AgentClientConfig(); err == nil {
+			t.Fatal("partial agent route should be rejected")
+		}
+	})
 }
 
 func TestValidate_NormalizesPlaybookPromptCanaryScheduleID(t *testing.T) {
