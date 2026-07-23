@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -485,10 +486,20 @@ func (t *addSourceTool) Summarize(args json.RawMessage) string {
 const removeSourceSchema = `{
   "type": "object",
   "properties": {
-    "source_id": {"type": "integer", "description": "要取消订阅的信源 id（可先用 list_sources 查询）"}
+    "source_ids": {
+      "type": "array",
+      "items": {"type": "integer"},
+      "minItems": 1,
+      "maxItems": 20,
+      "description": "要取消订阅的信源 id 列表，一次最多 20 个（可先用 list_sources 查询）。用户一次要求退订多个时必须放进同一次调用，会合成一张确认卡一次确认。"
+    }
   },
-  "required": ["source_id"]
+  "required": ["source_ids"]
 }`
+
+// removeSourceBatchMax 与 schema maxItems 保持一致：确认卡摘要要完整列出每个
+// id，无上限会让卡片文案和单次事务规模都失控。
+const removeSourceBatchMax = 20
 
 type removeSourceTool struct {
 	st *store.Store
@@ -496,34 +507,103 @@ type removeSourceTool struct {
 
 func (t *removeSourceTool) Name() string { return "remove_source" }
 func (t *removeSourceTool) Description() string {
-	return "取消订阅指定信源（信源本身与历史内容保留）。source_id 可先用 list_sources 查询。"
+	return "取消订阅一个或多个信源（信源本身与历史内容保留）。source_ids 可先用 list_sources 查询；批量退订放同一次调用，一张确认卡一次确认。"
 }
 func (t *removeSourceTool) Parameters() json.RawMessage { return json.RawMessage(removeSourceSchema) }
 func (t *removeSourceTool) Mutating() bool              { return true }
 
+// removeSourceIDs 解析并规范化入参：schema 只声明 source_ids，但仍接受旧的
+// 单数 source_id——pending_actions 里可能有部署前落库、24h 内被点击的存量行，
+// 换 schema 不能让已发出的确认卡变成废卡。去重保序，全量校验后才动手。
+// malformed 区分「JSON 本身坏」与「能解析但校验不过」：前者卡面只能走兜底，
+// 后者要把 errText 原样上卡，用户在确认前就能看到这张卡不会执行。
+func removeSourceIDs(args json.RawMessage) (ids []int64, errText string, malformed bool) {
+	var a struct {
+		SourceID  int64   `json:"source_id"`
+		SourceIDs []int64 `json:"source_ids"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, "source_ids 必须是正整数数组", true
+	}
+	in := a.SourceIDs
+	if len(in) == 0 && a.SourceID > 0 {
+		in = []int64{a.SourceID}
+	}
+	if len(in) == 0 {
+		return nil, "source_ids 必须是非空的正整数数组", false
+	}
+	if len(in) > removeSourceBatchMax {
+		return nil, fmt.Sprintf("一次最多退订 %d 个信源", removeSourceBatchMax), false
+	}
+	seen := make(map[int64]bool, len(in))
+	out := make([]int64, 0, len(in))
+	for _, id := range in {
+		if id <= 0 {
+			return nil, "source_ids 必须是正整数数组", false
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out, "", false
+}
+
+func joinSourceIDs(ids []int64) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.FormatInt(id, 10)
+	}
+	return strings.Join(parts, "、")
+}
+
 // Execute 复用 store.RemoveSubscription：按 (user_id, source_id) 删行，天然只能
 // 删自己的订阅，无需再校验信源归属；删不存在的订阅静默成功（与 API 幂等语义一致）。
+// 批量逐个删，中途失败如实报告已删部分——删除幂等，用户重新发起不会产生新副作用。
 func (t *removeSourceTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
-	var a struct {
-		SourceID int64 `json:"source_id"`
+	ids, errText, _ := removeSourceIDs(args)
+	if errText != "" {
+		return errText, nil
 	}
-	if err := json.Unmarshal(args, &a); err != nil || a.SourceID <= 0 {
-		return "source_id 必须是正整数", nil
+	return removeSourcesSequentially(ctx, ids, func(ctx context.Context, id int64) error {
+		return t.st.RemoveSubscription(ctx, userID, id)
+	})
+}
+
+// removeSourcesSequentially 抽出批量循环便于单测（工具持具体 *store.Store 不可
+// fake）。中途失败必须用**最外层** AppError 携带已删部分——feishu 卡片文案与
+// 会话回调都只取 errors.As 命中的 AppError.Message，fmt.Errorf 包装文本到不了
+// 用户面前，"如实报告已删部分"的承诺会变成只写日志的死话。
+func removeSourcesSequentially(
+	ctx context.Context, ids []int64, remove func(context.Context, int64) error,
+) (string, error) {
+	for i, id := range ids {
+		if err := remove(ctx, id); err != nil {
+			if i > 0 {
+				return "", types.NewAppError(types.CodeDatabase, fmt.Sprintf(
+					"已取消订阅信源（id=%s），但退订 id=%d 失败，其余未处理",
+					joinSourceIDs(ids[:i]), id), err)
+			}
+			return "", err
+		}
 	}
-	if err := t.st.RemoveSubscription(ctx, userID, a.SourceID); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("已取消订阅信源（id=%d），信源与历史内容保留。", a.SourceID), nil
+	return fmt.Sprintf("已取消订阅信源（id=%s），信源与历史内容保留。", joinSourceIDs(ids)), nil
 }
 
 func (t *removeSourceTool) Summarize(args json.RawMessage) string {
-	var a struct {
-		SourceID int64 `json:"source_id"`
-	}
-	if err := json.Unmarshal(args, &a); err != nil {
+	ids, errText, malformed := removeSourceIDs(args)
+	if malformed {
 		return summarizeFallback("取消订阅信源", args)
 	}
-	return fmt.Sprintf("取消订阅信源（id=%d）", a.SourceID)
+	if errText != "" {
+		// 能解析但校验不过：卡面必须诚实——这张卡点确认也不会执行。
+		return fmt.Sprintf("取消订阅信源（参数无效：%s；确认后也不会执行）", errText)
+	}
+	if len(ids) == 1 {
+		return fmt.Sprintf("取消订阅信源（id=%d）", ids[0])
+	}
+	return fmt.Sprintf("取消订阅 %d 个信源（id=%s）", len(ids), joinSourceIDs(ids))
 }
 
 const enableSourceSchema = `{
