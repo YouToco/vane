@@ -50,6 +50,16 @@ function clipDetail(s: string, max = 120): string {
   return runes.length <= max ? s : runes.slice(0, max).join("") + "…";
 }
 
+function safeExternalHref(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 // 投递记录表：推送历史页（全局）与任务详情页（单任务）共用同一渲染与三态逻辑，
 // 差异只在取数函数与空态文案。加载失败与空数据是两种状态（vane-web#18 教训），
 // 这里分别渲染，绝不把错误吞成空表。
@@ -166,73 +176,76 @@ export default function DeliveriesTable({
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {items.map((it) => (
-                  <TableRow
-                    key={it.id}
-                    className={it.status === "failed" ? "bg-destructive/5" : ""}
-                  >
-                    <TableCell
-                      className="text-sm whitespace-nowrap"
-                      title={`delivery ${it.id} · batch ${it.batch_id}`}
+                {items.map((it) => {
+                  const href = safeExternalHref(it.url);
+                  return (
+                    <TableRow
+                      key={it.id}
+                      className={it.status === "failed" ? "bg-destructive/5" : ""}
                     >
-                      {fmtBeijing(it.sent_at ?? it.created_at)}
-                    </TableCell>
-                    <TableCell className="max-w-[200px] truncate">
-                      {it.url ? (
-                        <a
-                          href={it.url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex items-center gap-1 text-primary hover:underline"
-                        >
-                          {it.title || H.noContent}
-                          <ExternalLink className="size-3 shrink-0" />
-                        </a>
-                      ) : (
-                        <span className="text-muted-foreground">
-                          {it.title || H.contentDeleted}
-                        </span>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-sm">
-                      {it.score}
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={statusBadge(it.status)}>{it.status}</Badge>
-                    </TableCell>
-                    <TableCell>
-                      {it.feedbacks.length === 0 ? (
-                        <span className="text-muted-foreground">—</span>
-                      ) : (
-                        <div className="flex flex-wrap gap-1">
-                          {it.feedbacks.map((fb, i) => {
-                            const meta = FEEDBACK_META[fb.action];
-                            const tooltipText =
-                              fmtBeijing(fb.created_at) +
-                              (fb.detail ? ` · ${clipDetail(fb.detail)}` : "");
-                            return (
-                              <Tooltip key={i}>
-                                <TooltipTrigger render={<span />}>
-                                  <Badge variant={meta?.variant ?? "secondary"}>
-                                    {meta?.label ?? fb.action}
-                                    {meta?.showDetail && fb.detail && (
-                                      <span className="ml-1 opacity-75">
-                                        {clipDetail(fb.detail, 30)}
-                                      </span>
-                                    )}
-                                  </Badge>
-                                </TooltipTrigger>
-                                <TooltipContent>
-                                  <p className="max-w-xs">{tooltipText}</p>
-                                </TooltipContent>
-                              </Tooltip>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </TableCell>
-                  </TableRow>
-                ))}
+                      <TableCell
+                        className="text-sm whitespace-nowrap"
+                        title={`delivery ${it.id} · batch ${it.batch_id}`}
+                      >
+                        {fmtBeijing(it.sent_at ?? it.created_at)}
+                      </TableCell>
+                      <TableCell className="max-w-[200px] truncate">
+                        {href ? (
+                          <a
+                            href={href}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1 text-primary hover:underline"
+                          >
+                            {it.title || H.noContent}
+                            <ExternalLink className="size-3 shrink-0" />
+                          </a>
+                        ) : (
+                          <span className="text-muted-foreground">
+                            {it.title || H.contentDeleted}
+                          </span>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-sm">
+                        {it.score}
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant={statusBadge(it.status)}>{it.status}</Badge>
+                      </TableCell>
+                      <TableCell>
+                        {it.feedbacks.length === 0 ? (
+                          <span className="text-muted-foreground">—</span>
+                        ) : (
+                          <div className="flex flex-wrap gap-1">
+                            {it.feedbacks.map((fb, i) => {
+                              const meta = FEEDBACK_META[fb.action];
+                              const tooltipText =
+                                fmtBeijing(fb.created_at) +
+                                (fb.detail ? ` · ${clipDetail(fb.detail)}` : "");
+                              return (
+                                <Tooltip key={i}>
+                                  <TooltipTrigger render={<span />}>
+                                    <Badge variant={meta?.variant ?? "secondary"}>
+                                      {meta?.label ?? fb.action}
+                                      {meta?.showDetail && fb.detail && (
+                                        <span className="ml-1 opacity-75">
+                                          {clipDetail(fb.detail, 30)}
+                                        </span>
+                                      )}
+                                    </Badge>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    <p className="max-w-xs">{tooltipText}</p>
+                                  </TooltipContent>
+                                </Tooltip>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           </div>
