@@ -815,6 +815,97 @@ func TestHandleMessage_ExternalReadIsolatesWholeToolCallBatch(t *testing.T) {
 	}
 }
 
+func TestHandleMessage_ExternalReadProtocolFailureReturnsHonestRecovery(t *testing.T) {
+	fs := newFakeStore()
+	search := &fakeTool{
+		name:      "web_search",
+		untrusted: true,
+		result:    "OpenAI、Anthropic、Google 官方候选信源",
+	}
+	var requests []llm.ChatRequest
+	call := 0
+	chat := func(_ context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+		requests = append(requests, req)
+		call++
+		if call == 1 {
+			return &llm.ChatResponse{
+				ToolCalls: []llm.ToolCall{
+					{
+						ID:        "openai-only",
+						Name:      "web_search",
+						Arguments: `{"query":"OpenAI official model news"}`,
+					},
+					{
+						ID:        "anthropic-only",
+						Name:      "web_search",
+						Arguments: `{"query":"Anthropic official model news"}`,
+					},
+					{
+						ID:        "google-only",
+						Name:      "web_search",
+						Arguments: `{"query":"Google official model news"}`,
+					},
+				},
+				FinishReason: "tool_calls",
+			}, nil
+		}
+		if call == 2 {
+			return &llm.ChatResponse{
+				ToolCalls: []llm.ToolCall{{
+					ID:        "discover",
+					Name:      "web_search",
+					Arguments: `{"query":"OpenAI Anthropic Google official model news"}`,
+				}},
+				FinishReason: "tool_calls",
+			}, nil
+		}
+		return nil, fmt.Errorf("fake provider leak: %w", llm.ErrToolProtocolResponse)
+	}
+	l := newTestLoop(t, fs, chat, search)
+
+	out, err := l.HandleMessage(context.Background(), 7,
+		"每周整理 OpenAI、Anthropic 和 Google 的重要模型动态")
+	if err != nil {
+		t.Fatalf("classified protocol failure after external read must recover: %v", err)
+	}
+	if out.Reply != replyExternalProtocolFailure || out.Confirm != nil {
+		t.Fatalf("recovery outcome = %+v, want honest no-write reply", out)
+	}
+	if len(search.calls) != 1 || len(fs.actions) != 0 {
+		t.Fatalf("external discovery should run once with no pending action: search=%d actions=%d",
+			len(search.calls), len(fs.actions))
+	}
+	if len(requests) != 3 || len(requests[2].Tools) != 0 {
+		t.Fatalf("isolated recovery request must be tool-free: %+v", requests)
+	}
+	system := requests[0].Messages[0].Content
+	if !strings.Contains(system, "每条用户消息最多成功执行一次外部读取") ||
+		!strings.Contains(system, "合并成一次 web_search") {
+		t.Fatalf("external discovery budget is absent from system guidance: %q", system)
+	}
+	batchReplies := 0
+	for _, msg := range requests[1].Messages {
+		if msg.Role != "tool" {
+			continue
+		}
+		batchReplies++
+		if msg.Content != toolMsgExternalBatch ||
+			!strings.Contains(msg.Content, "合并成一次 web_search") {
+			t.Fatalf("batch rejection did not provide a single-query recovery path: %+v", msg)
+		}
+	}
+	if batchReplies != 3 {
+		t.Fatalf("all three rejected searches need protocol replies, got %d", batchReplies)
+	}
+
+	persisted := persistedMessages(t, fs)
+	raw, _ := json.Marshal(persisted)
+	if !strings.Contains(string(raw), untrustedHistoryPlaceholder) ||
+		strings.Contains(string(raw), replyExternalProtocolFailure) {
+		t.Fatalf("external result turn must remain compacted after recovery: %s", raw)
+	}
+}
+
 // 飞书追问/引用正文在第一次模型请求前就已进入上下文；安全边界不能等到
 // read_page 执行后才生效。脚本模型故意在首轮直接幻觉三类调用，运行时仍须挡住。
 func TestHandleExternalContextMessage_BlocksToolsAndProfileFromFirstRequest(t *testing.T) {
@@ -1198,6 +1289,49 @@ func TestHandleMessage_MutatingToolConfirmCard(t *testing.T) {
 	// 出确认卡路径同样要持久化会话（契约 §7）。
 	if fs.updateCalls != 1 {
 		t.Fatalf("确认卡路径应持久化会话 1 次, 实得 %d", fs.updateCalls)
+	}
+}
+
+func TestHandleMessage_MutatingToolProtocolFailureStillReturnsConfirmCard(t *testing.T) {
+	fs := newFakeStore()
+	addTool := &fakeTool{name: "add_source", mutating: true}
+	call := 0
+	chat := func(_ context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+		call++
+		if call == 1 {
+			return &llm.ChatResponse{
+				ToolCalls: []llm.ToolCall{{
+					ID:        "pending-add",
+					Name:      "add_source",
+					Arguments: `{"type":"rss","url":"https://example.com/feed"}`,
+				}},
+				FinishReason: "tool_calls",
+			}, nil
+		}
+		if len(req.Tools) != 0 {
+			return nil, errors.New("finalizer unexpectedly retained tools")
+		}
+		return nil, fmt.Errorf("fake provider leak: %w", llm.ErrToolProtocolResponse)
+	}
+	l := newTestLoop(t, fs, chat, addTool)
+
+	out, err := l.HandleMessage(context.Background(), 7, "订阅这个 RSS")
+	if err != nil {
+		t.Fatalf("pending action must survive classified finalizer failure: %v", err)
+	}
+	if out.Confirm == nil || out.Reply != replyPendingProtocolFailure {
+		t.Fatalf("pending recovery outcome = %+v", out)
+	}
+	if len(fs.actions) != 1 {
+		t.Fatalf("pending action was lost or duplicated: %d", len(fs.actions))
+	}
+	if _, ok := fs.actions[out.Confirm.ActionID]; !ok {
+		t.Fatalf("returned confirmation action %q is not durable", out.Confirm.ActionID)
+	}
+	persisted := persistedMessages(t, fs)
+	raw, _ := json.Marshal(persisted)
+	if !strings.Contains(string(raw), replyPendingProtocolFailure) {
+		t.Fatalf("session did not record the deterministic pending fact: %s", raw)
 	}
 }
 

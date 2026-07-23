@@ -1,8 +1,42 @@
 package llm
 
-import "strings"
+import (
+	"errors"
+	"strings"
 
-const dsmlSafeContent = "请查看当前会话中的最新状态。"
+	"github.com/YouToco/vane/types"
+)
+
+const dsmlSafeContent = "模型返回了无法安全解析的内部协议；原文已移除，且没有据此执行任何操作。"
+
+// ErrToolProtocolResponse classifies an upstream response that exposed an
+// internal tool protocol instead of returning a valid native tool call or
+// ordinary assistant content. Callers may recover only from durable state they
+// already own; they must never parse or execute the leaked text.
+var ErrToolProtocolResponse = errors.New("llm: unsafe tool protocol response")
+
+type toolProtocolResponseError struct {
+	app *types.AppError
+}
+
+func (e *toolProtocolResponseError) Error() string {
+	return e.app.Error()
+}
+
+func (e *toolProtocolResponseError) Unwrap() error {
+	return e.app
+}
+
+func (e *toolProtocolResponseError) Is(target error) bool {
+	return target == ErrToolProtocolResponse
+}
+
+func newToolProtocolResponseError() error {
+	app := types.NewAppError(types.CodeLLMUnavailable,
+		"llm: 上游工具调用格式异常", nil)
+	app.Retryable = false
+	return &toolProtocolResponseError{app: app}
+}
 
 // containsLeakedDSMLToolCalls recognizes DeepSeek V4's internal tool-call
 // protocol markers. It deliberately does not parse the envelope: model text

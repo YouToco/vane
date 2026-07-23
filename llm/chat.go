@@ -280,10 +280,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 			"native_tool_calls", len(toolCalls))
 		resp.Content = ""
 		resp.ToolCalls = nil
-		protocolErr := types.NewAppError(types.CodeLLMUnavailable,
-			"llm: 上游工具调用格式异常", nil)
-		protocolErr.Retryable = false
-		return resp, protocolErr
+		return resp, newToolProtocolResponseError()
 	}
 	// DeepSeek V4 DSML in message.content is an upstream protocol leak,
 	// including mixed native+DSML responses. Never promote or preserve it.
@@ -295,17 +292,10 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 			"native_tool_calls", len(toolCalls))
 		resp.Content = ""
 		resp.ToolCalls = nil
-		if len(req.Tools) > 0 || len(toolCalls) > 0 {
-			protocolErr := types.NewAppError(types.CodeLLMUnavailable,
-				"llm: 上游工具调用格式异常", nil)
-			protocolErr.Retryable = false
-			return resp, protocolErr
-		}
-		// Tool-free calls include the post-pending finalizer. Returning an error
-		// there would orphan an already-created confirmation card, so provide a
-		// neutral fixed display string while still removing all protocol text.
-		resp.Content = dsmlSafeContent
-		return resp, nil
+		// Tool-free does not imply that a pending action exists. The llm package
+		// cannot infer product state, so every leak is a classified failure.
+		// Agent callers may recover only from durable state they already own.
+		return resp, newToolProtocolResponseError()
 	}
 
 	// FC 场景下"空 content + 有 tool_calls"是正常形态；两者皆空才是隐性故障
