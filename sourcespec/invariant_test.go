@@ -85,6 +85,16 @@ func TestInvariant_FetchAffectingParamsChangeIdempotencyKey(t *testing.T) {
 			base:    map[string]string{"user_id": "aaa"},
 			variant: map[string]string{"user_id": "bbb"},
 		},
+		{
+			name: "weibo/user_posts 的 uid", platform: "weibo", cap: "user_posts",
+			base:    map[string]string{"uid": "2803301701"},
+			variant: map[string]string{"uid": "1111681197"},
+		},
+		{
+			name: "wechat_mp/user_posts 的 username", platform: "wechat_mp", cap: "user_posts",
+			base:    map[string]string{"username": "gh_363b924965e9"},
+			variant: map[string]string{"username": "gh_aaaaaaaaaaaa"},
+		},
 	}
 
 	for _, tc := range cases {

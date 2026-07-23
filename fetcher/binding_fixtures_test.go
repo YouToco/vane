@@ -256,3 +256,125 @@ const sampleFavedNotesResponse = `{
   }
  }
 }`
+
+// sampleWeiboUserPostsResponse 取自 2026-07-23 真实响应（uid=2803301701 原创条 +
+// uid=1111681197 转发条各一，逐字段保真、正文截短）：created_at 是 Twitter 同款
+// ruby_date（+0800）、身份槽 mblogid、转发内层 retweeted_status 结构完整。
+const sampleWeiboUserPostsResponse = `{
+ "code": 200,
+ "data": {
+  "data": {
+   "since_id": "5323757757404027kp2",
+   "list": [
+    {
+     "created_at": "Thu Jul 23 17:55:27 +0800 2026",
+     "id": 5323901641166101,
+     "idstr": "5323901641166101",
+     "mid": "5323901641166101",
+     "mblogid": "Ra1N24Tm5",
+     "user": {"id": 2803301701, "idstr": "2803301701", "screen_name": "人民日报"},
+     "text_raw": "#AI时代如何找到自身竞争力#【朱松纯：#最大的安稳是你的能力#】面对快速迭代发展的AI，年轻人要如何找到自己的核心竞争力？",
+     "text": "<a href=\"//s.weibo.com\">#AI时代如何找到自身竞争力#</a>【朱松纯…】",
+     "isLongText": false,
+     "reposts_count": 25
+    },
+    {
+     "created_at": "Thu Jul 23 10:32:43 +0800 2026",
+     "idstr": "5323790223672211",
+     "mblogid": "R9YTkfpjd",
+     "user": {"idstr": "1111681197", "screen_name": "来去之间"},
+     "text_raw": "转发微博",
+     "retweeted_status": {
+      "created_at": "Thu Jul 23 09:10:49 +0800 2026",
+      "idstr": "5323769612862517",
+      "mblogid": "R9Ym5c0FD",
+      "user": {"idstr": "3513171522", "screen_name": "Navis-慢点评测"},
+      "text_raw": "#特斯拉二季度业绩# 以价换量开始？ 交付和营收超出预期，利润率下跌，自由现金流甚至是负数。",
+      "isLongText": true,
+      "continue_tag": {"title": "全文"}
+     }
+    }
+   ],
+   "total": 151185
+  },
+  "ok": 1
+ }
+}`
+
+// sampleWeiboHotSearchResponse 取自 2026-07-23 真实响应（裁剪 3 条，含 1 条广告位）：
+// 正常条目**没有 is_ad 键**、有 realpos；广告条目 is_ad=1 且无 realpos（实测 1/51）。
+// 条目无时间戳、无 id（id 仅广告条目有），热搜词 word 即身份。
+const sampleWeiboHotSearchResponse = `{
+ "code": 200,
+ "data": {
+  "realtime": [
+   {
+    "realpos": 1,
+    "rank": 0,
+    "num": 1541843,
+    "word": "厦大回应644分考生误报分校",
+    "word_scheme": "#厦大回应644分考生误报分校#",
+    "label_name": "新",
+    "topic_flag": 1
+   },
+   {
+    "is_ad": 1,
+    "topic_ad": 1,
+    "id": 348199,
+    "rank": 5,
+    "num": 366561,
+    "word": "云南白药官宣周深双身份"
+   },
+   {
+    "realpos": 2,
+    "rank": 1,
+    "num": 1057431,
+    "word": "滔搏卖爆了",
+    "word_scheme": "#滔搏卖爆了#",
+    "label_name": "新",
+    "topic_flag": 1
+   }
+  ],
+  "hotgovs": []
+ }
+}`
+
+// sampleWechatArticlesResponse 取自 2026-07-23 真实响应（gh_363b924965e9，raw=false
+// 精简结构，裁剪 2 条）：digest 实测恒空（正文退回标题）、create_time 秒、
+// url 含每次抓取会变的 chksm 参数（故身份是 app_msg_id_idx 复合键而非 URL）。
+const sampleWechatArticlesResponse = `{
+ "code": 200,
+ "data": {
+  "biz_username": "gh_363b924965e9",
+  "is_end": 0,
+  "count": 2,
+  "next_offset": "WABgAGiBuKq87+fTsGpwAA==",
+  "articles": [
+   {
+    "app_msg_id": 2667023086,
+    "msg_type": 9,
+    "idx": 1,
+    "title": "“钩针男孩”，火了！",
+    "digest": "",
+    "url": "http://mp.weixin.qq.com/s?__biz=MjM5MjAxNDM4MA==&mid=2667023086&idx=1&sn=d2ca9c5f4c79905dcef8c676240e8c07&chksm=bc3fa8ed",
+    "source_url": "https://www.peopleapp.com/home",
+    "create_time": 1784799536,
+    "update_time": 1784800328,
+    "item_show_type": 0
+   },
+   {
+    "app_msg_id": 2667023067,
+    "msg_type": 9,
+    "idx": 1,
+    "title": "中纪委连打三“虎”！",
+    "digest": "",
+    "url": "http://mp.weixin.qq.com/s?__biz=MjM5MjAxNDM4MA==&mid=2667023067&idx=1&sn=94ec2ba97abe7c21631d950fd65c12c6&chksm=bc0aed4e",
+    "source_url": "",
+    "create_time": 1784794742,
+    "update_time": 1784795536,
+    "item_show_type": 0
+   }
+  ],
+  "pages": 1
+ }
+}`

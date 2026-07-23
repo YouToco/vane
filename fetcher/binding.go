@@ -54,6 +54,13 @@ type bindingSpec struct {
 	// MaxContentBytes 正文字节上限（0=不截断）。xhs 族沿用 4000（成本护栏）；
 	// x 不截断——旧 x.go 存推文全文，长文推被截是迁移回归（对抗审查 parity-4）。
 	MaxContentBytes int
+	// TimeoutSeconds 单端点调用超时覆盖（0=用 cfg/兜底 20s）。wechat_mp 官方文档明示
+	// 「请将 timeout 设置为 30 秒；设置过小会造成已扣费但收不到响应」——按次计费面
+	// 超时即白花钱，此字段是把上游的超时契约声明进模板（契约 §1 特性清单 2026-07-23 增补）。
+	// 已知取舍：本值只能**收紧**外层 ctx、不能放宽——add_source 试跑受飞书卡片执行
+	// 预算约束（agent probeBudget=25s），wechat_mp 的 probe 实际上限 25s，超时可能已扣费
+	// （probe 话术已如实告知）；周期抓取（Fetch activity 120s）不受此限，30s 完整生效。
+	TimeoutSeconds int
 
 	Enrich *enrichSpec // 可选：付费详情补全
 }
@@ -71,7 +78,16 @@ type bindingParam struct {
 // （json.Number "200"、bool "true"——见 scalarString）。
 type envelopeCheck struct{ Path, Want string }
 
-type fieldEquals struct{ Path, Want string }
+// fieldEquals 条目过滤：默认按 Want 等值比较（字符串化口径见 scalarString）；
+// WantAbsent=true 时改为「键不存在才保留」——用 resolvePath 的 ok 位判断，
+// 不再靠「miss → ""」与 Want "" 撞相等（那无法区分「无键」与「键在但值为 0/false」）。
+// 注意 WantAbsent 语义下显式 is_ad:0 也会被过滤——按上游当前形态（正常条目**无**该键）
+// 刻意选定，夹具案例钉住；若上游改为全量显式 0/1，靠下方「全量过滤」告警可见。
+type fieldEquals struct {
+	Path       string
+	Want       string
+	WantAbsent bool
+}
 
 // verifyParam 把条目字段与 config 参数对照：字段非空且不等 → 丢弃该条
 // （xhs/user_posts 串号防御的通用化；字段为空宽容保留，靠身份兜底）。
@@ -86,8 +102,12 @@ type bindingFields struct {
 	Content []string // 路径回退链；或单元素 "tmpl:…"（占位符为条目原始字段点路径）
 	Author  []string // 路径回退链；"$键名" 表示取 config 参数（x 的 screen_name 兜底）
 
-	URLPaths    []string // 直接从条目取 URL（hot_list）；与 URLTemplate 二选一
-	URLTemplate string   // 模板：{id} 取提取后 ID（PathEscape），{author} 取提取后 Author（原样）
+	URLPaths []string // 直接从条目取 URL（hot_list）；与 URLTemplate 二选一
+	// URLTemplate 模板：{id} 取提取后 ID（PathEscape），{author} 取提取后 Author（原样）；
+	// 其余 {点路径} 占位符从条目原始字段取值（renderTemplate，2026-07-23 增补——weibo 桌面
+	// 链接需要 uid+mblogid 双段：https://weibo.com/{user.idstr}/{id}）。字段占位符不做
+	// URL 转义，只用于 id 形态的字段（数字/base62），不用于自由文本。
+	URLTemplate string
 	URLQuery    []urlQueryParam
 
 	Time       []string
@@ -306,6 +326,96 @@ var bindingTemplates = map[bindingKey]bindingSpec{
 		Kind:            types.KindArticle,
 		MaxContentBytes: tikhubMaxDescBytes,
 	},
+
+	// ── 微博 + 公众号（2026-07-23 实测准入，契约 §7 增补；1.4 信源扩展）──
+	// 身份形状对照（M6 §7.3 新平台撞击分析）：weibo 帖=mblogid（9-10 位 base62 含大小写，
+	// 如 "Ra1N24Tm5"）、weibo 热搜=中文短语、wechat_mp=app_msg_id_idx（"2667023086_1"）——
+	// 三者与既有 web(恒含 ://)/xhs(24 位小写 hex)/x(19 位十进制) 均不可逐字节相等。
+	{types.PlatformWeibo, types.CapUserPosts}: {
+		Endpoint: "weibo_web_v2_fetch_user_posts",
+		Params: []bindingParam{
+			{Key: "uid", FromConfig: "uid", Required: true},
+			// feature=0：10 条基础数据（上游文档「性能最佳」）。增量追新首页足够，
+			// 与三 xhs 能力同款「只拉首页」拍板（契约 §7 分页条款）。
+			{Key: "feature", Const: "0"},
+		},
+		Envelope:  []envelopeCheck{{Path: "code", Want: "200"}, {Path: "data.ok", Want: "1"}},
+		ItemsPath: "data.data.list",
+		// 转发拆包（x retweet 同款语义）：转发不是新内容，被转发的那条才是——
+		// ExternalID 取原帖 mblogid，同一原帖经多号转发只落一行 content_item。
+		// 刻意不设 VerifyParam：拆包后条目归属是原作者，按所订 uid 对照会把转发全丢。
+		Unwrap: []string{"retweeted_status"},
+		Fields: bindingFields{
+			ID:      []string{"mblogid"},
+			Title:   nil, // 微博无标题（x 同款）
+			Content: []string{"text_raw"}, // 纯文本；text 是 HTML，不用
+			Author:  []string{"user.screen_name"},
+			// 桌面权威链接需要 uid+mblogid 双段；{user.idstr} 是字段占位符（拆包后
+			// 指向原作者 uid，链接与内容一致）。
+			URLTemplate: "https://weibo.com/{user.idstr}/{id}",
+			Time:        []string{"created_at"},
+			TimeFormat:  tfRubyDate, // "Thu Jul 23 17:55:27 +0800 2026"，与 Twitter 同格式（实测）
+		},
+		Kind: types.KindArticle,
+		// OrderCheck 关：账号可设置置顶微博（置顶=旧帖排首位），检了必误拒——x/user_posts 同款取舍。
+		// 已知取舍：isLongText 的长文 text_raw 被上游截断（实测 人民日报 9/20 条），
+		// 本期不做详情补全（enrich 现有触发语义是「过长=被截断信号」，与「过短需补全」相反，
+		// 且微博新闻体首段即要点）；若长期打分失真再按契约 §9 立项。
+		MaxContentBytes: tikhubMaxDescBytes,
+	},
+	{types.PlatformWeibo, types.CapHotList}: {
+		Endpoint:  "weibo_web_v2_fetch_hot_search",
+		Params:    nil,                                          // 无参数：全局一份热搜榜
+		Envelope:  []envelopeCheck{{Path: "code", Want: "200"}}, // 实测响应无 data.ok 字段
+		ItemsPath: "data.realtime",
+		// 广告位过滤：实测榜单混入 is_ad=1 的商业推广条目（无 realpos）；正常条目
+		// **没有 is_ad 键**（1/51 实测）→ WantAbsent 语义「键不存在才保留」。
+		ItemFilter: &fieldEquals{Path: "is_ad", WantAbsent: true},
+		Fields: bindingFields{
+			ID:    []string{"word"}, // 榜单条目无 id 字段（实测 id 仅广告条目有），热搜词即身份
+			Title: []string{"word"},
+			// 无正文：用榜位+热度合成，给打分器上下文（xhs/hot_list 薄正文先例，契约 §7.1）。
+			Content:     []string{"tmpl:{word}（微博热搜第 {realpos} 位，热度 {num}）"},
+			URLTemplate: "https://s.weibo.com/weibo",
+			URLQuery:    []urlQueryParam{{Key: "q", FromField: "word"}},
+			// 无 Time：榜单条目无时间戳（xhs/hot_list 同形态）。
+		},
+		Kind:            types.KindArticle,
+		MaxContentBytes: tikhubMaxDescBytes,
+	},
+	{types.PlatformWechatMP, types.CapUserPosts}: {
+		Endpoint: "wechat_mp_v2_fetch_account_articles",
+		Params: []bindingParam{
+			{Key: "username", FromConfig: "username", Required: true},
+			// raw=false：精简解析结构（data.articles，snake_case）。字符串 "false" 经上游
+			// FastAPI coerce 为 bool（2026-07-23 实测 200 且 params.raw=false 回显）。
+			// 已知依赖：catalog 声明 raw 类型是 boolean，此处发 JSON 字符串依赖上游 lax
+			// coercion；上游若切 strict validation 会 422（显式 HTTP 错误走 fail_count 链，
+			// 可见非静默）——re-gen 后该端点若 422 从此查起。
+			{Key: "raw", Const: "false"},
+			// page_size/offset/item_show_type 不发送：用上游默认（20 条/首页/文章栏目）。
+		},
+		Envelope:  []envelopeCheck{{Path: "code", Want: "200"}},
+		ItemsPath: "data.articles",
+		Fields: bindingFields{
+			// 复合身份：文章 URL 含每次抓取都会变的 chksm 签名参数，不能当身份；
+			// mid(app_msg_id)+idx（一次群发多篇文章的位次）才是微信文章的稳定锚点。
+			ID:      []string{"tmpl:{app_msg_id}_{idx}"},
+			Title:   []string{"title"},
+			Content: []string{"digest", "title"}, // digest 常为空（实测 人民日报 10/10 空）→ 退回标题
+			// Author 无字段可取：响应只有 gh_ 原始 ID（在 data 层非条目层），不硬造。
+			URLPaths:   []string{"url"},
+			Time:       []string{"create_time"},
+			TimeFormat: tfUnixS,
+		},
+		Kind: types.KindArticle,
+		// OrderCheck 关：列表语义是发文历史（实测降序），但上游无排序承诺，保守不检。
+		// 已知取舍：正文=digest（常为空）；详情补全需按 URL 调 fetch_article_detail 且触发
+		// 语义与现有 enrich（过长=截断）相反，留二期（契约 §9）。
+		MaxContentBytes: tikhubMaxDescBytes,
+		// 上游文档明示：微信服务器慢，timeout 须设 30s，否则「已扣费但收不到响应」。
+		TimeoutSeconds: 30,
+	},
 }
 
 // IsBindingBacked 报告 (platform, capability) 是否由绑定引擎承载
@@ -416,6 +526,10 @@ type BindingFetcher struct {
 	rec       BindingCallRecorder
 	maxBody   int64 // 响应体上限（invoke 读 cap+1，超出即显式报错）
 	apiKeySet bool
+	// callTimeout 默认单次调用超时（cfg/兜底 20s）。invoker 的 http.Client.Timeout 只设
+	// 全模板最大值当保险丝，真正的每次调用预算由 ctx 按「模板 TimeoutSeconds 或本默认值」
+	// 控制——否则声明了 30s 的模板会被 client 级 20s 抢先掐断，超时覆盖形同虚设。
+	callTimeout time.Duration
 
 	// enrich 限速是**实例级**闸门（跨源、跨 Fetch 调用共享）：Multi 只持有一个
 	// BindingFetcher，Fetch 活动串行遍历到期源——若每次调用各自计数，源 B 的首条
@@ -436,21 +550,31 @@ func NewBinding(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorde
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
+	// client 级超时抬到「默认与全部模板覆盖值的最大者」：它只是保险丝，每次调用的
+	// 真实预算在 callAndDecode 由 ctx 控制（默认 timeout，模板声明了 TimeoutSeconds
+	// 用声明值）。不抬的话模板级 30s 声明会被 client 级 20s 抢先掐断。
+	clientTimeout := timeout
+	for _, spec := range bindingTemplates {
+		if d := time.Duration(spec.TimeoutSeconds) * time.Second; d > clientTimeout {
+			clientTimeout = d
+		}
+	}
 	maxMB := cfg.MaxResponseMB
 	if maxMB <= 0 {
 		maxMB = 5
 	}
 	maxBody := int64(maxMB) * 1024 * 1024
 	opts := append([]tikhubinvoke.Option{
-		tikhubinvoke.WithTimeout(timeout),
+		tikhubinvoke.WithTimeout(clientTimeout),
 		tikhubinvoke.WithBodyCap(maxBody),
 	}, invOpts...)
 	return &BindingFetcher{
-		inv:       tikhubinvoke.New(cfg, opts...),
-		seen:      seen,
-		rec:       rec,
-		maxBody:   maxBody,
-		apiKeySet: cfg.TikhubAPIKey != "",
+		inv:         tikhubinvoke.New(cfg, opts...),
+		seen:        seen,
+		rec:         rec,
+		maxBody:     maxBody,
+		apiKeySet:   cfg.TikhubAPIKey != "",
+		callTimeout: timeout,
 	}
 }
 
@@ -543,7 +667,7 @@ func (b *BindingFetcher) run(
 	}
 
 	root, err := b.callAndDecode(
-		ctx, entry, params, spec.Envelope, spec.MsgPath, src, beforeEffect)
+		ctx, entry, params, spec.Envelope, spec.MsgPath, src, beforeEffect, b.specTimeout(spec))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -574,8 +698,12 @@ func (b *BindingFetcher) run(
 		it := ri
 		// 条目过滤：多态流（广告位/用户卡片）不是漂移，静默跳过是正确行为。
 		if spec.ItemFilter != nil {
-			v, _ := resolvePath(it, spec.ItemFilter.Path)
-			if scalarString(v) != spec.ItemFilter.Want {
+			v, ok := resolvePath(it, spec.ItemFilter.Path)
+			keep := scalarString(v) == spec.ItemFilter.Want
+			if spec.ItemFilter.WantAbsent {
+				keep = !ok
+			}
+			if !keep {
 				filtered++
 				continue
 			}
@@ -614,13 +742,13 @@ func (b *BindingFetcher) run(
 			}
 		}
 
-		id := strings.TrimSpace(chainString(it, spec.Fields.ID, cfgMap))
+		id := strings.TrimSpace(chainString(it, spec.Fields.ID, cfgMap, true))
 		if id == "" {
 			identityMissing++ // 无身份的条目由 finalize 统一拒绝口径，这里早退省事。
 			continue
 		}
-		content := chainString(it, spec.Fields.Content, cfgMap)
-		author := chainString(it, spec.Fields.Author, cfgMap)
+		content := chainString(it, spec.Fields.Content, cfgMap, false)
+		author := chainString(it, spec.Fields.Author, cfgMap, false)
 
 		var pub *time.Time
 		if len(spec.Fields.Time) > 0 {
@@ -634,11 +762,24 @@ func (b *BindingFetcher) run(
 
 		itemURL := ""
 		if len(spec.Fields.URLPaths) > 0 {
-			itemURL = strings.TrimSpace(chainString(it, spec.Fields.URLPaths, cfgMap))
+			itemURL = strings.TrimSpace(chainString(it, spec.Fields.URLPaths, cfgMap, false))
 		} else if spec.Fields.URLTemplate != "" {
 			itemURL = strings.ReplaceAll(spec.Fields.URLTemplate, "{id}", url.PathEscape(id))
 			itemURL = strings.ReplaceAll(itemURL, "{author}", author)
-			itemURL += buildURLQuery(it, spec.Fields.URLQuery)
+			// 剩余 {点路径} 占位符从条目原始字段取值（weibo 桌面链接的 {user.idstr}）。
+			// 只用于 id 形态字段、不做转义（见 bindingFields.URLTemplate 注释）；
+			// 既有模板 URL 无其他花括号，此步对它们是恒等的。任一占位符缺失 → 整个
+			// URL 置空（推送卡无链接优于 weibo.com//xxx 死链），条目本身保留。
+			if strings.Contains(itemURL, "{") {
+				rendered, rok := renderTemplate(itemURL, it)
+				if !rok {
+					rendered = ""
+				}
+				itemURL = rendered
+			}
+			if itemURL != "" {
+				itemURL += buildURLQuery(it, spec.Fields.URLQuery)
+			}
 		}
 
 		cands = append(cands, extracted{
@@ -646,7 +787,7 @@ func (b *BindingFetcher) run(
 				SourceID:    src.ID,
 				ExternalID:  id,
 				URL:         itemURL,
-				Title:       chainString(it, spec.Fields.Title, cfgMap),
+				Title:       chainString(it, spec.Fields.Title, cfgMap, false),
 				Author:      author,
 				PublishedAt: pub,
 				FetchedAt:   now,
@@ -665,6 +806,13 @@ func (b *BindingFetcher) run(
 		return nil, nil, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("条目全部无法提取（%d 条：下钻失败 %d、身份缺失 %d，endpoint=%s，source_id=%d）——疑似响应结构漂移",
 				len(rawItems), rootMisses, identityMissing, spec.Endpoint, src.ID), nil)
+	}
+	// 「整屏被过滤」不是漂移（多态流合法形态，上面刻意豁免），但值得可观测：
+	// 若上游把过滤字段从「仅特殊条目有」改成「全量显式 0/1」（WantAbsent 语义的已知
+	// 脆弱面），存量订阅会从此每轮走到这里而非报错——这条 Warn 是唯一信号。
+	if len(rawItems) > 0 && filtered == len(rawItems) {
+		slog.Warn("binding: 本轮条目被 ItemFilter 全量过滤",
+			"source_id", src.ID, "endpoint", spec.Endpoint, "filtered", filtered)
 	}
 	if identityMissing > 0 {
 		slog.Warn("binding: 部分条目身份字段为空已丢弃",
@@ -773,7 +921,17 @@ func buildProbeReport(spec bindingSpec, n, identityMissing int, get func(int) (*
 	return report, nil
 }
 
+// specTimeout 取本次调用的 ctx 预算：模板声明了 TimeoutSeconds 用声明值，否则用默认。
+func (b *BindingFetcher) specTimeout(spec bindingSpec) time.Duration {
+	if spec.TimeoutSeconds > 0 {
+		return time.Duration(spec.TimeoutSeconds) * time.Second
+	}
+	return b.callTimeout
+}
+
 // callAndDecode 调一次端点：记账 → 状态分类 → UseNumber 解码 → 信封断言。
+// timeout 是本次调用的 ctx 预算（0=不加，调用方自管）；client 级超时只是全模板
+// 最大值的保险丝，见 NewBinding。
 func (b *BindingFetcher) callAndDecode(
 	ctx context.Context,
 	entry tikhubcatalog.Entry,
@@ -782,9 +940,15 @@ func (b *BindingFetcher) callAndDecode(
 	msgPath string,
 	src types.Source,
 	beforeEffect func(context.Context) error,
+	timeout time.Duration,
 ) (any, error) {
 	if err := checkEffectGate(ctx, beforeEffect); err != nil {
 		return nil, err
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
 	res, err := b.inv.Invoke(ctx, entry, params)
 	b.record(ctx, entry, params, res, err, src)
@@ -1056,7 +1220,7 @@ func (b *BindingFetcher) fetchDetail(
 		params[k] = scalarString(v)
 	}
 	root, err := b.callAndDecode(
-		ctx, entry, params, es.Envelope, es.MsgPath, src, beforeEffect)
+		ctx, entry, params, es.Envelope, es.MsgPath, src, beforeEffect, b.callTimeout)
 	if err != nil {
 		return "", err
 	}
@@ -1203,14 +1367,22 @@ func scalarString(v any) string {
 
 // chainString 依次尝试回退链，取第一个非空值。"$键名" 取 config 参数，
 // "tmpl:…" 按模板渲染（占位符 = 条目原始字段点路径）。
-func chainString(item any, chain []string, cfg map[string]string) string {
+// chainString 依次取回退链第一个非空值。strictTmpl 只影响 "tmpl:" 元素：true 时任一
+// 占位符缺失/为空 → 该元素整体作废（取下一回退项）。**ID 链必须 strict**——宽松渲染会把
+// 缺 app_msg_id 的条目拼成 "_1" 这类非空垃圾身份：既绕过 identityMissing 反漂移防线
+// （契约 §3.5 防线 3 对该端点的身份漂移失明），又经裸 CanonicalKey 让所有账号同 idx 的
+// 文章全局撞键、被 ON CONFLICT 静默归并。Content 合成保持宽松（少个榜位数字不该整条判废）。
+func chainString(item any, chain []string, cfg map[string]string, strictTmpl bool) string {
 	for _, src := range chain {
 		var v string
 		switch {
 		case strings.HasPrefix(src, "$"):
 			v = cfg[src[1:]]
 		case strings.HasPrefix(src, "tmpl:"):
-			v = renderTemplate(src[len("tmpl:"):], item)
+			s, ok := renderTemplate(src[len("tmpl:"):], item)
+			if !strictTmpl || ok {
+				v = s
+			}
 		default:
 			raw, _ := resolvePath(item, src)
 			v = scalarString(raw)
@@ -1223,23 +1395,30 @@ func chainString(item any, chain []string, cfg map[string]string) string {
 }
 
 // renderTemplate 把 {点路径} 占位符替换为条目字段值（缺失 → 空串）。
-func renderTemplate(tmpl string, item any) string {
+// ok 报告是否所有占位符都解析出了非空值——身份/URL 用途必须检查 ok
+// （缺一段的复合身份或双斜杠死链都不该带着「看起来有值」的外形过关）。
+func renderTemplate(tmpl string, item any) (string, bool) {
 	var sb strings.Builder
+	ok := true
 	rest := tmpl
 	for {
 		i := strings.IndexByte(rest, '{')
 		if i < 0 {
 			sb.WriteString(rest)
-			return sb.String()
+			return sb.String(), ok
 		}
 		j := strings.IndexByte(rest[i:], '}')
 		if j < 0 {
 			sb.WriteString(rest)
-			return sb.String()
+			return sb.String(), ok
 		}
 		sb.WriteString(rest[:i])
-		v, _ := resolvePath(item, rest[i+1:i+j])
-		sb.WriteString(scalarString(v))
+		v, found := resolvePath(item, rest[i+1:i+j])
+		s := scalarString(v)
+		if !found || strings.TrimSpace(s) == "" {
+			ok = false
+		}
+		sb.WriteString(s)
 		rest = rest[i+j+1:]
 	}
 }
@@ -1346,6 +1525,10 @@ var tikhubEndpointPrice = map[string]float64{
 	"xiaohongshu_web_v3_fetch_note_detail":     0.010, // enrich 详情
 	"xiaohongshu_web_v3_fetch_hot_list":        0.001,
 	"twitter_web_fetch_user_post_tweet":        0.001,
+	// wechat_mp：上游文档明标「价格：0.01$/次」（2026-07-23）。
+	"wechat_mp_v2_fetch_account_articles": 0.010,
+	// weibo 两端点上游未标价、使用日志尚未实查——刻意不登记，走最贵档兜底
+	//（宁可多算不能少算）；实查到单价后再补行。
 }
 
 const tikhubFallbackPrice = 0.010

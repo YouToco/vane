@@ -121,6 +121,23 @@ var catalog = map[key]Entry{
 		Platform: types.PlatformXHS, Capability: types.CapFavedNotes,
 		Kind: types.KindArticle, Status: StatusAvailable,
 	},
+
+	// ── 微博 + 公众号（endpoint-binding-contract.md §7 增补，2026-07-23 实测准入）──
+	// weibo/user_posts：订阅微博账号新发布（uid）；weibo/hot_list：微博热搜榜（全局一份）；
+	// wechat_mp/user_posts：订阅公众号发文（gh_ 原始 ID）。均由绑定引擎承载，
+	// 实测口径可复跑：fetcher/binding_test.go 真实响应样本锁提取/身份/时间。
+	{types.PlatformWeibo, types.CapUserPosts}: {
+		Platform: types.PlatformWeibo, Capability: types.CapUserPosts,
+		Kind: types.KindArticle, Status: StatusAvailable,
+	},
+	{types.PlatformWeibo, types.CapHotList}: {
+		Platform: types.PlatformWeibo, Capability: types.CapHotList,
+		Kind: types.KindArticle, Status: StatusAvailable,
+	},
+	{types.PlatformWechatMP, types.CapUserPosts}: {
+		Platform: types.PlatformWechatMP, Capability: types.CapUserPosts,
+		Kind: types.KindArticle, Status: StatusAvailable,
+	},
 }
 
 // Lookup 返回 (平台, 能力) 对应的条目。ok=false 表示这个组合根本不在注册表里

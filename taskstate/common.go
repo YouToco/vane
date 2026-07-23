@@ -95,7 +95,11 @@ func validReadCapability(platform types.Platform, capability types.Capability) b
 	switch string(platform) + "/" + string(capability) {
 	case "web/feed", "web/search", "web/contents", "x/user_posts",
 		"xhs/search", "xhs/user_posts", "xhs/hot_list", "xhs/topic_feed",
-		"xhs/faved_notes":
+		"xhs/faved_notes",
+		// 2026-07-23 增补（与 sourcecatalog/multi 路由同批）：缺席会让 weibo/wechat_mp
+		// 源通过 ValidateMaterialized、确认卡直到用户确认，却在提交事务构建 Approved
+		// head 时被拒——用户确认后期不可读失败（对抗审查 HIGH-1）。
+		"weibo/user_posts", "weibo/hot_list", "wechat_mp/user_posts":
 		return true
 	}
 	return false

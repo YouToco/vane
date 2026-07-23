@@ -26,6 +26,9 @@ func TestValidateMaterializedRoundTripsEveryAvailableCapability(t *testing.T) {
 		{Platform: "xhs", Capability: "hot_list", Params: map[string]string{}},
 		{Platform: "xhs", Capability: "topic_feed", Params: map[string]string{"page_id": "6a5578b3000000000e03cc00"}},
 		{Platform: "xhs", Capability: "faved_notes", Params: map[string]string{"user_id": "6a5578b3000000000e03cc00"}},
+		{Platform: "weibo", Capability: "user_posts", Params: map[string]string{"uid": "2803301701"}},
+		{Platform: "weibo", Capability: "hot_list", Params: map[string]string{}},
+		{Platform: "wechat_mp", Capability: "user_posts", Params: map[string]string{"username": "gh_363b924965e9"}},
 	}
 	for _, spec := range tests {
 		spec := spec

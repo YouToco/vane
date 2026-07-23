@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,20 +31,23 @@ import (
 
 // fakeUpstream 按路径路由响应体，并记录全部请求供断言。
 type fakeUpstream struct {
-	mu     sync.Mutex
-	bodies map[string]string // path -> body
-	status map[string]int    // path -> 覆盖状态码（缺省 200）
-	reqs   []*http.Request
+	mu      sync.Mutex
+	bodies  map[string]string // path -> body
+	status  map[string]int    // path -> 覆盖状态码（缺省 200）
+	reqs    []*http.Request
+	reqBody map[string][]string // path -> 收到的请求体（POST 端点断言用）
 }
 
 func newFakeUpstream() *fakeUpstream {
-	return &fakeUpstream{bodies: map[string]string{}, status: map[string]int{}}
+	return &fakeUpstream{bodies: map[string]string{}, status: map[string]int{}, reqBody: map[string][]string{}}
 }
 
 func (f *fakeUpstream) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		in, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
 		f.reqs = append(f.reqs, r.Clone(context.Background()))
+		f.reqBody[r.URL.Path] = append(f.reqBody[r.URL.Path], string(in))
 		body, ok := f.bodies[r.URL.Path]
 		st := f.status[r.URL.Path]
 		f.mu.Unlock()
@@ -68,6 +72,12 @@ func (f *fakeUpstream) requests(path string) []*http.Request {
 		}
 	}
 	return out
+}
+
+func (f *fakeUpstream) requestBodies(path string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.reqBody[path]...)
 }
 
 type fakeRecorder struct {
@@ -117,13 +127,16 @@ func bindingSrc(c types.Capability, cfg string) types.Source {
 }
 
 const (
-	pathSearch   = "/api/v1/xiaohongshu/app_v2/search_notes"
-	pathDetail   = "/api/v1/xiaohongshu/web_v3/fetch_note_detail"
-	pathUserPost = "/api/v1/xiaohongshu/app_v2/get_user_posted_notes"
-	pathTwitter  = "/api/v1/twitter/web/fetch_user_post_tweet"
-	pathHotList  = "/api/v1/xiaohongshu/web_v3/fetch_hot_list"
-	pathTopic    = "/api/v1/xiaohongshu/app_v2/get_topic_feed"
-	pathFaved    = "/api/v1/xiaohongshu/app_v2/get_user_faved_notes"
+	pathSearch     = "/api/v1/xiaohongshu/app_v2/search_notes"
+	pathDetail     = "/api/v1/xiaohongshu/web_v3/fetch_note_detail"
+	pathUserPost   = "/api/v1/xiaohongshu/app_v2/get_user_posted_notes"
+	pathTwitter    = "/api/v1/twitter/web/fetch_user_post_tweet"
+	pathHotList    = "/api/v1/xiaohongshu/web_v3/fetch_hot_list"
+	pathTopic      = "/api/v1/xiaohongshu/app_v2/get_topic_feed"
+	pathFaved      = "/api/v1/xiaohongshu/app_v2/get_user_faved_notes"
+	pathWeiboPosts = "/api/v1/weibo/web_v2/fetch_user_posts"
+	pathWeiboHot   = "/api/v1/weibo/web_v2/fetch_hot_search"
+	pathWechatArts = "/api/v1/wechat_mp/v2/fetch_account_articles"
 )
 
 // ────────── 模板引用完整性（契约 §8.1）──────────
@@ -420,6 +433,246 @@ func TestBinding_FavedNotes(t *testing.T) {
 	}
 	if items[0].PublishedAt == nil || items[0].PublishedAt.Unix() != 1761006989 {
 		t.Errorf("unix_s 时间漂移: %v", items[0].PublishedAt)
+	}
+}
+
+// ────────── 微博 / 微信公众号（契约 §8.2，2026-07-23 实测样本）──────────
+
+func weiboSrc(c types.Capability, cfg string) types.Source {
+	return types.Source{ID: 7, Platform: types.PlatformWeibo, Capability: c, Config: json.RawMessage(cfg)}
+}
+
+func TestBinding_WeiboUserPosts_MapsAndUnwrapsRetweet(t *testing.T) {
+	up := newFakeUpstream()
+	up.bodies[pathWeiboPosts] = sampleWeiboUserPostsResponse
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	items, err := b.Fetch(context.Background(), weiboSrc(types.CapUserPosts, `{"uid":"2803301701"}`))
+	if err != nil {
+		t.Fatalf("Fetch 失败: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("期望 2 条（原创 + 转发拆包），实际 %d", len(items))
+	}
+	// 原创条：身份=mblogid，URL 双段（uid+mblogid），正文取 text_raw 纯文本。
+	orig := items[0]
+	if orig.ExternalID != "Ra1N24Tm5" || orig.CanonicalKey != "Ra1N24Tm5" {
+		t.Errorf("身份漂移: external=%q canonical=%q", orig.ExternalID, orig.CanonicalKey)
+	}
+	if orig.URL != "https://weibo.com/2803301701/Ra1N24Tm5" {
+		t.Errorf("URL 漂移: %q", orig.URL)
+	}
+	if orig.Author != "人民日报" || orig.Title != "" {
+		t.Errorf("字段漂移: author=%q title=%q（微博无标题）", orig.Author, orig.Title)
+	}
+	if !strings.Contains(orig.Content, "#AI时代如何找到自身竞争力#") || strings.Contains(orig.Content, "<a") {
+		t.Errorf("正文应取 text_raw 纯文本而非 text HTML: %q", orig.Content)
+	}
+	// ruby_date +0800 时区必须换算：17:55:27 +0800 = 09:55:27 UTC。
+	if orig.PublishedAt == nil || !orig.PublishedAt.Equal(time.Date(2026, 7, 23, 9, 55, 27, 0, time.UTC)) {
+		t.Errorf("ruby_date(+0800) 时间漂移: %v", orig.PublishedAt)
+	}
+	// 转发拆包（x retweet 同款语义）：身份/作者/URL/正文全部指向被转发的原帖。
+	rt := items[1]
+	if rt.ExternalID != "R9Ym5c0FD" {
+		t.Fatalf("转发未拆包: %q（外壳是 R9YTkfpjd）", rt.ExternalID)
+	}
+	if rt.Author != "Navis-慢点评测" || rt.URL != "https://weibo.com/3513171522/R9Ym5c0FD" {
+		t.Errorf("拆包字段漂移: author=%q url=%q（应随原作者）", rt.Author, rt.URL)
+	}
+	if !strings.Contains(rt.Content, "特斯拉二季度业绩") {
+		t.Errorf("拆包应取原帖全文: %q", rt.Content)
+	}
+	// 请求参数：uid 透传 + feature=0（10 条基础数据档）。
+	reqs := up.requests(pathWeiboPosts)
+	if len(reqs) != 1 {
+		t.Fatalf("期望 1 次请求，实际 %d", len(reqs))
+	}
+	q := reqs[0].URL.Query()
+	if q.Get("uid") != "2803301701" || q.Get("feature") != "0" {
+		t.Errorf("请求参数漂移: %v", reqs[0].URL.RawQuery)
+	}
+}
+
+func TestBinding_WeiboHotSearch_FiltersAdsAndSynthesizes(t *testing.T) {
+	up := newFakeUpstream()
+	up.bodies[pathWeiboHot] = sampleWeiboHotSearchResponse
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	items, err := b.Fetch(context.Background(), weiboSrc(types.CapHotList, `{}`))
+	if err != nil {
+		t.Fatalf("Fetch 失败: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("期望 2 条（is_ad=1 广告位剔除），实际 %d", len(items))
+	}
+	for _, it := range items {
+		if strings.Contains(it.Title, "云南白药") {
+			t.Errorf("广告条目未被过滤: %q", it.Title)
+		}
+		if it.PublishedAt != nil {
+			t.Errorf("热搜条目不该有时间戳: %v", it.PublishedAt)
+		}
+		if it.ExternalID == "" || it.CanonicalKey != it.ExternalID || it.ExternalID != it.Title {
+			t.Errorf("身份应为热搜词本身: external=%q title=%q", it.ExternalID, it.Title)
+		}
+	}
+	first := items[0]
+	if !strings.Contains(first.Content, "微博热搜第 1 位") || !strings.Contains(first.Content, "热度 1541843") {
+		t.Errorf("合成正文缺榜位/热度上下文: %q", first.Content)
+	}
+	if !strings.HasPrefix(first.URL, "https://s.weibo.com/weibo?q=") {
+		t.Errorf("URL 应为热搜落地页: %q", first.URL)
+	}
+}
+
+func TestBinding_WechatMP_CompositeIDAndDigestFallback(t *testing.T) {
+	up := newFakeUpstream()
+	up.bodies[pathWechatArts] = sampleWechatArticlesResponse
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	items, err := b.Fetch(context.Background(), types.Source{
+		ID: 7, Platform: types.PlatformWechatMP, Capability: types.CapUserPosts,
+		Config: json.RawMessage(`{"username":"gh_363b924965e9"}`),
+	})
+	if err != nil {
+		t.Fatalf("Fetch 失败: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("期望 2 条，实际 %d", len(items))
+	}
+	it := items[0]
+	// 复合身份 app_msg_id_idx：URL 含每次抓取会变的 chksm 参数，不能当身份。
+	if it.ExternalID != "2667023086_1" || it.CanonicalKey != "2667023086_1" {
+		t.Errorf("复合身份漂移: external=%q canonical=%q", it.ExternalID, it.CanonicalKey)
+	}
+	if it.Title != "“钩针男孩”，火了！" {
+		t.Errorf("标题漂移: %q", it.Title)
+	}
+	// digest 实测恒空 → 正文退回标题（已知取舍，详情补全留二期）。
+	if it.Content != it.Title {
+		t.Errorf("digest 为空时正文应退回标题: content=%q", it.Content)
+	}
+	if !strings.HasPrefix(it.URL, "http://mp.weixin.qq.com/s?__biz=") {
+		t.Errorf("URL 应取上游原文链接: %q", it.URL)
+	}
+	if it.PublishedAt == nil || it.PublishedAt.Unix() != 1784799536 {
+		t.Errorf("unix_s 时间漂移: %v", it.PublishedAt)
+	}
+	if it.Author != "" {
+		t.Errorf("响应无作者字段，不该硬造: %q", it.Author)
+	}
+	// POST JSON body：username 透传 + raw="false"（上游 FastAPI coerce 为 bool，实测）。
+	reqs := up.requests(pathWechatArts)
+	if len(reqs) != 1 || reqs[0].Method != http.MethodPost {
+		t.Fatalf("期望 1 次 POST 请求，实际 %d 次 method=%v", len(reqs), reqs)
+	}
+	bodies := up.requestBodies(pathWechatArts)
+	if len(bodies) != 1 {
+		t.Fatalf("未捕获请求体")
+	}
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(bodies[0]), &sent); err != nil {
+		t.Fatalf("请求体不是 JSON: %v", err)
+	}
+	if sent["username"] != "gh_363b924965e9" || sent["raw"] != "false" {
+		t.Errorf("POST body 参数漂移: %v", sent)
+	}
+}
+
+func TestBinding_WechatMP_MissingIDFieldIsDriftNotGarbageKey(t *testing.T) {
+	// 对抗审查 HIGH-2 的机制锁定：tmpl 复合身份任一段缺失必须走 identityMissing →
+	// 候选全灭触发反漂移防线（契约 §3.5 防线 3），而不是宽松渲染出 "_1" 这类非空
+	// 垃圾身份——那会让所有公众号同 idx 的文章全局撞 canonical_key 被静默归并。
+	up := newFakeUpstream()
+	up.bodies[pathWechatArts] = `{"code":200,"data":{"articles":[
+	  {"msg_type":9,"idx":1,"title":"文章甲","digest":"","url":"http://mp.weixin.qq.com/s?__biz=a","create_time":1784799536},
+	  {"msg_type":9,"idx":1,"title":"文章乙","digest":"","url":"http://mp.weixin.qq.com/s?__biz=b","create_time":1784794742}
+	]}}`
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	_, err := b.Fetch(context.Background(), types.Source{
+		ID: 7, Platform: types.PlatformWechatMP, Capability: types.CapUserPosts,
+		Config: json.RawMessage(`{"username":"gh_363b924965e9"}`),
+	})
+	if !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("app_msg_id 全缺应判结构漂移（CodeValidation），实际 %v", err)
+	}
+}
+
+func TestBinding_Weibo_MissingURLPlaceholderYieldsEmptyURLNotDeadLink(t *testing.T) {
+	// 对抗审查 LOW-1：条目缺 user 对象时 {user.idstr} 渲染不出 → 整个 URL 置空
+	// （推送卡无链接优于 weibo.com//xxx 死链），条目本身保留（URL 不是身份）。
+	up := newFakeUpstream()
+	up.bodies[pathWeiboPosts] = `{"code":200,"data":{"data":{"list":[
+	  {"created_at":"Thu Jul 23 17:55:27 +0800 2026","mblogid":"Ra1N24Tm5","text_raw":"没有 user 对象的条目"}
+	]},"ok":1}}`
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	items, err := b.Fetch(context.Background(), weiboSrc(types.CapUserPosts, `{"uid":"2803301701"}`))
+	if err != nil || len(items) != 1 {
+		t.Fatalf("缺 user 的条目应保留: err=%v items=%d", err, len(items))
+	}
+	if items[0].URL != "" {
+		t.Errorf("占位符缺失应产出空 URL 而非死链: %q", items[0].URL)
+	}
+	if items[0].ExternalID != "Ra1N24Tm5" {
+		t.Errorf("身份不受 URL 渲染影响: %q", items[0].ExternalID)
+	}
+}
+
+func TestBinding_WeiboHotSearch_ExplicitIsAdZeroIsFiltered(t *testing.T) {
+	// 对抗审查 MEDIUM-1 的语义钉死：WantAbsent=「键不存在才保留」——显式 is_ad:0 也会
+	// 被过滤（按上游当前形态刻意选定：正常条目**无**该键）。若上游改为全量显式 0/1，
+	// 表现是整屏被滤的合法空轮（有 Warn 可观测），不是报错——此测试红了说明语义被改。
+	up := newFakeUpstream()
+	up.bodies[pathWeiboHot] = `{"code":200,"data":{"realtime":[
+	  {"realpos":1,"num":100,"word":"显式零也被滤","is_ad":0},
+	  {"realpos":2,"num":90,"word":"无键才保留"}
+	]}}`
+	srv := httptest.NewServer(up.handler())
+	defer srv.Close()
+
+	b := newTestBinding(srv.URL, nil, nil)
+	items, err := b.Fetch(context.Background(), weiboSrc(types.CapHotList, `{}`))
+	if err != nil || len(items) != 1 {
+		t.Fatalf("期望仅保留无 is_ad 键的 1 条: err=%v items=%d", err, len(items))
+	}
+	if items[0].Title != "无键才保留" {
+		t.Errorf("保留错了条目: %q", items[0].Title)
+	}
+
+	// 整屏被滤是合法空轮（多态流豁免），不得误报漂移。
+	up.bodies[pathWeiboHot] = `{"code":200,"data":{"realtime":[
+	  {"realpos":1,"num":100,"word":"a","is_ad":1},
+	  {"realpos":2,"num":90,"word":"b","is_ad":0}
+	]}}`
+	items, err = b.Fetch(context.Background(), weiboSrc(types.CapHotList, `{}`))
+	if err != nil || len(items) != 0 {
+		t.Fatalf("整屏被过滤应为空成功: err=%v items=%d", err, len(items))
+	}
+}
+
+func TestBinding_SpecTimeoutOverride(t *testing.T) {
+	// 微信公众号上游明示 30s（否则「已扣费但收不到响应」）；其余模板用配置默认。
+	b := newTestBinding("http://unused", nil, nil) // cfg TimeoutSeconds=10
+	wechat := bindingTemplates[bindingKey{types.PlatformWechatMP, types.CapUserPosts}]
+	if got := b.specTimeout(wechat); got != 30*time.Second {
+		t.Errorf("微信模板超时应为声明的 30s，实际 %v", got)
+	}
+	weibo := bindingTemplates[bindingKey{types.PlatformWeibo, types.CapUserPosts}]
+	if got := b.specTimeout(weibo); got != 10*time.Second {
+		t.Errorf("未声明超时的模板应用配置默认 10s，实际 %v", got)
 	}
 }
 

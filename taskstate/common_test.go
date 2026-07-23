@@ -21,6 +21,9 @@ func TestFrozenV1LiteralAllowlists(t *testing.T) {
 		{"xhs", "hot_list"},
 		{"xhs", "topic_feed"},
 		{"xhs", "faved_notes"},
+		{"weibo", "user_posts"},
+		{"weibo", "hot_list"},
+		{"wechat_mp", "user_posts"},
 	}
 	for _, pair := range capabilities {
 		if !validReadCapability(types.Platform(pair[0]), types.Capability(pair[1])) {

@@ -39,6 +39,14 @@ func CanonicalKey(src types.Source, item types.ContentItem) string {
 	case types.PlatformX:
 		return strings.TrimSpace(item.ExternalID)
 
+	// weibo → mblogid（帖，9-10 位 base62 含大小写）/ 热搜词（榜，中文短语）；
+	// wechat_mp → app_msg_id_idx（"2667023086_1"，模板 tmpl 合成的复合身份——
+	// 文章 URL 含每次抓取会变的 chksm 参数，不能当身份）。
+	// 两平台的键形状与既有三平台不可逐字节相等（M6 §7.3 撞击分析，2026-07-23 实测），
+	// 详见 endpoint-binding-contract.md §7 的身份形状对照。
+	case types.PlatformWeibo, types.PlatformWechatMP:
+		return strings.TrimSpace(item.ExternalID)
+
 	case types.PlatformWeb:
 		return strings.TrimSpace(item.URL)
 

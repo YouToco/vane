@@ -235,6 +235,11 @@ Boss 列的能力：「关键词搜索、**用户搜索**、用户新文章详�
 > tikhub Provider 的三能力（xhs/search、xhs/user_posts、x/user_posts）自同日起由
 > 绑定引擎模板承载，bespoke fetcher 删除（等价义务：该契约 §6）。
 
+> 【2026-07-23 增补】新增两平台三绑定能力：weibo/user_posts（config `{uid}`）、
+> weibo/hot_list（config `{}`）、wechat_mp/user_posts（config `{username}`，gh_ 原始 ID）。
+> 实测证据、身份形状与已知取舍见 endpoint-binding-contract.md §7.4；跨平台碰撞分析
+> 已按 §7.3 Gate 重做（见该节同日增补）。
+
 ### 2.2 `Unavailable` 是一等条目，不是缺席 —— registry 唯一严格优于最小方案的地方
 
 ```go
@@ -1000,6 +1005,16 @@ if item.Kind == "" {
 > 仍会撞，而碰撞的后果是**把两篇无关内容合并成一篇（不可逆）**。
 > **新增平台时必须重做本节的碰撞分析**，这是 §17 Gate 的一条。
 > 彻底修需全库加前缀 = 007 同级身份重构，与 §18 D5 的 url 归一化同属被显式推迟的课题。
+
+> 【2026-07-23 增补，weibo / wechat_mp 过 Gate】新增两平台的实测形态：
+>
+> | platform | 实测形态 | 与既有形状的区分 |
+> |---|---|---|
+> | weibo（user_posts） | `Ra1N24Tm5`（mblogid，base62 短串） | 含大小写字母 → 非 24-hex、非纯十进制、无 `://` |
+> | weibo（hot_list） | `厦大回应644分考生误报分校`（热搜词） | 中文短语，与任何 ASCII ID 形状不相交 |
+> | wechat_mp | `2667023086_1`（app_msg_id + `_` + idx 复合） | 恒含下划线且两段皆数字，既有平台 ID 均无下划线 |
+>
+> 五平台裸值键仍互不同形；结论口径不变（经验性而非结构性），第六个平台再加时重做。
 
 ---
 
