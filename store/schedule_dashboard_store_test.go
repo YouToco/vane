@@ -107,7 +107,8 @@ func TestScheduleDashboardStore(t *testing.T) {
 		t.Fatalf("建外人批次失败: %v", err)
 	}
 
-	// 成本记账：trace1 挂 2 条 llm_calls 与 2 条 tool_calls（其一 cost NULL 的非计费调用）；
+	// 成本记账：trace1 挂 2 条 llm_calls（生产写入方 Score/CardGen 用管线 traceID，
+	// 与 push_batches.idempotency_key 同源——夹具按同一键种下才含被测特征）；
 	// trace2（空批）无调用；外人 trace 的成本绝不能串进来。
 	mustExec := func(t *testing.T, sql string, args ...any) {
 		t.Helper()
@@ -117,8 +118,6 @@ func TestScheduleDashboardStore(t *testing.T) {
 	}
 	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, user_id, cost_usd) VALUES ($1,'score','test-model',$2,0.5)`, trace1, owner.ID)
 	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, user_id, cost_usd) VALUES ($1,'cardgen','test-model',$2,0.25)`, trace1, owner.ID)
-	mustExec(t, `INSERT INTO tool_calls (trace_id, user_id, tool_name, cost_usd) VALUES ($1,$2,'web_contents',0.1)`, trace1, owner.ID)
-	mustExec(t, `INSERT INTO tool_calls (trace_id, user_id, tool_name) VALUES ($1,$2,'search_endpoints')`, trace1, owner.ID)
 	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, user_id, cost_usd) VALUES ($1,'score','test-model',$2,9.9)`, foreignTrace, stranger.ID)
 
 	t.Cleanup(func() {
@@ -126,7 +125,6 @@ func TestScheduleDashboardStore(t *testing.T) {
 		defer cancel()
 		ids := []int64{owner.ID, stranger.ID}
 		cleanupExec(cctx, t, st, `DELETE FROM llm_calls WHERE trace_id = ANY($1)`, []string{trace1, trace2, foreignTrace})
-		cleanupExec(cctx, t, st, `DELETE FROM tool_calls WHERE trace_id = ANY($1)`, []string{trace1, trace2, foreignTrace})
 		cleanupExec(cctx, t, st, `DELETE FROM deliveries WHERE user_id = ANY($1)`, ids)
 		cleanupExec(cctx, t, st, `DELETE FROM push_batches WHERE user_id = ANY($1)`, ids)
 		cleanupExec(cctx, t, st, `DELETE FROM schedule_sources WHERE schedule_id = ANY($1)`, []string{schedID, foreignSchedID})
@@ -250,6 +248,22 @@ func TestScheduleDashboardStore(t *testing.T) {
 		if allTotal < 2 {
 			t.Errorf("无过滤总数应 >= 2, 实得 %d", allTotal)
 		}
+		// 过滤 + 键集翻页组合：游标占位序号在 ScheduleID 占了 $2 之后必须顺移，
+		// 错位会把游标值当 schedule_id 比较——page_size=1 逐页走完且不重不漏。
+		p1, _, tok, err := st.ListDeliveryHistory(ctx, owner.ID, DeliveryHistoryQuery{ScheduleID: schedID, PageSize: 1})
+		if err != nil {
+			t.Fatalf("过滤翻页第一页失败: %v", err)
+		}
+		if len(p1) != 1 || tok == "" {
+			t.Fatalf("过滤翻页第一页形状不符: len=%d tok=%q", len(p1), tok)
+		}
+		p2, _, _, err := st.ListDeliveryHistory(ctx, owner.ID, DeliveryHistoryQuery{ScheduleID: schedID, PageSize: 1, PageToken: tok})
+		if err != nil {
+			t.Fatalf("过滤翻页第二页失败: %v", err)
+		}
+		if len(p2) != 1 || p2[0].ID == p1[0].ID || p2[0].BatchID != b1 {
+			t.Fatalf("过滤翻页第二页应为另一条 b1 投递: p1=%+v p2=%+v", p1, p2)
+		}
 	})
 
 	t.Run("成本按 trace 归集且不串号", func(t *testing.T) {
@@ -261,16 +275,12 @@ func TestScheduleDashboardStore(t *testing.T) {
 			t.Errorf("LLM 成本不符: cost=%v calls=%d, 期望 0.75/2（外人 9.9 不得串入）",
 				cost.LLMCostUSD, cost.LLMCalls)
 		}
-		if math.Abs(cost.ToolCostUSD-0.1) > 1e-9 || cost.ToolCalls != 2 {
-			t.Errorf("工具成本不符: cost=%v calls=%d, 期望 0.1/2（NULL 成本行计次不计钱）",
-				cost.ToolCostUSD, cost.ToolCalls)
-		}
 		// 外人查 owner 的任务：全零。
 		fcost, err := st.GetScheduleRunCost(ctx, stranger.ID, schedID)
 		if err != nil {
 			t.Fatalf("外人成本查询失败: %v", err)
 		}
-		if fcost.LLMCalls != 0 || fcost.ToolCalls != 0 || fcost.LLMCostUSD != 0 || fcost.ToolCostUSD != 0 {
+		if fcost.LLMCalls != 0 || fcost.LLMCostUSD != 0 {
 			t.Errorf("外人查 owner 任务成本应全零: %+v", fcost)
 		}
 	})

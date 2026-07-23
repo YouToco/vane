@@ -3,10 +3,15 @@
 //
 // 归集口径（成本）：推送管道以 workflow 确定性 traceID 同时作为
 // push_batches.idempotency_key（CreatePushBatchIdempotent / RecordEmptyPushBatch）与
-// llm_calls.trace_id / tool_calls.trace_id（Score/CardGen/EvolveProfile 等 Activity 记账），
-// 故「任务运行成本」= 经 idempotency_key ↔ trace_id 关联到该任务批次的调用之和。
+// llm_calls.trace_id（Score/CardGen/EvolveProfile 等 Activity 记账），
+// 故「任务运行 LLM 成本」= 经 idempotency_key ↔ trace_id 关联到该任务批次的调用之和。
 // 这**只覆盖推送管道运行**：agent 会话、深挖、A2A 的调用不挂任务批次，不在此口径内；
 // 020 之前的历史批次 schedule_id 为 NULL，同样不计入。宁可少算、口径清晰，不编大数。
+//
+// **tool_calls（Exa/TikHub 抓取费）刻意不归集**：管道抓取的记账 trace 锚是 workflow
+// execution ID 而非管线 traceID（workflow/activities.go 的绑定引擎注释——PushParams 没有
+// traceID，为它改活动入参会碰在途 run 的确定性），与 idempotency_key 永不相等；按执行 ID
+// 前缀模糊匹配是靠字符串巧合的口径，宁缺毋滥。待写入侧 trace 锚统一后再补（独立车道）。
 package store
 
 import (
@@ -66,12 +71,11 @@ type ScheduleRunSummary struct {
 	SourceCount    int64      `json:"source_count"`
 }
 
-// ScheduleRunCost 任务运行成本（口径见文件头注释：仅推送管道运行，trace 归集）。
+// ScheduleRunCost 任务运行 LLM 成本（口径见文件头注释：仅推送管道运行，trace 归集；
+// 抓取侧 tool_calls 因 trace 锚不一致本批不做，字段留白胜过编数）。
 type ScheduleRunCost struct {
-	LLMCostUSD  float64 `json:"llm_cost_usd"`
-	LLMCalls    int64   `json:"llm_calls"`
-	ToolCostUSD float64 `json:"tool_cost_usd"`
-	ToolCalls   int64   `json:"tool_calls"`
+	LLMCostUSD float64 `json:"llm_cost_usd"`
+	LLMCalls   int64   `json:"llm_calls"`
 }
 
 // ListScheduleSourceInfos 返回某任务绑定信源的展示摘要（归属校验进 WHERE，沿用
@@ -250,7 +254,7 @@ func (s *Store) GetScheduleRunSummary(ctx context.Context, userID int64, schedul
 	return &sum, nil
 }
 
-// GetScheduleRunCost 按 trace 归集任务运行成本（口径见文件头注释）。
+// GetScheduleRunCost 按 trace 归集任务运行 LLM 成本（口径见文件头注释）。
 // 无可归集调用 → 全零结构体，不是错误；他人任务同样得全零（批次带 user_id 谓词）。
 func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID string) (*ScheduleRunCost, error) {
 	var out ScheduleRunCost
@@ -262,16 +266,6 @@ func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID
 		userID, scheduleID).Scan(&out.LLMCostUSD, &out.LLMCalls); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("归集任务 LLM 成本（schedule_id=%s）", scheduleID), err)
-	}
-	// tool_calls.cost_usd 可空（023：非计费调用为 NULL），求和前逐行 COALESCE。
-	if err := s.pool.QueryRow(ctx,
-		`SELECT COALESCE(sum(COALESCE(tc.cost_usd, 0)), 0), count(*)
-		   FROM tool_calls tc
-		   JOIN push_batches pb ON pb.idempotency_key = tc.trace_id
-		  WHERE pb.user_id = $1 AND pb.schedule_id = $2 AND pb.idempotency_key <> ''`,
-		userID, scheduleID).Scan(&out.ToolCostUSD, &out.ToolCalls); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("归集任务工具成本（schedule_id=%s）", scheduleID), err)
 	}
 	return &out, nil
 }
