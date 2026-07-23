@@ -1,5 +1,11 @@
 # M6 契约：信源插件化（平台 × 能力 × 内容种类）
 
+> **历史设计记录，不是当前能力清单。** 本文保留 `web/page_watch`、
+> `page_snapshots`、`KindChange`、`SnapshotStore` 等内容用于解释当时的设计与下线决策；
+> 这些能力现已退役，不能据本文中的旧 schema、Gate 或排期重新实现。页面内容监控的现行能力是
+> `web/contents`：由 Exa `POST /contents` 抓取，统一走 data-feed 管道。当前代码真相源见
+> `sourcecatalog/`、`types/`、`sourcespec/` 与 `fetcher/exa_contents.go`。
+>
 > 事实基准：生产库 + 真实 API key 实测 2026-07-16。所有「实测」标注的数字都可复现。
 > 设计动机见 Boss 决策：**用户关注的是「来源平台」和「这个平台能给我什么功能」，
 > 而不是 tikhub 还是 exa 这种实现细节**。

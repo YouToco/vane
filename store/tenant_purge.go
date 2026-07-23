@@ -13,7 +13,7 @@ import (
 //
 // 这是全仓**唯一不可逆**的批量删除路径，红线是契约 I-A3：
 //
-//	硬删只删「租户所有表」。sources / content_items / content_sources / page_snapshots
+//	硬删只删「租户所有表」。sources / content_items / content_sources
 //	是**跨租户客观事实**——同一篇文章可能被多个租户的信源指向，删了会伤到别人。
 //
 // 三道结构性保证（不是纪律要求）：
@@ -94,7 +94,7 @@ var purgeOrder = []purgeStep{
 
 // purgeSharedTables 是**绝不能出现在 purgeOrder 里**的跨租户客观事实表（红线 I-A3）。
 // 单列出来是为了让守卫测试能直接断言，而不是靠 review 时肉眼比对。
-var purgeSharedTables = []string{"sources", "content_items", "content_sources", "page_snapshots"}
+var purgeSharedTables = []string{"sources", "content_items", "content_sources"}
 
 // PurgeReport 是一次清理的结果。dry-run 与真删返回同样的结构，
 // 便于运维先看一眼「会删掉什么」再决定要不要执行。
