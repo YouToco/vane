@@ -53,6 +53,18 @@ const exaAdHocSystemNote = `
 - 每条用户消息最多成功执行一次外部读取。需要查多个公司或站点时，合并成一次 web_search 查询，不要并列或接连调用多个外部读取；拿到结果后只总结候选并等待用户下一条消息。
 - create_schedule 必须带完整 intent 与 approved_fetch_plan。若采用 list_sources 返回的本人现有信源，把它的数字 id 放入 existing_source_ids，不要把 id 编造成 URL；新信源才提交完整 sources。确认卡会展示系统冻结后的每个长期信源，确认后不能自行扩大主题或替换长期信源。需要先上网找候选时，本轮只能做只读发现并把候选告诉用户，等用户下一条消息明确同意后才能创建任务；绝不能在读取外部结果的同一轮发起写操作。`
 
+// directTaskCreationSystemNote 只在用户明确要求按当前消息直接生成任务确认卡、
+// 且没有要求先查/核对时追加。运行时另有工具白名单二次门；prompt 只负责让模型
+// 尽快收敛到 create_schedule，而不是安全边界。
+const directTaskCreationSystemNote = `
+- 用户已明确要求直接生成任务确认卡。本轮不注入画像，也不要询问行业、职业、岗位或更新画像。不要调用 list_sources、list_schedules、web_search、read_page 或其他读取工具；只能使用本条用户消息中明确提供的信息调用 create_schedule，不得用历史、画像或自行扩写。新长期信源写入 approved_fetch_plan.sources，绝不能编造 existing_source_ids。若信息确实不足，不得编造；没有实际调用 create_schedule 就绝不能声称确认卡已经或即将出现。`
+
+const directTaskCreationRetrySystemNote = `
+- 系统刚刚拒绝并丢弃了一个非 create_schedule 工具调用；它没有执行，也没有产生可用结果。不要重试读取，只能调用 create_schedule 或明确追问缺失信息。`
+
+const directTaskCreationResponseRetrySystemNote = `
+- 你刚才没有调用 create_schedule；该回复已被系统丢弃。若用户已提供全部必需参数，现在调用 create_schedule；若确有缺失，不得编造。绝不能口头承诺确认卡已经、正在或即将生成。`
+
 // 契约 §7 固定的回复/占位文案。
 const (
 	// replyMaxTurns 是 MaxTurns 内未收敛时的兜底回复（契约原文，勿改）。
@@ -68,9 +80,16 @@ const (
 	// toolMsgExternalBatch 要求模型把外部读取拆成独立调用。若与内部读/写并列，
 	// 不能“挑一个执行”：被拒调用的参数/assistant content 仍会进下一轮历史。
 	toolMsgExternalBatch = "外部内容读取必须单独调用；本批包含多个工具调用，因此全部未执行。请下一轮只发起一个外部读取；需要查多个站点时，把目标合并成一次 web_search。"
+	// toolMsgDirectTaskCreationOnly 是用户已明确要求直接出任务确认卡时，对模型
+	// 幻觉读调用的固定回执。它不含外部结果，不触发 taint；下一轮仍只声明
+	// create_schedule，让模型自纠而不是再次进入读取→隔离循环。
+	toolMsgDirectTaskCreationOnly = "用户已明确要求直接生成任务确认卡且不再查询；本次读取未执行。请仅调用 create_schedule，若参数不足则明确追问，不能声称确认卡已生成。"
 	// replyTaskCreationConfirm 是 v1 durable proposal 的确定性出口。proposal 已经落库后
 	// 不再做一次可能失败的 LLM “收尾”：否则数据库里留下可执行动作，用户却收不到卡。
 	replyTaskCreationConfirm = "我已整理好任务方案，请确认卡片中的时间、门槛和信源。"
+	// replyTaskCreationNotCreated 是 direct 模式连续两次没有产生 proposal 时的
+	// 确定性出口。不能把模型的口头承诺原样发给用户。
+	replyTaskCreationNotCreated = "当前未能生成确认卡，任务尚未创建；请补充缺失参数或重新发送确认。"
 	// replyExternalProtocolFailure 用于外部只读调用已经进入隔离边界、但模型泄漏
 	// 内部工具协议的场景。外部调用本身也可能失败，故只陈述零工具边界能证明的事实。
 	replyExternalProtocolFailure = "外部资料读取或整理未能可靠完成；本轮未创建或修改任何内容，请重新发送需求。"
@@ -381,21 +400,27 @@ func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, ext
 		return Outcome{}, err
 	}
 
+	directTaskCreation := !externalInput && isDirectTaskCreationConfirmation(text)
+
 	// 外部上下文入口不读取画像：不是“读了但不渲染”，而是从数据访问层就不碰。
-	// 普通消息仍每条现查一次，本条消息内的多轮模型调用共享同一快照。
+	// direct-task-creation 同样从数据访问层跳过画像，防止模型把用户没有批准的
+	// 行业/岗位/标签扩写进 proposal。其余普通消息仍每条现查一次，本条消息内
+	// 的多轮模型调用共享同一快照。
 	var hint string
-	if !externalInput {
+	if !externalInput && !directTaskCreation {
 		hint = l.profileHint(ctx, userID)
 	}
 
 	// 兼容清洗部署前已经落库的外部 tool result：不能只保护新写入，否则旧会话
 	// 在下一条消息仍会与画像和完整工具面同屏。
 	history := l.scrubUntrustedHistory(decodeMessages(sess))
-	// 外部追问/引用正文的首轮模型请求也不能看到既有会话：即使零工具、
-	// 零画像，恶意正文仍可直接要求模型复述旧私聊/任务结果。历史只留待
-	// 本轮结束后重新合并持久化，不进入 converse。
+	// 外部追问/引用正文的首轮模型请求不能看到既有会话：即使零工具、
+	// 零画像，恶意正文仍可直接要求模型复述旧私聊/任务结果。
+	// self-contained direct-task-creation 同样只给当前用户消息：历史里可能
+	// 留有 view_profile 回执或模型派生画像，不能让它们扩写本次 proposal。
+	// 两类历史都只留待本轮结束后重新合并持久化，不进入 converse。
 	modelHistory := history
-	if externalInput {
+	if externalInput || directTaskCreation {
 		modelHistory = nil
 	}
 	msgs := append(modelHistory, llm.ChatMessage{Role: "user", Content: text})
@@ -409,6 +434,7 @@ func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, ext
 	// 传给工具 Execute（工具是全局单例，不能携带 per-message 状态）。
 	state := &toolRunState{
 		activation:              decodeActivation(sess.ActivatedTools),
+		directTaskCreation:      directTaskCreation,
 		untrustedExternalResult: externalInput,
 	}
 
@@ -423,6 +449,18 @@ func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, ext
 		// 给出了信任标签，未来包装文案改名也不能让原文漏进持久化历史。
 		externalTurn := redactLatestExternalInput(msgs)
 		msgs = truncateMessages(append(history, externalTurn...))
+	} else if directTaskCreation {
+		// converse 只处理 current-user-only 视图；持久化时把本轮安全交换追加
+		// 回原有已清洗历史，既不泄漏旧画像给模型，也不抹掉用户会话。
+		// 无论最终成功与否都不保留动态参数校验 tool result：先校验失败、
+		// 再修正成功时，通用历史清洗仍无法仅凭自由文本证明第一次回执来自
+		// 本地，会 fail-closed 把整轮误记成“外部查询”。工具审计仍在
+		// tool_calls 独立账本；聊天历史只留用户可见的事实。
+		msgs = []llm.ChatMessage{
+			{Role: "user", Content: text},
+			{Role: "assistant", Content: outcome.Reply},
+		}
+		msgs = truncateMessages(append(history, msgs...))
 	}
 	msgs = l.scrubUntrustedHistory(msgs)
 	l.saveSession(ctx, sess, msgs, turns, state)
@@ -466,6 +504,12 @@ func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMess
 func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msgs []llm.ChatMessage, hint string, state *toolRunState) (Outcome, []llm.ChatMessage, int, error) {
 	ctx = context.WithValue(ctx, toolRunKey{}, state)
 
+	var directTaskCreationBase []llm.ChatMessage
+	if state != nil && state.directTaskCreation {
+		// 缩面后若模型仍幻觉隐藏工具，下一轮回到这一份进入本消息时的
+		// 安全基线；不把“未声明工具的原生 tool history”送回供应商。
+		directTaskCreationBase = append([]llm.ChatMessage(nil), msgs...)
+	}
 	turns := 0
 	for turns < l.maxTurns {
 		// Do not start a new paid model turn after the owner canceled. Individual
@@ -481,6 +525,11 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			// runToolCalls 双层关闭，避免把上下文编码进第二个 URL/query 外带。
 			profileHint, renderProfile = "", false
 		}
+		if state.directTaskCreation {
+			// direct 模式也不渲染“画像尚未建立”占位：基础 prompt 会据此主动
+			// 追问行业/岗位，正好偏离当前已明确的出卡请求。
+			profileHint, renderProfile = "", false
+		}
 		tools := l.requestTools(state)
 		requestMessages := msgs
 		if state.untrustedExternalResult && len(tools) == 0 {
@@ -490,9 +539,19 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			// 只把 taint 后含工具协议的出站视图投影为纯 user 数据消息。
 			requestMessages = untrustedContinuationMessages(msgs)
 		}
+		system := l.sys
+		if state.directTaskCreation {
+			system += directTaskCreationSystemNote
+			if state.directTaskCreationToolRejected {
+				system += directTaskCreationRetrySystemNote
+			}
+			if state.directTaskCreationResponseRejected {
+				system += directTaskCreationResponseRetrySystemNote
+			}
+		}
 		resp, err := l.chatFn(ctx, llm.ChatRequest{
 			Model:    l.model,
-			Messages: withSystem(l.sys, requestMessages, profileHint, renderProfile),
+			Messages: withSystem(system, requestMessages, profileHint, renderProfile),
 			// 每轮现算工具面：静态声明 + 会话已激活端点声明（search_endpoints 本轮
 			// 激活的端点，下一轮就出现在这里——检索后注入的核心闭环）。
 			Tools:     tools,
@@ -519,6 +578,22 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 
 		// 无 tool_calls 即收敛：模型给出了最终文字回复。
 		if len(resp.ToolCalls) == 0 {
+			if state.directTaskCreation {
+				if !state.directTaskCreationResponseRejected {
+					// direct 模式不转发任何没有 proposal 的自由文本：开放式
+					// “追问”分类可被“确认卡稍后出现，可以吗？”一类同义承诺
+					// 绕过。回到安全基线，给模型一次只调用 create_schedule
+					// 的自纠机会。
+					state.directTaskCreationResponseRejected = true
+					msgs = append([]llm.ChatMessage(nil), directTaskCreationBase...)
+					continue
+				}
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    "assistant",
+					Content: replyTaskCreationNotCreated,
+				})
+				return Outcome{Reply: replyTaskCreationNotCreated}, msgs, turns, nil
+			}
 			msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: resp.Content})
 			return Outcome{Reply: nonEmptyReply(resp.Content)}, msgs, turns, nil
 		}
@@ -526,9 +601,16 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		// assistant 历史消息必须携带 tool_calls 字段回传（契约 §4 线协议）。
 		// 外部读取执行成功后会在下方缩成去参数/去 content 的协议壳。
 		currentUser := latestUserMessage(msgs)
+		assistantContent := resp.Content
+		if state.directTaskCreation {
+			// direct 模式的可见成功只来自 durable proposal 后的固定出口。
+			// 即使供应商把“确认卡已生成”与无效 tool_call 同批返回，也不能
+			// 让这段口头承诺进入下一轮请求或持久化历史。
+			assistantContent = ""
+		}
 		msgs = append(msgs, llm.ChatMessage{
 			Role:      "assistant",
-			Content:   resp.Content,
+			Content:   assistantContent,
 			ToolCalls: resp.ToolCalls,
 		})
 
@@ -543,6 +625,12 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			// assistant content 与真实 arguments 全部丢弃；仅保留 tool_call
 			// 的 id/name 协议壳来匹配 role=tool 回执。
 			msgs = isolateExternalResultTurn(currentUser, resp.ToolCalls, toolMsgs)
+		}
+		if pending == nil && state.directTaskCreation && state.directTaskCreationToolRejected {
+			// 隐藏工具没有执行，协议壳也不值得保留；回到基线后让模型在
+			// 只声明 create_schedule 的干净请求上自纠。
+			msgs = append([]llm.ChatMessage(nil), directTaskCreationBase...)
+			continue
 		}
 		if pending == nil {
 			continue // 本轮全是读工具/自纠回执，结果已回填，进入下一轮。
@@ -609,6 +697,23 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		}
 		return out
 	}
+	if state != nil && state.directTaskCreation {
+		// 用户已经明确要求按当前消息直接出任务确认卡：只缩小工具面，不扩大
+		// 权限。create_schedule 仍只生成 durable proposal，真正执行必须点卡。
+		tool, ok := l.tools["create_schedule"]
+		if !ok || !tool.Mutating() {
+			return nil
+		}
+		// New 的 map 语义是同名后注册者生效；从尾部取声明，确保 schema 与
+		// runToolCalls 最终解析到的是同一个注册项。
+		for i := len(l.toolDefs) - 1; i >= 0; i-- {
+			def := l.toolDefs[i]
+			if def.Name == "create_schedule" {
+				return []llm.ToolDef{def}
+			}
+		}
+		return nil
+	}
 	if l.endpoints == nil {
 		return l.toolDefs
 	}
@@ -670,7 +775,32 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 	// 模型单独重试。只“放行一个、拒绝其余”仍会把被拒调用的 args/content
 	// 写进下一轮消息，与随后返回的恶意网页同屏。
 	state := runStateFrom(ctx)
-	if len(calls) != 1 && l.batchMayProduceExternalResult(calls, state) {
+	if state != nil && state.directTaskCreation {
+		for _, tc := range calls {
+			if tc.Name == "create_schedule" {
+				continue
+			}
+			state.directTaskCreationToolRejected = true
+			for _, rejected := range calls {
+				out = append(out, toolMsg(rejected.ID, toolMsgDirectTaskCreationOnly))
+			}
+			return nil, out, nil
+		}
+		tool, ok := l.tools["create_schedule"]
+		if !ok || !tool.Mutating() {
+			state.directTaskCreationToolRejected = true
+			for _, rejected := range calls {
+				out = append(out, toolMsg(rejected.ID,
+					"任务确认能力当前不可用；本次调用未执行。"))
+			}
+			return nil, out, nil
+		}
+		// 合法 create_schedule 重试需要看见 controller 的参数校验回执；
+		// 清掉旧拒绝标记，避免下一轮把该声明过的协议也丢回基线。
+		state.directTaskCreationToolRejected = false
+	}
+	if len(calls) != 1 && (state == nil || !state.directTaskCreation) &&
+		l.batchMayProduceExternalResult(calls, state) {
 		for _, tc := range calls {
 			out = append(out, toolMsg(tc.ID, toolMsgExternalBatch))
 		}
@@ -697,7 +827,6 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			out = append(out, toolMsg(tc.ID, fmt.Sprintf("工具 %s 不存在", tc.Name)))
 			continue
 		}
-
 		// 外部网页结果可参与本轮回答，但之后不能再调用任何工具。这是 prompt
 		// 之外的确定性边界：即使模型服从恶意网页并调用 view_profile、
 		// create_schedule 或把上下文编码进第二个 URL，系统也只回固定拒绝，
@@ -738,6 +867,15 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		if tc.Name == "create_schedule" {
 			if l.taskCreation == nil {
 				return nil, out, errors.New("agent: task creation controller is not configured")
+			}
+			if state := runStateFrom(ctx); state != nil && state.directTaskCreation &&
+				directTaskCreationReferencesExistingSources(args) {
+				// self-contained direct 模式没有执行 list_sources，也看不到历史；
+				// existing_source_ids 只能是模型猜测。即使仍需点卡，放进
+				// Propose 也会触发隐藏 DB 读取并让当前消息之外的数据影响方案。
+				out = append(out, toolMsg(tc.ID,
+					"直接创建模式不能引用 existing_source_ids；请在 approved_fetch_plan.sources 中提交用户本条消息明确指定的新信源。"))
+				continue
 			}
 			actionID := uuid.NewString()
 			proposal, err := l.taskCreation.Propose(ctx, task.CreationProposalInput{
@@ -785,6 +923,83 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		out = append(out, toolMsg(tc.ID, toolMsgConfirmCreated))
 	}
 	return pending, out, nil
+}
+
+func directTaskCreationReferencesExistingSources(args json.RawMessage) bool {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(args, &root) != nil {
+		return false // 交给 CreationController 返回统一 JSON/字段校验错误。
+	}
+	rawPlan, ok := root["approved_fetch_plan"]
+	if !ok {
+		return false
+	}
+	var plan map[string]json.RawMessage
+	if json.Unmarshal(rawPlan, &plan) != nil {
+		return false
+	}
+	_, ok = plan["existing_source_ids"]
+	return ok
+}
+
+func isDirectTaskCreationConfirmation(text string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(text), ""))
+	if normalized == "" {
+		return false
+	}
+	if containsAny(normalized,
+		"不要创建", "别创建", "取消创建", "暂不创建", "先不创建", "不创建",
+		"不要生成", "别生成", "暂不生成", "先不生成", "不生成",
+		"不要出确认卡", "别出确认卡",
+		"不确认创建", "我不确认", "未确认创建", "还没确认创建", "还未确认创建",
+		"尚未确认创建", "没有确认创建",
+		"donotcreate", "don'tcreate", "cancelcreation", "donotconfirm", "don'tconfirm",
+		"donotgenerate", "don'tgenerate", "notconfirmed", "havenotconfirmed",
+	) {
+		return false
+	}
+	if containsAny(normalized,
+		"?", "？", "吗", "为什么", "怎么", "如何", "能否", "能不能", "是否",
+		"是不是", "要不要", "可不可以", "什么是",
+		"why", "howdo", "howcan", "canwe", "cani", "shouldi",
+	) {
+		return false
+	}
+	if !startsWithAny(normalized,
+		"确认创建", "直接生成确认卡", "直接出确认卡",
+		"请直接生成确认卡", "请直接出确认卡",
+		"confirmandcreate", "directlycreatetheconfirmationcard",
+		"createtheconfirmationcard",
+	) {
+		return false
+	}
+	if containsAny(normalized,
+		"先搜索", "先查询", "先查", "先检查", "先核对", "先看看", "先看一下", "先看",
+		"先列出", "先列一下", "先列", "创建前", "确认前",
+		"搜索一下", "查询一下", "查一下", "检查一下", "核对一下", "列出现有",
+		"searchfirst", "checkfirst", "lookupfirst",
+	) {
+		return false
+	}
+	return true
+}
+
+func containsAny(text string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if strings.Contains(text, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func startsWithAny(text string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if strings.HasPrefix(text, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func latestUserMessage(msgs []llm.ChatMessage) llm.ChatMessage {

@@ -78,6 +78,19 @@ type toolCallRecKey struct{}
 // toolRunState 是一次 HandleMessage 的工具运行状态。
 type toolRunState struct {
 	activation *activationState
+	// directTaskCreation 表示用户已经明确要求按当前消息直接生成任务确认卡，
+	// 且没有要求先查询/核对。该模式只缩小当前消息的工具面到 create_schedule；
+	// 它不执行任务，仍须经过 durable proposal + 人工点击确认卡。
+	directTaskCreation bool
+	// directTaskCreationToolRejected 记录模型在缩面后仍幻觉调用了其他工具。
+	// 下一轮会丢弃这段未执行的原生 tool protocol，只保留进入本消息时的
+	// 安全基线并强化 system 提示，避免再次触发供应商协议兼容问题。
+	directTaskCreationToolRejected bool
+	// directTaskCreationResponseRejected 记录模型在没有真实 proposal 时给出了
+	// 无工具文字。下一轮同样回到安全基线；连续两次不调用 create_schedule
+	// 则返回确定性未创建文案。这里不词法区分“追问”和“口头承诺”，避免同义
+	// 承诺加问号绕过。
+	directTaskCreationResponseRejected bool
 	// endpointCalls 本条消息内已发起的端点调用次数（限额判定用）。计数时机在
 	// 校验通过之后、发请求之前：打到上游才算（含 HTTP 错误——失败同样计费），
 	// 参数校验失败没打上游、不计费，不吃限额。
