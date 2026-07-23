@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -115,6 +116,9 @@ func TestChatRejectsProductionDSMLLeakWithoutExecuting(t *testing.T) {
 	if types.IsRetryable(err) {
 		t.Error("DSML protocol error must be non-retryable")
 	}
+	if !errors.Is(err, ErrToolProtocolResponse) {
+		t.Fatalf("DSML error is not classifiable by callers: %v", err)
+	}
 	const want = "LLM_UNAVAILABLE: llm: 上游工具调用格式异常"
 	if err.Error() != want {
 		t.Errorf("error = %q, want fixed %q", err, want)
@@ -159,13 +163,19 @@ func TestChatHarmlessDSMLProseIsPreserved(t *testing.T) {
 	}
 }
 
-func TestChatToolFreeDSMLUsesPendingSafeDisplay(t *testing.T) {
+func TestChatToolFreeDSMLFailsClosedWithoutDurableState(t *testing.T) {
 	resp, err := chatWithDSMLResponse(t, productionDSMLLeak, nil, nil)
-	if err != nil {
-		t.Fatalf("tool-free finalizer must not orphan pending state: %v", err)
+	if err == nil {
+		t.Fatalf("tool-free DSML without caller-owned durable state must fail closed: %+v", resp)
 	}
-	if resp == nil || resp.Content != dsmlSafeContent || len(resp.ToolCalls) != 0 {
-		t.Fatalf("tool-free DSML did not become the neutral safe display: %+v", resp)
+	if resp == nil || resp.Content != "" || len(resp.ToolCalls) != 0 {
+		t.Fatalf("tool-free DSML retained executable or raw content: %+v", resp)
+	}
+	if types.IsRetryable(err) {
+		t.Error("deterministic protocol leak must be non-retryable")
+	}
+	if !errors.Is(err, ErrToolProtocolResponse) {
+		t.Fatalf("tool-free DSML error is not classifiable by callers: %v", err)
 	}
 }
 
@@ -333,6 +343,9 @@ func TestDoChatAccountsRejectedDSMLWithoutLeakingIt(t *testing.T) {
 		})
 	if err == nil || resp != nil {
 		t.Fatalf("DoChat must expose only the error: resp=%+v err=%v", resp, err)
+	}
+	if !errors.Is(err, ErrToolProtocolResponse) {
+		t.Fatalf("DoChat lost the protocol classification needed by Agent recovery: %v", err)
 	}
 	if st.call == nil {
 		t.Fatal("DSML protocol error was not recorded")
