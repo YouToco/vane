@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -14,8 +15,10 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/scheduler"
+	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
@@ -191,12 +194,12 @@ func (c *CreationCoordinator) Propose(
 	// Preserve the A0-observed path exactly: every pre-existing sources-only
 	// command first goes through the original full normalizer, including its
 	// validation precedence and error mapping. Only if that shape fails do we
-	// inspect the new reference-bearing proposal form.
+	// inspect the transient reference/source-spec proposal form.
 	command, _, legacyErr := normalizeCreateScheduleCommand(in.RawArgs)
 	var proposalArgs *createScheduleProposalArgs
 	var err error
 	if legacyErr != nil {
-		if !creationProposalHasReferenceField(in.RawArgs) {
+		if !creationProposalHasTransientField(in.RawArgs) {
 			return CreationProposal{}, creationValidation(
 				"任务方案未通过校验："+legacyErr.Error(), legacyErr,
 			)
@@ -207,10 +210,18 @@ func (c *CreationCoordinator) Propose(
 				"任务方案未通过校验："+err.Error(), err,
 			)
 		}
-		if proposalArgs.ApprovedFetchPlan.ExistingSourceIDs == nil {
-			err = errors.New("task: approved_fetch_plan.existing_source_ids must be an array")
-			return CreationProposal{}, creationValidation("任务方案未通过校验："+err.Error(), err)
+		materialized, materializeErr := materializeCreationSourceSpecs(
+			proposalArgs.ApprovedFetchPlan.SourceSpecs,
+		)
+		if materializeErr != nil {
+			return CreationProposal{}, creationValidation(
+				"任务方案未通过校验："+materializeErr.Error(), materializeErr,
+			)
 		}
+		proposalArgs.ApprovedFetchPlan.Sources = append(
+			proposalArgs.ApprovedFetchPlan.Sources, materialized...,
+		)
+		proposalArgs.ApprovedFetchPlan.SourceSpecs = nil
 	}
 	var tenantID int64
 	var canonicalArgs json.RawMessage
@@ -219,6 +230,22 @@ func (c *CreationCoordinator) Propose(
 		// Exact legacy order: every deterministic artifact is built before the
 		// first database lookup. A0 golden tests depend on failures here winning
 		// over membership/workspace failures.
+		canonicalArgs, summary, err = finalizeCreationProposal(command)
+		if err != nil {
+			return CreationProposal{}, err
+		}
+		tenantID, err = c.resolveActiveTenant(ctx, in.UserID)
+		if err != nil {
+			return CreationProposal{}, err
+		}
+	} else if len(proposalArgs.ApprovedFetchPlan.ExistingSourceIDs) == 0 {
+		// Pure source-spec proposals have no authorization-bearing references.
+		// Finish every deterministic build/network/summary check before the first
+		// tenant lookup, matching the legacy A0 validation precedence.
+		command, err = normalizeExpandedCreationProposal(proposalArgs, nil)
+		if err != nil {
+			return CreationProposal{}, err
+		}
 		canonicalArgs, summary, err = finalizeCreationProposal(command)
 		if err != nil {
 			return CreationProposal{}, err
@@ -1235,11 +1262,27 @@ type createScheduleProposalArgs struct {
 }
 
 type createScheduleProposalFetchPlan struct {
-	ExistingSourceIDs []int64               `json:"existing_source_ids,omitempty"`
-	Sources           []compiledFetchSource `json:"sources,omitempty"`
+	ExistingSourceIDs []int64                    `json:"existing_source_ids,omitempty"`
+	Sources           []compiledFetchSource      `json:"sources,omitempty"`
+	SourceSpecs       *createScheduleSourceSpecs `json:"source_specs,omitempty"`
 }
 
-func creationProposalHasReferenceField(raw json.RawMessage) bool {
+const creationSourceSpecsVersion = "vane.source-specs/v1"
+
+type createScheduleSourceSpecs struct {
+	Version string            `json:"version"`
+	Items   []json.RawMessage `json:"items"`
+}
+
+type createScheduleProposalExactEnvelope struct {
+	Spec              json.RawMessage `json:"spec,omitempty"`
+	Intent            json.RawMessage `json:"intent,omitempty"`
+	NLDescription     json.RawMessage `json:"nl_description,omitempty"`
+	Strictness        json.RawMessage `json:"strictness,omitempty"`
+	ApprovedFetchPlan json.RawMessage `json:"approved_fetch_plan,omitempty"`
+}
+
+func creationProposalHasTransientField(raw json.RawMessage) bool {
 	var root map[string]json.RawMessage
 	if err := decodeStrictJSON(raw, &root); err != nil {
 		return false
@@ -1252,7 +1295,10 @@ func creationProposalHasReferenceField(raw json.RawMessage) bool {
 	if err := decodeStrictJSON(planRaw, &plan); err != nil {
 		return false
 	}
-	_, ok = plan["existing_source_ids"]
+	if _, ok = plan["existing_source_ids"]; ok {
+		return true
+	}
+	_, ok = plan["source_specs"]
 	return ok
 }
 
@@ -1260,18 +1306,95 @@ func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArg
 	if len(raw) == 0 || len(raw) > maxCreationCommandBytes || !utf8.Valid(raw) {
 		return nil, errors.New("task: create_schedule args are invalid")
 	}
-	var args *createScheduleProposalArgs
-	if err := decodeStrictJSON(raw, &args); err != nil {
-		return nil, fmt.Errorf("task: decode create_schedule proposal: %w", err)
+	var envelope createScheduleProposalExactEnvelope
+	if err := strictjson.DecodeExact(raw, &envelope); err != nil {
+		return nil, fmt.Errorf("task: decode exact create_schedule proposal envelope: %w", err)
 	}
-	if args == nil || args.Spec == nil {
-		return nil, errors.New("task: create_schedule spec is required")
+	args := &createScheduleProposalArgs{}
+	if len(envelope.Spec) != 0 {
+		if err := decodeStrictJSON(envelope.Spec, &args.Spec); err != nil {
+			return nil, fmt.Errorf("task: decode create_schedule spec: %w", err)
+		}
 	}
-	if args.ApprovedFetchPlan == nil {
+	if len(envelope.Intent) != 0 {
+		if err := decodeStrictJSON(envelope.Intent, &args.Intent); err != nil {
+			return nil, fmt.Errorf("task: decode create_schedule intent: %w", err)
+		}
+	}
+	if len(envelope.NLDescription) != 0 {
+		if isExplicitJSONNull(envelope.NLDescription) {
+			return nil, errors.New("task: nl_description must be a string")
+		}
+		if err := decodeStrictJSON(envelope.NLDescription, &args.NLDescription); err != nil {
+			return nil, fmt.Errorf("task: decode create_schedule nl_description: %w", err)
+		}
+	}
+	if len(envelope.Strictness) != 0 {
+		if isExplicitJSONNull(envelope.Strictness) {
+			return nil, errors.New("task: strictness must be a string")
+		}
+		if err := decodeStrictJSON(envelope.Strictness, &args.Strictness); err != nil {
+			return nil, fmt.Errorf("task: decode create_schedule strictness: %w", err)
+		}
+	}
+	// Preserve the legacy common-envelope precedence before inspecting any
+	// transient plan structure. Invalid spec/intent/strictness must win over a
+	// bad source_specs version, empty items, or invalid existing IDs.
+	if _, err := normalizeCreateScheduleEnvelope(&createScheduleCommandArgs{
+		Spec: args.Spec, Intent: args.Intent,
+		NLDescription: args.NLDescription, Strictness: args.Strictness,
+	}); err != nil {
+		return nil, err
+	}
+	if len(envelope.ApprovedFetchPlan) == 0 {
 		return nil, errors.New("task: approved_fetch_plan is required")
 	}
-	plan := args.ApprovedFetchPlan
-	combined := len(plan.ExistingSourceIDs) + len(plan.Sources)
+	var plan createScheduleProposalFetchPlan
+	if err := strictjson.DecodeExact(envelope.ApprovedFetchPlan, &plan); err != nil {
+		return nil, fmt.Errorf("task: decode exact approved_fetch_plan: %w", err)
+	}
+	args.ApprovedFetchPlan = &plan
+	var planFields map[string]json.RawMessage
+	if err := decodeStrictJSON(envelope.ApprovedFetchPlan, &planFields); err != nil ||
+		planFields == nil {
+		return nil, errors.New("task: approved_fetch_plan must be a JSON object")
+	}
+	existingRaw, hasExisting := planFields["existing_source_ids"]
+	sourcesRaw, hasSources := planFields["sources"]
+	sourceSpecsRaw, hasSourceSpecs := planFields["source_specs"]
+	if hasExisting && bytes.Equal(bytes.TrimSpace(existingRaw), []byte("null")) {
+		return nil, errors.New(
+			"task: approved_fetch_plan.existing_source_ids must be an array",
+		)
+	}
+	if hasSources && bytes.Equal(bytes.TrimSpace(sourcesRaw), []byte("null")) {
+		return nil, errors.New("task: approved_fetch_plan.sources must be an array")
+	}
+	if hasSourceSpecs && bytes.Equal(bytes.TrimSpace(sourceSpecsRaw), []byte("null")) {
+		return nil, errors.New("task: approved_fetch_plan.source_specs must be an object")
+	}
+	if hasSourceSpecs && hasSources {
+		return nil, errors.New(
+			"task: approved_fetch_plan.source_specs cannot be mixed with materialized sources",
+		)
+	}
+	sourceSpecCount := 0
+	if hasSourceSpecs {
+		if plan.SourceSpecs == nil ||
+			plan.SourceSpecs.Version != creationSourceSpecsVersion {
+			return nil, fmt.Errorf(
+				"task: approved_fetch_plan.source_specs.version must be %q",
+				creationSourceSpecsVersion,
+			)
+		}
+		sourceSpecCount = len(plan.SourceSpecs.Items)
+		if sourceSpecCount == 0 {
+			return nil, errors.New(
+				"task: approved_fetch_plan.source_specs.items must be non-empty",
+			)
+		}
+	}
+	combined := len(plan.ExistingSourceIDs) + len(plan.Sources) + sourceSpecCount
 	if combined == 0 {
 		return nil, errors.New("task: approved_fetch_plan must contain at least one source")
 	}
@@ -1295,6 +1418,247 @@ func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArg
 		seen[sourceID] = struct{}{}
 	}
 	return args, nil
+}
+
+func materializeCreationSourceSpecs(
+	sourceSpecs *createScheduleSourceSpecs,
+) ([]compiledFetchSource, error) {
+	if sourceSpecs == nil {
+		return nil, nil
+	}
+	materialized := make([]compiledFetchSource, 0, len(sourceSpecs.Items))
+	for i, raw := range sourceSpecs.Items {
+		spec, err := decodeCreationSourceSpec(raw)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"task: approved_fetch_plan.source_specs.items[%d]: %w", i, err,
+			)
+		}
+		source, message := sourcespec.Build(spec)
+		if message != "" || source == nil {
+			if message == "" {
+				message = "信源无法构造"
+			}
+			return nil, fmt.Errorf(
+				"task: approved_fetch_plan.source_specs.items[%d]: %s", i, message,
+			)
+		}
+		// Model-facing specs never control presentation titles. Build derives a
+		// deterministic title from the real query/URL; normalize that derived
+		// label before it reaches a plain-text confirmation card, then rebuild
+		// with the exact safe title so ValidateMaterialized remains a proof.
+		safeTitle := promptguard.SingleLine(promptguard.StripInvisible(source.Title))
+		safeTitle = truncateCreationRunes(safeTitle, maxCompiledSourceRunes)
+		if safeTitle != source.Title {
+			spec.Title = safeTitle
+			source, message = sourcespec.Build(spec)
+			if message != "" || source == nil {
+				if message == "" {
+					message = "信源安全标题无法构造"
+				}
+				return nil, fmt.Errorf(
+					"task: approved_fetch_plan.source_specs.items[%d]: %s", i, message,
+				)
+			}
+		}
+		config := bytes.Clone(source.Config)
+		if len(bytes.TrimSpace(config)) == 0 {
+			// json.RawMessage(nil) marshals as null, while durable source config
+			// is always a JSON object. Normalize feed's empty config explicitly.
+			config = json.RawMessage(`{}`)
+		}
+		materialized = append(materialized, compiledFetchSource{
+			Platform: string(source.Platform), Capability: string(source.Capability),
+			Title: source.Title, URL: source.URL, Config: config,
+		})
+	}
+	return materialized, nil
+}
+
+var creationXHSUserIDRe = regexp.MustCompile(`^[0-9a-f]{24}$`)
+
+func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return sourcespec.Spec{}, errors.New("source spec must be a JSON object")
+	}
+	var fields map[string]json.RawMessage
+	if err := decodeStrictJSON(raw, &fields); err != nil || fields == nil {
+		if err == nil {
+			err = errors.New("source spec must be a non-null JSON object")
+		}
+		return sourcespec.Spec{}, err
+	}
+	var kind string
+	kindRaw, ok := fields["kind"]
+	if !ok || json.Unmarshal(kindRaw, &kind) != nil || strings.TrimSpace(kind) != kind {
+		return sourcespec.Spec{}, errors.New("kind must be a non-empty string")
+	}
+	switch kind {
+	case "web_search":
+		if isExplicitJSONNull(fields["include_domains"]) {
+			return sourcespec.Spec{}, errors.New("include_domains must be an array")
+		}
+		var input struct {
+			Kind           string   `json:"kind"`
+			Query          string   `json:"query"`
+			Category       string   `json:"category,omitempty"`
+			IncludeDomains []string `json:"include_domains,omitempty"`
+		}
+		if err := strictjson.DecodeExact(raw, &input); err != nil {
+			return sourcespec.Spec{}, err
+		}
+		params := map[string]string{"query": input.Query}
+		if input.Category != "" {
+			params["category"] = input.Category
+		}
+		if input.IncludeDomains != nil {
+			encoded, err := json.Marshal(input.IncludeDomains)
+			if err != nil {
+				return sourcespec.Spec{}, fmt.Errorf("encode include_domains: %w", err)
+			}
+			params["include_domains"] = string(encoded)
+		}
+		return sourcespec.Spec{
+			Platform: string(types.PlatformWeb), Capability: string(types.CapSearch),
+			Params: params,
+		}, nil
+
+	case "web_feed":
+		if isExplicitJSONNull(fields["categories"]) {
+			return sourcespec.Spec{}, errors.New("categories must be an array")
+		}
+		var input struct {
+			Kind       string   `json:"kind"`
+			FeedURL    string   `json:"feed_url"`
+			Categories []string `json:"categories,omitempty"`
+		}
+		if err := strictjson.DecodeExact(raw, &input); err != nil {
+			return sourcespec.Spec{}, err
+		}
+		params := map[string]string{"url": input.FeedURL}
+		if input.Categories != nil {
+			encoded, err := json.Marshal(input.Categories)
+			if err != nil {
+				return sourcespec.Spec{}, fmt.Errorf("encode categories: %w", err)
+			}
+			params["categories"] = string(encoded)
+		}
+		return sourcespec.Spec{
+			Platform: string(types.PlatformWeb), Capability: string(types.CapFeed),
+			Params: params,
+		}, nil
+
+	case "web_contents":
+		var input struct {
+			Kind    string `json:"kind"`
+			PageURL string `json:"page_url"`
+		}
+		if err := strictjson.DecodeExact(raw, &input); err != nil {
+			return sourcespec.Spec{}, err
+		}
+		return sourcespec.Spec{
+			Platform: string(types.PlatformWeb), Capability: string(types.CapContents),
+			Params: map[string]string{"url": input.PageURL},
+		}, nil
+
+	case "x_user_posts":
+		var input struct {
+			Kind       string `json:"kind"`
+			ScreenName string `json:"screen_name"`
+		}
+		if err := strictjson.DecodeExact(raw, &input); err != nil {
+			return sourcespec.Spec{}, err
+		}
+		return sourcespec.Spec{
+			Platform: string(types.PlatformX), Capability: string(types.CapUserPosts),
+			Params: map[string]string{"screen_name": input.ScreenName},
+		}, nil
+
+	case "xhs_search":
+		var input struct {
+			Kind    string `json:"kind"`
+			Keyword string `json:"keyword"`
+		}
+		if err := strictjson.DecodeExact(raw, &input); err != nil {
+			return sourcespec.Spec{}, err
+		}
+		return sourcespec.Spec{
+			Platform: string(types.PlatformXHS), Capability: string(types.CapSearch),
+			Params: map[string]string{"keyword": input.Keyword},
+		}, nil
+
+	case "xhs_user_posts", "xhs_faved_notes":
+		var input struct {
+			Kind       string `json:"kind"`
+			UserID     string `json:"user_id,omitempty"`
+			ProfileURL string `json:"profile_url,omitempty"`
+		}
+		if err := strictjson.DecodeExact(raw, &input); err != nil {
+			return sourcespec.Spec{}, err
+		}
+		if (strings.TrimSpace(input.UserID) == "") ==
+			(strings.TrimSpace(input.ProfileURL) == "") {
+			return sourcespec.Spec{}, errors.New(
+				"exactly one of user_id or profile_url is required",
+			)
+		}
+		if input.UserID != "" && !creationXHSUserIDRe.MatchString(input.UserID) {
+			return sourcespec.Spec{}, errors.New(
+				"user_id must be exactly 24 lowercase hexadecimal characters",
+			)
+		}
+		capability := types.CapUserPosts
+		if kind == "xhs_faved_notes" {
+			capability = types.CapFavedNotes
+		}
+		return sourcespec.Spec{
+			Platform: string(types.PlatformXHS), Capability: string(capability),
+			Params: map[string]string{
+				"user_id": input.UserID, "profile_url": input.ProfileURL,
+			},
+		}, nil
+
+	case "xhs_hot_list":
+		var input struct {
+			Kind string `json:"kind"`
+		}
+		if err := strictjson.DecodeExact(raw, &input); err != nil {
+			return sourcespec.Spec{}, err
+		}
+		return sourcespec.Spec{
+			Platform: string(types.PlatformXHS), Capability: string(types.CapHotList),
+			Params: map[string]string{},
+		}, nil
+
+	case "xhs_topic_feed":
+		var input struct {
+			Kind     string `json:"kind"`
+			PageID   string `json:"page_id,omitempty"`
+			TopicURL string `json:"topic_url,omitempty"`
+		}
+		if err := strictjson.DecodeExact(raw, &input); err != nil {
+			return sourcespec.Spec{}, err
+		}
+		if (strings.TrimSpace(input.PageID) == "") ==
+			(strings.TrimSpace(input.TopicURL) == "") {
+			return sourcespec.Spec{}, errors.New(
+				"exactly one of page_id or topic_url is required",
+			)
+		}
+		return sourcespec.Spec{
+			Platform: string(types.PlatformXHS), Capability: string(types.CapTopicFeed),
+			Params: map[string]string{
+				"page_id": input.PageID, "topic_url": input.TopicURL,
+			},
+		}, nil
+
+	default:
+		return sourcespec.Spec{}, fmt.Errorf("unsupported kind %q", kind)
+	}
+}
+
+func isExplicitJSONNull(raw json.RawMessage) bool {
+	return len(raw) != 0 && bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
 // freezeCreationProposal resolves authorized references exactly once and then
@@ -1330,6 +1694,19 @@ func (c *CreationCoordinator) freezeCreationProposal(
 		}
 	}
 
+	return normalizeExpandedCreationProposal(proposal, resolved)
+}
+
+func normalizeExpandedCreationProposal(
+	proposal *createScheduleProposalArgs,
+	resolved []types.Source,
+) (normalizedCreateScheduleCommand, error) {
+	if proposal == nil || proposal.ApprovedFetchPlan == nil {
+		return normalizedCreateScheduleCommand{}, creationValidation(
+			"任务方案未通过校验", nil,
+		)
+	}
+	plan := proposal.ApprovedFetchPlan
 	sources := make([]compiledFetchSource, 0, len(resolved)+len(plan.Sources))
 	for i, source := range resolved {
 		if source.ID != plan.ExistingSourceIDs[i] || source.Status != types.SourceStatusActive {
@@ -1553,9 +1930,11 @@ func summarizeApprovedSource(source compiledFetchSource) string {
 			IncludeDomains []string `json:"include_domains"`
 		}
 		if decodeStrictJSON(source.Config, &config) == nil {
-			detail := "搜索“" + config.Query + "”"
+			detail := "搜索“" +
+				promptguard.SingleLine(promptguard.StripInvisible(config.Query)) + "”"
 			if config.Category != "" {
-				detail += "，分类 " + config.Category
+				detail += "，分类 " +
+					promptguard.SingleLine(promptguard.StripInvisible(config.Category))
 			}
 			if len(config.IncludeDomains) != 0 {
 				detail += "，仅限 " + strings.Join(config.IncludeDomains, "、")

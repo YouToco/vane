@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
@@ -605,6 +606,9 @@ func parseIncludeDomains(raw string) ([]string, string) {
 		if d == "" {
 			continue
 		}
+		if !validIncludeDomain(d) {
+			return nil, "include_domains 每项必须是裸域名，不能含协议、路径、端口、通配符、IP 或本地域名"
+		}
 		if _, dup := seen[d]; dup {
 			continue
 		}
@@ -616,6 +620,87 @@ func parseIncludeDomains(raw string) ([]string, string) {
 	}
 	sort.Strings(out)
 	return out, ""
+}
+
+func validIncludeDomain(domain string) bool {
+	if domain == "" || len(domain) > 253 || strings.HasSuffix(domain, ".") ||
+		strings.ContainsAny(domain, ":/?#@*[]") ||
+		IsIPAddressLike(domain) ||
+		domain == "localhost" || strings.HasSuffix(domain, ".localhost") ||
+		strings.HasSuffix(domain, ".local") {
+		return false
+	}
+	labels := strings.Split(domain, ".")
+	if len(labels) < 2 {
+		return false
+	}
+	for _, label := range labels {
+		if label == "" || len(label) > 63 ||
+			label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+// IsIPAddressLike recognizes canonical IP literals and the numeric IPv4
+// spellings accepted by common resolvers/inet_aton (for example 127.1,
+// 2130706433, 017700000001, and 0x7f000001). netip.ParseAddr also recognizes
+// RFC 6874 zoned IPv6 literals (for example fe80::1%en0), which must never
+// masquerade as hostnames during pre-pending SSRF validation.
+func IsIPAddressLike(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	parts := strings.Split(host, ".")
+	for _, part := range parts {
+		if !numericHostPart(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func numericHostPart(part string) bool {
+	if part == "" {
+		return false
+	}
+	if part[0] == '+' {
+		part = part[1:]
+		if part == "" {
+			return false
+		}
+	}
+	if strings.HasPrefix(part, "0x") || strings.HasPrefix(part, "0X") {
+		part = part[2:]
+		if part == "" {
+			return false
+		}
+		for _, r := range part {
+			if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') ||
+				(r >= 'A' && r <= 'F') {
+				continue
+			}
+			return false
+		}
+		return true
+	}
+	for _, r := range part {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // parseCategories 解析 web/feed 的 categories 入参（JSON 字符串数组），

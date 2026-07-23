@@ -470,50 +470,60 @@ func normalizeCreateScheduleCommand(
 		return normalizedCreateScheduleCommand{}, nil,
 			fmt.Errorf("task: decode create_schedule args: %w", err)
 	}
-	if args == nil || args.Spec == nil {
-		return normalizedCreateScheduleCommand{}, nil, errors.New("task: create_schedule spec is required")
-	}
-	intent := strings.TrimSpace(args.Intent)
-	if intent == "" {
-		return normalizedCreateScheduleCommand{}, nil,
-			errors.New("task: approved intent must be non-empty")
-	}
-	if utf8.RuneCountInString(intent) > maxCreationPlaybookRunes {
-		return normalizedCreateScheduleCommand{}, nil,
-			fmt.Errorf("task: approved intent exceeds %d characters", maxCreationPlaybookRunes)
-	}
-	if args.Strictness != "" && !args.Strictness.Valid() {
-		return normalizedCreateScheduleCommand{}, nil,
-			errors.New("task: strictness must be empty, loose, normal, or strict")
-	}
-	spec, err := normalizeCreationScheduleSpec(*args.Spec)
+	command, err := normalizeCreateScheduleEnvelope(args)
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, nil, err
-	}
-	description := strings.TrimSpace(args.NLDescription)
-	if description == "" {
-		description = truncateCreationRunes(intent, maxCreationDescriptionRunes)
-	}
-	if utf8.RuneCountInString(description) > maxCreationDescriptionRunes {
-		return normalizedCreateScheduleCommand{}, nil,
-			fmt.Errorf("task: nl_description exceeds %d characters", maxCreationDescriptionRunes)
 	}
 	approvedPlan, err := canonicalizeFetchPlan(args.ApprovedFetchPlan)
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, nil,
 			fmt.Errorf("task: approved_fetch_plan is invalid: %w", err)
 	}
-	command := normalizedCreateScheduleCommand{
-		Version: creationCommandVersion, Spec: spec,
-		Intent: intent, NLDescription: description, Strictness: args.Strictness,
-		ApprovedFetchPlan: approvedPlan,
-	}
+	command.ApprovedFetchPlan = approvedPlan
 	canonical, err := json.Marshal(command)
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, nil,
 			fmt.Errorf("task: marshal normalized create_schedule command: %w", err)
 	}
 	return command, canonical, nil
+}
+
+func normalizeCreateScheduleEnvelope(
+	args *createScheduleCommandArgs,
+) (normalizedCreateScheduleCommand, error) {
+	if args == nil || args.Spec == nil {
+		return normalizedCreateScheduleCommand{},
+			errors.New("task: create_schedule spec is required")
+	}
+	intent := strings.TrimSpace(args.Intent)
+	if intent == "" {
+		return normalizedCreateScheduleCommand{},
+			errors.New("task: approved intent must be non-empty")
+	}
+	if utf8.RuneCountInString(intent) > maxCreationPlaybookRunes {
+		return normalizedCreateScheduleCommand{},
+			fmt.Errorf("task: approved intent exceeds %d characters", maxCreationPlaybookRunes)
+	}
+	if args.Strictness != "" && !args.Strictness.Valid() {
+		return normalizedCreateScheduleCommand{},
+			errors.New("task: strictness must be empty, loose, normal, or strict")
+	}
+	spec, err := normalizeCreationScheduleSpec(*args.Spec)
+	if err != nil {
+		return normalizedCreateScheduleCommand{}, err
+	}
+	description := strings.TrimSpace(args.NLDescription)
+	if description == "" {
+		description = truncateCreationRunes(intent, maxCreationDescriptionRunes)
+	}
+	if utf8.RuneCountInString(description) > maxCreationDescriptionRunes {
+		return normalizedCreateScheduleCommand{},
+			fmt.Errorf("task: nl_description exceeds %d characters", maxCreationDescriptionRunes)
+	}
+	return normalizedCreateScheduleCommand{
+		Version: creationCommandVersion, Spec: spec,
+		Intent: intent, NLDescription: description, Strictness: args.Strictness,
+	}, nil
 }
 
 func normalizeCreationScheduleSpec(in createScheduleCommandSpec) (scheduler.ScheduleSpec, error) {
@@ -636,8 +646,12 @@ func validateApprovedSourceNetworkBoundary(source *types.Source) error {
 		strings.HasSuffix(host, ".local") {
 		return errors.New("local hostnames are forbidden")
 	}
-	if ip := net.ParseIP(host); ip != nil && approvedSourceIPBlocked(ip) {
-		return errors.New("private or special-use IP addresses are forbidden")
+	if ip := net.ParseIP(host); ip != nil {
+		if approvedSourceIPBlocked(ip) {
+			return errors.New("private or special-use IP addresses are forbidden")
+		}
+	} else if sourcespec.IsIPAddressLike(host) {
+		return errors.New("non-canonical numeric IP addresses are forbidden")
 	}
 	return nil
 }

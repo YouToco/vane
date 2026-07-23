@@ -122,6 +122,49 @@ func TestFetchRSS_BlocksLoopback(t *testing.T) {
 	}
 }
 
+func TestFetchRSS_BlocksZonedIPv6LiteralBeforeRequest(t *testing.T) {
+	f := newTestFetcher()
+	var lookups int
+	f.lookupIP = func(string) ([]net.IP, error) {
+		lookups++
+		return nil, errors.New("lookup must not run")
+	}
+	for _, rawURL := range []string{
+		"http://[::1%25lo0]/feed.xml",
+		"http://[fe80::1%25en0]:8080/feed.xml",
+	} {
+		t.Run(rawURL, func(t *testing.T) {
+			_, err := f.FetchRSS(t.Context(), types.Source{ID: 1, URL: rawURL})
+			if !errors.Is(err, types.ErrValidation) ||
+				types.CodeOf(err) != types.CodeValidation {
+				t.Fatalf("zoned IPv6 literal must fail before request: err=%v", err)
+			}
+		})
+	}
+	if lookups != 0 {
+		t.Fatalf("zoned literal must be rejected before DNS or request: lookups=%d", lookups)
+	}
+}
+
+func TestFetchRSS_RedirectCannotBypassDialerWithZonedIPv6(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://[fe80::1%25en0]/feed.xml", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	// Allow the initial httptest loopback target. The redirect does not re-enter
+	// fetchBody's preflight, so only Dialer.Control can stop the zoned target.
+	f := newTestFetcher()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	_, err := f.FetchRSS(ctx, types.Source{ID: 1, URL: srv.URL})
+	if !errors.Is(err, errBlockedDial) ||
+		!errors.Is(err, types.ErrValidation) ||
+		types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("redirected zoned IPv6 must be blocked by Dialer.Control: err=%v", err)
+	}
+}
+
 func TestFetchRSS_RejectsBadScheme(t *testing.T) {
 	f := newTestFetcher()
 	_, err := f.FetchRSS(context.Background(), types.Source{ID: 1, URL: "ftp://example.com/feed"})

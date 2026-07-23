@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/scheduler"
+	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/types"
 )
 
@@ -42,6 +43,8 @@ type creationSagaFakeStore struct {
 	resolveSourceIDs         []int64
 	resolveSources           map[int64]types.Source
 	resolveErr               error
+	membershipCalls          int
+	tenantCalls              int
 }
 
 func newCreationSagaFakeStore() *creationSagaFakeStore {
@@ -54,10 +57,12 @@ func (s *creationSagaFakeStore) ListMembershipsByUser(
 	_ context.Context,
 	userID int64,
 ) ([]types.Membership, error) {
+	s.membershipCalls++
 	return []types.Membership{{TenantID: s.tenant.ID, UserID: userID}}, nil
 }
 
 func (s *creationSagaFakeStore) GetTenant(context.Context, int64) (*types.Tenant, error) {
+	s.tenantCalls++
 	tenant := s.tenant
 	return &tenant, nil
 }
@@ -560,6 +565,453 @@ func TestCreationCoordinator_ProposalCanonicalizesBeforePersistence(t *testing.T
 	}
 }
 
+func TestCreationCoordinator_ProposalMaterializesVersionedSourceSpecsBeforePersistence(t *testing.T) {
+	store := newCreationSagaFakeStore()
+	schedules := &creationSagaFakeScheduler{}
+	coordinator := NewCreationCoordinator(store, schedules, nil)
+	plan := json.RawMessage(`{
+		"source_specs":{
+			"version":"vane.source-specs/v1",
+			"items":[{
+				"kind":"web_search",
+				"query":"major AI model API pricing deprecation security updates",
+				"include_domains":["OpenAI.com","anthropic.com","openai.com","deepmind.google"]
+			},{
+				"kind":"web_contents",
+				"page_url":"https://ai.google.dev/gemini-api/docs/changelog"
+			}]
+		}
+	}`)
+
+	proposal, err := coordinator.Propose(t.Context(), CreationProposalInput{
+		ActionID: "action-source-specs", UserID: 11,
+		RawArgs: mustCreateArgsWithPlan(
+			t, "只监控三家公司官方确认的重大更新", "三家官方 AI 动态", plan,
+		),
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	if store.createCalls != 1 || store.resolveCalls != 0 {
+		t.Fatalf("纯 source_specs 应直接物化且不读取现有信源: create=%d resolve=%d",
+			store.createCalls, store.resolveCalls)
+	}
+	if bytes.Contains(store.op.Args, []byte("source_specs")) {
+		t.Fatalf("durable args 不得保存 transient source_specs: %s", store.op.Args)
+	}
+	command, _, err := normalizeCreateScheduleCommand(store.op.Args)
+	if err != nil {
+		t.Fatalf("normalize durable args: %v", err)
+	}
+	var frozen compiledFetchPlan
+	if err := decodeStrictJSON(command.ApprovedFetchPlan, &frozen); err != nil {
+		t.Fatalf("decode frozen plan: %v", err)
+	}
+	if len(frozen.Sources) != 2 {
+		t.Fatalf("frozen sources=%d want=2: %s", len(frozen.Sources), command.ApprovedFetchPlan)
+	}
+	search := frozen.Sources[0]
+	if search.URL != "vane://web/search?q=major+AI+model+API+pricing+deprecation+security+updates&include_domains=anthropic.com%2Cdeepmind.google%2Copenai.com" ||
+		search.Title != "搜索: major AI model API pricing deprecation security updates" ||
+		string(search.Config) != `{"include_domains":["anthropic.com","deepmind.google","openai.com"],"query":"major AI model API pricing deprecation security updates"}` {
+		t.Fatalf("web_search 未确定性物化: %+v", search)
+	}
+	contents := frozen.Sources[1]
+	if contents.URL != "vane://web/contents?url=https%3A%2F%2Fai.google.dev%2Fgemini-api%2Fdocs%2Fchangelog" ||
+		contents.Title != "页面监控: https://ai.google.dev/gemini-api/docs/changelog" ||
+		string(contents.Config) != `{"url":"https://ai.google.dev/gemini-api/docs/changelog"}` {
+		t.Fatalf("web_contents 未确定性物化: %+v", contents)
+	}
+	for _, want := range []string{
+		"信息范围（2）",
+		"搜索“major AI model API pricing deprecation security updates”",
+		"仅限 anthropic.com、deepmind.google、openai.com",
+		"页面 https://ai.google.dev/gemini-api/docs/changelog",
+	} {
+		if !strings.Contains(proposal.Summary, want) {
+			t.Fatalf("summary missing %q: %s", want, proposal.Summary)
+		}
+	}
+
+	// Confirm and every recovery pass consume only the already frozen durable
+	// plan. They must not decode source_specs or reinterpret the user's request.
+	frozenPlan := bytes.Clone(command.ApprovedFetchPlan)
+	result, err := coordinator.Confirm(
+		t.Context(), 11, "action-source-specs", testCreationReceiptTarget,
+	)
+	if err != nil || result.Status != types.PendingActionStatusExecuted ||
+		schedules.activateCalls != 1 ||
+		!bytes.Equal(store.definition.FetchPlan, frozenPlan) ||
+		bytes.Contains(store.definition.FetchPlan, []byte("source_specs")) {
+		t.Fatalf("Confirm must execute the exact frozen plan: result=%+v err=%v activate=%d frozen=%s final=%s",
+			result, err, schedules.activateCalls, frozenPlan, store.definition.FetchPlan)
+	}
+}
+
+func TestCreationCoordinator_SourceSpecsAreStrictAtomicAndUnambiguous(t *testing.T) {
+	valid := `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","include_domains":["openai.com"]}]}}`
+	cases := []struct {
+		name string
+		plan string
+		want string
+	}{
+		{
+			name: "wrong version",
+			plan: `{"source_specs":{"version":"vane.source-specs/v2","items":[{"kind":"web_search","query":"AI"}]}}`,
+			want: "version",
+		},
+		{
+			name: "case folded version key",
+			plan: `{"source_specs":{"VERSION":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
+			want: "unknown exact field",
+		},
+		{
+			name: "case folded source specs key",
+			plan: `{"Source_Specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
+			want: "unknown field",
+		},
+		{
+			name: "mixed with materialized sources",
+			plan: strings.TrimSuffix(valid, "}") + `,"sources":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=A","config":{"query":"A"}}]}`,
+			want: "cannot be mixed",
+		},
+		{
+			name: "null materialized sources cannot hide mixing",
+			plan: `{"sources":null,"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
+			want: "sources must be an array",
+		},
+		{
+			name: "null source specs is not omission",
+			plan: `{"source_specs":null,"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=AI","config":{"query":"AI"}}]}`,
+			want: "source_specs must be an object",
+		},
+		{
+			name: "null existing ids is not omission",
+			plan: `{"existing_source_ids":null,"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
+			want: "existing_source_ids must be an array",
+		},
+		{
+			name: "unknown field",
+			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","config":{}}]}}`,
+			want: "unknown exact field",
+		},
+		{
+			name: "duplicate inner key",
+			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","query":"crypto"}]}}`,
+			want: "duplicate",
+		},
+		{
+			name: "escaped discriminator key",
+			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"\u006bind":"web_search","query":"AI"}]}}`,
+			want: "canonical",
+		},
+		{
+			name: "case alias discriminator cannot collapse",
+			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","KIND":"web_contents","query":"AI"}]}}`,
+			want: "unknown exact field",
+		},
+		{
+			name: "irrelevant field",
+			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_contents","page_url":"https://openai.com/news","query":"AI"}]}}`,
+			want: "unknown exact field",
+		},
+		{
+			name: "null include domains",
+			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","include_domains":null}]}}`,
+			want: "include_domains must be an array",
+		},
+		{
+			name: "null feed categories",
+			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_feed","feed_url":"https://openai.com/news/rss.xml","categories":null}]}}`,
+			want: "categories must be an array",
+		},
+		{
+			name: "ambiguous identity alternatives",
+			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"xhs_user_posts","user_id":"6a5578b3000000000e03cc00","profile_url":"https://www.xiaohongshu.com/user/profile/6a5578b3000000000e03cc00"}]}}`,
+			want: "exactly one",
+		},
+		{
+			name: "invalid xhs user id before any lookup",
+			plan: `{"existing_source_ids":[12],"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"xhs_faved_notes","user_id":"abc"}]}}`,
+			want: "24 lowercase hexadecimal",
+		},
+		{
+			name: "invalid include domain",
+			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","include_domains":["https://openai.com/news"]}]}}`,
+			want: "include_domains",
+		},
+		{
+			name: "one bad item rejects whole batch",
+			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"},{"kind":"web_contents","page_url":"http://127.0.0.1/private"}]}}`,
+			want: "network policy",
+		},
+		{
+			name: "canonical duplicate",
+			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","include_domains":["OpenAI.com"]},{"kind":"web_search","query":"AI","include_domains":["openai.com"]}]}}`,
+			want: "duplicated",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newCreationSagaFakeStore()
+			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+				ActionID: "action-invalid-source-spec", UserID: 11,
+				RawArgs: mustCreateArgsWithPlan(
+					t, "监控官方更新", "官方更新", json.RawMessage(tc.plan),
+				),
+				ExpiresAt: time.Now().Add(time.Hour),
+			})
+			if !errors.Is(err, types.ErrValidation) || !strings.Contains(err.Error(), tc.want) ||
+				store.createCalls != 0 || store.resolveCalls != 0 ||
+				store.membershipCalls != 0 || store.tenantCalls != 0 {
+				t.Fatalf("err=%v want_substring=%q create=%d resolve=%d membership=%d tenant=%d",
+					err, tc.want, store.createCalls, store.resolveCalls,
+					store.membershipCalls, store.tenantCalls)
+			}
+		})
+	}
+}
+
+func TestCreationCoordinator_SourceSpecsValidateCommonEnvelopeBeforeMaterializing(t *testing.T) {
+	plans := []json.RawMessage{
+		json.RawMessage(`{"source_specs":{"version":"bad","items":[]}}`),
+		json.RawMessage(`{"source_specs":{"version":"vane.source-specs/v1","items":[]}}`),
+		json.RawMessage(`{"existing_source_ids":"not-an-array","source_specs":{
+			"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`),
+		json.RawMessage(`{"source_specs":{"version":"vane.source-specs/v1","items":[{
+			"kind":"web_search","query":"AI","include_domains":["https://openai.com"]
+		}]}}`),
+	}
+	for i, plan := range plans {
+		t.Run(fmt.Sprintf("plan_%d", i), func(t *testing.T) {
+			store := newCreationSagaFakeStore()
+			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+			raw := mustCreateArgsWithPlan(t, "   ", "无效意图", plan)
+			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+				ActionID: "action-invalid-envelope-order", UserID: 11, RawArgs: raw,
+				ExpiresAt: time.Now().Add(time.Hour),
+			})
+			if !errors.Is(err, types.ErrValidation) ||
+				!strings.Contains(err.Error(), "approved intent must be non-empty") ||
+				store.membershipCalls != 0 || store.tenantCalls != 0 ||
+				store.resolveCalls != 0 || store.createCalls != 0 {
+				t.Fatalf("common envelope validation order drifted: err=%v membership=%d tenant=%d resolve=%d create=%d",
+					err, store.membershipCalls, store.tenantCalls,
+					store.resolveCalls, store.createCalls)
+			}
+		})
+	}
+}
+
+func TestCreationCoordinator_SourceSpecsRejectNullOptionalEnvelopeFields(t *testing.T) {
+	plan := `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`
+	for _, tc := range []struct {
+		name  string
+		field string
+	}{
+		{name: "nl description", field: `"nl_description":null`},
+		{name: "strictness", field: `"strictness":null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newCreationSagaFakeStore()
+			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+			raw := json.RawMessage(`{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
+				`"intent":"监控官方更新","approved_fetch_plan":` + plan + `,` + tc.field + `}`)
+			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+				ActionID: "action-null-envelope", UserID: 11, RawArgs: raw,
+				ExpiresAt: time.Now().Add(time.Hour),
+			})
+			if !errors.Is(err, types.ErrValidation) ||
+				!strings.Contains(err.Error(), "must be a string") ||
+				store.membershipCalls != 0 || store.tenantCalls != 0 ||
+				store.resolveCalls != 0 || store.createCalls != 0 {
+				t.Fatalf("null optional envelope field must fail before lookup: err=%v store=%+v",
+					err, store)
+			}
+		})
+	}
+}
+
+func TestMaterializeCreationSourceSpecs_CoversEveryAdvertisedKind(t *testing.T) {
+	const hexID = "6a5578b3000000000e03cc00"
+	cases := []struct {
+		name       string
+		item       string
+		wantURL    string
+		wantConfig string
+	}{
+		{
+			name:    "web search",
+			item:    `{"kind":"web_search","query":"AI","category":"news"}`,
+			wantURL: "vane://web/search?q=AI&category=news",
+		},
+		{
+			name:    "web feed",
+			item:    `{"kind":"web_feed","feed_url":"https://example.com/feed.xml","categories":["AI"]}`,
+			wantURL: "https://example.com/feed.xml#vane-categories=ai",
+		},
+		{
+			name:    "web contents",
+			item:    `{"kind":"web_contents","page_url":"https://example.com/changelog"}`,
+			wantURL: "vane://web/contents?url=https%3A%2F%2Fexample.com%2Fchangelog",
+		},
+		{
+			name:    "x user posts",
+			item:    `{"kind":"x_user_posts","screen_name":"OpenAI"}`,
+			wantURL: "vane://x/user_posts?screen_name=OpenAI",
+		},
+		{
+			name:    "xhs search",
+			item:    `{"kind":"xhs_search","keyword":"人工智能"}`,
+			wantURL: "vane://xhs/search?keyword=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD",
+		},
+		{
+			name:    "xhs user posts",
+			item:    `{"kind":"xhs_user_posts","user_id":"` + hexID + `"}`,
+			wantURL: "vane://xhs/user_posts?user_id=" + hexID,
+		},
+		{
+			name:       "xhs hot list",
+			item:       `{"kind":"xhs_hot_list"}`,
+			wantURL:    "vane://xhs/hot_list",
+			wantConfig: `{}`,
+		},
+		{
+			name:    "xhs topic feed",
+			item:    `{"kind":"xhs_topic_feed","page_id":"` + hexID + `"}`,
+			wantURL: "vane://xhs/topic_feed?page_id=" + hexID,
+		},
+		{
+			name:    "xhs faved notes",
+			item:    `{"kind":"xhs_faved_notes","profile_url":"https://www.xiaohongshu.com/user/profile/` + hexID + `"}`,
+			wantURL: "vane://xhs/faved_notes?user_id=" + hexID,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := materializeCreationSourceSpecs(&createScheduleSourceSpecs{
+				Version: creationSourceSpecsVersion,
+				Items:   []json.RawMessage{json.RawMessage(tc.item)},
+			})
+			if err != nil || len(got) != 1 || got[0].URL != tc.wantURL {
+				t.Fatalf("materialize=%+v err=%v want_url=%q", got, err, tc.wantURL)
+			}
+			source := &types.Source{
+				Platform:   types.Platform(got[0].Platform),
+				Capability: types.Capability(got[0].Capability),
+				Title:      got[0].Title, URL: got[0].URL, Config: got[0].Config,
+			}
+			if message := sourcespec.ValidateMaterialized(source); message != "" {
+				t.Fatalf("materialized source failed registry round-trip: source=%+v message=%q",
+					source, message)
+			}
+			if tc.wantConfig != "" && string(got[0].Config) != tc.wantConfig {
+				t.Fatalf("config=%s want=%s", got[0].Config, tc.wantConfig)
+			}
+		})
+	}
+}
+
+func TestMaterializeCreationSourceSpecs_ValidatesXHSUserIDs(t *testing.T) {
+	const userID = "6a5578b3000000000e03cc00"
+	profileURL := "https://www.xiaohongshu.com/user/profile/" + userID
+	for _, kind := range []string{"xhs_user_posts", "xhs_faved_notes"} {
+		t.Run(kind+"/valid_direct_and_profile_url_match", func(t *testing.T) {
+			direct, err := materializeCreationSourceSpecs(&createScheduleSourceSpecs{
+				Version: creationSourceSpecsVersion,
+				Items: []json.RawMessage{json.RawMessage(
+					`{"kind":"` + kind + `","user_id":"` + userID + `"}`,
+				)},
+			})
+			if err != nil || len(direct) != 1 {
+				t.Fatalf("direct user_id materialization=%+v err=%v", direct, err)
+			}
+			profile, err := materializeCreationSourceSpecs(&createScheduleSourceSpecs{
+				Version: creationSourceSpecsVersion,
+				Items: []json.RawMessage{json.RawMessage(
+					`{"kind":"` + kind + `","profile_url":"` + profileURL + `"}`,
+				)},
+			})
+			if err != nil || len(profile) != 1 ||
+				direct[0].URL != profile[0].URL ||
+				!bytes.Equal(direct[0].Config, profile[0].Config) {
+				t.Fatalf("profile_url must normalize identically: direct=%+v profile=%+v err=%v",
+					direct, profile, err)
+			}
+		})
+
+		invalid := []string{
+			"abc",
+			"6a5578b3000000000e03cc0g",
+			userID + "0",
+			" " + userID,
+			strings.ToUpper(userID),
+			profileURL,
+		}
+		for _, value := range invalid {
+			t.Run(kind+"/reject/"+value, func(t *testing.T) {
+				_, err := materializeCreationSourceSpecs(&createScheduleSourceSpecs{
+					Version: creationSourceSpecsVersion,
+					Items: []json.RawMessage{mustMarshal(t, map[string]any{
+						"kind": kind, "user_id": value,
+					})},
+				})
+				if err == nil || !strings.Contains(err.Error(), "24 lowercase hexadecimal") {
+					t.Fatalf("invalid direct user_id must be rejected: value=%q err=%v", value, err)
+				}
+			})
+		}
+	}
+}
+
+func TestCreationCoordinator_ProposalCombinesExistingSourcesAndSourceSpecs(t *testing.T) {
+	store := newCreationSagaFakeStore()
+	store.resolveSources = map[int64]types.Source{
+		12: {
+			ID: 12, Platform: types.PlatformWeb, Capability: types.CapSearch,
+			Title: "现有源", URL: "vane://web/search?q=existing",
+			Config: json.RawMessage(`{"query":"existing"}`), Status: types.SourceStatusActive,
+		},
+	}
+	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+	plan := json.RawMessage(`{
+		"existing_source_ids":[12],
+		"source_specs":{
+			"version":"vane.source-specs/v1",
+			"items":[{"kind":"web_feed","feed_url":"https://example.com/feed.xml"}]
+		}
+	}`)
+	_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+		ActionID: "action-existing-and-spec", UserID: 11,
+		RawArgs:   mustCreateArgsWithPlan(t, "监控已有源和新 RSS", "混合来源", plan),
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	if store.resolveCalls != 1 || store.createCalls != 1 ||
+		bytes.Contains(store.op.Args, []byte("source_specs")) ||
+		bytes.Contains(store.op.Args, []byte("existing_source_ids")) {
+		t.Fatalf("引用与 source_specs 应一次冻结为 durable sources: resolve=%d create=%d args=%s",
+			store.resolveCalls, store.createCalls, store.op.Args)
+	}
+	command, _, err := normalizeCreateScheduleCommand(store.op.Args)
+	if err != nil {
+		t.Fatalf("normalize durable args: %v", err)
+	}
+	var frozen compiledFetchPlan
+	if err := decodeStrictJSON(command.ApprovedFetchPlan, &frozen); err != nil {
+		t.Fatalf("decode frozen plan: %v", err)
+	}
+	if len(frozen.Sources) != 2 || frozen.Sources[0].URL != "vane://web/search?q=existing" ||
+		frozen.Sources[1].URL != "https://example.com/feed.xml" ||
+		string(frozen.Sources[1].Config) != `{}` {
+		t.Fatalf("frozen plan 顺序或 feed 空 config 漂移: %+v", frozen.Sources)
+	}
+}
+
 func TestCreationCoordinator_LegacyValidationStillPrecedesTenantLookup(t *testing.T) {
 	store := newCreationSagaFakeStore()
 	store.tenant.Status = types.TenantStatusSuspended
@@ -881,17 +1333,36 @@ func TestDecodeCreationProposalArgs_SourceBoundaries(t *testing.T) {
 }
 
 func TestCreationCoordinator_RejectsSSRFBeforePendingAction(t *testing.T) {
-	store := newCreationSagaFakeStore()
-	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
-	raw := mustCreateArgsWithPlan(t, "监控本地服务", "本地", json.RawMessage(
-		`{"sources":[{"platform":"web","capability":"feed","url":"http://127.0.0.1/rss","config":{}}]}`,
-	))
-	_, err := coordinator.Propose(t.Context(), CreationProposalInput{
-		ActionID: "action-ssrf", UserID: 11, RawArgs: raw,
-		ExpiresAt: time.Now().Add(time.Hour),
-	})
-	if !errors.Is(err, types.ErrValidation) || store.createCalls != 0 {
-		t.Fatalf("err=%v create_calls=%d", err, store.createCalls)
+	for _, rawURL := range []string{
+		"http://127.0.0.1/rss",
+		"http://127.1/rss",
+		"http://2130706433/rss",
+		"http://017700000001/rss",
+		"http://0x7f000001/rss",
+		"http://[::1%25lo0]/rss",
+		"http://[fe80::1%25en0]/rss",
+		"http://[fe80::1%25en0]:8080/rss",
+		"http://[fe80::1%25%65%6e%30]/rss",
+	} {
+		t.Run(rawURL, func(t *testing.T) {
+			store := newCreationSagaFakeStore()
+			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+			raw := mustCreateArgsWithPlan(t, "监控本地服务", "本地", mustMarshal(t, map[string]any{
+				"sources": []map[string]any{{
+					"platform": "web", "capability": "feed",
+					"url": rawURL, "config": map[string]any{},
+				}},
+			}))
+			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+				ActionID: "action-ssrf", UserID: 11, RawArgs: raw,
+				ExpiresAt: time.Now().Add(time.Hour),
+			})
+			if !errors.Is(err, types.ErrValidation) || store.createCalls != 0 ||
+				store.membershipCalls != 0 || store.tenantCalls != 0 {
+				t.Fatalf("err=%v create=%d membership=%d tenant=%d",
+					err, store.createCalls, store.membershipCalls, store.tenantCalls)
+			}
+		})
 	}
 }
 
