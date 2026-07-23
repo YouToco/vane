@@ -278,6 +278,23 @@ Loop 行为细则：
   在加载时迁移清洗。历史判定不依赖当前工具是否装配或仍在目录中；同时只有出现真实
   `role=tool` 外部回执才压平，单纯生成 add_source pending 确认卡不误删。清洗完成后，
   下一条明确用户消息才恢复正常工具面。
+- 下一条用户消息若以强肯定命令明确要求按当前消息**直接生成任务确认卡**（如「确认创建，
+  直接生成确认卡」），且没有要求先搜索、查询、检查或核对，则本消息进入
+  `direct-task-creation` 缩面：从数据访问层跳过画像，模型请求只声明 `create_schedule`，
+  请求消息只保留当前 user turn（原有已清洗历史在本轮结束后再合并持久化），
+  且声明与执行两层都要求该注册工具的真实 effect 为 mutating；同名只读工具不得暴露或执行。
+  `approved_fetch_plan.existing_source_ids` 在此模式下禁止出现，防模型猜 ID 触发隐藏 DB 读取；
+  当前消息明确的新信源必须完整写入 `approved_fetch_plan.sources`。
+  运行时对任何幻觉的其他已注册工具调用也返回固定本地拒绝，不执行、不 taint。
+  用户明确说「不要再搜索／直接出确认卡」
+  时优先按此缩面；明确否定创建或要求先核对时不得进入。该模式只减少读取能力，不增加权限：
+  `create_schedule` 仍只落 durable proposal，任务仍须用户点击确认卡才执行。任何无工具自由文本
+  都会被丢弃并回到 clean baseline 自纠一次（不尝试用词法区分“追问”与“口头承诺”），连续两次
+  没有真实 proposal 则返回固定的「任务尚未创建」文案；带 tool_calls 的 assistant content 也
+  强制清空，避免参数校验失败时把同批的「卡已生成」承诺留进历史。整轮无论是否成功，
+  会话只持久化当前 user + 确定性回复，不保留动态校验 tool result（工具审计仍走独立账本），
+  避免通用 fail-closed 清洗把本地拒绝误记成外部查询。此规则避免外部发现完成后的确认消息
+  又被 `list_sources` 带回 untrusted-result 边界，形成「确认→再读→隔离→口头承诺」循环。
 - turn 达 MaxTurns：Reply="这个请求步骤太多，我先停下来了，请把需求拆小一点再试"。
 - 全部 LLM 错误向上抛（feishu 层 humanize）。
 
@@ -350,6 +367,14 @@ Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的
 - store：DB 门控子测试（agent_sessions CRUD、ClaimPendingAction 幂等/过期）。
 - sourcespec：迁移原 buildSource 全部用例。
 - agent：mock Client？——llm.Client 是具体类型，Loop 依赖收窄：Loop 内部通过 `chatFn func(ctx, llm.ChatRequest) (*llm.ChatResponse, error)` 字段调用（默认包 DoChat），测试注入假实现。覆盖：纯聊天、读工具单轮、写工具确认卡、未知工具自纠、maxTurns 兜底、ExecuteAction 幂等；恶意外部结果必须用真实外部工具分类反向证明画像读取、写 pending action 与 URL/query 上下文外带均被确定性拒绝，并覆盖跨消息、部署前存量会话、外部 Probe 成功/失败回调、本地缓存分页、同批“内部读→外部读→写”乱序及 `search_endpoints+未激活动态端点`；外部结果后的零工具出站请求必须断言只有 system+user、无原生 tool protocol，JSON 字段边界不可由外部正文伪造，且内部历史仍按原 user+固定占位持久化；外部上下文测试必须证明首轮零画像读取/零工具/零既有历史、原文零持久化且旧历史保留，扁平化时真实追问与外部正文不发生信任提升；add_source 只建 pending 或整批拒绝后重试写工具时不会被误判为已执行外部查询。
+- `direct-task-creation` 必须用生产同形的「确认创建，直接生成确认卡，不要再次搜索」消息覆盖：
+  即使模型先并列幻觉 `list_sources/list_schedules`、再单独重试 `list_sources`，两次都零执行、
+  零 taint、画像零读取，所有模型请求只声明 `create_schedule`，随后合法调用只能产生一个 durable
+  proposal；模型无工具文字（包括「确认卡稍后会出现，可以吗？」或真实追问）必须丢弃并从 clean
+  baseline 自纠，连续两次无工具文字只能返回固定未创建文案；另须覆盖旧画像历史 current-turn
+  隔离、读+写混合批次原子拒绝、同名非 mutating 工具零执行，以及无效 create tool_call 同批口头
+  承诺不入历史、`existing_source_ids` 零 Propose。删除请求侧缩面、运行时二次门、clean-baseline reset 或
+  无 proposal 的口头承诺门中的任一项，测试都必须变红。
 - fetcher：Exa ad-hoc 上游账本必须断言 trace/user 归属与 `source_id=0`，反向断言这些本地归属元数据没有出现在第三方请求体/请求头；取消后的记账 context 仍可用且有 deadline，`statuses[].status=error` 必须在账本标为失败而不是 HTTP 200 成功。
 - feishu：BuildConfirmCard JSON 结构断言；回调 owner 校验单测（能 mock 的部分）。
 
