@@ -1,0 +1,313 @@
+package store
+
+import (
+	"encoding/json"
+	"math"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/YouToco/vane/types"
+)
+
+// TestScheduleDashboardStore 是 DATABASE_URL 门控的集成测试（M7 功能 6.6/6.7）：
+// 任务级数据面的五个读查询对着真库验证——运行概览、批次分页、任务过滤的投递历史、
+// trace 归集成本，以及贯穿全部查询的归属隔离（他人任务恒不可见/恒为零）。
+func TestScheduleDashboardStore(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("未设置 DATABASE_URL，跳过任务数据面集成测试")
+	}
+	ctx := t.Context()
+	if err := Migrate(ctx, dbURL); err != nil {
+		t.Fatalf("Migrate() 失败: %v", err)
+	}
+	st, err := New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("New() 失败: %v", err)
+	}
+	registerStoreClose(t, st)
+
+	owner, err := st.UpsertUserByOpenID(ctx, "test_dash_"+uuid.NewString(), "dash-owner")
+	if err != nil {
+		t.Fatalf("建 owner 失败: %v", err)
+	}
+	attachTenant(t, st, owner.ID)
+	stranger, err := st.UpsertUserByOpenID(ctx, "test_dash_stranger_"+uuid.NewString(), "dash-stranger")
+	if err != nil {
+		t.Fatalf("建 stranger 失败: %v", err)
+	}
+	attachTenant(t, st, stranger.ID)
+
+	mkSchedule := func(t *testing.T, userID int64) string {
+		t.Helper()
+		id := "push-dash-" + uuid.NewString()
+		if err := st.InsertSchedule(ctx, &types.Schedule{
+			ID: id, UserID: userID,
+			SpecJSON: json.RawMessage(`{"cron":"30 8 * * *"}`), ScopeJSON: json.RawMessage("{}"),
+			Status: types.ScheduleStatusActive,
+		}); err != nil {
+			t.Fatalf("InsertSchedule 失败: %v", err)
+		}
+		return id
+	}
+	schedID := mkSchedule(t, owner.ID)
+	foreignSchedID := mkSchedule(t, stranger.ID)
+
+	// 两个信源链接到 owner 的任务（source_count=2 的地基）。
+	mkSource := func(t *testing.T) int64 {
+		t.Helper()
+		id, _, err := st.GetOrCreateSource(ctx, &types.Source{
+			Platform: types.PlatformWeb, Capability: types.CapSearch,
+			URL: "vane://web/search?q=" + uuid.NewString(), Config: json.RawMessage(`{"query":"x"}`),
+		})
+		if err != nil {
+			t.Fatalf("GetOrCreateSource 失败: %v", err)
+		}
+		return id
+	}
+	s1, s2 := mkSource(t), mkSource(t)
+	if err := st.ReplaceScheduleSources(ctx, owner.ID, schedID, []int64{s1, s2}); err != nil {
+		t.Fatalf("ReplaceScheduleSources 失败: %v", err)
+	}
+
+	// 运行历史：b1 真实批次（2 投递、1 已发）→ b2 空批（fetch 闸门）。b2 后建，
+	// 是"最近一次运行"。外人任务另有一批，用于验证隔离。
+	trace1 := "trace-dash-" + uuid.NewString()
+	b1, err := st.CreatePushBatchIdempotent(ctx, owner.ID, trace1, schedID)
+	if err != nil {
+		t.Fatalf("建批次 b1 失败: %v", err)
+	}
+	if err := st.UpdatePushBatchStatus(ctx, b1, types.BatchStatusDone); err != nil {
+		t.Fatalf("置 b1 done 失败: %v", err)
+	}
+	d1, err := st.InsertDelivery(ctx, &types.Delivery{BatchID: b1, UserID: owner.ID, Score: 88, BodyMD: "第一条"})
+	if err != nil {
+		t.Fatalf("插投递 d1 失败: %v", err)
+	}
+	if err := st.MarkDeliverySent(ctx, d1, "om_dash_"+uuid.NewString(), nil, time.Now().UTC()); err != nil {
+		t.Fatalf("标记 d1 已发失败: %v", err)
+	}
+	if _, err := st.InsertDelivery(ctx, &types.Delivery{BatchID: b1, UserID: owner.ID, Score: 70, BodyMD: "第二条（未发成）"}); err != nil {
+		t.Fatalf("插投递 d2 失败: %v", err)
+	}
+
+	trace2 := "trace-dash-" + uuid.NewString()
+	b2, skipped, err := st.RecordEmptyPushBatch(ctx, owner.ID, trace2, schedID,
+		types.BatchExitGateFetch, types.PipelineCounts{})
+	if err != nil || skipped {
+		t.Fatalf("记空批 b2 失败: skipped=%v err=%v", skipped, err)
+	}
+
+	foreignTrace := "trace-dash-" + uuid.NewString()
+	fb1, err := st.CreatePushBatchIdempotent(ctx, stranger.ID, foreignTrace, foreignSchedID)
+	if err != nil {
+		t.Fatalf("建外人批次失败: %v", err)
+	}
+
+	// 成本记账：trace1 挂 2 条 llm_calls（生产写入方 Score/CardGen 用管线 traceID，
+	// 与 push_batches.idempotency_key 同源——夹具按同一键种下才含被测特征）；
+	// trace2（空批）无调用；外人 trace 的成本绝不能串进来。
+	mustExec := func(t *testing.T, sql string, args ...any) {
+		t.Helper()
+		if _, err := st.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("种子 SQL 失败: %v\n  %s", err, sql)
+		}
+	}
+	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, user_id, cost_usd) VALUES ($1,'score','test-model',$2,0.5)`, trace1, owner.ID)
+	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, user_id, cost_usd) VALUES ($1,'cardgen','test-model',$2,0.25)`, trace1, owner.ID)
+	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, user_id, cost_usd) VALUES ($1,'score','test-model',$2,9.9)`, foreignTrace, stranger.ID)
+
+	t.Cleanup(func() {
+		cctx, cancel := cleanupContext()
+		defer cancel()
+		ids := []int64{owner.ID, stranger.ID}
+		cleanupExec(cctx, t, st, `DELETE FROM llm_calls WHERE trace_id = ANY($1)`, []string{trace1, trace2, foreignTrace})
+		cleanupExec(cctx, t, st, `DELETE FROM deliveries WHERE user_id = ANY($1)`, ids)
+		cleanupExec(cctx, t, st, `DELETE FROM push_batches WHERE user_id = ANY($1)`, ids)
+		cleanupExec(cctx, t, st, `DELETE FROM schedule_sources WHERE schedule_id = ANY($1)`, []string{schedID, foreignSchedID})
+		cleanupExec(cctx, t, st, `DELETE FROM schedules WHERE user_id = ANY($1)`, ids)
+		cleanupExec(cctx, t, st, `DELETE FROM sources WHERE id = ANY($1)`, []int64{s1, s2})
+		cleanupExec(cctx, t, st, `DELETE FROM memberships WHERE user_id = ANY($1)`, ids)
+		cleanupExec(cctx, t, st, `DELETE FROM users WHERE id = ANY($1)`, ids)
+	})
+
+	t.Run("单任务运行概览", func(t *testing.T) {
+		sum, err := st.GetScheduleRunSummary(ctx, owner.ID, schedID)
+		if err != nil {
+			t.Fatalf("GetScheduleRunSummary 失败: %v", err)
+		}
+		if sum.ScheduleID != schedID {
+			t.Errorf("schedule_id = %s, 期望 %s", sum.ScheduleID, schedID)
+		}
+		// 最近一次运行是 b2 空批：created_at 平手时按 id 倒序取大者，b2 后插必胜。
+		if sum.LastRunAt == nil || sum.LastStatus != string(types.BatchStatusEmpty) ||
+			sum.LastExitGate != string(types.BatchExitGateFetch) {
+			t.Errorf("最近运行应为空批(fetch)，实得 at=%v status=%q gate=%q",
+				sum.LastRunAt, sum.LastStatus, sum.LastExitGate)
+		}
+		if sum.Batches7d != 2 || sum.EmptyBatches7d != 1 || sum.SentPushes7d != 1 || sum.SourceCount != 2 {
+			t.Errorf("计数不符: batches=%d empty=%d sent=%d sources=%d, 期望 2/1/1/2",
+				sum.Batches7d, sum.EmptyBatches7d, sum.SentPushes7d, sum.SourceCount)
+		}
+	})
+
+	t.Run("概览列表只见自己的任务", func(t *testing.T) {
+		items, err := st.ListScheduleRunSummaries(ctx, owner.ID)
+		if err != nil {
+			t.Fatalf("ListScheduleRunSummaries 失败: %v", err)
+		}
+		var found bool
+		for _, it := range items {
+			if it.ScheduleID == foreignSchedID {
+				t.Fatalf("外人任务 %s 泄漏进 owner 的概览列表", foreignSchedID)
+			}
+			if it.ScheduleID == schedID {
+				found = true
+				if it.SentPushes7d != 1 || it.SourceCount != 2 {
+					t.Errorf("列表行计数与单查不一致: sent=%d sources=%d", it.SentPushes7d, it.SourceCount)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("概览列表缺 owner 自己的任务 %s", schedID)
+		}
+	})
+
+	t.Run("他人任务概览按不存在处理", func(t *testing.T) {
+		if _, err := st.GetScheduleRunSummary(ctx, owner.ID, foreignSchedID); err == nil {
+			t.Fatal("查他人任务概览应 NotFound，实得 nil error")
+		}
+	})
+
+	t.Run("批次分页与投递计数", func(t *testing.T) {
+		// 第一页（page_size=1）：最新的 b2 空批。
+		page1, total, next, err := st.ListScheduleBatches(ctx, owner.ID, schedID, BatchHistoryQuery{PageSize: 1})
+		if err != nil {
+			t.Fatalf("ListScheduleBatches 第一页失败: %v", err)
+		}
+		if total != 2 || len(page1) != 1 || next == "" {
+			t.Fatalf("第一页形状不符: total=%d len=%d next=%q", total, len(page1), next)
+		}
+		if page1[0].ID != b2 || page1[0].Status != string(types.BatchStatusEmpty) ||
+			page1[0].ExitGate != string(types.BatchExitGateFetch) || page1[0].Deliveries != 0 {
+			t.Errorf("第一页应为 b2 空批: %+v", page1[0])
+		}
+		// 第二页：b1 真实批次，2 投递 1 已发。
+		page2, _, next2, err := st.ListScheduleBatches(ctx, owner.ID, schedID, BatchHistoryQuery{PageSize: 1, PageToken: next})
+		if err != nil {
+			t.Fatalf("ListScheduleBatches 第二页失败: %v", err)
+		}
+		if len(page2) != 1 || page2[0].ID != b1 {
+			t.Fatalf("第二页应为 b1: %+v", page2)
+		}
+		if page2[0].Status != string(types.BatchStatusDone) || page2[0].Deliveries != 2 || page2[0].Sent != 1 {
+			t.Errorf("b1 计数不符: status=%q deliveries=%d sent=%d, 期望 done/2/1",
+				page2[0].Status, page2[0].Deliveries, page2[0].Sent)
+		}
+		_ = next2 // 满页时有下一页 token，翻空属正常，不再断言。
+
+		// 拿他人任务 id 翻批次：空页零总数，不泄露存在性。
+		none, ftotal, _, err := st.ListScheduleBatches(ctx, owner.ID, foreignSchedID, BatchHistoryQuery{})
+		if err != nil {
+			t.Fatalf("翻他人任务批次失败: %v", err)
+		}
+		if len(none) != 0 || ftotal != 0 {
+			t.Errorf("他人任务批次应为空页: len=%d total=%d（外人批次 %d 泄漏）", len(none), ftotal, fb1)
+		}
+	})
+
+	t.Run("投递历史按任务过滤", func(t *testing.T) {
+		items, total, _, err := st.ListDeliveryHistory(ctx, owner.ID, DeliveryHistoryQuery{ScheduleID: schedID})
+		if err != nil {
+			t.Fatalf("ListDeliveryHistory(任务过滤) 失败: %v", err)
+		}
+		if total != 2 || len(items) != 2 {
+			t.Fatalf("任务过滤应恰得 b1 的 2 条投递: total=%d len=%d", total, len(items))
+		}
+		for _, it := range items {
+			if it.BatchID != b1 {
+				t.Errorf("串批投递: delivery %d 挂 batch %d, 期望 %d", it.ID, it.BatchID, b1)
+			}
+		}
+		// 外人以同一 schedule id 过滤：零行（user_id 谓词兜底）。
+		_, strangerTotal, _, err := st.ListDeliveryHistory(ctx, stranger.ID, DeliveryHistoryQuery{ScheduleID: schedID})
+		if err != nil {
+			t.Fatalf("外人过滤查询失败: %v", err)
+		}
+		if strangerTotal != 0 {
+			t.Errorf("外人按 owner 任务过滤应零行, 实得 total=%d", strangerTotal)
+		}
+		// 不带过滤的既有行为不受影响：至少包含这 2 条。
+		_, allTotal, _, err := st.ListDeliveryHistory(ctx, owner.ID, DeliveryHistoryQuery{})
+		if err != nil {
+			t.Fatalf("无过滤查询失败: %v", err)
+		}
+		if allTotal < 2 {
+			t.Errorf("无过滤总数应 >= 2, 实得 %d", allTotal)
+		}
+		// 过滤 + 键集翻页组合：游标占位序号在 ScheduleID 占了 $2 之后必须顺移，
+		// 错位会把游标值当 schedule_id 比较——page_size=1 逐页走完且不重不漏。
+		p1, _, tok, err := st.ListDeliveryHistory(ctx, owner.ID, DeliveryHistoryQuery{ScheduleID: schedID, PageSize: 1})
+		if err != nil {
+			t.Fatalf("过滤翻页第一页失败: %v", err)
+		}
+		if len(p1) != 1 || tok == "" {
+			t.Fatalf("过滤翻页第一页形状不符: len=%d tok=%q", len(p1), tok)
+		}
+		p2, _, _, err := st.ListDeliveryHistory(ctx, owner.ID, DeliveryHistoryQuery{ScheduleID: schedID, PageSize: 1, PageToken: tok})
+		if err != nil {
+			t.Fatalf("过滤翻页第二页失败: %v", err)
+		}
+		if len(p2) != 1 || p2[0].ID == p1[0].ID || p2[0].BatchID != b1 {
+			t.Fatalf("过滤翻页第二页应为另一条 b1 投递: p1=%+v p2=%+v", p1, p2)
+		}
+	})
+
+	t.Run("成本按 trace 归集且不串号", func(t *testing.T) {
+		cost, err := st.GetScheduleRunCost(ctx, owner.ID, schedID)
+		if err != nil {
+			t.Fatalf("GetScheduleRunCost 失败: %v", err)
+		}
+		if math.Abs(cost.LLMCostUSD-0.75) > 1e-9 || cost.LLMCalls != 2 {
+			t.Errorf("LLM 成本不符: cost=%v calls=%d, 期望 0.75/2（外人 9.9 不得串入）",
+				cost.LLMCostUSD, cost.LLMCalls)
+		}
+		// 外人查 owner 的任务：全零。
+		fcost, err := st.GetScheduleRunCost(ctx, stranger.ID, schedID)
+		if err != nil {
+			t.Fatalf("外人成本查询失败: %v", err)
+		}
+		if fcost.LLMCalls != 0 || fcost.LLMCostUSD != 0 {
+			t.Errorf("外人查 owner 任务成本应全零: %+v", fcost)
+		}
+	})
+
+	t.Run("任务信源摘要", func(t *testing.T) {
+		infos, err := st.ListScheduleSourceInfos(ctx, owner.ID, schedID)
+		if err != nil {
+			t.Fatalf("ListScheduleSourceInfos 失败: %v", err)
+		}
+		if len(infos) != 2 {
+			t.Fatalf("应得 2 个信源, 实得 %d", len(infos))
+		}
+		for _, info := range infos {
+			if info.ID != s1 && info.ID != s2 {
+				t.Errorf("串源: %d 不在 {%d,%d}", info.ID, s1, s2)
+			}
+			if info.Platform != string(types.PlatformWeb) || info.Status == "" {
+				t.Errorf("信源摘要字段不完整: %+v", info)
+			}
+		}
+		// 外人查：空（归属谓词在 WHERE）。
+		finfos, err := st.ListScheduleSourceInfos(ctx, stranger.ID, schedID)
+		if err != nil {
+			t.Fatalf("外人信源查询失败: %v", err)
+		}
+		if len(finfos) != 0 {
+			t.Errorf("外人查 owner 任务信源应为空, 实得 %d 个", len(finfos))
+		}
+	})
+}
