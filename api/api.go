@@ -90,6 +90,13 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	// M3 推送管道端点（契约 B8）：全部走会话中间件，是"人与未来 AI 同一出口"的确定性 API。
 	inner.HandleFunc("GET /api/schedules", s.handleListSchedules)
 	inner.HandleFunc("DELETE /api/schedules/{id}", s.handleDeleteSchedule)
+
+	// M7 任务数据面端点（功能 6.6/6.7）：只读，任务详情/运行历史/任务推送/列表概览。
+	// "summary" 是字面段，ServeMux 精确度规则保证它优先于 {id} 通配匹配。
+	inner.HandleFunc("GET /api/schedules/summary", s.handleListScheduleSummaries)
+	inner.HandleFunc("GET /api/schedules/{id}", s.handleGetScheduleDetail)
+	inner.HandleFunc("GET /api/schedules/{id}/batches", s.handleListScheduleBatches)
+	inner.HandleFunc("GET /api/schedules/{id}/deliveries", s.handleListScheduleDeliveries)
 	inner.HandleFunc("POST /api/push/now", s.handlePushNow)
 	inner.HandleFunc("GET /api/subscriptions", s.handleListSubscriptions)
 	inner.HandleFunc("POST /api/subscriptions", s.handleAddSubscription)
