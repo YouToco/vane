@@ -381,12 +381,13 @@ func (f *fakeStore) CancelPendingAction(_ context.Context, id string, userID int
 
 // fakeTool 记录每次 Execute 调用，供断言"执行了几次、带什么参数"。
 type fakeTool struct {
-	name      string
-	mutating  bool
-	untrusted bool
-	result    string
-	execErr   error
-	calls     []toolCallRecord
+	name       string
+	mutating   bool
+	untrusted  bool
+	result     string
+	execErr    error
+	calls      []toolCallRecord
+	parameters json.RawMessage
 }
 
 type toolCallRecord struct {
@@ -413,9 +414,17 @@ func (i *blockingToolCallInserter) InsertToolCall(ctx context.Context, _ *types.
 	return 1, nil
 }
 
-func (t *fakeTool) Name() string                       { return t.name }
-func (t *fakeTool) Description() string                { return "测试工具 " + t.name }
-func (t *fakeTool) Parameters() json.RawMessage        { return json.RawMessage(`{"type":"object"}`) }
+func (t *fakeTool) Name() string        { return t.name }
+func (t *fakeTool) Description() string { return "测试工具 " + t.name }
+func (t *fakeTool) Parameters() json.RawMessage {
+	if len(t.parameters) != 0 {
+		return t.parameters
+	}
+	if t.name == "create_schedule" {
+		return json.RawMessage(createScheduleSchema)
+	}
+	return json.RawMessage(`{"type":"object"}`)
+}
 func (t *fakeTool) Mutating() bool                     { return t.mutating }
 func (t *fakeTool) untrustedResult() bool              { return t.untrusted }
 func (t *fakeTool) Summarize(a json.RawMessage) string { return "摘要:" + string(a) }
@@ -1404,9 +1413,9 @@ func TestHandleMessage_ExternalBatchRejectedThenWriteRetryPreservesPendingHistor
 func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *testing.T) {
 	const args = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
 		`"intent":"只监控 OpenAI、Anthropic、Google 官方确认的重大模型、API、定价、下线与安全政策更新；无重要更新不推送",` +
-		`"approved_fetch_plan":{"sources":[{"platform":"web","capability":"search",` +
-		`"title":"三家官方 AI 动态","url":"vane://web/search?q=major+AI+model+API+pricing+deprecation+security+updates&include_domains=ai.google.dev%2Canthropic.com%2Cblog.google%2Cdeepmind.google%2Copenai.com",` +
-		`"config":{"query":"major AI model API pricing deprecation security updates","include_domains":["ai.google.dev","anthropic.com","blog.google","deepmind.google","openai.com"]}}]},` +
+		`"approved_fetch_plan":{"source_specs":{"version":"vane.source-specs/v1","items":[{` +
+		`"kind":"web_search","query":"major AI model API pricing deprecation security updates",` +
+		`"include_domains":["ai.google.dev","anthropic.com","blog.google","deepmind.google","openai.com"]}]}},` +
 		`"nl_description":"每周一上午 9 点整理三家官方重大模型动态","strictness":"strict"}`
 	const userText = "确认创建，直接生成确认卡，不要再次搜索。每周一上午 9:00（Asia/Shanghai）执行。" +
 		"核心信源仅限 OpenAI、Anthropic、Google 的官方博客、公告页和 API 更新日志；" +
@@ -1489,6 +1498,30 @@ func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *t
 		if len(req.Tools) != 1 || req.Tools[0].Name != "create_schedule" {
 			t.Fatalf("第 %d 次请求必须只声明 create_schedule，实得 %+v", i+1, req.Tools)
 		}
+		var directSchema struct {
+			Properties struct {
+				ApprovedFetchPlan struct {
+					Required   []string                   `json:"required"`
+					Properties map[string]json.RawMessage `json:"properties"`
+				} `json:"approved_fetch_plan"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(req.Tools[0].Parameters, &directSchema); err != nil {
+			t.Fatalf("第 %d 次 direct schema 非法: %v", i+1, err)
+		}
+		directPlan := directSchema.Properties.ApprovedFetchPlan
+		if !slices.Equal(directPlan.Required, []string{"source_specs"}) ||
+			len(directPlan.Properties) != 1 ||
+			len(directPlan.Properties["source_specs"]) == 0 {
+			t.Fatalf("第 %d 次 direct schema 必须只暴露且强制 source_specs: %+v",
+				i+1, directPlan)
+		}
+		sourceSpecsSchema := string(directPlan.Properties["source_specs"])
+		if strings.Contains(sourceSpecsSchema, "可以与 existing_source_ids 组合") ||
+			!strings.Contains(sourceSpecsSchema, "不能使用 existing_source_ids") {
+			t.Fatalf("第 %d 次 direct source_specs 文案不得诱导隐藏字段: %s",
+				i+1, sourceSpecsSchema)
+		}
 		rawReq, err := json.Marshal(req.Messages)
 		if err != nil {
 			t.Fatal(err)
@@ -1528,7 +1561,8 @@ func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *t
 
 func TestHandleMessage_ExplicitTaskConfirmationRejectsOralCardPromise(t *testing.T) {
 	const args = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
-		`"intent":"每周整理三家官方重大模型动态","approved_fetch_plan":{"sources":[]},` +
+		`"intent":"每周整理三家官方重大模型动态","approved_fetch_plan":{"source_specs":{` +
+		`"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI updates"}]}},` +
 		`"nl_description":"每周一上午 9 点整理三家官方重大模型动态","strictness":"strict"}`
 	fs := newFakeStore()
 	create := &fakeTool{name: "create_schedule", mutating: true}
@@ -1606,9 +1640,8 @@ func TestHandleMessage_ExplicitTaskConfirmationNeverForwardsToolFreeText(t *test
 
 func TestHandleMessage_ExplicitTaskConfirmationValidationRetryKeepsHistoryCanonical(t *testing.T) {
 	const validArgs = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
-		`"intent":"监控官方更新","approved_fetch_plan":{"sources":[{"platform":"web",` +
-		`"capability":"search","title":"官方更新","url":"vane://web/search?q=official",` +
-		`"config":{"query":"official"}}]}}`
+		`"intent":"监控官方更新","approved_fetch_plan":{"source_specs":{` +
+		`"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"official"}]}}}`
 	fs := newFakeStore()
 	create := &fakeTool{name: "create_schedule", mutating: true}
 	creation := &fakeCreationController{
@@ -1663,6 +1696,162 @@ func TestHandleMessage_ExplicitTaskConfirmationValidationRetryKeepsHistoryCanoni
 	}
 }
 
+func TestHandleMessage_ExplicitTaskConfirmationStopsAfterTwoProposalValidationFailures(t *testing.T) {
+	const firstArgs = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
+		`"intent":"第一次合法协议参数","approved_fetch_plan":{"source_specs":{` +
+		`"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"first"}]}}}`
+	const secondArgs = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
+		`"intent":"第二次合法协议参数","approved_fetch_plan":{"source_specs":{` +
+		`"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"second"}]}}}`
+	fs := newFakeStore()
+	create := &fakeTool{name: "create_schedule", mutating: true}
+	creation := &fakeCreationController{
+		proposeErrs: []error{
+			types.NewAppError(types.CodeValidation, "第一个参数错误", nil),
+			types.NewAppError(types.CodeValidation, "第二个参数错误", nil),
+			nil,
+		},
+		proposeResult: task.CreationProposal{Summary: "不应创建"},
+	}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "invalid-1", Name: "create_schedule", Arguments: firstArgs,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "invalid-2", Name: "create_schedule", Arguments: secondArgs,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "must-not-run", Name: "create_schedule", Arguments: `{"third":true}`,
+		}}, FinishReason: "tool_calls"},
+	}}
+	l := newTestLoop(t, fs, chat.fn, create)
+	l.taskCreation = creation
+	l.maxTurns = 20
+
+	out, err := l.HandleMessage(t.Context(), 7, "确认创建，直接生成确认卡，不要再次搜索。")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if out.Confirm != nil || out.Reply != replyTaskCreationNotCreated ||
+		len(creation.proposeCalls) != 2 || len(chat.requests) != 2 {
+		t.Fatalf("两次 proposal 校验失败后必须诚实停下: out=%+v proposals=%d requests=%d",
+			out, len(creation.proposeCalls), len(chat.requests))
+	}
+}
+
+func TestHandleMessage_ExplicitTaskConfirmationRejectsMultipleCreateCallsAtomically(t *testing.T) {
+	fs := newFakeStore()
+	create := &fakeTool{name: "create_schedule", mutating: true}
+	creation := &fakeCreationController{
+		proposeErrs: []error{
+			types.NewAppError(types.CodeValidation, "第一个参数错误", nil),
+			types.NewAppError(types.CodeValidation, "第二个参数错误", nil),
+			nil,
+		},
+		proposeResult: task.CreationProposal{Summary: "第三个调用不得穿透"},
+	}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		ToolCalls: []llm.ToolCall{
+			{ID: "invalid-1", Name: "create_schedule", Arguments: `{"first":true}`},
+			{ID: "invalid-2", Name: "create_schedule", Arguments: `{"second":true}`},
+			{ID: "valid-3", Name: "create_schedule", Arguments: `{"third":true}`},
+		},
+		FinishReason: "tool_calls",
+	}}}
+	l := newTestLoop(t, fs, chat.fn, create)
+	l.taskCreation = creation
+	l.maxTurns = 1
+
+	out, err := l.HandleMessage(t.Context(), 7, "确认创建，直接生成确认卡，不要再次搜索。")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if out.Confirm != nil || out.Reply != replyTaskCreationNotCreated ||
+		len(creation.proposeCalls) != 0 || len(chat.requests) != 1 {
+		t.Fatalf("同批多个 create_schedule 必须整批零执行: out=%+v proposals=%d requests=%d",
+			out, len(creation.proposeCalls), len(chat.requests))
+	}
+}
+
+func TestHandleMessage_ExplicitTaskConfirmationCapsModelTurnsAtFour(t *testing.T) {
+	fs := newFakeStore()
+	hiddenRead := &fakeTool{name: "list_sources", result: "不得执行"}
+	create := &fakeTool{name: "create_schedule", mutating: true}
+	creation := &fakeCreationController{
+		proposeResult: task.CreationProposal{Summary: "第五轮不应创建"},
+	}
+	responses := make([]*llm.ChatResponse, 0, 5)
+	for i := 0; i < 4; i++ {
+		responses = append(responses, &llm.ChatResponse{
+			ToolCalls: []llm.ToolCall{{
+				ID:   fmt.Sprintf("hidden-read-%d", i),
+				Name: "list_sources", Arguments: `{}`,
+			}},
+			FinishReason: "tool_calls",
+		})
+	}
+	responses = append(responses, &llm.ChatResponse{
+		ToolCalls: []llm.ToolCall{{
+			ID: "fifth-create", Name: "create_schedule", Arguments: `{}`,
+		}},
+		FinishReason: "tool_calls",
+	})
+	chat := &scriptedChat{responses: responses}
+	l := newTestLoop(t, fs, chat.fn, hiddenRead, create)
+	l.taskCreation = creation
+	l.maxTurns = 20
+
+	out, err := l.HandleMessage(t.Context(), 7, "确认创建，直接生成确认卡，不要再次搜索。")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if out.Confirm != nil || out.Reply != replyTaskCreationNotCreated ||
+		len(chat.requests) != 4 || len(creation.proposeCalls) != 0 || len(hiddenRead.calls) != 0 {
+		t.Fatalf("direct 模式只能消费四轮且不得执行隐藏读取: out=%+v requests=%d proposals=%d reads=%d",
+			out, len(chat.requests), len(creation.proposeCalls), len(hiddenRead.calls))
+	}
+}
+
+func TestHandleMessage_ExplicitTaskConfirmationAllowsSuccessOnFourthTurn(t *testing.T) {
+	const args = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
+		`"intent":"监控官方更新","approved_fetch_plan":{"source_specs":{` +
+		`"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"official updates"}]}}}`
+	fs := newFakeStore()
+	hiddenRead := &fakeTool{name: "list_sources", result: "不得执行"}
+	create := &fakeTool{name: "create_schedule", mutating: true}
+	creation := &fakeCreationController{
+		proposeResult: task.CreationProposal{Summary: "第四轮合法任务"},
+	}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "hidden-1", Name: "list_sources", Arguments: `{}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "hidden-2", Name: "list_sources", Arguments: `{}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "hidden-3", Name: "list_sources", Arguments: `{}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "create-on-fourth", Name: "create_schedule", Arguments: args,
+		}}, FinishReason: "tool_calls"},
+	}}
+	l := newTestLoop(t, fs, chat.fn, hiddenRead, create)
+	l.taskCreation = creation
+	l.maxTurns = 20
+
+	out, err := l.HandleMessage(t.Context(), 7, "确认创建，直接生成确认卡，不要再次搜索。")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
+		len(chat.requests) != 4 || len(creation.proposeCalls) != 1 ||
+		len(hiddenRead.calls) != 0 {
+		t.Fatalf("第四轮合法 proposal 应被接受: out=%+v requests=%d proposals=%d reads=%d",
+			out, len(chat.requests), len(creation.proposeCalls), len(hiddenRead.calls))
+	}
+}
+
 func TestHandleMessage_ExplicitTaskConfirmationRejectsNonMutatingCreateSchedule(t *testing.T) {
 	fs := newFakeStore()
 	notDurable := &fakeTool{name: "create_schedule", mutating: false, result: "绕过 proposal"}
@@ -1691,36 +1880,139 @@ func TestHandleMessage_ExplicitTaskConfirmationRejectsNonMutatingCreateSchedule(
 }
 
 func TestHandleMessage_ExplicitTaskConfirmationRejectsExistingSourceIDs(t *testing.T) {
+	for _, key := range []string{
+		"existing_source_ids", "EXISTING_SOURCE_IDS", `\u0065xisting_source_ids`,
+	} {
+		t.Run(key, func(t *testing.T) {
+			fs := newFakeStore()
+			create := &fakeTool{name: "create_schedule", mutating: true}
+			creation := &fakeCreationController{}
+			chat := &scriptedChat{responses: []*llm.ChatResponse{{
+				ToolCalls: []llm.ToolCall{{
+					ID: "guessed-source", Name: "create_schedule",
+					Arguments: `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
+						`"intent":"监控官方更新","approved_fetch_plan":{"` +
+						key + `":[1]}}`,
+				}},
+				FinishReason: "tool_calls",
+			}}}
+			l := newTestLoop(t, fs, chat.fn, create)
+			l.taskCreation = creation
+			l.maxTurns = 1
+
+			out, err := l.HandleMessage(
+				t.Context(), 7, "确认创建，直接生成确认卡，不要再次搜索。",
+			)
+			if err != nil {
+				t.Fatalf("HandleMessage() error = %v", err)
+			}
+			if out.Confirm != nil || len(creation.proposeCalls) != 0 {
+				t.Fatalf("direct 模式猜测 existing_source_ids 不得进入 Propose: out=%+v calls=%+v",
+					out, creation.proposeCalls)
+			}
+			raw, err := json.Marshal(persistedMessages(t, fs))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(raw), untrustedHistoryPlaceholder) ||
+				strings.Contains(strings.ToLower(string(raw)), "existing_source_ids") {
+				t.Fatalf("本地参数拒绝不得伪装成外部查询或把猜测参数留进聊天历史: %s", raw)
+			}
+		})
+	}
+}
+
+func TestHandleMessage_ExplicitTaskConfirmationRejectsLegacyMaterializedSources(t *testing.T) {
+	for _, key := range []string{"sources", "Sources", "SOURCES", `\u0073ources`} {
+		t.Run(key, func(t *testing.T) {
+			fs := newFakeStore()
+			create := &fakeTool{name: "create_schedule", mutating: true}
+			creation := &fakeCreationController{}
+			args := `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
+				`"intent":"监控官方更新","approved_fetch_plan":{"` + key + `":[{` +
+				`"platform":"web","capability":"search","title":"官方更新",` +
+				`"url":"vane://web/search?q=official","config":{"query":"official"}}]}}`
+			chat := &scriptedChat{responses: []*llm.ChatResponse{{
+				ToolCalls: []llm.ToolCall{{
+					ID: "legacy-source", Name: "create_schedule", Arguments: args,
+				}},
+				FinishReason: "tool_calls",
+			}}}
+			l := newTestLoop(t, fs, chat.fn, create)
+			l.taskCreation = creation
+			l.maxTurns = 1
+
+			out, err := l.HandleMessage(
+				t.Context(), 7, "确认创建，直接生成确认卡，不要再次搜索。",
+			)
+			if err != nil {
+				t.Fatalf("HandleMessage() error = %v", err)
+			}
+			if out.Confirm != nil || len(creation.proposeCalls) != 0 {
+				t.Fatalf("direct 模式不得把模型猜测的 durable sources 交给 Propose: out=%+v calls=%+v",
+					out, creation.proposeCalls)
+			}
+		})
+	}
+}
+
+func TestHandleMessage_ModelCannotSubmitLegacyMaterializedSourcesOutsideDirectMode(t *testing.T) {
+	fs := newFakeStore()
+	create := &fakeTool{name: "create_schedule", mutating: true}
+	creation := &fakeCreationController{
+		proposeResult: task.CreationProposal{Summary: "不应创建"},
+	}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "legacy-source", Name: "create_schedule",
+			Arguments: `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
+				`"intent":"监控官方更新","approved_fetch_plan":{"Sources":[{` +
+				`"platform":"web","capability":"search","title":"官方更新",` +
+				`"url":"vane://web/search?q=official","config":{"query":"official"}}]}}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "未创建。", FinishReason: "stop"},
+	}}
+	l := newTestLoop(t, fs, chat.fn, create)
+	l.taskCreation = creation
+
+	out, err := l.HandleMessage(t.Context(), 7, "每周监控官方更新")
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if out.Confirm != nil || len(creation.proposeCalls) != 0 ||
+		len(chat.requests) != 2 {
+		t.Fatalf("普通模型轨也不得提交 durable sources: out=%+v calls=%d requests=%d",
+			out, len(creation.proposeCalls), len(chat.requests))
+	}
+}
+
+func TestHandleMessage_ExplicitTaskConfirmationCountsLocalSchemaRejections(t *testing.T) {
 	fs := newFakeStore()
 	create := &fakeTool{name: "create_schedule", mutating: true}
 	creation := &fakeCreationController{}
-	chat := &scriptedChat{responses: []*llm.ChatResponse{{
-		ToolCalls: []llm.ToolCall{{
-			ID: "guessed-source", Name: "create_schedule",
-			Arguments: `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
-				`"intent":"监控官方更新","approved_fetch_plan":{"existing_source_ids":[1]}}`,
-		}},
-		FinishReason: "tool_calls",
-	}}}
+	responses := make([]*llm.ChatResponse, 0, 3)
+	for i := 0; i < 3; i++ {
+		responses = append(responses, &llm.ChatResponse{
+			ToolCalls: []llm.ToolCall{{
+				ID: fmt.Sprintf("legacy-%d", i), Name: "create_schedule",
+				Arguments: `{"approved_fetch_plan":{"SOURCES":[]}}`,
+			}},
+			FinishReason: "tool_calls",
+		})
+	}
+	chat := &scriptedChat{responses: responses}
 	l := newTestLoop(t, fs, chat.fn, create)
 	l.taskCreation = creation
-	l.maxTurns = 1
+	l.maxTurns = 20
 
 	out, err := l.HandleMessage(t.Context(), 7, "确认创建，直接生成确认卡，不要再次搜索。")
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm != nil || len(creation.proposeCalls) != 0 {
-		t.Fatalf("direct 模式猜测 existing_source_ids 不得进入 Propose: out=%+v calls=%+v",
-			out, creation.proposeCalls)
-	}
-	raw, err := json.Marshal(persistedMessages(t, fs))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), untrustedHistoryPlaceholder) ||
-		strings.Contains(string(raw), "existing_source_ids") {
-		t.Fatalf("本地参数拒绝不得伪装成外部查询或把猜测参数留进聊天历史: %s", raw)
+	if out.Confirm != nil || out.Reply != replyTaskCreationNotCreated ||
+		len(chat.requests) != 2 || len(creation.proposeCalls) != 0 {
+		t.Fatalf("本地 schema 拒绝也必须两次即停: out=%+v requests=%d proposals=%d",
+			out, len(chat.requests), len(creation.proposeCalls))
 	}
 }
 
@@ -1945,8 +2237,8 @@ func TestHandleMessage_MutatingToolProtocolFailureStillReturnsConfirmCard(t *tes
 func TestHandleMessage_CreateScheduleUsesDurableV1Proposal(t *testing.T) {
 	const args = `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
 		`"intent":"只监控 Anthropic 官方状态故障",` +
-		`"approved_fetch_plan":{"sources":[{"platform":"web","capability":"feed",` +
-		`"title":"Anthropic Status","url":"https://status.anthropic.com/history.rss","config":{}}]},` +
+		`"approved_fetch_plan":{"source_specs":{"version":"vane.source-specs/v1","items":[{` +
+		`"kind":"web_feed","feed_url":"https://status.anthropic.com/history.rss"}]}},` +
 		`"strictness":"strict"}`
 	const durableSummary = "创建定时推送任务：每天 08:00（Asia/Shanghai）\n" +
 		"监控意图：只监控 Anthropic 官方状态故障\n" +
@@ -2204,7 +2496,12 @@ func TestHandleMessage_CreateScheduleValidationFailureDoesNotCreateLegacyAction(
 		args string
 		msg  string
 	}{
-		{name: "missing intent", args: `{"spec":{"cron":"0 8 * * *"},"approved_fetch_plan":{"sources":[{}]}}`, msg: "intent 必填"},
+		{
+			name: "missing intent",
+			args: `{"spec":{"cron":"0 8 * * *"},"approved_fetch_plan":{"source_specs":{` +
+				`"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"status"}]}}}`,
+			msg: "intent 必填",
+		},
 		{name: "missing approved plan", args: `{"spec":{"cron":"0 8 * * *"},"intent":"监控官方状态"}`, msg: "approved_fetch_plan 必填"},
 	}
 	for _, tt := range tests {
@@ -2392,16 +2689,18 @@ func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testin
 	})
 
 	invalidCases := []struct {
-		name string
-		args string
+		name            string
+		args            string
+		rejectedByAgent bool
 	}{
 		{
 			name: "cron 与 interval 互斥失败",
 			args: `{"spec":{"cron":"0 8 * * *","every_seconds":3600}}`,
 		},
 		{
-			name: "JSON 类型错误",
-			args: `[]`,
+			name:            "JSON 类型错误",
+			args:            `[]`,
+			rejectedByAgent: true,
 		},
 		{
 			name: "非法 strictness",
@@ -2429,6 +2728,16 @@ func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testin
 			}
 
 			out, err := l.HandleMessage(t.Context(), 7, "建一个任务")
+			if tc.rejectedByAgent {
+				if err != nil || out.Confirm != nil || out.Reply != "请确认。" {
+					t.Fatalf("非对象参数必须在 Agent 边界拒绝且不得出卡: out=%+v err=%v", out, err)
+				}
+				if len(fs.actions) != 0 || len(deps.events) != 0 {
+					t.Fatalf("非对象参数不得落 pending 或碰 scheduler: actions=%d events=%v",
+						len(fs.actions), deps.events)
+				}
+				return
+			}
 			if err != nil || out.Confirm == nil {
 				t.Fatalf("非法工具参数仍会先生成确认卡: out=%+v err=%v", out, err)
 			}

@@ -1276,12 +1276,23 @@ func TestCreateScheduleSchema_RequiresApprovedIntentAndFetchPlan(t *testing.T) {
 							Minimum int `json:"minimum"`
 						} `json:"items"`
 					} `json:"existing_source_ids"`
-					Sources struct {
-						MaxItems int `json:"maxItems"`
-						Items    struct {
-							Required []string `json:"required"`
-						} `json:"items"`
-					} `json:"sources"`
+					SourceSpecs struct {
+						Required   []string `json:"required"`
+						Properties struct {
+							Version struct {
+								Enum []string `json:"enum"`
+							} `json:"version"`
+							Items struct {
+								MinItems int `json:"minItems"`
+								MaxItems int `json:"maxItems"`
+								Items    struct {
+									Required   []string       `json:"required"`
+									Properties map[string]any `json:"properties"`
+								} `json:"items"`
+							} `json:"items"`
+						} `json:"properties"`
+					} `json:"source_specs"`
+					LegacySources json.RawMessage `json:"sources"`
 				} `json:"properties"`
 			} `json:"approved_fetch_plan"`
 		} `json:"properties"`
@@ -1302,13 +1313,37 @@ func TestCreateScheduleSchema_RequiresApprovedIntentAndFetchPlan(t *testing.T) {
 	if refs.MaxItems != 64 || !refs.UniqueItems || refs.Items.Minimum != 1 {
 		t.Fatalf("existing_source_ids 边界不完整：%+v", refs)
 	}
-	if plan.Properties.Sources.MaxItems != 64 {
-		t.Fatalf("sources 最大边界不完整：%+v", plan.Properties.Sources)
+	if len(plan.Properties.LegacySources) != 0 {
+		t.Fatalf("durable sources/config 不得继续暴露给模型：%s", plan.Properties.LegacySources)
 	}
-	for _, required := range []string{"platform", "capability", "url", "config"} {
-		if !slices.Contains(plan.Properties.Sources.Items.Required, required) {
-			t.Fatalf("批准信源缺少必填字段 %q：%v", required, plan.Properties.Sources.Items.Required)
+	specs := plan.Properties.SourceSpecs
+	if !slices.Contains(specs.Required, "version") || !slices.Contains(specs.Required, "items") ||
+		!slices.Equal(specs.Properties.Version.Enum, []string{"vane.source-specs/v1"}) ||
+		specs.Properties.Items.MinItems != 1 || specs.Properties.Items.MaxItems != 64 {
+		t.Fatalf("source_specs 版本或边界不完整：%+v", specs)
+	}
+	for _, required := range []string{"kind"} {
+		if !slices.Contains(specs.Properties.Items.Items.Required, required) {
+			t.Fatalf("source_specs item 缺少必填字段 %q：%v",
+				required, specs.Properties.Items.Items.Required)
 		}
+	}
+	for _, forbidden := range []string{"config", "selectors", "url", "title"} {
+		if _, exposed := specs.Properties.Items.Items.Properties[forbidden]; exposed {
+			t.Fatalf("source_specs 不得暴露内部或可伪造字段 %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"kind", "query", "include_domains", "feed_url", "page_url", "user_id",
+	} {
+		if _, ok := specs.Properties.Items.Items.Properties[required]; !ok {
+			t.Fatalf("source_specs 缺少模型可理解字段 %q", required)
+		}
+	}
+	userID, ok := specs.Properties.Items.Items.Properties["user_id"].(map[string]any)
+	if !ok || userID["pattern"] != "^[0-9a-f]{24}$" ||
+		!strings.Contains(fmt.Sprint(userID["description"]), "24 位小写十六进制") {
+		t.Fatalf("xhs user_id schema 必须逐字暴露服务端格式约束：%+v", userID)
 	}
 }
 

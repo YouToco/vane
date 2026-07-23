@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -119,7 +120,11 @@ func New(cfg config.FetchConfig) *Fetcher {
 			if err != nil {
 				host = address
 			}
-			if ip := net.ParseIP(host); ip != nil && f.isBlocked(ip) {
+			blocked, literal := classifyIPLiteral(host, f.isBlocked)
+			// Control runs after name resolution and must receive a concrete IP.
+			// Fail closed if that invariant ever changes; a hostname here would
+			// otherwise bypass the DNS-rebinding boundary.
+			if !literal || blocked {
 				return errBlockedDial
 			}
 			return nil
@@ -260,6 +265,10 @@ func (f *Fetcher) fetchBodyWithEffectGate(
 	// 话术只说「解析到私网/环回地址」不带具体 IP（对抗审查 B-LOW）：probe 会把该
 	// Message 透出到用户/模型面，回显解析到的内网 IP 会把被阻断的 SSRF 从盲变非盲。
 	host := u.Hostname()
+	if blocked, literal := classifyIPLiteral(host, f.isBlocked); literal && blocked {
+		return nil, nil, types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("RSS 源 %q 解析到私网/环回地址，已拒绝", host), nil)
+	}
 	if ips, lerr := f.lookupIP(host); lerr == nil {
 		for _, ip := range ips {
 			if f.isBlocked(ip) {
@@ -564,6 +573,26 @@ func finalize(src types.Source, item *types.ContentItem) dropReason {
 		item.ExternalID = item.ContentHash
 	}
 	return dropNone
+}
+
+// classifyIPLiteral parses canonical IPv4/IPv6 and RFC 6874 zoned IPv6
+// literals. A zone is an interface-local routing selector, so it is blocked
+// regardless of the injected CIDR predicate. The returned literal bit lets
+// URL preflight ignore ordinary hostnames while Dialer.Control can fail closed:
+// Control is expected to receive only a DNS-resolved concrete address.
+func classifyIPLiteral(
+	host string,
+	isBlocked func(net.IP) bool,
+) (blocked, literal bool) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(host))
+	if err != nil {
+		return false, false
+	}
+	if addr.Zone() != "" {
+		return true, true
+	}
+	addr = addr.Unmap()
+	return isBlocked(net.IP(addr.AsSlice())), true
 }
 
 // authorName 从 gofeed 条目提取作者名。Author 已被 gofeed 标记 deprecated，

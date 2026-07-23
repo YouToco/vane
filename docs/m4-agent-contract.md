@@ -283,8 +283,16 @@ Loop 行为细则：
   `direct-task-creation` 缩面：从数据访问层跳过画像，模型请求只声明 `create_schedule`，
   请求消息只保留当前 user turn（原有已清洗历史在本轮结束后再合并持久化），
   且声明与执行两层都要求该注册工具的真实 effect 为 mutating；同名只读工具不得暴露或执行。
-  `approved_fetch_plan.existing_source_ids` 在此模式下禁止出现，防模型猜 ID 触发隐藏 DB 读取；
-  当前消息明确的新信源必须完整写入 `approved_fetch_plan.sources`。
+  `approved_fetch_plan.existing_source_ids` 与内部持久化字段 `sources` 在此模式下禁止出现：
+  前者防模型猜 ID 触发隐藏 DB 读取，后者防模型猜 `vane://` URL/config/title。
+  当前消息明确的新信源必须写入版本化 `approved_fetch_plan.source_specs`
+  （`version=vane.source-specs/v1`），只提交 kind 对应的人类可读原始参数；Coordinator
+  在 pending 前经 `sourcespec.Build` 原子物化，再走原有 canonical/SSRF/重复 URL 校验。
+  任一 spec 非法则整份 proposal 失败，durable args 与 recovery 仍只认严格 `sources`。
+  所有模型轨（不只是 direct）都在 Agent 边界禁止提交内部 `sources`；Coordinator
+  保留旧 `sources` 入口只供已冻结数据、恢复流程和可信内部兼容。版本化 envelope、
+  plan 与每种 spec 的字段名逐字匹配，大小写别名、转义键、重复键、未知字段和显式
+  `null` 均拒绝；URL/域名还须在 pending 前拒绝十进制、八进制、十六进制及缩写 IPv4。
   运行时对任何幻觉的其他已注册工具调用也返回固定本地拒绝，不执行、不 taint。
   用户明确说「不要再搜索／直接出确认卡」
   时优先按此缩面；明确否定创建或要求先核对时不得进入。该模式只减少读取能力，不增加权限：
@@ -295,7 +303,12 @@ Loop 行为细则：
   会话只持久化当前 user + 确定性回复，不保留动态校验 tool result（工具审计仍走独立账本），
   避免通用 fail-closed 清洗把本地拒绝误记成外部查询。此规则避免外部发现完成后的确认消息
   又被 `list_sources` 带回 untrusted-result 边界，形成「确认→再读→隔离→口头承诺」循环。
-- turn 达 MaxTurns：Reply="这个请求步骤太多，我先停下来了，请把需求拆小一点再试"。
+  direct 请求 schema 只暴露且强制 `source_specs`；每个 assistant 响应必须恰有一个
+  `create_schedule` 调用，多调用整批零执行。direct 模式独立限制为
+  `min(agent.max_turns, 4)`；create_schedule 参数校验（含本地精确字段门）最多失败两次，
+  第二次仍失败即返回固定「任务尚未创建」文案，不能把全局 20 轮当成付费猜格式预算。
+- 普通 turn 达 MaxTurns：Reply="这个请求步骤太多，我先停下来了，请把需求拆小一点再试"；
+  direct-task-creation 达独立四轮上限则返回固定「任务尚未创建」文案。
 - 全部 LLM 错误向上抛（feishu 层 humanize）。
 
 ## 8. agent 工具集（`agent/tools.go`，构造函数 `BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger) []Tool`）
@@ -306,7 +319,7 @@ Loop 行为细则：
 | add_source | **yes** | sourcespec.Build → store.UpsertSource + AddSubscription | 参数 schema 同 spike：{type(enum rss/exa/tikhub_xhs), url, query, keyword, title?, category?} |
 | remove_source | **yes** | store.RemoveSubscription | {source_id:integer} |
 | list_schedules | no | store.ListSchedulesByUser | 中文列表文本 |
-| create_schedule | **yes** | scheduler.CreatePush | {spec:{cron?, every_seconds?, tz?}, nl_description?}；校验对齐 api/schedules.go（cron/every 二选一、every≥3600） |
+| create_schedule | **yes** | CreationCoordinator.Propose → 人工确认 → creation saga | `{spec,intent,approved_fetch_plan:{existing_source_ids?,source_specs?},nl_description?,strictness?}`；`source_specs` 是 `vane.source-specs/v1` 原始规格，模型面不暴露 durable `sources/config/vane://`；cron/every 二选一且 every≥3600 |
 | remove_schedule | **yes** | scheduler.DeletePush | {schedule_id:string} |
 | push_now | no（低危） | PushTrigger 接口（api push/now 同款触发） | 返回 run_id 文本 |
 | web_search | no | fetcher.ExaFetcher.Search（Exa /search，按次计费） | {query, num_results?(默认5/上限20), include_domains?}；一次性语义搜索，不建信源、不写内容库，结果只回当前对话（2026-07-20 增，见修订记录） |
@@ -373,8 +386,13 @@ Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的
   proposal；模型无工具文字（包括「确认卡稍后会出现，可以吗？」或真实追问）必须丢弃并从 clean
   baseline 自纠，连续两次无工具文字只能返回固定未创建文案；另须覆盖旧画像历史 current-turn
   隔离、读+写混合批次原子拒绝、同名非 mutating 工具零执行，以及无效 create tool_call 同批口头
-  承诺不入历史、`existing_source_ids` 零 Propose。删除请求侧缩面、运行时二次门、clean-baseline reset 或
-  无 proposal 的口头承诺门中的任一项，测试都必须变红。
+  承诺不入历史、`existing_source_ids`/legacy `sources` 零 Propose、参数校验两次即停、direct
+  第五轮绝不消费、同一响应多个 create 调用整批零执行。另须证明
+  `source_specs → sourcespec.Build → canonical sources` 在 pending
+  前完成，未知/重复/错 kind 字段、SSRF、非法裸域名、canonical 重复或批内任一坏项均整单拒绝，
+  durable bytes 与 recovery 不含 `source_specs`，Confirm 逐字消费该冻结计划且不重建。
+  删除请求侧缩面、运行时二次门、
+  clean-baseline reset、确定性物化或无 proposal 的口头承诺门中的任一项，测试都必须变红。
 - fetcher：Exa ad-hoc 上游账本必须断言 trace/user 归属与 `source_id=0`，反向断言这些本地归属元数据没有出现在第三方请求体/请求头；取消后的记账 context 仍可用且有 deadline，`statuses[].status=error` 必须在账本标为失败而不是 HTTP 200 成功。
 - feishu：BuildConfirmCard JSON 结构断言；回调 owner 校验单测（能 mock 的部分）。
 

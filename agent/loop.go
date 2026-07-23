@@ -10,6 +10,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/profilehint"
 	"github.com/YouToco/vane/task"
@@ -51,13 +53,13 @@ const (
 const exaAdHocSystemNote = `
 - 用户想「看一下/查一下」某个页面或主题（一次性需求）：直接调 web_search 或 read_page 拿到结果回答，**不要为一次性需求新建信源**。只有周期性、持续性的关注（每天盯某类信息、某页面有变化就告诉我）才用 add_source 订阅或 create_schedule 建定时任务。
 - 每条用户消息最多成功执行一次外部读取。需要查多个公司或站点时，合并成一次 web_search 查询，不要并列或接连调用多个外部读取；拿到结果后只总结候选并等待用户下一条消息。
-- create_schedule 必须带完整 intent 与 approved_fetch_plan。若采用 list_sources 返回的本人现有信源，把它的数字 id 放入 existing_source_ids，不要把 id 编造成 URL；新信源才提交完整 sources。确认卡会展示系统冻结后的每个长期信源，确认后不能自行扩大主题或替换长期信源。需要先上网找候选时，本轮只能做只读发现并把候选告诉用户，等用户下一条消息明确同意后才能创建任务；绝不能在读取外部结果的同一轮发起写操作。`
+- create_schedule 必须带完整 intent 与 approved_fetch_plan。若采用 list_sources 返回的本人现有信源，把它的数字 id 放入 existing_source_ids；新信源用 source_specs（固定 version=vane.source-specs/v1）提交人类可读的原始参数。绝不能编造 config、selectors、vane:// URL 或把 id 拼成 URL。确认卡会展示系统确定性物化并冻结后的每个长期信源，确认后不能自行扩大主题或替换长期信源。需要先上网找候选时，本轮只能做只读发现并把候选告诉用户，等用户下一条消息明确同意后才能创建任务；绝不能在读取外部结果的同一轮发起写操作。`
 
 // directTaskCreationSystemNote 只在用户明确要求按当前消息直接生成任务确认卡、
 // 且没有要求先查/核对时追加。运行时另有工具白名单二次门；prompt 只负责让模型
 // 尽快收敛到 create_schedule，而不是安全边界。
 const directTaskCreationSystemNote = `
-- 用户已明确要求直接生成任务确认卡。本轮不注入画像，也不要询问行业、职业、岗位或更新画像。不要调用 list_sources、list_schedules、web_search、read_page 或其他读取工具；只能使用本条用户消息中明确提供的信息调用 create_schedule，不得用历史、画像或自行扩写。新长期信源写入 approved_fetch_plan.sources，绝不能编造 existing_source_ids。若信息确实不足，不得编造；没有实际调用 create_schedule 就绝不能声称确认卡已经或即将出现。`
+- 用户已明确要求直接生成任务确认卡。本轮不注入画像，也不要询问行业、职业、岗位或更新画像。不要调用 list_sources、list_schedules、web_search、read_page 或其他读取工具；只能使用本条用户消息中明确提供的信息调用 create_schedule，不得用历史或画像。新长期信源必须写入 approved_fetch_plan.source_specs，version 固定为 vane.source-specs/v1；只能提交 kind 对应的人类可读参数，绝不能编写 sources、config、selectors、vane:// URL 或 existing_source_ids。唯一允许的有界补全是：用户明确点名机构且要求官方来源时，可填写这些机构对应的官方裸域名；精确域名会在确认卡展示并由用户点击批准，不得加入未点名机构、媒体或社区。若信息确实不足，不得编造；没有实际调用 create_schedule 就绝不能声称确认卡已经或即将出现。`
 
 const directTaskCreationRetrySystemNote = `
 - 系统刚刚拒绝并丢弃了一个非 create_schedule 工具调用；它没有执行，也没有产生可用结果。不要重试读取，只能调用 create_schedule 或明确追问缺失信息。`
@@ -116,6 +118,12 @@ const (
 	// 与 config setDefaults（agent.max_turns=20、session_ttl_minutes=30）取值一致。
 	defaultMaxTurns   = 20
 	defaultSessionTTL = 30 * time.Minute
+	// direct-task-creation 已缩面到单一 proposal 工具；四轮足以覆盖隐藏读取/
+	// 无工具文字拒绝、一次参数自纠与最终合法 proposal，不能把全局 20 轮当付费重试预算。
+	directTaskCreationMaxTurns = 4
+	// 参数校验只允许携带精确错误自纠一次。第二次仍失败就诚实退出；
+	// schema/业务错误不应靠同一个模型反复猜到全局轮次耗尽。
+	directTaskCreationMaxValidationFailures = 2
 
 	// pendingActionTTL 待确认动作的有效期（契约 §7：24h 过期）。
 	pendingActionTTL = 24 * time.Hour
@@ -510,8 +518,12 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		// 安全基线；不把“未声明工具的原生 tool history”送回供应商。
 		directTaskCreationBase = append([]llm.ChatMessage(nil), msgs...)
 	}
+	maxTurns := l.maxTurns
+	if state != nil && state.directTaskCreation && maxTurns > directTaskCreationMaxTurns {
+		maxTurns = directTaskCreationMaxTurns
+	}
 	turns := 0
-	for turns < l.maxTurns {
+	for turns < maxTurns {
 		// Do not start a new paid model turn after the owner canceled. Individual
 		// LLM calls still finish their bounded ledger tail before returning.
 		if err := ctx.Err(); err != nil {
@@ -626,6 +638,14 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			// 的 id/name 协议壳来匹配 role=tool 回执。
 			msgs = isolateExternalResultTurn(currentUser, resp.ToolCalls, toolMsgs)
 		}
+		if pending == nil && state.directTaskCreation &&
+			state.directTaskCreationValidationFailures >=
+				directTaskCreationMaxValidationFailures {
+			msgs = append(msgs, llm.ChatMessage{
+				Role: "assistant", Content: replyTaskCreationNotCreated,
+			})
+			return Outcome{Reply: replyTaskCreationNotCreated}, msgs, turns, nil
+		}
 		if pending == nil && state.directTaskCreation && state.directTaskCreationToolRejected {
 			// 隐藏工具没有执行，协议壳也不值得保留；回到基线后让模型在
 			// 只声明 create_schedule 的干净请求上自纠。
@@ -679,8 +699,12 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 	}
 
 	// MaxTurns 内未收敛：兜底文案也写进历史，保持"每条 user 都有回应"。
-	msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: replyMaxTurns})
-	return Outcome{Reply: replyMaxTurns}, msgs, turns, nil
+	reply := replyMaxTurns
+	if state != nil && state.directTaskCreation {
+		reply = replyTaskCreationNotCreated
+	}
+	msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: reply})
+	return Outcome{Reply: reply}, msgs, turns, nil
 }
 
 // requestTools 组装本轮请求的工具声明：静态声明在前（进程内恒定），已激活端点
@@ -709,7 +733,11 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		for i := len(l.toolDefs) - 1; i >= 0; i-- {
 			def := l.toolDefs[i]
 			if def.Name == "create_schedule" {
-				return []llm.ToolDef{def}
+				direct, ok := projectDirectTaskCreationToolDef(def)
+				if !ok {
+					return nil
+				}
+				return []llm.ToolDef{direct}
 			}
 		}
 		return nil
@@ -724,6 +752,44 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 	out := make([]llm.ToolDef, 0, len(l.toolDefs)+len(dyn))
 	out = append(out, l.toolDefs...)
 	return append(out, dyn...)
+}
+
+func projectDirectTaskCreationToolDef(def llm.ToolDef) (llm.ToolDef, bool) {
+	var schema map[string]any
+	if err := json.Unmarshal(def.Parameters, &schema); err != nil {
+		return llm.ToolDef{}, false
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		return llm.ToolDef{}, false
+	}
+	approved, ok := properties["approved_fetch_plan"].(map[string]any)
+	if !ok {
+		return llm.ToolDef{}, false
+	}
+	planProperties, ok := approved["properties"].(map[string]any)
+	if !ok {
+		return llm.ToolDef{}, false
+	}
+	sourceSpecs, ok := planProperties["source_specs"]
+	if !ok {
+		return llm.ToolDef{}, false
+	}
+	sourceSpecsObject, ok := sourceSpecs.(map[string]any)
+	if !ok {
+		return llm.ToolDef{}, false
+	}
+	sourceSpecsObject["description"] = "本次直接创建必填：只提交当前消息指定的新信源原始规格；系统负责生成内部 URL/config/title。不能使用 existing_source_ids 或旧式 sources。"
+	approved["properties"] = map[string]any{"source_specs": sourceSpecs}
+	approved["required"] = []string{"source_specs"}
+	approved["description"] = "直接创建模式只接受本条用户消息指定的新信源；必须使用版本化 source_specs，不能引用 existing_source_ids 或提交内部 sources。"
+	projected, err := json.Marshal(schema)
+	if err != nil {
+		return llm.ToolDef{}, false
+	}
+	def.Description = "按当前用户消息生成任务确认卡。新信源必须使用 source_specs；本次不允许读取或引用 existing_source_ids，点击确认卡前不会执行任务。"
+	def.Parameters = projected
+	return def, true
 }
 
 // resolveTool 按扩展白名单解析工具（M4 契约 §10 + 端点注册表契约 §4）：
@@ -776,6 +842,14 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 	// 写进下一轮消息，与随后返回的恶意网页同屏。
 	state := runStateFrom(ctx)
 	if state != nil && state.directTaskCreation {
+		if len(calls) != 1 {
+			state.directTaskCreationToolRejected = true
+			for _, rejected := range calls {
+				out = append(out, toolMsg(rejected.ID,
+					"直接创建模式每轮只能调用一次 create_schedule；本批未执行。"))
+			}
+			return nil, out, nil
+		}
 		for _, tc := range calls {
 			if tc.Name == "create_schedule" {
 				continue
@@ -868,13 +942,31 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			if l.taskCreation == nil {
 				return nil, out, errors.New("agent: task creation controller is not configured")
 			}
-			if state := runStateFrom(ctx); state != nil && state.directTaskCreation &&
-				directTaskCreationReferencesExistingSources(args) {
-				// self-contained direct 模式没有执行 list_sources，也看不到历史；
-				// existing_source_ids 只能是模型猜测。即使仍需点卡，放进
-				// Propose 也会触发隐藏 DB 读取并让当前消息之外的数据影响方案。
+			plan, exact := inspectModelTaskCreationPlan(args)
+			state := runStateFrom(ctx)
+			if !exact {
+				if state != nil && state.directTaskCreation {
+					state.directTaskCreationValidationFailures++
+				}
 				out = append(out, toolMsg(tc.ID,
-					"直接创建模式不能引用 existing_source_ids；请在 approved_fetch_plan.sources 中提交用户本条消息明确指定的新信源。"))
+					"create_schedule 字段名必须与 schema 完全一致，不能使用大小写别名、转义键或未知字段。"))
+				continue
+			}
+			if plan.hasSources {
+				if state != nil && state.directTaskCreation {
+					state.directTaskCreationValidationFailures++
+				}
+				out = append(out, toolMsg(tc.ID,
+					"create_schedule 不接受模型提交 approved_fetch_plan.sources；请改用 source_specs（version=vane.source-specs/v1）提交原始信源参数。"))
+				continue
+			}
+			if state != nil && state.directTaskCreation && plan.hasExistingSourceIDs {
+				// self-contained direct 模式没有执行 list_sources，也看不到历史；
+				// existing_source_ids 只能是模型猜测，会让当前消息之外的数据
+				// 进入方案。普通模式仍可在真实 list_sources 后引用。
+				state.directTaskCreationValidationFailures++
+				out = append(out, toolMsg(tc.ID,
+					"直接创建模式不能使用 existing_source_ids；请用 approved_fetch_plan.source_specs（version=vane.source-specs/v1）提交用户本条消息指定的新信源。"))
 				continue
 			}
 			actionID := uuid.NewString()
@@ -887,6 +979,10 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			})
 			if err != nil {
 				if message, ok := creationProposalValidationMessage(err); ok {
+					if state := runStateFrom(ctx); state != nil &&
+						state.directTaskCreation {
+						state.directTaskCreationValidationFailures++
+					}
 					out = append(out, toolMsg(tc.ID, message))
 					continue
 				}
@@ -925,21 +1021,41 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 	return pending, out, nil
 }
 
-func directTaskCreationReferencesExistingSources(args json.RawMessage) bool {
-	var root map[string]json.RawMessage
-	if json.Unmarshal(args, &root) != nil {
-		return false // 交给 CreationController 返回统一 JSON/字段校验错误。
+type modelTaskCreationPlanInspection struct {
+	hasExistingSourceIDs bool
+	hasSources           bool
+}
+
+func inspectModelTaskCreationPlan(
+	args json.RawMessage,
+) (modelTaskCreationPlanInspection, bool) {
+	var envelope struct {
+		Spec              json.RawMessage `json:"spec,omitempty"`
+		Intent            json.RawMessage `json:"intent,omitempty"`
+		ApprovedFetchPlan json.RawMessage `json:"approved_fetch_plan,omitempty"`
+		NLDescription     json.RawMessage `json:"nl_description,omitempty"`
+		Strictness        json.RawMessage `json:"strictness,omitempty"`
 	}
-	rawPlan, ok := root["approved_fetch_plan"]
-	if !ok {
-		return false
+	if strictjson.DecodeExact(args, &envelope) != nil {
+		return modelTaskCreationPlanInspection{}, false
 	}
-	var plan map[string]json.RawMessage
-	if json.Unmarshal(rawPlan, &plan) != nil {
-		return false
+	if len(bytes.TrimSpace(envelope.ApprovedFetchPlan)) == 0 {
+		// Missing plan remains a controller validation error; the exact envelope
+		// check above has already ruled out a case-folded alias.
+		return modelTaskCreationPlanInspection{}, true
 	}
-	_, ok = plan["existing_source_ids"]
-	return ok
+	var plan struct {
+		ExistingSourceIDs json.RawMessage `json:"existing_source_ids,omitempty"`
+		Sources           json.RawMessage `json:"sources,omitempty"`
+		SourceSpecs       json.RawMessage `json:"source_specs,omitempty"`
+	}
+	if strictjson.DecodeExact(envelope.ApprovedFetchPlan, &plan) != nil {
+		return modelTaskCreationPlanInspection{}, false
+	}
+	return modelTaskCreationPlanInspection{
+		hasExistingSourceIDs: len(plan.ExistingSourceIDs) != 0,
+		hasSources:           len(plan.Sources) != 0,
+	}, true
 }
 
 func isDirectTaskCreationConfirmation(text string) bool {

@@ -651,7 +651,7 @@ const createScheduleSchema = `{
     "intent": {"type": "string", "minLength": 1, "description": "用户已经确认的持续监控目标与筛选范围。必须完整、自包含；它会成为任务手册，确认后不得由系统自行扩大主题或范围。"},
     "approved_fetch_plan": {
       "type": "object",
-      "description": "待用户确认的完整长期抓取计划。可以用 existing_source_ids 引用 list_sources 返回的本人现有信源，也可以在 sources 中提交新材料化信源；两者合计必须为 1-64 个。确认前系统会把引用冻结为完整计划，之后不会再让模型换源。",
+      "description": "待用户确认的完整长期抓取计划。可以用 existing_source_ids 引用 list_sources 返回的本人现有信源，也可以用 source_specs 提交新的原始信源规格；两者合计必须为 1-64 个。系统会在出确认卡前把规格确定性物化并冻结，模型绝不能编写 config、selectors 或 vane:// URL。",
       "properties": {
         "existing_source_ids": {
           "type": "array",
@@ -660,22 +660,53 @@ const createScheduleSchema = `{
           "description": "可选：list_sources 返回的本人 active 订阅信源 id。不要把 id 拼成 URL；系统会在提案时按当前授权解析并冻结完整值。",
           "items": {"type": "integer", "minimum": 1}
         },
-        "sources": {
-          "type": "array",
-          "maxItems": 64,
-          "description": "可选：新的长期信源；每项必须给出可执行的 platform/capability/url/config。与 existing_source_ids 合计至少一个。",
-          "items": {
-            "type": "object",
-            "properties": {
-              "platform": {"type": "string", "minLength": 1, "description": "注册平台名，如 web"},
-              "capability": {"type": "string", "minLength": 1, "description": "注册的只读能力名，如 feed、contents 或 search"},
-              "title": {"type": "string", "description": "可选的人类可读信源名"},
-              "url": {"type": "string", "minLength": 1, "description": "材料化后的 canonical http(s) 或 vane:// URL，不得含凭证"},
-              "config": {"type": "object", "description": "与 platform/capability/url 精确对应的完整能力参数"}
+        "source_specs": {
+          "type": "object",
+          "description": "可选：新的长期信源原始规格。只能使用下面的 kind 与对应的人类可读参数；系统负责生成内部 URL/config/title。可以与 existing_source_ids 组合，但不能提交旧式 sources。",
+          "properties": {
+            "version": {
+              "type": "string",
+              "enum": ["vane.source-specs/v1"],
+              "description": "固定协议版本，必须逐字填写 vane.source-specs/v1"
             },
-            "required": ["platform", "capability", "url", "config"],
-            "additionalProperties": false
-          }
+            "items": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 64,
+              "description": "信源规格。kind 与参数必须匹配，不能夹带其他 kind 的字段。常用精确模板：网页搜索={\"kind\":\"web_search\",\"query\":\"主题\",\"include_domains\":[\"openai.com\"]}；普通页面={\"kind\":\"web_contents\",\"page_url\":\"https://...\"}；已知 RSS={\"kind\":\"web_feed\",\"feed_url\":\"https://...xml\"}。",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": ["web_search", "web_feed", "web_contents", "x_user_posts", "xhs_search", "xhs_user_posts", "xhs_hot_list", "xhs_topic_feed", "xhs_faved_notes"],
+                    "description": "web_search=网页搜索；web_feed=已知 RSS/Atom 地址；web_contents=监控已知页面；x_user_posts=X 账号；其余为对应小红书能力"
+                  },
+                  "query": {"type": "string", "description": "仅 web_search 必填：搜索词"},
+                  "category": {"type": "string", "description": "仅 web_search 可选：Exa 类别，如 news"},
+                  "include_domains": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {"type": "string"},
+                    "description": "仅 web_search 可选：裸域名白名单，如 [\"openai.com\",\"anthropic.com\"]；不能含协议、路径、端口、通配符或 IP。用户只点名机构并要求官方来源时，可基于该机构填写对应官方根域名；确认卡会展示并冻结精确域名，绝不能加入用户未点名的机构、媒体或社区。"
+                  },
+                  "feed_url": {"type": "string", "description": "仅 web_feed 必填：已知 RSS/Atom 的 http/https 地址；不要把普通网页猜成 feed"},
+                  "categories": {"type": "array", "items": {"type": "string"}, "description": "仅 web_feed 可选：RSS 分类过滤"},
+                  "page_url": {"type": "string", "description": "仅 web_contents 必填：要监控的普通 http/https 页面地址"},
+                  "screen_name": {"type": "string", "description": "仅 x_user_posts 必填：X 用户名"},
+                  "keyword": {"type": "string", "description": "仅 xhs_search 必填：小红书搜索词"},
+	                  "user_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "description": "仅 xhs_user_posts/xhs_faved_notes：24 位小写十六进制用户 ID，与 profile_url 二选一"},
+	                  "profile_url": {"type": "string", "description": "仅 xhs_user_posts/xhs_faved_notes：小红书用户主页 https://www.xiaohongshu.com/user/profile/<24位小写十六进制ID>，与 user_id 二选一"},
+	                  "page_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "description": "仅 xhs_topic_feed：24 位小写十六进制话题 ID，与 topic_url 二选一"},
+                  "topic_url": {"type": "string", "description": "仅 xhs_topic_feed：与 page_id 二选一"}
+                },
+                "required": ["kind"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["version", "items"],
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -724,7 +755,7 @@ type createScheduleTool struct {
 
 func (t *createScheduleTool) Name() string { return "create_schedule" }
 func (t *createScheduleTool) Description() string {
-	return "创建定时推送任务。必须同时提交用户批准的监控意图与长期抓取计划；已有信源用 list_sources 返回的 id 放进 existing_source_ids，新信源放进 sources。确认前系统会冻结完整计划，之后不会再自动换源。触发频率用 cron 或 every_seconds 二选一，频率不得高于每小时一次。"
+	return "创建定时推送任务。必须同时提交用户批准的监控意图与长期抓取计划；已有信源用 list_sources 返回的 id 放进 existing_source_ids，新信源用版本化 source_specs 提交原始参数。系统会在确认卡前确定性生成并冻结内部信源，模型不得编写 config、selectors 或 vane:// URL。触发频率用 cron 或 every_seconds 二选一，频率不得高于每小时一次。"
 }
 func (t *createScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(createScheduleSchema)

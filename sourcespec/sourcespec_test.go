@@ -178,6 +178,61 @@ func TestBuild_WebSearchIncludeDomainsRejectsBadJSON(t *testing.T) {
 	}
 }
 
+func TestBuild_WebSearchIncludeDomainsRejectsNonHostValues(t *testing.T) {
+	for _, value := range []string{
+		"https://openai.com/news",
+		"openai.com/path",
+		"openai.com:443",
+		"*.openai.com",
+		"127.0.0.1",
+		"127.1",
+		"2130706433",
+		"017700000001",
+		"0x7f000001",
+		"localhost",
+		"internal.local",
+		"-openai.com",
+	} {
+		t.Run(value, func(t *testing.T) {
+			raw, err := json.Marshal([]string{value})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, msg := Build(Spec{
+				Platform: "web", Capability: "search",
+				Params: map[string]string{
+					"query": "AI", "include_domains": string(raw),
+				},
+			})
+			if msg == "" || !strings.Contains(msg, "include_domains") {
+				t.Fatalf("非法域名值应被明确拒绝: value=%q msg=%q", value, msg)
+			}
+		})
+	}
+}
+
+func TestIsIPAddressLikeRecognizesResolverAndZonedSpellings(t *testing.T) {
+	for _, host := range []string{
+		"127.0.0.1",
+		"127.1",
+		"2130706433",
+		"017700000001",
+		"0x7f000001",
+		"::1",
+		"::1%lo0",
+		"fe80::1%en0",
+	} {
+		if !IsIPAddressLike(host) {
+			t.Errorf("%q must be classified as an IP literal", host)
+		}
+	}
+	for _, host := range []string{"openai.com", "123.example.com", "deadbeef.example"} {
+		if IsIPAddressLike(host) {
+			t.Errorf("%q must remain a hostname", host)
+		}
+	}
+}
+
 func TestBuild_TrimsWhitespace(t *testing.T) {
 	a, _ := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": "AI"}})
 	b, _ := Build(Spec{Platform: "web", Capability: "search", Params: map[string]string{"query": "  AI  "}})

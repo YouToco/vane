@@ -91,6 +91,10 @@ type toolRunState struct {
 	// 则返回确定性未创建文案。这里不词法区分“追问”和“口头承诺”，避免同义
 	// 承诺加问号绕过。
 	directTaskCreationResponseRejected bool
+	// directTaskCreationValidationFailures 统计 Agent 精确字段门和
+	// create_schedule controller 返回的确定性参数校验失败。上限与全局
+	// MaxTurns 分离，防模型拿同一份错误反复猜内部格式并消耗 20 次付费调用。
+	directTaskCreationValidationFailures int
 	// endpointCalls 本条消息内已发起的端点调用次数（限额判定用）。计数时机在
 	// 校验通过之后、发请求之前：打到上游才算（含 HTTP 错误——失败同样计费），
 	// 参数校验失败没打上游、不计费，不吃限额。
