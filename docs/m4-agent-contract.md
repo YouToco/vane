@@ -317,7 +317,7 @@ Loop 行为细则：
 |---|---|---|---|
 | list_sources | no | store.ListSubscribedSourcesByUser | 返回 id/类型/标题/状态的中文列表文本 |
 | add_source | **yes** | sourcespec.Build → store.UpsertSource + AddSubscription | 参数 schema 同 spike：{type(enum rss/exa/tikhub_xhs), url, query, keyword, title?, category?} |
-| remove_source | **yes** | store.RemoveSubscription | {source_id:integer} |
+| remove_source | **yes** | store.RemoveSubscription（逐 id，删除幂等） | {source_ids:[integer]}（1–20 个，去重保序，一张确认卡列全并一次确认；旧单数 {source_id} 仅为兼容存量 pending_actions 保留解析，schema 不再声明——2026-07-23 增补，批量意图不再被拆成 N 轮确认） |
 | list_schedules | no | store.ListSchedulesByUser | 中文列表文本 |
 | create_schedule | **yes** | CreationCoordinator.Propose → 人工确认 → creation saga | `{spec,intent,approved_fetch_plan:{existing_source_ids?,source_specs?},nl_description?,strictness?}`；`source_specs` 是 `vane.source-specs/v1` 原始规格，模型面不暴露 durable `sources/config/vane://`；cron/every 二选一且 every≥3600 |
 | remove_schedule | **yes** | scheduler.DeletePush | {schedule_id:string} |

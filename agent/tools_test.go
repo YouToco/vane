@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -563,9 +564,23 @@ func TestEnableSourceTool(t *testing.T) {
 
 // TestOtherTools_Summarize 覆盖此前零测试的三个写工具 Summarize（审计 M-3）。
 func TestOtherTools_Summarize(t *testing.T) {
-	t.Run("remove_source", func(t *testing.T) {
+	t.Run("remove_source 单个", func(t *testing.T) {
+		got := (&removeSourceTool{}).Summarize(json.RawMessage(`{"source_ids":[42]}`))
+		if got != "取消订阅信源（id=42）" {
+			t.Fatalf("实得 %q", got)
+		}
+	})
+	// 部署前落库的 pending_actions 仍是单数 source_id；换 schema 不能废掉已发出的卡。
+	t.Run("remove_source 兼容旧单数入参", func(t *testing.T) {
 		got := (&removeSourceTool{}).Summarize(json.RawMessage(`{"source_id":42}`))
 		if got != "取消订阅信源（id=42）" {
+			t.Fatalf("实得 %q", got)
+		}
+	})
+	// 批量是本工具的核心承诺：一张卡完整列出每个 id，用户点一次确认全部。
+	t.Run("remove_source 批量列出全部 id", func(t *testing.T) {
+		got := (&removeSourceTool{}).Summarize(json.RawMessage(`{"source_ids":[31,32,33]}`))
+		if got != "取消订阅 3 个信源（id=31、32、33）" {
 			t.Fatalf("实得 %q", got)
 		}
 	})
@@ -647,6 +662,157 @@ func TestOtherTools_Summarize(t *testing.T) {
 	t.Run("非法 JSON 兜底", func(t *testing.T) {
 		if got := (&removeSourceTool{}).Summarize(json.RawMessage(`{`)); !strings.Contains(got, "取消订阅信源") {
 			t.Fatalf("应走 summarizeFallback, 实得 %q", got)
+		}
+	})
+	// 能解析但校验不过（如超上限）：卡面必须诚实说明确认也不会执行，
+	// 不能落成一段截断 JSON 的垃圾卡（审查 M-2）。
+	t.Run("remove_source 超上限卡面诚实", func(t *testing.T) {
+		ids := make([]string, removeSourceBatchMax+1)
+		for i := range ids {
+			ids[i] = strconv.Itoa(i + 1)
+		}
+		got := (&removeSourceTool{}).Summarize(json.RawMessage(`{"source_ids":[` + strings.Join(ids, ",") + `]}`))
+		for _, want := range []string{"参数无效", "确认后也不会执行"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("卡面缺 %q：%s", want, got)
+			}
+		}
+	})
+}
+
+// TestRemoveSourceIDs 钉死批量入参的规范化契约：Execute 与 Summarize 共用同一
+// 解析器，卡面摘要与真正执行的 id 集合不可能漂移。
+func TestRemoveSourceIDs(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    string
+		want    []int64
+		wantErr bool
+	}{
+		{name: "批量", args: `{"source_ids":[31,32,33]}`, want: []int64{31, 32, 33}},
+		{name: "旧单数兼容", args: `{"source_id":7}`, want: []int64{7}},
+		{name: "去重保序", args: `{"source_ids":[5,3,5,3]}`, want: []int64{5, 3}},
+		// source_ids 优先：两者并存时旧字段不得混入，否则卡面与执行集合不一致。
+		{name: "数组优先于单数", args: `{"source_id":1,"source_ids":[2]}`, want: []int64{2}},
+		{name: "空数组拒绝", args: `{"source_ids":[]}`, wantErr: true},
+		{name: "两者皆缺拒绝", args: `{}`, wantErr: true},
+		{name: "非正数拒绝", args: `{"source_ids":[3,0]}`, wantErr: true},
+		{name: "负数拒绝", args: `{"source_ids":[-1]}`, wantErr: true},
+		{name: "非法 JSON 拒绝", args: `{`, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, errText, _ := removeSourceIDs(json.RawMessage(tc.args))
+			if tc.wantErr {
+				if errText == "" {
+					t.Fatalf("期望拒绝，实得 ids=%v", got)
+				}
+				return
+			}
+			if errText != "" {
+				t.Fatalf("期望通过，实得错误 %q", errText)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("ids=%v，期望 %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("ids=%v，期望 %v", got, tc.want)
+				}
+			}
+		})
+	}
+	t.Run("超过上限拒绝", func(t *testing.T) {
+		ids := make([]string, removeSourceBatchMax+1)
+		for i := range ids {
+			ids[i] = strconv.Itoa(i + 1)
+		}
+		args := `{"source_ids":[` + strings.Join(ids, ",") + `]}`
+		if got, errText, _ := removeSourceIDs(json.RawMessage(args)); errText == "" {
+			t.Fatalf("超上限应拒绝，实得 ids=%v", got)
+		}
+	})
+	// malformed 标志决定卡面走兜底还是把校验文案上卡，两态必须可区分。
+	t.Run("JSON 坏是 malformed", func(t *testing.T) {
+		if _, _, malformed := removeSourceIDs(json.RawMessage(`{`)); !malformed {
+			t.Fatal("非法 JSON 应标记 malformed")
+		}
+	})
+	t.Run("校验不过不是 malformed", func(t *testing.T) {
+		if _, errText, malformed := removeSourceIDs(json.RawMessage(`{"source_ids":[]}`)); malformed || errText == "" {
+			t.Fatalf("空数组应是校验失败非 malformed，errText=%q malformed=%v", errText, malformed)
+		}
+	})
+}
+
+// TestRemoveSourceSchema_BatchMaxConsistent 钉死常量与 schema maxItems 的一致性：
+// 改 schema 忘改常量会让 strict 模型能发出确认后才被拦的批量（审查 L-1）。
+func TestRemoveSourceSchema_BatchMaxConsistent(t *testing.T) {
+	var schema struct {
+		Properties struct {
+			SourceIDs struct {
+				MaxItems int `json:"maxItems"`
+			} `json:"source_ids"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal((&removeSourceTool{}).Parameters(), &schema); err != nil {
+		t.Fatalf("schema 不是合法 JSON: %v", err)
+	}
+	if schema.Properties.SourceIDs.MaxItems != removeSourceBatchMax {
+		t.Fatalf("schema maxItems=%d 与 removeSourceBatchMax=%d 漂移",
+			schema.Properties.SourceIDs.MaxItems, removeSourceBatchMax)
+	}
+}
+
+// TestRemoveSourcesSequentially 钉死批量执行循环（审查 L-2）：每个 id 都被删、
+// 中途失败时最外层 AppError.Message 必须携带已删部分——feishu 两个用户可见出口
+// （卡片文案、会话回调）都只取 errors.As 命中的 AppError.Message（审查 M-1）。
+func TestRemoveSourcesSequentially(t *testing.T) {
+	ctx := context.Background()
+	t.Run("全部成功逐个删", func(t *testing.T) {
+		var removed []int64
+		result, err := removeSourcesSequentially(ctx, []int64{31, 32, 33},
+			func(_ context.Context, id int64) error {
+				removed = append(removed, id)
+				return nil
+			})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if !reflect.DeepEqual(removed, []int64{31, 32, 33}) {
+			t.Fatalf("实删 %v，期望全部", removed)
+		}
+		if !strings.Contains(result, "id=31、32、33") {
+			t.Fatalf("结果文案应列全 id，实得 %q", result)
+		}
+	})
+	t.Run("中途失败报告已删部分", func(t *testing.T) {
+		boom := types.NewAppError(types.CodeDatabase, "移除订阅（user=1, source=33）", errors.New("db down"))
+		_, err := removeSourcesSequentially(ctx, []int64{31, 32, 33},
+			func(_ context.Context, id int64) error {
+				if id == 33 {
+					return boom
+				}
+				return nil
+			})
+		var ae *types.AppError
+		if !errors.As(err, &ae) {
+			t.Fatalf("应可 errors.As 到 AppError，实得 %v", err)
+		}
+		// errors.As 命中链上最外层 AppError：Message 必须带已删进度，否则
+		// 用户看到"执行失败"却不知道 31、32 已经删了。
+		for _, want := range []string{"id=31、32", "id=33 失败"} {
+			if !strings.Contains(ae.Message, want) {
+				t.Fatalf("AppError.Message 缺 %q：%s", want, ae.Message)
+			}
+		}
+	})
+	t.Run("首个就失败原样上抛", func(t *testing.T) {
+		boom := errors.New("db down")
+		_, err := removeSourcesSequentially(ctx, []int64{31},
+			func(context.Context, int64) error { return boom })
+		if !errors.Is(err, boom) {
+			t.Fatalf("首个失败应原样上抛，实得 %v", err)
 		}
 	})
 }
