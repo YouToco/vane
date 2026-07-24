@@ -220,7 +220,7 @@ func TestCompiledSnapshotV1ExactEqual_IsByteAndOrderSensitive(t *testing.T) {
 	}
 }
 
-func TestCompiledSourceSideEffectsRemainPinnedToV1(t *testing.T) {
+func TestCompiledSourceSideEffectsUseAuthoritativeSnapshot(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("resolve source fence guard")
@@ -257,7 +257,7 @@ func TestCompiledSourceSideEffectsRemainPinnedToV1(t *testing.T) {
 			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
 				if identifier, ok := node.(*ast.Ident); ok &&
-					identifier.Name == "loadFrozenTaskRunSourceV1" {
+					identifier.Name == "loadAuthoritativeTaskRunSource" {
 					got[function.Name.Name]++
 				}
 				return true
@@ -269,11 +269,11 @@ func TestCompiledSourceSideEffectsRemainPinnedToV1(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != len(want) {
-		t.Fatalf("v1 source fence callers = %v, want %v", got, want)
+		t.Fatalf("authoritative source fence callers = %v, want %v", got, want)
 	}
 	for function, calls := range want {
 		if got[function] != calls {
-			t.Errorf("%s v1 source fence calls = %d, want %d",
+			t.Errorf("%s authoritative source fence calls = %d, want %d",
 				function, got[function], calls)
 		}
 	}

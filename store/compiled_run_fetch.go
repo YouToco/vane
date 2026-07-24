@@ -33,7 +33,8 @@ func (s *Store) UpsertContentItemForTaskRunV1(
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
 
-	frozen, err := loadFrozenTaskRunSourceV1(ctx, tx, expected, sourceID)
+	frozen, err := loadAuthoritativeTaskRunSource(
+		ctx, tx, expected, ref, sourceID)
 	if err != nil {
 		return 0, false, err
 	}
@@ -132,7 +133,8 @@ func (s *Store) UpdateSourceFetchStateForTaskRunV1(
 		return false, err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
-	frozen, err := loadFrozenTaskRunSourceV1(ctx, tx, expected, sourceID)
+	frozen, err := loadAuthoritativeTaskRunSource(
+		ctx, tx, expected, ref, sourceID)
 	if err != nil {
 		return false, err
 	}
@@ -177,7 +179,8 @@ func (s *Store) DisableSourceIfActiveForTaskRunV1(
 		return false, err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
-	frozen, err := loadFrozenTaskRunSourceV1(ctx, tx, expected, sourceID)
+	frozen, err := loadAuthoritativeTaskRunSource(
+		ctx, tx, expected, ref, sourceID)
 	if err != nil {
 		return false, err
 	}
@@ -286,31 +289,25 @@ func (s *Store) ListRecentSimhashesForTaskRunV1(
 	return out, nil
 }
 
-func loadFrozenTaskRunSourceV1(
+func loadAuthoritativeTaskRunSource(
 	ctx context.Context,
 	tx pgx.Tx,
 	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
 	sourceID int64,
 ) (taskRunSourceIdentityV1, error) {
-	lookup := CreateOrGetTaskRunSnapshotParams{
-		TenantID: expected.TenantID, UserID: expected.UserID, TaskID: expected.TaskID,
-		TemporalWorkflowID: expected.TemporalWorkflowID,
-		TemporalRunID:      expected.TemporalRunID,
-	}
-	snapshot, found, err := loadTaskRunSnapshot(ctx, tx, lookup)
+	_, snapshot, _, err := loadAuthoritativeCompiledTaskRunSnapshot(
+		ctx, tx, expected, ref)
 	if err != nil {
 		return taskRunSourceIdentityV1{}, err
 	}
-	if !found {
-		return taskRunSourceIdentityV1{}, taskRunNotFound()
-	}
-	decoded, err := readTaskRunSnapshotPayload(snapshot.Payload)
-	if err != nil || decoded.Payload == nil || decoded.Payload.Definition == nil {
-		return taskRunSourceIdentityV1{}, taskRunIntegrityError()
-	}
-	for _, source := range decoded.Payload.Definition.Sources {
+	for _, source := range snapshot.Definition.Sources {
 		if source.SourceID == sourceID {
-			return source, nil
+			return taskRunSourceIdentityV1{
+				SourceID: source.SourceID, Platform: string(source.Platform),
+				Capability: string(source.Capability), Title: source.Title,
+				URL: source.URL, Config: source.Config,
+			}, nil
 		}
 	}
 	return taskRunSourceIdentityV1{}, taskRunValidationError(

@@ -193,21 +193,28 @@ func (f *compiledRunStoreFake) CreateOrGetCompiledRunSnapshotShadowV2(
 	return f.CreateOrGetCompiledRunSnapshotV1(ctx, identity, policy)
 }
 
-func (f *compiledRunStoreFake) LoadCompiledTaskRunSnapshotV1(
+func (f *compiledRunStoreFake) LoadAuthoritativeCompiledTaskRunSnapshot(
 	_ context.Context,
 	identity types.RunIdentity,
 	ref types.RunSnapshotRef,
-) (runcontext.CompiledSnapshotV1, error) {
+) (
+	runcontext.CompiledSnapshotV1,
+	store.CompiledRunSnapshotAuthority,
+	error,
+) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.loadSnapshotIdentities = append(f.loadSnapshotIdentities, identity)
 	if f.loadSnapshotErr != nil {
-		return runcontext.CompiledSnapshotV1{}, f.loadSnapshotErr
+		return runcontext.CompiledSnapshotV1{}, "", f.loadSnapshotErr
 	}
 	if f.snapshot.Ref == (types.RunSnapshotRef{}) {
-		return runcontext.CompiledSnapshotV1{Ref: ref, Mode: types.ExecutionModeCompiled}, nil
+		return runcontext.CompiledSnapshotV1{
+			Ref: ref, Mode: types.ExecutionModeCompiled,
+		}, store.CompiledRunSnapshotAuthorityV1, nil
 	}
-	return cloneCompiledSnapshot(f.snapshot), nil
+	return cloneCompiledSnapshot(
+		f.snapshot), store.CompiledRunSnapshotAuthorityV1, nil
 }
 
 func (f *compiledRunStoreFake) AuditCompiledTaskRunSnapshotV2(

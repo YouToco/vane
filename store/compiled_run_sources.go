@@ -81,7 +81,8 @@ func (s *Store) ListUnpushedForTaskRunV1(
 	defer rollbackCompiledTaskTx(ctx, tx)
 	exactSourceIDs := make([]int64, 0, len(sourceIDs))
 	for _, sourceID := range sourceIDs {
-		frozen, err := loadFrozenTaskRunSourceV1(ctx, tx, expected, sourceID)
+		frozen, err := loadAuthoritativeTaskRunSource(
+			ctx, tx, expected, ref, sourceID)
 		if err != nil {
 			return nil, err
 		}
