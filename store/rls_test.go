@@ -233,6 +233,7 @@ func TestRLS_PoliciesCoverAllTenantTables(t *testing.T) {
 		"profiles", "schedules", "agent_sessions", "pending_actions",
 		"llm_calls", "tool_calls", "task_run_snapshots",
 		"task_run_snapshot_v2_shadows",
+		"task_run_snapshot_v2_cutover_events",
 		"task_approved_definition_versions", "task_adaptive_states",
 		"task_definition_edit_operations", "task_definition_edit_receipts",
 		"agent_events",

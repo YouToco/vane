@@ -90,6 +90,7 @@ type taskRunSnapshot struct {
 	ReferenceSchemaVersion  string
 	Payload                 json.RawMessage
 	BudgetJSON              json.RawMessage
+	V2CutoverEventID        *int64
 	CreatedAt               time.Time
 }
 
@@ -97,7 +98,8 @@ const taskRunSnapshotColumns = `id, tenant_id, user_id, task_id,
 	temporal_workflow_id, temporal_run_id, run_kind, execution_mode, adaptive_version,
 	capability_catalog_digest, tool_policy_digest, prompt_policy_digest,
 	model_policy_digest, quota_policy_digest, definition_digest, plan_digest,
-	payload_digest, reference_digest, reference_schema_version, payload, budget, created_at`
+	payload_digest, reference_digest, reference_schema_version, payload, budget,
+	v2_cutover_event_id, created_at`
 
 type taskRunSnapshotQueryer interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
@@ -118,6 +120,24 @@ func (s *Store) createOrGetTaskRunSnapshotWithShadowV2(
 	p CreateOrGetTaskRunSnapshotParams,
 	shadowV2 bool,
 ) (*taskRunSnapshot, error) {
+	return s.createOrGetTaskRunSnapshotWithAuthorityV2(
+		ctx, p, shadowV2, nil)
+}
+
+// createOrGetTaskRunSnapshotWithAuthorityV2 is the migration-safe persistence
+// primitive for controlled store tests. Every production caller passes a nil
+// authority marker through createOrGetTaskRunSnapshotWithShadowV2 until the
+// separately reviewed activation batch lands.
+func (s *Store) createOrGetTaskRunSnapshotWithAuthorityV2(
+	ctx context.Context,
+	p CreateOrGetTaskRunSnapshotParams,
+	shadowV2 bool,
+	v2CutoverEventID *int64,
+) (*taskRunSnapshot, error) {
+	if v2CutoverEventID != nil && !shadowV2 {
+		return nil, taskRunValidationError(
+			"task run snapshot v2 authority requires a shadow")
+	}
 	if err := validateTaskRunLookupInput(p); err != nil {
 		return nil, err
 	}
@@ -127,6 +147,9 @@ func (s *Store) createOrGetTaskRunSnapshotWithShadowV2(
 		return nil, taskRunDatabaseError("begin task run snapshot transaction", err)
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := setTaskRunTenantContext(ctx, tx, p.TenantID); err != nil {
+		return nil, err
+	}
 	if err := lockTaskRunSnapshotRun(ctx, tx, p.TemporalRunID); err != nil {
 		return nil, err
 	}
@@ -203,6 +226,7 @@ func (s *Store) createOrGetTaskRunSnapshotWithShadowV2(
 		PayloadDigest:           payloadDigest,
 		Payload:                 payloadJSON,
 		BudgetJSON:              budgetJSON,
+		V2CutoverEventID:        v2CutoverEventID,
 		ReferenceSchemaVersion:  types.RunSnapshotSchemaVersion,
 	}
 	sealedRef, err := sealTaskRunSnapshotReferenceV1(candidate, taskRunBudgetV1{
@@ -236,10 +260,11 @@ func (s *Store) createOrGetTaskRunSnapshotWithShadowV2(
 			run_kind, execution_mode, adaptive_version, capability_catalog_digest,
 			tool_policy_digest, prompt_policy_digest, model_policy_digest,
 			quota_policy_digest, definition_digest, plan_digest, payload_digest,
-			reference_digest, reference_schema_version, payload, budget
+			reference_digest, reference_schema_version, payload, budget,
+			v2_cutover_event_id
 		 ) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-			$15, $16, $17, $18, $19, $20, $21
+			$15, $16, $17, $18, $19, $20, $21, $22
 		 ) ON CONFLICT (temporal_run_id) DO NOTHING
 		 RETURNING `+taskRunSnapshotColumns,
 		candidate.ID, candidate.TenantID, candidate.UserID, candidate.TaskID,
@@ -249,7 +274,7 @@ func (s *Store) createOrGetTaskRunSnapshotWithShadowV2(
 		candidate.ModelPolicyDigest, candidate.QuotaPolicyDigest,
 		candidate.DefinitionDigest, candidate.PlanDigest, candidate.PayloadDigest,
 		candidate.ReferenceDigest, candidate.ReferenceSchemaVersion,
-		candidate.Payload, candidate.BudgetJSON,
+		candidate.Payload, candidate.BudgetJSON, candidate.V2CutoverEventID,
 	))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) || taskRunSerializationFailure(err) ||
@@ -317,6 +342,22 @@ func (s *Store) loadTaskRunSnapshotShadowBehindFenceV2(
 	return winner, true, nil
 }
 
+func setTaskRunTenantContext(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID int64,
+) error {
+	if tenantID <= 0 {
+		return taskRunValidationError("task run snapshot tenant is invalid")
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id', $1, true)`,
+		fmt.Sprintf("%d", tenantID)); err != nil {
+		return taskRunDatabaseError("set task run snapshot tenant context", err)
+	}
+	return nil
+}
+
 func lockTaskRunSnapshotRun(ctx context.Context, tx pgx.Tx, temporalRunID string) error {
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1, $2))`,
@@ -378,6 +419,7 @@ func scanTaskRunSnapshot(row pgx.Row) (*taskRunSnapshot, error) {
 		&snapshot.DefinitionDigest, &snapshot.PlanDigest, &snapshot.PayloadDigest,
 		&snapshot.ReferenceDigest, &snapshot.ReferenceSchemaVersion,
 		&snapshot.Payload, &snapshot.BudgetJSON,
+		&snapshot.V2CutoverEventID,
 		&snapshot.CreatedAt,
 	); err != nil {
 		return nil, err

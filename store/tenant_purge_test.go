@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -249,7 +250,17 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("提交 Approved/Adaptive 清理夹具失败: %v", err)
 	}
-	if _, err := st.pool.Exec(ctx,
+	snapshotTx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("开启运行快照清理夹具事务失败: %v", err)
+	}
+	if _, err := snapshotTx.Exec(ctx,
+		`SELECT set_config('app.tenant_id', $1, true)`,
+		fmt.Sprintf("%d", tn.ID)); err != nil {
+		_ = snapshotTx.Rollback(ctx)
+		t.Fatalf("设置运行快照清理夹具租户失败: %v", err)
+	}
+	if _, err := snapshotTx.Exec(ctx,
 		`INSERT INTO task_run_snapshots (
 			tenant_id, user_id, task_id, temporal_workflow_id, temporal_run_id,
 			run_kind, execution_mode, adaptive_version,
@@ -262,9 +273,13 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 			repeat('4', 64), repeat('5', 64), repeat('6', 64), repeat('7', 64),
 			repeat('8', 64), 'purge-fixture/v1', convert_to('{}', 'UTF8'), '{}'::jsonb
 		 )`,
-		tn.ID, u.ID, "purge-task-"+uuid.NewString(), "purge-workflow-"+uuid.NewString(),
+		tn.ID, u.ID, taskID, "purge-workflow-"+uuid.NewString(),
 		"purge-run-"+uuid.NewString()); err != nil {
+		_ = snapshotTx.Rollback(ctx)
 		t.Fatalf("建运行快照清理夹具失败: %v", err)
+	}
+	if err := snapshotTx.Commit(ctx); err != nil {
+		t.Fatalf("提交运行快照清理夹具失败: %v", err)
 	}
 	eventPayload := `{"schema_version":"vane.agent-event/v1","kind":"turn_completed","body":{"outcome":"purge"}}`
 	if _, err := st.pool.Exec(ctx, `

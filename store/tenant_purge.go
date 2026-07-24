@@ -46,7 +46,9 @@ type purgeStep struct {
 //	task_creation_receipts               → pending_actions → agent_sessions
 //	agent_events                         → agent_sessions
 //	deliveries                            → push_batches
-//	task_run_snapshot_v2_shadows          → task_run_snapshots → tenants / users
+//	task_run_snapshot_v2_shadows          → task_run_snapshots
+//	task_run_snapshots                    → task_run_snapshot_v2_cutover_events
+//	schedules(current cutover pointer)     → task_run_snapshot_v2_cutover_events
 //	task_definition_edit_receipts         → task_definition_edit_operations
 //	schedules(definition-edit marker)     → task_definition_edit_operations
 //	task_adaptive_states                  → task_approved_definition_versions → schedules
@@ -65,6 +67,11 @@ var purgeOrder = []purgeStep{
 	{"schedule_sources", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
 	// Adaptive 的 last-known-good 外键指向 immutable definition，因此必须先删。
 	{"task_adaptive_states", "tenant_id = $1"},
+	// A marked run points at its immutable cutover event. Parents must be gone
+	// before the event, but events intentionally do not point back to the
+	// current schedule or Approved Definition.
+	{"task_run_snapshot_v2_shadows", "tenant_id = $1"},
+	{"task_run_snapshots", "tenant_id = $1"},
 	// 删除当前 definition 会由 FK 把 schedules 收敛为 compiled/headless，随后
 	// schedules 自己在父表位置删除；动态任务也不会短暂留下无 definition 的模式。
 	{"task_approved_definition_versions", "tenant_id = $1"},
@@ -78,14 +85,13 @@ var purgeOrder = []purgeStep{
 	{"deliveries", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},
 	{"agent_sessions", "tenant_id = $1"},
-	// 虽然 tenant FK 带 ON DELETE CASCADE，仍须显式删除：否则 dry-run/report
-	// 看不见这批不可变审计数据，purge schema 守卫也会把它视为漏项。
-	{"task_run_snapshot_v2_shadows", "tenant_id = $1"},
-	{"task_run_snapshots", "tenant_id = $1"},
-
 	{"subscriptions", "tenant_id = $1"},
 	{"profiles", "tenant_id = $1"},
 	{"schedules", "tenant_id = $1"},
+	// schedules may point at the current event. Deleting the task removes that
+	// pointer row while preserving event evidence; tenant purge then reports
+	// and deletes the now-unreferenced immutable events explicitly.
+	{"task_run_snapshot_v2_cutover_events", "tenant_id = $1"},
 	{"llm_calls", "tenant_id = $1"},
 	{"tool_calls", "tenant_id = $1"},
 	{"user_sessions", "tenant_id = $1"},
@@ -146,6 +152,12 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	}
 	// 回滚兜底：dry-run 走下方显式 Rollback，真删走 Commit；两者之后这里都是 no-op。
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id', $1, true)`,
+		fmt.Sprintf("%d", tenantID)); err != nil {
+		return nil, types.NewAppError(
+			types.CodeDatabase, "设置租户清理上下文", err)
+	}
 
 	// Definition edit transactions globally lock schedule → operation → receipt.
 	// Purge must join that order before its FK-safe child-first DELETE sequence:
