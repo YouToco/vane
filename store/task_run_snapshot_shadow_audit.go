@@ -29,6 +29,53 @@ type TaskRunSnapshotShadowAuditPage struct {
 	Next  *int64                           `json:"next,omitempty"`
 }
 
+type TaskRunSnapshotShadowAuditScope struct {
+	ThroughID int64 `json:"through_id"`
+	Count     int64 `json:"count"`
+}
+
+// FreezeTaskRunSnapshotShadowAuditScope takes one repeatable-read observation
+// of the exact task's upper id and row count. A later page scan uses ThroughID
+// as its immutable ceiling; rows created after this call cannot enter the
+// operator Gate, while Count detects deletion or skipped-prefix drift.
+func (s *Store) FreezeTaskRunSnapshotShadowAuditScope(
+	ctx context.Context,
+	taskID string,
+	since time.Time,
+) (TaskRunSnapshotShadowAuditScope, error) {
+	if !validTaskRunTaskID(taskID) || since.IsZero() {
+		return TaskRunSnapshotShadowAuditScope{},
+			taskRunValidationError("task run snapshot v2 audit scope is invalid")
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return TaskRunSnapshotShadowAuditScope{},
+			taskRunDatabaseError("begin task run snapshot v2 audit scope", err)
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+	var scope TaskRunSnapshotShadowAuditScope
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(id), 0), COUNT(*)
+		   FROM task_run_snapshots
+		  WHERE task_id=$1 AND created_at >= $2`,
+		taskID, since,
+	).Scan(&scope.ThroughID, &scope.Count); err != nil {
+		return TaskRunSnapshotShadowAuditScope{},
+			taskRunDatabaseError("freeze task run snapshot v2 audit scope", err)
+	}
+	if (scope.Count == 0) != (scope.ThroughID == 0) ||
+		scope.Count < 0 || scope.ThroughID < 0 {
+		return TaskRunSnapshotShadowAuditScope{}, taskRunIntegrityError()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return TaskRunSnapshotShadowAuditScope{},
+			taskRunDatabaseError("commit task run snapshot v2 audit scope", err)
+	}
+	return scope, nil
+}
+
 // AuditTaskRunSnapshotShadowsV2 strictly verifies one canary's v1 rows and
 // sidecars without returning any persisted raw payload.
 func (s *Store) AuditTaskRunSnapshotShadowsV2(

@@ -5,8 +5,10 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,6 +110,11 @@ func TestAuditCompiledTaskRunSnapshotV2_NonMatchNeverMaterializes(t *testing.T) 
 
 func TestAuditTaskRunSnapshotShadowsV2Through_FreezesTypedSample(t *testing.T) {
 	f := newTaskRunSnapshotFixture(t)
+	empty, err := f.st.FreezeTaskRunSnapshotShadowAuditScope(
+		t.Context(), f.taskID(), time.Now().Add(-time.Minute))
+	if err != nil || empty != (TaskRunSnapshotShadowAuditScope{}) {
+		t.Fatalf("empty frozen scope = %+v, %v", empty, err)
+	}
 	taskID := f.taskID()
 	f.createApprovedTask(t, taskID, 1)
 	baseline, err := f.st.reconcileTaskDefinitionBaseline(
@@ -134,11 +141,20 @@ func TestAuditTaskRunSnapshotShadowsV2Through_FreezesTypedSample(t *testing.T) {
 		return ref
 	}
 	first := create("run-v2-through-first")
+	scope, err := f.st.FreezeTaskRunSnapshotShadowAuditScope(
+		t.Context(), taskID, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("freeze typed audit scope: %v", err)
+	}
+	if scope.ThroughID != first.SnapshotID || scope.Count != 1 {
+		t.Fatalf("frozen scope = %+v, want through=%d count=1",
+			scope, first.SnapshotID)
+	}
 	_ = create("run-v2-through-second")
 
 	page, err := f.st.AuditTaskRunSnapshotShadowsV2Through(
 		t.Context(), taskID, time.Now().Add(-time.Minute), 0,
-		first.SnapshotID, 1)
+		scope.ThroughID, 1)
 	if err != nil {
 		t.Fatalf("typed frozen audit: %v", err)
 	}
@@ -217,11 +233,22 @@ func TestCompiledSourceSideEffectsRemainPinnedToV1(t *testing.T) {
 		"ListUnpushedForTaskRunV1":           1,
 	}
 	got := make(map[string]int)
-	for _, name := range []string{"compiled_run_fetch.go", "compiled_run_sources.go"} {
-		file, err := parser.ParseFile(
-			token.NewFileSet(), filepath.Join(storeDir, name), nil, 0)
+	err := filepath.WalkDir(storeDir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
-			t.Fatal(err)
+			return err
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" || entry.Name() == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
 		}
 		for _, declaration := range file.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
@@ -229,17 +256,17 @@ func TestCompiledSourceSideEffectsRemainPinnedToV1(t *testing.T) {
 				continue
 			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				identifier, ok := call.Fun.(*ast.Ident)
-				if ok && identifier.Name == "loadFrozenTaskRunSourceV1" {
+				if identifier, ok := node.(*ast.Ident); ok &&
+					identifier.Name == "loadFrozenTaskRunSourceV1" {
 					got[function.Name.Name]++
 				}
 				return true
 			})
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(got) != len(want) {
 		t.Fatalf("v1 source fence callers = %v, want %v", got, want)

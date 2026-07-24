@@ -31,11 +31,12 @@ import (
 )
 
 const (
-	exitOK              = 0
-	exitVerifyFailed    = 1
-	exitFailure         = 2
-	exitVerifyMorePages = 3
-	runTimeout          = 2 * time.Minute
+	exitOK                      = 0
+	exitVerifyFailed            = 1
+	exitFailure                 = 2
+	exitVerifyMorePages         = 3
+	runTimeout                  = 2 * time.Minute
+	maxSnapshotShadowAuditItems = 1000
 )
 
 func main() {
@@ -104,17 +105,16 @@ func runSnapshotShadow(args []string) int {
 	fs.SetOutput(os.Stderr)
 	taskID := fs.String("task", "", "exact canary task id")
 	rawSince := fs.String("since", "", "inclusive RFC3339 canary start")
-	throughID := fs.Int64("through-id", 0, "inclusive frozen snapshot id ceiling")
 	expectedCount := fs.Int("expected-count", 0, "exact number of rows required")
 	limit := fs.Int("limit", 100, "page size (1-1000)")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
 	since, err := time.Parse(time.RFC3339, *rawSince)
-	if err != nil || *taskID == "" || *throughID <= 0 || *expectedCount <= 0 {
+	if err != nil || *taskID == "" || *expectedCount <= 0 {
 		fmt.Fprintln(os.Stderr,
 			"runtimeadmin: snapshot-shadow requires -task, RFC3339 -since, "+
-				"-through-id and -expected-count")
+				"and -expected-count")
 		return exitFailure
 	}
 	cfg, err := config.Load("")
@@ -133,8 +133,21 @@ func runSnapshotShadow(args []string) int {
 		return exitFailure
 	}
 	defer st.Close()
+	scope, err := st.FreezeTaskRunSnapshotShadowAuditScope(ctx, *taskID, since)
+	if err != nil {
+		return finishSnapshotShadowRun(
+			os.Stdout, os.Stderr, store.TaskRunSnapshotShadowAuditPage{},
+			*expectedCount, err)
+	}
+	if scope.Count <= 0 || scope.Count > maxSnapshotShadowAuditItems ||
+		int64(*expectedCount) != scope.Count {
+		return finishSnapshotShadowRun(
+			os.Stdout, os.Stderr, store.TaskRunSnapshotShadowAuditPage{},
+			*expectedCount, types.NewAppError(types.CodeValidation,
+				"snapshot shadow audit scope does not match the asserted count", nil))
+	}
 	page, err := collectSnapshotShadowAudit(
-		ctx, *taskID, since, *throughID, *limit, *expectedCount,
+		ctx, *taskID, since, scope.ThroughID, *limit, int(scope.Count),
 		st.AuditTaskRunSnapshotShadowsV2Through)
 	return finishSnapshotShadowRun(
 		os.Stdout, os.Stderr, page, *expectedCount, err)
@@ -154,11 +167,11 @@ func collectSnapshotShadowAudit(
 	since time.Time,
 	throughID int64,
 	limit int,
-	expectedCount int,
+	frozenCount int,
 	load snapshotShadowPageLoader,
 ) (store.TaskRunSnapshotShadowAuditPage, error) {
 	collected := store.TaskRunSnapshotShadowAuditPage{
-		Items: make([]store.TaskRunSnapshotShadowAuditItem, 0, expectedCount),
+		Items: make([]store.TaskRunSnapshotShadowAuditItem, 0, frozenCount),
 	}
 	var afterID int64
 	for {
@@ -167,7 +180,7 @@ func collectSnapshotShadowAudit(
 			return store.TaskRunSnapshotShadowAuditPage{}, err
 		}
 		collected.Items = append(collected.Items, page.Items...)
-		if len(collected.Items) > expectedCount {
+		if len(collected.Items) > frozenCount {
 			return collected, nil
 		}
 		if page.Next == nil {

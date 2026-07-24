@@ -304,9 +304,13 @@ func TestCollectSnapshotShadowAuditLimitOneExpectedTwoPasses(t *testing.T) {
 	}
 }
 
-func TestRunSnapshotShadowRejectsAfterID(t *testing.T) {
-	if got := runSnapshotShadow([]string{"-after-id", "1"}); got != exitFailure {
-		t.Fatalf("after-id escape exit = %d, want %d", got, exitFailure)
+func TestRunSnapshotShadowRejectsCallerControlledBounds(t *testing.T) {
+	for _, flag := range []string{"-after-id", "-through-id"} {
+		t.Run(flag, func(t *testing.T) {
+			if got := runSnapshotShadow([]string{flag, "1"}); got != exitFailure {
+				t.Fatalf("%s escape exit = %d, want %d", flag, got, exitFailure)
+			}
+		})
 	}
 }
 
