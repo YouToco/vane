@@ -318,7 +318,7 @@ func run() error {
 		st, sched, nil, sched, endpoints, fetch, exaTools,
 		definitionEditToolController,
 	)
-	agentLoop := agent.New(agent.Deps{
+	agentLoop, err := agent.NewChecked(agent.Deps{
 		Client:       agentLLMClient,
 		Recorder:     recorder,
 		Store:        st,
@@ -334,6 +334,9 @@ func run() error {
 		// rolled back. Tool registration above is the only proposal exposure.
 		TaskDefinitionEdit: definitionEditController,
 	})
+	if err != nil {
+		return fmt.Errorf("装配 Agent 工具注册表: %w", err)
+	}
 	manager.SetAgent(agentLoop)
 
 	// 反馈服务（M5 契约 §13）：装在 agent 之后——Notifier 就是 agentLoop
@@ -579,18 +582,17 @@ func run() error {
 		}
 
 		// assistant.chat 的 A2A 轨 agent 实例（契约 §12 P2）：与飞书轨完全隔离——
-		// 工具用**显式只读白名单**（不是 !Mutating() 过滤：push_now 虽标记非 mutating
-		// 但有触发推送的副作用、view_profile 涉画像，都是 A2A 非目标）；
+		// 工具只由 agent 包的本地 authorization policy 筛选；main 不解释 effect，
+		// 更不读取远端 metadata。当前策略精确授权 list_sources/list_schedules；
 		// system prompt 换 A2A 语境；Store/Profiles 不注入（RunOnce 不碰会话与画像，
 		// 误用 HandleMessage 会在 loadOrCreateSession 处 nil panic——响亮的装配错误）。
-		var a2aTools []agent.Tool
-		for _, t := range tools {
-			switch t.Name() {
-			case "list_sources", "list_schedules":
-				a2aTools = append(a2aTools, t)
-			}
+		a2aTools, filterErr := agent.FilterAuthorizedTools(
+			tools, agent.AuthorizationA2AReadOnly,
+		)
+		if filterErr != nil {
+			return fmt.Errorf("筛选 A2A Agent 工具: %w", filterErr)
 		}
-		a2aLoop := agent.New(agent.Deps{
+		a2aLoop, loopErr := agent.NewChecked(agent.Deps{
 			Client:       agentLLMClient,
 			Recorder:     recorder,
 			Tools:        a2aTools,
@@ -599,6 +601,9 @@ func run() error {
 			SystemPrompt: a2a.ChatSystemPrompt,
 			ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
 		})
+		if loopErr != nil {
+			return fmt.Errorf("装配 A2A Agent 工具注册表: %w", loopErr)
+		}
 		a2aRuntime, err = a2a.Mount(mux, a2a.Deps{
 			Storage:   st,
 			Content:   st,

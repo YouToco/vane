@@ -7,8 +7,8 @@
 //     生成，Execute 走 tikhubinvoke 通用调用器，结果原文（截断）回给模型阅读。
 //
 // 三条硬边界：
-//   - 端点工具**全部只读**（Mutating=false）：查询社媒数据不改系统状态，免确认卡
-//     （Boss 拍板）；因此它们永远不进 pending_actions，ExecuteAction 路径只需静态白名单。
+//   - 端点工具按本地 ToolPolicy 声明网络读取、计费与 taint，免确认卡（Boss 拍板）；
+//     因此它们永远不进 pending_actions，ExecuteAction 路径只需静态白名单。
 //   - 白名单语义（M4 契约 §10）扩展为「静态工具 ∪ 会话已激活端点」：模型编造的
 //     端点名（哪怕真在注册表里）只要没被本会话 search_endpoints 激活过，一律拒绝——
 //     激活集是显式审计过的调用面，跳过检索直呼端点名是绕过检索留痕的旁门。
@@ -249,26 +249,37 @@ func NewEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, 
 		results: newResultCache(), limits: limits}
 }
 
-// SearchTool 返回检索元工具（进静态白名单，BuildTools 装配）。
-func (e *EndpointTools) SearchTool() Tool { return &searchEndpointsTool{ep: e} }
+// SearchTool 返回检索元工具（进静态白名单，BuildTools 装配）。检索会修改
+// 本消息 activation，但现有调用与预算仍完全由工具自身管理。
+func (e *EndpointTools) SearchTool() ToolSpec {
+	return newToolSpec(&searchEndpointsTool{ep: e}, ownerPolicy(
+		Effects(EffectNetworkRead, EffectBillable, EffectActivationWrite),
+		ConfirmationNone, BudgetToolManaged))
+}
 
 // ReadResultTool 返回大结果取回工具（进静态白名单，BuildTools 装配；契约 §3.5）。
-func (e *EndpointTools) ReadResultTool() Tool {
-	return &readEndpointResultTool{cache: e.results, perRead: e.limits.PerCall}
+func (e *EndpointTools) ReadResultTool() ToolSpec {
+	return newToolSpec(
+		&readEndpointResultTool{cache: e.results, perRead: e.limits.PerCall},
+		ownerPolicy(Effects(EffectLocalHandleRead, EffectTrustTaint),
+			ConfirmationNone, BudgetNone),
+	)
 }
 
 // Resolve 按白名单语义解析动态端点工具：必须**已激活**且仍在注册表里。
 // 注册表里存在但未激活 → 不解析（见文件头注第二条硬边界）；
 // 已激活但注册表已无此端点（re-gen 下线）→ 不解析，模型收到标准"工具不存在"自纠文案。
-func (e *EndpointTools) Resolve(name string, act *activationState) (Tool, bool) {
+func (e *EndpointTools) Resolve(name string, act *activationState) (ToolSpec, bool) {
 	if act == nil || !act.contains(name) {
-		return nil, false
+		return ToolSpec{}, false
 	}
 	entry, ok := tikhubcatalog.Lookup(name)
 	if !ok {
-		return nil, false
+		return ToolSpec{}, false
 	}
-	return &endpointTool{ep: e, entry: entry}, true
+	return newToolSpec(&endpointTool{ep: e, entry: entry}, ownerPolicy(
+		Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
+		ConfirmationNone, BudgetToolManaged)), true
 }
 
 func isRegisteredEndpoint(name string) bool {
@@ -287,11 +298,10 @@ func (e *EndpointTools) Defs(act *activationState) []llm.ToolDef {
 		if !ok {
 			continue // 注册表下线的端点不再注入；Resolve 同步拒绝，两处口径一致
 		}
-		defs = append(defs, llm.ToolDef{
-			Name:        entry.Name,
-			Description: endpointDefDescription(entry),
-			Parameters:  endpointParamsSchema(entry),
-		})
+		spec := newToolSpec(&endpointTool{ep: e, entry: entry}, ownerPolicy(
+			Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
+			ConfirmationNone, BudgetToolManaged))
+		defs = append(defs, spec.Definition)
 	}
 	return defs
 }
@@ -390,7 +400,6 @@ func (t *searchEndpointsTool) Description() string {
 func (t *searchEndpointsTool) Parameters() json.RawMessage {
 	return json.RawMessage(searchEndpointsSchema)
 }
-func (t *searchEndpointsTool) Mutating() bool                   { return false }
 func (t *searchEndpointsTool) Summarize(json.RawMessage) string { return "" }
 func (t *searchEndpointsTool) toolKind() types.ToolCallKind     { return types.ToolCallKindTikHubSearch }
 
@@ -490,7 +499,6 @@ func (t *endpointTool) Description() string { return endpointDefDescription(t.en
 func (t *endpointTool) Parameters() json.RawMessage {
 	return endpointParamsSchema(t.entry)
 }
-func (t *endpointTool) Mutating() bool                   { return false }
 func (t *endpointTool) untrustedResult() bool            { return true }
 func (t *endpointTool) Summarize(json.RawMessage) string { return "" }
 func (t *endpointTool) toolKind() types.ToolCallKind     { return types.ToolCallKindTikHubEndpoint }

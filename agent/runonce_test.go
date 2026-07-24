@@ -14,7 +14,7 @@ import (
 func newRunOnceLoop(t *testing.T, chat func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error), tools ...Tool) *Loop {
 	t.Helper()
 	l := New(Deps{
-		Tools:        tools,
+		Tools:        testToolSpecs(tools...),
 		Model:        "deepseek-v4-pro",
 		MaxTurns:     5,
 		SessionTTL:   30 * time.Minute,
@@ -169,7 +169,7 @@ func TestRunOnce_写工具装配防御(t *testing.T) {
 		{Content: "已生成确认卡", FinishReason: "stop"},
 	}}
 	l := New(Deps{
-		Store: fs, Tools: []Tool{tool},
+		Store: fs, Tools: testToolSpecs(tool),
 		Model: "deepseek-v4-pro", MaxTurns: 5, SessionTTL: 30 * time.Minute,
 		SystemPrompt: "你是 A2A 对外助理。",
 	})

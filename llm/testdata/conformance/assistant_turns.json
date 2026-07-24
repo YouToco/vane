@@ -1,0 +1,320 @@
+[
+  {
+    "name": "normal stop",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "stop",
+    "content": "done",
+    "want_stop_reason": "stop"
+  },
+  {
+    "name": "normal native tool calls",
+    "provider": "kimi",
+    "request_model": "kimi-k2.6",
+    "tools_declared": true,
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "list_sources",
+          "arguments": "{}"
+        }
+      }
+    ],
+    "want_stop_reason": "tool_calls",
+    "want_tool_calls": 1
+  },
+  {
+    "name": "production deepseek dsml",
+    "provider": "deepseek",
+    "request_model": "deepseek-v4-pro",
+    "response_model": "deepseek-v4-pro",
+    "tools_declared": true,
+    "finish_reason": "stop",
+    "content": "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"create_schedule\">\n<｜｜DSML｜｜parameter name=\"name\" string=\"true\">AI 行业早报</｜｜DSML｜｜parameter>\n<｜｜DSML｜｜parameter name=\"source_ids\" array=\"true\">[26]</｜｜DSML｜｜parameter>\n<｜｜DSML｜｜parameter name=\"schedule\" string=\"true\">每天 08:30</｜｜DSML｜｜parameter>\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>",
+    "want_error": true
+  },
+  {
+    "name": "mixed native and dsml",
+    "provider": "deepseek",
+    "request_model": "deepseek-v4-pro",
+    "response_model": "deepseek-v4-pro",
+    "tools_declared": true,
+    "finish_reason": "tool_calls",
+    "content": "<｜｜DSML｜｜tool_calls>",
+    "tool_calls": [
+      {
+        "id": "call_native",
+        "type": "function",
+        "function": {
+          "name": "list_sources",
+          "arguments": "{}"
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "finish says tool calls without calls",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "tool_calls",
+    "want_error": true
+  },
+  {
+    "name": "native call with stop",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "stop",
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "list_sources",
+          "arguments": "{}"
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "length with tool",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "length",
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "list_sources",
+          "arguments": "{}"
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "empty id",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "",
+        "type": "function",
+        "function": {
+          "name": "list_sources",
+          "arguments": "{}"
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "duplicate id",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "call_dup",
+        "type": "function",
+        "function": {
+          "name": "list_sources",
+          "arguments": "{}"
+        }
+      },
+      {
+        "id": "call_dup",
+        "type": "function",
+        "function": {
+          "name": "list_schedules",
+          "arguments": "{}"
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "bad arguments",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "list_sources",
+          "arguments": "[]"
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "malformed arguments",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "list_sources",
+          "arguments": "{"
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "arguments has wrong wire type",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "list_sources",
+          "arguments": {}
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "empty function name",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": " ",
+          "arguments": "{}"
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "non function type",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "custom",
+        "function": {
+          "name": "list_sources",
+          "arguments": "{}"
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "content filter with tool",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "content_filter",
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "list_sources",
+          "arguments": "{}"
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "unknown finish with tool",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "vendor_new_reason",
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "list_sources",
+          "arguments": "{}"
+        }
+      }
+    ],
+    "want_error": true
+  },
+  {
+    "name": "tool free finish drift",
+    "provider": "deepseek",
+    "request_model": "deepseek-v4-pro",
+    "tools_declared": false,
+    "finish_reason": "tool_calls",
+    "content": "final confirmation",
+    "want_stop_reason": "tool_calls"
+  },
+  {
+    "name": "tool free native call is inert",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": false,
+    "finish_reason": "tool_calls",
+    "content": "final confirmation",
+    "tool_calls": [
+      {
+        "id": "call_ignored",
+        "type": "function",
+        "function": {
+          "name": "remove_schedule",
+          "arguments": "{\"schedule_id\":\"danger\"}"
+        }
+      }
+    ],
+    "want_stop_reason": "tool_calls"
+  },
+  {
+    "name": "dsml prose outside deepseek is content",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "stop",
+    "content": "<｜｜DSML｜｜tool_calls> is quoted user content",
+    "want_stop_reason": "stop"
+  },
+  {
+    "name": "unknown finish without calls",
+    "provider": "openai",
+    "request_model": "gpt-compatible",
+    "tools_declared": true,
+    "finish_reason": "vendor_new_reason",
+    "content": "partial",
+    "want_stop_reason": "unknown"
+  }
+]

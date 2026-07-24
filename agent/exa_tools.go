@@ -65,10 +65,18 @@ func NewExaTools(searcher webSearcher, reader pageReader, counter exaCallCounter
 }
 
 // SearchTool 返回 web_search（进静态白名单，BuildTools 装配）。
-func (e *ExaTools) SearchTool() Tool { return &webSearchTool{et: e} }
+func (e *ExaTools) SearchTool() ToolSpec {
+	return newToolSpec(&webSearchTool{et: e}, ownerPolicy(
+		Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
+		ConfirmationNone, BudgetToolManaged))
+}
 
 // ReadPageTool 返回 read_page（进静态白名单，BuildTools 装配）。
-func (e *ExaTools) ReadPageTool() Tool { return &readPageTool{et: e} }
+func (e *ExaTools) ReadPageTool() ToolSpec {
+	return newToolSpec(&readPageTool{et: e}, ownerPolicy(
+		Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
+		ConfirmationNone, BudgetToolManaged))
+}
 
 // checkBudget 双重限额判定（契约 §8 增补；模板照 endpointTool.Execute 的限额段）。
 // 返回 "" = 放行；非空 = 拒绝文案（记 budget_exceeded——没打上游，不计入日限额 COUNT，
@@ -177,7 +185,6 @@ func (t *webSearchTool) Description() string {
 		"不需要把搜索词加成信源。返回标题/链接/发布日期/正文摘要。要读某个具体页面的完整正文用 read_page。"
 }
 func (t *webSearchTool) Parameters() json.RawMessage { return json.RawMessage(webSearchSchema) }
-func (t *webSearchTool) Mutating() bool              { return false }
 func (t *webSearchTool) untrustedResult() bool       { return true }
 func (t *webSearchTool) toolKind() types.ToolCallKind {
 	return types.ToolCallKindExaFetch
@@ -284,7 +291,6 @@ func (t *readPageTool) Description() string {
 		"正文过长会截断；要持续监控页面变化才用 add_source（web/contents）。"
 }
 func (t *readPageTool) Parameters() json.RawMessage { return json.RawMessage(readPageSchema) }
-func (t *readPageTool) Mutating() bool              { return false }
 func (t *readPageTool) untrustedResult() bool       { return true }
 func (t *readPageTool) toolKind() types.ToolCallKind {
 	return types.ToolCallKindExaFetch

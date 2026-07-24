@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/YouToco/vane/store"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
 
@@ -60,8 +60,8 @@ type ChatRequest struct {
 	DisableThinking bool     // 语义同 Request.DisableThinking（见 client.go 的事故注释）
 }
 
-// ChatResponse 单次 Chat 调用结果。FinishReason 透传上游
-// （stop/tool_calls/length），调用方据此区分"要执行工具"与"直接回复"。
+// ChatResponse 单次 Chat 调用结果。现有调用方 API 保持不变；字段由通过
+// provider-neutral 校验的 AssistantTurn 投影而来。
 type ChatResponse struct {
 	Content          string
 	ToolCalls        []ToolCall
@@ -117,15 +117,9 @@ type wireChatRequest struct {
 }
 
 type wireChatResponse struct {
-	Model   string `json:"model"`
-	Choices []struct {
-		FinishReason string `json:"finish_reason"`
-		Message      struct {
-			Content   string         `json:"content"`
-			ToolCalls []wireToolCall `json:"tool_calls"`
-		} `json:"message"`
-	} `json:"choices"`
-	Usage struct {
+	Model   string           `json:"model"`
+	Choices []wireChatChoice `json:"choices"`
+	Usage   struct {
 		PromptTokens          int `json:"prompt_tokens"`
 		CompletionTokens      int `json:"completion_tokens"`
 		PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
@@ -260,20 +254,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	if respModel == "" {
 		respModel = model
 	}
-	msg := cr.Choices[0].Message
-
-	var toolCalls []ToolCall
-	for _, tc := range msg.ToolCalls {
-		toolCalls = append(toolCalls, ToolCall{
-			ID:        tc.ID,
-			Name:      tc.Function.Name,
-			Arguments: tc.Function.Arguments,
-		})
-	}
 	resp := &ChatResponse{
-		Content:          msg.Content,
-		ToolCalls:        toolCalls,
-		FinishReason:     cr.Choices[0].FinishReason,
 		PromptTokens:     cr.Usage.PromptTokens,
 		CompletionTokens: cr.Usage.CompletionTokens,
 		CacheHitTokens:   cr.Usage.PromptCacheHitTokens,
@@ -281,41 +262,31 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		Model:            respModel,
 		LatencyMs:        int(time.Since(start).Milliseconds()),
 	}
-	toolEnabled := len(req.Tools) > 0
-	deepSeekV4 := isDeepSeekV4(c.provider, model, respModel)
-	finishHasToolCalls := cr.Choices[0].FinishReason == "tool_calls"
-	if toolEnabled && deepSeekV4 && (len(toolCalls) > 0) != finishHasToolCalls {
-		slog.Warn("llm: 上游 tool_calls 与 finish_reason 不一致",
+	turn, err := adaptAssistantTurn(cr.Choices[0], assistantTurnOptions{
+		Provider:      c.provider,
+		RequestModel:  model,
+		ResponseModel: respModel,
+		ToolsDeclared: len(req.Tools) > 0,
+	})
+	if err != nil {
+		slog.Warn("llm: 上游工具协议响应不合法",
 			"provider", c.provider,
 			"model", respModel,
-			"finish_reason", cr.Choices[0].FinishReason,
-			"native_tool_calls", len(toolCalls))
-		resp.Content = ""
-		resp.ToolCalls = nil
-		return resp, newToolProtocolResponseError()
-	}
-	// DeepSeek V4 DSML in message.content is an upstream protocol leak,
-	// including mixed native+DSML responses. Never promote or preserve it.
-	if isDeepSeekV4DSML(c.provider, msg.Content, model, respModel) {
-		slog.Warn("llm: 上游返回 DSML 协议文本",
-			"provider", c.provider,
-			"model", respModel,
+			"finish_reason", cr.Choices[0].FinishReason.Value,
 			"request_has_tools", len(req.Tools) > 0,
-			"native_tool_calls", len(toolCalls))
-		resp.Content = ""
-		resp.ToolCalls = nil
-		// Tool-free does not imply that a pending action exists. The llm package
-		// cannot infer product state, so every leak is a classified failure.
-		// Agent callers may recover only from durable state they already own.
-		return resp, newToolProtocolResponseError()
+			"native_tool_calls", len(cr.Choices[0].Message.ToolCalls))
+		return resp, err
 	}
+	resp.Content = turn.Content
+	resp.ToolCalls = turn.ToolCalls
+	resp.FinishReason = turn.StopReason.String()
 
 	// FC 场景下"空 content + 有 tool_calls"是正常形态；两者皆空才是隐性故障
 	// 信号（如思维链吃光预算），沿用 Complete 的 WARN 语义留下可检索告警。
-	if msg.Content == "" && len(toolCalls) == 0 {
+	if turn.Content == "" && len(turn.ToolCalls) == 0 {
 		slog.Warn("llm: 上游返回空 content 且无 tool_calls",
 			"model", respModel,
-			"finish_reason", cr.Choices[0].FinishReason,
+			"finish_reason", cr.Choices[0].FinishReason.Value,
 			"completion_tokens", cr.Usage.CompletionTokens)
 	}
 	return resp, nil

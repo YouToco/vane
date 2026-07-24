@@ -82,22 +82,34 @@ type playbookStore interface {
 // 与 URL 类 web 能力的试跑）；nil 合法（测试/未装配）——退回不试跑直接落库。
 // exa 是 Exa ad-hoc 工具对（web_search/read_page）；nil（Exa key 未配置）时不装配，
 // 工具面与该特性上线前完全一致（同 endpoints 的 nil 语义）。
-func BuildTools(st *store.Store, sched *scheduler.Scheduler, tasks taskCreator, pusher PushTrigger, endpoints *EndpointTools, prober sourceProber, exa *ExaTools, definitionEdits ...DefinitionEditController) []Tool {
-	tools := []Tool{
-		&listSourcesTool{st: st},
-		&addSourceTool{st: st, prober: prober},
-		&removeSourceTool{st: st},
-		&enableSourceTool{st: st},
-		&listSchedulesTool{st: st},
-		&createScheduleTool{tasks: tasks},
-		&removeScheduleTool{sched: sched},
-		&pushNowTool{pusher: pusher},
-		&viewProfileTool{st: st},
-		&updateProfileTool{st: st},
-		&viewTaskPlaybookTool{st: st}, // 情报任务手册（Task Playbook）
+func BuildTools(st *store.Store, sched *scheduler.Scheduler, tasks taskCreator, pusher PushTrigger, endpoints *EndpointTools, prober sourceProber, exa *ExaTools, definitionEdits ...DefinitionEditController) []ToolSpec {
+	tools := []ToolSpec{
+		newToolSpec(&listSourcesTool{st: st}, a2aReadPolicy(Effects(EffectInternalRead, EffectTrustTaint))),
+		newToolSpec(&addSourceTool{st: st, prober: prober}, ownerPolicy(
+			Effects(EffectNetworkRead, EffectBillable, EffectStateWrite, EffectTrustTaint),
+			ConfirmationRequired, BudgetDownstreamManaged)),
+		newToolSpec(&removeSourceTool{st: st}, ownerPolicy(
+			Effects(EffectStateWrite), ConfirmationRequired, BudgetNone)),
+		newToolSpec(&enableSourceTool{st: st}, ownerPolicy(
+			Effects(EffectStateWrite), ConfirmationRequired, BudgetNone)),
+		newToolSpec(&listSchedulesTool{st: st}, a2aReadPolicy(Effects(EffectInternalRead))),
+		newToolSpec(&createScheduleTool{tasks: tasks}, ownerPolicy(
+			Effects(EffectDurableProposal, EffectStateWrite), ConfirmationRequired, BudgetNone)),
+		newToolSpec(&removeScheduleTool{sched: sched}, ownerPolicy(
+			Effects(EffectStateWrite), ConfirmationRequired, BudgetNone)),
+		newToolSpec(&pushNowTool{pusher: pusher}, ownerPolicy(
+			Effects(EffectDelivery), ConfirmationNone, BudgetDownstreamManaged)),
+		newToolSpec(&viewProfileTool{st: st}, ownerPolicy(
+			Effects(EffectInternalRead), ConfirmationNone, BudgetNone)),
+		newToolSpec(&updateProfileTool{st: st}, ownerPolicy(
+			Effects(EffectStateWrite), ConfirmationRequired, BudgetNone)),
+		newToolSpec(&viewTaskPlaybookTool{st: st}, ownerPolicy(
+			Effects(EffectInternalRead), ConfirmationNone, BudgetNone)),
 	}
 	if len(definitionEdits) == 1 && definitionEdits[0] != nil {
-		tools = append(tools, &editTaskDefinitionTool{})
+		tools = append(tools, newToolSpec(&editTaskDefinitionTool{}, ownerPolicy(
+			Effects(EffectDurableProposal, EffectStateWrite),
+			ConfirmationRequired, BudgetNone)))
 	}
 	if endpoints != nil {
 		tools = append(tools, endpoints.SearchTool(), endpoints.ReadResultTool())
@@ -158,7 +170,6 @@ func (*editTaskDefinitionTool) Description() string {
 func (*editTaskDefinitionTool) Parameters() json.RawMessage {
 	return json.RawMessage(editTaskDefinitionSchema)
 }
-func (*editTaskDefinitionTool) Mutating() bool { return true }
 func (*editTaskDefinitionTool) Execute(
 	context.Context,
 	int64,
@@ -201,7 +212,6 @@ func (t *listSourcesTool) Description() string {
 	return "列出用户当前订阅的全部信源（含 id、类型、标题、状态）。"
 }
 func (t *listSourcesTool) Parameters() json.RawMessage { return json.RawMessage(emptyParamsSchema) }
-func (t *listSourcesTool) Mutating() bool              { return false }
 
 // Execute 用 ListSubscribedSourcesByUser（不过滤 source.status）而非 active-only：
 // 与 GET /api/subscriptions 同语义——被自动 disabled 的源也要让用户看见并知道原因。
@@ -347,7 +357,6 @@ func unavailableCapabilitiesNote() string {
 	return "\n\n当前不支持的能力（请勿尝试添加，会被拒绝）：\n- " + strings.Join(lines, "\n- ")
 }
 func (t *addSourceTool) Parameters() json.RawMessage { return json.RawMessage(addSourceSchema) }
-func (t *addSourceTool) Mutating() bool              { return true }
 
 // specFromArgs 把模型给的扁平入参映射为 sourcespec.Spec 的 params map。
 // 抽成纯函数是为了让「哪个字段进哪个 param 键」这层 **agent 独有**的映射可被单测：
@@ -575,7 +584,6 @@ func (t *removeSourceTool) Description() string {
 	return "取消订阅一个或多个信源（信源本身与历史内容保留）。source_ids 可先用 list_sources 查询；批量退订放同一次调用，一张确认卡一次确认。"
 }
 func (t *removeSourceTool) Parameters() json.RawMessage { return json.RawMessage(removeSourceSchema) }
-func (t *removeSourceTool) Mutating() bool              { return true }
 
 // removeSourceIDs 解析并规范化入参：schema 只声明 source_ids，但仍接受旧的
 // 单数 source_id——pending_actions 里可能有部署前落库、24h 内被点击的存量行，
@@ -688,7 +696,6 @@ func (t *enableSourceTool) Description() string {
 	return "重新启用一个因连续抓取失败被自动暂停的信源：置回正常、清零失败计数、立即恢复抓取。source_id 可先用 list_sources 查看状态。"
 }
 func (t *enableSourceTool) Parameters() json.RawMessage { return json.RawMessage(enableSourceSchema) }
-func (t *enableSourceTool) Mutating() bool              { return true }
 
 // Execute 复用 store.EnableSource：归属校验（本人 active 订阅）进 SQL 的 WHERE，
 // 启用未订阅的源 enabled=false，回自纠文案而不上抛（与 remove_source 的越权处理一致）。
@@ -732,7 +739,6 @@ func (t *listSchedulesTool) Description() string {
 	return "列出用户当前的全部定时推送任务（含 id、触发频率、状态、描述）。"
 }
 func (t *listSchedulesTool) Parameters() json.RawMessage { return json.RawMessage(emptyParamsSchema) }
-func (t *listSchedulesTool) Mutating() bool              { return false }
 
 func (t *listSchedulesTool) Execute(ctx context.Context, userID int64, _ json.RawMessage) (string, error) {
 	list, err := t.st.ListSchedulesByUser(ctx, userID)
@@ -916,7 +922,6 @@ func (t *createScheduleTool) Description() string {
 func (t *createScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(createScheduleSchema)
 }
-func (t *createScheduleTool) Mutating() bool { return true }
 
 // Execute 只服务历史 v0 卡片，保留其原有 best-effort 语义。新 v1 动作在 Loop 中
 // 进入 durable controller，绝不会调用这里或在确认后重新选择长期信源。
@@ -1104,7 +1109,6 @@ func (t *updateScheduleTool) Description() string {
 func (t *updateScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(updateScheduleSchema)
 }
-func (t *updateScheduleTool) Mutating() bool { return true }
 
 func (t *updateScheduleTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
 	var a updateScheduleArgs
@@ -1183,7 +1187,6 @@ func (t *removeScheduleTool) Description() string {
 func (t *removeScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(removeScheduleSchema)
 }
-func (t *removeScheduleTool) Mutating() bool { return true }
 
 // Execute 的归属校验由 Scheduler.DeletePush 内的 GetSchedule(id, userID) 承担：
 // 「不存在」与「不属于你」归一为 NotFound，agent 拿到伪造的 schedule_id 也删不动别人的。
@@ -1233,7 +1236,6 @@ func (t *pushNowTool) Description() string {
 	return "立即触发一次推送（推送用户全部订阅的最新内容，不创建定时任务）。"
 }
 func (t *pushNowTool) Parameters() json.RawMessage { return json.RawMessage(emptyParamsSchema) }
-func (t *pushNowTool) Mutating() bool              { return false }
 
 func (t *pushNowTool) Execute(ctx context.Context, userID int64, _ json.RawMessage) (string, error) {
 	_, err := t.pusher.TriggerPushNow(ctx, userID)
@@ -1269,7 +1271,6 @@ func (t *viewProfileTool) Description() string {
 	return "查看用户当前画像（行业、职业、关注标签、摘要）。修改画像前应先调用本工具取现有标签，合并后再提交。"
 }
 func (t *viewProfileTool) Parameters() json.RawMessage { return json.RawMessage(emptyParamsSchema) }
-func (t *viewProfileTool) Mutating() bool              { return false }
 
 // Execute NotFound 回固定引导文案（契约 §12.3 锁死文本）而非报错：画像为空是
 // 常态起点，systemPrompt 会驱动模型据此自然引导首采。
@@ -1328,7 +1329,6 @@ func (t *updateProfileTool) Description() string {
 func (t *updateProfileTool) Parameters() json.RawMessage {
 	return json.RawMessage(updateProfileSchema)
 }
-func (t *updateProfileTool) Mutating() bool { return true }
 
 // Execute（确认后执行）：全缺省是确定性可自纠失败，回文案不触库；
 // UpsertProfileFields 部分更新（nil 不改），不触碰 summary/游标/token 三件套。
@@ -1457,7 +1457,6 @@ func (t *viewTaskPlaybookTool) Description() string {
 func (t *viewTaskPlaybookTool) Parameters() json.RawMessage {
 	return json.RawMessage(viewTaskPlaybookSchema)
 }
-func (t *viewTaskPlaybookTool) Mutating() bool { return false }
 
 // Execute NotFound 回引导文案而非报错：手册不存在（老任务未迁移）或任务非本人，
 // 对模型都是"没有可看的手册"，回自纠文案让它引导用户；基础设施错误上抛。
@@ -1606,7 +1605,6 @@ func (t *editTaskPlaybookTool) Description() string {
 func (t *editTaskPlaybookTool) Parameters() json.RawMessage {
 	return json.RawMessage(editTaskPlaybookSchema)
 }
-func (t *editTaskPlaybookTool) Mutating() bool { return true }
 
 // Execute（确认后执行）：空 schedule_id / 空 content 是确定性可自纠失败，回文案不触库；
 // content 超上限截断后落库；UpsertSchedulePlaybook 归属未命中（ok=false）回自纠文案不上抛

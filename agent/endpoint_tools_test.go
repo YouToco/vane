@@ -555,7 +555,7 @@ func TestHandleMessage_TaintedEndpointAllowsOnlyCurrentLocalCacheContinuation(t 
 	}}
 	l := New(Deps{
 		Store: fs, Profiles: fs,
-		Tools: []Tool{ep.SearchTool(), ep.ReadResultTool()},
+		Tools: []ToolSpec{ep.SearchTool(), ep.ReadResultTool()},
 		Model: "m", MaxTurns: 5, SessionTTL: 30 * time.Minute,
 		Endpoints: ep,
 	})
@@ -688,8 +688,8 @@ func TestHandleMessage_SearchAndUnactivatedEndpointSameBatchAreBothRejected(t *t
 }
 
 // BuildTools2Static 测试装配：只装 search_endpoints（其余静态工具与本特性无关）。
-func BuildTools2Static(ep *EndpointTools) []Tool {
-	return []Tool{ep.SearchTool()}
+func BuildTools2Static(ep *EndpointTools) []ToolSpec {
+	return []ToolSpec{ep.SearchTool()}
 }
 
 // TestEndpointTool_BigIntArgPrecision：大 ID 参数经 UseNumber 全链路保真到上游

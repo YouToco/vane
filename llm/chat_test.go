@@ -284,6 +284,10 @@ func TestChatToolCallsParsing(t *testing.T) {
 	c := newTestClient(srv.URL, 5)
 	resp, err := c.Chat(context.Background(), ChatRequest{
 		Messages: []ChatMessage{{Role: "user", Content: "列出我的信源，然后删掉源 3"}},
+		Tools: []ToolDef{
+			{Name: "list_sources", Parameters: json.RawMessage(`{"type":"object"}`)},
+			{Name: "remove_source", Parameters: json.RawMessage(`{"type":"object"}`)},
+		},
 	})
 	if err != nil {
 		t.Fatalf("Chat 返回错误: %v", err)
@@ -371,6 +375,10 @@ func TestDoChatPassthrough(t *testing.T) {
 	resp, err := DoChat(context.Background(), c, nil, CallMeta{SpanName: "agent"}, ChatRequest{
 		Model:    "deepseek-v4-pro",
 		Messages: []ChatMessage{{Role: "user", Content: "列出信源"}},
+		Tools: []ToolDef{
+			{Name: "list_sources", Parameters: json.RawMessage(`{"type":"object"}`)},
+			{Name: "remove_source", Parameters: json.RawMessage(`{"type":"object"}`)},
+		},
 	})
 	if err != nil {
 		t.Fatalf("DoChat 返回错误: %v", err)

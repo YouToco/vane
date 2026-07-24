@@ -88,11 +88,6 @@ func TestPushNowTool_Execute(t *testing.T) {
 // ============================================================
 
 func TestViewProfileTool(t *testing.T) {
-	// 读工具红线：Mutating=true 会让 loop 把它挂起去出确认卡——查画像不该要人点确认。
-	if (&viewProfileTool{}).Mutating() {
-		t.Fatal("view_profile 必须是读工具（Mutating=false）")
-	}
-
 	t.Run("有画像时渲染中文各字段", func(t *testing.T) {
 		fs := newFakeStore()
 		fs.profiles[7] = &types.Profile{
@@ -155,11 +150,6 @@ func TestViewProfileTool(t *testing.T) {
 // ============================================================
 
 func TestUpdateProfileTool(t *testing.T) {
-	// M4 不变式（AI 出预填、人点执行）：写画像必须走确认卡。
-	if !(&updateProfileTool{}).Mutating() {
-		t.Fatal("update_profile 必须是写工具（Mutating=true），否则模型可绕过确认卡直接改画像")
-	}
-
 	t.Run("三字段全缺省回自纠文案且不触库", func(t *testing.T) {
 		fs := newFakeStore()
 		got, err := (&updateProfileTool{st: fs}).Execute(context.Background(), 7, json.RawMessage(`{}`))
@@ -550,9 +540,6 @@ func TestAddSourceTool_Summarize(t *testing.T) {
 // Summarize 如实展示会启用哪个源。Execute 的归属校验（EnableSource 的 SQL WHERE）由
 // store 集成测试覆盖（enable_source 持具体 *store.Store 不可 fake）。
 func TestEnableSourceTool(t *testing.T) {
-	if !(&enableSourceTool{}).Mutating() {
-		t.Fatal("enable_source 必须是写工具（Mutating=true），否则可绕过确认卡直接改源状态")
-	}
 	got := (&enableSourceTool{}).Summarize(json.RawMessage(`{"source_id":7}`))
 	if got != "重新启用信源（id=7）" {
 		t.Fatalf("Summarize 实得 %q", got)
@@ -825,9 +812,6 @@ func TestUpdateScheduleTool_契约(t *testing.T) {
 
 	if tool.Name() != "update_schedule" {
 		t.Errorf("工具名不符: %s", tool.Name())
-	}
-	if !tool.Mutating() {
-		t.Error("改调度是写操作，Mutating 必须为 true（否则绕过确认卡）")
 	}
 	// schema 必须是合法 JSON object schema，且把两个必填项声明出来。
 	var schema map[string]any
@@ -1105,9 +1089,6 @@ func (f *fakeTranslator) Translate(_ context.Context, userID int64, content stri
 }
 
 func TestViewTaskPlaybookTool(t *testing.T) {
-	if (&viewTaskPlaybookTool{}).Mutating() {
-		t.Fatal("view_task_playbook 必须是读工具（Mutating=false），否则查手册要人点确认卡")
-	}
 	t.Run("有手册逐字返回", func(t *testing.T) {
 		fs := newFakePlaybookStore()
 		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1", Content: "每天早八 AI 官方新闻"}
@@ -1177,9 +1158,6 @@ func TestViewTaskPlaybookTool(t *testing.T) {
 }
 
 func TestEditTaskPlaybookTool(t *testing.T) {
-	if !(&editTaskPlaybookTool{}).Mutating() {
-		t.Fatal("edit_task_playbook 必须是写工具（Mutating=true），否则绕过确认卡")
-	}
 	t.Run("正常写入", func(t *testing.T) {
 		fs := newFakePlaybookStore()
 		fs.owner["s1"] = 7 // 已存在且属本人

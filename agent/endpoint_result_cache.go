@@ -252,7 +252,6 @@ func (t *readEndpointResultTool) Description() string {
 func (t *readEndpointResultTool) Parameters() json.RawMessage {
 	return json.RawMessage(readEndpointResultSchema)
 }
-func (t *readEndpointResultTool) Mutating() bool { return false }
 
 // 缓存只保存 TikHub 第三方原文：读取后仍保持 taint；但它不访问网络、不读画像/
 // 任务等内部状态，允许作为 taint 后唯一的本地分页续读能力。

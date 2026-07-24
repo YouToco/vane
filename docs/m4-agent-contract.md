@@ -148,6 +148,28 @@ func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Ch
 role=tool 消息 `{role:"tool",tool_call_id,content}`；assistant 带 tool_calls 的历史消息必须原样带 tool_calls 字段回传。
 空 content 且无 tool_calls 时沿用现有 WARN。信号量/错误映射复用 Complete 的实现（可提公共 helper）。
 
+### 4.1 AssistantTurn 归一化边界（7.5，2026-07-24）
+
+`Chat` 的 OpenAI-compatible wire choice 必须先经纯适配器归一化为
+`AssistantTurn{Content, ToolCalls, StopReason}`，再投影到兼容的 `ChatResponse`；
+Agent loop 本批不迁移。`StopReason` 的零值与未知 wire 值均为 `unknown`，已知值为
+`stop/tool_calls/length/content_filter`。
+
+请求声明 tools 时，只有 `stop_reason=tool_calls` 才能产生可执行 `ToolCalls`，且该 reason
+必须至少有一条调用；`length/content_filter/unknown/stop` 携带调用或
+`tool_calls` reason 无调用均以 `ErrToolProtocolResponse` fail-closed。每条调用必须满足：
+`type=function`、非空且批内唯一的 id、非空 function name、arguments 为合法 JSON object。
+任一项失败则整批调用不可见、不可执行。`Chat` 只返回 usage/model/latency 的内部 partial
+供 `DoChat` 记账，`DoChat` 记账后只向业务调用方返回 error。
+
+不声明 tools 的收尾请求没有可执行工具面：忽略 wire `tool_calls`，保留正文与归一化 stop
+reason，避免 provider finish_reason 漂移误触发工具。DeepSeek V4 的全角 DSML marker 仍按
+已知 provider+请求/响应 model 组合 fail-closed（包括 native+DSML 混合）；其他 provider
+的普通正文不因同样 marker 被全局误杀。历史会话的 DSML 清洗规则不变。
+
+可回放样本位于 `llm/testdata/conformance/assistant_turns.json`；新增 provider 或观察到新的
+wire 漂移时先追加脱敏样本，再修改适配规则。
+
 ## 5. config（`config/config.go`）
 
 ```go
@@ -174,16 +196,24 @@ api/subscriptions.go 改为薄适配（JSON decode → sourcespec.Spec → Build
 ## 7. agent 包（新包 `agent/`）
 
 ```go
-// Tool 是 agent 可用工具。Mutating=true 的工具不由 loop 直接执行，走确认卡。
+// Tool 只承载可执行实现。模型可见声明与受信执行策略由本地 ToolSpec 绑定；
+// 远程 MCP/供应商注解不得充当授权源（7.6，2026-07-24）。
 type Tool interface {
-    Name() string
-    Description() string
-    Parameters() json.RawMessage           // JSON schema（对齐 M4 spike 里验证过的形态）
-    Mutating() bool
     // Execute 返回给模型/用户看的结果文本（中文）。参数是模型产出的 arguments 原始 JSON。
     Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error)
-    // Summarize 把 args 渲染成确认卡上的人类可读摘要（仅 Mutating 工具需要有意义实现）。
+    // Summarize 把 args 渲染成确认卡上的人类可读摘要（ConfirmationRequired 工具须有意义实现）。
     Summarize(args json.RawMessage) string
+}
+
+// ToolSpec = 模型可见 Definition + 本地受信 Policy + 可执行 Tool。
+// Policy.Confirmation=Required 的工具不由 loop 直接执行，走确认卡 / durable proposal。
+// Effects 显式声明 internal_read/network_read/billable/state_write/delivery/
+// durable_proposal/trust_taint/local_handle_read/activation_write；零值无效。
+// 与 compiled runtimepolicy.ToolPolicyV1（空 allowlist）是不同概念，禁止混用 schema。
+type ToolSpec struct {
+    Tool
+    Definition llm.ToolDef
+    Policy     ToolPolicy
 }
 
 // Deps 注入（main.go 装配）。SessionStore/ActionStore 是 store 方法的窄接口（契约 §2 签名）。
@@ -191,12 +221,13 @@ type Deps struct {
     Client   *llm.Client
     Recorder *llm.Recorder
     Store    Store   // 窄接口：§2 全部 6 个方法
-    Tools    []Tool
+    Tools    []ToolSpec
     Model    string        // cfg.LLM.AgentModel
     MaxTurns int           // cfg.Agent.MaxTurns
     SessionTTL time.Duration // cfg.Agent.SessionTTLMinutes
 }
-func New(d Deps) *Loop
+func New(d Deps) *Loop          // 装配期校验失败则 panic
+func NewChecked(d Deps) (*Loop, error)
 
 type Outcome struct {
     Reply   string   // 给用户的文字回复（恒非空）
@@ -311,19 +342,23 @@ Loop 行为细则：
   direct-task-creation 达独立四轮上限则返回固定「任务尚未创建」文案。
 - 全部 LLM 错误向上抛（feishu 层 humanize）。
 
-## 8. agent 工具集（`agent/tools.go`，构造函数 `BuildTools(st *store.Store, sched *scheduler.Scheduler, pusher PushTrigger) []Tool`）
+## 8. agent 工具集（`agent/tools.go`，构造函数 `BuildTools(...) []ToolSpec`）
 
-| 工具 | Mutating | 底层调用 | 说明 |
-|---|---|---|---|
-| list_sources | no | store.ListSubscribedSourcesByUser | 返回 id/类型/标题/状态的中文列表文本 |
-| add_source | **yes** | sourcespec.Build → store.UpsertSource + AddSubscription | 参数 schema 同 spike：{type(enum rss/exa/tikhub_xhs), url, query, keyword, title?, category?} |
-| remove_source | **yes** | store.RemoveSubscription（逐 id，删除幂等） | {source_ids:[integer]}（1–20 个，去重保序，一张确认卡列全并一次确认；旧单数 {source_id} 仅为兼容存量 pending_actions 保留解析，schema 不再声明——2026-07-23 增补，批量意图不再被拆成 N 轮确认） |
-| list_schedules | no | store.ListSchedulesByUser | 中文列表文本 |
-| create_schedule | **yes** | CreationCoordinator.Propose → 人工确认 → creation saga | `{spec,intent,approved_fetch_plan:{existing_source_ids?,source_specs?},nl_description?,strictness?}`；`source_specs` 是 `vane.source-specs/v1` 原始规格，模型面不暴露 durable `sources/config/vane://`；cron/every 二选一且 every≥3600 |
-| remove_schedule | **yes** | scheduler.DeletePush | {schedule_id:string} |
-| push_now | no（低危） | PushTrigger 接口（api push/now 同款触发） | 返回 run_id 文本 |
-| web_search | no | fetcher.ExaFetcher.Search（Exa /search，按次计费） | {query, num_results?(默认5/上限20), include_domains?}；一次性语义搜索，不建信源、不写内容库，结果只回当前对话（2026-07-20 增，见修订记录） |
-| read_page | no | fetcher.ExaContentsFetcher.ReadPage（Exa /contents，maxAgeHours:0 活抓，按次计费） | {url}；一次性读取指定页面正文，不建信源、不写内容库（2026-07-20 增，见修订记录） |
+决策面以 `ToolPolicy` 为准（7.6）：`Confirmation` 替代旧 `Mutating()`；`Effects` 必须完整声明副作用。
+A2A 只读面按 `AuthorizationA2AReadOnly` 过滤，**不**用「无确认」近似——`push_now` 为
+`EffectDelivery` 且 `ConfirmationNone`，不得进入 A2A。
+
+| 工具 | Confirmation | 关键 Effects | 底层调用 | 说明 |
+|---|---|---|---|---|
+| list_sources | none | internal_read + trust_taint | store.ListSubscribedSourcesByUser | 返回 id/类型/标题/状态的中文列表文本；A2A 可读 |
+| add_source | **required** | state_write（确认后 probe 可 taint） | sourcespec.Build → store.UpsertSource + AddSubscription | 参数 schema 同 spike：{type(enum rss/exa/tikhub_xhs), url, query, keyword, title?, category?} |
+| remove_source | **required** | state_write | store.RemoveSubscription（逐 id，删除幂等） | {source_ids:[integer]}（1–20 个，去重保序，一张确认卡列全并一次确认；旧单数 {source_id} 仅为兼容存量 pending_actions 保留解析，schema 不再声明——2026-07-23 增补，批量意图不再被拆成 N 轮确认） |
+| list_schedules | none | internal_read | store.ListSchedulesByUser | 中文列表文本；A2A 可读 |
+| create_schedule | **required** | durable_proposal + state_write | CreationCoordinator.Propose → 人工确认 → creation saga | `{spec,intent,approved_fetch_plan:{existing_source_ids?,source_specs?},nl_description?,strictness?}`；`source_specs` 是 `vane.source-specs/v1` 原始规格，模型面不暴露 durable `sources/config/vane://`；cron/every 二选一且 every≥3600 |
+| remove_schedule | **required** | state_write | scheduler.DeletePush | {schedule_id:string} |
+| push_now | none | delivery | PushTrigger 接口（api push/now 同款触发） | 返回 run_id 文本；有副作用但现网免确认，不得因 delivery 误标 required |
+| web_search | none | network_read + billable + trust_taint | fetcher.ExaFetcher.Search（Exa /search，按次计费） | {query, num_results?(默认5/上限20), include_domains?}；一次性语义搜索，不建信源、不写内容库，结果只回当前对话（2026-07-20 增，见修订记录） |
+| read_page | none | network_read + billable + trust_taint | fetcher.ExaContentsFetcher.ReadPage（Exa /contents，maxAgeHours:0 活抓，按次计费） | {url}；一次性读取指定页面正文，不建信源、不写内容库（2026-07-20 增，见修订记录） |
 
 **§8 增补（2026-07-20，Boss 拍板）**：web_search / read_page 解决「临时查一下」被迫
 add_source 的形态（信源固定点反模式——一次性需求不该走订阅设施）。两工具按次计费，
