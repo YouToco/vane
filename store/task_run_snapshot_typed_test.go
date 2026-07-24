@@ -218,6 +218,75 @@ func TestCreateOrGetCompiledTaskRunSnapshotV1_UsesTypedCanonicalPolicies(t *test
 	}
 }
 
+func TestCreateOrGetCompiledTaskRunSnapshotV1_TemporalScheduleIdentity(
+	t *testing.T,
+) {
+	f := newTaskRunSnapshotFixture(t)
+	taskID := f.taskID()
+	f.createApprovedTask(t, taskID, 1)
+	baseline, err := f.st.reconcileTaskDefinitionBaseline(t.Context(),
+		TaskDefinitionBaselineApply, TaskDefinitionBaselineCursor{
+			TenantID: f.tenantID, UserID: f.userID, TaskID: taskID,
+		})
+	if err != nil || baseline.Status != TaskDefinitionBaselineApplied {
+		t.Fatalf("apply baseline = %+v, %v", baseline, err)
+	}
+	policy := testCompiledRunPolicyV1(t)
+	identity := types.RunIdentity{
+		TemporalWorkflowID: scheduledTaskWorkflowID(taskID) + "-2026-07-24T15:52:40Z",
+		TemporalRunID:      "019f94d4-2b27-7d89-ab35-edb60d25ec6e",
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           f.tenantID,
+		UserID:             f.userID,
+		TaskID:             taskID,
+	}
+
+	ref, err := f.st.CreateOrGetCompiledTaskRunSnapshotV1(t.Context(),
+		CreateOrGetCompiledTaskRunSnapshotV1Params{Identity: identity, Policy: policy})
+	if err != nil {
+		t.Fatalf("create typed Temporal schedule snapshot: %v", err)
+	}
+	if err := ref.ValidateFor(identity); err != nil {
+		t.Fatalf("typed Temporal schedule ref is invalid: %v", err)
+	}
+	loaded, found, err := f.st.LoadCompiledRunSnapshotRefV1(t.Context(), identity)
+	if err != nil || !found || loaded != ref {
+		t.Fatalf("load typed Temporal schedule ref = %+v, %v, %v", loaded, found, err)
+	}
+	authorized, err := f.st.AuthorizeTaskRunSideEffect(t.Context(), identity, ref)
+	if err != nil || !authorized {
+		t.Fatalf("authorize typed Temporal schedule snapshot = %v, %v", authorized, err)
+	}
+
+	shadowIdentity := identity
+	shadowIdentity.TemporalWorkflowID =
+		scheduledTaskWorkflowID(taskID) + "-2026-07-24T15:53:40Z"
+	shadowIdentity.TemporalRunID = "019f94d5-15c7-7b82-9813-2b33e114dd24"
+	shadowRef, err := f.st.CreateOrGetCompiledRunSnapshotShadowV2(
+		t.Context(), shadowIdentity, policy)
+	if err != nil {
+		t.Fatalf("create shadow Temporal schedule snapshot: %v", err)
+	}
+	if err := shadowRef.ValidateFor(shadowIdentity); err != nil {
+		t.Fatalf("shadow Temporal schedule ref is invalid: %v", err)
+	}
+	var parentCount, shadowCount int
+	if err := f.st.pool.QueryRow(t.Context(),
+		`SELECT
+		    (SELECT count(*) FROM task_run_snapshots
+		      WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3),
+		    (SELECT count(*) FROM task_run_snapshot_v2_shadows
+		      WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3)`,
+		f.tenantID, f.userID, taskID,
+	).Scan(&parentCount, &shadowCount); err != nil {
+		t.Fatal(err)
+	}
+	if parentCount != 2 || shadowCount != 1 {
+		t.Fatalf("Temporal schedule rows = parent %d shadow %d, want 2/1",
+			parentCount, shadowCount)
+	}
+}
+
 func TestCreateOrGetCompiledTaskRunSnapshotV1_RejectsInvalidPolicyBeforeWrite(t *testing.T) {
 	f := newTaskRunSnapshotFixture(t)
 	taskID := f.taskID()

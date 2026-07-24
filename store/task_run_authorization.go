@@ -9,8 +9,6 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-const scheduledTaskWorkflowPrefix = "wf-"
-
 type taskRunAuthorizationQueryer interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
@@ -55,7 +53,7 @@ func resolveScheduledRunIdentity(
 	if err := identity.Validate(); err != nil {
 		return types.RunIdentity{}, err
 	}
-	if workflowID != scheduledTaskWorkflowID(taskID) {
+	if !validScheduledTaskWorkflowExecutionIDV1(taskID, workflowID) {
 		return types.RunIdentity{}, taskRunNotFound()
 	}
 
@@ -163,5 +161,5 @@ func authorizeLiveTaskRunSideEffectV1(
 }
 
 func scheduledTaskWorkflowID(taskID string) string {
-	return scheduledTaskWorkflowPrefix + taskID
+	return taskRunScheduledWorkflowPrefixV1 + taskID
 }

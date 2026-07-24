@@ -503,6 +503,13 @@ func TestTaskRunAuthorization_LiveScopeAndRevocation(t *testing.T) {
 	tests := []liveCase{
 		{name: "active legacy task", wantResolved: true, wantAuthorized: true},
 		{
+			name: "active Temporal schedule execution",
+			mutate: func(_ *testing.T, _ *taskRunAuthorizationFixture, _ *string, _ *int64, identity *types.RunIdentity) {
+				identity.TemporalWorkflowID += "-2026-07-24T15:52:40Z"
+			},
+			wantResolved: true, wantAuthorized: true,
+		},
+		{
 			name: "completed v1 task is mature",
 			mutate: func(t *testing.T, f *taskRunAuthorizationFixture, taskID *string, _ *int64, _ *types.RunIdentity) {
 				f.createOperation(t, *taskID, "executed", "completed")
@@ -585,12 +592,13 @@ func TestTaskRunAuthorization_LiveScopeAndRevocation(t *testing.T) {
 
 			got, err := f.st.ResolveScheduledRunIdentity(
 				t.Context(), taskID, lookupUserID,
-				scheduledTaskWorkflowID(taskID), runID)
+				identity.TemporalWorkflowID, runID)
 			if tt.wantResolved {
 				if err != nil {
 					t.Fatalf("ResolveScheduledRunIdentity() error: %v", err)
 				}
 				want := scheduledRunIdentity(taskID, f.tenantID, lookupUserID, runID)
+				want.TemporalWorkflowID = identity.TemporalWorkflowID
 				if !reflect.DeepEqual(got, want) {
 					t.Fatalf("resolved identity = %+v, want %+v", got, want)
 				}

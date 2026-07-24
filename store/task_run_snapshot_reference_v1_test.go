@@ -48,6 +48,50 @@ func goldenTaskRunSnapshotRowV1() taskRunSnapshot {
 	}
 }
 
+func TestValidScheduledTaskWorkflowExecutionIDV1(t *testing.T) {
+	const taskID = "task-v1-0123456789abcdef"
+	base := taskRunScheduledWorkflowPrefixV1 + taskID
+	tests := []struct {
+		name       string
+		taskID     string
+		workflowID string
+		want       bool
+	}{
+		{name: "retained bare action ID", taskID: taskID, workflowID: base, want: true},
+		{
+			name:       "Temporal canonical UTC second",
+			taskID:     taskID,
+			workflowID: base + "-2026-07-24T15:52:40Z",
+			want:       true,
+		},
+		{
+			name:       "task ID may contain timestamp-like text",
+			taskID:     taskID + "-2025-01-02T03:04:05Z",
+			workflowID: base + "-2025-01-02T03:04:05Z-2026-07-24T15:52:40Z",
+			want:       true,
+		},
+		{name: "empty task", workflowID: "wf-", want: false},
+		{name: "wrong task", taskID: taskID, workflowID: "wf-other-2026-07-24T15:52:40Z"},
+		{name: "broad prefix only", taskID: taskID, workflowID: base + "-attacker"},
+		{name: "missing suffix", taskID: taskID, workflowID: base + "-"},
+		{name: "lowercase UTC marker", taskID: taskID, workflowID: base + "-2026-07-24T15:52:40z"},
+		{name: "numeric UTC offset", taskID: taskID, workflowID: base + "-2026-07-24T15:52:40+00:00"},
+		{name: "fractional second", taskID: taskID, workflowID: base + "-2026-07-24T15:52:40.001Z"},
+		{name: "invalid calendar date", taskID: taskID, workflowID: base + "-2026-02-30T15:52:40Z"},
+		{name: "trailing bytes", taskID: taskID, workflowID: base + "-2026-07-24T15:52:40Z-extra"},
+		{name: "control byte", taskID: taskID, workflowID: base + "-2026-07-24T15:52:40Z\n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validScheduledTaskWorkflowExecutionIDV1(
+				test.taskID, test.workflowID); got != test.want {
+				t.Fatalf("validScheduledTaskWorkflowExecutionIDV1(%q, %q) = %v, want %v",
+					test.taskID, test.workflowID, got, test.want)
+			}
+		})
+	}
+}
+
 // This is a hand-authored persisted row and reference envelope. Neither the
 // expected bytes nor digest are produced by the current types contract, so an
 // incompatible v1 representation change fails before old rows reach runtime.
