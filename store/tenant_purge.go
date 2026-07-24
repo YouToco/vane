@@ -46,6 +46,7 @@ type purgeStep struct {
 //	task_creation_receipts               → pending_actions → agent_sessions
 //	agent_events                         → agent_sessions
 //	deliveries                            → push_batches
+//	deliveries → push_batches             → task_run_snapshots
 //	task_run_snapshot_v2_shadows          → task_run_snapshots
 //	task_run_snapshots                    → task_run_snapshot_v2_cutover_events
 //	schedules(current cutover pointer)     → task_run_snapshot_v2_cutover_events
@@ -67,11 +68,6 @@ var purgeOrder = []purgeStep{
 	{"schedule_sources", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
 	// Adaptive 的 last-known-good 外键指向 immutable definition，因此必须先删。
 	{"task_adaptive_states", "tenant_id = $1"},
-	// A marked run points at its immutable cutover event. Parents must be gone
-	// before the event, but events intentionally do not point back to the
-	// current schedule or Approved Definition.
-	{"task_run_snapshot_v2_shadows", "tenant_id = $1"},
-	{"task_run_snapshots", "tenant_id = $1"},
 	// 删除当前 definition 会由 FK 把 schedules 收敛为 compiled/headless，随后
 	// schedules 自己在父表位置删除；动态任务也不会短暂留下无 definition 的模式。
 	{"task_approved_definition_versions", "tenant_id = $1"},
@@ -84,6 +80,12 @@ var purgeOrder = []purgeStep{
 	{"agent_events", "tenant_id = $1"},
 	{"deliveries", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},
+	// Compiled push batches retain the immutable run snapshot through migration
+	// 031, so batches must be gone before either the marked parent or its
+	// sidecar. A marked run also points at its immutable cutover event; parents
+	// must be gone before that event.
+	{"task_run_snapshot_v2_shadows", "tenant_id = $1"},
+	{"task_run_snapshots", "tenant_id = $1"},
 	{"agent_sessions", "tenant_id = $1"},
 	{"subscriptions", "tenant_id = $1"},
 	{"profiles", "tenant_id = $1"},

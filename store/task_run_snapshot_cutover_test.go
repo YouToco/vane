@@ -808,12 +808,22 @@ func TestTaskRunSnapshotCutoverMigrationPrivileges(t *testing.T) {
 func TestTaskRunSnapshotCutoverTenantPurgeReportsAndDeletesFence(t *testing.T) {
 	f := newTaskRunSnapshotCutoverFixture(t)
 	eventID := f.eventID
-	if _, err := f.base.st.createOrGetTaskRunSnapshotWithAuthorityV2(
+	marked, err := f.base.st.createOrGetTaskRunSnapshotWithAuthorityV2(
 		t.Context(),
 		f.base.params(f.taskID, "cutover-purge-"+uuid.NewString()),
 		true, &eventID,
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatalf("create marked purge run: %v", err)
+	}
+	if _, err := f.base.st.pool.Exec(t.Context(),
+		`INSERT INTO push_batches (
+		    tenant_id, user_id, idempotency_key, run_snapshot_id
+		 ) VALUES ($1, $2, $3, $4)`,
+		f.base.tenantID, f.base.userID,
+		"cutover-purge-batch-"+uuid.NewString(), marked.ID,
+	); err != nil {
+		t.Fatalf("create marked compiled push batch: %v", err)
 	}
 	dry, err := f.base.st.PurgeTenant(t.Context(), f.base.tenantID, true)
 	if err != nil {
@@ -821,10 +831,12 @@ func TestTaskRunSnapshotCutoverTenantPurgeReportsAndDeletesFence(t *testing.T) {
 	}
 	if dry.Rows["task_run_snapshot_v2_shadows"] != 2 ||
 		dry.Rows["task_run_snapshots"] != 2 ||
+		dry.Rows["push_batches"] != 1 ||
 		dry.Rows["task_run_snapshot_v2_cutover_events"] != 1 {
-		t.Fatalf("dry-run cutover rows shadows/parents/events = %d/%d/%d",
+		t.Fatalf("dry-run cutover rows shadows/parents/batches/events = %d/%d/%d/%d",
 			dry.Rows["task_run_snapshot_v2_shadows"],
 			dry.Rows["task_run_snapshots"],
+			dry.Rows["push_batches"],
 			dry.Rows["task_run_snapshot_v2_cutover_events"])
 	}
 	var events int
@@ -843,10 +855,12 @@ func TestTaskRunSnapshotCutoverTenantPurgeReportsAndDeletesFence(t *testing.T) {
 	}
 	if real.Rows["task_run_snapshot_v2_shadows"] != 2 ||
 		real.Rows["task_run_snapshots"] != 2 ||
+		real.Rows["push_batches"] != 1 ||
 		real.Rows["task_run_snapshot_v2_cutover_events"] != 1 {
-		t.Fatalf("real cutover rows shadows/parents/events = %d/%d/%d",
+		t.Fatalf("real cutover rows shadows/parents/batches/events = %d/%d/%d/%d",
 			real.Rows["task_run_snapshot_v2_shadows"],
 			real.Rows["task_run_snapshots"],
+			real.Rows["push_batches"],
 			real.Rows["task_run_snapshot_v2_cutover_events"])
 	}
 	if err := f.base.st.pool.QueryRow(t.Context(),
