@@ -1,11 +1,13 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"io/fs"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pressly/goose/v3"
 )
@@ -131,4 +133,130 @@ func TestMigration035RefusesEventDataDowngrade(t *testing.T) {
 	if _, err := provider.Down(ctx); err != nil {
 		t.Fatalf("清空 event ledger 后应可回滚 035: %v", err)
 	}
+}
+
+func TestMigration035DownSerializesBeforeEmptyCheck(t *testing.T) {
+	db, provider := migration035Scratch(t)
+	ctx := t.Context()
+
+	var userID, sessionID int64
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO users (feishu_open_id, name)
+		VALUES ('migration-035-race-user', 'migration 035 race')
+		RETURNING id`,
+	).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO agent_sessions (tenant_id, user_id)
+		VALUES (1, $1) RETURNING id`, userID,
+	).Scan(&sessionID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep a valid append uncommitted on one physical connection. It holds a
+	// RowExclusiveLock but is invisible to another transaction's EXISTS.
+	appendTx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendDone := false
+	defer func() {
+		if !appendDone {
+			_ = appendTx.Rollback()
+		}
+	}()
+	payload := `{"schema_version":"vane.agent-event/v1","kind":"user_message","body":{"text":"concurrent"}}`
+	if _, err := appendTx.ExecContext(ctx, `
+		INSERT INTO agent_events (
+			tenant_id, user_id, session_id, sequence,
+			batch_idempotency_key, batch_index, batch_size,
+			kind, schema_version, payload, payload_digest, batch_digest
+		) VALUES (
+			1, $1, $2, 1, 'migration-035-race', 0, 1,
+			'user_message', 'vane.agent-event/v1',
+			convert_to($3, 'UTF8'),
+			encode(sha256(convert_to($3, 'UTF8')), 'hex'),
+			repeat('b', 64)
+		)`, userID, sessionID, payload); err != nil {
+		t.Fatal(err)
+	}
+
+	downDone := make(chan error, 1)
+	go func() {
+		_, downErr := provider.Down(ctx)
+		downDone <- downErr
+	}()
+
+	// The fixed migration must block at its explicit pre-check LOCK, not later
+	// at DROP TABLE. Without that statement the old migration reaches the empty
+	// EXISTS, then blocks at DROP; committing below would let it silently delete
+	// the newly visible row.
+	lockObserved := waitForMigration035DowngradeFence(ctx, db, 5*time.Second)
+	if err := appendTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	appendDone = true
+
+	var downErr error
+	select {
+	case downErr = <-downDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("035 Down did not converge after concurrent append committed")
+	}
+	if !lockObserved {
+		t.Fatal("035 Down never waited at the pre-check ACCESS EXCLUSIVE fence")
+	}
+	if downErr == nil || !strings.Contains(downErr.Error(), "refusing downgrade") {
+		t.Fatalf("035 Down silently accepted a concurrent append: %v", downErr)
+	}
+
+	var version, rows int
+	var exists bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT
+		  (SELECT COALESCE(max(version_id), 0)
+		     FROM goose_db_version WHERE is_applied),
+		  (SELECT count(*) FROM agent_events),
+		  to_regclass('public.agent_events') IS NOT NULL`,
+	).Scan(&version, &rows, &exists); err != nil {
+		t.Fatal(err)
+	}
+	if version != 35 || rows != 1 || !exists {
+		t.Fatalf("concurrent append was not atomically preserved: version=%d rows=%d exists=%v",
+			version, rows, exists)
+	}
+
+	if _, err := db.ExecContext(ctx, `DELETE FROM agent_events`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Down(ctx); err != nil {
+		t.Fatalf("empty ledger should downgrade after concurrent Gate: %v", err)
+	}
+}
+
+func waitForMigration035DowngradeFence(
+	ctx context.Context,
+	db *sql.DB,
+	timeout time.Duration,
+) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		err := db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				  FROM pg_stat_activity
+				 WHERE datname=current_database()
+				   AND pid<>pg_backend_pid()
+				   AND wait_event_type='Lock'
+				   AND query LIKE '%migration 035 downgrade fence%'
+			)`,
+		).Scan(&waiting)
+		if err == nil && waiting {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
 }

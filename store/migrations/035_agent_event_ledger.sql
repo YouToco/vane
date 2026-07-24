@@ -84,6 +84,14 @@ CREATE POLICY tenant_isolation ON agent_events AS RESTRICTIVE
 
 -- Once dual-write begins, event rows are non-regenerable audit history. Empty
 -- development databases may downgrade; non-empty ledgers must fail atomically.
+-- Take the strongest table lock before the emptiness check. DROP TABLE also
+-- needs this lock, but taking it only after EXISTS leaves a TOCTOU window:
+-- an append that was invisible/uncommitted during EXISTS could commit while
+-- DROP waits, then be silently destroyed. Goose runs this migration in one
+-- transaction, so the lock is retained through the check and DROP/commit.
+LOCK TABLE agent_events IN ACCESS EXCLUSIVE MODE
+    /* migration 035 downgrade fence */;
+
 -- +goose StatementBegin
 DO $$
 BEGIN
