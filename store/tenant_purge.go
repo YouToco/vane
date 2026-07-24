@@ -46,7 +46,7 @@ type purgeStep struct {
 //	task_creation_receipts               → pending_actions → agent_sessions
 //	agent_events                         → agent_sessions
 //	deliveries                            → push_batches
-//	task_run_snapshots                    → tenants / users
+//	task_run_snapshot_v2_shadows          → task_run_snapshots → tenants / users
 //	task_definition_edit_receipts         → task_definition_edit_operations
 //	schedules(definition-edit marker)     → task_definition_edit_operations
 //	task_adaptive_states                  → task_approved_definition_versions → schedules
@@ -80,6 +80,7 @@ var purgeOrder = []purgeStep{
 	{"agent_sessions", "tenant_id = $1"},
 	// 虽然 tenant FK 带 ON DELETE CASCADE，仍须显式删除：否则 dry-run/report
 	// 看不见这批不可变审计数据，purge schema 守卫也会把它视为漏项。
+	{"task_run_snapshot_v2_shadows", "tenant_id = $1"},
 	{"task_run_snapshots", "tenant_id = $1"},
 
 	{"subscriptions", "tenant_id = $1"},

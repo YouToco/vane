@@ -34,6 +34,21 @@ func (s *Store) CreateOrGetCompiledRunSnapshotV1(
 		CreateOrGetCompiledTaskRunSnapshotV1Params{Identity: identity, Policy: policy})
 }
 
+// CreateOrGetCompiledRunSnapshotShadowV2 creates the unchanged v1 runtime
+// snapshot plus its C2c-2 sidecar in one transaction. The returned reference
+// remains v1 and no runtime consumer reads the sidecar.
+func (s *Store) CreateOrGetCompiledRunSnapshotShadowV2(
+	ctx context.Context,
+	identity types.RunIdentity,
+	policy runtimepolicy.BundleV1,
+) (types.RunSnapshotRef, error) {
+	return s.createOrGetCompiledTaskRunSnapshotV1(ctx,
+		CreateOrGetCompiledTaskRunSnapshotV1Params{
+			Identity: identity,
+			Policy:   policy,
+		}, true)
+}
+
 // CreateOrGetCompiledTaskRunSnapshotV1 freezes one compiled scheduled run from
 // typed policy input. It deliberately owns serialization of all five policy
 // bodies so a future Activity cannot bypass the DTO boundary with arbitrary
@@ -45,6 +60,14 @@ func (s *Store) CreateOrGetCompiledRunSnapshotV1(
 func (s *Store) CreateOrGetCompiledTaskRunSnapshotV1(
 	ctx context.Context,
 	p CreateOrGetCompiledTaskRunSnapshotV1Params,
+) (types.RunSnapshotRef, error) {
+	return s.createOrGetCompiledTaskRunSnapshotV1(ctx, p, false)
+}
+
+func (s *Store) createOrGetCompiledTaskRunSnapshotV1(
+	ctx context.Context,
+	p CreateOrGetCompiledTaskRunSnapshotV1Params,
+	shadowV2 bool,
 ) (types.RunSnapshotRef, error) {
 	if err := validateTaskRunExpectedIdentityV1(p.Identity); err != nil {
 		return types.RunSnapshotRef{}, taskRunValidationError(
@@ -91,7 +114,7 @@ func (s *Store) CreateOrGetCompiledTaskRunSnapshotV1(
 	lookup.ModelPolicyJSON = modelPolicy
 	lookup.QuotaPolicyJSON = quotaPolicy
 	lookup.BudgetJSON = budget
-	snapshot, err := s.createOrGetTaskRunSnapshot(ctx, lookup)
+	snapshot, err := s.createOrGetTaskRunSnapshotWithShadowV2(ctx, lookup, shadowV2)
 	if err != nil {
 		return types.RunSnapshotRef{}, err
 	}

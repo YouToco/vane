@@ -51,6 +51,8 @@ pipeline:
   compiled_runtime_enabled: false
   compiled_runtime_canary_schedule_id: ""
   compiled_runtime_allow_all: false
+  # C2c-2: exact one-task shadow canary. Empty means fully off.
+  snapshot_v2_shadow_canary_schedule_id: ""
 
 agent:
   max_turns: 20

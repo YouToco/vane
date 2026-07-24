@@ -9,6 +9,38 @@ import (
 	"github.com/spf13/viper"
 )
 
+func TestSnapshotV2ShadowCanaryScheduleIDValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "off"},
+		{name: "exact", value: "push-shadow-canary"},
+		{name: "trimmed", value: "  push-shadow-canary  "},
+		{name: "whitespace", value: "  ", wantErr: true},
+		{name: "control", value: "push\nshadow", wantErr: true},
+		{name: "format control", value: "push\u200bshadow", wantErr: true},
+		{name: "too long", value: strings.Repeat("a", 256), wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{DB: DBConfig{URL: "postgres://test"}}
+			cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID = test.value
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error = %v", err)
+			}
+			if !test.wantErr && test.value != "" &&
+				cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID !=
+					strings.TrimSpace(test.value) {
+				t.Fatalf("canary id = %q",
+					cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID)
+			}
+		})
+	}
+}
+
 // clearVaneEnv 清掉本进程可能残留的 VANE_ 环境变量，保证测试相互隔离。
 // 通过 t.Setenv("", …) 之外的 os.Unsetenv 也能配合 t.Setenv 的自动恢复：
 // 先 t.Setenv 注册恢复点，再 os.Unsetenv 真正清空。

@@ -16,7 +16,7 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-func TestCreateOrGetCompiledTaskRunSnapshotV1UsesPinnedIdentityValidation(t *testing.T) {
+func TestCompiledTaskRunSnapshotAdapterUsesPinnedIdentityValidation(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller could not locate typed snapshot test")
@@ -30,18 +30,18 @@ func TestCreateOrGetCompiledTaskRunSnapshotV1UsesPinnedIdentityValidation(t *tes
 	var target *ast.FuncDecl
 	for _, declaration := range file.Decls {
 		function, isFunction := declaration.(*ast.FuncDecl)
-		if isFunction && function.Name.Name == "CreateOrGetCompiledTaskRunSnapshotV1" {
+		if isFunction && function.Name.Name == "createOrGetCompiledTaskRunSnapshotV1" {
 			target = function
 			break
 		}
 	}
 	if target == nil || target.Body == nil {
-		t.Fatal("CreateOrGetCompiledTaskRunSnapshotV1 is missing")
+		t.Fatal("createOrGetCompiledTaskRunSnapshotV1 is missing")
 	}
 	required := map[string]bool{
-		"validateTaskRunExpectedIdentityV1": false,
-		"createOrGetTaskRunSnapshot":        false,
-		"loadTaskRunSnapshotBehindFence":    false,
+		"validateTaskRunExpectedIdentityV1":      false,
+		"createOrGetTaskRunSnapshotWithShadowV2": false,
+		"loadTaskRunSnapshotBehindFence":         false,
 	}
 	forbiddenIdentifiers := map[string]struct{}{
 		"scheduledTaskWorkflowID": {},

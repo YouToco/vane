@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const latestMigrationVersion int64 = 35
+const latestMigrationVersion int64 = 36
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -67,6 +67,8 @@ var wantTables = []string{
 	"task_definition_edit_receipts",
 	// 035 append-only Agent semantic event ledger (7.7-A).
 	"agent_events",
+	// 036 C2c-2 immutable run-snapshot v2 shadow sidecar.
+	"task_run_snapshot_v2_shadows",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的

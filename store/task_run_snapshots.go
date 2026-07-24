@@ -110,6 +110,14 @@ func (s *Store) createOrGetTaskRunSnapshot(
 	ctx context.Context,
 	p CreateOrGetTaskRunSnapshotParams,
 ) (*taskRunSnapshot, error) {
+	return s.createOrGetTaskRunSnapshotWithShadowV2(ctx, p, false)
+}
+
+func (s *Store) createOrGetTaskRunSnapshotWithShadowV2(
+	ctx context.Context,
+	p CreateOrGetTaskRunSnapshotParams,
+	shadowV2 bool,
+) (*taskRunSnapshot, error) {
 	if err := validateTaskRunLookupInput(p); err != nil {
 		return nil, err
 	}
@@ -126,6 +134,12 @@ func (s *Store) createOrGetTaskRunSnapshot(
 	if existing, found, err := loadTaskRunSnapshot(ctx, tx, p); err != nil {
 		return nil, err
 	} else if found {
+		if shadowV2 {
+			if _, err := validateExistingTaskRunSnapshotShadowV2(
+				ctx, tx, existing); err != nil {
+				return nil, err
+			}
+		}
 		return existing, nil
 	}
 	if err := validateNewTaskRunInput(p); err != nil {
@@ -202,6 +216,13 @@ func (s *Store) createOrGetTaskRunSnapshot(
 		return nil, taskRunIntegrityError()
 	}
 	candidate.ReferenceDigest = sealedRef.ReferenceDigest
+	var shadow taskRunSnapshotShadowV2
+	if shadowV2 {
+		shadow, err = buildTaskRunSnapshotShadowV2(ctx, tx, candidate)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// RunID is the conflict arbiter because it is globally unique. Using only
 	// the scoped unique here is racy on PostgreSQL: concurrent identical writers
@@ -241,10 +262,59 @@ func (s *Store) createOrGetTaskRunSnapshot(
 	if err := validateStoredTaskRunSnapshot(inserted, p); err != nil {
 		return nil, err
 	}
+	if shadowV2 {
+		if err := insertTaskRunSnapshotShadowV2(ctx, tx, shadow); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
+		if shadowV2 {
+			rollbackCompiledTaskTx(ctx, tx)
+			recoveryCtx, cancel := context.WithTimeout(
+				context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			winner, found, loadErr := s.loadTaskRunSnapshotShadowBehindFenceV2(
+				recoveryCtx, p)
+			if loadErr != nil {
+				return nil, loadErr
+			}
+			if found {
+				return winner, nil
+			}
+		}
 		return nil, taskRunDatabaseError("commit task run snapshot transaction", err)
 	}
 	return inserted, nil
+}
+
+func (s *Store) loadTaskRunSnapshotShadowBehindFenceV2(
+	ctx context.Context,
+	p CreateOrGetTaskRunSnapshotParams,
+) (*taskRunSnapshot, bool, error) {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, false, taskRunDatabaseError(
+			"begin task run snapshot v2 recovery transaction", err)
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockTaskRunSnapshotRun(ctx, tx, p.TemporalRunID); err != nil {
+		return nil, false, err
+	}
+	winner, found, err := loadTaskRunSnapshot(ctx, tx, p)
+	if err != nil || !found {
+		return winner, found, err
+	}
+	if found, err := validateExistingTaskRunSnapshotShadowV2(
+		ctx, tx, winner); err != nil {
+		return nil, false, err
+	} else if !found {
+		return nil, false, taskRunIntegrityError()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, taskRunDatabaseError(
+			"commit task run snapshot v2 recovery transaction", err)
+	}
+	return winner, true, nil
 }
 
 func lockTaskRunSnapshotRun(ctx context.Context, tx pgx.Tx, temporalRunID string) error {

@@ -141,6 +141,54 @@ func TestFinishBaselineRunSanitizesEncodingError(t *testing.T) {
 	}
 }
 
+func TestFinishSnapshotShadowRunStrictExit(t *testing.T) {
+	next := int64(7)
+	tests := []struct {
+		name string
+		page store.TaskRunSnapshotShadowAuditPage
+		want int
+	}{
+		{name: "empty", want: exitVerifyFailed},
+		{name: "match", page: store.TaskRunSnapshotShadowAuditPage{
+			Items: []store.TaskRunSnapshotShadowAuditItem{{
+				SnapshotID: 1, Status: store.TaskRunSnapshotShadowMatch,
+			}},
+		}, want: exitOK},
+		{name: "missing", page: store.TaskRunSnapshotShadowAuditPage{
+			Items: []store.TaskRunSnapshotShadowAuditItem{{
+				SnapshotID: 1, Status: "missing",
+			}},
+		}, want: exitVerifyFailed},
+		{name: "headless", page: store.TaskRunSnapshotShadowAuditPage{
+			Items: []store.TaskRunSnapshotShadowAuditItem{{
+				SnapshotID: 1, Status: store.TaskRunSnapshotShadowHeadless,
+			}},
+		}, want: exitVerifyFailed},
+		{name: "legacy", page: store.TaskRunSnapshotShadowAuditPage{
+			Items: []store.TaskRunSnapshotShadowAuditItem{{
+				SnapshotID: 1, Status: store.TaskRunSnapshotShadowLegacyCompatible,
+			}},
+		}, want: exitVerifyFailed},
+		{name: "next", page: store.TaskRunSnapshotShadowAuditPage{
+			Items: []store.TaskRunSnapshotShadowAuditItem{{
+				SnapshotID: 1, Status: store.TaskRunSnapshotShadowMatch,
+			}}, Next: &next,
+		}, want: exitVerifyMorePages},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if got := finishSnapshotShadowRun(
+				&stdout, &stderr, test.page, nil); got != test.want {
+				t.Fatalf("exit=%d want=%d", got, test.want)
+			}
+			if stdout.Len() == 0 || stderr.Len() != 0 {
+				t.Fatalf("stdout/stderr = %q/%q", stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
 func TestRuntimeAdminDeploymentWorkflow(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {

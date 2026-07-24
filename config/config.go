@@ -11,6 +11,8 @@ import (
 	"net"
 	"os"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/spf13/viper"
 )
@@ -126,6 +128,9 @@ type PipelineConfig struct {
 	CompiledRuntimeCanaryScheduleID string `mapstructure:"compiled_runtime_canary_schedule_id"`
 	// CompiledRuntimeAllowAll is the deliberate second key for broad rollout.
 	CompiledRuntimeAllowAll bool `mapstructure:"compiled_runtime_allow_all"`
+	// SnapshotV2ShadowCanaryScheduleID enables C2c-2 shadow persistence for
+	// exactly one task. Empty is the complete rollback/off state.
+	SnapshotV2ShadowCanaryScheduleID string `mapstructure:"snapshot_v2_shadow_canary_schedule_id"`
 }
 
 // AgentConfig 是 agent loop 运行约束配置。
@@ -289,6 +294,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.compiled_runtime_enabled", false)
 	v.SetDefault("pipeline.compiled_runtime_canary_schedule_id", "")
 	v.SetDefault("pipeline.compiled_runtime_allow_all", false)
+	v.SetDefault("pipeline.snapshot_v2_shadow_canary_schedule_id", "")
 
 	v.SetDefault("agent.max_turns", 20)
 	v.SetDefault("agent.definition_edit_enabled", false)
@@ -361,6 +367,15 @@ func (c *Config) Validate() error {
 			return errors.New("config: compiled runtime 单任务 canary 与 allow_all 不能同时启用")
 		}
 	}
+	rawShadowCanaryID := c.Pipeline.SnapshotV2ShadowCanaryScheduleID
+	shadowCanaryID := strings.TrimSpace(rawShadowCanaryID)
+	if rawShadowCanaryID != "" && shadowCanaryID == "" {
+		return errors.New("config: pipeline.snapshot_v2_shadow_canary_schedule_id 不能仅含空白")
+	}
+	if shadowCanaryID != "" && !validSnapshotShadowCanaryID(shadowCanaryID) {
+		return errors.New("config: pipeline.snapshot_v2_shadow_canary_schedule_id 无效")
+	}
+	c.Pipeline.SnapshotV2ShadowCanaryScheduleID = shadowCanaryID
 
 	if c.Server.Addr == "" {
 		c.Server.Addr = "127.0.0.1:8080" // 与 setDefaults 一致：空值回退也只绑 loopback
@@ -399,6 +414,18 @@ func (c *Config) Validate() error {
 		return errors.New("config: fetch compiled credential generation 必须为正数")
 	}
 	return nil
+}
+
+func validSnapshotShadowCanaryID(value string) bool {
+	if value == "" || len(value) > 255 || !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			return false
+		}
+	}
+	return true
 }
 
 // AgentClientConfig 返回 Agent/DeepDive/A2A 质量档使用的独立客户端配置。
