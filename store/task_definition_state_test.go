@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -553,23 +554,35 @@ func TestTaskDefinitionBaselineAdapterDoesNotReuseCurrentPlanTypes(t *testing.T)
 	if !ok {
 		t.Fatal("resolve current source file")
 	}
-	sourceFile := strings.TrimSuffix(thisFile, "_test.go") + ".go"
-	file, err := parser.ParseFile(token.NewFileSet(), sourceFile, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
 	forbidden := map[string]struct{}{
-		"compiledFetchPlan": {}, "compiledPlanSource": {},
+		"compiledFetchPlan":  {},
+		"compiledPlanSource": {},
 	}
-	ast.Inspect(file, func(node ast.Node) bool {
-		identifier, ok := node.(*ast.Ident)
-		if ok {
-			if _, found := forbidden[identifier.Name]; found {
-				t.Errorf("frozen baseline adapter references current type %s", identifier.Name)
-			}
+	sourceFiles := []string{
+		strings.TrimSuffix(thisFile, "_test.go") + ".go",
+		filepath.Join(filepath.Dir(thisFile), "task_definition_baseline.go"),
+	}
+	for _, sourceFile := range sourceFiles {
+		fileForbidden := maps.Clone(forbidden)
+		if filepath.Base(sourceFile) == "task_definition_baseline.go" {
+			fileForbidden["BuildApprovedDefinitionV1"] = struct{}{}
+			fileForbidden["ValidateApprovedDefinitionV1ForWrite"] = struct{}{}
 		}
-		return true
-	})
+		file, err := parser.ParseFile(token.NewFileSet(), sourceFile, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			identifier, ok := node.(*ast.Ident)
+			if ok {
+				if _, found := fileForbidden[identifier.Name]; found {
+					t.Errorf("frozen baseline adapter %s references current writer %s",
+						filepath.Base(sourceFile), identifier.Name)
+				}
+			}
+			return true
+		})
+	}
 }
 
 func TestTaskStatePayloadMutationIsDetectedOnRead(t *testing.T) {

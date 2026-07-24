@@ -69,17 +69,19 @@ jobs:
         with:
           go-version: "1.26"
 
-      # 三个二进制都要上生产：
-      #   vane      —— 主服务
-      #   useradmin —— 账号管理（**部署 D2′ 认证后必须有它**，否则 owner 接管不了
-      #                 账号，Dashboard 直接登不进去且无法自救）
-      #   gate      —— Gate 探针（下方「Gate probes」post-deploy 步骤执行它，
-      #                 红灯打红流水线——2026-07-20 拍板接线）
+      # 四个二进制都要上生产：
+      #   vane         —— 主服务
+      #   useradmin    —— 账号管理（**部署 D2′ 认证后必须有它**，否则 owner 接管不了
+      #                    账号，Dashboard 直接登不进去且无法自救）
+      #   gate         —— Gate 探针（下方「Gate probes」post-deploy 步骤执行它，
+      #                    红灯打红流水线——2026-07-20 拍板接线）
+      #   runtimeadmin —— Runtime 管理工具（C2c baseline 的 dry-run/apply/verify 唯一入口）
       - name: Build linux binaries
         run: |
           GOOS=linux GOARCH=amd64 go build -o bin/vane ./cmd/server
           GOOS=linux GOARCH=amd64 go build -o bin/useradmin ./cmd/useradmin
           GOOS=linux GOARCH=amd64 go build -o bin/gate ./cmd/gate
+          GOOS=linux GOARCH=amd64 go build -o bin/runtimeadmin ./cmd/runtimeadmin
         env:
           CGO_ENABLED: "0"
 
@@ -100,7 +102,7 @@ jobs:
           port: ${{ secrets.VPS_PORT }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: "bin/vane,bin/useradmin,bin/gate"
+          source: "bin/vane,bin/useradmin,bin/gate,bin/runtimeadmin"
           target: "/opt/vane/"
 
       # 基础设施文件（Caddyfile / compose / systemd unit / dynamicconfig）随代码同步。
@@ -148,7 +150,8 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            chmod +x /opt/vane/bin/vane /opt/vane/bin/useradmin /opt/vane/bin/gate
+            chmod +x /opt/vane/bin/vane /opt/vane/bin/useradmin /opt/vane/bin/gate /opt/vane/bin/runtimeadmin
+            test -x /opt/vane/bin/runtimeadmin
             systemctl restart vane
             # Type=simple 下 restart 立即返回，必须主动验证：
             # 迁移失败/配置缺失会崩溃重启循环，没有这步 CI 会假绿。
