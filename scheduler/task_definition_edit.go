@@ -31,7 +31,8 @@ import (
 )
 
 const (
-	taskDefinitionEditWireVersion = "v1"
+	taskDefinitionEditWireVersionV1 = "v1"
+	taskDefinitionEditWireVersionV2 = "v2"
 	// Literals by design: advancing either current task-schedule writer alias
 	// must not reinterpret or strand a frozen definition-edit/v1 operation.
 	taskDefinitionEditOwnershipIDSchemeVersion = "v1"
@@ -191,6 +192,13 @@ func (s *Scheduler) PrepareTaskDefinitionEdit(
 			TaskScheduleErrorInvalid, "prepare_definition_edit", req.Creation.TaskID, err,
 		)
 	}
+	wireVersion := taskDefinitionEditWireVersionV1
+	if req.Creation.FingerprintVersion == taskScheduleFingerprintVersionV1 {
+		// Wire v1 is retained byte-for-byte for v2 creation provenance. A
+		// distinct wire version admits historical v1 creation bytes without
+		// widening or reinterpreting the v1 recovery contract.
+		wireVersion = taskDefinitionEditWireVersionV2
+	}
 	dc, err := s.taskDefinitionEditEnvironment(ctx, req.Creation, "prepare_definition_edit")
 	if err != nil {
 		return PreparedTaskDefinitionEdit{}, TaskDefinitionEditSnapshot{}, err
@@ -225,7 +233,7 @@ func (s *Scheduler) PrepareTaskDefinitionEdit(
 		)
 	}
 	operationDigest, err := digestTaskDefinitionEditOperationSeed(taskDefinitionEditOperationSeed{
-		WireVersion:            taskDefinitionEditWireVersion,
+		WireVersion:            wireVersion,
 		OperationID:            req.OperationID,
 		CreationRequestDigest:  req.Creation.RequestDigest,
 		TenantID:               req.Creation.TenantID,
@@ -252,7 +260,7 @@ func (s *Scheduler) PrepareTaskDefinitionEdit(
 		)
 	}
 	prepared := PreparedTaskDefinitionEdit{
-		WireVersion:            taskDefinitionEditWireVersion,
+		WireVersion:            wireVersion,
 		OperationID:            req.OperationID,
 		OperationDigest:        operationDigest,
 		BaseProjectionDigest:   baseProjectionDigest,
@@ -697,10 +705,11 @@ func validateTaskDefinitionEditRequestIdentityV1(req TaskDefinitionEditRequest) 
 		return fmt.Errorf("validate creation ownership: %w", err)
 	}
 	if req.Creation.IDSchemeVersion != taskDefinitionEditOwnershipIDSchemeVersion {
-		return errors.New("definition edit v1 requires the retained v1 task ID scheme")
+		return errors.New("definition edit requires the retained v1 task ID scheme")
 	}
-	if req.Creation.FingerprintVersion != taskDefinitionEditOwnershipFingerprintVersion {
-		return errors.New("definition edit v1 requires the retained v2 task ownership fingerprint")
+	if req.Creation.FingerprintVersion != taskScheduleFingerprintVersionV1 &&
+		req.Creation.FingerprintVersion != taskDefinitionEditOwnershipFingerprintVersion {
+		return errors.New("definition edit requires a retained v1 or v2 task ownership fingerprint")
 	}
 	if err := validateTaskScheduleString("operation_id", req.OperationID, true); err != nil {
 		return err
@@ -1149,7 +1158,7 @@ func buildTaskDefinitionEditUpdateRequest(
 		ScheduleId:    prepared.Creation.TaskID,
 		Schedule:      schedule,
 		ConflictToken: slices.Clone(conflictToken),
-		Identity:      "vane-task-definition-edit/" + taskDefinitionEditWireVersion,
+		Identity:      "vane-task-definition-edit/" + prepared.WireVersion,
 		RequestId: taskScheduleRequestID(
 			"definition_edit/"+phase+"/"+prepared.OperationDigest,
 			prepared.RequestDigest,
@@ -1215,17 +1224,23 @@ func taskDefinitionEditProtoSchedule(
 }
 
 func validatePreparedTaskDefinitionEdit(prepared PreparedTaskDefinitionEdit) error {
-	if prepared.WireVersion != taskDefinitionEditWireVersion {
-		return fmt.Errorf("unsupported definition edit wire version %q", prepared.WireVersion)
-	}
 	if err := validatePreparedTaskSchedule(prepared.Creation); err != nil {
 		return fmt.Errorf("validate creation ownership: %w", err)
 	}
 	if prepared.Creation.IDSchemeVersion != taskDefinitionEditOwnershipIDSchemeVersion {
-		return errors.New("definition edit v1 ownership ID scheme is not retained v1")
+		return errors.New("definition edit ownership ID scheme is not retained v1")
 	}
-	if prepared.Creation.FingerprintVersion != taskDefinitionEditOwnershipFingerprintVersion {
-		return errors.New("definition edit v1 ownership fingerprint is not retained v2")
+	switch prepared.WireVersion {
+	case taskDefinitionEditWireVersionV1:
+		if prepared.Creation.FingerprintVersion != taskDefinitionEditOwnershipFingerprintVersion {
+			return errors.New("definition edit v1 ownership fingerprint is not retained v2")
+		}
+	case taskDefinitionEditWireVersionV2:
+		if prepared.Creation.FingerprintVersion != taskScheduleFingerprintVersionV1 {
+			return errors.New("definition edit v2 ownership fingerprint is not retained v1")
+		}
+	default:
+		return fmt.Errorf("unsupported definition edit wire version %q", prepared.WireVersion)
 	}
 	if err := validateTaskScheduleString("operation_id", prepared.OperationID, true); err != nil {
 		return err

@@ -142,6 +142,11 @@ Approved head、projection digest、creation ownership 与 phase checkpoint，�
 scheme、operation ID 字节上限、timing reader，以及共享 `ScheduleSpec`/`PushScope`/`PushParams`/prepared schedule
 布局；这些类型演进时必须新建 wire 并保留 v1 reader，不能直接修改 guard。
 
+历史 create-schedule 的 `prepared_schedule` 可能仍是 task ownership fingerprint v1；其 Temporal Action 在激活时
+已按 retained reader 补齐 tenant/compiled envelope，但不可变创建凭据本身不得重写。此类任务只能由
+definition-edit/v2 prepared wire 承载，且 v2 必须严格绑定 fingerprint v1 creation；原 definition-edit/v1 继续只接受
+fingerprint v2 creation。两种 wire 共用现有字段布局和 fail-closed phase 语义，但禁止互换版本号或借 v2 放宽 v1 reader。
+
 隐式 `temporal-default-json-v1` converter ID 由 exact PushParams payload golden 约束，且禁止用显式自定义 converter
 重绑同一 ID；SDK 升级若改变 payload，必须 bump converter ID 并注册旧 decoder。另一个部署不变量是：存在
 nonterminal edit operation 时不得直接把唯一 Scheduler namespace 从 A 切到 B；必须先 drain/终结，或先实现按 sealed

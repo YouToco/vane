@@ -58,11 +58,18 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 		killPoint         definitionEditCoordinatorIntegrationKillPoint
 		originalStatus    types.ScheduleStatus
 		staleTakeover     bool
+		retainedV1Create  bool
 		wantRecovery      bool
 		wantDurablePhase  types.TaskDefinitionEditPhase
 		wantTemporalPhase scheduler.TaskDefinitionEditPhase
 	}{
 		{name: "uninterrupted active", killPoint: definitionEditCoordinatorKillNone, originalStatus: types.ScheduleStatusActive},
+		{
+			name:             "uninterrupted active retained v1 creation",
+			killPoint:        definitionEditCoordinatorKillNone,
+			originalStatus:   types.ScheduleStatusActive,
+			retainedV1Create: true,
+		},
 		{name: "uninterrupted paused", killPoint: definitionEditCoordinatorKillNone, originalStatus: types.ScheduleStatusPaused},
 		{name: "create response lost", killPoint: definitionEditCoordinatorKillCreate, originalStatus: types.ScheduleStatusActive},
 		{
@@ -171,8 +178,17 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 		t.Run(testCase.name, func(t *testing.T) {
 			fixture := newDefinitionEditCoordinatorIntegrationFixture(
 				t, dbURL, server.Client(), namespace, taskQueue, testCase.killPoint,
-				testCase.originalStatus,
+				testCase.originalStatus, testCase.retainedV1Create,
 			)
+			if testCase.retainedV1Create &&
+				(fixture.prepared.Creation.FingerprintVersion != "v1" ||
+					fixture.prepared.WireVersion != "v2") {
+				t.Fatalf(
+					"retained creation compatibility = fingerprint %q wire %q",
+					fixture.prepared.Creation.FingerprintVersion,
+					fixture.prepared.WireVersion,
+				)
+			}
 			if testCase.staleTakeover {
 				runDefinitionEditCoordinatorIntegrationTakeoverLoss(t, fixture)
 				assertDefinitionEditCoordinatorIntegrationConverged(t, fixture)
@@ -279,17 +295,20 @@ func newDefinitionEditCoordinatorIntegrationFixture(
 	taskQueue string,
 	killPoint definitionEditCoordinatorIntegrationKillPoint,
 	originalStatus types.ScheduleStatus,
+	retainedV1Create bool,
 ) definitionEditCoordinatorIntegrationFixture {
 	t.Helper()
 	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 
-	schedules := scheduler.New(
-		temporalClient, taskQueue, nil,
+	options := []scheduler.SchedulerOption{
 		scheduler.WithTaskScheduleNamespace(namespace),
-		scheduler.WithCompiledRuntimeRollout(true, "", true),
-	)
+	}
+	if !retainedV1Create {
+		options = append(options, scheduler.WithCompiledRuntimeRollout(true, "", true))
+	}
+	schedules := scheduler.New(temporalClient, taskQueue, nil, options...)
 	creation := NewCreationCoordinator(st, schedules, nil)
 	creationSession, err := st.CreateAgentSession(ctx, userID)
 	if err != nil {

@@ -82,6 +82,12 @@ func TestDecodeFrozenProposal_RejectsExactAndCrossSplicedWire(t *testing.T) {
 	unsafeProposal := proposal
 	unsafeProposal.PreparedEditDigest = digest(unsafePreparedRaw)
 
+	reinterpretedPrepared := prepared
+	reinterpretedPrepared.WireVersion = preparedWireVersionV2
+	reinterpretedPreparedRaw := mustMarshal(t, reinterpretedPrepared)
+	reinterpretedProposal := proposal
+	reinterpretedProposal.PreparedEditDigest = digest(reinterpretedPreparedRaw)
+
 	tests := []struct {
 		name         string
 		proposal     []byte
@@ -113,6 +119,11 @@ func TestDecodeFrozenProposal_RejectsExactAndCrossSplicedWire(t *testing.T) {
 		{
 			name: "unsafe active restore", proposal: mustMarshal(t, unsafeProposal),
 			prepared: unsafePreparedRaw, baseSnapshot: fixture.BaseSnapshot,
+		},
+		{
+			name:     "v1 wire reinterpreted as v2",
+			proposal: mustMarshal(t, reinterpretedProposal),
+			prepared: reinterpretedPreparedRaw, baseSnapshot: fixture.BaseSnapshot,
 		},
 	}
 	for _, testCase := range tests {

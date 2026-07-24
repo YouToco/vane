@@ -25,8 +25,9 @@ import (
 )
 
 const (
-	proposalWireVersion = "vane.task-definition-edit-proposal/v1"
-	preparedWireVersion = "v1"
+	proposalWireVersion   = "vane.task-definition-edit-proposal/v1"
+	preparedWireVersionV1 = "v1"
+	preparedWireVersionV2 = "v2"
 
 	maxProposalBytes       = 64 << 10
 	maxDefinitionBytes     = 2 << 20
@@ -36,7 +37,8 @@ const (
 	maxReferenceBytes      = 1024
 	maxTaskIDBytes         = 255
 	retainedIDScheme       = "v1"
-	retainedFingerprint    = "v2"
+	retainedFingerprintV1  = "v1"
+	retainedFingerprintV2  = "v2"
 	retainedRuntime        = "compiled-snapshot/v1"
 	retainedEditNoteRoot   = "vane/task-definition-edit/v1"
 	retainedActivationNote = "vane/task-schedule/v1:definition-committed"
@@ -549,8 +551,7 @@ func validateProposal(
 }
 
 func validatePrepared(proposal ProposalV1, prepared PreparedEditV1) error {
-	if prepared.WireVersion != preparedWireVersion ||
-		prepared.OperationID != proposal.OperationID ||
+	if prepared.OperationID != proposal.OperationID ||
 		!validIdentifier(prepared.OperationID, maxOperationIDBytes) {
 		return invalid("validate prepared identity", errors.New("operation identity differs"))
 	}
@@ -574,7 +575,6 @@ func validatePrepared(proposal ProposalV1, prepared PreparedEditV1) error {
 	}
 	creation := prepared.Creation
 	if creation.IDSchemeVersion != retainedIDScheme ||
-		creation.FingerprintVersion != retainedFingerprint ||
 		creation.TenantID != proposal.Target.TenantID ||
 		creation.UserID != proposal.Target.UserID || creation.TaskID != proposal.Target.TaskID ||
 		!validIdentifier(creation.OperationID, maxOperationIDBytes) ||
@@ -584,7 +584,28 @@ func validatePrepared(proposal ProposalV1, prepared PreparedEditV1) error {
 		!validIdentifier(creation.ConverterID, maxReferenceBytes) {
 		return invalid("validate creation ownership", errors.New("creation provenance is invalid"))
 	}
-	if err := validateActionOwner(creation.Action, creation); err != nil {
+	switch prepared.WireVersion {
+	case preparedWireVersionV1:
+		if creation.FingerprintVersion != retainedFingerprintV2 {
+			return invalid(
+				"validate creation ownership",
+				errors.New("definition edit v1 requires retained v2 creation provenance"),
+			)
+		}
+	case preparedWireVersionV2:
+		if creation.FingerprintVersion != retainedFingerprintV1 {
+			return invalid(
+				"validate creation ownership",
+				errors.New("definition edit v2 requires retained v1 creation provenance"),
+			)
+		}
+	default:
+		return invalid(
+			"validate prepared identity",
+			errors.New("prepared wire version is unsupported"),
+		)
+	}
+	if err := validateCreationAction(creation.Action, creation); err != nil {
 		return invalid("validate creation action", err)
 	}
 	if err := validateTiming(creation.Timing); err != nil {
@@ -754,6 +775,19 @@ func representationForPhase(prepared PreparedEditV1, phase SnapshotPhaseV1) (Rep
 	default:
 		return RepresentationV1{}, false
 	}
+}
+
+func validateCreationAction(action PreparedActionV1, creation PreparedCreationV1) error {
+	if creation.FingerprintVersion != retainedFingerprintV1 {
+		return validateActionOwner(action, creation)
+	}
+	if action.Params.TenantID != 0 || action.Params.ExecutionMode != "" ||
+		action.Params.RuntimeVersion != "" {
+		return errors.New("retained v1 creation action is not in its legacy shape")
+	}
+	action.Params.TenantID = creation.TenantID
+	action.Params.ExecutionMode = "compiled"
+	return validateActionOwner(action, creation)
 }
 
 func validateActionOwner(action PreparedActionV1, creation PreparedCreationV1) error {
