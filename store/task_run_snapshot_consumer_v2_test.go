@@ -228,9 +228,6 @@ func TestCompiledSourceSideEffectsRemainPinnedToV1(t *testing.T) {
 			if !ok || function.Body == nil {
 				continue
 			}
-			if function.Name.Name == "validateFrozenTaskRunSourceSetV1" {
-				continue
-			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
 				call, ok := node.(*ast.CallExpr)
 				if !ok {

@@ -296,6 +296,7 @@ type Activities struct {
 	snapshotV2ShadowCanaryTaskID    string
 	compiledSnapshotV2AuditReader   CompiledRunSnapshotV2AuditReader
 	snapshotV2ReadAuditCanaryTaskID string
+	snapshotV2ReadAuditTimeout      time.Duration
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding
@@ -364,7 +365,8 @@ func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, f
 	aggHeader func(task string, n int) (title, template string), opts ...ActivitiesOption) *Activities {
 	a := &Activities{fetcher: f, scorer: sc, cardgen: cg, pusher: p, store: st, feishu: fs,
 		evolver: ev, buildNotice: buildNotice,
-		buildAggCard: buildAggCard, aggHeader: aggHeader}
+		buildAggCard: buildAggCard, aggHeader: aggHeader,
+		snapshotV2ReadAuditTimeout: 2 * time.Second}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(a)
@@ -747,7 +749,11 @@ func (a *Activities) auditCompiledSnapshotV2(
 		expected.TaskID != a.snapshotV2ReadAuditCanaryTaskID {
 		return
 	}
-	auditCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	timeout := a.snapshotV2ReadAuditTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	auditCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	result, err := a.compiledSnapshotV2AuditReader.
 		AuditCompiledTaskRunSnapshotV2(auditCtx, expected, ref)

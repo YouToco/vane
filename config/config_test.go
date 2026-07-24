@@ -43,17 +43,32 @@ func TestSnapshotV2ShadowCanaryScheduleIDValidation(t *testing.T) {
 
 func TestSnapshotV2ReadAuditCanaryValidation(t *testing.T) {
 	tests := []struct {
-		name      string
-		compiled  bool
-		shadow    string
-		readAudit string
-		want      string
-		wantErr   bool
+		name           string
+		compiled       bool
+		compiledCanary string
+		allowAll       bool
+		shadow         string
+		readAudit      string
+		want           string
+		wantErr        bool
 	}{
 		{name: "off"},
 		{
 			name: "exact match", compiled: true,
-			shadow: "push-shadow-canary", readAudit: " push-shadow-canary ",
+			compiledCanary: "push-shadow-canary",
+			shadow:         "push-shadow-canary", readAudit: " push-shadow-canary ",
+			want: "push-shadow-canary",
+		},
+		{
+			name: "compiled rollout task differs", compiled: true,
+			compiledCanary: "push-compiled-other",
+			shadow:         "push-shadow-canary", readAudit: "push-shadow-canary",
+			wantErr: true,
+		},
+		{
+			name: "compiled allow all contains audit task", compiled: true,
+			allowAll: true,
+			shadow:   "push-shadow-canary", readAudit: "push-shadow-canary",
 			want: "push-shadow-canary",
 		},
 		{
@@ -79,7 +94,8 @@ func TestSnapshotV2ReadAuditCanaryValidation(t *testing.T) {
 				DB: DBConfig{URL: "postgres://test"},
 				Pipeline: PipelineConfig{
 					CompiledRuntimeEnabled:              test.compiled,
-					CompiledRuntimeCanaryScheduleID:     "push-shadow-canary",
+					CompiledRuntimeCanaryScheduleID:     test.compiledCanary,
+					CompiledRuntimeAllowAll:             test.allowAll,
 					SnapshotV2ShadowCanaryScheduleID:    test.shadow,
 					SnapshotV2ReadAuditCanaryScheduleID: test.readAudit,
 				},

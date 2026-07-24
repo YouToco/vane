@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -211,6 +213,100 @@ func TestFinishSnapshotShadowRunStrictExit(t *testing.T) {
 				t.Fatalf("stdout/stderr = %q/%q", stdout.String(), stderr.String())
 			}
 		})
+	}
+}
+
+func TestCollectSnapshotShadowAuditScansFrozenPrefix(t *testing.T) {
+	firstCursor := int64(1)
+	var afters []int64
+	load := func(
+		_ context.Context,
+		_ string,
+		_ time.Time,
+		afterID int64,
+		_ int64,
+		limit int,
+	) (store.TaskRunSnapshotShadowAuditPage, error) {
+		afters = append(afters, afterID)
+		if limit != 1 {
+			t.Fatalf("limit = %d, want 1", limit)
+		}
+		if afterID == 0 {
+			return store.TaskRunSnapshotShadowAuditPage{
+				Items: []store.TaskRunSnapshotShadowAuditItem{{
+					SnapshotID: 1, Status: store.TaskRunSnapshotShadowProjectionMismatch,
+					TypedAuditStatus: store.CompiledRunSnapshotV2AuditNonMatch,
+				}},
+				Next: &firstCursor,
+			}, nil
+		}
+		if afterID != firstCursor {
+			t.Fatalf("unexpected cursor %d", afterID)
+		}
+		return store.TaskRunSnapshotShadowAuditPage{
+			Items: []store.TaskRunSnapshotShadowAuditItem{{
+				SnapshotID: 2, Status: store.TaskRunSnapshotShadowMatch,
+				TypedAuditStatus: store.CompiledRunSnapshotV2AuditMatch,
+				TypedEqual:       true,
+			}},
+		}, nil
+	}
+	page, err := collectSnapshotShadowAudit(
+		t.Context(), "task", time.Now(), 2, 1, 2, load)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || len(afters) != 2 ||
+		afters[0] != 0 || afters[1] != 1 {
+		t.Fatalf("collected page/afters = %+v/%v", page, afters)
+	}
+	var stdout, stderr bytes.Buffer
+	if got := finishSnapshotShadowRun(
+		&stdout, &stderr, page, 2, nil); got != exitVerifyFailed {
+		t.Fatalf("bad frozen prefix exit = %d, want %d", got, exitVerifyFailed)
+	}
+}
+
+func TestCollectSnapshotShadowAuditLimitOneExpectedTwoPasses(t *testing.T) {
+	cursor := int64(1)
+	load := func(
+		_ context.Context,
+		_ string,
+		_ time.Time,
+		afterID int64,
+		_ int64,
+		_ int,
+	) (store.TaskRunSnapshotShadowAuditPage, error) {
+		item := store.TaskRunSnapshotShadowAuditItem{
+			SnapshotID: afterID + 1, Status: store.TaskRunSnapshotShadowMatch,
+			TypedAuditStatus: store.CompiledRunSnapshotV2AuditMatch,
+			TypedEqual:       true,
+		}
+		if afterID == 0 {
+			return store.TaskRunSnapshotShadowAuditPage{
+				Items: []store.TaskRunSnapshotShadowAuditItem{item},
+				Next:  &cursor,
+			}, nil
+		}
+		return store.TaskRunSnapshotShadowAuditPage{
+			Items: []store.TaskRunSnapshotShadowAuditItem{item},
+		}, nil
+	}
+	page, err := collectSnapshotShadowAudit(
+		t.Context(), "task", time.Now(), 2, 1, 2, load)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if got := finishSnapshotShadowRun(
+		&stdout, &stderr, page, 2, nil); got != exitOK {
+		t.Fatalf("complete two-page sample exit = %d, want %d", got, exitOK)
+	}
+}
+
+func TestRunSnapshotShadowRejectsAfterID(t *testing.T) {
+	if got := runSnapshotShadow([]string{"-after-id", "1"}); got != exitFailure {
+		t.Fatalf("after-id escape exit = %d, want %d", got, exitFailure)
 	}
 }
 

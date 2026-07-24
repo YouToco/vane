@@ -127,6 +127,7 @@ type compiledRunStoreFake struct {
 	shadowCreates          int
 	auditResult            store.CompiledRunSnapshotV2AuditResult
 	auditErr               error
+	auditBlock             bool
 
 	dueSources         []types.Source
 	candidates         []types.ContentItem
@@ -210,14 +211,19 @@ func (f *compiledRunStoreFake) LoadCompiledTaskRunSnapshotV1(
 }
 
 func (f *compiledRunStoreFake) AuditCompiledTaskRunSnapshotV2(
-	_ context.Context,
+	ctx context.Context,
 	identity types.RunIdentity,
 	_ types.RunSnapshotRef,
 ) (store.CompiledRunSnapshotV2AuditResult, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.auditIdentities = append(f.auditIdentities, identity)
-	return f.auditResult, f.auditErr
+	result, err, block := f.auditResult, f.auditErr, f.auditBlock
+	f.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return store.CompiledRunSnapshotV2AuditResult{}, ctx.Err()
+	}
+	return result, err
 }
 
 func (f *compiledRunStoreFake) AuthorizeTaskRunSideEffect(
@@ -855,6 +861,40 @@ func TestPrepareRun_SnapshotV2ReadAuditIsExactAndAfterV1Authorization(t *testing
 				t.Fatalf("audit calls = %d, want %d", got, test.wantCalls)
 			}
 		})
+	}
+}
+
+func TestPrepareRun_SnapshotV2ReadAuditTimeoutKeepsV1Result(t *testing.T) {
+	identity := testActivityIdentity(7, 9, "task-read-audit-timeout")
+	compiledStore := &compiledRunStoreFake{
+		authorize: true, auditBlock: true,
+	}
+	a := NewActivities(
+		new(compiledRouteFetcherFake), fakeScorer{}, fakeCardGen{},
+		&fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledRuntimeV1(
+			compiledStore,
+			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+				return runtimepolicy.BundleV1{SchemaVersion: "audit-timeout-policy"}, nil
+			},
+			new(compiledModelResolverFake)),
+		WithSnapshotV2ReadAuditCanary(compiledStore, identity.TaskID),
+	)
+	a.snapshotV2ReadAuditTimeout = 20 * time.Millisecond
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.PrepareRun)
+	started := time.Now()
+	result, err := executePrepareRun(t, env, a, PushParams{
+		TenantID: identity.TenantID, UserID: identity.UserID,
+		RunKind: PushRunKindScheduled, ExecutionMode: types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeSnapshotV1, ScheduleID: identity.TaskID,
+	})
+	if err != nil || !result.Authorized {
+		t.Fatalf("v1 result changed by audit timeout: %+v, %v", result, err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("audit timeout was not bounded: %v", elapsed)
 	}
 }
 

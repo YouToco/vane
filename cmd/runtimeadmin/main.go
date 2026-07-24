@@ -104,7 +104,6 @@ func runSnapshotShadow(args []string) int {
 	fs.SetOutput(os.Stderr)
 	taskID := fs.String("task", "", "exact canary task id")
 	rawSince := fs.String("since", "", "inclusive RFC3339 canary start")
-	afterID := fs.Int64("after-id", 0, "exclusive snapshot id cursor")
 	throughID := fs.Int64("through-id", 0, "inclusive frozen snapshot id ceiling")
 	expectedCount := fs.Int("expected-count", 0, "exact number of rows required")
 	limit := fs.Int("limit", 100, "page size (1-1000)")
@@ -134,10 +133,53 @@ func runSnapshotShadow(args []string) int {
 		return exitFailure
 	}
 	defer st.Close()
-	page, err := st.AuditTaskRunSnapshotShadowsV2Through(
-		ctx, *taskID, since, *afterID, *throughID, *limit)
+	page, err := collectSnapshotShadowAudit(
+		ctx, *taskID, since, *throughID, *limit, *expectedCount,
+		st.AuditTaskRunSnapshotShadowsV2Through)
 	return finishSnapshotShadowRun(
 		os.Stdout, os.Stderr, page, *expectedCount, err)
+}
+
+type snapshotShadowPageLoader func(
+	context.Context, string, time.Time, int64, int64, int,
+) (store.TaskRunSnapshotShadowAuditPage, error)
+
+// collectSnapshotShadowAudit always starts at zero and follows Store-issued
+// cursors through the complete frozen interval. The CLI deliberately exposes
+// no after-id escape hatch: an operator cannot present a clean suffix while
+// skipping a bad prefix.
+func collectSnapshotShadowAudit(
+	ctx context.Context,
+	taskID string,
+	since time.Time,
+	throughID int64,
+	limit int,
+	expectedCount int,
+	load snapshotShadowPageLoader,
+) (store.TaskRunSnapshotShadowAuditPage, error) {
+	collected := store.TaskRunSnapshotShadowAuditPage{
+		Items: make([]store.TaskRunSnapshotShadowAuditItem, 0, expectedCount),
+	}
+	var afterID int64
+	for {
+		page, err := load(ctx, taskID, since, afterID, throughID, limit)
+		if err != nil {
+			return store.TaskRunSnapshotShadowAuditPage{}, err
+		}
+		collected.Items = append(collected.Items, page.Items...)
+		if len(collected.Items) > expectedCount {
+			return collected, nil
+		}
+		if page.Next == nil {
+			return collected, nil
+		}
+		if *page.Next <= afterID || *page.Next >= throughID {
+			return store.TaskRunSnapshotShadowAuditPage{},
+				types.NewAppError(types.CodeValidation,
+					"snapshot shadow audit cursor is invalid", nil)
+		}
+		afterID = *page.Next
+	}
 }
 
 func finishSnapshotShadowRun(

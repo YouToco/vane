@@ -395,6 +395,10 @@ func (c *Config) Validate() error {
 	if readAuditCanaryID != "" && readAuditCanaryID != shadowCanaryID {
 		return errors.New("config: snapshot v2 read audit canary 必须精确等于 shadow canary")
 	}
+	if readAuditCanaryID != "" && !c.Pipeline.CompiledRuntimeAllowAll &&
+		compiledCanaryID != readAuditCanaryID {
+		return errors.New("config: snapshot v2 read audit canary 必须位于 compiled runtime rollout")
+	}
 	c.Pipeline.SnapshotV2ReadAuditCanaryScheduleID = readAuditCanaryID
 
 	if c.Server.Addr == "" {

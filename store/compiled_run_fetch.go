@@ -316,17 +316,3 @@ func loadFrozenTaskRunSourceV1(
 	return taskRunSourceIdentityV1{}, taskRunValidationError(
 		"compiled source is outside the frozen task scope")
 }
-
-func validateFrozenTaskRunSourceSetV1(
-	ctx context.Context,
-	tx pgx.Tx,
-	expected types.RunIdentity,
-	sourceIDs []int64,
-) error {
-	for _, sourceID := range sourceIDs {
-		if _, err := loadFrozenTaskRunSourceV1(ctx, tx, expected, sourceID); err != nil {
-			return err
-		}
-	}
-	return nil
-}

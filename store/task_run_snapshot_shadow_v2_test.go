@@ -606,15 +606,39 @@ func TestTaskRunSnapshotShadowV2HasOnlyAuditRuntimeConsumer(t *testing.T) {
 	for _, forbidden := range []string{
 		"FROM schedules",
 		"JOIN schedules",
-		"task_definition_versions",
+		"task_approved_definition_versions",
 		"task_adaptive_states",
-		"loadApprovedDefinition",
-		"loadAdaptiveState",
 	} {
 		if bytes.Contains(reader, []byte(forbidden)) {
 			t.Errorf("retained v2 audit reader reached current state via %q", forbidden)
 		}
 	}
+	readerFile, err := parser.ParseFile(
+		token.NewFileSet(), "task_run_snapshot_consumer_v2.go", reader, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forbiddenHelpers := map[string]bool{
+		"GetCurrentApprovedDefinition":          true,
+		"GetApprovedDefinitionVersion":          true,
+		"GetAdaptiveStateForDefinition":         true,
+		"loadApprovedDefinitionVersionTx":       true,
+		"loadApprovedDefinitionByApprovalRefTx": true,
+		"loadAdaptiveStateTx":                   true,
+	}
+	ast.Inspect(readerFile, func(node ast.Node) bool {
+		var name string
+		switch expression := node.(type) {
+		case *ast.Ident:
+			name = expression.Name
+		case *ast.SelectorExpr:
+			name = expression.Sel.Name
+		}
+		if forbiddenHelpers[name] {
+			t.Errorf("retained v2 audit reader reached current state helper %q", name)
+		}
+		return true
+	})
 }
 
 func TestTaskRunSnapshotShadowV2CompositeParentFence(t *testing.T) {
