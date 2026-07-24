@@ -31,11 +31,12 @@ import (
 )
 
 const (
-	exitOK              = 0
-	exitVerifyFailed    = 1
-	exitFailure         = 2
-	exitVerifyMorePages = 3
-	runTimeout          = 2 * time.Minute
+	exitOK                      = 0
+	exitVerifyFailed            = 1
+	exitFailure                 = 2
+	exitVerifyMorePages         = 3
+	runTimeout                  = 2 * time.Minute
+	maxSnapshotShadowAuditItems = 1000
 )
 
 func main() {
@@ -104,15 +105,16 @@ func runSnapshotShadow(args []string) int {
 	fs.SetOutput(os.Stderr)
 	taskID := fs.String("task", "", "exact canary task id")
 	rawSince := fs.String("since", "", "inclusive RFC3339 canary start")
-	afterID := fs.Int64("after-id", 0, "exclusive snapshot id cursor")
+	expectedCount := fs.Int("expected-count", 0, "exact number of rows required")
 	limit := fs.Int("limit", 100, "page size (1-1000)")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
 	since, err := time.Parse(time.RFC3339, *rawSince)
-	if err != nil || *taskID == "" {
+	if err != nil || *taskID == "" || *expectedCount <= 0 {
 		fmt.Fprintln(os.Stderr,
-			"runtimeadmin: snapshot-shadow requires -task and RFC3339 -since")
+			"runtimeadmin: snapshot-shadow requires -task, RFC3339 -since, "+
+				"and -expected-count")
 		return exitFailure
 	}
 	cfg, err := config.Load("")
@@ -131,15 +133,73 @@ func runSnapshotShadow(args []string) int {
 		return exitFailure
 	}
 	defer st.Close()
-	page, err := st.AuditTaskRunSnapshotShadowsV2(
-		ctx, *taskID, since, *afterID, *limit)
-	return finishSnapshotShadowRun(os.Stdout, os.Stderr, page, err)
+	scope, err := st.FreezeTaskRunSnapshotShadowAuditScope(ctx, *taskID, since)
+	if err != nil {
+		return finishSnapshotShadowRun(
+			os.Stdout, os.Stderr, store.TaskRunSnapshotShadowAuditPage{},
+			*expectedCount, err)
+	}
+	if scope.Count <= 0 || scope.Count > maxSnapshotShadowAuditItems ||
+		int64(*expectedCount) != scope.Count {
+		return finishSnapshotShadowRun(
+			os.Stdout, os.Stderr, store.TaskRunSnapshotShadowAuditPage{},
+			*expectedCount, types.NewAppError(types.CodeValidation,
+				"snapshot shadow audit scope does not match the asserted count", nil))
+	}
+	page, err := collectSnapshotShadowAudit(
+		ctx, *taskID, since, scope.ThroughID, *limit, int(scope.Count),
+		st.AuditTaskRunSnapshotShadowsV2Through)
+	return finishSnapshotShadowRun(
+		os.Stdout, os.Stderr, page, *expectedCount, err)
+}
+
+type snapshotShadowPageLoader func(
+	context.Context, string, time.Time, int64, int64, int,
+) (store.TaskRunSnapshotShadowAuditPage, error)
+
+// collectSnapshotShadowAudit always starts at zero and follows Store-issued
+// cursors through the complete frozen interval. The CLI deliberately exposes
+// no after-id escape hatch: an operator cannot present a clean suffix while
+// skipping a bad prefix.
+func collectSnapshotShadowAudit(
+	ctx context.Context,
+	taskID string,
+	since time.Time,
+	throughID int64,
+	limit int,
+	frozenCount int,
+	load snapshotShadowPageLoader,
+) (store.TaskRunSnapshotShadowAuditPage, error) {
+	collected := store.TaskRunSnapshotShadowAuditPage{
+		Items: make([]store.TaskRunSnapshotShadowAuditItem, 0, frozenCount),
+	}
+	var afterID int64
+	for {
+		page, err := load(ctx, taskID, since, afterID, throughID, limit)
+		if err != nil {
+			return store.TaskRunSnapshotShadowAuditPage{}, err
+		}
+		collected.Items = append(collected.Items, page.Items...)
+		if len(collected.Items) > frozenCount {
+			return collected, nil
+		}
+		if page.Next == nil {
+			return collected, nil
+		}
+		if *page.Next <= afterID || *page.Next >= throughID {
+			return store.TaskRunSnapshotShadowAuditPage{},
+				types.NewAppError(types.CodeValidation,
+					"snapshot shadow audit cursor is invalid", nil)
+		}
+		afterID = *page.Next
+	}
 }
 
 func finishSnapshotShadowRun(
 	stdout io.Writer,
 	stderr io.Writer,
 	page store.TaskRunSnapshotShadowAuditPage,
+	expectedCount int,
 	runErr error,
 ) int {
 	if runErr != nil {
@@ -153,11 +213,13 @@ func finishSnapshotShadowRun(
 		fmt.Fprintln(stderr, "runtimeadmin: 输出结果失败")
 		return exitFailure
 	}
-	if len(page.Items) == 0 {
+	if len(page.Items) == 0 || len(page.Items) != expectedCount {
 		return exitVerifyFailed
 	}
 	for _, item := range page.Items {
-		if item.Status != store.TaskRunSnapshotShadowMatch {
+		if item.Status != store.TaskRunSnapshotShadowMatch ||
+			item.TypedAuditStatus != store.CompiledRunSnapshotV2AuditMatch ||
+			!item.TypedEqual {
 			return exitVerifyFailed
 		}
 	}

@@ -122,8 +122,12 @@ type compiledRunStoreFake struct {
 	createIdentities       []types.RunIdentity
 	loadSnapshotIdentities []types.RunIdentity
 	authorizeIdentities    []types.RunIdentity
+	auditIdentities        []types.RunIdentity
 	createPolicies         []runtimepolicy.BundleV1
 	shadowCreates          int
+	auditResult            store.CompiledRunSnapshotV2AuditResult
+	auditErr               error
+	auditBlock             bool
 
 	dueSources         []types.Source
 	candidates         []types.ContentItem
@@ -204,6 +208,22 @@ func (f *compiledRunStoreFake) LoadCompiledTaskRunSnapshotV1(
 		return runcontext.CompiledSnapshotV1{Ref: ref, Mode: types.ExecutionModeCompiled}, nil
 	}
 	return cloneCompiledSnapshot(f.snapshot), nil
+}
+
+func (f *compiledRunStoreFake) AuditCompiledTaskRunSnapshotV2(
+	ctx context.Context,
+	identity types.RunIdentity,
+	_ types.RunSnapshotRef,
+) (store.CompiledRunSnapshotV2AuditResult, error) {
+	f.mu.Lock()
+	f.auditIdentities = append(f.auditIdentities, identity)
+	result, err, block := f.auditResult, f.auditErr, f.auditBlock
+	f.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return store.CompiledRunSnapshotV2AuditResult{}, ctx.Err()
+	}
+	return result, err
 }
 
 func (f *compiledRunStoreFake) AuthorizeTaskRunSideEffect(
@@ -752,7 +772,10 @@ func TestPrepareRun_CreatesThenRecoversExactReferenceBeforeCurrentState(t *testi
 
 func TestPrepareRun_SnapshotV2ShadowUsesExactCanaryAndV1Wire(t *testing.T) {
 	identity := testActivityIdentity(7, 9, "task-shadow-canary")
-	compiledStore := &compiledRunStoreFake{authorize: true}
+	compiledStore := &compiledRunStoreFake{
+		authorize: true,
+		auditErr:  errors.New("injected observation failure"),
+	}
 	resolver := new(compiledModelResolverFake)
 	builder := func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
 		return runtimepolicy.BundleV1{SchemaVersion: "shadow-policy"}, nil
@@ -760,7 +783,8 @@ func TestPrepareRun_SnapshotV2ShadowUsesExactCanaryAndV1Wire(t *testing.T) {
 	a := NewActivities(new(compiledRouteFetcherFake), fakeScorer{}, fakeCardGen{},
 		&fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
 		WithCompiledRuntimeV1(compiledStore, builder, resolver),
-		WithSnapshotV2ShadowCanary(compiledStore, identity.TaskID))
+		WithSnapshotV2ShadowCanary(compiledStore, identity.TaskID),
+		WithSnapshotV2ReadAuditCanary(compiledStore, identity.TaskID))
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestActivityEnvironment()
 	env.RegisterActivity(a.PrepareRun)
@@ -776,9 +800,101 @@ func TestPrepareRun_SnapshotV2ShadowUsesExactCanaryAndV1Wire(t *testing.T) {
 	}
 	compiledStore.mu.Lock()
 	shadowCreates := compiledStore.shadowCreates
+	auditCalls := len(compiledStore.auditIdentities)
 	compiledStore.mu.Unlock()
 	if shadowCreates != 1 {
 		t.Fatalf("shadow creates = %d, want 1", shadowCreates)
+	}
+	if auditCalls != 1 {
+		t.Fatalf("audit calls = %d, want 1", auditCalls)
+	}
+}
+
+func TestPrepareRun_SnapshotV2ReadAuditIsExactAndAfterV1Authorization(t *testing.T) {
+	tests := []struct {
+		name      string
+		canaryID  string
+		authorize bool
+		loadErr   error
+		wantCalls int
+	}{
+		{name: "exact authorized", canaryID: "task-read-audit", authorize: true, wantCalls: 1},
+		{name: "outside exact task", canaryID: "task-other", authorize: true},
+		{name: "unauthorized", canaryID: "task-read-audit"},
+		{
+			name: "v1 load failed", canaryID: "task-read-audit", authorize: true,
+			loadErr: errors.New("injected v1 read failure"),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			identity := testActivityIdentity(7, 9, "task-read-audit")
+			compiledStore := &compiledRunStoreFake{
+				authorize: test.authorize, loadSnapshotErr: test.loadErr,
+				auditResult: store.CompiledRunSnapshotV2AuditResult{
+					Status: store.CompiledRunSnapshotV2AuditMatch, TypedEqual: true,
+				},
+			}
+			a := NewActivities(
+				new(compiledRouteFetcherFake), fakeScorer{}, fakeCardGen{},
+				&fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
+				WithCompiledRuntimeV1(
+					compiledStore,
+					func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+						return runtimepolicy.BundleV1{SchemaVersion: "audit-policy"}, nil
+					},
+					new(compiledModelResolverFake)),
+				WithSnapshotV2ReadAuditCanary(compiledStore, test.canaryID),
+			)
+			var suite testsuite.WorkflowTestSuite
+			env := suite.NewTestActivityEnvironment()
+			env.RegisterActivity(a.PrepareRun)
+			_, _ = executePrepareRun(t, env, a, PushParams{
+				TenantID: identity.TenantID, UserID: identity.UserID,
+				RunKind: PushRunKindScheduled, ExecutionMode: types.ExecutionModeCompiled,
+				RuntimeVersion: CompiledRuntimeSnapshotV1, ScheduleID: identity.TaskID,
+			})
+			compiledStore.mu.Lock()
+			got := len(compiledStore.auditIdentities)
+			compiledStore.mu.Unlock()
+			if got != test.wantCalls {
+				t.Fatalf("audit calls = %d, want %d", got, test.wantCalls)
+			}
+		})
+	}
+}
+
+func TestPrepareRun_SnapshotV2ReadAuditTimeoutKeepsV1Result(t *testing.T) {
+	identity := testActivityIdentity(7, 9, "task-read-audit-timeout")
+	compiledStore := &compiledRunStoreFake{
+		authorize: true, auditBlock: true,
+	}
+	a := NewActivities(
+		new(compiledRouteFetcherFake), fakeScorer{}, fakeCardGen{},
+		&fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledRuntimeV1(
+			compiledStore,
+			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+				return runtimepolicy.BundleV1{SchemaVersion: "audit-timeout-policy"}, nil
+			},
+			new(compiledModelResolverFake)),
+		WithSnapshotV2ReadAuditCanary(compiledStore, identity.TaskID),
+	)
+	a.snapshotV2ReadAuditTimeout = 20 * time.Millisecond
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.PrepareRun)
+	started := time.Now()
+	result, err := executePrepareRun(t, env, a, PushParams{
+		TenantID: identity.TenantID, UserID: identity.UserID,
+		RunKind: PushRunKindScheduled, ExecutionMode: types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeSnapshotV1, ScheduleID: identity.TaskID,
+	})
+	if err != nil || !result.Authorized {
+		t.Fatalf("v1 result changed by audit timeout: %+v, %v", result, err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("audit timeout was not bounded: %v", elapsed)
 	}
 }
 

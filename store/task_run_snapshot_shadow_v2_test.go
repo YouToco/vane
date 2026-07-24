@@ -12,7 +12,9 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -505,7 +507,7 @@ func TestTaskRunSnapshotShadowV2RejectsReSealedFalseMatch(t *testing.T) {
 	}
 }
 
-func TestTaskRunSnapshotShadowV2HasNoRuntimeConsumer(t *testing.T) {
+func TestTaskRunSnapshotShadowV2HasOnlyAuditRuntimeConsumer(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("cannot locate shadow test")
@@ -514,15 +516,22 @@ func TestTaskRunSnapshotShadowV2HasNoRuntimeConsumer(t *testing.T) {
 	allowedTableReferences := map[string]bool{
 		filepath.Clean(filepath.Join(repoRoot, "store", "task_run_snapshot_shadow_v2.go")):    true,
 		filepath.Clean(filepath.Join(repoRoot, "store", "task_run_snapshot_shadow_audit.go")): true,
+		filepath.Clean(filepath.Join(repoRoot, "store", "task_run_snapshot_consumer_v2.go")):  true,
 		filepath.Clean(filepath.Join(repoRoot, "store", "tenant_purge.go")):                   true,
 	}
 	allowedCalls := map[string]bool{
-		"CreateOrGetCompiledRunSnapshotShadowV2|workflow/activities.go|PrepareRun": true,
-		"AuditTaskRunSnapshotShadowsV2|cmd/runtimeadmin/main.go|runSnapshotShadow": true,
+		"CreateOrGetCompiledRunSnapshotShadowV2|workflow/activities.go|PrepareRun":                                   true,
+		"AuditCompiledTaskRunSnapshotV2|workflow/activities.go|auditCompiledSnapshotV2":                              true,
+		"AuditTaskRunSnapshotShadowsV2Through|cmd/runtimeadmin/main.go|runSnapshotShadow":                            true,
+		"AuditTaskRunSnapshotShadowsV2Through|store/task_run_snapshot_shadow_audit.go|AuditTaskRunSnapshotShadowsV2": true,
+		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_consumer_v2.go|AuditCompiledTaskRunSnapshotV2":       true,
+		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_shadow_audit.go|auditTaskRunSnapshotShadowsV2":       true,
 	}
 	guardedCalls := map[string]bool{
 		"CreateOrGetCompiledRunSnapshotShadowV2": true,
-		"AuditTaskRunSnapshotShadowsV2":          true,
+		"AuditCompiledTaskRunSnapshotV2":         true,
+		"AuditTaskRunSnapshotShadowsV2Through":   true,
+		"auditCompiledTaskRunSnapshotV2":         true,
 	}
 	var escaped []string
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, err error) error {
@@ -563,23 +572,19 @@ func TestTaskRunSnapshotShadowV2HasNoRuntimeConsumer(t *testing.T) {
 				continue
 			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
 				var callName string
-				switch function := call.Fun.(type) {
+				switch expression := node.(type) {
 				case *ast.Ident:
-					callName = function.Name
+					callName = expression.Name
 				case *ast.SelectorExpr:
-					callName = function.Sel.Name
+					callName = expression.Sel.Name
 				}
 				if !guardedCalls[callName] {
 					return true
 				}
 				key := fmt.Sprintf("%s|%s|%s", callName, relativePath, function.Name.Name)
 				if !allowedCalls[key] {
-					position := fileSet.Position(call.Pos())
+					position := fileSet.Position(node.Pos())
 					escaped = append(escaped, fmt.Sprintf("%s:%d calls %s from %s",
 						relativePath, position.Line, callName, function.Name.Name))
 				}
@@ -594,6 +599,105 @@ func TestTaskRunSnapshotShadowV2HasNoRuntimeConsumer(t *testing.T) {
 	if len(escaped) != 0 {
 		t.Fatalf("v2 shadow table escaped persistence/audit boundary: %v", escaped)
 	}
+
+	reader, err := os.ReadFile(filepath.Join(
+		repoRoot, "store", "task_run_snapshot_consumer_v2.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if violations := retainedV2CurrentStateViolations(reader); len(violations) != 0 {
+		t.Errorf("retained v2 audit reader reached current state: %v", violations)
+	}
+
+	for _, table := range []string{
+		"schedules", "schedule_playbooks", "schedule_sources", "subscriptions",
+		"sources", "task_approved_definition_versions", "task_adaptive_states",
+	} {
+		t.Run("reject raw sql "+table, func(t *testing.T) {
+			source := []byte("package store\nfunc injected() { _ = `SELECT * FROM " +
+				table + "` }\n")
+			if violations := retainedV2CurrentStateViolations(source); len(violations) == 0 {
+				t.Fatalf("current table %q mutation escaped guard", table)
+			}
+		})
+	}
+	for _, source := range []string{
+		"package store\nfunc injected() { _ = loadTaskRunDefinition }\n",
+		"package store\nfunc injected() { alias := loadApprovedDefinitionVersionTx; _ = alias }\n",
+		"package store\nfunc injected(s *Store) { _ = s.GetAdaptiveStateForDefinition }\n",
+		"package store\nfunc injected(s *Store) { _ = s.GetSchedulePlaybook }\n",
+		"package store\nfunc injected(s *Store) { alias := s.ListDueSourcesByUser; _ = alias }\n",
+		"package store\nfunc injected() { _ = `SELECT * FROM audit_unapproved_table` }\n",
+	} {
+		if violations := retainedV2CurrentStateViolations([]byte(source)); len(violations) == 0 {
+			t.Fatalf("current helper mutation escaped guard: %s", source)
+		}
+	}
+}
+
+func retainedV2CurrentStateViolations(source []byte) []string {
+	file, err := parser.ParseFile(token.NewFileSet(), "reader.go", source, 0)
+	if err != nil {
+		return []string{"parse_error"}
+	}
+	forbiddenTables := []string{
+		"schedules", "schedule_playbooks", "schedule_sources", "subscriptions",
+		"sources", "task_approved_definition_versions", "task_adaptive_states",
+	}
+	forbiddenHelpers := map[string]bool{
+		"loadTaskRunDefinition":                 true,
+		"loadApprovedTaskRunSources":            true,
+		"loadLegacyTaskRunSources":              true,
+		"GetSchedule":                           true,
+		"GetScheduleStrictness":                 true,
+		"GetSchedulePlaybook":                   true,
+		"ListDueSourcesBySchedule":              true,
+		"ListDueSourcesByUser":                  true,
+		"ListSubscribedSourcesByUser":           true,
+		"ListDueSourcesByIDs":                   true,
+		"GetCurrentApprovedDefinition":          true,
+		"GetApprovedDefinitionVersion":          true,
+		"GetAdaptiveStateForDefinition":         true,
+		"loadApprovedDefinitionVersionTx":       true,
+		"loadApprovedDefinitionByApprovalRefTx": true,
+		"loadAdaptiveStateTx":                   true,
+	}
+	var violations []string
+	sqlTable := regexp.MustCompile(`(?i)\b(?:from|join)\s+([a-z_][a-z0-9_]*)`)
+	allowedTables := map[string]bool{
+		"task_run_snapshots":           true,
+		"task_run_snapshot_v2_shadows": true,
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		if literal, ok := node.(*ast.BasicLit); ok && literal.Kind == token.STRING {
+			value, err := strconv.Unquote(literal.Value)
+			if err == nil {
+				value = strings.ToLower(value)
+				for _, match := range sqlTable.FindAllStringSubmatch(value, -1) {
+					if len(match) == 2 && !allowedTables[match[1]] {
+						violations = append(violations, "sql_table:"+match[1])
+					}
+				}
+				for _, table := range forbiddenTables {
+					if strings.Contains(value, table) {
+						violations = append(violations, "table:"+table)
+					}
+				}
+			}
+		}
+		var name string
+		switch expression := node.(type) {
+		case *ast.Ident:
+			name = expression.Name
+		case *ast.SelectorExpr:
+			name = expression.Sel.Name
+		}
+		if forbiddenHelpers[name] {
+			violations = append(violations, "helper:"+name)
+		}
+		return true
+	})
+	return violations
 }
 
 func TestTaskRunSnapshotShadowV2CompositeParentFence(t *testing.T) {

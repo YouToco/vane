@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -144,46 +146,169 @@ func TestFinishBaselineRunSanitizesEncodingError(t *testing.T) {
 func TestFinishSnapshotShadowRunStrictExit(t *testing.T) {
 	next := int64(7)
 	tests := []struct {
-		name string
-		page store.TaskRunSnapshotShadowAuditPage
-		want int
+		name          string
+		page          store.TaskRunSnapshotShadowAuditPage
+		expectedCount int
+		want          int
 	}{
-		{name: "empty", want: exitVerifyFailed},
+		{name: "empty", expectedCount: 1, want: exitVerifyFailed},
 		{name: "match", page: store.TaskRunSnapshotShadowAuditPage{
 			Items: []store.TaskRunSnapshotShadowAuditItem{{
 				SnapshotID: 1, Status: store.TaskRunSnapshotShadowMatch,
+				TypedAuditStatus: store.CompiledRunSnapshotV2AuditMatch,
+				TypedEqual:       true,
 			}},
-		}, want: exitOK},
+		}, expectedCount: 1, want: exitOK},
 		{name: "missing", page: store.TaskRunSnapshotShadowAuditPage{
 			Items: []store.TaskRunSnapshotShadowAuditItem{{
 				SnapshotID: 1, Status: "missing",
 			}},
-		}, want: exitVerifyFailed},
+		}, expectedCount: 1, want: exitVerifyFailed},
 		{name: "headless", page: store.TaskRunSnapshotShadowAuditPage{
 			Items: []store.TaskRunSnapshotShadowAuditItem{{
 				SnapshotID: 1, Status: store.TaskRunSnapshotShadowHeadless,
 			}},
-		}, want: exitVerifyFailed},
+		}, expectedCount: 1, want: exitVerifyFailed},
 		{name: "legacy", page: store.TaskRunSnapshotShadowAuditPage{
 			Items: []store.TaskRunSnapshotShadowAuditItem{{
 				SnapshotID: 1, Status: store.TaskRunSnapshotShadowLegacyCompatible,
 			}},
-		}, want: exitVerifyFailed},
+		}, expectedCount: 1, want: exitVerifyFailed},
 		{name: "next", page: store.TaskRunSnapshotShadowAuditPage{
 			Items: []store.TaskRunSnapshotShadowAuditItem{{
 				SnapshotID: 1, Status: store.TaskRunSnapshotShadowMatch,
+				TypedAuditStatus: store.CompiledRunSnapshotV2AuditMatch,
+				TypedEqual:       true,
 			}}, Next: &next,
-		}, want: exitVerifyMorePages},
+		}, expectedCount: 1, want: exitVerifyMorePages},
+		{name: "typed mismatch", page: store.TaskRunSnapshotShadowAuditPage{
+			Items: []store.TaskRunSnapshotShadowAuditItem{{
+				SnapshotID: 1, Status: store.TaskRunSnapshotShadowMatch,
+				TypedAuditStatus: store.CompiledRunSnapshotV2AuditTypedMismatch,
+			}},
+		}, expectedCount: 1, want: exitVerifyFailed},
+		{name: "count mismatch", page: store.TaskRunSnapshotShadowAuditPage{
+			Items: []store.TaskRunSnapshotShadowAuditItem{
+				{
+					SnapshotID: 1, Status: store.TaskRunSnapshotShadowMatch,
+					TypedAuditStatus: store.CompiledRunSnapshotV2AuditMatch,
+					TypedEqual:       true,
+				},
+				{
+					SnapshotID: 2, Status: store.TaskRunSnapshotShadowMatch,
+					TypedAuditStatus: store.CompiledRunSnapshotV2AuditMatch,
+					TypedEqual:       true,
+				},
+			},
+		}, expectedCount: 1, want: exitVerifyFailed},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			if got := finishSnapshotShadowRun(
-				&stdout, &stderr, test.page, nil); got != test.want {
+				&stdout, &stderr, test.page, test.expectedCount, nil); got != test.want {
 				t.Fatalf("exit=%d want=%d", got, test.want)
 			}
 			if stdout.Len() == 0 || stderr.Len() != 0 {
 				t.Fatalf("stdout/stderr = %q/%q", stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestCollectSnapshotShadowAuditScansFrozenPrefix(t *testing.T) {
+	firstCursor := int64(1)
+	var afters []int64
+	load := func(
+		_ context.Context,
+		_ string,
+		_ time.Time,
+		afterID int64,
+		_ int64,
+		limit int,
+	) (store.TaskRunSnapshotShadowAuditPage, error) {
+		afters = append(afters, afterID)
+		if limit != 1 {
+			t.Fatalf("limit = %d, want 1", limit)
+		}
+		if afterID == 0 {
+			return store.TaskRunSnapshotShadowAuditPage{
+				Items: []store.TaskRunSnapshotShadowAuditItem{{
+					SnapshotID: 1, Status: store.TaskRunSnapshotShadowProjectionMismatch,
+					TypedAuditStatus: store.CompiledRunSnapshotV2AuditNonMatch,
+				}},
+				Next: &firstCursor,
+			}, nil
+		}
+		if afterID != firstCursor {
+			t.Fatalf("unexpected cursor %d", afterID)
+		}
+		return store.TaskRunSnapshotShadowAuditPage{
+			Items: []store.TaskRunSnapshotShadowAuditItem{{
+				SnapshotID: 2, Status: store.TaskRunSnapshotShadowMatch,
+				TypedAuditStatus: store.CompiledRunSnapshotV2AuditMatch,
+				TypedEqual:       true,
+			}},
+		}, nil
+	}
+	page, err := collectSnapshotShadowAudit(
+		t.Context(), "task", time.Now(), 2, 1, 2, load)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || len(afters) != 2 ||
+		afters[0] != 0 || afters[1] != 1 {
+		t.Fatalf("collected page/afters = %+v/%v", page, afters)
+	}
+	var stdout, stderr bytes.Buffer
+	if got := finishSnapshotShadowRun(
+		&stdout, &stderr, page, 2, nil); got != exitVerifyFailed {
+		t.Fatalf("bad frozen prefix exit = %d, want %d", got, exitVerifyFailed)
+	}
+}
+
+func TestCollectSnapshotShadowAuditLimitOneExpectedTwoPasses(t *testing.T) {
+	cursor := int64(1)
+	load := func(
+		_ context.Context,
+		_ string,
+		_ time.Time,
+		afterID int64,
+		_ int64,
+		_ int,
+	) (store.TaskRunSnapshotShadowAuditPage, error) {
+		item := store.TaskRunSnapshotShadowAuditItem{
+			SnapshotID: afterID + 1, Status: store.TaskRunSnapshotShadowMatch,
+			TypedAuditStatus: store.CompiledRunSnapshotV2AuditMatch,
+			TypedEqual:       true,
+		}
+		if afterID == 0 {
+			return store.TaskRunSnapshotShadowAuditPage{
+				Items: []store.TaskRunSnapshotShadowAuditItem{item},
+				Next:  &cursor,
+			}, nil
+		}
+		return store.TaskRunSnapshotShadowAuditPage{
+			Items: []store.TaskRunSnapshotShadowAuditItem{item},
+		}, nil
+	}
+	page, err := collectSnapshotShadowAudit(
+		t.Context(), "task", time.Now(), 2, 1, 2, load)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if got := finishSnapshotShadowRun(
+		&stdout, &stderr, page, 2, nil); got != exitOK {
+		t.Fatalf("complete two-page sample exit = %d, want %d", got, exitOK)
+	}
+}
+
+func TestRunSnapshotShadowRejectsCallerControlledBounds(t *testing.T) {
+	for _, flag := range []string{"-after-id", "-through-id"} {
+		t.Run(flag, func(t *testing.T) {
+			if got := runSnapshotShadow([]string{flag, "1"}); got != exitFailure {
+				t.Fatalf("%s escape exit = %d, want %d", flag, got, exitFailure)
 			}
 		})
 	}

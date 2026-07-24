@@ -41,6 +41,78 @@ func TestSnapshotV2ShadowCanaryScheduleIDValidation(t *testing.T) {
 	}
 }
 
+func TestSnapshotV2ReadAuditCanaryValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		compiled       bool
+		compiledCanary string
+		allowAll       bool
+		shadow         string
+		readAudit      string
+		want           string
+		wantErr        bool
+	}{
+		{name: "off"},
+		{
+			name: "exact match", compiled: true,
+			compiledCanary: "push-shadow-canary",
+			shadow:         "push-shadow-canary", readAudit: " push-shadow-canary ",
+			want: "push-shadow-canary",
+		},
+		{
+			name: "compiled rollout task differs", compiled: true,
+			compiledCanary: "push-compiled-other",
+			shadow:         "push-shadow-canary", readAudit: "push-shadow-canary",
+			wantErr: true,
+		},
+		{
+			name: "compiled allow all contains audit task", compiled: true,
+			allowAll: true,
+			shadow:   "push-shadow-canary", readAudit: "push-shadow-canary",
+			want: "push-shadow-canary",
+		},
+		{
+			name: "compiled disabled", shadow: "push-shadow-canary",
+			readAudit: "push-shadow-canary", wantErr: true,
+		},
+		{
+			name: "writer differs", compiled: true, shadow: "push-shadow-canary",
+			readAudit: "push-other", wantErr: true,
+		},
+		{
+			name: "writer missing", compiled: true,
+			readAudit: "push-shadow-canary", wantErr: true,
+		},
+		{
+			name: "whitespace", compiled: true, shadow: "push-shadow-canary",
+			readAudit: " \t ", wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{
+				DB: DBConfig{URL: "postgres://test"},
+				Pipeline: PipelineConfig{
+					CompiledRuntimeEnabled:              test.compiled,
+					CompiledRuntimeCanaryScheduleID:     test.compiledCanary,
+					CompiledRuntimeAllowAll:             test.allowAll,
+					SnapshotV2ShadowCanaryScheduleID:    test.shadow,
+					SnapshotV2ReadAuditCanaryScheduleID: test.readAudit,
+				},
+			}
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr=%v", err, test.wantErr)
+			}
+			if !test.wantErr &&
+				cfg.Pipeline.SnapshotV2ReadAuditCanaryScheduleID != test.want {
+				t.Fatalf("read audit canary = %q, want %q",
+					cfg.Pipeline.SnapshotV2ReadAuditCanaryScheduleID, test.want)
+			}
+		})
+	}
+}
+
 // clearVaneEnv 清掉本进程可能残留的 VANE_ 环境变量，保证测试相互隔离。
 // 通过 t.Setenv("", …) 之外的 os.Unsetenv 也能配合 t.Setenv 的自动恢复：
 // 先 t.Setenv 注册恢复点，再 os.Unsetenv 真正清空。

@@ -131,6 +131,10 @@ type PipelineConfig struct {
 	// SnapshotV2ShadowCanaryScheduleID enables C2c-2 shadow persistence for
 	// exactly one task. Empty is the complete rollback/off state.
 	SnapshotV2ShadowCanaryScheduleID string `mapstructure:"snapshot_v2_shadow_canary_schedule_id"`
+	// SnapshotV2ReadAuditCanaryScheduleID enables C2c-3a observation-only
+	// typed materialization for exactly the same task as the shadow writer.
+	// Empty is the complete rollback/off state; v1 remains authoritative.
+	SnapshotV2ReadAuditCanaryScheduleID string `mapstructure:"snapshot_v2_read_audit_canary_schedule_id"`
 }
 
 // AgentConfig 是 agent loop 运行约束配置。
@@ -295,6 +299,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.compiled_runtime_canary_schedule_id", "")
 	v.SetDefault("pipeline.compiled_runtime_allow_all", false)
 	v.SetDefault("pipeline.snapshot_v2_shadow_canary_schedule_id", "")
+	v.SetDefault("pipeline.snapshot_v2_read_audit_canary_schedule_id", "")
 
 	v.SetDefault("agent.max_turns", 20)
 	v.SetDefault("agent.definition_edit_enabled", false)
@@ -376,6 +381,25 @@ func (c *Config) Validate() error {
 		return errors.New("config: pipeline.snapshot_v2_shadow_canary_schedule_id 无效")
 	}
 	c.Pipeline.SnapshotV2ShadowCanaryScheduleID = shadowCanaryID
+	rawReadAuditCanaryID := c.Pipeline.SnapshotV2ReadAuditCanaryScheduleID
+	readAuditCanaryID := strings.TrimSpace(rawReadAuditCanaryID)
+	if rawReadAuditCanaryID != "" && readAuditCanaryID == "" {
+		return errors.New("config: pipeline.snapshot_v2_read_audit_canary_schedule_id 不能仅含空白")
+	}
+	if readAuditCanaryID != "" && !validSnapshotShadowCanaryID(readAuditCanaryID) {
+		return errors.New("config: pipeline.snapshot_v2_read_audit_canary_schedule_id 无效")
+	}
+	if readAuditCanaryID != "" && !c.Pipeline.CompiledRuntimeEnabled {
+		return errors.New("config: snapshot v2 read audit canary 要求 compiled runtime 已启用")
+	}
+	if readAuditCanaryID != "" && readAuditCanaryID != shadowCanaryID {
+		return errors.New("config: snapshot v2 read audit canary 必须精确等于 shadow canary")
+	}
+	if readAuditCanaryID != "" && !c.Pipeline.CompiledRuntimeAllowAll &&
+		compiledCanaryID != readAuditCanaryID {
+		return errors.New("config: snapshot v2 read audit canary 必须位于 compiled runtime rollout")
+	}
+	c.Pipeline.SnapshotV2ReadAuditCanaryScheduleID = readAuditCanaryID
 
 	if c.Server.Addr == "" {
 		c.Server.Addr = "127.0.0.1:8080" // 与 setDefaults 一致：空值回退也只绑 loopback

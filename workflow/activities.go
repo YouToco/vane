@@ -241,6 +241,12 @@ type CompiledRunSnapshotShadowV2Store interface {
 	) (types.RunSnapshotRef, error)
 }
 
+type CompiledRunSnapshotV2AuditReader interface {
+	AuditCompiledTaskRunSnapshotV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+	) (storepkg.CompiledRunSnapshotV2AuditResult, error)
+}
+
 // CompiledPolicyBuilderV1 freezes the process's current non-secret runtime
 // policy. The boolean is the per-task result of the existing playbook rollout
 // decision, not a mutable pointer to configuration.
@@ -281,13 +287,16 @@ type Activities struct {
 	// playbookPromptsEnabled is the P1c rollout switch. A non-empty canary ID
 	// narrows injection to one real schedule; empty means all schedules once
 	// the canary has passed. Both are immutable after worker construction.
-	playbookPromptsEnabled         bool
-	playbookPromptCanaryScheduleID string
-	compiledStore                  CompiledRunStore
-	buildCompiledPolicyV1          CompiledPolicyBuilderV1
-	compiledModelResolverV1        CompiledModelResolverV1
-	compiledShadowStoreV2          CompiledRunSnapshotShadowV2Store
-	snapshotV2ShadowCanaryTaskID   string
+	playbookPromptsEnabled          bool
+	playbookPromptCanaryScheduleID  string
+	compiledStore                   CompiledRunStore
+	buildCompiledPolicyV1           CompiledPolicyBuilderV1
+	compiledModelResolverV1         CompiledModelResolverV1
+	compiledShadowStoreV2           CompiledRunSnapshotShadowV2Store
+	snapshotV2ShadowCanaryTaskID    string
+	compiledSnapshotV2AuditReader   CompiledRunSnapshotV2AuditReader
+	snapshotV2ReadAuditCanaryTaskID string
+	snapshotV2ReadAuditTimeout      time.Duration
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding
@@ -334,6 +343,19 @@ func WithSnapshotV2ShadowCanary(
 	}
 }
 
+// WithSnapshotV2ReadAuditCanary enables C2c-3a observation for exactly one
+// task. The materialized v2 view is compared and logged, then discarded; every
+// runtime consumer continues using the independently loaded pinned v1 view.
+func WithSnapshotV2ReadAuditCanary(
+	reader CompiledRunSnapshotV2AuditReader,
+	taskID string,
+) ActivitiesOption {
+	return func(a *Activities) {
+		a.compiledSnapshotV2AuditReader = reader
+		a.snapshotV2ReadAuditCanaryTaskID = taskID
+	}
+}
+
 // NewActivities 装配 Activities。前六参顺序与规格 B6"持有 fetcher/scorer/
 // cardgen/pusher/store/feishuMgr"一致；ev 可为 nil（演化灰度关闭）；
 // buildNotice 可为 nil（抓取失败告警退化为 no-op）。
@@ -343,7 +365,8 @@ func NewActivities(f Fetcher, sc Scorer, cg CardGenerator, p Pusher, st Store, f
 	aggHeader func(task string, n int) (title, template string), opts ...ActivitiesOption) *Activities {
 	a := &Activities{fetcher: f, scorer: sc, cardgen: cg, pusher: p, store: st, feishu: fs,
 		evolver: ev, buildNotice: buildNotice,
-		buildAggCard: buildAggCard, aggHeader: aggHeader}
+		buildAggCard: buildAggCard, aggHeader: aggHeader,
+		snapshotV2ReadAuditTimeout: 2 * time.Second}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(a)
@@ -648,6 +671,7 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 	if !authorized {
 		return PrepareRunResult{}, nil
 	}
+	a.auditCompiledSnapshotV2(ctx, expected, ref, "prepare_run")
 	result := PrepareRunResult{Authorized: true, Snapshot: ref}
 	if err := result.ValidateFor(expected); err != nil {
 		return PrepareRunResult{}, nonRetryable(err)
@@ -704,7 +728,62 @@ func (a *Activities) loadCompiledRunV1(
 	if err != nil {
 		return runcontext.CompiledSnapshotV1{}, true, err
 	}
+	a.auditCompiledSnapshotV2(ctx, expected, run.Snapshot, "activity_consumer")
 	return snapshot, true, nil
+}
+
+// auditCompiledSnapshotV2 is C2c-3a's only Activity-side v2 read router. It is
+// deliberately observation-only: missing/non-match/corrupt shadows are
+// visible in structured logs, but the caller always keeps the v1 value it
+// loaded before entering this helper. In particular, Definition.Sources used
+// by Fetch and hidden Store source side effects remain v1-authoritative. C2c-3b
+// must switch those consumers and Store fences together; changing only this
+// helper would create two source truths.
+func (a *Activities) auditCompiledSnapshotV2(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	stage string,
+) {
+	if a.compiledSnapshotV2AuditReader == nil ||
+		expected.TaskID != a.snapshotV2ReadAuditCanaryTaskID {
+		return
+	}
+	timeout := a.snapshotV2ReadAuditTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	auditCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	result, err := a.compiledSnapshotV2AuditReader.
+		AuditCompiledTaskRunSnapshotV2(auditCtx, expected, ref)
+	info := activity.GetInfo(ctx)
+	attrs := []any{
+		"stage", stage,
+		"activity_type", info.ActivityType.Name,
+		"activity_attempt", info.Attempt,
+		"task_id", expected.TaskID,
+		"temporal_workflow_id", expected.TemporalWorkflowID,
+		"temporal_run_id", expected.TemporalRunID,
+		"snapshot_id", ref.SnapshotID,
+		"v1_payload_digest", ref.PayloadDigest,
+		"authoritative", "v1",
+		"shadow", "v2",
+	}
+	if err != nil {
+		attrs = append(attrs,
+			"outcome", "error",
+			"error_code", types.CodeOf(err),
+			"error_type", fmt.Sprintf("%T", err))
+		slog.ErrorContext(ctx, "compiled snapshot v2 read audit", attrs...)
+		return
+	}
+	attrs = append(attrs,
+		"outcome", result.Status,
+		"shadow_status", result.ShadowStatus,
+		"shadow_payload_digest", result.ShadowPayloadDigest,
+		"typed_equal", result.TypedEqual)
+	slog.InfoContext(ctx, "compiled snapshot v2 read audit", attrs...)
 }
 
 func (a *Activities) resolveCompiledModelPolicyV1(
