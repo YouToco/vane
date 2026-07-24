@@ -47,8 +47,13 @@ func run(args []string) int {
 	if len(args) > 0 && args[0] == "snapshot-shadow" {
 		return runSnapshotShadow(args[1:])
 	}
+	if len(args) > 0 && args[0] == "snapshot-cutover" {
+		return runSnapshotCutover(args[1:])
+	}
 	if len(args) == 0 || args[0] != "baseline" {
-		fmt.Fprintln(os.Stderr, "用法: runtimeadmin baseline ... | snapshot-shadow ...")
+		fmt.Fprintln(os.Stderr,
+			"用法: runtimeadmin baseline ... | snapshot-shadow ... | "+
+				"snapshot-cutover ...")
 		return exitFailure
 	}
 	fs := flag.NewFlagSet("runtimeadmin baseline", flag.ContinueOnError)
@@ -98,6 +103,97 @@ func run(args []string) int {
 			TaskID:   *afterTask,
 		}, *limit)
 	return finishBaselineRun(os.Stdout, os.Stderr, mode, page, err)
+}
+
+func runSnapshotCutover(args []string) int {
+	fs := flag.NewFlagSet("runtimeadmin snapshot-cutover", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	tenantID := fs.Int64("tenant", 0, "exact tenant id")
+	userID := fs.Int64("user", 0, "exact task owner user id")
+	taskID := fs.String("task", "", "exact task id")
+	rawAction := fs.String(
+		"action", "status", "status、activate 或 rollback")
+	confirm := fs.Bool(
+		"confirm-cutover", false,
+		"确认 activate/rollback 会持久化 cutover event 与任务 pointer")
+	if err := fs.Parse(args); err != nil {
+		return exitFailure
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr,
+			"runtimeadmin: snapshot-cutover 不接受位置参数")
+		return exitFailure
+	}
+	if *tenantID <= 0 || *userID <= 0 || *taskID == "" {
+		fmt.Fprintln(os.Stderr,
+			"runtimeadmin: snapshot-cutover requires positive -tenant/-user "+
+				"and exact -task")
+		return exitFailure
+	}
+	var action store.TaskRunSnapshotCutoverAction
+	switch *rawAction {
+	case "status":
+	case string(store.TaskRunSnapshotCutoverActivate):
+		action = store.TaskRunSnapshotCutoverActivate
+	case string(store.TaskRunSnapshotCutoverRollback):
+		action = store.TaskRunSnapshotCutoverRollback
+	default:
+		fmt.Fprintln(os.Stderr,
+			"runtimeadmin: snapshot-cutover -action 仅支持 status、activate、rollback")
+		return exitFailure
+	}
+	if *rawAction != "status" && !*confirm {
+		fmt.Fprintln(os.Stderr,
+			"runtimeadmin: activate/rollback 必须显式提供 -confirm-cutover")
+		return exitFailure
+	}
+
+	cfg, err := config.Load("")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runtimeadmin: 加载配置失败")
+		return exitFailure
+	}
+	ctx, stop := signal.NotifyContext(
+		context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, runTimeout)
+	defer cancel()
+	st, err := store.New(ctx, cfg.DB.URL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runtimeadmin: 连接数据库失败")
+		return exitFailure
+	}
+	defer st.Close()
+
+	var output any
+	if *rawAction == "status" {
+		output, err = st.GetTaskRunSnapshotCutoverStatus(
+			ctx, *tenantID, *userID, *taskID)
+	} else {
+		output, err = st.ControlTaskRunSnapshotCutover(
+			ctx, *tenantID, *userID, *taskID, action)
+	}
+	return finishSnapshotCutoverRun(os.Stdout, os.Stderr, output, err)
+}
+
+func finishSnapshotCutoverRun(
+	stdout io.Writer,
+	stderr io.Writer,
+	output any,
+	runErr error,
+) int {
+	if runErr != nil {
+		fmt.Fprintln(stderr, "runtimeadmin: "+safeError(
+			runErr, "snapshot cutover operation failed"))
+		return exitFailure
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(output); err != nil {
+		fmt.Fprintln(stderr, "runtimeadmin: 输出结果失败")
+		return exitFailure
+	}
+	return exitOK
 }
 
 func runSnapshotShadow(args []string) int {

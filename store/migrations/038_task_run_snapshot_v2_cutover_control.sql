@@ -101,11 +101,10 @@ DECLARE
     row_ok BOOLEAN;
 BEGIN
     SELECT p.payload, p.payload_digest, sh.payload, sh.payload_digest,
-           d.payload, d.version, d.definition_digest
+           sh.approved_definition_version, sh.approved_definition_digest
       INTO parent_payload, parent_payload_digest,
            shadow_payload, shadow_payload_digest,
-           approved_payload, approved_definition_version,
-           approved_definition_digest
+           approved_definition_version, approved_definition_digest
       FROM public.task_run_snapshots p
       JOIN public.task_run_snapshot_v2_shadows sh
         ON sh.run_snapshot_id = p.id
@@ -117,27 +116,27 @@ BEGIN
        AND sh.status = 'match'
        AND sh.adaptive_version = 0
        AND sh.adaptive_digest IS NULL
-      JOIN public.task_approved_definition_versions d
-        ON d.tenant_id = sh.tenant_id
-       AND d.user_id = sh.user_id
-       AND d.task_id = sh.task_id
-       AND d.version = sh.approved_definition_version
-       AND d.definition_digest = sh.approved_definition_digest
      WHERE p.id = expected_snapshot_id;
 
     IF parent_payload IS NULL OR shadow_payload IS NULL OR
-       approved_payload IS NULL OR
+       approved_definition_version IS NULL OR
+       approved_definition_digest IS NULL OR
        encode(sha256(parent_payload), 'hex') IS DISTINCT FROM
            parent_payload_digest OR
        encode(sha256(shadow_payload), 'hex') IS DISTINCT FROM
-           shadow_payload_digest OR
-       encode(sha256(approved_payload), 'hex')
-           IS DISTINCT FROM approved_definition_digest THEN
+           shadow_payload_digest THEN
         RETURN FALSE;
     END IF;
 
     parent_json := convert_from(parent_payload, 'UTF8')::json;
     shadow_json := convert_from(shadow_payload, 'UTF8')::json;
+    approved_payload := convert_to(
+        (shadow_json #> '{approved,payload}')::text, 'UTF8');
+    IF approved_payload IS NULL OR
+       encode(sha256(approved_payload), 'hex') IS DISTINCT FROM
+           approved_definition_digest THEN
+        RETURN FALSE;
+    END IF;
     approved_json := convert_from(approved_payload, 'UTF8')::json;
 
     row_ok :=
@@ -247,10 +246,18 @@ DECLARE
     new_event_id BIGINT;
     changed BIGINT;
 BEGIN
-    IF requested_tenant_id <= 0 OR requested_user_id <= 0 OR
+    IF current_setting('role', true) IS DISTINCT FROM
+       'vane_snapshot_cutover_operator' THEN
+        RAISE EXCEPTION
+            'snapshot cutover control requires restricted operator role'
+            USING ERRCODE = '42501';
+    END IF;
+    IF requested_tenant_id IS NULL OR requested_tenant_id <= 0 OR
+       requested_user_id IS NULL OR requested_user_id <= 0 OR
        requested_task_id IS NULL OR requested_task_id = '' OR
        btrim(requested_task_id) <> requested_task_id OR
        octet_length(requested_task_id) > 255 OR
+       requested_action IS NULL OR
        requested_action NOT IN ('activate', 'rollback') THEN
         RAISE EXCEPTION 'snapshot cutover control request is invalid'
             USING ERRCODE = '22023';

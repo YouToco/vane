@@ -314,6 +314,89 @@ func TestRunSnapshotShadowRejectsCallerControlledBounds(t *testing.T) {
 	}
 }
 
+func TestRunSnapshotCutoverRequiresExactIdentityAndConfirmation(t *testing.T) {
+	for name, args := range map[string][]string{
+		"missing identity": {"-action", "status"},
+		"invalid action": {
+			"-tenant", "1", "-user", "2", "-task", "task",
+			"-action", "apply",
+		},
+		"activate unconfirmed": {
+			"-tenant", "1", "-user", "2", "-task", "task",
+			"-action", "activate",
+		},
+		"rollback unconfirmed": {
+			"-tenant", "1", "-user", "2", "-task", "task",
+			"-action", "rollback",
+		},
+		"positional carrier": {
+			"-tenant", "1", "-user", "2", "-task", "task",
+			"-action", "status", "carrier",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := runSnapshotCutover(args); got != exitFailure {
+				t.Fatalf("exit=%d want=%d", got, exitFailure)
+			}
+		})
+	}
+}
+
+func TestFinishSnapshotCutoverRunOutputsOnlySafeCarrier(t *testing.T) {
+	result := store.TaskRunSnapshotCutoverResult{
+		TenantID: 1, UserID: 2, TaskID: "task", EventID: 3,
+		Generation: 4, Action: store.TaskRunSnapshotCutoverActivate,
+		ApprovedDefinitionVersion: 5,
+		SnapshotHighWatermark:     6,
+		AuditFromSnapshotID:       1,
+		AuditCount:                6,
+		AuditThroughID:            6,
+	}
+	var stdout, stderr bytes.Buffer
+	if got := finishSnapshotCutoverRun(
+		&stdout, &stderr, result, nil); got != exitOK {
+		t.Fatalf("exit=%d want=%d", got, exitOK)
+	}
+	output := stdout.String()
+	for _, want := range []string{
+		`"task_id": "task"`, `"action": "activate"`,
+		`"audit_count": 6`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("JSON missing %q: %s", want, output)
+		}
+	}
+	for _, forbidden := range []string{
+		"payload", "playbook", "prompt", "url", "config",
+		"definition_digest",
+	} {
+		if strings.Contains(output, forbidden) {
+			t.Errorf("JSON leaked forbidden field %q: %s", forbidden, output)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestFinishSnapshotCutoverRunSanitizesStoreError(t *testing.T) {
+	const secret = "postgres://owner:secret@private/db"
+	runErr := types.NewAppError(
+		types.CodeDatabase, "snapshot cutover unavailable",
+		errors.New(secret))
+	var stdout, stderr bytes.Buffer
+	if got := finishSnapshotCutoverRun(
+		&stdout, &stderr, nil, runErr); got != exitFailure {
+		t.Fatalf("exit=%d want=%d", got, exitFailure)
+	}
+	if stdout.Len() != 0 ||
+		!strings.Contains(stderr.String(), "snapshot cutover unavailable") ||
+		strings.Contains(stderr.String(), secret) {
+		t.Fatalf("unsafe output stdout/stderr=%q/%q",
+			stdout.String(), stderr.String())
+	}
+}
+
 func TestRuntimeAdminDeploymentWorkflow(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {

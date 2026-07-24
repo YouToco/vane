@@ -119,6 +119,34 @@ func TestMigration038RestrictedOperatorAndDefinerBoundary(t *testing.T) {
 			operatorTableGrants, operatorSequenceGrants)
 	}
 
+	if _, err := db.ExecContext(t.Context(),
+		`SELECT * FROM task_run_snapshot_v2_cutover_control(
+		    1,1,'migration-038-owner-direct','activate')`); err == nil {
+		t.Fatal("function owner directly entered cutover definer")
+	} else {
+		requireSQLState038(t, err, "42501")
+	}
+	appTx, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := appTx.ExecContext(t.Context(),
+		`SET LOCAL ROLE vane_app`); err != nil {
+		_ = appTx.Rollback()
+		t.Fatal(err)
+	}
+	if _, err := appTx.ExecContext(t.Context(),
+		`SELECT * FROM task_run_snapshot_v2_cutover_control(
+		    1,1,'migration-038-app-direct','activate')`); err == nil {
+		_ = appTx.Rollback()
+		t.Fatal("vane_app directly entered cutover definer")
+	} else {
+		requireSQLState038(t, err, "42501")
+	}
+	if err := appTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
 	tx, err := db.BeginTx(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -137,21 +165,46 @@ func TestMigration038RestrictedOperatorAndDefinerBoundary(t *testing.T) {
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	tx, err = db.BeginTx(t.Context(), nil)
-	if err != nil {
+	for name, args := range map[string][4]any{
+		"null tenant": {nil, int64(1), "migration-038-task", "activate"},
+		"null user":   {int64(1), nil, "migration-038-task", "activate"},
+		"null task":   {int64(1), int64(1), nil, "activate"},
+		"empty task":  {int64(1), int64(1), "", "activate"},
+		"null action": {int64(1), int64(1), "migration-038-task", nil},
+		"forged":      {int64(1), int64(1), "migration-038-task", "forged"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tx, err := db.BeginTx(t.Context(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback() }()
+			if _, err := tx.ExecContext(t.Context(),
+				`SET LOCAL ROLE vane_snapshot_cutover_operator`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.ExecContext(t.Context(),
+				`SELECT * FROM task_run_snapshot_v2_cutover_control(
+				    $1,$2,$3,$4)`,
+				args[0], args[1], args[2], args[3]); err == nil {
+				t.Fatal("control primitive accepted invalid argument")
+			} else {
+				requireSQLState038(t, err, "22023")
+			}
+		})
+	}
+	var events, pointers int
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT
+		  (SELECT count(*) FROM task_run_snapshot_v2_cutover_events),
+		  (SELECT count(*) FROM schedules
+		    WHERE run_snapshot_cutover_event_id IS NOT NULL)`,
+	).Scan(&events, &pointers); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(t.Context(),
-		`SET LOCAL ROLE vane_snapshot_cutover_operator`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.ExecContext(t.Context(),
-		`SELECT * FROM task_run_snapshot_v2_cutover_control(
-		    1,1,'migration-038-task','forged')`); err == nil {
-		t.Fatal("control primitive accepted forged action")
-	} else {
-		requireSQLState038(t, err, "22023")
+	if events != 0 || pointers != 0 {
+		t.Fatalf("invalid control mutated events/pointers = %d/%d",
+			events, pointers)
 	}
 }
 

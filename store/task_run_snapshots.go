@@ -120,29 +120,11 @@ func (s *Store) createOrGetTaskRunSnapshotWithShadowV2(
 	p CreateOrGetTaskRunSnapshotParams,
 	shadowV2 bool,
 ) (*taskRunSnapshot, error) {
-	return s.createOrGetTaskRunSnapshotWithAuthorityV2(
-		ctx, p, shadowV2, nil)
-}
-
-// createOrGetTaskRunSnapshotWithAuthorityV2 is the migration-safe persistence
-// primitive for controlled store tests. Every production caller passes a nil
-// authority marker through createOrGetTaskRunSnapshotWithShadowV2 until the
-// separately reviewed activation batch lands.
-func (s *Store) createOrGetTaskRunSnapshotWithAuthorityV2(
-	ctx context.Context,
-	p CreateOrGetTaskRunSnapshotParams,
-	shadowV2 bool,
-	v2CutoverEventID *int64,
-) (*taskRunSnapshot, error) {
-	if v2CutoverEventID != nil && !shadowV2 {
-		return nil, taskRunValidationError(
-			"task run snapshot v2 authority requires a shadow")
-	}
 	if err := validateTaskRunLookupInput(p); err != nil {
 		return nil, err
 	}
 
-	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, taskRunDatabaseError("begin task run snapshot transaction", err)
 	}
@@ -164,6 +146,18 @@ func (s *Store) createOrGetTaskRunSnapshotWithAuthorityV2(
 			}
 		}
 		return existing, nil
+	}
+	v2CutoverEventID, cutoverEnrolled, err := loadTaskRunSnapshotAdmissionV2(
+		ctx, tx, p.TenantID, p.UserID, p.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	if cutoverEnrolled {
+		// Active admission is durable database state, not a rollout flag.
+		// Active and rolled-back tasks both need a complete sidecar population:
+		// rollback runs stay v1-authoritative but must be auditable before a
+		// later reactivation.
+		shadowV2 = true
 	}
 	if err := validateNewTaskRunInput(p); err != nil {
 		return nil, err
@@ -310,6 +304,54 @@ func (s *Store) createOrGetTaskRunSnapshotWithAuthorityV2(
 		return nil, taskRunDatabaseError("commit task run snapshot transaction", err)
 	}
 	return inserted, nil
+}
+
+// loadTaskRunSnapshotAdmissionV2 is called only after exact RunID replay has
+// missed. Its schedule lock is the first mutable task lock for a genuinely new
+// run and is held through parent+sidecar commit, excluding operator/purge/
+// delete transitions. The marker is derived only from the current pointer;
+// callers cannot supply or select a historical event.
+func loadTaskRunSnapshotAdmissionV2(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID, userID int64,
+	taskID string,
+) (*int64, bool, error) {
+	var pointer *int64
+	if err := tx.QueryRow(ctx,
+		`SELECT run_snapshot_cutover_event_id
+		   FROM schedules
+		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3
+		  FOR SHARE`,
+		tenantID, userID, taskID,
+	).Scan(&pointer); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, taskRunNotFound()
+		}
+		return nil, false, taskRunDatabaseError(
+			"lock task run snapshot admission", err)
+	}
+	if pointer == nil {
+		return nil, false, nil
+	}
+	var action string
+	if err := tx.QueryRow(ctx,
+		`SELECT action
+		   FROM task_run_snapshot_v2_cutover_events
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND task_id=$4`,
+		*pointer, tenantID, userID, taskID,
+	).Scan(&action); err != nil {
+		return nil, false, taskRunIntegrityError()
+	}
+	switch action {
+	case "activate":
+		marker := *pointer
+		return &marker, true, nil
+	case "rollback":
+		return nil, true, nil
+	default:
+		return nil, false, taskRunIntegrityError()
+	}
 }
 
 func (s *Store) loadTaskRunSnapshotShadowBehindFenceV2(
