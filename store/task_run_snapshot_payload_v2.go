@@ -138,7 +138,8 @@ func readTaskRunSnapshotShadowPayloadV2(
 				errors.New("task run snapshot v2 adaptive state is not canonical")
 		}
 	}
-	if err := validateTaskRunSnapshotShadowStatusV2(payload); err != nil {
+	if err := validateTaskRunSnapshotShadowStatusV2(
+		payload, legacy.Payload); err != nil {
 		return taskRunSnapshotShadowPayloadV2{}, nil, err
 	}
 	canonical, err := json.Marshal(payload)
@@ -151,54 +152,22 @@ func readTaskRunSnapshotShadowPayloadV2(
 
 func validateTaskRunSnapshotShadowStatusV2(
 	payload taskRunSnapshotShadowPayloadV2,
+	legacy *taskRunSnapshotPayloadV1,
 ) error {
-	if payload.Status == TaskRunSnapshotShadowHeadless {
-		if payload.Approved == nil && payload.Adaptive == nil {
-			return nil
+	var definition *taskstate.ApprovedDefinitionV1
+	if payload.Approved != nil {
+		decoded, err := taskstate.DecodeApprovedDefinitionV1(payload.Approved.Payload)
+		if err != nil {
+			return errors.New("task run shadow approved definition is invalid")
 		}
-		return errors.New("headless task run shadow state is inconsistent")
+		definition = &decoded
 	}
-	if payload.Approved == nil {
-		return errors.New("task run shadow approved definition is missing")
+	expected := classifyTaskRunSnapshotShadowV2(
+		legacy, definition, payload.Approved, payload.Adaptive)
+	if payload.Status != expected {
+		return errors.New("task run shadow status differs from frozen inputs")
 	}
-	definition, err := taskstate.DecodeApprovedDefinitionV1(payload.Approved.Payload)
-	if err != nil {
-		return errors.New("task run shadow approved definition is invalid")
-	}
-	if payload.Adaptive == nil {
-		switch payload.Status {
-		case TaskRunSnapshotShadowMatch:
-			if definition.SourceScope == taskstate.SourceScopeApprovedPlan {
-				return nil
-			}
-		case TaskRunSnapshotShadowLegacyCompatible:
-			if definition.SourceScope == taskstate.SourceScopeLegacySubscriptions {
-				return nil
-			}
-		case TaskRunSnapshotShadowProjectionMismatch:
-			return nil
-		}
-		return errors.New("task run shadow status requires adaptive state")
-	}
-	basisMatches := payload.Adaptive.BasisDefinitionVersion == payload.Approved.Version &&
-		constantTimeDigestEqual(
-			payload.Adaptive.BasisDefinitionDigest, payload.Approved.Digest)
-	switch payload.Status {
-	case TaskRunSnapshotShadowAdaptivePresent:
-		if basisMatches && definition.SourceScope == taskstate.SourceScopeApprovedPlan {
-			return nil
-		}
-	case TaskRunSnapshotShadowAdaptiveForLegacy:
-		if basisMatches &&
-			definition.SourceScope == taskstate.SourceScopeLegacySubscriptions {
-			return nil
-		}
-	case TaskRunSnapshotShadowAdaptiveBasisMismatch:
-		if !basisMatches {
-			return nil
-		}
-	}
-	return errors.New("task run shadow status is inconsistent")
+	return nil
 }
 
 func validateTaskRunSnapshotShadowApprovedV2(

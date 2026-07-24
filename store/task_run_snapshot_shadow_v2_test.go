@@ -6,6 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -443,16 +447,82 @@ func TestTaskRunSnapshotShadowV2CorruptReplayFailsClosed(t *testing.T) {
 	}
 }
 
+func TestTaskRunSnapshotShadowV2RejectsReSealedFalseMatch(t *testing.T) {
+	f := newTaskRunSnapshotFixture(t)
+	taskID := f.taskID()
+	f.createApprovedTask(t, taskID, 1)
+	result, err := f.st.reconcileTaskDefinitionBaseline(t.Context(),
+		TaskDefinitionBaselineApply, TaskDefinitionBaselineCursor{
+			TenantID: f.tenantID, UserID: f.userID, TaskID: taskID,
+		})
+	if err != nil || result.Status != TaskDefinitionBaselineApplied {
+		t.Fatalf("apply baseline = %+v, %v", result, err)
+	}
+	snapshot, err := f.st.createOrGetTaskRunSnapshotWithShadowV2(
+		t.Context(), f.params(taskID, "shadow-false-match"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw []byte
+	if err := f.st.pool.QueryRow(t.Context(),
+		`SELECT payload FROM task_run_snapshot_v2_shadows WHERE run_snapshot_id=$1`,
+		snapshot.ID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	payload, _, err := readTaskRunSnapshotShadowPayloadV2(raw)
+	if err != nil || payload.Approved == nil {
+		t.Fatalf("read valid shadow: %v", err)
+	}
+	approved, err := taskstate.DecodeApprovedDefinitionV1(payload.Approved.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approved.NLDescription += " attacker drift"
+	approvedRaw, err := taskstate.EncodeApprovedDefinitionV1(approved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.Approved.Payload = approvedRaw
+	payload.Approved.Digest = sha256Hex(approvedRaw)
+	resealed, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readTaskRunSnapshotShadowPayloadV2(resealed); err == nil {
+		t.Fatal("retained reader accepted re-sealed false match")
+	}
+	if _, err := f.st.pool.Exec(t.Context(),
+		`UPDATE task_run_snapshot_v2_shadows
+		    SET approved_definition_digest=$2, payload=$3, payload_digest=$4
+		  WHERE run_snapshot_id=$1`,
+		snapshot.ID, payload.Approved.Digest, resealed, sha256Hex(resealed)); err != nil {
+		t.Fatalf("install re-sealed owner mutation: %v", err)
+	}
+	if _, err := f.st.AuditTaskRunSnapshotShadowsV2(
+		t.Context(), taskID, time.Now().Add(-time.Minute), 0, 10,
+	); !errors.Is(err, types.ErrInternal) {
+		t.Fatalf("audit accepted re-sealed false match: %v", err)
+	}
+}
+
 func TestTaskRunSnapshotShadowV2HasNoRuntimeConsumer(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("cannot locate shadow test")
 	}
 	repoRoot := filepath.Dir(filepath.Dir(thisFile))
-	allowed := map[string]bool{
+	allowedTableReferences := map[string]bool{
 		filepath.Clean(filepath.Join(repoRoot, "store", "task_run_snapshot_shadow_v2.go")):    true,
 		filepath.Clean(filepath.Join(repoRoot, "store", "task_run_snapshot_shadow_audit.go")): true,
 		filepath.Clean(filepath.Join(repoRoot, "store", "tenant_purge.go")):                   true,
+	}
+	allowedCalls := map[string]bool{
+		"CreateOrGetCompiledRunSnapshotShadowV2|workflow/activities.go|PrepareRun": true,
+		"AuditTaskRunSnapshotShadowsV2|cmd/runtimeadmin/main.go|runSnapshotShadow": true,
+	}
+	guardedCalls := map[string]bool{
+		"CreateOrGetCompiledRunSnapshotShadowV2": true,
+		"AuditTaskRunSnapshotShadowsV2":          true,
 	}
 	var escaped []string
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, err error) error {
@@ -473,8 +543,48 @@ func TestTaskRunSnapshotShadowV2HasNoRuntimeConsumer(t *testing.T) {
 			return err
 		}
 		if bytes.Contains(raw, []byte("task_run_snapshot_v2_shadows")) &&
-			!allowed[filepath.Clean(path)] {
+			!allowedTableReferences[filepath.Clean(path)] {
 			escaped = append(escaped, path)
+		}
+
+		relativePath, err := filepath.Rel(repoRoot, path)
+		if err != nil {
+			return err
+		}
+		relativePath = filepath.ToSlash(relativePath)
+		fileSet := token.NewFileSet()
+		parsed, err := parser.ParseFile(fileSet, path, raw, 0)
+		if err != nil {
+			return err
+		}
+		for _, declaration := range parsed.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				var callName string
+				switch function := call.Fun.(type) {
+				case *ast.Ident:
+					callName = function.Name
+				case *ast.SelectorExpr:
+					callName = function.Sel.Name
+				}
+				if !guardedCalls[callName] {
+					return true
+				}
+				key := fmt.Sprintf("%s|%s|%s", callName, relativePath, function.Name.Name)
+				if !allowedCalls[key] {
+					position := fileSet.Position(call.Pos())
+					escaped = append(escaped, fmt.Sprintf("%s:%d calls %s from %s",
+						relativePath, position.Line, callName, function.Name.Name))
+				}
+				return true
+			})
 		}
 		return nil
 	})
@@ -586,6 +696,97 @@ func TestTaskRunSnapshotShadowV2SchemaPrivileges(t *testing.T) {
 		t.Fatalf("shadow privileges rls/select/insert/update/delete/seq-use/seq-select = "+
 			"%v/%v/%v/%v/%v/%v/%v", rls, canSelect, canInsertColumn,
 			canUpdate, canDelete, sequenceUsage, sequenceSelect)
+	}
+}
+
+func TestTaskRunSnapshotShadowV2DatabaseRejectsNullPassStatuses(t *testing.T) {
+	f := newTaskRunSnapshotFixture(t)
+	taskID := f.taskID()
+	f.createApprovedTask(t, taskID, 1)
+	result, err := f.st.reconcileTaskDefinitionBaseline(t.Context(),
+		TaskDefinitionBaselineApply, TaskDefinitionBaselineCursor{
+			TenantID: f.tenantID, UserID: f.userID, TaskID: taskID,
+		})
+	if err != nil || result.Status != TaskDefinitionBaselineApplied {
+		t.Fatalf("apply baseline = %+v, %v", result, err)
+	}
+	parent, err := f.st.createOrGetTaskRunSnapshot(
+		t.Context(), f.params(taskID, "shadow-null-pass-parent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := []struct {
+		status   TaskRunSnapshotShadowStatus
+		adaptive bool
+	}{
+		{status: TaskRunSnapshotShadowMatch},
+		{status: TaskRunSnapshotShadowLegacyCompatible},
+		{status: TaskRunSnapshotShadowProjectionMismatch},
+		{status: TaskRunSnapshotShadowAdaptivePresent, adaptive: true},
+		{status: TaskRunSnapshotShadowAdaptiveBasisMismatch, adaptive: true},
+		{status: TaskRunSnapshotShadowAdaptiveForLegacy, adaptive: true},
+	}
+	for _, test := range statuses {
+		t.Run(string(test.status), func(t *testing.T) {
+			tx, err := f.st.pool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(t.Context())
+			if _, err := tx.Exec(t.Context(), `SET LOCAL ROLE vane_app`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(t.Context(),
+				`SELECT set_config('app.tenant_id',$1,true)`,
+				fmt.Sprint(f.tenantID)); err != nil {
+				t.Fatal(err)
+			}
+			adaptiveVersion := int64(0)
+			var adaptiveDigest *string
+			adaptiveJSON := "null"
+			if test.adaptive {
+				adaptiveVersion = 1
+				digest := sha256Hex([]byte("{}"))
+				adaptiveDigest = &digest
+				// Deliberately lacks basis fields and its retained payload lacks
+				// schema/identity. PostgreSQL CHECK must evaluate false, not NULL.
+				adaptiveJSON = fmt.Sprintf(
+					`{"version":1,"digest":%q,"schema_version":"vane.task-adaptive-state/v1",`+
+						`"payload":{},"last_known_good_definition_version":null}`,
+					digest)
+			}
+			body := fmt.Sprintf(
+				`{"schema_version":"vane.task-run-snapshot-shadow/v2",`+
+					`"status":%q,`+
+					`"identity":{"tenant_id":%d,"user_id":%d,"task_id":%q,`+
+					`"temporal_workflow_id":%q,"temporal_run_id":%q},`+
+					`"legacy":{"snapshot_id":%d},`+
+					`"approved":{"version":%d,"digest":%q,`+
+					`"schema_version":"vane.task-approved-definition/v1","payload":{}},`+
+					`"adaptive":%s}`,
+				test.status, f.tenantID, f.userID, taskID,
+				parent.TemporalWorkflowID,
+				parent.TemporalRunID,
+				parent.ID, result.Version, result.Digest, adaptiveJSON)
+			_, err = tx.Exec(t.Context(),
+				`INSERT INTO task_run_snapshot_v2_shadows (
+					run_snapshot_id,tenant_id,user_id,task_id,
+					temporal_workflow_id,temporal_run_id,status,
+					approved_definition_version,approved_definition_digest,
+					adaptive_version,adaptive_digest,payload,payload_digest
+				 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+				           convert_to($12,'UTF8'),
+				           encode(sha256(convert_to($12,'UTF8')),'hex'))`,
+				parent.ID, f.tenantID, f.userID, taskID,
+				parent.TemporalWorkflowID,
+				parent.TemporalRunID,
+				test.status, result.Version, result.Digest,
+				adaptiveVersion, adaptiveDigest, body)
+			var pgErr *pgconn.PgError
+			if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+				t.Fatalf("null-pass mutation error = %v", err)
+			}
+		})
 	}
 }
 

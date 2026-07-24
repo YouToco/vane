@@ -142,20 +142,34 @@ func buildTaskRunSnapshotShadowV2(
 		shadow.AdaptiveDigest = cloneStringValue(adaptive.Digest)
 	}
 
-	status := compareTaskRunSnapshotShadowV2(decoded.Payload, approved.Definition)
-	if found && (adaptive.BasisDefinitionVersion != approved.Version ||
-		!constantTimeTaskStateDigestEqual(
-			adaptive.BasisDefinitionDigest, approved.Digest)) {
-		status = TaskRunSnapshotShadowAdaptiveBasisMismatch
-	} else if found &&
-		approved.Definition.SourceScope == taskstate.SourceScopeLegacySubscriptions {
-		status = TaskRunSnapshotShadowAdaptiveForLegacy
-	} else if found {
-		status = TaskRunSnapshotShadowAdaptivePresent
-	}
+	status := classifyTaskRunSnapshotShadowV2(
+		decoded.Payload, &approved.Definition, payload.Approved, payload.Adaptive)
 	payload.Status = status
 	shadow.Status = status
 	return sealTaskRunSnapshotShadowV2(shadow, payload)
+}
+
+func classifyTaskRunSnapshotShadowV2(
+	legacy *taskRunSnapshotPayloadV1,
+	definition *taskstate.ApprovedDefinitionV1,
+	approved *taskRunSnapshotShadowApprovedV2,
+	adaptive *taskRunSnapshotShadowAdaptiveV2,
+) TaskRunSnapshotShadowStatus {
+	if definition == nil || approved == nil {
+		return TaskRunSnapshotShadowHeadless
+	}
+	if adaptive == nil {
+		return compareTaskRunSnapshotShadowV2(legacy, *definition)
+	}
+	if adaptive.BasisDefinitionVersion != approved.Version ||
+		!constantTimeTaskStateDigestEqual(
+			adaptive.BasisDefinitionDigest, approved.Digest) {
+		return TaskRunSnapshotShadowAdaptiveBasisMismatch
+	}
+	if definition.SourceScope == taskstate.SourceScopeLegacySubscriptions {
+		return TaskRunSnapshotShadowAdaptiveForLegacy
+	}
+	return TaskRunSnapshotShadowAdaptivePresent
 }
 
 func compareTaskRunSnapshotShadowV2(

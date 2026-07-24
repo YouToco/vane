@@ -72,40 +72,102 @@ CREATE TABLE task_run_snapshot_v2_shadows (
          (adaptive_version > 0 AND adaptive_digest ~ '^[0-9a-f]{64}$'))
     ),
     CONSTRAINT task_run_snapshot_v2_shadow_status_complete CHECK (
-        (status = 'headless' AND adaptive_version = 0) OR
-        (status = 'match' AND adaptive_version = 0 AND
-         convert_from(payload, 'UTF8')::jsonb #>> '{approved,payload,source_scope}'
-            = 'approved_plan') OR
-        (status = 'legacy_compatible' AND adaptive_version = 0 AND
-         convert_from(payload, 'UTF8')::jsonb #>> '{approved,payload,source_scope}'
-            = 'legacy_subscriptions') OR
-        (status = 'projection_mismatch' AND adaptive_version = 0) OR
-        (status = 'adaptive_present' AND adaptive_version > 0 AND
-         convert_from(payload, 'UTF8')::jsonb #>> '{approved,payload,source_scope}'
-            = 'approved_plan' AND
-         (convert_from(payload, 'UTF8')::jsonb
-            #>> '{adaptive,basis_definition_version}')::bigint
-            = approved_definition_version AND
-         convert_from(payload, 'UTF8')::jsonb
-            #>> '{adaptive,basis_definition_digest}'
-            = approved_definition_digest) OR
-        (status = 'adaptive_basis_mismatch' AND adaptive_version > 0 AND (
-         (convert_from(payload, 'UTF8')::jsonb
-            #>> '{adaptive,basis_definition_version}')::bigint
-            <> approved_definition_version OR
-         convert_from(payload, 'UTF8')::jsonb
-            #>> '{adaptive,basis_definition_digest}'
-            <> approved_definition_digest
-        )) OR
-        (status = 'adaptive_for_legacy' AND adaptive_version > 0 AND
-         convert_from(payload, 'UTF8')::jsonb #>> '{approved,payload,source_scope}'
-            = 'legacy_subscriptions' AND
-         (convert_from(payload, 'UTF8')::jsonb
-            #>> '{adaptive,basis_definition_version}')::bigint
-            = approved_definition_version AND
-         convert_from(payload, 'UTF8')::jsonb
-            #>> '{adaptive,basis_definition_digest}'
-            = approved_definition_digest)
+        (
+            (status = 'headless' AND adaptive_version = 0) OR
+            (
+                status <> 'headless' AND
+                convert_from(payload, 'UTF8')::jsonb
+                    #>> '{approved,payload,schema_version}'
+                    IS NOT DISTINCT FROM 'vane.task-approved-definition/v1' AND
+                (convert_from(payload, 'UTF8')::jsonb
+                    #>> '{approved,payload,tenant_id}')::bigint
+                    IS NOT DISTINCT FROM tenant_id AND
+                (convert_from(payload, 'UTF8')::jsonb
+                    #>> '{approved,payload,user_id}')::bigint
+                    IS NOT DISTINCT FROM user_id AND
+                convert_from(payload, 'UTF8')::jsonb
+                    #>> '{approved,payload,task_id}'
+                    IS NOT DISTINCT FROM task_id AND
+                convert_from(payload, 'UTF8')::jsonb
+                    #>> '{approved,payload,execution_mode}'
+                    IS NOT DISTINCT FROM 'compiled' AND
+                (
+                    convert_from(payload, 'UTF8')::jsonb
+                        #>> '{approved,payload,source_scope}'
+                    IN ('approved_plan', 'legacy_subscriptions')
+                ) IS TRUE AND
+                (
+                    (
+                        adaptive_version = 0 AND
+                        (
+                            (status = 'match' AND
+                             convert_from(payload, 'UTF8')::jsonb
+                                #>> '{approved,payload,source_scope}'
+                                IS NOT DISTINCT FROM 'approved_plan') OR
+                            (status = 'legacy_compatible' AND
+                             convert_from(payload, 'UTF8')::jsonb
+                                #>> '{approved,payload,source_scope}'
+                                IS NOT DISTINCT FROM 'legacy_subscriptions') OR
+                            status = 'projection_mismatch'
+                        )
+                    ) OR
+                    (
+                        adaptive_version > 0 AND
+                        convert_from(payload, 'UTF8')::jsonb
+                            #>> '{adaptive,payload,schema_version}'
+                            IS NOT DISTINCT FROM 'vane.task-adaptive-state/v1' AND
+                        (convert_from(payload, 'UTF8')::jsonb
+                            #>> '{adaptive,payload,tenant_id}')::bigint
+                            IS NOT DISTINCT FROM tenant_id AND
+                        (convert_from(payload, 'UTF8')::jsonb
+                            #>> '{adaptive,payload,user_id}')::bigint
+                            IS NOT DISTINCT FROM user_id AND
+                        convert_from(payload, 'UTF8')::jsonb
+                            #>> '{adaptive,payload,task_id}'
+                            IS NOT DISTINCT FROM task_id AND
+                        (convert_from(payload, 'UTF8')::jsonb
+                            #>> '{adaptive,basis_definition_version}')::bigint
+                            IS NOT NULL AND
+                        (convert_from(payload, 'UTF8')::jsonb
+                            #>> '{adaptive,basis_definition_version}')::bigint > 0 AND
+                        convert_from(payload, 'UTF8')::jsonb
+                            #>> '{adaptive,basis_definition_digest}'
+                            ~ '^[0-9a-f]{64}$' AND
+                        (
+                            (status = 'adaptive_present' AND
+                             convert_from(payload, 'UTF8')::jsonb
+                                #>> '{approved,payload,source_scope}'
+                                IS NOT DISTINCT FROM 'approved_plan' AND
+                             (convert_from(payload, 'UTF8')::jsonb
+                                #>> '{adaptive,basis_definition_version}')::bigint
+                                IS NOT DISTINCT FROM approved_definition_version AND
+                             convert_from(payload, 'UTF8')::jsonb
+                                #>> '{adaptive,basis_definition_digest}'
+                                IS NOT DISTINCT FROM approved_definition_digest) OR
+                            (status = 'adaptive_basis_mismatch' AND
+                             (
+                                 (convert_from(payload, 'UTF8')::jsonb
+                                    #>> '{adaptive,basis_definition_version}')::bigint
+                                    IS DISTINCT FROM approved_definition_version OR
+                                 convert_from(payload, 'UTF8')::jsonb
+                                    #>> '{adaptive,basis_definition_digest}'
+                                    IS DISTINCT FROM approved_definition_digest
+                             )) OR
+                            (status = 'adaptive_for_legacy' AND
+                             convert_from(payload, 'UTF8')::jsonb
+                                #>> '{approved,payload,source_scope}'
+                                IS NOT DISTINCT FROM 'legacy_subscriptions' AND
+                             (convert_from(payload, 'UTF8')::jsonb
+                                #>> '{adaptive,basis_definition_version}')::bigint
+                                IS NOT DISTINCT FROM approved_definition_version AND
+                             convert_from(payload, 'UTF8')::jsonb
+                                #>> '{adaptive,basis_definition_digest}'
+                                IS NOT DISTINCT FROM approved_definition_digest)
+                        )
+                    )
+                )
+            )
+        ) IS TRUE
     ),
     CONSTRAINT task_run_snapshot_v2_shadow_payload_valid CHECK (
         octet_length(payload) > 0 AND octet_length(payload) <= 5242880 AND
