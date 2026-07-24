@@ -1613,6 +1613,63 @@ func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *t
 	}
 }
 
+func TestHandleMessage_OrdinaryCreateScrubsUnbackedConfirmationClaim(t *testing.T) {
+	// 非 direct 模式下模型零工具口头承诺“确认卡已发出”——飞书层不会 SendCard。
+	// 出口必须 fail-closed，不能把谎言交给用户。
+	fs := newFakeStore()
+	create := &fakeTool{name: "create_schedule", mutating: true}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		Content: "确认卡已发出，请查看并确认。", FinishReason: "stop",
+	}}}
+	l := newTestLoop(t, fs, chat.fn, create)
+
+	out, err := l.HandleMessage(t.Context(), 7, "每周一整理一下 AI 新闻")
+	if err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if out.Confirm != nil {
+		t.Fatalf("零工具不得出 Confirm: %+v", out)
+	}
+	if out.Reply != replyUnbackedConfirmationClaim {
+		t.Fatalf("口头确认卡承诺必须被替换: got %q", out.Reply)
+	}
+	persisted := persistedMessages(t, fs)
+	if len(persisted) < 2 || persisted[len(persisted)-1].Content != replyUnbackedConfirmationClaim {
+		t.Fatalf("清洗后的文案也必须写入会话: %+v", persisted)
+	}
+}
+
+func TestHandleMessage_SmokeStyleFirstEmitCardEntersDirectMode(t *testing.T) {
+	const args = `{"spec":{"cron":"0 9 * * *","tz":"Asia/Shanghai"},` +
+		`"intent":"smoke 测试可删","approved_fetch_plan":{"source_specs":{` +
+		`"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"smoke"}]}},` +
+		`"nl_description":"每天 09:00 的临时测试任务"}`
+	fs := newFakeStore()
+	create := &fakeTool{name: "create_schedule", mutating: true}
+	creation := &fakeCreationController{
+		proposeResult: task.CreationProposal{Summary: "每天 09:00 的临时测试任务"},
+	}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{Content: "确认卡已发出，请查看并确认。", FinishReason: "stop"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "smoke-create", Name: "create_schedule", Arguments: args,
+		}}, FinishReason: "tool_calls"},
+	}}
+	l := newTestLoop(t, fs, chat.fn, create)
+	l.taskCreation = creation
+
+	out, err := l.HandleMessage(t.Context(), 7,
+		"帮我建一个每天 09:00 的临时测试任务，意图写「smoke 测试可删」，先出确认卡，不要直接执行。")
+	if err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
+		len(creation.proposeCalls) != 1 || len(chat.requests) != 2 {
+		t.Fatalf("先出确认卡话术应进 direct 并自纠出卡: out=%+v requests=%d proposals=%d",
+			out, len(chat.requests), len(creation.proposeCalls))
+	}
+}
+
 func TestHandleMessage_ExplicitTaskConfirmationRejectsOralCardPromise(t *testing.T) {
 	const args = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
 		`"intent":"每周整理三家官方重大模型动态","approved_fetch_plan":{"source_specs":{` +
@@ -2155,6 +2212,16 @@ func TestIsDirectTaskCreationConfirmation(t *testing.T) {
 			name: "英文直接确认",
 			text: "Confirm and create without searching again",
 			want: true,
+		},
+		{
+			name: "先出确认卡的建任务话术进 direct",
+			text: "帮我建一个每天 09:00 的临时测试任务，意图写「smoke 测试可删」，先出确认卡，不要直接执行。",
+			want: true,
+		},
+		{
+			name: "只讨论确认卡不进 direct",
+			text: "确认卡长什么样",
+			want: false,
 		},
 	}
 	for _, tt := range tests {

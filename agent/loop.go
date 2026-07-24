@@ -102,6 +102,11 @@ const (
 	// replyPendingProtocolFailure 只在 pending_action 已落库后使用。它不声称执行成功，
 	// 只告诉用户确认卡这一项已经存在，避免协议异常把可确认动作变成孤儿。
 	replyPendingProtocolFailure = "确认卡已生成，请在卡片中核对后确认。"
+	// replyUnbackedConfirmationClaim 用于模型口头声称“确认卡已发出/已生成”，
+	// 但本轮 Confirm 为空（未落 pending/proposal）的 fail-closed 出口。
+	// 2026-07-24 生产 smoke：普通建任务话术未进 direct 模式时，Kimi 曾发出
+	// “确认卡已发出，请查看并确认。”且零工具调用，飞书层因而不会 SendCard。
+	replyUnbackedConfirmationClaim = "这次没有真正发出确认卡。若要创建或修改，请再说一次，并等到下方出现带「确认/取消」按钮的卡片后再点。"
 	// untrustedHistoryPlaceholder 替代持久化历史中的整段外部工具交换。
 	// 原始结果仍在 tool_calls 审计账本，不能再次与下一条消息的画像/完整工具面同屏。
 	untrustedHistoryPlaceholder  = "已完成一次外部只读查询。为防网页或信源中的指令污染后续会话，原始工具结果未保留在对话上下文中。"
@@ -510,6 +515,16 @@ func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, ext
 		}
 		msgs = truncateMessages(append(history, msgs...))
 	}
+	if outcome.Confirm == nil {
+		// 纵深：任何出口在 Confirm 为空时都不得把“确认卡已发出”类口头承诺交给飞书。
+		scrubbed := rejectUnbackedConfirmationClaim(outcome.Reply)
+		if scrubbed != outcome.Reply {
+			outcome.Reply = scrubbed
+			if len(msgs) > 0 && msgs[len(msgs)-1].Role == "assistant" {
+				msgs[len(msgs)-1].Content = scrubbed
+			}
+		}
+	}
 	msgs = l.scrubUntrustedHistory(msgs)
 	l.saveSession(ctx, sess, msgs, turns, state)
 	return outcome, nil
@@ -646,8 +661,9 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				})
 				return Outcome{Reply: replyTaskCreationNotCreated}, msgs, turns, nil
 			}
-			msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: resp.Content})
-			return Outcome{Reply: nonEmptyReply(resp.Content)}, msgs, turns, nil
+			reply := rejectUnbackedConfirmationClaim(resp.Content)
+			msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: reply})
+			return Outcome{Reply: reply}, msgs, turns, nil
 		}
 
 		// assistant 历史消息必须携带 tool_calls 字段回传（契约 §4 线协议）。
@@ -1219,12 +1235,22 @@ func isDirectTaskCreationConfirmation(text string) bool {
 	) {
 		return false
 	}
-	if !startsWithAny(normalized,
+	explicitCardNow := containsAny(normalized,
+		"先出确认卡", "先发确认卡", "先给确认卡",
+		"出确认卡不要直接", "发确认卡不要直接",
+	)
+	startsDirect := startsWithAny(normalized,
 		"确认创建", "直接生成确认卡", "直接出确认卡",
 		"请直接生成确认卡", "请直接出确认卡",
 		"confirmandcreate", "directlycreatetheconfirmationcard",
 		"createtheconfirmationcard",
-	) {
+	)
+	if !startsDirect && !explicitCardNow {
+		return false
+	}
+	// “先出确认卡”类话术必须同时带创建/任务意图，避免把纯讨论误送进 direct。
+	if explicitCardNow && !startsDirect &&
+		!containsAny(normalized, "建", "创建", "任务", "推送", "监控", "schedule") {
 		return false
 	}
 	if containsAny(normalized,
@@ -1236,6 +1262,29 @@ func isDirectTaskCreationConfirmation(text string) bool {
 		return false
 	}
 	return true
+}
+
+// claimsUnbackedConfirmationCard 判定模型自由文本是否在声称确认卡已发出/已生成。
+// 仅用于 Confirm==nil 时的出口清洗；pending 已落库的 replyPendingProtocolFailure 不走这里。
+func claimsUnbackedConfirmationCard(reply string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(reply), ""))
+	if normalized == "" {
+		return false
+	}
+	return containsAny(normalized,
+		"确认卡已发出", "确认卡已经发出", "确认卡已生成", "确认卡已经生成",
+		"确认卡已发送", "确认卡已经发送", "已发出确认卡", "已生成确认卡",
+		"已发送确认卡", "请查看并确认", "请查收确认卡",
+		"confirmationcardhasbeensent", "confirmationcardhasbeengenerated",
+		"cardhasbeensent", "pleasecheckandconfirm",
+	)
+}
+
+func rejectUnbackedConfirmationClaim(reply string) string {
+	if claimsUnbackedConfirmationCard(reply) {
+		return replyUnbackedConfirmationClaim
+	}
+	return nonEmptyReply(reply)
 }
 
 func containsAny(text string, candidates ...string) bool {
