@@ -214,7 +214,7 @@ type Store interface {
 type CompiledRunStore interface {
 	LoadCompiledRunSnapshotRefV1(context.Context, types.RunIdentity) (types.RunSnapshotRef, bool, error)
 	CreateOrGetCompiledRunSnapshotV1(context.Context, types.RunIdentity, runtimepolicy.BundleV1) (types.RunSnapshotRef, error)
-	LoadCompiledTaskRunSnapshotV1(context.Context, types.RunIdentity, types.RunSnapshotRef) (runcontext.CompiledSnapshotV1, error)
+	LoadAuthoritativeCompiledTaskRunSnapshot(context.Context, types.RunIdentity, types.RunSnapshotRef) (runcontext.CompiledSnapshotV1, storepkg.CompiledRunSnapshotAuthority, error)
 	AuthorizeTaskRunSideEffect(context.Context, types.RunIdentity, types.RunSnapshotRef) (bool, error)
 	AuthorizeAndConsumeTaskRunLLMQuotaV1(context.Context, types.RunIdentity, types.RunSnapshotRef, runtimepolicy.QuotaBucketV1, float64) error
 	UpsertContentItemForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, *types.ContentItem) (int64, bool, error)
@@ -498,7 +498,7 @@ func (a *Activities) refuseIfTenantGone(ctx context.Context, userID int64, stage
 // 可先不传 evolver 灰度上线，pipeline 行为与 M4 完全一致。错误原样上抛交给
 // RetryPolicy；重试耗尽后由 workflow 侧吞掉——演化失败永不阻断推送（红线）。
 func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error {
-	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
 		return retryableOrNot(err)
 	}
@@ -657,7 +657,8 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 			return PrepareRunResult{}, retryableOrNot(err)
 		}
 	}
-	snapshot, err := a.compiledStore.LoadCompiledTaskRunSnapshotV1(ctx, expected, ref)
+	snapshot, authority, err := a.compiledStore.LoadAuthoritativeCompiledTaskRunSnapshot(
+		ctx, expected, ref)
 	if err != nil {
 		return PrepareRunResult{}, retryableOrNot(err)
 	}
@@ -671,7 +672,9 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 	if !authorized {
 		return PrepareRunResult{}, nil
 	}
-	a.auditCompiledSnapshotV2(ctx, expected, ref, "prepare_run")
+	a.logCompiledSnapshotAuthority(ctx, expected, ref, authority, "prepare_run")
+	a.auditCompiledSnapshotV2(
+		ctx, expected, ref, authority, "prepare_run")
 	result := PrepareRunResult{Authorized: true, Snapshot: ref}
 	if err := result.ValidateFor(expected); err != nil {
 		return PrepareRunResult{}, nonRetryable(err)
@@ -708,7 +711,7 @@ func activityRunIdentityV1(ctx context.Context, userID int64, run *CompiledRunIn
 	return expected, nil
 }
 
-func (a *Activities) loadCompiledRunV1(
+func (a *Activities) loadAuthoritativeCompiledRun(
 	ctx context.Context,
 	userID int64,
 	run *CompiledRunInputV1,
@@ -724,25 +727,28 @@ func (a *Activities) loadCompiledRunV1(
 	if err != nil {
 		return runcontext.CompiledSnapshotV1{}, true, err
 	}
-	snapshot, err := a.compiledStore.LoadCompiledTaskRunSnapshotV1(ctx, expected, run.Snapshot)
+	snapshot, authority, err := a.compiledStore.LoadAuthoritativeCompiledTaskRunSnapshot(
+		ctx, expected, run.Snapshot)
 	if err != nil {
 		return runcontext.CompiledSnapshotV1{}, true, err
 	}
-	a.auditCompiledSnapshotV2(ctx, expected, run.Snapshot, "activity_consumer")
+	a.logCompiledSnapshotAuthority(
+		ctx, expected, run.Snapshot, authority, "activity_consumer")
+	a.auditCompiledSnapshotV2(
+		ctx, expected, run.Snapshot, authority, "activity_consumer")
 	return snapshot, true, nil
 }
 
 // auditCompiledSnapshotV2 is C2c-3a's only Activity-side v2 read router. It is
-// deliberately observation-only: missing/non-match/corrupt shadows are
-// visible in structured logs, but the caller always keeps the v1 value it
-// loaded before entering this helper. In particular, Definition.Sources used
-// by Fetch and hidden Store source side effects remain v1-authoritative. C2c-3b
-// must switch those consumers and Store fences together; changing only this
-// helper would create two source truths.
+// deliberately observation-only: missing/non-match/corrupt shadows remain
+// visible in structured logs but never select authority. The immutable parent
+// marker was already interpreted by loadAuthoritativeCompiledRun; this helper
+// only preserves the independent C2c-3a canary signal.
 func (a *Activities) auditCompiledSnapshotV2(
 	ctx context.Context,
 	expected types.RunIdentity,
 	ref types.RunSnapshotRef,
+	authority storepkg.CompiledRunSnapshotAuthority,
 	stage string,
 ) {
 	if a.compiledSnapshotV2AuditReader == nil ||
@@ -767,7 +773,7 @@ func (a *Activities) auditCompiledSnapshotV2(
 		"temporal_run_id", expected.TemporalRunID,
 		"snapshot_id", ref.SnapshotID,
 		"v1_payload_digest", ref.PayloadDigest,
-		"authoritative", "v1",
+		"authoritative", authority,
 		"shadow", "v2",
 	}
 	if err != nil {
@@ -784,6 +790,28 @@ func (a *Activities) auditCompiledSnapshotV2(
 		"shadow_payload_digest", result.ShadowPayloadDigest,
 		"typed_equal", result.TypedEqual)
 	slog.InfoContext(ctx, "compiled snapshot v2 read audit", attrs...)
+}
+
+func (a *Activities) logCompiledSnapshotAuthority(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	authority storepkg.CompiledRunSnapshotAuthority,
+	stage string,
+) {
+	if authority != storepkg.CompiledRunSnapshotAuthorityV2 {
+		return
+	}
+	info := activity.GetInfo(ctx)
+	slog.InfoContext(ctx, "compiled snapshot authority selected",
+		"stage", stage,
+		"activity_type", info.ActivityType.Name,
+		"activity_attempt", info.Attempt,
+		"task_id", expected.TaskID,
+		"temporal_workflow_id", expected.TemporalWorkflowID,
+		"temporal_run_id", expected.TemporalRunID,
+		"snapshot_id", ref.SnapshotID,
+		"authority", authority)
 }
 
 func (a *Activities) resolveCompiledModelPolicyV1(
@@ -917,7 +945,7 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 			Snapshot: *p.Snapshot,
 		}
 	}
-	snapshot, compiled, err := a.loadCompiledRunV1(ctx, p.UserID, compiledInput)
+	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, p.UserID, compiledInput)
 	if err != nil {
 		return nil, retryableOrNot(err)
 	}
@@ -1393,7 +1421,7 @@ func renderSourcesDisabledAlert(disabled []fetchFailure) string {
 // 判近重复，导致整批全删、pipeline "去重后无内容" 早退、永远推不出卡片。故先收集本批
 // 全部 ID，传给 ListRecentSimhashesByUser 排除——"历史"只含本批之外的内容。
 func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem, error) {
-	_, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	_, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
 		return nil, retryableOrNot(err)
 	}
@@ -1679,7 +1707,7 @@ func (a *Activities) loadTaskInstruction(
 // 而 llm.Client 早已配好 5 路并发闸门却只被喂进 1 个。顺带也把 activity 的
 // StartToCloseTimeout=120s 从"正在变薄的余量"拉回安全区（45 条 × 最坏 1372ms 已达 62 秒）。
 func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem, error) {
-	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
 		return nil, retryableOrNot(err)
 	}
@@ -1791,7 +1819,7 @@ func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredIte
 	if n <= 0 {
 		n = defaultTopN
 	}
-	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
 		return nil, retryableOrNot(err)
 	}
@@ -1850,7 +1878,7 @@ func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredIte
 // （Push 按本切片顺序拼卡），而 Score 的产出还要过一遍 RankTopN 重排。
 // 换句话说，这里若按完成先后收集，同一批内容每次推送的卡面顺序都会不一样。
 func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard, error) {
-	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
 		return nil, retryableOrNot(err)
 	}
@@ -1967,7 +1995,7 @@ func logPipelineItemFailure(ctx context.Context, message string, contentItemID i
 // CodeValidation 不可重试（闸门/幂等键传空是代码 bug，重试只是重复失败，
 // 让它立刻失败并在 Warn 里露出来）。
 func (a *Activities) RecordEmptyBatch(ctx context.Context, in RecordEmptyIn) error {
-	if _, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run); compiled {
+	if _, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run); compiled {
 		if err != nil {
 			return retryableOrNot(err)
 		}
@@ -2012,7 +2040,7 @@ func (a *Activities) RecordEmptyBatch(ctx context.Context, in RecordEmptyIn) err
 // 收件人是飞书 owner（M3 单用户）；无 owner 直接失败。单卡推送失败跳过，
 // 只要有一张成功就算 done，全失败则 failed 并返回错误。
 func (a *Activities) Push(ctx context.Context, in PushIn) error {
-	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
 		return retryableOrNot(err)
 	}
@@ -2353,7 +2381,7 @@ type NotifyEmptyIn struct {
 // best-effort：通知失败只记日志不返回错误——空批次是正常终态（红线），
 // 不能让一张通知卡的失败把它变成 workflow 失败。
 func (a *Activities) NotifyEmptyResult(ctx context.Context, in NotifyEmptyIn) error {
-	snapshot, compiled, err := a.loadCompiledRunV1(ctx, in.UserID, in.Run)
+	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
 		return retryableOrNot(err)
 	}

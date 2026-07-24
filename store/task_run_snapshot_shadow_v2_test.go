@@ -507,7 +507,7 @@ func TestTaskRunSnapshotShadowV2RejectsReSealedFalseMatch(t *testing.T) {
 	}
 }
 
-func TestTaskRunSnapshotShadowV2HasOnlyAuditRuntimeConsumer(t *testing.T) {
+func TestTaskRunSnapshotShadowV2HasOnlyExplicitRuntimeConsumers(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("cannot locate shadow test")
@@ -517,15 +517,17 @@ func TestTaskRunSnapshotShadowV2HasOnlyAuditRuntimeConsumer(t *testing.T) {
 		filepath.Clean(filepath.Join(repoRoot, "store", "task_run_snapshot_shadow_v2.go")):    true,
 		filepath.Clean(filepath.Join(repoRoot, "store", "task_run_snapshot_shadow_audit.go")): true,
 		filepath.Clean(filepath.Join(repoRoot, "store", "task_run_snapshot_consumer_v2.go")):  true,
+		filepath.Clean(filepath.Join(repoRoot, "store", "task_run_snapshot_authority.go")):    true,
 		filepath.Clean(filepath.Join(repoRoot, "store", "tenant_purge.go")):                   true,
 	}
 	allowedCalls := map[string]bool{
-		"CreateOrGetCompiledRunSnapshotShadowV2|workflow/activities.go|PrepareRun":                                   true,
-		"AuditCompiledTaskRunSnapshotV2|workflow/activities.go|auditCompiledSnapshotV2":                              true,
-		"AuditTaskRunSnapshotShadowsV2Through|cmd/runtimeadmin/main.go|runSnapshotShadow":                            true,
-		"AuditTaskRunSnapshotShadowsV2Through|store/task_run_snapshot_shadow_audit.go|AuditTaskRunSnapshotShadowsV2": true,
-		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_consumer_v2.go|AuditCompiledTaskRunSnapshotV2":       true,
-		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_shadow_audit.go|auditTaskRunSnapshotShadowsV2":       true,
+		"CreateOrGetCompiledRunSnapshotShadowV2|workflow/activities.go|PrepareRun":                                     true,
+		"AuditCompiledTaskRunSnapshotV2|workflow/activities.go|auditCompiledSnapshotV2":                                true,
+		"AuditTaskRunSnapshotShadowsV2Through|cmd/runtimeadmin/main.go|runSnapshotShadow":                              true,
+		"AuditTaskRunSnapshotShadowsV2Through|store/task_run_snapshot_shadow_audit.go|AuditTaskRunSnapshotShadowsV2":   true,
+		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_consumer_v2.go|AuditCompiledTaskRunSnapshotV2":         true,
+		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_shadow_audit.go|auditTaskRunSnapshotShadowsV2":         true,
+		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_authority.go|loadAuthoritativeCompiledTaskRunSnapshot": true,
 	}
 	guardedCalls := map[string]bool{
 		"CreateOrGetCompiledRunSnapshotShadowV2": true,
@@ -600,13 +602,34 @@ func TestTaskRunSnapshotShadowV2HasOnlyAuditRuntimeConsumer(t *testing.T) {
 		t.Fatalf("v2 shadow table escaped persistence/audit boundary: %v", escaped)
 	}
 
-	reader, err := os.ReadFile(filepath.Join(
-		repoRoot, "store", "task_run_snapshot_consumer_v2.go"))
+	for _, readerName := range []string{
+		"task_run_snapshot_consumer_v2.go",
+	} {
+		reader, err := os.ReadFile(filepath.Join(
+			repoRoot, "store", readerName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if violations := retainedV2CurrentStateViolations(reader); len(violations) != 0 {
+			t.Errorf("retained v2 reader %s reached current state: %v",
+				readerName, violations)
+		}
+	}
+	authorityReader, err := os.ReadFile(filepath.Join(
+		repoRoot, "store", "task_run_snapshot_authority.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if violations := retainedV2CurrentStateViolations(reader); len(violations) != 0 {
-		t.Errorf("retained v2 audit reader reached current state: %v", violations)
+	for _, forbidden := range [][]byte{
+		[]byte("FROM schedules"),
+		[]byte("JOIN schedules"),
+		[]byte("task_approved_definition_versions"),
+		[]byte("task_adaptive_states"),
+		[]byte("ORDER BY"),
+	} {
+		if bytes.Contains(authorityReader, forbidden) {
+			t.Errorf("authority reader reached mutable/latest state %q", forbidden)
+		}
 	}
 
 	for _, table := range []string{

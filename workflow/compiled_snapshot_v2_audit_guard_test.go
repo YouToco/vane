@@ -33,16 +33,31 @@ func TestCompiledSnapshotV2AuditRouterCoversEveryCompiledActivity(t *testing.T) 
 		"RecordEmptyBatch", "Push", "NotifyEmptyResult",
 	} {
 		if got := countCallsInFunction(
-			functions[name], "loadCompiledRunV1"); got != 1 {
-			t.Errorf("%s loadCompiledRunV1 calls = %d, want 1", name, got)
+			functions[name], "loadAuthoritativeCompiledRun"); got != 1 {
+			t.Errorf("%s loadAuthoritativeCompiledRun calls = %d, want 1",
+				name, got)
 		}
+	}
+	if got := countCallsInFunction(
+		functions["PrepareRun"],
+		"LoadAuthoritativeCompiledTaskRunSnapshot",
+	); got != 1 {
+		t.Errorf("PrepareRun authoritative Store loads = %d, want 1", got)
 	}
 	if got := countCallsInFunction(
 		functions["PrepareRun"], "auditCompiledSnapshotV2"); got != 1 {
 		t.Errorf("PrepareRun audit router calls = %d, want 1", got)
 	}
 	if got := countCallsInFunction(
-		functions["loadCompiledRunV1"], "auditCompiledSnapshotV2"); got != 1 {
+		functions["loadAuthoritativeCompiledRun"],
+		"LoadAuthoritativeCompiledTaskRunSnapshot",
+	); got != 1 {
+		t.Errorf("common consumer authoritative Store loads = %d, want 1", got)
+	}
+	if got := countCallsInFunction(
+		functions["loadAuthoritativeCompiledRun"],
+		"auditCompiledSnapshotV2",
+	); got != 1 {
 		t.Errorf("common consumer audit router calls = %d, want 1", got)
 	}
 	if got := countCallsInFunction(
@@ -57,6 +72,7 @@ func TestCompiledSnapshotV2AuditRouterCoversEveryCompiledActivity(t *testing.T) 
 	for _, forbidden := range [][]byte{
 		[]byte("AuditCompiledTaskRunSnapshotV2"),
 		[]byte("snapshot_v2_read_audit"),
+		[]byte("LoadCompiledTaskRunSnapshotV1"),
 	} {
 		if bytes.Contains(workflowSource, forbidden) {
 			t.Errorf("workflow history path contains audit-only symbol %q", forbidden)

@@ -1102,18 +1102,30 @@ func TestTaskRunSnapshots_MigrationShape(t *testing.T) {
 	if strings.Join(privileges, ",") != "INSERT,SELECT" {
 		t.Fatalf("immutable table 对 vane_app 只应 INSERT/SELECT，实际 %v", privileges)
 	}
-	var taskFKs int
+	var currentTaskDependencyPaths int
 	if err := f.st.pool.QueryRow(ctx,
-		`SELECT count(*)
-		   FROM pg_constraint c
-		   JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=ANY(c.conkey)
-		  WHERE c.conrelid='task_run_snapshots'::regclass AND c.contype='f'
-		    AND a.attname='task_id'`,
-	).Scan(&taskFKs); err != nil {
+		`WITH RECURSIVE referenced(relid) AS (
+		    SELECT c.confrelid
+		      FROM pg_constraint c
+		     WHERE c.conrelid='task_run_snapshots'::regclass
+		       AND c.contype='f'
+		    UNION
+		    SELECT c.confrelid
+		      FROM pg_constraint c
+		      JOIN referenced r ON r.relid=c.conrelid
+		     WHERE c.contype='f'
+		)
+		SELECT count(*) FROM referenced
+		 WHERE relid IN (
+		    'schedules'::regclass,
+		    'task_approved_definition_versions'::regclass
+		 )`,
+	).Scan(&currentTaskDependencyPaths); err != nil {
 		t.Fatal(err)
 	}
-	if taskFKs != 0 {
-		t.Fatalf("task_id 必须无 FK 以保留删任务后的审计，实际 %d", taskFKs)
+	if currentTaskDependencyPaths != 0 {
+		t.Fatalf("task run snapshot 不得经任何 FK 路径回指 current task，实际 %d",
+			currentTaskDependencyPaths)
 	}
 	var payloadType string
 	if err := f.st.pool.QueryRow(ctx,
