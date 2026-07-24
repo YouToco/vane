@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -10,7 +11,9 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +21,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/YouToco/vane/types"
 )
 
 type taskRunSnapshotCutoverFixture struct {
@@ -45,10 +50,26 @@ func newTaskRunSnapshotCutoverFixture(
 	if err != nil || baseline.Status != TaskDefinitionBaselineApplied {
 		t.Fatalf("apply cutover baseline = %+v, %v", baseline, err)
 	}
-	canary, err := base.st.createOrGetTaskRunSnapshotWithShadowV2(
-		t.Context(), base.params(taskID, "cutover-canary-"+uuid.NewString()), true)
+	canaryIdentity := types.RunIdentity{
+		TemporalWorkflowID: scheduledTaskWorkflowID(taskID),
+		TemporalRunID:      "cutover-canary-" + uuid.NewString(),
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           base.tenantID,
+		UserID:             base.userID,
+		TaskID:             taskID,
+	}
+	canaryRef, err := base.st.CreateOrGetCompiledRunSnapshotShadowV2(
+		t.Context(), canaryIdentity, testCompiledRunPolicyV1(t))
 	if err != nil {
 		t.Fatalf("create cutover canary: %v", err)
+	}
+	canary, err := scanTaskRunSnapshot(base.st.pool.QueryRow(t.Context(),
+		`SELECT `+taskRunSnapshotColumns+`
+		   FROM task_run_snapshots
+		  WHERE id=$1`,
+		canaryRef.SnapshotID))
+	if err != nil {
+		t.Fatalf("load cutover canary: %v", err)
 	}
 	eventID := insertCutoverEventAndPointSchedule(
 		t, base.st, base.tenantID, base.userID, taskID,
@@ -359,6 +380,142 @@ func TestTaskRunSnapshotCutoverMarkerRejectsSidecarEmbeddingOtherParent(
 	if err := tx.Commit(t.Context()); err == nil {
 		t.Fatal("marked parent accepted a sidecar embedding another parent")
 	}
+}
+
+func TestTaskRunSnapshotCutoverMarkerRejectsSemanticOnlyParentMatch(
+	t *testing.T,
+) {
+	f := newTaskRunSnapshotCutoverFixture(t)
+	mutations := map[string]func([]byte) []byte{
+		"number spelling": func(raw []byte) []byte {
+			return bytes.Replace(raw, []byte(":0"), []byte(":0.0"), 1)
+		},
+		"root key order": reorderJSONObjectKeysDescending,
+		"insignificant whitespace": func(raw []byte) []byte {
+			return append([]byte{'{', ' '}, raw[1:]...)
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			mutated := mutate(bytes.Clone(f.canary.Payload))
+			if bytes.Equal(mutated, f.canary.Payload) ||
+				!json.Valid(mutated) ||
+				!jsonSemanticallyEqual(mutated, f.canary.Payload) {
+				t.Fatalf("fixture is not a semantic-only mutation:\n%s\n%s",
+					f.canary.Payload, mutated)
+			}
+			assertCutoverMarkerRejectsEmbeddedPayload(
+				t, f, mutated)
+		})
+	}
+}
+
+func assertCutoverMarkerRejectsEmbeddedPayload(
+	t *testing.T,
+	f taskRunSnapshotCutoverFixture,
+	embedded []byte,
+) {
+	t.Helper()
+	tx, err := f.base.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollbackCompiledTaskTx(t.Context(), tx)
+	setCutoverTenantContext(t, tx, f.base.tenantID)
+
+	runID := "cutover-semantic-parent-" + uuid.NewString()
+	var parentID int64
+	var workflowID string
+	if err := tx.QueryRow(t.Context(),
+		cloneTaskRunSnapshotSQL+` RETURNING id, temporal_workflow_id`,
+		f.canary.ID, runID, f.eventID,
+	).Scan(&parentID, &workflowID); err != nil {
+		t.Fatalf("insert marked parent: %v", err)
+	}
+	var templateRaw []byte
+	if err := tx.QueryRow(t.Context(),
+		`SELECT payload FROM task_run_snapshot_v2_shadows
+		  WHERE run_snapshot_id=$1`,
+		f.canary.ID).Scan(&templateRaw); err != nil {
+		t.Fatal(err)
+	}
+	envelope, _, err := readTaskRunSnapshotShadowPayloadV2(templateRaw)
+	if err != nil {
+		t.Fatalf("decode sidecar template: %v", err)
+	}
+	envelope.Identity.TemporalWorkflowID = workflowID
+	envelope.Identity.TemporalRunID = runID
+	envelope.Legacy.SnapshotID = parentID
+	envelope.Legacy.Payload = bytes.Clone(f.canary.Payload)
+	outer, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer = bytes.Replace(
+		outer, f.canary.Payload, embedded, 1)
+	if !bytes.Contains(outer, embedded) {
+		t.Fatal("semantic mutation was not retained in sidecar bytes")
+	}
+	var approvedVersion *int64
+	var approvedDigest *string
+	if envelope.Approved != nil {
+		approvedVersion = &envelope.Approved.Version
+		approvedDigest = &envelope.Approved.Digest
+	}
+	var adaptiveDigest *string
+	if envelope.Adaptive != nil {
+		adaptiveDigest = &envelope.Adaptive.Digest
+	}
+	if _, err := tx.Exec(t.Context(),
+		`INSERT INTO task_run_snapshot_v2_shadows (
+		    run_snapshot_id,tenant_id,user_id,task_id,
+		    temporal_workflow_id,temporal_run_id,status,
+		    approved_definition_version,approved_definition_digest,
+		    adaptive_version,adaptive_digest,payload,payload_digest
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		parentID, f.base.tenantID, f.base.userID, f.taskID,
+		workflowID, runID, envelope.Status,
+		approvedVersion, approvedDigest,
+		adaptiveVersionValue(envelope.Adaptive), adaptiveDigest,
+		outer, sha256Hex(outer),
+	); err != nil {
+		t.Fatalf("insert semantic-only sidecar: %v", err)
+	}
+	if err := tx.Commit(t.Context()); err == nil {
+		t.Fatal("marked parent accepted semantic-only embedded parent bytes")
+	}
+}
+
+func reorderJSONObjectKeysDescending(raw []byte) []byte {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || len(fields) < 2 {
+		return raw
+	}
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	var out bytes.Buffer
+	out.WriteByte('{')
+	for i, key := range keys {
+		if i > 0 {
+			out.WriteByte(',')
+		}
+		encodedKey, _ := json.Marshal(key)
+		out.Write(encodedKey)
+		out.WriteByte(':')
+		out.Write(fields[key])
+	}
+	out.WriteByte('}')
+	return out.Bytes()
+}
+
+func jsonSemanticallyEqual(left, right []byte) bool {
+	var leftValue, rightValue any
+	return json.Unmarshal(left, &leftValue) == nil &&
+		json.Unmarshal(right, &rightValue) == nil &&
+		reflect.DeepEqual(leftValue, rightValue)
 }
 
 func TestTaskRunSnapshotCutoverActivePinDriftFailsAllNewWriters(t *testing.T) {

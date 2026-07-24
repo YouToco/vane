@@ -413,10 +413,17 @@ BEGIN
        AND sh.status = 'match'
        AND sh.approved_definition_version = event_definition_version
        AND sh.approved_definition_digest = event_definition_digest
-       AND convert_from(sh.payload, 'UTF8')::jsonb
+       AND convert_from(sh.payload, 'UTF8')::json
             #>> '{legacy,payload_digest}' = NEW.payload_digest
-       AND convert_from(sh.payload, 'UTF8')::jsonb
-            #> '{legacy,payload}' = convert_from(NEW.payload, 'UTF8')::jsonb;
+       -- json (not jsonb) preserves the selected child value's original
+       -- number spelling, key order, and whitespace. Comparing the selected
+       -- bytes prevents a semantically-equal sidecar from claiming a different
+       -- retained parent body.
+       AND convert_to(
+               (convert_from(sh.payload, 'UTF8')::json
+                    #> '{legacy,payload}')::text,
+               'UTF8'
+           ) = NEW.payload;
 
     IF shadow_count <> 1 THEN
         RAISE EXCEPTION
