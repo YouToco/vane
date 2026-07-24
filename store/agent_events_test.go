@@ -492,6 +492,9 @@ func TestAgentEventsListAndReplayFailClosedOnCorruption(t *testing.T) {
 			events[1].ID, originalDigest,
 		)
 	})
+	if listed, err := f.store.ListAgentEvents(ctx, f.scopeA(), 0, 1); !errors.Is(err, types.ErrInternal) || listed != nil {
+		t.Fatalf("corrupt second row crossed first-page boundary: events=%+v err=%v", listed, err)
+	}
 	if listed, err := f.store.ListAgentEvents(ctx, f.scopeA(), 0, 10); !errors.Is(err, types.ErrInternal) || listed != nil {
 		t.Fatalf("corrupt List events=%+v err=%v", listed, err)
 	}
@@ -649,17 +652,23 @@ func TestAgentEventLedgerHasZeroProductionCallPoints(t *testing.T) {
 			}
 			return nil
 		}
-		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") ||
-			filepath.Clean(path) == provider {
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
 		if err != nil {
 			return err
 		}
+		var allowed map[token.Pos]struct{}
+		if filepath.Clean(path) == provider {
+			allowed, err = agentEventLedgerProviderDeclarations(file)
+			if err != nil {
+				return err
+			}
+		}
 		violations = append(
 			violations,
-			agentEventLedgerForbiddenReferences(fset, file)...,
+			agentEventLedgerForbiddenReferences(fset, file, allowed)...,
 		)
 		return nil
 	})
@@ -687,15 +696,43 @@ var byName = "ListAgentEvents"
 	if err != nil {
 		t.Fatal(err)
 	}
-	violations := agentEventLedgerForbiddenReferences(fset, file)
+	violations := agentEventLedgerForbiddenReferences(fset, file, nil)
 	if len(violations) < 4 {
 		t.Fatalf("method value/interface/wrapper escaped guard: %v", violations)
+	}
+}
+
+func TestAgentEventLedgerGuardCatchesProviderWrapper(t *testing.T) {
+	t.Parallel()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "agent_events.go", `package store
+type Store struct{}
+func (s *Store) AppendAgentEvents() {}
+func (s *Store) ListAgentEvents() {}
+func (s *Store) ReplayAgentEvents() {}
+func (s *Store) hiddenAppendWrapper() {
+	s.AppendAgentEvents()
+}
+`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := agentEventLedgerProviderDeclarations(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations := agentEventLedgerForbiddenReferences(fset, file, allowed)
+	if !slices.ContainsFunc(violations, func(violation string) bool {
+		return strings.Contains(violation, "AppendAgentEvents")
+	}) {
+		t.Fatalf("provider-local wrapper escaped zero-call guard: %v", violations)
 	}
 }
 
 func agentEventLedgerForbiddenReferences(
 	fset *token.FileSet,
 	file *ast.File,
+	allowed map[token.Pos]struct{},
 ) []string {
 	sensitive := map[string]struct{}{
 		"AppendAgentEvents": {},
@@ -707,6 +744,9 @@ func agentEventLedgerForbiddenReferences(
 		switch typed := node.(type) {
 		case *ast.Ident:
 			if _, forbidden := sensitive[typed.Name]; forbidden {
+				if _, ok := allowed[typed.Pos()]; ok {
+					return true
+				}
 				violations = append(violations,
 					fmt.Sprintf("%s: forbidden Agent event ledger reference %s",
 						fset.Position(typed.Pos()), typed.Name))
@@ -722,4 +762,50 @@ func agentEventLedgerForbiddenReferences(
 		return true
 	})
 	return violations
+}
+
+func agentEventLedgerProviderDeclarations(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	want := map[string]int{
+		"AppendAgentEvents": 0,
+		"ListAgentEvents":   0,
+		"ReplayAgentEvents": 0,
+	}
+	allowed := make(map[token.Pos]struct{}, len(want))
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Recv == nil {
+			continue
+		}
+		if _, sensitive := want[function.Name.Name]; !sensitive {
+			continue
+		}
+		if len(function.Recv.List) != 1 ||
+			!agentEventLedgerStoreReceiver(function.Recv.List[0].Type) {
+			return nil, fmt.Errorf(
+				"Agent event ledger provider %s has a non-Store receiver",
+				function.Name.Name,
+			)
+		}
+		want[function.Name.Name]++
+		allowed[function.Name.Pos()] = struct{}{}
+	}
+	for name, count := range want {
+		if count != 1 {
+			return nil, fmt.Errorf(
+				"Agent event ledger provider must declare %s exactly once, got %d",
+				name, count,
+			)
+		}
+	}
+	return allowed, nil
+}
+
+func agentEventLedgerStoreReceiver(expression ast.Expr) bool {
+	if star, ok := expression.(*ast.StarExpr); ok {
+		expression = star.X
+	}
+	identifier, ok := expression.(*ast.Ident)
+	return ok && identifier.Name == "Store"
 }
