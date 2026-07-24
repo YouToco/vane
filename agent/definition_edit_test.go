@@ -113,13 +113,14 @@ func TestBuildTools_DefinitionEditFlagBoundary(t *testing.T) {
 	if tool == nil {
 		t.Fatal("enabled BuildTools did not register edit_task_definition")
 	}
-	if !tool.Mutating() {
+	if tool.Policy.Confirmation != ConfirmationRequired ||
+		!tool.Policy.Effects.Has(EffectDurableProposal) {
 		t.Fatal("edit_task_definition must require a confirmation card")
 	}
 	var schema struct {
 		Required []string `json:"required"`
 	}
-	if err := json.Unmarshal(tool.Parameters(), &schema); err != nil {
+	if err := json.Unmarshal(tool.Definition.Parameters, &schema); err != nil {
 		t.Fatalf("tool schema is invalid: %v", err)
 	}
 	if len(schema.Required) != 1 || schema.Required[0] != "task_id" {
@@ -350,10 +351,10 @@ func TestRecordDefinitionEditReceiptSessionUsesAgentUserLock(t *testing.T) {
 	}
 }
 
-func toolNamed(tools []Tool, name string) Tool {
-	for _, tool := range tools {
-		if tool.Name() == name {
-			return tool
+func toolNamed(tools []ToolSpec, name string) *ToolSpec {
+	for i := range tools {
+		if tools[i].Name() == name {
+			return &tools[i]
 		}
 	}
 	return nil

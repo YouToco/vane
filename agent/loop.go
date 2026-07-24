@@ -155,18 +155,6 @@ const (
 	toolResultPreviewMaxRunes = 8192
 )
 
-// Tool 是 agent 可用工具。Mutating=true 的工具不由 loop 直接执行，走确认卡。
-type Tool interface {
-	Name() string
-	Description() string
-	Parameters() json.RawMessage // JSON schema（对齐 M4 spike 里验证过的形态）
-	Mutating() bool
-	// Execute 返回给模型/用户看的结果文本（中文）。参数是模型产出的 arguments 原始 JSON。
-	Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error)
-	// Summarize 把 args 渲染成确认卡上的人类可读摘要（仅 Mutating 工具需要有意义实现）。
-	Summarize(args json.RawMessage) string
-}
-
 // Store 是 agent 所需 store 方法的窄接口（契约 §2 全部 7 个方法，
 // 与 *store.Store 签名逐字一致）。
 // 收窄的目的：agent 单测用内存假实现即可，不依赖数据库；生产由 *store.Store 满足。
@@ -223,7 +211,7 @@ type Deps struct {
 	Recorder   *llm.Recorder
 	Store      Store         // 窄接口：契约 §2 全部 7 个方法
 	Profiles   ProfileReader // 画像读取（M5 契约 §12.2），system 注入 [用户画像] 段
-	Tools      []Tool
+	Tools      []ToolSpec
 	Model      string        // cfg.LLM.AgentModel
 	MaxTurns   int           // cfg.Agent.MaxTurns
 	SessionTTL time.Duration // cfg.Agent.SessionTTLMinutes
@@ -304,9 +292,9 @@ type Loop struct {
 	chatFn             func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
 	store              Store
 	profiles           ProfileReader
-	tools              map[string]Tool // 按 Name 索引的白名单注册表（静态部分）
-	toolDefs           []llm.ToolDef   // 预构建的静态工具声明；动态端点声明按会话追加在其后
-	endpoints          *EndpointTools  // 动态端点工具面，nil = 未装配
+	tools              map[string]ToolSpec // 按 Name 索引的受信白名单注册表（静态部分）
+	toolDefs           []llm.ToolDef       // 预构建的静态工具声明；动态端点声明按会话追加在其后
+	endpoints          *EndpointTools      // 动态端点工具面，nil = 未装配
 	toolCalls          *ToolCallRecorder
 	taskCreation       CreationController
 	taskDefinitionEdit DefinitionEditController
@@ -344,9 +332,20 @@ type chatMeta struct {
 	userID  int64
 }
 
-// New 构造 Loop。MaxTurns/SessionTTL 的非法值（<=0）兜底为 config 默认值，
-// 避免装配疏漏造成"一轮都不跑"或"每条消息都新开会话"。
+// New 构造 Loop。非法工具装配属于本地编程错误，必须在进程接流量前 fail-fast；
+// 需要显式处理错误的测试/装配校验可调用 NewChecked。
 func New(d Deps) *Loop {
+	l, err := NewChecked(d)
+	if err != nil {
+		panic(err)
+	}
+	return l
+}
+
+// NewChecked validates the complete local registry before constructing a Loop.
+// Duplicate names, invalid schemas and zero/contradictory policies are rejected
+// rather than silently dropped or overwritten.
+func NewChecked(d Deps) (*Loop, error) {
 	maxTurns := d.MaxTurns
 	if maxTurns < 1 {
 		maxTurns = defaultMaxTurns
@@ -356,15 +355,17 @@ func New(d Deps) *Loop {
 		ttl = defaultSessionTTL
 	}
 
-	tools := make(map[string]Tool, len(d.Tools))
+	tools := make(map[string]ToolSpec, len(d.Tools))
 	defs := make([]llm.ToolDef, 0, len(d.Tools))
-	for _, t := range d.Tools {
-		tools[t.Name()] = t
-		defs = append(defs, llm.ToolDef{
-			Name:        t.Name(),
-			Description: t.Description(),
-			Parameters:  t.Parameters(),
-		})
+	for _, spec := range d.Tools {
+		if err := spec.validate(); err != nil {
+			return nil, fmt.Errorf("agent: invalid tool %q: %w", spec.Name(), err)
+		}
+		if _, exists := tools[spec.Name()]; exists {
+			return nil, fmt.Errorf("agent: duplicate tool name %q", spec.Name())
+		}
+		tools[spec.Name()] = spec
+		defs = append(defs, spec.Definition)
 	}
 
 	// system prompt：自定义（A2A 轨）优先，零值回落默认飞书常量。
@@ -416,7 +417,7 @@ func New(d Deps) *Loop {
 		defer cancel()
 		return llm.DoChat(cctx, d.Client, d.Recorder, meta, req)
 	}
-	return l
+	return l, nil
 }
 
 // HandleMessage 执行完整 agent loop（契约 §7）：取/建会话 → 多轮 FC →
@@ -777,23 +778,16 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 	if state != nil && state.directTaskCreation {
 		// 用户已经明确要求按当前消息直接出任务确认卡：只缩小工具面，不扩大
 		// 权限。create_schedule 仍只生成 durable proposal，真正执行必须点卡。
-		tool, ok := l.tools["create_schedule"]
-		if !ok || !tool.Mutating() {
+		spec, ok := l.tools["create_schedule"]
+		if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
+			spec.Policy.Confirmation != ConfirmationRequired {
 			return nil
 		}
-		// New 的 map 语义是同名后注册者生效；从尾部取声明，确保 schema 与
-		// runToolCalls 最终解析到的是同一个注册项。
-		for i := len(l.toolDefs) - 1; i >= 0; i-- {
-			def := l.toolDefs[i]
-			if def.Name == "create_schedule" {
-				direct, ok := projectDirectTaskCreationToolDef(def)
-				if !ok {
-					return nil
-				}
-				return []llm.ToolDef{direct}
-			}
+		direct, ok := projectDirectTaskCreationToolDef(spec.Definition)
+		if !ok {
+			return nil
 		}
-		return nil
+		return []llm.ToolDef{direct}
 	}
 	if l.endpoints == nil {
 		return l.toolDefs
@@ -847,32 +841,33 @@ func projectDirectTaskCreationToolDef(def llm.ToolDef) (llm.ToolDef, bool) {
 
 // resolveTool 按扩展白名单解析工具（M4 契约 §10 + 端点注册表契约 §4）：
 // 静态注册表优先，未命中再查「会话已激活端点」。两者都未命中 = 模型编造，拒绝。
-func (l *Loop) resolveTool(name string, state *toolRunState) (Tool, bool) {
+func (l *Loop) resolveTool(name string, state *toolRunState) (ToolSpec, bool) {
 	if tool, ok := l.tools[name]; ok {
 		return tool, ok
 	}
 	if l.endpoints != nil && state != nil {
 		return l.endpoints.Resolve(name, state.activation)
 	}
-	return nil, false
+	return ToolSpec{}, false
 }
 
-func isUntrustedResultTool(tool Tool) bool {
-	marker, ok := tool.(interface{ untrustedResult() bool })
-	return ok && marker.untrustedResult()
+func isUntrustedResultTool(spec ToolSpec) bool {
+	return spec.Policy.Effects.Has(EffectTrustTaint)
 }
 
-func isSafeAfterUntrusted(tool Tool) bool {
-	marker, ok := tool.(interface{ safeAfterUntrusted() bool })
-	return ok && marker.safeAfterUntrusted()
+func isSafeAfterUntrusted(spec ToolSpec) bool {
+	return spec.Policy.Effects.Has(EffectLocalHandleRead)
 }
 
-func canDeclareAfterUntrusted(state *toolRunState, tool Tool) bool {
-	return state != nil && state.hasLocalResultHandles() && isSafeAfterUntrusted(tool)
+func canDeclareAfterUntrusted(state *toolRunState, spec ToolSpec) bool {
+	return state != nil && state.hasLocalResultHandles() && isSafeAfterUntrusted(spec)
 }
 
-func canRunAfterUntrusted(state *toolRunState, tool Tool, args json.RawMessage) bool {
-	continuation, ok := tool.(interface {
+func canRunAfterUntrusted(state *toolRunState, spec ToolSpec, args json.RawMessage) bool {
+	if !spec.Policy.Effects.Has(EffectLocalHandleRead) {
+		return false
+	}
+	continuation, ok := spec.Tool.(interface {
 		allowedAfterUntrusted(*toolRunState, json.RawMessage) bool
 	})
 	return ok && continuation.allowedAfterUntrusted(state, args)
@@ -913,8 +908,9 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			}
 			return nil, out, nil
 		}
-		tool, ok := l.tools["create_schedule"]
-		if !ok || !tool.Mutating() {
+		spec, ok := l.tools["create_schedule"]
+		if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
+			spec.Policy.Confirmation != ConfirmationRequired {
 			state.directTaskCreationToolRejected = true
 			for _, rejected := range calls {
 				out = append(out, toolMsg(rejected.ID,
@@ -947,7 +943,7 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			continue
 		}
 
-		tool, ok := l.resolveTool(tc.Name, runStateFrom(ctx))
+		spec, ok := l.resolveTool(tc.Name, runStateFrom(ctx))
 		if !ok {
 			// 白名单红线（契约 §10）：未注册/未激活工具名一律拒绝，
 			// 以错误文本回给模型自纠，继续循环。
@@ -960,7 +956,7 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		// 不读内部数据、不访问外网、不执行、不落 pending。
 		if state := runStateFrom(ctx); state != nil && state.untrustedExternalResult {
 			args := json.RawMessage(tc.Arguments)
-			if localContinuationUsed || !canRunAfterUntrusted(state, tool, args) {
+			if localContinuationUsed || !canRunAfterUntrusted(state, spec, args) {
 				out = append(out, toolMsg(tc.ID, toolMsgUntrustedBoundary))
 				continue
 			}
@@ -970,8 +966,8 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		}
 
 		args := json.RawMessage(tc.Arguments)
-		if !tool.Mutating() {
-			result, err := l.execRecorded(ctx, userID, sessionID, tool, args)
+		if spec.Policy.Confirmation == ConfirmationNone {
+			result, err := l.execRecorded(ctx, userID, sessionID, spec, args)
 			if err != nil {
 				// 读工具失败不判整轮死刑：错误文本回给模型，由它决定换参数重试
 				// 还是向用户解释。只取 AppError.Message（人话），**不用 err.Error()**
@@ -1108,7 +1104,7 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			SessionID: sessionID,
 			ToolName:  tc.Name,
 			Args:      args,
-			Summary:   tool.Summarize(args),
+			Summary:   spec.Summarize(args),
 			Status:    types.PendingActionStatusPending,
 			ExpiresAt: time.Now().Add(pendingActionTTL),
 		}
@@ -1400,8 +1396,9 @@ func (l *Loop) firstExternalReadIndex(calls []llm.ToolCall, state *toolRunState)
 		return -1
 	}
 	for i, tc := range calls {
-		tool, ok := l.resolveTool(tc.Name, state)
-		if ok && !tool.Mutating() && isUntrustedResultTool(tool) {
+		spec, ok := l.resolveTool(tc.Name, state)
+		if ok && spec.Policy.Confirmation == ConfirmationNone &&
+			isUntrustedResultTool(spec) {
 			return i
 		}
 	}
@@ -1538,7 +1535,7 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 		return reply, nil
 	}
 
-	tool, ok := l.tools[pa.ToolName]
+	spec, ok := l.tools[pa.ToolName]
 	if !ok {
 		// 工具注册表是唯一可调用面：落库后被下线的工具同样拒绝。
 		reply := fmt.Sprintf("工具 %s 已不可用，本次操作未执行。", pa.ToolName)
@@ -1551,7 +1548,7 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 	// 独立 trace，让 Agent 外层工具行与 add_source Probe 等 fetcher 上游行
 	// 仍可按唯一 trace 配对；已有 meta（测试/未来内部调用）则原样复用。
 	ctx = ensureCardActionTrace(ctx, userID)
-	result, err := l.execRecorded(ctx, userID, pa.SessionID, tool, pa.Args)
+	result, err := l.execRecorded(ctx, userID, pa.SessionID, spec, pa.Args)
 	if err != nil {
 		// 失败同样回写：模型该知道动作已被消耗且未成功，而不是继续等确认。
 		// 只落 AppError.Message 不落完整错误链——Cause 可能携带连接串、SQL
@@ -1563,7 +1560,7 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 			msg = ae.Message
 		}
 		callback := fmt.Sprintf("[卡片回调] 用户已点击「确认」，但执行失败：%s", msg)
-		if isUntrustedResultTool(tool) {
+		if isUntrustedResultTool(spec) {
 			// 外部试跑的失败 Message 同样可能携带页面声明 URL/标题/上游
 			// 摘要；“失败”不等于“没有读到外部内容”。
 			callback = untrustedFailurePlaceholder
@@ -1572,7 +1569,7 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 		return "", err
 	}
 	callback := fmt.Sprintf("[卡片回调] 用户已点击「确认」，操作已执行：%s。执行结果：%s", pa.Summary, result)
-	if isUntrustedResultTool(tool) {
+	if isUntrustedResultTool(spec) {
 		// add_source 等确认动作会在执行期试跑外部源；详细结果可以展示给用户，
 		// 但不能作为下一轮模型历史回灌。tool_calls 账本仍保留审计摘要。
 		callback = untrustedCallbackPlaceholder
@@ -2011,15 +2008,15 @@ func (l *Loop) saveSession(ctx context.Context, sess *types.AgentSession, msgs [
 //   - 记录先建、经 ctx 传入工具：search/endpoint 工具回填专属字段（检索词/候选/
 //     HTTP 状态/上游体量），静态工具无感；
 //   - Execute 的 (result, err) 原样透传，记账不改变任何既有错误语义。
-func (l *Loop) execRecorded(ctx context.Context, userID int64, sessionID *int64, tool Tool, args json.RawMessage) (string, error) {
+func (l *Loop) execRecorded(ctx context.Context, userID int64, sessionID *int64, spec ToolSpec, args json.RawMessage) (string, error) {
 	rec := &types.ToolCall{
-		ToolName:  tool.Name(),
+		ToolName:  spec.Name(),
 		ToolKind:  types.ToolCallKindStatic,
 		UserID:    &userID,
 		SessionID: sessionID,
 		Arguments: normalizeArgsJSON(args),
 	}
-	if k, ok := tool.(interface{ toolKind() types.ToolCallKind }); ok {
+	if k, ok := spec.Tool.(interface{ toolKind() types.ToolCallKind }); ok {
 		rec.ToolKind = k.toolKind()
 	}
 	if m, ok := ctx.Value(chatMetaKey{}).(chatMeta); ok {
@@ -2028,9 +2025,9 @@ func (l *Loop) execRecorded(ctx context.Context, userID int64, sessionID *int64,
 	ctx = context.WithValue(ctx, toolCallRecKey{}, rec)
 
 	start := time.Now()
-	result, err := tool.Execute(ctx, userID, args)
+	result, err := spec.Execute(ctx, userID, args)
 	rec.DurationMs = int(time.Since(start).Milliseconds())
-	if isUntrustedResultTool(tool) {
+	if isUntrustedResultTool(spec) {
 		if state := runStateFrom(ctx); state != nil {
 			// 保守地按“工具被调用过”标记：即使这一轮只拿到空结果/固定错误，
 			// 多挡一次写也比把上游边界误判成可信更安全；下一条用户消息自动复位。

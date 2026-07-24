@@ -423,9 +423,8 @@ func (t *fakeTool) Parameters() json.RawMessage {
 	if t.name == "create_schedule" {
 		return json.RawMessage(createScheduleSchema)
 	}
-	return json.RawMessage(`{"type":"object"}`)
+	return json.RawMessage(`{"type":"object","properties":{}}`)
 }
-func (t *fakeTool) Mutating() bool                     { return t.mutating }
 func (t *fakeTool) untrustedResult() bool              { return t.untrusted }
 func (t *fakeTool) Summarize(a json.RawMessage) string { return "摘要:" + string(a) }
 
@@ -471,12 +470,55 @@ func (r *countingProfileReader) GetProfile(context.Context, int64) (*types.Profi
 // newTestLoop 构造注入假 chatFn 的 Loop。Client/Recorder 传 nil：
 // New 生成的默认 chatFn 随即被覆盖，永远不会被调用。
 // Profiles 与 Store 共用同一 fakeStore：无画像行时走 NotFound → 空画像分支。
+func testToolSpecs(tools ...Tool) []ToolSpec {
+	specs := make([]ToolSpec, 0, len(tools))
+	for _, tool := range tools {
+		// Production helpers (ReadPageTool/ReadResultTool/...) already return a
+		// locally trusted ToolSpec. Re-deriving policy from the Tool interface
+		// would drop TrustTaint / LocalHandleRead and silently break isolation.
+		if spec, ok := tool.(ToolSpec); ok {
+			specs = append(specs, spec)
+			continue
+		}
+		declared := tool.(declaredTool)
+		effects := Effects(EffectInternalRead)
+		confirmation := ConfirmationNone
+		budget := BudgetNone
+		fake, isFake := tool.(*fakeTool)
+		if isFake && fake.mutating {
+			effects = Effects(EffectStateWrite)
+			confirmation = ConfirmationRequired
+		}
+		if declared.Name() == "create_schedule" {
+			// Only real durable create tools get proposal policy. Tests may
+			// register a same-named impostor with mutating=false to prove
+			// direct-mode refuses non-durable create_schedule.
+			if !isFake || fake.mutating {
+				effects = Effects(EffectDurableProposal, EffectStateWrite)
+				confirmation = ConfirmationRequired
+			}
+		}
+		if marker, ok := tool.(interface{ untrustedResult() bool }); ok &&
+			marker.untrustedResult() {
+			effects |= Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint)
+			budget = BudgetToolManaged
+		}
+		if declared.Name() == "read_endpoint_result" {
+			effects = Effects(EffectLocalHandleRead, EffectTrustTaint)
+			budget = BudgetNone
+		}
+		specs = append(specs, newToolSpec(declared,
+			ownerPolicy(effects, confirmation, budget)))
+	}
+	return specs
+}
+
 func newTestLoop(t *testing.T, fs *fakeStore, chat func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error), tools ...Tool) *Loop {
 	t.Helper()
 	l := New(Deps{
 		Store:    fs,
 		Profiles: fs,
-		Tools:    tools,
+		Tools:    testToolSpecs(tools...),
 		TaskCreation: &fakeCreationController{
 			confirmErr: task.ErrCreationOperationNotFound,
 			cancelErr:  task.ErrCreationOperationNotFound,
@@ -608,12 +650,13 @@ func TestExternalResultToolTrustClassification(t *testing.T) {
 		"add_source":           &addSourceTool{},
 	}
 	for name, tool := range tools {
-		if !isUntrustedResultTool(tool) {
+		spec := testToolSpecs(tool)[0]
+		if !isUntrustedResultTool(spec) {
 			t.Errorf("%s 会返回外部来源数据，必须标记 untrusted result", name)
 		}
 	}
 	for name, tool := range tools {
-		got := isSafeAfterUntrusted(tool)
+		got := isSafeAfterUntrusted(testToolSpecs(tool)[0])
 		want := name == "read_endpoint_result"
 		if got != want {
 			t.Errorf("%s safeAfterUntrusted=%v，期望 %v", name, got, want)
@@ -2954,7 +2997,7 @@ func TestHandleMessage_MaxTurnsFallback(t *testing.T) {
 			FinishReason: "tool_calls",
 		}, nil
 	}
-	l := New(Deps{Store: fs, Tools: []Tool{readTool}, Model: "deepseek-v4-pro", MaxTurns: 3, SessionTTL: 30 * time.Minute})
+	l := New(Deps{Store: fs, Tools: testToolSpecs(readTool), Model: "deepseek-v4-pro", MaxTurns: 3, SessionTTL: 30 * time.Minute})
 	l.chatFn = stubborn
 
 	out, err := l.HandleMessage(context.Background(), 1, "陷入循环吧")
