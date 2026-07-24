@@ -266,9 +266,26 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		"purge-run-"+uuid.NewString()); err != nil {
 		t.Fatalf("建运行快照清理夹具失败: %v", err)
 	}
+	eventPayload := `{"schema_version":"vane.agent-event/v1","kind":"turn_completed","body":{"outcome":"purge"}}`
+	if _, err := st.pool.Exec(ctx, `
+		INSERT INTO agent_events (
+			tenant_id, user_id, session_id, sequence,
+			batch_idempotency_key, batch_index, batch_size,
+			kind, schema_version, payload, payload_digest, batch_digest
+		) VALUES (
+			$1, $2, $3, 1, $4, 0, 1, 'turn_completed',
+			'vane.agent-event/v1', convert_to($5, 'UTF8'),
+			encode(sha256(convert_to($5, 'UTF8')), 'hex'), repeat('a',64)
+		)`,
+		tn.ID, u.ID, editSessionID, "purge-event-"+uuid.NewString(),
+		eventPayload,
+	); err != nil {
+		t.Fatalf("建 Agent event 清理夹具失败: %v", err)
+	}
 	t.Cleanup(func() {
 		c, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(c, t, st, `DELETE FROM agent_events WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_definition_edit_receipts WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_definition_edit_operations WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_adaptive_states WHERE tenant_id = $1`, tn.ID)
@@ -321,6 +338,10 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 			rep.Rows["task_definition_edit_operations"],
 			rep.Rows["task_definition_edit_receipts"])
 	}
+	if rep.Rows["agent_events"] != 1 {
+		t.Errorf("试运行报告必须包含 Agent event，实得 %d",
+			rep.Rows["agent_events"])
+	}
 
 	// 租户与数据必须原封不动。
 	if _, err := st.GetTenant(ctx, tenantID); err != nil {
@@ -371,6 +392,14 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	if n != 1 {
 		t.Errorf("试运行后 Definition Edit receipt 应还在，实得 %d 行 —— 事务没回滚", n)
 	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events WHERE tenant_id = $1`, tenantID,
+	).Scan(&n); err != nil {
+		t.Fatalf("查 Agent event 失败: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("试运行后 Agent event 应还在，实得 %d 行 —— 事务没回滚", n)
+	}
 }
 
 // TestPurgeTenant_RealDeleteRemovesTenantData：真删要真的删干净。
@@ -400,6 +429,10 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 		t.Errorf("清理报告必须包含 Definition Edit operation/receipt，实得 %d/%d",
 			rep.Rows["task_definition_edit_operations"],
 			rep.Rows["task_definition_edit_receipts"])
+	}
+	if rep.Rows["agent_events"] != 1 {
+		t.Errorf("清理报告必须包含 Agent event，实得 %d",
+			rep.Rows["agent_events"])
 	}
 	if _, err := st.GetTenant(ctx, tenantID); err == nil {
 		t.Error("清理后租户仍存在")
@@ -448,6 +481,14 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("租户数据应被清空，task_definition_edit_receipts 仍有 %d 行", n)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events WHERE tenant_id = $1`, tenantID,
+	).Scan(&n); err != nil {
+		t.Fatalf("查 Agent event 失败: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("租户数据应被清空，agent_events 仍有 %d 行", n)
 	}
 }
 

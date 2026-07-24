@@ -44,6 +44,7 @@ type purgeStep struct {
 //	schedule_playbooks / schedule_sources → schedules
 //	feedbacks                             → deliveries
 //	task_creation_receipts               → pending_actions → agent_sessions
+//	agent_events                         → agent_sessions
 //	deliveries                            → push_batches
 //	task_run_snapshots                    → tenants / users
 //	task_definition_edit_receipts         → task_definition_edit_operations
@@ -71,6 +72,9 @@ var purgeOrder = []purgeStep{
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
 	{"pending_actions", "tenant_id = $1"},
+	// Semantic events reference agent_sessions by complete tenant/user/session
+	// scope and therefore must be deleted before the session projection.
+	{"agent_events", "tenant_id = $1"},
 	{"deliveries", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},
 	{"agent_sessions", "tenant_id = $1"},
