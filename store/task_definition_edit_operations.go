@@ -347,23 +347,13 @@ func validateTaskDefinitionEditCreationScope(
 		return taskDefinitionEditConflict("schedule differs from the approved base")
 	}
 
-	var membershipValid bool
-	err := tx.QueryRow(ctx,
-		`SELECT true
-		   FROM tenants t
-		   JOIN memberships m ON m.tenant_id=t.id
-		  WHERE t.id=$1 AND m.user_id=$2 AND t.status='active'
-		    AND t.deleted_at IS NULL
-		  FOR SHARE OF t, m`, proposal.Actor.TenantID, proposal.Actor.UserID,
-	).Scan(&membershipValid)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return taskDefinitionEditValidation("actor membership is not active")
-	}
-	if err != nil {
-		return taskDefinitionEditDatabaseError("validate active membership", err)
+	if err := validateTaskDefinitionEditActiveActor(
+		ctx, tx, proposal.Actor.TenantID, proposal.Actor.UserID,
+	); err != nil {
+		return err
 	}
 	var sessionValid bool
-	err = tx.QueryRow(ctx,
+	err := tx.QueryRow(ctx,
 		`SELECT true
 		   FROM agent_sessions
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND status='active'
@@ -393,6 +383,30 @@ func validateTaskDefinitionEditCreationScope(
 		return err
 	}
 	return validateTaskDefinitionEditCreationProvenance(ctx, tx, frozen)
+}
+
+func validateTaskDefinitionEditActiveActor(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID, userID int64,
+) error {
+	var membershipValid bool
+	err := tx.QueryRow(ctx,
+		`SELECT true
+		   FROM tenants t
+		   JOIN memberships m ON m.tenant_id=t.id
+		  WHERE t.id=$1 AND m.user_id=$2 AND t.status='active'
+		    AND t.deleted_at IS NULL
+		  FOR SHARE OF t, m`,
+		tenantID, userID,
+	).Scan(&membershipValid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return taskDefinitionEditValidation("actor membership is not active")
+	}
+	if err != nil {
+		return taskDefinitionEditDatabaseError("validate active membership", err)
+	}
+	return nil
 }
 
 func validateTaskDefinitionEditCreationProvenance(
@@ -700,6 +714,14 @@ func (s *Store) terminatePendingTaskDefinitionEdit(
 	if err != nil {
 		return nil, err
 	}
+	if !requireExpired &&
+		op.Status == types.TaskDefinitionEditOperationStatusPending {
+		if err := validateTaskDefinitionEditActiveActor(
+			ctx, tx, op.TenantID, op.UserID,
+		); err != nil {
+			return nil, err
+		}
+	}
 	databaseNow, err := taskDefinitionEditDatabaseClock(ctx, tx)
 	if err != nil {
 		return nil, err
@@ -869,6 +891,11 @@ func (s *Store) AcquireTaskDefinitionEditOperation(
 
 	switch op.Status {
 	case types.TaskDefinitionEditOperationStatusPending:
+		if err := validateTaskDefinitionEditActiveActor(
+			ctx, tx, op.TenantID, op.UserID,
+		); err != nil {
+			return nil, err
+		}
 		if !pendingTaskDefinitionEditPristine(op) {
 			return nil, taskDefinitionEditConflict("pending operation has durable saga state")
 		}
@@ -1320,6 +1347,12 @@ func (s *Store) QuiesceTaskDefinitionEdit(
 		return taskDefinitionEditDatabaseError("begin database quiesce", err)
 	}
 	defer rollbackTaskDefinitionEditTx(ctx, tx)
+	// Legacy startup ReconcileActions holds this same advisory lock across its
+	// bounded Temporal update. Taking it before any row lock closes the stale
+	// active-list window without changing the durable edit marker protocol.
+	if err := lockTaskScheduleMutation(ctx, tx, lease.TaskID); err != nil {
+		return err
+	}
 	schedule, err := lockTaskDefinitionEditScheduleForUpdate(ctx, tx,
 		lease.TargetTenantID, lease.TargetUserID, lease.TaskID)
 	if err != nil {

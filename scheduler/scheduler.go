@@ -37,6 +37,16 @@ const (
 	defaultTZ = "Asia/Shanghai"
 	// scheduleStatusActive 是 schedules 表 status 列的活跃取值。
 	scheduleStatusActive = "active"
+	// scheduleReconcileAttemptTimeout bounds the one startup-only transaction
+	// which intentionally keeps a PostgreSQL advisory lock across Temporal I/O.
+	// The lock closes the legacy List→quiesce race; the timeout prevents one
+	// unhealthy remote schedule from pinning that lock indefinitely.
+	scheduleReconcileAttemptTimeout = 15 * time.Second
+	scheduleReconcileReleaseTimeout = 2 * time.Second
+	// scheduleReconcilePassTimeout bounds the synchronous startup barrier as a
+	// whole. Per-schedule timeouts alone scale as active-count × 15 seconds and
+	// can otherwise keep every ingress dark indefinitely.
+	scheduleReconcilePassTimeout = 90 * time.Second
 )
 
 // ScheduleSpec 是 Vane 侧中立的调度频率描述：cron 与 every_seconds 二选一。
@@ -88,6 +98,10 @@ type scheduleStore interface {
 	UpdateScheduleSpec(ctx context.Context, id string, spec json.RawMessage, nlDesc *string) error
 	DeleteSchedule(ctx context.Context, id string, userID int64) error
 	GetSchedule(ctx context.Context, id string, userID int64) (*types.Schedule, error)
+	AcquireScheduleReconcile(
+		ctx context.Context,
+		id string,
+	) (*types.Schedule, func(context.Context) error, error)
 }
 
 // Scheduler 持有 Temporal client、任务队列名与 store（镜像用）。
@@ -234,21 +248,43 @@ func makePushParams(tenantID, userID int64, schedID string, scope workflow.PushS
 // UpdatePush 改任务名时只换 Spec、不碰 Action，镜像 nl_description 新而 Action.NLDesc 旧 → 聚合卡
 // header 永久显示旧任务名；本方法在下次启动时据镜像把 Action 刷回新名（UpdatePush 侧另有即时回写）。
 //
-// best-effort：单条失败只 slog、继续下一条（不因个别调度 reconcile 失败而中断启动）；
+// fail-closed：单条失败会继续检查其余调度以收集诊断，但最终返回聚合错误，调用方不得
+// 开放 worker/Agent/HTTP/飞书 ingress；全局预算耗尽时立即停止，不再按 active 数线性等待。
 // 幂等：先 Describe 看 Action.Args 的可漂移字段是否已与期望 params 一致，一致则跳过、
 // 不写 Temporal（新建调度、以及上次已 reconcile 过且未改名的调度，重启时都命中跳过）。
 func (s *Scheduler) ReconcileActions(ctx context.Context) error {
-	schedules, err := s.st.ListActiveSchedules(ctx)
+	return s.reconcileActions(ctx, scheduleReconcilePassTimeout)
+}
+
+func (s *Scheduler) reconcileActions(ctx context.Context, budget time.Duration) error {
+	if budget <= 0 {
+		return fmt.Errorf("scheduler: reconcile 全局启动预算无效: %s", budget)
+	}
+	passCtx, cancelPass := context.WithTimeout(ctx, budget)
+	defer cancelPass()
+
+	schedules, err := s.st.ListActiveSchedules(passCtx)
 	if err != nil {
 		return err
 	}
 	var updated, skipped, failed int
-	for _, sc := range schedules {
-		didUpdate, rerr := s.reconcileOne(ctx, sc)
+	var reconcileErrors []error
+	for index, sc := range schedules {
+		if err := passCtx.Err(); err != nil {
+			reconcileErrors = append(reconcileErrors, fmt.Errorf(
+				"scheduler: reconcile 全局启动预算耗尽（processed=%d remaining=%d）: %w",
+				index, len(schedules)-index, err,
+			))
+			break
+		}
+		didUpdate, rerr := s.reconcileOne(passCtx, sc)
 		switch {
 		case rerr != nil:
 			failed++
-			slog.Error("scheduler: reconcile 调度 Action 失败（跳过，不影响其它调度与启动）",
+			reconcileErrors = append(reconcileErrors, fmt.Errorf(
+				"reconcile schedule %s: %w", sc.ID, rerr,
+			))
+			slog.Error("scheduler: reconcile 调度 Action 失败（fail-closed）",
 				"schedule_id", sc.ID, "err", rerr)
 		case didUpdate:
 			updated++
@@ -260,12 +296,50 @@ func (s *Scheduler) ReconcileActions(ctx context.Context) error {
 	}
 	slog.Info("scheduler: 存量调度 Action reconcile 完成",
 		"total", len(schedules), "updated", updated, "skipped", skipped, "failed", failed)
-	return nil
+	return errors.Join(reconcileErrors...)
 }
 
 // reconcileOne 把单个调度的 Action.Args 自愈到期望 params。
 // 返回 didUpdate=true 表示确实写了 Temporal。
-func (s *Scheduler) reconcileOne(ctx context.Context, sc types.Schedule) (bool, error) {
+func (s *Scheduler) reconcileOne(ctx context.Context, listed types.Schedule) (updated bool, err error) {
+	attemptCtx, cancelAttempt := context.WithTimeout(ctx, scheduleReconcileAttemptTimeout)
+	defer cancelAttempt()
+
+	releaseProcessGate, err := s.acquireTaskScheduleGate(
+		attemptCtx, "reconcile_schedule_action", listed.ID,
+	)
+	if err != nil {
+		return false, err
+	}
+	defer releaseProcessGate()
+
+	// ListActiveSchedules is only a discovery snapshot. Authorization is
+	// deliberately repeated under a cross-process PostgreSQL advisory lock;
+	// QuiesceTaskDefinitionEdit takes the same lock before installing its
+	// marker. A nil schedule means the task is no longer active or an edit now
+	// owns it, both normal skip outcomes.
+	sc, releaseDatabaseGate, err := s.st.AcquireScheduleReconcile(attemptCtx, listed.ID)
+	if err != nil {
+		return false, err
+	}
+	if releaseDatabaseGate != nil {
+		defer func() {
+			releaseCtx, cancelRelease := context.WithTimeout(
+				context.WithoutCancel(ctx), scheduleReconcileReleaseTimeout,
+			)
+			defer cancelRelease()
+			if releaseErr := releaseDatabaseGate(releaseCtx); releaseErr != nil {
+				err = errors.Join(err, fmt.Errorf(
+					"释放调度 %s 的 reconcile 数据库 gate: %w",
+					listed.ID, releaseErr,
+				))
+			}
+		}()
+	}
+	if sc == nil {
+		return false, nil
+	}
+
 	var scope workflow.PushScope
 	if len(sc.ScopeJSON) > 0 {
 		if err := json.Unmarshal(sc.ScopeJSON, &scope); err != nil {
@@ -280,8 +354,8 @@ func (s *Scheduler) reconcileOne(ctx context.Context, sc types.Schedule) (bool, 
 	want.ExecutionMode = sc.ExecutionMode
 	want.RuntimeVersion = s.compiledRuntime.runtimeVersionFor(sc.ID)
 
-	h := s.c.ScheduleClient().GetHandle(ctx, sc.ID)
-	desc, err := h.Describe(ctx)
+	h := s.c.ScheduleClient().GetHandle(attemptCtx, sc.ID)
+	desc, err := h.Describe(attemptCtx)
 	if err != nil {
 		return false, err
 	}
@@ -295,7 +369,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, sc types.Schedule) (bool, 
 
 	// 只替换 Action.Args，其余（Workflow 类型名、ID、TaskQueue、超时、Spec、Overlap、State）
 	// 一律原样带走——照抄 UpdatePush 的值拷贝纪律：自己 new 一个 Action 会静默丢掉这些字段。
-	err = h.Update(ctx, client.ScheduleUpdateOptions{
+	err = h.Update(attemptCtx, client.ScheduleUpdateOptions{
 		DoUpdate: func(in client.ScheduleUpdateInput) (*client.ScheduleUpdate, error) {
 			sch := in.Description.Schedule
 			wf, ok := sch.Action.(*client.ScheduleWorkflowAction)

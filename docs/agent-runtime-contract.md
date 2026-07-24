@@ -73,6 +73,16 @@ C2b3-2 继续按故障域拆成四个不可跳级的子列车：
   reconcile 不得持有 active 快照跨过 quiesce/recovery 后再写回 Temporal；须等待首次恢复完成，或在每次写前
   以 operation marker/status/fence 重新授权，并以并发真 Temporal Gate 证明旧 Action 不会覆盖已完成编辑。
 
+当前 2d 第 2 步接入默认关闭的 `agent.definition_edit_enabled`：开启时唯一
+`edit_task_definition` 工具可修改完整 intent/手册、调度、列表描述与门槛，Agent 的
+Propose/Confirm/Cancel 分别只委托 definition-edit controller，且仅精确的
+`ErrDefinitionEditOperationNotFound` 可继续兼容路由。确认/取消已经绑定原卡 App fingerprint +
+message ID。第 3 步现已接通独立 terminal outbox dispatcher：只消费
+`task_definition_edit_receipts` 的 lease/fence API，从冻结 operation/result 生成不可变 card payload
+与固定 session 事实，先原子 checkpoint session、再 Patch 原卡、最后 checkpoint sent；响应丢失只会
+以相同 target+bytes 精确 replay，不会新发卡或重复 session 消息。dispatcher 无论 feature flag 状态均在
+所有 ingress 前启动，用于收敛历史 outbox；生产和普通用户行为仍因 flag 默认关闭而不暴露编辑工具。
+
 这里的 **attempt** 专指一次代码级 `runTaskDefinitionEditAttempt` 调用：它从一个已持久化 phase 开始，最多
 调用一次 Pause/Apply/Restore raw phase，并在一次本地事务推进或一次远端 checkpoint 后立即返回。同一条仍
 有效的 lease/fence 可以顺序执行多个这样的代码级 attempt。operation 行的 `attempt` 列只审计首次 acquisition
@@ -95,11 +105,14 @@ cancelled/expired/blocked/superseded 不得用同名“终态 phase”覆盖进�
 pause/apply/restore canonical snapshot 前缀完全一致；cancelled/expired 只能停在 `proposal_sealed`，
 completed 只能停在 `temporal_target_restored`。
 
-当前生产 `DATABASE_URL` 同时承担 migration 与 runtime，连接角色是新表 owner；owner 对表有隐式 DML 且默认
-绕过 RLS。因此 2a 的 dark 保证只来自“无 Store API + AST 零引用守卫”，不能宣称数据库权限级不可写。
-在 2d authenticated wiring 前，必须完成 migration/admin 与 runtime 权限分离，或在所有 edit 事务中可靠
-激活 scoped restricted role + tenant context，并以真生产同形连接证明；033 不给 `vane_app` 显式 DML 只是
-为该切换保留最小授权面，不是当前生产安全边界。
+生产仍以同一 `DATABASE_URL` 承担 migration 与 runtime，但 034 起所有 definition-edit operation/receipt 事务
+必须先设置 transaction-local `app.tenant_id`，再 `SET LOCAL ROLE vane_edit_coordinator` 或
+`vane_edit_receipt`。两个角色均为 NOLOGIN/NOINHERIT/NOBYPASSRLS，且按 operation 与 receipt 职责拆分列级授权；
+owner 连接只负责打开事务，不能成为 edit Store API 的实际 current role。2d 在 ingress 前以生产同形连接执行
+runtime role Gate：核 `current_user`、tenant GUC、superuser/bypass-RLS、schedule DELETE、marker UPDATE 与
+receipt payload UPDATE 的正负权限矩阵；并对各职责表验证 `row_security_active=true`、current role 非表 owner，
+再以 owner 可见的非空 tenant 集合和不存在的 probe tenant 实证 coordinator 跨租户读取为 0，避免空表假绿。
+任一漂移必须拒绝启动。033 不给 `vane_app` 显式 DML 只是迁移前的预留面，不能替代 034 的 scoped role 边界。
 
 033 同时把 `schedules` 原有的 table-level INSERT/UPDATE 收窄为 legacy 列 allowlist，明确排除
 `definition_edit_operation_id/definition_edit_fence`；2b 必须用 coordinator 专用受限角色/事务路径写 marker。
@@ -133,7 +146,16 @@ scheme、operation ID 字节上限、timing reader，以及共享 `ScheduleSpec`
 重绑同一 ID；SDK 升级若改变 payload，必须 bump converter ID 并注册旧 decoder。另一个部署不变量是：存在
 nonterminal edit operation 时不得直接把唯一 Scheduler namespace 从 A 切到 B；必须先 drain/终结，或先实现按 sealed
 namespace+namespace ID 路由的 retained client。namespace 同名重建仍由 ID mismatch fail closed。两项均属于 2d
-接线/部署 Gate。
+接线/部署 Gate。2d 单 namespace 版本必须在 ingress 前 tenant-sharded、page-bounded 扫描全部 nonterminal
+operation，严格解码其 frozen proposal/checkpoint，并用实时 Temporal DescribeNamespace 重验 sealed namespace
+name+ID 与 retained converter；不一致、损坏或超过有界积压上限均拒绝启动，不得只等到下一次远端 phase 才发现。
+
+legacy `ReconcileActions` 只能在 definition-edit 首轮 recovery 后、所有 ingress 前同步执行。active 列表只是发现
+快照；每个 Temporal Describe/Update 前必须进入同 TaskID 进程 gate，并与 `QuiesceTaskDefinitionEdit` 共用
+PostgreSQL transaction advisory lock，再重读 schedule。只有 status=active、edit marker/fence 均空的最新行可写；
+paused、marker 已安装或用户已删除均是正常跳过。单次持锁的远端尝试与 rollback 必须有硬超时；同步全量
+reconcile 另有全局启动预算。任一单项失败或预算耗尽均拒绝开放 worker/Agent/HTTP/飞书 ingress，避免
+Temporal 故障按 active 数线性拖死启动或带着漏修调度继续运行。
 
 恢复或迟到 replay 只有在 current Approved head **恰好等于该 operation 的 target head**，且 Temporal
 仍是该 operation 的 exact base/target pre-state 时才可继续。C2b-2 返回历史成功记录不等于获得远端写
@@ -274,7 +296,7 @@ Activity result 进入 Temporal history。首版 planner 硬上限为 8 轮、16
 | C2a | mode + Approved/Adaptive schema、冻结 wire 与 fenced Store | 零调用点；默认 Compiled，动态模式仍关闭 |
 | C2b-1 | 创建双写 legacy/Approved + 关闭旧编辑旁路 | 新建任务安全停靠，仍不重开编辑、不切运行读取 |
 | C2b-2 | exact base version+digest definition CAS | 零生产调用点；证明单库原子提交与 exact replay |
-| C2b-3 | 2a 冻结协议 → 2b fenced Store → 2c dark coordinator → 2d authenticated wiring | 全部 kill point 过 Gate 后才重开唯一编辑入口，仍不切运行读取 |
+| C2b-3 | 2a 冻结协议 → 2b fenced Store → 2c dark coordinator → 2d-1 安全 Gate → 2d authenticated wiring | 2d-1 先闭合 restricted role、legacy reconcile 串行化与 namespace preflight，入口仍 dark；全部 kill point 过 Gate 后才重开唯一编辑入口，仍不切运行读取 |
 | C2c | 存量适配、shadow 对账并切 immutable head 读取 | 动态模式仍 feature flag 关闭 |
 | C3 | RunID/StepID 检查点、LKG、bounded `PlanFetch` | 仅 shadow，无用户推送影响 |
 | C4 | 两条首批竖切的 Boss 单任务 canary | 逐步放量，可回滚 Compiled/LKG |

@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +24,33 @@ import (
 var testTaskDefinitionEditReceiptTarget = TaskDefinitionEditReceiptTarget{
 	Provider: "feishu_card_patch:test-app",
 	Target:   "om_definition_edit_test",
+}
+
+func TestTaskDefinitionEditCoordinator_CancelReplayPreservesFinalCard(t *testing.T) {
+	frozen := definitionEditCoordinatorFrozenFixture(
+		t, types.ScheduleStatusActive,
+	)
+	store := newDefinitionEditCoordinatorFakeStore(
+		definitionEditCoordinatorOperation(frozen, false),
+	)
+	coordinator := newTestTaskDefinitionEditCoordinator(
+		store, &definitionEditCoordinatorFakeScheduler{},
+	)
+	scope := store.operation().Scope()
+	first, err := coordinator.Cancel(
+		t.Context(), scope, testTaskDefinitionEditReceiptTarget,
+	)
+	if err != nil || first.Replayed || !first.ReceiptBound ||
+		first.Status != types.TaskDefinitionEditOperationStatusCancelled {
+		t.Fatalf("first cancel=%+v err=%v", first, err)
+	}
+	replayed, err := coordinator.Cancel(
+		t.Context(), scope, testTaskDefinitionEditReceiptTarget,
+	)
+	if err != nil || !replayed.Replayed || !replayed.ReceiptBound ||
+		replayed.Status != types.TaskDefinitionEditOperationStatusCancelled {
+		t.Fatalf("replayed cancel=%+v err=%v", replayed, err)
+	}
 }
 
 func TestTaskDefinitionEditCoordinator_AttemptLifecycle(t *testing.T) {
@@ -482,6 +510,92 @@ func TestTaskDefinitionEditCoordinator_PrepareAndSealRejectsMalformedScopeBefore
 	}
 }
 
+func TestTaskDefinitionEditCoordinator_ValidateRuntimeEnvironmentScansNonterminalOperations(t *testing.T) {
+	frozen := definitionEditCoordinatorFrozenFixture(t, types.ScheduleStatusActive)
+	store := newDefinitionEditCoordinatorFakeStore(
+		definitionEditCoordinatorOperation(frozen, false),
+	)
+	schedules := &definitionEditCoordinatorFakeScheduler{}
+	coordinator := newTestTaskDefinitionEditCoordinator(store, schedules)
+
+	if err := coordinator.ValidateRuntimeEnvironment(t.Context()); err != nil {
+		t.Fatalf("ValidateRuntimeEnvironment: %v", err)
+	}
+	if schedules.environmentValidationCalls != 1 {
+		t.Fatalf("environment validations = %d, want 1",
+			schedules.environmentValidationCalls)
+	}
+
+	schedules.environmentValidationErr = errors.New("namespace identity differs")
+	if err := coordinator.ValidateRuntimeEnvironment(t.Context()); err == nil ||
+		!strings.Contains(err.Error(), "runtime environment differs") {
+		t.Fatalf("namespace mismatch must fail startup preflight: %v", err)
+	}
+}
+
+func TestTaskDefinitionEditCoordinator_ValidateRuntimeEnvironmentPaginatesExactFullPage(t *testing.T) {
+	frozen := definitionEditCoordinatorFrozenFixture(t, types.ScheduleStatusActive)
+	op := definitionEditCoordinatorOperation(frozen, false)
+	base := newDefinitionEditCoordinatorFakeStore(op)
+	store := &definitionEditPreflightPagedStore{
+		TaskDefinitionEditStore: base,
+		op:                      *op,
+		fullPages:               1,
+		shortTail:               1,
+	}
+	schedules := &definitionEditCoordinatorFakeScheduler{}
+
+	if err := newTestTaskDefinitionEditCoordinator(
+		store, schedules,
+	).ValidateRuntimeEnvironment(t.Context()); err != nil {
+		t.Fatalf("ValidateRuntimeEnvironment: %v", err)
+	}
+	if !slices.Equal(store.operationCursors, []string{"", op.ID}) {
+		t.Fatalf("operation cursors = %v, want empty then %q",
+			store.operationCursors, op.ID)
+	}
+	if schedules.environmentValidationCalls != taskDefinitionEditPreflightOpLimit+1 {
+		t.Fatalf("environment validations = %d, want %d",
+			schedules.environmentValidationCalls, taskDefinitionEditPreflightOpLimit+1)
+	}
+}
+
+func TestValidateTaskDefinitionEditPreflightBudgetFailsClosed(t *testing.T) {
+	if err := validateTaskDefinitionEditPreflightBudget(
+		taskDefinitionEditPreflightMaxOps,
+		taskDefinitionEditPreflightMaxOps,
+	); err != nil {
+		t.Fatalf("exact preflight cap rejected: %v", err)
+	}
+	err := validateTaskDefinitionEditPreflightBudget(
+		taskDefinitionEditPreflightMaxOps+1,
+		taskDefinitionEditPreflightMaxOps,
+	)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 10000 operations") {
+		t.Fatalf("oversize nonterminal backlog must fail closed: %v", err)
+	}
+}
+
+func TestTaskDefinitionEditCoordinator_ValidateRuntimeEnvironmentRejectsDamagedCheckpointBeforeTemporal(t *testing.T) {
+	frozen := definitionEditCoordinatorFrozenFixture(t, types.ScheduleStatusActive)
+	op := definitionEditCoordinatorOperation(frozen, false)
+	op.PreparedEdit = bytes.Clone(op.PreparedEdit)
+	op.PreparedEdit[0] ^= 0xff
+	store := newDefinitionEditCoordinatorFakeStore(op)
+	schedules := &definitionEditCoordinatorFakeScheduler{}
+
+	err := newTestTaskDefinitionEditCoordinator(
+		store, schedules,
+	).ValidateRuntimeEnvironment(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "before startup") {
+		t.Fatalf("damaged durable checkpoint must fail startup: %v", err)
+	}
+	if schedules.environmentValidationCalls != 0 {
+		t.Fatalf("damaged checkpoint reached Temporal validation %d times",
+			schedules.environmentValidationCalls)
+	}
+}
+
 func TestTaskDefinitionEditCoordinator_RecoveryPassIsTenantShardedAndBounded(t *testing.T) {
 	tenantIDs := make([]int64, taskDefinitionEditRecoveryTenantLimit)
 	for i := range tenantIDs {
@@ -572,14 +686,16 @@ func newTestTaskDefinitionEditCoordinator(
 type definitionEditCoordinatorFakeScheduler struct {
 	mu sync.Mutex
 
-	prepareCalls int
-	prepared     scheduler.PreparedTaskDefinitionEdit
-	baseSnapshot scheduler.TaskDefinitionEditSnapshot
-	prepareErr   error
-	pauseErr     error
-	applyErr     error
-	restoreErr   error
-	calls        []scheduler.TaskDefinitionEditPhase
+	prepareCalls               int
+	prepared                   scheduler.PreparedTaskDefinitionEdit
+	baseSnapshot               scheduler.TaskDefinitionEditSnapshot
+	prepareErr                 error
+	pauseErr                   error
+	applyErr                   error
+	restoreErr                 error
+	calls                      []scheduler.TaskDefinitionEditPhase
+	environmentValidationCalls int
+	environmentValidationErr   error
 }
 
 func (s *definitionEditCoordinatorFakeScheduler) PrepareTaskDefinitionEdit(
@@ -673,6 +789,16 @@ func (s *definitionEditCoordinatorFakeScheduler) RestoreTaskDefinitionEdit(
 	), nil
 }
 
+func (s *definitionEditCoordinatorFakeScheduler) ValidateTaskDefinitionEditEnvironment(
+	_ context.Context,
+	_ scheduler.PreparedTaskDefinitionEdit,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.environmentValidationCalls++
+	return s.environmentValidationErr
+}
+
 func (s *definitionEditCoordinatorFakeScheduler) totalCalls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -740,6 +866,52 @@ type definitionEditCoordinatorFakeStore struct {
 	cursors      []int64
 }
 
+type definitionEditPreflightPagedStore struct {
+	TaskDefinitionEditStore
+
+	op               types.TaskDefinitionEditOperation
+	fullPages        int
+	shortTail        int
+	operationCursors []string
+}
+
+func (s *definitionEditPreflightPagedStore) ListNonterminalTaskDefinitionEditTenantIDs(
+	_ context.Context,
+	afterTenantID int64,
+	_ int,
+) ([]int64, error) {
+	if afterTenantID >= s.op.TenantID {
+		return nil, nil
+	}
+	return []int64{s.op.TenantID}, nil
+}
+
+func (s *definitionEditPreflightPagedStore) ListNonterminalTaskDefinitionEditOperations(
+	_ context.Context,
+	_ int64,
+	afterOperationID string,
+	limit int,
+) ([]types.TaskDefinitionEditOperation, error) {
+	s.operationCursors = append(s.operationCursors, afterOperationID)
+	if len(s.operationCursors) <= s.fullPages {
+		operations := make([]types.TaskDefinitionEditOperation, limit)
+		for i := range operations {
+			operations[i] = *cloneDefinitionEditCoordinatorOperation(&s.op)
+		}
+		return operations, nil
+	}
+	if s.shortTail > 0 {
+		tail := s.shortTail
+		s.shortTail = 0
+		operations := make([]types.TaskDefinitionEditOperation, tail)
+		for i := range operations {
+			operations[i] = *cloneDefinitionEditCoordinatorOperation(&s.op)
+		}
+		return operations, nil
+	}
+	return nil, nil
+}
+
 func newDefinitionEditCoordinatorFakeStore(
 	op *types.TaskDefinitionEditOperation,
 ) *definitionEditCoordinatorFakeStore {
@@ -776,6 +948,37 @@ func (s *definitionEditCoordinatorFakeStore) CreateTaskDefinitionEditOperation(
 		return nil, injectedErr
 	}
 	return result, nil
+}
+
+func (s *definitionEditCoordinatorFakeStore) ListNonterminalTaskDefinitionEditTenantIDs(
+	_ context.Context,
+	afterTenantID int64,
+	_ int,
+) ([]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.op == nil || s.op.TenantID <= afterTenantID ||
+		taskDefinitionEditOperationTerminal(s.op.Status) {
+		return nil, nil
+	}
+	return []int64{s.op.TenantID}, nil
+}
+
+func (s *definitionEditCoordinatorFakeStore) ListNonterminalTaskDefinitionEditOperations(
+	_ context.Context,
+	tenantID int64,
+	afterOperationID string,
+	_ int,
+) ([]types.TaskDefinitionEditOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.op == nil || s.op.TenantID != tenantID || s.op.ID <= afterOperationID ||
+		taskDefinitionEditOperationTerminal(s.op.Status) {
+		return nil, nil
+	}
+	return []types.TaskDefinitionEditOperation{
+		*cloneDefinitionEditCoordinatorOperation(s.op),
+	}, nil
 }
 
 func (s *definitionEditCoordinatorFakeStore) LoadTaskDefinitionEditOperation(

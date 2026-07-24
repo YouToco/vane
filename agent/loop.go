@@ -90,6 +90,9 @@ const (
 	// replyTaskCreationConfirm 是 v1 durable proposal 的确定性出口。proposal 已经落库后
 	// 不再做一次可能失败的 LLM “收尾”：否则数据库里留下可执行动作，用户却收不到卡。
 	replyTaskCreationConfirm = "我已整理好任务方案，请确认卡片中的时间、门槛和信源。"
+	// replyDefinitionEditConfirm is emitted only after the edit coordinator has
+	// sealed the exact base/target proposal. No second model turn may orphan it.
+	replyDefinitionEditConfirm = "我已冻结任务编辑方案，请核对确认卡中的变更。"
 	// replyTaskCreationNotCreated 是 direct 模式连续两次没有产生 proposal 时的
 	// 确定性出口。不能把模型的口头承诺原样发给用户。
 	replyTaskCreationNotCreated = "当前未能生成确认卡，任务尚未创建；请补充缺失参数或重新发送确认。"
@@ -186,6 +189,27 @@ type CreationController interface {
 	Cancel(ctx context.Context, userID int64, actionID string, receipt task.CreationReceiptTarget) (task.CreationResult, error)
 }
 
+// DefinitionEditController is the only current definition-edit ingress.
+// Agent never receives raw Store, scheduler or coordinator phase methods.
+type DefinitionEditController interface {
+	Propose(
+		ctx context.Context,
+		in task.DefinitionEditProposalInput,
+	) (task.DefinitionEditProposal, error)
+	Confirm(
+		ctx context.Context,
+		userID int64,
+		actionID string,
+		receipt task.TaskDefinitionEditReceiptTarget,
+	) (task.TaskDefinitionEditOutcome, error)
+	Cancel(
+		ctx context.Context,
+		userID int64,
+		actionID string,
+		receipt task.TaskDefinitionEditReceiptTarget,
+	) (task.TaskDefinitionEditOutcome, error)
+}
+
 // ProfileReader 是画像读取的窄接口（M5 契约 §12.2，生产实现 *store.Store）。
 // 与 Store 分开声明：画像是增强不是门槛，读取失败必须降级为空画像而非报错，
 // 窄接口让测试可独立注入两态与失败。
@@ -211,6 +235,10 @@ type Deps struct {
 	// TaskCreation 接管新 create_schedule proposal/confirm。nil 时 create_schedule
 	// proposal fail-closed；历史 v0 卡仍可由 execution_version=0 的 Claim 谓词排空。
 	TaskCreation CreationController
+	// TaskDefinitionEdit is nil unless the default-off feature flag is enabled.
+	// When present it must be the same controller used to register
+	// edit_task_definition in BuildTools.
+	TaskDefinitionEdit DefinitionEditController
 	// SystemPrompt 覆盖默认 system 常量（M4 契约 §7.1，A2A 轨用）。零值回落包内
 	// systemPrompt 常量——飞书轨装配不传本字段，行为零变化。默认常量写死了飞书语境
 	//（确认卡/卡片回调/画像引导），A2A 轨的对端是外部 agent，语境完全不同。
@@ -229,6 +257,14 @@ type creationReceiptSessionStore interface {
 		ctx context.Context,
 		lease types.TaskCreationReceiptLease,
 		msgs json.RawMessage,
+	) error
+}
+
+type definitionEditReceiptSessionStore interface {
+	RecordTaskDefinitionEditReceiptSessionMessages(
+		context.Context,
+		types.TaskDefinitionEditReceiptLease,
+		json.RawMessage,
 	) error
 }
 
@@ -265,19 +301,20 @@ type Confirm struct {
 // 可安全被多个 goroutine（并发消息）共享。
 type Loop struct {
 	// chatFn 是模型调用入口（契约 §7）：默认包一层 DoChat，测试注入假实现。
-	chatFn        func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
-	store         Store
-	profiles      ProfileReader
-	tools         map[string]Tool // 按 Name 索引的白名单注册表（静态部分）
-	toolDefs      []llm.ToolDef   // 预构建的静态工具声明；动态端点声明按会话追加在其后
-	endpoints     *EndpointTools  // 动态端点工具面，nil = 未装配
-	toolCalls     *ToolCallRecorder
-	taskCreation  CreationController
-	sys           string // system prompt（含端点检索能力说明段，装配时定型）
-	renderProfile bool   // 是否渲染 [用户画像] 段：默认飞书轨 true，自定义 prompt 的 A2A 轨 false
-	model         string
-	maxTurns      int
-	sessionTTL    time.Duration
+	chatFn             func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
+	store              Store
+	profiles           ProfileReader
+	tools              map[string]Tool // 按 Name 索引的白名单注册表（静态部分）
+	toolDefs           []llm.ToolDef   // 预构建的静态工具声明；动态端点声明按会话追加在其后
+	endpoints          *EndpointTools  // 动态端点工具面，nil = 未装配
+	toolCalls          *ToolCallRecorder
+	taskCreation       CreationController
+	taskDefinitionEdit DefinitionEditController
+	sys                string // system prompt（含端点检索能力说明段，装配时定型）
+	renderProfile      bool   // 是否渲染 [用户画像] 段：默认飞书轨 true，自定义 prompt 的 A2A 轨 false
+	model              string
+	maxTurns           int
+	sessionTTL         time.Duration
 
 	// userMu 按 userID 串行化 HandleMessage（审查 #并发盲覆盖）：feishu 对每条消息
 	// 起独立 goroutine，而 HandleMessage 是 load→append→save 的读改写、
@@ -357,6 +394,7 @@ func New(d Deps) *Loop {
 		endpoints:             d.Endpoints,
 		toolCalls:             d.ToolCalls,
 		taskCreation:          d.TaskCreation,
+		taskDefinitionEdit:    d.TaskDefinitionEdit,
 		sys:                   sys,
 		renderProfile:         renderProfile,
 		model:                 d.Model,
@@ -665,6 +703,20 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				Confirm: &Confirm{ActionID: pending.ID, Summary: confirmSummary(pending)},
 			}, msgs, turns, nil
 		}
+		if pending.ToolName == "edit_task_definition" {
+			// The exact edit operation is already sealed. A free-form final LLM
+			// call could fail after persistence and orphan the confirmation card.
+			msgs = append(msgs, llm.ChatMessage{
+				Role: "assistant", Content: replyDefinitionEditConfirm,
+			})
+			return Outcome{
+				Reply: replyDefinitionEditConfirm,
+				Confirm: &Confirm{
+					ActionID: pending.ID,
+					Summary:  confirmSummary(pending),
+				},
+			}, msgs, turns, nil
+		}
 
 		// 出确认卡路径：再调一次模型拿收尾文案，不带 tools 防再触发工具调用。
 		if err := ctx.Err(); err != nil {
@@ -939,6 +991,43 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 
 		// 首个写工具：只落 pending_action，不执行（AI 出预填、人点执行）。
 		// Status 显式赋 pending，不依赖 store/DB 默认值。
+		if tc.Name == "edit_task_definition" {
+			if l.taskDefinitionEdit == nil {
+				return nil, out, errors.New(
+					"agent: task definition edit controller is not configured",
+				)
+			}
+			actionID := uuid.NewString()
+			proposal, err := l.taskDefinitionEdit.Propose(
+				ctx,
+				task.DefinitionEditProposalInput{
+					ActionID: actionID, UserID: userID, SessionID: sessionID,
+					RawArgs: args, ExpiresAt: time.Now().Add(pendingActionTTL),
+				},
+			)
+			if err != nil {
+				if message, ok := creationProposalValidationMessage(err); ok {
+					out = append(out, toolMsg(tc.ID, message))
+					continue
+				}
+				return nil, out, fmt.Errorf(
+					"propose durable task definition edit: %w", err,
+				)
+			}
+			if proposal.ID == "" || proposal.ID != actionID ||
+				strings.TrimSpace(proposal.Summary) == "" {
+				return nil, out, errors.New(
+					"agent: definition edit proposal returned an invalid identity or summary",
+				)
+			}
+			pending = &types.PendingAction{
+				ID: proposal.ID, UserID: userID, SessionID: sessionID,
+				ToolName: tc.Name, Args: args, Summary: proposal.Summary,
+				Status: types.PendingActionStatusPending,
+			}
+			out = append(out, toolMsg(tc.ID, toolMsgConfirmCreated))
+			continue
+		}
 		if tc.Name == "create_schedule" {
 			if l.taskCreation == nil {
 				return nil, out, errors.New("agent: task creation controller is not configured")
@@ -1395,6 +1484,38 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 			return "", fmt.Errorf("confirm durable task creation: %w", err)
 		}
 	}
+	if l.taskDefinitionEdit != nil {
+		receiptState, _ := ctx.Value(
+			cardActionReceiptStateKey{},
+		).(*cardActionReceiptState)
+		var receiptTarget task.TaskDefinitionEditReceiptTarget
+		if receiptState != nil {
+			receiptTarget = task.TaskDefinitionEditReceiptTarget{
+				Provider: receiptState.target.Provider,
+				Target:   receiptState.target.Target,
+			}
+		}
+		outcome, err := l.taskDefinitionEdit.Confirm(
+			ctx, userID, actionID, receiptTarget,
+		)
+		if err == nil {
+			message := definitionEditOutcomeMessage(outcome)
+			if outcome.ReceiptBound && receiptState != nil {
+				receiptState.durable = true
+				receiptState.preserve = outcome.Replayed
+				return "任务编辑已受理，最终结果会更新在这张卡片上。", nil
+			}
+			return message, nil
+		}
+		if !errors.Is(err, task.ErrDefinitionEditOperationNotFound) {
+			if receiptState != nil {
+				receiptState.preserve = true
+			}
+			return "", fmt.Errorf(
+				"confirm durable task definition edit: %w", err,
+			)
+		}
+	}
 
 	// nil controller 仍允许排空与 create_schedule 无关的历史 v0 卡；生产 Store 的
 	// Claim 谓词固定 execution_version=0，故这里不可能误领 v1 创建 operation。
@@ -1554,6 +1675,31 @@ func creationResultMessage(result task.CreationResult) string {
 	return "任务创建请求已处理。"
 }
 
+func definitionEditOutcomeMessage(
+	outcome task.TaskDefinitionEditOutcome,
+) string {
+	if outcome.Recovering {
+		return "任务编辑已受理，系统正在可靠完成，无需重复确认。"
+	}
+	switch outcome.Status {
+	case types.TaskDefinitionEditOperationStatusCompleted:
+		return fmt.Sprintf("任务编辑已完成（id=%s）。", outcome.TaskID)
+	case types.TaskDefinitionEditOperationStatusCancelled:
+		return "已取消，本次任务编辑不会执行。"
+	case types.TaskDefinitionEditOperationStatusExpired:
+		return "任务编辑确认已过期，本次变更未执行。"
+	case types.TaskDefinitionEditOperationStatusSuperseded:
+		return "任务定义已被更新，本次旧编辑方案未执行。"
+	case types.TaskDefinitionEditOperationStatusBlocked:
+		return "任务编辑因安全检查未通过而停止，任务保持暂停以等待处理。"
+	default:
+		return "任务编辑请求已处理。"
+	}
+}
+
+// definitionEditSessionFact contains only fixed terminal facts. Target
+// definition text, provider errors and Temporal details never re-enter the
+// model conversation.
 // CancelAction 取消按钮回调。取消结果回写会话后返回用于更新卡片的文本。
 // 归属校验（契约 §10）同样在 Cancel 的 WHERE 谓词内完成。
 func (l *Loop) CancelActionWithReceipt(
@@ -1597,6 +1743,37 @@ func (l *Loop) CancelAction(ctx context.Context, userID int64, actionID string) 
 				receiptState.preserve = true
 			}
 			return "", fmt.Errorf("cancel durable task creation: %w", err)
+		}
+	}
+	if l.taskDefinitionEdit != nil {
+		receiptState, _ := ctx.Value(
+			cardActionReceiptStateKey{},
+		).(*cardActionReceiptState)
+		var receiptTarget task.TaskDefinitionEditReceiptTarget
+		if receiptState != nil {
+			receiptTarget = task.TaskDefinitionEditReceiptTarget{
+				Provider: receiptState.target.Provider,
+				Target:   receiptState.target.Target,
+			}
+		}
+		outcome, err := l.taskDefinitionEdit.Cancel(
+			ctx, userID, actionID, receiptTarget,
+		)
+		if err == nil {
+			if outcome.ReceiptBound && receiptState != nil {
+				receiptState.durable = true
+				receiptState.preserve = outcome.Replayed
+				return definitionEditOutcomeMessage(outcome), nil
+			}
+			return definitionEditOutcomeMessage(outcome), nil
+		}
+		if !errors.Is(err, task.ErrDefinitionEditOperationNotFound) {
+			if receiptState != nil {
+				receiptState.preserve = true
+			}
+			return "", fmt.Errorf(
+				"cancel durable task definition edit: %w", err,
+			)
 		}
 	}
 
@@ -1669,6 +1846,39 @@ func (l *Loop) RecordCreationReceiptSession(
 		return err
 	}
 	return store.RecordTaskCreationReceiptSessionMessages(
+		ctx, receipt.Lease(), messages,
+	)
+}
+
+// RecordDefinitionEditReceiptSession gives definition-edit outbox checkpoints
+// the same per-user serialization as normal Agent turns. The Store owns the
+// atomic append+receipt checkpoint and exact response-loss replay.
+func (l *Loop) RecordDefinitionEditReceiptSession(
+	ctx context.Context,
+	receipt types.TaskDefinitionEditReceipt,
+	messages json.RawMessage,
+) error {
+	store, ok := l.store.(definitionEditReceiptSessionStore)
+	if !ok {
+		return errors.New(
+			"agent: task definition edit receipt session store is unavailable",
+		)
+	}
+	muValue, _ := l.userMu.LoadOrStore(
+		receipt.UserID, &sync.Mutex{},
+	)
+	userMu := muValue.(*sync.Mutex)
+	if !userMu.TryLock() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return errCreationReceiptSessionBusy
+	}
+	defer userMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return store.RecordTaskDefinitionEditReceiptSessionMessages(
 		ctx, receipt.Lease(), messages,
 	)
 }

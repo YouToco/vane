@@ -611,6 +611,20 @@ func (s *Scheduler) buildTaskDefinitionEditRuntime(
 	return prepared, dc, nil
 }
 
+// ValidateTaskDefinitionEditEnvironment is the read-only startup preflight for
+// a durable nonterminal operation. It reuses the exact retained decoder and
+// live namespace identity checks used before every remote phase, but performs
+// no Schedule Describe or mutation.
+func (s *Scheduler) ValidateTaskDefinitionEditEnvironment(
+	ctx context.Context,
+	prepared PreparedTaskDefinitionEdit,
+) error {
+	_, _, err := s.buildTaskDefinitionEditRuntime(
+		ctx, prepared, "validate_definition_edit_environment",
+	)
+	return err
+}
+
 func (s *Scheduler) taskDefinitionEditEnvironment(
 	ctx context.Context,
 	creation PreparedTaskSchedule,

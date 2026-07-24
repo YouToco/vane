@@ -82,7 +82,7 @@ type playbookStore interface {
 // 与 URL 类 web 能力的试跑）；nil 合法（测试/未装配）——退回不试跑直接落库。
 // exa 是 Exa ad-hoc 工具对（web_search/read_page）；nil（Exa key 未配置）时不装配，
 // 工具面与该特性上线前完全一致（同 endpoints 的 nil 语义）。
-func BuildTools(st *store.Store, sched *scheduler.Scheduler, tasks taskCreator, pusher PushTrigger, endpoints *EndpointTools, prober sourceProber, exa *ExaTools) []Tool {
+func BuildTools(st *store.Store, sched *scheduler.Scheduler, tasks taskCreator, pusher PushTrigger, endpoints *EndpointTools, prober sourceProber, exa *ExaTools, definitionEdits ...DefinitionEditController) []Tool {
 	tools := []Tool{
 		&listSourcesTool{st: st},
 		&addSourceTool{st: st, prober: prober},
@@ -96,6 +96,9 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, tasks taskCreator, 
 		&updateProfileTool{st: st},
 		&viewTaskPlaybookTool{st: st}, // 情报任务手册（Task Playbook）
 	}
+	if len(definitionEdits) == 1 && definitionEdits[0] != nil {
+		tools = append(tools, &editTaskDefinitionTool{})
+	}
 	if endpoints != nil {
 		tools = append(tools, endpoints.SearchTool(), endpoints.ReadResultTool())
 	}
@@ -103,6 +106,68 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, tasks taskCreator, 
 		tools = append(tools, exa.SearchTool(), exa.ReadPageTool())
 	}
 	return tools
+}
+
+// edit_task_definition is the only current definition writer. Its proposal,
+// confirmation and cancellation are intercepted by Loop and delegated to the
+// durable definition-edit controller; Execute is deliberately non-operational
+// so a generic pending-action replay can never reach an old writer.
+const editTaskDefinitionSchema = `{
+  "type": "object",
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "要编辑的定时任务 id（先用 list_schedules 查询）"
+    },
+    "spec": {
+      "type": "object",
+      "description": "可选：替换触发频率；cron 与 every_seconds 必须且只能提供一个",
+      "properties": {
+        "cron": {"type": "string", "description": "5 段 cron，如 \"30 8 * * *\""},
+        "every_seconds": {"type": "integer", "description": "固定间隔秒数，不低于 3600"},
+        "anchor_at": {"type": "string", "description": "可选 RFC3339 锚点，只与 every_seconds 搭配"},
+        "tz": {"type": "string", "description": "可选 IANA 时区，缺省 Asia/Shanghai"}
+      },
+      "additionalProperties": false
+    },
+    "intent": {
+      "type": "string",
+      "minLength": 1,
+      "description": "可选：完整替换持续监控意图与任务手册；必须自包含，不能只写增量片段"
+    },
+    "nl_description": {
+      "type": "string",
+      "description": "可选：替换任务列表中的自然语言描述；空串表示清空"
+    },
+    "strictness": {
+      "type": "string",
+      "enum": ["loose", "normal", "strict"],
+      "description": "可选：替换推送门槛"
+    }
+  },
+  "required": ["task_id"],
+  "additionalProperties": false
+}`
+
+type editTaskDefinitionTool struct{}
+
+func (*editTaskDefinitionTool) Name() string { return "edit_task_definition" }
+func (*editTaskDefinitionTool) Description() string {
+	return "编辑已有定时任务的完整已批准定义。可一次修改触发频率、完整监控意图/手册、列表描述和推送门槛；未提供的字段保持不变。系统会冻结当前 definition head 与目标定义，先发原确认卡，确认后由唯一可恢复协调器执行。"
+}
+func (*editTaskDefinitionTool) Parameters() json.RawMessage {
+	return json.RawMessage(editTaskDefinitionSchema)
+}
+func (*editTaskDefinitionTool) Mutating() bool { return true }
+func (*editTaskDefinitionTool) Execute(
+	context.Context,
+	int64,
+	json.RawMessage,
+) (string, error) {
+	return "这张任务编辑确认不属于当前安全协议，请重新发起编辑。", nil
+}
+func (*editTaskDefinitionTool) Summarize(args json.RawMessage) string {
+	return summarizeFallback("编辑定时推送任务", args)
 }
 
 // emptyParamsSchema 是无参工具的 JSON schema：仍须是合法 object schema，

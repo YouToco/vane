@@ -96,6 +96,15 @@ func newTaskDefinitionStateFixture(t *testing.T) taskDefinitionStateFixture {
 	).Scan(&sourceID); err != nil {
 		t.Fatalf("load materialized source id: %v", err)
 	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(ctx, t, st,
+			`DELETE FROM schedule_sources WHERE schedule_id=$1 AND source_id=$2`,
+			taskID, sourceID)
+		cleanupExec(ctx, t, st,
+			`DELETE FROM sources WHERE id=$1`, sourceID)
+	})
 	exactPlan, err := json.Marshal(taskstate.FetchPlanV1{Sources: []taskstate.PlanSourceV1{{
 		Platform: source.Platform, Capability: source.Capability,
 		Title: source.Title, URL: source.URL, Config: source.Config,

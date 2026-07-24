@@ -14,10 +14,10 @@ import (
 	"testing"
 )
 
-// C2b3-2c activates recovery only. The composition root may construct the
-// coordinator and run recovery, but it must not pass that value to an ingress
-// or invoke proposal/confirmation/cancellation/receipt behavior.
-func TestDefinitionEditCoordinatorWiringIsRecoveryOnly(t *testing.T) {
+// C2b3-2d permits one additional edge: the composition root may pass the
+// coordinator exactly once into NewDefinitionEditController. Agent receives
+// only that narrow controller, never the concrete coordinator or phase APIs.
+func TestDefinitionEditCoordinatorWiringUsesSingleAuthenticatedController(t *testing.T) {
 	t.Parallel()
 	_, testFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -26,6 +26,7 @@ func TestDefinitionEditCoordinatorWiringIsRecoveryOnly(t *testing.T) {
 	taskDir := filepath.Clean(filepath.Dir(testFile))
 	repoRoot := filepath.Clean(filepath.Dir(taskDir))
 	providerPath := filepath.Join(taskDir, "definition_edit_coordinator.go")
+	controllerPath := filepath.Join(taskDir, "definition_edit_controller.go")
 	wiringPath := filepath.Join(repoRoot, "cmd", "server", "main.go")
 	fset := token.NewFileSet()
 	productionFiles, err := definitionEditCoordinatorProductionFiles(repoRoot, fset)
@@ -73,6 +74,17 @@ func TestDefinitionEditCoordinatorWiringIsRecoveryOnly(t *testing.T) {
 	for position := range wiringAllowed {
 		allowed[position] = struct{}{}
 	}
+	controller, ok := productionFiles[controllerPath]
+	if !ok {
+		t.Fatalf("definition edit controller %s is missing", controllerPath)
+	}
+	controllerAllowed, err := definitionEditControllerCoordinatorCalls(controller)
+	if err != nil {
+		t.Fatalf("validate controller coordinator boundary: %v", err)
+	}
+	for position := range controllerAllowed {
+		allowed[position] = struct{}{}
+	}
 
 	violations, err := definitionEditCoordinatorProviderEscapeViolations(provider, fset)
 	if err != nil {
@@ -96,9 +108,57 @@ func TestDefinitionEditCoordinatorWiringIsRecoveryOnly(t *testing.T) {
 	}
 	slices.Sort(violations)
 	if len(violations) != 0 {
-		t.Fatalf("C2b3-2c coordinator escaped recovery-only wiring:\n%s",
+		t.Fatalf("C2b3-2d coordinator escaped Gate/recovery/controller wiring:\n%s",
 			strings.Join(violations, "\n"))
 	}
+}
+
+func definitionEditControllerCoordinatorCalls(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	expected := map[string]int{
+		"PrepareAndSealProposal": 0,
+		"Confirm":                0,
+		"Cancel":                 0,
+	}
+	allowed := make(map[token.Pos]struct{}, len(expected))
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := definitionEditCoordinatorUnparen(
+			call.Fun,
+		).(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if _, watched := expected[selector.Sel.Name]; !watched {
+			return true
+		}
+		field, ok := definitionEditCoordinatorUnparen(
+			selector.X,
+		).(*ast.SelectorExpr)
+		if !ok || field.Sel.Name != "coordinator" {
+			return true
+		}
+		receiver, ok := definitionEditCoordinatorUnparen(field.X).(*ast.Ident)
+		if !ok || receiver.Name != "c" {
+			return true
+		}
+		expected[selector.Sel.Name]++
+		allowed[selector.Sel.Pos()] = struct{}{}
+		return true
+	})
+	for method, count := range expected {
+		if count != 1 {
+			return nil, fmt.Errorf(
+				"definition edit controller must directly call coordinator.%s exactly once, got %d",
+				method, count,
+			)
+		}
+	}
+	return allowed, nil
 }
 
 // One invocation of runTaskDefinitionEditAttempt may select one of the three
@@ -396,6 +456,8 @@ func definitionEditCoordinatorProductionFiles(
 func definitionEditCoordinatorProviderFunctionSymbols() map[string]struct{} {
 	return definitionEditCoordinatorStringSet([]string{
 		"NewTaskDefinitionEditCoordinator",
+		"ValidateRuntimeEnvironment",
+		"validateTaskDefinitionEditPreflightBudget",
 		"PrepareAndSealProposal",
 		"prepareTaskDefinitionEditProposal",
 		"validateTaskDefinitionEditPrepareInput",
@@ -438,6 +500,7 @@ func definitionEditCoordinatorProviderFunctionSymbols() map[string]struct{} {
 
 func definitionEditCoordinatorPrivateGraphSymbols() map[string]struct{} {
 	return definitionEditCoordinatorStringSet([]string{
+		"validateTaskDefinitionEditPreflightBudget",
 		"prepareTaskDefinitionEditProposal",
 		"sealTaskDefinitionEditProposal",
 		"validateDependencies",
@@ -466,6 +529,8 @@ type definitionEditCoordinatorGraphExpectation struct {
 
 func definitionEditCoordinatorProviderGraphExpectations() []definitionEditCoordinatorGraphExpectation {
 	return []definitionEditCoordinatorGraphExpectation{
+		{"ValidateRuntimeEnvironment", "validateDependencies", 1},
+		{"ValidateRuntimeEnvironment", "validateTaskDefinitionEditPreflightBudget", 1},
 		{"PrepareAndSealProposal", "validateDependencies", 1},
 		{"PrepareAndSealProposal", "prepareTaskDefinitionEditProposal", 1},
 		{"PrepareAndSealProposal", "sealTaskDefinitionEditProposal", 1},
@@ -1143,28 +1208,73 @@ func definitionEditCoordinatorRecoveryWiring(
 		site.selector.Sel.Pos(): {},
 	}
 	allowedVariablePositions := map[token.Pos]struct{}{site.variable.Pos(): {}}
-	runRecoveryCalls := 0
+	allowedMethodCalls := map[string]int{
+		"ValidateRuntimeEnvironment": 0,
+		"RecoverStaleOnce":           0,
+		"RunRecovery":                0,
+	}
 	ast.Inspect(mainFunction.Body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
 		selector, ok := definitionEditCoordinatorUnparen(call.Fun).(*ast.SelectorExpr)
-		if !ok || selector.Sel.Name != "RunRecovery" {
+		if !ok {
+			return true
+		}
+		if _, watched := allowedMethodCalls[selector.Sel.Name]; !watched {
 			return true
 		}
 		receiver, ok := definitionEditCoordinatorUnparen(selector.X).(*ast.Ident)
 		if !ok || receiver.Obj != site.variable.Obj {
 			return true
 		}
-		runRecoveryCalls++
+		allowedMethodCalls[selector.Sel.Name]++
 		allowed[selector.Sel.Pos()] = struct{}{}
 		allowedVariablePositions[receiver.Pos()] = struct{}{}
 		return true
 	})
-	if runRecoveryCalls != 1 {
-		return nil, fmt.Errorf("cmd/server run must directly call definition edit RunRecovery exactly once, got %d",
-			runRecoveryCalls)
+	for method, count := range allowedMethodCalls {
+		if count != 1 {
+			return nil, fmt.Errorf(
+				"cmd/server run must directly call definition edit %s exactly once, got %d",
+				method, count,
+			)
+		}
+	}
+	controllerEdges := 0
+	ast.Inspect(mainFunction.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || len(call.Args) != 2 {
+			return true
+		}
+		selector, ok := definitionEditCoordinatorUnparen(
+			call.Fun,
+		).(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "NewDefinitionEditController" {
+			return true
+		}
+		pkg, ok := definitionEditCoordinatorUnparen(
+			selector.X,
+		).(*ast.Ident)
+		if !ok || pkg.Name != taskImportName {
+			return true
+		}
+		receiver, ok := definitionEditCoordinatorUnparen(
+			call.Args[1],
+		).(*ast.Ident)
+		if !ok || receiver.Obj != site.variable.Obj {
+			return true
+		}
+		controllerEdges++
+		allowedVariablePositions[receiver.Pos()] = struct{}{}
+		return true
+	})
+	if controllerEdges != 1 {
+		return nil, fmt.Errorf(
+			"cmd/server run must pass the coordinator to task.NewDefinitionEditController exactly once, got %d",
+			controllerEdges,
+		)
 	}
 
 	var escaped []string
@@ -1179,7 +1289,7 @@ func definitionEditCoordinatorRecoveryWiring(
 		return true
 	})
 	if len(escaped) != 0 {
-		return nil, fmt.Errorf("definition edit coordinator value may only be assigned and used as the RunRecovery receiver; extra uses=%d",
+		return nil, fmt.Errorf("definition edit coordinator value may only be assigned and used by environment/recovery or the single authenticated controller; extra uses=%d",
 			len(escaped))
 	}
 	return allowed, nil

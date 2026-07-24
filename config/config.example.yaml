@@ -54,6 +54,8 @@ pipeline:
 
 agent:
   max_turns: 20
+  # C2b3-2d 唯一任务定义编辑入口；真卡 Gate 与耐久回执接通前保持 false。
+  definition_edit_enabled: false
   token_budget_daily: 100000 # 预留，当前未接线（无代码按它拦截）；实际护栏是 max_turns + endpoint_*_cap
   session_ttl_minutes: 30 # 同一 owner 会话闲置过期窗口（M4）
 

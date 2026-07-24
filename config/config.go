@@ -131,6 +131,10 @@ type PipelineConfig struct {
 // AgentConfig 是 agent loop 运行约束配置。
 type AgentConfig struct {
 	MaxTurns int `mapstructure:"max_turns"`
+	// DefinitionEditEnabled exposes the single C2b3-2d Agent/controller path.
+	// It is false by default until the real-card Gate and receipt dispatcher
+	// are completed; false omits the tool and controller from Agent entirely.
+	DefinitionEditEnabled bool `mapstructure:"definition_edit_enabled"`
 	// TokenBudgetDaily 预留、**当前未接线**：无任何代码按它拦截、也不递增 profiles 表的
 	// tokens_used_today（那三列恒为建表默认值）。agent 现有的按次护栏是 MaxTurns 与
 	// EndpointMsgCap/EndpointDailyCap（后两者是活的、从 tool_calls 表 COUNT 强制）。
@@ -287,6 +291,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.compiled_runtime_allow_all", false)
 
 	v.SetDefault("agent.max_turns", 20)
+	v.SetDefault("agent.definition_edit_enabled", false)
 	v.SetDefault("agent.token_budget_daily", 100000)
 	v.SetDefault("agent.session_ttl_minutes", 30)
 	v.SetDefault("agent.endpoint_msg_cap", 10)

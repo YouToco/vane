@@ -98,6 +98,40 @@ func TestSendCreationReceiptPatchRequestAndSuccessWithoutData(t *testing.T) {
 	}
 }
 
+func TestSendDefinitionEditReceiptUsesSameOriginalCardPatchBoundary(t *testing.T) {
+	const (
+		messageID = "om_definition_edit_receipt"
+		cardJSON  = `{"schema":"2.0","config":{"update_multi":true}}`
+	)
+	var patchCalls int
+	m := newCreationReceiptTestManager(
+		t,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if serveCreationReceiptToken(w, r) {
+				return
+			}
+			patchCalls++
+			if r.Method != http.MethodPatch ||
+				r.URL.EscapedPath() !=
+					"/open-apis/im/v1/messages/"+messageID {
+				t.Fatalf("definition edit receipt must PATCH original card: %s %s",
+					r.Method, r.URL.EscapedPath())
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"code":0,"msg":"success"}`)
+		}),
+		nil,
+	)
+	if err := m.SendDefinitionEditReceipt(
+		t.Context(), creationReceiptTestProvider, messageID, cardJSON,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if patchCalls != 1 {
+		t.Fatalf("patch calls=%d, want 1", patchCalls)
+	}
+}
+
 func TestSendCreationReceiptTimeoutRetryOverwritesSameResource(t *testing.T) {
 	const (
 		messageID = "om_timeout_then_retry"

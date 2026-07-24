@@ -695,14 +695,19 @@ func (f *fakeScheduleClient) GetHandle(_ context.Context, id string) client.Sche
 // 把返回的 Schedule 落成新的当前值——这样才能断言"只有 Spec 变了、Action/Policy 没丢"。
 type fakeScheduleHandle struct {
 	client.ScheduleHandle
-	current     client.Schedule
-	updateErr   error             // 非 nil = 模拟 Temporal Update 失败
-	describeErr error             // 非 nil = 模拟 Temporal Describe 失败（reconcile 用例）
-	history     []client.Schedule // 每次成功 Update 后的快照（用于验回滚发生过）
+	current       client.Schedule
+	updateErr     error // 非 nil = 模拟 Temporal Update 失败
+	describeErr   error // 非 nil = 模拟 Temporal Describe 失败（reconcile 用例）
+	blockDescribe bool
+	history       []client.Schedule // 每次成功 Update 后的快照（用于验回滚发生过）
 }
 
 // Describe 返回当前持有的 Schedule 快照，供 ReconcileActions 判断是否已带 schedule_id。
-func (h *fakeScheduleHandle) Describe(_ context.Context) (*client.ScheduleDescription, error) {
+func (h *fakeScheduleHandle) Describe(ctx context.Context) (*client.ScheduleDescription, error) {
+	if h.blockDescribe {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if h.describeErr != nil {
 		return nil, h.describeErr
 	}
@@ -727,13 +732,18 @@ func (h *fakeScheduleHandle) Update(_ context.Context, o client.ScheduleUpdateOp
 // fakeScheduleStore 按预设让镜像写成功/失败，并记录收到的参数。
 type fakeScheduleStore struct {
 	scheduleStore
-	updateErr  error
-	gotID      string
-	gotSpec    json.RawMessage
-	gotNLDesc  *string
-	updateCall int
-	active     []types.Schedule // ReconcileActions 用例：ListActiveSchedules 返回值
-	activeErr  error
+	updateErr             error
+	gotID                 string
+	gotSpec               json.RawMessage
+	gotNLDesc             *string
+	updateCall            int
+	active                []types.Schedule // ReconcileActions 用例：ListActiveSchedules 返回值
+	activeErr             error
+	reconcileCurrent      map[string]*types.Schedule
+	reconcileAcquireCalls []string
+	reconcileReleaseCalls int
+	reconcileAcquireErr   error
+	reconcileReleaseErr   error
 }
 
 // ListActiveSchedules 供 ReconcileActions 用例注入存量调度集合。
@@ -745,6 +755,42 @@ func (f *fakeScheduleStore) ListActiveSchedules(_ context.Context) ([]types.Sche
 		}
 	}
 	return active, f.activeErr
+}
+
+func (f *fakeScheduleStore) AcquireScheduleReconcile(
+	_ context.Context,
+	id string,
+) (*types.Schedule, func(context.Context) error, error) {
+	f.reconcileAcquireCalls = append(f.reconcileAcquireCalls, id)
+	if f.reconcileAcquireErr != nil {
+		return nil, nil, f.reconcileAcquireErr
+	}
+	release := func(context.Context) error {
+		f.reconcileReleaseCalls++
+		return f.reconcileReleaseErr
+	}
+	if f.reconcileCurrent != nil {
+		current := f.reconcileCurrent[id]
+		if current == nil {
+			return nil, release, nil
+		}
+		copied := *current
+		if copied.ExecutionMode == "" {
+			copied.ExecutionMode = types.ExecutionModeCompiled
+		}
+		return &copied, release, nil
+	}
+	for i := range f.active {
+		if f.active[i].ID != id {
+			continue
+		}
+		copied := f.active[i]
+		if copied.ExecutionMode == "" {
+			copied.ExecutionMode = types.ExecutionModeCompiled
+		}
+		return &copied, release, nil
+	}
+	return nil, release, nil
 }
 
 // GetSchedule 一律放行：本组用例聚焦「更新 Spec 时不弄丢 Action/Policy」，
@@ -1250,6 +1296,11 @@ func TestReconcileActions_补齐缺失的scheduleID(t *testing.T) {
 	if len(h.history) != 1 {
 		t.Fatalf("缺 id 的调度应被 Update 一次，实得 %d", len(h.history))
 	}
+	if len(st.reconcileAcquireCalls) != 1 || st.reconcileAcquireCalls[0] != "push-1-old" ||
+		st.reconcileReleaseCalls != 1 {
+		t.Fatalf("reconcile 授权 acquire/release = %v/%d，期望 [push-1-old]/1",
+			st.reconcileAcquireCalls, st.reconcileReleaseCalls)
+	}
 	act, ok := h.current.Action.(*client.ScheduleWorkflowAction)
 	if !ok {
 		t.Fatalf("Action 类型错: %T", h.current.Action)
@@ -1282,6 +1333,68 @@ func TestReconcileActions_补齐缺失的scheduleID(t *testing.T) {
 	}
 	if h.current.State == nil || h.current.State.Note != "原始状态" {
 		t.Errorf("State 不该被动")
+	}
+}
+
+func TestReconcileActions_写前重读发现编辑标记则跳过(t *testing.T) {
+	const taskID = "push-1-editing"
+	h := &fakeScheduleHandle{current: reconcileSchedule(
+		"wf-"+taskID, []interface{}{payloadArg(t, workflow.PushParams{UserID: 1})},
+	)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{taskID: h},
+	}}
+	stale := types.Schedule{
+		ID: taskID, TenantID: 7, UserID: 1, NLDescription: "旧快照",
+		ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
+	}
+	st := &fakeScheduleStore{
+		active: []types.Schedule{stale},
+		reconcileCurrent: map[string]*types.Schedule{
+			taskID: nil, // Store 在 advisory gate 内发现 paused/marker，拒绝授权。
+		},
+	}
+
+	if err := New(fc, "tq", st).ReconcileActions(t.Context()); err != nil {
+		t.Fatalf("ReconcileActions 失败: %v", err)
+	}
+	if len(h.history) != 0 {
+		t.Fatalf("编辑已 quiesce 后不得再写 Temporal，实得 %d 次", len(h.history))
+	}
+	if st.reconcileReleaseCalls != 1 {
+		t.Fatalf("跳过路径也必须释放 DB gate，实得 %d", st.reconcileReleaseCalls)
+	}
+}
+
+func TestReconcileOne_远端失败仍释放数据库Gate并保留双错误(t *testing.T) {
+	const taskID = "push-1-release-error"
+	temporalErr := errors.New("temporal unavailable")
+	releaseErr := errors.New("rollback unavailable")
+	h := &fakeScheduleHandle{
+		current:     reconcileSchedule("wf-"+taskID, nil),
+		describeErr: temporalErr,
+	}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{taskID: h},
+	}}
+	current := types.Schedule{
+		ID: taskID, TenantID: 7, UserID: 1, NLDescription: "release",
+		ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
+	}
+	st := &fakeScheduleStore{
+		active:              []types.Schedule{current},
+		reconcileReleaseErr: releaseErr,
+	}
+
+	updated, err := New(fc, "tq", st).reconcileOne(t.Context(), current)
+	if updated || err == nil {
+		t.Fatalf("reconcileOne = %v, %v; want false and joined error", updated, err)
+	}
+	if !errors.Is(err, temporalErr) || !errors.Is(err, releaseErr) {
+		t.Fatalf("reconcileOne must preserve remote and release errors: %v", err)
+	}
+	if st.reconcileReleaseCalls != 1 {
+		t.Fatalf("database gate release calls = %d, want 1", st.reconcileReleaseCalls)
 	}
 }
 
@@ -1433,10 +1546,11 @@ func TestReconcileActions_任务名漂移回写(t *testing.T) {
 	}
 }
 
-// TestReconcileActions_单条失败不中断 守 best-effort：一个调度 Describe 失败只跳过它，
-// 不阻断其它调度，整体仍返回 nil（不因个别 reconcile 失败而拒绝启动）。
-func TestReconcileActions_单条失败不中断(t *testing.T) {
-	bad := &fakeScheduleHandle{describeErr: errors.New("temporal 抖动")}
+// TestReconcileActions_单条失败继续检查但最终拒绝启动：尽量收集完整诊断，
+// 但任何漏修都不得在 worker ingress 开放后静默遗留。
+func TestReconcileActions_单条失败聚合后FailClosed(t *testing.T) {
+	temporalErr := errors.New("temporal 抖动")
+	bad := &fakeScheduleHandle{describeErr: temporalErr}
 	goodFrozen := []interface{}{payloadArg(t, workflow.PushParams{UserID: 2})}
 	good := &fakeScheduleHandle{current: reconcileSchedule("wf-push-2-ok", goodFrozen)}
 	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handles: map[string]*fakeScheduleHandle{
@@ -1449,10 +1563,45 @@ func TestReconcileActions_单条失败不中断(t *testing.T) {
 	}}
 	s := New(fc, "tq", st)
 
-	if err := s.ReconcileActions(context.Background()); err != nil {
-		t.Fatalf("best-effort 应返回 nil，实得 %v", err)
+	err := s.ReconcileActions(context.Background())
+	if !errors.Is(err, temporalErr) {
+		t.Fatalf("单条失败必须聚合并拒绝启动，实得 %v", err)
 	}
 	if len(good.history) != 1 {
 		t.Errorf("失败调度不该阻断后续，good 应被 Update 一次，实得 %d", len(good.history))
+	}
+}
+
+func TestReconcileActions_全局启动预算耗尽立即FailClosed(t *testing.T) {
+	const (
+		blockedID = "push-1-blocked"
+		unseenID  = "push-2-unseen"
+	)
+	blocked := &fakeScheduleHandle{blockDescribe: true}
+	unseen := &fakeScheduleHandle{current: reconcileSchedule("wf-"+unseenID, nil)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handles: map[string]*fakeScheduleHandle{
+		blockedID: blocked,
+		unseenID:  unseen,
+	}}}
+	st := &fakeScheduleStore{active: []types.Schedule{
+		{ID: blockedID, UserID: 1, ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive},
+		{ID: unseenID, UserID: 2, ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive},
+	}}
+
+	started := time.Now()
+	err := New(fc, "tq", st).reconcileActions(t.Context(), 25*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("global startup budget must fail closed: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("global startup budget took %s, want bounded completion", elapsed)
+	}
+	if len(st.reconcileAcquireCalls) != 1 ||
+		st.reconcileAcquireCalls[0] != blockedID {
+		t.Fatalf("post-budget schedules must remain untouched: %v",
+			st.reconcileAcquireCalls)
+	}
+	if len(unseen.history) != 0 {
+		t.Fatalf("post-budget schedule was updated %d times", len(unseen.history))
 	}
 }

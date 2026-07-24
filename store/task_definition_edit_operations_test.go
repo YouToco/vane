@@ -307,6 +307,179 @@ func TestTaskDefinitionEditAcquireQuiesceTakeoverAndTerminalOutbox(
 	}
 }
 
+func TestTaskDefinitionEditOperationBlocksLegacyReconcileAuthorization(t *testing.T) {
+	f := newTaskDefinitionEditOperationFixture(t)
+	ctx := t.Context()
+	acquired, err := f.state.store.AcquireTaskDefinitionEditOperation(
+		ctx,
+		types.AcquireTaskDefinitionEditOperationParams{
+			Scope: f.op.Scope(), LeaseOwner: "edit-reconcile-race",
+			LeaseDuration:   time.Minute,
+			ReceiptProvider: "feishu_card_patch:app-test",
+			ReceiptTarget:   "message-test/card-test",
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcquireTaskDefinitionEditOperation: %v", err)
+	}
+
+	sc, releaseReconcile, err := f.state.store.AcquireScheduleReconcile(
+		ctx, f.op.TaskID,
+	)
+	if err != nil {
+		t.Fatalf("AcquireScheduleReconcile = %+v, %v", sc, err)
+	}
+	if releaseReconcile == nil {
+		t.Fatal("operation-owned skip must return advisory lock release")
+	}
+	if sc != nil {
+		t.Fatalf("nonterminal definition edit authorized legacy reconcile: %+v", sc)
+	}
+	if err := releaseReconcile(ctx); err != nil {
+		t.Fatalf("release skipped reconcile authorization: %v", err)
+	}
+	if err := f.state.store.QuiesceTaskDefinitionEdit(
+		ctx, acquired.Lease(),
+	); err != nil {
+		t.Fatalf("QuiesceTaskDefinitionEdit: %v", err)
+	}
+
+	sc, releaseReconcile, err = f.state.store.AcquireScheduleReconcile(
+		ctx, f.op.TaskID,
+	)
+	if err != nil {
+		t.Fatalf("AcquireScheduleReconcile after quiesce: %v", err)
+	}
+	if releaseReconcile == nil {
+		t.Fatal("quiesced skip must return advisory lock release")
+	}
+	defer func() {
+		if err := releaseReconcile(context.Background()); err != nil {
+			t.Errorf("release quiesced reconcile authorization: %v", err)
+		}
+	}()
+	if sc != nil {
+		t.Fatalf("quiesced task must not authorize legacy reconcile: %+v", sc)
+	}
+}
+
+func TestTaskDefinitionEditAcquireRejectsConcurrentMembershipRevocation(
+	t *testing.T,
+) {
+	f := newTaskDefinitionEditOperationFixture(t)
+	ctx := t.Context()
+	t.Cleanup(func() {
+		if _, err := f.state.store.pool.Exec(context.Background(),
+			`INSERT INTO memberships (tenant_id,user_id,role)
+			 VALUES ($1,$2,'owner') ON CONFLICT DO NOTHING`,
+			f.op.TenantID, f.op.UserID,
+		); err != nil {
+			t.Errorf("restore confirmed actor membership: %v", err)
+		}
+	})
+	holder, err := f.state.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(context.Background())
+	if _, err := holder.Exec(ctx,
+		`DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`,
+		f.op.TenantID, f.op.UserID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.state.store.AcquireTaskDefinitionEditOperation(
+			ctx, types.AcquireTaskDefinitionEditOperationParams{
+				Scope: f.op.Scope(), LeaseOwner: "revoked-confirm",
+				LeaseDuration:   time.Minute,
+				ReceiptProvider: "feishu_card_patch:app-test",
+				ReceiptTarget:   "message-revoked-confirm",
+			},
+		)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("acquire did not serialize with membership revocation: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("acquire after concurrent membership revocation = %v", err)
+	}
+	op, err := f.state.store.LoadTaskDefinitionEditOperation(ctx, f.op.Scope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Status != types.TaskDefinitionEditOperationStatusPending ||
+		op.ConfirmedAt != nil {
+		t.Fatalf("revoked confirmation mutated operation: %+v", op)
+	}
+}
+
+func TestTaskDefinitionEditCancelRejectsConcurrentMembershipRevocation(
+	t *testing.T,
+) {
+	f := newTaskDefinitionEditOperationFixture(t)
+	ctx := t.Context()
+	t.Cleanup(func() {
+		if _, err := f.state.store.pool.Exec(context.Background(),
+			`INSERT INTO memberships (tenant_id,user_id,role)
+			 VALUES ($1,$2,'owner') ON CONFLICT DO NOTHING`,
+			f.op.TenantID, f.op.UserID,
+		); err != nil {
+			t.Errorf("restore cancelled actor membership: %v", err)
+		}
+	})
+	holder, err := f.state.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(context.Background())
+	if _, err := holder.Exec(ctx,
+		`DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`,
+		f.op.TenantID, f.op.UserID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.state.store.CancelTaskDefinitionEditOperation(
+			ctx, types.CancelTaskDefinitionEditOperationParams{
+				Scope:           f.op.Scope(),
+				ReceiptProvider: "feishu_card_patch:app-test",
+				ReceiptTarget:   "message-revoked-cancel",
+			},
+		)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("cancel did not serialize with membership revocation: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("cancel after concurrent membership revocation = %v", err)
+	}
+	op, err := f.state.store.LoadTaskDefinitionEditOperation(ctx, f.op.Scope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Status != types.TaskDefinitionEditOperationStatusPending ||
+		op.TombstonedAt != nil {
+		t.Fatalf("revoked cancellation mutated operation: %+v", op)
+	}
+}
+
 func TestTaskDefinitionEditCheckpointCommitAndCompleteAtomic(t *testing.T) {
 	f := newTaskDefinitionEditOperationFixture(t)
 	ctx := t.Context()

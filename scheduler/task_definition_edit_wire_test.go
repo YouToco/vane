@@ -72,7 +72,9 @@ func TestTaskDefinitionEditProposalComponentFixtureV1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read proposal component fixture %s: %v\ngenerated fixture:\n%s", path, err, generated)
 	}
-	want = bytes.TrimSuffix(want, []byte("\n"))
+	// Git may materialize the JSON fixture with CRLF on Windows. Line endings
+	// outside the single JSON value are not wire bytes.
+	want = bytes.TrimRight(want, "\r\n")
 	if !bytes.Equal(generated, want) {
 		t.Fatalf("proposal component fixture drifted; update only with an intentional wire migration\n got: %s\nwant: %s", generated, want)
 	}
