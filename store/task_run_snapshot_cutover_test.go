@@ -34,6 +34,28 @@ type taskRunSnapshotCutoverFixture struct {
 	generation int64
 }
 
+// createOrGetTaskRunSnapshotWithAuthorityV2 remains a controlled test helper.
+// Production derives the marker from the locked schedule pointer and exposes
+// no marker-bearing input.
+func (s *Store) createOrGetTaskRunSnapshotWithAuthorityV2(
+	ctx context.Context,
+	p CreateOrGetTaskRunSnapshotParams,
+	shadowV2 bool,
+	expectedEventID *int64,
+) (*taskRunSnapshot, error) {
+	snapshot, err := s.createOrGetTaskRunSnapshotWithShadowV2(
+		ctx, p, shadowV2)
+	if err != nil {
+		return nil, err
+	}
+	if expectedEventID != nil &&
+		(snapshot.V2CutoverEventID == nil ||
+			*snapshot.V2CutoverEventID != *expectedEventID) {
+		return nil, taskRunIntegrityError()
+	}
+	return snapshot, nil
+}
+
 func newTaskRunSnapshotCutoverFixture(
 	t *testing.T,
 ) taskRunSnapshotCutoverFixture {
@@ -144,26 +166,30 @@ func insertCutoverEvent(
 	return eventID
 }
 
-func TestTaskRunSnapshotCutoverFenceRejectsUnmarkedProductionWriter(t *testing.T) {
+func TestTaskRunSnapshotCutoverFenceDerivesProductionMarker(t *testing.T) {
 	f := newTaskRunSnapshotCutoverFixture(t)
 	runID := "cutover-old-writer-" + uuid.NewString()
-	_, err := f.base.st.createOrGetTaskRunSnapshotWithShadowV2(
+	snapshot, err := f.base.st.createOrGetTaskRunSnapshotWithShadowV2(
 		t.Context(), f.base.params(f.taskID, runID), true)
-	if err == nil {
-		t.Fatal("active cutover accepted a production writer with a NULL marker")
+	if err != nil {
+		t.Fatalf("active cutover production writer: %v", err)
 	}
-	var parents, shadows int
+	var parents, shadows, marked int
 	if err := f.base.st.pool.QueryRow(t.Context(),
 		`SELECT
 		   (SELECT count(*) FROM task_run_snapshots WHERE temporal_run_id=$1),
 		   (SELECT count(*) FROM task_run_snapshot_v2_shadows
-		     WHERE temporal_run_id=$1)`,
-		runID).Scan(&parents, &shadows); err != nil {
+		     WHERE temporal_run_id=$1),
+		   (SELECT count(*) FROM task_run_snapshots
+		     WHERE temporal_run_id=$1 AND v2_cutover_event_id=$2)`,
+		runID, f.eventID).Scan(&parents, &shadows, &marked); err != nil {
 		t.Fatal(err)
 	}
-	if parents != 0 || shadows != 0 {
-		t.Fatalf("rejected old writer persisted parent/shadow = %d/%d",
-			parents, shadows)
+	if parents != 1 || shadows != 1 || marked != 1 ||
+		snapshot.V2CutoverEventID == nil ||
+		*snapshot.V2CutoverEventID != f.eventID {
+		t.Fatalf("derived production parent/shadow/marked = %d/%d/%d %+v",
+			parents, shadows, marked, snapshot.V2CutoverEventID)
 	}
 }
 
@@ -1033,6 +1059,14 @@ func TestTaskRunSnapshotCutoverTenantPurgeReportsAndDeletesFence(t *testing.T) {
 
 func TestTaskRunSnapshotCutoverErrorDoesNotExposeDatabaseDetail(t *testing.T) {
 	f := newTaskRunSnapshotCutoverFixture(t)
+	if _, err := f.base.st.pool.Exec(t.Context(),
+		`UPDATE schedules
+		    SET approved_definition_version=NULL,
+		        approved_definition_digest=NULL
+		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+		f.base.tenantID, f.base.userID, f.taskID); err != nil {
+		t.Fatal(err)
+	}
 	runID := "cutover-safe-error-" + uuid.NewString()
 	_, err := f.base.st.createOrGetTaskRunSnapshotWithShadowV2(
 		t.Context(), f.base.params(f.taskID, runID), true)
@@ -1045,14 +1079,14 @@ func TestTaskRunSnapshotCutoverErrorDoesNotExposeDatabaseDetail(t *testing.T) {
 	}
 }
 
-func TestTaskRunSnapshotCutoverHasNoProductionAdmissionWriter(t *testing.T) {
+func TestTaskRunSnapshotCutoverHasOnlyDerivedProductionAdmission(t *testing.T) {
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("resolve cutover test path")
 	}
 	root := filepath.Dir(filepath.Dir(file))
 	fset := token.NewFileSet()
-	var authorityCalls []string
+	var admissionCalls []string
 	for _, dir := range []string{"store", "workflow", filepath.Join("cmd", "runtimeadmin")} {
 		err := filepath.WalkDir(filepath.Join(root, dir),
 			func(path string, entry os.DirEntry, walkErr error) error {
@@ -1083,25 +1117,24 @@ func TestTaskRunSnapshotCutoverHasNoProductionAdmissionWriter(t *testing.T) {
 					if !ok {
 						return true
 					}
-					selector, ok := call.Fun.(*ast.SelectorExpr)
-					if !ok ||
-						selector.Sel.Name !=
-							"createOrGetTaskRunSnapshotWithAuthorityV2" {
+					var callName string
+					switch callee := call.Fun.(type) {
+					case *ast.Ident:
+						callName = callee.Name
+					case *ast.SelectorExpr:
+						callName = callee.Sel.Name
+					}
+					if callName ==
+						"createOrGetTaskRunSnapshotWithAuthorityV2" {
+						t.Errorf("production marker-bearing writer in %s",
+							filepath.ToSlash(path))
+					}
+					if callName != "loadTaskRunSnapshotAdmissionV2" {
 						return true
 					}
 					position := fset.Position(call.Pos())
-					authorityCalls = append(authorityCalls,
+					admissionCalls = append(admissionCalls,
 						fmt.Sprintf("%s:%d", filepath.ToSlash(path), position.Line))
-					if len(call.Args) != 4 {
-						t.Errorf("authority writer call args = %d in %s",
-							len(call.Args), filepath.ToSlash(path))
-						return true
-					}
-					identifier, nilArg := call.Args[3].(*ast.Ident)
-					if !nilArg || identifier.Name != "nil" {
-						t.Errorf("production authority writer has non-nil marker in %s",
-							filepath.ToSlash(path))
-					}
 					return true
 				})
 				return nil
@@ -1110,9 +1143,9 @@ func TestTaskRunSnapshotCutoverHasNoProductionAdmissionWriter(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(authorityCalls) != 1 ||
-		!strings.Contains(authorityCalls[0], "store/task_run_snapshots.go") {
-		t.Fatalf("production authority-writer calls = %v, want one nil wrapper",
-			authorityCalls)
+	if len(admissionCalls) != 1 ||
+		!strings.Contains(admissionCalls[0], "store/task_run_snapshots.go") {
+		t.Fatalf("production admission calls = %v, want one derived path",
+			admissionCalls)
 	}
 }

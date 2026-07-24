@@ -521,13 +521,14 @@ func TestTaskRunSnapshotShadowV2HasOnlyExplicitRuntimeConsumers(t *testing.T) {
 		filepath.Clean(filepath.Join(repoRoot, "store", "tenant_purge.go")):                   true,
 	}
 	allowedCalls := map[string]bool{
-		"CreateOrGetCompiledRunSnapshotShadowV2|workflow/activities.go|PrepareRun":                                     true,
-		"AuditCompiledTaskRunSnapshotV2|workflow/activities.go|auditCompiledSnapshotV2":                                true,
-		"AuditTaskRunSnapshotShadowsV2Through|cmd/runtimeadmin/main.go|runSnapshotShadow":                              true,
-		"AuditTaskRunSnapshotShadowsV2Through|store/task_run_snapshot_shadow_audit.go|AuditTaskRunSnapshotShadowsV2":   true,
-		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_consumer_v2.go|AuditCompiledTaskRunSnapshotV2":         true,
-		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_shadow_audit.go|auditTaskRunSnapshotShadowsV2":         true,
-		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_authority.go|loadAuthoritativeCompiledTaskRunSnapshot": true,
+		"CreateOrGetCompiledRunSnapshotShadowV2|workflow/activities.go|PrepareRun":                                      true,
+		"AuditCompiledTaskRunSnapshotV2|workflow/activities.go|auditCompiledSnapshotV2":                                 true,
+		"AuditTaskRunSnapshotShadowsV2Through|cmd/runtimeadmin/main.go|runSnapshotShadow":                               true,
+		"AuditTaskRunSnapshotShadowsV2Through|store/task_run_snapshot_shadow_audit.go|AuditTaskRunSnapshotShadowsV2":    true,
+		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_consumer_v2.go|AuditCompiledTaskRunSnapshotV2":          true,
+		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_shadow_audit.go|auditTaskRunSnapshotShadowsV2":          true,
+		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_authority.go|loadAuthoritativeCompiledTaskRunSnapshot":  true,
+		"auditCompiledTaskRunSnapshotV2|store/task_run_snapshot_cutover_control.go|strictAuditTaskRunSnapshotCutoverV2": true,
 	}
 	guardedCalls := map[string]bool{
 		"CreateOrGetCompiledRunSnapshotShadowV2": true,
