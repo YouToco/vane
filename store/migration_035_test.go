@@ -39,6 +39,27 @@ func migration035Scratch(t *testing.T) (*sql.DB, *goose.Provider) {
 
 func TestMigration035EmptyLedgerCanDowngrade(t *testing.T) {
 	db, provider := migration035Scratch(t)
+	var payloadInsert, idInsert, createdAtInsert, sequenceUsage, sequenceSelect bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT
+		  has_column_privilege('vane_app','agent_events','payload','INSERT'),
+		  has_column_privilege('vane_app','agent_events','id','INSERT'),
+		  has_column_privilege('vane_app','agent_events','created_at','INSERT'),
+		  has_sequence_privilege('vane_app','agent_events_id_seq','USAGE'),
+		  has_sequence_privilege('vane_app','agent_events_id_seq','SELECT')`,
+	).Scan(
+		&payloadInsert, &idInsert, &createdAtInsert,
+		&sequenceUsage, &sequenceSelect,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !payloadInsert || idInsert || createdAtInsert ||
+		!sequenceUsage || sequenceSelect {
+		t.Fatalf("append-only grants drifted: payload_insert=%v id_insert=%v "+
+			"created_at_insert=%v sequence_usage=%v sequence_select=%v",
+			payloadInsert, idInsert, createdAtInsert,
+			sequenceUsage, sequenceSelect)
+	}
 	if _, err := provider.Down(t.Context()); err != nil {
 		t.Fatalf("空 agent_events 应可回滚 035: %v", err)
 	}
@@ -98,6 +119,10 @@ func TestMigration035RefusesEventDataDowngrade(t *testing.T) {
 	if version != 35 || rows != 1 || !exists {
 		t.Fatalf("拒绝回滚必须原子保留版本/表/行: version=%d rows=%d exists=%v",
 			version, rows, exists)
+	}
+	if _, err := db.ExecContext(ctx,
+		`UPDATE agent_events SET batch_idempotency_key='bad key'`); err == nil {
+		t.Fatal("database accepted idempotency bytes rejected by the Store grammar")
 	}
 
 	if _, err := db.ExecContext(ctx, `DELETE FROM agent_events`); err != nil {

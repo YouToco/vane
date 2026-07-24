@@ -323,15 +323,24 @@ func TestAgentEventsScopeAndAtomicValidation(t *testing.T) {
 	valid := agentledger.Input{
 		Kind: agentledger.KindUserMessage, Body: []byte(`{"text":"safe"}`),
 	}
+	secretInvalid := "duplicate-secret-must-not-leak"
 	_, err := f.store.AppendAgentEvents(ctx, agentledger.AppendBatch{
 		Scope: f.scopeA(), IdempotencyKey: "atomic-invalid",
 		Events: []agentledger.Input{
 			valid,
-			{Kind: agentledger.KindToolCall, Body: []byte(`{"x":1,"x":2}`)},
+			{
+				Kind: agentledger.KindToolCall,
+				Body: []byte(
+					`{"x":"` + secretInvalid + `","x":"changed"}`,
+				),
+			},
 		},
 	})
 	if !errors.Is(err, types.ErrValidation) {
 		t.Fatalf("invalid atomic batch error=%v", err)
+	}
+	if strings.Contains(err.Error(), secretInvalid) {
+		t.Fatalf("validation error leaked event payload: %v", err)
 	}
 	var count int
 	if err := f.store.pool.QueryRow(ctx,
@@ -381,6 +390,79 @@ func TestAgentEventsScopeAndAtomicValidation(t *testing.T) {
 			t.Fatalf("bound %d error=%v", i, err)
 		}
 	}
+}
+
+func TestAgentEventsBatchRollsBackAfterPartialDatabaseFailure(t *testing.T) {
+	f := newAgentEventFixture(t)
+	ctx := t.Context()
+	testStore := *f.store
+	testStore.beginTx = func(
+		ctx context.Context,
+		options pgx.TxOptions,
+	) (pgx.Tx, error) {
+		tx, err := f.store.pool.BeginTx(ctx, options)
+		if err != nil {
+			return nil, err
+		}
+		return &failSecondAgentEventInsertTx{Tx: tx}, nil
+	}
+	secret := "must-not-appear-in-errors"
+	_, err := testStore.AppendAgentEvents(ctx, agentledger.AppendBatch{
+		Scope: f.scopeA(), IdempotencyKey: "partial-db-failure",
+		Events: []agentledger.Input{
+			{Kind: agentledger.KindUserMessage, Body: []byte(`{"text":"first"}`)},
+			{
+				Kind: agentledger.KindAssistantMessage,
+				Body: []byte(`{"text":"` + secret + `"}`),
+			},
+		},
+	})
+	if !errors.Is(err, types.ErrDatabase) {
+		t.Fatalf("partial insert error=%v, want database error", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("database error leaked event payload: %v", err)
+	}
+	var count int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3`,
+		f.tenantA, f.userA, f.sessionA,
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("failed batch committed %d partial rows", count)
+	}
+}
+
+type failSecondAgentEventInsertTx struct {
+	pgx.Tx
+	inserts int
+}
+
+func (tx *failSecondAgentEventInsertTx) QueryRow(
+	ctx context.Context,
+	sql string,
+	args ...any,
+) pgx.Row {
+	if strings.Contains(sql, "INSERT INTO agent_events") {
+		tx.inserts++
+		if tx.inserts == 2 {
+			return agentEventErrorRow{
+				err: errors.New("synthetic database failure"),
+			}
+		}
+	}
+	return tx.Tx.QueryRow(ctx, sql, args...)
+}
+
+type agentEventErrorRow struct {
+	err error
+}
+
+func (row agentEventErrorRow) Scan(...any) error {
+	return row.err
 }
 
 func TestAgentEventsListAndReplayFailClosedOnCorruption(t *testing.T) {

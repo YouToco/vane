@@ -406,12 +406,12 @@ func validateAgentEventReplay(
 	requested []agentledger.CanonicalEvent,
 	requestedBatchDigest string,
 ) error {
-	if len(stored) != len(requested) {
-		return agentEventConflict()
-	}
 	storedCanonical, err := validateStoredAgentEventBatch(stored)
 	if err != nil {
 		return err
+	}
+	if len(storedCanonical) != len(requested) {
+		return agentEventConflict()
 	}
 	storedBatchDigest := stored[0].BatchDigest
 	if !constantTimeAgentEventDigestEqual(
