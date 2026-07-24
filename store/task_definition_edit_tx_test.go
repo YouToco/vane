@@ -55,6 +55,9 @@ func TestValidateTaskDefinitionEditRLSObservationFailsClosed(t *testing.T) {
 
 func TestValidateTaskDefinitionEditRuntimeRoles(t *testing.T) {
 	st := tenantTestStore(t)
+	// Keep the receipt-role visibility check non-vacuous: the startup probe uses
+	// an absent tenant context and must not see this retained tenant's receipt.
+	newTaskDefinitionEditReceiptFixture(t, st, "feishu", "runtime-role-probe")
 	for attempt := 1; attempt <= 2; attempt++ {
 		if err := st.ValidateTaskDefinitionEditRuntimeRoles(t.Context()); err != nil {
 			t.Fatalf("ValidateTaskDefinitionEditRuntimeRoles attempt %d: %v",

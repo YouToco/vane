@@ -49,6 +49,7 @@ func (s *Store) ValidateTaskDefinitionEditRuntimeRoles(ctx context.Context) erro
 		{
 			role:                 "vane_edit_receipt",
 			rlsTable:             "task_definition_edit_receipts",
+			probeTenantIsolation: true,
 			mayUpdateReceiptBody: true,
 		},
 	} {
@@ -102,13 +103,24 @@ func (s *Store) ValidateTaskDefinitionEditRuntimeRoles(ctx context.Context) erro
 		}
 		var crossTenantRows int64
 		if expected.probeTenantIsolation {
-			if err := tx.QueryRow(ctx, `SELECT count(*) FROM tenants`).Scan(
-				&crossTenantRows,
-			); err != nil {
+			var probeErr error
+			switch expected.role {
+			case "vane_edit_coordinator":
+				probeErr = tx.QueryRow(ctx, `SELECT count(*) FROM tenants`).Scan(
+					&crossTenantRows,
+				)
+			case "vane_edit_receipt":
+				probeErr = tx.QueryRow(ctx,
+					`SELECT count(*) FROM task_definition_edit_receipts`,
+				).Scan(&crossTenantRows)
+			default:
+				probeErr = fmt.Errorf("unsupported tenant isolation probe role")
+			}
+			if probeErr != nil {
 				rollbackTaskDefinitionEditTx(ctx, tx)
 				return fmt.Errorf(
 					"probe task definition edit runtime role %s tenant isolation: %w",
-					expected.role, err,
+					expected.role, probeErr,
 				)
 			}
 		}
