@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -23,6 +24,30 @@ const (
 	maxTaskRunReferenceBytesV1       = 512
 	maxTaskRunReferenceTaskIDV1      = 255
 )
+
+// validScheduledTaskWorkflowExecutionIDV1 accepts the retained bare Action ID
+// and Temporal Schedule's default execution ID. Temporal appends the nominal
+// time after truncating it to a UTC second; accepting any broader prefix would
+// let an unrelated workflow impersonate a scheduled task.
+func validScheduledTaskWorkflowExecutionIDV1(taskID, workflowID string) bool {
+	if !validTaskRunReferenceTextV1(taskID, maxTaskRunReferenceTaskIDV1) ||
+		!validTaskRunReferenceTextV1(workflowID, maxTaskRunReferenceBytesV1) {
+		return false
+	}
+	base := taskRunScheduledWorkflowPrefixV1 + taskID
+	if workflowID == base {
+		return true
+	}
+	const timestampLayout = "2006-01-02T15:04:05Z"
+	if len(workflowID) != len(base)+1+len(timestampLayout) ||
+		workflowID[:len(base)] != base ||
+		workflowID[len(base)] != '-' {
+		return false
+	}
+	timestamp := workflowID[len(base)+1:]
+	parsed, err := time.Parse(timestampLayout, timestamp)
+	return err == nil && parsed.UTC().Format(timestampLayout) == timestamp
+}
 
 func validateTaskRunSnapshotReferenceForExpectedV1(
 	ref types.RunSnapshotRef,
@@ -52,7 +77,8 @@ func validateTaskRunExpectedIdentityV1(expected types.RunIdentity) error {
 		!validTaskRunReferenceTextV1(expected.TemporalWorkflowID, maxTaskRunReferenceBytesV1) ||
 		!validTaskRunReferenceTextV1(expected.TemporalRunID, maxTaskRunReferenceBytesV1) ||
 		!validTaskRunReferenceTextV1(expected.TaskID, maxTaskRunReferenceTaskIDV1) ||
-		expected.TemporalWorkflowID != taskRunScheduledWorkflowPrefixV1+expected.TaskID {
+		!validScheduledTaskWorkflowExecutionIDV1(
+			expected.TaskID, expected.TemporalWorkflowID) {
 		return errors.New("invalid expected v1 task run identity")
 	}
 	return nil
