@@ -160,7 +160,9 @@ func run() error {
 				})
 			}, compiledModelResolver),
 		workflow.WithSnapshotV2ShadowCanary(
-			st, cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID))
+			st, cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID),
+		workflow.WithSnapshotV2ReadAuditCanary(
+			st, cfg.Pipeline.SnapshotV2ReadAuditCanaryScheduleID))
 	slog.Info("task playbook prompt policy configured",
 		"enabled", cfg.Pipeline.PlaybookPromptsEnabled,
 		"canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID,

@@ -56,9 +56,20 @@ func (s *Store) LoadCompiledTaskRunSnapshotV1(
 	expected types.RunIdentity,
 	ref types.RunSnapshotRef,
 ) (runcontext.CompiledSnapshotV1, error) {
+	_, compiled, err := loadCompiledTaskRunSnapshotV1(
+		ctx, s.pool, expected, ref)
+	return compiled, err
+}
+
+func loadCompiledTaskRunSnapshotV1(
+	ctx context.Context,
+	q taskRunSnapshotQueryer,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+) (*taskRunSnapshot, runcontext.CompiledSnapshotV1, error) {
 	callerReference, err := validateTaskRunSnapshotReferenceForExpectedV1(ref, expected)
 	if err != nil {
-		return runcontext.CompiledSnapshotV1{},
+		return nil, runcontext.CompiledSnapshotV1{},
 			taskRunValidationError("task run snapshot reference is invalid")
 	}
 	lookup := CreateOrGetTaskRunSnapshotParams{
@@ -66,23 +77,34 @@ func (s *Store) LoadCompiledTaskRunSnapshotV1(
 		TemporalWorkflowID: expected.TemporalWorkflowID,
 		TemporalRunID:      expected.TemporalRunID,
 	}
-	snapshot, found, err := loadTaskRunSnapshot(ctx, s.pool, lookup)
+	snapshot, found, err := loadTaskRunSnapshot(ctx, q, lookup)
 	if err != nil {
-		return runcontext.CompiledSnapshotV1{}, err
+		return nil, runcontext.CompiledSnapshotV1{}, err
 	}
 	if !found {
-		return runcontext.CompiledSnapshotV1{}, taskRunNotFound()
+		return nil, runcontext.CompiledSnapshotV1{}, taskRunNotFound()
 	}
 	storedRef, err := snapshot.safeRef()
 	if err != nil {
-		return runcontext.CompiledSnapshotV1{}, taskRunIntegrityError()
+		return nil, runcontext.CompiledSnapshotV1{}, taskRunIntegrityError()
 	}
 	storedReference, err := validateTaskRunSnapshotReferenceForExpectedV1(storedRef, expected)
 	if err != nil || storedReference != callerReference {
-		return runcontext.CompiledSnapshotV1{}, taskRunIntegrityError()
+		return nil, runcontext.CompiledSnapshotV1{}, taskRunIntegrityError()
 	}
 
-	decoded, err := readTaskRunSnapshotPayload(snapshot.Payload)
+	compiled, err := decodeCompiledTaskRunSnapshotV1(storedRef, snapshot.Payload)
+	if err != nil {
+		return nil, runcontext.CompiledSnapshotV1{}, err
+	}
+	return snapshot, compiled, nil
+}
+
+func decodeCompiledTaskRunSnapshotV1(
+	storedRef types.RunSnapshotRef,
+	raw []byte,
+) (runcontext.CompiledSnapshotV1, error) {
+	decoded, err := readTaskRunSnapshotPayload(raw)
 	if err != nil || decoded.Payload == nil || decoded.Payload.Definition == nil ||
 		decoded.Payload.Policies == nil || decoded.Payload.Budget == nil {
 		return runcontext.CompiledSnapshotV1{}, taskRunIntegrityError()

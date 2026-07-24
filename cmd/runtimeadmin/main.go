@@ -105,14 +105,17 @@ func runSnapshotShadow(args []string) int {
 	taskID := fs.String("task", "", "exact canary task id")
 	rawSince := fs.String("since", "", "inclusive RFC3339 canary start")
 	afterID := fs.Int64("after-id", 0, "exclusive snapshot id cursor")
+	throughID := fs.Int64("through-id", 0, "inclusive frozen snapshot id ceiling")
+	expectedCount := fs.Int("expected-count", 0, "exact number of rows required")
 	limit := fs.Int("limit", 100, "page size (1-1000)")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
 	since, err := time.Parse(time.RFC3339, *rawSince)
-	if err != nil || *taskID == "" {
+	if err != nil || *taskID == "" || *throughID <= 0 || *expectedCount <= 0 {
 		fmt.Fprintln(os.Stderr,
-			"runtimeadmin: snapshot-shadow requires -task and RFC3339 -since")
+			"runtimeadmin: snapshot-shadow requires -task, RFC3339 -since, "+
+				"-through-id and -expected-count")
 		return exitFailure
 	}
 	cfg, err := config.Load("")
@@ -131,15 +134,17 @@ func runSnapshotShadow(args []string) int {
 		return exitFailure
 	}
 	defer st.Close()
-	page, err := st.AuditTaskRunSnapshotShadowsV2(
-		ctx, *taskID, since, *afterID, *limit)
-	return finishSnapshotShadowRun(os.Stdout, os.Stderr, page, err)
+	page, err := st.AuditTaskRunSnapshotShadowsV2Through(
+		ctx, *taskID, since, *afterID, *throughID, *limit)
+	return finishSnapshotShadowRun(
+		os.Stdout, os.Stderr, page, *expectedCount, err)
 }
 
 func finishSnapshotShadowRun(
 	stdout io.Writer,
 	stderr io.Writer,
 	page store.TaskRunSnapshotShadowAuditPage,
+	expectedCount int,
 	runErr error,
 ) int {
 	if runErr != nil {
@@ -153,11 +158,13 @@ func finishSnapshotShadowRun(
 		fmt.Fprintln(stderr, "runtimeadmin: 输出结果失败")
 		return exitFailure
 	}
-	if len(page.Items) == 0 {
+	if len(page.Items) == 0 || len(page.Items) != expectedCount {
 		return exitVerifyFailed
 	}
 	for _, item := range page.Items {
-		if item.Status != store.TaskRunSnapshotShadowMatch {
+		if item.Status != store.TaskRunSnapshotShadowMatch ||
+			item.TypedAuditStatus != store.CompiledRunSnapshotV2AuditMatch ||
+			!item.TypedEqual {
 			return exitVerifyFailed
 		}
 	}
