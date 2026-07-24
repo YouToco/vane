@@ -326,11 +326,12 @@ func (s *Scheduler) PauseTaskDefinitionEdit() {}
 
 func taskDefinitionEditGuardedMethods() map[string]struct{} {
 	return map[string]struct{}{
-		"PrepareTaskDefinitionEdit":  {},
-		"DescribeTaskDefinitionEdit": {},
-		"PauseTaskDefinitionEdit":    {},
-		"ApplyTaskDefinitionEdit":    {},
-		"RestoreTaskDefinitionEdit":  {},
+		"PrepareTaskDefinitionEdit":             {},
+		"DescribeTaskDefinitionEdit":            {},
+		"PauseTaskDefinitionEdit":               {},
+		"ApplyTaskDefinitionEdit":               {},
+		"RestoreTaskDefinitionEdit":             {},
+		"ValidateTaskDefinitionEditEnvironment": {},
 	}
 }
 
@@ -341,6 +342,7 @@ func taskDefinitionEditProviderFunctionSymbols() map[string]struct{} {
 		"PauseTaskDefinitionEdit",
 		"ApplyTaskDefinitionEdit",
 		"RestoreTaskDefinitionEdit",
+		"ValidateTaskDefinitionEditEnvironment",
 		"transitionTaskDefinitionEdit",
 		"observeTaskDefinitionEditSource",
 		"buildTaskDefinitionEditRuntime",
@@ -407,6 +409,7 @@ func taskDefinitionEditTransitionGraphSymbols() map[string]struct{} {
 		"PauseTaskDefinitionEdit":               {},
 		"ApplyTaskDefinitionEdit":               {},
 		"RestoreTaskDefinitionEdit":             {},
+		"ValidateTaskDefinitionEditEnvironment": {},
 		"transitionTaskDefinitionEdit":          {},
 		"observeTaskDefinitionEditSource":       {},
 		"buildTaskDefinitionEditRuntime":        {},
@@ -424,6 +427,7 @@ type taskDefinitionEditGraphExpectation struct {
 
 func taskDefinitionEditProviderGraphExpectations() []taskDefinitionEditGraphExpectation {
 	return []taskDefinitionEditGraphExpectation{
+		{"ValidateTaskDefinitionEditEnvironment", "buildTaskDefinitionEditRuntime", 1},
 		{"PrepareTaskDefinitionEdit", "taskDefinitionEditEnvironment", 1},
 		{"PrepareTaskDefinitionEdit", "describeTaskDefinitionEdit", 1},
 		{"DescribeTaskDefinitionEdit", "buildTaskDefinitionEditRuntime", 1},
@@ -1123,6 +1127,7 @@ func taskDefinitionEditCoordinatorRawCalls(
 		function string
 	}
 	expectations := []expectation{
+		{"ValidateTaskDefinitionEditEnvironment", "ValidateRuntimeEnvironment"},
 		{"PrepareTaskDefinitionEdit", "prepareTaskDefinitionEditProposal"},
 		{"PauseTaskDefinitionEdit", "runTaskDefinitionEditPauseAttempt"},
 		{"ApplyTaskDefinitionEdit", "runTaskDefinitionEditApplyAttempt"},

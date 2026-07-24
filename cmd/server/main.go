@@ -190,11 +190,6 @@ func run() error {
 	w.RegisterActivity(activities.RecordEmptyBatch)
 	w.RegisterActivity(activities.NotifyEmptyResult)
 	w.RegisterActivity(activities.Push)
-	if err := w.Start(); err != nil {
-		temporalClient.Close()
-		st.Close()
-		return fmt.Errorf("启动 Temporal worker: %w", err)
-	}
 
 	// scheduler 是唯一直接碰 SDK client 的调度封装（供 API 建/删/触发调度）。
 	sched := scheduler.New(temporalClient, cfg.Temporal.TaskQueue, st,
@@ -210,6 +205,41 @@ func run() error {
 	// intentionally retained only in this composition root: it is not injected
 	// into Agent, HTTP, Feishu, or the receipt dispatcher.
 	definitionEditCoordinator := task.NewTaskDefinitionEditCoordinator(st, sched, slog.Default())
+
+	roleGateCtx, cancelRoleGate := context.WithTimeout(ctx, 10*time.Second)
+	roleGateErr := st.ValidateTaskDefinitionEditRuntimeRoles(roleGateCtx)
+	cancelRoleGate()
+	if roleGateErr != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("任务定义编辑受限角色 Gate: %w", roleGateErr)
+	}
+	environmentGateCtx, cancelEnvironmentGate := context.WithTimeout(ctx, 90*time.Second)
+	environmentGateErr := definitionEditCoordinator.ValidateRuntimeEnvironment(
+		environmentGateCtx,
+	)
+	cancelEnvironmentGate()
+	if environmentGateErr != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("任务定义编辑 Temporal 环境 Gate: %w", environmentGateErr)
+	}
+
+	// C2b3-2d startup barrier: finish one bounded recovery pass before legacy
+	// Action reconciliation. Reconcile additionally re-authorizes each schedule
+	// under the same PostgreSQL advisory lock used by edit quiesce, so a failed
+	// recovery pass cannot turn an old active discovery snapshot into a write
+	// across a live operation marker.
+	if err := definitionEditCoordinator.RecoverStaleOnce(ctx); err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("任务定义编辑首轮恢复 Gate: %w", err)
+	}
+	if err := sched.ReconcileActions(ctx); err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("scheduler: 存量调度 Action reconcile 安全 Gate: %w", err)
+	}
 	var maintenanceWG sync.WaitGroup
 	runMaintenance := func(fn func()) {
 		maintenanceWG.Add(1)
@@ -231,16 +261,6 @@ func run() error {
 			return ctx.Err()
 		}
 	}
-
-	// 存量调度 Action reconcile（任务手册 P1b 收尾）：给 b1 之前建的老调度补上 schedule_id，
-	// 使已编译手册的任务真正走 b3 隔离（详见 scheduler.ReconcileActions）。后台跑、不阻塞
-	// 启动——reconcile 是幂等自愈维护，单条失败已在内部 slog，不该因 Temporal 抖动而拒绝
-	// 服务就绪；worker 已在上方 Start，此刻 Temporal 连通性已确立。
-	runMaintenance(func() {
-		if err := sched.ReconcileActions(ctx); err != nil {
-			slog.Error("scheduler: 存量调度 Action reconcile 整体失败（不影响启动）", "err", err)
-		}
-	})
 
 	// 配额 reconcile（契约 §2.7）：给缺配额行的租户补齐默认额度。同样后台跑、幂等。
 	//
@@ -287,7 +307,17 @@ func run() error {
 	// Legacy v0 create_schedule cards are deliberately drained without execution
 	// in Loop.ExecuteAction. Passing no legacy creator makes the old active-first
 	// CreatePush path unreachable even if that guard regresses.
-	tools := agent.BuildTools(st, sched, nil, sched, endpoints, fetch, exaTools)
+	definitionEditController := task.NewDefinitionEditController(
+		st, definitionEditCoordinator,
+	)
+	var definitionEditToolController agent.DefinitionEditController
+	if cfg.Agent.DefinitionEditEnabled {
+		definitionEditToolController = definitionEditController
+	}
+	tools := agent.BuildTools(
+		st, sched, nil, sched, endpoints, fetch, exaTools,
+		definitionEditToolController,
+	)
 	agentLoop := agent.New(agent.Deps{
 		Client:       agentLLMClient,
 		Recorder:     recorder,
@@ -300,6 +330,9 @@ func run() error {
 		Endpoints:    endpoints,
 		ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
 		TaskCreation: creationCoordinator,
+		// Historical cards must remain confirmable/cancellable when the flag is
+		// rolled back. Tool registration above is the only proposal exposure.
+		TaskDefinitionEdit: definitionEditController,
 	})
 	manager.SetAgent(agentLoop)
 
@@ -336,15 +369,38 @@ func run() error {
 				fmt.Errorf("排空启动维护任务: %w", maintenanceErr),
 			)
 		}
-		w.Stop()
 		temporalClient.Close()
 		st.Close()
 		return fmt.Errorf("装配任务创建耐久回执: %w", err)
 	}
+	definitionEditReceiptDispatcher, err :=
+		task.NewDefinitionEditReceiptDispatcher(
+			task.DefinitionEditReceiptDispatcherDeps{
+				Store: st, Sender: manager, Sessions: agentLoop,
+				BuildCard: feishu.BuildReplyCard, Logger: slog.Default(),
+			},
+		)
+	if err != nil {
+		stop()
+		maintenanceCtx, cancelMaintenance := context.WithTimeout(
+			context.Background(), 30*time.Second,
+		)
+		maintenanceErr := waitMaintenance(maintenanceCtx)
+		cancelMaintenance()
+		if maintenanceErr != nil {
+			return errors.Join(
+				fmt.Errorf("装配任务定义编辑耐久回执: %w", err),
+				fmt.Errorf("排空启动维护任务: %w", maintenanceErr),
+			)
+		}
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("装配任务定义编辑耐久回执: %w", err)
+	}
 
-	// C2b3-2c definition-edit recovery starts before any Feishu/HTTP ingress is
-	// admitted. RunRecovery performs one immediate scan and then periodic scans;
-	// no proposal, confirmation, cancellation, or receipt path is wired here.
+	// Definition-edit recovery starts before any Feishu/HTTP ingress is admitted.
+	// The optional Agent controller below shares this coordinator only after all
+	// startup Gates; terminal receipt dispatch remains a separate later step.
 	definitionEditRecoveryCtx, cancelDefinitionEditRecovery := context.WithCancel(ctx)
 	definitionEditRecoveryDone := make(chan struct{})
 	go func() {
@@ -379,10 +435,9 @@ func run() error {
 		}
 	}
 
-	// A6 outbox starts before the first new callback is admitted. A terminal
-	// operation and its receipt are one database transaction; this runner can
-	// therefore recover work left by any prior process without reconstructing
-	// user-facing content from live configuration.
+	// Both durable outboxes start before every ingress. Terminal operation and
+	// receipt identity are one transaction; neither dispatcher reconstructs
+	// user-visible content from live configuration.
 	receiptDispatchCtx, cancelReceiptDispatch := context.WithCancel(ctx)
 	receiptDispatchDone := make(chan struct{})
 	go func() {
@@ -397,6 +452,59 @@ func run() error {
 		case <-time.After(30 * time.Second):
 			return errors.New("task creation receipt dispatcher 关停超时")
 		}
+	}
+	definitionEditReceiptDispatchCtx, cancelDefinitionEditReceiptDispatch :=
+		context.WithCancel(ctx)
+	definitionEditReceiptDispatchDone := make(chan struct{})
+	go func() {
+		defer close(definitionEditReceiptDispatchDone)
+		definitionEditReceiptDispatcher.Run(
+			definitionEditReceiptDispatchCtx,
+		)
+	}()
+	stopDefinitionEditReceiptDispatch := func() error {
+		cancelDefinitionEditReceiptDispatch()
+		select {
+		case <-definitionEditReceiptDispatchDone:
+			return nil
+		case <-time.After(30 * time.Second):
+			return errors.New(
+				"task definition edit receipt dispatcher 关停超时",
+			)
+		}
+	}
+
+	// The worker is an ingress too: a registered task queue can immediately
+	// receive scheduled runs. Start it only after both recovery loops and both
+	// terminal outbox consumers have started.
+	if err := w.Start(); err != nil {
+		stop()
+		recoveryErr := stopCreationRecovery()
+		definitionEditRecoveryErr := stopDefinitionEditRecovery()
+		creationReceiptErr := stopReceiptDispatch()
+		definitionEditReceiptErr :=
+			stopDefinitionEditReceiptDispatch()
+		maintenanceCtx, cancelMaintenance := context.WithTimeout(
+			context.Background(), 30*time.Second,
+		)
+		maintenanceErr := waitMaintenance(maintenanceCtx)
+		cancelMaintenance()
+		drainErr := errors.Join(
+			recoveryErr, definitionEditRecoveryErr,
+			creationReceiptErr, definitionEditReceiptErr,
+			maintenanceErr,
+		)
+		if drainErr != nil {
+			return errors.Join(
+				fmt.Errorf("启动 Temporal worker: %w", err),
+				fmt.Errorf(
+					"worker 启动失败后未能安全排空: %w", drainErr,
+				),
+			)
+		}
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("启动 Temporal worker: %w", err)
 	}
 
 	// 依赖就绪后再拉飞书 WS 连接：无配置静默待命，ctx 取消时断开。
@@ -506,18 +614,20 @@ func run() error {
 			recoveryErr := stopCreationRecovery()
 			definitionEditRecoveryErr := stopDefinitionEditRecovery()
 			receiptErr := stopReceiptDispatch()
+			definitionEditReceiptErr :=
+				stopDefinitionEditReceiptDispatch()
 			sessionErr := drainAgentSessions()
 			maintenanceCtx, cancelMaintenance := context.WithTimeout(context.Background(), 30*time.Second)
 			maintenanceErr := waitMaintenance(maintenanceCtx)
 			cancelMaintenance()
 			if drainErr != nil || recoveryErr != nil || definitionEditRecoveryErr != nil ||
-				receiptErr != nil ||
+				receiptErr != nil || definitionEditReceiptErr != nil ||
 				sessionErr != nil || maintenanceErr != nil {
 				// An admitted callback may still own DB/Temporal work. Do not close
 				// those resources underneath it; returning exits the process.
 				return errors.Join(fmt.Errorf("挂载 A2A server: %w", err),
 					drainErr, recoveryErr, definitionEditRecoveryErr, receiptErr,
-					sessionErr, maintenanceErr)
+					definitionEditReceiptErr, sessionErr, maintenanceErr)
 			}
 			w.Stop()
 			temporalClient.Close()
@@ -611,11 +721,17 @@ func run() error {
 		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空任务定义编辑恢复器: %w", err))
 	}
 	// No producer remains after callback plus both durable-operation recovery
-	// loops drain. Now stop the creation receipt consumer, wait for its fenced
-	// session/PATCH checkpoint, then close admission for legacy best-effort
-	// session writes. Definition-edit receipts deliberately remain unwired.
+	// loops drain. Stop both outbox consumers, wait for their fenced
+	// session/PATCH checkpoints, then close admission for legacy best-effort
+	// session writes.
 	if err := stopReceiptDispatch(); err != nil {
 		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空任务创建耐久回执: %w", err))
+	}
+	if err := stopDefinitionEditReceiptDispatch(); err != nil {
+		shutdownErrs = append(
+			shutdownErrs,
+			fmt.Errorf("排空任务定义编辑耐久回执: %w", err),
+		)
 	}
 	if err := drainAgentSessions(); err != nil {
 		shutdownErrs = append(shutdownErrs, err)

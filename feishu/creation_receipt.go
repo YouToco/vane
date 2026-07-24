@@ -23,14 +23,47 @@ func (m *Manager) SendCreationReceipt(
 	messageID string,
 	cardJSON string,
 ) error {
+	return m.sendCardPatchReceipt(
+		ctx, provider, messageID, cardJSON, "创建",
+	)
+}
+
+// SendDefinitionEditReceipt converges a terminal definition-edit outbox onto
+// the same immutable confirmation-card resource. It shares the app-bound Patch
+// adapter with creation receipts but never creates a new message.
+func (m *Manager) SendDefinitionEditReceipt(
+	ctx context.Context,
+	provider string,
+	messageID string,
+	cardJSON string,
+) error {
+	return m.sendCardPatchReceipt(
+		ctx, provider, messageID, cardJSON, "编辑",
+	)
+}
+
+func (m *Manager) sendCardPatchReceipt(
+	ctx context.Context,
+	provider string,
+	messageID string,
+	cardJSON string,
+	kind string,
+) error {
 	if !task.IsFeishuCardPatchReceiptProvider(provider) {
-		return types.NewAppError(types.CodeValidation, "创建回执通道身份无效", nil)
+		return types.NewAppError(
+			types.CodeValidation, kind+"回执通道身份无效", nil,
+		)
 	}
 	if messageID == "" {
-		return types.NewAppError(types.CodeValidation, "创建回执目标 message_id 为空", nil)
+		return types.NewAppError(
+			types.CodeValidation,
+			kind+"回执目标 message_id 为空", nil,
+		)
 	}
 	if cardJSON == "" {
-		return types.NewAppError(types.CodeValidation, "创建回执卡片内容为空", nil)
+		return types.NewAppError(
+			types.CodeValidation, kind+"回执卡片内容为空", nil,
+		)
 	}
 
 	// 与普通主动推送不同，这里由耐久 dispatcher 驱动：进程刚启动、飞书通道
@@ -39,7 +72,10 @@ func (m *Manager) SendCreationReceipt(
 	client, appID := m.apiClient, m.apiAppID
 	m.mu.Unlock()
 	if client == nil {
-		return types.NewAppError(types.CodePushFailed, "飞书通道未就绪，无法更新创建回执", nil)
+		return types.NewAppError(
+			types.CodePushFailed,
+			"飞书通道未就绪，无法更新"+kind+"回执", nil,
+		)
 	}
 	if provider != task.FeishuCardPatchReceiptProviderForApp(appID) {
 		// A different current app has no authority over the resource emitted by
@@ -47,7 +83,7 @@ func (m *Manager) SendCreationReceipt(
 		// switching channels must not discard the durable receipt, and returning
 		// to the original app (including secret rotation) can converge it later.
 		return types.NewAppError(types.CodePushFailed,
-			"当前飞书 App 与创建回执所属 App 不一致", nil)
+			"当前飞书 App 与"+kind+"回执所属 App 不一致", nil)
 	}
 
 	resp, err := client.Im.Message.Patch(ctx, larkim.NewPatchMessageReqBuilder().
@@ -59,11 +95,16 @@ func (m *Manager) SendCreationReceipt(
 	if err != nil {
 		// 超时/断连时远端可能已经完成更新。调用方会用完全相同的 target 与
 		// 冻结内容重试 Patch；资源覆盖语义使这一重试不会新增消息。
-		return types.NewAppError(types.CodePushFailed, "更新任务创建回执失败", err)
+		return types.NewAppError(
+			types.CodePushFailed, "更新任务"+kind+"回执失败", err,
+		)
 	}
 	if !resp.Success() {
 		ae := types.NewAppError(types.CodePushFailed,
-			fmt.Sprintf("更新任务创建回执被飞书拒绝（code %d：%s）", resp.Code, resp.Msg), nil)
+			fmt.Sprintf(
+				"更新任务%s回执被飞书拒绝（code %d：%s）",
+				kind, resp.Code, resp.Msg,
+			), nil)
 		if creationReceiptPermanentRejection(resp.Code) {
 			ae.Retryable = false
 		}

@@ -19,18 +19,21 @@ import (
 )
 
 const (
-	taskDefinitionEditLeaseDuration       = time.Minute
-	taskDefinitionEditAttemptTimeout      = 30 * time.Second
-	taskDefinitionEditExternalRPCTimeout  = 8 * time.Second
-	taskDefinitionEditConvergenceTimeout  = 5 * time.Second
-	taskDefinitionEditRecoveryInterval    = 15 * time.Second
-	taskDefinitionEditRecoveryPassTimeout = 90 * time.Second
-	taskDefinitionEditRecoveryTenantLimit = 100
-	taskDefinitionEditRecoveryPerTenant   = 4
-	taskDefinitionEditRecoveryPassLimit   = 64
-	taskDefinitionEditRecoveryConcurrency = 4
-	taskDefinitionEditResultVersion       = "vane.task-definition-edit-result/v1"
-	taskDefinitionEditMaxLocalAttempts    = 16
+	taskDefinitionEditLeaseDuration        = time.Minute
+	taskDefinitionEditAttemptTimeout       = 30 * time.Second
+	taskDefinitionEditExternalRPCTimeout   = 8 * time.Second
+	taskDefinitionEditConvergenceTimeout   = 5 * time.Second
+	taskDefinitionEditRecoveryInterval     = 15 * time.Second
+	taskDefinitionEditRecoveryPassTimeout  = 90 * time.Second
+	taskDefinitionEditRecoveryTenantLimit  = 100
+	taskDefinitionEditRecoveryPerTenant    = 4
+	taskDefinitionEditRecoveryPassLimit    = 64
+	taskDefinitionEditRecoveryConcurrency  = 4
+	taskDefinitionEditResultVersion        = "vane.task-definition-edit-result/v1"
+	taskDefinitionEditMaxLocalAttempts     = 16
+	taskDefinitionEditPreflightTenantLimit = 100
+	taskDefinitionEditPreflightOpLimit     = 100
+	taskDefinitionEditPreflightMaxOps      = 10_000
 )
 
 // TaskDefinitionEditStore is the complete C2b3 operation boundary. Receipt
@@ -72,6 +75,17 @@ type TaskDefinitionEditStore interface {
 		context.Context,
 		int64,
 		time.Time,
+		int,
+	) ([]types.TaskDefinitionEditOperation, error)
+	ListNonterminalTaskDefinitionEditTenantIDs(
+		context.Context,
+		int64,
+		int,
+	) ([]int64, error)
+	ListNonterminalTaskDefinitionEditOperations(
+		context.Context,
+		int64,
+		string,
 		int,
 	) ([]types.TaskDefinitionEditOperation, error)
 	QuiesceTaskDefinitionEdit(
@@ -141,6 +155,10 @@ type TaskDefinitionEditScheduler interface {
 		scheduler.PreparedTaskDefinitionEdit,
 		scheduler.TaskDefinitionEditSnapshot,
 	) (scheduler.TaskDefinitionEditSnapshot, error)
+	ValidateTaskDefinitionEditEnvironment(
+		context.Context,
+		scheduler.PreparedTaskDefinitionEdit,
+	) error
 }
 
 // PrepareTaskDefinitionEditProposalInput contains the authenticated identities
@@ -167,8 +185,8 @@ type PrepareTaskDefinitionEditProposalInput struct {
 
 // TaskDefinitionEditReceiptTarget is the already-authenticated provider
 // resource accepted by the Store in the same transaction as confirmation.
-// C2b3-2d will derive it from the original Feishu card; 2c does not construct or
-// trust provider callback identity itself.
+// Agent derives it from the original Feishu App fingerprint and message ID;
+// the coordinator never constructs or trusts callback identity itself.
 type TaskDefinitionEditReceiptTarget struct {
 	Provider string
 	Target   string
@@ -180,15 +198,21 @@ type TaskDefinitionEditReceiptTarget struct {
 type TaskDefinitionEditOutcome struct {
 	OperationID string
 	TaskID      string
+	SessionID   int64
 	Status      types.TaskDefinitionEditOperationStatus
 	Phase       types.TaskDefinitionEditPhase
 	Recovering  bool
 	Replayed    bool
+	// ReceiptBound proves that the original provider card identity was accepted
+	// durably with the operation. The callback must then leave terminal delivery
+	// to the outbox dispatcher.
+	ReceiptBound bool
 }
 
 // TaskDefinitionEditCoordinator is the sole C2b3 cross-system writer. Process
-// startup constructs it only for dark recovery in 2c; Agent, HTTP, and Feishu
-// cannot reach proposal or confirmation methods until the separate 2d gates.
+// startup constructs it for the environment Gate and recovery. The default-off
+// DefinitionEditController is its sole authenticated Agent ingress; HTTP and
+// every retired definition writer remain unable to reach these methods.
 type TaskDefinitionEditCoordinator struct {
 	store     TaskDefinitionEditStore
 	scheduler TaskDefinitionEditScheduler
@@ -211,10 +235,96 @@ func NewTaskDefinitionEditCoordinator(
 	}
 }
 
+// ValidateRuntimeEnvironment scans every durable nonterminal operation before
+// ingress and proves its sealed namespace name/ID and retained converter are
+// still served by this process. Queries are tenant-sharded and page-bounded;
+// an unexpectedly large backlog fails closed instead of silently truncating.
+func (c *TaskDefinitionEditCoordinator) ValidateRuntimeEnvironment(
+	ctx context.Context,
+) error {
+	if err := c.validateDependencies(true); err != nil {
+		return err
+	}
+
+	var (
+		afterTenantID int64
+		scanned       int
+	)
+	for {
+		tenantIDs, err := c.store.ListNonterminalTaskDefinitionEditTenantIDs(
+			ctx, afterTenantID, taskDefinitionEditPreflightTenantLimit,
+		)
+		if err != nil {
+			return fmt.Errorf("task: list definition edit preflight tenants: %w", err)
+		}
+		if len(tenantIDs) == 0 {
+			return nil
+		}
+		for _, tenantID := range tenantIDs {
+			afterOperationID := ""
+			for {
+				operations, err := c.store.ListNonterminalTaskDefinitionEditOperations(
+					ctx, tenantID, afterOperationID, taskDefinitionEditPreflightOpLimit,
+				)
+				if err != nil {
+					return fmt.Errorf(
+						"task: list definition edit preflight operations for tenant %d: %w",
+						tenantID, err,
+					)
+				}
+				if len(operations) == 0 {
+					break
+				}
+				for i := range operations {
+					scanned++
+					if err := validateTaskDefinitionEditPreflightBudget(
+						scanned, taskDefinitionEditPreflightMaxOps,
+					); err != nil {
+						return err
+					}
+					frozen, err := validateTaskDefinitionEditOperationCheckpoints(&operations[i])
+					if err != nil {
+						return fmt.Errorf(
+							"task: validate definition edit operation %s before startup: %w",
+							operations[i].ID, err,
+						)
+					}
+					if err := c.scheduler.ValidateTaskDefinitionEditEnvironment(
+						ctx, frozen.PreparedEdit,
+					); err != nil {
+						return fmt.Errorf(
+							"task: definition edit operation %s runtime environment differs: %w",
+							operations[i].ID, err,
+						)
+					}
+				}
+				afterOperationID = operations[len(operations)-1].ID
+				if len(operations) < taskDefinitionEditPreflightOpLimit {
+					break
+				}
+			}
+		}
+		afterTenantID = tenantIDs[len(tenantIDs)-1]
+		if len(tenantIDs) < taskDefinitionEditPreflightTenantLimit {
+			return nil
+		}
+	}
+}
+
+func validateTaskDefinitionEditPreflightBudget(scanned, maximum int) error {
+	if maximum <= 0 || scanned < 0 || scanned > maximum {
+		return fmt.Errorf(
+			"task: definition edit environment preflight exceeds %d operations",
+			maximum,
+		)
+	}
+	return nil
+}
+
 // PrepareAndSealProposal performs the only legal pre-confirmation Temporal
 // read, binds it to the exact Approved definitions, and persists the five
-// canonical checkpoints. C2b3-2c intentionally has no production ingress to
-// this method; C2b3-2d will add the authenticated controller.
+// canonical checkpoints. Only DefinitionEditController may call it from a
+// default-off authenticated Agent proposal.
 func (c *TaskDefinitionEditCoordinator) PrepareAndSealProposal(
 	ctx context.Context,
 	in PrepareTaskDefinitionEditProposalInput,
@@ -530,6 +640,9 @@ func (c *TaskDefinitionEditCoordinator) Cancel(
 	scope types.TaskDefinitionEditScope,
 	receipt TaskDefinitionEditReceiptTarget,
 ) (TaskDefinitionEditOutcome, error) {
+	if err := ctx.Err(); err != nil {
+		return TaskDefinitionEditOutcome{}, err
+	}
 	if err := c.validateDependencies(false); err != nil {
 		return TaskDefinitionEditOutcome{}, err
 	}
@@ -538,6 +651,23 @@ func (c *TaskDefinitionEditCoordinator) Cancel(
 			Scope: scope, ReceiptProvider: receipt.Provider,
 			ReceiptTarget: receipt.Target,
 		})
+	if err == nil {
+		return taskDefinitionEditOutcome(op), nil
+	}
+	if errors.Is(err, types.ErrTaskDefinitionEditTerminal) && op != nil &&
+		op.Status == types.TaskDefinitionEditOperationStatusCancelled {
+		if op.ReceiptProvider != receipt.Provider ||
+			op.ReceiptTarget != receipt.Target {
+			return TaskDefinitionEditOutcome{}, types.NewAppError(
+				types.CodeConflict,
+				"task definition edit: terminal receipt target differs",
+				types.ErrConflict,
+			)
+		}
+		outcome := taskDefinitionEditOutcome(op)
+		outcome.Replayed = true
+		return outcome, nil
+	}
 	return taskDefinitionEditOutcome(op), err
 }
 
@@ -1378,10 +1508,12 @@ func taskDefinitionEditOutcome(
 		return TaskDefinitionEditOutcome{}
 	}
 	return TaskDefinitionEditOutcome{
-		OperationID: op.ID,
-		TaskID:      op.TaskID,
-		Status:      op.Status,
-		Phase:       op.Phase,
-		Recovering:  op.Status == types.TaskDefinitionEditOperationStatusExecuting,
+		OperationID:  op.ID,
+		TaskID:       op.TaskID,
+		SessionID:    op.SessionID,
+		Status:       op.Status,
+		Phase:        op.Phase,
+		Recovering:   op.Status == types.TaskDefinitionEditOperationStatusExecuting,
+		ReceiptBound: op.ReceiptProvider != "" && op.ReceiptTarget != "",
 	}
 }

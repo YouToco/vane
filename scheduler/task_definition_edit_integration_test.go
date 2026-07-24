@@ -207,6 +207,35 @@ func TestTaskDefinitionEditIntegration_RealDevServerLifecycle(t *testing.T) {
 		t, ctx, scheduler, preparedV3, preparedV3.TargetFinal,
 		TaskDefinitionEditPhaseTargetFinal, targetV3, true,
 	)
+	mismatchStartCtx, cancelMismatchStart := context.WithTimeout(
+		t.Context(), 2*time.Minute,
+	)
+	mismatchServer, err := testsuite.StartDevServer(
+		mismatchStartCtx,
+		testsuite.DevServerOptions{
+			ClientOptions: &client.Options{Namespace: namespace},
+			LogLevel:      "error",
+		},
+	)
+	cancelMismatchStart()
+	if err != nil {
+		t.Fatalf("start namespace-mismatch Temporal dev server: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := mismatchServer.Stop(); err != nil {
+			t.Errorf("stop namespace-mismatch Temporal dev server: %v", err)
+		}
+		mismatchServer.Client().Close()
+	})
+	mismatchScheduler := New(
+		mismatchServer.Client(), taskQueue, nil,
+		WithTaskScheduleNamespace(namespace),
+	)
+	if err := mismatchScheduler.ValidateTaskDefinitionEditEnvironment(
+		ctx, preparedV3,
+	); err == nil || !strings.Contains(err.Error(), "namespace id") {
+		t.Fatalf("real Temporal namespace identity mismatch did not fail closed: %v", err)
+	}
 	finalRaw, err := handle.Describe(ctx)
 	if err != nil {
 		t.Fatalf("raw Describe final paused v3: %v", err)

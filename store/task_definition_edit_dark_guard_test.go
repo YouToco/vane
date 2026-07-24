@@ -13,9 +13,8 @@ import (
 	"testing"
 )
 
-// C2b3-2c gives exactly one production file access to the durable operation
-// substrate. Receipt delivery remains dark until the authenticated C2b3-2d
-// wiring lands.
+// C2b3-2d gives exactly one production file access to operation APIs and one
+// separate dispatcher access to receipt APIs.
 func TestTaskDefinitionEditStoreAPIsHaveOneCoordinator(t *testing.T) {
 	t.Parallel()
 	_, testFile, _, ok := runtime.Caller(0)
@@ -26,6 +25,11 @@ func TestTaskDefinitionEditStoreAPIsHaveOneCoordinator(t *testing.T) {
 	repoRoot := filepath.Clean(filepath.Dir(storeDir))
 	providerFunctions := taskDefinitionEditStoreProviderFunctionSymbols(storeDir)
 	coordinatorPath := filepath.Join(repoRoot, "task", "definition_edit_coordinator.go")
+	dispatcherPath := filepath.Join(
+		repoRoot, "task", "definition_edit_receipt_dispatcher.go",
+	)
+	agentLoopPath := filepath.Join(repoRoot, "agent", "loop.go")
+	startupPath := filepath.Join(repoRoot, "cmd", "server", "main.go")
 	operationMethods := taskDefinitionEditOperationStoreMethods()
 	receiptMethods := taskDefinitionEditReceiptStoreMethods()
 	mutationGraph := taskDefinitionEditStoreMutationGraphSymbols()
@@ -69,6 +73,41 @@ func TestTaskDefinitionEditStoreAPIsHaveOneCoordinator(t *testing.T) {
 				t.Fatalf("validate exact coordinator Store calls: %v", allowErr)
 			}
 		}
+		if cleanPath == dispatcherPath {
+			dispatcherAllowed, allowErr :=
+				taskDefinitionEditReceiptDispatcherStoreCalls(file)
+			if allowErr != nil {
+				t.Fatalf(
+					"validate exact definition edit receipt dispatcher Store calls: %v",
+					allowErr,
+				)
+			}
+			for position := range dispatcherAllowed {
+				allowed[position] = struct{}{}
+			}
+		}
+		if cleanPath == agentLoopPath {
+			sessionAllowed, allowErr :=
+				taskDefinitionEditReceiptSessionStoreCall(file)
+			if allowErr != nil {
+				t.Fatalf(
+					"validate exact definition edit session Store bridge: %v",
+					allowErr,
+				)
+			}
+			for position := range sessionAllowed {
+				allowed[position] = struct{}{}
+			}
+		}
+		if cleanPath == startupPath {
+			startupAllowed, allowErr := taskDefinitionEditStartupStoreCalls(file)
+			if allowErr != nil {
+				t.Fatalf("validate exact startup Store calls: %v", allowErr)
+			}
+			for position := range startupAllowed {
+				allowed[position] = struct{}{}
+			}
+		}
 		violations = append(violations, taskDefinitionEditStoreReferenceViolations(
 			fset, file, allowed, operationMethods, receiptMethods, storeAliases,
 		)...)
@@ -84,9 +123,119 @@ func TestTaskDefinitionEditStoreAPIsHaveOneCoordinator(t *testing.T) {
 	}
 	slices.Sort(violations)
 	if len(violations) != 0 {
-		t.Fatalf("C2b3-2c Store boundary escaped its coordinator:\n%s",
+		t.Fatalf("C2b3-2d Store boundary escaped coordinator/dispatcher:\n%s",
 			strings.Join(violations, "\n"))
 	}
+}
+
+func taskDefinitionEditReceiptSessionStoreCall(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	const (
+		functionName = "RecordDefinitionEditReceiptSession"
+		methodName   = "RecordTaskDefinitionEditReceiptSessionMessages"
+	)
+	var positions []token.Pos
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != functionName ||
+			function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := taskDefinitionEditStoreUnparen(
+				call.Fun,
+			).(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != methodName {
+				return true
+			}
+			receiver, ok := taskDefinitionEditStoreUnparen(
+				selector.X,
+			).(*ast.Ident)
+			if ok && receiver.Name == "store" {
+				positions = append(positions, selector.Sel.Pos())
+			}
+			return true
+		})
+	}
+	if len(positions) != 1 {
+		return nil, fmt.Errorf(
+			"agent %s must call store.%s exactly once, got %d",
+			functionName, methodName, len(positions),
+		)
+	}
+	return map[token.Pos]struct{}{positions[0]: {}}, nil
+}
+
+func taskDefinitionEditReceiptDispatcherStoreCalls(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	expectations := []taskDefinitionEditStoreCallExpectation{
+		{"ListDueTaskDefinitionEditReceiptTenantIDs", "DispatchOnce", 2},
+		{"ListDueTaskDefinitionEditReceipts", "DispatchOnce", 1},
+		{"AcquireTaskDefinitionEditReceipt", "dispatchReceipt", 1},
+		{"CheckpointTaskDefinitionEditReceiptPayload", "loadOrCheckpointPayload", 1},
+		{"MarkTaskDefinitionEditReceiptSent", "dispatchReceipt", 1},
+		{"RecordTaskDefinitionEditReceiptSendFailure", "finishFailure", 1},
+	}
+	type key struct{ method, function string }
+	want := make(map[key]int, len(expectations))
+	for _, expectation := range expectations {
+		want[key{expectation.method, expectation.function}] =
+			expectation.count
+	}
+	got := make(map[key]int, len(want))
+	allowed := make(map[token.Pos]struct{})
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := taskDefinitionEditStoreUnparen(
+				call.Fun,
+			).(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			storeField, ok := taskDefinitionEditStoreUnparen(
+				selector.X,
+			).(*ast.SelectorExpr)
+			if !ok || storeField.Sel.Name != "store" {
+				return true
+			}
+			receiver, ok := taskDefinitionEditStoreUnparen(
+				storeField.X,
+			).(*ast.Ident)
+			if !ok || receiver.Name != "d" {
+				return true
+			}
+			callKey := key{selector.Sel.Name, function.Name.Name}
+			if _, expected := want[callKey]; !expected {
+				return true
+			}
+			got[callKey]++
+			allowed[selector.Sel.Pos()] = struct{}{}
+			return true
+		})
+	}
+	for expected, count := range want {
+		if got[expected] != count {
+			return nil, fmt.Errorf(
+				"definition edit receipt dispatcher %s must call d.store.%s exactly %d time(s), got %d",
+				expected.function, expected.method, count, got[expected],
+			)
+		}
+	}
+	return allowed, nil
 }
 
 func TestTaskDefinitionEditStoreGuardCatchesMethodValuesAndReceiptCalls(t *testing.T) {
@@ -266,6 +415,61 @@ func run(s *storepkg.Store) { _ = s.AdvanceEdit() }
 	}
 }
 
+func TestTaskDefinitionEditStartupStoreGateRejectsDeadOrWrongWiring(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		source string
+	}{
+		{
+			name: "dead closure",
+			source: `package main
+func run() error {
+	st, _ := store.New()
+	gate := func() { _ = st.ValidateTaskDefinitionEditRuntimeRoles(nil) }
+	_ = gate
+	return nil
+}`,
+		},
+		{
+			name: "wrong receiver",
+			source: `package main
+func run() error {
+	st, _ := store.New()
+	other, _ := store.New()
+	_ = st
+	err := other.ValidateTaskDefinitionEditRuntimeRoles(nil)
+	return err
+}`,
+		},
+		{
+			name: "outside run",
+			source: `package main
+func hidden(st *Store) { _ = st.ValidateTaskDefinitionEditRuntimeRoles(nil) }
+func run() error {
+	st, _ := store.New()
+	_ = st
+	return nil
+}`,
+		},
+	}
+	for _, testCase := range cases {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			file, err := parser.ParseFile(
+				token.NewFileSet(), "main.go", testCase.source, 0,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := taskDefinitionEditStartupStoreCalls(file); err == nil {
+				t.Fatal("unsafe runtime-role Gate wiring was accepted")
+			}
+		})
+	}
+}
+
 func TestTaskDefinitionEditStoreGuardCoversEveryExportedMethod(t *testing.T) {
 	t.Parallel()
 	_, testFile, _, ok := runtime.Caller(0)
@@ -279,6 +483,7 @@ func TestTaskDefinitionEditStoreGuardCoversEveryExportedMethod(t *testing.T) {
 	providerFiles := make(map[string]*ast.File, 3)
 	for _, name := range []string{
 		"task_definition_edit_operations.go",
+		"task_definition_edit_preflight.go",
 		"task_definition_edit_receipts.go",
 		"task_definition_edit_tx.go",
 	} {
@@ -352,6 +557,8 @@ func taskDefinitionEditCoordinatorStoreCalls(file *ast.File) (map[token.Pos]stru
 		{"LoadTaskDefinitionEditOperation", "loadTaskDefinitionEditConvergent", 1},
 		{"ListStaleTaskDefinitionEditTenantIDs", "RecoverStaleOnce", 2},
 		{"ListStaleTaskDefinitionEditOperations", "RecoverStaleOnce", 1},
+		{"ListNonterminalTaskDefinitionEditTenantIDs", "ValidateRuntimeEnvironment", 1},
+		{"ListNonterminalTaskDefinitionEditOperations", "ValidateRuntimeEnvironment", 1},
 	}
 	type expectationKey struct{ method, function string }
 	want := make(map[expectationKey]int, len(expectations))
@@ -395,6 +602,105 @@ func taskDefinitionEditCoordinatorStoreCalls(file *ast.File) (map[token.Pos]stru
 		}
 	}
 	return allowed, nil
+}
+
+func taskDefinitionEditStartupStoreCalls(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	const method = "ValidateTaskDefinitionEditRuntimeRoles"
+	var run *ast.FuncDecl
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Recv != nil || function.Name.Name != "run" {
+			continue
+		}
+		if run != nil {
+			return nil, fmt.Errorf("cmd/server must define exactly one top-level run")
+		}
+		run = function
+	}
+	if run == nil || run.Body == nil {
+		return nil, fmt.Errorf("cmd/server top-level run function is missing")
+	}
+
+	var storeObject *ast.Object
+	for _, statement := range run.Body.List {
+		assignment, ok := statement.(*ast.AssignStmt)
+		if !ok {
+			continue
+		}
+		constructsStore := slices.ContainsFunc(assignment.Rhs, func(expr ast.Expr) bool {
+			call, ok := taskDefinitionEditStoreUnparen(expr).(*ast.CallExpr)
+			if !ok {
+				return false
+			}
+			selector, ok := taskDefinitionEditStoreUnparen(call.Fun).(*ast.SelectorExpr)
+			if !ok {
+				return false
+			}
+			receiver, receiverOK := taskDefinitionEditStoreUnparen(selector.X).(*ast.Ident)
+			return receiverOK && receiver.Name == "store" &&
+				selector.Sel.Name == "New"
+		})
+		if !constructsStore {
+			continue
+		}
+		for _, lhs := range assignment.Lhs {
+			ident, ok := taskDefinitionEditStoreUnparen(lhs).(*ast.Ident)
+			if ok && ident.Name == "st" {
+				storeObject = ident.Obj
+			}
+		}
+	}
+	if storeObject == nil {
+		return nil, fmt.Errorf("cmd/server run must bind store.New result to st")
+	}
+
+	totalCalls := 0
+	var allowedPosition token.Pos
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := taskDefinitionEditStoreUnparen(call.Fun).(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != method {
+			return true
+		}
+		totalCalls++
+		return true
+	})
+	for _, statement := range run.Body.List {
+		assignment, ok := statement.(*ast.AssignStmt)
+		if !ok {
+			continue
+		}
+		for _, rhs := range assignment.Rhs {
+			call, ok := taskDefinitionEditStoreUnparen(rhs).(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			selector, ok := taskDefinitionEditStoreUnparen(call.Fun).(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != method {
+				continue
+			}
+			receiver, ok := taskDefinitionEditStoreUnparen(selector.X).(*ast.Ident)
+			if !ok || receiver.Name != "st" || receiver.Obj != storeObject {
+				continue
+			}
+			if allowedPosition != token.NoPos {
+				return nil, fmt.Errorf("cmd/server run calls %s more than once", method)
+			}
+			allowedPosition = selector.Sel.Pos()
+		}
+	}
+	if totalCalls != 1 || allowedPosition == token.NoPos {
+		return nil, fmt.Errorf(
+			"cmd/server run must directly and unconditionally assign st.%s exactly once, got total=%d",
+			method, totalCalls,
+		)
+	}
+	return map[token.Pos]struct{}{allowedPosition: {}}, nil
 }
 
 func taskDefinitionEditStoreReferenceViolations(
@@ -458,8 +764,11 @@ func taskDefinitionEditStoreReferenceViolations(
 			return true
 		}
 		if _, receipt := receiptMethods[selector.Sel.Name]; receipt {
+			if _, ok := allowed[selector.Sel.Pos()]; ok {
+				return true
+			}
 			violations = append(violations, fset.Position(selector.Sel.Pos()).String()+
-				": definition edit receipt Store API must remain dark "+selector.Sel.Name)
+				": definition edit receipt Store API outside exact dispatcher call "+selector.Sel.Name)
 		}
 		return true
 	})
@@ -645,6 +954,8 @@ func taskDefinitionEditStoreMutationGraphSymbols() map[string]struct{} {
 		"beginTaskDefinitionEditTx",
 		"beginTaskDefinitionEditReceiptTx",
 		"beginTaskDefinitionEditRoleTx",
+		"validateTaskDefinitionEditRLSObservation",
+		"ValidateTaskDefinitionEditRuntimeRoles",
 	})
 }
 
@@ -681,6 +992,7 @@ func taskDefinitionEditStoreMutationGraphExpectations() []taskDefinitionEditStor
 		{"beginTaskDefinitionEditTx", "AcquireTaskDefinitionEditOperation", 1},
 		{"beginTaskDefinitionEditTx", "RenewTaskDefinitionEditLease", 1},
 		{"beginTaskDefinitionEditTx", "ListStaleTaskDefinitionEditOperations", 1},
+		{"beginTaskDefinitionEditTx", "ListNonterminalTaskDefinitionEditOperations", 1},
 		{"beginTaskDefinitionEditTx", "QuiesceTaskDefinitionEdit", 1},
 		{"beginTaskDefinitionEditTx", "AuthorizeTaskDefinitionEditRemotePhase", 1},
 		{"beginTaskDefinitionEditTx", "checkpointTaskDefinitionEditSnapshot", 1},
@@ -697,6 +1009,8 @@ func taskDefinitionEditStoreMutationGraphExpectations() []taskDefinitionEditStor
 		{"beginTaskDefinitionEditReceiptTx", "RecordTaskDefinitionEditReceiptSendFailure", 1},
 		{"beginTaskDefinitionEditRoleTx", "beginTaskDefinitionEditTx", 1},
 		{"beginTaskDefinitionEditRoleTx", "beginTaskDefinitionEditReceiptTx", 1},
+		{"beginTaskDefinitionEditRoleTx", "ValidateTaskDefinitionEditRuntimeRoles", 1},
+		{"validateTaskDefinitionEditRLSObservation", "ValidateTaskDefinitionEditRuntimeRoles", 1},
 	}
 }
 
@@ -727,6 +1041,7 @@ func taskDefinitionEditStoreProviderFunctionSymbols(
 			"loadLeasedTaskDefinitionEditOperation",
 			"taskDefinitionEditOriginalStatus",
 			"validateTaskDefinitionEditCreationScope",
+			"validateTaskDefinitionEditActiveActor",
 			"validateTaskDefinitionEditCreationProvenance",
 			"CreateTaskDefinitionEditOperation",
 			"taskDefinitionEditCreationReplayEqual",
@@ -799,7 +1114,13 @@ func taskDefinitionEditStoreProviderFunctionSymbols(
 			"taskDefinitionEditReceiptTerminal",
 			"taskDefinitionEditReceiptLeaseLost",
 		}),
+		filepath.Clean(filepath.Join(storeDir, "task_definition_edit_preflight.go")): taskDefinitionEditStoreMethodSet([]string{
+			"ListNonterminalTaskDefinitionEditTenantIDs",
+			"ListNonterminalTaskDefinitionEditOperations",
+		}),
 		filepath.Clean(filepath.Join(storeDir, "task_definition_edit_tx.go")): taskDefinitionEditStoreMethodSet([]string{
+			"ValidateTaskDefinitionEditRuntimeRoles",
+			"validateTaskDefinitionEditRLSObservation",
 			"beginTaskDefinitionEditTx",
 			"beginTaskDefinitionEditReceiptTx",
 			"beginTaskDefinitionEditRoleTx",
@@ -976,6 +1297,9 @@ func taskDefinitionEditOperationStoreMethods() map[string]struct{} {
 		"RenewTaskDefinitionEditLease",
 		"ListStaleTaskDefinitionEditTenantIDs",
 		"ListStaleTaskDefinitionEditOperations",
+		"ListNonterminalTaskDefinitionEditTenantIDs",
+		"ListNonterminalTaskDefinitionEditOperations",
+		"ValidateTaskDefinitionEditRuntimeRoles",
 		"QuiesceTaskDefinitionEdit",
 		"AuthorizeTaskDefinitionEditRemotePhase",
 		"CheckpointTaskDefinitionEditBasePaused",
