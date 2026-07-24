@@ -204,6 +204,7 @@ func TestPreparedTaskDefinitionEditWire_RejectsShapeCanonicalityAndTampering(t *
 		{name: "case folded root field", raw: bytes.Replace(valid, []byte(`"wire_version"`), []byte(`"WIRE_VERSION"`), 1)},
 		{name: "escaped root field", raw: bytes.Replace(valid, []byte(`"wire_version"`), []byte(`"\u0077ire_version"`), 1)},
 		{name: "missing root field", raw: bytes.Replace(valid, []byte(`"wire_version":"v1",`), nil, 1)},
+		{name: "v1 wire reinterpreted as v2", raw: bytes.Replace(valid, []byte(`"wire_version":"v1"`), []byte(`"wire_version":"v2"`), 1)},
 		{name: "null scalar", raw: bytes.Replace(valid, []byte(`"operation_id":"edit-wire-strict"`), []byte(`"operation_id":null`), 1)},
 		{name: "semantic digest tamper", raw: tamperedWire},
 	}

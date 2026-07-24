@@ -14,6 +14,7 @@ import (
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 
+	"github.com/YouToco/vane/definitioneditwire"
 	"github.com/YouToco/vane/workflow"
 )
 
@@ -116,6 +117,80 @@ func changedTaskDefinitionEditDefinition(
 func expectedTaskDefinitionEditRequestID(phase, operationDigest, requestDigest string) string {
 	sum := sha256.Sum256([]byte("definition_edit/" + phase + "/" + operationDigest + ":" + requestDigest))
 	return hex.EncodeToString(sum[:])
+}
+
+func TestTaskDefinitionEdit_RetainedV1CreationProvenance(t *testing.T) {
+	fake := newTaskScheduleFakeClient()
+	scheduler := newTaskScheduleTestScheduler(fake)
+	request := validTaskScheduleRequest()
+	request.Spec = ScheduleSpec{Cron: "0 9 * * 1", TZ: "Asia/Shanghai"}
+	request.NLDescription = "每周一上午 9:00 推送 AI 官方重大更新"
+	creation := preparedTaskSchedule(t, scheduler, request)
+	if creation.FingerprintVersion != taskScheduleFingerprintVersionV1 {
+		t.Fatalf("creation fingerprint version = %q, want retained v1", creation.FingerprintVersion)
+	}
+	ensured, err := scheduler.Scheduler.EnsurePausedTask(t.Context(), creation)
+	if err != nil {
+		t.Fatalf("ensure paused creation: %v", err)
+	}
+	if _, err := scheduler.Scheduler.ActivateTask(t.Context(), creation, ensured.Snapshot); err != nil {
+		t.Fatalf("activate creation: %v", err)
+	}
+
+	base := TaskDefinitionEditDefinition{
+		Spec:          request.Spec,
+		Scope:         cloneTaskDefinitionEditScope(request.Scope),
+		NLDescription: request.NLDescription,
+	}
+	target := cloneTaskDefinitionEditDefinition(base)
+	target.NLDescription = "[C2b3-2d Gate 临时] " + base.NLDescription
+	prepared, snapshot, err := scheduler.PrepareTaskDefinitionEdit(
+		t.Context(),
+		TaskDefinitionEditRequest{
+			OperationID:   "edit-retained-v1-creation",
+			Creation:      creation,
+			BaseHead:      taskDefinitionEditHead(1, "a"),
+			TargetHead:    taskDefinitionEditHead(2, "b"),
+			OriginalState: TaskDefinitionEditOriginalStateActive,
+			Base:          base,
+			Target:        target,
+		},
+	)
+	if err != nil {
+		t.Fatalf("PrepareTaskDefinitionEdit retained v1 creation: %v", err)
+	}
+	if prepared.WireVersion != "v2" {
+		t.Fatalf("prepared wire version = %q, want v2 compatibility wire", prepared.WireVersion)
+	}
+	if prepared.Creation.FingerprintVersion != taskScheduleFingerprintVersionV1 {
+		t.Fatalf("prepared creation fingerprint version = %q, want retained v1", prepared.Creation.FingerprintVersion)
+	}
+	if snapshot.Phase != TaskDefinitionEditPhaseBaseOriginal ||
+		snapshot.Revision != prepared.BaseRevision {
+		t.Fatalf("base snapshot = %+v, want exact base_original", snapshot)
+	}
+	preparedBytes, err := EncodePreparedTaskDefinitionEdit(prepared)
+	if err != nil {
+		t.Fatalf("encode retained v1 compatibility edit: %v", err)
+	}
+	snapshotBytes, err := EncodeTaskDefinitionEditBaseSnapshot(prepared, snapshot)
+	if err != nil {
+		t.Fatalf("encode retained v1 base snapshot: %v", err)
+	}
+	if _, err := definitioneditwire.DecodePhaseSnapshotBytes(
+		preparedBytes,
+		snapshotBytes,
+	); err != nil {
+		t.Fatalf("retained recovery reader rejected compatibility wire: %v", err)
+	}
+	reinterpreted := prepared
+	reinterpreted.WireVersion = taskDefinitionEditWireVersionV1
+	if _, err := EncodePreparedTaskDefinitionEdit(reinterpreted); !errors.Is(
+		err,
+		ErrTaskScheduleInvalid,
+	) {
+		t.Fatalf("v1 wire accepted retained v1 creation provenance: %v", err)
+	}
 }
 
 func TestTaskDefinitionEdit_ActiveRawCASLifecycle(t *testing.T) {
