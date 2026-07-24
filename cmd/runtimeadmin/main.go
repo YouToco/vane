@@ -7,6 +7,10 @@
 //	runtimeadmin baseline -mode dry-run -limit 100
 //	runtimeadmin baseline -mode apply -confirm-apply -limit 100
 //	runtimeadmin baseline -mode verify -after-tenant 1 -after-user 2 -after-task push-123
+//
+// Verify returns 0 only when every item in the page is verified and Next is
+// absent. Exit 1 means a non-verified item, 2 means the command failed, and 3
+// means the JSON Next cursor must be supplied to a subsequent verify call.
 package main
 
 import (
@@ -15,6 +19,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -26,9 +31,11 @@ import (
 )
 
 const (
-	exitOK      = 0
-	exitFailure = 2
-	runTimeout  = 2 * time.Minute
+	exitOK              = 0
+	exitVerifyFailed    = 1
+	exitFailure         = 2
+	exitVerifyMorePages = 3
+	runTimeout          = 2 * time.Minute
 )
 
 func main() {
@@ -86,16 +93,44 @@ func run(args []string) int {
 			UserID:   *afterUser,
 			TaskID:   *afterTask,
 		}, *limit)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "runtimeadmin: "+safeError(
-			err, "任务 definition baseline 执行失败"))
+	return finishBaselineRun(os.Stdout, os.Stderr, mode, page, err)
+}
+
+func finishBaselineRun(
+	stdout io.Writer,
+	stderr io.Writer,
+	mode store.TaskDefinitionBaselineMode,
+	page store.TaskDefinitionBaselinePage,
+	runErr error,
+) int {
+	if runErr != nil {
+		fmt.Fprintln(stderr, "runtimeadmin: "+safeError(
+			runErr, "任务 definition baseline 执行失败"))
 		return exitFailure
 	}
-	encoder := json.NewEncoder(os.Stdout)
+	encoder := json.NewEncoder(stdout)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(page); err != nil {
-		fmt.Fprintln(os.Stderr, "runtimeadmin: 输出结果失败")
+		fmt.Fprintln(stderr, "runtimeadmin: 输出结果失败")
 		return exitFailure
+	}
+	return baselineExitCode(mode, page)
+}
+
+func baselineExitCode(
+	mode store.TaskDefinitionBaselineMode,
+	page store.TaskDefinitionBaselinePage,
+) int {
+	if mode != store.TaskDefinitionBaselineVerify {
+		return exitOK
+	}
+	for _, item := range page.Items {
+		if item.Status != store.TaskDefinitionBaselineVerified {
+			return exitVerifyFailed
+		}
+	}
+	if page.Next != nil {
+		return exitVerifyMorePages
 	}
 	return exitOK
 }

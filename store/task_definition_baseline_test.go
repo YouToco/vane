@@ -4,7 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -392,6 +399,113 @@ func TestTaskDefinitionBaselineKeysetPagination(t *testing.T) {
 	if !found[first.taskID] || !found[second.taskID] {
 		t.Fatalf("pagination missed fixtures: %+v", found)
 	}
+}
+
+func TestTaskDefinitionBaselineHasOnlyRuntimeAdminProductionCaller(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve test source")
+	}
+	repoRoot := filepath.Dir(filepath.Dir(thisFile))
+	callers, err := findTaskDefinitionBaselineCallers(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"cmd/runtimeadmin/main.go"}
+	if !slices.Equal(callers, want) {
+		t.Fatalf("baseline production callers=%v want=%v", callers, want)
+	}
+}
+
+func TestTaskDefinitionBaselineCallerGuardDetectsServerAndWrapperMutation(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"store/provider.go": `package store
+type Store struct{}
+func (s *Store) ReconcileTaskDefinitionBaselines() {}
+func (s *Store) providerHelper() { s.ReconcileTaskDefinitionBaselines() }
+`,
+		"cmd/server/main.go": `package main
+type Store struct{}
+func main() { var st Store; st.ReconcileTaskDefinitionBaselines() }
+`,
+		"wrapper/wrapper.go": `package wrapper
+type Store struct{}
+func ReconcileTaskDefinitionBaselines(st *Store) {
+	st.ReconcileTaskDefinitionBaselines()
+}
+`,
+	}
+	for name, content := range files {
+		path := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	callers, err := findTaskDefinitionBaselineCallers(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"cmd/server/main.go",
+		"store/provider.go",
+		"wrapper/wrapper.go",
+	}
+	if !slices.Equal(callers, want) {
+		t.Fatalf("synthetic callers=%v want=%v", callers, want)
+	}
+}
+
+func findTaskDefinitionBaselineCallers(repoRoot string) ([]string, error) {
+	var callers []string
+	err := filepath.WalkDir(
+		repoRoot,
+		func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() {
+				if entry.Name() == ".git" ||
+					strings.HasPrefix(entry.Name(), ".tmp") {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if filepath.Ext(path) != ".go" ||
+				strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+			if err != nil {
+				return err
+			}
+			found := false
+			ast.Inspect(file, func(node ast.Node) bool {
+				selector, ok := node.(*ast.SelectorExpr)
+				if ok &&
+					selector.Sel.Name == "ReconcileTaskDefinitionBaselines" {
+					found = true
+				}
+				return true
+			})
+			if found {
+				relative, err := filepath.Rel(repoRoot, path)
+				if err != nil {
+					return err
+				}
+				callers = append(callers, filepath.ToSlash(relative))
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(callers)
+	return callers, nil
 }
 
 func taskDefinitionBaselineResultForTask(
