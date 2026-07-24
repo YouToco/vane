@@ -108,6 +108,30 @@ func (s *Store) InsertInitialApprovedDefinition(
 	if err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
+	record, err := insertInitialApprovedDefinitionTx(
+		ctx, tx, definition, payload, digest, approvalRef, head)
+	if err != nil {
+		return ApprovedDefinitionVersionRecord{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ApprovedDefinitionVersionRecord{}, taskStateDatabaseError(
+			"commit initial approved definition", err)
+	}
+	return record, nil
+}
+
+// insertInitialApprovedDefinitionTx is the shared exact version-1 append used
+// by the explicit primitive above and the C2c one-way legacy baseline adapter.
+// The caller must hold the schedule lock returned by lockTaskDefinitionScope
+// and owns commit/rollback.
+func insertInitialApprovedDefinitionTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	definition taskstate.ApprovedDefinitionV1,
+	payload []byte,
+	digest, approvalRef string,
+	head taskDefinitionHead,
+) (ApprovedDefinitionVersionRecord, error) {
 	if definition.ExecutionMode != types.ExecutionModeCompiled {
 		return ApprovedDefinitionVersionRecord{}, taskStateValidation(
 			"C2a only permits compiled approved definitions")
@@ -124,10 +148,6 @@ func (s *Store) InsertInitialApprovedDefinition(
 			!bytes.Equal(existingByApproval.Payload, payload) {
 			return ApprovedDefinitionVersionRecord{}, taskStateConflict(
 				"approved definition approval reference already has another result")
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return ApprovedDefinitionVersionRecord{}, taskStateDatabaseError(
-				"commit approved definition replay", err)
 		}
 		return existingByApproval, nil
 	}
@@ -154,10 +174,6 @@ func (s *Store) InsertInitialApprovedDefinition(
 			!bytes.Equal(existing.Payload, payload) {
 			return ApprovedDefinitionVersionRecord{}, taskStateConflict(
 				"approved definition initialization conflicts with the current head")
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return ApprovedDefinitionVersionRecord{}, taskStateDatabaseError(
-				"commit approved definition replay", err)
 		}
 		return existing, nil
 	}
@@ -205,10 +221,6 @@ func (s *Store) InsertInitialApprovedDefinition(
 	if tag.RowsAffected() != 1 {
 		return ApprovedDefinitionVersionRecord{}, taskStateConflict(
 			"approved definition head changed concurrently")
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return ApprovedDefinitionVersionRecord{}, taskStateDatabaseError(
-			"commit initial approved definition", err)
 	}
 	return record, nil
 }
