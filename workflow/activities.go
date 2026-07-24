@@ -235,6 +235,12 @@ type CompiledRunStore interface {
 	SourceForContentFromIDs(context.Context, int64, []int64) (int64, bool, error)
 }
 
+type CompiledRunSnapshotShadowV2Store interface {
+	CreateOrGetCompiledRunSnapshotShadowV2(
+		context.Context, types.RunIdentity, runtimepolicy.BundleV1,
+	) (types.RunSnapshotRef, error)
+}
+
 // CompiledPolicyBuilderV1 freezes the process's current non-secret runtime
 // policy. The boolean is the per-task result of the existing playbook rollout
 // decision, not a mutable pointer to configuration.
@@ -280,6 +286,8 @@ type Activities struct {
 	compiledStore                  CompiledRunStore
 	buildCompiledPolicyV1          CompiledPolicyBuilderV1
 	compiledModelResolverV1        CompiledModelResolverV1
+	compiledShadowStoreV2          CompiledRunSnapshotShadowV2Store
+	snapshotV2ShadowCanaryTaskID   string
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding
@@ -310,6 +318,19 @@ func WithCompiledRuntimeV1(
 		a.compiledStore = st
 		a.buildCompiledPolicyV1 = builder
 		a.compiledModelResolverV1 = modelResolver
+	}
+}
+
+// WithSnapshotV2ShadowCanary enables C2c-2 for exactly one task. It changes
+// only the run-start persistence call; PrepareRun still returns and consumes
+// the sealed v1 reference.
+func WithSnapshotV2ShadowCanary(
+	st CompiledRunSnapshotShadowV2Store,
+	taskID string,
+) ActivitiesOption {
+	return func(a *Activities) {
+		a.compiledShadowStoreV2 = st
+		a.snapshotV2ShadowCanaryTaskID = taskID
 	}
 }
 
@@ -594,7 +615,14 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 		if _, err := a.resolveCompiledModelPolicyV1(policy.ModelPolicy); err != nil {
 			return PrepareRunResult{}, nonRetryable(err)
 		}
-		ref, err = a.compiledStore.CreateOrGetCompiledRunSnapshotV1(ctx, expected, policy)
+		if a.compiledShadowStoreV2 != nil &&
+			p.ScheduleID == a.snapshotV2ShadowCanaryTaskID {
+			ref, err = a.compiledShadowStoreV2.CreateOrGetCompiledRunSnapshotShadowV2(
+				ctx, expected, policy)
+		} else {
+			ref, err = a.compiledStore.CreateOrGetCompiledRunSnapshotV1(
+				ctx, expected, policy)
+		}
 		if err != nil {
 			// A task may be paused/deleted after Temporal has started the run but
 			// before its first immutable snapshot is committed. That is a normal

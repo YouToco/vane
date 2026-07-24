@@ -43,8 +43,11 @@ func main() {
 }
 
 func run(args []string) int {
+	if len(args) > 0 && args[0] == "snapshot-shadow" {
+		return runSnapshotShadow(args[1:])
+	}
 	if len(args) == 0 || args[0] != "baseline" {
-		fmt.Fprintln(os.Stderr, "用法: runtimeadmin baseline -mode dry-run|apply|verify [cursor flags]")
+		fmt.Fprintln(os.Stderr, "用法: runtimeadmin baseline ... | snapshot-shadow ...")
 		return exitFailure
 	}
 	fs := flag.NewFlagSet("runtimeadmin baseline", flag.ContinueOnError)
@@ -94,6 +97,74 @@ func run(args []string) int {
 			TaskID:   *afterTask,
 		}, *limit)
 	return finishBaselineRun(os.Stdout, os.Stderr, mode, page, err)
+}
+
+func runSnapshotShadow(args []string) int {
+	fs := flag.NewFlagSet("runtimeadmin snapshot-shadow", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	taskID := fs.String("task", "", "exact canary task id")
+	rawSince := fs.String("since", "", "inclusive RFC3339 canary start")
+	afterID := fs.Int64("after-id", 0, "exclusive snapshot id cursor")
+	limit := fs.Int("limit", 100, "page size (1-1000)")
+	if err := fs.Parse(args); err != nil {
+		return exitFailure
+	}
+	since, err := time.Parse(time.RFC3339, *rawSince)
+	if err != nil || *taskID == "" {
+		fmt.Fprintln(os.Stderr,
+			"runtimeadmin: snapshot-shadow requires -task and RFC3339 -since")
+		return exitFailure
+	}
+	cfg, err := config.Load("")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runtimeadmin: 加载配置失败")
+		return exitFailure
+	}
+	ctx, stop := signal.NotifyContext(
+		context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, runTimeout)
+	defer cancel()
+	st, err := store.New(ctx, cfg.DB.URL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runtimeadmin: 连接数据库失败")
+		return exitFailure
+	}
+	defer st.Close()
+	page, err := st.AuditTaskRunSnapshotShadowsV2(
+		ctx, *taskID, since, *afterID, *limit)
+	return finishSnapshotShadowRun(os.Stdout, os.Stderr, page, err)
+}
+
+func finishSnapshotShadowRun(
+	stdout io.Writer,
+	stderr io.Writer,
+	page store.TaskRunSnapshotShadowAuditPage,
+	runErr error,
+) int {
+	if runErr != nil {
+		fmt.Fprintln(stderr, "runtimeadmin: "+safeError(
+			runErr, "snapshot shadow verify failed"))
+		return exitFailure
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(page); err != nil {
+		fmt.Fprintln(stderr, "runtimeadmin: 输出结果失败")
+		return exitFailure
+	}
+	if len(page.Items) == 0 {
+		return exitVerifyFailed
+	}
+	for _, item := range page.Items {
+		if item.Status != store.TaskRunSnapshotShadowMatch {
+			return exitVerifyFailed
+		}
+	}
+	if page.Next != nil {
+		return exitVerifyMorePages
+	}
+	return exitOK
 }
 
 func finishBaselineRun(

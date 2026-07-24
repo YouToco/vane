@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -123,6 +124,7 @@ func TestCreateTaskRunSnapshotShadowV2AtomicAndNoBackfill(t *testing.T) {
 		!bytes.Equal(digest, mustDecodeDigest(t, sha256Hex(payload))) {
 		t.Fatalf("shadow status/digest = %q/%x", status, digest)
 	}
+	auditSince := time.Now().Add(-time.Minute)
 
 	legacyRun := "shadow-preexisting-v1"
 	legacy, err := f.st.createOrGetTaskRunSnapshot(
@@ -140,6 +142,21 @@ func TestCreateTaskRunSnapshotShadowV2AtomicAndNoBackfill(t *testing.T) {
 		`SELECT count(*) FROM task_run_snapshot_v2_shadows WHERE run_snapshot_id=$1`,
 		legacy.ID).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("pre-shadow replay sidecars = %d, %v", count, err)
+	}
+	page, err := f.st.AuditTaskRunSnapshotShadowsV2(
+		t.Context(), taskID, auditSince, 0, 1)
+	if err != nil || len(page.Items) != 1 || page.Next == nil ||
+		page.Items[0].Status != TaskRunSnapshotShadowMatch ||
+		page.Items[0].V1PayloadDigest == "" ||
+		page.Items[0].ShadowPayloadDigest == "" {
+		t.Fatalf("first audit page = %+v, %v", page, err)
+	}
+	page, err = f.st.AuditTaskRunSnapshotShadowsV2(
+		t.Context(), taskID, auditSince, *page.Next, 1)
+	if err != nil || len(page.Items) != 1 || page.Next != nil ||
+		page.Items[0].Status != "missing" ||
+		page.Items[0].ShadowPayloadDigest != "" {
+		t.Fatalf("second audit page = %+v, %v", page, err)
 	}
 }
 

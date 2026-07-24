@@ -135,7 +135,8 @@ func (s *Store) createOrGetTaskRunSnapshotWithShadowV2(
 		return nil, err
 	} else if found {
 		if shadowV2 {
-			if err := validateExistingTaskRunSnapshotShadowV2(ctx, tx, existing); err != nil {
+			if _, err := validateExistingTaskRunSnapshotShadowV2(
+				ctx, tx, existing); err != nil {
 				return nil, err
 			}
 		}
@@ -269,7 +270,11 @@ func (s *Store) createOrGetTaskRunSnapshotWithShadowV2(
 	if err := tx.Commit(ctx); err != nil {
 		if shadowV2 {
 			rollbackCompiledTaskTx(ctx, tx)
-			winner, found, loadErr := s.loadTaskRunSnapshotShadowBehindFenceV2(ctx, p)
+			recoveryCtx, cancel := context.WithTimeout(
+				context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			winner, found, loadErr := s.loadTaskRunSnapshotShadowBehindFenceV2(
+				recoveryCtx, p)
 			if loadErr != nil {
 				return nil, loadErr
 			}
@@ -299,8 +304,11 @@ func (s *Store) loadTaskRunSnapshotShadowBehindFenceV2(
 	if err != nil || !found {
 		return winner, found, err
 	}
-	if err := validateExistingTaskRunSnapshotShadowV2(ctx, tx, winner); err != nil {
+	if found, err := validateExistingTaskRunSnapshotShadowV2(
+		ctx, tx, winner); err != nil {
 		return nil, false, err
+	} else if !found {
+		return nil, false, taskRunIntegrityError()
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, taskRunDatabaseError(

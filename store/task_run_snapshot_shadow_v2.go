@@ -202,7 +202,7 @@ func validateExistingTaskRunSnapshotShadowV2(
 	ctx context.Context,
 	tx pgx.Tx,
 	snapshot *taskRunSnapshot,
-) error {
+) (bool, error) {
 	var status string
 	var tenantID, userID int64
 	var taskID, workflowID, runID string
@@ -225,10 +225,10 @@ func validateExistingTaskRunSnapshotShadowV2(
 	if errors.Is(err, pgx.ErrNoRows) {
 		// A committed v1 from before shadow enablement is intentionally not
 		// backfilled from a newer movable head.
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return taskRunDatabaseError("load task run snapshot v2 shadow", err)
+		return false, taskRunDatabaseError("load task run snapshot v2 shadow", err)
 	}
 	decoded, canonical, err := readTaskRunSnapshotShadowPayloadV2(payload)
 	if err != nil || !bytes.Equal(canonical, payload) ||
@@ -243,9 +243,9 @@ func validateExistingTaskRunSnapshotShadowV2(
 		approvedDigestValue(decoded.Approved) != pointerStringValue(approvedDigest) ||
 		adaptiveVersionValue(decoded.Adaptive) != adaptiveVersion ||
 		adaptiveDigestValue(decoded.Adaptive) != pointerStringValue(adaptiveDigest) {
-		return taskRunIntegrityError()
+		return false, taskRunIntegrityError()
 	}
-	return nil
+	return true, nil
 }
 
 func approvedVersionValue(value *taskRunSnapshotShadowApprovedV2) int64 {

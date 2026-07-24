@@ -1163,6 +1163,7 @@ func TestCreateOrGetTaskRunSnapshot_HasSinglePreparedProductionPath(t *testing.T
 	var references []string
 	var rawCalls, typedCalls, facadeCalls int
 	typedAdapterPath := filepath.Join(repoRoot, "store", "task_run_snapshot_typed.go")
+	rawPrimitivePath := filepath.Join(repoRoot, "store", "task_run_snapshots.go")
 	prepareRunPath := filepath.Join(repoRoot, "workflow", "activities.go")
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -1193,11 +1194,15 @@ func TestCreateOrGetTaskRunSnapshot_HasSinglePreparedProductionPath(t *testing.T
 				}
 				allowed := false
 				switch selector.Sel.Name {
-				case "createOrGetTaskRunSnapshot":
+				case "createOrGetTaskRunSnapshotWithShadowV2":
 					allowed = filepath.Clean(path) == filepath.Clean(typedAdapterPath) &&
-						function.Name.Name == "CreateOrGetCompiledTaskRunSnapshotV1"
+						function.Name.Name == "createOrGetCompiledTaskRunSnapshotV1"
 					if allowed {
 						rawCalls++
+					} else {
+						allowed = filepath.Clean(path) ==
+							filepath.Clean(rawPrimitivePath) &&
+							function.Name.Name == "createOrGetTaskRunSnapshot"
 					}
 				case "CreateOrGetCompiledTaskRunSnapshotV1":
 					allowed = filepath.Clean(path) == filepath.Clean(typedAdapterPath) &&

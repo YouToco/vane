@@ -158,7 +158,9 @@ func run() error {
 					ExaCredentialGeneration:    cfg.Fetch.CompiledExaCredentialGeneration,
 					TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
 				})
-			}, compiledModelResolver))
+			}, compiledModelResolver),
+		workflow.WithSnapshotV2ShadowCanary(
+			st, cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID))
 	slog.Info("task playbook prompt policy configured",
 		"enabled", cfg.Pipeline.PlaybookPromptsEnabled,
 		"canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID,

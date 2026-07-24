@@ -123,6 +123,7 @@ type compiledRunStoreFake struct {
 	loadSnapshotIdentities []types.RunIdentity
 	authorizeIdentities    []types.RunIdentity
 	createPolicies         []runtimepolicy.BundleV1
+	shadowCreates          int
 
 	dueSources         []types.Source
 	candidates         []types.ContentItem
@@ -175,6 +176,17 @@ func (f *compiledRunStoreFake) CreateOrGetCompiledRunSnapshotV1(
 		Policy:     policy,
 	}
 	return ref, nil
+}
+
+func (f *compiledRunStoreFake) CreateOrGetCompiledRunSnapshotShadowV2(
+	ctx context.Context,
+	identity types.RunIdentity,
+	policy runtimepolicy.BundleV1,
+) (types.RunSnapshotRef, error) {
+	f.mu.Lock()
+	f.shadowCreates++
+	f.mu.Unlock()
+	return f.CreateOrGetCompiledRunSnapshotV1(ctx, identity, policy)
 }
 
 func (f *compiledRunStoreFake) LoadCompiledTaskRunSnapshotV1(
@@ -735,6 +747,38 @@ func TestPrepareRun_CreatesThenRecoversExactReferenceBeforeCurrentState(t *testi
 	loadRef, create, loadSnapshot, authorize = compiledStore.counts()
 	if loadRef != 2 || create != 1 || loadSnapshot != 2 || authorize != 2 || builderCalls.Load() != 1 {
 		t.Fatalf("recovery consulted current state: loadRef=%d create=%d load=%d auth=%d build=%d", loadRef, create, loadSnapshot, authorize, builderCalls.Load())
+	}
+}
+
+func TestPrepareRun_SnapshotV2ShadowUsesExactCanaryAndV1Wire(t *testing.T) {
+	identity := testActivityIdentity(7, 9, "task-shadow-canary")
+	compiledStore := &compiledRunStoreFake{authorize: true}
+	resolver := new(compiledModelResolverFake)
+	builder := func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+		return runtimepolicy.BundleV1{SchemaVersion: "shadow-policy"}, nil
+	}
+	a := NewActivities(new(compiledRouteFetcherFake), fakeScorer{}, fakeCardGen{},
+		&fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledRuntimeV1(compiledStore, builder, resolver),
+		WithSnapshotV2ShadowCanary(compiledStore, identity.TaskID))
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.PrepareRun)
+	p := PushParams{
+		TenantID: identity.TenantID, UserID: identity.UserID,
+		RunKind: PushRunKindScheduled, ExecutionMode: types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeSnapshotV1, ScheduleID: identity.TaskID,
+	}
+	result, err := executePrepareRun(t, env, a, p)
+	if err != nil || !result.Authorized ||
+		result.Snapshot.SchemaVersion != types.RunSnapshotSchemaVersion {
+		t.Fatalf("shadow PrepareRun = %+v, %v", result, err)
+	}
+	compiledStore.mu.Lock()
+	shadowCreates := compiledStore.shadowCreates
+	compiledStore.mu.Unlock()
+	if shadowCreates != 1 {
+		t.Fatalf("shadow creates = %d, want 1", shadowCreates)
 	}
 }
 
