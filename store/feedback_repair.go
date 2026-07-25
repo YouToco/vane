@@ -267,6 +267,11 @@ var (
 	// They are used to repair historical free-text feedback, so a conservative
 	// false negative is preferable to teaching the profile a wrong diagnosis.
 	legacyRelativeAgePattern = regexp.MustCompile(`(?:[1-9][0-9]*|[一二三四五六七八九十百千万两]+)\s*(?:天|日|周|星期|个月|月|年)\s*前`)
+	// This fallback intentionally describes one short, self-contained complaint
+	// rather than merely co-occurring words anywhere in the feedback. It keeps
+	// the legacy production phrase “一个月前的内容了啊” while rejecting notes
+	// such as “我正在整理一个月前的内容，没问题”.
+	legacyRelativeContentComplaintPattern = regexp.MustCompile(`(?:[1-9][0-9]*|[一二三四五六七八九十百千万两]+)\s*(?:天|日|周|星期|个月|月|年)\s*前\s*的\s*(?:内容|新闻|文章|资讯)了(?:啊|呀|呢)?[。！？!?]?$`)
 	// Submatches 1-3 are YYYY年M月D日/号; 4-6 are YYYY-MM-DD. Keeping
 	// parsing local and strict lets a future date fail closed instead of being
 	// misclassified as stale merely because it appears beside a complaint.
@@ -296,13 +301,24 @@ func inferLegacyFeedbackReason(
 		return types.FeedbackReasonOutdated
 	case isExplicitDelayedDeliveryComplaint(normalized, feedbackCreatedAt):
 		return types.FeedbackReasonOutdated
+	case isLegacyRelativeContentComplaint(normalized):
+		return types.FeedbackReasonOutdated
 	case legacyRelativeAgePattern.MatchString(normalized) &&
+		!legacyAbsoluteDatePattern.MatchString(normalized) &&
 		(strings.Contains(normalized, "这都") || strings.Contains(normalized, "太久") ||
 			strings.Contains(normalized, "太早")):
 		return types.FeedbackReasonOutdated
 	default:
 		return types.FeedbackReasonOther
 	}
+}
+
+func isLegacyRelativeContentComplaint(normalized string) bool {
+	// A dated statement is handled only by the stricter absolute-date path;
+	// otherwise a future date could be accidentally overridden by a separate
+	// relative phrase in the same sentence.
+	return !legacyAbsoluteDatePattern.MatchString(normalized) &&
+		legacyRelativeContentComplaintPattern.MatchString(normalized)
 }
 
 // isExplicitDelayedDeliveryComplaint recognizes two conservative historical
@@ -323,6 +339,9 @@ func isExplicitDelayedDeliveryComplaint(
 		strings.Contains(normalized, "这么久才推") ||
 		strings.Contains(normalized, "现在还推")
 	if legacyRelativeAgePattern.MatchString(normalized) && hasDeliveryDelayComplaint {
+		if legacyAbsoluteDatePattern.MatchString(normalized) {
+			return legacyPastAbsoluteDate(normalized, feedbackCreatedAt)
+		}
 		return true
 	}
 	return hasDeliveryDelayComplaint &&
