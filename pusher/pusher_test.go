@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/types"
 )
 
@@ -15,6 +16,8 @@ type fakeSender struct {
 	retID       string
 	retErr      error
 	called      bool
+	gotUUID     string
+	observation pusheffect.ProviderObservation
 }
 
 func (f *fakeSender) SendCard(_ context.Context, openID, cardJSON string) (string, error) {
@@ -22,6 +25,19 @@ func (f *fakeSender) SendCard(_ context.Context, openID, cardJSON string) (strin
 	f.gotOpenID = openID
 	f.gotCardJSON = cardJSON
 	return f.retID, f.retErr
+}
+
+func (f *fakeSender) SendCardWithUUIDResult(
+	_ context.Context,
+	openID string,
+	cardJSON string,
+	messageUUID string,
+) (pusheffect.ProviderObservation, error) {
+	f.called = true
+	f.gotOpenID = openID
+	f.gotCardJSON = cardJSON
+	f.gotUUID = messageUUID
+	return f.observation, f.retErr
 }
 
 func TestPush_EmptyOpenID(t *testing.T) {
@@ -68,5 +84,46 @@ func TestPush_SenderErrorPropagates(t *testing.T) {
 	_, err := p.Push(context.Background(), "ou_owner", `{}`)
 	if !errors.Is(err, types.ErrPush) {
 		t.Errorf("sender 的推送错误应原样透传，得到 %v", err)
+	}
+}
+
+func TestPushWithUUID_ForwardsTypedObservation(t *testing.T) {
+	const messageUUID = "019f9824-39b6-7e13-b247-b5ee5713c52b"
+	fs := &fakeSender{observation: pusheffect.ProviderObservation{
+		Disposition: pusheffect.AttemptSent,
+		MessageID:   "om_effect",
+		ChatID:      "oc_owner",
+	}}
+	got, err := New(fs).PushWithUUID(
+		t.Context(), "ou_owner", `{"card":"frozen"}`, messageUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != fs.observation || fs.gotOpenID != "ou_owner" ||
+		fs.gotCardJSON != `{"card":"frozen"}` || fs.gotUUID != messageUUID {
+		t.Fatalf("observation/args drift: got=%+v sender=%+v", got, fs)
+	}
+}
+
+type legacyOnlySender struct{}
+
+func (legacyOnlySender) SendCard(
+	context.Context,
+	string,
+	string,
+) (string, error) {
+	return "", nil
+}
+
+func TestPushWithUUID_FailsClosedWithoutDurableCapability(t *testing.T) {
+	got, err := New(legacyOnlySender{}).PushWithUUID(
+		t.Context(),
+		"ou_owner",
+		`{"card":"frozen"}`,
+		"019f9824-39b6-7e13-b247-b5ee5713c52b",
+	)
+	if err == nil || got.Disposition != pusheffect.AttemptDefiniteNotSent ||
+		!errors.Is(err, types.ErrConflict) {
+		t.Fatalf("got=%+v err=%v, want fail-closed conflict", got, err)
 	}
 }

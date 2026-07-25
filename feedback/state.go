@@ -54,5 +54,6 @@ type CardInput struct {
 type AggregateCardInput struct {
 	HeaderTitle    string      // 完整标题串；空则构卡函数用兜底"📮 今日推送 · N 条"
 	HeaderTemplate string      // 飞书 header template 色名；空则 "blue"
+	EffectID       string      // durable push effect marker；空则保持历史卡字节形态
 	Items          []CardInput // 按分数降序；每项的 DeliveryID/State 各自独立
 }

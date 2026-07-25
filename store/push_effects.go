@@ -647,6 +647,187 @@ func (s *Store) RecordPushEffectSent(
 	return nil
 }
 
+// RecordPushEffectSentWithDeliveries atomically closes one provider effect and
+// every delivery frozen into it. A process crash can therefore leave both
+// sides pending or both sides sent, never "provider effect sent / deliveries
+// pending" (or the reverse). Batch completion remains a separate idempotent
+// receipt: existing compiled recovery closes it once all deliveries are sent.
+func (s *Store) RecordPushEffectSentWithDeliveries(
+	ctx context.Context,
+	receipt pusheffect.SentReceipt,
+) error {
+	if err := validatePushEffectSentReceipt(receipt); err != nil {
+		return err
+	}
+	tx, err := s.beginPushEffectReceiptTx(ctx, receipt.TenantID)
+	if err != nil {
+		return pushEffectDatabaseError(
+			"begin sent delivery receipt transaction", err)
+	}
+	defer rollbackPushEffectTx(ctx, tx)
+
+	var (
+		status                        pusheffect.Status
+		leaseOwner, providerMessageID string
+		fence, batchID                int64
+		deliveryIDs                   []int64
+		cardPayload                   []byte
+		sentAt                        *time.Time
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT status, lease_owner, fence, provider_message_id, sent_at,
+		       batch_id, delivery_ids, card_payload
+		  FROM push_effects
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		 FOR UPDATE`,
+		receipt.ID, receipt.TenantID, receipt.UserID,
+	).Scan(
+		&status, &leaseOwner, &fence, &providerMessageID, &sentAt,
+		&batchID, &deliveryIDs, &cardPayload,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pushEffectNotFound()
+	}
+	if err != nil {
+		return pushEffectDatabaseError("load sent delivery receipt target", err)
+	}
+	if len(deliveryIDs) == 0 || len(cardPayload) == 0 {
+		return pushEffectConflict("sent delivery receipt checkpoint is incomplete")
+	}
+
+	deliveriesMatch, err := lockAndValidatePushEffectDeliveries(
+		ctx, tx, receipt, batchID, deliveryIDs, cardPayload,
+	)
+	if err != nil {
+		return err
+	}
+	if status == pusheffect.StatusSent {
+		if fence != receipt.ExpectedFence ||
+			providerMessageID != receipt.ProviderMessageID ||
+			sentAt == nil || !deliveriesMatch {
+			return pushEffectConflict("sent delivery receipt differs")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return pushEffectDatabaseError(
+				"commit sent delivery receipt replay", err)
+		}
+		return nil
+	}
+	if fence != receipt.ExpectedFence ||
+		(status == pusheffect.StatusSending && leaseOwner != receipt.LeaseOwner) ||
+		(status == pusheffect.StatusAmbiguous && receipt.LeaseOwner != "") ||
+		(status != pusheffect.StatusSending && status != pusheffect.StatusAmbiguous) {
+		return pushEffectLeaseLost()
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE deliveries
+		   SET feishu_message_id=$5, card_json=$6::jsonb,
+		       status=$7, sent_at=clock_timestamp()
+		 WHERE tenant_id=$1 AND user_id=$2 AND batch_id=$3
+		   AND id=ANY($4)
+		   AND (
+		       status=$8 OR (
+		           status=$7 AND feishu_message_id=$5
+		           AND card_json=$6::jsonb AND sent_at IS NOT NULL
+		       )
+		   )`,
+		receipt.TenantID, receipt.UserID, batchID, deliveryIDs,
+		receipt.ProviderMessageID, cardPayload,
+		types.DeliveryStatusSent, types.DeliveryStatusPending,
+	)
+	if err != nil {
+		return pushEffectDatabaseError("write delivery receipts", err)
+	}
+	if tag.RowsAffected() != int64(len(deliveryIDs)) {
+		return pushEffectConflict("delivery receipt aggregate differs")
+	}
+
+	tag, err = tx.Exec(ctx, `
+		UPDATE push_effects
+		   SET status='sent', lease_owner='', lease_until=NULL,
+		       takeover_not_before=NULL, provider_message_id=$5,
+		       failure_class='', ambiguous_since=NULL,
+		       sent_at=clock_timestamp(), updated_at=clock_timestamp()
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND fence=$4
+		   AND status IN ('sending','ambiguous')`,
+		receipt.ID, receipt.TenantID, receipt.UserID,
+		receipt.ExpectedFence, receipt.ProviderMessageID,
+	)
+	if err != nil {
+		return pushEffectDatabaseError("write sent effect receipt", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return pushEffectLeaseLost()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return pushEffectDatabaseError(
+			"commit sent delivery receipt transaction", err)
+	}
+	return nil
+}
+
+func lockAndValidatePushEffectDeliveries(
+	ctx context.Context,
+	tx pgx.Tx,
+	receipt pusheffect.SentReceipt,
+	batchID int64,
+	deliveryIDs []int64,
+	cardPayload []byte,
+) (allSentAndMatching bool, err error) {
+	rows, err := tx.Query(ctx, `
+		SELECT id, status, feishu_message_id,
+		       card_json=$5::jsonb, sent_at
+		  FROM deliveries
+		 WHERE tenant_id=$1 AND user_id=$2 AND batch_id=$3 AND id=ANY($4)
+		 ORDER BY id
+		 FOR UPDATE`,
+		receipt.TenantID, receipt.UserID, batchID, deliveryIDs, cardPayload,
+	)
+	if err != nil {
+		return false, pushEffectDatabaseError("lock delivery receipt aggregate", err)
+	}
+	defer rows.Close()
+
+	seen := make([]int64, 0, len(deliveryIDs))
+	allSentAndMatching = true
+	for rows.Next() {
+		var (
+			statusMessageID string
+			deliveryID      int64
+			status          types.DeliveryStatus
+			cardMatches     bool
+			deliverySentAt  *time.Time
+		)
+		if err := rows.Scan(
+			&deliveryID, &status, &statusMessageID,
+			&cardMatches, &deliverySentAt,
+		); err != nil {
+			return false, pushEffectDatabaseError(
+				"scan delivery receipt aggregate", err)
+		}
+		seen = append(seen, deliveryID)
+		if status == types.DeliveryStatusPending {
+			allSentAndMatching = false
+			continue
+		}
+		if status != types.DeliveryStatusSent ||
+			statusMessageID != receipt.ProviderMessageID ||
+			deliverySentAt == nil || !cardMatches {
+			return false, pushEffectConflict("delivery receipt aggregate differs")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, pushEffectDatabaseError(
+			"iterate delivery receipt aggregate", err)
+	}
+	rows.Close()
+	if !slices.Equal(seen, deliveryIDs) {
+		return false, pushEffectConflict("delivery receipt aggregate is incomplete")
+	}
+	return allSentAndMatching, nil
+}
+
 func (s *Store) BlockPushEffect(
 	ctx context.Context,
 	resolution pusheffect.Resolution,
