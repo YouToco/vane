@@ -386,6 +386,19 @@ func TestPushEffectStaleSendingBecomesAmbiguousWithoutSendLease(t *testing.T) {
 		taken.Fence != claimed.Fence+1 {
 		t.Fatalf("unsafe takeover result=%+v", taken)
 	}
+	tenantIDs, err := f.store.ListRecoverablePushEffectTenantIDs(
+		ctx, time.Now().Add(time.Minute), 0, 10)
+	if err != nil || len(tenantIDs) != 1 ||
+		tenantIDs[0] != f.prepared.TenantID {
+		t.Fatalf("ambiguous recoverable tenant shards=%v err=%v", tenantIDs, err)
+	}
+	recoverable, err := f.store.ListRecoverablePushEffects(
+		ctx, f.prepared.TenantID, time.Now().Add(time.Minute), 10)
+	if err != nil || len(recoverable) != 1 ||
+		recoverable[0].ID != f.prepared.ID ||
+		recoverable[0].Status != pusheffect.StatusAmbiguous {
+		t.Fatalf("ambiguous recoverable effects=%+v err=%v", recoverable, err)
+	}
 	if _, err := f.store.ClaimPushEffect(ctx, pusheffect.ClaimParams{
 		Scope: f.prepared.Scope(), LeaseOwner: "new-worker",
 		LeaseDuration: time.Minute,

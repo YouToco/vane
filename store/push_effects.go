@@ -199,6 +199,7 @@ func (s *Store) ListRecoverablePushEffectTenantIDs(
 		SELECT DISTINCT tenant_id
 		  FROM push_effects
 		 WHERE tenant_id>$2 AND (
+		       status='ambiguous' OR
 		       (status IN ('prepared','definite_failed') AND
 		        next_attempt_at<=LEAST($1,clock_timestamp())) OR
 		       (status='sending' AND takeover_not_before IS NOT NULL AND
@@ -255,6 +256,7 @@ func (s *Store) ListRecoverablePushEffects(
 		SELECT `+pushEffectColumns+`
 		  FROM push_effects
 		 WHERE tenant_id=$1 AND (
+		       status='ambiguous' OR
 		       (status IN ('prepared','definite_failed') AND
 		        next_attempt_at<=LEAST($2,clock_timestamp())) OR
 		       (status='sending' AND takeover_not_before IS NOT NULL AND
@@ -262,6 +264,7 @@ func (s *Store) ListRecoverablePushEffects(
 		   )
 		 ORDER BY
 		   CASE WHEN status='sending' THEN takeover_not_before
+		        WHEN status='ambiguous' THEN ambiguous_since
 		        ELSE next_attempt_at END,
 		   id
 		 LIMIT $3`,
