@@ -99,16 +99,19 @@ func (m *Manager) sendCard(
 	}
 	// message_id 回填 deliveries.feishu_message_id，用于后续追溯/撤回。飞书即使
 	// 返回 code=0，也可能因异常响应缺失 data/message_id；此时远端结果未知，
-	// 绝不能用 ("", nil) 冒充发送成功。保持 CodePushFailed 可重试，让上层
-	// effect coordinator 将其收敛为 ambiguous，而不是落一个无回执的 sent。
+	// 绝不能用 ("", nil) 冒充发送成功。只有显式稳定 UUID 的入口可在飞书
+	// 一小时去重窗内安全重试；legacy 入口必须不可重试，让上层将结果收敛为
+	// ambiguous，而不是盲发重复卡或落一个无回执的 sent。
 	if resp.Data == nil ||
 		resp.Data.MessageId == nil ||
 		*resp.Data.MessageId == "" {
-		return "", types.NewAppError(
+		ae := types.NewAppError(
 			types.CodePushFailed,
 			"主动推送成功响应缺少消息 id",
 			nil,
 		)
+		ae.Retryable = messageUUID != ""
+		return "", ae
 	}
 	return *resp.Data.MessageId, nil
 }

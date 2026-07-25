@@ -323,17 +323,20 @@ func TestManager_SendCardRejectsSuccessWithoutMessageID(t *testing.T) {
 		},
 	}
 	sendPaths := []struct {
-		name string
-		send func(context.Context, *Manager) (string, error)
+		name              string
+		expectedRetryable bool
+		send              func(context.Context, *Manager) (string, error)
 	}{
 		{
-			name: "legacy send",
+			name:              "legacy send",
+			expectedRetryable: false,
 			send: func(ctx context.Context, m *Manager) (string, error) {
 				return m.SendCard(ctx, openID, cardJSON)
 			},
 		},
 		{
-			name: "stable uuid send",
+			name:              "stable uuid send",
+			expectedRetryable: true,
 			send: func(ctx context.Context, m *Manager) (string, error) {
 				return m.SendCardWithUUID(ctx, openID, cardJSON, messageUUID)
 			},
@@ -361,8 +364,15 @@ func TestManager_SendCardRejectsSuccessWithoutMessageID(t *testing.T) {
 					if messageID != "" {
 						t.Fatalf("message id = %q, want empty", messageID)
 					}
-					if !errors.Is(err, types.ErrPush) || !types.IsRetryable(err) {
-						t.Fatalf("error = %v, want retryable push error", err)
+					if !errors.Is(err, types.ErrPush) {
+						t.Fatalf("error = %v, want push error", err)
+					}
+					if got := types.IsRetryable(err); got != sendPath.expectedRetryable {
+						t.Fatalf(
+							"retryable = %v, want %v",
+							got,
+							sendPath.expectedRetryable,
+						)
 					}
 					observed := err.Error() + "\n" + logger.String()
 					for _, secret := range []string{openID, cardJSON, messageUUID} {
