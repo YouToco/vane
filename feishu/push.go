@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/YouToco/vane/types"
@@ -16,7 +17,45 @@ import (
 // 内部固定用 BuildReplyCard 造测试文案、收件人固定为缓存 owner、错误话术面向配置用户；
 // 本方法是通用的"把已生成好的 card JSON 发给任意 open_id"，收件人与内容都由调用方决定，
 // 二者语义不同，硬合并会让任一方多出无关分支。
+//
+// 兼容入口刻意不生成 UUID：没有调用方持久化的稳定值，现场生成只会制造虚假的
+// 幂等保证。需要跨重试去重的调用方应改用 SendCardWithUUID。
 func (m *Manager) SendCard(ctx context.Context, openID, cardJSON string) (string, error) {
+	return m.sendCard(ctx, openID, cardJSON, "")
+}
+
+// SendCardWithUUID 使用调用方持久化的 UUID 主动发送交互卡片。
+//
+// 飞书对相同 UUID 的 Message.Create 请求在一小时内至多成功一次。该保证只有在
+// 调用方跨重试复用同一个 UUID 时成立，因此本方法只接受显式、规范、非零 UUID：
+// 它不会现场生成 UUID，也不会把非法值降级为无 UUID 发送。调用方仍须持久化远端
+// message_id；超过飞书去重窗口后，不能仅凭本方法盲目重发结果未知的请求。
+func (m *Manager) SendCardWithUUID(
+	ctx context.Context,
+	openID string,
+	cardJSON string,
+	messageUUID string,
+) (string, error) {
+	parsedUUID, err := uuid.Parse(messageUUID)
+	if err != nil ||
+		parsedUUID == uuid.Nil ||
+		len(messageUUID) != len(uuid.Nil.String()) ||
+		parsedUUID.String() != messageUUID {
+		return "", types.NewAppError(
+			types.CodeValidation,
+			"主动推送消息 uuid 必须是规范的非零 uuid",
+			nil,
+		)
+	}
+	return m.sendCard(ctx, openID, cardJSON, messageUUID)
+}
+
+func (m *Manager) sendCard(
+	ctx context.Context,
+	openID string,
+	cardJSON string,
+	messageUUID string,
+) (string, error) {
 	if openID == "" {
 		return "", types.NewAppError(types.CodeValidation, "推送目标 open_id 为空", nil)
 	}
@@ -28,13 +67,17 @@ func (m *Manager) SendCard(ctx context.Context, openID, cardJSON string) (string
 		return "", types.NewAppError(types.CodeConflict, "飞书通道未连接，无法主动推送", nil)
 	}
 
+	body := larkim.NewCreateMessageReqBodyBuilder().
+		ReceiveId(openID).
+		MsgType(larkim.MsgTypeInteractive).
+		Content(cardJSON)
+	if messageUUID != "" {
+		body.Uuid(messageUUID)
+	}
+
 	resp, err := client.Im.Message.Create(ctx, larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(larkim.CreateMessageV1ReceiveIDTypeOpenId).
-		Body(larkim.NewCreateMessageReqBodyBuilder().
-			ReceiveId(openID).
-			MsgType(larkim.MsgTypeInteractive).
-			Content(cardJSON).
-			Build()).
+		Body(body.Build()).
 		Build())
 	if err != nil {
 		// 传输层失败（网络/超时）默认可重试，沿用 CodePushFailed 的默认 Retryable。
@@ -71,8 +114,10 @@ func (m *Manager) OwnerOpenID() string {
 
 // permanentRejection 报告一个飞书拒收 code 是否为确定性失败（重试必然同样失败）。
 // 清单只收实锤过语义的码，按需扩充：
-//   200673 卡片结构非法（2026-07-17 生产实锤：form 缺 name 整卡被拒）；
-//   230002 收件人 open_id 非法（收件人错重试不会变对）。
+//
+//	200673 卡片结构非法（2026-07-17 生产实锤：form 缺 name 整卡被拒）；
+//	230002 收件人 open_id 非法（收件人错重试不会变对）。
+//
 // 其余（限流/内部错误/未知码）按可重试处理——瞬态居多，宁可多试。
 func permanentRejection(code int) bool {
 	switch code {
