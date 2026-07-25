@@ -8,7 +8,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -432,6 +434,237 @@ func TestManagerReloadDisabledRevokesOutboundClient(t *testing.T) {
 	m.mu.Unlock()
 	if client != nil || appID != "" {
 		t.Fatalf("disabled reconfigure retained outbound authority: client=%v app_id=%q", client != nil, appID)
+	}
+}
+
+type managerRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f managerRoundTripFunc) RoundTrip(
+	request *http.Request,
+) (*http.Response, error) {
+	return f(request)
+}
+
+func TestPrepareOutboundIsIngressFreeAndConsumedOnceByStart(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("DATABASE_URL 未设置，跳过飞书 outbound-only 真库测试")
+	}
+	ctx := t.Context()
+	if err := store.Migrate(ctx, dbURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.New(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, st)
+	old, oldErr := st.GetSetting(ctx, settingKeyFeishu)
+	if oldErr != nil && !errors.Is(oldErr, types.ErrNotFound) {
+		t.Fatal(oldErr)
+	}
+	oldOwner, oldOwnerErr := st.GetSetting(ctx, settingKeyOwner)
+	if oldOwnerErr != nil && !errors.Is(oldOwnerErr, types.ErrNotFound) {
+		t.Fatal(oldOwnerErr)
+	}
+	cleanupExec(ctx, t, dbURL,
+		`DELETE FROM settings WHERE key=$1`, settingKeyOwner)
+	cleanupCtx, cancelCleanup := cleanupContext()
+	t.Cleanup(cancelCleanup)
+	t.Cleanup(func() {
+		if oldErr == nil {
+			cleanupExec(cleanupCtx, t, dbURL, `
+				INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now())
+				ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,
+					updated_at=now()`,
+				settingKeyFeishu, old)
+			return
+		}
+		cleanupExec(cleanupCtx, t, dbURL,
+			`DELETE FROM settings WHERE key=$1`, settingKeyFeishu)
+	})
+	t.Cleanup(func() {
+		if oldOwnerErr == nil {
+			cleanupExec(cleanupCtx, t, dbURL, `
+				INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now())
+				ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value,
+					updated_at=now()`,
+				settingKeyOwner, oldOwner)
+			return
+		}
+		cleanupExec(cleanupCtx, t, dbURL,
+			`DELETE FROM settings WHERE key=$1`, settingKeyOwner)
+	})
+	raw, err := json.Marshal(feishuSetting{
+		AppID: "prepared-app", AppSecret: "prepared-secret", Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutSetting(ctx, settingKeyFeishu, raw); err != nil {
+		t.Fatal(err)
+	}
+	oldVerifyClient := verifyHTTPClient
+	verifyHTTPClient = &http.Client{
+		Transport: managerRoundTripFunc(func(
+			request *http.Request,
+		) (*http.Response, error) {
+			body := `{"code":0,"tenant_access_token":"test-token"}`
+			if request.URL.String() == botInfoURL {
+				body = `{"code":0,"bot":{"activate_status":2,"app_name":"test-bot"}}`
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    request,
+			}, nil
+		}),
+	}
+	workingVerifyClient := verifyHTTPClient
+	t.Cleanup(func() { verifyHTTPClient = oldVerifyClient })
+
+	m := NewManager(st, nil, nil)
+	if err := m.PrepareOutbound(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	preparedClient := m.apiClient
+	preparedGeneration := m.startupOutbound
+	wsCancel := m.wsCancel
+	connected := m.connected
+	baseCtx := m.baseCtx
+	m.mu.Unlock()
+	if preparedClient == nil || preparedGeneration == nil ||
+		wsCancel != nil || connected || baseCtx != nil {
+		t.Fatalf(
+			"PrepareOutbound admitted ingress: client=%v generation=%v ws=%v connected=%v base=%v",
+			preparedClient != nil, preparedGeneration != nil,
+			wsCancel != nil, connected, baseCtx != nil,
+		)
+	}
+
+	startCtx, cancelStart := context.WithCancel(ctx)
+	cancelStart()
+	m.Start(startCtx)
+	m.mu.Lock()
+	gotClient := m.apiClient
+	generationAfterStart := m.startupOutbound
+	m.mu.Unlock()
+	if gotClient != preparedClient || generationAfterStart != nil {
+		t.Fatal("Start cleared outbound authority or did not consume generation")
+	}
+	if err := m.PrepareOutbound(ctx); err == nil {
+		t.Fatal("PrepareOutbound mutated an already-started Manager")
+	}
+	m.mu.Lock()
+	clientAfterLatePrepare := m.apiClient
+	m.mu.Unlock()
+	if clientAfterLatePrepare != preparedClient {
+		t.Fatal("late PrepareOutbound replaced live outbound client")
+	}
+	if m.startPreparedWebSocket(startCtx) {
+		t.Fatal("prepared generation was consumed more than once")
+	}
+	m.cancelWebSocket()
+
+	stopped := NewManager(st, nil, nil)
+	if err := stopped.PrepareOutbound(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := stopped.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stopped.Start(ctx)
+	stopped.mu.Lock()
+	stoppedWS := stopped.wsCancel
+	stoppedConnected := stopped.connected
+	stoppedGeneration := stopped.startupOutbound
+	stopped.mu.Unlock()
+	if stoppedWS != nil || stoppedConnected || stoppedGeneration != nil {
+		t.Fatal("post-Shutdown Start resurrected prepared Feishu ingress")
+	}
+	if err := stopped.PrepareOutbound(ctx); err == nil {
+		t.Fatal("post-Shutdown PrepareOutbound installed new authority")
+	}
+
+	verifyEntered := make(chan struct{})
+	releaseVerify := make(chan struct{})
+	verifyHTTPClient = &http.Client{
+		Transport: managerRoundTripFunc(func(
+			request *http.Request,
+		) (*http.Response, error) {
+			body := `{"code":0,"tenant_access_token":"test-token"}`
+			if request.URL.String() == botInfoURL {
+				close(verifyEntered)
+				<-releaseVerify
+				body = `{"code":0,"bot":{"activate_status":2,"app_name":"test-bot"}}`
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    request,
+			}, nil
+		}),
+	}
+	racing := NewManager(st, nil, nil)
+	prepareDone := make(chan error, 1)
+	go func() { prepareDone <- racing.PrepareOutbound(ctx) }()
+	<-verifyEntered
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- racing.Shutdown(ctx) }()
+	deadline := time.Now().Add(time.Second)
+	for !racing.asyncClosed.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !racing.asyncClosed.Load() {
+		t.Fatal("Shutdown did not close outbound admission")
+	}
+	close(releaseVerify)
+	if err := <-prepareDone; err == nil {
+		t.Fatal("in-flight PrepareOutbound crossed Shutdown boundary")
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+	racing.mu.Lock()
+	racingClient := racing.apiClient
+	racingGeneration := racing.startupOutbound
+	racing.mu.Unlock()
+	if racingClient != nil || racingGeneration != nil {
+		t.Fatal("late PrepareOutbound resurrected authority after Shutdown")
+	}
+	verifyHTTPClient = workingVerifyClient
+
+	unconsumed := NewManager(st, nil, nil)
+	if err := unconsumed.PrepareOutbound(ctx); err != nil {
+		t.Fatal(err)
+	}
+	unconsumed.mu.Lock()
+	unconsumedBeforeDisable := unconsumed.startupOutbound
+	unconsumed.mu.Unlock()
+	if unconsumedBeforeDisable == nil {
+		t.Fatal("successful re-prepare did not install a generation")
+	}
+	disabled, err := json.Marshal(feishuSetting{
+		AppID: "prepared-app", AppSecret: "prepared-secret", Enabled: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutSetting(ctx, settingKeyFeishu, disabled); err != nil {
+		t.Fatal(err)
+	}
+	if err := unconsumed.PrepareOutbound(ctx); err == nil {
+		t.Fatal("disabled outbound setting was accepted")
+	}
+	unconsumed.mu.Lock()
+	clientAfterDisable := unconsumed.apiClient
+	generationAfterDisable := unconsumed.startupOutbound
+	unconsumed.mu.Unlock()
+	if clientAfterDisable != nil || generationAfterDisable != nil {
+		t.Fatal("failed outbound preparation retained prior authority")
 	}
 }
 

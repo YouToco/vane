@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
@@ -124,6 +125,7 @@ type Manager struct {
 	// 新准入并等待，只有调用方给的停机宽限耗尽才取消 asyncCtx 强制收敛。
 	asyncMu        sync.Mutex
 	asyncAccepting bool
+	asyncClosed    atomic.Bool
 	asyncCtx       context.Context
 	asyncCancel    context.CancelFunc
 	asyncWG        sync.WaitGroup
@@ -153,18 +155,22 @@ type Manager struct {
 	wsCancel context.CancelFunc // 取消当前 WS 连接；nil 表示当前无连接
 	// gen 是连接代数：每次 reload 递增。旧连接的 WS goroutine 回写错误
 	// 状态前先比对代数，避免"旧连接的尸体"覆盖新连接的健康状态。
-	gen         int64
-	apiClient   *lark.Client // 发消息用的 API 客户端，与 WS 客户端分离
-	apiAppID    string       // 与 apiClient 同代；A6 用其防止跨 App 修改旧卡
-	configured  bool
-	connected   bool
-	botName     string
-	ownerOpenID string
-	ownerName   string
-	ownerAppID  string
-	ownerChatID string
-	lastError   string
-	connectedAt *time.Time
+	gen       int64
+	apiClient *lark.Client // 发消息用的 API 客户端，与 WS 客户端分离
+	apiAppID  string       // 与 apiClient 同代；A6 用其防止跨 App 修改旧卡
+	// startupOutbound exists only between the synchronous outbound-only Gate
+	// and Start. It prevents Start from clearing that freshly verified client
+	// while Temporal ingress is already live, and is consumed exactly once.
+	startupOutbound *feishuSetting
+	configured      bool
+	connected       bool
+	botName         string
+	ownerOpenID     string
+	ownerName       string
+	ownerAppID      string
+	ownerChatID     string
+	lastError       string
+	connectedAt     *time.Time
 }
 
 // NewManager 构造 Manager。llm 客户端与记账器由 main 注入，
@@ -241,9 +247,13 @@ func (m *Manager) beginCallback() (finish func(), ok bool) {
 // A6 的跨进程耐久送达由独立 receipt dispatcher 承担；它在 Manager ingress
 // 排空后仍复用这里保留的同代 API 客户端，直到 dispatcher 自己完成停机。
 func (m *Manager) Shutdown(ctx context.Context) error {
+	m.asyncClosed.Store(true)
 	m.asyncMu.Lock()
 	m.asyncAccepting = false
 	m.asyncMu.Unlock()
+	m.mu.Lock()
+	m.startupOutbound = nil
+	m.mu.Unlock()
 
 	// 先取消连接，让消息/菜单工作收到取消；确认/反馈使用 detachParent，仍可在
 	// 调用方给出的停机宽限内完成并发送结果。
@@ -347,6 +357,21 @@ func (m *Manager) Start(ctx context.Context) {
 	m.baseCtx = ctx
 	m.mu.Unlock()
 
+	// Prepared startup bypasses startAsync's goroutine, so take the same
+	// admission lock explicitly. Shutdown cannot close admission between this
+	// decision and WS installation, and a post-Shutdown Start cannot resurrect
+	// the connection.
+	m.asyncMu.Lock()
+	if !m.asyncAccepting {
+		m.asyncMu.Unlock()
+		slog.Warn("feishu: Manager 正在关闭，跳过启动重载")
+		return
+	}
+	preparedStarted := m.startPreparedWebSocket(ctx)
+	m.asyncMu.Unlock()
+	if preparedStarted {
+		return
+	}
 	if !m.startAsync(ctx, 30*time.Second, false, "startup_reload", func(ctx context.Context) {
 		if err := m.reload(ctx); err != nil {
 			slog.Error("feishu: 启动时连接失败（可在 Dashboard 重新配置）", "err", err)
@@ -354,6 +379,168 @@ func (m *Manager) Start(ctx context.Context) {
 	}) {
 		slog.Warn("feishu: Manager 正在关闭，跳过启动重载")
 	}
+}
+
+// PrepareOutbound synchronously prepares only the provider API client used by
+// durable send/reconciliation. It does not create a WebSocket client, admit a
+// callback, or start a goroutine. The server uses this as a startup barrier
+// before the first push-effect recovery pass; ordinary default-off startup
+// continues to use Start directly.
+func (m *Manager) PrepareOutbound(ctx context.Context) error {
+	if m == nil || m.st == nil {
+		return types.NewAppError(
+			types.CodeInternal, "飞书发送端未就绪", nil)
+	}
+	finish, accepted := m.beginCallback()
+	if !accepted {
+		return types.NewAppError(
+			types.CodeConflict, "服务正在重启，请稍后重试", types.ErrConflict)
+	}
+	defer finish()
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	m.mu.Lock()
+	started := m.baseCtx != nil || m.wsCancel != nil || m.connected
+	m.mu.Unlock()
+	if started {
+		return types.NewAppError(
+			types.CodeConflict,
+			"飞书发送端仅允许在服务入口启动前预热",
+			types.ErrConflict,
+		)
+	}
+
+	// This is an outbound permission boundary just like Reconfigure: never
+	// retain an earlier client while current durable settings are evaluated.
+	m.mu.Lock()
+	m.apiClient = nil
+	m.apiAppID = ""
+	m.startupOutbound = nil
+	m.configured = false
+	m.connected = false
+	m.connectedAt = nil
+	m.lastError = ""
+	m.mu.Unlock()
+
+	raw, err := m.st.GetSetting(ctx, settingKeyFeishu)
+	if errors.Is(err, types.ErrNotFound) {
+		return types.NewAppError(
+			types.CodeConflict, "飞书发送端尚未配置", nil)
+	}
+	if err != nil {
+		return types.NewAppError(
+			types.CodeInternal, "读取飞书发送端配置失败", nil)
+	}
+	var cfg feishuSetting
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return types.NewAppError(
+			types.CodeInternal, "飞书发送端配置无效", nil)
+	}
+	configured := cfg.AppID != "" && cfg.AppSecret != ""
+	m.mu.Lock()
+	m.configured = configured
+	m.mu.Unlock()
+	if !configured || !cfg.Enabled {
+		return types.NewAppError(
+			types.CodeConflict, "飞书发送端未启用", nil)
+	}
+
+	vr := verifyCredentials(ctx, cfg.AppID, cfg.AppSecret)
+	if !vr.CredentialsOK {
+		m.setError(vr.Detail)
+		return types.NewAppError(
+			types.CodeValidation, "飞书发送端凭证校验失败", nil)
+	}
+	m.loadOwner(ctx)
+	if m.asyncClosed.Load() {
+		return types.NewAppError(
+			types.CodeConflict, "服务正在重启，请稍后重试", types.ErrConflict)
+	}
+	m.mu.Lock()
+	m.apiClient = lark.NewClient(cfg.AppID, cfg.AppSecret)
+	m.apiAppID = cfg.AppID
+	m.botName = vr.BotName
+	prepared := cfg
+	m.startupOutbound = &prepared
+	m.mu.Unlock()
+	if m.asyncClosed.Load() {
+		m.mu.Lock()
+		m.apiClient = nil
+		m.apiAppID = ""
+		m.startupOutbound = nil
+		m.mu.Unlock()
+		return types.NewAppError(
+			types.CodeConflict, "服务正在重启，请稍后重试", types.ErrConflict)
+	}
+	if err := m.backfillOwnerChatID(ctx); err != nil &&
+		!errors.Is(err, types.ErrNotFound) {
+		// Chat backfill is supplementary for old installations. Exact recovery
+		// uses the frozen chat checkpoint and does not depend on this cache.
+		slog.WarnContext(ctx, "feishu: outbound-only owner chat backfill skipped",
+			"error_code", types.CodeOf(err))
+	}
+	return nil
+}
+
+// startPreparedWebSocket consumes the credential generation synchronously
+// prepared by PrepareOutbound. It never clears the ready API client, so the
+// worker admitted immediately before Manager.Start cannot observe a false
+// outbound-not-ready gap.
+func (m *Manager) startPreparedWebSocket(ctx context.Context) bool {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	m.mu.Lock()
+	prepared := m.startupOutbound
+	m.startupOutbound = nil
+	if prepared == nil || m.apiClient == nil ||
+		m.apiAppID != prepared.AppID {
+		m.mu.Unlock()
+		return false
+	}
+	if m.wsCancel != nil {
+		m.wsCancel()
+		m.wsCancel = nil
+	}
+	m.gen++
+	gen := m.gen
+	wsCtx, cancel := context.WithCancel(ctx)
+	m.wsCancel = cancel
+	m.mu.Unlock()
+
+	wsCli := m.newWebSocketClient(wsCtx, *prepared)
+	now := time.Now()
+	m.mu.Lock()
+	m.connected = true
+	m.connectedAt = &now
+	m.mu.Unlock()
+	go func() {
+		err := wsCli.Start(wsCtx)
+		if err == nil {
+			return
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.gen != gen {
+			return
+		}
+		m.recordWSFailureLocked(slog.Default(), err)
+	}()
+	return true
+}
+
+func (m *Manager) newWebSocketClient(
+	ctx context.Context,
+	cfg feishuSetting,
+) *larkws.Client {
+	h := newHandlerForApp(m, ctx, cfg.AppID)
+	return larkws.NewClient(cfg.AppID, cfg.AppSecret,
+		larkws.WithEventHandler(h.eventDispatcher()),
+		// The SDK may include the complete WebSocket URL not only in INFO
+		// connection logs, but also in malformed-URL errors. Discard all
+		// SDK-supplied values before they can reach journald.
+		larkws.WithLogger(newFeishuSDKLogger()),
+		larkws.WithLogLevel(larkcore.LogLevelError),
+	)
 }
 
 // Reconfigure 在 API 层保存新配置后调用：断开旧连接 → 重读 settings → 重连。
@@ -451,6 +638,7 @@ func (m *Manager) reload(ctx context.Context) error {
 	// background senders continue using credentials the user just revoked.
 	m.apiClient = nil
 	m.apiAppID = ""
+	m.startupOutbound = nil
 	base := m.baseCtx
 	m.mu.Unlock()
 	if base == nil {
@@ -499,15 +687,7 @@ func (m *Manager) reload(ctx context.Context) error {
 	// 用户回控制台保存"长连接"订阅方式并发布版本后自然就绪。
 
 	wsCtx, cancel := context.WithCancel(base)
-	h := newHandlerForApp(m, wsCtx, cfg.AppID)
-	wsCli := larkws.NewClient(cfg.AppID, cfg.AppSecret,
-		larkws.WithEventHandler(h.eventDispatcher()),
-		// The SDK may include the complete WebSocket URL not only in INFO
-		// connection logs, but also in malformed-URL errors. The custom logger
-		// discards every SDK-supplied value before it reaches journald.
-		larkws.WithLogger(newFeishuSDKLogger()),
-		larkws.WithLogLevel(larkcore.LogLevelError),
-	)
+	wsCli := m.newWebSocketClient(wsCtx, cfg)
 
 	now := time.Now()
 	m.mu.Lock()

@@ -83,6 +83,8 @@ func mutated(s interface{ ClaimPushEffectReconciliation(); RecordPushEffectSent(
 func pushEffectRecoverySelectorViolation(method, path string) bool {
 	coordinator := strings.HasSuffix(
 		filepath.ToSlash(path), "/pushrecovery/coordinator.go")
+	runner := strings.HasSuffix(
+		filepath.ToSlash(path), "/pushrecovery/runner.go")
 	switch method {
 	case "TakeOverStalePushEffect",
 		"ClaimAuthorizedPushEffect",
@@ -91,8 +93,11 @@ func pushEffectRecoverySelectorViolation(method, path string) bool {
 		"BlockConflictingPushEffectHistory",
 		"BlockExhaustedPushEffectAttempts":
 		return !coordinator
-	case "ListRecoverablePushEffectTenantIDs",
-		"ListRecoverablePushEffects",
+	case "ReadPushEffectRecoveryCutoff",
+		"ListRecoverablePushEffectTenantIDs",
+		"ListRecoverablePushEffects":
+		return !runner
+	case
 		"ClaimPushEffectReconciliation",
 		"RecordPushEffectSent",
 		"BlockPushEffect":

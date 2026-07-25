@@ -33,6 +33,7 @@ import (
 	"github.com/YouToco/vane/profilehint"
 	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/pusher"
+	"github.com/YouToco/vane/pushrecovery"
 	"github.com/YouToco/vane/runtimeconfig"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/scheduler"
@@ -290,6 +291,55 @@ func run() error {
 		st.Close()
 		return fmt.Errorf("scheduler: 存量调度 Action reconcile 安全 Gate: %w", err)
 	}
+
+	// Push-effect recovery has a separate exact-task switch from fresh sends.
+	// When enabled, prepare outbound API authority without opening Feishu WS,
+	// then finish a complete recovery pass before any external ingress.
+	var pushRecoveryRunner *pushrecovery.Runner
+	if cfg.Pipeline.PushEffectRecoveryCanaryScheduleID != "" {
+		outboundCtx, cancelOutbound := context.WithTimeout(ctx, 30*time.Second)
+		outboundErr := manager.PrepareOutbound(outboundCtx)
+		cancelOutbound()
+		if outboundErr != nil {
+			temporalClient.Close()
+			st.Close()
+			return fmt.Errorf("push effect recovery 飞书发送端 Gate: %w",
+				outboundErr)
+		}
+		pushRecoveryCoordinator, err := pushrecovery.New(
+			pushrecovery.Deps{
+				Store: st, Sender: push, HistoryResolver: manager,
+				Config: pushrecovery.Config{
+					ExactTaskID: cfg.Pipeline.PushEffectRecoveryCanaryScheduleID,
+				},
+			},
+		)
+		if err != nil {
+			temporalClient.Close()
+			st.Close()
+			return fmt.Errorf("装配 push effect recovery coordinator: %w",
+				err)
+		}
+		pushRecoveryRunner, err = pushrecovery.NewRunner(
+			pushrecovery.RunnerDeps{
+				Store: st, Coordinator: pushRecoveryCoordinator,
+				Config: pushrecovery.RunnerConfig{
+					ExactTaskID: cfg.Pipeline.PushEffectRecoveryCanaryScheduleID,
+				},
+				Logger: slog.Default(),
+			},
+		)
+		if err != nil {
+			temporalClient.Close()
+			st.Close()
+			return fmt.Errorf("装配 push effect recovery lifecycle: %w", err)
+		}
+		if err := pushRecoveryRunner.RunStartup(ctx); err != nil {
+			temporalClient.Close()
+			st.Close()
+			return fmt.Errorf("push effect recovery 首轮恢复 Gate: %w", err)
+		}
+	}
 	var maintenanceWG sync.WaitGroup
 	runMaintenance := func(fn func()) {
 		maintenanceWG.Add(1)
@@ -470,6 +520,26 @@ func run() error {
 		}
 	}
 
+	pushRecoveryCtx, cancelPushRecovery := context.WithCancel(ctx)
+	pushRecoveryDone := make(chan struct{})
+	if pushRecoveryRunner == nil {
+		close(pushRecoveryDone)
+	} else {
+		go func() {
+			defer close(pushRecoveryDone)
+			pushRecoveryRunner.Run(pushRecoveryCtx)
+		}()
+	}
+	stopPushRecovery := func() error {
+		cancelPushRecovery()
+		select {
+		case <-pushRecoveryDone:
+			return nil
+		case <-time.After(30 * time.Second):
+			return errors.New("push effect recovery 关停超时")
+		}
+	}
+
 	// A5 创建恢复器在飞书 WS/HTTP 接收新确认之前启动。首次扫描与周期扫描都
 	// 在后台执行，不阻塞 readyz；关停时必须先等它退出，再释放 Temporal/DB。
 	creationRecoveryCtx, cancelCreationRecovery := context.WithCancel(ctx)
@@ -534,6 +604,7 @@ func run() error {
 		stop()
 		recoveryErr := stopCreationRecovery()
 		definitionEditRecoveryErr := stopDefinitionEditRecovery()
+		pushRecoveryErr := stopPushRecovery()
 		creationReceiptErr := stopReceiptDispatch()
 		definitionEditReceiptErr :=
 			stopDefinitionEditReceiptDispatch()
@@ -544,6 +615,7 @@ func run() error {
 		cancelMaintenance()
 		drainErr := errors.Join(
 			recoveryErr, definitionEditRecoveryErr,
+			pushRecoveryErr,
 			creationReceiptErr, definitionEditReceiptErr,
 			maintenanceErr,
 		)
@@ -668,6 +740,7 @@ func run() error {
 			drainErr := drainIngress()
 			recoveryErr := stopCreationRecovery()
 			definitionEditRecoveryErr := stopDefinitionEditRecovery()
+			pushRecoveryErr := stopPushRecovery()
 			receiptErr := stopReceiptDispatch()
 			definitionEditReceiptErr :=
 				stopDefinitionEditReceiptDispatch()
@@ -675,13 +748,15 @@ func run() error {
 			maintenanceCtx, cancelMaintenance := context.WithTimeout(context.Background(), 30*time.Second)
 			maintenanceErr := waitMaintenance(maintenanceCtx)
 			cancelMaintenance()
-			if drainErr != nil || recoveryErr != nil || definitionEditRecoveryErr != nil ||
+			if drainErr != nil || recoveryErr != nil ||
+				definitionEditRecoveryErr != nil || pushRecoveryErr != nil ||
 				receiptErr != nil || definitionEditReceiptErr != nil ||
 				sessionErr != nil || maintenanceErr != nil {
 				// An admitted callback may still own DB/Temporal work. Do not close
 				// those resources underneath it; returning exits the process.
 				return errors.Join(fmt.Errorf("挂载 A2A server: %w", err),
-					drainErr, recoveryErr, definitionEditRecoveryErr, receiptErr,
+					drainErr, recoveryErr, definitionEditRecoveryErr,
+					pushRecoveryErr, receiptErr,
 					definitionEditReceiptErr, sessionErr, maintenanceErr)
 			}
 			w.Stop()
@@ -774,6 +849,10 @@ func run() error {
 	// 或在执行 Temporal exact-CAS；必须在关闭两个依赖前得到它的退出证明。
 	if err := stopDefinitionEditRecovery(); err != nil {
 		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空任务定义编辑恢复器: %w", err))
+	}
+	if err := stopPushRecovery(); err != nil {
+		shutdownErrs = append(
+			shutdownErrs, fmt.Errorf("排空 push effect recovery: %w", err))
 	}
 	// No producer remains after callback plus both durable-operation recovery
 	// loops drain. Stop both outbox consumers, wait for their fenced

@@ -143,6 +143,9 @@ type PipelineConfig struct {
 	// PushEffectCanaryScheduleID enables durable external push effects for
 	// exactly one compiled task. Empty is fully dark; broad rollout has no key.
 	PushEffectCanaryScheduleID string `mapstructure:"push_effect_canary_schedule_id"`
+	// PushEffectRecoveryCanaryScheduleID enables recovery for one compiled
+	// task. It is independent of the fresh-send canary for separate rollback.
+	PushEffectRecoveryCanaryScheduleID string `mapstructure:"push_effect_recovery_canary_schedule_id"`
 }
 
 // AgentConfig 是 agent loop 运行约束配置。
@@ -314,6 +317,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.observation_shadow_canary_schedule_id", "")
 	v.SetDefault("pipeline.observation_authority_canary_schedule_id", "")
 	v.SetDefault("pipeline.push_effect_canary_schedule_id", "")
+	v.SetDefault("pipeline.push_effect_recovery_canary_schedule_id", "")
 
 	v.SetDefault("agent.max_turns", 20)
 	v.SetDefault("agent.definition_edit_enabled", false)
@@ -431,6 +435,29 @@ func (c *Config) Validate() error {
 		return errors.New("config: push effect canary 必须位于 compiled runtime rollout")
 	}
 	c.Pipeline.PushEffectCanaryScheduleID = pushEffectCanaryID
+	rawPushRecoveryCanaryID :=
+		c.Pipeline.PushEffectRecoveryCanaryScheduleID
+	pushRecoveryCanaryID := strings.TrimSpace(rawPushRecoveryCanaryID)
+	if rawPushRecoveryCanaryID != "" && pushRecoveryCanaryID == "" {
+		return errors.New(
+			"config: pipeline.push_effect_recovery_canary_schedule_id 不能仅含空白")
+	}
+	if pushRecoveryCanaryID != "" &&
+		!validSnapshotShadowCanaryID(pushRecoveryCanaryID) {
+		return errors.New(
+			"config: pipeline.push_effect_recovery_canary_schedule_id 无效")
+	}
+	if pushRecoveryCanaryID != "" && !c.Pipeline.CompiledRuntimeEnabled {
+		return errors.New(
+			"config: push effect recovery canary 要求 compiled runtime 已启用")
+	}
+	if pushRecoveryCanaryID != "" &&
+		!c.Pipeline.CompiledRuntimeAllowAll &&
+		compiledCanaryID != pushRecoveryCanaryID {
+		return errors.New(
+			"config: push effect recovery canary 必须位于 compiled runtime rollout")
+	}
+	c.Pipeline.PushEffectRecoveryCanaryScheduleID = pushRecoveryCanaryID
 
 	rawObservationShadow := c.Pipeline.ObservationShadowCanaryScheduleID
 	observationShadow := strings.TrimSpace(rawObservationShadow)

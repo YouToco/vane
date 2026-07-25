@@ -138,6 +138,94 @@ func newPushEffectFixtureAt(t *testing.T, version int64) pushEffectFixture {
 	return f
 }
 
+func addPushEffectFixtureEffect(
+	t *testing.T,
+	f pushEffectFixture,
+	prepared pusheffect.Prepared,
+) pusheffect.Prepared {
+	t.Helper()
+	ctx := t.Context()
+	var batchID, deliveryID int64
+	if err := f.db.QueryRowContext(ctx, `
+		INSERT INTO push_batches (
+			tenant_id,user_id,status,idempotency_key,run_snapshot_id
+		) VALUES ($1,$2,'pending',$3,$4) RETURNING id`,
+		prepared.TenantID, prepared.UserID,
+		"batch-"+uuid.NewString(), prepared.RunSnapshotID,
+	).Scan(&batchID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.QueryRowContext(ctx, `
+		INSERT INTO deliveries (
+			tenant_id,batch_id,user_id,score,card_json,status
+		) VALUES ($1,$2,$3,80,'{}'::jsonb,'pending') RETURNING id`,
+		prepared.TenantID, batchID, prepared.UserID,
+	).Scan(&deliveryID); err != nil {
+		t.Fatal(err)
+	}
+	prepared.BatchID = batchID
+	prepared.DeliveryIDs = []int64{deliveryID}
+	prepared.ObservationEventKeys = nil
+	prepared.StepID = "push-" + uuid.NewString()
+	prepared.ProviderUUID = uuid.NewString()
+	if prepared.ID == "" {
+		prepared.ID = "effect-" + uuid.NewString()
+	}
+	winner, err := f.store.ClaimPushBatchDeliveryAuthority(
+		ctx,
+		types.PushBatchScope{
+			TenantID: prepared.TenantID,
+			UserID:   prepared.UserID,
+			BatchID:  batchID,
+		},
+		types.PushBatchDeliveryAuthorityEffect,
+	)
+	if err != nil || winner != types.PushBatchDeliveryAuthorityEffect {
+		t.Fatalf("claim fixture batch authority=%q/%v", winner, err)
+	}
+	if _, err := f.store.CreatePushEffect(ctx, prepared); err != nil {
+		t.Fatal(err)
+	}
+	return prepared
+}
+
+func addPushEffectFixtureTask(
+	t *testing.T,
+	f pushEffectFixture,
+) (string, int64, string) {
+	t.Helper()
+	ctx := t.Context()
+	taskID := "push-effect-sibling-" + uuid.NewString()
+	runID := uuid.NewString()
+	digest := strings.Repeat("b", 64)
+	if _, err := f.db.ExecContext(ctx, `
+		INSERT INTO schedules (
+			id,tenant_id,user_id,nl_description,spec_json,scope_json,
+			status,execution_mode
+		) VALUES ($1,1,$2,'sibling','{}'::jsonb,'{}'::jsonb,
+			'active','compiled')`,
+		taskID, f.prepared.UserID); err != nil {
+		t.Fatal(err)
+	}
+	var snapshotID int64
+	if err := f.db.QueryRowContext(ctx, `
+		INSERT INTO task_run_snapshots (
+			tenant_id,user_id,task_id,temporal_workflow_id,temporal_run_id,
+			run_kind,execution_mode,adaptive_version,
+			capability_catalog_digest,tool_policy_digest,prompt_policy_digest,
+			model_policy_digest,quota_policy_digest,definition_digest,plan_digest,
+			payload_digest,reference_digest,reference_schema_version,payload,budget
+		) VALUES (
+			1,$1,$2,$3,$4,'scheduled','compiled',0,
+			$5,$5,$5,$5,$5,$5,$5,$5,$5,'fixture/v1','{}','{}'::jsonb
+		) RETURNING id`,
+		f.prepared.UserID, taskID, "workflow-"+runID, runID, digest,
+	).Scan(&snapshotID); err != nil {
+		t.Fatal(err)
+	}
+	return taskID, snapshotID, runID
+}
+
 func TestMigration039RefusesDurablePushEffectDowngrade(t *testing.T) {
 	f := newPushEffectFixtureBeforeAuthority(t)
 	insertRawPushEffectV39(t, f)
@@ -281,12 +369,13 @@ func TestPushEffectCreateClaimFailureAndReceiptConverge(t *testing.T) {
 		t.Fatal(err)
 	}
 	tenantIDs, err := f.store.ListRecoverablePushEffectTenantIDs(
-		ctx, time.Now().Add(time.Minute), 0, 10)
+		ctx, f.prepared.TaskID, time.Now().Add(time.Minute), 0, 10)
 	if err != nil || len(tenantIDs) != 1 || tenantIDs[0] != f.prepared.TenantID {
 		t.Fatalf("recoverable tenant shards=%v err=%v", tenantIDs, err)
 	}
 	recoverable, err := f.store.ListRecoverablePushEffects(
-		ctx, f.prepared.TenantID, time.Now().Add(time.Minute), 10)
+		ctx, f.prepared.TaskID, f.prepared.TenantID,
+		time.Now().Add(time.Minute), "", 10)
 	if err != nil || len(recoverable) != 1 ||
 		recoverable[0].ID != f.prepared.ID ||
 		recoverable[0].Status != pusheffect.StatusPrepared {
@@ -384,6 +473,215 @@ func TestPushEffectCreateClaimFailureAndReceiptConverge(t *testing.T) {
 	if err != nil || final.Status != pusheffect.StatusSent ||
 		final.ProviderMessageID != "om_message" {
 		t.Fatalf("final=%+v err=%v", final, err)
+	}
+}
+
+func TestRecoverablePushEffectDiscoveryUsesDBClockTaskAndKeyset(
+	t *testing.T,
+) {
+	f := newPushEffectFixture(t)
+	ctx := t.Context()
+	base := f.prepared
+	base.ObservationEventKeys = nil
+	base.DeliveryIDs = nil
+
+	preparedDue := base
+	preparedDue.ID = "effect-a-" + uuid.NewString()
+	preparedDue = addPushEffectFixtureEffect(t, f, preparedDue)
+	definiteDue := base
+	definiteDue.ID = "effect-b-" + uuid.NewString()
+	definiteDue = addPushEffectFixtureEffect(t, f, definiteDue)
+	staleSending := base
+	staleSending.ID = "effect-c-" + uuid.NewString()
+	staleSending = addPushEffectFixtureEffect(t, f, staleSending)
+	ambiguousDue := base
+	ambiguousDue.ID = "effect-d-" + uuid.NewString()
+	ambiguousDue = addPushEffectFixtureEffect(t, f, ambiguousDue)
+	futurePrepared := base
+	futurePrepared.ID = "effect-e-" + uuid.NewString()
+	futurePrepared = addPushEffectFixtureEffect(t, f, futurePrepared)
+	currentSending := base
+	currentSending.ID = "effect-f-" + uuid.NewString()
+	currentSending = addPushEffectFixtureEffect(t, f, currentSending)
+	blocked := base
+	blocked.ID = "effect-g-" + uuid.NewString()
+	blocked = addPushEffectFixtureEffect(t, f, blocked)
+
+	siblingTaskID, siblingSnapshotID, siblingRunID :=
+		addPushEffectFixtureTask(t, f)
+	sibling := base
+	sibling.ID = "effect-h-" + uuid.NewString()
+	sibling.TaskID = siblingTaskID
+	sibling.RunSnapshotID = siblingSnapshotID
+	sibling.RunID = siblingRunID
+	sibling = addPushEffectFixtureEffect(t, f, sibling)
+
+	cutoff, err := f.store.ReadPushEffectRecoveryCutoff(ctx)
+	if err != nil || cutoff.IsZero() {
+		t.Fatalf("database cutoff=%v/%v", cutoff, err)
+	}
+	behindHost := cutoff.Add(-time.Second)
+	dueAt := cutoff.Add(-500 * time.Millisecond)
+	if _, err := f.db.ExecContext(ctx, `
+		UPDATE push_effects
+		   SET next_attempt_at=$2
+		 WHERE id=$1`,
+		preparedDue.ID, dueAt); err != nil {
+		t.Fatal(err)
+	}
+
+	definiteLease, err := f.store.ClaimPushEffect(ctx,
+		pusheffect.ClaimParams{
+			Scope: definiteDue.Scope(), LeaseOwner: "definite-worker",
+			LeaseDuration: time.Minute,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.RecordPushEffectDefiniteFailure(ctx,
+		pusheffect.FailureParams{
+			Lease: pusheffect.Lease{
+				Scope:      definiteDue.Scope(),
+				LeaseOwner: definiteLease.LeaseOwner,
+				Fence:      definiteLease.Fence,
+			},
+			Class:      "provider_definite_rejection",
+			RetryAfter: time.Microsecond,
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ExecContext(ctx,
+		`UPDATE push_effects SET next_attempt_at=$2 WHERE id=$1`,
+		definiteDue.ID, dueAt); err != nil {
+		t.Fatal(err)
+	}
+
+	staleLease, err := f.store.ClaimPushEffect(ctx,
+		pusheffect.ClaimParams{
+			Scope: staleSending.Scope(), LeaseOwner: "stale-worker",
+			LeaseDuration: time.Minute,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ExecContext(ctx, `
+		UPDATE push_effects
+		   SET lease_until=$2, takeover_not_before=$2
+		 WHERE id=$1 AND fence=$3`,
+		staleSending.ID, dueAt, staleLease.Fence); err != nil {
+		t.Fatal(err)
+	}
+
+	ambiguousLease, err := f.store.ClaimPushEffect(ctx,
+		pusheffect.ClaimParams{
+			Scope: ambiguousDue.Scope(), LeaseOwner: "ambiguous-worker",
+			LeaseDuration: time.Minute,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.RecordPushEffectAmbiguous(ctx,
+		pusheffect.FailureParams{
+			Lease: pusheffect.Lease{
+				Scope:      ambiguousDue.Scope(),
+				LeaseOwner: ambiguousLease.LeaseOwner,
+				Fence:      ambiguousLease.Fence,
+			},
+			Class: "provider_response_unknown",
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ExecContext(ctx,
+		`UPDATE push_effects SET next_attempt_at=$2 WHERE id=$1`,
+		ambiguousDue.ID, dueAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ExecContext(ctx,
+		`UPDATE push_effects SET next_attempt_at=$2 WHERE id=$1`,
+		futurePrepared.ID, cutoff.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.ClaimPushEffect(ctx, pusheffect.ClaimParams{
+		Scope: currentSending.Scope(), LeaseOwner: "current-worker",
+		LeaseDuration: time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ExecContext(ctx, `
+		UPDATE push_effects
+		   SET status='blocked', failure_class='operator_blocked',
+		       fence=1, attempt=1, blocked_at=$2, updated_at=$2
+		 WHERE id=$1`,
+		blocked.ID, cutoff); err != nil {
+		t.Fatal(err)
+	}
+
+	if tenants, err := f.store.ListRecoverablePushEffectTenantIDs(
+		ctx, base.TaskID, cutoff, 0, 1,
+	); err != nil || len(tenants) != 1 || tenants[0] != base.TenantID {
+		t.Fatalf("tenant page=%v/%v", tenants, err)
+	}
+	if tenants, err := f.store.ListRecoverablePushEffectTenantIDs(
+		ctx, base.TaskID, cutoff, base.TenantID, 1,
+	); err != nil || len(tenants) != 0 {
+		t.Fatalf("tenant keyset tail=%v/%v", tenants, err)
+	}
+
+	var gotIDs []string
+	after := ""
+	for {
+		page, err := f.store.ListRecoverablePushEffects(
+			ctx, base.TaskID, base.TenantID, cutoff, after, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, effect := range page {
+			gotIDs = append(gotIDs, effect.ID)
+		}
+		if len(page) < 2 {
+			break
+		}
+		after = page[len(page)-1].ID
+	}
+	wantIDs := []string{
+		preparedDue.ID, definiteDue.ID, staleSending.ID, ambiguousDue.ID,
+	}
+	if len(gotIDs) != len(wantIDs) {
+		t.Fatalf("recoverable ids=%v want=%v", gotIDs, wantIDs)
+	}
+	for i := range wantIDs {
+		if gotIDs[i] != wantIDs[i] {
+			t.Fatalf("recoverable ids=%v want=%v", gotIDs, wantIDs)
+		}
+	}
+	for _, excluded := range []string{
+		futurePrepared.ID, currentSending.ID, blocked.ID, sibling.ID,
+	} {
+		if strings.Contains(strings.Join(gotIDs, ","), excluded) {
+			t.Fatalf("excluded effect %s appeared in %v", excluded, gotIDs)
+		}
+	}
+	if behind, err := f.store.ListRecoverablePushEffects(
+		ctx, base.TaskID, base.TenantID, behindHost, "", 10,
+	); err != nil || len(behind) != 0 {
+		t.Fatalf("behind-host cutoff unexpectedly recovered=%v/%v",
+			behind, err)
+	}
+	if siblingPage, err := f.store.ListRecoverablePushEffects(
+		ctx, siblingTaskID, base.TenantID, cutoff, "", 10,
+	); err != nil || len(siblingPage) != 1 ||
+		siblingPage[0].ID != sibling.ID {
+		t.Fatalf("sibling task page=%v/%v", siblingPage, err)
+	}
+	if _, err := f.store.ListRecoverablePushEffectTenantIDs(
+		ctx, " \n", cutoff, 0, 10,
+	); err == nil {
+		t.Fatal("malformed task ID was accepted")
+	}
+	if _, err := f.store.ListRecoverablePushEffects(
+		ctx, base.TaskID, base.TenantID, cutoff, " \n", 10,
+	); err == nil {
+		t.Fatal("malformed effect cursor was accepted")
 	}
 }
 

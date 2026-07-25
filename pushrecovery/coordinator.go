@@ -252,11 +252,15 @@ func (c *Coordinator) resolveAmbiguous(
 	)
 	cancelProvider()
 	if err != nil {
-		_, deferErr := c.deferAmbiguous(ctx, effect, false)
-		return OutcomeAmbiguous, errors.Join(
-			fmt.Errorf("resolve push effect history: %w", err),
-			deferErr,
-		)
+		outcome, deferErr := c.deferAmbiguous(ctx, effect, false)
+		if deferErr != nil {
+			return "", errors.Join(
+				fmt.Errorf("resolve push effect history: %w", err),
+				deferErr,
+			)
+		}
+		return outcome, fmt.Errorf(
+			"resolve push effect history: %w", err)
 	}
 	switch {
 	case observation.MatchCount == 1 && observation.MessageID != "":
@@ -331,14 +335,19 @@ func (c *Coordinator) claimAndSend(
 			c.store.ClaimAuthorizedPushEffect(ctx, params)
 	}
 	if err != nil {
-		var deferErr error
 		if reconciliation {
-			_, deferErr = c.deferAmbiguous(ctx, effect, false)
+			outcome, deferErr := c.deferAmbiguous(ctx, effect, false)
+			if deferErr != nil {
+				return "", fmt.Errorf(
+					"claim authorized push effect: %w",
+					errors.Join(err, deferErr),
+				)
+			}
+			return outcome, fmt.Errorf(
+				"claim authorized push effect: %w", err)
 		}
 		return "", fmt.Errorf(
-			"claim authorized push effect: %w",
-			errors.Join(err, deferErr),
-		)
+			"claim authorized push effect: %w", err)
 	}
 	switch decision {
 	case pusheffect.AuthorizedClaimNotDue:
@@ -498,7 +507,11 @@ func (c *Coordinator) deferAmbiguous(
 func (c *Coordinator) checkpointContext(
 	parent context.Context,
 ) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(parent, c.config.CheckpointTimeout)
+	// Once a provider/history boundary has returned, the mandatory durable
+	// classification must survive lifecycle cancellation for one short,
+	// bounded checkpoint window. Values are preserved; cancellation is not.
+	return context.WithTimeout(
+		context.WithoutCancel(parent), c.config.CheckpointTimeout)
 }
 
 func validSentObservation(
