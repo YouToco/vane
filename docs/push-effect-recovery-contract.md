@@ -97,14 +97,30 @@ itself supply a durable local receipt. A timeout, response loss, empty message
 ID, process exit after the remote call, or local receipt uncertainty enters
 `ambiguous`.
 
-An ambiguous effect may progress only through a provider-specific resolver:
+During the one-hour provider window, an ambiguous effect may replay the exact
+same target, card bytes, and UUID as a reconciliation attempt. This is not a
+new send authorization: changing any input or UUID is forbidden, and the effect
+remains ambiguous until a durable message ID is obtained. After the window,
+Create is forbidden.
+
+An ambiguous effect may otherwise progress only through a provider-specific
+resolver:
 
 1. exact matching message found: adopt its message ID and record `sent`;
-2. provider proves no message exists and the retry remains safe: return to
-   `prepared`;
-3. no authoritative answer, or the UUID window expired: record `blocked`.
+2. no authoritative answer when the UUID window expires: record `blocked`.
 
 Matching only time, title, recipient, or a text excerpt is not authoritative.
+Feishu exposes no get-by-UUID API, and a message-list miss does not prove that a
+send did not happen.
+
+For positive Feishu reconciliation, the effect must also freeze the owner P2P
+chat ID and embed its non-sensitive effect ID into the exact card JSON. The
+resolver may list that exact chat and adopt a message only when one interactive
+message from the expected application contains the exact effect ID and frozen
+card content. Zero matches remain ambiguous; multiple matches are an invariant
+violation and become blocked. The required chat ID must be durably captured
+from an inbound message/event or a successful Create receipt rather than
+re-derived from mutable owner state.
 
 ## 6. Atomic projection settlement
 
