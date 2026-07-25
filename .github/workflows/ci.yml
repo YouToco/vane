@@ -161,7 +161,10 @@ jobs:
             # below every assertion, the unit stays stopped for operator inspection.
             if systemctl is-active --quiet vane; then
               old_invocation=$(systemctl show vane --property=InvocationID --value)
-              drain_started_at=$(date --iso-8601=seconds)
+              # Use journalctl's timezone-independent Unix timestamp syntax.
+              # The production journalctl rejects RFC3339 offsets with a colon
+              # (for example -04:00), even though GNU date emits that form.
+              drain_started_at=$(date +%s)
               test -n "$old_invocation"
               echo "draining old vane invocation=$old_invocation started_at=$drain_started_at"
 
@@ -179,7 +182,7 @@ jobs:
                 exit 1
               fi
 
-              stop_log=$(journalctl -u vane --since "$drain_started_at" --no-pager -o cat)
+              stop_log=$(journalctl -u vane --since "@$drain_started_at" --no-pager -o cat)
               if grep -Eiq \
                 "(stop-sigterm.*timed out|timed out.*killing|signal SIGKILL|status=9/KILL|code=killed.*KILL)" \
                 <<<"$old_invocation_log"$'\n'"$stop_log"; then
