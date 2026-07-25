@@ -268,22 +268,13 @@ func lockValidMembership(ctx context.Context, tx pgx.Tx, tenantID, userID int64)
 	var valid bool
 	err := tx.QueryRow(ctx,
 		`SELECT true
-		   FROM tenants
-		  WHERE id = $1 AND status = 'active' AND deleted_at IS NULL
-		  FOR SHARE /* membership tenant root lock order */`,
-		tenantID).Scan(&valid)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return compiledTaskValidationError(
-				fmt.Sprintf("tenant_id=%d 与 user_id=%d 不构成有效成员关系", tenantID, userID), nil)
-		}
-		return types.NewAppError(types.CodeDatabase, "锁定并校验租户成员关系", err)
-	}
-	err = tx.QueryRow(ctx,
-		`SELECT true
 		   FROM memberships m
-		  WHERE m.tenant_id = $1 AND m.user_id = $2
-		  FOR SHARE /* membership row lock order */`,
+		   JOIN tenants t ON t.id = m.tenant_id
+		  WHERE m.tenant_id = $1
+		    AND m.user_id = $2
+		    AND t.status = 'active'
+		    AND t.deleted_at IS NULL
+		  FOR SHARE OF m, t`,
 		tenantID, userID).Scan(&valid)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

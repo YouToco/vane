@@ -174,20 +174,19 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	}
 
 	// Across the purge/coordinator/receipt/session conflict set, every path
-	// follows this shared partial order:
+	// follows this shared partial order (including FK-acquired parent locks):
 	//
-	//   tenant -> membership -> user -> task-creation operation
-	//   task-creation operation -> schedule (when an aggregate exists)
+	//   task-creation operation -> membership/user capacity -> schedule
 	//   task-creation operation -> task-creation receipt -> session
 	//   schedule -> definition-edit operation -> definition-edit receipt -> session
-	//   session -> agent event
+	//   session -> agent event -> tenant (event FK)
+	//   every tenant-owned child -> tenant delete
 	//
-	// Task Creation locks the tenant and membership before its shared user
-	// capacity row and operation. Purge does not touch or lock users: a user can
-	// belong to another tenant, so taking that shared row would create exactly
-	// the forbidden cross-tenant lock. Locking this tenant and its membership
-	// rows first is sufficient because every coordinator reaches the user and
-	// operation only after those roots.
+	// Purge deliberately does not pre-lock tenant, membership, or the shared
+	// user capacity row. Tenant is the FK parent reached last by normal turns
+	// and definition-edit creation, while users can span tenants and must never
+	// be pulled into a tenant-wide purge. Existing Task Creation sagas use their
+	// pending_action as the root before any identity/capacity or aggregate lock.
 	//
 	// The two receipt dispatchers really lock their receipt before updating the
 	// session. Definition-edit coordinators lock schedule -> operation before
@@ -205,19 +204,6 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		name  string
 		query string
 	}{
-		{
-			name: "tenants",
-			query: `SELECT id FROM tenants
-			         WHERE id = $1
-			         FOR UPDATE /* tenant purge tenant root lock order */`,
-		},
-		{
-			name: "memberships",
-			query: `SELECT user_id FROM memberships
-			         WHERE tenant_id = $1
-			         ORDER BY user_id
-			         FOR UPDATE /* tenant purge membership root lock order */`,
-		},
 		{
 			name: "pending_actions",
 			query: `SELECT id FROM pending_actions

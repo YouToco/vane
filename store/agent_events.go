@@ -387,7 +387,8 @@ func insertAgentEventBatch(
 				kind, schema_version, payload, payload_digest, batch_digest
 			 ) VALUES (
 				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-			 ) RETURNING `+agentEventColumns,
+			 ) /* agent event tenant FK lock order */
+			 RETURNING `+agentEventColumns,
 			batch.Scope.TenantID, batch.Scope.UserID, batch.Scope.SessionID,
 			nextSequence+int64(i), batch.IdempotencyKey, i, len(canonical),
 			string(canonical[i].Kind()), agentledger.SchemaVersion,

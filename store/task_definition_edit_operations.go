@@ -378,11 +378,8 @@ func validateTaskDefinitionEditCreationScope(
 			[]byte(proposal.BaseHead.Digest)) != 1 {
 		return taskDefinitionEditConflict("approved base bytes differ")
 	}
-	if err := validateApprovedDefinitionProjectionTx(ctx, tx,
-		baseDefinition, frozen.BaseDefinitionBytes); err != nil {
-		return err
-	}
-	return validateTaskDefinitionEditCreationProvenance(ctx, tx, frozen)
+	return validateApprovedDefinitionProjectionTx(ctx, tx,
+		baseDefinition, frozen.BaseDefinitionBytes)
 }
 
 func validateTaskDefinitionEditActiveActor(
@@ -397,7 +394,8 @@ func validateTaskDefinitionEditActiveActor(
 		   JOIN memberships m ON m.tenant_id=t.id
 		  WHERE t.id=$1 AND m.user_id=$2 AND t.status='active'
 		    AND t.deleted_at IS NULL
-		  FOR SHARE OF t, m`,
+		  FOR SHARE OF t, m
+		  /* task definition edit tenant lock order */`,
 		tenantID, userID,
 	).Scan(&membershipValid)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -523,6 +521,27 @@ func (s *Store) CreateTaskDefinitionEditOperation(
 	}
 	defer rollbackTaskDefinitionEditTx(ctx, tx)
 
+	// The successful Task Creation operation is part of the frozen proposal's
+	// authority and is also the first root in tenant purge. Lock it before the
+	// schedule so new creation and purge share pending_action -> schedule. An
+	// already-durable operation is a response replay: retain its historical
+	// schedule -> operation order and do not re-require mutable provenance.
+	var operationExists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM task_definition_edit_operations WHERE id=$1
+		)`,
+		proposal.OperationID,
+	).Scan(&operationExists); err != nil {
+		return nil, taskDefinitionEditDatabaseError(
+			"check operation creation replay", err,
+		)
+	}
+	if !operationExists {
+		if err := validateTaskDefinitionEditCreationProvenance(ctx, tx, frozen); err != nil {
+			return nil, err
+		}
+	}
 	schedule, err := lockTaskDefinitionEditScheduleForUpdate(ctx, tx,
 		proposal.Target.TenantID, proposal.Target.UserID, proposal.Target.TaskID)
 	if err != nil {
