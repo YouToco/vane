@@ -205,6 +205,105 @@ func TestPushEffectCanaryLoadsFromPureEnvironment(t *testing.T) {
 	}
 }
 
+func TestPushEffectRecoveryCanaryIsIndependentAndInsideCompiledRollout(
+	t *testing.T,
+) {
+	tests := []struct {
+		name     string
+		pipeline PipelineConfig
+		want     string
+		wantErr  bool
+	}{
+		{name: "default off"},
+		{
+			name: "recovery only exact task",
+			pipeline: PipelineConfig{
+				CompiledRuntimeEnabled:             true,
+				CompiledRuntimeCanaryScheduleID:    "task-recovery",
+				PushEffectRecoveryCanaryScheduleID: " task-recovery ",
+			},
+			want: "task-recovery",
+		},
+		{
+			name: "recovery independent from different fresh send",
+			pipeline: PipelineConfig{
+				CompiledRuntimeEnabled:             true,
+				CompiledRuntimeAllowAll:            true,
+				PushEffectCanaryScheduleID:         "task-fresh",
+				PushEffectRecoveryCanaryScheduleID: "task-recovery",
+			},
+			want: "task-recovery",
+		},
+		{
+			name: "compiled disabled",
+			pipeline: PipelineConfig{
+				PushEffectRecoveryCanaryScheduleID: "task-recovery",
+			},
+			wantErr: true,
+		},
+		{
+			name: "outside exact compiled rollout",
+			pipeline: PipelineConfig{
+				CompiledRuntimeEnabled:             true,
+				CompiledRuntimeCanaryScheduleID:    "task-other",
+				PushEffectRecoveryCanaryScheduleID: "task-recovery",
+			},
+			wantErr: true,
+		},
+		{
+			name: "whitespace",
+			pipeline: PipelineConfig{
+				CompiledRuntimeEnabled:             true,
+				CompiledRuntimeCanaryScheduleID:    "task-recovery",
+				PushEffectRecoveryCanaryScheduleID: " \t ",
+			},
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{
+				DB:       DBConfig{URL: "postgres://test"},
+				Pipeline: test.pipeline,
+			}
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error=%v wantErr=%v", err, test.wantErr)
+			}
+			if !test.wantErr &&
+				cfg.Pipeline.PushEffectRecoveryCanaryScheduleID != test.want {
+				t.Fatalf("recovery canary=%q want=%q",
+					cfg.Pipeline.PushEffectRecoveryCanaryScheduleID,
+					test.want)
+			}
+		})
+	}
+}
+
+func TestPushEffectRecoveryCanaryLoadsFromPureEnvironment(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("VANE_DB_URL", "postgres://env")
+	t.Setenv("VANE_PIPELINE_COMPILED_RUNTIME_ENABLED", "true")
+	t.Setenv(
+		"VANE_PIPELINE_COMPILED_RUNTIME_CANARY_SCHEDULE_ID",
+		"task-recovery",
+	)
+	t.Setenv(
+		"VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID",
+		"task-recovery",
+	)
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pipeline.PushEffectRecoveryCanaryScheduleID != "task-recovery" ||
+		cfg.Pipeline.PushEffectCanaryScheduleID != "" {
+		t.Fatalf("pipeline=%+v", cfg.Pipeline)
+	}
+}
+
 func TestObservationCanaryValidation(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -599,6 +698,7 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.playbook_prompts_allow_all", cfg.Pipeline.PlaybookPromptsAllowAll, false},
 		{"pipeline.observation_shadow_canary_schedule_id", cfg.Pipeline.ObservationShadowCanaryScheduleID, ""},
 		{"pipeline.observation_authority_canary_schedule_id", cfg.Pipeline.ObservationAuthorityCanaryScheduleID, ""},
+		{"pipeline.push_effect_recovery_canary_schedule_id", cfg.Pipeline.PushEffectRecoveryCanaryScheduleID, ""},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
 		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 100000},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},

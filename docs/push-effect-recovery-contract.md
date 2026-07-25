@@ -5,11 +5,14 @@
 > state transitions, provider idempotency, or recovery authority requires a new
 > version and the S-level verification gates in `AGENTS.md`.
 
-Implementation status (2026-07-25): PR-C supplies one dark, exact-task
-`pushrecovery.Coordinator.Attempt` authority path, atomic live authorization,
-positive-only Feishu history resolution, and fixed-predicate reconciliation
-transitions. It has no production call point, scan, startup pass, ticker,
-goroutine, lifecycle wiring, unrestricted operator, or legacy-batch adoption.
+Implementation status (2026-07-25): PR-D wires PR-C's exact-task
+`pushrecovery.Coordinator.Attempt` behind the independent, default-empty
+`pipeline.push_effect_recovery_canary_schedule_id`. It adds an outbound-only
+Feishu readiness barrier, immutable DB-clock task/tenant/effect keyset
+discovery, a bounded startup pass before every ingress, periodic recovery,
+fair cursor rotation, finite concurrency/time budgets, low-cardinality process
+metrics/logs, and context-owned drain. It still has no unrestricted operator or
+legacy-batch adoption.
 
 ## 1. Truth boundaries
 
@@ -159,20 +162,24 @@ compiled Push once the effect path is enabled.
 
 ## 7. Recovery lifecycle and limits
 
-This section remains the post-PR-C lifecycle target. None of these lifecycle
-behaviors is enabled by the dark single-attempt authority package.
+These lifecycle behaviors run only when the independent exact-task recovery
+canary is non-empty and inside the compiled-runtime rollout. Empty is the
+complete rollback state and performs no outbound preparation or attempt.
 
 - A bounded startup pass runs before external ingress.
-- A tenant-sharded, page-bounded periodic worker handles stale nonterminal
-  effects.
+- A DB-clock, exact-task, tenant-sharded and keyset-page-bounded periodic worker
+  handles due `prepared`, `definite_failed`, and `ambiguous` effects plus stale
+  `sending` effects.
 - The worker has a finite global concurrency limit, per-attempt timeout, maximum
-  attempts, and context-owned shutdown.
+  attempts, per-pass discovery/admission deadline, fair capped-pass cursor, and
+  context-owned shutdown. Admitted work retains its bounded durable checkpoint
+  budget; no new attempt is admitted after the pass deadline.
 - Recovery metrics use only low-cardinality labels: state, provider, outcome,
   and failure class. Tenant, user, task, run, effect, recipient, provider UUID,
   and card contents must not be metric labels or log message text.
-- Logs may carry internal IDs as structured attributes where operationally
-  required, but never card bytes, recipient identifiers, credentials, or
-  provider UUID.
+- Recovery logs carry only bounded trigger/outcome/error-code/counter fields;
+  they never carry tenant, user, task, run, effect, recipient, card, message,
+  credential, or provider UUID values.
 
 ## 8. Legacy pending rows
 
@@ -192,9 +199,9 @@ versioned effect; it does not delete deliveries or forge `sent`.
    call points.
 2. Deploy the stable-UUID Feishu adapter and dark effect preparation.
 3. Enable live effect settlement for one exact task; recovery remains disabled.
-4. Deploy the dark exact-task recovery authority with no lifecycle or production
-   call point; then independently enable bounded recovery and run the complete
-   fault matrix.
+4. Deploy the exact-task recovery authority, then its independently gated
+   bounded lifecycle. Keep the recovery key empty until the production canary
+   task is explicitly selected and the complete fault matrix is green.
 5. Expand only after shadow/projection audits remain exact. Agent ledger main
    read switching is an independent release decision.
 

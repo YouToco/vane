@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestPushRecoveryRemainsDarkAndSingleAttemptOnly(t *testing.T) {
+func TestPushRecoveryLifecycleHasNarrowProductionWiring(t *testing.T) {
 	t.Parallel()
 
 	root := filepath.Clean("..")
@@ -48,7 +48,10 @@ func TestPushRecoveryRemainsDarkAndSingleAttemptOnly(t *testing.T) {
 				return err
 			}
 			if value == "github.com/YouToco/vane/pushrecovery" {
-				t.Errorf("production recovery wiring/import exists in %s", path)
+				clean := filepath.ToSlash(path)
+				if !strings.HasSuffix(clean, "/cmd/server/main.go") {
+					t.Errorf("recovery import outside composition root: %s", path)
+				}
 			}
 		}
 		return nil
@@ -77,12 +80,14 @@ func (c *Coordinator) Run(ctx context.Context) {
 	_, _ = attempt(ctx, pusheffect.Scope{})
 }`
 	file, err := parser.ParseFile(
-		token.NewFileSet(), "runner.go", source, parser.ParseComments)
+		token.NewFileSet(), "pushrecovery/evil.go", source,
+		parser.ParseComments)
 	if err != nil {
 		t.Fatal(err)
 	}
 	methods := make(map[string]bool)
-	violations := inspectRecoveryAST(file, "runner.go", methods)
+	violations := inspectRecoveryAST(
+		file, "pushrecovery/evil.go", methods)
 	if len(violations) < 3 || !methods["Run"] {
 		t.Fatalf(
 			"guard accepted same-package runner mutation: methods=%v violations=%v",
@@ -112,7 +117,9 @@ func inspectRecoveryAST(
 				exportedMethods[typed.Name.Name] = true
 			}
 		case *ast.SelectorExpr:
-			if inRecoveryPackage && typed.Sel.Name == "Attempt" {
+			if inRecoveryPackage && typed.Sel.Name == "Attempt" &&
+				!strings.HasSuffix(
+					filepath.ToSlash(path), "/pushrecovery/runner.go") {
 				violations = append(
 					violations,
 					path+": Coordinator.Attempt production selection is forbidden",
@@ -125,7 +132,9 @@ func inspectRecoveryAST(
 			}
 			if inRecoveryPackage &&
 				(selector.Sel.Name == "NewTicker" ||
-					selector.Sel.Name == "Tick") {
+					selector.Sel.Name == "Tick") &&
+				!strings.HasSuffix(
+					filepath.ToSlash(path), "/pushrecovery/runner.go") {
 				violations = append(
 					violations, path+": recovery ticker is forbidden")
 			}

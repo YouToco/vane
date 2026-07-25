@@ -59,6 +59,8 @@ pipeline:
   observation_authority_canary_schedule_id: ""
   # Durable provider effect: exact one-task compiled canary only.
   push_effect_canary_schedule_id: ""
+  # Independent exact-task recovery canary. Empty keeps recovery fully dark.
+  push_effect_recovery_canary_schedule_id: ""
 
 agent:
   max_turns: 20

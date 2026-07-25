@@ -200,11 +200,14 @@ func (s *Store) LoadPushEffect(
 // subsequent row read or mutation re-enters the tenant-scoped coordinator role.
 func (s *Store) ListRecoverablePushEffectTenantIDs(
 	ctx context.Context,
+	expectedTaskID string,
 	before time.Time,
 	afterTenantID int64,
 	limit int,
 ) ([]int64, error) {
-	if before.IsZero() || afterTenantID < 0 || limit <= 0 || limit > 1000 {
+	if !validTaskRunTaskID(expectedTaskID) || before.IsZero() ||
+		afterTenantID < 0 ||
+		limit <= 0 || limit > 1000 {
 		return nil, pushEffectValidation(
 			"recoverable push effect tenant query is invalid")
 	}
@@ -217,14 +220,16 @@ func (s *Store) ListRecoverablePushEffectTenantIDs(
 	rows, err := tx.Query(ctx, `
 		SELECT DISTINCT tenant_id
 		  FROM push_effects
-		 WHERE tenant_id>$2 AND (
+		 WHERE task_id=$1 AND tenant_id>$3 AND (
 		       (status IN ('prepared','definite_failed') AND
-		        next_attempt_at<=LEAST($1,clock_timestamp())) OR
+		        next_attempt_at<=LEAST($2,clock_timestamp())) OR
 		       (status='sending' AND takeover_not_before IS NOT NULL AND
-		        takeover_not_before<=LEAST($1,clock_timestamp()))
+		        takeover_not_before<=LEAST($2,clock_timestamp())) OR
+		       (status='ambiguous' AND
+		        next_attempt_at<=LEAST($2,clock_timestamp()))
 		   )
-		 ORDER BY tenant_id LIMIT $3`,
-		before, afterTenantID, limit)
+		 ORDER BY tenant_id LIMIT $4`,
+		expectedTaskID, before, afterTenantID, limit)
 	if err != nil {
 		return nil, pushEffectDatabaseError(
 			"list recoverable tenant shards", err)
@@ -251,16 +256,49 @@ func (s *Store) ListRecoverablePushEffectTenantIDs(
 	return tenantIDs, nil
 }
 
+// ReadPushEffectRecoveryCutoff captures the database protocol clock once for a
+// complete paged recovery pass. Host clock skew must not delay UUID-window
+// reconciliation or make pages disagree about what was due at pass start.
+func (s *Store) ReadPushEffectRecoveryCutoff(
+	ctx context.Context,
+) (time.Time, error) {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return time.Time{}, pushEffectDatabaseError(
+			"begin recovery cutoff read", err)
+	}
+	defer rollbackPushEffectTx(ctx, tx)
+	var cutoff time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(
+		&cutoff,
+	); err != nil {
+		return time.Time{}, pushEffectDatabaseError(
+			"read recovery cutoff", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return time.Time{}, pushEffectDatabaseError(
+			"commit recovery cutoff read", err)
+	}
+	return cutoff, nil
+}
+
 // ListRecoverablePushEffects returns due safe-send rows and stale sending rows
 // for one tenant. Callers must Claim the former or TakeOver the latter; listing
 // itself grants no provider authority.
 func (s *Store) ListRecoverablePushEffects(
 	ctx context.Context,
+	expectedTaskID string,
 	tenantID int64,
 	before time.Time,
+	afterEffectID string,
 	limit int,
 ) ([]pusheffect.Effect, error) {
-	if tenantID <= 0 || before.IsZero() || limit <= 0 || limit > 1000 {
+	if !validTaskRunTaskID(expectedTaskID) || tenantID <= 0 ||
+		before.IsZero() ||
+		(afterEffectID != "" &&
+			(afterEffectID != strings.TrimSpace(afterEffectID) ||
+				len(afterEffectID) > 512 || !utf8.ValidString(afterEffectID))) ||
+		limit <= 0 || limit > 1000 {
 		return nil, pushEffectValidation(
 			"recoverable push effect query is invalid")
 	}
@@ -273,18 +311,17 @@ func (s *Store) ListRecoverablePushEffects(
 	rows, err := tx.Query(ctx, `
 		SELECT `+pushEffectColumns+`
 		  FROM push_effects
-		 WHERE tenant_id=$1 AND (
+		 WHERE task_id=$1 AND tenant_id=$2 AND id>$4 AND (
 		       (status IN ('prepared','definite_failed') AND
-		        next_attempt_at<=LEAST($2,clock_timestamp())) OR
+		        next_attempt_at<=LEAST($3,clock_timestamp())) OR
 		       (status='sending' AND takeover_not_before IS NOT NULL AND
-		        takeover_not_before<=LEAST($2,clock_timestamp()))
+		        takeover_not_before<=LEAST($3,clock_timestamp())) OR
+		       (status='ambiguous' AND
+		        next_attempt_at<=LEAST($3,clock_timestamp()))
 		   )
-		 ORDER BY
-		   CASE WHEN status='sending' THEN takeover_not_before
-		        ELSE next_attempt_at END,
-		   id
-		 LIMIT $3`,
-		tenantID, before, limit)
+		 ORDER BY id
+		 LIMIT $5`,
+		expectedTaskID, tenantID, before, afterEffectID, limit)
 	if err != nil {
 		return nil, pushEffectDatabaseError(
 			"list recoverable push effects", err)

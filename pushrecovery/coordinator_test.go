@@ -20,6 +20,9 @@ type fakeStore struct {
 	exhausted          *pusheffect.ExhaustedResolution
 	checkpointCanceled bool
 	claimDecision      pusheffect.AuthorizedClaimDecision
+	claimErr           error
+	deferDecision      pusheffect.ReconciliationDecision
+	deferErr           error
 	claimCalls         int
 }
 
@@ -50,6 +53,9 @@ func (f *fakeStore) ClaimAuthorizedPushEffect(
 ) (*pusheffect.Effect, pusheffect.AuthorizedClaimDecision, error) {
 	f.authorizedClaim = params
 	f.claimCalls++
+	if f.claimErr != nil {
+		return nil, "", f.claimErr
+	}
 	if f.claimDecision == pusheffect.AuthorizedClaimNotDue ||
 		f.claimDecision == pusheffect.AuthorizedClaimDenied {
 		return nil, f.claimDecision, nil
@@ -102,6 +108,12 @@ func (f *fakeStore) DeferOrBlockPushEffectReconciliation(
 ) (pusheffect.ReconciliationDecision, error) {
 	f.checkpointCanceled = f.checkpointCanceled || ctx.Err() != nil
 	f.deferred = &schedule
+	if f.deferErr != nil {
+		return "", f.deferErr
+	}
+	if f.deferDecision != "" {
+		return f.deferDecision, nil
+	}
 	return pusheffect.ReconciliationDeferred, nil
 }
 
@@ -314,6 +326,111 @@ func TestAttemptProviderTimeoutStillPersistsAmbiguousAndBackoff(t *testing.T) {
 	}
 }
 
+func TestAttemptHistoryErrorPreservesDurableBlockAndCheckpointFailureIsUnknown(
+	t *testing.T,
+) {
+	t.Parallel()
+	historyErr := errors.New("history unavailable")
+	checkpointErr := errors.New("checkpoint unavailable")
+	for _, test := range []struct {
+		name        string
+		store       *fakeStore
+		wantOutcome Outcome
+		wantErr     error
+	}{
+		{
+			name: "expired window blocks",
+			store: &fakeStore{
+				deferDecision: pusheffect.ReconciliationBlocked,
+			},
+			wantOutcome: OutcomeBlocked,
+			wantErr:     historyErr,
+		},
+		{
+			name:    "checkpoint failure has no durable outcome",
+			store:   &fakeStore{deferErr: checkpointErr},
+			wantErr: checkpointErr,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			effect := testEffect()
+			effect.Status = pusheffect.StatusAmbiguous
+			effect.Fence = 1
+			effect.Attempt = 1
+			test.store.effect = effect
+			coordinator, err := New(Deps{
+				Store: test.store,
+				Sender: fakeSender{send: func(context.Context) (
+					pusheffect.ProviderObservation, error,
+				) {
+					t.Fatal("history error called provider")
+					return pusheffect.ProviderObservation{}, nil
+				}},
+				HistoryResolver: fakeHistoryResolver{
+					resolve: func(context.Context) (
+						pusheffect.HistoryObservation, error,
+					) {
+						return pusheffect.HistoryObservation{}, historyErr
+					},
+				},
+				Config: Config{ExactTaskID: effect.TaskID},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			outcome, err := coordinator.Attempt(
+				t.Context(), effect.Scope())
+			if outcome != test.wantOutcome ||
+				!errors.Is(err, test.wantErr) {
+				t.Fatalf("Attempt()=%q/%v", outcome, err)
+			}
+		})
+	}
+}
+
+func TestAttemptLifecycleCancellationCannotEraseProviderReceipt(t *testing.T) {
+	t.Parallel()
+	effect := testEffect()
+	st := &fakeStore{effect: effect}
+	attemptCtx, cancelAttempt := context.WithCancel(t.Context())
+	coordinator, err := New(Deps{
+		Store: st,
+		Sender: fakeSender{send: func(context.Context) (
+			pusheffect.ProviderObservation, error,
+		) {
+			cancelAttempt()
+			return pusheffect.ProviderObservation{
+				Disposition: pusheffect.AttemptSent,
+				AppIdentity: effect.AppIdentity,
+				MessageID:   "om_after_cancel",
+				ChatID:      effect.ProviderChatID,
+			}, nil
+		}},
+		HistoryResolver: fakeHistoryResolver{
+			resolve: func(context.Context) (
+				pusheffect.HistoryObservation, error,
+			) {
+				return pusheffect.HistoryObservation{}, nil
+			},
+		},
+		Config: Config{
+			ExactTaskID:       effect.TaskID,
+			CheckpointTimeout: time.Second,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := coordinator.Attempt(attemptCtx, effect.Scope())
+	if err != nil || outcome != OutcomeSent {
+		t.Fatalf("Attempt()=%q/%v", outcome, err)
+	}
+	if st.receipt == nil || st.checkpointCanceled {
+		t.Fatalf("receipt=%+v checkpointCanceled=%v",
+			st.receipt, st.checkpointCanceled)
+	}
+}
+
 func TestAttemptAmbiguousNotDueNeverBurnsReconciliationAttempt(t *testing.T) {
 	t.Parallel()
 
@@ -432,7 +549,7 @@ func TestAttemptHistoryTimeoutStillPersistsDefer(t *testing.T) {
 		t.Fatal(err)
 	}
 	outcome, err := coordinator.Attempt(t.Context(), effect.Scope())
-	if outcome != OutcomeAmbiguous ||
+	if outcome != OutcomeDeferred ||
 		!errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Attempt()=%q/%v", outcome, err)
 	}
