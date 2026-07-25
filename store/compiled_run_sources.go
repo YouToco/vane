@@ -138,6 +138,18 @@ func (s *Store) ListUnpushedForTaskRunV1(
 		                FROM deliveries d
 		               WHERE d.tenant_id = $1 AND d.user_id = $2
 		                 AND d.content_item_id = ci.id
+		                 AND d.status <> 'failed'
+		                 AND NOT EXISTS (
+		                     SELECT 1
+		                       FROM task_observed_events e
+		                       JOIN push_batches b ON b.id=d.batch_id
+		                      WHERE e.delivery_id=d.id
+		                        AND e.tenant_id=$1 AND e.user_id=$2
+		                        AND e.status='qualified'
+		                        AND e.created_at <=
+		                            clock_timestamp() - interval '10 minutes'
+		                        AND b.status IN ('failed','pending')
+		                 )
 		          )
 		   ) candidates
 		  WHERE candidates.rn <= $5

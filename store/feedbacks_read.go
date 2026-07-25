@@ -41,7 +41,8 @@ func (s *Store) listFeedbacksForEvolution(
 	afterID int64,
 	limit int,
 ) ([]types.FeedbackWithContent, error) {
-	query := `SELECT f.id, f.user_id, f.delivery_id, f.action, f.detail, f.created_at,
+	query := `SELECT f.id, f.user_id, f.delivery_id, f.action,
+		        COALESCE(f.reason_code, ''), f.detail, f.created_at,
 		        d.score,
 		        COALESCE(ci.title, ''),
 		        COALESCE(left(ci.content, 200), '')
@@ -53,7 +54,8 @@ func (s *Store) listFeedbacksForEvolution(
 		 LIMIT $3`
 	args := []any{userID, afterID, limit}
 	if tenantID > 0 {
-		query = `SELECT f.id, f.user_id, f.delivery_id, f.action, f.detail, f.created_at,
+		query = `SELECT f.id, f.user_id, f.delivery_id, f.action,
+		        COALESCE(f.reason_code, ''), f.detail, f.created_at,
 		        d.score,
 		        COALESCE(ci.title, ''),
 		        COALESCE(left(ci.content, 200), '')
@@ -77,7 +79,8 @@ func (s *Store) listFeedbacksForEvolution(
 	for rows.Next() {
 		var fc types.FeedbackWithContent
 		if err := rows.Scan(
-			&fc.ID, &fc.UserID, &fc.DeliveryID, &fc.Action, &fc.Detail, &fc.CreatedAt,
+			&fc.ID, &fc.UserID, &fc.DeliveryID, &fc.Action, &fc.ReasonCode,
+			&fc.Detail, &fc.CreatedAt,
 			&fc.Score, &fc.ContentTitle, &fc.ContentExcerpt,
 		); err != nil {
 			return nil, types.NewAppError(types.CodeDatabase, "扫描待演化反馈行", err)
@@ -114,7 +117,7 @@ func (s *Store) ListRecentNegativeFeedbackTitles(ctx context.Context, userID int
 		`SELECT COALESCE(NULLIF(ci.title, ''), left(ci.content, 200))
 		 FROM (
 		     SELECT DISTINCT ON (f.delivery_id)
-		            f.delivery_id, f.action, f.created_at
+		            f.delivery_id, f.action, f.reason_code, f.created_at
 		     FROM feedbacks f
 		     WHERE f.user_id = $1 AND f.created_at >= $2
 		       AND f.action IN ('interested', 'not_interested', 'misjudged')
@@ -122,7 +125,8 @@ func (s *Store) ListRecentNegativeFeedbackTitles(ctx context.Context, userID int
 		 ) latest
 		 JOIN deliveries d ON d.id = latest.delivery_id
 		 JOIN content_items ci ON ci.id = d.content_item_id
-		 WHERE latest.action IN ('not_interested', 'misjudged')
+		 WHERE latest.action = 'not_interested'
+		    OR (latest.action = 'misjudged' AND latest.reason_code = 'not_relevant')
 		 ORDER BY latest.created_at DESC`,
 		userID, since)
 	if err != nil {
@@ -175,7 +179,7 @@ func (s *Store) ListRecentNegativeFeedbackTitlesForTenant(
 		`SELECT COALESCE(NULLIF(ci.title, ''), left(ci.content, 200))
 		 FROM (
 		     SELECT DISTINCT ON (f.delivery_id)
-		            f.delivery_id, f.action, f.created_at
+		            f.delivery_id, f.action, f.reason_code, f.created_at
 		     FROM feedbacks f
 		     WHERE f.tenant_id = $1 AND f.user_id = $2 AND f.created_at >= $3
 		       AND f.action IN ('interested', 'not_interested', 'misjudged')
@@ -184,7 +188,8 @@ func (s *Store) ListRecentNegativeFeedbackTitlesForTenant(
 		 JOIN deliveries d
 		   ON d.id = latest.delivery_id AND d.tenant_id = $1 AND d.user_id = $2
 		 JOIN content_items ci ON ci.id = d.content_item_id
-		 WHERE latest.action IN ('not_interested', 'misjudged')
+		 WHERE latest.action = 'not_interested'
+		    OR (latest.action = 'misjudged' AND latest.reason_code = 'not_relevant')
 		 ORDER BY latest.created_at DESC`,
 		tenantID, userID, since)
 	if err != nil {

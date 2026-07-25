@@ -24,12 +24,14 @@ import (
 	"github.com/YouToco/vane/auth"
 	"github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/eventqualifier"
 	"github.com/YouToco/vane/evolver"
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/profilehint"
+	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/pusher"
 	"github.com/YouToco/vane/runtimeconfig"
 	"github.com/YouToco/vane/runtimepolicy"
@@ -136,6 +138,38 @@ func run() error {
 	// 构卡函数注入而非 workflow 直接 import feishu：feishu→agent→workflow 依赖链
 	// 已存在，直接调用会成环（M5 契约 §8.2）。
 	ev := evolver.New(llmClient, recorder, st)
+	ev.SetTaskPolicySuggestionNotifier(func(
+		ctx context.Context,
+		tenantID, userID, deliveryID int64,
+		claimToken string,
+	) (string, bool, error) {
+		openID, err := st.GetUserFeishuOpenID(ctx, userID)
+		if err != nil {
+			return "", true, err
+		}
+		if err := st.BeginTaskPolicySuggestionDispatch(
+			ctx, tenantID, userID, claimToken,
+		); err != nil {
+			return "", true, err
+		}
+		observation, err := manager.SendCardWithUUIDResult(
+			ctx, manager.AppIdentity(), openID, feishu.BuildReplyCard(
+				fmt.Sprintf(
+					"你反馈推送 #%d 过时，但该任务还没有明确的新鲜度窗口。"+
+						"请回复我希望采用的范围（例如“只看相邻两次 9 点之间”）；"+
+						"我会先给出任务修改确认卡，确认前不会修改任务。",
+					deliveryID,
+				)), claimToken)
+		if err == nil &&
+			observation.Disposition != pusheffect.AttemptSent {
+			err = fmt.Errorf(
+				"任务策略建议发送返回非 sent 状态：%s",
+				observation.Disposition)
+		}
+		return observation.MessageID,
+			observation.Disposition == pusheffect.AttemptDefiniteNotSent,
+			err
+	})
 	// buildNotice=feishu.BuildReplyCard：抓取失败告警走无按钮的普通卡（功能 5.2），
 	// 与 buildCard（带反馈按钮的 delivery 卡）分开注入，不碰 M5 卡片反馈路径。
 	activities := workflow.NewActivities(fetch, score, cards, push, st, manager, ev,
@@ -162,7 +196,11 @@ func run() error {
 		workflow.WithSnapshotV2ShadowCanary(
 			st, cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID),
 		workflow.WithSnapshotV2ReadAuditCanary(
-			st, cfg.Pipeline.SnapshotV2ReadAuditCanaryScheduleID))
+			st, cfg.Pipeline.SnapshotV2ReadAuditCanaryScheduleID),
+		workflow.WithObservationRuntime(
+			st, eventqualifier.New(recorder),
+			cfg.Pipeline.ObservationShadowCanaryScheduleID,
+			cfg.Pipeline.ObservationAuthorityCanaryScheduleID))
 	slog.Info("task playbook prompt policy configured",
 		"enabled", cfg.Pipeline.PlaybookPromptsEnabled,
 		"canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID,
@@ -188,6 +226,7 @@ func run() error {
 	w.RegisterActivity(activities.EvolveProfile)
 	w.RegisterActivity(activities.Fetch)
 	w.RegisterActivity(activities.Dedup)
+	w.RegisterActivity(activities.QualifyEvents)
 	w.RegisterActivity(activities.Score)
 	w.RegisterActivity(activities.Select)
 	w.RegisterActivity(activities.CardGen)

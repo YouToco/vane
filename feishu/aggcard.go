@@ -17,7 +17,6 @@ import (
 	"strings"
 
 	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/types"
 )
 
 const (
@@ -158,11 +157,11 @@ func aggItemElements(input feedback.CardInput) []any {
 		els = append(els, map[string]any{"tag": "markdown", "content": line})
 	}
 
-	// 条件 form：仅该条 not_interested 且未 misjudged 时渲染，且**渲染在该条自己的
+	// 条件 form：仅点击 👎 的瞬态响应渲染，且**渲染在该条自己的
 	// 元素块内**（需求 (b)）。name 三件套按 delivery_id 唯一化——这是三重对齐断言
 	//（handler 侧）的产生端：form=fbr_{id} / input=reason_{id} / submit=submit_{id}，
 	// 提交回调靠 Action.Name 后缀与 value.delivery_id 互验。
-	if input.State.Preference == types.FeedbackActionNotInterested && !input.State.Misjudged {
+	if input.State.BadFeedbackOpen && !input.State.Misjudged {
 		els = append(els, aggReasonForm(idStr))
 	}
 	return els
@@ -172,35 +171,7 @@ func aggItemElements(input feedback.CardInput) []any {
 // form 硬约束（历史事故 200530/300123/200673）：form 内交互组件必须有 name；
 // 必须含 form_action_type=submit 的提交按钮，缺失整卡非法。
 func aggReasonForm(idStr string) map[string]any {
-	return map[string]any{
-		"tag":  "form",
-		"name": "fbr_" + idStr,
-		"elements": []any{
-			map[string]any{
-				"tag":  "input",
-				"name": "reason_" + idStr,
-				"placeholder": map[string]any{
-					"tag":     "plain_text",
-					"content": "哪里不对？说一句，下次就准了（可跳过）",
-				},
-				"max_length": 500,
-			},
-			map[string]any{
-				"tag":              "button",
-				"name":             "submit_" + idStr,
-				"form_action_type": "submit",
-				"text":             map[string]any{"tag": "plain_text", "content": "提交"},
-				"type":             "primary",
-				"behaviors": []any{map[string]any{
-					"type": "callback",
-					"value": map[string]any{
-						"vane_action": cardActionFeedbackReason,
-						"delivery_id": idStr,
-					},
-				}},
-			},
-		},
-	}
+	return feedbackProblemForm(idStr, true)
 }
 
 // escapeMarkdown 中和标题里能改变 markdown/HTML 结构的字符（对抗审查：外部标题

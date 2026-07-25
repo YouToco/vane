@@ -53,9 +53,11 @@ func TestCompiledPromptReads_AreExactTenantScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := f.base.st.pool.Exec(ctx,
-		`INSERT INTO feedbacks (tenant_id, user_id, delivery_id, action)
-		 VALUES ($1, $3, $4, 'not_interested'),
-		        ($2, $3, $5, 'misjudged')`,
+		`INSERT INTO feedbacks (
+		     tenant_id, user_id, delivery_id, action, reason_code
+		 )
+		 VALUES ($1, $3, $4, 'not_interested', NULL),
+		        ($2, $3, $5, 'misjudged', 'not_relevant')`,
 		f.idA.TenantID, f.idB.TenantID, f.idA.UserID, deliveryA, deliveryB); err != nil {
 		t.Fatal(err)
 	}

@@ -54,6 +54,9 @@ pipeline:
   # C2c-2: exact one-task shadow canary. Empty means fully off.
   snapshot_v2_shadow_canary_schedule_id: ""
   snapshot_v2_read_audit_canary_schedule_id: ""
+  # Observation policy rollout is exact-task only. Authority must equal shadow.
+  observation_shadow_canary_schedule_id: ""
+  observation_authority_canary_schedule_id: ""
 
 agent:
   max_turns: 20

@@ -12,10 +12,53 @@ import (
 
 	enums "go.temporal.io/api/enums/v1"
 
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
+
+func TestNormalizeCreateScheduleCommandObservationWindows(t *testing.T) {
+	windows := []observation.WindowSpecV1{
+		{Kind: observation.WindowScheduleInterval},
+		{Kind: observation.WindowRollingDuration, RollingDurationSeconds: 30 * 24 * 3600},
+		{Kind: observation.WindowCalendarPeriod, CalendarPeriod: observation.CalendarDay},
+	}
+	for _, window := range windows {
+		t.Run(string(window.Kind), func(t *testing.T) {
+			raw, err := json.Marshal(createScheduleCommandArgs{
+				Spec:   &createScheduleCommandSpec{Cron: "0 9 * * *", TZ: "Asia/Shanghai"},
+				Intent: "每天九点检查 OpenAI 是否上新",
+				ObservationPolicy: &observation.PolicySpecV1{
+					Schema: observation.SchemaV1, Mode: observation.ModeEvent,
+					Window: window, LatePolicy: observation.LateStrict,
+					Evidence: observation.EvidencePolicyV1{
+						Requirement:     observation.EvidenceOfficialRequired,
+						OfficialDomains: []string{"openai.com"},
+					},
+					UnknownTime: observation.UnknownTimeReject,
+					Event: &observation.EventPolicyV1{
+						Subject: "OpenAI models", EventKind: "model_release",
+						Qualification: observation.QualificationGeneralAvailability,
+					},
+					QualifierPrompt: observation.QualifierPromptV1,
+				},
+				ApprovedFetchPlan: json.RawMessage(validApprovedFetchPlan()),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			command, _, err := normalizeCreateScheduleCommand(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if command.ObservationPolicy == nil ||
+				command.ObservationPolicy.Window != window {
+				t.Fatalf("policy=%+v want window=%+v", command.ObservationPolicy, window)
+			}
+		})
+	}
+}
 
 type creationPrepareFakeStore struct {
 	op types.TaskCreationOperation

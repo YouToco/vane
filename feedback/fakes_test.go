@@ -68,6 +68,8 @@ type fakeStore struct {
 	detailErr      error
 	itemErr        error
 	profileErr     error
+	auditErr       error
+	auditOutcome   types.FreshnessFeedbackAuditOutcome
 
 	// 调用留痕：断言"不查库""不重复生成"这类负向要求。
 	byMsgIDCalls   []string
@@ -181,6 +183,18 @@ func (f *fakeStore) InsertFeedback(_ context.Context, fb *types.Feedback) (int64
 		return 0, f.insertErr
 	}
 	return f.insertLocked(fb), nil
+}
+
+func (f *fakeStore) AuditOutdatedFeedback(
+	_ context.Context, _, _ int64,
+) (types.FreshnessFeedbackAuditOutcome, error) {
+	if f.auditErr != nil {
+		return "", f.auditErr
+	}
+	if f.auditOutcome == "" {
+		return types.FreshnessAuditUnverifiable, nil
+	}
+	return f.auditOutcome, nil
 }
 
 // insertLocked 追加一行并返回新 id（调用方须持锁）。id 单调递增，
@@ -431,11 +445,12 @@ func (c *fakeCards) build(input CardInput) string {
 	defer c.mu.Unlock()
 	c.calls = append(c.calls, cardCall{bodyMD: input.BodyMD, deliveryID: input.DeliveryID, state: input.State})
 	b, err := json.Marshal(map[string]any{
-		"body_md":     input.BodyMD,
-		"delivery_id": input.DeliveryID,
-		"pref":        string(input.State.Preference),
-		"misjudged":   input.State.Misjudged,
-		"deep_dive":   input.State.DeepDiveRequested,
+		"body_md":           input.BodyMD,
+		"delivery_id":       input.DeliveryID,
+		"pref":              string(input.State.Preference),
+		"misjudged":         input.State.Misjudged,
+		"bad_feedback_open": input.State.BadFeedbackOpen,
+		"deep_dive":         input.State.DeepDiveRequested,
 	})
 	if err != nil {
 		panic(err)
@@ -451,11 +466,12 @@ func (c *fakeCards) count() int {
 
 // decodedCard 是 fakeCards.build 产物的反解形态。
 type decodedCard struct {
-	BodyMD     string `json:"body_md"`
-	DeliveryID int64  `json:"delivery_id"`
-	Pref       string `json:"pref"`
-	Misjudged  bool   `json:"misjudged"`
-	DeepDive   bool   `json:"deep_dive"`
+	BodyMD          string `json:"body_md"`
+	DeliveryID      int64  `json:"delivery_id"`
+	Pref            string `json:"pref"`
+	Misjudged       bool   `json:"misjudged"`
+	BadFeedbackOpen bool   `json:"bad_feedback_open"`
+	DeepDive        bool   `json:"deep_dive"`
 }
 
 func decodeCard(t *testing.T, cardJSON string) decodedCard {
@@ -651,6 +667,22 @@ func (h *harness) click(t *testing.T, action types.FeedbackAction) ClickResult {
 	res, err := h.svc.HandleClick(context.Background(), testUserID, Click{Action: action, DeliveryID: testDeliveryID})
 	if err != nil {
 		t.Fatalf("HandleClick(%s) 意外报错: %v", action, err)
+	}
+	return res
+}
+
+// submitBadFeedback submits the panel opened by the 👎 / historical misjudged
+// action. It is intentionally separate from click: opening/cancelling must
+// never be mistaken for a persisted preference event.
+func (h *harness) submitBadFeedback(t *testing.T, reason types.FeedbackReason, detail string) ClickResult {
+	t.Helper()
+	res, err := h.svc.HandleReasonSubmit(context.Background(), testUserID, ReasonSubmit{
+		DeliveryID: testDeliveryID,
+		ReasonCode: reason,
+		Detail:     detail,
+	})
+	if err != nil {
+		t.Fatalf("HandleReasonSubmit(%s) 意外报错: %v", reason, err)
 	}
 	return res
 }

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/fetcher"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/sourcespec"
@@ -155,6 +156,49 @@ const editTaskDefinitionSchema = `{
       "type": "string",
       "enum": ["loose", "normal", "strict"],
       "description": "可选：替换推送门槛"
+    },
+    "observation_policy": {
+      "type": "object",
+      "description": "可选：完整替换新鲜度/事件判定策略；修改后从确认时刻起生效，不补推更早内容",
+      "properties": {
+        "schema": {"type":"string","enum":["vane.observation-policy/v1"]},
+        "mode": {"type":"string","enum":["content","event"]},
+        "window": {
+          "type":"object",
+          "properties":{
+            "kind":{"type":"string","enum":["schedule_interval","rolling_duration","calendar_period"]},
+            "rolling_duration_seconds":{"type":"integer","minimum":3600,"maximum":31622400},
+            "calendar_period":{"type":"string","enum":["day","week","month"]}
+          },
+          "required":["kind"],
+          "additionalProperties":false
+        },
+        "late_policy":{"type":"string","enum":["strict","bounded"]},
+        "allowed_lateness_seconds":{"type":"integer","minimum":1,"maximum":2592000},
+        "evidence":{
+          "type":"object",
+          "properties":{
+            "requirement":{"type":"string","enum":["official_required","trusted_allowed"]},
+            "official_domains":{"type":"array","uniqueItems":true,"items":{"type":"string"}}
+          },
+          "required":["requirement"],
+          "additionalProperties":false
+        },
+        "unknown_time":{"type":"string","enum":["reject","deprioritize","allow"]},
+        "event":{
+          "type":"object",
+          "properties":{
+            "subject":{"type":"string","minLength":1},
+            "event_kind":{"type":"string","minLength":1},
+            "qualification":{"type":"string","enum":["official_announcement","general_availability","either"]}
+          },
+          "required":["subject","event_kind","qualification"],
+          "additionalProperties":false
+        },
+        "qualifier_prompt":{"type":"string","enum":["vane.qualify-events/v1"]}
+      },
+      "required":["schema","mode","window","late_policy","evidence","unknown_time"],
+      "additionalProperties":false
     }
   },
   "required": ["task_id"],
@@ -165,7 +209,7 @@ type editTaskDefinitionTool struct{}
 
 func (*editTaskDefinitionTool) Name() string { return "edit_task_definition" }
 func (*editTaskDefinitionTool) Description() string {
-	return "编辑已有定时任务的完整已批准定义。可一次修改触发频率、完整监控意图/手册、列表描述和推送门槛；未提供的字段保持不变。系统会冻结当前 definition head 与目标定义，先发原确认卡，确认后由唯一可恢复协调器执行。"
+	return "编辑已有定时任务的完整已批准定义。可一次修改触发频率、完整监控意图/手册、列表描述、推送门槛和新鲜度/事件判定策略；未提供的字段保持不变。系统会冻结当前 definition head 与目标定义，先发原确认卡，确认后由唯一可恢复协调器执行。"
 }
 func (*editTaskDefinitionTool) Parameters() json.RawMessage {
 	return json.RawMessage(editTaskDefinitionSchema)
@@ -873,6 +917,49 @@ const createScheduleSchema = `{
       },
       "additionalProperties": false
     },
+    "observation_policy": {
+      "type": "object",
+      "description": "可选：任务的新鲜度/事件判定策略。用户说“上新才推”“没有就不推”“只看今天/最近N天”时必须填写。模型只负责提取并交用户确认，运行时代码拥有最终放行权。",
+      "properties": {
+        "schema": {"type":"string","enum":["vane.observation-policy/v1"]},
+        "mode": {"type":"string","enum":["content","event"],"description":"content=时间范围内的普通内容；event=只有确认的事件发生才推"},
+        "window": {
+          "type":"object",
+          "properties":{
+            "kind":{"type":"string","enum":["schedule_interval","rolling_duration","calendar_period"]},
+            "rolling_duration_seconds":{"type":"integer","minimum":3600,"maximum":31622400},
+            "calendar_period":{"type":"string","enum":["day","week","month"]}
+          },
+          "required":["kind"],
+          "additionalProperties":false
+        },
+        "late_policy":{"type":"string","enum":["strict","bounded"]},
+        "allowed_lateness_seconds":{"type":"integer","minimum":1,"maximum":2592000},
+        "evidence":{
+          "type":"object",
+          "properties":{
+            "requirement":{"type":"string","enum":["official_required","trusted_allowed"]},
+            "official_domains":{"type":"array","uniqueItems":true,"items":{"type":"string"}}
+          },
+          "required":["requirement"],
+          "additionalProperties":false
+        },
+        "unknown_time":{"type":"string","enum":["reject","deprioritize","allow"]},
+        "event":{
+          "type":"object",
+          "properties":{
+            "subject":{"type":"string","minLength":1},
+            "event_kind":{"type":"string","minLength":1},
+            "qualification":{"type":"string","enum":["official_announcement","general_availability","either"]}
+          },
+          "required":["subject","event_kind","qualification"],
+          "additionalProperties":false
+        },
+        "qualifier_prompt":{"type":"string","enum":["vane.qualify-events/v1"]}
+      },
+      "required":["schema","mode","window","late_policy","evidence","unknown_time"],
+      "additionalProperties":false
+    },
     "nl_description": {"type": "string", "description": "可选：该任务的自然语言描述（如\"每天早上 8 点推送\"），用于列表展示"},
     "strictness": {"type": "string", "enum": ["loose", "normal", "strict"], "description": "可选：推送门槛档位，从用户对相关度的要求推断——「只要非常相关的/重大更新才推」→ strict（仅 ≥60 分高相关才推）；「一般相关就行」→ normal（≥40 分）；「都推来看看/宽松点」→ loose（只过滤与画像无关的内容）。用户没表态就不传（按系统兜底，等价 loose）"}
   },
@@ -888,10 +975,11 @@ type createScheduleArgs struct {
 		AnchorAt     string `json:"anchor_at"`
 		TZ           string `json:"tz"`
 	} `json:"spec"`
-	Intent            string          `json:"intent"`
-	ApprovedFetchPlan json.RawMessage `json:"approved_fetch_plan"`
-	NLDescription     string          `json:"nl_description"`
-	Strictness        string          `json:"strictness"`
+	Intent            string                    `json:"intent"`
+	ApprovedFetchPlan json.RawMessage           `json:"approved_fetch_plan"`
+	ObservationPolicy *observation.PolicySpecV1 `json:"observation_policy"`
+	NLDescription     string                    `json:"nl_description"`
+	Strictness        string                    `json:"strictness"`
 }
 
 type approvedFetchPlanSummary struct {
@@ -1017,6 +1105,9 @@ func (t *createScheduleTool) Summarize(args json.RawMessage) string {
 		strictness = types.StrictnessLoose
 	}
 	s += fmt.Sprintf("\n推送门槛：%s（%s）", strictnessLabel(strictness), strictnessDesc(strictness))
+	if policy := a.ObservationPolicy; policy != nil {
+		s += "\n新鲜度策略：" + summarizeObservationPolicy(*policy)
+	}
 	var plan approvedFetchPlanSummary
 	if err := json.Unmarshal(a.ApprovedFetchPlan, &plan); err == nil && len(plan.Sources) > 0 {
 		s += fmt.Sprintf("\n批准信源（%d）：", len(plan.Sources))
@@ -1034,6 +1125,49 @@ func (t *createScheduleTool) Summarize(args json.RawMessage) string {
 		}
 	}
 	return s
+}
+
+func summarizeObservationPolicy(policy observation.PolicySpecV1) string {
+	var window string
+	switch policy.Window.Kind {
+	case observation.WindowScheduleInterval:
+		window = "相邻两次计划触发之间"
+	case observation.WindowRollingDuration:
+		window = fmt.Sprintf("最近 %d 小时",
+			policy.Window.RollingDurationSeconds/3600)
+	case observation.WindowCalendarPeriod:
+		window = map[observation.CalendarPeriod]string{
+			observation.CalendarDay:   "本日",
+			observation.CalendarWeek:  "本周",
+			observation.CalendarMonth: "本月",
+		}[policy.Window.CalendarPeriod]
+	}
+	late := "窗口外不补推"
+	if policy.LatePolicy == observation.LateBounded {
+		late = fmt.Sprintf("允许迟到 %d 秒", policy.AllowedLatenessSecs)
+	}
+	unknown := map[observation.UnknownTimePolicy]string{
+		observation.UnknownTimeReject:       "日期未知拒绝",
+		observation.UnknownTimeDeprioritize: "日期未知降权",
+		observation.UnknownTimeAllow:        "日期未知允许",
+	}[policy.UnknownTime]
+	evidence := "允许可信媒体证据"
+	if policy.Evidence.Requirement == observation.EvidenceOfficialRequired {
+		evidence = "仅官方证据：" + strings.Join(
+			policy.Evidence.OfficialDomains, "、")
+	}
+	if policy.Mode != observation.ModeEvent || policy.Event == nil {
+		return "普通内容模式；窗口 " + window + "；" + late + "；" +
+			unknown + "；" + evidence
+	}
+	qualification := map[observation.Qualification]string{
+		observation.QualificationAnnouncement:        "官方宣布即算",
+		observation.QualificationGeneralAvailability: "正式可用才算",
+		observation.QualificationEither:              "官方宣布或正式可用均算",
+	}[policy.Event.Qualification]
+	return fmt.Sprintf(
+		"仅事件发生时推送；%s（%s）；窗口 %s；%s；%s；%s；无匹配事件不发消息",
+		policy.Event.Subject, qualification, window, late, unknown, evidence)
 }
 
 // validateScheduleSpecFields 是 create_schedule / update_schedule 共用的 spec 前置校验，
@@ -1057,7 +1191,15 @@ func validateScheduleSpecFields(cron string, everySeconds int) string {
 
 // validateScheduleArgs 是 create_schedule 的入口（保留原名，语义不变）。
 func validateScheduleArgs(a createScheduleArgs) string {
-	return validateScheduleSpecFields(a.Spec.Cron, a.Spec.EverySeconds)
+	if message := validateScheduleSpecFields(a.Spec.Cron, a.Spec.EverySeconds); message != "" {
+		return message
+	}
+	if a.ObservationPolicy != nil {
+		if err := a.ObservationPolicy.Validate(); err != nil {
+			return "observation_policy 无效：" + err.Error()
+		}
+	}
+	return ""
 }
 
 // ============================================================
@@ -1396,15 +1538,19 @@ func profileFieldChange(name, v string) string {
 // 采集什么；summary 归演化独有，为空整段省略，不引导模型对它下手。
 func renderProfile(p *types.Profile) string {
 	var b strings.Builder
-	b.WriteString("行业：" + orUnset(p.Industry))
-	b.WriteString("；职业：" + orUnset(p.Occupation))
+	b.WriteString("行业：")
+	b.WriteString(orUnset(p.Industry))
+	b.WriteString("；职业：")
+	b.WriteString(orUnset(p.Occupation))
 	if len(p.Tags) > 0 {
-		b.WriteString("；关注标签：" + strings.Join(p.Tags, "、"))
+		b.WriteString("；关注标签：")
+		b.WriteString(strings.Join(p.Tags, "、"))
 	} else {
 		b.WriteString("；关注标签：（未设置）")
 	}
 	if s := strings.TrimSpace(p.Summary); s != "" {
-		b.WriteString("；摘要：" + s)
+		b.WriteString("；摘要：")
+		b.WriteString(s)
 	}
 	return b.String()
 }

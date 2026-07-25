@@ -29,6 +29,9 @@ func (c *activityInputCapture) register(env *testsuite.TestWorkflowEnvironment) 
 	reg("EvolveProfile", func(context.Context, EvolveIn) error { return nil })
 	reg("Fetch", func(context.Context, PushParams) ([]types.ContentItem, error) { return items(1), nil })
 	reg("Dedup", func(_ context.Context, in DedupIn) ([]types.ContentItem, error) { return in.Items, nil })
+	reg("QualifyEvents", func(_ context.Context, in QualifyEventsIn) (QualifyEventsResult, error) {
+		return QualifyEventsResult{Items: in.Items, Outcome: "not_configured"}, nil
+	})
 	reg("Score", func(_ context.Context, in ScoreIn) ([]types.ScoredItem, error) {
 		c.mu.Lock()
 		c.score = append(c.score, in)

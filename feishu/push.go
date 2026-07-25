@@ -143,7 +143,8 @@ func (m *Manager) sendCardWithClient(
 	}
 	if !resp.Success() {
 		ae := types.NewAppError(types.CodePushFailed,
-			fmt.Sprintf("主动推送卡片被飞书拒绝（code %d：%s）", resp.Code, resp.Msg), nil)
+			fmt.Sprintf("主动推送卡片被飞书拒绝（code %d：%s）", resp.Code, resp.Msg),
+			nil)
 		// 确定性拒收不可重试（bug 狩猎 2026-07-19 MAJOR：此前一律按 CodePushFailed
 		// 默认可重试，卡片 JSON 非法这类怎么重试都非法的错误会白烧满 Temporal 重试
 		// 预算、把真实原因埋进一串重试噪音里）。清单只收实锤过语义的码，按需扩充：

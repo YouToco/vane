@@ -547,6 +547,9 @@ func TestPushEffectConcurrentClaimHasOneFence(t *testing.T) {
 func TestPushEffectCreateFirstSerializesTenantPurge(t *testing.T) {
 	f := newPushEffectFixture(t)
 	ctx := t.Context()
+	if _, err := f.provider.Up(ctx); err != nil {
+		t.Fatalf("migrate purge fixture to latest: %v", err)
+	}
 
 	parentTx, err := f.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -623,6 +626,9 @@ func TestPushEffectCreateFirstSerializesTenantPurge(t *testing.T) {
 func TestPushEffectPurgeFirstRejectsWaitingCreate(t *testing.T) {
 	f := newPushEffectFixture(t)
 	ctx := t.Context()
+	if _, err := f.provider.Up(ctx); err != nil {
+		t.Fatalf("migrate purge fixture to latest: %v", err)
+	}
 
 	scheduleTx, err := f.db.BeginTx(ctx, nil)
 	if err != nil {

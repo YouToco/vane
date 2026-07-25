@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const latestMigrationVersion int64 = 39
+const latestMigrationVersion int64 = 46
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -27,6 +27,9 @@ var wantTables = []string{
 	"push_batches",
 	"deliveries",
 	"feedbacks",
+	"task_event_qualification_steps",
+	"task_observed_events",
+	"feedback_freshness_triage",
 	"profiles",
 	"llm_calls",
 	// 002 M2 settings / 003 M3 schedules
@@ -124,6 +127,23 @@ func TestMigrationsCoverWantTables(t *testing.T) {
 	for tbl := range want {
 		if _, ok := created[tbl]; !ok {
 			t.Errorf("wantTables 记了表 %s，但没有任何迁移建它", tbl)
+		}
+	}
+}
+
+func TestObservationMigrationHasDurableDowngradeFence(t *testing.T) {
+	raw, err := fs.ReadFile(migrationsFS, "migrations/040_observation_feedback.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := string(raw)
+	for _, required := range []string{
+		"LOCK TABLE task_observed_events, task_event_qualification_steps, feedbacks",
+		"IN ACCESS EXCLUSIVE MODE",
+		"refusing downgrade while durable observation state exists",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration 040 missing downgrade fence fragment %q", required)
 		}
 	}
 }

@@ -23,6 +23,9 @@ type Store interface {
 	// 按分数降序；历史单条卡查回 1 行，重建路径据 len 分流。
 	ListDeliveriesByFeishuMessage(ctx context.Context, userID int64, msgID string) ([]types.Delivery, error)
 	InsertFeedback(ctx context.Context, f *types.Feedback) (int64, error)
+	AuditOutdatedFeedback(
+		ctx context.Context, userID, feedbackID int64,
+	) (types.FreshnessFeedbackAuditOutcome, error)
 	InsertDeepDiveFeedback(ctx context.Context, f *types.Feedback) (id int64, existingDetail string, existed bool, err error)
 	LatestFeedbackAction(ctx context.Context, deliveryID int64, actions []types.FeedbackAction) (types.FeedbackAction, error)
 	HasFeedback(ctx context.Context, deliveryID int64, action types.FeedbackAction) (bool, error)
@@ -201,16 +204,34 @@ func (s *Service) HandleClick(ctx context.Context, userID int64, click Click) (C
 	}
 
 	switch click.Action {
-	case types.FeedbackActionInterested, types.FeedbackActionNotInterested:
+	case types.FeedbackActionInterested:
 		return s.handleAttitude(ctx, userID, d, click.Action)
-	case types.FeedbackActionMisjudged:
-		return s.handleMisjudged(ctx, userID, d)
+	case types.FeedbackActionNotInterested, types.FeedbackActionMisjudged:
+		return s.openBadFeedback(ctx, d)
 	case types.FeedbackActionDeepDive:
 		return s.handleDeepDive(ctx, userID, d)
 	default:
 		// feishu 侧白名单已挡未知值，这里是纵深兜底。
 		return ClickResult{Toast: "未知操作"}, nil
 	}
+}
+
+// openBadFeedback only opens the reason panel. In particular, the historical
+// 👎 callback value remains accepted but no longer writes not_interested.
+func (s *Service) openBadFeedback(
+	ctx context.Context,
+	d *types.Delivery,
+) (ClickResult, error) {
+	has, err := s.deps.Store.HasFeedback(ctx, d.ID, types.FeedbackActionMisjudged)
+	if err != nil {
+		return ClickResult{}, err
+	}
+	if has {
+		return s.rebuilt(ctx, d, "已提交过问题反馈", true, nil), nil
+	}
+	return s.rebuilt(ctx, d, "请选择这条推送的问题", true, func(st *CardState) {
+		st.BadFeedbackOpen = true
+	}), nil
 }
 
 // handleAttitude 处理感兴趣/不感兴趣：追加式事件日志、最新为准。
@@ -233,33 +254,15 @@ func (s *Service) handleAttitude(ctx context.Context, userID int64, d *types.Del
 	return s.rebuilt(ctx, d, "已记录："+actionLabel(action), true, nil), nil
 }
 
-// handleMisjudged 处理误判：一次性信号（MVP 不可撤销），独立于态度、可并存。
-func (s *Service) handleMisjudged(ctx context.Context, userID int64, d *types.Delivery) (ClickResult, error) {
-	has, err := s.deps.Store.HasFeedback(ctx, d.ID, types.FeedbackActionMisjudged)
-	if err != nil {
-		return ClickResult{}, err
-	}
-	if has {
-		return s.rebuilt(ctx, d, "已标记过误判", true, nil), nil
-	}
-	if _, err := s.deps.Store.InsertFeedback(ctx, &types.Feedback{
-		UserID: userID, DeliveryID: d.ID, Action: types.FeedbackActionMisjudged,
-	}); err != nil {
-		return ClickResult{}, err
-	}
-	s.notifyClick(ctx, userID, d.ID, "误判", "")
-	return s.rebuilt(ctx, d, "已标记误判，将用于修正推送判断", true, nil), nil
-}
-
-// ReasonSubmit 表示 form 提交的反馈原因（点 👎 后出现的输入框）。
+// ReasonSubmit 表示“反馈问题”面板的一次提交。
 type ReasonSubmit struct {
 	DeliveryID int64
-	Reason     string // 用户填写的文字，可为空（"可跳过"）
+	ReasonCode types.FeedbackReason
+	Detail     string
 }
 
-// HandleReasonSubmit 处理 👎 后的 form 提交：记录 misjudged + detail。
-// 用户已点过 👎（not_interested 已落库），form 是可选的补充——空 reason 也算
-// 有效提交（语义：确认误判，但不想说原因）。
+// HandleReasonSubmit atomically records one misjudged event with a stable
+// reason. Opening or cancelling the panel creates no row.
 func (s *Service) HandleReasonSubmit(ctx context.Context, userID int64, submit ReasonSubmit) (ClickResult, error) {
 	d, err := s.deps.Store.GetDeliveryForUser(ctx, submit.DeliveryID, userID)
 	if err != nil {
@@ -273,20 +276,61 @@ func (s *Service) HandleReasonSubmit(ctx context.Context, userID int64, submit R
 		return ClickResult{}, err
 	}
 	if has {
-		return s.rebuilt(ctx, d, "已标记过误判", true, nil), nil
+		return s.rebuilt(ctx, d, "已提交过问题反馈", true, nil), nil
 	}
-	reason := promptguard.TruncateRunes(strings.TrimSpace(submit.Reason), 500)
-	if _, err := s.deps.Store.InsertFeedback(ctx, &types.Feedback{
-		UserID: userID, DeliveryID: d.ID, Action: types.FeedbackActionMisjudged, Detail: reason,
-	}); err != nil {
+	detail := promptguard.TruncateRunes(strings.TrimSpace(submit.Detail), 500)
+	// Already-issued legacy cards submit only free text. Normalize them to the
+	// typed "other" lane so they share the one-row unique constraint and can
+	// never bypass the new reason model.
+	if submit.ReasonCode == "" {
+		if detail == "" {
+			return ClickResult{Toast: "请填写问题说明"}, nil
+		}
+		submit.ReasonCode = types.FeedbackReasonOther
+	}
+	if !submit.ReasonCode.Valid() {
+		return ClickResult{Toast: "反馈原因无效，请重新选择"}, nil
+	}
+	if submit.ReasonCode == types.FeedbackReasonOther && detail == "" {
+		return ClickResult{Toast: "选择“其他”时请填写说明"}, nil
+	}
+	feedbackID, err := s.deps.Store.InsertFeedback(ctx, &types.Feedback{
+		UserID: userID, DeliveryID: d.ID, Action: types.FeedbackActionMisjudged,
+		ReasonCode: submit.ReasonCode, Detail: detail,
+	})
+	if err != nil {
 		return ClickResult{}, err
 	}
-	suffix := ""
-	if reason != "" {
-		suffix = "（附原因）"
+	label := submit.ReasonCode.Label()
+	if submit.ReasonCode == types.FeedbackReasonOutdated {
+		outcome, auditErr := s.deps.Store.AuditOutdatedFeedback(
+			ctx, userID, feedbackID)
+		if auditErr != nil {
+			slog.WarnContext(ctx, "feedback: 过时反馈审计失败",
+				"user_id", userID, "feedback_id", feedbackID, "err", auditErr)
+		} else {
+			s.routeFreshnessAudit(ctx, userID, d.ID, outcome)
+		}
 	}
-	s.notifyClick(ctx, userID, d.ID, "误判"+suffix, "")
-	return s.rebuilt(ctx, d, "已标记误判，将用于修正推送判断", true, nil), nil
+	s.notifyClick(ctx, userID, d.ID, "反馈问题："+label, "")
+	return s.rebuilt(ctx, d, "已记录问题反馈："+label, true, nil), nil
+}
+
+func (s *Service) routeFreshnessAudit(
+	ctx context.Context,
+	userID, deliveryID int64,
+	outcome types.FreshnessFeedbackAuditOutcome,
+) {
+	switch outcome {
+	case types.FreshnessAuditSystemDefect:
+		slog.ErrorContext(ctx, "feedback: 推送突破已批准的新鲜度窗口",
+			"user_id", userID, "delivery_id", deliveryID)
+	case types.FreshnessAuditTaskPolicySuggestion:
+		if s.deps.Notifier != nil {
+			s.deps.Notifier.NotifyEvent(ctx, userID,
+				fmt.Sprintf("[卡片回调] 用户反馈推送 #%d 过时；当前任务没有明确的新鲜度策略。请提出任务修改建议并等待用户确认，不得自动修改任务。", deliveryID))
+		}
+	}
 }
 
 // rebuilt 组装"toast + 重建卡"的返回：每次点击都按库内状态重建整卡

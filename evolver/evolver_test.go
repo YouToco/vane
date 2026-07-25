@@ -349,6 +349,70 @@ func TestBuildEvolveUser_DetailTruncateAndSanitize(t *testing.T) {
 	}
 }
 
+func TestBuildEvolveUser_MisjudgedReasonAndLegacyDetail(t *testing.T) {
+	at := time.Date(2026, 7, 24, 9, 0, 0, 0, time.UTC)
+	rows := []types.FeedbackWithContent{
+		{
+			Feedback: types.Feedback{
+				ID: 1, DeliveryID: 10, Action: types.FeedbackActionMisjudged,
+				ReasonCode: types.FeedbackReasonOutdated,
+				Detail:     "这都3个月前的内容了", CreatedAt: at,
+			},
+			Score: 95, ContentTitle: "旧新闻",
+		},
+		{
+			// 旧卡没有 reason_code；必须先走 feedbackrepair 的可确认预览，
+			// 不能在普通 Evolver 周期里把自由文本直接当成学习事实。
+			Feedback: types.Feedback{
+				ID: 2, DeliveryID: 11, Action: types.FeedbackActionMisjudged,
+				Detail: "发布时间太早", CreatedAt: at.Add(time.Minute),
+			},
+			Score: 90, ContentTitle: "历史卡",
+		},
+	}
+	got := buildEvolveUser(&types.Profile{}, rows)
+	for _, want := range []string{
+		"问题原因：过时或超出任务时间范围",
+		"备注：这都3个月前的内容了",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("演化提示必须消费原因/补充文字 %q，实际：\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "问题原因：\n") {
+		t.Errorf("空 reason_code 的旧卡不应伪造原因，实际：\n%s", got)
+	}
+	if strings.Contains(got, "备注：发布时间太早") {
+		t.Errorf("旧卡必须预览确认后再进入演化，实际：\n%s", got)
+	}
+}
+
+func TestFeedbackRowsForProfileLearningRoutesProblemReasons(t *testing.T) {
+	rows := []types.FeedbackWithContent{
+		{Feedback: types.Feedback{ID: 1, Action: types.FeedbackActionInterested}},
+		{Feedback: types.Feedback{
+			ID: 2, Action: types.FeedbackActionMisjudged,
+			ReasonCode: types.FeedbackReasonNotRelevant,
+		}},
+		{Feedback: types.Feedback{
+			ID: 3, Action: types.FeedbackActionMisjudged,
+			ReasonCode: types.FeedbackReasonOutdated,
+		}},
+		{Feedback: types.Feedback{
+			ID: 4, Action: types.FeedbackActionMisjudged,
+			ReasonCode: types.FeedbackReasonFactWrong,
+		}},
+		{Feedback: types.Feedback{
+			ID: 5, Action: types.FeedbackActionMisjudged,
+			ReasonCode: types.FeedbackReasonOther,
+		}},
+	}
+	got := feedbackRowsForProfileLearning(rows)
+	if len(got) != 2 || got[0].ID != 1 || got[1].ID != 2 {
+		t.Fatalf("profile learning rows=%+v, want interested + not_relevant", got)
+	}
+}
+
 // ---------- 集成测试（DATABASE_URL 门控 + httptest 假上游，模式同 llm/scorer 包） ----------
 
 // fakeUpstream 仿 DeepSeek 上游：记录每次请求体，按预设 status/content 应答。

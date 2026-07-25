@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -88,6 +89,19 @@ func (s *Store) beginCompiledRunWriteV1(
 	tx, err := s.beginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, taskRunDatabaseError("begin compiled task run write", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id', $1, true)`,
+		fmt.Sprintf("%d", expected.TenantID)); err != nil {
+		rollbackCompiledTaskTx(ctx, tx)
+		return nil, taskRunDatabaseError("set compiled task run tenant context", err)
+	}
+	// Production connects as the schema owner, which bypasses ordinary RLS.
+	// Every compiled write explicitly enters the same restricted application
+	// role exercised by RLS integration tests before reading any tenant row.
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		rollbackCompiledTaskTx(ctx, tx)
+		return nil, taskRunDatabaseError("enter compiled task run role", err)
 	}
 
 	lookup := CreateOrGetTaskRunSnapshotParams{

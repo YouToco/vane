@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
@@ -145,7 +146,8 @@ func (c *DefinitionEditController) Propose(
 			"task: definition edit basis digest differs",
 		)
 	}
-	target, summary, err := applyDefinitionEditCommand(base, command)
+	target, summary, err := applyDefinitionEditCommand(
+		base, command, time.Now().UTC().Truncate(time.Second))
 	if err != nil {
 		return DefinitionEditProposal{}, err
 	}
@@ -285,6 +287,7 @@ type definitionEditCommand struct {
 	Intent        *string
 	NLDescription *string
 	Strictness    *types.PushStrictness
+	ObservationPolicy *observation.PolicySpecV1
 }
 
 func decodeDefinitionEditCommand(raw json.RawMessage) (definitionEditCommand, error) {
@@ -294,6 +297,7 @@ func decodeDefinitionEditCommand(raw json.RawMessage) (definitionEditCommand, er
 		Intent        json.RawMessage `json:"intent,omitempty"`
 		NLDescription json.RawMessage `json:"nl_description,omitempty"`
 		Strictness    json.RawMessage `json:"strictness,omitempty"`
+		ObservationPolicy json.RawMessage `json:"observation_policy,omitempty"`
 	}
 	if strictjson.DecodeExact(raw, &wire) != nil {
 		return definitionEditCommand{}, definitionEditControllerValidation(
@@ -346,8 +350,19 @@ func decodeDefinitionEditCommand(raw json.RawMessage) (definitionEditCommand, er
 		}
 		command.Strictness = &strictness
 	}
+	if len(wire.ObservationPolicy) != 0 {
+		var policy observation.PolicySpecV1
+		if strictjson.DecodeExact(wire.ObservationPolicy, &policy) != nil ||
+			policy.Validate() != nil {
+			return definitionEditCommand{}, definitionEditControllerValidation(
+				"observation_policy 无效",
+			)
+		}
+		command.ObservationPolicy = &policy
+	}
 	if command.Spec == nil && command.Intent == nil &&
-		command.NLDescription == nil && command.Strictness == nil {
+		command.NLDescription == nil && command.Strictness == nil &&
+		command.ObservationPolicy == nil {
 		return definitionEditCommand{}, definitionEditControllerValidation(
 			"请至少提供一项要修改的任务定义",
 		)
@@ -358,9 +373,14 @@ func decodeDefinitionEditCommand(raw json.RawMessage) (definitionEditCommand, er
 func applyDefinitionEditCommand(
 	base taskstate.ApprovedDefinitionV1,
 	command definitionEditCommand,
+	effectiveTimes ...time.Time,
 ) (taskstate.ApprovedDefinitionV1, string, error) {
 	target := base
 	changes := make([]string, 0, 4)
+	effectiveAt := time.Now().UTC().Truncate(time.Second)
+	if len(effectiveTimes) > 0 {
+		effectiveAt = effectiveTimes[0]
+	}
 	if command.Spec != nil {
 		canonical, err := json.Marshal(command.Spec)
 		if err != nil {
@@ -396,6 +416,31 @@ func applyDefinitionEditCommand(
 		target.Strictness = *command.Strictness
 		changes = append(changes,
 			"推送门槛改为"+definitionEditStrictnessLabel(*command.Strictness))
+	}
+	if command.ObservationPolicy != nil {
+		policy, err := observation.Compile(*command.ObservationPolicy, effectiveAt)
+		if err != nil {
+			return taskstate.ApprovedDefinitionV1{}, "",
+				definitionEditControllerValidation("observation_policy 无法生效")
+		}
+		var current struct {
+			SourceIDs []int64 `json:"source_ids,omitempty"`
+			TopN int `json:"top_n,omitempty"`
+			Observation *observation.PolicyV1 `json:"observation,omitempty"`
+		}
+		if strictjson.DecodeExact(target.ScopeJSON, &current) != nil {
+			return taskstate.ApprovedDefinitionV1{}, "",
+				definitionEditControllerValidation("当前任务范围无效")
+		}
+		current.Observation = &policy
+		canonical, err := json.Marshal(current)
+		if err != nil {
+			return taskstate.ApprovedDefinitionV1{}, "",
+				definitionEditControllerValidation("新鲜度策略无法规范化")
+		}
+		target.ScopeJSON = canonical
+		changes = append(changes, "新鲜度策略已更新（生效时间 "+
+			policy.EffectiveAt.Format(time.RFC3339)+"）")
 	}
 	if err := taskstate.ValidateApprovedDefinitionV1ForWrite(target); err != nil {
 		return taskstate.ApprovedDefinitionV1{}, "",

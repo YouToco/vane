@@ -14,9 +14,7 @@
 // 能直接复用 selector.RankTopN 而非各写一份 TopN。
 package workflow
 
-import (
-	"github.com/YouToco/vane/types"
-)
+import "github.com/YouToco/vane/types"
 
 // defaultTopN 是每批默认推送条数（PushScope.TopN 为 0 时取此值，见规格 B1）。
 const defaultTopN = 5

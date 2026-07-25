@@ -16,11 +16,11 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-// 本文件测的是**编排**：五处"无内容可推"闸门各自留下一行空批次（009 /
+// 本文件测的是**编排**：各处"无内容可推"闸门各自留下一行空批次（009 /
 // 契约 §16 修订记录「空批次缺口」），且记账失败不改变正常终态。
 //
 // 为什么用桩替换全部 Activity，而不是注入 fake 依赖跑真 Activity：
-// 五个闸门里**有三个（score/select/cardgen）用真 Activity 根本走不到**——
+// 其中**有三个（score/select/cardgen）用真 Activity 根本走不到**——
 // Score/CardGen 整批失败时返回的是 CodeLLMUnavailable 错误而非空切片
 // （activities.go 的 `len(x)==0 && len(in.Items)>0` 分支），selector.RankTopN
 // 在 n>=1 且输入非空时恒返回非空（selector.go:65-67）。它们是**防御性**闸门：
@@ -37,11 +37,13 @@ import (
 // 与 gateStubs 分开，是为了让用例表能安全按值拷贝——gateStubs 带锁，
 // 放进表里再 range 就是 copylocks（go vet 会拦，且拷出来的锁本就没意义）。
 type gateOut struct {
-	items    []types.ContentItem
-	deduped  []types.ContentItem
-	scored   []types.ScoredItem
-	selected []types.ScoredItem
-	cards    []GeneratedCard
+	items          []types.ContentItem
+	deduped        []types.ContentItem
+	qualifyEmpty   bool
+	qualifyOutcome string
+	scored         []types.ScoredItem
+	selected       []types.ScoredItem
+	cards          []GeneratedCard
 
 	recErr error // 非 nil = 模拟记账活动失败
 }
@@ -66,6 +68,12 @@ func (g *gateStubs) register(env *testsuite.TestWorkflowEnvironment) {
 	reg("EvolveProfile", func(context.Context, EvolveIn) error { return nil })
 	reg("Fetch", func(context.Context, PushParams) ([]types.ContentItem, error) { return g.out.items, nil })
 	reg("Dedup", func(context.Context, DedupIn) ([]types.ContentItem, error) { return g.out.deduped, nil })
+	reg("QualifyEvents", func(_ context.Context, in QualifyEventsIn) (QualifyEventsResult, error) {
+		if g.out.qualifyEmpty {
+			return QualifyEventsResult{Outcome: g.out.qualifyOutcome}, nil
+		}
+		return QualifyEventsResult{Items: in.Items, Outcome: "not_configured"}, nil
+	})
 	reg("Score", func(context.Context, ScoreIn) ([]types.ScoredItem, error) { return g.out.scored, nil })
 	reg("Select", func(context.Context, SelectIn) ([]types.ScoredItem, error) { return g.out.selected, nil })
 	reg("CardGen", func(context.Context, CardGenIn) ([]GeneratedCard, error) { return g.out.cards, nil })
@@ -153,6 +161,7 @@ func countsStr(c types.PipelineCounts) string {
 	}
 	add("fetched", c.Fetched)
 	add("deduped", c.Deduped)
+	add("qualified", c.Qualified)
 	add("scored", c.Scored)
 	add("selected", c.Selected)
 	add("cards", c.Cards)
@@ -183,7 +192,7 @@ func cardsOf(n int) []GeneratedCard {
 	return out
 }
 
-// TestPushPipelineWorkflow_EmptyBatchExitGates 五个闸门各自的退出路径：
+// TestPushPipelineWorkflow_EmptyBatchExitGates 各闸门的退出路径：
 // 恰好记一行空批次、闸门对得上、漏斗停在该停的地方、且 workflow 仍是成功终态。
 func TestPushPipelineWorkflow_EmptyBatchExitGates(t *testing.T) {
 	tests := []struct {
@@ -209,10 +218,28 @@ func TestPushPipelineWorkflow_EmptyBatchExitGates(t *testing.T) {
 			wantCounts: "fetched=20 deduped=0",
 		},
 		{
+			name: "observation 闸门：本周期无新事件",
+			out: gateOut{
+				items: items(20), deduped: items(18),
+				qualifyEmpty: true, qualifyOutcome: "no_match",
+			},
+			wantGate:   types.BatchExitGateObservationNoMatch,
+			wantCounts: "fetched=20 deduped=18 qualified=0",
+		},
+		{
+			name: "observation 闸门：证据不足",
+			out: gateOut{
+				items: items(20), deduped: items(18),
+				qualifyEmpty: true, qualifyOutcome: "uncertain",
+			},
+			wantGate:   types.BatchExitGateObservationUncertain,
+			wantCounts: "fetched=20 deduped=18 qualified=0",
+		},
+		{
 			name:       "score 闸门：打分后无内容",
 			out:        gateOut{items: items(20), deduped: items(18)},
 			wantGate:   types.BatchExitGateScore,
-			wantCounts: "fetched=20 deduped=18 scored=0",
+			wantCounts: "fetched=20 deduped=18 qualified=18 scored=0",
 		},
 		{
 			name: "select 闸门：择优后无内容",
@@ -220,7 +247,7 @@ func TestPushPipelineWorkflow_EmptyBatchExitGates(t *testing.T) {
 				items: items(20), deduped: items(18), scored: scoredItems(18),
 			},
 			wantGate:   types.BatchExitGateSelect,
-			wantCounts: "fetched=20 deduped=18 scored=18 selected=0",
+			wantCounts: "fetched=20 deduped=18 qualified=18 scored=18 selected=0",
 		},
 		{
 			name: "cardgen 闸门：卡片生成后无内容",
@@ -229,7 +256,7 @@ func TestPushPipelineWorkflow_EmptyBatchExitGates(t *testing.T) {
 				selected: scoredItems(5),
 			},
 			wantGate:   types.BatchExitGateCardGen,
-			wantCounts: "fetched=20 deduped=18 scored=18 selected=5 cards=0",
+			wantCounts: "fetched=20 deduped=18 qualified=18 scored=18 selected=5 cards=0",
 		},
 	}
 

@@ -228,6 +228,34 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 		return nil
 	}
 
+	// 2.5 Observation —— 新鲜度/事件判定。旧历史没有该 Activity，
+	// GetVersion 让 replay 保持原命令序列；新运行由 Activity 内的 exact-task
+	// shadow/authority 路由决定是否真正过滤。
+	if workflow.GetVersion(
+		ctx, "observation-qualification-v1", workflow.DefaultVersion, 1,
+	) >= 1 {
+		qualifyCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
+		var qualified QualifyEventsResult
+		if err := workflow.ExecuteActivity(qualifyCtx, a.QualifyEvents, QualifyEventsIn{
+			UserID: p.UserID, TraceID: traceID, ScheduleID: p.ScheduleID,
+			Items: deduped, Run: compiledRun,
+		}).Get(qualifyCtx, &qualified); err != nil {
+			return err
+		}
+		counts = counts.WithQualified(len(qualified.Items))
+		if len(qualified.Items) == 0 {
+			gate := types.BatchExitGateObservationNoMatch
+			if qualified.Outcome == "uncertain" {
+				gate = types.BatchExitGateObservationUncertain
+			}
+			recordEmpty(gate, -1)
+			log.Info("观察策略判定后无可推事件",
+				"trace_id", traceID, "outcome", qualified.Outcome)
+			return nil
+		}
+		deduped = qualified.Items
+	}
+
 	// 3. Score —— LLM 调用，超时给足。
 	var scored []types.ScoredItem
 	scoreCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())

@@ -113,6 +113,59 @@ func TestSnapshotV2ReadAuditCanaryValidation(t *testing.T) {
 	}
 }
 
+func TestObservationCanaryValidation(t *testing.T) {
+	tests := []struct {
+		name       string
+		compiled   bool
+		compiledID string
+		allowAll   bool
+		shadow     string
+		authority  string
+		wantErr    bool
+	}{
+		{name: "off"},
+		{
+			name: "shadow only", compiled: true, compiledID: "push-observe",
+			shadow: " push-observe ",
+		},
+		{
+			name: "authority exact", compiled: true, compiledID: "push-observe",
+			shadow: "push-observe", authority: "push-observe",
+		},
+		{
+			name: "allow all compiled", compiled: true, allowAll: true,
+			shadow: "push-observe", authority: "push-observe",
+		},
+		{name: "disabled", shadow: "push-observe", wantErr: true},
+		{
+			name: "outside compiled canary", compiled: true,
+			compiledID: "push-other", shadow: "push-observe", wantErr: true,
+		},
+		{
+			name: "authority differs", compiled: true, compiledID: "push-observe",
+			shadow: "push-observe", authority: "push-other", wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{
+				DB: DBConfig{URL: "postgres://test"},
+				Pipeline: PipelineConfig{
+					CompiledRuntimeEnabled:               test.compiled,
+					CompiledRuntimeCanaryScheduleID:      test.compiledID,
+					CompiledRuntimeAllowAll:              test.allowAll,
+					ObservationShadowCanaryScheduleID:    test.shadow,
+					ObservationAuthorityCanaryScheduleID: test.authority,
+				},
+			}
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error=%v wantErr=%v", err, test.wantErr)
+			}
+		})
+	}
+}
+
 // clearVaneEnv 清掉本进程可能残留的 VANE_ 环境变量，保证测试相互隔离。
 // 通过 t.Setenv("", …) 之外的 os.Unsetenv 也能配合 t.Setenv 的自动恢复：
 // 先 t.Setenv 注册恢复点，再 os.Unsetenv 真正清空。

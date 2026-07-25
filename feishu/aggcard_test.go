@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/types"
 )
 
 // xhsTokenURL 带 xsec_token 访问票据的真实形状小红书 URL。规格 A.3 硬约束：
@@ -59,21 +58,21 @@ func TestAggregateCard_href逐字符保留(t *testing.T) {
 // 必须按 delivery_id 互异——单条卡的硬编码 name 在 N 条 form 并存时必然重名，
 // 正是"对 B 条说推错、记到 A 条"的物理路径。
 func TestAggregateCard_双form名互异(t *testing.T) {
-	nin := feedback.CardState{Preference: types.FeedbackActionNotInterested}
+	nin := feedback.CardState{BadFeedbackOpen: true}
 	card := BuildAggregateCard(feedback.AggregateCardInput{Items: []feedback.CardInput{
 		{DeliveryID: 101, Title: "甲", State: nin},
 		{DeliveryID: 102, Title: "乙", State: nin},
 	}})
 	for _, want := range []string{
-		`"name":"fbr_101"`, `"name":"reason_101"`, `"name":"submit_101"`,
-		`"name":"fbr_102"`, `"name":"reason_102"`, `"name":"submit_102"`,
+		`"name":"fbr_101"`, `"name":"detail_101"`, `"name":"submit_101_outdated_or_out_of_window"`,
+		`"name":"fbr_102"`, `"name":"detail_102"`, `"name":"submit_102_outdated_or_out_of_window"`,
 	} {
 		if !strings.Contains(card, want) {
 			t.Errorf("双 form 卡应含唯一化 name %s，卡：%s", want, card)
 		}
 	}
 	// 旧世界的硬编码 name 绝不能出现在聚合卡里。
-	for _, bad := range []string{`"name":"feedback_reason"`, `"name":"reason"`, `"name":"submit_reason"`} {
+	for _, bad := range []string{`"name":"feedback_reason"`, `"name":"reason"`, `"name":"submit_reason_outdated_or_out_of_window"`} {
 		if strings.Contains(card, bad) {
 			t.Errorf("聚合卡不得出现硬编码 form name %s（串条物理路径），卡：%s", bad, card)
 		}
@@ -84,7 +83,7 @@ func TestAggregateCard_双form名互异(t *testing.T) {
 // name，且必须含 form_action_type=submit 的提交按钮——结构性校验防整卡被拒。
 func TestAggregateCard_form硬约束(t *testing.T) {
 	card := BuildAggregateCard(feedback.AggregateCardInput{Items: []feedback.CardInput{
-		{DeliveryID: 7, Title: "x", State: feedback.CardState{Preference: types.FeedbackActionNotInterested}},
+		{DeliveryID: 7, Title: "x", State: feedback.CardState{BadFeedbackOpen: true}},
 	}})
 	var c struct {
 		Body struct {
@@ -102,7 +101,7 @@ func TestAggregateCard_form硬约束(t *testing.T) {
 		}
 	}
 	if form == nil {
-		t.Fatal("not_interested 未误判时应渲染 form")
+		t.Fatal("打开问题面板时应渲染 form")
 	}
 	els, _ := form["elements"].([]any)
 	hasSubmit := false
@@ -120,21 +119,19 @@ func TestAggregateCard_form硬约束(t *testing.T) {
 	}
 }
 
-// TestAggregateCard_状态门控 form 只在该条 not_interested 且未 misjudged 时出现；
+// TestAggregateCard_状态门控 form 只在该条暂态打开且未 misjudged 时出现；
 // 兄弟条目的状态互不串染。深挖按钮不得出现在聚合卡。
 func TestAggregateCard_状态门控(t *testing.T) {
 	card := BuildAggregateCard(feedback.AggregateCardInput{Items: []feedback.CardInput{
 		{DeliveryID: 1, Title: "未表态"},
-		{DeliveryID: 2, Title: "已误判", State: feedback.CardState{
-			Preference: types.FeedbackActionNotInterested, Misjudged: true}},
-		{DeliveryID: 3, Title: "待填原因", State: feedback.CardState{
-			Preference: types.FeedbackActionNotInterested}},
+		{DeliveryID: 2, Title: "已误判", State: feedback.CardState{BadFeedbackOpen: true, Misjudged: true}},
+		{DeliveryID: 3, Title: "待填原因", State: feedback.CardState{BadFeedbackOpen: true}},
 	}})
 	if strings.Contains(card, `"name":"fbr_1"`) || strings.Contains(card, `"name":"fbr_2"`) {
 		t.Error("未表态/已误判的条目不该渲染 form")
 	}
 	if !strings.Contains(card, `"name":"fbr_3"`) {
-		t.Error("not_interested 未误判的条目应渲染 form")
+		t.Error("打开问题面板且未提交的条目应渲染 form")
 	}
 	if strings.Contains(card, "深挖") {
 		t.Error("深挖按钮不得出现在聚合卡面（附录 A.2）")
@@ -177,7 +174,7 @@ func TestExtractReasonFromForm_三重对齐(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := extractReasonFromForm(c.actionName, c.fv, c.deliveryID)
+			got, err := extractReasonFromForm(c.actionName, c.fv, c.deliveryID, "")
 			if (err != nil) != c.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, c.wantErr)
 			}

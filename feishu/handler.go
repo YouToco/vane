@@ -515,7 +515,7 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 	}
 	verb, actionID := parseCardActionValue(event.Event.Action.Value)
 	fbAction, deliveryID, isFeedback := parseFeedbackValue(event.Event.Action.Value)
-	reasonDeliveryID, isReasonSubmit := parseFeedbackReasonValue(event.Event.Action.Value)
+	reasonDeliveryID, reasonCode, isReasonSubmit := parseFeedbackReasonValue(event.Event.Action.Value)
 	// 四类 value 之外（含 value 结构不识别）静默忽略，不弹错误打扰。
 	if !isFeedback && !isReasonSubmit && (actionID == "" || (verb != cardActionConfirm && verb != cardActionCancel)) {
 		return &callback.CardActionTriggerResponse{}, nil
@@ -549,7 +549,7 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 			slog.Error("feishu: 反馈原因回调 upsert 用户失败", "err", err, "open_id", operatorID)
 			return toastResponse("error", "内部数据错误，请稍后重试"), nil
 		}
-		reason, rerr := extractReasonFromForm(event.Event.Action.Name, event.Event.Action.FormValue, reasonDeliveryID)
+		detail, rerr := extractReasonFromForm(event.Event.Action.Name, event.Event.Action.FormValue, reasonDeliveryID, reasonCode)
 		if rerr != nil {
 			// 三重对齐失败 = 提交按钮与 value 指向的条目对不上。绝不猜、绝不静默落库
 			// ——错误归属的 misjudged 不可撤销且会毒化画像演化（附录 A.4 红线）。
@@ -557,7 +557,7 @@ func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTrig
 				"action_name", event.Event.Action.Name, "delivery_id", reasonDeliveryID, "err", rerr)
 			return toastResponse("error", "表单数据异常，请重新点击 👎 后再试"), nil
 		}
-		return h.onFeedbackReasonSubmit(user.ID, reasonDeliveryID, reason), nil
+		return h.onFeedbackReasonSubmit(user.ID, reasonDeliveryID, reasonCode, detail), nil
 	}
 
 	runner := h.m.agentRunner()
@@ -774,20 +774,33 @@ func parseFeedbackValue(value map[string]interface{}) (action types.FeedbackActi
 
 // parseFeedbackReasonValue 解析 form 提交的"fbr" value：只需 delivery_id，
 // 原因文本在 FormValue 里（由调用方提取）。
-func parseFeedbackReasonValue(value map[string]interface{}) (deliveryID int64, ok bool) {
+func parseFeedbackReasonValue(value map[string]interface{}) (
+	deliveryID int64,
+	reasonCode types.FeedbackReason,
+	ok bool,
+) {
 	if verb, _ := value["vane_action"].(string); verb != cardActionFeedbackReason {
-		return 0, false
+		return 0, "", false
 	}
 	idStr, _ := value["delivery_id"].(string)
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil || id <= 0 {
-		return 0, false
+		return 0, "", false
 	}
-	return id, true
+	rawReason, _ := value["reason_code"].(string)
+	reasonCode = types.FeedbackReason(rawReason)
+	if reasonCode != "" && !reasonCode.Valid() {
+		return 0, "", false
+	}
+	return id, reasonCode, true
 }
 
 // onFeedbackReasonSubmit 处理 👎 后 form 提交的反馈原因。
-func (h *handler) onFeedbackReasonSubmit(userID, deliveryID int64, reason string) *callback.CardActionTriggerResponse {
+func (h *handler) onFeedbackReasonSubmit(
+	userID, deliveryID int64,
+	reasonCode types.FeedbackReason,
+	detail string,
+) *callback.CardActionTriggerResponse {
 	fb := h.m.feedbackRunner()
 	if fb == nil {
 		return toastResponse("error", "反馈功能尚未就绪，请稍后重试")
@@ -803,7 +816,7 @@ func (h *handler) onFeedbackReasonSubmit(userID, deliveryID int64, reason string
 				}
 			}()
 			result, err := fb.HandleReasonSubmit(execCtx, userID, feedback.ReasonSubmit{
-				DeliveryID: deliveryID, Reason: reason,
+				DeliveryID: deliveryID, ReasonCode: reasonCode, Detail: detail,
 			})
 			if err != nil {
 				slog.Error("feishu: 反馈原因处理失败", "err", err, "delivery_id", deliveryID)
@@ -1201,7 +1214,9 @@ func parsePostContent(raw string) string {
 			// 正是 URL，锚文本与 href 不同时以"锚文本 (href)"并入正文；
 			// 相同（裸链接粘贴的常态）则不重复。
 			if node.Tag == "a" && node.Href != "" && node.Href != node.Text {
-				sb.WriteString(" (" + node.Href + ")")
+				sb.WriteString(" (")
+				sb.WriteString(node.Href)
+				sb.WriteString(")")
 			}
 		}
 		if line := sb.String(); strings.TrimSpace(line) != "" {
@@ -1248,9 +1263,20 @@ func strVal(p *string) string {
 // 对齐通过后 key 缺失按空串处理（原因本就可跳过），不回退旧 key——回退等于把
 // "取错 form 的数据"重新变成静默路径。Name 为空的兜底只服务极老事件形状：仅当
 // FormValue 里只有旧世界的 "reason" 键时才按历史卡处理。
-func extractReasonFromForm(actionName string, formValue map[string]interface{}, deliveryID int64) (string, error) {
+func extractReasonFromForm(
+	actionName string,
+	formValue map[string]interface{},
+	deliveryID int64,
+	reasonCode types.FeedbackReason,
+) (string, error) {
 	idStr := strconv.FormatInt(deliveryID, 10)
 	switch {
+	case reasonCode.Valid() && actionName == "submit_reason_"+string(reasonCode):
+		detail, _ := formValue["detail"].(string)
+		return detail, nil
+	case reasonCode.Valid() && actionName == "submit_"+idStr+"_"+string(reasonCode):
+		detail, _ := formValue["detail_"+idStr].(string)
+		return detail, nil
 	case actionName == "submit_reason":
 		// 历史单条卡：一卡一 form，无串条面。
 		reason, _ := formValue["reason"].(string)

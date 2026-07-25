@@ -135,6 +135,11 @@ type PipelineConfig struct {
 	// typed materialization for exactly the same task as the shadow writer.
 	// Empty is the complete rollback/off state; v1 remains authoritative.
 	SnapshotV2ReadAuditCanaryScheduleID string `mapstructure:"snapshot_v2_read_audit_canary_schedule_id"`
+	// ObservationShadowCanaryScheduleID computes the new policy for exactly one
+	// task without changing candidates. AuthorityCanary may only name that same
+	// task and is the exact rollback switch for deterministic admission.
+	ObservationShadowCanaryScheduleID    string `mapstructure:"observation_shadow_canary_schedule_id"`
+	ObservationAuthorityCanaryScheduleID string `mapstructure:"observation_authority_canary_schedule_id"`
 }
 
 // AgentConfig 是 agent loop 运行约束配置。
@@ -400,6 +405,32 @@ func (c *Config) Validate() error {
 		return errors.New("config: snapshot v2 read audit canary 必须位于 compiled runtime rollout")
 	}
 	c.Pipeline.SnapshotV2ReadAuditCanaryScheduleID = readAuditCanaryID
+
+	rawObservationShadow := c.Pipeline.ObservationShadowCanaryScheduleID
+	observationShadow := strings.TrimSpace(rawObservationShadow)
+	if rawObservationShadow != "" && observationShadow == "" {
+		return errors.New("config: pipeline.observation_shadow_canary_schedule_id 不能仅含空白")
+	}
+	if observationShadow != "" && !validSnapshotShadowCanaryID(observationShadow) {
+		return errors.New("config: pipeline.observation_shadow_canary_schedule_id 无效")
+	}
+	rawObservationAuthority := c.Pipeline.ObservationAuthorityCanaryScheduleID
+	observationAuthority := strings.TrimSpace(rawObservationAuthority)
+	if rawObservationAuthority != "" && observationAuthority == "" {
+		return errors.New("config: pipeline.observation_authority_canary_schedule_id 不能仅含空白")
+	}
+	if observationAuthority != "" && observationAuthority != observationShadow {
+		return errors.New("config: observation authority canary 必须精确等于 shadow canary")
+	}
+	if observationShadow != "" && !c.Pipeline.CompiledRuntimeEnabled {
+		return errors.New("config: observation canary 要求 compiled runtime 已启用")
+	}
+	if observationShadow != "" && !c.Pipeline.CompiledRuntimeAllowAll &&
+		compiledCanaryID != observationShadow {
+		return errors.New("config: observation canary 必须位于 compiled runtime rollout")
+	}
+	c.Pipeline.ObservationShadowCanaryScheduleID = observationShadow
+	c.Pipeline.ObservationAuthorityCanaryScheduleID = observationAuthority
 
 	if c.Server.Addr == "" {
 		c.Server.Addr = "127.0.0.1:8080" // 与 setDefaults 一致：空值回退也只绑 loopback

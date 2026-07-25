@@ -82,6 +82,17 @@ type ContentItem struct {
 	Simhash     *int64     `json:"simhash,omitempty"`      // BIGINT，可空（未计算时为 NULL）
 	FetchedAt   time.Time  `json:"fetched_at"`
 	CreatedAt   time.Time  `json:"created_at"`
+	// ObservationEventKey/PolicyDigest are runtime-only admission labels. They
+	// are not content facts and are never persisted to content_items; they flow
+	// through Score/CardGen so Push can bind the exact qualified event to its
+	// delivery before any external send.
+	ObservationEventKey     string          `json:"observation_event_key,omitempty"`
+	ObservationPolicyDigest string          `json:"observation_policy_digest,omitempty"`
+	ObservationEventJSON    json.RawMessage `json:"observation_event_json,omitempty"`
+	// ObservationScorePenalty is a runtime-only deterministic adjustment for
+	// content whose source supplied no date under a confirmed "deprioritize"
+	// policy. It is never persisted as an objective content fact.
+	ObservationScorePenalty float64 `json:"observation_score_penalty,omitempty"`
 }
 
 // PipelineCounts 是一次 pipeline 的漏斗快照（push_batches.stage_counts，JSONB）：
@@ -105,11 +116,12 @@ type ContentItem struct {
 // 消费方各不相同故不能在 types 里定死。漏斗计数恰恰相反——形状固定且全系统唯一，
 // 定成结构体才能让 store/probe/前端共用一份、编译期对齐。
 type PipelineCounts struct {
-	Fetched  *int `json:"fetched,omitempty"`
-	Deduped  *int `json:"deduped,omitempty"`
-	Scored   *int `json:"scored,omitempty"`
-	Selected *int `json:"selected,omitempty"`
-	Cards    *int `json:"cards,omitempty"`
+	Fetched   *int `json:"fetched,omitempty"`
+	Deduped   *int `json:"deduped,omitempty"`
+	Qualified *int `json:"qualified,omitempty"`
+	Scored    *int `json:"scored,omitempty"`
+	Selected  *int `json:"selected,omitempty"`
+	Cards     *int `json:"cards,omitempty"`
 }
 
 // WithFetched 等五个方法逐级填漏斗，返回副本而非就地改。
@@ -117,11 +129,12 @@ type PipelineCounts struct {
 // 值接收者 + 返回副本是为了在 **workflow 函数体内**安全使用（Temporal 确定性约束，
 // workflow/types.go:5-8）：纯计算、无共享状态、重放逐字一致。顺带把取地址收进
 // 方法内部——每次调用的形参 n 都是新变量，杜绝了循环里 &i 全指同一个的经典坑。
-func (c PipelineCounts) WithFetched(n int) PipelineCounts  { c.Fetched = &n; return c }
-func (c PipelineCounts) WithDeduped(n int) PipelineCounts  { c.Deduped = &n; return c }
-func (c PipelineCounts) WithScored(n int) PipelineCounts   { c.Scored = &n; return c }
-func (c PipelineCounts) WithSelected(n int) PipelineCounts { c.Selected = &n; return c }
-func (c PipelineCounts) WithCards(n int) PipelineCounts    { c.Cards = &n; return c }
+func (c PipelineCounts) WithFetched(n int) PipelineCounts   { c.Fetched = &n; return c }
+func (c PipelineCounts) WithDeduped(n int) PipelineCounts   { c.Deduped = &n; return c }
+func (c PipelineCounts) WithQualified(n int) PipelineCounts { c.Qualified = &n; return c }
+func (c PipelineCounts) WithScored(n int) PipelineCounts    { c.Scored = &n; return c }
+func (c PipelineCounts) WithSelected(n int) PipelineCounts  { c.Selected = &n; return c }
+func (c PipelineCounts) WithCards(n int) PipelineCounts     { c.Cards = &n; return c }
 
 // PushBatch 一次推送决策周期（push_batches 表）。
 type PushBatch struct {
@@ -166,6 +179,7 @@ type Feedback struct {
 	UserID     int64          `json:"user_id"`
 	DeliveryID int64          `json:"delivery_id"`
 	Action     FeedbackAction `json:"action"` // NOT NULL
+	ReasonCode FeedbackReason `json:"reason_code,omitempty"`
 	Detail     string         `json:"detail"` // 文字反馈原文，按钮反馈为空串
 	CreatedAt  time.Time      `json:"created_at"`
 }

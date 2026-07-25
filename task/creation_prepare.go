@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/types"
@@ -103,6 +104,7 @@ type createScheduleCommandArgs struct {
 	NLDescription     string                     `json:"nl_description"`
 	Strictness        types.PushStrictness       `json:"strictness"`
 	ApprovedFetchPlan json.RawMessage            `json:"approved_fetch_plan"`
+	ObservationPolicy *observation.PolicySpecV1  `json:"observation_policy,omitempty"`
 }
 
 type createScheduleCommandSpec struct {
@@ -113,12 +115,13 @@ type createScheduleCommandSpec struct {
 }
 
 type normalizedCreateScheduleCommand struct {
-	Version           string                 `json:"version"`
-	Spec              scheduler.ScheduleSpec `json:"spec"`
-	Intent            string                 `json:"intent"`
-	NLDescription     string                 `json:"nl_description"`
-	Strictness        types.PushStrictness   `json:"strictness,omitempty"`
-	ApprovedFetchPlan json.RawMessage        `json:"approved_fetch_plan"`
+	Version           string                    `json:"version"`
+	Spec              scheduler.ScheduleSpec    `json:"spec"`
+	Intent            string                    `json:"intent"`
+	NLDescription     string                    `json:"nl_description"`
+	Strictness        types.PushStrictness      `json:"strictness,omitempty"`
+	ApprovedFetchPlan json.RawMessage           `json:"approved_fetch_plan"`
+	ObservationPolicy *observation.PolicySpecV1 `json:"observation_policy,omitempty"`
 }
 
 type compiledTaskDefinitionCheckpoint struct {
@@ -131,6 +134,7 @@ type compiledTaskDefinitionCheckpoint struct {
 	CommandDigest    string                 `json:"command_digest"`
 	Spec             scheduler.ScheduleSpec `json:"spec"`
 	Scope            workflow.PushScope     `json:"scope"`
+	Observation      *observation.PolicyV1  `json:"observation,omitempty"`
 	NLDescription    string                 `json:"nl_description"`
 	PlaybookContent  string                 `json:"playbook_content"`
 	FetchPlan        json.RawMessage        `json:"fetch_plan"`
@@ -250,6 +254,17 @@ func (p *CreationPreparer) Prepare(
 
 	playbook := command.Intent
 	canonicalPlan := bytes.Clone(command.ApprovedFetchPlan)
+	var compiledObservation *observation.PolicyV1
+	if command.ObservationPolicy != nil {
+		policy, policyErr := observation.Compile(*command.ObservationPolicy, loaded.CreatedAt)
+		if policyErr != nil {
+			return CreationPrepareResult{}, p.failKnownFailure(
+				ctx, in.Lease, "observation_policy_invalid",
+				"已批准的新鲜度策略无法生效，未创建任务", policyErr,
+			)
+		}
+		compiledObservation = &policy
+	}
 
 	compiled := compiledTaskDefinitionCheckpoint{
 		Version:         compiledDefinitionVersion,
@@ -260,6 +275,7 @@ func (p *CreationPreparer) Prepare(
 		CommandDigest:   sha256Hex(commandBytes),
 		Spec:            command.Spec,
 		Scope:           workflow.PushScope{},
+		Observation:     compiledObservation,
 		NLDescription:   command.NLDescription,
 		PlaybookContent: playbook,
 		FetchPlan:       canonicalPlan,
@@ -353,7 +369,7 @@ func (p *CreationPreparer) prepareSchedule(
 	}
 	prepared, err := p.schedules.Prepare(ctx, scheduler.TaskScheduleRequest{
 		TenantID: in.TenantID, UserID: in.UserID, OperationID: in.OperationID,
-		Spec: compiled.Spec, Scope: workflow.PushScope{},
+		Spec: compiled.Spec, Scope: compiled.Scope,
 		NLDescription: compiled.NLDescription, PreparedDigest: digest,
 	})
 	if err != nil {
@@ -508,6 +524,12 @@ func normalizeCreateScheduleEnvelope(
 		return normalizedCreateScheduleCommand{},
 			errors.New("task: strictness must be empty, loose, normal, or strict")
 	}
+	if args.ObservationPolicy != nil {
+		if err := args.ObservationPolicy.Validate(); err != nil {
+			return normalizedCreateScheduleCommand{},
+				fmt.Errorf("task: observation_policy is invalid: %w", err)
+		}
+	}
 	spec, err := normalizeCreationScheduleSpec(*args.Spec)
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, err
@@ -523,6 +545,7 @@ func normalizeCreateScheduleEnvelope(
 	return normalizedCreateScheduleCommand{
 		Version: creationCommandVersion, Spec: spec,
 		Intent: intent, NLDescription: description, Strictness: args.Strictness,
+		ObservationPolicy: args.ObservationPolicy,
 	}, nil
 }
 
@@ -728,7 +751,18 @@ func validateCompiledCheckpoint(
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled definition differs from sealed command")
 	}
 	if compiled.Scope.TopN != 0 || len(compiled.Scope.SourceIDs) != 0 {
-		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled definition scope must be explicitly empty")
+		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled definition source scope must be explicitly empty")
+	}
+	if command.ObservationPolicy == nil {
+		if compiled.Observation != nil {
+			return compiledTaskDefinitionCheckpoint{}, errors.New("compiled definition has an unapproved observation policy")
+		}
+	} else {
+		expected, compileErr := observation.Compile(*command.ObservationPolicy, op.CreatedAt)
+		if compileErr != nil || compiled.Observation == nil ||
+			!observationPoliciesEqual(expected, *compiled.Observation) {
+			return compiledTaskDefinitionCheckpoint{}, errors.New("compiled observation policy differs from approved command")
+		}
 	}
 	plan, err := canonicalizeFetchPlan(compiled.FetchPlan)
 	if err != nil || !bytes.Equal(plan, compiled.FetchPlan) {
@@ -800,7 +834,9 @@ func pausedDefinitionFromCompiled(
 	if err != nil {
 		return types.PausedCompiledTaskDefinition{}, fmt.Errorf("marshal compiled schedule spec: %w", err)
 	}
-	scopeJSON, err := json.Marshal(workflow.PushScope{})
+	scopeJSON, err := json.Marshal(compiledTaskScopeV1{
+		Observation: compiled.Observation,
+	})
 	if err != nil {
 		return types.PausedCompiledTaskDefinition{}, fmt.Errorf("marshal compiled task scope: %w", err)
 	}
@@ -813,6 +849,16 @@ func pausedDefinitionFromCompiled(
 		FetchPlan:       append(json.RawMessage(nil), compiled.FetchPlan...),
 		Strictness:      compiled.Strictness,
 	}, nil
+}
+
+type compiledTaskScopeV1 struct {
+	Observation *observation.PolicyV1 `json:"observation,omitempty"`
+}
+
+func observationPoliciesEqual(left, right observation.PolicyV1) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
 }
 
 func (p *CreationPreparer) blockInvalidCheckpoint(

@@ -46,6 +46,8 @@ type purgeStep struct {
 //	task_creation_receipts               → pending_actions → agent_sessions
 //	agent_events                         → agent_sessions
 //	push_effects                        → deliveries / push_batches / task_run_snapshots
+//	task_observed_events               → deliveries / task_run_snapshots
+//	task_event_qualification_steps     → task_run_snapshots
 //	deliveries                            → push_batches
 //	deliveries → push_batches             → task_run_snapshots
 //	task_run_snapshot_v2_shadows          → task_run_snapshots
@@ -73,6 +75,7 @@ var purgeOrder = []purgeStep{
 	// schedules 自己在父表位置删除；动态任务也不会短暂留下无 definition 的模式。
 	{"task_approved_definition_versions", "tenant_id = $1"},
 
+	{"feedback_freshness_triage", "tenant_id = $1"},
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
 	{"pending_actions", "tenant_id = $1"},
@@ -82,6 +85,10 @@ var purgeOrder = []purgeStep{
 	// External effect checkpoints bind exact delivery, batch, and immutable run
 	// identities, so they must be removed before all three parent aggregates.
 	{"push_effects", "tenant_id = $1"},
+	// Observation admission and paid-step checkpoints bind immutable task/run
+	// identities. Events may additionally bind a delivery after it is created.
+	{"task_observed_events", "tenant_id = $1"},
+	{"task_event_qualification_steps", "tenant_id = $1"},
 	{"deliveries", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},
 	// Compiled push batches retain the immutable run snapshot through migration

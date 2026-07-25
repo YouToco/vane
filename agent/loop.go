@@ -55,7 +55,8 @@ const (
 const exaAdHocSystemNote = `
 - 用户想「看一下/查一下」某个页面或主题（一次性需求）：直接调 web_search 或 read_page 拿到结果回答，**不要为一次性需求新建信源**。只有周期性、持续性的关注（每天盯某类信息、某页面有变化就告诉我）才用 add_source 订阅或 create_schedule 建定时任务。
 - 每条用户消息最多成功执行一次外部读取。需要查多个公司或站点时，合并成一次 web_search 查询，不要并列或接连调用多个外部读取；拿到结果后只总结候选并等待用户下一条消息。
-- create_schedule 必须带完整 intent 与 approved_fetch_plan。若采用 list_sources 返回的本人现有信源，把它的数字 id 放入 existing_source_ids；新信源用 source_specs（固定 version=vane.source-specs/v1）提交人类可读的原始参数。绝不能编造 config、selectors、vane:// URL 或把 id 拼成 URL。确认卡会展示系统确定性物化并冻结后的每个长期信源，确认后不能自行扩大主题或替换长期信源。需要先上网找候选时，本轮只能做只读发现并把候选告诉用户，等用户下一条消息明确同意后才能创建任务；绝不能在读取外部结果的同一轮发起写操作。`
+- create_schedule 必须带完整 intent 与 approved_fetch_plan。若采用 list_sources 返回的本人现有信源，把它的数字 id 放入 existing_source_ids；新信源用 source_specs（固定 version=vane.source-specs/v1）提交人类可读的原始参数。绝不能编造 config、selectors、vane:// URL 或把 id 拼成 URL。确认卡会展示系统确定性物化并冻结后的每个长期信源，确认后不能自行扩大主题或替换长期信源。需要先上网找候选时，本轮只能做只读发现并把候选告诉用户，等用户下一条消息明确同意后才能创建任务；绝不能在读取外部结果的同一轮发起写操作。
+- 用户要求“只看今天/最近 N 天/相邻两次检查之间”或“有事件才推、没有就不推”时，create_schedule 必须携带 observation_policy。每天 9 点检查是否上新通常使用 schedule_interval，窗口是相邻两次计划触发时刻之间；实际执行延迟不能改变窗口。用户只说“上新”而没有说明“官方宣布即算”还是“正式可用才算”时，语义存在实质差异，必须先追问，不能自行选择。事件模式要写 qualifier_prompt=vane.qualify-events/v1；要求官方证据时只填用户点名机构的官方裸域名。`
 
 // directTaskCreationSystemNote 只在用户明确要求按当前消息直接生成任务确认卡、
 // 且没有要求先查/核对时追加。运行时另有工具白名单二次门；prompt 只负责让模型

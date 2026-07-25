@@ -27,3 +27,18 @@ func (s *Store) UpsertUserByOpenID(ctx context.Context, openID, name string) (*t
 	}
 	return u, nil
 }
+
+func (s *Store) GetUserFeishuOpenID(ctx context.Context, userID int64) (string, error) {
+	var openID string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT feishu_open_id FROM users WHERE id=$1`,
+		userID).Scan(&openID); err != nil {
+		return "", types.NewAppError(
+			types.CodeDatabase, fmt.Sprintf("查询用户 %d 飞书身份", userID), err)
+	}
+	if openID == "" {
+		return "", types.NewAppError(
+			types.CodeNotFound, "用户尚未绑定飞书身份", nil)
+	}
+	return openID, nil
+}

@@ -1233,6 +1233,9 @@ func (c *compiledWorkflowCapture) register(env *testsuite.TestWorkflowEnvironmen
 		c.dedup = append(c.dedup, in)
 		return in.Items, nil
 	})
+	reg("QualifyEvents", func(_ context.Context, in QualifyEventsIn) (QualifyEventsResult, error) {
+		return QualifyEventsResult{Items: in.Items, Outcome: "not_configured"}, nil
+	})
 	reg("Score", func(_ context.Context, in ScoreIn) ([]types.ScoredItem, error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
