@@ -214,10 +214,24 @@ func (s *Store) CommitAgentSessionTurn(
 	if err != nil {
 		return agentledger.ProjectionShadowAudit{}, err
 	}
+	batchProjection, err := agentledger.ProjectCanonicalSessionSnapshot(canonical)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventValidationError(
+				"agent session event batch is not a complete projection snapshot",
+			)
+	}
 	desiredDigest, err := agentledger.ProjectionDigest(projection)
 	if err != nil {
 		return agentledger.ProjectionShadowAudit{},
 			agentEventValidationError("agent session projection is invalid")
+	}
+	batchProjectionDigest, err := agentledger.ProjectionDigest(batchProjection)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventValidationError(
+				"agent session event batch projection is invalid",
+			)
 	}
 
 	tx, err := s.beginTx(ctx, pgx.TxOptions{})
@@ -228,7 +242,7 @@ func (s *Store) CommitAgentSessionTurn(
 	defer func() {
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 	}()
-	if err := setAgentEventTenantContext(
+	if err := setAgentEventRuntimeContext(
 		ctx, tx, batch.Scope.TenantID,
 	); err != nil {
 		return agentledger.ProjectionShadowAudit{}, err
@@ -256,9 +270,20 @@ func (s *Store) CommitAgentSessionTurn(
 		); err != nil {
 			return agentledger.ProjectionShadowAudit{}, err
 		}
+		if !constantTimeAgentEventDigestEqual(
+			batchProjectionDigest, desiredDigest,
+		) {
+			return agentledger.ProjectionShadowAudit{},
+				agentEventValidationError(
+					"agent session event batch does not match projection",
+				)
+		}
 		audit, err := auditAgentSessionProjection(current, beforeEvents, priorState)
 		if err != nil {
 			return agentledger.ProjectionShadowAudit{}, err
+		}
+		if !audit.Match {
+			return agentledger.ProjectionShadowAudit{}, agentEventIntegrityError()
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return agentledger.ProjectionShadowAudit{},
@@ -269,6 +294,14 @@ func (s *Store) CommitAgentSessionTurn(
 		return audit, nil
 	}
 
+	if !constantTimeAgentEventDigestEqual(
+		batchProjectionDigest, desiredDigest,
+	) {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventValidationError(
+				"agent session event batch does not match projection",
+			)
+	}
 	baseDigest, err := agentledger.ProjectionSnapshotBaseDigest(canonical[0])
 	if err != nil {
 		return agentledger.ProjectionShadowAudit{},
@@ -324,7 +357,13 @@ func (s *Store) CommitAgentSessionTurn(
 	if err != nil {
 		return agentledger.ProjectionShadowAudit{}, err
 	}
-	if audit.LegacyDigest != desiredDigest {
+	if !audit.Match ||
+		!constantTimeAgentEventDigestEqual(
+			audit.LegacyDigest, desiredDigest,
+		) ||
+		!constantTimeAgentEventDigestEqual(
+			audit.EventDigest, desiredDigest,
+		) {
 		return agentledger.ProjectionShadowAudit{}, agentEventIntegrityError()
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -423,6 +462,17 @@ func setAgentEventTenantContext(
 	return nil
 }
 
+func setAgentEventRuntimeContext(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID int64,
+) error {
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		return agentEventDatabaseError("set agent event runtime role", err)
+	}
+	return setAgentEventTenantContext(ctx, tx, tenantID)
+}
+
 func loadAgentSessionProjectionForUpdate(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -433,7 +483,7 @@ func loadAgentSessionProjectionForUpdate(
 		`SELECT messages, turn_count, activated_tools
 		   FROM agent_sessions
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
-		  FOR UPDATE`,
+		  FOR UPDATE /* agent ledger normal-turn session lock */`,
 		scope.SessionID, scope.TenantID, scope.UserID,
 	).Scan(
 		&projection.Messages,

@@ -173,6 +173,34 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			types.CodeDatabase, "锁定租户清理准入根", err)
 	}
 
+	// Normal Agent turns lock agent_sessions before appending their child
+	// agent_events. Purge joins that same parent-before-child order and locks
+	// every tenant session by stable id before deleting any child. Therefore a
+	// concurrent CommitAgentSessionTurn either finishes before purge observes
+	// the session, or wakes after purge commits and returns NotFound; it cannot
+	// re-create event residue between the child and parent DELETE steps.
+	sessionRows, err := tx.Query(ctx, `
+		SELECT id
+		  FROM agent_sessions
+		 WHERE tenant_id=$1
+		 ORDER BY id
+		 FOR UPDATE /* tenant purge agent-session lock order */`,
+		tenantID,
+	)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("锁定租户 %d 的 agent_sessions", tenantID), err)
+	}
+	for sessionRows.Next() {
+	}
+	sessionRowsErr := sessionRows.Err()
+	sessionRows.Close()
+	if sessionRowsErr != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("扫描租户 %d 的 agent_sessions 锁", tenantID),
+			sessionRowsErr)
+	}
+
 	// Definition edit transactions globally lock schedule → operation → receipt.
 	// Purge must join that order before its FK-safe child-first DELETE sequence:
 	// deleting an operation fires schedules' ON DELETE SET NULL and otherwise

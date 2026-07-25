@@ -303,8 +303,19 @@ func isProjectionSnapshotBatch(batch []Event) bool {
 		validDigest(started.BaseProjectionDigest)
 }
 
-func projectSnapshotBatch(batch []Event) (SessionProjection, error) {
-	started, err := decodeProjectionStarted(batch[0])
+// ProjectCanonicalSessionSnapshot validates and projects exactly one
+// self-contained full-snapshot generation. Unlike ProjectLatestSessionSnapshot,
+// it never falls back to an earlier valid batch; dual-write callers use it to
+// prove the newly supplied batch itself represents the desired projection.
+func ProjectCanonicalSessionSnapshot(
+	batch []CanonicalEvent,
+) (SessionProjection, error) {
+	if len(batch) < 2 || batch[0].Kind() != KindTurnStarted ||
+		batch[len(batch)-1].Kind() != KindTurnCompleted {
+		return SessionProjection{},
+			invalidProjection("snapshot lifecycle is incomplete")
+	}
+	started, err := decodeCanonicalProjectionStarted(batch[0])
 	if err != nil {
 		return SessionProjection{}, err
 	}
@@ -312,17 +323,17 @@ func projectSnapshotBatch(batch []Event) (SessionProjection, error) {
 	confirmationSeen := false
 	for i := 1; i < len(batch)-1; i++ {
 		event := batch[i]
-		switch event.Kind {
+		switch event.Kind() {
 		case KindUserMessage, KindAssistantMessage, KindToolCall, KindToolResult:
 			if confirmationSeen {
 				return SessionProjection{}, invalidProjection("message follows confirmation")
 			}
-			message, turnID, err := decodeProjectionMessage(event)
+			message, turnID, err := decodeCanonicalProjectionMessage(event)
 			if err != nil || turnID != started.TurnID {
 				return SessionProjection{}, invalidProjection("snapshot message is invalid")
 			}
 			expectedKind, err := projectionMessageKind(message)
-			if err != nil || expectedKind != event.Kind {
+			if err != nil || expectedKind != event.Kind() {
 				return SessionProjection{}, invalidProjection("snapshot message kind does not match")
 			}
 			messages = append(messages, message)
@@ -330,7 +341,7 @@ func projectSnapshotBatch(batch []Event) (SessionProjection, error) {
 			if confirmationSeen {
 				return SessionProjection{}, invalidProjection("snapshot has duplicate confirmation")
 			}
-			confirmation, err := decodeProjectionConfirmation(event)
+			confirmation, err := decodeCanonicalProjectionConfirmation(event)
 			if err != nil || confirmation.TurnID != started.TurnID {
 				return SessionProjection{}, invalidProjection("snapshot confirmation is invalid")
 			}
@@ -339,7 +350,7 @@ func projectSnapshotBatch(batch []Event) (SessionProjection, error) {
 			return SessionProjection{}, invalidProjection("snapshot contains an unsupported event")
 		}
 	}
-	completed, err := decodeProjectionCompleted(batch[len(batch)-1])
+	completed, err := decodeCanonicalProjectionCompleted(batch[len(batch)-1])
 	if err != nil || completed.TurnID != started.TurnID ||
 		completed.SchemaVersion != ProjectionSchemaVersion ||
 		completed.Generation != ProjectionFullSnapshot {
@@ -370,9 +381,26 @@ func projectSnapshotBatch(batch []Event) (SessionProjection, error) {
 	}, nil
 }
 
-func decodeProjectionStarted(event Event) (projectionStartedV1, error) {
+func projectSnapshotBatch(batch []Event) (SessionProjection, error) {
+	canonical := make([]CanonicalEvent, len(batch))
+	for i := range batch {
+		event, err := Decode(batch[i].Payload, batch[i].PayloadDigest)
+		if err != nil || event.Kind() != batch[i].Kind {
+			return SessionProjection{},
+				invalidProjection("event payload integrity failed")
+		}
+		canonical[i] = event
+	}
+	return ProjectCanonicalSessionSnapshot(canonical)
+}
+
+func decodeCanonicalProjectionStarted(
+	event CanonicalEvent,
+) (projectionStartedV1, error) {
 	var body *projectionStartedV1
-	if err := decodeProjectionBody(event, KindTurnStarted, &body); err != nil ||
+	if err := decodeCanonicalProjectionBody(
+		event, KindTurnStarted, &body,
+	); err != nil ||
 		body == nil || body.SchemaVersion != ProjectionSchemaVersion ||
 		body.Generation != ProjectionFullSnapshot ||
 		!validProjectionTurnID(body.TurnID) ||
@@ -382,9 +410,13 @@ func decodeProjectionStarted(event Event) (projectionStartedV1, error) {
 	return *body, nil
 }
 
-func decodeProjectionMessage(event Event) (projectionMessageV1, string, error) {
+func decodeCanonicalProjectionMessage(
+	event CanonicalEvent,
+) (projectionMessageV1, string, error) {
 	var body *projectionMessageBodyV1
-	if err := decodeProjectionBody(event, event.Kind, &body); err != nil ||
+	if err := decodeCanonicalProjectionBody(
+		event, event.Kind(), &body,
+	); err != nil ||
 		body == nil || body.SchemaVersion != ProjectionSchemaVersion ||
 		!validProjectionTurnID(body.TurnID) {
 		return projectionMessageV1{}, "", invalidProjection("snapshot message body is invalid")
@@ -392,9 +424,11 @@ func decodeProjectionMessage(event Event) (projectionMessageV1, string, error) {
 	return body.Message, body.TurnID, nil
 }
 
-func decodeProjectionConfirmation(event Event) (projectionConfirmationV1, error) {
+func decodeCanonicalProjectionConfirmation(
+	event CanonicalEvent,
+) (projectionConfirmationV1, error) {
 	var body *projectionConfirmationV1
-	if err := decodeProjectionBody(
+	if err := decodeCanonicalProjectionBody(
 		event, KindConfirmationRequested, &body,
 	); err != nil || body == nil ||
 		body.SchemaVersion != ProjectionSchemaVersion ||
@@ -405,9 +439,13 @@ func decodeProjectionConfirmation(event Event) (projectionConfirmationV1, error)
 	return *body, nil
 }
 
-func decodeProjectionCompleted(event Event) (projectionCompletedV1, error) {
+func decodeCanonicalProjectionCompleted(
+	event CanonicalEvent,
+) (projectionCompletedV1, error) {
 	var body *projectionCompletedV1
-	if err := decodeProjectionBody(event, KindTurnCompleted, &body); err != nil ||
+	if err := decodeCanonicalProjectionBody(
+		event, KindTurnCompleted, &body,
+	); err != nil ||
 		body == nil {
 		return projectionCompletedV1{}, invalidProjection("snapshot completion body is invalid")
 	}
@@ -419,15 +457,15 @@ func decodeProjectionCompleted(event Event) (projectionCompletedV1, error) {
 	return *body, nil
 }
 
-func decodeProjectionBody(event Event, kind Kind, target any) error {
-	if event.Kind != kind {
+func decodeCanonicalProjectionBody(
+	event CanonicalEvent,
+	kind Kind,
+	target any,
+) error {
+	if event.Kind() != kind {
 		return invalidProjection("event kind is inconsistent")
 	}
-	canonical, err := Decode(event.Payload, event.PayloadDigest)
-	if err != nil || canonical.Kind() != kind {
-		return invalidProjection("event payload integrity failed")
-	}
-	if err := strictjson.Decode(canonical.Body(), target); err != nil {
+	if err := strictjson.Decode(event.Body(), target); err != nil {
 		return invalidProjection("event body schema is invalid")
 	}
 	return nil

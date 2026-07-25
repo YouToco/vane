@@ -1,6 +1,9 @@
 package store
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -8,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/agentledger"
 	"github.com/YouToco/vane/types"
 )
 
@@ -594,6 +598,116 @@ func TestPurgeTenant_DefinitionEditLockOrderDoesNotDeadlock(t *testing.T) {
 	}
 }
 
+func TestPurgeTenantWinsAgainstConcurrentAgentTurnCommit(t *testing.T) {
+	st := purgeStore(t)
+	tenantID := seedPurgeTenant(t, st)
+	ctx := t.Context()
+
+	var scope agentledger.Scope
+	var taskID string
+	var base agentledger.SessionProjection
+	if err := st.pool.QueryRow(ctx, `
+		SELECT s.tenant_id, s.user_id, s.id,
+		       s.messages, s.turn_count, s.activated_tools,
+		       (SELECT id FROM schedules WHERE tenant_id=s.tenant_id LIMIT 1)
+		  FROM agent_sessions s
+		 WHERE s.tenant_id=$1
+		 ORDER BY s.id
+		 LIMIT 1`,
+		tenantID,
+	).Scan(
+		&scope.TenantID, &scope.UserID, &scope.SessionID,
+		&base.Messages, &base.TurnCount, &base.ActivatedTools,
+		&taskID,
+	); err != nil {
+		t.Fatalf("查 purge/Commit 并发夹具失败: %v", err)
+	}
+	desired := agentledger.SessionProjection{
+		Messages: json.RawMessage(
+			`[{"role":"user","content":"concurrent purge"}]`,
+		),
+		TurnCount:      1,
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	batch := projectionSnapshotBatch(
+		t, scope, "turn-concurrent-purge", base, desired, "",
+	)
+
+	blocker, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(context.WithoutCancel(ctx)) }()
+	var lockedTaskID string
+	if err := blocker.QueryRow(ctx, `
+		SELECT id FROM schedules
+		 WHERE tenant_id=$1 AND id=$2
+		 FOR UPDATE`,
+		tenantID, taskID,
+	).Scan(&lockedTaskID); err != nil {
+		t.Fatalf("锁 purge schedule blocker 失败: %v", err)
+	}
+
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, purgeErr := st.PurgeTenant(ctx, tenantID, false)
+		purgeDone <- purgeResult{report: report, err: purgeErr}
+	}()
+	// Purge reaches the schedule blocker only after it has acquired every
+	// tenant agent_sessions lock in stable id order.
+	waitForTenantPurgeDefinitionEditLock(t, st)
+
+	commitDone := make(chan error, 1)
+	go func() {
+		_, commitErr := st.CommitAgentSessionTurn(ctx, desired, batch)
+		commitDone <- commitErr
+	}()
+	waitForAgentTurnSessionLock(t, st)
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("释放 purge schedule blocker 失败: %v", err)
+	}
+
+	select {
+	case result := <-purgeDone:
+		if result.err != nil {
+			t.Fatalf("tenant purge 失败: %v", result.err)
+		}
+		if result.report == nil || result.report.Rows["tenants"] != 1 {
+			t.Fatalf("tenant purge 报告异常: %+v", result.report)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant purge 未在 blocker 释放后收敛")
+	}
+	select {
+	case commitErr := <-commitDone:
+		if !errors.Is(commitErr, types.ErrNotFound) {
+			t.Fatalf("purge winner 后 Commit error=%v, want NotFound", commitErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("concurrent Agent turn Commit 未在 purge 后收敛")
+	}
+
+	var events, sessions, tenants int
+	if err := st.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM agent_events WHERE tenant_id=$1),
+			(SELECT count(*) FROM agent_sessions WHERE tenant_id=$1),
+			(SELECT count(*) FROM tenants WHERE id=$1)`,
+		tenantID,
+	).Scan(&events, &sessions, &tenants); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 || sessions != 0 || tenants != 0 {
+		t.Fatalf("purge residue events=%d sessions=%d tenants=%d",
+			events, sessions, tenants)
+	}
+}
+
 func waitForTenantPurgeDefinitionEditLock(t *testing.T, st *Store) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -615,6 +729,48 @@ func waitForTenantPurgeDefinitionEditLock(t *testing.T, st *Store) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("tenant purge 未按 schedule-first 锁序等待")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForAgentTurnSessionLock(t *testing.T, st *Store) {
+	t.Helper()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%agent ledger normal-turn session lock%",
+		"Agent turn Commit 未等待 tenant purge 的 session 锁",
+	)
+}
+
+func waitForDatabaseLockQuery(
+	t *testing.T,
+	st *Store,
+	queryPattern string,
+	timeoutMessage string,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err := st.pool.QueryRow(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1
+				  FROM pg_stat_activity
+				 WHERE datname=current_database()
+				   AND pid<>pg_backend_pid()
+				   AND wait_event_type='Lock'
+				   AND query LIKE $1
+			)`,
+			queryPattern,
+		).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(timeoutMessage)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
