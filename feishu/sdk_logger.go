@@ -15,17 +15,13 @@ import (
 // Vane retains a fixed error event here and emits a credential-free error type
 // when Start returns.
 type feishuSDKLogger struct {
-	errorEvent func(context.Context)
+	logger *slog.Logger
 }
 
 var _ larkcore.Logger = (*feishuSDKLogger)(nil)
 
 func newFeishuSDKLogger() *feishuSDKLogger {
-	return &feishuSDKLogger{
-		errorEvent: func(ctx context.Context) {
-			slog.ErrorContext(ctx, "feishu: SDK error（详情已脱敏）")
-		},
-	}
+	return &feishuSDKLogger{logger: slog.Default()}
 }
 
 func (*feishuSDKLogger) Debug(context.Context, ...interface{}) {}
@@ -33,7 +29,7 @@ func (*feishuSDKLogger) Info(context.Context, ...interface{})  {}
 func (*feishuSDKLogger) Warn(context.Context, ...interface{})  {}
 
 func (l *feishuSDKLogger) Error(ctx context.Context, _ ...interface{}) {
-	if l != nil && l.errorEvent != nil {
-		l.errorEvent(ctx)
+	if l != nil && l.logger != nil {
+		l.logger.ErrorContext(ctx, "feishu: SDK error（详情已脱敏）")
 	}
 }
