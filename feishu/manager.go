@@ -84,9 +84,11 @@ type feishuSetting struct {
 // ownerSetting 对应 settings.feishu_owner 的 value 结构。
 // owner = 第一个给机器人发消息的飞书用户，是测试卡片与后续推送的收件人。
 type ownerSetting struct {
-	OpenID     string `json:"open_id"`
-	Name       string `json:"name"`
-	CapturedAt string `json:"captured_at"`
+	OpenID      string `json:"open_id"`
+	Name        string `json:"name"`
+	AppIdentity string `json:"app_identity,omitempty"`
+	ChatID      string `json:"chat_id,omitempty"`
+	CapturedAt  string `json:"captured_at"`
 }
 
 // Status 是飞书通道状态快照，直接序列化为 GET /api/feishu/status 的响应体。
@@ -159,6 +161,8 @@ type Manager struct {
 	botName     string
 	ownerOpenID string
 	ownerName   string
+	ownerAppID  string
+	ownerChatID string
 	lastError   string
 	connectedAt *time.Time
 }
@@ -517,6 +521,15 @@ func (m *Manager) reload(ctx context.Context) error {
 	m.connectedAt = &now
 	m.mu.Unlock()
 
+	if err := m.backfillOwnerChatID(ctx); err != nil {
+		if errors.Is(err, types.ErrNotFound) {
+			slog.Info("feishu: owner chat 暂无历史回执可回填")
+		} else {
+			slog.Warn("feishu: owner chat 回填未完成",
+				"error_code", types.CodeOf(err))
+		}
+	}
+
 	go func() {
 		// larkws 的 Start 成功时永久阻塞（SDK 内部尾部 select{}）：
 		// wsCtx 取消只能终止连接循环，goroutine 本身会永远停在 select{}
@@ -558,11 +571,60 @@ func (m *Manager) api() *lark.Client {
 	return m.apiClient
 }
 
+func (m *Manager) currentAPI() (*lark.Client, string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.apiClient == nil || m.apiAppID == "" {
+		return nil, m.apiAppID, false
+	}
+	return m.apiClient, m.apiAppID, true
+}
+
+// apiForExpectedApp atomically binds one durable provider attempt to the
+// exact configured App generation. The returned identity belongs to the
+// returned client even if Reconfigure replaces the Manager fields while the
+// request is in flight.
+func (m *Manager) apiForExpectedApp(expectedAppID string) (*lark.Client, string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	actualAppID := m.apiAppID
+	if expectedAppID == "" ||
+		m.apiClient == nil ||
+		actualAppID == "" ||
+		actualAppID != expectedAppID {
+		return nil, actualAppID, false
+	}
+	return m.apiClient, actualAppID, true
+}
+
+func (m *Manager) appIsCurrent(appID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return appID != "" && m.apiClient != nil && m.apiAppID == appID
+}
+
 // setOwner 更新 owner 内存缓存（handler 捕获 owner、loadOwner 预热时调用）。
 func (m *Manager) setOwner(openID, name string) {
+	m.setOwnerWithChat(openID, name, "", "")
+}
+
+func (m *Manager) setOwnerWithChat(openID, name, appID, chatID string) {
 	m.mu.Lock()
+	if m.ownerOpenID != "" && m.ownerOpenID != openID {
+		m.ownerAppID = ""
+		m.ownerChatID = ""
+	}
 	m.ownerOpenID = openID
 	m.ownerName = name
+	if appID != "" {
+		if m.ownerAppID != appID {
+			m.ownerChatID = ""
+		}
+		m.ownerAppID = appID
+	}
+	if appID != "" && chatID != "" {
+		m.ownerChatID = chatID
+	}
 	m.mu.Unlock()
 }
 
@@ -578,6 +640,12 @@ func (m *Manager) ownerID() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.ownerOpenID
+}
+
+func (m *Manager) ownerIdentity() (openID, appID, chatID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ownerOpenID, m.ownerAppID, m.ownerChatID
 }
 
 // setError 记录最近一次错误供 Status 展示。
@@ -601,5 +669,5 @@ func (m *Manager) loadOwner(ctx context.Context) {
 		slog.Error("feishu: owner 设置格式异常", "err", err)
 		return
 	}
-	m.setOwner(own.OpenID, own.Name)
+	m.setOwnerWithChat(own.OpenID, own.Name, own.AppIdentity, own.ChatID)
 }

@@ -10,11 +10,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 
+	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/types"
 )
 
@@ -186,6 +188,206 @@ func TestManager_SendCardWithUUIDForwardsStableUUID(t *testing.T) {
 		gotUUIDs[1] != messageUUID {
 		t.Fatalf("request uuids = %v, want exact stable uuid twice", gotUUIDs)
 	}
+}
+
+func TestManager_SendCardWithUUIDResultReturnsTypedSentReceipt(t *testing.T) {
+	const messageUUID = "019f9824-39b6-7e13-b247-b5ee5713c52b"
+	m := newPushTestManager(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if servePushTestToken(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w,
+			`{"code":0,"msg":"success","data":{`+
+				`"message_id":"om_effect","chat_id":"oc_effect"}}`)
+	}), nil)
+
+	result, err := m.SendCardWithUUIDResult(
+		t.Context(), "test-app", "ou_owner", `{"type":"card"}`, messageUUID)
+	if err != nil {
+		t.Fatalf("SendCardWithUUIDResult() error = %v", err)
+	}
+	if result.Disposition != pusheffect.AttemptSent ||
+		result.AppIdentity != "test-app" ||
+		result.MessageID != "om_effect" ||
+		result.ChatID != "oc_effect" {
+		t.Fatalf("result = %+v, want typed sent receipt", result)
+	}
+}
+
+func TestManager_SendCardWithUUIDResultRejectsAppMismatchBeforeNetwork(t *testing.T) {
+	const messageUUID = "019f9824-39b6-7e13-b247-b5ee5713c52b"
+	var networkCalls atomic.Int32
+	m := newPushTestManager(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		networkCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w,
+			`{"code":0,"msg":"success","data":{"message_id":"om_wrong_app"}}`)
+	}), nil)
+
+	result, err := m.SendCardWithUUIDResult(
+		t.Context(),
+		"frozen-other-app",
+		"ou_owner",
+		`{"type":"card"}`,
+		messageUUID,
+	)
+	if !errors.Is(err, types.ErrConflict) ||
+		result.Disposition != pusheffect.AttemptDefiniteNotSent ||
+		result.AppIdentity != "test-app" {
+		t.Fatalf("result=%+v err=%v, want pre-network App mismatch", result, err)
+	}
+	if got := networkCalls.Load(); got != 0 {
+		t.Fatalf("App mismatch reached provider network: calls=%d", got)
+	}
+}
+
+func TestManager_SendCardWithUUIDResultBindsInFlightClientGeneration(t *testing.T) {
+	const messageUUID = "019f9824-39b6-7e13-b247-b5ee5713c52b"
+	requestStarted := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	var startOnce sync.Once
+	m := newPushTestManager(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if servePushTestToken(w, r) {
+			return
+		}
+		startOnce.Do(func() { close(requestStarted) })
+		<-releaseResponse
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w,
+			`{"code":0,"msg":"success","data":{`+
+				`"message_id":"om_old_generation","chat_id":"oc_old_generation"}}`)
+	}), nil)
+
+	type sendResult struct {
+		observation pusheffect.ProviderObservation
+		err         error
+	}
+	done := make(chan sendResult, 1)
+	go func() {
+		observation, err := m.SendCardWithUUIDResult(
+			t.Context(),
+			"test-app",
+			"ou_owner",
+			`{"type":"card"}`,
+			messageUUID,
+		)
+		done <- sendResult{observation: observation, err: err}
+	}()
+	<-requestStarted
+	m.mu.Lock()
+	m.apiClient = lark.NewClient("new-app", "new-secret")
+	m.apiAppID = "new-app"
+	m.mu.Unlock()
+	close(releaseResponse)
+
+	result := <-done
+	if result.err != nil {
+		t.Fatalf("SendCardWithUUIDResult() error = %v", result.err)
+	}
+	if result.observation.Disposition != pusheffect.AttemptSent ||
+		result.observation.AppIdentity != "test-app" ||
+		result.observation.MessageID != "om_old_generation" {
+		t.Fatalf(
+			"observation = %+v, want exact old client generation",
+			result.observation,
+		)
+	}
+}
+
+func TestManager_SendCardWithUUIDResultClassifiesBoundary(t *testing.T) {
+	const messageUUID = "019f9824-39b6-7e13-b247-b5ee5713c52b"
+	tests := []struct {
+		name       string
+		httpStatus int
+		body       string
+		want       pusheffect.AttemptDisposition
+	}{
+		{
+			name: "provider rejection is definite not sent",
+			body: `{"code":200673,"msg":"invalid card"}`,
+			want: pusheffect.AttemptDefiniteNotSent,
+		},
+		{
+			name:       "json 500 is ambiguous",
+			httpStatus: http.StatusInternalServerError,
+			body:       `{"code":987654,"msg":"internal error after unknown boundary"}`,
+			want:       pusheffect.AttemptAmbiguous,
+		},
+		{
+			name:       "json 502 is ambiguous",
+			httpStatus: http.StatusBadGateway,
+			body:       `{"code":987654,"msg":"bad gateway after unknown boundary"}`,
+			want:       pusheffect.AttemptAmbiguous,
+		},
+		{
+			name:       "http 429 is definite rejection",
+			httpStatus: http.StatusTooManyRequests,
+			body:       `{"code":99991429,"msg":"rate limited"}`,
+			want:       pusheffect.AttemptDefiniteNotSent,
+		},
+		{
+			name:       "unknown http 400 is definite rejection",
+			httpStatus: http.StatusBadRequest,
+			body:       `{"code":99990400,"msg":"bad request"}`,
+			want:       pusheffect.AttemptDefiniteNotSent,
+		},
+		{
+			name: "unknown business rejection is ambiguous",
+			body: `{"code":987654,"msg":"unknown business failure"}`,
+			want: pusheffect.AttemptAmbiguous,
+		},
+		{
+			name: "success without receipt is ambiguous",
+			body: `{"code":0,"msg":"success","data":{}}`,
+			want: pusheffect.AttemptAmbiguous,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newPushTestManager(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if servePushTestToken(w, r) {
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if tt.httpStatus != 0 {
+					w.WriteHeader(tt.httpStatus)
+				}
+				_, _ = io.WriteString(w, tt.body)
+			}), nil)
+			result, err := m.SendCardWithUUIDResult(
+				t.Context(), "test-app", "ou_owner", `{"type":"card"}`, messageUUID)
+			if err == nil {
+				t.Fatal("SendCardWithUUIDResult() error = nil, want failure")
+			}
+			if result.Disposition != tt.want {
+				t.Fatalf("disposition = %q, want %q", result.Disposition, tt.want)
+			}
+		})
+	}
+
+	t.Run("invalid input is definite not sent", func(t *testing.T) {
+		m := NewManager(nil, nil, nil)
+		result, err := m.SendCardWithUUIDResult(
+			t.Context(), "test-app", "ou_owner", `{"type":"card"}`, "not-a-uuid")
+		if err == nil || result.Disposition != pusheffect.AttemptDefiniteNotSent {
+			t.Fatalf("result=%+v err=%v, want definite validation failure", result, err)
+		}
+	})
+
+	t.Run("transport failure is ambiguous", func(t *testing.T) {
+		m := newPushTestManager(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if servePushTestToken(w, r) {
+				return
+			}
+			http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+		}), nil)
+		result, err := m.SendCardWithUUIDResult(
+			t.Context(), "test-app", "ou_owner", `{"type":"card"}`, messageUUID)
+		if err == nil || result.Disposition != pusheffect.AttemptAmbiguous {
+			t.Fatalf("result=%+v err=%v, want ambiguous transport failure", result, err)
+		}
+	})
 }
 
 func TestManager_SendCardWithUUIDRejectsInvalidUUIDBeforeNetwork(t *testing.T) {

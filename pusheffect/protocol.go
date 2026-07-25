@@ -54,6 +54,29 @@ func (s Status) Valid() bool {
 	}
 }
 
+// AttemptDisposition reports what one provider request proved. It never
+// summarizes the whole durable effect: a later definite rejection cannot
+// erase an earlier ambiguous boundary crossing.
+type AttemptDisposition string
+
+const (
+	AttemptDefiniteNotSent AttemptDisposition = "definite_not_sent"
+	AttemptAmbiguous       AttemptDisposition = "ambiguous"
+	AttemptSent            AttemptDisposition = "sent"
+)
+
+// ProviderObservation is the provider adapter's typed result. MessageID is
+// required for sent; AppIdentity identifies the exact provider client
+// generation selected before the request, including when a reconfiguration
+// races with an in-flight send. ChatID is supplementary routing evidence, not
+// proof of delivery by itself.
+type ProviderObservation struct {
+	Disposition AttemptDisposition
+	AppIdentity string
+	MessageID   string
+	ChatID      string
+}
+
 type Scope struct {
 	ID       string
 	TenantID int64

@@ -170,6 +170,42 @@ func (s *Store) GetDeliveryByFeishuMessageID(ctx context.Context, userID int64, 
 	return &d, nil
 }
 
+// LatestSentDeliveryMessageID returns one positive historical provider receipt
+// for owner-chat backfill. It never treats pending/failed rows or an empty
+// message id as provider evidence.
+func (s *Store) LatestSentDeliveryMessageID(
+	ctx context.Context,
+	userID int64,
+) (string, error) {
+	var messageID string
+	err := s.pool.QueryRow(ctx, `
+		SELECT feishu_message_id
+		  FROM deliveries
+		 WHERE user_id = $1
+		   AND status = $2
+		   AND feishu_message_id <> ''
+		   AND sent_at IS NOT NULL
+		 ORDER BY sent_at DESC, id DESC
+		 LIMIT 1`,
+		userID, types.DeliveryStatusSent,
+	).Scan(&messageID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", types.NewAppError(
+			types.CodeNotFound,
+			fmt.Sprintf("用户 %d 没有可用于会话回填的已发送投递", userID),
+			err,
+		)
+	}
+	if err != nil {
+		return "", types.NewAppError(
+			types.CodeDatabase,
+			fmt.Sprintf("查询用户 %d 的最新已发送投递", userID),
+			err,
+		)
+	}
+	return messageID, nil
+}
+
 // ListDeliveriesByFeishuMessage 返回同一条飞书消息承载的全部投递，按 id 升序——
 // id 序 = 插入序 = 首发时聚合卡的条目序（Push 按 in.Cards 顺序逐条 Insert），
 // 重建整卡时条目不换位。**不能按 score 排**：首发序来自 selector 的新鲜度衰减

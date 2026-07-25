@@ -279,6 +279,13 @@ Activity result 进入 Temporal history。首版 planner 硬上限为 8 轮、16
 - lease/fence 使用数据库时钟；陈旧 owner 不得提交结果。
 - 预算从持久步骤汇总，不能依赖 Activity 内存计数。
 
+Push 的外部 `Message.Create` 不是普通可重算步骤，必须遵守
+[Push Durable Effect / Recovery Contract](push-effect-recovery-contract.md)：按聚合卡 chunk
+先冻结 exact target、card bytes+digest、delivery 集合与稳定 provider UUID，再由独立
+lease/fence effect 状态机发送和收敛。`pending delivery` 不证明消息未发送；timeout/响应丢失进入
+`ambiguous`，未获权威对账前禁止再次 Create。该 effect 账本与 Agent 会话事件账本分域，
+也不复制 Temporal 的确定性编排历史。
+
 规划失败、预算耗尽或不确定结果时，只能使用最近一次**已批准且校验通过**的计划，或已被固定代码
 授权为同主体、同 canonical domain 等价恢复的计划；动态单次计划和临时新源不得成为跨 run LKG。
 没有有效计划则记录 blocked 并通知。禁止回退为抓取用户全部订阅源。
@@ -303,7 +310,9 @@ Activity result 进入 Temporal history。首版 planner 硬上限为 8 轮、16
 | C2b-2 | exact base version+digest definition CAS | 零生产调用点；证明单库原子提交与 exact replay |
 | C2b-3 | 2a 冻结协议 → 2b fenced Store → 2c dark coordinator → 2d-1 安全 Gate → 2d authenticated wiring | 2d-1 先闭合 restricted role、legacy reconcile 串行化与 namespace preflight，入口仍 dark；全部 kill point 过 Gate 后才重开唯一编辑入口，仍不切运行读取 |
 | C2c | 存量适配、shadow 对账并切 immutable head 读取 | 动态模式仍 feature flag 关闭 |
-| C3 | RunID/StepID 检查点、LKG、bounded `PlanFetch` | 仅 shadow，无用户推送影响 |
+| C3a | RunID/StepID 检查点、LKG、bounded `PlanFetch` | 仅 shadow，无用户推送影响 |
+| C3b | Push effect checkpoint + stable provider UUID | 先 dark preparation/receipt shadow，仍不自动恢复 |
+| C3c | fenced Push recovery coordinator | exact-task canary；`ambiguous` 对账失败必须 blocked，禁止盲重发 |
 | C4 | 两条首批竖切的 Boss 单任务 canary | 逐步放量，可回滚 Compiled/LKG |
 
 首批竖切：
