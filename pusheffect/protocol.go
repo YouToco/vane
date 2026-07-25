@@ -228,6 +228,16 @@ type ExhaustedResolution struct {
 	ExpectedTaskID string
 }
 
+// ExpiryResolution asks the Store to terminally classify an unclaimed,
+// deterministic effect only when the database clock proves that the complete
+// required provider window no longer fits before idempotency expiry.
+type ExpiryResolution struct {
+	Scope
+	ExpectedFence  int64
+	ExpectedTaskID string
+	RequiredWindow time.Duration
+}
+
 type SentReceipt struct {
 	Scope
 	ExpectedFence        int64

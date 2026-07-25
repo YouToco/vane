@@ -91,7 +91,8 @@ func pushEffectRecoverySelectorViolation(method, path string) bool {
 		"ClaimAuthorizedPushEffectReconciliation",
 		"DeferOrBlockPushEffectReconciliation",
 		"BlockConflictingPushEffectHistory",
-		"BlockExhaustedPushEffectAttempts":
+		"BlockExhaustedPushEffectAttempts",
+		"BlockExpiredUnclaimedPushEffect":
 		return !coordinator
 	case "ReadPushEffectRecoveryCutoff",
 		"ListRecoverablePushEffectTenantIDs",

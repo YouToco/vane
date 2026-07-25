@@ -15,6 +15,347 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+func TestParseLegacyBatch63RepairOptionsIsPhysicallyPinned(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	expiresAt := "2026-07-25T13:00:00Z"
+	tests := []struct {
+		name string
+		args []string
+		ok   bool
+	}{
+		{
+			name: "preview",
+			args: []string{
+				"-action", "preview", "-evidence", "proof.json",
+				"-expires-at", expiresAt,
+			},
+			ok: true,
+		},
+		{
+			name: "apply exact confirmed plan",
+			args: []string{
+				"-action", "apply", "-evidence", "proof.json",
+				"-expires-at", expiresAt, "-plan-digest", digest,
+				"-confirm-apply",
+			},
+			ok: true,
+		},
+		{name: "verify", args: []string{"-action", "verify"}, ok: true},
+		{
+			name: "abort exact confirmed plan",
+			args: []string{
+				"-action", "abort", "-plan-digest", digest, "-confirm-abort",
+			},
+			ok: true,
+		},
+		{
+			name: "reject batch selector",
+			args: []string{"-action", "verify", "-batch", "63"},
+		},
+		{
+			name: "reject positional carrier",
+			args: []string{"-action", "verify", "63"},
+		},
+		{
+			name: "reject unconfirmed apply",
+			args: []string{
+				"-action", "apply", "-evidence", "proof.json",
+				"-expires-at", expiresAt, "-plan-digest", digest,
+			},
+		},
+		{
+			name: "reject unconfirmed abort",
+			args: []string{"-action", "abort", "-plan-digest", digest},
+		},
+		{
+			name: "reject evidence on abort",
+			args: []string{
+				"-action", "abort", "-evidence", "proof.json",
+				"-plan-digest", digest, "-confirm-abort",
+			},
+		},
+		{
+			name: "reject digest on preview",
+			args: []string{
+				"-action", "preview", "-evidence", "proof.json",
+				"-expires-at", expiresAt, "-plan-digest", digest,
+			},
+		},
+		{
+			name: "reject uppercase digest",
+			args: []string{
+				"-action", "apply", "-evidence", "proof.json",
+				"-expires-at", expiresAt,
+				"-plan-digest", strings.Repeat("A", 64), "-confirm-apply",
+			},
+		},
+		{
+			name: "reject missing preview expiry",
+			args: []string{"-action", "preview", "-evidence", "proof.json"},
+		},
+		{
+			name: "reject malformed expiry",
+			args: []string{
+				"-action", "preview", "-evidence", "proof.json",
+				"-expires-at", "tomorrow",
+			},
+		},
+		{
+			name: "reject expiry carrier on verify",
+			args: []string{
+				"-action", "verify", "-expires-at", expiresAt,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			_, ok := parseLegacyBatch63RepairOptions(test.args, &stderr)
+			if ok != test.ok {
+				t.Fatalf("ok=%t want=%t stderr=%q", ok, test.ok, stderr.String())
+			}
+		})
+	}
+}
+
+func TestReadLegacyBatch63EvidenceIsBoundedAndSanitized(t *testing.T) {
+	dir := t.TempDir()
+	validPath := filepath.Join(dir, "evidence.json")
+	if err := os.WriteFile(validPath, []byte(`{"proof":"bound"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := readLegacyBatch63Evidence(validPath)
+	if err != nil || string(raw) != `{"proof":"bound"}` {
+		t.Fatalf("raw/err=%q/%v", raw, err)
+	}
+
+	oversizePath := filepath.Join(dir, "oversize.json")
+	if err := os.WriteFile(
+		oversizePath,
+		bytes.Repeat([]byte("x"), maxLegacyBatch63EvidenceBytes+1),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readLegacyBatch63Evidence(oversizePath); err == nil ||
+		strings.Contains(err.Error(), oversizePath) {
+		t.Fatalf("oversize error leaked path or was nil: %v", err)
+	}
+	const secretPath = "operator-secret-proof.json"
+	if _, err := readLegacyBatch63Evidence(
+		filepath.Join(dir, secretPath)); err == nil ||
+		strings.Contains(err.Error(), secretPath) {
+		t.Fatalf("missing-file error leaked path or was nil: %v", err)
+	}
+}
+
+func TestFinishLegacyBatch63RepairRunOutputsOnlySafeCarrier(t *testing.T) {
+	enableBy := time.Date(2026, 7, 25, 12, 5, 0, 0, time.UTC)
+	expiresAt := time.Date(2026, 7, 25, 13, 0, 0, 0, time.UTC)
+	output := legacyBatch63RepairOutput{
+		Phase: "finalized", PlanDigest: strings.Repeat("a", 64),
+		EnableBy: &enableBy, ExpiresAt: &expiresAt, Remaining: 3300,
+	}
+	var stdout, stderr bytes.Buffer
+	if got := finishLegacyBatch63RepairRun(
+		&stdout, &stderr, output, nil); got != exitOK {
+		t.Fatalf("exit=%d stderr=%q", got, stderr.String())
+	}
+	for _, expected := range []string{
+		`"phase": "finalized"`,
+		`"plan_digest": "`,
+		`"enable_by": "2026-07-25T12:05:00Z"`,
+		`"expires_at": "2026-07-25T13:00:00Z"`,
+		`"remaining": 3300`,
+	} {
+		if !strings.Contains(stdout.String(), expected) {
+			t.Errorf("output missing %q: %s", expected, stdout.String())
+		}
+	}
+	for _, forbidden := range []string{
+		"evidence", "journal", "code_excerpt", "card", "target", "app_identity",
+		"effect_id", "effect_state", "batch_state", "authority",
+	} {
+		if strings.Contains(stdout.String(), forbidden) {
+			t.Errorf("output leaked forbidden field %q: %s",
+				forbidden, stdout.String())
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestFinishLegacyBatch63RepairRunSanitizesError(t *testing.T) {
+	const secret = "raw journal and postgres://owner:secret@private/db"
+	runErr := types.NewAppError(
+		types.CodeDatabase, "legacy repair unavailable", errors.New(secret))
+	var stdout, stderr bytes.Buffer
+	if got := finishLegacyBatch63RepairRun(
+		&stdout, &stderr, legacyBatch63RepairOutput{}, runErr,
+	); got != exitFailure {
+		t.Fatalf("exit=%d", got)
+	}
+	if stdout.Len() != 0 ||
+		!strings.Contains(stderr.String(), "legacy repair unavailable") ||
+		strings.Contains(stderr.String(), secret) {
+		t.Fatalf("unsafe output stdout/stderr=%q/%q",
+			stdout.String(), stderr.String())
+	}
+}
+
+func TestExecuteLegacyBatch63RepairRoutesExactAction(t *testing.T) {
+	expiresAt := time.Date(2026, 7, 25, 13, 0, 0, 0, time.UTC)
+	databaseNow := expiresAt.Add(-50 * time.Minute)
+	enableBy := databaseNow.Add(5 * time.Minute)
+	digest := strings.Repeat("a", 64)
+	evidence := []byte(`{"schema_version":"proof"}`)
+
+	t.Run("preview binds evidence expiry and fixed card builder", func(t *testing.T) {
+		fake := &fakeLegacyBatch63RepairStore{
+			previewPlan: store.LegacyBatch63RepairPlan{
+				PlanDigest: digest, DatabaseNow: databaseNow,
+				EnableBy: enableBy, ExpiresAt: expiresAt,
+			},
+		}
+		output, err := executeLegacyBatch63Repair(
+			t.Context(), fake,
+			legacyBatch63RepairOptions{
+				Action: legacyBatch63RepairPreview, ExpiresAt: expiresAt,
+			},
+			evidence, databaseNow,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fake.action != "preview" ||
+			!bytes.Equal(fake.evidence.CanonicalBytes, evidence) ||
+			!fake.expiresAt.Equal(expiresAt) ||
+			output.Phase != "preview" || output.PlanDigest != digest ||
+			output.Remaining != int64((50*time.Minute)/time.Second) ||
+			!strings.Contains(fake.card, `"effect_id":"effect-fixed"`) ||
+			!strings.Contains(fake.card, `"delivery_id":"202"`) {
+			t.Fatalf("fake/output=%+v/%+v", fake, output)
+		}
+	})
+
+	t.Run("apply forwards only exact digest", func(t *testing.T) {
+		fake := &fakeLegacyBatch63RepairStore{
+			status: store.LegacyBatch63RepairStatus{
+				Phase: "finalized", PlanDigest: digest,
+				EnableBy: &enableBy, ExpiresAt: &expiresAt,
+				DatabaseNow: databaseNow,
+			},
+		}
+		output, err := executeLegacyBatch63Repair(
+			t.Context(), fake,
+			legacyBatch63RepairOptions{
+				Action:     legacyBatch63RepairApply,
+				PlanDigest: digest, ExpiresAt: expiresAt,
+			},
+			evidence, databaseNow,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fake.action != "apply" || fake.planDigest != digest ||
+			output.Phase != "finalized" ||
+			output.Remaining != int64((50*time.Minute)/time.Second) {
+			t.Fatalf("fake/output=%+v/%+v", fake, output)
+		}
+	})
+
+	t.Run("verify carries no evidence", func(t *testing.T) {
+		fake := &fakeLegacyBatch63RepairStore{
+			status: store.LegacyBatch63RepairStatus{Phase: "absent"},
+		}
+		output, err := executeLegacyBatch63Repair(
+			t.Context(), fake,
+			legacyBatch63RepairOptions{Action: legacyBatch63RepairVerify},
+			nil, databaseNow,
+		)
+		if err != nil || fake.action != "verify" ||
+			len(fake.evidence.CanonicalBytes) != 0 ||
+			output.Phase != "absent" {
+			t.Fatalf("fake/output/err=%+v/%+v/%v", fake, output, err)
+		}
+	})
+
+	t.Run("abort forwards only exact digest", func(t *testing.T) {
+		fake := &fakeLegacyBatch63RepairStore{
+			status: store.LegacyBatch63RepairStatus{
+				Phase: "blocked", PlanDigest: digest,
+			},
+		}
+		output, err := executeLegacyBatch63Repair(
+			t.Context(), fake,
+			legacyBatch63RepairOptions{
+				Action: legacyBatch63RepairAbort, PlanDigest: digest,
+			},
+			nil, databaseNow,
+		)
+		if err != nil || fake.action != "abort" ||
+			fake.planDigest != digest || output.Phase != "blocked" {
+			t.Fatalf("fake/output/err=%+v/%+v/%v", fake, output, err)
+		}
+	})
+}
+
+type fakeLegacyBatch63RepairStore struct {
+	action      string
+	planDigest  string
+	evidence    store.LegacyBatch63RepairEvidence
+	expiresAt   time.Time
+	card        string
+	previewPlan store.LegacyBatch63RepairPlan
+	status      store.LegacyBatch63RepairStatus
+	err         error
+}
+
+func (f *fakeLegacyBatch63RepairStore) PreviewLegacyBatch63Repair(
+	_ context.Context,
+	evidence store.LegacyBatch63RepairEvidence,
+	expiresAt time.Time,
+	buildCard store.LegacyBatch63CardBuilder,
+) (store.LegacyBatch63RepairPlan, error) {
+	f.action, f.evidence, f.expiresAt = "preview", evidence, expiresAt
+	f.card = buildCard(store.LegacyBatch63CardInput{
+		EffectID: "effect-fixed",
+		Items: []store.LegacyBatch63CardItem{{
+			DeliveryID: 202, BodyMD: "body", Title: "title", Score: 85,
+		}},
+	})
+	return f.previewPlan, f.err
+}
+
+func (f *fakeLegacyBatch63RepairStore) FinalizeLegacyBatch63Repair(
+	_ context.Context,
+	planDigest string,
+	evidence store.LegacyBatch63RepairEvidence,
+	expiresAt time.Time,
+	buildCard store.LegacyBatch63CardBuilder,
+) (store.LegacyBatch63RepairStatus, error) {
+	f.action, f.planDigest = "apply", planDigest
+	f.evidence, f.expiresAt = evidence, expiresAt
+	f.card = buildCard(store.LegacyBatch63CardInput{EffectID: "effect-fixed"})
+	return f.status, f.err
+}
+
+func (f *fakeLegacyBatch63RepairStore) VerifyLegacyBatch63Repair(
+	context.Context,
+) (store.LegacyBatch63RepairStatus, error) {
+	f.action = "verify"
+	return f.status, f.err
+}
+
+func (f *fakeLegacyBatch63RepairStore) AbortLegacyBatch63Repair(
+	_ context.Context,
+	planDigest string,
+) (store.LegacyBatch63RepairStatus, error) {
+	f.action, f.planDigest = "abort", planDigest
+	return f.status, f.err
+}
+
 func TestBaselineExitCode(t *testing.T) {
 	tests := []struct {
 		name   string

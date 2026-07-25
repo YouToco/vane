@@ -193,6 +193,75 @@ the local “Feishu channel is disconnected” branch is evidence that the provi
 API was not called. The operator records the evidence source and creates a new
 versioned effect; it does not delete deliveries or forge `sent`.
 
+For every deterministic `prepared` or `definite_failed` effect, the recovery
+coordinator also owns a restricted database-clock terminal checkpoint. If the
+remaining provider UUID window can no longer contain one complete send lease,
+the exact unclaimed fence is atomically changed to
+`blocked/provider_window_expired_no_send`. The transition races the normal
+authorized claim under the same batch lock, so exactly one path wins; it never
+applies to `sending`, `ambiguous`, or `sent`. This prevents an expired,
+definitely-not-sent effect from remaining recoverable forever.
+
+### 8.1 Physical batch 63 one-time repair
+
+The only initial legacy adoption is a physically pinned, one-time
+`runtimeadmin legacy-batch63-repair` operation. It has no batch, tenant, user,
+task, Run, target, App, card, or UUID selector. Its database role and
+SECURITY DEFINER functions are dedicated to physical `push_batches.id=63`;
+`PUBLIC`, `vane_app`, the generic coordinator, and the generic effect operator
+cannot execute them.
+
+The evidence file is canonical, strict JSON and content-addressed by the Store.
+It binds all of the following together:
+
+- batch 63, the exact task, Temporal Workflow/Run, Activity ID 52 and attempt 1;
+- service revision
+  `5a82b1350aba467189ba36a90105f6de3d4d65e4`;
+- the non-retryable `CONFLICT` result with exactly five items;
+- the exact `client == nil` code branch before
+  `client.Im.Message.Create`;
+- the exact journald lines and their SHA-256 digest; and
+- the explicit fact that Temporal history is no longer retained. History
+  `not found`, an empty provider receipt, or a caller-supplied label alone is
+  never proof.
+
+`preview` is read-only. Its only plan-time input is an absolute RFC3339
+`-expires-at`, reused as the same exact instant by `apply`; the Store accepts it
+only in the database-clock 45-to-60-minute safety window. Preview re-locks and
+hashes the
+exact failed batch, snapshot,
+five ordered pending deliveries, frozen content/source card inputs, and current
+non-secret Feishu target generation. The Store, not command-line input,
+deterministically rebuilds the aggregate card and all `pusheffect.Prepared`
+fields. The output carries only `phase`, the exact plan digest, `enable_by`,
+`expires_at`, and remaining seconds; it never emits evidence, raw logs, card
+bytes, recipient, App identity, provider UUID, or database error details.
+
+`apply` requires the evidence file, exact preview digest, and
+`-confirm-apply`. Under one physical batch/effect lock transaction it recomputes
+the complete material and evidence digest, rejects any drift, changes batch 63
+from `failed/NULL` to `pending/effect`, creates one `prepared` effect, and
+appends the `finalized` audit event. Exact replay may only return the already
+finalized identical plan. No provider call is reachable from this operator.
+
+The repair UUID expires no later than one database-clock hour after preview,
+and apply requires at least 45 minutes to remain. Fresh claim also requires the
+complete send lease to fit inside the frozen provider window. The recovery
+canary stays empty through preview and apply; after finalized verification, the
+exact task key must be enabled before the emitted absolute `enable_by` deadline.
+If that deadline is missed, `abort` with the exact digest and
+`-confirm-abort` atomically wins against claim, blocks only an unclaimed
+`prepared` effect, restores the batch to `failed`, and appends a `blocked`
+audit event. It cannot abort `sending`, failed-attempt, ambiguous, or sent
+effects.
+
+`verify` is read-only and reports the durable phase, exact plan digest, and
+deadline window without exposing the underlying effect/card/provider fields.
+The production Gate is not complete until recovery records `sent`, all five
+deliveries share the exact receipt/card, batch 63 is `done`, the Feishu message
+is positively retrievable, the exact recovery key has been removed again, and
+health/readiness/log probes remain green.
+
 ## 9. Release train
 
 1. Deploy schema, codec, Store, roles, and integrity tests with zero production

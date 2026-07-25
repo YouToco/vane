@@ -22,21 +22,25 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/feedback"
+	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
 
 const (
-	exitOK                      = 0
-	exitVerifyFailed            = 1
-	exitFailure                 = 2
-	exitVerifyMorePages         = 3
-	runTimeout                  = 2 * time.Minute
-	maxSnapshotShadowAuditItems = 1000
+	exitOK                        = 0
+	exitVerifyFailed              = 1
+	exitFailure                   = 2
+	exitVerifyMorePages           = 3
+	runTimeout                    = 2 * time.Minute
+	maxSnapshotShadowAuditItems   = 1000
+	maxLegacyBatch63EvidenceBytes = 1 << 20
 )
 
 func main() {
@@ -44,6 +48,9 @@ func main() {
 }
 
 func run(args []string) int {
+	if len(args) > 0 && args[0] == "legacy-batch63-repair" {
+		return runLegacyBatch63Repair(args[1:])
+	}
 	if len(args) > 0 && args[0] == "snapshot-shadow" {
 		return runSnapshotShadow(args[1:])
 	}
@@ -53,7 +60,7 @@ func run(args []string) int {
 	if len(args) == 0 || args[0] != "baseline" {
 		fmt.Fprintln(os.Stderr,
 			"用法: runtimeadmin baseline ... | snapshot-shadow ... | "+
-				"snapshot-cutover ...")
+				"snapshot-cutover ... | legacy-batch63-repair ...")
 		return exitFailure
 	}
 	fs := flag.NewFlagSet("runtimeadmin baseline", flag.ContinueOnError)
@@ -103,6 +110,314 @@ func run(args []string) int {
 			TaskID:   *afterTask,
 		}, *limit)
 	return finishBaselineRun(os.Stdout, os.Stderr, mode, page, err)
+}
+
+type legacyBatch63RepairAction string
+
+const (
+	legacyBatch63RepairPreview legacyBatch63RepairAction = "preview"
+	legacyBatch63RepairApply   legacyBatch63RepairAction = "apply"
+	legacyBatch63RepairVerify  legacyBatch63RepairAction = "verify"
+	legacyBatch63RepairAbort   legacyBatch63RepairAction = "abort"
+)
+
+type legacyBatch63RepairOptions struct {
+	Action       legacyBatch63RepairAction
+	EvidencePath string
+	PlanDigest   string
+	ExpiresAt    time.Time
+	ConfirmApply bool
+	ConfirmAbort bool
+}
+
+type legacyBatch63RepairOutput struct {
+	Phase      string     `json:"phase"`
+	PlanDigest string     `json:"plan_digest"`
+	EnableBy   *time.Time `json:"enable_by"`
+	ExpiresAt  *time.Time `json:"expires_at"`
+	Remaining  int64      `json:"remaining"`
+}
+
+type legacyBatch63RepairStore interface {
+	PreviewLegacyBatch63Repair(
+		context.Context,
+		store.LegacyBatch63RepairEvidence,
+		time.Time,
+		store.LegacyBatch63CardBuilder,
+	) (store.LegacyBatch63RepairPlan, error)
+	FinalizeLegacyBatch63Repair(
+		context.Context,
+		string,
+		store.LegacyBatch63RepairEvidence,
+		time.Time,
+		store.LegacyBatch63CardBuilder,
+	) (store.LegacyBatch63RepairStatus, error)
+	VerifyLegacyBatch63Repair(
+		context.Context,
+	) (store.LegacyBatch63RepairStatus, error)
+	AbortLegacyBatch63Repair(
+		context.Context,
+		string,
+	) (store.LegacyBatch63RepairStatus, error)
+}
+
+func runLegacyBatch63Repair(args []string) int {
+	opts, ok := parseLegacyBatch63RepairOptions(args, os.Stderr)
+	if !ok {
+		return exitFailure
+	}
+	var evidenceBytes []byte
+	var err error
+	if opts.Action == legacyBatch63RepairPreview ||
+		opts.Action == legacyBatch63RepairApply {
+		evidenceBytes, err = readLegacyBatch63Evidence(opts.EvidencePath)
+		if err != nil {
+			return finishLegacyBatch63RepairRun(
+				os.Stdout, os.Stderr, legacyBatch63RepairOutput{},
+				types.NewAppError(
+					types.CodeValidation, "repair evidence file is invalid", nil))
+		}
+	}
+	cfg, err := config.Load("")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runtimeadmin: 加载配置失败")
+		return exitFailure
+	}
+	ctx, stop := signal.NotifyContext(
+		context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, runTimeout)
+	defer cancel()
+	st, err := store.New(ctx, cfg.DB.URL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runtimeadmin: 连接数据库失败")
+		return exitFailure
+	}
+	defer st.Close()
+	output, err := executeLegacyBatch63Repair(
+		ctx, st, opts, evidenceBytes, time.Now().UTC())
+	return finishLegacyBatch63RepairRun(os.Stdout, os.Stderr, output, err)
+}
+
+func executeLegacyBatch63Repair(
+	ctx context.Context,
+	st legacyBatch63RepairStore,
+	opts legacyBatch63RepairOptions,
+	evidenceBytes []byte,
+	now time.Time,
+) (legacyBatch63RepairOutput, error) {
+	evidence := store.LegacyBatch63RepairEvidence{
+		CanonicalBytes: evidenceBytes,
+	}
+	switch opts.Action {
+	case legacyBatch63RepairPreview:
+		plan, err := st.PreviewLegacyBatch63Repair(
+			ctx, evidence, opts.ExpiresAt, buildLegacyBatch63Card)
+		if err != nil {
+			return legacyBatch63RepairOutput{}, err
+		}
+		enableBy, expiresAt := plan.EnableBy.UTC(), plan.ExpiresAt.UTC()
+		return legacyBatch63RepairOutput{
+			Phase:      string(legacyBatch63RepairPreview),
+			PlanDigest: plan.PlanDigest,
+			EnableBy:   &enableBy,
+			ExpiresAt:  &expiresAt,
+			Remaining: legacyBatch63Remaining(
+				&expiresAt, plan.DatabaseNow),
+		}, nil
+	case legacyBatch63RepairApply:
+		status, err := st.FinalizeLegacyBatch63Repair(
+			ctx, opts.PlanDigest, evidence, opts.ExpiresAt,
+			buildLegacyBatch63Card)
+		return legacyBatch63OutputFromStatus(status, now), err
+	case legacyBatch63RepairVerify:
+		status, err := st.VerifyLegacyBatch63Repair(ctx)
+		return legacyBatch63OutputFromStatus(status, now), err
+	case legacyBatch63RepairAbort:
+		status, err := st.AbortLegacyBatch63Repair(
+			ctx, opts.PlanDigest)
+		return legacyBatch63OutputFromStatus(status, now), err
+	default:
+		return legacyBatch63RepairOutput{}, types.NewAppError(
+			types.CodeValidation, "legacy repair action is invalid", nil)
+	}
+}
+
+func buildLegacyBatch63Card(input store.LegacyBatch63CardInput) string {
+	items := make([]feedback.CardInput, len(input.Items))
+	for index, item := range input.Items {
+		items[index] = feedback.CardInput{
+			BodyMD: item.BodyMD, DeliveryID: item.DeliveryID,
+			Title: item.Title, Score: item.Score, URL: item.URL,
+			SourceTitle: item.SourceTitle,
+			Platform:    types.Platform(item.Platform),
+			PublishedAt: item.PublishedAt,
+		}
+	}
+	headerTitle, headerTemplate :=
+		feishu.AggHeaderForTask(input.TaskTitle, len(items))
+	return feishu.BuildAggregateCard(feedback.AggregateCardInput{
+		HeaderTitle: headerTitle, HeaderTemplate: headerTemplate,
+		EffectID: input.EffectID, Items: items,
+	})
+}
+
+func legacyBatch63OutputFromStatus(
+	status store.LegacyBatch63RepairStatus,
+	_ time.Time,
+) legacyBatch63RepairOutput {
+	return legacyBatch63RepairOutput{
+		Phase:      status.Phase,
+		PlanDigest: status.PlanDigest,
+		EnableBy:   status.EnableBy,
+		ExpiresAt:  status.ExpiresAt,
+		Remaining: legacyBatch63Remaining(
+			status.ExpiresAt, status.DatabaseNow),
+	}
+}
+
+func parseLegacyBatch63RepairOptions(
+	args []string,
+	stderr io.Writer,
+) (legacyBatch63RepairOptions, bool) {
+	fs := flag.NewFlagSet("runtimeadmin legacy-batch63-repair", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	rawAction := fs.String(
+		"action", string(legacyBatch63RepairPreview),
+		"preview、apply、verify 或 abort")
+	evidencePath := fs.String(
+		"evidence", "", "canonical evidence JSON file (preview/apply only)")
+	planDigest := fs.String(
+		"plan-digest", "", "exact preview plan digest (apply/abort only)")
+	rawExpiresAt := fs.String(
+		"expires-at", "", "exact RFC3339 provider UUID expiry (preview/apply only)")
+	confirmApply := fs.Bool(
+		"confirm-apply", false, "confirm the exact plan will be finalized")
+	confirmAbort := fs.Bool(
+		"confirm-abort", false, "confirm the exact unclaimed plan will be blocked")
+	if err := fs.Parse(args); err != nil {
+		return legacyBatch63RepairOptions{}, false
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr,
+			"runtimeadmin: legacy-batch63-repair 不接受位置参数")
+		return legacyBatch63RepairOptions{}, false
+	}
+	opts := legacyBatch63RepairOptions{
+		Action:       legacyBatch63RepairAction(*rawAction),
+		EvidencePath: *evidencePath,
+		PlanDigest:   *planDigest,
+		ConfirmApply: *confirmApply,
+		ConfirmAbort: *confirmAbort,
+	}
+	if *rawExpiresAt != "" {
+		expiresAt, err := time.Parse(time.RFC3339, *rawExpiresAt)
+		if err != nil {
+			fmt.Fprintln(stderr,
+				"runtimeadmin: -expires-at 必须是 RFC3339 时间")
+			return legacyBatch63RepairOptions{}, false
+		}
+		opts.ExpiresAt = expiresAt.UTC()
+	}
+	switch opts.Action {
+	case legacyBatch63RepairPreview:
+		if opts.EvidencePath == "" || opts.ExpiresAt.IsZero() ||
+			opts.PlanDigest != "" ||
+			opts.ConfirmApply || opts.ConfirmAbort {
+			fmt.Fprintln(stderr,
+				"runtimeadmin: preview 需要 -evidence 与 -expires-at")
+			return legacyBatch63RepairOptions{}, false
+		}
+	case legacyBatch63RepairApply:
+		if opts.EvidencePath == "" || !validLegacyBatch63PlanDigest(
+			opts.PlanDigest) || opts.ExpiresAt.IsZero() ||
+			!opts.ConfirmApply || opts.ConfirmAbort {
+			fmt.Fprintln(stderr,
+				"runtimeadmin: apply 需要 -evidence、-expires-at、-plan-digest 与 -confirm-apply")
+			return legacyBatch63RepairOptions{}, false
+		}
+	case legacyBatch63RepairVerify:
+		if opts.EvidencePath != "" || opts.PlanDigest != "" ||
+			!opts.ExpiresAt.IsZero() ||
+			opts.ConfirmApply || opts.ConfirmAbort {
+			fmt.Fprintln(stderr,
+				"runtimeadmin: verify 不接受 evidence、digest 或 confirm 参数")
+			return legacyBatch63RepairOptions{}, false
+		}
+	case legacyBatch63RepairAbort:
+		if opts.EvidencePath != "" || !validLegacyBatch63PlanDigest(
+			opts.PlanDigest) || !opts.ExpiresAt.IsZero() ||
+			opts.ConfirmApply || !opts.ConfirmAbort {
+			fmt.Fprintln(stderr,
+				"runtimeadmin: abort 需要 -plan-digest 与 -confirm-abort")
+			return legacyBatch63RepairOptions{}, false
+		}
+	default:
+		fmt.Fprintln(stderr,
+			"runtimeadmin: legacy-batch63-repair -action 仅支持 preview、apply、verify、abort")
+		return legacyBatch63RepairOptions{}, false
+	}
+	return opts, true
+}
+
+func validLegacyBatch63PlanDigest(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func readLegacyBatch63Evidence(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, errors.New("evidence file is unavailable")
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(
+		file, maxLegacyBatch63EvidenceBytes+1))
+	if err != nil {
+		return nil, errors.New("evidence file is unavailable")
+	}
+	if len(raw) == 0 || len(raw) > maxLegacyBatch63EvidenceBytes {
+		return nil, errors.New("evidence file size is invalid")
+	}
+	return raw, nil
+}
+
+func finishLegacyBatch63RepairRun(
+	stdout io.Writer,
+	stderr io.Writer,
+	output legacyBatch63RepairOutput,
+	runErr error,
+) int {
+	if runErr != nil {
+		fmt.Fprintln(stderr, "runtimeadmin: "+safeError(
+			runErr, "legacy batch 63 repair failed"))
+		return exitFailure
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(output); err != nil {
+		fmt.Fprintln(stderr, "runtimeadmin: 输出结果失败")
+		return exitFailure
+	}
+	return exitOK
+}
+
+func legacyBatch63Remaining(expiresAt *time.Time, now time.Time) int64 {
+	if expiresAt == nil {
+		return 0
+	}
+	remaining := expiresAt.Sub(now.UTC())
+	if remaining <= 0 {
+		return 0
+	}
+	return int64(remaining / time.Second)
 }
 
 func runSnapshotCutover(args []string) int {
