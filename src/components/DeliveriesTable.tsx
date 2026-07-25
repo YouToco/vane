@@ -45,6 +45,19 @@ function feedbackMeta(h: Dict["app"]["history"]): FeedbackMeta {
   };
 }
 
+function feedbackReasonLabel(reasonCode: string | undefined, h: Dict["app"]["history"]): string | null {
+  if (!reasonCode) return null;
+  const labels: Record<string, string> = {
+    outdated_or_out_of_window: h.fbReasonOutdated,
+    not_relevant: h.fbReasonNotRelevant,
+    duplicate: h.fbReasonDuplicate,
+    factually_wrong: h.fbReasonFactuallyWrong,
+    poor_source_or_evidence: h.fbReasonPoorEvidence,
+    other: h.fbReasonOther,
+  };
+  return labels[reasonCode] ?? reasonCode;
+}
+
 function clipDetail(s: string, max = 120): string {
   const runes = Array.from(s);
   return runes.length <= max ? s : runes.slice(0, max).join("") + "…";
@@ -219,14 +232,19 @@ export default function DeliveriesTable({
                           <div className="flex flex-wrap gap-1">
                             {it.feedbacks.map((fb, i) => {
                               const meta = FEEDBACK_META[fb.action];
+                              const reasonLabel = feedbackReasonLabel(fb.reason_code, H);
                               const tooltipText =
                                 fmtBeijing(fb.created_at) +
+                                (reasonLabel ? ` · ${reasonLabel}` : "") +
                                 (fb.detail ? ` · ${clipDetail(fb.detail)}` : "");
                               return (
                                 <Tooltip key={i}>
                                   <TooltipTrigger render={<span />}>
                                     <Badge variant={meta?.variant ?? "secondary"}>
-                                      {meta?.label ?? fb.action}
+                                      {reasonLabel ? H.fbIssue : meta?.label ?? fb.action}
+                                      {reasonLabel && (
+                                        <span className="ml-1 opacity-75">· {reasonLabel}</span>
+                                      )}
                                       {meta?.showDetail && fb.detail && (
                                         <span className="ml-1 opacity-75">
                                           {clipDetail(fb.detail, 30)}

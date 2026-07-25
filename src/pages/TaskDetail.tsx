@@ -28,6 +28,7 @@ import type {
   ScheduleBatchItem,
   PipelineCounts,
   ScheduleSourceInfo,
+  ObservationPolicy,
 } from "../api";
 import { fmt, useI18n, type Dict } from "@/i18n";
 import { fmtBeijing } from "@/lib/time";
@@ -191,6 +192,93 @@ function sourceStatusVariant(status: string): "default" | "secondary" | "outline
   return "outline";
 }
 
+function durationText(seconds: number, d: Dict["app"]["taskDetail"]): string {
+  if (seconds % 86400 === 0) return `${seconds / 86400} ${d.observationDays}`;
+  if (seconds % 3600 === 0) return `${seconds / 3600} ${d.observationHours}`;
+  return `${seconds / 60} ${d.observationMinutes}`;
+}
+
+function policyValue(value: string | undefined, labels: Record<string, string>): string {
+  return value ? labels[value] ?? value : "—";
+}
+
+function ObservationTab({ policy }: { policy: ObservationPolicy }) {
+  const { t } = useI18n();
+  const D = t.app.taskDetail;
+  const window = policy.window;
+  const evidence = policy.evidence;
+  const eventDefinition = [
+    policy.event?.subject,
+    policy.event?.event_kind,
+    policy.event?.qualification,
+  ].filter(Boolean).join(" · ");
+  const rows: [string, string][] = [
+    [
+      D.observationMode,
+      `${policyValue(policy.mode, {
+        content: D.observationContent,
+        event: D.observationEvent,
+      })}${eventDefinition ? ` · ${eventDefinition}` : ""}`,
+    ],
+    [
+      D.observationWindow,
+      window?.kind === "schedule_interval"
+        ? D.observationScheduleInterval
+        : window?.kind === "rolling_duration" && typeof window.rolling_duration_seconds === "number"
+          ? `${D.observationRolling} · ${durationText(window.rolling_duration_seconds, D)}`
+          : window?.kind === "calendar_period"
+            ? `${D.observationCalendar} · ${policyValue(window.calendar_period, {
+                day: D.observationDay,
+                week: D.observationWeek,
+                month: D.observationMonth,
+              })}`
+            : "—",
+    ],
+    [
+      D.observationEvidence,
+      evidence?.requirement === "official_required"
+        ? D.observationOfficialOnly
+        : evidence?.requirement === "trusted_allowed"
+          ? D.observationTrustedAllowed
+          : evidence?.requirement ?? "—",
+    ],
+    [
+      D.observationLate,
+      policy.late_policy === "strict"
+        ? D.observationStrict
+        : policy.late_policy === "bounded" && typeof policy.allowed_lateness_seconds === "number"
+          ? `${D.observationBounded} · ${durationText(policy.allowed_lateness_seconds, D)}`
+          : policy.late_policy ?? "—",
+    ],
+    [
+      D.observationUnknownTime,
+      policyValue(policy.unknown_time, {
+        reject: D.observationReject,
+        deprioritize: D.observationDeprioritize,
+        allow: D.observationAllow,
+      }),
+    ],
+  ];
+  if (policy.effective_at) rows.push([D.observationEffectiveAt, fmtBeijing(policy.effective_at)]);
+  if (evidence?.official_domains?.length) rows.push([D.observationOfficialDomains, evidence.official_domains.join(", ")]);
+
+  return (
+    <Card>
+      <CardContent className="py-5 space-y-3">
+        <p className="text-xs text-muted-foreground">{D.observationDesc}</p>
+        <dl className="grid gap-x-6 gap-y-3 sm:grid-cols-2 text-sm">
+          {rows.map(([label, value]) => (
+            <div key={label} className="min-w-0">
+              <dt className="text-xs text-muted-foreground">{label}</dt>
+              <dd className="mt-0.5 break-words">{value}</dd>
+            </div>
+          ))}
+        </dl>
+      </CardContent>
+    </Card>
+  );
+}
+
 // 绑定信源 Tab：详情接口已随首屏取回，这里纯渲染。空 ≠ 坏：老任务走账号级
 // 订阅、没有 schedule_sources 行，空态文案要说真话而不是「没数据」。
 function SourcesTab({ sources }: { sources: ScheduleSourceInfo[] }) {
@@ -324,6 +412,10 @@ export default function TaskDetail({ scheduleID }: { scheduleID: string }) {
   }
 
   const { schedule, summary, sources, playbook, cost } = detail;
+  // `observation` is the immutable runtime-policy projection; the alias keeps
+  // this first read-only UI useful while older API deployments expose the
+  // create-command spelling instead.
+  const observation = schedule.scope.observation ?? schedule.scope.observation_policy;
   const stats = [
     { icon: Send, label: D.statSent7d, value: String(summary.sent_pushes_7d) },
     { icon: PlayCircle, label: D.statRuns7d, value: String(summary.batches_7d) },
@@ -401,6 +493,7 @@ export default function TaskDetail({ scheduleID }: { scheduleID: string }) {
           <TabsTrigger value="runs">{D.tabRuns}</TabsTrigger>
           <TabsTrigger value="sources">{D.tabSources}</TabsTrigger>
           <TabsTrigger value="playbook">{D.tabPlaybook}</TabsTrigger>
+          {observation && <TabsTrigger value="observation">{D.tabObservation}</TabsTrigger>}
         </TabsList>
         <TabsContent value="pushes">
           <DeliveriesTable
@@ -436,6 +529,11 @@ export default function TaskDetail({ scheduleID }: { scheduleID: string }) {
             </Card>
           )}
         </TabsContent>
+        {observation && (
+          <TabsContent value="observation">
+            <ObservationTab policy={observation} />
+          </TabsContent>
+        )}
       </Tabs>
     </div>
   );

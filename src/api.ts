@@ -44,6 +44,37 @@ export interface ConfigResult {
 export interface PushScope {
   source_ids?: number[];
   top_n?: number;
+  // Observation policy is compiled and approved with the task definition.  New
+  // runtime snapshots use `observation`; `observation_policy` keeps the Web
+  // client tolerant of the create-command representation during rollout.
+  observation?: ObservationPolicy;
+  observation_policy?: ObservationPolicy;
+}
+
+// Read-only projection of the versioned freshness/event policy. The backend
+// owns validation and enforcement; optional fields deliberately let the UI
+// show older policy revisions without inventing defaults.
+export interface ObservationPolicy {
+  schema?: string;
+  mode?: "content" | "event" | string;
+  window?: {
+    kind?: "schedule_interval" | "rolling_duration" | "calendar_period" | string;
+    rolling_duration_seconds?: number;
+    calendar_period?: "day" | "week" | "month" | string;
+  };
+  evidence?: {
+    requirement?: "official_required" | "trusted_allowed" | string;
+    official_domains?: string[];
+  };
+  late_policy?: "strict" | "bounded" | string;
+  allowed_lateness_seconds?: number;
+  unknown_time?: "reject" | "deprioritize" | "allow" | string;
+  event?: {
+    subject?: string;
+    event_kind?: string;
+    qualification?: "official_announcement" | "general_availability" | "either" | string;
+  };
+  effective_at?: string;
 }
 
 // ScheduleSpec 是前端时间选择器编译出的中立频率结构（B2 spec_json / B7 ScheduleSpec）。
@@ -227,6 +258,9 @@ export interface ObservabilityReport {
 // 一条投递上的一次反馈动作。action 是后端 FeedbackAction 原文。
 export interface DeliveryFeedback {
   action: string; // interested / not_interested / misjudged / deep_dive / question
+  // New issue feedback is a single `misjudged` row with a reason code. Older
+  // rows omit this field and remain readable as their original action.
+  reason_code?: string;
   detail: string; // 文字反馈原文，按钮反馈为空串
   created_at: string; // UTC
 }
