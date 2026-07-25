@@ -3178,9 +3178,13 @@ func (a *Activities) sendDurablePushChunk(
 	}
 	failure := pusheffect.FailureParams{
 		Lease: lease, Class: failureClass,
-		RetryAfter: pushEffectRetryAfter,
 	}
 	if definite {
+		// Only a provider response that proves "not sent" may schedule a
+		// fresh-send retry. Ambiguous entry carries no retry authority; the
+		// recovery coordinator persists its separate history-reconciliation
+		// deferral after the state transition succeeds.
+		failure.RetryAfter = pushEffectRetryAfter
 		err = a.pushEffectStore.RecordPushEffectDefiniteFailure(ctx, failure)
 	} else {
 		err = a.pushEffectStore.RecordPushEffectAmbiguous(ctx, failure)

@@ -17,14 +17,16 @@ import (
 type pushEffectStoreFake struct {
 	mu sync.Mutex
 
-	initialStatus pusheffect.Status
-	batchStarted  bool
-	prepared      []pusheffect.Prepared
-	claims        int
-	reconciles    int
-	definite      int
-	ambiguous     int
-	receipts      []pusheffect.SentReceipt
+	initialStatus   pusheffect.Status
+	batchStarted    bool
+	prepared        []pusheffect.Prepared
+	claims          int
+	reconciles      int
+	definite        int
+	ambiguous       int
+	definiteParams  []pusheffect.FailureParams
+	ambiguousParams []pusheffect.FailureParams
+	receipts        []pusheffect.SentReceipt
 }
 
 func (f *pushEffectStoreFake) PushEffectBatchStarted(
@@ -82,21 +84,29 @@ func (f *pushEffectStoreFake) ClaimPushEffectReconciliation(
 
 func (f *pushEffectStoreFake) RecordPushEffectDefiniteFailure(
 	_ context.Context,
-	_ pusheffect.FailureParams,
+	params pusheffect.FailureParams,
 ) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if params.RetryAfter <= 0 {
+		return errors.New("store contract: definite failure requires retry backoff")
+	}
 	f.definite++
+	f.definiteParams = append(f.definiteParams, params)
 	return nil
 }
 
 func (f *pushEffectStoreFake) RecordPushEffectAmbiguous(
 	_ context.Context,
-	_ pusheffect.FailureParams,
+	params pusheffect.FailureParams,
 ) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if params.RetryAfter != 0 {
+		return errors.New("store contract: ambiguous failure forbids retry backoff")
+	}
 	f.ambiguous++
+	f.ambiguousParams = append(f.ambiguousParams, params)
 	return nil
 }
 
@@ -259,6 +269,75 @@ func TestPushEffectReconciliationNeverDowngradesAmbiguous(t *testing.T) {
 		effects.definite != 0 {
 		t.Fatalf("ambiguous downgrade: reconcile=%d ambiguous=%d definite=%d",
 			effects.reconciles, effects.ambiguous, effects.definite)
+	}
+	if len(effects.ambiguousParams) != 1 ||
+		effects.ambiguousParams[0].RetryAfter != 0 {
+		t.Fatalf("ambiguous failure retry boundary=%v, want zero",
+			effects.ambiguousParams)
+	}
+}
+
+func TestPushEffectDefiniteFailureRetainsRetryBackoff(t *testing.T) {
+	identity, ref, snapshot := compiledActivityFixture("Frozen Task")
+	compiledStore := &compiledRunStoreFake{
+		snapshot: snapshot, authorize: true,
+	}
+	effects := new(pushEffectStoreFake)
+	rejection := pusheffect.ProviderObservation{
+		Disposition: pusheffect.AttemptDefiniteNotSent,
+		AppIdentity: "cli_test",
+	}
+	pusher := &fakePusher{
+		durableObservation: &rejection,
+		durableErr: types.NewAppError(
+			types.CodePushFailed, "provider rejected request", errors.New("rejected"),
+		),
+	}
+	a := NewActivities(
+		fakeFetcher{}, fakeScorer{}, fakeCardGen{}, pusher,
+		&effectCountingStore{fakeStore: new(fakeStore)},
+		fakeFeishu{}, nil, nil,
+		func(in feedback.AggregateCardInput) string {
+			return `{"effect_id":"` + in.EffectID + `"}`
+		},
+		func(string, int) (string, string) { return "title", "blue" },
+		WithCompiledRuntimeV1(
+			compiledStore,
+			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+				return runtimepolicy.BundleV1{}, nil
+			},
+			new(compiledModelResolverFake),
+		),
+		WithPushEffectCanary(effects, identity.TaskID),
+	)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.Push)
+	err := executePushActivity(t, env, a, PushIn{
+		UserID: identity.UserID, ScheduleID: identity.TaskID,
+		TraceID: "trace-effect-definite-failure",
+		Run: &CompiledRunInputV1{
+			TenantID: identity.TenantID, TaskID: identity.TaskID, Snapshot: ref,
+		},
+		Cards: []GeneratedCard{{
+			Scored: types.ScoredItem{
+				Item: types.ContentItem{ID: 501, SourceID: 10}, Score: 88,
+			},
+			BodyMD: "body",
+		}},
+	})
+	if err == nil {
+		t.Fatal("provider rejection should fail this Activity attempt")
+	}
+	effects.mu.Lock()
+	defer effects.mu.Unlock()
+	if effects.definite != 1 || effects.ambiguous != 0 ||
+		len(effects.definiteParams) != 1 ||
+		effects.definiteParams[0].RetryAfter != pushEffectRetryAfter {
+		t.Fatalf(
+			"definite failure boundary definite=%d ambiguous=%d params=%+v",
+			effects.definite, effects.ambiguous, effects.definiteParams,
+		)
 	}
 }
 
