@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestPushEffectStoreHasZeroProductionCallPoints(t *testing.T) {
+func TestPushEffectStoreCallPointsStayInFencedCoordinator(t *testing.T) {
 	methods := map[string]bool{
 		"CreatePushEffect":                   true,
 		"LoadPushEffect":                     true,
@@ -23,12 +23,23 @@ func TestPushEffectStoreHasZeroProductionCallPoints(t *testing.T) {
 		"RecordPushEffectDefiniteFailure":    true,
 		"RecordPushEffectAmbiguous":          true,
 		"RecordPushEffectSent":               true,
+		"RecordPushEffectSentWithDeliveries": true,
 		"BlockPushEffect":                    true,
 	}
+	expected := map[string]int{
+		"CreatePushEffect":                   1,
+		"ClaimPushEffect":                    1,
+		"ClaimPushEffectReconciliation":      1,
+		"RecordPushEffectDefiniteFailure":    1,
+		"RecordPushEffectAmbiguous":          1,
+		"RecordPushEffectSentWithDeliveries": 2,
+	}
+	found := make(map[string]int)
 	root, err := filepath.Abs("..")
 	if err != nil {
 		t.Fatal(err)
 	}
+	allowedFile := filepath.Join(root, "workflow", "activities.go")
 	fset := token.NewFileSet()
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -50,18 +61,52 @@ func TestPushEffectStoreHasZeroProductionCallPoints(t *testing.T) {
 		if parseErr != nil {
 			return parseErr
 		}
-		ast.Inspect(file, func(node ast.Node) bool {
-			selector, ok := node.(*ast.SelectorExpr)
-			if ok && methods[selector.Sel.Name] {
-				position := fset.Position(selector.Pos())
-				t.Errorf("push effect Store API is wired before its coordinator Gate: %s:%d",
-					position.Filename, position.Line)
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
 			}
-			return true
-		})
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				selector, ok := node.(*ast.SelectorExpr)
+				if !ok || !methods[selector.Sel.Name] {
+					return true
+				}
+				position := fset.Position(selector.Pos())
+				if filepath.Clean(path) != allowedFile ||
+					function.Name.Name != "sendDurablePushChunk" ||
+					!isPushEffectCoordinatorReceiver(selector.X) {
+					t.Errorf(
+						"push effect Store API escaped fenced coordinator: %s:%d (%s)",
+						position.Filename, position.Line, selector.Sel.Name,
+					)
+					return true
+				}
+				found[selector.Sel.Name]++
+				return true
+			})
+		}
 		return nil
 	})
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
+	for method, want := range expected {
+		if got := found[method]; got != want {
+			t.Errorf("fenced call count %s=%d, want %d", method, got, want)
+		}
+	}
+	for method, got := range found {
+		if _, ok := expected[method]; !ok && got != 0 {
+			t.Errorf("unexpected fenced call %s=%d", method, got)
+		}
+	}
+}
+
+func isPushEffectCoordinatorReceiver(expression ast.Expr) bool {
+	selector, ok := expression.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "pushEffectStore" {
+		return false
+	}
+	identifier, ok := selector.X.(*ast.Ident)
+	return ok && identifier.Name == "a"
 }

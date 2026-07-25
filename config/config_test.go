@@ -166,6 +166,66 @@ func TestObservationCanaryValidation(t *testing.T) {
 	}
 }
 
+func TestPushEffectCanaryValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		compiled       bool
+		compiledCanary string
+		allowAll       bool
+		effectCanary   string
+		want           string
+		wantErr        bool
+	}{
+		{name: "off"},
+		{
+			name: "exact compiled canary", compiled: true,
+			compiledCanary: "push-effect-canary",
+			effectCanary:   " push-effect-canary ",
+			want:           "push-effect-canary",
+		},
+		{
+			name: "compiled allow all", compiled: true, allowAll: true,
+			effectCanary: "push-effect-canary", want: "push-effect-canary",
+		},
+		{
+			name:         "compiled disabled",
+			effectCanary: "push-effect-canary", wantErr: true,
+		},
+		{
+			name: "outside compiled canary", compiled: true,
+			compiledCanary: "other-task",
+			effectCanary:   "push-effect-canary", wantErr: true,
+		},
+		{
+			name: "whitespace", compiled: true,
+			compiledCanary: "push-effect-canary",
+			effectCanary:   " \t ", wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{
+				DB: DBConfig{URL: "postgres://test"},
+				Pipeline: PipelineConfig{
+					CompiledRuntimeEnabled:          test.compiled,
+					CompiledRuntimeCanaryScheduleID: test.compiledCanary,
+					CompiledRuntimeAllowAll:         test.allowAll,
+					PushEffectCanaryScheduleID:      test.effectCanary,
+				},
+			}
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr=%v", err, test.wantErr)
+			}
+			if !test.wantErr &&
+				cfg.Pipeline.PushEffectCanaryScheduleID != test.want {
+				t.Fatalf("push effect canary = %q, want %q",
+					cfg.Pipeline.PushEffectCanaryScheduleID, test.want)
+			}
+		})
+	}
+}
+
 // clearVaneEnv 清掉本进程可能残留的 VANE_ 环境变量，保证测试相互隔离。
 // 通过 t.Setenv("", …) 之外的 os.Unsetenv 也能配合 t.Setenv 的自动恢复：
 // 先 t.Setenv 注册恢复点，再 os.Unsetenv 真正清空。

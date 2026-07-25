@@ -13,6 +13,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"github.com/YouToco/vane/feedback"
+	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/types"
 )
 
@@ -48,8 +49,10 @@ type fakePusher struct {
 	// "各块的投递回填各自块的 msgID"（跨块错记 msgID 的变异体曾全绿存活）。
 	perCallID bool
 	// failCalls 里列出的调用序号（1 起）返回错误——部分失败矩阵用。
-	failCalls map[int]error
-	calls     int
+	failCalls          map[int]error
+	calls              int
+	durableObservation *pusheffect.ProviderObservation
+	durableErr         error
 }
 
 func (p *fakePusher) Push(_ context.Context, _, cardJSON string) (string, error) {
@@ -70,6 +73,41 @@ func (p *fakePusher) Push(_ context.Context, _, cardJSON string) (string, error)
 	return id, nil
 }
 
+func (p *fakePusher) PushWithUUID(
+	ctx context.Context,
+	openID string,
+	cardJSON string,
+	_ string,
+) (pusheffect.ProviderObservation, error) {
+	p.mu.Lock()
+	observation := p.durableObservation
+	durableErr := p.durableErr
+	p.mu.Unlock()
+	if observation != nil || durableErr != nil {
+		p.mu.Lock()
+		p.calls++
+		p.sent = append(p.sent, cardJSON)
+		p.mu.Unlock()
+		if observation == nil {
+			return pusheffect.ProviderObservation{
+				Disposition: pusheffect.AttemptAmbiguous,
+			}, durableErr
+		}
+		return *observation, durableErr
+	}
+	messageID, err := p.Push(ctx, openID, cardJSON)
+	if err != nil {
+		return pusheffect.ProviderObservation{
+			Disposition: pusheffect.AttemptAmbiguous,
+		}, err
+	}
+	return pusheffect.ProviderObservation{
+		Disposition: pusheffect.AttemptSent,
+		MessageID:   messageID,
+		ChatID:      "oc_owner",
+	}, nil
+}
+
 func (p *fakePusher) sentCards() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -79,6 +117,8 @@ func (p *fakePusher) sentCards() []string {
 type fakeFeishu struct{}
 
 func (fakeFeishu) OwnerOpenID() string { return "ou_owner" }
+func (fakeFeishu) OwnerChatID() string { return "oc_owner" }
+func (fakeFeishu) AppIdentity() string { return "cli_test" }
 
 type fakeEvolver struct {
 	mu         sync.Mutex
@@ -728,6 +768,8 @@ func (f scriptedFetcher) Fetch(_ context.Context, src types.Source) ([]types.Con
 type noOwnerFeishu struct{}
 
 func (noOwnerFeishu) OwnerOpenID() string { return "" }
+func (noOwnerFeishu) OwnerChatID() string { return "" }
+func (noOwnerFeishu) AppIdentity() string { return "" }
 
 // idNotice 身份构卡器：把 markdown 原样当卡 JSON 返回，便于对推送内容做子串断言。
 func idNotice(md string) string { return md }

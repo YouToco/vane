@@ -57,6 +57,8 @@ pipeline:
   # Observation policy rollout is exact-task only. Authority must equal shadow.
   observation_shadow_canary_schedule_id: ""
   observation_authority_canary_schedule_id: ""
+  # Durable provider effect: exact one-task compiled canary only.
+  push_effect_canary_schedule_id: ""
 
 agent:
   max_turns: 20

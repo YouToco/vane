@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"go.temporal.io/sdk/activity"
 
 	cardgenpkg "github.com/YouToco/vane/cardgen"
@@ -25,6 +26,7 @@ import (
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/promptguard"
+	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
 	scorerpkg "github.com/YouToco/vane/scorer"
@@ -72,6 +74,18 @@ const alertFetchFailThreshold = 3
 const (
 	aggMaxItemsPerCard = 8
 	aggMaxCardBytes    = 28 << 10
+)
+
+const (
+	pushEffectLeaseDuration   = time.Minute
+	pushEffectRetryAfter      = 30 * time.Second
+	pushEffectProvider        = "feishu-im-message-create"
+	pushEffectStepID          = "push-card"
+	pushEffectMarkerWidthSeed = "00000000-0000-5000-8000-000000000000"
+)
+
+var pushEffectUUIDNamespace = uuid.MustParse(
+	"9a5ffb09-a6ca-51c1-b7c8-9f6e804f69ad",
 )
 
 // disableFetchFailThreshold 是"连续失败达此值自动停用"的阈值（功能 5.2，Boss 拍板
@@ -139,12 +153,20 @@ type compiledProfileEvolverV1 interface {
 // Pusher 主动推送一张卡片给指定 open_id（pusher.Push），返回飞书消息 ID。
 type Pusher interface {
 	Push(ctx context.Context, ownerOpenID, cardJSON string) (string, error)
+	PushWithUUID(
+		context.Context,
+		string,
+		string,
+		string,
+	) (pusheffect.ProviderObservation, error)
 }
 
 // FeishuManager 暴露 owner（推送收件人）。SendCard 由 Pusher 内部承担，
 // 本接口只取 OwnerOpenID——Push Activity 需要知道"推给谁"。
 type FeishuManager interface {
 	OwnerOpenID() string
+	OwnerChatID() string
+	AppIdentity() string
 }
 
 // Store 是 Activity 需要的数据访问子集（规格 B3 的相关方法）。
@@ -251,6 +273,27 @@ type CompiledRunSnapshotV2AuditReader interface {
 	) (storepkg.CompiledRunSnapshotV2AuditResult, error)
 }
 
+type PushEffectStore interface {
+	CreatePushEffect(context.Context, pusheffect.Prepared) (*pusheffect.Effect, error)
+	ClaimPushEffect(context.Context, pusheffect.ClaimParams) (*pusheffect.Effect, error)
+	ClaimPushEffectReconciliation(
+		context.Context,
+		pusheffect.ClaimParams,
+	) (*pusheffect.Effect, error)
+	RecordPushEffectDefiniteFailure(
+		context.Context,
+		pusheffect.FailureParams,
+	) error
+	RecordPushEffectAmbiguous(
+		context.Context,
+		pusheffect.FailureParams,
+	) error
+	RecordPushEffectSentWithDeliveries(
+		context.Context,
+		pusheffect.SentReceipt,
+	) error
+}
+
 // CompiledPolicyBuilderV1 freezes the process's current non-secret runtime
 // policy. The boolean is the per-task result of the existing playbook rollout
 // decision, not a mutable pointer to configuration.
@@ -305,6 +348,8 @@ type Activities struct {
 	eventQualifier                   *eventqualifier.Qualifier
 	observationShadowCanaryTaskID    string
 	observationAuthorityCanaryTaskID string
+	pushEffectStore                  PushEffectStore
+	pushEffectCanaryTaskID           string
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding
@@ -406,6 +451,18 @@ func WithSnapshotV2ReadAuditCanary(
 	return func(a *Activities) {
 		a.compiledSnapshotV2AuditReader = reader
 		a.snapshotV2ReadAuditCanaryTaskID = taskID
+	}
+}
+
+// WithPushEffectCanary enables durable provider effects for exactly one
+// compiled task. Empty task IDs keep all call points dark.
+func WithPushEffectCanary(
+	st PushEffectStore,
+	taskID string,
+) ActivitiesOption {
+	return func(a *Activities) {
+		a.pushEffectStore = st
+		a.pushEffectCanaryTaskID = strings.TrimSpace(taskID)
 	}
 }
 
@@ -2522,6 +2579,38 @@ func (a *Activities) RecordEmptyBatch(ctx context.Context, in RecordEmptyIn) err
 	return nil
 }
 
+type pushPendingItem struct {
+	delID    int64
+	input    feedback.CardInput
+	eventKey string
+}
+
+type plannedPushChunk struct {
+	items    []pushPendingItem
+	cardJSON string
+}
+
+func planPushChunks(
+	pending []pushPendingItem,
+	marker string,
+	build func([]pushPendingItem, string) string,
+) []plannedPushChunk {
+	chunks := make([]plannedPushChunk, 0)
+	for start := 0; start < len(pending); {
+		size := min(aggMaxItemsPerCard, len(pending)-start)
+		cardJSON := build(pending[start:start+size], marker)
+		for len(cardJSON) > aggMaxCardBytes && size > 1 {
+			size = max(size/2, 1)
+			cardJSON = build(pending[start:start+size], marker)
+		}
+		chunks = append(chunks, plannedPushChunk{
+			items: pending[start : start+size], cardJSON: cardJSON,
+		})
+		start += size
+	}
+	return chunks
+}
+
 // Push 建批次 → 逐条建 Delivery → 主动推送 → 标记已发 → 收尾批次状态。
 // 收件人是飞书 owner（M3 单用户）；无 owner 直接失败。单卡推送失败跳过，
 // 只要有一张成功就算 done，全失败则 failed 并返回错误。
@@ -2605,12 +2694,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	// （它们已在上次重试成功发出的那张卡里）；只有存在未发条目时才推一张新聚合卡。
 	anySent := false
 	sentThisAttempt := false
-	type pendingItem struct {
-		delID    int64
-		input    feedback.CardInput
-		eventKey string
-	}
-	var pending []pendingItem
+	var pending []pushPendingItem
 	skippedObservedEvents := 0
 	for _, card := range in.Cards {
 		eventKey := card.Scored.Item.ObservationEventKey
@@ -2730,7 +2814,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 				ci.Platform = src.Platform
 			}
 		}
-		pending = append(pending, pendingItem{
+		pending = append(pending, pushPendingItem{
 			delID: delID, input: ci,
 			eventKey: eventKey,
 		})
@@ -2758,7 +2842,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	// 若只在这里被聚合成新 AppError 就会丢失（bug 狩猎批审查发现），Temporal
 	// 会白重试三次必然同败的卡。
 	anyRetryableFail := false
-	buildChunk := func(chunk []pendingItem) string {
+	buildChunk := func(chunk []pushPendingItem, effectID string) string {
 		items := make([]feedback.CardInput, len(chunk))
 		for i, p := range chunk {
 			items[i] = p.input
@@ -2768,17 +2852,29 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			title, tmpl = a.aggHeader(taskTitle, len(items))
 		}
 		return a.buildAggCard(feedback.AggregateCardInput{
-			HeaderTitle: title, HeaderTemplate: tmpl, Items: items,
+			HeaderTitle: title, HeaderTemplate: tmpl,
+			EffectID: effectID, Items: items,
 		})
 	}
-	for start := 0; start < len(pending); {
-		size := min(aggMaxItemsPerCard, len(pending)-start)
-		cardJSON := buildChunk(pending[start : start+size])
-		for len(cardJSON) > aggMaxCardBytes && size > 1 {
-			size = max(size/2, 1)
-			cardJSON = buildChunk(pending[start : start+size])
+	effectEnabled := compiled &&
+		a.pushEffectStore != nil &&
+		a.pushEffectCanaryTaskID != "" &&
+		a.pushEffectCanaryTaskID == compiledIdentity.TaskID
+	planningMarker := ""
+	if effectEnabled {
+		planningMarker = pushEffectMarkerWidthSeed
+	}
+	plannedChunks := planPushChunks(pending, planningMarker, buildChunk)
+	for chunkIndex, planned := range plannedChunks {
+		effectID := ""
+		if effectEnabled {
+			effectID = pushEffectID(compiledIdentity, chunkIndex)
 		}
-		chunk := pending[start : start+size]
+		cardJSON := planned.cardJSON
+		if effectEnabled {
+			cardJSON = buildChunk(planned.items, effectID)
+		}
+		chunk := planned.items
 		if len(cardJSON) > aggMaxCardBytes {
 			slog.Warn("push: 单条内容构卡即超字节上限，硬发（可能被飞书拒）",
 				"delivery_id", chunk[0].delID, "bytes", len(cardJSON))
@@ -2789,7 +2885,24 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 				return retryableOrNot(err)
 			}
 		}
-		msgID, perr := a.pusher.Push(ctx, owner, cardJSON)
+		var msgID string
+		var perr error
+		if effectEnabled {
+			msgID, perr = a.sendDurablePushChunk(
+				ctx,
+				compiledIdentity,
+				in.Run.Snapshot,
+				batchID,
+				chunkIndex,
+				len(plannedChunks),
+				chunk,
+				cardJSON,
+				effectID,
+				owner,
+			)
+		} else {
+			msgID, perr = a.pusher.Push(ctx, owner, cardJSON)
+		}
 		if perr != nil {
 			slog.Warn("push: 聚合卡推送失败，跳过该块", "trace_id", in.TraceID,
 				"items", len(chunk), "err", perr)
@@ -2797,7 +2910,11 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			if types.IsRetryable(perr) {
 				anyRetryableFail = true
 			}
-			start += size
+			continue
+		}
+		if effectEnabled {
+			anySent = true
+			sentThisAttempt = true
 			continue
 		}
 		// MarkDeliverySent and the final batch status are the durable receipt of
@@ -2832,7 +2949,6 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 		}
 		anySent = true
 		sentThisAttempt = true
-		start += size
 		if compiledReceiptErr != nil {
 			// The external send succeeded, so claiming batch=done while any
 			// delivery receipt is missing would make the loss permanent. Keep the
@@ -2892,6 +3008,176 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 		return retryableOrNot(err)
 	}
 	return nil
+}
+
+func pushEffectID(identity types.RunIdentity, chunkIndex int) string {
+	name := fmt.Sprintf(
+		"%d|%d|%s|%s|%s|%s|%d",
+		identity.TenantID,
+		identity.UserID,
+		identity.TaskID,
+		identity.TemporalRunID,
+		pushEffectStepID,
+		identity.TemporalWorkflowID,
+		chunkIndex,
+	)
+	return uuid.NewSHA1(pushEffectUUIDNamespace, []byte(name)).String()
+}
+
+func (a *Activities) sendDurablePushChunk(
+	ctx context.Context,
+	identity types.RunIdentity,
+	ref types.RunSnapshotRef,
+	batchID int64,
+	chunkIndex int,
+	chunkCount int,
+	chunk []pushPendingItem,
+	cardJSON string,
+	effectID string,
+	ownerOpenID string,
+) (string, error) {
+	if a.pushEffectStore == nil || !activity.IsActivity(ctx) ||
+		batchID <= 0 || chunkIndex < 0 || chunkCount <= 0 ||
+		chunkIndex >= chunkCount || len(chunk) == 0 ||
+		effectID == "" || ownerOpenID == "" {
+		return "", types.NewAppError(
+			types.CodeValidation,
+			"durable push effect input is invalid",
+			nil,
+		)
+	}
+	ownerChatID := a.feishu.OwnerChatID()
+	appIdentity := a.feishu.AppIdentity()
+	if ownerChatID == "" || appIdentity == "" {
+		return "", types.NewAppError(
+			types.CodeConflict,
+			"durable push effect provider identity is unavailable",
+			nil,
+		)
+	}
+	info := activity.GetInfo(ctx)
+	scheduledAt := info.ScheduledTime.UTC().Truncate(time.Microsecond)
+	if scheduledAt.IsZero() {
+		return "", types.NewAppError(
+			types.CodeValidation,
+			"durable push effect scheduled time is unavailable",
+			nil,
+		)
+	}
+	deliveryIDs := make([]int64, len(chunk))
+	for i := range chunk {
+		deliveryIDs[i] = chunk[i].delID
+	}
+	prepared := pusheffect.Prepared{
+		ID: effectID, TenantID: identity.TenantID, UserID: identity.UserID,
+		TaskID: identity.TaskID, RunSnapshotID: ref.SnapshotID,
+		RunID: identity.TemporalRunID, StepID: pushEffectStepID,
+		ChunkIndex: chunkIndex, ChunkCount: chunkCount,
+		BatchID: batchID, DeliveryIDs: deliveryIDs,
+		Provider: pushEffectProvider, AppIdentity: appIdentity,
+		ProviderChatID: ownerChatID, Target: ownerOpenID,
+		Card: []byte(cardJSON), ProviderUUID: effectID,
+		IdempotencyExpiresAt: scheduledAt.Add(time.Hour),
+	}
+	effect, err := a.pushEffectStore.CreatePushEffect(ctx, prepared)
+	if err != nil {
+		return "", err
+	}
+
+	leaseMaterial := fmt.Sprintf(
+		"%s/%s/%s/%d",
+		identity.TemporalWorkflowID,
+		identity.TemporalRunID,
+		info.ActivityID,
+		info.Attempt,
+	)
+	leaseOwner := "push/" + uuid.NewSHA1(
+		pushEffectUUIDNamespace, []byte(leaseMaterial),
+	).String()
+	claim := pusheffect.ClaimParams{
+		Scope: effect.Scope(), LeaseOwner: leaseOwner,
+		LeaseDuration: pushEffectLeaseDuration,
+	}
+	wasAmbiguous := effect.Status == pusheffect.StatusAmbiguous
+	switch effect.Status {
+	case pusheffect.StatusPrepared, pusheffect.StatusDefiniteFailed:
+		effect, err = a.pushEffectStore.ClaimPushEffect(ctx, claim)
+	case pusheffect.StatusAmbiguous:
+		effect, err = a.pushEffectStore.ClaimPushEffectReconciliation(ctx, claim)
+	case pusheffect.StatusSent:
+		if err := a.pushEffectStore.RecordPushEffectSentWithDeliveries(
+			ctx,
+			pusheffect.SentReceipt{
+				Scope: effect.Scope(), ExpectedFence: effect.Fence,
+				ProviderMessageID: effect.ProviderMessageID,
+			},
+		); err != nil {
+			return "", err
+		}
+		return effect.ProviderMessageID, nil
+	default:
+		err = types.NewAppError(
+			types.CodeConflict,
+			"durable push effect is already in flight or blocked",
+			nil,
+		)
+	}
+	if err != nil {
+		return "", err
+	}
+	lease := pusheffect.Lease{
+		Scope: effect.Scope(), LeaseOwner: effect.LeaseOwner,
+		Fence: effect.Fence,
+	}
+	observation, sendErr := a.pusher.PushWithUUID(
+		ctx, ownerOpenID, cardJSON, effect.ProviderUUID)
+	if observation.Disposition == pusheffect.AttemptSent &&
+		sendErr == nil &&
+		observation.MessageID != "" &&
+		(observation.ChatID == "" || observation.ChatID == ownerChatID) {
+		if err := a.pushEffectStore.RecordPushEffectSentWithDeliveries(
+			ctx,
+			pusheffect.SentReceipt{
+				Scope: effect.Scope(), ExpectedFence: effect.Fence,
+				LeaseOwner:        effect.LeaseOwner,
+				ProviderMessageID: observation.MessageID,
+			},
+		); err != nil {
+			return "", err
+		}
+		return observation.MessageID, nil
+	}
+
+	failureClass := "provider_response_unknown"
+	definite := observation.Disposition == pusheffect.AttemptDefiniteNotSent &&
+		!wasAmbiguous
+	if observation.Disposition == pusheffect.AttemptSent {
+		failureClass = "provider_receipt_invalid"
+	} else if definite {
+		failureClass = "provider_definite_rejection"
+	} else if wasAmbiguous {
+		failureClass = "reconciliation_without_positive_receipt"
+	}
+	failure := pusheffect.FailureParams{
+		Lease: lease, Class: failureClass,
+		RetryAfter: pushEffectRetryAfter,
+	}
+	if definite {
+		err = a.pushEffectStore.RecordPushEffectDefiniteFailure(ctx, failure)
+	} else {
+		err = a.pushEffectStore.RecordPushEffectAmbiguous(ctx, failure)
+	}
+	if err != nil {
+		return "", err
+	}
+	if sendErr != nil {
+		return "", sendErr
+	}
+	return "", types.NewAppError(
+		types.CodePushFailed,
+		"durable push provider attempt did not produce a valid sent receipt",
+		nil,
+	)
 }
 
 // filterSources 只保留 id ∈ want 的信源（PushScope.SourceIDs 非空时用）。

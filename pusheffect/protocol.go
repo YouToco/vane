@@ -77,6 +77,22 @@ type ProviderObservation struct {
 	ChatID      string
 }
 
+type HistoryQuery struct {
+	EffectID      string
+	ProviderChatID string
+	AppIdentity   string
+	StartTime     time.Time
+	EndTime       time.Time
+}
+
+// HistoryObservation contains positive provider evidence only. MatchCount=0
+// is never proof that no send occurred; MatchCount>1 is a conflict requiring a
+// blocked/operator resolution.
+type HistoryObservation struct {
+	MatchCount int
+	MessageID  string
+}
+
 type Scope struct {
 	ID       string
 	TenantID int64

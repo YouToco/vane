@@ -140,6 +140,9 @@ type PipelineConfig struct {
 	// task and is the exact rollback switch for deterministic admission.
 	ObservationShadowCanaryScheduleID    string `mapstructure:"observation_shadow_canary_schedule_id"`
 	ObservationAuthorityCanaryScheduleID string `mapstructure:"observation_authority_canary_schedule_id"`
+	// PushEffectCanaryScheduleID enables durable external push effects for
+	// exactly one compiled task. Empty is fully dark; broad rollout has no key.
+	PushEffectCanaryScheduleID string `mapstructure:"push_effect_canary_schedule_id"`
 }
 
 // AgentConfig 是 agent loop 运行约束配置。
@@ -305,6 +308,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.compiled_runtime_allow_all", false)
 	v.SetDefault("pipeline.snapshot_v2_shadow_canary_schedule_id", "")
 	v.SetDefault("pipeline.snapshot_v2_read_audit_canary_schedule_id", "")
+	v.SetDefault("pipeline.push_effect_canary_schedule_id", "")
 
 	v.SetDefault("agent.max_turns", 20)
 	v.SetDefault("agent.definition_edit_enabled", false)
@@ -405,6 +409,23 @@ func (c *Config) Validate() error {
 		return errors.New("config: snapshot v2 read audit canary 必须位于 compiled runtime rollout")
 	}
 	c.Pipeline.SnapshotV2ReadAuditCanaryScheduleID = readAuditCanaryID
+	rawPushEffectCanaryID := c.Pipeline.PushEffectCanaryScheduleID
+	pushEffectCanaryID := strings.TrimSpace(rawPushEffectCanaryID)
+	if rawPushEffectCanaryID != "" && pushEffectCanaryID == "" {
+		return errors.New("config: pipeline.push_effect_canary_schedule_id 不能仅含空白")
+	}
+	if pushEffectCanaryID != "" &&
+		!validSnapshotShadowCanaryID(pushEffectCanaryID) {
+		return errors.New("config: pipeline.push_effect_canary_schedule_id 无效")
+	}
+	if pushEffectCanaryID != "" && !c.Pipeline.CompiledRuntimeEnabled {
+		return errors.New("config: push effect canary 要求 compiled runtime 已启用")
+	}
+	if pushEffectCanaryID != "" && !c.Pipeline.CompiledRuntimeAllowAll &&
+		compiledCanaryID != pushEffectCanaryID {
+		return errors.New("config: push effect canary 必须位于 compiled runtime rollout")
+	}
+	c.Pipeline.PushEffectCanaryScheduleID = pushEffectCanaryID
 
 	rawObservationShadow := c.Pipeline.ObservationShadowCanaryScheduleID
 	observationShadow := strings.TrimSpace(rawObservationShadow)
