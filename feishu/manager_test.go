@@ -371,3 +371,71 @@ func TestManagerReloadDisabledRevokesOutboundClient(t *testing.T) {
 		t.Fatalf("disabled reconfigure retained outbound authority: client=%v app_id=%q", client != nil, appID)
 	}
 }
+
+func TestCaptureOwnerBackfillsChatIDWithoutChangingOwner(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("DATABASE_URL 未设置，跳过 owner chat 真库测试")
+	}
+	ctx := t.Context()
+	if err := store.Migrate(ctx, dbURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.New(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, st)
+	old, oldErr := st.GetSetting(ctx, settingKeyOwner)
+	if oldErr != nil && !errors.Is(oldErr, types.ErrNotFound) {
+		t.Fatal(oldErr)
+	}
+	cleanupCtx, cancelCleanup := cleanupContext()
+	t.Cleanup(cancelCleanup)
+	t.Cleanup(func() {
+		if oldErr == nil {
+			cleanupExec(cleanupCtx, t, dbURL, `
+				INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now())
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+				settingKeyOwner, old)
+			return
+		}
+		cleanupExec(cleanupCtx, t, dbURL,
+			`DELETE FROM settings WHERE key = $1`, settingKeyOwner)
+	})
+
+	initial, err := json.Marshal(ownerSetting{
+		OpenID: "ou_owner", Name: "owner",
+		CapturedAt: "2026-07-24T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutSetting(ctx, settingKeyOwner, initial); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(st, nil, nil)
+	m.setOwner("ou_owner", "owner")
+	h := &handler{m: m}
+
+	h.captureOwnerIfFirst(ctx, "ou_owner", "owner", "oc_owner_chat")
+	if got := m.OwnerChatID(); got != "oc_owner_chat" {
+		t.Fatalf("owner chat id = %q, want oc_owner_chat", got)
+	}
+	raw, err := st.GetSetting(ctx, settingKeyOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted ownerSetting
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.OpenID != "ou_owner" || persisted.ChatID != "oc_owner_chat" {
+		t.Fatalf("persisted owner = %+v", persisted)
+	}
+
+	h.captureOwnerIfFirst(ctx, "ou_other", "other", "oc_other_chat")
+	if got := m.OwnerChatID(); got != "oc_owner_chat" {
+		t.Fatalf("non-owner overwrote owner chat id: %q", got)
+	}
+}

@@ -188,6 +188,92 @@ func TestManager_SendCardWithUUIDForwardsStableUUID(t *testing.T) {
 	}
 }
 
+func TestManager_SendCardWithUUIDResultReturnsTypedSentReceipt(t *testing.T) {
+	const messageUUID = "019f9824-39b6-7e13-b247-b5ee5713c52b"
+	m := newPushTestManager(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if servePushTestToken(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w,
+			`{"code":0,"msg":"success","data":{`+
+				`"message_id":"om_effect","chat_id":"oc_effect"}}`)
+	}), nil)
+
+	result, err := m.SendCardWithUUIDResult(
+		t.Context(), "ou_owner", `{"type":"card"}`, messageUUID)
+	if err != nil {
+		t.Fatalf("SendCardWithUUIDResult() error = %v", err)
+	}
+	if result.Disposition != ProviderAttemptSent ||
+		result.MessageID != "om_effect" ||
+		result.ChatID != "oc_effect" {
+		t.Fatalf("result = %+v, want typed sent receipt", result)
+	}
+}
+
+func TestManager_SendCardWithUUIDResultClassifiesBoundary(t *testing.T) {
+	const messageUUID = "019f9824-39b6-7e13-b247-b5ee5713c52b"
+	tests := []struct {
+		name string
+		body string
+		want ProviderAttemptDisposition
+	}{
+		{
+			name: "provider rejection is definite not sent",
+			body: `{"code":200673,"msg":"invalid card"}`,
+			want: ProviderAttemptDefiniteNotSent,
+		},
+		{
+			name: "success without receipt is ambiguous",
+			body: `{"code":0,"msg":"success","data":{}}`,
+			want: ProviderAttemptAmbiguous,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newPushTestManager(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if servePushTestToken(w, r) {
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tt.body)
+			}), nil)
+			result, err := m.SendCardWithUUIDResult(
+				t.Context(), "ou_owner", `{"type":"card"}`, messageUUID)
+			if err == nil {
+				t.Fatal("SendCardWithUUIDResult() error = nil, want failure")
+			}
+			if result.Disposition != tt.want {
+				t.Fatalf("disposition = %q, want %q", result.Disposition, tt.want)
+			}
+		})
+	}
+
+	t.Run("invalid input is definite not sent", func(t *testing.T) {
+		m := NewManager(nil, nil, nil)
+		result, err := m.SendCardWithUUIDResult(
+			t.Context(), "ou_owner", `{"type":"card"}`, "not-a-uuid")
+		if err == nil || result.Disposition != ProviderAttemptDefiniteNotSent {
+			t.Fatalf("result=%+v err=%v, want definite validation failure", result, err)
+		}
+	})
+
+	t.Run("transport failure is ambiguous", func(t *testing.T) {
+		m := newPushTestManager(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if servePushTestToken(w, r) {
+				return
+			}
+			http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+		}), nil)
+		result, err := m.SendCardWithUUIDResult(
+			t.Context(), "ou_owner", `{"type":"card"}`, messageUUID)
+		if err == nil || result.Disposition != ProviderAttemptAmbiguous {
+			t.Fatalf("result=%+v err=%v, want ambiguous transport failure", result, err)
+		}
+	})
+}
+
 func TestManager_SendCardWithUUIDRejectsInvalidUUIDBeforeNetwork(t *testing.T) {
 	var networkCalls int
 	m := newPushTestManager(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

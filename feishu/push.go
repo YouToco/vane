@@ -10,6 +10,27 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+// ProviderAttemptDisposition states what is known about this one provider
+// request. It does not erase an earlier ambiguous attempt: a coordinator
+// replaying the same UUID must keep the whole effect ambiguous unless it gains
+// positive sent evidence.
+type ProviderAttemptDisposition string
+
+const (
+	ProviderAttemptDefiniteNotSent ProviderAttemptDisposition = "definite_not_sent"
+	ProviderAttemptAmbiguous       ProviderAttemptDisposition = "ambiguous"
+	ProviderAttemptSent            ProviderAttemptDisposition = "sent"
+)
+
+// ProviderSendObservation is the typed observation returned to the durable effect
+// coordinator. MessageID is required for sent; ChatID is copied when Feishu
+// returns it and is never treated as proof of delivery by itself.
+type ProviderSendObservation struct {
+	Disposition ProviderAttemptDisposition
+	MessageID   string
+	ChatID      string
+}
+
 // SendCard 主动发一张交互卡片给指定 open_id（Im.Message.Create，非 reply）。
 // M3 推送管道的出口：pusher 通过 FeishuSender 接口调它把卡片推给 owner。
 //
@@ -21,7 +42,8 @@ import (
 // 兼容入口刻意不生成 UUID：没有调用方持久化的稳定值，现场生成只会制造虚假的
 // 幂等保证。需要跨重试去重的调用方应改用 SendCardWithUUID。
 func (m *Manager) SendCard(ctx context.Context, openID, cardJSON string) (string, error) {
-	return m.sendCard(ctx, openID, cardJSON, "")
+	result, err := m.sendCard(ctx, openID, cardJSON, "")
+	return result.MessageID, err
 }
 
 // SendCardWithUUID 使用调用方持久化的 UUID 主动发送交互卡片。
@@ -36,16 +58,28 @@ func (m *Manager) SendCardWithUUID(
 	cardJSON string,
 	messageUUID string,
 ) (string, error) {
-	parsedUUID, err := uuid.Parse(messageUUID)
-	if err != nil ||
-		parsedUUID == uuid.Nil ||
-		len(messageUUID) != len(uuid.Nil.String()) ||
-		parsedUUID.String() != messageUUID {
-		return "", types.NewAppError(
-			types.CodeValidation,
-			"主动推送消息 uuid 必须是规范的非零 uuid",
-			nil,
-		)
+	result, err := m.SendCardWithUUIDResult(ctx, openID, cardJSON, messageUUID)
+	return result.MessageID, err
+}
+
+// SendCardWithUUIDResult is the durable-effect provider boundary. Unlike the
+// compatibility methods it returns whether the request was definitely not
+// sent, definitely sent, or crossed the provider boundary with an unknown
+// result. Callers must persist that disposition before deciding whether any
+// retry is safe.
+func (m *Manager) SendCardWithUUIDResult(
+	ctx context.Context,
+	openID string,
+	cardJSON string,
+	messageUUID string,
+) (ProviderSendObservation, error) {
+	if !validStableMessageUUID(messageUUID) {
+		return ProviderSendObservation{Disposition: ProviderAttemptDefiniteNotSent},
+			types.NewAppError(
+				types.CodeValidation,
+				"主动推送消息 uuid 必须是规范的非零 uuid",
+				nil,
+			)
 	}
 	return m.sendCard(ctx, openID, cardJSON, messageUUID)
 }
@@ -55,16 +89,18 @@ func (m *Manager) sendCard(
 	openID string,
 	cardJSON string,
 	messageUUID string,
-) (string, error) {
+) (ProviderSendObservation, error) {
 	if openID == "" {
-		return "", types.NewAppError(types.CodeValidation, "推送目标 open_id 为空", nil)
+		return ProviderSendObservation{Disposition: ProviderAttemptDefiniteNotSent},
+			types.NewAppError(types.CodeValidation, "推送目标 open_id 为空", nil)
 	}
 	// api() 返回的是"当前已连接"的客户端；未连接（未配置/连接失败）时为 nil。
 	// 用 CodeConflict 而非 CodePushFailed：这是"通道未就绪"的状态冲突，
 	// 调用方（Push activity）据此判断为不可重试的前置条件缺失，而非瞬态发送失败。
 	client := m.api()
 	if client == nil {
-		return "", types.NewAppError(types.CodeConflict, "飞书通道未连接，无法主动推送", nil)
+		return ProviderSendObservation{Disposition: ProviderAttemptDefiniteNotSent},
+			types.NewAppError(types.CodeConflict, "飞书通道未连接，无法主动推送", nil)
 	}
 
 	body := larkim.NewCreateMessageReqBodyBuilder().
@@ -81,7 +117,8 @@ func (m *Manager) sendCard(
 		Build())
 	if err != nil {
 		// 传输层失败（网络/超时）默认可重试，沿用 CodePushFailed 的默认 Retryable。
-		return "", types.NewAppError(types.CodePushFailed, "主动推送卡片失败", err)
+		return ProviderSendObservation{Disposition: ProviderAttemptAmbiguous},
+			types.NewAppError(types.CodePushFailed, "主动推送卡片失败", err)
 	}
 	if !resp.Success() {
 		ae := types.NewAppError(types.CodePushFailed,
@@ -95,7 +132,7 @@ func (m *Manager) sendCard(
 		if permanentRejection(resp.Code) {
 			ae.Retryable = false
 		}
-		return "", ae
+		return ProviderSendObservation{Disposition: ProviderAttemptDefiniteNotSent}, ae
 	}
 	// message_id 回填 deliveries.feishu_message_id，用于后续追溯/撤回。飞书即使
 	// 返回 code=0，也可能因异常响应缺失 data/message_id；此时远端结果未知，
@@ -111,9 +148,24 @@ func (m *Manager) sendCard(
 			nil,
 		)
 		ae.Retryable = messageUUID != ""
-		return "", ae
+		return ProviderSendObservation{Disposition: ProviderAttemptAmbiguous}, ae
 	}
-	return *resp.Data.MessageId, nil
+	result := ProviderSendObservation{
+		Disposition: ProviderAttemptSent,
+		MessageID:   *resp.Data.MessageId,
+	}
+	if resp.Data.ChatId != nil {
+		result.ChatID = *resp.Data.ChatId
+	}
+	return result, nil
+}
+
+func validStableMessageUUID(messageUUID string) bool {
+	parsedUUID, err := uuid.Parse(messageUUID)
+	return err == nil &&
+		parsedUUID != uuid.Nil &&
+		len(messageUUID) == len(uuid.Nil.String()) &&
+		parsedUUID.String() == messageUUID
 }
 
 // OwnerOpenID 导出 owner 的 open_id：推送管道需要知道"推给谁"。
@@ -121,6 +173,14 @@ func (m *Manager) sendCard(
 // 调用方（Push activity / pusher）据空串判定为"尚无收件人"。
 func (m *Manager) OwnerOpenID() string {
 	return m.ownerID()
+}
+
+// OwnerChatID returns the frozen P2P conversation used for positive provider
+// reconciliation. Older owner settings may legitimately return empty until a
+// new inbound owner message or a historical-message backfill supplies it.
+func (m *Manager) OwnerChatID() string {
+	_, chatID := m.ownerIdentity()
+	return chatID
 }
 
 // permanentRejection 报告一个飞书拒收 code 是否为确定性失败（重试必然同样失败）。

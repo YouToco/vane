@@ -260,7 +260,7 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 		return
 	}
 
-	h.captureOwnerIfFirst(ctx, openID, name)
+	h.captureOwnerIfFirst(ctx, openID, name, strVal(msg.ChatId))
 
 	// 授权白名单：只为 owner 服务。owner = 第一个发消息的人（上一步刚确定），
 	// 其余租户成员即便发现了机器人也不能驱动付费 LLM 调用——防止 DeepSeek
@@ -896,14 +896,30 @@ func toastResponse(typ, content string) *callback.CardActionTriggerResponse {
 
 // captureOwnerIfFirst 把第一个发消息的用户记为 owner（feishu_owner setting）。
 // owner 一经写入不再更换：它是测试卡片与后续推送的收件人。
-func (h *handler) captureOwnerIfFirst(ctx context.Context, openID, name string) {
+func (h *handler) captureOwnerIfFirst(
+	ctx context.Context,
+	openID string,
+	name string,
+	chatID string,
+) {
+	if !validOwnerChatID(chatID) {
+		chatID = ""
+	}
+	cachedOpenID, cachedChatID := h.m.ownerIdentity()
+	if cachedOpenID != "" &&
+		(cachedOpenID != openID || cachedChatID != "" || chatID == "") {
+		return
+	}
+
 	// captureMu 串行化整段 check-then-act：并发的首批消息可能都看到
 	// ownerCaptured()==false 而各写各的 owner（last-write-wins）。持锁保证
 	// owner 真正 write-once。owner 捕获是一次性低频操作，串行无性能顾虑。
 	h.m.captureMu.Lock()
 	defer h.m.captureMu.Unlock()
 
-	if h.m.ownerCaptured() {
+	cachedOpenID, cachedChatID = h.m.ownerIdentity()
+	if cachedOpenID != "" &&
+		(cachedOpenID != openID || cachedChatID != "" || chatID == "") {
 		return
 	}
 	// 缓存为空不代表库里没有（比如进程刚重启还没 reload owner），
@@ -912,7 +928,21 @@ func (h *handler) captureOwnerIfFirst(ctx context.Context, openID, name string) 
 	if err == nil {
 		var own ownerSetting
 		if json.Unmarshal(raw, &own) == nil && own.OpenID != "" {
-			h.m.setOwner(own.OpenID, own.Name)
+			if own.OpenID == openID && own.ChatID == "" && chatID != "" {
+				own.ChatID = chatID
+				value, marshalErr := json.Marshal(own)
+				if marshalErr != nil {
+					slog.Error("feishu: 序列化 owner chat 设置失败")
+					return
+				}
+				if putErr := h.m.st.PutSetting(
+					ctx, settingKeyOwner, json.RawMessage(value),
+				); putErr != nil {
+					slog.Error("feishu: 回填 owner chat 设置失败", "err", putErr)
+					return
+				}
+			}
+			h.m.setOwnerWithChat(own.OpenID, own.Name, own.ChatID)
 			return
 		}
 	} else if !errors.Is(err, types.ErrNotFound) {
@@ -923,6 +953,7 @@ func (h *handler) captureOwnerIfFirst(ctx context.Context, openID, name string) 
 	own := ownerSetting{
 		OpenID:     openID,
 		Name:       name,
+		ChatID:     chatID,
 		CapturedAt: time.Now().Format(time.RFC3339),
 	}
 	value, _ := json.Marshal(own)
@@ -930,8 +961,13 @@ func (h *handler) captureOwnerIfFirst(ctx context.Context, openID, name string) 
 		slog.Error("feishu: 写入 owner 设置失败", "err", err)
 		return
 	}
-	h.m.setOwner(openID, name)
+	h.m.setOwnerWithChat(openID, name, chatID)
 	slog.Info("feishu: 已捕获 owner", "open_id", openID)
+}
+
+func validOwnerChatID(chatID string) bool {
+	return chatID == "" ||
+		(len(chatID) <= 512 && strings.TrimSpace(chatID) == chatID)
 }
 
 // reply 用交互卡片回复指定消息。回复失败只记日志：
