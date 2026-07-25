@@ -200,7 +200,9 @@ func run() error {
 		workflow.WithObservationRuntime(
 			st, eventqualifier.New(recorder),
 			cfg.Pipeline.ObservationShadowCanaryScheduleID,
-			cfg.Pipeline.ObservationAuthorityCanaryScheduleID))
+			cfg.Pipeline.ObservationAuthorityCanaryScheduleID),
+		workflow.WithPushEffectCanary(
+			st, cfg.Pipeline.PushEffectCanaryScheduleID))
 	slog.Info("task playbook prompt policy configured",
 		"enabled", cfg.Pipeline.PlaybookPromptsEnabled,
 		"canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID,

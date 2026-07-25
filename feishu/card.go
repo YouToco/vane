@@ -198,7 +198,7 @@ func BuildDeliveryCard(input feedback.CardInput) string {
 	}
 
 	if input.State.BadFeedbackOpen && !input.State.Misjudged {
-		elements = append(elements, feedbackProblemForm(idStr, false))
+		elements = append(elements, feedbackProblemForm(idStr, false, ""))
 	}
 
 	card := map[string]any{
@@ -226,7 +226,11 @@ var feedbackReasonOptions = []struct {
 // feedbackProblemForm uses only input and submit buttons already exercised by
 // production cards. Each reason button submits exactly one fixed code; the
 // shared detail is optional except for “other”.
-func feedbackProblemForm(idStr string, aggregate bool) map[string]any {
+func feedbackProblemForm(
+	idStr string,
+	aggregate bool,
+	effectID string,
+) map[string]any {
 	formName, inputName, submitPrefix := "feedback_problem", "detail", "submit_reason_"
 	if aggregate {
 		formName = "fbr_" + idStr
@@ -235,7 +239,7 @@ func feedbackProblemForm(idStr string, aggregate bool) map[string]any {
 	}
 	elements := []any{
 		map[string]any{
-			"tag":  "markdown",
+			"tag":     "markdown",
 			"content": "**这条推送哪里有问题？** 请选择一个原因；如需补充，可填写说明。",
 		},
 		map[string]any{
@@ -248,6 +252,14 @@ func feedbackProblemForm(idStr string, aggregate bool) map[string]any {
 		},
 	}
 	for _, option := range feedbackReasonOptions {
+		callbackValue := map[string]any{
+			"vane_action": cardActionFeedbackReason,
+			"delivery_id": idStr,
+			"reason_code": string(option.code),
+		}
+		if effectID != "" {
+			callbackValue["effect_id"] = effectID
+		}
 		elements = append(elements, map[string]any{
 			"tag":              "button",
 			"name":             submitPrefix + string(option.code),
@@ -255,12 +267,8 @@ func feedbackProblemForm(idStr string, aggregate bool) map[string]any {
 			"text":             map[string]any{"tag": "plain_text", "content": option.label},
 			"type":             "default",
 			"behaviors": []any{map[string]any{
-				"type": "callback",
-				"value": map[string]any{
-					"vane_action": cardActionFeedbackReason,
-					"delivery_id": idStr,
-					"reason_code": string(option.code),
-				},
+				"type":  "callback",
+				"value": callbackValue,
 			}},
 		})
 	}

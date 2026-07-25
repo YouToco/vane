@@ -7,6 +7,7 @@ package pusher
 import (
 	"context"
 
+	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/types"
 )
 
@@ -14,6 +15,16 @@ import (
 // feishu.Manager 天然实现它（SendCard 签名一致），无需 feishu 包反向依赖 pusher。
 type FeishuSender interface {
 	SendCard(ctx context.Context, openID, cardJSON string) (feishuMessageID string, err error)
+}
+
+type durableFeishuSender interface {
+	SendCardWithUUIDResult(
+		context.Context,
+		string,
+		string,
+		string,
+		string,
+	) (pusheffect.ProviderObservation, error)
 }
 
 // Pusher 持有发送通道。零值不可用，必须经 New 构造。
@@ -35,4 +46,39 @@ func (p *Pusher) Push(ctx context.Context, ownerOpenID, cardJSON string) (string
 	// SendCard 已返回统一的 AppError（CodePushFailed/CodeConflict/CodeValidation），
 	// 这里直接透传：Push 本身不新增语义，多包一层只会掩盖底层错误码影响重试判定。
 	return p.fs.SendCard(ctx, ownerOpenID, cardJSON)
+}
+
+// PushWithUUID crosses the durable provider boundary with the exact frozen
+// UUID. The typed observation describes this attempt only; the coordinator
+// owns all whole-effect state transitions.
+func (p *Pusher) PushWithUUID(
+	ctx context.Context,
+	expectedAppIdentity string,
+	ownerOpenID string,
+	cardJSON string,
+	messageUUID string,
+) (pusheffect.ProviderObservation, error) {
+	if expectedAppIdentity == "" || ownerOpenID == "" {
+		return pusheffect.ProviderObservation{
+				Disposition: pusheffect.AttemptDefiniteNotSent,
+			},
+			types.NewAppError(
+				types.CodeValidation,
+				"耐久推送 App 身份或目标为空",
+				nil,
+			)
+	}
+	sender, ok := p.fs.(durableFeishuSender)
+	if !ok {
+		return pusheffect.ProviderObservation{
+				Disposition: pusheffect.AttemptDefiniteNotSent,
+			},
+			types.NewAppError(
+				types.CodeConflict,
+				"飞书发送器未装配耐久 UUID 能力",
+				nil,
+			)
+	}
+	return sender.SendCardWithUUIDResult(
+		ctx, expectedAppIdentity, ownerOpenID, cardJSON, messageUUID)
 }

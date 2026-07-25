@@ -165,6 +165,10 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	}
 	// 回滚兜底：dry-run 走下方显式 Rollback，真删走 Commit；两者之后这里都是 no-op。
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockPushEffectSchemaWriter(ctx, tx); err != nil {
+		return nil, types.NewAppError(
+			types.CodeDatabase, "锁定推送效果 schema 准入", err)
+	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
 		fmt.Sprintf("%d", tenantID)); err != nil {
@@ -211,6 +215,34 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		name  string
 		query string
 	}{
+		{
+			name: "push_batches",
+			query: `SELECT id FROM push_batches
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge push batch lock order */`,
+		},
+		{
+			name: "push_effects",
+			query: `SELECT id FROM push_effects
+			         WHERE tenant_id = $1
+			         ORDER BY batch_id,chunk_index,id
+			         FOR UPDATE /* tenant purge push effect lock order */`,
+		},
+		{
+			name: "deliveries",
+			query: `SELECT id FROM deliveries
+			         WHERE tenant_id = $1
+			         ORDER BY batch_id,id
+			         FOR UPDATE /* tenant purge delivery lock order */`,
+		},
+		{
+			name: "task_observed_events",
+			query: `SELECT id FROM task_observed_events
+			         WHERE tenant_id = $1
+			         ORDER BY delivery_id NULLS FIRST,id
+			         FOR UPDATE /* tenant purge observed event lock order */`,
+		},
 		{
 			name: "pending_actions",
 			query: `SELECT id FROM pending_actions

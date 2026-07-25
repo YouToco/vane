@@ -26,6 +26,10 @@ func fixture() Prepared {
 
 func TestCanonicalizeRoundTripAndDefensiveCopies(t *testing.T) {
 	input := fixture()
+	input.ObservationEventKeys = []string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"",
+	}
 	canonical, err := Canonicalize(input)
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +46,12 @@ func TestCanonicalizeRoundTripAndDefensiveCopies(t *testing.T) {
 	}
 	input.Card[0] = 'x'
 	input.DeliveryIDs[0] = 999
-	if bytes.Equal(input.Card, got.Card) || got.DeliveryIDs[0] != 5 {
+	input.ObservationEventKeys[0] =
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if bytes.Equal(input.Card, got.Card) ||
+		got.DeliveryIDs[0] != 5 ||
+		got.ObservationEventKeys[0] !=
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatal("canonical payload aliases caller memory")
 	}
 }
@@ -57,6 +66,17 @@ func TestCanonicalizeRejectsAmbiguousIdentity(t *testing.T) {
 		}},
 		{name: "unordered deliveries", change: func(p *Prepared) {
 			p.DeliveryIDs = []int64{6, 5}
+		}},
+		{name: "misaligned observation keys", change: func(p *Prepared) {
+			p.ObservationEventKeys = []string{
+				"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			}
+		}},
+		{name: "all-empty observation keys", change: func(p *Prepared) {
+			p.ObservationEventKeys = []string{"", ""}
+		}},
+		{name: "invalid observation key", change: func(p *Prepared) {
+			p.ObservationEventKeys = []string{"not-a-digest", ""}
 		}},
 		{name: "noncanonical uuid", change: func(p *Prepared) {
 			p.ProviderUUID = "2F790AB2-0622-4DF8-8F93-6079A3A0F94F"

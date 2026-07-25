@@ -487,15 +487,16 @@ func (s *Service) rebuildAggregate(ctx context.Context, clicked *types.Delivery,
 		}
 		items = append(items, input)
 	}
-	title, tmpl := parseAggHeader(clicked.CardJSON)
+	title, tmpl, effectID := parseAggMetadata(clicked.CardJSON)
 	return s.deps.BuildAggCard(AggregateCardInput{
-		HeaderTitle: title, HeaderTemplate: tmpl, Items: items,
+		HeaderTitle: title, HeaderTemplate: tmpl, EffectID: effectID, Items: items,
 	}), nil
 }
 
-// parseAggHeader 从库存 card_json 解析 header 标题与色名；失败返回空串（构卡落兜底）。
+// parseAggMetadata 从库存 card_json 解析 header 与 durable effect marker；
+// 失败或 marker 漂移返回空串（构卡落兜底，绝不传播冲突身份）。
 // 本地实现而非引 feishu 包：feishu→(agent)→…→feedback 的依赖方向不可倒转。
-func parseAggHeader(cardJSON []byte) (title, template string) {
+func parseAggMetadata(cardJSON []byte) (title, template, effectID string) {
 	var c struct {
 		Header struct {
 			Title struct {
@@ -505,9 +506,42 @@ func parseAggHeader(cardJSON []byte) (title, template string) {
 		} `json:"header"`
 	}
 	if err := json.Unmarshal(cardJSON, &c); err != nil {
-		return "", ""
+		return "", "", ""
 	}
-	return c.Header.Title.Content, c.Header.Template
+	var raw any
+	if err := json.Unmarshal(cardJSON, &raw); err != nil {
+		return c.Header.Title.Content, c.Header.Template, ""
+	}
+	var markers []string
+	collectEffectMarkers(raw, &markers)
+	for _, marker := range markers {
+		if marker == "" || (effectID != "" && marker != effectID) {
+			return c.Header.Title.Content, c.Header.Template, ""
+		}
+		effectID = marker
+	}
+	return c.Header.Title.Content, c.Header.Template, effectID
+}
+
+func collectEffectMarkers(value any, markers *[]string) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if key == "effect_id" {
+				if marker, ok := child.(string); ok {
+					*markers = append(*markers, marker)
+				} else {
+					*markers = append(*markers, "")
+				}
+				continue
+			}
+			collectEffectMarkers(child, markers)
+		}
+	case []any:
+		for _, child := range typed {
+			collectEffectMarkers(child, markers)
+		}
+	}
 }
 
 // contentOf 取投递对应的内容行（toast 标题回显用）；无内容或查失败返回 nil。

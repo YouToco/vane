@@ -121,6 +121,31 @@ func TestAggregateCard_form硬约束(t *testing.T) {
 
 // TestAggregateCard_状态门控 form 只在该条暂态打开且未 misjudged 时出现；
 // 兄弟条目的状态互不串染。深挖按钮不得出现在聚合卡。
+func TestAggregateCardEffectMarkerCoversEveryCallback(t *testing.T) {
+	const effectID = "019f9824-39b6-7e13-b247-b5ee5713c52b"
+	card := BuildAggregateCard(feedback.AggregateCardInput{
+		EffectID: effectID,
+		Items: []feedback.CardInput{{
+			DeliveryID: 7,
+			Title:      "marker",
+			State: feedback.CardState{
+				BadFeedbackOpen: true,
+			},
+		}},
+	})
+	callbacks := strings.Count(card, `"type":"callback"`)
+	if got := strings.Count(card, `"effect_id":"`+effectID+`"`); got != callbacks {
+		t.Fatalf("effect marker count = %d, want every one of %d callbacks: %s",
+			got, callbacks, card)
+	}
+	legacy := BuildAggregateCard(feedback.AggregateCardInput{
+		Items: []feedback.CardInput{{DeliveryID: 7, Title: "legacy"}},
+	})
+	if strings.Contains(legacy, `"effect_id"`) {
+		t.Fatalf("empty marker changed historical card shape: %s", legacy)
+	}
+}
+
 func TestAggregateCard_状态门控(t *testing.T) {
 	card := BuildAggregateCard(feedback.AggregateCardInput{Items: []feedback.CardInput{
 		{DeliveryID: 1, Title: "未表态"},

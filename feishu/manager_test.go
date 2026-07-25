@@ -107,6 +107,67 @@ func TestManagerUsesCredentialSafeSDKLogger(t *testing.T) {
 	}
 }
 
+func TestPushEffectTargetNeverSplicesProviderGenerations(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	type generation struct {
+		owner string
+		chat  string
+		app   string
+	}
+	generations := []generation{
+		{owner: "ou_owner_a", chat: "oc_chat_a", app: "cli_app_a"},
+		{owner: "ou_owner_b", chat: "oc_chat_b", app: "cli_app_b"},
+	}
+	install := func(g generation) {
+		m.mu.Lock()
+		m.apiClient = lark.NewClient(g.app, "test-secret")
+		m.apiAppID = g.app
+		m.ownerOpenID = g.owner
+		m.ownerChatID = g.chat
+		m.ownerAppID = g.app
+		m.mu.Unlock()
+	}
+	install(generations[0])
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 20_000; i++ {
+			install(generations[i%len(generations)])
+		}
+	}()
+
+	for {
+		owner, chat, app := m.PushEffectTarget()
+		valid := false
+		for _, generation := range generations {
+			if owner == generation.owner &&
+				chat == generation.chat &&
+				app == generation.app {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			t.Fatalf("spliced provider generation: owner=%q chat=%q app=%q",
+				owner, chat, app)
+		}
+		select {
+		case <-done:
+			m.mu.Lock()
+			m.ownerAppID = "cli_stale"
+			m.mu.Unlock()
+			owner, chat, app = m.PushEffectTarget()
+			if owner != "" || chat != "" || app != "" {
+				t.Fatalf("cross-App owner binding exposed: %q/%q/%q",
+					owner, chat, app)
+			}
+			return
+		default:
+		}
+	}
+}
+
 func assertSafeWSClientOptions(t *testing.T, call *ast.CallExpr, wsAlias string) {
 	t.Helper()
 	if len(call.Args) != 5 {

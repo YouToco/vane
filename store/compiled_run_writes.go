@@ -394,15 +394,78 @@ func (s *Store) InsertDeliveryForTaskRunV1(
 	if status == "" {
 		status = types.DeliveryStatusPending
 	}
-	tx, err := s.beginAuthorizedCompiledRunWriteV1(ctx, expected, ref)
+	tx, _, err := s.beginObservedEventAdmissionV1(
+		ctx,
+		expected,
+		ref,
+		[]types.PushBatchScope{{
+			TenantID: expected.TenantID,
+			UserID:   expected.UserID,
+			BatchID:  d.BatchID,
+		}},
+		map[int64]int64{d.BatchID: ref.SnapshotID},
+		false,
+	)
 	if err != nil {
+		if errors.Is(err, types.ErrConflict) {
+			return 0, false, false, taskRunNotFound()
+		}
 		return 0, false, false, err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
-	if err := lockCompiledLegacyPushBatchV1(
-		ctx, tx, expected, ref.SnapshotID, d.BatchID, "",
-	); err != nil {
+	effectBatches, err := lockObservedEventPushEffects(
+		ctx,
+		tx,
+		expected.TenantID,
+		expected.UserID,
+		[]int64{d.BatchID},
+	)
+	if err != nil {
 		return 0, false, false, err
+	}
+	if effectBatches[d.BatchID] {
+		if d.ContentItemID == nil {
+			return 0, false, false, observationConflict(
+				"push effect delivery aggregate is frozen")
+		}
+		var storedStatus types.DeliveryStatus
+		lookupErr := tx.QueryRow(ctx, `
+			SELECT d.id,d.status
+			  FROM deliveries d
+			  JOIN push_batches b ON b.id=d.batch_id
+			 WHERE d.batch_id=$1 AND d.content_item_id=$2
+			   AND d.tenant_id=$3 AND d.user_id=$4
+			   AND b.tenant_id=$3 AND b.user_id=$4
+			   AND b.idempotency_key=$5 AND b.schedule_id=$6
+			   AND b.run_snapshot_id=$7
+			   AND d.score IS NOT DISTINCT FROM $8
+			   AND d.body_md=$9
+			 FOR UPDATE OF d`,
+			d.BatchID,
+			*d.ContentItemID,
+			expected.TenantID,
+			expected.UserID,
+			physicalKey,
+			expected.TaskID,
+			ref.SnapshotID,
+			d.Score,
+			d.BodyMD,
+		).Scan(&id, &storedStatus)
+		if lookupErr == nil {
+			if err := commitCompiledRunWriteV1(
+				ctx, tx, "commit frozen compiled delivery replay",
+			); err != nil {
+				return 0, false, false, err
+			}
+			return id, true,
+				storedStatus == types.DeliveryStatusSent, nil
+		}
+		if !errors.Is(lookupErr, pgx.ErrNoRows) {
+			return 0, false, false, taskRunDatabaseError(
+				"load frozen compiled delivery replay", lookupErr)
+		}
+		return 0, false, false, observationConflict(
+			"push effect delivery aggregate is frozen")
 	}
 
 	err = tx.QueryRow(ctx,
