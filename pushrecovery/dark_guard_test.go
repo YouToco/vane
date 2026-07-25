@@ -1,6 +1,7 @@
 package pushrecovery
 
 import (
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
@@ -42,18 +43,56 @@ func TestPushRecoveryHasZeroProductionCallPoints(t *testing.T) {
 		if parseErr != nil {
 			return parseErr
 		}
-		for _, spec := range file.Imports {
-			value, unquoteErr := strconv.Unquote(spec.Path.Value)
-			if unquoteErr != nil {
-				return unquoteErr
-			}
-			if strings.HasSuffix(value, "/pushrecovery") {
-				t.Errorf("production import of dark push recovery: %s", path)
-			}
+		imported, importErr := fileImportsPushRecovery(file)
+		if importErr != nil {
+			return importErr
+		}
+		if imported {
+			t.Errorf("production import of dark push recovery: %s", path)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPushRecoveryDarkGuardCatchesMainAndWorkflowWiring(t *testing.T) {
+	for _, packageName := range []string{"main", "workflow"} {
+		t.Run(packageName, func(t *testing.T) {
+			source := `package ` + packageName + `
+import recovery "github.com/YouToco/vane/pushrecovery"
+func wireRecovery() { _, _ = recovery.New(recovery.Deps{}) }
+`
+			file, err := parser.ParseFile(
+				token.NewFileSet(),
+				packageName+".go",
+				source,
+				0,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			imported, err := fileImportsPushRecovery(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !imported {
+				t.Fatal("dark guard missed production recovery wiring mutation")
+			}
+		})
+	}
+}
+
+func fileImportsPushRecovery(file *ast.File) (bool, error) {
+	for _, spec := range file.Imports {
+		value, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			return false, err
+		}
+		if strings.HasSuffix(value, "/pushrecovery") {
+			return true, nil
+		}
+	}
+	return false, nil
 }

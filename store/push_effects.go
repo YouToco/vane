@@ -237,8 +237,7 @@ func (s *Store) ListRecoverablePushEffectTenantIDs(
 		SELECT DISTINCT tenant_id
 		  FROM push_effects
 		 WHERE tenant_id>$2 AND (
-		       status='ambiguous' OR
-		       (status IN ('prepared','definite_failed') AND
+		       (status IN ('prepared','definite_failed','ambiguous') AND
 		        next_attempt_at<=LEAST($1,clock_timestamp())) OR
 		       (status='sending' AND takeover_not_before IS NOT NULL AND
 		        takeover_not_before<=LEAST($1,clock_timestamp()))
@@ -294,15 +293,13 @@ func (s *Store) ListRecoverablePushEffects(
 		SELECT `+pushEffectColumns+`
 		  FROM push_effects
 		 WHERE tenant_id=$1 AND (
-		       status='ambiguous' OR
-		       (status IN ('prepared','definite_failed') AND
+		       (status IN ('prepared','definite_failed','ambiguous') AND
 		        next_attempt_at<=LEAST($2,clock_timestamp())) OR
 		       (status='sending' AND takeover_not_before IS NOT NULL AND
 		        takeover_not_before<=LEAST($2,clock_timestamp()))
 		   )
 		 ORDER BY
 		   CASE WHEN status='sending' THEN takeover_not_before
-		        WHEN status='ambiguous' THEN ambiguous_since
 		        ELSE next_attempt_at END,
 		   id
 		 LIMIT $3`,
@@ -553,6 +550,116 @@ func (s *Store) RecordPushEffectAmbiguous(
 		return err
 	}
 	return s.recordPushEffectFailure(ctx, params, pusheffect.StatusAmbiguous)
+}
+
+// DeferPushEffectReconciliation moves one fenced ambiguous checkpoint behind a
+// PostgreSQL-clock backoff. It never authorizes Create and clamps the next due
+// time to the provider UUID expiry so the terminal resolver cannot be hidden
+// past the point where exact replay becomes forbidden.
+func (s *Store) DeferPushEffectReconciliation(
+	ctx context.Context,
+	resolution pusheffect.Resolution,
+	retryAfter time.Duration,
+) error {
+	if retryAfter <= 0 || retryAfter > maxPushEffectRetryWindow {
+		return pushEffectValidation(
+			"push effect reconciliation deferral is invalid")
+	}
+	return s.deferPushEffectReconciliation(
+		ctx,
+		resolution,
+		retryAfter,
+		false,
+	)
+}
+
+// DeferPushEffectReconciliationUntilExpiry persistently removes an
+// attempt-exhausted ambiguous checkpoint from the due queue until its exact
+// frozen UUID-window boundary. Positive history remains eligible at expiry;
+// only a predicate-constrained block transition may then make it terminal.
+func (s *Store) DeferPushEffectReconciliationUntilExpiry(
+	ctx context.Context,
+	resolution pusheffect.Resolution,
+) error {
+	return s.deferPushEffectReconciliation(
+		ctx,
+		resolution,
+		0,
+		true,
+	)
+}
+
+func (s *Store) deferPushEffectReconciliation(
+	ctx context.Context,
+	resolution pusheffect.Resolution,
+	retryAfter time.Duration,
+	untilExpiry bool,
+) error {
+	if err := validatePushEffectResolution(resolution); err != nil {
+		return err
+	}
+	tx, err := s.beginPushEffectCoordinatorTx(ctx, resolution.TenantID)
+	if err != nil {
+		return pushEffectDatabaseError(
+			"begin reconciliation deferral transaction", err)
+	}
+	defer rollbackPushEffectTx(ctx, tx)
+	effect, _, err := loadPushEffectWithClock(ctx, tx, resolution.Scope)
+	if err != nil {
+		return err
+	}
+	if err := validateStoredPushEffect(effect); err != nil {
+		return err
+	}
+	if effect.Status != pusheffect.StatusAmbiguous ||
+		effect.Fence != resolution.ExpectedFence {
+		return pushEffectLeaseLost()
+	}
+
+	var tag pgconn.CommandTag
+	if untilExpiry {
+		tag, err = tx.Exec(ctx, `
+			UPDATE push_effects
+			   SET next_attempt_at=idempotency_expires_at,
+			       failure_class=$5, updated_at=clock_timestamp()
+			 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+			   AND fence=$4 AND status='ambiguous'`,
+			resolution.ID,
+			resolution.TenantID,
+			resolution.UserID,
+			resolution.ExpectedFence,
+			resolution.Class,
+		)
+	} else {
+		tag, err = tx.Exec(ctx, `
+			UPDATE push_effects
+			   SET next_attempt_at=LEAST(
+			           idempotency_expires_at,
+			           clock_timestamp()+($6*interval '1 microsecond')
+			       ),
+			       failure_class=$5, updated_at=clock_timestamp()
+			 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+			   AND fence=$4 AND status='ambiguous'`,
+			resolution.ID,
+			resolution.TenantID,
+			resolution.UserID,
+			resolution.ExpectedFence,
+			resolution.Class,
+			retryAfter.Microseconds(),
+		)
+	}
+	if err != nil {
+		return pushEffectDatabaseError(
+			"defer push effect reconciliation", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return pushEffectLeaseLost()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return pushEffectDatabaseError(
+			"commit reconciliation deferral transaction", err)
+	}
+	return nil
 }
 
 func (s *Store) recordPushEffectFailure(

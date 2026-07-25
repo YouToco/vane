@@ -308,14 +308,20 @@ func TestCoordinatorAmbiguousExpiryAndConflictBlockWithoutCreate(
 
 func TestCoordinatorRecoverOnceIsTenantShardedAndBounded(t *testing.T) {
 	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
-	store := newFakeStore(testEffect(now, pusheffect.StatusSent))
+	store := newFakeStore(testEffect(now, pusheffect.StatusAmbiguous))
+	store.dbNow = now
 	store.tenants = []int64{1, 2, 3, 4}
 	store.shards = make(map[int64][]pusheffect.Effect)
 	for _, tenantID := range store.tenants {
 		for range 4 {
-			effect := testEffect(now, pusheffect.StatusSent)
+			effect := testEffect(now, pusheffect.StatusAmbiguous)
 			effect.TenantID = tenantID
 			effect.ID = uuid.NewString()
+			effect.Fence = 1
+			effect.Attempt = defaultMaxAttempts
+			effect.FailureClass = "response_unknown"
+			ambiguousSince := now.Add(-time.Minute)
+			effect.AmbiguousSince = &ambiguousSince
 			store.shards[tenantID] = append(store.shards[tenantID], effect)
 		}
 	}
@@ -342,6 +348,104 @@ func TestCoordinatorRecoverOnceIsTenantShardedAndBounded(t *testing.T) {
 	}
 	if total != 5 {
 		t.Fatalf("global requested effect capacity=%d, want 5", total)
+	}
+}
+
+func TestCoordinatorPersistentDeferralPreventsSameTenantStarvationAcrossRestart(
+	t *testing.T,
+) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	exhausted := testEffect(now, pusheffect.StatusAmbiguous)
+	exhausted.ID = "00000000-0000-0000-0000-000000000001"
+	exhausted.Fence = 1
+	exhausted.Attempt = defaultMaxAttempts
+	exhausted.FailureClass = "response_unknown"
+	exhaustedSince := now.Add(-time.Minute)
+	exhausted.AmbiguousSince = &exhaustedSince
+
+	second := testEffect(now, pusheffect.StatusAmbiguous)
+	second.ID = "00000000-0000-0000-0000-000000000002"
+	second.Fence = 1
+	second.Attempt = 1
+	second.FailureClass = "response_unknown"
+	secondSince := now.Add(-time.Minute)
+	second.AmbiguousSince = &secondSince
+
+	third := testEffect(now, pusheffect.StatusAmbiguous)
+	third.ID = "00000000-0000-0000-0000-000000000003"
+	third.Fence = 1
+	third.Attempt = 1
+	third.FailureClass = "response_unknown"
+	thirdSince := now.Add(-time.Minute)
+	third.AmbiguousSince = &thirdSince
+
+	store := newFakeStore(exhausted)
+	store.dbNow = now
+	store.tenants = []int64{1}
+	store.shards = map[int64][]pusheffect.Effect{
+		1: {exhausted, second, third},
+	}
+	provider := &fakeProvider{
+		historyByEffect: map[string]pusheffect.HistoryObservation{
+			exhausted.ID: {},
+			second.ID: {
+				MatchCount: 1,
+				MessageID:  "om_second",
+			},
+			third.ID: {
+				MatchCount: 1,
+				MessageID:  "om_third",
+			},
+		},
+	}
+	first := newTestCoordinator(t, store, provider, now)
+	first.config.TenantLimit = 1
+	first.config.PerTenantLimit = 1
+	first.config.PassLimit = 1
+	first.config.Concurrency = 1
+
+	if err := first.RecoverOnce(t.Context()); err != nil {
+		t.Fatalf("first recovery pass: %v", err)
+	}
+	if err := first.RecoverOnce(t.Context()); err != nil {
+		t.Fatalf("second recovery pass: %v", err)
+	}
+
+	// Simulate restart: the tenant cursor resets, but next_attempt_at remains
+	// in the shared durable Store.
+	restarted := newTestCoordinator(t, store, provider, now)
+	restarted.config.TenantLimit = 1
+	restarted.config.PerTenantLimit = 1
+	restarted.config.PassLimit = 1
+	restarted.config.Concurrency = 1
+	if err := restarted.RecoverOnce(t.Context()); err != nil {
+		t.Fatalf("post-restart recovery pass: %v", err)
+	}
+
+	provider.mu.Lock()
+	if provider.historyCallsByEffect[exhausted.ID] != 1 ||
+		provider.historyCallsByEffect[second.ID] != 1 ||
+		provider.historyCallsByEffect[third.ID] != 1 {
+		t.Fatalf(
+			"history calls exhausted/second/third=%d/%d/%d, want 1/1/1",
+			provider.historyCallsByEffect[exhausted.ID],
+			provider.historyCallsByEffect[second.ID],
+			provider.historyCallsByEffect[third.ID],
+		)
+	}
+	provider.mu.Unlock()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	deferred, ok := store.effectByIDLocked(exhausted.ID)
+	if !ok ||
+		!deferred.NextAttemptAt.Equal(deferred.IdempotencyExpiresAt) ||
+		store.expiryDeferralCalls != 1 {
+		t.Fatalf(
+			"persistent exhausted deferral=%+v found=%v calls=%d",
+			deferred,
+			ok,
+			store.expiryDeferralCalls,
+		)
 	}
 }
 
@@ -403,6 +507,7 @@ type fakeStore struct {
 
 	effect     pusheffect.Effect
 	authorized bool
+	dbNow      time.Time
 	tenants    []int64
 	shards     map[int64][]pusheffect.Effect
 
@@ -414,6 +519,8 @@ type fakeStore struct {
 	definiteFailureCalls     int
 	ambiguousCalls           int
 	sentCalls                int
+	deferralCalls            int
+	expiryDeferralCalls      int
 	expiredBlockCalls        int
 	conflictBlockCalls       int
 }
@@ -456,10 +563,30 @@ func (s *fakeStore) ListRecoverablePushEffects(
 	defer s.mu.Unlock()
 	s.effectListLimits = append(s.effectListLimits, limit)
 	shard := s.shards[tenantID]
-	if len(shard) > limit {
-		shard = shard[:limit]
+	due := make([]pusheffect.Effect, 0, min(limit, len(shard)))
+	for _, effect := range shard {
+		if len(due) >= limit {
+			break
+		}
+		switch effect.Status {
+		case pusheffect.StatusPrepared,
+			pusheffect.StatusDefiniteFailed,
+			pusheffect.StatusAmbiguous:
+			if !s.dbNow.IsZero() && effect.NextAttemptAt.After(s.dbNow) {
+				continue
+			}
+		case pusheffect.StatusSending:
+			if effect.TakeoverNotBefore == nil ||
+				(!s.dbNow.IsZero() &&
+					effect.TakeoverNotBefore.After(s.dbNow)) {
+				continue
+			}
+		default:
+			continue
+		}
+		due = append(due, effect)
 	}
-	return append([]pusheffect.Effect(nil), shard...), nil
+	return due, nil
 }
 
 func (s *fakeStore) TakeOverStalePushEffect(
@@ -548,35 +675,103 @@ func (s *fakeStore) RecordPushEffectAmbiguous(
 
 func (s *fakeStore) RecordPushEffectSentWithDeliveries(
 	_ context.Context,
-	_ pusheffect.SentReceipt,
+	receipt pusheffect.SentReceipt,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sentCalls++
-	s.effect.Status = pusheffect.StatusSent
+	s.updateEffectLocked(receipt.ID, func(effect *pusheffect.Effect) {
+		effect.Status = pusheffect.StatusSent
+	})
+	return nil
+}
+
+func (s *fakeStore) DeferPushEffectReconciliation(
+	_ context.Context,
+	resolution pusheffect.Resolution,
+	retryAfter time.Duration,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deferralCalls++
+	s.updateEffectLocked(resolution.ID, func(effect *pusheffect.Effect) {
+		effect.NextAttemptAt = s.dbNow.Add(retryAfter)
+		if effect.NextAttemptAt.After(effect.IdempotencyExpiresAt) {
+			effect.NextAttemptAt = effect.IdempotencyExpiresAt
+		}
+		effect.FailureClass = resolution.Class
+	})
+	return nil
+}
+
+func (s *fakeStore) DeferPushEffectReconciliationUntilExpiry(
+	_ context.Context,
+	resolution pusheffect.Resolution,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.expiryDeferralCalls++
+	s.updateEffectLocked(resolution.ID, func(effect *pusheffect.Effect) {
+		effect.NextAttemptAt = effect.IdempotencyExpiresAt
+		effect.FailureClass = resolution.Class
+	})
 	return nil
 }
 
 func (s *fakeStore) BlockExpiredPushEffect(
 	_ context.Context,
-	_ pusheffect.Resolution,
+	resolution pusheffect.Resolution,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.expiredBlockCalls++
-	s.effect.Status = pusheffect.StatusBlocked
+	s.updateEffectLocked(resolution.ID, func(effect *pusheffect.Effect) {
+		effect.Status = pusheffect.StatusBlocked
+	})
 	return nil
 }
 
 func (s *fakeStore) BlockConflictingPushEffectHistory(
 	_ context.Context,
-	_ pusheffect.Resolution,
+	resolution pusheffect.Resolution,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.conflictBlockCalls++
-	s.effect.Status = pusheffect.StatusBlocked
+	s.updateEffectLocked(resolution.ID, func(effect *pusheffect.Effect) {
+		effect.Status = pusheffect.StatusBlocked
+	})
 	return nil
+}
+
+func (s *fakeStore) updateEffectLocked(
+	effectID string,
+	update func(*pusheffect.Effect),
+) {
+	if s.effect.ID == effectID {
+		update(&s.effect)
+	}
+	for tenantID, shard := range s.shards {
+		for i := range shard {
+			if shard[i].ID == effectID {
+				update(&shard[i])
+			}
+		}
+		s.shards[tenantID] = shard
+	}
+}
+
+func (s *fakeStore) effectByIDLocked(
+	effectID string,
+) (pusheffect.Effect, bool) {
+	for _, shard := range s.shards {
+		for _, effect := range shard {
+			if effect.ID == effectID {
+				return effect, true
+			}
+		}
+	}
+	return pusheffect.Effect{}, false
 }
 
 type fakeProvider struct {
@@ -584,16 +779,18 @@ type fakeProvider struct {
 
 	historyObservation pusheffect.HistoryObservation
 	historyErr         error
+	historyByEffect    map[string]pusheffect.HistoryObservation
 	sendObservation    pusheffect.ProviderObservation
 	sendErr            error
 
-	historyCalls   int
-	sendCalls      int
-	historyQuery   pusheffect.HistoryQuery
-	gotAppIdentity string
-	gotTarget      string
-	gotCard        string
-	gotUUID        string
+	historyCalls         int
+	historyCallsByEffect map[string]int
+	sendCalls            int
+	historyQuery         pusheffect.HistoryQuery
+	gotAppIdentity       string
+	gotTarget            string
+	gotCard              string
+	gotUUID              string
 }
 
 func (p *fakeProvider) ResolvePushEffectMessage(
@@ -604,6 +801,13 @@ func (p *fakeProvider) ResolvePushEffectMessage(
 	defer p.mu.Unlock()
 	p.historyCalls++
 	p.historyQuery = query
+	if p.historyCallsByEffect == nil {
+		p.historyCallsByEffect = make(map[string]int)
+	}
+	p.historyCallsByEffect[query.EffectID]++
+	if observation, ok := p.historyByEffect[query.EffectID]; ok {
+		return observation, p.historyErr
+	}
 	return p.historyObservation, p.historyErr
 }
 

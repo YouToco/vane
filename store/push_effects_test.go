@@ -511,6 +511,148 @@ func TestPushEffectReconciliationStopsAtProviderWindow(t *testing.T) {
 	}
 }
 
+func TestPushEffectAmbiguousDeferralIsFencedAndDueByDatabaseClock(
+	t *testing.T,
+) {
+	f := newPushEffectFixture(t)
+	ctx := t.Context()
+	if _, err := f.store.CreatePushEffect(ctx, f.prepared); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := f.store.ClaimPushEffect(
+		ctx,
+		pusheffect.ClaimParams{
+			Scope:         f.prepared.Scope(),
+			LeaseOwner:    "defer-" + uuid.NewString(),
+			LeaseDuration: time.Minute,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.RecordPushEffectAmbiguous(
+		ctx,
+		pusheffect.FailureParams{
+			Lease: pusheffect.Lease{
+				Scope:      claimed.Scope(),
+				LeaseOwner: claimed.LeaseOwner,
+				Fence:      claimed.Fence,
+			},
+			Class: "response_unknown",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	resolution := pusheffect.Resolution{
+		Scope:         claimed.Scope(),
+		ExpectedFence: claimed.Fence,
+		Class:         "provider_history_miss",
+	}
+	if err := f.store.DeferPushEffectReconciliation(
+		ctx,
+		resolution,
+		5*time.Minute,
+	); err != nil {
+		t.Fatal(err)
+	}
+	recoverable, err := f.store.ListRecoverablePushEffects(
+		ctx,
+		f.prepared.TenantID,
+		time.Now().Add(24*time.Hour),
+		10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recoverable) != 0 {
+		t.Fatalf("deferred ambiguous effects=%d, want 0", len(recoverable))
+	}
+	tenantIDs, err := f.store.ListRecoverablePushEffectTenantIDs(
+		ctx,
+		time.Now().Add(24*time.Hour),
+		0,
+		10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tenantIDs) != 0 {
+		t.Fatalf("deferred ambiguous tenant shards=%v, want none", tenantIDs)
+	}
+
+	if err := f.store.DeferPushEffectReconciliation(
+		ctx,
+		pusheffect.Resolution{
+			Scope:         claimed.Scope(),
+			ExpectedFence: claimed.Fence + 1,
+			Class:         "stale_fence",
+		},
+		time.Minute,
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("stale defer fence error=%v, want conflict", err)
+	}
+
+	if _, err := f.db.ExecContext(ctx, `
+		UPDATE push_effects
+		   SET next_attempt_at=clock_timestamp()-interval '1 second'
+		 WHERE id=$1`,
+		f.prepared.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	recoverable, err = f.store.ListRecoverablePushEffects(
+		ctx,
+		f.prepared.TenantID,
+		time.Now().Add(24*time.Hour),
+		10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recoverable) != 1 ||
+		recoverable[0].ID != f.prepared.ID {
+		t.Fatalf("due ambiguous effects=%+v, want exact deferred effect", recoverable)
+	}
+	tenantIDs, err = f.store.ListRecoverablePushEffectTenantIDs(
+		ctx,
+		time.Now().Add(24*time.Hour),
+		0,
+		10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tenantIDs) != 1 ||
+		tenantIDs[0] != f.prepared.TenantID {
+		t.Fatalf("due ambiguous tenant shards=%v, want exact tenant", tenantIDs)
+	}
+
+	if err := f.store.DeferPushEffectReconciliationUntilExpiry(
+		ctx,
+		pusheffect.Resolution{
+			Scope:         claimed.Scope(),
+			ExpectedFence: claimed.Fence,
+			Class:         "attempt_budget_exhausted",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	current, err := f.store.LoadPushEffect(ctx, claimed.Scope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.NextAttemptAt.Equal(current.IdempotencyExpiresAt) ||
+		current.FailureClass != "attempt_budget_exhausted" {
+		t.Fatalf(
+			"expiry deferral next/class=%s/%q, want %s/attempt_budget_exhausted",
+			current.NextAttemptAt,
+			current.FailureClass,
+			current.IdempotencyExpiresAt,
+		)
+	}
+}
+
 func TestPushEffectRLSAndStoredIntegrity(t *testing.T) {
 	f := newPushEffectFixture(t)
 	ctx := t.Context()

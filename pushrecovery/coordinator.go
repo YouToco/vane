@@ -83,6 +83,15 @@ type Store interface {
 		context.Context,
 		pusheffect.SentReceipt,
 	) error
+	DeferPushEffectReconciliation(
+		context.Context,
+		pusheffect.Resolution,
+		time.Duration,
+	) error
+	DeferPushEffectReconciliationUntilExpiry(
+		context.Context,
+		pusheffect.Resolution,
+	) error
 
 	// These are not aliases for the existing generic operator transition.
 	// Their future SQL must enforce the expiry/conflict predicate and expected
@@ -417,11 +426,17 @@ func (c *Coordinator) recoverAmbiguous(
 		},
 	)
 	if err != nil {
-		return OutcomeAmbiguous, fmt.Errorf(
+		deferErr := c.deferAmbiguous(
+			ctx,
+			effect,
+			"provider_history_unavailable",
+			false,
+		)
+		return OutcomeAmbiguous, errors.Join(fmt.Errorf(
 			"resolve ambiguous push effect %s: %w",
 			effect.ID,
 			err,
-		)
+		), deferErr)
 	}
 	switch {
 	case observation.MatchCount == 1 && observation.MessageID != "":
@@ -486,6 +501,14 @@ func (c *Coordinator) recoverAmbiguous(
 	if effect.Attempt >= c.config.MaxAttempts {
 		// Positive history remains eligible on later passes. The attempt cap
 		// suppresses Create only; it must not erase a remotely sent message.
+		if err := c.deferAmbiguous(
+			ctx,
+			effect,
+			"attempt_budget_exhausted",
+			true,
+		); err != nil {
+			return "", err
+		}
 		return OutcomeDeferred, nil
 	}
 	return c.recoverSafeSend(ctx, effect, true)
@@ -497,6 +520,16 @@ func (c *Coordinator) recoverSafeSend(
 	reconciliation bool,
 ) (Outcome, error) {
 	if effect.Attempt >= c.config.MaxAttempts {
+		if reconciliation {
+			if err := c.deferAmbiguous(
+				ctx,
+				effect,
+				"attempt_budget_exhausted",
+				true,
+			); err != nil {
+				return "", err
+			}
+		}
 		return OutcomeDeferred, nil
 	}
 	authorized, err := c.store.AuthorizePushEffectRunSideEffect(
@@ -504,13 +537,32 @@ func (c *Coordinator) recoverSafeSend(
 		effect.Scope(),
 	)
 	if err != nil {
+		var deferErr error
+		if reconciliation {
+			deferErr = c.deferAmbiguous(
+				ctx,
+				effect,
+				"run_authorization_unavailable",
+				false,
+			)
+		}
 		return "", fmt.Errorf(
 			"preflight push effect %s run authority: %w",
 			effect.ID,
-			err,
+			errors.Join(err, deferErr),
 		)
 	}
 	if !authorized {
+		if reconciliation {
+			if err := c.deferAmbiguous(
+				ctx,
+				effect,
+				"run_not_authorized",
+				false,
+			); err != nil {
+				return "", err
+			}
+		}
 		return OutcomeNotAuthorized, nil
 	}
 
@@ -536,6 +588,7 @@ func (c *Coordinator) recoverSafeSend(
 		)
 	}
 	if claimed == nil ||
+		claimed.Scope() != effect.Scope() ||
 		claimed.Status != pusheffect.StatusSending ||
 		claimed.LeaseOwner == "" ||
 		claimed.Fence <= effect.Fence {
@@ -622,7 +675,52 @@ func (c *Coordinator) sendClaimed(
 			persistErr,
 		))
 	}
+	if outcome == OutcomeAmbiguous {
+		deferErr := c.deferAmbiguous(
+			ctx,
+			effect,
+			class,
+			false,
+		)
+		if deferErr != nil {
+			return "", errors.Join(sendErr, deferErr)
+		}
+	}
 	return outcome, sendErr
+}
+
+func (c *Coordinator) deferAmbiguous(
+	ctx context.Context,
+	effect *pusheffect.Effect,
+	class string,
+	untilExpiry bool,
+) error {
+	resolution := pusheffect.Resolution{
+		Scope:         effect.Scope(),
+		ExpectedFence: effect.Fence,
+		Class:         class,
+	}
+	var err error
+	if untilExpiry {
+		err = c.store.DeferPushEffectReconciliationUntilExpiry(
+			ctx,
+			resolution,
+		)
+	} else {
+		err = c.store.DeferPushEffectReconciliation(
+			ctx,
+			resolution,
+			c.config.RetryAfter,
+		)
+	}
+	if err != nil {
+		return fmt.Errorf(
+			"defer ambiguous push effect %s: %w",
+			effect.ID,
+			err,
+		)
+	}
+	return nil
 }
 
 func validSentObservation(

@@ -13,28 +13,46 @@ import (
 
 func TestPushEffectStoreCallPointsStayInFencedCoordinator(t *testing.T) {
 	methods := map[string]bool{
-		"PushEffectBatchStarted":             true,
-		"CreatePushEffect":                   true,
-		"LoadPushEffect":                     true,
-		"ListRecoverablePushEffectTenantIDs": true,
-		"ListRecoverablePushEffects":         true,
-		"ClaimPushEffect":                    true,
-		"ClaimPushEffectReconciliation":      true,
-		"TakeOverStalePushEffect":            true,
-		"RecordPushEffectDefiniteFailure":    true,
-		"RecordPushEffectAmbiguous":          true,
-		"RecordPushEffectSent":               true,
-		"RecordPushEffectSentWithDeliveries": true,
-		"BlockPushEffect":                    true,
+		"PushEffectBatchStarted":                   true,
+		"CreatePushEffect":                         true,
+		"LoadPushEffect":                           true,
+		"ListRecoverablePushEffectTenantIDs":       true,
+		"ListRecoverablePushEffects":               true,
+		"ClaimPushEffect":                          true,
+		"ClaimPushEffectReconciliation":            true,
+		"TakeOverStalePushEffect":                  true,
+		"RecordPushEffectDefiniteFailure":          true,
+		"RecordPushEffectAmbiguous":                true,
+		"RecordPushEffectSent":                     true,
+		"RecordPushEffectSentWithDeliveries":       true,
+		"AuthorizePushEffectRunSideEffect":         true,
+		"ClaimAuthorizedPushEffect":                true,
+		"ClaimAuthorizedPushEffectReconciliation":  true,
+		"DeferPushEffectReconciliation":            true,
+		"DeferPushEffectReconciliationUntilExpiry": true,
+		"BlockExpiredPushEffect":                   true,
+		"BlockConflictingPushEffectHistory":        true,
+		"BlockPushEffect":                          true,
 	}
 	expected := map[string]int{
-		"PushEffectBatchStarted":             1,
-		"CreatePushEffect":                   1,
-		"ClaimPushEffect":                    1,
-		"ClaimPushEffectReconciliation":      1,
-		"RecordPushEffectDefiniteFailure":    1,
-		"RecordPushEffectAmbiguous":          1,
-		"RecordPushEffectSentWithDeliveries": 2,
+		"PushEffectBatchStarted":                   1,
+		"CreatePushEffect":                         1,
+		"LoadPushEffect":                           1,
+		"ListRecoverablePushEffectTenantIDs":       2,
+		"ListRecoverablePushEffects":               1,
+		"ClaimPushEffect":                          1,
+		"ClaimPushEffectReconciliation":            1,
+		"TakeOverStalePushEffect":                  1,
+		"RecordPushEffectDefiniteFailure":          2,
+		"RecordPushEffectAmbiguous":                2,
+		"RecordPushEffectSentWithDeliveries":       4,
+		"AuthorizePushEffectRunSideEffect":         1,
+		"ClaimAuthorizedPushEffect":                1,
+		"ClaimAuthorizedPushEffectReconciliation":  1,
+		"DeferPushEffectReconciliation":            1,
+		"DeferPushEffectReconciliationUntilExpiry": 1,
+		"BlockExpiredPushEffect":                   1,
+		"BlockConflictingPushEffectHistory":        1,
 	}
 	found := make(map[string]int)
 	root, err := filepath.Abs("..")
@@ -42,6 +60,12 @@ func TestPushEffectStoreCallPointsStayInFencedCoordinator(t *testing.T) {
 		t.Fatal(err)
 	}
 	allowedFile := filepath.Join(root, "workflow", "activities.go")
+	recoveryFile := filepath.Join(root, "pushrecovery", "coordinator.go")
+	authorizationFile := filepath.Join(
+		root,
+		"store",
+		"push_effect_authorization.go",
+	)
 	fset := token.NewFileSet()
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -74,12 +98,24 @@ func TestPushEffectStoreCallPointsStayInFencedCoordinator(t *testing.T) {
 					return true
 				}
 				position := fset.Position(selector.Pos())
-				allowedCall := filepath.Clean(path) == allowedFile &&
+				cleanPath := filepath.Clean(path)
+				allowedCall := (cleanPath == allowedFile &&
 					isPushEffectCoordinatorReceiver(selector.X) &&
 					((selector.Sel.Name == "PushEffectBatchStarted" &&
 						function.Name.Name == "Push") ||
 						(selector.Sel.Name != "PushEffectBatchStarted" &&
-							function.Name.Name == "sendDurablePushChunk"))
+							function.Name.Name == "sendDurablePushChunk"))) ||
+					(cleanPath == recoveryFile &&
+						isPushRecoveryStoreReceiver(selector.X) &&
+						allowedPushRecoveryStoreCall(
+							function.Name.Name,
+							selector.Sel.Name,
+						)) ||
+					(cleanPath == authorizationFile &&
+						function.Name.Name ==
+							"AuthorizePushEffectRunSideEffect" &&
+						selector.Sel.Name == "LoadPushEffect" &&
+						isStoreReceiver(selector.X))
 				if !allowedCall {
 					t.Errorf(
 						"push effect Store API escaped fenced coordinator: %s:%d (%s)",
@@ -115,4 +151,50 @@ func isPushEffectCoordinatorReceiver(expression ast.Expr) bool {
 	}
 	identifier, ok := selector.X.(*ast.Ident)
 	return ok && identifier.Name == "a"
+}
+
+func isPushRecoveryStoreReceiver(expression ast.Expr) bool {
+	selector, ok := expression.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "store" {
+		return false
+	}
+	identifier, ok := selector.X.(*ast.Ident)
+	return ok && identifier.Name == "c"
+}
+
+func isStoreReceiver(expression ast.Expr) bool {
+	identifier, ok := expression.(*ast.Ident)
+	return ok && identifier.Name == "s"
+}
+
+func allowedPushRecoveryStoreCall(functionName, methodName string) bool {
+	allowed := map[string]map[string]bool{
+		"RecoverOnce": {
+			"ListRecoverablePushEffectTenantIDs": true,
+			"ListRecoverablePushEffects":         true,
+		},
+		"recoverEffect": {
+			"TakeOverStalePushEffect": true,
+		},
+		"recoverAmbiguous": {
+			"RecordPushEffectSentWithDeliveries": true,
+			"BlockExpiredPushEffect":             true,
+			"BlockConflictingPushEffectHistory":  true,
+		},
+		"recoverSafeSend": {
+			"AuthorizePushEffectRunSideEffect":        true,
+			"ClaimAuthorizedPushEffect":               true,
+			"ClaimAuthorizedPushEffectReconciliation": true,
+		},
+		"sendClaimed": {
+			"RecordPushEffectSentWithDeliveries": true,
+			"RecordPushEffectDefiniteFailure":    true,
+			"RecordPushEffectAmbiguous":          true,
+		},
+		"deferAmbiguous": {
+			"DeferPushEffectReconciliation":            true,
+			"DeferPushEffectReconciliationUntilExpiry": true,
+		},
+	}
+	return allowed[functionName][methodName]
 }
