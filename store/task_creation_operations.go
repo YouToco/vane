@@ -1254,7 +1254,7 @@ func loadScopedTaskCreationOperationForUpdate(
 		   FROM pending_actions
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		    AND tool_name = 'create_schedule' AND execution_version = $4
-		  FOR UPDATE`,
+		  FOR UPDATE /* task creation operation lock order */`,
 		lease.ID, lease.TenantID, lease.UserID, types.TaskCreationExecutionVersionV1,
 	), &op)
 	if err != nil {

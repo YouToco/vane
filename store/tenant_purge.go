@@ -173,13 +173,21 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			types.CodeDatabase, "锁定租户清理准入根", err)
 	}
 
-	// Across the purge/receipt/session conflict set, every path follows this
-	// shared partial order:
+	// Across the purge/coordinator/receipt/session conflict set, every path
+	// follows this shared partial order:
 	//
+	//   tenant -> membership -> user -> task-creation operation
 	//   task-creation operation -> schedule (when an aggregate exists)
 	//   task-creation operation -> task-creation receipt -> session
 	//   schedule -> definition-edit operation -> definition-edit receipt -> session
 	//   session -> agent event
+	//
+	// Task Creation locks the tenant and membership before its shared user
+	// capacity row and operation. Purge does not touch or lock users: a user can
+	// belong to another tenant, so taking that shared row would create exactly
+	// the forbidden cross-tenant lock. Locking this tenant and its membership
+	// rows first is sufficient because every coordinator reaches the user and
+	// operation only after those roots.
 	//
 	// The two receipt dispatchers really lock their receipt before updating the
 	// session. Definition-edit coordinators lock schedule -> operation before
@@ -197,6 +205,19 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		name  string
 		query string
 	}{
+		{
+			name: "tenants",
+			query: `SELECT id FROM tenants
+			         WHERE id = $1
+			         FOR UPDATE /* tenant purge tenant root lock order */`,
+		},
+		{
+			name: "memberships",
+			query: `SELECT user_id FROM memberships
+			         WHERE tenant_id = $1
+			         ORDER BY user_id
+			         FOR UPDATE /* tenant purge membership root lock order */`,
+		},
 		{
 			name: "pending_actions",
 			query: `SELECT id FROM pending_actions

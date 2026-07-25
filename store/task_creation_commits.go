@@ -824,13 +824,36 @@ func lockValidMembershipForTaskCreation(
 	var valid bool
 	err := tx.QueryRow(ctx,
 		`SELECT true
+		   FROM tenants
+		  WHERE id = $1 AND status = 'active' AND deleted_at IS NULL
+		  FOR SHARE /* task creation tenant root lock order */`,
+		tenantID,
+	).Scan(&valid)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return taskCreationValidation("operation membership is no longer active")
+		}
+		return taskCreationDatabaseError("lock task capacity membership", err)
+	}
+	err = tx.QueryRow(ctx,
+		`SELECT true
 		   FROM memberships m
-		   JOIN tenants t ON t.id = m.tenant_id
-		   JOIN users u ON u.id = m.user_id
 		  WHERE m.tenant_id = $1 AND m.user_id = $2
-		    AND t.status = 'active' AND t.deleted_at IS NULL
-		  FOR UPDATE OF u, m FOR SHARE OF t`,
+		  FOR UPDATE /* task creation membership root lock order */`,
 		tenantID, userID,
+	).Scan(&valid)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return taskCreationValidation("operation membership is no longer active")
+		}
+		return taskCreationDatabaseError("lock task capacity membership", err)
+	}
+	err = tx.QueryRow(ctx,
+		`SELECT true
+		   FROM users
+		  WHERE id = $1
+		  FOR UPDATE /* task creation user root lock order */`,
+		userID,
 	).Scan(&valid)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

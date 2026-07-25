@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/agentledger"
 	"github.com/YouToco/vane/types"
@@ -719,6 +721,95 @@ func TestPurgeTenant_TaskCreationReceiptWorkerDoesNotDeadlock(t *testing.T) {
 		t.Fatalf("Task Creation receipt purge report=%+v", report)
 	}
 	assertPurgedReceiptWorkerRows(t, st, tenantID)
+}
+
+func TestPurgeTenant_TaskCreationCoordinatorRootLockDoesNotDeadlock(t *testing.T) {
+	st := purgeStore(t)
+	fixture := newCompiledTaskFixture(t, st)
+	cleanupA5Fixture(t, st, fixture)
+	ctx := t.Context()
+	commit := preparedA5Commit(t, st, fixture, "purge-root-lock")
+
+	blocker, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(context.WithoutCancel(ctx)) }()
+	var operationID string
+	if err := blocker.QueryRow(ctx, `
+		SELECT id FROM pending_actions
+		 WHERE id=$1 AND tenant_id=$2
+		 FOR UPDATE`,
+		commit.Lease.ID, fixture.tenantID,
+	).Scan(&operationID); err != nil {
+		t.Fatalf("锁 Task Creation operation blocker 失败: %v", err)
+	}
+
+	coordinatorDone := make(chan error, 1)
+	go func() {
+		coordinatorDone <- st.CommitPausedCompiledTaskDefinitionForCreation(
+			ctx, commit,
+		)
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%task creation operation lock order%",
+		"Task Creation coordinator 未在持有根锁后等待 operation",
+	)
+
+	var lockedTenantID int64
+	err = st.pool.QueryRow(ctx, `
+		SELECT id FROM tenants
+		 WHERE id=$1
+		 FOR UPDATE NOWAIT`,
+		fixture.tenantID,
+	).Scan(&lockedTenantID)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("coordinator 未真实持有 tenant SHARE 锁: id=%d err=%v",
+			lockedTenantID, err)
+	}
+
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, purgeErr := st.PurgeTenant(ctx, fixture.tenantID, false)
+		purgeDone <- purgeResult{report: report, err: purgeErr}
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%tenant purge tenant root lock order%",
+		"tenant purge 未先等待 coordinator 的 tenant 根锁",
+	)
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("释放 Task Creation operation blocker 失败: %v", err)
+	}
+	select {
+	case err := <-coordinatorDone:
+		if err != nil {
+			t.Fatalf("Task Creation coordinator 与 purge 并发失败: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Task Creation coordinator 未在 operation blocker 释放后收敛")
+	}
+	select {
+	case result := <-purgeDone:
+		if result.err != nil {
+			t.Fatalf("tenant purge 与 Task Creation coordinator 并发失败: %v",
+				result.err)
+		}
+		if result.report == nil || result.report.Rows["tenants"] != 1 ||
+			result.report.Rows["pending_actions"] != 1 {
+			t.Fatalf("tenant purge 报告异常: %+v", result.report)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant purge 未在 coordinator 释放根锁后收敛")
+	}
+	assertPurgedReceiptWorkerRows(t, st, fixture.tenantID)
 }
 
 func TestPurgeTenantRemovesAgentTurnCommittedBeforeSessionFence(t *testing.T) {
