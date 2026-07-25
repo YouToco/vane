@@ -3,8 +3,10 @@ package feishu
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/google/uuid"
+	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/YouToco/vane/pusheffect"
@@ -38,7 +40,13 @@ func (m *Manager) SendCardWithUUID(
 	cardJSON string,
 	messageUUID string,
 ) (string, error) {
-	result, err := m.SendCardWithUUIDResult(ctx, openID, cardJSON, messageUUID)
+	result, err := m.SendCardWithUUIDResult(
+		ctx,
+		m.AppIdentity(),
+		openID,
+		cardJSON,
+		messageUUID,
+	)
 	return result.MessageID, err
 }
 
@@ -49,6 +57,7 @@ func (m *Manager) SendCardWithUUID(
 // retry is safe.
 func (m *Manager) SendCardWithUUIDResult(
 	ctx context.Context,
+	expectedAppIdentity string,
 	openID string,
 	cardJSON string,
 	messageUUID string,
@@ -61,7 +70,26 @@ func (m *Manager) SendCardWithUUIDResult(
 				nil,
 			)
 	}
-	return m.sendCard(ctx, openID, cardJSON, messageUUID)
+	client, actualAppIdentity, ok := m.apiForExpectedApp(expectedAppIdentity)
+	if !ok {
+		return pusheffect.ProviderObservation{
+				Disposition: pusheffect.AttemptDefiniteNotSent,
+				AppIdentity: actualAppIdentity,
+			},
+			types.NewAppError(
+				types.CodeConflict,
+				"飞书 App 身份与耐久推送快照不一致",
+				nil,
+			)
+	}
+	return m.sendCardWithClient(
+		ctx,
+		client,
+		actualAppIdentity,
+		openID,
+		cardJSON,
+		messageUUID,
+	)
 }
 
 func (m *Manager) sendCard(
@@ -82,7 +110,17 @@ func (m *Manager) sendCard(
 		return pusheffect.ProviderObservation{Disposition: pusheffect.AttemptDefiniteNotSent},
 			types.NewAppError(types.CodeConflict, "飞书通道未连接，无法主动推送", nil)
 	}
+	return m.sendCardWithClient(ctx, client, "", openID, cardJSON, messageUUID)
+}
 
+func (m *Manager) sendCardWithClient(
+	ctx context.Context,
+	client *lark.Client,
+	appIdentity string,
+	openID string,
+	cardJSON string,
+	messageUUID string,
+) (pusheffect.ProviderObservation, error) {
 	body := larkim.NewCreateMessageReqBodyBuilder().
 		ReceiveId(openID).
 		MsgType(larkim.MsgTypeInteractive).
@@ -97,7 +135,10 @@ func (m *Manager) sendCard(
 		Build())
 	if err != nil {
 		// 传输层失败（网络/超时）默认可重试，沿用 CodePushFailed 的默认 Retryable。
-		return pusheffect.ProviderObservation{Disposition: pusheffect.AttemptAmbiguous},
+		return pusheffect.ProviderObservation{
+				Disposition: pusheffect.AttemptAmbiguous,
+				AppIdentity: appIdentity,
+			},
 			types.NewAppError(types.CodePushFailed, "主动推送卡片失败", err)
 	}
 	if !resp.Success() {
@@ -112,7 +153,13 @@ func (m *Manager) sendCard(
 		if permanentRejection(resp.Code) {
 			ae.Retryable = false
 		}
-		return pusheffect.ProviderObservation{Disposition: pusheffect.AttemptDefiniteNotSent}, ae
+		return pusheffect.ProviderObservation{
+			Disposition: providerRejectionDisposition(
+				resp.StatusCode,
+				resp.Code,
+			),
+			AppIdentity: appIdentity,
+		}, ae
 	}
 	// message_id 回填 deliveries.feishu_message_id，用于后续追溯/撤回。飞书即使
 	// 返回 code=0，也可能因异常响应缺失 data/message_id；此时远端结果未知，
@@ -128,10 +175,14 @@ func (m *Manager) sendCard(
 			nil,
 		)
 		ae.Retryable = messageUUID != ""
-		return pusheffect.ProviderObservation{Disposition: pusheffect.AttemptAmbiguous}, ae
+		return pusheffect.ProviderObservation{
+			Disposition: pusheffect.AttemptAmbiguous,
+			AppIdentity: appIdentity,
+		}, ae
 	}
 	result := pusheffect.ProviderObservation{
 		Disposition: pusheffect.AttemptSent,
+		AppIdentity: appIdentity,
 		MessageID:   *resp.Data.MessageId,
 	}
 	if resp.Data.ChatId != nil {
@@ -159,8 +210,21 @@ func (m *Manager) OwnerOpenID() string {
 // reconciliation. Older owner settings may legitimately return empty until a
 // new inbound owner message or a historical-message backfill supplies it.
 func (m *Manager) OwnerChatID() string {
-	_, chatID := m.ownerIdentity()
-	return chatID
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ownerAppID == "" || m.ownerAppID != m.apiAppID {
+		return ""
+	}
+	return m.ownerChatID
+}
+
+// AppIdentity returns the non-secret identity of the currently installed API
+// client. Secret rotation for the same App preserves this value; switching
+// Apps changes it.
+func (m *Manager) AppIdentity() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.apiAppID
 }
 
 // permanentRejection 报告一个飞书拒收 code 是否为确定性失败（重试必然同样失败）。
@@ -176,4 +240,25 @@ func permanentRejection(code int) bool {
 		return true
 	}
 	return false
+}
+
+// providerRejectionDisposition separates an HTTP/provider rejection that
+// positively proves no side effect from a response that may have been emitted
+// after the provider committed the message. In particular, the SDK can decode
+// a JSON 5xx into a normal response object; treating every non-zero provider
+// code as definite would then authorize an unsafe duplicate retry.
+func providerRejectionDisposition(
+	httpStatus int,
+	providerCode int,
+) pusheffect.AttemptDisposition {
+	if httpStatus >= http.StatusInternalServerError {
+		return pusheffect.AttemptAmbiguous
+	}
+	if httpStatus == http.StatusTooManyRequests ||
+		(httpStatus >= http.StatusBadRequest &&
+			httpStatus < http.StatusInternalServerError) ||
+		permanentRejection(providerCode) {
+		return pusheffect.AttemptDefiniteNotSent
+	}
+	return pusheffect.AttemptAmbiguous
 }

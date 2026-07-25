@@ -66,10 +66,13 @@ const (
 )
 
 // ProviderObservation is the provider adapter's typed result. MessageID is
-// required for sent; ChatID is supplementary routing evidence, not proof of
-// delivery by itself.
+// required for sent; AppIdentity identifies the exact provider client
+// generation selected before the request, including when a reconfiguration
+// races with an in-flight send. ChatID is supplementary routing evidence, not
+// proof of delivery by itself.
 type ProviderObservation struct {
 	Disposition AttemptDisposition
+	AppIdentity string
 	MessageID   string
 	ChatID      string
 }

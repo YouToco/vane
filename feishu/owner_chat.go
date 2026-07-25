@@ -30,8 +30,8 @@ func (m *Manager) backfillOwnerChatID(ctx context.Context) error {
 	m.captureMu.Lock()
 	defer m.captureMu.Unlock()
 
-	openID, cachedChatID := m.ownerIdentity()
-	if openID == "" || cachedChatID != "" {
+	openID, _, _ := m.ownerIdentity()
+	if openID == "" {
 		return nil
 	}
 	raw, err := m.st.GetSetting(ctx, settingKeyOwner)
@@ -44,12 +44,32 @@ func (m *Manager) backfillOwnerChatID(ctx context.Context) error {
 		return types.NewAppError(
 			types.CodeValidation, "飞书 owner 设置无法用于会话回填", nil)
 	}
-	if owner.ChatID != "" {
+	client, currentAppID, ok := m.currentAPI()
+	if !ok {
+		return types.NewAppError(
+			types.CodeConflict, "飞书通道未就绪，无法回填 owner 会话", nil)
+	}
+	if owner.AppIdentity != "" && owner.AppIdentity != currentAppID {
+		m.setOwnerWithChat(
+			owner.OpenID,
+			owner.Name,
+			owner.AppIdentity,
+			owner.ChatID,
+		)
+		return types.NewAppError(
+			types.CodeConflict, "飞书 owner 会话属于另一 App", nil)
+	}
+	if owner.AppIdentity == currentAppID && owner.ChatID != "" {
 		if !validOwnerChatID(owner.ChatID) {
 			return types.NewAppError(
 				types.CodeValidation, "飞书 owner 会话标识无效", nil)
 		}
-		m.setOwnerWithChat(owner.OpenID, owner.Name, owner.ChatID)
+		m.setOwnerWithChat(
+			owner.OpenID,
+			owner.Name,
+			owner.AppIdentity,
+			owner.ChatID,
+		)
 		return nil
 	}
 	if owner.OpenID != openID {
@@ -70,12 +90,6 @@ func (m *Manager) backfillOwnerChatID(ctx context.Context) error {
 		return types.NewAppError(
 			types.CodeDatabase, "无法读取会话回填的历史发送回执", nil)
 	}
-	client := m.api()
-	if client == nil {
-		return types.NewAppError(
-			types.CodeConflict, "飞书通道未就绪，无法回填 owner 会话", nil)
-	}
-
 	fetchCtx, cancel := context.WithTimeout(ctx, ownerChatBackfillTimeout)
 	defer cancel()
 	resp, err := client.Im.Message.Get(
@@ -98,6 +112,11 @@ func (m *Manager) backfillOwnerChatID(ctx context.Context) error {
 			types.CodeConflict, "飞书历史消息缺少精确 owner 会话证据", nil)
 	}
 
+	if !m.appIsCurrent(currentAppID) {
+		return types.NewAppError(
+			types.CodeConflict, "飞书 App 在会话回填期间发生变化", nil)
+	}
+	owner.AppIdentity = currentAppID
 	owner.ChatID = *item.ChatId
 	value, err := json.Marshal(owner)
 	if err != nil {
@@ -108,6 +127,11 @@ func (m *Manager) backfillOwnerChatID(ctx context.Context) error {
 		return types.NewAppError(
 			types.CodeDatabase, "无法持久化飞书 owner 会话", nil)
 	}
-	m.setOwnerWithChat(owner.OpenID, owner.Name, owner.ChatID)
+	m.setOwnerWithChat(
+		owner.OpenID,
+		owner.Name,
+		owner.AppIdentity,
+		owner.ChatID,
+	)
 	return nil
 }

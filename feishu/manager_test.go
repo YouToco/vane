@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -372,7 +374,7 @@ func TestManagerReloadDisabledRevokesOutboundClient(t *testing.T) {
 	}
 }
 
-func TestCaptureOwnerBackfillsChatIDWithoutChangingOwner(t *testing.T) {
+func TestCaptureOwnerBindsP2PChatToCurrentApp(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		t.Skip("DATABASE_URL 未设置，跳过 owner chat 真库测试")
@@ -415,10 +417,20 @@ func TestCaptureOwnerBackfillsChatIDWithoutChangingOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := NewManager(st, nil, nil)
+	m.mu.Lock()
+	m.apiClient = lark.NewClient("test-app", "test-secret")
+	m.apiAppID = "test-app"
+	m.mu.Unlock()
 	m.setOwner("ou_owner", "owner")
-	h := &handler{m: m}
+	h := newHandlerForApp(m, context.Background(), "test-app")
 
-	h.captureOwnerIfFirst(ctx, "ou_owner", "owner", "oc_owner_chat")
+	h.captureOwnerIfFirst(
+		ctx, "ou_owner", "owner", "oc_group", "group", "test-app")
+	if got := m.OwnerChatID(); got != "" {
+		t.Fatalf("group message captured owner P2P chat id: %q", got)
+	}
+	h.captureOwnerIfFirst(
+		ctx, "ou_owner", "owner", "oc_owner_chat", "p2p", "test-app")
 	if got := m.OwnerChatID(); got != "oc_owner_chat" {
 		t.Fatalf("owner chat id = %q, want oc_owner_chat", got)
 	}
@@ -430,12 +442,140 @@ func TestCaptureOwnerBackfillsChatIDWithoutChangingOwner(t *testing.T) {
 	if err := json.Unmarshal(raw, &persisted); err != nil {
 		t.Fatal(err)
 	}
-	if persisted.OpenID != "ou_owner" || persisted.ChatID != "oc_owner_chat" {
+	if persisted.OpenID != "ou_owner" ||
+		persisted.AppIdentity != "test-app" ||
+		persisted.ChatID != "oc_owner_chat" {
 		t.Fatalf("persisted owner = %+v", persisted)
 	}
 
-	h.captureOwnerIfFirst(ctx, "ou_other", "other", "oc_other_chat")
+	h.captureOwnerIfFirst(
+		ctx, "ou_owner", "owner", "oc_group_2", "group", "test-app")
+	if got := m.OwnerChatID(); got != "oc_owner_chat" {
+		t.Fatalf("group message overwrote owner P2P chat id: %q", got)
+	}
+	h.captureOwnerIfFirst(
+		ctx, "ou_other", "other", "oc_other_chat", "p2p", "test-app")
 	if got := m.OwnerChatID(); got != "oc_owner_chat" {
 		t.Fatalf("non-owner overwrote owner chat id: %q", got)
+	}
+
+	restarted := NewManager(st, nil, nil)
+	restarted.mu.Lock()
+	restarted.apiClient = lark.NewClient("test-app", "rotated-secret")
+	restarted.apiAppID = "test-app"
+	restarted.mu.Unlock()
+	restarted.loadOwner(ctx)
+	if got := restarted.OwnerChatID(); got != "oc_owner_chat" {
+		t.Fatalf("same-App secret rotation lost owner chat id: %q", got)
+	}
+
+	retiredHandler := newHandlerForApp(
+		restarted, context.Background(), "test-app")
+	restarted.mu.Lock()
+	restarted.apiClient = lark.NewClient("new-app", "new-secret")
+	restarted.apiAppID = "new-app"
+	restarted.mu.Unlock()
+	if got := restarted.OwnerChatID(); got != "" {
+		t.Fatalf("cross-App reconfigure exposed old owner chat id: %q", got)
+	}
+	// An event from the retired App generation cannot restore its chat.
+	retiredHandler.captureOwnerIfFirst(
+		ctx, "ou_owner", "owner", "oc_retired", "p2p", "test-app")
+	if got := restarted.OwnerChatID(); got != "" {
+		t.Fatalf("retired App handler restored old owner chat id: %q", got)
+	}
+	newHandler := newHandlerForApp(restarted, context.Background(), "new-app")
+	newHandler.captureOwnerIfFirst(
+		ctx, "ou_owner", "owner", "oc_new_group", "group", "new-app")
+	if got := restarted.OwnerChatID(); got != "" {
+		t.Fatalf("new App group message captured P2P chat id: %q", got)
+	}
+	newHandler.captureOwnerIfFirst(
+		ctx, "ou_owner", "owner", "oc_new_p2p", "p2p", "new-app")
+	if got := restarted.OwnerChatID(); got != "oc_new_p2p" {
+		t.Fatalf("new App P2P message did not rebind owner chat id: %q", got)
+	}
+}
+
+func TestCaptureOwnerConcurrentGroupAndP2PConvergesToP2P(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("DATABASE_URL 未设置，跳过 owner chat 并发真库测试")
+	}
+	ctx := t.Context()
+	if err := store.Migrate(ctx, dbURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.New(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, st)
+	old, oldErr := st.GetSetting(ctx, settingKeyOwner)
+	if oldErr != nil && !errors.Is(oldErr, types.ErrNotFound) {
+		t.Fatal(oldErr)
+	}
+	cleanupCtx, cancelCleanup := cleanupContext()
+	t.Cleanup(cancelCleanup)
+	t.Cleanup(func() {
+		if oldErr == nil {
+			cleanupExec(cleanupCtx, t, dbURL, `
+				INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now())
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+				settingKeyOwner, old)
+			return
+		}
+		cleanupExec(cleanupCtx, t, dbURL,
+			`DELETE FROM settings WHERE key = $1`, settingKeyOwner)
+	})
+	if err := st.PutSetting(ctx, settingKeyOwner, json.RawMessage(
+		`{"open_id":"ou_owner","name":"owner","captured_at":"2026-07-24T00:00:00Z"}`,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewManager(st, nil, nil)
+	m.mu.Lock()
+	m.apiClient = lark.NewClient("test-app", "test-secret")
+	m.apiAppID = "test-app"
+	m.mu.Unlock()
+	m.setOwner("ou_owner", "owner")
+	h := newHandlerForApp(m, context.Background(), "test-app")
+
+	var wg sync.WaitGroup
+	for i := range 32 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			h.captureOwnerIfFirst(
+				ctx, "ou_owner", "owner", "oc_group", "group", "test-app")
+		}()
+		go func(index int) {
+			defer wg.Done()
+			h.captureOwnerIfFirst(
+				ctx,
+				"ou_owner",
+				"owner",
+				fmt.Sprintf("oc_p2p_%d", index),
+				"p2p",
+				"test-app",
+			)
+		}(i)
+	}
+	wg.Wait()
+	if got := m.OwnerChatID(); !strings.HasPrefix(got, "oc_p2p_") {
+		t.Fatalf("concurrent capture did not converge to P2P chat: %q", got)
+	}
+	raw, err := st.GetSetting(ctx, settingKeyOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted ownerSetting
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.AppIdentity != "test-app" ||
+		!strings.HasPrefix(persisted.ChatID, "oc_p2p_") {
+		t.Fatalf("persisted owner = %+v, want current App P2P chat", persisted)
 	}
 }

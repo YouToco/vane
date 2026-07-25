@@ -114,13 +114,27 @@ Feishu exposes no get-by-UUID API, and a message-list miss does not prove that a
 send did not happen.
 
 For positive Feishu reconciliation, the effect must also freeze the owner P2P
-chat ID and embed its non-sensitive effect ID into the exact card JSON. The
-resolver may list that exact chat and adopt a message only when one interactive
-message from the expected application contains the exact effect ID and frozen
-card content. Zero matches remain ambiguous; multiple matches are an invariant
-violation and become blocked. The required chat ID must be durably captured
-from an inbound message/event or a successful Create receipt rather than
-re-derived from mutable owner state.
+chat ID, the non-secret App identity that owns that chat, and embed its
+non-sensitive effect ID into the exact card JSON. An owner chat may be captured
+only from a `p2p` event; a group event may identify the owner but cannot supply
+the push conversation. Secret rotation for the same App preserves the binding,
+while switching Apps invalidates the old chat until positive evidence from the
+new App replaces it.
+
+The durable Create boundary atomically validates the frozen expected App
+against the exact selected client generation and returns that actual App
+identity with every observation. A reconfiguration racing an in-flight request
+therefore cannot relabel the result. Transport failures, missing success
+receipts, unknown business failures, and decoded JSON 5xx responses are
+ambiguous; only explicit no-side-effect HTTP/provider rejections are definite
+not-sent.
+
+The resolver may list that exact chat and adopt a message only when one
+interactive message from the expected application contains the exact effect ID
+and frozen card content. Zero matches remain ambiguous; multiple matches are an
+invariant violation and become blocked. The required chat ID must be durably
+captured from an inbound message/event or a successful Create receipt rather
+than re-derived from mutable owner state.
 
 ## 6. Atomic projection settlement
 
