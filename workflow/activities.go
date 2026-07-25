@@ -232,6 +232,11 @@ type CompiledRunStore interface {
 	AdvanceProfileCursorForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, time.Time, int64) error
 	CreatePushBatchForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string) (int64, error)
 	CreateOrRecoverPushBatchForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string) (int64, bool, error)
+	ClaimPushBatchDeliveryAuthority(
+		context.Context,
+		types.PushBatchScope,
+		types.PushBatchDeliveryAuthority,
+	) (types.PushBatchDeliveryAuthority, error)
 	RecordEmptyPushBatchForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, types.BatchExitGate, types.PipelineCounts) (int64, bool, error)
 	InsertDeliveryForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, *types.Delivery) (int64, bool, bool, error)
 	UpdatePushBatchStatusForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, int64, types.BatchStatus) error
@@ -2635,6 +2640,27 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	}
 	if err != nil {
 		return err
+	}
+	if compiled {
+		winner, claimErr := a.compiledStore.ClaimPushBatchDeliveryAuthority(
+			ctx,
+			types.PushBatchScope{
+				TenantID: compiledIdentity.TenantID,
+				UserID:   compiledIdentity.UserID,
+				BatchID:  batchID,
+			},
+			types.PushBatchDeliveryAuthorityLegacy,
+		)
+		if claimErr != nil {
+			return retryableOrNot(claimErr)
+		}
+		if winner != types.PushBatchDeliveryAuthorityLegacy {
+			return nonRetryable(types.NewAppError(
+				types.CodeConflict,
+				"push batch delivery authority is not legacy",
+				nil,
+			))
+		}
 	}
 	if recoveryOnly {
 		// A previous attempt durably recorded every delivery as sent but exited

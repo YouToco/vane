@@ -24,6 +24,14 @@ type pushEffectFixture struct {
 }
 
 func newPushEffectFixture(t *testing.T) pushEffectFixture {
+	return newPushEffectFixtureAt(t, 47)
+}
+
+func newPushEffectFixtureBeforeAuthority(t *testing.T) pushEffectFixture {
+	return newPushEffectFixtureAt(t, 39)
+}
+
+func newPushEffectFixtureAt(t *testing.T, version int64) pushEffectFixture {
 	t.Helper()
 	dbURL, db, provider := migration039Scratch(t)
 	ctx := t.Context()
@@ -85,12 +93,17 @@ func newPushEffectFixture(t *testing.T) pushEffectFixture {
 			t.Fatal(err)
 		}
 	}
+	if version > 39 {
+		if _, err := provider.UpTo(ctx, version); err != nil {
+			t.Fatal(err)
+		}
+	}
 	st, err := New(ctx, dbURL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	return pushEffectFixture{
+	f := pushEffectFixture{
 		store: st, db: db, provider: provider,
 		prepared: pusheffect.Prepared{
 			ID: "effect-" + uuid.NewString(), TenantID: 1, UserID: userID,
@@ -105,13 +118,29 @@ func newPushEffectFixture(t *testing.T) pushEffectFixture {
 				Truncate(time.Microsecond).Add(time.Hour),
 		},
 	}
+	if version >= 47 {
+		winner, err := st.ClaimPushBatchDeliveryAuthority(
+			ctx,
+			types.PushBatchScope{
+				TenantID: f.prepared.TenantID,
+				UserID:   f.prepared.UserID,
+				BatchID:  f.prepared.BatchID,
+			},
+			types.PushBatchDeliveryAuthorityEffect,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if winner != types.PushBatchDeliveryAuthorityEffect {
+			t.Fatalf("push effect fixture authority=%q", winner)
+		}
+	}
+	return f
 }
 
 func TestMigration039RefusesDurablePushEffectDowngrade(t *testing.T) {
-	f := newPushEffectFixture(t)
-	if _, err := f.store.CreatePushEffect(t.Context(), f.prepared); err != nil {
-		t.Fatal(err)
-	}
+	f := newPushEffectFixtureBeforeAuthority(t)
+	insertRawPushEffectV39(t, f)
 	if _, err := f.provider.Down(t.Context()); err == nil ||
 		!strings.Contains(err.Error(), "refusing downgrade") {
 		t.Fatalf("039 downgrade accepted durable effect: %v", err)
@@ -131,7 +160,7 @@ func TestMigration039RefusesDurablePushEffectDowngrade(t *testing.T) {
 }
 
 func TestMigration039DownSerializesConcurrentPushEffectInsert(t *testing.T) {
-	f := newPushEffectFixture(t)
+	f := newPushEffectFixtureBeforeAuthority(t)
 	canonical, err := pusheffect.Canonicalize(f.prepared)
 	if err != nil {
 		t.Fatal(err)
@@ -187,6 +216,35 @@ func TestMigration039DownSerializesConcurrentPushEffectInsert(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("039 Down did not converge")
+	}
+}
+
+func insertRawPushEffectV39(t *testing.T, f pushEffectFixture) {
+	t.Helper()
+	canonical, err := pusheffect.Canonicalize(f.prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ExecContext(t.Context(), `
+		INSERT INTO push_effects (
+			id,tenant_id,user_id,task_id,run_snapshot_id,run_id,step_id,
+			chunk_index,chunk_count,batch_id,delivery_ids,provider,app_identity,
+			provider_chat_id,target,card_payload,card_digest,provider_uuid,
+			idempotency_expires_at,schema_version,canonical_payload,payload_digest
+		) VALUES (
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+			$17,$18::uuid,$19,$20,$21,$22
+		)`,
+		f.prepared.ID, f.prepared.TenantID, f.prepared.UserID,
+		f.prepared.TaskID, f.prepared.RunSnapshotID, f.prepared.RunID,
+		f.prepared.StepID, f.prepared.ChunkIndex, f.prepared.ChunkCount,
+		f.prepared.BatchID, f.prepared.DeliveryIDs, f.prepared.Provider,
+		f.prepared.AppIdentity, f.prepared.ProviderChatID, f.prepared.Target,
+		f.prepared.Card, canonical.CardDigest(), f.prepared.ProviderUUID,
+		f.prepared.IdempotencyExpiresAt, pusheffect.SchemaVersion,
+		canonical.Payload(), canonical.Digest(),
+	); err != nil {
+		t.Fatal(err)
 	}
 }
 

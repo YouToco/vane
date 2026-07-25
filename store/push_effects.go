@@ -72,17 +72,25 @@ func (s *Store) CreatePushEffect(
 	}
 	tx, err := s.beginPushEffectCoordinatorTx(ctx, prepared.TenantID)
 	if err != nil {
+		if errors.Is(err, types.ErrNotFound) {
+			return nil, pushEffectConflict("push effect tenant is unavailable")
+		}
 		return nil, pushEffectDatabaseError("begin create transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
 
-	tenantExists, err := lockTenantAdmissionRoot(ctx, tx, prepared.TenantID)
-	if err != nil {
-		return nil, pushEffectDatabaseError(
-			"lock push effect tenant admission root", err)
-	}
-	if !tenantExists {
-		return nil, pushEffectConflict("push effect tenant is unavailable")
+	if _, err := lockPushEffectBatchAdmission(
+		ctx,
+		tx,
+		types.PushBatchScope{
+			TenantID: prepared.TenantID,
+			UserID:   prepared.UserID,
+			BatchID:  prepared.BatchID,
+		},
+		prepared.RunSnapshotID,
+		types.PushBatchDeliveryAuthorityEffect,
+	); err != nil {
+		return nil, err
 	}
 
 	existing, err := loadPushEffectForUpdate(ctx, tx, prepared.Scope())
@@ -309,6 +317,9 @@ func (s *Store) ClaimPushEffect(
 		return nil, pushEffectDatabaseError("begin claim transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(ctx, tx, params.Scope); err != nil {
+		return nil, err
+	}
 	effect, databaseNow, err := loadPushEffectWithClock(ctx, tx, params.Scope)
 	if err != nil {
 		return nil, err
@@ -379,6 +390,9 @@ func (s *Store) ClaimPushEffectReconciliation(
 			"begin reconciliation claim transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(ctx, tx, params.Scope); err != nil {
+		return nil, err
+	}
 	effect, databaseNow, err := loadPushEffectWithClock(ctx, tx, params.Scope)
 	if err != nil {
 		return nil, err
@@ -450,6 +464,9 @@ func (s *Store) TakeOverStalePushEffect(
 		return nil, pushEffectDatabaseError("begin takeover transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(ctx, tx, scope); err != nil {
+		return nil, err
+	}
 	effect, databaseNow, err := loadPushEffectWithClock(ctx, tx, scope)
 	if err != nil {
 		return nil, err
@@ -524,6 +541,9 @@ func (s *Store) recordPushEffectFailure(
 		return pushEffectDatabaseError("begin failure transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(ctx, tx, params.Scope); err != nil {
+		return err
+	}
 	effect, databaseNow, err := loadPushEffectWithClock(ctx, tx, params.Scope)
 	if err != nil {
 		return err
@@ -590,6 +610,9 @@ func (s *Store) RecordPushEffectSent(
 		return pushEffectDatabaseError("begin sent receipt transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(ctx, tx, receipt.Scope); err != nil {
+		return err
+	}
 	var (
 		status                        pusheffect.Status
 		leaseOwner, providerMessageID string
@@ -659,6 +682,9 @@ func (s *Store) BlockPushEffect(
 		return pushEffectDatabaseError("begin block transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(ctx, tx, resolution.Scope); err != nil {
+		return err
+	}
 	var status pusheffect.Status
 	var fence int64
 	var class string
@@ -753,6 +779,38 @@ func verifyPushEffectAggregate(
 		return pushEffectConflict("push effect aggregate provenance differs")
 	}
 	return nil
+}
+
+func lockPushEffectBatchForScope(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope pusheffect.Scope,
+) error {
+	var batchID, snapshotID int64
+	err := tx.QueryRow(ctx, `
+		SELECT batch_id,run_snapshot_id
+		  FROM push_effects
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		scope.ID, scope.TenantID, scope.UserID,
+	).Scan(&batchID, &snapshotID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pushEffectNotFound()
+	}
+	if err != nil {
+		return pushEffectDatabaseError("inspect push effect batch admission", err)
+	}
+	_, err = lockPushEffectBatchAdmission(
+		ctx,
+		tx,
+		types.PushBatchScope{
+			TenantID: scope.TenantID,
+			UserID:   scope.UserID,
+			BatchID:  batchID,
+		},
+		snapshotID,
+		types.PushBatchDeliveryAuthorityEffect,
+	)
+	return err
 }
 
 func loadPushEffect(
@@ -989,6 +1047,9 @@ func pushEffectIntegrity() error {
 }
 
 func pushEffectDatabaseError(action string, cause error) error {
+	if errors.Is(cause, types.ErrNotFound) {
+		return pushEffectNotFound()
+	}
 	var safeCause error
 	switch {
 	case cause == nil:

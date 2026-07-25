@@ -149,10 +149,72 @@ jobs:
           port: ${{ secrets.VPS_PORT }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          command_timeout: 20m
           script: |
+            set -euo pipefail
             chmod +x /opt/vane/bin/vane /opt/vane/bin/useradmin /opt/vane/bin/gate /opt/vane/bin/runtimeadmin
             test -x /opt/vane/bin/runtimeadmin
-            systemctl restart vane
+
+            # Migration 047 installs the cross-version writer fence. The old worker must
+            # therefore finish its own graceful shutdown before the new binary is allowed
+            # to start and migrate. A missing proof is a hard failure: because `start` is
+            # below every assertion, the unit stays stopped for operator inspection.
+            if systemctl is-active --quiet vane; then
+              old_invocation=$(systemctl show vane --property=InvocationID --value)
+              drain_started_at=$(date --iso-8601=seconds)
+              test -n "$old_invocation"
+              echo "draining old vane invocation=$old_invocation started_at=$drain_started_at"
+
+              systemctl stop vane
+
+              stopped_state=$(systemctl is-active vane || true)
+              if [ "$stopped_state" != "inactive" ]; then
+                echo "old vane invocation did not become inactive (state=$stopped_state)" >&2
+                exit 1
+              fi
+
+              old_invocation_log=$(journalctl "_SYSTEMD_INVOCATION_ID=$old_invocation" --no-pager -o cat)
+              if ! grep -Fq "关停完成" <<<"$old_invocation_log"; then
+                echo "old vane invocation has no application graceful-shutdown proof" >&2
+                exit 1
+              fi
+
+              stop_log=$(journalctl -u vane --since "$drain_started_at" --no-pager -o cat)
+              if grep -Eiq \
+                "(stop-sigterm.*timed out|timed out.*killing|signal SIGKILL|status=9/KILL|code=killed.*KILL)" \
+                <<<"$old_invocation_log"$'\n'"$stop_log"; then
+                echo "old vane invocation hit a stop timeout or SIGKILL" >&2
+                exit 1
+              fi
+            else
+              # First installation (or an intentionally pre-stopped unit) has no old
+              # invocation to prove. It must still be inactive and process-free.
+              stopped_state=$(systemctl is-active vane || true)
+              if [ "$stopped_state" != "inactive" ]; then
+                echo "vane has no active invocation but is not inactive (state=$stopped_state)" >&2
+                exit 1
+              fi
+              echo "no active vane invocation; skipping old-journal drain proof"
+            fi
+
+            leftover_pids=""
+            for process_exe in /proc/[0-9]*/exe; do
+              executable=$(readlink "$process_exe" 2>/dev/null || true)
+              case "$executable" in
+                "/opt/vane/bin/vane"|"/opt/vane/bin/vane (deleted)")
+                  pid=${process_exe#/proc/}
+                  pid=${pid%/exe}
+                  leftover_pids="$leftover_pids $pid"
+                  ;;
+              esac
+            done
+            if [ -n "$leftover_pids" ]; then
+              echo "old /opt/vane/bin/vane processes remain:$leftover_pids" >&2
+              exit 1
+            fi
+
+            echo "old vane worker drain verified; starting roll-forward binary"
+            systemctl start vane
             # Type=simple 下 restart 立即返回，必须主动验证：
             # 迁移失败/配置缺失会崩溃重启循环，没有这步 CI 会假绿。
             sleep 5

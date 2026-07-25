@@ -268,6 +268,21 @@ func TestCompiledRunWrites_ExactTenantRevocationAndDurableReceipt(t *testing.T) 
 	if err != nil {
 		t.Fatalf("create delivery-free receipt batch: %v", err)
 	}
+	for _, batchID := range []int64{batchA, mixedBatch, emptyReceiptBatch} {
+		winner, claimErr := f.base.st.ClaimPushBatchDeliveryAuthority(
+			ctx,
+			types.PushBatchScope{
+				TenantID: f.idA.TenantID,
+				UserID:   f.idA.UserID,
+				BatchID:  batchID,
+			},
+			types.PushBatchDeliveryAuthorityLegacy,
+		)
+		if claimErr != nil || winner != types.PushBatchDeliveryAuthorityLegacy {
+			t.Fatalf("claim batch %d legacy authority = %q err=%v",
+				batchID, winner, claimErr)
+		}
+	}
 
 	if _, err := f.base.st.pool.Exec(ctx,
 		`INSERT INTO profiles
@@ -527,6 +542,16 @@ func TestCompiledRunWrites_SameTraceDifferentRunSnapshotsStayIsolated(t *testing
 		"om-wrong-run", json.RawMessage(`{"wrong":true}`), time.Now().UTC(),
 	); !errors.Is(err, types.ErrNotFound) {
 		t.Fatalf("reset run receipt through original batch error = %v, want not found", err)
+	}
+	var firstAuthority *string
+	if err := f.base.st.pool.QueryRow(ctx,
+		`SELECT delivery_authority FROM push_batches WHERE id=$1`,
+		firstBatch,
+	).Scan(&firstAuthority); err != nil {
+		t.Fatal(err)
+	}
+	if firstAuthority != nil {
+		t.Fatalf("wrong-snapshot receipt claimed authority %q", *firstAuthority)
 	}
 }
 
