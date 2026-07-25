@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/agentledger"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/profilehint"
@@ -166,7 +167,7 @@ const (
 type Store interface {
 	GetActiveAgentSession(ctx context.Context, userID int64, since time.Time) (*types.AgentSession, error)
 	CreateAgentSession(ctx context.Context, userID int64) (*types.AgentSession, error)
-	UpdateAgentSession(ctx context.Context, id int64, messages json.RawMessage, turnCount int, activatedTools json.RawMessage) error
+	CommitAgentSessionTurn(ctx context.Context, projection agentledger.SessionProjection, batch agentledger.AppendBatch) (agentledger.ProjectionShadowAudit, error)
 	AppendAgentSessionMessages(ctx context.Context, sessionID int64, msgs json.RawMessage) error
 	CreatePendingAction(ctx context.Context, a *types.PendingAction) error
 	ClaimPendingAction(ctx context.Context, id string, userID int64) (*types.PendingAction, error)
@@ -481,7 +482,8 @@ func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, ext
 
 	// 同一条消息内的多轮模型调用共享 trace_id，llm_calls/tool_calls 里可按 trace
 	// 回放整个 loop。
-	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{traceID: uuid.NewString(), userID: userID})
+	turnID := uuid.NewString()
+	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{traceID: turnID, userID: userID})
 
 	// 端点注册表契约 §4：激活集随会话持久化，本条消息的工具运行状态经 ctx 旁路
 	// 传给工具 Execute（工具是全局单例，不能携带 per-message 状态）。
@@ -526,7 +528,7 @@ func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, ext
 		}
 	}
 	msgs = l.scrubUntrustedHistory(msgs)
-	l.saveSession(ctx, sess, msgs, turns, state)
+	l.saveSession(ctx, sess, msgs, turns, state, outcome.Confirm, turnID)
 	return outcome, nil
 }
 
@@ -2040,14 +2042,99 @@ func (l *Loop) loadOrCreateSession(ctx context.Context, userID int64) (*types.Ag
 // （端点注册表契约 §4：激活在 TTL 内跨消息有效）。
 // 持久化失败只记日志不上抛：回复已经生成，宁可下一轮丢上下文，
 // 也不把已成功的对话放大成用户可见的失败（与 llm.Recorder 的旁路原则一致）。
-func (l *Loop) saveSession(ctx context.Context, sess *types.AgentSession, msgs []llm.ChatMessage, turns int, state *toolRunState) {
+func (l *Loop) saveSession(
+	ctx context.Context,
+	sess *types.AgentSession,
+	msgs []llm.ChatMessage,
+	turns int,
+	state *toolRunState,
+	confirm *Confirm,
+	turnID string,
+) {
 	raw, err := json.Marshal(msgs)
 	if err != nil {
 		slog.Error("agent: 会话 messages 序列化失败", "session_id", sess.ID, "err", err)
 		return
 	}
-	if err := l.store.UpdateAgentSession(ctx, sess.ID, raw, sess.TurnCount+turns, state.activation.encode()); err != nil {
-		slog.Error("agent: 会话持久化失败", "session_id", sess.ID, "err", err)
+	activatedTools := state.activation.encode()
+	var confirmationAction string
+	if confirm != nil {
+		confirmationAction = confirm.ActionID
+	}
+	projection := agentledger.SessionProjection{
+		Messages:       raw,
+		TurnCount:      sess.TurnCount + turns,
+		ActivatedTools: activatedTools,
+	}
+	baseProjectionDigest, err := agentledger.ProjectionDigest(
+		agentledger.SessionProjection{
+			Messages:       sess.Messages,
+			TurnCount:      sess.TurnCount,
+			ActivatedTools: sess.ActivatedTools,
+		},
+	)
+	if err != nil {
+		slog.Error("agent: 会话原投影摘要失败",
+			"tenant_id", sess.TenantID,
+			"user_id", sess.UserID,
+			"session_id", sess.ID,
+			"err", err)
+		return
+	}
+	batch, err := agentledger.BuildProjectionSnapshotBatch(
+		agentledger.ProjectionSnapshotInput{
+			Scope: agentledger.Scope{
+				TenantID:  sess.TenantID,
+				UserID:    sess.UserID,
+				SessionID: sess.ID,
+			},
+			BaseProjectionDigest: baseProjectionDigest,
+			TurnID:               turnID,
+			Messages:             raw,
+			TurnCount:            projection.TurnCount,
+			ActivatedTools:       activatedTools,
+			ConfirmationAction:   confirmationAction,
+		},
+	)
+	if err != nil {
+		// Projection errors deliberately exclude message/card bodies.
+		slog.Error("agent: 会话事件快照构建失败",
+			"tenant_id", sess.TenantID,
+			"user_id", sess.UserID,
+			"session_id", sess.ID,
+			"err", err)
+		return
+	}
+	audit, err := l.store.CommitAgentSessionTurn(ctx, projection, batch)
+	if err != nil {
+		slog.Error("agent: 会话与事件账本原子持久化失败",
+			"tenant_id", sess.TenantID,
+			"user_id", sess.UserID,
+			"session_id", sess.ID,
+			"err", err)
+		return
+	}
+	if !audit.Match {
+		slog.Error("agent: 会话事件 shadow 投影不一致",
+			"tenant_id", sess.TenantID,
+			"user_id", sess.UserID,
+			"session_id", sess.ID,
+			"reason", audit.Reason,
+			"prior_state", audit.PriorState,
+			"legacy_message_count", audit.LegacyMessageCount,
+			"event_message_count", audit.EventMessageCount)
+		return
+	}
+	if audit.PriorState != "match" && audit.PriorState != "uninitialized" {
+		// Known 7.7-B boundary: callback and restricted receipt appenders are
+		// not yet transactional ledger writers. A normal turn resynchronizes
+		// the latest full snapshot and attributes the preceding drift.
+		slog.Warn("agent: 会话事件 shadow 已重同步未覆盖写入口",
+			"tenant_id", sess.TenantID,
+			"user_id", sess.UserID,
+			"session_id", sess.ID,
+			"reason", audit.Reason,
+			"prior_state", audit.PriorState)
 	}
 }
 

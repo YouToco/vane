@@ -345,6 +345,7 @@ type SchedulePlaybook struct {
 // （含 tool_calls），延迟解析；system 消息不入库，由 agent loop 调用时动态前置。
 type AgentSession struct {
 	ID        int64              `json:"id"`
+	TenantID  int64              `json:"tenant_id"`
 	UserID    int64              `json:"user_id"`
 	Status    AgentSessionStatus `json:"status"`
 	Messages  json.RawMessage    `json:"messages"` // JSONB，[]llm.ChatMessage 序列化

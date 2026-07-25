@@ -14,12 +14,12 @@ import (
 )
 
 // agentSessionColumns 是 agent_sessions 表全列，SELECT 与 scanAgentSession 一一对应。
-const agentSessionColumns = `id, user_id, status, messages, turn_count, activated_tools, created_at, updated_at`
+const agentSessionColumns = `id, tenant_id, user_id, status, messages, turn_count, activated_tools, created_at, updated_at`
 
 // scanAgentSession 把一行 agent_sessions 扫进 types.AgentSession（复用于单行与 RETURNING）。
 func scanAgentSession(row pgx.Row, as *types.AgentSession) error {
 	return row.Scan(
-		&as.ID, &as.UserID, &as.Status, &as.Messages,
+		&as.ID, &as.TenantID, &as.UserID, &as.Status, &as.Messages,
 		&as.TurnCount, &as.ActivatedTools, &as.CreatedAt, &as.UpdatedAt,
 	)
 }

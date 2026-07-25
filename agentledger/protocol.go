@@ -108,6 +108,7 @@ type Event struct {
 // defensive copies so callers cannot mutate bytes after digest calculation.
 type CanonicalEvent struct {
 	kind    Kind
+	body    []byte
 	payload []byte
 	digest  string
 }
@@ -118,6 +119,12 @@ func (e CanonicalEvent) Kind() Kind {
 
 func (e CanonicalEvent) Payload() []byte {
 	return slices.Clone(e.payload)
+}
+
+// Body returns the canonical kind-specific JSON object. Projectors consume
+// this retained representation instead of reinterpreting the outer envelope.
+func (e CanonicalEvent) Body() []byte {
+	return slices.Clone(e.body)
 }
 
 func (e CanonicalEvent) Digest() string {
@@ -156,6 +163,7 @@ func Canonicalize(input Input) (CanonicalEvent, error) {
 	}
 	return CanonicalEvent{
 		kind:    input.Kind,
+		body:    body,
 		payload: payload,
 		digest:  digest(payload),
 	}, nil

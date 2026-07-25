@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -170,6 +171,379 @@ func TestAgentEventsAppendListReplayAndExactReplay(t *testing.T) {
 	}
 	if len(all) != 2 || all[0].ID != first[0].ID || all[1].ID != first[1].ID {
 		t.Fatalf("ReplayAgentEvents()=%+v", all)
+	}
+}
+
+func TestCommitAgentSessionTurnAtomicProjectionAndShadowResync(t *testing.T) {
+	f := newAgentEventFixture(t)
+	ctx := t.Context()
+	firstProjection := agentledger.SessionProjection{
+		Messages: json.RawMessage(
+			`[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]`,
+		),
+		TurnCount:      1,
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	emptyProjection := agentledger.SessionProjection{
+		Messages:       json.RawMessage(`[]`),
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	firstBatch := projectionSnapshotBatch(
+		t, f.scopeA(), "turn-shadow-1", emptyProjection, firstProjection, "",
+	)
+	firstAudit, err := f.store.CommitAgentSessionTurn(
+		ctx, firstProjection, firstBatch,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !firstAudit.Match || firstAudit.PriorState != "uninitialized" ||
+		firstAudit.Reason != "initialized" {
+		t.Fatalf("first audit=%+v", firstAudit)
+	}
+	assertStoredAgentSessionProjection(t, f, firstProjection)
+
+	callback := json.RawMessage(
+		`[{"role":"user","content":"[卡片回调] resolved"}]`,
+	)
+	if err := f.store.AppendAgentSessionMessages(
+		ctx, f.sessionA, callback,
+	); err != nil {
+		t.Fatal(err)
+	}
+	callbackProjection := agentledger.SessionProjection{
+		Messages: json.RawMessage(`[
+			{"role":"user","content":"hello"},
+			{"role":"assistant","content":"hi"},
+			{"role":"user","content":"[卡片回调] resolved"}
+		]`),
+		TurnCount:      1,
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	secondProjection := agentledger.SessionProjection{
+		Messages: json.RawMessage(`[
+			{"role":"user","content":"hello"},
+			{"role":"assistant","content":"hi"},
+			{"role":"user","content":"[卡片回调] resolved"},
+			{"role":"user","content":"continue"},
+			{"role":"assistant","content":"done"}
+		]`),
+		TurnCount:      2,
+		ActivatedTools: json.RawMessage(`["endpoint_a"]`),
+	}
+	secondBatch := projectionSnapshotBatch(
+		t, f.scopeA(), "turn-shadow-2", callbackProjection, secondProjection, "",
+	)
+	secondAudit, err := f.store.CommitAgentSessionTurn(
+		ctx, secondProjection, secondBatch,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !secondAudit.Match ||
+		secondAudit.PriorState != "unsupported_writer_or_projection_drift" ||
+		secondAudit.Reason !=
+			"resynced_after_unsupported_writer_or_projection_drift" {
+		t.Fatalf("second audit=%+v", secondAudit)
+	}
+	assertStoredAgentSessionProjection(t, f, secondProjection)
+
+	replayed, err := f.store.ReplayAgentEvents(ctx, f.scopeA())
+	if err != nil {
+		t.Fatal(err)
+	}
+	projected, err := agentledger.ProjectLatestSessionSnapshot(replayed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotDigest, err := agentledger.ProjectionDigest(projected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest, err := agentledger.ProjectionDigest(secondProjection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotDigest != wantDigest {
+		t.Fatalf("event projection digest=%s want=%s", gotDigest, wantDigest)
+	}
+}
+
+func TestCommitAgentSessionTurnExactReplayAndConflict(t *testing.T) {
+	f := newAgentEventFixture(t)
+	ctx := t.Context()
+	projection := agentledger.SessionProjection{
+		Messages:       json.RawMessage(`[{"role":"user","content":"hello"}]`),
+		TurnCount:      1,
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	batch := projectionSnapshotBatch(
+		t, f.scopeA(), "turn-exact-replay",
+		agentledger.SessionProjection{
+			Messages:       json.RawMessage(`[]`),
+			ActivatedTools: json.RawMessage(`[]`),
+		},
+		projection, "",
+	)
+	if _, err := f.store.CommitAgentSessionTurn(ctx, projection, batch); err != nil {
+		t.Fatal(err)
+	}
+	replayAudit, err := f.store.CommitAgentSessionTurn(ctx, projection, batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replayAudit.Match {
+		t.Fatalf("replay audit=%+v", replayAudit)
+	}
+
+	changed := batch
+	changed.Events = append([]agentledger.Input(nil), batch.Events...)
+	changed.Events[1] = agentledger.Input{
+		Kind: agentledger.KindUserMessage,
+		Body: json.RawMessage(
+			`{"schema_version":"vane.agent-session-projection/v1",` +
+				`"turn_id":"turn-exact-replay",` +
+				`"message":{"role":"user","content":"changed"}}`,
+		),
+	}
+	if _, err := f.store.CommitAgentSessionTurn(
+		ctx, projection, changed,
+	); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("changed replay error=%v, want CodeConflict", err)
+	}
+}
+
+func TestCommitAgentSessionTurnRejectsStaleBaseProjection(t *testing.T) {
+	f := newAgentEventFixture(t)
+	ctx := t.Context()
+	base := agentledger.SessionProjection{
+		Messages:       json.RawMessage(`[]`),
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	desired := agentledger.SessionProjection{
+		Messages: json.RawMessage(
+			`[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]`,
+		),
+		TurnCount:      1,
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	batch := projectionSnapshotBatch(
+		t, f.scopeA(), "turn-stale-base", base, desired, "",
+	)
+	callback := json.RawMessage(
+		`[{"role":"user","content":"[卡片回调] concurrent"}]`,
+	)
+	if err := f.store.AppendAgentSessionMessages(
+		ctx, f.sessionA, callback,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.CommitAgentSessionTurn(
+		ctx, desired, batch,
+	); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("stale base error=%v, want CodeConflict", err)
+	}
+	var eventCount int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3`,
+		f.tenantA, f.userA, f.sessionA,
+	).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 0 {
+		t.Fatalf("stale commit appended %d events", eventCount)
+	}
+	var messages json.RawMessage
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT messages FROM agent_sessions WHERE id=$1`,
+		f.sessionA,
+	).Scan(&messages); err != nil {
+		t.Fatal(err)
+	}
+	var decoded []json.RawMessage
+	if err := json.Unmarshal(messages, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) != 1 {
+		t.Fatalf("concurrent callback was overwritten: %s", messages)
+	}
+}
+
+func TestCommitAgentSessionTurnConcurrentWritersUseBaseFence(t *testing.T) {
+	f := newAgentEventFixture(t)
+	ctx := t.Context()
+	base := agentledger.SessionProjection{
+		Messages:       json.RawMessage(`[]`),
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	projections := []agentledger.SessionProjection{
+		{
+			Messages:       json.RawMessage(`[{"role":"user","content":"a"}]`),
+			TurnCount:      1,
+			ActivatedTools: json.RawMessage(`[]`),
+		},
+		{
+			Messages:       json.RawMessage(`[{"role":"user","content":"b"}]`),
+			TurnCount:      1,
+			ActivatedTools: json.RawMessage(`[]`),
+		},
+	}
+	batches := []agentledger.AppendBatch{
+		projectionSnapshotBatch(
+			t, f.scopeA(), "turn-concurrent-a", base, projections[0], "",
+		),
+		projectionSnapshotBatch(
+			t, f.scopeA(), "turn-concurrent-b", base, projections[1], "",
+		),
+	}
+	errs := make(chan error, len(batches))
+	var wg sync.WaitGroup
+	for i := range batches {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			_, err := f.store.CommitAgentSessionTurn(
+				ctx, projections[index], batches[index],
+			)
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	successes, conflicts := 0, 0
+	for err := range errs {
+		if err == nil {
+			successes++
+			continue
+		}
+		switch types.CodeOf(err) {
+		case types.CodeConflict:
+			conflicts++
+		default:
+			t.Fatalf("concurrent commit error=%v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("successes=%d conflicts=%d", successes, conflicts)
+	}
+	var batchCount int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(DISTINCT batch_idempotency_key)
+		   FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3`,
+		f.tenantA, f.userA, f.sessionA,
+	).Scan(&batchCount); err != nil {
+		t.Fatal(err)
+	}
+	if batchCount != 1 {
+		t.Fatalf("committed event batches=%d want=1", batchCount)
+	}
+}
+
+func TestCommitAgentSessionTurnRollsBackEventsWhenProjectionUpdateFails(t *testing.T) {
+	f := newAgentEventFixture(t)
+	ctx := t.Context()
+	tooLargeForPostgresInt := int64(1 << 31)
+	if int64(int(tooLargeForPostgresInt)) != tooLargeForPostgresInt {
+		t.Skip("requires an int wider than PostgreSQL int4")
+	}
+	projection := agentledger.SessionProjection{
+		Messages:       json.RawMessage(`[{"role":"user","content":"hello"}]`),
+		TurnCount:      int(tooLargeForPostgresInt),
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	batch := projectionSnapshotBatch(
+		t, f.scopeA(), "turn-rollback",
+		agentledger.SessionProjection{
+			Messages:       json.RawMessage(`[]`),
+			ActivatedTools: json.RawMessage(`[]`),
+		},
+		projection, "",
+	)
+	if _, err := f.store.CommitAgentSessionTurn(
+		ctx, projection, batch,
+	); err == nil {
+		t.Fatal("out-of-range projection update unexpectedly succeeded")
+	}
+	var eventCount int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3`,
+		f.tenantA, f.userA, f.sessionA,
+	).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 0 {
+		t.Fatalf("rolled-back transaction left %d events", eventCount)
+	}
+	var turnCount int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT turn_count FROM agent_sessions WHERE id=$1`,
+		f.sessionA,
+	).Scan(&turnCount); err != nil {
+		t.Fatal(err)
+	}
+	if turnCount != 0 {
+		t.Fatalf("rolled-back transaction changed turn_count to %d", turnCount)
+	}
+}
+
+func projectionSnapshotBatch(
+	t *testing.T,
+	scope agentledger.Scope,
+	turnID string,
+	base agentledger.SessionProjection,
+	projection agentledger.SessionProjection,
+	confirmationAction string,
+) agentledger.AppendBatch {
+	t.Helper()
+	baseDigest, err := agentledger.ProjectionDigest(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := agentledger.BuildProjectionSnapshotBatch(
+		agentledger.ProjectionSnapshotInput{
+			Scope:                scope,
+			TurnID:               turnID,
+			BaseProjectionDigest: baseDigest,
+			Messages:             projection.Messages,
+			TurnCount:            projection.TurnCount,
+			ActivatedTools:       projection.ActivatedTools,
+			ConfirmationAction:   confirmationAction,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return batch
+}
+
+func assertStoredAgentSessionProjection(
+	t *testing.T,
+	f agentEventFixture,
+	want agentledger.SessionProjection,
+) {
+	t.Helper()
+	var got agentledger.SessionProjection
+	if err := f.store.pool.QueryRow(t.Context(),
+		`SELECT messages, turn_count, activated_tools
+		   FROM agent_sessions
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		f.sessionA, f.tenantA, f.userA,
+	).Scan(&got.Messages, &got.TurnCount, &got.ActivatedTools); err != nil {
+		t.Fatal(err)
+	}
+	gotDigest, err := agentledger.ProjectionDigest(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest, err := agentledger.ProjectionDigest(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotDigest != wantDigest {
+		t.Fatalf("stored projection digest=%s want=%s", gotDigest, wantDigest)
 	}
 }
 
@@ -628,7 +1002,7 @@ func TestAgentEventsRLSAndAppendOnlyRole(t *testing.T) {
 	}
 }
 
-func TestAgentEventLedgerHasZeroProductionCallPoints(t *testing.T) {
+func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 	t.Parallel()
 	_, testFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -637,6 +1011,7 @@ func TestAgentEventLedgerHasZeroProductionCallPoints(t *testing.T) {
 	storeDir := filepath.Clean(filepath.Dir(testFile))
 	repoRoot := filepath.Clean(filepath.Dir(storeDir))
 	provider := filepath.Join(storeDir, "agent_events.go")
+	agentLoop := filepath.Join(repoRoot, "agent", "loop.go")
 	fset := token.NewFileSet()
 	var violations []string
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, walkErr error) error {
@@ -665,18 +1040,35 @@ func TestAgentEventLedgerHasZeroProductionCallPoints(t *testing.T) {
 			if err != nil {
 				return err
 			}
+		} else if filepath.Clean(path) == agentLoop {
+			allowed, err = agentEventLedgerAgentLoopReferences(file)
+			if err != nil {
+				return err
+			}
 		}
 		violations = append(
 			violations,
 			agentEventLedgerForbiddenReferences(fset, file, allowed)...,
 		)
+		for _, imported := range file.Imports {
+			if strings.Trim(imported.Path.Value, `"`) !=
+				"github.com/YouToco/vane/agentledger" {
+				continue
+			}
+			clean := filepath.Clean(path)
+			if clean != provider && clean != agentLoop {
+				violations = append(violations,
+					fmt.Sprintf("%s: forbidden Agent event ledger import",
+						fset.Position(imported.Pos())))
+			}
+		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(violations) != 0 {
-		t.Fatalf("7.7-A must keep zero production call points:\n%s",
+		t.Fatalf("7.7-B permits only normal Agent turn dual-write:\n%s",
 			strings.Join(violations, "\n"))
 	}
 }
@@ -691,13 +1083,16 @@ func renamedWrapper(s interface{ ReplayAgentEvents() }) {
 	call()
 }
 func sameNameWrapper() { AppendAgentEvents() }
+func escapedCommit(s interface{ CommitAgentSessionTurn() }) {
+	s.CommitAgentSessionTurn()
+}
 var byName = "ListAgentEvents"
 `, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	violations := agentEventLedgerForbiddenReferences(fset, file, nil)
-	if len(violations) < 4 {
+	if len(violations) < 6 {
 		t.Fatalf("method value/interface/wrapper escaped guard: %v", violations)
 	}
 }
@@ -710,6 +1105,7 @@ type Store struct{}
 func (s *Store) AppendAgentEvents() {}
 func (s *Store) ListAgentEvents() {}
 func (s *Store) ReplayAgentEvents() {}
+func (s *Store) CommitAgentSessionTurn() {}
 func (s *Store) hiddenAppendWrapper() {
 	s.AppendAgentEvents()
 }
@@ -735,9 +1131,10 @@ func agentEventLedgerForbiddenReferences(
 	allowed map[token.Pos]struct{},
 ) []string {
 	sensitive := map[string]struct{}{
-		"AppendAgentEvents": {},
-		"ListAgentEvents":   {},
-		"ReplayAgentEvents": {},
+		"AppendAgentEvents":      {},
+		"ListAgentEvents":        {},
+		"ReplayAgentEvents":      {},
+		"CommitAgentSessionTurn": {},
 	}
 	var violations []string
 	ast.Inspect(file, func(node ast.Node) bool {
@@ -768,9 +1165,10 @@ func agentEventLedgerProviderDeclarations(
 	file *ast.File,
 ) (map[token.Pos]struct{}, error) {
 	want := map[string]int{
-		"AppendAgentEvents": 0,
-		"ListAgentEvents":   0,
-		"ReplayAgentEvents": 0,
+		"AppendAgentEvents":      0,
+		"ListAgentEvents":        0,
+		"ReplayAgentEvents":      0,
+		"CommitAgentSessionTurn": 0,
 	}
 	allowed := make(map[token.Pos]struct{}, len(want))
 	for _, declaration := range file.Decls {
@@ -798,6 +1196,29 @@ func agentEventLedgerProviderDeclarations(
 				name, count,
 			)
 		}
+	}
+	return allowed, nil
+}
+
+func agentEventLedgerAgentLoopReferences(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	const name = "CommitAgentSessionTurn"
+	allowed := make(map[token.Pos]struct{}, 2)
+	ast.Inspect(file, func(node ast.Node) bool {
+		identifier, ok := node.(*ast.Ident)
+		if ok && identifier.Name == name {
+			allowed[identifier.Pos()] = struct{}{}
+		}
+		return true
+	})
+	// One narrow Store interface declaration and one saveSession call. Any
+	// wrapper, method value, Push/Runtime bridge, or second call point fails.
+	if len(allowed) != 2 {
+		return nil, fmt.Errorf(
+			"Agent loop must reference %s exactly twice, got %d",
+			name, len(allowed),
+		)
 	}
 	return allowed, nil
 }
