@@ -925,12 +925,14 @@ func (s *Store) RecordPushEffectSentWithDeliveries(
 		leaseOwner, providerMessageID string
 		fence, batchID                int64
 		deliveryIDs                   []int64
-		cardPayload                   []byte
+		cardPayload, canonicalPayload []byte
+		payloadDigest                 string
 		sentAt                        *time.Time
 	)
 	err = tx.QueryRow(ctx, `
 		SELECT status, lease_owner, fence, provider_message_id, sent_at,
-		       batch_id, delivery_ids, card_payload
+		       batch_id, delivery_ids, card_payload,
+		       canonical_payload, payload_digest
 		  FROM push_effects
 		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		 FOR UPDATE`,
@@ -938,6 +940,7 @@ func (s *Store) RecordPushEffectSentWithDeliveries(
 	).Scan(
 		&status, &leaseOwner, &fence, &providerMessageID, &sentAt,
 		&batchID, &deliveryIDs, &cardPayload,
+		&canonicalPayload, &payloadDigest,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pushEffectNotFound()
@@ -948,6 +951,26 @@ func (s *Store) RecordPushEffectSentWithDeliveries(
 	if len(deliveryIDs) == 0 || len(cardPayload) == 0 {
 		return pushEffectConflict("sent delivery receipt checkpoint is incomplete")
 	}
+	canonical, err := pusheffect.Decode(canonicalPayload, payloadDigest)
+	if err != nil {
+		return pushEffectIntegrity()
+	}
+	prepared := canonical.Prepared()
+	if prepared.ID != receipt.ID ||
+		prepared.TenantID != receipt.TenantID ||
+		prepared.UserID != receipt.UserID ||
+		prepared.BatchID != batchID ||
+		!slices.Equal(prepared.DeliveryIDs, deliveryIDs) ||
+		!bytes.Equal(prepared.Card, cardPayload) {
+		return pushEffectIntegrity()
+	}
+	if len(receipt.ObservationEventKeys) > 0 &&
+		!slices.Equal(
+			receipt.ObservationEventKeys,
+			prepared.ObservationEventKeys,
+		) {
+		return pushEffectConflict("sent observation receipt differs")
+	}
 
 	deliveriesMatch, err := lockAndValidatePushEffectDeliveries(
 		ctx, tx, receipt, batchID, deliveryIDs, cardPayload,
@@ -955,11 +978,21 @@ func (s *Store) RecordPushEffectSentWithDeliveries(
 	if err != nil {
 		return err
 	}
+	if err := lockAndValidatePushEffectObservedEvents(
+		ctx, tx, prepared,
+	); err != nil {
+		return err
+	}
 	if status == pusheffect.StatusSent {
 		if fence != receipt.ExpectedFence ||
 			providerMessageID != receipt.ProviderMessageID ||
 			sentAt == nil || !deliveriesMatch {
 			return pushEffectConflict("sent delivery receipt differs")
+		}
+		if err := markPushEffectObservedEventsDelivered(
+			ctx, tx, prepared,
+		); err != nil {
+			return err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return pushEffectDatabaseError(
@@ -995,6 +1028,11 @@ func (s *Store) RecordPushEffectSentWithDeliveries(
 	}
 	if tag.RowsAffected() != int64(len(deliveryIDs)) {
 		return pushEffectConflict("delivery receipt aggregate differs")
+	}
+	if err := markPushEffectObservedEventsDelivered(
+		ctx, tx, prepared,
+	); err != nil {
+		return err
 	}
 
 	tag, err = tx.Exec(ctx, `
@@ -1080,6 +1118,141 @@ func lockAndValidatePushEffectDeliveries(
 		return false, pushEffectConflict("delivery receipt aggregate is incomplete")
 	}
 	return allSentAndMatching, nil
+}
+
+func lockAndValidatePushEffectObservedEvents(
+	ctx context.Context,
+	tx pgx.Tx,
+	prepared pusheffect.Prepared,
+) error {
+	rows, err := tx.Query(ctx, `
+		SELECT tenant_id,user_id,task_id,run_snapshot_id,temporal_run_id,
+		       delivery_id,event_key,status,delivered_at
+		  FROM task_observed_events
+		 WHERE tenant_id=$1 AND user_id=$2
+		   AND delivery_id=ANY($3::bigint[])
+		 ORDER BY delivery_id,event_key
+		 FOR UPDATE`,
+		prepared.TenantID,
+		prepared.UserID,
+		prepared.DeliveryIDs,
+	)
+	if err != nil {
+		return pushEffectDatabaseError(
+			"lock observed event receipt aggregate",
+			err,
+		)
+	}
+	defer rows.Close()
+
+	expected := make(map[int64]string, len(prepared.ObservationEventKeys))
+	for i, eventKey := range prepared.ObservationEventKeys {
+		if eventKey != "" {
+			expected[prepared.DeliveryIDs[i]] = eventKey
+		}
+	}
+	seen := make(map[int64]struct{}, len(expected))
+	for rows.Next() {
+		var (
+			tenantID, userID, snapshotID, deliveryID int64
+			taskID, runID, eventKey, status          string
+			deliveredAt                              *time.Time
+		)
+		if err := rows.Scan(
+			&tenantID,
+			&userID,
+			&taskID,
+			&snapshotID,
+			&runID,
+			&deliveryID,
+			&eventKey,
+			&status,
+			&deliveredAt,
+		); err != nil {
+			return pushEffectDatabaseError(
+				"scan observed event receipt aggregate",
+				err,
+			)
+		}
+		expectedKey, ok := expected[deliveryID]
+		_, duplicate := seen[deliveryID]
+		if !ok || duplicate ||
+			tenantID != prepared.TenantID ||
+			userID != prepared.UserID ||
+			taskID != prepared.TaskID ||
+			snapshotID != prepared.RunSnapshotID ||
+			runID != prepared.RunID ||
+			eventKey != expectedKey ||
+			(status != "qualified" && status != "delivered") ||
+			(status == "qualified" && deliveredAt != nil) ||
+			(status == "delivered" && deliveredAt == nil) {
+			return pushEffectConflict(
+				"observed event receipt aggregate differs",
+			)
+		}
+		seen[deliveryID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return pushEffectDatabaseError(
+			"iterate observed event receipt aggregate",
+			err,
+		)
+	}
+	rows.Close()
+	if len(seen) != len(expected) {
+		return pushEffectConflict(
+			"observed event receipt aggregate is incomplete",
+		)
+	}
+	return nil
+}
+
+func markPushEffectObservedEventsDelivered(
+	ctx context.Context,
+	tx pgx.Tx,
+	prepared pusheffect.Prepared,
+) error {
+	for i, eventKey := range prepared.ObservationEventKeys {
+		if eventKey == "" {
+			continue
+		}
+		deliveryID := prepared.DeliveryIDs[i]
+		tag, err := tx.Exec(ctx, `
+			UPDATE task_observed_events e
+			   SET status='delivered',
+			       delivered_at=COALESCE(e.delivered_at,d.sent_at)
+			  FROM deliveries d
+			 WHERE e.tenant_id=$1 AND e.user_id=$2 AND e.task_id=$3
+			   AND e.run_snapshot_id=$4 AND e.temporal_run_id=$5
+			   AND e.delivery_id=$6 AND e.event_key=$7
+			   AND e.status IN ('qualified','delivered')
+			   AND d.id=e.delivery_id
+			   AND d.tenant_id=e.tenant_id
+			   AND d.user_id=e.user_id
+			   AND d.status=$8
+			   AND d.sent_at IS NOT NULL`,
+			prepared.TenantID,
+			prepared.UserID,
+			prepared.TaskID,
+			prepared.RunSnapshotID,
+			prepared.RunID,
+			deliveryID,
+			eventKey,
+			types.DeliveryStatusSent,
+		)
+		if err != nil {
+			return pushEffectDatabaseError(
+				"write observed event receipt",
+				err,
+			)
+		}
+		if tag.RowsAffected() != 1 {
+			return pushEffectConflict(
+				"observed event delivery receipt differs",
+			)
+		}
+	}
+	return nil
 }
 
 func (s *Store) BlockPushEffect(
@@ -1367,6 +1540,26 @@ func validatePushEffectSentReceipt(receipt pusheffect.SentReceipt) error {
 		len(receipt.ProviderMessageID) > maxPushEffectMessageID ||
 		!utf8.ValidString(receipt.ProviderMessageID) {
 		return pushEffectValidation("push effect sent receipt is invalid")
+	}
+	if len(receipt.ObservationEventKeys) > 0 {
+		if len(receipt.ObservationEventKeys) > 256 {
+			return pushEffectValidation("push effect sent receipt is invalid")
+		}
+		hasEvent := false
+		for _, key := range receipt.ObservationEventKeys {
+			if key == "" {
+				continue
+			}
+			if !pusheffect.ValidObservationEventKey(key) {
+				return pushEffectValidation(
+					"push effect sent receipt is invalid",
+				)
+			}
+			hasEvent = true
+		}
+		if !hasEvent {
+			return pushEffectValidation("push effect sent receipt is invalid")
+		}
 	}
 	return nil
 }

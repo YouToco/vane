@@ -2,17 +2,109 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
 	"go.temporal.io/sdk/testsuite"
 
 	"github.com/YouToco/vane/feedback"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
 )
+
+type pushEffectObservationStoreFake struct {
+	mu sync.Mutex
+
+	reserved      int
+	boundKey      string
+	boundDelivery int64
+	marked        int
+}
+
+func (*pushEffectObservationStoreFake) PrepareObservationQualificationStep(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	string,
+	string,
+) (string, json.RawMessage, error) {
+	return "", nil, errors.New("unexpected qualification preparation")
+}
+
+func (*pushEffectObservationStoreFake) MarkObservationQualificationSending(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	string,
+	string,
+) error {
+	return errors.New("unexpected qualification send")
+}
+
+func (*pushEffectObservationStoreFake) CompleteObservationQualificationStep(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	string,
+	string,
+	json.RawMessage,
+) error {
+	return errors.New("unexpected qualification completion")
+}
+
+func (*pushEffectObservationStoreFake) MarkObservationQualificationUncertain(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	string,
+	string,
+) error {
+	return errors.New("unexpected qualification uncertainty")
+}
+
+func (f *pushEffectObservationStoreFake) ReserveObservedEventV1(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRef,
+	_ observation.QualifiedEvent,
+) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reserved++
+	return true, nil
+}
+
+func (f *pushEffectObservationStoreFake) BindObservedEventDeliveryV1(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRef,
+	_ string,
+	eventKey string,
+	deliveryID int64,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.boundKey = eventKey
+	f.boundDelivery = deliveryID
+	return nil
+}
+
+func (f *pushEffectObservationStoreFake) MarkObservedEventDeliveredV1(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	int64,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.marked++
+	return nil
+}
 
 type pushEffectStoreFake struct {
 	mu sync.Mutex
@@ -126,6 +218,7 @@ func TestPush_CompiledCanaryUsesDurableEffectAndAtomicReceipt(t *testing.T) {
 		snapshot: snapshot, authorize: true,
 	}
 	effects := new(pushEffectStoreFake)
+	observed := new(pushEffectObservationStoreFake)
 	legacyStore := &effectCountingStore{fakeStore: new(fakeStore)}
 	observation := pusheffect.ProviderObservation{
 		Disposition: pusheffect.AttemptSent,
@@ -150,8 +243,11 @@ func TestPush_CompiledCanaryUsesDurableEffectAndAtomicReceipt(t *testing.T) {
 			},
 			new(compiledModelResolverFake),
 		),
+		WithObservationRuntime(observed, nil, "", ""),
 		WithPushEffectCanary(effects, identity.TaskID),
 	)
+	eventKey := strings.Repeat("b", 64)
+	policyDigest := strings.Repeat("c", 64)
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestActivityEnvironment()
 	env.RegisterActivity(a.Push)
@@ -165,6 +261,12 @@ func TestPush_CompiledCanaryUsesDurableEffectAndAtomicReceipt(t *testing.T) {
 			Scored: types.ScoredItem{
 				Item: types.ContentItem{
 					ID: 501, SourceID: 10, Title: "item",
+					ObservationEventKey:     eventKey,
+					ObservationPolicyDigest: policyDigest,
+					ObservationEventJSON: json.RawMessage(
+						`{"event_type":"release","subject":"item",` +
+							`"occurred_at":"2026-07-25T00:00:00Z"}`,
+					),
 				},
 				Score: 88,
 			},
@@ -189,11 +291,31 @@ func TestPush_CompiledCanaryUsesDurableEffectAndAtomicReceipt(t *testing.T) {
 		prepared.AppIdentity != "cli_test" ||
 		prepared.RunSnapshotID != ref.SnapshotID ||
 		len(prepared.DeliveryIDs) != 1 ||
+		len(prepared.ObservationEventKeys) != 1 ||
+		prepared.ObservationEventKeys[0] != eventKey ||
 		string(prepared.Card) != `{"effect_id":"`+marker+`"}` {
 		t.Fatalf("prepared checkpoint drift: %+v marker=%q", prepared, marker)
 	}
-	if effects.receipts[0].ProviderMessageID != "om_effect" {
+	if effects.receipts[0].ProviderMessageID != "om_effect" ||
+		len(effects.receipts[0].ObservationEventKeys) != 1 ||
+		effects.receipts[0].ObservationEventKeys[0] != eventKey {
 		t.Fatalf("receipt = %+v", effects.receipts[0])
+	}
+	observed.mu.Lock()
+	reserved := observed.reserved
+	boundKey := observed.boundKey
+	boundDelivery := observed.boundDelivery
+	marked := observed.marked
+	observed.mu.Unlock()
+	if reserved != 1 || boundKey != eventKey ||
+		boundDelivery != prepared.DeliveryIDs[0] || marked != 0 {
+		t.Fatalf(
+			"observation reserve/bind/legacy-mark=%d/%q/%d/%d",
+			reserved,
+			boundKey,
+			boundDelivery,
+			marked,
+		)
 	}
 	compiledStore.mu.Lock()
 	deliveryReceipts := compiledStore.deliveryReceipts

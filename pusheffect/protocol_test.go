@@ -3,6 +3,7 @@ package pusheffect
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,7 +16,8 @@ func fixture() Prepared {
 		RunSnapshotID: 3, RunID: "run-1", StepID: "push",
 		ChunkIndex: 0, ChunkCount: 1, BatchID: 4,
 		DeliveryIDs: []int64{5, 6}, Provider: "feishu",
-		AppIdentity: "app-fingerprint", ProviderChatID: "oc_owner_p2p",
+		ObservationEventKeys: []string{strings.Repeat("a", 64), ""},
+		AppIdentity:          "app-fingerprint", ProviderChatID: "oc_owner_p2p",
 		Target:       "ou_target",
 		Card:         []byte(`{"type":"card","body":"exact bytes"}`),
 		ProviderUUID: uuid.MustParse("2f790ab2-0622-4df8-8f93-6079a3a0f94f").String(),
@@ -42,7 +44,9 @@ func TestCanonicalizeRoundTripAndDefensiveCopies(t *testing.T) {
 	}
 	input.Card[0] = 'x'
 	input.DeliveryIDs[0] = 999
-	if bytes.Equal(input.Card, got.Card) || got.DeliveryIDs[0] != 5 {
+	input.ObservationEventKeys[0] = strings.Repeat("b", 64)
+	if bytes.Equal(input.Card, got.Card) || got.DeliveryIDs[0] != 5 ||
+		got.ObservationEventKeys[0] != strings.Repeat("a", 64) {
 		t.Fatal("canonical payload aliases caller memory")
 	}
 }
@@ -57,6 +61,15 @@ func TestCanonicalizeRejectsAmbiguousIdentity(t *testing.T) {
 		}},
 		{name: "unordered deliveries", change: func(p *Prepared) {
 			p.DeliveryIDs = []int64{6, 5}
+		}},
+		{name: "misaligned observation events", change: func(p *Prepared) {
+			p.ObservationEventKeys = []string{strings.Repeat("a", 64)}
+		}},
+		{name: "invalid observation event key", change: func(p *Prepared) {
+			p.ObservationEventKeys[0] = "not-a-digest"
+		}},
+		{name: "all blank observation event keys", change: func(p *Prepared) {
+			p.ObservationEventKeys = []string{"", ""}
 		}},
 		{name: "noncanonical uuid", change: func(p *Prepared) {
 			p.ProviderUUID = "2F790AB2-0622-4DF8-8F93-6079A3A0F94F"

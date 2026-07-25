@@ -126,6 +126,100 @@ func TestDurablePushBackoffIsDefiniteOnly(t *testing.T) {
 	}
 }
 
+// TestDurablePushCannotContinueBeforeAtomicObservationReceipt is the mutation
+// trap for observation delivery settlement. The durable branch may skip the
+// legacy per-delivery loop only because sendDurablePushChunk has already
+// persisted effect+deliveries+observations through the atomic Store receipt.
+func TestDurablePushCannotContinueBeforeAtomicObservationReceipt(t *testing.T) {
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, "activities.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	push := findWorkflowFunction(file, "Push")
+	durable := findWorkflowFunction(file, "sendDurablePushChunk")
+	if push == nil || push.Body == nil || durable == nil || durable.Body == nil {
+		t.Fatal("durable push production functions not found")
+	}
+
+	sendCalls := make([]token.Pos, 0, 1)
+	durableContinues := make([]token.Pos, 0, 1)
+	ast.Inspect(push.Body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.CallExpr:
+			selector, ok := typed.Fun.(*ast.SelectorExpr)
+			if ok && selector.Sel.Name == "sendDurablePushChunk" {
+				sendCalls = append(sendCalls, typed.Pos())
+			}
+		case *ast.IfStmt:
+			condition, ok := typed.Cond.(*ast.Ident)
+			if !ok || condition.Name != "effectEnabled" {
+				return true
+			}
+			ast.Inspect(typed.Body, func(child ast.Node) bool {
+				branch, ok := child.(*ast.BranchStmt)
+				if ok && branch.Tok == token.CONTINUE {
+					durableContinues = append(durableContinues, branch.Pos())
+				}
+				return true
+			})
+		}
+		return true
+	})
+	if len(sendCalls) != 1 || len(durableContinues) != 1 ||
+		durableContinues[0] <= sendCalls[0] {
+		t.Fatalf(
+			"durable send/continue boundary calls=%v continues=%v",
+			sendCalls,
+			durableContinues,
+		)
+	}
+
+	atomicReceipts := 0
+	receiptEventKeys := 0
+	directObservationMarks := 0
+	ast.Inspect(durable.Body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.CallExpr:
+			selector, ok := typed.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			switch selector.Sel.Name {
+			case "RecordPushEffectSentWithDeliveries":
+				atomicReceipts++
+			case "MarkObservedEventDeliveredV1":
+				directObservationMarks++
+			}
+		case *ast.CompositeLit:
+			typeName, ok := typed.Type.(*ast.SelectorExpr)
+			if !ok || typeName.Sel.Name != "SentReceipt" {
+				return true
+			}
+			for _, element := range typed.Elts {
+				field, ok := element.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				key, ok := field.Key.(*ast.Ident)
+				if ok && key.Name == "ObservationEventKeys" {
+					receiptEventKeys++
+				}
+			}
+		}
+		return true
+	})
+	if atomicReceipts != 2 || receiptEventKeys != 2 ||
+		directObservationMarks != 0 {
+		t.Fatalf(
+			"durable observation receipt calls/keys/direct=%d/%d/%d, want 2/2/0",
+			atomicReceipts,
+			receiptEventKeys,
+			directObservationMarks,
+		)
+	}
+}
+
 func findWorkflowFunction(file *ast.File, name string) *ast.FuncDecl {
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)

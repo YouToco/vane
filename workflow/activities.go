@@ -3081,8 +3081,16 @@ func (a *Activities) sendDurablePushChunk(
 		)
 	}
 	deliveryIDs := make([]int64, len(chunk))
+	observationEventKeys := make([]string, len(chunk))
+	hasObservationEvent := false
 	for i := range chunk {
 		deliveryIDs[i] = chunk[i].delID
+		observationEventKeys[i] = chunk[i].eventKey
+		hasObservationEvent = hasObservationEvent ||
+			chunk[i].eventKey != ""
+	}
+	if !hasObservationEvent {
+		observationEventKeys = nil
 	}
 	prepared := pusheffect.Prepared{
 		ID: effectID, TenantID: identity.TenantID, UserID: identity.UserID,
@@ -3090,7 +3098,8 @@ func (a *Activities) sendDurablePushChunk(
 		RunID: identity.TemporalRunID, StepID: pushEffectStepID,
 		ChunkIndex: chunkIndex, ChunkCount: chunkCount,
 		BatchID: batchID, DeliveryIDs: deliveryIDs,
-		Provider: pushEffectProvider, AppIdentity: appIdentity,
+		ObservationEventKeys: observationEventKeys,
+		Provider:             pushEffectProvider, AppIdentity: appIdentity,
 		ProviderChatID: ownerChatID, Target: ownerOpenID,
 		Card: []byte(cardJSON), ProviderUUID: effectID,
 		IdempotencyExpiresAt: scheduledAt.Add(time.Hour),
@@ -3125,7 +3134,8 @@ func (a *Activities) sendDurablePushChunk(
 			ctx,
 			pusheffect.SentReceipt{
 				Scope: effect.Scope(), ExpectedFence: effect.Fence,
-				ProviderMessageID: effect.ProviderMessageID,
+				ProviderMessageID:    effect.ProviderMessageID,
+				ObservationEventKeys: prepared.ObservationEventKeys,
 			},
 		); err != nil {
 			return "", err
@@ -3157,8 +3167,9 @@ func (a *Activities) sendDurablePushChunk(
 			ctx,
 			pusheffect.SentReceipt{
 				Scope: effect.Scope(), ExpectedFence: effect.Fence,
-				LeaseOwner:        effect.LeaseOwner,
-				ProviderMessageID: observation.MessageID,
+				LeaseOwner:           effect.LeaseOwner,
+				ProviderMessageID:    observation.MessageID,
+				ObservationEventKeys: prepared.ObservationEventKeys,
 			},
 		); err != nil {
 			return "", err
