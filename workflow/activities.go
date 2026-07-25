@@ -217,7 +217,10 @@ type Store interface {
 // require. The concrete production implementation is *store.Store.
 type CompiledRunStore interface {
 	LoadCompiledRunSnapshotRefV1(context.Context, types.RunIdentity) (types.RunSnapshotRef, bool, error)
-	CreateOrGetCompiledRunSnapshotV1(context.Context, types.RunIdentity, runtimepolicy.BundleV1) (types.RunSnapshotRef, error)
+	CreateOrGetCompiledRunSnapshotV1(
+		context.Context, types.RunIdentity, runtimepolicy.BundleV1,
+		...observation.RolloutMode,
+	) (types.RunSnapshotRef, error)
 	LoadAuthoritativeCompiledTaskRunSnapshot(context.Context, types.RunIdentity, types.RunSnapshotRef) (runcontext.CompiledSnapshotV1, storepkg.CompiledRunSnapshotAuthority, error)
 	AuthorizeTaskRunSideEffect(context.Context, types.RunIdentity, types.RunSnapshotRef) (bool, error)
 	AuthorizeAndConsumeTaskRunLLMQuotaV1(context.Context, types.RunIdentity, types.RunSnapshotRef, runtimepolicy.QuotaBucketV1, float64) error
@@ -242,6 +245,7 @@ type CompiledRunStore interface {
 type CompiledRunSnapshotShadowV2Store interface {
 	CreateOrGetCompiledRunSnapshotShadowV2(
 		context.Context, types.RunIdentity, runtimepolicy.BundleV1,
+		...observation.RolloutMode,
 	) (types.RunSnapshotRef, error)
 }
 
@@ -317,6 +321,11 @@ type ObservationRuntimeStore interface {
 	) (string, json.RawMessage, error)
 	MarkObservationQualificationSending(
 		context.Context, types.RunIdentity, types.RunSnapshotRef, string, string,
+	) error
+	AuthorizeObservationQualificationSpendV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		string, string, observation.RolloutMode,
+		*runtimepolicy.QuotaBucketV1, float64,
 	) error
 	CompleteObservationQualificationStep(
 		context.Context, types.RunIdentity, types.RunSnapshotRef, string, string,
@@ -691,6 +700,7 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 		return PrepareRunResult{}, retryableOrNot(err)
 	}
 	if !found {
+		observationRollout := a.observationRolloutForTask(p.ScheduleID)
 		policy, buildErr := a.buildCompiledPolicyV1(
 			ctx, p.TenantID, a.taskInstructionEnabled(p.ScheduleID))
 		if buildErr != nil {
@@ -707,10 +717,10 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 		if a.compiledShadowStoreV2 != nil &&
 			p.ScheduleID == a.snapshotV2ShadowCanaryTaskID {
 			ref, err = a.compiledShadowStoreV2.CreateOrGetCompiledRunSnapshotShadowV2(
-				ctx, expected, policy)
+				ctx, expected, policy, observationRollout)
 		} else {
 			ref, err = a.compiledStore.CreateOrGetCompiledRunSnapshotV1(
-				ctx, expected, policy)
+				ctx, expected, policy, observationRollout)
 		}
 		if err != nil {
 			// A task may be paused/deleted after Temporal has started the run but
@@ -746,6 +756,18 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 		return PrepareRunResult{}, nonRetryable(err)
 	}
 	return result, nil
+}
+
+func (a *Activities) observationRolloutForTask(
+	taskID string,
+) observation.RolloutMode {
+	if taskID != "" && taskID == a.observationAuthorityCanaryTaskID {
+		return observation.RolloutAuthority
+	}
+	if taskID != "" && taskID == a.observationShadowCanaryTaskID {
+		return observation.RolloutShadow
+	}
+	return observation.RolloutOff
 }
 
 func (a *Activities) taskInstructionEnabled(scheduleID string) bool {
@@ -1791,9 +1813,12 @@ func (a *Activities) QualifyEvents(
 	if scope.Observation == nil {
 		return QualifyEventsResult{Items: in.Items, Outcome: "not_configured"}, nil
 	}
-	shadow := in.ScheduleID == a.observationShadowCanaryTaskID
-	authority := in.ScheduleID == a.observationAuthorityCanaryTaskID
-	if !shadow && !authority {
+	rollout := snapshot.ObservationRollout
+	if !rollout.Valid() {
+		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
+			types.CodeValidation, "compiled observation rollout is invalid", nil))
+	}
+	if rollout == observation.RolloutOff {
 		return QualifyEventsResult{Items: in.Items, Outcome: "rollout_off"}, nil
 	}
 	if a.observationStore == nil {
@@ -1803,6 +1828,10 @@ func (a *Activities) QualifyEvents(
 	expected, err := activityRunIdentityV1(ctx, in.UserID, in.Run)
 	if err != nil {
 		return QualifyEventsResult{}, retryableOrNot(err)
+	}
+	if in.ScheduleID != expected.TaskID {
+		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
+			types.CodeValidation, "compiled observation task differs", nil))
 	}
 	nominal, err := observation.NominalTrigger(
 		expected.TaskID, expected.TemporalWorkflowID)
@@ -1838,14 +1867,10 @@ func (a *Activities) QualifyEvents(
 		}
 	} else {
 		qualified, outcome, err = a.qualifyEventCandidates(
-			ctx, expected, snapshot, in, *scope.Observation, window)
+			ctx, expected, snapshot, in, rollout, *scope.Observation, window)
 		if err != nil {
 			return QualifyEventsResult{}, err
 		}
-	}
-	rollout := "shadow"
-	if authority {
-		rollout = "authority"
 	}
 	slog.InfoContext(ctx, "observation qualification",
 		"task_id", expected.TaskID,
@@ -1857,7 +1882,7 @@ func (a *Activities) QualifyEvents(
 		"qualified_count", len(qualified),
 		"window_start", window.Start,
 		"window_end", window.End)
-	if shadow && !authority {
+	if rollout == observation.RolloutShadow {
 		return QualifyEventsResult{Items: in.Items, Outcome: "shadow_" + outcome}, nil
 	}
 	return QualifyEventsResult{Items: qualified, Outcome: outcome}, nil
@@ -1897,6 +1922,7 @@ func (a *Activities) qualifyEventCandidates(
 	expected types.RunIdentity,
 	snapshot runcontext.CompiledSnapshotV1,
 	in QualifyEventsIn,
+	rollout observation.RolloutMode,
 	policy observation.PolicyV1,
 	window observation.Window,
 ) ([]types.ContentItem, string, error) {
@@ -1922,6 +1948,8 @@ func (a *Activities) qualifyEventCandidates(
 		return nil, "", retryableOrNot(err)
 	}
 	var result eventqualifier.Result
+	var canonical []byte
+	needsReceipt := false
 	switch status {
 	case storepkg.ObservationStepCompleted:
 		result, err = eventqualifier.Decode(cached)
@@ -1942,44 +1970,45 @@ func (a *Activities) qualifyEventCandidates(
 			return nil, "", nonRetryable(types.NewAppError(
 				types.CodeValidation, "compiled qualifier model call is missing", nil))
 		}
-		quotaRule, ok := snapshot.Policy.QuotaPolicy.Bucket("llm_tokens")
-		if !ok {
-			return nil, "", nonRetryable(types.NewAppError(
-				types.CodeValidation, "compiled qualifier quota rule is missing", nil))
+		var quotaRule *runtimepolicy.QuotaBucketV1
+		if rollout == observation.RolloutAuthority {
+			rule, ok := snapshot.Policy.QuotaPolicy.Bucket("llm_tokens")
+			if !ok {
+				return nil, "", nonRetryable(types.NewAppError(
+					types.CodeValidation, "compiled qualifier quota rule is missing", nil))
+			}
+			quotaRule = &rule
 		}
 		beforeSpend := func(effectCtx context.Context, amount float64) error {
-			if err := a.consumeCompiledLLMQuotaV1(
-				effectCtx, in.UserID, in.Run,
-				snapshot.Policy.QuotaPolicy, amount,
-			); err != nil {
-				return err
-			}
-			return a.observationStore.MarkObservationQualificationSending(
-				effectCtx, expected, in.Run.Snapshot, stepID, requestDigest)
+			return a.observationStore.AuthorizeObservationQualificationSpendV1(
+				effectCtx, expected, in.Run.Snapshot, stepID, requestDigest,
+				rollout, quotaRule, amount)
 		}
-		var canonical []byte
-		result, canonical, err = a.eventQualifier.Qualify(ctx, eventqualifier.Request{
+		qualifierRequest := eventqualifier.Request{
 			TenantID: expected.TenantID, UserID: expected.UserID,
 			TraceID: in.TraceID, Policy: policy, Window: window,
 			Candidates: in.Items, Client: modelClient, ModelCall: modelCall,
-			QuotaRule: &quotaRule, BeforeSpend: beforeSpend,
-		})
+			QuotaRule: quotaRule, BeforeSpend: beforeSpend,
+		}
+		if rollout == observation.RolloutShadow {
+			result, canonical, err = a.eventQualifier.QualifyObservationShadow(
+				ctx, qualifierRequest)
+		} else {
+			result, canonical, err = a.eventQualifier.Qualify(
+				ctx, qualifierRequest)
+		}
 		if err != nil {
 			receiptCtx, cancel := detachedObservationReceiptContext(ctx)
-			defer cancel()
-			_ = a.observationStore.MarkObservationQualificationUncertain(
+			receiptErr := a.observationStore.MarkObservationQualificationUncertain(
 				receiptCtx, expected, in.Run.Snapshot,
 				stepID, requestDigest)
+			cancel()
+			if receiptErr != nil {
+				return nil, "", retryableOrNot(receiptErr)
+			}
 			return nil, "uncertain", nil
 		}
-		receiptCtx, cancel := detachedObservationReceiptContext(ctx)
-		defer cancel()
-		if err := a.observationStore.CompleteObservationQualificationStep(
-			receiptCtx, expected, in.Run.Snapshot,
-			stepID, requestDigest, canonical,
-		); err != nil {
-			return nil, "", retryableOrNot(err)
-		}
+		needsReceipt = true
 	default:
 		return nil, "", nonRetryable(types.NewAppError(
 			types.CodeConflict, "observation qualification state is invalid", nil))
@@ -1991,7 +2020,34 @@ func (a *Activities) qualifyEventCandidates(
 			"task_id", expected.TaskID,
 			"snapshot_id", in.Run.Snapshot.SnapshotID,
 			"err", err)
+		if !needsReceipt {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeConflict,
+				"stored event qualification failed deterministic validation",
+				err))
+		}
+		receiptCtx, cancel := detachedObservationReceiptContext(ctx)
+		receiptErr := a.observationStore.MarkObservationQualificationUncertain(
+			receiptCtx, expected, in.Run.Snapshot,
+			stepID, requestDigest)
+		cancel()
+		if receiptErr != nil {
+			return nil, "", retryableOrNot(receiptErr)
+		}
 		return nil, "uncertain", nil
+	}
+	if err != nil {
+		return nil, outcome, err
+	}
+	if needsReceipt {
+		receiptCtx, cancel := detachedObservationReceiptContext(ctx)
+		receiptErr := a.observationStore.CompleteObservationQualificationStep(
+			receiptCtx, expected, in.Run.Snapshot,
+			stepID, requestDigest, canonical)
+		cancel()
+		if receiptErr != nil {
+			return nil, "", retryableOrNot(receiptErr)
+		}
 	}
 	return qualified, outcome, err
 }

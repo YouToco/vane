@@ -14,8 +14,107 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
 )
+
+func TestAuthorizeObservationQualificationSpendV1_IsolatesShadowAndAtomicallyFencesAuthority(
+	t *testing.T,
+) {
+	f := newCompiledRunWriteFixture(t)
+	ctx := t.Context()
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(cleanupCtx, t, f.base.st,
+			`DELETE FROM task_event_qualification_steps WHERE tenant_id=$1`,
+			f.base.tenantID)
+	})
+	setBucket(t, f.base.st, f.base.tenantID,
+		QuotaLLMTokens, 100, 0.000001, 100)
+	rule := runtimepolicy.QuotaBucketV1{
+		Name: string(QuotaLLMTokens), Financial: true,
+		EnforcementVersion: runtimepolicy.QuotaEnforcementLLMPrechargeV1,
+	}
+
+	createRun := func(mode observation.RolloutMode) (
+		types.RunIdentity, types.RunSnapshotRef,
+	) {
+		t.Helper()
+		identity := scheduledRunIdentity(
+			f.taskA, f.base.tenantID, f.base.userID,
+			"run-observation-spend-"+string(mode)+"-"+uuid.NewString())
+		ref, err := f.base.st.CreateOrGetCompiledTaskRunSnapshotV1(
+			ctx, CreateOrGetCompiledTaskRunSnapshotV1Params{
+				Identity: identity, Policy: testCompiledRunPolicyV1(t),
+				ObservationRollout: mode,
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return identity, ref
+	}
+	prepare := func(identity types.RunIdentity, ref types.RunSnapshotRef, digest string) {
+		t.Helper()
+		status, _, err := f.base.st.PrepareObservationQualificationStep(
+			ctx, identity, ref, "qualify-events-v1", digest)
+		if err != nil || status != ObservationStepPrepared {
+			t.Fatalf("prepare status=%q err=%v", status, err)
+		}
+	}
+
+	shadowID, shadowRef := createRun(observation.RolloutShadow)
+	shadowDigest := strings.Repeat("1", 64)
+	prepare(shadowID, shadowRef, shadowDigest)
+	beforeShadow := runtimeQuotaTokens(
+		t, f.base.st, f.base.tenantID, QuotaLLMTokens)
+	if err := f.base.st.AuthorizeObservationQualificationSpendV1(
+		ctx, shadowID, shadowRef, "qualify-events-v1", shadowDigest,
+		observation.RolloutShadow, nil, 20,
+	); err != nil {
+		t.Fatal(err)
+	}
+	afterShadow := runtimeQuotaTokens(
+		t, f.base.st, f.base.tenantID, QuotaLLMTokens)
+	if afterShadow != beforeShadow {
+		t.Fatalf("shadow changed production quota: before=%f after=%f",
+			beforeShadow, afterShadow)
+	}
+	if err := f.base.st.AuthorizeObservationQualificationSpendV1(
+		ctx, shadowID, shadowRef, "qualify-events-v1", shadowDigest,
+		observation.RolloutShadow, nil, 20,
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("shadow replay spend = %v, want conflict", err)
+	}
+
+	authorityID, authorityRef := createRun(observation.RolloutAuthority)
+	authorityDigest := strings.Repeat("2", 64)
+	prepare(authorityID, authorityRef, authorityDigest)
+	beforeAuthority := runtimeQuotaTokens(
+		t, f.base.st, f.base.tenantID, QuotaLLMTokens)
+	if err := f.base.st.AuthorizeObservationQualificationSpendV1(
+		ctx, authorityID, authorityRef, "qualify-events-v1", authorityDigest,
+		observation.RolloutAuthority, &rule, 20,
+	); err != nil {
+		t.Fatal(err)
+	}
+	afterAuthority := runtimeQuotaTokens(
+		t, f.base.st, f.base.tenantID, QuotaLLMTokens)
+	if delta := beforeAuthority - afterAuthority; delta < 19.9 || delta > 20.1 {
+		t.Fatalf("authority quota delta=%f, want about 20", delta)
+	}
+	if err := f.base.st.AuthorizeObservationQualificationSpendV1(
+		ctx, authorityID, authorityRef, "qualify-events-v1", authorityDigest,
+		observation.RolloutAuthority, &rule, 20,
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("authority replay spend = %v, want conflict", err)
+	}
+	afterReplay := runtimeQuotaTokens(
+		t, f.base.st, f.base.tenantID, QuotaLLMTokens)
+	if delta := afterAuthority - afterReplay; delta < -0.01 || delta > 0.01 {
+		t.Fatalf("failed authority replay leaked quota: delta=%f", delta)
+	}
+}
 
 func TestObservationQualificationCheckpointAndEventLedger(t *testing.T) {
 	f := newCompiledRunWriteFixture(t)

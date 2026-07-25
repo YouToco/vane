@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/types"
 )
 
@@ -70,6 +71,7 @@ type taskRunSnapshotPayload struct {
 	RunKind                types.RunSnapshotKind    `json:"run_kind"`
 	Mode                   types.ExecutionMode      `json:"mode"`
 	AdaptiveVersion        int64                    `json:"adaptive_version"`
+	ObservationRollout     observation.RolloutMode  `json:"observation_rollout,omitempty"`
 	Policies               taskRunPolicyPayloads    `json:"policies"`
 	Budget                 taskRunBudget            `json:"budget"`
 	Definition             taskRunDefinitionPayload `json:"definition"`
@@ -177,6 +179,7 @@ type taskRunSnapshotPayloadV1 struct {
 	RunKind                string                      `json:"run_kind"`
 	Mode                   string                      `json:"mode"`
 	AdaptiveVersion        int64                       `json:"adaptive_version"`
+	ObservationRollout     string                      `json:"observation_rollout,omitempty"`
 	Policies               *taskRunPolicyPayloadsV1    `json:"policies"`
 	Budget                 *taskRunBudgetV1            `json:"budget"`
 	Definition             *taskRunDefinitionPayloadV1 `json:"definition"`
@@ -274,6 +277,7 @@ func canonicalizeTaskRunPayloadV1(
 		payload.ReferenceSchemaVersion != taskRunReferenceSchemaV1 ||
 		payload.RunKind != "scheduled" || payload.Mode != "compiled" ||
 		payload.AdaptiveVersion != 0 || payload.TenantID <= 0 || payload.UserID <= 0 ||
+		!validTaskRunObservationRolloutV1(payload.ObservationRollout) ||
 		!validTaskRunTaskIDV1(payload.TaskID) || payload.Policies == nil ||
 		payload.Budget == nil || *payload.Budget != (taskRunBudgetV1{}) ||
 		payload.Definition == nil {
@@ -376,6 +380,16 @@ func canonicalizeTaskRunPayloadV1(
 		Payload: payload, Canonical: canonical, DefinitionDigest: definitionDigest,
 		PlanDigest: planDigest, PolicyDigests: policyDigests,
 	}, nil
+}
+
+func validTaskRunObservationRolloutV1(value string) bool {
+	switch observation.RolloutMode(value) {
+	case "", observation.RolloutOff,
+		observation.RolloutShadow, observation.RolloutAuthority:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateTaskRunApprovedDefinitionV1(

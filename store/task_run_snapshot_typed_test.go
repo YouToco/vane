@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
 )
@@ -344,6 +345,7 @@ func TestCreateOrGetCompiledTaskRunSnapshotV1_ResponseLostRetryPrecedesPolicyAnd
 	first, err := f.st.CreateOrGetCompiledTaskRunSnapshotV1(t.Context(),
 		CreateOrGetCompiledTaskRunSnapshotV1Params{
 			Identity: identity, Policy: testCompiledRunPolicyV1(t),
+			ObservationRollout: observation.RolloutShadow,
 		})
 	if err != nil {
 		t.Fatalf("first CreateOrGetCompiledTaskRunSnapshotV1() error = %v", err)
@@ -355,12 +357,27 @@ func TestCreateOrGetCompiledTaskRunSnapshotV1_ResponseLostRetryPrecedesPolicyAnd
 	// The zero bundle is intentionally invalid. A retry must load the immutable
 	// winner before inspecting any current policy or current task aggregate.
 	retry, err := f.st.CreateOrGetCompiledTaskRunSnapshotV1(t.Context(),
-		CreateOrGetCompiledTaskRunSnapshotV1Params{Identity: identity})
+		CreateOrGetCompiledTaskRunSnapshotV1Params{
+			Identity: identity,
+			// Simulate a restarted worker whose mutable config now selects
+			// authority. The committed shadow decision must win before both the
+			// invalid policy and the new rollout are inspected.
+			ObservationRollout: observation.RolloutAuthority,
+		})
 	if err != nil {
 		t.Fatalf("response-lost retry error = %v", err)
 	}
 	if retry != first {
 		t.Fatalf("response-lost retry returned another ref:\n got %+v\nwant %+v", retry, first)
+	}
+	snapshot, err := f.st.LoadCompiledTaskRunSnapshotV1(
+		t.Context(), identity, retry)
+	if err != nil {
+		t.Fatalf("load response-lost winner: %v", err)
+	}
+	if snapshot.ObservationRollout != observation.RolloutShadow {
+		t.Fatalf("response-lost rollout = %q, want frozen shadow",
+			snapshot.ObservationRollout)
 	}
 }
 

@@ -31,10 +31,41 @@ type CallMeta struct {
 	BeforeSpend func(context.Context, float64) error
 }
 
+type observationShadowSpend func(context.Context, float64) error
+
 // Do 调用 + 记账一体：计时 → Complete → 构造 LLMCall → Record。
 // 失败也要记账（error 字段填原因），否则限流/超时这类最需要观测的
 // 失败反而在 llm_calls 里不可见。
 func Do(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Request) (*Response, error) {
+	return do(ctx, c, rec, meta, req, nil)
+}
+
+// DoObservationShadow performs an operator-funded observation shadow call.
+// It deliberately bypasses tenant quota while retaining the durable gate and
+// llm_calls audit. Production call sites are constrained by an AST invariant.
+func DoObservationShadow(
+	ctx context.Context,
+	c *Client,
+	rec *Recorder,
+	meta CallMeta,
+	req Request,
+	beforeSpend func(context.Context, float64) error,
+) (*Response, error) {
+	if beforeSpend == nil {
+		return nil, types.NewAppError(types.CodeInternal,
+			"observation shadow authorization is missing", nil)
+	}
+	return do(ctx, c, rec, meta, req, observationShadowSpend(beforeSpend))
+}
+
+func do(
+	ctx context.Context,
+	c *Client,
+	rec *Recorder,
+	meta CallMeta,
+	req Request,
+	shadow observationShadowSpend,
+) (*Response, error) {
 	// 配额闸门在**发请求之前**（契约 §2.7，D3 财务护栏）。
 	//
 	// llm 包有**两个**发请求的入口，两个都必须装闸门：Do（单轮，打分/出卡/演化）
@@ -51,6 +82,16 @@ func Do(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Reques
 			if err := callerBeforeSend(sendCtx); err != nil {
 				return err
 			}
+		}
+		if shadow != nil {
+			if meta.BeforeSpend != nil || meta.QuotaRule != nil {
+				return types.NewAppError(types.CodeInternal,
+					"independent spend authorization is ambiguous", nil)
+			}
+			if err := shadow(sendCtx, estimate); err != nil {
+				return err
+			}
+			return nil
 		}
 		if meta.BeforeSpend != nil {
 			if meta.QuotaRule == nil || meta.TenantID == nil || *meta.TenantID <= 0 ||

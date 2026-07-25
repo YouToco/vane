@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
@@ -151,9 +152,16 @@ func decodeCompiledTaskRunSnapshotV1(
 			URL: source.URL, Config: bytes.Clone(source.Config),
 		}
 	}
+	rollout := observation.RolloutMode(decoded.Payload.ObservationRollout)
+	if rollout == "" {
+		// Historical v1 snapshots predate rollout admission. Missing is pinned
+		// to off; it must never be reinterpreted through live worker config.
+		rollout = observation.RolloutOff
+	}
 	return runcontext.CompiledSnapshotV1{
 		Ref: storedRef, Mode: types.ExecutionMode(decoded.Payload.Mode),
-		AdaptiveVersion: decoded.Payload.AdaptiveVersion,
+		AdaptiveVersion:    decoded.Payload.AdaptiveVersion,
+		ObservationRollout: rollout,
 		Budget: types.PlannerBudget{
 			MaxPlannerRounds: decoded.Payload.Budget.MaxPlannerRounds,
 			MaxToolCalls:     decoded.Payload.Budget.MaxToolCalls,

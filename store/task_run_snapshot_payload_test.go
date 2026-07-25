@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/observation"
 )
 
 const goldenTaskRunSnapshotPayloadV1 = `{"schema_version":"vane.task-run-snapshot-payload/v1","tenant_id":7,"user_id":11,"task_id":"golden-task","run_kind":"scheduled","mode":"compiled","adaptive_version":0,"policies":{"capability_catalog":{"capabilities":["web/search"]},"tool_policy":{"allow":["fetch"]},"prompt_policy":{"score":"v1"},"model_policy":{"model":"m1","provider":"test"},"quota_policy":{"bucket":"fetch","limit":7}},"budget":{"max_planner_rounds":0,"max_tool_calls":0,"max_tokens":0,"max_cost_micro_usd":0,"duration_ms":0},"definition":{"task_id":"golden-task","tenant_id":7,"user_id":11,"nl_description":"monitor status","spec_json":{"cron":"0 8 * * *","tz":"UTC"},"scope_json":{"max_items":3},"playbook_content":"trusted only","strictness":"normal","source_scope":"approved_plan","fetch_plan":{"sources":[{"platform":"web","capability":"search","title":"Official","url":"https://example.test/status","config":{"query":"status"}}]},"sources":[{"source_id":42,"platform":"web","capability":"search","title":"Official","url":"https://example.test/status","config":{"query":"status"}}]},"reference_schema_version":"vane.run-snapshot-ref/v1"}`
@@ -58,6 +59,32 @@ func TestTaskRunSnapshotPayloadV1Golden(t *testing.T) {
 	if decoded.PolicyDigests != wantPolicyDigests {
 		t.Fatalf("v1 policy digest domain drifted:\n got %+v\nwant %+v",
 			decoded.PolicyDigests, wantPolicyDigests)
+	}
+}
+
+func TestTaskRunSnapshotPayloadV1ObservationRolloutIsDigestBound(t *testing.T) {
+	decoded, err := readTaskRunSnapshotPayload(
+		[]byte(goldenTaskRunSnapshotPayloadV1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Payload.ObservationRollout != "" {
+		t.Fatalf("historical rollout = %q, want omitted/off",
+			decoded.Payload.ObservationRollout)
+	}
+	oldDigest := sha256Hex(decoded.Canonical)
+	decoded.Payload.ObservationRollout = string(observation.RolloutShadow)
+	withRollout, err := canonicalizeTaskRunPayloadV1(decoded.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(withRollout.Canonical,
+		[]byte(`"observation_rollout":"shadow"`)) {
+		t.Fatalf("new rollout omitted from canonical payload: %s",
+			withRollout.Canonical)
+	}
+	if got := sha256Hex(withRollout.Canonical); got == oldDigest {
+		t.Fatal("observation rollout did not change payload digest")
 	}
 }
 
@@ -449,7 +476,8 @@ func TestTaskRunSnapshotPayloadV1WireTagsArePinned(t *testing.T) {
 		}},
 		{reflect.TypeFor[taskRunSnapshotPayloadV1](), []string{
 			"schema_version", "tenant_id", "user_id", "task_id", "run_kind", "mode",
-			"adaptive_version", "policies", "budget", "definition", "reference_schema_version",
+			"adaptive_version", "observation_rollout,omitempty", "policies", "budget",
+			"definition", "reference_schema_version",
 		}},
 		{reflect.TypeFor[taskRunApprovedDefinitionDigestEnvelopeV1](), []string{
 			"version", "task_id", "tenant_id", "user_id", "nl_description", "spec_json",

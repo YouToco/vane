@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -14,12 +16,15 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
+	temporalworkflow "go.temporal.io/sdk/workflow"
 
 	cardgenpkg "github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/config"
+	"github.com/YouToco/vane/eventqualifier"
 	"github.com/YouToco/vane/feedback"
 	vaneFetcher "github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimeconfig"
 	"github.com/YouToco/vane/runtimepolicy"
@@ -34,8 +39,9 @@ const (
 )
 
 type compiledModelResolverFake struct {
-	err   error
-	calls atomic.Int32
+	err    error
+	calls  atomic.Int32
+	client *llm.Client
 }
 
 type compiledRouteFetcherFake struct {
@@ -100,6 +106,9 @@ func (f *compiledModelResolverFake) ResolveRuntimeModelPolicyV1(runtimepolicy.Mo
 	if f.err != nil {
 		return nil, f.err
 	}
+	if f.client != nil {
+		return f.client, nil
+	}
 	return llm.New(config.LLMConfig{MaxConcurrent: 1}), nil
 }
 
@@ -124,6 +133,7 @@ type compiledRunStoreFake struct {
 	authorizeIdentities    []types.RunIdentity
 	auditIdentities        []types.RunIdentity
 	createPolicies         []runtimepolicy.BundleV1
+	createRollouts         []observation.RolloutMode
 	shadowCreates          int
 	auditResult            store.CompiledRunSnapshotV2AuditResult
 	auditErr               error
@@ -148,6 +158,125 @@ type compiledRunStoreFake struct {
 	deliveryReceiptErr error
 }
 
+type observationRuntimeStoreFake struct {
+	mu sync.Mutex
+
+	status         string
+	response       json.RawMessage
+	spendCalls     int
+	spendRollout   []observation.RolloutMode
+	spendRuleNil   []bool
+	completeCalls  int
+	uncertainCalls int
+}
+
+func (f *observationRuntimeStoreFake) PrepareObservationQualificationStep(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	string,
+	string,
+) (string, json.RawMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.status == "" {
+		f.status = store.ObservationStepPrepared
+	}
+	return f.status, append(json.RawMessage(nil), f.response...), nil
+}
+
+func (f *observationRuntimeStoreFake) MarkObservationQualificationSending(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	string,
+	string,
+) error {
+	return errors.New("legacy split spend fence must not be called")
+}
+
+func (f *observationRuntimeStoreFake) AuthorizeObservationQualificationSpendV1(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRef,
+	_, _ string,
+	rollout observation.RolloutMode,
+	rule *runtimepolicy.QuotaBucketV1,
+	_ float64,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.status != store.ObservationStepPrepared {
+		return types.ErrConflict
+	}
+	f.spendCalls++
+	f.spendRollout = append(f.spendRollout, rollout)
+	f.spendRuleNil = append(f.spendRuleNil, rule == nil)
+	f.status = store.ObservationStepSending
+	return nil
+}
+
+func (f *observationRuntimeStoreFake) CompleteObservationQualificationStep(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRef,
+	_, _ string,
+	response json.RawMessage,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.status != store.ObservationStepSending {
+		return types.ErrConflict
+	}
+	f.status = store.ObservationStepCompleted
+	f.response = append(json.RawMessage(nil), response...)
+	f.completeCalls++
+	return nil
+}
+
+func (f *observationRuntimeStoreFake) MarkObservationQualificationUncertain(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	string,
+	string,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.status = store.ObservationStepUncertain
+	f.uncertainCalls++
+	return nil
+}
+
+func (*observationRuntimeStoreFake) ReserveObservedEventV1(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	observation.QualifiedEvent,
+) (bool, error) {
+	return true, nil
+}
+
+func (*observationRuntimeStoreFake) BindObservedEventDeliveryV1(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	string,
+	string,
+	int64,
+) error {
+	return nil
+}
+
+func (*observationRuntimeStoreFake) MarkObservedEventDeliveredV1(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	int64,
+) error {
+	return nil
+}
+
 func (f *compiledRunStoreFake) LoadCompiledRunSnapshotRefV1(
 	_ context.Context,
 	identity types.RunIdentity,
@@ -162,11 +291,17 @@ func (f *compiledRunStoreFake) CreateOrGetCompiledRunSnapshotV1(
 	_ context.Context,
 	identity types.RunIdentity,
 	policy runtimepolicy.BundleV1,
+	rollouts ...observation.RolloutMode,
 ) (types.RunSnapshotRef, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createIdentities = append(f.createIdentities, identity)
 	f.createPolicies = append(f.createPolicies, policy)
+	rollout := observation.RolloutOff
+	if len(rollouts) == 1 {
+		rollout = rollouts[0]
+	}
+	f.createRollouts = append(f.createRollouts, rollout)
 	if f.createErr != nil {
 		return types.RunSnapshotRef{}, f.createErr
 	}
@@ -174,10 +309,11 @@ func (f *compiledRunStoreFake) CreateOrGetCompiledRunSnapshotV1(
 	f.ref = ref
 	f.found = true
 	f.snapshot = runcontext.CompiledSnapshotV1{
-		Ref:        ref,
-		Mode:       types.ExecutionModeCompiled,
-		Definition: runcontext.DefinitionV1{TaskID: identity.TaskID, TenantID: identity.TenantID, UserID: identity.UserID, ScopeJSON: json.RawMessage(`{}`)},
-		Policy:     policy,
+		Ref:                ref,
+		Mode:               types.ExecutionModeCompiled,
+		ObservationRollout: rollout,
+		Definition:         runcontext.DefinitionV1{TaskID: identity.TaskID, TenantID: identity.TenantID, UserID: identity.UserID, ScopeJSON: json.RawMessage(`{}`)},
+		Policy:             policy,
 	}
 	return ref, nil
 }
@@ -186,11 +322,12 @@ func (f *compiledRunStoreFake) CreateOrGetCompiledRunSnapshotShadowV2(
 	ctx context.Context,
 	identity types.RunIdentity,
 	policy runtimepolicy.BundleV1,
+	rollouts ...observation.RolloutMode,
 ) (types.RunSnapshotRef, error) {
 	f.mu.Lock()
 	f.shadowCreates++
 	f.mu.Unlock()
-	return f.CreateOrGetCompiledRunSnapshotV1(ctx, identity, policy)
+	return f.CreateOrGetCompiledRunSnapshotV1(ctx, identity, policy, rollouts...)
 }
 
 func (f *compiledRunStoreFake) LoadAuthoritativeCompiledTaskRunSnapshot(
@@ -209,12 +346,54 @@ func (f *compiledRunStoreFake) LoadAuthoritativeCompiledTaskRunSnapshot(
 		return runcontext.CompiledSnapshotV1{}, "", f.loadSnapshotErr
 	}
 	if f.snapshot.Ref == (types.RunSnapshotRef{}) {
+		if f.snapshot.Definition.TaskID != "" {
+			snapshot := cloneCompiledSnapshot(f.snapshot)
+			snapshot.Ref = ref
+			return snapshot, store.CompiledRunSnapshotAuthorityV1, nil
+		}
 		return runcontext.CompiledSnapshotV1{
 			Ref: ref, Mode: types.ExecutionModeCompiled,
 		}, store.CompiledRunSnapshotAuthorityV1, nil
 	}
 	return cloneCompiledSnapshot(
 		f.snapshot), store.CompiledRunSnapshotAuthorityV1, nil
+}
+
+type qualifyTwiceWorkflowResult struct {
+	First  QualifyEventsResult
+	Second QualifyEventsResult
+}
+
+func qualifyTwiceTestWorkflow(
+	ctx temporalworkflow.Context,
+	in QualifyEventsIn,
+) (qualifyTwiceWorkflowResult, error) {
+	info := temporalworkflow.GetInfo(ctx).WorkflowExecution
+	identity := types.RunIdentity{
+		TemporalWorkflowID: info.ID,
+		TemporalRunID:      info.RunID,
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           in.Run.TenantID,
+		UserID:             in.UserID,
+		TaskID:             in.Run.TaskID,
+	}
+	in.Run.Snapshot = mustCompiledRunRef(identity, 123)
+	activityCtx := temporalworkflow.WithActivityOptions(
+		ctx, temporalworkflow.ActivityOptions{
+			StartToCloseTimeout: time.Minute,
+		})
+	var out qualifyTwiceWorkflowResult
+	if err := temporalworkflow.ExecuteActivity(
+		activityCtx, "QualifyEvents", in,
+	).Get(activityCtx, &out.First); err != nil {
+		return qualifyTwiceWorkflowResult{}, err
+	}
+	if err := temporalworkflow.ExecuteActivity(
+		activityCtx, "QualifyEvents", in,
+	).Get(activityCtx, &out.Second); err != nil {
+		return qualifyTwiceWorkflowResult{}, err
+	}
+	return out, nil
 }
 
 func (f *compiledRunStoreFake) AuditCompiledTaskRunSnapshotV2(
@@ -735,7 +914,8 @@ func TestPrepareRun_CreatesThenRecoversExactReferenceBeforeCurrentState(t *testi
 		return runtimepolicy.BundleV1{SchemaVersion: "first-policy"}, nil
 	}
 	a := NewActivities(new(compiledRouteFetcherFake), fakeScorer{}, fakeCardGen{}, &fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
-		WithCompiledRuntimeV1(compiledStore, builder, resolver))
+		WithCompiledRuntimeV1(compiledStore, builder, resolver),
+		WithObservationRuntime(nil, nil, identity.TaskID, ""))
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestActivityEnvironment()
 	env.RegisterActivity(a.PrepareRun)
@@ -754,6 +934,15 @@ func TestPrepareRun_CreatesThenRecoversExactReferenceBeforeCurrentState(t *testi
 	if loadRef != 1 || create != 1 || loadSnapshot != 1 || authorize != 1 || builderCalls.Load() != 1 {
 		t.Fatalf("initial call sequence loadRef=%d create=%d load=%d auth=%d build=%d", loadRef, create, loadSnapshot, authorize, builderCalls.Load())
 	}
+	compiledStore.mu.Lock()
+	if len(compiledStore.createRollouts) != 1 ||
+		compiledStore.createRollouts[0] != observation.RolloutShadow ||
+		compiledStore.snapshot.ObservationRollout != observation.RolloutShadow {
+		t.Fatalf("initial rollout was not frozen as shadow: create=%v snapshot=%q",
+			compiledStore.createRollouts,
+			compiledStore.snapshot.ObservationRollout)
+	}
+	compiledStore.mu.Unlock()
 
 	// Simulate both current task deletion and an invalid new deployment policy:
 	// Create would now fail and the builder is unavailable. Recovery must load
@@ -763,6 +952,10 @@ func TestPrepareRun_CreatesThenRecoversExactReferenceBeforeCurrentState(t *testi
 	compiledStore.mu.Unlock()
 	currentErr := errors.New("current policy is broken")
 	builderErr.Store(&currentErr)
+	// Simulate worker restart/config toggle to authority. Recovery must not
+	// recalculate rollout for this already-committed Temporal run.
+	a.observationShadowCanaryTaskID = ""
+	a.observationAuthorityCanaryTaskID = identity.TaskID
 
 	recovered, err := executePrepareRun(t, env, a, p)
 	if err != nil {
@@ -774,6 +967,342 @@ func TestPrepareRun_CreatesThenRecoversExactReferenceBeforeCurrentState(t *testi
 	loadRef, create, loadSnapshot, authorize = compiledStore.counts()
 	if loadRef != 2 || create != 1 || loadSnapshot != 2 || authorize != 2 || builderCalls.Load() != 1 {
 		t.Fatalf("recovery consulted current state: loadRef=%d create=%d load=%d auth=%d build=%d", loadRef, create, loadSnapshot, authorize, builderCalls.Load())
+	}
+	compiledStore.mu.Lock()
+	defer compiledStore.mu.Unlock()
+	if compiledStore.snapshot.ObservationRollout != observation.RolloutShadow ||
+		len(compiledStore.createRollouts) != 1 {
+		t.Fatalf("recovery changed frozen rollout: snapshot=%q creates=%v",
+			compiledStore.snapshot.ObservationRollout,
+			compiledStore.createRollouts)
+	}
+}
+
+func TestQualifyEvents_ShadowUsesFrozenRolloutCallsOnceAndReturnsCandidates(
+	t *testing.T,
+) {
+	const (
+		taskID     = "task-observation-shadow"
+		workflowID = "wf-task-observation-shadow-2026-07-25T00:00:00Z"
+	)
+	var upstreamCalls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter, _ *http.Request,
+	) {
+		upstreamCalls.Add(1)
+		_, _ = w.Write([]byte(`{
+			"id":"shadow-call",
+			"model":"shadow-model",
+			"choices":[{"message":{"content":"{\"outcome\":\"no_match\",\"events\":[]}"}}],
+			"usage":{"prompt_tokens":10,"completion_tokens":4}
+		}`))
+	}))
+	t.Cleanup(srv.Close)
+	modelClient := llm.New(config.LLMConfig{
+		Provider: "deepseek", BaseURL: srv.URL,
+		APIKey: "test", MaxConcurrent: 1,
+	})
+
+	policy, err := observation.Compile(observation.PolicySpecV1{
+		Schema: observation.SchemaV1,
+		Mode:   observation.ModeEvent,
+		Window: observation.WindowSpecV1{
+			Kind:                   observation.WindowRollingDuration,
+			RollingDurationSeconds: 86_400,
+		},
+		LatePolicy: observation.LateStrict,
+		Evidence: observation.EvidencePolicyV1{
+			Requirement:     observation.EvidenceOfficialRequired,
+			OfficialDomains: []string{"openai.com"},
+		},
+		UnknownTime: observation.UnknownTimeReject,
+		Event: &observation.EventPolicyV1{
+			Subject: "OpenAI models", EventKind: "model_release",
+			Qualification: observation.QualificationGeneralAvailability,
+		},
+		QualifierPrompt: observation.QualifierPromptV1,
+	}, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopeJSON, err := json.Marshal(struct {
+		Observation observation.PolicyV1 `json:"observation"`
+	}{Observation: policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	modelPolicy := runtimepolicy.ModelPolicyV1{
+		Calls: []runtimepolicy.ModelCallV1{{
+			Stage: runtimepolicy.ModelStageCardGen,
+			Model: "shadow-model", MaxTokens: 256, DisableThinking: true,
+		}},
+	}
+	quotaPolicy := runtimepolicy.QuotaPolicyV1{
+		Buckets: []runtimepolicy.QuotaBucketV1{{
+			Name: "llm_tokens", Financial: true,
+			EnforcementVersion: runtimepolicy.QuotaEnforcementLLMPrechargeV1,
+		}},
+	}
+	compiledStore := &compiledRunStoreFake{
+		snapshot: runcontext.CompiledSnapshotV1{
+			Mode:               types.ExecutionModeCompiled,
+			ObservationRollout: observation.RolloutShadow,
+			Definition: runcontext.DefinitionV1{
+				TaskID: taskID, TenantID: 7, UserID: 9,
+				SpecJSON:  json.RawMessage(`{"every_seconds":86400,"anchor_at":"2026-07-01T00:00:00Z","tz":"UTC"}`),
+				ScopeJSON: scopeJSON,
+			},
+			Policy: runtimepolicy.BundleV1{
+				ModelPolicy: modelPolicy,
+				QuotaPolicy: quotaPolicy,
+			},
+		},
+	}
+	observationStore := new(observationRuntimeStoreFake)
+	resolver := &compiledModelResolverFake{client: modelClient}
+	activities := NewActivities(
+		new(compiledRouteFetcherFake), fakeScorer{}, fakeCardGen{},
+		&fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledRuntimeV1(compiledStore, nil, resolver),
+		// Live config has advanced to authority. The existing run remains
+		// shadow because QualifyEvents reads only the immutable snapshot.
+		WithObservationRuntime(
+			observationStore, eventqualifier.New(nil), taskID, taskID),
+	)
+
+	published := time.Date(2026, 7, 24, 23, 0, 0, 0, time.UTC)
+	candidates := []types.ContentItem{{
+		ID: 77, Title: "candidate", URL: "https://openai.com/index/release",
+		Content: "OpenAI announced availability.", PublishedAt: &published,
+	}}
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: workflowID})
+	env.RegisterWorkflow(qualifyTwiceTestWorkflow)
+	env.RegisterActivity(activities.QualifyEvents)
+	env.ExecuteWorkflow(qualifyTwiceTestWorkflow, QualifyEventsIn{
+		UserID: 9, TraceID: "shadow-trace", ScheduleID: taskID,
+		Items: candidates,
+		Run:   &CompiledRunInputV1{TenantID: 7, TaskID: taskID},
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("shadow qualification workflow: %v", err)
+	}
+	var result qualifyTwiceWorkflowResult
+	if err := env.GetWorkflowResult(&result); err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range []QualifyEventsResult{result.First, result.Second} {
+		if !reflect.DeepEqual(got.Items, candidates) ||
+			got.Outcome != "shadow_no_match" {
+			t.Fatalf("shadow result=%+v, want original candidates/no_match", got)
+		}
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("shadow qualifier upstream calls=%d, want 1 across retry",
+			upstreamCalls.Load())
+	}
+	observationStore.mu.Lock()
+	defer observationStore.mu.Unlock()
+	if observationStore.spendCalls != 1 ||
+		observationStore.completeCalls != 1 ||
+		len(observationStore.spendRollout) != 1 ||
+		observationStore.spendRollout[0] != observation.RolloutShadow ||
+		!observationStore.spendRuleNil[0] {
+		t.Fatalf("shadow spend fence drifted: %+v", observationStore)
+	}
+}
+
+func TestQualifyEventCandidates_InvalidSemanticResultIsPersistedUncertain(
+	t *testing.T,
+) {
+	const taskID = "task-observation-invalid-semantic"
+	var upstreamCalls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter, _ *http.Request,
+	) {
+		upstreamCalls.Add(1)
+		_, _ = w.Write([]byte(`{
+			"id":"invalid-semantic-call",
+			"model":"shadow-model",
+			"choices":[{"message":{"content":"{\"outcome\":\"match\",\"events\":[{\"event_type\":\"model_release\",\"subject\":\"OpenAI models\",\"release_identifier\":\"gpt-invalid\",\"occurred_at\":\"2026-07-24T23:00:00Z\",\"qualification\":\"general_availability\",\"evidence_content_ids\":[999],\"reason\":\"not a supplied candidate\"}]}"}}],
+			"usage":{"prompt_tokens":10,"completion_tokens":4}
+		}`))
+	}))
+	t.Cleanup(srv.Close)
+	modelClient := llm.New(config.LLMConfig{
+		Provider: "deepseek", BaseURL: srv.URL,
+		APIKey: "test", MaxConcurrent: 1,
+	})
+	policy, err := observation.Compile(observation.PolicySpecV1{
+		Schema: observation.SchemaV1,
+		Mode:   observation.ModeEvent,
+		Window: observation.WindowSpecV1{
+			Kind:                   observation.WindowRollingDuration,
+			RollingDurationSeconds: 86_400,
+		},
+		LatePolicy: observation.LateStrict,
+		Evidence: observation.EvidencePolicyV1{
+			Requirement:     observation.EvidenceOfficialRequired,
+			OfficialDomains: []string{"openai.com"},
+		},
+		UnknownTime: observation.UnknownTimeReject,
+		Event: &observation.EventPolicyV1{
+			Subject: "OpenAI models", EventKind: "model_release",
+			Qualification: observation.QualificationGeneralAvailability,
+		},
+		QualifierPrompt: observation.QualifierPromptV1,
+	}, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := types.RunIdentity{
+		TemporalWorkflowID: "wf-" + taskID + "-2026-07-25T00:00:00Z",
+		TemporalRunID:      "run-invalid-semantic",
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           7,
+		UserID:             9,
+		TaskID:             taskID,
+	}
+	ref := mustCompiledRunRef(identity, 501)
+	observationStore := new(observationRuntimeStoreFake)
+	activities := NewActivities(
+		new(compiledRouteFetcherFake), fakeScorer{}, fakeCardGen{},
+		&fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledRuntimeV1(nil, nil,
+			&compiledModelResolverFake{client: modelClient}),
+		WithObservationRuntime(
+			observationStore, eventqualifier.New(nil), taskID, ""),
+	)
+	published := time.Date(2026, 7, 24, 23, 0, 0, 0, time.UTC)
+	items := []types.ContentItem{{
+		ID: 77, Title: "candidate", URL: "https://openai.com/index/release",
+		Content: "OpenAI announced availability.", PublishedAt: &published,
+	}}
+	got, outcome, err := activities.qualifyEventCandidates(
+		t.Context(),
+		identity,
+		runcontext.CompiledSnapshotV1{
+			Ref: ref, Mode: types.ExecutionModeCompiled,
+			ObservationRollout: observation.RolloutShadow,
+			Policy: runtimepolicy.BundleV1{
+				ModelPolicy: runtimepolicy.ModelPolicyV1{
+					Calls: []runtimepolicy.ModelCallV1{{
+						Stage: runtimepolicy.ModelStageCardGen,
+						Model: "shadow-model", MaxTokens: 256,
+						DisableThinking: true,
+					}},
+				},
+			},
+		},
+		QualifyEventsIn{
+			UserID: 9, TraceID: "invalid-semantic-trace",
+			ScheduleID: taskID, Items: items,
+			Run: &CompiledRunInputV1{
+				TenantID: 7, TaskID: taskID, Snapshot: ref,
+			},
+		},
+		observation.RolloutShadow,
+		policy,
+		observation.Window{
+			Start: time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC),
+			End:   time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil || outcome != "uncertain" {
+		t.Fatalf("invalid semantic result=(%v,%q), want nil/uncertain",
+			got, outcome)
+	}
+	observationStore.mu.Lock()
+	defer observationStore.mu.Unlock()
+	if upstreamCalls.Load() != 1 ||
+		observationStore.spendCalls != 1 ||
+		observationStore.completeCalls != 0 ||
+		observationStore.uncertainCalls != 1 ||
+		observationStore.status != store.ObservationStepUncertain {
+		t.Fatalf("invalid semantic audit drifted: upstream=%d store=%+v",
+			upstreamCalls.Load(), observationStore)
+	}
+}
+
+func TestQualifyEvents_ContentShadowUsesSnapshotWhenLiveConfigIsOff(
+	t *testing.T,
+) {
+	const (
+		taskID     = "task-observation-content"
+		workflowID = "wf-task-observation-content-2026-07-25T00:00:00Z"
+	)
+	policy, err := observation.Compile(observation.PolicySpecV1{
+		Schema: observation.SchemaV1,
+		Mode:   observation.ModeContent,
+		Window: observation.WindowSpecV1{
+			Kind:                   observation.WindowRollingDuration,
+			RollingDurationSeconds: 3_600,
+		},
+		LatePolicy: observation.LateStrict,
+		Evidence: observation.EvidencePolicyV1{
+			Requirement: observation.EvidenceTrustedAllowed,
+		},
+		UnknownTime: observation.UnknownTimeReject,
+	}, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopeJSON, err := json.Marshal(struct {
+		Observation observation.PolicyV1 `json:"observation"`
+	}{Observation: policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiledStore := &compiledRunStoreFake{
+		snapshot: runcontext.CompiledSnapshotV1{
+			Mode:               types.ExecutionModeCompiled,
+			ObservationRollout: observation.RolloutShadow,
+			Definition: runcontext.DefinitionV1{
+				TaskID: taskID, TenantID: 7, UserID: 9,
+				SpecJSON:  json.RawMessage(`{"every_seconds":3600,"anchor_at":"2026-07-01T00:00:00Z","tz":"UTC"}`),
+				ScopeJSON: scopeJSON,
+			},
+		},
+	}
+	observationStore := new(observationRuntimeStoreFake)
+	activities := NewActivities(
+		new(compiledRouteFetcherFake), fakeScorer{}, fakeCardGen{},
+		&fakePusher{}, &fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledRuntimeV1(compiledStore, nil, nil),
+		// Current worker rollout is fully off.
+		WithObservationRuntime(observationStore, nil, "", ""),
+	)
+	old := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	candidates := []types.ContentItem{{
+		ID: 88, Title: "old candidate",
+		URL: "https://example.com/old", PublishedAt: &old,
+	}}
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: workflowID})
+	env.RegisterWorkflow(qualifyTwiceTestWorkflow)
+	env.RegisterActivity(activities.QualifyEvents)
+	env.ExecuteWorkflow(qualifyTwiceTestWorkflow, QualifyEventsIn{
+		UserID: 9, TraceID: "content-shadow", ScheduleID: taskID,
+		Items: candidates,
+		Run:   &CompiledRunInputV1{TenantID: 7, TaskID: taskID},
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("content shadow workflow: %v", err)
+	}
+	var result qualifyTwiceWorkflowResult
+	if err := env.GetWorkflowResult(&result); err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range []QualifyEventsResult{result.First, result.Second} {
+		if !reflect.DeepEqual(got.Items, candidates) ||
+			got.Outcome != "shadow_no_match" {
+			t.Fatalf("content shadow result=%+v", got)
+		}
 	}
 }
 

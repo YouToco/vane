@@ -305,6 +305,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.compiled_runtime_allow_all", false)
 	v.SetDefault("pipeline.snapshot_v2_shadow_canary_schedule_id", "")
 	v.SetDefault("pipeline.snapshot_v2_read_audit_canary_schedule_id", "")
+	// Observation rollout remains exact-task only. Register both defaults so
+	// Viper AutomaticEnv recognizes VANE_PIPELINE_OBSERVATION_* in an
+	// environment-only deployment; neither is sensitive configuration.
+	v.SetDefault("pipeline.observation_shadow_canary_schedule_id", "")
+	v.SetDefault("pipeline.observation_authority_canary_schedule_id", "")
 
 	v.SetDefault("agent.max_turns", 20)
 	v.SetDefault("agent.definition_edit_enabled", false)

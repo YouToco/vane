@@ -44,7 +44,7 @@ type upstreamEntry struct {
 // 否则 TestInvariant_NoUnguardedUpstreamEntry 会变红。
 var upstreamEntries = []upstreamEntry{
 	{
-		file: "do.go", fn: "Do", upstream: "Complete",
+		file: "do.go", fn: "do", upstream: "Complete",
 		gate: "BeforeSpend", accounting: "finishCallAccountingWithReservation",
 		why: "单轮调用：打分 / 出卡 / 画像演化 / playbook 翻译；" +
 			"compiled run 必须消费冻结规则", estimator: "estimateTokens",
@@ -210,9 +210,10 @@ func TestInvariant_NoUnguardedUpstreamEntry(t *testing.T) {
 		}
 		for _, d := range f.Decls {
 			fd, ok := d.(*ast.FuncDecl)
-			// 只看包级导出函数：Client 自己的方法（Complete/Chat）是被包装的对象，
-			// 闸门装在包装层而不是它们身上。
-			if !ok || fd.Recv != nil || !fd.Name.IsExported() || fd.Body == nil {
+			// 检查全部包级函数（包括私有咽喉）：Client 自己的方法
+			//（Complete/Chat）是被包装的对象，闸门装在包装层而不是它们身上。
+			// 私有函数也必须登记，否则把上游调用抽进 helper 就能绕过结构守卫。
+			if !ok || fd.Recv != nil || fd.Body == nil {
 				continue
 			}
 			for m := range lowLevel {

@@ -6,6 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
 )
@@ -16,8 +17,9 @@ import (
 // non-secret runtime DTOs. Compiled V1 has no planner, so callers cannot supply
 // a budget, execution mode, or adaptive version independently.
 type CreateOrGetCompiledTaskRunSnapshotV1Params struct {
-	Identity types.RunIdentity
-	Policy   runtimepolicy.BundleV1
+	Identity           types.RunIdentity
+	Policy             runtimepolicy.BundleV1
+	ObservationRollout observation.RolloutMode
 }
 
 // CreateOrGetCompiledRunSnapshotV1 is the interface-friendly production
@@ -29,9 +31,16 @@ func (s *Store) CreateOrGetCompiledRunSnapshotV1(
 	ctx context.Context,
 	identity types.RunIdentity,
 	policy runtimepolicy.BundleV1,
+	observationRollout ...observation.RolloutMode,
 ) (types.RunSnapshotRef, error) {
+	rollout, err := observationRolloutArgument(observationRollout)
+	if err != nil {
+		return types.RunSnapshotRef{}, err
+	}
 	return s.CreateOrGetCompiledTaskRunSnapshotV1(ctx,
-		CreateOrGetCompiledTaskRunSnapshotV1Params{Identity: identity, Policy: policy})
+		CreateOrGetCompiledTaskRunSnapshotV1Params{
+			Identity: identity, Policy: policy, ObservationRollout: rollout,
+		})
 }
 
 // CreateOrGetCompiledRunSnapshotShadowV2 creates the unchanged v1 runtime
@@ -41,11 +50,15 @@ func (s *Store) CreateOrGetCompiledRunSnapshotShadowV2(
 	ctx context.Context,
 	identity types.RunIdentity,
 	policy runtimepolicy.BundleV1,
+	observationRollout ...observation.RolloutMode,
 ) (types.RunSnapshotRef, error) {
+	rollout, err := observationRolloutArgument(observationRollout)
+	if err != nil {
+		return types.RunSnapshotRef{}, err
+	}
 	return s.createOrGetCompiledTaskRunSnapshotV1(ctx,
 		CreateOrGetCompiledTaskRunSnapshotV1Params{
-			Identity: identity,
-			Policy:   policy,
+			Identity: identity, Policy: policy, ObservationRollout: rollout,
 		}, true)
 }
 
@@ -86,8 +99,10 @@ func (s *Store) createOrGetCompiledTaskRunSnapshotV1(
 	promptPolicy, promptErr := runtimepolicy.EncodePromptPolicyV1(p.Policy.PromptPolicy)
 	modelPolicy, modelErr := runtimepolicy.EncodeModelPolicyV1(p.Policy.ModelPolicy)
 	quotaPolicy, quotaErr := runtimepolicy.EncodeQuotaPolicyV1(p.Policy.QuotaPolicy)
+	rollout, rolloutErr := normalizeObservationRollout(
+		[]observation.RolloutMode{p.ObservationRollout})
 	if capabilityErr != nil || toolErr != nil || promptErr != nil ||
-		modelErr != nil || quotaErr != nil ||
+		modelErr != nil || quotaErr != nil || rolloutErr != nil ||
 		p.Policy.SchemaVersion != runtimepolicy.BundleSchemaVersionV1 {
 		// An invalid/obsolete caller still waits behind the same RunID fence.
 		// This preserves response-lost recovery without creating an outer
@@ -114,11 +129,42 @@ func (s *Store) createOrGetCompiledTaskRunSnapshotV1(
 	lookup.ModelPolicyJSON = modelPolicy
 	lookup.QuotaPolicyJSON = quotaPolicy
 	lookup.BudgetJSON = budget
+	lookup.ObservationRollout = rollout
 	snapshot, err := s.createOrGetTaskRunSnapshotWithShadowV2(ctx, lookup, shadowV2)
 	if err != nil {
 		return types.RunSnapshotRef{}, err
 	}
 	return snapshot.safeRef()
+}
+
+func observationRolloutArgument(
+	values []observation.RolloutMode,
+) (observation.RolloutMode, error) {
+	if len(values) > 1 {
+		return "", taskRunValidationError(
+			"compiled observation rollout has multiple decisions")
+	}
+	if len(values) == 0 {
+		return observation.RolloutOff, nil
+	}
+	return values[0], nil
+}
+
+func normalizeObservationRollout(
+	values []observation.RolloutMode,
+) (observation.RolloutMode, error) {
+	if len(values) > 1 {
+		return "", taskRunValidationError(
+			"compiled observation rollout has multiple decisions")
+	}
+	if len(values) == 0 || values[0] == "" {
+		return observation.RolloutOff, nil
+	}
+	if !values[0].Valid() {
+		return "", taskRunValidationError(
+			"compiled observation rollout is invalid")
+	}
+	return values[0], nil
 }
 
 // loadTaskRunSnapshotBehindFence waits for any in-flight writer of the same

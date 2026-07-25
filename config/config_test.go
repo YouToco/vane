@@ -115,26 +115,30 @@ func TestSnapshotV2ReadAuditCanaryValidation(t *testing.T) {
 
 func TestObservationCanaryValidation(t *testing.T) {
 	tests := []struct {
-		name       string
-		compiled   bool
-		compiledID string
-		allowAll   bool
-		shadow     string
-		authority  string
-		wantErr    bool
+		name          string
+		compiled      bool
+		compiledID    string
+		allowAll      bool
+		shadow        string
+		authority     string
+		wantShadow    string
+		wantAuthority string
+		wantErr       bool
 	}{
 		{name: "off"},
 		{
 			name: "shadow only", compiled: true, compiledID: "push-observe",
-			shadow: " push-observe ",
+			shadow: " push-observe ", wantShadow: "push-observe",
 		},
 		{
 			name: "authority exact", compiled: true, compiledID: "push-observe",
 			shadow: "push-observe", authority: "push-observe",
+			wantShadow: "push-observe", wantAuthority: "push-observe",
 		},
 		{
 			name: "allow all compiled", compiled: true, allowAll: true,
 			shadow: "push-observe", authority: "push-observe",
+			wantShadow: "push-observe", wantAuthority: "push-observe",
 		},
 		{name: "disabled", shadow: "push-observe", wantErr: true},
 		{
@@ -144,6 +148,22 @@ func TestObservationCanaryValidation(t *testing.T) {
 		{
 			name: "authority differs", compiled: true, compiledID: "push-observe",
 			shadow: "push-observe", authority: "push-other", wantErr: true,
+		},
+		{
+			name: "authority requires shadow", compiled: true, compiledID: "push-observe",
+			authority: "push-observe", wantErr: true,
+		},
+		{
+			name: "shadow whitespace only", compiled: true, compiledID: "push-observe",
+			shadow: " \t\n ", wantErr: true,
+		},
+		{
+			name: "authority whitespace only", compiled: true, compiledID: "push-observe",
+			shadow: "push-observe", authority: " \t\n ", wantErr: true,
+		},
+		{
+			name: "invalid shadow identifier", compiled: true, compiledID: "push-observe",
+			shadow: "push\nobserve", wantErr: true,
 		},
 	}
 	for _, test := range tests {
@@ -161,6 +181,14 @@ func TestObservationCanaryValidation(t *testing.T) {
 			err := cfg.Validate()
 			if (err != nil) != test.wantErr {
 				t.Fatalf("Validate() error=%v wantErr=%v", err, test.wantErr)
+			}
+			if !test.wantErr &&
+				(cfg.Pipeline.ObservationShadowCanaryScheduleID != test.wantShadow ||
+					cfg.Pipeline.ObservationAuthorityCanaryScheduleID != test.wantAuthority) {
+				t.Fatalf("observation canaries = (%q,%q), want (%q,%q)",
+					cfg.Pipeline.ObservationShadowCanaryScheduleID,
+					cfg.Pipeline.ObservationAuthorityCanaryScheduleID,
+					test.wantShadow, test.wantAuthority)
 			}
 		})
 	}
@@ -416,6 +444,30 @@ func TestEnvOnlyNoFile(t *testing.T) {
 	}
 }
 
+// TestEnvOnlyObservationCanaries proves that the exact-task observation
+// switches are registered with Viper before AutomaticEnv. Without defaults (or
+// an explicit BindEnv), VANE_PIPELINE_OBSERVATION_* is silently omitted by
+// Unmarshal in an environment-only deployment.
+func TestEnvOnlyObservationCanaries(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("VANE_DB_URL", "postgres://env")
+	t.Setenv("VANE_PIPELINE_COMPILED_RUNTIME_ENABLED", "true")
+	t.Setenv("VANE_PIPELINE_COMPILED_RUNTIME_CANARY_SCHEDULE_ID", "push-observe")
+	t.Setenv("VANE_PIPELINE_OBSERVATION_SHADOW_CANARY_SCHEDULE_ID", " push-observe ")
+	t.Setenv("VANE_PIPELINE_OBSERVATION_AUTHORITY_CANARY_SCHEDULE_ID", "push-observe")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("环境变量 observation canary 配置应能启动: %v", err)
+	}
+	if cfg.Pipeline.ObservationShadowCanaryScheduleID != "push-observe" ||
+		cfg.Pipeline.ObservationAuthorityCanaryScheduleID != "push-observe" {
+		t.Fatalf("VANE_PIPELINE_OBSERVATION_* 未进入配置或未规范化: %+v", cfg.Pipeline)
+	}
+}
+
 // TestDefaults 验证内置默认值与 config.example.yaml 一致。
 func TestDefaults(t *testing.T) {
 	clearVaneEnv(t)
@@ -453,6 +505,8 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.playbook_prompts_enabled", cfg.Pipeline.PlaybookPromptsEnabled, false},
 		{"pipeline.playbook_prompt_canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID, ""},
 		{"pipeline.playbook_prompts_allow_all", cfg.Pipeline.PlaybookPromptsAllowAll, false},
+		{"pipeline.observation_shadow_canary_schedule_id", cfg.Pipeline.ObservationShadowCanaryScheduleID, ""},
+		{"pipeline.observation_authority_canary_schedule_id", cfg.Pipeline.ObservationAuthorityCanaryScheduleID, ""},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
 		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 100000},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},
