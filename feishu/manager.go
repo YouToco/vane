@@ -498,7 +498,11 @@ func (m *Manager) reload(ctx context.Context) error {
 	h := newHandlerForApp(m, wsCtx, cfg.AppID)
 	wsCli := larkws.NewClient(cfg.AppID, cfg.AppSecret,
 		larkws.WithEventHandler(h.eventDispatcher()),
-		larkws.WithLogLevel(larkcore.LogLevelInfo),
+		// The SDK may include the complete WebSocket URL not only in INFO
+		// connection logs, but also in malformed-URL errors. The custom logger
+		// discards every SDK-supplied value before it reaches journald.
+		larkws.WithLogger(newFeishuSDKLogger()),
+		larkws.WithLogLevel(larkcore.LogLevelError),
 	)
 
 	now := time.Now()
@@ -530,12 +534,21 @@ func (m *Manager) reload(ctx context.Context) error {
 		if m.gen != gen {
 			return // 已被更新的连接取代，不覆盖新状态
 		}
-		m.connected = false
-		m.connectedAt = nil
-		m.lastError = "WS 连接失败：" + err.Error()
-		slog.Error("feishu: WS 连接退出", "err", err)
+		m.recordWSFailureLocked(slog.Default(), err)
 	}()
 	return nil
+}
+
+// recordWSFailureLocked records a WS failure without retaining any provider
+// value. The caller must hold m.mu.
+func (m *Manager) recordWSFailureLocked(logger *slog.Logger, err error) {
+	m.connected = false
+	m.connectedAt = nil
+	m.lastError = "WS 连接失败（详情已脱敏）"
+	if logger != nil {
+		logger.Error("feishu: WS 连接退出（详情已脱敏）",
+			"error_type", fmt.Sprintf("%T", err))
+	}
 }
 
 // api 返回当前发消息用的 API 客户端（handler 回复消息时取用）。

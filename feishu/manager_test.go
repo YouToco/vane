@@ -4,7 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +21,149 @@ import (
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
+
+func TestManagerUsesCredentialSafeSDKLogger(t *testing.T) {
+	fset := token.NewFileSet()
+	newClientSelectors := 0
+	err := filepath.WalkDir("..", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, parseErr := parser.ParseFile(fset, filepath.Clean(path), nil, 0)
+		if parseErr != nil {
+			return parseErr
+		}
+		wsAliases := make(map[string]struct{})
+		for _, spec := range file.Imports {
+			importPath, unquoteErr := strconv.Unquote(spec.Path.Value)
+			if unquoteErr != nil || importPath != "github.com/larksuite/oapi-sdk-go/v3/ws" {
+				continue
+			}
+			alias := "ws"
+			if spec.Name != nil {
+				alias = spec.Name.Name
+			}
+			if alias == "." {
+				t.Fatalf("Feishu WS SDK dot import bypasses constructor guard: %s", path)
+			}
+			wsAliases[alias] = struct{}{}
+		}
+
+		var parents []ast.Node
+		ast.Inspect(file, func(node ast.Node) bool {
+			if node == nil {
+				parents = parents[:len(parents)-1]
+				return true
+			}
+			var parent ast.Node
+			if len(parents) > 0 {
+				parent = parents[len(parents)-1]
+			}
+			parents = append(parents, node)
+
+			selector, ok := node.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != "NewClient" {
+				return true
+			}
+			pkg, ok := selector.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			if _, imported := wsAliases[pkg.Name]; !imported {
+				return true
+			}
+			newClientSelectors++
+			call, direct := parent.(*ast.CallExpr)
+			rel, relErr := filepath.Rel("..", path)
+			if relErr != nil {
+				t.Fatal(relErr)
+			}
+			if !direct || call.Fun != selector ||
+				filepath.ToSlash(rel) != "feishu/manager.go" {
+				t.Fatalf("Feishu WS constructor must be one direct manager.go call: %s",
+					fset.Position(selector.Pos()))
+			}
+			assertSafeWSClientOptions(t, call, pkg.Name)
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newClientSelectors != 1 {
+		t.Fatalf("Feishu WS constructor selectors = %d, want 1", newClientSelectors)
+	}
+}
+
+func assertSafeWSClientOptions(t *testing.T, call *ast.CallExpr, wsAlias string) {
+	t.Helper()
+	if len(call.Args) != 5 {
+		t.Fatalf("Feishu WS constructor args = %d, want app, secret and exactly 3 options",
+			len(call.Args))
+	}
+	counts := map[string]int{}
+	for _, expr := range call.Args[2:] {
+		option, ok := expr.(*ast.CallExpr)
+		if !ok {
+			t.Fatal("Feishu WS options must be direct calls")
+		}
+		selector, ok := option.Fun.(*ast.SelectorExpr)
+		if !ok {
+			t.Fatal("Feishu WS option must be a package selector")
+		}
+		pkg, ok := selector.X.(*ast.Ident)
+		if !ok || pkg.Name != wsAlias || len(option.Args) != 1 {
+			t.Fatal("Feishu WS option must be a single-argument SDK option")
+		}
+		counts[selector.Sel.Name]++
+		switch selector.Sel.Name {
+		case "WithEventHandler":
+		case "WithLogger":
+			if !isDirectZeroArgCall(option.Args[0], "newFeishuSDKLogger") {
+				t.Fatal("Feishu WS logger is not the credential-safe logger")
+			}
+		case "WithLogLevel":
+			if !isSelector(option.Args[0], "larkcore", "LogLevelError") {
+				t.Fatal("Feishu WS log level is not Error")
+			}
+		default:
+			t.Fatalf("unreviewed Feishu WS option %s", selector.Sel.Name)
+		}
+	}
+	for _, option := range []string{"WithEventHandler", "WithLogger", "WithLogLevel"} {
+		if counts[option] != 1 {
+			t.Fatalf("Feishu WS option %s count = %d, want 1", option, counts[option])
+		}
+	}
+}
+
+func isDirectZeroArgCall(expr ast.Expr, name string) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 0 {
+		return false
+	}
+	ident, ok := call.Fun.(*ast.Ident)
+	return ok && ident.Name == name
+}
+
+func isSelector(expr ast.Expr, pkgName, selectorName string) bool {
+	selector, ok := expr.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != selectorName {
+		return false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	return ok && pkg.Name == pkgName
+}
 
 func TestManagerShutdownRejectsNewWorkAndWaitsForInflight(t *testing.T) {
 	m := NewManager(nil, nil, nil)
