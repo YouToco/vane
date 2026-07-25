@@ -24,9 +24,21 @@ type pushEffectFixture struct {
 }
 
 func newPushEffectFixture(t *testing.T) pushEffectFixture {
+	return newPushEffectFixtureAt(t, 48)
+}
+
+func newPushEffectFixtureAt(
+	t *testing.T,
+	migrationVersion int64,
+) pushEffectFixture {
 	t.Helper()
 	dbURL, db, provider := migration039Scratch(t)
 	ctx := t.Context()
+	if migrationVersion > 39 {
+		if _, err := provider.UpTo(ctx, migrationVersion); err != nil {
+			t.Fatalf("migrate to %d: %v", migrationVersion, err)
+		}
+	}
 	var userID, snapshotID, batchID, deliveryA, deliveryB int64
 	openID := "push-effect-" + uuid.NewString()
 	if err := db.QueryRowContext(ctx, `
@@ -85,6 +97,16 @@ func newPushEffectFixture(t *testing.T) pushEffectFixture {
 			t.Fatal(err)
 		}
 	}
+	if migrationVersion >= 48 {
+		if _, err := db.ExecContext(ctx, `
+			UPDATE push_batches
+			   SET delivery_authority='effect'
+			 WHERE id=$1`,
+			batchID,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
 	st, err := New(ctx, dbURL)
 	if err != nil {
 		t.Fatal(err)
@@ -108,10 +130,8 @@ func newPushEffectFixture(t *testing.T) pushEffectFixture {
 }
 
 func TestMigration039RefusesDurablePushEffectDowngrade(t *testing.T) {
-	f := newPushEffectFixture(t)
-	if _, err := f.store.CreatePushEffect(t.Context(), f.prepared); err != nil {
-		t.Fatal(err)
-	}
+	f := newPushEffectFixtureAt(t, 39)
+	insertPushEffectFixtureRaw(t, f, f.db)
 	if _, err := f.provider.Down(t.Context()); err == nil ||
 		!strings.Contains(err.Error(), "refusing downgrade") {
 		t.Fatalf("039 downgrade accepted durable effect: %v", err)
@@ -131,11 +151,7 @@ func TestMigration039RefusesDurablePushEffectDowngrade(t *testing.T) {
 }
 
 func TestMigration039DownSerializesConcurrentPushEffectInsert(t *testing.T) {
-	f := newPushEffectFixture(t)
-	canonical, err := pusheffect.Canonicalize(f.prepared)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := newPushEffectFixtureAt(t, 39)
 	insertTx, err := f.db.BeginTx(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -146,27 +162,7 @@ func TestMigration039DownSerializesConcurrentPushEffectInsert(t *testing.T) {
 			_ = insertTx.Rollback()
 		}
 	}()
-	if _, err := insertTx.ExecContext(t.Context(), `
-		INSERT INTO push_effects (
-			id,tenant_id,user_id,task_id,run_snapshot_id,run_id,step_id,
-			chunk_index,chunk_count,batch_id,delivery_ids,provider,app_identity,
-			provider_chat_id,target,card_payload,card_digest,provider_uuid,
-			idempotency_expires_at,schema_version,canonical_payload,payload_digest
-		) VALUES (
-			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-			$17,$18::uuid,$19,$20,$21,$22
-		)`,
-		f.prepared.ID, f.prepared.TenantID, f.prepared.UserID,
-		f.prepared.TaskID, f.prepared.RunSnapshotID, f.prepared.RunID,
-		f.prepared.StepID, f.prepared.ChunkIndex, f.prepared.ChunkCount,
-		f.prepared.BatchID, f.prepared.DeliveryIDs, f.prepared.Provider,
-		f.prepared.AppIdentity, f.prepared.ProviderChatID, f.prepared.Target,
-		f.prepared.Card, canonical.CardDigest(), f.prepared.ProviderUUID,
-		f.prepared.IdempotencyExpiresAt,
-		pusheffect.SchemaVersion, canonical.Payload(), canonical.Digest(),
-	); err != nil {
-		t.Fatal(err)
-	}
+	insertPushEffectFixtureRaw(t, f, insertTx)
 	downDone := make(chan error, 1)
 	go func() {
 		_, downErr := f.provider.Down(t.Context())
@@ -187,6 +183,43 @@ func TestMigration039DownSerializesConcurrentPushEffectInsert(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("039 Down did not converge")
+	}
+}
+
+type pushEffectFixtureExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertPushEffectFixtureRaw(
+	t *testing.T,
+	f pushEffectFixture,
+	execer pushEffectFixtureExecer,
+) {
+	t.Helper()
+	canonical, err := pusheffect.Canonicalize(f.prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execer.ExecContext(t.Context(), `
+		INSERT INTO push_effects (
+			id,tenant_id,user_id,task_id,run_snapshot_id,run_id,step_id,
+			chunk_index,chunk_count,batch_id,delivery_ids,provider,app_identity,
+			provider_chat_id,target,card_payload,card_digest,provider_uuid,
+			idempotency_expires_at,schema_version,canonical_payload,payload_digest
+		) VALUES (
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+			$17,$18::uuid,$19,$20,$21,$22
+		)`,
+		f.prepared.ID, f.prepared.TenantID, f.prepared.UserID,
+		f.prepared.TaskID, f.prepared.RunSnapshotID, f.prepared.RunID,
+		f.prepared.StepID, f.prepared.ChunkIndex, f.prepared.ChunkCount,
+		f.prepared.BatchID, f.prepared.DeliveryIDs, f.prepared.Provider,
+		f.prepared.AppIdentity, f.prepared.ProviderChatID, f.prepared.Target,
+		f.prepared.Card, canonical.CardDigest(), f.prepared.ProviderUUID,
+		f.prepared.IdempotencyExpiresAt,
+		pusheffect.SchemaVersion, canonical.Payload(), canonical.Digest(),
+	); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -213,6 +246,49 @@ func waitForMigration039DowngradeFence(
 		time.Sleep(10 * time.Millisecond)
 	}
 	return false
+}
+
+func TestCreatePushEffectRequiresEffectBatchAuthority(t *testing.T) {
+	f := newPushEffectFixture(t)
+	ctx := t.Context()
+	if _, err := f.db.ExecContext(ctx, `
+		UPDATE push_batches SET delivery_authority='legacy' WHERE id=$1`,
+		f.prepared.BatchID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.CreatePushEffect(ctx, f.prepared); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("legacy authority admitted effect create: %v", err)
+	}
+	var effects int
+	if err := f.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM push_effects WHERE id=$1`,
+		f.prepared.ID,
+	).Scan(&effects); err != nil {
+		t.Fatal(err)
+	}
+	if effects != 0 {
+		t.Fatalf("rejected authority inserted %d effects", effects)
+	}
+
+	if _, err := f.db.ExecContext(ctx, `
+		UPDATE push_batches SET delivery_authority='effect' WHERE id=$1`,
+		f.prepared.BatchID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.CreatePushEffect(ctx, f.prepared); err != nil {
+		t.Fatalf("effect authority create: %v", err)
+	}
+	if _, err := f.db.ExecContext(ctx, `
+		UPDATE push_batches SET delivery_authority='legacy' WHERE id=$1`,
+		f.prepared.BatchID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.CreatePushEffect(ctx, f.prepared); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("replay bypassed revoked effect authority: %v", err)
+	}
 }
 
 func TestPushEffectCreateClaimFailureAndReceiptConverge(t *testing.T) {

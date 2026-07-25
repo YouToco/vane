@@ -111,6 +111,8 @@ type pushEffectStoreFake struct {
 
 	initialStatus   pusheffect.Status
 	batchStarted    bool
+	authorityWinner types.PushBatchDeliveryAuthority
+	authorityClaims []types.PushBatchDeliveryAuthority
 	prepared        []pusheffect.Prepared
 	claims          int
 	reconciles      int
@@ -119,6 +121,20 @@ type pushEffectStoreFake struct {
 	definiteParams  []pusheffect.FailureParams
 	ambiguousParams []pusheffect.FailureParams
 	receipts        []pusheffect.SentReceipt
+}
+
+func (f *pushEffectStoreFake) ClaimPushBatchDeliveryAuthority(
+	_ context.Context,
+	_ types.PushBatchScope,
+	desired types.PushBatchDeliveryAuthority,
+) (types.PushBatchDeliveryAuthority, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.authorityClaims = append(f.authorityClaims, desired)
+	if f.authorityWinner.Valid() {
+		return f.authorityWinner, nil
+	}
+	return desired, nil
 }
 
 func (f *pushEffectStoreFake) PushEffectBatchStarted(
@@ -279,8 +295,11 @@ func TestPush_CompiledCanaryUsesDurableEffectAndAtomicReceipt(t *testing.T) {
 	effects.mu.Lock()
 	defer effects.mu.Unlock()
 	if len(effects.prepared) != 1 || effects.claims != 1 ||
-		effects.reconciles != 0 || len(effects.receipts) != 1 {
-		t.Fatalf("effect calls prepared=%d claim=%d reconcile=%d receipts=%d",
+		effects.reconciles != 0 || len(effects.receipts) != 1 ||
+		len(effects.authorityClaims) != 1 ||
+		effects.authorityClaims[0] != types.PushBatchDeliveryAuthorityEffect {
+		t.Fatalf("effect calls authority=%v prepared=%d claim=%d reconcile=%d receipts=%d",
+			effects.authorityClaims,
 			len(effects.prepared), effects.claims,
 			effects.reconciles, len(effects.receipts))
 	}
@@ -324,6 +343,134 @@ func TestPush_CompiledCanaryUsesDurableEffectAndAtomicReceipt(t *testing.T) {
 	if deliveryReceipts != 0 || batchStatuses != 1 {
 		t.Fatalf("legacy compiled receipts=%d batch statuses=%d",
 			deliveryReceipts, batchStatuses)
+	}
+}
+
+func TestPushBatchAuthorityWinnerOverridesLocalRouting(t *testing.T) {
+	tests := []struct {
+		name            string
+		canarySelected  bool
+		winner          types.PushBatchDeliveryAuthority
+		wantDesired     types.PushBatchDeliveryAuthority
+		wantEffects     int
+		wantLegacyMarks int
+	}{
+		{
+			name:            "legacy winner overrides canary",
+			canarySelected:  true,
+			winner:          types.PushBatchDeliveryAuthorityLegacy,
+			wantDesired:     types.PushBatchDeliveryAuthorityEffect,
+			wantLegacyMarks: 1,
+		},
+		{
+			name:        "effect winner overrides rollback",
+			winner:      types.PushBatchDeliveryAuthorityEffect,
+			wantDesired: types.PushBatchDeliveryAuthorityLegacy,
+			wantEffects: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			identity, ref, snapshot := compiledActivityFixture("Frozen Task")
+			compiledStore := &compiledRunStoreFake{
+				snapshot: snapshot, authorize: true,
+			}
+			effects := &pushEffectStoreFake{
+				authorityWinner: test.winner,
+			}
+			observation := pusheffect.ProviderObservation{
+				Disposition: pusheffect.AttemptSent,
+				AppIdentity: "cli_test",
+				MessageID:   "om_authority",
+				ChatID:      "oc_owner",
+			}
+			pusher := &fakePusher{durableObservation: &observation}
+			canaryTaskID := ""
+			if test.canarySelected {
+				canaryTaskID = identity.TaskID
+			}
+			a := NewActivities(
+				fakeFetcher{},
+				fakeScorer{},
+				fakeCardGen{},
+				pusher,
+				&effectCountingStore{fakeStore: new(fakeStore)},
+				fakeFeishu{},
+				nil,
+				nil,
+				func(in feedback.AggregateCardInput) string {
+					return `{"effect_id":"` + in.EffectID + `"}`
+				},
+				func(string, int) (string, string) {
+					return "title", "blue"
+				},
+				WithCompiledRuntimeV1(
+					compiledStore,
+					func(
+						context.Context,
+						int64,
+						bool,
+					) (runtimepolicy.BundleV1, error) {
+						return runtimepolicy.BundleV1{}, nil
+					},
+					new(compiledModelResolverFake),
+				),
+				WithPushEffectCanary(effects, canaryTaskID),
+			)
+			var suite testsuite.WorkflowTestSuite
+			env := suite.NewTestActivityEnvironment()
+			env.RegisterActivity(a.Push)
+			err := executePushActivity(t, env, a, PushIn{
+				UserID:     identity.UserID,
+				ScheduleID: identity.TaskID,
+				TraceID:    "trace-authority-" + test.name,
+				Run: &CompiledRunInputV1{
+					TenantID: identity.TenantID,
+					TaskID:   identity.TaskID,
+					Snapshot: ref,
+				},
+				Cards: []GeneratedCard{{
+					Scored: types.ScoredItem{
+						Item: types.ContentItem{
+							ID: 501, SourceID: 10, Title: "item",
+						},
+						Score: 88,
+					},
+					BodyMD: "body",
+				}},
+			})
+			if err != nil {
+				t.Fatalf("Push failed: %v", err)
+			}
+			effects.mu.Lock()
+			authorityClaims := append(
+				[]types.PushBatchDeliveryAuthority(nil),
+				effects.authorityClaims...,
+			)
+			prepared := len(effects.prepared)
+			effects.mu.Unlock()
+			if len(authorityClaims) != 1 ||
+				authorityClaims[0] != test.wantDesired ||
+				prepared != test.wantEffects {
+				t.Fatalf(
+					"authority/prepared=%v/%d, want %q/%d",
+					authorityClaims,
+					prepared,
+					test.wantDesired,
+					test.wantEffects,
+				)
+			}
+			compiledStore.mu.Lock()
+			legacyMarks := compiledStore.deliveryReceipts
+			compiledStore.mu.Unlock()
+			if legacyMarks != test.wantLegacyMarks {
+				t.Fatalf(
+					"legacy delivery receipts=%d, want %d",
+					legacyMarks,
+					test.wantLegacyMarks,
+				)
+			}
+		})
 	}
 }
 

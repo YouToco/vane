@@ -18,6 +18,12 @@ func pushBatchAuthorityFixture(t *testing.T) pushEffectFixture {
 	if _, err := f.provider.UpTo(t.Context(), 48); err != nil {
 		t.Fatalf("migrate to 048: %v", err)
 	}
+	if _, err := f.db.ExecContext(t.Context(), `
+		UPDATE push_batches SET delivery_authority=NULL WHERE id=$1`,
+		f.prepared.BatchID,
+	); err != nil {
+		t.Fatal(err)
+	}
 	return f
 }
 
@@ -216,11 +222,9 @@ func TestClaimPushBatchDeliveryAuthorityExactScopeAndValidation(t *testing.T) {
 }
 
 func TestMigration048BackfillsEffectAuthority(t *testing.T) {
-	f := newPushEffectFixture(t)
+	f := newPushEffectFixtureAt(t, 39)
 	ctx := t.Context()
-	if _, err := f.store.CreatePushEffect(ctx, f.prepared); err != nil {
-		t.Fatal(err)
-	}
+	insertPushEffectFixtureRaw(t, f, f.db)
 	if _, err := f.provider.UpTo(ctx, 48); err != nil {
 		t.Fatalf("migrate to 048: %v", err)
 	}
@@ -250,6 +254,33 @@ func TestMigration048BackfillsEffectAuthority(t *testing.T) {
 	}
 	if winner != types.PushBatchDeliveryAuthorityEffect {
 		t.Fatalf("legacy stole backfilled authority: %q", winner)
+	}
+}
+
+func TestMigration048BackfillsLegacySentAuthority(t *testing.T) {
+	f := newPushEffectFixtureAt(t, 39)
+	ctx := t.Context()
+	if _, err := f.db.ExecContext(ctx, `
+		UPDATE deliveries
+		   SET status='sent',feishu_message_id='om_legacy',
+		       sent_at=clock_timestamp()
+		 WHERE id=$1`,
+		f.prepared.DeliveryIDs[0],
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.provider.UpTo(ctx, 48); err != nil {
+		t.Fatalf("migrate to 048: %v", err)
+	}
+	var authority types.PushBatchDeliveryAuthority
+	if err := f.db.QueryRowContext(ctx, `
+		SELECT delivery_authority FROM push_batches WHERE id=$1`,
+		f.prepared.BatchID,
+	).Scan(&authority); err != nil {
+		t.Fatal(err)
+	}
+	if authority != types.PushBatchDeliveryAuthorityLegacy {
+		t.Fatalf("legacy sent batch backfilled authority=%q", authority)
 	}
 }
 

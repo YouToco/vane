@@ -15,11 +15,25 @@ const migration047TestPauseKey int64 = pushEffectSchemaFenceKey - 47
 
 func migration047FenceFixture(t *testing.T) pushEffectFixture {
 	t.Helper()
-	f := newPushEffectFixture(t)
-	if _, err := f.provider.UpTo(t.Context(), 47); err != nil {
-		t.Fatalf("migrate to 047: %v", err)
-	}
+	f := newPushEffectFixtureAt(t, 47)
+	installMigration047AuthorityCompatibility(t, f)
 	return f
+}
+
+func installMigration047AuthorityCompatibility(
+	t *testing.T,
+	f pushEffectFixture,
+) {
+	t.Helper()
+	if _, err := f.db.ExecContext(t.Context(), `
+		ALTER TABLE push_batches ADD COLUMN delivery_authority TEXT;
+		UPDATE push_batches SET delivery_authority='effect' WHERE id=$1;
+		GRANT SELECT (delivery_authority)
+		    ON push_batches TO vane_push_effect_coordinator`,
+		f.prepared.BatchID,
+	); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestMigration047CreateFirstSerializesDowngrade(t *testing.T) {

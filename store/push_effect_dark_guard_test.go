@@ -13,6 +13,7 @@ import (
 
 func TestPushEffectStoreCallPointsStayInFencedCoordinator(t *testing.T) {
 	methods := map[string]bool{
+		"ClaimPushBatchDeliveryAuthority":          true,
 		"PushEffectBatchStarted":                   true,
 		"CreatePushEffect":                         true,
 		"LoadPushEffect":                           true,
@@ -36,6 +37,7 @@ func TestPushEffectStoreCallPointsStayInFencedCoordinator(t *testing.T) {
 		"BlockPushEffect":                          true,
 	}
 	expected := map[string]int{
+		"ClaimPushBatchDeliveryAuthority":         1,
 		"PushEffectBatchStarted":                  1,
 		"CreatePushEffect":                        1,
 		"LoadPushEffect":                          1,
@@ -100,7 +102,8 @@ func TestPushEffectStoreCallPointsStayInFencedCoordinator(t *testing.T) {
 				cleanPath := filepath.Clean(path)
 				allowedCall := (cleanPath == allowedFile &&
 					isPushEffectCoordinatorReceiver(selector.X) &&
-					((selector.Sel.Name == "PushEffectBatchStarted" &&
+					(((selector.Sel.Name == "PushEffectBatchStarted" ||
+						selector.Sel.Name == "ClaimPushBatchDeliveryAuthority") &&
 						function.Name.Name == "Push") ||
 						(selector.Sel.Name != "PushEffectBatchStarted" &&
 							function.Name.Name == "sendDurablePushChunk"))) ||

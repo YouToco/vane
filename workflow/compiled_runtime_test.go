@@ -2128,6 +2128,7 @@ func TestPush_CompiledRecoveryOnlyAfterRevocationMarksDoneWithoutResend(t *testi
 		snapshot: snapshot, recoveryOnly: true, authorize: false,
 	}
 	legacyStore := &effectCountingStore{fakeStore: new(fakeStore)}
+	effects := new(pushEffectStoreFake)
 	pusher := &fakePusher{msgID: "must-not-resend"}
 	a := NewActivities(fakeFetcher{}, fakeScorer{}, fakeCardGen{}, pusher, legacyStore, noOwnerFeishu{}, nil, nil,
 		func(feedback.AggregateCardInput) string { return `{}` },
@@ -2136,7 +2137,8 @@ func TestPush_CompiledRecoveryOnlyAfterRevocationMarksDoneWithoutResend(t *testi
 			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
 				return runtimepolicy.BundleV1{}, nil
 			},
-			new(compiledModelResolverFake)))
+			new(compiledModelResolverFake)),
+		WithPushEffectCanary(effects, identity.TaskID))
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestActivityEnvironment()
 	env.RegisterActivity(a.Push)
@@ -2155,6 +2157,17 @@ func TestPush_CompiledRecoveryOnlyAfterRevocationMarksDoneWithoutResend(t *testi
 	}
 	if got := len(pusher.sentCards()); got != 0 {
 		t.Fatalf("recovery-only retry resent %d external cards", got)
+	}
+	effects.mu.Lock()
+	authorityClaims := len(effects.authorityClaims)
+	preparedEffects := len(effects.prepared)
+	effects.mu.Unlock()
+	if authorityClaims != 0 || preparedEffects != 0 {
+		t.Fatalf(
+			"recovery-only touched live authority/effects=%d/%d",
+			authorityClaims,
+			preparedEffects,
+		)
 	}
 	compiledStore.mu.Lock()
 	recoveries, authorizations := compiledStore.recoveryCalls, len(compiledStore.authorizeIdentities)

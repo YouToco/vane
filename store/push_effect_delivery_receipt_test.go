@@ -465,11 +465,9 @@ func assertPushEffectReceiptUncommitted(
 }
 
 func TestMigration047ReceiptRoleAndDowngradeFence(t *testing.T) {
-	f := newPushEffectFixture(t)
+	f := newPushEffectFixtureAt(t, 47)
 	ctx := t.Context()
-	if _, err := f.provider.UpTo(ctx, 47); err != nil {
-		t.Fatalf("migrate to 047: %v", err)
-	}
+	installMigration047AuthorityCompatibility(t, f)
 	var (
 		effectCheckpointRead, deliveryRead, deliveryUpdate bool
 		deliveryInsert, effectIdentityUpdate               bool

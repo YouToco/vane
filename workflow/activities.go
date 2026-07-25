@@ -276,6 +276,11 @@ type CompiledRunSnapshotV2AuditReader interface {
 }
 
 type PushEffectStore interface {
+	ClaimPushBatchDeliveryAuthority(
+		context.Context,
+		types.PushBatchScope,
+		types.PushBatchDeliveryAuthority,
+	) (types.PushBatchDeliveryAuthority, error)
 	PushEffectBatchStarted(
 		context.Context,
 		int64,
@@ -2694,6 +2699,38 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			"尚未捕获飞书 owner，无法推送", nil))
 	}
 
+	effectEnabled := false
+	if compiled && a.pushEffectStore != nil {
+		batchStarted, err := a.pushEffectStore.PushEffectBatchStarted(
+			ctx,
+			compiledIdentity.TenantID,
+			compiledIdentity.UserID,
+			batchID,
+		)
+		if err != nil {
+			return retryableOrNot(err)
+		}
+		desired := types.PushBatchDeliveryAuthorityLegacy
+		if batchStarted ||
+			(a.pushEffectCanaryTaskID != "" &&
+				a.pushEffectCanaryTaskID == compiledIdentity.TaskID) {
+			desired = types.PushBatchDeliveryAuthorityEffect
+		}
+		winner, err := a.pushEffectStore.ClaimPushBatchDeliveryAuthority(
+			ctx,
+			types.PushBatchScope{
+				TenantID: compiledIdentity.TenantID,
+				UserID:   compiledIdentity.UserID,
+				BatchID:  batchID,
+			},
+			desired,
+		)
+		if err != nil {
+			return retryableOrNot(err)
+		}
+		effectEnabled = winner == types.PushBatchDeliveryAuthorityEffect
+	}
+
 	// 聚合卡改版（card-redesign-spec.md 附录 A，2026-07-18）：一批一张聚合卡，
 	// 不再一条内容一张卡。deliveries 仍 per-content（数据模型不变），
 	// 同批各 delivery 共享同一 feishu_message_id——重建路径靠它找兄弟条目。
@@ -2774,7 +2811,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 		}
 		if existed && sentAlready {
 			// 重试时该 (batch, content) 已发过：不进新卡，绝不重复推——幂等核心（#1 CRITICAL）。
-			if compiled && eventKey != "" {
+			if compiled && eventKey != "" && !effectEnabled {
 				if err := a.observationStore.MarkObservedEventDeliveredV1(
 					ctx, compiledIdentity, in.Run.Snapshot, delID,
 				); err != nil {
@@ -2863,21 +2900,6 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			HeaderTitle: title, HeaderTemplate: tmpl,
 			EffectID: effectID, Items: items,
 		})
-	}
-	effectEnabled := false
-	if compiled && a.pushEffectStore != nil {
-		batchStarted, err := a.pushEffectStore.PushEffectBatchStarted(
-			ctx,
-			compiledIdentity.TenantID,
-			compiledIdentity.UserID,
-			batchID,
-		)
-		if err != nil {
-			return retryableOrNot(err)
-		}
-		effectEnabled = batchStarted ||
-			(a.pushEffectCanaryTaskID != "" &&
-				a.pushEffectCanaryTaskID == compiledIdentity.TaskID)
 	}
 	planningMarker := ""
 	if effectEnabled {

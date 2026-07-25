@@ -85,6 +85,9 @@ func (s *Store) CreatePushEffect(
 		return nil, pushEffectConflict("push effect tenant is unavailable")
 	}
 
+	if err := verifyPushEffectAggregate(ctx, tx, prepared); err != nil {
+		return nil, err
+	}
 	existing, err := loadPushEffectForUpdate(ctx, tx, prepared.Scope())
 	if err == nil {
 		if err := validatePushEffectReplay(existing, canonical); err != nil {
@@ -100,9 +103,6 @@ func (s *Store) CreatePushEffect(
 		return existing, nil
 	}
 	if !errors.Is(err, types.ErrNotFound) {
-		return nil, err
-	}
-	if err := verifyPushEffectAggregate(ctx, tx, prepared); err != nil {
 		return nil, err
 	}
 	tag, err := tx.Exec(ctx, `
@@ -1341,6 +1341,7 @@ func verifyPushEffectAggregate(
 			SELECT 1 FROM push_batches
 			 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 			   AND run_snapshot_id=$4
+			   AND delivery_authority='effect'
 		)`,
 		prepared.BatchID, prepared.TenantID, prepared.UserID,
 		prepared.RunSnapshotID,

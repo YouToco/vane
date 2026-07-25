@@ -25,6 +25,22 @@ UPDATE push_batches b
           AND e.batch_id=b.id
    );
 
+-- A pre-048 legacy retry may already contain exact sent receipts. It must
+-- remain on the legacy protocol even when the task is now selected by the
+-- effect canary; otherwise one batch could mix provider protocols.
+UPDATE push_batches b
+   SET delivery_authority='legacy'
+ WHERE delivery_authority IS NULL
+   AND EXISTS (
+       SELECT 1 FROM deliveries d
+        WHERE d.tenant_id=b.tenant_id
+          AND d.user_id=b.user_id
+          AND d.batch_id=b.id
+          AND d.status='sent'
+          AND d.feishu_message_id<>''
+          AND d.sent_at IS NOT NULL
+   );
+
 -- +goose StatementBegin
 DO $$
 BEGIN
