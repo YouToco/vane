@@ -8,6 +8,7 @@ package runcontext
 import (
 	"encoding/json"
 
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
 )
@@ -51,10 +52,11 @@ type DefinitionV1 struct {
 // V1 snapshot. Ref is the only member allowed to cross back into Workflow
 // history; Definition and Policy must remain inside the Activity process.
 type CompiledSnapshotV1 struct {
-	Ref             types.RunSnapshotRef
-	Mode            types.ExecutionMode
-	AdaptiveVersion int64
-	Budget          types.PlannerBudget
-	Definition      DefinitionV1
-	Policy          runtimepolicy.BundleV1
+	Ref                types.RunSnapshotRef
+	Mode               types.ExecutionMode
+	AdaptiveVersion    int64
+	Budget             types.PlannerBudget
+	ObservationRollout observation.RolloutMode
+	Definition         DefinitionV1
+	Policy             runtimepolicy.BundleV1
 }

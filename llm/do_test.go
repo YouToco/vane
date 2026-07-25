@@ -353,3 +353,103 @@ func TestDo_CompiledGateRunsAfterSemaphoreWaitAndBlocksRevokedRequest(t *testing
 		t.Fatalf("rejected queued request reconciled an unmade reservation %d times", recStore.frozenAdjustCalls)
 	}
 }
+
+func TestDoObservationShadow_IsAuditedWithoutTenantQuota(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter, _ *http.Request,
+	) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(okResponseBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	recStore := &routingRecorderStore{}
+	userID, tenantID := int64(41), int64(9)
+	var gates atomic.Int64
+	if _, err := DoObservationShadow(t.Context(), newTestClient(srv.URL, 1),
+		&Recorder{st: recStore}, CallMeta{
+			TraceID: "observation-shadow", SpanName: "qualify_events",
+			TenantID: &tenantID, UserID: &userID,
+		}, Request{User: "shadow candidate"},
+		func(context.Context, float64) error {
+			gates.Add(1)
+			return nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if gates.Load() != 1 || hits.Load() != 1 {
+		t.Fatalf("independent gate=%d upstream=%d, want 1/1",
+			gates.Load(), hits.Load())
+	}
+	if recStore.legacyTryCalls != 0 || recStore.legacyAdjustCalls != 0 ||
+		recStore.frozenTryCalls != 0 || recStore.frozenAdjustCalls != 0 {
+		t.Fatalf("independent spend touched tenant quota: %+v", recStore)
+	}
+	if recStore.insertCalls != 1 {
+		t.Fatalf("independent spend llm_calls=%d, want 1",
+			recStore.insertCalls)
+	}
+}
+
+func TestDoObservationShadow_RejectsProductionQuotaMixBeforeUpstream(t *testing.T) {
+	tests := []struct {
+		name string
+		meta func(*CallMeta)
+	}{
+		{
+			name: "compiled before spend",
+			meta: func(meta *CallMeta) {
+				meta.BeforeSpend = func(context.Context, float64) error {
+					return nil
+				}
+			},
+		},
+		{
+			name: "compiled quota rule",
+			meta: func(meta *CallMeta) {
+				rule := validFrozenLLMQuotaRule()
+				meta.QuotaRule = &rule
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var hits atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(
+				w http.ResponseWriter, _ *http.Request,
+			) {
+				hits.Add(1)
+				_, _ = w.Write([]byte(okResponseBody))
+			}))
+			t.Cleanup(srv.Close)
+			userID, tenantID := int64(41), int64(9)
+			meta := CallMeta{
+				TenantID: &tenantID, UserID: &userID,
+			}
+			test.meta(&meta)
+			if _, err := DoObservationShadow(
+				t.Context(), newTestClient(srv.URL, 1),
+				&Recorder{st: &routingRecorderStore{}}, meta,
+				Request{User: "must not leave"},
+				func(context.Context, float64) error {
+					return nil
+				},
+			); types.CodeOf(err) != types.CodeInternal {
+				t.Fatalf("DoObservationShadow() error=%v, want CodeInternal", err)
+			}
+			if hits.Load() != 0 {
+				t.Fatalf("ambiguous independent spend reached upstream %d times",
+					hits.Load())
+			}
+		})
+	}
+}
+
+func TestDoObservationShadow_RejectsMissingAuthorization(t *testing.T) {
+	if _, err := DoObservationShadow(
+		t.Context(), nil, nil, CallMeta{}, Request{}, nil,
+	); types.CodeOf(err) != types.CodeInternal {
+		t.Fatalf("DoObservationShadow() error=%v, want CodeInternal", err)
+	}
+}

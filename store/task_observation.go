@@ -6,11 +6,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
 )
 
@@ -126,6 +128,109 @@ func (s *Store) MarkObservationQualificationSending(
 	}
 	return commitCompiledRunWriteV1(ctx, tx,
 		"commit observation qualification sending")
+}
+
+// AuthorizeObservationQualificationSpendV1 is the final external-effect fence
+// for event qualification. Both modes first prove the immutable per-run
+// rollout decision and move prepared -> sending exactly once. Authority also
+// reserves the production compiled LLM bucket in the same transaction; shadow
+// is operator-funded and deliberately never reads or changes that bucket.
+func (s *Store) AuthorizeObservationQualificationSpendV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	stepID, requestDigest string,
+	rollout observation.RolloutMode,
+	rule *runtimepolicy.QuotaBucketV1,
+	amount float64,
+) error {
+	if stepID == "" || !validObservationDigest(requestDigest) ||
+		(rollout != observation.RolloutShadow &&
+			rollout != observation.RolloutAuthority) ||
+		amount <= 0 || math.IsNaN(amount) || math.IsInf(amount, 0) {
+		return taskRunValidationError(
+			"observation qualification spend is invalid")
+	}
+	if rollout == observation.RolloutAuthority {
+		if rule == nil || rule.Name != string(QuotaLLMTokens) ||
+			!rule.Financial ||
+			rule.EnforcementVersion !=
+				runtimepolicy.QuotaEnforcementLLMPrechargeV1 {
+			return taskRunValidationError(
+				"observation authority quota request is invalid")
+		}
+	} else if rule != nil {
+		return taskRunValidationError(
+			"observation shadow must not use production quota")
+	}
+
+	// This transaction intentionally stays in the schema-owner role. vane_app
+	// has no UPDATE privilege on tenant_quota, while the quota reservation and
+	// prepared->sending transition must commit atomically. The same exact
+	// sealed-reference validation and live aggregate share locks used by
+	// beginAuthorizedCompiledRunWriteV1 are performed explicitly before either
+	// write; every following predicate repeats the full tenant/run scope.
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return taskRunDatabaseError(
+			"begin observation qualification spend", err)
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+
+	_, frozen, err := loadCompiledTaskRunSnapshotV1(
+		ctx, tx, expected, ref)
+	if err != nil {
+		return err
+	}
+	if frozen.ObservationRollout != rollout {
+		return observationConflict(
+			"observation qualification rollout differs")
+	}
+	if err := lockLiveCompiledRunWriteV1(ctx, tx, expected); err != nil {
+		return err
+	}
+
+	if rollout == observation.RolloutAuthority {
+		tag, err := tx.Exec(ctx,
+			`UPDATE tenant_quota
+			    SET tokens = LEAST(
+			            burst,
+			            tokens + rate * EXTRACT(EPOCH FROM (now() - updated_at))
+			        ) - $3,
+			        updated_at = now()
+			  WHERE tenant_id=$1 AND bucket=$2
+			    AND LEAST(
+			            burst,
+			            tokens + rate * EXTRACT(EPOCH FROM (now() - updated_at))
+			        ) >= $3`,
+			expected.TenantID, string(QuotaLLMTokens), amount)
+		if err != nil {
+			return classifyQuotaErr(err,
+				"reserve observation authority llm quota")
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrQuotaExceeded
+		}
+	}
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE task_event_qualification_steps
+		    SET status='sending',updated_at=clock_timestamp()
+		  WHERE tenant_id=$1 AND task_id=$2 AND run_snapshot_id=$3
+		    AND temporal_run_id=$4 AND step_id=$5
+		    AND request_digest=$6 AND status='prepared'`,
+		expected.TenantID, expected.TaskID, ref.SnapshotID,
+		expected.TemporalRunID, stepID, requestDigest)
+	if err != nil {
+		return taskRunDatabaseError(
+			"authorize observation qualification spend", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return observationConflict(
+			"observation qualification is not prepared")
+	}
+	return commitCompiledRunWriteV1(ctx, tx,
+		"commit observation qualification spend authorization")
 }
 
 func (s *Store) CompleteObservationQualificationStep(

@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/types"
 )
 
@@ -63,6 +64,7 @@ type CreateOrGetTaskRunSnapshotParams struct {
 	ModelPolicyJSON       json.RawMessage
 	QuotaPolicyJSON       json.RawMessage
 	BudgetJSON            json.RawMessage
+	ObservationRollout    observation.RolloutMode
 }
 
 // taskRunSnapshot is the private immutable database row. It must never cross
@@ -186,6 +188,7 @@ func (s *Store) createOrGetTaskRunSnapshotWithShadowV2(
 		RunKind:                types.RunSnapshotKindScheduled,
 		Mode:                   p.Mode,
 		AdaptiveVersion:        p.AdaptiveVersion,
+		ObservationRollout:     p.ObservationRollout,
 		Policies:               policies,
 		Budget:                 budget,
 		Definition:             definition,

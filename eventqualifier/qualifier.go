@@ -62,6 +62,23 @@ type Event struct {
 }
 
 func (q *Qualifier) Qualify(ctx context.Context, req Request) (Result, []byte, error) {
+	return q.qualify(ctx, req, false)
+}
+
+// QualifyObservationShadow runs the qualifier through the operator-funded
+// shadow spend path. Production call sites are constrained by an AST invariant.
+func (q *Qualifier) QualifyObservationShadow(
+	ctx context.Context,
+	req Request,
+) (Result, []byte, error) {
+	return q.qualify(ctx, req, true)
+}
+
+func (q *Qualifier) qualify(
+	ctx context.Context,
+	req Request,
+	observationShadow bool,
+) (Result, []byte, error) {
 	if q == nil || req.Client == nil || req.Policy.Event == nil ||
 		len(req.Candidates) == 0 {
 		return Result{}, nil, types.NewAppError(types.CodeValidation,
@@ -73,15 +90,26 @@ func (q *Qualifier) Qualify(ctx context.Context, req Request) (Result, []byte, e
 	}
 	temperature := float32(req.ModelCall.Temperature)
 	maxTokens := req.ModelCall.MaxTokens
-	response, err := llm.Do(ctx, req.Client, q.recorder, llm.CallMeta{
+	meta := llm.CallMeta{
 		TraceID: req.TraceID, SpanName: "qualify_events",
 		TenantID: &req.TenantID, UserID: &req.UserID,
 		QuotaRule: req.QuotaRule, BeforeSpend: req.BeforeSpend,
-	}, llm.Request{
+	}
+	llmRequest := llm.Request{
 		System: systemPromptV1, User: user, Model: req.ModelCall.Model,
 		Temperature: &temperature, MaxTokens: &maxTokens,
 		DisableThinking: req.ModelCall.DisableThinking,
-	})
+	}
+	var response *llm.Response
+	if observationShadow {
+		meta.BeforeSpend = nil
+		meta.QuotaRule = nil
+		response, err = llm.DoObservationShadow(
+			ctx, req.Client, q.recorder, meta, llmRequest, req.BeforeSpend)
+	} else {
+		response, err = llm.Do(
+			ctx, req.Client, q.recorder, meta, llmRequest)
+	}
 	if err != nil {
 		return Result{}, nil, err
 	}

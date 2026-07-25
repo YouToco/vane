@@ -205,6 +205,11 @@ func run() error {
 		"enabled", cfg.Pipeline.PlaybookPromptsEnabled,
 		"canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID,
 		"allow_all", cfg.Pipeline.PlaybookPromptsAllowAll)
+	slog.Info("observation rollout configured",
+		"shadow_task_id",
+		cfg.Pipeline.ObservationShadowCanaryScheduleID,
+		"authority_task_id",
+		cfg.Pipeline.ObservationAuthorityCanaryScheduleID)
 
 	// worker：非阻塞 Start，关停时 Stop()（见下方顺序关停）。显式 stop timeout
 	// 保证 Stop 不会采用 SDK 的 0 秒默认值、在 Activity 仍收尾时就释放 DB/Temporal。

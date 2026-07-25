@@ -153,6 +153,7 @@ func auditCompiledTaskRunSnapshotV2(
 		return runcontext.CompiledSnapshotV1{}, CompiledRunSnapshotV2AuditResult{},
 			taskRunIntegrityError()
 	}
+	embeddedV1.ObservationRollout = fixedV1.ObservationRollout
 	approved, err := taskstate.DecodeApprovedDefinitionV1(decoded.Approved.Payload)
 	if err != nil {
 		return runcontext.CompiledSnapshotV1{}, CompiledRunSnapshotV2AuditResult{},
@@ -203,6 +204,7 @@ func compiledSnapshotV1ExactEqual(
 		left.Mode == right.Mode &&
 		left.AdaptiveVersion == right.AdaptiveVersion &&
 		left.Budget == right.Budget &&
+		left.ObservationRollout == right.ObservationRollout &&
 		leftPolicyErr == nil && rightPolicyErr == nil &&
 		rawBytesExactEqual(leftPolicy, rightPolicy) &&
 		compiledDefinitionV1ExactEqual(left.Definition, right.Definition)
