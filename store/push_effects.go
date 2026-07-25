@@ -176,6 +176,44 @@ func (s *Store) LoadPushEffect(
 	return effect, nil
 }
 
+// PushEffectBatchStarted is the durable rollback latch for one compiled push
+// batch. Once any chunk has crossed into the effect protocol, configuration
+// rollback may stop admitting new batches but must never route this batch back
+// through the legacy no-UUID sender.
+func (s *Store) PushEffectBatchStarted(
+	ctx context.Context,
+	tenantID int64,
+	userID int64,
+	batchID int64,
+) (bool, error) {
+	if tenantID <= 0 || userID <= 0 || batchID <= 0 {
+		return false, pushEffectValidation(
+			"push effect batch latch scope is invalid")
+	}
+	tx, err := s.beginPushEffectCoordinatorTx(ctx, tenantID)
+	if err != nil {
+		return false, pushEffectDatabaseError(
+			"begin push effect batch latch transaction", err)
+	}
+	defer rollbackPushEffectTx(ctx, tx)
+	var started bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM push_effects
+			 WHERE tenant_id=$1 AND user_id=$2 AND batch_id=$3
+		)`,
+		tenantID, userID, batchID,
+	).Scan(&started); err != nil {
+		return false, pushEffectDatabaseError(
+			"read push effect batch latch", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, pushEffectDatabaseError(
+			"commit push effect batch latch transaction", err)
+	}
+	return started, nil
+}
+
 // ListRecoverablePushEffectTenantIDs is the only cross-tenant discovery
 // exception. It is owner/admin READ ONLY and returns tenant IDs only; every
 // subsequent row read or mutation re-enters the tenant-scoped coordinator role.

@@ -18,12 +18,24 @@ type pushEffectStoreFake struct {
 	mu sync.Mutex
 
 	initialStatus pusheffect.Status
+	batchStarted  bool
 	prepared      []pusheffect.Prepared
 	claims        int
 	reconciles    int
 	definite      int
 	ambiguous     int
 	receipts      []pusheffect.SentReceipt
+}
+
+func (f *pushEffectStoreFake) PushEffectBatchStarted(
+	_ context.Context,
+	_ int64,
+	_ int64,
+	_ int64,
+) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.batchStarted || len(f.prepared) > 0, nil
 }
 
 func (f *pushEffectStoreFake) CreatePushEffect(
@@ -188,7 +200,10 @@ func TestPushEffectReconciliationNeverDowngradesAmbiguous(t *testing.T) {
 	compiledStore := &compiledRunStoreFake{
 		snapshot: snapshot, authorize: true,
 	}
-	effects := &pushEffectStoreFake{initialStatus: pusheffect.StatusAmbiguous}
+	effects := &pushEffectStoreFake{
+		initialStatus: pusheffect.StatusAmbiguous,
+		batchStarted:  true,
+	}
 	rejection := pusheffect.ProviderObservation{
 		Disposition: pusheffect.AttemptDefiniteNotSent,
 		AppIdentity: "cli_test",
@@ -214,7 +229,10 @@ func TestPushEffectReconciliationNeverDowngradesAmbiguous(t *testing.T) {
 			},
 			new(compiledModelResolverFake),
 		),
-		WithPushEffectCanary(effects, identity.TaskID),
+		// Configuration rollback stops admitting new batches. The durable
+		// batch latch must still resume this already-started effect and must
+		// never fall through to legacy no-UUID Push.
+		WithPushEffectCanary(effects, ""),
 	)
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestActivityEnvironment()

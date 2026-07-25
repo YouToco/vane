@@ -275,6 +275,12 @@ type CompiledRunSnapshotV2AuditReader interface {
 }
 
 type PushEffectStore interface {
+	PushEffectBatchStarted(
+		context.Context,
+		int64,
+		int64,
+		int64,
+	) (bool, error)
 	CreatePushEffect(context.Context, pusheffect.Prepared) (*pusheffect.Effect, error)
 	ClaimPushEffect(context.Context, pusheffect.ClaimParams) (*pusheffect.Effect, error)
 	ClaimPushEffectReconciliation(
@@ -2857,10 +2863,21 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			EffectID: effectID, Items: items,
 		})
 	}
-	effectEnabled := compiled &&
-		a.pushEffectStore != nil &&
-		a.pushEffectCanaryTaskID != "" &&
-		a.pushEffectCanaryTaskID == compiledIdentity.TaskID
+	effectEnabled := false
+	if compiled && a.pushEffectStore != nil {
+		batchStarted, err := a.pushEffectStore.PushEffectBatchStarted(
+			ctx,
+			compiledIdentity.TenantID,
+			compiledIdentity.UserID,
+			batchID,
+		)
+		if err != nil {
+			return retryableOrNot(err)
+		}
+		effectEnabled = batchStarted ||
+			(a.pushEffectCanaryTaskID != "" &&
+				a.pushEffectCanaryTaskID == compiledIdentity.TaskID)
+	}
 	planningMarker := ""
 	if effectEnabled {
 		planningMarker = pushEffectMarkerWidthSeed

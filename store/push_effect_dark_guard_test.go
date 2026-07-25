@@ -13,6 +13,7 @@ import (
 
 func TestPushEffectStoreCallPointsStayInFencedCoordinator(t *testing.T) {
 	methods := map[string]bool{
+		"PushEffectBatchStarted":             true,
 		"CreatePushEffect":                   true,
 		"LoadPushEffect":                     true,
 		"ListRecoverablePushEffectTenantIDs": true,
@@ -27,6 +28,7 @@ func TestPushEffectStoreCallPointsStayInFencedCoordinator(t *testing.T) {
 		"BlockPushEffect":                    true,
 	}
 	expected := map[string]int{
+		"PushEffectBatchStarted":             1,
 		"CreatePushEffect":                   1,
 		"ClaimPushEffect":                    1,
 		"ClaimPushEffectReconciliation":      1,
@@ -72,9 +74,13 @@ func TestPushEffectStoreCallPointsStayInFencedCoordinator(t *testing.T) {
 					return true
 				}
 				position := fset.Position(selector.Pos())
-				if filepath.Clean(path) != allowedFile ||
-					function.Name.Name != "sendDurablePushChunk" ||
-					!isPushEffectCoordinatorReceiver(selector.X) {
+				allowedCall := filepath.Clean(path) == allowedFile &&
+					isPushEffectCoordinatorReceiver(selector.X) &&
+					((selector.Sel.Name == "PushEffectBatchStarted" &&
+						function.Name.Name == "Push") ||
+						(selector.Sel.Name != "PushEffectBatchStarted" &&
+							function.Name.Name == "sendDurablePushChunk"))
+				if !allowedCall {
 					t.Errorf(
 						"push effect Store API escaped fenced coordinator: %s:%d (%s)",
 						position.Filename, position.Line, selector.Sel.Name,

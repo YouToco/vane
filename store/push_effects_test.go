@@ -222,6 +222,27 @@ func TestPushEffectCreateClaimFailureAndReceiptConverge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	started, err := f.store.PushEffectBatchStarted(
+		ctx, f.prepared.TenantID, f.prepared.UserID, f.prepared.BatchID)
+	if err != nil || !started {
+		t.Fatalf("created batch latch started=%v err=%v", started, err)
+	}
+	for _, scope := range []struct {
+		tenantID int64
+		userID   int64
+		batchID  int64
+	}{
+		{f.prepared.TenantID + 1, f.prepared.UserID, f.prepared.BatchID},
+		{f.prepared.TenantID, f.prepared.UserID + 1, f.prepared.BatchID},
+		{f.prepared.TenantID, f.prepared.UserID, f.prepared.BatchID + 1},
+	} {
+		started, err := f.store.PushEffectBatchStarted(
+			ctx, scope.tenantID, scope.userID, scope.batchID)
+		if err != nil || started {
+			t.Fatalf("foreign batch latch scope=%+v started=%v err=%v",
+				scope, started, err)
+		}
+	}
 	tenantIDs, err := f.store.ListRecoverablePushEffectTenantIDs(
 		ctx, time.Now().Add(time.Minute), 0, 10)
 	if err != nil || len(tenantIDs) != 1 || tenantIDs[0] != f.prepared.TenantID {
