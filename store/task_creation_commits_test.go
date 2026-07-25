@@ -202,6 +202,117 @@ func TestCreateTaskCreationOperation_V1Boundary(t *testing.T) {
 	}
 }
 
+func TestCreateTaskCreationOperation_CrossTenantReplayProbeDoesNotLockForeignOperation(
+	t *testing.T,
+) {
+	st := tenantTestStore(t)
+	tenantA := newCompiledTaskFixture(t, st)
+	tenantB := newCompiledTaskFixture(t, st)
+	cleanupA5Fixture(t, st, tenantA)
+	cleanupA5Fixture(t, st, tenantB)
+	ctx := t.Context()
+
+	paramsA := taskCreationCreateParams(tenantA, uuid.NewString())
+	if _, err := st.CreateTaskCreationOperation(ctx, paramsA); err != nil {
+		t.Fatalf("创建 tenant A operation: %v", err)
+	}
+	paramsB := taskCreationCreateParams(tenantB, paramsA.ID)
+
+	blocker, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(context.WithoutCancel(ctx)) }()
+	var userID int64
+	if err := blocker.QueryRow(ctx, `
+		SELECT user_id FROM memberships
+		 WHERE tenant_id=$1 AND user_id=$2
+		 FOR UPDATE`,
+		tenantB.tenantID, tenantB.userID,
+	).Scan(&userID); err != nil {
+		t.Fatalf("锁 tenant B membership blocker: %v", err)
+	}
+
+	foreignProbeDone := make(chan error, 1)
+	go func() {
+		_, createErr := st.CreateTaskCreationOperation(ctx, paramsB)
+		foreignProbeDone <- createErr
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%FROM memberships m%",
+		"tenant B replay probe 未在 scoped lookup 后等待自身 membership",
+	)
+
+	var operationID string
+	if err := st.pool.QueryRow(ctx, `
+		SELECT id FROM pending_actions
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		 FOR UPDATE NOWAIT`,
+		paramsA.ID, tenantA.tenantID, tenantA.userID,
+	).Scan(&operationID); err != nil {
+		t.Fatalf("tenant B probe 不得锁定 tenant A operation: %v", err)
+	}
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("释放 tenant B membership blocker: %v", err)
+	}
+	select {
+	case err := <-foreignProbeDone:
+		if !errors.Is(err, types.ErrConflict) {
+			t.Fatalf("跨租户全局 operation ID 冲突必须安全拒绝: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant B 全局 ID 冲突未收敛")
+	}
+
+	replayed, err := st.CreateTaskCreationOperation(ctx, paramsA)
+	if err != nil || replayed.ID != paramsA.ID ||
+		replayed.TenantID != tenantA.tenantID || replayed.UserID != tenantA.userID {
+		t.Fatalf("tenant A exact replay 未保持可用: op=%+v err=%v", replayed, err)
+	}
+	var tenantBRows int
+	if err := st.pool.QueryRow(ctx, `
+		SELECT count(*) FROM pending_actions
+		 WHERE id=$1 AND tenant_id=$2`,
+		paramsA.ID, tenantB.tenantID,
+	).Scan(&tenantBRows); err != nil {
+		t.Fatal(err)
+	}
+	if tenantBRows != 0 {
+		t.Fatalf("跨租户全局 ID 冲突不得创建或采用 tenant B row: %d", tenantBRows)
+	}
+}
+
+func TestTaskCreationReplayRootQueryRequiresExactTenantProtocolScope(t *testing.T) {
+	raw, err := os.ReadFile("task_creation_operations.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(raw)
+	start := strings.Index(source, "func loadTaskCreationOperationForCreationReplay(")
+	if start < 0 {
+		t.Fatal("缺少 Task Creation replay 根查询 helper")
+	}
+	endOffset := strings.Index(
+		source[start:], "func validateTaskCreationOperationCreationScope(",
+	)
+	if endOffset < 0 {
+		t.Fatal("无法界定 Task Creation replay 根查询 helper")
+	}
+	helper := source[start : start+endOffset]
+	for _, required := range []string{
+		"WHERE id = $1 AND tenant_id = $2 AND user_id = $3",
+		"tool_name = 'create_schedule' AND execution_version = $4",
+		"id, tenantID, userID, types.TaskCreationExecutionVersionV1",
+		"FOR SHARE /* task creation replay operation lock order */",
+	} {
+		if !strings.Contains(helper, required) {
+			t.Fatalf("Task Creation replay 根查询退化，缺少 %q", required)
+		}
+	}
+}
+
 func TestTaskCreationLookupAndCancel_V1IsolationAndLinearization(t *testing.T) {
 	st := tenantTestStore(t)
 	f := newCompiledTaskFixture(t, st)

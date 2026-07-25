@@ -75,7 +75,7 @@ func (s *Store) CreateTaskCreationOperation(
 	defer rollbackTaskCreationTransaction(ctx, tx)
 
 	existing, found, err := loadTaskCreationOperationForCreationReplay(
-		ctx, tx, p.ID,
+		ctx, tx, p.ID, p.TenantID, p.UserID,
 	)
 	if err != nil {
 		return nil, err
@@ -140,14 +140,17 @@ func loadTaskCreationOperationForCreationReplay(
 	ctx context.Context,
 	tx pgx.Tx,
 	id string,
+	tenantID int64,
+	userID int64,
 ) (*types.TaskCreationOperation, bool, error) {
 	var op types.TaskCreationOperation
 	err := scanTaskCreationOperation(tx.QueryRow(ctx,
 		`SELECT `+taskCreationOperationColumns+`
 		   FROM pending_actions
-		  WHERE id = $1
+		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
+		    AND tool_name = 'create_schedule' AND execution_version = $4
 		  FOR SHARE /* task creation replay operation lock order */`,
-		id,
+		id, tenantID, userID, types.TaskCreationExecutionVersionV1,
 	), &op)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
@@ -216,7 +219,9 @@ func (s *Store) loadTaskCreationOperationCreationReplay(
 	}
 	defer rollbackTaskCreationTransaction(ctx, tx)
 
-	op, found, err := loadTaskCreationOperationForCreationReplay(ctx, tx, p.ID)
+	op, found, err := loadTaskCreationOperationForCreationReplay(
+		ctx, tx, p.ID, p.TenantID, p.UserID,
+	)
 	if err != nil {
 		return nil, err
 	}
