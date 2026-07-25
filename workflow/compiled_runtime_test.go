@@ -156,6 +156,20 @@ type compiledRunStoreFake struct {
 	fetchDisables      int
 	recoveryOnly       bool
 	deliveryReceiptErr error
+	authorityWinner    types.PushBatchDeliveryAuthority
+	authorityErr       error
+	authorityCalls     int
+	authorityScopes    []types.PushBatchScope
+	authorityDesired   []types.PushBatchDeliveryAuthority
+	authorityOrder     *pushAuthorityOrder
+}
+
+type pushAuthorityOrder struct {
+	claimed         atomic.Bool
+	reserveBefore   atomic.Bool
+	deliveryBefore  atomic.Bool
+	providerBefore  atomic.Bool
+	batchDoneBefore atomic.Bool
 }
 
 type observationRuntimeStoreFake struct {
@@ -168,6 +182,8 @@ type observationRuntimeStoreFake struct {
 	spendRuleNil   []bool
 	completeCalls  int
 	uncertainCalls int
+	reserveCalls   int
+	authorityOrder *pushAuthorityOrder
 }
 
 func (f *observationRuntimeStoreFake) PrepareObservationQualificationStep(
@@ -248,12 +264,18 @@ func (f *observationRuntimeStoreFake) MarkObservationQualificationUncertain(
 	return nil
 }
 
-func (*observationRuntimeStoreFake) ReserveObservedEventV1(
+func (f *observationRuntimeStoreFake) ReserveObservedEventV1(
 	context.Context,
 	types.RunIdentity,
 	types.RunSnapshotRef,
 	observation.QualifiedEvent,
 ) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reserveCalls++
+	if f.authorityOrder != nil && !f.authorityOrder.claimed.Load() {
+		f.authorityOrder.reserveBefore.Store(true)
+	}
 	return true, nil
 }
 
@@ -642,6 +664,29 @@ func (f *compiledRunStoreFake) CreateOrRecoverPushBatchForTaskRunV1(
 	return id, false, err
 }
 
+func (f *compiledRunStoreFake) ClaimPushBatchDeliveryAuthority(
+	_ context.Context,
+	scope types.PushBatchScope,
+	desired types.PushBatchDeliveryAuthority,
+) (types.PushBatchDeliveryAuthority, error) {
+	f.mu.Lock()
+	f.authorityCalls++
+	f.authorityScopes = append(f.authorityScopes, scope)
+	f.authorityDesired = append(f.authorityDesired, desired)
+	winner, err, order := f.authorityWinner, f.authorityErr, f.authorityOrder
+	f.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	if winner == "" {
+		winner = types.PushBatchDeliveryAuthorityLegacy
+	}
+	if order != nil {
+		order.claimed.Store(true)
+	}
+	return winner, nil
+}
+
 func (f *compiledRunStoreFake) RecordEmptyPushBatchForTaskRunV1(
 	ctx context.Context,
 	identity types.RunIdentity,
@@ -670,6 +715,9 @@ func (f *compiledRunStoreFake) InsertDeliveryForTaskRunV1(
 	_ string,
 	_ *types.Delivery,
 ) (int64, bool, bool, error) {
+	if f.authorityOrder != nil && !f.authorityOrder.claimed.Load() {
+		f.authorityOrder.deliveryBefore.Store(true)
+	}
 	authorized, err := f.AuthorizeTaskRunSideEffect(ctx, identity, types.RunSnapshotRef{})
 	if err != nil {
 		return 0, false, false, err
@@ -712,6 +760,9 @@ func (f *compiledRunStoreFake) MarkPushBatchDoneReceiptV1(
 	_ string,
 	_ int64,
 ) error {
+	if f.authorityOrder != nil && !f.authorityOrder.claimed.Load() {
+		f.authorityOrder.batchDoneBefore.Store(true)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.batchStatuses++
@@ -2439,6 +2490,23 @@ func executePushActivity(t *testing.T, env *testsuite.TestActivityEnvironment, a
 	return err
 }
 
+type authorityCheckingPusher struct {
+	order *pushAuthorityOrder
+	calls atomic.Int32
+}
+
+func (p *authorityCheckingPusher) Push(
+	context.Context,
+	string,
+	string,
+) (string, error) {
+	if !p.order.claimed.Load() {
+		p.order.providerBefore.Store(true)
+	}
+	p.calls.Add(1)
+	return "om-authority-ordered", nil
+}
+
 func TestPush_CompiledRunUsesFrozenTaskTitleAndSourceAttribution(t *testing.T) {
 	identity, ref, snapshot := compiledActivityFixture("Frozen Task Title")
 	compiledStore := &compiledRunStoreFake{
@@ -2494,6 +2562,303 @@ func TestPush_CompiledRunUsesFrozenTaskTitleAndSourceAttribution(t *testing.T) {
 	compiledStore.mu.Unlock()
 	if len(attributionIDs) != 1 || !reflect.DeepEqual(attributionIDs[0], []int64{10}) {
 		t.Fatalf("source attribution scope = %v, want [[10]]", attributionIDs)
+	}
+}
+
+func TestPush_CompiledClaimsLegacyAuthorityBeforeAllDeliveryEffects(t *testing.T) {
+	identity, ref, snapshot := compiledActivityFixture("Frozen Task")
+	order := new(pushAuthorityOrder)
+	compiledStore := &compiledRunStoreFake{
+		snapshot: snapshot, authorize: true, authorityOrder: order,
+	}
+	observationStore := &observationRuntimeStoreFake{authorityOrder: order}
+	pusher := &authorityCheckingPusher{order: order}
+	a := NewActivities(
+		fakeFetcher{},
+		fakeScorer{},
+		fakeCardGen{},
+		pusher,
+		new(fakeStore),
+		fakeFeishu{},
+		nil,
+		nil,
+		func(feedback.AggregateCardInput) string { return `{}` },
+		func(string, int) (string, string) { return "title", "blue" },
+		WithCompiledRuntimeV1(
+			compiledStore,
+			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+				return runtimepolicy.BundleV1{}, nil
+			},
+			new(compiledModelResolverFake),
+		),
+		WithObservationRuntime(observationStore, nil, "", ""),
+	)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.Push)
+	err := executePushActivity(t, env, a, PushIn{
+		UserID: identity.UserID, ScheduleID: identity.TaskID, TraceID: "trace-authority-order",
+		Run: &CompiledRunInputV1{
+			TenantID: identity.TenantID,
+			TaskID:   identity.TaskID,
+			Snapshot: ref,
+		},
+		Cards: []GeneratedCard{{
+			Scored: types.ScoredItem{
+				Item: types.ContentItem{
+					ID:                      501,
+					SourceID:                10,
+					Title:                   "item",
+					ObservationPolicyDigest: "policy-digest",
+					ObservationEventKey:     "event-key",
+					ObservationEventJSON: json.RawMessage(
+						`{"event_type":"release","subject":"vane","occurred_at":"2026-07-25T12:00:00Z"}`,
+					),
+				},
+				Score: 88,
+			},
+			BodyMD: "body",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("compiled Push failed: %v", err)
+	}
+	if order.reserveBefore.Load() ||
+		order.deliveryBefore.Load() ||
+		order.providerBefore.Load() ||
+		order.batchDoneBefore.Load() {
+		t.Fatalf(
+			"delivery effect preceded authority claim: reserve=%t delivery=%t provider=%t batch_done=%t",
+			order.reserveBefore.Load(),
+			order.deliveryBefore.Load(),
+			order.providerBefore.Load(),
+			order.batchDoneBefore.Load(),
+		)
+	}
+	compiledStore.mu.Lock()
+	authorityCalls := compiledStore.authorityCalls
+	authorityScopes := append([]types.PushBatchScope(nil), compiledStore.authorityScopes...)
+	authorityDesired := append(
+		[]types.PushBatchDeliveryAuthority(nil),
+		compiledStore.authorityDesired...,
+	)
+	deliveryWrites := compiledStore.deliveryWrites
+	compiledStore.mu.Unlock()
+	if authorityCalls != 1 {
+		t.Fatalf("authority claims = %d, want exactly 1", authorityCalls)
+	}
+	wantScope := types.PushBatchScope{
+		TenantID: identity.TenantID,
+		UserID:   identity.UserID,
+		BatchID:  101,
+	}
+	if !reflect.DeepEqual(authorityScopes, []types.PushBatchScope{wantScope}) {
+		t.Fatalf("authority scopes = %+v, want %+v", authorityScopes, wantScope)
+	}
+	if !reflect.DeepEqual(
+		authorityDesired,
+		[]types.PushBatchDeliveryAuthority{types.PushBatchDeliveryAuthorityLegacy},
+	) {
+		t.Fatalf("desired authority = %v, want legacy", authorityDesired)
+	}
+	observationStore.mu.Lock()
+	reserveCalls := observationStore.reserveCalls
+	observationStore.mu.Unlock()
+	if reserveCalls != 1 || deliveryWrites != 1 || pusher.calls.Load() != 1 {
+		t.Fatalf(
+			"delivery effects = reserve:%d insert:%d provider:%d, want 1/1/1",
+			reserveCalls,
+			deliveryWrites,
+			pusher.calls.Load(),
+		)
+	}
+}
+
+func TestPush_CompiledEffectAuthorityWinnerStopsAllDeliveryEffects(t *testing.T) {
+	identity, ref, snapshot := compiledActivityFixture("Frozen Task")
+	compiledStore := &compiledRunStoreFake{
+		snapshot:        snapshot,
+		authorize:       true,
+		authorityWinner: types.PushBatchDeliveryAuthorityEffect,
+	}
+	observationStore := new(observationRuntimeStoreFake)
+	legacyStore := &effectCountingStore{fakeStore: new(fakeStore)}
+	pusher := &fakePusher{msgID: "must-not-send"}
+	a := NewActivities(
+		fakeFetcher{},
+		fakeScorer{},
+		fakeCardGen{},
+		pusher,
+		legacyStore,
+		fakeFeishu{},
+		nil,
+		nil,
+		func(feedback.AggregateCardInput) string { return `{}` },
+		func(string, int) (string, string) { return "title", "blue" },
+		WithCompiledRuntimeV1(
+			compiledStore,
+			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+				return runtimepolicy.BundleV1{}, nil
+			},
+			new(compiledModelResolverFake),
+		),
+		WithObservationRuntime(observationStore, nil, "", ""),
+	)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.Push)
+	err := executePushActivity(t, env, a, PushIn{
+		UserID: identity.UserID, ScheduleID: identity.TaskID, TraceID: "trace-effect-winner",
+		Run: &CompiledRunInputV1{
+			TenantID: identity.TenantID,
+			TaskID:   identity.TaskID,
+			Snapshot: ref,
+		},
+		Cards: []GeneratedCard{{
+			Scored: types.ScoredItem{
+				Item: types.ContentItem{
+					ID:                      501,
+					SourceID:                10,
+					Title:                   "item",
+					ObservationPolicyDigest: "policy-digest",
+					ObservationEventKey:     "event-key",
+					ObservationEventJSON: json.RawMessage(
+						`{"event_type":"release","subject":"vane","occurred_at":"2026-07-25T12:00:00Z"}`,
+					),
+				},
+				Score: 88,
+			},
+			BodyMD: "body",
+		}},
+	})
+	if err == nil {
+		t.Fatal("effect authority winner must fail the legacy delivery path closed")
+	}
+	var appErr *temporal.ApplicationError
+	if !errors.As(err, &appErr) || !appErr.NonRetryable() {
+		t.Fatalf("effect authority conflict must be non-retryable: %T %v", err, err)
+	}
+	observationStore.mu.Lock()
+	reserveCalls := observationStore.reserveCalls
+	observationStore.mu.Unlock()
+	compiledStore.mu.Lock()
+	claims := compiledStore.authorityCalls
+	batches := compiledStore.batchWrites
+	inserts := compiledStore.deliveryWrites
+	receipts := compiledStore.deliveryReceipts
+	statuses := compiledStore.batchStatuses
+	compiledStore.mu.Unlock()
+	if claims != 1 || batches != 1 {
+		t.Fatalf("authority path not reached exactly once: claims=%d batches=%d", claims, batches)
+	}
+	if reserveCalls != 0 || inserts != 0 || len(pusher.sentCards()) != 0 ||
+		receipts != 0 || statuses != 0 {
+		t.Fatalf(
+			"effect winner leaked legacy effects: reserve=%d insert=%d provider=%d delivery_receipt=%d batch_receipt=%d",
+			reserveCalls,
+			inserts,
+			len(pusher.sentCards()),
+			receipts,
+			statuses,
+		)
+	}
+	_, _, legacyBatches, legacyInserts, legacyMarks, legacyStatuses, _ := legacyStore.effectCounts()
+	if legacyBatches != 0 || legacyInserts != 0 || legacyMarks != 0 || legacyStatuses != 0 {
+		t.Fatalf(
+			"effect winner escaped to legacy store: batches=%d inserts=%d marks=%d statuses=%d",
+			legacyBatches,
+			legacyInserts,
+			legacyMarks,
+			legacyStatuses,
+		)
+	}
+}
+
+func TestPush_CompiledAuthorityClaimFailureStopsAllDeliveryEffects(t *testing.T) {
+	identity, ref, snapshot := compiledActivityFixture("Frozen Task")
+	compiledStore := &compiledRunStoreFake{
+		snapshot:  snapshot,
+		authorize: true,
+		authorityErr: types.NewAppError(
+			types.CodeDatabase,
+			"claim push batch delivery authority",
+			errors.New("database unavailable"),
+		),
+	}
+	legacyStore := &effectCountingStore{fakeStore: new(fakeStore)}
+	pusher := &fakePusher{msgID: "must-not-send"}
+	a := NewActivities(
+		fakeFetcher{},
+		fakeScorer{},
+		fakeCardGen{},
+		pusher,
+		legacyStore,
+		fakeFeishu{},
+		nil,
+		nil,
+		func(feedback.AggregateCardInput) string { return `{}` },
+		func(string, int) (string, string) { return "title", "blue" },
+		WithCompiledRuntimeV1(
+			compiledStore,
+			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+				return runtimepolicy.BundleV1{}, nil
+			},
+			new(compiledModelResolverFake),
+		),
+	)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.Push)
+	err := executePushActivity(t, env, a, PushIn{
+		UserID: identity.UserID, ScheduleID: identity.TaskID, TraceID: "trace-authority-error",
+		Run: &CompiledRunInputV1{
+			TenantID: identity.TenantID,
+			TaskID:   identity.TaskID,
+			Snapshot: ref,
+		},
+		Cards: []GeneratedCard{{
+			Scored: types.ScoredItem{
+				Item:  types.ContentItem{ID: 501, SourceID: 10, Title: "item"},
+				Score: 88,
+			},
+			BodyMD: "body",
+		}},
+	})
+	if err == nil {
+		t.Fatal("authority claim error must fail the legacy delivery path closed")
+	}
+	var appErr *temporal.ApplicationError
+	if !errors.As(err, &appErr) || appErr.NonRetryable() {
+		t.Fatalf("database authority failure must remain retryable: %T %v", err, err)
+	}
+	compiledStore.mu.Lock()
+	claims := compiledStore.authorityCalls
+	batches := compiledStore.batchWrites
+	inserts := compiledStore.deliveryWrites
+	receipts := compiledStore.deliveryReceipts
+	statuses := compiledStore.batchStatuses
+	compiledStore.mu.Unlock()
+	if claims != 1 || batches != 1 {
+		t.Fatalf("authority error path not reached exactly once: claims=%d batches=%d", claims, batches)
+	}
+	if inserts != 0 || len(pusher.sentCards()) != 0 || receipts != 0 || statuses != 0 {
+		t.Fatalf(
+			"authority error leaked delivery effects: inserts=%d provider=%d delivery_receipts=%d batch_receipts=%d",
+			inserts,
+			len(pusher.sentCards()),
+			receipts,
+			statuses,
+		)
+	}
+	_, _, legacyBatches, legacyInserts, legacyMarks, legacyStatuses, _ := legacyStore.effectCounts()
+	if legacyBatches != 0 || legacyInserts != 0 || legacyMarks != 0 || legacyStatuses != 0 {
+		t.Fatalf(
+			"authority error escaped to legacy store: batches=%d inserts=%d marks=%d statuses=%d",
+			legacyBatches,
+			legacyInserts,
+			legacyMarks,
+			legacyStatuses,
+		)
 	}
 }
 
@@ -2653,8 +3018,10 @@ func TestPush_CompiledDeliveryReceiptFailurePreventsBatchDone(t *testing.T) {
 
 func TestPush_CompiledRecoveryOnlyAfterRevocationMarksDoneWithoutResend(t *testing.T) {
 	identity, ref, snapshot := compiledActivityFixture("Frozen Task")
+	order := new(pushAuthorityOrder)
 	compiledStore := &compiledRunStoreFake{
 		snapshot: snapshot, recoveryOnly: true, authorize: false,
+		authorityOrder: order,
 	}
 	legacyStore := &effectCountingStore{fakeStore: new(fakeStore)}
 	pusher := &fakePusher{msgID: "must-not-resend"}
@@ -2687,12 +3054,20 @@ func TestPush_CompiledRecoveryOnlyAfterRevocationMarksDoneWithoutResend(t *testi
 	}
 	compiledStore.mu.Lock()
 	recoveries, authorizations := compiledStore.recoveryCalls, len(compiledStore.authorizeIdentities)
+	authorityCalls := compiledStore.authorityCalls
 	batches, inserts := compiledStore.batchWrites, compiledStore.deliveryWrites
 	receipts, statuses := compiledStore.deliveryReceipts, compiledStore.batchStatuses
 	compiledStore.mu.Unlock()
 	if recoveries != 1 || authorizations != 0 {
 		t.Fatalf("recovery path calls = %d, live authorizations = %d; want 1 and 0",
 			recoveries, authorizations)
+	}
+	if authorityCalls != 1 || order.batchDoneBefore.Load() {
+		t.Fatalf(
+			"recovery authority order: claims=%d batch_done_before_claim=%t, want 1/false",
+			authorityCalls,
+			order.batchDoneBefore.Load(),
+		)
 	}
 	if batches != 0 || inserts != 0 || receipts != 0 || statuses != 1 {
 		t.Fatalf("recovery-only effects: batches=%d inserts=%d receipts=%d statuses=%d",

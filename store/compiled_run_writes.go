@@ -188,6 +188,10 @@ func (s *Store) CreatePushBatchForTaskRunV1(
 		return 0, err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockPushEffectSchemaWriter(ctx, tx); err != nil {
+		return 0, taskRunDatabaseError(
+			"lock compiled push batch schema admission", err)
+	}
 
 	var id int64
 	err = tx.QueryRow(ctx,
@@ -312,6 +316,10 @@ func (s *Store) RecordEmptyPushBatchForTaskRunV1(
 		return 0, false, err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockPushEffectSchemaWriter(ctx, tx); err != nil {
+		return 0, false, taskRunDatabaseError(
+			"lock compiled empty batch schema admission", err)
+	}
 
 	err = tx.QueryRow(ctx,
 		`INSERT INTO push_batches
@@ -391,6 +399,11 @@ func (s *Store) InsertDeliveryForTaskRunV1(
 		return 0, false, false, err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockCompiledLegacyPushBatchV1(
+		ctx, tx, expected, ref.SnapshotID, d.BatchID, "",
+	); err != nil {
+		return 0, false, false, err
+	}
 
 	err = tx.QueryRow(ctx,
 		`INSERT INTO deliveries (
@@ -471,6 +484,12 @@ func (s *Store) UpdatePushBatchStatusForTaskRunV1(
 		return err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockCompiledLegacyPushBatchV1(
+		ctx, tx, expected, ref.SnapshotID, batchID,
+		types.PushBatchDeliveryAuthorityLegacy,
+	); err != nil {
+		return err
+	}
 	if err := updateCompiledPushBatchStatusV1(
 		ctx, tx, expected, ref.SnapshotID, physicalKey, batchID, status,
 	); err != nil {
@@ -498,6 +517,12 @@ func (s *Store) MarkPushBatchDoneReceiptV1(
 		return err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockCompiledLegacyPushBatchV1(
+		ctx, tx, expected, ref.SnapshotID, batchID,
+		types.PushBatchDeliveryAuthorityLegacy,
+	); err != nil {
+		return err
+	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE push_batches b
 		    SET status = $7
@@ -590,6 +615,12 @@ func (s *Store) MarkDeliverySentForTaskRunV1(
 		return err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockCompiledLegacyPushBatchV1(
+		ctx, tx, expected, ref.SnapshotID, batchID,
+		types.PushBatchDeliveryAuthorityLegacy,
+	); err != nil {
+		return err
+	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE deliveries d
 		    SET feishu_message_id = $8,
@@ -618,6 +649,30 @@ func (s *Store) MarkDeliverySentForTaskRunV1(
 		return taskRunNotFound()
 	}
 	return commitCompiledRunWriteV1(ctx, tx, "commit compiled delivery receipt")
+}
+
+func lockCompiledLegacyPushBatchV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected types.RunIdentity,
+	snapshotID, batchID int64,
+	requiredAuthority types.PushBatchDeliveryAuthority,
+) error {
+	_, err := lockPushEffectBatchAdmission(
+		ctx,
+		tx,
+		types.PushBatchScope{
+			TenantID: expected.TenantID,
+			UserID:   expected.UserID,
+			BatchID:  batchID,
+		},
+		snapshotID,
+		requiredAuthority,
+	)
+	if errors.Is(err, types.ErrConflict) {
+		return taskRunNotFound()
+	}
+	return err
 }
 
 // EvolveProfileForTaskRunV1 is the exact-tenant compiled evolution CAS. The

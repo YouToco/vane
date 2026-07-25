@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/YouToco/vane/types"
 )
 
 const pushEffectRollbackTimeout = 2 * time.Second
@@ -44,10 +46,23 @@ func (s *Store) beginPushEffectRoleTx(
 	if err != nil {
 		return nil, fmt.Errorf("begin push effect transaction: %w", err)
 	}
+	if err := lockPushEffectSchemaWriter(ctx, tx); err != nil {
+		rollbackPushEffectTx(ctx, tx)
+		return nil, fmt.Errorf("lock push effect schema admission: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id',$1,true)`,
 		strconv.FormatInt(tenantID, 10)); err != nil {
 		rollbackPushEffectTx(ctx, tx)
 		return nil, fmt.Errorf("set push effect tenant context: %w", err)
+	}
+	tenantExists, err := lockTenantAdmissionRoot(ctx, tx, tenantID)
+	if err != nil {
+		rollbackPushEffectTx(ctx, tx)
+		return nil, fmt.Errorf("lock push effect tenant admission: %w", err)
+	}
+	if !tenantExists {
+		rollbackPushEffectTx(ctx, tx)
+		return nil, types.ErrNotFound
 	}
 	var setRole string
 	switch role {

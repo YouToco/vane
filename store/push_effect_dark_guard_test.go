@@ -42,8 +42,7 @@ func TestPushEffectStoreHasZeroProductionCallPoints(t *testing.T) {
 			return nil
 		}
 		if !strings.HasSuffix(path, ".go") ||
-			strings.HasSuffix(path, "_test.go") ||
-			filepath.Clean(path) == filepath.Join(root, "store", "push_effects.go") {
+			strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		file, parseErr := parser.ParseFile(fset, path, nil, 0)
