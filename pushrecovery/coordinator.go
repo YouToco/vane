@@ -73,6 +73,10 @@ type Store interface {
 		context.Context,
 		pusheffect.ExhaustedResolution,
 	) error
+	BlockExpiredUnclaimedPushEffect(
+		context.Context,
+		pusheffect.ExpiryResolution,
+	) (bool, error)
 }
 
 type Sender interface {
@@ -223,6 +227,13 @@ func (c *Coordinator) Attempt(
 		if effect.RecoveryBudgetExhausted() {
 			return c.blockExhausted(ctx, effect)
 		}
+		blocked, blockErr := c.blockExpiredUnclaimed(ctx, effect)
+		if blockErr != nil {
+			return "", blockErr
+		}
+		if blocked {
+			return OutcomeBlocked, nil
+		}
 		return c.claimAndSend(ctx, effect, false)
 	case pusheffect.StatusAmbiguous:
 		// Continue below.
@@ -351,8 +362,26 @@ func (c *Coordinator) claimAndSend(
 	}
 	switch decision {
 	case pusheffect.AuthorizedClaimNotDue:
+		if !reconciliation {
+			if blocked, blockErr := c.blockExpiredUnclaimed(
+				ctx, effect,
+			); blockErr != nil {
+				return "", blockErr
+			} else if blocked {
+				return OutcomeBlocked, nil
+			}
+		}
 		return OutcomeDeferred, nil
 	case pusheffect.AuthorizedClaimDenied:
+		if !reconciliation {
+			if blocked, blockErr := c.blockExpiredUnclaimed(
+				ctx, effect,
+			); blockErr != nil {
+				return "", blockErr
+			} else if blocked {
+				return OutcomeBlocked, nil
+			}
+		}
 		if reconciliation {
 			if _, err := c.deferAmbiguous(ctx, effect, false); err != nil {
 				return "", err
@@ -389,6 +418,28 @@ func (c *Coordinator) blockExhausted(
 		return "", fmt.Errorf("block exhausted push effect: %w", err)
 	}
 	return OutcomeBlocked, nil
+}
+
+func (c *Coordinator) blockExpiredUnclaimed(
+	ctx context.Context,
+	effect *pusheffect.Effect,
+) (bool, error) {
+	checkpointCtx, cancelCheckpoint := c.checkpointContext(ctx)
+	defer cancelCheckpoint()
+	blocked, err := c.store.BlockExpiredUnclaimedPushEffect(
+		checkpointCtx,
+		pusheffect.ExpiryResolution{
+			Scope:          effect.Scope(),
+			ExpectedFence:  effect.Fence,
+			ExpectedTaskID: c.config.ExactTaskID,
+			RequiredWindow: c.config.LeaseDuration,
+		},
+	)
+	if err != nil {
+		return false, fmt.Errorf(
+			"block expired unclaimed push effect: %w", err)
+	}
+	return blocked, nil
 }
 
 func (c *Coordinator) sendClaimed(

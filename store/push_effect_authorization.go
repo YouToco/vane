@@ -69,7 +69,8 @@ func (s *Store) claimAuthorizedPushEffect(
 		return nil, "", pushEffectConflict(
 			"push effect is outside the enabled recovery task")
 	}
-	if err := validatePushEffectRunSnapshotForClaim(ctx, tx, effect); err != nil {
+	legacyDated, err := validatePushEffectRunSnapshotForClaim(ctx, tx, effect)
+	if err != nil {
 		return nil, "", err
 	}
 
@@ -78,7 +79,7 @@ func (s *Store) claimAuthorizedPushEffect(
 		effect.LeaseUntil != nil &&
 		databaseNow.Before(*effect.LeaseUntil) {
 		replayed, authorized, err := loadAuthorizedPushEffectClaimReplay(
-			ctx, tx, effect, params, reconciliation)
+			ctx, tx, effect, params, reconciliation, legacyDated)
 		if err != nil {
 			return nil, "", err
 		}
@@ -112,6 +113,12 @@ func (s *Store) claimAuthorizedPushEffect(
 			effect.Status != pusheffect.StatusDefiniteFailed {
 			return nil, "", pushEffectBusyOrTerminal(effect.Status)
 		}
+		if !databaseNow.Before(effect.IdempotencyExpiresAt) ||
+			databaseNow.Add(params.LeaseDuration).After(
+				effect.IdempotencyExpiresAt) {
+			return nil, "", pushEffectConflict(
+				"push effect provider window cannot contain the complete lease")
+		}
 		if databaseNow.Before(effect.NextAttemptAt) {
 			if err := tx.Commit(ctx); err != nil {
 				return nil, "", pushEffectDatabaseError(
@@ -122,7 +129,7 @@ func (s *Store) claimAuthorizedPushEffect(
 	}
 
 	claimed, authorized, err := updateAuthorizedPushEffectClaim(
-		ctx, tx, effect, params, reconciliation)
+		ctx, tx, effect, params, reconciliation, legacyDated)
 	if err != nil {
 		return nil, "", err
 	}
@@ -147,7 +154,7 @@ func validatePushEffectRunSnapshotForClaim(
 	ctx context.Context,
 	tx pgx.Tx,
 	effect *pusheffect.Effect,
-) error {
+) (bool, error) {
 	var snapshot taskRunSnapshot
 	var rawMode string
 	err := tx.QueryRow(ctx, `
@@ -168,15 +175,15 @@ func validatePushEffectRunSnapshotForClaim(
 		&snapshot.BudgetJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return pushEffectIntegrity()
+		return false, pushEffectIntegrity()
 	}
 	if err != nil {
-		return pushEffectDatabaseError(
+		return false, pushEffectDatabaseError(
 			"load authorized claim run snapshot", err)
 	}
 	mode, err := types.ParseExecutionMode(rawMode)
 	if err != nil {
-		return pushEffectIntegrity()
+		return false, pushEffectIntegrity()
 	}
 	snapshot.Mode = mode
 	ref, err := snapshot.safeRef()
@@ -185,11 +192,35 @@ func validatePushEffectRunSnapshotForClaim(
 		ref.TenantID != effect.TenantID ||
 		ref.UserID != effect.UserID ||
 		ref.TaskID != effect.TaskID ||
-		ref.TemporalRunID != effect.RunID ||
-		ref.TemporalWorkflowID != scheduledTaskWorkflowID(effect.TaskID) {
-		return pushEffectIntegrity()
+		ref.TemporalRunID != effect.RunID {
+		return false, pushEffectIntegrity()
 	}
-	return nil
+	if ref.TemporalWorkflowID == scheduledTaskWorkflowID(effect.TaskID) {
+		return false, nil
+	}
+	if !validScheduledTaskWorkflowExecutionIDV1(
+		effect.TaskID, ref.TemporalWorkflowID,
+	) {
+		return false, pushEffectIntegrity()
+	}
+	// Retained snapshots normally use the bare Schedule Action ID. The only
+	// dated execution admitted here is the physically pinned batch 63 repair,
+	// after its finalized audit and exact immutable effect are both present.
+	var legacyReady bool
+	if err := tx.QueryRow(ctx, `
+		SELECT public.legacy_push_batch_63_claim_ready_v1(
+			$1,$2,$3,$4,$5,$6,$7
+		)`,
+		effect.ID, effect.TenantID, effect.UserID, effect.TaskID,
+		effect.RunSnapshotID, effect.RunID, effect.PayloadDigest,
+	).Scan(&legacyReady); err != nil {
+		return false, pushEffectDatabaseError(
+			"validate legacy batch 63 claim readiness", err)
+	}
+	if !legacyReady {
+		return false, pushEffectIntegrity()
+	}
+	return true, nil
 }
 
 const pushEffectRunSnapshotReferenceColumns = `id, tenant_id, user_id, task_id,
@@ -205,12 +236,20 @@ func loadAuthorizedPushEffectClaimReplay(
 	effect *pusheffect.Effect,
 	params pusheffect.AuthorizedClaimParams,
 	reconciliation bool,
+	legacyDated bool,
 ) (*pusheffect.Effect, bool, error) {
 	windowPredicate := ""
 	if reconciliation {
 		windowPredicate = `
 		   AND clock_timestamp()+($6*interval '1 microsecond')
 		       <=e.idempotency_expires_at`
+	} else {
+		// A same-owner replay returns the already-held lease rather than
+		// extending it. Reject legacy/invalid sending rows whose complete
+		// lease crosses the frozen provider UUID window.
+		windowPredicate = `
+		   AND $6::bigint>0
+		   AND e.lease_until<=e.idempotency_expires_at`
 	}
 	row := tx.QueryRow(ctx, `
 		SELECT `+pushEffectColumns+`
@@ -218,9 +257,11 @@ func loadAuthorizedPushEffectClaimReplay(
 		 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3
 		   AND e.status='sending' AND e.lease_owner=$4 AND e.fence=$5
 		   AND e.lease_until>clock_timestamp()`+windowPredicate+`
-		   AND `+authorizedPushEffectRunPredicate,
+		   AND $7::bigint>0
+		   AND `+authorizedPushEffectRunPredicate(legacyDated, false),
 		params.ID, params.TenantID, params.UserID, params.LeaseOwner,
 		effect.Fence, params.LeaseDuration.Microseconds(),
+		params.DenialRetryAfter.Microseconds(),
 		types.ScheduleStatusActive, types.TenantStatusActive,
 		scheduledTaskWorkflowID(effect.TaskID), params.ExpectedTaskID)
 	replayed, err := scanPushEffect(row)
@@ -243,9 +284,11 @@ func updateAuthorizedPushEffectClaim(
 	effect *pusheffect.Effect,
 	params pusheffect.AuthorizedClaimParams,
 	reconciliation bool,
+	legacyDated bool,
 ) (*pusheffect.Effect, bool, error) {
 	if !reconciliation {
-		return updateFreshAuthorizedPushEffectClaim(ctx, tx, effect, params)
+		return updateFreshAuthorizedPushEffectClaim(
+			ctx, tx, effect, params, legacyDated)
 	}
 	statusPredicate := `
 		   AND e.status='ambiguous'
@@ -263,7 +306,7 @@ func updateAuthorizedPushEffectClaim(
 		 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3 AND e.fence=$5
 		   AND e.lease_owner='' AND e.lease_until IS NULL`+
 		statusPredicate+`
-		   AND `+authorizedPushEffectRunPredicate+`
+		   AND `+authorizedPushEffectRunPredicate(legacyDated, false)+`
 		 RETURNING `+pushEffectColumns,
 		params.ID, params.TenantID, params.UserID, params.LeaseOwner,
 		effect.Fence, params.LeaseDuration.Microseconds(),
@@ -286,12 +329,21 @@ func updateFreshAuthorizedPushEffectClaim(
 	tx pgx.Tx,
 	effect *pusheffect.Effect,
 	params pusheffect.AuthorizedClaimParams,
+	legacyDated bool,
 ) (*pusheffect.Effect, bool, error) {
 	var authorized bool
 	err := tx.QueryRow(ctx, `
-		WITH decision AS (
-			SELECT `+authorizedPushEffectRunPredicate+` AS authorized
+		WITH database_clock AS MATERIALIZED (
+			SELECT clock_timestamp() AS database_now
+		), decision AS (
+			SELECT (
+				`+authorizedPushEffectRunPredicate(legacyDated, true)+`
+				AND database_clock.database_now+
+				    ($6*interval '1 microsecond')<=e.idempotency_expires_at
+			) AS authorized,
+			database_clock.database_now
 			  FROM push_effects e
+			  CROSS JOIN database_clock
 			 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3
 			   AND e.fence=$5
 		)
@@ -301,21 +353,24 @@ func updateFreshAuthorizedPushEffectClaim(
 		       lease_owner=CASE WHEN decision.authorized THEN $4
 		                        ELSE e.lease_owner END,
 		       lease_until=CASE WHEN decision.authorized
-		                   THEN clock_timestamp()+($6*interval '1 microsecond')
+		                   THEN decision.database_now+
+		                        ($6*interval '1 microsecond')
 		                   ELSE NULL END,
 		       takeover_not_before=CASE WHEN decision.authorized
-		                   THEN clock_timestamp()+($7*interval '1 microsecond')
+		                   THEN decision.database_now+
+		                        ($7*interval '1 microsecond')
 		                   ELSE NULL END,
 		       fence=e.fence+CASE WHEN decision.authorized THEN 1 ELSE 0 END,
 		       attempt=e.attempt+CASE WHEN decision.authorized THEN 1 ELSE 0 END,
 		       next_attempt_at=CASE WHEN decision.authorized
 		                   THEN e.next_attempt_at
-		                   ELSE clock_timestamp()+($12*interval '1 microsecond') END,
+		                   ELSE decision.database_now+
+		                        ($12*interval '1 microsecond') END,
 		       failure_class=CASE WHEN decision.authorized THEN ''
 		                          ELSE e.failure_class END,
 		       ambiguous_since=CASE WHEN decision.authorized THEN NULL
 		                            ELSE e.ambiguous_since END,
-		       updated_at=clock_timestamp()
+		       updated_at=decision.database_now
 		  FROM decision
 		 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3 AND e.fence=$5
 		   AND e.task_id=$11
@@ -350,7 +405,29 @@ func updateFreshAuthorizedPushEffectClaim(
 // authorizedPushEffectRunPredicate is evaluated by the same SQL statement that
 // mutates the effect. It deliberately repeats every immutable coordinate and
 // current live-state predicate; a stale preflight cannot authorize the UPDATE.
-const authorizedPushEffectRunPredicate = `EXISTS (
+//
+// Keep the normal predicate free of references to migration 050 objects. Some
+// migration-boundary tests intentionally exercise a schema at version 49, and
+// PostgreSQL resolves every function in an OR expression while parsing it even
+// when the bare-workflow side is already true.
+func authorizedPushEffectRunPredicate(
+	legacyDated bool,
+	freshAdmission bool,
+) string {
+	workflowPredicate := `r.temporal_workflow_id=$10`
+	if legacyDated {
+		function := "public.legacy_push_batch_63_claim_ready_v1"
+		if freshAdmission {
+			function = "public.legacy_push_batch_63_fresh_claim_ready_v1"
+		}
+		// $10 is deliberately cast even though the dated path does not compare
+		// it. PostgreSQL requires a type for every numbered bind parameter.
+		workflowPredicate = `$10::text IS NOT NULL AND ` + function + `(
+			e.id,e.tenant_id,e.user_id,e.task_id,e.run_snapshot_id,
+			e.run_id,e.payload_digest
+		)`
+	}
+	return `EXISTS (
 	SELECT 1
 	  FROM task_run_snapshots r
 	  JOIN schedules s
@@ -364,7 +441,7 @@ const authorizedPushEffectRunPredicate = `EXISTS (
 	   AND r.user_id=e.user_id
 	   AND r.task_id=e.task_id
 	   AND r.temporal_run_id=e.run_id
-	   AND r.temporal_workflow_id=$10
+	   AND (` + workflowPredicate + `)
 	   AND s.status=$8
 	   AND t.status=$9 AND t.deleted_at IS NULL
 	   AND NOT EXISTS (
@@ -376,3 +453,4 @@ const authorizedPushEffectRunPredicate = `EXISTS (
 	          AND NOT (p.status='executed' AND p.phase='completed')
 	   )
 )`
+}

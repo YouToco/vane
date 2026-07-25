@@ -1,6 +1,8 @@
 package store
 
 import (
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -286,6 +288,872 @@ func TestClaimAuthorizedPushEffectHasOneConcurrentWinner(t *testing.T) {
 	}
 }
 
+func TestClaimAuthorizedPushEffectAllowsOnlyFinalizedLegacyBatch63Workflow(
+	t *testing.T,
+) {
+	f := newLegacyBatch63Fixture(t)
+	plan, err := f.st.PreviewLegacyBatch63Repair(
+		t.Context(), f.evidence, f.expiresAt, f.buildCard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.FinalizeLegacyBatch63Repair(
+		t.Context(), plan.PlanDigest, f.evidence, f.expiresAt, f.buildCard,
+	); err != nil {
+		t.Fatal(err)
+	}
+	scope := pusheffect.Scope{
+		ID: legacyBatch63EffectID, TenantID: plan.Prepared.TenantID,
+		UserID: plan.Prepared.UserID,
+	}
+	claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+		t.Context(),
+		pusheffect.AuthorizedClaimParams{
+			ClaimParams: pusheffect.ClaimParams{
+				Scope: scope, LeaseOwner: "legacy-batch63-dated-workflow",
+				LeaseDuration: time.Minute,
+			},
+			ExpectedTaskID: legacyBatch63TaskID, DenialRetryAfter: time.Minute,
+		},
+	)
+	if err != nil || decision != pusheffect.AuthorizedClaimed ||
+		claimed == nil || claimed.Status != pusheffect.StatusSending ||
+		claimed.TaskID != legacyBatch63TaskID ||
+		claimed.RunID != legacyBatch63RunID {
+		t.Fatalf(
+			"legacy dated claim=%+v decision=%q err=%v",
+			claimed, decision, err,
+		)
+	}
+}
+
+func TestClaimAuthorizedPushEffectRejectsDatedWorkflowWithoutExactRepairAudit(
+	t *testing.T,
+) {
+	f, effect := authorizedPushEffectFixtureForWorkflow(
+		t, "dated")
+	_, decision, err := f.st.ClaimAuthorizedPushEffect(
+		t.Context(),
+		authorizedPushEffectClaimParams(effect, "ordinary-dated-workflow"),
+	)
+	if err == nil || decision != "" {
+		t.Fatalf("ordinary dated workflow decision=%q err=%v", decision, err)
+	}
+	assertPushEffectProviderStateUnclaimed(t, f, effect)
+}
+
+func TestClaimAuthorizedPushEffectRejectsDriftedLegacyBatch63Evidence(
+	t *testing.T,
+) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, legacyBatch63Fixture, LegacyBatch63RepairPlan)
+	}{
+		{
+			name: "task",
+			mutate: func(
+				t *testing.T,
+				f legacyBatch63Fixture,
+				_ LegacyBatch63RepairPlan,
+			) {
+				if _, err := f.st.pool.Exec(t.Context(), `
+					UPDATE push_effects SET task_id=task_id||'-drift'
+					 WHERE id=$1`,
+					legacyBatch63EffectID,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "run",
+			mutate: func(
+				t *testing.T,
+				f legacyBatch63Fixture,
+				_ LegacyBatch63RepairPlan,
+			) {
+				if _, err := f.st.pool.Exec(t.Context(), `
+					UPDATE push_effects SET run_id=run_id||'-drift'
+					 WHERE id=$1`,
+					legacyBatch63EffectID,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "workflow",
+			mutate: func(
+				t *testing.T,
+				f legacyBatch63Fixture,
+				plan LegacyBatch63RepairPlan,
+			) {
+				if _, err := f.st.pool.Exec(t.Context(), `
+					UPDATE task_run_snapshots
+					   SET temporal_workflow_id=$2
+					 WHERE id=$1`,
+					plan.Prepared.RunSnapshotID,
+					scheduledTaskWorkflowID(legacyBatch63TaskID),
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "effect",
+			mutate: func(
+				t *testing.T,
+				f legacyBatch63Fixture,
+				_ LegacyBatch63RepairPlan,
+			) {
+				if _, err := f.st.pool.Exec(t.Context(), `
+					UPDATE push_effects SET provider=provider||'-drift'
+					 WHERE id=$1`,
+					legacyBatch63EffectID,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "audit",
+			mutate: func(
+				t *testing.T,
+				f legacyBatch63Fixture,
+				_ LegacyBatch63RepairPlan,
+			) {
+				if _, err := f.st.pool.Exec(t.Context(), `
+					DELETE FROM legacy_batch63_repair_events
+					 WHERE batch_id=63`,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newLegacyBatch63Fixture(t)
+			plan, err := f.st.PreviewLegacyBatch63Repair(
+				t.Context(), f.evidence, f.expiresAt, f.buildCard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.st.FinalizeLegacyBatch63Repair(
+				t.Context(), plan.PlanDigest, f.evidence, f.expiresAt,
+				f.buildCard,
+			); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, f, plan)
+			effect := &pusheffect.Effect{
+				Prepared: pusheffect.Prepared{
+					ID: legacyBatch63EffectID, TenantID: plan.Prepared.TenantID,
+					UserID: plan.Prepared.UserID, TaskID: legacyBatch63TaskID,
+				},
+			}
+			_, decision, err := f.st.ClaimAuthorizedPushEffect(
+				t.Context(),
+				authorizedPushEffectClaimParams(
+					effect, "legacy-batch63-"+test.name),
+			)
+			if err == nil || decision != "" {
+				t.Fatalf(
+					"drifted %s decision=%q err=%v",
+					test.name, decision, err,
+				)
+			}
+		})
+	}
+}
+
+func TestClaimAuthorizedPushEffectRejectsBlockedLegacyBatch63Repair(
+	t *testing.T,
+) {
+	f := newLegacyBatch63Fixture(t)
+	plan, err := f.st.PreviewLegacyBatch63Repair(
+		t.Context(), f.evidence, f.expiresAt, f.buildCard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.FinalizeLegacyBatch63Repair(
+		t.Context(), plan.PlanDigest, f.evidence, f.expiresAt, f.buildCard,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.AbortLegacyBatch63Repair(
+		t.Context(), plan.PlanDigest,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var ready bool
+	if err := f.st.pool.QueryRow(t.Context(), `
+		SELECT public.legacy_push_batch_63_claim_ready_v1(
+			$1,$2,$3,$4,$5,$6,$7
+		)`,
+		legacyBatch63EffectID, plan.Prepared.TenantID, plan.Prepared.UserID,
+		legacyBatch63TaskID, plan.Prepared.RunSnapshotID, legacyBatch63RunID,
+		plan.PayloadDigest,
+	).Scan(&ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready {
+		t.Fatal("blocked legacy batch 63 remained claim-ready")
+	}
+	effect := &pusheffect.Effect{
+		Prepared: pusheffect.Prepared{
+			ID: legacyBatch63EffectID, TenantID: plan.Prepared.TenantID,
+			UserID: plan.Prepared.UserID, TaskID: legacyBatch63TaskID,
+		},
+	}
+	_, decision, err := f.st.ClaimAuthorizedPushEffect(
+		t.Context(),
+		authorizedPushEffectClaimParams(effect, "legacy-batch63-blocked"),
+	)
+	if err == nil || decision != "" {
+		t.Fatalf("blocked decision=%q err=%v", decision, err)
+	}
+}
+
+func TestClaimAuthorizedPushEffectRejectsLegacyBatch63AfterEnableBy(
+	t *testing.T,
+) {
+	t.Run("fresh", func(t *testing.T) {
+		f, plan := finalizedLegacyBatch63Repair(t)
+		expireLegacyBatch63EnableBy(t, f)
+		effect := &pusheffect.Effect{Prepared: plan.Prepared}
+		claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(),
+			authorizedPushEffectClaimParams(effect, "legacy-late-fresh"),
+		)
+		if err != nil || claimed != nil ||
+			decision != pusheffect.AuthorizedClaimDenied {
+			t.Fatalf("late fresh claim=%+v decision=%q err=%v",
+				claimed, decision, err)
+		}
+		var status string
+		var fence int64
+		var attempt int
+		if err := f.st.pool.QueryRow(t.Context(), `
+			SELECT status,fence,attempt FROM push_effects WHERE id=$1`,
+			effect.ID,
+		).Scan(&status, &fence, &attempt); err != nil {
+			t.Fatal(err)
+		}
+		if status != string(pusheffect.StatusPrepared) ||
+			fence != 0 || attempt != 0 {
+			t.Fatalf("late fresh mutated effect=%s/%d/%d",
+				status, fence, attempt)
+		}
+	})
+
+	t.Run("same owner replay", func(t *testing.T) {
+		f, plan := finalizedLegacyBatch63Repair(t)
+		effect := &pusheffect.Effect{Prepared: plan.Prepared}
+		params := authorizedPushEffectClaimParams(effect, "legacy-late-replay")
+		if _, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(), params,
+		); err != nil || decision != pusheffect.AuthorizedClaimed {
+			t.Fatalf("initial claim decision=%q err=%v", decision, err)
+		}
+		if _, err := f.st.pool.Exec(t.Context(), `
+			UPDATE legacy_batch63_repair_events
+			   SET enable_by=clock_timestamp()-interval '1 second'
+			 WHERE batch_id=63 AND phase='finalized'`); err != nil {
+			t.Fatal(err)
+		}
+		claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(), params)
+		if err != nil || claimed == nil ||
+			decision != pusheffect.AuthorizedClaimed {
+			t.Fatalf("late replay claim=%+v decision=%q err=%v",
+				claimed, decision, err)
+		}
+	})
+
+	t.Run("reconciliation", func(t *testing.T) {
+		f, plan := finalizedLegacyBatch63Repair(t)
+		effect := &pusheffect.Effect{Prepared: plan.Prepared}
+		params := authorizedPushEffectClaimParams(
+			effect, "legacy-late-reconciliation")
+		if _, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(), params,
+		); err != nil || decision != pusheffect.AuthorizedClaimed {
+			t.Fatalf("initial claim decision=%q err=%v", decision, err)
+		}
+		if _, err := f.st.pool.Exec(t.Context(), `
+			UPDATE push_effects
+			   SET status='ambiguous',lease_owner='',lease_until=NULL,
+			       takeover_not_before=NULL,
+			       failure_class='provider_outcome_unknown',
+			       ambiguous_since=clock_timestamp(),
+			       next_attempt_at=clock_timestamp()-interval '1 second'
+			 WHERE id=$1`,
+			legacyBatch63EffectID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.st.pool.Exec(t.Context(), `
+			UPDATE legacy_batch63_repair_events
+			   SET enable_by=clock_timestamp()-interval '1 second'
+			 WHERE batch_id=63 AND phase='finalized'`); err != nil {
+			t.Fatal(err)
+		}
+		claimed, decision, err := f.st.ClaimAuthorizedPushEffectReconciliation(
+			t.Context(), params)
+		if err != nil || claimed == nil ||
+			decision != pusheffect.AuthorizedClaimed {
+			t.Fatalf("late reconciliation claim=%+v decision=%q err=%v",
+				claimed, decision, err)
+		}
+	})
+
+	t.Run("definite failure retry and terminal budget", func(t *testing.T) {
+		f, plan := finalizedLegacyBatch63Repair(t)
+		effect := &pusheffect.Effect{Prepared: plan.Prepared}
+		params := authorizedPushEffectClaimParams(
+			effect, "legacy-definite-1")
+		claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(), params)
+		if err != nil || decision != pusheffect.AuthorizedClaimed {
+			t.Fatalf("initial claim=%+v decision=%q err=%v",
+				claimed, decision, err)
+		}
+		if _, err := f.st.pool.Exec(t.Context(), `
+			UPDATE legacy_batch63_repair_events
+			   SET enable_by=clock_timestamp()-interval '1 second'
+			 WHERE batch_id=63 AND phase='finalized'`); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			lease := pusheffect.Lease{
+				Scope: claimed.Scope(), LeaseOwner: claimed.LeaseOwner,
+				Fence: claimed.Fence,
+			}
+			if err := f.st.RecordPushEffectDefiniteFailure(
+				t.Context(),
+				pusheffect.FailureParams{
+					Lease: lease, Class: "provider_definite_failure",
+					RetryAfter: time.Second,
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+			if claimed.Attempt >= pusheffect.RecoveryMaxAttempts {
+				break
+			}
+			if _, err := f.st.pool.Exec(t.Context(), `
+				UPDATE push_effects
+				   SET next_attempt_at=clock_timestamp()-interval '1 second'
+				 WHERE id=$1`, legacyBatch63EffectID); err != nil {
+				t.Fatal(err)
+			}
+			params.LeaseOwner = "legacy-definite-" +
+				string(rune('1'+claimed.Attempt))
+			wantAttempt := claimed.Attempt + 1
+			claimed, decision, err = f.st.ClaimAuthorizedPushEffect(
+				t.Context(), params)
+			if err != nil || decision != pusheffect.AuthorizedClaimed {
+				t.Fatalf("retry attempt=%d claim=%+v decision=%q err=%v",
+					wantAttempt, claimed, decision, err)
+			}
+		}
+		if claimed.Attempt != pusheffect.RecoveryMaxAttempts {
+			t.Fatalf("terminal attempt=%d", claimed.Attempt)
+		}
+		if err := f.st.BlockExhaustedPushEffectAttempts(
+			t.Context(),
+			pusheffect.ExhaustedResolution{
+				Scope: claimed.Scope(), ExpectedFence: claimed.Fence,
+				ExpectedTaskID: legacyBatch63TaskID,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		terminal, err := f.st.LoadPushEffect(
+			t.Context(), claimed.Scope())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if terminal.Status != pusheffect.StatusBlocked ||
+			terminal.FailureClass != "attempt_budget_exhausted" {
+			t.Fatalf("terminal effect=%+v", terminal)
+		}
+		status, err := f.st.VerifyLegacyBatch63Repair(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Phase != "finalized" ||
+			status.EffectStatus != string(pusheffect.StatusBlocked) {
+			t.Fatalf("terminal repair status=%+v", status)
+		}
+	})
+}
+
+func TestLegacyBatch63AbortWinsAgainstLateClaim(t *testing.T) {
+	f, plan := finalizedLegacyBatch63Repair(t)
+	expireLegacyBatch63EnableBy(t, f)
+	effect := &pusheffect.Effect{Prepared: plan.Prepared}
+	type result struct {
+		operation string
+		decision  pusheffect.AuthorizedClaimDecision
+		err       error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		<-start
+		_, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(),
+			authorizedPushEffectClaimParams(effect, "legacy-late-race"),
+		)
+		results <- result{
+			operation: "claim", decision: decision, err: err,
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		<-start
+		_, err := f.st.AbortLegacyBatch63Repair(
+			t.Context(), plan.PlanDigest)
+		results <- result{operation: "abort", err: err}
+	}()
+	close(start)
+	workers.Wait()
+	close(results)
+	for got := range results {
+		switch got.operation {
+		case "claim":
+			if got.err == nil &&
+				got.decision != pusheffect.AuthorizedClaimDenied {
+				t.Fatalf("late claim decision=%q err=%v",
+					got.decision, got.err)
+			}
+			if got.err != nil && got.decision != "" {
+				t.Fatalf("late claim decision=%q err=%v",
+					got.decision, got.err)
+			}
+		case "abort":
+			if got.err != nil {
+				t.Fatalf("abort lost to late claim: %v", got.err)
+			}
+		}
+	}
+	status, err := f.st.VerifyLegacyBatch63Repair(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Phase != "blocked" || status.EffectStatus != "blocked" ||
+		status.BatchStatus != "failed" {
+		t.Fatalf("late race status=%+v", status)
+	}
+}
+
+func TestLegacyBatch63FreshClaimAndAbortHaveOneWinner(t *testing.T) {
+	f, plan := finalizedLegacyBatch63Repair(t)
+	effect := &pusheffect.Effect{Prepared: plan.Prepared}
+	type result struct {
+		operation string
+		decision  pusheffect.AuthorizedClaimDecision
+		err       error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		<-start
+		_, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(),
+			authorizedPushEffectClaimParams(effect, "legacy-fresh-race"),
+		)
+		results <- result{
+			operation: "claim", decision: decision, err: err,
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		<-start
+		_, err := f.st.AbortLegacyBatch63Repair(
+			t.Context(), plan.PlanDigest)
+		results <- result{operation: "abort", err: err}
+	}()
+	close(start)
+	workers.Wait()
+	close(results)
+	winners := 0
+	for got := range results {
+		switch got.operation {
+		case "claim":
+			if got.err == nil &&
+				got.decision == pusheffect.AuthorizedClaimed {
+				winners++
+			} else if got.err == nil || got.decision != "" {
+				t.Fatalf("fresh race claim decision=%q err=%v",
+					got.decision, got.err)
+			}
+		case "abort":
+			if got.err == nil {
+				winners++
+			}
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("fresh claim-vs-abort winners=%d", winners)
+	}
+	status, err := f.st.VerifyLegacyBatch63Repair(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch status.Phase {
+	case "finalized":
+		if status.EffectStatus != "sending" {
+			t.Fatalf("claim winner status=%+v", status)
+		}
+	case "blocked":
+		if status.EffectStatus != "blocked" ||
+			status.BatchStatus != "failed" {
+			t.Fatalf("abort winner status=%+v", status)
+		}
+	default:
+		t.Fatalf("nonterminal race status=%+v", status)
+	}
+}
+
+func finalizedLegacyBatch63Repair(
+	t *testing.T,
+) (legacyBatch63Fixture, LegacyBatch63RepairPlan) {
+	t.Helper()
+	f := newLegacyBatch63Fixture(t)
+	plan, err := f.st.PreviewLegacyBatch63Repair(
+		t.Context(), f.evidence, f.expiresAt, f.buildCard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.FinalizeLegacyBatch63Repair(
+		t.Context(), plan.PlanDigest, f.evidence, f.expiresAt, f.buildCard,
+	); err != nil {
+		t.Fatal(err)
+	}
+	return f, plan
+}
+
+func expireLegacyBatch63EnableBy(t *testing.T, f legacyBatch63Fixture) {
+	t.Helper()
+	if _, err := f.st.pool.Exec(t.Context(), `
+		UPDATE legacy_batch63_repair_events
+		   SET enable_by=clock_timestamp()-interval '1 second'
+		 WHERE batch_id=63 AND phase='finalized'`); err != nil {
+		t.Fatal(err)
+	}
+	var payloadDigest string
+	if err := f.st.pool.QueryRow(t.Context(),
+		`SELECT payload_digest FROM push_effects WHERE id=$1`,
+		legacyBatch63EffectID,
+	).Scan(&payloadDigest); err != nil {
+		t.Fatal(err)
+	}
+	var identityReady, freshReady bool
+	if err := f.st.pool.QueryRow(t.Context(), `
+		SELECT
+		  legacy_push_batch_63_claim_ready_v1(
+		    $1,1,1,$2,3,$3,$4
+		  ),
+		  legacy_push_batch_63_fresh_claim_ready_v1(
+		    $1,1,1,$2,3,$3,$4
+		  )`,
+		legacyBatch63EffectID, legacyBatch63TaskID, legacyBatch63RunID,
+		payloadDigest,
+	).Scan(&identityReady, &freshReady); err != nil {
+		t.Fatal(err)
+	}
+	if !identityReady || freshReady {
+		t.Fatalf("late readiness identity/fresh=%v/%v",
+			identityReady, freshReady)
+	}
+}
+
+func authorizedPushEffectClaimParams(
+	effect *pusheffect.Effect,
+	leaseOwner string,
+) pusheffect.AuthorizedClaimParams {
+	return pusheffect.AuthorizedClaimParams{
+		ClaimParams: pusheffect.ClaimParams{
+			Scope: effect.Scope(), LeaseOwner: leaseOwner,
+			LeaseDuration: time.Minute,
+		},
+		ExpectedTaskID: effect.TaskID, DenialRetryAfter: time.Minute,
+	}
+}
+
+func TestClaimAuthorizedPushEffectSchema49DoesNotResolveLegacyHelper(
+	t *testing.T,
+) {
+	f := newPushEffectFixtureAt(t, 49)
+	var helperAbsent bool
+	if err := f.db.QueryRowContext(t.Context(), `
+		SELECT to_regprocedure(
+		  'public.legacy_push_batch_63_claim_ready_v1(text,bigint,bigint,text,bigint,text,text)'
+		) IS NULL`,
+	).Scan(&helperAbsent); err != nil {
+		t.Fatal(err)
+	}
+	if !helperAbsent {
+		t.Fatal("schema 49 unexpectedly contains migration 050 helper")
+	}
+	digest := strings.Repeat("a", 64)
+	budget := []byte(
+		`{"max_planner_rounds":0,"max_tool_calls":0,"max_tokens":0,` +
+			`"max_cost_micro_usd":0,"duration_ms":0}`)
+	snapshot := taskRunSnapshot{
+		ID: f.prepared.RunSnapshotID, TenantID: f.prepared.TenantID,
+		UserID: f.prepared.UserID, TaskID: f.prepared.TaskID,
+		TemporalWorkflowID:      scheduledTaskWorkflowID(f.prepared.TaskID),
+		TemporalRunID:           f.prepared.RunID,
+		RunKind:                 types.RunSnapshotKindScheduled,
+		Mode:                    types.ExecutionModeCompiled,
+		CapabilityCatalogDigest: digest, ToolPolicyDigest: digest,
+		PromptPolicyDigest: digest, ModelPolicyDigest: digest,
+		QuotaPolicyDigest: digest, DefinitionDigest: digest,
+		PlanDigest: digest, PayloadDigest: digest,
+		ReferenceSchemaVersion: taskRunReferenceSchemaVersionV1,
+		BudgetJSON:             budget,
+	}
+	ref, err := sealTaskRunSnapshotReferenceV1(
+		&snapshot, taskRunBudgetV1{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(t.Context(), `
+		UPDATE task_run_snapshots
+		   SET temporal_workflow_id=$2,reference_digest=$3,
+		       reference_schema_version=$4,budget=$5
+		 WHERE id=$1`,
+		snapshot.ID, snapshot.TemporalWorkflowID, ref.ReferenceDigest,
+		taskRunReferenceSchemaVersionV1, budget,
+	); err != nil {
+		t.Fatal(err)
+	}
+	effect, err := f.store.CreatePushEffect(t.Context(), f.prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, decision, err := f.store.ClaimAuthorizedPushEffect(
+		t.Context(),
+		authorizedPushEffectClaimParams(effect, "schema49-normal"),
+	)
+	if err != nil || decision != pusheffect.AuthorizedClaimed ||
+		claimed == nil || claimed.Status != pusheffect.StatusSending {
+		t.Fatalf("schema49 claim=%+v decision=%q err=%v",
+			claimed, decision, err)
+	}
+}
+
+func TestClaimAuthorizedPushEffectLeaseFitsProviderWindow(t *testing.T) {
+	t.Run("fresh claim rejects an incomplete provider window", func(t *testing.T) {
+		f, effect := authorizedPushEffectFixture(t)
+		claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(),
+			pusheffect.AuthorizedClaimParams{
+				ClaimParams: pusheffect.ClaimParams{
+					Scope: effect.Scope(), LeaseOwner: "window-too-short",
+					LeaseDuration: 2 * time.Hour,
+				},
+				ExpectedTaskID:   effect.TaskID,
+				DenialRetryAfter: time.Minute,
+			},
+		)
+		if err == nil || !errors.Is(err, types.ErrConflict) ||
+			claimed != nil || decision != "" {
+			t.Fatalf(
+				"incomplete-window claim=%+v decision=%q err=%v",
+				claimed, decision, err,
+			)
+		}
+		assertPushEffectProviderStateUnclaimed(t, f, effect)
+	})
+
+	t.Run("fresh lease is bounded by one database clock sample", func(t *testing.T) {
+		f, effect := authorizedPushEffectFixture(t)
+		claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(),
+			pusheffect.AuthorizedClaimParams{
+				ClaimParams: pusheffect.ClaimParams{
+					Scope: effect.Scope(), LeaseOwner: "database-clock-window",
+					LeaseDuration: 59 * time.Minute,
+				},
+				ExpectedTaskID:   effect.TaskID,
+				DenialRetryAfter: time.Minute,
+			},
+		)
+		if err != nil || decision != pusheffect.AuthorizedClaimed ||
+			claimed == nil || claimed.LeaseUntil == nil {
+			t.Fatalf("bounded claim=%+v decision=%q err=%v", claimed, decision, err)
+		}
+		if claimed.LeaseUntil.After(claimed.IdempotencyExpiresAt) {
+			t.Fatalf(
+				"lease_until=%s exceeds provider expiry=%s",
+				claimed.LeaseUntil, claimed.IdempotencyExpiresAt,
+			)
+		}
+		var (
+			leaseUntil, updatedAt time.Time
+			expiresAt             time.Time
+		)
+		if err := f.st.pool.QueryRow(t.Context(), `
+			SELECT lease_until,idempotency_expires_at,updated_at
+			  FROM push_effects WHERE id=$1`,
+			effect.ID,
+		).Scan(&leaseUntil, &expiresAt, &updatedAt); err != nil {
+			t.Fatal(err)
+		}
+		if !leaseUntil.Equal(updatedAt.Add(59*time.Minute)) ||
+			leaseUntil.After(expiresAt) {
+			t.Fatalf(
+				"DB-clock lease=%s updated=%s expiry=%s",
+				leaseUntil, updatedAt, expiresAt,
+			)
+		}
+	})
+
+	t.Run("same owner replay rejects a lease beyond provider expiry", func(t *testing.T) {
+		f, effect := authorizedPushEffectFixture(t)
+		params := pusheffect.AuthorizedClaimParams{
+			ClaimParams: pusheffect.ClaimParams{
+				Scope: effect.Scope(), LeaseOwner: "same-owner-window",
+				LeaseDuration: time.Minute,
+			},
+			ExpectedTaskID: effect.TaskID, DenialRetryAfter: time.Minute,
+		}
+		claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+			t.Context(), params)
+		if err != nil || decision != pusheffect.AuthorizedClaimed ||
+			claimed == nil || claimed.LeaseUntil == nil {
+			t.Fatalf("initial claim=%+v decision=%q err=%v", claimed, decision, err)
+		}
+		if _, err := f.st.pool.Exec(t.Context(), `
+			UPDATE push_effects
+			   SET lease_until=idempotency_expires_at+interval '1 second',
+			       takeover_not_before=idempotency_expires_at+
+			           interval '31 seconds'
+			 WHERE id=$1`,
+			effect.ID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		replayed, replayDecision, err :=
+			f.st.ClaimAuthorizedPushEffect(t.Context(), params)
+		if err != nil || replayed != nil ||
+			replayDecision != pusheffect.AuthorizedClaimDenied {
+			t.Fatalf(
+				"out-of-window replay=%+v decision=%q err=%v",
+				replayed, replayDecision, err,
+			)
+		}
+		var (
+			status                string
+			fence, attempt        int64
+			leaseUntil, expiresAt time.Time
+		)
+		if err := f.st.pool.QueryRow(t.Context(), `
+			SELECT status,fence,attempt,lease_until,idempotency_expires_at
+			  FROM push_effects WHERE id=$1`,
+			effect.ID,
+		).Scan(
+			&status, &fence, &attempt, &leaseUntil, &expiresAt,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if status != string(pusheffect.StatusSending) ||
+			fence != claimed.Fence || attempt != int64(claimed.Attempt) ||
+			!leaseUntil.After(expiresAt) {
+			t.Fatalf(
+				"replay mutated provider state=%q fence=%d attempt=%d lease=%s expiry=%s",
+				status, fence, attempt, leaseUntil, expiresAt,
+			)
+		}
+	})
+}
+
+func TestClaimAuthorizedPushEffectExpiredWindowHasNoConcurrentWinner(
+	t *testing.T,
+) {
+	f, effect := authorizedPushEffectFixture(t)
+	type result struct {
+		decision pusheffect.AuthorizedClaimDecision
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	var workers sync.WaitGroup
+	for worker := range 2 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			_, decision, err := f.st.ClaimAuthorizedPushEffect(
+				t.Context(),
+				pusheffect.AuthorizedClaimParams{
+					ClaimParams: pusheffect.ClaimParams{
+						Scope: effect.Scope(),
+						LeaseOwner: "expired-window-" +
+							string(rune('a'+worker)),
+						LeaseDuration: 2 * time.Hour,
+					},
+					ExpectedTaskID:   effect.TaskID,
+					DenialRetryAfter: time.Minute,
+				},
+			)
+			results <- result{decision: decision, err: err}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	for got := range results {
+		if got.err == nil || !errors.Is(got.err, types.ErrConflict) ||
+			got.decision != "" {
+			t.Fatalf(
+				"concurrent expired-window decision=%q err=%v",
+				got.decision, got.err,
+			)
+		}
+	}
+	assertPushEffectProviderStateUnclaimed(t, f, effect)
+}
+
+func assertPushEffectProviderStateUnclaimed(
+	t *testing.T,
+	f *taskRunSnapshotFixture,
+	effect *pusheffect.Effect,
+) {
+	t.Helper()
+	var (
+		status, owner string
+		fence         int64
+		attempt       int
+		leaseUntil    *time.Time
+	)
+	if err := f.st.pool.QueryRow(t.Context(), `
+		SELECT status,lease_owner,fence,attempt,lease_until
+		  FROM push_effects WHERE id=$1`,
+		effect.ID,
+	).Scan(&status, &owner, &fence, &attempt, &leaseUntil); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(pusheffect.StatusPrepared) || owner != "" ||
+		fence != 0 || attempt != 0 || leaseUntil != nil {
+		t.Fatalf(
+			"provider state changed=%q owner=%q fence=%d attempt=%d lease=%v",
+			status, owner, fence, attempt, leaseUntil,
+		)
+	}
+}
+
 func TestClaimAuthorizedPushEffectReconciliationHonorsDatabaseDueTime(
 	t *testing.T,
 ) {
@@ -376,12 +1244,33 @@ func TestClaimAuthorizedPushEffectReconciliationHonorsDatabaseDueTime(
 func authorizedPushEffectFixture(
 	t *testing.T,
 ) (*taskRunSnapshotFixture, *pusheffect.Effect) {
+	return authorizedPushEffectFixtureWithExpiry(t, "", time.Hour)
+}
+
+func authorizedPushEffectFixtureForWorkflow(
+	t *testing.T,
+	workflowID string,
+) (*taskRunSnapshotFixture, *pusheffect.Effect) {
+	return authorizedPushEffectFixtureWithExpiry(t, workflowID, time.Hour)
+}
+
+func authorizedPushEffectFixtureWithExpiry(
+	t *testing.T,
+	workflowID string,
+	expiresAfter time.Duration,
+) (*taskRunSnapshotFixture, *pusheffect.Effect) {
 	t.Helper()
 	f := newTaskRunSnapshotFixture(t)
 	taskID := f.taskID()
 	f.createApprovedTask(t, taskID, 1)
 	identity := scheduledRunIdentity(
 		taskID, f.tenantID, f.userID, "push-effect-auth-"+uuid.NewString())
+	if workflowID == "dated" {
+		identity.TemporalWorkflowID = scheduledTaskWorkflowID(taskID) +
+			"-2026-07-24T20:28:32Z"
+	} else if workflowID != "" {
+		identity.TemporalWorkflowID = workflowID
+	}
 	ref, err := f.st.CreateOrGetCompiledTaskRunSnapshotV1(
 		t.Context(),
 		CreateOrGetCompiledTaskRunSnapshotV1Params{
@@ -466,7 +1355,7 @@ func authorizedPushEffectFixture(
 			ProviderUUID:         uuid.NewString(),
 			ObservationEventKeys: []string{eventKey},
 			IdempotencyExpiresAt: time.Now().UTC().
-				Truncate(time.Microsecond).Add(time.Hour),
+				Truncate(time.Microsecond).Add(expiresAfter),
 		},
 	)
 	if err != nil {

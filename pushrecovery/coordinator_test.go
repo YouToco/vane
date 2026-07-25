@@ -18,12 +18,17 @@ type fakeStore struct {
 	deferred           *pusheffect.ReconciliationSchedule
 	historyConflict    *pusheffect.HistoryResolution
 	exhausted          *pusheffect.ExhaustedResolution
+	expired            *pusheffect.ExpiryResolution
 	checkpointCanceled bool
 	claimDecision      pusheffect.AuthorizedClaimDecision
 	claimErr           error
 	deferDecision      pusheffect.ReconciliationDecision
 	deferErr           error
 	claimCalls         int
+	expiryBlocked      bool
+	expiryResults      []bool
+	expiryErr          error
+	expiryCalls        int
 }
 
 func (f *fakeStore) LoadPushEffect(
@@ -133,6 +138,21 @@ func (f *fakeStore) BlockExhaustedPushEffectAttempts(
 	f.checkpointCanceled = f.checkpointCanceled || ctx.Err() != nil
 	f.exhausted = &resolution
 	return nil
+}
+
+func (f *fakeStore) BlockExpiredUnclaimedPushEffect(
+	ctx context.Context,
+	resolution pusheffect.ExpiryResolution,
+) (bool, error) {
+	f.checkpointCanceled = f.checkpointCanceled || ctx.Err() != nil
+	f.expired = &resolution
+	f.expiryCalls++
+	if len(f.expiryResults) > 0 {
+		result := f.expiryResults[0]
+		f.expiryResults = f.expiryResults[1:]
+		return result, f.expiryErr
+	}
+	return f.expiryBlocked, f.expiryErr
 }
 
 type fakeSender struct {
@@ -468,10 +488,11 @@ func TestAttemptAmbiguousNotDueNeverBurnsReconciliationAttempt(t *testing.T) {
 			t.Fatalf("Attempt()=%q/%v", outcome, err)
 		}
 	}
-	if sendCalls != 0 || st.deferred != nil || st.claimCalls != 2 {
+	if sendCalls != 0 || st.deferred != nil || st.claimCalls != 2 ||
+		st.expiryCalls != 0 {
 		t.Fatalf(
-			"not-due attempts send=%d deferred=%+v claims=%d",
-			sendCalls, st.deferred, st.claimCalls,
+			"not-due attempts send=%d deferred=%+v claims=%d expiry=%d",
+			sendCalls, st.deferred, st.claimCalls, st.expiryCalls,
 		)
 	}
 }
@@ -513,6 +534,94 @@ func TestAttemptBlocksDeterministicExhaustedEffect(t *testing.T) {
 		st.exhausted.ExpectedTaskID != effect.TaskID ||
 		st.exhausted.ExpectedFence != effect.Fence {
 		t.Fatalf("exhausted resolution=%+v", st.exhausted)
+	}
+	if st.expiryCalls != 0 {
+		t.Fatalf("exhausted terminal cause was replaced by expiry calls=%d",
+			st.expiryCalls)
+	}
+}
+
+func TestAttemptCheckpointsExpiredDeterministicEffect(t *testing.T) {
+	t.Parallel()
+
+	effect := testEffect()
+	effect.Status = pusheffect.StatusDefiniteFailed
+	effect.Fence = 3
+	effect.Attempt = 3
+	st := &fakeStore{effect: effect, expiryBlocked: true}
+	coordinator, err := New(Deps{
+		Store: st,
+		Sender: fakeSender{send: func(context.Context) (
+			pusheffect.ProviderObservation, error,
+		) {
+			t.Fatal("expired deterministic effect called provider")
+			return pusheffect.ProviderObservation{}, nil
+		}},
+		HistoryResolver: fakeHistoryResolver{
+			resolve: func(context.Context) (
+				pusheffect.HistoryObservation, error,
+			) {
+				t.Fatal("expired deterministic effect called history")
+				return pusheffect.HistoryObservation{}, nil
+			},
+		},
+		Config: Config{
+			ExactTaskID: effect.TaskID, LeaseDuration: 45 * time.Second,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := coordinator.Attempt(t.Context(), effect.Scope())
+	if err != nil || outcome != OutcomeBlocked {
+		t.Fatalf("Attempt()=%q/%v", outcome, err)
+	}
+	if st.expired == nil ||
+		st.expired.Scope != effect.Scope() ||
+		st.expired.ExpectedFence != effect.Fence ||
+		st.expired.ExpectedTaskID != effect.TaskID ||
+		st.expired.RequiredWindow != 45*time.Second ||
+		st.claimCalls != 0 {
+		t.Fatalf("expiry=%+v claimCalls=%d", st.expired, st.claimCalls)
+	}
+}
+
+func TestAttemptClaimDenialConvergesNewlyExpiredEffect(t *testing.T) {
+	t.Parallel()
+
+	effect := testEffect()
+	st := &fakeStore{
+		effect:        effect,
+		claimDecision: pusheffect.AuthorizedClaimDenied,
+		expiryResults: []bool{false, true},
+	}
+	coordinator, err := New(Deps{
+		Store: st,
+		Sender: fakeSender{send: func(context.Context) (
+			pusheffect.ProviderObservation, error,
+		) {
+			t.Fatal("denied expired effect called provider")
+			return pusheffect.ProviderObservation{}, nil
+		}},
+		HistoryResolver: fakeHistoryResolver{
+			resolve: func(context.Context) (
+				pusheffect.HistoryObservation, error,
+			) {
+				t.Fatal("deterministic effect called history")
+				return pusheffect.HistoryObservation{}, nil
+			},
+		},
+		Config: Config{ExactTaskID: effect.TaskID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := coordinator.Attempt(t.Context(), effect.Scope())
+	if err != nil || outcome != OutcomeBlocked {
+		t.Fatalf("Attempt()=%q/%v", outcome, err)
+	}
+	if st.claimCalls != 1 || st.expiryCalls != 2 {
+		t.Fatalf("claim/expiry calls=%d/%d", st.claimCalls, st.expiryCalls)
 	}
 }
 
@@ -609,8 +718,10 @@ func TestAttemptDecisionMatrix(t *testing.T) {
 			claimDecision: pusheffect.AuthorizedClaimDenied,
 			wantOutcome:   OutcomeNotAuthorized,
 			verify: func(t *testing.T, store *fakeStore) {
-				if store.deferred == nil {
-					t.Fatal("ambiguous denial did not persist defer")
+				if store.deferred == nil || store.expiryCalls != 0 {
+					t.Fatalf(
+						"ambiguous denial defer=%+v expiry=%d",
+						store.deferred, store.expiryCalls)
 				}
 			},
 		},
