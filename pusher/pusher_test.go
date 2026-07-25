@@ -17,6 +17,7 @@ type fakeSender struct {
 	retErr      error
 	called      bool
 	gotUUID     string
+	gotAppID    string
 	observation pusheffect.ProviderObservation
 }
 
@@ -29,11 +30,13 @@ func (f *fakeSender) SendCard(_ context.Context, openID, cardJSON string) (strin
 
 func (f *fakeSender) SendCardWithUUIDResult(
 	_ context.Context,
+	expectedAppIdentity string,
 	openID string,
 	cardJSON string,
 	messageUUID string,
 ) (pusheffect.ProviderObservation, error) {
 	f.called = true
+	f.gotAppID = expectedAppIdentity
 	f.gotOpenID = openID
 	f.gotCardJSON = cardJSON
 	f.gotUUID = messageUUID
@@ -91,15 +94,23 @@ func TestPushWithUUID_ForwardsTypedObservation(t *testing.T) {
 	const messageUUID = "019f9824-39b6-7e13-b247-b5ee5713c52b"
 	fs := &fakeSender{observation: pusheffect.ProviderObservation{
 		Disposition: pusheffect.AttemptSent,
+		AppIdentity: "cli_test",
 		MessageID:   "om_effect",
 		ChatID:      "oc_owner",
 	}}
 	got, err := New(fs).PushWithUUID(
-		t.Context(), "ou_owner", `{"card":"frozen"}`, messageUUID)
+		t.Context(),
+		"cli_test",
+		"ou_owner",
+		`{"card":"frozen"}`,
+		messageUUID,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != fs.observation || fs.gotOpenID != "ou_owner" ||
+	if got != fs.observation ||
+		fs.gotAppID != "cli_test" ||
+		fs.gotOpenID != "ou_owner" ||
 		fs.gotCardJSON != `{"card":"frozen"}` || fs.gotUUID != messageUUID {
 		t.Fatalf("observation/args drift: got=%+v sender=%+v", got, fs)
 	}
@@ -118,6 +129,7 @@ func (legacyOnlySender) SendCard(
 func TestPushWithUUID_FailsClosedWithoutDurableCapability(t *testing.T) {
 	got, err := New(legacyOnlySender{}).PushWithUUID(
 		t.Context(),
+		"cli_test",
 		"ou_owner",
 		`{"card":"frozen"}`,
 		"019f9824-39b6-7e13-b247-b5ee5713c52b",

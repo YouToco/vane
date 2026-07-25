@@ -75,6 +75,7 @@ func (p *fakePusher) Push(_ context.Context, _, cardJSON string) (string, error)
 
 func (p *fakePusher) PushWithUUID(
 	ctx context.Context,
+	appIdentity string,
 	openID string,
 	cardJSON string,
 	_ string,
@@ -91,6 +92,7 @@ func (p *fakePusher) PushWithUUID(
 		if observation == nil {
 			return pusheffect.ProviderObservation{
 				Disposition: pusheffect.AttemptAmbiguous,
+				AppIdentity: appIdentity,
 			}, durableErr
 		}
 		return *observation, durableErr
@@ -99,10 +101,12 @@ func (p *fakePusher) PushWithUUID(
 	if err != nil {
 		return pusheffect.ProviderObservation{
 			Disposition: pusheffect.AttemptAmbiguous,
+			AppIdentity: appIdentity,
 		}, err
 	}
 	return pusheffect.ProviderObservation{
 		Disposition: pusheffect.AttemptSent,
+		AppIdentity: appIdentity,
 		MessageID:   messageID,
 		ChatID:      "oc_owner",
 	}, nil

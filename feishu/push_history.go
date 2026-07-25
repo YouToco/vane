@@ -9,7 +9,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/YouToco/vane/pusheffect"
@@ -35,7 +34,7 @@ func (m *Manager) ResolvePushEffectMessage(
 			nil,
 		)
 	}
-	client, ok := m.pushHistoryClient(query.AppIdentity)
+	client, _, ok := m.apiForExpectedApp(query.AppIdentity)
 	if !ok {
 		return pusheffect.HistoryObservation{}, types.NewAppError(
 			types.CodeConflict,
@@ -105,19 +104,6 @@ func validPushHistoryQuery(query pusheffect.HistoryQuery) bool {
 		!query.EndTime.IsZero() &&
 		query.EndTime.After(query.StartTime) &&
 		query.EndTime.Sub(query.StartTime) <= 2*time.Hour
-}
-
-func (m *Manager) pushHistoryClient(
-	expectedAppIdentity string,
-) (*lark.Client, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if expectedAppIdentity == "" ||
-		m.apiClient == nil ||
-		m.apiAppID != expectedAppIdentity {
-		return nil, false
-	}
-	return m.apiClient, true
 }
 
 func validPushHistoryIdentity(identity string) bool {

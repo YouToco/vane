@@ -158,6 +158,7 @@ type Pusher interface {
 		string,
 		string,
 		string,
+		string,
 	) (pusheffect.ProviderObservation, error)
 }
 
@@ -3130,11 +3131,13 @@ func (a *Activities) sendDurablePushChunk(
 		Fence: effect.Fence,
 	}
 	observation, sendErr := a.pusher.PushWithUUID(
-		ctx, ownerOpenID, cardJSON, effect.ProviderUUID)
-	if observation.Disposition == pusheffect.AttemptSent &&
-		sendErr == nil &&
-		observation.MessageID != "" &&
-		(observation.ChatID == "" || observation.ChatID == ownerChatID) {
+		ctx,
+		effect.AppIdentity,
+		effect.Target,
+		string(effect.Card),
+		effect.ProviderUUID,
+	)
+	if sendErr == nil && validPushEffectSentObservation(effect, observation) {
 		if err := a.pushEffectStore.RecordPushEffectSentWithDeliveries(
 			ctx,
 			pusheffect.SentReceipt{
@@ -3178,6 +3181,21 @@ func (a *Activities) sendDurablePushChunk(
 		"durable push provider attempt did not produce a valid sent receipt",
 		nil,
 	)
+}
+
+func validPushEffectSentObservation(
+	effect *pusheffect.Effect,
+	observation pusheffect.ProviderObservation,
+) bool {
+	if effect == nil {
+		return false
+	}
+	return observation.Disposition == pusheffect.AttemptSent &&
+		observation.AppIdentity != "" &&
+		observation.AppIdentity == effect.AppIdentity &&
+		observation.MessageID != "" &&
+		(observation.ChatID == "" ||
+			observation.ChatID == effect.ProviderChatID)
 }
 
 // filterSources 只保留 id ∈ want 的信源（PushScope.SourceIDs 非空时用）。

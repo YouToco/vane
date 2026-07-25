@@ -107,6 +107,7 @@ func TestPush_CompiledCanaryUsesDurableEffectAndAtomicReceipt(t *testing.T) {
 	legacyStore := &effectCountingStore{fakeStore: new(fakeStore)}
 	observation := pusheffect.ProviderObservation{
 		Disposition: pusheffect.AttemptSent,
+		AppIdentity: "cli_test",
 		MessageID:   "om_effect",
 		ChatID:      "oc_owner",
 	}
@@ -190,6 +191,7 @@ func TestPushEffectReconciliationNeverDowngradesAmbiguous(t *testing.T) {
 	effects := &pushEffectStoreFake{initialStatus: pusheffect.StatusAmbiguous}
 	rejection := pusheffect.ProviderObservation{
 		Disposition: pusheffect.AttemptDefiniteNotSent,
+		AppIdentity: "cli_test",
 	}
 	pusher := &fakePusher{
 		durableObservation: &rejection,
@@ -239,5 +241,69 @@ func TestPushEffectReconciliationNeverDowngradesAmbiguous(t *testing.T) {
 		effects.definite != 0 {
 		t.Fatalf("ambiguous downgrade: reconcile=%d ambiguous=%d definite=%d",
 			effects.reconciles, effects.ambiguous, effects.definite)
+	}
+}
+
+func TestValidPushEffectSentObservationBindsFrozenProviderIdentity(t *testing.T) {
+	effect := pusheffect.Effect{Prepared: pusheffect.Prepared{
+		AppIdentity:    "cli_frozen",
+		ProviderChatID: "oc_frozen",
+	}}
+	base := pusheffect.ProviderObservation{
+		Disposition: pusheffect.AttemptSent,
+		AppIdentity: "cli_frozen",
+		MessageID:   "om_receipt",
+		ChatID:      "oc_frozen",
+	}
+	if !validPushEffectSentObservation(&effect, base) {
+		t.Fatal("exact provider observation was rejected")
+	}
+	tests := []struct {
+		name   string
+		mutate func(*pusheffect.ProviderObservation)
+	}{
+		{
+			name: "missing app identity",
+			mutate: func(observation *pusheffect.ProviderObservation) {
+				observation.AppIdentity = ""
+			},
+		},
+		{
+			name: "wrong app identity",
+			mutate: func(observation *pusheffect.ProviderObservation) {
+				observation.AppIdentity = "cli_other"
+			},
+		},
+		{
+			name: "wrong chat",
+			mutate: func(observation *pusheffect.ProviderObservation) {
+				observation.ChatID = "oc_other"
+			},
+		},
+		{
+			name: "missing message receipt",
+			mutate: func(observation *pusheffect.ProviderObservation) {
+				observation.MessageID = ""
+			},
+		},
+		{
+			name: "non-sent disposition",
+			mutate: func(observation *pusheffect.ProviderObservation) {
+				observation.Disposition = pusheffect.AttemptAmbiguous
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			observation := base
+			test.mutate(&observation)
+			if validPushEffectSentObservation(&effect, observation) {
+				t.Fatalf("non-exact observation accepted: %+v", observation)
+			}
+		})
+	}
+	base.ChatID = ""
+	if !validPushEffectSentObservation(&effect, base) {
+		t.Fatal("provider receipt without supplementary ChatID was rejected")
 	}
 }

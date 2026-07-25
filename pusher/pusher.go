@@ -23,6 +23,7 @@ type durableFeishuSender interface {
 		string,
 		string,
 		string,
+		string,
 	) (pusheffect.ProviderObservation, error)
 }
 
@@ -52,17 +53,18 @@ func (p *Pusher) Push(ctx context.Context, ownerOpenID, cardJSON string) (string
 // owns all whole-effect state transitions.
 func (p *Pusher) PushWithUUID(
 	ctx context.Context,
+	expectedAppIdentity string,
 	ownerOpenID string,
 	cardJSON string,
 	messageUUID string,
 ) (pusheffect.ProviderObservation, error) {
-	if ownerOpenID == "" {
+	if expectedAppIdentity == "" || ownerOpenID == "" {
 		return pusheffect.ProviderObservation{
 				Disposition: pusheffect.AttemptDefiniteNotSent,
 			},
 			types.NewAppError(
 				types.CodeValidation,
-				"推送目标 open_id 为空，可能尚未捕获 owner",
+				"耐久推送 App 身份或目标为空",
 				nil,
 			)
 	}
@@ -78,5 +80,5 @@ func (p *Pusher) PushWithUUID(
 			)
 	}
 	return sender.SendCardWithUUIDResult(
-		ctx, ownerOpenID, cardJSON, messageUUID)
+		ctx, expectedAppIdentity, ownerOpenID, cardJSON, messageUUID)
 }
