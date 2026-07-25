@@ -408,6 +408,17 @@ func TestFeedbackStore(t *testing.T) {
 		}
 		return id
 	}
+	addReasonFeedback := func(t *testing.T, userID, deliveryID int64, reason types.FeedbackReason, detail string) int64 {
+		t.Helper()
+		id, err := st.InsertFeedback(ctx, &types.Feedback{
+			UserID: userID, DeliveryID: deliveryID, Action: types.FeedbackActionMisjudged,
+			ReasonCode: reason, Detail: detail,
+		})
+		if err != nil {
+			t.Fatalf("InsertFeedback(misjudged,%s) 失败: %v", reason, err)
+		}
+		return id
+	}
 
 	t.Run("非法action返回Validation", func(t *testing.T) {
 		ci := newContent(t, "校验用内容", "正文")
@@ -417,6 +428,41 @@ func TestFeedbackStore(t *testing.T) {
 		})
 		if !errors.Is(err, types.ErrValidation) {
 			t.Errorf("非法 action 应 ErrValidation，实际: %v", err)
+		}
+	})
+
+	t.Run("misjudged原因校验与历史行读取", func(t *testing.T) {
+		ci := newContent(t, "原因校验内容", "正文")
+		d := newDelivery(t, u.ID, batchID, &ci, "")
+		if _, err := st.InsertFeedback(ctx, &types.Feedback{
+			UserID: u.ID, DeliveryID: d, Action: types.FeedbackActionMisjudged,
+			ReasonCode: types.FeedbackReason("forged"),
+		}); !errors.Is(err, types.ErrValidation) {
+			t.Errorf("伪造 reason_code 应 ErrValidation，实际: %v", err)
+		}
+		if _, err := st.InsertFeedback(ctx, &types.Feedback{
+			UserID: u.ID, DeliveryID: d,
+			Action: types.FeedbackActionMisjudged, Detail: "新回调不得为空原因",
+		}); !errors.Is(err, types.ErrValidation) {
+			t.Errorf("新 misjudged 空原因应 ErrValidation，实际: %v", err)
+		}
+		// 发版前已存在的空 reason_code 行仍必须可审计读取；新应用写入
+		// 已被上面的固定原因约束封住。
+		var legacyID int64
+		if err := st.pool.QueryRow(ctx,
+			`INSERT INTO feedbacks (
+			     tenant_id,user_id,delivery_id,action,detail
+			 ) VALUES (
+			     (SELECT tenant_id FROM deliveries WHERE id=$2),
+			     $1,$2,'misjudged','旧卡补充原因'
+			 )
+			 RETURNING id`,
+			u.ID, d).Scan(&legacyID); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := st.ListFeedbacksForEvolution(ctx, u.ID, legacyID-1, 10)
+		if err != nil || len(rows) != 1 || rows[0].ReasonCode != "" || rows[0].Detail != "旧卡补充原因" {
+			t.Fatalf("旧卡空原因必须可审计读取: rows=%+v err=%v", rows, err)
 		}
 	})
 
@@ -438,7 +484,7 @@ func TestFeedbackStore(t *testing.T) {
 
 		addFeedback(t, u.ID, d, types.FeedbackActionInterested, "")
 		addFeedback(t, u.ID, d, types.FeedbackActionNotInterested, "")
-		addFeedback(t, u.ID, d, types.FeedbackActionMisjudged, "")
+		addReasonFeedback(t, u.ID, d, types.FeedbackReasonOther, "问题")
 
 		// 双值集合：最新态度 = not_interested（misjudged 不在集合内，不干扰）。
 		got, err := st.LatestFeedbackAction(ctx, d, attitudes)
@@ -594,10 +640,12 @@ func TestFeedbackStore(t *testing.T) {
 		addFeedback(t, u2.ID, dB, types.FeedbackActionNotInterested, "")
 		addFeedback(t, u2.ID, dB, types.FeedbackActionInterested, "") // F2：改主意 → 不返回
 		dC := mk("AI编程助手评测")
-		addFeedback(t, u2.ID, dC, types.FeedbackActionMisjudged, "")
+		addReasonFeedback(t, u2.ID, dC, types.FeedbackReasonOutdated, "三个月前")
 		addFeedback(t, u2.ID, dC, types.FeedbackActionInterested, "") // misjudged→interested → 不返回
 		dD := mk("纯误判内容")
-		addFeedback(t, u2.ID, dD, types.FeedbackActionMisjudged, "") // 纯误判 → 返回
+		addReasonFeedback(t, u2.ID, dD, types.FeedbackReasonNotRelevant, "") // 与任务无关 → 返回
+		dOld := mk("过时新闻")
+		addReasonFeedback(t, u2.ID, dOld, types.FeedbackReasonOutdated, "三个月前")
 		dE := mk("只感兴趣内容")
 		addFeedback(t, u2.ID, dE, types.FeedbackActionInterested, "") // 正面 → 不返回
 		dG := mk("只追问内容")
@@ -617,7 +665,7 @@ func TestFeedbackStore(t *testing.T) {
 		if len(titles) != len(want) || titles[0] != want[0] || titles[1] != want[1] {
 			t.Errorf("负面清单应为 %v（倒序+去重），实际 %v", want, titles)
 		}
-		for _, banned := range []string{"美股大盘复盘", "AI编程助手评测", "只感兴趣内容", "只追问内容"} {
+		for _, banned := range []string{"美股大盘复盘", "AI编程助手评测", "过时新闻", "只感兴趣内容", "只追问内容"} {
 			for _, got := range titles {
 				if got == banned {
 					t.Errorf("%q 不应出现在负面清单（最新态度非负/非态度）", banned)
@@ -678,7 +726,7 @@ func TestFeedbackStore(t *testing.T) {
 		addFeedback(t, u3.ID, dBlank, types.FeedbackActionNotInterested, "") // 双空 → 跳过
 		// 同正文第二条无标题 delivery → 按回退串去重只留一条。
 		dDup := mk("", longContent)
-		addFeedback(t, u3.ID, dDup, types.FeedbackActionMisjudged, "")
+		addReasonFeedback(t, u3.ID, dDup, types.FeedbackReasonNotRelevant, "")
 
 		titles, err := st.ListRecentNegativeFeedbackTitles(ctx, u3.ID, since, 10)
 		if err != nil {

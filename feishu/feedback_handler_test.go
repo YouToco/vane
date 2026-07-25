@@ -34,12 +34,13 @@ type fakeFeedbackRunner struct {
 	mu sync.Mutex
 
 	// HandleClick 的留痕与预设。
-	clicks     []feedback.Click
-	clickUsers []int64
-	result     feedback.ClickResult
-	err        error
-	delay      time.Duration // 模拟慢处理，触发 2.5s 同步预算
-	panicMsg   string        // 非空则 panic，验证 recover 兜底
+	clicks        []feedback.Click
+	clickUsers    []int64
+	reasonSubmits []feedback.ReasonSubmit
+	result        feedback.ClickResult
+	err           error
+	delay         time.Duration // 模拟慢处理，触发 2.5s 同步预算
+	panicMsg      string        // 非空则 panic，验证 recover 兜底
 
 	// WrapQuestion 的留痕与预设。
 	wraps       []wrapCall
@@ -65,7 +66,7 @@ func (f *fakeFeedbackRunner) HandleClick(_ context.Context, userID int64, click 
 
 func (f *fakeFeedbackRunner) HandleReasonSubmit(_ context.Context, userID int64, submit feedback.ReasonSubmit) (feedback.ClickResult, error) {
 	f.mu.Lock()
-	f.clicks = append(f.clicks, feedback.Click{Action: types.FeedbackActionMisjudged, DeliveryID: submit.DeliveryID})
+	f.reasonSubmits = append(f.reasonSubmits, submit)
 	f.clickUsers = append(f.clickUsers, userID)
 	res, err := f.result, f.err
 	f.mu.Unlock()
@@ -281,6 +282,41 @@ func TestParseFeedbackValue(t *testing.T) {
 			}
 			if id != tc.wantID {
 				t.Errorf("parseFeedbackValue() deliveryID = %d, 期望 %d", id, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestParseFeedbackReasonValue(t *testing.T) {
+	cases := []struct {
+		name       string
+		value      map[string]interface{}
+		wantID     int64
+		wantReason types.FeedbackReason
+		wantOK     bool
+	}{
+		{
+			name: "当前卡固定过时原因", value: map[string]interface{}{
+				"vane_action": "fbr", "delivery_id": "42", "reason_code": "outdated_or_out_of_window",
+			}, wantID: 42, wantReason: types.FeedbackReasonOutdated, wantOK: true,
+		},
+		{
+			name: "历史卡空原因兼容", value: map[string]interface{}{
+				"vane_action": "fbr", "delivery_id": "42",
+			}, wantID: 42, wantOK: true,
+		},
+		{name: "伪造原因拒绝", value: map[string]interface{}{
+			"vane_action": "fbr", "delivery_id": "42", "reason_code": "not_interested",
+		}},
+		{name: "非字符串投递ID拒绝", value: map[string]interface{}{
+			"vane_action": "fbr", "delivery_id": 42, "reason_code": "duplicate",
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, reason, ok := parseFeedbackReasonValue(tc.value)
+			if id != tc.wantID || reason != tc.wantReason || ok != tc.wantOK {
+				t.Fatalf("parseFeedbackReasonValue() = (%d,%q,%v), want (%d,%q,%v)", id, reason, ok, tc.wantID, tc.wantReason, tc.wantOK)
 			}
 		})
 	}

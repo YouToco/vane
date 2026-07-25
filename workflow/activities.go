@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,10 +18,12 @@ import (
 
 	cardgenpkg "github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/dedup"
+	"github.com/YouToco/vane/eventqualifier"
 	evolverpkg "github.com/YouToco/vane/evolver"
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
@@ -287,21 +291,70 @@ type Activities struct {
 	// playbookPromptsEnabled is the P1c rollout switch. A non-empty canary ID
 	// narrows injection to one real schedule; empty means all schedules once
 	// the canary has passed. Both are immutable after worker construction.
-	playbookPromptsEnabled          bool
-	playbookPromptCanaryScheduleID  string
-	compiledStore                   CompiledRunStore
-	buildCompiledPolicyV1           CompiledPolicyBuilderV1
-	compiledModelResolverV1         CompiledModelResolverV1
-	compiledShadowStoreV2           CompiledRunSnapshotShadowV2Store
-	snapshotV2ShadowCanaryTaskID    string
-	compiledSnapshotV2AuditReader   CompiledRunSnapshotV2AuditReader
-	snapshotV2ReadAuditCanaryTaskID string
-	snapshotV2ReadAuditTimeout      time.Duration
+	playbookPromptsEnabled           bool
+	playbookPromptCanaryScheduleID   string
+	compiledStore                    CompiledRunStore
+	buildCompiledPolicyV1            CompiledPolicyBuilderV1
+	compiledModelResolverV1          CompiledModelResolverV1
+	compiledShadowStoreV2            CompiledRunSnapshotShadowV2Store
+	snapshotV2ShadowCanaryTaskID     string
+	compiledSnapshotV2AuditReader    CompiledRunSnapshotV2AuditReader
+	snapshotV2ReadAuditCanaryTaskID  string
+	snapshotV2ReadAuditTimeout       time.Duration
+	observationStore                 ObservationRuntimeStore
+	eventQualifier                   *eventqualifier.Qualifier
+	observationShadowCanaryTaskID    string
+	observationAuthorityCanaryTaskID string
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding
 // another positional constructor parameter to every test and composition root.
 type ActivitiesOption func(*Activities)
+
+type ObservationRuntimeStore interface {
+	PrepareObservationQualificationStep(
+		context.Context, types.RunIdentity, types.RunSnapshotRef, string, string,
+	) (string, json.RawMessage, error)
+	MarkObservationQualificationSending(
+		context.Context, types.RunIdentity, types.RunSnapshotRef, string, string,
+	) error
+	CompleteObservationQualificationStep(
+		context.Context, types.RunIdentity, types.RunSnapshotRef, string, string,
+		json.RawMessage,
+	) error
+	MarkObservationQualificationUncertain(
+		context.Context, types.RunIdentity, types.RunSnapshotRef, string, string,
+	) error
+	ReserveObservedEventV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		observation.QualifiedEvent,
+	) (bool, error)
+	BindObservedEventDeliveryV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		string, string, int64,
+	) error
+	MarkObservedEventDeliveredV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef, int64,
+	) error
+}
+
+// WithObservationRuntime enables the bounded qualifier for exactly one shadow
+// task and, optionally, one exact authority task. Empty IDs are a complete
+// rollback switch. Authority is still selected in Workflow history through a
+// versioned Activity call; mutable config never changes an in-flight command
+// sequence.
+func WithObservationRuntime(
+	st ObservationRuntimeStore,
+	qualifier *eventqualifier.Qualifier,
+	shadowTaskID, authorityTaskID string,
+) ActivitiesOption {
+	return func(a *Activities) {
+		a.observationStore = st
+		a.eventQualifier = qualifier
+		a.observationShadowCanaryTaskID = strings.TrimSpace(shadowTaskID)
+		a.observationAuthorityCanaryTaskID = strings.TrimSpace(authorityTaskID)
+	}
+}
 
 // WithPlaybookPromptPolicy controls P1c prompt injection. enabled=false is an
 // exact rollback switch. When canaryScheduleID is non-empty, only that one task
@@ -393,6 +446,19 @@ type DedupIn struct {
 	TraceID string              `json:"trace_id"`
 	Items   []types.ContentItem `json:"items"`
 	Run     *CompiledRunInputV1 `json:"run,omitempty"`
+}
+
+type QualifyEventsIn struct {
+	UserID     int64               `json:"user_id"`
+	TraceID    string              `json:"trace_id"`
+	ScheduleID string              `json:"schedule_id"`
+	Items      []types.ContentItem `json:"items"`
+	Run        *CompiledRunInputV1 `json:"run,omitempty"`
+}
+
+type QualifyEventsResult struct {
+	Items   []types.ContentItem `json:"items"`
+	Outcome string              `json:"outcome"`
 }
 
 // ScoreIn 是 Score Activity 的入参。
@@ -1700,6 +1766,425 @@ func (a *Activities) loadTaskInstruction(
 	return pb.Content
 }
 
+// QualifyEvents applies the immutable observation policy after content dedup
+// and before relevance scoring. Shadow computes and audits a decision but
+// returns the original candidates; exact authority returns only admitted
+// candidates.
+func (a *Activities) QualifyEvents(
+	ctx context.Context,
+	in QualifyEventsIn,
+) (QualifyEventsResult, error) {
+	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
+	if err != nil {
+		return QualifyEventsResult{}, retryableOrNot(err)
+	}
+	if !compiled {
+		return QualifyEventsResult{Items: in.Items, Outcome: "not_configured"}, nil
+	}
+	var scope struct {
+		Observation *observation.PolicyV1 `json:"observation,omitempty"`
+	}
+	if err := json.Unmarshal(snapshot.Definition.ScopeJSON, &scope); err != nil {
+		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
+			types.CodeValidation, "compiled observation scope is invalid", err))
+	}
+	if scope.Observation == nil {
+		return QualifyEventsResult{Items: in.Items, Outcome: "not_configured"}, nil
+	}
+	shadow := in.ScheduleID == a.observationShadowCanaryTaskID
+	authority := in.ScheduleID == a.observationAuthorityCanaryTaskID
+	if !shadow && !authority {
+		return QualifyEventsResult{Items: in.Items, Outcome: "rollout_off"}, nil
+	}
+	if a.observationStore == nil {
+		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
+			types.CodeInternal, "observation runtime store is not configured", nil))
+	}
+	expected, err := activityRunIdentityV1(ctx, in.UserID, in.Run)
+	if err != nil {
+		return QualifyEventsResult{}, retryableOrNot(err)
+	}
+	nominal, err := observation.NominalTrigger(
+		expected.TaskID, expected.TemporalWorkflowID)
+	if err != nil {
+		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
+			types.CodeValidation, "scheduled observation has no nominal trigger", err))
+	}
+	var spec struct {
+		Cron         string `json:"cron"`
+		EverySeconds int    `json:"every_seconds"`
+		AnchorAt     string `json:"anchor_at"`
+		TZ           string `json:"tz"`
+	}
+	if err := json.Unmarshal(snapshot.Definition.SpecJSON, &spec); err != nil {
+		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
+			types.CodeValidation, "compiled observation schedule is invalid", err))
+	}
+	window, err := observation.WindowForNominal(*scope.Observation, observation.Schedule{
+		Cron: spec.Cron, EverySeconds: spec.EverySeconds,
+		AnchorAt: spec.AnchorAt, TimeZone: spec.TZ,
+	}, nominal)
+	if err != nil {
+		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
+			types.CodeValidation, "compiled observation window is invalid", err))
+	}
+
+	var qualified []types.ContentItem
+	outcome := "no_match"
+	if scope.Observation.Mode == observation.ModeContent {
+		qualified = qualifyContentWindow(*scope.Observation, window, in.Items)
+		if len(qualified) > 0 {
+			outcome = "match"
+		}
+	} else {
+		qualified, outcome, err = a.qualifyEventCandidates(
+			ctx, expected, snapshot, in, *scope.Observation, window)
+		if err != nil {
+			return QualifyEventsResult{}, err
+		}
+	}
+	rollout := "shadow"
+	if authority {
+		rollout = "authority"
+	}
+	slog.InfoContext(ctx, "observation qualification",
+		"task_id", expected.TaskID,
+		"snapshot_id", in.Run.Snapshot.SnapshotID,
+		"mode", scope.Observation.Mode,
+		"rollout", rollout,
+		"outcome", outcome,
+		"candidate_count", len(in.Items),
+		"qualified_count", len(qualified),
+		"window_start", window.Start,
+		"window_end", window.End)
+	if shadow && !authority {
+		return QualifyEventsResult{Items: in.Items, Outcome: "shadow_" + outcome}, nil
+	}
+	return QualifyEventsResult{Items: qualified, Outcome: outcome}, nil
+}
+
+func qualifyContentWindow(
+	policy observation.PolicyV1,
+	window observation.Window,
+	items []types.ContentItem,
+) []types.ContentItem {
+	start := window.Start
+	if policy.LatePolicy == observation.LateBounded {
+		start = start.Add(-time.Duration(policy.AllowedLatenessSecs) * time.Second)
+	}
+	admission := observation.Window{Start: start, End: window.End}
+	out := make([]types.ContentItem, 0, len(items))
+	for _, item := range items {
+		if item.PublishedAt == nil {
+			switch policy.UnknownTime {
+			case observation.UnknownTimeDeprioritize:
+				item.ObservationScorePenalty = -20
+				out = append(out, item)
+			case observation.UnknownTimeAllow:
+				out = append(out, item)
+			}
+			continue
+		}
+		if admission.Contains(item.PublishedAt.UTC()) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func (a *Activities) qualifyEventCandidates(
+	ctx context.Context,
+	expected types.RunIdentity,
+	snapshot runcontext.CompiledSnapshotV1,
+	in QualifyEventsIn,
+	policy observation.PolicyV1,
+	window observation.Window,
+) ([]types.ContentItem, string, error) {
+	if a.eventQualifier == nil || a.compiledModelResolverV1 == nil {
+		return nil, "", nonRetryable(types.NewAppError(
+			types.CodeInternal, "event qualifier is not configured", nil))
+	}
+	policyDigest, err := observation.PolicyDigest(policy)
+	if err != nil {
+		return nil, "", nonRetryable(types.NewAppError(
+			types.CodeValidation, "observation policy digest failed", err))
+	}
+	requestDigest, err := observationQualificationRequestDigest(
+		policyDigest, window, in.Items)
+	if err != nil {
+		return nil, "", nonRetryable(types.NewAppError(
+			types.CodeValidation, "observation request digest failed", err))
+	}
+	const stepID = "qualify-events-v1"
+	status, cached, err := a.observationStore.PrepareObservationQualificationStep(
+		ctx, expected, in.Run.Snapshot, stepID, requestDigest)
+	if err != nil {
+		return nil, "", retryableOrNot(err)
+	}
+	var result eventqualifier.Result
+	switch status {
+	case storepkg.ObservationStepCompleted:
+		result, err = eventqualifier.Decode(cached)
+		if err != nil {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeValidation, "stored event qualification is invalid", err))
+		}
+	case storepkg.ObservationStepUncertain:
+		return nil, "uncertain", nil
+	case storepkg.ObservationStepPrepared:
+		modelClient, resolveErr := a.resolveCompiledModelPolicyV1(
+			snapshot.Policy.ModelPolicy)
+		if resolveErr != nil {
+			return nil, "", retryableOrNot(resolveErr)
+		}
+		modelCall, ok := snapshot.Policy.ModelPolicy.Call(runtimepolicy.ModelStageCardGen)
+		if !ok {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeValidation, "compiled qualifier model call is missing", nil))
+		}
+		quotaRule, ok := snapshot.Policy.QuotaPolicy.Bucket("llm_tokens")
+		if !ok {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeValidation, "compiled qualifier quota rule is missing", nil))
+		}
+		beforeSpend := func(effectCtx context.Context, amount float64) error {
+			if err := a.consumeCompiledLLMQuotaV1(
+				effectCtx, in.UserID, in.Run,
+				snapshot.Policy.QuotaPolicy, amount,
+			); err != nil {
+				return err
+			}
+			return a.observationStore.MarkObservationQualificationSending(
+				effectCtx, expected, in.Run.Snapshot, stepID, requestDigest)
+		}
+		var canonical []byte
+		result, canonical, err = a.eventQualifier.Qualify(ctx, eventqualifier.Request{
+			TenantID: expected.TenantID, UserID: expected.UserID,
+			TraceID: in.TraceID, Policy: policy, Window: window,
+			Candidates: in.Items, Client: modelClient, ModelCall: modelCall,
+			QuotaRule: &quotaRule, BeforeSpend: beforeSpend,
+		})
+		if err != nil {
+			receiptCtx, cancel := detachedObservationReceiptContext(ctx)
+			defer cancel()
+			_ = a.observationStore.MarkObservationQualificationUncertain(
+				receiptCtx, expected, in.Run.Snapshot,
+				stepID, requestDigest)
+			return nil, "uncertain", nil
+		}
+		receiptCtx, cancel := detachedObservationReceiptContext(ctx)
+		defer cancel()
+		if err := a.observationStore.CompleteObservationQualificationStep(
+			receiptCtx, expected, in.Run.Snapshot,
+			stepID, requestDigest, canonical,
+		); err != nil {
+			return nil, "", retryableOrNot(err)
+		}
+	default:
+		return nil, "", nonRetryable(types.NewAppError(
+			types.CodeConflict, "observation qualification state is invalid", nil))
+	}
+	qualified, outcome, err := a.validateQualifiedEvents(
+		policy, policyDigest, window, in.Items, result)
+	if err != nil && types.CodeOf(err) == types.CodeValidation {
+		slog.WarnContext(ctx, "observation qualifier output rejected",
+			"task_id", expected.TaskID,
+			"snapshot_id", in.Run.Snapshot.SnapshotID,
+			"err", err)
+		return nil, "uncertain", nil
+	}
+	return qualified, outcome, err
+}
+
+func detachedObservationReceiptContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+}
+
+func observationQualificationRequestDigest(
+	policyDigest string,
+	window observation.Window,
+	items []types.ContentItem,
+) (string, error) {
+	type candidate struct {
+		ID          int64      `json:"id"`
+		URL         string     `json:"url"`
+		ContentHash string     `json:"content_hash"`
+		PublishedAt *time.Time `json:"published_at,omitempty"`
+	}
+	payload := struct {
+		PolicyDigest string             `json:"policy_digest"`
+		Window       observation.Window `json:"window"`
+		Candidates   []candidate        `json:"candidates"`
+	}{PolicyDigest: policyDigest, Window: window}
+	for _, item := range items {
+		payload.Candidates = append(payload.Candidates, candidate{
+			ID: item.ID, URL: item.URL, ContentHash: item.ContentHash,
+			PublishedAt: item.PublishedAt,
+		})
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (a *Activities) validateQualifiedEvents(
+	policy observation.PolicyV1,
+	policyDigest string,
+	window observation.Window,
+	items []types.ContentItem,
+	result eventqualifier.Result,
+) ([]types.ContentItem, string, error) {
+	if result.Outcome == "no_match" || result.Outcome == "uncertain" {
+		if len(result.Events) != 0 {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeValidation, "non-match qualifier returned events", nil))
+		}
+		return nil, result.Outcome, nil
+	}
+	if result.Outcome != "match" || len(result.Events) == 0 ||
+		policy.Event == nil {
+		return nil, "", nonRetryable(types.NewAppError(
+			types.CodeValidation, "event qualifier outcome is invalid", nil))
+	}
+	byID := make(map[int64]types.ContentItem, len(items))
+	for _, item := range items {
+		byID[item.ID] = item
+	}
+	admissionStart := window.Start
+	if policy.LatePolicy == observation.LateBounded {
+		admissionStart = admissionStart.Add(
+			-time.Duration(policy.AllowedLatenessSecs) * time.Second)
+	}
+	admission := observation.Window{Start: admissionStart, End: window.End}
+	out := make([]types.ContentItem, 0, len(result.Events))
+	seenKeys := make(map[string]struct{}, len(result.Events))
+	for _, event := range result.Events {
+		if event.EventType != policy.Event.EventKind ||
+			event.Subject != policy.Event.Subject ||
+			strings.TrimSpace(event.ReleaseIdentifier) == "" ||
+			!qualificationAllowed(
+				policy.Event.Qualification,
+				observation.Qualification(event.Qualification)) ||
+			len(event.EvidenceContentIDs) == 0 {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeValidation, "qualified event differs from approved definition", nil))
+		}
+		occurredAt, err := time.Parse(time.RFC3339, event.OccurredAt)
+		if err != nil || !admission.Contains(occurredAt.UTC()) {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeValidation, "qualified event time is outside the approved window", err))
+		}
+		var primary types.ContentItem
+		for index, contentID := range event.EvidenceContentIDs {
+			candidate, ok := byID[contentID]
+			if !ok || candidate.PublishedAt == nil ||
+				!candidate.PublishedAt.UTC().Truncate(time.Second).
+					Equal(occurredAt.UTC().Truncate(time.Second)) {
+				return nil, "", nonRetryable(types.NewAppError(
+					types.CodeValidation, "qualified event cited unverifiable evidence", nil))
+			}
+			if policy.Evidence.Requirement == observation.EvidenceOfficialRequired &&
+				!observation.OfficialURLAllowed(
+					candidate.URL, policy.Evidence.OfficialDomains) {
+				return nil, "", nonRetryable(types.NewAppError(
+					types.CodeValidation, "qualified event lacks approved official evidence", nil))
+			}
+			if index == 0 {
+				primary = candidate
+			}
+		}
+		releaseIdentity := canonicalReleaseIdentity(event.ReleaseIdentifier)
+		if releaseIdentity == "" {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeValidation, "qualified event release identity is invalid", nil))
+		}
+		eventKey := qualifiedEventKey(
+			policyDigest, event.EventType, releaseIdentity)
+		if _, duplicate := seenKeys[eventKey]; duplicate {
+			continue
+		}
+		seenKeys[eventKey] = struct{}{}
+		evidence, _ := json.Marshal(event)
+		primary.ObservationEventKey = eventKey
+		primary.ObservationPolicyDigest = policyDigest
+		primary.ObservationEventJSON = evidence
+		out = append(out, primary)
+	}
+	if len(out) == 0 {
+		return nil, "no_match", nil
+	}
+	return out, "match", nil
+}
+
+func qualificationAllowed(
+	approved, actual observation.Qualification,
+) bool {
+	if approved == observation.QualificationEither {
+		return actual == observation.QualificationAnnouncement ||
+			actual == observation.QualificationGeneralAvailability
+	}
+	return approved == actual
+}
+
+func qualifiedEventKey(policyDigest, eventType, releaseIdentifier string) string {
+	sum := sha256.Sum256([]byte(
+		policyDigest + "\x00" + eventType + "\x00" + releaseIdentifier))
+	return hex.EncodeToString(sum[:])
+}
+
+func canonicalReleaseIdentity(value string) string {
+	stop := map[string]struct{}{
+		"announce": {}, "announced": {}, "announcement": {},
+		"introduce": {}, "introduced": {}, "introducing": {},
+		"launch": {}, "launched": {}, "release": {}, "released": {},
+		"model": {}, "official": {}, "general": {}, "availability": {},
+	}
+	tokens := strings.FieldsFunc(strings.ToLower(strings.TrimSpace(value)), func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	})
+	var identity strings.Builder
+	for _, token := range tokens {
+		if _, ignored := stop[token]; ignored {
+			continue
+		}
+		identity.WriteString(token)
+	}
+	if identity.Len() == 0 || identity.Len() > 128 {
+		return ""
+	}
+	return identity.String()
+}
+
+func observedEventForPush(item types.ContentItem) (observation.QualifiedEvent, error) {
+	if item.ObservationEventKey == "" ||
+		item.ObservationPolicyDigest == "" ||
+		len(item.ObservationEventJSON) == 0 {
+		return observation.QualifiedEvent{}, types.NewAppError(
+			types.CodeValidation, "qualified event push metadata is incomplete", nil)
+	}
+	var event eventqualifier.Event
+	if err := json.Unmarshal(item.ObservationEventJSON, &event); err != nil {
+		return observation.QualifiedEvent{}, types.NewAppError(
+			types.CodeValidation, "qualified event push evidence is invalid", err)
+	}
+	occurredAt, err := time.Parse(time.RFC3339, event.OccurredAt)
+	if err != nil || event.EventType == "" || event.Subject == "" {
+		return observation.QualifiedEvent{}, types.NewAppError(
+			types.CodeValidation, "qualified event push identity is invalid", err)
+	}
+	return observation.QualifiedEvent{
+		PolicyDigest: item.ObservationPolicyDigest,
+		EventKey:     item.ObservationEventKey,
+		EventType:    event.EventType,
+		Subject:      event.Subject,
+		OccurredAt:   occurredAt.UTC(),
+		EvidenceJSON: append(json.RawMessage(nil), item.ObservationEventJSON...),
+	}, nil
+}
+
 // Score 逐条打分（并发扇出，见 mapConcurrent）。同一 TraceID 串起整批的 llm_calls
 // 便于事后追踪。单条失败跳过；整批全失败（大概率 LLM 不可用）返回错误触发重试。
 //
@@ -1783,6 +2268,7 @@ func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem,
 			if err != nil {
 				return types.ScoredItem{}, err
 			}
+			s = max(0, min(100, s+item.ObservationScorePenalty))
 			return types.ScoredItem{Item: item, Score: s}, nil
 		},
 		func(item types.ContentItem, err error) {
@@ -2120,11 +2606,35 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	anySent := false
 	sentThisAttempt := false
 	type pendingItem struct {
-		delID int64
-		input feedback.CardInput
+		delID    int64
+		input    feedback.CardInput
+		eventKey string
 	}
 	var pending []pendingItem
+	skippedObservedEvents := 0
 	for _, card := range in.Cards {
+		eventKey := card.Scored.Item.ObservationEventKey
+		if compiled && eventKey != "" {
+			if a.observationStore == nil {
+				return nonRetryable(types.NewAppError(types.CodeInternal,
+					"observation delivery store is not configured", nil))
+			}
+			event, eventErr := observedEventForPush(card.Scored.Item)
+			if eventErr != nil {
+				return nonRetryable(eventErr)
+			}
+			accepted, reserveErr := a.observationStore.ReserveObservedEventV1(
+				ctx, compiledIdentity, in.Run.Snapshot, event)
+			if reserveErr != nil {
+				return retryableOrNot(reserveErr)
+			}
+			if !accepted {
+				// Another successful or still-live run already owns this exact
+				// task event. It must not create even a pending delivery.
+				skippedObservedEvents++
+				continue
+			}
+		}
 		d := &types.Delivery{
 			BatchID: batchID,
 			UserID:  in.UserID,
@@ -2149,11 +2659,36 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			delID, existed, sentAlready, ierr = a.store.InsertDeliveryIdempotent(ctx, d)
 		}
 		if ierr != nil {
+			if compiled && eventKey != "" {
+				// The event reservation is durable. Retrying the activity lets
+				// the same run reuse it; silently skipping would strand it.
+				return retryableOrNot(ierr)
+			}
 			slog.Warn("push: 建投递记录失败，跳过", "trace_id", in.TraceID, "err", ierr)
 			continue
 		}
+		if compiled && card.Scored.Item.ObservationEventKey != "" {
+			if a.observationStore == nil {
+				return nonRetryable(types.NewAppError(types.CodeInternal,
+					"observation delivery store is not configured", nil))
+			}
+			if err := a.observationStore.BindObservedEventDeliveryV1(
+				ctx, compiledIdentity, in.Run.Snapshot,
+				card.Scored.Item.ObservationPolicyDigest,
+				card.Scored.Item.ObservationEventKey, delID,
+			); err != nil {
+				return retryableOrNot(err)
+			}
+		}
 		if existed && sentAlready {
 			// 重试时该 (batch, content) 已发过：不进新卡，绝不重复推——幂等核心（#1 CRITICAL）。
+			if compiled && eventKey != "" {
+				if err := a.observationStore.MarkObservedEventDeliveredV1(
+					ctx, compiledIdentity, in.Run.Snapshot, delID,
+				); err != nil {
+					return retryableOrNot(err)
+				}
+			}
 			anySent = true
 			continue
 		}
@@ -2195,7 +2730,21 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 				ci.Platform = src.Platform
 			}
 		}
-		pending = append(pending, pendingItem{delID: delID, input: ci})
+		pending = append(pending, pendingItem{
+			delID: delID, input: ci,
+			eventKey: eventKey,
+		})
+	}
+	if len(pending) == 0 && skippedObservedEvents > 0 && !anySent {
+		// A concurrent/prior run already owns every qualified event. This is a
+		// successful no-op observation cycle, not a push failure.
+		if err := a.compiledStore.UpdatePushBatchStatusForTaskRunV1(
+			ctx, compiledIdentity, in.Run.Snapshot, in.TraceID,
+			batchID, types.BatchStatusDone,
+		); err != nil {
+			return retryableOrNot(err)
+		}
+		return nil
 	}
 
 	// 分块发送：每卡条数封顶 + 构卡后字节硬校验（附录 A 吸收自被否方案的两点之一）。
@@ -2273,6 +2822,12 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 				if compiled && compiledReceiptErr == nil {
 					compiledReceiptErr = merr
 				}
+			} else if compiled && p.eventKey != "" {
+				merr = a.observationStore.MarkObservedEventDeliveredV1(
+					ctx, compiledIdentity, in.Run.Snapshot, p.delID)
+				if merr != nil && compiledReceiptErr == nil {
+					compiledReceiptErr = merr
+				}
 			}
 		}
 		anySent = true
@@ -2308,9 +2863,9 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	}
 	// 部分块失败（对抗审查 HIGH）：**不结算 done、返回可重试错误**。批次终态留待重试
 	// 收敛——sentAlready 幂等保证重试不重发成功块，只补失败块；若记 done 并吞掉错误，
-	// 失败块的条目会永久搁浅 pending 且（ListUnpushedByUser 按 deliveries 任意状态排除）
-	// 永不再成为候选，正是上方注释声称要消灭的"已打分未送达永远消失"。
-	// 重试耗尽时批次停在 pending——作为可见异常留给探针，而非谎报 done。
+	// 本轮就会把失败条目伪装成成功。重试耗尽时批次停在 pending，作为可见异常留给
+	// 探针；事件模式下，超过接管窗的 qualified+pending 绑定会在下一运行重新进入
+	// compiled 候选并转移账本所有权，避免永久吞事件。
 	if failedItems > 0 {
 		ae := types.NewAppError(types.CodePushFailed,
 			fmt.Sprintf("部分推送失败（%d 条未送达），等待重试补发", failedItems), nil)

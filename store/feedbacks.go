@@ -25,16 +25,103 @@ var validFeedbackActions = map[types.FeedbackAction]bool{
 // (delivery_id, action) 唯一索引会使第三次点击命中旧行、最新态度被错判）。
 // action 不在 5 枚举内返回 CodeValidation；detail 由调用方截断。
 func (s *Store) InsertFeedback(ctx context.Context, f *types.Feedback) (int64, error) {
+	if f == nil {
+		return 0, types.NewAppError(types.CodeValidation, "反馈不能为空", nil)
+	}
 	if !validFeedbackActions[f.Action] {
 		return 0, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("非法反馈动作 %q", f.Action), nil)
 	}
+	if f.Action == types.FeedbackActionMisjudged && !f.ReasonCode.Valid() {
+		return 0, types.NewAppError(types.CodeValidation,
+			"问题反馈必须提供固定原因", nil)
+	}
+	if f.ReasonCode != "" &&
+		(f.Action != types.FeedbackActionMisjudged || !f.ReasonCode.Valid()) {
+		return 0, types.NewAppError(types.CodeValidation,
+			fmt.Sprintf("非法反馈原因 %q", f.ReasonCode), nil)
+	}
 	var id int64
+	if f.Action == types.FeedbackActionMisjudged && f.ReasonCode.Valid() {
+		var tenantID int64
+		if err := s.pool.QueryRow(ctx,
+			`SELECT tenant_id FROM deliveries WHERE id=$1 AND user_id=$2`,
+			f.DeliveryID, f.UserID).Scan(&tenantID); err != nil {
+			return 0, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("解析问题反馈租户（delivery=%d）", f.DeliveryID), err)
+		}
+		tx, err := s.beginTx(ctx, pgx.TxOptions{})
+		if err != nil {
+			return 0, types.NewAppError(
+				types.CodeDatabase, "开始问题反馈事务", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := tx.Exec(ctx,
+			`SELECT set_config('app.tenant_id',$1,true)`,
+			fmt.Sprintf("%d", tenantID)); err != nil {
+			return 0, types.NewAppError(
+				types.CodeDatabase, "设置问题反馈租户上下文", err)
+		}
+		if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+			return 0, types.NewAppError(
+				types.CodeDatabase, "进入问题反馈受限角色", err)
+		}
+		err = tx.QueryRow(ctx,
+			`WITH recorded AS (
+			     INSERT INTO feedbacks (
+			         tenant_id,user_id,delivery_id,action,reason_code,detail
+			     )
+			     VALUES ($5,$1,$2,'misjudged',$3,$4)
+			     ON CONFLICT (delivery_id)
+			         WHERE action='misjudged' AND reason_code IS NOT NULL
+			         DO UPDATE SET delivery_id=EXCLUDED.delivery_id
+			     RETURNING id,tenant_id,user_id,delivery_id,reason_code,detail
+			 ), queued AS (
+			     INSERT INTO feedback_freshness_triage (
+			         tenant_id,user_id,feedback_id,delivery_id,reason_code,detail,
+			         status,outcome,audit_json
+			     )
+			     SELECT tenant_id,user_id,id,delivery_id,reason_code,detail,
+			            CASE WHEN reason_code='outdated_or_out_of_window'
+			                 THEN 'pending' ELSE 'routed' END,
+			            CASE reason_code
+			              WHEN 'not_relevant' THEN 'interest_signal'
+			              WHEN 'duplicate' THEN 'duplicate_diagnostic'
+			              WHEN 'factually_wrong' THEN 'factual_diagnostic'
+			              WHEN 'poor_source_or_evidence' THEN 'evidence_diagnostic'
+			              WHEN 'other' THEN 'manual_review'
+			              ELSE NULL
+			            END,
+			            jsonb_build_object(
+			                'schema','vane.feedback-problem-triage/v1',
+			                'reason_code',reason_code,'detail',detail
+			            )
+			       FROM recorded
+			     ON CONFLICT (feedback_id) DO NOTHING
+			 )
+			 SELECT id FROM recorded`,
+			f.UserID, f.DeliveryID, f.ReasonCode, f.Detail, tenantID).Scan(&id)
+		if err != nil {
+			return 0, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("插入问题反馈（delivery=%d, reason=%s）",
+					f.DeliveryID, f.ReasonCode), err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return 0, types.NewAppError(
+				types.CodeDatabase, "提交问题反馈事务", err)
+		}
+		return id, nil
+	}
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO feedbacks (tenant_id, user_id, delivery_id, action, detail)
-		 VALUES (`+tenantOfUser+`$1), $1, $2, $3, $4)
+		`INSERT INTO feedbacks (
+		     tenant_id, user_id, delivery_id, action, reason_code, detail
+		 )
+		 VALUES (
+		     (SELECT tenant_id FROM deliveries WHERE id=$2 AND user_id=$1),
+		     $1, $2, $3, NULLIF($4, ''), $5
+		 )
 		 RETURNING id`,
-		f.UserID, f.DeliveryID, f.Action, f.Detail).Scan(&id)
+		f.UserID, f.DeliveryID, f.Action, f.ReasonCode, f.Detail).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("插入反馈（delivery=%d, action=%s）", f.DeliveryID, f.Action), err)
@@ -58,7 +145,10 @@ func (s *Store) InsertDeepDiveFeedback(ctx context.Context, f *types.Feedback) (
 	}
 	err = s.pool.QueryRow(ctx,
 		`INSERT INTO feedbacks (tenant_id, user_id, delivery_id, action, detail)
-		 VALUES (`+tenantOfUser+`$1), $1, $2, 'deep_dive', $3)
+		 VALUES (
+		     (SELECT tenant_id FROM deliveries WHERE id=$2 AND user_id=$1),
+		     $1, $2, 'deep_dive', $3
+		 )
 		 ON CONFLICT (delivery_id) WHERE action = 'deep_dive' DO NOTHING
 		 RETURNING id`,
 		f.UserID, f.DeliveryID, f.Detail).Scan(&id)

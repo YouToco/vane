@@ -61,14 +61,25 @@ const evolveSystemPrompt = `你是用户画像维护器。根据用户对已推�
 
 // Evolver 画像演化器（契约 §9 锁定字段）。模型走 llm.Client 默认档 v4-flash。
 type Evolver struct {
-	cli *llm.Client
-	rec *llm.Recorder
-	st  *store.Store
+	cli                          *llm.Client
+	rec                          *llm.Recorder
+	st                           *store.Store
+	taskPolicySuggestionNotifier func(
+		context.Context, int64, int64, int64, string,
+	) (string, bool, error)
 }
 
 // New 构造 Evolver，依赖由 cmd/server 装配时注入。
 func New(cli *llm.Client, rec *llm.Recorder, st *store.Store) *Evolver {
 	return &Evolver{cli: cli, rec: rec, st: st}
+}
+
+func (e *Evolver) SetTaskPolicySuggestionNotifier(
+	notifier func(
+		context.Context, int64, int64, int64, string,
+	) (string, bool, error),
+) {
+	e.taskPolicySuggestionNotifier = notifier
 }
 
 // evolveOutput 演化 LLM 的输出 schema（契约 §9）：summary 与 tags 全量重写。
@@ -93,6 +104,66 @@ func (e *Evolver) evolve(
 	beforeSpend func(context.Context, float64) error,
 	writes *CompiledProfileWritesV1,
 ) error {
+	if outcomes, auditErr := e.st.AuditPendingOutdatedFeedbacks(
+		ctx, tenantID, userID, batchLimit,
+	); auditErr != nil {
+		slog.WarnContext(ctx, "evolver: 待处理过时反馈审计将在下轮重试",
+			"tenant_id", tenantID, "user_id", userID, "err", auditErr)
+	} else {
+		for _, outcome := range outcomes {
+			if outcome == types.FreshnessAuditSystemDefect {
+				slog.ErrorContext(ctx, "evolver: 重试审计确认推送突破新鲜度窗口",
+					"tenant_id", tenantID, "user_id", userID)
+			}
+		}
+	}
+	if tenantID > 0 && e.taskPolicySuggestionNotifier != nil {
+		for range batchLimit {
+			suggestion, claimErr := e.st.ClaimTaskPolicySuggestion(
+				ctx, tenantID, userID)
+			if errors.Is(claimErr, types.ErrNotFound) {
+				break
+			}
+			if claimErr != nil {
+				slog.WarnContext(ctx, "evolver: 领取任务策略建议失败",
+					"tenant_id", tenantID, "user_id", userID, "err", claimErr)
+				break
+			}
+			messageID, definitelyNotSent, notifyErr :=
+				e.taskPolicySuggestionNotifier(
+					ctx, tenantID, userID, suggestion.DeliveryID,
+					suggestion.ClaimToken)
+			if notifyErr != nil {
+				var markErr error
+				if definitelyNotSent {
+					markErr = e.st.ReleaseTaskPolicySuggestion(
+						ctx, tenantID, userID, suggestion.ClaimToken,
+						notifyErr.Error())
+				} else {
+					markErr = e.st.MarkTaskPolicySuggestionUncertain(
+						ctx, tenantID, userID, suggestion.ClaimToken,
+						notifyErr.Error())
+				}
+				if markErr != nil {
+					slog.WarnContext(ctx, "evolver: 任务策略建议失败态回执失败",
+						"tenant_id", tenantID, "user_id", userID,
+						"feedback_id", suggestion.FeedbackID,
+						"definitely_not_sent", definitelyNotSent, "err", markErr)
+				}
+				// definite failure 回到 pending，但不能在同一轮热循环重试。
+				break
+			}
+			if markErr := e.st.CompleteTaskPolicySuggestion(
+				ctx, tenantID, userID, suggestion.ClaimToken, messageID,
+			); markErr != nil {
+				// SendCard 已成功而回执失败时，绝不能把记录退回 pending。
+				// 它保持 sending；租约到期后 Store 会收敛为 uncertain，等待人工核验。
+				slog.WarnContext(ctx, "evolver: 任务策略建议发送成功但回执失败",
+					"tenant_id", tenantID, "user_id", userID,
+					"feedback_id", suggestion.FeedbackID, "err", markErr)
+			}
+		}
+	}
 	var p *types.Profile
 	var err error
 	if tenantID > 0 {
@@ -126,10 +197,15 @@ func (e *Evolver) evolve(
 	// 游标恒 = 本批返回切片最后一行的 feedbacks.id（审查 F8）：截断批次的
 	// 未消费行留待下轮；语义失败路径的 AdvanceProfileCursor 也传同一值。
 	newCursor := batch[len(batch)-1].ID
+	learningRows := feedbackRowsForProfileLearning(batch)
+	if len(learningRows) == 0 {
+		return e.advanceCursorWithoutLearning(
+			ctx, p, userID, traceID, newCursor, writes)
+	}
 
 	req := llm.Request{
 		System:      execution.systemPrompt,
-		User:        buildEvolveUser(p, dedupLatest(batch)),
+		User:        buildEvolveUser(p, dedupLatest(learningRows)),
 		Model:       execution.model,
 		Temperature: f32ptr(execution.temperature),
 		MaxTokens:   iptr(execution.maxTokens),
@@ -192,6 +268,47 @@ func (e *Evolver) evolve(
 		return err
 	}
 	return nil
+}
+
+// feedbackRowsForProfileLearning keeps product-quality feedback out of the
+// interest model. Only "not relevant" is an explicit topical preference;
+// outdated, duplicate, factual, evidence and free-form problem reports belong
+// to their diagnostic lanes and must not mutate the user's interests.
+func feedbackRowsForProfileLearning(
+	rows []types.FeedbackWithContent,
+) []types.FeedbackWithContent {
+	out := make([]types.FeedbackWithContent, 0, len(rows))
+	for _, row := range rows {
+		if row.Action != types.FeedbackActionMisjudged ||
+			row.ReasonCode == types.FeedbackReasonNotRelevant {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+func (e *Evolver) advanceCursorWithoutLearning(
+	ctx context.Context,
+	p *types.Profile,
+	userID int64,
+	traceID string,
+	newCursor int64,
+	writes *CompiledProfileWritesV1,
+) error {
+	var err error
+	if writes != nil {
+		err = writes.AdvanceCursor(
+			ctx, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+	} else {
+		err = e.st.AdvanceProfileCursor(
+			ctx, userID, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+	}
+	if errors.Is(err, types.ErrConflict) {
+		slog.Info("evolver: 诊断类反馈游标 CAS 冲突，交由下轮重读",
+			"user_id", userID, "trace_id", traceID)
+		return nil
+	}
+	return err
 }
 
 // discardBatch 语义失败处置（契约 §9）：AdvanceProfileCursor 标记本批已消费防死循环
@@ -303,12 +420,18 @@ func buildEvolveUser(p *types.Profile, rows []types.FeedbackWithContent) string 
 			b.WriteString(promptguard.Sanitize(promptguard.SingleLine(r.ContentExcerpt)))
 			b.WriteString("\n")
 		}
-		// 「备注」按 system prompt 规则 5 的定义只能是**用户自己输入的文字**——
-		// 只有 question 行的 detail 是用户原话。deep_dive 行的 detail 存的是模型
+		// 「备注」按 system prompt 规则 5 的定义只能是**用户自己输入的文字**。
+		// misjudged 的固定原因码和 detail 都是用户明确提交；deep_dive 行的 detail 存的是模型
 		// 生成的解读正文（F4 让它落库以便重发），把那 200 字当成"用户的观点"
 		// 喂给演化，会让模型据 AI 自己写的散文新增标签，正撞规则 3 末句
 		// 「没有反馈支撑的兴趣不得凭空编造」。该行的信号价值由 action 标签本身承载。
-		if r.Action == types.FeedbackActionQuestion {
+		if r.Action == types.FeedbackActionMisjudged && r.ReasonCode.Valid() {
+			b.WriteString("问题原因：")
+			b.WriteString(r.ReasonCode.Label())
+			b.WriteString("\n")
+		}
+		if r.Action == types.FeedbackActionQuestion ||
+			(r.Action == types.FeedbackActionMisjudged && r.ReasonCode.Valid()) {
 			if d := promptguard.TruncateRunes(promptguard.Sanitize(promptguard.SingleLine(r.Detail)), maxDetailRunes); d != "" {
 				b.WriteString("备注：")
 				b.WriteString(d)

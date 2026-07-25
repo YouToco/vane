@@ -118,6 +118,8 @@ type BatchExitGate string
 const (
 	BatchExitGateFetch  BatchExitGate = "fetch"  // 抓取后无候选：压根没抓到新内容
 	BatchExitGateDedup  BatchExitGate = "dedup"  // 去重后无候选：抓到了但全是重复
+	BatchExitGateObservationNoMatch BatchExitGate = "observation_no_match"
+	BatchExitGateObservationUncertain BatchExitGate = "observation_uncertain"
 	BatchExitGateScore  BatchExitGate = "score"  // 打分后无候选
 	BatchExitGateSelect BatchExitGate = "select" // 择优后无候选
 	// BatchExitGateQuota 额度用尽而非"没内容"。**必须与其它闸门区分开**：

@@ -20,6 +20,10 @@ type CardState struct {
 	Preference types.FeedbackAction
 	// Misjudged 是否已标记误判（独立于态度、可并存，MVP 不可撤销）。
 	Misjudged bool
+	// BadFeedbackOpen only controls the transient reason panel rendered in the
+	// callback response. Opening it writes no feedback row and therefore cannot
+	// accidentally become a "not interested" profile signal.
+	BadFeedbackOpen bool
 	// DeepDiveRequested 是否已请求深度解读（此行定格后不再变，生成失败也不回退）。
 	DeepDiveRequested bool
 }

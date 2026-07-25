@@ -113,8 +113,8 @@ func BuildConfirmCard(summary, actionID string) string {
 	return string(raw)
 }
 
-// feedbackButtons 推送卡的三个 emoji 反馈按钮（卡片改版：从四文字按钮精简为三图标）。
-// 误判入口折叠进 👎 后的 form：点 👎 = not_interested，form 提交 = misjudged + detail。
+// feedbackButtons 推送卡的三个 emoji 反馈按钮。历史 callback value 仍用
+// not_interested，但服务端把 👎 解释为“打开问题面板”，点击本身不落反馈。
 var feedbackButtons = []struct {
 	action types.FeedbackAction
 	label  string
@@ -197,42 +197,8 @@ func BuildDeliveryCard(input feedback.CardInput) string {
 		elements = append(elements, map[string]any{"tag": "markdown", "content": line})
 	}
 
-	// 点 👎 后出现 form（可跳过的原因收集）；误判落库后收起——
-	// 状态行已有「⚠️ 已标记误判」，form 留着会让人以为还能再提。
-	if input.State.Preference == types.FeedbackActionNotInterested && !input.State.Misjudged {
-		elements = append(elements, map[string]any{
-			"tag":  "form",
-			"name": "feedback_reason",
-			"elements": []any{
-				map[string]any{
-					"tag":  "input",
-					"name": "reason",
-					"placeholder": map[string]any{
-						"tag":     "plain_text",
-						"content": "哪里不对？说一句，下次就准了（可跳过）",
-					},
-					"max_length": 500,
-				},
-				map[string]any{
-					"tag": "button",
-					// form 内的交互组件必须有 name（缺失报 200530）；且 form 容器要求
-					// 至少一个 form_action_type=submit 的提交按钮——缺失时整卡非法：
-					// 发消息被拒（300123），作为回调响应返回则客户端报 200673
-					//（"返回了错误的卡片"），按钮永久转圈且回调被重推。
-					"name":             "submit_reason",
-					"form_action_type": "submit",
-					"text":             map[string]any{"tag": "plain_text", "content": "提交"},
-					"type":             "primary",
-					"behaviors": []any{map[string]any{
-						"type": "callback",
-						"value": map[string]any{
-							"vane_action": cardActionFeedbackReason,
-							"delivery_id": idStr,
-						},
-					}},
-				},
-			},
-		})
+	if input.State.BadFeedbackOpen && !input.State.Misjudged {
+		elements = append(elements, feedbackProblemForm(idStr, false))
 	}
 
 	card := map[string]any{
@@ -243,6 +209,62 @@ func BuildDeliveryCard(input feedback.CardInput) string {
 	}
 	raw, _ := json.Marshal(card)
 	return string(raw)
+}
+
+var feedbackReasonOptions = []struct {
+	code  types.FeedbackReason
+	label string
+}{
+	{types.FeedbackReasonOutdated, "过时或超出任务时间范围"},
+	{types.FeedbackReasonNotRelevant, "与任务无关"},
+	{types.FeedbackReasonDuplicate, "重复或已经推过"},
+	{types.FeedbackReasonFactWrong, "事实或结论错误"},
+	{types.FeedbackReasonPoorSource, "来源或证据质量差"},
+	{types.FeedbackReasonOther, "其他（请填写说明）"},
+}
+
+// feedbackProblemForm uses only input and submit buttons already exercised by
+// production cards. Each reason button submits exactly one fixed code; the
+// shared detail is optional except for “other”.
+func feedbackProblemForm(idStr string, aggregate bool) map[string]any {
+	formName, inputName, submitPrefix := "feedback_problem", "detail", "submit_reason_"
+	if aggregate {
+		formName = "fbr_" + idStr
+		inputName = "detail_" + idStr
+		submitPrefix = "submit_" + idStr + "_"
+	}
+	elements := []any{
+		map[string]any{
+			"tag":  "markdown",
+			"content": "**这条推送哪里有问题？** 请选择一个原因；如需补充，可填写说明。",
+		},
+		map[string]any{
+			"tag":  "input",
+			"name": inputName,
+			"placeholder": map[string]any{
+				"tag": "plain_text", "content": "补充说明（选择“其他”时必填）",
+			},
+			"max_length": 500,
+		},
+	}
+	for _, option := range feedbackReasonOptions {
+		elements = append(elements, map[string]any{
+			"tag":              "button",
+			"name":             submitPrefix + string(option.code),
+			"form_action_type": "submit",
+			"text":             map[string]any{"tag": "plain_text", "content": option.label},
+			"type":             "default",
+			"behaviors": []any{map[string]any{
+				"type": "callback",
+				"value": map[string]any{
+					"vane_action": cardActionFeedbackReason,
+					"delivery_id": idStr,
+					"reason_code": string(option.code),
+				},
+			}},
+		})
+	}
+	return map[string]any{"tag": "form", "name": formName, "elements": elements}
 }
 
 // buildSubtitle 拼装 header subtitle：{emoji} {栏目} · {域名} · {相对时间}。

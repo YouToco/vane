@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
@@ -478,9 +479,27 @@ func definitionEditSchedulerProjection(
 	if err := strictjson.DecodeExact(definition.SpecJSON, &spec); err != nil {
 		return scheduler.TaskDefinitionEditDefinition{}, fmt.Errorf("decode exact schedule spec: %w", err)
 	}
-	var scope workflow.PushScope
-	if err := strictjson.DecodeExact(definition.ScopeJSON, &scope); err != nil {
+	var approvedScope struct {
+		SourceIDs   []int64               `json:"source_ids,omitempty"`
+		TopN        int                   `json:"top_n,omitempty"`
+		Observation *observation.PolicyV1 `json:"observation,omitempty"`
+	}
+	if err := strictjson.DecodeExact(definition.ScopeJSON, &approvedScope); err != nil {
 		return scheduler.TaskDefinitionEditDefinition{}, fmt.Errorf("decode exact push scope: %w", err)
+	}
+	if approvedScope.Observation != nil {
+		if err := approvedScope.Observation.Validate(); err != nil {
+			return scheduler.TaskDefinitionEditDefinition{},
+				fmt.Errorf("decode exact observation policy: %w", err)
+		}
+		if approvedScope.Observation.EffectiveAt.IsZero() {
+			return scheduler.TaskDefinitionEditDefinition{},
+				errors.New("decode exact observation policy: effective_at is required")
+		}
+	}
+	scope := workflow.PushScope{
+		SourceIDs: approvedScope.SourceIDs,
+		TopN:      approvedScope.TopN,
 	}
 	return scheduler.TaskDefinitionEditDefinition{
 		Spec: spec, Scope: scope, NLDescription: definition.NLDescription,

@@ -42,9 +42,10 @@ type DeliveryHistoryItem struct {
 
 // DeliveryFeedback 是历史行内嵌的一条反馈。
 type DeliveryFeedback struct {
-	Action    string    `json:"action"` // types.FeedbackAction 原文
-	Detail    string    `json:"detail"`
-	CreatedAt time.Time `json:"created_at"`
+	Action     string    `json:"action"` // types.FeedbackAction 原文
+	ReasonCode string    `json:"reason_code,omitempty"`
+	Detail     string    `json:"detail"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // ListDeliveryHistory 按 owner 倒序返回推送历史。
@@ -141,7 +142,7 @@ func (s *Store) ListDeliveryHistory(ctx context.Context, userID int64, q Deliver
 // 加谓词让本查询独立成立（防止未来复用时漏掉归属检查）。
 func (s *Store) attachFeedbacks(ctx context.Context, userID int64, ids []int64, items []DeliveryHistoryItem) error {
 	rows, err := s.pool.Query(ctx,
-		`SELECT delivery_id, action, detail, created_at
+		`SELECT delivery_id, action, COALESCE(reason_code, ''), detail, created_at
 		 FROM feedbacks
 		 WHERE user_id = $1 AND delivery_id = ANY($2)
 		 ORDER BY created_at ASC, id ASC`,
@@ -155,7 +156,9 @@ func (s *Store) attachFeedbacks(ctx context.Context, userID int64, ids []int64, 
 	for rows.Next() {
 		var deliveryID int64
 		var fb DeliveryFeedback
-		if err := rows.Scan(&deliveryID, &fb.Action, &fb.Detail, &fb.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&deliveryID, &fb.Action, &fb.ReasonCode, &fb.Detail, &fb.CreatedAt,
+		); err != nil {
 			return types.NewAppError(types.CodeDatabase, "扫描反馈行", err)
 		}
 		byDelivery[deliveryID] = append(byDelivery[deliveryID], fb)

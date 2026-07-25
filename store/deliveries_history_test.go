@@ -144,7 +144,8 @@ func TestListDeliveryHistory(t *testing.T) {
 		t.Fatalf("InsertFeedback(not_interested) 失败: %v", err)
 	}
 	if _, err := st.InsertFeedback(ctx, &types.Feedback{
-		UserID: owner.ID, DeliveryID: d1, Action: types.FeedbackActionMisjudged, Detail: "点错了",
+		UserID: owner.ID, DeliveryID: d1, Action: types.FeedbackActionMisjudged,
+		ReasonCode: types.FeedbackReasonOther, Detail: "点错了",
 	}); err != nil {
 		t.Fatalf("InsertFeedback(misjudged) 失败: %v", err)
 	}

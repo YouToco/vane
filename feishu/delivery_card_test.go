@@ -336,11 +336,11 @@ func TestBuildDeliveryCardStateLinePlacement(t *testing.T) {
 func TestBuildDeliveryCardFormSubmitButton(t *testing.T) {
 	raw := BuildDeliveryCard(feedback.CardInput{
 		BodyMD: "正文", DeliveryID: 7,
-		State: feedback.CardState{Preference: types.FeedbackActionNotInterested},
+		State: feedback.CardState{BadFeedbackOpen: true},
 	})
 	card := decodeDeliveryCard(t, raw)
-	if len(card.Body.Elements) != 4 {
-		t.Fatalf("body.elements 长度 = %d, 期望 4（markdown + column_set + 状态行 + 误判表单）",
+	if len(card.Body.Elements) != 3 {
+		t.Fatalf("body.elements 长度 = %d, 期望 3（markdown + column_set + 问题反馈表单）",
 			len(card.Body.Elements))
 	}
 
@@ -353,7 +353,7 @@ func TestBuildDeliveryCardFormSubmitButton(t *testing.T) {
 			FormActionType string `json:"form_action_type"`
 		} `json:"elements"`
 	}
-	if err := json.Unmarshal(card.Body.Elements[3], &form); err != nil {
+	if err := json.Unmarshal(card.Body.Elements[2], &form); err != nil {
 		t.Fatalf("解析 form 元素失败: %v", err)
 	}
 	if form.Tag != "form" || form.Name == "" {
@@ -362,8 +362,9 @@ func TestBuildDeliveryCardFormSubmitButton(t *testing.T) {
 
 	var hasSubmit bool
 	for _, el := range form.Elements {
-		// form 内所有交互组件（input/button）都必须有非空 name（200530）。
-		if el.Name == "" {
+		// form 内交互组件（input/button）都必须有非空 name（200530）；
+		// 说明 markdown 不是交互组件，无需 name。
+		if (el.Tag == "input" || el.Tag == "button") && el.Name == "" {
 			t.Errorf("form 内 %q 组件缺 name", el.Tag)
 		}
 		if el.Tag == "button" && el.FormActionType == "submit" {
@@ -372,6 +373,28 @@ func TestBuildDeliveryCardFormSubmitButton(t *testing.T) {
 	}
 	if !hasSubmit {
 		t.Errorf("form 内没有 form_action_type=\"submit\" 的提交按钮（整卡会被飞书判非法）")
+	}
+}
+
+func TestBuildDeliveryCard_BadFeedbackButtonsCarryFixedReasonCode(t *testing.T) {
+	raw := BuildDeliveryCard(feedback.CardInput{
+		BodyMD: "正文", DeliveryID: 7,
+		State: feedback.CardState{BadFeedbackOpen: true},
+	})
+	for _, reason := range []types.FeedbackReason{
+		types.FeedbackReasonOutdated,
+		types.FeedbackReasonNotRelevant,
+		types.FeedbackReasonDuplicate,
+		types.FeedbackReasonFactWrong,
+		types.FeedbackReasonPoorSource,
+		types.FeedbackReasonOther,
+	} {
+		if !strings.Contains(raw, `"reason_code":"`+string(reason)+`"`) {
+			t.Errorf("问题面板缺少固定 reason_code %q: %s", reason, raw)
+		}
+	}
+	if strings.Contains(raw, `"fb":"not_interested"`) && strings.Contains(raw, `"reason_code":"not_interested"`) {
+		t.Error("不感兴趣不是问题原因；面板不得把点踩编码为 not_interested")
 	}
 }
 
