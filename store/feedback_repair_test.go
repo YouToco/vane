@@ -2,6 +2,7 @@ package store
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -9,18 +10,42 @@ import (
 )
 
 func TestInferLegacyFeedbackReason(t *testing.T) {
-	cases := map[string]types.FeedbackReason{
-		"这都3个月前的内容了": types.FeedbackReasonOutdated,
-		"这条已经推过":     types.FeedbackReasonDuplicate,
-		"结论不对":       types.FeedbackReasonFactWrong,
-		"来源质量太差":     types.FeedbackReasonPoorSource,
-		"和我的任务无关":    types.FeedbackReasonNotRelevant,
-		"排版很糟糕":      types.FeedbackReasonOther,
+	feedbackCreatedAt := time.Date(2026, 7, 25, 8, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		detail string
+		want   types.FeedbackReason
+	}{
+		{"existing relative month", "这都3个月前的内容了", types.FeedbackReasonOutdated},
+		{"relative days plus delayed delivery complaint", "3天前的内容怎么现在才推", types.FeedbackReasonOutdated},
+		{"relative Chinese number plus delayed delivery complaint", "三天前的内容怎么现在才推", types.FeedbackReasonOutdated},
+		{"absolute old ISO date with explicit complaint", "2025-10-15 的文章为什么现在才推？", types.FeedbackReasonOutdated},
+		{"absolute old Chinese date with explicit complaint", "2025年10月15号的内容现在还推。", types.FeedbackReasonOutdated},
+		{"absolute date content suffix requires human review", "2025年10月15日 的内容啊", types.FeedbackReasonOther},
+		{"future date cannot be stale", "2099-10-15 的内容为什么现在才推", types.FeedbackReasonOther},
+		{"duplicate", "这条已经推过", types.FeedbackReasonDuplicate},
+		{"duplicate wins over freshness", "3天前才推的这条已经推过", types.FeedbackReasonDuplicate},
+		{"factually wrong", "结论不对", types.FeedbackReasonFactWrong},
+		{"factually wrong wins over freshness", "三天前的内容怎么现在才推，结论不对", types.FeedbackReasonFactWrong},
+		{"poor source", "来源质量太差", types.FeedbackReasonPoorSource},
+		{"poor source wins over freshness", "3天前的内容现在才推，来源质量太差", types.FeedbackReasonPoorSource},
+		{"not relevant", "和我的任务无关", types.FeedbackReasonNotRelevant},
+		{"not relevant wins over freshness", "3天前的内容怎么现在才推，和我的任务无关", types.FeedbackReasonNotRelevant},
+		{"ordinary today reference", "今天的内容我晚点再看", types.FeedbackReasonOther},
+		{"ordinary absolute date reference", "今天安排复盘 2025年10月15日 的内容", types.FeedbackReasonOther},
+		{"ordinary date without content complaint", "日期写成 2025年10月15日 就行", types.FeedbackReasonOther},
+		{"vague delayed wording", "这个内容才推", types.FeedbackReasonOther},
+		{"other", "排版很糟糕", types.FeedbackReasonOther},
 	}
-	for detail, want := range cases {
-		if got := inferLegacyFeedbackReason(detail); got != want {
-			t.Errorf("inferLegacyFeedbackReason(%q)=%q want=%q", detail, got, want)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := inferLegacyFeedbackReason(
+				tc.detail,
+				feedbackCreatedAt,
+			); got != tc.want {
+				t.Errorf("inferLegacyFeedbackReason(%q)=%q want=%q", tc.detail, got, tc.want)
+			}
+		})
 	}
 }
 

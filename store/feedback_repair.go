@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -182,10 +185,10 @@ func buildLegacyFeedbackRepairPlan(
 		return FeedbackRepairPlan{}, types.NewAppError(types.CodeDatabase, "读取反馈演化游标", err)
 	}
 	rows, err := tx.Query(ctx,
-		`SELECT id, delivery_id, detail
+		`SELECT id, delivery_id, detail, created_at
 		   FROM (
 		       SELECT DISTINCT ON (delivery_id)
-		              id, delivery_id, action, reason_code, detail
+		              id, delivery_id, action, reason_code, detail, created_at
 		         FROM feedbacks
 		        WHERE tenant_id = $1 AND user_id = $2
 		          AND action = 'misjudged'
@@ -204,10 +207,13 @@ func buildLegacyFeedbackRepairPlan(
 	}
 	for rows.Next() {
 		var item FeedbackRepairItem
-		if err := rows.Scan(&item.FeedbackID, &item.DeliveryID, &item.Detail); err != nil {
+		var feedbackCreatedAt time.Time
+		if err := rows.Scan(
+			&item.FeedbackID, &item.DeliveryID, &item.Detail, &feedbackCreatedAt,
+		); err != nil {
 			return FeedbackRepairPlan{}, types.NewAppError(types.CodeDatabase, "扫描历史反馈修复候选", err)
 		}
-		item.ProposedReason = inferLegacyFeedbackReason(item.Detail)
+		item.ProposedReason = inferLegacyFeedbackReason(item.Detail, feedbackCreatedAt)
 		item.WasConsumed = item.FeedbackID <= cursor
 		plan.Items = append(plan.Items, item)
 		if plan.ReplayFromID == 0 || item.FeedbackID < plan.ReplayFromID {
@@ -256,15 +262,26 @@ func feedbackRepairDigest(plan FeedbackRepairPlan) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func inferLegacyFeedbackReason(detail string) types.FeedbackReason {
+var (
+	// These patterns deliberately recognize only explicit temporal statements.
+	// They are used to repair historical free-text feedback, so a conservative
+	// false negative is preferable to teaching the profile a wrong diagnosis.
+	legacyRelativeAgePattern = regexp.MustCompile(`(?:[1-9][0-9]*|[一二三四五六七八九十百千万两]+)\s*(?:天|日|周|星期|个月|月|年)\s*前`)
+	// Submatches 1-3 are YYYY年M月D日/号; 4-6 are YYYY-MM-DD. Keeping
+	// parsing local and strict lets a future date fail closed instead of being
+	// misclassified as stale merely because it appears beside a complaint.
+	legacyAbsoluteDatePattern = regexp.MustCompile(`(?:(20[0-9]{2})年(0?[1-9]|1[0-2])月(0?[1-9]|[12][0-9]|3[01])(?:日|号)|(20[0-9]{2})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01]))`)
+)
+
+func inferLegacyFeedbackReason(
+	detail string,
+	feedbackCreatedAt time.Time,
+) types.FeedbackReason {
 	normalized := strings.ToLower(strings.TrimSpace(detail))
 	switch {
-	case strings.Contains(normalized, "月前"),
-		strings.Contains(normalized, "年前"),
-		strings.Contains(normalized, "过时"),
-		strings.Contains(normalized, "旧闻"),
-		strings.Contains(normalized, "时间范围"):
-		return types.FeedbackReasonOutdated
+	// Specific diagnostics must win over freshness. A feedback such as
+	// “3天前才推的这条已经推过” is a duplicate diagnosis, not a topic or
+	// window preference.
 	case strings.Contains(normalized, "重复"), strings.Contains(normalized, "推过"):
 		return types.FeedbackReasonDuplicate
 	case strings.Contains(normalized, "错误"), strings.Contains(normalized, "不对"):
@@ -273,9 +290,64 @@ func inferLegacyFeedbackReason(detail string) types.FeedbackReason {
 		return types.FeedbackReasonPoorSource
 	case strings.Contains(normalized, "无关"), strings.Contains(normalized, "不相关"):
 		return types.FeedbackReasonNotRelevant
+	case strings.Contains(normalized, "过时"),
+		strings.Contains(normalized, "旧闻"),
+		strings.Contains(normalized, "时间范围"):
+		return types.FeedbackReasonOutdated
+	case isExplicitDelayedDeliveryComplaint(normalized, feedbackCreatedAt):
+		return types.FeedbackReasonOutdated
+	case legacyRelativeAgePattern.MatchString(normalized) &&
+		(strings.Contains(normalized, "这都") || strings.Contains(normalized, "太久") ||
+			strings.Contains(normalized, "太早")):
+		return types.FeedbackReasonOutdated
 	default:
 		return types.FeedbackReasonOther
 	}
+}
+
+// isExplicitDelayedDeliveryComplaint recognizes two conservative historical
+// phrasings:
+//   - a relative age plus an explicit "why only push now" complaint;
+//   - a past absolute date plus the same explicit delivery complaint.
+//
+// It intentionally does not treat bare “今天”, a bare calendar date, or vague
+// “才推/还推” wording as freshness feedback: those phrases are common in
+// ordinary task descriptions and must remain available for human review.
+func isExplicitDelayedDeliveryComplaint(
+	normalized string,
+	feedbackCreatedAt time.Time,
+) bool {
+	hasDeliveryDelayComplaint := strings.Contains(normalized, "怎么现在才推") ||
+		strings.Contains(normalized, "为什么现在才推") ||
+		strings.Contains(normalized, "现在才推") ||
+		strings.Contains(normalized, "这么久才推") ||
+		strings.Contains(normalized, "现在还推")
+	if legacyRelativeAgePattern.MatchString(normalized) && hasDeliveryDelayComplaint {
+		return true
+	}
+	return hasDeliveryDelayComplaint &&
+		legacyPastAbsoluteDate(normalized, feedbackCreatedAt)
+}
+
+func legacyPastAbsoluteDate(normalized string, now time.Time) bool {
+	match := legacyAbsoluteDatePattern.FindStringSubmatch(normalized)
+	if len(match) == 0 {
+		return false
+	}
+	year, month, day := match[1], match[2], match[3]
+	if year == "" {
+		year, month, day = match[4], match[5], match[6]
+	}
+	y, _ := strconv.Atoi(year)
+	m, _ := strconv.Atoi(month)
+	d, _ := strconv.Atoi(day)
+	date := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC)
+	if date.Year() != y || int(date.Month()) != m || date.Day() != d {
+		return false
+	}
+	todaySource := now.UTC()
+	today := time.Date(todaySource.Year(), todaySource.Month(), todaySource.Day(), 0, 0, 0, 0, time.UTC)
+	return date.Before(today)
 }
 
 func setTenantContext(ctx context.Context, tx pgx.Tx, tenantID int64) error {
