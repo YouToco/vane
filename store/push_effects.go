@@ -76,6 +76,15 @@ func (s *Store) CreatePushEffect(
 	}
 	defer rollbackPushEffectTx(ctx, tx)
 
+	tenantExists, err := lockTenantAdmissionRoot(ctx, tx, prepared.TenantID)
+	if err != nil {
+		return nil, pushEffectDatabaseError(
+			"lock push effect tenant admission root", err)
+	}
+	if !tenantExists {
+		return nil, pushEffectConflict("push effect tenant is unavailable")
+	}
+
 	existing, err := loadPushEffectForUpdate(ctx, tx, prepared.Scope())
 	if err == nil {
 		if err := validatePushEffectReplay(existing, canonical); err != nil {

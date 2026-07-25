@@ -165,6 +165,14 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			types.CodeDatabase, "设置租户清理上下文", err)
 	}
 
+	// Join the same per-tenant admission protocol as effect preparation before
+	// taking any child row lock. This is an advisory root rather than a tenants
+	// row lock so the schedule-first definition-edit order below stays acyclic.
+	if _, err := lockTenantAdmissionRoot(ctx, tx, tenantID); err != nil {
+		return nil, types.NewAppError(
+			types.CodeDatabase, "锁定租户清理准入根", err)
+	}
+
 	// Definition edit transactions globally lock schedule → operation → receipt.
 	// Purge must join that order before its FK-safe child-first DELETE sequence:
 	// deleting an operation fires schedules' ON DELETE SET NULL and otherwise

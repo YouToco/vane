@@ -218,6 +218,9 @@ GRANT SELECT (
 GRANT SELECT (
     id, tenant_id, user_id, batch_id
 ) ON deliveries TO vane_push_effect_coordinator;
+GRANT SELECT (
+    id
+) ON tenants TO vane_push_effect_coordinator;
 
 GRANT SELECT ON push_effects TO vane_push_effect_coordinator;
 GRANT INSERT (
@@ -303,6 +306,9 @@ REVOKE SELECT ON push_effects FROM vane_push_effect_coordinator;
 REVOKE SELECT (
     id, tenant_id, user_id, batch_id
 ) ON deliveries FROM vane_push_effect_coordinator;
+REVOKE SELECT (
+    id
+) ON tenants FROM vane_push_effect_coordinator;
 REVOKE SELECT (
     id, tenant_id, user_id, run_snapshot_id
 ) ON push_batches FROM vane_push_effect_coordinator;

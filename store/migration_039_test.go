@@ -71,10 +71,11 @@ func TestMigration039RestrictedRoleMatrix(t *testing.T) {
 	}
 
 	var (
-		coordinatorInsert, coordinatorIdentityUpdate bool
-		receiptSentUpdate, receiptCardUpdate         bool
-		operatorBlockUpdate, operatorMessageUpdate   bool
-		appSelect                                    bool
+		coordinatorInsert, coordinatorIdentityUpdate   bool
+		receiptSentUpdate, receiptCardUpdate           bool
+		operatorBlockUpdate, operatorMessageUpdate     bool
+		coordinatorTenantRoot, coordinatorTenantStatus bool
+		appSelect                                      bool
 	)
 	if err := db.QueryRowContext(t.Context(), `
 		SELECT
@@ -84,21 +85,26 @@ func TestMigration039RestrictedRoleMatrix(t *testing.T) {
 		  has_column_privilege('vane_push_effect_receipt','push_effects','card_payload','UPDATE'),
 		  has_column_privilege('vane_push_effect_operator','push_effects','blocked_at','UPDATE'),
 		  has_column_privilege('vane_push_effect_operator','push_effects','provider_message_id','UPDATE'),
+		  has_column_privilege('vane_push_effect_coordinator','tenants','id','SELECT'),
+		  has_column_privilege('vane_push_effect_coordinator','tenants','status','SELECT'),
 		  has_table_privilege('vane_app','push_effects','SELECT')`,
 	).Scan(
 		&coordinatorInsert, &coordinatorIdentityUpdate,
 		&receiptSentUpdate, &receiptCardUpdate,
-		&operatorBlockUpdate, &operatorMessageUpdate, &appSelect,
+		&operatorBlockUpdate, &operatorMessageUpdate,
+		&coordinatorTenantRoot, &coordinatorTenantStatus, &appSelect,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if !coordinatorInsert || coordinatorIdentityUpdate ||
 		!receiptSentUpdate || receiptCardUpdate ||
-		!operatorBlockUpdate || operatorMessageUpdate || appSelect {
-		t.Fatalf("role matrix drifted: coordinator=%v/%v receipt=%v/%v operator=%v/%v app=%v",
+		!operatorBlockUpdate || operatorMessageUpdate ||
+		!coordinatorTenantRoot || coordinatorTenantStatus || appSelect {
+		t.Fatalf("role matrix drifted: coordinator=%v/%v receipt=%v/%v operator=%v/%v tenant=%v/%v app=%v",
 			coordinatorInsert, coordinatorIdentityUpdate,
 			receiptSentUpdate, receiptCardUpdate,
-			operatorBlockUpdate, operatorMessageUpdate, appSelect)
+			operatorBlockUpdate, operatorMessageUpdate,
+			coordinatorTenantRoot, coordinatorTenantStatus, appSelect)
 	}
 }
 

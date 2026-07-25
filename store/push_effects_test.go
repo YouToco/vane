@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -540,5 +541,242 @@ func TestPushEffectConcurrentClaimHasOneFence(t *testing.T) {
 	}
 	if successes != 1 || conflicts != 1 {
 		t.Fatalf("claim results success/conflict=%d/%d", successes, conflicts)
+	}
+}
+
+func TestPushEffectCreateFirstSerializesTenantPurge(t *testing.T) {
+	f := newPushEffectFixture(t)
+	ctx := t.Context()
+
+	parentTx, err := f.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentReleased := false
+	defer func() {
+		if !parentReleased {
+			_ = parentTx.Rollback()
+		}
+	}()
+	var batchID int64
+	if err := parentTx.QueryRowContext(ctx, `
+		SELECT id FROM push_batches
+		 WHERE id=$1 AND tenant_id=$2
+		 FOR UPDATE /* push effect create-first parent gate */`,
+		f.prepared.BatchID, f.prepared.TenantID).Scan(&batchID); err != nil {
+		t.Fatal(err)
+	}
+
+	createDone := make(chan error, 1)
+	go func() {
+		_, createErr := f.store.CreatePushEffect(ctx, f.prepared)
+		createDone <- createErr
+	}()
+	waitForTenantAdmissionRootHolder(t, f.db, f.prepared.TenantID)
+
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, purgeErr := f.store.PurgeTenant(
+			ctx, f.prepared.TenantID, false)
+		purgeDone <- purgeResult{report: report, err: purgeErr}
+	}()
+	waitForTenantAdmissionRootWaiter(t, f.db)
+
+	if err := parentTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	parentReleased = true
+
+	select {
+	case createErr := <-createDone:
+		if createErr != nil {
+			t.Fatalf("create-first effect failed: %v", createErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("create-first effect did not converge")
+	}
+
+	var purged purgeResult
+	select {
+	case purged = <-purgeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("create-first purge did not converge")
+	}
+	if purged.err != nil {
+		t.Fatalf("create-first purge failed: %v", purged.err)
+	}
+	if purged.report == nil ||
+		purged.report.Rows["push_effects"] != 1 ||
+		purged.report.Rows["deliveries"] != 2 ||
+		purged.report.Rows["push_batches"] != 1 ||
+		purged.report.Rows["task_run_snapshots"] != 1 ||
+		purged.report.Rows["tenants"] != 1 {
+		t.Fatalf("create-first purge report = %+v", purged.report)
+	}
+	assertPushEffectAggregatePurged(t, f)
+}
+
+func TestPushEffectPurgeFirstRejectsWaitingCreate(t *testing.T) {
+	f := newPushEffectFixture(t)
+	ctx := t.Context()
+
+	scheduleTx, err := f.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduleReleased := false
+	defer func() {
+		if !scheduleReleased {
+			_ = scheduleTx.Rollback()
+		}
+	}()
+	var taskID string
+	if err := scheduleTx.QueryRowContext(ctx, `
+		SELECT id FROM schedules
+		 WHERE id=$1 AND tenant_id=$2
+		 FOR UPDATE /* push effect purge-first schedule gate */`,
+		f.prepared.TaskID, f.prepared.TenantID).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, purgeErr := f.store.PurgeTenant(
+			ctx, f.prepared.TenantID, false)
+		purgeDone <- purgeResult{report: report, err: purgeErr}
+	}()
+	waitForTenantAdmissionRootHolder(t, f.db, f.prepared.TenantID)
+	waitForTenantPurgeDefinitionEditLock(t, f.store)
+
+	createDone := make(chan error, 1)
+	go func() {
+		_, createErr := f.store.CreatePushEffect(ctx, f.prepared)
+		createDone <- createErr
+	}()
+	waitForTenantAdmissionRootWaiter(t, f.db)
+
+	if err := scheduleTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	scheduleReleased = true
+
+	var purged purgeResult
+	select {
+	case purged = <-purgeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("purge-first purge did not converge")
+	}
+	if purged.err != nil {
+		t.Fatalf("purge-first purge failed: %v", purged.err)
+	}
+	if purged.report == nil ||
+		purged.report.Rows["push_effects"] != 0 ||
+		purged.report.Rows["deliveries"] != 2 ||
+		purged.report.Rows["push_batches"] != 1 ||
+		purged.report.Rows["task_run_snapshots"] != 1 ||
+		purged.report.Rows["tenants"] != 1 {
+		t.Fatalf("purge-first purge report = %+v", purged.report)
+	}
+
+	select {
+	case createErr := <-createDone:
+		if !errors.Is(createErr, types.ErrConflict) {
+			t.Fatalf("purge-first create error = %v, want conflict", createErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("purge-first create did not converge")
+	}
+	assertPushEffectAggregatePurged(t, f)
+}
+
+func waitForTenantAdmissionRootHolder(
+	t *testing.T,
+	db *sql.DB,
+	tenantID int64,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		tx, err := db.BeginTx(t.Context(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var acquired bool
+		key := tenantAdmissionRootLockNamespace +
+			strconv.FormatInt(tenantID, 10)
+		queryErr := tx.QueryRowContext(t.Context(), `
+			SELECT pg_try_advisory_xact_lock(hashtextextended($1, $2))`,
+			key, tenantAdmissionRootLockSeed).Scan(&acquired)
+		rollbackErr := tx.Rollback()
+		if queryErr != nil {
+			t.Fatal(queryErr)
+		}
+		if rollbackErr != nil {
+			t.Fatal(rollbackErr)
+		}
+		if !acquired {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tenant admission root was not held")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForTenantAdmissionRootWaiter(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err := db.QueryRowContext(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1
+				  FROM pg_stat_activity
+				 WHERE datname=current_database()
+				   AND pid<>pg_backend_pid()
+				   AND wait_event_type='Lock'
+				   AND query LIKE
+				       '%pg_advisory_xact_lock(hashtextextended%'
+			)`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tenant admission root waiter was not observed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func assertPushEffectAggregatePurged(t *testing.T, f pushEffectFixture) {
+	t.Helper()
+	var effects, deliveries, batches, snapshots, tenants int
+	if err := f.db.QueryRowContext(t.Context(), `
+		SELECT
+		  (SELECT count(*) FROM push_effects WHERE tenant_id=$1),
+		  (SELECT count(*) FROM deliveries WHERE tenant_id=$1),
+		  (SELECT count(*) FROM push_batches WHERE tenant_id=$1),
+		  (SELECT count(*) FROM task_run_snapshots WHERE tenant_id=$1),
+		  (SELECT count(*) FROM tenants WHERE id=$1)`,
+		f.prepared.TenantID,
+	).Scan(&effects, &deliveries, &batches, &snapshots, &tenants); err != nil {
+		t.Fatal(err)
+	}
+	if effects != 0 || deliveries != 0 || batches != 0 ||
+		snapshots != 0 || tenants != 0 {
+		t.Fatalf(
+			"purged aggregate effects/deliveries/batches/snapshots/tenants=%d/%d/%d/%d/%d",
+			effects, deliveries, batches, snapshots, tenants)
 	}
 }
