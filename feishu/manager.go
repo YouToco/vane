@@ -498,7 +498,11 @@ func (m *Manager) reload(ctx context.Context) error {
 	h := newHandlerForApp(m, wsCtx, cfg.AppID)
 	wsCli := larkws.NewClient(cfg.AppID, cfg.AppSecret,
 		larkws.WithEventHandler(h.eventDispatcher()),
-		larkws.WithLogLevel(larkcore.LogLevelInfo),
+		// The SDK's INFO connection line contains the WebSocket access_key and
+		// ticket in the URL. Those are short-lived credentials, but they still
+		// must not enter journald. Keep only SDK errors; Vane emits its own
+		// credential-free lifecycle/status logs.
+		larkws.WithLogLevel(larkcore.LogLevelError),
 	)
 
 	now := time.Now()

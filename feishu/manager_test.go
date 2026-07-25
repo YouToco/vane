@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +15,20 @@ import (
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
+
+func TestManagerSDKLogLevelDoesNotExposeWebSocketCredentials(t *testing.T) {
+	source, err := os.ReadFile("manager.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(source)
+	if strings.Contains(code, "larkws.WithLogLevel(larkcore.LogLevelInfo)") {
+		t.Fatal("Feishu SDK INFO logs expose WebSocket access_key and ticket")
+	}
+	if !strings.Contains(code, "larkws.WithLogLevel(larkcore.LogLevelError)") {
+		t.Fatal("Feishu SDK must retain credential-free error logging")
+	}
+}
 
 func TestManagerShutdownRejectsNewWorkAndWaitsForInflight(t *testing.T) {
 	m := NewManager(nil, nil, nil)
