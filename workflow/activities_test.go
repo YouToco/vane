@@ -123,6 +123,9 @@ type fakeFeishu struct{}
 func (fakeFeishu) OwnerOpenID() string { return "ou_owner" }
 func (fakeFeishu) OwnerChatID() string { return "oc_owner" }
 func (fakeFeishu) AppIdentity() string { return "cli_test" }
+func (fakeFeishu) PushEffectTarget() (string, string, string) {
+	return "ou_owner", "oc_owner", "cli_test"
+}
 
 type fakeEvolver struct {
 	mu         sync.Mutex
@@ -774,6 +777,9 @@ type noOwnerFeishu struct{}
 func (noOwnerFeishu) OwnerOpenID() string { return "" }
 func (noOwnerFeishu) OwnerChatID() string { return "" }
 func (noOwnerFeishu) AppIdentity() string { return "" }
+func (noOwnerFeishu) PushEffectTarget() (string, string, string) {
+	return "", "", ""
+}
 
 // idNotice 身份构卡器：把 markdown 原样当卡 JSON 返回，便于对推送内容做子串断言。
 func idNotice(md string) string { return md }

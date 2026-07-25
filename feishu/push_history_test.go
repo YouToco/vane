@@ -14,11 +14,13 @@ func TestPushHistoryItemMatchesExactPositiveEvidence(t *testing.T) {
 		effectID = "019f9824-39b6-7e13-b247-b5ee5713c52b"
 		chatID   = "oc_owner_p2p"
 		appID    = "cli_expected_app"
+		cardJSON = `{"effect_id":"` + effectID + `","body":"frozen"}`
 	)
 	query := pusheffect.HistoryQuery{
 		EffectID: effectID, ProviderChatID: chatID, AppIdentity: appID,
-		StartTime: time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC),
-		EndTime:   time.Date(2026, 7, 25, 1, 0, 0, 0, time.UTC),
+		CardDigest: pusheffect.CardDigest([]byte(cardJSON)),
+		StartTime:  time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC),
+		EndTime:    time.Date(2026, 7, 25, 1, 0, 0, 0, time.UTC),
 	}
 	if !validPushHistoryQuery(query) {
 		t.Fatal("valid exact history query was rejected")
@@ -27,8 +29,7 @@ func TestPushHistoryItemMatchesExactPositiveEvidence(t *testing.T) {
 		"om_exact",
 		chatID,
 		appID,
-		`{"elements":[{"behaviors":[{"value":{`+
-			`"effect_id":"`+effectID+`"}}]}]}`,
+		cardJSON,
 	)
 	if !pushHistoryItemMatches(item, query) {
 		t.Fatal("exact positive provider evidence did not match")
@@ -76,6 +77,14 @@ func TestPushHistoryItemMatchesExactPositiveEvidence(t *testing.T) {
 			},
 		},
 		{
+			name: "same marker different frozen card",
+			mutate: func(message *larkim.Message) {
+				message.Body.Content = pushHistoryPtr(
+					`{"effect_id":"` + effectID + `","body":"variant"}`,
+				)
+			},
+		},
+		{
 			name: "conflicting marker",
 			mutate: func(message *larkim.Message) {
 				message.Body.Content = pushHistoryPtr(
@@ -97,7 +106,7 @@ func TestPushHistoryItemMatchesExactPositiveEvidence(t *testing.T) {
 				"om_candidate",
 				chatID,
 				appID,
-				`{"effect_id":"`+effectID+`"}`,
+				cardJSON,
 			)
 			test.mutate(candidate)
 			if pushHistoryItemMatches(candidate, query) {
@@ -112,6 +121,7 @@ func TestValidPushHistoryQueryRejectsUnfrozenInputs(t *testing.T) {
 		EffectID:       "019f9824-39b6-7e13-b247-b5ee5713c52b",
 		ProviderChatID: "oc_owner_p2p",
 		AppIdentity:    "cli_expected_app",
+		CardDigest:     pusheffect.CardDigest([]byte(`{"card":"frozen"}`)),
 		StartTime:      time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC),
 		EndTime:        time.Date(2026, 7, 25, 1, 0, 0, 0, time.UTC),
 	}
@@ -141,6 +151,18 @@ func TestValidPushHistoryQueryRejectsUnfrozenInputs(t *testing.T) {
 			name: "control in app identity",
 			mutate: func(query *pusheffect.HistoryQuery) {
 				query.AppIdentity = "cli_expected\napp"
+			},
+		},
+		{
+			name: "missing card digest",
+			mutate: func(query *pusheffect.HistoryQuery) {
+				query.CardDigest = ""
+			},
+		},
+		{
+			name: "noncanonical card digest",
+			mutate: func(query *pusheffect.HistoryQuery) {
+				query.CardDigest = "ABCDEF"
 			},
 		},
 		{

@@ -168,6 +168,7 @@ type FeishuManager interface {
 	OwnerOpenID() string
 	OwnerChatID() string
 	AppIdentity() string
+	PushEffectTarget() (ownerOpenID, ownerChatID, appIdentity string)
 }
 
 // Store 是 Activity 需要的数据访问子集（规格 B3 的相关方法）。
@@ -2916,7 +2917,6 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 				chunk,
 				cardJSON,
 				effectID,
-				owner,
 			)
 		} else {
 			msgID, perr = a.pusher.Push(ctx, owner, cardJSON)
@@ -3052,21 +3052,19 @@ func (a *Activities) sendDurablePushChunk(
 	chunk []pushPendingItem,
 	cardJSON string,
 	effectID string,
-	ownerOpenID string,
 ) (string, error) {
 	if a.pushEffectStore == nil || !activity.IsActivity(ctx) ||
 		batchID <= 0 || chunkIndex < 0 || chunkCount <= 0 ||
 		chunkIndex >= chunkCount || len(chunk) == 0 ||
-		effectID == "" || ownerOpenID == "" {
+		effectID == "" {
 		return "", types.NewAppError(
 			types.CodeValidation,
 			"durable push effect input is invalid",
 			nil,
 		)
 	}
-	ownerChatID := a.feishu.OwnerChatID()
-	appIdentity := a.feishu.AppIdentity()
-	if ownerChatID == "" || appIdentity == "" {
+	ownerOpenID, ownerChatID, appIdentity := a.feishu.PushEffectTarget()
+	if ownerOpenID == "" || ownerChatID == "" || appIdentity == "" {
 		return "", types.NewAppError(
 			types.CodeConflict,
 			"durable push effect provider identity is unavailable",

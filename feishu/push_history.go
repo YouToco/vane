@@ -21,8 +21,8 @@ const (
 )
 
 // ResolvePushEffectMessage looks only for positive evidence in the exact
-// frozen P2P chat, app identity, time window, message type and effect marker.
-// An empty result is deliberately non-terminal.
+// frozen P2P chat, app identity, time window, message type, effect marker and
+// exact card digest. An empty result is deliberately non-terminal.
 func (m *Manager) ResolvePushEffectMessage(
 	ctx context.Context,
 	query pusheffect.HistoryQuery,
@@ -100,6 +100,7 @@ func validPushHistoryQuery(query pusheffect.HistoryQuery) bool {
 		validOwnerChatID(query.ProviderChatID) &&
 		query.ProviderChatID != "" &&
 		validPushHistoryIdentity(query.AppIdentity) &&
+		pusheffect.ValidCardDigest(query.CardDigest) &&
 		!query.StartTime.IsZero() &&
 		!query.EndTime.IsZero() &&
 		query.EndTime.After(query.StartTime) &&
@@ -136,7 +137,9 @@ func pushHistoryItemMatches(
 		(item.Deleted != nil && *item.Deleted) {
 		return false
 	}
-	return cardHasExactEffectMarker(*item.Body.Content, query.EffectID)
+	card := *item.Body.Content
+	return cardHasExactEffectMarker(card, query.EffectID) &&
+		pusheffect.CardMatchesDigest([]byte(card), query.CardDigest)
 }
 
 func cardHasExactEffectMarker(cardJSON, effectID string) bool {

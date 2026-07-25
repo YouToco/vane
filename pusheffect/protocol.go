@@ -78,11 +78,14 @@ type ProviderObservation struct {
 }
 
 type HistoryQuery struct {
-	EffectID      string
+	EffectID       string
 	ProviderChatID string
-	AppIdentity   string
-	StartTime     time.Time
-	EndTime       time.Time
+	AppIdentity    string
+	// CardDigest is the immutable SHA-256 checkpoint of the exact frozen card
+	// bytes. A marker match without this digest is not positive send evidence.
+	CardDigest string
+	StartTime  time.Time
+	EndTime    time.Time
 }
 
 // HistoryObservation contains positive provider evidence only. MatchCount=0
@@ -217,6 +220,25 @@ func (c Canonical) Prepared() Prepared {
 func (c Canonical) Payload() []byte    { return slices.Clone(c.payload) }
 func (c Canonical) Digest() string     { return c.digest }
 func (c Canonical) CardDigest() string { return c.cardDigest }
+
+// CardMatchesDigest compares provider history bytes with the immutable digest
+// stored on the effect. It rejects malformed/non-canonical digest strings and
+// uses a constant-time comparison for the fixed-size checkpoint.
+func CardMatchesDigest(card []byte, expected string) bool {
+	return constantDigestEqual(digest(card), expected)
+}
+
+// CardDigest returns the exact immutable card-byte checkpoint persisted by the
+// effect protocol and supplied to provider-history reconciliation.
+func CardDigest(card []byte) string {
+	return digest(card)
+}
+
+// ValidCardDigest reports whether a stored/query digest uses the canonical
+// lowercase SHA-256 representation accepted by the effect protocol.
+func ValidCardDigest(value string) bool {
+	return validDigest(value)
+}
 
 func Canonicalize(p Prepared) (Canonical, error) {
 	if err := validatePrepared(p); err != nil {
