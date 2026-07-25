@@ -83,7 +83,7 @@ func BuildAggregateCard(in feedback.AggregateCardInput) string {
 		if i > 0 {
 			elements = append(elements, map[string]any{"tag": "hr"})
 		}
-		elements = append(elements, aggItemElements(item)...)
+		elements = append(elements, aggItemElements(item, in.EffectID)...)
 	}
 
 	card := map[string]any{
@@ -101,7 +101,7 @@ func BuildAggregateCard(in feedback.AggregateCardInput) string {
 }
 
 // aggItemElements 渲染卡内单条情报：标题行 / 来源行 / 解读 / 原文链接 / 按钮 / 状态行 / 条件 form。
-func aggItemElements(input feedback.CardInput) []any {
+func aggItemElements(input feedback.CardInput, effectID string) []any {
 	idStr := strconv.FormatInt(input.DeliveryID, 10)
 	els := make([]any, 0, 7)
 
@@ -142,11 +142,9 @@ func aggItemElements(input feedback.CardInput) []any {
 				"text": map[string]any{"tag": "plain_text", "content": b.label},
 				"behaviors": []any{map[string]any{
 					"type": "callback",
-					"value": map[string]any{
-						"vane_action": cardActionFeedback,
-						"fb":          string(b.action),
-						"delivery_id": idStr,
-					},
+					"value": aggregateCallbackValue(
+						cardActionFeedback, string(b.action), idStr, effectID,
+					),
 				}},
 			}},
 		})
@@ -162,7 +160,7 @@ func aggItemElements(input feedback.CardInput) []any {
 	//（handler 侧）的产生端：form=fbr_{id} / input=reason_{id} / submit=submit_{id}，
 	// 提交回调靠 Action.Name 后缀与 value.delivery_id 互验。
 	if input.State.BadFeedbackOpen && !input.State.Misjudged {
-		els = append(els, aggReasonForm(idStr))
+		els = append(els, aggReasonForm(idStr, effectID))
 	}
 	return els
 }
@@ -170,8 +168,27 @@ func aggItemElements(input feedback.CardInput) []any {
 // aggReasonForm 该条专属的误判原因 form。结构与单条卡 form 相同，仅 name 唯一化。
 // form 硬约束（历史事故 200530/300123/200673）：form 内交互组件必须有 name；
 // 必须含 form_action_type=submit 的提交按钮，缺失整卡非法。
-func aggReasonForm(idStr string) map[string]any {
-	return feedbackProblemForm(idStr, true)
+func aggReasonForm(idStr, effectID string) map[string]any {
+	return feedbackProblemForm(idStr, true, effectID)
+}
+
+func aggregateCallbackValue(
+	action string,
+	feedbackAction string,
+	deliveryID string,
+	effectID string,
+) map[string]any {
+	value := map[string]any{
+		"vane_action": action,
+		"delivery_id": deliveryID,
+	}
+	if feedbackAction != "" {
+		value["fb"] = feedbackAction
+	}
+	if effectID != "" {
+		value["effect_id"] = effectID
+	}
+	return value
 }
 
 // escapeMarkdown 中和标题里能改变 markdown/HTML 结构的字符（对抗审查：外部标题

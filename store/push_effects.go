@@ -79,7 +79,7 @@ func (s *Store) CreatePushEffect(
 	}
 	defer rollbackPushEffectTx(ctx, tx)
 
-	if _, err := lockPushEffectBatchAdmission(
+	batchStatus, err := lockPushEffectBatchAdmission(
 		ctx,
 		tx,
 		types.PushBatchScope{
@@ -89,7 +89,8 @@ func (s *Store) CreatePushEffect(
 		},
 		prepared.RunSnapshotID,
 		types.PushBatchDeliveryAuthorityEffect,
-	); err != nil {
+	)
+	if err != nil {
 		return nil, err
 	}
 
@@ -109,6 +110,10 @@ func (s *Store) CreatePushEffect(
 	}
 	if !errors.Is(err, types.ErrNotFound) {
 		return nil, err
+	}
+	if batchStatus != types.BatchStatusPending {
+		return nil, pushEffectConflict(
+			"push effect batch is not pending")
 	}
 	if err := verifyPushEffectAggregate(ctx, tx, prepared); err != nil {
 		return nil, err
@@ -765,18 +770,96 @@ func verifyPushEffectAggregate(
 	).Scan(&batchFound); err != nil {
 		return pushEffectDatabaseError("verify push batch", err)
 	}
-	var deliveryCount int
+	var (
+		lockedDeliveryIDs      []int64
+		lockedDeliveryStatuses []string
+		lockedDeliveryMessages []string
+		lockedDeliverySent     []bool
+		observedDeliveryIDs    []int64
+		observedEventKeys      []string
+		observedTaskIDs        []string
+		observedRunSnapshotIDs []int64
+		observedTemporalRunIDs []string
+		observedStatuses       []string
+		observedHasDeliveredAt []bool
+	)
 	if err := tx.QueryRow(ctx, `
-		SELECT count(*) FROM deliveries
-		 WHERE tenant_id=$1 AND user_id=$2 AND batch_id=$3
-		   AND id=ANY($4::bigint[])`,
+		SELECT locked_delivery_ids,locked_delivery_statuses,
+		       locked_delivery_message_ids,locked_delivery_has_sent_at,
+		       observed_delivery_ids,observed_event_keys,
+		       observed_task_ids,observed_run_snapshot_ids,
+		       observed_temporal_run_ids,observed_statuses,
+		       observed_has_delivered_at
+		  FROM lock_push_effect_aggregate_v1($1,$2,$3,$4)`,
 		prepared.TenantID, prepared.UserID, prepared.BatchID,
 		prepared.DeliveryIDs,
-	).Scan(&deliveryCount); err != nil {
-		return pushEffectDatabaseError("verify deliveries", err)
+	).Scan(
+		&lockedDeliveryIDs,
+		&lockedDeliveryStatuses,
+		&lockedDeliveryMessages,
+		&lockedDeliverySent,
+		&observedDeliveryIDs,
+		&observedEventKeys,
+		&observedTaskIDs,
+		&observedRunSnapshotIDs,
+		&observedTemporalRunIDs,
+		&observedStatuses,
+		&observedHasDeliveredAt,
+	); err != nil {
+		return pushEffectDatabaseError(
+			"lock push effect delivery and observation aggregate", err)
 	}
-	if !snapshotFound || !batchFound || deliveryCount != len(prepared.DeliveryIDs) {
+	expectedDeliveryIDs := slices.Clone(prepared.DeliveryIDs)
+	slices.Sort(expectedDeliveryIDs)
+	if !snapshotFound || !batchFound ||
+		!slices.Equal(lockedDeliveryIDs, expectedDeliveryIDs) {
 		return pushEffectConflict("push effect aggregate provenance differs")
+	}
+	if len(lockedDeliveryStatuses) != len(lockedDeliveryIDs) ||
+		len(lockedDeliveryMessages) != len(lockedDeliveryIDs) ||
+		len(lockedDeliverySent) != len(lockedDeliveryIDs) {
+		return pushEffectConflict("push effect delivery aggregate differs")
+	}
+	for index := range lockedDeliveryIDs {
+		if lockedDeliveryStatuses[index] !=
+			string(types.DeliveryStatusPending) ||
+			lockedDeliveryMessages[index] != "" ||
+			lockedDeliverySent[index] {
+			return pushEffectConflict(
+				"push effect delivery is not pending")
+		}
+	}
+	expectedObserved := make(map[int64]string, len(prepared.ObservationEventKeys))
+	for index, eventKey := range prepared.ObservationEventKeys {
+		if eventKey != "" {
+			expectedObserved[prepared.DeliveryIDs[index]] = eventKey
+		}
+	}
+	if len(observedDeliveryIDs) != len(expectedObserved) ||
+		len(observedEventKeys) != len(expectedObserved) ||
+		len(observedTaskIDs) != len(expectedObserved) ||
+		len(observedRunSnapshotIDs) != len(expectedObserved) ||
+		len(observedTemporalRunIDs) != len(expectedObserved) ||
+		len(observedStatuses) != len(expectedObserved) ||
+		len(observedHasDeliveredAt) != len(expectedObserved) {
+		return pushEffectConflict("push effect observation aggregate differs")
+	}
+	for index, deliveryID := range observedDeliveryIDs {
+		eventKey, ok := expectedObserved[deliveryID]
+		if !ok ||
+			eventKey != observedEventKeys[index] ||
+			observedTaskIDs[index] != prepared.TaskID ||
+			observedRunSnapshotIDs[index] != prepared.RunSnapshotID ||
+			observedTemporalRunIDs[index] != prepared.RunID ||
+			observedStatuses[index] != "qualified" ||
+			observedHasDeliveredAt[index] {
+			return pushEffectConflict(
+				"push effect observation aggregate differs")
+		}
+		delete(expectedObserved, deliveryID)
+	}
+	if len(expectedObserved) != 0 {
+		return pushEffectConflict("push effect observation aggregate differs")
 	}
 	return nil
 }
@@ -990,6 +1073,12 @@ func validatePushEffectSentReceipt(receipt pusheffect.SentReceipt) error {
 		len(receipt.ProviderMessageID) > maxPushEffectMessageID ||
 		!utf8.ValidString(receipt.ProviderMessageID) {
 		return pushEffectValidation("push effect sent receipt is invalid")
+	}
+	for _, eventKey := range receipt.ObservationEventKeys {
+		if eventKey != "" && !pusheffect.ValidObservationEventKey(eventKey) {
+			return pushEffectValidation(
+				"push effect sent observation receipt is invalid")
+		}
 	}
 	return nil
 }

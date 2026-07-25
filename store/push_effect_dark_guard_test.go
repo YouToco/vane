@@ -11,17 +11,12 @@ import (
 	"testing"
 )
 
-func TestPushEffectStoreHasZeroProductionCallPoints(t *testing.T) {
+func TestPushEffectRecoveryStoreHasZeroProductionCallPoints(t *testing.T) {
 	methods := map[string]bool{
-		"CreatePushEffect":                   true,
-		"LoadPushEffect":                     true,
 		"ListRecoverablePushEffectTenantIDs": true,
 		"ListRecoverablePushEffects":         true,
-		"ClaimPushEffect":                    true,
 		"ClaimPushEffectReconciliation":      true,
 		"TakeOverStalePushEffect":            true,
-		"RecordPushEffectDefiniteFailure":    true,
-		"RecordPushEffectAmbiguous":          true,
 		"RecordPushEffectSent":               true,
 		"BlockPushEffect":                    true,
 	}
@@ -53,7 +48,7 @@ func TestPushEffectStoreHasZeroProductionCallPoints(t *testing.T) {
 			selector, ok := node.(*ast.SelectorExpr)
 			if ok && methods[selector.Sel.Name] {
 				position := fset.Position(selector.Pos())
-				t.Errorf("push effect Store API is wired before its coordinator Gate: %s:%d",
+				t.Errorf("push effect recovery API is wired in PR-B: %s:%d",
 					position.Filename, position.Line)
 			}
 			return true

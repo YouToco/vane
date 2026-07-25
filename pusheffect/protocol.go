@@ -84,17 +84,21 @@ type Scope struct {
 }
 
 type Prepared struct {
-	ID                   string
-	TenantID             int64
-	UserID               int64
-	TaskID               string
-	RunSnapshotID        int64
-	RunID                string
-	StepID               string
-	ChunkIndex           int
-	ChunkCount           int
-	BatchID              int64
-	DeliveryIDs          []int64
+	ID            string
+	TenantID      int64
+	UserID        int64
+	TaskID        string
+	RunSnapshotID int64
+	RunID         string
+	StepID        string
+	ChunkIndex    int
+	ChunkCount    int
+	BatchID       int64
+	DeliveryIDs   []int64
+	// ObservationEventKeys is aligned with DeliveryIDs when at least one
+	// delivery represents a qualified observation. Empty entries identify
+	// ordinary deliveries in a mixed aggregate.
+	ObservationEventKeys []string
 	Provider             string
 	AppIdentity          string
 	ProviderChatID       string
@@ -156,32 +160,34 @@ type Resolution struct {
 
 type SentReceipt struct {
 	Scope
-	ExpectedFence     int64
-	LeaseOwner        string
-	ProviderMessageID string
+	ExpectedFence        int64
+	LeaseOwner           string
+	ProviderMessageID    string
+	ObservationEventKeys []string
 }
 
 type wireV1 struct {
-	SchemaVersion        string  `json:"schema_version"`
-	EffectID             string  `json:"effect_id"`
-	TenantID             int64   `json:"tenant_id"`
-	UserID               int64   `json:"user_id"`
-	TaskID               string  `json:"task_id"`
-	RunSnapshotID        int64   `json:"run_snapshot_id"`
-	RunID                string  `json:"run_id"`
-	StepID               string  `json:"step_id"`
-	ChunkIndex           int     `json:"chunk_index"`
-	ChunkCount           int     `json:"chunk_count"`
-	BatchID              int64   `json:"batch_id"`
-	DeliveryIDs          []int64 `json:"delivery_ids"`
-	Provider             string  `json:"provider"`
-	AppIdentity          string  `json:"app_identity"`
-	ProviderChatID       string  `json:"provider_chat_id"`
-	Target               string  `json:"target"`
-	CardBase64           string  `json:"card_base64"`
-	CardDigest           string  `json:"card_digest"`
-	ProviderUUID         string  `json:"provider_uuid"`
-	IdempotencyExpiresAt string  `json:"idempotency_expires_at"`
+	SchemaVersion        string   `json:"schema_version"`
+	EffectID             string   `json:"effect_id"`
+	TenantID             int64    `json:"tenant_id"`
+	UserID               int64    `json:"user_id"`
+	TaskID               string   `json:"task_id"`
+	RunSnapshotID        int64    `json:"run_snapshot_id"`
+	RunID                string   `json:"run_id"`
+	StepID               string   `json:"step_id"`
+	ChunkIndex           int      `json:"chunk_index"`
+	ChunkCount           int      `json:"chunk_count"`
+	BatchID              int64    `json:"batch_id"`
+	DeliveryIDs          []int64  `json:"delivery_ids"`
+	ObservationEventKeys []string `json:"observation_event_keys,omitempty"`
+	Provider             string   `json:"provider"`
+	AppIdentity          string   `json:"app_identity"`
+	ProviderChatID       string   `json:"provider_chat_id"`
+	Target               string   `json:"target"`
+	CardBase64           string   `json:"card_base64"`
+	CardDigest           string   `json:"card_digest"`
+	ProviderUUID         string   `json:"provider_uuid"`
+	IdempotencyExpiresAt string   `json:"idempotency_expires_at"`
 }
 
 type Canonical struct {
@@ -194,6 +200,7 @@ type Canonical struct {
 func (c Canonical) Prepared() Prepared {
 	p := c.prepared
 	p.DeliveryIDs = slices.Clone(p.DeliveryIDs)
+	p.ObservationEventKeys = slices.Clone(p.ObservationEventKeys)
 	p.Card = slices.Clone(p.Card)
 	return p
 }
@@ -213,7 +220,8 @@ func Canonicalize(p Prepared) (Canonical, error) {
 		TaskID: p.TaskID, RunSnapshotID: p.RunSnapshotID, RunID: p.RunID,
 		StepID: p.StepID, ChunkIndex: p.ChunkIndex, ChunkCount: p.ChunkCount,
 		BatchID: p.BatchID, DeliveryIDs: slices.Clone(p.DeliveryIDs),
-		Provider: p.Provider, AppIdentity: p.AppIdentity,
+		ObservationEventKeys: slices.Clone(p.ObservationEventKeys),
+		Provider:             p.Provider, AppIdentity: p.AppIdentity,
 		ProviderChatID: p.ProviderChatID, Target: p.Target,
 		CardBase64: base64.StdEncoding.EncodeToString(p.Card),
 		CardDigest: cardDigest, ProviderUUID: p.ProviderUUID,
@@ -254,7 +262,8 @@ func Decode(payload []byte, storedDigest string) (Canonical, error) {
 		TaskID: wire.TaskID, RunSnapshotID: wire.RunSnapshotID, RunID: wire.RunID,
 		StepID: wire.StepID, ChunkIndex: wire.ChunkIndex, ChunkCount: wire.ChunkCount,
 		BatchID: wire.BatchID, DeliveryIDs: wire.DeliveryIDs,
-		Provider: wire.Provider, AppIdentity: wire.AppIdentity,
+		ObservationEventKeys: wire.ObservationEventKeys,
+		Provider:             wire.Provider, AppIdentity: wire.AppIdentity,
 		ProviderChatID: wire.ProviderChatID, Target: wire.Target,
 		Card: card, ProviderUUID: wire.ProviderUUID,
 		IdempotencyExpiresAt: expiresAt,
@@ -292,6 +301,24 @@ func validatePrepared(p Prepared) error {
 			return invalid("delivery ids must be positive and strictly increasing")
 		}
 	}
+	if len(p.ObservationEventKeys) > 0 {
+		if len(p.ObservationEventKeys) != len(p.DeliveryIDs) {
+			return invalid("observation event keys must align with delivery ids")
+		}
+		hasEvent := false
+		for _, key := range p.ObservationEventKeys {
+			if key == "" {
+				continue
+			}
+			if !validDigest(key) {
+				return invalid("observation event key is invalid")
+			}
+			hasEvent = true
+		}
+		if !hasEvent {
+			return invalid("observation event keys must not be all empty")
+		}
+	}
 	parsed, err := uuid.Parse(p.ProviderUUID)
 	if err != nil || parsed.String() != p.ProviderUUID {
 		return invalid("provider uuid is not canonical")
@@ -311,8 +338,16 @@ func validText(value string, maximum int) bool {
 
 func clonePrepared(p Prepared) Prepared {
 	p.DeliveryIDs = slices.Clone(p.DeliveryIDs)
+	p.ObservationEventKeys = slices.Clone(p.ObservationEventKeys)
 	p.Card = slices.Clone(p.Card)
 	return p
+}
+
+// ValidObservationEventKey reports whether a receipt event key uses the
+// canonical lowercase SHA-256 representation frozen by the observation
+// protocol.
+func ValidObservationEventKey(value string) bool {
+	return validDigest(value)
 }
 
 func digest(payload []byte) string {

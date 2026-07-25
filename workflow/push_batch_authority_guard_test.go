@@ -35,6 +35,15 @@ func TestPushAuthorityGuard(t *testing.T) {
 	}
 
 	claimCalls := 0
+	var claimPosition token.Pos
+	allowedEffectCalls := map[string]bool{
+		"ListPushEffectsForBatch":      true,
+		"CompleteEmptyPushEffectBatch": true,
+		"PushEffectTarget":             true,
+		"sendFrozenPushEffects":        true,
+		"settleSentPushEffects":        true,
+		"SettlePushEffectBatchReceipt": true,
+	}
 	effectCalls := []string{}
 	ast.Inspect(push.Body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
@@ -48,8 +57,14 @@ func TestPushAuthorityGuard(t *testing.T) {
 		switch {
 		case selector.Sel.Name == "ClaimPushBatchDeliveryAuthority":
 			claimCalls++
-		case strings.Contains(selector.Sel.Name, "PushEffect"):
+			claimPosition = call.Pos()
+		case strings.Contains(selector.Sel.Name, "PushEffect") &&
+			!allowedEffectCalls[selector.Sel.Name]:
 			effectCalls = append(effectCalls, selector.Sel.Name)
+		case allowedEffectCalls[selector.Sel.Name] &&
+			(claimPosition == token.NoPos || call.Pos() < claimPosition):
+			effectCalls = append(effectCalls,
+				selector.Sel.Name+" before authority claim")
 		}
 		return true
 	})
@@ -57,6 +72,7 @@ func TestPushAuthorityGuard(t *testing.T) {
 		t.Fatalf("Push authority claims = %d, want exactly 1", claimCalls)
 	}
 	if len(effectCalls) != 0 {
-		t.Fatalf("authority-only Push must not call effect APIs: %v", effectCalls)
+		t.Fatalf("Push has effect calls outside the authority fence: %v",
+			effectCalls)
 	}
 }

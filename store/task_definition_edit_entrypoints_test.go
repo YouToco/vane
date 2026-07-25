@@ -268,7 +268,7 @@ func newTaskDefinitionEditEntrypointFixture(
 	withProvenance bool,
 ) *taskDefinitionEditEntrypointFixture {
 	t.Helper()
-	st := tenantTestStore(t)
+	st := taskDefinitionEditEntrypointTestStore(t)
 	components := loadTaskDefinitionEditEntrypointComponents(t)
 	base, err := taskstate.DecodeApprovedDefinitionV1(components.BaseDefinition)
 	if err != nil {
@@ -320,6 +320,20 @@ func newTaskDefinitionEditEntrypointFixture(
 		f.insertSuccessfulCreationProvenance(t, components.PreparedEdit)
 	}
 	return f
+}
+
+func taskDefinitionEditEntrypointTestStore(t *testing.T) *Store {
+	t.Helper()
+	dbURL, _, provider := migration039Scratch(t)
+	if _, err := provider.Up(t.Context()); err != nil {
+		t.Fatalf("migrate retained entrypoint scratch DB: %v", err)
+	}
+	st, err := New(t.Context(), dbURL)
+	if err != nil {
+		t.Fatalf("open retained entrypoint scratch Store: %v", err)
+	}
+	t.Cleanup(st.Close)
+	return st
 }
 
 func loadTaskDefinitionEditEntrypointComponents(

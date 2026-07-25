@@ -228,6 +228,28 @@ func (m *Manager) AppIdentity() string {
 	return m.apiAppID
 }
 
+// PushEffectTarget atomically snapshots the complete durable routing
+// generation. Returning the three fields from one critical section prevents a
+// reconfiguration from splicing an old owner/chat binding onto a new App (or
+// vice versa). An incomplete or cross-App binding is unavailable as a whole.
+func (m *Manager) PushEffectTarget() (
+	ownerOpenID string,
+	ownerChatID string,
+	appIdentity string,
+) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.apiClient == nil ||
+		m.apiAppID == "" ||
+		m.ownerOpenID == "" ||
+		m.ownerChatID == "" ||
+		m.ownerAppID == "" ||
+		m.ownerAppID != m.apiAppID {
+		return "", "", ""
+	}
+	return m.ownerOpenID, m.ownerChatID, m.apiAppID
+}
+
 // permanentRejection 报告一个飞书拒收 code 是否为确定性失败（重试必然同样失败）。
 // 清单只收实锤过语义的码，按需扩充：
 //

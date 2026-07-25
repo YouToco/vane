@@ -24,7 +24,7 @@ type pushEffectFixture struct {
 }
 
 func newPushEffectFixture(t *testing.T) pushEffectFixture {
-	return newPushEffectFixtureAt(t, 47)
+	return newPushEffectFixtureAt(t, 48)
 }
 
 func newPushEffectFixtureBeforeAuthority(t *testing.T) pushEffectFixture {

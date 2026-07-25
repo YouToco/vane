@@ -149,6 +149,7 @@ type compiledRunStoreFake struct {
 	batchWrites        int
 	recoveryCalls      int
 	deliveryWrites     int
+	deliveryIDSequence []int64
 	deliveryReceipts   int
 	batchStatuses      int
 	fetchUpserts       int
@@ -175,15 +176,18 @@ type pushAuthorityOrder struct {
 type observationRuntimeStoreFake struct {
 	mu sync.Mutex
 
-	status         string
-	response       json.RawMessage
-	spendCalls     int
-	spendRollout   []observation.RolloutMode
-	spendRuleNil   []bool
-	completeCalls  int
-	uncertainCalls int
-	reserveCalls   int
-	authorityOrder *pushAuthorityOrder
+	status          string
+	response        json.RawMessage
+	spendCalls      int
+	spendRollout    []observation.RolloutMode
+	spendRuleNil    []bool
+	completeCalls   int
+	uncertainCalls  int
+	reserveCalls    int
+	reserveBatchIDs []int64
+	bindBatchIDs    []int64
+	bindDeliveryIDs []int64
+	authorityOrder  *pushAuthorityOrder
 }
 
 func (f *observationRuntimeStoreFake) PrepareObservationQualificationStep(
@@ -265,28 +269,35 @@ func (f *observationRuntimeStoreFake) MarkObservationQualificationUncertain(
 }
 
 func (f *observationRuntimeStoreFake) ReserveObservedEventV1(
-	context.Context,
-	types.RunIdentity,
-	types.RunSnapshotRef,
-	observation.QualifiedEvent,
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRef,
+	batchID int64,
+	_ observation.QualifiedEvent,
 ) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reserveCalls++
+	f.reserveBatchIDs = append(f.reserveBatchIDs, batchID)
 	if f.authorityOrder != nil && !f.authorityOrder.claimed.Load() {
 		f.authorityOrder.reserveBefore.Store(true)
 	}
 	return true, nil
 }
 
-func (*observationRuntimeStoreFake) BindObservedEventDeliveryV1(
-	context.Context,
-	types.RunIdentity,
-	types.RunSnapshotRef,
-	string,
-	string,
-	int64,
+func (f *observationRuntimeStoreFake) BindObservedEventDeliveryV1(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRef,
+	_ string,
+	_ string,
+	batchID int64,
+	deliveryID int64,
 ) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bindBatchIDs = append(f.bindBatchIDs, batchID)
+	f.bindDeliveryIDs = append(f.bindDeliveryIDs, deliveryID)
 	return nil
 }
 
@@ -729,6 +740,11 @@ func (f *compiledRunStoreFake) InsertDeliveryForTaskRunV1(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deliveryWrites++
+	if len(f.deliveryIDSequence) > 0 {
+		id := f.deliveryIDSequence[0]
+		f.deliveryIDSequence = f.deliveryIDSequence[1:]
+		return id, false, false, nil
+	}
 	return 201, false, false, nil
 }
 
@@ -2663,6 +2679,18 @@ func TestPush_CompiledClaimsLegacyAuthorityBeforeAllDeliveryEffects(t *testing.T
 	}
 	observationStore.mu.Lock()
 	reserveCalls := observationStore.reserveCalls
+	reserveBatchIDs := append(
+		[]int64(nil),
+		observationStore.reserveBatchIDs...,
+	)
+	bindBatchIDs := append(
+		[]int64(nil),
+		observationStore.bindBatchIDs...,
+	)
+	bindDeliveryIDs := append(
+		[]int64(nil),
+		observationStore.bindDeliveryIDs...,
+	)
 	observationStore.mu.Unlock()
 	if reserveCalls != 1 || deliveryWrites != 1 || pusher.calls.Load() != 1 {
 		t.Fatalf(
@@ -2670,6 +2698,16 @@ func TestPush_CompiledClaimsLegacyAuthorityBeforeAllDeliveryEffects(t *testing.T
 			reserveCalls,
 			deliveryWrites,
 			pusher.calls.Load(),
+		)
+	}
+	if !reflect.DeepEqual(reserveBatchIDs, []int64{101}) ||
+		!reflect.DeepEqual(bindBatchIDs, []int64{101}) ||
+		!reflect.DeepEqual(bindDeliveryIDs, []int64{201}) {
+		t.Fatalf(
+			"observation batch binding reserve=%v bind=%v deliveries=%v, want [101]/[101]/[201]",
+			reserveBatchIDs,
+			bindBatchIDs,
+			bindDeliveryIDs,
 		)
 	}
 }

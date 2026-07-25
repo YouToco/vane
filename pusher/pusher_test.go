@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/types"
 )
 
@@ -15,6 +16,19 @@ type fakeSender struct {
 	retID       string
 	retErr      error
 	called      bool
+	gotApp      string
+	gotUUID     string
+	observation pusheffect.ProviderObservation
+}
+
+type legacyOnlySender struct{}
+
+func (legacyOnlySender) SendCard(
+	context.Context,
+	string,
+	string,
+) (string, error) {
+	return "om_legacy", nil
 }
 
 func (f *fakeSender) SendCard(_ context.Context, openID, cardJSON string) (string, error) {
@@ -22,6 +36,18 @@ func (f *fakeSender) SendCard(_ context.Context, openID, cardJSON string) (strin
 	f.gotOpenID = openID
 	f.gotCardJSON = cardJSON
 	return f.retID, f.retErr
+}
+
+func (f *fakeSender) SendCardWithUUIDResult(
+	_ context.Context,
+	appIdentity, openID, cardJSON, messageUUID string,
+) (pusheffect.ProviderObservation, error) {
+	f.called = true
+	f.gotApp = appIdentity
+	f.gotOpenID = openID
+	f.gotCardJSON = cardJSON
+	f.gotUUID = messageUUID
+	return f.observation, f.retErr
 }
 
 func TestPush_EmptyOpenID(t *testing.T) {
@@ -68,5 +94,42 @@ func TestPush_SenderErrorPropagates(t *testing.T) {
 	_, err := p.Push(context.Background(), "ou_owner", `{}`)
 	if !errors.Is(err, types.ErrPush) {
 		t.Errorf("sender 的推送错误应原样透传，得到 %v", err)
+	}
+}
+
+func TestPushWithUUIDPreservesFrozenProviderIdentity(t *testing.T) {
+	want := pusheffect.ProviderObservation{
+		Disposition: pusheffect.AttemptSent,
+		AppIdentity: "app-generation-7",
+		ChatID:      "oc_owner",
+		MessageID:   "om_sent",
+	}
+	fs := &fakeSender{observation: want}
+	got, err := New(fs).PushWithUUID(
+		t.Context(),
+		"app-generation-7",
+		"ou_owner",
+		`{"card":"frozen"}`,
+		"2f790ab2-0622-4df8-8f93-6079a3a0f94f",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want ||
+		fs.gotApp != "app-generation-7" ||
+		fs.gotOpenID != "ou_owner" ||
+		fs.gotCardJSON != `{"card":"frozen"}` ||
+		fs.gotUUID != "2f790ab2-0622-4df8-8f93-6079a3a0f94f" {
+		t.Fatalf("durable send drifted: got=%+v sender=%+v", got, fs)
+	}
+}
+
+func TestPushWithUUIDRejectsLegacyOnlySender(t *testing.T) {
+	got, err := New(legacyOnlySender{}).PushWithUUID(
+		t.Context(), "app", "ou_owner", `{}`, "uuid",
+	)
+	if !errors.Is(err, types.ErrConflict) ||
+		got.Disposition != pusheffect.AttemptDefiniteNotSent {
+		t.Fatalf("legacy-only result=%+v err=%v", got, err)
 	}
 }

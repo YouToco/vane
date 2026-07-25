@@ -308,7 +308,7 @@ func (s *Store) MarkObservationQualificationUncertain(
 		"commit observation qualification uncertainty")
 }
 
-func (s *Store) ReserveObservedEventV1(
+func (s *Store) reserveObservedEventLegacyV1(
 	ctx context.Context,
 	expected types.RunIdentity,
 	ref types.RunSnapshotRef,
@@ -413,7 +413,7 @@ func (s *Store) ReserveObservedEventV1(
 	return accepted, nil
 }
 
-func (s *Store) BindObservedEventDeliveryV1(
+func (s *Store) bindObservedEventDeliveryLegacyV1(
 	ctx context.Context,
 	expected types.RunIdentity,
 	ref types.RunSnapshotRef,

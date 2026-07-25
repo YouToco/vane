@@ -113,6 +113,98 @@ func TestSnapshotV2ReadAuditCanaryValidation(t *testing.T) {
 	}
 }
 
+func TestPushEffectCanaryValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		compiled       bool
+		compiledCanary string
+		allowAll       bool
+		effectCanary   string
+		want           string
+		wantErr        bool
+	}{
+		{name: "off"},
+		{
+			name: "exact compiled task", compiled: true,
+			compiledCanary: "push-effect-task",
+			effectCanary:   " push-effect-task ",
+			want:           "push-effect-task",
+		},
+		{
+			name: "compiled allow all contains exact task", compiled: true,
+			allowAll: true, effectCanary: "push-effect-task",
+			want: "push-effect-task",
+		},
+		{
+			name:         "compiled disabled",
+			effectCanary: "push-effect-task", wantErr: true,
+		},
+		{
+			name: "outside compiled rollout", compiled: true,
+			compiledCanary: "other-task",
+			effectCanary:   "push-effect-task",
+			wantErr:        true,
+		},
+		{
+			name: "whitespace", compiled: true,
+			compiledCanary: "push-effect-task",
+			effectCanary:   " \t ",
+			wantErr:        true,
+		},
+		{
+			name: "control", compiled: true, allowAll: true,
+			effectCanary: "push\neffect", wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{
+				DB: DBConfig{URL: "postgres://test"},
+				Pipeline: PipelineConfig{
+					CompiledRuntimeEnabled:          test.compiled,
+					CompiledRuntimeCanaryScheduleID: test.compiledCanary,
+					CompiledRuntimeAllowAll:         test.allowAll,
+					PushEffectCanaryScheduleID:      test.effectCanary,
+				},
+			}
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr=%v", err, test.wantErr)
+			}
+			if !test.wantErr &&
+				cfg.Pipeline.PushEffectCanaryScheduleID != test.want {
+				t.Fatalf("push effect canary = %q, want %q",
+					cfg.Pipeline.PushEffectCanaryScheduleID, test.want)
+			}
+		})
+	}
+}
+
+func TestPushEffectCanaryLoadsFromPureEnvironment(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("VANE_DB_URL", "postgres://env")
+	t.Setenv("VANE_PIPELINE_COMPILED_RUNTIME_ENABLED", "true")
+	t.Setenv(
+		"VANE_PIPELINE_COMPILED_RUNTIME_CANARY_SCHEDULE_ID",
+		"push-effect-task",
+	)
+	t.Setenv(
+		"VANE_PIPELINE_PUSH_EFFECT_CANARY_SCHEDULE_ID",
+		"push-effect-task",
+	)
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pipeline.PushEffectCanaryScheduleID != "push-effect-task" {
+		t.Fatalf("pure env push effect canary = %q",
+			cfg.Pipeline.PushEffectCanaryScheduleID)
+	}
+}
+
 func TestObservationCanaryValidation(t *testing.T) {
 	tests := []struct {
 		name          string
