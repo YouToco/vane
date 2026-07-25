@@ -520,6 +520,104 @@ func TestCommitAgentSessionTurnRejectsProjectionBatchMismatchAtomically(
 	assertAgentTurnCommitLeftNoMutation(t, f)
 }
 
+func TestCommitAgentSessionTurnPostWriteAuditMismatchRollsBackAndKeepsBaseReusable(
+	t *testing.T,
+) {
+	f := newAgentEventFixture(t)
+	ctx := t.Context()
+	base := agentledger.SessionProjection{
+		Messages:       json.RawMessage(`[]`),
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	desired := agentledger.SessionProjection{
+		Messages: json.RawMessage(
+			`[{"role":"user","content":"correct"}]`,
+		),
+		TurnCount:      1,
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	const failedTurnID = "turn-post-write-audit-mismatch"
+	failedBatch := projectionSnapshotBatch(
+		t, f.scopeA(), failedTurnID, base, desired, "",
+	)
+	poisonProjection := agentledger.SessionProjection{
+		Messages: json.RawMessage(
+			`[{"role":"user","content":"storage-mismatch"}]`,
+		),
+		TurnCount:      1,
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	poisonBatch := projectionSnapshotBatch(
+		t, f.scopeA(), failedTurnID, base, poisonProjection, "",
+	)
+	poisonEvent, err := agentledger.Canonicalize(poisonBatch.Events[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mismatchStore := *f.store
+	mismatchStore.beginTx = func(
+		ctx context.Context,
+		options pgx.TxOptions,
+	) (pgx.Tx, error) {
+		tx, err := f.store.pool.BeginTx(ctx, options)
+		if err != nil {
+			return nil, err
+		}
+		return &corruptAgentEventInsertTx{
+			Tx: tx, targetInsert: 2,
+			payload: poisonEvent.Payload(), payloadDigest: poisonEvent.Digest(),
+		}, nil
+	}
+	if _, err := mismatchStore.CommitAgentSessionTurn(
+		ctx, desired, failedBatch,
+	); !errors.Is(err, types.ErrInternal) {
+		t.Fatalf("post-write projection mismatch error=%v, want internal", err)
+	}
+	assertAgentTurnCommitLeftNoMutation(t, f)
+	var failedKeyRows int
+	if err := f.store.pool.QueryRow(ctx, `
+		SELECT count(*) FROM agent_events
+		 WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+		   AND batch_idempotency_key=$4`,
+		f.tenantA, f.userA, f.sessionA, failedBatch.IdempotencyKey,
+	).Scan(&failedKeyRows); err != nil {
+		t.Fatal(err)
+	}
+	if failedKeyRows != 0 {
+		t.Fatalf("rolled-back mismatch retained %d rows for key %q",
+			failedKeyRows, failedBatch.IdempotencyKey)
+	}
+
+	const successTurnID = "turn-after-post-write-audit-mismatch"
+	successBatch := projectionSnapshotBatch(
+		t, f.scopeA(), successTurnID, base, desired, "",
+	)
+	audit, err := f.store.CommitAgentSessionTurn(ctx, desired, successBatch)
+	if err != nil {
+		t.Fatalf("same base was contaminated by rolled-back mismatch: %v", err)
+	}
+	if !audit.Match {
+		t.Fatalf("correct retry audit=%+v", audit)
+	}
+	events, err := f.store.ReplayAgentEvents(ctx, f.scopeA())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != len(successBatch.Events) {
+		t.Fatalf("replayed events=%d want=%d", len(events), len(successBatch.Events))
+	}
+	for i := range events {
+		if events[i].Sequence != int64(i+1) ||
+			events[i].IdempotencyKey != successBatch.IdempotencyKey {
+			t.Fatalf("event[%d] sequence/key=%d/%q want=%d/%q",
+				i, events[i].Sequence, events[i].IdempotencyKey,
+				i+1, successBatch.IdempotencyKey)
+		}
+	}
+	assertStoredAgentSessionProjection(t, f, desired)
+}
+
 func TestCommitAgentSessionTurnRejectsIllegalSnapshotGenerationAtomically(
 	t *testing.T,
 ) {
@@ -910,6 +1008,32 @@ func (tx *failSecondAgentEventInsertTx) QueryRow(
 		}
 	}
 	return tx.Tx.QueryRow(ctx, sql, args...)
+}
+
+type corruptAgentEventInsertTx struct {
+	pgx.Tx
+	inserts       int
+	targetInsert  int
+	payload       []byte
+	payloadDigest string
+}
+
+func (tx *corruptAgentEventInsertTx) QueryRow(
+	ctx context.Context,
+	sql string,
+	args ...any,
+) pgx.Row {
+	if !strings.Contains(sql, "INSERT INTO agent_events") {
+		return tx.Tx.QueryRow(ctx, sql, args...)
+	}
+	tx.inserts++
+	if tx.inserts != tx.targetInsert {
+		return tx.Tx.QueryRow(ctx, sql, args...)
+	}
+	corruptedArgs := append([]any(nil), args...)
+	corruptedArgs[9] = tx.payload
+	corruptedArgs[10] = tx.payloadDigest
+	return tx.Tx.QueryRow(ctx, sql, corruptedArgs...)
 }
 
 type agentEventErrorRow struct {

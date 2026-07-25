@@ -357,13 +357,7 @@ func (s *Store) CommitAgentSessionTurn(
 	if err != nil {
 		return agentledger.ProjectionShadowAudit{}, err
 	}
-	if !audit.Match ||
-		!constantTimeAgentEventDigestEqual(
-			audit.LegacyDigest, desiredDigest,
-		) ||
-		!constantTimeAgentEventDigestEqual(
-			audit.EventDigest, desiredDigest,
-		) {
+	if !audit.Match {
 		return agentledger.ProjectionShadowAudit{}, agentEventIntegrityError()
 	}
 	if err := tx.Commit(ctx); err != nil {
