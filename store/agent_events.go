@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -47,6 +48,9 @@ func (s *Store) AppendAgentEvents(
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 	}()
 
+	if err := setAgentEventTenantContext(ctx, tx, batch.Scope.TenantID); err != nil {
+		return nil, err
+	}
 	if err := lockAgentEventSession(ctx, tx, batch.Scope); err != nil {
 		return nil, err
 	}
@@ -69,32 +73,11 @@ func (s *Store) AppendAgentEvents(
 		return existing, nil
 	}
 
-	nextSequence, err := nextAgentEventSequence(ctx, tx, batch.Scope)
+	inserted, err := insertAgentEventBatch(
+		ctx, tx, batch, canonical, batchDigest,
+	)
 	if err != nil {
 		return nil, err
-	}
-	inserted := make([]agentledger.Event, 0, len(canonical))
-	for i := range canonical {
-		event, scanErr := scanAgentEvent(tx.QueryRow(ctx,
-			`INSERT INTO agent_events (
-				tenant_id, user_id, session_id, sequence,
-				batch_idempotency_key, batch_index, batch_size,
-				kind, schema_version, payload, payload_digest, batch_digest
-			 ) VALUES (
-				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-			 ) RETURNING `+agentEventColumns,
-			batch.Scope.TenantID, batch.Scope.UserID, batch.Scope.SessionID,
-			nextSequence+int64(i), batch.IdempotencyKey, i, len(canonical),
-			string(canonical[i].Kind()), agentledger.SchemaVersion,
-			canonical[i].Payload(), canonical[i].Digest(), batchDigest,
-		))
-		if scanErr != nil {
-			return nil, agentEventDatabaseError("insert agent event", scanErr)
-		}
-		if _, validateErr := validateStoredAgentEvent(event); validateErr != nil {
-			return nil, validateErr
-		}
-		inserted = append(inserted, event)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, agentEventDatabaseError("commit agent event append transaction", err)
@@ -123,6 +106,9 @@ func (s *Store) ListAgentEvents(
 	defer func() {
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 	}()
+	if err := setAgentEventTenantContext(ctx, tx, scope.TenantID); err != nil {
+		return nil, err
+	}
 	rows, err := tx.Query(ctx,
 		`SELECT `+agentEventColumns+`
 		   FROM agent_events
@@ -184,7 +170,8 @@ func (s *Store) ListAgentEvents(
 
 // ReplayAgentEvents reads a repeatable snapshot of the full session ledger and
 // proves sequence continuity, complete atomic batches, and every payload/batch
-// digest. Projection building is deliberately deferred to 7.7-B.
+// digest. 7.7-B's retained projector consumes only rows returned by this
+// integrity boundary.
 func (s *Store) ReplayAgentEvents(
 	ctx context.Context,
 	scope agentledger.Scope,
@@ -199,9 +186,230 @@ func (s *Store) ReplayAgentEvents(
 	defer func() {
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 	}()
+	if err := setAgentEventTenantContext(ctx, tx, scope.TenantID); err != nil {
+		return nil, err
+	}
 	if err := requireAgentEventSession(ctx, tx, scope); err != nil {
 		return nil, err
 	}
+	events, err := loadCompleteAgentEventLedger(ctx, tx, scope)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, agentEventDatabaseError("commit agent event replay transaction", err)
+	}
+	return events, nil
+}
+
+// CommitAgentSessionTurn atomically keeps agent_sessions as the primary
+// projection and appends one self-contained normal-turn event generation.
+// Exact response-loss replay never overwrites a later session projection.
+func (s *Store) CommitAgentSessionTurn(
+	ctx context.Context,
+	projection agentledger.SessionProjection,
+	batch agentledger.AppendBatch,
+) (agentledger.ProjectionShadowAudit, error) {
+	canonical, batchDigest, err := prepareAgentEventBatch(batch)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, err
+	}
+	batchProjection, err := agentledger.ProjectCanonicalSessionSnapshot(canonical)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventValidationError(
+				"agent session event batch is not a complete projection snapshot",
+			)
+	}
+	desiredDigest, err := agentledger.ProjectionDigest(projection)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventValidationError("agent session projection is invalid")
+	}
+	batchProjectionDigest, err := agentledger.ProjectionDigest(batchProjection)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventValidationError(
+				"agent session event batch projection is invalid",
+			)
+	}
+
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventDatabaseError("begin agent session dual-write transaction", err)
+	}
+	defer func() {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+	}()
+	if err := setAgentEventRuntimeContext(
+		ctx, tx, batch.Scope.TenantID,
+	); err != nil {
+		return agentledger.ProjectionShadowAudit{}, err
+	}
+
+	current, err := loadAgentSessionProjectionForUpdate(ctx, tx, batch.Scope)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, err
+	}
+	beforeEvents, err := loadCompleteAgentEventLedger(ctx, tx, batch.Scope)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, err
+	}
+	priorState := comparePriorAgentSessionProjection(current, beforeEvents)
+
+	existing, err := loadAgentEventBatch(
+		ctx, tx, batch.Scope, batch.IdempotencyKey,
+	)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, err
+	}
+	if len(existing) > 0 {
+		if err := validateAgentEventReplay(
+			existing, canonical, batchDigest,
+		); err != nil {
+			return agentledger.ProjectionShadowAudit{}, err
+		}
+		if !constantTimeAgentEventDigestEqual(
+			batchProjectionDigest, desiredDigest,
+		) {
+			return agentledger.ProjectionShadowAudit{},
+				agentEventValidationError(
+					"agent session event batch does not match projection",
+				)
+		}
+		audit, err := auditAgentSessionProjection(current, beforeEvents, priorState)
+		if err != nil {
+			return agentledger.ProjectionShadowAudit{}, err
+		}
+		if !audit.Match {
+			return agentledger.ProjectionShadowAudit{}, agentEventIntegrityError()
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return agentledger.ProjectionShadowAudit{},
+				agentEventDatabaseError(
+					"commit agent session dual-write replay transaction", err,
+				)
+		}
+		return audit, nil
+	}
+
+	if !constantTimeAgentEventDigestEqual(
+		batchProjectionDigest, desiredDigest,
+	) {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventValidationError(
+				"agent session event batch does not match projection",
+			)
+	}
+	baseDigest, err := agentledger.ProjectionSnapshotBaseDigest(canonical[0])
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventValidationError("agent session snapshot base is invalid")
+	}
+	currentDigest, err := agentledger.ProjectionDigest(current)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, agentEventIntegrityError()
+	}
+	if !constantTimeAgentEventDigestEqual(baseDigest, currentDigest) {
+		return agentledger.ProjectionShadowAudit{},
+			agentSessionProjectionConflict()
+	}
+
+	inserted, err := insertAgentEventBatch(
+		ctx, tx, batch, canonical, batchDigest,
+	)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, err
+	}
+	messages := projection.Messages
+	if len(messages) == 0 {
+		messages = json.RawMessage("[]")
+	}
+	activatedTools := projection.ActivatedTools
+	if len(activatedTools) == 0 {
+		activatedTools = json.RawMessage("[]")
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE agent_sessions
+		    SET messages=$4, turn_count=$5, activated_tools=$6,
+		        updated_at=now()
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		batch.Scope.SessionID, batch.Scope.TenantID, batch.Scope.UserID,
+		messages, projection.TurnCount, activatedTools,
+	)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventDatabaseError("update agent session primary projection", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return agentledger.ProjectionShadowAudit{}, agentEventNotFound()
+	}
+
+	allEvents := append([]agentledger.Event(nil), beforeEvents...)
+	allEvents = append(allEvents, inserted...)
+	updated := agentledger.SessionProjection{
+		Messages:       messages,
+		TurnCount:      projection.TurnCount,
+		ActivatedTools: activatedTools,
+	}
+	audit, err := auditAgentSessionProjection(updated, allEvents, priorState)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, err
+	}
+	if !audit.Match {
+		return agentledger.ProjectionShadowAudit{}, agentEventIntegrityError()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventDatabaseError("commit agent session dual-write transaction", err)
+	}
+	return audit, nil
+}
+
+func insertAgentEventBatch(
+	ctx context.Context,
+	tx pgx.Tx,
+	batch agentledger.AppendBatch,
+	canonical []agentledger.CanonicalEvent,
+	batchDigest string,
+) ([]agentledger.Event, error) {
+	nextSequence, err := nextAgentEventSequence(ctx, tx, batch.Scope)
+	if err != nil {
+		return nil, err
+	}
+	inserted := make([]agentledger.Event, 0, len(canonical))
+	for i := range canonical {
+		event, scanErr := scanAgentEvent(tx.QueryRow(ctx,
+			`INSERT INTO agent_events (
+				tenant_id, user_id, session_id, sequence,
+				batch_idempotency_key, batch_index, batch_size,
+				kind, schema_version, payload, payload_digest, batch_digest
+			 ) VALUES (
+				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+			 ) /* agent event tenant FK lock order */
+			 RETURNING `+agentEventColumns,
+			batch.Scope.TenantID, batch.Scope.UserID, batch.Scope.SessionID,
+			nextSequence+int64(i), batch.IdempotencyKey, i, len(canonical),
+			string(canonical[i].Kind()), agentledger.SchemaVersion,
+			canonical[i].Payload(), canonical[i].Digest(), batchDigest,
+		))
+		if scanErr != nil {
+			return nil, agentEventDatabaseError("insert agent event", scanErr)
+		}
+		if _, validateErr := validateStoredAgentEvent(event); validateErr != nil {
+			return nil, validateErr
+		}
+		inserted = append(inserted, event)
+	}
+	return inserted, nil
+}
+
+func loadCompleteAgentEventLedger(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope agentledger.Scope,
+) ([]agentledger.Event, error) {
 	rows, err := tx.Query(ctx,
 		`SELECT `+agentEventColumns+`
 		   FROM agent_events
@@ -229,10 +437,144 @@ func (s *Store) ReplayAgentEvents(
 	if err := validateCompleteAgentEventLedger(scope, events); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, agentEventDatabaseError("commit agent event replay transaction", err)
-	}
 	return events, nil
+}
+
+func setAgentEventTenantContext(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID int64,
+) error {
+	if tenantID <= 0 {
+		return agentEventValidationError("agent event tenant is invalid")
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id', $1, true)`,
+		fmt.Sprintf("%d", tenantID),
+	); err != nil {
+		return agentEventDatabaseError("set agent event tenant context", err)
+	}
+	return nil
+}
+
+func setAgentEventRuntimeContext(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID int64,
+) error {
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		return agentEventDatabaseError("set agent event runtime role", err)
+	}
+	return setAgentEventTenantContext(ctx, tx, tenantID)
+}
+
+func loadAgentSessionProjectionForUpdate(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope agentledger.Scope,
+) (agentledger.SessionProjection, error) {
+	var projection agentledger.SessionProjection
+	err := tx.QueryRow(ctx,
+		`SELECT messages, turn_count, activated_tools
+		   FROM agent_sessions
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		  FOR UPDATE /* agent ledger normal-turn session lock */`,
+		scope.SessionID, scope.TenantID, scope.UserID,
+	).Scan(
+		&projection.Messages,
+		&projection.TurnCount,
+		&projection.ActivatedTools,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return agentledger.SessionProjection{}, agentEventNotFound()
+	}
+	if err != nil {
+		return agentledger.SessionProjection{},
+			agentEventDatabaseError("lock agent session primary projection", err)
+	}
+	return projection, nil
+}
+
+func comparePriorAgentSessionProjection(
+	legacy agentledger.SessionProjection,
+	events []agentledger.Event,
+) string {
+	if len(events) == 0 {
+		return "uninitialized"
+	}
+	projected, err := agentledger.ProjectLatestSessionSnapshot(events)
+	if err != nil {
+		return "unsupported_event_history"
+	}
+	legacyDigest, err := agentledger.ProjectionDigest(legacy)
+	if err != nil {
+		return "invalid_legacy_projection"
+	}
+	eventDigest, err := agentledger.ProjectionDigest(projected)
+	if err != nil {
+		return "invalid_event_projection"
+	}
+	if constantTimeAgentEventDigestEqual(legacyDigest, eventDigest) {
+		return "match"
+	}
+	// The known unsupported writers are AppendAgentSessionMessages and the two
+	// restricted receipt transactions. 7.7-B records/resynchronizes this drift
+	// but does not pretend those paths are transactionally dual-written.
+	return "unsupported_writer_or_projection_drift"
+}
+
+func auditAgentSessionProjection(
+	legacy agentledger.SessionProjection,
+	events []agentledger.Event,
+	priorState string,
+) (agentledger.ProjectionShadowAudit, error) {
+	projected, err := agentledger.ProjectLatestSessionSnapshot(events)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, agentEventIntegrityError()
+	}
+	legacyDigest, err := agentledger.ProjectionDigest(legacy)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, agentEventIntegrityError()
+	}
+	eventDigest, err := agentledger.ProjectionDigest(projected)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, agentEventIntegrityError()
+	}
+	legacyCount, err := agentSessionProjectionMessageCount(legacy.Messages)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, agentEventIntegrityError()
+	}
+	eventCount, err := agentSessionProjectionMessageCount(projected.Messages)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, agentEventIntegrityError()
+	}
+	match := constantTimeAgentEventDigestEqual(legacyDigest, eventDigest)
+	reason := "match"
+	switch {
+	case !match:
+		reason = "projection_mismatch"
+	case priorState == "uninitialized":
+		reason = "initialized"
+	case priorState != "match":
+		reason = "resynced_after_" + priorState
+	}
+	return agentledger.ProjectionShadowAudit{
+		Match:              match,
+		PriorState:         priorState,
+		Reason:             reason,
+		LegacyDigest:       legacyDigest,
+		EventDigest:        eventDigest,
+		LegacyMessageCount: legacyCount,
+		EventMessageCount:  eventCount,
+	}, nil
+}
+
+func agentSessionProjectionMessageCount(raw json.RawMessage) (int, error) {
+	var messages []json.RawMessage
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		return 0, err
+	}
+	return len(messages), nil
 }
 
 func prepareAgentEventBatch(
@@ -571,6 +913,11 @@ func agentEventNotFound() error {
 func agentEventConflict() error {
 	return types.NewAppError(types.CodeConflict,
 		"agent event idempotency key has different canonical bytes", nil)
+}
+
+func agentSessionProjectionConflict() error {
+	return types.NewAppError(types.CodeConflict,
+		"agent session projection changed before dual-write commit", nil)
 }
 
 func agentEventIntegrityError() error {

@@ -76,16 +76,16 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 	}
 	defer rollbackTaskCreationTransaction(ctx, tx)
 
-	// All v1 paths which need both identity/capacity locks and the operation row
-	// take them in this order. In particular, exact Create replay already holds
-	// the membership before it waits on pending_actions; reversing the order here
-	// creates a real PostgreSQL deadlock under recovery.
-	if err := lockValidMembershipForTaskCreation(
-		ctx, tx, p.Lease.TenantID, p.Lease.UserID); err != nil {
-		return err
-	}
 	op, _, err := loadLeasedTaskCreationOperation(ctx, tx, p.Lease)
 	if err != nil {
+		return err
+	}
+	// The durable operation is the root for every existing v1 creation saga.
+	// Purge fences the same row before schedules, receipts, sessions, and the
+	// final tenant delete. Capacity locks follow it and never participate in
+	// tenant purge because users may be shared across tenants.
+	if err := lockValidMembershipForTaskCreation(
+		ctx, tx, p.Lease.TenantID, p.Lease.UserID); err != nil {
 		return err
 	}
 	if err := validateTaskCreationDefinitionCommitBinding(op, p); err != nil {
@@ -189,11 +189,11 @@ func (s *Store) BeginTaskCreationActivation(
 		return false, taskCreationDatabaseError("begin activation authorization", err)
 	}
 	defer rollbackTaskCreationTransaction(ctx, tx)
-	if err := lockValidMembership(ctx, tx, lease.TenantID, lease.UserID); err != nil {
-		return false, err
-	}
 	op, _, err := loadLeasedTaskCreationOperation(ctx, tx, lease)
 	if err != nil {
+		return false, err
+	}
+	if err := lockValidMembership(ctx, tx, lease.TenantID, lease.UserID); err != nil {
 		return false, err
 	}
 	if op.TaskID != taskID || !taskCreationBindingStateComplete(op) {
@@ -272,11 +272,11 @@ func (s *Store) CommitTaskCreationActivation(
 		return taskCreationDatabaseError("begin activation commit", err)
 	}
 	defer rollbackTaskCreationTransaction(ctx, tx)
-	if err := lockValidMembership(ctx, tx, lease.TenantID, lease.UserID); err != nil {
-		return err
-	}
 	op, _, err := loadLeasedTaskCreationOperation(ctx, tx, lease)
 	if err != nil {
+		return err
+	}
+	if err := lockValidMembership(ctx, tx, lease.TenantID, lease.UserID); err != nil {
 		return err
 	}
 	if op.TaskID != taskID || !taskCreationBindingStateComplete(op) {
@@ -829,7 +829,8 @@ func lockValidMembershipForTaskCreation(
 		   JOIN users u ON u.id = m.user_id
 		  WHERE m.tenant_id = $1 AND m.user_id = $2
 		    AND t.status = 'active' AND t.deleted_at IS NULL
-		  FOR UPDATE OF u, m FOR SHARE OF t`,
+		  FOR UPDATE OF u, m FOR SHARE OF t
+		  /* task creation membership lock order */`,
 		tenantID, userID,
 	).Scan(&valid)
 	if err != nil {

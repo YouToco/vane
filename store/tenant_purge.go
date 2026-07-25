@@ -173,15 +173,44 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			types.CodeDatabase, "锁定租户清理准入根", err)
 	}
 
-	// Definition edit transactions globally lock schedule → operation → receipt.
-	// Purge must join that order before its FK-safe child-first DELETE sequence:
-	// deleting an operation fires schedules' ON DELETE SET NULL and otherwise
-	// creates operation → schedule, the exact reverse edge of an edit worker.
-	// Drain every ordered SELECT so PostgreSQL really acquires all row locks.
-	definitionEditLocks := []struct {
+	// Across the purge/coordinator/receipt/session conflict set, every path
+	// follows this shared partial order (including FK-acquired parent locks):
+	//
+	//   task-creation operation -> membership/user capacity -> schedule
+	//   task-creation operation -> task-creation receipt -> session
+	//   schedule -> definition-edit operation -> definition-edit receipt -> session
+	//   session -> agent event -> tenant (event FK)
+	//   every tenant-owned child -> tenant delete
+	//
+	// Purge deliberately does not pre-lock tenant, membership, or the shared
+	// user capacity row. Tenant is the FK parent reached last by normal turns
+	// and definition-edit creation, while users can span tenants and must never
+	// be pulled into a tenant-wide purge. Existing Task Creation sagas use their
+	// pending_action as the root before any identity/capacity or aggregate lock.
+	//
+	// The two receipt dispatchers really lock their receipt before updating the
+	// session. Definition-edit coordinators lock schedule -> operation before
+	// inserting/verifying the receipt; task-creation coordinators lock the
+	// pending action before inserting its receipt. Purge must therefore lock
+	// both complete parent/receipt chains before any session. Its old
+	// session-first prelock formed receipt -> session -> receipt with either
+	// dispatcher and could raise PostgreSQL 40P01.
+	//
+	// These are tenant-scoped row locks, drained in stable primary-key order;
+	// no table-wide or cross-tenant lock is used. They precede the FK-safe
+	// child-first DELETE sequence, whose statement order need not equal lock
+	// order once every conflicting row is already fenced.
+	purgeLocks := []struct {
 		name  string
 		query string
 	}{
+		{
+			name: "pending_actions",
+			query: `SELECT id FROM pending_actions
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge task-creation lock order */`,
+		},
 		{
 			name: "schedules",
 			query: `SELECT id FROM schedules
@@ -201,10 +230,24 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			query: `SELECT id FROM task_definition_edit_receipts
 			         WHERE tenant_id = $1
 			         ORDER BY id
-			         FOR UPDATE /* tenant purge definition-edit lock order */`,
+			         FOR UPDATE /* tenant purge definition-edit receipt lock order */`,
+		},
+		{
+			name: "task_creation_receipts",
+			query: `SELECT id FROM task_creation_receipts
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge task-creation receipt lock order */`,
+		},
+		{
+			name: "agent_sessions",
+			query: `SELECT id FROM agent_sessions
+			         WHERE tenant_id = $1
+			         ORDER BY id
+			         FOR UPDATE /* tenant purge agent-session lock order */`,
 		},
 	}
-	for _, lock := range definitionEditLocks {
+	for _, lock := range purgeLocks {
 		rows, lockErr := tx.Query(ctx, lock.query, tenantID)
 		if lockErr != nil {
 			return nil, types.NewAppError(types.CodeDatabase,

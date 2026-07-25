@@ -1,13 +1,21 @@
 package store
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/YouToco/vane/agentledger"
 	"github.com/YouToco/vane/types"
 )
 
@@ -594,6 +602,608 @@ func TestPurgeTenant_DefinitionEditLockOrderDoesNotDeadlock(t *testing.T) {
 	}
 }
 
+func TestPurgeTenant_DefinitionEditReceiptWorkerDoesNotDeadlock(t *testing.T) {
+	st := purgeStore(t)
+	tenantID := seedPurgeTenant(t, st)
+	ctx := t.Context()
+
+	var receiptID, userID, sessionID int64
+	if err := st.pool.QueryRow(ctx, `
+		UPDATE task_definition_edit_receipts
+		   SET status='pending', next_attempt_at=clock_timestamp()-interval '1 second',
+		       lease_owner='', lease_until=NULL, takeover_not_before=NULL,
+		       session_recorded_at=NULL, session_messages_digest='',
+		       provider_message_id='', sent_at=NULL
+		 WHERE tenant_id=$1
+		 RETURNING id, user_id, session_id`,
+		tenantID,
+	).Scan(&receiptID, &userID, &sessionID); err != nil {
+		t.Fatalf("准备 Definition Edit receipt worker 夹具失败: %v", err)
+	}
+	receipt, err := st.AcquireTaskDefinitionEditReceipt(
+		ctx, types.AcquireTaskDefinitionEditReceiptParams{
+			ID: receiptID, TenantID: tenantID, UserID: userID,
+			LeaseOwner:    "purge-definition-receipt-worker",
+			LeaseDuration: 10 * time.Minute,
+		},
+	)
+	if err != nil {
+		t.Fatalf("领取 Definition Edit receipt 失败: %v", err)
+	}
+	report := runPurgeAgainstPausedReceiptWorker(
+		t, st, tenantID,
+		"task_definition_edit_receipts",
+		"%tenant purge definition-edit receipt lock order%",
+		func(workerStore *Store) error {
+			return workerStore.RecordTaskDefinitionEditReceiptSessionMessages(
+				ctx, receipt.Lease(),
+				json.RawMessage(`[{"role":"user","content":"definition receipt"}]`),
+			)
+		},
+	)
+	if report.Rows["task_definition_edit_receipts"] != 1 ||
+		report.Rows["agent_sessions"] == 0 {
+		t.Fatalf("Definition Edit receipt purge report=%+v", report)
+	}
+	assertPurgedReceiptWorkerRows(t, st, tenantID)
+}
+
+func TestPurgeTenant_TaskCreationReceiptWorkerDoesNotDeadlock(t *testing.T) {
+	st := purgeStore(t)
+	tenantID := seedPurgeTenant(t, st)
+	ctx := t.Context()
+
+	var userID, sessionID int64
+	if err := st.pool.QueryRow(ctx, `
+		SELECT user_id, id
+		  FROM agent_sessions
+		 WHERE tenant_id=$1
+		 ORDER BY id LIMIT 1`,
+		tenantID,
+	).Scan(&userID, &sessionID); err != nil {
+		t.Fatalf("查 Task Creation receipt worker scope 失败: %v", err)
+	}
+	fixture := &compiledTaskFixture{
+		st: st, tenantID: tenantID, userID: userID,
+	}
+	operationID := uuid.NewString()
+	create := taskCreationCreateParams(fixture, operationID)
+	create.SessionID = &sessionID
+	if _, err := st.CreateTaskCreationOperation(ctx, create); err != nil {
+		t.Fatalf("建 Task Creation operation 失败: %v", err)
+	}
+	if _, err := st.CancelTaskCreationOperation(
+		ctx,
+		taskCreationCancelParams(
+			operationID, tenantID, userID, "om_purge_creation_receipt",
+		),
+	); err != nil {
+		t.Fatalf("终态化 Task Creation operation 失败: %v", err)
+	}
+	receipt, err := st.LoadTaskCreationReceiptByOperation(
+		ctx, operationID, tenantID, userID,
+	)
+	if err != nil {
+		t.Fatalf("读取 Task Creation receipt 失败: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx, `
+		UPDATE task_creation_receipts
+		   SET next_attempt_at=clock_timestamp()-interval '1 second'
+		 WHERE id=$1`,
+		receipt.ID,
+	); err != nil {
+		t.Fatalf("设置 Task Creation receipt 到期失败: %v", err)
+	}
+	receipt, err = st.AcquireTaskCreationReceipt(
+		ctx, types.AcquireTaskCreationReceiptParams{
+			ID: receipt.ID, TenantID: tenantID, UserID: userID,
+			LeaseOwner:    "purge-creation-receipt-worker",
+			LeaseDuration: 10 * time.Minute,
+		},
+	)
+	if err != nil {
+		t.Fatalf("领取 Task Creation receipt 失败: %v", err)
+	}
+	report := runPurgeAgainstPausedReceiptWorker(
+		t, st, tenantID,
+		"task_creation_receipts",
+		"%tenant purge task-creation receipt lock order%",
+		func(workerStore *Store) error {
+			return workerStore.RecordTaskCreationReceiptSessionMessages(
+				ctx, receipt.Lease(),
+				json.RawMessage(`[{"role":"user","content":"creation receipt"}]`),
+			)
+		},
+	)
+	if report.Rows["task_creation_receipts"] != 1 ||
+		report.Rows["pending_actions"] != 1 ||
+		report.Rows["agent_sessions"] == 0 {
+		t.Fatalf("Task Creation receipt purge report=%+v", report)
+	}
+	assertPurgedReceiptWorkerRows(t, st, tenantID)
+}
+
+func TestPurgeTenant_TaskCreationCoordinatorOperationFirstDoesNotDeadlock(t *testing.T) {
+	st := purgeStore(t)
+	fixture := newCompiledTaskFixture(t, st)
+	cleanupA5Fixture(t, st, fixture)
+	ctx := t.Context()
+	commit := preparedA5Commit(t, st, fixture, "purge-operation-first")
+
+	blocker, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(context.WithoutCancel(ctx)) }()
+	var membershipUserID int64
+	if err := blocker.QueryRow(ctx, `
+		SELECT user_id FROM memberships
+		 WHERE tenant_id=$1 AND user_id=$2
+		 FOR UPDATE`,
+		fixture.tenantID, fixture.userID,
+	).Scan(&membershipUserID); err != nil {
+		t.Fatalf("锁 Task Creation membership blocker 失败: %v", err)
+	}
+
+	coordinatorDone := make(chan error, 1)
+	go func() {
+		coordinatorDone <- st.CommitPausedCompiledTaskDefinitionForCreation(
+			ctx, commit,
+		)
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%task creation membership lock order%",
+		"Task Creation coordinator 未在持有 operation 后等待 membership",
+	)
+
+	var lockedOperationID string
+	err = st.pool.QueryRow(ctx, `
+		SELECT id FROM pending_actions
+		 WHERE id=$1 AND tenant_id=$2
+		 FOR UPDATE NOWAIT`,
+		commit.Lease.ID, fixture.tenantID,
+	).Scan(&lockedOperationID)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("coordinator 未真实先持有 operation UPDATE 锁: id=%q err=%v",
+			lockedOperationID, err)
+	}
+
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, purgeErr := st.PurgeTenant(ctx, fixture.tenantID, false)
+		purgeDone <- purgeResult{report: report, err: purgeErr}
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%tenant purge task-creation lock order%",
+		"tenant purge 未先等待 coordinator 的 operation 根锁",
+	)
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("释放 Task Creation membership blocker 失败: %v", err)
+	}
+	select {
+	case err := <-coordinatorDone:
+		if err != nil {
+			t.Fatalf("Task Creation coordinator 与 purge 并发失败: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Task Creation coordinator 未在 membership blocker 释放后收敛")
+	}
+	select {
+	case result := <-purgeDone:
+		if result.err != nil {
+			t.Fatalf("tenant purge 与 Task Creation coordinator 并发失败: %v",
+				result.err)
+		}
+		if result.report == nil || result.report.Rows["tenants"] != 1 ||
+			result.report.Rows["pending_actions"] != 1 {
+			t.Fatalf("tenant purge 报告异常: %+v", result.report)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant purge 未在 coordinator 释放根锁后收敛")
+	}
+	assertPurgedReceiptWorkerRows(t, st, fixture.tenantID)
+}
+
+func TestPurgeTenant_DefinitionEditScheduleThenTenantDoesNotDeadlock(t *testing.T) {
+	fixture := newTaskDefinitionEditEntrypointFixture(t, true)
+	st := fixture.store
+	ctx := t.Context()
+	frozen := fixture.buildProposal(
+		t, fixture.databaseNow(t).Add(time.Hour), "purge-definition-edit-lock-order",
+	)
+
+	blocker, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(context.WithoutCancel(ctx)) }()
+	var tenantID int64
+	if err := blocker.QueryRow(ctx, `
+		SELECT id FROM tenants
+		 WHERE id=$1
+		 FOR UPDATE`,
+		fixture.base.TenantID,
+	).Scan(&tenantID); err != nil {
+		t.Fatalf("锁 Definition Edit tenant blocker 失败: %v", err)
+	}
+
+	editDone := make(chan error, 1)
+	go func() {
+		_, createErr := st.CreateTaskDefinitionEditOperation(
+			ctx, taskDefinitionEditCreateParams(frozen),
+		)
+		editDone <- createErr
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%task definition edit tenant lock order%",
+		"Definition Edit creation 未在持有 schedule 后等待 tenant",
+	)
+
+	var lockedTaskID string
+	err = st.pool.QueryRow(ctx, `
+		SELECT id FROM schedules
+		 WHERE tenant_id=$1 AND id=$2
+		 FOR UPDATE NOWAIT`,
+		fixture.base.TenantID, fixture.base.TaskID,
+	).Scan(&lockedTaskID)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("Definition Edit creation 未真实持有 schedule UPDATE 锁: id=%q err=%v",
+			lockedTaskID, err)
+	}
+
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, purgeErr := st.PurgeTenant(ctx, fixture.base.TenantID, false)
+		purgeDone <- purgeResult{report: report, err: purgeErr}
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%tenant purge task-creation lock order%",
+		"tenant purge 未等待 Definition Edit 已持有的 provenance 根锁",
+	)
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("释放 Definition Edit tenant blocker 失败: %v", err)
+	}
+	select {
+	case err := <-editDone:
+		if err != nil {
+			t.Fatalf("Definition Edit creation 与 purge 并发失败: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Definition Edit creation 未在 tenant blocker 释放后收敛")
+	}
+	select {
+	case result := <-purgeDone:
+		if result.err != nil {
+			t.Fatalf("tenant purge 与 Definition Edit creation 并发失败: %v",
+				result.err)
+		}
+		if result.report == nil || result.report.Rows["tenants"] != 1 ||
+			result.report.Rows["task_definition_edit_operations"] != 1 {
+			t.Fatalf("tenant purge 报告异常: %+v", result.report)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant purge 未在 Definition Edit creation 释放锁后收敛")
+	}
+	assertPurgedReceiptWorkerRows(t, st, fixture.base.TenantID)
+}
+
+func TestPurgeTenantRemovesAgentTurnCommittedBeforeSessionFence(t *testing.T) {
+	st := purgeStore(t)
+	tenantID := seedPurgeTenant(t, st)
+	ctx := t.Context()
+
+	var scope agentledger.Scope
+	var taskID string
+	var base agentledger.SessionProjection
+	if err := st.pool.QueryRow(ctx, `
+		SELECT m.tenant_id, m.user_id,
+		       (SELECT id FROM schedules WHERE tenant_id=m.tenant_id LIMIT 1)
+		  FROM memberships m
+		 WHERE m.tenant_id=$1
+		 ORDER BY m.user_id
+		 LIMIT 1`,
+		tenantID,
+	).Scan(
+		&scope.TenantID, &scope.UserID, &taskID,
+	); err != nil {
+		t.Fatalf("查 purge/Commit 并发夹具失败: %v", err)
+	}
+	if err := st.pool.QueryRow(ctx, `
+		INSERT INTO agent_sessions (tenant_id, user_id)
+		VALUES ($1, $2)
+		RETURNING id, messages, turn_count, activated_tools`,
+		scope.TenantID, scope.UserID,
+	).Scan(
+		&scope.SessionID, &base.Messages, &base.TurnCount, &base.ActivatedTools,
+	); err != nil {
+		t.Fatalf("建 purge/Commit 干净 session 夹具失败: %v", err)
+	}
+	desired := agentledger.SessionProjection{
+		Messages: json.RawMessage(
+			`[{"role":"user","content":"concurrent purge"}]`,
+		),
+		TurnCount:      1,
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	batch := projectionSnapshotBatch(
+		t, scope, "turn-concurrent-purge", base, desired, "",
+	)
+
+	blocker, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(context.WithoutCancel(ctx)) }()
+	var lockedTenantID int64
+	if err := blocker.QueryRow(ctx, `
+		SELECT id FROM tenants
+		 WHERE id=$1
+		 FOR UPDATE`,
+		tenantID,
+	).Scan(&lockedTenantID); err != nil {
+		t.Fatalf("锁 Agent turn tenant FK blocker 失败: %v", err)
+	}
+
+	commitDone := make(chan error, 1)
+	go func() {
+		_, commitErr := st.CommitAgentSessionTurn(ctx, desired, batch)
+		commitDone <- commitErr
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%agent event tenant FK lock order%",
+		"Agent turn 未在持有 session 后等待 event tenant FK",
+	)
+
+	var lockedSessionID int64
+	err = st.pool.QueryRow(ctx, `
+		SELECT id FROM agent_sessions
+		 WHERE id=$1 AND tenant_id=$2
+		 FOR UPDATE NOWAIT`,
+		scope.SessionID, tenantID,
+	).Scan(&lockedSessionID)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("Agent turn 未真实持有 session UPDATE 锁: id=%d err=%v",
+			lockedSessionID, err)
+	}
+
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, purgeErr := st.PurgeTenant(ctx, tenantID, false)
+		purgeDone <- purgeResult{report: report, err: purgeErr}
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%tenant purge agent-session lock order%",
+		"tenant purge 未在 tenant delete 前等待 Agent turn session 锁",
+	)
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("释放 Agent turn tenant FK blocker 失败: %v", err)
+	}
+	select {
+	case commitErr := <-commitDone:
+		if commitErr != nil {
+			t.Fatalf("Agent turn 与 purge 并发失败: %v", commitErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Agent turn 未在 tenant FK blocker 释放后收敛")
+	}
+
+	select {
+	case result := <-purgeDone:
+		if result.err != nil {
+			t.Fatalf("tenant purge 失败: %v", result.err)
+		}
+		if result.report == nil || result.report.Rows["tenants"] != 1 {
+			t.Fatalf("tenant purge 报告异常: %+v", result.report)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant purge 未在 blocker 释放后收敛")
+	}
+
+	var events, sessions, tenants int
+	if err := st.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM agent_events WHERE tenant_id=$1),
+			(SELECT count(*) FROM agent_sessions WHERE tenant_id=$1),
+			(SELECT count(*) FROM tenants WHERE id=$1)`,
+		tenantID,
+	).Scan(&events, &sessions, &tenants); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 || sessions != 0 || tenants != 0 {
+		t.Fatalf("purge residue events=%d sessions=%d tenants=%d",
+			events, sessions, tenants)
+	}
+}
+
+type pauseAfterReceiptLockTx struct {
+	pgx.Tx
+	table   string
+	locked  chan struct{}
+	resume  <-chan struct{}
+	lockOne sync.Once
+}
+
+func (tx *pauseAfterReceiptLockTx) QueryRow(
+	ctx context.Context,
+	sql string,
+	args ...any,
+) pgx.Row {
+	row := tx.Tx.QueryRow(ctx, sql, args...)
+	if !strings.Contains(sql, "FROM "+tx.table+" r") ||
+		!strings.Contains(sql, "FOR UPDATE OF r") {
+		return row
+	}
+	return pauseAfterReceiptLockRow{
+		Row: row,
+		pause: func() {
+			tx.lockOne.Do(func() {
+				close(tx.locked)
+				<-tx.resume
+			})
+		},
+	}
+}
+
+type pauseAfterReceiptLockRow struct {
+	pgx.Row
+	pause func()
+}
+
+func (row pauseAfterReceiptLockRow) Scan(dest ...any) error {
+	if err := row.Row.Scan(dest...); err != nil {
+		return err
+	}
+	row.pause()
+	return nil
+}
+
+func runPurgeAgainstPausedReceiptWorker(
+	t *testing.T,
+	st *Store,
+	tenantID int64,
+	receiptTable string,
+	purgeWaitPattern string,
+	worker func(*Store) error,
+) *PurgeReport {
+	t.Helper()
+	receiptLocked := make(chan struct{})
+	resumeWorker := make(chan struct{})
+	var resumeOnce sync.Once
+	resume := func() {
+		resumeOnce.Do(func() {
+			close(resumeWorker)
+		})
+	}
+	t.Cleanup(resume)
+	workerStore := *st
+	workerStore.beginTx = func(
+		ctx context.Context,
+		options pgx.TxOptions,
+	) (pgx.Tx, error) {
+		tx, err := st.pool.BeginTx(ctx, options)
+		if err != nil {
+			return nil, err
+		}
+		return &pauseAfterReceiptLockTx{
+			Tx: tx, table: receiptTable,
+			locked: receiptLocked, resume: resumeWorker,
+		}, nil
+	}
+
+	workerDone := make(chan error, 1)
+	go func() {
+		workerDone <- worker(&workerStore)
+	}()
+	select {
+	case <-receiptLocked:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s worker 未持有真实 receipt FOR UPDATE 锁", receiptTable)
+	}
+
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, err := st.PurgeTenant(t.Context(), tenantID, false)
+		purgeDone <- purgeResult{report: report, err: err}
+	}()
+	waitForDatabaseLockQuery(
+		t, st, purgeWaitPattern,
+		"tenant purge 未在 "+receiptTable+" 等待 worker receipt 锁",
+	)
+	resume()
+
+	select {
+	case err := <-workerDone:
+		if err != nil {
+			t.Fatalf("%s worker 与 purge 并发失败: %v", receiptTable, err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s worker 未在 purge 持有 session 前收敛", receiptTable)
+	}
+	select {
+	case result := <-purgeDone:
+		if result.err != nil {
+			t.Fatalf("tenant purge 与 %s worker 并发失败: %v",
+				receiptTable, result.err)
+		}
+		if result.report == nil || result.report.Rows["tenants"] != 1 {
+			t.Fatalf("tenant purge 报告异常: %+v", result.report)
+		}
+		return result.report
+	case <-time.After(10 * time.Second):
+		t.Fatalf("tenant purge 未在 %s worker 释放锁后收敛", receiptTable)
+		return nil
+	}
+}
+
+func assertPurgedReceiptWorkerRows(
+	t *testing.T,
+	st *Store,
+	tenantID int64,
+) {
+	t.Helper()
+	var (
+		editReceipts, editOperations, creationReceipts int
+		creationOperations, schedules, sessions        int
+		events, tenants                                int
+	)
+	if err := st.pool.QueryRow(t.Context(), `
+		SELECT
+			(SELECT count(*) FROM task_definition_edit_receipts WHERE tenant_id=$1),
+			(SELECT count(*) FROM task_definition_edit_operations WHERE tenant_id=$1),
+			(SELECT count(*) FROM task_creation_receipts WHERE tenant_id=$1),
+			(SELECT count(*) FROM pending_actions WHERE tenant_id=$1),
+			(SELECT count(*) FROM schedules WHERE tenant_id=$1),
+			(SELECT count(*) FROM agent_sessions WHERE tenant_id=$1),
+			(SELECT count(*) FROM agent_events WHERE tenant_id=$1),
+			(SELECT count(*) FROM tenants WHERE id=$1)`,
+		tenantID,
+	).Scan(
+		&editReceipts, &editOperations, &creationReceipts,
+		&creationOperations, &schedules, &sessions, &events, &tenants,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if editReceipts != 0 || editOperations != 0 ||
+		creationReceipts != 0 || creationOperations != 0 ||
+		schedules != 0 || sessions != 0 || events != 0 || tenants != 0 {
+		t.Fatalf(
+			"purge residue edit_receipts=%d edit_operations=%d "+
+				"creation_receipts=%d creation_operations=%d schedules=%d "+
+				"sessions=%d events=%d tenants=%d",
+			editReceipts, editOperations, creationReceipts, creationOperations,
+			schedules, sessions, events, tenants,
+		)
+	}
+}
+
 func waitForTenantPurgeDefinitionEditLock(t *testing.T, st *Store) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -615,6 +1225,39 @@ func waitForTenantPurgeDefinitionEditLock(t *testing.T, st *Store) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("tenant purge 未按 schedule-first 锁序等待")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForDatabaseLockQuery(
+	t *testing.T,
+	st *Store,
+	queryPattern string,
+	timeoutMessage string,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err := st.pool.QueryRow(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1
+				  FROM pg_stat_activity
+				 WHERE datname=current_database()
+				   AND pid<>pg_backend_pid()
+				   AND wait_event_type='Lock'
+				   AND query LIKE $1
+			)`,
+			queryPattern,
+		).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(timeoutMessage)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

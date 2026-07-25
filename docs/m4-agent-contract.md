@@ -170,6 +170,29 @@ reason，避免 provider finish_reason 漂移误触发工具。DeepSeek V4 的�
 可回放样本位于 `llm/testdata/conformance/assistant_turns.json`；新增 provider 或观察到新的
 wire 漂移时先追加脱敏样本，再修改适配规则。
 
+### 4.2 Agent 事件账本 normal-turn shadow（7.7-B1，2026-07-24）
+
+`agent_sessions.messages/turn_count/activated_tools` 仍是唯一主读与业务投影。普通飞书
+`HandleMessage` 在安全清洗、消息裁剪和模型循环全部结束后，必须用
+`CommitAgentSessionTurn` 在一个 PostgreSQL 事务中完成：
+
+1. 以加载时旧投影的 canonical digest 作 base fence，拒绝跨进程或旁路写造成的陈旧覆盖；
+2. 追加一个 `vane.agent-session-projection/v1 + full_snapshot` 事件 batch；
+3. 更新旧 JSONB 投影；
+4. 只取最后一个完整 snapshot generation 重放，与旧投影做 digest/count shadow 对账。
+
+每个 generation 为 `turn_started → 最多 60 条 user_message/assistant_message/tool_call/
+tool_result → 可选 confirmation_requested → turn_completed`，总数最多 63，低于 migration 035
+冻结的 64 条上限。任一消息、payload、batch 或投影非法时整笔事务失败；不得裁掉事件后仍报告
+match。日志只记录 scope、固定 reason 和数量，不记录 payload、消息、工具参数或卡片正文。
+
+本阶段只覆盖 normal Agent turn。`AppendAgentSessionMessages`、task creation receipt 与
+definition-edit receipt 的会话 append 仍是已知 unsupported writer；下一次 normal turn 的
+pre-shadow 若发现这类漂移，固定归因为 `unsupported_writer_or_projection_drift`，随后用新的完整
+generation 重同步。它们获得独立受限角色的原子 ledger 权限前，不得切事件主读，也不得宣称
+7.7 全写入口完成。Agent ledger 仍不得被 Push、Temporal、task creation 或 definition edit 当成
+业务真相。
+
 ## 5. config（`config/config.go`）
 
 ```go

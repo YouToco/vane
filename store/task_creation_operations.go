@@ -74,24 +74,30 @@ func (s *Store) CreateTaskCreationOperation(
 	}
 	defer rollbackTaskCreationTransaction(ctx, tx)
 
+	existing, found, err := loadTaskCreationOperationForCreationReplay(
+		ctx, tx, p.ID, p.TenantID, p.UserID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		if err := validateTaskCreationOperationCreationScope(ctx, tx, p); err != nil {
+			return nil, err
+		}
+		if !taskCreationCreationRequestEqual(existing, p) {
+			return nil, taskCreationConflict("operation id already exists")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, taskCreationDatabaseError("commit operation creation replay", err)
+		}
+		return existing, nil
+	}
+
 	if err := lockValidMembership(ctx, tx, p.TenantID, p.UserID); err != nil {
 		return nil, err
 	}
-	if p.SessionID != nil {
-		var valid bool
-		err := tx.QueryRow(ctx,
-			`SELECT true
-			   FROM agent_sessions
-			  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
-			  FOR SHARE`,
-			*p.SessionID, p.TenantID, p.UserID,
-		).Scan(&valid)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil, taskCreationValidation("agent session is outside operation scope")
-			}
-			return nil, taskCreationDatabaseError("validate operation session", err)
-		}
+	if err := validateTaskCreationOperationSession(ctx, tx, p); err != nil {
+		return nil, err
 	}
 	databaseNow, err := taskCreationDatabaseClock(ctx, tx)
 	if err != nil {
@@ -115,17 +121,12 @@ func (s *Store) CreateTaskCreationOperation(
 	), &op)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			err = scanTaskCreationOperation(tx.QueryRow(ctx,
-				`SELECT `+taskCreationOperationColumns+`
-				   FROM pending_actions WHERE id = $1 FOR SHARE`, p.ID,
-			), &op)
-			if err != nil {
-				return nil, taskCreationDatabaseError("load conflicting operation", err)
+			if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
+				return nil, taskCreationDatabaseError(
+					"release creation scope before replay", rollbackErr,
+				)
 			}
-			if !taskCreationCreationRequestEqual(&op, p) {
-				return nil, taskCreationConflict("operation id already exists")
-			}
-			return &op, nil
+			return s.loadTaskCreationOperationCreationReplay(ctx, p)
 		}
 		return nil, taskCreationDatabaseError("insert operation", err)
 	}
@@ -133,6 +134,110 @@ func (s *Store) CreateTaskCreationOperation(
 		return nil, taskCreationDatabaseError("commit operation creation", err)
 	}
 	return &op, nil
+}
+
+func loadTaskCreationOperationForCreationReplay(
+	ctx context.Context,
+	tx pgx.Tx,
+	id string,
+	tenantID int64,
+	userID int64,
+) (*types.TaskCreationOperation, bool, error) {
+	var op types.TaskCreationOperation
+	err := scanTaskCreationOperation(tx.QueryRow(ctx,
+		`SELECT `+taskCreationOperationColumns+`
+		   FROM pending_actions
+		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
+		    AND tool_name = 'create_schedule' AND execution_version = $4
+		  FOR SHARE /* task creation replay operation lock order */`,
+		id, tenantID, userID, types.TaskCreationExecutionVersionV1,
+	), &op)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, taskCreationDatabaseError(
+			"load operation creation replay", err,
+		)
+	}
+	return &op, true, nil
+}
+
+func validateTaskCreationOperationCreationScope(
+	ctx context.Context,
+	tx pgx.Tx,
+	p types.CreateTaskCreationOperationParams,
+) error {
+	if err := lockValidMembership(ctx, tx, p.TenantID, p.UserID); err != nil {
+		return err
+	}
+	if err := validateTaskCreationOperationSession(ctx, tx, p); err != nil {
+		return err
+	}
+	databaseNow, err := taskCreationDatabaseClock(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !databaseNow.Before(p.ExpiresAt) {
+		return taskCreationValidation("operation expiry is not in the future")
+	}
+	return nil
+}
+
+func validateTaskCreationOperationSession(
+	ctx context.Context,
+	tx pgx.Tx,
+	p types.CreateTaskCreationOperationParams,
+) error {
+	if p.SessionID == nil {
+		return nil
+	}
+	var valid bool
+	err := tx.QueryRow(ctx,
+		`SELECT true
+		   FROM agent_sessions
+		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
+		  FOR SHARE`,
+		*p.SessionID, p.TenantID, p.UserID,
+	).Scan(&valid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return taskCreationValidation("agent session is outside operation scope")
+	}
+	if err != nil {
+		return taskCreationDatabaseError("validate operation session", err)
+	}
+	return nil
+}
+
+func (s *Store) loadTaskCreationOperationCreationReplay(
+	ctx context.Context,
+	p types.CreateTaskCreationOperationParams,
+) (*types.TaskCreationOperation, error) {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, taskCreationDatabaseError("begin operation creation replay", err)
+	}
+	defer rollbackTaskCreationTransaction(ctx, tx)
+
+	op, found, err := loadTaskCreationOperationForCreationReplay(
+		ctx, tx, p.ID, p.TenantID, p.UserID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, taskCreationConflict("operation id conflict disappeared")
+	}
+	if err := validateTaskCreationOperationCreationScope(ctx, tx, p); err != nil {
+		return nil, err
+	}
+	if !taskCreationCreationRequestEqual(op, p) {
+		return nil, taskCreationConflict("operation id already exists")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, taskCreationDatabaseError("commit operation creation replay", err)
+	}
+	return op, nil
 }
 
 // CancelTaskCreationOperation linearizes a user's pre-claim cancellation with
@@ -1254,7 +1359,7 @@ func loadScopedTaskCreationOperationForUpdate(
 		   FROM pending_actions
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		    AND tool_name = 'create_schedule' AND execution_version = $4
-		  FOR UPDATE`,
+		  FOR UPDATE /* task creation operation lock order */`,
 		lease.ID, lease.TenantID, lease.UserID, types.TaskCreationExecutionVersionV1,
 	), &op)
 	if err != nil {

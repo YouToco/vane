@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/agentledger"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
@@ -43,6 +44,7 @@ type fakeStore struct {
 	updateCalls   int
 	lastMessages  json.RawMessage
 	lastTurnCount int
+	eventBatches  []agentledger.AppendBatch
 
 	// mu 保护 appendCalls、getActiveCalls 与 sessions 内容：卡片回调/事件通告回写
 	// 在独立 goroutine 里执行，与测试主 goroutine 的断言读取并发。
@@ -153,6 +155,7 @@ func (f *fakeStore) CreateAgentSession(_ context.Context, userID int64) (*types.
 	f.nextSessionID++
 	s := &types.AgentSession{
 		ID:        f.nextSessionID,
+		TenantID:  1,
 		UserID:    userID,
 		Status:    types.AgentSessionStatusActive,
 		Messages:  json.RawMessage("[]"),
@@ -179,6 +182,34 @@ func (f *fakeStore) UpdateAgentSession(_ context.Context, id int64, messages jso
 	f.lastMessages = messages
 	f.lastTurnCount = turnCount
 	return nil
+}
+
+func (f *fakeStore) CommitAgentSessionTurn(
+	_ context.Context,
+	projection agentledger.SessionProjection,
+	batch agentledger.AppendBatch,
+) (agentledger.ProjectionShadowAudit, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.sessions[batch.Scope.SessionID]
+	if !ok || s.TenantID != batch.Scope.TenantID ||
+		s.UserID != batch.Scope.UserID {
+		return agentledger.ProjectionShadowAudit{},
+			notFoundErr("fake: 会话不存在")
+	}
+	s.Messages = projection.Messages
+	s.TurnCount = projection.TurnCount
+	s.ActivatedTools = projection.ActivatedTools
+	s.UpdatedAt = time.Now()
+	f.updateCalls++
+	f.lastMessages = projection.Messages
+	f.lastTurnCount = projection.TurnCount
+	f.eventBatches = append(f.eventBatches, batch)
+	return agentledger.ProjectionShadowAudit{
+		Match:      true,
+		PriorState: "match",
+		Reason:     "match",
+	}, nil
 }
 
 func (f *fakeStore) AppendAgentSessionMessages(ctx context.Context, sessionID int64, msgs json.RawMessage) error {
@@ -531,7 +562,7 @@ func newTestLoop(t *testing.T, fs *fakeStore, chat func(context.Context, llm.Cha
 	return l
 }
 
-// persistedMessages 解出最近一次 UpdateAgentSession 写入的消息数组。
+// persistedMessages 解出最近一次 CommitAgentSessionTurn 写入的消息数组。
 func persistedMessages(t *testing.T, fs *fakeStore) []llm.ChatMessage {
 	t.Helper()
 	var msgs []llm.ChatMessage
@@ -581,7 +612,8 @@ func TestHandleMessage_PlainChat(t *testing.T) {
 		t.Fatalf("请求应携带 1 个工具声明, 实得 %d", len(req.Tools))
 	}
 
-	// 持久化侧：user+assistant 两条，system 不入库，turn_count=1。
+	// 持久化侧：旧投影与 full-snapshot event generation 同时提交；
+	// user+assistant 两条，system 不入库，turn_count=1。
 	if fs.updateCalls != 1 {
 		t.Fatalf("期望 UpdateAgentSession 恰好 1 次, 实得 %d", fs.updateCalls)
 	}
@@ -591,6 +623,27 @@ func TestHandleMessage_PlainChat(t *testing.T) {
 	}
 	if fs.lastTurnCount != 1 {
 		t.Fatalf("turn_count = %d, 期望 1", fs.lastTurnCount)
+	}
+	if len(fs.eventBatches) != 1 {
+		t.Fatalf("event batches=%d want=1", len(fs.eventBatches))
+	}
+	kinds := make([]agentledger.Kind, len(fs.eventBatches[0].Events))
+	for i := range fs.eventBatches[0].Events {
+		kinds[i] = fs.eventBatches[0].Events[i].Kind
+	}
+	wantKinds := []agentledger.Kind{
+		agentledger.KindTurnStarted,
+		agentledger.KindUserMessage,
+		agentledger.KindAssistantMessage,
+		agentledger.KindTurnCompleted,
+	}
+	if !slices.Equal(kinds, wantKinds) {
+		t.Fatalf("event kinds=%v want=%v", kinds, wantKinds)
+	}
+	if fs.eventBatches[0].Scope != (agentledger.Scope{
+		TenantID: 1, UserID: 1, SessionID: 1,
+	}) {
+		t.Fatalf("event scope=%+v", fs.eventBatches[0].Scope)
 	}
 }
 
@@ -637,6 +690,21 @@ func TestHandleMessage_ReadToolSingleRound(t *testing.T) {
 	}
 	if fs.lastTurnCount != 2 {
 		t.Fatalf("turn_count = %d, 期望 2", fs.lastTurnCount)
+	}
+	kinds := make([]agentledger.Kind, len(fs.eventBatches[0].Events))
+	for i := range fs.eventBatches[0].Events {
+		kinds[i] = fs.eventBatches[0].Events[i].Kind
+	}
+	wantKinds := []agentledger.Kind{
+		agentledger.KindTurnStarted,
+		agentledger.KindUserMessage,
+		agentledger.KindToolCall,
+		agentledger.KindToolResult,
+		agentledger.KindAssistantMessage,
+		agentledger.KindTurnCompleted,
+	}
+	if !slices.Equal(kinds, wantKinds) {
+		t.Fatalf("event kinds=%v want=%v", kinds, wantKinds)
 	}
 }
 
@@ -2309,6 +2377,18 @@ func TestHandleMessage_MutatingToolConfirmCard(t *testing.T) {
 	// 出确认卡路径同样要持久化会话（契约 §7）。
 	if fs.updateCalls != 1 {
 		t.Fatalf("确认卡路径应持久化会话 1 次, 实得 %d", fs.updateCalls)
+	}
+	if len(fs.eventBatches) != 1 {
+		t.Fatalf("确认卡路径 event batches=%d want=1", len(fs.eventBatches))
+	}
+	confirmationEvents := 0
+	for _, event := range fs.eventBatches[0].Events {
+		if event.Kind == agentledger.KindConfirmationRequested {
+			confirmationEvents++
+		}
+	}
+	if confirmationEvents != 1 {
+		t.Fatalf("confirmation_requested events=%d want=1", confirmationEvents)
 	}
 }
 
