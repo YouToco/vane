@@ -1,0 +1,378 @@
+package store
+
+import (
+	"context"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/YouToco/vane/pusheffect"
+	"github.com/YouToco/vane/types"
+)
+
+// ClaimAuthorizedPushEffect atomically revalidates the exact immutable run
+// snapshot plus current tenant/member/task authority while claiming a fresh
+// provider-send lease. A live revocation preserves every provider/effect field
+// and advances only the database-clock retry schedule.
+func (s *Store) ClaimAuthorizedPushEffect(
+	ctx context.Context,
+	params pusheffect.AuthorizedClaimParams,
+) (*pusheffect.Effect, pusheffect.AuthorizedClaimDecision, error) {
+	return s.claimAuthorizedPushEffect(ctx, params, false)
+}
+
+// ClaimAuthorizedPushEffectReconciliation applies the same live authority gate
+// to an exact UUID replay. The database-clock predicate additionally requires
+// the complete lease to fit inside the frozen provider idempotency window.
+func (s *Store) ClaimAuthorizedPushEffectReconciliation(
+	ctx context.Context,
+	params pusheffect.AuthorizedClaimParams,
+) (*pusheffect.Effect, pusheffect.AuthorizedClaimDecision, error) {
+	return s.claimAuthorizedPushEffect(ctx, params, true)
+}
+
+func (s *Store) claimAuthorizedPushEffect(
+	ctx context.Context,
+	params pusheffect.AuthorizedClaimParams,
+	reconciliation bool,
+) (*pusheffect.Effect, pusheffect.AuthorizedClaimDecision, error) {
+	if err := validatePushEffectClaim(params.ClaimParams); err != nil {
+		return nil, "", err
+	}
+	if params.ExpectedTaskID == "" {
+		return nil, "", pushEffectValidation(
+			"authorized push effect task is invalid")
+	}
+	if params.DenialRetryAfter <= 0 ||
+		params.DenialRetryAfter > maxPushEffectRetryWindow ||
+		params.DenialRetryAfter.Microseconds() <= 0 {
+		return nil, "", pushEffectValidation(
+			"authorized push effect denial retry is invalid")
+	}
+	tx, err := s.beginPushEffectCoordinatorTx(ctx, params.TenantID)
+	if err != nil {
+		return nil, "", pushEffectDatabaseError(
+			"begin authorized claim transaction", err)
+	}
+	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(ctx, tx, params.Scope); err != nil {
+		return nil, "", err
+	}
+	effect, databaseNow, err := loadPushEffectWithClock(ctx, tx, params.Scope)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := validateStoredPushEffect(effect); err != nil {
+		return nil, "", err
+	}
+	if effect.TaskID != params.ExpectedTaskID {
+		return nil, "", pushEffectConflict(
+			"push effect is outside the enabled recovery task")
+	}
+	if err := validatePushEffectRunSnapshotForClaim(ctx, tx, effect); err != nil {
+		return nil, "", err
+	}
+
+	if effect.Status == pusheffect.StatusSending &&
+		effect.LeaseOwner == params.LeaseOwner &&
+		effect.LeaseUntil != nil &&
+		databaseNow.Before(*effect.LeaseUntil) {
+		replayed, authorized, err := loadAuthorizedPushEffectClaimReplay(
+			ctx, tx, effect, params, reconciliation)
+		if err != nil {
+			return nil, "", err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, "", pushEffectDatabaseError(
+				"commit authorized claim replay", err)
+		}
+		if !authorized {
+			return nil, pusheffect.AuthorizedClaimDenied, nil
+		}
+		return replayed, pusheffect.AuthorizedClaimed, nil
+	}
+
+	if reconciliation {
+		if effect.Status != pusheffect.StatusAmbiguous ||
+			!databaseNow.Before(effect.IdempotencyExpiresAt) ||
+			databaseNow.Add(params.LeaseDuration).After(
+				effect.IdempotencyExpiresAt) {
+			return nil, "", pushEffectConflict(
+				"push effect reconciliation window is unavailable")
+		}
+		if databaseNow.Before(effect.NextAttemptAt) {
+			if err := tx.Commit(ctx); err != nil {
+				return nil, "", pushEffectDatabaseError(
+					"commit reconciliation not-due decision", err)
+			}
+			return nil, pusheffect.AuthorizedClaimNotDue, nil
+		}
+	} else {
+		if effect.Status != pusheffect.StatusPrepared &&
+			effect.Status != pusheffect.StatusDefiniteFailed {
+			return nil, "", pushEffectBusyOrTerminal(effect.Status)
+		}
+		if databaseNow.Before(effect.NextAttemptAt) {
+			if err := tx.Commit(ctx); err != nil {
+				return nil, "", pushEffectDatabaseError(
+					"commit authorized claim not-due decision", err)
+			}
+			return nil, pusheffect.AuthorizedClaimNotDue, nil
+		}
+	}
+
+	claimed, authorized, err := updateAuthorizedPushEffectClaim(
+		ctx, tx, effect, params, reconciliation)
+	if err != nil {
+		return nil, "", err
+	}
+	if !authorized {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, "", pushEffectDatabaseError(
+				"commit unauthorized claim", err)
+		}
+		return nil, pusheffect.AuthorizedClaimDenied, nil
+	}
+	if err := validateStoredPushEffect(claimed); err != nil {
+		return nil, "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, "", pushEffectDatabaseError(
+			"commit authorized claim transaction", err)
+	}
+	return claimed, pusheffect.AuthorizedClaimed, nil
+}
+
+func validatePushEffectRunSnapshotForClaim(
+	ctx context.Context,
+	tx pgx.Tx,
+	effect *pusheffect.Effect,
+) error {
+	var snapshot taskRunSnapshot
+	var rawMode string
+	err := tx.QueryRow(ctx, `
+		SELECT `+pushEffectRunSnapshotReferenceColumns+`
+		  FROM task_run_snapshots
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		   AND task_id=$4 AND temporal_run_id=$5`,
+		effect.RunSnapshotID, effect.TenantID, effect.UserID,
+		effect.TaskID, effect.RunID).Scan(
+		&snapshot.ID, &snapshot.TenantID, &snapshot.UserID, &snapshot.TaskID,
+		&snapshot.TemporalWorkflowID, &snapshot.TemporalRunID,
+		&snapshot.RunKind, &rawMode, &snapshot.AdaptiveVersion,
+		&snapshot.CapabilityCatalogDigest, &snapshot.ToolPolicyDigest,
+		&snapshot.PromptPolicyDigest, &snapshot.ModelPolicyDigest,
+		&snapshot.QuotaPolicyDigest, &snapshot.DefinitionDigest,
+		&snapshot.PlanDigest, &snapshot.PayloadDigest,
+		&snapshot.ReferenceDigest, &snapshot.ReferenceSchemaVersion,
+		&snapshot.BudgetJSON,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pushEffectIntegrity()
+	}
+	if err != nil {
+		return pushEffectDatabaseError(
+			"load authorized claim run snapshot", err)
+	}
+	mode, err := types.ParseExecutionMode(rawMode)
+	if err != nil {
+		return pushEffectIntegrity()
+	}
+	snapshot.Mode = mode
+	ref, err := snapshot.safeRef()
+	if err != nil ||
+		ref.SnapshotID != effect.RunSnapshotID ||
+		ref.TenantID != effect.TenantID ||
+		ref.UserID != effect.UserID ||
+		ref.TaskID != effect.TaskID ||
+		ref.TemporalRunID != effect.RunID ||
+		ref.TemporalWorkflowID != scheduledTaskWorkflowID(effect.TaskID) {
+		return pushEffectIntegrity()
+	}
+	return nil
+}
+
+const pushEffectRunSnapshotReferenceColumns = `id, tenant_id, user_id, task_id,
+	temporal_workflow_id, temporal_run_id, run_kind, execution_mode,
+	adaptive_version, capability_catalog_digest, tool_policy_digest,
+	prompt_policy_digest, model_policy_digest, quota_policy_digest,
+	definition_digest, plan_digest, payload_digest, reference_digest,
+	reference_schema_version, budget`
+
+func loadAuthorizedPushEffectClaimReplay(
+	ctx context.Context,
+	tx pgx.Tx,
+	effect *pusheffect.Effect,
+	params pusheffect.AuthorizedClaimParams,
+	reconciliation bool,
+) (*pusheffect.Effect, bool, error) {
+	windowPredicate := ""
+	if reconciliation {
+		windowPredicate = `
+		   AND clock_timestamp()+($6*interval '1 microsecond')
+		       <=e.idempotency_expires_at`
+	}
+	row := tx.QueryRow(ctx, `
+		SELECT `+pushEffectColumns+`
+		  FROM push_effects e
+		 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3
+		   AND e.status='sending' AND e.lease_owner=$4 AND e.fence=$5
+		   AND e.lease_until>clock_timestamp()`+windowPredicate+`
+		   AND `+authorizedPushEffectRunPredicate,
+		params.ID, params.TenantID, params.UserID, params.LeaseOwner,
+		effect.Fence, params.LeaseDuration.Microseconds(),
+		types.ScheduleStatusActive, types.TenantStatusActive,
+		scheduledTaskWorkflowID(effect.TaskID), params.ExpectedTaskID)
+	replayed, err := scanPushEffect(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, pushEffectScanError(
+			"revalidate authorized claim replay", err)
+	}
+	if err := validateStoredPushEffect(replayed); err != nil {
+		return nil, false, err
+	}
+	return replayed, true, nil
+}
+
+func updateAuthorizedPushEffectClaim(
+	ctx context.Context,
+	tx pgx.Tx,
+	effect *pusheffect.Effect,
+	params pusheffect.AuthorizedClaimParams,
+	reconciliation bool,
+) (*pusheffect.Effect, bool, error) {
+	if !reconciliation {
+		return updateFreshAuthorizedPushEffectClaim(ctx, tx, effect, params)
+	}
+	statusPredicate := `
+		   AND e.status='ambiguous'
+		   AND e.next_attempt_at<=clock_timestamp()
+		   AND clock_timestamp()+($6*interval '1 microsecond')
+		       <=e.idempotency_expires_at`
+	row := tx.QueryRow(ctx, `
+		UPDATE push_effects e
+		   SET status='sending', lease_owner=$4,
+		       lease_until=clock_timestamp()+($6*interval '1 microsecond'),
+		       takeover_not_before=clock_timestamp()+($7*interval '1 microsecond'),
+		       fence=e.fence+1, attempt=e.attempt+1,
+		       failure_class='', ambiguous_since=NULL,
+		       updated_at=clock_timestamp()
+		 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3 AND e.fence=$5
+		   AND e.lease_owner='' AND e.lease_until IS NULL`+
+		statusPredicate+`
+		   AND `+authorizedPushEffectRunPredicate+`
+		 RETURNING `+pushEffectColumns,
+		params.ID, params.TenantID, params.UserID, params.LeaseOwner,
+		effect.Fence, params.LeaseDuration.Microseconds(),
+		(params.LeaseDuration + pushEffectTakeoverGrace).Microseconds(),
+		types.ScheduleStatusActive, types.TenantStatusActive,
+		scheduledTaskWorkflowID(effect.TaskID), params.ExpectedTaskID)
+	claimed, err := scanPushEffect(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, pushEffectScanError(
+			"claim authorized push effect reconciliation", err)
+	}
+	return claimed, true, nil
+}
+
+func updateFreshAuthorizedPushEffectClaim(
+	ctx context.Context,
+	tx pgx.Tx,
+	effect *pusheffect.Effect,
+	params pusheffect.AuthorizedClaimParams,
+) (*pusheffect.Effect, bool, error) {
+	var authorized bool
+	err := tx.QueryRow(ctx, `
+		WITH decision AS (
+			SELECT `+authorizedPushEffectRunPredicate+` AS authorized
+			  FROM push_effects e
+			 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3
+			   AND e.fence=$5
+		)
+		UPDATE push_effects e
+		   SET status=CASE WHEN decision.authorized THEN 'sending'
+		                   ELSE e.status END,
+		       lease_owner=CASE WHEN decision.authorized THEN $4
+		                        ELSE e.lease_owner END,
+		       lease_until=CASE WHEN decision.authorized
+		                   THEN clock_timestamp()+($6*interval '1 microsecond')
+		                   ELSE NULL END,
+		       takeover_not_before=CASE WHEN decision.authorized
+		                   THEN clock_timestamp()+($7*interval '1 microsecond')
+		                   ELSE NULL END,
+		       fence=e.fence+CASE WHEN decision.authorized THEN 1 ELSE 0 END,
+		       attempt=e.attempt+CASE WHEN decision.authorized THEN 1 ELSE 0 END,
+		       next_attempt_at=CASE WHEN decision.authorized
+		                   THEN e.next_attempt_at
+		                   ELSE clock_timestamp()+($12*interval '1 microsecond') END,
+		       failure_class=CASE WHEN decision.authorized THEN ''
+		                          ELSE e.failure_class END,
+		       ambiguous_since=CASE WHEN decision.authorized THEN NULL
+		                            ELSE e.ambiguous_since END,
+		       updated_at=clock_timestamp()
+		  FROM decision
+		 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3 AND e.fence=$5
+		   AND e.task_id=$11
+		   AND e.status IN ('prepared','definite_failed')
+		   AND e.next_attempt_at<=clock_timestamp()
+		   AND e.lease_owner='' AND e.lease_until IS NULL
+		 RETURNING decision.authorized`,
+		params.ID, params.TenantID, params.UserID, params.LeaseOwner,
+		effect.Fence, params.LeaseDuration.Microseconds(),
+		(params.LeaseDuration + pushEffectTakeoverGrace).Microseconds(),
+		types.ScheduleStatusActive, types.TenantStatusActive,
+		scheduledTaskWorkflowID(effect.TaskID), params.ExpectedTaskID,
+		params.DenialRetryAfter.Microseconds(),
+	).Scan(&authorized)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, pushEffectBusy()
+	}
+	if err != nil {
+		return nil, false, pushEffectDatabaseError(
+			"claim or defer unauthorized push effect", err)
+	}
+	if !authorized {
+		return nil, false, nil
+	}
+	claimed, err := loadPushEffectForUpdate(ctx, tx, params.Scope)
+	if err != nil {
+		return nil, false, err
+	}
+	return claimed, true, nil
+}
+
+// authorizedPushEffectRunPredicate is evaluated by the same SQL statement that
+// mutates the effect. It deliberately repeats every immutable coordinate and
+// current live-state predicate; a stale preflight cannot authorize the UPDATE.
+const authorizedPushEffectRunPredicate = `EXISTS (
+	SELECT 1
+	  FROM task_run_snapshots r
+	  JOIN schedules s
+	    ON s.id=r.task_id AND s.tenant_id=r.tenant_id AND s.user_id=r.user_id
+	  JOIN tenants t ON t.id=r.tenant_id
+	  JOIN memberships m
+	    ON m.tenant_id=r.tenant_id AND m.user_id=r.user_id
+	 WHERE r.id=e.run_snapshot_id
+	   AND e.task_id=$11
+	   AND r.tenant_id=e.tenant_id
+	   AND r.user_id=e.user_id
+	   AND r.task_id=e.task_id
+	   AND r.temporal_run_id=e.run_id
+	   AND r.temporal_workflow_id=$10
+	   AND s.status=$8
+	   AND t.status=$9 AND t.deleted_at IS NULL
+	   AND NOT EXISTS (
+	       SELECT 1
+	         FROM pending_actions p
+	        WHERE p.task_id=s.id
+	          AND p.tenant_id=s.tenant_id AND p.user_id=s.user_id
+	          AND p.tool_name='create_schedule' AND p.execution_version=1
+	          AND NOT (p.status='executed' AND p.phase='completed')
+	   )
+)`

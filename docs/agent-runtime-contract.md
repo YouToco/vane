@@ -312,7 +312,7 @@ lease/fence effect 状态机发送和收敛。`pending delivery` 不证明消息
 | C2c | 存量适配、shadow 对账并切 immutable head 读取 | 动态模式仍 feature flag 关闭 |
 | C3a | RunID/StepID 检查点、LKG、bounded `PlanFetch` | 仅 shadow，无用户推送影响 |
 | C3b | Push effect checkpoint + stable provider UUID | 先 dark preparation/receipt shadow，仍不自动恢复 |
-| C3c | fenced Push recovery coordinator | exact-task canary；`ambiguous` 对账失败必须 blocked，禁止盲重发 |
+| C3c | fenced Push recovery coordinator | PR-C 已落 dark exact-task 单次 `Attempt` authority；无 production wiring/lifecycle/operator；后续 exact-task canary，`ambiguous` 对账失败必须 blocked，禁止盲重发 |
 | C4 | 两条首批竖切的 Boss 单任务 canary | 逐步放量，可回滚 Compiled/LKG |
 
 首批竖切：

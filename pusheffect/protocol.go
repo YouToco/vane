@@ -22,7 +22,9 @@ import (
 )
 
 const (
-	SchemaVersion = "vane.push-effect/v1"
+	SchemaVersion       = "vane.push-effect/v1"
+	RecoveryMaxAttempts = 8
+	MaxLeaseDuration    = 24 * time.Hour
 
 	maxIdentityBytes = 512
 	maxTargetBytes   = 1024
@@ -75,6 +77,25 @@ type ProviderObservation struct {
 	AppIdentity string
 	MessageID   string
 	ChatID      string
+}
+
+type HistoryQuery struct {
+	EffectID       string
+	ProviderChatID string
+	AppIdentity    string
+	// CardDigest is the immutable SHA-256 checkpoint of the exact frozen card
+	// bytes. A marker match without this digest is not positive send evidence.
+	CardDigest string
+	StartTime  time.Time
+	EndTime    time.Time
+}
+
+// HistoryObservation contains positive provider evidence only. MatchCount=0
+// is never proof that no send occurred; MatchCount>1 is a conflict requiring a
+// blocked/operator resolution.
+type HistoryObservation struct {
+	MatchCount int
+	MessageID  string
 }
 
 type Scope struct {
@@ -134,6 +155,10 @@ type Effect struct {
 	UpdatedAt         time.Time
 }
 
+func (e Effect) RecoveryBudgetExhausted() bool {
+	return e.Attempt >= RecoveryMaxAttempts
+}
+
 type Lease struct {
 	Scope
 	LeaseOwner string
@@ -146,6 +171,23 @@ type ClaimParams struct {
 	LeaseDuration time.Duration
 }
 
+// AuthorizedClaimParams binds recovery to one explicitly enabled task. The
+// Store repeats this task ID in the atomic live-authority UPDATE; a caller
+// cannot turn a scoped recovery coordinator into a tenant-wide sender.
+type AuthorizedClaimParams struct {
+	ClaimParams
+	ExpectedTaskID   string
+	DenialRetryAfter time.Duration
+}
+
+type AuthorizedClaimDecision string
+
+const (
+	AuthorizedClaimed     AuthorizedClaimDecision = "claimed"
+	AuthorizedClaimDenied AuthorizedClaimDecision = "not_authorized"
+	AuthorizedClaimNotDue AuthorizedClaimDecision = "not_due"
+)
+
 type FailureParams struct {
 	Lease
 	Class      string
@@ -156,6 +198,34 @@ type Resolution struct {
 	Scope
 	ExpectedFence int64
 	Class         string
+}
+
+// ReconciliationSchedule asks the Store to make one database-clock decision:
+// defer an exact ambiguous fence while the provider UUID window is open, or
+// atomically block it once that window has expired.
+type ReconciliationSchedule struct {
+	Scope
+	ExpectedFence int64
+	RetryAfter    time.Duration
+	UntilExpiry   bool
+}
+
+type ReconciliationDecision string
+
+const (
+	ReconciliationDeferred ReconciliationDecision = "deferred"
+	ReconciliationBlocked  ReconciliationDecision = "blocked"
+)
+
+type HistoryResolution struct {
+	Scope
+	ExpectedFence int64
+}
+
+type ExhaustedResolution struct {
+	Scope
+	ExpectedFence  int64
+	ExpectedTaskID string
 }
 
 type SentReceipt struct {
@@ -208,6 +278,25 @@ func (c Canonical) Prepared() Prepared {
 func (c Canonical) Payload() []byte    { return slices.Clone(c.payload) }
 func (c Canonical) Digest() string     { return c.digest }
 func (c Canonical) CardDigest() string { return c.cardDigest }
+
+// CardMatchesDigest compares provider history bytes with the immutable digest
+// stored on the effect. It rejects malformed/non-canonical digest strings and
+// uses a constant-time comparison for the fixed-size checkpoint.
+func CardMatchesDigest(card []byte, expected string) bool {
+	return constantDigestEqual(digest(card), expected)
+}
+
+// CardDigest returns the exact immutable card-byte checkpoint persisted by the
+// effect protocol and supplied to provider-history reconciliation.
+func CardDigest(card []byte) string {
+	return digest(card)
+}
+
+// ValidCardDigest reports whether a stored/query digest uses the canonical
+// lowercase SHA-256 representation accepted by the effect protocol.
+func ValidCardDigest(value string) bool {
+	return validDigest(value)
+}
 
 func Canonicalize(p Prepared) (Canonical, error) {
 	if err := validatePrepared(p); err != nil {

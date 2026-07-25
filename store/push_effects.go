@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	maxPushEffectLease       = 24 * time.Hour
+	maxPushEffectLease       = pusheffect.MaxLeaseDuration
 	maxPushEffectRetryWindow = 30 * 24 * time.Hour
 	pushEffectTakeoverGrace  = 30 * time.Second
 	maxPushEffectFailure     = 128
@@ -57,7 +57,13 @@ func scanPushEffect(row pushEffectScanner) (*pusheffect.Effect, error) {
 		&effect.AmbiguousSince, &effect.SentAt, &effect.BlockedAt,
 		&effect.CreatedAt, &effect.UpdatedAt,
 	)
-	return &effect, err
+	if err != nil {
+		return &effect, err
+	}
+	if err := validateStoredPushEffect(&effect); err != nil {
+		return nil, err
+	}
+	return &effect, nil
 }
 
 // CreatePushEffect freezes one provider request. Exact response-lost replay
@@ -288,7 +294,7 @@ func (s *Store) ListRecoverablePushEffects(
 	for rows.Next() {
 		effect, err := scanPushEffect(rows)
 		if err != nil {
-			return nil, pushEffectDatabaseError(
+			return nil, pushEffectScanError(
 				"scan recoverable push effect", err)
 		}
 		if err := validateStoredPushEffect(effect); err != nil {
@@ -911,7 +917,7 @@ func loadPushEffect(
 		return nil, pushEffectNotFound()
 	}
 	if err != nil {
-		return nil, pushEffectDatabaseError("load push effect", err)
+		return nil, pushEffectScanError("load push effect", err)
 	}
 	return effect, nil
 }
@@ -982,6 +988,8 @@ func validateStoredPushEffect(effect *pusheffect.Effect) error {
 		!prepared.IdempotencyExpiresAt.Equal(effect.IdempotencyExpiresAt) {
 		return pushEffectIntegrity()
 	}
+	effect.ObservationEventKeys =
+		slices.Clone(prepared.ObservationEventKeys)
 	return nil
 }
 
@@ -1155,4 +1163,12 @@ func pushEffectDatabaseError(action string, cause error) error {
 		}
 	}
 	return types.NewAppError(types.CodeDatabase, "push effect: "+action, safeCause)
+}
+
+func pushEffectScanError(action string, cause error) error {
+	var appErr *types.AppError
+	if errors.As(cause, &appErr) {
+		return cause
+	}
+	return pushEffectDatabaseError(action, cause)
 }

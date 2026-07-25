@@ -12,14 +12,6 @@ import (
 )
 
 func TestPushEffectRecoveryStoreHasZeroProductionCallPoints(t *testing.T) {
-	methods := map[string]bool{
-		"ListRecoverablePushEffectTenantIDs": true,
-		"ListRecoverablePushEffects":         true,
-		"ClaimPushEffectReconciliation":      true,
-		"TakeOverStalePushEffect":            true,
-		"RecordPushEffectSent":               true,
-		"BlockPushEffect":                    true,
-	}
 	root, err := filepath.Abs("..")
 	if err != nil {
 		t.Fatal(err)
@@ -46,7 +38,8 @@ func TestPushEffectRecoveryStoreHasZeroProductionCallPoints(t *testing.T) {
 		}
 		ast.Inspect(file, func(node ast.Node) bool {
 			selector, ok := node.(*ast.SelectorExpr)
-			if ok && methods[selector.Sel.Name] {
+			if ok && pushEffectRecoverySelectorViolation(
+				selector.Sel.Name, path) {
 				position := fset.Position(selector.Pos())
 				t.Errorf("push effect recovery API is wired in PR-B: %s:%d",
 					position.Filename, position.Line)
@@ -57,5 +50,54 @@ func TestPushEffectRecoveryStoreHasZeroProductionCallPoints(t *testing.T) {
 	})
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
+	}
+}
+
+func TestPushEffectRecoveryGuardRejectsLegacyCoordinatorMutation(t *testing.T) {
+	t.Parallel()
+
+	source := `package pushrecovery
+func mutated(s interface{ ClaimPushEffectReconciliation(); RecordPushEffectSent() }) {
+	s.ClaimPushEffectReconciliation()
+	s.RecordPushEffectSent()
+}`
+	file, err := parser.ParseFile(
+		token.NewFileSet(), "pushrecovery/coordinator.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations := 0
+	ast.Inspect(file, func(node ast.Node) bool {
+		if selector, ok := node.(*ast.SelectorExpr); ok &&
+			pushEffectRecoverySelectorViolation(
+				selector.Sel.Name, "pushrecovery/coordinator.go") {
+			violations++
+		}
+		return true
+	})
+	if violations != 2 {
+		t.Fatalf("legacy coordinator mutation violations=%d, want 2", violations)
+	}
+}
+
+func pushEffectRecoverySelectorViolation(method, path string) bool {
+	coordinator := strings.HasSuffix(
+		filepath.ToSlash(path), "/pushrecovery/coordinator.go")
+	switch method {
+	case "TakeOverStalePushEffect",
+		"ClaimAuthorizedPushEffect",
+		"ClaimAuthorizedPushEffectReconciliation",
+		"DeferOrBlockPushEffectReconciliation",
+		"BlockConflictingPushEffectHistory",
+		"BlockExhaustedPushEffectAttempts":
+		return !coordinator
+	case "ListRecoverablePushEffectTenantIDs",
+		"ListRecoverablePushEffects",
+		"ClaimPushEffectReconciliation",
+		"RecordPushEffectSent",
+		"BlockPushEffect":
+		return true
+	default:
+		return false
 	}
 }

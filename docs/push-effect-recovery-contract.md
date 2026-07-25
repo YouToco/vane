@@ -5,6 +5,12 @@
 > state transitions, provider idempotency, or recovery authority requires a new
 > version and the S-level verification gates in `AGENTS.md`.
 
+Implementation status (2026-07-25): PR-C supplies one dark, exact-task
+`pushrecovery.Coordinator.Attempt` authority path, atomic live authorization,
+positive-only Feishu history resolution, and fixed-predicate reconciliation
+transitions. It has no production call point, scan, startup pass, ticker,
+goroutine, lifecycle wiring, unrestricted operator, or legacy-batch adoption.
+
 ## 1. Truth boundaries
 
 Three durable histories remain deliberately separate:
@@ -153,6 +159,9 @@ compiled Push once the effect path is enabled.
 
 ## 7. Recovery lifecycle and limits
 
+This section remains the post-PR-C lifecycle target. None of these lifecycle
+behaviors is enabled by the dark single-attempt authority package.
+
 - A bounded startup pass runs before external ingress.
 - A tenant-sharded, page-bounded periodic worker handles stale nonterminal
   effects.
@@ -183,7 +192,9 @@ versioned effect; it does not delete deliveries or forge `sent`.
    call points.
 2. Deploy the stable-UUID Feishu adapter and dark effect preparation.
 3. Enable live effect settlement for one exact task; recovery remains disabled.
-4. Enable bounded recovery for the exact task and run the complete fault matrix.
+4. Deploy the dark exact-task recovery authority with no lifecycle or production
+   call point; then independently enable bounded recovery and run the complete
+   fault matrix.
 5. Expand only after shadow/projection audits remain exact. Agent ledger main
    read switching is an independent release decision.
 
