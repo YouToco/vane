@@ -102,6 +102,11 @@ func (s *Store) beginPushBatchAuthorityTx(
 		rollbackPushEffectTx(ctx, tx)
 		return nil, fmt.Errorf("set tenant context: %w", err)
 	}
+	_, err = lockTenantAdmissionRoot(ctx, tx, tenantID)
+	if err != nil {
+		rollbackPushEffectTx(ctx, tx)
+		return nil, fmt.Errorf("lock tenant admission: %w", err)
+	}
 	if _, err := tx.Exec(
 		ctx,
 		`SET LOCAL ROLE vane_push_batch_authority`,

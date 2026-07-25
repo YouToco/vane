@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/types"
 )
 
@@ -76,13 +77,21 @@ func TestObservationQualificationCheckpointAndEventLedger(t *testing.T) {
 		OccurredAt:   time.Date(2026, 7, 24, 1, 0, 0, 0, time.UTC),
 		EvidenceJSON: json.RawMessage(`{"content_ids":[1]}`),
 	}
+	batchA := createObservationBatch(
+		t,
+		f,
+		f.idA,
+		f.refA,
+		"observe-a-"+uuid.NewString(),
+	)
 	var accepted atomic.Int64
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ok, err := f.base.st.ReserveObservedEventV1(ctx, f.idA, f.refA, event)
+			ok, err := f.base.st.ReserveObservedEventV1(
+				ctx, f.idA, f.refA, batchA, event)
 			if err != nil {
 				t.Errorf("reserve: %v", err)
 				return
@@ -114,8 +123,15 @@ func TestObservationQualificationCheckpointAndEventLedger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	otherBatch := createObservationBatch(
+		t,
+		f,
+		otherIdentity,
+		otherRef,
+		"observe-other-"+uuid.NewString(),
+	)
 	if ok, err := f.base.st.ReserveObservedEventV1(
-		ctx, otherIdentity, otherRef, event); err != nil || ok {
+		ctx, otherIdentity, otherRef, otherBatch, event); err != nil || ok {
 		t.Fatalf("cross-run duplicate accepted=%v err=%v", ok, err)
 	}
 	if _, err := f.base.st.pool.Exec(ctx,
@@ -128,7 +144,7 @@ func TestObservationQualificationCheckpointAndEventLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ok, err := f.base.st.ReserveObservedEventV1(
-		ctx, otherIdentity, otherRef, event); err != nil || !ok {
+		ctx, otherIdentity, otherRef, otherBatch, event); err != nil || !ok {
 		t.Fatalf("stale unbound event takeover accepted=%v err=%v", ok, err)
 	}
 }
@@ -342,6 +358,9 @@ func TestStalePendingObservedEventReentersCandidatesAndTransfers(t *testing.T) {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(cleanupCtx, t, f.base.st,
+			`DELETE FROM push_effects WHERE tenant_id=$1`,
+			f.idA.TenantID)
+		cleanupExec(cleanupCtx, t, f.base.st,
 			`DELETE FROM task_observed_events WHERE tenant_id=$1`,
 			f.idA.TenantID)
 	})
@@ -353,15 +372,11 @@ func TestStalePendingObservedEventReentersCandidatesAndTransfers(t *testing.T) {
 		OccurredAt:   time.Now().UTC().Truncate(time.Second),
 		EvidenceJSON: json.RawMessage(`{"content_ids":[1]}`),
 	}
-	if ok, err := f.base.st.ReserveObservedEventV1(
-		ctx, f.idA, f.refA, event); err != nil || !ok {
-		t.Fatalf("initial reserve accepted=%v err=%v", ok, err)
-	}
 	key := "partial-failure-" + uuid.NewString()
-	batchID, err := f.base.st.CreatePushBatchForTaskRunV1(
-		ctx, f.idA, f.refA, key)
-	if err != nil {
-		t.Fatal(err)
+	batchID := createObservationBatch(t, f, f.idA, f.refA, key)
+	if ok, err := f.base.st.ReserveObservedEventV1(
+		ctx, f.idA, f.refA, batchID, event); err != nil || !ok {
+		t.Fatalf("initial reserve accepted=%v err=%v", ok, err)
 	}
 	contentID := f.createContent(t, f.sourceA, "partial-failure")
 	deliveryID, _, _, err := f.base.st.InsertDeliveryForTaskRunV1(
@@ -373,7 +388,8 @@ func TestStalePendingObservedEventReentersCandidatesAndTransfers(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := f.base.st.BindObservedEventDeliveryV1(
-		ctx, f.idA, f.refA, event.PolicyDigest, event.EventKey, deliveryID,
+		ctx, f.idA, f.refA, event.PolicyDigest, event.EventKey,
+		batchID, deliveryID,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -396,13 +412,21 @@ func TestStalePendingObservedEventReentersCandidatesAndTransfers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	replacementKey := "partial-failure-replacement-" + uuid.NewString()
+	replacementBatch := createObservationBatch(
+		t,
+		f,
+		nextIdentity,
+		nextRef,
+		replacementKey,
+	)
 	candidates, err := f.base.st.ListUnpushedForTaskRunV1(
 		ctx, nextIdentity, nextRef, []int64{f.sourceA}, 10, 10)
 	if err != nil || len(candidates) != 1 || candidates[0].ID != contentID {
 		t.Fatalf("recovery candidates=%+v err=%v", candidates, err)
 	}
 	if ok, err := f.base.st.ReserveObservedEventV1(
-		ctx, nextIdentity, nextRef, event); err != nil || !ok {
+		ctx, nextIdentity, nextRef, replacementBatch, event); err != nil || !ok {
 		t.Fatalf("next-run takeover accepted=%v err=%v", ok, err)
 	}
 	var runID string
@@ -424,12 +448,6 @@ func TestStalePendingObservedEventReentersCandidatesAndTransfers(t *testing.T) {
 		t.Fatalf("first stale delivery status=%q err=%v", firstStatus, err)
 	}
 
-	replacementKey := "partial-failure-replacement-" + uuid.NewString()
-	replacementBatch, err := f.base.st.CreatePushBatchForTaskRunV1(
-		ctx, nextIdentity, nextRef, replacementKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 	replacementDelivery, _, _, err := f.base.st.InsertDeliveryForTaskRunV1(
 		ctx, nextIdentity, nextRef, replacementKey, &types.Delivery{
 			BatchID: replacementBatch, UserID: nextIdentity.UserID,
@@ -440,7 +458,8 @@ func TestStalePendingObservedEventReentersCandidatesAndTransfers(t *testing.T) {
 	}
 	if err := f.base.st.BindObservedEventDeliveryV1(
 		ctx, nextIdentity, nextRef,
-		event.PolicyDigest, event.EventKey, replacementDelivery,
+		event.PolicyDigest, event.EventKey,
+		replacementBatch, replacementDelivery,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -453,6 +472,30 @@ func TestStalePendingObservedEventReentersCandidatesAndTransfers(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := f.base.st.CreatePushEffect(ctx, pusheffect.Prepared{
+		ID:                   "effect-" + uuid.NewString(),
+		TenantID:             nextIdentity.TenantID,
+		UserID:               nextIdentity.UserID,
+		TaskID:               nextIdentity.TaskID,
+		RunSnapshotID:        nextRef.SnapshotID,
+		RunID:                nextIdentity.TemporalRunID,
+		StepID:               "push/0",
+		ChunkIndex:           0,
+		ChunkCount:           1,
+		BatchID:              replacementBatch,
+		DeliveryIDs:          []int64{replacementDelivery},
+		ObservationEventKeys: []string{event.EventKey},
+		Provider:             "feishu",
+		AppIdentity:          "app-fingerprint",
+		ProviderChatID:       "oc_owner_p2p",
+		Target:               "ou_target",
+		Card:                 []byte(`{"card":"frozen"}`),
+		ProviderUUID:         uuid.NewString(),
+		IdempotencyExpiresAt: time.Now().UTC().
+			Truncate(time.Microsecond).Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("freeze replacement effect: %v", err)
+	}
 	thirdIdentity := scheduledRunIdentity(
 		f.taskA, f.idA.TenantID, f.idA.UserID, "run-third-"+uuid.NewString())
 	thirdRef, err := f.base.st.CreateOrGetCompiledTaskRunSnapshotV1(
@@ -462,22 +505,64 @@ func TestStalePendingObservedEventReentersCandidatesAndTransfers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	thirdBatch := createObservationBatch(
+		t,
+		f,
+		thirdIdentity,
+		thirdRef,
+		"partial-failure-third-"+uuid.NewString(),
+	)
 	candidates, err = f.base.st.ListUnpushedForTaskRunV1(
 		ctx, thirdIdentity, thirdRef, []int64{f.sourceA}, 10, 10)
 	if err != nil || len(candidates) != 1 || candidates[0].ID != contentID {
 		t.Fatalf("second recovery candidates=%+v err=%v", candidates, err)
 	}
 	if ok, err := f.base.st.ReserveObservedEventV1(
-		ctx, thirdIdentity, thirdRef, event); err != nil || !ok {
-		t.Fatalf("second takeover accepted=%v err=%v", ok, err)
+		ctx, thirdIdentity, thirdRef, thirdBatch, event); err != nil || ok {
+		t.Fatalf("effect-bound takeover accepted=%v err=%v", ok, err)
 	}
 	var replacementStatus string
 	if err := f.base.st.pool.QueryRow(ctx,
 		`SELECT status FROM deliveries WHERE id=$1`,
 		replacementDelivery).Scan(&replacementStatus); err != nil ||
-		replacementStatus != "failed" {
-		t.Fatalf("replacement stale status=%q err=%v", replacementStatus, err)
+		replacementStatus != "pending" {
+		t.Fatalf("effect-bound stale status=%q err=%v", replacementStatus, err)
 	}
+}
+
+func createObservationBatch(
+	t *testing.T,
+	f *compiledRunWriteFixture,
+	identity types.RunIdentity,
+	ref types.RunSnapshotRef,
+	key string,
+) int64 {
+	t.Helper()
+	batchID, err := f.base.st.CreatePushBatchForTaskRunV1(
+		t.Context(),
+		identity,
+		ref,
+		key,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winner, err := f.base.st.ClaimPushBatchDeliveryAuthority(
+		t.Context(),
+		types.PushBatchScope{
+			TenantID: identity.TenantID,
+			UserID:   identity.UserID,
+			BatchID:  batchID,
+		},
+		types.PushBatchDeliveryAuthorityEffect,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if winner != types.PushBatchDeliveryAuthorityEffect {
+		t.Fatalf("observation batch authority=%q", winner)
+	}
+	return batchID
 }
 
 func TestAllProblemReasonsEnterDurableTriage(t *testing.T) {

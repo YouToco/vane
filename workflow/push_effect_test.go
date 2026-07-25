@@ -71,6 +71,7 @@ func (f *pushEffectObservationStoreFake) ReserveObservedEventV1(
 	_ context.Context,
 	_ types.RunIdentity,
 	_ types.RunSnapshotRef,
+	_ int64,
 	_ observation.QualifiedEvent,
 ) (bool, error) {
 	f.mu.Lock()
@@ -85,6 +86,7 @@ func (f *pushEffectObservationStoreFake) BindObservedEventDeliveryV1(
 	_ types.RunSnapshotRef,
 	_ string,
 	eventKey string,
+	_ int64,
 	deliveryID int64,
 ) error {
 	f.mu.Lock()

@@ -386,7 +386,18 @@ func (s *Store) InsertDeliveryForTaskRunV1(
 	if status == "" {
 		status = types.DeliveryStatusPending
 	}
-	tx, err := s.beginAuthorizedCompiledRunWriteV1(ctx, expected, ref)
+	tx, _, err := s.beginObservedEventAdmissionV1(
+		ctx,
+		expected,
+		ref,
+		[]types.PushBatchScope{{
+			TenantID: expected.TenantID,
+			UserID:   expected.UserID,
+			BatchID:  d.BatchID,
+		}},
+		map[int64]int64{d.BatchID: ref.SnapshotID},
+		false,
+	)
 	if err != nil {
 		return 0, false, false, err
 	}

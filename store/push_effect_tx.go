@@ -85,6 +85,11 @@ func (s *Store) beginPushEffectRoleTx(
 		rollbackPushEffectTx(ctx, tx)
 		return nil, fmt.Errorf("set push effect tenant context: %w", err)
 	}
+	_, err = lockTenantAdmissionRoot(ctx, tx, tenantID)
+	if err != nil {
+		rollbackPushEffectTx(ctx, tx)
+		return nil, fmt.Errorf("lock push effect tenant admission: %w", err)
+	}
 	if _, err := tx.Exec(ctx, setRole); err != nil {
 		rollbackPushEffectTx(ctx, tx)
 		return nil, fmt.Errorf("set push effect role: %w", err)

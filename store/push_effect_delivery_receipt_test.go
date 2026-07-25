@@ -42,12 +42,13 @@ func TestPushEffectSentAndDeliveryReceiptsAreAtomic(t *testing.T) {
 			t.Fatalf("exact response-lost replay: %v", err)
 		}
 
-		var effectStatus string
+		var effectStatus, batchStatus string
 		var sentDeliveries int
 		var cardsMatch, observedDelivered bool
 		if err := f.db.QueryRowContext(ctx, `
 			SELECT
 			  (SELECT status FROM push_effects WHERE id=$1),
+			  (SELECT status FROM push_batches WHERE id=$9),
 			  (SELECT count(*) FROM deliveries
 			    WHERE id=ANY($2) AND status='sent'
 			      AND feishu_message_id='om_atomic' AND sent_at IS NOT NULL),
@@ -64,8 +65,10 @@ func TestPushEffectSentAndDeliveryReceiptsAreAtomic(t *testing.T) {
 			f.prepared.ID, f.prepared.DeliveryIDs, f.prepared.Card,
 			f.prepared.TenantID, f.prepared.UserID, f.prepared.TaskID,
 			f.prepared.DeliveryIDs[0], eventKey,
+			f.prepared.BatchID,
 		).Scan(
 			&effectStatus,
+			&batchStatus,
 			&sentDeliveries,
 			&cardsMatch,
 			&observedDelivered,
@@ -73,11 +76,13 @@ func TestPushEffectSentAndDeliveryReceiptsAreAtomic(t *testing.T) {
 			t.Fatal(err)
 		}
 		if effectStatus != string(pusheffect.StatusSent) ||
+			batchStatus != string(types.BatchStatusDone) ||
 			sentDeliveries != len(f.prepared.DeliveryIDs) ||
 			!cardsMatch || !observedDelivered {
 			t.Fatalf(
-				"effect/deliveries=%s/%d cardsMatch=%v observed=%v",
+				"effect/batch/deliveries=%s/%s/%d cardsMatch=%v observed=%v",
 				effectStatus,
+				batchStatus,
 				sentDeliveries,
 				cardsMatch,
 				observedDelivered,
@@ -156,12 +161,13 @@ func TestPushEffectSentAndDeliveryReceiptsAreAtomic(t *testing.T) {
 		if err == nil {
 			t.Fatal("injected effect receipt failure returned nil")
 		}
-		var effectStatus string
+		var effectStatus, batchStatus string
 		var pending int
 		var observationQualified bool
 		if err := f.db.QueryRowContext(ctx, `
 			SELECT
 			  (SELECT status FROM push_effects WHERE id=$1),
+			  (SELECT status FROM push_batches WHERE id=$8),
 			  (SELECT count(*) FROM deliveries
 			    WHERE id=ANY($2) AND status='pending'
 			      AND feishu_message_id='' AND sent_at IS NULL),
@@ -174,15 +180,23 @@ func TestPushEffectSentAndDeliveryReceiptsAreAtomic(t *testing.T) {
 			f.prepared.ID, f.prepared.DeliveryIDs,
 			f.prepared.TenantID, f.prepared.UserID, f.prepared.TaskID,
 			f.prepared.DeliveryIDs[0], eventKey,
-		).Scan(&effectStatus, &pending, &observationQualified); err != nil {
+			f.prepared.BatchID,
+		).Scan(
+			&effectStatus,
+			&batchStatus,
+			&pending,
+			&observationQualified,
+		); err != nil {
 			t.Fatal(err)
 		}
 		if effectStatus != string(pusheffect.StatusSending) ||
+			batchStatus != string(types.BatchStatusPending) ||
 			pending != len(f.prepared.DeliveryIDs) ||
 			!observationQualified {
 			t.Fatalf(
-				"partial commit effect=%s pending=%d observationQualified=%v",
+				"partial commit effect=%s batch=%s pending=%d observationQualified=%v",
 				effectStatus,
+				batchStatus,
 				pending,
 				observationQualified,
 			)

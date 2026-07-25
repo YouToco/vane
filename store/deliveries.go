@@ -37,19 +37,30 @@ func (s *Store) InsertDelivery(ctx context.Context, d *types.Delivery) (int64, e
 	if status == "" {
 		status = types.DeliveryStatusPending
 	}
+	tx, tenantID, err := s.beginDeliveryBatchAdmission(
+		ctx, d.BatchID, d.UserID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
 	var id int64
-	err := s.pool.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`INSERT INTO deliveries (
 			tenant_id, batch_id, user_id, content_item_id, score, body_md, card_json,
 			feishu_message_id, status
-		) VALUES (`+tenantOfUser+`$2), $1, $2, $3, $4, $5, $6, $7, $8)
+		) VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id`,
 		d.BatchID, d.UserID, d.ContentItemID, d.Score, d.BodyMD, card,
-		d.FeishuMessageID, status,
+		d.FeishuMessageID, status, tenantID,
 	).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("插入投递（batch=%d, user=%d）", d.BatchID, d.UserID), err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("提交投递（batch=%d, user=%d）", d.BatchID, d.UserID), err)
 	}
 	return id, nil
 }
@@ -72,17 +83,28 @@ func (s *Store) InsertDeliveryIdempotent(ctx context.Context, d *types.Delivery)
 	if status == "" {
 		status = types.DeliveryStatusPending
 	}
-	err = s.pool.QueryRow(ctx,
+	tx, tenantID, err := s.beginDeliveryBatchAdmission(
+		ctx, d.BatchID, d.UserID,
+	)
+	if err != nil {
+		return 0, false, false, err
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+	err = tx.QueryRow(ctx,
 		`INSERT INTO deliveries (
 			tenant_id, batch_id, user_id, content_item_id, score, body_md, card_json,
 			feishu_message_id, status
-		) VALUES (`+tenantOfUser+`$2), $1, $2, $3, $4, $5, $6, $7, $8)
+		) VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (batch_id, content_item_id) WHERE content_item_id IS NOT NULL DO NOTHING
 		RETURNING id`,
 		d.BatchID, d.UserID, d.ContentItemID, d.Score, d.BodyMD, card,
-		d.FeishuMessageID, status,
+		d.FeishuMessageID, status, tenantID,
 	).Scan(&id)
 	if err == nil {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, false, false, types.NewAppError(
+				types.CodeDatabase, "提交幂等投递", err)
+		}
 		return id, false, false, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -91,13 +113,76 @@ func (s *Store) InsertDeliveryIdempotent(ctx context.Context, d *types.Delivery)
 	}
 	// 命中批内内容唯一键冲突：投递已存在，补查其 id 与 status，判定是否已发。
 	var st types.DeliveryStatus
-	if qerr := s.pool.QueryRow(ctx,
-		`SELECT id, status FROM deliveries WHERE batch_id = $1 AND content_item_id = $2`,
-		d.BatchID, d.ContentItemID).Scan(&id, &st); qerr != nil {
+	if qerr := tx.QueryRow(ctx,
+		`SELECT id, status FROM deliveries
+		  WHERE tenant_id=$1 AND user_id=$2
+		    AND batch_id=$3 AND content_item_id=$4`,
+		tenantID, d.UserID, d.BatchID, d.ContentItemID).Scan(&id, &st); qerr != nil {
 		return 0, false, false, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("回查既有投递（batch=%d, content_item=%v）", d.BatchID, d.ContentItemID), qerr)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, false, false, types.NewAppError(
+			types.CodeDatabase, "提交幂等投递回放", err)
+	}
 	return id, true, st == types.DeliveryStatusSent, nil
+}
+
+func (s *Store) beginDeliveryBatchAdmission(
+	ctx context.Context,
+	batchID, userID int64,
+) (pgx.Tx, int64, error) {
+	if batchID <= 0 || userID <= 0 {
+		return nil, 0, types.NewAppError(
+			types.CodeValidation, "投递 batch scope 无效", nil)
+	}
+	var tenantID int64
+	if err := s.pool.QueryRow(ctx, `
+		SELECT tenant_id
+		  FROM push_batches
+		 WHERE id=$1 AND user_id=$2`,
+		batchID, userID,
+	).Scan(&tenantID); err != nil {
+		return nil, 0, types.NewAppError(
+			types.CodeDatabase, "读取投递 batch 准入", err)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, 0, types.NewAppError(
+			types.CodeDatabase, "开启投递 batch 准入", err)
+	}
+	if err := lockPushEffectSchemaWriter(ctx, tx); err != nil {
+		rollbackCompiledTaskTx(ctx, tx)
+		return nil, 0, types.NewAppError(
+			types.CodeDatabase, "锁定投递 schema 准入", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true)`,
+		fmt.Sprintf("%d", tenantID),
+	); err != nil {
+		rollbackCompiledTaskTx(ctx, tx)
+		return nil, 0, types.NewAppError(
+			types.CodeDatabase, "设置投递租户上下文", err)
+	}
+	exists, err := lockTenantAdmissionRoot(ctx, tx, tenantID)
+	if err != nil || !exists {
+		rollbackCompiledTaskTx(ctx, tx)
+		return nil, 0, types.NewAppError(
+			types.CodeConflict, "投递租户准入不可用", err)
+	}
+	var lockedTenantID int64
+	if err := tx.QueryRow(ctx, `
+		SELECT tenant_id
+		  FROM push_batches
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		 FOR UPDATE`,
+		batchID, tenantID, userID,
+	).Scan(&lockedTenantID); err != nil {
+		rollbackCompiledTaskTx(ctx, tx)
+		return nil, 0, types.NewAppError(
+			types.CodeConflict, "投递 batch 准入不可用", err)
+	}
+	return tx, tenantID, nil
 }
 
 // MarkDeliverySent 回填飞书消息 id 与最终卡片 JSON、置 status=sent 并写 sent_at。

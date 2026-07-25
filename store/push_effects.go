@@ -76,16 +76,17 @@ func (s *Store) CreatePushEffect(
 	}
 	defer rollbackPushEffectTx(ctx, tx)
 
-	tenantExists, err := lockTenantAdmissionRoot(ctx, tx, prepared.TenantID)
-	if err != nil {
-		return nil, pushEffectDatabaseError(
-			"lock push effect tenant admission root", err)
-	}
-	if !tenantExists {
-		return nil, pushEffectConflict("push effect tenant is unavailable")
-	}
-
-	if err := verifyPushEffectAggregate(ctx, tx, prepared); err != nil {
+	if _, err := lockPushEffectBatchAdmission(
+		ctx,
+		tx,
+		types.PushBatchScope{
+			TenantID: prepared.TenantID,
+			UserID:   prepared.UserID,
+			BatchID:  prepared.BatchID,
+		},
+		prepared.RunSnapshotID,
+		types.PushBatchDeliveryAuthorityEffect,
+	); err != nil {
 		return nil, err
 	}
 	existing, err := loadPushEffectForUpdate(ctx, tx, prepared.Scope())
@@ -94,6 +95,9 @@ func (s *Store) CreatePushEffect(
 			return nil, err
 		}
 		if err := validateStoredPushEffect(existing); err != nil {
+			return nil, err
+		}
+		if err := verifyPushEffectAggregate(ctx, tx, prepared); err != nil {
 			return nil, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -143,6 +147,9 @@ func (s *Store) CreatePushEffect(
 		}
 	}
 	if err := validateStoredPushEffect(effect); err != nil {
+		return nil, err
+	}
+	if err := verifyPushEffectAggregate(ctx, tx, prepared); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -347,6 +354,9 @@ func (s *Store) ClaimPushEffect(
 		return nil, pushEffectDatabaseError("begin claim transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(ctx, tx, params.Scope); err != nil {
+		return nil, err
+	}
 	effect, databaseNow, err := loadPushEffectWithClock(ctx, tx, params.Scope)
 	if err != nil {
 		return nil, err
@@ -417,6 +427,9 @@ func (s *Store) ClaimPushEffectReconciliation(
 			"begin reconciliation claim transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(ctx, tx, params.Scope); err != nil {
+		return nil, err
+	}
 	effect, databaseNow, err := loadPushEffectWithClock(ctx, tx, params.Scope)
 	if err != nil {
 		return nil, err
@@ -488,6 +501,9 @@ func (s *Store) TakeOverStalePushEffect(
 		return nil, pushEffectDatabaseError("begin takeover transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(ctx, tx, scope); err != nil {
+		return nil, err
+	}
 	effect, databaseNow, err := loadPushEffectWithClock(ctx, tx, scope)
 	if err != nil {
 		return nil, err
@@ -626,6 +642,11 @@ func (s *Store) tryDeferPushEffectReconciliation(
 			"begin reconciliation deferral transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(
+		ctx, tx, schedule.Scope,
+	); err != nil {
+		return false, err
+	}
 	effect, _, err := loadPushEffectWithClock(ctx, tx, schedule.Scope)
 	if err != nil {
 		return false, err
@@ -778,6 +799,9 @@ func (s *Store) recordPushEffectFailure(
 		return pushEffectDatabaseError("begin failure transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	if err := lockPushEffectBatchForScope(ctx, tx, params.Scope); err != nil {
+		return err
+	}
 	effect, databaseNow, err := loadPushEffectWithClock(ctx, tx, params.Scope)
 	if err != nil {
 		return err
@@ -904,8 +928,8 @@ func (s *Store) RecordPushEffectSent(
 // RecordPushEffectSentWithDeliveries atomically closes one provider effect and
 // every delivery frozen into it. A process crash can therefore leave both
 // sides pending or both sides sent, never "provider effect sent / deliveries
-// pending" (or the reverse). Batch completion remains a separate idempotent
-// receipt: existing compiled recovery closes it once all deliveries are sent.
+// pending" (or the reverse). The same receipt closes the batch only after its
+// complete contiguous chunk/effect/delivery/observation aggregate is terminal.
 func (s *Store) RecordPushEffectSentWithDeliveries(
 	ctx context.Context,
 	receipt pusheffect.SentReceipt,
@@ -919,6 +943,70 @@ func (s *Store) RecordPushEffectSentWithDeliveries(
 			"begin sent delivery receipt transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+
+	var (
+		admissionBatchID       int64
+		admissionPayload       []byte
+		admissionPayloadDigest string
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT batch_id,canonical_payload,payload_digest
+		  FROM push_effects
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		receipt.ID,
+		receipt.TenantID,
+		receipt.UserID,
+	).Scan(
+		&admissionBatchID,
+		&admissionPayload,
+		&admissionPayloadDigest,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pushEffectNotFound()
+	}
+	if err != nil {
+		return pushEffectDatabaseError(
+			"load sent receipt batch admission",
+			err,
+		)
+	}
+	admissionCanonical, err := pusheffect.Decode(
+		admissionPayload,
+		admissionPayloadDigest,
+	)
+	if err != nil {
+		return pushEffectIntegrity()
+	}
+	admissionPrepared := admissionCanonical.Prepared()
+	if admissionPrepared.ID != receipt.ID ||
+		admissionPrepared.TenantID != receipt.TenantID ||
+		admissionPrepared.UserID != receipt.UserID ||
+		admissionPrepared.BatchID != admissionBatchID {
+		return pushEffectIntegrity()
+	}
+	batchStatus, err := lockPushEffectBatchAdmission(
+		ctx,
+		tx,
+		types.PushBatchScope{
+			TenantID: receipt.TenantID,
+			UserID:   receipt.UserID,
+			BatchID:  admissionBatchID,
+		},
+		admissionPrepared.RunSnapshotID,
+		types.PushBatchDeliveryAuthorityEffect,
+	)
+	if err != nil {
+		return err
+	}
+	if err := lockPushEffectBatchRows(
+		ctx,
+		tx,
+		receipt.TenantID,
+		receipt.UserID,
+		admissionBatchID,
+	); err != nil {
+		return err
+	}
 
 	var (
 		status                        pusheffect.Status
@@ -978,7 +1066,7 @@ func (s *Store) RecordPushEffectSentWithDeliveries(
 	if err != nil {
 		return err
 	}
-	if err := lockAndValidatePushEffectObservedEvents(
+	if _, err := lockAndValidatePushEffectObservedEvents(
 		ctx, tx, prepared,
 	); err != nil {
 		return err
@@ -991,6 +1079,14 @@ func (s *Store) RecordPushEffectSentWithDeliveries(
 		}
 		if err := markPushEffectObservedEventsDelivered(
 			ctx, tx, prepared,
+		); err != nil {
+			return err
+		}
+		if err := settlePushEffectBatchReceipt(
+			ctx,
+			tx,
+			prepared,
+			batchStatus,
 		); err != nil {
 			return err
 		}
@@ -1052,11 +1148,81 @@ func (s *Store) RecordPushEffectSentWithDeliveries(
 	if tag.RowsAffected() != 1 {
 		return pushEffectLeaseLost()
 	}
+	if err := settlePushEffectBatchReceipt(
+		ctx,
+		tx,
+		prepared,
+		batchStatus,
+	); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return pushEffectDatabaseError(
 			"commit sent delivery receipt transaction", err)
 	}
 	return nil
+}
+
+func lockPushEffectBatchRows(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID, userID, batchID int64,
+) error {
+	rows, err := tx.Query(ctx, `
+		SELECT id
+		  FROM push_effects
+		 WHERE tenant_id=$1 AND user_id=$2 AND batch_id=$3
+		 ORDER BY chunk_index,id
+		 FOR UPDATE`,
+		tenantID, userID, batchID,
+	)
+	if err != nil {
+		return pushEffectDatabaseError("lock push effect batch rows", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return pushEffectDatabaseError("scan push effect batch row", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return pushEffectDatabaseError("iterate push effect batch rows", err)
+	}
+	return nil
+}
+
+func lockPushEffectBatchForScope(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope pusheffect.Scope,
+) error {
+	var batchID, snapshotID int64
+	err := tx.QueryRow(ctx, `
+		SELECT batch_id,run_snapshot_id
+		  FROM push_effects
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		scope.ID, scope.TenantID, scope.UserID,
+	).Scan(&batchID, &snapshotID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pushEffectNotFound()
+	}
+	if err != nil {
+		return pushEffectDatabaseError(
+			"inspect push effect batch admission", err)
+	}
+	_, err = lockPushEffectBatchAdmission(
+		ctx,
+		tx,
+		types.PushBatchScope{
+			TenantID: scope.TenantID,
+			UserID:   scope.UserID,
+			BatchID:  batchID,
+		},
+		snapshotID,
+		types.PushBatchDeliveryAuthorityEffect,
+	)
+	return err
 }
 
 func lockAndValidatePushEffectDeliveries(
@@ -1124,7 +1290,7 @@ func lockAndValidatePushEffectObservedEvents(
 	ctx context.Context,
 	tx pgx.Tx,
 	prepared pusheffect.Prepared,
-) error {
+) (bool, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT tenant_id,user_id,task_id,run_snapshot_id,temporal_run_id,
 		       delivery_id,event_key,status,delivered_at
@@ -1138,7 +1304,7 @@ func lockAndValidatePushEffectObservedEvents(
 		prepared.DeliveryIDs,
 	)
 	if err != nil {
-		return pushEffectDatabaseError(
+		return false, pushEffectDatabaseError(
 			"lock observed event receipt aggregate",
 			err,
 		)
@@ -1152,6 +1318,7 @@ func lockAndValidatePushEffectObservedEvents(
 		}
 	}
 	seen := make(map[int64]struct{}, len(expected))
+	allDelivered := true
 	for rows.Next() {
 		var (
 			tenantID, userID, snapshotID, deliveryID int64
@@ -1169,7 +1336,7 @@ func lockAndValidatePushEffectObservedEvents(
 			&status,
 			&deliveredAt,
 		); err != nil {
-			return pushEffectDatabaseError(
+			return false, pushEffectDatabaseError(
 				"scan observed event receipt aggregate",
 				err,
 			)
@@ -1186,25 +1353,26 @@ func lockAndValidatePushEffectObservedEvents(
 			(status != "qualified" && status != "delivered") ||
 			(status == "qualified" && deliveredAt != nil) ||
 			(status == "delivered" && deliveredAt == nil) {
-			return pushEffectConflict(
+			return false, pushEffectConflict(
 				"observed event receipt aggregate differs",
 			)
 		}
+		allDelivered = allDelivered && status == "delivered"
 		seen[deliveryID] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
-		return pushEffectDatabaseError(
+		return false, pushEffectDatabaseError(
 			"iterate observed event receipt aggregate",
 			err,
 		)
 	}
 	rows.Close()
 	if len(seen) != len(expected) {
-		return pushEffectConflict(
+		return false, pushEffectConflict(
 			"observed event receipt aggregate is incomplete",
 		)
 	}
-	return nil
+	return allDelivered, nil
 }
 
 func markPushEffectObservedEventsDelivered(
@@ -1251,6 +1419,224 @@ func markPushEffectObservedEventsDelivered(
 				"observed event delivery receipt differs",
 			)
 		}
+	}
+	return nil
+}
+
+func settlePushEffectBatchReceipt(
+	ctx context.Context,
+	tx pgx.Tx,
+	current pusheffect.Prepared,
+	batchStatus types.BatchStatus,
+) error {
+	rows, err := tx.Query(ctx, `
+		SELECT id,status,chunk_index,chunk_count,delivery_ids,
+		       canonical_payload,payload_digest
+		  FROM push_effects
+		 WHERE tenant_id=$1 AND user_id=$2 AND batch_id=$3
+		 ORDER BY chunk_index,id
+		 FOR UPDATE`,
+		current.TenantID,
+		current.UserID,
+		current.BatchID,
+	)
+	if err != nil {
+		return pushEffectDatabaseError("lock push effect batch aggregate", err)
+	}
+	defer rows.Close()
+
+	type batchEffect struct {
+		prepared pusheffect.Prepared
+		status   pusheffect.Status
+	}
+	effects := make([]batchEffect, 0, current.ChunkCount)
+	deliveryIDs := make([]int64, 0)
+	complete := true
+	for rows.Next() {
+		var (
+			id, payloadDigest string
+			status            pusheffect.Status
+			chunkIndex        int
+			chunkCount        int
+			storedDeliveryIDs []int64
+			canonicalPayload  []byte
+		)
+		if err := rows.Scan(
+			&id,
+			&status,
+			&chunkIndex,
+			&chunkCount,
+			&storedDeliveryIDs,
+			&canonicalPayload,
+			&payloadDigest,
+		); err != nil {
+			return pushEffectDatabaseError(
+				"scan push effect batch aggregate",
+				err,
+			)
+		}
+		canonical, err := pusheffect.Decode(
+			canonicalPayload,
+			payloadDigest,
+		)
+		if err != nil {
+			return pushEffectIntegrity()
+		}
+		prepared := canonical.Prepared()
+		if prepared.ID != id ||
+			prepared.TenantID != current.TenantID ||
+			prepared.UserID != current.UserID ||
+			prepared.BatchID != current.BatchID ||
+			prepared.RunSnapshotID != current.RunSnapshotID ||
+			prepared.RunID != current.RunID ||
+			prepared.ChunkIndex != chunkIndex ||
+			prepared.ChunkCount != chunkCount ||
+			!slices.Equal(prepared.DeliveryIDs, storedDeliveryIDs) {
+			return pushEffectIntegrity()
+		}
+		effects = append(effects, batchEffect{
+			prepared: prepared,
+			status:   status,
+		})
+		deliveryIDs = append(deliveryIDs, prepared.DeliveryIDs...)
+	}
+	if err := rows.Err(); err != nil {
+		return pushEffectDatabaseError(
+			"iterate push effect batch aggregate",
+			err,
+		)
+	}
+	rows.Close()
+	if len(effects) != current.ChunkCount {
+		complete = false
+	}
+	for index, effect := range effects {
+		if effect.prepared.ChunkCount != current.ChunkCount ||
+			effect.prepared.ChunkIndex != index ||
+			effect.status != pusheffect.StatusSent {
+			complete = false
+		}
+	}
+	slices.Sort(deliveryIDs)
+	for index := 1; index < len(deliveryIDs); index++ {
+		if deliveryIDs[index] == deliveryIDs[index-1] {
+			complete = false
+		}
+	}
+
+	deliveryRows, err := tx.Query(ctx, `
+		SELECT id,status
+		  FROM deliveries
+		 WHERE tenant_id=$1 AND user_id=$2 AND batch_id=$3
+		 ORDER BY id
+		 FOR UPDATE`,
+		current.TenantID,
+		current.UserID,
+		current.BatchID,
+	)
+	if err != nil {
+		return pushEffectDatabaseError(
+			"lock push effect batch deliveries",
+			err,
+		)
+	}
+	defer deliveryRows.Close()
+	storedDeliveryIDs := make([]int64, 0, len(deliveryIDs))
+	for deliveryRows.Next() {
+		var id int64
+		var status types.DeliveryStatus
+		if err := deliveryRows.Scan(&id, &status); err != nil {
+			return pushEffectDatabaseError(
+				"scan push effect batch delivery",
+				err,
+			)
+		}
+		storedDeliveryIDs = append(storedDeliveryIDs, id)
+		if status != types.DeliveryStatusSent {
+			complete = false
+		}
+	}
+	if err := deliveryRows.Err(); err != nil {
+		return pushEffectDatabaseError(
+			"iterate push effect batch deliveries",
+			err,
+		)
+	}
+	deliveryRows.Close()
+	if !slices.Equal(deliveryIDs, storedDeliveryIDs) {
+		complete = false
+	}
+	for _, effect := range effects {
+		allDelivered, err := lockAndValidatePushEffectObservedEvents(
+			ctx,
+			tx,
+			effect.prepared,
+		)
+		if err != nil {
+			return err
+		}
+		if !allDelivered {
+			complete = false
+		}
+	}
+	if !complete {
+		if batchStatus == types.BatchStatusDone {
+			return pushEffectConflict(
+				"completed push effect batch aggregate differs",
+			)
+		}
+		if batchStatus == types.BatchStatusFailed {
+			tag, err := tx.Exec(ctx, `
+				UPDATE push_batches
+				   SET status=$5
+				 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+				   AND run_snapshot_id=$4
+				   AND delivery_authority=$6
+				   AND status=$7`,
+				current.BatchID,
+				current.TenantID,
+				current.UserID,
+				current.RunSnapshotID,
+				types.BatchStatusPending,
+				types.PushBatchDeliveryAuthorityEffect,
+				types.BatchStatusFailed,
+			)
+			if err != nil {
+				return pushEffectDatabaseError(
+					"reopen incomplete push effect batch",
+					err,
+				)
+			}
+			if tag.RowsAffected() != 1 {
+				return pushEffectConflict(
+					"incomplete push effect batch status differs",
+				)
+			}
+		}
+		return nil
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE push_batches
+		   SET status=$5
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		   AND run_snapshot_id=$4
+		   AND delivery_authority=$6
+		   AND status IN ($5,$7,$8)`,
+		current.BatchID,
+		current.TenantID,
+		current.UserID,
+		current.RunSnapshotID,
+		types.BatchStatusDone,
+		types.PushBatchDeliveryAuthorityEffect,
+		types.BatchStatusPending,
+		types.BatchStatusFailed,
+	)
+	if err != nil {
+		return pushEffectDatabaseError("complete push effect batch", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return pushEffectConflict("push effect batch completion differs")
 	}
 	return nil
 }
@@ -1348,18 +1734,50 @@ func verifyPushEffectAggregate(
 	).Scan(&batchFound); err != nil {
 		return pushEffectDatabaseError("verify push batch", err)
 	}
-	var deliveryCount int
+	var (
+		lockedDeliveryIDs   []int64
+		observedDeliveryIDs []int64
+		observedEventKeys   []string
+	)
 	if err := tx.QueryRow(ctx, `
-		SELECT count(*) FROM deliveries
-		 WHERE tenant_id=$1 AND user_id=$2 AND batch_id=$3
-		   AND id=ANY($4::bigint[])`,
+		SELECT locked_delivery_ids,observed_delivery_ids,observed_event_keys
+		  FROM lock_push_effect_aggregate_v1($1,$2,$3,$4)`,
 		prepared.TenantID, prepared.UserID, prepared.BatchID,
 		prepared.DeliveryIDs,
-	).Scan(&deliveryCount); err != nil {
-		return pushEffectDatabaseError("verify deliveries", err)
+	).Scan(
+		&lockedDeliveryIDs,
+		&observedDeliveryIDs,
+		&observedEventKeys,
+	); err != nil {
+		return pushEffectDatabaseError(
+			"lock push effect delivery and observation aggregate", err)
 	}
-	if !snapshotFound || !batchFound || deliveryCount != len(prepared.DeliveryIDs) {
+	expectedDeliveryIDs := slices.Clone(prepared.DeliveryIDs)
+	slices.Sort(expectedDeliveryIDs)
+	if !snapshotFound || !batchFound ||
+		!slices.Equal(lockedDeliveryIDs, expectedDeliveryIDs) {
 		return pushEffectConflict("push effect aggregate provenance differs")
+	}
+	expectedObserved := make(map[int64]string, len(prepared.ObservationEventKeys))
+	for index, eventKey := range prepared.ObservationEventKeys {
+		if eventKey != "" {
+			expectedObserved[prepared.DeliveryIDs[index]] = eventKey
+		}
+	}
+	if len(observedDeliveryIDs) != len(expectedObserved) ||
+		len(observedEventKeys) != len(expectedObserved) {
+		return pushEffectConflict("push effect observation aggregate differs")
+	}
+	for index, deliveryID := range observedDeliveryIDs {
+		eventKey, ok := expectedObserved[deliveryID]
+		if !ok || eventKey != observedEventKeys[index] {
+			return pushEffectConflict(
+				"push effect observation aggregate differs")
+		}
+		delete(expectedObserved, deliveryID)
+	}
+	if len(expectedObserved) != 0 {
+		return pushEffectConflict("push effect observation aggregate differs")
 	}
 	return nil
 }

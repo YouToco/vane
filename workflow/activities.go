@@ -385,11 +385,11 @@ type ObservationRuntimeStore interface {
 	) error
 	ReserveObservedEventV1(
 		context.Context, types.RunIdentity, types.RunSnapshotRef,
-		observation.QualifiedEvent,
+		int64, observation.QualifiedEvent,
 	) (bool, error)
 	BindObservedEventDeliveryV1(
 		context.Context, types.RunIdentity, types.RunSnapshotRef,
-		string, string, int64,
+		string, string, int64, int64,
 	) error
 	MarkObservedEventDeliveredV1(
 		context.Context, types.RunIdentity, types.RunSnapshotRef, int64,
@@ -2753,7 +2753,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 				return nonRetryable(eventErr)
 			}
 			accepted, reserveErr := a.observationStore.ReserveObservedEventV1(
-				ctx, compiledIdentity, in.Run.Snapshot, event)
+				ctx, compiledIdentity, in.Run.Snapshot, batchID, event)
 			if reserveErr != nil {
 				return retryableOrNot(reserveErr)
 			}
@@ -2804,7 +2804,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			if err := a.observationStore.BindObservedEventDeliveryV1(
 				ctx, compiledIdentity, in.Run.Snapshot,
 				card.Scored.Item.ObservationPolicyDigest,
-				card.Scored.Item.ObservationEventKey, delID,
+				card.Scored.Item.ObservationEventKey, batchID, delID,
 			); err != nil {
 				return retryableOrNot(err)
 			}

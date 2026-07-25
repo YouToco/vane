@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -207,6 +209,7 @@ func (s *Store) ReserveObservedEventV1(
 	ctx context.Context,
 	expected types.RunIdentity,
 	ref types.RunSnapshotRef,
+	batchID int64,
 	event observation.QualifiedEvent,
 ) (bool, error) {
 	if !validObservationDigest(event.PolicyDigest) ||
@@ -215,76 +218,253 @@ func (s *Store) ReserveObservedEventV1(
 		len(event.EvidenceJSON) == 0 || !json.Valid(event.EvidenceJSON) {
 		return false, taskRunValidationError("qualified event is invalid")
 	}
-	tx, err := s.beginAuthorizedCompiledRunWriteV1(ctx, expected, ref)
+	for attempt := 0; attempt < 3; attempt++ {
+		accepted, err := s.reserveObservedEventAttemptV1(
+			ctx, expected, ref, batchID, event,
+		)
+		if !errors.Is(err, errObservedEventAdmissionDrift) {
+			return accepted, err
+		}
+	}
+	return false, observationConflict("observed event admission kept changing")
+}
+
+var errObservedEventAdmissionDrift = errors.New(
+	"observed event admission candidate changed",
+)
+
+type observedEventAdmissionCandidate struct {
+	found                  bool
+	id, userID, snapshotID int64
+	runID, status          string
+	createdAt              time.Time
+	deliveryID, batchID    *int64
+	batchSnapshotID        *int64
+}
+
+func (s *Store) loadObservedEventAdmissionCandidate(
+	ctx context.Context,
+	expected types.RunIdentity,
+	event observation.QualifiedEvent,
+) (observedEventAdmissionCandidate, error) {
+	var candidate observedEventAdmissionCandidate
+	err := s.pool.QueryRow(ctx, `
+		SELECT e.id,e.user_id,e.run_snapshot_id,e.temporal_run_id,e.status,
+		       e.created_at,e.delivery_id,d.batch_id,b.run_snapshot_id
+		  FROM task_observed_events e
+		  LEFT JOIN deliveries d
+		    ON d.id=e.delivery_id AND d.tenant_id=e.tenant_id
+		   AND d.user_id=e.user_id
+		  LEFT JOIN push_batches b
+		    ON b.id=d.batch_id AND b.tenant_id=d.tenant_id
+		   AND b.user_id=d.user_id
+		 WHERE e.tenant_id=$1 AND e.task_id=$2
+		   AND e.policy_digest=$3 AND e.event_key=$4`,
+		expected.TenantID,
+		expected.TaskID,
+		event.PolicyDigest,
+		event.EventKey,
+	).Scan(
+		&candidate.id,
+		&candidate.userID,
+		&candidate.snapshotID,
+		&candidate.runID,
+		&candidate.status,
+		&candidate.createdAt,
+		&candidate.deliveryID,
+		&candidate.batchID,
+		&candidate.batchSnapshotID,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return candidate, nil
+	}
+	if err != nil {
+		return candidate, taskRunDatabaseError(
+			"inspect observed event admission candidate",
+			err,
+		)
+	}
+	candidate.found = true
+	return candidate, nil
+}
+
+func (s *Store) reserveObservedEventAttemptV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	batchID int64,
+	event observation.QualifiedEvent,
+) (bool, error) {
+	candidate, err := s.loadObservedEventAdmissionCandidate(
+		ctx, expected, event,
+	)
+	if err != nil {
+		return false, err
+	}
+	scopes := []types.PushBatchScope{{
+		TenantID: expected.TenantID,
+		UserID:   expected.UserID,
+		BatchID:  batchID,
+	}}
+	snapshots := map[int64]int64{batchID: ref.SnapshotID}
+	if candidate.found && candidate.deliveryID != nil {
+		if candidate.userID != expected.UserID ||
+			candidate.batchID == nil ||
+			candidate.batchSnapshotID == nil {
+			return false, observationConflict(
+				"observed event delivery batch is unavailable",
+			)
+		}
+		scopes = append(scopes, types.PushBatchScope{
+			TenantID: expected.TenantID,
+			UserID:   expected.UserID,
+			BatchID:  *candidate.batchID,
+		})
+		snapshots[*candidate.batchID] = *candidate.batchSnapshotID
+	}
+	tx, batchStatuses, err := s.beginObservedEventAdmissionV1(
+		ctx, expected, ref, scopes, snapshots, true,
+	)
 	if err != nil {
 		return false, err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
-	var id int64
-	err = tx.QueryRow(ctx,
-		`INSERT INTO task_observed_events (
+
+	batchIDs := make([]int64, 0, len(scopes))
+	for _, scope := range scopes {
+		batchIDs = append(batchIDs, scope.BatchID)
+	}
+	effectBatch, err := lockObservedEventPushEffects(
+		ctx, tx, expected.TenantID, expected.UserID, batchIDs,
+	)
+	if err != nil {
+		return false, err
+	}
+
+	if !candidate.found {
+		var id int64
+		err = tx.QueryRow(ctx,
+			`INSERT INTO task_observed_events (
 		     tenant_id,user_id,task_id,policy_digest,event_key,event_type,
 		     subject,occurred_at,evidence_json,run_snapshot_id,temporal_run_id
 		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 ON CONFLICT (tenant_id,task_id,policy_digest,event_key) DO NOTHING
 		 RETURNING id`,
-		expected.TenantID, expected.UserID, expected.TaskID,
-		event.PolicyDigest, event.EventKey, event.EventType, event.Subject,
-		event.OccurredAt, event.EvidenceJSON, ref.SnapshotID,
-		expected.TemporalRunID,
-	).Scan(&id)
-	if err == nil {
+			expected.TenantID, expected.UserID, expected.TaskID,
+			event.PolicyDigest, event.EventKey, event.EventType, event.Subject,
+			event.OccurredAt, event.EvidenceJSON, ref.SnapshotID,
+			expected.TemporalRunID,
+		).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, errObservedEventAdmissionDrift
+		}
+		if err != nil {
+			return false, taskRunDatabaseError("reserve qualified event", err)
+		}
 		if err := commitCompiledRunWriteV1(ctx, tx,
 			"commit qualified event reservation"); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return false, taskRunDatabaseError("reserve qualified event", err)
-	}
-	var snapshotID int64
-	var runID, status string
-	var deliveryID *int64
-	var reclaimable bool
-	if err := tx.QueryRow(ctx,
-		`SELECT e.run_snapshot_id,e.temporal_run_id,e.status,e.delivery_id,
-		        COALESCE((
-		            e.status='qualified'
-		            AND e.created_at <= clock_timestamp() - interval '10 minutes'
-		            AND (
-		                e.delivery_id IS NULL
-		                OR (
-		                    d.status='pending'
-		                    AND b.status IN ('failed','pending')
-		                )
-		            )
-		        ),false) AS reclaimable
-		   FROM task_observed_events e
-		   LEFT JOIN deliveries d ON d.id=e.delivery_id
-		   LEFT JOIN push_batches b ON b.id=d.batch_id
-		  WHERE e.tenant_id=$1 AND e.task_id=$2
-		    AND e.policy_digest=$3 AND e.event_key=$4
-		  FOR UPDATE OF e`,
-		expected.TenantID, expected.TaskID, event.PolicyDigest, event.EventKey,
-	).Scan(&snapshotID, &runID, &status, &deliveryID, &reclaimable); err != nil {
-		return false, taskRunDatabaseError("load qualified event conflict", err)
-	}
-	accepted := snapshotID == ref.SnapshotID &&
-		runID == expected.TemporalRunID && status == "qualified"
-	if !accepted && reclaimable {
-		if deliveryID != nil {
-			if _, updateErr := tx.Exec(ctx,
-				`UPDATE deliveries
-				    SET status='failed'
-				  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
-				    AND status='pending'`,
-				*deliveryID, expected.TenantID, expected.UserID,
-			); updateErr != nil {
-				return false, taskRunDatabaseError(
-					"retire stale observed event delivery", updateErr)
+
+	var deliveryStatus types.DeliveryStatus
+	if candidate.deliveryID != nil {
+		var lockedBatchID int64
+		if err := tx.QueryRow(ctx, `
+			SELECT batch_id,status
+			  FROM deliveries
+			 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+			 FOR UPDATE`,
+			*candidate.deliveryID,
+			expected.TenantID,
+			expected.UserID,
+		).Scan(&lockedBatchID, &deliveryStatus); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return false, errObservedEventAdmissionDrift
 			}
+			return false, taskRunDatabaseError(
+				"lock observed event delivery candidate", err)
 		}
+		if candidate.batchID == nil || lockedBatchID != *candidate.batchID {
+			return false, errObservedEventAdmissionDrift
+		}
+	}
+
+	var (
+		locked observedEventAdmissionCandidate
+		stale  bool
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT id,user_id,run_snapshot_id,temporal_run_id,status,
+		       created_at,delivery_id,
+		       created_at <= clock_timestamp()-interval '10 minutes'
+		  FROM task_observed_events
+		 WHERE tenant_id=$1 AND task_id=$2
+		   AND policy_digest=$3 AND event_key=$4
+		 FOR UPDATE`,
+		expected.TenantID,
+		expected.TaskID,
+		event.PolicyDigest,
+		event.EventKey,
+	).Scan(
+		&locked.id,
+		&locked.userID,
+		&locked.snapshotID,
+		&locked.runID,
+		&locked.status,
+		&locked.createdAt,
+		&locked.deliveryID,
+		&stale,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, errObservedEventAdmissionDrift
+	}
+	if err != nil {
+		return false, taskRunDatabaseError("lock qualified event conflict", err)
+	}
+	if locked.id != candidate.id ||
+		locked.userID != candidate.userID ||
+		locked.snapshotID != candidate.snapshotID ||
+		locked.runID != candidate.runID ||
+		locked.status != candidate.status ||
+		!locked.createdAt.Equal(candidate.createdAt) ||
+		!equalOptionalInt64(locked.deliveryID, candidate.deliveryID) {
+		return false, errObservedEventAdmissionDrift
+	}
+
+	accepted := locked.snapshotID == ref.SnapshotID &&
+		locked.runID == expected.TemporalRunID &&
+		locked.status == "qualified"
+	reclaimable := locked.status == "qualified" && stale
+	if candidate.deliveryID != nil {
+		previousBatchID := *candidate.batchID
+		reclaimable = reclaimable &&
+			deliveryStatus == types.DeliveryStatusPending &&
+			(batchStatuses[previousBatchID] == types.BatchStatusFailed ||
+				batchStatuses[previousBatchID] == types.BatchStatusPending) &&
+			!effectBatch[previousBatchID]
+	}
+	if !accepted && reclaimable && candidate.deliveryID != nil {
+		tag, updateErr := tx.Exec(ctx,
+			`UPDATE deliveries
+			    SET status='failed'
+			  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+			    AND batch_id=$4 AND status='pending'`,
+			*candidate.deliveryID,
+			expected.TenantID,
+			expected.UserID,
+			*candidate.batchID,
+		)
+		if updateErr != nil {
+			return false, taskRunDatabaseError(
+				"retire stale observed event delivery", updateErr)
+		}
+		if tag.RowsAffected() != 1 {
+			return false, errObservedEventAdmissionDrift
+		}
+	}
+	if !accepted && reclaimable {
 		tag, updateErr := tx.Exec(ctx,
 			`UPDATE task_observed_events
 			    SET event_type=$5,subject=$6,occurred_at=$7,evidence_json=$8,
@@ -308,22 +488,84 @@ func (s *Store) ReserveObservedEventV1(
 	return accepted, nil
 }
 
+func equalOptionalInt64(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func lockObservedEventPushEffects(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID, userID int64,
+	batchIDs []int64,
+) (map[int64]bool, error) {
+	slices.Sort(batchIDs)
+	batchIDs = slices.Compact(batchIDs)
+	var effectBatchIDs []int64
+	err := tx.QueryRow(ctx, `
+		SELECT lock_observed_event_push_effects_v1($1,$2,$3)`,
+		tenantID, userID, batchIDs,
+	).Scan(&effectBatchIDs)
+	if err != nil {
+		return nil, taskRunDatabaseError(
+			"lock observed event push effects", err)
+	}
+	found := make(map[int64]bool, len(batchIDs))
+	for _, effectBatchID := range effectBatchIDs {
+		found[effectBatchID] = true
+	}
+	return found, nil
+}
+
 func (s *Store) BindObservedEventDeliveryV1(
 	ctx context.Context,
 	expected types.RunIdentity,
 	ref types.RunSnapshotRef,
 	policyDigest, eventKey string,
+	batchID int64,
 	deliveryID int64,
 ) error {
 	if !validObservationDigest(policyDigest) || !validObservationDigest(eventKey) ||
-		deliveryID <= 0 {
+		batchID <= 0 || deliveryID <= 0 {
 		return taskRunValidationError("observed event delivery binding is invalid")
 	}
-	tx, err := s.beginAuthorizedCompiledRunWriteV1(ctx, expected, ref)
+	tx, _, err := s.beginObservedEventAdmissionV1(
+		ctx, expected, ref,
+		[]types.PushBatchScope{{
+			TenantID: expected.TenantID,
+			UserID:   expected.UserID,
+			BatchID:  batchID,
+		}},
+		map[int64]int64{batchID: ref.SnapshotID},
+		true,
+	)
 	if err != nil {
 		return err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
+	if _, err := lockObservedEventPushEffects(
+		ctx, tx, expected.TenantID, expected.UserID, []int64{batchID},
+	); err != nil {
+		return err
+	}
+	var lockedDeliveryID int64
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		  FROM deliveries
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND batch_id=$4
+		 FOR UPDATE`,
+		deliveryID,
+		expected.TenantID,
+		expected.UserID,
+		batchID,
+	).Scan(&lockedDeliveryID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return observationConflict("observed event delivery is unavailable")
+		}
+		return taskRunDatabaseError("lock observed event delivery", err)
+	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE task_observed_events e
 		    SET delivery_id=$6
@@ -331,13 +573,9 @@ func (s *Store) BindObservedEventDeliveryV1(
 		    AND e.policy_digest=$3 AND e.event_key=$4
 		    AND e.run_snapshot_id=$5 AND e.temporal_run_id=$7
 		    AND e.status='qualified'
-		    AND (e.delivery_id IS NULL OR e.delivery_id=$6)
-		    AND EXISTS (
-		        SELECT 1 FROM deliveries d
-		         WHERE d.id=$6 AND d.tenant_id=$1 AND d.user_id=$8
-		    )`,
+		    AND (e.delivery_id IS NULL OR e.delivery_id=$6)`,
 		expected.TenantID, expected.TaskID, policyDigest, eventKey,
-		ref.SnapshotID, deliveryID, expected.TemporalRunID, expected.UserID)
+		ref.SnapshotID, deliveryID, expected.TemporalRunID)
 	if err != nil {
 		return taskRunDatabaseError("bind observed event delivery", err)
 	}
