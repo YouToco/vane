@@ -97,12 +97,20 @@ func (m *Manager) sendCard(
 		}
 		return "", ae
 	}
-	// message_id 回填 deliveries.feishu_message_id，用于后续追溯/撤回。
-	// resp.Data 恒非 nil（Success 已判真），但 MessageId 是 *string，仍做空指针防护。
-	if resp.Data != nil && resp.Data.MessageId != nil {
-		return *resp.Data.MessageId, nil
+	// message_id 回填 deliveries.feishu_message_id，用于后续追溯/撤回。飞书即使
+	// 返回 code=0，也可能因异常响应缺失 data/message_id；此时远端结果未知，
+	// 绝不能用 ("", nil) 冒充发送成功。保持 CodePushFailed 可重试，让上层
+	// effect coordinator 将其收敛为 ambiguous，而不是落一个无回执的 sent。
+	if resp.Data == nil ||
+		resp.Data.MessageId == nil ||
+		*resp.Data.MessageId == "" {
+		return "", types.NewAppError(
+			types.CodePushFailed,
+			"主动推送成功响应缺少消息 id",
+			nil,
+		)
 	}
-	return "", nil
+	return *resp.Data.MessageId, nil
 }
 
 // OwnerOpenID 导出 owner 的 open_id：推送管道需要知道"推给谁"。

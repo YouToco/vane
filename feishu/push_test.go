@@ -298,3 +298,83 @@ func TestManager_SendCardWithUUIDPreservesProviderErrorClassification(t *testing
 		})
 	}
 }
+
+func TestManager_SendCardRejectsSuccessWithoutMessageID(t *testing.T) {
+	const (
+		messageUUID = "019f9824-39b6-7e13-b247-b5ee5713c52b"
+		openID      = "ou_sensitive_owner"
+		cardJSON    = `{"secret":"sensitive card"}`
+	)
+	responses := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "missing data",
+			body: `{"code":0,"msg":"success"}`,
+		},
+		{
+			name: "missing message id",
+			body: `{"code":0,"msg":"success","data":{}}`,
+		},
+		{
+			name: "empty message id",
+			body: `{"code":0,"msg":"success","data":{"message_id":""}}`,
+		},
+	}
+	sendPaths := []struct {
+		name string
+		send func(context.Context, *Manager) (string, error)
+	}{
+		{
+			name: "legacy send",
+			send: func(ctx context.Context, m *Manager) (string, error) {
+				return m.SendCard(ctx, openID, cardJSON)
+			},
+		},
+		{
+			name: "stable uuid send",
+			send: func(ctx context.Context, m *Manager) (string, error) {
+				return m.SendCardWithUUID(ctx, openID, cardJSON, messageUUID)
+			},
+		},
+	}
+
+	for _, response := range responses {
+		t.Run(response.name, func(t *testing.T) {
+			for _, sendPath := range sendPaths {
+				t.Run(sendPath.name, func(t *testing.T) {
+					logger := &pushTestLogger{}
+					m := newPushTestManager(
+						t,
+						http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							if servePushTestToken(w, r) {
+								return
+							}
+							w.Header().Set("Content-Type", "application/json")
+							_, _ = io.WriteString(w, response.body)
+						}),
+						logger,
+					)
+
+					messageID, err := sendPath.send(t.Context(), m)
+					if messageID != "" {
+						t.Fatalf("message id = %q, want empty", messageID)
+					}
+					if !errors.Is(err, types.ErrPush) || !types.IsRetryable(err) {
+						t.Fatalf("error = %v, want retryable push error", err)
+					}
+					observed := err.Error() + "\n" + logger.String()
+					for _, secret := range []string{openID, cardJSON, messageUUID} {
+						if strings.Contains(observed, secret) {
+							t.Fatalf(
+								"error or log output contains sensitive send material %q",
+								secret,
+							)
+						}
+					}
+				})
+			}
+		})
+	}
+}
