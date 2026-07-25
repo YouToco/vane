@@ -653,6 +653,95 @@ func TestPushEffectAmbiguousDeferralIsFencedAndDueByDatabaseClock(
 	}
 }
 
+func TestPushEffectReconciliationScheduleUsesDatabaseClockAtExpiryBoundary(
+	t *testing.T,
+) {
+	f := newPushEffectFixture(t)
+	ctx := t.Context()
+	f.prepared.IdempotencyExpiresAt = time.Now().UTC().
+		Truncate(time.Microsecond).Add(2 * time.Second)
+	if _, err := f.store.CreatePushEffect(ctx, f.prepared); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := f.store.ClaimPushEffect(
+		ctx,
+		pusheffect.ClaimParams{
+			Scope:         f.prepared.Scope(),
+			LeaseOwner:    "db-clock-" + uuid.NewString(),
+			LeaseDuration: time.Minute,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.RecordPushEffectAmbiguous(
+		ctx,
+		pusheffect.FailureParams{
+			Lease: pusheffect.Lease{
+				Scope:      claimed.Scope(),
+				LeaseOwner: claimed.LeaseOwner,
+				Fence:      claimed.Fence,
+			},
+			Class: "response_unknown",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	schedule := pusheffect.ReconciliationSchedule{
+		Resolution: pusheffect.Resolution{
+			Scope:         claimed.Scope(),
+			ExpectedFence: claimed.Fence,
+			Class:         "provider_history_unavailable",
+		},
+		RetryAfter:   5 * time.Minute,
+		ExpiredClass: "provider_window_expired",
+	}
+	decision, err := f.store.DeferOrBlockPushEffectReconciliation(
+		ctx,
+		schedule,
+	)
+	if err != nil || decision != pusheffect.ReconciliationDeferred {
+		t.Fatalf("open-window decision=%q err=%v, want deferred", decision, err)
+	}
+	current, err := f.store.LoadPushEffect(ctx, claimed.Scope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.NextAttemptAt.Equal(current.IdempotencyExpiresAt) ||
+		current.Status != pusheffect.StatusAmbiguous {
+		t.Fatalf("open-window checkpoint=%+v", current)
+	}
+
+	// No process timestamp is accepted by the transition. PostgreSQL waits
+	// through the exact boundary and then makes the opposite decision.
+	if _, err := f.db.ExecContext(ctx, `
+		SELECT pg_sleep(
+			GREATEST(0,EXTRACT(EPOCH FROM (
+				idempotency_expires_at-clock_timestamp()
+			)))+0.02
+		) FROM push_effects WHERE id=$1`,
+		f.prepared.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	decision, err = f.store.DeferOrBlockPushEffectReconciliation(
+		ctx,
+		schedule,
+	)
+	if err != nil || decision != pusheffect.ReconciliationBlocked {
+		t.Fatalf("expired-window decision=%q err=%v, want blocked", decision, err)
+	}
+	current, err = f.store.LoadPushEffect(ctx, claimed.Scope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != pusheffect.StatusBlocked ||
+		current.BlockedAt == nil ||
+		current.FailureClass != "provider_window_expired" {
+		t.Fatalf("expired-window checkpoint=%+v", current)
+	}
+}
+
 func TestPushEffectRLSAndStoredIntegrity(t *testing.T) {
 	f := newPushEffectFixture(t)
 	ctx := t.Context()

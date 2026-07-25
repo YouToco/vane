@@ -19,6 +19,7 @@ const (
 	defaultRecoveryInterval    = 15 * time.Second
 	defaultPassTimeout         = 90 * time.Second
 	defaultAttemptTimeout      = 30 * time.Second
+	defaultCheckpointTimeout   = 5 * time.Second
 	defaultLeaseDuration       = time.Minute
 	defaultRetryAfter          = 30 * time.Second
 	defaultTenantLimit         = 100
@@ -83,15 +84,10 @@ type Store interface {
 		context.Context,
 		pusheffect.SentReceipt,
 	) error
-	DeferPushEffectReconciliation(
+	DeferOrBlockPushEffectReconciliation(
 		context.Context,
-		pusheffect.Resolution,
-		time.Duration,
-	) error
-	DeferPushEffectReconciliationUntilExpiry(
-		context.Context,
-		pusheffect.Resolution,
-	) error
+		pusheffect.ReconciliationSchedule,
+	) (pusheffect.ReconciliationDecision, error)
 
 	// These are not aliases for the existing generic operator transition.
 	// Their future SQL must enforce the expiry/conflict predicate and expected
@@ -121,17 +117,18 @@ type Provider interface {
 }
 
 type Config struct {
-	RecoveryInterval time.Duration
-	PassTimeout      time.Duration
-	AttemptTimeout   time.Duration
-	LeaseDuration    time.Duration
-	RetryAfter       time.Duration
-	TenantLimit      int
-	PerTenantLimit   int
-	PassLimit        int
-	Concurrency      int
-	MaxAttempts      int
-	HistorySkew      time.Duration
+	RecoveryInterval  time.Duration
+	PassTimeout       time.Duration
+	AttemptTimeout    time.Duration
+	CheckpointTimeout time.Duration
+	LeaseDuration     time.Duration
+	RetryAfter        time.Duration
+	TenantLimit       int
+	PerTenantLimit    int
+	PassLimit         int
+	Concurrency       int
+	MaxAttempts       int
+	HistorySkew       time.Duration
 }
 
 func (c Config) withDefaults() Config {
@@ -143,6 +140,10 @@ func (c Config) withDefaults() Config {
 	}
 	if c.AttemptTimeout <= 0 {
 		c.AttemptTimeout = defaultAttemptTimeout
+	}
+	if c.CheckpointTimeout <= 0 ||
+		c.CheckpointTimeout > defaultCheckpointTimeout {
+		c.CheckpointTimeout = defaultCheckpointTimeout
 	}
 	if c.LeaseDuration <= 0 {
 		c.LeaseDuration = defaultLeaseDuration
@@ -344,8 +345,9 @@ func (c *Coordinator) RecoverOnce(ctx context.Context) error {
 				c.config.AttemptTimeout,
 			)
 			defer cancelAttempt()
-			if _, recoverErr := c.recoverEffect(
+			if _, recoverErr := c.recoverEffectWithCheckpoint(
 				attemptCtx,
+				passCtx,
 				effect,
 			); recoverErr != nil {
 				errorsMu.Lock()
@@ -362,6 +364,14 @@ func (c *Coordinator) RecoverOnce(ctx context.Context) error {
 // every provider Create still requires the future atomic authorized claim.
 func (c *Coordinator) recoverEffect(
 	ctx context.Context,
+	listed pusheffect.Effect,
+) (Outcome, error) {
+	return c.recoverEffectWithCheckpoint(ctx, ctx, listed)
+}
+
+func (c *Coordinator) recoverEffectWithCheckpoint(
+	ctx context.Context,
+	checkpointParent context.Context,
 	listed pusheffect.Effect,
 ) (Outcome, error) {
 	if c == nil || c.store == nil || c.provider == nil {
@@ -395,7 +405,7 @@ func (c *Coordinator) recoverEffect(
 			)
 		}
 	case pusheffect.StatusPrepared, pusheffect.StatusDefiniteFailed:
-		return c.recoverSafeSend(ctx, effect, false)
+		return c.recoverSafeSend(ctx, checkpointParent, effect, false)
 	case pusheffect.StatusAmbiguous:
 		// Continue below.
 	default:
@@ -405,11 +415,12 @@ func (c *Coordinator) recoverEffect(
 			effect.Status,
 		)
 	}
-	return c.recoverAmbiguous(ctx, effect)
+	return c.recoverAmbiguous(ctx, checkpointParent, effect)
 }
 
 func (c *Coordinator) recoverAmbiguous(
 	ctx context.Context,
+	checkpointParent context.Context,
 	effect *pusheffect.Effect,
 ) (Outcome, error) {
 	observation, err := c.provider.ResolvePushEffectMessage(
@@ -426,8 +437,8 @@ func (c *Coordinator) recoverAmbiguous(
 		},
 	)
 	if err != nil {
-		deferErr := c.deferAmbiguous(
-			ctx,
+		_, deferErr := c.deferAmbiguous(
+			checkpointParent,
 			effect,
 			"provider_history_unavailable",
 			false,
@@ -440,8 +451,12 @@ func (c *Coordinator) recoverAmbiguous(
 	}
 	switch {
 	case observation.MatchCount == 1 && observation.MessageID != "":
+		checkpointCtx, cancelCheckpoint := c.checkpointContext(
+			checkpointParent,
+		)
+		defer cancelCheckpoint()
 		err := c.store.RecordPushEffectSentWithDeliveries(
-			ctx,
+			checkpointCtx,
 			pusheffect.SentReceipt{
 				Scope:             effect.Scope(),
 				ExpectedFence:     effect.Fence,
@@ -457,8 +472,12 @@ func (c *Coordinator) recoverAmbiguous(
 		}
 		return OutcomeSent, nil
 	case observation.MatchCount > 1:
+		checkpointCtx, cancelCheckpoint := c.checkpointContext(
+			checkpointParent,
+		)
+		defer cancelCheckpoint()
 		err := c.store.BlockConflictingPushEffectHistory(
-			ctx,
+			checkpointCtx,
 			pusheffect.Resolution{
 				Scope:         effect.Scope(),
 				ExpectedFence: effect.Fence,
@@ -480,55 +499,50 @@ func (c *Coordinator) recoverAmbiguous(
 		)
 	}
 
-	if !c.now().Before(effect.IdempotencyExpiresAt) {
-		err := c.store.BlockExpiredPushEffect(
-			ctx,
-			pusheffect.Resolution{
-				Scope:         effect.Scope(),
-				ExpectedFence: effect.Fence,
-				Class:         "provider_window_expired",
-			},
-		)
-		if err != nil {
-			return "", fmt.Errorf(
-				"block expired push effect %s: %w",
-				effect.ID,
-				err,
-			)
-		}
-		return OutcomeBlocked, nil
-	}
 	if effect.Attempt >= c.config.MaxAttempts {
 		// Positive history remains eligible on later passes. The attempt cap
 		// suppresses Create only; it must not erase a remotely sent message.
-		if err := c.deferAmbiguous(
-			ctx,
+		outcome, err := c.deferAmbiguous(
+			checkpointParent,
 			effect,
 			"attempt_budget_exhausted",
 			true,
-		); err != nil {
+		)
+		if err != nil {
 			return "", err
 		}
-		return OutcomeDeferred, nil
+		return outcome, nil
 	}
-	return c.recoverSafeSend(ctx, effect, true)
+	decision, err := c.deferAmbiguous(
+		checkpointParent,
+		effect,
+		"provider_history_miss",
+		false,
+	)
+	if err != nil || decision == OutcomeBlocked {
+		return decision, err
+	}
+	return c.recoverSafeSend(ctx, checkpointParent, effect, true)
 }
 
 func (c *Coordinator) recoverSafeSend(
 	ctx context.Context,
+	checkpointParent context.Context,
 	effect *pusheffect.Effect,
 	reconciliation bool,
 ) (Outcome, error) {
 	if effect.Attempt >= c.config.MaxAttempts {
 		if reconciliation {
-			if err := c.deferAmbiguous(
-				ctx,
+			outcome, err := c.deferAmbiguous(
+				checkpointParent,
 				effect,
 				"attempt_budget_exhausted",
 				true,
-			); err != nil {
+			)
+			if err != nil {
 				return "", err
 			}
+			return outcome, nil
 		}
 		return OutcomeDeferred, nil
 	}
@@ -539,8 +553,8 @@ func (c *Coordinator) recoverSafeSend(
 	if err != nil {
 		var deferErr error
 		if reconciliation {
-			deferErr = c.deferAmbiguous(
-				ctx,
+			_, deferErr = c.deferAmbiguous(
+				checkpointParent,
 				effect,
 				"run_authorization_unavailable",
 				false,
@@ -554,13 +568,17 @@ func (c *Coordinator) recoverSafeSend(
 	}
 	if !authorized {
 		if reconciliation {
-			if err := c.deferAmbiguous(
-				ctx,
+			outcome, err := c.deferAmbiguous(
+				checkpointParent,
 				effect,
 				"run_not_authorized",
 				false,
-			); err != nil {
+			)
+			if err != nil {
 				return "", err
+			}
+			if outcome == OutcomeBlocked {
+				return outcome, nil
 			}
 		}
 		return OutcomeNotAuthorized, nil
@@ -597,11 +615,12 @@ func (c *Coordinator) recoverSafeSend(
 			effect.ID,
 		)
 	}
-	return c.sendClaimed(ctx, claimed, reconciliation)
+	return c.sendClaimed(ctx, checkpointParent, claimed, reconciliation)
 }
 
 func (c *Coordinator) sendClaimed(
 	ctx context.Context,
+	checkpointParent context.Context,
 	effect *pusheffect.Effect,
 	wasAmbiguous bool,
 ) (Outcome, error) {
@@ -618,8 +637,12 @@ func (c *Coordinator) sendClaimed(
 		Fence:      effect.Fence,
 	}
 	if sendErr == nil && validSentObservation(effect, observation) {
+		checkpointCtx, cancelCheckpoint := c.checkpointContext(
+			checkpointParent,
+		)
+		defer cancelCheckpoint()
 		err := c.store.RecordPushEffectSentWithDeliveries(
-			ctx,
+			checkpointCtx,
 			pusheffect.SentReceipt{
 				Scope:             effect.Scope(),
 				ExpectedFence:     effect.Fence,
@@ -654,16 +677,18 @@ func (c *Coordinator) sendClaimed(
 	}
 	var persistErr error
 	var outcome Outcome
+	checkpointCtx, cancelCheckpoint := c.checkpointContext(checkpointParent)
+	defer cancelCheckpoint()
 	if definite {
 		failure.RetryAfter = c.config.RetryAfter
 		persistErr = c.store.RecordPushEffectDefiniteFailure(
-			ctx,
+			checkpointCtx,
 			failure,
 		)
 		outcome = OutcomeDefiniteFail
 	} else {
 		persistErr = c.store.RecordPushEffectAmbiguous(
-			ctx,
+			checkpointCtx,
 			failure,
 		)
 		outcome = OutcomeAmbiguous
@@ -676,8 +701,8 @@ func (c *Coordinator) sendClaimed(
 		))
 	}
 	if outcome == OutcomeAmbiguous {
-		deferErr := c.deferAmbiguous(
-			ctx,
+		deferredOutcome, deferErr := c.deferAmbiguous(
+			checkpointParent,
 			effect,
 			class,
 			false,
@@ -685,42 +710,62 @@ func (c *Coordinator) sendClaimed(
 		if deferErr != nil {
 			return "", errors.Join(sendErr, deferErr)
 		}
+		if deferredOutcome == OutcomeBlocked {
+			return OutcomeBlocked, sendErr
+		}
 	}
 	return outcome, sendErr
 }
 
 func (c *Coordinator) deferAmbiguous(
-	ctx context.Context,
+	checkpointParent context.Context,
 	effect *pusheffect.Effect,
 	class string,
 	untilExpiry bool,
-) error {
-	resolution := pusheffect.Resolution{
-		Scope:         effect.Scope(),
-		ExpectedFence: effect.Fence,
-		Class:         class,
-	}
-	var err error
-	if untilExpiry {
-		err = c.store.DeferPushEffectReconciliationUntilExpiry(
-			ctx,
-			resolution,
-		)
-	} else {
-		err = c.store.DeferPushEffectReconciliation(
-			ctx,
-			resolution,
-			c.config.RetryAfter,
-		)
-	}
+) (Outcome, error) {
+	checkpointCtx, cancelCheckpoint := c.checkpointContext(checkpointParent)
+	defer cancelCheckpoint()
+	decision, err := c.store.DeferOrBlockPushEffectReconciliation(
+		checkpointCtx,
+		pusheffect.ReconciliationSchedule{
+			Resolution: pusheffect.Resolution{
+				Scope:         effect.Scope(),
+				ExpectedFence: effect.Fence,
+				Class:         class,
+			},
+			RetryAfter:   c.config.RetryAfter,
+			UntilExpiry:  untilExpiry,
+			ExpiredClass: "provider_window_expired",
+		},
+	)
 	if err != nil {
-		return fmt.Errorf(
+		return "", fmt.Errorf(
 			"defer ambiguous push effect %s: %w",
 			effect.ID,
 			err,
 		)
 	}
-	return nil
+	switch decision {
+	case pusheffect.ReconciliationDeferred:
+		return OutcomeDeferred, nil
+	case pusheffect.ReconciliationBlocked:
+		return OutcomeBlocked, nil
+	default:
+		return "", fmt.Errorf(
+			"defer ambiguous push effect %s returned invalid decision %q",
+			effect.ID,
+			decision,
+		)
+	}
+}
+
+func (c *Coordinator) checkpointContext(
+	parent context.Context,
+) (context.Context, context.CancelFunc) {
+	// RecoverOnce passes passCtx here: checkpoints therefore survive only the
+	// provider attempt deadline, never pass timeout or process shutdown, and
+	// this separate deadline keeps a stuck database write bounded.
+	return context.WithTimeout(parent, c.config.CheckpointTimeout)
 }
 
 func validSentObservation(

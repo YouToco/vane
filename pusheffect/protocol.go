@@ -173,6 +173,23 @@ type Resolution struct {
 	Class         string
 }
 
+// ReconciliationSchedule asks the Store to make one database-clock decision:
+// defer an exact ambiguous fence while the provider UUID window is open, or
+// atomically block it once that window has expired.
+type ReconciliationSchedule struct {
+	Resolution
+	RetryAfter   time.Duration
+	UntilExpiry  bool
+	ExpiredClass string
+}
+
+type ReconciliationDecision string
+
+const (
+	ReconciliationDeferred ReconciliationDecision = "deferred"
+	ReconciliationBlocked  ReconciliationDecision = "blocked"
+)
+
 type SentReceipt struct {
 	Scope
 	ExpectedFence     int64

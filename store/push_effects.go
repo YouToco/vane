@@ -561,16 +561,15 @@ func (s *Store) DeferPushEffectReconciliation(
 	resolution pusheffect.Resolution,
 	retryAfter time.Duration,
 ) error {
-	if retryAfter <= 0 || retryAfter > maxPushEffectRetryWindow {
-		return pushEffectValidation(
-			"push effect reconciliation deferral is invalid")
-	}
-	return s.deferPushEffectReconciliation(
+	_, err := s.DeferOrBlockPushEffectReconciliation(
 		ctx,
-		resolution,
-		retryAfter,
-		false,
+		pusheffect.ReconciliationSchedule{
+			Resolution:   resolution,
+			RetryAfter:   retryAfter,
+			ExpiredClass: "provider_window_expired",
+		},
 	)
+	return err
 }
 
 // DeferPushEffectReconciliationUntilExpiry persistently removes an
@@ -581,54 +580,78 @@ func (s *Store) DeferPushEffectReconciliationUntilExpiry(
 	ctx context.Context,
 	resolution pusheffect.Resolution,
 ) error {
-	return s.deferPushEffectReconciliation(
+	_, err := s.DeferOrBlockPushEffectReconciliation(
 		ctx,
-		resolution,
-		0,
-		true,
+		pusheffect.ReconciliationSchedule{
+			Resolution:   resolution,
+			UntilExpiry:  true,
+			ExpiredClass: "provider_window_expired",
+		},
 	)
+	return err
 }
 
-func (s *Store) deferPushEffectReconciliation(
+// DeferOrBlockPushEffectReconciliation makes the UUID-window decision using
+// PostgreSQL time under the exact effect fence. It cannot return "deferred"
+// after the provider window has expired, even when the process clock is
+// behind, and it cannot block a still-open window when the process clock is
+// ahead.
+func (s *Store) DeferOrBlockPushEffectReconciliation(
 	ctx context.Context,
-	resolution pusheffect.Resolution,
-	retryAfter time.Duration,
-	untilExpiry bool,
-) error {
-	if err := validatePushEffectResolution(resolution); err != nil {
-		return err
+	schedule pusheffect.ReconciliationSchedule,
+) (pusheffect.ReconciliationDecision, error) {
+	if err := validatePushEffectReconciliationSchedule(schedule); err != nil {
+		return "", err
 	}
-	tx, err := s.beginPushEffectCoordinatorTx(ctx, resolution.TenantID)
+	deferred, err := s.tryDeferPushEffectReconciliation(ctx, schedule)
 	if err != nil {
-		return pushEffectDatabaseError(
+		return "", err
+	}
+	if deferred {
+		return pusheffect.ReconciliationDeferred, nil
+	}
+	return s.blockExpiredPushEffectReconciliation(ctx, schedule)
+}
+
+func (s *Store) tryDeferPushEffectReconciliation(
+	ctx context.Context,
+	schedule pusheffect.ReconciliationSchedule,
+) (bool, error) {
+	tx, err := s.beginPushEffectCoordinatorTx(
+		ctx,
+		schedule.TenantID,
+	)
+	if err != nil {
+		return false, pushEffectDatabaseError(
 			"begin reconciliation deferral transaction", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
-	effect, _, err := loadPushEffectWithClock(ctx, tx, resolution.Scope)
+	effect, _, err := loadPushEffectWithClock(ctx, tx, schedule.Scope)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := validateStoredPushEffect(effect); err != nil {
-		return err
+		return false, err
 	}
 	if effect.Status != pusheffect.StatusAmbiguous ||
-		effect.Fence != resolution.ExpectedFence {
-		return pushEffectLeaseLost()
+		effect.Fence != schedule.ExpectedFence {
+		return false, pushEffectLeaseLost()
 	}
 
 	var tag pgconn.CommandTag
-	if untilExpiry {
+	if schedule.UntilExpiry {
 		tag, err = tx.Exec(ctx, `
 			UPDATE push_effects
 			   SET next_attempt_at=idempotency_expires_at,
 			       failure_class=$5, updated_at=clock_timestamp()
 			 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
-			   AND fence=$4 AND status='ambiguous'`,
-			resolution.ID,
-			resolution.TenantID,
-			resolution.UserID,
-			resolution.ExpectedFence,
-			resolution.Class,
+			   AND fence=$4 AND status='ambiguous'
+			   AND idempotency_expires_at>clock_timestamp()`,
+			schedule.ID,
+			schedule.TenantID,
+			schedule.UserID,
+			schedule.ExpectedFence,
+			schedule.Class,
 		)
 	} else {
 		tag, err = tx.Exec(ctx, `
@@ -639,27 +662,110 @@ func (s *Store) deferPushEffectReconciliation(
 			       ),
 			       failure_class=$5, updated_at=clock_timestamp()
 			 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
-			   AND fence=$4 AND status='ambiguous'`,
-			resolution.ID,
-			resolution.TenantID,
-			resolution.UserID,
-			resolution.ExpectedFence,
-			resolution.Class,
-			retryAfter.Microseconds(),
+			   AND fence=$4 AND status='ambiguous'
+			   AND idempotency_expires_at>clock_timestamp()`,
+			schedule.ID,
+			schedule.TenantID,
+			schedule.UserID,
+			schedule.ExpectedFence,
+			schedule.Class,
+			schedule.RetryAfter.Microseconds(),
 		)
 	}
 	if err != nil {
-		return pushEffectDatabaseError(
+		return false, pushEffectDatabaseError(
 			"defer push effect reconciliation", err)
 	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
 	if tag.RowsAffected() != 1 {
-		return pushEffectLeaseLost()
+		return false, pushEffectIntegrity()
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return pushEffectDatabaseError(
+		return false, pushEffectDatabaseError(
 			"commit reconciliation deferral transaction", err)
 	}
-	return nil
+	return true, nil
+}
+
+func (s *Store) blockExpiredPushEffectReconciliation(
+	ctx context.Context,
+	schedule pusheffect.ReconciliationSchedule,
+) (pusheffect.ReconciliationDecision, error) {
+	tx, err := s.beginPushEffectOperatorTx(ctx, schedule.TenantID)
+	if err != nil {
+		return "", pushEffectDatabaseError(
+			"begin expired reconciliation transaction", err)
+	}
+	defer rollbackPushEffectTx(ctx, tx)
+	var (
+		status    pusheffect.Status
+		fence     int64
+		class     string
+		blockedAt *time.Time
+		expired   bool
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT status, fence, failure_class, blocked_at,
+		       idempotency_expires_at<=clock_timestamp()
+		  FROM push_effects
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		 FOR UPDATE`,
+		schedule.ID, schedule.TenantID, schedule.UserID,
+	).Scan(&status, &fence, &class, &blockedAt, &expired)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", pushEffectNotFound()
+	}
+	if err != nil {
+		return "", pushEffectDatabaseError(
+			"load expired reconciliation target", err)
+	}
+	if status == pusheffect.StatusBlocked {
+		if fence == schedule.ExpectedFence &&
+			class == schedule.ExpiredClass && blockedAt != nil {
+			if err := tx.Commit(ctx); err != nil {
+				return "", pushEffectDatabaseError(
+					"commit expired reconciliation replay", err)
+			}
+			return pusheffect.ReconciliationBlocked, nil
+		}
+		return "", pushEffectConflict(
+			"expired reconciliation resolution differs")
+	}
+	if status != pusheffect.StatusAmbiguous ||
+		fence != schedule.ExpectedFence {
+		return "", pushEffectLeaseLost()
+	}
+	if !expired {
+		return "", pushEffectConflict(
+			"push effect reconciliation window changed")
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE push_effects
+		   SET status='blocked', failure_class=$5,
+		       blocked_at=clock_timestamp(), updated_at=clock_timestamp()
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		   AND fence=$4 AND status='ambiguous'
+		   AND idempotency_expires_at<=clock_timestamp()`,
+		schedule.ID,
+		schedule.TenantID,
+		schedule.UserID,
+		schedule.ExpectedFence,
+		schedule.ExpiredClass,
+	)
+	if err != nil {
+		return "", pushEffectDatabaseError(
+			"block expired push effect reconciliation", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return "", pushEffectLeaseLost()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", pushEffectDatabaseError(
+			"commit expired reconciliation transaction", err)
+	}
+	return pusheffect.ReconciliationBlocked, nil
 }
 
 func (s *Store) recordPushEffectFailure(
@@ -1275,6 +1381,33 @@ func validatePushEffectResolution(resolution pusheffect.Resolution) error {
 		len(resolution.Class) > maxPushEffectFailure ||
 		!utf8.ValidString(resolution.Class) {
 		return pushEffectValidation("push effect resolution is invalid")
+	}
+	return nil
+}
+
+func validatePushEffectReconciliationSchedule(
+	schedule pusheffect.ReconciliationSchedule,
+) error {
+	if err := validatePushEffectResolution(schedule.Resolution); err != nil {
+		return err
+	}
+	expired := schedule.Resolution
+	expired.Class = schedule.ExpiredClass
+	if err := validatePushEffectResolution(expired); err != nil {
+		return err
+	}
+	if schedule.UntilExpiry {
+		if schedule.RetryAfter != 0 {
+			return pushEffectValidation(
+				"expiry reconciliation schedule cannot retry")
+		}
+		return nil
+	}
+	if schedule.RetryAfter <= 0 ||
+		schedule.RetryAfter > maxPushEffectRetryWindow ||
+		schedule.RetryAfter.Microseconds() <= 0 {
+		return pushEffectValidation(
+			"push effect reconciliation deferral is invalid")
 	}
 	return nil
 }

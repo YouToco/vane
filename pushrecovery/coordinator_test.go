@@ -306,6 +306,39 @@ func TestCoordinatorAmbiguousExpiryAndConflictBlockWithoutCreate(
 	}
 }
 
+func TestCoordinatorNeverUsesProcessClockForExpiryAuthority(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	effect := testEffect(now, pusheffect.StatusAmbiguous)
+	effect.Fence = 1
+	effect.Attempt = defaultMaxAttempts
+	effect.FailureClass = "response_unknown"
+	ambiguousSince := now.Add(-time.Minute)
+	effect.AmbiguousSince = &ambiguousSince
+
+	store := newFakeStore(effect)
+	coordinator := newTestCoordinator(t, store, &fakeProvider{}, now)
+	coordinator.now = func() time.Time { return now.Add(24 * time.Hour) }
+	outcome, err := coordinator.recoverEffect(t.Context(), effect)
+	if err != nil || outcome != OutcomeDeferred {
+		t.Fatalf(
+			"ahead process clock outcome=%q err=%v, want deferred",
+			outcome,
+			err,
+		)
+	}
+
+	store.dbNow = effect.IdempotencyExpiresAt
+	coordinator.now = func() time.Time { return now.Add(-24 * time.Hour) }
+	outcome, err = coordinator.recoverEffect(t.Context(), effect)
+	if err != nil || outcome != OutcomeBlocked {
+		t.Fatalf(
+			"behind process clock outcome=%q err=%v, want blocked",
+			outcome,
+			err,
+		)
+	}
+}
+
 func TestCoordinatorRecoverOnceIsTenantShardedAndBounded(t *testing.T) {
 	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
 	store := newFakeStore(testEffect(now, pusheffect.StatusAmbiguous))
@@ -449,6 +482,118 @@ func TestCoordinatorPersistentDeferralPreventsSameTenantStarvationAcrossRestart(
 	}
 }
 
+func TestCoordinatorProviderTimeoutCheckpointsAcrossRestartWithoutStarvation(
+	t *testing.T,
+) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	timedOut := testEffect(now, pusheffect.StatusAmbiguous)
+	timedOut.ID = "00000000-0000-0000-0000-000000000011"
+	timedOut.Fence = 1
+	timedOut.Attempt = 1
+	timedOut.FailureClass = "response_unknown"
+	timedOutSince := now.Add(-time.Minute)
+	timedOut.AmbiguousSince = &timedOutSince
+
+	next := testEffect(now, pusheffect.StatusAmbiguous)
+	next.ID = "00000000-0000-0000-0000-000000000012"
+	next.Fence = 1
+	next.Attempt = 1
+	next.FailureClass = "response_unknown"
+	nextSince := now.Add(-time.Minute)
+	next.AmbiguousSince = &nextSince
+
+	store := newFakeStore(timedOut)
+	store.tenants = []int64{1}
+	store.shards = map[int64][]pusheffect.Effect{1: {timedOut, next}}
+	provider := &fakeProvider{
+		historyWaitForContext: map[string]bool{timedOut.ID: true},
+		historyByEffect: map[string]pusheffect.HistoryObservation{
+			next.ID: {MatchCount: 1, MessageID: "om_after_timeout"},
+		},
+	}
+	first := newTestCoordinator(t, store, provider, now)
+	first.config.TenantLimit = 1
+	first.config.PerTenantLimit = 1
+	first.config.PassLimit = 1
+	first.config.Concurrency = 1
+	first.config.AttemptTimeout = 10 * time.Millisecond
+	first.config.CheckpointTimeout = 100 * time.Millisecond
+	first.config.PassTimeout = time.Second
+
+	err := first.RecoverOnce(t.Context())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout recovery error=%v, want deadline exceeded", err)
+	}
+
+	store.mu.Lock()
+	deferred, found := store.effectByIDLocked(timedOut.ID)
+	if !found || !deferred.NextAttemptAt.After(store.dbNow) ||
+		store.deferralCalls != 1 {
+		store.mu.Unlock()
+		t.Fatalf(
+			"timeout checkpoint=%+v found=%v deferrals=%d",
+			deferred,
+			found,
+			store.deferralCalls,
+		)
+	}
+	store.mu.Unlock()
+
+	// A fresh coordinator resets its cursor, but the durable backoff makes the
+	// next same-tenant effect visible despite a per-tenant limit of one.
+	restarted := newTestCoordinator(t, store, provider, now)
+	restarted.config.TenantLimit = 1
+	restarted.config.PerTenantLimit = 1
+	restarted.config.PassLimit = 1
+	restarted.config.Concurrency = 1
+	if err := restarted.RecoverOnce(t.Context()); err != nil {
+		t.Fatalf("post-timeout restart recovery: %v", err)
+	}
+	if err := restarted.RecoverOnce(t.Context()); err != nil {
+		t.Fatalf("immediate history throttle pass: %v", err)
+	}
+
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.historyCallsByEffect[timedOut.ID] != 1 ||
+		provider.historyCallsByEffect[next.ID] != 1 {
+		t.Fatalf(
+			"history calls timed-out/next=%d/%d, want 1/1",
+			provider.historyCallsByEffect[timedOut.ID],
+			provider.historyCallsByEffect[next.ID],
+		)
+	}
+}
+
+func TestCoordinatorCheckpointHonorsPassCancellation(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	effect := testEffect(now, pusheffect.StatusAmbiguous)
+	effect.Fence = 1
+	effect.Attempt = 1
+	effect.FailureClass = "response_unknown"
+	ambiguousSince := now.Add(-time.Minute)
+	effect.AmbiguousSince = &ambiguousSince
+	store := newFakeStore(effect)
+	provider := &fakeProvider{historyErr: context.DeadlineExceeded}
+	coordinator := newTestCoordinator(t, store, provider, now)
+
+	passCtx, cancelPass := context.WithCancel(t.Context())
+	cancelPass()
+	_, err := coordinator.recoverEffectWithCheckpoint(
+		t.Context(),
+		passCtx,
+		effect,
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown checkpoint error=%v, want canceled", err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.deferralCalls != 0 {
+		t.Fatalf("shutdown deferrals=%d, want 0", store.deferralCalls)
+	}
+}
+
 func newTestCoordinator(
 	t *testing.T,
 	store Store,
@@ -529,6 +674,7 @@ func newFakeStore(effect pusheffect.Effect) *fakeStore {
 	return &fakeStore{
 		effect:     effect,
 		authorized: true,
+		dbNow:      effect.UpdatedAt,
 		shards: map[int64][]pusheffect.Effect{
 			effect.TenantID: {effect},
 		},
@@ -718,6 +864,55 @@ func (s *fakeStore) DeferPushEffectReconciliationUntilExpiry(
 	return nil
 }
 
+func (s *fakeStore) DeferOrBlockPushEffectReconciliation(
+	ctx context.Context,
+	schedule pusheffect.ReconciliationSchedule,
+) (pusheffect.ReconciliationDecision, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var decision pusheffect.ReconciliationDecision
+	target, found := s.effectByIDLocked(schedule.ID)
+	if !found && s.effect.ID == schedule.ID {
+		target = s.effect
+		found = true
+	}
+	if !found {
+		return "", errors.New("fake reconciliation target not found")
+	}
+	expired := !s.dbNow.Before(target.IdempotencyExpiresAt)
+	if expired {
+		s.expiredBlockCalls++
+	} else if schedule.UntilExpiry {
+		s.expiryDeferralCalls++
+	} else {
+		s.deferralCalls++
+	}
+	s.updateEffectLocked(schedule.ID, func(effect *pusheffect.Effect) {
+		if !s.dbNow.Before(effect.IdempotencyExpiresAt) {
+			effect.Status = pusheffect.StatusBlocked
+			effect.FailureClass = schedule.ExpiredClass
+			blockedAt := s.dbNow
+			effect.BlockedAt = &blockedAt
+			decision = pusheffect.ReconciliationBlocked
+			return
+		}
+		if schedule.UntilExpiry {
+			effect.NextAttemptAt = effect.IdempotencyExpiresAt
+		} else {
+			effect.NextAttemptAt = s.dbNow.Add(schedule.RetryAfter)
+			if effect.NextAttemptAt.After(effect.IdempotencyExpiresAt) {
+				effect.NextAttemptAt = effect.IdempotencyExpiresAt
+			}
+		}
+		effect.FailureClass = schedule.Class
+		decision = pusheffect.ReconciliationDeferred
+	})
+	return decision, nil
+}
+
 func (s *fakeStore) BlockExpiredPushEffect(
 	_ context.Context,
 	resolution pusheffect.Resolution,
@@ -777,11 +972,12 @@ func (s *fakeStore) effectByIDLocked(
 type fakeProvider struct {
 	mu sync.Mutex
 
-	historyObservation pusheffect.HistoryObservation
-	historyErr         error
-	historyByEffect    map[string]pusheffect.HistoryObservation
-	sendObservation    pusheffect.ProviderObservation
-	sendErr            error
+	historyObservation    pusheffect.HistoryObservation
+	historyErr            error
+	historyByEffect       map[string]pusheffect.HistoryObservation
+	historyWaitForContext map[string]bool
+	sendObservation       pusheffect.ProviderObservation
+	sendErr               error
 
 	historyCalls         int
 	historyCallsByEffect map[string]int
@@ -794,21 +990,29 @@ type fakeProvider struct {
 }
 
 func (p *fakeProvider) ResolvePushEffectMessage(
-	_ context.Context,
+	ctx context.Context,
 	query pusheffect.HistoryQuery,
 ) (pusheffect.HistoryObservation, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.historyCalls++
 	p.historyQuery = query
 	if p.historyCallsByEffect == nil {
 		p.historyCallsByEffect = make(map[string]int)
 	}
 	p.historyCallsByEffect[query.EffectID]++
-	if observation, ok := p.historyByEffect[query.EffectID]; ok {
-		return observation, p.historyErr
+	observation, hasObservation := p.historyByEffect[query.EffectID]
+	defaultObservation := p.historyObservation
+	waitForContext := p.historyWaitForContext[query.EffectID]
+	historyErr := p.historyErr
+	p.mu.Unlock()
+	if waitForContext {
+		<-ctx.Done()
+		return observation, ctx.Err()
 	}
-	return p.historyObservation, p.historyErr
+	if hasObservation {
+		return observation, historyErr
+	}
+	return defaultObservation, historyErr
 }
 
 func (p *fakeProvider) PushWithUUID(
