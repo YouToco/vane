@@ -5,6 +5,12 @@
 
 -- +goose Up
 
+-- 047 is the live-protocol admission boundary. Migrations 039-046 install the
+-- dark store, but a runtime identity may enter its restricted roles only while
+-- the atomic delivery-receipt contract is present.
+GRANT vane_push_effect_coordinator, vane_push_effect_receipt,
+    vane_push_effect_operator TO CURRENT_USER;
+
 GRANT SELECT (
     batch_id, delivery_ids, card_payload
 ) ON push_effects TO vane_push_effect_receipt;
@@ -18,6 +24,11 @@ GRANT UPDATE (
 ) ON deliveries TO vane_push_effect_receipt;
 
 -- +goose Down
+
+-- Stable ASCII "VANEPUSH". Every post-047 effect writer takes the matching
+-- shared transaction lock before any role, tenant, or table lock. Admission is
+-- therefore drained before this migration starts its table lock graph.
+SELECT pg_advisory_xact_lock(6215335020355474248);
 
 LOCK TABLE push_effects, deliveries IN ACCESS EXCLUSIVE MODE
     /* migration 047 downgrade fence */;
@@ -42,3 +53,9 @@ REVOKE SELECT (
 REVOKE SELECT (
     batch_id, delivery_ids, card_payload
 ) ON push_effects FROM vane_push_effect_receipt;
+
+-- Revoke runtime admission last: a failed non-empty downgrade above preserves
+-- every role membership and capability. A successful empty downgrade makes a
+-- writer that was waiting on the schema fence fail at SET ROLE after wakeup.
+REVOKE vane_push_effect_coordinator, vane_push_effect_receipt,
+    vane_push_effect_operator FROM CURRENT_USER;

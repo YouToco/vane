@@ -165,6 +165,13 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	}
 	// 回滚兜底：dry-run 走下方显式 Rollback，真删走 Commit；两者之后这里都是 no-op。
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Purge deletes push_effects outside the restricted effect role helpers.
+	// Join schema admission before any tenant or child lock so migrations can
+	// drain this writer without forming a table-lock cycle.
+	if err := lockPushEffectSchemaWriter(ctx, tx); err != nil {
+		return nil, types.NewAppError(
+			types.CodeDatabase, "锁定推送效果 schema 准入", err)
+	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
 		fmt.Sprintf("%d", tenantID)); err != nil {
