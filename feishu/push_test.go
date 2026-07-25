@@ -15,6 +15,7 @@ import (
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 
+	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/types"
 )
 
@@ -205,7 +206,7 @@ func TestManager_SendCardWithUUIDResultReturnsTypedSentReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendCardWithUUIDResult() error = %v", err)
 	}
-	if result.Disposition != ProviderAttemptSent ||
+	if result.Disposition != pusheffect.AttemptSent ||
 		result.MessageID != "om_effect" ||
 		result.ChatID != "oc_effect" {
 		t.Fatalf("result = %+v, want typed sent receipt", result)
@@ -217,17 +218,17 @@ func TestManager_SendCardWithUUIDResultClassifiesBoundary(t *testing.T) {
 	tests := []struct {
 		name string
 		body string
-		want ProviderAttemptDisposition
+		want pusheffect.AttemptDisposition
 	}{
 		{
 			name: "provider rejection is definite not sent",
 			body: `{"code":200673,"msg":"invalid card"}`,
-			want: ProviderAttemptDefiniteNotSent,
+			want: pusheffect.AttemptDefiniteNotSent,
 		},
 		{
 			name: "success without receipt is ambiguous",
 			body: `{"code":0,"msg":"success","data":{}}`,
-			want: ProviderAttemptAmbiguous,
+			want: pusheffect.AttemptAmbiguous,
 		},
 	}
 	for _, tt := range tests {
@@ -254,7 +255,7 @@ func TestManager_SendCardWithUUIDResultClassifiesBoundary(t *testing.T) {
 		m := NewManager(nil, nil, nil)
 		result, err := m.SendCardWithUUIDResult(
 			t.Context(), "ou_owner", `{"type":"card"}`, "not-a-uuid")
-		if err == nil || result.Disposition != ProviderAttemptDefiniteNotSent {
+		if err == nil || result.Disposition != pusheffect.AttemptDefiniteNotSent {
 			t.Fatalf("result=%+v err=%v, want definite validation failure", result, err)
 		}
 	})
@@ -268,7 +269,7 @@ func TestManager_SendCardWithUUIDResultClassifiesBoundary(t *testing.T) {
 		}), nil)
 		result, err := m.SendCardWithUUIDResult(
 			t.Context(), "ou_owner", `{"type":"card"}`, messageUUID)
-		if err == nil || result.Disposition != ProviderAttemptAmbiguous {
+		if err == nil || result.Disposition != pusheffect.AttemptAmbiguous {
 			t.Fatalf("result=%+v err=%v, want ambiguous transport failure", result, err)
 		}
 	})
