@@ -45,6 +45,7 @@ type purgeStep struct {
 //	feedbacks                             → deliveries
 //	task_creation_receipts               → pending_actions → agent_sessions
 //	agent_events                         → agent_sessions
+//	push_effects                        → deliveries / push_batches / task_run_snapshots
 //	deliveries                            → push_batches
 //	deliveries → push_batches             → task_run_snapshots
 //	task_run_snapshot_v2_shadows          → task_run_snapshots
@@ -78,6 +79,9 @@ var purgeOrder = []purgeStep{
 	// Semantic events reference agent_sessions by complete tenant/user/session
 	// scope and therefore must be deleted before the session projection.
 	{"agent_events", "tenant_id = $1"},
+	// External effect checkpoints bind exact delivery, batch, and immutable run
+	// identities, so they must be removed before all three parent aggregates.
+	{"push_effects", "tenant_id = $1"},
 	{"deliveries", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},
 	// Compiled push batches retain the immutable run snapshot through migration
@@ -159,6 +163,14 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		fmt.Sprintf("%d", tenantID)); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "设置租户清理上下文", err)
+	}
+
+	// Join the same per-tenant admission protocol as effect preparation before
+	// taking any child row lock. This is an advisory root rather than a tenants
+	// row lock so the schedule-first definition-edit order below stays acyclic.
+	if _, err := lockTenantAdmissionRoot(ctx, tx, tenantID); err != nil {
+		return nil, types.NewAppError(
+			types.CodeDatabase, "锁定租户清理准入根", err)
 	}
 
 	// Definition edit transactions globally lock schedule → operation → receipt.
