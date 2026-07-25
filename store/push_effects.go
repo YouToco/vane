@@ -1168,6 +1168,7 @@ func verifyPushEffectAggregate(
 			SELECT 1 FROM push_batches
 			 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 			   AND run_snapshot_id=$4
+			   AND delivery_authority='effect'
 		)`,
 		prepared.BatchID, prepared.TenantID, prepared.UserID,
 		prepared.RunSnapshotID,

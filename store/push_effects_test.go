@@ -24,9 +24,21 @@ type pushEffectFixture struct {
 }
 
 func newPushEffectFixture(t *testing.T) pushEffectFixture {
+	return newPushEffectFixtureAt(t, 48)
+}
+
+func newPushEffectFixtureAt(
+	t *testing.T,
+	migrationVersion int64,
+) pushEffectFixture {
 	t.Helper()
 	dbURL, db, provider := migration039Scratch(t)
 	ctx := t.Context()
+	if migrationVersion > 39 {
+		if _, err := provider.UpTo(ctx, migrationVersion); err != nil {
+			t.Fatalf("migrate to %d: %v", migrationVersion, err)
+		}
+	}
 	var userID, snapshotID, batchID, deliveryA, deliveryB int64
 	openID := "push-effect-" + uuid.NewString()
 	if err := db.QueryRowContext(ctx, `
@@ -82,6 +94,16 @@ func newPushEffectFixture(t *testing.T) pushEffectFixture {
 			) VALUES (1,$1,$2,80,'{}'::jsonb,'pending') RETURNING id`,
 			batchID, userID,
 		).Scan(destination); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if migrationVersion >= 48 {
+		if _, err := db.ExecContext(ctx, `
+			UPDATE push_batches
+			   SET delivery_authority='effect'
+			 WHERE id=$1`,
+			batchID,
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
