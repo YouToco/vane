@@ -57,7 +57,7 @@ func (s *Store) ListPushEffectsForBatch(
 	for rows.Next() {
 		effect, err := scanPushEffect(rows)
 		if err != nil {
-			return nil, pushEffectDatabaseError(
+			return nil, pushEffectScanError(
 				"scan push effect batch plan", err)
 		}
 		if err := validateStoredPushEffect(effect); err != nil {
