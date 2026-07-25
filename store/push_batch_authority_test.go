@@ -421,8 +421,14 @@ func TestMigration048EmptyDowngrade(t *testing.T) {
 		t.Fatalf("empty 048 downgrade: %v", err)
 	}
 	var (
-		version      int
-		columnExists bool
+		version                 int
+		columnExists            bool
+		receiptDigestRead       bool
+		receiptCanonicalRead    bool
+		receiptSentUpdate       bool
+		receiptObservedRead     bool
+		receiptObservedUpdate   bool
+		receiptObservedPolicies int
 	)
 	if err := f.db.QueryRowContext(ctx, `
 		SELECT
@@ -433,12 +439,58 @@ func TestMigration048EmptyDowngrade(t *testing.T) {
 		     WHERE table_schema='public'
 		       AND table_name='push_batches'
 		       AND column_name='delivery_authority'
-		  )`,
-	).Scan(&version, &columnExists); err != nil {
+		  ),
+		  has_column_privilege(
+		    'vane_push_effect_receipt','push_effects',
+		    'payload_digest','SELECT'),
+		  has_column_privilege(
+		    'vane_push_effect_receipt','push_effects',
+		    'canonical_payload','SELECT'),
+		  has_column_privilege(
+		    'vane_push_effect_receipt','push_effects',
+		    'sent_at','UPDATE'),
+		  has_column_privilege(
+		    'vane_push_effect_receipt','task_observed_events',
+		    'event_key','SELECT'),
+		  has_column_privilege(
+		    'vane_push_effect_receipt','task_observed_events',
+		    'delivered_at','UPDATE'),
+		  (SELECT count(*) FROM pg_policies
+		    WHERE schemaname='public'
+		      AND tablename='task_observed_events'
+		      AND policyname IN (
+		        'push_effect_receipt_select_visible',
+		        'push_effect_receipt_update_visible',
+		        'push_effect_receipt_tenant_isolation'
+		      )
+		      AND 'vane_push_effect_receipt'=ANY(roles))`,
+	).Scan(
+		&version,
+		&columnExists,
+		&receiptDigestRead,
+		&receiptCanonicalRead,
+		&receiptSentUpdate,
+		&receiptObservedRead,
+		&receiptObservedUpdate,
+		&receiptObservedPolicies,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if version != 47 || columnExists {
-		t.Fatalf("empty down version/column=%d/%v", version, columnExists)
+	if version != 47 || columnExists ||
+		!receiptDigestRead || receiptCanonicalRead || !receiptSentUpdate ||
+		receiptObservedRead || receiptObservedUpdate ||
+		receiptObservedPolicies != 0 {
+		t.Fatalf(
+			"v47 downgrade matrix version/column=%d/%v receipt digest/canonical/sent=%v/%v/%v observed=%v/%v policies=%d",
+			version,
+			columnExists,
+			receiptDigestRead,
+			receiptCanonicalRead,
+			receiptSentUpdate,
+			receiptObservedRead,
+			receiptObservedUpdate,
+			receiptObservedPolicies,
+		)
 	}
 }
 

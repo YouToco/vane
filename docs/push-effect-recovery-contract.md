@@ -179,6 +179,12 @@ versioned effect; it does not delete deliveries or forge `sent`.
 
 ## 9. Release train
 
+Before the first post-048 worker may claim a batch or enable the exact-task
+canary, deployment must stop Push ingress and drain every pre-048 Push Activity
+to completion. A rolling overlap is forbidden: old workers do not participate
+in the durable batch-authority claim or its schema-admission fence, so migration
+success alone cannot make a mixed-version send safe.
+
 1. Deploy schema, codec, Store, roles, and integrity tests with zero production
    call points.
 2. Deploy the stable-UUID Feishu adapter and dark effect preparation.

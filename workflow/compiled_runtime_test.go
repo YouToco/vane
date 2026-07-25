@@ -2122,7 +2122,7 @@ func TestPush_CompiledDeliveryReceiptFailurePreventsBatchDone(t *testing.T) {
 	}
 }
 
-func TestPush_CompiledRecoveryOnlyAfterRevocationMarksDoneWithoutResend(t *testing.T) {
+func TestPush_CompiledRecoveryOnlyClaimsAuthorityBeforeDoneWithoutResend(t *testing.T) {
 	identity, ref, snapshot := compiledActivityFixture("Frozen Task")
 	compiledStore := &compiledRunStoreFake{
 		snapshot: snapshot, recoveryOnly: true, authorize: false,
@@ -2159,12 +2159,17 @@ func TestPush_CompiledRecoveryOnlyAfterRevocationMarksDoneWithoutResend(t *testi
 		t.Fatalf("recovery-only retry resent %d external cards", got)
 	}
 	effects.mu.Lock()
-	authorityClaims := len(effects.authorityClaims)
+	authorityClaims := append(
+		[]types.PushBatchDeliveryAuthority(nil),
+		effects.authorityClaims...,
+	)
 	preparedEffects := len(effects.prepared)
 	effects.mu.Unlock()
-	if authorityClaims != 0 || preparedEffects != 0 {
+	if len(authorityClaims) != 1 ||
+		authorityClaims[0] != types.PushBatchDeliveryAuthorityEffect ||
+		preparedEffects != 0 {
 		t.Fatalf(
-			"recovery-only touched live authority/effects=%d/%d",
+			"recovery-only authority/effects=%v/%d",
 			authorityClaims,
 			preparedEffects,
 		)
@@ -2186,5 +2191,77 @@ func TestPush_CompiledRecoveryOnlyAfterRevocationMarksDoneWithoutResend(t *testi
 	if legacyBatches != 0 || legacyInserts != 0 || legacyMarks != 0 || legacyStatuses != 0 {
 		t.Fatalf("compiled recovery escaped to legacy writes: batches=%d inserts=%d marks=%d statuses=%d",
 			legacyBatches, legacyInserts, legacyMarks, legacyStatuses)
+	}
+}
+
+func TestPush_CompiledRecoveryOnlyAuthorityFailureDoesNotMarkDone(t *testing.T) {
+	identity, ref, snapshot := compiledActivityFixture("Frozen Task")
+	compiledStore := &compiledRunStoreFake{
+		snapshot: snapshot, recoveryOnly: true, authorize: false,
+	}
+	authorityErr := types.NewAppError(
+		types.CodeDatabase,
+		"claim push batch delivery authority",
+		nil,
+	)
+	effects := &pushEffectStoreFake{authorityErr: authorityErr}
+	a := NewActivities(
+		fakeFetcher{},
+		fakeScorer{},
+		fakeCardGen{},
+		&fakePusher{msgID: "must-not-resend"},
+		&effectCountingStore{fakeStore: new(fakeStore)},
+		noOwnerFeishu{},
+		nil,
+		nil,
+		func(feedback.AggregateCardInput) string { return `{}` },
+		func(string, int) (string, string) { return "title", "blue" },
+		WithCompiledRuntimeV1(
+			compiledStore,
+			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+				return runtimepolicy.BundleV1{}, nil
+			},
+			new(compiledModelResolverFake),
+		),
+		WithPushEffectCanary(effects, identity.TaskID),
+	)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.Push)
+	err := executePushActivity(t, env, a, PushIn{
+		UserID: identity.UserID, ScheduleID: identity.TaskID,
+		TraceID: "trace-recovery-authority-failure",
+		Run: &CompiledRunInputV1{
+			TenantID: identity.TenantID,
+			TaskID:   identity.TaskID,
+			Snapshot: ref,
+		},
+		Cards: []GeneratedCard{{
+			Scored: types.ScoredItem{Item: types.ContentItem{
+				ID: 501, SourceID: 10, Title: "item",
+			}, Score: 88},
+			BodyMD: "body",
+		}},
+	})
+	if err == nil {
+		t.Fatal("recovery-only Push accepted a failed authority claim")
+	}
+	compiledStore.mu.Lock()
+	statuses := compiledStore.batchStatuses
+	compiledStore.mu.Unlock()
+	if statuses != 0 {
+		t.Fatalf("authority failure finalized %d batches", statuses)
+	}
+	effects.mu.Lock()
+	claims := append(
+		[]types.PushBatchDeliveryAuthority(nil),
+		effects.authorityClaims...,
+	)
+	prepared := len(effects.prepared)
+	effects.mu.Unlock()
+	if len(claims) != 1 ||
+		claims[0] != types.PushBatchDeliveryAuthorityEffect ||
+		prepared != 0 {
+		t.Fatalf("authority failure calls=%v prepared=%d", claims, prepared)
 	}
 }

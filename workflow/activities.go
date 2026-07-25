@@ -2682,23 +2682,6 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	if err != nil {
 		return err
 	}
-	if recoveryOnly {
-		// A previous attempt durably recorded every delivery as sent but exited
-		// before the terminal batch receipt. Live authority may now be revoked;
-		// the store only returns this state from exact immutable sent evidence.
-		// Finish that receipt immediately and never rebuild or resend the card.
-		return retryableOrNot(a.compiledStore.MarkPushBatchDoneReceiptV1(
-			ctx, compiledIdentity, in.Run.Snapshot, in.TraceID, batchID))
-	}
-	if owner == "" {
-		// Compiled receipt-only recovery above must remain possible after the
-		// owner identity disappears: the external card is already sent and this
-		// branch only applies to a new send. Legacy keeps its original pre-batch
-		// owner check above.
-		return nonRetryable(types.NewAppError(types.CodeNotFound,
-			"尚未捕获飞书 owner，无法推送", nil))
-	}
-
 	effectEnabled := false
 	if compiled && a.pushEffectStore != nil {
 		batchStarted, err := a.pushEffectStore.PushEffectBatchStarted(
@@ -2729,6 +2712,31 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			return retryableOrNot(err)
 		}
 		effectEnabled = winner == types.PushBatchDeliveryAuthorityEffect
+	}
+	if recoveryOnly {
+		if a.pushEffectStore == nil {
+			return nonRetryable(types.NewAppError(
+				types.CodeInternal,
+				"push batch delivery authority store is not configured",
+				nil,
+			))
+		}
+		// A previous attempt durably recorded every delivery as sent but exited
+		// before the terminal batch receipt. Live run authority may now be
+		// revoked, but the exact batch still elects and obeys its durable
+		// delivery protocol before any terminal write. The store only returns
+		// this state from immutable sent evidence, so either winner may safely
+		// finish the projection without rebuilding or resending the card.
+		return retryableOrNot(a.compiledStore.MarkPushBatchDoneReceiptV1(
+			ctx, compiledIdentity, in.Run.Snapshot, in.TraceID, batchID))
+	}
+	if owner == "" {
+		// Compiled receipt-only recovery above must remain possible after the
+		// owner identity disappears: the external card is already sent and this
+		// branch only applies to a new send. Legacy keeps its original pre-batch
+		// owner check above.
+		return nonRetryable(types.NewAppError(types.CodeNotFound,
+			"尚未捕获飞书 owner，无法推送", nil))
 	}
 
 	// 聚合卡改版（card-redesign-spec.md 附录 A，2026-07-18）：一批一张聚合卡，

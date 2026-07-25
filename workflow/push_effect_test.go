@@ -114,6 +114,7 @@ type pushEffectStoreFake struct {
 	initialStatus   pusheffect.Status
 	batchStarted    bool
 	authorityWinner types.PushBatchDeliveryAuthority
+	authorityErr    error
 	authorityClaims []types.PushBatchDeliveryAuthority
 	prepared        []pusheffect.Prepared
 	claims          int
@@ -133,6 +134,9 @@ func (f *pushEffectStoreFake) ClaimPushBatchDeliveryAuthority(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.authorityClaims = append(f.authorityClaims, desired)
+	if f.authorityErr != nil {
+		return "", f.authorityErr
+	}
 	if f.authorityWinner.Valid() {
 		return f.authorityWinner, nil
 	}

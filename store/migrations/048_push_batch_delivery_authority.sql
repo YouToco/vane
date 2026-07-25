@@ -323,7 +323,7 @@ REVOKE SELECT (
     delivery_id, status, delivered_at
 ) ON task_observed_events FROM vane_push_effect_receipt;
 REVOKE SELECT (
-    canonical_payload, payload_digest, chunk_index, chunk_count
+    canonical_payload, chunk_index, chunk_count
 ) ON push_effects FROM vane_push_effect_receipt;
 REVOKE UPDATE (
     status
