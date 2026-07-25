@@ -498,10 +498,10 @@ func (m *Manager) reload(ctx context.Context) error {
 	h := newHandlerForApp(m, wsCtx, cfg.AppID)
 	wsCli := larkws.NewClient(cfg.AppID, cfg.AppSecret,
 		larkws.WithEventHandler(h.eventDispatcher()),
-		// The SDK's INFO connection line contains the WebSocket access_key and
-		// ticket in the URL. Those are short-lived credentials, but they still
-		// must not enter journald. Keep only SDK errors; Vane emits its own
-		// credential-free lifecycle/status logs.
+		// The SDK may include the complete WebSocket URL not only in INFO
+		// connection logs, but also in malformed-URL errors. The custom logger
+		// discards every SDK-supplied value before it reaches journald.
+		larkws.WithLogger(newFeishuSDKLogger()),
 		larkws.WithLogLevel(larkcore.LogLevelError),
 	)
 
@@ -536,8 +536,9 @@ func (m *Manager) reload(ctx context.Context) error {
 		}
 		m.connected = false
 		m.connectedAt = nil
-		m.lastError = "WS 连接失败：" + err.Error()
-		slog.Error("feishu: WS 连接退出", "err", err)
+		m.lastError = "WS 连接失败（详情已脱敏）"
+		slog.Error("feishu: WS 连接退出（详情已脱敏）",
+			"error_type", fmt.Sprintf("%T", err))
 	}()
 	return nil
 }

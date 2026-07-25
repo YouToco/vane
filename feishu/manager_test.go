@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,18 +18,83 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-func TestManagerSDKLogLevelDoesNotExposeWebSocketCredentials(t *testing.T) {
-	source, err := os.ReadFile("manager.go")
+func TestManagerUsesCredentialSafeSDKLogger(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "manager.go", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	code := string(source)
-	if strings.Contains(code, "larkws.WithLogLevel(larkcore.LogLevelInfo)") {
-		t.Fatal("Feishu SDK INFO logs expose WebSocket access_key and ticket")
+
+	var (
+		newClientCalls int
+		safeLoggerArgs int
+		errorLevelArgs int
+	)
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, ok := selector.X.(*ast.Ident)
+		if !ok || pkg.Name != "larkws" {
+			return true
+		}
+		if selector.Sel.Name != "NewClient" {
+			return true
+		}
+		newClientCalls++
+		for _, arg := range call.Args {
+			option, ok := arg.(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			optionSelector, ok := option.Fun.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			optionPkg, ok := optionSelector.X.(*ast.Ident)
+			if !ok || optionPkg.Name != "larkws" || len(option.Args) != 1 {
+				continue
+			}
+			switch optionSelector.Sel.Name {
+			case "WithLogger":
+				if isDirectZeroArgCall(option.Args[0], "newFeishuSDKLogger") {
+					safeLoggerArgs++
+				}
+			case "WithLogLevel":
+				if isSelector(option.Args[0], "larkcore", "LogLevelError") {
+					errorLevelArgs++
+				}
+			}
+		}
+		return true
+	})
+	if newClientCalls != 1 || safeLoggerArgs != 1 || errorLevelArgs != 1 {
+		t.Fatalf("unsafe Feishu WS construction: NewClient=%d safe_logger=%d error_level=%d",
+			newClientCalls, safeLoggerArgs, errorLevelArgs)
 	}
-	if !strings.Contains(code, "larkws.WithLogLevel(larkcore.LogLevelError)") {
-		t.Fatal("Feishu SDK must retain credential-free error logging")
+}
+
+func isDirectZeroArgCall(expr ast.Expr, name string) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 0 {
+		return false
 	}
+	ident, ok := call.Fun.(*ast.Ident)
+	return ok && ident.Name == name
+}
+
+func isSelector(expr ast.Expr, pkgName, selectorName string) bool {
+	selector, ok := expr.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != selectorName {
+		return false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	return ok && pkg.Name == pkgName
 }
 
 func TestManagerShutdownRejectsNewWorkAndWaitsForInflight(t *testing.T) {
