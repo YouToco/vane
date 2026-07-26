@@ -1,0 +1,119 @@
+name: Deploy production
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vane-production-control-plane
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Linux, ARM64, vane-deploy]
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout deployment control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: control-plane
+
+      - name: Checkout vane main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: YouToco/vane
+          ref: refs/heads/main
+          ssh-key: ${{ secrets.VANE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: source/vane
+
+      - name: Checkout vane-web main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: YouToco/vane-web
+          ref: refs/heads/main
+          ssh-key: ${{ secrets.VANE_WEB_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: source/vane-web
+
+      - name: Plan from checked-out commits
+        id: plan
+        run: control-plane/scripts/plan.sh source/vane source/vane-web
+
+      - name: Set up Go
+        if: steps.plan.outputs.backend_changed == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.26"
+          cache-dependency-path: source/vane/go.sum
+
+      - name: Build backend production binaries
+        if: steps.plan.outputs.backend_changed == 'true'
+        working-directory: source/vane
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build -o bin/vane ./cmd/server
+          go build -o bin/useradmin ./cmd/useradmin
+          go build -o bin/gate ./cmd/gate
+          go build -o bin/runtimeadmin ./cmd/runtimeadmin
+
+      - name: Set up Node
+        if: steps.plan.outputs.frontend_changed == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: source/vane-web/package-lock.json
+
+      - name: Build frontend production bundle
+        if: steps.plan.outputs.frontend_changed == 'true'
+        working-directory: source/vane-web
+        env:
+          VITE_API_BASE: https://api.vane.zhuoqidev.com
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install pinned deployment CLIs
+        if: steps.plan.outputs.frontend_changed == 'true'
+        env:
+          WRANGLER_VERSION: "4.111.0"
+        run: |
+          control-plane/scripts/install-aliyun.sh
+          npm install \
+            --prefix "$RUNNER_TEMP/wrangler-$WRANGLER_VERSION" \
+            --no-audit --no-fund --save-exact \
+            "wrangler@$WRANGLER_VERSION"
+
+      - name: Reconcile production
+        if: steps.plan.outputs.any_changed == 'true'
+        env:
+          BACKEND_PLANNED_SHA: ${{ steps.plan.outputs.backend_sha }}
+          FRONTEND_PLANNED_SHA: ${{ steps.plan.outputs.frontend_sha }}
+          ALIYUN_BIN: ${{ runner.temp }}/aliyun-3.4.8/aliyun
+          WRANGLER_BIN: ${{ runner.temp }}/wrangler-4.111.0/node_modules/.bin/wrangler
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_SSH_HOST_ED25519_FINGERPRINT: ${{ secrets.VPS_SSH_HOST_ED25519_FINGERPRINT }}
+          ALIYUN_ACCESS_KEY_ID: ${{ secrets.ALIYUN_ACCESS_KEY_ID }}
+          ALIYUN_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: control-plane/scripts/deploy.sh source/vane source/vane-web
+
+      - name: Nothing to deploy
+        if: steps.plan.outputs.any_changed != 'true'
+        run: echo "Both checked-out main commits already passed production deployment."
