@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -972,27 +971,30 @@ func TestFinishSnapshotCutoverRunSanitizesStoreError(t *testing.T) {
 	}
 }
 
-func TestRuntimeAdminDeploymentWorkflow(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("resolve test source")
-	}
-	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 	payload, err := os.ReadFile(filepath.Join(
-		repoRoot, ".github", "workflows", "ci.yml"))
+		"..", "..", ".github", "workflows", "ci.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	workflow := string(payload)
-	for _, fragment := range []string{
-		"# 四个二进制都要上生产：",
-		"GOOS=linux GOARCH=amd64 go build -o bin/runtimeadmin ./cmd/runtimeadmin",
-		`source: "bin/vane,bin/useradmin,bin/gate,bin/runtimeadmin"`,
-		"chmod +x /opt/vane/bin/vane /opt/vane/bin/useradmin /opt/vane/bin/gate /opt/vane/bin/runtimeadmin",
-		"test -x /opt/vane/bin/runtimeadmin",
+	for _, required := range []string{
+		"runs-on: [self-hosted, Linux, ARM64, vane-test]",
+		"permissions:\n  contents: read",
+		"persist-credentials: false",
 	} {
-		if !strings.Contains(workflow, fragment) {
-			t.Errorf("deployment workflow missing %q", fragment)
+		if !strings.Contains(workflow, required) {
+			t.Errorf("source CI missing isolation guard %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"vane-deploy",
+		"VPS_",
+		"appleboy/",
+		"workflow_dispatch:",
+	} {
+		if strings.Contains(workflow, forbidden) {
+			t.Errorf("source CI contains production capability %q", forbidden)
 		}
 	}
 }
