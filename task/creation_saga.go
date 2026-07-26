@@ -1350,15 +1350,16 @@ func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArg
 		if isExplicitJSONNull(envelope.ObservationPolicy) {
 			return nil, errors.New("task: observation_policy must be an object")
 		}
-		if err := decodeStrictJSON(
-			envelope.ObservationPolicy,
-			&args.ObservationPolicy,
+		var policy observation.PolicySpecV1
+		if err := strictjson.DecodeExact(
+			envelope.ObservationPolicy, &policy,
 		); err != nil {
 			return nil, fmt.Errorf(
 				"task: decode create_schedule observation_policy: %w",
 				err,
 			)
 		}
+		args.ObservationPolicy = &policy
 	}
 	// Preserve the legacy common-envelope precedence before inspecting any
 	// transient plan structure. Invalid spec/intent/strictness must win over a
@@ -1919,6 +1920,12 @@ func summarizeCreationProposal(command normalizedCreateScheduleCommand) (string,
 	}
 	builder.WriteString("\n筛选：")
 	builder.WriteString(summarizeCreationStrictness(strictness))
+	if command.ObservationPolicy != nil {
+		builder.WriteString("\n新鲜度策略：")
+		builder.WriteString(summarizeCreationObservationPolicy(
+			*command.ObservationPolicy,
+		))
+	}
 	builder.WriteString(fmt.Sprintf("\n信息范围（%d）：", len(plan.Sources)))
 	for _, source := range plan.Sources {
 		builder.WriteString("\n- ")
@@ -1932,6 +1939,53 @@ func summarizeCreationProposal(command normalizedCreateScheduleCommand) (string,
 		return "", fmt.Errorf("confirmation summary exceeds %d bytes", maxCreationSummaryBytes)
 	}
 	return summary, nil
+}
+
+func summarizeCreationObservationPolicy(policy observation.PolicySpecV1) string {
+	var window string
+	switch policy.Window.Kind {
+	case observation.WindowScheduleInterval:
+		window = "相邻两次计划触发之间"
+	case observation.WindowRollingDuration:
+		window = fmt.Sprintf(
+			"最近 %d 小时", policy.Window.RollingDurationSeconds/3600,
+		)
+	case observation.WindowCalendarPeriod:
+		window = map[observation.CalendarPeriod]string{
+			observation.CalendarDay:   "本日",
+			observation.CalendarWeek:  "本周",
+			observation.CalendarMonth: "本月",
+		}[policy.Window.CalendarPeriod]
+	}
+	late := "窗口外不补推"
+	if policy.LatePolicy == observation.LateBounded {
+		late = fmt.Sprintf("允许迟到 %d 秒", policy.AllowedLatenessSecs)
+	}
+	unknown := map[observation.UnknownTimePolicy]string{
+		observation.UnknownTimeReject:       "日期未知拒绝",
+		observation.UnknownTimeDeprioritize: "日期未知降权",
+		observation.UnknownTimeAllow:        "日期未知允许",
+	}[policy.UnknownTime]
+	evidence := "允许可信媒体证据"
+	if policy.Evidence.Requirement == observation.EvidenceOfficialRequired {
+		evidence = "仅官方证据：" + strings.Join(
+			policy.Evidence.OfficialDomains, "、",
+		)
+	}
+	if policy.Mode != observation.ModeEvent || policy.Event == nil {
+		return "普通内容模式；窗口 " + window + "；" + late + "；" +
+			unknown + "；" + evidence
+	}
+	qualification := map[observation.Qualification]string{
+		observation.QualificationAnnouncement:        "官方宣布即算",
+		observation.QualificationGeneralAvailability: "正式可用才算",
+		observation.QualificationEither:              "官方宣布或正式可用均算",
+	}[policy.Event.Qualification]
+	return fmt.Sprintf(
+		"仅事件发生时推送；%s（%s；%s）；窗口 %s；%s；%s；%s；无匹配事件不发消息",
+		policy.Event.Subject, policy.Event.EventKind, qualification,
+		window, late, unknown, evidence,
+	)
 }
 
 func summarizeCreationTiming(spec scheduler.ScheduleSpec) string {

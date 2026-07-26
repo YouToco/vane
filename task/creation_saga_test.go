@@ -667,7 +667,7 @@ func TestCreationCoordinator_ProposalPreservesObservationPolicyAcrossCanonicalRe
 		},
 		UnknownTime: observation.UnknownTimeReject,
 		Event: &observation.EventPolicyV1{
-			Subject:       "OpenAI API",
+			Subject:       "OpenAI \u202eAPI",
 			EventKind:     "重大版本发布",
 			Qualification: observation.QualificationAnnouncement,
 		},
@@ -690,12 +690,32 @@ func TestCreationCoordinator_ProposalPreservesObservationPolicyAcrossCanonicalRe
 		"observation_policy": policy,
 	})
 
-	_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+	proposal, err := coordinator.Propose(t.Context(), CreationProposalInput{
 		ActionID: "action-observation-policy", UserID: 11, RawArgs: raw,
 		ExpiresAt: time.Now().Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
+	}
+	for _, want := range []string{
+		"新鲜度策略：仅事件发生时推送",
+		"OpenAI API",
+		"重大版本发布",
+		"官方宣布即算",
+		"窗口 相邻两次计划触发之间",
+		"窗口外不补推",
+		"日期未知拒绝",
+		"仅官方证据：openai.com",
+		"无匹配事件不发消息",
+	} {
+		if !strings.Contains(proposal.Summary, want) {
+			t.Fatalf("confirmation summary missing %q: %s", want, proposal.Summary)
+		}
+	}
+	if strings.Contains(proposal.Summary, "\u202e") ||
+		len(proposal.Summary) > maxCreationSummaryBytes {
+		t.Fatalf("confirmation summary 未安全清洗或超限: len=%d summary=%q",
+			len(proposal.Summary), proposal.Summary)
 	}
 	command, _, err := normalizeCreateScheduleCommand(store.op.Args)
 	if err != nil {
@@ -746,10 +766,8 @@ func TestCreationCoordinator_ProposalPreservesObservationPolicyAcrossCanonicalRe
 	}
 }
 
-func TestCreationCoordinator_SourceSpecsRejectUnknownObservationPolicyField(t *testing.T) {
-	store := newCreationSagaFakeStore()
-	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
-	raw := json.RawMessage(`{
+func TestCreationCoordinator_SourceSpecsRejectNonCanonicalObservationPolicyFields(t *testing.T) {
+	valid := json.RawMessage(`{
 		"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},
 		"intent":"监控官方更新",
 		"approved_fetch_plan":{"source_specs":{
@@ -762,20 +780,55 @@ func TestCreationCoordinator_SourceSpecsRejectUnknownObservationPolicyField(t *t
 			"window":{"kind":"schedule_interval"},
 			"late_policy":"strict",
 			"evidence":{"requirement":"trusted_allowed"},
-			"unknown_time":"reject",
-			"unexpected":true
+			"unknown_time":"reject"
 		}
 	}`)
-	_, err := coordinator.Propose(t.Context(), CreationProposalInput{
-		ActionID: "action-unknown-observation-field", UserID: 11, RawArgs: raw,
-		ExpiresAt: time.Now().Add(time.Hour),
-	})
-	if !errors.Is(err, types.ErrValidation) ||
-		!strings.Contains(err.Error(), `unknown field "unexpected"`) ||
-		store.membershipCalls != 0 || store.tenantCalls != 0 ||
-		store.resolveCalls != 0 || store.createCalls != 0 {
-		t.Fatalf("unknown observation field must fail before lookup: err=%v store=%+v",
-			err, store)
+	tests := []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{
+			name: "unknown field",
+			mutate: func(raw []byte) []byte {
+				return bytes.Replace(
+					raw, []byte(`"unknown_time":"reject"`),
+					[]byte(`"unknown_time":"reject","unexpected":true`), 1,
+				)
+			},
+		},
+		{
+			name: "case folded alias",
+			mutate: func(raw []byte) []byte {
+				return bytes.Replace(raw, []byte(`"mode"`), []byte(`"Mode"`), 1)
+			},
+		},
+		{
+			name: "escaped field alias",
+			mutate: func(raw []byte) []byte {
+				return bytes.Replace(
+					raw, []byte(`"mode"`), []byte(`"mo\u0064e"`), 1,
+				)
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := newCreationSagaFakeStore()
+			coordinator := NewCreationCoordinator(
+				store, &creationSagaFakeScheduler{}, nil,
+			)
+			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+				ActionID: "action-invalid-observation-field", UserID: 11,
+				RawArgs:   testCase.mutate(bytes.Clone(valid)),
+				ExpiresAt: time.Now().Add(time.Hour),
+			})
+			if !errors.Is(err, types.ErrValidation) ||
+				store.membershipCalls != 0 || store.tenantCalls != 0 ||
+				store.resolveCalls != 0 || store.createCalls != 0 {
+				t.Fatalf("non-canonical observation field must fail before lookup/write: err=%v store=%+v",
+					err, store)
+			}
+		})
 	}
 }
 
