@@ -43,12 +43,16 @@ const (
 )
 
 type taskDefinitionEditScheduleRow struct {
-	Status      types.ScheduleStatus
-	Mode        types.ExecutionMode
-	Version     *int64
-	Digest      *string
-	OperationID *string
-	Fence       *int64
+	Status                   types.ScheduleStatus
+	Mode                     types.ExecutionMode
+	Version                  *int64
+	Digest                   *string
+	OperationID              *string
+	Fence                    *int64
+	CutoverEventID           *int64
+	CutoverAction            *TaskRunSnapshotCutoverAction
+	CutoverDefinitionVersion *int64
+	CutoverDefinitionDigest  *string
 }
 
 func scanTaskDefinitionEditOperation(
@@ -225,15 +229,25 @@ func lockTaskDefinitionEditScheduleForUpdate(
 ) (*taskDefinitionEditScheduleRow, error) {
 	var row taskDefinitionEditScheduleRow
 	var rawStatus, rawMode string
+	var rawCutoverAction *string
 	err := tx.QueryRow(ctx,
-		`SELECT status, execution_mode, approved_definition_version,
-		        approved_definition_digest, definition_edit_operation_id,
-		        definition_edit_fence
-		   FROM schedules
-		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3
-		  FOR UPDATE`, tenantID, userID, taskID,
+		`SELECT s.status, s.execution_mode, s.approved_definition_version,
+		        s.approved_definition_digest, s.definition_edit_operation_id,
+		        s.definition_edit_fence, s.run_snapshot_cutover_event_id,
+		        e.action, e.approved_definition_version,
+		        e.approved_definition_digest
+		   FROM schedules s
+		   LEFT JOIN task_run_snapshot_v2_cutover_events e
+		     ON e.id=s.run_snapshot_cutover_event_id
+		    AND e.tenant_id=s.tenant_id
+		    AND e.user_id=s.user_id
+		    AND e.task_id=s.id
+		  WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.id=$3
+		  FOR UPDATE OF s`, tenantID, userID, taskID,
 	).Scan(&rawStatus, &rawMode, &row.Version, &row.Digest,
-		&row.OperationID, &row.Fence)
+		&row.OperationID, &row.Fence, &row.CutoverEventID,
+		&rawCutoverAction, &row.CutoverDefinitionVersion,
+		&row.CutoverDefinitionDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -246,10 +260,22 @@ func lockTaskDefinitionEditScheduleForUpdate(
 	}
 	mode, err := types.ParseExecutionMode(rawMode)
 	if err != nil || (row.Version == nil) != (row.Digest == nil) ||
-		(row.OperationID == nil) != (row.Fence == nil) {
+		(row.OperationID == nil) != (row.Fence == nil) ||
+		(row.CutoverEventID == nil) != (rawCutoverAction == nil) ||
+		(row.CutoverEventID == nil) != (row.CutoverDefinitionVersion == nil) ||
+		(row.CutoverEventID == nil) != (row.CutoverDefinitionDigest == nil) {
 		return nil, taskDefinitionEditIntegrity()
 	}
 	row.Mode = mode
+	if rawCutoverAction != nil {
+		action := TaskRunSnapshotCutoverAction(*rawCutoverAction)
+		if !action.valid() ||
+			!validTaskStateDigest(*row.CutoverDefinitionDigest) ||
+			*row.CutoverDefinitionVersion <= 0 {
+			return nil, taskDefinitionEditIntegrity()
+		}
+		row.CutoverAction = &action
+	}
 	return &row, nil
 }
 
@@ -1396,6 +1422,9 @@ func (s *Store) QuiesceTaskDefinitionEdit(
 			ctx, tx, op, assessment)
 		return terminateErr
 	}
+	if err := validateTaskDefinitionEditCutoverBase(op, schedule); err != nil {
+		return err
+	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE schedules
 		    SET status=$7, definition_edit_operation_id=$8,
@@ -1479,6 +1508,13 @@ func (s *Store) AuthorizeTaskDefinitionEditRemotePhase(
 		terminated, terminateErr := s.terminateAcquiredTaskDefinitionEditAssessment(
 			ctx, tx, op, assessment)
 		return terminated, terminateErr
+	}
+	if expectedPhase != types.TaskDefinitionEditPhaseDBQuiesced {
+		if err := ensureTaskDefinitionEditCutoverTx(
+			ctx, tx, op, lease, schedule,
+		); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, taskDefinitionEditDatabaseError("commit remote authorization", err)
@@ -2023,6 +2059,11 @@ func (s *Store) CompleteTaskDefinitionEditOperation(
 	if err := validateLoadedTaskDefinitionEditLease(op, databaseNow, lease); err != nil {
 		return err
 	}
+	if err := ensureTaskDefinitionEditCutoverTx(
+		ctx, tx, op, lease, schedule,
+	); err != nil {
+		return err
+	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE schedules
 		    SET status=$4, definition_edit_operation_id=NULL,
@@ -2096,6 +2137,15 @@ func (s *Store) CommitTaskDefinitionEditDefinition(
 		if err := verifyCommittedTaskDefinitionEditTx(ctx, tx, op); err != nil {
 			return err
 		}
+		if err := ensureTaskDefinitionEditCutoverTx(
+			ctx, tx, op, lease, schedule,
+		); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return taskDefinitionEditDatabaseError(
+				"commit snapshot cutover replay", err)
+		}
 		return nil
 	}
 	if op.Phase != types.TaskDefinitionEditPhaseTemporalBasePaused {
@@ -2105,6 +2155,9 @@ func (s *Store) CommitTaskDefinitionEditDefinition(
 		_, terminateErr := s.terminateAcquiredTaskDefinitionEditAssessment(
 			ctx, tx, op, assessment)
 		return terminateErr
+	}
+	if err := validateTaskDefinitionEditCutoverBase(op, schedule); err != nil {
+		return err
 	}
 	target, err := taskstate.DecodeApprovedDefinitionV1(op.TargetDefinition)
 	if err != nil {
@@ -2140,6 +2193,11 @@ func (s *Store) CommitTaskDefinitionEditDefinition(
 		record.ApprovalRef != op.ApprovalRef ||
 		!bytes.Equal(record.Payload, op.TargetDefinition) {
 		return taskDefinitionEditIntegrity()
+	}
+	if err := ensureTaskDefinitionEditCutoverTx(
+		ctx, tx, op, lease, schedule,
+	); err != nil {
+		return err
 	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE task_definition_edit_operations

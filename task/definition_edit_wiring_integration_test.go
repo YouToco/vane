@@ -26,7 +26,7 @@ func TestTaskDefinitionEditCoordinatorIntegration_CancelBindsOriginalReceipt(
 	server, namespace, taskQueue := startDefinitionEditIntegrationServer(t)
 	fixture := newDefinitionEditCoordinatorIntegrationFixture(
 		t, dbURL, server.Client(), namespace, taskQueue,
-		definitionEditCoordinatorKillNone, types.ScheduleStatusActive, false,
+		definitionEditCoordinatorKillNone, types.ScheduleStatusActive, false, false,
 	)
 
 	outcome, err := fixture.coordinator.Cancel(
@@ -69,7 +69,7 @@ func TestTaskDefinitionEditCoordinatorIntegration_LegacyReconcileCannotOverwrite
 	server, namespace, taskQueue := startDefinitionEditIntegrationServer(t)
 	fixture := newDefinitionEditCoordinatorIntegrationFixture(
 		t, dbURL, server.Client(), namespace, taskQueue,
-		definitionEditCoordinatorKillNone, types.ScheduleStatusActive, false,
+		definitionEditCoordinatorKillNone, types.ScheduleStatusActive, false, false,
 	)
 	blockingStore := &definitionEditBlockingReconcileStore{
 		Store: fixture.store, targetID: fixture.operation.TaskID,
@@ -133,7 +133,7 @@ func TestDefinitionEditReceiptDispatcherIntegration_PostgreSQLResponseLossRecove
 	server, namespace, taskQueue := startDefinitionEditIntegrationServer(t)
 	fixture := newDefinitionEditCoordinatorIntegrationFixture(
 		t, dbURL, server.Client(), namespace, taskQueue,
-		definitionEditCoordinatorKillNone, types.ScheduleStatusActive, false,
+		definitionEditCoordinatorKillNone, types.ScheduleStatusActive, false, false,
 	)
 	outcome, err := fixture.coordinator.Confirm(
 		t.Context(), fixture.operation.Scope(), fixture.receipt,

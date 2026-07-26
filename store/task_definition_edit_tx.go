@@ -12,11 +12,12 @@ import (
 const taskDefinitionEditRollbackTimeout = 2 * time.Second
 
 type taskDefinitionEditRoleExpectation struct {
-	role                 string
-	rlsTable             string
-	probeTenantIsolation bool
-	mayUpdateMarker      bool
-	mayUpdateReceiptBody bool
+	role                    string
+	rlsTable                string
+	probeTenantIsolation    bool
+	mayUpdateMarker         bool
+	mayUpdateReceiptBody    bool
+	mayExecuteCutoverRebase bool
 }
 
 // ValidateTaskDefinitionEditRuntimeRoles proves the exact production
@@ -41,10 +42,11 @@ func (s *Store) ValidateTaskDefinitionEditRuntimeRoles(ctx context.Context) erro
 	probeTenantID := maxTenantID + 1
 	for _, expected := range []taskDefinitionEditRoleExpectation{
 		{
-			role:                 "vane_edit_coordinator",
-			rlsTable:             "schedules",
-			probeTenantIsolation: true,
-			mayUpdateMarker:      true,
+			role:                    "vane_edit_coordinator",
+			rlsTable:                "schedules",
+			probeTenantIsolation:    true,
+			mayUpdateMarker:         true,
+			mayExecuteCutoverRebase: true,
 		},
 		{
 			role:                 "vane_edit_receipt",
@@ -63,6 +65,8 @@ func (s *Store) ValidateTaskDefinitionEditRuntimeRoles(ctx context.Context) erro
 			superuser, bypassRLS, canLogin, inherits          bool
 			createDB, createRole, replication, mayDeleteTasks bool
 			mayUpdateMarker, mayUpdateReceipt                 bool
+			mayExecuteCutoverRebase, mayUpdateCutoverPointer  bool
+			mayInsertCutoverEvent, mayUseCutoverSequence      bool
 			rowSecurityActive, ownsRLSTable                   bool
 		)
 		err = tx.QueryRow(ctx, `
@@ -84,6 +88,24 @@ func (s *Store) ValidateTaskDefinitionEditRuntimeRoles(ctx context.Context) erro
 			           current_user, 'task_definition_edit_receipts',
 			           'payload', 'UPDATE'
 			       ),
+			       has_function_privilege(
+			           current_user,
+			           'public.task_run_snapshot_v2_rebase_definition_edit(text,bigint,text)',
+			           'EXECUTE'
+			       ),
+			       has_column_privilege(
+			           current_user, 'schedules',
+			           'run_snapshot_cutover_event_id', 'UPDATE'
+			       ),
+			       has_table_privilege(
+			           current_user, 'task_run_snapshot_v2_cutover_events',
+			           'INSERT'
+			       ),
+			       has_sequence_privilege(
+			           current_user,
+			           'task_run_snapshot_v2_cutover_events_id_seq',
+			           'USAGE'
+			       ),
 			       row_security_active($1::regclass),
 			       c.relowner = r.oid
 			  FROM pg_roles r
@@ -94,6 +116,8 @@ func (s *Store) ValidateTaskDefinitionEditRuntimeRoles(ctx context.Context) erro
 			&currentRole, &tenantContext, &superuser, &bypassRLS, &canLogin,
 			&inherits, &createDB, &createRole, &replication,
 			&mayDeleteTasks, &mayUpdateMarker, &mayUpdateReceipt,
+			&mayExecuteCutoverRebase, &mayUpdateCutoverPointer,
+			&mayInsertCutoverEvent, &mayUseCutoverSequence,
 			&rowSecurityActive, &ownsRLSTable,
 		)
 		if err != nil {
@@ -141,13 +165,18 @@ func (s *Store) ValidateTaskDefinitionEditRuntimeRoles(ctx context.Context) erro
 			superuser || bypassRLS || canLogin || inherits || createDB ||
 			createRole || replication || mayDeleteTasks ||
 			mayUpdateMarker != expected.mayUpdateMarker ||
-			mayUpdateReceipt != expected.mayUpdateReceiptBody {
+			mayUpdateReceipt != expected.mayUpdateReceiptBody ||
+			mayExecuteCutoverRebase != expected.mayExecuteCutoverRebase ||
+			mayUpdateCutoverPointer || mayInsertCutoverEvent ||
+			mayUseCutoverSequence {
 			return fmt.Errorf(
 				"task definition edit runtime role %s has unsafe capabilities "+
-					"(current=%s tenant=%s superuser=%t bypass_rls=%t login=%t inherit=%t createdb=%t createrole=%t replication=%t delete_schedule=%t marker_update=%t receipt_payload_update=%t rls_table=%s row_security_active=%t owns_rls_table=%t cross_tenant_rows=%d owner_probe_rows=%d)",
+					"(current=%s tenant=%s superuser=%t bypass_rls=%t login=%t inherit=%t createdb=%t createrole=%t replication=%t delete_schedule=%t marker_update=%t receipt_payload_update=%t cutover_rebase_execute=%t cutover_pointer_update=%t cutover_event_insert=%t cutover_sequence_usage=%t rls_table=%s row_security_active=%t owns_rls_table=%t cross_tenant_rows=%d owner_probe_rows=%d)",
 				expected.role, currentRole, tenantContext, superuser, bypassRLS,
 				canLogin, inherits, createDB, createRole, replication,
 				mayDeleteTasks, mayUpdateMarker, mayUpdateReceipt,
+				mayExecuteCutoverRebase, mayUpdateCutoverPointer,
+				mayInsertCutoverEvent, mayUseCutoverSequence,
 				expected.rlsTable, rowSecurityActive, ownsRLSTable,
 				crossTenantRows, tenantCount,
 			)

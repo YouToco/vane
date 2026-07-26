@@ -18,6 +18,7 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/taskstate"
@@ -59,6 +60,7 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 		originalStatus    types.ScheduleStatus
 		staleTakeover     bool
 		retainedV1Create  bool
+		activeCutover     bool
 		wantRecovery      bool
 		wantDurablePhase  types.TaskDefinitionEditPhase
 		wantTemporalPhase scheduler.TaskDefinitionEditPhase
@@ -116,13 +118,13 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 		},
 		{
 			name: "definition commit response lost", killPoint: definitionEditCoordinatorKillDefinitionCommit,
-			originalStatus: types.ScheduleStatusActive, wantRecovery: true,
+			originalStatus: types.ScheduleStatusActive, activeCutover: true, wantRecovery: true,
 			wantDurablePhase:  types.TaskDefinitionEditPhaseDefinitionCommitted,
 			wantTemporalPhase: scheduler.TaskDefinitionEditPhaseBasePaused,
 		},
 		{
 			name: "apply authorization response lost", killPoint: definitionEditCoordinatorKillAuthorizeApply,
-			originalStatus: types.ScheduleStatusActive, wantRecovery: true,
+			originalStatus: types.ScheduleStatusActive, activeCutover: true, wantRecovery: true,
 			wantDurablePhase:  types.TaskDefinitionEditPhaseDefinitionCommitted,
 			wantTemporalPhase: scheduler.TaskDefinitionEditPhaseBasePaused,
 		},
@@ -146,7 +148,7 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 		},
 		{
 			name: "restore authorization response lost", killPoint: definitionEditCoordinatorKillAuthorizeRestore,
-			originalStatus: types.ScheduleStatusActive, wantRecovery: true,
+			originalStatus: types.ScheduleStatusActive, activeCutover: true, wantRecovery: true,
 			wantDurablePhase:  types.TaskDefinitionEditPhaseTemporalTargetApplied,
 			wantTemporalPhase: scheduler.TaskDefinitionEditPhaseTargetPaused,
 		},
@@ -168,7 +170,10 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 			wantDurablePhase:  types.TaskDefinitionEditPhaseTemporalTargetRestored,
 			wantTemporalPhase: scheduler.TaskDefinitionEditPhaseTargetFinal,
 		},
-		{name: "complete response lost", killPoint: definitionEditCoordinatorKillComplete, originalStatus: types.ScheduleStatusActive},
+		{
+			name: "complete response lost", killPoint: definitionEditCoordinatorKillComplete,
+			originalStatus: types.ScheduleStatusActive, activeCutover: true,
+		},
 		{
 			name: "stale takeover response lost", killPoint: definitionEditCoordinatorKillTakeover,
 			originalStatus: types.ScheduleStatusActive, staleTakeover: true,
@@ -179,6 +184,7 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 			fixture := newDefinitionEditCoordinatorIntegrationFixture(
 				t, dbURL, server.Client(), namespace, taskQueue, testCase.killPoint,
 				testCase.originalStatus, testCase.retainedV1Create,
+				testCase.activeCutover,
 			)
 			if testCase.retainedV1Create &&
 				(fixture.prepared.Creation.FingerprintVersion != "v1" ||
@@ -225,6 +231,29 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 			}
 
 			assertDefinitionEditCoordinatorIntegrationConverged(t, fixture)
+			if testCase.activeCutover {
+				assertDefinitionEditCoordinatorIntegrationCutover(
+					t, fixture, fixture.targetHead, 3,
+				)
+				beforeReplay := fixture.temporalCalls.snapshot()
+				replay, replayErr := fixture.coordinator.Confirm(
+					t.Context(), fixture.operation.Scope(), fixture.receipt,
+				)
+				if replayErr != nil || !replay.Replayed ||
+					replay.Status != types.TaskDefinitionEditOperationStatusCompleted {
+					t.Fatalf("terminal exact replay=%+v err=%v", replay, replayErr)
+				}
+				afterReplay := fixture.temporalCalls.snapshot()
+				if afterReplay != beforeReplay {
+					t.Fatalf(
+						"terminal exact replay made Temporal schedule RPCs: before=%+v after=%+v",
+						beforeReplay, afterReplay,
+					)
+				}
+				assertDefinitionEditCoordinatorIntegrationCutover(
+					t, fixture, fixture.targetHead, 3,
+				)
+			}
 		})
 	}
 }
@@ -274,17 +303,173 @@ func runDefinitionEditCoordinatorIntegrationTakeoverLoss(
 }
 
 type definitionEditCoordinatorIntegrationFixture struct {
-	dbURL       string
-	store       *store.Store
-	coordinator *TaskDefinitionEditCoordinator
-	killStore   *definitionEditCoordinatorIntegrationKillStore
-	schedules   *scheduler.Scheduler
-	operation   *types.TaskDefinitionEditOperation
-	receipt     TaskDefinitionEditReceiptTarget
-	target      taskstate.ApprovedDefinitionV1
-	targetHead  scheduler.TaskDefinitionEditHead
-	prepared    scheduler.PreparedTaskDefinitionEdit
-	wantStatus  types.ScheduleStatus
+	dbURL              string
+	store              *store.Store
+	coordinator        *TaskDefinitionEditCoordinator
+	killStore          *definitionEditCoordinatorIntegrationKillStore
+	schedules          *scheduler.Scheduler
+	operation          *types.TaskDefinitionEditOperation
+	receipt            TaskDefinitionEditReceiptTarget
+	target             taskstate.ApprovedDefinitionV1
+	targetHead         scheduler.TaskDefinitionEditHead
+	prepared           scheduler.PreparedTaskDefinitionEdit
+	wantStatus         types.ScheduleStatus
+	temporalCalls      *definitionEditTemporalRPCCounter
+	baseCutoverEventID *int64
+}
+
+type definitionEditTemporalRPCSnapshot struct {
+	Create   int
+	Delete   int
+	Backfill int
+	Update   int
+	Describe int
+	Trigger  int
+	Pause    int
+	Unpause  int
+}
+
+type definitionEditTemporalRPCCounter struct {
+	mu            sync.Mutex
+	snapshotValue definitionEditTemporalRPCSnapshot
+}
+
+func (c *definitionEditTemporalRPCCounter) add(
+	update func(*definitionEditTemporalRPCSnapshot),
+) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	update(&c.snapshotValue)
+}
+
+func (c *definitionEditTemporalRPCCounter) snapshot() definitionEditTemporalRPCSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.snapshotValue
+}
+
+type definitionEditCountingTemporalClient struct {
+	client.Client
+	counter *definitionEditTemporalRPCCounter
+}
+
+func newDefinitionEditCountingTemporalClient(
+	base client.Client,
+) *definitionEditCountingTemporalClient {
+	return &definitionEditCountingTemporalClient{
+		Client:  base,
+		counter: &definitionEditTemporalRPCCounter{},
+	}
+}
+
+func (c *definitionEditCountingTemporalClient) ScheduleClient() client.ScheduleClient {
+	return &definitionEditCountingScheduleClient{
+		ScheduleClient: c.Client.ScheduleClient(),
+		counter:        c.counter,
+	}
+}
+
+type definitionEditCountingScheduleClient struct {
+	client.ScheduleClient
+	counter *definitionEditTemporalRPCCounter
+}
+
+func (c *definitionEditCountingScheduleClient) Create(
+	ctx context.Context,
+	options client.ScheduleOptions,
+) (client.ScheduleHandle, error) {
+	c.counter.add(func(value *definitionEditTemporalRPCSnapshot) {
+		value.Create++
+	})
+	handle, err := c.ScheduleClient.Create(ctx, options)
+	if err != nil {
+		return handle, err
+	}
+	return &definitionEditCountingScheduleHandle{
+		ScheduleHandle: handle,
+		counter:        c.counter,
+	}, nil
+}
+
+func (c *definitionEditCountingScheduleClient) GetHandle(
+	ctx context.Context,
+	scheduleID string,
+) client.ScheduleHandle {
+	return &definitionEditCountingScheduleHandle{
+		ScheduleHandle: c.ScheduleClient.GetHandle(ctx, scheduleID),
+		counter:        c.counter,
+	}
+}
+
+type definitionEditCountingScheduleHandle struct {
+	client.ScheduleHandle
+	counter *definitionEditTemporalRPCCounter
+}
+
+func (h *definitionEditCountingScheduleHandle) Delete(ctx context.Context) error {
+	h.counter.add(func(value *definitionEditTemporalRPCSnapshot) {
+		value.Delete++
+	})
+	return h.ScheduleHandle.Delete(ctx)
+}
+
+func (h *definitionEditCountingScheduleHandle) Backfill(
+	ctx context.Context,
+	options client.ScheduleBackfillOptions,
+) error {
+	h.counter.add(func(value *definitionEditTemporalRPCSnapshot) {
+		value.Backfill++
+	})
+	return h.ScheduleHandle.Backfill(ctx, options)
+}
+
+func (h *definitionEditCountingScheduleHandle) Update(
+	ctx context.Context,
+	options client.ScheduleUpdateOptions,
+) error {
+	h.counter.add(func(value *definitionEditTemporalRPCSnapshot) {
+		value.Update++
+	})
+	return h.ScheduleHandle.Update(ctx, options)
+}
+
+func (h *definitionEditCountingScheduleHandle) Describe(
+	ctx context.Context,
+) (*client.ScheduleDescription, error) {
+	h.counter.add(func(value *definitionEditTemporalRPCSnapshot) {
+		value.Describe++
+	})
+	return h.ScheduleHandle.Describe(ctx)
+}
+
+func (h *definitionEditCountingScheduleHandle) Trigger(
+	ctx context.Context,
+	options client.ScheduleTriggerOptions,
+) error {
+	h.counter.add(func(value *definitionEditTemporalRPCSnapshot) {
+		value.Trigger++
+	})
+	return h.ScheduleHandle.Trigger(ctx, options)
+}
+
+func (h *definitionEditCountingScheduleHandle) Pause(
+	ctx context.Context,
+	options client.SchedulePauseOptions,
+) error {
+	h.counter.add(func(value *definitionEditTemporalRPCSnapshot) {
+		value.Pause++
+	})
+	return h.ScheduleHandle.Pause(ctx, options)
+}
+
+func (h *definitionEditCountingScheduleHandle) Unpause(
+	ctx context.Context,
+	options client.ScheduleUnpauseOptions,
+) error {
+	h.counter.add(func(value *definitionEditTemporalRPCSnapshot) {
+		value.Unpause++
+	})
+	return h.ScheduleHandle.Unpause(ctx, options)
 }
 
 func newDefinitionEditCoordinatorIntegrationFixture(
@@ -296,6 +481,7 @@ func newDefinitionEditCoordinatorIntegrationFixture(
 	killPoint definitionEditCoordinatorIntegrationKillPoint,
 	originalStatus types.ScheduleStatus,
 	retainedV1Create bool,
+	activeCutover bool,
 ) definitionEditCoordinatorIntegrationFixture {
 	t.Helper()
 	st, tenantID, userID := newCreationCoordinatorPostgreSQLFixture(t)
@@ -308,7 +494,8 @@ func newDefinitionEditCoordinatorIntegrationFixture(
 	if !retainedV1Create {
 		options = append(options, scheduler.WithCompiledRuntimeRollout(true, "", true))
 	}
-	schedules := scheduler.New(temporalClient, taskQueue, nil, options...)
+	countingTemporal := newDefinitionEditCountingTemporalClient(temporalClient)
+	schedules := scheduler.New(countingTemporal, taskQueue, nil, options...)
 	creation := NewCreationCoordinator(st, schedules, nil)
 	creationSession, err := st.CreateAgentSession(ctx, userID)
 	if err != nil {
@@ -367,6 +554,13 @@ func newDefinitionEditCoordinatorIntegrationFixture(
 	if err != nil {
 		t.Fatalf("load base Approved definition: %v", err)
 	}
+	var baseCutoverEventID *int64
+	if activeCutover {
+		eventID := activateDefinitionEditCoordinatorIntegrationCutover(
+			t, st, tenantID, userID, taskID,
+		)
+		baseCutoverEventID = &eventID
+	}
 	target := base.Definition
 	target.NLDescription = "C2b3 coordinator target " + uuid.NewString()
 	target.SpecJSON = json.RawMessage(`{"every_seconds":7200,"tz":"UTC"}`)
@@ -421,6 +615,8 @@ func newDefinitionEditCoordinatorIntegrationFixture(
 		schedules: schedules,
 		operation: op, receipt: receipt, target: target,
 		targetHead: targetHead, prepared: prepared, wantStatus: originalStatus,
+		temporalCalls:      countingTemporal.counter,
+		baseCutoverEventID: baseCutoverEventID,
 	}
 }
 
@@ -450,6 +646,24 @@ func assertDefinitionEditCoordinatorIntegrationInterrupted(
 	}
 	if remote.Phase != wantTemporal {
 		t.Fatalf("interrupted Temporal phase=%s, want=%s", remote.Phase, wantTemporal)
+	}
+	if fixture.baseCutoverEventID != nil {
+		switch wantDurable {
+		case types.TaskDefinitionEditPhaseDefinitionCommitted,
+			types.TaskDefinitionEditPhaseTemporalTargetApplied,
+			types.TaskDefinitionEditPhaseTemporalTargetRestored:
+			assertDefinitionEditCoordinatorIntegrationCutover(
+				t, fixture, fixture.targetHead, 3,
+			)
+		default:
+			baseHead := scheduler.TaskDefinitionEditHead{
+				Version: fixture.operation.BaseDefinitionVersion,
+				Digest:  fixture.operation.BaseDefinitionDigest,
+			}
+			assertDefinitionEditCoordinatorIntegrationCutover(
+				t, fixture, baseHead, 1,
+			)
+		}
 	}
 }
 
@@ -641,6 +855,176 @@ func setDefinitionEditCoordinatorScheduleStatus(
 	)
 	if err != nil || tag.RowsAffected() != 1 {
 		t.Fatalf("set schedule status rows=%d err=%v", tag.RowsAffected(), err)
+	}
+}
+
+func activateDefinitionEditCoordinatorIntegrationCutover(
+	t *testing.T,
+	st *store.Store,
+	tenantID int64,
+	userID int64,
+	taskID string,
+) int64 {
+	t.Helper()
+	policy, err := runtimepolicy.BuildV1(runtimepolicy.BuildInputV1{
+		AllowedCapabilities: []runtimepolicy.CapabilityV1{{
+			Platform: "web", Capability: "search", Kind: "article",
+			ImplementationVersion: "fetcher.exa/v1",
+			CredentialRef: runtimepolicy.CredentialRefV1{
+				ID: runtimepolicy.CredentialIDExaPrimaryV1, Generation: 1,
+			},
+		}},
+		ScorePrompt: runtimepolicy.PromptStageV1{
+			SystemPrompt: "score prompt", RendererVersion: "scorer.render/v1",
+		},
+		CardGenPrompt: runtimepolicy.PromptStageV1{
+			SystemPrompt: "card prompt", RendererVersion: "cardgen.render/v1",
+		},
+		ProfileEvolvePrompt: runtimepolicy.PromptStageV1{
+			SystemPrompt: "evolve prompt", RendererVersion: "evolver.render/v1",
+		},
+		TaskInstructionEnabled: true,
+		ModelProvider:          "deepseek",
+		ModelEndpoint: runtimepolicy.EndpointRefV1{
+			ID: runtimepolicy.EndpointIDDeepSeekCompatiblePrimaryV1, Generation: 1,
+		},
+		ModelCredentialRef: runtimepolicy.CredentialRefV1{
+			ID: runtimepolicy.CredentialIDLLMPrimaryV1, Generation: 1,
+		},
+		ModelCalls: []runtimepolicy.ModelCallV1{
+			{
+				Stage: runtimepolicy.ModelStageScore, Model: "model-1",
+				MaxTokens: 16, DisableThinking: true,
+			},
+			{
+				Stage: runtimepolicy.ModelStageCardGen, Model: "model-1",
+				Temperature: 0.7, MaxTokens: 400, DisableThinking: true,
+			},
+			{
+				Stage: runtimepolicy.ModelStageProfileEvolve, Model: "model-1",
+				MaxTokens: 800, DisableThinking: true,
+			},
+		},
+		QuotaBuckets: []runtimepolicy.QuotaBucketV1{{
+			Name:      "llm_tokens",
+			Financial: true, EnforcementVersion: "precharge-reconcile/v1",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("build active-cutover runtime policy: %v", err)
+	}
+	identity := types.RunIdentity{
+		TemporalWorkflowID: "wf-" + taskID,
+		TemporalRunID:      "definition-edit-cutover-" + uuid.NewString(),
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           tenantID,
+		UserID:             userID,
+		TaskID:             taskID,
+	}
+	ref, err := st.CreateOrGetCompiledRunSnapshotShadowV2(
+		t.Context(), identity, policy,
+	)
+	if err != nil {
+		t.Fatalf("create active-cutover retained-v2 snapshot: %v", err)
+	}
+	audit, err := st.AuditCompiledTaskRunSnapshotV2(
+		t.Context(), identity, ref,
+	)
+	if err != nil || audit.Status != store.CompiledRunSnapshotV2AuditMatch ||
+		audit.ShadowStatus != store.TaskRunSnapshotShadowMatch ||
+		!audit.TypedEqual {
+		t.Fatalf("active-cutover retained-v2 audit=%+v err=%v", audit, err)
+	}
+	activation, err := st.ControlTaskRunSnapshotCutover(
+		t.Context(), tenantID, userID, taskID,
+		store.TaskRunSnapshotCutoverActivate,
+	)
+	if err != nil {
+		t.Fatalf("activate retained-v2 authority: %v", err)
+	}
+	return activation.EventID
+}
+
+func assertDefinitionEditCoordinatorIntegrationCutover(
+	t *testing.T,
+	fixture definitionEditCoordinatorIntegrationFixture,
+	wantHead scheduler.TaskDefinitionEditHead,
+	wantEventCount int,
+) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, fixture.dbURL)
+	if err != nil {
+		t.Fatalf("connect for definition-edit cutover audit: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Errorf("close definition-edit cutover audit connection: %v", err)
+		}
+	}()
+	var (
+		pointerID         int64
+		action            string
+		definitionVersion int64
+		definitionDigest  string
+		eventCount        int
+		editEventCount    int
+	)
+	err = conn.QueryRow(ctx, `
+		SELECT s.run_snapshot_cutover_event_id, e.action,
+		       e.approved_definition_version, e.approved_definition_digest,
+		       (SELECT count(*)
+		          FROM task_run_snapshot_v2_cutover_events scoped
+		         WHERE scoped.tenant_id=s.tenant_id
+		           AND scoped.user_id=s.user_id
+		           AND scoped.task_id=s.id),
+		       (SELECT count(*)
+		          FROM task_run_snapshot_v2_cutover_events owned
+		         WHERE owned.tenant_id=s.tenant_id
+		           AND owned.user_id=s.user_id
+		           AND owned.task_id=s.id
+		           AND owned.definition_edit_operation_id=$4)
+		  FROM schedules s
+		  JOIN task_run_snapshot_v2_cutover_events e
+		    ON e.id=s.run_snapshot_cutover_event_id
+		   AND e.tenant_id=s.tenant_id
+		   AND e.user_id=s.user_id
+		   AND e.task_id=s.id
+		 WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.id=$3`,
+		fixture.operation.TargetTenantID,
+		fixture.operation.TargetUserID,
+		fixture.operation.TaskID,
+		fixture.operation.ID,
+	).Scan(
+		&pointerID, &action, &definitionVersion, &definitionDigest,
+		&eventCount, &editEventCount,
+	)
+	if err != nil {
+		t.Fatalf("load definition-edit cutover state: %v", err)
+	}
+	wantEditEvents := 0
+	if wantEventCount == 3 {
+		wantEditEvents = 2
+	}
+	if action != string(store.TaskRunSnapshotCutoverActivate) ||
+		definitionVersion != wantHead.Version ||
+		definitionDigest != wantHead.Digest ||
+		eventCount != wantEventCount ||
+		editEventCount != wantEditEvents {
+		t.Fatalf(
+			"cutover pointer=%d action=%q head=%d/%s events=%d edit_events=%d, want active %d/%s events=%d edit_events=%d",
+			pointerID, action, definitionVersion, definitionDigest,
+			eventCount, editEventCount, wantHead.Version, wantHead.Digest,
+			wantEventCount, wantEditEvents,
+		)
+	}
+	if wantEventCount == 1 && fixture.baseCutoverEventID != nil &&
+		pointerID != *fixture.baseCutoverEventID {
+		t.Fatalf(
+			"pre-commit active cutover pointer=%d, want base event=%d",
+			pointerID, *fixture.baseCutoverEventID,
+		)
 	}
 }
 
