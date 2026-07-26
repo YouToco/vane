@@ -48,9 +48,9 @@ type actionDispatcherStore interface {
 // owns one stable process identity, bounded admission, and an explicit
 // Stop/Wait lifecycle so Store cannot close while an admitted effect is live.
 type ActionDispatcher struct {
-	store  actionDispatcherStore
-	logger *slog.Logger
-	owner  string
+	actionStore actionDispatcherStore
+	logger      *slog.Logger
+	owner       string
 
 	dispatchMu sync.Mutex
 	cursor     int64
@@ -73,16 +73,16 @@ func NewActionDispatcher(
 		logger = slog.Default()
 	}
 	return &ActionDispatcher{
-		store:  st,
-		logger: logger,
-		owner:  "agent-action-dispatcher-" + uuid.NewString(),
+		actionStore: st,
+		logger:      logger,
+		owner:       "agent-action-dispatcher-" + uuid.NewString(),
 	}, nil
 }
 
 // Start begins with an immediate bounded pass, then polls every two seconds.
 // It may be called exactly once; Stop is the only admission-closing operation.
 func (d *ActionDispatcher) Start(parent context.Context) error {
-	if d == nil || d.store == nil {
+	if d == nil || d.actionStore == nil {
 		return errors.New(
 			"agentcontinuation: action dispatcher Store is required")
 	}
@@ -173,7 +173,7 @@ func (d *ActionDispatcher) dispatchAndLog(ctx context.Context) {
 // adapter, and status; this layer never calls Tool.Execute or discovers a
 // provider, Temporal run, or current Agent session.
 func (d *ActionDispatcher) DispatchOnce(ctx context.Context) error {
-	if d == nil || d.store == nil {
+	if d == nil || d.actionStore == nil {
 		return errors.New(
 			"agentcontinuation: action dispatcher Store is required")
 	}
@@ -184,13 +184,13 @@ func (d *ActionDispatcher) DispatchOnce(ctx context.Context) error {
 	defer d.dispatchMu.Unlock()
 
 	boundary := time.Now().Add(24 * time.Hour)
-	tenantIDs, err := d.store.ListDueAgentActionContinuationTenantIDs(
+	tenantIDs, err := d.actionStore.ListDueAgentActionContinuationTenantIDs(
 		ctx, boundary, d.cursor, actionTenantPageSize)
 	if err != nil {
 		return fmt.Errorf("list action continuation tenant shards: %w", err)
 	}
 	if len(tenantIDs) == 0 && d.cursor > 0 {
-		tenantIDs, err = d.store.ListDueAgentActionContinuationTenantIDs(
+		tenantIDs, err = d.actionStore.ListDueAgentActionContinuationTenantIDs(
 			ctx, boundary, 0, actionTenantPageSize)
 		if err != nil {
 			return fmt.Errorf(
@@ -211,7 +211,7 @@ func (d *ActionDispatcher) DispatchOnce(ctx context.Context) error {
 		errorsMu.Unlock()
 	}
 	for _, tenantID := range tenantIDs {
-		actions, listErr := d.store.ListDueAgentActionContinuations(
+		actions, listErr := d.actionStore.ListDueAgentActionContinuations(
 			ctx, tenantID, boundary, actionPageSize)
 		if listErr != nil {
 			appendError(fmt.Errorf(
@@ -250,7 +250,7 @@ func (d *ActionDispatcher) dispatchAction(
 	ctx context.Context,
 	listed store.AgentActionContinuation,
 ) error {
-	action, err := d.store.AcquireAgentActionContinuation(
+	action, err := d.actionStore.AcquireAgentActionContinuation(
 		ctx, listed.ActionID, listed.TenantID, listed.UserID,
 		d.owner, actionLeaseDuration)
 	if err != nil {
@@ -264,7 +264,7 @@ func (d *ActionDispatcher) dispatchAction(
 	if err != nil {
 		return err
 	}
-	if err := d.store.ProjectAgentActionContinuation(ctx, lease); err != nil {
+	if err := d.actionStore.ProjectAgentActionContinuation(ctx, lease); err != nil {
 		if errors.Is(err, store.ErrAgentActionBusy) ||
 			errors.Is(err, store.ErrAgentActionTerminal) {
 			return err
@@ -272,7 +272,7 @@ func (d *ActionDispatcher) dispatchAction(
 		releaseCtx, cancel := context.WithTimeout(
 			context.WithoutCancel(ctx), actionReleaseTimeout)
 		defer cancel()
-		releaseErr := d.store.ReleaseAgentActionContinuation(
+		releaseErr := d.actionStore.ReleaseAgentActionContinuation(
 			releaseCtx, lease, actionRetryBackoff(int64(action.AttemptCount)))
 		if releaseErr != nil {
 			return errors.Join(

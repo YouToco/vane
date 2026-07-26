@@ -41,7 +41,7 @@ type ActionOutcome struct {
 // actions. It deliberately exposes neither raw Store mutation entrypoints nor
 // the generic Tool execution registry.
 type ActionController struct {
-	store actionStore
+	actionStore actionStore
 }
 
 func NewActionController(st actionStore) (*ActionController, error) {
@@ -49,7 +49,7 @@ func NewActionController(st actionStore) (*ActionController, error) {
 		return nil, errors.New(
 			"agentcontinuation: action controller Store is required")
 	}
-	return &ActionController{store: st}, nil
+	return &ActionController{actionStore: st}, nil
 }
 
 func (c *ActionController) Confirm(
@@ -57,11 +57,11 @@ func (c *ActionController) Confirm(
 	userID int64,
 	actionID string,
 ) (ActionOutcome, error) {
-	if c == nil || c.store == nil {
+	if c == nil || c.actionStore == nil {
 		return ActionOutcome{}, errors.New(
 			"agentcontinuation: action controller Store is required")
 	}
-	result, err := c.store.ConfirmAgentActionContinuation(
+	result, err := c.actionStore.ConfirmAgentActionContinuation(
 		ctx, userID, actionID)
 	if err != nil {
 		return ActionOutcome{}, mapActionDecisionError("confirm", err)
@@ -74,11 +74,11 @@ func (c *ActionController) Cancel(
 	userID int64,
 	actionID string,
 ) (ActionOutcome, error) {
-	if c == nil || c.store == nil {
+	if c == nil || c.actionStore == nil {
 		return ActionOutcome{}, errors.New(
 			"agentcontinuation: action controller Store is required")
 	}
-	result, err := c.store.CancelAgentActionContinuation(
+	result, err := c.actionStore.CancelAgentActionContinuation(
 		ctx, userID, actionID)
 	if err != nil {
 		return ActionOutcome{}, mapActionDecisionError("cancel", err)
