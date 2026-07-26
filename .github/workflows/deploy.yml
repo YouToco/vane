@@ -61,41 +61,59 @@ jobs:
           [[ "$fingerprint" == \
             "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU" ]]
 
+          # test-anchor: remote-main-sha-begin
           remote_main_sha() {
             local repository=$1
             local key_value=$2
             local key_file=$secret_dir/id
-            local output sha ref
-            printf '%s\n' "$key_value" >"$key_file"
-            chmod 600 "$key_file"
-            ssh_command=$(
-              printf "ssh -i '%s' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='%s'" \
-                "$key_file" "$secret_dir/known_hosts"
-            )
+            local output sha ref ssh_command
+            if ! printf '%s\n' "$key_value" >"$key_file"; then
+              echo "failed to materialize source deploy key" >&2
+              return 1
+            fi
+            if ! chmod 600 "$key_file"; then
+              rm -f -- "$key_file"
+              echo "failed to secure source deploy key" >&2
+              return 1
+            fi
+            if ! ssh-keygen -y -P '' -f "$key_file" >/dev/null 2>&1; then
+              rm -f -- "$key_file"
+              echo "source deploy key has invalid format" >&2
+              return 1
+            fi
+            printf -v ssh_command \
+              "ssh -i '%s' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='%s'" \
+              "$key_file" "$secret_dir/known_hosts"
             if ! output=$(
               GIT_SSH_COMMAND="$ssh_command" \
                 git ls-remote "git@github.com:$repository.git" refs/heads/main
             ); then
-              echo "failed to resolve $repository main" >&2
+              rm -f -- "$key_file"
+              echo "failed to resolve source main SHA" >&2
               return 1
             fi
             rm -f -- "$key_file"
             read -r sha ref <<<"$output"
-            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ||
-              "$ref" != refs/heads/main ||
-              "$output" != "$sha"$'\t'"$ref" ]]; then
-              echo "invalid $repository main response" >&2
+            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]] ||
+              [[ "$ref" != refs/heads/main ]] ||
+              [[ "$output" != "$sha"$'\t'"$ref" ]]; then
+              echo "source main resolution returned invalid output" >&2
               return 1
             fi
             printf '%s' "$sha"
           }
+          # test-anchor: remote-main-sha-end
 
-          if ! backend_sha=$(remote_main_sha YouToco/vane "$VANE_READ_KEY"); then
+          if ! backend_sha=$(
+            remote_main_sha YouToco/vane "$VANE_READ_KEY"
+          ); then
+            echo "backend main SHA resolution failed" >&2
             exit 1
           fi
           if ! frontend_sha=$(
             remote_main_sha YouToco/vane-web "$VANE_WEB_READ_KEY"
           ); then
+            echo "frontend main SHA resolution failed" >&2
             exit 1
           fi
 
