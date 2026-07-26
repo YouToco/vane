@@ -613,6 +613,23 @@ func TestEvolveIntegration(t *testing.T) {
 		}
 		return id
 	}
+	addReasonFeedback := func(
+		t *testing.T,
+		userID, deliveryID int64,
+		reason types.FeedbackReason,
+		detail string,
+	) int64 {
+		t.Helper()
+		id, err := st.InsertFeedback(ctx, &types.Feedback{
+			UserID: userID, DeliveryID: deliveryID,
+			Action: types.FeedbackActionMisjudged, ReasonCode: reason,
+			Detail: detail,
+		})
+		if err != nil {
+			t.Fatalf("InsertFeedback(misjudged,%s) 失败: %v", reason, err)
+		}
+		return id
+	}
 	getProfile := func(t *testing.T, userID int64) *types.Profile {
 		t.Helper()
 		p, err := st.GetProfile(ctx, userID)
@@ -714,6 +731,70 @@ func TestEvolveIntegration(t *testing.T) {
 		}
 		if !got.UpdatedAt.After(before.UpdatedAt) {
 			t.Errorf("演化成功应刷新 updated_at：前 %v，后 %v", before.UpdatedAt, got.UpdatedAt)
+		}
+	})
+
+	t.Run("旧卡问题原因取代空白负兴趣且仍推进批尾游标", func(t *testing.T) {
+		uid, bid := newUser(t)
+		newProfile(t, uid, []string{"Go"})
+
+		oldDelivery := newDelivery(t, uid, bid, "三个月前的旧闻")
+		addFeedback(
+			t, uid, oldDelivery, types.FeedbackActionNotInterested, "",
+		)
+		addReasonFeedback(
+			t, uid, oldDelivery, types.FeedbackReasonOutdated,
+			"这都三个月前的内容了",
+		)
+		interestedDelivery := newDelivery(t, uid, bid, "窗口内的新事件")
+		lastFeedbackID := addFeedback(
+			t, uid, interestedDelivery, types.FeedbackActionInterested, "",
+		)
+
+		up.set(http.StatusOK, `{"summary":"只从真实兴趣更新。","tags":["Go"]}`)
+		if err := ev.Evolve(
+			ctx, uid, "trace-superseded-negative-mixed",
+		); err != nil {
+			t.Fatalf("Evolve() 失败: %v", err)
+		}
+		prompt := up.last(t).Messages[1].Content
+		if strings.Contains(prompt, "三个月前的旧闻") ||
+			strings.Contains(prompt, "反馈：不感兴趣") {
+			t.Fatalf("旧卡自动落的负兴趣不得进入画像 prompt:\n%s", prompt)
+		}
+		if !strings.Contains(prompt, "窗口内的新事件") ||
+			!strings.Contains(prompt, "反馈：感兴趣") {
+			t.Fatalf("真实兴趣必须保留在画像 prompt:\n%s", prompt)
+		}
+		if got := getProfile(t, uid).LastEvolvedFeedbackID; got != lastFeedbackID {
+			t.Errorf("游标应推进到批尾 %d，实际 %d", lastFeedbackID, got)
+		}
+	})
+
+	t.Run("仅旧卡诊断反馈零LLM并推进typed游标", func(t *testing.T) {
+		uid, bid := newUser(t)
+		newProfile(t, uid, []string{"Go"})
+
+		deliveryID := newDelivery(t, uid, bid, "仅诊断的过时旧闻")
+		addFeedback(
+			t, uid, deliveryID, types.FeedbackActionNotInterested, "",
+		)
+		typedID := addReasonFeedback(
+			t, uid, deliveryID, types.FeedbackReasonOutdated,
+			"窗口外旧闻",
+		)
+
+		beforeCalls := up.calls()
+		if err := ev.Evolve(
+			ctx, uid, "trace-superseded-negative-only",
+		); err != nil {
+			t.Fatalf("Evolve() 失败: %v", err)
+		}
+		if got := up.calls(); got != beforeCalls {
+			t.Errorf("仅诊断反馈不应调用 LLM：before=%d after=%d", beforeCalls, got)
+		}
+		if got := getProfile(t, uid).LastEvolvedFeedbackID; got != typedID {
+			t.Errorf("游标应推进到 typed 行 %d，实际 %d", typedID, got)
 		}
 	})
 

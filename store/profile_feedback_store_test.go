@@ -627,6 +627,242 @@ func TestFeedbackStore(t *testing.T) {
 		}
 	})
 
+	t.Run("ListFeedbacksForEvolution旧卡双记录按问题原因取代负兴趣", func(t *testing.T) {
+		reasons := []types.FeedbackReason{
+			types.FeedbackReasonOutdated,
+			types.FeedbackReasonNotRelevant,
+			types.FeedbackReasonDuplicate,
+			types.FeedbackReasonFactWrong,
+			types.FeedbackReasonPoorSource,
+			types.FeedbackReasonOther,
+		}
+		for _, reason := range reasons {
+			t.Run(string(reason), func(t *testing.T) {
+				ci := newContent(t, "旧卡配对-"+string(reason), "正文")
+				deliveryID := newDelivery(t, u.ID, batchID, &ci, "")
+				legacyID := addFeedback(
+					t, u.ID, deliveryID,
+					types.FeedbackActionNotInterested, "",
+				)
+				typedID := addReasonFeedback(
+					t, u.ID, deliveryID, reason, "问题原因",
+				)
+
+				// limit=1 直接证明取代判断会越过分页边界查找后写入的
+				// typed 行；若先分页再在 Go 中过滤，这里会错误返回旧 👎。
+				rows, err := st.ListFeedbacksForEvolution(
+					ctx, u.ID, legacyID-1, 1,
+				)
+				if err != nil {
+					t.Fatalf("ListFeedbacksForEvolution() 失败: %v", err)
+				}
+				if len(rows) != 1 || rows[0].ID != typedID ||
+					rows[0].ReasonCode != reason {
+					t.Fatalf(
+						"原因 %q 应取代旧 not_interested，实际 %+v",
+						reason, rows,
+					)
+				}
+			})
+		}
+
+		ciDetailed := newContent(t, "带说明的明确负兴趣", "正文")
+		dDetailed := newDelivery(t, u.ID, batchID, &ciDetailed, "")
+		detailedNegativeID := addFeedback(
+			t, u.ID, dDetailed,
+			types.FeedbackActionNotInterested, "明确不喜欢这个主题",
+		)
+		detailedTypedID := addReasonFeedback(
+			t, u.ID, dDetailed, types.FeedbackReasonOutdated, "同时也过时",
+		)
+		rows, err := st.ListFeedbacksForEvolution(
+			ctx, u.ID, detailedNegativeID-1, 10,
+		)
+		if err != nil {
+			t.Fatalf("ListFeedbacksForEvolution() 带 detail 失败: %v", err)
+		}
+		if len(rows) != 2 || rows[0].ID != detailedNegativeID ||
+			rows[1].ID != detailedTypedID {
+			t.Fatalf("带 detail 的明确 not_interested 不得被取代，实际 %+v", rows)
+		}
+
+		ciUntyped := newContent(t, "旧卡未结构化误判", "正文")
+		dUntyped := newDelivery(t, u.ID, batchID, &ciUntyped, "")
+		untypedLegacyID := addFeedback(
+			t, u.ID, dUntyped, types.FeedbackActionNotInterested, "",
+		)
+		var untypedMisjudgedID int64
+		if err := st.pool.QueryRow(ctx,
+			`INSERT INTO feedbacks (
+			     tenant_id,user_id,delivery_id,action,detail
+			 )
+			 VALUES (
+			     (SELECT tenant_id FROM deliveries WHERE id=$2),
+			     $1,$2,'misjudged','旧卡未结构化说明'
+			 )
+			 RETURNING id`,
+			u.ID, dUntyped,
+		).Scan(&untypedMisjudgedID); err != nil {
+			t.Fatal(err)
+		}
+		rows, err = st.ListFeedbacksForEvolution(
+			ctx, u.ID, untypedLegacyID-1, 10,
+		)
+		if err != nil {
+			t.Fatalf("ListFeedbacksForEvolution() untyped 失败: %v", err)
+		}
+		if len(rows) != 2 || rows[0].ID != untypedLegacyID ||
+			rows[1].ID != untypedMisjudgedID {
+			t.Fatalf("未结构化 misjudged 不得取代旧 not_interested，实际 %+v", rows)
+		}
+
+		ciPair := newContent(t, "先问题后明确负兴趣", "正文")
+		dPair := newDelivery(t, u.ID, batchID, &ciPair, "")
+		legacyID := addFeedback(
+			t, u.ID, dPair, types.FeedbackActionNotInterested, "",
+		)
+		typedID := addReasonFeedback(
+			t, u.ID, dPair, types.FeedbackReasonOutdated, "过时",
+		)
+		laterNegativeID := addFeedback(
+			t, u.ID, dPair, types.FeedbackActionNotInterested, "",
+		)
+
+		ciOther := newContent(t, "另一投递的明确负兴趣", "正文")
+		dOther := newDelivery(t, u.ID, batchID, &ciOther, "")
+		otherNegativeID := addFeedback(
+			t, u.ID, dOther, types.FeedbackActionNotInterested, "",
+		)
+
+		rows, err = st.ListFeedbacksForEvolution(
+			ctx, u.ID, legacyID-1, 10,
+		)
+		if err != nil {
+			t.Fatalf("ListFeedbacksForEvolution() 失败: %v", err)
+		}
+		wantIDs := []int64{typedID, laterNegativeID, otherNegativeID}
+		if len(rows) != len(wantIDs) {
+			t.Fatalf("应保留 typed、后续明确负兴趣和不同投递负兴趣，实际 %+v", rows)
+		}
+		for i, wantID := range wantIDs {
+			if rows[i].ID != wantID {
+				t.Errorf("rows[%d].ID=%d，期望 %d", i, rows[i].ID, wantID)
+			}
+		}
+
+		var tenantID int64
+		if err := st.pool.QueryRow(ctx,
+			`SELECT tenant_id FROM deliveries WHERE id=$1`,
+			dPair,
+		).Scan(&tenantID); err != nil {
+			t.Fatal(err)
+		}
+		rows, err = st.ListFeedbacksForEvolutionForTenant(
+			ctx, tenantID, u.ID, legacyID-1, 10,
+		)
+		if err != nil {
+			t.Fatalf("ListFeedbacksForEvolutionForTenant() 失败: %v", err)
+		}
+		if len(rows) != len(wantIDs) {
+			t.Fatalf("精确租户读取应与同租户用户读取一致，实际 %+v", rows)
+		}
+		for i, wantID := range wantIDs {
+			if rows[i].ID != wantID {
+				t.Errorf("tenant rows[%d].ID=%d，期望 %d", i, rows[i].ID, wantID)
+			}
+		}
+	})
+
+	t.Run("ListFeedbacksForEvolution取代关系严格租户隔离", func(t *testing.T) {
+		ci := newContent(t, "跨租户伪配对", "正文")
+		deliveryID := newDelivery(t, u.ID, batchID, &ci, "")
+		var tenantA, tenantB int64
+		if err := st.pool.QueryRow(ctx,
+			`SELECT tenant_id FROM deliveries WHERE id=$1`,
+			deliveryID,
+		).Scan(&tenantA); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.pool.QueryRow(ctx,
+			`INSERT INTO tenants (status,plan)
+			 VALUES ('active','free')
+			 RETURNING id`,
+		).Scan(&tenantB); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.pool.Exec(ctx,
+			`INSERT INTO memberships (tenant_id,user_id,role)
+			 VALUES ($1,$2,'owner')`,
+			tenantB, u.ID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			cleanupCtx, cancel := cleanupContext()
+			defer cancel()
+			cleanupExec(cleanupCtx, t, st,
+				`DELETE FROM feedbacks WHERE tenant_id=$1`, tenantB)
+			cleanupExec(cleanupCtx, t, st,
+				`DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`,
+				tenantB, u.ID)
+			cleanupExec(cleanupCtx, t, st,
+				`DELETE FROM tenants WHERE id=$1`, tenantB)
+		})
+
+		var legacyID, foreignTypedID int64
+		if err := st.pool.QueryRow(ctx,
+			`INSERT INTO feedbacks (
+			     tenant_id,user_id,delivery_id,action
+			 )
+			 VALUES ($1,$2,$3,'not_interested')
+			 RETURNING id`,
+			tenantA, u.ID, deliveryID,
+		).Scan(&legacyID); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.pool.QueryRow(ctx,
+			`INSERT INTO feedbacks (
+			     tenant_id,user_id,delivery_id,action,reason_code
+			 )
+			 VALUES ($1,$2,$3,'misjudged','outdated_or_out_of_window')
+			 RETURNING id`,
+			tenantB, u.ID, deliveryID,
+		).Scan(&foreignTypedID); err != nil {
+			t.Fatal(err)
+		}
+
+		rows, err := st.ListFeedbacksForEvolutionForTenant(
+			ctx, tenantA, u.ID, legacyID-1, 10,
+		)
+		if err != nil {
+			t.Fatalf("tenant A 读取失败: %v", err)
+		}
+		if len(rows) != 1 || rows[0].ID != legacyID {
+			t.Fatalf("其他租户 typed 行不得取代 tenant A 负兴趣，实际 %+v", rows)
+		}
+
+		rows, err = st.ListFeedbacksForEvolutionForTenant(
+			ctx, tenantB, u.ID, legacyID-1, 10,
+		)
+		if err != nil {
+			t.Fatalf("tenant B 读取失败: %v", err)
+		}
+		if len(rows) != 0 {
+			t.Fatalf("feedback 与 delivery 租户不一致时必须不可见，实际 %+v", rows)
+		}
+
+		rows, err = st.ListFeedbacksForEvolution(
+			ctx, u.ID, legacyID-1, 10,
+		)
+		if err != nil {
+			t.Fatalf("用户全局读取失败: %v", err)
+		}
+		if len(rows) != 2 || rows[0].ID != legacyID ||
+			rows[1].ID != foreignTypedID {
+			t.Fatalf("跨租户 typed 行不得压掉旧负兴趣，实际 %+v", rows)
+		}
+	})
+
 	t.Run("ListRecentNegativeFeedbackTitles最新态度过滤", func(t *testing.T) {
 		since := time.Now().Add(-14 * 24 * time.Hour)
 		mk := func(title string) int64 {
@@ -645,6 +881,7 @@ func TestFeedbackStore(t *testing.T) {
 		dD := mk("纯误判内容")
 		addReasonFeedback(t, u2.ID, dD, types.FeedbackReasonNotRelevant, "") // 与任务无关 → 返回
 		dOld := mk("过时新闻")
+		addFeedback(t, u2.ID, dOld, types.FeedbackActionNotInterested, "")
 		addReasonFeedback(t, u2.ID, dOld, types.FeedbackReasonOutdated, "三个月前")
 		dE := mk("只感兴趣内容")
 		addFeedback(t, u2.ID, dE, types.FeedbackActionInterested, "") // 正面 → 不返回
