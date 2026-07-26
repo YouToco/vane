@@ -25,13 +25,18 @@ type scheduleDetailScheduleDTO struct {
 	NextRun *time.Time `json:"next_run,omitempty"`
 }
 
+type scheduleCapabilitiesDTO struct {
+	DefinitionEdit bool `json:"definition_edit"`
+}
+
 // scheduleDetailResp 是 GET /api/schedules/{id} 的响应体。
 type scheduleDetailResp struct {
-	Schedule scheduleDetailScheduleDTO  `json:"schedule"`
-	Summary  store.ScheduleRunSummary   `json:"summary"`
-	Sources  []store.ScheduleSourceInfo `json:"sources"`
-	Playbook *schedulePlaybookDTO       `json:"playbook,omitempty"` // 无手册的老任务缺省
-	Cost     store.ScheduleRunCost      `json:"cost"`               // 口径见 store/schedule_dashboard.go
+	Schedule     scheduleDetailScheduleDTO  `json:"schedule"`
+	Summary      store.ScheduleRunSummary   `json:"summary"`
+	Sources      []store.ScheduleSourceInfo `json:"sources"`
+	Playbook     *schedulePlaybookDTO       `json:"playbook,omitempty"` // 无手册的老任务缺省
+	Cost         store.ScheduleRunCost      `json:"cost"`               // 口径见 store/schedule_dashboard.go
+	Capabilities scheduleCapabilitiesDTO    `json:"capabilities"`
 }
 
 // handleGetScheduleDetail 返回单任务详情：本体 + 运行概览 + 绑定信源 + 手册 + 成本。
@@ -114,6 +119,9 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 		},
 		Summary: *summary, Sources: sources,
 		Playbook: playbook, Cost: *cost,
+		Capabilities: scheduleCapabilitiesDTO{
+			DefinitionEdit: s.deps.DefinitionEditEnabled,
+		},
 	})
 }
 

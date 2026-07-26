@@ -118,3 +118,53 @@ func TestCORS_预检不再广告PATCH(t *testing.T) {
 		t.Errorf("Allow-Methods must not advertise retired PATCH route: %q", allow)
 	}
 }
+
+func TestCORS_AuthenticatedUnsafeMethodsRejectSameSiteForeignOrigin(
+	t *testing.T,
+) {
+	const evilSameSiteOrigin = "https://evil.zhuoqidev.com"
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "confirm", path: "/api/task-actions/action-1/confirm"},
+		{name: "cancel", path: "/api/task-actions/action-1/cancel"},
+		{name: "run", path: "/api/schedules/task-1/run"},
+		{name: "pause", path: "/api/schedules/task-1/pause"},
+		{name: "resume", path: "/api/schedules/task-1/resume"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			actionAgent := &fakeTaskActionAgent{}
+			scheduleController := &fakeScheduleActionController{}
+			deps, cookie := authedDeps(t, Deps{
+				Origin:      testOrigin,
+				TaskAgent:   actionAgent,
+				TaskActions: newFakeTaskActionStore(),
+				Scheduler:   scheduleController,
+			})
+			mux := http.NewServeMux()
+			Mount(mux, deps)
+			req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+			req.AddCookie(cookie)
+			req.Header.Set("Origin", evilSameSiteOrigin)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf(
+					"status=%d body=%s, want 403",
+					rec.Code, rec.Body.String(),
+				)
+			}
+			if actionAgent.executeCalls != 0 ||
+				actionAgent.cancelCalls != 0 ||
+				scheduleController.command != "" {
+				t.Fatalf(
+					"foreign Origin reached a side effect: agent=%+v schedule=%+v",
+					actionAgent, scheduleController,
+				)
+			}
+		})
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
+	"github.com/google/uuid"
 )
 
 type fakeDefinitionEditController struct {
@@ -165,6 +166,148 @@ func TestLoop_DefinitionEditProposalUsesControllerNotGenericPending(t *testing.T
 	}
 	if store.createCalls != 0 {
 		t.Fatalf("definition edit used generic pending action: %d calls", store.createCalls)
+	}
+}
+
+func TestLoop_WebDefinitionEditIsolatesHistoryAndPinsToolAndTask(
+	t *testing.T,
+) {
+	store := newFakeStore()
+	session, err := store.CreateAgentSession(t.Context(), 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Messages = json.RawMessage(
+		`[{"role":"user","content":"PRIVATE_HISTORY_SENTINEL"}]`,
+	)
+	store.sessions[session.ID].Messages = session.Messages
+	controller := &fakeDefinitionEditController{}
+	tools := BuildTools(nil, nil, nil, nil, nil, nil, nil, controller)
+	loop := New(Deps{
+		Store: store, Tools: tools, TaskDefinitionEdit: controller,
+	})
+	actionID := uuid.NewString()
+	var requests []llm.ChatRequest
+	loop.chatFn = func(
+		_ context.Context,
+		req llm.ChatRequest,
+	) (*llm.ChatResponse, error) {
+		requests = append(requests, req)
+		if len(requests) == 1 {
+			return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID: "hidden-read", Name: "list_schedules",
+				Arguments: `{}`,
+			}}}, nil
+		}
+		return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+			ID: "edit", Name: "edit_task_definition",
+			Arguments: `{"task_id":"task-edit-1","strictness":"strict"}`,
+		}}}, nil
+	}
+
+	out, err := loop.HandleTaskDefinitionEditMessage(
+		t.Context(), 11, actionID, "task-edit-1", "改成严格模式",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Confirm == nil || out.Confirm.ActionID != actionID {
+		t.Fatalf("outcome=%+v", out)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("model requests=%d, want bounded retry", len(requests))
+	}
+	for i, req := range requests {
+		if len(req.Tools) != 1 ||
+			req.Tools[0].Name != "edit_task_definition" {
+			t.Fatalf("request %d tools=%+v", i+1, req.Tools)
+		}
+		raw, marshalErr := json.Marshal(req.Messages)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if bytes.Contains(raw, []byte("PRIVATE_HISTORY_SENTINEL")) ||
+			bytes.Contains(raw, []byte("hidden-read")) {
+			t.Fatalf("request %d leaked isolated history/protocol: %s", i+1, raw)
+		}
+	}
+	if len(controller.proposeCalls) != 1 ||
+		controller.proposeCalls[0].ActionID != actionID ||
+		string(controller.proposeCalls[0].RawArgs) !=
+			`{"task_id":"task-edit-1","strictness":"strict"}` {
+		t.Fatalf("proposal calls=%+v", controller.proposeCalls)
+	}
+}
+
+func TestLoop_WebDefinitionEditRejectsMismatchedTaskBeforeController(
+	t *testing.T,
+) {
+	store := newFakeStore()
+	controller := &fakeDefinitionEditController{}
+	tools := BuildTools(nil, nil, nil, nil, nil, nil, nil, controller)
+	loop := New(Deps{
+		Store: store, Tools: tools, TaskDefinitionEdit: controller,
+	})
+	loop.chatFn = func(
+		context.Context,
+		llm.ChatRequest,
+	) (*llm.ChatResponse, error) {
+		return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+			ID: "edit", Name: "edit_task_definition",
+			Arguments: `{"task_id":"another-task","strictness":"strict"}`,
+		}}}, nil
+	}
+
+	out, err := loop.HandleTaskDefinitionEditMessage(
+		t.Context(), 11, uuid.NewString(), "task-edit-1", "改成严格模式",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Confirm != nil ||
+		out.Reply != replyTaskDefinitionEditNotCreated ||
+		len(controller.proposeCalls) != 0 {
+		t.Fatalf(
+			"outcome=%+v propose=%+v",
+			out, controller.proposeCalls,
+		)
+	}
+}
+
+func TestLoop_WebCreationUsesTrustedActionIdentity(t *testing.T) {
+	store := newFakeStore()
+	controller := &fakeCreationController{}
+	tools := BuildTools(nil, nil, nil, nil, nil, nil, nil)
+	loop := New(Deps{
+		Store: store, Tools: tools, TaskCreation: controller,
+	})
+	loop.chatFn = func(
+		context.Context,
+		llm.ChatRequest,
+	) (*llm.ChatResponse, error) {
+		return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+			ID: "create", Name: "create_schedule",
+			Arguments: `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
+				`"intent":"每天追踪官方更新","approved_fetch_plan":{"source_specs":{` +
+				`"version":"vane.source-specs/v1","items":[{"kind":"web_search",` +
+				`"query":"官方更新"}]}}}`,
+		}}}, nil
+	}
+	actionID := uuid.NewString()
+	out, err := loop.HandleTaskCreationMessage(
+		t.Context(), 11, actionID,
+		"确认创建，直接生成确认卡。任务需求：每天追踪官方更新",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Confirm == nil || out.Confirm.ActionID != actionID ||
+		len(controller.proposeCalls) != 1 ||
+		controller.proposeCalls[0].ActionID != actionID {
+		t.Fatalf(
+			"outcome=%+v calls=%+v",
+			out, controller.proposeCalls,
+		)
 	}
 }
 
