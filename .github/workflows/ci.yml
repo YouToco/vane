@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: read
@@ -23,6 +25,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
+          cache: false
           go-version: "1.26"
 
       - name: Shell syntax

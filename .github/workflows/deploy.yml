@@ -1,13 +1,9 @@
 name: Deploy production
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
-  # Unlike workflow_dispatch, repository_dispatch always executes the
-  # default-branch workflow at the default-branch SHA. The payload is ignored;
-  # plan still resolves both source repositories' exact main SHAs itself.
-  repository_dispatch:
-    types: [deploy-production]
+  workflow_run:
+    workflows: ["Control plane CI"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -20,6 +16,16 @@ jobs:
   # This job runs on the deployment VM because that VM owns the durable
   # deployed-SHA state. It never checks out or executes either source repo.
   plan:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      (
+        github.event.workflow_run.event == 'push' ||
+        github.event.workflow_run.event == 'schedule'
+      ) &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_sha == github.sha
     runs-on: [self-hosted, Linux, ARM64, vane-deploy]
     timeout-minutes: 10
     outputs:
@@ -66,19 +72,32 @@ jobs:
               printf "ssh -i '%s' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='%s'" \
                 "$key_file" "$secret_dir/known_hosts"
             )
-            output=$(
+            if ! output=$(
               GIT_SSH_COMMAND="$ssh_command" \
                 git ls-remote "git@github.com:$repository.git" refs/heads/main
-            )
+            ); then
+              echo "failed to resolve $repository main" >&2
+              return 1
+            fi
             rm -f -- "$key_file"
             read -r sha ref <<<"$output"
-            [[ "$sha" =~ ^[0-9a-f]{40}$ && "$ref" == refs/heads/main ]]
-            [[ "$output" == "$sha"$'\t'"$ref" ]]
+            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ||
+              "$ref" != refs/heads/main ||
+              "$output" != "$sha"$'\t'"$ref" ]]; then
+              echo "invalid $repository main response" >&2
+              return 1
+            fi
             printf '%s' "$sha"
           }
 
-          backend_sha=$(remote_main_sha YouToco/vane "$VANE_READ_KEY")
-          frontend_sha=$(remote_main_sha YouToco/vane-web "$VANE_WEB_READ_KEY")
+          if ! backend_sha=$(remote_main_sha YouToco/vane "$VANE_READ_KEY"); then
+            exit 1
+          fi
+          if ! frontend_sha=$(
+            remote_main_sha YouToco/vane-web "$VANE_WEB_READ_KEY"
+          ); then
+            exit 1
+          fi
 
           state_root=${XDG_STATE_HOME:-"$HOME/.local/state"}
           state_dir=$state_root/vane-deploy
@@ -93,13 +112,22 @@ jobs:
             local value=
             if [[ -f "$state_file" ]]; then
               value=$(tr -d '\r\n' <"$state_file")
-              [[ "$value" =~ ^[0-9a-f]{40}$ ]]
+              if [[ ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "durable state is malformed: $state_file" >&2
+                return 1
+              fi
             fi
             printf '%s' "$value"
           }
 
-          backend_deployed=$(read_state "$state_dir/deployed-vane.sha")
-          frontend_deployed=$(read_state "$state_dir/deployed-vane-web.sha")
+          if ! backend_deployed=$(read_state "$state_dir/deployed-vane.sha"); then
+            exit 1
+          fi
+          if ! frontend_deployed=$(
+            read_state "$state_dir/deployed-vane-web.sha"
+          ); then
+            exit 1
+          fi
           backend_changed=false
           frontend_changed=false
           [[ "$backend_deployed" == "$backend_sha" ]] || backend_changed=true
@@ -170,6 +198,7 @@ jobs:
         if: needs.plan.outputs.backend_changed == 'true'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
+          cache: false
           go-version: "1.26"
 
       - name: Set up Node

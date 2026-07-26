@@ -46,28 +46,25 @@ Aliyun CDN and Cloudflare Pages succeed. If backend succeeds and frontend fails,
 backend state remains truthfully advanced; the next poll rebuilds and retries
 only the frontend.
 
-The production workflow polls every five minutes. An owner can also request the
-same poll immediately by creating a `repository_dispatch` event with the exact
-type `deploy-production`. GitHub fixes that event's workflow, `GITHUB_REF`, and
-`GITHUB_SHA` to the default branch; the workflow ignores `client_payload` and
-still resolves source `main` SHAs independently. There is deliberately no
-branch-selectable `workflow_dispatch`. The certificate workflow remains
-schedule-only. A failed production run is retried with GitHub's run-rerun
-operation using **Re-run all jobs** so `plan`, the exact-SHA Gates, artifacts,
-and deployment all share the new run attempt. GitHub Environment approval is
-intentionally not used as a security boundary on this Free private repository.
-
-To request an immediate production poll:
-
-```bash
-gh api --method POST repos/YouToco/vane-deploy/dispatches \
-  -f event_type=deploy-production
-```
+Control-plane CI runs on every `main` push and every five minutes. The
+production workflow listens only to a completed Control-plane CI run and
+requires a successful same-repository `push` or `schedule` run on `main` whose
+head SHA is still the current default-branch SHA. PR, feature-branch, failed,
+stale-SHA, and cross-repository completions cannot enter `plan`. There is no
+`workflow_dispatch` or `repository_dispatch` production entry. The certificate
+workflow remains schedule-only. A failed production run is retried with
+GitHub's run-rerun operation using **Re-run all jobs** so `plan`, the exact-SHA
+Gates, artifacts, and deployment all share the new run attempt. GitHub
+Environment approval is intentionally not used as a security boundary on this
+Free private repository.
 
 ## Runner provisioning
 
-Both runners are repository-scoped and carry exactly one custom label:
+All three runners are repository-scoped:
 
+- control-plane CI: `[self-hosted, Linux, ARM64, vane-test]`; this runner lives
+  in `vane-test`, so PR-controlled control-plane checks never enter the trusted
+  exact-main build VM.
 - build VM: `[self-hosted, Linux, ARM64, vane-build]`; Docker is available for
   the PostgreSQL service, and the pinned setup actions provide Go 1.26 and
   Node 22.
