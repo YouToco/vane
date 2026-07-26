@@ -48,9 +48,9 @@ only the frontend.
 
 Control-plane CI runs on every `main` push and every five minutes. The
 production workflow listens only to a completed Control-plane CI run and
-requires a successful same-repository `push` on `main` whose head SHA is still
-the current default-branch SHA. PR, feature-branch, failed, stale-SHA, and
-cross-repository completions cannot enter `plan`. There is deliberately no
+requires a successful same-repository `push` or `schedule` run on `main` whose
+head SHA is still the current default-branch SHA. PR, feature-branch, failed,
+stale-SHA, and cross-repository completions cannot enter `plan`. There is no
 `workflow_dispatch` or `repository_dispatch` production entry. The certificate
 workflow remains schedule-only. A failed production run is retried with
 GitHub's run-rerun operation using **Re-run all jobs** so `plan`, the exact-SHA
