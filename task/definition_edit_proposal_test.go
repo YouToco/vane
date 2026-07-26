@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
@@ -271,6 +272,89 @@ func TestDefinitionEditSchedulerProjection_RejectsUnrepresentableJSON(t *testing
 			testCase.mutate(&definition)
 			if _, err := definitionEditSchedulerProjection(definition); err == nil {
 				t.Fatal("definitionEditSchedulerProjection() accepted unrepresentable JSON")
+			}
+		})
+	}
+}
+
+func TestDefinitionEditSchedulerProjection_AcceptsObservationPolicy(t *testing.T) {
+	fixture := loadDefinitionEditProposalFixture(t)
+	policy, err := observation.Compile(observation.PolicySpecV1{
+		Schema:     observation.SchemaV1,
+		Mode:       observation.ModeEvent,
+		Window:     observation.WindowSpecV1{Kind: observation.WindowScheduleInterval},
+		LatePolicy: observation.LateStrict,
+		Evidence: observation.EvidencePolicyV1{
+			Requirement:     observation.EvidenceOfficialRequired,
+			OfficialDomains: []string{"openai.com"},
+		},
+		UnknownTime: observation.UnknownTimeReject,
+		Event: &observation.EventPolicyV1{
+			Subject:       "OpenAI 模型",
+			EventKind:     "新模型上新",
+			Qualification: observation.QualificationGeneralAvailability,
+		},
+		QualifierPrompt: observation.QualifierPromptV1,
+	}, time.Date(2026, 7, 25, 1, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+	scopeJSON, err := json.Marshal(struct {
+		SourceIDs   []int64              `json:"source_ids,omitempty"`
+		TopN        int                  `json:"top_n,omitempty"`
+		Observation observation.PolicyV1 `json:"observation"`
+	}{
+		SourceIDs:   []int64{22, 33},
+		TopN:        5,
+		Observation: policy,
+	})
+	if err != nil {
+		t.Fatalf("marshal scope: %v", err)
+	}
+	definition := fixture.target
+	definition.ScopeJSON = scopeJSON
+
+	got, err := definitionEditSchedulerProjection(definition)
+	if err != nil {
+		t.Fatalf("definitionEditSchedulerProjection() error = %v", err)
+	}
+	if !reflect.DeepEqual(got.Scope.SourceIDs, []int64{22, 33}) ||
+		got.Scope.TopN != 5 {
+		t.Fatalf("projection scope = %+v", got.Scope)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{
+			name: "unknown observation field",
+			mutate: func(raw []byte) []byte {
+				return bytes.Replace(raw, []byte(`"schema":`),
+					[]byte(`"future":true,"schema":`), 1)
+			},
+		},
+		{
+			name: "case folded observation field",
+			mutate: func(raw []byte) []byte {
+				return bytes.Replace(raw, []byte(`"schema"`),
+					[]byte(`"SCHEMA"`), 1)
+			},
+		},
+		{
+			name: "missing effective at",
+			mutate: func(raw []byte) []byte {
+				return bytes.Replace(raw,
+					[]byte(`,"effective_at":"2026-07-25T01:00:00Z"`), nil, 1)
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			invalid := definition
+			invalid.ScopeJSON = testCase.mutate(bytes.Clone(scopeJSON))
+			if _, err := definitionEditSchedulerProjection(invalid); err == nil {
+				t.Fatal("definitionEditSchedulerProjection() accepted invalid observation wire")
 			}
 		})
 	}

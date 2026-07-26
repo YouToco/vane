@@ -308,6 +308,52 @@ func TestValidateApprovedProjectionBindings_AnchoredIntervalUsesWriterLayout(t *
 	}
 }
 
+func TestValidateApprovedProjectionBindings_ObservationStaysOutsideTemporalProjection(t *testing.T) {
+	specRaw := []byte(`{"cron":"0 9 * * 1","tz":"Asia/Shanghai"}`)
+	legacyScope := PushScopeV1{SourceIDs: []int64{11, 22}, TopN: 3}
+	scopeRaw := []byte(`{"source_ids":[11,22],"top_n":3,"observation":{"schema":"vane.observation-policy/v1","mode":"content","window":{"kind":"schedule_interval"},"late_policy":"strict","evidence":{"requirement":"trusted_allowed"},"unknown_time":"reject","effective_at":"2026-07-25T01:00:00Z"}}`)
+	nlDescription := "每周一 09:00 检查官方更新"
+	wantProjection := approvedProjectionV1{
+		Spec: ScheduleSpecV1{
+			Cron: "0 9 * * 1",
+			TZ:   "Asia/Shanghai",
+		},
+		Scope:         legacyScope,
+		NLDescription: nlDescription,
+	}
+	wantDigest, err := digestJSON(wantProjection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := PreparedEditV1{
+		BaseProjectionDigest:   wantDigest,
+		TargetProjectionDigest: wantDigest,
+		BaseOriginal: RepresentationV1{Action: PreparedActionV1{
+			Params: PushParamsV1{Scope: legacyScope, NLDesc: nlDescription},
+		}},
+		TargetFinal: RepresentationV1{Action: PreparedActionV1{
+			Params: PushParamsV1{Scope: legacyScope, NLDesc: nlDescription},
+		}},
+	}
+	if err := ValidateApprovedProjectionBindings(
+		prepared,
+		specRaw, scopeRaw, nlDescription,
+		specRaw, scopeRaw, nlDescription,
+	); err != nil {
+		t.Fatalf("observation policy changed retained Temporal projection: %v", err)
+	}
+
+	invalid := bytes.Replace(scopeRaw, []byte(`"schema":`),
+		[]byte(`"future":true,"schema":`), 1)
+	if err := ValidateApprovedProjectionBindings(
+		prepared,
+		specRaw, scopeRaw, nlDescription,
+		specRaw, invalid, nlDescription,
+	); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unknown observation field error = %v, want ErrInvalid", err)
+	}
+}
+
 func loadFixture(t *testing.T) (componentFixtureV1, []byte) {
 	t.Helper()
 	raw, err := os.ReadFile("../task/testdata/definition_edit_proposal_components_v1.json")

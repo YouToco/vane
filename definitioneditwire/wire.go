@@ -22,6 +22,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/observation"
 )
 
 const (
@@ -100,6 +101,12 @@ type ProposalV1 struct {
 type PushScopeV1 struct {
 	SourceIDs []int64 `json:"source_ids,omitempty"`
 	TopN      int     `json:"top_n,omitempty"`
+}
+
+type approvedScopeWireV1 struct {
+	SourceIDs   []int64         `json:"source_ids,omitempty"`
+	TopN        int             `json:"top_n,omitempty"`
+	Observation json.RawMessage `json:"observation,omitempty"`
 }
 
 // ScheduleSpecV1 mirrors the frozen scheduler V1 projection layout. Approved
@@ -471,8 +478,8 @@ func approvedProjection(
 	if err := strictjson.DecodeExact(specRaw, &spec); err != nil {
 		return approvedProjectionV1{}, "", invalid("decode approved spec", err)
 	}
-	var scope PushScopeV1
-	if err := decodeCanonical("approved scope", scopeRaw, &scope); err != nil {
+	scope, err := decodeApprovedScope(scopeRaw)
+	if err != nil {
 		return approvedProjectionV1{}, "", err
 	}
 	if scope.TopN < 0 {
@@ -501,6 +508,23 @@ func approvedProjection(
 			"digest approved projection", err)
 	}
 	return projection, projectionDigest, nil
+}
+
+func decodeApprovedScope(raw []byte) (PushScopeV1, error) {
+	var wire approvedScopeWireV1
+	if err := decodeCanonical("approved scope", raw, &wire); err != nil {
+		return PushScopeV1{}, err
+	}
+	if len(wire.Observation) != 0 &&
+		!bytes.Equal(bytes.TrimSpace(wire.Observation), []byte("null")) {
+		if _, err := observation.DecodePolicyV1Exact(wire.Observation); err != nil {
+			return PushScopeV1{}, invalid("decode approved observation", err)
+		}
+	}
+	return PushScopeV1{
+		SourceIDs: wire.SourceIDs,
+		TopN:      wire.TopN,
+	}, nil
 }
 
 func projectionMatchesAction(

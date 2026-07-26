@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/robfig/cron"
 )
 
@@ -115,6 +116,19 @@ type PolicyV1 struct {
 	EffectiveAt time.Time `json:"effective_at"`
 }
 
+type policyWireV1 struct {
+	Schema              string            `json:"schema"`
+	Mode                Mode              `json:"mode"`
+	Window              WindowSpecV1      `json:"window"`
+	LatePolicy          LatePolicy        `json:"late_policy"`
+	AllowedLatenessSecs int64             `json:"allowed_lateness_seconds,omitempty"`
+	Evidence            EvidencePolicyV1  `json:"evidence"`
+	UnknownTime         UnknownTimePolicy `json:"unknown_time"`
+	Event               *EventPolicyV1    `json:"event,omitempty"`
+	QualifierPrompt     string            `json:"qualifier_prompt,omitempty"`
+	EffectiveAt         time.Time         `json:"effective_at"`
+}
+
 func Compile(spec PolicySpecV1, effectiveAt time.Time) (PolicyV1, error) {
 	if err := spec.Validate(); err != nil {
 		return PolicyV1{}, err
@@ -126,6 +140,36 @@ func Compile(spec PolicySpecV1, effectiveAt time.Time) (PolicyV1, error) {
 		PolicySpecV1: spec,
 		EffectiveAt:  effectiveAt.UTC().Truncate(time.Second),
 	}, nil
+}
+
+// DecodePolicyV1Exact decodes the flattened PolicyV1 JSON wire without
+// weakening exact-key checks for its embedded PolicySpecV1 fields.
+func DecodePolicyV1Exact(raw []byte) (PolicyV1, error) {
+	var wire policyWireV1
+	if err := strictjson.DecodeExact(raw, &wire); err != nil {
+		return PolicyV1{}, err
+	}
+	policy := PolicyV1{
+		PolicySpecV1: PolicySpecV1{
+			Schema:              wire.Schema,
+			Mode:                wire.Mode,
+			Window:              wire.Window,
+			LatePolicy:          wire.LatePolicy,
+			AllowedLatenessSecs: wire.AllowedLatenessSecs,
+			Evidence:            wire.Evidence,
+			UnknownTime:         wire.UnknownTime,
+			Event:               wire.Event,
+			QualifierPrompt:     wire.QualifierPrompt,
+		},
+		EffectiveAt: wire.EffectiveAt,
+	}
+	if err := policy.Validate(); err != nil {
+		return PolicyV1{}, err
+	}
+	if policy.EffectiveAt.IsZero() {
+		return PolicyV1{}, errors.New("observation: effective_at is required")
+	}
+	return policy, nil
 }
 
 func (p PolicySpecV1) Validate() error {
