@@ -1947,8 +1947,8 @@ func summarizeCreationObservationPolicy(policy observation.PolicySpecV1) string 
 	case observation.WindowScheduleInterval:
 		window = "相邻两次计划触发之间"
 	case observation.WindowRollingDuration:
-		window = fmt.Sprintf(
-			"最近 %d 小时", policy.Window.RollingDurationSeconds/3600,
+		window = "最近 " + summarizeCreationRollingDuration(
+			policy.Window.RollingDurationSeconds,
 		)
 	case observation.WindowCalendarPeriod:
 		window = map[observation.CalendarPeriod]string{
@@ -1986,6 +1986,26 @@ func summarizeCreationObservationPolicy(policy observation.PolicySpecV1) string 
 		policy.Event.Subject, policy.Event.EventKind, qualification,
 		window, late, unknown, evidence,
 	)
+}
+
+func summarizeCreationRollingDuration(seconds int64) string {
+	duration := time.Duration(seconds) * time.Second
+	parts := make([]string, 0, 3)
+	if hours := duration / time.Hour; hours != 0 {
+		parts = append(parts, fmt.Sprintf("%d小时", hours))
+		duration %= time.Hour
+	}
+	if minutes := duration / time.Minute; minutes != 0 {
+		parts = append(parts, fmt.Sprintf("%d分钟", minutes))
+		duration %= time.Minute
+	}
+	if remainingSeconds := duration / time.Second; remainingSeconds != 0 {
+		parts = append(parts, fmt.Sprintf("%d秒", remainingSeconds))
+	}
+	if len(parts) == 0 {
+		return "0秒"
+	}
+	return strings.Join(parts, "")
 }
 
 func summarizeCreationTiming(spec scheduler.ScheduleSpec) string {

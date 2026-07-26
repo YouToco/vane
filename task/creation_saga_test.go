@@ -832,6 +832,34 @@ func TestCreationCoordinator_SourceSpecsRejectNonCanonicalObservationPolicyField
 	}
 }
 
+func TestSummarizeCreationObservationPolicy_RollingDurationIsExact(t *testing.T) {
+	tests := []struct {
+		name    string
+		seconds int64
+		want    string
+	}{
+		{name: "ninety minutes", seconds: 5400, want: "最近 1小时30分钟"},
+		{name: "keeps remaining seconds", seconds: 3601, want: "最近 1小时1秒"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := summarizeCreationObservationPolicy(observation.PolicySpecV1{
+				Mode: observation.ModeContent,
+				Window: observation.WindowSpecV1{
+					Kind:                   observation.WindowRollingDuration,
+					RollingDurationSeconds: testCase.seconds,
+				},
+				LatePolicy:  observation.LateStrict,
+				Evidence:    observation.EvidencePolicyV1{Requirement: observation.EvidenceTrustedAllowed},
+				UnknownTime: observation.UnknownTimeReject,
+			})
+			if !strings.Contains(got, testCase.want) {
+				t.Fatalf("summary=%q, want exact rolling duration %q", got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestCreationCoordinator_SourceSpecsAreStrictAtomicAndUnambiguous(t *testing.T) {
 	valid := `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","include_domains":["openai.com"]}]}}`
 	cases := []struct {
