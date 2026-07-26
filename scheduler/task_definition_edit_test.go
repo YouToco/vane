@@ -604,6 +604,63 @@ func TestTaskDefinitionEdit_DefinitionOnlyEditChangesRemoteMarker(t *testing.T) 
 	}
 }
 
+func TestTaskDefinitionEdit_FinalPausedMarkerRemainsValidAfterActivation(t *testing.T) {
+	fixture := newTaskDefinitionEditFixture(t, TaskDefinitionEditOriginalStatePaused)
+	head1 := taskDefinitionEditHead(1, "a")
+	head2 := taskDefinitionEditHead(2, "b")
+	definition2 := changedTaskDefinitionEditDefinition(fixture.base, "v2")
+	prepared1, _ := fixture.prepare(
+		t, "edit-paused-v1-v2",
+		head1, head2,
+		fixture.base, definition2,
+	)
+	base, err := fixture.scheduler.PauseTaskDefinitionEdit(t.Context(), prepared1)
+	if err != nil {
+		t.Fatalf("observe paused v1 base: %v", err)
+	}
+	final, err := fixture.scheduler.ApplyTaskDefinitionEdit(t.Context(), prepared1, base)
+	if err != nil {
+		t.Fatalf("apply paused v2 target: %v", err)
+	}
+	if _, err := fixture.scheduler.RestoreTaskDefinitionEdit(
+		t.Context(), prepared1, final,
+	); err != nil {
+		t.Fatalf("reobserve paused v2 target: %v", err)
+	}
+	if prepared1.TargetFinal.Fingerprint.EditPhase != "final_paused" {
+		t.Fatalf(
+			"paused target marker = %q, want final_paused",
+			prepared1.TargetFinal.Fingerprint.EditPhase,
+		)
+	}
+
+	const activationNote = "runtime cutover activated finalized task"
+	if !fixture.fake.mutate(fixture.creation.TaskID, func(
+		description *client.ScheduleDescription,
+	) {
+		description.Schedule.State.Paused = false
+		description.Schedule.State.Note = activationNote
+	}) {
+		t.Fatal("activate finalized paused task: missing fake record")
+	}
+
+	definition3 := changedTaskDefinitionEditDefinition(definition2, "v3")
+	fixture.state = TaskDefinitionEditOriginalStateActive
+	prepared2, snapshot2 := fixture.prepare(
+		t, "edit-activated-v2-v3",
+		head2, taskDefinitionEditHead(3, "c"),
+		definition2, definition3,
+	)
+	if prepared2.BaseOriginal.State.Paused ||
+		prepared2.BaseOriginal.State.Note != activationNote ||
+		snapshot2.Phase != TaskDefinitionEditPhaseBaseOriginal {
+		t.Fatalf(
+			"activated finalized base = %+v snapshot=%+v",
+			prepared2.BaseOriginal.State, snapshot2,
+		)
+	}
+}
+
 func TestTaskDefinitionEdit_NewerOperationMarkerRejectsLateRestore(t *testing.T) {
 	fixture := newTaskDefinitionEditFixture(t, TaskDefinitionEditOriginalStateActive)
 	head1 := taskDefinitionEditHead(1, "a")
