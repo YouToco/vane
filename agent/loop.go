@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/agentcontext"
 	"github.com/YouToco/vane/agentledger"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/llm"
@@ -356,6 +357,7 @@ type chatMetaKey struct{}
 type chatMeta struct {
 	traceID string
 	userID  int64
+	scope   agentcontext.Scope
 }
 
 // New 构造 Loop。非法工具装配属于本地编程错误，必须在进程接流量前 fail-fast；
@@ -566,7 +568,14 @@ func (l *Loop) handleMessage(
 	// 同一条消息内的多轮模型调用共享 trace_id，llm_calls/tool_calls 里可按 trace
 	// 回放整个 loop。
 	turnID := uuid.NewString()
-	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{traceID: turnID, userID: userID})
+	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{
+		traceID: turnID,
+		userID:  userID,
+		scope: agentcontext.Scope{
+			TenantID: sess.TenantID, UserID: sess.UserID,
+			SessionID: sess.ID,
+		},
+	})
 
 	// 端点注册表契约 §4：激活集随会话持久化，本条消息的工具运行状态经 ctx 旁路
 	// 传给工具 Execute（工具是全局单例，不能携带 per-message 状态）。
@@ -642,7 +651,10 @@ func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMess
 	msgs = append(msgs, llm.ChatMessage{Role: "user", Content: text})
 	msgs = truncateMessages(msgs)
 
-	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{traceID: uuid.NewString(), userID: userID})
+	turnID := uuid.NewString()
+	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{
+		traceID: turnID, userID: userID,
+	})
 	state := &toolRunState{activation: &activationState{}}
 
 	outcome, msgs, _, err := l.converse(ctx, userID, nil, msgs, "", state)
@@ -729,7 +741,7 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				system += directTaskDefinitionEditResponseRetrySystemNote
 			}
 		}
-		resp, err := l.chatFn(ctx, llm.ChatRequest{
+		request := llm.ChatRequest{
 			Model:    l.model,
 			Messages: withSystem(system, requestMessages, profileHint, renderProfile),
 			// 每轮现算工具面：静态声明 + 会话已激活端点声明（search_endpoints 本轮
@@ -742,7 +754,12 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			// （与当日打分全空事故同机理）。
 			// Temperature 保持 nil：用上游默认值。
 			DisableThinking: true,
-		})
+		}
+		// 7.8-A is observation-only: build/seal a provider-neutral candidate
+		// immediately before chatFn, then send the already-built legacy request
+		// unchanged. Shadow failures are logged and never alter this request.
+		l.shadowAgentContext(ctx, request, state, turns)
+		resp, err := l.chatFn(ctx, request)
 		if err != nil {
 			if errors.Is(err, llm.ErrToolProtocolResponse) && state.untrustedExternalResult {
 				slog.Warn("agent: 外部读取后模型协议异常，返回确定性恢复文案",
@@ -858,6 +875,7 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			// v1 proposal 已成为耐久事实，直接生成固定出口，不再冒险调用一次
 			// LLM。确认卡正文完全采用 controller 从 canonical args 生成的摘要。
 			msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: replyTaskCreationConfirm})
+			l.shadowFinalPendingContext(ctx, msgs, state, turns+1)
 			return Outcome{
 				Reply:   replyTaskCreationConfirm,
 				Confirm: &Confirm{ActionID: pending.ID, Summary: confirmSummary(pending)},
@@ -869,6 +887,7 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			msgs = append(msgs, llm.ChatMessage{
 				Role: "assistant", Content: replyDefinitionEditConfirm,
 			})
+			l.shadowFinalPendingContext(ctx, msgs, state, turns+1)
 			return Outcome{
 				Reply: replyDefinitionEditConfirm,
 				Confirm: &Confirm{
@@ -882,12 +901,14 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		if err := ctx.Err(); err != nil {
 			return Outcome{}, nil, 0, err
 		}
-		final, err := l.chatFn(ctx, llm.ChatRequest{
+		finalRequest := llm.ChatRequest{
 			Model:           l.model,
 			Messages:        withSystem(l.sys, msgs, hint, l.renderProfile),
 			MaxTokens:       iptr(replyMaxTokens),
 			DisableThinking: true, // 同主循环：关思维链防预算被 CoT 吃光。
-		})
+		}
+		l.shadowAgentContext(ctx, finalRequest, state, turns+1)
+		final, err := l.chatFn(ctx, finalRequest)
 		if err != nil {
 			if !errors.Is(err, llm.ErrToolProtocolResponse) {
 				return Outcome{}, nil, 0, err
