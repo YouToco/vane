@@ -479,12 +479,17 @@ func hidden(target any) {
 
 	externalHelperEscape := parseAgentActionMutation(
 		t, `package agentcontinuation
-type ActionDispatcher struct{ store any }
 func (d *ActionDispatcher) Escape() {
 	externalhelper.Hidden(d.store)
 }`)
 	got = agentActionUnapprovedStoreFieldViolations(
-		map[string]*ast.File{path: externalHelperEscape}, root)
+		map[string]*ast.File{
+			filepath.Join(
+				root, "agentcontinuation", "action_escape.go",
+			): externalHelperEscape,
+		},
+		root,
+	)
 	if !agentActionViolationContains(
 		got, "Escape unapproved Store field receiver d.store",
 	) {
@@ -1174,10 +1179,6 @@ func agentActionUnapprovedStoreFieldViolations(
 	files map[string]*ast.File,
 	root string,
 ) []string {
-	adapterFiles := map[string]bool{
-		"agentcontinuation/action_controller.go": true,
-		"agentcontinuation/action_dispatcher.go": true,
-	}
 	var violations []string
 	for path, file := range files {
 		relativePath, err := filepath.Rel(filepath.Clean(root), path)
@@ -1185,14 +1186,26 @@ func agentActionUnapprovedStoreFieldViolations(
 			continue
 		}
 		relativePath = filepath.ToSlash(relativePath)
-		if !adapterFiles[relativePath] {
+		if !strings.HasPrefix(relativePath, "agentcontinuation/") {
 			continue
 		}
 		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			carriers := agentActionCarrierIdentifiers(function)
+			if len(carriers) == 0 {
+				continue
+			}
 			declarationName := agentActionDeclarationName(declaration)
 			ast.Inspect(declaration, func(node ast.Node) bool {
 				selector, ok := node.(*ast.SelectorExpr)
 				if !ok || selector.Sel.Name != "store" {
+					return true
+				}
+				base := agentActionExpressionBase(selector.X)
+				if !carriers[base] {
 					return true
 				}
 				receiver := agentActionExpressionPath(selector)
@@ -1216,6 +1229,76 @@ func agentActionUnapprovedStoreFieldViolations(
 		}
 	}
 	return violations
+}
+
+func agentActionCarrierIdentifiers(
+	function *ast.FuncDecl,
+) map[string]bool {
+	carriers := make(map[string]bool)
+	addFields := func(fields *ast.FieldList) {
+		if fields == nil {
+			return
+		}
+		for _, field := range fields.List {
+			if !agentActionCarrierType(field.Type) {
+				continue
+			}
+			for _, name := range field.Names {
+				carriers[name.Name] = true
+			}
+		}
+	}
+	addFields(function.Recv)
+	addFields(function.Type.Params)
+
+	changed := true
+	for changed {
+		changed = false
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			assignment, ok := node.(*ast.AssignStmt)
+			if !ok || len(assignment.Lhs) != len(assignment.Rhs) {
+				return true
+			}
+			for i, right := range assignment.Rhs {
+				rightName, ok := right.(*ast.Ident)
+				if !ok || !carriers[rightName.Name] {
+					continue
+				}
+				leftName, ok := assignment.Lhs[i].(*ast.Ident)
+				if ok && !carriers[leftName.Name] {
+					carriers[leftName.Name] = true
+					changed = true
+				}
+			}
+			return true
+		})
+	}
+	return carriers
+}
+
+func agentActionCarrierType(expression ast.Expr) bool {
+	if pointer, ok := expression.(*ast.StarExpr); ok {
+		expression = pointer.X
+	}
+	identifier, ok := expression.(*ast.Ident)
+	return ok &&
+		(identifier.Name == "ActionDispatcher" ||
+			identifier.Name == "ActionController")
+}
+
+func agentActionExpressionBase(expression ast.Expr) string {
+	for {
+		selector, ok := expression.(*ast.SelectorExpr)
+		if !ok {
+			break
+		}
+		expression = selector.X
+	}
+	identifier, _ := expression.(*ast.Ident)
+	if identifier == nil {
+		return ""
+	}
+	return identifier.Name
 }
 
 func agentActionAdapterGenericExecutionViolations(
