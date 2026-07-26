@@ -12,6 +12,12 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+const (
+	agentActionCancelledSessionMessages = `[{"role":"user","content":"[卡片回调] 用户已取消重新启用信源；未产生变更。"}]`
+	agentActionExpiredSessionMessages   = `[{"role":"user","content":"[卡片回调] 重新启用信源确认卡已过期；未产生变更。"}]`
+	agentActionBlockedSessionMessages   = `[{"role":"user","content":"[卡片回调] 重新启用信源操作已因安全检查停止；未产生额外变更。"}]`
+)
+
 func (s *Store) ListDueAgentActionContinuationTenantIDs(
 	ctx context.Context,
 	before time.Time,
@@ -161,15 +167,23 @@ func (s *Store) AcquireAgentActionContinuation(
 		ctx, tx, action.ActionID,
 	); err != nil {
 		if agentSessionFactShouldBlock(err) {
+			blockReason, stageErr :=
+				stageAgentActionBlockedSessionTx(
+					ctx, tx, action, "authority_integrity",
+				)
+			if stageErr != nil {
+				return nil, stageErr
+			}
 			tag, blockErr := tx.Exec(ctx,
 				`UPDATE agent_action_continuations
 				    SET status='blocked',
-				        blocked_reason='authority_integrity',
+				        blocked_reason=$4,
 				        lease_owner=NULL,lease_expires_at=NULL,
 				        updated_at=clock_timestamp()
 				  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3
 				    AND status='confirmed'`,
 				action.ActionID, action.TenantID, action.UserID,
+				blockReason,
 			)
 			if blockErr != nil {
 				return nil, agentEventDatabaseError(
@@ -187,14 +201,21 @@ func (s *Store) AcquireAgentActionContinuation(
 		return nil, err
 	}
 	if err := validateFrozenAgentAction(action); err != nil {
+		blockReason, stageErr := stageAgentActionBlockedSessionTx(
+			ctx, tx, action, "payload_integrity",
+		)
+		if stageErr != nil {
+			return nil, stageErr
+		}
 		tag, blockErr := tx.Exec(ctx,
 			`UPDATE agent_action_continuations
-			    SET status='blocked',blocked_reason='payload_integrity',
+			    SET status='blocked',blocked_reason=$4,
 			        lease_owner=NULL,lease_expires_at=NULL,
 			        updated_at=clock_timestamp()
 			  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3
 			    AND status='confirmed'`,
 			action.ActionID, action.TenantID, action.UserID,
+			blockReason,
 		)
 		if blockErr != nil {
 			return nil, agentEventDatabaseError(
@@ -340,16 +361,22 @@ func (s *Store) ProjectAgentActionContinuation(
 			action.LeaseFence != lease.Fence {
 			return err
 		}
+		blockReason, stageErr := stageAgentActionBlockedSessionTx(
+			ctx, tx, action, "payload_integrity",
+		)
+		if stageErr != nil {
+			return stageErr
+		}
 		tag, blockErr := tx.Exec(ctx,
 			`UPDATE agent_action_continuations
-			    SET status='blocked',blocked_reason='payload_integrity',
+			    SET status='blocked',blocked_reason=$6,
 			        lease_owner=NULL,lease_expires_at=NULL,
 			        updated_at=clock_timestamp()
 			  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3
 			    AND status='confirmed' AND lease_owner=$4
 			    AND lease_fence=$5`,
 			lease.ActionID, lease.TenantID, lease.UserID,
-			lease.Owner, lease.Fence,
+			lease.Owner, lease.Fence, blockReason,
 		)
 		if blockErr != nil {
 			return agentEventDatabaseError(
@@ -372,17 +399,24 @@ func (s *Store) ProjectAgentActionContinuation(
 			action.LeaseOwner != nil &&
 			*action.LeaseOwner == lease.Owner &&
 			action.LeaseFence == lease.Fence {
+			blockReason, stageErr :=
+				stageAgentActionBlockedSessionTx(
+					ctx, tx, action, "authority_integrity",
+				)
+			if stageErr != nil {
+				return stageErr
+			}
 			tag, blockErr := tx.Exec(ctx,
 				`UPDATE agent_action_continuations
 				    SET status='blocked',
-				        blocked_reason='authority_integrity',
+				        blocked_reason=$6,
 				        lease_owner=NULL,lease_expires_at=NULL,
 				        updated_at=clock_timestamp()
 				  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3
 				    AND status='confirmed' AND lease_owner=$4
 				    AND lease_fence=$5`,
 				lease.ActionID, lease.TenantID, lease.UserID,
-				lease.Owner, lease.Fence,
+				lease.Owner, lease.Fence, blockReason,
 			)
 			if blockErr != nil {
 				return agentEventDatabaseError(
@@ -497,6 +531,10 @@ func (s *Store) ProjectAgentActionContinuation(
 		if !agentSessionFactShouldBlock(appendErr) {
 			return appendErr
 		}
+		// A deterministic session-ledger integrity failure cannot safely
+		// carry its own terminal fact. The effect savepoint above is fully
+		// rolled back; only this explicit operator-visible blocked checkpoint
+		// is committed so the action cannot retry the business effect.
 		blockTag, blockErr := tx.Exec(ctx,
 			`UPDATE agent_action_continuations
 			    SET status='blocked',blocked_reason='projection_integrity',
@@ -619,17 +657,24 @@ func (s *Store) ReleaseAgentActionContinuation(
 		ctx, tx, action.ActionID,
 	); err != nil {
 		if agentSessionFactShouldBlock(err) {
+			blockReason, stageErr :=
+				stageAgentActionBlockedSessionTx(
+					ctx, tx, action, "authority_integrity",
+				)
+			if stageErr != nil {
+				return stageErr
+			}
 			tag, blockErr := tx.Exec(ctx,
 				`UPDATE agent_action_continuations
 				    SET status='blocked',
-				        blocked_reason='authority_integrity',
+				        blocked_reason=$6,
 				        lease_owner=NULL,lease_expires_at=NULL,
 				        updated_at=clock_timestamp()
 				  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3
 				    AND status='confirmed' AND lease_owner=$4
 				    AND lease_fence=$5`,
 				lease.ActionID, lease.TenantID, lease.UserID,
-				lease.Owner, lease.Fence,
+				lease.Owner, lease.Fence, blockReason,
 			)
 			if blockErr != nil {
 				return agentEventDatabaseError(
@@ -745,6 +790,85 @@ func terminalAgentActionMessages(
 	default:
 		return nil, agentEventIntegrityError()
 	}
+}
+
+func commitAgentActionTerminalSessionTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	action AgentActionContinuation,
+	status string,
+	replayOnly bool,
+) error {
+	var messages []byte
+	switch status {
+	case AgentActionStatusCompleted:
+		var err error
+		messages, err = terminalAgentActionMessages(action)
+		if err != nil {
+			return err
+		}
+	case AgentActionStatusCancelled:
+		messages = []byte(agentActionCancelledSessionMessages)
+	case AgentActionStatusExpired:
+		messages = []byte(agentActionExpiredSessionMessages)
+	case AgentActionStatusBlocked:
+		messages = []byte(agentActionBlockedSessionMessages)
+	default:
+		return agentEventIntegrityError()
+	}
+	_, replayed, err := commitAgentSessionAppendTx(
+		ctx, tx, action.TenantID, action.UserID, action.SessionID,
+		"agent-action:enable-source:"+action.ActionID,
+		json.RawMessage(messages), replayOnly,
+	)
+	if err != nil {
+		return err
+	}
+	if replayOnly && !replayed {
+		return agentEventIntegrityError()
+	}
+	return nil
+}
+
+func stageAgentActionBlockedSessionTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	action AgentActionContinuation,
+	reason string,
+) (string, error) {
+	switch reason {
+	case "authority_integrity", "payload_integrity":
+	default:
+		return "", agentEventIntegrityError()
+	}
+	factTx, err := tx.Begin(ctx)
+	if err != nil {
+		return "", agentEventDatabaseError(
+			"begin Agent action blocked session savepoint", err)
+	}
+	if appendErr := commitAgentActionTerminalSessionTx(
+		ctx, factTx, action, AgentActionStatusBlocked, false,
+	); appendErr != nil {
+		if rollbackErr := factTx.Rollback(
+			context.WithoutCancel(ctx),
+		); rollbackErr != nil {
+			return "", errors.Join(
+				appendErr,
+				agentEventDatabaseError(
+					"rollback Agent action blocked session savepoint",
+					rollbackErr),
+			)
+		}
+		if agentSessionFactShouldBlock(appendErr) {
+			return "projection_integrity", nil
+		}
+		return "", appendErr
+	}
+	if err := factTx.Commit(ctx); err != nil {
+		return "", agentEventDatabaseError(
+			"release Agent action blocked session savepoint", err)
+	}
+	return reason, nil
 }
 
 func agentActionProjectionError(action string, err error) error {

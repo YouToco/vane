@@ -59,6 +59,7 @@ type ActionDispatcher struct {
 	cancel      context.CancelFunc
 	done        chan struct{}
 	started     bool
+	stopped     bool
 }
 
 func NewActionDispatcher(
@@ -100,6 +101,7 @@ func (d *ActionDispatcher) Start(parent context.Context) error {
 	d.cancel = cancel
 	d.done = make(chan struct{})
 	d.started = true
+	d.stopped = false
 	go d.run(ctx, d.done)
 	return nil
 }
@@ -112,10 +114,13 @@ func (d *ActionDispatcher) Stop() {
 	}
 	d.lifecycleMu.Lock()
 	cancel := d.cancel
-	d.lifecycleMu.Unlock()
+	if d.started {
+		d.stopped = true
+	}
 	if cancel != nil {
 		cancel()
 	}
+	d.lifecycleMu.Unlock()
 }
 
 // Wait blocks until the dispatch loop and every admitted projection have
@@ -228,6 +233,15 @@ func (d *ActionDispatcher) DispatchOnce(ctx context.Context) error {
 				appendError(ctx.Err())
 				return errors.Join(dispatchErrors...)
 			}
+			d.lifecycleMu.Lock()
+			stopped := d.stopped || ctx.Err() != nil
+			if stopped {
+				d.lifecycleMu.Unlock()
+				<-semaphore
+				wait.Wait()
+				appendError(ctx.Err())
+				return errors.Join(dispatchErrors...)
+			}
 			wait.Add(1)
 			go func() {
 				defer wait.Done()
@@ -240,6 +254,7 @@ func (d *ActionDispatcher) DispatchOnce(ctx context.Context) error {
 						action.ActionID, err))
 				}
 			}()
+			d.lifecycleMu.Unlock()
 		}
 	}
 	wait.Wait()

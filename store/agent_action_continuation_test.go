@@ -448,25 +448,72 @@ func TestAgentActionContinuationEffectAndSessionCheckpointAreAtomic(
 	); err != nil {
 		t.Fatal(err)
 	}
+	var conflictEventsBefore int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND session_id=$2`,
+		f.tenantA, f.sessionA,
+	).Scan(&conflictEventsBefore); err != nil {
+		t.Fatal(err)
+	}
 	if err := f.store.ProjectAgentActionContinuation(
 		ctx, conflictLease,
 	); err != nil {
 		t.Fatalf("conflict should checkpoint blocked: %v", err)
 	}
+	var blockReason string
 	if err := f.store.pool.QueryRow(ctx,
-		`SELECT s.status,a.status
+		`SELECT s.status,a.status,a.blocked_reason
 		   FROM sources s
 		   CROSS JOIN agent_action_continuations a
 		  WHERE s.id=$1 AND a.action_id=$2`,
 		conflictSourceID, conflictActionID,
-	).Scan(&status, &actionStatus); err != nil {
+	).Scan(&status, &actionStatus, &blockReason); err != nil {
 		t.Fatal(err)
 	}
 	if status != string(types.SourceStatusDisabled) ||
-		actionStatus != AgentActionStatusBlocked {
+		actionStatus != AgentActionStatusBlocked ||
+		blockReason != "projection_integrity" {
 		t.Fatalf(
-			"conflicting source/action status=%s/%s",
-			status, actionStatus,
+			"conflicting source/action status/reason=%s/%s/%s",
+			status, actionStatus, blockReason,
+		)
+	}
+	var conflictEventsAfter int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND session_id=$2`,
+		f.tenantA, f.sessionA,
+	).Scan(&conflictEventsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if conflictEventsAfter != conflictEventsBefore {
+		t.Fatalf(
+			"projection-integrity block changed session events=%d/%d",
+			conflictEventsBefore, conflictEventsAfter,
+		)
+	}
+	blockedReplay, err := f.store.ConfirmAgentActionContinuation(
+		ctx, f.userA, conflictActionID,
+	)
+	if err != nil || !blockedReplay.Replayed ||
+		blockedReplay.Status != AgentActionStatusBlocked {
+		t.Fatalf(
+			"projection-integrity replay=%+v err=%v",
+			blockedReplay, err,
+		)
+	}
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND session_id=$2`,
+		f.tenantA, f.sessionA,
+	).Scan(&conflictEventsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if conflictEventsAfter != conflictEventsBefore {
+		t.Fatalf(
+			"projection-integrity replay changed events=%d/%d",
+			conflictEventsBefore, conflictEventsAfter,
 		)
 	}
 
@@ -487,20 +534,91 @@ func TestAgentActionContinuationEffectAndSessionCheckpointAreAtomic(
 		t.Fatalf("corrupt payload should checkpoint blocked: %v", err)
 	}
 	if err := f.store.pool.QueryRow(ctx,
-		`SELECT s.status,a.status
+		`SELECT s.status,a.status,a.blocked_reason
 		   FROM sources s
 		   CROSS JOIN agent_action_continuations a
 		  WHERE s.id=$1 AND a.action_id=$2`,
 		corruptSourceID, corruptActionID,
-	).Scan(&status, &actionStatus); err != nil {
+	).Scan(&status, &actionStatus, &blockReason); err != nil {
 		t.Fatal(err)
 	}
 	if status != string(types.SourceStatusDisabled) ||
-		actionStatus != AgentActionStatusBlocked {
+		actionStatus != AgentActionStatusBlocked ||
+		blockReason != "payload_integrity" {
 		t.Fatalf(
-			"corrupt source/action status=%s/%s",
-			status, actionStatus,
+			"corrupt source/action status/reason=%s/%s/%s",
+			status, actionStatus, blockReason,
 		)
+	}
+	blockedKey, _, err := agentSessionAppendIdentity(
+		"agent-action:enable-source:"+corruptActionID,
+		json.RawMessage(agentActionBlockedSessionMessages),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blockedEvents int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND session_id=$2
+		    AND batch_idempotency_key=$3`,
+		f.tenantA, f.sessionA, blockedKey,
+	).Scan(&blockedEvents); err != nil {
+		t.Fatal(err)
+	}
+	if blockedEvents == 0 {
+		t.Fatal("payload-integrity block terminal fact is absent")
+	}
+	if replay, err := f.store.ConfirmAgentActionContinuation(
+		ctx, f.userA, corruptActionID,
+	); err == nil || replay.Handled {
+		t.Fatalf(
+			"payload-integrity block bypassed frozen validation: %+v err=%v",
+			replay, err,
+		)
+	}
+}
+
+func TestAgentActionTerminalMessageLiteralGolden(t *testing.T) {
+	if agentActionAdapterVersion != "vane.enable-source/postgres/v1" {
+		t.Fatalf(
+			"adapter version=%q want vane.enable-source/postgres/v1",
+			agentActionAdapterVersion,
+		)
+	}
+	for name, test := range map[string]struct {
+		got  string
+		want string
+	}{
+		"cancelled": {
+			got:  agentActionCancelledSessionMessages,
+			want: `[{"role":"user","content":"[卡片回调] 用户已取消重新启用信源；未产生变更。"}]`,
+		},
+		"expired": {
+			got:  agentActionExpiredSessionMessages,
+			want: `[{"role":"user","content":"[卡片回调] 重新启用信源确认卡已过期；未产生变更。"}]`,
+		},
+		"blocked": {
+			got:  agentActionBlockedSessionMessages,
+			want: `[{"role":"user","content":"[卡片回调] 重新启用信源操作已因安全检查停止；未产生额外变更。"}]`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if test.got != test.want {
+				t.Fatalf("terminal message=%q want=%q", test.got, test.want)
+			}
+			var messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			}
+			if err := json.Unmarshal([]byte(test.got), &messages); err != nil {
+				t.Fatalf("terminal message is not valid JSON: %v", err)
+			}
+			if len(messages) != 1 || messages[0].Role != "user" ||
+				messages[0].Content == "" {
+				t.Fatalf("terminal message shape=%+v", messages)
+			}
+		})
 	}
 }
 
@@ -602,6 +720,28 @@ func TestAgentActionContinuationTerminalPathsAndFences(t *testing.T) {
 		}
 		return lease
 	}
+	sessionTerminalEvents := func(
+		actionID, messages string,
+	) int {
+		t.Helper()
+		key, _, err := agentSessionAppendIdentity(
+			"agent-action:enable-source:"+actionID,
+			json.RawMessage(messages),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var events int
+		if err := f.store.pool.QueryRow(ctx,
+			`SELECT count(*) FROM agent_events
+			  WHERE tenant_id=$1 AND session_id=$2
+			    AND batch_idempotency_key=$3`,
+			f.tenantA, f.sessionA, key,
+		).Scan(&events); err != nil {
+			t.Fatal(err)
+		}
+		return events
+	}
 
 	t.Run("cancel and expiry activation replay", func(t *testing.T) {
 		cancelID := create(910001, "cancel replay")
@@ -610,6 +750,27 @@ func TestAgentActionContinuationTerminalPathsAndFences(t *testing.T) {
 		)
 		if err != nil || cancelled.Status != AgentActionStatusCancelled {
 			t.Fatalf("cancel=%+v err=%v", cancelled, err)
+		}
+		cancelEvents := sessionTerminalEvents(
+			cancelID, agentActionCancelledSessionMessages,
+		)
+		if cancelEvents == 0 {
+			t.Fatal("cancelled terminal session fact is absent")
+		}
+		cancelReplay, err := f.store.CancelAgentActionContinuation(
+			ctx, f.userA, cancelID,
+		)
+		if err != nil || !cancelReplay.Replayed ||
+			cancelReplay.Status != AgentActionStatusCancelled {
+			t.Fatalf("cancel replay=%+v err=%v", cancelReplay, err)
+		}
+		if replayEvents := sessionTerminalEvents(
+			cancelID, agentActionCancelledSessionMessages,
+		); replayEvents != cancelEvents {
+			t.Fatalf(
+				"cancel replay duplicated events=%d/%d",
+				cancelEvents, replayEvents,
+			)
 		}
 		if generation, err := f.store.ActivateAgentActionContinuation(
 			ctx, f.tenantA, f.userA, cancelID, "cancel replay",
@@ -631,6 +792,27 @@ func TestAgentActionContinuationTerminalPathsAndFences(t *testing.T) {
 		)
 		if err != nil || expired.Status != AgentActionStatusExpired {
 			t.Fatalf("expire=%+v err=%v", expired, err)
+		}
+		expiredEvents := sessionTerminalEvents(
+			expiredID, agentActionExpiredSessionMessages,
+		)
+		if expiredEvents == 0 {
+			t.Fatal("expired terminal session fact is absent")
+		}
+		expiredReplay, err := f.store.ConfirmAgentActionContinuation(
+			ctx, f.userA, expiredID,
+		)
+		if err != nil || !expiredReplay.Replayed ||
+			expiredReplay.Status != AgentActionStatusExpired {
+			t.Fatalf("expiry replay=%+v err=%v", expiredReplay, err)
+		}
+		if replayEvents := sessionTerminalEvents(
+			expiredID, agentActionExpiredSessionMessages,
+		); replayEvents != expiredEvents {
+			t.Fatalf(
+				"expiry replay duplicated events=%d/%d",
+				expiredEvents, replayEvents,
+			)
 		}
 		if generation, err := f.store.ActivateAgentActionContinuation(
 			ctx, f.tenantA, f.userA, expiredID, "expiry replay",
@@ -681,6 +863,75 @@ func TestAgentActionContinuationTerminalPathsAndFences(t *testing.T) {
 				"confirm drift mutated root/continuation=%s/%s",
 				rootStatus, continuationStatus,
 			)
+		}
+	})
+
+	t.Run("terminal session conflict rolls back decision", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			sourceID int64
+			expire   bool
+		}{
+			{name: "cancel", sourceID: 910006},
+			{name: "expire", sourceID: 910007, expire: true},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				actionID := create(tt.sourceID, tt.name+" conflict")
+				if tt.expire {
+					if _, err := f.store.pool.Exec(ctx,
+						`UPDATE pending_actions
+						    SET expires_at=clock_timestamp()-interval '1 second'
+						  WHERE id=$1`,
+						actionID,
+					); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := f.store.CommitAgentSessionAppend(
+					ctx, f.userA, f.sessionA,
+					"agent-action:enable-source:"+actionID,
+					json.RawMessage(
+						`[{"role":"user","content":"conflicting bytes"}]`,
+					),
+				); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				if tt.expire {
+					_, err = f.store.ConfirmAgentActionContinuation(
+						ctx, f.userA, actionID,
+					)
+				} else {
+					_, err = f.store.CancelAgentActionContinuation(
+						ctx, f.userA, actionID,
+					)
+				}
+				if err == nil {
+					t.Fatal("terminal conflict unexpectedly committed")
+				}
+				var rootStatus, continuationStatus string
+				if err := f.store.pool.QueryRow(ctx,
+					`SELECT p.status,c.status
+					   FROM pending_actions p
+					   JOIN agent_action_continuations c
+					     ON c.action_id=p.id
+					  WHERE p.id=$1`,
+					actionID,
+				).Scan(
+					&rootStatus, &continuationStatus,
+				); err != nil {
+					t.Fatal(err)
+				}
+				if rootStatus !=
+					string(types.PendingActionStatusPending) ||
+					continuationStatus != AgentActionStatusPending {
+					t.Fatalf(
+						"terminal conflict committed=%s/%s",
+						rootStatus, continuationStatus,
+					)
+				}
+			})
 		}
 	})
 
@@ -744,6 +995,147 @@ func TestAgentActionContinuationTerminalPathsAndFences(t *testing.T) {
 		if status != AgentActionStatusBlocked ||
 			reason != "authority_integrity" {
 			t.Fatalf("authority block=%s/%s", status, reason)
+		}
+		if events := sessionTerminalEvents(
+			actionID, agentActionBlockedSessionMessages,
+		); events == 0 {
+			t.Fatal("authority block terminal session fact is absent")
+		}
+		if replay, err := f.store.ConfirmAgentActionContinuation(
+			ctx, f.userA, actionID,
+		); err == nil || replay.Handled {
+			t.Fatalf(
+				"authority-integrity block bypassed authority validation: %+v err=%v",
+				replay, err,
+			)
+		}
+	})
+
+	t.Run("authority damage session conflict blocks without half write", func(t *testing.T) {
+		sourceID := createSource("authority-conflict", f.userA)
+		actionID := create(sourceID, "authority conflict")
+		confirm(actionID)
+		if _, err := f.store.CommitAgentSessionAppend(
+			ctx, f.userA, f.sessionA,
+			"agent-action:enable-source:"+actionID,
+			json.RawMessage(
+				`[{"role":"user","content":"conflicting authority bytes"}]`,
+			),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.pool.Exec(ctx,
+			`DELETE FROM agent_action_continuation_authority_events
+			  WHERE action_id=$1`,
+			actionID,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		type snapshot struct {
+			sessionMessages string
+			sessionEvents   int
+			sourceStatus    string
+			sourceFailCount int
+			sourceUpdatedAt time.Time
+		}
+		readSnapshot := func() snapshot {
+			t.Helper()
+			var got snapshot
+			if err := f.store.pool.QueryRow(ctx,
+				`SELECT s.messages,
+				        (SELECT count(*) FROM agent_events e
+				          WHERE e.tenant_id=$1 AND e.session_id=$2),
+				        src.status,src.fail_count,src.updated_at
+				   FROM agent_sessions s
+				   CROSS JOIN sources src
+				  WHERE s.id=$2 AND s.tenant_id=$1 AND s.user_id=$3
+				    AND src.id=$4`,
+				f.tenantA, f.sessionA, f.userA, sourceID,
+			).Scan(
+				&got.sessionMessages, &got.sessionEvents,
+				&got.sourceStatus, &got.sourceFailCount,
+				&got.sourceUpdatedAt,
+			); err != nil {
+				t.Fatal(err)
+			}
+			return got
+		}
+		before := readSnapshot()
+
+		if _, err := f.store.AcquireAgentActionContinuation(
+			ctx, actionID, f.tenantA, f.userA,
+			"authority-conflict-worker", time.Minute,
+		); !errors.Is(err, ErrAgentActionTerminal) {
+			t.Fatalf("authority conflict acquire err=%v", err)
+		}
+		var actionStatus, blockReason, rootStatus string
+		if err := f.store.pool.QueryRow(ctx,
+			`SELECT c.status,c.blocked_reason,p.status
+			   FROM agent_action_continuations c
+			   JOIN pending_actions p ON p.id=c.action_id
+			  WHERE c.action_id=$1`,
+			actionID,
+		).Scan(
+			&actionStatus, &blockReason, &rootStatus,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if actionStatus != AgentActionStatusBlocked ||
+			blockReason != "projection_integrity" ||
+			rootStatus != string(types.PendingActionStatusExecuted) {
+			t.Fatalf(
+				"authority conflict action/reason/root=%s/%s/%s",
+				actionStatus, blockReason, rootStatus,
+			)
+		}
+		afterBlock := readSnapshot()
+		if afterBlock != before {
+			t.Fatalf(
+				"authority conflict half-wrote session/source\nbefore=%+v\nafter=%+v",
+				before, afterBlock,
+			)
+		}
+
+		replay, err := f.store.ConfirmAgentActionContinuation(
+			ctx, f.userA, actionID,
+		)
+		if err != nil || !replay.Handled || !replay.Replayed ||
+			replay.Status != AgentActionStatusBlocked {
+			t.Fatalf(
+				"projection-integrity callback replay=%+v err=%v",
+				replay, err,
+			)
+		}
+		afterReplay := readSnapshot()
+		if afterReplay != before {
+			t.Fatalf(
+				"projection-integrity replay wrote session/source\nbefore=%+v\nafter=%+v",
+				before, afterReplay,
+			)
+		}
+		if _, err := f.store.pool.Exec(ctx,
+			`UPDATE pending_actions
+			    SET args=jsonb_build_object('source_id',$2::bigint)
+			  WHERE id=$1`,
+			actionID, sourceID+1_000_000,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if replay, err := f.store.ConfirmAgentActionContinuation(
+			ctx, f.userA, actionID,
+		); err == nil || replay.Handled {
+			t.Fatalf(
+				"projection-integrity replay bypassed root args binding: %+v err=%v",
+				replay, err,
+			)
+		}
+		afterRootDrift := readSnapshot()
+		if afterRootDrift != before {
+			t.Fatalf(
+				"rejected projection-integrity root drift wrote session/source\nbefore=%+v\nafter=%+v",
+				before, afterRootDrift,
+			)
 		}
 	})
 

@@ -273,9 +273,11 @@ func (s *Store) GetAgentActionContinuationStatus(
 		}
 		if generation != 2 || route != AgentActionAuthorityLegacy ||
 			action.Status != AgentActionStatusRolledBack ||
-			rootStatus != string(types.PendingActionStatusPending) ||
 			action.ConfirmedAt != nil || action.AttemptCount != 0 ||
-			action.LeaseFence != 0 || action.TerminalCode != nil {
+			action.LeaseOwner != nil || action.LeaseFence != 0 ||
+			action.LeaseExpiresAt != nil || action.TerminalCode != nil ||
+			action.CompletedAt != nil || action.BlockedReason != nil ||
+			!validRolledBackAgentActionRoot(rootStatus) {
 			return AgentActionContinuationStatus{},
 				agentEventIntegrityError()
 		}
@@ -822,7 +824,10 @@ func replayAgentActionRollback(
 ) (int64, error) {
 	if action.Status != AgentActionStatusRolledBack ||
 		action.ConfirmedAt != nil || action.AttemptCount != 0 ||
-		rootStatus != string(types.PendingActionStatusPending) {
+		action.LeaseOwner != nil || action.LeaseFence != 0 ||
+		action.LeaseExpiresAt != nil || action.TerminalCode != nil ||
+		action.CompletedAt != nil || action.BlockedReason != nil ||
+		!validRolledBackAgentActionRoot(rootStatus) {
 		return 0, agentEventIntegrityError()
 	}
 	rows, err := tx.Query(ctx,
@@ -863,6 +868,8 @@ func replayAgentActionRollback(
 		got[0].mode != AgentActionAuthorityDurable ||
 		got[1].generation != 2 ||
 		got[1].mode != AgentActionAuthorityLegacy ||
+		strings.TrimSpace(got[0].evidence) != got[0].evidence ||
+		got[0].evidence == "" || len(got[0].evidence) > 512 ||
 		got[1].evidence != evidence {
 		return 0, agentEventIntegrityError()
 	}
@@ -871,6 +878,18 @@ func replayAgentActionRollback(
 			"commit Agent action rollback replay", err)
 	}
 	return 2, nil
+}
+
+func validRolledBackAgentActionRoot(rootStatus string) bool {
+	switch types.PendingActionStatus(rootStatus) {
+	case types.PendingActionStatusPending,
+		types.PendingActionStatusExecuted,
+		types.PendingActionStatusCancelled,
+		types.PendingActionStatusExpired:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateAgentActionRootBinding(
@@ -1037,6 +1056,24 @@ func (s *Store) decideAgentActionContinuation(
 	if err := validateFrozenAgentAction(action); err != nil {
 		return AgentActionConfirmation{}, err
 	}
+	projectionIntegrityBlock :=
+		action.Status == AgentActionStatusBlocked &&
+			action.BlockedReason != nil &&
+			*action.BlockedReason == "projection_integrity"
+	if projectionIntegrityBlock {
+		if err := validateAgentActionTerminalRoot(
+			action.Status, pendingStatus,
+		); err != nil {
+			return AgentActionConfirmation{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return AgentActionConfirmation{}, agentEventDatabaseError(
+				"commit Agent action projection-integrity replay", err)
+		}
+		return AgentActionConfirmation{
+			Handled: true, Replayed: true, Status: action.Status,
+		}, nil
+	}
 	if err := validateActiveAgentActionAuthority(
 		ctx, tx, actionID,
 	); err != nil {
@@ -1047,6 +1084,17 @@ func (s *Store) decideAgentActionContinuation(
 			action.Status, pendingStatus,
 		); err != nil {
 			return AgentActionConfirmation{}, err
+		}
+		if action.Status != AgentActionStatusConfirmed {
+			if err := commitAgentActionTerminalSessionTx(
+				ctx, tx, action, action.Status, true,
+			); err != nil {
+				return AgentActionConfirmation{}, err
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return AgentActionConfirmation{}, agentEventDatabaseError(
+				"commit Agent action terminal replay", err)
 		}
 		return AgentActionConfirmation{
 			Handled: true, Accepted: action.Status == AgentActionStatusConfirmed ||
@@ -1085,6 +1133,12 @@ func (s *Store) decideAgentActionContinuation(
 		}
 		if tag.RowsAffected() != 1 {
 			return AgentActionConfirmation{}, agentEventIntegrityError()
+		}
+		action.Status = AgentActionStatusCancelled
+		if err := commitAgentActionTerminalSessionTx(
+			ctx, tx, action, action.Status, false,
+		); err != nil {
+			return AgentActionConfirmation{}, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return AgentActionConfirmation{}, agentEventDatabaseError(
@@ -1128,6 +1182,12 @@ func (s *Store) decideAgentActionContinuation(
 		}
 		if tag.RowsAffected() != 1 {
 			return AgentActionConfirmation{}, agentEventIntegrityError()
+		}
+		action.Status = AgentActionStatusExpired
+		if err := commitAgentActionTerminalSessionTx(
+			ctx, tx, action, action.Status, false,
+		); err != nil {
+			return AgentActionConfirmation{}, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return AgentActionConfirmation{}, agentEventDatabaseError(

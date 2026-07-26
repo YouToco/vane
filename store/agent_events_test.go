@@ -1926,6 +1926,9 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 	actionProjection := filepath.Join(
 		storeDir, "agent_action_projection.go",
 	)
+	actionContinuation := filepath.Join(
+		storeDir, "agent_action_continuation.go",
+	)
 	fset := token.NewFileSet()
 	var violations []string
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, walkErr error) error {
@@ -2008,6 +2011,12 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 		} else if filepath.Clean(path) == actionProjection {
 			allowed, err =
 				agentEventLedgerActionProjectionReferences(file)
+			if err != nil {
+				return err
+			}
+		} else if filepath.Clean(path) == actionContinuation {
+			allowed, err =
+				agentEventLedgerActionContinuationReferences(file)
 			if err != nil {
 				return err
 			}
@@ -2297,6 +2306,27 @@ func (s *Store) ProjectAgentActionContinuation() {
 		json.RawMessage(messages), false,
 	)
 	_, _, _, _ = replayed, err, appendErr, effectTx
+}
+func commitAgentActionTerminalSessionTx(
+	ctx, tx any,
+	action actionState,
+	status string,
+	replayOnly bool,
+) {
+	var messages any
+	_, replayed, err := commitAgentSessionAppendTx(
+		ctx, tx, action.TenantID, action.UserID, action.SessionID,
+		"agent-action:enable-source:"+action.ActionID,
+		json.RawMessage(messages), replayOnly,
+	)
+	_, _ = replayed, err
+}
+func stageAgentActionBlockedSessionTx() {
+	var ctx, factTx any
+	var action actionState
+	commitAgentActionTerminalSessionTx(
+		ctx, factTx, action, AgentActionStatusBlocked, false,
+	)
 }`
 	mutations := map[string]string{
 		"method value alias": strings.Replace(
@@ -2327,6 +2357,25 @@ func (s *Store) ProjectAgentActionContinuation() {
 			"_, _, _, _ = replayed, err, appendErr, effectTx",
 			"commitAgentSessionAppendTx()\n"+
 				"\t_, _, _, _ = replayed, err, appendErr, effectTx",
+			1,
+		),
+		"terminal wrapper permits create": strings.Replace(
+			valid,
+			"json.RawMessage(messages), replayOnly,",
+			"json.RawMessage(messages), false,",
+			1,
+		),
+		"blocked stage status drift": strings.Replace(
+			valid,
+			"ctx, factTx, action, AgentActionStatusBlocked, false,",
+			"ctx, factTx, action, action.Status, false,",
+			1,
+		),
+		"blocked stage method value": strings.Replace(
+			valid,
+			"commitAgentActionTerminalSessionTx(\n\t\tctx, factTx",
+			"terminal := commitAgentActionTerminalSessionTx\n"+
+				"\tterminal(\n\t\tctx, factTx",
 			1,
 		),
 	}
@@ -2360,6 +2409,93 @@ func (s *Store) ProjectAgentActionContinuation() {
 			)
 			if boundaryErr == nil && len(violations) == 0 {
 				t.Fatal("mutated action projection boundary passed")
+			}
+		})
+	}
+}
+
+func TestAgentEventLedgerActionContinuationBoundaryRejectsMutations(
+	t *testing.T,
+) {
+	t.Parallel()
+	valid := `package store
+type Store struct{}
+type actionState struct{ Status string }
+func (s *Store) decideAgentActionContinuation() {
+	var ctx, tx any
+	var action actionState
+	commitAgentActionTerminalSessionTx(
+		ctx, tx, action, action.Status, true,
+	)
+	commitAgentActionTerminalSessionTx(
+		ctx, tx, action, action.Status, false,
+	)
+	commitAgentActionTerminalSessionTx(
+		ctx, tx, action, action.Status, false,
+	)
+}`
+	mutations := map[string]string{
+		"method value alias": strings.Replace(
+			valid,
+			"commitAgentActionTerminalSessionTx(\n\t\tctx, tx",
+			"terminal := commitAgentActionTerminalSessionTx\n"+
+				"\tterminal(\n\t\tctx, tx",
+			1,
+		),
+		"replay permits create": strings.Replace(
+			valid, "action.Status, true,", "action.Status, false,", 1,
+		),
+		"create becomes replay": strings.Replace(
+			valid, "action.Status, false,", "action.Status, true,", 1,
+		),
+		"transaction drift": strings.Replace(
+			valid, "ctx, tx, action", "ctx, effectTx, action", 1,
+		),
+		"action drift": strings.Replace(
+			valid, "ctx, tx, action, action.Status",
+			"ctx, tx, lease.Action, action.Status", 1,
+		),
+		"status drift": strings.Replace(
+			valid, "action, action.Status, true,",
+			"action, AgentActionStatusCompleted, true,", 1,
+		),
+		"fourth helper call": strings.Replace(
+			valid,
+			"\n}",
+			"\n\tcommitAgentActionTerminalSessionTx()\n}",
+			1,
+		),
+	}
+	parse := func(t *testing.T, source string) *ast.File {
+		t.Helper()
+		file, err := parser.ParseFile(
+			token.NewFileSet(), "agent_action_continuation.go", source, 0,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return file
+	}
+	validFile := parse(t, valid)
+	allowed, err := agentEventLedgerActionContinuationReferences(validFile)
+	if err != nil {
+		t.Fatalf("valid exact boundary: %v", err)
+	}
+	if violations := agentEventLedgerForbiddenReferences(
+		token.NewFileSet(), validFile, allowed,
+	); len(violations) != 0 {
+		t.Fatalf("valid exact boundary violations=%v", violations)
+	}
+	for name, source := range mutations {
+		t.Run(name, func(t *testing.T) {
+			file := parse(t, source)
+			allowed, boundaryErr :=
+				agentEventLedgerActionContinuationReferences(file)
+			violations := agentEventLedgerForbiddenReferences(
+				token.NewFileSet(), file, allowed,
+			)
+			if boundaryErr == nil && len(violations) == 0 {
+				t.Fatal("mutated action continuation boundary passed")
 			}
 		})
 	}
@@ -2703,6 +2839,7 @@ func agentEventLedgerForbiddenReferences(
 		"CommitAgentSessionAppend":                  {},
 		"AppendAgentSessionMessages":                {},
 		"commitAgentSessionAppendTx":                {},
+		"commitAgentActionTerminalSessionTx":        {},
 		"UpdateAgentSession":                        {},
 		"agentSessionProjectionLedgerAuthoritative": {},
 		"GetAgentSessionProjectionAuthorityStatus":  {},
@@ -3097,40 +3234,62 @@ func agentEventLedgerReceiptHelperReferences(
 func agentEventLedgerActionProjectionReferences(
 	file *ast.File,
 ) (map[token.Pos]struct{}, error) {
-	const functionName = "ProjectAgentActionContinuation"
-	var target *ast.FuncDecl
+	var project, terminal, stage *ast.FuncDecl
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
-		if !ok || function.Name.Name != functionName {
+		if !ok {
 			continue
 		}
-		if target != nil {
-			return nil, errors.New(
-				"Agent action projection boundary is duplicated",
-			)
+		switch function.Name.Name {
+		case "ProjectAgentActionContinuation":
+			if project != nil {
+				return nil, errors.New(
+					"Agent action projection boundary is duplicated",
+				)
+			}
+			project = function
+		case "commitAgentActionTerminalSessionTx":
+			if terminal != nil {
+				return nil, errors.New(
+					"Agent action terminal append boundary is duplicated",
+				)
+			}
+			terminal = function
+		case "stageAgentActionBlockedSessionTx":
+			if stage != nil {
+				return nil, errors.New(
+					"Agent action blocked append boundary is duplicated",
+				)
+			}
+			stage = function
 		}
-		target = function
 	}
-	if target == nil || target.Body == nil ||
-		target.Recv == nil || len(target.Recv.List) != 1 ||
-		!agentEventLedgerStoreReceiver(target.Recv.List[0].Type) {
+	if project == nil || project.Body == nil ||
+		project.Recv == nil || len(project.Recv.List) != 1 ||
+		!agentEventLedgerStoreReceiver(project.Recv.List[0].Type) {
 		return nil, errors.New(
 			"Agent action projection boundary must remain a Store method",
 		)
 	}
+	if terminal == nil || terminal.Body == nil || terminal.Recv != nil {
+		return nil, errors.New(
+			"Agent action terminal append boundary must remain a package helper",
+		)
+	}
+	if stage == nil || stage.Body == nil || stage.Recv != nil {
+		return nil, errors.New(
+			"Agent action blocked append boundary must remain a package helper",
+		)
+	}
 
-	allowed := make(map[token.Pos]struct{}, 2)
-	references := 0
+	allowed := make(map[token.Pos]struct{}, 5)
+	allowed[terminal.Name.Pos()] = struct{}{}
 	calls := map[string]int{
 		"tx:true":        0,
 		"effectTx:false": 0,
 	}
 	var boundaryErr error
-	ast.Inspect(target.Body, func(node ast.Node) bool {
-		identifier, ok := node.(*ast.Ident)
-		if ok && identifier.Name == "commitAgentSessionAppendTx" {
-			references++
-		}
+	ast.Inspect(project.Body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -3163,15 +3322,166 @@ func agentEventLedgerActionProjectionReferences(
 	if boundaryErr != nil {
 		return nil, boundaryErr
 	}
-	if references != 2 || len(allowed) != 2 ||
-		calls["tx:true"] != 1 || calls["effectTx:false"] != 1 {
+	if calls["tx:true"] != 1 || calls["effectTx:false"] != 1 {
 		return nil, fmt.Errorf(
-			"Agent action append refs/allowed/replay/effect=%d/%d/%d/%d, want 2/2/1/1",
-			references, len(allowed), calls["tx:true"],
-			calls["effectTx:false"],
+			"Agent action append replay/effect=%d/%d, want 1/1",
+			calls["tx:true"], calls["effectTx:false"],
+		)
+	}
+
+	terminalCalls := 0
+	ast.Inspect(terminal.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		helper, ok := call.Fun.(*ast.Ident)
+		if !ok || helper.Name != "commitAgentSessionAppendTx" {
+			return true
+		}
+		terminalCalls++
+		if len(call.Args) != 8 ||
+			agentEventLedgerIdent(call.Args[1]) != "tx" ||
+			agentEventLedgerIdent(call.Args[7]) != "replayOnly" ||
+			!agentEventLedgerActionAppendScope(call.Args) {
+			boundaryErr = errors.New(
+				"Agent action terminal append escaped exact scope",
+			)
+			return true
+		}
+		allowed[helper.Pos()] = struct{}{}
+		return true
+	})
+	if boundaryErr != nil {
+		return nil, boundaryErr
+	}
+	if terminalCalls != 1 {
+		return nil, fmt.Errorf(
+			"Agent action terminal append calls=%d, want 1",
+			terminalCalls,
+		)
+	}
+
+	stageCalls := 0
+	ast.Inspect(stage.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		helper, ok := call.Fun.(*ast.Ident)
+		if !ok || helper.Name != "commitAgentActionTerminalSessionTx" {
+			return true
+		}
+		stageCalls++
+		if !agentEventLedgerTerminalActionCallScope(
+			call.Args, "factTx", "AgentActionStatusBlocked", "false",
+		) {
+			boundaryErr = errors.New(
+				"Agent action blocked append escaped exact scope",
+			)
+			return true
+		}
+		allowed[helper.Pos()] = struct{}{}
+		return true
+	})
+	if boundaryErr != nil {
+		return nil, boundaryErr
+	}
+	if stageCalls != 1 || len(allowed) != 5 {
+		return nil, fmt.Errorf(
+			"Agent action append allowed/stage=%d/%d, want 5/1",
+			len(allowed), stageCalls,
 		)
 	}
 	return allowed, nil
+}
+
+func agentEventLedgerActionContinuationReferences(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	const functionName = "decideAgentActionContinuation"
+	var target *ast.FuncDecl
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != functionName {
+			continue
+		}
+		if target != nil {
+			return nil, errors.New(
+				"Agent action continuation boundary is duplicated",
+			)
+		}
+		target = function
+	}
+	if target == nil || target.Body == nil ||
+		target.Recv == nil || len(target.Recv.List) != 1 ||
+		!agentEventLedgerStoreReceiver(target.Recv.List[0].Type) {
+		return nil, errors.New(
+			"Agent action continuation boundary must remain a Store method",
+		)
+	}
+
+	allowed := make(map[token.Pos]struct{}, 3)
+	calls := map[string]int{
+		"true":  0,
+		"false": 0,
+	}
+	var boundaryErr error
+	ast.Inspect(target.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		helper, ok := call.Fun.(*ast.Ident)
+		if !ok || helper.Name != "commitAgentActionTerminalSessionTx" {
+			return true
+		}
+		replayOnly := ""
+		if len(call.Args) == 5 {
+			replayOnly = agentEventLedgerIdent(call.Args[4])
+		}
+		if _, expected := calls[replayOnly]; !expected ||
+			!agentEventLedgerTerminalActionCallScope(
+				call.Args, "tx", "action.Status", replayOnly,
+			) {
+			boundaryErr = fmt.Errorf(
+				"Agent action continuation terminal append escaped exact scope: replay=%s",
+				replayOnly,
+			)
+			return true
+		}
+		calls[replayOnly]++
+		allowed[helper.Pos()] = struct{}{}
+		return true
+	})
+	if boundaryErr != nil {
+		return nil, boundaryErr
+	}
+	if len(allowed) != 3 || calls["true"] != 1 || calls["false"] != 2 {
+		return nil, fmt.Errorf(
+			"Agent action continuation terminal append allowed/replay/create=%d/%d/%d, want 3/1/2",
+			len(allowed), calls["true"], calls["false"],
+		)
+	}
+	return allowed, nil
+}
+
+func agentEventLedgerTerminalActionCallScope(
+	args []ast.Expr,
+	transaction, status, replayOnly string,
+) bool {
+	if len(args) != 5 ||
+		agentEventLedgerIdent(args[0]) != "ctx" ||
+		agentEventLedgerIdent(args[1]) != transaction ||
+		agentEventLedgerIdent(args[2]) != "action" ||
+		agentEventLedgerIdent(args[4]) != replayOnly {
+		return false
+	}
+	if strings.Contains(status, ".") {
+		parts := strings.SplitN(status, ".", 2)
+		return agentEventLedgerSelector(args[3], parts[0], parts[1])
+	}
+	return agentEventLedgerIdent(args[3]) == status
 }
 
 func agentEventLedgerActionAppendScope(args []ast.Expr) bool {
