@@ -14,6 +14,11 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+const (
+	agentSessionFactAdmissionClass = 1447120453 // "VANE"
+	agentSessionFactAdmissionKey   = 1095976527 // "ASFO"
+)
+
 // validFeedbackActions 是 feedbacks.action 的合法取值全集（与 types 枚举对齐，
 // 001 沿用"枚举由应用层校验、不建 CHECK"的约定，这里就是那道应用层校验）。
 var validFeedbackActions = map[types.FeedbackAction]bool{
@@ -63,6 +68,15 @@ func (s *Store) InsertFeedbackWithSessionCutoff(
 			types.CodeDatabase, "开始反馈事实事务", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock($1,$2)
+		   /* agent session fact producer/downgrade admission */`,
+		agentSessionFactAdmissionClass,
+		agentSessionFactAdmissionKey,
+	); err != nil {
+		return 0, types.NewAppError(
+			types.CodeDatabase, "acquire feedback fact admission", err)
+	}
 
 	var tenantID int64
 	if err := tx.QueryRow(ctx,
@@ -75,7 +89,8 @@ func (s *Store) InsertFeedbackWithSessionCutoff(
 		return 0, err
 	}
 
-	id, inserted, err := insertFeedbackFact(ctx, tx, tenantID, f)
+	id, inserted, frozenReason, frozenDetail, err := insertFeedbackFact(
+		ctx, tx, tenantID, f)
 	if err != nil {
 		return 0, err
 	}
@@ -104,10 +119,30 @@ func (s *Store) InsertFeedbackWithSessionCutoff(
 				 )
 				 ON CONFLICT (feedback_id) DO NOTHING`,
 			tenantID, f.UserID, id, f.DeliveryID,
-			f.ReasonCode, f.Detail,
+			frozenReason, frozenDetail,
 		); err != nil {
 			return 0, types.NewAppError(types.CodeDatabase,
 				"enqueue feedback freshness triage", err)
+		}
+		var storedReason types.FeedbackReason
+		var storedDetail, auditReason, auditDetail string
+		if err := tx.QueryRow(ctx,
+			`SELECT reason_code,detail,
+			        audit_json->>'reason_code',audit_json->>'detail'
+			   FROM feedback_freshness_triage
+			  WHERE tenant_id=$1 AND user_id=$2
+			    AND feedback_id=$3 AND delivery_id=$4`,
+			tenantID, f.UserID, id, f.DeliveryID,
+		).Scan(
+			&storedReason, &storedDetail, &auditReason, &auditDetail,
+		); err != nil {
+			return 0, types.NewAppError(types.CodeDatabase,
+				"load frozen feedback freshness triage", err)
+		}
+		if storedReason != frozenReason || storedDetail != frozenDetail ||
+			auditReason != string(frozenReason) ||
+			auditDetail != frozenDetail {
+			return 0, agentEventIntegrityError()
 		}
 	}
 	if inserted {
@@ -132,7 +167,13 @@ func insertFeedbackFact(
 	tx pgx.Tx,
 	tenantID int64,
 	f *types.Feedback,
-) (id int64, inserted bool, err error) {
+) (
+	id int64,
+	inserted bool,
+	frozenReason types.FeedbackReason,
+	frozenDetail string,
+	err error,
+) {
 	if f.Action == types.FeedbackActionMisjudged {
 		err = tx.QueryRow(ctx,
 			`INSERT INTO feedbacks (
@@ -147,18 +188,22 @@ func insertFeedbackFact(
 		).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			err = tx.QueryRow(ctx,
-				`SELECT id FROM feedbacks
+				`SELECT id,reason_code,detail FROM feedbacks
 				  WHERE delivery_id=$1 AND action='misjudged'
 				    AND reason_code IS NOT NULL`,
 				f.DeliveryID,
-			).Scan(&id)
+			).Scan(&id, &frozenReason, &frozenDetail)
 			if err != nil {
-				return 0, false, types.NewAppError(
+				return 0, false, "", "", types.NewAppError(
 					types.CodeDatabase,
 					"load existing problem feedback", err)
 			}
-			return id, false, nil
+			if !frozenReason.Valid() {
+				return 0, false, "", "", agentEventIntegrityError()
+			}
+			return id, false, frozenReason, frozenDetail, nil
 		}
+		frozenReason, frozenDetail = f.ReasonCode, f.Detail
 	} else {
 		err = tx.QueryRow(ctx,
 			`INSERT INTO feedbacks (
@@ -171,11 +216,11 @@ func insertFeedbackFact(
 		).Scan(&id)
 	}
 	if err != nil {
-		return 0, false, types.NewAppError(types.CodeDatabase,
+		return 0, false, "", "", types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("插入反馈（delivery=%d, action=%s）",
 				f.DeliveryID, f.Action), err)
 	}
-	return id, true, nil
+	return id, true, frozenReason, frozenDetail, nil
 }
 
 func enqueueAgentSessionFeedbackFact(

@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -160,6 +162,94 @@ func TestAgentSessionFactFeedbackFreezesExactSessionAndReplays(
 		t, f.store, laterSessionID, feedbackID, false)
 }
 
+func TestAgentSessionFactCompletedReplayNeverReconstructsMissingBatch(
+	t *testing.T,
+) {
+	f := newAgentSessionFactFixture(t)
+	feedbackID := f.insertFeedback(t, types.FeedbackActionInterested)
+	fact := f.loadFact(t, feedbackID)
+	lease := acquireFact(t, f, fact, "fact-completed-missing")
+	if err := f.store.ProjectAgentSessionFact(t.Context(), lease); err != nil {
+		t.Fatal(err)
+	}
+	key, _, err := agentSessionAppendIdentity(
+		lease.Source, json.RawMessage(lease.Messages))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(t.Context(),
+		`DELETE FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+		    AND batch_idempotency_key=$4`,
+		lease.TenantID, lease.UserID, lease.SessionID, key,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ProjectAgentSessionFact(
+		t.Context(), lease,
+	); !errors.Is(err, types.ErrInternal) {
+		t.Fatalf("missing completed replay evidence err=%v", err)
+	}
+	var events int
+	if err := f.store.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+		    AND batch_idempotency_key=$4`,
+		lease.TenantID, lease.UserID, lease.SessionID, key,
+	).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 {
+		t.Fatalf("completed replay reconstructed %d events", events)
+	}
+	if got := f.loadFact(t, feedbackID).Status; got !=
+		AgentSessionFactStatusCompleted {
+		t.Fatalf("completed checkpoint changed to %q", got)
+	}
+}
+
+func TestAgentSessionFactCompletedReplayRejectsDamagedBatch(
+	t *testing.T,
+) {
+	f := newAgentSessionFactFixture(t)
+	feedbackID := f.insertFeedback(t, types.FeedbackActionInterested)
+	fact := f.loadFact(t, feedbackID)
+	lease := acquireFact(t, f, fact, "fact-completed-damaged")
+	if err := f.store.ProjectAgentSessionFact(t.Context(), lease); err != nil {
+		t.Fatal(err)
+	}
+	key, _, err := agentSessionAppendIdentity(
+		lease.Source, json.RawMessage(lease.Messages))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(t.Context(),
+		`UPDATE agent_events SET payload_digest=repeat('a',64)
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+		    AND batch_idempotency_key=$4 AND batch_index=0`,
+		lease.TenantID, lease.UserID, lease.SessionID, key,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ProjectAgentSessionFact(
+		t.Context(), lease,
+	); !errors.Is(err, types.ErrInternal) {
+		t.Fatalf("damaged completed replay evidence err=%v", err)
+	}
+	var digest string
+	if err := f.store.pool.QueryRow(t.Context(),
+		`SELECT payload_digest FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+		    AND batch_idempotency_key=$4 AND batch_index=0`,
+		lease.TenantID, lease.UserID, lease.SessionID, key,
+	).Scan(&digest); err != nil {
+		t.Fatal(err)
+	}
+	if digest != strings.Repeat("a", 64) {
+		t.Fatalf("completed replay rewrote damaged digest=%q", digest)
+	}
+}
+
 func TestAgentSessionFactOutboxFailureRollsBackFeedback(t *testing.T) {
 	f := newAgentSessionFactFixture(t)
 	faultStore := *f.store
@@ -197,6 +287,80 @@ func TestAgentSessionFactOutboxFailureRollsBackFeedback(t *testing.T) {
 	}
 	if feedbacks != 0 || facts != 0 {
 		t.Fatalf("atomic rollback feedbacks=%d facts=%d", feedbacks, facts)
+	}
+}
+
+func TestAgentSessionFactAppendFailureRollsBackSavepointBeforeBlock(
+	t *testing.T,
+) {
+	f := newAgentSessionFactFixture(t)
+	ctx := t.Context()
+	for _, statement := range []string{
+		`CREATE FUNCTION m056_corrupt_second_event()
+		   RETURNS trigger LANGUAGE plpgsql AS $$
+		   BEGIN
+		     IF NEW.batch_index = 1 AND
+		        NEW.batch_idempotency_key LIKE 'side.%' THEN
+		       NEW.payload_digest := repeat('a',64);
+		     END IF;
+		     RETURN NEW;
+		   END $$`,
+		`CREATE TRIGGER m056_corrupt_second_event
+		   BEFORE INSERT ON agent_events
+		   FOR EACH ROW EXECUTE FUNCTION m056_corrupt_second_event()`,
+	} {
+		if _, err := f.store.pool.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		cleanupExec(context.Background(), t, f.store,
+			`DROP TRIGGER IF EXISTS m056_corrupt_second_event
+			   ON agent_events`)
+		cleanupExec(context.Background(), t, f.store,
+			`DROP FUNCTION IF EXISTS m056_corrupt_second_event()`)
+	})
+
+	feedbackID := f.insertFeedback(t, types.FeedbackActionInterested)
+	fact := f.loadFact(t, feedbackID)
+	lease := acquireFact(t, f, fact, "fact-savepoint-rollback")
+	key, _, err := agentSessionAppendIdentity(
+		lease.Source, json.RawMessage(lease.Messages))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeMessages []byte
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT messages FROM agent_sessions WHERE id=$1`,
+		lease.SessionID,
+	).Scan(&beforeMessages); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ProjectAgentSessionFact(ctx, lease); err != nil {
+		t.Fatalf("post-write integrity failure must checkpoint blocked: %v", err)
+	}
+	blocked := f.loadFact(t, feedbackID)
+	if blocked.Status != AgentSessionFactStatusBlocked ||
+		blocked.BlockedReason == nil ||
+		*blocked.BlockedReason != "projection_integrity" {
+		t.Fatalf("blocked fact=%+v", blocked)
+	}
+	var events int
+	var afterMessages []byte
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT
+		    (SELECT count(*) FROM agent_events
+		      WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+		        AND batch_idempotency_key=$4),
+		    (SELECT messages FROM agent_sessions WHERE id=$3)`,
+		lease.TenantID, lease.UserID, lease.SessionID, key,
+	).Scan(&events, &afterMessages); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 || string(afterMessages) != string(beforeMessages) {
+		t.Fatalf(
+			"savepoint leaked helper writes events=%d before=%s after=%s",
+			events, beforeMessages, afterMessages)
 	}
 }
 
@@ -428,6 +592,8 @@ func TestAgentSessionFactLegacyMisjudgedReplayDoesNotCreateOutbox(
 		t.Fatalf("misjudged replay id=%d want=%d", replayedID, firstID)
 	}
 	var feedbacks, facts, triage int
+	var triageReason, triageDetail, triageOutcome string
+	var auditReason, auditDetail string
 	if err := f.store.pool.QueryRow(t.Context(),
 		`SELECT
 		    (SELECT count(*) FROM feedbacks
@@ -437,15 +603,37 @@ func TestAgentSessionFactLegacyMisjudgedReplayDoesNotCreateOutbox(
 		      WHERE tenant_id=$1 AND fact_type='feedback'
 		        AND fact_id=$3),
 		    (SELECT count(*) FROM feedback_freshness_triage
+		      WHERE tenant_id=$1 AND feedback_id=$3),
+		    (SELECT reason_code FROM feedback_freshness_triage
+		      WHERE tenant_id=$1 AND feedback_id=$3),
+		    (SELECT detail FROM feedback_freshness_triage
+		      WHERE tenant_id=$1 AND feedback_id=$3),
+		    (SELECT outcome FROM feedback_freshness_triage
+		      WHERE tenant_id=$1 AND feedback_id=$3),
+		    (SELECT audit_json->>'reason_code'
+		       FROM feedback_freshness_triage
+		      WHERE tenant_id=$1 AND feedback_id=$3),
+		    (SELECT audit_json->>'detail'
+		       FROM feedback_freshness_triage
 		      WHERE tenant_id=$1 AND feedback_id=$3)`,
 		f.tenantA, f.deliveryID, firstID,
-	).Scan(&feedbacks, &facts, &triage); err != nil {
+	).Scan(
+		&feedbacks, &facts, &triage,
+		&triageReason, &triageDetail, &triageOutcome,
+		&auditReason, &auditDetail,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if feedbacks != 1 || facts != 1 || triage != 1 {
+	if feedbacks != 1 || facts != 1 || triage != 1 ||
+		triageReason != string(types.FeedbackReasonOther) ||
+		triageDetail != "first" || triageOutcome != "manual_review" ||
+		auditReason != triageReason || auditDetail != triageDetail {
 		t.Fatalf(
-			"feedbacks=%d facts=%d triage=%d want=1/1/1",
-			feedbacks, facts, triage)
+			"feedbacks=%d facts=%d triage=%d reason=%q detail=%q "+
+				"outcome=%q audit_reason=%q audit_detail=%q",
+			feedbacks, facts, triage,
+			triageReason, triageDetail, triageOutcome,
+			auditReason, auditDetail)
 	}
 }
 

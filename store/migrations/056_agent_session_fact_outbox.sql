@@ -217,6 +217,9 @@ GRANT UPDATE (
 
 -- +goose Down
 
+SELECT pg_advisory_xact_lock(1447120453,1095976527)
+    /* agent session fact producer/downgrade admission */;
+
 LOCK TABLE agent_session_fact_outbox IN ACCESS EXCLUSIVE MODE
     /* migration 056 downgrade fence: projector/purge lock order first */;
 LOCK TABLE agent_sessions IN ACCESS EXCLUSIVE MODE

@@ -379,11 +379,45 @@ func (s *Store) ProjectAgentSessionFact(
 		}
 	}
 
-	_, _, appendErr := commitAgentSessionAppendTx(
-		ctx, tx, lease.TenantID, lease.UserID, lease.SessionID,
-		lease.Source, json.RawMessage(lease.Messages), false,
+	replayOnly := fact.Status == AgentSessionFactStatusCompleted
+	appendTarget := pgx.Tx(tx)
+	var appendSavepoint pgx.Tx
+	if !replayOnly {
+		appendSavepoint, err = tx.Begin(ctx)
+		if err != nil {
+			return agentEventDatabaseError(
+				"begin agent session fact append savepoint", err)
+		}
+		appendTarget = appendSavepoint
+	}
+	_, replayed, appendErr := commitAgentSessionAppendTx(
+		ctx, appendTarget, lease.TenantID, lease.UserID, lease.SessionID,
+		lease.Source, json.RawMessage(lease.Messages), replayOnly,
 	)
+	if replayOnly {
+		if appendErr != nil {
+			return appendErr
+		}
+		if !replayed {
+			return agentEventIntegrityError()
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return agentEventDatabaseError(
+				"commit agent session fact exact replay", err)
+		}
+		return nil
+	}
 	if appendErr != nil {
+		if rollbackErr := appendSavepoint.Rollback(
+			context.WithoutCancel(ctx),
+		); rollbackErr != nil {
+			return errors.Join(
+				appendErr,
+				agentEventDatabaseError(
+					"rollback invalid agent session fact append",
+					rollbackErr),
+			)
+		}
 		if !agentSessionFactShouldBlock(appendErr) {
 			return appendErr
 		}
@@ -411,12 +445,9 @@ func (s *Store) ProjectAgentSessionFact(
 		}
 		return nil
 	}
-	if fact.Status == AgentSessionFactStatusCompleted {
-		if err := tx.Commit(ctx); err != nil {
-			return agentEventDatabaseError(
-				"commit agent session fact exact replay", err)
-		}
-		return nil
+	if err := appendSavepoint.Commit(ctx); err != nil {
+		return agentEventDatabaseError(
+			"release agent session fact append savepoint", err)
 	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE agent_session_fact_outbox
@@ -565,10 +596,231 @@ func setAgentSessionFactProjectorContext(
 	tx pgx.Tx,
 	tenantID int64,
 ) error {
+	if err := validateAgentSessionFactProjector(ctx, tx); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx,
 		`SET LOCAL ROLE vane_agent_session_fact_projector`); err != nil {
 		return agentEventDatabaseError(
 			"enter agent session fact projector role", err)
 	}
 	return setAgentEventTenantContext(ctx, tx, tenantID)
+}
+
+// validateAgentSessionFactProjector re-proves the entire projector role
+// boundary before every Acquire/Project/Release mutation. Cluster role and ACL
+// drift after migration is therefore fail-closed at the write boundary.
+func validateAgentSessionFactProjector(
+	ctx context.Context,
+	tx pgx.Tx,
+) error {
+	var valid bool
+	err := tx.QueryRow(ctx, `
+		SELECT
+		  NOT op.rolsuper AND NOT op.rolcreatedb AND NOT op.rolcreaterole AND
+		  NOT op.rolcanlogin AND NOT op.rolinherit AND NOT op.rolreplication AND
+		  NOT op.rolbypassrls AND
+		  op.rolconfig =
+		    ARRAY['search_path=pg_catalog, public']::TEXT[] AND
+		  pg_has_role(CURRENT_USER, op.oid, 'SET') AND
+		  NOT pg_has_role('vane_app', op.oid, 'MEMBER') AND
+		  NOT pg_has_role(op.oid, 'vane_app', 'MEMBER') AND
+		  has_schema_privilege(op.oid, 'public', 'USAGE') AND
+		  NOT has_schema_privilege(op.oid, 'public', 'CREATE') AND
+		  NOT EXISTS (
+		    SELECT 1
+		      FROM pg_namespace n
+		     WHERE n.nspname <> 'public'
+		       AND n.nspname <> 'information_schema'
+		       AND n.nspname NOT LIKE 'pg_%'
+		       AND (
+		         n.nspowner = op.oid OR
+		         has_schema_privilege(op.oid, n.oid, 'USAGE') OR
+		         has_schema_privilege(op.oid, n.oid, 'CREATE')
+		       )
+		  ) AND
+		  has_table_privilege(op.oid, 'agent_events', 'SELECT') AND
+		  has_table_privilege(
+		    op.oid, 'agent_session_projection_authority_events', 'SELECT'
+		  ) AND
+		  has_table_privilege(
+		    op.oid, 'agent_session_fact_outbox', 'SELECT'
+		  ) AND
+		  ARRAY(
+		    SELECT a.attname::TEXT
+		      FROM pg_attribute a
+		     WHERE a.attrelid = 'agent_sessions'::regclass
+		       AND a.attnum > 0 AND NOT a.attisdropped
+		       AND has_column_privilege(
+		             op.oid, a.attrelid, a.attname, 'SELECT'
+		           )
+		     ORDER BY a.attname
+		  ) = ARRAY[
+		    'activated_tools','id','messages','tenant_id','turn_count','user_id'
+		  ]::TEXT[] AND
+		  ARRAY(
+		    SELECT a.attname::TEXT
+		      FROM pg_attribute a
+		     WHERE a.attrelid = 'agent_events'::regclass
+		       AND a.attnum > 0 AND NOT a.attisdropped
+		       AND has_column_privilege(
+		             op.oid, a.attrelid, a.attname, 'INSERT'
+		           )
+		     ORDER BY a.attname
+		  ) = ARRAY[
+		    'batch_digest','batch_idempotency_key','batch_index','batch_size',
+		    'kind','payload','payload_digest','schema_version','sequence',
+		    'session_id','tenant_id','user_id'
+		  ]::TEXT[] AND
+		  ARRAY(
+		    SELECT a.attname::TEXT
+		      FROM pg_attribute a
+		     WHERE a.attrelid = 'agent_session_fact_outbox'::regclass
+		       AND a.attnum > 0 AND NOT a.attisdropped
+		       AND has_column_privilege(
+		             op.oid, a.attrelid, a.attname, 'UPDATE'
+		           )
+		     ORDER BY a.attname
+		  ) = ARRAY[
+		    'attempt_count','blocked_reason','lease_expires_at','lease_fence',
+		    'lease_owner','next_attempt_at','session_recorded_at','status',
+		    'updated_at'
+		  ]::TEXT[] AND
+		  ARRAY(
+		    SELECT a.attname::TEXT
+		      FROM pg_attribute a
+		     WHERE a.attrelid = 'agent_sessions'::regclass
+		       AND a.attnum > 0 AND NOT a.attisdropped
+		       AND has_column_privilege(
+		             op.oid, a.attrelid, a.attname, 'UPDATE'
+		           )
+		     ORDER BY a.attname
+		  ) = ARRAY['messages']::TEXT[] AND
+		  NOT EXISTS (
+		    SELECT 1
+		      FROM pg_class c
+		      JOIN pg_namespace n ON n.oid = c.relnamespace
+		     WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v','m','f')
+		       AND (
+		         has_table_privilege(
+		           op.oid, c.oid,
+		           'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+		         ) OR (
+		           has_table_privilege(op.oid, c.oid, 'SELECT') AND
+		           c.oid NOT IN (
+		             'agent_events'::regclass,
+		             'agent_session_projection_authority_events'::regclass,
+		             'agent_session_fact_outbox'::regclass
+		           )
+		         )
+		       )
+		  ) AND
+		  NOT EXISTS (
+		    SELECT 1
+		      FROM pg_attribute a
+		      JOIN pg_class c ON c.oid = a.attrelid
+		      JOIN pg_namespace n ON n.oid = c.relnamespace
+		     WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v','m','f')
+		       AND a.attnum > 0 AND NOT a.attisdropped
+		       AND has_column_privilege(op.oid, a.attrelid, a.attname, 'SELECT')
+		       AND NOT (
+		         c.oid IN (
+		           'agent_events'::regclass,
+		           'agent_session_projection_authority_events'::regclass,
+		           'agent_session_fact_outbox'::regclass
+		         ) OR (
+		           c.oid = 'agent_sessions'::regclass AND
+		           a.attname IN (
+		             'activated_tools','id','messages',
+		             'tenant_id','turn_count','user_id'
+		           )
+		         )
+		       )
+		  ) AND
+		  NOT EXISTS (
+		    SELECT 1
+		      FROM pg_attribute a
+		      JOIN pg_class c ON c.oid = a.attrelid
+		      JOIN pg_namespace n ON n.oid = c.relnamespace
+		     WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v','m','f')
+		       AND a.attnum > 0 AND NOT a.attisdropped
+		       AND has_column_privilege(op.oid, a.attrelid, a.attname, 'INSERT')
+		       AND NOT (
+		         c.oid = 'agent_events'::regclass AND
+		         a.attname IN (
+		           'batch_digest','batch_idempotency_key','batch_index',
+		           'batch_size','kind','payload','payload_digest',
+		           'schema_version','sequence','session_id','tenant_id','user_id'
+		         )
+		       )
+		  ) AND
+		  NOT EXISTS (
+		    SELECT 1
+		      FROM pg_attribute a
+		      JOIN pg_class c ON c.oid = a.attrelid
+		      JOIN pg_namespace n ON n.oid = c.relnamespace
+		     WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v','m','f')
+		       AND a.attnum > 0 AND NOT a.attisdropped
+		       AND has_column_privilege(op.oid, a.attrelid, a.attname, 'UPDATE')
+		       AND NOT (
+		         (c.oid = 'agent_sessions'::regclass AND
+		          a.attname = 'messages') OR
+		         (c.oid = 'agent_session_fact_outbox'::regclass AND
+		          a.attname IN (
+		            'attempt_count','blocked_reason','lease_expires_at',
+		            'lease_fence','lease_owner','next_attempt_at',
+		            'session_recorded_at','status','updated_at'
+		          ))
+		       )
+		  ) AND
+		  has_sequence_privilege(
+		    op.oid, 'agent_events_id_seq', 'USAGE'
+		  ) AND
+		  NOT has_sequence_privilege(
+		    op.oid, 'agent_events_id_seq', 'SELECT,UPDATE'
+		  ) AND
+		  NOT EXISTS (
+		    SELECT 1
+		      FROM pg_class c
+		      JOIN pg_namespace n ON n.oid = c.relnamespace
+		     WHERE n.nspname = 'public'
+		       AND c.oid <> 'agent_events_id_seq'::regclass
+		       AND CASE
+		             WHEN c.relkind = 'S' THEN has_sequence_privilege(
+		               op.oid, c.oid, 'USAGE,SELECT,UPDATE'
+		             )
+		             ELSE FALSE
+		           END
+		  ) AND
+		  NOT EXISTS (
+		    SELECT 1
+		      FROM pg_proc p
+		      JOIN pg_namespace n ON n.oid = p.pronamespace
+		     WHERE n.nspname = 'public' AND p.prosecdef
+		       AND has_function_privilege(op.oid, p.oid, 'EXECUTE')
+		  ) AND
+		  NOT EXISTS (
+		    SELECT 1
+		      FROM pg_auth_members am
+		     WHERE am.roleid = op.oid
+		       AND am.member <> (SELECT oid FROM pg_roles
+		                           WHERE rolname = CURRENT_USER)
+		  ) AND
+		  EXISTS (
+		    SELECT 1
+		      FROM pg_auth_members am
+		     WHERE am.roleid = op.oid
+		       AND am.member = (SELECT oid FROM pg_roles
+		                          WHERE rolname = CURRENT_USER)
+		  ) AND
+		  NOT EXISTS (
+		    SELECT 1 FROM pg_auth_members am WHERE am.member = op.oid
+		  )
+		  FROM pg_roles op
+		 WHERE op.rolname = 'vane_agent_session_fact_projector'`,
+	).Scan(&valid)
+	if err != nil || !valid {
+		return agentEventIntegrityError()
+	}
+	return nil
 }
