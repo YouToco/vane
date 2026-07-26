@@ -96,6 +96,33 @@ type AgentActionConfirmation struct {
 	Status   string
 }
 
+// AgentActionContinuationStatus is the exact, read-only operator view of one
+// pending action and its durable continuation authority. Eligibility is
+// derived only after the root, frozen payload, and complete authority history
+// have been verified in one repeatable-read transaction.
+type AgentActionContinuationStatus struct {
+	TenantID           int64      `json:"tenant_id"`
+	UserID             int64      `json:"user_id"`
+	ActionID           string     `json:"action_id"`
+	SessionID          int64      `json:"session_id"`
+	SourceID           int64      `json:"source_id"`
+	ExecutionVersion   int        `json:"execution_version"`
+	Route              string     `json:"route"`
+	Generation         int64      `json:"generation"`
+	Status             string     `json:"status"`
+	TerminalCode       *string    `json:"terminal_code,omitempty"`
+	AttemptCount       int        `json:"attempt_count"`
+	LeaseOwner         *string    `json:"lease_owner,omitempty"`
+	LeaseFence         int64      `json:"lease_fence"`
+	LeaseExpiresAt     *time.Time `json:"lease_expires_at,omitempty"`
+	NextAttemptAt      *time.Time `json:"next_attempt_at,omitempty"`
+	ConfirmedAt        *time.Time `json:"confirmed_at,omitempty"`
+	CompletedAt        *time.Time `json:"completed_at,omitempty"`
+	BlockedReason      *string    `json:"blocked_reason,omitempty"`
+	ActivationEligible bool       `json:"activation_eligible"`
+	RollbackEligible   bool       `json:"rollback_eligible"`
+}
+
 const agentActionContinuationColumns = `action_id,tenant_id,user_id,
 	session_id,source_id,canonical_args,args_digest,tool_spec_version,
 	tool_spec,tool_spec_digest,tool_policy_version,tool_policy,
@@ -131,6 +158,242 @@ func scanAgentActionContinuation(
 func AgentActionPayloadDigest(payload []byte) string {
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])
+}
+
+// GetAgentActionContinuationStatus returns a fail-closed operator view for one
+// exact action. A legacy action with no continuation is returned only when it
+// is a valid enable_source activation candidate; a rolled-back action retains
+// its verified generation-2 legacy history.
+func (s *Store) GetAgentActionContinuationStatus(
+	ctx context.Context,
+	tenantID, userID int64,
+	actionID string,
+) (AgentActionContinuationStatus, error) {
+	if tenantID <= 0 || userID <= 0 || actionID == "" {
+		return AgentActionContinuationStatus{},
+			agentEventValidationError(
+				"Agent action status scope is invalid")
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.RepeatableRead,
+	})
+	if err != nil {
+		return AgentActionContinuationStatus{},
+			agentEventDatabaseError(
+				"begin Agent action status", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := setAgentActionOperatorContext(ctx, tx, tenantID); err != nil {
+		return AgentActionContinuationStatus{}, err
+	}
+
+	var (
+		rootSessionID    *int64
+		rootToolName     string
+		rootArgs         []byte
+		rootStatus       string
+		rootExpiresAt    time.Time
+		executionVersion int
+		databaseNow      time.Time
+	)
+	if err := tx.QueryRow(ctx,
+		`SELECT session_id,tool_name,args,status,expires_at,
+		        execution_version,clock_timestamp()
+		   FROM pending_actions
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		actionID, tenantID, userID,
+	).Scan(
+		&rootSessionID, &rootToolName, &rootArgs, &rootStatus,
+		&rootExpiresAt, &executionVersion, &databaseNow,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return AgentActionContinuationStatus{}, agentEventNotFound()
+		}
+		return AgentActionContinuationStatus{},
+			agentEventDatabaseError(
+				"read Agent action status root", err)
+	}
+	if rootSessionID == nil || *rootSessionID <= 0 ||
+		rootToolName != agentActionToolName {
+		return AgentActionContinuationStatus{}, agentEventIntegrityError()
+	}
+	sourceID, canonicalArgs, err := canonicalEnableSourceArgs(rootArgs)
+	if err != nil {
+		return AgentActionContinuationStatus{}, agentEventIntegrityError()
+	}
+	status := AgentActionContinuationStatus{
+		TenantID: tenantID, UserID: userID, ActionID: actionID,
+		SessionID: *rootSessionID, SourceID: sourceID,
+		ExecutionVersion: executionVersion,
+		Route:            AgentActionAuthorityLegacy,
+		Status:           rootStatus,
+	}
+
+	action, continuationExists, err :=
+		loadAgentActionContinuationForStatus(
+			ctx, tx, tenantID, userID, actionID,
+		)
+	if err != nil {
+		return AgentActionContinuationStatus{}, err
+	}
+	generation, route, err := loadAgentActionAuthorityStatus(
+		ctx, tx, actionID,
+	)
+	if err != nil {
+		return AgentActionContinuationStatus{}, err
+	}
+	status.Generation = generation
+	status.Route = route
+
+	switch executionVersion {
+	case 0:
+		if !continuationExists {
+			if generation != 0 || route != AgentActionAuthorityLegacy ||
+				rootStatus != string(types.PendingActionStatusPending) ||
+				!databaseNow.Before(rootExpiresAt) {
+				return AgentActionContinuationStatus{},
+					agentEventIntegrityError()
+			}
+			if _, err := freezeEnableSourceAction(sourceID); err != nil {
+				return AgentActionContinuationStatus{},
+					agentEventIntegrityError()
+			}
+			status.ActivationEligible = true
+			if err := tx.Commit(ctx); err != nil {
+				return AgentActionContinuationStatus{},
+					agentEventDatabaseError(
+						"commit Agent action status", err)
+			}
+			return status, nil
+		}
+		if generation != 2 || route != AgentActionAuthorityLegacy ||
+			action.Status != AgentActionStatusRolledBack ||
+			rootStatus != string(types.PendingActionStatusPending) ||
+			action.ConfirmedAt != nil || action.AttemptCount != 0 ||
+			action.LeaseFence != 0 || action.TerminalCode != nil {
+			return AgentActionContinuationStatus{},
+				agentEventIntegrityError()
+		}
+	case AgentActionExecutionVersion:
+		if !continuationExists || generation != 1 ||
+			route != AgentActionAuthorityDurable {
+			return AgentActionContinuationStatus{},
+				agentEventIntegrityError()
+		}
+		if action.Status == AgentActionStatusPending {
+			if rootStatus != string(types.PendingActionStatusPending) {
+				return AgentActionContinuationStatus{},
+					agentEventIntegrityError()
+			}
+		} else if err := validateAgentActionTerminalRoot(
+			action.Status, rootStatus,
+		); err != nil {
+			return AgentActionContinuationStatus{}, err
+		}
+	default:
+		return AgentActionContinuationStatus{}, agentEventIntegrityError()
+	}
+	if string(canonicalArgs) != string(action.CanonicalArgs) ||
+		action.SessionID != *rootSessionID ||
+		action.SourceID != sourceID {
+		return AgentActionContinuationStatus{}, agentEventIntegrityError()
+	}
+	if err := validateFrozenAgentAction(action); err != nil {
+		return AgentActionContinuationStatus{}, err
+	}
+	status.SessionID = action.SessionID
+	status.SourceID = action.SourceID
+	status.Status = action.Status
+	status.TerminalCode = action.TerminalCode
+	status.AttemptCount = action.AttemptCount
+	status.LeaseOwner = action.LeaseOwner
+	status.LeaseFence = action.LeaseFence
+	status.LeaseExpiresAt = action.LeaseExpiresAt
+	status.NextAttemptAt = &action.NextAttemptAt
+	status.ConfirmedAt = action.ConfirmedAt
+	status.CompletedAt = action.CompletedAt
+	status.BlockedReason = action.BlockedReason
+	status.RollbackEligible =
+		executionVersion == AgentActionExecutionVersion &&
+			action.Status == AgentActionStatusPending &&
+			action.ConfirmedAt == nil && action.AttemptCount == 0 &&
+			action.LeaseFence == 0 && action.TerminalCode == nil
+	if err := tx.Commit(ctx); err != nil {
+		return AgentActionContinuationStatus{},
+			agentEventDatabaseError(
+				"commit Agent action status", err)
+	}
+	return status, nil
+}
+
+func loadAgentActionContinuationForStatus(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID, userID int64,
+	actionID string,
+) (AgentActionContinuation, bool, error) {
+	action, err := scanAgentActionContinuation(tx.QueryRow(ctx,
+		`SELECT `+agentActionContinuationColumns+`
+		   FROM agent_action_continuations
+		  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3`,
+		actionID, tenantID, userID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AgentActionContinuation{}, false, nil
+	}
+	if err != nil {
+		return AgentActionContinuation{}, false,
+			agentEventDatabaseError(
+				"read Agent action status continuation", err)
+	}
+	return action, true, nil
+}
+
+func loadAgentActionAuthorityStatus(
+	ctx context.Context,
+	tx pgx.Tx,
+	actionID string,
+) (int64, string, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT generation,mode,evidence
+		   FROM agent_action_continuation_authority_events
+		  WHERE action_id=$1 ORDER BY generation`,
+		actionID,
+	)
+	if err != nil {
+		return 0, "", agentEventDatabaseError(
+			"read Agent action status authority", err)
+	}
+	defer rows.Close()
+	generation := int64(0)
+	route := AgentActionAuthorityLegacy
+	for rows.Next() {
+		var gotGeneration int64
+		var mode, evidence string
+		if err := rows.Scan(
+			&gotGeneration, &mode, &evidence,
+		); err != nil {
+			return 0, "", agentEventDatabaseError(
+				"scan Agent action status authority", err)
+		}
+		wantMode := AgentActionAuthorityDurable
+		if gotGeneration == 2 {
+			wantMode = AgentActionAuthorityLegacy
+		}
+		if gotGeneration != generation+1 || gotGeneration > 2 ||
+			mode != wantMode ||
+			strings.TrimSpace(evidence) != evidence ||
+			evidence == "" || len(evidence) > 512 {
+			return 0, "", agentEventIntegrityError()
+		}
+		generation = gotGeneration
+		route = mode
+	}
+	if err := rows.Err(); err != nil {
+		return 0, "", agentEventDatabaseError(
+			"iterate Agent action status authority", err)
+	}
+	return generation, route, nil
 }
 
 // ActivateAgentActionContinuation atomically promotes one exact, pristine
