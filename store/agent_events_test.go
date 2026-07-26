@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -911,6 +912,237 @@ func TestCommitAgentSessionTurnRejectsIllegalSnapshotGenerationAtomically(
 	assertAgentTurnCommitLeftNoMutation(t, f)
 }
 
+func TestGetActiveAgentSessionLedgerAuthorityFailsClosedAndRollbackRestoresLegacy(
+	t *testing.T,
+) {
+	f := newAgentEventFixture(t)
+	ctx := t.Context()
+	base := agentledger.SessionProjection{
+		Messages: json.RawMessage(`[]`), ActivatedTools: json.RawMessage(`[]`),
+	}
+	first := agentledger.SessionProjection{
+		Messages: json.RawMessage(
+			`[{"role":"user","content":"first"},{"role":"assistant","content":"reply"}]`,
+		),
+		TurnCount: 1, ActivatedTools: json.RawMessage(`[]`),
+	}
+	if _, err := f.store.CommitAgentSessionTurn(
+		ctx, first,
+		projectionSnapshotBatch(
+			t, f.scopeA(), "authority-read-1", base, first, "",
+		),
+	); err != nil {
+		t.Fatalf("initialize dual-write projection: %v", err)
+	}
+	if status, err := f.store.ControlAgentSessionProjectionAuthority(
+		ctx, f.tenantA, f.userA, f.sessionA,
+		AgentSessionProjectionAuthorityActivate,
+	); err != nil || status.Route != AgentSessionProjectionRouteLedger {
+		t.Fatalf("activate ledger authority: status=%+v err=%v", status, err)
+	}
+
+	got, err := f.store.GetActiveAgentSession(
+		ctx, f.userA, time.Now().Add(-time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("ledger-authoritative read: %v", err)
+	}
+	assertAgentSessionProjectionDigest(t, got, first)
+
+	if _, err := f.store.pool.Exec(ctx,
+		`UPDATE agent_sessions
+		    SET messages='[{"role":"user","content":"drift"}]'::jsonb
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		f.sessionA, f.tenantA, f.userA,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.GetActiveAgentSession(
+		ctx, f.userA, time.Now().Add(-time.Hour),
+	); err == nil {
+		t.Fatal("ledger-authoritative read accepted a mismatched legacy replica")
+	}
+
+	second := agentledger.SessionProjection{
+		Messages: json.RawMessage(
+			`[{"role":"user","content":"first"},{"role":"assistant","content":"reply"},` +
+				`{"role":"user","content":"second"},{"role":"assistant","content":"reply two"}]`,
+		),
+		TurnCount: 2, ActivatedTools: json.RawMessage(`[]`),
+	}
+	if _, err := f.store.CommitAgentSessionTurn(
+		ctx, second,
+		projectionSnapshotBatch(
+			t, f.scopeA(), "authority-read-2", first, second, "",
+		),
+	); err == nil {
+		t.Fatal("ledger-authoritative writer accepted a mismatched legacy replica")
+	}
+
+	updateAgentSessionProjectionFixture(t, f, first)
+	if status, err := f.store.ControlAgentSessionProjectionAuthority(
+		ctx, f.tenantA, f.userA, f.sessionA,
+		AgentSessionProjectionAuthorityRollback,
+	); err != nil || status.Route != AgentSessionProjectionRouteLegacy {
+		t.Fatalf("rollback legacy authority: status=%+v err=%v", status, err)
+	}
+	legacyAfterRollback := agentledger.SessionProjection{
+		Messages: json.RawMessage(
+			`[{"role":"user","content":"legacy after rollback"}]`,
+		),
+		TurnCount: 3, ActivatedTools: json.RawMessage(`[]`),
+	}
+	updateAgentSessionProjectionFixture(t, f, legacyAfterRollback)
+	got, err = f.store.GetActiveAgentSession(
+		ctx, f.userA, time.Now().Add(-time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("legacy read after rollback: %v", err)
+	}
+	assertAgentSessionProjectionDigest(t, got, legacyAfterRollback)
+
+	afterRollbackWrite := agentledger.SessionProjection{
+		Messages: json.RawMessage(
+			`[{"role":"user","content":"legacy after rollback"},` +
+				`{"role":"assistant","content":"resynchronized"}]`,
+		),
+		TurnCount: 4, ActivatedTools: json.RawMessage(`[]`),
+	}
+	audit, err := f.store.CommitAgentSessionTurn(
+		ctx, afterRollbackWrite,
+		projectionSnapshotBatch(
+			t, f.scopeA(), "authority-read-3",
+			legacyAfterRollback, afterRollbackWrite, "",
+		),
+	)
+	if err != nil {
+		t.Fatalf("legacy writer after rollback: %v", err)
+	}
+	if !audit.Match ||
+		audit.PriorState != "unsupported_writer_or_projection_drift" {
+		t.Fatalf("rollback resync audit=%+v", audit)
+	}
+}
+
+func TestGetActiveAgentSessionLedgerAuthorityRejectsUnavailableLedger(
+	t *testing.T,
+) {
+	t.Run("zero events", func(t *testing.T) {
+		f := newAgentEventFixture(t)
+		insertInvalidAgentSessionProjectionAuthorityFixture(t, f)
+		if _, err := f.store.GetActiveAgentSession(
+			t.Context(), f.userA, time.Now().Add(-time.Hour),
+		); err == nil {
+			t.Fatal("ledger-authoritative read accepted an empty ledger")
+		}
+	})
+
+	t.Run("incomplete batch", func(t *testing.T) {
+		f := newAgentEventFixture(t)
+		initializeAgentSessionProjectionFixture(t, f, "missing-batch")
+		if _, err := f.store.ControlAgentSessionProjectionAuthority(
+			t.Context(), f.tenantA, f.userA, f.sessionA,
+			AgentSessionProjectionAuthorityActivate,
+		); err != nil {
+			t.Fatalf("activate ledger authority: %v", err)
+		}
+		if _, err := f.store.pool.Exec(t.Context(),
+			`DELETE FROM agent_events
+			  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+			    AND batch_index=1`,
+			f.tenantA, f.userA, f.sessionA,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.GetActiveAgentSession(
+			t.Context(), f.userA, time.Now().Add(-time.Hour),
+		); err == nil {
+			t.Fatal("ledger-authoritative read accepted an incomplete batch")
+		}
+	})
+
+	t.Run("corrupt payload", func(t *testing.T) {
+		f := newAgentEventFixture(t)
+		initializeAgentSessionProjectionFixture(t, f, "corrupt-payload")
+		if _, err := f.store.ControlAgentSessionProjectionAuthority(
+			t.Context(), f.tenantA, f.userA, f.sessionA,
+			AgentSessionProjectionAuthorityActivate,
+		); err != nil {
+			t.Fatalf("activate ledger authority: %v", err)
+		}
+		if _, err := f.store.pool.Exec(t.Context(),
+			`UPDATE agent_events
+			    SET payload=decode('00', 'hex')
+			  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+			    AND batch_index=1`,
+			f.tenantA, f.userA, f.sessionA,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.GetActiveAgentSession(
+			t.Context(), f.userA, time.Now().Add(-time.Hour),
+		); err == nil {
+			t.Fatal("ledger-authoritative read accepted a corrupt event payload")
+		}
+	})
+}
+
+func TestActiveAgentSessionReadSnapshotDoesNotTearAcrossCutover(
+	t *testing.T,
+) {
+	f := newAgentEventFixture(t)
+	projection := initializeAgentSessionProjectionFixture(
+		t, f, "read-cutover-snapshot",
+	)
+	tx, err := f.store.beginTx(
+		t.Context(), pgx.TxOptions{IsoLevel: pgx.RepeatableRead},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = tx.Rollback(context.WithoutCancel(t.Context()))
+	}()
+
+	// Establish the read transaction snapshot before the control transaction
+	// activates ledger authority.
+	var session types.AgentSession
+	if err := scanAgentSession(tx.QueryRow(t.Context(),
+		`SELECT `+agentSessionColumns+`
+		   FROM agent_sessions
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		f.sessionA, f.tenantA, f.userA,
+	), &session); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.ControlAgentSessionProjectionAuthority(
+		t.Context(), f.tenantA, f.userA, f.sessionA,
+		AgentSessionProjectionAuthorityActivate,
+	); err != nil {
+		t.Fatalf("activate ledger authority: %v", err)
+	}
+
+	// The in-flight read must finish wholly on its earlier legacy route. A
+	// fresh read below observes the committed ledger route.
+	if err := loadAuthoritativeActiveAgentSessionProjection(
+		t.Context(), tx, &session,
+	); err != nil {
+		t.Fatalf("in-flight legacy snapshot: %v", err)
+	}
+	assertAgentSessionProjectionDigest(t, &session, projection)
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh, err := f.store.GetActiveAgentSession(
+		t.Context(), f.userA, time.Now().Add(-time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("fresh ledger-authoritative read: %v", err)
+	}
+	assertAgentSessionProjectionDigest(t, fresh, projection)
+}
+
 func assertAgentTurnCommitLeftNoMutation(t *testing.T, f agentEventFixture) {
 	t.Helper()
 	var eventCount, turnCount int
@@ -985,6 +1217,140 @@ func assertStoredAgentSessionProjection(
 	}
 	if gotDigest != wantDigest {
 		t.Fatalf("stored projection digest=%s want=%s", gotDigest, wantDigest)
+	}
+}
+
+func initializeAgentSessionProjectionFixture(
+	t *testing.T,
+	f agentEventFixture,
+	turnID string,
+) agentledger.SessionProjection {
+	t.Helper()
+	base := agentledger.SessionProjection{
+		Messages: json.RawMessage(`[]`), ActivatedTools: json.RawMessage(`[]`),
+	}
+	projection := agentledger.SessionProjection{
+		Messages: json.RawMessage(
+			`[{"role":"user","content":"fixture"},{"role":"assistant","content":"reply"}]`,
+		),
+		TurnCount: 1, ActivatedTools: json.RawMessage(`[]`),
+	}
+	if _, err := f.store.CommitAgentSessionTurn(
+		t.Context(), projection,
+		projectionSnapshotBatch(
+			t, f.scopeA(), turnID, base, projection, "",
+		),
+	); err != nil {
+		t.Fatalf("initialize projection fixture: %v", err)
+	}
+	return projection
+}
+
+func initializeEmptyAgentSessionLedgerAuthority(
+	t *testing.T,
+	st *Store,
+	scope agentledger.Scope,
+	turnID string,
+) {
+	t.Helper()
+	empty := agentledger.SessionProjection{
+		Messages:       json.RawMessage(`[]`),
+		ActivatedTools: json.RawMessage(`[]`),
+	}
+	if _, err := st.CommitAgentSessionTurn(
+		t.Context(), empty,
+		projectionSnapshotBatch(t, scope, turnID, empty, empty, ""),
+	); err != nil {
+		t.Fatalf("initialize empty Agent ledger: %v", err)
+	}
+	status, err := st.ControlAgentSessionProjectionAuthority(
+		t.Context(), scope.TenantID, scope.UserID, scope.SessionID,
+		AgentSessionProjectionAuthorityActivate,
+	)
+	if err != nil {
+		t.Fatalf("activate Agent ledger authority: %v", err)
+	}
+	if status.Route != AgentSessionProjectionRouteLedger {
+		t.Fatalf("Agent ledger authority status=%+v", status)
+	}
+}
+
+func insertInvalidAgentSessionProjectionAuthorityFixture(
+	t *testing.T,
+	f agentEventFixture,
+) {
+	t.Helper()
+	var projection agentledger.SessionProjection
+	if err := f.store.pool.QueryRow(t.Context(),
+		`SELECT messages, turn_count, activated_tools
+		   FROM agent_sessions
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		f.sessionA, f.tenantA, f.userA,
+	).Scan(
+		&projection.Messages,
+		&projection.TurnCount,
+		&projection.ActivatedTools,
+	); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := agentledger.ProjectionDigest(projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(t.Context(), `
+		INSERT INTO agent_session_projection_authority_events (
+			tenant_id, user_id, session_id, generation, action,
+			ledger_head_sequence, legacy_digest, ledger_digest
+		) VALUES ($1,$2,$3,1,'activate',1,$4,$4)`,
+		f.tenantA, f.userA, f.sessionA, digest,
+	); err != nil {
+		t.Fatalf("insert invalid zero-ledger authority fixture: %v", err)
+	}
+}
+
+func updateAgentSessionProjectionFixture(
+	t *testing.T,
+	f agentEventFixture,
+	projection agentledger.SessionProjection,
+) {
+	t.Helper()
+	if _, err := f.store.pool.Exec(t.Context(),
+		`UPDATE agent_sessions
+		    SET messages=$4, turn_count=$5, activated_tools=$6
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		f.sessionA, f.tenantA, f.userA,
+		projection.Messages, projection.TurnCount, projection.ActivatedTools,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertAgentSessionProjectionDigest(
+	t *testing.T,
+	session *types.AgentSession,
+	want agentledger.SessionProjection,
+) {
+	t.Helper()
+	if session == nil {
+		t.Fatal("nil AgentSession")
+	}
+	gotDigest, err := agentledger.ProjectionDigest(
+		agentledger.SessionProjection{
+			Messages:       session.Messages,
+			TurnCount:      session.TurnCount,
+			ActivatedTools: session.ActivatedTools,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest, err := agentledger.ProjectionDigest(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotDigest != wantDigest {
+		t.Fatalf("AgentSession projection digest=%s want=%s",
+			gotDigest, wantDigest)
 	}
 }
 
@@ -1539,6 +1905,10 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 	storeDir := filepath.Clean(filepath.Dir(testFile))
 	repoRoot := filepath.Clean(filepath.Dir(storeDir))
 	provider := filepath.Join(storeDir, "agent_events.go")
+	authority := filepath.Join(
+		storeDir, "agent_session_projection_authority.go",
+	)
+	runtimeAdmin := filepath.Join(repoRoot, "cmd", "runtimeadmin", "main.go")
 	agentLoop := filepath.Join(repoRoot, "agent", "loop.go")
 	creationReceipts := filepath.Join(
 		storeDir, "task_creation_receipts.go",
@@ -1568,9 +1938,23 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
 		var allowed map[token.Pos]struct{}
 		if filepath.Clean(path) == provider {
 			allowed, err = agentEventLedgerProviderDeclarations(file)
+			if err != nil {
+				return err
+			}
+		} else if filepath.Clean(path) == authority {
+			allowed, err = agentEventLedgerAuthorityDeclarations(file)
+			if err != nil {
+				return err
+			}
+		} else if filepath.Clean(path) == runtimeAdmin {
+			allowed, err = agentEventLedgerRuntimeAdminAuthorityReferences(file)
 			if err != nil {
 				return err
 			}
@@ -1602,13 +1986,31 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 			violations,
 			agentEventLedgerForbiddenReferences(fset, file, allowed)...,
 		)
+		clean := filepath.Clean(path)
+		if clean != authority &&
+			strings.Contains(
+				string(raw),
+				"SET LOCAL ROLE vane_agent_session_projection_operator",
+			) {
+			violations = append(violations,
+				fmt.Sprintf("%s: Agent projection operator role entry escaped controller",
+					clean))
+		}
+		if clean != authority &&
+			strings.Contains(
+				string(raw),
+				"INSERT INTO agent_session_projection_authority_events",
+			) {
+			violations = append(violations,
+				fmt.Sprintf("%s: raw Agent projection authority append escaped controller",
+					clean))
+		}
 		for _, imported := range file.Imports {
 			if strings.Trim(imported.Path.Value, `"`) !=
 				"github.com/YouToco/vane/agentledger" {
 				continue
 			}
-			clean := filepath.Clean(path)
-			if clean != provider && clean != agentLoop {
+			if clean != provider && clean != authority && clean != agentLoop {
 				violations = append(violations,
 					fmt.Sprintf("%s: forbidden Agent event ledger import",
 						fset.Position(imported.Pos())))
@@ -1648,9 +2050,20 @@ func resurrectProjectionOverwrite(s interface{ UpdateAgentSession() }) {
 	s.UpdateAgentSession()
 }
 func escapedPrivateHelper() { commitAgentSessionAppendTx() }
+func escapedRouteHelper() { agentSessionProjectionLedgerAuthoritative() }
+func escapedAuthorityStatus(s interface{ GetAgentSessionProjectionAuthorityStatus() }) {
+	s.GetAgentSessionProjectionAuthorityStatus()
+}
+func escapedAuthorityControl(s interface{ ControlAgentSessionProjectionAuthority() }) {
+	control := s.ControlAgentSessionProjectionAuthority
+	control()
+}
 var helperByName = "commitAgentSessionAppendTx"
 var overwriteByName = "UpdateAgentSession"
 var byName = "ListAgentEvents"
+var routeByName = "agentSessionProjectionLedgerAuthoritative"
+var statusByName = "GetAgentSessionProjectionAuthorityStatus"
+var controlByName = "ControlAgentSessionProjectionAuthority"
 `, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -1686,6 +2099,12 @@ func hiddenSideWriterWrapper() {
 }
 func hiddenProjectionSQL() {
 	_ = "UPDATE agent_sessions SET messages='[]'"
+}
+func loadAuthoritativeActiveAgentSessionProjection() {
+	agentSessionProjectionLedgerAuthoritative()
+}
+func loadAuthoritativeAgentSessionProjectionForUpdate() {
+	agentSessionProjectionLedgerAuthoritative()
 }
 `, 0)
 	if err != nil {
@@ -1788,20 +2207,98 @@ func (l *Loop) saveSession() {
 	}
 }
 
+func TestAgentEventLedgerAuthorityGuardRejectsWrappers(t *testing.T) {
+	t.Parallel()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "agent_session_projection_authority.go", `package store
+type Store struct{}
+func agentSessionProjectionLedgerAuthoritative() {}
+func (s *Store) GetAgentSessionProjectionAuthorityStatus() {}
+func (s *Store) ControlAgentSessionProjectionAuthority() {}
+func hiddenAuthorityWrapper() {
+	agentSessionProjectionLedgerAuthoritative()
+}
+`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := agentEventLedgerAuthorityDeclarations(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations := agentEventLedgerForbiddenReferences(fset, file, allowed)
+	if !slices.ContainsFunc(violations, func(violation string) bool {
+		return strings.Contains(
+			violation, "agentSessionProjectionLedgerAuthoritative",
+		)
+	}) {
+		t.Fatalf("authority wrapper escaped exact declaration guard: %v", violations)
+	}
+}
+
+func TestAgentEventLedgerRuntimeAdminAuthorityGuardRejectsIndirection(
+	t *testing.T,
+) {
+	t.Parallel()
+	mutations := map[string]string{
+		"method value alias": `package main
+type agentSessionCutoverStore interface {
+	GetAgentSessionProjectionAuthorityStatus()
+	ControlAgentSessionProjectionAuthority()
+}
+func executeAgentSessionCutover(st agentSessionCutoverStore) {
+	status := st.GetAgentSessionProjectionAuthorityStatus
+	status()
+	st.ControlAgentSessionProjectionAuthority()
+}`,
+		"wrapper": `package main
+type agentSessionCutoverStore interface {
+	GetAgentSessionProjectionAuthorityStatus()
+	ControlAgentSessionProjectionAuthority()
+}
+func getStatus(st agentSessionCutoverStore) {
+	st.GetAgentSessionProjectionAuthorityStatus()
+}
+func executeAgentSessionCutover(st agentSessionCutoverStore) {
+	getStatus(st)
+	st.ControlAgentSessionProjectionAuthority()
+}`,
+	}
+	for name, source := range mutations {
+		t.Run(name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "main.go", source, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := agentEventLedgerRuntimeAdminAuthorityReferences(
+				file,
+			); err == nil {
+				t.Fatal(
+					"mutated runtimeadmin unexpectedly passed direct-call guard",
+				)
+			}
+		})
+	}
+}
+
 func agentEventLedgerForbiddenReferences(
 	fset *token.FileSet,
 	file *ast.File,
 	allowed map[token.Pos]struct{},
 ) []string {
 	sensitive := map[string]struct{}{
-		"AppendAgentEvents":          {},
-		"ListAgentEvents":            {},
-		"ReplayAgentEvents":          {},
-		"CommitAgentSessionTurn":     {},
-		"CommitAgentSessionAppend":   {},
-		"AppendAgentSessionMessages": {},
-		"commitAgentSessionAppendTx": {},
-		"UpdateAgentSession":         {},
+		"AppendAgentEvents":                         {},
+		"ListAgentEvents":                           {},
+		"ReplayAgentEvents":                         {},
+		"CommitAgentSessionTurn":                    {},
+		"CommitAgentSessionAppend":                  {},
+		"AppendAgentSessionMessages":                {},
+		"commitAgentSessionAppendTx":                {},
+		"UpdateAgentSession":                        {},
+		"agentSessionProjectionLedgerAuthoritative": {},
+		"GetAgentSessionProjectionAuthorityStatus":  {},
+		"ControlAgentSessionProjectionAuthority":    {},
 	}
 	var violations []string
 	ast.Inspect(file, func(node ast.Node) bool {
@@ -1889,6 +2386,10 @@ func agentEventLedgerProviderDeclarations(
 	helperDeclarations := 0
 	providerCalls := 0
 	projectionSQLWrites := 0
+	routeBoundaries := map[string]int{
+		"loadAuthoritativeActiveAgentSessionProjection":    0,
+		"loadAuthoritativeAgentSessionProjectionForUpdate": 0,
+	}
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
 		if !ok {
@@ -1922,6 +2423,25 @@ func agentEventLedgerProviderDeclarations(
 		}
 		if function.Name.Name != "CommitAgentSessionAppend" ||
 			function.Body == nil {
+			if _, guarded := routeBoundaries[function.Name.Name]; !guarded ||
+				function.Body == nil {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				helper, ok := call.Fun.(*ast.Ident)
+				if !ok ||
+					helper.Name !=
+						"agentSessionProjectionLedgerAuthoritative" {
+					return true
+				}
+				routeBoundaries[function.Name.Name]++
+				allowed[helper.Pos()] = struct{}{}
+				return true
+			})
 			continue
 		}
 		ast.Inspect(function.Body, func(node ast.Node) bool {
@@ -1944,6 +2464,174 @@ func agentEventLedgerProviderDeclarations(
 			"Agent session provider helper declarations/calls/SQL writes=%d/%d/%d, want 1/1/2",
 			helperDeclarations, providerCalls, projectionSQLWrites,
 		)
+	}
+	for functionName, count := range routeBoundaries {
+		if count != 1 {
+			return nil, fmt.Errorf(
+				"Agent session provider %s must directly call projection authority exactly once, got %d",
+				functionName, count,
+			)
+		}
+	}
+	return allowed, nil
+}
+
+func agentEventLedgerAuthorityDeclarations(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	methods := map[string]int{
+		"GetAgentSessionProjectionAuthorityStatus": 0,
+		"ControlAgentSessionProjectionAuthority":   0,
+	}
+	helperDeclarations := 0
+	allowed := make(map[token.Pos]struct{}, len(methods)+1)
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if function.Name.Name ==
+			"agentSessionProjectionLedgerAuthoritative" {
+			if function.Recv != nil {
+				return nil, errors.New(
+					"Agent session projection route helper must remain package-private",
+				)
+			}
+			helperDeclarations++
+			allowed[function.Name.Pos()] = struct{}{}
+			continue
+		}
+		if _, guarded := methods[function.Name.Name]; !guarded {
+			continue
+		}
+		if function.Recv == nil || len(function.Recv.List) != 1 ||
+			!agentEventLedgerStoreReceiver(function.Recv.List[0].Type) {
+			return nil, fmt.Errorf(
+				"Agent session projection authority %s must remain a Store method",
+				function.Name.Name,
+			)
+		}
+		methods[function.Name.Name]++
+		allowed[function.Name.Pos()] = struct{}{}
+	}
+	if helperDeclarations != 1 {
+		return nil, fmt.Errorf(
+			"Agent session projection route helper declarations=%d, want 1",
+			helperDeclarations,
+		)
+	}
+	for name, count := range methods {
+		if count != 1 {
+			return nil, fmt.Errorf(
+				"Agent session projection authority must declare %s exactly once, got %d",
+				name, count,
+			)
+		}
+	}
+	return allowed, nil
+}
+
+func agentEventLedgerRuntimeAdminAuthorityReferences(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	methods := map[string]int{
+		"GetAgentSessionProjectionAuthorityStatus": 0,
+		"ControlAgentSessionProjectionAuthority":   0,
+	}
+	allowed := make(map[token.Pos]struct{}, len(methods)*2)
+	var execute *ast.FuncDecl
+	for _, declaration := range file.Decls {
+		switch typed := declaration.(type) {
+		case *ast.GenDecl:
+			if typed.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range typed.Specs {
+				typeSpec, ok := spec.(*ast.TypeSpec)
+				if !ok ||
+					typeSpec.Name.Name != "agentSessionCutoverStore" {
+					continue
+				}
+				interfaceType, ok := typeSpec.Type.(*ast.InterfaceType)
+				if !ok {
+					return nil, errors.New(
+						"runtimeadmin Agent session cutover store must remain an interface",
+					)
+				}
+				for _, field := range interfaceType.Methods.List {
+					if len(field.Names) != 1 {
+						continue
+					}
+					name := field.Names[0].Name
+					if _, guarded := methods[name]; !guarded {
+						continue
+					}
+					if _, ok := field.Type.(*ast.FuncType); !ok {
+						return nil, fmt.Errorf(
+							"runtimeadmin authority boundary %s must remain a method field",
+							name,
+						)
+					}
+					methods[name]++
+					allowed[field.Names[0].Pos()] = struct{}{}
+				}
+			}
+		case *ast.FuncDecl:
+			if typed.Name.Name != "executeAgentSessionCutover" {
+				continue
+			}
+			if execute != nil {
+				return nil, errors.New(
+					"runtimeadmin Agent session cutover executor is duplicated",
+				)
+			}
+			execute = typed
+		}
+	}
+	for name, count := range methods {
+		if count != 1 {
+			return nil, fmt.Errorf(
+				"runtimeadmin cutover store must declare %s exactly once, got %d",
+				name, count,
+			)
+		}
+	}
+	if execute == nil || execute.Body == nil {
+		return nil, errors.New(
+			"runtimeadmin Agent session cutover executor is unavailable",
+		)
+	}
+	directCalls := map[string]int{
+		"GetAgentSessionProjectionAuthorityStatus": 0,
+		"ControlAgentSessionProjectionAuthority":   0,
+	}
+	ast.Inspect(execute.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		method, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if _, guarded := directCalls[method.Sel.Name]; !guarded {
+			return true
+		}
+		receiver, ok := method.X.(*ast.Ident)
+		if !ok || receiver.Name != "st" {
+			return true
+		}
+		directCalls[method.Sel.Name]++
+		allowed[method.Sel.Pos()] = struct{}{}
+		return true
+	})
+	for name, count := range directCalls {
+		if count != 1 {
+			return nil, fmt.Errorf(
+				"runtimeadmin cutover executor must directly call st.%s exactly once, got %d",
+				name, count,
+			)
+		}
 	}
 	return allowed, nil
 }

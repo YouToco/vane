@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/agentledger"
 	"github.com/YouToco/vane/types"
 )
 
@@ -128,6 +129,11 @@ func TestTaskDefinitionEditReceipt_LeasePayloadSessionAndDeliveryLifecycle(
 	f := newTaskDefinitionEditReceiptFixture(
 		t, st, "feishu_card_patch:test", "om_"+uuid.NewString())
 	ctx := t.Context()
+	initializeEmptyAgentSessionLedgerAuthority(
+		t, st, agentledger.Scope{
+			TenantID: f.tenantID, UserID: f.userID, SessionID: f.sessionID,
+		}, "definition-edit-receipt-ledger-authority",
+	)
 	makeTaskDefinitionEditReceiptDue(t, f)
 
 	claim := raceTaskDefinitionEditReceiptAcquireForTest(t, f)

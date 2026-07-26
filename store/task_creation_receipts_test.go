@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/agentledger"
 	"github.com/YouToco/vane/types"
 )
 
@@ -333,6 +334,11 @@ func TestTaskCreationReceipt_LeasePayloadSessionAndDeliveryLifecycle(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	initializeEmptyAgentSessionLedgerAuthority(
+		t, st, agentledger.Scope{
+			TenantID: f.tenantID, UserID: f.userID, SessionID: session.ID,
+		}, "creation-receipt-ledger-authority",
+	)
 	p := taskCreationCreateParams(f, uuid.NewString())
 	p.SessionID = &session.ID
 	if _, err := st.CreateTaskCreationOperation(ctx, p); err != nil {
