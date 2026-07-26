@@ -20,6 +20,7 @@ import (
 
 	"github.com/YouToco/vane/a2a"
 	"github.com/YouToco/vane/agent"
+	"github.com/YouToco/vane/agentcontinuation"
 	"github.com/YouToco/vane/api"
 	"github.com/YouToco/vane/auth"
 	"github.com/YouToco/vane/cardgen"
@@ -488,10 +489,11 @@ func run() error {
 		Client:        agentLLMClient,
 		Recorder:      recorder,
 		Sender:        manager,
-		Notifier:      agentLoop,
 		BuildCard:     feishu.BuildDeliveryCard,
 		BuildAggCard:  feishu.BuildAggregateCard,
 		DeepDiveModel: cfg.LLM.AgentModel,
+		SessionTTL: time.Duration(
+			cfg.Agent.SessionTTLMinutes) * time.Minute,
 	})
 	manager.SetFeedback(fbSvc)
 
@@ -539,6 +541,26 @@ func run() error {
 		temporalClient.Close()
 		st.Close()
 		return fmt.Errorf("装配任务定义编辑耐久回执: %w", err)
+	}
+	continuationDispatcher, err := agentcontinuation.New(
+		st, slog.Default(),
+	)
+	if err != nil {
+		stop()
+		maintenanceCtx, cancelMaintenance := context.WithTimeout(
+			context.Background(), 30*time.Second,
+		)
+		maintenanceErr := waitMaintenance(maintenanceCtx)
+		cancelMaintenance()
+		if maintenanceErr != nil {
+			return errors.Join(
+				fmt.Errorf("装配 Agent 耐久延续投影器: %w", err),
+				fmt.Errorf("排空启动维护任务: %w", maintenanceErr),
+			)
+		}
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("装配 Agent 耐久延续投影器: %w", err)
 	}
 
 	// Definition-edit recovery starts before any Feishu/HTTP ingress is admitted.
@@ -653,6 +675,13 @@ func run() error {
 			)
 		}
 	}
+
+	// Feedback producers freeze exact session scope in their business
+	// transaction. The projector starts before every ingress, scans only that
+	// durable outbox, and has no provider dependency.
+	runMaintenance(func() {
+		continuationDispatcher.Run(ctx)
+	})
 
 	// The worker is an ingress too: a registered task queue can immediately
 	// receive scheduled runs. Start it only after both recovery loops and both

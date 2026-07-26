@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/promptguard"
@@ -23,6 +24,9 @@ type Store interface {
 	// 按分数降序；历史单条卡查回 1 行，重建路径据 len 分流。
 	ListDeliveriesByFeishuMessage(ctx context.Context, userID int64, msgID string) ([]types.Delivery, error)
 	InsertFeedback(ctx context.Context, f *types.Feedback) (int64, error)
+	InsertFeedbackWithSessionCutoff(
+		ctx context.Context, f *types.Feedback, activeSince time.Time,
+	) (int64, error)
 	AuditOutdatedFeedback(
 		ctx context.Context, userID, feedbackID int64,
 	) (types.FreshnessFeedbackAuditOutcome, error)
@@ -86,6 +90,9 @@ type Deps struct {
 	// DeepDiveModel deep_dive 生成用模型（cfg.LLM.AgentModel——Boss 拍板③：
 	// 深度解读值得 v4-pro，与打分/出卡的默认档分开）。
 	DeepDiveModel string
+	// SessionTTL is the same inactivity boundary used by Agent. Feedback facts
+	// freeze only a session active within this cutoff.
+	SessionTTL time.Duration
 }
 
 // Service 处理推送卡反馈按钮点击与追问上下文包装。
@@ -110,6 +117,9 @@ type Service struct {
 
 // New 构造 Service。
 func New(deps Deps) *Service {
+	if deps.SessionTTL <= 0 {
+		deps.SessionTTL = 30 * time.Minute
+	}
 	stopCtx, stop := context.WithCancel(context.Background())
 	return &Service{
 		deps:              deps,
@@ -250,15 +260,16 @@ func (s *Service) handleAttitude(ctx context.Context, userID int64, d *types.Del
 		// 幂等：不插行但仍重建卡——并发窗口下状态行的短暂缺项靠重复点击自愈。
 		return s.rebuilt(ctx, d, "已记录过", true, nil), nil
 	}
-	feedbackID, err := s.deps.Store.InsertFeedback(ctx, &types.Feedback{
-		UserID: userID, DeliveryID: d.ID, Action: action,
-	})
+	_, err = s.deps.Store.InsertFeedbackWithSessionCutoff(
+		ctx, &types.Feedback{
+			UserID: userID, DeliveryID: d.ID, Action: action,
+		}, time.Now().Add(-s.deps.SessionTTL))
 	if err != nil {
 		return ClickResult{}, err
 	}
-	s.notifyClick(
-		ctx, userID, feedbackID, d.ID, actionLabel(action), "",
-	)
+	// InsertFeedback freezes the exact active Agent session (or a durable
+	// no_active_session suppression) in the same transaction as this fact.
+	// The continuation projector owns the only session append.
 	return s.rebuilt(ctx, d, "已记录："+actionLabel(action), true, nil), nil
 }
 
@@ -302,10 +313,11 @@ func (s *Service) HandleReasonSubmit(ctx context.Context, userID int64, submit R
 	if submit.ReasonCode == types.FeedbackReasonOther && detail == "" {
 		return ClickResult{Toast: "选择“其他”时请填写说明"}, nil
 	}
-	feedbackID, err := s.deps.Store.InsertFeedback(ctx, &types.Feedback{
-		UserID: userID, DeliveryID: d.ID, Action: types.FeedbackActionMisjudged,
-		ReasonCode: submit.ReasonCode, Detail: detail,
-	})
+	feedbackID, err := s.deps.Store.InsertFeedbackWithSessionCutoff(
+		ctx, &types.Feedback{
+			UserID: userID, DeliveryID: d.ID, Action: types.FeedbackActionMisjudged,
+			ReasonCode: submit.ReasonCode, Detail: detail,
+		}, time.Now().Add(-s.deps.SessionTTL))
 	if err != nil {
 		return ClickResult{}, err
 	}
@@ -322,9 +334,8 @@ func (s *Service) HandleReasonSubmit(ctx context.Context, userID int64, submit R
 			)
 		}
 	}
-	s.notifyClick(
-		ctx, userID, feedbackID, d.ID, "反馈问题："+label, "",
-	)
+	// The durable continuation outbox, created by InsertFeedback, owns the
+	// session projection. Do not race it with the legacy best-effort notifier.
 	return s.rebuilt(ctx, d, "已记录问题反馈："+label, true, nil), nil
 }
 
