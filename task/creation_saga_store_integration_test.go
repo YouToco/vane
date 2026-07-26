@@ -144,15 +144,7 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("load terminal receipt: %v", err)
 		}
-		if delay := time.Until(receipt.NextAttemptAt) + 50*time.Millisecond; delay > 0 {
-			timer := time.NewTimer(delay)
-			select {
-			case <-timer.C:
-			case <-t.Context().Done():
-				timer.Stop()
-				t.Fatal(t.Context().Err())
-			}
-		}
+		receipt = waitForDueTaskCreationReceipt(t, st, *receipt)
 		sender := &receiptDispatcherFakeSender{}
 		dispatcher, err := NewCreationReceiptDispatcher(CreationReceiptDispatcherDeps{
 			Store: st, Sender: sender,
@@ -282,4 +274,42 @@ func newCreationCoordinatorPostgreSQLFixture(
 		}
 	})
 	return st, tenant.ID, user.ID
+}
+
+func waitForDueTaskCreationReceipt(
+	t *testing.T,
+	st *store.Store,
+	receipt types.TaskCreationReceipt,
+) *types.TaskCreationReceipt {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		// The production due query compares next_attempt_at with the database
+		// clock. Poll that same boundary instead of estimating it from the Go
+		// process clock, which may be slightly ahead of PostgreSQL on CI hosts.
+		due, err := st.ListDueTaskCreationReceipts(
+			ctx, receipt.TenantID, time.Now().Add(time.Hour), 100,
+		)
+		if err != nil {
+			t.Fatalf("list due terminal receipts: %v", err)
+		}
+		for i := range due {
+			if due[i].ID == receipt.ID {
+				return &due[i]
+			}
+		}
+
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf(
+				"terminal receipt %d did not become due by database clock: %v",
+				receipt.ID, ctx.Err(),
+			)
+		}
+	}
 }
