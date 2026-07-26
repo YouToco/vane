@@ -303,7 +303,8 @@ func waitForBlockedAgentActionSourceUpdate(
 			   AND pid<>pg_backend_pid()
 			   AND wait_event_type='Lock'
 			   AND query LIKE '%UPDATE sources%'
-			   AND query LIKE '%SET status=%'
+			   AND query LIKE
+			       '%SET status=$4,fail_count=0,next_fetch_at=clock_timestamp(),%'
 			 ORDER BY pid
 			 LIMIT 1`).Scan(&pid)
 		if err == nil {
