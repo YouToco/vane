@@ -72,6 +72,12 @@ var agentActionReferenceAllowances = []agentActionReferenceAllowance{
 	},
 	{
 		path:        "agentcontinuation/action_controller.go",
+		declaration: "NewActionController",
+		receiver:    "st",
+		references:  map[string]int{},
+	},
+	{
+		path:        "agentcontinuation/action_controller.go",
 		declaration: "Confirm",
 		receiver:    "c.store",
 		references: map[string]int{
@@ -96,6 +102,18 @@ var agentActionReferenceAllowances = []agentActionReferenceAllowance{
 			"ProjectAgentActionContinuation":          1,
 			"ReleaseAgentActionContinuation":          1,
 		},
+	},
+	{
+		path:        "agentcontinuation/action_dispatcher.go",
+		declaration: "NewActionDispatcher",
+		receiver:    "st",
+		references:  map[string]int{},
+	},
+	{
+		path:        "agentcontinuation/action_dispatcher.go",
+		declaration: "Start",
+		receiver:    "d.store",
+		references:  map[string]int{},
 	},
 	{
 		path:        "agentcontinuation/action_dispatcher.go",
@@ -155,6 +173,10 @@ func TestAgentActionContinuationHasOnlyExactProductionEntrypoints(t *testing.T) 
 	violations = append(
 		violations,
 		agentActionAdapterGenericExecutionViolations(files, root)...,
+	)
+	violations = append(
+		violations,
+		agentActionUnapprovedStoreFieldViolations(files, root)...,
 	)
 	sort.Strings(violations)
 	if len(violations) != 0 {
@@ -351,6 +373,31 @@ func executeAgentActionCutover(
 		t.Fatalf("wrong receiver escaped direct-call guard: %v", got)
 	}
 
+	forwardedReceiver := parseAgentActionMutation(t, `package main
+func executeAgentActionCutover(
+	st interface {
+		GetAgentActionContinuationStatus()
+		ActivateAgentActionContinuation()
+		RollbackAgentActionContinuation()
+	},
+) {
+	st.ActivateAgentActionContinuation()
+	st.GetAgentActionContinuationStatus()
+	st.RollbackAgentActionContinuation()
+	hidden(st)
+}`)
+	files = map[string]*ast.File{
+		filepath.Join(
+			root, "cmd", "runtimeadmin", "main.go",
+		): forwardedReceiver,
+	}
+	got = agentActionApprovedAdapterViolations(files, root)
+	if !agentActionViolationContains(
+		got, "receiver st escaped direct call",
+	) {
+		t.Fatalf("forwarded Store receiver escaped guard: %v", got)
+	}
+
 	staleExportedDispatcher := parseAgentActionMutation(t, `package agentcontinuation
 type ActionStore interface {
 	ListDueAgentActionContinuationTenantIDs()
@@ -403,6 +450,45 @@ func escape() {}`)
 		map[string]*ast.File{path: file}, root)
 	if !agentActionViolationContains(got, "dynamic import unsafe") {
 		t.Fatalf("unsafe adapter escape passed guard: %v", got)
+	}
+
+	adapter := parseAgentActionMutation(t, `package agentcontinuation
+func dispatchAction(d *ActionDispatcher) {
+	d.store.AcquireAgentActionContinuation()
+	d.store.ProjectAgentActionContinuation()
+	d.store.ReleaseAgentActionContinuation()
+	hidden(d.store)
+}`)
+	helper := parseAgentActionMutation(t, `package agentcontinuation
+import r "reflect"
+func hidden(target any) {
+	r.ValueOf(target).Method(0).Call(nil)
+}`)
+	got = agentActionAdapterGenericExecutionViolations(
+		map[string]*ast.File{
+			path: adapter,
+			filepath.Join(
+				root, "agentcontinuation", "action_dynamic_helper.go",
+			): helper,
+		},
+		root,
+	)
+	if !agentActionViolationContains(got, "dynamic import reflect") {
+		t.Fatalf("cross-file reflection helper passed guard: %v", got)
+	}
+
+	externalHelperEscape := parseAgentActionMutation(
+		t, `package agentcontinuation
+type ActionDispatcher struct{ store any }
+func (d *ActionDispatcher) Escape() {
+	externalhelper.Hidden(d.store)
+}`)
+	got = agentActionUnapprovedStoreFieldViolations(
+		map[string]*ast.File{path: externalHelperEscape}, root)
+	if !agentActionViolationContains(
+		got, "Escape unapproved Store field receiver d.store",
+	) {
+		t.Fatalf("external dynamic helper escape passed guard: %v", got)
 	}
 }
 
@@ -958,6 +1044,15 @@ func agentActionApprovedAdapterViolations(
 				fmt.Sprintf("%s:%s unapproved %s refs=%d",
 					allowance.path, allowance.declaration, name, count))
 		}
+		if allowance.receiver != "" {
+			for _, escaped := range agentActionReceiverEscapes(
+				declaration, allowance.receiver, allowance.references,
+			) {
+				violations = append(violations,
+					fmt.Sprintf("%s:%s %s",
+						allowance.path, allowance.declaration, escaped))
+			}
+		}
 	}
 	return violations
 }
@@ -998,6 +1093,71 @@ func agentActionExpressionPath(expression ast.Expr) string {
 	}
 }
 
+func agentActionReceiverEscapes(
+	declaration ast.Decl,
+	receiver string,
+	allowedMethods map[string]int,
+) []string {
+	parents := make(map[ast.Node]ast.Node)
+	var stack []ast.Node
+	ast.Inspect(declaration, func(node ast.Node) bool {
+		if node == nil {
+			stack = stack[:len(stack)-1]
+			return false
+		}
+		if len(stack) > 0 {
+			parents[node] = stack[len(stack)-1]
+		}
+		stack = append(stack, node)
+		return true
+	})
+
+	var violations []string
+	ast.Inspect(declaration, func(node ast.Node) bool {
+		expression, ok := node.(ast.Expr)
+		if !ok || agentActionExpressionPath(expression) != receiver {
+			return true
+		}
+		parent := parents[node]
+		if field, ok := parent.(*ast.Field); ok {
+			for _, name := range field.Names {
+				if name == node {
+					return true
+				}
+			}
+		}
+		if selector, ok := parent.(*ast.SelectorExpr); ok &&
+			selector.X == node && allowedMethods[selector.Sel.Name] > 0 {
+			if call, ok := parents[selector].(*ast.CallExpr); ok &&
+				call.Fun == selector {
+				return true
+			}
+		}
+		if binary, ok := parent.(*ast.BinaryExpr); ok &&
+			(binary.Op == token.EQL || binary.Op == token.NEQ) {
+			other := binary.X
+			if other == node {
+				other = binary.Y
+			}
+			if identifier, ok := other.(*ast.Ident); ok &&
+				identifier.Name == "nil" {
+				return true
+			}
+		}
+		if keyValue, ok := parent.(*ast.KeyValueExpr); ok &&
+			keyValue.Value == node {
+			if key, ok := keyValue.Key.(*ast.Ident); ok &&
+				key.Name == "store" {
+				return true
+			}
+		}
+		violations = append(violations,
+			fmt.Sprintf("receiver %s escaped direct call", receiver))
+		return true
+	})
+	return violations
+}
+
 func agentActionFindDeclaration(
 	file *ast.File,
 	name string,
@@ -1010,21 +1170,67 @@ func agentActionFindDeclaration(
 	return nil
 }
 
-func agentActionAdapterGenericExecutionViolations(
+func agentActionUnapprovedStoreFieldViolations(
 	files map[string]*ast.File,
 	root string,
 ) []string {
 	adapterFiles := map[string]bool{
-		"cmd/runtimeadmin/main.go":               true,
 		"agentcontinuation/action_controller.go": true,
 		"agentcontinuation/action_dispatcher.go": true,
 	}
 	var violations []string
-	for relativePath := range adapterFiles {
-		path := filepath.Join(
-			filepath.Clean(root), filepath.FromSlash(relativePath))
-		file, ok := files[path]
-		if !ok {
+	for path, file := range files {
+		relativePath, err := filepath.Rel(filepath.Clean(root), path)
+		if err != nil {
+			continue
+		}
+		relativePath = filepath.ToSlash(relativePath)
+		if !adapterFiles[relativePath] {
+			continue
+		}
+		for _, declaration := range file.Decls {
+			declarationName := agentActionDeclarationName(declaration)
+			ast.Inspect(declaration, func(node ast.Node) bool {
+				selector, ok := node.(*ast.SelectorExpr)
+				if !ok || selector.Sel.Name != "store" {
+					return true
+				}
+				receiver := agentActionExpressionPath(selector)
+				allowed := false
+				for _, allowance := range agentActionReferenceAllowances {
+					if allowance.path == relativePath &&
+						allowance.declaration == declarationName &&
+						allowance.receiver == receiver {
+						allowed = true
+						break
+					}
+				}
+				if !allowed {
+					violations = append(violations,
+						fmt.Sprintf(
+							"%s:%s unapproved Store field receiver %s",
+							relativePath, declarationName, receiver))
+				}
+				return true
+			})
+		}
+	}
+	return violations
+}
+
+func agentActionAdapterGenericExecutionViolations(
+	files map[string]*ast.File,
+	root string,
+) []string {
+	var violations []string
+	for path, file := range files {
+		relativePath, err := filepath.Rel(filepath.Clean(root), path)
+		if err != nil {
+			continue
+		}
+		relativePath = filepath.ToSlash(relativePath)
+		if !strings.HasPrefix(relativePath, "agentcontinuation/") &&
+			!strings.HasPrefix(relativePath, "cmd/runtimeadmin/") {
 			continue
 		}
 		ast.Inspect(file, func(node ast.Node) bool {
