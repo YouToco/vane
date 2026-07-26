@@ -1988,9 +1988,9 @@ func (l *Loop) NotifyEvent(
 // legacy+ledger 原子性与精确重试反重复，不负责从业务事实耐久重建未开始的写入；
 // 扫描/checkpoint/断点重试属于 7.10。
 //
-//   - 持 per-user 锁（与 HandleMessage 的 userMu 同一把）：side-writer 原子提交
-//     虽由 Store 持 session 根锁，但若落在 HandleMessage 的 load→save 窗口中间，
-//     仍会被 saveSession 的全量覆盖写吞掉。
+//   - 持 per-user 锁（与 HandleMessage 的 userMu 同一把）：避免 side-writer
+//     在 HandleMessage 的 load→save 窗口中间提交，使 normal-turn base fence
+//     因看见未加载的新投影而产生可避免的 stale-base conflict。
 //   - 抢锁与写库放在独立 goroutine：HandleMessage 可持锁整条消息预算（分钟级），
 //     同步等锁会把卡片结果更新拖到分钟级；且 sync.Mutex 不感知 ctx，调用方的
 //     回调预算会在等锁中流逝殆尽，锁到手时写库必败。goroutine 生命周期
