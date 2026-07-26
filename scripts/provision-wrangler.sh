@@ -86,12 +86,16 @@ else
   [[ $("$node_staging/bin/node" --version) == "v$node_version" ]]
   chown -R root:root "$node_staging"
   chmod -R go-w "$node_staging"
+  chmod 755 "$node_staging"
   mv "$node_staging" "$node_target"
   node_staging=
   rm -f -- "$node_archive"
   node_archive=
 fi
-if find "$node_target" \( ! -user root -o -perm /022 \) -print -quit |
+chmod 755 "$node_target"
+if find "$node_target" \
+  \( ! -user root -o \( ! -type l -a -perm /022 \) \) \
+  -print -quit |
   grep -q .; then
   echo "pinned Node tree is not root-owned/read-only" >&2
   exit 1
@@ -127,9 +131,12 @@ wrangler_entry=$wrangler_staging/node_modules/wrangler/bin/wrangler.js
 
 chown -R root:root "$wrangler_staging"
 chmod -R go-w "$wrangler_staging"
+chmod 755 "$wrangler_staging"
 mv "$wrangler_staging" "$wrangler_target"
 wrangler_staging=
-if find "$wrangler_target" \( ! -user root -o -perm /022 \) -print -quit |
+if find "$wrangler_target" \
+  \( ! -user root -o \( ! -type l -a -perm /022 \) \) \
+  -print -quit |
   grep -q .; then
   echo "Wrangler tree is not root-owned/read-only" >&2
   exit 1
@@ -144,8 +151,14 @@ chown root:root "$wrapper_temp"
 chmod 0755 "$wrapper_temp"
 mv "$wrapper_temp" "$wrapper"
 
-[[ $("$wrapper" --version | tail -n 1) == "$wrangler_version" ]]
-"$wrapper" pages deploy --help >/dev/null
+runner_wrangler_version=$(
+  runuser -u "$runner_user" -- \
+    bash -c 'cd / && exec "$1" --version' bash "$wrapper" |
+    tail -n 1
+)
+[[ $runner_wrangler_version == "$wrangler_version" ]]
+runuser -u "$runner_user" -- \
+  bash -c 'cd / && exec "$1" pages deploy --help >/dev/null' bash "$wrapper"
 [[ $(stat -c '%U:%G:%a' "$wrapper") == root:root:755 ]]
 
 trap - EXIT

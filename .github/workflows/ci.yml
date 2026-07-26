@@ -11,7 +11,9 @@ permissions:
 
 jobs:
   test:
-    runs-on: [self-hosted, Linux, ARM64, vane-build]
+    # PR-controlled code must not execute in the trusted exact-main build VM.
+    # This runner is repo-scoped to vane-deploy but lives in vane-test.
+    runs-on: [self-hosted, Linux, ARM64, vane-test]
     timeout-minutes: 15
 
     steps:
