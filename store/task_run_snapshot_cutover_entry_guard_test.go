@@ -73,10 +73,18 @@ func TestTaskRunSnapshotCutoverProductionEntryIsRuntimeAdminOnly(t *testing.T) {
 					relative)
 			}
 			if strings.Contains(string(raw),
-				"task_run_snapshot_v2_cutover_control(") &&
+				"FROM task_run_snapshot_v2_cutover_control(") &&
 				relative != "store/task_run_snapshot_cutover_control.go" {
 				t.Errorf("raw cutover primitive escaped Store controller: %s",
 					relative)
+			}
+			if strings.Contains(string(raw),
+				"FROM task_run_snapshot_v2_rebase_definition_edit(") &&
+				relative != "store/task_definition_edit_cutover.go" {
+				t.Errorf(
+					"definition-edit rebase primitive escaped Store controller: %s",
+					relative,
+				)
 			}
 			for _, forbidden := range []string{
 				"INSERT INTO task_run_snapshot_v2_cutover_events",

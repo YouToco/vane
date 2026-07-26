@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const latestMigrationVersion int64 = 56
+const latestMigrationVersion int64 = 57
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -81,6 +81,7 @@ var wantTables = []string{
 	// 036 C2c-2 immutable run-snapshot v2 shadow sidecar.
 	"task_run_snapshot_v2_shadows",
 	// 037 C2c-3b-1 durable per-run v2 authority fence.
+	// 036 C2c-2 immutable run-snapshot v2 shadow sidecar.
 	"task_run_snapshot_v2_cutover_events",
 	// 038 adds only restricted cutover functions/role; no new table.
 	// 039 durable external push effect/checkpoint substrate.

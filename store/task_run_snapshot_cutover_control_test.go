@@ -113,14 +113,8 @@ func TestTaskRunSnapshotCutoverControlReplayFailsClosedOnActivePinDrift(
 	f, taskID, _ := newTaskRunSnapshotCutoverControlFixture(t)
 	activation := callTaskRunSnapshotCutoverControl(
 		t, f.st, f.tenantID, f.userID, taskID, "activate")
-	if _, err := f.st.pool.Exec(t.Context(),
-		`UPDATE schedules
-		    SET approved_definition_version=NULL,
-		        approved_definition_digest=NULL
-		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
-		f.tenantID, f.userID, taskID); err != nil {
-		t.Fatal(err)
-	}
+	forceTaskRunSnapshotCutoverActivePinDrift(
+		t, f.st, f.tenantID, f.userID, taskID)
 	_, err := callTaskRunSnapshotCutoverControlError(
 		t, f.st, f.tenantID, f.userID, taskID, "activate")
 	requireSQLState038(t, err, "23514")

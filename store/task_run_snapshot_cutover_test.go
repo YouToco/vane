@@ -546,14 +546,8 @@ func jsonSemanticallyEqual(left, right []byte) bool {
 
 func TestTaskRunSnapshotCutoverActivePinDriftFailsAllNewWriters(t *testing.T) {
 	f := newTaskRunSnapshotCutoverFixture(t)
-	if _, err := f.base.st.pool.Exec(t.Context(),
-		`UPDATE schedules
-		    SET approved_definition_version=NULL,
-		        approved_definition_digest=NULL
-		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
-		f.base.tenantID, f.base.userID, f.taskID); err != nil {
-		t.Fatalf("drift current Approved head: %v", err)
-	}
+	forceTaskRunSnapshotCutoverActivePinDrift(
+		t, f.base.st, f.base.tenantID, f.base.userID, f.taskID)
 	for _, marked := range []bool{false, true} {
 		runID := fmt.Sprintf("cutover-pin-drift-%v-%s", marked, uuid.NewString())
 		var eventID *int64
@@ -1059,14 +1053,8 @@ func TestTaskRunSnapshotCutoverTenantPurgeReportsAndDeletesFence(t *testing.T) {
 
 func TestTaskRunSnapshotCutoverErrorDoesNotExposeDatabaseDetail(t *testing.T) {
 	f := newTaskRunSnapshotCutoverFixture(t)
-	if _, err := f.base.st.pool.Exec(t.Context(),
-		`UPDATE schedules
-		    SET approved_definition_version=NULL,
-		        approved_definition_digest=NULL
-		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
-		f.base.tenantID, f.base.userID, f.taskID); err != nil {
-		t.Fatal(err)
-	}
+	forceTaskRunSnapshotCutoverActivePinDrift(
+		t, f.base.st, f.base.tenantID, f.base.userID, f.taskID)
 	runID := "cutover-safe-error-" + uuid.NewString()
 	_, err := f.base.st.createOrGetTaskRunSnapshotWithShadowV2(
 		t.Context(), f.base.params(f.taskID, runID), true)
@@ -1076,6 +1064,35 @@ func TestTaskRunSnapshotCutoverErrorDoesNotExposeDatabaseDetail(t *testing.T) {
 	if errors.Is(err, context.Canceled) ||
 		fmt.Sprint(err) == "" {
 		t.Fatalf("unexpected admission error: %v", err)
+	}
+}
+
+func forceTaskRunSnapshotCutoverActivePinDrift(
+	t *testing.T,
+	st *Store,
+	tenantID, userID int64,
+	taskID string,
+) {
+	t.Helper()
+	tx, err := st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("begin active-pin corruption fixture: %v", err)
+	}
+	defer rollbackCompiledTaskTx(context.Background(), tx)
+	if _, err := tx.Exec(t.Context(),
+		`SET LOCAL session_replication_role = replica`); err != nil {
+		t.Fatalf("isolate active-pin corruption fixture: %v", err)
+	}
+	if _, err := tx.Exec(t.Context(),
+		`UPDATE schedules
+		    SET approved_definition_version=NULL,
+		        approved_definition_digest=NULL
+		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+		tenantID, userID, taskID); err != nil {
+		t.Fatalf("inject current Approved head drift: %v", err)
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatalf("commit active-pin corruption fixture: %v", err)
 	}
 }
 

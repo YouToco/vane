@@ -71,19 +71,34 @@ func (s *Store) ControlTaskRunSnapshotCutover(
 		return TaskRunSnapshotCutoverResult{}, err
 	}
 
-	var pointer *int64
+	var (
+		pointer       *int64
+		editOperation *string
+		editFence     *int64
+	)
 	if err := tx.QueryRow(ctx,
-		`SELECT run_snapshot_cutover_event_id
+		`SELECT run_snapshot_cutover_event_id,
+		        definition_edit_operation_id,definition_edit_fence
 		   FROM schedules
 		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3
 		  FOR UPDATE`,
 		tenantID, userID, taskID,
-	).Scan(&pointer); err != nil {
+	).Scan(&pointer, &editOperation, &editFence); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return TaskRunSnapshotCutoverResult{}, taskRunNotFound()
 		}
 		return TaskRunSnapshotCutoverResult{},
 			taskRunDatabaseError("lock snapshot cutover schedule", err)
+	}
+	if (editOperation == nil) != (editFence == nil) {
+		return TaskRunSnapshotCutoverResult{}, taskRunIntegrityError()
+	}
+	if editOperation != nil {
+		return TaskRunSnapshotCutoverResult{}, types.NewAppError(
+			types.CodeConflict,
+			"task run snapshot cutover conflicts with a definition edit",
+			nil,
+		)
 	}
 
 	var currentAction *string
