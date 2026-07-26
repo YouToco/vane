@@ -479,23 +479,9 @@ func definitionEditSchedulerProjection(
 	if err := strictjson.DecodeExact(definition.SpecJSON, &spec); err != nil {
 		return scheduler.TaskDefinitionEditDefinition{}, fmt.Errorf("decode exact schedule spec: %w", err)
 	}
-	var approvedScope struct {
-		SourceIDs   []int64               `json:"source_ids,omitempty"`
-		TopN        int                   `json:"top_n,omitempty"`
-		Observation *observation.PolicyV1 `json:"observation,omitempty"`
-	}
-	if err := strictjson.DecodeExact(definition.ScopeJSON, &approvedScope); err != nil {
+	approvedScope, err := decodeDefinitionEditApprovedScope(definition.ScopeJSON)
+	if err != nil {
 		return scheduler.TaskDefinitionEditDefinition{}, fmt.Errorf("decode exact push scope: %w", err)
-	}
-	if approvedScope.Observation != nil {
-		if err := approvedScope.Observation.Validate(); err != nil {
-			return scheduler.TaskDefinitionEditDefinition{},
-				fmt.Errorf("decode exact observation policy: %w", err)
-		}
-		if approvedScope.Observation.EffectiveAt.IsZero() {
-			return scheduler.TaskDefinitionEditDefinition{},
-				errors.New("decode exact observation policy: effective_at is required")
-		}
 	}
 	scope := workflow.PushScope{
 		SourceIDs: approvedScope.SourceIDs,
@@ -504,6 +490,39 @@ func definitionEditSchedulerProjection(
 	return scheduler.TaskDefinitionEditDefinition{
 		Spec: spec, Scope: scope, NLDescription: definition.NLDescription,
 	}, nil
+}
+
+type definitionEditApprovedScope struct {
+	SourceIDs   []int64               `json:"source_ids,omitempty"`
+	TopN        int                   `json:"top_n,omitempty"`
+	Observation *observation.PolicyV1 `json:"observation,omitempty"`
+}
+
+func decodeDefinitionEditApprovedScope(
+	raw json.RawMessage,
+) (definitionEditApprovedScope, error) {
+	var wire struct {
+		SourceIDs   []int64         `json:"source_ids,omitempty"`
+		TopN        int             `json:"top_n,omitempty"`
+		Observation json.RawMessage `json:"observation,omitempty"`
+	}
+	if err := strictjson.DecodeExact(raw, &wire); err != nil {
+		return definitionEditApprovedScope{}, err
+	}
+	scope := definitionEditApprovedScope{
+		SourceIDs: wire.SourceIDs,
+		TopN:      wire.TopN,
+	}
+	if len(wire.Observation) == 0 ||
+		bytes.Equal(bytes.TrimSpace(wire.Observation), []byte("null")) {
+		return scope, nil
+	}
+	policy, err := observation.DecodePolicyV1Exact(wire.Observation)
+	if err != nil {
+		return definitionEditApprovedScope{}, err
+	}
+	scope.Observation = &policy
+	return scope, nil
 }
 
 func definitionEditOriginalStatusForWrite(

@@ -1,9 +1,65 @@
 package observation
 
 import (
+	"bytes"
+	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 )
+
+func TestDecodePolicyV1Exact_FlattenedEmbeddedWire(t *testing.T) {
+	want := mustScheduleIntervalPolicy(
+		t, time.Date(2026, 7, 25, 1, 0, 0, 0, time.UTC),
+	)
+	raw, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodePolicyV1Exact(raw)
+	if err != nil {
+		t.Fatalf("DecodePolicyV1Exact() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("decoded policy = %+v, want %+v", got, want)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{
+			name: "unknown field",
+			mutate: func(value []byte) []byte {
+				return bytes.Replace(value, []byte(`"schema":`),
+					[]byte(`"future":true,"schema":`), 1)
+			},
+		},
+		{
+			name: "case folded field",
+			mutate: func(value []byte) []byte {
+				return bytes.Replace(value, []byte(`"schema"`),
+					[]byte(`"SCHEMA"`), 1)
+			},
+		},
+		{
+			name: "missing effective at",
+			mutate: func(value []byte) []byte {
+				return bytes.Replace(value,
+					[]byte(`,"effective_at":"2026-07-25T01:00:00Z"`), nil, 1)
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			if _, err := DecodePolicyV1Exact(
+				testCase.mutate(bytes.Clone(raw)),
+			); err == nil {
+				t.Fatal("DecodePolicyV1Exact() accepted invalid wire")
+			}
+		})
+	}
+}
 
 func TestScheduleIntervalUsesNominalAndOpenClosedBoundary(t *testing.T) {
 	effective := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)

@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/YouToco/vane/taskstate"
 )
 
 type componentFixtureV1 struct {
@@ -305,6 +307,111 @@ func TestValidateApprovedProjectionBindings_AnchoredIntervalUsesWriterLayout(t *
 		specRaw, scopeRaw, nlDescription,
 	); err != nil {
 		t.Fatalf("anchored interval projection rejected: %v", err)
+	}
+}
+
+func TestValidateApprovedProjectionBindings_ObservationStaysOutsideTemporalProjection(t *testing.T) {
+	specRaw := []byte(`{"cron":"0 9 * * 1","tz":"Asia/Shanghai"}`)
+	legacyScope := PushScopeV1{SourceIDs: []int64{11, 22}, TopN: 3}
+	scopeRaw := []byte(`{"observation":{"effective_at":"2026-07-25T01:00:00Z","evidence":{"requirement":"trusted_allowed"},"late_policy":"strict","mode":"content","schema":"vane.observation-policy/v1","unknown_time":"reject","window":{"kind":"schedule_interval"}},"source_ids":[11,22],"top_n":3}`)
+	nlDescription := "每周一 09:00 检查官方更新"
+	wantProjection := approvedProjectionV1{
+		Spec: ScheduleSpecV1{
+			Cron: "0 9 * * 1",
+			TZ:   "Asia/Shanghai",
+		},
+		Scope:         legacyScope,
+		NLDescription: nlDescription,
+	}
+	wantDigest, err := digestJSON(wantProjection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := PreparedEditV1{
+		BaseProjectionDigest:   wantDigest,
+		TargetProjectionDigest: wantDigest,
+		BaseOriginal: RepresentationV1{Action: PreparedActionV1{
+			Params: PushParamsV1{Scope: legacyScope, NLDesc: nlDescription},
+		}},
+		TargetFinal: RepresentationV1{Action: PreparedActionV1{
+			Params: PushParamsV1{Scope: legacyScope, NLDesc: nlDescription},
+		}},
+	}
+	if err := ValidateApprovedProjectionBindings(
+		prepared,
+		specRaw, scopeRaw, nlDescription,
+		specRaw, scopeRaw, nlDescription,
+	); err != nil {
+		t.Fatalf("observation policy changed retained Temporal projection: %v", err)
+	}
+
+	invalid := bytes.Replace(scopeRaw, []byte(`"schema":`),
+		[]byte(`"future":true,"schema":`), 1)
+	if err := ValidateApprovedProjectionBindings(
+		prepared,
+		specRaw, scopeRaw, nlDescription,
+		specRaw, invalid, nlDescription,
+	); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unknown observation field error = %v, want ErrInvalid", err)
+	}
+}
+
+func TestValidateApprovedProjectionBindings_AcceptsTaskstateCanonicalObservationScope(t *testing.T) {
+	fixture, proposal := loadFixture(t)
+	frozen, err := DecodeFrozenProposal(
+		proposal, fixture.BaseDefinition, fixture.TargetDefinition,
+		fixture.PreparedEdit, fixture.BaseSnapshot,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := taskstate.DecodeApprovedDefinitionV1(fixture.TargetDefinition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacyScope PushScopeV1
+	if err := json.Unmarshal(target.ScopeJSON, &legacyScope); err != nil {
+		t.Fatal(err)
+	}
+	target.ScopeJSON, err = json.Marshal(struct {
+		SourceIDs   []int64         `json:"source_ids,omitempty"`
+		TopN        int             `json:"top_n,omitempty"`
+		Observation json.RawMessage `json:"observation"`
+	}{
+		SourceIDs: legacyScope.SourceIDs,
+		TopN:      legacyScope.TopN,
+		Observation: json.RawMessage(
+			`{"schema":"vane.observation-policy/v1","mode":"content","window":{"kind":"schedule_interval"},"late_policy":"strict","evidence":{"requirement":"trusted_allowed"},"unknown_time":"reject","effective_at":"2026-07-25T01:00:00Z"}`,
+		),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetBytes, err := taskstate.EncodeApprovedDefinitionV1(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type projectionFields struct {
+		NLDescription string          `json:"nl_description"`
+		SpecJSON      json.RawMessage `json:"spec_json"`
+		ScopeJSON     json.RawMessage `json:"scope_json"`
+	}
+	var baseWire, targetWire projectionFields
+	if err := json.Unmarshal(fixture.BaseDefinition, &baseWire); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(targetBytes, &targetWire); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(targetWire.ScopeJSON, []byte(`{"observation":`)) {
+		t.Fatalf("taskstate scope was not map-canonical: %s", targetWire.ScopeJSON)
+	}
+	if err := ValidateApprovedProjectionBindings(
+		frozen.Prepared,
+		baseWire.SpecJSON, baseWire.ScopeJSON, baseWire.NLDescription,
+		targetWire.SpecJSON, targetWire.ScopeJSON, targetWire.NLDescription,
+	); err != nil {
+		t.Fatalf("taskstate-canonical observation scope rejected: %v", err)
 	}
 }
 

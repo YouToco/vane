@@ -282,21 +282,21 @@ func (c *DefinitionEditController) loadScope(
 }
 
 type definitionEditCommand struct {
-	TaskID        string
-	Spec          *scheduler.ScheduleSpec
-	Intent        *string
-	NLDescription *string
-	Strictness    *types.PushStrictness
+	TaskID            string
+	Spec              *scheduler.ScheduleSpec
+	Intent            *string
+	NLDescription     *string
+	Strictness        *types.PushStrictness
 	ObservationPolicy *observation.PolicySpecV1
 }
 
 func decodeDefinitionEditCommand(raw json.RawMessage) (definitionEditCommand, error) {
 	var wire struct {
-		TaskID        json.RawMessage `json:"task_id"`
-		Spec          json.RawMessage `json:"spec,omitempty"`
-		Intent        json.RawMessage `json:"intent,omitempty"`
-		NLDescription json.RawMessage `json:"nl_description,omitempty"`
-		Strictness    json.RawMessage `json:"strictness,omitempty"`
+		TaskID            json.RawMessage `json:"task_id"`
+		Spec              json.RawMessage `json:"spec,omitempty"`
+		Intent            json.RawMessage `json:"intent,omitempty"`
+		NLDescription     json.RawMessage `json:"nl_description,omitempty"`
+		Strictness        json.RawMessage `json:"strictness,omitempty"`
 		ObservationPolicy json.RawMessage `json:"observation_policy,omitempty"`
 	}
 	if strictjson.DecodeExact(raw, &wire) != nil {
@@ -423,12 +423,8 @@ func applyDefinitionEditCommand(
 			return taskstate.ApprovedDefinitionV1{}, "",
 				definitionEditControllerValidation("observation_policy 无法生效")
 		}
-		var current struct {
-			SourceIDs []int64 `json:"source_ids,omitempty"`
-			TopN int `json:"top_n,omitempty"`
-			Observation *observation.PolicyV1 `json:"observation,omitempty"`
-		}
-		if strictjson.DecodeExact(target.ScopeJSON, &current) != nil {
+		current, err := decodeDefinitionEditApprovedScope(target.ScopeJSON)
+		if err != nil {
 			return taskstate.ApprovedDefinitionV1{}, "",
 				definitionEditControllerValidation("当前任务范围无效")
 		}

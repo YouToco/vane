@@ -1,6 +1,7 @@
 package task
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -52,9 +53,10 @@ func (f *definitionEditControllerFakeStore) LoadTaskDefinitionEditOperationByAct
 }
 
 type definitionEditControllerFakeCoordinator struct {
-	prepareCalls []PrepareTaskDefinitionEditProposalInput
-	prepareOp    *types.TaskDefinitionEditOperation
-	prepareErr   error
+	prepareCalls       []PrepareTaskDefinitionEditProposalInput
+	prepareOp          *types.TaskDefinitionEditOperation
+	prepareErr         error
+	validateProjection bool
 
 	confirmScopes   []types.TaskDefinitionEditScope
 	confirmReceipts []TaskDefinitionEditReceiptTarget
@@ -72,6 +74,11 @@ func (f *definitionEditControllerFakeCoordinator) PrepareAndSealProposal(
 	in PrepareTaskDefinitionEditProposalInput,
 ) (*types.TaskDefinitionEditOperation, error) {
 	f.prepareCalls = append(f.prepareCalls, in)
+	if f.validateProjection {
+		if _, err := definitionEditSchedulerProjection(in.TargetDefinition); err != nil {
+			return nil, err
+		}
+	}
 	return f.prepareOp, f.prepareErr
 }
 
@@ -170,6 +177,106 @@ func TestDefinitionEditController_ProposeSealsExactPatchedDefinition(t *testing.
 	}
 	if got.TargetHead.Digest != targetDigest || got.TargetHead.Digest == got.BaseHead.Digest {
 		t.Fatalf("target head = %+v, digest=%q", got.TargetHead, targetDigest)
+	}
+}
+
+func TestDefinitionEditController_ProposeObservationPolicyReachesConfirmation(t *testing.T) {
+	base := definitionEditControllerBase(t)
+	baseDigest, err := taskstate.DigestApprovedDefinitionV1(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	creation := scheduler.PreparedTaskSchedule{
+		TaskID: "task-edit-1", TenantID: 7, UserID: 11,
+		PreparedDigest: strings.Repeat("a", 64),
+	}
+	store := &definitionEditControllerFakeStore{
+		tenantID: 7, status: types.ScheduleStatusActive,
+		version: 3, digest: baseDigest, base: base,
+		creation: mustJSON(t, creation),
+	}
+	coordinator := &definitionEditControllerFakeCoordinator{
+		validateProjection: true,
+		prepareOp: &types.TaskDefinitionEditOperation{
+			ID: "edit-observation-1", TenantID: 7, UserID: 11,
+			TargetTenantID: 7, TargetUserID: 11, TaskID: "task-edit-1",
+		},
+	}
+	controller := NewDefinitionEditController(store, coordinator)
+	sessionID := int64(92)
+	rawArgs := json.RawMessage(`{
+		"task_id":"task-edit-1",
+		"observation_policy":{
+			"schema":"vane.observation-policy/v1",
+			"mode":"event",
+			"window":{"kind":"schedule_interval"},
+			"late_policy":"strict",
+			"evidence":{
+				"requirement":"official_required",
+				"official_domains":["openai.com"]
+			},
+			"unknown_time":"reject",
+			"event":{
+				"subject":"OpenAI 模型",
+				"event_kind":"新模型上新",
+				"qualification":"general_availability"
+			},
+			"qualifier_prompt":"vane.qualify-events/v1"
+		}
+	}`)
+	proposal, err := controller.Propose(t.Context(), DefinitionEditProposalInput{
+		ActionID: "edit-observation-1", UserID: 11, SessionID: &sessionID,
+		RawArgs:   rawArgs,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("Propose() error = %v", err)
+	}
+	if proposal.ID != "edit-observation-1" ||
+		len(coordinator.prepareCalls) != 1 {
+		t.Fatalf("proposal=%+v prepare calls=%d", proposal, len(coordinator.prepareCalls))
+	}
+	targetScope := string(coordinator.prepareCalls[0].TargetDefinition.ScopeJSON)
+	for _, want := range []string{
+		`"schema":"vane.observation-policy/v1"`,
+		`"kind":"schedule_interval"`,
+		`"effective_at":`,
+	} {
+		if !strings.Contains(targetScope, want) {
+			t.Fatalf("target scope missing %s: %s", want, targetScope)
+		}
+	}
+
+	updatedBase := coordinator.prepareCalls[0].TargetDefinition
+	updatedDigest, err := taskstate.DigestApprovedDefinitionV1(updatedBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCoordinator := &definitionEditControllerFakeCoordinator{
+		validateProjection: true,
+		prepareOp: &types.TaskDefinitionEditOperation{
+			ID: "edit-observation-2", TenantID: 7, UserID: 11,
+			TargetTenantID: 7, TargetUserID: 11, TaskID: "task-edit-1",
+		},
+	}
+	secondController := NewDefinitionEditController(
+		&definitionEditControllerFakeStore{
+			tenantID: 7, status: types.ScheduleStatusActive,
+			version: 4, digest: updatedDigest, base: updatedBase,
+			creation: mustJSON(t, creation),
+		},
+		secondCoordinator,
+	)
+	secondArgs := bytes.Replace(rawArgs, []byte(`general_availability`),
+		[]byte(`official_announcement`), 1)
+	if _, err := secondController.Propose(
+		t.Context(),
+		DefinitionEditProposalInput{
+			ActionID: "edit-observation-2", UserID: 11, SessionID: &sessionID,
+			RawArgs: secondArgs, ExpiresAt: time.Now().Add(time.Hour),
+		},
+	); err != nil {
+		t.Fatalf("second Propose() with existing observation error = %v", err)
 	}
 }
 
