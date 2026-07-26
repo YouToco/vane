@@ -248,17 +248,22 @@ func (s *Store) GetAgentActionContinuationStatus(
 	switch executionVersion {
 	case 0:
 		if !continuationExists {
-			if generation != 0 || route != AgentActionAuthorityLegacy ||
-				rootStatus != string(types.PendingActionStatusPending) ||
-				!databaseNow.Before(rootExpiresAt) {
+			if generation != 0 || route != AgentActionAuthorityLegacy {
 				return AgentActionContinuationStatus{},
 					agentEventIntegrityError()
 			}
-			if _, err := freezeEnableSourceAction(sourceID); err != nil {
+			switch types.PendingActionStatus(rootStatus) {
+			case types.PendingActionStatusPending,
+				types.PendingActionStatusExecuted,
+				types.PendingActionStatusCancelled,
+				types.PendingActionStatusExpired:
+			default:
 				return AgentActionContinuationStatus{},
 					agentEventIntegrityError()
 			}
-			status.ActivationEligible = true
+			status.ActivationEligible =
+				rootStatus == string(types.PendingActionStatusPending) &&
+					databaseNow.Before(rootExpiresAt)
 			if err := tx.Commit(ctx); err != nil {
 				return AgentActionContinuationStatus{},
 					agentEventDatabaseError(

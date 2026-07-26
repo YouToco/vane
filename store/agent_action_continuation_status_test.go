@@ -59,6 +59,25 @@ func TestGetAgentActionContinuationStatusVerifiesExactAuthority(t *testing.T) {
 		string(types.PendingActionStatusPending) {
 		t.Fatalf("legacy status=%+v", legacy)
 	}
+	if _, err := f.store.pool.Exec(ctx,
+		`UPDATE pending_actions
+		    SET expires_at=clock_timestamp()-interval '1 second'
+		  WHERE id=$1`,
+		legacyID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	expiredLegacy, err := f.store.GetAgentActionContinuationStatus(
+		ctx, f.tenantA, f.userA, legacyID,
+	)
+	if err != nil {
+		t.Fatalf("read ineligible expired legacy status: %v", err)
+	}
+	if expiredLegacy.ActivationEligible ||
+		expiredLegacy.Route != AgentActionAuthorityLegacy ||
+		expiredLegacy.Generation != 0 {
+		t.Fatalf("expired legacy status=%+v", expiredLegacy)
+	}
 
 	rollbackID := create(930002)
 	if _, err := f.store.ActivateAgentActionContinuation(
