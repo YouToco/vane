@@ -6,9 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: [self-hosted, Linux, ARM64, vane-ci]
+    runs-on: [self-hosted, Linux, ARM64, vane-test]
 
     services:
       postgres:
@@ -26,9 +29,11 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: "1.26"
 
@@ -48,7 +53,8 @@ jobs:
 
   deploy:
     needs: test
-    runs-on: [self-hosted, Linux, ARM64, vane-ci]
+    runs-on: [self-hosted, Linux, ARM64, vane-deploy]
+    environment: production
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     # 串行化对同一台 VPS 的部署。无此 group 时，相近时间 push main（如一个 release
@@ -63,9 +69,11 @@ jobs:
       cancel-in-progress: false
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: "1.26"
 
@@ -86,7 +94,7 @@ jobs:
           CGO_ENABLED: "0"
 
       - name: Prepare directories
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
         with:
           host: ${{ secrets.VPS_HOST }}
           port: ${{ secrets.VPS_PORT }}
@@ -96,7 +104,7 @@ jobs:
             mkdir -p /opt/vane/bin
 
       - name: Upload binary
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           port: ${{ secrets.VPS_PORT }}
@@ -109,7 +117,7 @@ jobs:
       # 缺这步会导致：改了 Caddyfile 或 compose 后 VPS 仍跑旧配置——M2 前端 404 即因此
       # （前端产物已就位但 Caddy 未挂 web 卷、Caddyfile 未更新）。strip_components 去掉 deploy/ 前缀。
       - name: Upload infra files
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           port: ${{ secrets.VPS_PORT }}
@@ -120,7 +128,7 @@ jobs:
           strip_components: 1
 
       - name: Apply infra changes
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
         with:
           host: ${{ secrets.VPS_HOST }}
           port: ${{ secrets.VPS_PORT }}
@@ -143,7 +151,7 @@ jobs:
             fi
 
       - name: Restart and verify
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
         with:
           host: ${{ secrets.VPS_HOST }}
           port: ${{ secrets.VPS_PORT }}
@@ -237,7 +245,7 @@ jobs:
       # 黄灯不阻断（exit 0——数据不足/需人工确认，部署当天几乎必然有黄，见 cmd/gate 头注释）。
       # 窗口 24h 覆盖部署前数据是刻意语义："上一版制造的红灯"不该被下一次部署静默滚过。
       - name: Gate probes
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
         with:
           host: ${{ secrets.VPS_HOST }}
           port: ${{ secrets.VPS_PORT }}
