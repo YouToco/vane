@@ -1923,6 +1923,9 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 	continuationFacts := filepath.Join(
 		storeDir, "agent_session_fact_outbox.go",
 	)
+	actionProjection := filepath.Join(
+		storeDir, "agent_action_projection.go",
+	)
 	fset := token.NewFileSet()
 	var violations []string
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, walkErr error) error {
@@ -1999,6 +2002,12 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 				"ProjectAgentSessionFact",
 				1,
 			)
+			if err != nil {
+				return err
+			}
+		} else if filepath.Clean(path) == actionProjection {
+			allowed, err =
+				agentEventLedgerActionProjectionReferences(file)
 			if err != nil {
 				return err
 			}
@@ -2258,6 +2267,101 @@ var helperName = "commitAgentSessionAppendTx"
 			"receipt helper method value/wrapper/dynamic string escaped guard: %v",
 			violations,
 		)
+	}
+}
+
+func TestAgentEventLedgerActionProjectionBoundaryRejectsMutations(
+	t *testing.T,
+) {
+	t.Parallel()
+	valid := `package store
+type Store struct{}
+type actionState struct {
+	TenantID int64
+	UserID int64
+	SessionID int64
+	ActionID string
+}
+var json struct{ RawMessage func(any) any }
+func (s *Store) ProjectAgentActionContinuation() {
+	var ctx, tx, effectTx, messages any
+	var action actionState
+	_, replayed, err := commitAgentSessionAppendTx(
+		ctx, tx, action.TenantID, action.UserID, action.SessionID,
+		"agent-action:enable-source:"+action.ActionID,
+		json.RawMessage(messages), true,
+	)
+	_, _, appendErr := commitAgentSessionAppendTx(
+		ctx, effectTx, action.TenantID, action.UserID, action.SessionID,
+		"agent-action:enable-source:"+action.ActionID,
+		json.RawMessage(messages), false,
+	)
+	_, _, _, _ = replayed, err, appendErr, effectTx
+}`
+	mutations := map[string]string{
+		"method value alias": strings.Replace(
+			valid,
+			"_, replayed, err := commitAgentSessionAppendTx(",
+			"appendSession := commitAgentSessionAppendTx\n"+
+				"\t_, replayed, err := appendSession(",
+			1,
+		),
+		"replay permits create": strings.Replace(
+			valid, "json.RawMessage(messages), true,",
+			"json.RawMessage(messages), false,", 1,
+		),
+		"effect uses outer transaction": strings.Replace(
+			valid, "ctx, effectTx, action.TenantID",
+			"ctx, tx, action.TenantID", 1,
+		),
+		"identity drift": strings.Replace(
+			valid, `"agent-action:enable-source:"+action.ActionID`,
+			`"agent-action:"+action.ActionID`, 1,
+		),
+		"wrong frozen session": strings.Replace(
+			valid, "action.UserID, action.SessionID,",
+			"action.UserID, lease.SessionID,", 1,
+		),
+		"third helper call": strings.Replace(
+			valid,
+			"_, _, _, _ = replayed, err, appendErr, effectTx",
+			"commitAgentSessionAppendTx()\n"+
+				"\t_, _, _, _ = replayed, err, appendErr, effectTx",
+			1,
+		),
+	}
+	parse := func(t *testing.T, source string) *ast.File {
+		t.Helper()
+		file, err := parser.ParseFile(
+			token.NewFileSet(), "agent_action_projection.go", source, 0,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return file
+	}
+	validFile := parse(t, valid)
+	allowed, err := agentEventLedgerActionProjectionReferences(validFile)
+	if err != nil {
+		t.Fatalf("valid exact boundary: %v", err)
+	}
+	if violations := agentEventLedgerForbiddenReferences(
+		token.NewFileSet(), validFile, allowed,
+	); len(violations) != 0 {
+		t.Fatalf("valid exact boundary violations=%v", violations)
+	}
+	for name, source := range mutations {
+		t.Run(name, func(t *testing.T) {
+			file := parse(t, source)
+			allowed, boundaryErr :=
+				agentEventLedgerActionProjectionReferences(file)
+			violations := agentEventLedgerForbiddenReferences(
+				token.NewFileSet(), file, allowed,
+			)
+			if boundaryErr == nil && len(violations) == 0 {
+				t.Fatal("mutated action projection boundary passed")
+			}
+		})
 	}
 }
 
@@ -2988,6 +3092,141 @@ func agentEventLedgerReceiptHelperReferences(
 		)
 	}
 	return allowed, nil
+}
+
+func agentEventLedgerActionProjectionReferences(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	const functionName = "ProjectAgentActionContinuation"
+	var target *ast.FuncDecl
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != functionName {
+			continue
+		}
+		if target != nil {
+			return nil, errors.New(
+				"Agent action projection boundary is duplicated",
+			)
+		}
+		target = function
+	}
+	if target == nil || target.Body == nil ||
+		target.Recv == nil || len(target.Recv.List) != 1 ||
+		!agentEventLedgerStoreReceiver(target.Recv.List[0].Type) {
+		return nil, errors.New(
+			"Agent action projection boundary must remain a Store method",
+		)
+	}
+
+	allowed := make(map[token.Pos]struct{}, 2)
+	references := 0
+	calls := map[string]int{
+		"tx:true":        0,
+		"effectTx:false": 0,
+	}
+	var boundaryErr error
+	ast.Inspect(target.Body, func(node ast.Node) bool {
+		identifier, ok := node.(*ast.Ident)
+		if ok && identifier.Name == "commitAgentSessionAppendTx" {
+			references++
+		}
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		helper, ok := call.Fun.(*ast.Ident)
+		if !ok || helper.Name != "commitAgentSessionAppendTx" {
+			return true
+		}
+		if len(call.Args) != 8 {
+			boundaryErr = fmt.Errorf(
+				"Agent action append args=%d want=8", len(call.Args),
+			)
+			return true
+		}
+		transaction := agentEventLedgerIdent(call.Args[1])
+		replayOnly := agentEventLedgerIdent(call.Args[7])
+		key := transaction + ":" + replayOnly
+		if _, expected := calls[key]; !expected ||
+			!agentEventLedgerActionAppendScope(call.Args) {
+			boundaryErr = fmt.Errorf(
+				"Agent action append escaped exact scope: tx=%s replay=%s",
+				transaction, replayOnly,
+			)
+			return true
+		}
+		calls[key]++
+		allowed[helper.Pos()] = struct{}{}
+		return true
+	})
+	if boundaryErr != nil {
+		return nil, boundaryErr
+	}
+	if references != 2 || len(allowed) != 2 ||
+		calls["tx:true"] != 1 || calls["effectTx:false"] != 1 {
+		return nil, fmt.Errorf(
+			"Agent action append refs/allowed/replay/effect=%d/%d/%d/%d, want 2/2/1/1",
+			references, len(allowed), calls["tx:true"],
+			calls["effectTx:false"],
+		)
+	}
+	return allowed, nil
+}
+
+func agentEventLedgerActionAppendScope(args []ast.Expr) bool {
+	if agentEventLedgerIdent(args[0]) != "ctx" ||
+		!agentEventLedgerSelector(args[2], "action", "TenantID") ||
+		!agentEventLedgerSelector(args[3], "action", "UserID") ||
+		!agentEventLedgerSelector(args[4], "action", "SessionID") {
+		return false
+	}
+	identity, ok := args[5].(*ast.BinaryExpr)
+	if !ok || identity.Op != token.ADD ||
+		!agentEventLedgerString(
+			identity.X, "agent-action:enable-source:",
+		) ||
+		!agentEventLedgerSelector(
+			identity.Y, "action", "ActionID",
+		) {
+		return false
+	}
+	messages, ok := args[6].(*ast.CallExpr)
+	if !ok || len(messages.Args) != 1 ||
+		!agentEventLedgerSelector(
+			messages.Fun, "json", "RawMessage",
+		) ||
+		agentEventLedgerIdent(messages.Args[0]) != "messages" {
+		return false
+	}
+	return true
+}
+
+func agentEventLedgerIdent(expression ast.Expr) string {
+	identifier, _ := expression.(*ast.Ident)
+	if identifier == nil {
+		return ""
+	}
+	return identifier.Name
+}
+
+func agentEventLedgerSelector(
+	expression ast.Expr,
+	base, field string,
+) bool {
+	selector, ok := expression.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != field {
+		return false
+	}
+	return agentEventLedgerIdent(selector.X) == base
+}
+
+func agentEventLedgerString(expression ast.Expr, want string) bool {
+	literal, ok := expression.(*ast.BasicLit)
+	if !ok || literal.Kind != token.STRING {
+		return false
+	}
+	return strings.Trim(literal.Value, "\"`") == want
 }
 
 func agentEventLedgerAgentLoopReferences(
