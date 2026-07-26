@@ -15,7 +15,7 @@ on:
 
 jobs:
   renew:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64, vane-web-ci]
     steps:
       - name: Issue cert (acme.sh + alidns DNS-01)
         run: |
@@ -30,7 +30,7 @@ jobs:
           # 必须带 token：匿名配额按 runner 共享 IP 计，曾被 403 限流（2026-07-19，ci.yml 同修）。
           url=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
             https://api.github.com/repos/aliyun/aliyun-cli/releases/latest \
-            | jq -r '.assets[] | select(.name | test("linux-.*-amd64\\.tgz$")) | .browser_download_url')
+            | jq -r '.assets[] | select(.name | test("linux-.*-arm64\\.tgz$")) | .browser_download_url')
           [ -n "$url" ] || { echo "GitHub API 未解析出下载地址（限流或资产命名变更）"; exit 1; }
           curl -fsSL -o /tmp/aliyun.tgz "$url"
           tar -xzf /tmp/aliyun.tgz -C /tmp && sudo mv /tmp/aliyun /usr/local/bin/aliyun
