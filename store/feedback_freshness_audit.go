@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/types"
 )
@@ -27,11 +29,13 @@ func (s *Store) AuditOutdatedFeedback(
 		publishedAt *time.Time
 		payload     []byte
 		workflowID  string
+		batchTaskID string
 	)
 	err := s.pool.QueryRow(ctx,
 		`SELECT f.tenant_id,f.delivery_id,c.published_at,
 		        COALESCE(r.payload,''::bytea),
-		        COALESCE(r.temporal_workflow_id,'')
+		        COALESCE(r.temporal_workflow_id,''),
+		        COALESCE(b.schedule_id,'')
 		   FROM feedbacks f
 		   JOIN deliveries d ON d.id=f.delivery_id
 		   LEFT JOIN content_items c ON c.id=d.content_item_id
@@ -41,7 +45,10 @@ func (s *Store) AuditOutdatedFeedback(
 		    AND f.action='misjudged'
 		    AND f.reason_code='outdated_or_out_of_window'`,
 		feedbackID, userID,
-	).Scan(&tenantID, &deliveryID, &publishedAt, &payload, &workflowID)
+	).Scan(
+		&tenantID, &deliveryID, &publishedAt, &payload,
+		&workflowID, &batchTaskID,
+	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", types.NewAppError(
 			types.CodeNotFound, "过时反馈不存在或不属于该用户", nil)
@@ -57,25 +64,38 @@ func (s *Store) AuditOutdatedFeedback(
 		"feedback_id": feedbackID,
 		"delivery_id": deliveryID,
 	}
-	if len(payload) == 0 {
+	if batchTaskID != "" {
+		taskID = &batchTaskID
+		audit["task_id"] = batchTaskID
+	}
+	if batchTaskID == "" {
+		audit["reason"] = "delivery batch task identity is unavailable"
+	} else if len(payload) == 0 {
 		outcome = types.FreshnessAuditTaskPolicySuggestion
 		audit["reason"] = "delivery has no immutable compiled run snapshot"
 	} else if decoded, decodeErr := readTaskRunSnapshotPayload(payload); decodeErr != nil {
 		audit["reason"] = "immutable run snapshot could not be verified"
 	} else {
 		definition := decoded.Payload.Definition
-		taskValue := definition.TaskID
-		taskID = &taskValue
-		var scope struct {
-			Observation *observation.PolicyV1 `json:"observation,omitempty"`
-		}
-		if json.Unmarshal(definition.ScopeJSON, &scope) != nil ||
-			scope.Observation == nil {
+		hasObservation, scopeErr :=
+			decodeHistoricalObservationPresence(definition.ScopeJSON)
+		if definition.TaskID != batchTaskID {
+			audit["reason"] =
+				"immutable run snapshot task differs from delivery batch"
+		} else if scopeErr != nil {
+			audit["reason"] =
+				"immutable run snapshot observation policy is invalid"
+		} else if !hasObservation {
 			outcome = types.FreshnessAuditTaskPolicySuggestion
 			audit["reason"] = "task has no approved observation policy"
 		} else if publishedAt == nil {
 			audit["reason"] = "content occurrence time is unavailable"
 		} else {
+			policy, err := decodeHistoricalObservationPolicy(
+				definition.ScopeJSON)
+			if err != nil || policy == nil {
+				return "", taskStateIntegrity()
+			}
 			nominal, nominalErr := observation.NominalTrigger(
 				definition.TaskID, workflowID)
 			var spec struct {
@@ -86,7 +106,7 @@ func (s *Store) AuditOutdatedFeedback(
 			}
 			specErr := json.Unmarshal(definition.SpecJSON, &spec)
 			window, windowErr := observation.WindowForNominal(
-				*scope.Observation,
+				*policy,
 				observation.Schedule{
 					Cron: spec.Cron, EverySeconds: spec.EverySeconds,
 					AnchorAt: spec.AnchorAt, TimeZone: spec.TZ,
@@ -97,9 +117,9 @@ func (s *Store) AuditOutdatedFeedback(
 				audit["reason"] = "approved observation window could not be reconstructed"
 			} else {
 				start := window.Start
-				if scope.Observation.LatePolicy == observation.LateBounded {
+				if policy.LatePolicy == observation.LateBounded {
 					start = start.Add(
-						-time.Duration(scope.Observation.AllowedLatenessSecs) *
+						-time.Duration(policy.AllowedLatenessSecs) *
 							time.Second)
 				}
 				admission := observation.Window{Start: start, End: window.End}
@@ -315,49 +335,293 @@ func (s *Store) ClaimTaskPolicySuggestion(
 	return suggestion, nil
 }
 
+type currentObservationPolicyState uint8
+
+const (
+	currentObservationPolicyUnverifiable currentObservationPolicyState = iota
+	currentObservationPolicyAbsent
+	currentObservationPolicyPresent
+)
+
+func currentApprovedObservationPolicyTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID, userID int64,
+	taskID string,
+) (currentObservationPolicyState, error) {
+	if taskID == "" {
+		return currentObservationPolicyUnverifiable, nil
+	}
+	var version *int64
+	var digest *string
+	var rawMode string
+	var editOperationID *string
+	var editFence *int64
+	err := tx.QueryRow(ctx,
+		`SELECT s.approved_definition_version,s.approved_definition_digest,
+		        s.execution_mode,s.definition_edit_operation_id,
+		        s.definition_edit_fence
+		   FROM schedules s
+		   JOIN tenants t
+		     ON t.id=s.tenant_id
+		    AND t.status='active' AND t.deleted_at IS NULL
+		   JOIN memberships m
+		     ON m.tenant_id=s.tenant_id AND m.user_id=s.user_id
+		  WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.id=$3
+		    AND s.status IN ('active','paused')
+		  FOR KEY SHARE OF s`,
+		tenantID, userID, taskID).Scan(
+		&version, &digest, &rawMode, &editOperationID, &editFence)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return currentObservationPolicyUnverifiable, nil
+	}
+	if err != nil {
+		return currentObservationPolicyUnverifiable,
+			taskRunDatabaseError("lock current task policy head", err)
+	}
+	mode, modeErr := types.ParseExecutionMode(rawMode)
+	if version == nil || digest == nil ||
+		editOperationID != nil || editFence != nil ||
+		modeErr != nil || mode != types.ExecutionModeCompiled {
+		return currentObservationPolicyUnverifiable, nil
+	}
+	record, err := scanApprovedDefinitionVersion(tx.QueryRow(ctx,
+		`SELECT d.version,d.schema_version,d.execution_mode,
+		        d.definition_digest,d.payload,d.approval_ref,d.created_at
+		   FROM task_approved_definition_versions d
+		  WHERE d.tenant_id=$1 AND d.user_id=$2 AND d.task_id=$3
+		    AND d.version=$4 AND d.definition_digest=$5`,
+		tenantID, userID, taskID, *version, *digest),
+		tenantID, userID, taskID)
+	if errors.Is(err, types.ErrNotFound) {
+		return currentObservationPolicyUnverifiable, nil
+	}
+	if err != nil {
+		return currentObservationPolicyUnverifiable, err
+	}
+	if record.Definition.ExecutionMode != mode {
+		return currentObservationPolicyUnverifiable, taskStateIntegrity()
+	}
+	hasObservation, err := decodeObservationPresence(
+		record.Definition.ScopeJSON)
+	if err != nil {
+		return currentObservationPolicyUnverifiable, taskStateIntegrity()
+	}
+	if hasObservation {
+		return currentObservationPolicyPresent, nil
+	}
+	return currentObservationPolicyAbsent, nil
+}
+
+func decodeHistoricalObservationPresence(raw json.RawMessage) (bool, error) {
+	policy, err := decodeHistoricalObservationPolicy(raw)
+	return policy != nil, err
+}
+
+func decodeHistoricalObservationPolicy(
+	raw json.RawMessage,
+) (*observation.PolicyV1, error) {
+	var scope map[string]json.RawMessage
+	if err := strictjson.Decode(raw, &scope); err != nil || scope == nil {
+		return nil, err
+	}
+	rawObservation, ok := scope["observation"]
+	if !ok || len(rawObservation) == 0 ||
+		bytes.Equal(bytes.TrimSpace(rawObservation), []byte("null")) {
+		return nil, nil
+	}
+	policy, err := observation.DecodePolicyV1Exact(rawObservation)
+	if err != nil {
+		return nil, err
+	}
+	return &policy, nil
+}
+
+func decodeObservationPresence(raw json.RawMessage) (bool, error) {
+	var scope struct {
+		Observation json.RawMessage `json:"observation,omitempty"`
+		SourceIDs   []int64         `json:"source_ids,omitempty"`
+		TopN        int             `json:"top_n,omitempty"`
+	}
+	if err := strictjson.DecodeExact(raw, &scope); err != nil {
+		return false, err
+	}
+	if len(scope.Observation) == 0 ||
+		bytes.Equal(bytes.TrimSpace(scope.Observation), []byte("null")) {
+		return false, nil
+	}
+	if _, err := observation.DecodePolicyV1Exact(scope.Observation); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) BeginTaskPolicySuggestionDispatch(
 	ctx context.Context,
 	tenantID, userID int64,
 	claimToken string,
-) error {
+) (bool, error) {
 	if tenantID <= 0 || userID <= 0 || claimToken == "" {
-		return types.NewAppError(
+		return false, types.NewAppError(
 			types.CodeValidation, "任务策略建议发送围栏无效", nil)
 	}
 	tx, err := s.beginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return taskRunDatabaseError("begin task suggestion dispatch", err)
+		return false, taskRunDatabaseError(
+			"begin task suggestion dispatch", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id',$1,true)`,
 		fmt.Sprintf("%d", tenantID)); err != nil {
-		return taskRunDatabaseError("set task suggestion dispatch tenant", err)
+		return false, taskRunDatabaseError(
+			"set task suggestion dispatch tenant", err)
 	}
 	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
-		return taskRunDatabaseError("enter task suggestion dispatch role", err)
+		return false, taskRunDatabaseError(
+			"enter task suggestion dispatch role", err)
+	}
+	var triageTaskID, batchTaskID string
+	err = tx.QueryRow(ctx,
+		`SELECT COALESCE(t.task_id,''),COALESCE(b.schedule_id,'')
+		   FROM feedback_freshness_triage t
+		   JOIN deliveries d
+		     ON d.tenant_id=t.tenant_id AND d.user_id=t.user_id
+		    AND d.id=t.delivery_id
+		   JOIN push_batches b
+		     ON b.tenant_id=d.tenant_id AND b.user_id=d.user_id
+		    AND b.id=d.batch_id
+		  WHERE t.tenant_id=$1 AND t.user_id=$2
+		    AND t.outcome='task_policy_suggestion'
+		    AND t.notification_status='claimed'
+		    AND t.notification_claim_token=$3`,
+		tenantID, userID, claimToken).Scan(&triageTaskID, &batchTaskID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, types.NewAppError(
+			types.CodeConflict, "任务策略建议发送租约已变化", nil)
+	}
+	if err != nil {
+		return false, taskRunDatabaseError(
+			"read task suggestion dispatch identity", err)
+	}
+	identityVerified := batchTaskID != "" &&
+		(triageTaskID == "" || triageTaskID == batchTaskID)
+	if !identityVerified {
+		tag, updateErr := tx.Exec(ctx,
+			`UPDATE feedback_freshness_triage
+			    SET notification_status='uncertain',
+			        notification_claim_token=NULL,
+			        notification_lease_until=NULL,
+			        notification_last_error=
+			            'task identity could not be verified before dispatch',
+			        updated_at=clock_timestamp()
+			  WHERE tenant_id=$1 AND user_id=$2
+			    AND outcome='task_policy_suggestion'
+			    AND notification_status='claimed'
+			    AND notification_claim_token=$3`,
+			tenantID, userID, claimToken)
+		if updateErr != nil {
+			return false, taskRunDatabaseError(
+				"quarantine task suggestion identity", updateErr)
+		}
+		if tag.RowsAffected() != 1 {
+			return false, types.NewAppError(
+				types.CodeConflict, "任务策略建议发送租约已变化", nil)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, taskRunDatabaseError(
+				"commit unverified task suggestion identity", err)
+		}
+		return false, nil
+	}
+	policyState, err := currentApprovedObservationPolicyTx(
+		ctx, tx, tenantID, userID, batchTaskID)
+	if err != nil {
+		return false, err
+	}
+	if policyState != currentObservationPolicyAbsent {
+		status := "not_required"
+		cause := "current approved observation policy already exists"
+		if policyState == currentObservationPolicyUnverifiable {
+			status = "uncertain"
+			cause = "current approved task policy could not be verified"
+		}
+		tag, updateErr := tx.Exec(ctx,
+			`UPDATE feedback_freshness_triage
+			    SET notification_status=$4,
+			        task_id=COALESCE(task_id,$6),
+			        notification_claim_token=NULL,
+			        notification_lease_until=NULL,
+			        notification_last_error=$5,
+			        updated_at=clock_timestamp()
+			  WHERE tenant_id=$1 AND user_id=$2
+			    AND outcome='task_policy_suggestion'
+			    AND notification_status='claimed'
+			    AND notification_claim_token=$3
+			    AND (task_id IS NULL OR task_id=$6)
+			    AND EXISTS (
+			        SELECT 1
+			          FROM deliveries d
+			          JOIN push_batches b
+			            ON b.tenant_id=d.tenant_id AND b.user_id=d.user_id
+			           AND b.id=d.batch_id
+			         WHERE d.tenant_id=feedback_freshness_triage.tenant_id
+			           AND d.user_id=feedback_freshness_triage.user_id
+			           AND d.id=feedback_freshness_triage.delivery_id
+			           AND b.schedule_id=$6
+			    )`,
+			tenantID, userID, claimToken, status, cause, batchTaskID)
+		if updateErr != nil {
+			return false, taskRunDatabaseError(
+				"resolve task suggestion before dispatch", updateErr)
+		}
+		if tag.RowsAffected() != 1 {
+			return false, types.NewAppError(
+				types.CodeConflict, "任务策略建议发送租约已变化", nil)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, taskRunDatabaseError(
+				"commit resolved task suggestion", err)
+		}
+		return false, nil
 	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE feedback_freshness_triage
 		    SET notification_status='sending',
+		        task_id=COALESCE(task_id,$5),
 		        notification_lease_until=clock_timestamp()+$4::interval,
 		        updated_at=clock_timestamp()
 		  WHERE tenant_id=$1 AND user_id=$2
 		    AND outcome='task_policy_suggestion'
 		    AND notification_status='claimed'
-		    AND notification_claim_token=$3`,
-		tenantID, userID, claimToken, taskPolicySuggestionLease.String())
+		    AND notification_claim_token=$3
+		    AND (task_id IS NULL OR task_id=$5)
+		    AND EXISTS (
+		        SELECT 1
+		          FROM deliveries d
+		          JOIN push_batches b
+		            ON b.tenant_id=d.tenant_id AND b.user_id=d.user_id
+		           AND b.id=d.batch_id
+		         WHERE d.tenant_id=feedback_freshness_triage.tenant_id
+		           AND d.user_id=feedback_freshness_triage.user_id
+		           AND d.id=feedback_freshness_triage.delivery_id
+		           AND b.schedule_id=$5
+		    )`,
+		tenantID, userID, claimToken, taskPolicySuggestionLease.String(),
+		batchTaskID)
 	if err != nil {
-		return taskRunDatabaseError("fence task suggestion dispatch", err)
+		return false, taskRunDatabaseError(
+			"fence task suggestion dispatch", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return types.NewAppError(
+		return false, types.NewAppError(
 			types.CodeConflict, "任务策略建议发送租约已变化", nil)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return taskRunDatabaseError("commit task suggestion dispatch", err)
+		return false, taskRunDatabaseError(
+			"commit task suggestion dispatch", err)
 	}
-	return nil
+	return true, nil
 }
 
 func (s *Store) CompleteTaskPolicySuggestion(

@@ -66,7 +66,13 @@ type Evolver struct {
 	st                           *store.Store
 	taskPolicySuggestionNotifier func(
 		context.Context, int64, int64, int64, string,
-	) (string, bool, error)
+	) (TaskPolicySuggestionNotification, error)
+}
+
+type TaskPolicySuggestionNotification struct {
+	MessageID         string
+	Suppressed        bool
+	DefinitelyNotSent bool
 }
 
 // New 构造 Evolver，依赖由 cmd/server 装配时注入。
@@ -77,7 +83,7 @@ func New(cli *llm.Client, rec *llm.Recorder, st *store.Store) *Evolver {
 func (e *Evolver) SetTaskPolicySuggestionNotifier(
 	notifier func(
 		context.Context, int64, int64, int64, string,
-	) (string, bool, error),
+	) (TaskPolicySuggestionNotification, error),
 ) {
 	e.taskPolicySuggestionNotifier = notifier
 }
@@ -129,13 +135,13 @@ func (e *Evolver) evolve(
 					"tenant_id", tenantID, "user_id", userID, "err", claimErr)
 				break
 			}
-			messageID, definitelyNotSent, notifyErr :=
+			notification, notifyErr :=
 				e.taskPolicySuggestionNotifier(
 					ctx, tenantID, userID, suggestion.DeliveryID,
 					suggestion.ClaimToken)
 			if notifyErr != nil {
 				var markErr error
-				if definitelyNotSent {
+				if notification.DefinitelyNotSent {
 					markErr = e.st.ReleaseTaskPolicySuggestion(
 						ctx, tenantID, userID, suggestion.ClaimToken,
 						notifyErr.Error())
@@ -148,13 +154,18 @@ func (e *Evolver) evolve(
 					slog.WarnContext(ctx, "evolver: 任务策略建议失败态回执失败",
 						"tenant_id", tenantID, "user_id", userID,
 						"feedback_id", suggestion.FeedbackID,
-						"definitely_not_sent", definitelyNotSent, "err", markErr)
+						"definitely_not_sent", notification.DefinitelyNotSent,
+						"err", markErr)
 				}
 				// definite failure 回到 pending，但不能在同一轮热循环重试。
 				break
 			}
+			if notification.Suppressed {
+				continue
+			}
 			if markErr := e.st.CompleteTaskPolicySuggestion(
-				ctx, tenantID, userID, suggestion.ClaimToken, messageID,
+				ctx, tenantID, userID, suggestion.ClaimToken,
+				notification.MessageID,
 			); markErr != nil {
 				// SendCard 已成功而回执失败时，绝不能把记录退回 pending。
 				// 它保持 sending；租约到期后 Store 会收敛为 uncertain，等待人工核验。

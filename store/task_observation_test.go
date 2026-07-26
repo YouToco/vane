@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
 
@@ -292,6 +294,7 @@ func TestAuditOutdatedFeedbackWithoutPolicyCreatesSuggestion(t *testing.T) {
 		stored != string(types.FreshnessAuditTaskPolicySuggestion) {
 		t.Fatalf("stored outcome=%q err=%v", stored, err)
 	}
+	installCurrentApprovedTaskPolicy(t, f, false)
 	const claimers = 8
 	var (
 		claimWG sync.WaitGroup
@@ -321,10 +324,10 @@ func TestAuditOutdatedFeedbackWithoutPolicyCreatesSuggestion(t *testing.T) {
 		claims[0].ClaimToken == "" {
 		t.Fatalf("claims=%+v, want exactly one fenced claim", claims)
 	}
-	if err := f.base.st.BeginTaskPolicySuggestionDispatch(
+	if dispatch, err := f.base.st.BeginTaskPolicySuggestionDispatch(
 		ctx, f.idA.TenantID, f.idA.UserID, claims[0].ClaimToken,
-	); err != nil {
-		t.Fatal(err)
+	); err != nil || !dispatch {
+		t.Fatalf("begin dispatch=%v err=%v", dispatch, err)
 	}
 	if err := f.base.st.CompleteTaskPolicySuggestion(
 		ctx, f.idA.TenantID, f.idA.UserID,
@@ -371,10 +374,10 @@ func TestAuditOutdatedFeedbackWithoutPolicyCreatesSuggestion(t *testing.T) {
 		t.Fatalf("expired pre-dispatch claim not safely reclaimed: %+v err=%v",
 			lostReceiptClaim, err)
 	}
-	if err := f.base.st.BeginTaskPolicySuggestionDispatch(
+	if dispatch, err := f.base.st.BeginTaskPolicySuggestionDispatch(
 		ctx, f.idA.TenantID, f.idA.UserID, lostReceiptClaim.ClaimToken,
-	); err != nil {
-		t.Fatal(err)
+	); err != nil || !dispatch {
+		t.Fatalf("begin lost-receipt dispatch=%v err=%v", dispatch, err)
 	}
 	if _, err := f.base.st.pool.Exec(ctx,
 		`UPDATE feedback_freshness_triage
@@ -411,10 +414,10 @@ func TestAuditOutdatedFeedbackWithoutPolicyCreatesSuggestion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.base.st.BeginTaskPolicySuggestionDispatch(
+	if dispatch, err := f.base.st.BeginTaskPolicySuggestionDispatch(
 		ctx, f.idA.TenantID, f.idA.UserID, retryableClaim.ClaimToken,
-	); err != nil {
-		t.Fatal(err)
+	); err != nil || !dispatch {
+		t.Fatalf("begin retryable dispatch=%v err=%v", dispatch, err)
 	}
 	if err := f.base.st.ReleaseTaskPolicySuggestion(
 		ctx, f.idA.TenantID, f.idA.UserID,
@@ -427,16 +430,404 @@ func TestAuditOutdatedFeedbackWithoutPolicyCreatesSuggestion(t *testing.T) {
 	if err != nil || reclaimed.FeedbackID != feedbackID {
 		t.Fatalf("definite failure not retryable: %+v err=%v", reclaimed, err)
 	}
-	if err := f.base.st.BeginTaskPolicySuggestionDispatch(
+	if dispatch, err := f.base.st.BeginTaskPolicySuggestionDispatch(
 		ctx, f.idA.TenantID, f.idA.UserID, reclaimed.ClaimToken,
-	); err != nil {
-		t.Fatal(err)
+	); err != nil || !dispatch {
+		t.Fatalf("begin reclaimed dispatch=%v err=%v", dispatch, err)
 	}
 	if err := f.base.st.MarkTaskPolicySuggestionUncertain(
 		ctx, f.idA.TenantID, f.idA.UserID,
 		reclaimed.ClaimToken, "test cleanup",
 	); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTaskPolicySuggestionSuppressedByCurrentApprovedObservation(
+	t *testing.T,
+) {
+	f := newCompiledRunWriteFixture(t)
+	ctx := t.Context()
+
+	firstFeedbackID, _ := createOutdatedSuggestion(t, f, "before-policy")
+	if _, err := f.base.st.pool.Exec(ctx,
+		`UPDATE feedback_freshness_triage
+		    SET task_id=NULL
+		  WHERE feedback_id=$1`,
+		firstFeedbackID); err != nil {
+		t.Fatal(err)
+	}
+	installCurrentApprovedTaskPolicy(t, f, false)
+	firstClaim, err := f.base.st.ClaimTaskPolicySuggestion(
+		ctx, f.idA.TenantID, f.idA.UserID)
+	if err != nil || firstClaim.FeedbackID != firstFeedbackID {
+		t.Fatalf("claim before policy=%+v err=%v", firstClaim, err)
+	}
+
+	advanceCurrentApprovedObservationPolicy(t, f)
+	dispatch, err := f.base.st.BeginTaskPolicySuggestionDispatch(
+		ctx, f.idA.TenantID, f.idA.UserID, firstClaim.ClaimToken)
+	if err != nil || dispatch {
+		t.Fatalf("dispatch after policy commit=%v err=%v, want suppressed",
+			dispatch, err)
+	}
+	assertTaskSuggestionNotificationStatus(
+		t, f, firstFeedbackID, "not_required")
+
+	secondFeedbackID, _ := createOutdatedSuggestion(t, f, "after-policy")
+	secondClaim, err := f.base.st.ClaimTaskPolicySuggestion(
+		ctx, f.idA.TenantID, f.idA.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err = f.base.st.BeginTaskPolicySuggestionDispatch(
+		ctx, f.idA.TenantID, f.idA.UserID, secondClaim.ClaimToken)
+	if err != nil || dispatch {
+		t.Fatalf("current policy backlog dispatch=%v err=%v, want suppressed",
+			dispatch, err)
+	}
+	assertTaskSuggestionNotificationStatus(
+		t, f, secondFeedbackID, "not_required")
+}
+
+func TestTaskPolicySuggestionUnverifiableCurrentStateNeverClaims(
+	t *testing.T,
+) {
+	t.Run("approved head missing", func(t *testing.T) {
+		f := newCompiledRunWriteFixture(t)
+		feedbackID, _ := createOutdatedSuggestion(t, f, "missing-head")
+		claim, err := f.base.st.ClaimTaskPolicySuggestion(
+			t.Context(), f.idA.TenantID, f.idA.UserID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dispatch, err := f.base.st.BeginTaskPolicySuggestionDispatch(
+			t.Context(), f.idA.TenantID, f.idA.UserID, claim.ClaimToken)
+		if err != nil || dispatch {
+			t.Fatalf("missing head dispatch=%v err=%v", dispatch, err)
+		}
+		assertTaskSuggestionNotificationStatus(
+			t, f, feedbackID, "uncertain")
+	})
+
+	t.Run("task identity missing", func(t *testing.T) {
+		f := newCompiledRunWriteFixture(t)
+		feedbackID, deliveryID :=
+			createOutdatedSuggestion(t, f, "missing-identity")
+		if _, err := f.base.st.pool.Exec(t.Context(),
+			`UPDATE feedback_freshness_triage
+			    SET task_id=NULL
+			  WHERE feedback_id=$1`,
+			feedbackID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.base.st.pool.Exec(t.Context(),
+			`UPDATE push_batches
+			    SET schedule_id=NULL
+			  WHERE id=(SELECT batch_id FROM deliveries WHERE id=$1)`,
+			deliveryID); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := f.base.st.ClaimTaskPolicySuggestion(
+			t.Context(), f.idA.TenantID, f.idA.UserID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dispatch, err := f.base.st.BeginTaskPolicySuggestionDispatch(
+			t.Context(), f.idA.TenantID, f.idA.UserID, claim.ClaimToken)
+		if err != nil || dispatch {
+			t.Fatalf("missing identity dispatch=%v err=%v", dispatch, err)
+		}
+		assertTaskSuggestionNotificationStatus(
+			t, f, feedbackID, "uncertain")
+	})
+}
+
+func TestBeginTaskPolicySuggestionDispatchLocksScheduleBeforeTriage(
+	t *testing.T,
+) {
+	f := newCompiledRunWriteFixture(t)
+	ctx := t.Context()
+	feedbackID, _ := createOutdatedSuggestion(t, f, "schedule-first")
+	installCurrentApprovedTaskPolicy(t, f, false)
+	claim, err := f.base.st.ClaimTaskPolicySuggestion(
+		ctx, f.idA.TenantID, f.idA.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := f.base.st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(context.Background()) }()
+	if _, err := blocker.Exec(ctx,
+		`SELECT id FROM schedules
+		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3
+		  FOR UPDATE`,
+		f.idA.TenantID, f.idA.UserID, f.taskA); err != nil {
+		t.Fatal(err)
+	}
+
+	type dispatchResult struct {
+		dispatch bool
+		err      error
+	}
+	done := make(chan dispatchResult, 1)
+	go func() {
+		dispatch, beginErr := f.base.st.BeginTaskPolicySuggestionDispatch(
+			context.Background(), f.idA.TenantID, f.idA.UserID,
+			claim.ClaimToken)
+		done <- dispatchResult{dispatch: dispatch, err: beginErr}
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	if _, err := blocker.Exec(ctx, `SET LOCAL statement_timeout='1s'`); err != nil {
+		t.Fatal(err)
+	}
+	var lockedFeedbackID int64
+	if err := blocker.QueryRow(ctx,
+		`SELECT feedback_id
+		   FROM feedback_freshness_triage
+		  WHERE feedback_id=$1
+		  FOR UPDATE`,
+		feedbackID).Scan(&lockedFeedbackID); err != nil {
+		t.Fatalf("dispatch held triage while waiting for schedule: %v", err)
+	}
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-done:
+		if result.err != nil || !result.dispatch {
+			t.Fatalf("dispatch after schedule release=%v err=%v",
+				result.dispatch, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatch did not finish after schedule lock was released")
+	}
+}
+
+func TestCurrentApprovedObservationPolicyRejectsInFlightEdit(
+	t *testing.T,
+) {
+	f := newTaskDefinitionEditEntrypointFixture(t, true)
+	f.acquireAndQuiesce(t, "observation-policy-in-flight:"+uuid.NewString())
+
+	ctx := t.Context()
+	tx, err := f.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true)`,
+		fmt.Sprintf("%d", f.base.TenantID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		t.Fatal(err)
+	}
+	state, err := currentApprovedObservationPolicyTx(
+		ctx, tx, f.base.TenantID, f.base.UserID, f.base.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != currentObservationPolicyUnverifiable {
+		t.Fatalf("in-flight edit policy state=%v, want unverifiable", state)
+	}
+}
+
+func createOutdatedSuggestion(
+	t *testing.T,
+	f *compiledRunWriteFixture,
+	suffix string,
+) (int64, int64) {
+	t.Helper()
+	ctx := t.Context()
+	batchKey := "freshness-current-policy-" + suffix + "-" + uuid.NewString()
+	batchID, err := f.base.st.CreatePushBatchForTaskRunV1(
+		ctx, f.idA, f.refA, batchKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentID := f.createContent(t, f.sourceA, suffix)
+	deliveryID, _, _, err := f.base.st.InsertDeliveryForTaskRunV1(
+		ctx, f.idA, f.refA, batchKey, &types.Delivery{
+			BatchID: batchID, UserID: f.idA.UserID,
+			ContentItemID: &contentID, BodyMD: "old",
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	feedbackID, err := f.base.st.InsertFeedback(ctx, &types.Feedback{
+		UserID: f.idA.UserID, DeliveryID: deliveryID,
+		Action:     types.FeedbackActionMisjudged,
+		ReasonCode: types.FeedbackReasonOutdated,
+		Detail:     "too old",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(cleanupCtx, t, f.base.st,
+			`DELETE FROM feedback_freshness_triage WHERE feedback_id=$1`,
+			feedbackID)
+		cleanupExec(cleanupCtx, t, f.base.st,
+			`DELETE FROM feedbacks WHERE id=$1`, feedbackID)
+	})
+	outcome, err := f.base.st.AuditOutdatedFeedback(
+		ctx, f.idA.UserID, feedbackID)
+	if err != nil ||
+		outcome != types.FreshnessAuditTaskPolicySuggestion {
+		t.Fatalf("audit outcome=%q err=%v", outcome, err)
+	}
+	return feedbackID, deliveryID
+}
+
+func installCurrentApprovedTaskPolicy(
+	t *testing.T,
+	f *compiledRunWriteFixture,
+	withObservation bool,
+) {
+	t.Helper()
+	ctx := t.Context()
+	scopeJSON := currentTaskScopeJSON(t, f, withObservation)
+	if _, err := f.base.st.pool.Exec(ctx,
+		`UPDATE schedules SET scope_json=$2 WHERE id=$1`,
+		f.taskA, scopeJSON); err != nil {
+		t.Fatal(err)
+	}
+	result, err := f.base.st.reconcileTaskDefinitionBaseline(
+		ctx, TaskDefinitionBaselineApply, TaskDefinitionBaselineCursor{
+			TenantID: f.idA.TenantID,
+			UserID:   f.idA.UserID,
+			TaskID:   f.taskA,
+		})
+	if err != nil || result.Status != TaskDefinitionBaselineApplied {
+		t.Fatalf("install approved observation result=%+v err=%v", result, err)
+	}
+}
+
+func advanceCurrentApprovedObservationPolicy(
+	t *testing.T,
+	f *compiledRunWriteFixture,
+) {
+	t.Helper()
+	ctx := t.Context()
+	current, err := f.base.st.GetCurrentApprovedDefinition(
+		ctx, f.idA.TenantID, f.idA.UserID, f.taskA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := current.Definition
+	definition.ScopeJSON = currentTaskScopeJSON(t, f, true)
+	payload, err := taskstate.EncodeApprovedDefinitionV1(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := digestTaskStatePayload(payload)
+	tx, err := f.base.st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO task_approved_definition_versions (
+			tenant_id,user_id,task_id,version,schema_version,
+			execution_mode,definition_digest,payload,approval_ref
+		 ) VALUES ($1,$2,$3,2,$4,$5,$6,$7,$8)`,
+		f.idA.TenantID, f.idA.UserID, f.taskA,
+		definition.SchemaVersion, definition.ExecutionMode,
+		digest, payload, "observation-suppression-v2:"+f.taskA,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE schedules
+		    SET scope_json=$4,approved_definition_version=2,
+		        approved_definition_digest=$5
+		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+		f.idA.TenantID, f.idA.UserID, f.taskA,
+		definition.ScopeJSON, digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func currentTaskScopeJSON(
+	t *testing.T,
+	f *compiledRunWriteFixture,
+	withObservation bool,
+) json.RawMessage {
+	t.Helper()
+	var policy *observation.PolicyV1
+	if withObservation {
+		compiled, err := observation.Compile(observation.PolicySpecV1{
+			Schema: observation.SchemaV1,
+			Mode:   observation.ModeEvent,
+			Window: observation.WindowSpecV1{
+				Kind: observation.WindowScheduleInterval,
+			},
+			LatePolicy: observation.LateStrict,
+			Evidence: observation.EvidencePolicyV1{
+				Requirement:     observation.EvidenceOfficialRequired,
+				OfficialDomains: []string{"openai.com"},
+			},
+			UnknownTime: observation.UnknownTimeReject,
+			Event: &observation.EventPolicyV1{
+				Subject:       "OpenAI models",
+				EventKind:     "model release",
+				Qualification: observation.QualificationGeneralAvailability,
+			},
+			QualifierPrompt: observation.QualifierPromptV1,
+		}, time.Now().UTC().Add(-time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		policy = &compiled
+	}
+	scopeJSON, err := json.Marshal(struct {
+		SourceIDs   []int64               `json:"source_ids,omitempty"`
+		TopN        int                   `json:"top_n,omitempty"`
+		Observation *observation.PolicyV1 `json:"observation,omitempty"`
+	}{
+		SourceIDs: []int64{f.sourceA}, TopN: 5, Observation: policy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scopeJSON
+}
+
+func assertTaskSuggestionNotificationStatus(
+	t *testing.T,
+	f *compiledRunWriteFixture,
+	feedbackID int64,
+	want string,
+) {
+	t.Helper()
+	var (
+		status     string
+		claimToken *string
+		leaseUntil *time.Time
+	)
+	if err := f.base.st.pool.QueryRow(t.Context(),
+		`SELECT notification_status,notification_claim_token,
+		        notification_lease_until
+		   FROM feedback_freshness_triage WHERE feedback_id=$1`,
+		feedbackID,
+	).Scan(&status, &claimToken, &leaseUntil); err != nil {
+		t.Fatal(err)
+	}
+	if status != want || claimToken != nil || leaseUntil != nil {
+		t.Fatalf("notification status=%q token=%v lease=%v, want %q/NULL/NULL",
+			status, claimToken, leaseUntil, want)
 	}
 }
 

@@ -338,13 +338,9 @@ func (s *Service) routeFreshnessAudit(
 		slog.ErrorContext(ctx, "feedback: 推送突破已批准的新鲜度窗口",
 			"user_id", userID, "delivery_id", deliveryID)
 	case types.FreshnessAuditTaskPolicySuggestion:
-		if s.deps.Notifier != nil {
-			s.deps.Notifier.NotifyEvent(
-				ctx,
-				userID,
-				fmt.Sprintf("feedback-policy-suggestion:%d", feedbackID),
-				fmt.Sprintf("[卡片回调] 用户反馈推送 #%d 过时；当前任务没有明确的新鲜度策略。请提出任务修改建议并等待用户确认，不得自动修改任务。", deliveryID))
-		}
+		slog.InfoContext(ctx,
+			"feedback: 当次推送未冻结新鲜度策略，等待耐久发送前核验当前定义",
+			"user_id", userID, "delivery_id", deliveryID)
 	}
 }
 
