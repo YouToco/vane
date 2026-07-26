@@ -937,11 +937,10 @@ func baseFingerprintMatches(representation RepresentationV1, head HeadV1) bool {
 		!validDigest(value.EditOperationDigest) {
 		return false
 	}
-	if representation.State.Paused {
-		return value.EditPhase == "final_active" || value.EditPhase == "final_paused"
-	}
-	return value.EditPhase == "final_active" &&
-		representation.State.Note == noteFor("final_active", value.EditOperationDigest)
+	// The final marker records the lifecycle state at commit time. Later
+	// pause, resume, and runtime-cutover operations may change ScheduleState
+	// while deliberately preserving this exact Approved-head proof.
+	return value.EditPhase == "final_active" || value.EditPhase == "final_paused"
 }
 
 func phaseFingerprintMatches(value FingerprintV1, head HeadV1, operationDigest, phase string) bool {

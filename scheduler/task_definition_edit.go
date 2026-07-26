@@ -996,21 +996,14 @@ func validateTaskDefinitionEditBaseFingerprint(
 	if err := validateTaskScheduleDigest("base edit operation digest", fingerprint.EditOperationDigest); err != nil {
 		return err
 	}
-	wantPhase := "final_active"
-	phaseMatches := fingerprint.EditPhase == wantPhase
-	if paused {
-		// A later user pause changes ScheduleState but deliberately preserves
-		// the committed definition marker. Both final variants therefore prove
-		// the same Approved head while the exact paused flag/note are frozen by
-		// this new edit proposal.
-		phaseMatches = fingerprint.EditPhase == "final_active" ||
-			fingerprint.EditPhase == "final_paused"
-	}
-	if !phaseMatches {
+	// The final phase records the lifecycle state at commit time, while later
+	// pause, resume, and runtime-cutover operations deliberately preserve the
+	// committed definition marker. Either final variant therefore proves the
+	// same Approved head. The current paused flag is checked against
+	// PostgreSQL above and its note is frozen into the new edit proposal.
+	if fingerprint.EditPhase != "final_active" &&
+		fingerprint.EditPhase != "final_paused" {
 		return errors.New("base definition edit marker is not a final phase")
-	}
-	if !paused && note != taskDefinitionEditNote("final_active", fingerprint.EditOperationDigest) {
-		return errors.New("active base note does not match its final edit marker")
 	}
 	return nil
 }
