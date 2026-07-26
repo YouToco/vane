@@ -1920,6 +1920,9 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 	contextSnapshots := filepath.Join(
 		storeDir, "agent_turn_context_snapshots.go",
 	)
+	continuationFacts := filepath.Join(
+		storeDir, "agent_session_fact_outbox.go",
+	)
 	fset := token.NewFileSet()
 	var violations []string
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, walkErr error) error {
@@ -1990,6 +1993,15 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 			if err != nil {
 				return err
 			}
+		} else if filepath.Clean(path) == continuationFacts {
+			allowed, err = agentEventLedgerReceiptHelperReferences(
+				file,
+				"ProjectAgentSessionFact",
+				1,
+			)
+			if err != nil {
+				return err
+			}
 		}
 		violations = append(
 			violations,
@@ -2003,6 +2015,15 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 			) {
 			violations = append(violations,
 				fmt.Sprintf("%s: Agent projection operator role entry escaped controller",
+					clean))
+		}
+		if clean != continuationFacts &&
+			strings.Contains(
+				string(raw),
+				"SET LOCAL ROLE vane_agent_session_fact_projector",
+			) {
+			violations = append(violations,
+				fmt.Sprintf("%s: continuation projector role entry escaped provider",
 					clean))
 		}
 		if clean != authority &&

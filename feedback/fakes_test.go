@@ -185,6 +185,14 @@ func (f *fakeStore) InsertFeedback(_ context.Context, fb *types.Feedback) (int64
 	return f.insertLocked(fb), nil
 }
 
+func (f *fakeStore) InsertFeedbackWithSessionCutoff(
+	ctx context.Context,
+	fb *types.Feedback,
+	_ time.Time,
+) (int64, error) {
+	return f.InsertFeedback(ctx, fb)
+}
+
 func (f *fakeStore) AuditOutdatedFeedback(
 	_ context.Context, _, _ int64,
 ) (types.FreshnessFeedbackAuditOutcome, error) {
