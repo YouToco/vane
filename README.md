@@ -46,17 +46,25 @@ Aliyun CDN and Cloudflare Pages succeed. If backend succeeds and frontend fails,
 backend state remains truthfully advanced; the next poll rebuilds and retries
 only the frontend.
 
-The production workflow is schedule-only and polls every five minutes. The
-certificate workflow is also schedule-only. There is no branch-selectable
-`workflow_dispatch`; a failed main run is retried with GitHub's run-rerun
-operation using **Re-run all jobs** so `plan`, the exact-SHA Gates, artifacts,
-and deployment all share the new run attempt. GitHub Environment approval is
-intentionally not used as a security boundary on this Free private repository.
+Control-plane CI runs on every `main` push and every five minutes. The
+production workflow listens only to a completed Control-plane CI run and
+requires a successful same-repository `push` on `main` whose head SHA is still
+the current default-branch SHA. PR, feature-branch, failed, stale-SHA, and
+cross-repository completions cannot enter `plan`. There is deliberately no
+`workflow_dispatch` or `repository_dispatch` production entry. The certificate
+workflow remains schedule-only. A failed production run is retried with
+GitHub's run-rerun operation using **Re-run all jobs** so `plan`, the exact-SHA
+Gates, artifacts, and deployment all share the new run attempt. GitHub
+Environment approval is intentionally not used as a security boundary on this
+Free private repository.
 
 ## Runner provisioning
 
-Both runners are repository-scoped and carry exactly one custom label:
+All three runners are repository-scoped:
 
+- control-plane CI: `[self-hosted, Linux, ARM64, vane-test]`; this runner lives
+  in `vane-test`, so PR-controlled control-plane checks never enter the trusted
+  exact-main build VM.
 - build VM: `[self-hosted, Linux, ARM64, vane-build]`; Docker is available for
   the PostgreSQL service, and the pinned setup actions provide Go 1.26 and
   Node 22.
