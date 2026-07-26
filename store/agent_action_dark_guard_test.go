@@ -84,7 +84,7 @@ var agentActionReferenceAllowances = []agentActionReferenceAllowance{
 	},
 	{
 		path:        "agentcontinuation/action_dispatcher.go",
-		declaration: "ActionStore",
+		declaration: "actionDispatcherStore",
 		references: map[string]int{
 			"ListDueAgentActionContinuationTenantIDs": 1,
 			"ListDueAgentActionContinuations":         1,
@@ -298,6 +298,27 @@ func executeAgentActionCutover(
 		got, "ActivateAgentActionContinuation count=3 want=1",
 	) {
 		t.Fatalf("duplicate exact call did not fail count guard: %v", got)
+	}
+
+	staleExportedDispatcher := parseAgentActionMutation(t, `package agentcontinuation
+type ActionStore interface {
+	ListDueAgentActionContinuationTenantIDs()
+	ListDueAgentActionContinuations()
+	AcquireAgentActionContinuation()
+	ProjectAgentActionContinuation()
+	ReleaseAgentActionContinuation()
+}`)
+	files = map[string]*ast.File{
+		filepath.Join(
+			root, "agentcontinuation", "action_dispatcher.go",
+		): staleExportedDispatcher,
+	}
+	got = agentActionApprovedAdapterViolations(files, root)
+	if !agentActionViolationContains(
+		got,
+		"agentcontinuation/action_dispatcher.go:actionDispatcherStore approved declaration is missing",
+	) {
+		t.Fatalf("stale exported dispatcher interface passed guard: %v", got)
 	}
 }
 
