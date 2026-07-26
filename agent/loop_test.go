@@ -60,10 +60,11 @@ type upsertProfileRecord struct {
 	tags                 []string
 }
 
-// appendRecord 记录一次 AppendAgentSessionMessages 调用，供断言回写目标与内容。
+// appendRecord 记录一次 CommitAgentSessionAppend 调用，供断言回写目标与内容。
 type appendRecord struct {
-	sessionID int64
-	msgs      json.RawMessage
+	sessionID         int64
+	operationIdentity string
+	msgs              json.RawMessage
 }
 
 func newFakeStore() *fakeStore {
@@ -167,23 +168,6 @@ func (f *fakeStore) CreateAgentSession(_ context.Context, userID int64) (*types.
 	return &cp, nil
 }
 
-func (f *fakeStore) UpdateAgentSession(_ context.Context, id int64, messages json.RawMessage, turnCount int, activatedTools json.RawMessage) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	s, ok := f.sessions[id]
-	if !ok {
-		return notFoundErr("fake: 会话不存在")
-	}
-	s.Messages = messages
-	s.TurnCount = turnCount
-	s.ActivatedTools = activatedTools
-	s.UpdatedAt = time.Now()
-	f.updateCalls++
-	f.lastMessages = messages
-	f.lastTurnCount = turnCount
-	return nil
-}
-
 func (f *fakeStore) CommitAgentSessionTurn(
 	_ context.Context,
 	projection agentledger.SessionProjection,
@@ -212,34 +196,38 @@ func (f *fakeStore) CommitAgentSessionTurn(
 	}, nil
 }
 
-func (f *fakeStore) AppendAgentSessionMessages(ctx context.Context, sessionID int64, msgs json.RawMessage) error {
+func (f *fakeStore) CommitAgentSessionAppend(
+	ctx context.Context,
+	userID int64,
+	sessionID int64,
+	operationIdentity string,
+	msgs json.RawMessage,
+) (agentledger.ProjectionShadowAudit, error) {
 	// 对齐 pgx 行为：已取消/过期的 ctx 立即失败不触库——回写必须在拿到锁后
 	// 用脱离调用方 deadline 的独立 ctx，否则这里就会把它打回。
 	if err := ctx.Err(); err != nil {
-		return err
+		return agentledger.ProjectionShadowAudit{}, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	s, ok := f.sessions[sessionID]
-	if !ok {
-		return notFoundErr("fake: 会话不存在")
+	if !ok || s.UserID != userID {
+		return agentledger.ProjectionShadowAudit{},
+			notFoundErr("fake: 会话不存在")
 	}
 	// 模拟 jsonb || 的数组拼接语义（两边都必须是数组）。生产实现不刷 updated_at
 	// （防点卡复活超时会话），fake 同步该语义。
-	var existing, incoming []json.RawMessage
-	if err := json.Unmarshal(s.Messages, &existing); err != nil {
-		return err
-	}
-	if err := json.Unmarshal(msgs, &incoming); err != nil {
-		return err
-	}
-	merged, err := json.Marshal(append(existing, incoming...))
+	merged, err := agentledger.AppendProjectionMessages(s.Messages, msgs)
 	if err != nil {
-		return err
+		return agentledger.ProjectionShadowAudit{}, err
 	}
 	s.Messages = merged
-	f.appendCalls = append(f.appendCalls, appendRecord{sessionID: sessionID, msgs: msgs})
-	return nil
+	f.appendCalls = append(f.appendCalls, appendRecord{
+		sessionID: sessionID, operationIdentity: operationIdentity, msgs: msgs,
+	})
+	return agentledger.ProjectionShadowAudit{
+		Match: true, PriorState: "match", Reason: "match",
+	}, nil
 }
 
 func (f *fakeStore) appendCount() int {
@@ -615,7 +603,7 @@ func TestHandleMessage_PlainChat(t *testing.T) {
 	// 持久化侧：旧投影与 full-snapshot event generation 同时提交；
 	// user+assistant 两条，system 不入库，turn_count=1。
 	if fs.updateCalls != 1 {
-		t.Fatalf("期望 UpdateAgentSession 恰好 1 次, 实得 %d", fs.updateCalls)
+		t.Fatalf("期望 CommitAgentSessionTurn 恰好 1 次, 实得 %d", fs.updateCalls)
 	}
 	msgs := persistedMessages(t, fs)
 	if len(msgs) != 2 || msgs[0].Role != "user" || msgs[1].Role != "assistant" {
@@ -3281,7 +3269,7 @@ func TestCancelAction_ThenExecuteRejected(t *testing.T) {
 // 卡片回调结果回写会话
 // ============================================================
 
-// appendedMessages 解出第 i 次 AppendAgentSessionMessages 收到的消息数组。
+// appendedMessages 解出第 i 次 CommitAgentSessionAppend 收到的消息数组。
 func appendedMessages(t *testing.T, fs *fakeStore, i int) []llm.ChatMessage {
 	t.Helper()
 	fs.mu.Lock()
@@ -3329,7 +3317,8 @@ func TestExecuteAction_AppendsCardCallback(t *testing.T) {
 		t.Fatalf("ExecuteAction 意外报错: %v", err)
 	}
 	waitAppends(t, fs, 1)
-	if rec := appendCallAt(fs, 0); rec.sessionID != sess.ID {
+	if rec := appendCallAt(fs, 0); rec.sessionID != sess.ID ||
+		rec.operationIdentity != "card-callback:execute:act-1" {
 		t.Fatalf("应向会话 %d 回写, 实得 %+v", sess.ID, rec)
 	}
 	msgs := appendedMessages(t, fs, 0)
@@ -3749,10 +3738,14 @@ func TestNotifyEvent(t *testing.T) {
 		sess, _ := fs.CreateAgentSession(context.Background(), 7)
 		l := newTestLoop(t, fs, (&scriptedChat{}).fn)
 
-		l.NotifyEvent(context.Background(), 7, noticeNotInterested)
+		l.NotifyEvent(
+			context.Background(), 7, "feedback-click:1",
+			noticeNotInterested,
+		)
 		waitAppends(t, fs, 1)
 
-		if rec := appendCallAt(fs, 0); rec.sessionID != sess.ID {
+		if rec := appendCallAt(fs, 0); rec.sessionID != sess.ID ||
+			rec.operationIdentity != "feedback-click:1" {
 			t.Fatalf("应向 active 会话 %d 回写, 实得 %+v", sess.ID, rec)
 		}
 		msgs := appendedMessages(t, fs, 0)
@@ -3775,7 +3768,10 @@ func TestNotifyEvent(t *testing.T) {
 		fs := newFakeStore() // 用户从未对话过
 		l := newTestLoop(t, fs, (&scriptedChat{}).fn)
 
-		l.NotifyEvent(context.Background(), 7, noticeNotInterested)
+		l.NotifyEvent(
+			context.Background(), 7, "feedback-click:2",
+			noticeNotInterested,
+		)
 		waitAppends(t, fs, 0) // 等一拍确认没有回写溜进来
 
 		if fs.sessionCount() != 0 {
@@ -3793,7 +3789,10 @@ func TestNotifyEvent(t *testing.T) {
 		fs.sessions[sess.ID].UpdatedAt = time.Now().Add(-2 * time.Hour)
 		l := newTestLoop(t, fs, (&scriptedChat{}).fn)
 
-		l.NotifyEvent(context.Background(), 7, noticeNotInterested)
+		l.NotifyEvent(
+			context.Background(), 7, "feedback-click:3",
+			noticeNotInterested,
+		)
 		waitAppends(t, fs, 0)
 
 		if got := decodeMessages(fs.sessionMessages(sess.ID)); len(got) != 0 {
@@ -3810,7 +3809,7 @@ func TestNotifyEvent(t *testing.T) {
 //
 //	（TTL 边界上 HandleMessage 新开会话），通告会写进过期会话；
 //
-// ② 通告必须排在 saveSession 之后落地，否则被 UpdateAgentSession 的全量覆盖写吞掉。
+// ② 通告必须排在 saveSession 之后落地，避免 normal-turn base fence 冲突。
 // 断言 ① 靠"锁被对端持有期间 GetActiveAgentSession 一次都不能被调到"，
 // 把现查挪到 mu.Lock() 之前（无论移进 NotifyEvent 本体还是 goroutine 开头）即变红。
 func TestNotifyEvent_QueriesInsideLockAndSerializesWithHandleMessage(t *testing.T) {
@@ -3842,7 +3841,7 @@ func TestNotifyEvent_QueriesInsideLockAndSerializesWithHandleMessage(t *testing.
 	// 调用方 ctx 已取消：回写必须靠 WithoutCancel 的独立 ctx 存活（对齐确认卡回调纪律）。
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	l.NotifyEvent(ctx, 7, noticeNotInterested)
+	l.NotifyEvent(ctx, 7, "feedback-click:4", noticeNotInterested)
 
 	// 锁仍被 HandleMessage 持有：现查与回写都不可能发生。
 	time.Sleep(30 * time.Millisecond)

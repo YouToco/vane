@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +30,8 @@ func TestTaskCreationReceipt_TerminalAtomicityBindingAndStableProviderKey(t *tes
 			`DELETE FROM task_creation_receipts WHERE tenant_id = $1`, f.tenantID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM pending_actions WHERE tenant_id = $1`, f.tenantID)
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM agent_events WHERE tenant_id = $1`, f.tenantID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM agent_sessions WHERE tenant_id = $1`, f.tenantID)
 	})
@@ -320,6 +324,8 @@ func TestTaskCreationReceipt_LeasePayloadSessionAndDeliveryLifecycle(t *testing.
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM pending_actions WHERE tenant_id = $1`, f.tenantID)
 		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM agent_events WHERE tenant_id = $1`, f.tenantID)
+		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM agent_sessions WHERE tenant_id = $1`, f.tenantID)
 	})
 
@@ -407,6 +413,20 @@ func TestTaskCreationReceipt_LeasePayloadSessionAndDeliveryLifecycle(t *testing.
 	if len(recordedMessages) != 1 {
 		t.Fatalf("session messages must append exactly once: %+v", recordedMessages)
 	}
+	var creationEventCount int
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*)
+		   FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+		    AND batch_idempotency_key LIKE 'side.%'`,
+		f.tenantID, f.userID, session.ID,
+	).Scan(&creationEventCount); err != nil {
+		t.Fatal(err)
+	}
+	if creationEventCount != 3 {
+		t.Fatalf("creation receipt snapshot event count=%d want=3",
+			creationEventCount)
+	}
 	if err := lostStore.MarkTaskCreationReceiptSent(
 		ctx, claimed.Lease(), "om_lifecycle"); !errors.Is(err, types.ErrDatabase) {
 		t.Fatalf("sent commit response loss must surface database error: %v", err)
@@ -421,6 +441,177 @@ func TestTaskCreationReceipt_LeasePayloadSessionAndDeliveryLifecycle(t *testing.
 	}); !errors.Is(err, types.ErrTaskCreationReceiptTerminal) {
 		t.Fatalf("sent receipt cannot be reacquired: %v", err)
 	}
+}
+
+func TestTaskCreationReceiptSessionCheckpointUsesTenantScopedRuntimeRole(
+	t *testing.T,
+) {
+	st := tenantTestStore(t)
+	f := newCompiledTaskFixture(t, st)
+	ctx := t.Context()
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM task_creation_receipts WHERE tenant_id=$1`,
+			f.tenantID)
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM pending_actions WHERE tenant_id=$1`,
+			f.tenantID)
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM agent_events WHERE tenant_id=$1`,
+			f.tenantID)
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM agent_sessions WHERE tenant_id=$1`,
+			f.tenantID)
+	})
+
+	session, err := st.CreateAgentSession(ctx, f.userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := taskCreationCreateParams(f, uuid.NewString())
+	params.SessionID = &session.ID
+	if _, err := st.CreateTaskCreationOperation(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CancelTaskCreationOperation(
+		ctx,
+		taskCreationCancelParams(
+			params.ID, f.tenantID, f.userID, "om_runtime_scope",
+		),
+	); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := st.LoadTaskCreationReceiptByOperation(
+		ctx, params.ID, f.tenantID, f.userID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx, `
+		UPDATE task_creation_receipts
+		   SET next_attempt_at=clock_timestamp()-interval '1 second'
+		 WHERE id=$1`, receipt.ID); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err = st.AcquireTaskCreationReceipt(
+		ctx,
+		types.AcquireTaskCreationReceiptParams{
+			ID: receipt.ID, TenantID: f.tenantID, UserID: f.userID,
+			LeaseOwner: "runtime-scope-worker", LeaseDuration: time.Minute,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scopedStore := *st
+	var audited *taskCreationReceiptRuntimeScopeTx
+	scopedStore.beginTx = func(
+		ctx context.Context,
+		options pgx.TxOptions,
+	) (pgx.Tx, error) {
+		tx, err := st.pool.BeginTx(ctx, options)
+		if err != nil {
+			return nil, err
+		}
+		audited = &taskCreationReceiptRuntimeScopeTx{
+			Tx: tx,
+		}
+		return audited, nil
+	}
+	messages := json.RawMessage(
+		`[{"role":"user","content":"runtime scoped receipt"}]`,
+	)
+	if err := scopedStore.RecordTaskCreationReceiptSessionMessages(
+		ctx, receipt.Lease(), messages,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if audited == nil || !audited.receiptLockObserved ||
+		audited.role != "vane_app" ||
+		audited.tenantSetting != fmt.Sprintf("%d", f.tenantID) ||
+		audited.scopeErr != nil {
+		t.Fatalf(
+			"receipt root lock scope role=%q tenant=%q observed=%v err=%v",
+			audited.role,
+			audited.tenantSetting,
+			audited.receiptLockObserved,
+			audited.scopeErr,
+		)
+	}
+
+	var (
+		receiptRead, sessionMessageUpdate, eventPayloadInsert bool
+		eventUpdate, eventDelete                              bool
+	)
+	if err := st.pool.QueryRow(ctx, `
+		SELECT
+		  has_table_privilege(
+		    'vane_app','task_creation_receipts','SELECT'),
+		  has_column_privilege(
+		    'vane_app','agent_sessions','messages','UPDATE'),
+		  has_column_privilege(
+		    'vane_app','agent_events','payload','INSERT'),
+		  has_table_privilege(
+		    'vane_app','agent_events','UPDATE'),
+		  has_table_privilege(
+		    'vane_app','agent_events','DELETE')`,
+	).Scan(
+		&receiptRead,
+		&sessionMessageUpdate,
+		&eventPayloadInsert,
+		&eventUpdate,
+		&eventDelete,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !receiptRead || !sessionMessageUpdate || !eventPayloadInsert ||
+		eventUpdate || eventDelete {
+		t.Fatalf(
+			"vane_app receipt capability drift receipt_read=%v "+
+				"session_update=%v event_insert/update/delete=%v/%v/%v",
+			receiptRead,
+			sessionMessageUpdate,
+			eventPayloadInsert,
+			eventUpdate,
+			eventDelete,
+		)
+	}
+
+	wrongScope := receipt.Lease()
+	wrongScope.TenantID += 999
+	if err := st.RecordTaskCreationReceiptSessionMessages(
+		ctx, wrongScope, messages,
+	); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("cross-tenant receipt checkpoint error=%v, want not found", err)
+	}
+}
+
+type taskCreationReceiptRuntimeScopeTx struct {
+	pgx.Tx
+	receiptLockObserved bool
+	role                string
+	tenantSetting       string
+	scopeErr            error
+}
+
+func (tx *taskCreationReceiptRuntimeScopeTx) QueryRow(
+	ctx context.Context,
+	sql string,
+	args ...any,
+) pgx.Row {
+	if !tx.receiptLockObserved &&
+		strings.Contains(sql, "FROM task_creation_receipts r") &&
+		strings.Contains(sql, "FOR UPDATE OF r") {
+		tx.receiptLockObserved = true
+		tx.scopeErr = tx.Tx.QueryRow(ctx, `
+			SELECT current_user,
+			       current_setting('app.tenant_id', true)`,
+		).Scan(&tx.role, &tx.tenantSetting)
+	}
+	return tx.Tx.QueryRow(ctx, sql, args...)
 }
 
 func TestTaskCreationReceipt_SendFailureRetryTakeoverAndPermanentBlock(t *testing.T) {

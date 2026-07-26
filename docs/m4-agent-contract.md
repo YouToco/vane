@@ -56,8 +56,9 @@ CREATE INDEX idx_pending_actions_user_status ON pending_actions (user_id, status
 func (s *Store) GetActiveAgentSession(ctx context.Context, userID int64, since time.Time) (*types.AgentSession, error)
 // CreateAgentSession 新建 active 会话，返回完整实体。
 func (s *Store) CreateAgentSession(ctx context.Context, userID int64) (*types.AgentSession, error)
-// UpdateAgentSession 覆盖写 messages 与 turn_count，刷新 updated_at。
-func (s *Store) UpdateAgentSession(ctx context.Context, id int64, messages json.RawMessage, turnCount int) error
+// CommitAgentSessionTurn 以 base fence 原子提交整轮 legacy 投影、完整快照事件批次与 shadow audit。
+// 不再暴露可绕过事件账本的公开覆盖入口。
+func (s *Store) CommitAgentSessionTurn(ctx context.Context, projection agentledger.SessionProjection, batch agentledger.AppendBatch) (agentledger.ProjectionShadowAudit, error)
 // CreatePendingAction 落一条待确认动作。
 func (s *Store) CreatePendingAction(ctx context.Context, a *types.PendingAction) error
 // ClaimPendingAction 原子领取：status='pending' AND expires_at>now() AND user_id=$userID
@@ -67,11 +68,20 @@ func (s *Store) ClaimPendingAction(ctx context.Context, id string, userID int64)
 // CancelPendingAction pending → cancelled（同样带 user_id 谓词）；非 pending/非本人返回 ErrNotFound 类错误。
 // RETURNING 返回实体：卡片回调回写通告需要 Summary。
 func (s *Store) CancelPendingAction(ctx context.Context, id string, userID int64) (*types.PendingAction, error)
-// AppendAgentSessionMessages 原子追加会话消息（msgs 必须是 JSON 数组，库内 jsonb || 拼接）。
-// 供卡片回调回写「[卡片回调]」通告：与 saveSession 的全量覆盖写并发时只有先后、没有丢失。
+// CommitAgentSessionAppend 供卡片回调、反馈通告等旁路写入：同一事务追加 legacy JSONB、
+// 写入完整快照事件批次并校验 shadow；operationIdentity 的精确重放不重复，不同正文冲突。
 // 刻意不刷 updated_at——确认卡有效期（24h）远超会话 TTL（30min），点卡不得复活超时会话。
-func (s *Store) AppendAgentSessionMessages(ctx context.Context, sessionID int64, msgs json.RawMessage) error
+func (s *Store) CommitAgentSessionAppend(ctx context.Context, userID int64, sessionID int64, operationIdentity string, msgs json.RawMessage) (agentledger.ProjectionShadowAudit, error)
 ```
+
+### B2 耐久边界
+
+卡片回调和反馈通告在 ingress 仍是 best-effort 异步旁路：若进程在事务开始前退出，
+B2 不承诺从业务事实重新发现并补写会话。B2 保证的是一旦旁路事务提交，
+legacy JSONB 与事件账本完整快照同成同败；提交响应丢失后，以稳定
+`operationIdentity` 精确重试不会重复写入。该身份既是当前反重复边界，也是未来恢复接口，
+不是耐久恢复本身。业务事实到会话提示的扫描、checkpoint 与断点重试属于 7.10，
+不在 B2 范围内。
 
 ## 3. types 新实体（`types/entities.go` 追加；枚举加 `types/enums.go`）
 
@@ -170,7 +180,7 @@ reason，避免 provider finish_reason 漂移误触发工具。DeepSeek V4 的�
 可回放样本位于 `llm/testdata/conformance/assistant_turns.json`；新增 provider 或观察到新的
 wire 漂移时先追加脱敏样本，再修改适配规则。
 
-### 4.2 Agent 事件账本 normal-turn shadow（7.7-B1，2026-07-24）
+### 4.2 Agent 事件账本全写入口 shadow（7.7-B2，2026-07-25）
 
 `agent_sessions.messages/turn_count/activated_tools` 仍是唯一主读与业务投影。普通飞书
 `HandleMessage` 在安全清洗、消息裁剪和模型循环全部结束后，必须用
@@ -186,12 +196,30 @@ tool_result → 可选 confirmation_requested → turn_completed`，总数最多
 冻结的 64 条上限。任一消息、payload、batch 或投影非法时整笔事务失败；不得裁掉事件后仍报告
 match。日志只记录 scope、固定 reason 和数量，不记录 payload、消息、工具参数或卡片正文。
 
-本阶段只覆盖 normal Agent turn。`AppendAgentSessionMessages`、task creation receipt 与
-definition-edit receipt 的会话 append 仍是已知 unsupported writer；下一次 normal turn 的
-pre-shadow 若发现这类漂移，固定归因为 `unsupported_writer_or_projection_drift`，随后用新的完整
-generation 重同步。它们获得独立受限角色的原子 ledger 权限前，不得切事件主读，也不得宣称
-7.7 全写入口完成。Agent ledger 仍不得被 Push、Temporal、task creation 或 definition edit 当成
-业务真相。
+卡片确认回调、feedback `NotifyEvent`、task creation receipt 与 definition-edit receipt 也必须
+在 Store 内持 exact session 根行锁后，以当前旧投影构造同样的 full snapshot generation，并在
+一个事务中完成 ledger append、旧 JSONB 更新和 projector shadow audit。receipt 的
+`session_recorded_at/session_messages_digest` checkpoint 与这三步同事务；锁序固定为
+callback/Notify=`session`，creation/definition receipt=`receipt → session`。响应丢失重试以
+持久 action+resolved verb、已落库 feedback row id 或 receipt id 为 source identity；长身份只做
+带 domain separator 的 SHA-256，禁止随机数、时间或消息正文 hash 充当来源身份。相同来源+不同
+消息必须 conflict，相同来源+相同消息不得重复追加。
+
+side writer 沿用会话的 60 条裁剪纪律：在根锁事务内保留最早 user 意图，并把最近段边界推进到
+user 消息，避免孤儿 tool result；不得在 Loop 预读后拼 projection。旧
+`AppendAgentSessionMessages` 生产入口已经退役。definition-edit receipt 角色只额外获得
+`agent_sessions.turn_count/activated_tools` 读取和 `agent_events` immutable SELECT/INSERT +
+sequence USAGE，不得获得 event UPDATE/DELETE、session 其他列写入或 owner/app 绕行。
+task creation receipt 则必须在首次 receipt 根锁前进入 tenant-scoped `vane_app`，复用既有
+receipt/session/event RLS 与权限；不得因内部 ledger helper 而借 migration owner 绕过。
+
+callback/feedback 的 ingress 调度仍是 best-effort：B2 不从已提交业务事实扫描并重建一次
+尚未开始的旁路事务。B2 的边界是一旦事务提交，legacy 与 ledger 同成同败；提交响应丢失则
+用稳定 source identity 精确重试而不重复。该 identity 是反重复与未来恢复接口，不等于
+耐久恢复。业务事实→会话提示的扫描、checkpoint 与断点重试属于 7.10。
+
+`agent_sessions.messages/turn_count/activated_tools` 仍是唯一主读；B3 切换、7.8 与 7.10 不属于
+本阶段。Agent ledger 也仍不得被 Push、Temporal、task creation 或 definition edit 当成业务真相。
 
 ## 5. config（`config/config.go`）
 

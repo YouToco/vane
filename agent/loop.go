@@ -169,7 +169,7 @@ type Store interface {
 	GetActiveAgentSession(ctx context.Context, userID int64, since time.Time) (*types.AgentSession, error)
 	CreateAgentSession(ctx context.Context, userID int64) (*types.AgentSession, error)
 	CommitAgentSessionTurn(ctx context.Context, projection agentledger.SessionProjection, batch agentledger.AppendBatch) (agentledger.ProjectionShadowAudit, error)
-	AppendAgentSessionMessages(ctx context.Context, sessionID int64, msgs json.RawMessage) error
+	CommitAgentSessionAppend(ctx context.Context, userID int64, sessionID int64, operationIdentity string, msgs json.RawMessage) (agentledger.ProjectionShadowAudit, error)
 	CreatePendingAction(ctx context.Context, a *types.PendingAction) error
 	ClaimPendingAction(ctx context.Context, id string, userID int64) (*types.PendingAction, error)
 	CancelPendingAction(ctx context.Context, id string, userID int64) (*types.PendingAction, error)
@@ -312,8 +312,8 @@ type Loop struct {
 	sessionTTL         time.Duration
 
 	// userMu 按 userID 串行化 HandleMessage（审查 #并发盲覆盖）：feishu 对每条消息
-	// 起独立 goroutine，而 HandleMessage 是 load→append→save 的读改写、
-	// UpdateAgentSession 是无版本条件的覆盖写——用户在机器人"思考中"补发第二条消息
+	// 起独立 goroutine，而 HandleMessage 是 load→append→save 的读改写；
+	// 即使最终 CommitAgentSessionTurn 有 base fence，用户在机器人"思考中"补发第二条消息
 	// 就会整段覆盖丢失第一条的交换，TTL 边界还会双开会话分叉。串行化后第二条消息
 	// 排队等待，天然看到第一条的完整上下文，也更符合"共享多轮会话"的语义。
 	// 单 owner MVP 下 map 只会有一个条目，无清理需求。
@@ -1521,6 +1521,7 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 			// the old synchronous callback. Preserve that replay behavior only;
 			// every newly accepted v1 click is bound and takes the branch above.
 			l.appendCardCallback(ctx, userID, creationResult.SessionID,
+				"card-callback:execute:"+actionID,
 				creationResultCallback(creationResult, message))
 			return message, nil
 		}
@@ -1583,6 +1584,7 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 		// Claim 原子消费，用户重发会生成完整的 v1 方案。
 		reply := "这张旧版任务确认已失效，请重新描述需求以生成完整任务。"
 		l.appendCardCallback(ctx, userID, pa.SessionID,
+			"card-callback:execute:"+actionID,
 			"[卡片回调] 用户点击了旧版任务确认；系统未执行，并要求重新生成完整任务。")
 		return reply, nil
 	}
@@ -1592,6 +1594,7 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 		// 工具注册表是唯一可调用面：落库后被下线的工具同样拒绝。
 		reply := fmt.Sprintf("工具 %s 已不可用，本次操作未执行。", pa.ToolName)
 		l.appendCardCallback(ctx, userID, pa.SessionID,
+			"card-callback:execute:"+actionID,
 			fmt.Sprintf("[卡片回调] 用户已点击「确认」，但%s", reply))
 		return reply, nil
 	}
@@ -1617,7 +1620,10 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 			// 摘要；“失败”不等于“没有读到外部内容”。
 			callback = untrustedFailurePlaceholder
 		}
-		l.appendCardCallback(ctx, userID, pa.SessionID, callback)
+		l.appendCardCallback(
+			ctx, userID, pa.SessionID,
+			"card-callback:execute:"+actionID, callback,
+		)
 		return "", err
 	}
 	callback := fmt.Sprintf("[卡片回调] 用户已点击「确认」，操作已执行：%s。执行结果：%s", pa.Summary, result)
@@ -1626,7 +1632,10 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 		// 但不能作为下一轮模型历史回灌。tool_calls 账本仍保留审计摘要。
 		callback = untrustedCallbackPlaceholder
 	}
-	l.appendCardCallback(ctx, userID, pa.SessionID, callback)
+	l.appendCardCallback(
+		ctx, userID, pa.SessionID,
+		"card-callback:execute:"+actionID, callback,
+	)
 	return result, nil
 }
 
@@ -1784,6 +1793,7 @@ func (l *Loop) CancelAction(ctx context.Context, userID int64, actionID string) 
 				return message, nil
 			}
 			l.appendCardCallback(ctx, userID, result.SessionID,
+				"card-callback:cancel:"+actionID,
 				creationCancelResultCallback(result, message))
 			return message, nil
 		}
@@ -1835,6 +1845,7 @@ func (l *Loop) CancelAction(ctx context.Context, userID int64, actionID string) 
 		return "", err
 	}
 	l.appendCardCallback(ctx, userID, pa.SessionID,
+		"card-callback:cancel:"+actionID,
 		fmt.Sprintf("[卡片回调] 用户已点击「取消」，操作已取消：%s", pa.Summary))
 	return "已取消，本次操作不会执行。", nil
 }
@@ -1847,7 +1858,13 @@ func (l *Loop) CancelAction(ctx context.Context, userID int64, actionID string) 
 //   - sessionID 为 nil（动作无来源会话）直接跳过。
 //   - 失败只记日志不上抛（与 saveSession 同原则）：卡片结果已生成，
 //     旁路回写失败不放大成用户可见错误。
-func (l *Loop) appendCardCallback(ctx context.Context, userID int64, sessionID *int64, content string) {
+func (l *Loop) appendCardCallback(
+	ctx context.Context,
+	userID int64,
+	sessionID *int64,
+	operationIdentity string,
+	content string,
+) {
 	if sessionID == nil {
 		return
 	}
@@ -1859,7 +1876,9 @@ func (l *Loop) appendCardCallback(ctx context.Context, userID int64, sessionID *
 
 	sid := *sessionID
 	l.asyncSessionWrite(ctx, userID, func(dbCtx context.Context) {
-		if err := l.store.AppendAgentSessionMessages(dbCtx, sid, raw); err != nil {
+		if _, err := l.store.CommitAgentSessionAppend(
+			dbCtx, userID, sid, operationIdentity, raw,
+		); err != nil {
 			slog.Error("agent: 卡片回调回写会话失败", "session_id", sid, "err", err)
 		}
 	})
@@ -1867,8 +1886,8 @@ func (l *Loop) appendCardCallback(ctx context.Context, userID int64, sessionID *
 
 // RecordCreationReceiptSession is the A6 synchronous conversation checkpoint.
 // The database method atomically appends messages and marks the outbox row;
-// taking the same userMu as HandleMessage prevents its later full-session
-// UpdateAgentSession from overwriting that append.
+// taking the same userMu as HandleMessage avoids a stale normal-turn base
+// conflict while the receipt dispatcher checkpoints the same session.
 func (l *Loop) RecordCreationReceiptSession(
 	ctx context.Context,
 	receipt types.TaskCreationReceipt,
@@ -1937,7 +1956,12 @@ func (l *Loop) RecordDefinitionEditReceiptSession(
 // 无 active 会话（TTL 外）直接丢弃、绝不新建——用户没在对话，一条通告不值得开新会话。
 // GetActiveAgentSession 现查必须发生在 userMu 锁内（审查 F14）：锁外查到的会话可能
 // 在抢锁期间被换代（TTL 边界上 HandleMessage 新开会话），通告会写进过期会话。
-func (l *Loop) NotifyEvent(ctx context.Context, userID int64, notice string) {
+func (l *Loop) NotifyEvent(
+	ctx context.Context,
+	userID int64,
+	sourceIdentity string,
+	notice string,
+) {
 	raw, err := json.Marshal([]llm.ChatMessage{{Role: "user", Content: notice}})
 	if err != nil {
 		slog.Error("agent: 事件通告序列化失败", "user_id", userID, "err", err)
@@ -1951,15 +1975,21 @@ func (l *Loop) NotifyEvent(ctx context.Context, userID int64, notice string) {
 			}
 			return
 		}
-		if err := l.store.AppendAgentSessionMessages(dbCtx, sess.ID, raw); err != nil {
+		if _, err := l.store.CommitAgentSessionAppend(
+			dbCtx, userID, sess.ID, sourceIdentity, raw,
+		); err != nil {
 			slog.Error("agent: 事件通告回写会话失败", "session_id", sess.ID, "err", err)
 		}
 	})
 }
 
-// asyncSessionWrite 是会话旁路回写的共享纪律（appendCardCallback / NotifyEvent 共用）：
-//   - 持 per-user 锁（与 HandleMessage 的 userMu 同一把）：AppendAgentSessionMessages
-//     虽是库内原子拼接，但若落在 HandleMessage 的 load→save 窗口中间，
+// asyncSessionWrite 是会话旁路回写的共享纪律（appendCardCallback / NotifyEvent 共用）。
+// 该 ingress 仍是 best-effort：B2 的稳定 operation identity 只保证事务提交后的
+// legacy+ledger 原子性与精确重试反重复，不负责从业务事实耐久重建未开始的写入；
+// 扫描/checkpoint/断点重试属于 7.10。
+//
+//   - 持 per-user 锁（与 HandleMessage 的 userMu 同一把）：side-writer 原子提交
+//     虽由 Store 持 session 根锁，但若落在 HandleMessage 的 load→save 窗口中间，
 //     仍会被 saveSession 的全量覆盖写吞掉。
 //   - 抢锁与写库放在独立 goroutine：HandleMessage 可持锁整条消息预算（分钟级），
 //     同步等锁会把卡片结果更新拖到分钟级；且 sync.Mutex 不感知 ctx，调用方的
@@ -2127,10 +2157,11 @@ func (l *Loop) saveSession(
 		return
 	}
 	if audit.PriorState != "match" && audit.PriorState != "uninitialized" {
-		// Known 7.7-B boundary: callback and restricted receipt appenders are
-		// not yet transactional ledger writers. A normal turn resynchronizes
-		// the latest full snapshot and attributes the preceding drift.
-		slog.Warn("agent: 会话事件 shadow 已重同步未覆盖写入口",
+		// Every production projection writer is transactional with the ledger
+		// in B2. A mismatch here therefore attributes pre-B2 history, direct
+		// database repair, or corruption while resynchronizing the latest full
+		// snapshot; it is not an expected side-writer race.
+		slog.Warn("agent: 会话事件 shadow 已重同步既有漂移",
 			"tenant_id", sess.TenantID,
 			"user_id", sess.UserID,
 			"session_id", sess.ID,

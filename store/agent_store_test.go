@@ -41,8 +41,9 @@ func TestAgentStore(t *testing.T) {
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
 		defer cancel()
-		// FK 逆序：pending_actions → agent_sessions → users。
+		// FK 逆序：pending_actions/agent_events → agent_sessions → users。
 		cleanupExec(ctx, t, st, `DELETE FROM pending_actions WHERE user_id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM agent_events WHERE user_id = $1`, u.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM agent_sessions WHERE user_id = $1`, u.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id = $1`, u.ID)
 	})
@@ -70,8 +71,14 @@ func TestAgentStore(t *testing.T) {
 		}
 
 		msgs := json.RawMessage(`[{"role":"user","content":"你好"},{"role":"assistant","content":"你好，我是见微"}]`)
-		if err := st.UpdateAgentSession(ctx, created.ID, msgs, 1, nil); err != nil {
-			t.Fatalf("UpdateAgentSession() 失败: %v", err)
+		if _, err := st.pool.Exec(ctx, `
+			UPDATE agent_sessions
+			   SET messages=$2,turn_count=1,activated_tools='[]'::jsonb,
+			       updated_at=now()
+			 WHERE id=$1 /* controlled test fixture projection */`,
+			created.ID, msgs,
+		); err != nil {
+			t.Fatalf("受控 SQL 更新会话夹具失败: %v", err)
 		}
 
 		again, err := st.GetActiveAgentSession(ctx, u.ID, since)
@@ -91,12 +98,17 @@ func TestAgentStore(t *testing.T) {
 		}
 		// updated_at 必须被刷新（TTL 续期依赖它）。
 		if !again.UpdatedAt.After(created.UpdatedAt) {
-			t.Errorf("UpdateAgentSession 应刷新 updated_at：建 %v，更 %v", created.UpdatedAt, again.UpdatedAt)
+			t.Errorf("受控夹具更新应刷新 updated_at：建 %v，更 %v", created.UpdatedAt, again.UpdatedAt)
 		}
 
-		// 更新不存在的会话应返回 NotFound（防拿着被清理的 id 静默丢消息）。
-		if err := st.UpdateAgentSession(ctx, -1, msgs, 2, nil); !errors.Is(err, types.ErrNotFound) {
-			t.Errorf("更新不存在会话应 ErrNotFound，实际: %v", err)
+		// 受控 SQL 对不存在的会话必须零行。
+		if tag, err := st.pool.Exec(ctx, `
+			UPDATE agent_sessions SET messages=$2
+			 WHERE id=$1 /* controlled missing-session fixture */`,
+			-1, msgs,
+		); err != nil || tag.RowsAffected() != 0 {
+			t.Errorf("受控 SQL 更新不存在会话 rows=%d err=%v",
+				tag.RowsAffected(), err)
 		}
 	})
 
@@ -356,22 +368,30 @@ func TestAgentStore(t *testing.T) {
 		}
 	})
 
-	t.Run("Append消息原子拼接", func(t *testing.T) {
+	t.Run("SideWriter消息原子投影", func(t *testing.T) {
 		sess, err := st.CreateAgentSession(ctx, u.ID)
 		if err != nil {
 			t.Fatalf("CreateAgentSession() 失败: %v", err)
 		}
 		base := json.RawMessage(`[{"role":"user","content":"帮我加个源"}]`)
-		if err := st.UpdateAgentSession(ctx, sess.ID, base, 1, nil); err != nil {
-			t.Fatalf("UpdateAgentSession() 失败: %v", err)
+		if _, err := st.pool.Exec(ctx, `
+			UPDATE agent_sessions
+			   SET messages=$2,turn_count=1,activated_tools='[]'::jsonb,
+			       updated_at=now()
+			 WHERE id=$1 /* controlled side-writer fixture */`,
+			sess.ID, base,
+		); err != nil {
+			t.Fatalf("受控 SQL 初始化 side-writer 夹具失败: %v", err)
 		}
 		before, err := st.GetActiveAgentSession(ctx, u.ID, time.Now().Add(-30*time.Minute))
 		if err != nil {
 			t.Fatalf("append 前回读会话失败: %v", err)
 		}
 		appended := json.RawMessage(`[{"role":"user","content":"[卡片回调] 用户已点击「确认」"}]`)
-		if err := st.AppendAgentSessionMessages(ctx, sess.ID, appended); err != nil {
-			t.Fatalf("AppendAgentSessionMessages() 失败: %v", err)
+		if _, err := st.CommitAgentSessionAppend(
+			ctx, u.ID, sess.ID, "test-card-callback:confirm", appended,
+		); err != nil {
+			t.Fatalf("CommitAgentSessionAppend() 失败: %v", err)
 		}
 
 		got, err := st.GetActiveAgentSession(ctx, u.ID, time.Now().Add(-30*time.Minute))
@@ -392,8 +412,10 @@ func TestAgentStore(t *testing.T) {
 			t.Errorf("append 后 messages 不符: %s", got.Messages)
 		}
 
-		// 不存在的会话 NotFound（同 UpdateAgentSession）。
-		if err := st.AppendAgentSessionMessages(ctx, -1, appended); !errors.Is(err, types.ErrNotFound) {
+		// 不存在的会话 NotFound。
+		if _, err := st.CommitAgentSessionAppend(
+			ctx, u.ID, 999999999, "test-card-callback:not-found", appended,
+		); !errors.Is(err, types.ErrNotFound) {
 			t.Errorf("append 不存在会话应 ErrNotFound，实际: %v", err)
 		}
 	})

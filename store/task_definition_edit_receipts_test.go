@@ -213,6 +213,20 @@ func TestTaskDefinitionEditReceipt_LeasePayloadSessionAndDeliveryLifecycle(
 	if len(recorded) != 1 {
 		t.Fatalf("session messages appended more than once: %+v", recorded)
 	}
+	var definitionEventCount int
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*)
+		   FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
+		    AND batch_idempotency_key LIKE 'side.%'`,
+		f.tenantID, f.userID, f.sessionID,
+	).Scan(&definitionEventCount); err != nil {
+		t.Fatal(err)
+	}
+	if definitionEventCount != 3 {
+		t.Fatalf("definition receipt snapshot event count=%d want=3",
+			definitionEventCount)
+	}
 
 	if err := lostStore.MarkTaskDefinitionEditReceiptSent(
 		ctx, claim.Lease(), "om_delivery_result"); !errors.Is(err, types.ErrDatabase) {
@@ -521,6 +535,8 @@ func newTaskDefinitionEditReceiptFixture(
 			f.operationID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM task_definition_edit_operations WHERE id = $1`, f.operationID)
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM agent_events WHERE session_id = $1`, f.sessionID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM agent_sessions WHERE id = $1`, f.sessionID)
 	})

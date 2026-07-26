@@ -280,6 +280,9 @@ func (s *Store) RecordTaskCreationReceiptSessionMessages(
 	lease types.TaskCreationReceiptLease,
 	messages json.RawMessage,
 ) error {
+	if err := validateTaskCreationReceiptLease(lease); err != nil {
+		return err
+	}
 	if len(messages) == 0 || len(messages) > maxTaskCreationReceiptMessages ||
 		!utf8.Valid(messages) {
 		return taskCreationValidation("receipt session messages are invalid")
@@ -296,27 +299,59 @@ func (s *Store) RecordTaskCreationReceiptSessionMessages(
 		return taskCreationDatabaseError("begin receipt session checkpoint", err)
 	}
 	defer rollbackTaskCreationTransaction(ctx, tx)
+	// Enter the normal tenant-scoped runtime role before the receipt root lock.
+	// The transaction then follows receipt -> session and every receipt,
+	// projection, and event-ledger read/write remains under RLS/least privilege.
+	if err := setAgentEventRuntimeContext(
+		ctx, tx, lease.TenantID,
+	); err != nil {
+		return taskCreationDatabaseError(
+			"enter receipt session runtime scope", err,
+		)
+	}
 	receipt, _, err := loadLeasedTaskCreationReceipt(ctx, tx, lease)
 	if err != nil {
 		return err
 	}
 	if receipt.SessionRecordedAt != nil || receipt.SessionMessagesDigest != "" {
 		if receipt.SessionRecordedAt != nil && receipt.SessionMessagesDigest == digest {
+			if receipt.SessionID != nil {
+				_, _, replayErr := commitAgentSessionAppendTx(
+					ctx,
+					tx,
+					lease.TenantID,
+					lease.UserID,
+					*receipt.SessionID,
+					fmt.Sprintf("creation-receipt:%d", lease.ID),
+					messages,
+					true,
+				)
+				if replayErr != nil {
+					return taskCreationDatabaseError(
+						"replay receipt session ledger checkpoint",
+						replayErr,
+					)
+				}
+			}
 			return nil
 		}
 		return taskCreationConflict("immutable receipt session messages differ")
 	}
 	if receipt.SessionID != nil {
-		tag, err := tx.Exec(ctx, `
-			UPDATE agent_sessions
-			   SET messages = messages || $4::jsonb
-			 WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
-			*receipt.SessionID, lease.TenantID, lease.UserID, messages)
+		_, _, err := commitAgentSessionAppendTx(
+			ctx,
+			tx,
+			lease.TenantID,
+			lease.UserID,
+			*receipt.SessionID,
+			fmt.Sprintf("creation-receipt:%d", lease.ID),
+			messages,
+			false,
+		)
 		if err != nil {
-			return taskCreationDatabaseError("append receipt session messages", err)
-		}
-		if tag.RowsAffected() != 1 {
-			return taskCreationConflict("receipt agent session is outside scope")
+			return taskCreationDatabaseError(
+				"append receipt session projection and ledger", err,
+			)
 		}
 	}
 	tag, err := tx.Exec(ctx, `
