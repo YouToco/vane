@@ -1288,7 +1288,7 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workflow := string(payload)
+	workflow := strings.ReplaceAll(string(payload), "\r\n", "\n")
 	for _, required := range []string{
 		"runs-on: [self-hosted, Linux, ARM64, vane-test]",
 		"permissions:\n  contents: read",
