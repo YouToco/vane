@@ -12,7 +12,6 @@ import (
 
 const (
 	scheduleCommandRecoveryInterval = 10 * time.Second
-	scheduleCommandRecoveryAttempt  = 15 * time.Second
 )
 
 // RecoverScheduleCommandsOnce makes one bounded pass over the immutable
@@ -69,9 +68,7 @@ func (s *Scheduler) recoverScheduleCommands(
 		for i := range commands {
 			command := &commands[i]
 			afterTenantID, afterID = command.TenantID, command.ID
-			attemptCtx, cancel := context.WithTimeout(
-				passCtx, scheduleCommandRecoveryAttempt,
-			)
+			attemptCtx, cancel := s.newScheduleCommandWorkContext(passCtx)
 			err := s.runScheduleCommandAttempt(attemptCtx, command)
 			cancel()
 			processed++

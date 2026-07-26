@@ -158,6 +158,19 @@ func rollbackScheduleCommandTx(parent context.Context, tx pgx.Tx) {
 	_ = tx.Rollback(ctx)
 }
 
+func scheduleCommandStoreDetachedContext(
+	parent context.Context,
+	maximum time.Duration,
+) (context.Context, context.CancelFunc) {
+	detached := context.WithoutCancel(parent)
+	deadline := time.Now().Add(maximum)
+	if parentDeadline, ok := parent.Deadline(); ok &&
+		parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	return context.WithDeadline(detached, deadline)
+}
+
 func loadScheduleCommandByKey(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -388,8 +401,8 @@ func (s *Store) CreateOrLoadScheduleCommand(
 	if err := tx.Commit(ctx); err != nil {
 		// A lost COMMIT response is resolved by an exact scoped read. The same
 		// key cannot be rebound while its possibly-committed row exists.
-		readCtx, cancel := context.WithTimeout(
-			context.WithoutCancel(ctx), 3*time.Second,
+		readCtx, cancel := scheduleCommandStoreDetachedContext(
+			ctx, 3*time.Second,
 		)
 		defer cancel()
 		adopted, readErr := s.LoadScheduleCommand(

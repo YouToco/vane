@@ -55,6 +55,13 @@ const (
 	// would still scale as pending-count × 15 seconds and could keep ingress
 	// dark, or prevent the periodic loop from returning to its ticker.
 	ScheduleCommandRecoveryPassTimeout = 90 * time.Second
+	// defaultScheduleCommandAttemptTimeout is one shared online/recovery budget
+	// for the complete durable intent + one remote convergence attempt.
+	defaultScheduleCommandAttemptTimeout = 15 * time.Second
+	// scheduleCommandReleaseReserve leaves room inside the total attempt budget
+	// for Store's bounded rollback, which is what actually releases row and
+	// advisory locks when the remote call consumes its whole work deadline.
+	scheduleCommandReleaseReserve = 2 * time.Second
 	// scheduleCommandFactReadbackTimeout bounds detached Temporal fact reads
 	// and terminal checkpoint writes after the request context is cancelled.
 	// These paths intentionally survive client disconnects, but must not retain
@@ -171,18 +178,46 @@ type Scheduler struct {
 	taskScheduleGates taskScheduleGateSet
 	taskScheduleEnv   taskScheduleEnvironment
 	compiledRuntime   compiledRuntimeRollout
+	commandAttempt    time.Duration
 }
 
 // New 构造 Scheduler。client 由 cmd/server 用 client.Dial 建好后注入；
 // st 传 *store.Store（隐式满足 scheduleStore）。
 func New(c client.Client, taskQueue string, st scheduleStore, opts ...SchedulerOption) *Scheduler {
-	s := &Scheduler{c: c, tq: taskQueue, st: st}
+	s := &Scheduler{
+		c: c, tq: taskQueue, st: st,
+		commandAttempt: defaultScheduleCommandAttemptTimeout,
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(s)
 		}
 	}
 	return s
+}
+
+func withScheduleCommandAttemptTimeout(timeout time.Duration) SchedulerOption {
+	return func(s *Scheduler) {
+		s.commandAttempt = timeout
+	}
+}
+
+func (s *Scheduler) scheduleCommandAttemptTimeout() time.Duration {
+	if s.commandAttempt <= 0 {
+		return defaultScheduleCommandAttemptTimeout
+	}
+	return s.commandAttempt
+}
+
+func (s *Scheduler) newScheduleCommandWorkContext(
+	parent context.Context,
+) (context.Context, context.CancelFunc) {
+	total := s.scheduleCommandAttemptTimeout()
+	reserve := scheduleCommandReleaseReserve
+	if total <= reserve {
+		reserve = total / 4
+	}
+	return context.WithTimeout(parent, total-reserve)
 }
 
 // CreatePush 创建一个定时推送调度：校验 spec → 校验活跃上限 → Temporal Create →
@@ -731,13 +766,15 @@ func (s *Scheduler) executeNewScheduleCommand(
 			types.CodeValidation, "任务命令上下文无效", types.ErrValidation,
 		)
 	}
+	attemptCtx, cancelAttempt := s.newScheduleCommandWorkContext(ctx)
+	defer cancelAttempt()
 	commandStore, ok := s.st.(scheduleCommandStore)
 	if !ok {
 		return types.NewAppError(
 			types.CodeInternal, "任务命令控制面未配置", nil,
 		)
 	}
-	tenantID, err := s.st.ResolveActiveTenantForUser(ctx, userID)
+	tenantID, err := s.st.ResolveActiveTenantForUser(attemptCtx, userID)
 	if err != nil {
 		return err
 	}
@@ -745,7 +782,7 @@ func (s *Scheduler) executeNewScheduleCommand(
 		tenantID, userID, schedID, idempotencyKey, kind,
 	)
 	command, err := commandStore.CreateOrLoadScheduleCommand(
-		ctx, tenantID, userID, schedID, idempotencyKey, kind,
+		attemptCtx, tenantID, userID, schedID, idempotencyKey, kind,
 		payloadDigest, requestID,
 	)
 	if err != nil {
@@ -757,7 +794,7 @@ func (s *Scheduler) executeNewScheduleCommand(
 	case types.ScheduleCommandBlocked:
 		return scheduleCommandBlockedError(command)
 	case types.ScheduleCommandPending:
-		return s.runScheduleCommandAttempt(ctx, command)
+		return s.runScheduleCommandAttempt(attemptCtx, command)
 	default:
 		return types.NewAppError(
 			types.CodeInternal, "任务命令耐久状态损坏", nil,
@@ -825,8 +862,8 @@ func (s *Scheduler) runScheduleCommandAttempt(
 	remoteErr := s.applyScheduleCommandRemote(ctx, command)
 	if remoteErr != nil {
 		if isTaskScheduleNotFound(remoteErr) {
-			finishCtx, cancelFinish := context.WithTimeout(
-				context.WithoutCancel(ctx),
+			finishCtx, cancelFinish := scheduleCommandDetachedContext(
+				ctx,
 				scheduleCommandFactReadbackTimeout,
 			)
 			blockErr := block(
@@ -855,8 +892,8 @@ func (s *Scheduler) runScheduleCommandAttempt(
 		return nil
 	} else {
 		commitErr := err
-		readCtx, cancel := context.WithTimeout(
-			context.WithoutCancel(ctx), 3*time.Second,
+		readCtx, cancel := scheduleCommandDetachedContext(
+			ctx, 3*time.Second,
 		)
 		current, readErr := commandStore.LoadScheduleCommand(
 			readCtx, command.TenantID, command.UserID,
@@ -936,8 +973,8 @@ func (s *Scheduler) applyScheduleCommandRemote(
 		if patchErr == nil {
 			return nil
 		}
-		readCtx, cancelRead := context.WithTimeout(
-			context.WithoutCancel(ctx),
+		readCtx, cancelRead := scheduleCommandDetachedContext(
+			ctx,
 			scheduleCommandFactReadbackTimeout,
 		)
 		applied, describeErr := s.schedulePausedFact(
@@ -958,8 +995,8 @@ func (s *Scheduler) applyScheduleCommandRemote(
 		if deleteErr == nil || isTaskScheduleNotFound(deleteErr) {
 			return nil
 		}
-		readCtx, cancelRead := context.WithTimeout(
-			context.WithoutCancel(ctx),
+		readCtx, cancelRead := scheduleCommandDetachedContext(
+			ctx,
 			scheduleCommandFactReadbackTimeout,
 		)
 		_, describeErr := s.c.WorkflowService().DescribeSchedule(
@@ -978,6 +1015,19 @@ func (s *Scheduler) applyScheduleCommandRemote(
 			types.CodeValidation, "未知任务命令", types.ErrValidation,
 		)
 	}
+}
+
+func scheduleCommandDetachedContext(
+	parent context.Context,
+	maximum time.Duration,
+) (context.Context, context.CancelFunc) {
+	detached := context.WithoutCancel(parent)
+	deadline := time.Now().Add(maximum)
+	if parentDeadline, ok := parent.Deadline(); ok &&
+		parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	return context.WithDeadline(detached, deadline)
 }
 
 func shortScheduleCommandID(id string) string {

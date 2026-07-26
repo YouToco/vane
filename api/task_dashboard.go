@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -22,8 +23,18 @@ type schedulePlaybookDTO struct {
 
 type scheduleDetailScheduleDTO struct {
 	types.Schedule
-	NextRun *time.Time `json:"next_run,omitempty"`
+	NextRun      *time.Time           `json:"next_run,omitempty"`
+	NextRunState scheduleNextRunState `json:"next_run_state"`
 }
+
+type scheduleNextRunState string
+
+const (
+	scheduleNextRunScheduled   scheduleNextRunState = "scheduled"
+	scheduleNextRunPaused      scheduleNextRunState = "paused"
+	scheduleNextRunNone        scheduleNextRunState = "none"
+	scheduleNextRunUnavailable scheduleNextRunState = "unavailable"
+)
 
 type scheduleCapabilitiesDTO struct {
 	DefinitionEdit bool `json:"definition_edit"`
@@ -79,24 +90,21 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 		writeAppError(w, err)
 		return
 	}
-	var nextRun *time.Time
-	if reader, ok := s.deps.Scheduler.(scheduleNextRunReader); ok {
-		nextRun, err = reader.NextRun(
-			r.Context(), id, userID,
+	reader, _ := s.deps.Scheduler.(scheduleNextRunReader)
+	nextRun, nextRunState, nextRunErr := projectScheduleNextRun(
+		r.Context(), sched, reader,
+	)
+	if nextRunErr != nil {
+		// Next run is an optional live Temporal projection. The durable
+		// Postgres detail remains useful during a transient control-plane
+		// outage, so degrade only this field and keep the page readable.
+		slog.WarnContext(
+			r.Context(),
+			"api: read schedule next run",
+			"schedule_id", id,
+			"user_id", userID,
+			"err", nextRunErr,
 		)
-		if err != nil {
-			// Next run is an optional live Temporal projection. The durable
-			// Postgres detail remains useful during a transient control-plane
-			// outage, so degrade only this field and keep the page readable.
-			slog.WarnContext(
-				r.Context(),
-				"api: read schedule next run",
-				"schedule_id", id,
-				"user_id", userID,
-				"err", err,
-			)
-			nextRun = nil
-		}
 	}
 
 	// 手册是可选块：老任务/空手册任务没有行，NotFound 不是错误，整块缺省。
@@ -114,8 +122,9 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 
 	writeJSON(w, http.StatusOK, scheduleDetailResp{
 		Schedule: scheduleDetailScheduleDTO{
-			Schedule: *sched,
-			NextRun:  nextRun,
+			Schedule:     *sched,
+			NextRun:      nextRun,
+			NextRunState: nextRunState,
 		},
 		Summary: *summary, Sources: sources,
 		Playbook: playbook, Cost: *cost,
@@ -123,6 +132,37 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 			DefinitionEdit: s.deps.DefinitionEditEnabled,
 		},
 	})
+}
+
+func projectScheduleNextRun(
+	ctx context.Context,
+	schedule *types.Schedule,
+	reader scheduleNextRunReader,
+) (*time.Time, scheduleNextRunState, error) {
+	if schedule == nil {
+		return nil, scheduleNextRunUnavailable, errors.New(
+			"schedule next-run projection has no schedule",
+		)
+	}
+	if schedule.Status == types.ScheduleStatusPaused {
+		return nil, scheduleNextRunPaused, nil
+	}
+	if schedule.Status != types.ScheduleStatusActive {
+		return nil, scheduleNextRunUnavailable, errors.New(
+			"schedule next-run projection has invalid schedule status",
+		)
+	}
+	if reader == nil {
+		return nil, scheduleNextRunUnavailable, nil
+	}
+	nextRun, err := reader.NextRun(ctx, schedule.ID, schedule.UserID)
+	if err != nil {
+		return nil, scheduleNextRunUnavailable, err
+	}
+	if nextRun == nil {
+		return nil, scheduleNextRunNone, nil
+	}
+	return nextRun, scheduleNextRunScheduled, nil
 }
 
 // scheduleBatchesResp 是 GET /api/schedules/{id}/batches 的响应体。
