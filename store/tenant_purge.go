@@ -55,6 +55,7 @@ type purgeStep struct {
 //	schedules(current cutover pointer)     → task_run_snapshot_v2_cutover_events
 //	task_definition_edit_receipts         → task_definition_edit_operations
 //	schedules(definition-edit marker)     → task_definition_edit_operations
+//	schedule_commands                     → tenants / users
 //	task_adaptive_states                  → task_approved_definition_versions → schedules
 //	其余                                   → tenants / users
 //
@@ -65,6 +66,10 @@ var purgeOrder = []purgeStep{
 	// both audit tables still need explicit rows in the purge report.
 	{"task_definition_edit_receipts", "tenant_id = $1"},
 	{"task_definition_edit_operations", "tenant_id = $1"},
+	// Durable schedule command audit has no schedule FK so completed delete
+	// tombstones survive normal task deletion. Tenant hard-delete explicitly
+	// removes it before the tenant/user parents.
+	{"schedule_commands", "tenant_id = $1"},
 	// 无 tenant_id、经 schedules 反查的两张（正因为没有 tenant_id，
 	// 「按 tenant_id 列对账」的守卫看不见它们，必须靠外键可达性那条守卫兜住）。
 	{"schedule_playbooks", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
@@ -259,6 +264,13 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			         WHERE tenant_id = $1
 			         ORDER BY id
 			         FOR UPDATE /* tenant purge definition-edit lock order */`,
+		},
+		{
+			name: "schedule_commands",
+			query: `SELECT id FROM schedule_commands
+			         WHERE tenant_id = $1
+			         ORDER BY task_id,id
+			         FOR UPDATE /* tenant purge schedule-command lock order */`,
 		},
 		{
 			name: "task_definition_edit_operations",

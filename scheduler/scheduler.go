@@ -8,6 +8,7 @@ package scheduler
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,7 +20,9 @@ import (
 	"github.com/google/uuid"
 	commonpb "go.temporal.io/api/common/v1"
 	enums "go.temporal.io/api/enums/v1"
+	schedulepb "go.temporal.io/api/schedule/v1"
 	"go.temporal.io/api/serviceerror"
+	workflowservice "go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 
@@ -47,6 +50,23 @@ const (
 	// whole. Per-schedule timeouts alone scale as active-count × 15 seconds and
 	// can otherwise keep every ingress dark indefinitely.
 	scheduleReconcilePassTimeout = 90 * time.Second
+	// ScheduleCommandRecoveryPassTimeout bounds both the synchronous startup
+	// barrier and each periodic recovery pass. Per-command attempt bounds alone
+	// would still scale as pending-count × 15 seconds and could keep ingress
+	// dark, or prevent the periodic loop from returning to its ticker.
+	ScheduleCommandRecoveryPassTimeout = 90 * time.Second
+	// defaultScheduleCommandAttemptTimeout is one shared online/recovery budget
+	// for the complete durable intent + one remote convergence attempt.
+	defaultScheduleCommandAttemptTimeout = 15 * time.Second
+	// scheduleCommandReleaseReserve leaves room inside the total attempt budget
+	// for Store's bounded rollback, which is what actually releases row and
+	// advisory locks when the remote call consumes its whole work deadline.
+	scheduleCommandReleaseReserve = 2 * time.Second
+	// scheduleCommandFactReadbackTimeout bounds detached Temporal fact reads
+	// and terminal checkpoint writes after the request context is cancelled.
+	// These paths intentionally survive client disconnects, but must not retain
+	// the PostgreSQL transaction/advisory lock indefinitely.
+	scheduleCommandFactReadbackTimeout = 5 * time.Second
 )
 
 // ScheduleSpec 是 Vane 侧中立的调度频率描述：cron 与 every_seconds 二选一。
@@ -104,6 +124,52 @@ type scheduleStore interface {
 	) (*types.Schedule, func(context.Context) error, error)
 }
 
+type scheduleStatusStore interface {
+	BeginScheduleStatusChange(
+		ctx context.Context,
+		id string,
+		userID int64,
+		from types.ScheduleStatus,
+		to types.ScheduleStatus,
+	) (
+		commit func(context.Context) error,
+		rollback func(context.Context) error,
+		err error,
+	)
+}
+
+type scheduleCommandStore interface {
+	CreateOrLoadScheduleCommand(
+		ctx context.Context,
+		tenantID, userID int64,
+		taskID, key string,
+		kind types.ScheduleCommandKind,
+		payloadDigest, remoteRequestID string,
+	) (*types.ScheduleCommand, error)
+	LoadScheduleCommand(
+		ctx context.Context,
+		tenantID, userID int64,
+		key string,
+	) (*types.ScheduleCommand, error)
+	BeginScheduleCommandAttempt(
+		ctx context.Context,
+		tenantID, userID int64,
+		key string,
+	) (
+		command *types.ScheduleCommand,
+		schedule *types.Schedule,
+		complete func(context.Context) error,
+		block func(context.Context, string, string) error,
+		rollback func(context.Context) error,
+		err error,
+	)
+	ListPendingScheduleCommands(
+		ctx context.Context,
+		afterTenantID int64,
+		afterID string,
+	) ([]types.ScheduleCommand, error)
+}
+
 // Scheduler 持有 Temporal client、任务队列名与 store（镜像用）。
 type Scheduler struct {
 	c                 client.Client
@@ -112,18 +178,46 @@ type Scheduler struct {
 	taskScheduleGates taskScheduleGateSet
 	taskScheduleEnv   taskScheduleEnvironment
 	compiledRuntime   compiledRuntimeRollout
+	commandAttempt    time.Duration
 }
 
 // New 构造 Scheduler。client 由 cmd/server 用 client.Dial 建好后注入；
 // st 传 *store.Store（隐式满足 scheduleStore）。
 func New(c client.Client, taskQueue string, st scheduleStore, opts ...SchedulerOption) *Scheduler {
-	s := &Scheduler{c: c, tq: taskQueue, st: st}
+	s := &Scheduler{
+		c: c, tq: taskQueue, st: st,
+		commandAttempt: defaultScheduleCommandAttemptTimeout,
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(s)
 		}
 	}
 	return s
+}
+
+func withScheduleCommandAttemptTimeout(timeout time.Duration) SchedulerOption {
+	return func(s *Scheduler) {
+		s.commandAttempt = timeout
+	}
+}
+
+func (s *Scheduler) scheduleCommandAttemptTimeout() time.Duration {
+	if s.commandAttempt <= 0 {
+		return defaultScheduleCommandAttemptTimeout
+	}
+	return s.commandAttempt
+}
+
+func (s *Scheduler) newScheduleCommandWorkContext(
+	parent context.Context,
+) (context.Context, context.CancelFunc) {
+	total := s.scheduleCommandAttemptTimeout()
+	reserve := scheduleCommandReleaseReserve
+	if total <= reserve {
+		reserve = total / 4
+	}
+	return context.WithTimeout(parent, total-reserve)
 }
 
 // CreatePush 创建一个定时推送调度：校验 spec → 校验活跃上限 → Temporal Create →
@@ -474,6 +568,545 @@ func (s *Scheduler) TriggerPushNow(ctx context.Context, userID int64) (string, e
 	return run.GetID(), nil
 }
 
+// TriggerScheduleNow retains the pre-6.8 internal signature. HTTP callers use
+// TriggerScheduleNowIdempotent so a retry carries the same client key.
+func (s *Scheduler) TriggerScheduleNow(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+) error {
+	if _, ok := s.st.(scheduleCommandStore); !ok {
+		return s.triggerScheduleNowLegacy(ctx, schedID, userID)
+	}
+	return s.TriggerScheduleNowIdempotent(
+		ctx, schedID, userID, legacyScheduleCommandKey(),
+	)
+}
+
+// TriggerScheduleNowIdempotent starts the exact stored Action for one owned
+// active task. Temporal receives a deterministic PatchSchedule RequestId, so
+// response loss and recovery cannot trigger a second action.
+func (s *Scheduler) TriggerScheduleNowIdempotent(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+	idempotencyKey string,
+) error {
+	return s.executeNewScheduleCommand(
+		ctx, schedID, userID, idempotencyKey, types.ScheduleCommandRun,
+	)
+}
+
+// PausePush retains the pre-6.8 internal signature.
+func (s *Scheduler) PausePush(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+) error {
+	if _, ok := s.st.(scheduleCommandStore); !ok {
+		return s.changePushPausedLegacy(ctx, schedID, userID, true)
+	}
+	return s.PausePushIdempotent(
+		ctx, schedID, userID, legacyScheduleCommandKey(),
+	)
+}
+
+func (s *Scheduler) PausePushIdempotent(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+	idempotencyKey string,
+) error {
+	return s.executeNewScheduleCommand(
+		ctx, schedID, userID, idempotencyKey, types.ScheduleCommandPause,
+	)
+}
+
+// ResumePush retains the pre-6.8 internal signature.
+func (s *Scheduler) ResumePush(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+) error {
+	if _, ok := s.st.(scheduleCommandStore); !ok {
+		return s.changePushPausedLegacy(ctx, schedID, userID, false)
+	}
+	return s.ResumePushIdempotent(
+		ctx, schedID, userID, legacyScheduleCommandKey(),
+	)
+}
+
+func (s *Scheduler) ResumePushIdempotent(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+	idempotencyKey string,
+) error {
+	return s.executeNewScheduleCommand(
+		ctx, schedID, userID, idempotencyKey, types.ScheduleCommandResume,
+	)
+}
+
+func legacyScheduleCommandKey() string {
+	return "legacy-" + uuid.NewString()
+}
+
+func (s *Scheduler) triggerScheduleNowLegacy(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+) error {
+	sc, err := s.st.GetSchedule(ctx, schedID, userID)
+	if err != nil {
+		return err
+	}
+	if sc.Status != types.ScheduleStatusActive {
+		return types.NewAppError(
+			types.CodeConflict,
+			"任务已暂停，请先恢复后再立即运行。",
+			types.ErrConflict,
+		)
+	}
+	if err := s.c.ScheduleClient().GetHandle(
+		ctx, schedID,
+	).Trigger(ctx, client.ScheduleTriggerOptions{}); err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return scheduleCommandNotFound(schedID, err)
+		}
+		return types.NewAppError(
+			types.CodeInternal, "触发任务立即运行失败", err,
+		)
+	}
+	return nil
+}
+
+func (s *Scheduler) changePushPausedLegacy(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+	paused bool,
+) error {
+	sc, err := s.st.GetSchedule(ctx, schedID, userID)
+	if err != nil {
+		return err
+	}
+	from, to := types.ScheduleStatusActive, types.ScheduleStatusPaused
+	if !paused {
+		from, to = to, from
+	}
+	if sc.Status == to {
+		return nil
+	}
+	if sc.Status != from {
+		return types.NewAppError(
+			types.CodeConflict,
+			"任务当前状态不支持这项操作，请刷新后重试。",
+			types.ErrConflict,
+		)
+	}
+	statusStore, ok := s.st.(scheduleStatusStore)
+	if !ok {
+		return types.NewAppError(
+			types.CodeInternal, "任务暂停/恢复控制面未配置", nil,
+		)
+	}
+	commit, rollback, err := statusStore.BeginScheduleStatusChange(
+		ctx, schedID, userID, from, to,
+	)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rollbackErr := rollback(ctx); rollbackErr != nil {
+			slog.Error(
+				"scheduler: release legacy task status transaction",
+				"schedule_id", schedID, "err", rollbackErr,
+			)
+		}
+	}()
+	handle := s.c.ScheduleClient().GetHandle(ctx, schedID)
+	if err := mutateSchedulePaused(ctx, handle, paused); err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return scheduleCommandNotFound(schedID, err)
+		}
+		return types.NewAppError(
+			types.CodeInternal, "更新任务暂停状态失败", err,
+		)
+	}
+	return commit(ctx)
+}
+
+func scheduleCommandDigests(
+	tenantID, userID int64,
+	taskID, key string,
+	kind types.ScheduleCommandKind,
+) (string, string) {
+	payload := sha256.Sum256([]byte(
+		"schedule-command/v1\n" + string(kind) + "\n" + taskID,
+	))
+	payloadDigest := fmt.Sprintf("%x", payload[:])
+	request := sha256.Sum256([]byte(fmt.Sprintf(
+		"schedule-command-temporal/v1\n%d\n%d\n%s\n%s",
+		tenantID, userID, key, payloadDigest,
+	)))
+	return payloadDigest, fmt.Sprintf("%x", request[:])
+}
+
+func (s *Scheduler) executeNewScheduleCommand(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+	idempotencyKey string,
+	kind types.ScheduleCommandKind,
+) error {
+	if ctx == nil {
+		return types.NewAppError(
+			types.CodeValidation, "任务命令上下文无效", types.ErrValidation,
+		)
+	}
+	attemptCtx, cancelAttempt := s.newScheduleCommandWorkContext(ctx)
+	defer cancelAttempt()
+	commandStore, ok := s.st.(scheduleCommandStore)
+	if !ok {
+		return types.NewAppError(
+			types.CodeInternal, "任务命令控制面未配置", nil,
+		)
+	}
+	tenantID, err := s.st.ResolveActiveTenantForUser(attemptCtx, userID)
+	if err != nil {
+		return err
+	}
+	payloadDigest, requestID := scheduleCommandDigests(
+		tenantID, userID, schedID, idempotencyKey, kind,
+	)
+	command, err := commandStore.CreateOrLoadScheduleCommand(
+		attemptCtx, tenantID, userID, schedID, idempotencyKey, kind,
+		payloadDigest, requestID,
+	)
+	if err != nil {
+		return err
+	}
+	switch command.Status {
+	case types.ScheduleCommandCompleted:
+		return nil
+	case types.ScheduleCommandBlocked:
+		return scheduleCommandBlockedError(command)
+	case types.ScheduleCommandPending:
+		return s.runScheduleCommandAttempt(attemptCtx, command)
+	default:
+		return types.NewAppError(
+			types.CodeInternal, "任务命令耐久状态损坏", nil,
+		)
+	}
+}
+
+func (s *Scheduler) runScheduleCommandAttempt(
+	ctx context.Context,
+	expected *types.ScheduleCommand,
+) error {
+	if expected == nil {
+		return types.NewAppError(
+			types.CodeValidation, "任务命令不得为空", types.ErrValidation,
+		)
+	}
+	commandStore, ok := s.st.(scheduleCommandStore)
+	if !ok {
+		return types.NewAppError(
+			types.CodeInternal, "任务命令控制面未配置", nil,
+		)
+	}
+	releaseMemory, err := s.acquireTaskScheduleGate(
+		ctx, "schedule_command", expected.TaskID,
+	)
+	if err != nil {
+		return err
+	}
+	defer releaseMemory()
+	command, _, complete, block, rollback, err :=
+		commandStore.BeginScheduleCommandAttempt(
+			ctx, expected.TenantID, expected.UserID, expected.IdempotencyKey,
+		)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rollback != nil {
+			if rollbackErr := rollback(ctx); rollbackErr != nil {
+				slog.Error(
+					"scheduler: release schedule command transaction",
+					"schedule_id", expected.TaskID,
+					"err", rollbackErr,
+				)
+			}
+		}
+	}()
+	if command.Status == types.ScheduleCommandCompleted {
+		return nil
+	}
+	if command.Status == types.ScheduleCommandBlocked {
+		return scheduleCommandBlockedError(command)
+	}
+	if command.ID != expected.ID ||
+		command.PayloadDigest != expected.PayloadDigest ||
+		command.RemoteRequestID != expected.RemoteRequestID ||
+		command.TaskID != expected.TaskID || command.Kind != expected.Kind {
+		return types.NewAppError(
+			types.CodeConflict,
+			"任务命令恢复身份不一致",
+			types.ErrConflict,
+		)
+	}
+
+	remoteErr := s.applyScheduleCommandRemote(ctx, command)
+	if remoteErr != nil {
+		if isTaskScheduleNotFound(remoteErr) {
+			finishCtx, cancelFinish := scheduleCommandDetachedContext(
+				ctx,
+				scheduleCommandFactReadbackTimeout,
+			)
+			blockErr := block(
+				finishCtx,
+				"temporal_schedule_not_found",
+				"Temporal 中不存在对应任务调度",
+			)
+			cancelFinish()
+			if blockErr != nil {
+				return errors.Join(
+					scheduleCommandNotFound(command.TaskID, remoteErr),
+					blockErr,
+				)
+			}
+			return scheduleCommandNotFound(command.TaskID, remoteErr)
+		}
+		ae := types.NewAppError(
+			types.CodeInternal,
+			"任务操作结果暂未确认，系统将自动恢复，请稍后重试。",
+			remoteErr,
+		)
+		ae.Retryable = true
+		return ae
+	}
+	if err := complete(ctx); err == nil {
+		return nil
+	} else {
+		commitErr := err
+		readCtx, cancel := scheduleCommandDetachedContext(
+			ctx, 3*time.Second,
+		)
+		current, readErr := commandStore.LoadScheduleCommand(
+			readCtx, command.TenantID, command.UserID,
+			command.IdempotencyKey,
+		)
+		cancel()
+		if readErr == nil && current.ID == command.ID &&
+			current.Status == types.ScheduleCommandCompleted {
+			return nil
+		}
+		return errors.Join(commitErr, readErr)
+	}
+}
+
+func scheduleCommandNotFound(taskID string, cause error) error {
+	return types.NewAppError(
+		types.CodeNotFound,
+		fmt.Sprintf("定时任务 %s 不存在", taskID),
+		cause,
+	)
+}
+
+func scheduleCommandBlockedError(command *types.ScheduleCommand) error {
+	if command != nil &&
+		command.ErrorCode == "temporal_schedule_not_found" {
+		return scheduleCommandNotFound(command.TaskID, types.ErrNotFound)
+	}
+	return types.NewAppError(
+		types.CodeConflict,
+		"任务操作已被安全阻断，请刷新后重试。",
+		types.ErrConflict,
+	)
+}
+
+func (s *Scheduler) applyScheduleCommandRemote(
+	ctx context.Context,
+	command *types.ScheduleCommand,
+) error {
+	namespace := s.taskScheduleEnv.namespace
+	switch command.Kind {
+	case types.ScheduleCommandRun:
+		_, err := s.c.WorkflowService().PatchSchedule(
+			ctx, &workflowservice.PatchScheduleRequest{
+				Namespace: namespace, ScheduleId: command.TaskID,
+				Identity:  taskScheduleIdentity(taskScheduleFingerprintVersion),
+				RequestId: command.RemoteRequestID,
+				Patch: &schedulepb.SchedulePatch{
+					TriggerImmediately: &schedulepb.TriggerImmediatelyRequest{},
+				},
+			},
+		)
+		return err
+	case types.ScheduleCommandPause, types.ScheduleCommandResume:
+		wantPaused := command.Kind == types.ScheduleCommandPause
+		applied, err := s.schedulePausedFact(ctx, namespace, command.TaskID)
+		if err == nil && applied == wantPaused {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		patch := &schedulepb.SchedulePatch{}
+		note := "vane-web:" + string(command.Kind) + ":" +
+			shortScheduleCommandID(command.ID)
+		if wantPaused {
+			patch.Pause = note
+		} else {
+			patch.Unpause = note
+		}
+		_, patchErr := s.c.WorkflowService().PatchSchedule(
+			ctx, &workflowservice.PatchScheduleRequest{
+				Namespace: namespace, ScheduleId: command.TaskID,
+				Identity:  taskScheduleIdentity(taskScheduleFingerprintVersion),
+				RequestId: command.RemoteRequestID, Patch: patch,
+			},
+		)
+		if patchErr == nil {
+			return nil
+		}
+		readCtx, cancelRead := scheduleCommandDetachedContext(
+			ctx,
+			scheduleCommandFactReadbackTimeout,
+		)
+		applied, describeErr := s.schedulePausedFact(
+			readCtx, namespace, command.TaskID,
+		)
+		cancelRead()
+		if describeErr == nil && applied == wantPaused {
+			return nil
+		}
+		return errors.Join(patchErr, describeErr)
+	case types.ScheduleCommandDelete:
+		_, deleteErr := s.c.WorkflowService().DeleteSchedule(
+			ctx, &workflowservice.DeleteScheduleRequest{
+				Namespace: namespace, ScheduleId: command.TaskID,
+				Identity: taskScheduleIdentity(taskScheduleFingerprintVersion),
+			},
+		)
+		if deleteErr == nil || isTaskScheduleNotFound(deleteErr) {
+			return nil
+		}
+		readCtx, cancelRead := scheduleCommandDetachedContext(
+			ctx,
+			scheduleCommandFactReadbackTimeout,
+		)
+		_, describeErr := s.c.WorkflowService().DescribeSchedule(
+			readCtx,
+			&workflowservice.DescribeScheduleRequest{
+				Namespace: namespace, ScheduleId: command.TaskID,
+			},
+		)
+		cancelRead()
+		if isTaskScheduleNotFound(describeErr) {
+			return nil
+		}
+		return errors.Join(deleteErr, describeErr)
+	default:
+		return types.NewAppError(
+			types.CodeValidation, "未知任务命令", types.ErrValidation,
+		)
+	}
+}
+
+func scheduleCommandDetachedContext(
+	parent context.Context,
+	maximum time.Duration,
+) (context.Context, context.CancelFunc) {
+	detached := context.WithoutCancel(parent)
+	deadline := time.Now().Add(maximum)
+	if parentDeadline, ok := parent.Deadline(); ok &&
+		parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	return context.WithDeadline(detached, deadline)
+}
+
+func shortScheduleCommandID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
+func (s *Scheduler) schedulePausedFact(
+	ctx context.Context,
+	namespace, taskID string,
+) (bool, error) {
+	response, err := s.c.WorkflowService().DescribeSchedule(
+		ctx, &workflowservice.DescribeScheduleRequest{
+			Namespace: namespace, ScheduleId: taskID,
+		},
+	)
+	if err != nil {
+		return false, err
+	}
+	if response.GetSchedule() == nil ||
+		response.GetSchedule().GetState() == nil {
+		return false, errors.New("Temporal schedule state is missing")
+	}
+	return response.GetSchedule().GetState().GetPaused(), nil
+}
+
+func mutateSchedulePaused(
+	ctx context.Context,
+	handle client.ScheduleHandle,
+	paused bool,
+) error {
+	if paused {
+		return handle.Pause(ctx, client.SchedulePauseOptions{
+			Note: "Paused from Vane Web",
+		})
+	}
+	return handle.Unpause(ctx, client.ScheduleUnpauseOptions{
+		Note: "Resumed from Vane Web",
+	})
+}
+
+// NextRun returns Temporal's next planned action for one owned active task.
+func (s *Scheduler) NextRun(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+) (*time.Time, error) {
+	sc, err := s.st.GetSchedule(ctx, schedID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if sc.Status != types.ScheduleStatusActive {
+		return nil, nil
+	}
+	description, err := s.c.ScheduleClient().GetHandle(
+		ctx, schedID,
+	).Describe(ctx)
+	if err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return nil, types.NewAppError(
+				types.CodeNotFound,
+				fmt.Sprintf("定时任务 %s 不存在", schedID),
+				err,
+			)
+		}
+		return nil, types.NewAppError(
+			types.CodeInternal, "读取任务下次运行时间失败", err,
+		)
+	}
+	if len(description.Info.NextActionTimes) == 0 {
+		return nil, nil
+	}
+	next := description.Info.NextActionTimes[0]
+	return &next, nil
+}
+
 // UpdatePush 原地改一个已存在调度的触发频率（可选连带 nl_description）。
 //
 // 为什么要有它、而不是让调用方 Delete+Create（本方法存在的全部理由）：删重建会
@@ -594,12 +1227,34 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64
 	return nil
 }
 
-// DeletePush 删除调度：**先校验归属**，再 Temporal Delete，最后删镜像
-// （镜像删除失败只 slog）。
-//
-// 归属校验必须在动 Temporal 之前——Temporal 的删除不可逆，
-// 「先删后校验」等于校验失败时对方的调度已经没了，校验形同虚设。
+// DeletePush retains the pre-6.8 internal signature. Production Store values
+// still use the durable command path; narrow unit fakes retain the historical
+// behavior so old interface consumers do not need to know about HTTP keys.
 func (s *Scheduler) DeletePush(ctx context.Context, schedID string, userID int64) error {
+	if _, ok := s.st.(scheduleCommandStore); ok {
+		return s.DeletePushIdempotent(
+			ctx, schedID, userID, legacyScheduleCommandKey(),
+		)
+	}
+	return s.deletePushLegacy(ctx, schedID, userID)
+}
+
+func (s *Scheduler) DeletePushIdempotent(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+	idempotencyKey string,
+) error {
+	return s.executeNewScheduleCommand(
+		ctx, schedID, userID, idempotencyKey, types.ScheduleCommandDelete,
+	)
+}
+
+func (s *Scheduler) deletePushLegacy(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+) error {
 	// GetSchedule 带 user_id 谓词：不存在与不属于你归一为 NotFound，
 	// 不给调用方枚举他人调度 id 的机会。
 	if _, err := s.st.GetSchedule(ctx, schedID, userID); err != nil {
@@ -610,7 +1265,7 @@ func (s *Scheduler) DeletePush(ctx context.Context, schedID string, userID int64
 		return types.NewAppError(types.CodeInternal, "删除定时任务失败", err)
 	}
 	if err := s.st.DeleteSchedule(ctx, schedID, userID); err != nil {
-		slog.Error("scheduler: schedules 镜像删除失败（Temporal 已删除）", "schedule_id", schedID, "err", err)
+		return err
 	}
 	return nil
 }

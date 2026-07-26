@@ -1,11 +1,12 @@
 // 任务数据面只读端点（M7 功能 6.6/6.7）：任务详情页与任务列表页的任务级聚合读面。
-// 只读（不写表、不调模型、不碰 Temporal）；挂 /api/ 前缀自动继承会话中间件。
-// 暂停/恢复/编辑等操作面刻意不在此提供——任务编辑写路径由 Runtime C2b3 重造中
-// （agent-runtime-contract），2d 开闸前不得新增写入口。
+// 本文件仍只负责 Postgres 聚合读取；6.8 的确认式编辑与运行控制分别位于
+// task_actions.go / schedule_actions.go。挂 /api/ 前缀后统一继承会话中间件。
 package api
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -20,13 +21,33 @@ type schedulePlaybookDTO struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+type scheduleDetailScheduleDTO struct {
+	types.Schedule
+	NextRun      *time.Time           `json:"next_run,omitempty"`
+	NextRunState scheduleNextRunState `json:"next_run_state"`
+}
+
+type scheduleNextRunState string
+
+const (
+	scheduleNextRunScheduled   scheduleNextRunState = "scheduled"
+	scheduleNextRunPaused      scheduleNextRunState = "paused"
+	scheduleNextRunNone        scheduleNextRunState = "none"
+	scheduleNextRunUnavailable scheduleNextRunState = "unavailable"
+)
+
+type scheduleCapabilitiesDTO struct {
+	DefinitionEdit bool `json:"definition_edit"`
+}
+
 // scheduleDetailResp 是 GET /api/schedules/{id} 的响应体。
 type scheduleDetailResp struct {
-	Schedule types.Schedule             `json:"schedule"`
-	Summary  store.ScheduleRunSummary   `json:"summary"`
-	Sources  []store.ScheduleSourceInfo `json:"sources"`
-	Playbook *schedulePlaybookDTO       `json:"playbook,omitempty"` // 无手册的老任务缺省
-	Cost     store.ScheduleRunCost      `json:"cost"`               // 口径见 store/schedule_dashboard.go
+	Schedule     scheduleDetailScheduleDTO  `json:"schedule"`
+	Summary      store.ScheduleRunSummary   `json:"summary"`
+	Sources      []store.ScheduleSourceInfo `json:"sources"`
+	Playbook     *schedulePlaybookDTO       `json:"playbook,omitempty"` // 无手册的老任务缺省
+	Cost         store.ScheduleRunCost      `json:"cost"`               // 口径见 store/schedule_dashboard.go
+	Capabilities scheduleCapabilitiesDTO    `json:"capabilities"`
 }
 
 // handleGetScheduleDetail 返回单任务详情：本体 + 运行概览 + 绑定信源 + 手册 + 成本。
@@ -69,6 +90,22 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 		writeAppError(w, err)
 		return
 	}
+	reader, _ := s.deps.Scheduler.(scheduleNextRunReader)
+	nextRun, nextRunState, nextRunErr := projectScheduleNextRun(
+		r.Context(), sched, reader,
+	)
+	if nextRunErr != nil {
+		// Next run is an optional live Temporal projection. The durable
+		// Postgres detail remains useful during a transient control-plane
+		// outage, so degrade only this field and keep the page readable.
+		slog.WarnContext(
+			r.Context(),
+			"api: read schedule next run",
+			"schedule_id", id,
+			"user_id", userID,
+			"err", nextRunErr,
+		)
+	}
 
 	// 手册是可选块：老任务/空手册任务没有行，NotFound 不是错误，整块缺省。
 	var playbook *schedulePlaybookDTO
@@ -84,9 +121,48 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, scheduleDetailResp{
-		Schedule: *sched, Summary: *summary, Sources: sources,
+		Schedule: scheduleDetailScheduleDTO{
+			Schedule:     *sched,
+			NextRun:      nextRun,
+			NextRunState: nextRunState,
+		},
+		Summary: *summary, Sources: sources,
 		Playbook: playbook, Cost: *cost,
+		Capabilities: scheduleCapabilitiesDTO{
+			DefinitionEdit: s.deps.DefinitionEditEnabled,
+		},
 	})
+}
+
+func projectScheduleNextRun(
+	ctx context.Context,
+	schedule *types.Schedule,
+	reader scheduleNextRunReader,
+) (*time.Time, scheduleNextRunState, error) {
+	if schedule == nil {
+		return nil, scheduleNextRunUnavailable, errors.New(
+			"schedule next-run projection has no schedule",
+		)
+	}
+	if schedule.Status == types.ScheduleStatusPaused {
+		return nil, scheduleNextRunPaused, nil
+	}
+	if schedule.Status != types.ScheduleStatusActive {
+		return nil, scheduleNextRunUnavailable, errors.New(
+			"schedule next-run projection has invalid schedule status",
+		)
+	}
+	if reader == nil {
+		return nil, scheduleNextRunUnavailable, nil
+	}
+	nextRun, err := reader.NextRun(ctx, schedule.ID, schedule.UserID)
+	if err != nil {
+		return nil, scheduleNextRunUnavailable, err
+	}
+	if nextRun == nil {
+		return nil, scheduleNextRunNone, nil
+	}
+	return nextRun, scheduleNextRunScheduled, nil
 }
 
 // scheduleBatchesResp 是 GET /api/schedules/{id}/batches 的响应体。

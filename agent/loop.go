@@ -70,6 +70,17 @@ const directTaskCreationRetrySystemNote = `
 const directTaskCreationResponseRetrySystemNote = `
 - 你刚才没有调用 create_schedule；该回复已被系统丢弃。若用户已提供全部必需参数，现在调用 create_schedule；若确有缺失，不得编造。绝不能口头承诺确认卡已经、正在或即将生成。`
 
+const directTaskDefinitionEditSystemNote = `
+- 这是 Web 任务详情页发起的结构化编辑请求。本轮不读取会话历史、画像、信源、任务列表或网络；系统已在带外验证选中的任务 id。
+- 只能调用 edit_task_definition，且 arguments.task_id 必须逐字等于 system 消息末尾给出的 selected_task_id。不得调用任何读工具、create_schedule 或其他写工具。
+- 用户描述的是对选中任务的变更要求。只生成需要人工确认的冻结编辑方案；点击确认卡前不会执行。信息不足时不得编造，也不得声称确认卡已经或即将出现。`
+
+const directTaskDefinitionEditRetrySystemNote = `
+- 系统刚刚拒绝并丢弃了一个非 edit_task_definition 调用或 task_id 不匹配的调用；它没有执行，也没有产生 proposal。现在只能为 selected_task_id 调用 edit_task_definition。`
+
+const directTaskDefinitionEditResponseRetrySystemNote = `
+- 你刚才没有调用 edit_task_definition；该回复已被系统丢弃。若变更要求足够，现在调用 edit_task_definition；若确实不足，不得编造或口头承诺确认卡。`
+
 // 契约 §7 固定的回复/占位文案。
 const (
 	// replyMaxTurns 是 MaxTurns 内未收敛时的兜底回复（契约原文，勿改）。
@@ -89,6 +100,10 @@ const (
 	// 幻觉读调用的固定回执。它不含外部结果，不触发 taint；下一轮仍只声明
 	// create_schedule，让模型自纠而不是再次进入读取→隔离循环。
 	toolMsgDirectTaskCreationOnly = "用户已明确要求直接生成任务确认卡且不再查询；本次读取未执行。请仅调用 create_schedule，若参数不足则明确追问，不能声称确认卡已生成。"
+	// toolMsgDirectTaskDefinitionEditOnly is the deterministic rejection used
+	// by the Web-only edit lane. It never echoes a hallucinated tool name or
+	// arguments back into a subsequent model request.
+	toolMsgDirectTaskDefinitionEditOnly = "Web 任务编辑模式只允许为已选任务调用 edit_task_definition；本次其他调用未执行。"
 	// replyTaskCreationConfirm 是 v1 durable proposal 的确定性出口。proposal 已经落库后
 	// 不再做一次可能失败的 LLM “收尾”：否则数据库里留下可执行动作，用户却收不到卡。
 	replyTaskCreationConfirm = "我已整理好任务方案，请确认卡片中的时间、门槛和信源。"
@@ -97,7 +112,8 @@ const (
 	replyDefinitionEditConfirm = "我已冻结任务编辑方案，请核对确认卡中的变更。"
 	// replyTaskCreationNotCreated 是 direct 模式连续两次没有产生 proposal 时的
 	// 确定性出口。不能把模型的口头承诺原样发给用户。
-	replyTaskCreationNotCreated = "当前未能生成确认卡，任务尚未创建；请补充缺失参数或重新发送确认。"
+	replyTaskCreationNotCreated       = "当前未能生成确认卡，任务尚未创建；请补充缺失参数或重新发送确认。"
+	replyTaskDefinitionEditNotCreated = "当前未能生成任务编辑确认卡，任务尚未修改；请补充变更要求后重试。"
 	// replyExternalProtocolFailure 用于外部只读调用已经进入隔离边界、但模型泄漏
 	// 内部工具协议的场景。外部调用本身也可能失败，故只陈述零工具边界能证明的事实。
 	replyExternalProtocolFailure = "外部资料读取或整理未能可靠完成；本轮未创建或修改任何内容，请重新发送需求。"
@@ -135,6 +151,8 @@ const (
 	// 参数校验只允许携带精确错误自纠一次。第二次仍失败就诚实退出；
 	// schema/业务错误不应靠同一个模型反复猜到全局轮次耗尽。
 	directTaskCreationMaxValidationFailures = 2
+	directTaskDefinitionEditMaxTurns        = 4
+	directTaskDefinitionEditMaxFailures     = 2
 
 	// pendingActionTTL 待确认动作的有效期（契约 §7：24h 过期）。
 	pendingActionTTL = 24 * time.Hour
@@ -160,6 +178,7 @@ const (
 	// 元数据全量、内容截断——全文（上游可重取）不是本库资产，行式存储塞大 blob
 	// 只会拖慢分析查询。8K rune 覆盖绝大多数结果全文与排查所需上下文。
 	toolResultPreviewMaxRunes = 8192
+	definitionEditToolName    = "edit_task_definition"
 )
 
 // Store 是 agent 所需 store 方法的窄接口（契约 §2 全部 7 个方法，
@@ -432,7 +451,57 @@ func NewChecked(d Deps) (*Loop, error) {
 // 全部 LLM 错误向上抛（feishu 层 humanize）；LLM 出错路径不持久化本轮消息——
 // 半截上下文对下一轮没有价值，行为与现 chat_reply 的无状态失败一致。
 func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Outcome, error) {
-	return l.handleMessage(ctx, userID, text, false)
+	return l.handleMessage(ctx, userID, "", "", text, false)
+}
+
+// HandleTaskCreationMessage is the isolated Web creation lane. actionID is a
+// server-derived idempotency identity, not model or browser input. The model
+// receives no history/profile/dynamic tools and can only propose
+// create_schedule; the existing Feishu HandleMessage behavior is unchanged.
+func (l *Loop) HandleTaskCreationMessage(
+	ctx context.Context,
+	userID int64,
+	actionID string,
+	text string,
+) (Outcome, error) {
+	if !validDirectActionID(actionID) {
+		return Outcome{}, types.NewAppError(
+			types.CodeValidation,
+			"任务创建请求标识无效",
+			types.ErrValidation,
+		)
+	}
+	return l.handleMessage(ctx, userID, actionID, "", text, false)
+}
+
+// HandleTaskDefinitionEditMessage is the isolated Web edit lane. taskID is
+// verified by the HTTP principal/store boundary and is also enforced again
+// against tool arguments before the durable controller sees them.
+func (l *Loop) HandleTaskDefinitionEditMessage(
+	ctx context.Context,
+	userID int64,
+	actionID string,
+	taskID string,
+	text string,
+) (Outcome, error) {
+	if !validDirectActionID(actionID) ||
+		strings.TrimSpace(taskID) == "" ||
+		taskID != strings.TrimSpace(taskID) ||
+		len(taskID) > 255 {
+		return Outcome{}, types.NewAppError(
+			types.CodeValidation,
+			"任务编辑请求标识无效",
+			types.ErrValidation,
+		)
+	}
+	if l.taskDefinitionEdit == nil {
+		return Outcome{}, types.NewAppError(
+			types.CodeConflict,
+			"任务编辑能力尚未开启",
+			types.ErrConflict,
+		)
+	}
+	return l.handleMessage(ctx, userID, actionID, taskID, text, false)
 }
 
 // HandleExternalContextMessage 处理「用户文字 + 外部内容」的合成输入（当前由飞书
@@ -440,10 +509,17 @@ func (l *Loop) HandleMessage(ctx context.Context, userID int64, text string) (Ou
 // 才 taint：本入口从第一轮起不读画像、不声明工具，避免正文诱导写 pending、读取
 // 内部数据或把上下文编码进 URL/query。
 func (l *Loop) HandleExternalContextMessage(ctx context.Context, userID int64, text string) (Outcome, error) {
-	return l.handleMessage(ctx, userID, text, true)
+	return l.handleMessage(ctx, userID, "", "", text, true)
 }
 
-func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, externalInput bool) (Outcome, error) {
+func (l *Loop) handleMessage(
+	ctx context.Context,
+	userID int64,
+	directActionID string,
+	directDefinitionEditTaskID string,
+	text string,
+	externalInput bool,
+) (Outcome, error) {
 	// per-user 串行化整个 load→loop→save（见 userMu 字段注释）。
 	muVal, _ := l.userMu.LoadOrStore(userID, &sync.Mutex{})
 	mu := muVal.(*sync.Mutex)
@@ -455,14 +531,20 @@ func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, ext
 		return Outcome{}, err
 	}
 
-	directTaskCreation := !externalInput && isDirectTaskCreationConfirmation(text)
+	directDefinitionEdit := directDefinitionEditTaskID != ""
+	directTaskCreation := directActionID != "" && !directDefinitionEdit
+	if directActionID == "" {
+		directTaskCreation = !externalInput &&
+			isDirectTaskCreationConfirmation(text)
+	}
+	directProposal := directTaskCreation || directDefinitionEdit
 
 	// 外部上下文入口不读取画像：不是“读了但不渲染”，而是从数据访问层就不碰。
 	// direct-task-creation 同样从数据访问层跳过画像，防止模型把用户没有批准的
 	// 行业/岗位/标签扩写进 proposal。其余普通消息仍每条现查一次，本条消息内
 	// 的多轮模型调用共享同一快照。
 	var hint string
-	if !externalInput && !directTaskCreation {
+	if !externalInput && !directProposal {
 		hint = l.profileHint(ctx, userID)
 	}
 
@@ -475,7 +557,7 @@ func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, ext
 	// 留有 view_profile 回执或模型派生画像，不能让它们扩写本次 proposal。
 	// 两类历史都只留待本轮结束后重新合并持久化，不进入 converse。
 	modelHistory := history
-	if externalInput || directTaskCreation {
+	if externalInput || directProposal {
 		modelHistory = nil
 	}
 	msgs := append(modelHistory, llm.ChatMessage{Role: "user", Content: text})
@@ -489,9 +571,11 @@ func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, ext
 	// 端点注册表契约 §4：激活集随会话持久化，本条消息的工具运行状态经 ctx 旁路
 	// 传给工具 Execute（工具是全局单例，不能携带 per-message 状态）。
 	state := &toolRunState{
-		activation:              decodeActivation(sess.ActivatedTools),
-		directTaskCreation:      directTaskCreation,
-		untrustedExternalResult: externalInput,
+		activation:                 decodeActivation(sess.ActivatedTools),
+		directTaskCreation:         directTaskCreation,
+		directActionID:             directActionID,
+		directTaskDefinitionEditID: directDefinitionEditTaskID,
+		untrustedExternalResult:    externalInput,
 	}
 
 	sid := sess.ID
@@ -505,7 +589,7 @@ func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, ext
 		// 给出了信任标签，未来包装文案改名也不能让原文漏进持久化历史。
 		externalTurn := redactLatestExternalInput(msgs)
 		msgs = truncateMessages(append(history, externalTurn...))
-	} else if directTaskCreation {
+	} else if directProposal {
 		// converse 只处理 current-user-only 视图；持久化时把本轮安全交换追加
 		// 回原有已清洗历史，既不泄漏旧画像给模型，也不抹掉用户会话。
 		// 无论最终成功与否都不保留动态参数校验 tool result：先校验失败、
@@ -531,6 +615,14 @@ func (l *Loop) handleMessage(ctx context.Context, userID int64, text string, ext
 	msgs = l.scrubUntrustedHistory(msgs)
 	l.saveSession(ctx, sess, msgs, turns, state, outcome.Confirm, turnID)
 	return outcome, nil
+}
+
+func validDirectActionID(actionID string) bool {
+	if len(actionID) != 36 || actionID != strings.TrimSpace(actionID) {
+		return false
+	}
+	parsed, err := uuid.Parse(actionID)
+	return err == nil && parsed.String() == actionID
 }
 
 // RunOnce 在给定历史上执行一轮多轮 FC（M4 契约 §7.1，A2A 轨 / a2a-contract §12 P2）：
@@ -570,15 +662,20 @@ func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMess
 func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msgs []llm.ChatMessage, hint string, state *toolRunState) (Outcome, []llm.ChatMessage, int, error) {
 	ctx = context.WithValue(ctx, toolRunKey{}, state)
 
-	var directTaskCreationBase []llm.ChatMessage
-	if state != nil && state.directTaskCreation {
+	var directProposalBase []llm.ChatMessage
+	if state != nil && (state.directTaskCreation ||
+		state.directTaskDefinitionEditID != "") {
 		// 缩面后若模型仍幻觉隐藏工具，下一轮回到这一份进入本消息时的
 		// 安全基线；不把“未声明工具的原生 tool history”送回供应商。
-		directTaskCreationBase = append([]llm.ChatMessage(nil), msgs...)
+		directProposalBase = append([]llm.ChatMessage(nil), msgs...)
 	}
 	maxTurns := l.maxTurns
 	if state != nil && state.directTaskCreation && maxTurns > directTaskCreationMaxTurns {
 		maxTurns = directTaskCreationMaxTurns
+	}
+	if state != nil && state.directTaskDefinitionEditID != "" &&
+		maxTurns > directTaskDefinitionEditMaxTurns {
+		maxTurns = directTaskDefinitionEditMaxTurns
 	}
 	turns := 0
 	for turns < maxTurns {
@@ -595,7 +692,7 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			// runToolCalls 双层关闭，避免把上下文编码进第二个 URL/query 外带。
 			profileHint, renderProfile = "", false
 		}
-		if state.directTaskCreation {
+		if state.directTaskCreation || state.directTaskDefinitionEditID != "" {
 			// direct 模式也不渲染“画像尚未建立”占位：基础 prompt 会据此主动
 			// 追问行业/岗位，正好偏离当前已明确的出卡请求。
 			profileHint, renderProfile = "", false
@@ -617,6 +714,19 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			}
 			if state.directTaskCreationResponseRejected {
 				system += directTaskCreationResponseRetrySystemNote
+			}
+		}
+		if state.directTaskDefinitionEditID != "" {
+			system += directTaskDefinitionEditSystemNote +
+				fmt.Sprintf(
+					"\n- selected_task_id=%q",
+					state.directTaskDefinitionEditID,
+				)
+			if state.directTaskDefinitionEditToolRejected {
+				system += directTaskDefinitionEditRetrySystemNote
+			}
+			if state.directTaskDefinitionEditResponseRejected {
+				system += directTaskDefinitionEditResponseRetrySystemNote
 			}
 		}
 		resp, err := l.chatFn(ctx, llm.ChatRequest{
@@ -655,7 +765,7 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 					// 绕过。回到安全基线，给模型一次只调用 create_schedule
 					// 的自纠机会。
 					state.directTaskCreationResponseRejected = true
-					msgs = append([]llm.ChatMessage(nil), directTaskCreationBase...)
+					msgs = append([]llm.ChatMessage(nil), directProposalBase...)
 					continue
 				}
 				msgs = append(msgs, llm.ChatMessage{
@@ -663,6 +773,20 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 					Content: replyTaskCreationNotCreated,
 				})
 				return Outcome{Reply: replyTaskCreationNotCreated}, msgs, turns, nil
+			}
+			if state.directTaskDefinitionEditID != "" {
+				if !state.directTaskDefinitionEditResponseRejected {
+					state.directTaskDefinitionEditResponseRejected = true
+					msgs = append([]llm.ChatMessage(nil), directProposalBase...)
+					continue
+				}
+				msgs = append(msgs, llm.ChatMessage{
+					Role:    "assistant",
+					Content: replyTaskDefinitionEditNotCreated,
+				})
+				return Outcome{
+					Reply: replyTaskDefinitionEditNotCreated,
+				}, msgs, turns, nil
 			}
 			reply := rejectUnbackedConfirmationClaim(resp.Content)
 			msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: reply})
@@ -673,7 +797,7 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		// 外部读取执行成功后会在下方缩成去参数/去 content 的协议壳。
 		currentUser := latestUserMessage(msgs)
 		assistantContent := resp.Content
-		if state.directTaskCreation {
+		if state.directTaskCreation || state.directTaskDefinitionEditID != "" {
 			// direct 模式的可见成功只来自 durable proposal 后的固定出口。
 			// 即使供应商把“确认卡已生成”与无效 tool_call 同批返回，也不能
 			// 让这段口头承诺进入下一轮请求或持久化历史。
@@ -708,7 +832,23 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		if pending == nil && state.directTaskCreation && state.directTaskCreationToolRejected {
 			// 隐藏工具没有执行，协议壳也不值得保留；回到基线后让模型在
 			// 只声明 create_schedule 的干净请求上自纠。
-			msgs = append([]llm.ChatMessage(nil), directTaskCreationBase...)
+			msgs = append([]llm.ChatMessage(nil), directProposalBase...)
+			continue
+		}
+		if pending == nil && state.directTaskDefinitionEditID != "" &&
+			state.directTaskDefinitionEditFailures >=
+				directTaskDefinitionEditMaxFailures {
+			msgs = append(msgs, llm.ChatMessage{
+				Role:    "assistant",
+				Content: replyTaskDefinitionEditNotCreated,
+			})
+			return Outcome{
+				Reply: replyTaskDefinitionEditNotCreated,
+			}, msgs, turns, nil
+		}
+		if pending == nil && state.directTaskDefinitionEditID != "" &&
+			state.directTaskDefinitionEditToolRejected {
+			msgs = append([]llm.ChatMessage(nil), directProposalBase...)
 			continue
 		}
 		if pending == nil {
@@ -776,6 +916,9 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 	if state != nil && state.directTaskCreation {
 		reply = replyTaskCreationNotCreated
 	}
+	if state != nil && state.directTaskDefinitionEditID != "" {
+		reply = replyTaskDefinitionEditNotCreated
+	}
 	msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: reply})
 	return Outcome{Reply: reply}, msgs, turns, nil
 }
@@ -793,6 +936,15 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 			}
 		}
 		return out
+	}
+	if state != nil && state.directTaskDefinitionEditID != "" {
+		spec, ok := l.tools["edit_task_definition"]
+		if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
+			spec.Policy.Confirmation != ConfirmationRequired ||
+			l.taskDefinitionEdit == nil {
+			return nil
+		}
+		return []llm.ToolDef{spec.Definition}
 	}
 	if state != nil && state.directTaskCreation {
 		// 用户已经明确要求按当前消息直接出任务确认卡：只缩小工具面，不扩大
@@ -908,6 +1060,42 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 	// 模型单独重试。只“放行一个、拒绝其余”仍会把被拒调用的 args/content
 	// 写进下一轮消息，与随后返回的恶意网页同屏。
 	state := runStateFrom(ctx)
+	if state != nil && state.directTaskDefinitionEditID != "" {
+		if len(calls) != 1 || calls[0].Name != definitionEditToolName {
+			state.directTaskDefinitionEditToolRejected = true
+			for _, rejected := range calls {
+				out = append(out, toolMsg(
+					rejected.ID,
+					toolMsgDirectTaskDefinitionEditOnly,
+				))
+			}
+			return nil, out, nil
+		}
+		spec, ok := l.tools["edit_task_definition"]
+		if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
+			spec.Policy.Confirmation != ConfirmationRequired ||
+			l.taskDefinitionEdit == nil {
+			state.directTaskDefinitionEditToolRejected = true
+			out = append(out, toolMsg(
+				calls[0].ID,
+				"任务编辑确认能力当前不可用；本次调用未执行。",
+			))
+			return nil, out, nil
+		}
+		if !directDefinitionEditTargetsTask(
+			json.RawMessage(calls[0].Arguments),
+			state.directTaskDefinitionEditID,
+		) {
+			state.directTaskDefinitionEditFailures++
+			state.directTaskDefinitionEditToolRejected = true
+			out = append(out, toolMsg(
+				calls[0].ID,
+				"edit_task_definition 的 task_id 与 Web 已选任务不一致；本次调用未执行。",
+			))
+			return nil, out, nil
+		}
+		state.directTaskDefinitionEditToolRejected = false
+	}
 	if state != nil && state.directTaskCreation {
 		if len(calls) != 1 {
 			state.directTaskCreationToolRejected = true
@@ -1012,7 +1200,10 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 					"agent: task definition edit controller is not configured",
 				)
 			}
-			actionID := uuid.NewString()
+			actionID := state.directActionID
+			if actionID == "" {
+				actionID = uuid.NewString()
+			}
 			proposal, err := l.taskDefinitionEdit.Propose(
 				ctx,
 				task.DefinitionEditProposalInput{
@@ -1084,7 +1275,13 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 					"直接创建模式不能使用 existing_source_ids；请直接用 approved_fetch_plan.version/items 提交用户本条消息指定的新信源。"))
 				continue
 			}
-			actionID := uuid.NewString()
+			actionID := ""
+			if state != nil {
+				actionID = state.directActionID
+			}
+			if actionID == "" {
+				actionID = uuid.NewString()
+			}
 			proposal, err := l.taskCreation.Propose(ctx, task.CreationProposalInput{
 				ActionID:  actionID,
 				UserID:    userID,
@@ -1139,6 +1336,24 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 type modelTaskCreationPlanInspection struct {
 	hasExistingSourceIDs bool
 	hasSources           bool
+}
+
+func directDefinitionEditTargetsTask(
+	args json.RawMessage,
+	taskID string,
+) bool {
+	var envelope struct {
+		TaskID            string          `json:"task_id"`
+		Spec              json.RawMessage `json:"spec,omitempty"`
+		Intent            json.RawMessage `json:"intent,omitempty"`
+		NLDescription     json.RawMessage `json:"nl_description,omitempty"`
+		Strictness        json.RawMessage `json:"strictness,omitempty"`
+		ObservationPolicy json.RawMessage `json:"observation_policy,omitempty"`
+	}
+	if strictjson.DecodeExact(args, &envelope) != nil {
+		return false
+	}
+	return envelope.TaskID == taskID
 }
 
 // normalizeDirectTaskCreationArgs 把直建模式刻意简化的模型工具面恢复成

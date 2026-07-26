@@ -353,6 +353,29 @@ func TestCreationReceiptDispatcher_AmbiguousPatchReplayKeepsOneResource(t *testi
 	}
 }
 
+func TestCreationReceiptDispatcher_WebPollingSkipsExternalSender(t *testing.T) {
+	st := newReceiptDispatcherFakeStore(types.PendingActionStatusExecuted)
+	st.r.Provider = WebActionReceiptProvider
+	st.r.Target = st.r.OperationID
+	sessions := &receiptDispatcherFakeSessions{}
+	sender := &receiptDispatcherFakeSender{}
+	d := newReceiptDispatcherForTest(t, st, sessions, sender)
+
+	if err := d.DispatchOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	final := st.snapshot()
+	calls, resources := sender.snapshot()
+	if final.Status != types.TaskCreationReceiptStatusSent ||
+		final.ProviderMessageID != final.OperationID ||
+		calls != 0 || len(resources) != 0 || sessions.count() != 1 {
+		t.Fatalf(
+			"final=%+v calls=%d resources=%v sessions=%d",
+			final, calls, resources, sessions.count(),
+		)
+	}
+}
+
 func TestCreationReceiptDispatcher_CrashAfterPatchBeforeSentCheckpoint(t *testing.T) {
 	st := newReceiptDispatcherFakeStore(types.PendingActionStatusCancelled)
 	st.markFailures = 1

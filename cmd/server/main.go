@@ -277,6 +277,18 @@ func run() error {
 		st.Close()
 		return fmt.Errorf("任务定义编辑受限角色 Gate: %w", roleGateErr)
 	}
+	commandRoleGateCtx, cancelCommandRoleGate := context.WithTimeout(
+		ctx, 10*time.Second,
+	)
+	commandRoleGateErr := st.ValidateScheduleCommandRuntimeRole(
+		commandRoleGateCtx,
+	)
+	cancelCommandRoleGate()
+	if commandRoleGateErr != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("任务命令受限角色 Gate: %w", commandRoleGateErr)
+	}
 	environmentGateCtx, cancelEnvironmentGate := context.WithTimeout(ctx, 90*time.Second)
 	environmentGateErr := definitionEditCoordinator.ValidateRuntimeEnvironment(
 		environmentGateCtx,
@@ -297,6 +309,22 @@ func run() error {
 		temporalClient.Close()
 		st.Close()
 		return fmt.Errorf("任务定义编辑首轮恢复 Gate: %w", err)
+	}
+	scheduleCommandStartupCtx, cancelScheduleCommandStartup :=
+		context.WithTimeout(
+			ctx, scheduler.ScheduleCommandRecoveryPassTimeout,
+		)
+	scheduleCommandStartupErr :=
+		sched.RecoverScheduleCommandsOnce(scheduleCommandStartupCtx)
+	cancelScheduleCommandStartup()
+	if scheduleCommandStartupErr != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf(
+			"任务命令首轮恢复 Gate（%s budget）: %w",
+			scheduler.ScheduleCommandRecoveryPassTimeout,
+			scheduleCommandStartupErr,
+		)
 	}
 	if err := sched.ReconcileActions(ctx); err != nil {
 		temporalClient.Close()
@@ -532,6 +560,23 @@ func run() error {
 		}
 	}
 
+	scheduleCommandRecoveryCtx, cancelScheduleCommandRecovery :=
+		context.WithCancel(ctx)
+	scheduleCommandRecoveryDone := make(chan struct{})
+	go func() {
+		defer close(scheduleCommandRecoveryDone)
+		sched.RunScheduleCommandRecovery(scheduleCommandRecoveryCtx)
+	}()
+	stopScheduleCommandRecovery := func() error {
+		cancelScheduleCommandRecovery()
+		select {
+		case <-scheduleCommandRecoveryDone:
+			return nil
+		case <-time.After(30 * time.Second):
+			return errors.New("schedule command recovery 关停超时")
+		}
+	}
+
 	pushRecoveryCtx, cancelPushRecovery := context.WithCancel(ctx)
 	pushRecoveryDone := make(chan struct{})
 	if pushRecoveryRunner == nil {
@@ -616,6 +661,7 @@ func run() error {
 		stop()
 		recoveryErr := stopCreationRecovery()
 		definitionEditRecoveryErr := stopDefinitionEditRecovery()
+		scheduleCommandRecoveryErr := stopScheduleCommandRecovery()
 		pushRecoveryErr := stopPushRecovery()
 		creationReceiptErr := stopReceiptDispatch()
 		definitionEditReceiptErr :=
@@ -627,6 +673,7 @@ func run() error {
 		cancelMaintenance()
 		drainErr := errors.Join(
 			recoveryErr, definitionEditRecoveryErr,
+			scheduleCommandRecoveryErr,
 			pushRecoveryErr,
 			creationReceiptErr, definitionEditReceiptErr,
 			maintenanceErr,
@@ -687,10 +734,13 @@ func run() error {
 	principals := auth.NewOwnerResolver(st, feishu.SettingKeyOwner)
 
 	api.Mount(mux, api.Deps{
-		Store:     st,
-		Auth:      st,
-		Manager:   manager,
-		Scheduler: sched,
+		Store:                 st,
+		Auth:                  st,
+		Manager:               manager,
+		Scheduler:             sched,
+		TaskAgent:             agentLoop,
+		TaskActions:           st,
+		DefinitionEditEnabled: cfg.Agent.DefinitionEditEnabled,
 		// HTTP 面的 principal 来自会话中间件注入的 ctx（企业级契约 §1.1 的最终形态）；
 		// a2a/gate 无 HTTP 会话，仍用 owner 回退——这正是把 principal 做成接口的价值。
 		Principal: auth.NewContextResolver(),
@@ -752,6 +802,7 @@ func run() error {
 			drainErr := drainIngress()
 			recoveryErr := stopCreationRecovery()
 			definitionEditRecoveryErr := stopDefinitionEditRecovery()
+			scheduleCommandRecoveryErr := stopScheduleCommandRecovery()
 			pushRecoveryErr := stopPushRecovery()
 			receiptErr := stopReceiptDispatch()
 			definitionEditReceiptErr :=
@@ -761,14 +812,16 @@ func run() error {
 			maintenanceErr := waitMaintenance(maintenanceCtx)
 			cancelMaintenance()
 			if drainErr != nil || recoveryErr != nil ||
-				definitionEditRecoveryErr != nil || pushRecoveryErr != nil ||
+				definitionEditRecoveryErr != nil ||
+				scheduleCommandRecoveryErr != nil ||
+				pushRecoveryErr != nil ||
 				receiptErr != nil || definitionEditReceiptErr != nil ||
 				sessionErr != nil || maintenanceErr != nil {
 				// An admitted callback may still own DB/Temporal work. Do not close
 				// those resources underneath it; returning exits the process.
 				return errors.Join(fmt.Errorf("挂载 A2A server: %w", err),
 					drainErr, recoveryErr, definitionEditRecoveryErr,
-					pushRecoveryErr, receiptErr,
+					scheduleCommandRecoveryErr, pushRecoveryErr, receiptErr,
 					definitionEditReceiptErr, sessionErr, maintenanceErr)
 			}
 			w.Stop()
@@ -861,6 +914,11 @@ func run() error {
 	// 或在执行 Temporal exact-CAS；必须在关闭两个依赖前得到它的退出证明。
 	if err := stopDefinitionEditRecovery(); err != nil {
 		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空任务定义编辑恢复器: %w", err))
+	}
+	if err := stopScheduleCommandRecovery(); err != nil {
+		shutdownErrs = append(
+			shutdownErrs, fmt.Errorf("排空任务命令恢复器: %w", err),
+		)
 	}
 	if err := stopPushRecovery(); err != nil {
 		shutdownErrs = append(

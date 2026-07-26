@@ -44,12 +44,27 @@ func (s *server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "缺少 schedule id")
 		return
 	}
+	idempotencyKey, ok := scheduleCommandIdempotencyKey(r)
+	if !ok {
+		writeError(
+			w, http.StatusBadRequest,
+			"缺少或无效的 Idempotency-Key",
+		)
+		return
+	}
 	userID, err := s.ownerUserID(r.Context())
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
-	if err := s.deps.Scheduler.DeletePush(r.Context(), id, userID); err != nil {
+	controller, ok := s.deps.Scheduler.(scheduleDeleteController)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "任务操作控制面尚未就绪")
+		return
+	}
+	if err := controller.DeletePushIdempotent(
+		r.Context(), id, userID, idempotencyKey,
+	); err != nil {
 		writeAppError(w, err)
 		return
 	}

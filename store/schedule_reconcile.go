@@ -101,6 +101,111 @@ func scheduleReconcileRollbackContext(
 	)
 }
 
+// BeginScheduleStatusChange stages one owner-scoped active↔paused mirror
+// transition under the same cross-process lock as definition editing. The
+// caller performs the matching Temporal mutation while this transaction stays
+// open, then commits or rolls back the staged mirror change.
+func (s *Store) BeginScheduleStatusChange(
+	ctx context.Context,
+	id string,
+	userID int64,
+	from types.ScheduleStatus,
+	to types.ScheduleStatus,
+) (
+	commit func(context.Context) error,
+	rollback func(context.Context) error,
+	err error,
+) {
+	if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) ||
+		len(id) > 255 || userID <= 0 ||
+		!validScheduleStatusTransition(from, to) {
+		return nil, nil, types.NewAppError(
+			types.CodeValidation,
+			"任务暂停/恢复参数无效",
+			types.ErrValidation,
+		)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, nil, types.NewAppError(
+			types.CodeDatabase, "开始任务状态变更", err,
+		)
+	}
+	rollback = func(parent context.Context) error {
+		releaseCtx, cancelRelease := scheduleReconcileRollbackContext(parent)
+		defer cancelRelease()
+		err := tx.Rollback(releaseCtx)
+		if errors.Is(err, pgx.ErrTxClosed) {
+			return nil
+		}
+		return err
+	}
+	fail := func(cause error) (
+		func(context.Context) error,
+		func(context.Context) error,
+		error,
+	) {
+		if rollbackErr := rollback(ctx); rollbackErr != nil {
+			cause = errors.Join(cause, rollbackErr)
+		}
+		return nil, nil, cause
+	}
+	if err := lockTaskScheduleMutation(ctx, tx, id); err != nil {
+		return fail(err)
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE schedules s
+		   SET status=$4, updated_at=clock_timestamp()
+		 WHERE s.id=$1 AND s.user_id=$2 AND s.status=$3
+		   AND s.definition_edit_operation_id IS NULL
+		   AND s.definition_edit_fence IS NULL
+		   AND NOT EXISTS (
+		     SELECT 1
+		       FROM task_definition_edit_operations o
+		      WHERE o.target_tenant_id=s.tenant_id
+		        AND o.target_user_id=s.user_id
+		        AND o.task_id=s.id
+		        AND o.status IN ($5,$6)
+		        AND o.tombstoned_at IS NULL
+		   )
+		   AND `+matureSchedulePredicate,
+		id, userID, from, to,
+		types.TaskDefinitionEditOperationStatusPending,
+		types.TaskDefinitionEditOperationStatusExecuting,
+	)
+	if err != nil {
+		return fail(types.NewAppError(
+			types.CodeDatabase, "暂存任务状态变更", err,
+		))
+	}
+	if tag.RowsAffected() != 1 {
+		return fail(types.NewAppError(
+			types.CodeConflict,
+			"任务状态已变化或任务正在编辑，请刷新后重试。",
+			types.ErrConflict,
+		))
+	}
+	commit = func(commitCtx context.Context) error {
+		if err := tx.Commit(commitCtx); err != nil {
+			return types.NewAppError(
+				types.CodeDatabase, "提交任务状态变更", err,
+			)
+		}
+		return nil
+	}
+	return commit, rollback, nil
+}
+
+func validScheduleStatusTransition(
+	from types.ScheduleStatus,
+	to types.ScheduleStatus,
+) bool {
+	return (from == types.ScheduleStatusActive &&
+		to == types.ScheduleStatusPaused) ||
+		(from == types.ScheduleStatusPaused &&
+			to == types.ScheduleStatusActive)
+}
+
 // lockTaskScheduleMutation is the cross-process counterpart of Scheduler's
 // keyed in-memory gate. Hash collisions only over-serialize unrelated task
 // IDs; they cannot authorize a write. Every caller must acquire it before any

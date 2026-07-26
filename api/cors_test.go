@@ -23,6 +23,10 @@ func TestCORS_预检不进会话中间件(t *testing.T) {
 	req := httptest.NewRequest(http.MethodOptions, "/api/subscriptions", nil)
 	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Access-Control-Request-Method", "POST")
+	req.Header.Set(
+		"Access-Control-Request-Headers",
+		"content-type, idempotency-key",
+	)
 	rec := httptest.NewRecorder()
 	corsMux(testOrigin).ServeHTTP(rec, req)
 
@@ -38,6 +42,12 @@ func TestCORS_预检不进会话中间件(t *testing.T) {
 	}
 	if h.Get("Access-Control-Allow-Methods") == "" || h.Get("Access-Control-Allow-Headers") == "" {
 		t.Error("预检应答缺 Allow-Methods / Allow-Headers")
+	}
+	if got := h.Get("Access-Control-Allow-Headers"); got != "Content-Type, Idempotency-Key" {
+		t.Errorf(
+			"Allow-Headers = %q, want exact Content-Type + Idempotency-Key",
+			got,
+		)
 	}
 }
 
@@ -116,5 +126,55 @@ func TestCORS_预检不再广告PATCH(t *testing.T) {
 	}
 	if strings.Contains(allow, "PATCH") {
 		t.Errorf("Allow-Methods must not advertise retired PATCH route: %q", allow)
+	}
+}
+
+func TestCORS_AuthenticatedUnsafeMethodsRejectSameSiteForeignOrigin(
+	t *testing.T,
+) {
+	const evilSameSiteOrigin = "https://evil.zhuoqidev.com"
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "confirm", path: "/api/task-actions/action-1/confirm"},
+		{name: "cancel", path: "/api/task-actions/action-1/cancel"},
+		{name: "run", path: "/api/schedules/task-1/run"},
+		{name: "pause", path: "/api/schedules/task-1/pause"},
+		{name: "resume", path: "/api/schedules/task-1/resume"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			actionAgent := &fakeTaskActionAgent{}
+			scheduleController := &fakeScheduleActionController{}
+			deps, cookie := authedDeps(t, Deps{
+				Origin:      testOrigin,
+				TaskAgent:   actionAgent,
+				TaskActions: newFakeTaskActionStore(),
+				Scheduler:   scheduleController,
+			})
+			mux := http.NewServeMux()
+			Mount(mux, deps)
+			req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+			req.AddCookie(cookie)
+			req.Header.Set("Origin", evilSameSiteOrigin)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf(
+					"status=%d body=%s, want 403",
+					rec.Code, rec.Body.String(),
+				)
+			}
+			if actionAgent.executeCalls != 0 ||
+				actionAgent.cancelCalls != 0 ||
+				scheduleController.command != "" {
+				t.Fatalf(
+					"foreign Origin reached a side effect: agent=%+v schedule=%+v",
+					actionAgent, scheduleController,
+				)
+			}
+		})
 	}
 }

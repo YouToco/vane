@@ -8,11 +8,14 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
+	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/auth"
 	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
@@ -31,6 +34,96 @@ type Manager interface {
 type Scheduler interface {
 	PushNow(ctx context.Context, userID int64, scope workflow.PushScope) (runID string, err error)
 	DeletePush(ctx context.Context, schedID string, userID int64) error
+}
+
+type scheduleActionController interface {
+	TriggerScheduleNowIdempotent(
+		ctx context.Context,
+		schedID string,
+		userID int64,
+		idempotencyKey string,
+	) error
+	PausePushIdempotent(
+		ctx context.Context,
+		schedID string,
+		userID int64,
+		idempotencyKey string,
+	) error
+	ResumePushIdempotent(
+		ctx context.Context,
+		schedID string,
+		userID int64,
+		idempotencyKey string,
+	) error
+}
+
+type scheduleDeleteController interface {
+	DeletePushIdempotent(
+		ctx context.Context,
+		schedID string,
+		userID int64,
+		idempotencyKey string,
+	) error
+}
+
+type scheduleNextRunReader interface {
+	NextRun(ctx context.Context, schedID string, userID int64) (*time.Time, error)
+}
+
+// TaskAgent is the existing confirmed-write control plane exposed to the Web
+// transport. The API never receives raw Store/coordinator phase methods.
+type TaskAgent interface {
+	HandleMessage(
+		ctx context.Context,
+		userID int64,
+		text string,
+	) (agent.Outcome, error)
+	HandleTaskCreationMessage(
+		ctx context.Context,
+		userID int64,
+		actionID string,
+		text string,
+	) (agent.Outcome, error)
+	HandleTaskDefinitionEditMessage(
+		ctx context.Context,
+		userID int64,
+		actionID string,
+		taskID string,
+		text string,
+	) (agent.Outcome, error)
+	ExecuteActionWithReceipt(
+		ctx context.Context,
+		userID int64,
+		actionID string,
+		receipt task.CreationReceiptTarget,
+	) (agent.CardActionOutcome, error)
+	CancelActionWithReceipt(
+		ctx context.Context,
+		userID int64,
+		actionID string,
+		receipt task.CreationReceiptTarget,
+	) (agent.CardActionOutcome, error)
+}
+
+// TaskActionStore is the owner-scoped durable identity read boundary used by
+// the Web proposal/replay protocol. It prevents a transport retry from
+// re-running the model after the operation commit response was lost.
+type TaskActionStore interface {
+	GetSchedule(
+		ctx context.Context,
+		id string,
+		userID int64,
+	) (*types.Schedule, error)
+	LoadTaskCreationOperationByUser(
+		ctx context.Context,
+		id string,
+		userID int64,
+	) (*types.TaskCreationOperation, error)
+	LoadTaskDefinitionEditOperationByActor(
+		ctx context.Context,
+		actionID string,
+		userID int64,
+	) (*types.TaskDefinitionEditOperation, error)
 }
 
 // AuthStore 是认证路径所需的窄接口（生产实现 *store.Store）。
@@ -58,9 +151,17 @@ type Deps struct {
 	Auth      AuthStore
 	Manager   Manager
 	Scheduler Scheduler
+	TaskAgent TaskAgent
+	// TaskActions is the narrow durable replay/identity reader. Production
+	// injects the same Store; tests can prove transport invariants without PG.
+	TaskActions TaskActionStore
 	// Principal 是全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
 	// 生产由 main.go 注入 auth.NewOwnerResolver；单测可注入假实现。
 	Principal auth.PrincipalResolver
+	// DefinitionEditEnabled is the live process capability. The Web must not
+	// advertise or enter the definition-edit proposal path while the Agent
+	// feature flag is disabled, even though historical cards remain routable.
+	DefinitionEditEnabled bool
 	// Origin 是唯一放行 CORS 的前端源（VANE_DASHBOARD_ORIGIN，默认生产 Dashboard 域）。
 	// 前端迁 OSS+CDN 后与 API 跨源（vane.* → api.*），凭证请求要求逐字匹配的
 	// Allow-Origin + Allow-Credentials，不允许通配符。为空 = 不放行任何跨源。
@@ -68,14 +169,23 @@ type Deps struct {
 }
 
 type server struct {
-	deps    Deps
-	limiter *authLimiter
+	deps              Deps
+	limiter           *authLimiter
+	taskActionLimiter *authLimiter
+	taskActionMu      sync.Mutex
+	taskActionActive  map[int64]struct{}
 }
 
 // Mount 把 /api/* 路由挂到 mux。除 /api/auth/login 外全部要求会话 cookie；
 // /healthz /readyz 不在 /api 前缀下，不受本中间件影响。
 func Mount(mux *http.ServeMux, deps Deps) {
-	s := &server{deps: deps, limiter: newAuthLimiter()}
+	taskActionLimiter := newAuthLimiter()
+	taskActionLimiter.max = 6
+	s := &server{
+		deps: deps, limiter: newAuthLimiter(),
+		taskActionLimiter: taskActionLimiter,
+		taskActionActive:  make(map[int64]struct{}),
+	}
 
 	inner := http.NewServeMux()
 	inner.HandleFunc("POST /api/auth/register", s.handleRegister)
@@ -97,7 +207,14 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("GET /api/schedules/{id}", s.handleGetScheduleDetail)
 	inner.HandleFunc("GET /api/schedules/{id}/batches", s.handleListScheduleBatches)
 	inner.HandleFunc("GET /api/schedules/{id}/deliveries", s.handleListScheduleDeliveries)
+	inner.HandleFunc("POST /api/schedules/{id}/run", s.handleRunScheduleNow)
+	inner.HandleFunc("POST /api/schedules/{id}/pause", s.handlePauseSchedule)
+	inner.HandleFunc("POST /api/schedules/{id}/resume", s.handleResumeSchedule)
 	inner.HandleFunc("POST /api/push/now", s.handlePushNow)
+	inner.HandleFunc("POST /api/task-actions/propose", s.handleProposeTaskAction)
+	inner.HandleFunc("GET /api/task-actions/{id}", s.handleGetTaskAction)
+	inner.HandleFunc("POST /api/task-actions/{id}/confirm", s.handleConfirmTaskAction)
+	inner.HandleFunc("POST /api/task-actions/{id}/cancel", s.handleCancelTaskAction)
 	inner.HandleFunc("GET /api/subscriptions", s.handleListSubscriptions)
 	inner.HandleFunc("POST /api/subscriptions", s.handleAddSubscription)
 	inner.HandleFunc("DELETE /api/subscriptions/{source_id}", s.handleRemoveSubscription)
@@ -130,8 +247,10 @@ func Mount(mux *http.ServeMux, deps Deps) {
 // 落进会话中间件会 401，浏览器随即判定跨源失败——真请求根本发不出来。
 //
 // 只放行 deps.Origin 一个源：带凭证（cookie）的 CORS 规范禁止 Allow-Origin 通配符，
-// 且回显任意 Origin 等于把带 cookie 的 API 开放给全网页面。非放行源不加任何 CORS 头，
-// 浏览器侧按同源策略拒绝（curl / A2A 等非浏览器客户端不受影响，语义不变）。
+// 且回显任意 Origin 等于把带 cookie 的 API 开放给全网页面。带非空错误 Origin 的
+// unsafe 请求在会话中间件之前直接 403；只省略 CORS 响应头并不能阻止浏览器完成
+// simple POST 的副作用，尤其 vane.* / api.* 同站时 SameSite=Lax 仍会携带 cookie。
+// 无 Origin 的 curl / 服务端调用保持兼容。
 //
 // 会话 cookie 是 SameSite=Lax（auth.go）：vane.* 与 api.* 同注册域即同站，
 // Lax 不拦同站请求，故跨源 fetch(credentials:"include") 能带上 cookie，无需放宽 cookie 属性。
@@ -149,14 +268,30 @@ func (s *server) cors(next http.Handler) http.Handler {
 				// 连请求都不发（fetch 拿到的是网络错误，不是状态码）。新增写端点时
 				// 必须同步这一行；已退役的方法不得继续被浏览器预检广告。
 				h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE")
-				h.Set("Access-Control-Allow-Headers", "Content-Type")
+				h.Set(
+					"Access-Control-Allow-Headers",
+					"Content-Type, Idempotency-Key",
+				)
 				h.Set("Access-Control-Max-Age", "600")
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
 		}
+		if r.Method != http.MethodOptions && isUnsafeHTTPMethod(r.Method) &&
+			!s.checkOrigin(w, r) {
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isUnsafeHTTPMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return false
+	default:
+		return true
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

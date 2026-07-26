@@ -38,6 +38,15 @@ func (s *spyScheduler) DeletePush(_ context.Context, id string, _ int64) error {
 	s.deleted = id
 	return nil
 }
+func (s *spyScheduler) DeletePushIdempotent(
+	_ context.Context,
+	id string,
+	_ int64,
+	_ string,
+) error {
+	s.deleted = id
+	return nil
+}
 
 // authzMux 起一个以 userID 身份登录的 mux。
 func authzMux(t *testing.T, userID, tenantID int64, sched Scheduler) (*http.ServeMux, *http.Cookie) {
@@ -74,6 +83,7 @@ func TestAuthz_ScheduleOwnershipIsChecked(t *testing.T) {
 
 	t.Run("DELETE 必须带上调用者身份", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodDelete, "/api/schedules/push-1-victim", nil)
+		r.Header.Set("Idempotency-Key", "authz-delete-1")
 		r.AddCookie(cookie)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, r)
