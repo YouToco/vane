@@ -23,6 +23,11 @@ const (
 	// The original confirmation message is replaced in place, so replaying an
 	// ambiguous PATCH cannot create a second user-visible message.
 	FeishuCardPatchReceiptProvider = "feishu_card_patch"
+	// WebActionReceiptProvider identifies a browser-polled durable action. The
+	// operation ID is both the immutable target and the polling key. Dispatchers
+	// still append the terminal fact to Agent history, but there is no external
+	// provider mutation to perform.
+	WebActionReceiptProvider = "web_action_poll/v1"
 
 	creationReceiptPayloadVersion = "vane.task-creation-user-receipt/v1"
 	creationReceiptPollInterval   = 2 * time.Second
@@ -65,6 +70,23 @@ func validFeishuCardPatchReceiptProvider(provider string) bool {
 // valid app-bound Feishu Patch adapter identity.
 func IsFeishuCardPatchReceiptProvider(provider string) bool {
 	return validFeishuCardPatchReceiptProvider(provider)
+}
+
+// WebActionReceiptTarget returns the server-owned receipt identity for one
+// authenticated browser action. Callers must never accept provider/target from
+// request JSON.
+func WebActionReceiptTarget(actionID string) CreationReceiptTarget {
+	return CreationReceiptTarget{
+		Provider: WebActionReceiptProvider,
+		Target:   actionID,
+	}
+}
+
+func validWebActionReceiptTarget(provider, target, actionID string) bool {
+	return provider == WebActionReceiptProvider &&
+		target == actionID &&
+		strings.TrimSpace(actionID) != "" &&
+		actionID == strings.TrimSpace(actionID)
 }
 
 // CreationReceiptStore is the durable A6 outbox boundary. Every mutable method
@@ -282,17 +304,21 @@ func (d *CreationReceiptDispatcher) dispatchReceipt(
 		}
 	}
 
-	sendCtx, cancel := context.WithTimeout(ctx, creationReceiptSendTimeout)
-	err = d.sender.SendCreationReceipt(
-		sendCtx, receipt.Provider, receipt.Target, payload.CardJSON,
-	)
-	cancel()
-	if err != nil {
-		return d.finishFailure(ctx, lease, err, true)
+	if !validWebActionReceiptTarget(
+		receipt.Provider, receipt.Target, receipt.OperationID,
+	) {
+		sendCtx, cancel := context.WithTimeout(ctx, creationReceiptSendTimeout)
+		err = d.sender.SendCreationReceipt(
+			sendCtx, receipt.Provider, receipt.Target, payload.CardJSON,
+		)
+		cancel()
+		if err != nil {
+			return d.finishFailure(ctx, lease, err, true)
+		}
 	}
 
-	// Message.Patch returns no provider message ID. The existing immutable target
-	// is the resource identity and therefore the sent checkpoint value.
+	// Message.Patch and browser polling both use an existing immutable target,
+	// so that target is also the sent checkpoint value.
 	if err := d.store.MarkTaskCreationReceiptSent(ctx, lease, receipt.Target); err != nil {
 		// A patch may already be visible while this DB response is lost. Leave the
 		// row replayable: the next owner applies the same bytes to the same message.

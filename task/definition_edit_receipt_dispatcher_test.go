@@ -371,6 +371,35 @@ func TestDefinitionEditReceiptDispatcher_AmbiguousPatchReplayKeepsOneResource(
 	}
 }
 
+func TestDefinitionEditReceiptDispatcher_WebPollingSkipsExternalSender(
+	t *testing.T,
+) {
+	st := newDefinitionEditReceiptFakeStore(
+		types.TaskDefinitionEditOperationStatusCompleted,
+	)
+	st.r.Provider = WebActionReceiptProvider
+	st.r.Target = st.r.OperationID
+	sessions := &definitionEditReceiptFakeSessions{}
+	sender := &definitionEditReceiptFakeSender{}
+	d := newDefinitionEditReceiptDispatcherForTest(
+		t, st, sessions, sender,
+	)
+
+	if err := d.DispatchOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	final := st.snapshot()
+	calls, resources := sender.snapshot()
+	if final.Status != types.TaskDefinitionEditReceiptStatusSent ||
+		final.ProviderMessageID != final.OperationID ||
+		calls != 0 || len(resources) != 0 || sessions.count() != 1 {
+		t.Fatalf(
+			"final=%+v calls=%d resources=%v sessions=%d",
+			final, calls, resources, sessions.count(),
+		)
+	}
+}
+
 func TestDefinitionEditReceiptDispatcher_ResponseLossReplaysExactCheckpoints(
 	t *testing.T,
 ) {

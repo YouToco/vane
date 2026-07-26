@@ -104,6 +104,20 @@ type scheduleStore interface {
 	) (*types.Schedule, func(context.Context) error, error)
 }
 
+type scheduleStatusStore interface {
+	BeginScheduleStatusChange(
+		ctx context.Context,
+		id string,
+		userID int64,
+		from types.ScheduleStatus,
+		to types.ScheduleStatus,
+	) (
+		commit func(context.Context) error,
+		rollback func(context.Context) error,
+		err error,
+	)
+}
+
 // Scheduler 持有 Temporal client、任务队列名与 store（镜像用）。
 type Scheduler struct {
 	c                 client.Client
@@ -472,6 +486,210 @@ func (s *Scheduler) TriggerPushNow(ctx context.Context, userID int64) (string, e
 		return "", types.NewAppError(types.CodeInternal, "触发即时推送失败", err)
 	}
 	return run.GetID(), nil
+}
+
+// TriggerScheduleNow starts the exact stored Action for one owned active task.
+// Unlike PushNow it preserves schedule_id, compiled definition and approved
+// source scope, so the run is attributable to the selected task.
+func (s *Scheduler) TriggerScheduleNow(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+) error {
+	sc, err := s.st.GetSchedule(ctx, schedID, userID)
+	if err != nil {
+		return err
+	}
+	if sc.Status != types.ScheduleStatusActive {
+		return types.NewAppError(
+			types.CodeConflict,
+			"任务已暂停，请先恢复后再立即运行。",
+			types.ErrConflict,
+		)
+	}
+	if err := s.c.ScheduleClient().GetHandle(
+		ctx, schedID,
+	).Trigger(ctx, client.ScheduleTriggerOptions{}); err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return types.NewAppError(
+				types.CodeNotFound,
+				fmt.Sprintf("定时任务 %s 不存在", schedID),
+				err,
+			)
+		}
+		return types.NewAppError(
+			types.CodeInternal, "触发任务立即运行失败", err,
+		)
+	}
+	return nil
+}
+
+// PausePush pauses one owner-scoped task while keeping its immutable
+// definition and identity intact.
+func (s *Scheduler) PausePush(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+) error {
+	return s.changePushPaused(ctx, schedID, userID, true)
+}
+
+// ResumePush resumes one owner-scoped paused task.
+func (s *Scheduler) ResumePush(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+) error {
+	return s.changePushPaused(ctx, schedID, userID, false)
+}
+
+func (s *Scheduler) changePushPaused(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+	paused bool,
+) error {
+	sc, err := s.st.GetSchedule(ctx, schedID, userID)
+	if err != nil {
+		return err
+	}
+	from, to := types.ScheduleStatusActive, types.ScheduleStatusPaused
+	if !paused {
+		from, to = to, from
+	}
+	if sc.Status == to {
+		return nil
+	}
+	if sc.Status != from {
+		return types.NewAppError(
+			types.CodeConflict,
+			"任务当前状态不支持这项操作，请刷新后重试。",
+			types.ErrConflict,
+		)
+	}
+	statusStore, ok := s.st.(scheduleStatusStore)
+	if !ok {
+		return types.NewAppError(
+			types.CodeInternal,
+			"任务暂停/恢复控制面未配置",
+			nil,
+		)
+	}
+	commit, rollback, err := statusStore.BeginScheduleStatusChange(
+		ctx, schedID, userID, from, to,
+	)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rollbackErr := rollback(ctx); rollbackErr != nil {
+			slog.Error(
+				"scheduler: release task status transaction",
+				"schedule_id", schedID,
+				"err", rollbackErr,
+			)
+		}
+	}()
+
+	handle := s.c.ScheduleClient().GetHandle(ctx, schedID)
+	if err := mutateSchedulePaused(ctx, handle, paused); err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return types.NewAppError(
+				types.CodeNotFound,
+				fmt.Sprintf("定时任务 %s 不存在", schedID),
+				err,
+			)
+		}
+		return types.NewAppError(
+			types.CodeInternal, "更新任务暂停状态失败", err,
+		)
+	}
+	if err := commit(ctx); err == nil {
+		return nil
+	} else {
+		commitErr := err
+		// A commit response can be lost after PostgreSQL applied it. Read back
+		// before attempting a remote compensation.
+		readCtx, cancelRead := context.WithTimeout(
+			context.WithoutCancel(ctx), 3*time.Second,
+		)
+		current, readErr := s.st.GetSchedule(readCtx, schedID, userID)
+		cancelRead()
+		if readErr == nil && current.Status == to {
+			return nil
+		}
+		compensateCtx, cancelCompensate := context.WithTimeout(
+			context.WithoutCancel(ctx), 5*time.Second,
+		)
+		compensateErr := mutateSchedulePaused(
+			compensateCtx, handle, !paused,
+		)
+		cancelCompensate()
+		if compensateErr != nil {
+			slog.Error(
+				"scheduler: task status commit and Temporal compensation failed",
+				"schedule_id", schedID,
+				"target_status", to,
+				"commit_err", commitErr,
+				"read_err", readErr,
+				"compensation_err", compensateErr,
+			)
+		}
+		return errors.Join(commitErr, readErr, compensateErr)
+	}
+}
+
+func mutateSchedulePaused(
+	ctx context.Context,
+	handle client.ScheduleHandle,
+	paused bool,
+) error {
+	if paused {
+		return handle.Pause(ctx, client.SchedulePauseOptions{
+			Note: "Paused from Vane Web",
+		})
+	}
+	return handle.Unpause(ctx, client.ScheduleUnpauseOptions{
+		Note: "Resumed from Vane Web",
+	})
+}
+
+// NextRun returns Temporal's next planned action for one owned active task.
+func (s *Scheduler) NextRun(
+	ctx context.Context,
+	schedID string,
+	userID int64,
+) (*time.Time, error) {
+	sc, err := s.st.GetSchedule(ctx, schedID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if sc.Status != types.ScheduleStatusActive {
+		return nil, nil
+	}
+	description, err := s.c.ScheduleClient().GetHandle(
+		ctx, schedID,
+	).Describe(ctx)
+	if err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return nil, types.NewAppError(
+				types.CodeNotFound,
+				fmt.Sprintf("定时任务 %s 不存在", schedID),
+				err,
+			)
+		}
+		return nil, types.NewAppError(
+			types.CodeInternal, "读取任务下次运行时间失败", err,
+		)
+	}
+	if len(description.Info.NextActionTimes) == 0 {
+		return nil, nil
+	}
+	next := description.Info.NextActionTimes[0]
+	return &next, nil
 }
 
 // UpdatePush 原地改一个已存在调度的触发频率（可选连带 nl_description）。

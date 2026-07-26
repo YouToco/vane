@@ -1151,13 +1151,19 @@ func validateCreationReceiptTarget(
 	op *types.TaskCreationOperation,
 	target CreationReceiptTarget,
 ) error {
+	if op == nil {
+		return errors.New("task: creation receipt operation is nil")
+	}
 	if strings.TrimSpace(target.Provider) == "" ||
 		target.Provider != strings.TrimSpace(target.Provider) ||
 		strings.TrimSpace(target.Target) == "" ||
 		target.Target != strings.TrimSpace(target.Target) {
 		return creationValidation("任务回执目标缺失，请重新点击原确认卡。", nil)
 	}
-	if !validFeishuCardPatchReceiptProvider(target.Provider) {
+	if !validFeishuCardPatchReceiptProvider(target.Provider) &&
+		!validWebActionReceiptTarget(
+			target.Provider, target.Target, op.ID,
+		) {
 		return creationValidation("任务回执通道不受支持，请重新点击原确认卡。", nil)
 	}
 	if op != nil && (op.ReceiptProvider != "" || op.ReceiptTarget != "") &&

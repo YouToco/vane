@@ -700,6 +700,13 @@ type fakeScheduleHandle struct {
 	describeErr   error // 非 nil = 模拟 Temporal Describe 失败（reconcile 用例）
 	blockDescribe bool
 	history       []client.Schedule // 每次成功 Update 后的快照（用于验回滚发生过）
+	info          client.ScheduleInfo
+	triggerErr    error
+	pauseErr      error
+	unpauseErr    error
+	triggerCalls  int
+	pauseCalls    int
+	unpauseCalls  int
 }
 
 // Describe 返回当前持有的 Schedule 快照，供 ReconcileActions 判断是否已带 schedule_id。
@@ -711,7 +718,7 @@ func (h *fakeScheduleHandle) Describe(ctx context.Context) (*client.ScheduleDesc
 	if h.describeErr != nil {
 		return nil, h.describeErr
 	}
-	return &client.ScheduleDescription{Schedule: h.current}, nil
+	return &client.ScheduleDescription{Schedule: h.current, Info: h.info}, nil
 }
 
 func (h *fakeScheduleHandle) Update(_ context.Context, o client.ScheduleUpdateOptions) error {
@@ -727,6 +734,164 @@ func (h *fakeScheduleHandle) Update(_ context.Context, o client.ScheduleUpdateOp
 	h.current = *upd.Schedule
 	h.history = append(h.history, h.current)
 	return nil
+}
+
+func (h *fakeScheduleHandle) Trigger(
+	_ context.Context,
+	_ client.ScheduleTriggerOptions,
+) error {
+	h.triggerCalls++
+	return h.triggerErr
+}
+
+func (h *fakeScheduleHandle) Pause(
+	_ context.Context,
+	_ client.SchedulePauseOptions,
+) error {
+	h.pauseCalls++
+	return h.pauseErr
+}
+
+func (h *fakeScheduleHandle) Unpause(
+	_ context.Context,
+	_ client.ScheduleUnpauseOptions,
+) error {
+	h.unpauseCalls++
+	return h.unpauseErr
+}
+
+type lifecycleScheduleStore struct {
+	scheduleStore
+	status types.ScheduleStatus
+
+	beginCalls    int
+	commitCalls   int
+	rollbackCalls int
+	commitErr     error
+}
+
+func (s *lifecycleScheduleStore) GetSchedule(
+	_ context.Context,
+	id string,
+	userID int64,
+) (*types.Schedule, error) {
+	return &types.Schedule{
+		ID: id, UserID: userID, Status: s.status,
+	}, nil
+}
+
+func (s *lifecycleScheduleStore) BeginScheduleStatusChange(
+	_ context.Context,
+	_ string,
+	_ int64,
+	from types.ScheduleStatus,
+	to types.ScheduleStatus,
+) (
+	func(context.Context) error,
+	func(context.Context) error,
+	error,
+) {
+	s.beginCalls++
+	if s.status != from {
+		return nil, nil, types.ErrConflict
+	}
+	committed := false
+	commit := func(context.Context) error {
+		s.commitCalls++
+		if s.commitErr != nil {
+			return s.commitErr
+		}
+		s.status = to
+		committed = true
+		return nil
+	}
+	rollback := func(context.Context) error {
+		s.rollbackCalls++
+		if committed {
+			return nil
+		}
+		return nil
+	}
+	return commit, rollback, nil
+}
+
+func TestTaskLifecycleActionsPreserveSelectedScheduleIdentity(t *testing.T) {
+	handle := &fakeScheduleHandle{}
+	store := &lifecycleScheduleStore{status: types.ScheduleStatusActive}
+	temporal := &fakeTemporalClient{
+		sched: &fakeScheduleClient{handle: handle},
+	}
+	s := New(temporal, "tq", store)
+
+	if err := s.TriggerScheduleNow(
+		t.Context(), "task-web-1", 7,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if handle.triggerCalls != 1 ||
+		temporal.sched.gotID != "task-web-1" {
+		t.Fatalf(
+			"trigger calls=%d schedule=%q",
+			handle.triggerCalls, temporal.sched.gotID,
+		)
+	}
+
+	if err := s.PausePush(
+		t.Context(), "task-web-1", 7,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if store.status != types.ScheduleStatusPaused ||
+		handle.pauseCalls != 1 || store.commitCalls != 1 {
+		t.Fatalf(
+			"status=%s pause=%d commits=%d",
+			store.status, handle.pauseCalls, store.commitCalls,
+		)
+	}
+	if err := s.TriggerScheduleNow(
+		t.Context(), "task-web-1", 7,
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("paused trigger err=%v, want conflict", err)
+	}
+	if err := s.ResumePush(
+		t.Context(), "task-web-1", 7,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if store.status != types.ScheduleStatusActive ||
+		handle.unpauseCalls != 1 || store.commitCalls != 2 {
+		t.Fatalf(
+			"status=%s unpause=%d commits=%d",
+			store.status, handle.unpauseCalls, store.commitCalls,
+		)
+	}
+}
+
+func TestNextRunReadsTemporalAfterOwnershipCheck(t *testing.T) {
+	want := time.Date(2026, 7, 26, 9, 30, 0, 0, time.UTC)
+	handle := &fakeScheduleHandle{
+		info: client.ScheduleInfo{NextActionTimes: []time.Time{want}},
+	}
+	store := &lifecycleScheduleStore{status: types.ScheduleStatusActive}
+	s := New(
+		&fakeTemporalClient{
+			sched: &fakeScheduleClient{handle: handle},
+		},
+		"tq",
+		store,
+	)
+	got, err := s.NextRun(t.Context(), "task-web-2", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || !got.Equal(want) {
+		t.Fatalf("next=%v, want %v", got, want)
+	}
+	store.status = types.ScheduleStatusPaused
+	got, err = s.NextRun(t.Context(), "task-web-2", 8)
+	if err != nil || got != nil {
+		t.Fatalf("paused next=%v err=%v", got, err)
+	}
 }
 
 // fakeScheduleStore 按预设让镜像写成功/失败，并记录收到的参数。

@@ -265,15 +265,19 @@ func (d *DefinitionEditReceiptDispatcher) dispatchReceipt(
 		}
 	}
 
-	sendCtx, cancel := context.WithTimeout(
-		ctx, creationReceiptSendTimeout,
-	)
-	err = d.sender.SendDefinitionEditReceipt(
-		sendCtx, receipt.Provider, receipt.Target, payload.CardJSON,
-	)
-	cancel()
-	if err != nil {
-		return d.finishFailure(ctx, lease, err, true)
+	if !validWebActionReceiptTarget(
+		receipt.Provider, receipt.Target, receipt.OperationID,
+	) {
+		sendCtx, cancel := context.WithTimeout(
+			ctx, creationReceiptSendTimeout,
+		)
+		err = d.sender.SendDefinitionEditReceipt(
+			sendCtx, receipt.Provider, receipt.Target, payload.CardJSON,
+		)
+		cancel()
+		if err != nil {
+			return d.finishFailure(ctx, lease, err, true)
+		}
 	}
 	if err := d.store.MarkTaskDefinitionEditReceiptSent(
 		ctx, lease, receipt.Target,

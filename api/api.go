@@ -10,9 +10,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/auth"
 	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
@@ -31,6 +33,38 @@ type Manager interface {
 type Scheduler interface {
 	PushNow(ctx context.Context, userID int64, scope workflow.PushScope) (runID string, err error)
 	DeletePush(ctx context.Context, schedID string, userID int64) error
+}
+
+type scheduleActionController interface {
+	TriggerScheduleNow(ctx context.Context, schedID string, userID int64) error
+	PausePush(ctx context.Context, schedID string, userID int64) error
+	ResumePush(ctx context.Context, schedID string, userID int64) error
+}
+
+type scheduleNextRunReader interface {
+	NextRun(ctx context.Context, schedID string, userID int64) (*time.Time, error)
+}
+
+// TaskAgent is the existing confirmed-write control plane exposed to the Web
+// transport. The API never receives raw Store/coordinator phase methods.
+type TaskAgent interface {
+	HandleMessage(
+		ctx context.Context,
+		userID int64,
+		text string,
+	) (agent.Outcome, error)
+	ExecuteActionWithReceipt(
+		ctx context.Context,
+		userID int64,
+		actionID string,
+		receipt task.CreationReceiptTarget,
+	) (agent.CardActionOutcome, error)
+	CancelActionWithReceipt(
+		ctx context.Context,
+		userID int64,
+		actionID string,
+		receipt task.CreationReceiptTarget,
+	) (agent.CardActionOutcome, error)
 }
 
 // AuthStore 是认证路径所需的窄接口（生产实现 *store.Store）。
@@ -58,6 +92,7 @@ type Deps struct {
 	Auth      AuthStore
 	Manager   Manager
 	Scheduler Scheduler
+	TaskAgent TaskAgent
 	// Principal 是全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
 	// 生产由 main.go 注入 auth.NewOwnerResolver；单测可注入假实现。
 	Principal auth.PrincipalResolver
@@ -97,7 +132,14 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("GET /api/schedules/{id}", s.handleGetScheduleDetail)
 	inner.HandleFunc("GET /api/schedules/{id}/batches", s.handleListScheduleBatches)
 	inner.HandleFunc("GET /api/schedules/{id}/deliveries", s.handleListScheduleDeliveries)
+	inner.HandleFunc("POST /api/schedules/{id}/run", s.handleRunScheduleNow)
+	inner.HandleFunc("POST /api/schedules/{id}/pause", s.handlePauseSchedule)
+	inner.HandleFunc("POST /api/schedules/{id}/resume", s.handleResumeSchedule)
 	inner.HandleFunc("POST /api/push/now", s.handlePushNow)
+	inner.HandleFunc("POST /api/task-actions/propose", s.handleProposeTaskAction)
+	inner.HandleFunc("GET /api/task-actions/{id}", s.handleGetTaskAction)
+	inner.HandleFunc("POST /api/task-actions/{id}/confirm", s.handleConfirmTaskAction)
+	inner.HandleFunc("POST /api/task-actions/{id}/cancel", s.handleCancelTaskAction)
 	inner.HandleFunc("GET /api/subscriptions", s.handleListSubscriptions)
 	inner.HandleFunc("POST /api/subscriptions", s.handleAddSubscription)
 	inner.HandleFunc("DELETE /api/subscriptions/{source_id}", s.handleRemoveSubscription)

@@ -109,3 +109,60 @@ func TestScheduleReconcileRollbackContextIsDetachedAndBounded(t *testing.T) {
 			remaining, scheduleReconcileRollbackTimeout)
 	}
 }
+
+func TestBeginScheduleStatusChangeCommitsOrRollsBackUnderMutationLock(
+	t *testing.T,
+) {
+	st := tenantTestStore(t)
+	f := newCompiledTaskFixture(t, st)
+	ctx := t.Context()
+	taskID := f.taskID()
+	if _, err := st.pool.Exec(ctx, `
+		INSERT INTO schedules (
+			id, tenant_id, user_id, nl_description, spec_json, scope_json,
+			status, execution_mode
+		) VALUES ($1,$2,$3,'web lifecycle','{"cron":"0 8 * * *"}','{}',$4,$5)`,
+		taskID, f.tenantID, f.userID,
+		types.ScheduleStatusActive, types.ExecutionModeCompiled,
+	); err != nil {
+		t.Fatalf("insert schedule fixture: %v", err)
+	}
+
+	commit, rollback, err := st.BeginScheduleStatusChange(
+		ctx, taskID, f.userID,
+		types.ScheduleStatusActive,
+		types.ScheduleStatusPaused,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	paused, err := st.GetSchedule(ctx, taskID, f.userID)
+	if err != nil || paused.Status != types.ScheduleStatusPaused {
+		t.Fatalf("paused=%+v err=%v", paused, err)
+	}
+
+	commit, rollback, err = st.BeginScheduleStatusChange(
+		ctx, taskID, f.userID,
+		types.ScheduleStatusPaused,
+		types.ScheduleStatusActive,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rolledBack, err := st.GetSchedule(ctx, taskID, f.userID)
+	if err != nil || rolledBack.Status != types.ScheduleStatusPaused {
+		t.Fatalf("rolled back=%+v err=%v", rolledBack, err)
+	}
+	if commit == nil {
+		t.Fatal("status change did not return commit callback")
+	}
+}
