@@ -101,6 +101,17 @@ import "reflect"
 func write(value any) {
 	reflect.ValueOf(value).MethodByName("SealAgentTurnContextSnapshot").Call(nil)
 }`,
+		"split reflect method name": `package escape
+import "reflect"
+func write(value any) {
+	name := "SealAgent" + "TurnContextSnapshot"
+	reflect.ValueOf(value).MethodByName(name).Call(nil)
+}`,
+		"package constant raw insert": `package escape
+const snapshotTable = "agent_turn_context_snapshots"
+func write(tx interface{ Exec(string) }) {
+	tx.Exec("INSERT INTO public." + snapshotTable)
+}`,
 	}
 	for name, source := range mutations {
 		t.Run(name, func(t *testing.T) {
@@ -130,6 +141,34 @@ func agentTurnContextProductionViolations(
 	var violations []string
 	var sealSelectors int
 	var rawInsertFunctions int
+	var fileLiterals strings.Builder
+	ast.Inspect(file, func(node ast.Node) bool {
+		literal, ok := node.(*ast.BasicLit)
+		if !ok || literal.Kind != token.STRING {
+			return true
+		}
+		value, err := strconv.Unquote(literal.Value)
+		if err == nil {
+			fileLiterals.WriteString(strings.ToLower(value))
+		}
+		return true
+	})
+	fileLiteralText := fileLiterals.String()
+	if strings.Contains(
+		fileLiteralText, "sealagentturncontextsnapshot",
+	) {
+		violations = append(violations, fmt.Sprintf(
+			"%s has forbidden split/dynamic snapshot method reference", path,
+		))
+	}
+	if path != wantStore &&
+		strings.Contains(fileLiteralText, "insert") &&
+		strings.Contains(fileLiteralText, "agent_turn_context_snapshots") {
+		violations = append(violations, fmt.Sprintf(
+			"%s has snapshot INSERT/table literals outside exact Store file",
+			path,
+		))
+	}
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
 		if !ok {
