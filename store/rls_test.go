@@ -236,7 +236,8 @@ func TestRLS_PoliciesCoverAllTenantTables(t *testing.T) {
 		"task_run_snapshot_v2_cutover_events",
 		"task_approved_definition_versions", "task_adaptive_states",
 		"task_definition_edit_operations", "task_definition_edit_receipts",
-		"agent_events",
+		"agent_events", "agent_session_projection_authority_events",
+		"agent_turn_context_snapshots",
 	}
 	for _, tbl := range want {
 		var enabled bool

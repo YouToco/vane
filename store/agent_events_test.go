@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -1916,6 +1917,9 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 	definitionReceipts := filepath.Join(
 		storeDir, "task_definition_edit_receipts.go",
 	)
+	contextSnapshots := filepath.Join(
+		storeDir, "agent_turn_context_snapshots.go",
+	)
 	fset := token.NewFileSet()
 	var violations []string
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, walkErr error) error {
@@ -1981,6 +1985,11 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 			if err != nil {
 				return err
 			}
+		} else if filepath.Clean(path) == contextSnapshots {
+			allowed, err = agentEventLedgerContextSnapshotReferences(file)
+			if err != nil {
+				return err
+			}
 		}
 		violations = append(
 			violations,
@@ -2005,17 +2014,10 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 				fmt.Sprintf("%s: raw Agent projection authority append escaped controller",
 					clean))
 		}
-		for _, imported := range file.Imports {
-			if strings.Trim(imported.Path.Value, `"`) !=
-				"github.com/YouToco/vane/agentledger" {
-				continue
-			}
-			if clean != provider && clean != authority && clean != agentLoop {
-				violations = append(violations,
-					fmt.Sprintf("%s: forbidden Agent event ledger import",
-						fset.Position(imported.Pos())))
-			}
-		}
+		importAllowed := clean == provider || clean == authority ||
+			clean == agentLoop || clean == contextSnapshots
+		violations = append(violations,
+			agentEventLedgerForbiddenImports(fset, file, importAllowed)...)
 		return nil
 	})
 	if err != nil {
@@ -2024,6 +2026,73 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 	if len(violations) != 0 {
 		t.Fatalf("7.7-B2 permits only the exact Agent session write boundaries:\n%s",
 			strings.Join(violations, "\n"))
+	}
+}
+
+func TestAgentEventLedgerContextSnapshotGuardRejectsEscapes(t *testing.T) {
+	t.Parallel()
+	mutations := map[string]string{
+		"method value": `package store
+import "github.com/YouToco/vane/agentledger"
+type Store struct{}
+func (s *Store) SealAgentTurnContextSnapshot() {
+	loadAuthoritativeAgentSessionProjectionForUpdate()
+	_ = agentledger.Scope{}
+	_ = agentledger.ProjectionDigest(nil)
+	verifyStoredAgentTurnContextSnapshot()
+}
+func verifyStoredAgentTurnContextSnapshot(_ []agentledger.Event) {
+	project := agentledger.ProjectLatestSessionSnapshot
+	_, _ = project(nil)
+	_, _ = agentledger.ProjectionDigest(nil)
+}`,
+		"wrapper": `package store
+import "github.com/YouToco/vane/agentledger"
+type Store struct{}
+func (s *Store) SealAgentTurnContextSnapshot() {
+	loadAuthoritativeAgentSessionProjectionForUpdate()
+	_ = agentledger.Scope{}
+	_ = agentledger.ProjectionDigest(nil)
+	verifyStoredAgentTurnContextSnapshot()
+}
+func hiddenProjectionWrapper() {
+	_, _ = agentledger.ProjectLatestSessionSnapshot(nil)
+}
+func verifyStoredAgentTurnContextSnapshot(_ []agentledger.Event) {
+	_, _ = agentledger.ProjectLatestSessionSnapshot(nil)
+	_, _ = agentledger.ProjectionDigest(nil)
+}`,
+	}
+	for name, source := range mutations {
+		t.Run(name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(
+				fset, "agent_turn_context_snapshots.go", source, 0,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := agentEventLedgerContextSnapshotReferences(file); err == nil {
+				t.Fatal("mutated context snapshot boundary unexpectedly passed")
+			}
+		})
+	}
+}
+
+func TestAgentEventLedgerGuardRejectsImportOutsideExactFiles(t *testing.T) {
+	t.Parallel()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "escape.go", `package escape
+import "github.com/YouToco/vane/agentledger"
+var _ = agentledger.Scope{}
+`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations := agentEventLedgerForbiddenImports(fset, file, false)
+	if len(violations) != 1 ||
+		!strings.Contains(violations[0], "forbidden Agent event ledger import") {
+		t.Fatalf("unexpected import escaped exact-file guard: %v", violations)
 	}
 }
 
@@ -2280,6 +2349,220 @@ func executeAgentSessionCutover(st agentSessionCutoverStore) {
 			}
 		})
 	}
+}
+
+func agentEventLedgerForbiddenImports(
+	fset *token.FileSet,
+	file *ast.File,
+	allowed bool,
+) []string {
+	if allowed {
+		return nil
+	}
+	var violations []string
+	for _, imported := range file.Imports {
+		if strings.Trim(imported.Path.Value, `"`) !=
+			"github.com/YouToco/vane/agentledger" {
+			continue
+		}
+		violations = append(violations,
+			fmt.Sprintf("%s: forbidden Agent event ledger import",
+				fset.Position(imported.Pos())))
+	}
+	return violations
+}
+
+func agentEventLedgerContextSnapshotReferences(
+	file *ast.File,
+) (map[token.Pos]struct{}, error) {
+	var seal *ast.FuncDecl
+	var verify *ast.FuncDecl
+	var verifyAuthority *ast.FuncDecl
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		switch function.Name.Name {
+		case "SealAgentTurnContextSnapshot":
+			if seal != nil {
+				return nil, errors.New(
+					"Agent context snapshot seal boundary is duplicated",
+				)
+			}
+			seal = function
+		case "verifyStoredAgentTurnContextSnapshot":
+			if verify != nil {
+				return nil, errors.New(
+					"Agent context snapshot verifier boundary is duplicated",
+				)
+			}
+			verify = function
+		case "verifyAgentTurnContextSealAuthority":
+			if verifyAuthority != nil {
+				return nil, errors.New(
+					"Agent context snapshot authority verifier boundary is duplicated",
+				)
+			}
+			verifyAuthority = function
+		}
+	}
+	if seal == nil || seal.Body == nil || seal.Recv == nil ||
+		len(seal.Recv.List) != 1 ||
+		!agentEventLedgerStoreReceiver(seal.Recv.List[0].Type) {
+		return nil, errors.New(
+			"Agent context snapshot seal must remain a Store method",
+		)
+	}
+	if verify == nil || verify.Body == nil || verify.Recv != nil {
+		return nil, errors.New(
+			"Agent context snapshot verifier must remain package-private",
+		)
+	}
+	if verifyAuthority == nil || verifyAuthority.Body == nil ||
+		verifyAuthority.Recv != nil {
+		return nil, errors.New(
+			"Agent context snapshot authority verifier must remain package-private",
+		)
+	}
+	if err := agentEventLedgerExactFunctionReferences(
+		seal,
+		map[string]int{
+			"Scope":            1,
+			"ProjectionDigest": 1,
+		},
+		map[string]int{
+			"ProjectionDigest": 1,
+		},
+		map[string]int{
+			"loadAuthoritativeAgentSessionProjectionForUpdate": 1,
+			"verifyStoredAgentTurnContextSnapshot":             1,
+		},
+	); err != nil {
+		return nil, fmt.Errorf("Agent context snapshot seal boundary: %w", err)
+	}
+	if err := agentEventLedgerExactFunctionReferences(
+		verify,
+		map[string]int{
+			"Event":                        1,
+			"ProjectLatestSessionSnapshot": 1,
+			"ProjectionDigest":             1,
+		},
+		map[string]int{
+			"ProjectLatestSessionSnapshot": 1,
+			"ProjectionDigest":             1,
+		},
+		map[string]int{
+			"verifyAgentTurnContextSealAuthority": 1,
+		},
+	); err != nil {
+		return nil, fmt.Errorf(
+			"Agent context snapshot verifier boundary: %w", err,
+		)
+	}
+	if err := agentEventLedgerExactFunctionReferences(
+		verifyAuthority,
+		map[string]int{
+			"Event":                        1,
+			"ProjectLatestSessionSnapshot": 1,
+			"ProjectionDigest":             1,
+		},
+		map[string]int{
+			"ProjectLatestSessionSnapshot": 1,
+			"ProjectionDigest":             1,
+		},
+		nil,
+	); err != nil {
+		return nil, fmt.Errorf(
+			"Agent context snapshot authority verifier boundary: %w", err,
+		)
+	}
+	allowedFunctions := map[*ast.FuncDecl]struct{}{
+		seal: {}, verify: {}, verifyAuthority: {},
+	}
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if _, allowed := allowedFunctions[function]; allowed {
+			continue
+		}
+		escaped := false
+		ast.Inspect(function, func(node ast.Node) bool {
+			selector, ok := node.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := selector.X.(*ast.Ident)
+			if ok && pkg.Name == "agentledger" {
+				escaped = true
+			}
+			return true
+		})
+		if escaped {
+			return nil, fmt.Errorf(
+				"Agent event ledger reference escaped context snapshot seal path via %s",
+				function.Name.Name,
+			)
+		}
+	}
+	return nil, nil
+}
+
+func agentEventLedgerExactFunctionReferences(
+	function *ast.FuncDecl,
+	wantSelectors map[string]int,
+	wantCalls map[string]int,
+	wantDirectIdentifiers map[string]int,
+) error {
+	selectors := make(map[string]int, len(wantSelectors))
+	calls := make(map[string]int, len(wantCalls))
+	directIdentifiers := make(map[string]int, len(wantDirectIdentifiers))
+	identifierReferences := make(map[string]int, len(wantDirectIdentifiers))
+	ast.Inspect(function, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.SelectorExpr:
+			pkg, ok := typed.X.(*ast.Ident)
+			if ok && pkg.Name == "agentledger" {
+				selectors[typed.Sel.Name]++
+			}
+		case *ast.CallExpr:
+			switch callee := typed.Fun.(type) {
+			case *ast.SelectorExpr:
+				pkg, ok := callee.X.(*ast.Ident)
+				if ok && pkg.Name == "agentledger" {
+					calls[callee.Sel.Name]++
+				}
+			case *ast.Ident:
+				if _, guarded := wantDirectIdentifiers[callee.Name]; guarded {
+					directIdentifiers[callee.Name]++
+				}
+			}
+		case *ast.Ident:
+			if _, guarded := wantDirectIdentifiers[typed.Name]; guarded {
+				identifierReferences[typed.Name]++
+			}
+		}
+		return true
+	})
+	if !reflect.DeepEqual(selectors, wantSelectors) {
+		return fmt.Errorf(
+			"agentledger selectors=%v, want %v", selectors, wantSelectors,
+		)
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		return fmt.Errorf("agentledger direct calls=%v, want %v", calls, wantCalls)
+	}
+	if wantDirectIdentifiers != nil &&
+		(!reflect.DeepEqual(directIdentifiers, wantDirectIdentifiers) ||
+			!reflect.DeepEqual(identifierReferences, wantDirectIdentifiers)) {
+		return fmt.Errorf(
+			"direct helper calls/references=%v/%v, want %v",
+			directIdentifiers, identifierReferences, wantDirectIdentifiers,
+		)
+	}
+	return nil
 }
 
 func agentEventLedgerForbiddenReferences(
