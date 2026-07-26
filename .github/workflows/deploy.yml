@@ -3,6 +3,9 @@ name: Deploy production
 on:
   schedule:
     - cron: "*/5 * * * *"
+  workflow_run:
+    workflows: ["Control plane CI"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -15,6 +18,16 @@ jobs:
   # This job runs on the deployment VM because that VM owns the durable
   # deployed-SHA state. It never checks out or executes either source repo.
   plan:
+    if: >-
+      github.event_name == 'schedule' ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        github.event.workflow_run.head_sha == github.sha
+      )
     runs-on: [self-hosted, Linux, ARM64, vane-deploy]
     timeout-minutes: 10
     outputs:
