@@ -347,6 +347,10 @@ type Loop struct {
 	sessionWriteMu        sync.Mutex
 	sessionWriteAccepting bool
 	sessionWriteWG        sync.WaitGroup
+	// contextShadowSlots bounds 7.8-A best-effort Store/root-lock attempts per
+	// Loop while admitting adjacent model/final steps. A full slot set drops
+	// shadow evidence; it never queues goroutines behind the legacy Agent path.
+	contextShadowSlots chan struct{}
 }
 
 // chatMetaKey/chatMeta 经 ctx 旁路传递记账元信息：chatFn 的签名由契约固定、
@@ -430,6 +434,7 @@ func NewChecked(d Deps) (*Loop, error) {
 		maxTurns:              maxTurns,
 		sessionTTL:            ttl,
 		sessionWriteAccepting: true,
+		contextShadowSlots:    make(chan struct{}, agentContextShadowConcurrency),
 	}
 	l.chatFn = func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
 		meta := llm.CallMeta{TraceID: uuid.NewString(), SpanName: "agent"}
@@ -755,11 +760,15 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			// Temperature 保持 nil：用上游默认值。
 			DisableThinking: true,
 		}
-		// 7.8-A is observation-only: build/seal a provider-neutral candidate
-		// immediately before chatFn, then send the already-built legacy request
-		// unchanged. Shadow failures are logged and never alter this request.
-		l.shadowAgentContext(ctx, request, state, turns)
+		// 7.8-A is observation-only: synchronously build the provider-neutral
+		// candidate, send the already-built legacy request unchanged, and only
+		// then admit a bounded asynchronous seal. Store/root-lock latency cannot
+		// consume chatFn's context or alter its Outcome.
+		contextShadow := l.prepareAgentContextShadow(
+			ctx, request, state, turns,
+		)
 		resp, err := l.chatFn(ctx, request)
+		l.sealPreparedAgentContextShadow(ctx, contextShadow)
 		if err != nil {
 			if errors.Is(err, llm.ErrToolProtocolResponse) && state.untrustedExternalResult {
 				slog.Warn("agent: 外部读取后模型协议异常，返回确定性恢复文案",
@@ -907,8 +916,11 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			MaxTokens:       iptr(replyMaxTokens),
 			DisableThinking: true, // 同主循环：关思维链防预算被 CoT 吃光。
 		}
-		l.shadowAgentContext(ctx, finalRequest, state, turns+1)
+		finalContextShadow := l.prepareAgentContextShadow(
+			ctx, finalRequest, state, turns+1,
+		)
 		final, err := l.chatFn(ctx, finalRequest)
+		l.sealPreparedAgentContextShadow(ctx, finalContextShadow)
 		if err != nil {
 			if !errors.Is(err, llm.ErrToolProtocolResponse) {
 				return Outcome{}, nil, 0, err

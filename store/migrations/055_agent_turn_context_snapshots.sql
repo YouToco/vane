@@ -1,4 +1,6 @@
--- 055: Immutable, ledger-anchored shadow context candidates for Agent turns.
+-- 055: Immutable shadow context candidates with a seal-time durability
+-- watermark. The watermark is not the candidate's causal input base and is
+-- never sufficient for automatic replay/resume.
 --
 -- The runtime writes only when B3 says the exact session is ledger
 -- authoritative. candidate_snapshot is compiler output; untrusted current-turn
@@ -12,17 +14,17 @@ CREATE TABLE agent_turn_context_snapshots (
     user_id                  BIGINT      NOT NULL,
     session_id               BIGINT      NOT NULL,
     turn_id                  TEXT        NOT NULL,
-    model_step               INTEGER     NOT NULL,
+    context_step             INTEGER     NOT NULL,
     schema_version           TEXT        NOT NULL,
     compiler_version         TEXT        NOT NULL,
     candidate_digest         TEXT        NOT NULL,
     candidate_snapshot       JSONB       NOT NULL,
     replayable               BOOLEAN     NOT NULL,
-    authority_generation     BIGINT      NOT NULL,
-    ledger_head_sequence     BIGINT      NOT NULL,
-    ledger_head_event_id     BIGINT      NOT NULL,
-    ledger_projection_digest TEXT        NOT NULL,
-    snapshot_digest          TEXT        NOT NULL,
+    seal_authority_generation     BIGINT      NOT NULL,
+    seal_ledger_head_sequence     BIGINT      NOT NULL,
+    seal_ledger_head_event_id     BIGINT      NOT NULL,
+    seal_ledger_projection_digest TEXT        NOT NULL,
+    snapshot_digest               TEXT        NOT NULL,
     created_at               TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
 
     CONSTRAINT fk_agent_turn_context_snapshot_scope
@@ -30,11 +32,11 @@ CREATE TABLE agent_turn_context_snapshots (
         REFERENCES agent_sessions (id, tenant_id, user_id)
         ON DELETE CASCADE,
     CONSTRAINT uq_agent_turn_context_snapshot_step
-        UNIQUE (tenant_id, user_id, session_id, turn_id, model_step),
+        UNIQUE (tenant_id, user_id, session_id, turn_id, context_step),
     CONSTRAINT agent_turn_context_snapshot_turn_id_valid
         CHECK (length(turn_id) BETWEEN 1 AND 128),
-    CONSTRAINT agent_turn_context_snapshot_model_step_positive
-        CHECK (model_step > 0),
+    CONSTRAINT agent_turn_context_snapshot_context_step_positive
+        CHECK (context_step > 0),
     CONSTRAINT agent_turn_context_snapshot_schema_valid
         CHECK (schema_version = 'vane.agent-turn-context-snapshot/v1'),
     CONSTRAINT agent_turn_context_snapshot_compiler_valid
@@ -42,11 +44,14 @@ CREATE TABLE agent_turn_context_snapshots (
     CONSTRAINT agent_turn_context_snapshot_candidate_digest_valid
         CHECK (candidate_digest ~ '^[0-9a-f]{64}$'),
     CONSTRAINT agent_turn_context_snapshot_authority_positive
-        CHECK (authority_generation > 0),
+        CHECK (seal_authority_generation > 0),
     CONSTRAINT agent_turn_context_snapshot_head_positive
-        CHECK (ledger_head_sequence > 0 AND ledger_head_event_id > 0),
+        CHECK (
+            seal_ledger_head_sequence > 0 AND
+            seal_ledger_head_event_id > 0
+        ),
     CONSTRAINT agent_turn_context_snapshot_projection_digest_valid
-        CHECK (ledger_projection_digest ~ '^[0-9a-f]{64}$'),
+        CHECK (seal_ledger_projection_digest ~ '^[0-9a-f]{64}$'),
     CONSTRAINT agent_turn_context_snapshot_digest_valid
         CHECK (snapshot_digest ~ '^[0-9a-f]{64}$')
 );
@@ -71,10 +76,10 @@ CREATE POLICY tenant_isolation ON agent_turn_context_snapshots AS RESTRICTIVE
 
 GRANT SELECT ON agent_turn_context_snapshots TO vane_app;
 GRANT INSERT (
-    tenant_id, user_id, session_id, turn_id, model_step,
+    tenant_id, user_id, session_id, turn_id, context_step,
     schema_version, compiler_version, candidate_digest, candidate_snapshot,
-    replayable, authority_generation, ledger_head_sequence,
-    ledger_head_event_id, ledger_projection_digest, snapshot_digest
+    replayable, seal_authority_generation, seal_ledger_head_sequence,
+    seal_ledger_head_event_id, seal_ledger_projection_digest, snapshot_digest
 ) ON agent_turn_context_snapshots TO vane_app;
 GRANT USAGE ON SEQUENCE agent_turn_context_snapshots_id_seq TO vane_app;
 
@@ -97,10 +102,10 @@ END $$;
 
 REVOKE USAGE ON SEQUENCE agent_turn_context_snapshots_id_seq FROM vane_app;
 REVOKE INSERT (
-    tenant_id, user_id, session_id, turn_id, model_step,
+    tenant_id, user_id, session_id, turn_id, context_step,
     schema_version, compiler_version, candidate_digest, candidate_snapshot,
-    replayable, authority_generation, ledger_head_sequence,
-    ledger_head_event_id, ledger_projection_digest, snapshot_digest
+    replayable, seal_authority_generation, seal_ledger_head_sequence,
+    seal_ledger_head_event_id, seal_ledger_projection_digest, snapshot_digest
 ) ON agent_turn_context_snapshots FROM vane_app;
 REVOKE SELECT ON agent_turn_context_snapshots FROM vane_app;
 DROP POLICY IF EXISTS tenant_isolation ON agent_turn_context_snapshots;

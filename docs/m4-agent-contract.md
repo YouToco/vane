@@ -551,24 +551,32 @@ provider-neutral 包；固定版本为 `vane.agent-context/v1`、快照
 `vane.agent-turn-context-snapshot/v1`、compactor `none/v1`。
 
 - system、实际有序 tool definition、本地可信 ToolPolicy 与 output reserve 全部进入
-  确定性保守预算。工具定义及 policy 按当轮请求顺序完整冻结；顺序改变必须改变
+  确定性预算。v1 未绑定 provider tokenizer，所有文本按 UTF-8 byte length 计费，作为
+  “每个 token 至少消费一个输入 byte”的可证明上界。工具定义及 policy 按当轮请求顺序完整冻结；顺序改变必须改变
   `toolset_digest` 和 candidate digest。
 - history 只按完整 user turn 原子组保留或省略，不能切开 assistant/tool 协议。
   tool_call_id 孤儿、重复、缺回执或越序一律拒绝编译。历史从新到旧纳入预算；
   最初 user intent 只有在整组仍能容纳时才保留。v1 不接受或生成 summary。
   `kept_ranges/omitted_ranges` 的边界只表示 outbound request message ordinal，
-  不冒充 ledger event sequence；真实耐久锚只认 Store 写入的 ledger
-  head/event id/projection digest。
+  不冒充 ledger event sequence。
 - `untrusted_current` 原文只参与瞬时预算与不可逆 SHA-256 绑定；候选消息只保留固定
   placeholder，`replayable=false`。快照字节、错误和日志都不得包含外部原文。
-- Loop 在每次 `chatFn` 前先构造 legacy `ChatRequest`，再旁路 build/seal，最后把同一个
-  request 原样发给模型。build、route、ledger 或 INSERT 失败只写安全结构化 warning，
-  不改变 request、Outcome、工具协议或旧会话写入。direct-create 的历史裁面、taint
-  二阶段工具集和 pending final 各自形成独立 model step；RunOnce/A2A 只做内存编译，
+- Loop 在每次 `chatFn` 前同步构造 legacy `ChatRequest` 和纯内存 candidate，把同一个
+  request 原样发给模型；仅在 `chatFn` 返回后才以 `WithoutCancel` + 2 秒独立预算异步
+  best-effort seal。最多四个 seal 并发，满载时允许丢 shadow sample，绝不排无界队列，
+  因而这不是完整审计日志。build、route、ledger 或 INSERT 失败只写安全结构化 warning，
+  慢 Store、调用方取消及 shadow 失败均不改变 request、Outcome、工具协议或旧会话写入。
+  direct-create 的历史裁面、taint
+  二阶段工具集和 pending final 各自形成独立 `context_step`；该序号只标识候选，
+  不等价于 `llm_calls`，pending final 是未调用模型的 synthetic post-outcome candidate。
+  RunOnce/A2A 只做内存编译，
   不写 owner session 快照。
 - `agent_turn_context_snapshots` 只允许在 exact session 当前为 B3 `ledger` route 时写入。
   Store 必须先锁 session root，完整验证 authority history、ledger batch 与 legacy replica，
-  再自行冻结 authority generation、真实 ledger head/event id 与 projection digest。
+  再自行冻结 `seal_authority_generation`、`seal_ledger_head/event id` 与
+  `seal_ledger_projection_digest`。这些字段只表示 seal 执行时已耐久的水位，不证明
+  candidate 的 causal input base、不声称模型已消费到该 ledger head，也严禁据此自动
+  replay/resume；7.8-B 主读前必须另加付费调用前的 causal fence/authority。
   legacy route 明确 `Skipped` 零写；相同 scope/turn/step+digest exact replay，不同 digest
   conflict。表启用 restrictive tenant RLS；`vane_app` 只有 SELECT、指定列 INSERT 与
   sequence USAGE，无 UPDATE/DELETE/TRUNCATE；非空历史拒绝 Down，Tenant purge 子表先删。

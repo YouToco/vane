@@ -98,7 +98,7 @@ type Tool struct {
 type BuildInput struct {
 	Scope               Scope
 	TurnID              string
-	ModelStep           int
+	ContextStep         int
 	Model               string
 	SystemPrompt        string
 	Profile             []MaterialRef
@@ -113,6 +113,8 @@ type BuildInput struct {
 type Range struct {
 	FirstMessageOrdinal int64  `json:"first_message_ordinal"`
 	LastMessageOrdinal  int64  `json:"last_message_ordinal"`
+	SourceMessageCount  int    `json:"source_message_count"`
+	DurableMessageCount int    `json:"durable_message_count"`
 	Reason              string `json:"reason"`
 }
 
@@ -121,12 +123,14 @@ type CandidateSnapshot struct {
 	CompilerVersion      string        `json:"compiler_version"`
 	Scope                Scope         `json:"scope"`
 	TurnID               string        `json:"turn_id"`
-	ModelStep            int           `json:"model_step"`
+	ContextStep          int           `json:"context_step"`
 	Model                string        `json:"model"`
 	ContextWindowTokens  int           `json:"context_window_tokens"`
 	MaxOutputTokens      int           `json:"max_output_tokens"`
 	EstimatedInputTokens int           `json:"estimated_input_tokens"`
 	CandidateMessages    []Message     `json:"candidate_messages"`
+	CurrentMessageOffset int           `json:"current_message_offset"`
+	CurrentMessageCount  int           `json:"current_message_count"`
 	KeptRanges           []Range       `json:"kept_ranges"`
 	OmittedRanges        []Range       `json:"omitted_ranges"`
 	Materials            []MaterialRef `json:"materials"`
@@ -141,11 +145,11 @@ type CandidateSnapshot struct {
 
 type TurnSnapshot struct {
 	CandidateSnapshot
-	AuthorityGeneration    int64  `json:"authority_generation"`
-	LedgerHeadSequence     int64  `json:"ledger_head_sequence"`
-	LedgerHeadEventID      int64  `json:"ledger_head_event_id"`
-	LedgerProjectionDigest string `json:"ledger_projection_digest"`
-	SnapshotDigest         string `json:"snapshot_digest"`
+	SealAuthorityGeneration    int64  `json:"seal_authority_generation"`
+	SealLedgerHeadSequence     int64  `json:"seal_ledger_head_sequence"`
+	SealLedgerHeadEventID      int64  `json:"seal_ledger_head_event_id"`
+	SealLedgerProjectionDigest string `json:"seal_ledger_projection_digest"`
+	SnapshotDigest             string `json:"snapshot_digest"`
 }
 
 type BuildResult struct {
@@ -185,7 +189,10 @@ func Build(in BuildInput) (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, err
 	}
-	currentTokens := groupTokens(in.Current)
+	// Redaction can expand a short/empty tainted source into the fixed durable
+	// placeholder. Charge the larger shape so neither the provider input nor
+	// the persisted candidate can exceed the declared window.
+	currentTokens := max(groupTokens(in.Current), groupTokens(current))
 	if baseTokens+currentTokens > window {
 		return BuildResult{}, errors.New("agentcontext: required current turn exceeds context window")
 	}
@@ -230,19 +237,32 @@ func Build(in BuildInput) (BuildResult, error) {
 			untrustedDigests = append(untrustedDigests, digest)
 		}
 	}
+	currentOffset := len(messages)
 	messages = append(messages, current.Messages...)
-	kept = append(kept, groupRange(in.Current, "current"))
+	currentRange := groupRange(in.Current, "current")
+	currentRange.DurableMessageCount = len(current.Messages)
+	kept = append(kept, currentRange)
 	estimated += currentTokens
 	if currentDigest != "" {
 		untrustedDigests = append(untrustedDigests, currentDigest)
 	}
+	// Per-group checks protect atomicity while this whole-candidate check keeps
+	// tool-call identities globally unique across retained turns. Build and
+	// VerifyCandidate must accept exactly the same protocol surface.
+	if err := validateToolProtocol(messages); err != nil {
+		return BuildResult{},
+			errors.New("agentcontext: candidate message protocol is invalid")
+	}
 
 	candidate := CandidateSnapshot{
 		SchemaVersion: SnapshotSchemaVersion, CompilerVersion: CompilerVersion,
-		Scope: in.Scope, TurnID: in.TurnID, ModelStep: in.ModelStep,
+		Scope: in.Scope, TurnID: in.TurnID, ContextStep: in.ContextStep,
 		Model: in.Model, ContextWindowTokens: window,
 		MaxOutputTokens: reserved, EstimatedInputTokens: estimated,
-		CandidateMessages: messages, KeptRanges: kept, OmittedRanges: omitted,
+		CandidateMessages:    messages,
+		CurrentMessageOffset: currentOffset,
+		CurrentMessageCount:  len(current.Messages),
+		KeptRanges:           kept, OmittedRanges: omitted,
 		Materials: materials, Tools: tools, ToolsetDigest: toolDigest,
 		PolicyVersion: PolicyVersion, CompactorVersion: CompactorVersion,
 		Replayable: replayable,
@@ -266,7 +286,7 @@ func validateInput(in BuildInput) error {
 		return errors.New("agentcontext: scope is invalid")
 	}
 	if strings.TrimSpace(in.TurnID) == "" || len(in.TurnID) > 128 ||
-		in.ModelStep <= 0 {
+		in.ContextStep <= 0 {
 		return errors.New("agentcontext: turn identity is invalid")
 	}
 	if strings.TrimSpace(in.Model) == "" ||
@@ -288,8 +308,10 @@ func validateInput(in BuildInput) error {
 			continue
 		}
 		anchoredHistory = true
-		if group.FirstMessageOrdinal <= previousLast {
-			return errors.New("agentcontext: history message ranges overlap or are out of order")
+		if (previousLast == 0 && group.FirstMessageOrdinal != 1) ||
+			(previousLast > 0 &&
+				group.FirstMessageOrdinal != previousLast+1) {
+			return errors.New("agentcontext: history message ranges are not contiguous")
 		}
 		previousLast = group.LastMessageOrdinal
 	}
@@ -299,9 +321,19 @@ func validateInput(in BuildInput) error {
 	if err := validateGroup(in.Current, true); err != nil {
 		return fmt.Errorf("agentcontext: current group: %w", err)
 	}
+	if unanchoredHistory && in.Current.FirstMessageOrdinal > 0 {
+		return errors.New(
+			"agentcontext: unanchored history cannot precede an anchored current range",
+		)
+	}
+	if !anchoredHistory && !unanchoredHistory &&
+		in.Current.FirstMessageOrdinal > 0 &&
+		in.Current.FirstMessageOrdinal != 1 {
+		return errors.New("agentcontext: first anchored current range must start at one")
+	}
 	if anchoredHistory && in.Current.FirstMessageOrdinal > 0 &&
-		in.Current.FirstMessageOrdinal <= previousLast {
-		return errors.New("agentcontext: current message range overlaps history")
+		in.Current.FirstMessageOrdinal != previousLast+1 {
+		return errors.New("agentcontext: current message range is not contiguous with history")
 	}
 	return nil
 }
@@ -323,6 +355,11 @@ func validateGroup(group AtomicGroup, current bool) error {
 		(group.FirstMessageOrdinal > 0 &&
 			group.LastMessageOrdinal >= group.FirstMessageOrdinal)) {
 		return errors.New("history message range is invalid")
+	}
+	if group.FirstMessageOrdinal > 0 &&
+		group.LastMessageOrdinal-group.FirstMessageOrdinal+1 !=
+			int64(len(group.Messages)) {
+		return errors.New("message range length does not match messages")
 	}
 	if group.Trust == TrustUntrustedCurrent && !current {
 		return errors.New("untrusted_current is only valid for current turn")
@@ -475,12 +512,10 @@ func groupTokens(group AtomicGroup) int {
 }
 
 func conservativeTokens(value string) int {
-	if value == "" {
-		return 0
-	}
-	// Max of rune count and four-byte chunks is deliberately conservative for
-	// both CJK-heavy and ASCII-heavy provider tokenizers.
-	return max(utf8.RuneCountInString(value), (len(value)+3)/4)
+	// Without binding v1 snapshots to a provider tokenizer, UTF-8 byte length
+	// is the portable upper bound: every non-empty token must consume at least
+	// one input byte. This intentionally over-reserves ASCII, CJK and emoji.
+	return len(value)
 }
 
 func firstUserIntentGroup(history []AtomicGroup) int {
@@ -501,6 +536,8 @@ func groupRange(group AtomicGroup, reason string) Range {
 	return Range{
 		FirstMessageOrdinal: group.FirstMessageOrdinal,
 		LastMessageOrdinal:  group.LastMessageOrdinal,
+		SourceMessageCount:  len(group.Messages),
+		DurableMessageCount: len(group.Messages),
 		Reason:              reason,
 	}
 }
@@ -543,15 +580,20 @@ func VerifyCandidate(candidate CandidateSnapshot) error {
 		candidate.Scope.UserID <= 0 ||
 		candidate.Scope.SessionID <= 0 ||
 		len(candidate.TurnID) == 0 || len(candidate.TurnID) > 128 ||
-		candidate.ModelStep <= 0 ||
+		candidate.ContextStep <= 0 ||
 		strings.TrimSpace(candidate.Model) == "" ||
 		candidate.ContextWindowTokens <= 0 ||
 		candidate.MaxOutputTokens < 0 ||
+		candidate.CurrentMessageOffset < 1 ||
+		candidate.CurrentMessageCount <= 0 ||
+		candidate.CurrentMessageOffset+candidate.CurrentMessageCount !=
+			len(candidate.CandidateMessages) ||
 		!validDigest(candidate.ToolsetDigest) ||
 		!validDigest(candidate.Digest) {
 		return errors.New("agentcontext: candidate envelope is invalid")
 	}
-	normalizedTools, toolsetDigest, _, err := normalizeTools(candidate.Tools)
+	normalizedTools, toolsetDigest, toolTokens, err :=
+		normalizeTools(candidate.Tools)
 	if err != nil || toolsetDigest != candidate.ToolsetDigest {
 		return errors.New("agentcontext: candidate toolset is invalid")
 	}
@@ -574,6 +616,21 @@ func VerifyCandidate(candidate CandidateSnapshot) error {
 	if err := validateToolProtocol(candidate.CandidateMessages); err != nil {
 		return errors.New("agentcontext: candidate message protocol is invalid")
 	}
+	minimumInputTokens := contextEnvelopeOverhead + toolTokens +
+		messageFramingTokens +
+		conservativeTokens(candidate.CandidateMessages[0].Content) +
+		groupTokens(AtomicGroup{
+			Messages: candidate.CandidateMessages[1:],
+		})
+	if candidate.EstimatedInputTokens < minimumInputTokens ||
+		candidate.EstimatedInputTokens <= 0 ||
+		candidate.EstimatedInputTokens+candidate.MaxOutputTokens >
+			candidate.ContextWindowTokens {
+		return errors.New("agentcontext: candidate token budget is invalid")
+	}
+	if err := verifyCandidateRanges(candidate); err != nil {
+		return err
+	}
 	digest, err := candidateDigest(candidate)
 	if err != nil || digest != candidate.Digest {
 		return errors.New("agentcontext: candidate digest mismatch")
@@ -586,12 +643,158 @@ func VerifyCandidate(candidate CandidateSnapshot) error {
 		(candidate.Replayable && candidate.UntrustedDigest != "") {
 		return errors.New("agentcontext: replayability evidence is invalid")
 	}
-	raw, err := json.Marshal(candidate)
-	if err != nil || !candidate.Replayable &&
-		!bytes.Contains(raw, []byte(untrustedPlaceholder)) {
+	if !candidate.Replayable &&
+		!exactRedactedCurrent(candidate) {
 		return errors.New("agentcontext: non-replayable candidate is not redacted")
 	}
 	return nil
+}
+
+func verifyCandidateRanges(candidate CandidateSnapshot) error {
+	if len(candidate.KeptRanges) == 0 ||
+		candidate.KeptRanges[len(candidate.KeptRanges)-1].Reason != "current" {
+		return errors.New("agentcontext: candidate current range is invalid")
+	}
+	totalKept := 0
+	for i, kept := range candidate.KeptRanges {
+		if kept.SourceMessageCount <= 0 ||
+			kept.DurableMessageCount <= 0 ||
+			(kept.Reason != "history" &&
+				kept.Reason != "history_unanchored" &&
+				kept.Reason != "current") ||
+			(kept.Reason == "current" &&
+				i != len(candidate.KeptRanges)-1) {
+			return errors.New("agentcontext: candidate kept ranges are invalid")
+		}
+		if kept.SourceMessageCount != kept.DurableMessageCount &&
+			(kept.Reason != "current" || candidate.Replayable ||
+				kept.DurableMessageCount != 1) {
+			return errors.New(
+				"agentcontext: candidate durable/source range counts mismatch",
+			)
+		}
+		totalKept += kept.DurableMessageCount
+	}
+	if totalKept != len(candidate.CandidateMessages)-1 ||
+		candidate.KeptRanges[len(candidate.KeptRanges)-1].
+			DurableMessageCount !=
+			candidate.CurrentMessageCount {
+		return errors.New("agentcontext: candidate kept range counts mismatch")
+	}
+	historyKept := totalKept - candidate.CurrentMessageCount
+	if candidate.CurrentMessageOffset != 1+historyKept {
+		return errors.New("agentcontext: candidate current offset mismatch")
+	}
+
+	current := candidate.KeptRanges[len(candidate.KeptRanges)-1]
+	history := append(
+		slices.Clone(candidate.KeptRanges[:len(candidate.KeptRanges)-1]),
+		candidate.OmittedRanges...,
+	)
+	var keptLast, omittedLast int64
+	for _, item := range candidate.KeptRanges[:len(candidate.KeptRanges)-1] {
+		if item.FirstMessageOrdinal > 0 {
+			if keptLast > 0 && item.FirstMessageOrdinal <= keptLast {
+				return errors.New(
+					"agentcontext: kept history ranges are out of order",
+				)
+			}
+			keptLast = item.LastMessageOrdinal
+		}
+	}
+	for _, item := range candidate.OmittedRanges {
+		if item.Reason != "budget" ||
+			item.SourceMessageCount != item.DurableMessageCount {
+			return errors.New("agentcontext: omitted ranges are invalid")
+		}
+		if item.FirstMessageOrdinal > 0 {
+			if omittedLast > 0 && item.FirstMessageOrdinal <= omittedLast {
+				return errors.New(
+					"agentcontext: omitted history ranges are out of order",
+				)
+			}
+			omittedLast = item.LastMessageOrdinal
+		}
+	}
+	var anchoredHistory, unanchoredHistory bool
+	for _, item := range append(slices.Clone(history), current) {
+		if item.SourceMessageCount <= 0 ||
+			item.DurableMessageCount <= 0 ||
+			(item.Reason != "history" &&
+				item.Reason != "history_unanchored" &&
+				item.Reason != "current" &&
+				item.Reason != "budget") {
+			return errors.New("agentcontext: candidate ranges are invalid")
+		}
+		if item.FirstMessageOrdinal == 0 && item.LastMessageOrdinal == 0 {
+			if item.Reason == "history" {
+				return errors.New("agentcontext: unanchored history reason is invalid")
+			}
+			if item.Reason != "current" {
+				unanchoredHistory = true
+			}
+			continue
+		}
+		if item.FirstMessageOrdinal <= 0 ||
+			item.LastMessageOrdinal-item.FirstMessageOrdinal+1 !=
+				int64(item.SourceMessageCount) {
+			return errors.New("agentcontext: candidate range length mismatch")
+		}
+		if item.Reason != "current" {
+			anchoredHistory = true
+		}
+	}
+	if anchoredHistory && unanchoredHistory {
+		return errors.New(
+			"agentcontext: candidate history mixes anchor modes",
+		)
+	}
+	if unanchoredHistory && current.FirstMessageOrdinal > 0 {
+		return errors.New(
+			"agentcontext: anchored current follows unanchored history",
+		)
+	}
+	anchored := make([]Range, 0, len(history))
+	for _, item := range history {
+		if item.FirstMessageOrdinal > 0 {
+			anchored = append(anchored, item)
+		}
+	}
+	slices.SortFunc(anchored, func(a, b Range) int {
+		switch {
+		case a.FirstMessageOrdinal < b.FirstMessageOrdinal:
+			return -1
+		case a.FirstMessageOrdinal > b.FirstMessageOrdinal:
+			return 1
+		default:
+			return 0
+		}
+	})
+	var expected int64 = 1
+	for _, item := range anchored {
+		if item.FirstMessageOrdinal != expected {
+			return errors.New("agentcontext: candidate ranges are not contiguous")
+		}
+		expected = item.LastMessageOrdinal + 1
+	}
+	if current.FirstMessageOrdinal > 0 &&
+		current.FirstMessageOrdinal != expected {
+		return errors.New(
+			"agentcontext: current range is not contiguous with history",
+		)
+	}
+	return nil
+}
+
+func exactRedactedCurrent(candidate CandidateSnapshot) bool {
+	if candidate.CurrentMessageCount != 1 {
+		return false
+	}
+	current := candidate.CandidateMessages[candidate.CurrentMessageOffset]
+	return current.Role == "user" &&
+		current.Content == untrustedPlaceholder &&
+		len(current.ToolCalls) == 0 &&
+		current.ToolCallID == ""
 }
 
 func canonicalJSON(raw json.RawMessage) (json.RawMessage, error) {

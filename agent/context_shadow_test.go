@@ -18,16 +18,43 @@ import (
 
 type contextShadowStore struct {
 	*fakeStore
-	mu         sync.Mutex
-	candidates []agentcontext.CandidateSnapshot
-	sealErr    error
+	mu             sync.Mutex
+	candidates     []agentcontext.CandidateSnapshot
+	sealErr        error
+	sealPanic      bool
+	sealStarted    chan context.Context
+	attemptStarted chan contextShadowAttempt
+	sealRelease    <-chan struct{}
+}
+
+type contextShadowAttempt struct {
+	ctx       context.Context
+	candidate agentcontext.CandidateSnapshot
 }
 
 func (s *contextShadowStore) SealAgentTurnContextSnapshot(
-	_ context.Context,
+	ctx context.Context,
 	_ agentcontext.Scope,
 	candidate agentcontext.CandidateSnapshot,
 ) (agentcontext.SealResult, error) {
+	if s.sealPanic {
+		panic("context shadow test panic")
+	}
+	if s.sealStarted != nil {
+		s.sealStarted <- ctx
+	}
+	if s.attemptStarted != nil {
+		s.attemptStarted <- contextShadowAttempt{
+			ctx: ctx, candidate: candidate,
+		}
+	}
+	if s.sealRelease != nil {
+		select {
+		case <-s.sealRelease:
+		case <-ctx.Done():
+			return agentcontext.SealResult{}, ctx.Err()
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.candidates = append(s.candidates, candidate)
@@ -41,6 +68,43 @@ func (s *contextShadowStore) snapshots() []agentcontext.CandidateSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]agentcontext.CandidateSnapshot(nil), s.candidates...)
+}
+
+func TestContextShadowSealPanicIsContainedAndDrainCompletes(t *testing.T) {
+	store := &contextShadowStore{
+		fakeStore: newFakeStore(), sealPanic: true,
+	}
+	loop := newContextShadowLoop(
+		t, store,
+		func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+			return &llm.ChatResponse{Content: "unused"}, nil
+		},
+	)
+	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{
+		traceID: "turn-panic", userID: 7,
+		scope: agentcontext.Scope{
+			TenantID: 1, UserID: 7, SessionID: 1,
+		},
+	})
+	prepared := loop.prepareAgentContextShadow(
+		ctx,
+		llm.ChatRequest{
+			Model: loop.model,
+			Messages: []llm.ChatMessage{
+				{Role: "system", Content: loop.sys},
+				{Role: "user", Content: "question"},
+			},
+			MaxTokens: iptr(replyMaxTokens),
+		},
+		&toolRunState{activation: &activationState{}},
+		1,
+	)
+	loop.sealPreparedAgentContextShadow(ctx, prepared)
+	drainCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := loop.DrainSessionWrites(drainCtx); err != nil {
+		t.Fatalf("panic escaped or blocked drain: %v", err)
+	}
 }
 
 func TestContextShadowDoesNotChangeLegacyRequestOrOutcome(t *testing.T) {
@@ -77,9 +141,135 @@ func TestContextShadowDoesNotChangeLegacyRequestOrOutcome(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("chat request changed by shadow:\ngot=%+v\nwant=%+v", got, want)
 	}
-	snapshots := store.snapshots()
-	if len(snapshots) != 1 || snapshots[0].ModelStep != 1 {
+	snapshots := drainContextShadows(t, loop, store)
+	if len(snapshots) != 1 || snapshots[0].ContextStep != 1 {
 		t.Fatalf("snapshots=%+v", snapshots)
+	}
+}
+
+func TestContextShadowSlowStoreCannotDelayOrCancelLegacyCall(t *testing.T) {
+	started := make(chan context.Context, 1)
+	release := make(chan struct{})
+	store := &contextShadowStore{
+		fakeStore: newFakeStore(), sealStarted: started, sealRelease: release,
+	}
+	var request llm.ChatRequest
+	loop := newContextShadowLoop(
+		t, store,
+		func(_ context.Context, got llm.ChatRequest) (*llm.ChatResponse, error) {
+			request = cloneChatRequest(got)
+			return &llm.ChatResponse{Content: "legacy reply"}, nil
+		},
+	)
+	parent, cancelParent := context.WithCancel(t.Context())
+	type result struct {
+		outcome Outcome
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		outcome, err := loop.HandleMessage(parent, 7, "hello")
+		done <- result{outcome: outcome, err: err}
+	}()
+
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("slow shadow Store blocked legacy HandleMessage")
+	}
+	if got.err != nil || got.outcome.Reply != "legacy reply" {
+		t.Fatalf("legacy outcome changed: outcome=%+v err=%v", got.outcome, got.err)
+	}
+	if len(request.Messages) != 2 ||
+		!reflect.DeepEqual(
+			request.Messages[1],
+			llm.ChatMessage{Role: "user", Content: "hello"},
+		) {
+		t.Fatalf("legacy request changed: %+v", request)
+	}
+
+	var sealCtx context.Context
+	select {
+	case sealCtx = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("post-chat context seal was not admitted")
+	}
+	cancelParent()
+	select {
+	case <-sealCtx.Done():
+		t.Fatalf("caller cancellation reached shadow seal: %v", sealCtx.Err())
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if snapshots := drainContextShadows(t, loop, store); len(snapshots) != 1 {
+		t.Fatalf("snapshots=%+v", snapshots)
+	}
+}
+
+func TestContextShadowAdmitsAdjacentSyntheticStepAndDrainWaits(t *testing.T) {
+	attempts := make(chan contextShadowAttempt, 2)
+	release := make(chan struct{})
+	store := &contextShadowStore{
+		fakeStore: newFakeStore(), attemptStarted: attempts,
+		sealRelease: release,
+	}
+	loop := newContextShadowLoop(
+		t, store,
+		func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+			return &llm.ChatResponse{Content: "unused"}, nil
+		},
+	)
+	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{
+		traceID: "turn-adjacent", userID: 7,
+		scope: agentcontext.Scope{
+			TenantID: 1, UserID: 7, SessionID: 1,
+		},
+	})
+	request := llm.ChatRequest{
+		Model: loop.model,
+		Messages: []llm.ChatMessage{
+			{Role: "system", Content: loop.sys},
+			{Role: "user", Content: "change"},
+		},
+		MaxTokens: iptr(replyMaxTokens),
+	}
+	first := loop.prepareAgentContextShadow(
+		ctx, request, &toolRunState{activation: &activationState{}}, 1,
+	)
+	loop.sealPreparedAgentContextShadow(ctx, first)
+	loop.shadowFinalPendingContext(
+		ctx,
+		[]llm.ChatMessage{
+			{Role: "user", Content: "change"},
+			{Role: "assistant", Content: replyTaskCreationConfirm},
+		},
+		&toolRunState{activation: &activationState{}},
+		2,
+	)
+	seen := map[int]bool{}
+	for range 2 {
+		select {
+		case attempt := <-attempts:
+			seen[attempt.candidate.ContextStep] = true
+		case <-time.After(time.Second):
+			t.Fatal("blocked first seal structurally dropped adjacent context step")
+		}
+	}
+	if !seen[1] || !seen[2] {
+		t.Fatalf("admitted context steps=%v, want 1 and synthetic 2", seen)
+	}
+
+	drained := make(chan error, 1)
+	go func() { drained <- loop.DrainSessionWrites(t.Context()) }()
+	select {
+	case err := <-drained:
+		t.Fatalf("DrainSessionWrites returned before seals completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-drained; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -105,12 +295,12 @@ func TestContextShadowTracksToolsetTransitionAndRedactsTaintedStep(t *testing.T)
 	if _, err := loop.HandleMessage(t.Context(), 7, "research"); err != nil {
 		t.Fatal(err)
 	}
-	snapshots := store.snapshots()
+	snapshots := drainContextShadows(t, loop, store)
 	if len(snapshots) != 2 {
 		t.Fatalf("snapshots=%+v", snapshots)
 	}
 	if snapshots[0].ToolsetDigest == snapshots[1].ToolsetDigest {
-		t.Fatal("two model steps did not capture the toolset transition")
+		t.Fatal("two context steps did not capture the toolset transition")
 	}
 	if snapshots[1].Replayable ||
 		snapshots[1].UntrustedDigest == "" {
@@ -142,7 +332,7 @@ func TestContextShadowCandidateMessagesExactlyMirrorProfileRequest(t *testing.T)
 	if _, err := loop.HandleMessage(t.Context(), 7, "question"); err != nil {
 		t.Fatal(err)
 	}
-	snapshots := store.snapshots()
+	snapshots := drainContextShadows(t, loop, store)
 	if len(snapshots) != 1 {
 		t.Fatalf("snapshots=%+v", snapshots)
 	}
@@ -203,6 +393,31 @@ func TestContextShadowUsesLLMContextWindowRegistry(t *testing.T) {
 	}
 }
 
+func TestShadowMessageGroupsEmitContiguousExactOrdinalRanges(t *testing.T) {
+	_, groups := shadowMessageGroups([]llm.ChatMessage{
+		{Role: "system", Content: "system"},
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "answer"},
+		{Role: "user", Content: "second"},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{{
+			ID: "call-1", Name: "read", Arguments: `{}`,
+		}}},
+		{Role: "tool", Content: "result", ToolCallID: "call-1"},
+	}, nil)
+	if len(groups) != 2 {
+		t.Fatalf("groups=%+v", groups)
+	}
+	var previousLast int64
+	for i, group := range groups {
+		if group.FirstMessageOrdinal != previousLast+1 ||
+			group.LastMessageOrdinal-group.FirstMessageOrdinal+1 !=
+				int64(len(group.Messages)) {
+			t.Fatalf("group %d has fabricated/non-contiguous range: %+v", i, group)
+		}
+		previousLast = group.LastMessageOrdinal
+	}
+}
+
 func TestContextShadowDirectCreationHasNoHistoricalMessages(t *testing.T) {
 	store := &contextShadowStore{fakeStore: newFakeStore()}
 	session, err := store.CreateAgentSession(t.Context(), 7)
@@ -234,7 +449,7 @@ func TestContextShadowDirectCreationHasNoHistoricalMessages(t *testing.T) {
 	_, _ = loop.HandleMessage(
 		t.Context(), 7, "确认创建，直接生成确认卡，不要再次搜索。",
 	)
-	snapshots := store.snapshots()
+	snapshots := drainContextShadows(t, loop, store)
 	if len(snapshots) == 0 {
 		t.Fatal("direct creation produced no shadow")
 	}
@@ -244,30 +459,38 @@ func TestContextShadowDirectCreationHasNoHistoricalMessages(t *testing.T) {
 	}
 }
 
-func TestContextShadowPendingFinalIsIndependentStep(t *testing.T) {
+func TestContextShadowPendingFinalIsSyntheticContextStep(t *testing.T) {
 	store := &contextShadowStore{fakeStore: newFakeStore()}
-	write := &fakeTool{name: "write", mutating: true}
+	chatCalls := 0
 	loop := newContextShadowLoop(
 		t, store,
 		func(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
-			return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
-				ID: "write-1", Name: "write", Arguments: `{}`,
-			}}}, nil
+			chatCalls++
+			return &llm.ChatResponse{Content: "unused"}, nil
 		},
-		write,
 	)
-	outcome, err := loop.HandleMessage(t.Context(), 7, "change")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if outcome.Confirm == nil {
-		t.Fatal("expected pending confirmation")
-	}
-	snapshots := store.snapshots()
-	if len(snapshots) != 2 ||
-		snapshots[0].ModelStep != 1 ||
-		snapshots[1].ModelStep != 2 {
+	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{
+		traceID: "turn-synthetic", userID: 7,
+		scope: agentcontext.Scope{
+			TenantID: 1, UserID: 7, SessionID: 1,
+		},
+	})
+	loop.shadowFinalPendingContext(
+		ctx,
+		[]llm.ChatMessage{
+			{Role: "user", Content: "change"},
+			{Role: "assistant", Content: replyTaskCreationConfirm},
+		},
+		&toolRunState{activation: &activationState{}},
+		2,
+	)
+	snapshots := drainContextShadows(t, loop, store)
+	if len(snapshots) != 1 ||
+		snapshots[0].ContextStep != 2 {
 		t.Fatalf("pending snapshots=%+v", snapshots)
+	}
+	if chatCalls != 0 {
+		t.Fatalf("synthetic post-outcome context invented an LLM call: %d", chatCalls)
 	}
 }
 
@@ -284,9 +507,23 @@ func TestRunOnceContextShadowNeverPersistsOwnerSnapshot(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if snapshots := store.snapshots(); len(snapshots) != 0 {
+	if snapshots := drainContextShadows(t, loop, store); len(snapshots) != 0 {
 		t.Fatalf("RunOnce persisted owner snapshots: %+v", snapshots)
 	}
+}
+
+func drainContextShadows(
+	t *testing.T,
+	loop *Loop,
+	store *contextShadowStore,
+) []agentcontext.CandidateSnapshot {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := loop.DrainSessionWrites(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return store.snapshots()
 }
 
 func newContextShadowLoop(

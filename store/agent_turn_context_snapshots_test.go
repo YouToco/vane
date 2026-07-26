@@ -51,8 +51,8 @@ func TestSealAgentTurnContextSnapshotLedgerExactReplayAndConflict(t *testing.T) 
 		t.Fatal(err)
 	}
 	if !first.Sealed || first.Skipped ||
-		first.Snapshot.LedgerHeadSequence <= 0 ||
-		first.Snapshot.AuthorityGeneration != 1 {
+		first.Snapshot.SealLedgerHeadSequence <= 0 ||
+		first.Snapshot.SealAuthorityGeneration != 1 {
 		t.Fatalf("first seal=%+v", first)
 	}
 	replayed, err := f.store.SealAgentTurnContextSnapshot(
@@ -71,7 +71,7 @@ func TestSealAgentTurnContextSnapshotLedgerExactReplayAndConflict(t *testing.T) 
 	changed.Digest = ""
 	rebuilt, err := agentcontext.Build(agentcontext.BuildInput{
 		Scope: changed.Scope, TurnID: changed.TurnID,
-		ModelStep: changed.ModelStep, Model: changed.Model,
+		ContextStep: changed.ContextStep, Model: changed.Model,
 		SystemPrompt: "system", Current: agentcontext.AtomicGroup{
 			Trust: agentcontext.TrustTrusted,
 			Messages: []agentcontext.Message{{
@@ -134,13 +134,97 @@ func TestSealAgentTurnContextSnapshotConcurrentReplayConverges(t *testing.T) {
 	if err := f.store.pool.QueryRow(t.Context(),
 		`SELECT count(*) FROM agent_turn_context_snapshots
 		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
-		    AND turn_id='same-turn' AND model_step=1`,
+		    AND turn_id='same-turn' AND context_step=1`,
 		f.tenantA, f.userA, f.sessionA,
 	).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
 		t.Fatalf("concurrent replay wrote %d rows", count)
+	}
+}
+
+func TestSealAgentTurnContextSnapshotRejectsRollbackGenerationTamper(
+	t *testing.T,
+) {
+	f := newAgentEventFixture(t)
+	initializeAgentSessionProjectionFixture(t, f, "context-generation-base")
+	activateAgentSessionProjectionFixture(t, f.store, f.scopeA())
+	candidate := testAgentTurnCandidate(t, f, "generation-turn", 1, false)
+	first, err := f.store.SealAgentTurnContextSnapshot(
+		t.Context(), candidate.Scope, candidate,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := f.store.ControlAgentSessionProjectionAuthority(
+		t.Context(), f.tenantA, f.userA, f.sessionA,
+		AgentSessionProjectionAuthorityRollback,
+	)
+	if err != nil || status.Generation != 2 {
+		t.Fatalf("rollback status=%+v err=%v", status, err)
+	}
+	tampered := first.Snapshot
+	tampered.SealAuthorityGeneration = status.Generation
+	tampered.SnapshotDigest, err = agentcontext.TurnSnapshotDigest(tampered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(t.Context(),
+		`UPDATE agent_turn_context_snapshots
+		    SET seal_authority_generation=$1,snapshot_digest=$2
+		  WHERE tenant_id=$3 AND user_id=$4 AND session_id=$5
+		    AND turn_id=$6 AND context_step=$7`,
+		tampered.SealAuthorityGeneration, tampered.SnapshotDigest,
+		f.tenantA, f.userA, f.sessionA, candidate.TurnID,
+		candidate.ContextStep,
+	); err != nil {
+		t.Fatal(err)
+	}
+	activateAgentSessionProjectionFixture(t, f.store, f.scopeA())
+	if _, err := f.store.SealAgentTurnContextSnapshot(
+		t.Context(), candidate.Scope, candidate,
+	); err == nil {
+		t.Fatal("snapshot bound to rollback generation unexpectedly replayed")
+	}
+}
+
+func TestSealAgentTurnContextSnapshotRejectsDuplicateColumnDrift(t *testing.T) {
+	mutations := map[string]string{
+		"candidate digest": `UPDATE agent_turn_context_snapshots
+		    SET candidate_digest=repeat('f',64)
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3`,
+		"replayable": `UPDATE agent_turn_context_snapshots
+		    SET replayable=NOT replayable
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3`,
+	}
+	for name, statement := range mutations {
+		t.Run(name, func(t *testing.T) {
+			f := newAgentEventFixture(t)
+			initializeAgentSessionProjectionFixture(
+				t, f, "context-duplicate-column-"+
+					strings.ReplaceAll(name, " ", "-"),
+			)
+			activateAgentSessionProjectionFixture(t, f.store, f.scopeA())
+			candidate := testAgentTurnCandidate(
+				t, f, "duplicate-column-turn", 1, false,
+			)
+			if _, err := f.store.SealAgentTurnContextSnapshot(
+				t.Context(), candidate.Scope, candidate,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.store.pool.Exec(
+				t.Context(), statement, f.tenantA, f.userA, f.sessionA,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.store.SealAgentTurnContextSnapshot(
+				t.Context(), candidate.Scope, candidate,
+			); err == nil {
+				t.Fatal("relational/JSON duplicate column drift replayed")
+			}
+		})
 	}
 }
 
@@ -163,7 +247,7 @@ func TestSealAgentTurnContextSnapshotUntrustedRawNeverReachesDatabase(t *testing
 		`SELECT candidate_snapshot::text
 		   FROM agent_turn_context_snapshots
 		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3
-		    AND turn_id='untrusted-turn' AND model_step=1`,
+		    AND turn_id='untrusted-turn' AND context_step=1`,
 		f.tenantA, f.userA, f.sessionA,
 	).Scan(&raw); err != nil {
 		t.Fatal(err)
@@ -300,22 +384,35 @@ func testAgentTurnCandidate(
 	t.Helper()
 	trust := agentcontext.TrustTrusted
 	content := "question"
+	messages := []agentcontext.Message{{
+		Role: "user", Content: content,
+	}}
+	var firstOrdinal, lastOrdinal int64
 	if untrusted {
 		trust = agentcontext.TrustUntrustedCurrent
-		content = "EXTERNAL-RAW-DO-NOT-PERSIST"
+		firstOrdinal, lastOrdinal = 1, 3
+		messages = []agentcontext.Message{
+			{Role: "user", Content: "question"},
+			{Role: "assistant", ToolCalls: []agentcontext.ToolCall{{
+				ID: "external-1", Name: "read", Arguments: `{}`,
+			}}},
+			{
+				Role: "tool", ToolCallID: "external-1",
+				Content: "EXTERNAL-RAW-DO-NOT-PERSIST",
+			},
+		}
 	}
 	result, err := agentcontext.Build(agentcontext.BuildInput{
 		Scope: agentcontext.Scope{
 			TenantID: f.tenantA, UserID: f.userA,
 			SessionID: f.sessionA,
 		},
-		TurnID: turnID, ModelStep: step, Model: "model",
+		TurnID: turnID, ContextStep: step, Model: "model",
 		SystemPrompt: "system",
 		Current: agentcontext.AtomicGroup{
-			Trust: trust,
-			Messages: []agentcontext.Message{{
-				Role: "user", Content: content,
-			}},
+			FirstMessageOrdinal: firstOrdinal,
+			LastMessageOrdinal:  lastOrdinal,
+			Trust:               trust, Messages: messages,
 		},
 		ContextWindowTokens: 4096, MaxOutputTokens: 256,
 	})

@@ -106,11 +106,11 @@ func seedMigration055Snapshot(t *testing.T, db *sql.DB) {
 	}`
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO agent_turn_context_snapshots (
-		  tenant_id,user_id,session_id,turn_id,model_step,
+		  tenant_id,user_id,session_id,turn_id,context_step,
 		  schema_version,compiler_version,candidate_digest,
-		  candidate_snapshot,replayable,authority_generation,
-		  ledger_head_sequence,ledger_head_event_id,
-		  ledger_projection_digest,snapshot_digest
+		  candidate_snapshot,replayable,seal_authority_generation,
+		  seal_ledger_head_sequence,seal_ledger_head_event_id,
+		  seal_ledger_projection_digest,snapshot_digest
 		) VALUES (
 		  $1,$2,$3,'turn',1,
 		  'vane.agent-turn-context-snapshot/v1','vane.agent-context/v1',

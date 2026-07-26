@@ -30,8 +30,13 @@ func TestContextShadowWiringGuardsEveryLoopChatCall(t *testing.T) {
 		callAt := searchFrom + offset
 		prefixStart := max(0, callAt-240)
 		prefix := source[prefixStart:callAt]
-		if !strings.Contains(prefix, "l.shadowAgentContext(ctx,") {
-			t.Fatalf("chatFn call at byte %d bypasses context shadow", callAt)
+		if !strings.Contains(prefix, "l.prepareAgentContextShadow(") {
+			t.Fatalf("chatFn call at byte %d bypasses context build", callAt)
+		}
+		suffixEnd := min(len(source), callAt+240)
+		suffix := source[callAt:suffixEnd]
+		if !strings.Contains(suffix, "l.sealPreparedAgentContextShadow(") {
+			t.Fatalf("chatFn call at byte %d bypasses post-call seal", callAt)
 		}
 		calls++
 		searchFrom = callAt + len(call)
