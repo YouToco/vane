@@ -104,9 +104,9 @@ type PushScopeV1 struct {
 }
 
 type approvedScopeWireV1 struct {
+	Observation json.RawMessage `json:"observation,omitempty"`
 	SourceIDs   []int64         `json:"source_ids,omitempty"`
 	TopN        int             `json:"top_n,omitempty"`
-	Observation json.RawMessage `json:"observation,omitempty"`
 }
 
 // ScheduleSpecV1 mirrors the frozen scheduler V1 projection layout. Approved
