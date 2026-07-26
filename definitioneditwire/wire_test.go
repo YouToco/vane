@@ -50,6 +50,64 @@ func TestDecodeFrozenProposal_CanonicalBindings(t *testing.T) {
 	}
 }
 
+func TestDecodeFrozenProposal_AcceptsTerminalPausedMarkerAfterActivation(t *testing.T) {
+	fixture, proposalRaw := loadFixture(t)
+	var proposal ProposalV1
+	if err := json.Unmarshal(proposalRaw, &proposal); err != nil {
+		t.Fatal(err)
+	}
+	var prepared PreparedEditV1
+	if err := json.Unmarshal(fixture.PreparedEdit, &prepared); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot SnapshotV1
+	if err := json.Unmarshal(fixture.BaseSnapshot, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared.BaseOriginal.State.Paused = false
+	prepared.BaseOriginal.State.Note = "runtime cutover activated finalized task"
+	rebindPreparedEditDigests(t, &prepared, "final_paused")
+	preparedRaw := mustMarshal(t, prepared)
+	snapshot.RequestDigest = prepared.RequestDigest
+	snapshot.RepresentationDigest = prepared.BaseOriginal.Digest
+	snapshotRaw := mustMarshal(t, snapshot)
+	proposal.PreparedEditDigest = digest(preparedRaw)
+	proposal.BaseSnapshotDigest = digest(snapshotRaw)
+	proposalRaw = mustMarshal(t, proposal)
+
+	frozen, err := DecodeFrozenProposal(
+		proposalRaw, fixture.BaseDefinition, fixture.TargetDefinition,
+		preparedRaw, snapshotRaw,
+	)
+	if err != nil {
+		t.Fatalf("DecodeFrozenProposal() terminal paused marker after activation: %v", err)
+	}
+	if frozen.Prepared.BaseOriginal.Fingerprint.EditPhase != "final_paused" ||
+		frozen.Prepared.BaseOriginal.State.Paused ||
+		frozen.Prepared.BaseOriginal.State.Note !=
+			"runtime cutover activated finalized task" {
+		t.Fatalf("decoded activated terminal marker differs: %+v",
+			frozen.Prepared.BaseOriginal)
+	}
+
+	prepared.BaseOriginal.Fingerprint.EditPhase = "base_paused"
+	recomputeRepresentationDigest(t, &prepared.BaseOriginal)
+	recomputePreparedRequestDigest(t, &prepared)
+	preparedRaw = mustMarshal(t, prepared)
+	snapshot.RequestDigest = prepared.RequestDigest
+	snapshot.RepresentationDigest = prepared.BaseOriginal.Digest
+	snapshotRaw = mustMarshal(t, snapshot)
+	proposal.PreparedEditDigest = digest(preparedRaw)
+	proposal.BaseSnapshotDigest = digest(snapshotRaw)
+	if _, err := DecodeFrozenProposal(
+		mustMarshal(t, proposal), fixture.BaseDefinition, fixture.TargetDefinition,
+		preparedRaw, snapshotRaw,
+	); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("DecodeFrozenProposal() nonterminal base marker error = %v, want ErrInvalid", err)
+	}
+}
+
 func TestDecodeFrozenProposal_RejectsExactAndCrossSplicedWire(t *testing.T) {
 	fixture, proposalRaw := loadFixture(t)
 	var proposal ProposalV1
@@ -461,4 +519,83 @@ func mustMarshal(t *testing.T, value any) []byte {
 		t.Fatalf("marshal fixture: %v", err)
 	}
 	return raw
+}
+
+func rebindPreparedEditDigests(
+	t *testing.T,
+	prepared *PreparedEditV1,
+	basePhase string,
+) {
+	t.Helper()
+	operationDigest, err := digestJSON(operationSeedV1{
+		WireVersion:            prepared.WireVersion,
+		OperationID:            prepared.OperationID,
+		CreationRequestDigest:  prepared.Creation.RequestDigest,
+		TenantID:               prepared.Creation.TenantID,
+		UserID:                 prepared.Creation.UserID,
+		TaskID:                 prepared.Creation.TaskID,
+		BaseHead:               prepared.BaseHead,
+		TargetHead:             prepared.TargetHead,
+		OriginalState:          prepared.OriginalState,
+		BaseProjectionDigest:   prepared.BaseProjectionDigest,
+		TargetProjectionDigest: prepared.TargetProjectionDigest,
+		BaseTiming:             prepared.BaseOriginal.Timing,
+		BaseAction:             prepared.BaseOriginal.Action,
+		BasePolicy:             prepared.BaseOriginal.Policy,
+		BaseReusePolicy:        prepared.BaseOriginal.WorkflowIDReusePolicy,
+		BaseState:              prepared.BaseOriginal.State,
+		TargetTiming:           prepared.TargetFinal.Timing,
+		TargetAction:           prepared.TargetFinal.Action,
+		TargetPolicy:           prepared.TargetFinal.Policy,
+		TargetReusePolicy:      prepared.TargetFinal.WorkflowIDReusePolicy,
+	})
+	if err != nil {
+		t.Fatalf("digest operation seed: %v", err)
+	}
+	prepared.OperationDigest = operationDigest
+
+	phases := []struct {
+		representation *RepresentationV1
+		head           HeadV1
+		phase          string
+		updateNote     bool
+	}{
+		{&prepared.BaseOriginal, prepared.BaseHead, basePhase, false},
+		{&prepared.BasePaused, prepared.BaseHead, "base_paused", true},
+		{&prepared.TargetPaused, prepared.TargetHead, "target_paused", true},
+		{&prepared.TargetFinal, prepared.TargetHead, "final_active", true},
+	}
+	for _, phase := range phases {
+		phase.representation.Fingerprint.DefinitionVersion = phase.head.Version
+		phase.representation.Fingerprint.DefinitionDigest = phase.head.Digest
+		phase.representation.Fingerprint.EditOperationDigest = operationDigest
+		phase.representation.Fingerprint.EditPhase = phase.phase
+		if phase.updateNote {
+			phase.representation.State.Note = noteFor(phase.phase, operationDigest)
+		}
+		recomputeRepresentationDigest(t, phase.representation)
+	}
+	recomputePreparedRequestDigest(t, prepared)
+}
+
+func recomputeRepresentationDigest(t *testing.T, representation *RepresentationV1) {
+	t.Helper()
+	seed := *representation
+	seed.Digest = ""
+	value, err := digestJSON(seed)
+	if err != nil {
+		t.Fatalf("digest representation: %v", err)
+	}
+	representation.Digest = value
+}
+
+func recomputePreparedRequestDigest(t *testing.T, prepared *PreparedEditV1) {
+	t.Helper()
+	seed := *prepared
+	seed.RequestDigest = ""
+	value, err := digestJSON(seed)
+	if err != nil {
+		t.Fatalf("digest prepared request: %v", err)
+	}
+	prepared.RequestDigest = value
 }
