@@ -25,6 +25,9 @@ type contextShadowStore struct {
 	sealStarted    chan context.Context
 	attemptStarted chan contextShadowAttempt
 	sealRelease    <-chan struct{}
+	blockStep      int
+	blockStarted   chan<- struct{}
+	blockRelease   <-chan struct{}
 }
 
 type contextShadowAttempt struct {
@@ -46,6 +49,16 @@ func (s *contextShadowStore) SealAgentTurnContextSnapshot(
 	if s.attemptStarted != nil {
 		s.attemptStarted <- contextShadowAttempt{
 			ctx: ctx, candidate: candidate,
+		}
+	}
+	if candidate.ContextStep == s.blockStep && s.blockRelease != nil {
+		if s.blockStarted != nil {
+			s.blockStarted <- struct{}{}
+		}
+		select {
+		case <-s.blockRelease:
+		case <-ctx.Done():
+			return agentcontext.SealResult{}, ctx.Err()
 		}
 	}
 	if s.sealRelease != nil {
@@ -299,20 +312,97 @@ func TestContextShadowTracksToolsetTransitionAndRedactsTaintedStep(t *testing.T)
 	if len(snapshots) != 2 {
 		t.Fatalf("snapshots=%+v", snapshots)
 	}
-	if snapshots[0].ToolsetDigest == snapshots[1].ToolsetDigest {
+	byStep := snapshotsByContextStep(t, snapshots)
+	first, firstOK := byStep[1]
+	tainted, taintedOK := byStep[2]
+	if !firstOK || !taintedOK {
+		t.Fatalf("context steps=%v, want 1 and 2", byStep)
+	}
+	if first.TurnID != tainted.TurnID {
+		t.Fatalf("turn identity diverged: %q/%q", first.TurnID, tainted.TurnID)
+	}
+	if first.ToolsetDigest == tainted.ToolsetDigest {
 		t.Fatal("two context steps did not capture the toolset transition")
 	}
-	if snapshots[1].Replayable ||
-		snapshots[1].UntrustedDigest == "" {
-		t.Fatalf("tainted snapshot=%+v", snapshots[1])
+	if tainted.Replayable || tainted.UntrustedDigest == "" {
+		t.Fatalf("tainted snapshot=%+v", tainted)
 	}
-	raw, err := json.Marshal(snapshots[1])
+	raw, err := json.Marshal(tainted)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(raw), attack) {
 		t.Fatal("tainted external raw reached shadow candidate")
 	}
+}
+
+func TestContextShadowCompletionOrderDoesNotDefineContextIdentity(t *testing.T) {
+	blockStarted := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	store := &contextShadowStore{
+		fakeStore: newFakeStore(), blockStep: 1,
+		blockStarted: blockStarted, blockRelease: releaseFirst,
+	}
+	tool := &fakeTool{
+		name: "external", result: "external", untrusted: true,
+	}
+	call := llm.ToolCall{
+		ID: "call-1", Name: "external", Arguments: `{}`,
+	}
+	requests := 0
+	loop := newContextShadowLoop(
+		t, store,
+		func(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+			requests++
+			if requests == 1 {
+				return &llm.ChatResponse{
+					ToolCalls: []llm.ToolCall{call},
+				}, nil
+			}
+			select {
+			case <-blockStarted:
+			case <-time.After(time.Second):
+				t.Fatal("context step 1 did not enter the blocking Store")
+			}
+			return &llm.ChatResponse{Content: "safe summary"}, nil
+		},
+		tool,
+	)
+	if _, err := loop.HandleMessage(t.Context(), 7, "research"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(store.snapshots()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	completed := store.snapshots()
+	if len(completed) != 1 || completed[0].ContextStep != 2 {
+		t.Fatalf("completion order=%+v, want context step 2 first", completed)
+	}
+	close(releaseFirst)
+	snapshots := drainContextShadows(t, loop, store)
+	byStep := snapshotsByContextStep(t, snapshots)
+	if len(byStep) != 2 || byStep[1].TurnID != byStep[2].TurnID ||
+		byStep[1].ToolsetDigest == byStep[2].ToolsetDigest ||
+		byStep[2].Replayable {
+		t.Fatalf("out-of-order snapshot identities=%+v", byStep)
+	}
+}
+
+func snapshotsByContextStep(
+	t *testing.T,
+	snapshots []agentcontext.CandidateSnapshot,
+) map[int]agentcontext.CandidateSnapshot {
+	t.Helper()
+	byStep := make(map[int]agentcontext.CandidateSnapshot, len(snapshots))
+	for _, snapshot := range snapshots {
+		if _, exists := byStep[snapshot.ContextStep]; exists {
+			t.Fatalf("duplicate context step %d: %+v",
+				snapshot.ContextStep, snapshots)
+		}
+		byStep[snapshot.ContextStep] = snapshot
+	}
+	return byStep
 }
 
 func TestContextShadowCandidateMessagesExactlyMirrorProfileRequest(t *testing.T) {
