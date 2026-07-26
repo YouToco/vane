@@ -13,6 +13,13 @@ import (
 // afterID 即 profiles.last_evolved_feedback_id 游标，严格大于——游标行本身已消费。
 // LEFT JOIN content_items：内容被 TTL 清理（content_item_id 置 NULL）时
 // ContentTitle/ContentExcerpt 为空串，反馈行本身保留（反馈事实不随内容清理消失）。
+//
+// 旧卡的 👎 曾先追加 detail 为空的 not_interested，再由原因面板追加 typed
+// misjudged。对画像学习而言，后一个问题原因会取代同租户、用户、投递上
+// 更早的旧 UI 空白 not_interested；带 detail 的明确反馈和全部事实行仍保留。
+// superseding 行的查找刻意不受 afterID/limit 限制，否则配对行跨页时旧负兴趣
+// 仍会先污染画像。reason_code 非空即 typed 且合法，由 migration 040 CHECK
+// 作为六种原因的单一真相源。
 func (s *Store) ListFeedbacksForEvolution(ctx context.Context, userID int64, afterID int64, limit int) ([]types.FeedbackWithContent, error) {
 	return s.listFeedbacksForEvolution(ctx, 0, userID, afterID, limit)
 }
@@ -50,6 +57,20 @@ func (s *Store) listFeedbacksForEvolution(
 		 JOIN deliveries d ON d.id = f.delivery_id
 		 LEFT JOIN content_items ci ON ci.id = d.content_item_id
 		 WHERE f.user_id = $1 AND f.id > $2
+		   AND NOT (
+		       f.action = 'not_interested'
+		       AND btrim(f.detail) = ''
+		       AND EXISTS (
+		           SELECT 1
+		             FROM feedbacks superseding
+		            WHERE superseding.tenant_id = f.tenant_id
+		              AND superseding.user_id = f.user_id
+		              AND superseding.delivery_id = f.delivery_id
+		              AND superseding.id > f.id
+		              AND superseding.action = 'misjudged'
+		              AND superseding.reason_code IS NOT NULL
+		       )
+		   )
 		 ORDER BY f.id ASC
 		 LIMIT $3`
 	args := []any{userID, afterID, limit}
@@ -64,6 +85,20 @@ func (s *Store) listFeedbacksForEvolution(
 		   ON d.id = f.delivery_id AND d.tenant_id = $1
 		 LEFT JOIN content_items ci ON ci.id = d.content_item_id
 		 WHERE f.tenant_id = $1 AND f.user_id = $2 AND f.id > $3
+		   AND NOT (
+		       f.action = 'not_interested'
+		       AND btrim(f.detail) = ''
+		       AND EXISTS (
+		           SELECT 1
+		             FROM feedbacks superseding
+		            WHERE superseding.tenant_id = f.tenant_id
+		              AND superseding.user_id = f.user_id
+		              AND superseding.delivery_id = f.delivery_id
+		              AND superseding.id > f.id
+		              AND superseding.action = 'misjudged'
+		              AND superseding.reason_code IS NOT NULL
+		       )
+		   )
 		 ORDER BY f.id ASC
 		 LIMIT $4`
 		args = []any{tenantID, userID, afterID, limit}
