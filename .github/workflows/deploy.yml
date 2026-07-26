@@ -1,0 +1,446 @@
+name: Deploy production
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vane-production-control-plane
+  cancel-in-progress: false
+
+jobs:
+  # This job runs on the deployment VM because that VM owns the durable
+  # deployed-SHA state. It never checks out or executes either source repo.
+  plan:
+    runs-on: [self-hosted, Linux, ARM64, vane-deploy]
+    timeout-minutes: 10
+    outputs:
+      backend_sha: ${{ steps.plan.outputs.backend_sha }}
+      frontend_sha: ${{ steps.plan.outputs.frontend_sha }}
+      backend_changed: ${{ steps.plan.outputs.backend_changed }}
+      frontend_changed: ${{ steps.plan.outputs.frontend_changed }}
+      any_changed: ${{ steps.plan.outputs.any_changed }}
+      backend_previous: ${{ steps.plan.outputs.backend_previous }}
+      frontend_previous: ${{ steps.plan.outputs.frontend_previous }}
+
+    steps:
+      - name: Resolve source main SHAs and compare durable state
+        id: plan
+        env:
+          VANE_READ_KEY: ${{ secrets.VANE_READ_KEY }}
+          VANE_WEB_READ_KEY: ${{ secrets.VANE_WEB_READ_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          [[ -n "$VANE_READ_KEY" && -n "$VANE_WEB_READ_KEY" ]]
+          secret_dir=$(mktemp -d "$RUNNER_TEMP/source-plan.XXXXXX")
+          trap 'rm -rf -- "$secret_dir"' EXIT
+
+          ssh-keyscan -t ed25519 github.com 2>/dev/null |
+            sort -u >"$secret_dir/known_hosts"
+          [[ $(wc -l <"$secret_dir/known_hosts") -eq 1 ]]
+          fingerprint=$(
+            ssh-keygen -lf "$secret_dir/known_hosts" -E sha256 |
+              awk 'NR == 1 { print $2 }'
+          )
+          [[ "$fingerprint" == \
+            "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU" ]]
+
+          remote_main_sha() {
+            local repository=$1
+            local key_value=$2
+            local key_file=$secret_dir/id
+            local output sha ref
+            printf '%s\n' "$key_value" >"$key_file"
+            chmod 600 "$key_file"
+            ssh_command=$(
+              printf "ssh -i '%s' -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='%s'" \
+                "$key_file" "$secret_dir/known_hosts"
+            )
+            output=$(
+              GIT_SSH_COMMAND="$ssh_command" \
+                git ls-remote "git@github.com:$repository.git" refs/heads/main
+            )
+            rm -f -- "$key_file"
+            read -r sha ref <<<"$output"
+            [[ "$sha" =~ ^[0-9a-f]{40}$ && "$ref" == refs/heads/main ]]
+            [[ "$output" == "$sha"$'\t'"$ref" ]]
+            printf '%s' "$sha"
+          }
+
+          backend_sha=$(remote_main_sha YouToco/vane "$VANE_READ_KEY")
+          frontend_sha=$(remote_main_sha YouToco/vane-web "$VANE_WEB_READ_KEY")
+
+          state_root=${XDG_STATE_HOME:-"$HOME/.local/state"}
+          state_dir=$state_root/vane-deploy
+          mkdir -p "$state_dir"
+          chmod 700 "$state_dir"
+          command -v flock >/dev/null
+          exec 9>"$state_dir/control-plane.lock"
+          flock 9
+
+          read_state() {
+            local state_file=$1
+            local value=
+            if [[ -f "$state_file" ]]; then
+              value=$(tr -d '\r\n' <"$state_file")
+              [[ "$value" =~ ^[0-9a-f]{40}$ ]]
+            fi
+            printf '%s' "$value"
+          }
+
+          backend_deployed=$(read_state "$state_dir/deployed-vane.sha")
+          frontend_deployed=$(read_state "$state_dir/deployed-vane-web.sha")
+          backend_changed=false
+          frontend_changed=false
+          [[ "$backend_deployed" == "$backend_sha" ]] || backend_changed=true
+          [[ "$frontend_deployed" == "$frontend_sha" ]] || frontend_changed=true
+          any_changed=false
+          if [[ "$backend_changed" == true || "$frontend_changed" == true ]]; then
+            any_changed=true
+          fi
+
+          {
+            echo "backend_sha=$backend_sha"
+            echo "frontend_sha=$frontend_sha"
+            echo "backend_changed=$backend_changed"
+            echo "frontend_changed=$frontend_changed"
+            echo "any_changed=$any_changed"
+            echo "backend_previous=$backend_deployed"
+            echo "frontend_previous=$frontend_deployed"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "vane: $backend_sha (changed=$backend_changed)"
+          echo "vane-web: $frontend_sha (changed=$frontend_changed)"
+
+  # Source-controlled commands run only here, without production credentials.
+  # Every changed component receives a complete, independent gate at the exact
+  # SHA resolved by plan.
+  build:
+    needs: plan
+    if: needs.plan.outputs.any_changed == 'true'
+    runs-on: [self-hosted, Linux, ARM64, vane-build]
+    timeout-minutes: 75
+    env:
+      BUILD_ROOT_NAME: vane-build-${{ github.run_id }}-${{ github.run_attempt }}
+
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: vane_test
+          POSTGRES_USER: vane
+          POSTGRES_PASSWORD: vane_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Prepare per-attempt build root
+        run: |
+          set -euo pipefail
+          BUILD_ROOT="$RUNNER_TEMP/$BUILD_ROOT_NAME"
+          [[ "$BUILD_ROOT" == \
+            "$RUNNER_TEMP/vane-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
+          [[ ! -e "$BUILD_ROOT" ]]
+          install -d -m 0700 "$BUILD_ROOT"
+          echo "BUILD_ROOT=$BUILD_ROOT" >>"$GITHUB_ENV"
+
+      - name: Checkout deployment control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          clean: true
+          persist-credentials: false
+          path: control-plane
+
+      - name: Set up Go
+        if: needs.plan.outputs.backend_changed == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.26"
+
+      - name: Set up Node
+        if: needs.plan.outputs.frontend_changed == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+
+      - name: Checkout backend gate source at exact SHA
+        if: needs.plan.outputs.backend_changed == 'true'
+        env:
+          SOURCE_READ_KEY: ${{ secrets.VANE_READ_KEY }}
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/checkout-source.sh" \
+            YouToco/vane \
+            "${{ needs.plan.outputs.backend_sha }}" \
+            "$BUILD_ROOT/source/vane-gate"
+
+      - name: Backend independent full gate
+        if: needs.plan.outputs.backend_changed == 'true'
+        env:
+          DATABASE_URL: postgres://vane:vane_test@localhost:5432/vane_test?sslmode=disable
+        run: |
+          cd "$BUILD_ROOT/source/vane-gate"
+          if find "$RUNNER_TEMP" -maxdepth 1 -name 'source-checkout.*' -print -quit |
+            grep -q .; then
+            echo "source deploy key residue exists before execution" >&2
+            exit 1
+          fi
+          go mod download
+          go vet ./...
+          go test -race -count=1 -shuffle=on \
+            -coverprofile=coverage.txt -covermode=atomic ./...
+
+      - name: Rematerialize clean backend source for release
+        if: needs.plan.outputs.backend_changed == 'true'
+        env:
+          SOURCE_READ_KEY: ${{ secrets.VANE_READ_KEY }}
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/checkout-source.sh" \
+            YouToco/vane \
+            "${{ needs.plan.outputs.backend_sha }}" \
+            "$BUILD_ROOT/source/vane-release"
+
+      - name: Build four backend release binaries
+        if: needs.plan.outputs.backend_changed == 'true'
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          cd "$BUILD_ROOT/source/vane-release"
+          [[ -z $(git status --porcelain --untracked-files=all) ]]
+          go build -buildvcs=true -o bin/vane ./cmd/server
+          go build -buildvcs=true -o bin/useradmin ./cmd/useradmin
+          go build -buildvcs=true -o bin/gate ./cmd/gate
+          go build -buildvcs=true -o bin/runtimeadmin ./cmd/runtimeadmin
+          for binary in vane useradmin gate runtimeadmin; do
+            go version -m "bin/$binary" |
+              grep -Fx $'\tbuild\tvcs.revision=${{ needs.plan.outputs.backend_sha }}'
+            go version -m "bin/$binary" |
+              grep -Fx $'\tbuild\tvcs.modified=false'
+          done
+          [[ -z $(git status --porcelain --untracked-files=all) ]]
+
+      - name: Package backend artifact
+        if: needs.plan.outputs.backend_changed == 'true'
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/artifact.py" pack \
+            --component backend \
+            --sha "${{ needs.plan.outputs.backend_sha }}" \
+            --source "$BUILD_ROOT/source/vane-release" \
+            --output "$BUILD_ROOT/artifacts/backend"
+
+      - name: Upload backend artifact
+        if: needs.plan.outputs.backend_changed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ github.run_id }}-${{ github.run_attempt }}-backend-${{ needs.plan.outputs.backend_sha }}
+          path: ${{ runner.temp }}/vane-build-${{ github.run_id }}-${{ github.run_attempt }}/artifacts/backend/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Checkout frontend gate source at exact SHA
+        if: needs.plan.outputs.frontend_changed == 'true'
+        env:
+          SOURCE_READ_KEY: ${{ secrets.VANE_WEB_READ_KEY }}
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/checkout-source.sh" \
+            YouToco/vane-web \
+            "${{ needs.plan.outputs.frontend_sha }}" \
+            "$BUILD_ROOT/source/vane-web-gate"
+
+      - name: Frontend independent full gate
+        if: needs.plan.outputs.frontend_changed == 'true'
+        run: |
+          cd "$BUILD_ROOT/source/vane-web-gate"
+          if find "$RUNNER_TEMP" -maxdepth 1 -name 'source-checkout.*' -print -quit |
+            grep -q .; then
+            echo "source deploy key residue exists before execution" >&2
+            exit 1
+          fi
+          npm ci
+          npm test
+          npm run typecheck
+          VITE_API_BASE=https://api.vane.zhuoqidev.com npm run build
+
+      - name: Rematerialize clean frontend source for release
+        if: needs.plan.outputs.frontend_changed == 'true'
+        env:
+          SOURCE_READ_KEY: ${{ secrets.VANE_WEB_READ_KEY }}
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/checkout-source.sh" \
+            YouToco/vane-web \
+            "${{ needs.plan.outputs.frontend_sha }}" \
+            "$BUILD_ROOT/source/vane-web-release"
+
+      - name: Build frontend release bundle
+        if: needs.plan.outputs.frontend_changed == 'true'
+        env:
+          VITE_API_BASE: https://api.vane.zhuoqidev.com
+        run: |
+          cd "$BUILD_ROOT/source/vane-web-release"
+          [[ -z $(git status --porcelain --untracked-files=all) ]]
+          npm ci
+          npm run build
+          [[ -z $(git status --porcelain --untracked-files=all) ]]
+
+      - name: Package frontend artifact
+        if: needs.plan.outputs.frontend_changed == 'true'
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/artifact.py" pack \
+            --component frontend \
+            --sha "${{ needs.plan.outputs.frontend_sha }}" \
+            --source "$BUILD_ROOT/source/vane-web-release" \
+            --output "$BUILD_ROOT/artifacts/frontend"
+
+      - name: Upload frontend artifact
+        if: needs.plan.outputs.frontend_changed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ github.run_id }}-${{ github.run_attempt }}-frontend-${{ needs.plan.outputs.frontend_sha }}
+          path: ${{ runner.temp }}/vane-build-${{ github.run_id }}-${{ github.run_attempt }}/artifacts/frontend/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Remove per-attempt build root
+        if: always()
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_ROOT" == \
+            "$RUNNER_TEMP/vane-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
+          rm -rf -- "$BUILD_ROOT"
+
+  # This job receives only control-plane code and same-run artifacts. It never
+  # downloads or executes source trees, npm, or Go build/test commands.
+  deploy:
+    needs: [plan, build]
+    if: >-
+      needs.plan.outputs.any_changed == 'true' &&
+      needs.build.result == 'success'
+    runs-on: [self-hosted, Linux, ARM64, vane-deploy]
+    timeout-minutes: 35
+    env:
+      DEPLOY_ROOT_NAME: vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Prepare per-attempt deploy root
+        run: |
+          set -euo pipefail
+          DEPLOY_ROOT="$RUNNER_TEMP/$DEPLOY_ROOT_NAME"
+          [[ "$DEPLOY_ROOT" == \
+            "$RUNNER_TEMP/vane-deploy-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
+          [[ ! -e "$DEPLOY_ROOT" ]]
+          install -d -m 0700 "$DEPLOY_ROOT"
+          echo "DEPLOY_ROOT=$DEPLOY_ROOT" >>"$GITHUB_ENV"
+
+      - name: Checkout deployment control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          clean: true
+          persist-credentials: false
+          path: control-plane
+
+      - name: Download backend artifact from this run
+        if: needs.plan.outputs.backend_changed == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ github.run_id }}-${{ github.run_attempt }}-backend-${{ needs.plan.outputs.backend_sha }}
+          path: ${{ runner.temp }}/vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}/incoming/backend
+
+      - name: Download frontend artifact from this run
+        if: needs.plan.outputs.frontend_changed == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ github.run_id }}-${{ github.run_attempt }}-frontend-${{ needs.plan.outputs.frontend_sha }}
+          path: ${{ runner.temp }}/vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}/incoming/frontend
+
+      - name: Strictly validate backend artifact
+        if: needs.plan.outputs.backend_changed == 'true'
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/artifact.py" validate \
+            --component backend \
+            --sha "${{ needs.plan.outputs.backend_sha }}" \
+            --input "$DEPLOY_ROOT/incoming/backend" \
+            --output "$DEPLOY_ROOT/verified/backend"
+
+      - name: Strictly validate frontend artifact
+        if: needs.plan.outputs.frontend_changed == 'true'
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/artifact.py" validate \
+            --component frontend \
+            --sha "${{ needs.plan.outputs.frontend_sha }}" \
+            --input "$DEPLOY_ROOT/incoming/frontend" \
+            --output "$DEPLOY_ROOT/verified/frontend"
+
+      - name: Install pinned Aliyun CLI
+        if: needs.plan.outputs.frontend_changed == 'true'
+        run: control-plane/scripts/install-aliyun.sh
+
+      - name: Deploy backend and run production Gate
+        if: needs.plan.outputs.backend_changed == 'true'
+        env:
+          EXPECTED_DEPLOYED_SHA: ${{ needs.plan.outputs.backend_previous }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_SSH_HOST_ED25519_FINGERPRINT: ${{ secrets.VPS_SSH_HOST_ED25519_FINGERPRINT }}
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/deploy.sh" backend \
+            "$DEPLOY_ROOT/verified/backend" \
+            "${{ needs.plan.outputs.backend_sha }}"
+
+      - name: Deploy frontend to OSS and Aliyun CDN
+        if: needs.plan.outputs.frontend_changed == 'true'
+        env:
+          EXPECTED_DEPLOYED_SHA: ${{ needs.plan.outputs.frontend_previous }}
+          FRONTEND_RECEIPT_DIR: ${{ runner.temp }}/vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}/frontend-receipts
+          ALIYUN_BIN: ${{ runner.temp }}/aliyun-3.4.8/aliyun
+          ALIYUN_ACCESS_KEY_ID: ${{ secrets.ALIYUN_ACCESS_KEY_ID }}
+          ALIYUN_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/deploy.sh" frontend-aliyun \
+            "$DEPLOY_ROOT/verified/frontend" \
+            "${{ needs.plan.outputs.frontend_sha }}"
+
+      - name: Deploy frontend to Cloudflare Pages
+        if: needs.plan.outputs.frontend_changed == 'true'
+        env:
+          EXPECTED_DEPLOYED_SHA: ${{ needs.plan.outputs.frontend_previous }}
+          FRONTEND_RECEIPT_DIR: ${{ runner.temp }}/vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}/frontend-receipts
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_BIN: /opt/vane-deploy-tools/wrangler
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/deploy.sh" frontend-cloudflare \
+            "$DEPLOY_ROOT/verified/frontend" \
+            "${{ needs.plan.outputs.frontend_sha }}"
+
+      - name: Atomically finalize frontend SHA
+        if: needs.plan.outputs.frontend_changed == 'true'
+        env:
+          EXPECTED_DEPLOYED_SHA: ${{ needs.plan.outputs.frontend_previous }}
+          FRONTEND_RECEIPT_DIR: ${{ runner.temp }}/vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}/frontend-receipts
+        run: |
+          "$GITHUB_WORKSPACE/control-plane/scripts/deploy.sh" frontend-finalize \
+            "$DEPLOY_ROOT/verified/frontend" \
+            "${{ needs.plan.outputs.frontend_sha }}"
+
+      - name: Remove per-attempt deploy root
+        if: always()
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_ROOT" == \
+            "$RUNNER_TEMP/vane-deploy-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
+          rm -rf -- "$DEPLOY_ROOT"

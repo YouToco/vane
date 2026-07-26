@@ -1,0 +1,5 @@
+self-hosted-runner:
+  labels:
+    - vane-test
+    - vane-build
+    - vane-deploy
