@@ -84,7 +84,16 @@ jobs:
           # sync --delete = 镜像语义：清掉桶里已不在 dist 的旧 hash 产物
           aliyun oss sync dist/ oss://zhuoqidev-vane-web/ --delete --force
           # index.html 无 hash 会被边缘缓存，必须主动刷新目录让新版立即生效
-          aliyun cdn RefreshObjectCaches --ObjectPath "https://vane.zhuoqidev.com/" --ObjectType Directory
+          # CDN API 偶发在服务端完成前后超时；同一目录刷新可安全重试。
+          for attempt in 1 2 3; do
+            if aliyun cdn RefreshObjectCaches \
+              --ObjectPath "https://vane.zhuoqidev.com/" \
+              --ObjectType Directory; then
+              break
+            fi
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep $((attempt * 5))
+          done
 
       - name: Deploy Cloudflare Pages（境外线）
         run: npx --yes wrangler@4 pages deploy dist --project-name vane-web --branch main
