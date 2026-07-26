@@ -117,7 +117,6 @@ deploy_backend() {
   }
 
   local binary infra
-  command -v strings >/dev/null
   for binary in vane useradmin gate runtimeadmin; do
     [[ -x $payload/bin/$binary ]] || {
       echo "missing verified backend binary: $binary" >&2
@@ -125,15 +124,8 @@ deploy_backend() {
     }
     # The Python artifact validator performs the same build-info checks without
     # requiring Go on this VM. Keep this assertion close to deployment too.
-    strings "$payload/bin/$binary" |
-      grep -Fx "vcs.revision=$source_sha" >/dev/null
-    strings "$payload/bin/$binary" |
-      grep -Fx "vcs.modified=false" >/dev/null
-    if strings "$payload/bin/$binary" |
-      grep -Fx "vcs.modified=true" >/dev/null; then
-      echo "$binary was built from a modified worktree" >&2
-      exit 1
-    fi
+    "$(dirname "$0")/check-go-build-info.sh" \
+      "$payload/bin/$binary" "$source_sha"
   done
   for infra in \
     Caddyfile \
