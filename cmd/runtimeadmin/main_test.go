@@ -828,6 +828,258 @@ func TestExecuteAgentSessionCutoverRevalidatesScopeAndConfirmation(
 	}
 }
 
+func TestParseAgentActionCutoverRequiresExactScopeEvidenceAndConfirmation(
+	t *testing.T,
+) {
+	tests := []struct {
+		name string
+		args []string
+		ok   bool
+	}{
+		{
+			name: "status",
+			args: []string{
+				"-tenant", "1", "-user", "2", "-action-id", "action-3",
+				"-operation", "status",
+			},
+			ok: true,
+		},
+		{
+			name: "activate",
+			args: []string{
+				"-tenant", "1", "-user", "2", "-action-id", "action-3",
+				"-operation", "activate", "-evidence", "ticket-4",
+				"-confirm-cutover",
+			},
+			ok: true,
+		},
+		{
+			name: "rollback",
+			args: []string{
+				"-tenant", "1", "-user", "2", "-action-id", "action-3",
+				"-operation", "rollback", "-evidence", "ticket-5",
+				"-confirm-cutover",
+			},
+			ok: true,
+		},
+		{name: "missing scope", args: []string{"-operation", "status"}},
+		{
+			name: "untrimmed action id",
+			args: []string{
+				"-tenant", "1", "-user", "2", "-action-id", " action-3",
+				"-operation", "status",
+			},
+		},
+		{
+			name: "status rejects evidence",
+			args: []string{
+				"-tenant", "1", "-user", "2", "-action-id", "action-3",
+				"-operation", "status", "-evidence", "ticket-4",
+			},
+		},
+		{
+			name: "status rejects confirmation",
+			args: []string{
+				"-tenant", "1", "-user", "2", "-action-id", "action-3",
+				"-operation", "status", "-confirm-cutover",
+			},
+		},
+		{
+			name: "activate rejects missing evidence",
+			args: []string{
+				"-tenant", "1", "-user", "2", "-action-id", "action-3",
+				"-operation", "activate", "-confirm-cutover",
+			},
+		},
+		{
+			name: "rollback rejects missing confirmation",
+			args: []string{
+				"-tenant", "1", "-user", "2", "-action-id", "action-3",
+				"-operation", "rollback", "-evidence", "ticket-5",
+			},
+		},
+		{
+			name: "invalid operation",
+			args: []string{
+				"-tenant", "1", "-user", "2", "-action-id", "action-3",
+				"-operation", "apply",
+			},
+		},
+		{
+			name: "positional carrier",
+			args: []string{
+				"-tenant", "1", "-user", "2", "-action-id", "action-3",
+				"-operation", "status", "carrier",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			opts, ok := parseAgentActionCutoverOptions(tt.args, &stderr)
+			if ok != tt.ok {
+				t.Fatalf("options=%+v ok=%v want=%v stderr=%q",
+					opts, ok, tt.ok, stderr.String())
+			}
+			if tt.ok && stderr.Len() != 0 {
+				t.Fatalf("valid options emitted stderr=%q", stderr.String())
+			}
+			if !tt.ok && stderr.Len() == 0 {
+				t.Fatal("rejection did not explain safe usage")
+			}
+		})
+	}
+}
+
+func TestExecuteAgentActionCutoverRoutesOnlyExactDurableAPIs(
+	t *testing.T,
+) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	for _, operation := range []agentActionCutoverOperation{
+		agentActionCutoverStatus,
+		agentActionCutoverActivate,
+		agentActionCutoverRollback,
+	} {
+		t.Run(string(operation), func(t *testing.T) {
+			fake := &fakeAgentActionCutoverStore{
+				output: store.AgentActionContinuationStatus{
+					TenantID: 1, UserID: 2, ActionID: "action-3",
+					SessionID: 4, SourceID: 5, ExecutionVersion: 2,
+					Route: store.AgentActionAuthorityDurable, Generation: 1,
+					Status:        store.AgentActionStatusPending,
+					NextAttemptAt: &now, ActivationEligible: true,
+					RollbackEligible: true,
+				},
+			}
+			opts := agentActionCutoverOptions{
+				TenantID: 1, UserID: 2, ActionID: "action-3",
+				Operation: operation,
+			}
+			if operation != agentActionCutoverStatus {
+				opts.Evidence = "ticket-6"
+				opts.Confirm = true
+			}
+			output, err := executeAgentActionCutover(
+				t.Context(), fake, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCalls := []string{"status"}
+			if operation != agentActionCutoverStatus {
+				wantCalls = []string{string(operation), "status"}
+			}
+			if strings.Join(fake.calls, ",") != strings.Join(wantCalls, ",") ||
+				fake.tenantID != 1 || fake.userID != 2 ||
+				fake.actionID != "action-3" ||
+				(operation != agentActionCutoverStatus &&
+					fake.evidence != "ticket-6") ||
+				output.ExecutionVersion != 2 ||
+				output.Route != store.AgentActionAuthorityDurable ||
+				output.Generation != 1 {
+				t.Fatalf("fake/output=%+v/%+v", fake, output)
+			}
+		})
+	}
+}
+
+func TestExecuteAgentActionCutoverRevalidatesMutationBoundary(t *testing.T) {
+	tests := []agentActionCutoverOptions{
+		{
+			TenantID: 0, UserID: 2, ActionID: "action-3",
+			Operation: agentActionCutoverStatus,
+		},
+		{
+			TenantID: 1, UserID: 2, ActionID: " action-3",
+			Operation: agentActionCutoverStatus,
+		},
+		{
+			TenantID: 1, UserID: 2, ActionID: "action-3",
+			Operation: agentActionCutoverStatus, Evidence: "ticket-4",
+		},
+		{
+			TenantID: 1, UserID: 2, ActionID: "action-3",
+			Operation: agentActionCutoverActivate, Confirm: true,
+		},
+		{
+			TenantID: 1, UserID: 2, ActionID: "action-3",
+			Operation: agentActionCutoverRollback, Evidence: "ticket-5",
+		},
+		{
+			TenantID: 1, UserID: 2, ActionID: "action-3",
+			Operation: "apply", Evidence: "ticket-5", Confirm: true,
+		},
+	}
+	for _, opts := range tests {
+		fake := &fakeAgentActionCutoverStore{}
+		if _, err := executeAgentActionCutover(
+			t.Context(), fake, opts,
+		); !errors.Is(err, types.ErrValidation) {
+			t.Fatalf("opts=%+v error=%v, want validation", opts, err)
+		}
+		if len(fake.calls) != 0 {
+			t.Fatalf("opts=%+v reached Store via %v", opts, fake.calls)
+		}
+	}
+}
+
+type fakeAgentActionCutoverStore struct {
+	calls    []string
+	tenantID int64
+	userID   int64
+	actionID string
+	evidence string
+	output   store.AgentActionContinuationStatus
+	err      error
+}
+
+func (f *fakeAgentActionCutoverStore) record(
+	call string,
+	tenantID int64,
+	userID int64,
+	actionID string,
+	evidence string,
+) {
+	f.calls = append(f.calls, call)
+	f.tenantID = tenantID
+	f.userID = userID
+	f.actionID = actionID
+	if evidence != "" {
+		f.evidence = evidence
+	}
+}
+
+func (f *fakeAgentActionCutoverStore) GetAgentActionContinuationStatus(
+	_ context.Context,
+	tenantID int64,
+	userID int64,
+	actionID string,
+) (store.AgentActionContinuationStatus, error) {
+	f.record("status", tenantID, userID, actionID, "")
+	return f.output, f.err
+}
+
+func (f *fakeAgentActionCutoverStore) ActivateAgentActionContinuation(
+	_ context.Context,
+	tenantID int64,
+	userID int64,
+	actionID string,
+	evidence string,
+) (int64, error) {
+	f.record("activate", tenantID, userID, actionID, evidence)
+	return 1, f.err
+}
+
+func (f *fakeAgentActionCutoverStore) RollbackAgentActionContinuation(
+	_ context.Context,
+	tenantID int64,
+	userID int64,
+	actionID string,
+	evidence string,
+) (int64, error) {
+	f.record("rollback", tenantID, userID, actionID, evidence)
+	return 2, f.err
+}
+
 type fakeAgentSessionCutoverStore struct {
 	call      string
 	tenantID  int64
@@ -916,6 +1168,65 @@ func TestFinishAgentSessionCutoverRunSanitizesStoreError(t *testing.T) {
 	}
 }
 
+func TestFinishAgentActionCutoverRunOutputsOnlySafeCarrier(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	result := agentActionCutoverOutput{
+		TenantID: 1, UserID: 2, ActionID: "action-3",
+		SessionID: 4, SourceID: 5, ExecutionVersion: 2,
+		Route: store.AgentActionAuthorityDurable, Generation: 1,
+		Status:       store.AgentActionStatusConfirmed,
+		AttemptCount: 1, LeaseFence: 1, NextAttemptAt: &now,
+		ActivationEligible: false, RollbackEligible: false,
+	}
+	var stdout, stderr bytes.Buffer
+	if got := finishAgentActionCutoverRun(
+		&stdout, &stderr, result, nil,
+	); got != exitOK {
+		t.Fatalf("exit=%d want=%d", got, exitOK)
+	}
+	output := stdout.String()
+	for _, want := range []string{
+		`"action_id": "action-3"`, `"execution_version": 2`,
+		`"route": "durable"`, `"generation": 1`,
+		`"activation_eligible": false`, `"rollback_eligible": false`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("JSON missing %q: %s", want, output)
+		}
+	}
+	for _, forbidden := range []string{
+		"evidence", "canonical_args", "tool_spec", "tool_policy",
+		"success_messages", "not_found_messages", "database_url",
+	} {
+		if strings.Contains(output, forbidden) {
+			t.Errorf("JSON leaked forbidden field %q: %s",
+				forbidden, output)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestFinishAgentActionCutoverRunSanitizesStoreError(t *testing.T) {
+	const secret = `{"canonical_args":{"source_id":5,"secret":"private"}}`
+	runErr := types.NewAppError(
+		types.CodeConflict, "agent action cutover rejected",
+		errors.New(secret))
+	var stdout, stderr bytes.Buffer
+	if got := finishAgentActionCutoverRun(
+		&stdout, &stderr, agentActionCutoverOutput{}, runErr,
+	); got != exitFailure {
+		t.Fatalf("exit=%d want=%d", got, exitFailure)
+	}
+	if stdout.Len() != 0 ||
+		!strings.Contains(stderr.String(), "agent action cutover rejected") ||
+		strings.Contains(stderr.String(), secret) {
+		t.Fatalf("unsafe output stdout/stderr=%q/%q",
+			stdout.String(), stderr.String())
+	}
+}
+
 func TestFinishSnapshotCutoverRunOutputsOnlySafeCarrier(t *testing.T) {
 	result := store.TaskRunSnapshotCutoverResult{
 		TenantID: 1, UserID: 2, TaskID: "task", EventID: 3,
@@ -977,7 +1288,7 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workflow := string(payload)
+	workflow := strings.ReplaceAll(string(payload), "\r\n", "\n")
 	for _, required := range []string{
 		"runs-on: [self-hosted, Linux, ARM64, vane-test]",
 		"permissions:\n  contents: read",

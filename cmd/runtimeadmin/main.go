@@ -9,6 +9,8 @@
 //	runtimeadmin baseline -mode verify -after-tenant 1 -after-user 2 -after-task push-123
 //	runtimeadmin agent-session-cutover -tenant 1 -user 2 -session 3 -action status
 //	runtimeadmin agent-session-cutover -tenant 1 -user 2 -session 3 -action activate -confirm-cutover
+//	runtimeadmin agent-action-cutover -tenant 1 -user 2 -action-id action-3 -operation status
+//	runtimeadmin agent-action-cutover -tenant 1 -user 2 -action-id action-3 -operation activate -evidence ticket-123 -confirm-cutover
 //
 // Verify returns 0 only when every item in the page is verified and Next is
 // absent. Exit 1 means a non-verified item, 2 means the command failed, and 3
@@ -62,10 +64,14 @@ func run(args []string) int {
 	if len(args) > 0 && args[0] == "agent-session-cutover" {
 		return runAgentSessionCutover(args[1:])
 	}
+	if len(args) > 0 && args[0] == "agent-action-cutover" {
+		return runAgentActionCutover(args[1:])
+	}
 	if len(args) == 0 || args[0] != "baseline" {
 		fmt.Fprintln(os.Stderr,
 			"用法: runtimeadmin baseline ... | snapshot-shadow ... | "+
 				"snapshot-cutover ... | agent-session-cutover ... | "+
+				"agent-action-cutover ... | "+
 				"legacy-batch63-repair ...")
 		return exitFailure
 	}
@@ -611,6 +617,247 @@ func finishAgentSessionCutoverRun(
 	if runErr != nil {
 		fmt.Fprintln(stderr, "runtimeadmin: "+safeError(
 			runErr, "agent session cutover operation failed"))
+		return exitFailure
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(output); err != nil {
+		fmt.Fprintln(stderr, "runtimeadmin: 输出结果失败")
+		return exitFailure
+	}
+	return exitOK
+}
+
+type agentActionCutoverOperation string
+
+const (
+	agentActionCutoverStatus   agentActionCutoverOperation = "status"
+	agentActionCutoverActivate agentActionCutoverOperation = "activate"
+	agentActionCutoverRollback agentActionCutoverOperation = "rollback"
+)
+
+type agentActionCutoverOptions struct {
+	TenantID  int64
+	UserID    int64
+	ActionID  string
+	Operation agentActionCutoverOperation
+	Evidence  string
+	Confirm   bool
+}
+
+type agentActionCutoverOutput struct {
+	TenantID           int64      `json:"tenant_id"`
+	UserID             int64      `json:"user_id"`
+	ActionID           string     `json:"action_id"`
+	SessionID          int64      `json:"session_id"`
+	SourceID           int64      `json:"source_id"`
+	ExecutionVersion   int        `json:"execution_version"`
+	Route              string     `json:"route"`
+	Generation         int64      `json:"generation"`
+	Status             string     `json:"status"`
+	TerminalCode       *string    `json:"terminal_code,omitempty"`
+	AttemptCount       int        `json:"attempt_count"`
+	LeaseOwner         *string    `json:"lease_owner,omitempty"`
+	LeaseFence         int64      `json:"lease_fence"`
+	LeaseExpiresAt     *time.Time `json:"lease_expires_at,omitempty"`
+	NextAttemptAt      *time.Time `json:"next_attempt_at,omitempty"`
+	ConfirmedAt        *time.Time `json:"confirmed_at,omitempty"`
+	CompletedAt        *time.Time `json:"completed_at,omitempty"`
+	BlockedReason      *string    `json:"blocked_reason,omitempty"`
+	ActivationEligible bool       `json:"activation_eligible"`
+	RollbackEligible   bool       `json:"rollback_eligible"`
+}
+
+type agentActionCutoverStore interface {
+	GetAgentActionContinuationStatus(
+		context.Context, int64, int64, string,
+	) (store.AgentActionContinuationStatus, error)
+	ActivateAgentActionContinuation(
+		context.Context, int64, int64, string, string,
+	) (int64, error)
+	RollbackAgentActionContinuation(
+		context.Context, int64, int64, string, string,
+	) (int64, error)
+}
+
+func runAgentActionCutover(args []string) int {
+	opts, ok := parseAgentActionCutoverOptions(args, os.Stderr)
+	if !ok {
+		return exitFailure
+	}
+	cfg, err := config.Load("")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runtimeadmin: 加载配置失败")
+		return exitFailure
+	}
+	ctx, stop := signal.NotifyContext(
+		context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, runTimeout)
+	defer cancel()
+	st, err := store.New(ctx, cfg.DB.URL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "runtimeadmin: 连接数据库失败")
+		return exitFailure
+	}
+	defer st.Close()
+	output, err := executeAgentActionCutover(ctx, st, opts)
+	return finishAgentActionCutoverRun(os.Stdout, os.Stderr, output, err)
+}
+
+func parseAgentActionCutoverOptions(
+	args []string,
+	stderr io.Writer,
+) (agentActionCutoverOptions, bool) {
+	fs := flag.NewFlagSet(
+		"runtimeadmin agent-action-cutover", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	tenantID := fs.Int64("tenant", 0, "exact tenant id")
+	userID := fs.Int64("user", 0, "exact action owner user id")
+	actionID := fs.String("action-id", "", "exact pending action id")
+	rawOperation := fs.String(
+		"operation", string(agentActionCutoverStatus),
+		"status、activate 或 rollback")
+	evidence := fs.String(
+		"evidence", "", "operator evidence bound to activate/rollback")
+	confirm := fs.Bool(
+		"confirm-cutover", false,
+		"确认 activate/rollback 会持久化 exact action authority")
+	if err := fs.Parse(args); err != nil {
+		return agentActionCutoverOptions{}, false
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr,
+			"runtimeadmin: agent-action-cutover 不接受位置参数")
+		return agentActionCutoverOptions{}, false
+	}
+	if *tenantID <= 0 || *userID <= 0 || *actionID == "" ||
+		strings.TrimSpace(*actionID) != *actionID {
+		fmt.Fprintln(stderr,
+			"runtimeadmin: agent-action-cutover requires positive "+
+				"-tenant/-user and exact -action-id")
+		return agentActionCutoverOptions{}, false
+	}
+	operation := agentActionCutoverOperation(*rawOperation)
+	switch operation {
+	case agentActionCutoverStatus:
+		if *confirm || *evidence != "" {
+			fmt.Fprintln(stderr,
+				"runtimeadmin: status 不接受 -confirm-cutover 或 -evidence")
+			return agentActionCutoverOptions{}, false
+		}
+	case agentActionCutoverActivate, agentActionCutoverRollback:
+		if !*confirm || *evidence == "" ||
+			strings.TrimSpace(*evidence) != *evidence ||
+			len(*evidence) > 512 {
+			fmt.Fprintln(stderr,
+				"runtimeadmin: activate/rollback 必须显式提供 "+
+					"-confirm-cutover 与 exact -evidence")
+			return agentActionCutoverOptions{}, false
+		}
+	default:
+		fmt.Fprintln(stderr,
+			"runtimeadmin: agent-action-cutover -operation 仅支持 "+
+				"status、activate、rollback")
+		return agentActionCutoverOptions{}, false
+	}
+	return agentActionCutoverOptions{
+		TenantID:  *tenantID,
+		UserID:    *userID,
+		ActionID:  *actionID,
+		Operation: operation,
+		Evidence:  *evidence,
+		Confirm:   *confirm,
+	}, true
+}
+
+func executeAgentActionCutover(
+	ctx context.Context,
+	st agentActionCutoverStore,
+	opts agentActionCutoverOptions,
+) (agentActionCutoverOutput, error) {
+	if opts.TenantID <= 0 || opts.UserID <= 0 || opts.ActionID == "" ||
+		strings.TrimSpace(opts.ActionID) != opts.ActionID {
+		return agentActionCutoverOutput{}, types.NewAppError(
+			types.CodeValidation,
+			"agent action cutover requires exact positive scope", nil,
+		)
+	}
+	switch opts.Operation {
+	case agentActionCutoverStatus:
+		if opts.Confirm || opts.Evidence != "" {
+			return agentActionCutoverOutput{}, types.NewAppError(
+				types.CodeValidation,
+				"agent action cutover status rejects mutation evidence", nil,
+			)
+		}
+	case agentActionCutoverActivate, agentActionCutoverRollback:
+		if !opts.Confirm || opts.Evidence == "" ||
+			strings.TrimSpace(opts.Evidence) != opts.Evidence ||
+			len(opts.Evidence) > 512 {
+			return agentActionCutoverOutput{}, types.NewAppError(
+				types.CodeValidation,
+				"agent action cutover mutation requires exact confirmation", nil,
+			)
+		}
+	default:
+		return agentActionCutoverOutput{}, types.NewAppError(
+			types.CodeValidation,
+			"agent action cutover operation is invalid", nil,
+		)
+	}
+	if opts.Operation == agentActionCutoverActivate {
+		if _, err := st.ActivateAgentActionContinuation(
+			ctx, opts.TenantID, opts.UserID, opts.ActionID, opts.Evidence,
+		); err != nil {
+			return agentActionCutoverOutput{}, err
+		}
+	}
+	if opts.Operation == agentActionCutoverRollback {
+		if _, err := st.RollbackAgentActionContinuation(
+			ctx, opts.TenantID, opts.UserID, opts.ActionID, opts.Evidence,
+		); err != nil {
+			return agentActionCutoverOutput{}, err
+		}
+	}
+	status, err := st.GetAgentActionContinuationStatus(
+		ctx, opts.TenantID, opts.UserID, opts.ActionID)
+	if err != nil {
+		return agentActionCutoverOutput{}, err
+	}
+	return agentActionCutoverOutput{
+		TenantID:           status.TenantID,
+		UserID:             status.UserID,
+		ActionID:           status.ActionID,
+		SessionID:          status.SessionID,
+		SourceID:           status.SourceID,
+		ExecutionVersion:   status.ExecutionVersion,
+		Route:              status.Route,
+		Generation:         status.Generation,
+		Status:             status.Status,
+		TerminalCode:       status.TerminalCode,
+		AttemptCount:       status.AttemptCount,
+		LeaseOwner:         status.LeaseOwner,
+		LeaseFence:         status.LeaseFence,
+		LeaseExpiresAt:     status.LeaseExpiresAt,
+		NextAttemptAt:      status.NextAttemptAt,
+		ConfirmedAt:        status.ConfirmedAt,
+		CompletedAt:        status.CompletedAt,
+		BlockedReason:      status.BlockedReason,
+		ActivationEligible: status.ActivationEligible,
+		RollbackEligible:   status.RollbackEligible,
+	}, nil
+}
+
+func finishAgentActionCutoverRun(
+	stdout io.Writer,
+	stderr io.Writer,
+	output agentActionCutoverOutput,
+	runErr error,
+) int {
+	if runErr != nil {
+		fmt.Fprintln(stderr, "runtimeadmin: "+safeError(
+			runErr, "agent action cutover operation failed"))
 		return exitFailure
 	}
 	encoder := json.NewEncoder(stdout)

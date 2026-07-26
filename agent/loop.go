@@ -23,6 +23,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/YouToco/vane/agentcontext"
+	"github.com/YouToco/vane/agentcontinuation"
 	"github.com/YouToco/vane/agentledger"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/llm"
@@ -225,6 +226,22 @@ type DefinitionEditController interface {
 	) (task.TaskDefinitionEditOutcome, error)
 }
 
+// ActionContinuationController is the v2 durable action decision boundary.
+// Generic Tool execution and raw continuation mutation entrypoints are
+// intentionally absent.
+type ActionContinuationController interface {
+	Confirm(
+		context.Context,
+		int64,
+		string,
+	) (agentcontinuation.ActionOutcome, error)
+	Cancel(
+		context.Context,
+		int64,
+		string,
+	) (agentcontinuation.ActionOutcome, error)
+}
+
 // ProfileReader 是画像读取的窄接口（M5 契约 §12.2，生产实现 *store.Store）。
 // 与 Store 分开声明：画像是增强不是门槛，读取失败必须降级为空画像而非报错，
 // 窄接口让测试可独立注入两态与失败。
@@ -254,6 +271,9 @@ type Deps struct {
 	// When present it must be the same controller used to register
 	// edit_task_definition in BuildTools.
 	TaskDefinitionEdit DefinitionEditController
+	// ActionContinuation routes exact v2 enable_source callbacks before every
+	// historical action protocol. Production Feishu ingress always injects it.
+	ActionContinuation ActionContinuationController
 	// SystemPrompt 覆盖默认 system 常量（M4 契约 §7.1，A2A 轨用）。零值回落包内
 	// systemPrompt 常量——飞书轨装配不传本字段，行为零变化。默认常量写死了飞书语境
 	//（确认卡/卡片回调/画像引导），A2A 轨的对端是外部 agent，语境完全不同。
@@ -325,6 +345,7 @@ type Loop struct {
 	toolCalls          *ToolCallRecorder
 	taskCreation       CreationController
 	taskDefinitionEdit DefinitionEditController
+	actionContinuation ActionContinuationController
 	sys                string // system prompt（含端点检索能力说明段，装配时定型）
 	renderProfile      bool   // 是否渲染 [用户画像] 段：默认飞书轨 true，自定义 prompt 的 A2A 轨 false
 	model              string
@@ -428,6 +449,7 @@ func NewChecked(d Deps) (*Loop, error) {
 		toolCalls:             d.ToolCalls,
 		taskCreation:          d.TaskCreation,
 		taskDefinitionEdit:    d.TaskDefinitionEdit,
+		actionContinuation:    d.ActionContinuation,
 		sys:                   sys,
 		renderProfile:         renderProfile,
 		model:                 d.Model,
@@ -1744,6 +1766,22 @@ func (l *Loop) ExecuteActionWithReceipt(
 }
 
 func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string) (string, error) {
+	if l.actionContinuation != nil {
+		outcome, err := l.actionContinuation.Confirm(
+			ctx, userID, actionID)
+		if err == nil {
+			return outcome.Text, nil
+		}
+		if !errors.Is(err, agentcontinuation.ErrNotRouted) {
+			if receiptState, ok := ctx.Value(
+				cardActionReceiptStateKey{},
+			).(*cardActionReceiptState); ok {
+				receiptState.preserve = true
+			}
+			return "", fmt.Errorf(
+				"confirm durable Agent action continuation: %w", err)
+		}
+	}
 	if l.taskCreation != nil {
 		receiptState, _ := ctx.Value(cardActionReceiptStateKey{}).(*cardActionReceiptState)
 		var receiptTarget task.CreationReceiptTarget
@@ -2025,6 +2063,22 @@ func (l *Loop) CancelActionWithReceipt(
 }
 
 func (l *Loop) CancelAction(ctx context.Context, userID int64, actionID string) (string, error) {
+	if l.actionContinuation != nil {
+		outcome, err := l.actionContinuation.Cancel(
+			ctx, userID, actionID)
+		if err == nil {
+			return outcome.Text, nil
+		}
+		if !errors.Is(err, agentcontinuation.ErrNotRouted) {
+			if receiptState, ok := ctx.Value(
+				cardActionReceiptStateKey{},
+			).(*cardActionReceiptState); ok {
+				receiptState.preserve = true
+			}
+			return "", fmt.Errorf(
+				"cancel durable Agent action continuation: %w", err)
+		}
+	}
 	if l.taskCreation != nil {
 		receiptState, _ := ctx.Value(cardActionReceiptStateKey{}).(*cardActionReceiptState)
 		var receiptTarget task.CreationReceiptTarget

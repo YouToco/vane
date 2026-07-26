@@ -1261,6 +1261,222 @@ func TestPurgeTenantRemovesSideWriterCommittedBeforeSessionFence(
 	}
 }
 
+func TestPurgeTenantSerializesWithAgentActionProjection(t *testing.T) {
+	st := purgeStore(t)
+	tenantID := seedPurgeTenant(t, st)
+	ctx := t.Context()
+	var userID, sessionID int64
+	if err := st.pool.QueryRow(ctx, `
+		SELECT m.user_id,s.id
+		  FROM memberships m
+		  JOIN agent_sessions s
+		    ON s.tenant_id=m.tenant_id AND s.user_id=m.user_id
+		 WHERE m.tenant_id=$1
+		 ORDER BY s.id
+		 LIMIT 1`,
+		tenantID,
+	).Scan(&userID, &sessionID); err != nil {
+		t.Fatal(err)
+	}
+	sourceID, _, err := st.UpsertSource(ctx, &types.Source{
+		Platform: types.PlatformWeb, Capability: types.CapFeed,
+		URL:   "https://example.com/action-purge-" + uuid.NewString(),
+		Title: "action purge projection",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(
+			cleanupCtx, t, st,
+			`DELETE FROM sources WHERE id=$1`, sourceID,
+		)
+	})
+	if err := st.AddSubscription(ctx, userID, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE sources SET status='disabled',fail_count=9 WHERE id=$1`,
+		sourceID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	actionID := uuid.NewString()
+	if err := st.CreatePendingAction(ctx, &types.PendingAction{
+		ID: actionID, UserID: userID, SessionID: &sessionID,
+		ToolName:  "enable_source",
+		Args:      []byte(fmt.Sprintf(`{"source_id":%d}`, sourceID)),
+		Summary:   "purge projection",
+		Status:    types.PendingActionStatusPending,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ActivateAgentActionContinuation(
+		ctx, tenantID, userID, actionID, "purge projection",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ConfirmAgentActionContinuation(
+		ctx, userID, actionID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	acquired, err := st.AcquireAgentActionContinuation(
+		ctx, actionID, tenantID, userID,
+		"purge-projection-"+actionID, time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := acquired.Lease()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	continuationLocked := make(chan struct{})
+	resumeProject := make(chan struct{})
+	var resumeOnce sync.Once
+	resume := func() {
+		resumeOnce.Do(func() { close(resumeProject) })
+	}
+	t.Cleanup(resume)
+	projectStore := *st
+	projectStore.beginTx = func(
+		ctx context.Context,
+		options pgx.TxOptions,
+	) (pgx.Tx, error) {
+		tx, err := st.pool.BeginTx(ctx, options)
+		if err != nil {
+			return nil, err
+		}
+		return &pauseAgentActionProjectAfterContinuationTx{
+			Tx: tx, locked: continuationLocked, resume: resumeProject,
+		}, nil
+	}
+	projectDone := make(chan error, 1)
+	go func() {
+		projectDone <- projectStore.ProjectAgentActionContinuation(ctx, lease)
+	}()
+	select {
+	case <-continuationLocked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Agent action projector did not lock continuation")
+	}
+
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, err := st.PurgeTenant(ctx, tenantID, false)
+		purgeDone <- purgeResult{report: report, err: err}
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%tenant purge task-creation lock order%",
+		"tenant purge did not wait behind Agent action root",
+	)
+	resume()
+	select {
+	case err := <-projectDone:
+		if err != nil {
+			t.Fatalf("Agent action projection with purge: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Agent action projection did not converge")
+	}
+	select {
+	case result := <-purgeDone:
+		if result.err != nil {
+			t.Fatalf("tenant purge with Agent action: %v", result.err)
+		}
+		if result.report == nil ||
+			result.report.Rows["agent_action_continuation_authority_events"] != 1 ||
+			result.report.Rows["agent_action_continuations"] != 1 {
+			t.Fatalf("tenant purge report=%+v", result.report)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant purge did not converge after projection")
+	}
+	var (
+		sourceStatus                                         string
+		actions, continuations, authority, sessions, tenants int
+	)
+	if err := st.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT status FROM sources WHERE id=$1),
+			(SELECT count(*) FROM pending_actions WHERE tenant_id=$2),
+			(SELECT count(*) FROM agent_action_continuations WHERE tenant_id=$2),
+			(SELECT count(*) FROM agent_action_continuation_authority_events
+			  WHERE tenant_id=$2),
+			(SELECT count(*) FROM agent_sessions WHERE tenant_id=$2),
+			(SELECT count(*) FROM tenants WHERE id=$2)`,
+		sourceID, tenantID,
+	).Scan(
+		&sourceStatus, &actions, &continuations,
+		&authority, &sessions, &tenants,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if sourceStatus != string(types.SourceStatusActive) ||
+		actions != 0 || continuations != 0 || authority != 0 ||
+		sessions != 0 || tenants != 0 {
+		t.Fatalf(
+			"source/actions/continuations/authority/sessions/tenants="+
+				"%s/%d/%d/%d/%d/%d",
+			sourceStatus, actions, continuations, authority,
+			sessions, tenants,
+		)
+	}
+}
+
+type pauseAgentActionProjectAfterContinuationTx struct {
+	pgx.Tx
+	locked chan struct{}
+	resume <-chan struct{}
+	once   sync.Once
+}
+
+func (tx *pauseAgentActionProjectAfterContinuationTx) QueryRow(
+	ctx context.Context,
+	query string,
+	args ...any,
+) pgx.Row {
+	row := tx.Tx.QueryRow(ctx, query, args...)
+	if !strings.Contains(query, "FROM agent_action_continuations") ||
+		!strings.Contains(query, "FOR UPDATE") {
+		return row
+	}
+	return pauseAgentActionProjectAfterContinuationRow{
+		Row: row,
+		pause: func() {
+			tx.once.Do(func() {
+				close(tx.locked)
+				<-tx.resume
+			})
+		},
+	}
+}
+
+type pauseAgentActionProjectAfterContinuationRow struct {
+	pgx.Row
+	pause func()
+}
+
+func (row pauseAgentActionProjectAfterContinuationRow) Scan(
+	dest ...any,
+) error {
+	if err := row.Row.Scan(dest...); err != nil {
+		return err
+	}
+	row.pause()
+	return nil
+}
+
 type pauseAfterReceiptLockTx struct {
 	pgx.Tx
 	table   string

@@ -451,6 +451,10 @@ func run() error {
 	definitionEditController := task.NewDefinitionEditController(
 		st, definitionEditCoordinator,
 	)
+	actionController, err := agentcontinuation.NewActionController(st)
+	if err != nil {
+		return fmt.Errorf("装配 Agent 耐久动作控制器: %w", err)
+	}
 	var definitionEditToolController agent.DefinitionEditController
 	if cfg.Agent.DefinitionEditEnabled {
 		definitionEditToolController = definitionEditController
@@ -474,6 +478,7 @@ func run() error {
 		// Historical cards must remain confirmable/cancellable when the flag is
 		// rolled back. Tool registration above is the only proposal exposure.
 		TaskDefinitionEdit: definitionEditController,
+		ActionContinuation: actionController,
 	})
 	if err != nil {
 		return fmt.Errorf("装配 Agent 工具注册表: %w", err)
@@ -565,6 +570,51 @@ func run() error {
 		temporalClient.Close()
 		st.Close()
 		return fmt.Errorf("装配 Agent 耐久延续投影器: %w", err)
+	}
+	actionDispatcher, err := agentcontinuation.NewActionDispatcher(
+		st, slog.Default(),
+	)
+	if err != nil {
+		stop()
+		maintenanceCtx, cancelMaintenance := context.WithTimeout(
+			context.Background(), 30*time.Second,
+		)
+		maintenanceErr := waitMaintenance(maintenanceCtx)
+		cancelMaintenance()
+		if maintenanceErr != nil {
+			return errors.Join(
+				fmt.Errorf("装配 Agent 耐久动作执行器: %w", err),
+				fmt.Errorf("排空启动维护任务: %w", maintenanceErr),
+			)
+		}
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("装配 Agent 耐久动作执行器: %w", err)
+	}
+	if err := actionDispatcher.Start(ctx); err != nil {
+		stop()
+		maintenanceCtx, cancelMaintenance := context.WithTimeout(
+			context.Background(), 30*time.Second,
+		)
+		maintenanceErr := waitMaintenance(maintenanceCtx)
+		cancelMaintenance()
+		if maintenanceErr != nil {
+			return errors.Join(
+				fmt.Errorf("启动 Agent 耐久动作执行器: %w", err),
+				fmt.Errorf("排空启动维护任务: %w", maintenanceErr),
+			)
+		}
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("启动 Agent 耐久动作执行器: %w", err)
+	}
+	stopActionDispatcher := func() error {
+		actionDispatcher.Stop()
+		actionDrainCtx, cancelActionDrain := context.WithTimeout(
+			context.Background(), 30*time.Second,
+		)
+		defer cancelActionDrain()
+		return actionDispatcher.Wait(actionDrainCtx)
 	}
 
 	// Definition-edit recovery starts before any Feishu/HTTP ingress is admitted.
@@ -699,6 +749,7 @@ func run() error {
 		creationReceiptErr := stopReceiptDispatch()
 		definitionEditReceiptErr :=
 			stopDefinitionEditReceiptDispatch()
+		actionDispatcherErr := stopActionDispatcher()
 		maintenanceCtx, cancelMaintenance := context.WithTimeout(
 			context.Background(), 30*time.Second,
 		)
@@ -709,6 +760,7 @@ func run() error {
 			scheduleCommandRecoveryErr,
 			pushRecoveryErr,
 			creationReceiptErr, definitionEditReceiptErr,
+			actionDispatcherErr,
 			maintenanceErr,
 		)
 		if drainErr != nil {
@@ -807,7 +859,11 @@ func run() error {
 			tools, agent.AuthorizationA2AReadOnly,
 		)
 		if filterErr != nil {
-			return fmt.Errorf("筛选 A2A Agent 工具: %w", filterErr)
+			actionDispatcherErr := stopActionDispatcher()
+			return errors.Join(
+				fmt.Errorf("筛选 A2A Agent 工具: %w", filterErr),
+				actionDispatcherErr,
+			)
 		}
 		a2aLoop, loopErr := agent.NewChecked(agent.Deps{
 			Client:       agentLLMClient,
@@ -819,7 +875,11 @@ func run() error {
 			ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
 		})
 		if loopErr != nil {
-			return fmt.Errorf("装配 A2A Agent 工具注册表: %w", loopErr)
+			actionDispatcherErr := stopActionDispatcher()
+			return errors.Join(
+				fmt.Errorf("装配 A2A Agent 工具注册表: %w", loopErr),
+				actionDispatcherErr,
+			)
 		}
 		a2aRuntime, err = a2a.Mount(mux, a2a.Deps{
 			Storage:   st,
@@ -840,6 +900,7 @@ func run() error {
 			receiptErr := stopReceiptDispatch()
 			definitionEditReceiptErr :=
 				stopDefinitionEditReceiptDispatch()
+			actionDispatcherErr := stopActionDispatcher()
 			sessionErr := drainAgentSessions()
 			maintenanceCtx, cancelMaintenance := context.WithTimeout(context.Background(), 30*time.Second)
 			maintenanceErr := waitMaintenance(maintenanceCtx)
@@ -849,13 +910,15 @@ func run() error {
 				scheduleCommandRecoveryErr != nil ||
 				pushRecoveryErr != nil ||
 				receiptErr != nil || definitionEditReceiptErr != nil ||
-				sessionErr != nil || maintenanceErr != nil {
+				actionDispatcherErr != nil || sessionErr != nil ||
+				maintenanceErr != nil {
 				// An admitted callback may still own DB/Temporal work. Do not close
 				// those resources underneath it; returning exits the process.
 				return errors.Join(fmt.Errorf("挂载 A2A server: %w", err),
 					drainErr, recoveryErr, definitionEditRecoveryErr,
 					scheduleCommandRecoveryErr, pushRecoveryErr, receiptErr,
-					definitionEditReceiptErr, sessionErr, maintenanceErr)
+					definitionEditReceiptErr, actionDispatcherErr,
+					sessionErr, maintenanceErr)
 			}
 			w.Stop()
 			temporalClient.Close()
@@ -970,6 +1033,12 @@ func run() error {
 		shutdownErrs = append(
 			shutdownErrs,
 			fmt.Errorf("排空任务定义编辑耐久回执: %w", err),
+		)
+	}
+	if err := stopActionDispatcher(); err != nil {
+		shutdownErrs = append(
+			shutdownErrs,
+			fmt.Errorf("排空 Agent 耐久动作执行器: %w", err),
 		)
 	}
 	if err := drainAgentSessions(); err != nil {
