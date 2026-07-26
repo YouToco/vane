@@ -3,6 +3,9 @@ package agentcontinuation
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +23,7 @@ type fakeActionDispatchStore struct {
 	projectStarted chan struct{}
 	projectRelease chan struct{}
 	projectErr     error
+	acquireNil     bool
 	projectCalls   int
 	releaseCalls   int
 	releaseCtxErr  error
@@ -66,6 +70,9 @@ func (f *fakeActionDispatchStore) AcquireAgentActionContinuation(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.owners = append(f.owners, owner)
+	if f.acquireNil {
+		return nil, nil
+	}
 	for i := range f.actions {
 		if f.actions[i].ActionID != actionID {
 			continue
@@ -277,6 +284,30 @@ func TestActionDispatcherBoundsConcurrencyAndUsesStableOwner(
 	}
 }
 
+func TestActionDispatcherRejectsNilSuccessfulAcquisition(t *testing.T) {
+	st := &fakeActionDispatchStore{
+		actions:    []store.AgentActionContinuation{fakeAction("a1")},
+		acquireNil: true,
+	}
+	dispatcher, err := NewActionDispatcher(st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = dispatcher.DispatchOnce(t.Context())
+	if err == nil || !strings.Contains(
+		err.Error(), "action acquisition returned no action",
+	) {
+		t.Fatalf("DispatchOnce error=%v, want nil acquisition rejection", err)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.projectCalls != 0 || st.releaseCalls != 0 {
+		t.Fatalf(
+			"nil acquisition project/release=%d/%d want=0/0",
+			st.projectCalls, st.releaseCalls)
+	}
+}
+
 func TestActionRetryBackoffCapsAtFifteenMinutes(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -292,5 +323,44 @@ func TestActionRetryBackoffCapsAtFifteenMinutes(t *testing.T) {
 				t.Fatalf("backoff=%v want=%v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestActionDispatcherFutureBoundaryIsClampedByStoreDatabaseClock(
+	t *testing.T,
+) {
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate action dispatcher test")
+	}
+	dispatcherPath := filepath.Join(
+		filepath.Dir(testFile), "action_dispatcher.go")
+	dispatcherRaw, err := os.ReadFile(dispatcherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(
+		string(dispatcherRaw),
+		"boundary := time.Now().Add(24 * time.Hour)",
+	); got != 1 {
+		t.Fatalf("future due boundary count=%d want=1", got)
+	}
+
+	storePath := filepath.Clean(filepath.Join(
+		filepath.Dir(testFile), "..", "store", "agent_action_projection.go"))
+	storeRaw, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeSource := string(storeRaw)
+	for queryClamp, want := range map[string]int{
+		"next_attempt_at<=LEAST($1,clock_timestamp())": 1,
+		"next_attempt_at<=LEAST($2,clock_timestamp())": 1,
+	} {
+		if got := strings.Count(storeSource, queryClamp); got != want {
+			t.Fatalf(
+				"database-clock due clamp %q count=%d want=%d",
+				queryClamp, got, want)
+		}
 	}
 }

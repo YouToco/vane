@@ -22,11 +22,11 @@ const (
 	actionReleaseTimeout = 5 * time.Second
 )
 
-// ActionStore is the exact-action durable execution boundary. Its Store
+// actionDispatcherStore is the exact-action durable execution boundary. Its Store
 // implementation independently verifies execution_version=2, the generation-1
 // durable authority event, frozen enable_source bytes, and confirmed status at
 // acquisition and again in the effect transaction.
-type ActionStore interface {
+type actionDispatcherStore interface {
 	ListDueAgentActionContinuationTenantIDs(
 		context.Context, time.Time, int64, int,
 	) ([]int64, error)
@@ -48,7 +48,7 @@ type ActionStore interface {
 // owns one stable process identity, bounded admission, and an explicit
 // Stop/Wait lifecycle so Store cannot close while an admitted effect is live.
 type ActionDispatcher struct {
-	store  ActionStore
+	store  actionDispatcherStore
 	logger *slog.Logger
 	owner  string
 
@@ -62,7 +62,7 @@ type ActionDispatcher struct {
 }
 
 func NewActionDispatcher(
-	st ActionStore,
+	st actionDispatcherStore,
 	logger *slog.Logger,
 ) (*ActionDispatcher, error) {
 	if st == nil {
@@ -255,6 +255,10 @@ func (d *ActionDispatcher) dispatchAction(
 		d.owner, actionLeaseDuration)
 	if err != nil {
 		return err
+	}
+	if action == nil {
+		return errors.New(
+			"agentcontinuation: action acquisition returned no action")
 	}
 	lease, err := action.Lease()
 	if err != nil {
