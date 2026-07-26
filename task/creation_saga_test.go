@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/types"
@@ -646,6 +647,135 @@ func TestCreationCoordinator_ProposalMaterializesVersionedSourceSpecsBeforePersi
 		bytes.Contains(store.definition.FetchPlan, []byte("source_specs")) {
 		t.Fatalf("Confirm must execute the exact frozen plan: result=%+v err=%v activate=%d frozen=%s final=%s",
 			result, err, schedules.activateCalls, frozenPlan, store.definition.FetchPlan)
+	}
+}
+
+func TestCreationCoordinator_ProposalPreservesObservationPolicyAcrossCanonicalReplay(t *testing.T) {
+	store := newCreationSagaFakeStore()
+	schedules := &creationSagaFakeScheduler{}
+	coordinator := NewCreationCoordinator(store, schedules, nil)
+	policy := observation.PolicySpecV1{
+		Schema: observation.SchemaV1,
+		Mode:   observation.ModeEvent,
+		Window: observation.WindowSpecV1{
+			Kind: observation.WindowScheduleInterval,
+		},
+		LatePolicy: observation.LateStrict,
+		Evidence: observation.EvidencePolicyV1{
+			Requirement:     observation.EvidenceOfficialRequired,
+			OfficialDomains: []string{"openai.com"},
+		},
+		UnknownTime: observation.UnknownTimeReject,
+		Event: &observation.EventPolicyV1{
+			Subject:       "OpenAI API",
+			EventKind:     "重大版本发布",
+			Qualification: observation.QualificationAnnouncement,
+		},
+		QualifierPrompt: observation.QualifierPromptV1,
+	}
+	raw := mustMarshal(t, map[string]any{
+		"spec":           map[string]any{"every_seconds": 604800, "tz": "Asia/Shanghai"},
+		"intent":         "仅监控 OpenAI 官方确认的重大 API 更新；没有重要更新就不发送",
+		"nl_description": "每周一上午 9 点检查 OpenAI API 重大更新",
+		"strictness":     "strict",
+		"approved_fetch_plan": map[string]any{
+			"source_specs": map[string]any{
+				"version": creationSourceSpecsVersion,
+				"items": []any{map[string]any{
+					"kind": "web_search", "query": "OpenAI API major updates",
+					"include_domains": []string{"openai.com"},
+				}},
+			},
+		},
+		"observation_policy": policy,
+	})
+
+	_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+		ActionID: "action-observation-policy", UserID: 11, RawArgs: raw,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	command, _, err := normalizeCreateScheduleCommand(store.op.Args)
+	if err != nil {
+		t.Fatalf("normalize durable args: %v", err)
+	}
+	if command.ObservationPolicy == nil ||
+		!bytes.Equal(mustMarshal(t, command.ObservationPolicy), mustMarshal(t, policy)) {
+		t.Fatalf("durable command 丢失 observation_policy: args=%s policy=%+v",
+			store.op.Args, command.ObservationPolicy)
+	}
+	canonicalReplay, err := canonicalCreationProposalArgs(command)
+	if err != nil || !bytes.Equal(canonicalReplay, store.op.Args) {
+		t.Fatalf("canonical replay 漂移: got=%s want=%s err=%v",
+			canonicalReplay, store.op.Args, err)
+	}
+	var equivalent bytes.Buffer
+	if err := json.Indent(&equivalent, store.op.Args, "", "  "); err != nil {
+		t.Fatal(err)
+	}
+	if !creationProposalArgsEqual(store.op.Args, equivalent.Bytes()) {
+		t.Fatal("JSONB 等价重排必须保持 proposal identity")
+	}
+	var changed map[string]any
+	if err := json.Unmarshal(store.op.Args, &changed); err != nil {
+		t.Fatal(err)
+	}
+	changed["observation_policy"].(map[string]any)["unknown_time"] = "deprioritize"
+	if creationProposalArgsEqual(store.op.Args, mustMarshal(t, changed)) {
+		t.Fatal("observation_policy 改变不得被 canonical replay 视为同一 proposal")
+	}
+
+	store.op.CreatedAt = time.Date(2026, 7, 26, 9, 8, 21, 0, time.UTC)
+	result, err := coordinator.Confirm(
+		t.Context(), 11, "action-observation-policy", testCreationReceiptTarget,
+	)
+	if err != nil || result.Status != types.PendingActionStatusExecuted {
+		t.Fatalf("Confirm: result=%+v err=%v", result, err)
+	}
+	var scope compiledTaskScopeV1
+	if err := decodeStrictJSON(store.definition.ScopeJSON, &scope); err != nil {
+		t.Fatalf("decode compiled scope: %v", err)
+	}
+	wantCompiled, err := observation.Compile(policy, store.op.CreatedAt)
+	if err != nil || scope.Observation == nil ||
+		!observationPoliciesEqual(wantCompiled, *scope.Observation) {
+		t.Fatalf("compiled observation_policy 漂移: got=%+v want=%+v err=%v",
+			scope.Observation, wantCompiled, err)
+	}
+}
+
+func TestCreationCoordinator_SourceSpecsRejectUnknownObservationPolicyField(t *testing.T) {
+	store := newCreationSagaFakeStore()
+	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+	raw := json.RawMessage(`{
+		"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},
+		"intent":"监控官方更新",
+		"approved_fetch_plan":{"source_specs":{
+			"version":"vane.source-specs/v1",
+			"items":[{"kind":"web_search","query":"official updates"}]
+		}},
+		"observation_policy":{
+			"schema":"vane.observation-policy/v1",
+			"mode":"content",
+			"window":{"kind":"schedule_interval"},
+			"late_policy":"strict",
+			"evidence":{"requirement":"trusted_allowed"},
+			"unknown_time":"reject",
+			"unexpected":true
+		}
+	}`)
+	_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+		ActionID: "action-unknown-observation-field", UserID: 11, RawArgs: raw,
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if !errors.Is(err, types.ErrValidation) ||
+		!strings.Contains(err.Error(), `unknown field "unexpected"`) ||
+		store.membershipCalls != 0 || store.tenantCalls != 0 ||
+		store.resolveCalls != 0 || store.createCalls != 0 {
+		t.Fatalf("unknown observation field must fail before lookup: err=%v store=%+v",
+			err, store)
 	}
 }
 

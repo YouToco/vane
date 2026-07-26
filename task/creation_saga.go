@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/sourcespec"
@@ -1265,6 +1266,7 @@ type createScheduleProposalArgs struct {
 	NLDescription     string                           `json:"nl_description"`
 	Strictness        types.PushStrictness             `json:"strictness"`
 	ApprovedFetchPlan *createScheduleProposalFetchPlan `json:"approved_fetch_plan"`
+	ObservationPolicy *observation.PolicySpecV1        `json:"observation_policy,omitempty"`
 }
 
 type createScheduleProposalFetchPlan struct {
@@ -1286,6 +1288,7 @@ type createScheduleProposalExactEnvelope struct {
 	NLDescription     json.RawMessage `json:"nl_description,omitempty"`
 	Strictness        json.RawMessage `json:"strictness,omitempty"`
 	ApprovedFetchPlan json.RawMessage `json:"approved_fetch_plan,omitempty"`
+	ObservationPolicy json.RawMessage `json:"observation_policy,omitempty"`
 }
 
 func creationProposalHasTransientField(raw json.RawMessage) bool {
@@ -1343,12 +1346,27 @@ func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArg
 			return nil, fmt.Errorf("task: decode create_schedule strictness: %w", err)
 		}
 	}
+	if len(envelope.ObservationPolicy) != 0 {
+		if isExplicitJSONNull(envelope.ObservationPolicy) {
+			return nil, errors.New("task: observation_policy must be an object")
+		}
+		if err := decodeStrictJSON(
+			envelope.ObservationPolicy,
+			&args.ObservationPolicy,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"task: decode create_schedule observation_policy: %w",
+				err,
+			)
+		}
+	}
 	// Preserve the legacy common-envelope precedence before inspecting any
 	// transient plan structure. Invalid spec/intent/strictness must win over a
 	// bad source_specs version, empty items, or invalid existing IDs.
 	if _, err := normalizeCreateScheduleEnvelope(&createScheduleCommandArgs{
 		Spec: args.Spec, Intent: args.Intent,
 		NLDescription: args.NLDescription, Strictness: args.Strictness,
+		ObservationPolicy: args.ObservationPolicy,
 	}); err != nil {
 		return nil, err
 	}
@@ -1744,6 +1762,7 @@ func normalizeExpandedCreationProposal(
 		Spec: proposal.Spec, Intent: proposal.Intent,
 		NLDescription: proposal.NLDescription, Strictness: proposal.Strictness,
 		ApprovedFetchPlan: fullPlan,
+		ObservationPolicy: proposal.ObservationPolicy,
 	})
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, fmt.Errorf(
@@ -1844,15 +1863,17 @@ func canonicalCreationProposalArgs(
 	command normalizedCreateScheduleCommand,
 ) (json.RawMessage, error) {
 	args := struct {
-		Spec              scheduler.ScheduleSpec `json:"spec"`
-		Intent            string                 `json:"intent"`
-		NLDescription     string                 `json:"nl_description"`
-		Strictness        types.PushStrictness   `json:"strictness"`
-		ApprovedFetchPlan json.RawMessage        `json:"approved_fetch_plan"`
+		Spec              scheduler.ScheduleSpec    `json:"spec"`
+		Intent            string                    `json:"intent"`
+		NLDescription     string                    `json:"nl_description"`
+		Strictness        types.PushStrictness      `json:"strictness"`
+		ApprovedFetchPlan json.RawMessage           `json:"approved_fetch_plan"`
+		ObservationPolicy *observation.PolicySpecV1 `json:"observation_policy,omitempty"`
 	}{
 		Spec: command.Spec, Intent: command.Intent,
 		NLDescription: command.NLDescription, Strictness: command.Strictness,
 		ApprovedFetchPlan: bytes.Clone(command.ApprovedFetchPlan),
+		ObservationPolicy: command.ObservationPolicy,
 	}
 	canonical, err := json.Marshal(args)
 	if err != nil {
@@ -1862,10 +1883,18 @@ func canonicalCreationProposalArgs(
 	if err != nil {
 		return nil, fmt.Errorf("verify canonical proposal args: %w", err)
 	}
+	verificationPolicy, verificationPolicyErr := json.Marshal(
+		verification.ObservationPolicy,
+	)
+	commandPolicy, commandPolicyErr := json.Marshal(command.ObservationPolicy)
+	if verificationPolicyErr != nil || commandPolicyErr != nil {
+		return nil, errors.New("canonical proposal args changed the observation policy")
+	}
 	if verification.Version != command.Version || verification.Spec != command.Spec ||
 		verification.Intent != command.Intent ||
 		verification.NLDescription != command.NLDescription ||
 		verification.Strictness != command.Strictness ||
+		!bytes.Equal(verificationPolicy, commandPolicy) ||
 		!bytes.Equal(verification.ApprovedFetchPlan, command.ApprovedFetchPlan) {
 		return nil, errors.New("canonical proposal args changed the approved command")
 	}
