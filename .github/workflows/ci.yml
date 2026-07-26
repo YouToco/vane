@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64, vane-ci]
 
     services:
       postgres:
@@ -48,7 +48,7 @@ jobs:
 
   deploy:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64, vane-ci]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     # 串行化对同一台 VPS 的部署。无此 group 时，相近时间 push main（如一个 release
