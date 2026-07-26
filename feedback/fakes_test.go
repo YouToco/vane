@@ -406,8 +406,9 @@ func (s *fakeSender) canceledCount() int {
 }
 
 type notice struct {
-	userID int64
-	text   string
+	userID         int64
+	sourceIdentity string
+	text           string
 }
 
 type fakeNotifier struct {
@@ -415,10 +416,17 @@ type fakeNotifier struct {
 	notices []notice
 }
 
-func (n *fakeNotifier) NotifyEvent(_ context.Context, userID int64, text string) {
+func (n *fakeNotifier) NotifyEvent(
+	_ context.Context,
+	userID int64,
+	sourceIdentity string,
+	text string,
+) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.notices = append(n.notices, notice{userID: userID, text: text})
+	n.notices = append(n.notices, notice{
+		userID: userID, sourceIdentity: sourceIdentity, text: text,
+	})
 }
 
 func (n *fakeNotifier) all() []notice {

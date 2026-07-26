@@ -136,6 +136,75 @@ func TestProjectionDigestDoesNotExposeBodiesInErrors(t *testing.T) {
 	}
 }
 
+func TestAppendProjectionMessagesTruncatesAtUserBoundary(t *testing.T) {
+	messages := make([]map[string]string, 60)
+	for i := range messages {
+		role := "assistant"
+		if i%3 == 0 {
+			role = "user"
+		}
+		messages[i] = map[string]string{
+			"role": role, "content": string(rune('a' + i%26)),
+		}
+	}
+	current, err := json.Marshal(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := AppendProjectionMessages(
+		current,
+		json.RawMessage(`[{"role":"user","content":"callback"}]`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projected []map[string]any
+	if err := json.Unmarshal(got, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if len(projected) > 41 {
+		t.Fatalf("truncated message count=%d want <=41", len(projected))
+	}
+	if projected[0]["role"] != "user" ||
+		projected[0]["content"] != messages[0]["content"] {
+		t.Fatalf("first user intent not preserved: %#v", projected[0])
+	}
+	if projected[1]["role"] != "user" {
+		t.Fatalf("recent boundary role=%v want user", projected[1]["role"])
+	}
+	if projected[len(projected)-1]["content"] != "callback" {
+		t.Fatalf("callback not retained: %#v", projected[len(projected)-1])
+	}
+}
+
+func TestProjectionSnapshotTurnID(t *testing.T) {
+	batch := mustProjectionBatch(t, ProjectionSnapshotInput{
+		Scope:    Scope{TenantID: 1, UserID: 2, SessionID: 3},
+		TurnID:   "side-request-1",
+		Messages: json.RawMessage(`[{"role":"user","content":"callback"}]`),
+	})
+	canonical, err := Canonicalize(batch.Events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ProjectionSnapshotTurnID(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "side-request-1" {
+		t.Fatalf("turn id=%q want side-request-1", got)
+	}
+}
+
+func TestAppendProjectionMessagesRejectsEmptyAppend(t *testing.T) {
+	if _, err := AppendProjectionMessages(
+		json.RawMessage(`[{"role":"user","content":"existing"}]`),
+		json.RawMessage(`[]`),
+	); !errors.Is(err, ErrInvalidProjection) {
+		t.Fatalf("empty append error=%v, want ErrInvalidProjection", err)
+	}
+}
+
 func mustProjectionBatch(
 	t *testing.T,
 	input ProjectionSnapshotInput,

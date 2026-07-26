@@ -206,8 +206,11 @@ func TestCommitAgentSessionTurnAtomicProjectionAndShadowResync(t *testing.T) {
 	callback := json.RawMessage(
 		`[{"role":"user","content":"[卡片回调] resolved"}]`,
 	)
-	if err := f.store.AppendAgentSessionMessages(
-		ctx, f.sessionA, callback,
+	if _, err := f.store.pool.Exec(ctx,
+		`UPDATE agent_sessions
+		    SET messages=messages || $2::jsonb
+		  WHERE id=$1`,
+		f.sessionA, callback,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -266,6 +269,262 @@ func TestCommitAgentSessionTurnAtomicProjectionAndShadowResync(t *testing.T) {
 	}
 	if gotDigest != wantDigest {
 		t.Fatalf("event projection digest=%s want=%s", gotDigest, wantDigest)
+	}
+}
+
+func TestCommitAgentSessionAppendExactReplayTruncationAndScope(t *testing.T) {
+	f := newAgentEventFixture(t)
+	ctx := t.Context()
+	messages := make([]map[string]string, 60)
+	for i := range messages {
+		role := "assistant"
+		if i%3 == 0 {
+			role = "user"
+		}
+		messages[i] = map[string]string{
+			"role": role, "content": fmt.Sprintf("message-%d", i),
+		}
+	}
+	current, err := json.Marshal(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `
+		UPDATE agent_sessions
+		   SET messages=$2,turn_count=9,
+		       activated_tools='["endpoint-a"]'::jsonb
+		 WHERE id=$1 /* controlled truncation fixture */`,
+		f.sessionA, current,
+	); err != nil {
+		t.Fatal(err)
+	}
+	appended := json.RawMessage(
+		`[{"role":"user","content":"[卡片回调] exact"}]`,
+	)
+	first, err := f.store.CommitAgentSessionAppend(
+		ctx, f.userA, f.sessionA, "card-callback:execute:action-1", appended,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Match || first.PriorState != "uninitialized" {
+		t.Fatalf("first side-writer audit=%+v", first)
+	}
+	var stored []map[string]any
+	var turnCount int
+	var activated []string
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT messages,turn_count,activated_tools
+		   FROM agent_sessions WHERE id=$1`,
+		f.sessionA,
+	).Scan(&stored, &turnCount, &activated); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) > 41 ||
+		stored[0]["content"] != "message-0" ||
+		stored[len(stored)-1]["content"] != "[卡片回调] exact" {
+		t.Fatalf("side-writer truncation=%+v", stored)
+	}
+	if turnCount != 9 || !slices.Equal(activated, []string{"endpoint-a"}) {
+		t.Fatalf("side writer changed retained state: turn=%d tools=%v",
+			turnCount, activated)
+	}
+	var firstEventCount int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3`,
+		f.tenantA, f.userA, f.sessionA,
+	).Scan(&firstEventCount); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := f.store.CommitAgentSessionAppend(
+		ctx, f.userA, f.sessionA, "card-callback:execute:action-1", appended,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replay.Match {
+		t.Fatalf("replay audit=%+v", replay)
+	}
+	var replayEventCount int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3`,
+		f.tenantA, f.userA, f.sessionA,
+	).Scan(&replayEventCount); err != nil {
+		t.Fatal(err)
+	}
+	if replayEventCount != firstEventCount {
+		t.Fatalf("replay appended events: before=%d after=%d",
+			firstEventCount, replayEventCount)
+	}
+	later := json.RawMessage(
+		`[{"role":"user","content":"later generation"}]`,
+	)
+	if _, err := f.store.CommitAgentSessionAppend(
+		ctx, f.userA, f.sessionA, "feedback-click:2", later,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var afterLaterEventCount int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3`,
+		f.tenantA, f.userA, f.sessionA,
+	).Scan(&afterLaterEventCount); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.CommitAgentSessionAppend(
+		ctx, f.userA, f.sessionA, "card-callback:execute:action-1", appended,
+	); err != nil {
+		t.Fatalf("older exact replay after later generation: %v", err)
+	}
+	var afterOlderReplay []map[string]any
+	var afterOlderReplayEventCount int
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT messages FROM agent_sessions WHERE id=$1`,
+		f.sessionA,
+	).Scan(&afterOlderReplay); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_events
+		  WHERE tenant_id=$1 AND user_id=$2 AND session_id=$3`,
+		f.tenantA, f.userA, f.sessionA,
+	).Scan(&afterOlderReplayEventCount); err != nil {
+		t.Fatal(err)
+	}
+	if afterOlderReplay[len(afterOlderReplay)-1]["content"] !=
+		"later generation" {
+		t.Fatalf("older replay overwrote later projection: %+v",
+			afterOlderReplay)
+	}
+	if afterOlderReplayEventCount != afterLaterEventCount {
+		t.Fatalf("older replay appended events: before=%d after=%d",
+			afterLaterEventCount, afterOlderReplayEventCount)
+	}
+	secret := "changed-body-must-not-leak"
+	_, err = f.store.CommitAgentSessionAppend(
+		ctx,
+		f.userA,
+		f.sessionA,
+		"card-callback:execute:action-1",
+		json.RawMessage(
+			`[{"role":"user","content":"`+secret+`"}]`,
+		),
+	)
+	if !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("changed replay error=%v, want conflict", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("changed replay leaked message content: %v", err)
+	}
+	if _, err := f.store.CommitAgentSessionAppend(
+		ctx, f.userB, f.sessionA, "feedback-click:1", appended,
+	); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("cross-tenant/user append error=%v, want not found", err)
+	}
+}
+
+func TestCommitAgentSessionAppendAtomicResponseLossAndPreCommitFailure(
+	t *testing.T,
+) {
+	t.Run("commit response loss retains both projections exactly once",
+		func(t *testing.T) {
+			f := newAgentEventFixture(t)
+			ctx := t.Context()
+			messages := json.RawMessage(
+				`[{"role":"user","content":"response lost"}]`,
+			)
+			lost := storeWithCommitResponseLost(f.store)
+			if _, err := lost.CommitAgentSessionAppend(
+				ctx,
+				f.userA,
+				f.sessionA,
+				"feedback-click:response-loss",
+				messages,
+			); !errors.Is(err, types.ErrDatabase) {
+				t.Fatalf("commit response loss error=%v, want database", err)
+			}
+			assertAgentSessionAppendState(
+				t, f, "[{\"content\":\"response lost\",\"role\":\"user\"}]", 3,
+			)
+			if _, err := f.store.CommitAgentSessionAppend(
+				ctx,
+				f.userA,
+				f.sessionA,
+				"feedback-click:response-loss",
+				messages,
+			); err != nil {
+				t.Fatalf("response-loss exact replay: %v", err)
+			}
+			assertAgentSessionAppendState(
+				t, f, "[{\"content\":\"response lost\",\"role\":\"user\"}]", 3,
+			)
+		},
+	)
+	t.Run("pre-commit event failure rolls back both projections",
+		func(t *testing.T) {
+			f := newAgentEventFixture(t)
+			ctx := t.Context()
+			faultStore := *f.store
+			faultStore.beginTx = func(
+				ctx context.Context,
+				options pgx.TxOptions,
+			) (pgx.Tx, error) {
+				tx, err := f.store.pool.BeginTx(ctx, options)
+				if err != nil {
+					return nil, err
+				}
+				return &failSecondAgentEventInsertTx{Tx: tx}, nil
+			}
+			if _, err := faultStore.CommitAgentSessionAppend(
+				ctx,
+				f.userA,
+				f.sessionA,
+				"feedback-click:pre-commit-failure",
+				json.RawMessage(
+					`[{"role":"user","content":"must roll back"}]`,
+				),
+			); !errors.Is(err, types.ErrDatabase) {
+				t.Fatalf("pre-commit failure error=%v, want database", err)
+			}
+			assertAgentSessionAppendState(t, f, "[]", 0)
+		},
+	)
+}
+
+func assertAgentSessionAppendState(
+	t *testing.T,
+	f agentEventFixture,
+	wantMessages string,
+	wantEvents int,
+) {
+	t.Helper()
+	var messages json.RawMessage
+	var eventCount int
+	if err := f.store.pool.QueryRow(t.Context(), `
+		SELECT messages,
+		       (SELECT count(*) FROM agent_events
+		         WHERE tenant_id=$2 AND user_id=$3 AND session_id=$1)
+		  FROM agent_sessions
+		 WHERE id=$1`,
+		f.sessionA, f.tenantA, f.userA,
+	).Scan(&messages, &eventCount); err != nil {
+		t.Fatal(err)
+	}
+	var got, want any
+	if err := json.Unmarshal(messages, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(wantMessages), &want); err != nil {
+		t.Fatal(err)
+	}
+	gotWire, _ := json.Marshal(got)
+	wantWire, _ := json.Marshal(want)
+	if string(gotWire) != string(wantWire) || eventCount != wantEvents {
+		t.Fatalf("append state messages=%s events=%d want=%s/%d",
+			gotWire, eventCount, wantWire, wantEvents)
 	}
 }
 
@@ -333,8 +592,11 @@ func TestCommitAgentSessionTurnRejectsStaleBaseProjection(t *testing.T) {
 	callback := json.RawMessage(
 		`[{"role":"user","content":"[卡片回调] concurrent"}]`,
 	)
-	if err := f.store.AppendAgentSessionMessages(
-		ctx, f.sessionA, callback,
+	if _, err := f.store.pool.Exec(ctx,
+		`UPDATE agent_sessions
+		    SET messages=messages || $2::jsonb
+		  WHERE id=$1`,
+		f.sessionA, callback,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1278,6 +1540,12 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 	repoRoot := filepath.Clean(filepath.Dir(storeDir))
 	provider := filepath.Join(storeDir, "agent_events.go")
 	agentLoop := filepath.Join(repoRoot, "agent", "loop.go")
+	creationReceipts := filepath.Join(
+		storeDir, "task_creation_receipts.go",
+	)
+	definitionReceipts := filepath.Join(
+		storeDir, "task_definition_edit_receipts.go",
+	)
 	fset := token.NewFileSet()
 	var violations []string
 	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, walkErr error) error {
@@ -1311,6 +1579,24 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 			if err != nil {
 				return err
 			}
+		} else if filepath.Clean(path) == creationReceipts {
+			allowed, err = agentEventLedgerReceiptHelperReferences(
+				file,
+				"RecordTaskCreationReceiptSessionMessages",
+				2,
+			)
+			if err != nil {
+				return err
+			}
+		} else if filepath.Clean(path) == definitionReceipts {
+			allowed, err = agentEventLedgerReceiptHelperReferences(
+				file,
+				"RecordTaskDefinitionEditReceiptSessionMessages",
+				2,
+			)
+			if err != nil {
+				return err
+			}
 		}
 		violations = append(
 			violations,
@@ -1334,7 +1620,7 @@ func TestAgentEventLedgerProductionCallBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(violations) != 0 {
-		t.Fatalf("7.7-B permits only normal Agent turn dual-write:\n%s",
+		t.Fatalf("7.7-B2 permits only the exact Agent session write boundaries:\n%s",
 			strings.Join(violations, "\n"))
 	}
 }
@@ -1352,13 +1638,25 @@ func sameNameWrapper() { AppendAgentEvents() }
 func escapedCommit(s interface{ CommitAgentSessionTurn() }) {
 	s.CommitAgentSessionTurn()
 }
+func escapedSideWriter(s interface{ CommitAgentSessionAppend() }) {
+	s.CommitAgentSessionAppend()
+}
+func resurrectLegacyAppend(s interface{ AppendAgentSessionMessages() }) {
+	s.AppendAgentSessionMessages()
+}
+func resurrectProjectionOverwrite(s interface{ UpdateAgentSession() }) {
+	s.UpdateAgentSession()
+}
+func escapedPrivateHelper() { commitAgentSessionAppendTx() }
+var helperByName = "commitAgentSessionAppendTx"
+var overwriteByName = "UpdateAgentSession"
 var byName = "ListAgentEvents"
 `, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	violations := agentEventLedgerForbiddenReferences(fset, file, nil)
-	if len(violations) < 6 {
+	if len(violations) < 15 {
 		t.Fatalf("method value/interface/wrapper escaped guard: %v", violations)
 	}
 }
@@ -1371,9 +1669,23 @@ type Store struct{}
 func (s *Store) AppendAgentEvents() {}
 func (s *Store) ListAgentEvents() {}
 func (s *Store) ReplayAgentEvents() {}
-func (s *Store) CommitAgentSessionTurn() {}
+func (s *Store) CommitAgentSessionTurn() {
+	_ = "UPDATE agent_sessions SET messages=$1,turn_count=$2,activated_tools=$3"
+}
+func (s *Store) CommitAgentSessionAppend() {
+	commitAgentSessionAppendTx()
+}
+func commitAgentSessionAppendTx() {
+	_ = "UPDATE agent_sessions SET messages=$1"
+}
 func (s *Store) hiddenAppendWrapper() {
 	s.AppendAgentEvents()
+}
+func hiddenSideWriterWrapper() {
+	commitAgentSessionAppendTx()
+}
+func hiddenProjectionSQL() {
+	_ = "UPDATE agent_sessions SET messages='[]'"
 }
 `, 0)
 	if err != nil {
@@ -1386,8 +1698,57 @@ func (s *Store) hiddenAppendWrapper() {
 	violations := agentEventLedgerForbiddenReferences(fset, file, allowed)
 	if !slices.ContainsFunc(violations, func(violation string) bool {
 		return strings.Contains(violation, "AppendAgentEvents")
+	}) || !slices.ContainsFunc(violations, func(violation string) bool {
+		return strings.Contains(violation, "commitAgentSessionAppendTx")
+	}) || !slices.ContainsFunc(violations, func(violation string) bool {
+		return strings.Contains(
+			violation, "Agent session projection SQL write",
+		)
 	}) {
 		t.Fatalf("provider-local wrapper escaped zero-call guard: %v", violations)
+	}
+}
+
+func TestAgentEventLedgerGuardCatchesReceiptHelperEscape(t *testing.T) {
+	t.Parallel()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(
+		fset,
+		"task_creation_receipts.go",
+		`package store
+type Store struct{}
+func (s *Store) RecordTaskCreationReceiptSessionMessages() {
+	commitAgentSessionAppendTx()
+	commitAgentSessionAppendTx()
+	alias := commitAgentSessionAppendTx
+	_ = alias
+}
+func receiptHelperWrapper() {
+	commitAgentSessionAppendTx()
+}
+var helperName = "commitAgentSessionAppendTx"
+`,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed, err := agentEventLedgerReceiptHelperReferences(
+		file,
+		"RecordTaskCreationReceiptSessionMessages",
+		2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations := agentEventLedgerForbiddenReferences(
+		fset, file, allowed,
+	)
+	if len(violations) < 3 {
+		t.Fatalf(
+			"receipt helper method value/wrapper/dynamic string escaped guard: %v",
+			violations,
+		)
 	}
 }
 
@@ -1433,10 +1794,14 @@ func agentEventLedgerForbiddenReferences(
 	allowed map[token.Pos]struct{},
 ) []string {
 	sensitive := map[string]struct{}{
-		"AppendAgentEvents":      {},
-		"ListAgentEvents":        {},
-		"ReplayAgentEvents":      {},
-		"CommitAgentSessionTurn": {},
+		"AppendAgentEvents":          {},
+		"ListAgentEvents":            {},
+		"ReplayAgentEvents":          {},
+		"CommitAgentSessionTurn":     {},
+		"CommitAgentSessionAppend":   {},
+		"AppendAgentSessionMessages": {},
+		"commitAgentSessionAppendTx": {},
+		"UpdateAgentSession":         {},
 	}
 	var violations []string
 	ast.Inspect(file, func(node ast.Node) bool {
@@ -1457,20 +1822,42 @@ func agentEventLedgerForbiddenReferences(
 					fmt.Sprintf("%s: forbidden dynamic Agent event ledger reference %s",
 						fset.Position(typed.Pos()), value))
 			}
+			if agentSessionProjectionSQLWrite(value) {
+				if _, ok := allowed[typed.Pos()]; !ok {
+					violations = append(violations,
+						fmt.Sprintf(
+							"%s: forbidden direct Agent session projection SQL write",
+							fset.Position(typed.Pos()),
+						))
+				}
+			}
 		}
 		return true
 	})
 	return violations
 }
 
+func agentSessionProjectionSQLWrite(value string) bool {
+	normalized := strings.ToLower(
+		strings.Join(strings.Fields(value), " "),
+	)
+	if !strings.Contains(normalized, "update agent_sessions") {
+		return false
+	}
+	return strings.Contains(normalized, "messages") ||
+		strings.Contains(normalized, "turn_count") ||
+		strings.Contains(normalized, "activated_tools")
+}
+
 func agentEventLedgerProviderDeclarations(
 	file *ast.File,
 ) (map[token.Pos]struct{}, error) {
 	want := map[string]int{
-		"AppendAgentEvents":      0,
-		"ListAgentEvents":        0,
-		"ReplayAgentEvents":      0,
-		"CommitAgentSessionTurn": 0,
+		"AppendAgentEvents":        0,
+		"ListAgentEvents":          0,
+		"ReplayAgentEvents":        0,
+		"CommitAgentSessionTurn":   0,
+		"CommitAgentSessionAppend": 0,
 	}
 	allowed := make(map[token.Pos]struct{}, len(want))
 	for _, declaration := range file.Decls {
@@ -1499,17 +1886,129 @@ func agentEventLedgerProviderDeclarations(
 			)
 		}
 	}
+	helperDeclarations := 0
+	providerCalls := 0
+	projectionSQLWrites := 0
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if function.Name.Name == "commitAgentSessionAppendTx" {
+			if function.Recv != nil {
+				return nil, errors.New(
+					"Agent session append helper must remain package-private",
+				)
+			}
+			helperDeclarations++
+			allowed[function.Name.Pos()] = struct{}{}
+		}
+		if (function.Name.Name == "CommitAgentSessionTurn" ||
+			function.Name.Name == "commitAgentSessionAppendTx") &&
+			function.Body != nil {
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				literal, ok := node.(*ast.BasicLit)
+				if !ok {
+					return true
+				}
+				value := strings.Trim(literal.Value, "`\"")
+				if !agentSessionProjectionSQLWrite(value) {
+					return true
+				}
+				projectionSQLWrites++
+				allowed[literal.Pos()] = struct{}{}
+				return true
+			})
+		}
+		if function.Name.Name != "CommitAgentSessionAppend" ||
+			function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			helper, ok := call.Fun.(*ast.Ident)
+			if !ok || helper.Name != "commitAgentSessionAppendTx" {
+				return true
+			}
+			providerCalls++
+			allowed[helper.Pos()] = struct{}{}
+			return true
+		})
+	}
+	if helperDeclarations != 1 || providerCalls != 1 ||
+		projectionSQLWrites != 2 {
+		return nil, fmt.Errorf(
+			"Agent session provider helper declarations/calls/SQL writes=%d/%d/%d, want 1/1/2",
+			helperDeclarations, providerCalls, projectionSQLWrites,
+		)
+	}
+	return allowed, nil
+}
+
+func agentEventLedgerReceiptHelperReferences(
+	file *ast.File,
+	functionName string,
+	expectedCalls int,
+) (map[token.Pos]struct{}, error) {
+	allowed := make(map[token.Pos]struct{}, expectedCalls)
+	var target *ast.FuncDecl
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != functionName {
+			continue
+		}
+		if target != nil {
+			return nil, fmt.Errorf(
+				"receipt helper boundary %s is duplicated", functionName,
+			)
+		}
+		target = function
+	}
+	if target == nil || target.Body == nil ||
+		target.Recv == nil || len(target.Recv.List) != 1 ||
+		!agentEventLedgerStoreReceiver(target.Recv.List[0].Type) {
+		return nil, fmt.Errorf(
+			"receipt helper boundary %s must remain a Store method",
+			functionName,
+		)
+	}
+	directCalls := 0
+	ast.Inspect(target.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		helper, ok := call.Fun.(*ast.Ident)
+		if !ok || helper.Name != "commitAgentSessionAppendTx" {
+			return true
+		}
+		directCalls++
+		allowed[helper.Pos()] = struct{}{}
+		return true
+	})
+	if directCalls != expectedCalls {
+		return nil, fmt.Errorf(
+			"receipt boundary %s must directly call commitAgentSessionAppendTx %d times, got %d",
+			functionName, expectedCalls, directCalls,
+		)
+	}
 	return allowed, nil
 }
 
 func agentEventLedgerAgentLoopReferences(
 	file *ast.File,
 ) (map[token.Pos]struct{}, error) {
-	const name = "CommitAgentSessionTurn"
-	allowed := make(map[token.Pos]struct{}, 2)
+	boundaries := map[string]string{
+		"CommitAgentSessionTurn":   "saveSession",
+		"CommitAgentSessionAppend": "appendCardCallback",
+	}
+	allowed := make(map[token.Pos]struct{}, 6)
 
-	interfaceFields := 0
-	var saveSession *ast.FuncDecl
+	interfaceFields := make(map[string]int, len(boundaries))
+	functions := make(map[string]*ast.FuncDecl, len(boundaries)+1)
 	for _, declaration := range file.Decls {
 		switch typed := declaration.(type) {
 		case *ast.GenDecl:
@@ -1528,8 +2027,11 @@ func agentEventLedgerAgentLoopReferences(
 					)
 				}
 				for _, field := range interfaceType.Methods.List {
-					if len(field.Names) != 1 ||
-						field.Names[0].Name != name {
+					if len(field.Names) != 1 {
+						continue
+					}
+					name := field.Names[0].Name
+					if _, guarded := boundaries[name]; !guarded {
 						continue
 					}
 					if _, ok := field.Type.(*ast.FuncType); !ok {
@@ -1537,50 +2039,88 @@ func agentEventLedgerAgentLoopReferences(
 							"Agent loop ledger boundary must be a method field",
 						)
 					}
-					interfaceFields++
+					interfaceFields[name]++
 					allowed[field.Names[0].Pos()] = struct{}{}
 				}
 			}
 		case *ast.FuncDecl:
-			if typed.Name.Name == "saveSession" {
-				if saveSession != nil {
+			if typed.Name.Name == "saveSession" ||
+				typed.Name.Name == "appendCardCallback" ||
+				typed.Name.Name == "NotifyEvent" {
+				if functions[typed.Name.Name] != nil {
 					return nil, errors.New(
-						"Agent loop must declare saveSession exactly once",
+						"Agent loop guarded function is duplicated",
 					)
 				}
-				saveSession = typed
+				functions[typed.Name.Name] = typed
 			}
 		}
 	}
-	if interfaceFields != 1 {
-		return nil, fmt.Errorf(
-			"Agent loop Store must declare %s exactly once, got %d",
-			name, interfaceFields,
-		)
-	}
-	if saveSession == nil || saveSession.Body == nil {
-		return nil, errors.New("Agent loop saveSession is unavailable")
-	}
-	if saveSession.Recv == nil || len(saveSession.Recv.List) != 1 ||
-		len(saveSession.Recv.List[0].Names) != 1 ||
-		saveSession.Recv.List[0].Names[0].Name != "l" ||
-		!agentEventLedgerLoopReceiver(saveSession.Recv.List[0].Type) {
-		return nil, errors.New(
-			"Agent loop saveSession must remain a method on receiver l *Loop",
-		)
-	}
-
-	directCalls := 0
-	ast.Inspect(saveSession.Body, func(node ast.Node) bool {
-		if _, nestedFunction := node.(*ast.FuncLit); nestedFunction {
-			return false
+	for name, functionName := range boundaries {
+		if interfaceFields[name] != 1 {
+			return nil, fmt.Errorf(
+				"Agent loop Store must declare %s exactly once, got %d",
+				name, interfaceFields[name],
+			)
 		}
+		function := functions[functionName]
+		if function == nil || function.Body == nil {
+			return nil, fmt.Errorf(
+				"Agent loop %s is unavailable", functionName,
+			)
+		}
+		if function.Recv == nil || len(function.Recv.List) != 1 ||
+			len(function.Recv.List[0].Names) != 1 ||
+			function.Recv.List[0].Names[0].Name != "l" ||
+			!agentEventLedgerLoopReceiver(function.Recv.List[0].Type) {
+			return nil, fmt.Errorf(
+				"Agent loop %s must remain a method on receiver l *Loop",
+				functionName,
+			)
+		}
+		directCalls := 0
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			method, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || method.Sel.Name != name {
+				return true
+			}
+			store, ok := method.X.(*ast.SelectorExpr)
+			if !ok || store.Sel.Name != "store" {
+				return true
+			}
+			receiver, ok := store.X.(*ast.Ident)
+			if !ok || receiver.Name != "l" {
+				return true
+			}
+			directCalls++
+			allowed[method.Sel.Pos()] = struct{}{}
+			return true
+		})
+		if directCalls != 1 {
+			return nil, fmt.Errorf(
+				"Agent loop %s must directly call l.store.%s exactly once, got %d",
+				functionName, name, directCalls,
+			)
+		}
+	}
+	// NotifyEvent shares the same exact append boundary and must contain one
+	// direct call; allow only that second selector occurrence.
+	notify := functions["NotifyEvent"]
+	if notify == nil || notify.Body == nil {
+		return nil, errors.New("Agent loop NotifyEvent is unavailable")
+	}
+	notifyCalls := 0
+	ast.Inspect(notify.Body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
 		method, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || method.Sel.Name != name {
+		if !ok || method.Sel.Name != "CommitAgentSessionAppend" {
 			return true
 		}
 		store, ok := method.X.(*ast.SelectorExpr)
@@ -1591,14 +2131,14 @@ func agentEventLedgerAgentLoopReferences(
 		if !ok || receiver.Name != "l" {
 			return true
 		}
-		directCalls++
+		notifyCalls++
 		allowed[method.Sel.Pos()] = struct{}{}
 		return true
 	})
-	if directCalls != 1 {
+	if notifyCalls != 1 {
 		return nil, fmt.Errorf(
-			"Agent loop saveSession must directly call l.store.%s exactly once, got %d",
-			name, directCalls,
+			"Agent loop NotifyEvent must directly call l.store.CommitAgentSessionAppend exactly once, got %d",
+			notifyCalls,
 		)
 	}
 	return allowed, nil

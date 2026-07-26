@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -17,9 +18,10 @@ import (
 )
 
 const (
-	maxAgentEventBatchSize = 64
-	maxAgentEventListSize  = 200
-	maxAgentEventKeyBytes  = 255
+	maxAgentEventBatchSize          = 64
+	maxAgentEventListSize           = 200
+	maxAgentEventKeyBytes           = 255
+	maxAgentSideWriterIdentityBytes = 512
 )
 
 const agentEventColumns = `id, tenant_id, user_id, session_id, sequence,
@@ -367,6 +369,263 @@ func (s *Store) CommitAgentSessionTurn(
 	return audit, nil
 }
 
+// CommitAgentSessionAppend atomically appends one side-writer message batch to
+// the retained agent_sessions primary projection and records a complete ledger
+// snapshot. The durable operation identity, not message content or wall time,
+// owns idempotency; the request-bound turn identity detects a changed body.
+func (s *Store) CommitAgentSessionAppend(
+	ctx context.Context,
+	userID int64,
+	sessionID int64,
+	operationIdentity string,
+	messages json.RawMessage,
+) (agentledger.ProjectionShadowAudit, error) {
+	if userID <= 0 || sessionID <= 0 {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventValidationError("agent session append scope is invalid")
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventDatabaseError("begin agent session append transaction", err)
+	}
+	defer func() {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+	}()
+	scope, err := resolveAgentEventSessionScope(
+		ctx, tx, userID, sessionID,
+	)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, err
+	}
+	if err := setAgentEventRuntimeContext(ctx, tx, scope.TenantID); err != nil {
+		return agentledger.ProjectionShadowAudit{}, err
+	}
+	audit, _, err := commitAgentSessionAppendTx(
+		ctx, tx, scope.TenantID, scope.UserID, scope.SessionID,
+		operationIdentity, messages, false,
+	)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return agentledger.ProjectionShadowAudit{},
+			agentEventDatabaseError("commit agent session append transaction", err)
+	}
+	return audit, nil
+}
+
+func commitAgentSessionAppendTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID int64,
+	userID int64,
+	sessionID int64,
+	operationIdentity string,
+	messages json.RawMessage,
+	replayOnly bool,
+) (agentledger.ProjectionShadowAudit, bool, error) {
+	scope := agentledger.Scope{
+		TenantID: tenantID, UserID: userID, SessionID: sessionID,
+	}
+	if err := validateAgentEventScope(scope); err != nil {
+		return agentledger.ProjectionShadowAudit{}, false, err
+	}
+	idempotencyKey, turnID, err := agentSessionAppendIdentity(
+		operationIdentity, messages,
+	)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false, err
+	}
+	current, err := loadAgentSessionProjectionForUpdate(ctx, tx, scope)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false, err
+	}
+	beforeEvents, err := loadCompleteAgentEventLedger(ctx, tx, scope)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false, err
+	}
+	priorState := comparePriorAgentSessionProjection(current, beforeEvents)
+	existing, err := loadAgentEventBatch(
+		ctx, tx, scope, idempotencyKey,
+	)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false, err
+	}
+	if len(existing) > 0 {
+		canonical, err := validateStoredAgentEventBatch(existing)
+		if err != nil {
+			return agentledger.ProjectionShadowAudit{}, false, err
+		}
+		storedTurnID, err := agentledger.ProjectionSnapshotTurnID(canonical[0])
+		if err != nil ||
+			subtle.ConstantTimeCompare(
+				[]byte(storedTurnID), []byte(turnID),
+			) != 1 {
+			return agentledger.ProjectionShadowAudit{}, false,
+				agentEventConflict()
+		}
+		audit, err := auditAgentSessionProjection(
+			current, beforeEvents, priorState,
+		)
+		if err != nil {
+			return agentledger.ProjectionShadowAudit{}, false, err
+		}
+		if !audit.Match {
+			return agentledger.ProjectionShadowAudit{}, false,
+				agentEventIntegrityError()
+		}
+		return audit, true, nil
+	}
+	if replayOnly {
+		return agentledger.ProjectionShadowAudit{}, false, nil
+	}
+
+	desiredMessages, err := agentledger.AppendProjectionMessages(
+		current.Messages, messages,
+	)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false,
+			agentEventValidationError("agent session appended messages are invalid")
+	}
+	baseDigest, err := agentledger.ProjectionDigest(current)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false,
+			agentEventIntegrityError()
+	}
+	desired := agentledger.SessionProjection{
+		Messages:       desiredMessages,
+		TurnCount:      current.TurnCount,
+		ActivatedTools: current.ActivatedTools,
+	}
+	batch, err := agentledger.BuildProjectionSnapshotBatch(
+		agentledger.ProjectionSnapshotInput{
+			Scope:                scope,
+			TurnID:               turnID,
+			BaseProjectionDigest: baseDigest,
+			Messages:             desired.Messages,
+			TurnCount:            desired.TurnCount,
+			ActivatedTools:       desired.ActivatedTools,
+		},
+	)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false,
+			agentEventValidationError("build agent session append snapshot")
+	}
+	batch.IdempotencyKey = idempotencyKey
+	canonical, batchDigest, err := prepareAgentEventBatch(batch)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false, err
+	}
+	batchProjection, err := agentledger.ProjectCanonicalSessionSnapshot(canonical)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false,
+			agentEventValidationError(
+				"agent session append batch is not a complete projection snapshot",
+			)
+	}
+	desiredDigest, err := agentledger.ProjectionDigest(desired)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false,
+			agentEventIntegrityError()
+	}
+	batchDigestProjection, err := agentledger.ProjectionDigest(batchProjection)
+	if err != nil ||
+		!constantTimeAgentEventDigestEqual(
+			desiredDigest, batchDigestProjection,
+		) {
+		return agentledger.ProjectionShadowAudit{}, false,
+			agentEventIntegrityError()
+	}
+	inserted, err := insertAgentEventBatch(
+		ctx, tx, batch, canonical, batchDigest,
+	)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false, err
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE agent_sessions
+		    SET messages=$4
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		scope.SessionID, scope.TenantID, scope.UserID, desired.Messages,
+	)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false,
+			agentEventDatabaseError("update agent session appended projection", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return agentledger.ProjectionShadowAudit{}, false,
+			agentEventNotFound()
+	}
+	allEvents := append([]agentledger.Event(nil), beforeEvents...)
+	allEvents = append(allEvents, inserted...)
+	audit, err := auditAgentSessionProjection(desired, allEvents, priorState)
+	if err != nil {
+		return agentledger.ProjectionShadowAudit{}, false, err
+	}
+	if !audit.Match {
+		return agentledger.ProjectionShadowAudit{}, false,
+			agentEventIntegrityError()
+	}
+	return audit, false, nil
+}
+
+func resolveAgentEventSessionScope(
+	ctx context.Context,
+	tx pgx.Tx,
+	userID int64,
+	sessionID int64,
+) (agentledger.Scope, error) {
+	scope := agentledger.Scope{UserID: userID, SessionID: sessionID}
+	err := tx.QueryRow(ctx,
+		`SELECT tenant_id
+		   FROM agent_sessions
+		  WHERE id=$1 AND user_id=$2`,
+		sessionID, userID,
+	).Scan(&scope.TenantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return agentledger.Scope{}, agentEventNotFound()
+	}
+	if err != nil {
+		return agentledger.Scope{},
+			agentEventDatabaseError("resolve agent session append scope", err)
+	}
+	return scope, nil
+}
+
+func agentSessionAppendIdentity(
+	operationIdentity string,
+	messages json.RawMessage,
+) (string, string, error) {
+	if operationIdentity == "" ||
+		len(operationIdentity) > maxAgentSideWriterIdentityBytes ||
+		!utf8.ValidString(operationIdentity) ||
+		strings.TrimSpace(operationIdentity) != operationIdentity {
+		return "", "", agentEventValidationError(
+			"agent session append identity is invalid",
+		)
+	}
+	// Validate the message boundary before deriving an identity from it.
+	if _, err := agentledger.AppendProjectionMessages(
+		json.RawMessage("[]"), messages,
+	); err != nil {
+		return "", "", agentEventValidationError(
+			"agent session appended messages are invalid",
+		)
+	}
+	keySum := sha256.Sum256([]byte("vane.agent-side-writer/v1\x00" +
+		operationIdentity))
+	requestHash := sha256.New()
+	_, _ = requestHash.Write(
+		[]byte("vane.agent-side-writer-request/v1\x00"),
+	)
+	_, _ = requestHash.Write([]byte(operationIdentity))
+	_, _ = requestHash.Write([]byte{0})
+	_, _ = requestHash.Write(messages)
+	return "side." + fmt.Sprintf("%x", keySum[:]),
+		"side-" + fmt.Sprintf("%x", requestHash.Sum(nil)), nil
+}
+
 func insertAgentEventBatch(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -517,9 +776,8 @@ func comparePriorAgentSessionProjection(
 	if constantTimeAgentEventDigestEqual(legacyDigest, eventDigest) {
 		return "match"
 	}
-	// The known unsupported writers are AppendAgentSessionMessages and the two
-	// restricted receipt transactions. 7.7-B records/resynchronizes this drift
-	// but does not pretend those paths are transactionally dual-written.
+	// A mismatch now means pre-B2 history, direct database repair, or corruption:
+	// all production session writers converge through the transactional ledger.
 	return "unsupported_writer_or_projection_drift"
 }
 

@@ -19,8 +19,9 @@ const (
 	ProjectionSchemaVersion = "vane.agent-session-projection/v1"
 	ProjectionFullSnapshot  = "full_snapshot"
 
-	maxProjectionMessages = 60
-	maxProjectionTurnID   = 128
+	maxProjectionMessages        = 60
+	maxProjectionTurnID          = 128
+	keepRecentProjectionMessages = 40
 )
 
 var ErrInvalidProjection = errors.New("agent ledger: invalid session projection")
@@ -221,6 +222,65 @@ func ProjectionSnapshotBaseDigest(event CanonicalEvent) (string, error) {
 		return "", invalidProjection("snapshot base digest is invalid")
 	}
 	return started.BaseProjectionDigest, nil
+}
+
+// ProjectionSnapshotTurnID extracts the request-bound turn identity from a
+// canonical full-snapshot generation. Side-writer exact replay uses this
+// identity to prove that the same durable operation is retrying the same
+// appended message body without logging or separately persisting that body.
+func ProjectionSnapshotTurnID(event CanonicalEvent) (string, error) {
+	if event.Kind() != KindTurnStarted {
+		return "", invalidProjection("snapshot does not start with turn_started")
+	}
+	started, err := decodeCanonicalProjectionStarted(event)
+	if err != nil {
+		return "", err
+	}
+	return started.TurnID, nil
+}
+
+// AppendProjectionMessages applies the retained session-history truncation
+// contract to one side-writer append. It preserves the first user intent and
+// advances the recent-history boundary to a user message so a tool result is
+// never retained without its initiating user turn.
+func AppendProjectionMessages(
+	current json.RawMessage,
+	appended json.RawMessage,
+) (json.RawMessage, error) {
+	base, err := decodeProjectionMessages(current)
+	if err != nil {
+		return nil, err
+	}
+	additions, err := decodeProjectionMessages(appended)
+	if err != nil {
+		return nil, err
+	}
+	if len(additions) == 0 {
+		return nil, invalidProjection("appended messages must not be empty")
+	}
+	messages := append(base, additions...)
+	if len(messages) > maxProjectionMessages {
+		cut := len(messages) - keepRecentProjectionMessages
+		for cut < len(messages) && messages[cut].Role != "user" {
+			cut++
+		}
+		if cut >= len(messages) {
+			cut = len(messages)
+		}
+		truncated := make([]projectionMessageV1, 0, len(messages)-cut+1)
+		for i := 0; i < cut; i++ {
+			if messages[i].Role == "user" {
+				truncated = append(truncated, messages[i])
+				break
+			}
+		}
+		messages = append(truncated, messages[cut:]...)
+	}
+	raw, err := json.Marshal(messages)
+	if err != nil {
+		return nil, invalidProjection("appended messages cannot be encoded")
+	}
+	return raw, nil
 }
 
 // ProjectLatestSessionSnapshot rebuilds the latest complete full-snapshot

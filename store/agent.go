@@ -83,61 +83,6 @@ func (s *Store) CreateAgentSession(ctx context.Context, userID int64) (*types.Ag
 	return &as, nil
 }
 
-// UpdateAgentSession 覆盖写 messages、turn_count 与 activated_tools，并刷新
-// updated_at（即续 TTL）。messages/activatedTools 列 NOT NULL，nil/空归一为 '[]'
-// （与 InsertSchedule 对 JSONB 列的处理一致）。
-// 目标行不存在返回 CodeNotFound：调用方持有的 id 来自 Get/Create，更新不到行
-// 说明会话已被并发清理，静默成功会掩盖 bug。
-func (s *Store) UpdateAgentSession(ctx context.Context, id int64, messages json.RawMessage, turnCount int, activatedTools json.RawMessage) error {
-	if len(messages) == 0 {
-		messages = json.RawMessage("[]")
-	}
-	if len(activatedTools) == 0 {
-		activatedTools = json.RawMessage("[]")
-	}
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE agent_sessions
-		 SET messages = $2, turn_count = $3, activated_tools = $4, updated_at = now()
-		 WHERE id = $1`,
-		id, messages, turnCount, activatedTools)
-	if err != nil {
-		return types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("更新 agent 会话（id=%d）", id), err)
-	}
-	if tag.RowsAffected() == 0 {
-		return types.NewAppError(types.CodeNotFound,
-			fmt.Sprintf("agent 会话 id=%d 不存在", id), nil)
-	}
-	return nil
-}
-
-// AppendAgentSessionMessages 原子追加会话消息：msgs 必须是 JSON 数组
-// （jsonb || 对两个数组才是拼接语义），在库内一条 UPDATE 完成。
-// 不走"读出→内存 append→UpdateAgentSession"：卡片回调与 HandleMessage 分属
-// 不同 goroutine，读改写会与 saveSession 的全量覆盖写产生竞态互吞消息，
-// 库内原子拼接则与任意时刻的覆盖写都只有先后、没有丢失。
-// 刻意不刷 updated_at：会话 TTL 以用户消息计（契约 §0 30 分钟），而确认卡
-// 有效期 24h（取消更无时限）——点卡若续期，深夜一次点击就能把陈旧会话
-// 连同全部上下文复活给下一条消息。通告落进已过期的会话行无害：新会话
-// 历史里本就没有那张卡的"等待确认"记录，不存在要消除的幻觉。
-// 目标行不存在返回 CodeNotFound（同 UpdateAgentSession：静默成功会掩盖 bug）。
-func (s *Store) AppendAgentSessionMessages(ctx context.Context, sessionID int64, msgs json.RawMessage) error {
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE agent_sessions
-		 SET messages = messages || $2::jsonb
-		 WHERE id = $1`,
-		sessionID, msgs)
-	if err != nil {
-		return types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("追加 agent 会话消息（id=%d）", sessionID), err)
-	}
-	if tag.RowsAffected() == 0 {
-		return types.NewAppError(types.CodeNotFound,
-			fmt.Sprintf("agent 会话 id=%d 不存在", sessionID), nil)
-	}
-	return nil
-}
-
 // CreatePendingAction 落一条待确认动作。id（uuid）与 expires_at 由调用方给定；
 // args NOT NULL DEFAULT '{}'，nil/空归一为 '{}'；status 空缺省 pending。
 func (s *Store) CreatePendingAction(ctx context.Context, a *types.PendingAction) error {

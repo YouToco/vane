@@ -44,7 +44,12 @@ type Sender interface {
 // 「[卡片回调]」前缀的完整通告文案由本包组装（契约 §12.4）；无 active 会话时
 // 丢弃、写入纪律（锁序/预算）归 agent 侧，本包只管调用。
 type SessionNotifier interface {
-	NotifyEvent(ctx context.Context, userID int64, notice string)
+	NotifyEvent(
+		ctx context.Context,
+		userID int64,
+		sourceIdentity string,
+		notice string,
+	)
 }
 
 // CardBuilder 构造带按钮与状态行的推送卡 JSON（生产实现 feishu.BuildDeliveryCard）。
@@ -245,12 +250,15 @@ func (s *Service) handleAttitude(ctx context.Context, userID int64, d *types.Del
 		// 幂等：不插行但仍重建卡——并发窗口下状态行的短暂缺项靠重复点击自愈。
 		return s.rebuilt(ctx, d, "已记录过", true, nil), nil
 	}
-	if _, err := s.deps.Store.InsertFeedback(ctx, &types.Feedback{
+	feedbackID, err := s.deps.Store.InsertFeedback(ctx, &types.Feedback{
 		UserID: userID, DeliveryID: d.ID, Action: action,
-	}); err != nil {
+	})
+	if err != nil {
 		return ClickResult{}, err
 	}
-	s.notifyClick(ctx, userID, d.ID, actionLabel(action), "")
+	s.notifyClick(
+		ctx, userID, feedbackID, d.ID, actionLabel(action), "",
+	)
 	return s.rebuilt(ctx, d, "已记录："+actionLabel(action), true, nil), nil
 }
 
@@ -309,16 +317,20 @@ func (s *Service) HandleReasonSubmit(ctx context.Context, userID int64, submit R
 			slog.WarnContext(ctx, "feedback: 过时反馈审计失败",
 				"user_id", userID, "feedback_id", feedbackID, "err", auditErr)
 		} else {
-			s.routeFreshnessAudit(ctx, userID, d.ID, outcome)
+			s.routeFreshnessAudit(
+				ctx, userID, feedbackID, d.ID, outcome,
+			)
 		}
 	}
-	s.notifyClick(ctx, userID, d.ID, "反馈问题："+label, "")
+	s.notifyClick(
+		ctx, userID, feedbackID, d.ID, "反馈问题："+label, "",
+	)
 	return s.rebuilt(ctx, d, "已记录问题反馈："+label, true, nil), nil
 }
 
 func (s *Service) routeFreshnessAudit(
 	ctx context.Context,
-	userID, deliveryID int64,
+	userID, feedbackID, deliveryID int64,
 	outcome types.FreshnessFeedbackAuditOutcome,
 ) {
 	switch outcome {
@@ -327,7 +339,10 @@ func (s *Service) routeFreshnessAudit(
 			"user_id", userID, "delivery_id", deliveryID)
 	case types.FreshnessAuditTaskPolicySuggestion:
 		if s.deps.Notifier != nil {
-			s.deps.Notifier.NotifyEvent(ctx, userID,
+			s.deps.Notifier.NotifyEvent(
+				ctx,
+				userID,
+				fmt.Sprintf("feedback-policy-suggestion:%d", feedbackID),
 				fmt.Sprintf("[卡片回调] 用户反馈推送 #%d 过时；当前任务没有明确的新鲜度策略。请提出任务修改建议并等待用户确认，不得自动修改任务。", deliveryID))
 		}
 	}
@@ -425,11 +440,21 @@ func (s *Service) cardState(ctx context.Context, deliveryID int64) (CardState, e
 // 通告只含数据库主键与代码生成的动作标签，刻意不带内容标题/正文。标题来自
 // RSS/网页，是外部不可信数据；即使消毒后也不该被装进 systemPrompt 定义为
 // “真实用户操作”的高信任通道。用户仍可从原卡片看到标题。
-func (s *Service) notifyClick(ctx context.Context, userID, deliveryID int64, label, suffix string) {
+func (s *Service) notifyClick(
+	ctx context.Context,
+	userID int64,
+	feedbackID int64,
+	deliveryID int64,
+	label string,
+	suffix string,
+) {
 	if s.deps.Notifier == nil {
 		return
 	}
-	s.deps.Notifier.NotifyEvent(ctx, userID,
+	s.deps.Notifier.NotifyEvent(
+		ctx,
+		userID,
+		fmt.Sprintf("feedback-click:%d", feedbackID),
 		fmt.Sprintf("[卡片回调] 用户在推送卡片（delivery_id=%d）上点击了「%s」%s", deliveryID, label, suffix))
 }
 

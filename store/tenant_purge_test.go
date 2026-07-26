@@ -289,19 +289,14 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 	if err := snapshotTx.Commit(ctx); err != nil {
 		t.Fatalf("提交运行快照清理夹具失败: %v", err)
 	}
-	eventPayload := `{"schema_version":"vane.agent-event/v1","kind":"turn_completed","body":{"outcome":"purge"}}`
-	if _, err := st.pool.Exec(ctx, `
-		INSERT INTO agent_events (
-			tenant_id, user_id, session_id, sequence,
-			batch_idempotency_key, batch_index, batch_size,
-			kind, schema_version, payload, payload_digest, batch_digest
-		) VALUES (
-			$1, $2, $3, 1, $4, 0, 1, 'turn_completed',
-			'vane.agent-event/v1', convert_to($5, 'UTF8'),
-			encode(sha256(convert_to($5, 'UTF8')), 'hex'), repeat('a',64)
-		)`,
-		tn.ID, u.ID, editSessionID, "purge-event-"+uuid.NewString(),
-		eventPayload,
+	if _, err := st.CommitAgentSessionAppend(
+		ctx,
+		u.ID,
+		editSessionID,
+		"purge-fixture:"+uuid.NewString(),
+		json.RawMessage(
+			`[{"role":"user","content":"purge fixture"}]`,
+		),
 	); err != nil {
 		t.Fatalf("建 Agent event 清理夹具失败: %v", err)
 	}
@@ -361,7 +356,7 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 			rep.Rows["task_definition_edit_operations"],
 			rep.Rows["task_definition_edit_receipts"])
 	}
-	if rep.Rows["agent_events"] != 1 {
+	if rep.Rows["agent_events"] != 3 {
 		t.Errorf("试运行报告必须包含 Agent event，实得 %d",
 			rep.Rows["agent_events"])
 	}
@@ -420,7 +415,7 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	).Scan(&n); err != nil {
 		t.Fatalf("查 Agent event 失败: %v", err)
 	}
-	if n != 1 {
+	if n != 3 {
 		t.Errorf("试运行后 Agent event 应还在，实得 %d 行 —— 事务没回滚", n)
 	}
 }
@@ -453,7 +448,7 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 			rep.Rows["task_definition_edit_operations"],
 			rep.Rows["task_definition_edit_receipts"])
 	}
-	if rep.Rows["agent_events"] != 1 {
+	if rep.Rows["agent_events"] != 3 {
 		t.Errorf("清理报告必须包含 Agent event，实得 %d",
 			rep.Rows["agent_events"])
 	}
@@ -1023,6 +1018,132 @@ func TestPurgeTenantRemovesAgentTurnCommittedBeforeSessionFence(t *testing.T) {
 		t.Fatal("tenant purge 未在 blocker 释放后收敛")
 	}
 
+	var events, sessions, tenants int
+	if err := st.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM agent_events WHERE tenant_id=$1),
+			(SELECT count(*) FROM agent_sessions WHERE tenant_id=$1),
+			(SELECT count(*) FROM tenants WHERE id=$1)`,
+		tenantID,
+	).Scan(&events, &sessions, &tenants); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 || sessions != 0 || tenants != 0 {
+		t.Fatalf("purge residue events=%d sessions=%d tenants=%d",
+			events, sessions, tenants)
+	}
+}
+
+func TestPurgeTenantRemovesSideWriterCommittedBeforeSessionFence(
+	t *testing.T,
+) {
+	st := purgeStore(t)
+	tenantID := seedPurgeTenant(t, st)
+	ctx := t.Context()
+
+	var userID, sessionID int64
+	if err := st.pool.QueryRow(ctx, `
+		SELECT user_id
+		  FROM memberships
+		 WHERE tenant_id=$1
+		 ORDER BY user_id
+		 LIMIT 1`,
+		tenantID,
+	).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.pool.QueryRow(ctx, `
+		INSERT INTO agent_sessions (tenant_id,user_id)
+		VALUES ($1,$2) RETURNING id`,
+		tenantID, userID,
+	).Scan(&sessionID); err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(context.WithoutCancel(ctx)) }()
+	var lockedTenantID int64
+	if err := blocker.QueryRow(ctx, `
+		SELECT id FROM tenants
+		 WHERE id=$1
+		 FOR UPDATE`,
+		tenantID,
+	).Scan(&lockedTenantID); err != nil {
+		t.Fatal(err)
+	}
+
+	commitDone := make(chan error, 1)
+	go func() {
+		_, commitErr := st.CommitAgentSessionAppend(
+			ctx,
+			userID,
+			sessionID,
+			"feedback-click:purge-lock-order",
+			json.RawMessage(
+				`[{"role":"user","content":"concurrent side writer"}]`,
+			),
+		)
+		commitDone <- commitErr
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%agent event tenant FK lock order%",
+		"side writer 未在持有 session 后等待 event tenant FK",
+	)
+
+	var lockedSessionID int64
+	err = st.pool.QueryRow(ctx, `
+		SELECT id FROM agent_sessions
+		 WHERE id=$1 AND tenant_id=$2
+		 FOR UPDATE NOWAIT`,
+		sessionID, tenantID,
+	).Scan(&lockedSessionID)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("side writer 未真实持有 session UPDATE 锁: id=%d err=%v",
+			lockedSessionID, err)
+	}
+
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, purgeErr := st.PurgeTenant(ctx, tenantID, false)
+		purgeDone <- purgeResult{report: report, err: purgeErr}
+	}()
+	waitForDatabaseLockQuery(
+		t, st,
+		"%tenant purge agent-session lock order%",
+		"tenant purge 未在 tenant delete 前等待 side-writer session 锁",
+	)
+
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case commitErr := <-commitDone:
+		if commitErr != nil {
+			t.Fatalf("side writer 与 purge 并发失败: %v", commitErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("side writer 未在 tenant FK blocker 释放后收敛")
+	}
+	select {
+	case result := <-purgeDone:
+		if result.err != nil {
+			t.Fatalf("tenant purge 失败: %v", result.err)
+		}
+		if result.report == nil || result.report.Rows["tenants"] != 1 {
+			t.Fatalf("tenant purge 报告异常: %+v", result.report)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant purge 未在 side writer 释放锁后收敛")
+	}
 	var events, sessions, tenants int
 	if err := st.pool.QueryRow(ctx, `
 		SELECT

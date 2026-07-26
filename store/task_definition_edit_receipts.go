@@ -383,6 +383,22 @@ func (s *Store) RecordTaskDefinitionEditReceiptSessionMessages(
 	if receipt.SessionRecordedAt != nil || receipt.SessionMessagesDigest != "" {
 		if receipt.SessionRecordedAt != nil &&
 			receipt.SessionMessagesDigest == digest {
+			_, _, replayErr := commitAgentSessionAppendTx(
+				ctx,
+				tx,
+				lease.TenantID,
+				lease.UserID,
+				receipt.SessionID,
+				fmt.Sprintf("definition-edit-receipt:%d", lease.ID),
+				messages,
+				true,
+			)
+			if replayErr != nil {
+				return taskDefinitionEditReceiptDatabaseError(
+					"replay receipt session ledger checkpoint",
+					replayErr,
+				)
+			}
 			if err := tx.Commit(ctx); err != nil {
 				return taskDefinitionEditReceiptDatabaseError(
 					"commit receipt session replay", err)
@@ -393,19 +409,22 @@ func (s *Store) RecordTaskDefinitionEditReceiptSessionMessages(
 			"immutable task definition edit receipt session messages differ")
 	}
 
-	tag, err := tx.Exec(ctx, `
-		UPDATE agent_sessions
-		   SET messages = messages || $4::jsonb
-		 WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
-		receipt.SessionID, lease.TenantID, lease.UserID, messages)
+	_, _, err = commitAgentSessionAppendTx(
+		ctx,
+		tx,
+		lease.TenantID,
+		lease.UserID,
+		receipt.SessionID,
+		fmt.Sprintf("definition-edit-receipt:%d", lease.ID),
+		messages,
+		false,
+	)
 	if err != nil {
-		return taskDefinitionEditReceiptDatabaseError("append receipt session messages", err)
+		return taskDefinitionEditReceiptDatabaseError(
+			"append receipt session projection and ledger", err,
+		)
 	}
-	if tag.RowsAffected() != 1 {
-		return taskDefinitionEditReceiptConflict(
-			"task definition edit receipt agent session is outside scope")
-	}
-	tag, err = tx.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		UPDATE task_definition_edit_receipts
 		   SET session_recorded_at = clock_timestamp(),
 		       session_messages_digest = $6,
