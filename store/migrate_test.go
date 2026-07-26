@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const latestMigrationVersion int64 = 57
+const latestMigrationVersion int64 = 58
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -78,7 +78,7 @@ var wantTables = []string{
 	"agent_turn_context_snapshots",
 	// 056 durable business-fact to exact Agent-session continuation.
 	"agent_session_fact_outbox",
-	// 057 exact-action durable terminal convergence for enable_source.
+	// 058 exact-action durable terminal convergence for enable_source.
 	"agent_action_continuations",
 	"agent_action_continuation_authority_events",
 	// 036 C2c-2 immutable run-snapshot v2 shadow sidecar.

@@ -85,6 +85,8 @@ var purgeOrder = []purgeStep{
 	{"feedback_freshness_triage", "tenant_id = $1"},
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
+	{"agent_action_continuation_authority_events", "tenant_id = $1"},
+	{"agent_action_continuations", "tenant_id = $1"},
 	{"pending_actions", "tenant_id = $1"},
 	{"agent_turn_context_snapshots", "tenant_id = $1"},
 	{"agent_session_fact_outbox", "tenant_id = $1"},
@@ -261,6 +263,13 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			         WHERE tenant_id = $1
 			         ORDER BY id
 			         FOR UPDATE /* tenant purge task-creation lock order */`,
+		},
+		{
+			name: "agent_action_continuations",
+			query: `SELECT action_id FROM agent_action_continuations
+			         WHERE tenant_id = $1
+			         ORDER BY action_id
+			         FOR UPDATE /* tenant purge Agent action lock order */`,
 		},
 		{
 			name: "schedules",

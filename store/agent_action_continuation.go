@@ -187,6 +187,7 @@ func (s *Store) ActivateAgentActionContinuation(
 	if executionVersion == AgentActionExecutionVersion {
 		return replayAgentActionActivation(
 			ctx, tx, tenantID, userID, actionID, evidence,
+			sessionID, toolName, args, status,
 		)
 	}
 	if executionVersion != 0 || sessionID == nil || *sessionID <= 0 ||
@@ -282,6 +283,10 @@ func replayAgentActionActivation(
 	tx pgx.Tx,
 	tenantID, userID int64,
 	actionID, evidence string,
+	rootSessionID *int64,
+	rootToolName string,
+	rootArgs []byte,
+	rootStatus string,
 ) (int64, error) {
 	action, err := scanAgentActionContinuation(tx.QueryRow(ctx,
 		`SELECT `+agentActionContinuationColumns+`
@@ -290,7 +295,40 @@ func replayAgentActionActivation(
 		  FOR UPDATE`,
 		actionID, tenantID, userID,
 	))
-	if err != nil || action.Status != AgentActionStatusPending {
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, agentEventIntegrityError()
+		}
+		return 0, agentEventDatabaseError(
+			"lock Agent action activation continuation", err)
+	}
+	if action.Status != AgentActionStatusPending {
+		switch action.Status {
+		case AgentActionStatusPending, AgentActionStatusConfirmed,
+			AgentActionStatusCompleted, AgentActionStatusBlocked,
+			AgentActionStatusCancelled, AgentActionStatusExpired:
+		default:
+			return 0, agentEventIntegrityError()
+		}
+	}
+	if err := validateFrozenAgentAction(action); err != nil {
+		return 0, err
+	}
+	sourceID, canonicalArgs, err := canonicalEnableSourceArgs(rootArgs)
+	if err != nil || rootSessionID == nil ||
+		*rootSessionID != action.SessionID ||
+		rootToolName != agentActionToolName ||
+		sourceID != action.SourceID ||
+		string(canonicalArgs) != string(action.CanonicalArgs) {
+		return 0, agentEventIntegrityError()
+	}
+	if action.Status != AgentActionStatusPending {
+		if err := validateAgentActionTerminalRoot(
+			action.Status, rootStatus,
+		); err != nil {
+			return 0, err
+		}
+	} else if rootStatus != string(types.PendingActionStatusPending) {
 		return 0, agentEventIntegrityError()
 	}
 	rows, err := tx.Query(ctx,
@@ -306,10 +344,27 @@ func replayAgentActionActivation(
 	defer rows.Close()
 	var generation int64
 	var mode, gotEvidence string
-	if !rows.Next() ||
-		rows.Scan(&generation, &mode, &gotEvidence) != nil ||
-		rows.Next() || rows.Err() != nil ||
-		generation != 1 || mode != AgentActionAuthorityDurable ||
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return 0, agentEventDatabaseError(
+				"iterate Agent action activation history", err)
+		}
+		return 0, agentEventIntegrityError()
+	}
+	if err := rows.Scan(
+		&generation, &mode, &gotEvidence,
+	); err != nil {
+		return 0, agentEventDatabaseError(
+			"scan Agent action activation history", err)
+	}
+	if rows.Next() {
+		return 0, agentEventIntegrityError()
+	}
+	if err := rows.Err(); err != nil {
+		return 0, agentEventDatabaseError(
+			"iterate Agent action activation history", err)
+	}
+	if generation != 1 || mode != AgentActionAuthorityDurable ||
 		gotEvidence != evidence {
 		return 0, agentEventIntegrityError()
 	}
@@ -340,18 +395,35 @@ func (s *Store) RollbackAgentActionContinuation(
 			"begin Agent action rollback", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock($1,$2)`,
+		agentActionAdmissionClass, agentActionAdmissionKey,
+	); err != nil {
+		return 0, agentEventDatabaseError(
+			"lock Agent action rollback admission", err)
+	}
 	if err := setAgentActionOperatorContext(ctx, tx, tenantID); err != nil {
 		return 0, err
 	}
 	var executionVersion int
 	var pendingStatus string
+	var sessionID *int64
+	var toolName string
+	var args []byte
 	if err := tx.QueryRow(ctx,
-		`SELECT execution_version,status FROM pending_actions
+		`SELECT execution_version,status,session_id,tool_name,args
+		   FROM pending_actions
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		  FOR UPDATE`,
 		actionID, tenantID, userID,
-	).Scan(&executionVersion, &pendingStatus); err != nil {
-		return 0, agentEventNotFound()
+	).Scan(
+		&executionVersion, &pendingStatus, &sessionID, &toolName, &args,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, agentEventNotFound()
+		}
+		return 0, agentEventDatabaseError(
+			"lock Agent action rollback root", err)
 	}
 	action, err := scanAgentActionContinuation(tx.QueryRow(ctx,
 		`SELECT `+agentActionContinuationColumns+`
@@ -361,11 +433,20 @@ func (s *Store) RollbackAgentActionContinuation(
 		actionID, tenantID, userID,
 	))
 	if err != nil {
-		return 0, agentEventIntegrityError()
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, agentEventIntegrityError()
+		}
+		return 0, agentEventDatabaseError(
+			"lock Agent action rollback continuation", err)
+	}
+	if err := validateAgentActionRootBinding(
+		action, sessionID, toolName, args,
+	); err != nil {
+		return 0, err
 	}
 	if executionVersion == 0 {
 		return replayAgentActionRollback(
-			ctx, tx, action, evidence,
+			ctx, tx, action, pendingStatus, evidence,
 		)
 	}
 	if executionVersion != AgentActionExecutionVersion ||
@@ -375,19 +456,51 @@ func (s *Store) RollbackAgentActionContinuation(
 		action.LeaseFence != 0 || action.TerminalCode != nil {
 		return 0, ErrAgentActionTerminal
 	}
-	var count int
 	var generation int64
-	var mode string
-	if err := tx.QueryRow(ctx,
-		`SELECT count(*),max(generation),max(mode)
+	var mode, activationEvidence string
+	rows, err := tx.Query(ctx,
+		`SELECT generation,mode,evidence
 		   FROM agent_action_continuation_authority_events
-		  WHERE action_id=$1`,
+		  WHERE action_id=$1 ORDER BY generation`,
 		actionID,
-	).Scan(&count, &generation, &mode); err != nil ||
-		count != 1 || generation != 1 ||
-		mode != AgentActionAuthorityDurable {
+	)
+	if err != nil {
+		return 0, agentEventDatabaseError(
+			"read Agent action rollback history", err)
+	}
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return 0, agentEventDatabaseError(
+				"iterate Agent action rollback history", err)
+		}
+		rows.Close()
 		return 0, agentEventIntegrityError()
 	}
+	if err := rows.Scan(
+		&generation, &mode, &activationEvidence,
+	); err != nil {
+		rows.Close()
+		return 0, agentEventDatabaseError(
+			"scan Agent action rollback history", err)
+	}
+	if rows.Next() {
+		rows.Close()
+		return 0, agentEventIntegrityError()
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, agentEventDatabaseError(
+			"iterate Agent action rollback history", err)
+	}
+	if generation != 1 ||
+		mode != AgentActionAuthorityDurable ||
+		strings.TrimSpace(activationEvidence) != activationEvidence ||
+		activationEvidence == "" {
+		rows.Close()
+		return 0, agentEventIntegrityError()
+	}
+	rows.Close()
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO agent_action_continuation_authority_events (
 		     tenant_id,user_id,action_id,generation,mode,evidence
@@ -436,10 +549,12 @@ func replayAgentActionRollback(
 	ctx context.Context,
 	tx pgx.Tx,
 	action AgentActionContinuation,
+	rootStatus string,
 	evidence string,
 ) (int64, error) {
 	if action.Status != AgentActionStatusRolledBack ||
-		action.ConfirmedAt != nil || action.AttemptCount != 0 {
+		action.ConfirmedAt != nil || action.AttemptCount != 0 ||
+		rootStatus != string(types.PendingActionStatusPending) {
 		return 0, agentEventIntegrityError()
 	}
 	rows, err := tx.Query(ctx,
@@ -460,15 +575,22 @@ func replayAgentActionRollback(
 	}
 	i := 0
 	for rows.Next() {
-		if i >= len(got) ||
-			rows.Scan(
-				&got[i].generation, &got[i].mode, &got[i].evidence,
-			) != nil {
+		if i >= len(got) {
 			return 0, agentEventIntegrityError()
+		}
+		if err := rows.Scan(
+			&got[i].generation, &got[i].mode, &got[i].evidence,
+		); err != nil {
+			return 0, agentEventDatabaseError(
+				"scan Agent action rollback history", err)
 		}
 		i++
 	}
-	if rows.Err() != nil || i != 2 ||
+	if err := rows.Err(); err != nil {
+		return 0, agentEventDatabaseError(
+			"iterate Agent action rollback history", err)
+	}
+	if i != 2 ||
 		got[0].generation != 1 ||
 		got[0].mode != AgentActionAuthorityDurable ||
 		got[1].generation != 2 ||
@@ -481,6 +603,26 @@ func replayAgentActionRollback(
 			"commit Agent action rollback replay", err)
 	}
 	return 2, nil
+}
+
+func validateAgentActionRootBinding(
+	action AgentActionContinuation,
+	rootSessionID *int64,
+	rootToolName string,
+	rootArgs []byte,
+) error {
+	if err := validateFrozenAgentAction(action); err != nil {
+		return err
+	}
+	sourceID, canonicalArgs, err := canonicalEnableSourceArgs(rootArgs)
+	if err != nil || rootSessionID == nil ||
+		*rootSessionID != action.SessionID ||
+		rootToolName != agentActionToolName ||
+		sourceID != action.SourceID ||
+		string(canonicalArgs) != string(action.CanonicalArgs) {
+		return agentEventIntegrityError()
+	}
+	return nil
 }
 
 type frozenEnableSourceAction struct {
@@ -580,13 +722,20 @@ func (s *Store) decideAgentActionContinuation(
 	var expiresAt time.Time
 	var executionVersion int
 	var pendingStatus string
+	var rootSessionID *int64
+	var rootToolName string
+	var rootArgs []byte
 	err = tx.QueryRow(ctx,
-		`SELECT tenant_id,expires_at,execution_version,status
+		`SELECT tenant_id,expires_at,execution_version,status,
+		        session_id,tool_name,args
 		   FROM pending_actions
 		  WHERE id=$1 AND user_id=$2
 		  FOR UPDATE`,
 		actionID, userID,
-	).Scan(&tenantID, &expiresAt, &executionVersion, &pendingStatus)
+	).Scan(
+		&tenantID, &expiresAt, &executionVersion, &pendingStatus,
+		&rootSessionID, &rootToolName, &rootArgs,
+	)
 	if errors.Is(err, pgx.ErrNoRows) ||
 		(err == nil && executionVersion != AgentActionExecutionVersion) {
 		return AgentActionConfirmation{}, ErrAgentActionNotRouted
@@ -606,28 +755,68 @@ func (s *Store) decideAgentActionContinuation(
 		actionID, tenantID, userID,
 	))
 	if err != nil {
-		return AgentActionConfirmation{}, agentEventIntegrityError()
+		if errors.Is(err, pgx.ErrNoRows) {
+			return AgentActionConfirmation{}, agentEventIntegrityError()
+		}
+		return AgentActionConfirmation{}, agentEventDatabaseError(
+			"lock Agent action confirmation continuation", err)
+	}
+	if err := validateAgentActionRootBinding(
+		action, rootSessionID, rootToolName, rootArgs,
+	); err != nil {
+		return AgentActionConfirmation{}, err
+	}
+	if err := validateFrozenAgentAction(action); err != nil {
+		return AgentActionConfirmation{}, err
+	}
+	if err := validateActiveAgentActionAuthority(
+		ctx, tx, actionID,
+	); err != nil {
+		return AgentActionConfirmation{}, err
 	}
 	if action.Status != AgentActionStatusPending {
+		if err := validateAgentActionTerminalRoot(
+			action.Status, pendingStatus,
+		); err != nil {
+			return AgentActionConfirmation{}, err
+		}
 		return AgentActionConfirmation{
 			Handled: true, Accepted: action.Status == AgentActionStatusConfirmed ||
 				action.Status == AgentActionStatusCompleted,
 			Replayed: true, Status: action.Status,
 		}, nil
 	}
+	if pendingStatus != string(types.PendingActionStatusPending) {
+		return AgentActionConfirmation{}, agentEventIntegrityError()
+	}
 	if cancel {
-		if _, err := tx.Exec(ctx,
+		tag, err := tx.Exec(ctx,
 			`UPDATE pending_actions
 			    SET status='cancelled',updated_at=clock_timestamp()
-			  WHERE id=$1 AND user_id=$2 AND execution_version=$3;
-			 UPDATE agent_action_continuations
-			    SET status='cancelled',updated_at=clock_timestamp()
-			  WHERE action_id=$1 AND tenant_id=$4 AND user_id=$2
-			    AND status='pending'`,
+			  WHERE id=$1 AND tenant_id=$4 AND user_id=$2
+			    AND execution_version=$3 AND status='pending'`,
 			actionID, userID, AgentActionExecutionVersion, tenantID,
-		); err != nil {
+		)
+		if err != nil {
 			return AgentActionConfirmation{}, agentEventDatabaseError(
-				"cancel Agent action", err)
+				"cancel Agent action root", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return AgentActionConfirmation{}, agentEventIntegrityError()
+		}
+		tag, err = tx.Exec(ctx,
+			`UPDATE agent_action_continuations
+			    SET status='cancelled',updated_at=clock_timestamp()
+			  WHERE action_id=$1 AND tenant_id=$3 AND user_id=$2
+			    AND status='pending'`,
+			actionID, userID, tenantID,
+		)
+		if err != nil {
+			return AgentActionConfirmation{}, agentEventDatabaseError(
+				"cancel Agent action continuation", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return AgentActionConfirmation{}, agentEventIntegrityError()
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return AgentActionConfirmation{}, agentEventDatabaseError(
@@ -644,18 +833,33 @@ func (s *Store) decideAgentActionContinuation(
 			"read Agent action confirmation clock", err)
 	}
 	if !databaseNow.Before(expiresAt) {
-		if _, err := tx.Exec(ctx,
+		tag, err := tx.Exec(ctx,
 			`UPDATE pending_actions
 			    SET status='expired',updated_at=clock_timestamp()
-			  WHERE id=$1 AND user_id=$2 AND execution_version=$3;
-			 UPDATE agent_action_continuations
-			    SET status='expired',updated_at=clock_timestamp()
-			  WHERE action_id=$1 AND tenant_id=$4 AND user_id=$2
-			    AND status='pending'`,
+			  WHERE id=$1 AND tenant_id=$4 AND user_id=$2
+			    AND execution_version=$3 AND status='pending'`,
 			actionID, userID, AgentActionExecutionVersion, tenantID,
-		); err != nil {
+		)
+		if err != nil {
 			return AgentActionConfirmation{}, agentEventDatabaseError(
-				"expire Agent action", err)
+				"expire Agent action root", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return AgentActionConfirmation{}, agentEventIntegrityError()
+		}
+		tag, err = tx.Exec(ctx,
+			`UPDATE agent_action_continuations
+			    SET status='expired',updated_at=clock_timestamp()
+			  WHERE action_id=$1 AND tenant_id=$3 AND user_id=$2
+			    AND status='pending'`,
+			actionID, userID, tenantID,
+		)
+		if err != nil {
+			return AgentActionConfirmation{}, agentEventDatabaseError(
+				"expire Agent action continuation", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return AgentActionConfirmation{}, agentEventIntegrityError()
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return AgentActionConfirmation{}, agentEventDatabaseError(
@@ -665,42 +869,36 @@ func (s *Store) decideAgentActionContinuation(
 			Handled: true, Status: AgentActionStatusExpired,
 		}, nil
 	}
-	var mode string
-	err = tx.QueryRow(ctx,
-		`SELECT mode
-		   FROM agent_action_continuation_authority_events
-		  WHERE action_id=$1
-		  ORDER BY generation DESC LIMIT 1`,
-		actionID,
-	).Scan(&mode)
-	if errors.Is(err, pgx.ErrNoRows) || mode != AgentActionAuthorityDurable {
-		return AgentActionConfirmation{
-			Handled: true, Status: AgentActionStatusPending,
-		}, nil
-	}
-	if err != nil {
-		return AgentActionConfirmation{}, agentEventDatabaseError(
-			"read Agent action authority", err)
-	}
-	if pendingStatus != string(types.PendingActionStatusPending) {
-		return AgentActionConfirmation{}, agentEventIntegrityError()
-	}
-	if _, err := tx.Exec(ctx,
+	tag, err := tx.Exec(ctx,
 		`UPDATE pending_actions
 		    SET status='executed',executed_at=clock_timestamp(),
 		        updated_at=clock_timestamp()
-		  WHERE id=$1 AND user_id=$2 AND execution_version=$3
-		    AND status='pending';
-		 UPDATE agent_action_continuations
+		  WHERE id=$1 AND tenant_id=$4 AND user_id=$2
+		    AND execution_version=$3 AND status='pending'`,
+		actionID, userID, AgentActionExecutionVersion, tenantID,
+	)
+	if err != nil {
+		return AgentActionConfirmation{}, agentEventDatabaseError(
+			"confirm Agent action root", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return AgentActionConfirmation{}, agentEventIntegrityError()
+	}
+	tag, err = tx.Exec(ctx,
+		`UPDATE agent_action_continuations
 		    SET status='confirmed',confirmed_at=clock_timestamp(),
 		        next_attempt_at=clock_timestamp(),
 		        updated_at=clock_timestamp()
-		  WHERE action_id=$1 AND tenant_id=$4 AND user_id=$2
+		  WHERE action_id=$1 AND tenant_id=$3 AND user_id=$2
 		    AND status='pending'`,
-		actionID, userID, AgentActionExecutionVersion, tenantID,
-	); err != nil {
+		actionID, userID, tenantID,
+	)
+	if err != nil {
 		return AgentActionConfirmation{}, agentEventDatabaseError(
-			"confirm Agent action", err)
+			"confirm Agent action continuation", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return AgentActionConfirmation{}, agentEventIntegrityError()
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return AgentActionConfirmation{}, agentEventDatabaseError(
@@ -711,11 +909,75 @@ func (s *Store) decideAgentActionContinuation(
 	}, nil
 }
 
+func validateActiveAgentActionAuthority(
+	ctx context.Context,
+	tx pgx.Tx,
+	actionID string,
+) error {
+	rows, err := tx.Query(ctx,
+		`SELECT generation,mode
+		   FROM agent_action_continuation_authority_events
+		  WHERE action_id=$1 ORDER BY generation`,
+		actionID,
+	)
+	if err != nil {
+		return agentEventDatabaseError(
+			"read Agent action authority history", err)
+	}
+	defer rows.Close()
+	var generation int64
+	var mode string
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return agentEventDatabaseError(
+				"iterate Agent action authority history", err)
+		}
+		return agentEventIntegrityError()
+	}
+	if err := rows.Scan(&generation, &mode); err != nil {
+		return agentEventDatabaseError(
+			"scan Agent action authority history", err)
+	}
+	if generation != 1 || mode != AgentActionAuthorityDurable ||
+		rows.Next() {
+		return agentEventIntegrityError()
+	}
+	if err := rows.Err(); err != nil {
+		return agentEventDatabaseError(
+			"iterate Agent action authority history", err)
+	}
+	return nil
+}
+
+func validateAgentActionTerminalRoot(
+	actionStatus, rootStatus string,
+) error {
+	want := ""
+	switch actionStatus {
+	case AgentActionStatusConfirmed, AgentActionStatusCompleted,
+		AgentActionStatusBlocked:
+		want = string(types.PendingActionStatusExecuted)
+	case AgentActionStatusCancelled:
+		want = string(types.PendingActionStatusCancelled)
+	case AgentActionStatusExpired:
+		want = string(types.PendingActionStatusExpired)
+	default:
+		return agentEventIntegrityError()
+	}
+	if rootStatus != want {
+		return agentEventIntegrityError()
+	}
+	return nil
+}
+
 func setAgentActionContinuatorContext(
 	ctx context.Context,
 	tx pgx.Tx,
 	tenantID int64,
 ) error {
+	if err := validateAgentActionContinuator(ctx, tx); err != nil {
+		return err
+	}
 	if tenantID <= 0 {
 		return agentEventValidationError(
 			"Agent action tenant is invalid")
@@ -741,6 +1003,9 @@ func setAgentActionOperatorContext(
 	tx pgx.Tx,
 	tenantID int64,
 ) error {
+	if err := validateAgentActionOperator(ctx, tx); err != nil {
+		return err
+	}
 	if tenantID <= 0 {
 		return agentEventValidationError(
 			"Agent action tenant is invalid")

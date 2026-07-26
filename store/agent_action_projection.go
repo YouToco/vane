@@ -120,13 +120,18 @@ func (s *Store) AcquireAgentActionContinuation(
 	}
 	var rootVersion int
 	var rootStatus string
+	var rootSessionID *int64
 	if err := tx.QueryRow(ctx,
-		`SELECT execution_version,status FROM pending_actions
+		`SELECT execution_version,status,session_id FROM pending_actions
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		  FOR UPDATE`,
 		actionID, tenantID, userID,
-	).Scan(&rootVersion, &rootStatus); err != nil {
-		return nil, agentEventIntegrityError()
+	).Scan(&rootVersion, &rootStatus, &rootSessionID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, agentEventIntegrityError()
+		}
+		return nil, agentEventDatabaseError(
+			"lock Agent action acquisition root", err)
 	}
 	if rootVersion != AgentActionExecutionVersion ||
 		rootStatus != string(types.PendingActionStatusExecuted) {
@@ -140,13 +145,69 @@ func (s *Store) AcquireAgentActionContinuation(
 		actionID, tenantID, userID,
 	))
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, agentEventIntegrityError()
+		}
+		return nil, agentEventDatabaseError(
+			"lock Agent action acquisition continuation", err)
+	}
+	if rootSessionID == nil || *rootSessionID != action.SessionID {
 		return nil, agentEventIntegrityError()
 	}
 	if action.Status != AgentActionStatusConfirmed {
 		return nil, ErrAgentActionTerminal
 	}
-	if err := validateFrozenAgentAction(action); err != nil {
+	if err := validateActiveAgentActionAuthority(
+		ctx, tx, action.ActionID,
+	); err != nil {
+		if agentSessionFactShouldBlock(err) {
+			tag, blockErr := tx.Exec(ctx,
+				`UPDATE agent_action_continuations
+				    SET status='blocked',
+				        blocked_reason='authority_integrity',
+				        lease_owner=NULL,lease_expires_at=NULL,
+				        updated_at=clock_timestamp()
+				  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3
+				    AND status='confirmed'`,
+				action.ActionID, action.TenantID, action.UserID,
+			)
+			if blockErr != nil {
+				return nil, agentEventDatabaseError(
+					"block corrupt Agent action authority", blockErr)
+			}
+			if tag.RowsAffected() != 1 {
+				return nil, err
+			}
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return nil, agentEventDatabaseError(
+					"commit corrupt Agent action authority", commitErr)
+			}
+			return nil, ErrAgentActionTerminal
+		}
 		return nil, err
+	}
+	if err := validateFrozenAgentAction(action); err != nil {
+		tag, blockErr := tx.Exec(ctx,
+			`UPDATE agent_action_continuations
+			    SET status='blocked',blocked_reason='payload_integrity',
+			        lease_owner=NULL,lease_expires_at=NULL,
+			        updated_at=clock_timestamp()
+			  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3
+			    AND status='confirmed'`,
+			action.ActionID, action.TenantID, action.UserID,
+		)
+		if blockErr != nil {
+			return nil, agentEventDatabaseError(
+				"block corrupt Agent action acquisition", blockErr)
+		}
+		if tag.RowsAffected() != 1 {
+			return nil, err
+		}
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return nil, agentEventDatabaseError(
+				"commit corrupt Agent action acquisition", commitErr)
+		}
+		return nil, ErrAgentActionTerminal
 	}
 	var databaseNow time.Time
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).
@@ -238,13 +299,18 @@ func (s *Store) ProjectAgentActionContinuation(
 	}
 	var rootVersion int
 	var rootStatus string
+	var rootSessionID *int64
 	if err := tx.QueryRow(ctx,
-		`SELECT execution_version,status FROM pending_actions
+		`SELECT execution_version,status,session_id FROM pending_actions
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		  FOR UPDATE`,
 		lease.ActionID, lease.TenantID, lease.UserID,
-	).Scan(&rootVersion, &rootStatus); err != nil {
-		return agentEventIntegrityError()
+	).Scan(&rootVersion, &rootStatus, &rootSessionID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return agentEventIntegrityError()
+		}
+		return agentEventDatabaseError(
+			"lock Agent action projection root", err)
 	}
 	if rootVersion != AgentActionExecutionVersion ||
 		rootStatus != string(types.PendingActionStatusExecuted) {
@@ -258,9 +324,79 @@ func (s *Store) ProjectAgentActionContinuation(
 		lease.ActionID, lease.TenantID, lease.UserID,
 	))
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return agentEventIntegrityError()
+		}
+		return agentEventDatabaseError(
+			"lock Agent action projection continuation", err)
+	}
+	if rootSessionID == nil || *rootSessionID != action.SessionID {
 		return agentEventIntegrityError()
 	}
 	if err := validateFrozenAgentAction(action); err != nil {
+		if action.Status != AgentActionStatusConfirmed ||
+			action.LeaseOwner == nil ||
+			*action.LeaseOwner != lease.Owner ||
+			action.LeaseFence != lease.Fence {
+			return err
+		}
+		tag, blockErr := tx.Exec(ctx,
+			`UPDATE agent_action_continuations
+			    SET status='blocked',blocked_reason='payload_integrity',
+			        lease_owner=NULL,lease_expires_at=NULL,
+			        updated_at=clock_timestamp()
+			  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3
+			    AND status='confirmed' AND lease_owner=$4
+			    AND lease_fence=$5`,
+			lease.ActionID, lease.TenantID, lease.UserID,
+			lease.Owner, lease.Fence,
+		)
+		if blockErr != nil {
+			return agentEventDatabaseError(
+				"block corrupt Agent action projection", blockErr)
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrAgentActionBusy
+		}
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return agentEventDatabaseError(
+				"commit corrupt Agent action projection", commitErr)
+		}
+		return nil
+	}
+	if err := validateActiveAgentActionAuthority(
+		ctx, tx, action.ActionID,
+	); err != nil {
+		if agentSessionFactShouldBlock(err) &&
+			action.Status == AgentActionStatusConfirmed &&
+			action.LeaseOwner != nil &&
+			*action.LeaseOwner == lease.Owner &&
+			action.LeaseFence == lease.Fence {
+			tag, blockErr := tx.Exec(ctx,
+				`UPDATE agent_action_continuations
+				    SET status='blocked',
+				        blocked_reason='authority_integrity',
+				        lease_owner=NULL,lease_expires_at=NULL,
+				        updated_at=clock_timestamp()
+				  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3
+				    AND status='confirmed' AND lease_owner=$4
+				    AND lease_fence=$5`,
+				lease.ActionID, lease.TenantID, lease.UserID,
+				lease.Owner, lease.Fence,
+			)
+			if blockErr != nil {
+				return agentEventDatabaseError(
+					"block corrupt Agent action authority", blockErr)
+			}
+			if tag.RowsAffected() != 1 {
+				return ErrAgentActionBusy
+			}
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return agentEventDatabaseError(
+					"commit corrupt Agent action authority", commitErr)
+			}
+			return nil
+		}
 		return err
 	}
 	if action.SessionID != lease.SessionID ||
@@ -312,21 +448,23 @@ func (s *Store) ProjectAgentActionContinuation(
 	}
 	tag, effectErr := effectTx.Exec(ctx,
 		`UPDATE sources
-		    SET status=$3,fail_count=0,next_fetch_at=clock_timestamp(),
+		    SET status=$4,fail_count=0,next_fetch_at=clock_timestamp(),
 		        updated_at=clock_timestamp()
 		  WHERE id=$1
 		    AND (
 		      EXISTS (
 		        SELECT 1 FROM subscriptions
-		         WHERE source_id=$1 AND user_id=$2 AND status=$4
+		         WHERE tenant_id=$3 AND source_id=$1
+		           AND user_id=$2 AND status=$5
 		      )
 		      OR EXISTS (
 		        SELECT 1 FROM schedule_sources ss
 		        JOIN schedules sc ON sc.id=ss.schedule_id
-		         WHERE ss.source_id=$1 AND sc.user_id=$2
+		         WHERE ss.source_id=$1 AND sc.tenant_id=$3
+		           AND sc.user_id=$2
 		      )
 		    )`,
-		action.SourceID, action.UserID,
+		action.SourceID, action.UserID, action.TenantID,
 		types.SourceStatusActive, types.SubscriptionStatusActive,
 	)
 	if effectErr != nil {
@@ -440,15 +578,76 @@ func (s *Store) ReleaseAgentActionContinuation(
 	}
 	var rootVersion int
 	var rootStatus string
+	var rootSessionID *int64
 	if err := tx.QueryRow(ctx,
-		`SELECT execution_version,status FROM pending_actions
+		`SELECT execution_version,status,session_id FROM pending_actions
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		  FOR UPDATE`,
 		lease.ActionID, lease.TenantID, lease.UserID,
-	).Scan(&rootVersion, &rootStatus); err != nil ||
-		rootVersion != AgentActionExecutionVersion ||
+	).Scan(&rootVersion, &rootStatus, &rootSessionID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return agentEventIntegrityError()
+		}
+		return agentEventDatabaseError(
+			"lock Agent action release root", err)
+	}
+	if rootVersion != AgentActionExecutionVersion ||
 		rootStatus != string(types.PendingActionStatusExecuted) {
 		return agentEventIntegrityError()
+	}
+	action, err := scanAgentActionContinuation(tx.QueryRow(ctx,
+		`SELECT `+agentActionContinuationColumns+`
+		   FROM agent_action_continuations
+		  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3
+		  FOR UPDATE`,
+		lease.ActionID, lease.TenantID, lease.UserID,
+	))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return agentEventIntegrityError()
+		}
+		return agentEventDatabaseError(
+			"lock Agent action release continuation", err)
+	}
+	if action.Status != AgentActionStatusConfirmed ||
+		rootSessionID == nil || *rootSessionID != action.SessionID ||
+		action.LeaseOwner == nil || *action.LeaseOwner != lease.Owner ||
+		action.LeaseFence != lease.Fence {
+		return agentEventIntegrityError()
+	}
+	if err := validateActiveAgentActionAuthority(
+		ctx, tx, action.ActionID,
+	); err != nil {
+		if agentSessionFactShouldBlock(err) {
+			tag, blockErr := tx.Exec(ctx,
+				`UPDATE agent_action_continuations
+				    SET status='blocked',
+				        blocked_reason='authority_integrity',
+				        lease_owner=NULL,lease_expires_at=NULL,
+				        updated_at=clock_timestamp()
+				  WHERE action_id=$1 AND tenant_id=$2 AND user_id=$3
+				    AND status='confirmed' AND lease_owner=$4
+				    AND lease_fence=$5`,
+				lease.ActionID, lease.TenantID, lease.UserID,
+				lease.Owner, lease.Fence,
+			)
+			if blockErr != nil {
+				return agentEventDatabaseError(
+					"block corrupt Agent action authority release", blockErr)
+			}
+			if tag.RowsAffected() != 1 {
+				return ErrAgentActionBusy
+			}
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return agentEventDatabaseError(
+					"commit corrupt Agent action authority release", commitErr)
+			}
+			return nil
+		}
+		return err
+	}
+	if err := validateFrozenAgentAction(action); err != nil {
+		return err
 	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE agent_action_continuations

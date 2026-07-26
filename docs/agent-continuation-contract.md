@@ -78,3 +78,55 @@ The migration Down path first takes the same transaction-level admission lock
 as every producer, then follows the projector/purge order—outbox before session
 root—and refuses to remove any non-regenerable fact history. Tenant purge uses
 the same table lock and delete order.
+
+## 7.10-B1a dark exact-action substrate
+
+Migration 058 adds a separate, default-off continuation lane only for a
+confirmed `enable_source` action. This checkpoint is deliberately dark: no
+Agent, callback, server, startup scanner, model, provider, or Temporal
+production call site invokes it. Ordinary newly-created confirmation cards
+remain historical execution-version 0 actions and keep the existing
+claim-and-execute behavior.
+
+The only admission primitive is an explicit exact-action operator activation.
+It locks one still-pending v0 root, verifies its tenant/user/session,
+`enable_source` name, strict `{source_id}` arguments, DB-clock expiry, and
+absence of prior continuation history, then atomically:
+
+1. freezes canonical arguments and digests, the complete registered tool
+   definition/policy versions, the Postgres adapter version, and both possible
+   fixed code-generated terminal session facts;
+2. creates the exact continuation row and generation-1 durable authority;
+3. promotes only that root to execution version 2.
+
+The control operator and effect continuator are unrelated cluster-wide roles.
+Only the operator can promote/demote and append authority; only the
+continuator can confirm, lease, update `sources`, append the exact B3 session
+batch, and checkpoint terminal state. Every control/acquire/project/release
+transaction re-proves exact role attributes, membership graph, search path,
+schema/table/column/sequence ACLs, and lack of public security-definer access
+before entering either role.
+
+A pristine canary may be rolled back once. Rollback appends generation-2
+legacy authority, terminalizes the continuation as `rolled_back`, and demotes
+the untouched root to v0 in one transaction. The immutable row/history stays
+for audit; reactivation is forbidden. Confirmation, lease acquisition, or any
+effect attempt permanently closes rollback.
+
+Projection never calls the generic Agent tool executor or `EnableSource`, and
+never discovers a current session. It uses the frozen source ID and original
+session. The owned-source update, selected fixed terminal fact, route-aware B3
+append, and `completed` checkpoint share one transaction/savepoint. A damaged
+or conflicting B3 batch rolls the source update back before the continuation
+is terminally blocked. A lost commit response re-enters replay-only mode and
+must prove the existing complete batch byte-for-byte; it cannot reconstruct a
+missing batch from a completed flag.
+
+Tenant purge follows root → continuation → session lock order and deletes
+authority → continuation → pending root. Migration Down uses the same root
+order and refuses both any continuation history and any orphan execution
+version 2 root.
+
+The remaining B1b work is intentionally not claimed by this dark checkpoint:
+confirmation routing before legacy Claim, startup/periodic bounded dispatcher,
+graceful drain, and exact-action runtimeadmin CLI activation/status/rollback.

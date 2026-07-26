@@ -1,4 +1,4 @@
--- 057: exact-action durable terminal convergence for enable_source.
+-- 058: exact-action durable terminal convergence for enable_source.
 --
 -- This is a dark, per-action lane. New durable candidates use
 -- pending_actions.execution_version=2, so the historical v0 Claim can never
@@ -221,7 +221,7 @@ BEGIN
     ] LOOP
         IF pg_has_role(role_name,'vane_app','MEMBER')
            OR pg_has_role('vane_app',role_name,'MEMBER') THEN
-            RAISE EXCEPTION '057: vane_app and % must be unrelated',role_name;
+            RAISE EXCEPTION '058: vane_app and % must be unrelated',role_name;
         END IF;
         IF EXISTS (
             SELECT 1 FROM pg_auth_members am
@@ -230,14 +230,14 @@ BEGIN
             WHERE granted_role.rolname=role_name
               AND member_role.rolname<>CURRENT_USER
         ) THEN
-            RAISE EXCEPTION '057: only migration owner may enter %',role_name;
+            RAISE EXCEPTION '058: only migration owner may enter %',role_name;
         END IF;
         IF EXISTS (
             SELECT 1 FROM pg_auth_members am
             JOIN pg_roles member_role ON member_role.oid=am.member
             WHERE member_role.rolname=role_name
         ) THEN
-            RAISE EXCEPTION '057: % must not enter another role',role_name;
+            RAISE EXCEPTION '058: % must not enter another role',role_name;
         END IF;
     END LOOP;
     IF pg_has_role(
@@ -247,7 +247,7 @@ BEGIN
            'vane_agent_action_continuator',
            'vane_agent_action_operator','MEMBER'
        ) THEN
-        RAISE EXCEPTION '057: action control/effect roles must be unrelated';
+        RAISE EXCEPTION '058: action control/effect roles must be unrelated';
     END IF;
 END $$;
 -- +goose StatementEnd
@@ -256,10 +256,12 @@ GRANT USAGE ON SCHEMA public
     TO vane_agent_action_operator,vane_agent_action_continuator;
 
 GRANT SELECT (
-    id,tenant_id,user_id,session_id,tool_name,args,summary,status,expires_at,
-    executed_at,execution_version
-) ON pending_actions
-    TO vane_agent_action_operator,vane_agent_action_continuator;
+    id,tenant_id,user_id,session_id,tool_name,args,status,expires_at,
+    execution_version
+) ON pending_actions TO vane_agent_action_operator;
+GRANT SELECT (
+    id,tenant_id,user_id,session_id,status,execution_version
+) ON pending_actions TO vane_agent_action_continuator;
 GRANT UPDATE (execution_version)
     ON pending_actions TO vane_agent_action_operator;
 GRANT UPDATE (status,executed_at,updated_at)
@@ -290,9 +292,13 @@ GRANT UPDATE (status,updated_at)
     ON agent_action_continuations TO vane_agent_action_operator;
 
 GRANT SELECT (
-    id,tenant_id,user_id,action_id,generation,mode,evidence,created_at
+    tenant_id,user_id,action_id,generation,mode,evidence
 ) ON agent_action_continuation_authority_events
-    TO vane_agent_action_operator,vane_agent_action_continuator;
+    TO vane_agent_action_operator;
+GRANT SELECT (
+    tenant_id,action_id,generation,mode
+) ON agent_action_continuation_authority_events
+    TO vane_agent_action_continuator;
 GRANT INSERT (
     tenant_id,user_id,action_id,generation,mode,evidence
 ) ON agent_action_continuation_authority_events
@@ -300,15 +306,16 @@ GRANT INSERT (
 GRANT USAGE ON SEQUENCE agent_action_continuation_authority_events_id_seq
     TO vane_agent_action_operator;
 
-GRANT SELECT (id,status,fail_count,next_fetch_at,updated_at)
+GRANT SELECT (id)
     ON sources TO vane_agent_action_continuator;
 GRANT UPDATE (status,fail_count,next_fetch_at,updated_at)
     ON sources TO vane_agent_action_continuator;
-GRANT SELECT (source_id,user_id,status)
+GRANT SELECT (tenant_id,source_id,user_id,status)
     ON subscriptions TO vane_agent_action_continuator;
 GRANT SELECT (schedule_id,source_id)
     ON schedule_sources TO vane_agent_action_continuator;
-GRANT SELECT (id,user_id) ON schedules TO vane_agent_action_continuator;
+GRANT SELECT (id,tenant_id,user_id)
+    ON schedules TO vane_agent_action_continuator;
 GRANT SELECT (id,tenant_id,user_id,messages,turn_count,activated_tools)
     ON agent_sessions TO vane_agent_action_continuator;
 GRANT UPDATE (messages) ON agent_sessions TO vane_agent_action_continuator;
@@ -333,20 +340,24 @@ GRANT SELECT (
 SELECT pg_advisory_xact_lock(1447120453,1095976528)
     /* agent action producer/downgrade admission */;
 LOCK TABLE pending_actions IN ACCESS EXCLUSIVE MODE
-    /* migration 057 action root first */;
+    /* migration 058 action root first */;
 LOCK TABLE agent_action_continuations IN ACCESS EXCLUSIVE MODE
-    /* migration 057 continuation second */;
+    /* migration 058 continuation second */;
 LOCK TABLE sources IN ACCESS EXCLUSIVE MODE
-    /* migration 057 effect target third */;
+    /* migration 058 effect target third */;
 LOCK TABLE agent_sessions IN ACCESS EXCLUSIVE MODE
-    /* migration 057 session target fourth */;
+    /* migration 058 session target fourth */;
 
 -- +goose StatementBegin
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM agent_action_continuations) THEN
+    IF EXISTS (SELECT 1 FROM agent_action_continuations)
+       OR EXISTS (
+           SELECT 1 FROM pending_actions
+            WHERE execution_version=2
+       ) THEN
         RAISE EXCEPTION
-            '057: refusing downgrade while durable Agent actions exist';
+            '058: refusing downgrade while durable Agent actions exist';
     END IF;
 END $$;
 -- +goose StatementEnd
@@ -359,9 +370,13 @@ REVOKE INSERT (
 ) ON agent_action_continuation_authority_events
     FROM vane_agent_action_operator;
 REVOKE SELECT (
-    id,tenant_id,user_id,action_id,generation,mode,evidence,created_at
+    tenant_id,action_id,generation,mode
 ) ON agent_action_continuation_authority_events
-    FROM vane_agent_action_operator,vane_agent_action_continuator;
+    FROM vane_agent_action_continuator;
+REVOKE SELECT (
+    tenant_id,user_id,action_id,generation,mode,evidence
+) ON agent_action_continuation_authority_events
+    FROM vane_agent_action_operator;
 REVOKE UPDATE (
     status,terminal_code,lease_owner,lease_fence,lease_expires_at,
     attempt_count,next_attempt_at,confirmed_at,completed_at,
@@ -405,25 +420,27 @@ REVOKE UPDATE (messages) ON agent_sessions
     FROM vane_agent_action_continuator;
 REVOKE SELECT (id,tenant_id,user_id,messages,turn_count,activated_tools)
     ON agent_sessions FROM vane_agent_action_continuator;
-REVOKE SELECT (id,user_id) ON schedules
+REVOKE SELECT (id,tenant_id,user_id) ON schedules
     FROM vane_agent_action_continuator;
 REVOKE SELECT (schedule_id,source_id) ON schedule_sources
     FROM vane_agent_action_continuator;
-REVOKE SELECT (source_id,user_id,status) ON subscriptions
+REVOKE SELECT (tenant_id,source_id,user_id,status) ON subscriptions
     FROM vane_agent_action_continuator;
 REVOKE UPDATE (status,fail_count,next_fetch_at,updated_at)
     ON sources FROM vane_agent_action_continuator;
-REVOKE SELECT (id,status,fail_count,next_fetch_at,updated_at)
+REVOKE SELECT (id)
     ON sources FROM vane_agent_action_continuator;
 REVOKE UPDATE (status,executed_at,updated_at)
     ON pending_actions FROM vane_agent_action_continuator;
 REVOKE UPDATE (execution_version)
     ON pending_actions FROM vane_agent_action_operator;
 REVOKE SELECT (
-    id,tenant_id,user_id,session_id,tool_name,args,summary,status,expires_at,
-    executed_at,execution_version
-) ON pending_actions
-    FROM vane_agent_action_operator,vane_agent_action_continuator;
+    id,tenant_id,user_id,session_id,status,execution_version
+) ON pending_actions FROM vane_agent_action_continuator;
+REVOKE SELECT (
+    id,tenant_id,user_id,session_id,tool_name,args,status,expires_at,
+    execution_version
+) ON pending_actions FROM vane_agent_action_operator;
 REVOKE USAGE ON SCHEMA public
     FROM vane_agent_action_operator,vane_agent_action_continuator;
 
