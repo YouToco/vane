@@ -881,6 +881,7 @@ func TestFeedbackStore(t *testing.T) {
 		dD := mk("纯误判内容")
 		addReasonFeedback(t, u2.ID, dD, types.FeedbackReasonNotRelevant, "") // 与任务无关 → 返回
 		dOld := mk("过时新闻")
+		addFeedback(t, u2.ID, dOld, types.FeedbackActionNotInterested, "")
 		addReasonFeedback(t, u2.ID, dOld, types.FeedbackReasonOutdated, "三个月前")
 		dE := mk("只感兴趣内容")
 		addFeedback(t, u2.ID, dE, types.FeedbackActionInterested, "") // 正面 → 不返回
