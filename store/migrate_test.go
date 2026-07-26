@@ -78,6 +78,9 @@ var wantTables = []string{
 	"agent_turn_context_snapshots",
 	// 056 durable business-fact to exact Agent-session continuation.
 	"agent_session_fact_outbox",
+	// 057 exact-action durable terminal convergence for enable_source.
+	"agent_action_continuations",
+	"agent_action_continuation_authority_events",
 	// 036 C2c-2 immutable run-snapshot v2 shadow sidecar.
 	"task_run_snapshot_v2_shadows",
 	// 037 C2c-3b-1 durable per-run v2 authority fence.
