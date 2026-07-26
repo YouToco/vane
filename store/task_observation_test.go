@@ -541,6 +541,96 @@ func TestTaskPolicySuggestionUnverifiableCurrentStateNeverClaims(
 		assertTaskSuggestionNotificationStatus(
 			t, f, feedbackID, "uncertain")
 	})
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, *compiledRunWriteFixture)
+	}{
+		{
+			name: "tenant inactive",
+			mutate: func(t *testing.T, f *compiledRunWriteFixture) {
+				t.Helper()
+				if _, err := f.base.st.pool.Exec(t.Context(),
+					`UPDATE tenants SET status='suspended'
+					  WHERE id=$1`,
+					f.idA.TenantID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "membership missing",
+			mutate: func(t *testing.T, f *compiledRunWriteFixture) {
+				t.Helper()
+				if _, err := f.base.st.pool.Exec(t.Context(),
+					`DELETE FROM memberships
+					  WHERE tenant_id=$1 AND user_id=$2`,
+					f.idA.TenantID, f.idA.UserID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCompiledRunWriteFixture(t)
+			feedbackID, _ := createOutdatedSuggestion(
+				t, f, strings.ReplaceAll(tc.name, " ", "-"))
+			installCurrentApprovedTaskPolicy(t, f, false)
+			claim, err := f.base.st.ClaimTaskPolicySuggestion(
+				t.Context(), f.idA.TenantID, f.idA.UserID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(t, f)
+			dispatch, err := f.base.st.BeginTaskPolicySuggestionDispatch(
+				t.Context(), f.idA.TenantID, f.idA.UserID,
+				claim.ClaimToken)
+			if err != nil || dispatch {
+				t.Fatalf("unverifiable dispatch=%v err=%v",
+					dispatch, err)
+			}
+			assertTaskSuggestionNotificationStatus(
+				t, f, feedbackID, "uncertain")
+		})
+	}
+}
+
+func TestTaskPolicySuggestionDeletedTaskIsNotRequired(t *testing.T) {
+	f := newCompiledRunWriteFixture(t)
+	ctx := t.Context()
+	feedbackID, _ := createOutdatedSuggestion(t, f, "deleted-task")
+	claim, err := f.base.st.ClaimTaskPolicySuggestion(
+		ctx, f.idA.TenantID, f.idA.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.base.st.pool.Exec(ctx,
+		`DELETE FROM schedules
+		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+		f.idA.TenantID, f.idA.UserID, f.taskA); err != nil {
+		t.Fatal(err)
+	}
+
+	dispatch, err := f.base.st.BeginTaskPolicySuggestionDispatch(
+		ctx, f.idA.TenantID, f.idA.UserID, claim.ClaimToken)
+	if err != nil || dispatch {
+		t.Fatalf("deleted task dispatch=%v err=%v, want suppressed",
+			dispatch, err)
+	}
+	assertTaskSuggestionNotificationStatus(
+		t, f, feedbackID, "not_required")
+	var lastError string
+	if err := f.base.st.pool.QueryRow(ctx,
+		`SELECT COALESCE(notification_last_error,'')
+		   FROM feedback_freshness_triage
+		  WHERE tenant_id=$1 AND user_id=$2 AND feedback_id=$3`,
+		f.idA.TenantID, f.idA.UserID, feedbackID,
+	).Scan(&lastError); err != nil {
+		t.Fatal(err)
+	}
+	if lastError != "source task is missing or deleted" {
+		t.Fatalf("deleted task last error=%q", lastError)
+	}
 }
 
 func TestBeginTaskPolicySuggestionDispatchLocksScheduleBeforeTriage(

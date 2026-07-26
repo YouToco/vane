@@ -341,6 +341,7 @@ const (
 	currentObservationPolicyUnverifiable currentObservationPolicyState = iota
 	currentObservationPolicyAbsent
 	currentObservationPolicyPresent
+	currentObservationPolicyTaskMissing
 )
 
 func currentApprovedObservationPolicyTx(
@@ -355,29 +356,42 @@ func currentApprovedObservationPolicyTx(
 	var version *int64
 	var digest *string
 	var rawMode string
+	var rawStatus string
 	var editOperationID *string
 	var editFence *int64
+	var tenantActive, membershipExists bool
 	err := tx.QueryRow(ctx,
 		`SELECT s.approved_definition_version,s.approved_definition_digest,
 		        s.execution_mode,s.definition_edit_operation_id,
-		        s.definition_edit_fence
+		        s.definition_edit_fence,s.status,
+		        EXISTS (
+		            SELECT 1
+		              FROM tenants t
+		             WHERE t.id=s.tenant_id
+		               AND t.status='active' AND t.deleted_at IS NULL
+		        ),
+		        EXISTS (
+		            SELECT 1
+		              FROM memberships m
+		             WHERE m.tenant_id=s.tenant_id AND m.user_id=s.user_id
+		        )
 		   FROM schedules s
-		   JOIN tenants t
-		     ON t.id=s.tenant_id
-		    AND t.status='active' AND t.deleted_at IS NULL
-		   JOIN memberships m
-		     ON m.tenant_id=s.tenant_id AND m.user_id=s.user_id
 		  WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.id=$3
-		    AND s.status IN ('active','paused')
 		  FOR KEY SHARE OF s`,
 		tenantID, userID, taskID).Scan(
-		&version, &digest, &rawMode, &editOperationID, &editFence)
+		&version, &digest, &rawMode, &editOperationID, &editFence,
+		&rawStatus, &tenantActive, &membershipExists)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return currentObservationPolicyUnverifiable, nil
+		return currentObservationPolicyTaskMissing, nil
 	}
 	if err != nil {
 		return currentObservationPolicyUnverifiable,
 			taskRunDatabaseError("lock current task policy head", err)
+	}
+	if !tenantActive || !membershipExists ||
+		(rawStatus != string(types.ScheduleStatusActive) &&
+			rawStatus != string(types.ScheduleStatusPaused)) {
+		return currentObservationPolicyUnverifiable, nil
 	}
 	mode, modeErr := types.ParseExecutionMode(rawMode)
 	if version == nil || digest == nil ||
@@ -542,7 +556,10 @@ func (s *Store) BeginTaskPolicySuggestionDispatch(
 	if policyState != currentObservationPolicyAbsent {
 		status := "not_required"
 		cause := "current approved observation policy already exists"
-		if policyState == currentObservationPolicyUnverifiable {
+		switch policyState {
+		case currentObservationPolicyTaskMissing:
+			cause = "source task is missing or deleted"
+		case currentObservationPolicyUnverifiable:
 			status = "uncertain"
 			cause = "current approved task policy could not be verified"
 		}
