@@ -435,9 +435,11 @@ jobs:
             --input "$DEPLOY_ROOT/incoming/frontend" \
             --output "$DEPLOY_ROOT/verified/frontend"
 
-      - name: Install pinned Aliyun CLI
+      - name: Install pinned Aliyun tools
         if: needs.plan.outputs.frontend_changed == 'true'
-        run: control-plane/scripts/install-aliyun.sh
+        run: |
+          control-plane/scripts/install-aliyun.sh
+          control-plane/scripts/install-ossutil.sh
 
       - name: Deploy backend and run production Gate
         if: needs.plan.outputs.backend_changed == 'true'
@@ -459,6 +461,7 @@ jobs:
           EXPECTED_DEPLOYED_SHA: ${{ needs.plan.outputs.frontend_previous }}
           FRONTEND_RECEIPT_DIR: ${{ runner.temp }}/vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}/frontend-receipts
           ALIYUN_BIN: ${{ runner.temp }}/aliyun-3.4.8/aliyun
+          OSSUTIL_BIN: ${{ runner.temp }}/aliyun-3.4.8/ossutil
           ALIYUN_ACCESS_KEY_ID: ${{ secrets.ALIYUN_ACCESS_KEY_ID }}
           ALIYUN_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}
         run: |

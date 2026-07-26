@@ -269,10 +269,19 @@ deploy_frontend_aliyun() {
   fi
 
   require_env \
-    ALIYUN_BIN ALIYUN_ACCESS_KEY_ID ALIYUN_ACCESS_KEY_SECRET \
-    RUNNER_TEMP
+    ALIYUN_BIN OSSUTIL_BIN \
+    ALIYUN_ACCESS_KEY_ID ALIYUN_ACCESS_KEY_SECRET
   [[ -x $ALIYUN_BIN ]] || {
     echo "pinned Aliyun CLI is missing" >&2
+    exit 1
+  }
+  [[ -x $OSSUTIL_BIN ]] || {
+    echo "pinned ossutil is missing" >&2
+    exit 1
+  }
+  ossutil_version=$("$OSSUTIL_BIN" version)
+  [[ $ossutil_version == "2.3.0" ]] || {
+    echo "unexpected pinned ossutil version: $ossutil_version" >&2
     exit 1
   }
   [[ -f $payload/dist/index.html && ! -L $payload/dist/index.html ]] || {
@@ -281,31 +290,25 @@ deploy_frontend_aliyun() {
   }
 
   (
-    aliyun_temp=$(mktemp -d "$RUNNER_TEMP/aliyun-config.XXXXXX")
-    aliyun_config=$aliyun_temp/config.json
-    chmod 700 "$aliyun_temp"
-    trap 'rm -rf -- "$aliyun_temp"' EXIT
-
-    "$ALIYUN_BIN" configure set \
-      --config-path "$aliyun_config" \
-      --profile default \
-      --mode AK \
-      --access-key-id "$ALIYUN_ACCESS_KEY_ID" \
-      --access-key-secret "$ALIYUN_ACCESS_KEY_SECRET" \
-      --region cn-shenzhen
-
-    "$ALIYUN_BIN" oss sync \
+    # `aliyun oss` is the deprecated ossutil v1 bridge and does not understand
+    # the outer CLI's --config-path flag. Use the separately SHA-pinned
+    # ossutil v2 binary and its supported environment credential provider.
+    # Both distribution commands keep secrets out of argv and credential files.
+    OSS_ACCESS_KEY_ID="$ALIYUN_ACCESS_KEY_ID" \
+      OSS_ACCESS_KEY_SECRET="$ALIYUN_ACCESS_KEY_SECRET" \
+      OSS_REGION=cn-shenzhen \
+      "$OSSUTIL_BIN" sync \
       "$payload/dist/" oss://zhuoqidev-vane-web/ \
-      --delete --force \
-      --config-path "$aliyun_config" \
-      --profile default
+      --delete --force
 
     for attempt in 1 2 3; do
-      if "$ALIYUN_BIN" cdn RefreshObjectCaches \
+      if ALIBABA_CLOUD_IGNORE_PROFILE=TRUE \
+        ALIBABA_CLOUD_ACCESS_KEY_ID="$ALIYUN_ACCESS_KEY_ID" \
+        ALIBABA_CLOUD_ACCESS_KEY_SECRET="$ALIYUN_ACCESS_KEY_SECRET" \
+        ALIBABA_CLOUD_REGION_ID=cn-shenzhen \
+        "$ALIYUN_BIN" cdn RefreshObjectCaches \
         --ObjectPath "https://vane.zhuoqidev.com/" \
-        --ObjectType Directory \
-        --config-path "$aliyun_config" \
-        --profile default; then
+        --ObjectType Directory; then
         break
       fi
       [[ $attempt -lt 3 ]] || exit 1
