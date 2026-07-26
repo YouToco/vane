@@ -38,6 +38,7 @@ var agentActionGenericExecution = map[string]bool{
 type agentActionReferenceAllowance struct {
 	path        string
 	declaration string
+	receiver    string
 	references  map[string]int
 }
 
@@ -54,6 +55,7 @@ var agentActionReferenceAllowances = []agentActionReferenceAllowance{
 	{
 		path:        "cmd/runtimeadmin/main.go",
 		declaration: "executeAgentActionCutover",
+		receiver:    "st",
 		references: map[string]int{
 			"GetAgentActionContinuationStatus": 1,
 			"ActivateAgentActionContinuation":  1,
@@ -71,6 +73,7 @@ var agentActionReferenceAllowances = []agentActionReferenceAllowance{
 	{
 		path:        "agentcontinuation/action_controller.go",
 		declaration: "Confirm",
+		receiver:    "c.store",
 		references: map[string]int{
 			"ConfirmAgentActionContinuation": 1,
 		},
@@ -78,6 +81,7 @@ var agentActionReferenceAllowances = []agentActionReferenceAllowance{
 	{
 		path:        "agentcontinuation/action_controller.go",
 		declaration: "Cancel",
+		receiver:    "c.store",
 		references: map[string]int{
 			"CancelAgentActionContinuation": 1,
 		},
@@ -96,6 +100,7 @@ var agentActionReferenceAllowances = []agentActionReferenceAllowance{
 	{
 		path:        "agentcontinuation/action_dispatcher.go",
 		declaration: "DispatchOnce",
+		receiver:    "d.store",
 		references: map[string]int{
 			"ListDueAgentActionContinuationTenantIDs": 2,
 			"ListDueAgentActionContinuations":         1,
@@ -104,6 +109,7 @@ var agentActionReferenceAllowances = []agentActionReferenceAllowance{
 	{
 		path:        "agentcontinuation/action_dispatcher.go",
 		declaration: "dispatchAction",
+		receiver:    "d.store",
 		references: map[string]int{
 			"AcquireAgentActionContinuation": 1,
 			"ProjectAgentActionContinuation": 1,
@@ -285,19 +291,64 @@ func escape(s interface{ ActivateAgentActionContinuation() }) {
 
 	duplicate := parseAgentActionMutation(t, `package main
 func executeAgentActionCutover(
-	s interface{ ActivateAgentActionContinuation() },
+	st interface{ ActivateAgentActionContinuation() },
 ) {
-	s.ActivateAgentActionContinuation()
-	s.ActivateAgentActionContinuation()
+	st.ActivateAgentActionContinuation()
+	st.ActivateAgentActionContinuation()
 }`)
 	files := map[string]*ast.File{
 		filepath.Join(root, "cmd", "runtimeadmin", "main.go"): duplicate,
 	}
 	got := agentActionApprovedAdapterViolations(files, root)
 	if !agentActionViolationContains(
-		got, "ActivateAgentActionContinuation count=3 want=1",
+		got, "ActivateAgentActionContinuation direct count=2 want=1",
 	) {
 		t.Fatalf("duplicate exact call did not fail count guard: %v", got)
+	}
+
+	methodValue := parseAgentActionMutation(t, `package main
+func executeAgentActionCutover(
+	st interface {
+		GetAgentActionContinuationStatus()
+		ActivateAgentActionContinuation()
+		RollbackAgentActionContinuation()
+	},
+) {
+	activate := st.ActivateAgentActionContinuation
+	activate()
+	st.GetAgentActionContinuationStatus()
+	st.RollbackAgentActionContinuation()
+}`)
+	files = map[string]*ast.File{
+		filepath.Join(root, "cmd", "runtimeadmin", "main.go"): methodValue,
+	}
+	got = agentActionApprovedAdapterViolations(files, root)
+	if !agentActionViolationContains(
+		got, "ActivateAgentActionContinuation refs/direct=2/0",
+	) {
+		t.Fatalf("method value escaped direct-call guard: %v", got)
+	}
+
+	wrongReceiver := parseAgentActionMutation(t, `package main
+func executeAgentActionCutover(
+	st, other interface {
+		GetAgentActionContinuationStatus()
+		ActivateAgentActionContinuation()
+		RollbackAgentActionContinuation()
+	},
+) {
+	other.ActivateAgentActionContinuation()
+	st.GetAgentActionContinuationStatus()
+	st.RollbackAgentActionContinuation()
+}`)
+	files = map[string]*ast.File{
+		filepath.Join(root, "cmd", "runtimeadmin", "main.go"): wrongReceiver,
+	}
+	got = agentActionApprovedAdapterViolations(files, root)
+	if !agentActionViolationContains(
+		got, "ActivateAgentActionContinuation refs/direct=2/0 receiver=st",
+	) {
+		t.Fatalf("wrong receiver escaped direct-call guard: %v", got)
 	}
 
 	staleExportedDispatcher := parseAgentActionMutation(t, `package agentcontinuation
@@ -332,6 +383,20 @@ func escape(tool interface{ Execute() }) { tool.Execute() }`)
 		map[string]*ast.File{path: file}, root)
 	if !agentActionViolationContains(got, "generic Execute") {
 		t.Fatalf("generic adapter execution passed guard: %v", got)
+	}
+
+	file = parseAgentActionMutation(t, `package agentcontinuation
+import "reflect"
+func escape(target any) {
+	reflect.ValueOf(target).MethodByName(
+		"Activate" + "AgentActionContinuation",
+	).Call(nil)
+}`)
+	got = agentActionAdapterGenericExecutionViolations(
+		map[string]*ast.File{path: file}, root)
+	if !agentActionViolationContains(got, "dynamic dispatch reflect") ||
+		!agentActionViolationContains(got, "dynamic dispatch MethodByName") {
+		t.Fatalf("reflection adapter execution passed guard: %v", got)
 	}
 }
 
@@ -846,30 +911,85 @@ func agentActionApprovedAdapterViolations(
 					allowance.path, allowance.declaration))
 			continue
 		}
-		counts := make(map[string]int)
+		references := make(map[string]int)
 		ast.Inspect(declaration, func(node ast.Node) bool {
 			identifier, ok := node.(*ast.Ident)
 			if ok && agentActionEntryPoints[identifier.Name] {
-				counts[identifier.Name]++
+				references[identifier.Name]++
 			}
 			return true
 		})
+		counts := references
+		if allowance.receiver != "" {
+			counts = agentActionDirectEntryCalls(
+				declaration, allowance.receiver)
+		}
 		for name, want := range allowance.references {
 			if counts[name] != want {
 				violations = append(violations,
-					fmt.Sprintf("%s:%s %s count=%d want=%d",
+					fmt.Sprintf("%s:%s %s direct count=%d want=%d",
 						allowance.path, allowance.declaration,
 						name, counts[name], want))
 			}
+			if allowance.receiver != "" &&
+				references[name] != counts[name] {
+				violations = append(violations,
+					fmt.Sprintf(
+						"%s:%s %s refs/direct=%d/%d receiver=%s",
+						allowance.path, allowance.declaration, name,
+						references[name], counts[name], allowance.receiver))
+			}
 			delete(counts, name)
+			delete(references, name)
 		}
 		for name, count := range counts {
 			violations = append(violations,
 				fmt.Sprintf("%s:%s unapproved %s count=%d",
 					allowance.path, allowance.declaration, name, count))
 		}
+		for name, count := range references {
+			violations = append(violations,
+				fmt.Sprintf("%s:%s unapproved %s refs=%d",
+					allowance.path, allowance.declaration, name, count))
+		}
 	}
 	return violations
+}
+
+func agentActionDirectEntryCalls(
+	declaration ast.Decl,
+	receiver string,
+) map[string]int {
+	counts := make(map[string]int)
+	ast.Inspect(declaration, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || !agentActionEntryPoints[selector.Sel.Name] ||
+			agentActionExpressionPath(selector.X) != receiver {
+			return true
+		}
+		counts[selector.Sel.Name]++
+		return true
+	})
+	return counts
+}
+
+func agentActionExpressionPath(expression ast.Expr) string {
+	switch value := expression.(type) {
+	case *ast.Ident:
+		return value.Name
+	case *ast.SelectorExpr:
+		base := agentActionExpressionPath(value.X)
+		if base == "" {
+			return ""
+		}
+		return base + "." + value.Sel.Name
+	default:
+		return ""
+	}
 }
 
 func agentActionFindDeclaration(
@@ -907,6 +1027,12 @@ func agentActionAdapterGenericExecutionViolations(
 				if agentActionGenericExecution[value.Name] {
 					violations = append(violations,
 						fmt.Sprintf("%s reaches generic %s",
+							relativePath, value.Name))
+				}
+				if value.Name == "reflect" ||
+					value.Name == "MethodByName" {
+					violations = append(violations,
+						fmt.Sprintf("%s reaches dynamic dispatch %s",
 							relativePath, value.Name))
 				}
 			case *ast.BasicLit:
