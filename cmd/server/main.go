@@ -143,15 +143,25 @@ func run() error {
 		ctx context.Context,
 		tenantID, userID, deliveryID int64,
 		claimToken string,
-	) (string, bool, error) {
+	) (evolver.TaskPolicySuggestionNotification, error) {
 		openID, err := st.GetUserFeishuOpenID(ctx, userID)
 		if err != nil {
-			return "", true, err
+			return evolver.TaskPolicySuggestionNotification{
+				DefinitelyNotSent: true,
+			}, err
 		}
-		if err := st.BeginTaskPolicySuggestionDispatch(
+		dispatch, err := st.BeginTaskPolicySuggestionDispatch(
 			ctx, tenantID, userID, claimToken,
-		); err != nil {
-			return "", true, err
+		)
+		if err != nil {
+			return evolver.TaskPolicySuggestionNotification{
+				DefinitelyNotSent: true,
+			}, err
+		}
+		if !dispatch {
+			return evolver.TaskPolicySuggestionNotification{
+				Suppressed: true, DefinitelyNotSent: true,
+			}, nil
 		}
 		observation, err := manager.SendCardWithUUIDResult(
 			ctx, manager.AppIdentity(), openID, feishu.BuildReplyCard(
@@ -167,9 +177,11 @@ func run() error {
 				"任务策略建议发送返回非 sent 状态：%s",
 				observation.Disposition)
 		}
-		return observation.MessageID,
-			observation.Disposition == pusheffect.AttemptDefiniteNotSent,
-			err
+		return evolver.TaskPolicySuggestionNotification{
+			MessageID: observation.MessageID,
+			DefinitelyNotSent: observation.Disposition ==
+				pusheffect.AttemptDefiniteNotSent,
+		}, err
 	})
 	// buildNotice=feishu.BuildReplyCard：抓取失败告警走无按钮的普通卡（功能 5.2），
 	// 与 buildCard（带反馈按钮的 delivery 卡）分开注入，不碰 M5 卡片反馈路径。

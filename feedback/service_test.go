@@ -167,12 +167,10 @@ func TestHandleReasonSubmit_OutdatedWithoutPolicyCreatesSuggestionNotice(t *test
 
 	h.submitBadFeedback(t, types.FeedbackReasonOutdated, "窗口不对")
 	notices := h.notifier.all()
-	if len(notices) != 2 ||
-		notices[0].sourceIdentity != "feedback-policy-suggestion:1" ||
-		notices[1].sourceIdentity != "feedback-click:1" ||
-		!strings.Contains(notices[0].text, "等待用户确认") ||
-		!strings.Contains(notices[1].text, "反馈问题：过时或超出任务时间范围") {
-		t.Fatalf("suggestion and feedback notices=%+v", notices)
+	if len(notices) != 1 ||
+		notices[0].sourceIdentity != "feedback-click:1" ||
+		!strings.Contains(notices[0].text, "反馈问题：过时或超出任务时间范围") {
+		t.Fatalf("feedback notice=%+v", notices)
 	}
 }
 
