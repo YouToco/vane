@@ -1403,6 +1403,7 @@ func normalizeDirectTaskCreationArgs(args json.RawMessage) (json.RawMessage, boo
 		ApprovedFetchPlan json.RawMessage `json:"approved_fetch_plan,omitempty"`
 		NLDescription     json.RawMessage `json:"nl_description,omitempty"`
 		Strictness        json.RawMessage `json:"strictness,omitempty"`
+		ObservationPolicy json.RawMessage `json:"observation_policy,omitempty"`
 	}
 	if strictjson.DecodeExact(args, &envelope) != nil ||
 		len(bytes.TrimSpace(envelope.ApprovedFetchPlan)) == 0 {
@@ -1440,6 +1441,7 @@ func inspectModelTaskCreationPlan(
 		ApprovedFetchPlan json.RawMessage `json:"approved_fetch_plan,omitempty"`
 		NLDescription     json.RawMessage `json:"nl_description,omitempty"`
 		Strictness        json.RawMessage `json:"strictness,omitempty"`
+		ObservationPolicy json.RawMessage `json:"observation_policy,omitempty"`
 	}
 	if strictjson.DecodeExact(args, &envelope) != nil {
 		return modelTaskCreationPlanInspection{}, false

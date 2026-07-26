@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/sourcespec"
@@ -1265,6 +1266,7 @@ type createScheduleProposalArgs struct {
 	NLDescription     string                           `json:"nl_description"`
 	Strictness        types.PushStrictness             `json:"strictness"`
 	ApprovedFetchPlan *createScheduleProposalFetchPlan `json:"approved_fetch_plan"`
+	ObservationPolicy *observation.PolicySpecV1        `json:"observation_policy,omitempty"`
 }
 
 type createScheduleProposalFetchPlan struct {
@@ -1286,6 +1288,7 @@ type createScheduleProposalExactEnvelope struct {
 	NLDescription     json.RawMessage `json:"nl_description,omitempty"`
 	Strictness        json.RawMessage `json:"strictness,omitempty"`
 	ApprovedFetchPlan json.RawMessage `json:"approved_fetch_plan,omitempty"`
+	ObservationPolicy json.RawMessage `json:"observation_policy,omitempty"`
 }
 
 func creationProposalHasTransientField(raw json.RawMessage) bool {
@@ -1343,12 +1346,28 @@ func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArg
 			return nil, fmt.Errorf("task: decode create_schedule strictness: %w", err)
 		}
 	}
+	if len(envelope.ObservationPolicy) != 0 {
+		if isExplicitJSONNull(envelope.ObservationPolicy) {
+			return nil, errors.New("task: observation_policy must be an object")
+		}
+		var policy observation.PolicySpecV1
+		if err := strictjson.DecodeExact(
+			envelope.ObservationPolicy, &policy,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"task: decode create_schedule observation_policy: %w",
+				err,
+			)
+		}
+		args.ObservationPolicy = &policy
+	}
 	// Preserve the legacy common-envelope precedence before inspecting any
 	// transient plan structure. Invalid spec/intent/strictness must win over a
 	// bad source_specs version, empty items, or invalid existing IDs.
 	if _, err := normalizeCreateScheduleEnvelope(&createScheduleCommandArgs{
 		Spec: args.Spec, Intent: args.Intent,
 		NLDescription: args.NLDescription, Strictness: args.Strictness,
+		ObservationPolicy: args.ObservationPolicy,
 	}); err != nil {
 		return nil, err
 	}
@@ -1744,6 +1763,7 @@ func normalizeExpandedCreationProposal(
 		Spec: proposal.Spec, Intent: proposal.Intent,
 		NLDescription: proposal.NLDescription, Strictness: proposal.Strictness,
 		ApprovedFetchPlan: fullPlan,
+		ObservationPolicy: proposal.ObservationPolicy,
 	})
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, fmt.Errorf(
@@ -1844,15 +1864,17 @@ func canonicalCreationProposalArgs(
 	command normalizedCreateScheduleCommand,
 ) (json.RawMessage, error) {
 	args := struct {
-		Spec              scheduler.ScheduleSpec `json:"spec"`
-		Intent            string                 `json:"intent"`
-		NLDescription     string                 `json:"nl_description"`
-		Strictness        types.PushStrictness   `json:"strictness"`
-		ApprovedFetchPlan json.RawMessage        `json:"approved_fetch_plan"`
+		Spec              scheduler.ScheduleSpec    `json:"spec"`
+		Intent            string                    `json:"intent"`
+		NLDescription     string                    `json:"nl_description"`
+		Strictness        types.PushStrictness      `json:"strictness"`
+		ApprovedFetchPlan json.RawMessage           `json:"approved_fetch_plan"`
+		ObservationPolicy *observation.PolicySpecV1 `json:"observation_policy,omitempty"`
 	}{
 		Spec: command.Spec, Intent: command.Intent,
 		NLDescription: command.NLDescription, Strictness: command.Strictness,
 		ApprovedFetchPlan: bytes.Clone(command.ApprovedFetchPlan),
+		ObservationPolicy: command.ObservationPolicy,
 	}
 	canonical, err := json.Marshal(args)
 	if err != nil {
@@ -1862,10 +1884,18 @@ func canonicalCreationProposalArgs(
 	if err != nil {
 		return nil, fmt.Errorf("verify canonical proposal args: %w", err)
 	}
+	verificationPolicy, verificationPolicyErr := json.Marshal(
+		verification.ObservationPolicy,
+	)
+	commandPolicy, commandPolicyErr := json.Marshal(command.ObservationPolicy)
+	if verificationPolicyErr != nil || commandPolicyErr != nil {
+		return nil, errors.New("canonical proposal args changed the observation policy")
+	}
 	if verification.Version != command.Version || verification.Spec != command.Spec ||
 		verification.Intent != command.Intent ||
 		verification.NLDescription != command.NLDescription ||
 		verification.Strictness != command.Strictness ||
+		!bytes.Equal(verificationPolicy, commandPolicy) ||
 		!bytes.Equal(verification.ApprovedFetchPlan, command.ApprovedFetchPlan) {
 		return nil, errors.New("canonical proposal args changed the approved command")
 	}
@@ -1890,6 +1920,12 @@ func summarizeCreationProposal(command normalizedCreateScheduleCommand) (string,
 	}
 	builder.WriteString("\n筛选：")
 	builder.WriteString(summarizeCreationStrictness(strictness))
+	if command.ObservationPolicy != nil {
+		builder.WriteString("\n新鲜度策略：")
+		builder.WriteString(summarizeCreationObservationPolicy(
+			*command.ObservationPolicy,
+		))
+	}
 	builder.WriteString(fmt.Sprintf("\n信息范围（%d）：", len(plan.Sources)))
 	for _, source := range plan.Sources {
 		builder.WriteString("\n- ")
@@ -1903,6 +1939,73 @@ func summarizeCreationProposal(command normalizedCreateScheduleCommand) (string,
 		return "", fmt.Errorf("confirmation summary exceeds %d bytes", maxCreationSummaryBytes)
 	}
 	return summary, nil
+}
+
+func summarizeCreationObservationPolicy(policy observation.PolicySpecV1) string {
+	var window string
+	switch policy.Window.Kind {
+	case observation.WindowScheduleInterval:
+		window = "相邻两次计划触发之间"
+	case observation.WindowRollingDuration:
+		window = "最近 " + summarizeCreationRollingDuration(
+			policy.Window.RollingDurationSeconds,
+		)
+	case observation.WindowCalendarPeriod:
+		window = map[observation.CalendarPeriod]string{
+			observation.CalendarDay:   "本日",
+			observation.CalendarWeek:  "本周",
+			observation.CalendarMonth: "本月",
+		}[policy.Window.CalendarPeriod]
+	}
+	late := "窗口外不补推"
+	if policy.LatePolicy == observation.LateBounded {
+		late = fmt.Sprintf("允许迟到 %d 秒", policy.AllowedLatenessSecs)
+	}
+	unknown := map[observation.UnknownTimePolicy]string{
+		observation.UnknownTimeReject:       "日期未知拒绝",
+		observation.UnknownTimeDeprioritize: "日期未知降权",
+		observation.UnknownTimeAllow:        "日期未知允许",
+	}[policy.UnknownTime]
+	evidence := "允许可信媒体证据"
+	if policy.Evidence.Requirement == observation.EvidenceOfficialRequired {
+		evidence = "仅官方证据：" + strings.Join(
+			policy.Evidence.OfficialDomains, "、",
+		)
+	}
+	if policy.Mode != observation.ModeEvent || policy.Event == nil {
+		return "普通内容模式；窗口 " + window + "；" + late + "；" +
+			unknown + "；" + evidence
+	}
+	qualification := map[observation.Qualification]string{
+		observation.QualificationAnnouncement:        "官方宣布即算",
+		observation.QualificationGeneralAvailability: "正式可用才算",
+		observation.QualificationEither:              "官方宣布或正式可用均算",
+	}[policy.Event.Qualification]
+	return fmt.Sprintf(
+		"仅事件发生时推送；%s（%s；%s）；窗口 %s；%s；%s；%s；无匹配事件不发消息",
+		policy.Event.Subject, policy.Event.EventKind, qualification,
+		window, late, unknown, evidence,
+	)
+}
+
+func summarizeCreationRollingDuration(seconds int64) string {
+	duration := time.Duration(seconds) * time.Second
+	parts := make([]string, 0, 3)
+	if hours := duration / time.Hour; hours != 0 {
+		parts = append(parts, fmt.Sprintf("%d小时", hours))
+		duration %= time.Hour
+	}
+	if minutes := duration / time.Minute; minutes != 0 {
+		parts = append(parts, fmt.Sprintf("%d分钟", minutes))
+		duration %= time.Minute
+	}
+	if remainingSeconds := duration / time.Second; remainingSeconds != 0 {
+		parts = append(parts, fmt.Sprintf("%d秒", remainingSeconds))
+	}
+	if len(parts) == 0 {
+		return "0秒"
+	}
+	return strings.Join(parts, "")
 }
 
 func summarizeCreationTiming(spec scheduler.ScheduleSpec) string {

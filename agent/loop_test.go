@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -1666,6 +1667,98 @@ func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *t
 	if strings.Contains(string(raw), toolMsgDirectTaskCreationOnly) ||
 		strings.Contains(string(raw), toolMsgExternalBatch) {
 		t.Fatalf("被拒隐藏工具的协议历史不得跨过干净自纠基线: %s", raw)
+	}
+}
+
+func TestHandleMessage_ExplicitTaskConfirmationPreservesObservationPolicy(t *testing.T) {
+	const policy = `{"schema":"vane.observation-policy/v1","mode":"event",` +
+		`"window":{"kind":"schedule_interval"},"late_policy":"strict",` +
+		`"evidence":{"requirement":"official_required","official_domains":["openai.com"]},` +
+		`"unknown_time":"reject","event":{"subject":"OpenAI API",` +
+		`"event_kind":"重大版本发布","qualification":"official_announcement"},` +
+		`"qualifier_prompt":"vane.qualify-events/v1"}`
+	const args = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
+		`"intent":"仅监控 OpenAI 官方确认的重大 API 更新；没有重要更新就不发送",` +
+		`"approved_fetch_plan":{"version":"vane.source-specs/v1","items":[{` +
+		`"kind":"web_search","query":"OpenAI API major updates",` +
+		`"include_domains":["openai.com"]}]},"observation_policy":` + policy + `,` +
+		`"nl_description":"每周一上午 9 点检查 OpenAI API 重大更新",` +
+		`"strictness":"strict"}`
+
+	fs := newFakeStore()
+	create := &fakeTool{name: "create_schedule", mutating: true}
+	creation := &fakeCreationController{
+		proposeResult: task.CreationProposal{Summary: "OpenAI API 重大更新任务"},
+	}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		ToolCalls: []llm.ToolCall{{
+			ID: "kimi-production-shape", Name: "create_schedule", Arguments: args,
+		}},
+		FinishReason: "tool_calls",
+	}}}
+	l := newTestLoop(t, fs, chat.fn, create)
+	l.taskCreation = creation
+
+	out, err := l.HandleMessage(
+		t.Context(), 7, "确认创建，直接生成确认卡，不要再次搜索。"+args,
+	)
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if out.Confirm == nil || len(creation.proposeCalls) != 1 {
+		t.Fatalf("Kimi 生产同形参数必须进入 durable Propose: out=%+v calls=%+v",
+			out, creation.proposeCalls)
+	}
+	var proposed struct {
+		ApprovedFetchPlan struct {
+			SourceSpecs json.RawMessage `json:"source_specs"`
+		} `json:"approved_fetch_plan"`
+		ObservationPolicy json.RawMessage `json:"observation_policy"`
+	}
+	if err := json.Unmarshal(creation.proposeCalls[0].RawArgs, &proposed); err != nil {
+		t.Fatalf("Propose RawArgs 非法: %v", err)
+	}
+	if len(proposed.ApprovedFetchPlan.SourceSpecs) == 0 {
+		t.Fatalf("扁平 approved_fetch_plan 未规范化: %s",
+			creation.proposeCalls[0].RawArgs)
+	}
+	var gotPolicy, wantPolicy any
+	if err := json.Unmarshal(proposed.ObservationPolicy, &gotPolicy); err != nil {
+		t.Fatalf("Propose observation_policy 非法: %v", err)
+	}
+	if err := json.Unmarshal([]byte(policy), &wantPolicy); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotPolicy, wantPolicy) {
+		t.Fatalf("observation_policy 未保真进入 Propose: got=%s want=%s",
+			proposed.ObservationPolicy, policy)
+	}
+}
+
+func TestNormalizeDirectTaskCreationArgs_ObservationPolicyBoundary(t *testing.T) {
+	const base = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
+		`"intent":"监控官方更新","approved_fetch_plan":{` +
+		`"version":"vane.source-specs/v1","items":[{` +
+		`"kind":"web_search","query":"official updates"}]}}`
+	tests := []struct {
+		name string
+		args string
+		ok   bool
+	}{
+		{name: "optional policy absent", args: base, ok: true},
+		{
+			name: "unknown top-level field remains rejected",
+			args: strings.TrimSuffix(base, "}") + `,"unexpected":true}`,
+			ok:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ok := normalizeDirectTaskCreationArgs(json.RawMessage(tt.args))
+			if ok != tt.ok {
+				t.Fatalf("normalizeDirectTaskCreationArgs() ok=%v, want %v", ok, tt.ok)
+			}
+		})
 	}
 }
 
