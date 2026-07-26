@@ -386,17 +386,23 @@ func escape(tool interface{ Execute() }) { tool.Execute() }`)
 	}
 
 	file = parseAgentActionMutation(t, `package agentcontinuation
-import "reflect"
+import r "reflect"
 func escape(target any) {
-	reflect.ValueOf(target).MethodByName(
-		"Activate" + "AgentActionContinuation",
-	).Call(nil)
+	r.ValueOf(target).Method(0).Call(nil)
 }`)
 	got = agentActionAdapterGenericExecutionViolations(
 		map[string]*ast.File{path: file}, root)
-	if !agentActionViolationContains(got, "dynamic dispatch reflect") ||
-		!agentActionViolationContains(got, "dynamic dispatch MethodByName") {
+	if !agentActionViolationContains(got, "dynamic import reflect") {
 		t.Fatalf("reflection adapter execution passed guard: %v", got)
+	}
+
+	file = parseAgentActionMutation(t, `package agentcontinuation
+import _ "unsafe"
+func escape() {}`)
+	got = agentActionAdapterGenericExecutionViolations(
+		map[string]*ast.File{path: file}, root)
+	if !agentActionViolationContains(got, "dynamic import unsafe") {
+		t.Fatalf("unsafe adapter escape passed guard: %v", got)
 	}
 }
 
@@ -1023,6 +1029,17 @@ func agentActionAdapterGenericExecutionViolations(
 		}
 		ast.Inspect(file, func(node ast.Node) bool {
 			switch value := node.(type) {
+			case *ast.ImportSpec:
+				if value.Path == nil {
+					return true
+				}
+				importPath, err := strconv.Unquote(value.Path.Value)
+				if err == nil &&
+					(importPath == "reflect" || importPath == "unsafe") {
+					violations = append(violations,
+						fmt.Sprintf("%s reaches dynamic import %s",
+							relativePath, importPath))
+				}
 			case *ast.Ident:
 				if agentActionGenericExecution[value.Name] {
 					violations = append(violations,
