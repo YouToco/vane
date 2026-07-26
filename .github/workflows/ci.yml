@@ -6,13 +6,18 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: [self-hosted, Linux, ARM64, vane-web-ci]
+    runs-on: [self-hosted, Linux, ARM64, vane-test]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm
@@ -36,7 +41,8 @@ jobs:
   # VPS scp 兜底已随验收移除（回滚路径见 vane 仓 deploy/Caddyfile 头注释）。
   deploy:
     needs: build
-    runs-on: [self-hosted, Linux, ARM64, vane-web-ci]
+    runs-on: [self-hosted, Linux, ARM64, vane-deploy]
+    environment: production
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     # 串行化部署（vane 仓库 deploy-vps 同理）：并行的两次 push 谁晚完成谁覆盖，
@@ -46,9 +52,11 @@ jobs:
       cancel-in-progress: false
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm

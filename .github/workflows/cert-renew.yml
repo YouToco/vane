@@ -13,13 +13,26 @@ on:
     - cron: "0 3 1 * *" # 每月 1 日 03:00 UTC
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   renew:
-    runs-on: [self-hosted, Linux, ARM64, vane-web-ci]
+    runs-on: [self-hosted, Linux, ARM64, vane-deploy]
+    environment: production
     steps:
       - name: Issue cert (acme.sh + alidns DNS-01)
         run: |
-          curl -fsSL https://get.acme.sh | sh -s email=Liuzhuoqi147@gmail.com
+          acme_source=$(mktemp -d)
+          trap 'rm -rf "$acme_source"' EXIT
+          acme_commit=3661fd86b6304115e42f43910e6dd452ab9866d6
+          git clone --depth 1 --branch 3.1.4 --single-branch \
+            https://github.com/acmesh-official/acme.sh.git "$acme_source"
+          [ "$(git -C "$acme_source" rev-parse HEAD)" = "$acme_commit" ] || {
+            echo "acme.sh 3.1.4 did not resolve to pinned commit $acme_commit"
+            exit 1
+          }
+          "$acme_source/acme.sh" --install -m Liuzhuoqi147@gmail.com
           export Ali_Key="${{ secrets.ALIYUN_ACCESS_KEY_ID }}"
           export Ali_Secret="${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}"
           ~/.acme.sh/acme.sh --issue --dns dns_ali -d vane.zhuoqidev.com --server letsencrypt --force
