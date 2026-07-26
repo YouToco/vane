@@ -49,6 +49,7 @@ import {
 import { LogoMark } from "@/components/brand/Logo";
 import { LocaleSwitch } from "@/components/LocaleSwitch";
 import { useI18n } from "@/i18n";
+import { clearTaskMutationSessionStorage } from "@/lib/task-action-session";
 
 function useHash(): string {
   const [hash, setHash] = useState(location.hash || "#/");
@@ -105,12 +106,18 @@ function taskDetailID(hash: string): string | null {
   return id || null;
 }
 
-function renderPage(hash: string, isPlatformOwner: boolean) {
+function renderPage(
+  hash: string,
+  isPlatformOwner: boolean,
+  actorScope: string,
+) {
   const detailID = taskDetailID(hash);
-  if (detailID) return <TaskDetail scheduleID={detailID} />;
+  if (detailID) {
+    return <TaskDetail scheduleID={detailID} actorScope={actorScope} />;
+  }
   switch (hash) {
     case "#/tasks":
-      return <TaskDashboard />;
+      return <TaskDashboard actorScope={actorScope} />;
     case "#/history":
       return <History />;
     case "#/sources":
@@ -248,7 +255,11 @@ function Shell({ hash, me }: { hash: string; me: MeResponse }) {
   const { t } = useI18n();
   const { all } = useNav();
   const isPlatformOwner = me.tenant_id === PLATFORM_OWNER_TENANT_ID;
+  const actorScope = `${me.tenant_id}:${me.user_id}`;
   async function onLogout() {
+    try {
+      clearTaskMutationSessionStorage();
+    } catch {}
     try {
       await api.logout();
     } catch {}
@@ -273,7 +284,9 @@ function Shell({ hash, me }: { hash: string; me: MeResponse }) {
           </div>
         </header>
         <main className="flex-1 overflow-y-auto">
-          <div className="mx-auto max-w-5xl p-6">{renderPage(hash, isPlatformOwner)}</div>
+          <div className="mx-auto max-w-5xl p-6">
+            {renderPage(hash, isPlatformOwner, actorScope)}
+          </div>
         </main>
       </SidebarInset>
     </SidebarProvider>

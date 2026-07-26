@@ -94,7 +94,8 @@ export interface Schedule {
   spec: ScheduleSpec;
   scope: PushScope;
   status: string; // active/paused
-  next_run?: string; // 可选：后端若从 Temporal Describe 补充下次触发时间则有，否则前端按 spec 推导展示
+  next_run_state: "scheduled" | "paused" | "none" | "unavailable";
+  next_run?: string; // 只有 next_run_state=scheduled 时才是可信的 Temporal 下一次触发
   created_at?: string;
 }
 
@@ -351,10 +352,38 @@ export interface SchedulePlaybook {
 // GET /api/schedules/{id} 响应。playbook 缺席 = 老任务/无手册，不是错误。
 export interface ScheduleDetail {
   schedule: Schedule;
+  capabilities: {
+    definition_edit: boolean;
+  };
   summary: ScheduleRunSummary;
   sources: ScheduleSourceInfo[];
   playbook?: SchedulePlaybook;
   cost: ScheduleRunCost;
+}
+
+// ---- Web 原生任务控制面（功能 6.8）----
+
+export interface TaskActionPreview {
+  id: string;
+  kind: "create" | "edit";
+  task_id?: string;
+  summary: string;
+}
+
+export interface TaskActionProposal {
+  reply: string;
+  action?: TaskActionPreview;
+}
+
+export interface TaskActionStatus {
+  id: string;
+  kind: "create" | "edit";
+  status: string;
+  terminal: boolean;
+  task_id?: string;
+  summary?: string;
+  message?: string;
+  recovering?: boolean;
 }
 
 // ---- M7 成本与运行监控（功能 6.5）----
@@ -487,15 +516,56 @@ function asObject<T>(v: unknown): T {
   return (v ?? {}) as T;
 }
 
-function normalizeSchedule(raw: Record<string, unknown>): Schedule {
+export function normalizeSchedule(raw: Record<string, unknown>): Schedule {
+  const nextRun =
+    typeof (raw.next_run ?? raw.next_run_at) === "string"
+      ? String(raw.next_run ?? raw.next_run_at)
+      : undefined;
+  const rawNextRunState = raw.next_run_state;
+  const nextRunState: Schedule["next_run_state"] =
+    rawNextRunState === "scheduled" && nextRun
+      ? "scheduled"
+      : rawNextRunState === "paused"
+        ? "paused"
+        : rawNextRunState === "none"
+          ? "none"
+          : "unavailable";
   return {
     id: String(raw.id ?? ""),
     nl_description: typeof raw.nl_description === "string" ? raw.nl_description : "",
     spec: asObject<ScheduleSpec>(raw.spec ?? raw.spec_json),
     scope: asObject<PushScope>(raw.scope ?? raw.scope_json),
     status: typeof raw.status === "string" ? raw.status : "active",
-    next_run: (raw.next_run ?? raw.next_run_at) as string | undefined,
+    next_run_state: nextRunState,
+    ...(nextRunState === "scheduled" && nextRun
+      ? { next_run: nextRun }
+      : {}),
     created_at: raw.created_at as string | undefined,
+  };
+}
+
+type RawScheduleDetail = Omit<
+  ScheduleDetail,
+  "schedule" | "sources" | "capabilities"
+> & {
+  schedule: Record<string, unknown>;
+  sources?: ScheduleSourceInfo[] | null;
+  capabilities?: unknown;
+};
+
+export function normalizeScheduleDetail(
+  raw: RawScheduleDetail,
+): ScheduleDetail {
+  const capabilities = asObject<Record<string, unknown>>(raw.capabilities);
+  return {
+    ...raw,
+    schedule: normalizeSchedule(raw.schedule),
+    sources: arr(raw.sources),
+    capabilities: {
+      // Legacy/malformed responses must not expose an edit control which the
+      // currently deployed backend may be unable to honor.
+      definition_edit: capabilities.definition_edit === true,
+    },
   };
 }
 
@@ -561,13 +631,9 @@ export const api = {
   // scope_json 直出）；batches 的 stage_counts 是后端 json.RawMessage 直出，形状
   // 用 asObject 收敛（同 normalizeSchedule 的理由：JSONB 可能内联也可能字符串）。
   scheduleDetail: (id: string) =>
-    request<Omit<ScheduleDetail, "schedule"> & { schedule: Record<string, unknown> }>(
+    request<RawScheduleDetail>(
       `/api/schedules/${encodeURIComponent(id)}`,
-    ).then((r) => ({
-      ...r,
-      schedule: normalizeSchedule(r.schedule),
-      sources: arr(r.sources),
-    })),
+    ).then(normalizeScheduleDetail),
   scheduleSummaries: () =>
     request<{ items: ScheduleRunSummary[] }>("/api/schedules/summary").then((r) =>
       arr(r.items),
@@ -603,8 +669,54 @@ export const api = {
     }));
   },
 
-  deleteSchedule: (id: string) =>
-    request<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  proposeTaskAction: (text: string, taskId: string | undefined, requestId: string) =>
+    post<TaskActionProposal>("/api/task-actions/propose", {
+      text,
+      request_id: requestId,
+      ...(taskId ? { task_id: taskId } : {}),
+    }),
+  confirmTaskAction: (id: string) =>
+    post<{ message: string }>(
+      `/api/task-actions/${encodeURIComponent(id)}/confirm`,
+    ),
+  cancelTaskAction: (id: string) =>
+    post<{ message: string }>(
+      `/api/task-actions/${encodeURIComponent(id)}/cancel`,
+    ),
+  taskActionStatus: (id: string) =>
+    request<TaskActionStatus>(
+      `/api/task-actions/${encodeURIComponent(id)}`,
+    ),
+  runScheduleNow: (id: string, idempotencyKey: string) =>
+    request<{ ok: boolean }>(
+      `/api/schedules/${encodeURIComponent(id)}/run`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
+    ),
+  pauseSchedule: (id: string, idempotencyKey: string) =>
+    request<{ ok: boolean }>(
+      `/api/schedules/${encodeURIComponent(id)}/pause`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
+    ),
+  resumeSchedule: (id: string, idempotencyKey: string) =>
+    request<{ ok: boolean }>(
+      `/api/schedules/${encodeURIComponent(id)}/resume`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
+    ),
+
+  deleteSchedule: (id: string, idempotencyKey: string) =>
+    request<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { "Idempotency-Key": idempotencyKey },
+    }),
   // push/now 的 body 是 {scope?}（B8）；固化"现在推一次"默认不带 scope = 推全部订阅
   pushNow: (scope?: PushScope) =>
     post<{ run_id: string }>("/api/push/now", scope ? { scope } : {}),

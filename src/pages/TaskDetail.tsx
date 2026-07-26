@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   Loader2,
@@ -7,10 +7,16 @@ import {
   PlayCircle,
   CircleSlash,
   Coins,
+  Clock,
+  Pencil,
+  Pause,
+  Play,
+  Trash2,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import TaskActionDialog from "@/components/TaskActionDialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -29,13 +35,73 @@ import type {
   PipelineCounts,
   ScheduleSourceInfo,
   ObservationPolicy,
+  TaskActionStatus,
 } from "../api";
 import { fmt, useI18n, type Dict } from "@/i18n";
 import { fmtBeijing } from "@/lib/time";
 import DeliveriesTable from "@/components/DeliveriesTable";
 import { batchOutcomeLabel, batchOutcomeVariant } from "./TaskDashboard";
+import { SCHEDULE_COMMAND_STORAGE_PREFIX } from "@/lib/task-action-session";
+import {
+  nextRunPresentation,
+  taskDefinitionEditEnabled,
+} from "@/lib/task-detail-contract";
 
 const PAGE_SIZE = 20;
+type ScheduleCommand = "run" | "pause" | "resume" | "delete";
+
+function commandStorageKey(
+  actorScope: string,
+  scheduleID: string,
+  kind: ScheduleCommand,
+): string {
+  return `${SCHEDULE_COMMAND_STORAGE_PREFIX}:${encodeURIComponent(actorScope)}:${encodeURIComponent(scheduleID)}:${kind}`;
+}
+
+function commandIdempotencyKey(
+  actorScope: string,
+  scheduleID: string,
+  kind: ScheduleCommand,
+): string {
+  const key = commandStorageKey(actorScope, scheduleID, kind);
+  try {
+    const existing = window.sessionStorage.getItem(key);
+    if (existing) return existing;
+    const created = globalThis.crypto.randomUUID();
+    window.sessionStorage.setItem(key, created);
+    return created;
+  } catch {
+    // Session storage may be unavailable. The synchronous commandRef below
+    // still prevents ordinary double clicks from creating two live requests.
+    return globalThis.crypto.randomUUID();
+  }
+}
+
+function clearCommandIdempotencyKey(
+  actorScope: string,
+  scheduleID: string,
+  kind: ScheduleCommand,
+): void {
+  try {
+    window.sessionStorage.removeItem(
+      commandStorageKey(actorScope, scheduleID, kind),
+    );
+  } catch {
+    // A completed command does not need storage cleanup to remain correct.
+  }
+}
+
+function commandMayHaveReachedServer(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return true;
+  return (
+    error.status === 0 ||
+    error.status >= 500 ||
+    error.status === 408 ||
+    error.status === 409 ||
+    error.status === 425 ||
+    error.status === 429
+  );
+}
 
 // 漏斗文本：只列**有记录**的阶段（缺席 = 那一步没跑，api.ts PipelineCounts 注释；
 // 补零会把「没跑」编成「跑了得 0」）。全部缺席 → "—"。
@@ -352,12 +418,30 @@ function SourcesTab({ sources }: { sources: ScheduleSourceInfo[] }) {
   );
 }
 
-export default function TaskDetail({ scheduleID }: { scheduleID: string }) {
+export default function TaskDetail({
+  scheduleID,
+  actorScope,
+}: {
+  scheduleID: string;
+  actorScope: string;
+}) {
   const { t } = useI18n();
   const D = t.app.taskDetail;
+  const A = t.app.tasks;
   const [detail, setDetail] = useState<ScheduleDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
+  const [showEdit, setShowEdit] = useState(false);
+  const [command, setCommand] = useState("");
+  const commandRef = useRef<ScheduleCommand | "">("");
+  const [commandMessage, setCommandMessage] = useState("");
+  const [commandError, setCommandError] = useState("");
+
+  async function reloadDetail() {
+    const next = await api.scheduleDetail(scheduleID);
+    setDetail(next);
+    setLoadError("");
+  }
 
   useEffect(() => {
     let alive = true;
@@ -380,6 +464,74 @@ export default function TaskDetail({ scheduleID }: { scheduleID: string }) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scheduleID]);
+
+  async function runCommand(kind: "run" | "pause" | "resume") {
+    if (commandRef.current) return;
+    commandRef.current = kind;
+    setCommand(kind);
+    setCommandError("");
+    setCommandMessage("");
+    const idempotencyKey = commandIdempotencyKey(
+      actorScope,
+      scheduleID,
+      kind,
+    );
+    try {
+      if (kind === "run") {
+        await api.runScheduleNow(scheduleID, idempotencyKey);
+        setCommandMessage(D.runAccepted);
+      } else if (kind === "pause") {
+        await api.pauseSchedule(scheduleID, idempotencyKey);
+        await reloadDetail();
+        setCommandMessage(D.pauseDone);
+      } else {
+        await api.resumeSchedule(scheduleID, idempotencyKey);
+        await reloadDetail();
+        setCommandMessage(D.resumeDone);
+      }
+      clearCommandIdempotencyKey(actorScope, scheduleID, kind);
+    } catch (err) {
+      setCommandError(err instanceof ApiError ? err.message : t.app.common.loadFailed);
+      if (!commandMayHaveReachedServer(err)) {
+        clearCommandIdempotencyKey(actorScope, scheduleID, kind);
+      }
+    } finally {
+      commandRef.current = "";
+      setCommand("");
+    }
+  }
+
+  async function deleteTask() {
+    if (commandRef.current || !window.confirm(D.deleteConfirm)) return;
+    commandRef.current = "delete";
+    setCommand("delete");
+    setCommandError("");
+    const idempotencyKey = commandIdempotencyKey(
+      actorScope,
+      scheduleID,
+      "delete",
+    );
+    try {
+      await api.deleteSchedule(scheduleID, idempotencyKey);
+      clearCommandIdempotencyKey(actorScope, scheduleID, "delete");
+      location.hash = "#/tasks";
+    } catch (err) {
+      setCommandError(err instanceof ApiError ? err.message : t.app.common.loadFailed);
+      if (!commandMayHaveReachedServer(err)) {
+        clearCommandIdempotencyKey(actorScope, scheduleID, "delete");
+      }
+      commandRef.current = "";
+      setCommand("");
+    }
+  }
+
+  function handleEditComplete(status: TaskActionStatus) {
+    if (status.kind === "edit" && status.status === "completed") {
+      void reloadDetail().catch((err) => {
+        setCommandError(err instanceof ApiError ? err.message : t.app.common.loadFailed);
+      });
+    }
+  }
 
   if (loading) {
     return (
@@ -412,6 +564,8 @@ export default function TaskDetail({ scheduleID }: { scheduleID: string }) {
   }
 
   const { schedule, summary, sources, playbook, cost } = detail;
+  const editEnabled = taskDefinitionEditEnabled(detail);
+  const nextRun = nextRunPresentation(schedule);
   // `observation` is the immutable runtime-policy projection; the alias keeps
   // this first read-only UI useful while older API deployments expose the
   // create-command spelling instead.
@@ -468,6 +622,84 @@ export default function TaskDetail({ scheduleID }: { scheduleID: string }) {
             D.neverRan
           )}
         </p>
+        <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
+          <span className="inline-flex items-center gap-1">
+            <Clock className="size-4" />
+            {D.nextRun}{" "}
+            {nextRun.kind === "scheduled"
+              ? fmtBeijing(nextRun.at)
+              : nextRun.kind === "paused"
+                ? D.nextRunPaused
+                : nextRun.kind === "none"
+                  ? D.noNextRun
+                  : D.nextRunUnavailable}
+          </span>
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            onClick={() => void runCommand("run")}
+            disabled={command !== "" || schedule.status !== "active"}
+          >
+            {command === "run" ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Play className="size-4" />
+            )}
+            {D.runNow}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() =>
+              void runCommand(schedule.status === "active" ? "pause" : "resume")
+            }
+            disabled={command !== ""}
+          >
+            {command === "pause" || command === "resume" ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : schedule.status === "active" ? (
+              <Pause className="size-4" />
+            ) : (
+              <Play className="size-4" />
+            )}
+            {schedule.status === "active" ? D.pauseTask : D.resumeTask}
+          </Button>
+          {editEnabled && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setShowEdit(true)}
+              disabled={command !== ""}
+            >
+              <Pencil className="size-4" />
+              {D.editTask}
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="destructive"
+            onClick={() => void deleteTask()}
+            disabled={command !== ""}
+          >
+            {command === "delete" ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Trash2 className="size-4" />
+            )}
+            {D.deleteTask}
+          </Button>
+        </div>
+        {commandMessage && (
+          <Alert className="mt-4">
+            <AlertDescription>{commandMessage}</AlertDescription>
+          </Alert>
+        )}
+        {commandError && (
+          <Alert variant="destructive" className="mt-4">
+            <AlertDescription>{commandError}</AlertDescription>
+          </Alert>
+        )}
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -535,6 +767,34 @@ export default function TaskDetail({ scheduleID }: { scheduleID: string }) {
           </TabsContent>
         )}
       </Tabs>
+      {editEnabled && (
+        <TaskActionDialog
+          open={showEdit}
+          actorScope={actorScope}
+          taskID={scheduleID}
+          onClose={() => setShowEdit(false)}
+          onComplete={handleEditComplete}
+          labels={{
+            title: D.editTask,
+            description: D.editDesc,
+            placeholder: D.editPlaceholder,
+            inputLabel: D.editInputLabel,
+            draft: D.generateEdit,
+            drafting: D.generatingEdit,
+            preview: D.editPreview,
+            confirm: D.confirmEdit,
+            confirming: D.confirmingEdit,
+            cancel: D.cancelEdit,
+            close: D.closeEdit,
+            waiting: D.editWaiting,
+            checkAgain: A.checkAgain,
+            requestFailed: A.requestFailed,
+            resultStatus: A.resultStatus,
+            invalidProposal: A.invalidProposal,
+            status: A.actionStatus,
+          }}
+        />
+      )}
     </div>
   );
 }

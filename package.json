@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
-    "test": "node --test tests/source-view.test.mjs"
+    "test": "node --test tests/source-view.test.mjs && vitest run tests/task-action-dialog.test.tsx tests/task-contract.test.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",
@@ -32,10 +32,13 @@
     "@tailwindcss/vite": "^4.3.3",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
+    "@types/react-test-renderer": "^19.1.0",
     "@types/three": "^0.185.1",
     "@vitejs/plugin-react": "^6.0.3",
+    "react-test-renderer": "^19.2.8",
     "tailwindcss": "^4.3.3",
     "typescript": "~7.0.2",
-    "vite": "^8.1.4"
+    "vite": "^8.1.4",
+    "vitest": "^4.1.10"
   }
 }

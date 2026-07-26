@@ -4,10 +4,14 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
+import TaskActionDialog from "@/components/TaskActionDialog";
 import { api, ApiError } from "../api";
-import type { Schedule, ScheduleSpec, ScheduleRunSummary } from "../api";
+import type {
+  Schedule,
+  ScheduleSpec,
+  ScheduleRunSummary,
+  TaskActionStatus,
+} from "../api";
 import { fmt, useI18n, type Dict } from "@/i18n";
 import { fmtBeijing } from "@/lib/time";
 
@@ -173,43 +177,7 @@ function TaskCard({ task, summary }: { task: Schedule; summary?: ScheduleRunSumm
   );
 }
 
-// 新建任务对话框目前只有输入框，「发送」尚未接后端：
-// 自然语言 → 任务手册的编译能力在后端已存在（agent/playbook_translate.go），
-// 但入口是飞书 agent 工具（create_schedule），没有 HTTP 出口。
-// 接线属于 P2，这里先不给假的成功反馈。
-function CreateTaskDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { t } = useI18n();
-  const T = t.app.tasks;
-  const [input, setInput] = useState("");
-
-  return (
-    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{T.newTask}</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-4 pt-2">
-          <p className="text-sm text-muted-foreground">{T.dialogDesc}</p>
-          <div className="flex gap-2">
-            <Input
-              placeholder={T.dialogPlaceholder}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              className="flex-1"
-              autoFocus
-            />
-            <Button disabled size="sm" title={T.sendPendingTitle}>
-              {T.send}
-            </Button>
-          </div>
-          <p className="text-xs text-muted-foreground">{T.dialogNote}</p>
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-export default function TaskDashboard() {
+export default function TaskDashboard({ actorScope }: { actorScope: string }) {
   const { t } = useI18n();
   const T = t.app.tasks;
   const [showCreate, setShowCreate] = useState(false);
@@ -217,6 +185,17 @@ export default function TaskDashboard() {
   const [summaries, setSummaries] = useState<Map<string, ScheduleRunSummary>>(new Map());
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
+
+  function handleCreateClose(status?: TaskActionStatus) {
+    setShowCreate(false);
+    if (
+      status?.kind === "create" &&
+      status.status === "executed" &&
+      status.task_id
+    ) {
+      location.hash = `#/tasks/${encodeURIComponent(status.task_id)}`;
+    }
+  }
 
   useEffect(() => {
     let alive = true;
@@ -283,7 +262,34 @@ export default function TaskDashboard() {
         </>
       )}
 
-      <CreateTaskDialog open={showCreate} onClose={() => setShowCreate(false)} />
+      <TaskActionDialog
+        open={showCreate}
+        actorScope={actorScope}
+        onClose={handleCreateClose}
+        onComplete={() => {
+          // The durable terminal result stays visible until the user
+          // acknowledges it. Successful navigation happens in onClose.
+        }}
+        labels={{
+          title: T.newTask,
+          description: T.dialogDesc,
+          placeholder: T.dialogPlaceholder,
+          inputLabel: T.dialogInputLabel,
+          draft: T.generate,
+          drafting: T.generating,
+          preview: T.preview,
+          confirm: T.confirmCreate,
+          confirming: T.confirming,
+          cancel: T.cancel,
+          close: T.close,
+          waiting: T.waiting,
+          checkAgain: T.checkAgain,
+          requestFailed: T.requestFailed,
+          resultStatus: T.resultStatus,
+          invalidProposal: T.invalidProposal,
+          status: T.actionStatus,
+        }}
+      />
     </div>
   );
 }
