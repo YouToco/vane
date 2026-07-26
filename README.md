@@ -1,72 +1,137 @@
 # Vane deployment control plane
 
 This private repository is the only GitHub repository allowed to schedule the
-production deployment runner. The `vane` and `vane-web` source repositories run
-tests on their own runner, but contain no production workflow, runner label, or
-production credential.
+production deployment runner. The `vane` and `vane-web` source repositories
+contain no production workflow, runner label, or production credential.
 
-`deploy.yml` polls both source repositories' `main` branches every five minutes
-(and supports manual dispatch). It checks out each repository with a separate,
-read-only deploy key, compares the actual checked-out commit with persistent
-runner-VM state, and skips an unchanged component. A state file advances only
-after that component's complete deployment succeeds:
+## Three trust domains
 
-- backend: four Linux binaries, infra sync, graceful drain proof, restart,
-  readiness/well-known checks, and the 24-hour production Gate;
-- frontend: one production build deployed to OSS + Aliyun CDN and Cloudflare
-  Pages.
+1. `vane-test` runs ordinary source-repository pull-request and main CI. It has
+   no production access and its result is not trusted as a deployment gate.
+2. `vane-build` independently checks and builds the exact 40-character source
+   SHAs selected by this repository. It has two read-only source deploy keys,
+   but no production secrets.
+3. `vane-deploy` owns durable deployed-SHA and certificate state and is the only
+   runner that receives production credentials. Its dedicated
+   `vane-deploy-runner` Unix user has no local `sudo` or Docker-group access.
 
-`cert-renew.yml` retains the monthly Let's Encrypt DNS-01 renewal and Aliyun CDN
-upload. Both workflows use the same repository concurrency group and the same
-VM-wide `flock`, so backend, frontend, and certificate production mutations
-cannot overlap.
+`deploy.yml` is a strict `plan → build → deploy` DAG:
 
-## Trust boundary
+- `plan` runs on `vane-deploy`. It uses native `git ls-remote` with the two
+  read-only deploy keys to resolve each source `main`, then compares those exact
+  SHAs with the VM's durable state. It neither checks out nor executes source.
+- `build` runs on `vane-build` only when a component changed. Backend Gate is
+  `go mod download`, `go vet ./...`, and the complete uncached shuffled race
+  test suite against PostgreSQL 18. Frontend Gate is `npm ci`, tests, typecheck,
+  and build. After each Gate, the source is materialized again at the exact SHA
+  with a short-lived read key; release builds start from that new clean tree.
+- `deploy` runs on `vane-deploy`. It downloads only artifacts named with the
+  current run ID, attempt, component, and source SHA. It never downloads source
+  trees and runs no source build, npm install, or Go build/test command.
 
-- The sole runner labels are `[self-hosted, Linux, ARM64, vane-deploy]`.
-- The runner service account is `vane-deploy-runner`. It must not be in the
-  Docker group and has no local `sudo` access.
-- Workflows are triggered only by `schedule` and `workflow_dispatch`; neither
-  source pushes nor pull requests can enqueue this runner.
-- This repository intentionally does not use a GitHub Environment as a security
-  gate. Production credentials are repository secrets here only.
-- Every GitHub Action is pinned to a full commit SHA. Checkout credential
-  persistence is disabled.
-- VPS access uses native OpenSSH. `ssh-keyscan` output is accepted only after
-  its Ed25519 SHA256 fingerprint equals the pre-provisioned secret.
-- Aliyun CLI is pinned to `3.4.8` and its official ARM64 archive SHA256. It is
-  installed below `RUNNER_TEMP`, without `sudo` or a `latest` lookup.
-- Wrangler is installed below `RUNNER_TEMP` at exactly `4.111.0`.
-- acme.sh is fetched at commit
-  `3661fd86b6304115e42f43910e6dd452ab9866d6`, installed with `--no-cron
-  --no-profile`, and confined to the dedicated deploy state directory.
+Each component artifact is a tarball plus SHA256 sidecar and JSON manifest. The
+manifest binds source SHA, archive SHA256/size, and the complete file allowlist
+with per-file SHA256, size, and mode. Before any production secret is exposed,
+the deploy job rejects extra inputs, duplicate JSON keys, traversal, symlinks,
+hardlinks, devices, FIFOs, non-regular files, unexpected paths/modes, oversized
+content, checksum mismatches, and dirty/mismatched Go VCS build metadata. Files
+are copied out member-by-member; `extractall` is not used.
 
-The default persistent state directory is
-`~/.local/state/vane-deploy` (or `$XDG_STATE_HOME/vane-deploy` when set).
-It contains deployed SHA files, the global lock, and acme.sh account/certificate
-state. It must be backed up and readable only by `vane-deploy-runner`.
+Backend, Aliyun frontend, and Cloudflare frontend steps receive separate secret
+sets. The no-secret frontend finalizer requires exact-SHA success receipts from
+both channel steps. Backend state advances atomically only after upload,
+graceful drain proof, restart, readiness/well-known checks, and the 24-hour
+production Gate. Frontend state advances only in that finalizer after both OSS +
+Aliyun CDN and Cloudflare Pages succeed. If backend succeeds and frontend fails,
+backend state remains truthfully advanced; the next poll rebuilds and retries
+only the frontend.
+
+The production workflow is schedule-only and polls every five minutes. The
+certificate workflow is also schedule-only. There is no branch-selectable
+`workflow_dispatch`; a failed main run is retried with GitHub's run-rerun
+operation using **Re-run all jobs** so `plan`, the exact-SHA Gates, artifacts,
+and deployment all share the new run attempt. GitHub Environment approval is
+intentionally not used as a security boundary on this Free private repository.
+
+## Runner provisioning
+
+Both runners are repository-scoped and carry exactly one custom label:
+
+- build VM: `[self-hosted, Linux, ARM64, vane-build]`; Docker is available for
+  the PostgreSQL service, and the pinned setup actions provide Go 1.26 and
+  Node 22.
+- deploy VM: `[self-hosted, Linux, ARM64, vane-deploy]`; install Git, Python 3,
+  OpenSSH, OpenSSL, `flock`, GNU `date`, `curl`, `sha256sum`, and `strings`.
+  Do not install Docker access or `sudo` for the runner user.
+
+Wrangler and its Node runtime are provisioned out-of-band on the deploy VM.
+[`tools/wrangler/package-lock.json`](tools/wrangler/package-lock.json) pins the
+complete dependency tree with registry integrity hashes. From an audited
+checkout, an administrator runs `scripts/provision-wrangler.sh` in a root shell.
+The script downloads the fixed official Node `v22.23.1` Linux ARM64 archive,
+checks SHA256
+`0294e8b915ab75f92c7513d2fcb830ae06e10684e6c603e99a87dbf8835389c1`,
+and uses that exact Node/npm with the committed lock. npm runs as
+`vane-deploy-runner` with dependency lifecycle scripts disabled. After Wrangler
+version and Pages-command verification, Node and the `4.111.0` dependency tree
+become root-owned/read-only. `/opt/vane-deploy-tools/wrangler` is a root-owned
+wrapper that explicitly executes the pinned Node and Wrangler entrypoint; it
+does not depend on `PATH`. Workflows verify the exact Wrangler version and never
+run npm on the deployment VM.
+
+Aliyun CLI is installed per run below `RUNNER_TEMP` from the exact `3.4.8`
+ARM64 release archive after checking the official SHA256
+`a8b22c72c1984e0ef4db441ab1e7f1720a03553fae79cff9fb113806229e7876`.
+No `latest` lookup, `curl | sh`, container action, or local `sudo` is used.
+
+The VPS SSH principal is separate from the runner Unix user and must retain the
+existing remote permissions for `/opt/vane`, systemd, Docker, and journal
+inspection. Native OpenSSH accepts the VPS only when the runtime Ed25519 host
+key matches the repository's trusted SHA256 fingerprint.
 
 ## Required repository secrets
 
-| Secret | Purpose |
-| --- | --- |
-| `VANE_READ_KEY` | Private half of a read-only deploy key registered on `YouToco/vane` |
-| `VANE_WEB_READ_KEY` | Private half of a read-only deploy key registered on `YouToco/vane-web` |
-| `VPS_HOST`, `VPS_PORT`, `VPS_USER` | Production VPS SSH endpoint |
-| `VPS_SSH_KEY` | Production VPS private key |
-| `VPS_SSH_HOST_ED25519_FINGERPRINT` | Trusted value such as `SHA256:...`, obtained out-of-band |
-| `ALIYUN_ACCESS_KEY_ID`, `ALIYUN_ACCESS_KEY_SECRET` | OSS, CDN, and AliDNS access |
-| `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Pages deployment |
-| `ACME_ACCOUNT_EMAIL` | Let's Encrypt account email |
+| Secret | Used by | Purpose |
+| --- | --- | --- |
+| `VANE_READ_KEY` | plan/build checkout steps | Read-only deploy key for `YouToco/vane` |
+| `VANE_WEB_READ_KEY` | plan/build checkout steps | Read-only deploy key for `YouToco/vane-web` |
+| `VPS_HOST`, `VPS_PORT`, `VPS_USER` | backend deploy step | Production VPS endpoint |
+| `VPS_SSH_KEY` | backend deploy step | Production VPS private key |
+| `VPS_SSH_HOST_ED25519_FINGERPRINT` | backend deploy step | Out-of-band trusted `SHA256:...` |
+| `ALIYUN_ACCESS_KEY_ID`, `ALIYUN_ACCESS_KEY_SECRET` | frontend/certificate steps | OSS, CDN, and AliDNS |
+| `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` | frontend deploy step | Cloudflare Pages |
+| `ACME_ACCOUNT_EMAIL` | certificate workflow | Let's Encrypt account email |
 
-The source deploy keys must be distinct and must have **Allow write access**
-disabled. The VPS host fingerprint must be copied from a trusted VPS console or
-an already-verified connection, not learned from the first workflow run.
+The source keys must be distinct and have **Allow write access** disabled. Key
+files are created and deleted within the checkout/lookup step; source-controlled
+commands run only in later steps after the files and secret environments are
+gone.
 
-## State and recovery
+## Durable state, locking, and recovery
 
-Successful SHA files are `deployed-vane.sha` and `deployed-vane-web.sha`.
-Writing is atomic (`mktemp` + `mv`). If a deployment succeeds remotely but the
-runner dies before the state write, the next poll safely repeats that component.
-To intentionally redeploy a commit, remove only its exact SHA file while no
-workflow is running; the next dispatch will reconcile it.
+The default persistent state directory is
+`~/.local/state/vane-deploy` (or `$XDG_STATE_HOME/vane-deploy`). It contains:
+
+- `deployed-vane.sha` and `deployed-vane-web.sha`;
+- the VM-wide `control-plane.lock`, shared by backend, frontend, and certificate
+  production mutations;
+- dedicated acme.sh account, key, certificate, issuance-attempt, and verified
+  fingerprint state.
+
+SHA writes use `mktemp` + `mv` on the same filesystem. If a remote deployment
+succeeds but the runner dies before the state write, the next run safely repeats
+that component. To intentionally redeploy, remove only the exact component SHA
+file while no workflow is running.
+
+`cert-renew.yml` is independent but shares workflow concurrency and the VM lock.
+acme.sh is fetched only at commit
+`3661fd86b6304115e42f43910e6dd452ab9866d6`, installed with `--no-cron
+--no-profile`, and confined to its dedicated state directory. A valid local
+certificate with at least 60 days remaining is reused for upload/verification,
+so retries after CDN failure do not issue again. Issuance need is persisted
+before contacting Let's Encrypt and throttled to one attempt per 24 hours.
+Success requires the CDN edge leaf's SHA256 fingerprint to exactly match the
+newly uploaded local leaf and both to have at least 60 days remaining.
+
+On the first successful control-plane run, absent SHA state intentionally causes
+both components to pass their independent Gates and deploy once.

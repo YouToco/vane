@@ -1,0 +1,11 @@
+{
+  "name": "vane-deploy-wrangler",
+  "private": true,
+  "version": "1.0.0",
+  "engines": {
+    "node": "22.x"
+  },
+  "dependencies": {
+    "wrangler": "4.111.0"
+  }
+}
