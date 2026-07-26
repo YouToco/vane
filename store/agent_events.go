@@ -250,15 +250,13 @@ func (s *Store) CommitAgentSessionTurn(
 		return agentledger.ProjectionShadowAudit{}, err
 	}
 
-	current, err := loadAgentSessionProjectionForUpdate(ctx, tx, batch.Scope)
+	current, beforeEvents, priorState, err :=
+		loadAuthoritativeAgentSessionProjectionForUpdate(
+			ctx, tx, batch.Scope,
+		)
 	if err != nil {
 		return agentledger.ProjectionShadowAudit{}, err
 	}
-	beforeEvents, err := loadCompleteAgentEventLedger(ctx, tx, batch.Scope)
-	if err != nil {
-		return agentledger.ProjectionShadowAudit{}, err
-	}
-	priorState := comparePriorAgentSessionProjection(current, beforeEvents)
 
 	existing, err := loadAgentEventBatch(
 		ctx, tx, batch.Scope, batch.IdempotencyKey,
@@ -437,15 +435,11 @@ func commitAgentSessionAppendTx(
 	if err != nil {
 		return agentledger.ProjectionShadowAudit{}, false, err
 	}
-	current, err := loadAgentSessionProjectionForUpdate(ctx, tx, scope)
+	current, beforeEvents, priorState, err :=
+		loadAuthoritativeAgentSessionProjectionForUpdate(ctx, tx, scope)
 	if err != nil {
 		return agentledger.ProjectionShadowAudit{}, false, err
 	}
-	beforeEvents, err := loadCompleteAgentEventLedger(ctx, tx, scope)
-	if err != nil {
-		return agentledger.ProjectionShadowAudit{}, false, err
-	}
-	priorState := comparePriorAgentSessionProjection(current, beforeEvents)
 	existing, err := loadAgentEventBatch(
 		ctx, tx, scope, idempotencyKey,
 	)
@@ -708,6 +702,10 @@ func setAgentEventTenantContext(
 		return agentEventValidationError("agent event tenant is invalid")
 	}
 	if _, err := tx.Exec(ctx,
+		`SET LOCAL search_path = pg_catalog, public`); err != nil {
+		return agentEventDatabaseError("fix agent event search path", err)
+	}
+	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
 		fmt.Sprintf("%d", tenantID),
 	); err != nil {
@@ -752,6 +750,128 @@ func loadAgentSessionProjectionForUpdate(
 			agentEventDatabaseError("lock agent session primary projection", err)
 	}
 	return projection, nil
+}
+
+// loadAuthoritativeActiveAgentSessionProjection applies the durable per-session
+// read route to an AgentSession already selected inside one repeatable-read
+// transaction. Legacy/no-route keeps the row projection unchanged. Ledger
+// authority exposes only a completely verified latest full snapshot and only
+// while the retained JSONB replica matches it exactly.
+func loadAuthoritativeActiveAgentSessionProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	session *types.AgentSession,
+) error {
+	if session == nil {
+		return agentEventValidationError("agent session is nil")
+	}
+	scope := agentledger.Scope{
+		TenantID:  session.TenantID,
+		UserID:    session.UserID,
+		SessionID: session.ID,
+	}
+	if err := validateAgentEventScope(scope); err != nil {
+		return err
+	}
+	if err := setAgentEventTenantContext(ctx, tx, scope.TenantID); err != nil {
+		return err
+	}
+	ledgerAuthoritative, err :=
+		agentSessionProjectionLedgerAuthoritative(ctx, tx, scope)
+	if err != nil {
+		return err
+	}
+	if !ledgerAuthoritative {
+		return nil
+	}
+
+	legacy := agentledger.SessionProjection{
+		Messages:       session.Messages,
+		TurnCount:      session.TurnCount,
+		ActivatedTools: session.ActivatedTools,
+	}
+	projected, err := loadVerifiedLedgerSessionProjection(ctx, tx, scope, legacy)
+	if err != nil {
+		return err
+	}
+	session.Messages = projected.Messages
+	session.TurnCount = projected.TurnCount
+	session.ActivatedTools = projected.ActivatedTools
+	return nil
+}
+
+// loadAuthoritativeAgentSessionProjectionForUpdate fixes the lock order for
+// every production session writer: session root row, durable route, complete
+// ledger. A ledger route never falls back to the JSONB replica when the ledger
+// is empty, incomplete, corrupt, or disagrees with that replica.
+func loadAuthoritativeAgentSessionProjectionForUpdate(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope agentledger.Scope,
+) (
+	agentledger.SessionProjection,
+	[]agentledger.Event,
+	string,
+	error,
+) {
+	legacy, err := loadAgentSessionProjectionForUpdate(ctx, tx, scope)
+	if err != nil {
+		return agentledger.SessionProjection{}, nil, "", err
+	}
+	ledgerAuthoritative, err :=
+		agentSessionProjectionLedgerAuthoritative(ctx, tx, scope)
+	if err != nil {
+		return agentledger.SessionProjection{}, nil, "", err
+	}
+	events, err := loadCompleteAgentEventLedger(ctx, tx, scope)
+	if err != nil {
+		return agentledger.SessionProjection{}, nil, "", err
+	}
+	if !ledgerAuthoritative {
+		return legacy, events,
+			comparePriorAgentSessionProjection(legacy, events), nil
+	}
+	projected, err := verifiedLedgerSessionProjection(legacy, events)
+	if err != nil {
+		return agentledger.SessionProjection{}, nil, "", err
+	}
+	return projected, events, "match", nil
+}
+
+func loadVerifiedLedgerSessionProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope agentledger.Scope,
+	legacy agentledger.SessionProjection,
+) (agentledger.SessionProjection, error) {
+	events, err := loadCompleteAgentEventLedger(ctx, tx, scope)
+	if err != nil {
+		return agentledger.SessionProjection{}, err
+	}
+	return verifiedLedgerSessionProjection(legacy, events)
+}
+
+func verifiedLedgerSessionProjection(
+	legacy agentledger.SessionProjection,
+	events []agentledger.Event,
+) (agentledger.SessionProjection, error) {
+	if len(events) == 0 {
+		return agentledger.SessionProjection{}, agentEventIntegrityError()
+	}
+	projected, err := agentledger.ProjectLatestSessionSnapshot(events)
+	if err != nil {
+		return agentledger.SessionProjection{}, agentEventIntegrityError()
+	}
+	legacyDigest, err := agentledger.ProjectionDigest(legacy)
+	if err != nil {
+		return agentledger.SessionProjection{}, agentEventIntegrityError()
+	}
+	projectedDigest, err := agentledger.ProjectionDigest(projected)
+	if err != nil ||
+		!constantTimeAgentEventDigestEqual(legacyDigest, projectedDigest) {
+		return agentledger.SessionProjection{}, agentEventIntegrityError()
+	}
+	return projected, nil
 }
 
 func comparePriorAgentSessionProjection(

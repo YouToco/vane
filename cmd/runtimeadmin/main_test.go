@@ -683,6 +683,240 @@ func TestRunSnapshotCutoverRequiresExactIdentityAndConfirmation(t *testing.T) {
 	}
 }
 
+func TestParseAgentSessionCutoverRequiresExactIdentityAndConfirmation(
+	t *testing.T,
+) {
+	for name, args := range map[string][]string{
+		"missing identity": {"-action", "status"},
+		"zero session": {
+			"-tenant", "1", "-user", "2", "-session", "0",
+			"-action", "status",
+		},
+		"invalid action": {
+			"-tenant", "1", "-user", "2", "-session", "3",
+			"-action", "apply",
+		},
+		"activate unconfirmed": {
+			"-tenant", "1", "-user", "2", "-session", "3",
+			"-action", "activate",
+		},
+		"rollback unconfirmed": {
+			"-tenant", "1", "-user", "2", "-session", "3",
+			"-action", "rollback",
+		},
+		"status with write confirmation": {
+			"-tenant", "1", "-user", "2", "-session", "3",
+			"-action", "status", "-confirm-cutover",
+		},
+		"positional carrier": {
+			"-tenant", "1", "-user", "2", "-session", "3",
+			"-action", "status", "carrier",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			if _, ok := parseAgentSessionCutoverOptions(
+				args, &stderr,
+			); ok {
+				t.Fatalf("options unexpectedly accepted: %v", args)
+			}
+			if stderr.Len() == 0 {
+				t.Fatal("rejection did not explain safe usage")
+			}
+		})
+	}
+	for _, action := range []agentSessionCutoverAction{
+		agentSessionCutoverStatus,
+		agentSessionCutoverActivate,
+		agentSessionCutoverRollback,
+	} {
+		t.Run("valid "+string(action), func(t *testing.T) {
+			args := []string{
+				"-tenant", "1", "-user", "2", "-session", "3",
+				"-action", string(action),
+			}
+			if action != agentSessionCutoverStatus {
+				args = append(args, "-confirm-cutover")
+			}
+			var stderr bytes.Buffer
+			opts, ok := parseAgentSessionCutoverOptions(args, &stderr)
+			if !ok || stderr.Len() != 0 ||
+				opts.TenantID != 1 || opts.UserID != 2 ||
+				opts.SessionID != 3 || opts.Action != action {
+				t.Fatalf("options=%+v ok=%v stderr=%q",
+					opts, ok, stderr.String())
+			}
+		})
+	}
+}
+
+func TestExecuteAgentSessionCutoverRoutesOnlyDurableAuthorityAPI(
+	t *testing.T,
+) {
+	for _, action := range []agentSessionCutoverAction{
+		agentSessionCutoverStatus,
+		agentSessionCutoverActivate,
+		agentSessionCutoverRollback,
+	} {
+		t.Run(string(action), func(t *testing.T) {
+			fake := &fakeAgentSessionCutoverStore{
+				output: store.AgentSessionProjectionAuthorityStatus{
+					TenantID: 1, UserID: 2, SessionID: 3,
+					Route:      store.AgentSessionProjectionRouteLedger,
+					Generation: 4, EventID: 5, LedgerHeadSequence: 6,
+				},
+			}
+			output, err := executeAgentSessionCutover(
+				t.Context(), fake, agentSessionCutoverOptions{
+					TenantID: 1, UserID: 2, SessionID: 3,
+					Action:  action,
+					Confirm: action != agentSessionCutoverStatus,
+				})
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCall := "control"
+			if action == agentSessionCutoverStatus {
+				wantCall = "status"
+			}
+			if fake.call != wantCall || fake.tenantID != 1 ||
+				fake.userID != 2 || fake.sessionID != 3 ||
+				(action != agentSessionCutoverStatus &&
+					string(fake.action) != string(action)) ||
+				output.Route != "ledger" ||
+				output.LedgerHeadSequence != 6 {
+				t.Fatalf("fake/output=%+v/%+v", fake, output)
+			}
+		})
+	}
+}
+
+func TestExecuteAgentSessionCutoverRevalidatesScopeAndConfirmation(
+	t *testing.T,
+) {
+	tests := []agentSessionCutoverOptions{
+		{
+			TenantID: 0, UserID: 2, SessionID: 3,
+			Action: agentSessionCutoverStatus,
+		},
+		{
+			TenantID: 1, UserID: 2, SessionID: 3,
+			Action: agentSessionCutoverActivate,
+		},
+		{
+			TenantID: 1, UserID: 2, SessionID: 3,
+			Action: agentSessionCutoverRollback,
+		},
+		{
+			TenantID: 1, UserID: 2, SessionID: 3,
+			Action: agentSessionCutoverStatus, Confirm: true,
+		},
+		{
+			TenantID: 1, UserID: 2, SessionID: 3,
+			Action: "unknown", Confirm: true,
+		},
+	}
+	for _, opts := range tests {
+		fake := &fakeAgentSessionCutoverStore{}
+		if _, err := executeAgentSessionCutover(
+			t.Context(), fake, opts,
+		); !errors.Is(err, types.ErrValidation) {
+			t.Fatalf("opts=%+v error=%v, want validation", opts, err)
+		}
+		if fake.call != "" {
+			t.Fatalf("opts=%+v reached Store via %q", opts, fake.call)
+		}
+	}
+}
+
+type fakeAgentSessionCutoverStore struct {
+	call      string
+	tenantID  int64
+	userID    int64
+	sessionID int64
+	action    store.AgentSessionProjectionAuthorityAction
+	output    store.AgentSessionProjectionAuthorityStatus
+	err       error
+}
+
+func (f *fakeAgentSessionCutoverStore) GetAgentSessionProjectionAuthorityStatus(
+	_ context.Context,
+	tenantID int64,
+	userID int64,
+	sessionID int64,
+) (store.AgentSessionProjectionAuthorityStatus, error) {
+	f.call, f.tenantID, f.userID, f.sessionID =
+		"status", tenantID, userID, sessionID
+	return f.output, f.err
+}
+
+func (f *fakeAgentSessionCutoverStore) ControlAgentSessionProjectionAuthority(
+	_ context.Context,
+	tenantID int64,
+	userID int64,
+	sessionID int64,
+	action store.AgentSessionProjectionAuthorityAction,
+) (store.AgentSessionProjectionAuthorityStatus, error) {
+	f.call, f.tenantID, f.userID, f.sessionID =
+		"control", tenantID, userID, sessionID
+	f.action = action
+	return f.output, f.err
+}
+
+func TestFinishAgentSessionCutoverRunOutputsOnlySafeCarrier(t *testing.T) {
+	result := agentSessionCutoverOutput{
+		TenantID: 1, UserID: 2, SessionID: 3,
+		Route: "ledger", Generation: 4, EventID: 5,
+		LedgerHeadSequence: 6,
+	}
+	var stdout, stderr bytes.Buffer
+	if got := finishAgentSessionCutoverRun(
+		&stdout, &stderr, result, nil,
+	); got != exitOK {
+		t.Fatalf("exit=%d want=%d", got, exitOK)
+	}
+	output := stdout.String()
+	for _, want := range []string{
+		`"session_id": 3`, `"route": "ledger"`, `"generation": 4`,
+		`"ledger_head_sequence": 6`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("JSON missing %q: %s", want, output)
+		}
+	}
+	for _, forbidden := range []string{
+		"messages", "payload", "prompt", "content", "tool",
+		"activated_tools", "legacy_replica",
+	} {
+		if strings.Contains(output, forbidden) {
+			t.Errorf("JSON leaked forbidden field %q: %s",
+				forbidden, output)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestFinishAgentSessionCutoverRunSanitizesStoreError(t *testing.T) {
+	const secret = `session body: [{"role":"user","content":"secret"}]`
+	runErr := types.NewAppError(
+		types.CodeConflict, "agent session cutover rejected",
+		errors.New(secret))
+	var stdout, stderr bytes.Buffer
+	if got := finishAgentSessionCutoverRun(
+		&stdout, &stderr, agentSessionCutoverOutput{}, runErr,
+	); got != exitFailure {
+		t.Fatalf("exit=%d want=%d", got, exitFailure)
+	}
+	if stdout.Len() != 0 ||
+		!strings.Contains(stderr.String(), "agent session cutover rejected") ||
+		strings.Contains(stderr.String(), secret) {
+		t.Fatalf("unsafe output stdout/stderr=%q/%q",
+			stdout.String(), stderr.String())
+	}
+}
+
 func TestFinishSnapshotCutoverRunOutputsOnlySafeCarrier(t *testing.T) {
 	result := store.TaskRunSnapshotCutoverResult{
 		TenantID: 1, UserID: 2, TaskID: "task", EventID: 3,

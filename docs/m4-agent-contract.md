@@ -509,3 +509,37 @@ Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的
 - 验证至少覆盖：终态+outbox 原子回滚、跨 Tenant/User/Task、双击/竞争、stale takeover、
   会话提交响应丢失、Patch 成功但响应丢失、sent checkpoint 前崩溃、跨 App 拒发、渠道撤销、
   外部摘要注入、panic 保卡、忙 user 锁不阻塞，以及真实 PostgreSQL `-race`。
+
+## 13. 7.7-B3 会话主读 authority 与可回滚切换（2026-07-26）
+
+本节只定义 `agent_sessions` retained JSONB 与 `agent_events` projector 之间的主读选择，
+不改变消息写入、Agent prompt、工具协议或确认后的执行语义。切换控制面只有数据库直连的
+`runtimeadmin agent-session-cutover`；HTTP、飞书、Agent、A2A 与 Temporal 均不得暴露
+activate/rollback 入口。
+
+- authority 以 exact `(tenant_id,user_id,session_id)` 为作用域，只有 `legacy` 与 `ledger`
+  两种解析状态。无 authority event 时等价于 `legacy`，Store 按 retained JSONB 主读；
+  最新 `activate` event 解析为 `ledger`，最新 `rollback` event 解析为 `legacy`。
+  rollback 只能追加不可变 event，不能删除、覆盖或倒写历史。每代记录的 ledger
+  high-watermark 必须恰好落在完整 batch 末端；Store 必须重放该前缀并证明记录 digest
+  等于其最新完整 snapshot，不能只检查两个存储 digest 彼此相等。
+- `route=ledger` 是 fail-closed 权限，不是“尽量从 ledger 读”。零事件、批次不完整、sequence
+  不连续、digest/codec 损坏、投影失败，或 ledger projector 与同事务冻结的 legacy replica
+  不 exact match 时，读必须返回安全完整性错误；严禁静默回落 JSONB。
+- 所有会话 writers（普通 turn、callback/feedback side writer、task creation receipt、
+  definition-edit receipt）必须在同一事务内读取并锁定 authority，以 authority 选出的
+  authoritative base 构造下一代完整 snapshot；不得始终拿 retained JSONB 当 base，也不得
+  在 authority 检查前写任一投影。`route=ledger` 下仍原子维护 legacy replica，作为审计与
+  exact rollback 前置证明，而不是主读。
+- activate 仅允许当前 route 为 legacy、ledger 可完整投影且与 legacy replica exact match
+  时追加 `route=ledger` 事件；rollback 仅允许当前 route 为 ledger、当前 ledger 投影仍与
+  legacy replica exact match 时追加 `route=legacy` 事件。任一不匹配都保持原 authority，
+  不得用 rollback 掩盖损坏。重复同一目标 action 只能 exact replay，不能额外推进 generation。
+- `runtimeadmin agent-session-cutover` 强制 positive `-tenant/-user/-session` 和
+  `-action status|activate|rollback`；activate/rollback 必须显式
+  `-confirm-cutover`，status 反而拒绝 confirm。stdout 只输出 exact scope、route、
+  generation/event 等安全 carrier；错误只输出 `AppError.Message` 或固定兜底，不得泄露
+  messages、event payload、prompt、tool 结果、activated tools 或 legacy replica 正文。
+- 本批明确排除 7.8 ContextBuilder/Turn Snapshot 与 7.10 durable continuation：
+  不重排上下文、不新增 Agent 自动回续、不扫描业务事实、不改变 callback/feedback
+  best-effort ingress，也不重放任何 provider side effect。

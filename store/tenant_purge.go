@@ -44,7 +44,7 @@ type purgeStep struct {
 //	schedule_playbooks / schedule_sources → schedules
 //	feedbacks                             → deliveries
 //	task_creation_receipts               → pending_actions → agent_sessions
-//	agent_events                         → agent_sessions
+//	agent_session_projection_authority_events / agent_events → agent_sessions
 //	push_effects                        → deliveries / push_batches / task_run_snapshots
 //	task_observed_events               → deliveries / task_run_snapshots
 //	task_event_qualification_steps     → task_run_snapshots
@@ -79,8 +79,11 @@ var purgeOrder = []purgeStep{
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
 	{"pending_actions", "tenant_id = $1"},
-	// Semantic events reference agent_sessions by complete tenant/user/session
-	// scope and therefore must be deleted before the session projection.
+	// Projection authority and semantic events reference agent_sessions by the
+	// complete tenant/user/session scope and therefore must be deleted before
+	// the session projection. Authority is locked/read after the root session
+	// by writers, but purge already pre-locks session roots before child deletes.
+	{"agent_session_projection_authority_events", "tenant_id = $1"},
 	{"agent_events", "tenant_id = $1"},
 	// External effect checkpoints bind exact delivery, batch, and immutable run
 	// identities, so they must be removed before all three parent aggregates.

@@ -300,9 +300,18 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 	); err != nil {
 		t.Fatalf("建 Agent event 清理夹具失败: %v", err)
 	}
+	if _, err := st.ControlAgentSessionProjectionAuthority(
+		ctx, tn.ID, u.ID, editSessionID,
+		AgentSessionProjectionAuthorityActivate,
+	); err != nil {
+		t.Fatalf("激活 Agent projection authority 清理夹具失败: %v", err)
+	}
 	t.Cleanup(func() {
 		c, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(c, t, st,
+			`DELETE FROM agent_session_projection_authority_events
+			  WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM agent_events WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_definition_edit_receipts WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_definition_edit_operations WHERE tenant_id = $1`, tn.ID)
@@ -359,6 +368,10 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	if rep.Rows["agent_events"] != 3 {
 		t.Errorf("试运行报告必须包含 Agent event，实得 %d",
 			rep.Rows["agent_events"])
+	}
+	if rep.Rows["agent_session_projection_authority_events"] != 1 {
+		t.Errorf("试运行报告必须包含 Agent authority，实得 %d",
+			rep.Rows["agent_session_projection_authority_events"])
 	}
 
 	// 租户与数据必须原封不动。
@@ -417,6 +430,64 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	}
 	if n != 3 {
 		t.Errorf("试运行后 Agent event 应还在，实得 %d 行 —— 事务没回滚", n)
+	}
+}
+
+func TestAgentProjectionAuthorityControlRacesTenantPurgeWithoutDeadlock(
+	t *testing.T,
+) {
+	st := purgeStore(t)
+	tenantID := seedPurgeTenant(t, st)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	var userID, sessionID int64
+	if err := st.pool.QueryRow(ctx, `
+		SELECT user_id,id
+		  FROM agent_sessions
+		 WHERE tenant_id=$1
+		 ORDER BY id
+		 LIMIT 1`,
+		tenantID,
+	).Scan(&userID, &sessionID); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	controlErr := make(chan error, 1)
+	purgeErr := make(chan error, 1)
+	go func() {
+		<-start
+		_, err := st.ControlAgentSessionProjectionAuthority(
+			ctx, tenantID, userID, sessionID,
+			AgentSessionProjectionAuthorityRollback,
+		)
+		controlErr <- err
+	}()
+	go func() {
+		<-start
+		_, err := st.PurgeTenant(ctx, tenantID, false)
+		purgeErr <- err
+	}()
+	close(start)
+	if err := <-purgeErr; err != nil {
+		t.Fatalf("purge racing Agent authority control: %v", err)
+	}
+	if err := <-controlErr; err != nil &&
+		!errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("Agent authority control race error=%v", err)
+	}
+	var authorityRows, sessionRows int
+	if err := st.pool.QueryRow(t.Context(), `
+		SELECT
+		  (SELECT count(*) FROM agent_session_projection_authority_events
+		    WHERE tenant_id=$1),
+		  (SELECT count(*) FROM agent_sessions WHERE tenant_id=$1)`,
+		tenantID,
+	).Scan(&authorityRows, &sessionRows); err != nil {
+		t.Fatal(err)
+	}
+	if authorityRows != 0 || sessionRows != 0 {
+		t.Fatalf("purge left authority/session rows=%d/%d",
+			authorityRows, sessionRows)
 	}
 }
 

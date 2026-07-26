@@ -46,8 +46,22 @@ func scanPendingAction(row pgx.Row, pa *types.PendingAction) error {
 // 不会产生错误结果，故不用 SELECT FOR UPDATE。翻转刻意不动 updated_at——
 // 保留"最后活跃时间"语义供排查。
 func (s *Store) GetActiveAgentSession(ctx context.Context, userID int64, since time.Time) (*types.AgentSession, error) {
+	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("开始查询用户 %d 的活跃 agent 会话", userID), err)
+	}
+	defer func() {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+	}()
+	if _, err := tx.Exec(ctx,
+		`SET LOCAL search_path = pg_catalog, public`); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("固定用户 %d 的 agent 会话查询路径", userID), err)
+	}
+
 	var as types.AgentSession
-	err := scanAgentSession(s.pool.QueryRow(ctx,
+	err = scanAgentSession(tx.QueryRow(ctx,
 		`WITH stale AS (
 			UPDATE agent_sessions SET status = $3
 			WHERE user_id = $1 AND status = $4 AND updated_at < $2
@@ -60,11 +74,27 @@ func (s *Store) GetActiveAgentSession(ctx context.Context, userID int64, since t
 		userID, since, types.AgentSessionStatusExpired, types.AgentSessionStatusActive), &as)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// Preserve the legacy data-modifying CTE semantics: stale rows
+			// remain expired even though the SELECT arm returned no active
+			// session. Rolling this transaction back would silently resurrect
+			// them on every lookup.
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return nil, types.NewAppError(types.CodeDatabase,
+					fmt.Sprintf("提交用户 %d 的 agent 会话过期翻转", userID),
+					commitErr)
+			}
 			return nil, types.NewAppError(types.CodeNotFound,
 				fmt.Sprintf("用户 %d 无活跃 agent 会话", userID), err)
 		}
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("查询用户 %d 的活跃 agent 会话", userID), err)
+	}
+	if err := loadAuthoritativeActiveAgentSessionProjection(ctx, tx, &as); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("提交用户 %d 的活跃 agent 会话查询", userID), err)
 	}
 	return &as, nil
 }
