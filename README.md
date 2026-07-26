@@ -46,12 +46,23 @@ Aliyun CDN and Cloudflare Pages succeed. If backend succeeds and frontend fails,
 backend state remains truthfully advanced; the next poll rebuilds and retries
 only the frontend.
 
-The production workflow is schedule-only and polls every five minutes. The
-certificate workflow is also schedule-only. There is no branch-selectable
-`workflow_dispatch`; a failed main run is retried with GitHub's run-rerun
+The production workflow polls every five minutes. An owner can also request the
+same poll immediately by creating a `repository_dispatch` event with the exact
+type `deploy-production`. GitHub fixes that event's workflow, `GITHUB_REF`, and
+`GITHUB_SHA` to the default branch; the workflow ignores `client_payload` and
+still resolves source `main` SHAs independently. There is deliberately no
+branch-selectable `workflow_dispatch`. The certificate workflow remains
+schedule-only. A failed production run is retried with GitHub's run-rerun
 operation using **Re-run all jobs** so `plan`, the exact-SHA Gates, artifacts,
 and deployment all share the new run attempt. GitHub Environment approval is
 intentionally not used as a security boundary on this Free private repository.
+
+To request an immediate production poll:
+
+```bash
+gh api --method POST repos/YouToco/vane-deploy/dispatches \
+  -f event_type=deploy-production
+```
 
 ## Runner provisioning
 

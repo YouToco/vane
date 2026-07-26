@@ -3,6 +3,11 @@ name: Deploy production
 on:
   schedule:
     - cron: "*/5 * * * *"
+  # Unlike workflow_dispatch, repository_dispatch always executes the
+  # default-branch workflow at the default-branch SHA. The payload is ignored;
+  # plan still resolves both source repositories' exact main SHAs itself.
+  repository_dispatch:
+    types: [deploy-production]
 
 permissions:
   contents: read
