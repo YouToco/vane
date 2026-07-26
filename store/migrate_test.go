@@ -81,9 +81,9 @@ var wantTables = []string{
 	// 036 C2c-2 immutable run-snapshot v2 shadow sidecar.
 	"task_run_snapshot_v2_shadows",
 	// 037 C2c-3b-1 durable per-run v2 authority fence.
-	// 036 C2c-2 immutable run-snapshot v2 shadow sidecar.
 	"task_run_snapshot_v2_cutover_events",
 	// 038 adds only restricted cutover functions/role; no new table.
+	// 057 atomically rebases retained-v2 authority during definition edits.
 	// 039 durable external push effect/checkpoint substrate.
 	"push_effects",
 	// 050 physically pinned one-shot legacy batch 63 repair adjudication.

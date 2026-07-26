@@ -2,13 +2,16 @@ package store
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
+	"io/fs"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/pressly/goose/v3"
 
 	"github.com/YouToco/vane/definitioneditwire"
 	"github.com/YouToco/vane/types"
@@ -373,6 +376,117 @@ func TestMigration057CompleteDefinitionEditRebaseCommits(t *testing.T) {
 			f.op.TargetDefinitionDigest,
 		)
 	}
+
+	sqlDB, provider := migration057ProviderForStore(t, runFixture.st)
+	if _, err := provider.DownTo(ctx, 56); err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"refusing downgrade while definition-edit cutover history exists",
+		) {
+		t.Fatalf("057 downgrade accepted durable cutover history: %v", err)
+	}
+	var (
+		version                             int64
+		rebaseFunction, operationColumn     bool
+		finalIntegrityTrigger, ownedHistory bool
+	)
+	if err := sqlDB.QueryRowContext(ctx, `
+		SELECT
+		  COALESCE(MAX(version_id) FILTER (WHERE is_applied), 0),
+		  to_regprocedure(
+		      'task_run_snapshot_v2_rebase_definition_edit(text,bigint,text)'
+		  ) IS NOT NULL,
+		  EXISTS (
+		      SELECT 1
+		        FROM information_schema.columns
+		       WHERE table_schema='public'
+		         AND table_name='task_run_snapshot_v2_cutover_events'
+		         AND column_name='definition_edit_operation_id'
+		  ),
+		  EXISTS (
+		      SELECT 1
+		        FROM pg_trigger
+		       WHERE tgname='task_run_snapshot_v2_active_pin_final_integrity'
+		         AND NOT tgisinternal
+		  ),
+		  EXISTS (
+		      SELECT 1
+		        FROM task_run_snapshot_v2_cutover_events
+		       WHERE definition_edit_operation_id=$1
+		  )
+		  FROM goose_db_version`,
+		f.op.ID,
+	).Scan(
+		&version,
+		&rebaseFunction,
+		&operationColumn,
+		&finalIntegrityTrigger,
+		&ownedHistory,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if version != 57 || !rebaseFunction || !operationColumn ||
+		!finalIntegrityTrigger || !ownedHistory {
+		t.Fatalf(
+			"failed 057 Down leaked partial state: version=%d "+
+				"function=%v column=%v trigger=%v history=%v",
+			version,
+			rebaseFunction,
+			operationColumn,
+			finalIntegrityTrigger,
+			ownedHistory,
+		)
+	}
+}
+
+func TestMigration057EmptyHistoryDownRestoresMigration056Authority(
+	t *testing.T,
+) {
+	db, provider := migration035Scratch(t)
+	ctx := t.Context()
+	if _, err := provider.UpTo(ctx, 56); err != nil {
+		t.Fatalf("migrate to pre-057 schema: %v", err)
+	}
+	var pointerBefore string
+	if err := db.QueryRowContext(ctx, `
+		SELECT pg_get_functiondef(
+		    'task_run_snapshot_v2_cutover_pointer_transition()'::regprocedure
+		)`,
+	).Scan(&pointerBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(ctx, 57); err != nil {
+		t.Fatalf("migrate to 057: %v", err)
+	}
+	assertMigration057Authority(t, db, true)
+
+	if _, err := provider.DownTo(ctx, 56); err != nil {
+		t.Fatalf("empty 057 downgrade: %v", err)
+	}
+	assertMigration057Authority(t, db, false)
+
+	var (
+		version      int64
+		pointerAfter string
+	)
+	if err := db.QueryRowContext(ctx, `
+		SELECT
+		  COALESCE(MAX(version_id) FILTER (WHERE is_applied), 0),
+		  pg_get_functiondef(
+		      'task_run_snapshot_v2_cutover_pointer_transition()'::regprocedure
+		  )
+		  FROM goose_db_version`,
+	).Scan(&version, &pointerAfter); err != nil {
+		t.Fatal(err)
+	}
+	if version != 56 {
+		t.Fatalf("empty 057 downgrade version=%d want=56", version)
+	}
+	// CREATE OR REPLACE may omit blank lines retained from the original
+	// CREATE FUNCTION. Compare every non-empty definition line instead.
+	if compactSQLFunction(pointerAfter) != compactSQLFunction(pointerBefore) {
+		t.Fatal("057 Down did not restore migration 056 pointer authority")
+	}
 }
 
 func TestMigration057RejectsPreexistingCorruptCutoverPointer(t *testing.T) {
@@ -428,6 +542,101 @@ func TestMigration057RejectsPreexistingCorruptCutoverPointer(t *testing.T) {
 	if operationColumnExists {
 		t.Fatal("failed 057 migration leaked partial schema")
 	}
+}
+
+func migration057ProviderForStore(
+	t *testing.T,
+	st *Store,
+) (*sql.DB, *goose.Provider) {
+	t.Helper()
+	db, err := sql.Open("pgx", st.pool.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db, provider
+}
+
+func assertMigration057Authority(t *testing.T, db *sql.DB, want bool) {
+	t.Helper()
+	var (
+		rebaseFunction, operationColumn, finalIntegrityTrigger bool
+		snapshotsRead, shadowsRead, cutoverEventsRead          bool
+	)
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT
+		  to_regprocedure(
+		      'task_run_snapshot_v2_rebase_definition_edit(text,bigint,text)'
+		  ) IS NOT NULL,
+		  EXISTS (
+		      SELECT 1
+		        FROM information_schema.columns
+		       WHERE table_schema='public'
+		         AND table_name='task_run_snapshot_v2_cutover_events'
+		         AND column_name='definition_edit_operation_id'
+		  ),
+		  EXISTS (
+		      SELECT 1
+		        FROM pg_trigger
+		       WHERE tgname='task_run_snapshot_v2_active_pin_final_integrity'
+		         AND NOT tgisinternal
+		  ),
+		  has_table_privilege(
+		      'vane_edit_coordinator','task_run_snapshots','SELECT'),
+		  has_table_privilege(
+		      'vane_edit_coordinator','task_run_snapshot_v2_shadows','SELECT'),
+		  has_table_privilege(
+		      'vane_edit_coordinator',
+		      'task_run_snapshot_v2_cutover_events',
+		      'SELECT'
+		  )`,
+	).Scan(
+		&rebaseFunction,
+		&operationColumn,
+		&finalIntegrityTrigger,
+		&snapshotsRead,
+		&shadowsRead,
+		&cutoverEventsRead,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if rebaseFunction != want || operationColumn != want ||
+		finalIntegrityTrigger != want || snapshotsRead != want ||
+		shadowsRead != want || cutoverEventsRead != want {
+		t.Fatalf(
+			"057 authority present=%v want=%v: "+
+				"function=%v column=%v trigger=%v reads=%v/%v/%v",
+			rebaseFunction && operationColumn && finalIntegrityTrigger &&
+				snapshotsRead && shadowsRead && cutoverEventsRead,
+			want,
+			rebaseFunction,
+			operationColumn,
+			finalIntegrityTrigger,
+			snapshotsRead,
+			shadowsRead,
+			cutoverEventsRead,
+		)
+	}
+}
+
+func compactSQLFunction(definition string) string {
+	lines := strings.Split(definition, "\n")
+	compacted := lines[:0]
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			compacted = append(compacted, line)
+		}
+	}
+	return strings.Join(compacted, "\n")
 }
 
 func requireSQLState057(t *testing.T, err error, want string) {
