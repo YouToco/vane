@@ -162,6 +162,22 @@ func TestAgentSessionFactProjectorRuntimeCapabilityValidator(t *testing.T) {
 			          FROM vane_agent_session_fact_projector`,
 		},
 		{
+			name: "column references",
+			apply: `GRANT REFERENCES (session_messages)
+			        ON agent_session_fact_outbox
+			        TO vane_agent_session_fact_projector`,
+			restore: `REVOKE REFERENCES (session_messages)
+			          ON agent_session_fact_outbox
+			          FROM vane_agent_session_fact_projector`,
+		},
+		{
+			name: "table maintain",
+			apply: `GRANT MAINTAIN ON feedbacks
+			        TO vane_agent_session_fact_projector`,
+			restore: `REVOKE MAINTAIN ON feedbacks
+			          FROM vane_agent_session_fact_projector`,
+		},
+		{
 			name: "extra sequence",
 			apply: `GRANT USAGE ON SEQUENCE feedbacks_id_seq
 			        TO vane_agent_session_fact_projector`,
@@ -225,54 +241,86 @@ func TestAgentSessionFactProjectorDriftFailsAcquireProjectAndRelease(
 	secondID := f.insertFeedback(t, types.FeedbackActionNotInterested)
 	second := f.loadFact(t, secondID)
 
-	if _, err := f.store.pool.Exec(t.Context(),
-		`GRANT UPDATE (session_messages)
-		   ON agent_session_fact_outbox
-		   TO vane_agent_session_fact_projector`,
-	); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if _, err := f.store.pool.Exec(context.Background(),
-			`REVOKE UPDATE (session_messages)
-			   ON agent_session_fact_outbox
-			   FROM vane_agent_session_fact_projector`,
-		); err != nil {
-			t.Errorf("restore projector privilege: %v", err)
-		}
-	}()
+	for _, mutation := range []struct {
+		name, apply, restore string
+	}{
+		{
+			name: "immutable update",
+			apply: `GRANT UPDATE (session_messages)
+			        ON agent_session_fact_outbox
+			        TO vane_agent_session_fact_projector`,
+			restore: `REVOKE UPDATE (session_messages)
+			          ON agent_session_fact_outbox
+			          FROM vane_agent_session_fact_projector`,
+		},
+		{
+			name: "column references",
+			apply: `GRANT REFERENCES (session_messages)
+			        ON agent_session_fact_outbox
+			        TO vane_agent_session_fact_projector`,
+			restore: `REVOKE REFERENCES (session_messages)
+			          ON agent_session_fact_outbox
+			          FROM vane_agent_session_fact_projector`,
+		},
+		{
+			name: "table maintain",
+			apply: `GRANT MAINTAIN ON feedbacks
+			        TO vane_agent_session_fact_projector`,
+			restore: `REVOKE MAINTAIN ON feedbacks
+			          FROM vane_agent_session_fact_projector`,
+		},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			if _, err := f.store.pool.Exec(
+				t.Context(), mutation.apply,
+			); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if _, err := f.store.pool.Exec(
+					context.Background(), mutation.restore,
+				); err != nil {
+					t.Errorf("restore projector privilege: %v", err)
+				}
+			}()
 
-	_, err := f.store.AcquireAgentSessionFact(
-		t.Context(), AcquireAgentSessionFactParams{
-			ID: second.ID, TenantID: second.TenantID,
-			UserID: second.UserID, LeaseOwner: "drift-acquire",
-			LeaseDuration: time.Minute,
+			_, err := f.store.AcquireAgentSessionFact(
+				t.Context(), AcquireAgentSessionFactParams{
+					ID: second.ID, TenantID: second.TenantID,
+					UserID:        second.UserID,
+					LeaseOwner:    "drift-acquire-" + mutation.name,
+					LeaseDuration: time.Minute,
+				})
+			if !errors.Is(err, types.ErrInternal) {
+				t.Fatalf("Acquire drift err=%v", err)
+			}
+			if err := f.store.ProjectAgentSessionFact(
+				t.Context(), lease,
+			); !errors.Is(err, types.ErrInternal) {
+				t.Fatalf("Project drift err=%v", err)
+			}
+			if err := f.store.ReleaseAgentSessionFact(
+				t.Context(), lease, time.Minute,
+			); !errors.Is(err, types.ErrInternal) {
+				t.Fatalf("Release drift err=%v", err)
+			}
+			var events int
+			if err := f.store.pool.QueryRow(t.Context(),
+				`SELECT count(*) FROM agent_events
+				  WHERE tenant_id=$1 AND session_id=$2
+				    AND batch_idempotency_key LIKE 'side.%'`,
+				f.tenantA, f.sessionA,
+			).Scan(&events); err != nil {
+				t.Fatal(err)
+			}
+			if events != 0 {
+				t.Fatalf(
+					"capability drift admitted %d event writes",
+					events)
+			}
 		})
-	if !errors.Is(err, types.ErrInternal) {
-		t.Fatalf("Acquire drift err=%v", err)
 	}
-	if err := f.store.ProjectAgentSessionFact(
-		t.Context(), lease,
-	); !errors.Is(err, types.ErrInternal) {
-		t.Fatalf("Project drift err=%v", err)
-	}
-	if err := f.store.ReleaseAgentSessionFact(
-		t.Context(), lease, time.Minute,
-	); !errors.Is(err, types.ErrInternal) {
-		t.Fatalf("Release drift err=%v", err)
-	}
-	var events int
-	if err := f.store.pool.QueryRow(t.Context(),
-		`SELECT count(*) FROM agent_events
-		  WHERE tenant_id=$1 AND session_id=$2
-		    AND batch_idempotency_key LIKE 'side.%'`,
-		f.tenantA, f.sessionA,
-	).Scan(&events); err != nil {
-		t.Fatal(err)
-	}
-	if events != 0 {
-		t.Fatalf("capability drift admitted %d event writes", events)
-	}
+	assertProjectorCapabilityValid(t, f.store)
 }
 
 func assertProjectorCapabilityValid(t *testing.T, st *Store) {

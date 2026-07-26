@@ -704,7 +704,7 @@ func validateAgentSessionFactProjector(
 		       AND (
 		         has_table_privilege(
 		           op.oid, c.oid,
-		           'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+		           'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN'
 		         ) OR (
 		           has_table_privilege(op.oid, c.oid, 'SELECT') AND
 		           c.oid NOT IN (
@@ -772,6 +772,17 @@ func validateAgentSessionFactProjector(
 		            'session_recorded_at','status','updated_at'
 		          ))
 		       )
+		  ) AND
+		  NOT EXISTS (
+		    SELECT 1
+		      FROM pg_attribute a
+		      JOIN pg_class c ON c.oid = a.attrelid
+		      JOIN pg_namespace n ON n.oid = c.relnamespace
+		     WHERE n.nspname = 'public' AND c.relkind IN ('r','p','v','m','f')
+		       AND a.attnum > 0 AND NOT a.attisdropped
+		       AND has_column_privilege(
+		             op.oid, a.attrelid, a.attname, 'REFERENCES'
+		           )
 		  ) AND
 		  has_sequence_privilege(
 		    op.oid, 'agent_events_id_seq', 'USAGE'
