@@ -37,9 +37,33 @@ type Scheduler interface {
 }
 
 type scheduleActionController interface {
-	TriggerScheduleNow(ctx context.Context, schedID string, userID int64) error
-	PausePush(ctx context.Context, schedID string, userID int64) error
-	ResumePush(ctx context.Context, schedID string, userID int64) error
+	TriggerScheduleNowIdempotent(
+		ctx context.Context,
+		schedID string,
+		userID int64,
+		idempotencyKey string,
+	) error
+	PausePushIdempotent(
+		ctx context.Context,
+		schedID string,
+		userID int64,
+		idempotencyKey string,
+	) error
+	ResumePushIdempotent(
+		ctx context.Context,
+		schedID string,
+		userID int64,
+		idempotencyKey string,
+	) error
+}
+
+type scheduleDeleteController interface {
+	DeletePushIdempotent(
+		ctx context.Context,
+		schedID string,
+		userID int64,
+		idempotencyKey string,
+	) error
 }
 
 type scheduleNextRunReader interface {
@@ -244,7 +268,10 @@ func (s *server) cors(next http.Handler) http.Handler {
 				// 连请求都不发（fetch 拿到的是网络错误，不是状态码）。新增写端点时
 				// 必须同步这一行；已退役的方法不得继续被浏览器预检广告。
 				h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE")
-				h.Set("Access-Control-Allow-Headers", "Content-Type")
+				h.Set(
+					"Access-Control-Allow-Headers",
+					"Content-Type, Idempotency-Key",
+				)
 				h.Set("Access-Control-Max-Age", "600")
 				w.WriteHeader(http.StatusNoContent)
 				return

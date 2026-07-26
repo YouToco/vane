@@ -175,6 +175,19 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		t.Fatalf("建清理任务夹具失败: %v", err)
 	}
 	if _, err := tx.Exec(ctx, `
+		INSERT INTO schedule_commands (
+			id, tenant_id, user_id, task_id, idempotency_key, kind,
+			payload_digest, remote_request_id, status, phase, completed_at
+		) VALUES (
+			$1, $2, $3, $4, $5, 'pause', repeat('a', 64), repeat('b', 64),
+			'completed', 'completed', clock_timestamp()
+		)`,
+		uuid.NewString(), tn.ID, u.ID, taskID,
+		"purge-command-"+uuid.NewString(),
+	); err != nil {
+		t.Fatalf("建 Schedule Command 清理夹具失败: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO task_approved_definition_versions (
 			tenant_id, user_id, task_id, version, schema_version,
 			execution_mode, definition_digest, payload, approval_ref
@@ -317,6 +330,7 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		cleanupExec(c, t, st, `DELETE FROM task_definition_edit_operations WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_adaptive_states WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_approved_definition_versions WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM schedule_commands WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM schedules WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_run_snapshots WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM profiles WHERE tenant_id = $1`, tn.ID)
@@ -364,6 +378,10 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 		t.Errorf("试运行报告必须包含 Definition Edit operation/receipt，实得 %d/%d",
 			rep.Rows["task_definition_edit_operations"],
 			rep.Rows["task_definition_edit_receipts"])
+	}
+	if rep.Rows["schedule_commands"] != 1 {
+		t.Errorf("试运行报告必须包含 Schedule Command，实得 %d",
+			rep.Rows["schedule_commands"])
 	}
 	if rep.Rows["agent_events"] != 3 {
 		t.Errorf("试运行报告必须包含 Agent event，实得 %d",
@@ -422,6 +440,14 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("试运行后 Definition Edit receipt 应还在，实得 %d 行 —— 事务没回滚", n)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM schedule_commands WHERE tenant_id = $1`, tenantID,
+	).Scan(&n); err != nil {
+		t.Fatalf("查 Schedule Command 失败: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("试运行后 Schedule Command 应还在，实得 %d 行 —— 事务没回滚", n)
 	}
 	if err := st.pool.QueryRow(ctx,
 		`SELECT count(*) FROM agent_events WHERE tenant_id = $1`, tenantID,
@@ -518,6 +544,10 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 		t.Errorf("清理报告必须包含 Definition Edit operation/receipt，实得 %d/%d",
 			rep.Rows["task_definition_edit_operations"],
 			rep.Rows["task_definition_edit_receipts"])
+	}
+	if rep.Rows["schedule_commands"] != 1 {
+		t.Errorf("清理报告必须包含 Schedule Command，实得 %d",
+			rep.Rows["schedule_commands"])
 	}
 	if rep.Rows["agent_events"] != 3 {
 		t.Errorf("清理报告必须包含 Agent event，实得 %d",

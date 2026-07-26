@@ -823,6 +823,36 @@ func taskDefinitionEditRawTransportExpectations(
 			"DescribeSchedule",
 			1,
 		},
+		{
+			filepath.Clean(filepath.Join(schedulerDir, "task_schedule.go")),
+			"DeleteTask",
+			"DeleteSchedule",
+			1,
+		},
+		{
+			filepath.Clean(filepath.Join(schedulerDir, "scheduler.go")),
+			"applyScheduleCommandRemote",
+			"PatchSchedule",
+			2,
+		},
+		{
+			filepath.Clean(filepath.Join(schedulerDir, "scheduler.go")),
+			"applyScheduleCommandRemote",
+			"DeleteSchedule",
+			1,
+		},
+		{
+			filepath.Clean(filepath.Join(schedulerDir, "scheduler.go")),
+			"applyScheduleCommandRemote",
+			"DescribeSchedule",
+			1,
+		},
+		{
+			filepath.Clean(filepath.Join(schedulerDir, "scheduler.go")),
+			"schedulePausedFact",
+			"DescribeSchedule",
+			1,
+		},
 	}
 }
 
@@ -867,11 +897,16 @@ func taskDefinitionEditRawTransportViolations(
 					return true
 				}
 				method, raw := taskDefinitionEditRawWorkflowServiceCall(call)
-				if !raw || (method != "UpdateSchedule" && method != "DescribeSchedule") {
+				if !raw {
 					return true
 				}
 				selector := taskDefinitionEditUnparen(call.Fun).(*ast.SelectorExpr)
 				key := expectationKey{cleanPath, function.Name.Name, method}
+				if _, watched := want[key]; !watched &&
+					method != "UpdateSchedule" && method != "DescribeSchedule" &&
+					method != "PatchSchedule" && method != "DeleteSchedule" {
+					return true
+				}
 				if _, expected := want[key]; !expected {
 					violations = append(violations, fset.Position(selector.Sel.Pos()).String()+
 						": raw Scheduler transport call is not an exact existing site "+

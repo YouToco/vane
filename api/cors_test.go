@@ -23,6 +23,10 @@ func TestCORS_预检不进会话中间件(t *testing.T) {
 	req := httptest.NewRequest(http.MethodOptions, "/api/subscriptions", nil)
 	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Access-Control-Request-Method", "POST")
+	req.Header.Set(
+		"Access-Control-Request-Headers",
+		"content-type, idempotency-key",
+	)
 	rec := httptest.NewRecorder()
 	corsMux(testOrigin).ServeHTTP(rec, req)
 
@@ -38,6 +42,12 @@ func TestCORS_预检不进会话中间件(t *testing.T) {
 	}
 	if h.Get("Access-Control-Allow-Methods") == "" || h.Get("Access-Control-Allow-Headers") == "" {
 		t.Error("预检应答缺 Allow-Methods / Allow-Headers")
+	}
+	if got := h.Get("Access-Control-Allow-Headers"); got != "Content-Type, Idempotency-Key" {
+		t.Errorf(
+			"Allow-Headers = %q, want exact Content-Type + Idempotency-Key",
+			got,
+		)
 	}
 }
 
