@@ -2,13 +2,21 @@
 
 ## 7.10-A scope
 
-This batch covers feedback facts only. It does not re-enter the model, invoke a
-tool, send or patch a provider message, or reconstruct a historical business
-result. It makes the existing fixed `[卡片回调]` session fact recoverable.
+This batch covers ordinary attitude and reason feedback facts only. It does not
+re-enter the model, invoke a tool, send or patch a provider message, or
+reconstruct a historical business result. It makes their existing fixed
+`[卡片回调]` session fact recoverable.
+
+`question` and `deep_dive` remain outside migration 056. A question is already
+normal Agent input and must not be projected back as a second feedback turn.
+Deep-dive generation has its own result-delivery lifecycle; after that result
+is successfully sent it temporarily retains the legacy best-effort
+`SessionNotifier` callback. Therefore 056 must not be read as durable
+continuation for every feedback action.
 
 ## Producer boundary
 
-`Store.InsertFeedback` owns one repeatable-read transaction:
+`Store.InsertFeedbackWithSessionCutoff` owns one repeatable-read transaction:
 
 1. acquire the shared producer/downgrade transaction-level admission lock,
    before taking any table lock, then resolve the delivery's exact tenant;

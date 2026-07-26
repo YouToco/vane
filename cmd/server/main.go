@@ -480,15 +480,19 @@ func run() error {
 	}
 	manager.SetAgent(agentLoop)
 
-	// 反馈服务（M5 契约 §13）：装在 agent 之后——Notifier 就是 agentLoop
-	// （反馈点击要以「[卡片回调]」通告写进当前会话）；同样须在 manager.Start 之前
-	// 注入，否则 WS 连上后的首批卡片点击会落到 nil runner 上。
+	// 反馈服务（M5 契约 §13）：装在 agent 之后。普通态度/原因由 056 耐久投影；
+	// 仅 deep_dive 成功送达后仍通过 Notifier=agentLoop 做 legacy best-effort 会话回调。
+	// 同样须在 manager.Start 之前注入，否则 WS 连上后的首批 deep_dive 点击会
+	// 落到 nil runner 上。
 	// deep_dive 走质量档 AgentModel（Boss 拍板③）：用户显式请求、低频、长文质量敏感。
 	fbSvc := feedback.New(feedback.Deps{
-		Store:         st,
-		Client:        agentLLMClient,
-		Recorder:      recorder,
-		Sender:        manager,
+		Store:    st,
+		Client:   agentLLMClient,
+		Recorder: recorder,
+		Sender:   manager,
+		// 056 owns attitude/misjudged continuation. Deep-dive is explicitly
+		// outside that outbox and still needs this legacy success callback.
+		Notifier:      agentLoop,
 		BuildCard:     feishu.BuildDeliveryCard,
 		BuildAggCard:  feishu.BuildAggregateCard,
 		DeepDiveModel: cfg.LLM.AgentModel,
@@ -684,8 +688,8 @@ func run() error {
 	})
 
 	// The worker is an ingress too: a registered task queue can immediately
-	// receive scheduled runs. Start it only after both recovery loops and both
-	// terminal outbox consumers have started.
+	// receive scheduled runs. Start it only after every configured recovery
+	// loop and terminal outbox consumer has started.
 	if err := w.Start(); err != nil {
 		stop()
 		recoveryErr := stopCreationRecovery()
@@ -953,10 +957,12 @@ func run() error {
 		shutdownErrs = append(
 			shutdownErrs, fmt.Errorf("排空 push effect recovery: %w", err))
 	}
-	// No producer remains after callback plus both durable-operation recovery
-	// loops drain. Stop both outbox consumers, wait for their fenced
-	// session/PATCH checkpoints, then close admission for legacy best-effort
-	// session writes.
+	// No producer remains after callback and durable-operation recovery drain.
+	// Stop the explicit terminal outbox consumers and wait for their fenced
+	// PATCH checkpoints, then close admission for legacy best-effort session
+	// writes. The continuation projector is owned by the root ctx; stop()
+	// cancels it and the maintenanceWG drain below proves its exit and fenced
+	// session checkpoint before shared resources close.
 	if err := stopReceiptDispatch(); err != nil {
 		shutdownErrs = append(shutdownErrs, fmt.Errorf("排空任务创建耐久回执: %w", err))
 	}
