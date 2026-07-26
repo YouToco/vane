@@ -167,6 +167,28 @@ func (s *Service) generateDeepDive() {
 	s.notifyClick()
 }`,
 		},
+		"package helper function value": {
+			want: "Service.handleAttitude has forbidden package helper function value package.hiddenNotify",
+			source: `package feedback
+type Store struct{}
+type Service struct { deps struct { Store Store } }
+func (Store) InsertFeedbackWithSessionCutoff() {}
+func (Store) InsertDeepDiveFeedback() {}
+func (s *Service) notifyClick() {}
+func hiddenNotify(s *Service) { s.notifyClick() }
+func (s *Service) handleAttitude() {
+	s.deps.Store.InsertFeedbackWithSessionCutoff()
+	callback := hiddenNotify
+	callback(s)
+}
+func (s *Service) HandleReasonSubmit() {
+	s.deps.Store.InsertFeedbackWithSessionCutoff()
+}
+func (s *Service) generateDeepDive() {
+	s.deps.Store.InsertDeepDiveFeedback()
+	s.notifyClick()
+}`,
+		},
 	}
 	for name, mutation := range mutations {
 		t.Run(name, func(t *testing.T) {
@@ -189,6 +211,67 @@ func (s *Service) generateDeepDive() {
 					violations,
 					mutation.want,
 				)
+			}
+		})
+	}
+}
+
+func TestFeedbackSessionProjectionGuardAllowsUnrelatedNamesAndLocalShadows(
+	t *testing.T,
+) {
+	allowed := map[string]string{
+		"local package-helper shadow": `package feedback
+type Store struct{}
+type Service struct { deps struct { Store Store } }
+func (Store) InsertFeedbackWithSessionCutoff() {}
+func (Store) InsertDeepDiveFeedback() {}
+func (s *Service) notifyClick() {}
+func hiddenNotify(s *Service) { s.notifyClick() }
+func (s *Service) handleAttitude() {
+	s.deps.Store.InsertFeedbackWithSessionCutoff()
+	hiddenNotify := func(*Service) {}
+	hiddenNotify(s)
+}
+func (s *Service) HandleReasonSubmit() {
+	s.deps.Store.InsertFeedbackWithSessionCutoff()
+}
+func (s *Service) generateDeepDive() {
+	s.deps.Store.InsertDeepDiveFeedback()
+	s.notifyClick()
+}`,
+		"unrelated same-name receiver": `package feedback
+type Store struct{}
+type Other struct{}
+type Service struct { deps struct { Store Store } }
+func (Store) InsertFeedbackWithSessionCutoff() {}
+func (Store) InsertDeepDiveFeedback() {}
+func (Other) InsertFeedbackWithSessionCutoff() {}
+func (s *Service) notifyClick() {}
+func (s *Service) handleAttitude() {
+	s.deps.Store.InsertFeedbackWithSessionCutoff()
+	var other Other
+	other.InsertFeedbackWithSessionCutoff()
+}
+func (s *Service) HandleReasonSubmit() {
+	s.deps.Store.InsertFeedbackWithSessionCutoff()
+}
+func (s *Service) generateDeepDive() {
+	s.deps.Store.InsertDeepDiveFeedback()
+	s.notifyClick()
+}`,
+	}
+	for name, source := range allowed {
+		t.Run(name, func(t *testing.T) {
+			file, err := parser.ParseFile(
+				token.NewFileSet(), "feedback_allowed.go", source, 0,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if violations := feedbackSessionBoundaryViolations(
+				[]*ast.File{file},
+			); len(violations) != 0 {
+				t.Fatalf("valid feedback boundary rejected: %v", violations)
 			}
 		})
 	}
@@ -244,14 +327,16 @@ type feedbackBoundaryNode struct {
 }
 
 type feedbackSelectorStats struct {
-	total  int
-	exact  int
-	direct int
+	references int
+	direct     int
 }
 
 func feedbackSessionBoundaryViolations(files []*ast.File) []string {
 	serviceMethods := make(map[string]*feedbackBoundaryNode)
 	packageFunctions := make(map[string]*feedbackBoundaryNode)
+	packageFunctionObjects := make(
+		map[*ast.Object]*feedbackBoundaryNode,
+	)
 	var violations []string
 	for _, file := range files {
 		for _, declaration := range file.Decls {
@@ -279,6 +364,9 @@ func feedbackSessionBoundaryViolations(files []*ast.File) []string {
 			if function.Recv == nil {
 				node.key = "package." + function.Name.Name
 				packageFunctions[function.Name.Name] = node
+				if function.Name.Obj != nil {
+					packageFunctionObjects[function.Name.Obj] = node
+				}
 			}
 		}
 	}
@@ -296,10 +384,10 @@ func feedbackSessionBoundaryViolations(files []*ast.File) []string {
 			"InsertFeedbackWithSessionCutoff",
 			"deps", "Store", "InsertFeedbackWithSessionCutoff",
 		)
-		if stats != (feedbackSelectorStats{total: 1, exact: 1, direct: 1}) {
+		if stats != (feedbackSelectorStats{references: 1, direct: 1}) {
 			violations = append(violations, fmt.Sprintf(
-				"%s cutoff total/exact/direct=%d/%d/%d, want 1/1/1",
-				node.key, stats.total, stats.exact, stats.direct,
+				"%s cutoff target references/direct=%d/%d, want 1/1",
+				node.key, stats.references, stats.direct,
 			))
 		}
 	}
@@ -314,12 +402,11 @@ func feedbackSessionBoundaryViolations(files []*ast.File) []string {
 			"deps", "Store", "InsertDeepDiveFeedback",
 		)
 		if insertStats !=
-			(feedbackSelectorStats{total: 1, exact: 1, direct: 1}) {
+			(feedbackSelectorStats{references: 1, direct: 1}) {
 			violations = append(violations, fmt.Sprintf(
-				"%s deep-dive insert total/exact/direct=%d/%d/%d, want 1/1/1",
+				"%s deep-dive insert target references/direct=%d/%d, want 1/1",
 				deepDive.key,
-				insertStats.total,
-				insertStats.exact,
+				insertStats.references,
 				insertStats.direct,
 			))
 		}
@@ -329,12 +416,11 @@ func feedbackSessionBoundaryViolations(files []*ast.File) []string {
 			"notifyClick",
 		)
 		if notifyStats !=
-			(feedbackSelectorStats{total: 1, exact: 1, direct: 1}) {
+			(feedbackSelectorStats{references: 1, direct: 1}) {
 			violations = append(violations, fmt.Sprintf(
-				"%s notify total/exact/direct=%d/%d/%d, want 1/1/1",
+				"%s notify target references/direct=%d/%d, want 1/1",
 				deepDive.key,
-				notifyStats.total,
-				notifyStats.exact,
+				notifyStats.references,
 				notifyStats.direct,
 			))
 		}
@@ -343,11 +429,11 @@ func feedbackSessionBoundaryViolations(files []*ast.File) []string {
 			"InsertFeedbackWithSessionCutoff",
 			"deps", "Store", "InsertFeedbackWithSessionCutoff",
 		)
-		if cutoffStats.total != 0 {
+		if cutoffStats.references != 0 {
 			violations = append(violations, fmt.Sprintf(
-				"%s cutoff references=%d, want 0",
+				"%s cutoff target references=%d, want 0",
 				deepDive.key,
-				cutoffStats.total,
+				cutoffStats.references,
 			))
 		}
 	}
@@ -357,6 +443,7 @@ func feedbackSessionBoundaryViolations(files []*ast.File) []string {
 			ordinary,
 			serviceMethods,
 			packageFunctions,
+			packageFunctionObjects,
 		)...,
 	)
 	return violations
@@ -370,17 +457,15 @@ func feedbackTargetSelectorStats(
 	var stats feedbackSelectorStats
 	ast.Inspect(node.function.Body, func(candidate ast.Node) bool {
 		selector, ok := candidate.(*ast.SelectorExpr)
-		if !ok || selector.Sel.Name != method {
+		if !ok || selector.Sel.Name != method ||
+			!feedbackSelectorTargetsReceiver(
+				selector,
+				node.receiverObject,
+				pathAfterReceiver...,
+			) {
 			return true
 		}
-		stats.total++
-		if feedbackSelectorTargetsReceiver(
-			selector,
-			node.receiverObject,
-			pathAfterReceiver...,
-		) {
-			stats.exact++
-		}
+		stats.references++
 		return true
 	})
 	ast.Inspect(node.function.Body, func(candidate ast.Node) bool {
@@ -406,6 +491,7 @@ func feedbackReachableNotifyViolations(
 	start []*feedbackBoundaryNode,
 	serviceMethods map[string]*feedbackBoundaryNode,
 	packageFunctions map[string]*feedbackBoundaryNode,
+	packageFunctionObjects map[*ast.Object]*feedbackBoundaryNode,
 ) []string {
 	queue := slices.Clone(start)
 	visited := make(map[string]struct{}, len(queue))
@@ -436,22 +522,75 @@ func feedbackReachableNotifyViolations(
 			}
 			return true
 		})
+		directPackageCalls := make(map[token.Pos]struct{})
+		parents := feedbackASTParents(node.function.Body)
 		ast.Inspect(node.function.Body, func(candidate ast.Node) bool {
 			call, ok := candidate.(*ast.CallExpr)
 			if !ok {
 				return true
 			}
 			identifier, ok := feedbackUnparen(call.Fun).(*ast.Ident)
+			if ok {
+				directPackageCalls[identifier.Pos()] = struct{}{}
+			}
+			return true
+		})
+		ast.Inspect(node.function.Body, func(candidate ast.Node) bool {
+			identifier, ok := candidate.(*ast.Ident)
 			if !ok {
 				return true
 			}
-			if next := packageFunctions[identifier.Name]; next != nil {
-				queue = append(queue, next)
+			switch parent := parents[identifier].(type) {
+			case *ast.SelectorExpr:
+				if parent.Sel == identifier {
+					return true
+				}
+			case *ast.KeyValueExpr:
+				if parent.Key == identifier {
+					return true
+				}
 			}
+			next := packageFunctionObjects[identifier.Obj]
+			if next == nil && identifier.Obj == nil {
+				// parser resolves local shadows within their file. A nil
+				// object with an exact package declaration name is the
+				// cross-file package reference that parser.ParseDir leaves
+				// unresolved.
+				next = packageFunctions[identifier.Name]
+			}
+			if next == nil {
+				return true
+			}
+			if _, direct := directPackageCalls[identifier.Pos()]; direct {
+				queue = append(queue, next)
+				return true
+			}
+			violations = append(violations, fmt.Sprintf(
+				"%s has forbidden package helper function value %s",
+				node.key,
+				next.key,
+			))
 			return true
 		})
 	}
 	return violations
+}
+
+func feedbackASTParents(root ast.Node) map[ast.Node]ast.Node {
+	parents := make(map[ast.Node]ast.Node)
+	stack := make([]ast.Node, 0, 16)
+	ast.Inspect(root, func(node ast.Node) bool {
+		if node == nil {
+			stack = stack[:len(stack)-1]
+			return false
+		}
+		if len(stack) > 0 {
+			parents[node] = stack[len(stack)-1]
+		}
+		stack = append(stack, node)
+		return true
+	})
+	return parents
 }
 
 func feedbackServiceReceiver(
