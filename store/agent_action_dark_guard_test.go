@@ -17,6 +17,7 @@ import (
 )
 
 var agentActionEntryPoints = map[string]bool{
+	"GetAgentActionContinuationStatus":        true,
 	"ActivateAgentActionContinuation":         true,
 	"RollbackAgentActionContinuation":         true,
 	"ConfirmAgentActionContinuation":          true,
@@ -34,7 +35,84 @@ var agentActionGenericExecution = map[string]bool{
 	"EnableSource":          true,
 }
 
-func TestAgentActionContinuationRemainsDarkAndExact(t *testing.T) {
+type agentActionReferenceAllowance struct {
+	path        string
+	declaration string
+	references  map[string]int
+}
+
+var agentActionReferenceAllowances = []agentActionReferenceAllowance{
+	{
+		path:        "cmd/runtimeadmin/main.go",
+		declaration: "agentActionCutoverStore",
+		references: map[string]int{
+			"GetAgentActionContinuationStatus": 1,
+			"ActivateAgentActionContinuation":  1,
+			"RollbackAgentActionContinuation":  1,
+		},
+	},
+	{
+		path:        "cmd/runtimeadmin/main.go",
+		declaration: "executeAgentActionCutover",
+		references: map[string]int{
+			"GetAgentActionContinuationStatus": 1,
+			"ActivateAgentActionContinuation":  1,
+			"RollbackAgentActionContinuation":  1,
+		},
+	},
+	{
+		path:        "agentcontinuation/action_controller.go",
+		declaration: "actionStore",
+		references: map[string]int{
+			"ConfirmAgentActionContinuation": 1,
+			"CancelAgentActionContinuation":  1,
+		},
+	},
+	{
+		path:        "agentcontinuation/action_controller.go",
+		declaration: "Confirm",
+		references: map[string]int{
+			"ConfirmAgentActionContinuation": 1,
+		},
+	},
+	{
+		path:        "agentcontinuation/action_controller.go",
+		declaration: "Cancel",
+		references: map[string]int{
+			"CancelAgentActionContinuation": 1,
+		},
+	},
+	{
+		path:        "agentcontinuation/action_dispatcher.go",
+		declaration: "ActionStore",
+		references: map[string]int{
+			"ListDueAgentActionContinuationTenantIDs": 1,
+			"ListDueAgentActionContinuations":         1,
+			"AcquireAgentActionContinuation":          1,
+			"ProjectAgentActionContinuation":          1,
+			"ReleaseAgentActionContinuation":          1,
+		},
+	},
+	{
+		path:        "agentcontinuation/action_dispatcher.go",
+		declaration: "DispatchOnce",
+		references: map[string]int{
+			"ListDueAgentActionContinuationTenantIDs": 2,
+			"ListDueAgentActionContinuations":         1,
+		},
+	},
+	{
+		path:        "agentcontinuation/action_dispatcher.go",
+		declaration: "dispatchAction",
+		references: map[string]int{
+			"AcquireAgentActionContinuation": 1,
+			"ProjectAgentActionContinuation": 1,
+			"ReleaseAgentActionContinuation": 1,
+		},
+	},
+}
+
+func TestAgentActionContinuationHasOnlyExactProductionEntrypoints(t *testing.T) {
 	_, testFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate Agent action guard")
@@ -64,10 +142,18 @@ func TestAgentActionContinuationRemainsDarkAndExact(t *testing.T) {
 		violations,
 		agentActionRoleHelperReferenceViolations(files, storeRoot)...,
 	)
+	violations = append(
+		violations,
+		agentActionApprovedAdapterViolations(files, root)...,
+	)
+	violations = append(
+		violations,
+		agentActionAdapterGenericExecutionViolations(files, root)...,
+	)
 	sort.Strings(violations)
 	if len(violations) != 0 {
 		t.Fatalf(
-			"dark exact Agent action boundary escaped:\n%s",
+			"exact Agent action production boundary escaped:\n%s",
 			strings.Join(violations, "\n"),
 		)
 	}
@@ -153,6 +239,91 @@ func ProjectAgentActionContinuation() {}`,
 			}
 		})
 	}
+}
+
+func TestAgentActionExactAdaptersRejectEscapedAndDuplicatedCalls(
+	t *testing.T,
+) {
+	root := filepath.Clean("repo")
+	storeRoot := filepath.Join(root, "store")
+	for name, mutation := range map[string]struct {
+		path   string
+		source string
+	}{
+		"server direct call": {
+			path: "cmd/server/main.go",
+			source: `package main
+func escape(s interface{ AcquireAgentActionContinuation() }) {
+	s.AcquireAgentActionContinuation()
+}`,
+		},
+		"Agent loop direct call": {
+			path: "agent/loop.go",
+			source: `package agent
+func escape(s interface{ ConfirmAgentActionContinuation() }) {
+	s.ConfirmAgentActionContinuation()
+}`,
+		},
+		"runtimeadmin extra function": {
+			path: "cmd/runtimeadmin/main.go",
+			source: `package main
+func escape(s interface{ ActivateAgentActionContinuation() }) {
+	s.ActivateAgentActionContinuation()
+}`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(root, filepath.FromSlash(mutation.path))
+			file := parseAgentActionMutation(t, mutation.source)
+			got := agentActionForbiddenEntryReferences(
+				path, storeRoot, file)
+			if len(got) == 0 {
+				t.Fatal("escaped exact entrypoint passed guard")
+			}
+		})
+	}
+
+	duplicate := parseAgentActionMutation(t, `package main
+func executeAgentActionCutover(
+	s interface{ ActivateAgentActionContinuation() },
+) {
+	s.ActivateAgentActionContinuation()
+	s.ActivateAgentActionContinuation()
+}`)
+	files := map[string]*ast.File{
+		filepath.Join(root, "cmd", "runtimeadmin", "main.go"): duplicate,
+	}
+	got := agentActionApprovedAdapterViolations(files, root)
+	if !agentActionViolationContains(
+		got, "ActivateAgentActionContinuation count=3 want=1",
+	) {
+		t.Fatalf("duplicate exact call did not fail count guard: %v", got)
+	}
+}
+
+func TestAgentActionExactAdaptersRejectGenericExecution(t *testing.T) {
+	root := filepath.Clean("repo")
+	path := filepath.Join(
+		root, "agentcontinuation", "action_dispatcher.go")
+	file := parseAgentActionMutation(t, `package agentcontinuation
+func escape(tool interface{ Execute() }) { tool.Execute() }`)
+	got := agentActionAdapterGenericExecutionViolations(
+		map[string]*ast.File{path: file}, root)
+	if !agentActionViolationContains(got, "generic Execute") {
+		t.Fatalf("generic adapter execution passed guard: %v", got)
+	}
+}
+
+func agentActionViolationContains(
+	violations []string,
+	want string,
+) bool {
+	for _, violation := range violations {
+		if strings.Contains(violation, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestAgentActionDarkGuardRejectsRoleHelperEscapes(t *testing.T) {
@@ -497,20 +668,69 @@ func agentActionForbiddenEntryReferences(
 				function.Name.Name),
 		)
 	}
-	ast.Inspect(file, func(node ast.Node) bool {
-		identifier, ok := node.(*ast.Ident)
-		if !ok || !agentActionEntryPoints[identifier.Name] ||
-			allowedDefinitions[identifier] {
+	root := filepath.Dir(filepath.Clean(storeRoot))
+	relativePath, err := filepath.Rel(root, path)
+	if err != nil {
+		return append(violations,
+			fmt.Sprintf("%s: resolve Agent action boundary: %v", path, err))
+	}
+	relativePath = filepath.ToSlash(relativePath)
+	for _, declaration := range file.Decls {
+		declarationName := agentActionDeclarationName(declaration)
+		allowed := agentActionAllowedReferences(
+			relativePath, declarationName)
+		ast.Inspect(declaration, func(node ast.Node) bool {
+			identifier, ok := node.(*ast.Ident)
+			if !ok || !agentActionEntryPoints[identifier.Name] ||
+				allowedDefinitions[identifier] {
+				return true
+			}
+			if allowed[identifier.Name] > 0 {
+				return true
+			}
+			violations = append(
+				violations,
+				fmt.Sprintf("%s:%s forbidden reference %s",
+					path, declarationName, identifier.Name),
+			)
 			return true
-		}
-		violations = append(
-			violations,
-			fmt.Sprintf("%s: forbidden reference %s", path,
-				identifier.Name),
-		)
-		return true
-	})
+		})
+	}
 	return violations
+}
+
+func agentActionAllowedReferences(
+	path string,
+	declaration string,
+) map[string]int {
+	for _, allowance := range agentActionReferenceAllowances {
+		if allowance.path == path && allowance.declaration == declaration {
+			return allowance.references
+		}
+	}
+	return nil
+}
+
+func agentActionDeclarationName(declaration ast.Decl) string {
+	switch value := declaration.(type) {
+	case *ast.FuncDecl:
+		return value.Name.Name
+	case *ast.GenDecl:
+		if len(value.Specs) != 1 {
+			return value.Tok.String()
+		}
+		switch spec := value.Specs[0].(type) {
+		case *ast.TypeSpec:
+			return spec.Name.Name
+		case *ast.ValueSpec:
+			if len(spec.Names) == 1 {
+				return spec.Names[0].Name
+			}
+		}
+		return value.Tok.String()
+	default:
+		return "unknown"
+	}
 }
 
 func agentActionReachableRecoveryViolations(
@@ -582,6 +802,107 @@ func agentActionReachableRecoveryViolations(
 	return violations
 }
 
+func agentActionApprovedAdapterViolations(
+	files map[string]*ast.File,
+	root string,
+) []string {
+	var violations []string
+	for _, allowance := range agentActionReferenceAllowances {
+		path := filepath.Join(
+			filepath.Clean(root), filepath.FromSlash(allowance.path))
+		file, ok := files[path]
+		if !ok {
+			violations = append(violations,
+				fmt.Sprintf("%s: approved adapter file is missing",
+					allowance.path))
+			continue
+		}
+		declaration := agentActionFindDeclaration(
+			file, allowance.declaration)
+		if declaration == nil {
+			violations = append(violations,
+				fmt.Sprintf("%s:%s approved declaration is missing",
+					allowance.path, allowance.declaration))
+			continue
+		}
+		counts := make(map[string]int)
+		ast.Inspect(declaration, func(node ast.Node) bool {
+			identifier, ok := node.(*ast.Ident)
+			if ok && agentActionEntryPoints[identifier.Name] {
+				counts[identifier.Name]++
+			}
+			return true
+		})
+		for name, want := range allowance.references {
+			if counts[name] != want {
+				violations = append(violations,
+					fmt.Sprintf("%s:%s %s count=%d want=%d",
+						allowance.path, allowance.declaration,
+						name, counts[name], want))
+			}
+			delete(counts, name)
+		}
+		for name, count := range counts {
+			violations = append(violations,
+				fmt.Sprintf("%s:%s unapproved %s count=%d",
+					allowance.path, allowance.declaration, name, count))
+		}
+	}
+	return violations
+}
+
+func agentActionFindDeclaration(
+	file *ast.File,
+	name string,
+) ast.Decl {
+	for _, declaration := range file.Decls {
+		if agentActionDeclarationName(declaration) == name {
+			return declaration
+		}
+	}
+	return nil
+}
+
+func agentActionAdapterGenericExecutionViolations(
+	files map[string]*ast.File,
+	root string,
+) []string {
+	adapterFiles := map[string]bool{
+		"cmd/runtimeadmin/main.go":               true,
+		"agentcontinuation/action_controller.go": true,
+		"agentcontinuation/action_dispatcher.go": true,
+	}
+	var violations []string
+	for relativePath := range adapterFiles {
+		path := filepath.Join(
+			filepath.Clean(root), filepath.FromSlash(relativePath))
+		file, ok := files[path]
+		if !ok {
+			continue
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			switch value := node.(type) {
+			case *ast.Ident:
+				if agentActionGenericExecution[value.Name] {
+					violations = append(violations,
+						fmt.Sprintf("%s reaches generic %s",
+							relativePath, value.Name))
+				}
+			case *ast.BasicLit:
+				for name := range agentActionGenericExecution {
+					if strings.Contains(value.Value, name) {
+						violations = append(violations,
+							fmt.Sprintf("%s has dynamic generic %s",
+								relativePath, name))
+					}
+				}
+			}
+			return true
+		})
+	}
+	return violations
+}
+
 func agentActionRoleEntryViolations(
 	files map[string]*ast.File,
 	storeRoot string,
@@ -635,8 +956,9 @@ func agentActionRoleHelperReferenceViolations(
 	)
 	allowedCallers := map[string]map[string]bool{
 		"setAgentActionOperatorContext": {
-			"ActivateAgentActionContinuation": true,
-			"RollbackAgentActionContinuation": true,
+			"GetAgentActionContinuationStatus": true,
+			"ActivateAgentActionContinuation":  true,
+			"RollbackAgentActionContinuation":  true,
 		},
 		"setAgentActionContinuatorContext": {
 			"decideAgentActionContinuation":  true,
