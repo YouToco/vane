@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { api, ApiError } from "../api";
-import type { AddSubscriptionReq, Source } from "../api";
+import type { Source } from "../api";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -17,76 +17,108 @@ import {
   SelectItem,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Plus, Trash2, Loader2, Rss, Search, BookOpen, RotateCcw } from "lucide-react";
-
-type SrcType = "rss" | "exa" | "tikhub_xhs";
+import {
+  Plus,
+  Trash2,
+  Loader2,
+  Rss,
+  Search,
+  BookOpen,
+  RotateCcw,
+  ScanSearch,
+  Boxes,
+} from "lucide-react";
+import { fmt, useI18n, type Dict } from "@/i18n";
+import { fmtBeijing } from "@/lib/time";
+import {
+  buildSubscriptionRequest,
+  normalizeCategory,
+  safeHttpHref,
+  sourceView,
+  type SourceFormKind,
+} from "@/lib/source-view";
 
 const MAX_PARAM_RUNES = 256;
+const NONE_CATEGORY = "__none__";
 
 function runeCount(s: string): number {
   return [...s].length;
 }
 
-function statusDot(status: string, failCount: number): { color: string; label: string } {
+function statusDot(
+  status: string,
+  failCount: number,
+  t: Dict["app"]["sources"],
+): { color: string; label: string } {
   if (status === "active") {
     return failCount > 0
-      ? { color: "bg-amber-500", label: `抓取异常（连续失败 ${failCount} 次）` }
-      : { color: "bg-emerald-500", label: "正常抓取中" };
+      ? {
+          color: "bg-amber-500",
+          label: fmt(t.statusFetchFailed, { n: failCount }),
+        }
+      : { color: "bg-emerald-500", label: t.statusActive };
   }
-  if (status === "disabled") return { color: "bg-red-500", label: "已禁用（多次抓取失败）" };
-  if (status === "paused") return { color: "bg-muted-foreground/40", label: "已暂停" };
+  if (status === "disabled") {
+    return { color: "bg-red-500", label: t.statusDisabled };
+  }
+  if (status === "paused") {
+    return { color: "bg-muted-foreground/40", label: t.statusPaused };
+  }
   return { color: "bg-muted-foreground/40", label: status };
-}
-
-function looksLikeUrl(s: string): boolean {
-  const t = s.trim();
-  return /^https?:\/\/.+\..+/i.test(t);
 }
 
 function isSubmitEnter(e: KeyboardEvent<HTMLInputElement>): boolean {
   return e.key === "Enter" && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229;
 }
 
-function syntheticParam(url: string, param: string): string | null {
-  const qs = url.split("?")[1] ?? "";
-  return new URLSearchParams(qs).get(param);
+const CATEGORY_KEYS = [
+  ["", "categoryAny"],
+  ["company", "categoryCompany"],
+  ["research paper", "categoryResearch"],
+  ["news", "categoryNews"],
+  ["github", "categoryGithub"],
+  ["personal site", "categoryPersonal"],
+  ["people", "categoryPeople"],
+  ["financial report", "categoryFinancial"],
+] as const;
+
+function categoryLabel(value: string, t: Dict["app"]["sources"]): string {
+  const hit = CATEGORY_KEYS.find(([candidate]) => candidate === value);
+  return hit ? t[hit[1]] : value;
 }
 
-function typeMeta(s: Source): { badge: string; term: string; icon: typeof Rss } | null {
-  if (s.type === "exa") {
-    const cat = syntheticParam(s.url, "category");
-    return {
-      badge: cat ? `Exa 搜索 · ${categoryLabel(cat)}` : "Exa 搜索",
-      term: syntheticParam(s.url, "q") ?? s.url,
-      icon: Search,
-    };
+function sourceMeta(source: Source, t: Dict["app"]["sources"]) {
+  const view = sourceView(source);
+  switch (view.kind) {
+    case "rss":
+      return { badge: t.typeRss, term: view.term, icon: Rss };
+    case "webSearch":
+      return {
+        badge: view.category
+          ? fmt(t.typeExaCategory, { category: categoryLabel(view.category, t) })
+          : t.typeExa,
+        term: view.term,
+        icon: Search,
+      };
+    case "xhsSearch":
+      return { badge: t.typeXhs, term: view.term, icon: BookOpen };
+    case "webContents":
+      return { badge: t.typeWebContents, term: view.term, icon: ScanSearch };
+    case "platformCapability":
+      return {
+        badge: fmt(t.typePlatformCapability, { type: view.platformCapability }),
+        term: view.term,
+        icon: Boxes,
+      };
   }
-  if (s.type === "tikhub_xhs") {
-    return { badge: "小红书", term: syntheticParam(s.url, "keyword") ?? s.url, icon: BookOpen };
-  }
-  return null;
-}
-
-const EXA_CATEGORIES: [string, string][] = [
-  ["", "类别不限"],
-  ["company", "公司"],
-  ["research paper", "研究论文"],
-  ["news", "新闻"],
-  ["github", "GitHub"],
-  ["personal site", "个人网站"],
-  ["people", "人物"],
-  ["financial report", "财报"],
-];
-
-function categoryLabel(v: string): string {
-  const hit = EXA_CATEGORIES.find(([value]) => value === v);
-  return hit ? hit[1] : v;
 }
 
 export default function Sources() {
+  const { t } = useI18n();
+  const T = t.app.sources;
   const [sources, setSources] = useState<Source[] | null>(null);
   const [loadError, setLoadError] = useState("");
-  const [srcType, setSrcType] = useState<SrcType>("rss");
+  const [srcType, setSrcType] = useState<SourceFormKind>("rss");
   const [url, setUrl] = useState("");
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("");
@@ -101,54 +133,57 @@ export default function Sources() {
       setSources(list ?? []);
       setLoadError("");
     } catch (err) {
-      setLoadError(err instanceof ApiError ? err.message : "加载失败");
+      setLoadError(err instanceof ApiError ? err.message : T.loadFailed);
       setSources([]);
     }
   }
 
   useEffect(() => {
-    load();
+    void load();
+    // The API endpoint is stable; locale changes should update labels without
+    // refetching account data.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function validate(): { ok: boolean; warn: string } {
-    if (srcType === "rss") {
+    if (srcType === "rss" || srcType === "web_contents") {
       if (url.trim() === "") return { ok: false, warn: "" };
-      return looksLikeUrl(url)
+      return safeHttpHref(url)
         ? { ok: true, warn: "" }
-        : { ok: false, warn: "请输入以 http(s):// 开头的完整链接" };
+        : { ok: false, warn: T.invalidUrl };
     }
     const term = (srcType === "exa" ? query : keyword).trim();
     if (term === "") return { ok: false, warn: "" };
     if (runeCount(term) > MAX_PARAM_RUNES) {
-      return { ok: false, warn: `搜索词过长（上限 ${MAX_PARAM_RUNES} 字符）` };
+      return {
+        ok: false,
+        warn: fmt(T.termTooLong, { n: MAX_PARAM_RUNES }),
+      };
     }
     return { ok: true, warn: "" };
   }
+
   const valid = validate();
   const canAdd = valid.ok && !adding;
 
   async function onAdd() {
     if (!canAdd) return;
-    let req: AddSubscriptionReq;
-    if (srcType === "rss") {
-      req = { url: url.trim() };
-    } else if (srcType === "exa") {
-      req = category
-        ? { type: "exa", query: query.trim(), category }
-        : { type: "exa", query: query.trim() };
-    } else {
-      req = { type: "tikhub_xhs", keyword: keyword.trim() };
-    }
+    const req = buildSubscriptionRequest(srcType, {
+      url,
+      query,
+      category,
+      keyword,
+    });
     setAdding(true);
     try {
       await api.addSubscription(req);
-      if (srcType === "rss") setUrl("");
+      if (srcType === "rss" || srcType === "web_contents") setUrl("");
       else if (srcType === "exa") setQuery("");
       else setKeyword("");
       await load();
-      toast.success("信源已添加");
+      toast.success(T.added);
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "添加失败");
+      toast.error(err instanceof ApiError ? err.message : T.addFailed);
     } finally {
       setAdding(false);
     }
@@ -159,9 +194,9 @@ export default function Sources() {
     try {
       await api.removeSubscription(id);
       await load();
-      toast.success("已移除");
+      toast.success(T.removed);
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "移除失败");
+      toast.error(err instanceof ApiError ? err.message : T.removeFailed);
     } finally {
       setRemovingId(null);
     }
@@ -172,51 +207,59 @@ export default function Sources() {
     try {
       await api.enableSource(id);
       await load();
-      toast.success("已重新启用");
+      toast.success(T.enabled);
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "启用失败");
+      toast.error(err instanceof ApiError ? err.message : T.enableFailed);
     } finally {
       setEnablingId(null);
     }
   }
 
+  const urlPlaceholder =
+    srcType === "web_contents" ? T.webContentsPlaceholder : T.rssPlaceholder;
+
   return (
     <div className="space-y-6">
-      <p className="text-sm text-muted-foreground">
-        添加 RSS 链接、Exa 搜索词或小红书关键词，见微 Vane 会定期抓取并纳入推送候选。
-      </p>
+      <div>
+        <h1 className="text-xl font-semibold">{T.title}</h1>
+        <p className="mt-1 text-sm text-muted-foreground">{T.desc}</p>
+      </div>
 
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">添加信源</CardTitle>
+          <CardTitle className="text-base">{T.addTitle}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <Tabs value={srcType} onValueChange={(v) => setSrcType(v as SrcType)}>
-            <TabsList>
+          <Tabs value={srcType} onValueChange={(v) => setSrcType(v as SourceFormKind)}>
+            <TabsList className="h-auto flex-wrap">
               <TabsTrigger value="rss">
                 <Rss className="size-4 mr-1.5" />
-                RSS
+                {T.tabRss}
               </TabsTrigger>
               <TabsTrigger value="exa">
                 <Search className="size-4 mr-1.5" />
-                Exa 搜索
+                {T.tabExa}
               </TabsTrigger>
               <TabsTrigger value="tikhub_xhs">
                 <BookOpen className="size-4 mr-1.5" />
-                小红书关键词
+                {T.tabXhs}
+              </TabsTrigger>
+              <TabsTrigger value="web_contents">
+                <ScanSearch className="size-4 mr-1.5" />
+                {T.tabWebContents}
               </TabsTrigger>
             </TabsList>
           </Tabs>
 
-          <div className="flex gap-2">
-            {srcType === "rss" && (
+          <div className="flex flex-col gap-2 sm:flex-row">
+            {(srcType === "rss" || srcType === "web_contents") && (
               <Input
                 className="flex-1"
-                placeholder="https://example.com/feed.xml"
+                placeholder={urlPlaceholder}
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
                 onKeyDown={(e) => {
-                  if (isSubmitEnter(e)) onAdd();
+                  if (isSubmitEnter(e)) void onAdd();
                 }}
                 autoComplete="off"
               />
@@ -225,22 +268,25 @@ export default function Sources() {
               <>
                 <Input
                   className="flex-1"
-                  placeholder="输入搜索词，如：AI Agent 落地案例"
+                  placeholder={T.exaPlaceholder}
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   onKeyDown={(e) => {
-                    if (isSubmitEnter(e)) onAdd();
+                    if (isSubmitEnter(e)) void onAdd();
                   }}
                   autoComplete="off"
                 />
-                <Select value={category} onValueChange={(v) => setCategory(v ?? "")}>
-                  <SelectTrigger className="w-36">
-                    <SelectValue placeholder="类别不限" />
+                <Select
+                  value={category || NONE_CATEGORY}
+                  onValueChange={(v) => setCategory(normalizeCategory(v))}
+                >
+                  <SelectTrigger className="w-full sm:w-40">
+                    <SelectValue placeholder={T.categoryAny} />
                   </SelectTrigger>
                   <SelectContent>
-                    {EXA_CATEGORIES.map(([v, label]) => (
-                      <SelectItem key={v} value={v || "__none__"}>
-                        {label}
+                    {CATEGORY_KEYS.map(([value, key]) => (
+                      <SelectItem key={value || NONE_CATEGORY} value={value || NONE_CATEGORY}>
+                        {T[key]}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -250,26 +296,29 @@ export default function Sources() {
             {srcType === "tikhub_xhs" && (
               <Input
                 className="flex-1"
-                placeholder="输入小红书搜索关键词，如：手冲咖啡"
+                placeholder={T.xhsPlaceholder}
                 value={keyword}
                 onChange={(e) => setKeyword(e.target.value)}
                 onKeyDown={(e) => {
-                  if (isSubmitEnter(e)) onAdd();
+                  if (isSubmitEnter(e)) void onAdd();
                 }}
                 autoComplete="off"
               />
             )}
-            <Button onClick={onAdd} disabled={!canAdd}>
+            <Button onClick={() => void onAdd()} disabled={!canAdd}>
               {adding ? (
                 <Loader2 className="size-4 animate-spin" />
               ) : (
                 <>
                   <Plus className="size-4 mr-1" />
-                  添加
+                  {T.add}
                 </>
               )}
             </Button>
           </div>
+          {srcType === "web_contents" && (
+            <p className="text-xs text-muted-foreground">{T.webContentsNote}</p>
+          )}
           {valid.warn && (
             <p className="text-sm text-amber-600 dark:text-amber-400">{valid.warn}</p>
           )}
@@ -299,67 +348,68 @@ export default function Sources() {
       {sources !== null && sources.length === 0 && !loadError && (
         <Card>
           <CardContent className="py-12 text-center text-muted-foreground">
-            还没有信源，添加第一个订阅源开始吧。
+            {T.empty}
           </CardContent>
         </Card>
       )}
       <div className="space-y-2">
-        {sources?.map((s) => {
-          const dot = statusDot(s.status, s.fail_count);
-          const meta = typeMeta(s);
+        {sources?.map((source) => {
+          const dot = statusDot(source.status, source.fail_count, T);
+          const meta = sourceMeta(source, T);
+          const href = safeHttpHref(meta.term);
           return (
-            <Card key={s.id} className="transition-colors hover:bg-muted/30">
+            <Card key={source.id} className="transition-colors hover:bg-muted/30">
               <CardContent className="py-3 flex items-center gap-3">
                 <span
                   className={`flex size-2.5 shrink-0 rounded-full ${dot.color}`}
                   title={dot.label}
+                  aria-label={dot.label}
                 />
+                <meta.icon className="size-4 shrink-0 text-muted-foreground" />
                 <div className="flex-1 min-w-0">
                   <div className="text-sm font-medium truncate">
-                    {s.title || s.url}
+                    {source.title || meta.term}
                   </div>
                   <div className="flex flex-wrap items-center gap-2 mt-0.5">
-                    {meta ? (
-                      <>
-                        <Badge variant="outline" className="text-xs">
-                          {meta.badge}
-                        </Badge>
-                        <span className="text-xs text-muted-foreground truncate">
-                          {meta.term}
-                        </span>
-                      </>
-                    ) : (
+                    <Badge variant="outline" className="text-xs">
+                      {meta.badge}
+                    </Badge>
+                    {href ? (
                       <a
                         className="text-xs text-muted-foreground hover:text-primary truncate"
-                        href={s.url}
+                        href={href}
                         target="_blank"
                         rel="noreferrer"
                       >
-                        {s.url}
+                        {meta.term}
                       </a>
+                    ) : (
+                      <span className="text-xs text-muted-foreground truncate">
+                        {meta.term}
+                      </span>
                     )}
-                    {s.last_fetched_at && (
+                    {source.last_fetched_at && (
                       <span className="text-xs text-muted-foreground">
-                        上次抓取 {new Date(s.last_fetched_at).toLocaleString("zh-CN")}
+                        {T.lastFetched} {fmtBeijing(source.last_fetched_at)}
                       </span>
                     )}
                   </div>
                 </div>
-                {s.status === "disabled" && (
+                {source.status === "disabled" && (
                   <Button
                     variant="outline"
                     size="sm"
                     className="shrink-0"
-                    onClick={() => onEnable(s.id)}
-                    disabled={enablingId === s.id}
-                    title="连续抓取失败被自动停用，修复来源后点此恢复抓取"
+                    onClick={() => void onEnable(source.id)}
+                    disabled={enablingId === source.id}
+                    title={T.enableTitle}
                   >
-                    {enablingId === s.id ? (
+                    {enablingId === source.id ? (
                       <Loader2 className="size-4 animate-spin" />
                     ) : (
                       <>
                         <RotateCcw className="size-3.5 mr-1" />
-                        重新启用
+                        {T.enable}
                       </>
                     )}
                   </Button>
@@ -368,10 +418,12 @@ export default function Sources() {
                   variant="ghost"
                   size="icon"
                   className="shrink-0 text-muted-foreground hover:text-destructive"
-                  onClick={() => onRemove(s.id)}
-                  disabled={removingId === s.id}
+                  onClick={() => void onRemove(source.id)}
+                  disabled={removingId === source.id}
+                  title={T.remove}
+                  aria-label={T.remove}
                 >
-                  {removingId === s.id ? (
+                  {removingId === source.id ? (
                     <Loader2 className="size-4 animate-spin" />
                   ) : (
                     <Trash2 className="size-4" />

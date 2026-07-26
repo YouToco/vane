@@ -1,3 +1,5 @@
+import type { AddSubscriptionRequest } from "@/lib/source-view";
+
 // 统一 fetch 封装。
 // 为什么集中封装：所有请求都要带 cookie（credentials:'include'），且 401 需要统一踢回登录页，
 // 分散在各页面写会漏；错误统一转成后端约定的 {"error":"人话"} 文案，页面只管展示。
@@ -97,20 +99,19 @@ export interface Schedule {
 }
 
 // 加订阅请求体，与后端 addSubscriptionReq 对齐（api/subscriptions.go）。
-// rss 只传 {url}（type 缺省即 rss，向后兼容）；exa/tikhub_xhs 传结构化搜索参数，
-// 幂等合成键（exa://... / tikhub://...）由后端生成，前端不拼。
-export type AddSubscriptionReq =
-  | { url: string }
-  | { type: "exa"; query: string; category?: string }
-  | { type: "tikhub_xhs"; keyword: string };
+// 旧三种输入仍走兼容格式；web/contents 走当前 platform+capability+params 契约。
+export type AddSubscriptionReq = AddSubscriptionRequest;
 
 // Source 直接复用后端 types.Source 的 JSON（entities.go）。
 // 信源管理页只用到其中几列，其余字段忽略即可。
 export interface Source {
   id: number;
   type: string;
+  platform: string;
+  capability: string;
   url: string;
   title: string;
+  config: Record<string, unknown> | string | null;
   status: string; // active/disabled/paused
   fail_count: number;
   last_fetched_at?: string;

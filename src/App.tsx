@@ -7,6 +7,7 @@ import Home from "./pages/Home";
 import TaskDashboard from "./pages/TaskDashboard";
 import TaskDetail from "./pages/TaskDetail";
 import History from "./pages/History";
+import Sources from "./pages/Sources";
 import Settings from "./pages/Settings";
 import Admin from "./pages/Admin";
 import {
@@ -29,6 +30,7 @@ import {
   Home as HomeIcon,
   ListTodo,
   Send,
+  Rss,
   User,
   MessageSquare,
   ShieldCheck,
@@ -77,6 +79,7 @@ function useNav() {
         { hash: "#/", label: N.home, icon: HomeIcon },
         { hash: "#/tasks", label: N.tasks, icon: ListTodo },
         { hash: "#/history", label: N.history, icon: Send },
+        { hash: "#/sources", label: N.sources, icon: Rss },
       ],
     },
     {
@@ -110,6 +113,8 @@ function renderPage(hash: string, isPlatformOwner: boolean) {
       return <TaskDashboard />;
     case "#/history":
       return <History />;
+    case "#/sources":
+      return <Sources />;
     case "#/settings":
     case "#/settings/channel":
       return <Settings hash={hash} />;
