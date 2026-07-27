@@ -274,6 +274,11 @@ func run() error {
 			cfg.Pipeline.RunOutcomeEnabled,
 			cfg.Pipeline.RunOutcomeCanaryScheduleID,
 			cfg.Pipeline.RunOutcomeAllowAll,
+		),
+		scheduler.WithCanonicalBriefRollout(
+			cfg.Pipeline.CanonicalBriefEnabled,
+			cfg.Pipeline.CanonicalBriefCanaryScheduleID,
+			cfg.Pipeline.CanonicalBriefAllowAll,
 		))
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
 	// C2b3-2c keeps definition editing dark at every ingress, but already owns

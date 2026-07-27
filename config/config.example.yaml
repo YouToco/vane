@@ -55,6 +55,10 @@ pipeline:
   run_outcome_enabled: false
   run_outcome_canary_schedule_id: ""
   run_outcome_allow_all: false
+  # P1-C canonical Brief writer is nested inside RunOutcome and defaults off.
+  canonical_brief_enabled: false
+  canonical_brief_canary_schedule_id: ""
+  canonical_brief_allow_all: false
   # C2c-2: exact one-task shadow canary. Empty means fully off.
   snapshot_v2_shadow_canary_schedule_id: ""
   snapshot_v2_read_audit_canary_schedule_id: ""

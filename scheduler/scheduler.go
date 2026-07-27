@@ -179,6 +179,7 @@ type Scheduler struct {
 	taskScheduleEnv   taskScheduleEnvironment
 	compiledRuntime   compiledRuntimeRollout
 	runOutcome        runOutcomeRollout
+	canonicalBrief    canonicalBriefRollout
 	commandAttempt    time.Duration
 }
 

@@ -133,6 +133,11 @@ type PipelineConfig struct {
 	RunOutcomeEnabled          bool   `mapstructure:"run_outcome_enabled"`
 	RunOutcomeCanaryScheduleID string `mapstructure:"run_outcome_canary_schedule_id"`
 	RunOutcomeAllowAll         bool   `mapstructure:"run_outcome_allow_all"`
+	// CanonicalBrief* is P1-C's independent rollout. It may select only
+	// Actions already selected for RunOutcome.
+	CanonicalBriefEnabled          bool   `mapstructure:"canonical_brief_enabled"`
+	CanonicalBriefCanaryScheduleID string `mapstructure:"canonical_brief_canary_schedule_id"`
+	CanonicalBriefAllowAll         bool   `mapstructure:"canonical_brief_allow_all"`
 	// SnapshotV2ShadowCanaryScheduleID enables C2c-2 shadow persistence for
 	// exactly one task. Empty is the complete rollback/off state.
 	SnapshotV2ShadowCanaryScheduleID string `mapstructure:"snapshot_v2_shadow_canary_schedule_id"`
@@ -317,6 +322,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.run_outcome_enabled", false)
 	v.SetDefault("pipeline.run_outcome_canary_schedule_id", "")
 	v.SetDefault("pipeline.run_outcome_allow_all", false)
+	v.SetDefault("pipeline.canonical_brief_enabled", false)
+	v.SetDefault("pipeline.canonical_brief_canary_schedule_id", "")
+	v.SetDefault("pipeline.canonical_brief_allow_all", false)
 	v.SetDefault("pipeline.snapshot_v2_shadow_canary_schedule_id", "")
 	v.SetDefault("pipeline.snapshot_v2_read_audit_canary_schedule_id", "")
 	// Observation rollout remains exact-task only. Register both defaults so
@@ -424,6 +432,34 @@ func (c *Config) Validate() error {
 			compiledCanaryID != runOutcomeCanaryID {
 			return errors.New(
 				"config: run outcome canary 必须位于 compiled runtime rollout")
+		}
+	}
+	rawCanonicalBriefCanaryID := c.Pipeline.CanonicalBriefCanaryScheduleID
+	canonicalBriefCanaryID := strings.TrimSpace(rawCanonicalBriefCanaryID)
+	if c.Pipeline.CanonicalBriefEnabled &&
+		rawCanonicalBriefCanaryID != "" && canonicalBriefCanaryID == "" {
+		return errors.New(
+			"config: pipeline.canonical_brief_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.CanonicalBriefCanaryScheduleID = canonicalBriefCanaryID
+	if c.Pipeline.CanonicalBriefEnabled {
+		if !c.Pipeline.RunOutcomeEnabled {
+			return errors.New(
+				"config: canonical brief writer 要求 run outcome lifecycle 已启用")
+		}
+		if canonicalBriefCanaryID == "" && !c.Pipeline.CanonicalBriefAllowAll {
+			return errors.New(
+				"config: 全量启用 canonical brief 必须显式设置 pipeline.canonical_brief_allow_all=true")
+		}
+		if canonicalBriefCanaryID != "" && c.Pipeline.CanonicalBriefAllowAll {
+			return errors.New(
+				"config: canonical brief 单任务 canary 与 allow_all 不能同时启用")
+		}
+		if canonicalBriefCanaryID != "" &&
+			!c.Pipeline.RunOutcomeAllowAll &&
+			runOutcomeCanaryID != canonicalBriefCanaryID {
+			return errors.New(
+				"config: canonical brief canary 必须位于 run outcome rollout")
 		}
 	}
 	rawShadowCanaryID := c.Pipeline.SnapshotV2ShadowCanaryScheduleID

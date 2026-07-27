@@ -75,13 +75,24 @@ const CompiledRuntimeSnapshotV1 = "compiled-snapshot/v1"
 // keeps every pre-P1-B Action/history on CompiledRuntimeSnapshotV1.
 const CompiledRuntimeRunOutcomeV1 = "compiled-snapshot/v1+run-outcome/v1"
 
+// CompiledRuntimeCanonicalBriefV1 adds P1-C's durable pre-render Brief draft
+// and atomic outcome+Brief seal. Keeping a distinct durable label prevents
+// already-started P1-B histories from acquiring a new Activity command.
+const CompiledRuntimeCanonicalBriefV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1"
+
 func IsCompiledRuntimeV1(version string) bool {
 	return version == CompiledRuntimeSnapshotV1 ||
-		version == CompiledRuntimeRunOutcomeV1
+		version == CompiledRuntimeRunOutcomeV1 ||
+		version == CompiledRuntimeCanonicalBriefV1
 }
 
 func HasRunOutcomeV1(version string) bool {
-	return version == CompiledRuntimeRunOutcomeV1
+	return version == CompiledRuntimeRunOutcomeV1 ||
+		version == CompiledRuntimeCanonicalBriefV1
+}
+
+func HasCanonicalBriefV1(version string) bool {
+	return version == CompiledRuntimeCanonicalBriefV1
 }
 
 // CompiledRunInputV1 carries the trusted stable scope copied from the Schedule
