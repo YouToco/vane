@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "entry": "index.html",
+  "authenticatedEntry": "src/AuthenticatedApp.tsx",
+  "defaultAuthenticatedRoute": "src/pages/Home.tsx",
+  "baselineCommit": "f65b91ae43000cb17a9a2a7a2ff8ea4055eadce6",
+  "baselineDefaultRouteJavaScriptGzipBytes": 277379,
+  "minimumReductionPercent": 25,
+  "requiredLazyRoutes": [
+    "src/pages/Landing.tsx",
+    "src/pages/Login.tsx",
+    "src/pages/Home.tsx",
+    "src/pages/TaskDashboard.tsx",
+    "src/pages/TaskDetail.tsx",
+    "src/pages/History.tsx",
+    "src/pages/Sources.tsx",
+    "src/pages/Settings.tsx",
+    "src/pages/Admin.tsx"
+  ],
+  "forbiddenAuthenticatedInitialModules": [
+    "src/pages/Landing.tsx",
+    "src/pages/Login.tsx",
+    "src/components/landing/",
+    "node_modules/motion/",
+    "node_modules/three/",
+    "node_modules/@react-three/fiber/"
+  ]
+}

@@ -1,9 +1,15 @@
+// @vitest-environment jsdom
+
 import React from "react";
 import {
   act,
-  create,
-  type ReactTestRenderer,
-} from "react-test-renderer";
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  type RenderResult,
+} from "@testing-library/react";
+import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const apiMock = vi.hoisted(() => ({
@@ -36,10 +42,7 @@ vi.mock("@/components/ui/dialog", () => ({
   }) =>
     open ? (
       <mock-dialog>
-        <button
-          aria-label="dismiss"
-          onClick={() => onOpenChange(false)}
-        />
+        <button aria-label="dismiss" onClick={() => onOpenChange(false)} />
         {children}
       </mock-dialog>
     ) : null,
@@ -127,34 +130,6 @@ const labels: TaskActionDialogLabels = {
   },
 };
 
-class MemoryStorage {
-  private values = new Map<string, string>();
-
-  getItem(key: string) {
-    return this.values.get(key) ?? null;
-  }
-
-  setItem(key: string, value: string) {
-    this.values.set(key, value);
-  }
-
-  removeItem(key: string) {
-    this.values.delete(key);
-  }
-
-  clear() {
-    this.values.clear();
-  }
-
-  key(index: number) {
-    return Array.from(this.values.keys())[index] ?? null;
-  }
-
-  get length() {
-    return this.values.size;
-  }
-}
-
 function storedPending(id: string) {
   return JSON.stringify({
     version: 1,
@@ -166,8 +141,8 @@ function storedPending(id: string) {
   });
 }
 
-function textOf(renderer: ReactTestRenderer): string {
-  return JSON.stringify(renderer.toJSON());
+function pageText(): string {
+  return document.body.textContent ?? "";
 }
 
 async function flushEffects() {
@@ -177,7 +152,11 @@ async function flushEffects() {
   });
 }
 
-function renderDialog(
+function setupUser(): UserEvent {
+  return userEvent.setup();
+}
+
+function dialogElement(
   props: {
     open?: boolean;
     actorScope?: string;
@@ -186,7 +165,7 @@ function renderDialog(
     onComplete?: (status: TaskActionStatus) => void;
   } = {},
 ) {
-  return create(
+  return (
     <TaskActionDialog
       open={props.open ?? true}
       actorScope={props.actorScope ?? DEFAULT_ACTOR}
@@ -194,53 +173,38 @@ function renderDialog(
       labels={labels}
       onClose={props.onClose ?? vi.fn()}
       onComplete={props.onComplete ?? vi.fn()}
-    />,
+    />
   );
 }
 
-async function draftAction(
-  renderer: ReactTestRenderer,
-  text: string,
-): Promise<void> {
-  const input = renderer.root.findByType("input");
-  await act(async () => {
-    input.props.onChange({ target: { value: text } });
-  });
-  const draft = renderer.root
-    .findAllByType("button")
-    .find((node) => node.children.includes("Draft"));
-  await act(async () => {
-    draft?.props.onClick();
-    await Promise.resolve();
-    await Promise.resolve();
-  });
-  await vi.waitFor(() => {
+function renderDialog(
+  props: Parameters<typeof dialogElement>[0] = {},
+): RenderResult {
+  return render(dialogElement(props));
+}
+
+async function draftAction(user: UserEvent, text: string): Promise<void> {
+  await user.type(screen.getByRole("textbox", { name: "Task request" }), text);
+  await user.click(screen.getByRole("button", { name: "Draft" }));
+  await waitFor(() => {
     expect(apiMock.proposeTaskAction).toHaveBeenCalledTimes(1);
   });
   await flushEffects();
 }
 
 describe("TaskActionDialog durable lifecycle", () => {
-  let sessionStorage: MemoryStorage;
+  let sessionStorage: Storage;
 
   beforeEach(() => {
-    vi.useFakeTimers();
     vi.clearAllMocks();
-    sessionStorage = new MemoryStorage();
-    Object.defineProperty(globalThis, "window", {
-      configurable: true,
-      value: { sessionStorage },
-    });
-    Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", {
-      configurable: true,
-      value: true,
-    });
+    sessionStorage = window.sessionStorage;
+    sessionStorage.clear();
   });
 
   afterEach(() => {
+    cleanup();
+    sessionStorage.clear();
     vi.useRealTimers();
-    Reflect.deleteProperty(globalThis, "window");
-    Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
   });
 
   test("keeps a hidden terminal failure visible until acknowledgement", async () => {
@@ -253,26 +217,22 @@ describe("TaskActionDialog durable lifecycle", () => {
       message: "The durable action failed",
     });
     const onComplete = vi.fn();
+    const user = setupUser();
 
-    let renderer: ReactTestRenderer;
-    await act(async () => {
-      renderer = renderDialog({ open: false, onComplete });
-    });
+    renderDialog({ open: false, onComplete });
     await flushEffects();
 
-    expect(textOf(renderer!)).toContain("The durable action failed");
-    expect(textOf(renderer!)).toContain("failed");
+    expect(pageText()).toContain("The durable action failed");
+    expect(pageText()).toContain("failed");
     expect(onComplete).toHaveBeenCalledTimes(1);
     expect(sessionStorage.getItem(storageKey())).not.toBeNull();
 
-    const done = renderer!.root
-      .findAllByType("button")
-      .find((node) => node.children.includes("Done"));
-    await act(async () => done?.props.onClick());
+    await user.click(screen.getByRole("button", { name: "Done" }));
     expect(sessionStorage.getItem(storageKey())).toBeNull();
   });
 
   test("continues after the 120 second window and resumes immediately when reopened", async () => {
+    vi.useFakeTimers();
     sessionStorage.setItem(storageKey(), storedPending("action-slow"));
     apiMock.taskActionStatus.mockResolvedValue({
       id: "action-slow",
@@ -281,13 +241,10 @@ describe("TaskActionDialog durable lifecycle", () => {
       terminal: false,
     });
 
-    let renderer: ReactTestRenderer;
-    await act(async () => {
-      renderer = renderDialog();
-    });
+    const view = renderDialog();
     for (
       let attempt = 0;
-      attempt < 90 && !textOf(renderer!).includes("Still processing");
+      attempt < 90 && !pageText().includes("Still processing");
       attempt += 1
     ) {
       await act(async () => {
@@ -295,19 +252,9 @@ describe("TaskActionDialog durable lifecycle", () => {
       });
     }
     expect(apiMock.taskActionStatus.mock.calls.length).toBeGreaterThanOrEqual(80);
-    expect(textOf(renderer!)).toContain("Still processing");
+    expect(pageText()).toContain("Still processing");
 
-    await act(async () => {
-      renderer!.update(
-        <TaskActionDialog
-          open={false}
-          actorScope={DEFAULT_ACTOR}
-          labels={labels}
-          onClose={vi.fn()}
-          onComplete={vi.fn()}
-        />,
-      );
-    });
+    view.rerender(dialogElement({ open: false }));
     apiMock.taskActionStatus.mockResolvedValue({
       id: "action-slow",
       kind: "create",
@@ -316,21 +263,11 @@ describe("TaskActionDialog durable lifecycle", () => {
       task_id: "task-42",
       message: "Created",
     });
-    await act(async () => {
-      renderer!.update(
-        <TaskActionDialog
-          open
-          actorScope={DEFAULT_ACTOR}
-          labels={labels}
-          onClose={vi.fn()}
-          onComplete={vi.fn()}
-        />,
-      );
-    });
+    view.rerender(dialogElement({ open: true }));
     await flushEffects();
 
-    expect(textOf(renderer!)).toContain("Created");
-    expect(textOf(renderer!)).toContain(labels.status.executed);
+    expect(pageText()).toContain("Created");
+    expect(pageText()).toContain(labels.status.executed);
   });
 
   test("recovers an accepted action after unmount and reload", async () => {
@@ -342,12 +279,9 @@ describe("TaskActionDialog durable lifecycle", () => {
       terminal: false,
     });
 
-    let first: ReactTestRenderer;
-    await act(async () => {
-      first = renderDialog({ open: false });
-    });
+    const first = renderDialog({ open: false });
     await flushEffects();
-    await act(async () => first!.unmount());
+    first.unmount();
 
     const onComplete = vi.fn();
     apiMock.taskActionStatus.mockResolvedValue({
@@ -358,13 +292,10 @@ describe("TaskActionDialog durable lifecycle", () => {
       task_id: "task-reloaded",
       message: "Recovered creation",
     });
-    let reloaded: ReactTestRenderer;
-    await act(async () => {
-      reloaded = renderDialog({ open: false, onComplete });
-    });
+    renderDialog({ open: false, onComplete });
     await flushEffects();
 
-    expect(textOf(reloaded!)).toContain("Recovered creation");
+    expect(pageText()).toContain("Recovered creation");
     expect(onComplete).toHaveBeenCalledTimes(1);
     const persisted = sessionStorage.getItem(storageKey()) ?? "";
     expect(persisted).not.toContain("Recovered creation");
@@ -376,15 +307,12 @@ describe("TaskActionDialog durable lifecycle", () => {
     apiMock.taskActionStatus.mockRejectedValue(
       new ApiError(404, "Action not found"),
     );
-    let renderer: ReactTestRenderer;
-    await act(async () => {
-      renderer = renderDialog();
-    });
+    renderDialog();
     await flushEffects();
 
     expect(sessionStorage.getItem(storageKey())).toBeNull();
-    expect(renderer!.root.findByType("input")).toBeDefined();
-    expect(textOf(renderer!)).toContain("Action not found");
+    expect(screen.getByRole("textbox", { name: "Task request" })).toBeDefined();
+    expect(pageText()).toContain("Action not found");
   });
 
   test("restores proposal controls when status proves the mutation was not accepted", async () => {
@@ -397,18 +325,11 @@ describe("TaskActionDialog durable lifecycle", () => {
       summary: "Proposal remains available",
       message: "Awaiting confirmation",
     });
-    let renderer: ReactTestRenderer;
-    await act(async () => {
-      renderer = renderDialog();
-    });
+    renderDialog();
     await flushEffects();
 
-    expect(textOf(renderer!)).toContain("Proposal remains available");
-    expect(
-      renderer!.root
-        .findAllByType("button")
-        .some((node) => node.children.includes("Confirm")),
-    ).toBe(true);
+    expect(pageText()).toContain("Proposal remains available");
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeDefined();
     expect(sessionStorage.getItem(storageKey())).not.toBeNull();
   });
 
@@ -449,29 +370,23 @@ describe("TaskActionDialog durable lifecycle", () => {
       apiMock.taskActionStatus.mockImplementationOnce(
         () => new Promise(() => {}),
       );
+      const user = setupUser();
 
-      let first: ReactTestRenderer;
-      await act(async () => {
-        first = renderDialog();
-      });
-      await draftAction(first!, "Track official AI updates");
-      const buttonLabel = mutation === "confirm" ? "Confirm" : "Cancel";
-      const mutateButton = first!.root
-        .findAllByType("button")
-        .find((node) => node.children.includes(buttonLabel));
-      await act(async () => {
-        mutateButton?.props.onClick();
-        await Promise.resolve();
-        await Promise.resolve();
-      });
+      const first = renderDialog();
+      await draftAction(user, "Track official AI updates");
+      await user.click(
+        screen.getByRole("button", {
+          name: mutation === "confirm" ? "Confirm" : "Cancel",
+        }),
+      );
 
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(sessionStorage.getItem(storageKey()) ?? "").toContain(actionID);
       });
       const persistedBeforeResponse = sessionStorage.getItem(storageKey()) ?? "";
       expect(persistedBeforeResponse).toContain(actionID);
       expect(persistedBeforeResponse).not.toContain("Durable proposal");
-      await act(async () => first!.unmount());
+      first.unmount();
 
       apiMock.taskActionStatus.mockReset();
       apiMock.taskActionStatus.mockResolvedValue({
@@ -483,14 +398,13 @@ describe("TaskActionDialog durable lifecycle", () => {
         message: terminalMessage,
       });
       const onComplete = vi.fn();
-      let reloaded: ReactTestRenderer;
-      await act(async () => {
-        reloaded = renderDialog({ open: false, onComplete });
-      });
+      renderDialog({ open: false, onComplete });
       await flushEffects();
 
-      expect(textOf(reloaded!)).toContain(terminalMessage);
-      expect(textOf(reloaded!)).toContain(labels.status[terminalStatus]);
+      expect(pageText()).toContain(terminalMessage);
+      expect(pageText()).toContain(
+        labels.status[terminalStatus as keyof typeof labels.status],
+      );
       expect(onComplete).toHaveBeenCalledTimes(1);
     },
   );
@@ -506,53 +420,25 @@ describe("TaskActionDialog durable lifecycle", () => {
     });
     const onComplete = vi.fn();
 
-    let first: ReactTestRenderer;
-    await act(async () => {
-      first = renderDialog({ onComplete });
-    });
+    const first = renderDialog({ onComplete });
     await flushEffects();
-    await act(async () => {
-      first!.update(
-        <TaskActionDialog
-          open={false}
-          actorScope={DEFAULT_ACTOR}
-          labels={labels}
-          onClose={vi.fn()}
-          onComplete={onComplete}
-        />,
-      );
-      first!.update(
-        <TaskActionDialog
-          open
-          actorScope={DEFAULT_ACTOR}
-          labels={labels}
-          onClose={vi.fn()}
-          onComplete={onComplete}
-        />,
-      );
-    });
-    await vi.waitFor(() => {
+    first.rerender(dialogElement({ open: false, onComplete }));
+    first.rerender(dialogElement({ open: true, onComplete }));
+    await waitFor(() => {
       expect(onComplete).toHaveBeenCalledTimes(1);
     });
-    await act(async () => first!.unmount());
+    first.unmount();
 
-    let second: ReactTestRenderer;
-    await act(async () => {
-      second = renderDialog({ open: false, onComplete });
-    });
+    renderDialog({ open: false, onComplete });
     await flushEffects();
 
-    expect(textOf(second!)).toContain("Cancelled");
+    expect(pageText()).toContain("Cancelled");
     expect(onComplete).toHaveBeenCalledTimes(1);
   });
 
-  test("gives the free-text input a localized accessible name", async () => {
-    let renderer: ReactTestRenderer;
-    await act(async () => {
-      renderer = renderDialog();
-    });
-    const input = renderer!.root.findByType("input");
-    expect(input.props["aria-label"]).toBe("Task request");
+  test("gives the free-text input a localized accessible name", () => {
+    renderDialog();
+    expect(screen.getByRole("textbox", { name: "Task request" })).toBeDefined();
   });
 
   test.each([
@@ -590,19 +476,15 @@ describe("TaskActionDialog durable lifecycle", () => {
       reply: "Untrusted reply",
       action,
     });
-    let renderer: ReactTestRenderer;
-    await act(async () => {
-      renderer = renderDialog({ taskID });
-    });
-    await draftAction(renderer!, "Track official AI updates");
+    const user = setupUser();
+    renderDialog({ taskID });
+    await draftAction(user, "Track official AI updates");
 
-    expect(textOf(renderer!)).toContain("Proposal scope mismatch");
-    expect(textOf(renderer!)).not.toContain(action.summary);
+    expect(pageText()).toContain("Proposal scope mismatch");
+    expect(pageText()).not.toContain(action.summary);
     expect(
-      renderer!.root
-        .findAllByType("button")
-        .some((node) => node.children.includes("Confirm")),
-    ).toBe(false);
+      screen.queryByRole("button", { name: "Confirm" }),
+    ).toBeNull();
     for (let index = 0; index < sessionStorage.length; index += 1) {
       expect(sessionStorage.key(index)).not.toContain("vane.task-action.v1");
     }
@@ -624,22 +506,16 @@ describe("TaskActionDialog durable lifecycle", () => {
     sessionStorage.setItem("vane.locale", "en");
     apiMock.taskActionStatus.mockImplementation(() => new Promise(() => {}));
 
-    let first: ReactTestRenderer;
-    await act(async () => {
-      first = renderDialog({ actorScope: actorA, open: false });
-    });
+    const first = renderDialog({ actorScope: actorA, open: false });
     await flushEffects();
     expect(apiMock.taskActionStatus).toHaveBeenCalledWith("actor-a-action");
-    await act(async () => first!.unmount());
+    first.unmount();
     const callsBeforeActorB = apiMock.taskActionStatus.mock.calls.length;
 
-    let second: ReactTestRenderer;
-    await act(async () => {
-      second = renderDialog({ actorScope: actorB });
-    });
+    renderDialog({ actorScope: actorB });
     await flushEffects();
-    expect(second!.root.findByType("input")).toBeDefined();
-    expect(textOf(second!)).not.toContain("actor-a-action");
+    expect(screen.getByRole("textbox", { name: "Task request" })).toBeDefined();
+    expect(pageText()).not.toContain("actor-a-action");
     expect(apiMock.taskActionStatus).toHaveBeenCalledTimes(callsBeforeActorB);
 
     clearTaskMutationSessionStorage(sessionStorage);
@@ -660,29 +536,18 @@ describe("TaskActionDialog durable lifecycle", () => {
       status: "executing",
       terminal: false,
     });
-    let renderer: ReactTestRenderer;
-    await act(async () => {
-      renderer = renderDialog();
-    });
+    renderDialog();
     await flushEffects();
 
-    expect(textOf(renderer!)).toContain("In progress");
-    const liveRegion = renderer!.root.find(
-      (node) => node.props.role === "status",
-    );
-    expect(liveRegion.props["aria-live"]).toBe("polite");
+    expect(pageText()).toContain("In progress");
+    expect(screen.getByRole("status").getAttribute("aria-live")).toBe("polite");
   });
 
   test("matches the backend canonical payload digest vector", async () => {
     apiMock.proposeTaskAction.mockResolvedValue({ reply: "Drafted" });
-    let renderer: ReactTestRenderer;
-    await act(async () => {
-      renderer = renderDialog({ taskID: "task-1" });
-    });
-    await draftAction(
-      renderer!,
-      "追踪 <AI> 更新\u2028只看官方",
-    );
+    const user = setupUser();
+    renderDialog({ taskID: "task-1" });
+    await draftAction(user, "追踪 <AI> 更新\u2028只看官方");
 
     expect(apiMock.proposeTaskAction).toHaveBeenCalledTimes(1);
     const [, taskID, requestID] = apiMock.proposeTaskAction.mock.calls[0] as [

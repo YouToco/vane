@@ -1,10 +1,15 @@
+// @vitest-environment jsdom
+
 import React from "react";
 import {
-  act,
-  create,
-  type ReactTestRenderer,
-} from "react-test-renderer";
-import { beforeEach, describe, expect, test, vi } from "vitest";
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const apiMock = vi.hoisted(() => ({
   profile: vi.fn(),
@@ -142,25 +147,25 @@ const baseProfile = {
   updated_at: "2026-07-27T01:00:00Z",
 };
 
-function textOf(renderer: ReactTestRenderer): string {
-  return JSON.stringify(renderer.toJSON());
+function pageText(): string {
+  return document.body.textContent ?? "";
 }
 
-async function renderLoaded(): Promise<ReactTestRenderer> {
-  let renderer: ReactTestRenderer;
-  await act(async () => {
-    renderer = create(<Profile />);
-    await Promise.resolve();
-    await Promise.resolve();
-  });
-  return renderer!;
+function button(label: string): HTMLButtonElement {
+  return screen.getByRole("button", { name: label }) as HTMLButtonElement;
 }
 
-function button(renderer: ReactTestRenderer, label: string) {
-  return renderer.root
-    .findAllByType("button")
-    .find((node) => node.children.includes(label));
+async function renderLoaded() {
+  const user = userEvent.setup();
+  const view = render(<Profile />);
+  await waitFor(() => expect(apiMock.profileEdits).toHaveBeenCalledTimes(1));
+  return { user, ...view };
 }
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("profile manual editing", () => {
   beforeEach(() => {
@@ -174,34 +179,26 @@ describe("profile manual editing", () => {
       updated_at: "2026-07-27T02:00:00Z",
     });
     apiMock.undoProfileEdit.mockResolvedValue(baseProfile);
-    Object.defineProperty(globalThis, "window", {
-      configurable: true,
-      value: { confirm: vi.fn(() => true) },
-    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
   });
 
   test("sends only changed fields with the current revision and an idempotency key", async () => {
-    const renderer = await renderLoaded();
-    const industry = renderer.root
-      .findAllByType("input")
-      .find((node) => node.props.value === "AI");
-    await act(async () => {
-      industry?.props.onChange({ target: { value: "AI 工具" } });
-    });
-    await act(async () => {
-      button(renderer, "保存修改")?.props.onClick();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    const { user } = await renderLoaded();
+    const industry = screen.getByDisplayValue("AI");
+    await user.clear(industry);
+    await user.type(industry, "AI 工具");
+    await user.click(button("保存修改"));
 
-    expect(apiMock.updateProfile).toHaveBeenCalledWith(
-      {
-        expected_updated_at: baseProfile.updated_at,
-        industry: "AI 工具",
-      },
-      expect.stringMatching(/^profile-edit-/),
+    await waitFor(() =>
+      expect(apiMock.updateProfile).toHaveBeenCalledWith(
+        {
+          expected_updated_at: baseProfile.updated_at,
+          industry: "AI 工具",
+        },
+        expect.stringMatching(/^profile-edit-/),
+      ),
     );
-    expect(apiMock.profile).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(apiMock.profile).toHaveBeenCalledTimes(2));
   });
 
   test("does not canonicalize untouched legacy fields into an unrelated edit", async () => {
@@ -211,85 +208,65 @@ describe("profile manual editing", () => {
       occupation: "开发者",
       tags: [" Agent ", "Agent"],
     });
-    const renderer = await renderLoaded();
-    const occupation = renderer.root
-      .findAllByType("input")
-      .find((node) => node.props.value === "开发者");
-    await act(async () => {
-      occupation?.props.onChange({ target: { value: "创始人" } });
-    });
-    await act(async () => {
-      button(renderer, "保存修改")?.props.onClick();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    const { user } = await renderLoaded();
+    const occupation = screen.getByDisplayValue("开发者");
+    await user.clear(occupation);
+    await user.type(occupation, "创始人");
+    await user.click(button("保存修改"));
 
-    expect(apiMock.updateProfile).toHaveBeenCalledWith(
-      {
-        expected_updated_at: baseProfile.updated_at,
-        occupation: "创始人",
-      },
-      expect.stringMatching(/^profile-edit-/),
+    await waitFor(() =>
+      expect(apiMock.updateProfile).toHaveBeenCalledWith(
+        {
+          expected_updated_at: baseProfile.updated_at,
+          occupation: "创始人",
+        },
+        expect.stringMatching(/^profile-edit-/),
+      ),
     );
   });
 
   test("treats outer whitespace around a clean scalar as no semantic change", async () => {
-    const renderer = await renderLoaded();
-    const industry = renderer.root
-      .findAllByType("input")
-      .find((node) => node.props.value === "AI");
-    await act(async () => {
-      industry?.props.onChange({ target: { value: " AI " } });
-    });
+    const { user } = await renderLoaded();
+    const industry = screen.getByDisplayValue("AI");
+    await user.clear(industry);
+    await user.type(industry, " AI ");
 
-    expect(button(renderer, "保存修改")?.props.disabled).toBe(true);
+    expect(button("保存修改").disabled).toBe(true);
     expect(apiMock.updateProfile).not.toHaveBeenCalled();
   });
 
   test("preserves exact tag spacing and rejects pasted control characters", async () => {
-    const renderer = await renderLoaded();
-    const tagInput = renderer.root
-      .findAllByType("input")
-      .find((node) => node.props.placeholder === "输入标签");
-    await act(async () => {
-      tagInput?.props.onChange({ target: { value: "machine  learning" } });
-      tagInput?.props.onBlur();
-    });
-    await act(async () => {
-      button(renderer, "保存修改")?.props.onClick();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(apiMock.updateProfile).toHaveBeenCalledWith(
-      {
-        expected_updated_at: baseProfile.updated_at,
-        tags: ["Agent", "machine  learning"],
-      },
-      expect.stringMatching(/^profile-edit-/),
+    const { user } = await renderLoaded();
+    const tagInput = screen.getByPlaceholderText("输入标签");
+    await user.type(tagInput, "machine  learning");
+    await user.tab();
+    await user.click(button("保存修改"));
+    await waitFor(() =>
+      expect(apiMock.updateProfile).toHaveBeenCalledWith(
+        {
+          expected_updated_at: baseProfile.updated_at,
+          tags: ["Agent", "machine  learning"],
+        },
+        expect.stringMatching(/^profile-edit-/),
+      ),
     );
 
     apiMock.updateProfile.mockClear();
-    const nextTagInput = renderer.root
-      .findAllByType("input")
-      .find((node) => node.props.placeholder === "输入标签");
-    for (const invalid of ["bad\tlabel", "line\u2028separator", "paragraph\u2029separator"]) {
-      await act(async () => {
-        nextTagInput?.props.onChange({ target: { value: invalid } });
-      });
-      expect(textOf(renderer)).toContain("标签不能包含控制字符");
-      expect(
-        renderer.root
-          .findAllByType("input")
-          .find((node) => node.props.placeholder === "输入标签")
-          ?.props["aria-invalid"],
-      ).toBe(true);
-      expect(button(renderer, "保存修改")?.props.disabled).toBe(true);
+    for (const invalid of [
+      "bad\tlabel",
+      "line\u2028separator",
+      "paragraph\u2029separator",
+    ]) {
+      const nextTagInput = screen.getByPlaceholderText(
+        "输入标签",
+      ) as HTMLInputElement;
+      fireEvent.change(nextTagInput, { target: { value: invalid } });
+      expect(pageText()).toContain("标签不能包含控制字符");
+      expect(nextTagInput.getAttribute("aria-invalid")).toBe("true");
+      expect(button("保存修改").disabled).toBe(true);
     }
     expect(
-      renderer.root
-        .findAllByType("input")
-        .find((node) => node.props.placeholder === "输入标签")
-        ?.props["aria-describedby"],
+      screen.getByPlaceholderText("输入标签").getAttribute("aria-describedby"),
     ).toContain("-error");
     expect(apiMock.updateProfile).not.toHaveBeenCalled();
   });
@@ -315,30 +292,21 @@ describe("profile manual editing", () => {
         },
       ],
     });
-    const renderer = await renderLoaded();
-    expect(textOf(renderer)).toContain("撤销记录");
-    expect(textOf(renderer)).toContain("编辑");
+    await renderLoaded();
+    expect(pageText()).toContain("撤销记录");
+    expect(pageText()).toContain("编辑");
   });
 
   test("keeps the draft on a 409 and never reloads or overwrites automatically", async () => {
     apiMock.updateProfile.mockRejectedValue(new ApiError(409, "conflict"));
-    const renderer = await renderLoaded();
-    const industry = renderer.root
-      .findAllByType("input")
-      .find((node) => node.props.value === "AI");
-    await act(async () => {
-      industry?.props.onChange({ target: { value: "机器人" } });
-    });
-    await act(async () => {
-      button(renderer, "保存修改")?.props.onClick();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    const { user } = await renderLoaded();
+    const industry = screen.getByDisplayValue("AI");
+    await user.clear(industry);
+    await user.type(industry, "机器人");
+    await user.click(button("保存修改"));
 
-    expect(textOf(renderer)).toContain("画像已更新，重新加载后再改。");
-    expect(
-      renderer.root.findAllByType("input").some((node) => node.props.value === "机器人"),
-    ).toBe(true);
+    await screen.findByText("画像已更新，重新加载后再改。");
+    expect(screen.getByDisplayValue("机器人")).toBeDefined();
     expect(apiMock.profile).toHaveBeenCalledTimes(1);
     expect(apiMock.updateProfile).toHaveBeenCalledTimes(1);
   });
@@ -347,46 +315,32 @@ describe("profile manual editing", () => {
     apiMock.updateProfile
       .mockRejectedValueOnce(new ApiError(0, "offline"))
       .mockResolvedValueOnce({ ...baseProfile, occupation: "创始人" });
-    const renderer = await renderLoaded();
-    const occupation = renderer.root
-      .findAllByType("input")
-      .find((node) => node.props.value === "独立开发者");
-    await act(async () => {
-      occupation?.props.onChange({ target: { value: "创始人" } });
-    });
-    await act(async () => {
-      button(renderer, "保存修改")?.props.onClick();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    const { user } = await renderLoaded();
+    const occupation = screen.getByDisplayValue("独立开发者");
+    await user.clear(occupation);
+    await user.type(occupation, "创始人");
+    await user.click(button("保存修改"));
+    await waitFor(() => expect(apiMock.updateProfile).toHaveBeenCalledTimes(1));
     const firstKey = apiMock.updateProfile.mock.calls[0]?.[1];
-    await act(async () => {
-      button(renderer, "保存修改")?.props.onClick();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    await user.click(button("保存修改"));
 
-    expect(apiMock.updateProfile).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(apiMock.updateProfile).toHaveBeenCalledTimes(2));
     expect(apiMock.updateProfile.mock.calls[1]?.[1]).toBe(firstKey);
   });
 
   test("creates an absent profile with a null compare token", async () => {
     apiMock.profile.mockRejectedValueOnce(new ApiError(404, "missing"));
-    const renderer = await renderLoaded();
-    expect(textOf(renderer)).toContain("画像尚未生成");
-    const industry = renderer.root.findAllByType("input")[0];
-    await act(async () => {
-      industry.props.onChange({ target: { value: "AI" } });
-    });
-    await act(async () => {
-      button(renderer, "保存修改")?.props.onClick();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    const { user } = await renderLoaded();
+    expect(pageText()).toContain("画像尚未生成");
+    const industry = screen.getByLabelText("行业");
+    await user.type(industry, "AI");
+    await user.click(button("保存修改"));
 
-    expect(apiMock.updateProfile).toHaveBeenCalledWith(
-      { expected_updated_at: null, industry: "AI" },
-      expect.stringMatching(/^profile-edit-/),
+    await waitFor(() =>
+      expect(apiMock.updateProfile).toHaveBeenCalledWith(
+        { expected_updated_at: null, industry: "AI" },
+        expect.stringMatching(/^profile-edit-/),
+      ),
     );
   });
 
@@ -411,21 +365,15 @@ describe("profile manual editing", () => {
         },
       ],
     });
-    const renderer = await renderLoaded();
-    expect(
-      renderer.root
-        .findAllByType("button")
-        .filter((node) => node.children.includes("撤销")),
-    ).toHaveLength(1);
-    await act(async () => {
-      button(renderer, "撤销")?.props.onClick();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(apiMock.undoProfileEdit).toHaveBeenCalledWith(
-      "latest",
-      baseProfile.updated_at,
-      expect.stringMatching(/^profile-undo-/),
+    const { user } = await renderLoaded();
+    expect(screen.getAllByRole("button", { name: "撤销" })).toHaveLength(1);
+    await user.click(button("撤销"));
+    await waitFor(() =>
+      expect(apiMock.undoProfileEdit).toHaveBeenCalledWith(
+        "latest",
+        baseProfile.updated_at,
+        expect.stringMatching(/^profile-undo-/),
+      ),
     );
   });
 
@@ -442,59 +390,39 @@ describe("profile manual editing", () => {
         },
       ],
     });
-    const renderer = await renderLoaded();
-    const tagInput = renderer.root
-      .findAllByType("input")
-      .find((node) => node.props.placeholder === "输入标签");
-    await act(async () => {
-      tagInput?.props.onChange({ target: { value: "新标签" } });
-    });
+    const { user } = await renderLoaded();
+    const tagInput = screen.getByPlaceholderText("输入标签");
+    fireEvent.change(tagInput, { target: { value: "新标签" } });
     vi.mocked(window.confirm).mockReturnValue(false);
-    await act(async () => {
-      button(renderer, "撤销")?.props.onClick();
-    });
+    await user.click(button("撤销"));
 
     expect(window.confirm).toHaveBeenCalledWith("确认撤销并放弃草稿");
     expect(apiMock.undoProfileEdit).not.toHaveBeenCalled();
-    expect(
-      renderer.root.findAllByType("input").some((node) => node.props.value === "新标签"),
-    ).toBe(true);
+    expect(screen.getByDisplayValue("新标签")).toBeDefined();
   });
 
   test("asks before a reload would discard a dirty draft", async () => {
-    const renderer = await renderLoaded();
-    const occupation = renderer.root
-      .findAllByType("input")
-      .find((node) => node.props.value === "独立开发者");
-    await act(async () => {
-      occupation?.props.onChange({ target: { value: "创始人" } });
-    });
+    const { user } = await renderLoaded();
+    const occupation = screen.getByDisplayValue("独立开发者");
+    await user.clear(occupation);
+    await user.type(occupation, "创始人");
     vi.mocked(window.confirm).mockReturnValue(false);
-    await act(async () => {
-      button(renderer, "重新加载")?.props.onClick();
-    });
+    await user.click(button("重新加载"));
+
     expect(window.confirm).toHaveBeenCalledWith("确认重新加载");
     expect(apiMock.profile).toHaveBeenCalledTimes(1);
   });
 
   test("keeps a dirty draft when the locale rerenders the page", async () => {
-    const renderer = await renderLoaded();
-    const occupation = renderer.root
-      .findAllByType("input")
-      .find((node) => node.props.value === "独立开发者");
-    await act(async () => {
-      occupation?.props.onChange({ target: { value: "创始人" } });
-    });
+    const { user, rerender } = await renderLoaded();
+    const occupation = screen.getByDisplayValue("独立开发者");
+    await user.clear(occupation);
+    await user.type(occupation, "创始人");
     i18nState.desc = "Localized description";
-    await act(async () => {
-      renderer.update(<Profile />);
-      await Promise.resolve();
-    });
+    rerender(<Profile />);
 
-    expect(textOf(renderer)).toContain("Localized description");
-    expect(
-      renderer.root.findAllByType("input").some((node) => node.props.value === "创始人"),
-    ).toBe(true);
+    await screen.findByText("Localized description");
+    expect(screen.getByDisplayValue("创始人")).toBeDefined();
     expect(apiMock.profile).toHaveBeenCalledTimes(1);
   });
 });
