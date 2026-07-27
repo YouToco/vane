@@ -23,6 +23,10 @@ type canonicalBriefFixture struct {
 	deliveryAt []time.Time
 	bodyMD     []string
 	contentID  []int64
+	itemTitle  []string
+	itemURL    []string
+	published  []*time.Time
+	sourceName string
 }
 
 func newCanonicalBriefFixture(t *testing.T, deliveries int) *canonicalBriefFixture {
@@ -121,15 +125,22 @@ func newCanonicalBriefFixture(t *testing.T, deliveries int) *canonicalBriefFixtu
 	}
 	f := &canonicalBriefFixture{
 		base: base, identity: identity, ref: ref, batchID: batchID,
-		sourceID: sourceIDs[0],
+		sourceID: sourceIDs[0], sourceName: "approved 0",
 	}
 	for i := range deliveries {
 		itemURL := fmt.Sprintf("https://brief.test/%s/%d", uuid.NewString(), i)
+		itemTitle := fmt.Sprintf("brief item %d", i+1)
+		var publishedAt *time.Time
+		if i%2 == 0 {
+			value := time.Now().Add(-time.Duration(i+1) * time.Hour).
+				Round(0).UTC().Truncate(time.Microsecond)
+			publishedAt = &value
+		}
 		contentID, created, err := base.st.UpsertContentItem(
 			t.Context(), &types.ContentItem{
 				SourceID: sourceIDs[0], ExternalID: uuid.NewString(),
 				CanonicalKey: itemURL, URL: itemURL,
-				Title:       fmt.Sprintf("brief item %d", i+1),
+				Title: itemTitle, PublishedAt: publishedAt,
 				ContentHash: "hash-" + uuid.NewString(),
 			})
 		if err != nil || !created {
@@ -150,6 +161,9 @@ func newCanonicalBriefFixture(t *testing.T, deliveries int) *canonicalBriefFixtu
 		f.contentID = append(f.contentID, contentID)
 		f.deliveryID = append(f.deliveryID, deliveryID)
 		f.bodyMD = append(f.bodyMD, bodyMD)
+		f.itemTitle = append(f.itemTitle, itemTitle)
+		f.itemURL = append(f.itemURL, itemURL)
+		f.published = append(f.published, publishedAt)
 		var createdAt time.Time
 		if err := base.st.pool.QueryRow(t.Context(),
 			`SELECT created_at FROM deliveries WHERE id=$1`,
@@ -217,10 +231,11 @@ func (f *canonicalBriefFixture) draft(
 	for i := len(f.deliveryID) - 1; i >= 0; i-- {
 		insights = append(insights, types.InsightV1{
 			ID: f.deliveryID[i], RankPosition: len(insights) + 1,
-			Title:        fmt.Sprintf("Insight %d", i+1),
+			Title:        f.itemTitle[i],
 			BodyMD:       f.bodyMD[i],
-			SourceTitle:  "Official",
-			SourceURL:    fmt.Sprintf("https://example.com/%d", i+1),
+			SourceTitle:  f.sourceName,
+			SourceURL:    f.itemURL[i],
+			PublishedAt:  f.published[i],
 			DiscoveredAt: f.deliveryAt[i],
 		})
 	}
@@ -370,6 +385,44 @@ func TestCanonicalBriefDarkStoreRequiresContentAndCompleteDeliverySet(t *testing
 			t.Fatalf("partial batch error=%v want conflict", err)
 		}
 	})
+}
+
+func TestCanonicalBriefDarkStoreRejectsUndurableSourceClaims(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 1)
+	outcome := f.finalizedContentOutcome(t)
+	valid := f.draft(t, outcome)
+	cases := map[string]func(*types.BriefDraftV1){
+		"item title": func(d *types.BriefDraftV1) {
+			d.Insights[0].Title = "caller invented title"
+		},
+		"source URL": func(d *types.BriefDraftV1) {
+			d.Insights[0].SourceURL = "https://phishing.example/claim"
+		},
+		"source title": func(d *types.BriefDraftV1) {
+			d.Insights[0].SourceTitle = "Impersonated source"
+		},
+		"publication time": func(d *types.BriefDraftV1) {
+			value := time.Now().Add(24 * time.Hour)
+			d.Insights[0].PublishedAt = &value
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			candidate.Insights = append(
+				[]types.InsightV1(nil), valid.Insights...)
+			mutate(&candidate)
+			if _, err := f.base.st.FreezeBriefV1(
+				t.Context(), f.identity, f.ref, candidate,
+			); !errors.Is(err, types.ErrConflict) {
+				t.Fatalf("undurable claim error=%v want conflict", err)
+			}
+		})
+	}
+	if _, err := f.base.st.FreezeBriefV1(
+		t.Context(), f.identity, f.ref, valid); err != nil {
+		t.Fatalf("durable source evidence was rejected: %v", err)
+	}
 }
 
 func TestCanonicalBriefPendingMarkerConvergesUnderRace(t *testing.T) {

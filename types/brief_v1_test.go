@@ -131,6 +131,16 @@ func TestBriefV1RejectsUnsafeOrNonCanonicalInputs(t *testing.T) {
 		"oversized body": func(d *BriefDraftV1) {
 			d.Insights[0].BodyMD = strings.Repeat("x", maxBriefBodyBytes+1)
 		},
+		"oversized escaped payload": func(d *BriefDraftV1) {
+			body := strings.Repeat("\\", maxBriefBodyBytes)
+			d.Insights = make([]InsightV1, 64)
+			for i := range d.Insights {
+				d.Insights[i] = base.Insights[0]
+				d.Insights[i].ID = int64(i + 1)
+				d.Insights[i].RankPosition = i + 1
+				d.Insights[i].BodyMD = body
+			}
+		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {

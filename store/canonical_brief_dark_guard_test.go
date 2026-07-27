@@ -44,21 +44,13 @@ func TestCanonicalBriefP1AHasZeroProductionCallPoints(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		ast.Inspect(file, func(node ast.Node) bool {
-			call, ok := node.(*ast.CallExpr)
-			if !ok {
-				return true
+		for _, name := range canonicalBriefProtectedSelectors(file, protected) {
+			relative, relErr := filepath.Rel(root, path)
+			if relErr != nil {
+				relative = path
 			}
-			selector, ok := call.Fun.(*ast.SelectorExpr)
-			if ok && protected[selector.Sel.Name] {
-				relative, relErr := filepath.Rel(root, path)
-				if relErr != nil {
-					relative = path
-				}
-				calls = append(calls, relative+":"+selector.Sel.Name)
-			}
-			return true
-		})
+			calls = append(calls, relative+":"+name)
+		}
 		return nil
 	})
 	if err != nil {
@@ -67,4 +59,34 @@ func TestCanonicalBriefP1AHasZeroProductionCallPoints(t *testing.T) {
 	if len(calls) != 0 {
 		t.Fatalf("P1-A gained production call points: %v", calls)
 	}
+}
+
+func TestCanonicalBriefP1AGuardDetectsMethodValueAliases(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "alias.go", `package p
+var freezeDark = (*Store).FreezeBriefV1
+`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := canonicalBriefProtectedSelectors(
+		file, map[string]bool{"FreezeBriefV1": true})
+	if len(found) != 1 || found[0] != "FreezeBriefV1" {
+		t.Fatalf("method-value alias escaped guard: %v", found)
+	}
+}
+
+func canonicalBriefProtectedSelectors(
+	file *ast.File, protected map[string]bool,
+) []string {
+	var found []string
+	// Inspect every selector reference, not only direct CallExpr functions:
+	// method values and method expressions can otherwise alias a dark method.
+	ast.Inspect(file, func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		if ok && protected[selector.Sel.Name] {
+			found = append(found, selector.Sel.Name)
+		}
+		return true
+	})
+	return found
 }

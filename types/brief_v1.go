@@ -26,6 +26,7 @@ const (
 	maxBriefSourceTitleBytes = 2048
 	maxBriefSourceURLBytes   = 8192
 	maxBriefInsights         = 100
+	maxBriefPayloadBytes     = 32 << 20
 )
 
 // RunResultV1 separates user-visible content availability from completeness.
@@ -246,6 +247,16 @@ func (d BriefDraftV1) Validate() error {
 			return errors.New("brief insight id is duplicated")
 		}
 		seen[insight.ID] = struct{}{}
+	}
+	// JSON escaping can make the whole payload much larger than the sum of raw
+	// body bytes. Probe with the largest possible sequence ID and a full digest
+	// so every domain-valid Brief is also admissible under the database limit.
+	payload, err := json.Marshal(BriefV1{
+		ID: 1<<63 - 1, Digest: strings.Repeat("f", sha256.Size*2),
+		BriefDraftV1: d,
+	})
+	if err != nil || len(payload) > maxBriefPayloadBytes {
+		return errors.New("brief payload is too large")
 	}
 	return nil
 }

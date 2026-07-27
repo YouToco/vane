@@ -555,41 +555,52 @@ func verifyBriefDeliveriesV1(
 	ctx context.Context, tx pgx.Tx, draft types.BriefDraftV1,
 ) error {
 	rows, err := tx.Query(ctx,
-		`SELECT id,content_item_id,body_md,created_at
-		   FROM deliveries
-		  WHERE batch_id=$1 AND tenant_id=$2 AND user_id=$3
-		  ORDER BY id`,
-		draft.PushBatchID, draft.TenantID, draft.UserID,
+		`SELECT delivery_id,body_md,discovered_at,content_title,
+		        canonical_url,published_at,source_title
+		   FROM read_canonical_brief_delivery_evidence_v1($1,$2)`,
+		draft.PushBatchID, draft.RunSnapshotID,
 	)
 	if err != nil {
-		return canonicalBriefDatabaseError("lock brief deliveries", err)
+		return canonicalBriefDatabaseError("read brief delivery evidence", err)
 	}
 	defer rows.Close()
 	type evidence struct {
 		bodyMD       string
 		discoveredAt time.Time
+		title        string
+		sourceURL    string
+		publishedAt  *time.Time
+		sourceTitle  string
 	}
 	deliveries := make(map[int64]evidence, len(draft.Insights))
 	for rows.Next() {
 		var id int64
-		var contentItemID sql.NullInt64
 		var bodyMD string
 		var discoveredAt time.Time
+		var title, sourceURL, sourceTitle string
+		var publishedAt sql.NullTime
 		if err := rows.Scan(
-			&id, &contentItemID, &bodyMD, &discoveredAt); err != nil {
+			&id, &bodyMD, &discoveredAt, &title, &sourceURL,
+			&publishedAt, &sourceTitle,
+		); err != nil {
 			return canonicalBriefDatabaseError("scan brief delivery", err)
 		}
-		if !contentItemID.Valid {
-			return canonicalBriefConflictError(
-				"brief delivery has no source content identity")
+		var canonicalPublishedAt *time.Time
+		if publishedAt.Valid {
+			value := publishedAt.Time.Round(0).UTC().Truncate(time.Microsecond)
+			canonicalPublishedAt = &value
 		}
 		deliveries[id] = evidence{
 			bodyMD:       bodyMD,
 			discoveredAt: discoveredAt.Round(0).UTC().Truncate(time.Microsecond),
+			title:        title,
+			sourceURL:    sourceURL,
+			publishedAt:  canonicalPublishedAt,
+			sourceTitle:  sourceTitle,
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return canonicalBriefDatabaseError("read brief deliveries", err)
+		return canonicalBriefDatabaseError("read brief delivery evidence", err)
 	}
 	if len(deliveries) != len(draft.Insights) {
 		return canonicalBriefConflictError(
@@ -602,12 +613,24 @@ func verifyBriefDeliveriesV1(
 				"brief insight does not belong to the exact batch")
 		}
 		if insight.BodyMD != stored.bodyMD ||
-			insight.DiscoveredAt != stored.discoveredAt {
+			insight.DiscoveredAt != stored.discoveredAt ||
+			insight.Title != stored.title ||
+			insight.SourceURL != stored.sourceURL ||
+			insight.SourceTitle != stored.sourceTitle ||
+			!canonicalBriefOptionalTimeEqual(
+				insight.PublishedAt, stored.publishedAt) {
 			return canonicalBriefConflictError(
-				"brief insight does not match frozen delivery content")
+				"brief insight does not match durable source evidence")
 		}
 	}
 	return nil
+}
+
+func canonicalBriefOptionalTimeEqual(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
 }
 
 func commitCanonicalBriefTxV1(

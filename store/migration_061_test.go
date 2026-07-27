@@ -93,12 +93,13 @@ func TestMigration061RoleRLSAndLeastPrivilege(t *testing.T) {
 	}
 
 	var (
-		noLogin, noInherit, noBypass, noSuper  bool
-		ownerCanSet, appCanSet                 bool
-		appOutcomeAccess, appBriefAccess       bool
-		writerDelete, writerPayloadUpdate      bool
-		writerSealUpdate, writerDeliverySelect bool
-		rolePath                               bool
+		noLogin, noInherit, noBypass, noSuper bool
+		ownerCanSet, appCanSet                bool
+		appOutcomeAccess, appBriefAccess      bool
+		writerDelete, writerPayloadUpdate     bool
+		writerSealUpdate, writerDeliveryRead  bool
+		writerEvidenceExec, writerUsersRead   bool
+		rolePath                              bool
 	)
 	if err := f.base.st.pool.QueryRow(t.Context(), `
 		SELECT
@@ -115,31 +116,225 @@ func TestMigration061RoleRLSAndLeastPrivilege(t *testing.T) {
 		      'vane_brief_writer','brief_snapshots','payload','UPDATE'),
 		  has_column_privilege(
 		      'vane_brief_writer','push_batches','brief_state','UPDATE'),
-		  has_column_privilege(
-		      'vane_brief_writer','deliveries','id','SELECT'),
-		  cardinality(COALESCE(rolconfig,ARRAY[]::text[]))=1
-		    AND rolconfig[1]='search_path=pg_catalog, public, pg_temp'
+			  has_column_privilege(
+			      'vane_brief_writer','deliveries','id','SELECT'),
+			  has_function_privilege(
+			      'vane_brief_writer',
+			      'read_canonical_brief_delivery_evidence_v1(bigint,bigint)',
+			      'EXECUTE'),
+			  has_table_privilege(
+			      'vane_brief_writer','users','SELECT'),
+			  cardinality(COALESCE(rolconfig,ARRAY[]::text[]))=1
+			    AND rolconfig[1]='search_path=pg_catalog, public, pg_temp'
 		  FROM pg_roles WHERE rolname='vane_brief_writer'`,
 	).Scan(
 		&noLogin, &noInherit, &noBypass, &noSuper,
 		&ownerCanSet, &appCanSet, &appOutcomeAccess, &appBriefAccess,
 		&writerDelete, &writerPayloadUpdate, &writerSealUpdate,
-		&writerDeliverySelect, &rolePath,
+		&writerDeliveryRead, &writerEvidenceExec, &writerUsersRead,
+		&rolePath,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if !noLogin || !noInherit || !noBypass || !noSuper ||
 		!ownerCanSet || appCanSet || appOutcomeAccess || appBriefAccess ||
 		writerDelete || writerPayloadUpdate || !writerSealUpdate ||
-		!writerDeliverySelect || !rolePath {
+		writerDeliveryRead || !writerEvidenceExec || writerUsersRead ||
+		!rolePath {
 		t.Fatalf(
 			"unsafe brief role attrs=%t/%t/%t/%t set=%t/%t app=%t/%t "+
-				"writer=%t/%t/%t/%t path=%t marker=%d",
+				"writer=%t/%t/%t/%t/%t/%t path=%t marker=%d",
 			noLogin, noInherit, noBypass, noSuper, ownerCanSet, appCanSet,
 			appOutcomeAccess, appBriefAccess, writerDelete,
-			writerPayloadUpdate, writerSealUpdate, writerDeliverySelect,
-			rolePath, marker.ID,
+			writerPayloadUpdate, writerSealUpdate, writerDeliveryRead,
+			writerEvidenceExec, writerUsersRead, rolePath, marker.ID,
 		)
+	}
+}
+
+func TestMigration061RejectsDeliveryScopeDrift(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 0)
+	sameTenantUser := testUser(t, f.base.st)
+	if _, err := f.base.st.pool.Exec(t.Context(),
+		`INSERT INTO memberships (tenant_id,user_id,role)
+		 VALUES ($1,$2,'member')`,
+		f.identity.TenantID, sameTenantUser); err != nil {
+		t.Fatal(err)
+	}
+	var otherTenant, otherTenantUser int64
+	if err := f.base.st.pool.QueryRow(t.Context(),
+		`INSERT INTO tenants DEFAULT VALUES RETURNING id`,
+	).Scan(&otherTenant); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.base.st.pool.QueryRow(t.Context(),
+		`INSERT INTO users (feishu_open_id,name)
+		 VALUES ($1,'brief scope other') RETURNING id`,
+		fmt.Sprintf("ou_brief_scope_%d", otherTenant),
+	).Scan(&otherTenantUser); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.base.st.pool.Exec(t.Context(),
+		`INSERT INTO memberships (tenant_id,user_id,role)
+		 VALUES ($1,$2,'owner')`, otherTenant, otherTenantUser); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(ctx, t, f.base.st,
+			`DELETE FROM memberships WHERE user_id IN ($1,$2)`,
+			sameTenantUser, otherTenantUser)
+		cleanupExec(ctx, t, f.base.st,
+			`DELETE FROM users WHERE id IN ($1,$2)`,
+			sameTenantUser, otherTenantUser)
+		cleanupExec(ctx, t, f.base.st,
+			`DELETE FROM tenants WHERE id=$1`, otherTenant)
+	})
+
+	cases := []struct {
+		name     string
+		tenantID int64
+		userID   int64
+	}{
+		{"same tenant other user", f.identity.TenantID, sameTenantUser},
+		{"other tenant", otherTenant, otherTenantUser},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := f.base.st.pool.Exec(t.Context(),
+				`INSERT INTO deliveries (
+				    tenant_id,batch_id,user_id,body_md
+				 ) VALUES ($1,$2,$3,'scope poison')`,
+				tc.tenantID, f.batchID, tc.userID,
+			); err == nil {
+				t.Fatal("delivery scope drift was admitted")
+			}
+		})
+	}
+}
+
+func TestMigration061RejectsPreexistingDeliveryScopeDrift(t *testing.T) {
+	db, provider := migration035Scratch(t)
+	if _, err := provider.UpTo(t.Context(), 60); err != nil {
+		t.Fatalf("migrate to 060: %v", err)
+	}
+	var ownerID, otherID, batchID int64
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users (feishu_open_id,name)
+		VALUES ('ou_brief_scope_owner','brief scope owner')
+		RETURNING id`,
+	).Scan(&ownerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users (feishu_open_id,name)
+		VALUES ('ou_brief_scope_other','brief scope other')
+		RETURNING id`,
+	).Scan(&otherID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO memberships (tenant_id,user_id,role)
+		VALUES (1,$1,'owner'),(1,$2,'member')`, ownerID, otherID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO push_batches (tenant_id,user_id)
+		VALUES (1,$1) RETURNING id`, ownerID,
+	).Scan(&batchID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO deliveries (tenant_id,batch_id,user_id,body_md)
+		VALUES (1,$1,$2,'preexisting scope poison')`, batchID, otherID,
+	); err != nil {
+		t.Fatalf("v060 unexpectedly rejected fixture poison: %v", err)
+	}
+	if _, err := provider.UpTo(t.Context(), 61); err == nil ||
+		!strings.Contains(
+			err.Error(), "delivery scope differs from its push batch") {
+		t.Fatalf("migration admitted preexisting scope poison: %v", err)
+	}
+	var version int64
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT max(version_id) FROM goose_db_version WHERE is_applied`,
+	).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 60 {
+		t.Fatalf("failed migration left version %d, want 60", version)
+	}
+}
+
+func TestMigration061FinalizedOutcomeCannotReturnPending(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 0)
+	outcome := f.finalizedContentOutcome(t)
+	tx, err := f.base.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+	if _, err := tx.Exec(t.Context(),
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		fmt.Sprint(f.identity.TenantID),
+		fmt.Sprint(f.identity.UserID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(),
+		`SET LOCAL ROLE vane_brief_writer`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(),
+		`UPDATE task_run_outcomes
+		    SET status='pending',result=NULL,source_coverage=NULL,
+		        processing=NULL,failure_code='',failure_message='',
+		        finalized_at=NULL,outcome_digest=NULL
+		  WHERE id=$1`, outcome.ID,
+	); err == nil || !strings.Contains(
+		err.Error(), "run outcome transition authority denied") {
+		t.Fatalf("finalized outcome returned to pending: %v", err)
+	}
+}
+
+func TestMigration061ScrubsPreexistingWriterACL(t *testing.T) {
+	db, provider := migration035Scratch(t)
+	if _, err := provider.UpTo(t.Context(), 60); err != nil {
+		t.Fatalf("migrate to 060: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		DO $$
+		BEGIN
+		    IF NOT EXISTS (
+		        SELECT 1 FROM pg_roles WHERE rolname='vane_brief_writer'
+		    ) THEN
+		        CREATE ROLE vane_brief_writer
+		            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+		            NOLOGIN NOINHERIT NOBYPASSRLS;
+		    END IF;
+		END $$;
+		GRANT SELECT ON users TO vane_brief_writer`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 61); err != nil {
+		t.Fatalf("migrate to 061 with preexisting ACL: %v", err)
+	}
+	var canReadUsers, canExecuteEvidence bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT
+		  has_table_privilege('vane_brief_writer','users','SELECT'),
+		  has_function_privilege(
+		    'vane_brief_writer',
+		    'read_canonical_brief_delivery_evidence_v1(bigint,bigint)',
+		    'EXECUTE')`,
+	).Scan(&canReadUsers, &canExecuteEvidence); err != nil {
+		t.Fatal(err)
+	}
+	if canReadUsers || !canExecuteEvidence {
+		t.Fatalf("writer ACL scrub/whitelist drift: users=%t evidence=%t",
+			canReadUsers, canExecuteEvidence)
 	}
 }
 
@@ -154,7 +349,12 @@ func TestMigration061HasSafeDownFenceAndRoleRaceGuard(t *testing.T) {
 		"LOCK TABLE task_run_outcomes,push_batches,brief_snapshots",
 		"refusing downgrade while canonical outcome/brief evidence exists",
 		"WHEN duplicate_object OR unique_violation THEN NULL",
+		"delivery scope differs from its push batch",
+		"fk_deliveries_brief_batch_scope",
 		"deliveries_require_open_brief_batch_v1",
+		"task_run_outcomes_one_way_finalization_v1",
+		"read_canonical_brief_delivery_evidence_v1",
+		"DROP OWNED BY vane_brief_writer",
 		"push_batches_brief_state_authority_v1",
 	} {
 		if !strings.Contains(sqlText, required) {
