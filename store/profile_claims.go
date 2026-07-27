@@ -49,39 +49,10 @@ type profileClaimProjection struct {
 func (s *Store) ListProfileClaims(
 	ctx context.Context, tenantID, userID int64,
 ) (*types.ProfileClaimList, error) {
-	if tenantID <= 0 || userID <= 0 {
-		return nil, types.NewAppError(types.CodeValidation, "画像主张读取范围无效", nil)
-	}
-	tx, err := s.beginProfileClaimScopedTx(ctx, tenantID, false, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	var version, generation int64
-	err = tx.QueryRow(ctx,
-		`SELECT version,evidence_generation FROM profile_claim_states
-		  WHERE tenant_id=$1 AND user_id=$2 FOR SHARE`,
-		tenantID, userID).Scan(&version, &generation)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, types.NewAppError(types.CodeNotFound, "画像主张尚未初始化", nil)
-	}
-	if err != nil {
-		return nil, profileClaimDBError("read legacy profile claim state", err)
-	}
-	claims, events, err := loadProfileClaimLedgerTx(ctx, tx, tenantID, userID)
-	if err != nil {
-		return nil, err
-	}
-	projection := projectProfileClaims(claims, events, generation)
-	out := &types.ProfileClaimList{
-		Version: version,
-		Claims:  publicProfileClaims(claims, projection, events),
-		Events:  publicProfileClaimEvents(events),
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, profileClaimDBError("commit legacy profile claim read", err)
-	}
-	return out, nil
+	return s.ListProfileClaimsPage(
+		ctx, tenantID, userID,
+		ProfileClaimEventPageOptions{Limit: defaultProfileClaimEventLimit},
+	)
 }
 
 func (s *Store) ListProfileClaimsPage(

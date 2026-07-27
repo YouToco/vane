@@ -1179,13 +1179,54 @@ func TestProfileClaimEventPaginationAndBoundedActionReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	legacy, err := st.ListProfileClaims(t.Context(), 1, u.ID)
+	defaultPage, err := st.ListProfileClaims(t.Context(), 1, u.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(legacy.Events) != 997 {
-		t.Fatalf("no-parameter compatibility events=%d want legacy 997",
-			len(legacy.Events))
+	if len(defaultPage.Events) != defaultProfileClaimEventLimit ||
+		!defaultPage.EventsHasMore || defaultPage.EventsNextCursor == "" {
+		t.Fatalf("no-parameter default page events/more/cursor=%d/%t/%q",
+			len(defaultPage.Events), defaultPage.EventsHasMore,
+			defaultPage.EventsNextCursor)
+	}
+	if len(defaultPage.Claims) > maxPublicFirstProfileClaims {
+		t.Fatalf("no-parameter default claims=%d", len(defaultPage.Claims))
+	}
+	for i := 1; i < len(defaultPage.Events); i++ {
+		if parseTestID(t, defaultPage.Events[i-1].ID) <=
+			parseTestID(t, defaultPage.Events[i].ID) {
+			t.Fatalf("no-parameter default events not id DESC: %s then %s",
+				defaultPage.Events[i-1].ID, defaultPage.Events[i].ID)
+		}
+	}
+	defaultCursor, err := decodeProfileClaimEventCursor(
+		defaultPage.EventsNextCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultCursor.Limit != defaultProfileClaimEventLimit {
+		t.Fatalf("no-parameter cursor limit=%d", defaultCursor.Limit)
+	}
+	defaultContinuation, err := st.ListProfileClaimsPage(
+		t.Context(), 1, u.ID,
+		ProfileClaimEventPageOptions{
+			Limit:  defaultProfileClaimEventLimit,
+			Cursor: defaultPage.EventsNextCursor,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defaultContinuation.Events) != defaultProfileClaimEventLimit ||
+		len(defaultContinuation.Claims) > maxPublicEventContextClaims {
+		t.Fatalf("default continuation events/claims=%d/%d",
+			len(defaultContinuation.Events), len(defaultContinuation.Claims))
+	}
+	if parseTestID(t, defaultContinuation.Events[0].ID) >=
+		parseTestID(t, defaultPage.Events[len(defaultPage.Events)-1].ID) {
+		t.Fatalf("default continuation overlapped first page: %s after %s",
+			defaultContinuation.Events[0].ID,
+			defaultPage.Events[len(defaultPage.Events)-1].ID)
 	}
 
 	options := ProfileClaimEventPageOptions{Limit: 37}
