@@ -598,6 +598,152 @@ func TestPushPipelineWorkflow_ReplayCompiledRunOutcomeV1HappyPath(t *testing.T) 
 	}
 }
 
+// preResultV2CanonicalBriefHistory records the 43d041b command/result shape:
+// Prepare returns only Draft and there is no result-v2 Version marker.
+func preResultV2CanonicalBriefHistory(
+	t *testing.T,
+	execution sdkworkflow.Execution,
+) *historypb.History {
+	p := PushParams{
+		TenantID: 1, UserID: 1, ScheduleID: "task-p1c-replay",
+		NLDesc:  "每日 canonical 情报",
+		RunKind: PushRunKindScheduled, ExecutionMode: types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeCanonicalBriefV1,
+	}
+	identity := types.RunIdentity{
+		TemporalWorkflowID: execution.ID, TemporalRunID: execution.RunID,
+		RunKind:  types.RunSnapshotKindScheduled,
+		TenantID: p.TenantID, UserID: p.UserID, TaskID: p.ScheduleID,
+	}
+	ref := mustCompiledRunRef(identity, 103)
+	run := &CompiledRunInputV1{
+		TenantID: p.TenantID, TaskID: p.ScheduleID, Snapshot: ref,
+	}
+	preparedParams := p
+	preparedParams.Snapshot = &ref
+	marker := types.RunOutcomeMarkerV1{
+		ID: 203, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID, TenantID: p.TenantID,
+		UserID: p.UserID, TaskID: p.ScheduleID,
+	}
+	draft := types.BriefDraftV1{
+		SchemaVersion: types.BriefSchemaVersionV1,
+		RunOutcomeID:  marker.ID, RunSnapshotID: ref.SnapshotID,
+		PushBatchID: 303, TenantID: p.TenantID, UserID: p.UserID,
+		TaskID: p.ScheduleID,
+		Insights: []types.InsightV1{{
+			ID: 403, RankPosition: 1, Title: "item", BodyMD: "body",
+			SourceTitle: "source", SourceURL: "https://example.com/item",
+		}},
+	}
+	const traceID = "9f1d6c5e-0000-4000-8000-p1creplay000"
+	b := newHistoryBuilder(t, p)
+	b.sideEffect(1, traceID)
+	b.versionWithSearchAttributes("scheduled-runtime-envelope-v1", 1)
+	b.versionWithSearchAttributes("compiled-run-snapshot-v1", 1)
+	b.activity("PrepareRun", p,
+		PrepareRunResult{Authorized: true, Snapshot: ref})
+	b.versionWithSearchAttributes("run-outcome-lifecycle-v1", 1)
+	b.activity("BeginRunOutcomeV1",
+		RunOutcomeBeginIn{UserID: p.UserID, Run: *run}, marker)
+	b.activity("EvolveProfile",
+		EvolveIn{UserID: p.UserID, TraceID: traceID, Run: run}, nil)
+	b.activity("FetchOutcomeV1", preparedParams, FetchOutcomeResult{
+		Items: items(1), SourceCoverage: types.RunCompletenessComplete,
+	})
+	b.activity("Dedup", DedupIn{
+		UserID: p.UserID, TraceID: traceID, Items: items(1), Run: run,
+	}, items(1))
+	b.versionWithSearchAttributes("observation-qualification-v1", 1)
+	b.activity("QualifyEvents", QualifyEventsIn{
+		UserID: p.UserID, TraceID: traceID, ScheduleID: p.ScheduleID,
+		Items: items(1), Run: run,
+	}, QualifyEventsResult{Items: items(1), Outcome: "not_configured"})
+	b.activity("ScoreOutcomeV1", ScoreIn{
+		UserID: p.UserID, TraceID: traceID, Items: items(1),
+		ScheduleID: p.ScheduleID, Run: run,
+	}, ScoreOutcomeResult{
+		Items: scoredItems(1), Processing: types.RunCompletenessComplete,
+	})
+	b.activity("Select", SelectIn{
+		UserID: p.UserID, TraceID: traceID, TopN: defaultTopN,
+		Scored: scoredItems(1), ScheduleID: p.ScheduleID, Run: run,
+	}, scoredItems(1))
+	b.activity("CardGenOutcomeV1", CardGenIn{
+		UserID: p.UserID, TraceID: traceID, Items: scoredItems(1),
+		ScheduleID: p.ScheduleID, Run: run,
+	}, CardGenOutcomeResult{
+		Cards: cardsOf(1), Processing: types.RunCompletenessComplete,
+	})
+	b.versionWithSearchAttributes("canonical-brief-stage-v1", 1)
+	b.activity("PrepareCanonicalBriefV1", CanonicalBriefPrepareIn{
+		UserID: p.UserID, TraceID: traceID, Run: *run,
+		Marker: marker, Cards: cardsOf(1),
+	}, struct {
+		Draft *types.BriefDraftV1 `json:"draft,omitempty"`
+	}{Draft: &draft})
+	b.activity("Push", PushIn{
+		UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID,
+		Cards: cardsOf(1), TaskTitle: p.NLDesc, Run: run,
+		CanonicalOutcome: &marker, CanonicalBrief: &draft,
+	}, nil)
+	b.activity("FinalizeRunOutcomeV1", RunOutcomeFinalizeIn{
+		UserID: p.UserID, Run: *run,
+		Claim: types.RunOutcomeClaimV1{
+			RunOutcomeMarkerV1: marker,
+			Result:             types.RunResultContent,
+			SourceCoverage:     types.RunCompletenessComplete,
+			Processing:         types.RunCompletenessComplete,
+		},
+	}, nil)
+	return b.complete()
+}
+
+func TestPushPipelineWorkflow_ReplayPreResultV2CanonicalBrief(t *testing.T) {
+	execution := sdkworkflow.Execution{
+		ID:    "wf-task-p1c-replay",
+		RunID: "00000000-0000-4000-8000-000000000103",
+	}
+	if err := replayWithExecution(
+		t, preResultV2CanonicalBriefHistory(t, execution), execution,
+	); err != nil {
+		t.Fatalf("pre-result-v2 P1-C history must replay exactly: %v", err)
+	}
+}
+
+func TestPushPipelineWorkflow_ReplayPreResultV2PrepareFrontier(t *testing.T) {
+	execution := sdkworkflow.Execution{
+		ID:    "wf-task-p1c-prepare-frontier",
+		RunID: "00000000-0000-4000-8000-000000000104",
+	}
+	full := preResultV2CanonicalBriefHistory(t, execution)
+	var prepareScheduledID int64
+	frontierEnd := -1
+	for i, event := range full.Events {
+		if scheduled := event.GetActivityTaskScheduledEventAttributes(); scheduled != nil &&
+			scheduled.GetActivityType().GetName() ==
+				"PrepareCanonicalBriefV1" {
+			prepareScheduledID = event.GetEventId()
+		}
+		if prepareScheduledID > 0 {
+			if started := event.GetWorkflowTaskStartedEventAttributes(); started != nil &&
+				event.GetEventId() > prepareScheduledID {
+				frontierEnd = i + 1
+				break
+			}
+		}
+	}
+	if frontierEnd <= 0 {
+		t.Fatal("pre-result-v2 history has no Prepare completion frontier")
+	}
+	frontier := &historypb.History{
+		Events: full.Events[:frontierEnd],
+	}
+	if err := replayWithExecution(t, frontier, execution); err != nil {
+		t.Fatalf("pre-result-v2 Prepare frontier must resume: %v", err)
+	}
+}
+
 func TestPushPipelineWorkflow_ReplayCompiledV1RejectsPrepareMutation(t *testing.T) {
 	execution := sdkworkflow.Execution{
 		ID: "wf-task-c1b-replay", RunID: "00000000-0000-4000-8000-000000000101",

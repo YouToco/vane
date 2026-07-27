@@ -17,14 +17,44 @@ import (
 type canonicalBriefStoreFake struct {
 	mu sync.Mutex
 
-	loadDraft types.BriefDraftV1
-	loadFound bool
-	loadErr   error
+	loadDraft        types.BriefDraftV1
+	loadFound        bool
+	loadErr          error
+	loadEmpty        bool
+	loadEmptyErr     error
+	loadEmptyBatchID int64
 
-	prepareCalls int
-	prepareIDs   []int64
-	prepared     types.BriefDraftV1
-	prepareErr   error
+	prepareCalls   int
+	prepareIDs     []int64
+	prepared       types.BriefDraftV1
+	prepareErr     error
+	sealEmptyCalls int
+	sealEmptyErr   error
+}
+
+func (f *canonicalBriefStoreFake) LoadSealedEmptyBriefBatchV1(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	types.RunOutcomeMarkerV1,
+	string,
+) (int64, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loadEmptyBatchID, f.loadEmpty, f.loadEmptyErr
+}
+
+func (f *canonicalBriefStoreFake) SealEmptyBriefBatchV1(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRef,
+	types.RunOutcomeMarkerV1,
+	int64,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sealEmptyCalls++
+	return f.sealEmptyErr
 }
 
 func (f *canonicalBriefStoreFake) LoadPreparedBriefDraftV1(
@@ -224,6 +254,120 @@ func TestPrepareCanonicalBriefV1FailsClosedOnAnyDeliveryWrite(t *testing.T) {
 	if briefStore.prepareCalls != 0 {
 		t.Fatalf("stage persisted after failed delivery: %d",
 			briefStore.prepareCalls)
+	}
+}
+
+func TestPrepareCanonicalBriefV1ReplaysSealedEmptyBeforeMutableRun(t *testing.T) {
+	identity, ref, _ := compiledActivityFixture("Frozen Task")
+	briefStore := &canonicalBriefStoreFake{
+		loadEmpty: true, loadEmptyBatchID: 778,
+	}
+	compiledStore := &compiledRunStoreFake{
+		authorize: false,
+	}
+	a := NewActivities(
+		fakeFetcher{}, fakeScorer{}, fakeCardGen{}, new(fakePusher),
+		new(fakeStore), fakeFeishu{}, nil, nil,
+		func(feedback.AggregateCardInput) string { return `{}` },
+		func(string, int) (string, string) { return "title", "blue" },
+		WithCompiledRuntimeV1(
+			compiledStore, nil, new(compiledModelResolverFake)),
+		WithCanonicalBriefStoreV1(briefStore),
+		WithPushEffectCanary(newPRBActivityEffectStore(nil, nil), ""),
+	)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.PrepareCanonicalBriefV1)
+	marker := types.RunOutcomeMarkerV1{
+		ID: 404, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID,
+		TenantID:      identity.TenantID,
+		UserID:        identity.UserID,
+		TaskID:        identity.TaskID,
+	}
+	result, err := executeCanonicalBriefPrepareActivity(
+		t, env, a, CanonicalBriefPrepareIn{
+			UserID: identity.UserID, TraceID: "trace-empty-replay",
+			Run: CompiledRunInputV1{
+				TenantID: identity.TenantID,
+				TaskID:   identity.TaskID,
+				Snapshot: ref,
+			},
+			Marker: marker,
+			Cards: []GeneratedCard{{
+				Scored: types.ScoredItem{
+					Item: types.ContentItem{
+						ID: 1, SourceID: 10, Title: "item",
+						URL: "https://example.com/item",
+					},
+					Score: 80,
+				},
+				BodyMD: "body",
+			}},
+			GeneratedAt: time.Date(
+				2026, 7, 27, 2, 3, 6, 0, time.UTC),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Draft != nil || !result.Empty || result.BatchID != 778 {
+		t.Fatalf("sealed empty replay = %+v", result)
+	}
+}
+
+func TestPushCanonicalEmptyCompletesWithoutMutableRunRead(t *testing.T) {
+	identity, ref, _ := compiledActivityFixture("Frozen Task")
+	effectStore := newPRBActivityEffectStore(nil, nil)
+	a := NewActivities(
+		fakeFetcher{}, fakeScorer{}, fakeCardGen{}, new(fakePusher),
+		new(fakeStore), fakeFeishu{}, nil, nil,
+		func(feedback.AggregateCardInput) string { return `{}` },
+		func(string, int) (string, string) { return "title", "blue" },
+		// No compiled Store is installed: reaching mutable run loading would
+		// fail, proving the exact empty receipt returns first.
+		WithPushEffectCanary(effectStore, ""),
+	)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.Push)
+	marker := types.RunOutcomeMarkerV1{
+		ID: 403, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID,
+		TenantID:      identity.TenantID,
+		UserID:        identity.UserID,
+		TaskID:        identity.TaskID,
+	}
+	if _, err := env.ExecuteActivity(a.Push, PushIn{
+		UserID: identity.UserID, ScheduleID: identity.TaskID,
+		TraceID: "trace-empty-receipt",
+		Run: &CompiledRunInputV1{
+			TenantID: identity.TenantID,
+			TaskID:   identity.TaskID,
+			Snapshot: ref,
+		},
+		CanonicalOutcome: &marker,
+		CanonicalBatchID: 777,
+		Cards: []GeneratedCard{{
+			Scored: types.ScoredItem{
+				Item: types.ContentItem{
+					ID: 1, SourceID: 10, Title: "not re-planned",
+					URL: "https://example.com/not-replanned",
+				},
+				Score: 80,
+			},
+			BodyMD: "not re-planned",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	effectStore.mu.Lock()
+	defer effectStore.mu.Unlock()
+	if len(effectStore.empty) != 1 ||
+		effectStore.empty[0].BatchID != 777 ||
+		effectStore.empty[0].TenantID != identity.TenantID ||
+		len(effectStore.prepared) != 0 {
+		t.Fatalf("empty receipt calls=%+v prepared=%d",
+			effectStore.empty, len(effectStore.prepared))
 	}
 }
 

@@ -73,6 +73,33 @@ func (s *Store) claimAuthorizedPushEffect(
 	if err != nil {
 		return nil, "", err
 	}
+	admitted, err := canonicalBriefPushRecoveryAdmittedV1(
+		ctx, tx, effect)
+	if err != nil {
+		return nil, "", err
+	}
+	if !admitted {
+		if !reconciliation {
+			if _, err := tx.Exec(ctx, `
+				UPDATE push_effects
+				   SET next_attempt_at=clock_timestamp()+
+				       ($5*interval '1 microsecond'),
+				       updated_at=clock_timestamp()
+				 WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND fence=$4
+				   AND status IN ('prepared','definite_failed')`,
+				effect.ID, effect.TenantID, effect.UserID, effect.Fence,
+				params.DenialRetryAfter.Microseconds(),
+			); err != nil {
+				return nil, "", pushEffectDatabaseError(
+					"defer canonical push effect recovery", err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, "", pushEffectDatabaseError(
+				"commit canonical push effect recovery denial", err)
+		}
+		return nil, pusheffect.AuthorizedClaimDenied, nil
+	}
 
 	if effect.Status == pusheffect.StatusSending &&
 		effect.LeaseOwner == params.LeaseOwner &&
@@ -148,6 +175,37 @@ func (s *Store) claimAuthorizedPushEffect(
 			"commit authorized claim transaction", err)
 	}
 	return claimed, pusheffect.AuthorizedClaimed, nil
+}
+
+func canonicalBriefPushRecoveryAdmittedV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	effect *pusheffect.Effect,
+) (bool, error) {
+	var available bool
+	if err := tx.QueryRow(ctx, `
+		SELECT to_regprocedure(
+		    'public.canonical_brief_push_recovery_admitted_v1(bigint,bigint,text,bigint,bigint)'
+		) IS NOT NULL`,
+	).Scan(&available); err != nil {
+		return false, pushEffectDatabaseError(
+			"check canonical push recovery capability", err)
+	}
+	if !available {
+		return true, nil
+	}
+	var admitted bool
+	if err := tx.QueryRow(ctx, `
+		SELECT public.canonical_brief_push_recovery_admitted_v1(
+		    $1,$2,$3,$4,$5
+		)`,
+		effect.TenantID, effect.UserID, effect.TaskID,
+		effect.RunSnapshotID, effect.BatchID,
+	).Scan(&admitted); err != nil {
+		return false, pushEffectDatabaseError(
+			"check canonical push recovery admission", err)
+	}
+	return admitted, nil
 }
 
 func validatePushEffectRunSnapshotForClaim(

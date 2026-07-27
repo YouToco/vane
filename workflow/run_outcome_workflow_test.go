@@ -29,6 +29,8 @@ type runOutcomeWorkflowCase struct {
 	pushErr         error
 	finalizeErr     error
 	cancelAtEvolve  bool
+	canonical       bool
+	canonicalEmpty  bool
 }
 
 func executeRunOutcomeWorkflowCase(
@@ -127,6 +129,37 @@ func executeRunOutcomeWorkflowCase(
 			Processing: tc.cardProcessing,
 		}, nil
 	})
+	if tc.canonical {
+		reg("PrepareCanonicalBriefV1", func(
+			_ context.Context, in CanonicalBriefPrepareIn,
+		) (CanonicalBriefPrepareResult, error) {
+			if tc.canonicalEmpty {
+				return CanonicalBriefPrepareResult{
+					BatchID: 901, Empty: true,
+				}, nil
+			}
+			draft := types.BriefDraftV1{
+				SchemaVersion: types.BriefSchemaVersionV1,
+				RunOutcomeID:  in.Marker.ID,
+				RunSnapshotID: in.Run.Snapshot.SnapshotID,
+				PushBatchID:   901,
+				TenantID:      in.Run.TenantID,
+				UserID:        in.UserID,
+				TaskID:        in.Run.TaskID,
+				GeneratedAt:   in.GeneratedAt,
+				Insights: []types.InsightV1{{
+					ID: 1001, RankPosition: 1,
+					Title: "title", BodyMD: "body",
+					SourceTitle:  "source",
+					SourceURL:    "https://example.com/item",
+					DiscoveredAt: time.Unix(10, 0).UTC(),
+				}},
+			}
+			return CanonicalBriefPrepareResult{
+				Draft: &draft, BatchID: draft.PushBatchID,
+			}, nil
+		})
+	}
 	reg("Push", func(context.Context, PushIn) error { return tc.pushErr })
 	reg("RecordEmptyBatch", func(context.Context, RecordEmptyIn) error {
 		return nil
@@ -147,16 +180,57 @@ func executeRunOutcomeWorkflowCase(
 		}
 		return in.Claim.SealAt(time.Unix(1, 0).UTC())
 	})
+	runtimeVersion := CompiledRuntimeRunOutcomeV1
+	if tc.canonical {
+		runtimeVersion = CompiledRuntimeCanonicalBriefV1
+	}
 	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
 		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
 		ExecutionMode:  types.ExecutionModeCompiled,
-		RuntimeVersion: CompiledRuntimeRunOutcomeV1,
+		RuntimeVersion: runtimeVersion,
 		ScheduleID:     "task-run-outcome-matrix",
 	})
 	mu.Lock()
 	claim := finalized
 	mu.Unlock()
 	return claim, env.GetWorkflowError()
+}
+
+func TestPushPipelineWorkflow_CanonicalEmptyIsQuiet(t *testing.T) {
+	claim, err := executeRunOutcomeWorkflowCase(
+		t, runOutcomeWorkflowCase{
+			fetchItems: 2, fetchCoverage: types.RunCompletenessComplete,
+			scoreItems: 2, scoreProcessing: types.RunCompletenessComplete,
+			cardItems: 2, cardProcessing: types.RunCompletenessComplete,
+			canonical: true, canonicalEmpty: true,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Result != types.RunResultQuiet ||
+		claim.SourceCoverage != types.RunCompletenessComplete ||
+		claim.Processing != types.RunCompletenessComplete {
+		t.Fatalf("canonical empty claim = %+v", claim)
+	}
+}
+
+func TestPushPipelineWorkflow_CanonicalEmptyPushFailureIsFailed(t *testing.T) {
+	pushErr := temporal.NewNonRetryableApplicationError(
+		"empty receipt unavailable", string(types.CodeDatabase), nil)
+	claim, err := executeRunOutcomeWorkflowCase(
+		t, runOutcomeWorkflowCase{
+			fetchItems: 2, fetchCoverage: types.RunCompletenessComplete,
+			scoreItems: 2, scoreProcessing: types.RunCompletenessComplete,
+			cardItems: 2, cardProcessing: types.RunCompletenessComplete,
+			canonical: true, canonicalEmpty: true, pushErr: pushErr,
+		})
+	if err == nil {
+		t.Fatal("canonical empty receipt failure completed workflow")
+	}
+	if claim.Result != types.RunResultFailed ||
+		claim.Processing != types.RunCompletenessPartial {
+		t.Fatalf("canonical empty failure claim = %+v", claim)
+	}
 }
 
 func TestPushPipelineWorkflow_RunOutcomeFaultMatrix(t *testing.T) {
@@ -418,7 +492,9 @@ func TestPushPipelineWorkflow_CanonicalBriefStagesBeforePush(t *testing.T) {
 				DiscoveredAt: time.Unix(10, 0).UTC(),
 			}},
 		}
-		return CanonicalBriefPrepareResult{Draft: &draft}, nil
+		return CanonicalBriefPrepareResult{
+			Draft: &draft, BatchID: draft.PushBatchID,
+		}, nil
 	})
 	reg("Push", func(_ context.Context, in PushIn) error {
 		mu.Lock()

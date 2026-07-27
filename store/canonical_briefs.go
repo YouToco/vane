@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -281,6 +282,11 @@ func finalizeRunOutcomeClaimTxV1(
 		return types.RunOutcomeV1{},
 			canonicalBriefNotFoundError("run outcome marker is unavailable")
 	}
+	claim, err = normalizeCanonicalBriefTerminalClaimV1(
+		ctx, tx, claim)
+	if err != nil {
+		return types.RunOutcomeV1{}, err
+	}
 	if stored.Status == "finalized" {
 		replayed, err := stored.finalized()
 		if err != nil {
@@ -510,7 +516,7 @@ func (s *Store) LoadPreparedBriefDraftV1(
 				errors.New("canonical Brief stage capability is unavailable"))
 	}
 	outcomeRow, found, err := loadRunOutcomeForSnapshotV1(
-		ctx, tx, ref.SnapshotID, false)
+		ctx, tx, ref.SnapshotID, true)
 	if err != nil {
 		return types.BriefDraftV1{}, false, err
 	}
@@ -534,6 +540,96 @@ func (s *Store) LoadPreparedBriefDraftV1(
 		return types.BriefDraftV1{}, false, nil
 	}
 	return stage.draft, true, nil
+}
+
+// LoadSealedEmptyBriefBatchV1 recovers the committed empty-plan receipt before
+// mutable task or tenant authorization is consulted. It is the nil-draft
+// counterpart of LoadPreparedBriefDraftV1.
+func (s *Store) LoadSealedEmptyBriefBatchV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	marker types.RunOutcomeMarkerV1,
+	traceID string,
+) (int64, bool, error) {
+	if err := expected.Validate(); err != nil ||
+		ref.Validate() != nil || marker.Validate() != nil ||
+		traceID == "" || traceID != strings.TrimSpace(traceID) ||
+		len(traceID) > 512 ||
+		marker.RunSnapshotID != ref.SnapshotID ||
+		marker.TenantID != expected.TenantID ||
+		marker.UserID != expected.UserID ||
+		marker.TaskID != expected.TaskID {
+		return 0, false, canonicalBriefValidationError(
+			"empty brief receipt lookup is invalid")
+	}
+	tx, err := s.beginCanonicalBriefTxV1(ctx, expected, ref)
+	if err != nil {
+		return 0, false, err
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockCanonicalBriefRunV1(ctx, tx, ref.SnapshotID); err != nil {
+		return 0, false, err
+	}
+	outcomeRow, found, err := loadRunOutcomeForSnapshotV1(
+		ctx, tx, ref.SnapshotID, true)
+	if err != nil {
+		return 0, false, err
+	}
+	if !found || outcomeRow.ID != marker.ID ||
+		outcomeRow.marker() != marker {
+		return 0, false, canonicalBriefNotFoundError(
+			"run outcome marker is unavailable")
+	}
+	if _, found, err := loadCanonicalBriefStageV1(
+		ctx, tx, marker.ID); err != nil {
+		return 0, false, err
+	} else if found {
+		return 0, false, nil
+	}
+	var batchID int64
+	var briefState, authority string
+	physicalKey := compiledPushBatchPhysicalKeyV1(ref.SnapshotID, traceID)
+	err = tx.QueryRow(ctx,
+		`SELECT id,brief_state,delivery_authority
+		   FROM push_batches
+		  WHERE tenant_id=$1 AND user_id=$2 AND schedule_id=$3
+		    AND run_snapshot_id=$4 AND idempotency_key=$5`,
+		expected.TenantID, expected.UserID, expected.TaskID, ref.SnapshotID,
+		physicalKey,
+	).Scan(&batchID, &briefState, &authority)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := commitCanonicalBriefTxV1(
+			ctx, tx, "commit absent empty brief receipt lookup"); err != nil {
+			return 0, false, err
+		}
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, canonicalBriefDatabaseError(
+			"load empty canonical Brief batch", err)
+	}
+	if briefState != "sealed" ||
+		authority != string(types.PushBatchDeliveryAuthorityEffect) {
+		if err := commitCanonicalBriefTxV1(
+			ctx, tx, "commit open empty brief receipt lookup"); err != nil {
+			return 0, false, err
+		}
+		return 0, false, nil
+	}
+	evidence, err := readBriefEvidenceV1(
+		ctx, tx, batchID, ref.SnapshotID)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(evidence) != 0 {
+		return 0, false, canonicalBriefIntegrityError()
+	}
+	if err := commitCanonicalBriefTxV1(
+		ctx, tx, "commit empty brief receipt lookup"); err != nil {
+		return 0, false, err
+	}
+	return batchID, true, nil
 }
 
 // PrepareBriefDraftV1 durably stages the exact post-delivery/pre-render
@@ -594,7 +690,7 @@ func (s *Store) PrepareBriefDraftV1(
 				errors.New("canonical Brief stage capability is unavailable"))
 	}
 	outcomeRow, found, err := loadRunOutcomeForSnapshotV1(
-		ctx, tx, ref.SnapshotID, false)
+		ctx, tx, ref.SnapshotID, true)
 	if err != nil {
 		return types.BriefDraftV1{}, err
 	}
@@ -731,6 +827,119 @@ func (s *Store) PrepareBriefDraftV1(
 		return types.BriefDraftV1{}, err
 	}
 	return draft, nil
+}
+
+// SealEmptyBriefBatchV1 closes the canonical namespace for an observation run
+// whose complete delivery plan is empty. No stage or Brief is created, but the
+// sealed batch makes the quiet result immutable and prevents a later writer
+// from attaching content to the same exact run.
+func (s *Store) SealEmptyBriefBatchV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	marker types.RunOutcomeMarkerV1,
+	batchID int64,
+) error {
+	if err := expected.Validate(); err != nil ||
+		ref.Validate() != nil || marker.Validate() != nil ||
+		batchID <= 0 ||
+		marker.RunSnapshotID != ref.SnapshotID ||
+		marker.TenantID != expected.TenantID ||
+		marker.UserID != expected.UserID ||
+		marker.TaskID != expected.TaskID {
+		return canonicalBriefValidationError(
+			"empty brief batch input is invalid")
+	}
+	tx, err := s.beginCanonicalBriefTxV1(ctx, expected, ref)
+	if err != nil {
+		return err
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockCanonicalBriefRunV1(ctx, tx, ref.SnapshotID); err != nil {
+		return err
+	}
+	available, err := canonicalBriefStageCapabilityV1(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !available {
+		return canonicalBriefDatabaseError(
+			"check empty canonical Brief capability",
+			errors.New("canonical Brief stage capability is unavailable"))
+	}
+	outcomeRow, found, err := loadRunOutcomeForSnapshotV1(
+		ctx, tx, ref.SnapshotID, true)
+	if err != nil {
+		return err
+	}
+	if !found || outcomeRow.ID != marker.ID ||
+		outcomeRow.marker() != marker || outcomeRow.Status != "pending" {
+		return canonicalBriefNotFoundError(
+			"pending run outcome marker is unavailable")
+	}
+	if _, found, err := loadCanonicalBriefStageV1(
+		ctx, tx, marker.ID); err != nil {
+		return err
+	} else if found {
+		return canonicalBriefConflictError(
+			"empty canonical Brief batch already has a stage")
+	}
+	var briefState, batchStatus, authority string
+	err = tx.QueryRow(ctx,
+		`SELECT brief_state,status,delivery_authority
+		   FROM push_batches
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		    AND schedule_id=$4 AND run_snapshot_id=$5
+		  FOR UPDATE`,
+		batchID, expected.TenantID, expected.UserID,
+		expected.TaskID, ref.SnapshotID,
+	).Scan(&briefState, &batchStatus, &authority)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return canonicalBriefNotFoundError(
+			"empty canonical Brief batch is unavailable")
+	}
+	if err != nil {
+		return canonicalBriefDatabaseError(
+			"lock empty canonical Brief batch", err)
+	}
+	if batchStatus != string(types.BatchStatusPending) ||
+		authority != string(types.PushBatchDeliveryAuthorityEffect) {
+		return canonicalBriefConflictError(
+			"empty canonical Brief batch authority differs")
+	}
+	var deliveryCount int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		  FROM read_canonical_brief_delivery_evidence_v1($1,$2)`,
+		batchID, ref.SnapshotID,
+	).Scan(&deliveryCount); err != nil {
+		return canonicalBriefDatabaseError(
+			"inspect empty canonical Brief batch", err)
+	}
+	if deliveryCount != 0 {
+		return canonicalBriefConflictError(
+			"empty canonical Brief batch contains delivery evidence")
+	}
+	switch briefState {
+	case "sealed":
+		// Exact response-loss replay.
+	case "open":
+		tag, err := tx.Exec(ctx,
+			`UPDATE push_batches SET brief_state='sealed'
+			  WHERE id=$1 AND brief_state='open'`, batchID)
+		if err != nil {
+			return canonicalBriefDatabaseError(
+				"seal empty canonical Brief batch", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return canonicalBriefConflictError(
+				"empty canonical Brief batch seal lost its CAS")
+		}
+	default:
+		return canonicalBriefIntegrityError()
+	}
+	return commitCanonicalBriefTxV1(
+		ctx, tx, "commit empty canonical Brief batch")
 }
 
 // FreezeBriefV1 persists one immutable, channel-neutral whole-Brief snapshot.

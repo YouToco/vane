@@ -205,6 +205,13 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		return nil, types.NewAppError(
 			types.CodeDatabase, "锁定推送效果 schema 准入", err)
 	}
+	var canonicalBriefStagesAvailable bool
+	if err := tx.QueryRow(ctx,
+		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL`,
+	).Scan(&canonicalBriefStagesAvailable); err != nil {
+		return nil, types.NewAppError(
+			types.CodeDatabase, "检查 canonical Brief 清理能力", err)
+	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
 		fmt.Sprintf("%d", tenantID)); err != nil {
@@ -361,6 +368,12 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 
 	rep := &PurgeReport{TenantID: tenantID, Rows: map[string]int64{}, DryRun: dryRun}
 	for _, st := range purgeOrder {
+		if st.table == "canonical_brief_stages" &&
+			!canonicalBriefStagesAvailable {
+			// A current binary may safely drain while migration 064 has
+			// already been rolled back to 063.
+			continue
+		}
 		// #nosec G201 -- table 与 where 都来自本文件的常量表，不含任何外部输入；
 		// tenant_id 走参数化的 $1。
 		tag, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s", st.table, st.where), tenantID)

@@ -1,6 +1,8 @@
 package store
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -164,6 +166,612 @@ func TestCanonicalBriefStageAbortsWithNonContentOutcome(t *testing.T) {
 	}
 	if status != "aborted" || !resolvedAt.Equal(outcome.FinalizedAt) {
 		t.Fatalf("aborted stage = %q/%v", status, resolvedAt)
+	}
+}
+
+func TestCanonicalBriefSealedEmptyReceiptRecoversQuiet(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 0)
+	marker, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winner, err := f.base.st.ClaimPushBatchDeliveryAuthority(
+		t.Context(),
+		types.PushBatchScope{
+			TenantID: f.identity.TenantID,
+			UserID:   f.identity.UserID,
+			BatchID:  f.batchID,
+		},
+		types.PushBatchDeliveryAuthorityEffect,
+	)
+	if err != nil || winner != types.PushBatchDeliveryAuthorityEffect {
+		t.Fatalf("effect authority=%q err=%v", winner, err)
+	}
+	if err := f.base.st.SealEmptyBriefBatchV1(
+		t.Context(), f.identity, f.ref, marker, f.batchID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	batchID, found, err := f.base.st.LoadSealedEmptyBriefBatchV1(
+		t.Context(), f.identity, f.ref, marker, f.traceID)
+	if err != nil || !found || batchID != f.batchID {
+		t.Fatalf("empty receipt batch=%d found=%t err=%v",
+			batchID, found, err)
+	}
+	if _, found, err := f.base.st.LoadSealedEmptyBriefBatchV1(
+		t.Context(), f.identity, f.ref, marker, f.traceID+"-other",
+	); err != nil || found {
+		t.Fatalf("wrong trace empty receipt found=%t err=%v", found, err)
+	}
+	if err := f.base.st.CompleteEmptyPushEffectBatch(
+		t.Context(),
+		types.PushBatchScope{
+			TenantID: f.identity.TenantID,
+			UserID:   f.identity.UserID,
+			BatchID:  f.batchID,
+		},
+		f.ref.SnapshotID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	failed := types.RunOutcomeClaimV1{
+		RunOutcomeMarkerV1: marker,
+		Result:             types.RunResultFailed,
+		SourceCoverage:     types.RunCompletenessPartial,
+		Processing:         types.RunCompletenessPartial,
+		FailureCode:        "workflow_failed",
+		FailureMessage:     "finalizer failed",
+	}
+	outcome, err := f.base.st.FinalizeRunOutcomeClaimV1(
+		t.Context(), f.identity, f.ref, failed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Result != types.RunResultQuiet ||
+		outcome.Processing != types.RunCompletenessPartial {
+		t.Fatalf("empty recovered outcome = %+v", outcome)
+	}
+	var status, briefState string
+	if err := f.base.st.pool.QueryRow(t.Context(),
+		`SELECT status,brief_state FROM push_batches WHERE id=$1`,
+		f.batchID).Scan(&status, &briefState); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(types.BatchStatusDone) || briefState != "sealed" {
+		t.Fatalf("empty batch terminal=%q/%q", status, briefState)
+	}
+}
+
+func TestCanonicalEmptyLegacyRaceFailsClosedAfterConcurrentSeal(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 0)
+	_, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winner, err := f.base.st.ClaimPushBatchDeliveryAuthority(
+		t.Context(),
+		types.PushBatchScope{
+			TenantID: f.identity.TenantID,
+			UserID:   f.identity.UserID,
+			BatchID:  f.batchID,
+		},
+		types.PushBatchDeliveryAuthorityEffect,
+	)
+	if err != nil || winner != types.PushBatchDeliveryAuthorityEffect {
+		t.Fatalf("effect authority=%q err=%v", winner, err)
+	}
+
+	// Leave an uncommitted canonical seal in front of the capability
+	// function's open-state recheck. The first plain read can still observe
+	// open, but FOR UPDATE must wait and then deny the legacy handoff.
+	sealer, err := f.base.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sealer.Rollback(t.Context()) }()
+	if _, err := sealer.Exec(t.Context(),
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		fmt.Sprint(f.identity.TenantID),
+		fmt.Sprint(f.identity.UserID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sealer.Exec(
+		t.Context(), `SET LOCAL ROLE vane_brief_writer`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sealer.Exec(t.Context(),
+		`UPDATE push_batches SET brief_state='sealed' WHERE id=$1`,
+		f.batchID); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- f.base.st.CompleteEmptyPushEffectBatch(
+			t.Context(),
+			types.PushBatchScope{
+				TenantID: f.identity.TenantID,
+				UserID:   f.identity.UserID,
+				BatchID:  f.batchID,
+			},
+			f.ref.SnapshotID,
+		)
+	}()
+	waitDeadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err := f.base.st.pool.QueryRow(t.Context(), `
+			SELECT EXISTS (
+			    SELECT 1 FROM pg_locks
+			     WHERE locktype IN ('transactionid','tuple')
+			       AND NOT granted
+			)`,
+		).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			t.Fatal("legacy empty completion did not wait for seal")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := sealer.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, types.ErrConflict) {
+			t.Fatalf("legacy race error=%v, want conflict", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("legacy empty completion did not resume")
+	}
+	var status, briefState string
+	if err := f.base.st.pool.QueryRow(t.Context(),
+		`SELECT status,brief_state FROM push_batches WHERE id=$1`,
+		f.batchID,
+	).Scan(&status, &briefState); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(types.BatchStatusPending) || briefState != "sealed" {
+		t.Fatalf("legacy race terminal=%q/%q", status, briefState)
+	}
+}
+
+func TestCanonicalBriefStagedEvidenceOverridesFailedRecovery(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 1)
+	marker, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.base.st.PrepareBriefDraftV1(
+		t.Context(), f.identity, f.ref, marker, f.batchID,
+		time.Date(2026, 7, 27, 8, 9, 10, 0, time.UTC),
+		f.deliveryID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	failed := types.RunOutcomeClaimV1{
+		RunOutcomeMarkerV1: marker,
+		Result:             types.RunResultFailed,
+		SourceCoverage:     types.RunCompletenessPartial,
+		Processing:         types.RunCompletenessPartial,
+		FailureCode:        "workflow_failed",
+		FailureMessage:     "finalizer failed",
+	}
+	outcome, err := f.base.st.FinalizeRecoveredRunOutcomeClaimV1(
+		t.Context(), f.identity, failed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Result != types.RunResultContent ||
+		outcome.Processing != types.RunCompletenessPartial {
+		t.Fatalf("staged recovered outcome = %+v", outcome)
+	}
+	replayed, err := f.base.st.FinalizeRecoveredRunOutcomeClaimV1(
+		t.Context(), f.identity, failed)
+	if err != nil || replayed.Digest != outcome.Digest ||
+		!replayed.FinalizedAt.Equal(outcome.FinalizedAt) {
+		t.Fatalf("normalized failed replay=%+v err=%v", replayed, err)
+	}
+	if _, found, err := f.base.st.LoadBriefV1(
+		t.Context(), f.identity, f.ref); err != nil || !found {
+		t.Fatalf("staged recovery Brief found=%t err=%v", found, err)
+	}
+}
+
+func TestCanonicalBriefFinalizedFailedAbortedStageReplaysAfterResponseLoss(
+	t *testing.T,
+) {
+	f := newCanonicalBriefFixture(t, 1)
+	marker, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.base.st.PrepareBriefDraftV1(
+		t.Context(), f.identity, f.ref, marker, f.batchID,
+		time.Date(2026, 7, 27, 8, 9, 10, 0, time.UTC),
+		f.deliveryID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	claim := types.RunOutcomeClaimV1{
+		RunOutcomeMarkerV1: marker,
+		Result:             types.RunResultFailed,
+		SourceCoverage:     types.RunCompletenessPartial,
+		Processing:         types.RunCompletenessPartial,
+		FailureCode:        "workflow_failed",
+		FailureMessage:     "old finalizer response was lost",
+	}
+	finalizedAt := time.Date(
+		2026, 7, 27, 9, 10, 11, 123456000, time.UTC)
+	terminal, err := claim.SealAt(finalizedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.base.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+	if _, err := tx.Exec(t.Context(),
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		fmt.Sprint(f.identity.TenantID),
+		fmt.Sprint(f.identity.UserID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(
+		t.Context(), `SET LOCAL ROLE vane_brief_writer`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `
+		UPDATE task_run_outcomes
+		   SET status='finalized',result=$2,source_coverage=$3,
+		       processing=$4,failure_code=$5,failure_message=$6,
+		       finalized_at=$7,outcome_digest=$8
+		 WHERE id=$1 AND status='pending'`,
+		terminal.ID, terminal.Result, terminal.SourceCoverage,
+		terminal.Processing, terminal.FailureCode, terminal.FailureMessage,
+		terminal.FinalizedAt, terminal.Digest,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `
+		UPDATE canonical_brief_stages
+		   SET status='aborted',resolved_at=$2
+		 WHERE run_outcome_id=$1 AND status='staged'`,
+		terminal.ID, terminal.FinalizedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := f.base.st.FinalizeRunOutcomeClaimV1(
+		t.Context(), f.identity, f.ref, claim)
+	if err != nil {
+		t.Fatalf("exact old failed/aborted replay: %v", err)
+	}
+	if replayed.Digest != terminal.Digest ||
+		!replayed.FinalizedAt.Equal(terminal.FinalizedAt) {
+		t.Fatalf("failed/aborted replay=%+v want=%+v", replayed, terminal)
+	}
+	different := claim
+	different.FailureMessage = "different terminal receipt"
+	if _, err := f.base.st.FinalizeRunOutcomeClaimV1(
+		t.Context(), f.identity, f.ref, different,
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("different failed/aborted replay error=%v, want conflict", err)
+	}
+}
+
+func TestMigration064StageInsertSerializesOutcomeFinalization(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 1)
+	marker, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealCanonicalTestBatch(t, f)
+	draft, err := (types.BriefDraftV1{
+		SchemaVersion: types.BriefSchemaVersionV1,
+		RunOutcomeID:  marker.ID,
+		RunSnapshotID: marker.RunSnapshotID,
+		PushBatchID:   f.batchID,
+		TenantID:      marker.TenantID,
+		UserID:        marker.UserID,
+		TaskID:        marker.TaskID,
+		GeneratedAt:   time.Date(2026, 7, 27, 9, 10, 11, 0, time.UTC),
+		Insights: []types.InsightV1{{
+			ID: f.deliveryID[0], RankPosition: 1,
+			Title: f.itemTitle[0], BodyMD: f.bodyMD[0],
+			SourceTitle: f.sourceName, SourceURL: f.itemURL[0],
+			PublishedAt: f.published[0], DiscoveredAt: f.deliveryAt[0],
+		}},
+	}).Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := draft.RequestDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageTx, err := f.base.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stageTx.Rollback(t.Context()) }()
+	if _, err := stageTx.Exec(t.Context(),
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		fmt.Sprint(f.identity.TenantID),
+		fmt.Sprint(f.identity.UserID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stageTx.Exec(
+		t.Context(), `SET LOCAL ROLE vane_brief_writer`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stageTx.Exec(t.Context(), `
+		INSERT INTO canonical_brief_stages (
+		    run_outcome_id,tenant_id,user_id,task_id,run_snapshot_id,
+		    push_batch_id,schema_version,request_digest,payload,
+		    insight_count,generated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		draft.RunOutcomeID, draft.TenantID, draft.UserID, draft.TaskID,
+		draft.RunSnapshotID, draft.PushBatchID, draft.SchemaVersion,
+		digest, payload, len(draft.Insights), draft.GeneratedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	claim := types.RunOutcomeClaimV1{
+		RunOutcomeMarkerV1: marker,
+		Result:             types.RunResultContent,
+		SourceCoverage:     types.RunCompletenessComplete,
+		Processing:         types.RunCompletenessComplete,
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, finalizeErr := f.base.st.FinalizeRunOutcomeClaimV1(
+			t.Context(), f.identity, f.ref, claim)
+		done <- finalizeErr
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("finalizer crossed uncommitted stage admission: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := stageTx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("finalizer did not resume after stage commit")
+	}
+	var outcomeStatus, stageStatus string
+	if err := f.base.st.pool.QueryRow(t.Context(), `
+		SELECT o.status,s.status
+		  FROM task_run_outcomes o
+		  JOIN canonical_brief_stages s ON s.run_outcome_id=o.id
+		 WHERE o.id=$1`,
+		marker.ID,
+	).Scan(&outcomeStatus, &stageStatus); err != nil {
+		t.Fatal(err)
+	}
+	if outcomeStatus != "finalized" || stageStatus != "promoted" {
+		t.Fatalf("serialized terminal=%q/%q", outcomeStatus, stageStatus)
+	}
+}
+
+func TestMigration064StageAdmissionRequiresWriterAndExactSessionScope(
+	t *testing.T,
+) {
+	f := newCanonicalBriefFixture(t, 1)
+	marker, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealCanonicalTestBatch(t, f)
+	draft, err := (types.BriefDraftV1{
+		SchemaVersion: types.BriefSchemaVersionV1,
+		RunOutcomeID:  marker.ID,
+		RunSnapshotID: marker.RunSnapshotID,
+		PushBatchID:   f.batchID,
+		TenantID:      marker.TenantID,
+		UserID:        marker.UserID,
+		TaskID:        marker.TaskID,
+		GeneratedAt:   time.Date(2026, 7, 27, 9, 10, 11, 0, time.UTC),
+		Insights: []types.InsightV1{{
+			ID: f.deliveryID[0], RankPosition: 1,
+			Title: f.itemTitle[0], BodyMD: f.bodyMD[0],
+			SourceTitle: f.sourceName, SourceURL: f.itemURL[0],
+			PublishedAt: f.published[0], DiscoveredAt: f.deliveryAt[0],
+		}},
+	}).Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := draft.RequestDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert := func(
+		t *testing.T,
+		asWriter bool,
+		tenantSetting, userSetting *int64,
+	) error {
+		t.Helper()
+		tx, err := f.base.st.pool.Begin(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(t.Context()) }()
+		if tenantSetting != nil {
+			if _, err := tx.Exec(t.Context(),
+				`SELECT set_config('app.tenant_id',$1,true)`,
+				fmt.Sprint(*tenantSetting)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if userSetting != nil {
+			if _, err := tx.Exec(t.Context(),
+				`SELECT set_config('app.user_id',$1,true)`,
+				fmt.Sprint(*userSetting)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if asWriter {
+			if _, err := tx.Exec(
+				t.Context(), `SET LOCAL ROLE vane_brief_writer`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, err = tx.Exec(t.Context(), `
+			INSERT INTO canonical_brief_stages (
+			    run_outcome_id,tenant_id,user_id,task_id,run_snapshot_id,
+			    push_batch_id,schema_version,request_digest,payload,
+			    insight_count,generated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			draft.RunOutcomeID, draft.TenantID, draft.UserID, draft.TaskID,
+			draft.RunSnapshotID, draft.PushBatchID, draft.SchemaVersion,
+			digest, payload, len(draft.Insights), draft.GeneratedAt,
+		)
+		return err
+	}
+	wrongTenant := f.identity.TenantID + 1000
+	wrongUser := f.identity.UserID + 1000
+	tests := []struct {
+		name                       string
+		asWriter                   bool
+		tenantSetting, userSetting *int64
+	}{
+		{name: "wrong current user"},
+		{name: "missing scope", asWriter: true},
+		{
+			name: "wrong tenant", asWriter: true,
+			tenantSetting: &wrongTenant, userSetting: &f.identity.UserID,
+		},
+		{
+			name: "wrong user", asWriter: true,
+			tenantSetting: &f.identity.TenantID, userSetting: &wrongUser,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := insert(
+				t, test.asWriter, test.tenantSetting, test.userSetting,
+			); err == nil {
+				t.Fatal("stage admission crossed role/session boundary")
+			}
+		})
+	}
+}
+
+func TestCanonicalEmptyCompletionSerializesFailedFinalizer(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 0)
+	marker, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winner, err := f.base.st.ClaimPushBatchDeliveryAuthority(
+		t.Context(),
+		types.PushBatchScope{
+			TenantID: f.identity.TenantID,
+			UserID:   f.identity.UserID,
+			BatchID:  f.batchID,
+		},
+		types.PushBatchDeliveryAuthorityEffect,
+	)
+	if err != nil || winner != types.PushBatchDeliveryAuthorityEffect {
+		t.Fatalf("effect authority=%q err=%v", winner, err)
+	}
+	if err := f.base.st.SealEmptyBriefBatchV1(
+		t.Context(), f.identity, f.ref, marker, f.batchID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	receiptTx, err := f.base.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = receiptTx.Rollback(t.Context()) }()
+	if _, err := receiptTx.Exec(t.Context(),
+		`SELECT set_config('app.tenant_id',$1,true)`,
+		fmt.Sprint(f.identity.TenantID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := receiptTx.Exec(
+		t.Context(), `SET LOCAL ROLE vane_push_effect_receipt`); err != nil {
+		t.Fatal(err)
+	}
+	var decision string
+	if err := receiptTx.QueryRow(t.Context(), `
+		SELECT complete_canonical_empty_push_batch_v1($1,$2,$3,$4)`,
+		f.identity.TenantID, f.identity.UserID,
+		f.batchID, f.ref.SnapshotID,
+	).Scan(&decision); err != nil {
+		t.Fatal(err)
+	}
+	if decision != "done" {
+		t.Fatalf("empty receipt decision = %q", decision)
+	}
+	failed := types.RunOutcomeClaimV1{
+		RunOutcomeMarkerV1: marker,
+		Result:             types.RunResultFailed,
+		SourceCoverage:     types.RunCompletenessPartial,
+		Processing:         types.RunCompletenessPartial,
+		FailureCode:        "workflow_failed",
+		FailureMessage:     "push response was lost",
+	}
+	type finalizeResult struct {
+		outcome types.RunOutcomeV1
+		err     error
+	}
+	done := make(chan finalizeResult, 1)
+	go func() {
+		outcome, finalizeErr := f.base.st.FinalizeRunOutcomeClaimV1(
+			t.Context(), f.identity, f.ref, failed)
+		done <- finalizeResult{outcome: outcome, err: finalizeErr}
+	}()
+	select {
+	case result := <-done:
+		t.Fatalf("finalizer crossed uncommitted empty receipt: %+v", result)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := receiptTx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.outcome.Result != types.RunResultQuiet {
+			t.Fatalf("serialized empty outcome = %+v", result.outcome)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("finalizer did not resume after empty receipt commit")
 	}
 }
 

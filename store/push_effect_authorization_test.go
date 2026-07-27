@@ -1,7 +1,10 @@
 package store
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +15,268 @@ import (
 	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/types"
 )
+
+func TestClaimAuthorizedPushEffectHonorsCanonicalTerminalAdmission(t *testing.T) {
+	f, effect := authorizedPushEffectFixture(t)
+	payload := []byte("{}")
+	sum := sha256.Sum256(payload)
+	requestDigest := hex.EncodeToString(sum[:])
+	var outcomeID int64
+	tx, err := f.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+	if _, err := tx.Exec(t.Context(),
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		fmt.Sprint(effect.TenantID), fmt.Sprint(effect.UserID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(
+		t.Context(), `SET LOCAL ROLE vane_brief_writer`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(),
+		`UPDATE push_batches SET brief_state='sealed' WHERE id=$1`,
+		effect.BatchID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRow(t.Context(), `
+		INSERT INTO task_run_outcomes (
+		    tenant_id,user_id,task_id,run_snapshot_id,schema_version
+		) VALUES ($1,$2,$3,$4,$5)
+		RETURNING id`,
+		effect.TenantID, effect.UserID, effect.TaskID,
+		effect.RunSnapshotID, types.RunOutcomeSchemaVersionV1,
+	).Scan(&outcomeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `
+		INSERT INTO canonical_brief_stages (
+		    run_outcome_id,tenant_id,user_id,task_id,run_snapshot_id,
+		    push_batch_id,schema_version,request_digest,payload,
+		    insight_count,generated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1,clock_timestamp())`,
+		outcomeID, effect.TenantID, effect.UserID, effect.TaskID,
+		effect.RunSnapshotID, effect.BatchID, types.BriefSchemaVersionV1,
+		requestDigest, payload,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(cleanupCtx, t, f.st,
+			`DELETE FROM canonical_brief_stages WHERE run_outcome_id=$1`,
+			outcomeID)
+		cleanupExec(cleanupCtx, t, f.st,
+			`DELETE FROM task_run_outcomes WHERE id=$1`, outcomeID)
+	})
+	params := pusheffect.AuthorizedClaimParams{
+		ClaimParams: pusheffect.ClaimParams{
+			Scope: effect.Scope(), LeaseOwner: "canonical-pending-denied",
+			LeaseDuration: time.Minute,
+		},
+		ExpectedTaskID: effect.TaskID, DenialRetryAfter: time.Minute,
+	}
+	claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+		t.Context(), params)
+	if err != nil || claimed != nil ||
+		decision != pusheffect.AuthorizedClaimDenied {
+		t.Fatalf("staged claim=%+v decision=%q err=%v",
+			claimed, decision, err)
+	}
+
+	tx, err = f.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+	if _, err := tx.Exec(t.Context(),
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		fmt.Sprint(effect.TenantID), fmt.Sprint(effect.UserID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(
+		t.Context(), `SET LOCAL ROLE vane_brief_writer`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `
+		WITH finalized AS (
+		    UPDATE task_run_outcomes
+		       SET status='finalized',result='interrupted',
+		           source_coverage='partial',processing='partial',
+		           failure_code='workflow_terminated',
+		           failure_message='workflow was terminated',
+		           finalized_at=clock_timestamp(),
+		           outcome_digest=$2
+		     WHERE id=$1
+		     RETURNING finalized_at
+		)
+		UPDATE canonical_brief_stages
+		   SET status='aborted',
+		       resolved_at=(SELECT finalized_at FROM finalized)
+		 WHERE run_outcome_id=$1`,
+		outcomeID, strings.Repeat("0", 64),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.pool.Exec(t.Context(),
+		`UPDATE push_effects SET next_attempt_at=clock_timestamp()
+		  WHERE id=$1`,
+		effect.ID); err != nil {
+		t.Fatal(err)
+	}
+	params.LeaseOwner = "canonical-aborted-denied"
+	claimed, decision, err = f.st.ClaimAuthorizedPushEffect(
+		t.Context(), params)
+	if err != nil || claimed != nil ||
+		decision != pusheffect.AuthorizedClaimDenied {
+		t.Fatalf("aborted claim=%+v decision=%q err=%v",
+			claimed, decision, err)
+	}
+}
+
+func TestClaimAuthorizedPushEffectAllowsPromotedCanonicalContent(t *testing.T) {
+	f, effect := authorizedPushEffectFixture(t)
+	payload := []byte("{}")
+	sum := sha256.Sum256(payload)
+	requestDigest := hex.EncodeToString(sum[:])
+	generatedAt := time.Date(2026, 7, 27, 10, 11, 12, 0, time.UTC)
+	var outcomeID int64
+	tx, err := f.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+	if _, err := tx.Exec(t.Context(),
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		fmt.Sprint(effect.TenantID), fmt.Sprint(effect.UserID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(
+		t.Context(), `SET LOCAL ROLE vane_brief_writer`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(),
+		`UPDATE push_batches SET brief_state='sealed' WHERE id=$1`,
+		effect.BatchID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRow(t.Context(), `
+		INSERT INTO task_run_outcomes (
+		    tenant_id,user_id,task_id,run_snapshot_id,schema_version
+		) VALUES ($1,$2,$3,$4,$5)
+		RETURNING id`,
+		effect.TenantID, effect.UserID, effect.TaskID,
+		effect.RunSnapshotID, types.RunOutcomeSchemaVersionV1,
+	).Scan(&outcomeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `
+		INSERT INTO canonical_brief_stages (
+		    run_outcome_id,tenant_id,user_id,task_id,run_snapshot_id,
+		    push_batch_id,schema_version,request_digest,payload,
+		    insight_count,generated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1,$10)`,
+		outcomeID, effect.TenantID, effect.UserID, effect.TaskID,
+		effect.RunSnapshotID, effect.BatchID, types.BriefSchemaVersionV1,
+		requestDigest, payload, generatedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var briefID int64
+	finalizedAt := time.Date(2026, 7, 27, 10, 12, 13, 0, time.UTC)
+	tx, err = f.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+	if _, err := tx.Exec(t.Context(),
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		fmt.Sprint(effect.TenantID), fmt.Sprint(effect.UserID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(
+		t.Context(), `SET LOCAL ROLE vane_brief_writer`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `
+		UPDATE task_run_outcomes
+		   SET status='finalized',result='content',
+		       source_coverage='partial',processing='partial',
+		       finalized_at=$2,outcome_digest=$3
+		 WHERE id=$1`,
+		outcomeID, finalizedAt, strings.Repeat("1", 64),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRow(t.Context(), `
+		INSERT INTO brief_snapshots (
+		    id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,
+		    push_batch_id,schema_version,request_digest,payload_digest,
+		    payload,insight_count,generated_at
+		) VALUES (
+		    nextval('brief_snapshots_id_seq'),$1,$2,$3,$4,$5,$6,$7,
+		    $8,$9,$10,1,$11
+		) RETURNING id`,
+		effect.TenantID, effect.UserID, effect.TaskID, outcomeID,
+		effect.RunSnapshotID, effect.BatchID, types.BriefSchemaVersionV1,
+		requestDigest, strings.Repeat("2", 64), payload, generatedAt,
+	).Scan(&briefID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `
+		UPDATE canonical_brief_stages
+		   SET status='promoted',brief_snapshot_id=$2,resolved_at=$3
+		 WHERE run_outcome_id=$1`,
+		outcomeID, briefID, finalizedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(cleanupCtx, t, f.st,
+			`DELETE FROM canonical_brief_stages WHERE run_outcome_id=$1`,
+			outcomeID)
+		cleanupExec(cleanupCtx, t, f.st,
+			`DELETE FROM brief_snapshots WHERE id=$1`, briefID)
+		cleanupExec(cleanupCtx, t, f.st,
+			`DELETE FROM task_run_outcomes WHERE id=$1`, outcomeID)
+	})
+	claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
+		t.Context(),
+		pusheffect.AuthorizedClaimParams{
+			ClaimParams: pusheffect.ClaimParams{
+				Scope: effect.Scope(), LeaseOwner: "canonical-promoted",
+				LeaseDuration: time.Minute,
+			},
+			ExpectedTaskID: effect.TaskID, DenialRetryAfter: time.Minute,
+		},
+	)
+	if err != nil || decision != pusheffect.AuthorizedClaimed ||
+		claimed == nil || claimed.Status != pusheffect.StatusSending {
+		t.Fatalf("promoted claim=%+v decision=%q err=%v",
+			claimed, decision, err)
+	}
+}
 
 func TestClaimAuthorizedPushEffectIsExactAndBacksOffLiveDenial(t *testing.T) {
 	t.Run("authorized exact task claims", func(t *testing.T) {

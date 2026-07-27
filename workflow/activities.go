@@ -293,10 +293,18 @@ type CanonicalBriefStoreV1 interface {
 		context.Context, types.RunIdentity, types.RunSnapshotRef,
 		types.RunOutcomeMarkerV1,
 	) (types.BriefDraftV1, bool, error)
+	LoadSealedEmptyBriefBatchV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1, string,
+	) (int64, bool, error)
 	PrepareBriefDraftV1(
 		context.Context, types.RunIdentity, types.RunSnapshotRef,
 		types.RunOutcomeMarkerV1, int64, time.Time, []int64,
 	) (types.BriefDraftV1, error)
+	SealEmptyBriefBatchV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1, int64,
+	) error
 }
 
 type CompiledRunSnapshotShadowV2Store interface {
@@ -621,7 +629,9 @@ type CanonicalBriefPrepareIn struct {
 }
 
 type CanonicalBriefPrepareResult struct {
-	Draft *types.BriefDraftV1 `json:"draft,omitempty"`
+	Draft   *types.BriefDraftV1 `json:"draft,omitempty"`
+	BatchID int64               `json:"batch_id"`
+	Empty   bool                `json:"empty"`
 }
 
 type FetchOutcomeResult struct {
@@ -692,6 +702,7 @@ type PushIn struct {
 	// no delivery/Brief exists.
 	CanonicalOutcome *types.RunOutcomeMarkerV1 `json:"canonical_outcome,omitempty"`
 	CanonicalBrief   *types.BriefDraftV1       `json:"canonical_brief,omitempty"`
+	CanonicalBatchID int64                     `json:"canonical_batch_id,omitempty"`
 }
 
 // RecordEmptyIn 是 RecordEmptyBatch Activity 的入参（009 / 契约 §16「空批次缺口」）。
@@ -1020,7 +1031,19 @@ func (a *Activities) PrepareCanonicalBriefV1(
 					"canonical Brief response-loss replay differs",
 					nil))
 		}
-		return CanonicalBriefPrepareResult{Draft: &draft}, nil
+		return CanonicalBriefPrepareResult{
+			Draft: &draft, BatchID: draft.PushBatchID,
+		}, nil
+	}
+	if batchID, empty, loadErr :=
+		a.canonicalBriefStore.LoadSealedEmptyBriefBatchV1(
+			ctx, expected, in.Run.Snapshot, in.Marker, in.TraceID,
+		); loadErr != nil {
+		return CanonicalBriefPrepareResult{}, retryableOrNot(loadErr)
+	} else if empty {
+		return CanonicalBriefPrepareResult{
+			BatchID: batchID, Empty: true,
+		}, nil
 	}
 
 	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(
@@ -1096,7 +1119,14 @@ func (a *Activities) PrepareCanonicalBriefV1(
 		return CanonicalBriefPrepareResult{}, err
 	}
 	if len(plan.orderedDeliveryIDs) == 0 {
-		return CanonicalBriefPrepareResult{}, nil
+		if err := a.canonicalBriefStore.SealEmptyBriefBatchV1(
+			ctx, expected, in.Run.Snapshot, in.Marker, batchID,
+		); err != nil {
+			return CanonicalBriefPrepareResult{}, retryableOrNot(err)
+		}
+		return CanonicalBriefPrepareResult{
+			BatchID: batchID, Empty: true,
+		}, nil
 	}
 	draft, err := a.canonicalBriefStore.PrepareBriefDraftV1(
 		ctx, expected, in.Run.Snapshot, in.Marker, batchID,
@@ -1104,7 +1134,9 @@ func (a *Activities) PrepareCanonicalBriefV1(
 	if err != nil {
 		return CanonicalBriefPrepareResult{}, retryableOrNot(err)
 	}
-	return CanonicalBriefPrepareResult{Draft: &draft}, nil
+	return CanonicalBriefPrepareResult{
+		Draft: &draft, BatchID: batchID,
+	}, nil
 }
 
 func (a *Activities) observationRolloutForTask(
@@ -3135,7 +3167,7 @@ func validateCanonicalPushEnvelopeV1(
 	identity types.RunIdentity,
 ) error {
 	if in.CanonicalOutcome == nil {
-		if in.CanonicalBrief != nil {
+		if in.CanonicalBrief != nil || in.CanonicalBatchID != 0 {
 			return types.NewAppError(types.CodeValidation,
 				"canonical Brief is missing its outcome marker", nil)
 		}
@@ -3143,6 +3175,7 @@ func validateCanonicalPushEnvelopeV1(
 	}
 	marker := *in.CanonicalOutcome
 	if in.Run == nil || marker.Validate() != nil ||
+		in.CanonicalBatchID < 0 ||
 		marker.RunSnapshotID != in.Run.Snapshot.SnapshotID ||
 		marker.TenantID != identity.TenantID ||
 		marker.UserID != identity.UserID ||
@@ -3157,6 +3190,8 @@ func validateCanonicalPushEnvelopeV1(
 	if err != nil ||
 		draft.RunOutcomeID != marker.ID ||
 		draft.RunSnapshotID != marker.RunSnapshotID ||
+		(in.CanonicalBatchID > 0 &&
+			draft.PushBatchID != in.CanonicalBatchID) ||
 		draft.TenantID != marker.TenantID ||
 		draft.UserID != marker.UserID ||
 		draft.TaskID != marker.TaskID {
@@ -3292,6 +3327,36 @@ func planPushChunks(
 // 收件人是飞书 owner（M3 单用户）；无 owner 直接失败。单卡推送失败跳过，
 // 只要有一张成功就算 done，全失败则 failed 并返回错误。
 func (a *Activities) Push(ctx context.Context, in PushIn) error {
+	// A v2 nil-draft command is a receipt-only continuation. Preparation
+	// already froze the exact sealed empty batch, so completing it must not
+	// re-read mutable task/member authorization or re-run observation claims.
+	if in.CanonicalOutcome != nil && in.CanonicalBrief == nil &&
+		in.CanonicalBatchID > 0 {
+		if in.Run == nil || a.pushEffectStore == nil {
+			return nonRetryable(types.NewAppError(
+				types.CodeConflict,
+				"canonical empty push receipt is unavailable", nil))
+		}
+		expected, err := activityRunIdentityV1(ctx, in.UserID, in.Run)
+		if err != nil {
+			return nonRetryable(err)
+		}
+		if err := validateCanonicalPushEnvelopeV1(
+			in, expected); err != nil {
+			return nonRetryable(err)
+		}
+		return retryableOrNot(
+			a.pushEffectStore.CompleteEmptyPushEffectBatch(
+				ctx,
+				types.PushBatchScope{
+					TenantID: expected.TenantID,
+					UserID:   expected.UserID,
+					BatchID:  in.CanonicalBatchID,
+				},
+				in.Run.Snapshot.SnapshotID,
+			),
+		)
+	}
 	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
 		return retryableOrNot(err)
@@ -3357,6 +3422,12 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	}
 	if err != nil {
 		return err
+	}
+	if in.CanonicalOutcome != nil && in.CanonicalBatchID > 0 &&
+		batchID != in.CanonicalBatchID {
+		return nonRetryable(types.NewAppError(
+			types.CodeConflict,
+			"canonical push batch differs from prepared batch", nil))
 	}
 	effectAuthority := false
 	newEffectSendsEnabled := false
@@ -3554,25 +3625,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	if effectAuthority {
 		planningMarker = pushEffectMarkerWidthSeed
 	}
-	shadowCards := a.renderCanonicalBriefShadowV1(
-		in.CanonicalBrief, pending, planningMarker, buildChunk)
 	plannedChunks := planPushChunks(pending, planningMarker, buildChunk)
-	if in.CanonicalBrief != nil && len(shadowCards) > 0 {
-		mismatches := 0
-		if len(shadowCards) != len(plannedChunks) {
-			mismatches++
-		}
-		for index := 0; index < min(len(shadowCards), len(plannedChunks)); index++ {
-			if shadowCards[index] != plannedChunks[index].cardJSON {
-				mismatches++
-			}
-		}
-		if mismatches != 0 {
-			slog.Warn("canonical Brief shadow render mismatch",
-				"run_outcome_id", in.CanonicalBrief.RunOutcomeID,
-				"mismatches", mismatches)
-		}
-	}
 	if effectAuthority {
 		targetProvider, ok := a.feishu.(pushEffectTargetProvider)
 		if !ok {

@@ -28,6 +28,7 @@ type canonicalBriefFixture struct {
 	itemURL    []string
 	published  []*time.Time
 	sourceName string
+	traceID    string
 }
 
 func newCanonicalBriefFixture(t *testing.T, deliveries int) *canonicalBriefFixture {
@@ -119,14 +120,16 @@ func newCanonicalBriefFixture(t *testing.T, deliveries int) *canonicalBriefFixtu
 	if err := tx.Commit(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	traceID := "brief-" + uuid.NewString()
 	batchID, err := base.st.CreatePushBatchForTaskRunV1(
-		t.Context(), identity, ref, "brief-"+uuid.NewString())
+		t.Context(), identity, ref, traceID)
 	if err != nil {
 		t.Fatalf("create exact batch: %v", err)
 	}
 	f := &canonicalBriefFixture{
 		base: base, identity: identity, ref: ref, batchID: batchID,
 		sourceID: sourceIDs[0], sourceName: "approved 0",
+		traceID: traceID,
 	}
 	for i := range deliveries {
 		itemURL := fmt.Sprintf("https://brief.test/%s/%d", uuid.NewString(), i)

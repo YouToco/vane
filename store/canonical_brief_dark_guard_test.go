@@ -20,8 +20,9 @@ func TestCanonicalBriefP1CHasOnlyScopedProductionCallPoints(t *testing.T) {
 	}
 	root := filepath.Dir(filepath.Dir(thisFile))
 	protected := map[string]bool{
-		"FreezeBriefV1": true,
-		"LoadBriefV1":   true,
+		"FreezeBriefV1":                true,
+		"LoadBriefV1":                  true,
+		"renderCanonicalBriefShadowV1": true,
 	}
 	scoped := map[string]map[string]bool{
 		"CreatePendingRunOutcomeV1": {
@@ -34,6 +35,12 @@ func TestCanonicalBriefP1CHasOnlyScopedProductionCallPoints(t *testing.T) {
 			"workflow/activities.go": true,
 		},
 		"PrepareBriefDraftV1": {
+			"workflow/activities.go": true,
+		},
+		"LoadSealedEmptyBriefBatchV1": {
+			"workflow/activities.go": true,
+		},
+		"SealEmptyBriefBatchV1": {
 			"workflow/activities.go": true,
 		},
 		"ListStaleRunOutcomeCandidatesV1": {

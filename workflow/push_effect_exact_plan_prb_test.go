@@ -926,6 +926,7 @@ type prbActivityEffectStore struct {
 	definite []string
 	settles  int
 	desired  []types.PushBatchDeliveryAuthority
+	empty    []types.PushBatchScope
 }
 
 func newPRBActivityEffectStore(
@@ -1039,11 +1040,14 @@ func (s *prbActivityEffectStore) ListPushEffectsForBatch(
 	return result, nil
 }
 
-func (*prbActivityEffectStore) CompleteEmptyPushEffectBatch(
-	context.Context,
-	types.PushBatchScope,
-	int64,
+func (s *prbActivityEffectStore) CompleteEmptyPushEffectBatch(
+	_ context.Context,
+	scope types.PushBatchScope,
+	_ int64,
 ) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.empty = append(s.empty, scope)
 	return nil
 }
 
