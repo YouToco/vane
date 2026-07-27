@@ -188,7 +188,11 @@ GRANT EXECUTE ON FUNCTION
 -- +goose Down
 
 -- Recovery must remain available until every pre-downgrade marker has reached
--- an immutable terminal state.
+-- an immutable terminal state. Canonical outcome writers hold the matching
+-- shared transaction fence, so this drains admitted writers and prevents a
+-- fresh marker from committing between the check and recovery teardown.
+SELECT pg_advisory_xact_lock(6215335020355474248);
+
 -- +goose StatementBegin
 DO $$
 BEGIN

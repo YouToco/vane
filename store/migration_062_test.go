@@ -176,3 +176,94 @@ func TestMigration062DownRefusesPendingOutcome(t *testing.T) {
 		t.Fatalf("failed Down changed migration version to %d", version)
 	}
 }
+
+func TestMigration062DownDrainsAdmittedOutcomeWriter(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 0)
+	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writer, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerDone := false
+	defer func() {
+		if !writerDone {
+			_ = writer.Rollback()
+		}
+	}()
+	if _, err := writer.ExecContext(t.Context(),
+		`SELECT pg_advisory_xact_lock_shared(6215335020355474248)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.ExecContext(t.Context(), `
+		SELECT set_config('app.tenant_id',$1,true),
+		       set_config('app.user_id',$2,true)`,
+		fmt.Sprint(f.identity.TenantID),
+		fmt.Sprint(f.identity.UserID),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.ExecContext(t.Context(),
+		`SET LOCAL ROLE vane_brief_writer`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.ExecContext(t.Context(), `
+		INSERT INTO task_run_outcomes (
+		    tenant_id,user_id,task_id,run_snapshot_id,schema_version
+		) VALUES ($1,$2,$3,$4,'vane.run-outcome/v1')`,
+		f.identity.TenantID, f.identity.UserID,
+		f.identity.TaskID, f.ref.SnapshotID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	downDone := make(chan error, 1)
+	go func() {
+		_, downErr := provider.DownTo(t.Context(), 61)
+		downDone <- downErr
+	}()
+	select {
+	case err := <-downDone:
+		t.Fatalf("062 Down crossed an admitted outcome writer: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := writer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	writerDone = true
+
+	select {
+	case err := <-downDone:
+		if err == nil || !strings.Contains(
+			err.Error(), "refusing downgrade while pending run outcomes exist",
+		) {
+			t.Fatalf("062 Down did not observe admitted pending marker: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("062 Down did not converge after admitted writer committed")
+	}
+}
+
+func TestMigration062DownUsesCanonicalWriterFence(t *testing.T) {
+	raw, err := fs.ReadFile(
+		migrationsFS, "migrations/062_run_outcome_recovery.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw),
+		"SELECT pg_advisory_xact_lock(6215335020355474248)") {
+		t.Fatal("062 Down lacks the canonical writer admission fence")
+	}
+}
