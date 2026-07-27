@@ -1,0 +1,474 @@
+-- 061: channel-neutral RunOutcomeV1 + BriefV1 dark store.
+--
+-- This migration has no workflow/API call point. It establishes the exact-run
+-- identity, immutable whole-Brief payload, persisted rank, RLS, and a dedicated
+-- least-privilege writer before P1-B/P1-C connect any production lifecycle.
+
+-- +goose Up
+
+-- Composite scope keys let the new rows prove tenant/user/task ownership with
+-- ordinary FKs. The leading id is already unique, so these constraints do not
+-- change old lookup semantics or the retained idempotency arbiter.
+ALTER TABLE task_run_snapshots
+    ADD CONSTRAINT uq_task_run_snapshots_brief_scope
+    UNIQUE (id,tenant_id,user_id,task_id);
+
+ALTER TABLE push_batches
+    ADD COLUMN brief_state TEXT NOT NULL DEFAULT 'open',
+    ADD CONSTRAINT ck_push_batches_brief_state
+        CHECK (brief_state IN ('open','sealed')),
+    ADD CONSTRAINT uq_push_batches_brief_scope
+    UNIQUE (id,tenant_id,user_id,schedule_id,run_snapshot_id);
+
+-- The legacy vane_app table grant predates this column. A trigger therefore
+-- enforces the new authority independently of ambient table-level INSERT /
+-- UPDATE: normal writers may only create open batches, and only the dedicated
+-- role may perform the one-way open->sealed transition.
+-- +goose StatementBegin
+CREATE FUNCTION enforce_brief_batch_state_authority_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+BEGIN
+    IF TG_OP='INSERT' THEN
+        IF NEW.brief_state<>'open' THEN
+            RAISE EXCEPTION '061: new push batch must start open';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF current_user<>'vane_brief_writer' OR
+       OLD.brief_state<>'open' OR NEW.brief_state<>'sealed' THEN
+        RAISE EXCEPTION '061: brief batch seal authority denied';
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION enforce_brief_batch_state_authority_v1()
+    FROM PUBLIC;
+
+CREATE TRIGGER push_batches_brief_state_authority_v1
+BEFORE INSERT OR UPDATE OF brief_state ON push_batches
+FOR EACH ROW EXECUTE FUNCTION enforce_brief_batch_state_authority_v1();
+
+-- Serialize delivery creation with Brief freeze without granting the dark
+-- writer broad UPDATE on deliveries. Every insert takes a key-share lock on
+-- its batch; Freeze takes UPDATE on the same row, verifies the complete set,
+-- then flips open->sealed. Either the delivery wins and is included, or the
+-- seal wins and the late insert fails.
+-- +goose StatementBegin
+CREATE FUNCTION enforce_open_brief_batch_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+DECLARE state text;
+BEGIN
+    SELECT brief_state INTO state
+      FROM public.push_batches
+     WHERE id=NEW.batch_id
+     FOR KEY SHARE;
+    IF state IS NULL THEN
+        RAISE EXCEPTION '061: delivery batch is unavailable';
+    END IF;
+    IF state<>'open' THEN
+        -- Temporal response-loss replay may retry the exact existing
+        -- (batch_id,content_item_id) INSERT. Let it reach the retained unique
+        -- arbiter so ON CONFLICT can recover the original row; no new delivery
+        -- or payload mutation is admitted.
+        IF NEW.content_item_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM public.deliveries
+             WHERE batch_id=NEW.batch_id
+               AND content_item_id=NEW.content_item_id
+        ) THEN
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION '061: canonical Brief batch is sealed';
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION enforce_open_brief_batch_v1() FROM PUBLIC;
+
+CREATE TRIGGER deliveries_require_open_brief_batch_v1
+BEFORE INSERT OR UPDATE OF batch_id ON deliveries
+FOR EACH ROW EXECUTE FUNCTION enforce_open_brief_batch_v1();
+
+CREATE TABLE task_run_outcomes (
+    id               BIGSERIAL   PRIMARY KEY,
+    tenant_id        BIGINT      NOT NULL,
+    user_id          BIGINT      NOT NULL,
+    task_id          TEXT        NOT NULL,
+    run_snapshot_id  BIGINT      NOT NULL,
+    schema_version   TEXT        NOT NULL,
+    status           TEXT        NOT NULL DEFAULT 'pending',
+    result           TEXT,
+    source_coverage  TEXT,
+    processing       TEXT,
+    failure_code     TEXT        NOT NULL DEFAULT '',
+    failure_message  TEXT        NOT NULL DEFAULT '',
+    finalized_at     TIMESTAMPTZ,
+    outcome_digest   TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+
+    CONSTRAINT uq_task_run_outcomes_snapshot UNIQUE (run_snapshot_id),
+    CONSTRAINT uq_task_run_outcomes_brief_scope
+        UNIQUE (id,tenant_id,user_id,task_id,run_snapshot_id),
+    CONSTRAINT fk_task_run_outcomes_snapshot_scope
+        FOREIGN KEY (run_snapshot_id,tenant_id,user_id,task_id)
+        REFERENCES task_run_snapshots (id,tenant_id,user_id,task_id),
+    CONSTRAINT ck_task_run_outcomes_schema
+        CHECK (schema_version='vane.run-outcome/v1'),
+    CONSTRAINT ck_task_run_outcomes_task
+        CHECK (btrim(task_id)=task_id AND octet_length(task_id) BETWEEN 1 AND 255),
+    CONSTRAINT ck_task_run_outcomes_status
+        CHECK (status IN ('pending','finalized')),
+    CONSTRAINT ck_task_run_outcomes_result
+        CHECK (result IS NULL OR result IN ('content','quiet','failed','interrupted')),
+    CONSTRAINT ck_task_run_outcomes_source_coverage
+        CHECK (source_coverage IS NULL OR source_coverage IN ('complete','partial')),
+    CONSTRAINT ck_task_run_outcomes_processing
+        CHECK (processing IS NULL OR processing IN ('complete','partial')),
+    CONSTRAINT ck_task_run_outcomes_failure_size CHECK (
+        octet_length(failure_code)<=128 AND
+        octet_length(failure_message)<=4096
+    ),
+    CONSTRAINT ck_task_run_outcomes_digest
+        CHECK (outcome_digest IS NULL OR outcome_digest ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_task_run_outcomes_terminal_shape CHECK (
+        (
+            status='pending' AND result IS NULL AND
+            source_coverage IS NULL AND processing IS NULL AND
+            failure_code='' AND failure_message='' AND
+            finalized_at IS NULL AND outcome_digest IS NULL
+        ) OR (
+            status='finalized' AND result IS NOT NULL AND
+            source_coverage IS NOT NULL AND processing IS NOT NULL AND
+            finalized_at IS NOT NULL AND outcome_digest IS NOT NULL AND
+            (
+                (
+                    result IN ('failed','interrupted') AND
+                    btrim(failure_code)=failure_code AND failure_code<>''
+                ) OR (
+                    result IN ('content','quiet') AND
+                    failure_code='' AND failure_message=''
+                )
+            )
+        )
+    )
+);
+
+CREATE INDEX idx_task_run_outcomes_tenant_user_task_created
+    ON task_run_outcomes (tenant_id,user_id,task_id,created_at DESC,id DESC);
+
+CREATE TABLE brief_snapshots (
+    id               BIGSERIAL   PRIMARY KEY,
+    tenant_id        BIGINT      NOT NULL,
+    user_id          BIGINT      NOT NULL,
+    task_id          TEXT        NOT NULL,
+    run_outcome_id   BIGINT      NOT NULL,
+    run_snapshot_id  BIGINT      NOT NULL,
+    push_batch_id    BIGINT      NOT NULL,
+    schema_version   TEXT        NOT NULL,
+    request_digest   TEXT        NOT NULL,
+    payload_digest   TEXT        NOT NULL,
+    payload          BYTEA       NOT NULL,
+    insight_count    INTEGER     NOT NULL,
+    generated_at     TIMESTAMPTZ NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+
+    CONSTRAINT uq_brief_snapshots_outcome UNIQUE (run_outcome_id),
+    CONSTRAINT uq_brief_snapshots_run UNIQUE (run_snapshot_id),
+    CONSTRAINT uq_brief_snapshots_batch UNIQUE (push_batch_id),
+    CONSTRAINT uq_brief_snapshots_scope
+        UNIQUE (id,tenant_id,user_id,task_id),
+    CONSTRAINT fk_brief_snapshots_outcome_scope
+        FOREIGN KEY (
+            run_outcome_id,tenant_id,user_id,task_id,run_snapshot_id
+        ) REFERENCES task_run_outcomes (
+            id,tenant_id,user_id,task_id,run_snapshot_id
+        ),
+    CONSTRAINT fk_brief_snapshots_batch_scope
+        FOREIGN KEY (
+            push_batch_id,tenant_id,user_id,task_id,run_snapshot_id
+        ) REFERENCES push_batches (
+            id,tenant_id,user_id,schedule_id,run_snapshot_id
+        ),
+    CONSTRAINT ck_brief_snapshots_schema
+        CHECK (schema_version='vane.brief/v1'),
+    CONSTRAINT ck_brief_snapshots_task
+        CHECK (btrim(task_id)=task_id AND octet_length(task_id) BETWEEN 1 AND 255),
+    CONSTRAINT ck_brief_snapshots_request_digest
+        CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_brief_snapshots_payload_digest
+        CHECK (payload_digest ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_brief_snapshots_payload_size
+        CHECK (octet_length(payload) BETWEEN 2 AND 33554432),
+    CONSTRAINT ck_brief_snapshots_insight_count
+        CHECK (insight_count BETWEEN 1 AND 100)
+);
+
+CREATE INDEX idx_brief_snapshots_tenant_user_task_generated
+    ON brief_snapshots (
+        tenant_id,user_id,task_id,generated_at DESC,id DESC
+    );
+
+-- Dedicated dark writer. It is unrelated to vane_app and can only select the
+-- exact immutable run/batch/delivery scope plus write these two new tables.
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='vane_brief_writer') THEN
+        BEGIN
+            CREATE ROLE vane_brief_writer
+                NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+                NOLOGIN NOINHERIT NOBYPASSRLS;
+        EXCEPTION
+            WHEN duplicate_object OR unique_violation THEN NULL;
+        END;
+    END IF;
+END $$;
+-- +goose StatementEnd
+
+ALTER ROLE vane_brief_writer
+    NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+    NOLOGIN NOINHERIT NOBYPASSRLS;
+ALTER ROLE vane_brief_writer RESET ALL;
+ALTER ROLE vane_brief_writer SET search_path=pg_catalog,public,pg_temp;
+GRANT vane_brief_writer TO CURRENT_USER;
+
+REVOKE ALL ON task_run_outcomes,brief_snapshots
+    FROM PUBLIC,vane_app,vane_brief_writer;
+REVOKE ALL ON SEQUENCE task_run_outcomes_id_seq,brief_snapshots_id_seq
+    FROM PUBLIC,vane_app,vane_brief_writer;
+REVOKE ALL ON task_run_snapshots,push_batches,deliveries
+    FROM vane_brief_writer;
+
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF pg_has_role('vane_brief_writer','vane_app','MEMBER') OR
+       pg_has_role('vane_app','vane_brief_writer','MEMBER') THEN
+        RAISE EXCEPTION '061: vane_app and brief writer must be unrelated';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM pg_auth_members am
+          JOIN pg_roles granted_role ON granted_role.oid=am.roleid
+          JOIN pg_roles member_role ON member_role.oid=am.member
+         WHERE granted_role.rolname='vane_brief_writer'
+           AND member_role.rolname<>CURRENT_USER
+    ) THEN
+        RAISE EXCEPTION '061: only migration owner may enter brief writer';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM pg_auth_members am
+          JOIN pg_roles member_role ON member_role.oid=am.member
+         WHERE member_role.rolname='vane_brief_writer'
+    ) THEN
+        RAISE EXCEPTION '061: brief writer must not enter another role';
+    END IF;
+END $$;
+-- +goose StatementEnd
+
+GRANT USAGE ON SCHEMA public TO vane_brief_writer;
+GRANT SELECT (
+    id,tenant_id,user_id,task_id,temporal_workflow_id,temporal_run_id,
+    reference_schema_version,reference_digest,payload_digest
+) ON task_run_snapshots TO vane_brief_writer;
+GRANT SELECT (
+    id,tenant_id,user_id,schedule_id,run_snapshot_id,brief_state
+) ON push_batches TO vane_brief_writer;
+GRANT UPDATE (brief_state) ON push_batches TO vane_brief_writer;
+GRANT SELECT (
+    id,tenant_id,batch_id,user_id,content_item_id,body_md,created_at
+) ON deliveries TO vane_brief_writer;
+
+GRANT SELECT (
+    id,tenant_id,user_id,task_id,run_snapshot_id,schema_version,status,
+    result,source_coverage,processing,failure_code,failure_message,
+    finalized_at,outcome_digest,created_at
+), INSERT (
+    tenant_id,user_id,task_id,run_snapshot_id,schema_version
+), UPDATE (
+    status,result,source_coverage,processing,failure_code,failure_message,
+    finalized_at,outcome_digest
+) ON task_run_outcomes TO vane_brief_writer;
+GRANT USAGE,SELECT ON SEQUENCE task_run_outcomes_id_seq
+    TO vane_brief_writer;
+
+GRANT SELECT (
+    id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,
+    push_batch_id,schema_version,request_digest,payload_digest,payload,
+    insight_count,generated_at,created_at
+), INSERT (
+    id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,
+    push_batch_id,schema_version,request_digest,payload_digest,payload,
+    insight_count,generated_at
+) ON brief_snapshots TO vane_brief_writer;
+GRANT USAGE,SELECT ON SEQUENCE brief_snapshots_id_seq
+    TO vane_brief_writer;
+
+ALTER TABLE task_run_outcomes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_visible ON task_run_outcomes
+    FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY tenant_isolation ON task_run_outcomes AS RESTRICTIVE
+    FOR ALL
+    USING (
+        tenant_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.tenant_id',true)),'')::bigint
+    )
+    WITH CHECK (
+        tenant_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.tenant_id',true)),'')::bigint
+    );
+CREATE POLICY user_isolation ON task_run_outcomes AS RESTRICTIVE
+    FOR ALL
+    USING (
+        user_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
+    )
+    WITH CHECK (
+        user_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
+    );
+
+ALTER TABLE brief_snapshots ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_visible ON brief_snapshots
+    FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY tenant_isolation ON brief_snapshots AS RESTRICTIVE
+    FOR ALL
+    USING (
+        tenant_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.tenant_id',true)),'')::bigint
+    )
+    WITH CHECK (
+        tenant_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.tenant_id',true)),'')::bigint
+    );
+CREATE POLICY user_isolation ON brief_snapshots AS RESTRICTIVE
+    FOR ALL
+    USING (
+        user_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
+    )
+    WITH CHECK (
+        user_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
+    );
+
+-- Existing tables already have tenant RLS. These role-specific restrictive
+-- policies prevent same-tenant cross-user scope adoption.
+CREATE POLICY brief_writer_identity ON task_run_snapshots AS RESTRICTIVE
+    FOR SELECT TO vane_brief_writer
+    USING (
+        tenant_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.tenant_id',true)),'')::bigint AND
+        user_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
+    );
+CREATE POLICY brief_writer_identity ON push_batches AS RESTRICTIVE
+    FOR ALL TO vane_brief_writer
+    USING (
+        tenant_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.tenant_id',true)),'')::bigint AND
+        user_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
+    )
+    WITH CHECK (
+        tenant_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.tenant_id',true)),'')::bigint AND
+        user_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
+    );
+CREATE POLICY brief_writer_identity ON deliveries AS RESTRICTIVE
+    FOR SELECT TO vane_brief_writer
+    USING (
+        tenant_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.tenant_id',true)),'')::bigint AND
+        user_id IS NOT DISTINCT FROM
+        NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
+    );
+
+-- +goose Down
+
+LOCK TABLE task_run_outcomes,push_batches,brief_snapshots
+    IN ACCESS EXCLUSIVE MODE;
+
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM brief_snapshots) OR
+       EXISTS (SELECT 1 FROM task_run_outcomes) OR
+       EXISTS (SELECT 1 FROM push_batches WHERE brief_state='sealed') THEN
+        RAISE EXCEPTION
+            '061: refusing downgrade while canonical outcome/brief evidence exists';
+    END IF;
+END $$;
+-- +goose StatementEnd
+
+DROP POLICY IF EXISTS brief_writer_identity ON deliveries;
+DROP POLICY IF EXISTS brief_writer_identity ON push_batches;
+DROP POLICY IF EXISTS brief_writer_identity ON task_run_snapshots;
+
+DROP POLICY IF EXISTS user_isolation ON brief_snapshots;
+DROP POLICY IF EXISTS tenant_isolation ON brief_snapshots;
+DROP POLICY IF EXISTS tenant_visible ON brief_snapshots;
+DROP POLICY IF EXISTS user_isolation ON task_run_outcomes;
+DROP POLICY IF EXISTS tenant_isolation ON task_run_outcomes;
+DROP POLICY IF EXISTS tenant_visible ON task_run_outcomes;
+
+REVOKE SELECT (
+    id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,
+    push_batch_id,schema_version,request_digest,payload_digest,payload,
+    insight_count,generated_at,created_at
+), INSERT (
+    id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,
+    push_batch_id,schema_version,request_digest,payload_digest,payload,
+    insight_count,generated_at
+) ON brief_snapshots FROM vane_brief_writer;
+REVOKE USAGE,SELECT ON SEQUENCE brief_snapshots_id_seq
+    FROM vane_brief_writer;
+REVOKE SELECT (
+    id,tenant_id,user_id,task_id,run_snapshot_id,schema_version,status,
+    result,source_coverage,processing,failure_code,failure_message,
+    finalized_at,outcome_digest,created_at
+), INSERT (
+    tenant_id,user_id,task_id,run_snapshot_id,schema_version
+), UPDATE (
+    status,result,source_coverage,processing,failure_code,failure_message,
+    finalized_at,outcome_digest
+) ON task_run_outcomes FROM vane_brief_writer;
+REVOKE USAGE,SELECT ON SEQUENCE task_run_outcomes_id_seq
+    FROM vane_brief_writer;
+REVOKE SELECT (
+    id,tenant_id,batch_id,user_id,content_item_id,body_md,created_at
+) ON deliveries FROM vane_brief_writer;
+REVOKE SELECT (
+    id,tenant_id,user_id,schedule_id,run_snapshot_id,brief_state
+) ON push_batches FROM vane_brief_writer;
+REVOKE UPDATE (brief_state) ON push_batches FROM vane_brief_writer;
+REVOKE SELECT (
+    id,tenant_id,user_id,task_id,temporal_workflow_id,temporal_run_id,
+    reference_schema_version,reference_digest,payload_digest
+) ON task_run_snapshots FROM vane_brief_writer;
+REVOKE USAGE ON SCHEMA public FROM vane_brief_writer;
+
+DROP TABLE brief_snapshots;
+DROP TABLE task_run_outcomes;
+
+DROP TRIGGER deliveries_require_open_brief_batch_v1 ON deliveries;
+DROP FUNCTION enforce_open_brief_batch_v1();
+DROP TRIGGER push_batches_brief_state_authority_v1 ON push_batches;
+DROP FUNCTION enforce_brief_batch_state_authority_v1();
+
+ALTER TABLE push_batches
+    DROP CONSTRAINT uq_push_batches_brief_scope,
+    DROP CONSTRAINT ck_push_batches_brief_state,
+    DROP COLUMN brief_state;
+ALTER TABLE task_run_snapshots
+    DROP CONSTRAINT uq_task_run_snapshots_brief_scope;
