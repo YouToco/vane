@@ -60,7 +60,51 @@ func (s *Store) ListProfileClaims(
 	var version, generation int64
 	err = tx.QueryRow(ctx,
 		`SELECT version,evidence_generation FROM profile_claim_states
-		  WHERE tenant_id=$1 AND user_id=$2`,
+		  WHERE tenant_id=$1 AND user_id=$2 FOR SHARE`,
+		tenantID, userID).Scan(&version, &generation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, types.NewAppError(types.CodeNotFound, "画像主张尚未初始化", nil)
+	}
+	if err != nil {
+		return nil, profileClaimDBError("read legacy profile claim state", err)
+	}
+	claims, events, err := loadProfileClaimLedgerTx(ctx, tx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	projection := projectProfileClaims(claims, events, generation)
+	out := &types.ProfileClaimList{
+		Version: version,
+		Claims:  publicProfileClaims(claims, projection, events),
+		Events:  publicProfileClaimEvents(events),
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, profileClaimDBError("commit legacy profile claim read", err)
+	}
+	return out, nil
+}
+
+func (s *Store) ListProfileClaimsPage(
+	ctx context.Context, tenantID, userID int64,
+	options ProfileClaimEventPageOptions,
+) (*types.ProfileClaimList, error) {
+	if tenantID <= 0 || userID <= 0 {
+		return nil, types.NewAppError(types.CodeValidation, "画像主张读取范围无效", nil)
+	}
+	cursor, continuation, err := validateProfileClaimEventPageOptions(
+		tenantID, userID, options)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.beginProfileClaimScopedTx(ctx, tenantID, false, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var version, generation int64
+	err = tx.QueryRow(ctx,
+		`SELECT version,evidence_generation FROM profile_claim_states
+		  WHERE tenant_id=$1 AND user_id=$2 FOR SHARE`,
 		tenantID, userID).Scan(&version, &generation)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, types.NewAppError(types.CodeNotFound, "画像主张尚未初始化", nil)
@@ -72,11 +116,48 @@ func (s *Store) ListProfileClaims(
 	if err != nil {
 		return nil, err
 	}
+	snapshotMaxEventID := maxProfileClaimEventID(events)
+	beforeEventID := int64(0)
+	if continuation {
+		if cursor.SnapshotVersion != version ||
+			cursor.SnapshotMaxEventID != snapshotMaxEventID {
+			return nil, profileClaimCursorConflict()
+		}
+		beforeEventID = cursor.BeforeEventID
+	} else {
+		cursor = profileClaimEventCursor{
+			Schema:             profileClaimEventCursorSchema,
+			Kind:               profileClaimEventCursorKind,
+			TenantID:           tenantID,
+			UserID:             userID,
+			SnapshotVersion:    version,
+			SnapshotMaxEventID: snapshotMaxEventID,
+			Limit:              options.Limit,
+		}
+		if cursor.Limit == 0 {
+			cursor.Limit = defaultProfileClaimEventLimit
+		}
+	}
 	projection := projectProfileClaims(claims, events, generation)
+	pageEvents, hasMore := pageProfileClaimEvents(
+		events, snapshotMaxEventID, beforeEventID, cursor.Limit)
+	publicClaims, err := publicProfileClaimsForPage(
+		claims, projection, pageEvents, !continuation)
+	if err != nil {
+		return nil, err
+	}
 	out := &types.ProfileClaimList{
-		Version: version,
-		Claims:  publicProfileClaims(claims, projection, events),
-		Events:  publicProfileClaimEvents(events),
+		Version:       version,
+		Claims:        publicClaims,
+		Events:        publicProfileClaimEventPage(events, pageEvents),
+		EventsHasMore: hasMore,
+	}
+	if hasMore {
+		cursor.BeforeEventID = pageEvents[len(pageEvents)-1].ID
+		out.EventsNextCursor, err = encodeProfileClaimEventCursor(cursor)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, profileClaimDBError("commit profile claim read", err)
@@ -215,6 +296,7 @@ func (s *Store) ApplyProfileClaimAction(
 	}
 
 	var targetClaimID, resultClaimID, targetEventID *int64
+	actionContextIDs := make(map[int64]bool, 2)
 	switch action.Action {
 	case "correct", "suppress", "pin":
 		target, ok := claimByID[action.ClaimID]
@@ -286,8 +368,20 @@ func (s *Store) ApplyProfileClaimAction(
 		if dependent[target.ID] {
 			return nil, types.NewAppError(types.CodeConflict, "该人工事件已有后续依赖，不能直接撤销", nil)
 		}
+		if target.TargetClaimID != nil {
+			actionContextIDs[*target.TargetClaimID] = true
+		}
+		if target.ResultClaimID != nil {
+			actionContextIDs[*target.ResultClaimID] = true
+		}
 	default:
 		return nil, types.NewAppError(types.CodeValidation, "未知的画像主张操作", nil)
+	}
+	if targetClaimID != nil {
+		actionContextIDs[*targetClaimID] = true
+	}
+	if resultClaimID != nil {
+		actionContextIDs[*resultClaimID] = true
 	}
 
 	var eventID int64
@@ -311,6 +405,11 @@ func (s *Store) ApplyProfileClaimAction(
 		return nil, types.NewAppError(
 			types.CodeValidation, "生效画像摘要不能超过 500 字", nil)
 	}
+	publicClaims, err := publicProfileClaimsForAction(
+		claims, projection, actionContextIDs)
+	if err != nil {
+		return nil, err
+	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE profile_claim_states
 		    SET version=version+1,updated_at=clock_timestamp()
@@ -330,7 +429,7 @@ func (s *Store) ApplyProfileClaimAction(
 		Version: version + 1,
 		EventID: strconv.FormatInt(eventID, 10),
 		Profile: publicProfile(updated),
-		Claims:  publicProfileClaims(claims, projection, events),
+		Claims:  publicClaims,
 	}
 	payload, err := json.Marshal(result)
 	if err != nil {

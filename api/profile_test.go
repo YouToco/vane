@@ -113,6 +113,29 @@ func TestProfileClaimActionsRejectMalformedRequestsBeforeStore(t *testing.T) {
 	}
 }
 
+func TestProfileClaimsPaginationRejectsInvalidQueryBeforeStore(t *testing.T) {
+	mux, cookie := newProfileMux(t)
+	for _, rawQuery := range []string{
+		"unknown=1",
+		"event_limit=0",
+		"event_limit=51",
+		"event_limit=abc",
+		"event_limit=20&event_limit=21",
+		"event_cursor=",
+		"event_cursor=a&event_cursor=b",
+	} {
+		r := httptest.NewRequest(
+			http.MethodGet, profilePath+"/claims?"+rawQuery, nil)
+		r.AddCookie(cookie)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("query=%q status=%d body=%s",
+				rawQuery, w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestCanonicalizeProfilePatch(t *testing.T) {
 	industry := "  AI 应用  "
 	occupation := " 独立开发者 "

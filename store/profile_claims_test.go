@@ -2,9 +2,12 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1035,6 +1038,398 @@ func TestInitialProfileCreateConcurrentSameKeyExactReplay(t *testing.T) {
 	list, err := st.ListProfileClaims(t.Context(), 1, u.ID)
 	if err != nil || list.Version != 0 || len(list.Claims) != 2 {
 		t.Fatalf("duplicate initial claim state: %+v err=%v", list, err)
+	}
+}
+
+func TestProfileClaimEventPaginationAndBoundedActionReplay(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("未设置 DATABASE_URL")
+	}
+	if err := Migrate(t.Context(), dbURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, st)
+	u, err := st.UpsertUserByOpenID(
+		t.Context(), "claim_page_"+uuid.NewString(), "claim-page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachTenant(t, st, u.ID)
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		for _, table := range []string{
+			"profile_claim_receipts", "profile_claim_events", "profile_claims",
+			"profile_claim_states", "profiles",
+		} {
+			cleanupExec(ctx, t, st, "DELETE FROM "+table+" WHERE user_id=$1", u.ID)
+		}
+		cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE user_id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id=$1`, u.ID)
+	})
+
+	seedTx, err := st.beginProfileClaimScopedTx(t.Context(), 1, true, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = seedTx.Rollback(context.Background()) }()
+	if _, err := seedTx.Exec(t.Context(), `
+		INSERT INTO profiles(tenant_id,user_id,industry)
+		VALUES(1,$1,'legacy-source')`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seedTx.Exec(t.Context(), `
+		INSERT INTO profile_claim_states(tenant_id,user_id)
+		VALUES(1,$1)`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	var originalClaimID, resultClaimID, dependentResultClaimID int64
+	if err := seedTx.QueryRow(t.Context(), `
+		INSERT INTO profile_claims
+		    (tenant_id,user_id,field_name,claim_value,source_state)
+		VALUES(1,$1,'industry','legacy-source','source_unavailable')
+		RETURNING id`, u.ID).Scan(&originalClaimID); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedTx.QueryRow(t.Context(), `
+		INSERT INTO profile_claims
+		    (tenant_id,user_id,field_name,claim_value,source_state,
+		     supersedes_claim_id)
+		VALUES(1,$1,'industry','corrected-source','manual',$2)
+		RETURNING id`, u.ID, originalClaimID).Scan(&resultClaimID); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedTx.QueryRow(t.Context(), `
+		INSERT INTO profile_claims
+		    (tenant_id,user_id,field_name,claim_value,source_state,
+		     supersedes_claim_id)
+		VALUES(1,$1,'industry','dependent-source','manual',$2)
+		RETURNING id`,
+		u.ID, originalClaimID).Scan(&dependentResultClaimID); err != nil {
+		t.Fatal(err)
+	}
+	var correctEventID, dependentPinID, revokePinID int64
+	if err := seedTx.QueryRow(t.Context(), `
+		INSERT INTO profile_claim_events
+		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		     result_claim_id,expected_version,result_version)
+		VALUES(1,$1,$1,'correct',$2,$3,0,1)
+		RETURNING id`,
+		u.ID, originalClaimID, resultClaimID).Scan(&correctEventID); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedTx.QueryRow(t.Context(), `
+		INSERT INTO profile_claim_events
+		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		     expected_version,result_version)
+		VALUES(1,$1,$1,'pin',$2,1,2)
+		RETURNING id`,
+		u.ID, resultClaimID).Scan(&dependentPinID); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedTx.QueryRow(t.Context(), `
+		INSERT INTO profile_claim_events
+		    (tenant_id,user_id,actor_user_id,event_kind,target_event_id,
+		     expected_version,result_version)
+		VALUES(1,$1,$1,'revoke',$2,2,3)
+		RETURNING id`,
+		u.ID, dependentPinID).Scan(&revokePinID); err != nil {
+		t.Fatal(err)
+	}
+	var dependentCorrectID, activeDependentPinID int64
+	if err := seedTx.QueryRow(t.Context(), `
+		INSERT INTO profile_claim_events
+		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		     result_claim_id,expected_version,result_version)
+		VALUES(1,$1,$1,'correct',$2,$3,3,4)
+		RETURNING id`,
+		u.ID, originalClaimID, dependentResultClaimID,
+	).Scan(&dependentCorrectID); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedTx.QueryRow(t.Context(), `
+		INSERT INTO profile_claim_events
+		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		     expected_version,result_version)
+		VALUES(1,$1,$1,'pin',$2,4,5)
+		RETURNING id`,
+		u.ID, dependentResultClaimID).Scan(&activeDependentPinID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seedTx.Exec(t.Context(), `
+		INSERT INTO profile_claim_events
+		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		     expected_version,result_version)
+		SELECT 1,$1,$1,'pin',$2,n-1,n
+		  FROM generate_series(6,1000) n`,
+		u.ID, originalClaimID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seedTx.Exec(t.Context(), `
+		UPDATE profile_claim_states SET version=1000
+		 WHERE tenant_id=1 AND user_id=$1`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedTx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy, err := st.ListProfileClaims(t.Context(), 1, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.Events) != 997 {
+		t.Fatalf("no-parameter compatibility events=%d want legacy 997",
+			len(legacy.Events))
+	}
+
+	options := ProfileClaimEventPageOptions{Limit: 37}
+	seenEvents := make(map[string]bool, 1000)
+	lastID := int64(^uint64(0) >> 1)
+	firstCursor := ""
+	pageNumber := 0
+	var oldest types.ProfileClaimEvent
+	statusByID := make(map[string]types.ProfileClaimEvent)
+	for {
+		page, err := st.ListProfileClaimsPage(
+			t.Context(), 1, u.ID, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Events) == 0 || len(page.Events) > options.Limit {
+			t.Fatalf("page %d events=%d", pageNumber, len(page.Events))
+		}
+		if pageNumber == 0 {
+			if len(page.Claims) > maxPublicFirstProfileClaims {
+				t.Fatalf("first claims=%d", len(page.Claims))
+			}
+			source := findClaim(
+				t, page.Claims, "industry", "legacy-source", true)
+			if source.Source.State != "source_unavailable" {
+				t.Fatalf("source_unavailable lost on first page: %+v", source)
+			}
+			firstCursor = page.EventsNextCursor
+		} else {
+			if len(page.Claims) > maxPublicEventContextClaims {
+				t.Fatalf("continuation claims=%d", len(page.Claims))
+			}
+			contextIDs := make(map[string]bool)
+			for _, event := range page.Events {
+				if event.TargetClaimID != "" {
+					contextIDs[event.TargetClaimID] = true
+				}
+				if event.ResultClaimID != "" {
+					contextIDs[event.ResultClaimID] = true
+				}
+			}
+			for _, claim := range page.Claims {
+				if !contextIDs[claim.ID] {
+					t.Fatalf("continuation leaked non-context claim %+v", claim)
+				}
+			}
+		}
+		for _, event := range page.Events {
+			id := parseTestID(t, event.ID)
+			if id >= lastID {
+				t.Fatalf("events not strict id DESC: %d after %d", id, lastID)
+			}
+			if seenEvents[event.ID] {
+				t.Fatalf("duplicate paged event %s", event.ID)
+			}
+			seenEvents[event.ID] = true
+			lastID = id
+			oldest = event
+			statusByID[event.ID] = event
+		}
+		if !page.EventsHasMore {
+			if page.EventsNextCursor != "" {
+				t.Fatal("terminal page exposed next cursor")
+			}
+			break
+		}
+		if page.EventsNextCursor == "" {
+			t.Fatal("non-terminal page omitted cursor")
+		}
+		options.Cursor = page.EventsNextCursor
+		pageNumber++
+	}
+	if len(seenEvents) != 1000 {
+		t.Fatalf("paged events=%d want 1000", len(seenEvents))
+	}
+	if oldest.ID != strconv.FormatInt(correctEventID, 10) || !oldest.Revocable {
+		t.Fatalf("oldest correction not revocable: %+v", oldest)
+	}
+	dependentPin := statusByID[strconv.FormatInt(dependentPinID, 10)]
+	if !dependentPin.Revoked || dependentPin.Revocable {
+		t.Fatalf("revoked dependent pin status=%+v", dependentPin)
+	}
+	if revoked := statusByID[strconv.FormatInt(revokePinID, 10)]; revoked.Revocable {
+		t.Fatalf("revoke event advertised revocable: %+v", revoked)
+	}
+	dependentCorrect := statusByID[strconv.FormatInt(dependentCorrectID, 10)]
+	if dependentCorrect.Revoked || dependentCorrect.Revocable {
+		t.Fatalf("cross-page dependent correction status=%+v (pin=%d)",
+			dependentCorrect, activeDependentPinID)
+	}
+
+	decoded, err := decodeProfileClaimEventCursor(firstCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Kind != profileClaimEventCursorKind ||
+		decoded.Schema != profileClaimEventCursorSchema {
+		t.Fatalf("cursor kind/schema=%+v", decoded)
+	}
+	if _, err := st.ListProfileClaimsPage(
+		t.Context(), 1, u.ID+1,
+		ProfileClaimEventPageOptions{Limit: 37, Cursor: firstCursor},
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("cross-user cursor accepted: %v", err)
+	}
+	if _, err := st.ListProfileClaimsPage(
+		t.Context(), 1, u.ID,
+		ProfileClaimEventPageOptions{Limit: 20, Cursor: firstCursor},
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("cursor limit rebinding accepted: %v", err)
+	}
+	tamperedSnapshot := decoded
+	tamperedSnapshot.SnapshotMaxEventID--
+	tamperedCursor, err := encodeProfileClaimEventCursor(tamperedSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ListProfileClaimsPage(
+		t.Context(), 1, u.ID,
+		ProfileClaimEventPageOptions{Limit: 37, Cursor: tamperedCursor},
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("cursor snapshot max rebinding did not conflict: %v", err)
+	}
+	wrongKind := decoded
+	wrongKind.Kind = "other_events"
+	wrongKindCursor, err := encodeProfileClaimEventCursor(wrongKind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongSchema := decoded
+	wrongSchema.Schema = "vane.profile-claim-event-cursor/v2"
+	wrongSchemaCursor, err := encodeProfileClaimEventCursor(wrongSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidBefore := decoded
+	invalidBefore.BeforeEventID = invalidBefore.SnapshotMaxEventID + 1
+	invalidBeforeCursor, err := encodeProfileClaimEventCursor(invalidBefore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	malformed := []string{
+		strings.Repeat("x", maxProfileClaimEventCursorLen+1),
+		base64.RawURLEncoding.EncodeToString([]byte(`{}`)),
+		base64.RawURLEncoding.EncodeToString(
+			[]byte(`{"schema":"x","schema":"y"}`)),
+		base64.RawURLEncoding.EncodeToString(
+			[]byte(`{"unknown":true}`)),
+		base64.RawURLEncoding.EncodeToString(
+			[]byte(`{"schema":"x"} trailing`)),
+		wrongKindCursor,
+		wrongSchemaCursor,
+		invalidBeforeCursor,
+	}
+	for _, cursor := range malformed {
+		if _, err := st.ListProfileClaimsPage(
+			t.Context(), 1, u.ID,
+			ProfileClaimEventPageOptions{Limit: 37, Cursor: cursor},
+		); !errors.Is(err, types.ErrValidation) {
+			t.Fatalf("malformed cursor accepted: %v", err)
+		}
+	}
+
+	concurrentTx, err := st.beginProfileClaimScopedTx(
+		t.Context(), 1, true, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := concurrentTx.Exec(t.Context(), `
+		INSERT INTO profile_claim_events
+		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		     expected_version,result_version)
+		VALUES(1,$1,$1,'pin',$2,1000,1001)`,
+		u.ID, originalClaimID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := concurrentTx.Exec(t.Context(), `
+		UPDATE profile_claim_states SET version=1001
+		 WHERE tenant_id=1 AND user_id=$1 AND version=1000`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := concurrentTx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ListProfileClaimsPage(
+		t.Context(), 1, u.ID,
+		ProfileClaimEventPageOptions{Limit: 37, Cursor: firstCursor},
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("stale cursor version did not return conflict: %v", err)
+	}
+
+	action := types.ProfileClaimAction{
+		ExpectedVersion: 1001, Action: "suppress", ClaimID: originalClaimID,
+	}
+	firstAction, err := st.ApplyProfileClaimAction(
+		t.Context(), 1, u.ID, action,
+		"page-action", strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstAction.ClaimsComplete ||
+		len(firstAction.Claims) > maxPublicActionProfileClaims {
+		t.Fatalf("action claim bound/completeness=%d/%t",
+			len(firstAction.Claims), firstAction.ClaimsComplete)
+	}
+	if findClaim(
+		t, firstAction.Claims, "industry", "legacy-source", false,
+	).Source.State != "source_unavailable" {
+		t.Fatal("action target context lost source state")
+	}
+	replay, err := st.ApplyProfileClaimAction(
+		t.Context(), 1, u.ID, action,
+		"page-action", strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(firstAction, replay) {
+		t.Fatalf("bounded action receipt replay drifted:\n%+v\n%+v",
+			firstAction, replay)
+	}
+}
+
+func TestPublicProfileClaimPageFailsClosedAboveActiveBound(t *testing.T) {
+	claims := make([]profileClaimRow, 0, maxPublicActiveProfileClaims+1)
+	projection := profileClaimProjection{
+		active: make(map[int64]bool, maxPublicActiveProfileClaims+1),
+		pinned: map[int64]bool{},
+	}
+	for id := int64(1); id <= maxPublicActiveProfileClaims+1; id++ {
+		claims = append(claims, profileClaimRow{
+			ID: id, Field: "summary", Value: strconv.FormatInt(id, 10),
+			SourceState: "manual",
+		})
+		projection.active[id] = true
+	}
+	if _, err := publicProfileClaimsForPage(
+		claims, projection, nil, true,
+	); !errors.Is(err, types.ErrInternal) {
+		t.Fatalf("first page silently truncated active overflow: %v", err)
+	}
+	if _, err := publicProfileClaimsForAction(
+		claims, projection, nil,
+	); !errors.Is(err, types.ErrInternal) {
+		t.Fatalf("action silently truncated active overflow: %v", err)
 	}
 }
 

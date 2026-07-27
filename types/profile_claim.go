@@ -20,9 +20,11 @@ type ProfileClaim struct {
 }
 
 type ProfileClaimList struct {
-	Version int64               `json:"version"`
-	Claims  []ProfileClaim      `json:"claims"`
-	Events  []ProfileClaimEvent `json:"events"`
+	Version          int64               `json:"version"`
+	Claims           []ProfileClaim      `json:"claims"`
+	Events           []ProfileClaimEvent `json:"events"`
+	EventsHasMore    bool                `json:"events_has_more"`
+	EventsNextCursor string              `json:"events_next_cursor,omitempty"`
 }
 
 type ProfileClaimEvent struct {
@@ -44,8 +46,9 @@ type ProfileClaimAction struct {
 }
 
 type ProfileClaimActionResult struct {
-	Version int64          `json:"version"`
-	EventID string         `json:"event_id"`
-	Profile ProfileView    `json:"profile"`
-	Claims  []ProfileClaim `json:"claims"`
+	Version        int64          `json:"version"`
+	EventID        string         `json:"event_id"`
+	Profile        ProfileView    `json:"profile"`
+	Claims         []ProfileClaim `json:"claims"`
+	ClaimsComplete bool           `json:"claims_complete"`
 }

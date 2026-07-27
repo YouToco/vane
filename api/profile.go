@@ -184,17 +184,46 @@ func (s *server) handleUndoProfileEdit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleListProfileClaims(w http.ResponseWriter, r *http.Request) {
-	if len(r.URL.Query()) != 0 {
-		writeError(w, http.StatusBadRequest, "画像主张查询不接受查询参数")
-		return
+	query := r.URL.Query()
+	for key := range query {
+		if key != "event_limit" && key != "event_cursor" {
+			writeError(w, http.StatusBadRequest, "画像主张查询包含未知参数")
+			return
+		}
+	}
+	options := store.ProfileClaimEventPageOptions{Limit: 20}
+	if values, ok := query["event_limit"]; ok {
+		if len(values) != 1 {
+			writeError(w, http.StatusBadRequest, "event_limit 只能提供一次")
+			return
+		}
+		limit, err := strconv.Atoi(values[0])
+		if err != nil || limit < 1 || limit > 50 {
+			writeError(w, http.StatusBadRequest, "event_limit 必须是 1 到 50")
+			return
+		}
+		options.Limit = limit
+	}
+	if values, ok := query["event_cursor"]; ok {
+		if len(values) != 1 || values[0] == "" {
+			writeError(w, http.StatusBadRequest, "event_cursor 无效")
+			return
+		}
+		options.Cursor = values[0]
 	}
 	principal, err := auth.PrincipalFromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
-	result, err := s.deps.Store.ListProfileClaims(
-		r.Context(), int64(principal.TenantID), principal.UserID)
+	var result *types.ProfileClaimList
+	if len(query) == 0 {
+		result, err = s.deps.Store.ListProfileClaims(
+			r.Context(), int64(principal.TenantID), principal.UserID)
+	} else {
+		result, err = s.deps.Store.ListProfileClaimsPage(
+			r.Context(), int64(principal.TenantID), principal.UserID, options)
+	}
 	if err != nil {
 		writeAppError(w, err)
 		return
