@@ -46,6 +46,27 @@ Aliyun CDN and Cloudflare Pages succeed. If backend succeeds and frontend fails,
 backend state remains truthfully advanced; the next poll rebuilds and retries
 only the frontend.
 
+The Aliyun line first requires a closed Vite manifest dependency graph and
+content-addressed names for every runtime JavaScript/CSS object referenced by
+HTML or the Vite manifest. It then publishes every non-HTML object without
+deleting older objects and requires OSS `stat` to report the exact local
+`Content-Length` for every critical referenced asset. Secondary HTML and
+owner-preview metadata follow; the canonical `index.html` object is overwritten
+only after those checks pass and its own OSS `Content-Length` is checked after
+the write. CDN invalidation uses URL-encoded `File` refreshes for HTML entries
+and stable non-hashed public objects such as web manifests and root icons,
+instead of a directory-wide refresh. These invariants keep the previous entry's
+content-hashed assets available during cutover and make an exact-SHA retry
+idempotent.
+
+The fixed owner-preview path remains a documented residual risk in this
+mitigation. When a build includes it, deployment publishes it before the root
+entry and verifies `Cache-Control: no-store`. When a build omits it, deployment
+does not delete or overwrite an older fixed-path preview, so stale preview
+content may remain reachable. This risk is **not closed** here; closing it
+requires the follow-up `releases/<sha>` preview migration plus explicit
+version-aware garbage collection.
+
 Control-plane CI runs on every `main` push and every five minutes. The
 production workflow listens only to a completed Control-plane CI run and
 requires a successful same-repository `push` or `schedule` run on `main` whose
@@ -121,6 +142,9 @@ The default persistent state directory is
 `~/.local/state/vane-deploy` (or `$XDG_STATE_HOME/vane-deploy`). It contains:
 
 - `deployed-vane.sha` and `deployed-vane-web.sha`;
+- `releases/<frontend-source-sha>/frontend-aliyun.json`, a deterministic
+  successful-publication receipt containing the source SHA, complete file
+  SHA256/size list, and canonical entry SHA256;
 - the VM-wide `control-plane.lock`, shared by backend, frontend, and certificate
   production mutations;
 - dedicated acme.sh account, key, certificate, issuance-attempt, and verified

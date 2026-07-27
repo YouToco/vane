@@ -257,8 +257,78 @@ write_frontend_receipt() {
   mv -f "$receipt_temp" "$FRONTEND_RECEIPT_DIR/$channel.sha"
 }
 
+check_frontend_release_receipt() {
+  local planned_receipt=$1
+  local release_dir=$state_dir/releases/$source_sha
+  local release_receipt=$release_dir/frontend-aliyun.json
+  [[ ! -L $state_dir/releases && ! -L $release_dir ]] || {
+    echo "durable frontend release directory must not be a symlink" >&2
+    exit 1
+  }
+  if [[ -e $release_receipt || -L $release_receipt ]]; then
+    [[ -f $release_receipt && ! -L $release_receipt ]] || {
+      echo "durable frontend release receipt is not a regular file" >&2
+      exit 1
+    }
+    cmp -s "$planned_receipt" "$release_receipt" || {
+      echo "durable frontend release receipt conflicts with this payload" >&2
+      exit 1
+    }
+  fi
+}
+
+persist_frontend_release_receipt() {
+  local planned_receipt=$1
+  local release_dir=$state_dir/releases/$source_sha
+  local release_receipt=$release_dir/frontend-aliyun.json
+  local receipt_temp
+  [[ ! -L $state_dir/releases && ! -L $release_dir ]] || {
+    echo "durable frontend release directory must not be a symlink" >&2
+    exit 1
+  }
+  mkdir -p "$release_dir"
+  chmod 700 "$state_dir/releases" "$release_dir"
+  if [[ -e $release_receipt || -L $release_receipt ]]; then
+    [[ -f $release_receipt && ! -L $release_receipt ]] || {
+      echo "durable frontend release receipt is not a regular file" >&2
+      exit 1
+    }
+    cmp -s "$planned_receipt" "$release_receipt" || {
+      echo "durable frontend release receipt changed during publication" >&2
+      exit 1
+    }
+    return
+  fi
+  receipt_temp=$(mktemp "$release_dir/.frontend-aliyun.XXXXXX")
+  cp "$planned_receipt" "$receipt_temp"
+  chmod 600 "$receipt_temp"
+  mv "$receipt_temp" "$release_receipt"
+}
+
+stat_oss_object_with_size() {
+  local object=$1
+  local expected_size=$2
+  local object_meta
+  [[ $expected_size =~ ^[0-9]+$ ]] || {
+    echo "invalid expected OSS object size for $object" >&2
+    return 1
+  }
+  object_meta=$(
+    "$OSSUTIL_BIN" stat "oss://zhuoqidev-vane-web/$object"
+  )
+  if ! printf '%s\n' "$object_meta" |
+    grep -Eiq \
+      "^[[:space:]]*Content-Length[[:space:]]*:[[:space:]]*${expected_size}[[:space:]]*$"; then
+    echo "OSS object Content-Length does not match local file: $object" >&2
+    return 1
+  fi
+  printf '%s\n' "$object_meta"
+}
+
 deploy_frontend_aliyun() {
   local owner_preview_object="_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html"
+  local publication_plan
+  local -a refresh_urls
   if frontend_state_check; then
     :
   elif [[ $? -eq 10 ]]; then
@@ -268,6 +338,19 @@ deploy_frontend_aliyun() {
   else
     return 1
   fi
+
+  require_env FRONTEND_RECEIPT_DIR
+  command -v cmp >/dev/null
+  command -v python3 >/dev/null
+  mkdir -p "$FRONTEND_RECEIPT_DIR"
+  chmod 700 "$FRONTEND_RECEIPT_DIR"
+  publication_plan=$(mktemp -d "$FRONTEND_RECEIPT_DIR/.aliyun-plan.XXXXXX")
+  trap 'rm -rf -- "$publication_plan"' EXIT
+  "$(dirname "$0")/frontend-release.py" \
+    --dist "$payload/dist" \
+    --sha "$source_sha" \
+    --output "$publication_plan"
+  check_frontend_release_receipt "$publication_plan/release.json"
 
   require_env \
     ALIYUN_BIN OSSUTIL_BIN \
@@ -283,10 +366,6 @@ deploy_frontend_aliyun() {
   ossutil_version=$("$OSSUTIL_BIN" version)
   [[ $ossutil_version == "2.3.0" ]] || {
     echo "unexpected pinned ossutil version: $ossutil_version" >&2
-    exit 1
-  }
-  [[ -f $payload/dist/index.html && ! -L $payload/dist/index.html ]] || {
-    echo "verified frontend dist/index.html is missing" >&2
     exit 1
   }
   if [[ -e $payload/dist/$owner_preview_object ]]; then
@@ -305,9 +384,33 @@ deploy_frontend_aliyun() {
     export OSS_ACCESS_KEY_ID="$ALIYUN_ACCESS_KEY_ID"
     export OSS_ACCESS_KEY_SECRET="$ALIYUN_ACCESS_KEY_SECRET"
     export OSS_REGION=cn-shenzhen
-    "$OSSUTIL_BIN" sync \
-      "$payload/dist/" oss://zhuoqidev-vane-web/ \
-      --delete --force
+
+    # Immutable and non-HTML objects become available first. No object is
+    # deleted: older HTML can continue loading its content-hashed assets.
+    while IFS= read -r object; do
+      [[ -n $object ]] || continue
+      "$OSSUTIL_BIN" cp \
+        "$payload/dist/$object" \
+        "oss://zhuoqidev-vane-web/$object" \
+        --force
+    done <"$publication_plan/assets.list"
+
+    # The new entry and manifests must not be cut over until OSS reports the
+    # exact local Content-Length for every referenced asset.
+    while IFS=$'\t' read -r expected_size object; do
+      [[ -n $object ]] || continue
+      stat_oss_object_with_size "$object" "$expected_size" >/dev/null
+    done <"$publication_plan/critical-assets.list"
+
+    # Publish secondary HTML first. The canonical root entry is a separate,
+    # final object write after all earlier publication checks have passed.
+    while IFS= read -r object; do
+      [[ -n $object ]] || continue
+      "$OSSUTIL_BIN" cp \
+        "$payload/dist/$object" \
+        "oss://zhuoqidev-vane-web/$object" \
+        --force
+    done <"$publication_plan/html-before-entry.list"
 
     if [[ -f $payload/dist/$owner_preview_object ]]; then
       "$OSSUTIL_BIN" set-props \
@@ -316,8 +419,9 @@ deploy_frontend_aliyun() {
         --metadata-directive update \
         --force
       owner_preview_meta=$(
-        "$OSSUTIL_BIN" stat \
-          "oss://zhuoqidev-vane-web/$owner_preview_object"
+        stat_oss_object_with_size \
+          "$owner_preview_object" \
+          "$(wc -c <"$payload/dist/$owner_preview_object")"
       )
       if ! printf '%s\n' "$owner_preview_meta" |
         grep -Eiq 'Cache-Control[^[:alnum:]]+no-store'; then
@@ -326,21 +430,39 @@ deploy_frontend_aliyun() {
       fi
     fi
 
-    for attempt in 1 2 3; do
-      if ALIBABA_CLOUD_IGNORE_PROFILE=TRUE \
-        ALIBABA_CLOUD_ACCESS_KEY_ID="$ALIYUN_ACCESS_KEY_ID" \
-        ALIBABA_CLOUD_ACCESS_KEY_SECRET="$ALIYUN_ACCESS_KEY_SECRET" \
-        ALIBABA_CLOUD_REGION_ID=cn-shenzhen \
-        "$ALIYUN_BIN" cdn RefreshObjectCaches \
-        --ObjectPath "https://vane.zhuoqidev.com/" \
-        --ObjectType Directory; then
-        break
-      fi
-      [[ $attempt -lt 3 ]] || exit 1
-      sleep $((attempt * 5))
+    "$OSSUTIL_BIN" cp \
+      "$payload/dist/index.html" \
+      oss://zhuoqidev-vane-web/index.html \
+      --force
+    stat_oss_object_with_size \
+      index.html \
+      "$(wc -c <"$payload/dist/index.html")" >/dev/null
+
+    refresh_urls=()
+    while IFS= read -r refresh_path; do
+      [[ -n $refresh_path ]] || continue
+      refresh_urls+=("https://vane.zhuoqidev.com$refresh_path")
+    done <"$publication_plan/cdn-refresh-paths.list"
+    for refresh_url in "${refresh_urls[@]}"; do
+      for attempt in 1 2 3; do
+        if ALIBABA_CLOUD_IGNORE_PROFILE=TRUE \
+          ALIBABA_CLOUD_ACCESS_KEY_ID="$ALIYUN_ACCESS_KEY_ID" \
+          ALIBABA_CLOUD_ACCESS_KEY_SECRET="$ALIYUN_ACCESS_KEY_SECRET" \
+          ALIBABA_CLOUD_REGION_ID=cn-shenzhen \
+          "$ALIYUN_BIN" cdn RefreshObjectCaches \
+          --ObjectPath "$refresh_url" \
+          --ObjectType File; then
+          break
+        fi
+        [[ $attempt -lt 3 ]] || exit 1
+        sleep $((attempt * 5))
+      done
     done
   )
+  persist_frontend_release_receipt "$publication_plan/release.json"
   write_frontend_receipt aliyun
+  rm -rf -- "$publication_plan"
+  trap - EXIT
   echo "frontend Aliyun line deployed: $source_sha"
 }
 
