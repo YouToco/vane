@@ -136,6 +136,29 @@ func TestProfileClaimsPaginationRejectsInvalidQueryBeforeStore(t *testing.T) {
 	}
 }
 
+func TestProfileClaimEventPageOptionsDefaultWithoutQuery(t *testing.T) {
+	options, validationMessage := parseProfileClaimEventPageOptions(nil)
+	if validationMessage != "" {
+		t.Fatalf("parameterless GET rejected: %s", validationMessage)
+	}
+	if options.Limit != 20 || options.Cursor != "" {
+		t.Fatalf("parameterless GET options=%+v", options)
+	}
+
+	options, validationMessage = parseProfileClaimEventPageOptions(
+		map[string][]string{
+			"event_limit":  {"37"},
+			"event_cursor": {"opaque/current"},
+		},
+	)
+	if validationMessage != "" {
+		t.Fatalf("explicit pagination rejected: %s", validationMessage)
+	}
+	if options.Limit != 37 || options.Cursor != "opaque/current" {
+		t.Fatalf("explicit pagination options=%+v", options)
+	}
+}
+
 func TestCanonicalizeProfilePatch(t *testing.T) {
 	industry := "  AI 应用  "
 	occupation := " 独立开发者 "

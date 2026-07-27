@@ -184,51 +184,51 @@ func (s *server) handleUndoProfileEdit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleListProfileClaims(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query()
-	for key := range query {
-		if key != "event_limit" && key != "event_cursor" {
-			writeError(w, http.StatusBadRequest, "画像主张查询包含未知参数")
-			return
-		}
-	}
-	options := store.ProfileClaimEventPageOptions{Limit: 20}
-	if values, ok := query["event_limit"]; ok {
-		if len(values) != 1 {
-			writeError(w, http.StatusBadRequest, "event_limit 只能提供一次")
-			return
-		}
-		limit, err := strconv.Atoi(values[0])
-		if err != nil || limit < 1 || limit > 50 {
-			writeError(w, http.StatusBadRequest, "event_limit 必须是 1 到 50")
-			return
-		}
-		options.Limit = limit
-	}
-	if values, ok := query["event_cursor"]; ok {
-		if len(values) != 1 || values[0] == "" {
-			writeError(w, http.StatusBadRequest, "event_cursor 无效")
-			return
-		}
-		options.Cursor = values[0]
+	options, validationMessage := parseProfileClaimEventPageOptions(r.URL.Query())
+	if validationMessage != "" {
+		writeError(w, http.StatusBadRequest, validationMessage)
+		return
 	}
 	principal, err := auth.PrincipalFromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
-	var result *types.ProfileClaimList
-	if len(query) == 0 {
-		result, err = s.deps.Store.ListProfileClaims(
-			r.Context(), int64(principal.TenantID), principal.UserID)
-	} else {
-		result, err = s.deps.Store.ListProfileClaimsPage(
-			r.Context(), int64(principal.TenantID), principal.UserID, options)
-	}
+	result, err := s.deps.Store.ListProfileClaimsPage(
+		r.Context(), int64(principal.TenantID), principal.UserID, options)
 	if err != nil {
 		writeAppError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func parseProfileClaimEventPageOptions(
+	query map[string][]string,
+) (store.ProfileClaimEventPageOptions, string) {
+	for key := range query {
+		if key != "event_limit" && key != "event_cursor" {
+			return store.ProfileClaimEventPageOptions{}, "画像主张查询包含未知参数"
+		}
+	}
+	options := store.ProfileClaimEventPageOptions{Limit: 20}
+	if values, ok := query["event_limit"]; ok {
+		if len(values) != 1 {
+			return store.ProfileClaimEventPageOptions{}, "event_limit 只能提供一次"
+		}
+		limit, err := strconv.Atoi(values[0])
+		if err != nil || limit < 1 || limit > 50 {
+			return store.ProfileClaimEventPageOptions{}, "event_limit 必须是 1 到 50"
+		}
+		options.Limit = limit
+	}
+	if values, ok := query["event_cursor"]; ok {
+		if len(values) != 1 || values[0] == "" {
+			return store.ProfileClaimEventPageOptions{}, "event_cursor 无效"
+		}
+		options.Cursor = values[0]
+	}
+	return options, ""
 }
 
 func (s *server) handleProfileClaimAction(w http.ResponseWriter, r *http.Request) {

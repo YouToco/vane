@@ -226,11 +226,11 @@ func (s *Store) GetContentItem(ctx context.Context, id int64) (*types.ContentIte
   响应且不再次递增版本；同键异请求冲突；状态行锁 + CAS 保证并发只有一个新写生效。
   active summary claims 的总长度不超过 500 rune；mutation/跨代 pin 若突破上限必须整
   事务拒绝，不能留下 claim/event/version/profile 任一侧的半提交。
-- GET 显式提供 `event_limit`/`event_cursor` 时启用 event id DESC keyset 分页；游标绑定
-  tenant/user/version/snapshot max/before/limit，版本或 snapshot 变化返回冲突。首屏返回
-  全部 active claims（硬上界 514）及本页 event target/result context（总上界 614），
-  续页只返回本页 context（上界 100）；revoked/revocable/dependent 仍按完整 ledger 计算。
-  backend-first 过渡期内，无查询参数 GET 暂保留旧返回语义，待 UI 切换后再翻转默认。
+- GET 始终使用 event id DESC keyset 分页；省略 `event_limit` 时默认 20，显式值范围
+  1..50。游标绑定 tenant/user/version/snapshot max/before/limit，版本或 snapshot 变化返回
+  冲突。首屏返回全部 active claims（硬上界 514）及本页 event target/result context（总
+  上界 614），续页只返回本页 context（上界 100）；revoked/revocable/dependent 仍按完整
+  ledger 计算。无查询参数也不得恢复旧的无界历史响应。
 - action 响应只返回 active claims 与本次 target/result context（上界 516），并显式标记
   `claims_complete:false`；幂等 receipt 必须精确重放首次有界响应。
 - Evolver 的模型输入只能使用非 manual 的 evidence/base summary 与 tags；写回时先追加

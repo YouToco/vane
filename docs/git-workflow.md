@@ -52,6 +52,15 @@ chore(deps): bump pgx to v5.8
 - CI 绿 + self-review 后合并；GitHub 免费版私有仓库无强制 branch protection，
   以上靠纪律执行，CI 状态是硬门槛。
 
+### 后端 self-hosted runner 的 Go cache
+
+- `vane-test` 是持久化 self-hosted runner，`GOMODCACHE` 与 `GOCACHE` 已在本机跨任务复用。
+  默认 CI 因此对 `actions/setup-go` 显式设置 `cache: false`；这只关闭 GitHub Actions
+  远端 archive 的 restore/save，不会删除或禁用 runner 本地 Go cache。
+- 不要在默认 CI 重新启用 setup-go 远端 cache：向已有只读 module cache 解包会产生
+  `tar: Cannot open: File exists`，而保存整个持久目录曾产生约 1.33 GB 的 post-step 上传。
+  若将来需要远端 cache，先把两个 cache 目录隔离到每个任务的干净临时目录。
+
 ## 与里程碑排期的对应
 
 | Tag | 里程碑 | 内容 |
