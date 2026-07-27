@@ -455,6 +455,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("装配 Agent 耐久动作控制器: %w", err)
 	}
+	actionProposalController, err :=
+		agentcontinuation.NewActionProposalController(st)
+	if err != nil {
+		return fmt.Errorf("装配 Agent 耐久动作提案器: %w", err)
+	}
 	var definitionEditToolController agent.DefinitionEditController
 	if cfg.Agent.DefinitionEditEnabled {
 		definitionEditToolController = definitionEditController
@@ -479,6 +484,7 @@ func run() error {
 		// rolled back. Tool registration above is the only proposal exposure.
 		TaskDefinitionEdit: definitionEditController,
 		ActionContinuation: actionController,
+		ActionProposal:     actionProposalController,
 	})
 	if err != nil {
 		return fmt.Errorf("装配 Agent 工具注册表: %w", err)

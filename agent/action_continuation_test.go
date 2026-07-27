@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/agentcontinuation"
+	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/task"
 )
 
@@ -18,6 +20,88 @@ type fakeActionContinuationController struct {
 	cancelCalls    int
 	onConfirm      func()
 	onCancel       func()
+}
+
+type fakeActionProposalController struct {
+	input   agentcontinuation.ActionProposalInput
+	outcome agentcontinuation.ActionProposal
+	err     error
+	calls   int
+}
+
+func (f *fakeActionProposalController) Propose(
+	_ context.Context,
+	in agentcontinuation.ActionProposalInput,
+) (agentcontinuation.ActionProposal, error) {
+	f.calls++
+	f.input = in
+	if f.outcome.ID == "" {
+		f.outcome = agentcontinuation.ActionProposal{
+			ID: in.ActionID, Summary: in.Summary,
+		}
+	}
+	return f.outcome, f.err
+}
+
+func TestRunToolCalls_EnableSourceUsesOnlyAtomicDurableProposal(
+	t *testing.T,
+) {
+	fs := newFakeStore()
+	tool := &fakeTool{
+		name: "enable_source", mutating: true,
+		result: "must not execute",
+	}
+	loop := newTestLoop(t, fs, (&scriptedChat{}).fn, tool)
+	proposer := &fakeActionProposalController{}
+	loop.actionProposal = proposer
+	sessionID := int64(19)
+
+	pending, replies, err := loop.runToolCalls(
+		t.Context(), 7, &sessionID, []llm.ToolCall{{
+			ID: "call", Name: "enable_source",
+			Arguments: `{"source_id":11}`,
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proposer.calls != 1 || proposer.input.UserID != 7 ||
+		proposer.input.SessionID != sessionID ||
+		proposer.input.ToolName != "enable_source" ||
+		string(proposer.input.RawArgs) != `{"source_id":11}` ||
+		time.Until(proposer.input.ExpiresAt) < 23*time.Hour {
+		t.Fatalf("proposal call drifted: %+v", proposer)
+	}
+	if pending == nil || pending.ID != proposer.outcome.ID ||
+		len(replies) != 1 || len(fs.actions) != 0 ||
+		len(tool.calls) != 0 {
+		t.Fatalf(
+			"pending=%+v replies=%+v legacy=%d executes=%d",
+			pending, replies, len(fs.actions), len(tool.calls),
+		)
+	}
+}
+
+func TestRunToolCalls_EnableSourceMiswireDoesNotFallBackToLegacyRoot(
+	t *testing.T,
+) {
+	fs := newFakeStore()
+	tool := &fakeTool{name: "enable_source", mutating: true}
+	loop := newTestLoop(t, fs, (&scriptedChat{}).fn, tool)
+	sessionID := int64(19)
+	pending, _, err := loop.runToolCalls(
+		t.Context(), 7, &sessionID, []llm.ToolCall{{
+			ID: "call", Name: "enable_source",
+			Arguments: `{"source_id":11}`,
+		}},
+	)
+	if err == nil || pending != nil || len(fs.actions) != 0 ||
+		len(tool.calls) != 0 {
+		t.Fatalf(
+			"miswire fell back: pending=%+v legacy=%d executes=%d err=%v",
+			pending, len(fs.actions), len(tool.calls), err,
+		)
+	}
 }
 
 func (f *fakeActionContinuationController) Confirm(

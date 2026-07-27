@@ -22,12 +22,14 @@ func TestActionContinuationWiringStartsBeforeIngressAndDrainsBeforeStoreClose(
 	}
 	source := string(raw)
 	for fragment, want := range map[string]int{
-		"agentcontinuation.NewActionController(st)": 1,
-		"ActionContinuation: actionController":      1,
-		"agentcontinuation.NewActionDispatcher(":    1,
-		"actionDispatcher.Start(ctx)":               1,
-		"actionDispatcher.Stop()":                   1,
-		"actionDispatcher.Wait(actionDrainCtx)":     1,
+		"agentcontinuation.NewActionController(st)":         1,
+		"agentcontinuation.NewActionProposalController(st)": 1,
+		"ActionContinuation: actionController":              1,
+		"ActionProposal:     actionProposalController":      1,
+		"agentcontinuation.NewActionDispatcher(":            1,
+		"actionDispatcher.Start(ctx)":                       1,
+		"actionDispatcher.Stop()":                           1,
+		"actionDispatcher.Wait(actionDrainCtx)":             1,
 	} {
 		if got := strings.Count(source, fragment); got != want {
 			t.Fatalf("%q count=%d want=%d", fragment, got, want)

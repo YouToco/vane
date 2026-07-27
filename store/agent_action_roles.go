@@ -13,7 +13,50 @@ import (
 const (
 	agentActionOperatorRole    = "vane_agent_action_operator"
 	agentActionContinuatorRole = "vane_agent_action_continuator"
+	agentActionProposerRole    = "vane_agent_action_proposer"
 )
+
+func validateAgentActionProposer(ctx context.Context, tx pgx.Tx) error {
+	if err := validateAgentActionRole(
+		ctx, tx, agentActionProposerRole,
+		agentActionProposerSelectColumns(),
+		agentActionProposerInsertColumns(),
+		nil,
+		[]string{
+			"agent_action_continuation_authority_events_id_seq:USAGE",
+		},
+	); err != nil {
+		return err
+	}
+	var unrelated bool
+	if err := tx.QueryRow(ctx, `
+		SELECT NOT EXISTS (
+		         SELECT 1
+		           FROM pg_auth_members am
+		           JOIN pg_roles granted_role ON granted_role.oid=am.roleid
+		           JOIN pg_roles member_role ON member_role.oid=am.member
+		          WHERE (
+		                   granted_role.rolname=$1
+		               AND member_role.rolname=ANY($2::name[])
+		                ) OR (
+		                   member_role.rolname=$1
+		               AND granted_role.rolname=ANY($2::name[])
+		                )
+		       )`,
+		agentActionProposerRole,
+		[]string{
+			"vane_app",
+			agentActionOperatorRole,
+			agentActionContinuatorRole,
+		},
+	).Scan(&unrelated); err != nil || !unrelated {
+		return agentActionRoleDrift(
+			agentActionProposerRole,
+			fmt.Sprintf("peer roles unrelated=%v err=%v", unrelated, err),
+		)
+	}
+	return nil
+}
 
 func validateAgentActionOperator(ctx context.Context, tx pgx.Tx) error {
 	return validateAgentActionRole(
@@ -245,6 +288,20 @@ func mergeSortedColumns(groups ...[]string) []string {
 	return values
 }
 
+func withoutColumns(values []string, excluded ...string) []string {
+	exclusion := make(map[string]struct{}, len(excluded))
+	for _, value := range excluded {
+		exclusion[value] = struct{}{}
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, omit := exclusion[value]; !omit {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
 func agentActionOperatorRootSelectColumns() []string {
 	return prefixedColumns(
 		"pending_actions",
@@ -295,6 +352,50 @@ func agentActionOperatorSelectColumns() []string {
 		agentActionOperatorRootSelectColumns(),
 		agentActionContinuationSelectColumns(),
 		agentActionAuthoritySelectColumns(),
+	)
+}
+
+func agentActionProposerSelectColumns() []string {
+	return mergeSortedColumns(
+		prefixedColumns(
+			"pending_actions",
+			"args", "execution_version", "expires_at", "id", "session_id",
+			"status", "summary", "tenant_id", "tool_name", "user_id",
+		),
+		withoutColumns(
+			agentActionContinuationSelectColumns(),
+			"agent_action_continuations.created_at",
+			"agent_action_continuations.tool_name",
+			"agent_action_continuations.updated_at",
+		),
+		prefixedColumns(
+			"agent_action_continuation_authority_events",
+			"action_id", "evidence", "generation", "mode",
+		),
+	)
+}
+
+func agentActionProposerInsertColumns() []string {
+	return mergeSortedColumns(
+		prefixedColumns(
+			"pending_actions",
+			"args", "execution_version", "expires_at", "id", "session_id",
+			"status", "summary", "tenant_id", "tool_name", "user_id",
+		),
+		prefixedColumns(
+			"agent_action_continuations",
+			"action_id", "adapter_version", "args_digest", "canonical_args",
+			"next_attempt_at",
+			"not_found_digest", "not_found_messages", "session_id", "source_id",
+			"success_digest", "success_messages", "tenant_id", "tool_name",
+			"tool_policy", "tool_policy_digest", "tool_policy_version",
+			"tool_spec", "tool_spec_digest", "tool_spec_version", "user_id",
+		),
+		prefixedColumns(
+			"agent_action_continuation_authority_events",
+			"action_id", "evidence", "generation", "mode", "tenant_id",
+			"user_id",
+		),
 	)
 }
 

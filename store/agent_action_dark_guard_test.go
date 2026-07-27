@@ -17,6 +17,7 @@ import (
 )
 
 var agentActionEntryPoints = map[string]bool{
+	"ProposeAgentActionContinuation":          true,
 	"GetAgentActionContinuationStatus":        true,
 	"ActivateAgentActionContinuation":         true,
 	"RollbackAgentActionContinuation":         true,
@@ -43,6 +44,27 @@ type agentActionReferenceAllowance struct {
 }
 
 var agentActionReferenceAllowances = []agentActionReferenceAllowance{
+	{
+		path:        "agentcontinuation/action_proposal_controller.go",
+		declaration: "actionProposalStore",
+		references: map[string]int{
+			"ProposeAgentActionContinuation": 1,
+		},
+	},
+	{
+		path:        "agentcontinuation/action_proposal_controller.go",
+		declaration: "NewActionProposalController",
+		receiver:    "st",
+		references:  map[string]int{},
+	},
+	{
+		path:        "agentcontinuation/action_proposal_controller.go",
+		declaration: "Propose",
+		receiver:    "c.actionStore",
+		references: map[string]int{
+			"ProposeAgentActionContinuation": 2,
+		},
+	},
 	{
 		path:        "cmd/runtimeadmin/main.go",
 		declaration: "agentActionCutoverStore",
@@ -871,7 +893,8 @@ func agentActionForbiddenEntryReferences(
 		}
 		if filepath.Dir(path) == filepath.Clean(storeRoot) &&
 			(filepath.Base(path) == "agent_action_continuation.go" ||
-				filepath.Base(path) == "agent_action_projection.go") &&
+				filepath.Base(path) == "agent_action_projection.go" ||
+				filepath.Base(path) == "agent_action_proposal.go") &&
 			function.Recv != nil {
 			allowedDefinitions[function.Name] = true
 			continue
@@ -1310,12 +1333,25 @@ func agentActionRoleEntryViolations(
 	storeRoot string,
 ) []string {
 	var violations []string
-	want := filepath.Join(
+	continuationDefinitions := filepath.Join(
 		filepath.Clean(storeRoot), "agent_action_continuation.go",
 	)
-	roleEntries := map[string]int{
-		"SET LOCAL ROLE vane_agent_action_operator":    0,
-		"SET LOCAL ROLE vane_agent_action_continuator": 0,
+	proposalDefinitions := filepath.Join(
+		filepath.Clean(storeRoot), "agent_action_proposal.go",
+	)
+	roleEntries := map[string]struct {
+		count int
+		path  string
+	}{
+		"SET LOCAL ROLE vane_agent_action_operator": {
+			path: continuationDefinitions,
+		},
+		"SET LOCAL ROLE vane_agent_action_continuator": {
+			path: continuationDefinitions,
+		},
+		"SET LOCAL ROLE vane_agent_action_proposer": {
+			path: proposalDefinitions,
+		},
 	}
 	for path, file := range files {
 		ast.Inspect(file, func(node ast.Node) bool {
@@ -1323,10 +1359,11 @@ func agentActionRoleEntryViolations(
 			if !ok || literal.Kind != token.STRING {
 				return true
 			}
-			for role := range roleEntries {
+			for role, entry := range roleEntries {
 				if strings.Contains(literal.Value, role) {
-					roleEntries[role]++
-					if path != want {
+					entry.count++
+					roleEntries[role] = entry
+					if path != entry.path {
 						violations = append(
 							violations,
 							fmt.Sprintf("%s: %s escaped controller",
@@ -1338,11 +1375,11 @@ func agentActionRoleEntryViolations(
 			return true
 		})
 	}
-	for role, count := range roleEntries {
-		if count != 1 {
+	for role, entry := range roleEntries {
+		if entry.count != 1 {
 			violations = append(
 				violations,
-				fmt.Sprintf("%s count=%d want=1", role, count),
+				fmt.Sprintf("%s count=%d want=1", role, entry.count),
 			)
 		}
 	}
@@ -1353,10 +1390,16 @@ func agentActionRoleHelperReferenceViolations(
 	files map[string]*ast.File,
 	storeRoot string,
 ) []string {
-	wantDefinitions := filepath.Join(
+	continuationDefinitions := filepath.Join(
 		filepath.Clean(storeRoot), "agent_action_continuation.go",
 	)
+	proposalDefinitions := filepath.Join(
+		filepath.Clean(storeRoot), "agent_action_proposal.go",
+	)
 	allowedCallers := map[string]map[string]bool{
+		"setAgentActionProposerContext": {
+			"ProposeAgentActionContinuation": true,
+		},
 		"setAgentActionOperatorContext": {
 			"GetAgentActionContinuationStatus": true,
 			"ActivateAgentActionContinuation":  true,
@@ -1369,12 +1412,20 @@ func agentActionRoleHelperReferenceViolations(
 			"ReleaseAgentActionContinuation": true,
 		},
 	}
+	definitions := map[string]string{
+		"setAgentActionProposerContext":    proposalDefinitions,
+		"setAgentActionOperatorContext":    continuationDefinitions,
+		"setAgentActionContinuatorContext": continuationDefinitions,
+	}
 	allowedFiles := map[string]map[string]bool{
+		"setAgentActionProposerContext": {
+			proposalDefinitions: true,
+		},
 		"setAgentActionOperatorContext": {
-			wantDefinitions: true,
+			continuationDefinitions: true,
 		},
 		"setAgentActionContinuatorContext": {
-			wantDefinitions: true,
+			continuationDefinitions: true,
 			filepath.Join(
 				filepath.Clean(storeRoot),
 				"agent_action_projection.go",
@@ -1390,7 +1441,7 @@ func agentActionRoleHelperReferenceViolations(
 			}
 			for helper, callers := range allowedCallers {
 				if function.Name.Name == helper {
-					if path != wantDefinitions {
+					if path != definitions[helper] {
 						violations = append(
 							violations,
 							fmt.Sprintf("%s: role helper %s redeclared",
