@@ -57,8 +57,12 @@ func TestResolveRepoRelativeFileRejectsAbsoluteAndParentPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != timingPath {
-		t.Fatalf("resolved path = %q, want %q", got, timingPath)
+	resolvedTimingPath, err := filepath.EvalSymlinks(timingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != resolvedTimingPath {
+		t.Fatalf("resolved path = %q, want %q", got, resolvedTimingPath)
 	}
 	if _, err := resolveRepoRelativeFile(repo, timingPath); err == nil {
 		t.Fatal("absolute timing path was accepted")
