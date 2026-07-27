@@ -16,6 +16,7 @@ PREVIEW_OBJECT = (
 JS_OBJECT = "assets/app-AbCdEf12.js"
 CSS_OBJECT = "assets/app-ZyXwVu98.css"
 SHARED_JS_OBJECT = "assets/shared-QwErTy12.js"
+VITE_ASSET_OBJECT = "assets/VaneMascot-Hash1234.webp"
 ICON_OBJECT = "brand icon.png"
 
 
@@ -59,6 +60,7 @@ class FrontendAliyunTests(unittest.TestCase):
             (dist / SHARED_JS_OBJECT).write_text(
                 "new-shared", encoding="utf-8"
             )
+            (dist / VITE_ASSET_OBJECT).write_bytes(b"new-vite-asset")
             (dist / ICON_OBJECT).write_bytes(b"new-icon")
             (dist / "manifest.webmanifest").write_text(
                 json.dumps({"icons": [{"src": f"/{ICON_OBJECT}"}]}),
@@ -70,6 +72,7 @@ class FrontendAliyunTests(unittest.TestCase):
                         "src/main.ts": {
                             "file": JS_OBJECT,
                             "css": [CSS_OBJECT],
+                            "assets": [VITE_ASSET_OBJECT],
                             "imports": ["_shared"],
                             "dynamicImports": ["_shared"],
                         },
@@ -234,6 +237,20 @@ class FrontendAliyunTests(unittest.TestCase):
             ]
             self.assertGreaterEqual(len(critical_stats), 3, calls)
             self.assertTrue(all(index < entry_cp for index in critical_stats), calls)
+            vite_asset_cp = next(
+                index
+                for index, call in enumerate(calls)
+                if "\tcp\t" in call
+                and f"\toss://zhuoqidev-vane-web/{VITE_ASSET_OBJECT}\t" in call
+            )
+            vite_asset_stat = next(
+                index
+                for index, call in enumerate(calls)
+                if "\tstat\t" in call
+                and f"\toss://zhuoqidev-vane-web/{VITE_ASSET_OBJECT}\t" in call
+            )
+            self.assertLess(vite_asset_cp, vite_asset_stat, calls)
+            self.assertLess(vite_asset_stat, entry_cp, calls)
             entry_stat = next(
                 index
                 for index, call in enumerate(calls)
@@ -311,12 +328,13 @@ class FrontendAliyunTests(unittest.TestCase):
                     JS_OBJECT,
                     "manifest.webmanifest",
                     SHARED_JS_OBJECT,
+                    VITE_ASSET_OBJECT,
                 },
             )
 
     def test_failed_asset_verification_does_not_cut_over_entry(self) -> None:
         with self.publication_case() as case:
-            result = self.run_deploy(case, FAIL_SIZE_OBJECT=JS_OBJECT)
+            result = self.run_deploy(case, FAIL_SIZE_OBJECT=VITE_ASSET_OBJECT)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Content-Length does not match", result.stderr)
             self.assertEqual(
@@ -331,6 +349,7 @@ class FrontendAliyunTests(unittest.TestCase):
                 calls,
             )
             self.assertTrue((case["remote"] / "assets" / "old-hash.js").exists())
+            self.assertFalse(case["aliyun_log"].exists())
             self.assertFalse((case["receipts"] / "aliyun.sha").exists())
             self.assertFalse(
                 (
@@ -432,6 +451,46 @@ class FrontendAliyunTests(unittest.TestCase):
                 (case["remote"] / "index.html").read_text(encoding="utf-8"),
                 "old-index",
             )
+
+    def test_missing_vite_asset_fails_before_any_remote_mutation(self) -> None:
+        with self.publication_case() as case:
+            (case["dist"] / VITE_ASSET_OBJECT).unlink()
+
+            result = self.run_deploy(case)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                f"referenced frontend file is missing: {VITE_ASSET_OBJECT}",
+                result.stderr,
+            )
+            self.assertFalse(case["ossutil_log"].exists())
+            self.assertFalse(case["aliyun_log"].exists())
+            self.assertEqual(
+                (case["remote"] / "index.html").read_text(encoding="utf-8"),
+                "old-index",
+            )
+
+    def test_vite_assets_list_is_strictly_validated_before_remote_calls(
+        self,
+    ) -> None:
+        for invalid_assets in ("not-a-list", [""], [123]):
+            with (
+                self.subTest(invalid_assets=invalid_assets),
+                self.publication_case() as case,
+            ):
+                manifest_path = case["dist"] / ".vite" / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["src/main.ts"]["assets"] = invalid_assets
+                manifest_path.write_text(
+                    json.dumps(manifest), encoding="utf-8"
+                )
+
+                result = self.run_deploy(case)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "Vite manifest assets list is invalid", result.stderr
+                )
+                self.assertFalse(case["ossutil_log"].exists())
+                self.assertFalse(case["aliyun_log"].exists())
 
     def test_vite_dependency_keys_must_exist_before_remote_calls(self) -> None:
         for field in ("imports", "dynamicImports"):

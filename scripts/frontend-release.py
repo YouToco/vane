@@ -150,6 +150,13 @@ def vite_manifest_references(
         references.extend(css_values)
         runtime_references.extend(css_values)
 
+        asset_values = entry.get("assets", [])
+        if not isinstance(asset_values, list) or not all(
+            isinstance(item, str) and item for item in asset_values
+        ):
+            raise ValueError(f"Vite manifest assets list is invalid: {path}:{key}")
+        references.extend(asset_values)
+
         for field in ("imports", "dynamicImports"):
             dependencies = entry.get(field, [])
             if not isinstance(dependencies, list) or not all(
