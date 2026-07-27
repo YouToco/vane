@@ -18,7 +18,7 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-const latestMigrationVersion int64 = 61
+const latestMigrationVersion int64 = 62
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -102,6 +102,11 @@ var wantTables = []string{
 	// 061 channel-neutral exact-run outcome and immutable whole-Brief snapshot.
 	"task_run_outcomes",
 	"brief_snapshots",
+	// 062 来源级画像纠正 ledger、状态与响应丢失回执。
+	"profile_claim_states",
+	"profile_claims",
+	"profile_claim_events",
+	"profile_claim_receipts",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的

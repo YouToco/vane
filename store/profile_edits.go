@@ -77,7 +77,17 @@ func (s *Store) PatchProfile(
 	before := profileEditFields{Tags: []string{}, RemovedTags: []string{}}
 	var afterProfile *types.Profile
 	if expectedUpdatedAt == nil {
+		if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_profile_claim_editor`); err != nil {
+			return nil, profileClaimDBError("enter claim role for initial profile", err)
+		}
 		afterProfile, err = insertAbsentProfileTx(ctx, tx, tenantID, userID, patch)
+		if err == nil {
+			err = seedInitialManualProfileClaimsTx(
+				ctx, tx, tenantID, userID, afterProfile)
+		}
+		if _, roleErr := tx.Exec(ctx, `SET LOCAL ROLE vane_profile_editor`); roleErr != nil && err == nil {
+			err = profileClaimDBError("restore profile editor after initial profile", roleErr)
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			if p, found, replayErr := replayProfileEditTx(ctx, tx, tenantID, userID, idempotencyKey, requestDigest); replayErr != nil {
 				return nil, replayErr
@@ -87,23 +97,16 @@ func (s *Store) PatchProfile(
 			return nil, types.NewAppError(types.CodeConflict, "画像已经存在，请刷新后重试", nil)
 		}
 	} else {
-		current, loadErr := lockProfileTx(ctx, tx, tenantID, userID)
-		if loadErr != nil {
-			return nil, loadErr
-		}
 		if p, found, replayErr := replayProfileEditTx(ctx, tx, tenantID, userID, idempotencyKey, requestDigest); replayErr != nil {
 			return nil, replayErr
 		} else if found {
 			return p, commitProfileReplay(ctx, tx)
 		}
-		if !current.UpdatedAt.Equal(*expectedUpdatedAt) {
-			return nil, types.NewAppError(types.CodeConflict, "画像已发生变化，请刷新后重试", nil)
-		}
-		before = editableFields(current)
-		afterProfile, err = updateProfileTx(ctx, tx, tenantID, userID, *expectedUpdatedAt, patch)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, types.NewAppError(types.CodeConflict, "画像已发生变化，请刷新后重试", nil)
-		}
+		return nil, types.NewAppError(
+			types.CodeConflict,
+			"来源级画像 authority 已启用，请通过画像主张纠正",
+			nil,
+		)
 	}
 	if err != nil {
 		return nil, profileEditDBError("write profile patch", err)
@@ -146,61 +149,11 @@ func (s *Store) UndoProfileEdit(
 	} else if found {
 		return p, commitProfileReplay(ctx, tx)
 	}
-	target, err := profileRevisionByIDTx(
-		ctx, tx, tenantID, userID, targetRevisionID)
-	if err != nil {
-		return nil, err
-	}
-	current, err := lockProfileTx(ctx, tx, tenantID, userID)
-	if err != nil {
-		return nil, err
-	}
-	if p, found, replayErr := replayProfileEditTx(ctx, tx, tenantID, userID, idempotencyKey, requestDigest); replayErr != nil {
-		return nil, replayErr
-	} else if found {
-		return p, commitProfileReplay(ctx, tx)
-	}
-	latest, err := latestProfileRevisionTx(ctx, tx, tenantID, userID)
-	if err != nil {
-		return nil, err
-	}
-	if latest.ID != target.ID || target.Kind != "edit" || !target.Before.Exists {
-		return nil, types.NewAppError(types.CodeConflict, "只能撤销当前画像的最近一次编辑", nil)
-	}
-	if !current.UpdatedAt.Equal(expectedUpdatedAt) ||
-		!current.UpdatedAt.Equal(target.ResultUpdatedAt) ||
-		!equalProfileEditFields(editableFields(current), target.After) {
-		return nil, types.NewAppError(types.CodeConflict, "画像已发生后续变化，不能撤销", nil)
-	}
-	var restored types.Profile
-	err = scanProfileEdit(tx.QueryRow(ctx,
-		`UPDATE profiles
-		    SET industry=$4,occupation=$5,tags=$6,removed_tags=$7,
-		        updated_at=GREATEST(clock_timestamp(),updated_at+interval '1 microsecond')
-		  WHERE tenant_id=$1 AND user_id=$2 AND updated_at=$3
-		  RETURNING `+profileEditColumns,
-		tenantID, userID, expectedUpdatedAt, target.Before.Industry,
-		target.Before.Occupation, target.Before.Tags, target.Before.RemovedTags), &restored)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, types.NewAppError(types.CodeConflict, "画像已发生变化，请刷新后重试", nil)
-	}
-	if err != nil {
-		return nil, profileEditDBError("undo profile edit", err)
-	}
-	undoID, err := insertProfileRevisionTx(
-		ctx, tx, tenantID, userID, "undo", &target.ID,
-		editableFields(current), editableFields(&restored), restored.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	response := publicProfile(&restored)
-	if err := insertProfileReceiptTx(ctx, tx, tenantID, userID, idempotencyKey, requestDigest, undoID, &response); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, profileEditDBError("commit profile undo", err)
-	}
-	return &response, nil
+	return nil, types.NewAppError(
+		types.CodeConflict,
+		"来源级画像 authority 已启用，旧画像编辑不可撤销；请撤销对应主张事件",
+		nil,
+	)
 }
 
 func (s *Store) ListProfileEdits(
@@ -242,25 +195,14 @@ func (s *Store) ListProfileEdits(
 	if err := rows.Err(); err != nil {
 		return nil, profileEditDBError("iterate profile revisions", err)
 	}
-	var current *types.Profile
-	if len(raw) > 0 {
-		current, err = locklessProfileTx(ctx, tx, tenantID, userID)
-		if err != nil && !errors.Is(err, types.ErrNotFound) {
-			return nil, err
-		}
-		if errors.Is(err, types.ErrNotFound) {
-			current = nil
-		}
-	}
 	out := make([]types.ProfileEditRevision, 0, len(raw))
-	for i, r := range raw {
-		undoable := i == 0 && r.Kind == "edit" && r.Before.Exists &&
-			current != nil && current.UpdatedAt.Equal(r.ResultUpdatedAt) &&
-			equalProfileEditFields(editableFields(current), r.After)
+	for _, r := range raw {
 		out = append(out, types.ProfileEditRevision{
 			ID: strconv.FormatInt(r.ID, 10), CreatedAt: r.CreatedAt,
 			Actor: "self", Kind: r.Kind, Changes: publicProfileChanges(r.Before, r.After),
-			Undoable: undoable,
+			// Since 062, legacy revisions are audit-only. Recovery is an
+			// append-only revoke event in the claim ledger.
+			Undoable: false,
 		})
 	}
 	if err := tx.Commit(ctx); err != nil {

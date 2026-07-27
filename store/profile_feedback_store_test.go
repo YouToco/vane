@@ -16,9 +16,9 @@ import (
 )
 
 // TestProfileStore 是 DATABASE_URL 门控的集成测试（无则跳过，与 pipeline_store_test.go
-// 同一模式），覆盖 M5 契约 §15 store/profiles 段：UpsertProfileFields 首采 INSERT /
-// 部分更新 nil 不改 / 不触 summary 与游标 / tags 截 12；EvolveProfile (updated_at, 游标)
-// 双条件 CAS；AdvanceProfileCursor 不刷 updated_at 且校验旧游标。
+// 同一模式），覆盖 062 authority：UpsertProfileFields 仅首采 INSERT，已有画像
+// fail-closed；EvolveProfile (updated_at, 游标) 双条件 CAS；AdvanceProfileCursor
+// 不刷 updated_at 且校验旧游标。
 func TestProfileStore(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -43,12 +43,18 @@ func TestProfileStore(t *testing.T) {
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
 		defer cancel()
-		// FK 逆序：profiles → users。
+		for _, table := range []string{
+			"profile_claim_receipts", "profile_claim_events",
+			"profile_claims", "profile_claim_states",
+		} {
+			cleanupExec(ctx, t, st, "DELETE FROM "+table+" WHERE user_id=$1", u.ID)
+		}
 		cleanupExec(ctx, t, st, `DELETE FROM profiles WHERE user_id = $1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE user_id = $1`, u.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id = $1`, u.ID)
 	})
 
-	t.Run("首采INSERT与部分更新nil不改", func(t *testing.T) {
+	t.Run("首采INSERT并初始化manual claims后更新fail-closed", func(t *testing.T) {
 		if _, err := st.GetProfile(ctx, u.ID); !errors.Is(err, types.ErrNotFound) {
 			t.Fatalf("无画像时 GetProfile 应 ErrNotFound，实际: %v", err)
 		}
@@ -68,31 +74,28 @@ func TestProfileStore(t *testing.T) {
 			t.Errorf("首采不应带 summary/游标: summary=%q cursor=%d", p.Summary, p.LastEvolvedFeedbackID)
 		}
 
-		// 部分更新：只给 occupation，industry/tags 传 nil 不改。
+		claims, err := st.ListProfileClaims(ctx, 1, u.ID)
+		if err != nil || claims.Version != 0 {
+			t.Fatalf("首采 claims=%+v err=%v", claims, err)
+		}
+		for _, claim := range claims.Claims {
+			if claim.Source.State != "manual" {
+				t.Fatalf("首采来源不是 manual: %+v", claim)
+			}
+		}
 		occ2 := "架构师"
-		p2, err := st.UpsertProfileFields(ctx, u.ID, nil, &occ2, nil)
-		if err != nil {
-			t.Fatalf("UpsertProfileFields() 部分更新失败: %v", err)
-		}
-		if p2.Industry != "科技" {
-			t.Errorf("industry 传 nil 不应被改: %q", p2.Industry)
-		}
-		if p2.Occupation != "架构师" {
-			t.Errorf("occupation 应更新为架构师: %q", p2.Occupation)
-		}
-		if len(p2.Tags) != 2 || p2.Tags[0] != "Go" {
-			t.Errorf("tags 传 nil 不应被改: %v", p2.Tags)
-		}
-		// 人工写恒刷 updated_at（并发演化 CAS 失效退让的依据）。
-		if !p2.UpdatedAt.After(p.UpdatedAt) {
-			t.Errorf("Upsert 应刷新 updated_at：前 %v，后 %v", p.UpdatedAt, p2.UpdatedAt)
+		if _, err := st.UpsertProfileFields(
+			ctx, u.ID, nil, &occ2, nil,
+		); !errors.Is(err, types.ErrConflict) {
+			t.Fatalf("已有画像 update_profile 必须 fail-closed: %v", err)
 		}
 
 		got, err := st.GetProfile(ctx, u.ID)
 		if err != nil {
 			t.Fatalf("GetProfile() 失败: %v", err)
 		}
-		if got.Occupation != "架构师" || got.UserID != u.ID {
+		if got.Occupation != "后端工程师" || got.UserID != u.ID ||
+			!got.UpdatedAt.Equal(p.UpdatedAt) {
 			t.Errorf("GetProfile 回读不一致: %+v", got)
 		}
 	})
@@ -109,15 +112,15 @@ func TestProfileStore(t *testing.T) {
 		}
 
 		ind := "互联网"
-		p2, err := st.UpsertProfileFields(ctx, u.ID, &ind, nil, nil)
-		if err != nil {
-			t.Fatalf("UpsertProfileFields() 失败: %v", err)
+		if _, err := st.UpsertProfileFields(
+			ctx, u.ID, &ind, nil, nil,
+		); !errors.Is(err, types.ErrConflict) {
+			t.Fatalf("已有画像 Upsert 应冲突: %v", err)
 		}
-		if p2.Summary != "对 Go 与 AI 工程实践感兴趣" {
-			t.Errorf("Upsert 不得触碰演化产物 summary: %q", p2.Summary)
-		}
-		if p2.LastEvolvedFeedbackID != 42 {
-			t.Errorf("Upsert 不得触碰演化游标: %d", p2.LastEvolvedFeedbackID)
+		p2, err := st.GetProfile(ctx, u.ID)
+		if err != nil || p2.Summary != "对 Go 与 AI 工程实践感兴趣" ||
+			p2.LastEvolvedFeedbackID != 42 || p2.Industry != "科技" {
+			t.Fatalf("fail-closed 后画像漂移: %+v err=%v", p2, err)
 		}
 	})
 
@@ -126,7 +129,22 @@ func TestProfileStore(t *testing.T) {
 		for i := range tags {
 			tags[i] = "标签" + string(rune('A'+i))
 		}
-		p, err := st.UpsertProfileFields(ctx, u.ID, nil, nil, tags)
+		uTags, err := st.UpsertUserByOpenID(
+			ctx, "test_profile_tags_"+uuid.NewString(), "profile-tags")
+		if err != nil {
+			t.Fatal(err)
+		}
+		attachTenant(t, st, uTags.ID)
+		t.Cleanup(func() {
+			c, cancel := cleanupContext()
+			defer cancel()
+			for _, table := range []string{"profile_claims", "profile_claim_states", "profiles"} {
+				cleanupExec(c, t, st, "DELETE FROM "+table+" WHERE user_id=$1", uTags.ID)
+			}
+			cleanupExec(c, t, st, `DELETE FROM memberships WHERE user_id=$1`, uTags.ID)
+			cleanupExec(c, t, st, `DELETE FROM users WHERE id=$1`, uTags.ID)
+		})
+		p, err := st.UpsertProfileFields(ctx, uTags.ID, nil, nil, tags)
 		if err != nil {
 			t.Fatalf("UpsertProfileFields() 失败: %v", err)
 		}
@@ -143,9 +161,28 @@ func TestProfileStore(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetProfile() 失败: %v", err)
 		}
-		// 人工修正介入（无条件写刷 updated_at）→ 过期 token 演化必须冲突退让。
-		if _, err := st.UpsertProfileFields(ctx, u.ID, nil, nil, nil); err != nil {
-			t.Fatalf("UpsertProfileFields() 失败: %v", err)
+		claims, err := st.ListProfileClaims(ctx, 1, u.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var target int64
+		for _, claim := range claims.Claims {
+			if claim.Active && claim.Field == "tag" {
+				target = parseTestID(t, claim.ID)
+				break
+			}
+		}
+		if target == 0 {
+			t.Fatal("missing active tag claim")
+		}
+		if _, err := st.ApplyProfileClaimAction(
+			ctx, 1, u.ID,
+			types.ProfileClaimAction{
+				ExpectedVersion: claims.Version, Action: "pin", ClaimID: target,
+			},
+			"profile-cas-pin", strings.Repeat("a", 64),
+		); err != nil {
+			t.Fatalf("claim pin failed: %v", err)
 		}
 		err = st.EvolveProfile(ctx, u.ID, "过期演化不应写入", nil,
 			stale.LastEvolvedFeedbackID+1, stale.UpdatedAt, stale.LastEvolvedFeedbackID)
@@ -177,7 +214,9 @@ func TestProfileStore(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetProfile() 失败: %v", err)
 		}
-		if got.Summary != "新摘要。不感兴趣：美股。" || len(got.Tags) != 4 {
+		if !strings.Contains(got.Summary, "新摘要。不感兴趣：美股。") ||
+			!strings.Contains(got.Summary, "人工纠正：固定标签=Go") ||
+			len(got.Tags) != 4 {
 			t.Errorf("演化写入回读不一致: summary=%q tags=%v", got.Summary, got.Tags)
 		}
 		if got.LastEvolvedFeedbackID != fresh.LastEvolvedFeedbackID+7 {
@@ -239,7 +278,10 @@ func TestProfileStore(t *testing.T) {
 		t.Cleanup(func() {
 			ctx, cancel := cleanupContext()
 			defer cancel()
+			cleanupExec(ctx, t, st, `DELETE FROM profile_claims WHERE user_id = $1`, uRM.ID)
+			cleanupExec(ctx, t, st, `DELETE FROM profile_claim_states WHERE user_id = $1`, uRM.ID)
 			cleanupExec(ctx, t, st, `DELETE FROM profiles WHERE user_id = $1`, uRM.ID)
+			cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE user_id = $1`, uRM.ID)
 			cleanupExec(ctx, t, st, `DELETE FROM users WHERE id = $1`, uRM.ID)
 		})
 		// 黑名单语义是集合，比较序无关：array_agg ORDER BY 的具体顺序取决于库
@@ -265,6 +307,12 @@ func TestProfileStore(t *testing.T) {
 			t.Fatalf("首采失败: %v", err)
 		}
 		eq(t, p.RemovedTags, []string{}, "首采黑名单应为空")
+		if _, err := st.UpsertProfileFields(
+			ctx, uRM.ID, nil, nil, []string{"甲", "丙"},
+		); !errors.Is(err, types.ErrConflict) {
+			t.Fatalf("已有画像标签替换必须 fail-closed: %v", err)
+		}
+		return
 
 		// 删「乙」→ 入列。
 		p, err = st.UpsertProfileFields(ctx, uRM.ID, nil, nil, []string{"甲", "丙"})

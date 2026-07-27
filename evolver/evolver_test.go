@@ -535,7 +535,12 @@ func TestEvolveIntegration(t *testing.T) {
 			`DELETE FROM feedbacks WHERE user_id = ANY($1)`,
 			`DELETE FROM deliveries WHERE user_id = ANY($1)`,
 			`DELETE FROM push_batches WHERE user_id = ANY($1)`,
+			`DELETE FROM profile_claim_receipts WHERE user_id = ANY($1)`,
+			`DELETE FROM profile_claim_events WHERE user_id = ANY($1)`,
+			`DELETE FROM profile_claims WHERE user_id = ANY($1)`,
+			`DELETE FROM profile_claim_states WHERE user_id = ANY($1)`,
 			`DELETE FROM profiles WHERE user_id = ANY($1)`,
+			`DELETE FROM memberships WHERE user_id = ANY($1)`,
 		} {
 			_, _ = conn.Exec(cctx, sql, userIDs)
 		}
@@ -667,11 +672,12 @@ func TestEvolveIntegration(t *testing.T) {
 
 	t.Run("正常演化断言请求与写库", func(t *testing.T) {
 		uid, bid := newUser(t)
-		occ := "后端工程师"
-		if _, err := st.UpsertProfileFields(ctx, uid, nil, &occ, nil); err != nil {
+		ind, occ := "科技", "后端工程师"
+		before, err := st.UpsertProfileFields(
+			ctx, uid, &ind, &occ, []string{"Go"})
+		if err != nil {
 			t.Fatalf("UpsertProfileFields() 失败: %v", err)
 		}
-		before := newProfile(t, uid, []string{"Go"})
 
 		d1 := newDelivery(t, uid, bid, "Go 1.26 发布")
 		addFeedback(t, uid, d1, types.FeedbackActionInterested, "")

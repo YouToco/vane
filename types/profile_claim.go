@@ -1,0 +1,51 @@
+package types
+
+import "time"
+
+type ProfileClaimSource struct {
+	State   string `json:"state"`
+	RefType string `json:"ref_type,omitempty"`
+	Ref     string `json:"ref,omitempty"`
+}
+
+type ProfileClaim struct {
+	ID           string             `json:"id"`
+	Field        string             `json:"field"`
+	Value        string             `json:"value"`
+	Source       ProfileClaimSource `json:"source"`
+	SupersedesID string             `json:"supersedes_id,omitempty"`
+	Active       bool               `json:"active"`
+	Pinned       bool               `json:"pinned"`
+	CreatedAt    time.Time          `json:"created_at"`
+}
+
+type ProfileClaimList struct {
+	Version int64               `json:"version"`
+	Claims  []ProfileClaim      `json:"claims"`
+	Events  []ProfileClaimEvent `json:"events"`
+}
+
+type ProfileClaimEvent struct {
+	ID            string    `json:"id"`
+	Kind          string    `json:"kind"`
+	TargetClaimID string    `json:"target_claim_id,omitempty"`
+	ResultClaimID string    `json:"result_claim_id,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	Revoked       bool      `json:"revoked"`
+	Revocable     bool      `json:"revocable"`
+}
+
+type ProfileClaimAction struct {
+	ExpectedVersion int64
+	Action          string
+	ClaimID         int64
+	EventID         int64
+	Value           string
+}
+
+type ProfileClaimActionResult struct {
+	Version int64          `json:"version"`
+	EventID string         `json:"event_id"`
+	Profile ProfileView    `json:"profile"`
+	Claims  []ProfileClaim `json:"claims"`
+}

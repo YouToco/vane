@@ -204,6 +204,45 @@ func (s *Store) MarkDeliverySent(ctx context.Context, id int64, feishuMessageID 
 func (s *Store) GetContentItem(ctx context.Context, id int64) (*types.ContentItem, error)
 ```
 
+### 3.4 来源级画像纠正 authority（6.3-B，migration 062）
+
+`profiles` 从 062 起是派生读投影，不再是可被多条写路径任意覆盖的事实源。权威事实由
+`profile_claim_states`、`profile_claims`、`profile_claim_events` 和
+`profile_claim_receipts` 组成：
+
+- 来源对外只有 `evidence`、`manual`、`source_unavailable` 三态。迁移前已存在且无法
+  核验来源的字段只能回填为 `source_unavailable`，禁止补造 evidence。Evolver 写入的
+  `source_ref_type=feedback_range` 只表示“该 processing batch 产出了这一代画像”的
+  provenance，不表示范围内每条 feedback 都能逐句 entail 对应 statement。
+- summary 按确定性 Unicode 句界拆成最多 240 rune 的 statement claim；summary 整体
+  仍只读，但单条 statement 可 `correct`、`suppress`、`pin`，不会开放整段自由编辑。
+- 人工事件仅追加：`correct|suppress|pin|revoke`。`revoke` 是对同 tenant+user 的单个
+  未撤销人工事件的补偿，不删除 claim/event；已撤销、跨用户、revoke 事件和存在后续
+  依赖的目标必须拒绝。
+- mutation 必须携带 `Idempotency-Key` 与 `expected_version`。同键同摘要精确重放首次
+  响应且不再次递增版本；同键异请求冲突；状态行锁 + CAS 保证并发只有一个新写生效。
+- GET 返回有界 claims/history：claims 必须包含全部 active claim、所有可撤销 authority
+  event 所需的 target/result claim，再以最新 inactive history 补足通常 50 条；若 mandatory
+  集合本身超过 50 则不得截断。所有当前仍生效且可撤销的 authority event 也必须返回，
+  不能因“最近 50 条”展示上限失去恢复入口。
+- Evolver 的模型输入只能使用非 manual 的 evidence/base summary 与 tags；写回时先追加
+  新 evidence generation，再由 active claims + effective manual events 重编译 profile。
+  active correct/suppress/pin 必须跨后续 Evolver 保持效力。
+
+权限和切换边界：
+
+- 062 使用独立 `vane_profile_claim_editor`，不扩张 060 `vane_profile_editor` 的 summary
+  只读权限。claim role 是 NOLOGIN/NOINHERIT/NOBYPASSRLS，只有迁移 owner 可 SET；
+  所有 claim 表以及 profiles/memberships 均按精确 tenant+user RLS fail-closed；
+  missing/empty tenant/user GUC 必须得到零行或拒写，不能触发 bigint cast 错误。
+- 完全没有 profile 的首次采集可通过旧入口兼容委托：同一事务创建 profile、
+  `claim_state(version=0)` 与 manual seed claims。创建完成后，旧 PATCH/undo 和 Agent
+  `update_profile` 更新路径一律 fail-closed；旧 revisions/history 仅保留只读审计，
+  对外 `undoable` 恒为 false，恢复只能追加 claim `revoke` 补偿事件。
+- Agent `update_profile` 只用于首次采集。已有画像需要纠正时必须引导用户到 Web
+  「画像依据」逐条纠正、排除、固定或撤销，不新增未经设计的多-claim Agent 工具。
+- 6.3-B 不实现 reset epoch、整库画像重置或历史硬删；这些属于 6.3-C。
+
 ## 4. 新包 `profilehint`（画像提示 + per-trace 缓存，scorer/cardgen 共享）
 
 ```go

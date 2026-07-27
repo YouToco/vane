@@ -148,16 +148,9 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		t.Fatalf("建租户失败: %v", err)
 	}
 	// 塞一点租户数据，让清理有东西可删。
-	var profileUpdatedAt time.Time
-	if err := st.pool.QueryRow(ctx,
-		`INSERT INTO profiles (user_id, tenant_id, summary)
-		 VALUES ($1, $2, '测试画像') RETURNING updated_at`,
-		u.ID, tn.ID).Scan(&profileUpdatedAt); err != nil {
-		t.Fatalf("建画像失败: %v", err)
-	}
 	occupation := "清理测试职业"
 	if _, err := st.PatchProfile(
-		ctx, tn.ID, u.ID, &profileUpdatedAt,
+		ctx, tn.ID, u.ID, nil,
 		types.ProfileEditPatch{Occupation: &occupation},
 		"purge-profile-"+uuid.NewString(), strings.Repeat("c", 64),
 	); err != nil {
