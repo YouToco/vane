@@ -11,13 +11,15 @@
 -- producer-compatible table-lock order in Down.
 SELECT pg_advisory_xact_lock(6215335020355474248);
 
--- Composite scope keys let the new rows prove tenant/user/task ownership with
--- ordinary FKs. The leading id is already unique, so these constraints do not
--- change old lookup semantics or the retained idempotency arbiter.
-ALTER TABLE task_run_snapshots
-    ADD CONSTRAINT uq_task_run_snapshots_brief_scope
-    UNIQUE (id,tenant_id,user_id,task_id);
+-- A legacy delivery INSERT takes deliveries RowExclusive before its existing
+-- batch FK reaches push_batches. Take both schema locks in that producer order
+-- before any DDL so migration Up cannot form the inverse lock edge.
+LOCK TABLE deliveries,push_batches
+    IN ACCESS EXCLUSIVE MODE;
 
+-- Delivery/batch and Brief/outcome scope use composite FKs. Outcome/snapshot
+-- existence and exact scope use an admission trigger below, avoiding a
+-- task_run_snapshots dependency lock that conflicts with existing writer order.
 -- Existing deliveries must already agree with their parent batch scope. RLS
 -- can hide a poisoned row from a tenant-scoped reader, so fail the migration
 -- instead of letting a filtered subset masquerade as the complete batch.
@@ -97,6 +99,10 @@ SET search_path=pg_catalog,public,pg_temp
 AS $$
 DECLARE state text;
 BEGIN
+    IF TG_OP='UPDATE' THEN
+        RAISE EXCEPTION
+            '061: canonical delivery evidence is immutable';
+    END IF;
     SELECT brief_state INTO state
       FROM public.push_batches
      WHERE id=NEW.batch_id
@@ -111,7 +117,7 @@ BEGIN
         -- (batch_id,content_item_id) INSERT. Let it reach the retained unique
         -- arbiter so ON CONFLICT can recover the original row; no new delivery
         -- or payload mutation is admitted.
-        IF NEW.content_item_id IS NOT NULL AND EXISTS (
+        IF TG_OP='INSERT' AND NEW.content_item_id IS NOT NULL AND EXISTS (
             SELECT 1 FROM public.deliveries
              WHERE batch_id=NEW.batch_id
                AND tenant_id=NEW.tenant_id
@@ -129,7 +135,9 @@ $$;
 REVOKE ALL ON FUNCTION enforce_open_brief_batch_v1() FROM PUBLIC;
 
 CREATE TRIGGER deliveries_require_open_brief_batch_v1
-BEFORE INSERT OR UPDATE OF batch_id ON deliveries
+BEFORE INSERT OR UPDATE OF
+    batch_id,tenant_id,user_id,content_item_id,body_md,created_at
+ON deliveries
 FOR EACH ROW EXECUTE FUNCTION enforce_open_brief_batch_v1();
 
 CREATE TABLE task_run_outcomes (
@@ -152,9 +160,6 @@ CREATE TABLE task_run_outcomes (
     CONSTRAINT uq_task_run_outcomes_snapshot UNIQUE (run_snapshot_id),
     CONSTRAINT uq_task_run_outcomes_brief_scope
         UNIQUE (id,tenant_id,user_id,task_id,run_snapshot_id),
-    CONSTRAINT fk_task_run_outcomes_snapshot_scope
-        FOREIGN KEY (run_snapshot_id,tenant_id,user_id,task_id)
-        REFERENCES task_run_snapshots (id,tenant_id,user_id,task_id),
     CONSTRAINT ck_task_run_outcomes_schema
         CHECK (schema_version='vane.run-outcome/v1'),
     CONSTRAINT ck_task_run_outcomes_task
@@ -195,6 +200,45 @@ CREATE TABLE task_run_outcomes (
         )
     )
 );
+
+-- Snapshot existence and exact tenant/user/task scope are checked on admission
+-- by a definer trigger. No runtime role can delete snapshots, and tenant purge
+-- deletes outcomes first. Avoiding a cross-table FK is deliberate: even
+-- dropping that child FK locks task_run_snapshots and deadlocks with an
+-- existing snapshot-first writer waiting on the schema advisory fence.
+-- +goose StatementBegin
+CREATE FUNCTION enforce_run_outcome_snapshot_scope_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+BEGIN
+    IF NEW.tenant_id IS DISTINCT FROM
+           NULLIF(current_setting('app.tenant_id',true),'')::bigint OR
+       NEW.user_id IS DISTINCT FROM
+           NULLIF(current_setting('app.user_id',true),'')::bigint THEN
+        RAISE EXCEPTION '061: run outcome snapshot scope differs';
+    END IF;
+    PERFORM 1
+      FROM public.task_run_snapshots
+     WHERE id=NEW.run_snapshot_id
+       AND tenant_id=NEW.tenant_id
+       AND user_id=NEW.user_id
+       AND task_id=NEW.task_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '061: run outcome snapshot scope differs';
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION enforce_run_outcome_snapshot_scope_v1() FROM PUBLIC;
+
+CREATE TRIGGER task_run_outcomes_snapshot_scope_v1
+BEFORE INSERT OR UPDATE OF tenant_id,user_id,task_id,run_snapshot_id
+ON task_run_outcomes
+FOR EACH ROW EXECUTE FUNCTION enforce_run_outcome_snapshot_scope_v1();
 
 CREATE INDEX idx_task_run_outcomes_tenant_user_task_created
     ON task_run_outcomes (tenant_id,user_id,task_id,created_at DESC,id DESC);
@@ -282,6 +326,42 @@ CREATE INDEX idx_brief_snapshots_tenant_user_task_generated
         tenant_id,user_id,task_id,generated_at DESC,id DESC
     );
 
+-- Snapshot admission is exposed through an exact-scope definer rather than
+-- direct writer SELECT plus a new policy. Migration 061 therefore performs no
+-- DDL on task_run_snapshots while holding the schema advisory fence.
+-- +goose StatementBegin
+CREATE FUNCTION read_canonical_brief_run_identity_v1(
+    target_run_snapshot_id BIGINT
+)
+RETURNS TABLE (
+    task_id TEXT,
+    temporal_workflow_id TEXT,
+    temporal_run_id TEXT,
+    reference_schema_version TEXT,
+    reference_digest TEXT,
+    payload_digest TEXT
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT rs.task_id,rs.temporal_workflow_id,rs.temporal_run_id,
+           rs.reference_schema_version,rs.reference_digest,rs.payload_digest
+      FROM public.task_run_snapshots rs
+     WHERE rs.id=target_run_snapshot_id
+       AND rs.tenant_id IS NOT DISTINCT FROM
+           NULLIF(current_setting('app.tenant_id',true),'')::bigint
+       AND rs.user_id IS NOT DISTINCT FROM
+           NULLIF(current_setting('app.user_id',true),'')::bigint;
+END
+$$;
+-- +goose StatementEnd
+REVOKE ALL ON FUNCTION read_canonical_brief_run_identity_v1(BIGINT)
+    FROM PUBLIC;
+
 -- Expose only evidence reachable from an exact tenant/user/run batch. The
 -- global content tables intentionally have no tenant RLS, so the writer never
 -- receives direct SELECT on them. Source title comes from the immutable run
@@ -295,6 +375,7 @@ CREATE FUNCTION read_canonical_brief_delivery_evidence_v1(
 )
 RETURNS TABLE (
     delivery_id BIGINT,
+    evidence_complete BOOLEAN,
     body_md TEXT,
     discovered_at TIMESTAMPTZ,
     content_title TEXT,
@@ -307,9 +388,11 @@ STABLE
 SECURITY DEFINER
 SET search_path=pg_catalog,public,pg_temp
 AS $$
-    SELECT d.id,d.body_md,d.created_at,
-           ci.title,ci.url,ci.published_at,
-           matched_source.source_title
+    SELECT d.id,
+           ci.id IS NOT NULL AND matched_source.source_title IS NOT NULL,
+           d.body_md,d.created_at,
+           COALESCE(ci.title,''),COALESCE(ci.url,''),ci.published_at,
+           COALESCE(matched_source.source_title,'')
       FROM public.deliveries d
       JOIN public.push_batches b
         ON b.id=d.batch_id
@@ -320,8 +403,8 @@ AS $$
        AND rs.tenant_id=b.tenant_id
        AND rs.user_id=b.user_id
        AND rs.task_id=b.schedule_id
-      JOIN public.content_items ci ON ci.id=d.content_item_id
-      JOIN LATERAL (
+      LEFT JOIN public.content_items ci ON ci.id=d.content_item_id
+      LEFT JOIN LATERAL (
           SELECT frozen_source.value->>'title' AS source_title
             FROM public.content_sources cs
             JOIN LATERAL jsonb_array_elements(
@@ -413,15 +496,32 @@ BEGIN
         RAISE EXCEPTION
             '061: brief writer must not own database objects';
     END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM pg_shdepend dep
+          JOIN pg_roles r ON r.oid=dep.refobjid
+         WHERE r.rolname='vane_brief_writer'
+           AND dep.refclassid='pg_authid'::regclass
+           AND dep.deptype='a'
+           AND (
+               dep.dbid=(
+                   SELECT oid FROM pg_database
+                    WHERE datname=current_database()
+               ) OR (
+                   dep.dbid=0
+                   AND dep.classid='pg_database'::regclass
+                   AND dep.objid=(
+                       SELECT oid FROM pg_database
+                        WHERE datname=current_database()
+                   )
+               )
+           )
+    ) THEN
+        RAISE EXCEPTION
+            '061: brief writer has preexisting ACL in this database';
+    END IF;
 END $$;
 -- +goose StatementEnd
-
--- The role is cluster-wide and may predate this database migration. Once
--- ownership and membership are proven safe, DROP OWNED removes every direct
--- ACL in this database before the explicit whitelist below. It does not touch
--- ACLs in another database using the same cluster role.
-DROP OWNED BY vane_brief_writer;
-GRANT vane_brief_writer TO CURRENT_USER;
 
 REVOKE ALL ON task_run_outcomes,brief_snapshots
     FROM PUBLIC,vane_app,vane_brief_writer;
@@ -431,10 +531,6 @@ REVOKE ALL ON task_run_snapshots,push_batches,deliveries
     FROM vane_brief_writer;
 
 GRANT USAGE ON SCHEMA public TO vane_brief_writer;
-GRANT SELECT (
-    id,tenant_id,user_id,task_id,temporal_workflow_id,temporal_run_id,
-    reference_schema_version,reference_digest,payload_digest
-) ON task_run_snapshots TO vane_brief_writer;
 GRANT SELECT (
     id,tenant_id,user_id,schedule_id,run_snapshot_id,brief_state
 ) ON push_batches TO vane_brief_writer;
@@ -463,6 +559,9 @@ GRANT SELECT (
     insight_count,generated_at
 ) ON brief_snapshots TO vane_brief_writer;
 GRANT USAGE,SELECT ON SEQUENCE brief_snapshots_id_seq
+    TO vane_brief_writer;
+GRANT EXECUTE ON FUNCTION
+    read_canonical_brief_run_identity_v1(BIGINT)
     TO vane_brief_writer;
 GRANT EXECUTE ON FUNCTION
     read_canonical_brief_delivery_evidence_v1(BIGINT,BIGINT)
@@ -516,16 +615,8 @@ CREATE POLICY user_isolation ON brief_snapshots AS RESTRICTIVE
         NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
     );
 
--- Existing tables already have tenant RLS. These role-specific restrictive
--- policies prevent same-tenant cross-user scope adoption.
-CREATE POLICY brief_writer_identity ON task_run_snapshots AS RESTRICTIVE
-    FOR SELECT TO vane_brief_writer
-    USING (
-        tenant_id IS NOT DISTINCT FROM
-        NULLIF((SELECT current_setting('app.tenant_id',true)),'')::bigint AND
-        user_id IS NOT DISTINCT FROM
-        NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
-    );
+-- The existing batch table already has tenant RLS. This role-specific
+-- restrictive policy also prevents same-tenant cross-user scope adoption.
 CREATE POLICY brief_writer_identity ON push_batches AS RESTRICTIVE
     FOR ALL TO vane_brief_writer
     USING (
@@ -563,7 +654,6 @@ END $$;
 -- +goose StatementEnd
 
 DROP POLICY IF EXISTS brief_writer_identity ON push_batches;
-DROP POLICY IF EXISTS brief_writer_identity ON task_run_snapshots;
 
 DROP POLICY IF EXISTS user_isolation ON brief_snapshots;
 DROP POLICY IF EXISTS tenant_isolation ON brief_snapshots;
@@ -599,21 +689,24 @@ REVOKE SELECT (
     id,tenant_id,user_id,schedule_id,run_snapshot_id,brief_state
 ) ON push_batches FROM vane_brief_writer;
 REVOKE UPDATE (brief_state) ON push_batches FROM vane_brief_writer;
-REVOKE SELECT (
-    id,tenant_id,user_id,task_id,temporal_workflow_id,temporal_run_id,
-    reference_schema_version,reference_digest,payload_digest
-) ON task_run_snapshots FROM vane_brief_writer;
+REVOKE EXECUTE ON FUNCTION
+    read_canonical_brief_run_identity_v1(BIGINT)
+    FROM vane_brief_writer;
 REVOKE EXECUTE ON FUNCTION
     read_canonical_brief_delivery_evidence_v1(BIGINT,BIGINT)
     FROM vane_brief_writer;
 REVOKE USAGE ON SCHEMA public FROM vane_brief_writer;
 
 DROP FUNCTION read_canonical_brief_delivery_evidence_v1(BIGINT,BIGINT);
+DROP FUNCTION read_canonical_brief_run_identity_v1(BIGINT);
 
 DROP TABLE brief_snapshots;
 DROP TRIGGER task_run_outcomes_one_way_finalization_v1
     ON task_run_outcomes;
 DROP FUNCTION enforce_run_outcome_transition_v1();
+DROP TRIGGER task_run_outcomes_snapshot_scope_v1
+    ON task_run_outcomes;
+DROP FUNCTION enforce_run_outcome_snapshot_scope_v1();
 DROP TABLE task_run_outcomes;
 
 DROP TRIGGER deliveries_require_open_brief_batch_v1 ON deliveries;
@@ -628,5 +721,3 @@ ALTER TABLE push_batches
     DROP CONSTRAINT uq_push_batches_delivery_scope,
     DROP CONSTRAINT ck_push_batches_brief_state,
     DROP COLUMN brief_state;
-ALTER TABLE task_run_snapshots
-    DROP CONSTRAINT uq_task_run_snapshots_brief_scope;

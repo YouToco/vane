@@ -94,13 +94,14 @@ func TestMigration061RoleRLSAndLeastPrivilege(t *testing.T) {
 	}
 
 	var (
-		noLogin, noInherit, noBypass, noSuper bool
-		ownerCanSet, appCanSet                bool
-		appOutcomeAccess, appBriefAccess      bool
-		writerDelete, writerPayloadUpdate     bool
-		writerSealUpdate, writerDeliveryRead  bool
-		writerEvidenceExec, writerUsersRead   bool
-		rolePath                              bool
+		noLogin, noInherit, noBypass, noSuper  bool
+		ownerCanSet, appCanSet                 bool
+		appOutcomeAccess, appBriefAccess       bool
+		writerDelete, writerPayloadUpdate      bool
+		writerSealUpdate, writerDeliveryRead   bool
+		writerEvidenceExec, writerUsersRead    bool
+		writerSnapshotRead, writerIdentityExec bool
+		rolePath                               bool
 	)
 	if err := f.base.st.pool.QueryRow(t.Context(), `
 		SELECT
@@ -125,6 +126,12 @@ func TestMigration061RoleRLSAndLeastPrivilege(t *testing.T) {
 			      'EXECUTE'),
 			  has_table_privilege(
 			      'vane_brief_writer','users','SELECT'),
+			  has_table_privilege(
+			      'vane_brief_writer','task_run_snapshots','SELECT'),
+			  has_function_privilege(
+			      'vane_brief_writer',
+			      'read_canonical_brief_run_identity_v1(bigint)',
+			      'EXECUTE'),
 			  cardinality(COALESCE(rolconfig,ARRAY[]::text[]))=1
 			    AND rolconfig[1]='search_path=pg_catalog, public, pg_temp'
 		  FROM pg_roles WHERE rolname='vane_brief_writer'`,
@@ -133,7 +140,7 @@ func TestMigration061RoleRLSAndLeastPrivilege(t *testing.T) {
 		&ownerCanSet, &appCanSet, &appOutcomeAccess, &appBriefAccess,
 		&writerDelete, &writerPayloadUpdate, &writerSealUpdate,
 		&writerDeliveryRead, &writerEvidenceExec, &writerUsersRead,
-		&rolePath,
+		&writerSnapshotRead, &writerIdentityExec, &rolePath,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -141,14 +148,15 @@ func TestMigration061RoleRLSAndLeastPrivilege(t *testing.T) {
 		!ownerCanSet || appCanSet || appOutcomeAccess || appBriefAccess ||
 		writerDelete || writerPayloadUpdate || !writerSealUpdate ||
 		writerDeliveryRead || !writerEvidenceExec || writerUsersRead ||
-		!rolePath {
+		writerSnapshotRead || !writerIdentityExec || !rolePath {
 		t.Fatalf(
 			"unsafe brief role attrs=%t/%t/%t/%t set=%t/%t app=%t/%t "+
-				"writer=%t/%t/%t/%t/%t/%t path=%t marker=%d",
+				"writer=%t/%t/%t/%t/%t/%t/%t/%t path=%t marker=%d",
 			noLogin, noInherit, noBypass, noSuper, ownerCanSet, appCanSet,
 			appOutcomeAccess, appBriefAccess, writerDelete,
 			writerPayloadUpdate, writerSealUpdate, writerDeliveryRead,
-			writerEvidenceExec, writerUsersRead, rolePath, marker.ID,
+			writerEvidenceExec, writerUsersRead, writerSnapshotRead,
+			writerIdentityExec, rolePath, marker.ID,
 		)
 	}
 }
@@ -300,7 +308,37 @@ func TestMigration061FinalizedOutcomeCannotReturnPending(t *testing.T) {
 	}
 }
 
-func TestMigration061ScrubsPreexistingWriterACL(t *testing.T) {
+func TestMigration061RejectsRunOutcomeSnapshotScopeDrift(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 0)
+	otherUser := testUser(t, f.base.st)
+	if _, err := f.base.st.pool.Exec(t.Context(), `
+		INSERT INTO memberships (tenant_id,user_id,role)
+		VALUES ($1,$2,'member')`,
+		f.identity.TenantID, otherUser,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(ctx, t, f.base.st,
+			`DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`,
+			f.identity.TenantID, otherUser)
+		cleanupExec(ctx, t, f.base.st,
+			`DELETE FROM users WHERE id=$1`, otherUser)
+	})
+	if _, err := f.base.st.pool.Exec(t.Context(), `
+		INSERT INTO task_run_outcomes (
+		    tenant_id,user_id,task_id,run_snapshot_id,schema_version
+		) VALUES ($1,$2,$3,$4,'vane.run-outcome/v1')`,
+		f.identity.TenantID, otherUser, f.identity.TaskID, f.ref.SnapshotID,
+	); err == nil || !strings.Contains(
+		err.Error(), "run outcome snapshot scope differs") {
+		t.Fatalf("cross-user run outcome scope was admitted: %v", err)
+	}
+}
+
+func TestMigration061RejectsPreexistingWriterACL(t *testing.T) {
 	db, provider := migration035Scratch(t)
 	if _, err := provider.UpTo(t.Context(), 60); err != nil {
 		t.Fatalf("migrate to 060: %v", err)
@@ -319,23 +357,105 @@ func TestMigration061ScrubsPreexistingWriterACL(t *testing.T) {
 		GRANT SELECT ON users TO vane_brief_writer`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.UpTo(t.Context(), 61); err != nil {
-		t.Fatalf("migrate to 061 with preexisting ACL: %v", err)
+	if _, err := provider.UpTo(t.Context(), 61); err == nil ||
+		!strings.Contains(
+			err.Error(), "preexisting ACL in this database") {
+		t.Fatalf("migration admitted preexisting writer ACL: %v", err)
 	}
-	var canReadUsers, canExecuteEvidence bool
-	if err := db.QueryRowContext(t.Context(), `
-		SELECT
-		  has_table_privilege('vane_brief_writer','users','SELECT'),
-		  has_function_privilege(
-		    'vane_brief_writer',
-		    'read_canonical_brief_delivery_evidence_v1(bigint,bigint)',
-		    'EXECUTE')`,
-	).Scan(&canReadUsers, &canExecuteEvidence); err != nil {
+	var version int64
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT max(version_id) FROM goose_db_version WHERE is_applied`,
+	).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if canReadUsers || !canExecuteEvidence {
-		t.Fatalf("writer ACL scrub/whitelist drift: users=%t evidence=%t",
-			canReadUsers, canExecuteEvidence)
+	if version != 60 {
+		t.Fatalf("failed ACL migration left version %d, want 60", version)
+	}
+}
+
+func TestMigration061RejectsPreexistingWriterDatabaseACL(t *testing.T) {
+	db, provider := migration035Scratch(t)
+	if _, err := provider.UpTo(t.Context(), 60); err != nil {
+		t.Fatalf("migrate to 060: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		DO $$
+		BEGIN
+		    IF NOT EXISTS (
+		        SELECT 1 FROM pg_roles WHERE rolname='vane_brief_writer'
+		    ) THEN
+		        CREATE ROLE vane_brief_writer
+		            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+		            NOLOGIN NOINHERIT NOBYPASSRLS;
+		    END IF;
+		END $$`); err != nil {
+		t.Fatal(err)
+	}
+	var databaseName string
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT current_database()`).Scan(&databaseName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), fmt.Sprintf(
+		`GRANT CREATE ON DATABASE %q TO vane_brief_writer`, databaseName,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 61); err == nil ||
+		!strings.Contains(
+			err.Error(), "preexisting ACL in this database") {
+		t.Fatalf("migration admitted writer database ACL: %v", err)
+	}
+}
+
+func TestMigration061PreservesWriterACLInOtherDatabase(t *testing.T) {
+	db, provider := migration035Scratch(t)
+	if _, err := provider.UpTo(t.Context(), 60); err != nil {
+		t.Fatalf("migrate to 060: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		DO $$
+		BEGIN
+		    IF NOT EXISTS (
+		        SELECT 1 FROM pg_roles WHERE rolname='vane_brief_writer'
+		    ) THEN
+		        CREATE ROLE vane_brief_writer
+		            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+		            NOLOGIN NOINHERIT NOBYPASSRLS;
+		    END IF;
+		END $$`); err != nil {
+		t.Fatal(err)
+	}
+	otherURL := freshMigrationDatabase(t, "vane_brief_acl_other")
+	otherDB, err := sql.Open("pgx", otherURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherDB.Close()
+	var otherName string
+	if err := otherDB.QueryRowContext(t.Context(),
+		`SELECT current_database()`).Scan(&otherName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), fmt.Sprintf(`
+		REVOKE CONNECT ON DATABASE %q FROM PUBLIC;
+		GRANT CONNECT ON DATABASE %q TO vane_brief_writer`,
+		otherName, otherName,
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 61); err != nil {
+		t.Fatalf("migrate to 061 with other-database ACL: %v", err)
+	}
+	var retained bool
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT has_database_privilege(
+		    'vane_brief_writer',$1,'CONNECT')`, otherName,
+	).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if !retained {
+		t.Fatal("migration revoked writer ACL in another database")
 	}
 }
 
@@ -348,21 +468,221 @@ func TestMigration061HasSafeDownFenceAndRoleRaceGuard(t *testing.T) {
 	sqlText := string(raw)
 	for _, required := range []string{
 		"SELECT pg_advisory_xact_lock(6215335020355474248)",
+		"LOCK TABLE deliveries,push_batches",
 		"LOCK TABLE task_run_outcomes,deliveries,push_batches,brief_snapshots",
 		"refusing downgrade while canonical outcome/brief evidence exists",
 		"WHEN duplicate_object OR unique_violation THEN NULL",
 		"delivery scope differs from its push batch",
 		"fk_deliveries_brief_batch_scope",
 		"deliveries_require_open_brief_batch_v1",
+		"task_run_outcomes_snapshot_scope_v1",
 		"task_run_outcomes_one_way_finalization_v1",
+		"read_canonical_brief_run_identity_v1",
 		"read_canonical_brief_delivery_evidence_v1",
-		"DROP OWNED BY vane_brief_writer",
+		"brief writer has preexisting ACL in this database",
 		"push_batches_brief_state_authority_v1",
 	} {
 		if !strings.Contains(sqlText, required) {
 			t.Fatalf("migration 061 missing %q", required)
 		}
 	}
+	for _, forbidden := range []string{
+		"ALTER TABLE task_run_snapshots",
+		"POLICY brief_writer_identity ON task_run_snapshots",
+		"FOREIGN KEY (run_snapshot_id) REFERENCES task_run_snapshots",
+	} {
+		if strings.Contains(sqlText, forbidden) {
+			t.Fatalf("migration 061 must not lock task_run_snapshots via %q",
+				forbidden)
+		}
+	}
+}
+
+func TestMigration061UpDoesNotDeadlockWithDeliveryInsert(t *testing.T) {
+	db, provider := migration035Scratch(t)
+	if _, err := provider.UpTo(t.Context(), 60); err != nil {
+		t.Fatalf("migrate to 060: %v", err)
+	}
+	var userID, batchID int64
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users (feishu_open_id,name)
+		VALUES ('ou_brief_up_race','brief up race')
+		RETURNING id`,
+	).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO memberships (tenant_id,user_id,role)
+		VALUES (1,$1,'owner')`, userID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO push_batches (tenant_id,user_id)
+		VALUES (1,$1) RETURNING id`, userID,
+	).Scan(&batchID); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	writer, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerDone := false
+	defer func() {
+		if !writerDone {
+			_ = writer.Rollback()
+		}
+	}()
+	if _, err := writer.ExecContext(ctx, `
+		SET LOCAL deadlock_timeout='100ms';
+		SET LOCAL statement_timeout='5s';
+		LOCK TABLE deliveries IN ROW EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	upDone := make(chan error, 1)
+	go func() {
+		_, upErr := provider.UpTo(ctx, 61)
+		upDone <- upErr
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	if _, err := writer.ExecContext(ctx, `
+		INSERT INTO deliveries (tenant_id,batch_id,user_id,body_md)
+		VALUES (1,$1,$2,'concurrent up delivery')`, batchID, userID,
+	); err != nil {
+		t.Fatalf("delivery insert deadlocked with 061 Up: %v", err)
+	}
+	if err := writer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	writerDone = true
+
+	select {
+	case err := <-upDone:
+		if err != nil {
+			t.Fatalf("061 Up did not converge after delivery commit: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("061 Up did not converge")
+	}
+	var version, deliveries int
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT
+		  (SELECT max(version_id)
+		     FROM goose_db_version WHERE is_applied),
+		  (SELECT count(*) FROM deliveries WHERE batch_id=$1)`,
+		batchID,
+	).Scan(&version, &deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if version != 61 || deliveries != 1 {
+		t.Fatalf("Up result version/deliveries=%d/%d want 61/1",
+			version, deliveries)
+	}
+}
+
+func TestMigration061UpDoesNotDeadlockTaskSnapshotFence(t *testing.T) {
+	testMigration061TaskSnapshotFence(t, true)
+}
+
+func TestMigration061DownDoesNotDeadlockTaskSnapshotFence(t *testing.T) {
+	testMigration061TaskSnapshotFence(t, false)
+}
+
+func testMigration061TaskSnapshotFence(t *testing.T, up bool) {
+	t.Helper()
+	db, provider := migration035Scratch(t)
+	target := int64(60)
+	if !up {
+		target = 61
+	}
+	if _, err := provider.UpTo(t.Context(), target); err != nil {
+		t.Fatalf("migrate to %03d: %v", target, err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	snapshotTx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotDone := false
+	defer func() {
+		if !snapshotDone {
+			_ = snapshotTx.Rollback()
+		}
+	}()
+	var snapshots int
+	if err := snapshotTx.QueryRowContext(ctx,
+		`SELECT count(*) FROM task_run_snapshots`,
+	).Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+
+	blockerTx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockerDone := false
+	defer func() {
+		if !blockerDone {
+			_ = blockerTx.Rollback()
+		}
+	}()
+	if _, err := blockerTx.ExecContext(ctx,
+		`LOCK TABLE deliveries IN ROW EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	migrationDone := make(chan error, 1)
+	go func() {
+		if up {
+			_, err := provider.UpTo(ctx, 61)
+			migrationDone <- err
+			return
+		}
+		_, err := provider.Down(ctx)
+		migrationDone <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	fenceDone := make(chan error, 1)
+	go func() {
+		_, err := snapshotTx.ExecContext(ctx,
+			`SELECT pg_advisory_xact_lock_shared(6215335020355474248)`)
+		fenceDone <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if err := blockerTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	blockerDone = true
+
+	select {
+	case err := <-migrationDone:
+		if err != nil {
+			t.Fatalf("061 migration deadlocked with snapshot-first writer: %v",
+				err)
+		}
+	case <-ctx.Done():
+		t.Fatal("061 migration did not converge with snapshot-first writer")
+	}
+	select {
+	case err := <-fenceDone:
+		if err != nil {
+			t.Fatalf("snapshot-first writer did not enter shared fence: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("snapshot-first writer did not converge")
+	}
+	if err := snapshotTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	snapshotDone = true
 }
 
 func TestMigration061DownDoesNotDeadlockWithDeliveryInsert(t *testing.T) {
@@ -500,6 +820,13 @@ func TestMigration061DownRefusesDurableOutcomeEvidence(t *testing.T) {
 	}
 	if _, err := db.ExecContext(t.Context(),
 		`SET session_replication_role='origin'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		SELECT set_config('app.tenant_id','1',false),
+		       set_config('app.user_id',$1,false)`,
+		fmt.Sprint(userID),
+	); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(t.Context(),

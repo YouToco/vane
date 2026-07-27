@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -95,12 +96,12 @@ func newCanonicalBriefFixture(t *testing.T, deliveries int) *canonicalBriefFixtu
 	var visible bool
 	if err := tx.QueryRow(t.Context(),
 		`SELECT true
-		   FROM task_run_snapshots
-		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND task_id=$4
-		    AND temporal_workflow_id=$5 AND temporal_run_id=$6
-		    AND reference_schema_version=$7
-		    AND reference_digest=$8 AND payload_digest=$9`,
-		ref.SnapshotID, identity.TenantID, identity.UserID, identity.TaskID,
+		   FROM read_canonical_brief_run_identity_v1($1)
+		  WHERE task_id=$2
+		    AND temporal_workflow_id=$3 AND temporal_run_id=$4
+		    AND reference_schema_version=$5
+		    AND reference_digest=$6 AND payload_digest=$7`,
+		ref.SnapshotID, identity.TaskID,
 		identity.TemporalWorkflowID, identity.TemporalRunID,
 		ref.SchemaVersion, ref.ReferenceDigest, ref.PayloadDigest,
 	).Scan(&visible); err != nil {
@@ -422,6 +423,81 @@ func TestCanonicalBriefDarkStoreRejectsUndurableSourceClaims(t *testing.T) {
 	if _, err := f.base.st.FreezeBriefV1(
 		t.Context(), f.identity, f.ref, valid); err != nil {
 		t.Fatalf("durable source evidence was rejected: %v", err)
+	}
+}
+
+func TestCanonicalBriefDarkStoreRejectsDeliveryWithoutSourceEvidence(
+	t *testing.T,
+) {
+	f := newCanonicalBriefFixture(t, 1)
+	if _, _, _, err := f.base.st.InsertDeliveryIdempotent(
+		t.Context(), &types.Delivery{
+			BatchID: f.batchID, UserID: f.identity.UserID,
+			BodyMD: "delivery without a durable content item",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	outcome := f.finalizedContentOutcome(t)
+	if _, err := f.base.st.FreezeBriefV1(
+		t.Context(), f.identity, f.ref, f.draft(t, outcome),
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("incomplete delivery evidence error=%v want conflict", err)
+	}
+}
+
+func TestCanonicalBriefDarkStoreSealsDeliveryEvidence(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 1)
+	outcome := f.finalizedContentOutcome(t)
+	if _, err := f.base.st.FreezeBriefV1(
+		t.Context(), f.identity, f.ref, f.draft(t, outcome),
+	); err != nil {
+		t.Fatal(err)
+	}
+	var openBatchID int64
+	if err := f.base.st.pool.QueryRow(t.Context(), `
+		INSERT INTO push_batches (tenant_id,user_id)
+		VALUES ($1,$2) RETURNING id`,
+		f.identity.TenantID, f.identity.UserID,
+	).Scan(&openBatchID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(ctx, t, f.base.st,
+			`DELETE FROM push_batches WHERE id=$1`, openBatchID)
+	})
+	for name, mutation := range map[string]struct {
+		statement string
+		value     any
+	}{
+		"body": {
+			statement: `UPDATE deliveries SET body_md=$2 WHERE id=$1`,
+			value:     "mutated",
+		},
+		"batch": {
+			statement: `UPDATE deliveries SET batch_id=$2 WHERE id=$1`,
+			value:     openBatchID,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := f.base.st.pool.Exec(
+				t.Context(), mutation.statement,
+				f.deliveryID[0], mutation.value,
+			); err == nil || !strings.Contains(
+				err.Error(), "canonical delivery evidence is immutable") {
+				t.Fatalf("sealed delivery evidence mutation=%v", err)
+			}
+		})
+	}
+	if _, err := f.base.st.pool.Exec(t.Context(), `
+		UPDATE deliveries
+		   SET status='sent',feishu_message_id='receipt-after-seal',
+		       sent_at=clock_timestamp()
+		 WHERE id=$1`, f.deliveryID[0],
+	); err != nil {
+		t.Fatalf("receipt update after seal was rejected: %v", err)
 	}
 }
 

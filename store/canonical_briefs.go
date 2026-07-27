@@ -390,6 +390,11 @@ func (s *Store) beginCanonicalBriefTxV1(
 		return nil, canonicalBriefDatabaseError(
 			"begin canonical brief transaction", err)
 	}
+	if err := lockPushEffectSchemaWriter(ctx, tx); err != nil {
+		rollbackCompiledTaskTx(ctx, tx)
+		return nil, canonicalBriefDatabaseError(
+			"lock canonical brief schema admission", err)
+	}
 	if _, err := tx.Exec(
 		ctx, `SET LOCAL search_path=pg_catalog,public,pg_temp`); err != nil {
 		rollbackCompiledTaskTx(ctx, tx)
@@ -428,12 +433,12 @@ func (s *Store) beginCanonicalBriefTxV1(
 	var exact bool
 	err = tx.QueryRow(ctx,
 		`SELECT true
-		   FROM task_run_snapshots
-		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND task_id=$4
-		    AND temporal_workflow_id=$5 AND temporal_run_id=$6
-		    AND reference_schema_version=$7
-		    AND reference_digest=$8 AND payload_digest=$9`,
-		ref.SnapshotID, expected.TenantID, expected.UserID, expected.TaskID,
+		   FROM read_canonical_brief_run_identity_v1($1)
+		  WHERE task_id=$2
+		    AND temporal_workflow_id=$3 AND temporal_run_id=$4
+		    AND reference_schema_version=$5
+		    AND reference_digest=$6 AND payload_digest=$7`,
+		ref.SnapshotID, expected.TaskID,
 		expected.TemporalWorkflowID, expected.TemporalRunID,
 		ref.SchemaVersion, ref.ReferenceDigest, ref.PayloadDigest,
 	).Scan(&exact)
@@ -555,7 +560,7 @@ func verifyBriefDeliveriesV1(
 	ctx context.Context, tx pgx.Tx, draft types.BriefDraftV1,
 ) error {
 	rows, err := tx.Query(ctx,
-		`SELECT delivery_id,body_md,discovered_at,content_title,
+		`SELECT delivery_id,evidence_complete,body_md,discovered_at,content_title,
 		        canonical_url,published_at,source_title
 		   FROM read_canonical_brief_delivery_evidence_v1($1,$2)`,
 		draft.PushBatchID, draft.RunSnapshotID,
@@ -565,6 +570,7 @@ func verifyBriefDeliveriesV1(
 	}
 	defer rows.Close()
 	type evidence struct {
+		complete     bool
 		bodyMD       string
 		discoveredAt time.Time
 		title        string
@@ -575,12 +581,13 @@ func verifyBriefDeliveriesV1(
 	deliveries := make(map[int64]evidence, len(draft.Insights))
 	for rows.Next() {
 		var id int64
+		var complete bool
 		var bodyMD string
 		var discoveredAt time.Time
 		var title, sourceURL, sourceTitle string
 		var publishedAt sql.NullTime
 		if err := rows.Scan(
-			&id, &bodyMD, &discoveredAt, &title, &sourceURL,
+			&id, &complete, &bodyMD, &discoveredAt, &title, &sourceURL,
 			&publishedAt, &sourceTitle,
 		); err != nil {
 			return canonicalBriefDatabaseError("scan brief delivery", err)
@@ -591,6 +598,7 @@ func verifyBriefDeliveriesV1(
 			canonicalPublishedAt = &value
 		}
 		deliveries[id] = evidence{
+			complete:     complete,
 			bodyMD:       bodyMD,
 			discoveredAt: discoveredAt.Round(0).UTC().Truncate(time.Microsecond),
 			title:        title,
@@ -612,7 +620,8 @@ func verifyBriefDeliveriesV1(
 			return canonicalBriefConflictError(
 				"brief insight does not belong to the exact batch")
 		}
-		if insight.BodyMD != stored.bodyMD ||
+		if !stored.complete ||
+			insight.BodyMD != stored.bodyMD ||
 			insight.DiscoveredAt != stored.discoveredAt ||
 			insight.Title != stored.title ||
 			insight.SourceURL != stored.sourceURL ||
