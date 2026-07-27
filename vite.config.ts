@@ -2,6 +2,7 @@ import { defineConfig } from "vite";
 import type { Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { execFileSync } from "node:child_process";
 import path from "path";
 
 const root = path.resolve(__dirname);
@@ -9,6 +10,20 @@ const ownerPreviewHtml = path.resolve(
   root,
   "_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html",
 );
+
+function releaseID(): string {
+  const configured = process.env.VITE_RELEASE_ID?.trim();
+  if (configured) return configured;
+  try {
+    return execFileSync("git", ["rev-parse", "--verify", "HEAD"], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "unknown";
+  }
+}
 
 function normalizeModuleID(id: string): string {
   const normalized = id.replaceAll("\\", "/").split("?")[0];
@@ -48,6 +63,9 @@ function bundleAuditManifest(): Plugin {
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), bundleAuditManifest()],
+  define: {
+    __VANE_RELEASE__: JSON.stringify(releaseID()),
+  },
   resolve: {
     alias: {
       "@": path.resolve(root, "src"),
