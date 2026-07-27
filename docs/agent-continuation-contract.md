@@ -130,3 +130,35 @@ version 2 root.
 The remaining B1b work is intentionally not claimed by this dark checkpoint:
 confirmation routing before legacy Claim, startup/periodic bounded dispatcher,
 graceful drain, and exact-action runtimeadmin CLI activation/status/rollback.
+
+## 7.10-B1b live exact-action cutover
+
+B1b routes every card decision through the v2 controller before any legacy
+protocol. Only an exact `ErrNotRouted` may fall through; lookup, database and
+integrity ambiguity preserve the card and fail closed. A bounded dispatcher
+runs one startup pass before external ingress, then periodic tenant-keyset
+passes with fenced leases and graceful drain. The runtimeadmin surface remains
+an exact-action canary control plane; it is not a bulk switch.
+
+## 7.10-B2 atomic durable proposal
+
+Migration 059 changes only newly-issued `enable_source` cards. The Agent sends
+an internally generated action ID, exact session, strict arguments, visible
+summary and expiry to one proposal controller. Store derives the tenant from
+the user's canonical membership and, under the shared action admission lock,
+uses the independent `vane_agent_action_proposer` role to commit:
+
+1. an execution-version 2 pending root with canonical `{source_id}` arguments;
+2. the complete frozen continuation payload used by B1;
+3. generation-1 durable authority with fixed producer evidence.
+
+All three rows commit or roll back together. `CreatePendingAction → Activate`
+is forbidden for normal B2 cards. An exact retry after a lost commit response
+must verify the root, visible summary, expiry, every frozen payload byte and
+the sole authority event; it may not repair or recreate partial evidence.
+
+The proposer has only specified-column SELECT/INSERT on those three tables and
+sequence USAGE for the authority event. It has no UPDATE/DELETE/TRUNCATE,
+session projection, source effect, generic tool execution, provider, Temporal,
+operator or continuator capability. Existing v0 cards and every write tool
+other than `enable_source` retain their historical protocol.

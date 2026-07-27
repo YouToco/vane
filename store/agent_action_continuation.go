@@ -236,7 +236,7 @@ func (s *Store) GetAgentActionContinuationStatus(
 	if err != nil {
 		return AgentActionContinuationStatus{}, err
 	}
-	generation, route, err := loadAgentActionAuthorityStatus(
+	generation, route, authorityEvidence, err := loadAgentActionAuthorityStatus(
 		ctx, tx, actionID,
 	)
 	if err != nil {
@@ -322,6 +322,7 @@ func (s *Store) GetAgentActionContinuationStatus(
 	status.BlockedReason = action.BlockedReason
 	status.RollbackEligible =
 		executionVersion == AgentActionExecutionVersion &&
+			authorityEvidence != agentActionProposalEvidence &&
 			action.Status == AgentActionStatusPending &&
 			action.ConfirmedAt == nil && action.AttemptCount == 0 &&
 			action.LeaseFence == 0 && action.TerminalCode == nil
@@ -360,7 +361,7 @@ func loadAgentActionAuthorityStatus(
 	ctx context.Context,
 	tx pgx.Tx,
 	actionID string,
-) (int64, string, error) {
+) (int64, string, string, error) {
 	rows, err := tx.Query(ctx,
 		`SELECT generation,mode,evidence
 		   FROM agent_action_continuation_authority_events
@@ -368,19 +369,20 @@ func loadAgentActionAuthorityStatus(
 		actionID,
 	)
 	if err != nil {
-		return 0, "", agentEventDatabaseError(
+		return 0, "", "", agentEventDatabaseError(
 			"read Agent action status authority", err)
 	}
 	defer rows.Close()
 	generation := int64(0)
 	route := AgentActionAuthorityLegacy
+	authorityEvidence := ""
 	for rows.Next() {
 		var gotGeneration int64
 		var mode, evidence string
 		if err := rows.Scan(
 			&gotGeneration, &mode, &evidence,
 		); err != nil {
-			return 0, "", agentEventDatabaseError(
+			return 0, "", "", agentEventDatabaseError(
 				"scan Agent action status authority", err)
 		}
 		wantMode := AgentActionAuthorityDurable
@@ -391,16 +393,19 @@ func loadAgentActionAuthorityStatus(
 			mode != wantMode ||
 			strings.TrimSpace(evidence) != evidence ||
 			evidence == "" || len(evidence) > 512 {
-			return 0, "", agentEventIntegrityError()
+			return 0, "", "", agentEventIntegrityError()
 		}
 		generation = gotGeneration
 		route = mode
+		if gotGeneration == 1 {
+			authorityEvidence = evidence
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return 0, "", agentEventDatabaseError(
+		return 0, "", "", agentEventDatabaseError(
 			"iterate Agent action status authority", err)
 	}
-	return generation, route, nil
+	return generation, route, authorityEvidence, nil
 }
 
 // ActivateAgentActionContinuation atomically promotes one exact, pristine
@@ -771,6 +776,9 @@ func (s *Store) RollbackAgentActionContinuation(
 		return 0, agentEventIntegrityError()
 	}
 	rows.Close()
+	if activationEvidence == agentActionProposalEvidence {
+		return 0, ErrAgentActionTerminal
+	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO agent_action_continuation_authority_events (
 		     tenant_id,user_id,action_id,generation,mode,evidence

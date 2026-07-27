@@ -242,6 +242,16 @@ type ActionContinuationController interface {
 	) (agentcontinuation.ActionOutcome, error)
 }
 
+// ActionProposalController is the only production ingress for newly-issued
+// v2 enable_source cards. The implementation commits the pending root, frozen
+// continuation and generation-1 authority atomically.
+type ActionProposalController interface {
+	Propose(
+		context.Context,
+		agentcontinuation.ActionProposalInput,
+	) (agentcontinuation.ActionProposal, error)
+}
+
 // ProfileReader 是画像读取的窄接口（M5 契约 §12.2，生产实现 *store.Store）。
 // 与 Store 分开声明：画像是增强不是门槛，读取失败必须降级为空画像而非报错，
 // 窄接口让测试可独立注入两态与失败。
@@ -274,6 +284,10 @@ type Deps struct {
 	// ActionContinuation routes exact v2 enable_source callbacks before every
 	// historical action protocol. Production Feishu ingress always injects it.
 	ActionContinuation ActionContinuationController
+	// ActionProposal creates normal enable_source cards directly as v2. It is
+	// deliberately separate from legacy CreatePendingAction and the operator
+	// activation surface.
+	ActionProposal ActionProposalController
 	// SystemPrompt 覆盖默认 system 常量（M4 契约 §7.1，A2A 轨用）。零值回落包内
 	// systemPrompt 常量——飞书轨装配不传本字段，行为零变化。默认常量写死了飞书语境
 	//（确认卡/卡片回调/画像引导），A2A 轨的对端是外部 agent，语境完全不同。
@@ -346,6 +360,7 @@ type Loop struct {
 	taskCreation       CreationController
 	taskDefinitionEdit DefinitionEditController
 	actionContinuation ActionContinuationController
+	actionProposal     ActionProposalController
 	sys                string // system prompt（含端点检索能力说明段，装配时定型）
 	renderProfile      bool   // 是否渲染 [用户画像] 段：默认飞书轨 true，自定义 prompt 的 A2A 轨 false
 	model              string
@@ -450,6 +465,7 @@ func NewChecked(d Deps) (*Loop, error) {
 		taskCreation:          d.TaskCreation,
 		taskDefinitionEdit:    d.TaskDefinitionEdit,
 		actionContinuation:    d.ActionContinuation,
+		actionProposal:        d.ActionProposal,
 		sys:                   sys,
 		renderProfile:         renderProfile,
 		model:                 d.Model,
@@ -1360,6 +1376,41 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			}
 			// 仅构造本轮 UI/FC 所需的内存视图；v1 真相已经由 controller
 			// 以 canonical args 落库，绝不能再调 legacy CreatePendingAction。
+			pending = &types.PendingAction{
+				ID: proposal.ID, UserID: userID, SessionID: sessionID,
+				ToolName: tc.Name, Args: args, Summary: proposal.Summary,
+				Status: types.PendingActionStatusPending,
+			}
+			out = append(out, toolMsg(tc.ID, toolMsgConfirmCreated))
+			continue
+		}
+		if tc.Name == agentcontinuation.DurableActionToolName {
+			if l.actionProposal == nil {
+				return nil, out, errors.New(
+					"agent: durable action proposal controller is not configured",
+				)
+			}
+			actionID := uuid.NewString()
+			proposal, err := l.actionProposal.Propose(
+				ctx,
+				agentcontinuation.ActionProposalInput{
+					ActionID: actionID, UserID: userID,
+					SessionID: *sessionID, ToolName: tc.Name,
+					RawArgs: args, Summary: spec.Summarize(args),
+					ExpiresAt: time.Now().Add(pendingActionTTL),
+				},
+			)
+			if err != nil {
+				return nil, out, fmt.Errorf(
+					"propose durable Agent action: %w", err,
+				)
+			}
+			if proposal.ID != actionID ||
+				strings.TrimSpace(proposal.Summary) == "" {
+				return nil, out, errors.New(
+					"agent: durable action proposal returned an invalid identity or summary",
+				)
+			}
 			pending = &types.PendingAction{
 				ID: proposal.ID, UserID: userID, SessionID: sessionID,
 				ToolName: tc.Name, Args: args, Summary: proposal.Summary,

@@ -13,7 +13,50 @@ import (
 const (
 	agentActionOperatorRole    = "vane_agent_action_operator"
 	agentActionContinuatorRole = "vane_agent_action_continuator"
+	agentActionProposerRole    = "vane_agent_action_proposer"
 )
+
+func validateAgentActionProposer(ctx context.Context, tx pgx.Tx) error {
+	if err := validateAgentActionRole(
+		ctx, tx, agentActionProposerRole,
+		agentActionProposerSelectColumns(),
+		agentActionProposerInsertColumns(),
+		nil,
+		[]string{
+			"agent_action_continuation_authority_events_id_seq:USAGE",
+		},
+	); err != nil {
+		return err
+	}
+	var unrelated bool
+	if err := tx.QueryRow(ctx, `
+		SELECT NOT EXISTS (
+		         SELECT 1
+		           FROM pg_auth_members am
+		           JOIN pg_roles granted_role ON granted_role.oid=am.roleid
+		           JOIN pg_roles member_role ON member_role.oid=am.member
+		          WHERE (
+		                   granted_role.rolname=$1
+		               AND member_role.rolname=ANY($2::name[])
+		                ) OR (
+		                   member_role.rolname=$1
+		               AND granted_role.rolname=ANY($2::name[])
+		                )
+		       )`,
+		agentActionProposerRole,
+		[]string{
+			"vane_app",
+			agentActionOperatorRole,
+			agentActionContinuatorRole,
+		},
+	).Scan(&unrelated); err != nil || !unrelated {
+		return agentActionRoleDrift(
+			agentActionProposerRole,
+			fmt.Sprintf("peer roles unrelated=%v err=%v", unrelated, err),
+		)
+	}
+	return nil
+}
 
 func validateAgentActionOperator(ctx context.Context, tx pgx.Tx) error {
 	return validateAgentActionRole(
@@ -295,6 +338,41 @@ func agentActionOperatorSelectColumns() []string {
 		agentActionOperatorRootSelectColumns(),
 		agentActionContinuationSelectColumns(),
 		agentActionAuthoritySelectColumns(),
+	)
+}
+
+func agentActionProposerSelectColumns() []string {
+	return mergeSortedColumns(
+		prefixedColumns(
+			"pending_actions",
+			"args", "execution_version", "expires_at", "id", "session_id",
+			"status", "summary", "tenant_id", "tool_name", "user_id",
+		),
+		agentActionContinuationSelectColumns(),
+		agentActionAuthoritySelectColumns(),
+	)
+}
+
+func agentActionProposerInsertColumns() []string {
+	return mergeSortedColumns(
+		prefixedColumns(
+			"pending_actions",
+			"args", "execution_version", "expires_at", "id", "session_id",
+			"status", "summary", "tenant_id", "tool_name", "user_id",
+		),
+		prefixedColumns(
+			"agent_action_continuations",
+			"action_id", "adapter_version", "args_digest", "canonical_args",
+			"not_found_digest", "not_found_messages", "session_id", "source_id",
+			"success_digest", "success_messages", "tenant_id", "tool_name",
+			"tool_policy", "tool_policy_digest", "tool_policy_version",
+			"tool_spec", "tool_spec_digest", "tool_spec_version", "user_id",
+		),
+		prefixedColumns(
+			"agent_action_continuation_authority_events",
+			"action_id", "evidence", "generation", "mode", "tenant_id",
+			"user_id",
+		),
 	)
 }
 
