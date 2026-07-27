@@ -1063,7 +1063,8 @@ func (s *Scheduler) buildPreparedTaskSchedule(req TaskScheduleRequest) (Prepared
 		// an older binary can still resume every checkpoint written before C1b
 		// is deliberately activated.
 		fingerprintVersion = taskScheduleFingerprintVersion
-		params.RuntimeVersion = runtimeVersion
+		params.RuntimeVersion = s.runOutcome.runtimeVersionFor(
+			taskID, runtimeVersion)
 	} else {
 		// Preserve the exact semantic v1 Action envelope. buildTaskScheduleExpected
 		// upgrades it deterministically before Temporal I/O, while the durable
@@ -1339,7 +1340,7 @@ func validatePreparedTaskSchedule(prepared PreparedTaskSchedule) error {
 		if params.TenantID != prepared.TenantID || params.ExecutionMode != types.ExecutionModeCompiled {
 			return errors.New("v2 workflow params do not match the prepared tenant and compiled mode")
 		}
-		if params.RuntimeVersion != "" && params.RuntimeVersion != workflow.CompiledRuntimeSnapshotV1 {
+		if params.RuntimeVersion != "" && !workflow.IsCompiledRuntimeV1(params.RuntimeVersion) {
 			return errors.New("prepared Schedule Action runtime version is unsupported")
 		}
 	}

@@ -1,7 +1,9 @@
 # Canonical RunOutcome / Brief V1 contract
 
-Status: P1-A dark substrate. Migration 061 and Store methods exist, but no
-workflow, API, renderer, scheduler, or startup path calls them.
+Status: P1-B exact-run lifecycle. Migration 062 adds recovery and the workflow
+may create/finalize RunOutcome only for the independent compiled-runtime
+canary. Brief freeze/read, API, renderer, and every user-visible surface remain
+dark.
 
 ## Identity
 
@@ -29,10 +31,20 @@ workflow, API, renderer, scheduler, or startup path calls them.
 | `interrupted` | complete/partial | complete/partial | cancellation/termination stopped conclusion formation |
 
 The Store creates a `pending` marker and finalizes it with a single CAS.
-Identical finalization retries replay the stored outcome; a different terminal
-claim conflicts. A database trigger admits only `pending→finalized` and rejects
-every update to an already-finalized row, so immutability does not depend on
-callers using the Store. P1-B will own lifecycle wiring and termination recovery.
+Workflow and recovery submit `RunOutcomeClaimV1`, which contains neither time
+nor digest. Under the row/advisory lock, Store reads database time, seals the
+digest, and performs the one-way update. Identical semantic retries replay the
+stored outcome even after a lost response; a different terminal claim
+conflicts. A database trigger admits only `pending→finalized` and rejects every
+update to an already-finalized row, so immutability does not depend on callers
+using the Store.
+
+For P1-B Actions, `BeginRunOutcomeV1` is the first command after authorized
+`PrepareRun` and precedes Evolve, Fetch, LLM, notice, and push Activities.
+Fetch, Score, and CardGen use outcome-aware Activity variants without changing
+their business payload. Every normal exit finalizes. Error and cancellation
+paths attempt finalization on a disconnected workflow context while preserving
+the original Temporal error. Raw provider/driver chains are never persisted.
 
 ## Brief payload
 
@@ -109,8 +121,25 @@ or enter another runtime role. Tenant and exact-user restrictive boundaries
 apply to both new tables, the batch evidence table, and the constrained run and
 delivery evidence readers.
 
+`vane_run_outcome_recovery` is a separate NOLOGIN, NOINHERIT,
+NOBYPASSRLS role. It has no table access or write authority and can execute
+only a fixed two-minute-stale, 100-row-maximum `(created_at,id)` keyset reader.
+That reader returns the pending marker plus exact Temporal WorkflowID/RunID.
+The recovery runner performs one 30-second startup pass, then runs every 30
+seconds with four workers and five-second Temporal queries. Running executions
+are skipped. Exact terminal executions converge through the normal writer CAS;
+a completed execution without a terminal receipt becomes
+`failed/outcome_missing_terminal_receipt`. Shutdown stops admission and drains
+already-admitted recovery work.
+
 Up and Down first drain schema-aware writers and take producer-compatible
-access-exclusive locks. Down refuses to destroy any
-outcome or Brief evidence. Production remains default-off until later batches
-add versioned lifecycle wiring, exact-task canary, explicit rollback, and the
-external ICP rollout Gate.
+access-exclusive locks. Migration 062 Down refuses while any outcome remains
+pending; Migration 061 Down still refuses to destroy any outcome or Brief
+evidence.
+
+The independent rollout keys are `run_outcome_enabled`,
+`run_outcome_canary_schedule_id`, and `run_outcome_allow_all`. Selection is
+valid only inside the compiled-runtime rollout. Turning it off stops new marker
+creation but recovery remains active. Initial production rollout is one exact
+compiled task; `allow_all` stays false. Brief, API, renderer, model, message,
+and sending authority remain unchanged.

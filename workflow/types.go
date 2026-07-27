@@ -70,6 +70,20 @@ type PushParams struct {
 // the Compiled execution mode. Unknown is never used as a rollout label.
 const CompiledRuntimeSnapshotV1 = "compiled-snapshot/v1"
 
+// CompiledRuntimeRunOutcomeV1 selects the same compiled snapshot runtime plus
+// P1-B. A separate durable label preserves PushParams' frozen wire layout and
+// keeps every pre-P1-B Action/history on CompiledRuntimeSnapshotV1.
+const CompiledRuntimeRunOutcomeV1 = "compiled-snapshot/v1+run-outcome/v1"
+
+func IsCompiledRuntimeV1(version string) bool {
+	return version == CompiledRuntimeSnapshotV1 ||
+		version == CompiledRuntimeRunOutcomeV1
+}
+
+func HasRunOutcomeV1(version string) bool {
+	return version == CompiledRuntimeRunOutcomeV1
+}
+
 // CompiledRunInputV1 carries the trusted stable scope copied from the Schedule
 // Action plus the sealed reference returned by PrepareRun. It contains no
 // approved definition or runtime-policy body and is therefore safe for

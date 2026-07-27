@@ -128,6 +128,11 @@ type PipelineConfig struct {
 	CompiledRuntimeCanaryScheduleID string `mapstructure:"compiled_runtime_canary_schedule_id"`
 	// CompiledRuntimeAllowAll is the deliberate second key for broad rollout.
 	CompiledRuntimeAllowAll bool `mapstructure:"compiled_runtime_allow_all"`
+	// RunOutcome* is the independent P1-B lifecycle rollout. It may select only
+	// Actions already selected by the compiled runtime rollout.
+	RunOutcomeEnabled          bool   `mapstructure:"run_outcome_enabled"`
+	RunOutcomeCanaryScheduleID string `mapstructure:"run_outcome_canary_schedule_id"`
+	RunOutcomeAllowAll         bool   `mapstructure:"run_outcome_allow_all"`
 	// SnapshotV2ShadowCanaryScheduleID enables C2c-2 shadow persistence for
 	// exactly one task. Empty is the complete rollback/off state.
 	SnapshotV2ShadowCanaryScheduleID string `mapstructure:"snapshot_v2_shadow_canary_schedule_id"`
@@ -309,6 +314,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.compiled_runtime_enabled", false)
 	v.SetDefault("pipeline.compiled_runtime_canary_schedule_id", "")
 	v.SetDefault("pipeline.compiled_runtime_allow_all", false)
+	v.SetDefault("pipeline.run_outcome_enabled", false)
+	v.SetDefault("pipeline.run_outcome_canary_schedule_id", "")
+	v.SetDefault("pipeline.run_outcome_allow_all", false)
 	v.SetDefault("pipeline.snapshot_v2_shadow_canary_schedule_id", "")
 	v.SetDefault("pipeline.snapshot_v2_read_audit_canary_schedule_id", "")
 	// Observation rollout remains exact-task only. Register both defaults so
@@ -388,6 +396,34 @@ func (c *Config) Validate() error {
 		}
 		if compiledCanaryID != "" && c.Pipeline.CompiledRuntimeAllowAll {
 			return errors.New("config: compiled runtime 单任务 canary 与 allow_all 不能同时启用")
+		}
+	}
+	rawRunOutcomeCanaryID := c.Pipeline.RunOutcomeCanaryScheduleID
+	runOutcomeCanaryID := strings.TrimSpace(rawRunOutcomeCanaryID)
+	if c.Pipeline.RunOutcomeEnabled &&
+		rawRunOutcomeCanaryID != "" && runOutcomeCanaryID == "" {
+		return errors.New(
+			"config: pipeline.run_outcome_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.RunOutcomeCanaryScheduleID = runOutcomeCanaryID
+	if c.Pipeline.RunOutcomeEnabled {
+		if !c.Pipeline.CompiledRuntimeEnabled {
+			return errors.New(
+				"config: run outcome lifecycle 要求 compiled runtime 已启用")
+		}
+		if runOutcomeCanaryID == "" && !c.Pipeline.RunOutcomeAllowAll {
+			return errors.New(
+				"config: 全量启用 run outcome 必须显式设置 pipeline.run_outcome_allow_all=true")
+		}
+		if runOutcomeCanaryID != "" && c.Pipeline.RunOutcomeAllowAll {
+			return errors.New(
+				"config: run outcome 单任务 canary 与 allow_all 不能同时启用")
+		}
+		if runOutcomeCanaryID != "" &&
+			!c.Pipeline.CompiledRuntimeAllowAll &&
+			compiledCanaryID != runOutcomeCanaryID {
+			return errors.New(
+				"config: run outcome canary 必须位于 compiled runtime rollout")
 		}
 	}
 	rawShadowCanaryID := c.Pipeline.SnapshotV2ShadowCanaryScheduleID

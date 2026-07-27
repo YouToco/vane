@@ -26,7 +26,7 @@ import (
 // Temporal 兼容（契约 §8.2）：新增命令必须通过 replay baseline。运行授权 Activity
 // 由 GetVersion 保护：历史执行重放走 DefaultVersion，不期待不存在的 Activity；新执行
 // 记录版本 marker 后先授权。这个分支必须保留到所有旧历史超过 retention。
-func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
+func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 	log := workflow.GetLogger(ctx)
 
 	// traceID 必须确定性生成：workflow 内直接 uuid.New() 是非确定性副作用，
@@ -50,6 +50,10 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// "没跑"和"跑了得 0"是两种不同的事故，用零值记录等于重造一次本 PR 要修的混淆）。
 	var counts types.PipelineCounts
 	var compiledRun *CompiledRunInputV1
+	var outcomeMarker *types.RunOutcomeMarkerV1
+	outcomeCoverage := types.RunCompletenessPartial
+	outcomeProcessing := types.RunCompletenessComplete
+	var outcomeTerminal *runOutcomeTerminalV1
 
 	// New-format scheduled Actions carry an explicit tenant and a rollout-
 	// approved mode. GetVersion preserves already-started histories; the exact
@@ -77,7 +81,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 			return types.NewAppError(types.CodeValidation,
 				"scheduled run execution mode must be compiled", nil)
 		}
-		if p.RuntimeVersion != "" && p.RuntimeVersion != CompiledRuntimeSnapshotV1 {
+		if p.RuntimeVersion != "" && !IsCompiledRuntimeV1(p.RuntimeVersion) {
 			return types.NewAppError(types.CodeValidation,
 				"scheduled run runtime version is not supported", nil)
 		}
@@ -87,7 +91,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// immutable snapshot path. The command sequence is separately versioned;
 	// existing histories and ad-hoc/legacy inputs keep their old sequence.
 	if p.RunKind == PushRunKindScheduled && p.ExecutionMode == types.ExecutionModeCompiled &&
-		p.RuntimeVersion == CompiledRuntimeSnapshotV1 &&
+		IsCompiledRuntimeV1(p.RuntimeVersion) &&
 		workflow.GetVersion(ctx, "compiled-run-snapshot-v1", workflow.DefaultVersion, 1) >= 1 {
 		prepareCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
 		var prepared PrepareRunResult
@@ -136,6 +140,67 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 				return nil
 			}
 		}
+	}
+
+	// P1-B starts only after immutable authorization succeeds, yet before
+	// Evolve/Fetch/LLM/notification/push can schedule any external side effect.
+	// The separate version marker leaves pre-P1-B compiled histories unchanged.
+	if compiledRun != nil && HasRunOutcomeV1(p.RuntimeVersion) &&
+		workflow.GetVersion(
+			ctx, "run-outcome-lifecycle-v1", workflow.DefaultVersion, 1,
+		) >= 1 {
+		beginCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
+		var marker types.RunOutcomeMarkerV1
+		if err := workflow.ExecuteActivity(
+			beginCtx, a.BeginRunOutcomeV1,
+			RunOutcomeBeginIn{UserID: p.UserID, Run: *compiledRun},
+		).Get(beginCtx, &marker); err != nil {
+			return err
+		}
+		if err := marker.Validate(); err != nil ||
+			marker.RunSnapshotID != compiledRun.Snapshot.SnapshotID ||
+			marker.TenantID != compiledRun.TenantID ||
+			marker.UserID != p.UserID ||
+			marker.TaskID != compiledRun.TaskID {
+			return types.NewAppError(
+				types.CodeValidation, "run outcome marker differs from run", err)
+		}
+		outcomeMarker = &marker
+		defer func() {
+			terminal := outcomeTerminal
+			if terminal == nil {
+				terminal = terminalRunOutcomeForError(retErr)
+			}
+			processing := outcomeProcessing
+			if retErr != nil && outcomeTerminal == nil {
+				processing = types.RunCompletenessPartial
+			}
+			claim := types.RunOutcomeClaimV1{
+				RunOutcomeMarkerV1: marker,
+				Result:             terminal.result,
+				SourceCoverage:     outcomeCoverage,
+				Processing:         processing,
+				FailureCode:        terminal.failureCode,
+				FailureMessage:     terminal.failureMessage,
+			}
+			finalizeCtx, cancel := workflow.NewDisconnectedContext(ctx)
+			defer cancel()
+			finalizeCtx = workflow.WithActivityOptions(
+				finalizeCtx, quickActivityOptions())
+			err := workflow.ExecuteActivity(
+				finalizeCtx, a.FinalizeRunOutcomeV1,
+				RunOutcomeFinalizeIn{
+					UserID: p.UserID, Run: *compiledRun, Claim: claim,
+				},
+			).Get(finalizeCtx, nil)
+			if err != nil {
+				log.Error("run outcome finalization failed",
+					"snapshot_id", marker.RunSnapshotID, "err", err)
+				if retErr == nil {
+					retErr = err
+				}
+			}
+		}()
 	}
 
 	// recordEmpty 把一次"跑完了但没东西可推"落库。闭包而非方法：Activities 的方法
@@ -200,17 +265,30 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	evolveCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
 	if err := workflow.ExecuteActivity(evolveCtx, a.EvolveProfile, EvolveIn{UserID: p.UserID, TraceID: traceID, Run: compiledRun}).Get(evolveCtx, nil); err != nil {
 		log.Warn("画像演化失败，继续推送", "user_id", p.UserID, "trace_id", traceID, "err", err)
+		if outcomeMarker != nil {
+			outcomeProcessing = types.RunCompletenessPartial
+		}
 	}
 
 	// 1. Fetch —— 网络 I/O。
 	var items []types.ContentItem
 	fetchCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
-	if err := workflow.ExecuteActivity(fetchCtx, a.Fetch, p).Get(fetchCtx, &items); err != nil {
+	if outcomeMarker != nil {
+		var result FetchOutcomeResult
+		if err := workflow.ExecuteActivity(
+			fetchCtx, a.FetchOutcomeV1, p).Get(fetchCtx, &result); err != nil {
+			return err
+		}
+		items = result.Items
+		outcomeCoverage = result.SourceCoverage
+	} else if err := workflow.ExecuteActivity(
+		fetchCtx, a.Fetch, p).Get(fetchCtx, &items); err != nil {
 		return err
 	}
 	counts = counts.WithFetched(len(items))
 	if len(items) == 0 {
 		recordEmpty(types.BatchExitGateFetch, -1)
+		outcomeTerminal = quietRunOutcomeV1()
 		log.Info("无新内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
@@ -224,6 +302,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	counts = counts.WithDeduped(len(deduped))
 	if len(deduped) == 0 {
 		recordEmpty(types.BatchExitGateDedup, -1)
+		outcomeTerminal = quietRunOutcomeV1()
 		log.Info("去重后无内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
@@ -247,8 +326,10 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 			gate := types.BatchExitGateObservationNoMatch
 			if qualified.Outcome == "uncertain" {
 				gate = types.BatchExitGateObservationUncertain
+				outcomeProcessing = types.RunCompletenessPartial
 			}
 			recordEmpty(gate, -1)
+			outcomeTerminal = quietRunOutcomeV1()
 			log.Info("观察策略判定后无可推事件",
 				"trace_id", traceID, "outcome", qualified.Outcome)
 			return nil
@@ -259,19 +340,37 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 3. Score —— LLM 调用，超时给足。
 	var scored []types.ScoredItem
 	scoreCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
-	if err := workflow.ExecuteActivity(scoreCtx, a.Score, ScoreIn{
+	scoreIn := ScoreIn{
 		UserID: p.UserID, TraceID: traceID, Items: deduped, ScheduleID: p.ScheduleID, Run: compiledRun,
-	}).Get(scoreCtx, &scored); err != nil {
+	}
+	var scoreErr error
+	if outcomeMarker != nil {
+		var result ScoreOutcomeResult
+		scoreErr = workflow.ExecuteActivity(
+			scoreCtx, a.ScoreOutcomeV1, scoreIn).Get(scoreCtx, &result)
+		scored = result.Items
+		if result.Processing == types.RunCompletenessPartial {
+			outcomeProcessing = types.RunCompletenessPartial
+		}
+	} else {
+		scoreErr = workflow.ExecuteActivity(
+			scoreCtx, a.Score, scoreIn).Get(scoreCtx, &scored)
+	}
+	if scoreErr != nil {
 		// 额度用尽不是故障，是**正常终态**——和"没有新内容"同一类，只是原因不同。
 		// 让它走 workflow 失败会：① 在 Temporal 里堆一串红色的失败记录，
 		// ② 用户什么提示都收不到（失败路径不发通知），只能干等着纳闷。
 		// 导向空批次 + 专属闸门，用户会收到「额度用尽、会自动恢复」的人话。
-		if isQuotaFailure(err) {
+		if isQuotaFailure(scoreErr) {
 			recordEmpty(types.BatchExitGateQuota, -1)
+			outcomeProcessing = types.RunCompletenessPartial
+			outcomeTerminal = failedRunOutcomeV1(
+				string(types.CodeQuotaExceeded),
+				"本租户 LLM 额度已用尽，本轮跳过打分")
 			log.Info("额度用尽，本轮跳过打分", "trace_id", traceID)
 			return nil
 		}
-		return err
+		return scoreErr
 	}
 	// 本闸门当前**够不着**（core review 时核实，不是猜的）：Score 只在
 	// len(in.Items)==0 时返回空切片，而 in.Items 就是上面刚校验过非空的 deduped；
@@ -286,6 +385,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	counts = counts.WithScored(len(scored))
 	if len(scored) == 0 {
 		recordEmpty(types.BatchExitGateScore, -1)
+		outcomeTerminal = quietRunOutcomeV1()
 		log.Info("打分后无内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
@@ -314,6 +414,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 			}
 		}
 		recordEmpty(types.BatchExitGateSelect, maxScore)
+		outcomeTerminal = quietRunOutcomeV1()
 		log.Info("门槛过滤后无内容，pipeline 结束", "trace_id", traceID, "max_score", maxScore)
 		return nil
 	}
@@ -321,21 +422,40 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 5. CardGen —— LLM 调用。
 	var cards []GeneratedCard
 	cardCtx := workflow.WithActivityOptions(ctx, llmActivityOptions())
-	if err := workflow.ExecuteActivity(cardCtx, a.CardGen, CardGenIn{
+	cardIn := CardGenIn{
 		UserID: p.UserID, TraceID: traceID, Items: selected, ScheduleID: p.ScheduleID, Run: compiledRun,
-	}).Get(cardCtx, &cards); err != nil {
-		if isQuotaFailure(err) {
+	}
+	var cardErr error
+	if outcomeMarker != nil {
+		var result CardGenOutcomeResult
+		cardErr = workflow.ExecuteActivity(
+			cardCtx, a.CardGenOutcomeV1, cardIn).Get(cardCtx, &result)
+		cards = result.Cards
+		if result.Processing == types.RunCompletenessPartial {
+			outcomeProcessing = types.RunCompletenessPartial
+		}
+	} else {
+		cardErr = workflow.ExecuteActivity(
+			cardCtx, a.CardGen, cardIn).Get(cardCtx, &cards)
+	}
+	if cardErr != nil {
+		if isQuotaFailure(cardErr) {
 			recordEmpty(types.BatchExitGateQuota, -1)
+			outcomeProcessing = types.RunCompletenessPartial
+			outcomeTerminal = failedRunOutcomeV1(
+				string(types.CodeQuotaExceeded),
+				"本租户 LLM 额度已用尽，本轮跳过出卡")
 			log.Info("额度用尽，本轮跳过出卡", "trace_id", traceID)
 			return nil
 		}
-		return err
+		return cardErr
 	}
 	// 同 Score：CardGen 整批全失败走 CodeLLMUnavailable 错误分支，空切片只在
 	// 入参为空时出现，而 selected 刚校验非空。
 	counts = counts.WithCards(len(cards))
 	if len(cards) == 0 {
 		recordEmpty(types.BatchExitGateCardGen, -1)
+		outcomeTerminal = quietRunOutcomeV1()
 		log.Info("卡片生成后无内容，pipeline 结束", "trace_id", traceID)
 		return nil
 	}
@@ -343,11 +463,85 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) error {
 	// 6. Push —— 网络 I/O，主动推送飞书卡片。
 	pushCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
 	if err := workflow.ExecuteActivity(pushCtx, a.Push, PushIn{UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID, Cards: cards, TaskTitle: p.NLDesc, Run: compiledRun}).Get(pushCtx, nil); err != nil {
+		outcomeProcessing = types.RunCompletenessPartial
+		if !temporal.IsCanceledError(err) {
+			outcomeTerminal = contentRunOutcomeV1()
+		}
 		return err
 	}
 
+	outcomeTerminal = contentRunOutcomeV1()
 	log.Info("push pipeline 完成", "user_id", p.UserID, "trace_id", traceID, "pushed", len(cards))
 	return nil
+}
+
+type runOutcomeTerminalV1 struct {
+	result         types.RunResultV1
+	failureCode    string
+	failureMessage string
+}
+
+func quietRunOutcomeV1() *runOutcomeTerminalV1 {
+	return &runOutcomeTerminalV1{result: types.RunResultQuiet}
+}
+
+func contentRunOutcomeV1() *runOutcomeTerminalV1 {
+	return &runOutcomeTerminalV1{result: types.RunResultContent}
+}
+
+func failedRunOutcomeV1(code, message string) *runOutcomeTerminalV1 {
+	return &runOutcomeTerminalV1{
+		result:         types.RunResultFailed,
+		failureCode:    code,
+		failureMessage: boundedOutcomeFailureMessageV1(message),
+	}
+}
+
+func terminalRunOutcomeForError(err error) *runOutcomeTerminalV1 {
+	if err == nil {
+		return failedRunOutcomeV1(
+			"outcome_missing_terminal_receipt",
+			"workflow completed without a terminal outcome receipt")
+	}
+	if temporal.IsCanceledError(err) {
+		return &runOutcomeTerminalV1{
+			result:         types.RunResultInterrupted,
+			failureCode:    "workflow_canceled",
+			failureMessage: "workflow was canceled",
+		}
+	}
+	var appErr *temporal.ApplicationError
+	if errors.As(err, &appErr) && knownOutcomeFailureCodeV1(appErr.Type()) {
+		return failedRunOutcomeV1(appErr.Type(), appErr.Message())
+	}
+	return failedRunOutcomeV1(
+		"workflow_failed", "workflow failed before a reliable terminal result")
+}
+
+func knownOutcomeFailureCodeV1(code string) bool {
+	switch types.ErrCode(code) {
+	case types.CodeNotFound, types.CodeConflict, types.CodeValidation,
+		types.CodeDatabase, types.CodeInternal, types.CodeLLMRateLimit,
+		types.CodeLLMBadRequest, types.CodeLLMUnavailable,
+		types.CodeQuotaExceeded, types.CodeFetchTimeout,
+		types.CodeFetchRateLimit, types.CodePushFailed,
+		types.CodeDBDeadlock, types.CodeDBConnLost, types.CodeDBConstraint:
+		return true
+	default:
+		return false
+	}
+}
+
+func boundedOutcomeFailureMessageV1(message string) string {
+	const maxBytes = 4096
+	if len(message) <= maxBytes {
+		return message
+	}
+	cut := maxBytes
+	for cut > 0 && message[cut]&0xc0 == 0x80 {
+		cut--
+	}
+	return message[:cut]
 }
 
 // isQuotaFailure 判定 activity 错误是否为额度用尽。

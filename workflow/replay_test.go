@@ -504,6 +504,100 @@ func TestPushPipelineWorkflow_ReplayCompiledV1HappyPath(t *testing.T) {
 	}
 }
 
+func compiledRunOutcomeV1HappyPathHistory(
+	t *testing.T,
+	execution sdkworkflow.Execution,
+) *historypb.History {
+	t.Helper()
+	p := PushParams{
+		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeRunOutcomeV1,
+		ScheduleID:     "task-p1b-replay", NLDesc: "每日冻结情报",
+	}
+	identity := types.RunIdentity{
+		TemporalWorkflowID: execution.ID, TemporalRunID: execution.RunID,
+		RunKind:  types.RunSnapshotKindScheduled,
+		TenantID: p.TenantID, UserID: p.UserID, TaskID: p.ScheduleID,
+	}
+	ref := mustCompiledRunRef(identity, 102)
+	run := &CompiledRunInputV1{
+		TenantID: p.TenantID, TaskID: p.ScheduleID, Snapshot: ref,
+	}
+	preparedParams := p
+	preparedParams.Snapshot = &ref
+	marker := types.RunOutcomeMarkerV1{
+		ID: 202, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID, TenantID: p.TenantID,
+		UserID: p.UserID, TaskID: p.ScheduleID,
+	}
+	const traceID = "9f1d6c5e-0000-4000-8000-p1breplay000"
+	b := newHistoryBuilder(t, p)
+	b.sideEffect(1, traceID)
+	b.versionWithSearchAttributes("scheduled-runtime-envelope-v1", 1)
+	b.versionWithSearchAttributes("compiled-run-snapshot-v1", 1)
+	b.activity("PrepareRun", p,
+		PrepareRunResult{Authorized: true, Snapshot: ref})
+	b.versionWithSearchAttributes("run-outcome-lifecycle-v1", 1)
+	b.activity("BeginRunOutcomeV1",
+		RunOutcomeBeginIn{UserID: p.UserID, Run: *run}, marker)
+	b.activity("EvolveProfile",
+		EvolveIn{UserID: p.UserID, TraceID: traceID, Run: run}, nil)
+	b.activity("FetchOutcomeV1", preparedParams, FetchOutcomeResult{
+		Items: items(20), SourceCoverage: types.RunCompletenessComplete,
+	})
+	b.activity("Dedup", DedupIn{
+		UserID: p.UserID, TraceID: traceID, Items: items(20), Run: run,
+	}, items(18))
+	b.versionWithSearchAttributes("observation-qualification-v1", 1)
+	b.activity("QualifyEvents", QualifyEventsIn{
+		UserID: p.UserID, TraceID: traceID, ScheduleID: p.ScheduleID,
+		Items: items(18), Run: run,
+	}, QualifyEventsResult{Items: items(18), Outcome: "not_configured"})
+	b.activity("ScoreOutcomeV1", ScoreIn{
+		UserID: p.UserID, TraceID: traceID, Items: items(18),
+		ScheduleID: p.ScheduleID, Run: run,
+	}, ScoreOutcomeResult{
+		Items: scoredItems(18), Processing: types.RunCompletenessComplete,
+	})
+	b.activity("Select", SelectIn{
+		UserID: p.UserID, TraceID: traceID, TopN: defaultTopN,
+		Scored: scoredItems(18), ScheduleID: p.ScheduleID, Run: run,
+	}, scoredItems(5))
+	b.activity("CardGenOutcomeV1", CardGenIn{
+		UserID: p.UserID, TraceID: traceID, Items: scoredItems(5),
+		ScheduleID: p.ScheduleID, Run: run,
+	}, CardGenOutcomeResult{
+		Cards: cardsOf(5), Processing: types.RunCompletenessComplete,
+	})
+	b.activity("Push", PushIn{
+		UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID,
+		Cards: cardsOf(5), TaskTitle: p.NLDesc, Run: run,
+	}, nil)
+	b.activity("FinalizeRunOutcomeV1", RunOutcomeFinalizeIn{
+		UserID: p.UserID, Run: *run,
+		Claim: types.RunOutcomeClaimV1{
+			RunOutcomeMarkerV1: marker,
+			Result:             types.RunResultContent,
+			SourceCoverage:     types.RunCompletenessComplete,
+			Processing:         types.RunCompletenessComplete,
+		},
+	}, nil)
+	return b.complete()
+}
+
+func TestPushPipelineWorkflow_ReplayCompiledRunOutcomeV1HappyPath(t *testing.T) {
+	execution := sdkworkflow.Execution{
+		ID:    "wf-task-p1b-replay",
+		RunID: "00000000-0000-4000-8000-000000000102",
+	}
+	if err := replayWithExecution(
+		t, compiledRunOutcomeV1HappyPathHistory(t, execution), execution,
+	); err != nil {
+		t.Fatalf("P1-B history must replay exactly: %v", err)
+	}
+}
+
 func TestPushPipelineWorkflow_ReplayCompiledV1RejectsPrepareMutation(t *testing.T) {
 	execution := sdkworkflow.Execution{
 		ID: "wf-task-c1b-replay", RunID: "00000000-0000-4000-8000-000000000101",

@@ -178,6 +178,7 @@ type Scheduler struct {
 	taskScheduleGates taskScheduleGateSet
 	taskScheduleEnv   taskScheduleEnvironment
 	compiledRuntime   compiledRuntimeRollout
+	runOutcome        runOutcomeRollout
 	commandAttempt    time.Duration
 }
 

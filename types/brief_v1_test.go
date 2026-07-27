@@ -56,6 +56,35 @@ func TestRunOutcomeV1RejectsDishonestFailureShape(t *testing.T) {
 	}
 }
 
+func TestRunOutcomeClaimV1SealsOnlyWithStoreTimeAndMatchesSemantics(t *testing.T) {
+	claim := RunOutcomeClaimV1{
+		RunOutcomeMarkerV1: RunOutcomeMarkerV1{
+			ID: 1, SchemaVersion: RunOutcomeSchemaVersionV1,
+			RunSnapshotID: 2, TenantID: 3, UserID: 4, TaskID: "task-1",
+		},
+		Result: RunResultContent, SourceCoverage: RunCompletenessPartial,
+		Processing: RunCompletenessComplete,
+	}
+	if err := claim.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	at := time.Date(2026, 7, 27, 12, 34, 56, 123456789, time.FixedZone("x", 3600))
+	outcome, err := claim.SealAt(at)
+	if err != nil {
+		t.Fatalf("SealAt() error = %v", err)
+	}
+	if want := at.UTC().Truncate(time.Microsecond); !outcome.FinalizedAt.Equal(want) {
+		t.Fatalf("FinalizedAt = %v, want %v", outcome.FinalizedAt, want)
+	}
+	if !claim.Matches(outcome) {
+		t.Fatal("claim does not match its sealed outcome")
+	}
+	outcome.Processing = RunCompletenessPartial
+	if claim.Matches(outcome) {
+		t.Fatal("claim matched a different terminal semantic")
+	}
+}
+
 func TestBriefV1FreezesRankIdentityAndCanonicalSource(t *testing.T) {
 	published := time.Date(2026, 7, 27, 8, 0, 0, 999, time.UTC)
 	draft := BriefDraftV1{

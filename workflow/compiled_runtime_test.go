@@ -1775,6 +1775,8 @@ type compiledWorkflowCapture struct {
 
 	prepareCalls   int
 	authorizeCalls int
+	begin          []RunOutcomeBeginIn
+	finalize       []RunOutcomeFinalizeIn
 	evolve         []EvolveIn
 	fetch          []PushParams
 	dedup          []DedupIn
@@ -1784,6 +1786,7 @@ type compiledWorkflowCapture struct {
 	push           []PushIn
 	record         []RecordEmptyIn
 	notify         []NotifyEmptyIn
+	order          []string
 
 	selectEmpty bool
 }
@@ -1811,17 +1814,46 @@ func (c *compiledWorkflowCapture) register(env *testsuite.TestWorkflowEnvironmen
 		c.mu.Unlock()
 		return true, nil
 	})
+	reg("BeginRunOutcomeV1", func(_ context.Context, in RunOutcomeBeginIn) (types.RunOutcomeMarkerV1, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.begin = append(c.begin, in)
+		c.order = append(c.order, "begin")
+		return types.RunOutcomeMarkerV1{
+			ID: 91, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+			RunSnapshotID: in.Run.Snapshot.SnapshotID,
+			TenantID:      in.Run.TenantID, UserID: in.UserID,
+			TaskID: in.Run.TaskID,
+		}, nil
+	})
+	reg("FinalizeRunOutcomeV1", func(_ context.Context, in RunOutcomeFinalizeIn) (types.RunOutcomeV1, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.finalize = append(c.finalize, in)
+		return in.Claim.SealAt(time.Now())
+	})
 	reg("EvolveProfile", func(_ context.Context, in EvolveIn) error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.evolve = append(c.evolve, in)
+		c.order = append(c.order, "evolve")
 		return nil
 	})
 	reg("Fetch", func(_ context.Context, in PushParams) ([]types.ContentItem, error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.fetch = append(c.fetch, in)
+		c.order = append(c.order, "fetch")
 		return items(1), nil
+	})
+	reg("FetchOutcomeV1", func(_ context.Context, in PushParams) (FetchOutcomeResult, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.fetch = append(c.fetch, in)
+		c.order = append(c.order, "fetch")
+		return FetchOutcomeResult{
+			Items: items(1), SourceCoverage: types.RunCompletenessComplete,
+		}, nil
 	})
 	reg("Dedup", func(_ context.Context, in DedupIn) ([]types.ContentItem, error) {
 		c.mu.Lock()
@@ -1838,6 +1870,14 @@ func (c *compiledWorkflowCapture) register(env *testsuite.TestWorkflowEnvironmen
 		c.score = append(c.score, in)
 		return scoredItems(1), nil
 	})
+	reg("ScoreOutcomeV1", func(_ context.Context, in ScoreIn) (ScoreOutcomeResult, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.score = append(c.score, in)
+		return ScoreOutcomeResult{
+			Items: scoredItems(1), Processing: types.RunCompletenessComplete,
+		}, nil
+	})
 	reg("Select", func(_ context.Context, in SelectIn) ([]types.ScoredItem, error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -1852,6 +1892,14 @@ func (c *compiledWorkflowCapture) register(env *testsuite.TestWorkflowEnvironmen
 		defer c.mu.Unlock()
 		c.cardGen = append(c.cardGen, in)
 		return cardsOf(1), nil
+	})
+	reg("CardGenOutcomeV1", func(_ context.Context, in CardGenIn) (CardGenOutcomeResult, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.cardGen = append(c.cardGen, in)
+		return CardGenOutcomeResult{
+			Cards: cardsOf(1), Processing: types.RunCompletenessComplete,
+		}, nil
 	})
 	reg("Push", func(_ context.Context, in PushIn) error {
 		c.mu.Lock()
@@ -1922,6 +1970,66 @@ func TestPushPipelineWorkflow_CompiledRunUsesPrepareAndPropagatesOneReference(t 
 	capture.assertRunRef(t, want, capture.selectIn[0].Run, "Select")
 	capture.assertRunRef(t, want, capture.cardGen[0].Run, "CardGen")
 	capture.assertRunRef(t, want, capture.push[0].Run, "Push")
+}
+
+func TestPushPipelineWorkflow_RunOutcomeBeginsBeforeFirstSideEffectAndFinalizes(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{
+		ID: "wf-task-run-outcome",
+	})
+	capture := new(compiledWorkflowCapture)
+	capture.register(env)
+
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
+		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeRunOutcomeV1,
+		ScheduleID:     "task-run-outcome",
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("run outcome workflow failed: %v", err)
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if len(capture.begin) != 1 || len(capture.finalize) != 1 {
+		t.Fatalf("lifecycle calls begin=%d finalize=%d",
+			len(capture.begin), len(capture.finalize))
+	}
+	if len(capture.order) < 3 ||
+		capture.order[0] != "begin" ||
+		capture.order[1] != "evolve" ||
+		capture.order[2] != "fetch" {
+		t.Fatalf("first-side-effect ordering = %v", capture.order)
+	}
+	claim := capture.finalize[0].Claim
+	if claim.Result != types.RunResultContent ||
+		claim.SourceCoverage != types.RunCompletenessComplete ||
+		claim.Processing != types.RunCompletenessComplete {
+		t.Fatalf("content outcome claim = %+v", claim)
+	}
+}
+
+func TestPushPipelineWorkflow_PreP1BCompiledDoesNotCreateOutcomeMarker(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	capture := new(compiledWorkflowCapture)
+	capture.register(env)
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
+		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeSnapshotV1,
+		ScheduleID:     "task-pre-p1b",
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if len(capture.begin) != 0 || len(capture.finalize) != 0 {
+		t.Fatalf("pre-P1-B lifecycle calls begin=%d finalize=%d",
+			len(capture.begin), len(capture.finalize))
+	}
 }
 
 func TestPushPipelineWorkflow_CompiledEmptyExitPropagatesReferenceToRecordAndNotify(t *testing.T) {
