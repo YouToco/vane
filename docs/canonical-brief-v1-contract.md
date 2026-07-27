@@ -80,17 +80,19 @@ trigger binds all three columns. RLS therefore cannot hide a poisoned
 cross-tenant or cross-user row and let a filtered subset appear complete.
 The constrained evidence reader returns every scoped delivery, including rows
 whose content/source evidence is missing; Freeze rejects any incomplete row.
-Delivery identity and source-bearing fields are immutable after insertion,
-while receipt fields such as status, card, message ID, and sent time remain
-updatable after the batch is sealed.
+Delivery batch/tenant/user scope is immutable after insertion. Source-bearing
+fields may be corrected while the batch is open, but become immutable at seal;
+receipt fields such as status, card, message ID, and sent time remain updatable
+after the batch is sealed.
 
 ## Permissions and rollout
 
 `vane_brief_writer` is NOLOGIN, NOINHERIT, NOBYPASSRLS, unrelated to
 `vane_app`, and settable only by the migration owner. If the cluster-wide role
 already exists, the migration rejects owned objects or any preexisting ACL in
-the current database before applying the whitelist. Any cluster-wide parameter
-ACL is also rejected because it could disable the trigger boundary. The
+the current database before applying the whitelist. Any effective cluster-wide
+parameter privilege, including one inherited from `PUBLIC`, is also rejected
+because it could disable the trigger boundary. The
 migration never uses cluster-wide `DROP OWNED`, so privileges on another
 database are not mutated. It can:
 

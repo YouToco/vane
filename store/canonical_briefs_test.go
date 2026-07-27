@@ -448,6 +448,13 @@ func TestCanonicalBriefDarkStoreRejectsDeliveryWithoutSourceEvidence(
 
 func TestCanonicalBriefDarkStoreSealsDeliveryEvidence(t *testing.T) {
 	f := newCanonicalBriefFixture(t, 1)
+	f.bodyMD[0] = "corrected before canonical seal"
+	if _, err := f.base.st.pool.Exec(t.Context(), `
+		UPDATE deliveries SET body_md=$2 WHERE id=$1`,
+		f.deliveryID[0], f.bodyMD[0],
+	); err != nil {
+		t.Fatalf("open delivery evidence correction was rejected: %v", err)
+	}
 	outcome := f.finalizedContentOutcome(t)
 	if _, err := f.base.st.FreezeBriefV1(
 		t.Context(), f.identity, f.ref, f.draft(t, outcome),
@@ -471,14 +478,17 @@ func TestCanonicalBriefDarkStoreSealsDeliveryEvidence(t *testing.T) {
 	for name, mutation := range map[string]struct {
 		statement string
 		value     any
+		want      string
 	}{
 		"body": {
 			statement: `UPDATE deliveries SET body_md=$2 WHERE id=$1`,
 			value:     "mutated",
+			want:      "canonical delivery evidence is immutable",
 		},
 		"batch": {
 			statement: `UPDATE deliveries SET batch_id=$2 WHERE id=$1`,
 			value:     openBatchID,
+			want:      "canonical delivery scope is immutable",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -486,7 +496,7 @@ func TestCanonicalBriefDarkStoreSealsDeliveryEvidence(t *testing.T) {
 				t.Context(), mutation.statement,
 				f.deliveryID[0], mutation.value,
 			); err == nil || !strings.Contains(
-				err.Error(), "canonical delivery evidence is immutable") {
+				err.Error(), mutation.want) {
 				t.Fatalf("sealed delivery evidence mutation=%v", err)
 			}
 		})

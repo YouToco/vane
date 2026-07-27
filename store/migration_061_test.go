@@ -454,6 +454,51 @@ func TestMigration061RejectsWriterParameterACL(t *testing.T) {
 	}
 }
 
+func TestMigration061RejectsPublicParameterACL(t *testing.T) {
+	db, provider := migration035Scratch(t)
+	if _, err := provider.UpTo(t.Context(), 60); err != nil {
+		t.Fatalf("migrate to 060: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		DO $$
+		BEGIN
+		    IF NOT EXISTS (
+		        SELECT 1 FROM pg_roles WHERE rolname='vane_brief_writer'
+		    ) THEN
+		        CREATE ROLE vane_brief_writer
+		            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+		            NOLOGIN NOINHERIT NOBYPASSRLS;
+		    END IF;
+		END $$;
+		GRANT SET ON PARAMETER session_replication_role TO PUBLIC`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		if _, err := db.ExecContext(ctx, `
+			REVOKE SET ON PARAMETER session_replication_role
+			    FROM PUBLIC`); err != nil {
+			t.Errorf("cleanup PUBLIC parameter ACL: %v", err)
+		}
+	})
+	if _, err := provider.UpTo(t.Context(), 61); err == nil ||
+		!strings.Contains(
+			err.Error(), "unsafe cluster parameter ACL") {
+		t.Fatalf("migration admitted PUBLIC parameter ACL: %v", err)
+	}
+	var inherited bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT has_parameter_privilege(
+		    'vane_brief_writer','session_replication_role','SET')`,
+	).Scan(&inherited); err != nil {
+		t.Fatal(err)
+	}
+	if !inherited {
+		t.Fatal("test fixture did not retain PUBLIC parameter ACL")
+	}
+}
+
 func TestMigration061PreservesWriterACLInOtherDatabase(t *testing.T) {
 	db, provider := migration035Scratch(t)
 	if _, err := provider.UpTo(t.Context(), 60); err != nil {

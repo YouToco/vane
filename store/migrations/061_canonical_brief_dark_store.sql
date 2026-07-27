@@ -100,8 +100,25 @@ AS $$
 DECLARE state text;
 BEGIN
     IF TG_OP='UPDATE' THEN
-        RAISE EXCEPTION
-            '061: canonical delivery evidence is immutable';
+        IF ROW(NEW.batch_id,NEW.tenant_id,NEW.user_id) IS DISTINCT FROM
+           ROW(OLD.batch_id,OLD.tenant_id,OLD.user_id) THEN
+            RAISE EXCEPTION
+                '061: canonical delivery scope is immutable';
+        END IF;
+        SELECT brief_state INTO state
+          FROM public.push_batches
+         WHERE id=OLD.batch_id
+           AND tenant_id=OLD.tenant_id
+           AND user_id=OLD.user_id
+         FOR KEY SHARE;
+        IF state IS NULL THEN
+            RAISE EXCEPTION '061: delivery batch is unavailable';
+        END IF;
+        IF state<>'open' THEN
+            RAISE EXCEPTION
+                '061: canonical delivery evidence is immutable';
+        END IF;
+        RETURN NEW;
     END IF;
     SELECT brief_state INTO state
       FROM public.push_batches
@@ -522,13 +539,13 @@ BEGIN
     END IF;
     IF EXISTS (
         SELECT 1
-          FROM pg_shdepend dep
-          JOIN pg_roles r ON r.oid=dep.refobjid
-         WHERE r.rolname='vane_brief_writer'
-           AND dep.refclassid='pg_authid'::regclass
-           AND dep.deptype='a'
-           AND dep.dbid=0
-           AND dep.classid='pg_parameter_acl'::regclass
+          FROM pg_parameter_acl parameter_acl
+         WHERE has_parameter_privilege(
+                   'vane_brief_writer',parameter_acl.parname,'SET'
+               )
+            OR has_parameter_privilege(
+                   'vane_brief_writer',parameter_acl.parname,'ALTER SYSTEM'
+               )
     ) THEN
         RAISE EXCEPTION
             '061: brief writer has unsafe cluster parameter ACL';
