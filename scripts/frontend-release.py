@@ -274,13 +274,13 @@ def plan(dist: Path, source_sha: str, output: Path) -> None:
             manifest = json.loads(files[manifest_path].read_text(encoding="utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError(f"invalid frontend manifest: {manifest_path}") from error
-        raw_references = manifest_references(manifest)
-        raw_runtime_references: list[str] = []
         if is_vite_manifest(manifest_path, manifest):
-            vite_references, raw_runtime_references = vite_manifest_references(
+            raw_references, raw_runtime_references = vite_manifest_references(
                 manifest_path, manifest
             )
-            raw_references.extend(vite_references)
+        else:
+            raw_references = manifest_references(manifest)
+            raw_runtime_references = []
         for raw_reference in raw_references:
             # Vite's JSON manifest values are dist-root relative even though
             # the manifest commonly lives at .vite/manifest.json. Web app

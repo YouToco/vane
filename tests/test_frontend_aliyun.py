@@ -74,6 +74,10 @@ class FrontendAliyunTests(unittest.TestCase):
                             "dynamicImports": ["_shared"],
                         },
                         "_shared": {"file": SHARED_JS_OBJECT},
+                        "_src-Bi-fZELz.css": {
+                            "file": CSS_OBJECT,
+                            "src": "_src-Bi-fZELz.css",
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -419,7 +423,11 @@ class FrontendAliyunTests(unittest.TestCase):
             result = self.run_deploy(case)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("referenced frontend file is missing", result.stderr)
+            self.assertNotIn("publication_plan: unbound variable", result.stderr)
             self.assertFalse(case["ossutil_log"].exists())
+            self.assertEqual(
+                list(case["receipts"].glob(".aliyun-plan.*")), []
+            )
             self.assertEqual(
                 (case["remote"] / "index.html").read_text(encoding="utf-8"),
                 "old-index",

@@ -328,6 +328,7 @@ stat_oss_object_with_size() {
 deploy_frontend_aliyun() {
   local owner_preview_object="_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html"
   local publication_plan
+  local publication_plan_cleanup
   local -a refresh_urls
   if frontend_state_check; then
     :
@@ -345,7 +346,8 @@ deploy_frontend_aliyun() {
   mkdir -p "$FRONTEND_RECEIPT_DIR"
   chmod 700 "$FRONTEND_RECEIPT_DIR"
   publication_plan=$(mktemp -d "$FRONTEND_RECEIPT_DIR/.aliyun-plan.XXXXXX")
-  trap 'rm -rf -- "$publication_plan"' EXIT
+  printf -v publication_plan_cleanup 'rm -rf -- %q' "$publication_plan"
+  trap "$publication_plan_cleanup" EXIT
   "$(dirname "$0")/frontend-release.py" \
     --dist "$payload/dist" \
     --sha "$source_sha" \
