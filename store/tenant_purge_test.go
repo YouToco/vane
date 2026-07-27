@@ -148,10 +148,20 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		t.Fatalf("建租户失败: %v", err)
 	}
 	// 塞一点租户数据，让清理有东西可删。
-	if _, err := st.pool.Exec(ctx,
-		`INSERT INTO profiles (user_id, tenant_id, summary) VALUES ($1, $2, '测试画像')`,
-		u.ID, tn.ID); err != nil {
+	var profileUpdatedAt time.Time
+	if err := st.pool.QueryRow(ctx,
+		`INSERT INTO profiles (user_id, tenant_id, summary)
+		 VALUES ($1, $2, '测试画像') RETURNING updated_at`,
+		u.ID, tn.ID).Scan(&profileUpdatedAt); err != nil {
 		t.Fatalf("建画像失败: %v", err)
+	}
+	occupation := "清理测试职业"
+	if _, err := st.PatchProfile(
+		ctx, tn.ID, u.ID, &profileUpdatedAt,
+		types.ProfileEditPatch{Occupation: &occupation},
+		"purge-profile-"+uuid.NewString(), strings.Repeat("c", 64),
+	); err != nil {
+		t.Fatalf("建画像人工编辑审计失败: %v", err)
 	}
 	taskID := "purge-task-" + uuid.NewString()
 	editOperationID := "purge-definition-edit-" + uuid.NewString()
@@ -333,6 +343,8 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		cleanupExec(c, t, st, `DELETE FROM schedule_commands WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM schedules WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_run_snapshots WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM profile_edit_receipts WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM profile_edit_revisions WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM profiles WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM agent_sessions WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM tenant_quota WHERE tenant_id = $1`, tn.ID)
@@ -379,6 +391,12 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 			rep.Rows["task_definition_edit_operations"],
 			rep.Rows["task_definition_edit_receipts"])
 	}
+	if rep.Rows["profile_edit_receipts"] != 1 ||
+		rep.Rows["profile_edit_revisions"] != 1 {
+		t.Errorf("试运行报告必须包含画像 edit receipt/revision，实得 %d/%d",
+			rep.Rows["profile_edit_receipts"],
+			rep.Rows["profile_edit_revisions"])
+	}
 	if rep.Rows["schedule_commands"] != 1 {
 		t.Errorf("试运行报告必须包含 Schedule Command，实得 %d",
 			rep.Rows["schedule_commands"])
@@ -396,7 +414,7 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	if _, err := st.GetTenant(ctx, tenantID); err != nil {
 		t.Errorf("试运行后租户不该消失: %v", err)
 	}
-	var n int
+	var n, profileRevisions int
 	if err := st.pool.QueryRow(ctx,
 		`SELECT count(*) FROM profiles WHERE tenant_id = $1`, tenantID).Scan(&n); err != nil {
 		t.Fatalf("查画像失败: %v", err)
@@ -456,6 +474,17 @@ func TestPurgeTenant_DryRunChangesNothing(t *testing.T) {
 	}
 	if n != 3 {
 		t.Errorf("试运行后 Agent event 应还在，实得 %d 行 —— 事务没回滚", n)
+	}
+	if err := st.pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT count(*) FROM profile_edit_receipts WHERE tenant_id=$1),
+		  (SELECT count(*) FROM profile_edit_revisions WHERE tenant_id=$1)`,
+		tenantID).Scan(&n, &profileRevisions); err != nil {
+		t.Fatalf("查画像 edit audit 失败: %v", err)
+	}
+	if n != 1 || profileRevisions != 1 {
+		t.Errorf("试运行后画像 edit audit 应还在，实得 %d/%d",
+			n, profileRevisions)
 	}
 }
 
@@ -517,6 +546,155 @@ func TestAgentProjectionAuthorityControlRacesTenantPurgeWithoutDeadlock(
 	}
 }
 
+func TestPurgeTenant_ProfilePatchAfterAuditDeleteIsFenced(t *testing.T) {
+	st := purgeStore(t)
+	tenantID := seedPurgeTenant(t, st)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	var userID int64
+	var expectedUpdatedAt time.Time
+	if err := st.pool.QueryRow(ctx,
+		`SELECT user_id,updated_at FROM profiles WHERE tenant_id=$1`,
+		tenantID,
+	).Scan(&userID, &expectedUpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+
+	auditDeleted := make(chan struct{})
+	resumePurge := make(chan struct{})
+	var resumeOnce sync.Once
+	resume := func() { resumeOnce.Do(func() { close(resumePurge) }) }
+	t.Cleanup(resume)
+	pausedPurgeStore := *st
+	pausedPurgeStore.beginTx = func(
+		ctx context.Context, options pgx.TxOptions,
+	) (pgx.Tx, error) {
+		tx, err := st.pool.BeginTx(ctx, options)
+		if err != nil {
+			return nil, err
+		}
+		return &pauseAfterProfileAuditDeleteTx{
+			Tx: tx, deleted: auditDeleted, resume: resumePurge,
+		}, nil
+	}
+	type purgeResult struct {
+		report *PurgeReport
+		err    error
+	}
+	purgeDone := make(chan purgeResult, 1)
+	go func() {
+		report, err := pausedPurgeStore.PurgeTenant(ctx, tenantID, false)
+		purgeDone <- purgeResult{report: report, err: err}
+	}()
+	select {
+	case <-auditDeleted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant purge 未删除画像 audit 后暂停")
+	}
+
+	patchDone := make(chan error, 1)
+	occupation := "不能成为 purge phantom"
+	go func() {
+		_, err := st.PatchProfile(
+			ctx, tenantID, userID, &expectedUpdatedAt,
+			types.ProfileEditPatch{Occupation: &occupation},
+			"purge-phantom-"+uuid.NewString(), strings.Repeat("e", 64))
+		patchDone <- err
+	}()
+	waitForDatabaseLockQuery(
+		t, st, "%pg_advisory_xact_lock(hashtextextended($1, $2))%",
+		"画像 PATCH 未在任何 child write 前等待 tenant admission root",
+	)
+	select {
+	case err := <-patchDone:
+		t.Fatalf("画像 PATCH 绕过 tenant admission root 提前完成: %v", err)
+	default:
+	}
+	resume()
+	select {
+	case result := <-purgeDone:
+		if result.err != nil {
+			t.Fatalf("tenant purge 与画像 PATCH 并发失败: %v", result.err)
+		}
+		if result.report == nil ||
+			result.report.Rows["profile_edit_receipts"] != 1 ||
+			result.report.Rows["profile_edit_revisions"] != 1 ||
+			result.report.Rows["profiles"] != 1 ||
+			result.report.Rows["tenants"] != 1 {
+			t.Fatalf("tenant purge 漏计画像审计: %+v", result.report)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant purge 释放审计暂停点后未收敛")
+	}
+	select {
+	case err := <-patchDone:
+		if !errors.Is(err, types.ErrNotFound) {
+			t.Fatalf("purge 后画像 PATCH 应在根锁后观察到 NotFound: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tenant purge 完成后画像 PATCH 未收敛")
+	}
+	var receipts, revisions, profiles, tenants int
+	if err := st.pool.QueryRow(t.Context(), `
+		SELECT
+		  (SELECT count(*) FROM profile_edit_receipts WHERE tenant_id=$1),
+		  (SELECT count(*) FROM profile_edit_revisions WHERE tenant_id=$1),
+		  (SELECT count(*) FROM profiles WHERE tenant_id=$1),
+		  (SELECT count(*) FROM tenants WHERE id=$1)`,
+		tenantID,
+	).Scan(&receipts, &revisions, &profiles, &tenants); err != nil {
+		t.Fatal(err)
+	}
+	if receipts != 0 || revisions != 0 || profiles != 0 || tenants != 0 {
+		t.Fatalf("purge phantom residue receipts/revisions/profiles/tenants=%d/%d/%d/%d",
+			receipts, revisions, profiles, tenants)
+	}
+}
+
+func TestProfileEditAdmissionRootIsTenantScoped(t *testing.T) {
+	st := purgeStore(t)
+	tenantA := seedPurgeTenant(t, st)
+	tenantB := seedPurgeTenant(t, st)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var userA, userB int64
+	var expectedB time.Time
+	if err := st.pool.QueryRow(ctx,
+		`SELECT user_id FROM profiles WHERE tenant_id=$1`,
+		tenantA).Scan(&userA); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT user_id,updated_at FROM profiles WHERE tenant_id=$1`,
+		tenantB).Scan(&userB, &expectedB); err != nil {
+		t.Fatal(err)
+	}
+	tenantATx, err := st.beginProfileEditWriteTx(ctx, tenantA, userA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tenantATx.Rollback(context.Background()) }()
+
+	patchDone := make(chan error, 1)
+	industry := "跨租户不应阻塞"
+	go func() {
+		_, err := st.PatchProfile(
+			ctx, tenantB, userB, &expectedB,
+			types.ProfileEditPatch{Industry: &industry},
+			"cross-tenant-root-"+uuid.NewString(), strings.Repeat("f", 64))
+		patchDone <- err
+	}()
+	select {
+	case err := <-patchDone:
+		if err != nil {
+			t.Fatalf("tenant B PATCH 被 tenant A 根锁影响: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		_ = tenantATx.Rollback(context.Background())
+		t.Fatal("tenant admission root 错误地跨租户串行画像写")
+	}
+}
+
 // TestPurgeTenant_RealDeleteRemovesTenantData：真删要真的删干净。
 func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 	st := purgeStore(t)
@@ -549,6 +727,12 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 		t.Errorf("清理报告必须包含 Schedule Command，实得 %d",
 			rep.Rows["schedule_commands"])
 	}
+	if rep.Rows["profile_edit_receipts"] != 1 ||
+		rep.Rows["profile_edit_revisions"] != 1 {
+		t.Errorf("清理报告必须包含画像 edit receipt/revision，实得 %d/%d",
+			rep.Rows["profile_edit_receipts"],
+			rep.Rows["profile_edit_revisions"])
+	}
 	if rep.Rows["agent_events"] != 3 {
 		t.Errorf("清理报告必须包含 Agent event，实得 %d",
 			rep.Rows["agent_events"])
@@ -556,13 +740,24 @@ func TestPurgeTenant_RealDeleteRemovesTenantData(t *testing.T) {
 	if _, err := st.GetTenant(ctx, tenantID); err == nil {
 		t.Error("清理后租户仍存在")
 	}
-	var n int
+	var n, profileRevisions int
 	if err := st.pool.QueryRow(ctx,
 		`SELECT count(*) FROM profiles WHERE tenant_id = $1`, tenantID).Scan(&n); err != nil {
 		t.Fatalf("查画像失败: %v", err)
 	}
 	if n != 0 {
 		t.Errorf("租户数据应被清空，profiles 仍有 %d 行", n)
+	}
+	if err := st.pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT count(*) FROM profile_edit_receipts WHERE tenant_id=$1),
+		  (SELECT count(*) FROM profile_edit_revisions WHERE tenant_id=$1)`,
+		tenantID).Scan(&n, &profileRevisions); err != nil {
+		t.Fatalf("查画像 edit audit 失败: %v", err)
+	}
+	if n != 0 || profileRevisions != 0 {
+		t.Errorf("租户数据应被清空，画像 edit audit 仍有 %d/%d 行",
+			n, profileRevisions)
 	}
 	if err := st.pool.QueryRow(ctx,
 		`SELECT count(*) FROM task_run_snapshots WHERE tenant_id = $1`, tenantID).Scan(&n); err != nil {
@@ -1504,6 +1699,30 @@ func (tx *pauseAfterReceiptLockTx) QueryRow(
 			})
 		},
 	}
+}
+
+type pauseAfterProfileAuditDeleteTx struct {
+	pgx.Tx
+	deleted    chan struct{}
+	resume     <-chan struct{}
+	deleteOnce sync.Once
+}
+
+func (tx *pauseAfterProfileAuditDeleteTx) Exec(
+	ctx context.Context,
+	sql string,
+	args ...any,
+) (pgconn.CommandTag, error) {
+	tag, err := tx.Tx.Exec(ctx, sql, args...)
+	if err != nil || !strings.Contains(
+		sql, "DELETE FROM profile_edit_revisions") {
+		return tag, err
+	}
+	tx.deleteOnce.Do(func() {
+		close(tx.deleted)
+		<-tx.resume
+	})
+	return tag, nil
 }
 
 type pauseAfterReceiptLockRow struct {

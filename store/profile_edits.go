@@ -62,7 +62,7 @@ func (s *Store) PatchProfile(
 	if tenantID <= 0 || userID <= 0 || idempotencyKey == "" || requestDigest == "" {
 		return nil, types.NewAppError(types.CodeValidation, "画像修改范围或幂等凭据无效", nil)
 	}
-	tx, err := s.beginProfileEditTx(ctx, tenantID, userID)
+	tx, err := s.beginProfileEditWriteTx(ctx, tenantID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +136,7 @@ func (s *Store) UndoProfileEdit(
 		idempotencyKey == "" || requestDigest == "" {
 		return nil, types.NewAppError(types.CodeValidation, "画像撤销范围或幂等凭据无效", nil)
 	}
-	tx, err := s.beginProfileEditTx(ctx, tenantID, userID)
+	tx, err := s.beginProfileEditWriteTx(ctx, tenantID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -292,17 +292,56 @@ func (s *Store) GetProfileView(
 }
 
 func (s *Store) beginProfileEditTx(ctx context.Context, tenantID int64, userIDs ...int64) (pgx.Tx, error) {
+	return s.beginProfileEditScopedTx(ctx, tenantID, false, userIDs...)
+}
+
+func (s *Store) beginProfileEditWriteTx(
+	ctx context.Context, tenantID int64, userIDs ...int64,
+) (pgx.Tx, error) {
+	return s.beginProfileEditScopedTx(ctx, tenantID, true, userIDs...)
+}
+
+func (s *Store) beginProfileEditScopedTx(
+	ctx context.Context,
+	tenantID int64,
+	write bool,
+	userIDs ...int64,
+) (pgx.Tx, error) {
+	if tenantID <= 0 || len(userIDs) != 1 || userIDs[0] <= 0 {
+		return nil, types.NewAppError(
+			types.CodeValidation, "画像编辑用户范围无效", nil)
+	}
 	tx, err := s.beginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, profileEditDBError("begin profile edit", err)
 	}
+	// Pin relation resolution before the owner-scoped admission helper reads
+	// tenants. Listing pg_temp explicitly last prevents its implicit precedence.
+	if _, err := tx.Exec(
+		ctx, `SET LOCAL search_path = pg_catalog, public, pg_temp`); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, profileEditDBError("pin profile editor search path", err)
+	}
+	if write {
+		// Purge takes this same tenant root before every child row lock. Profile
+		// writes take it before receipt/revision/profile access and never lock a
+		// schedule or membership row, so compiled schedule -> profile remains
+		// acyclic while purge reports cannot miss a late profile edit.
+		exists, err := lockTenantAdmissionRoot(ctx, tx, tenantID)
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			return nil, profileEditDBError(
+				"lock profile edit tenant admission", err)
+		}
+		if !exists {
+			_ = tx.Rollback(ctx)
+			return nil, types.NewAppError(
+				types.CodeNotFound, "租户不存在", nil)
+		}
+	}
 	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id',$1,true)`, strconv.FormatInt(tenantID, 10)); err != nil {
 		_ = tx.Rollback(ctx)
 		return nil, profileEditDBError("set profile edit tenant", err)
-	}
-	if len(userIDs) != 1 || userIDs[0] <= 0 {
-		_ = tx.Rollback(ctx)
-		return nil, types.NewAppError(types.CodeValidation, "画像编辑用户范围无效", nil)
 	}
 	if _, err := tx.Exec(ctx, `SELECT set_config('app.user_id',$1,true)`, strconv.FormatInt(userIDs[0], 10)); err != nil {
 		_ = tx.Rollback(ctx)
@@ -311,11 +350,6 @@ func (s *Store) beginProfileEditTx(ctx context.Context, tenantID int64, userIDs 
 	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_profile_editor`); err != nil {
 		_ = tx.Rollback(ctx)
 		return nil, profileEditDBError("enter profile editor role", err)
-	}
-	if _, err := tx.Exec(
-		ctx, `SET LOCAL search_path = pg_catalog, public, pg_temp`); err != nil {
-		_ = tx.Rollback(ctx)
-		return nil, profileEditDBError("pin profile editor search path", err)
 	}
 	return tx, nil
 }

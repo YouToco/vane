@@ -695,6 +695,10 @@ func TestProfileEditTxPinsSearchPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := conn.Exec(t.Context(),
+		`CREATE TEMP TABLE tenants (id bigint)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(t.Context(),
 		`INSERT INTO profiles VALUES ($1,'pg-temp-trap')`, userID); err != nil {
 		t.Fatal(err)
 	}
@@ -703,9 +707,9 @@ func TestProfileEditTxPinsSearchPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	poisoned := &Store{beginTx: conn.BeginTx}
-	tx, err := poisoned.beginProfileEditTx(t.Context(), 1, userID)
+	tx, err := poisoned.beginProfileEditWriteTx(t.Context(), 1, userID)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("write admission resolved pg_temp.tenants instead of public: %v", err)
 	}
 	var searchPath, got string
 	if err := tx.QueryRow(t.Context(), `SHOW search_path`).Scan(&searchPath); err != nil {
