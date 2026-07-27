@@ -229,8 +229,11 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	// M7 运行统计端点（功能 6.5）：只读，成本/token/延迟/缓存按 span 聚合。
 	inner.HandleFunc("GET /api/admin/runstats", s.handleRunstats)
 
-	// M7 画像查看端点（功能 6.3）：只读，展示结构化标签 + 摘要画像（含负偏好尾句）；编辑写回留二期。
+	// M7 画像 authority：summary 只读，结构化字段写入使用 CAS + 幂等回执 + 追加审计。
 	inner.HandleFunc("GET /api/profile", s.handleProfile)
+	inner.HandleFunc("PATCH /api/profile", s.handlePatchProfile)
+	inner.HandleFunc("GET /api/profile/edits", s.handleListProfileEdits)
+	inner.HandleFunc("POST /api/profile/edits/{id}/undo", s.handleUndoProfileEdit)
 
 	// 邀请码管理端点（D4 准入闸门的管理面）：替代 SSH 跑 useradmin invite。
 	// 全部锁 requirePlatformOwner（handler 内第一行，非 owner 404）。
@@ -267,7 +270,7 @@ func (s *server) cors(next http.Handler) http.Handler {
 				// 这里漏一个方法，跨源前端就调不通对应端点——预检不放行，浏览器
 				// 连请求都不发（fetch 拿到的是网络错误，不是状态码）。新增写端点时
 				// 必须同步这一行；已退役的方法不得继续被浏览器预检广告。
-				h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE")
+				h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE")
 				h.Set(
 					"Access-Control-Allow-Headers",
 					"Content-Type, Idempotency-Key",

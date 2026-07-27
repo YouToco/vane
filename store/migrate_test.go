@@ -12,9 +12,13 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/pressly/goose/v3"
+
+	"github.com/YouToco/vane/types"
 )
 
-const latestMigrationVersion int64 = 59
+const latestMigrationVersion int64 = 60
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -92,6 +96,9 @@ var wantTables = []string{
 	"push_effects",
 	// 050 physically pinned one-shot legacy batch 63 repair adjudication.
 	"legacy_batch63_repair_events",
+	// 060 Web 画像人工修正审计与响应丢失回执。
+	"profile_edit_revisions",
+	"profile_edit_receipts",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的
@@ -144,6 +151,271 @@ func TestMigrationsCoverWantTables(t *testing.T) {
 			t.Errorf("wantTables 记了表 %s，但没有任何迁移建它", tbl)
 		}
 	}
+}
+
+func TestProfileEditMigrationHasSafeDowngradeFence(t *testing.T) {
+	raw, err := fs.ReadFile(
+		migrationsFS, "migrations/060_profile_manual_authority.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := string(raw)
+	for _, required := range []string{
+		"LOCK TABLE profile_edit_receipts, profile_edit_revisions",
+		"IN ACCESS EXCLUSIVE MODE",
+		"refusing downgrade while profile edit audit evidence exists",
+		"WHEN duplicate_object OR unique_violation THEN NULL",
+	} {
+		if !strings.Contains(sqlText, required) {
+			t.Fatalf("migration 060 missing downgrade fence fragment %q", required)
+		}
+	}
+}
+
+func TestProfileEditDowngradeFenceLockOrder(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("未设置 DATABASE_URL")
+	}
+	admin, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("vane_profile_down_%d", time.Now().UnixNano())
+	if _, err := admin.ExecContext(t.Context(), "CREATE DATABASE "+name); err != nil {
+		admin.Close()
+		t.Skipf("无 CREATE DATABASE 权限: %v", err)
+	}
+	t.Cleanup(func() {
+		defer admin.Close()
+		if _, err := admin.ExecContext(context.Background(),
+			"DROP DATABASE "+name+" WITH (FORCE)"); err != nil {
+			t.Errorf("清理临时库: %v", err)
+		}
+	})
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/" + name
+	freshURL := u.String()
+	if err := Migrate(t.Context(), freshURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(t.Context(), freshURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := testUserWithTenant(t, st, "profile-down")
+	value := "evidence"
+	if _, err := st.PatchProfile(
+		t.Context(), 1, userID, nil,
+		types.ProfileEditPatch{Industry: &value},
+		"down-fence", strings.Repeat("d", 64)); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	st.Close()
+
+	producer, err := sql.Open("pgx", freshURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer producer.Close()
+	producerTx, err := producer.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := producerTx.ExecContext(t.Context(),
+		`SELECT count(*) FROM profile_edit_receipts`); err != nil {
+		t.Fatal(err)
+	}
+
+	downDB, err := sql.Open("pgx", freshURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer downDB.Close()
+	downDB.SetMaxOpenConns(1)
+	var downPID int
+	if err := downDB.QueryRowContext(
+		t.Context(), `SELECT pg_backend_pid()`).Scan(&downPID); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, downDB, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	downResult := make(chan error, 1)
+	go func() {
+		_, err := provider.Down(context.Background())
+		downResult <- err
+	}()
+
+	// Down 必须先等待 producer 已持有的 receipt 锁，不能先拿 revision
+	// AX 后与 producer 的下一次 revision read 形成锁环。
+	lockDeadline := time.Now().Add(2 * time.Second)
+	for {
+		var waiting bool
+		err := producer.QueryRowContext(t.Context(),
+			`SELECT EXISTS (
+			     SELECT 1
+			       FROM pg_locks l
+			       JOIN pg_class c ON c.oid=l.relation
+			      WHERE l.pid=$1
+			        AND c.relname='profile_edit_receipts'
+			        AND l.mode='AccessExclusiveLock'
+			        AND NOT l.granted
+			 )`, downPID).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(lockDeadline) {
+			t.Fatal("Down 未在 receipts AccessExclusive 上等待")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	readCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if _, err := producerTx.ExecContext(
+		readCtx, `SELECT count(*) FROM profile_edit_revisions`); err != nil {
+		_ = producerTx.Rollback()
+		t.Fatalf("Down 锁序与 producer 成环: %v", err)
+	}
+	if err := producerTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-downResult:
+		if err == nil || !strings.Contains(err.Error(),
+			"refusing downgrade while profile edit audit evidence exists") {
+			t.Fatalf("非空 Down 应被 fence 拒绝: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Down 在 producer 完成后仍未退出")
+	}
+	verify, err := New(t.Context(), freshURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer verify.Close()
+	if got := gooseVersion(t, verify); got != 60 {
+		t.Fatalf("失败 Down 改变版本=%d", got)
+	}
+	for _, table := range []string{"profile_edit_receipts", "profile_edit_revisions"} {
+		var exists bool
+		if err := verify.pool.QueryRow(t.Context(),
+			`SELECT to_regclass('public.'||$1) IS NOT NULL`, table).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if !exists {
+			t.Fatalf("失败 Down 丢失表 %s", table)
+		}
+	}
+}
+
+func TestProfileEditEmptyDowngradeTo59(t *testing.T) {
+	freshURL := freshMigrationDatabase(t, "vane_profile_empty_down")
+	if err := Migrate(t.Context(), freshURL); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("pgx", freshURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Down(t.Context()); err != nil {
+		t.Fatalf("空审计 Down 60→59 应成功: %v", err)
+	}
+	var version int64
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT COALESCE(max(version_id),0) FROM goose_db_version
+		  WHERE is_applied`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 59 {
+		t.Fatalf("Down version=%d", version)
+	}
+	for _, table := range []string{"profile_edit_receipts", "profile_edit_revisions"} {
+		var exists bool
+		if err := db.QueryRowContext(t.Context(),
+			`SELECT to_regclass('public.'||$1) IS NOT NULL`, table).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists {
+			t.Fatalf("空 Down 后表仍存在: %s", table)
+		}
+	}
+	var profileUpdate, membershipSelect, sequenceUsage bool
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT has_column_privilege(
+		            'vane_profile_editor','profiles','industry','UPDATE'),
+		        has_column_privilege(
+		            'vane_profile_editor','memberships','user_id','SELECT'),
+		        has_sequence_privilege(
+		            'vane_profile_editor','profiles_id_seq','USAGE')`,
+	).Scan(&profileUpdate, &membershipSelect, &sequenceUsage); err != nil {
+		t.Fatal(err)
+	}
+	if profileUpdate || membershipSelect || sequenceUsage {
+		t.Fatalf("Down 留下本地授权: profile=%v membership=%v sequence=%v",
+			profileUpdate, membershipSelect, sequenceUsage)
+	}
+	var policies int
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM pg_policies
+		  WHERE policyname='profile_editor_identity'
+		    AND tablename IN ('profiles','memberships')`).Scan(&policies); err != nil {
+		t.Fatal(err)
+	}
+	if policies != 0 {
+		t.Fatalf("Down 留下 profile editor policies=%d", policies)
+	}
+}
+
+func freshMigrationDatabase(t *testing.T, prefix string) string {
+	t.Helper()
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("未设置 DATABASE_URL")
+	}
+	admin, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+	if _, err := admin.ExecContext(t.Context(), "CREATE DATABASE "+name); err != nil {
+		admin.Close()
+		t.Skipf("无 CREATE DATABASE 权限: %v", err)
+	}
+	t.Cleanup(func() {
+		defer admin.Close()
+		if _, err := admin.ExecContext(context.Background(),
+			"DROP DATABASE "+name+" WITH (FORCE)"); err != nil {
+			t.Errorf("清理临时库: %v", err)
+		}
+	})
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/" + name
+	return u.String()
 }
 
 func TestObservationMigrationHasDurableDowngradeFence(t *testing.T) {

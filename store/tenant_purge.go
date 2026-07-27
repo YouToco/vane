@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/YouToco/vane/types"
 )
 
@@ -59,6 +61,7 @@ type purgeStep struct {
 //	schedules(definition-edit marker)     → task_definition_edit_operations
 //	schedule_commands                     → tenants / users
 //	task_adaptive_states                  → task_approved_definition_versions → schedules
+//	profile_edit_receipts                 → profile_edit_revisions
 //	其余                                   → tenants / users
 //
 // 排错了不会静默——FK 约束会让整个事务失败，而 dry-run 就是为了在真删之前撞出这个。
@@ -113,6 +116,10 @@ var purgeOrder = []purgeStep{
 	{"task_run_snapshots", "tenant_id = $1"},
 	{"agent_sessions", "tenant_id = $1"},
 	{"subscriptions", "tenant_id = $1"},
+	// HTTP response-loss receipts reference the append-only revision. Both are
+	// tenant evidence and must be removed before the profile/membership roots.
+	{"profile_edit_receipts", "tenant_id = $1"},
+	{"profile_edit_revisions", "tenant_id = $1"},
 	{"profiles", "tenant_id = $1"},
 	{"schedules", "tenant_id = $1"},
 	// schedules may point at the current event. Deleting the task removes that
@@ -173,7 +180,7 @@ func (s *Store) ListPurgeableTenants(ctx context.Context) ([]int64, error) {
 // 调用方必须自行确认该租户确实已过保留期（用 ListPurgeableTenants），
 // 本方法不重复判定——它是一把刀，不是闸门；闸门在调用方。
 func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*PurgeReport, error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, types.NewAppError(types.CodeDatabase, "开启清理事务", err)
 	}
