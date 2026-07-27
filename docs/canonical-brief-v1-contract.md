@@ -89,8 +89,10 @@ updatable after the batch is sealed.
 `vane_brief_writer` is NOLOGIN, NOINHERIT, NOBYPASSRLS, unrelated to
 `vane_app`, and settable only by the migration owner. If the cluster-wide role
 already exists, the migration rejects owned objects or any preexisting ACL in
-the current database before applying the whitelist. It never uses cluster-wide
-`DROP OWNED`, so privileges on another database are not mutated. It can:
+the current database before applying the whitelist. Any cluster-wide parameter
+ACL is also rejected because it could disable the trigger boundary. The
+migration never uses cluster-wide `DROP OWNED`, so privileges on another
+database are not mutated. It can:
 
 - execute the exact-scope run identity reader and read only the batch identity
   columns needed for admission;

@@ -408,6 +408,52 @@ func TestMigration061RejectsPreexistingWriterDatabaseACL(t *testing.T) {
 	}
 }
 
+func TestMigration061RejectsWriterParameterACL(t *testing.T) {
+	db, provider := migration035Scratch(t)
+	if _, err := provider.UpTo(t.Context(), 60); err != nil {
+		t.Fatalf("migrate to 060: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		DO $$
+		BEGIN
+		    IF NOT EXISTS (
+		        SELECT 1 FROM pg_roles WHERE rolname='vane_brief_writer'
+		    ) THEN
+		        CREATE ROLE vane_brief_writer
+		            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+		            NOLOGIN NOINHERIT NOBYPASSRLS;
+		    END IF;
+		END $$;
+		GRANT SET ON PARAMETER session_replication_role
+		    TO vane_brief_writer`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		if _, err := db.ExecContext(ctx, `
+			REVOKE SET ON PARAMETER session_replication_role
+			    FROM vane_brief_writer`); err != nil {
+			t.Errorf("cleanup writer parameter ACL: %v", err)
+		}
+	})
+	if _, err := provider.UpTo(t.Context(), 61); err == nil ||
+		!strings.Contains(
+			err.Error(), "unsafe cluster parameter ACL") {
+		t.Fatalf("migration admitted writer parameter ACL: %v", err)
+	}
+	var canDisableTriggers bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT has_parameter_privilege(
+		    'vane_brief_writer','session_replication_role','SET')`,
+	).Scan(&canDisableTriggers); err != nil {
+		t.Fatal(err)
+	}
+	if !canDisableTriggers {
+		t.Fatal("test fixture did not retain the parameter ACL after fail-closed")
+	}
+}
+
 func TestMigration061PreservesWriterACLInOtherDatabase(t *testing.T) {
 	db, provider := migration035Scratch(t)
 	if _, err := provider.UpTo(t.Context(), 60); err != nil {
@@ -480,6 +526,8 @@ func TestMigration061HasSafeDownFenceAndRoleRaceGuard(t *testing.T) {
 		"read_canonical_brief_run_identity_v1",
 		"read_canonical_brief_delivery_evidence_v1",
 		"brief writer has preexisting ACL in this database",
+		"brief writer has unsafe cluster parameter ACL",
+		"pg_parameter_acl",
 		"push_batches_brief_state_authority_v1",
 	} {
 		if !strings.Contains(sqlText, required) {

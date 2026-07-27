@@ -520,6 +520,19 @@ BEGIN
         RAISE EXCEPTION
             '061: brief writer has preexisting ACL in this database';
     END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM pg_shdepend dep
+          JOIN pg_roles r ON r.oid=dep.refobjid
+         WHERE r.rolname='vane_brief_writer'
+           AND dep.refclassid='pg_authid'::regclass
+           AND dep.deptype='a'
+           AND dep.dbid=0
+           AND dep.classid='pg_parameter_acl'::regclass
+    ) THEN
+        RAISE EXCEPTION
+            '061: brief writer has unsafe cluster parameter ACL';
+    END IF;
 END $$;
 -- +goose StatementEnd
 
