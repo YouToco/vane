@@ -6,6 +6,11 @@
 
 -- +goose Up
 
+-- Drain every post-047 compiled writer before changing push batch/delivery
+-- protocol state. Pre-fence legacy inserts are still covered by the
+-- producer-compatible table-lock order in Down.
+SELECT pg_advisory_xact_lock(6215335020355474248);
+
 -- Composite scope keys let the new rows prove tenant/user/task ownership with
 -- ordinary FKs. The leading id is already unique, so these constraints do not
 -- change old lookup semantics or the retained idempotency arbiter.
@@ -537,7 +542,12 @@ CREATE POLICY brief_writer_identity ON push_batches AS RESTRICTIVE
     );
 -- +goose Down
 
-LOCK TABLE task_run_outcomes,push_batches,brief_snapshots
+SELECT pg_advisory_xact_lock(6215335020355474248);
+
+-- Producers acquire deliveries before the batch row (the open-batch trigger).
+-- Preserve that order so an already-admitted legacy INSERT can finish before
+-- this downgrade fence inspects durable evidence.
+LOCK TABLE task_run_outcomes,deliveries,push_batches,brief_snapshots
     IN ACCESS EXCLUSIVE MODE;
 
 -- +goose StatementBegin

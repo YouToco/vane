@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pressly/goose/v3"
 )
@@ -346,7 +347,8 @@ func TestMigration061HasSafeDownFenceAndRoleRaceGuard(t *testing.T) {
 	}
 	sqlText := string(raw)
 	for _, required := range []string{
-		"LOCK TABLE task_run_outcomes,push_batches,brief_snapshots",
+		"SELECT pg_advisory_xact_lock(6215335020355474248)",
+		"LOCK TABLE task_run_outcomes,deliveries,push_batches,brief_snapshots",
 		"refusing downgrade while canonical outcome/brief evidence exists",
 		"WHEN duplicate_object OR unique_violation THEN NULL",
 		"delivery scope differs from its push batch",
@@ -360,6 +362,93 @@ func TestMigration061HasSafeDownFenceAndRoleRaceGuard(t *testing.T) {
 		if !strings.Contains(sqlText, required) {
 			t.Fatalf("migration 061 missing %q", required)
 		}
+	}
+}
+
+func TestMigration061DownDoesNotDeadlockWithDeliveryInsert(t *testing.T) {
+	db, provider := migration035Scratch(t)
+	if _, err := provider.UpTo(t.Context(), 61); err != nil {
+		t.Fatalf("migrate to 061: %v", err)
+	}
+	var userID, batchID int64
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users (feishu_open_id,name)
+		VALUES ('ou_brief_down_race','brief down race')
+		RETURNING id`,
+	).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO memberships (tenant_id,user_id,role)
+		VALUES (1,$1,'owner')`, userID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO push_batches (tenant_id,user_id)
+		VALUES (1,$1) RETURNING id`, userID,
+	).Scan(&batchID); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	writer, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerDone := false
+	defer func() {
+		if !writerDone {
+			_ = writer.Rollback()
+		}
+	}()
+	if _, err := writer.ExecContext(ctx, `
+		SET LOCAL deadlock_timeout='100ms';
+		SET LOCAL statement_timeout='5s';
+		LOCK TABLE deliveries IN ROW EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	downDone := make(chan error, 1)
+	go func() {
+		_, downErr := provider.Down(ctx)
+		downDone <- downErr
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	if _, err := writer.ExecContext(ctx, `
+		INSERT INTO deliveries (tenant_id,batch_id,user_id,body_md)
+		VALUES (1,$1,$2,'concurrent down delivery')`, batchID, userID,
+	); err != nil {
+		t.Fatalf("delivery insert deadlocked with 061 Down: %v", err)
+	}
+	if err := writer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	writerDone = true
+
+	select {
+	case err := <-downDone:
+		if err != nil {
+			t.Fatalf("061 Down did not converge after delivery commit: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("061 Down did not converge")
+	}
+	var version, deliveries int
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT
+		  (SELECT max(version_id)
+		     FROM goose_db_version WHERE is_applied),
+		  (SELECT count(*) FROM deliveries WHERE batch_id=$1)`,
+		batchID,
+	).Scan(&version, &deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if version != 60 || deliveries != 1 {
+		t.Fatalf("Down result version/deliveries=%d/%d want 60/1",
+			version, deliveries)
 	}
 }
 
