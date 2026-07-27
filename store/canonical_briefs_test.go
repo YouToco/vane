@@ -345,6 +345,130 @@ func TestCanonicalBriefDarkStoreLifecycleAndExactReplay(t *testing.T) {
 	}
 }
 
+func TestRunOutcomeClaimUsesDatabaseTimeAndSemanticReplay(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 0)
+	marker, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := types.RunOutcomeClaimV1{
+		RunOutcomeMarkerV1: marker,
+		Result:             types.RunResultQuiet,
+		SourceCoverage:     types.RunCompletenessComplete,
+		Processing:         types.RunCompletenessComplete,
+	}
+	before := time.Now().UTC().Add(-time.Second)
+	first, err := f.base.st.FinalizeRunOutcomeClaimV1(
+		t.Context(), f.identity, f.ref, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.FinalizedAt.Before(before) || first.Digest == "" {
+		t.Fatalf("database-sealed outcome = %+v", first)
+	}
+	replayed, err := f.base.st.FinalizeRunOutcomeClaimV1(
+		t.Context(), f.identity, f.ref, claim)
+	if err != nil || replayed != first {
+		t.Fatalf("semantic replay = %+v, %v; want %+v", replayed, err, first)
+	}
+	different := claim
+	different.Processing = types.RunCompletenessPartial
+	if _, err := f.base.st.FinalizeRunOutcomeClaimV1(
+		t.Context(), f.identity, f.ref, different,
+	); err == nil || !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("different terminal claim error = %v, want conflict", err)
+	}
+}
+
+func TestRunOutcomeWorkflowRecoveryConcurrentCAS(t *testing.T) {
+	t.Run("same semantic converges", func(t *testing.T) {
+		f := newCanonicalBriefFixture(t, 0)
+		marker, err := f.base.st.CreatePendingRunOutcomeV1(
+			t.Context(), f.identity, f.ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim := types.RunOutcomeClaimV1{
+			RunOutcomeMarkerV1: marker,
+			Result:             types.RunResultQuiet,
+			SourceCoverage:     types.RunCompletenessComplete,
+			Processing:         types.RunCompletenessComplete,
+		}
+		results := make(chan types.RunOutcomeV1, 2)
+		errs := make(chan error, 2)
+		go func() {
+			outcome, err := f.base.st.FinalizeRunOutcomeClaimV1(
+				t.Context(), f.identity, f.ref, claim)
+			results <- outcome
+			errs <- err
+		}()
+		go func() {
+			outcome, err := f.base.st.FinalizeRecoveredRunOutcomeClaimV1(
+				t.Context(), f.identity, claim)
+			results <- outcome
+			errs <- err
+		}()
+		first, second := <-results, <-results
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		if first.Digest == "" || first != second {
+			t.Fatalf("concurrent same claim outcomes = %+v / %+v",
+				first, second)
+		}
+	})
+
+	t.Run("different semantic conflicts", func(t *testing.T) {
+		f := newCanonicalBriefFixture(t, 0)
+		marker, err := f.base.st.CreatePendingRunOutcomeV1(
+			t.Context(), f.identity, f.ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		quiet := types.RunOutcomeClaimV1{
+			RunOutcomeMarkerV1: marker,
+			Result:             types.RunResultQuiet,
+			SourceCoverage:     types.RunCompletenessComplete,
+			Processing:         types.RunCompletenessComplete,
+		}
+		failed := types.RunOutcomeClaimV1{
+			RunOutcomeMarkerV1: marker,
+			Result:             types.RunResultFailed,
+			SourceCoverage:     types.RunCompletenessPartial,
+			Processing:         types.RunCompletenessPartial,
+			FailureCode:        "workflow_failed",
+			FailureMessage:     "workflow failed before a reliable terminal result",
+		}
+		errs := make(chan error, 2)
+		go func() {
+			_, err := f.base.st.FinalizeRunOutcomeClaimV1(
+				t.Context(), f.identity, f.ref, quiet)
+			errs <- err
+		}()
+		go func() {
+			_, err := f.base.st.FinalizeRecoveredRunOutcomeClaimV1(
+				t.Context(), f.identity, failed)
+			errs <- err
+		}()
+		first, second := <-errs, <-errs
+		conflicts := 0
+		for _, err := range []error{first, second} {
+			if errors.Is(err, types.ErrConflict) {
+				conflicts++
+			} else if err != nil {
+				t.Fatalf("unexpected CAS error = %v", err)
+			}
+		}
+		if conflicts != 1 {
+			t.Fatalf("conflicts = %d, errors=%v/%v", conflicts, first, second)
+		}
+	})
+}
+
 func TestCanonicalBriefDarkStoreRequiresContentAndCompleteDeliverySet(t *testing.T) {
 	t.Run("quiet outcome", func(t *testing.T) {
 		f := newCanonicalBriefFixture(t, 1)

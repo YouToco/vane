@@ -1055,9 +1055,9 @@ func (s *Scheduler) buildPreparedTaskSchedule(req TaskScheduleRequest) (Prepared
 		scope.SourceIDs = slices.Clone(req.Scope.SourceIDs)
 	}
 	params := makePushParams(req.TenantID, req.UserID, taskID, scope, name)
-	runtimeVersion := s.compiledRuntime.runtimeVersionFor(taskID)
+	runtimeVersion := s.runtimeVersionFor(taskID, types.ExecutionModeCompiled)
 	fingerprintVersion := taskScheduleFingerprintVersionV1
-	if runtimeVersion == workflow.CompiledRuntimeSnapshotV1 {
+	if workflow.IsCompiledRuntimeV1(runtimeVersion) {
 		// A v2 checkpoint is written only for an explicitly selected C1b
 		// canary/all-task rollout. This keeps dark deployment expansion-safe:
 		// an older binary can still resume every checkpoint written before C1b
@@ -1339,7 +1339,7 @@ func validatePreparedTaskSchedule(prepared PreparedTaskSchedule) error {
 		if params.TenantID != prepared.TenantID || params.ExecutionMode != types.ExecutionModeCompiled {
 			return errors.New("v2 workflow params do not match the prepared tenant and compiled mode")
 		}
-		if params.RuntimeVersion != "" && params.RuntimeVersion != workflow.CompiledRuntimeSnapshotV1 {
+		if params.RuntimeVersion != "" && !workflow.IsCompiledRuntimeV1(params.RuntimeVersion) {
 			return errors.New("prepared Schedule Action runtime version is unsupported")
 		}
 	}

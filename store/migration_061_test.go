@@ -865,7 +865,7 @@ func TestMigration061DownDoesNotDeadlockWithDeliveryInsert(t *testing.T) {
 	}
 }
 
-func TestMigration061DownRefusesDurableOutcomeEvidence(t *testing.T) {
+func TestMigration063BlocksDowngradeWithPendingOutcome(t *testing.T) {
 	freshURL := freshMigrationDatabase(t, "vane_brief_down")
 	db, err := sql.Open("pgx", freshURL)
 	if err != nil {
@@ -938,10 +938,22 @@ func TestMigration061DownRefusesDurableOutcomeEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.Down(context.Background()); err == nil ||
+	if _, err := provider.UpTo(t.Context(), 63); err != nil {
+		t.Fatalf("migrate fresh downgrade fixture to 063: %v", err)
+	}
+	var beforeDown int64
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT COALESCE(max(version_id),0)
+		   FROM goose_db_version WHERE is_applied`).Scan(&beforeDown); err != nil {
+		t.Fatal(err)
+	}
+	if beforeDown != 63 {
+		t.Fatalf("migration version before 063 Down = %d", beforeDown)
+	}
+	if _, err := provider.DownTo(context.Background(), 62); err == nil ||
 		!strings.Contains(err.Error(),
-			"refusing downgrade while canonical outcome/brief evidence exists") {
-		t.Fatalf("061 Down accepted durable evidence: %v", err)
+			"refusing downgrade while pending run outcomes exist") {
+		t.Fatalf("063 Down accepted pending outcome evidence: %v", err)
 	}
 	var version int64
 	if err := db.QueryRowContext(t.Context(),
@@ -949,7 +961,7 @@ func TestMigration061DownRefusesDurableOutcomeEvidence(t *testing.T) {
 		   FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 61 {
-		t.Fatalf("failed 061 Down changed version to %d", version)
+	if version != 63 {
+		t.Fatalf("failed 063 Down changed version to %d", version)
 	}
 }

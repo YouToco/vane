@@ -96,6 +96,55 @@ type RunOutcomeV1 struct {
 	Digest         string            `json:"digest"`
 }
 
+// RunOutcomeClaimV1 is the semantic terminal claim supplied by workflow or
+// recovery code. The database owns FinalizedAt, and the Store seals the digest
+// only after reading that database time inside the finalization transaction.
+type RunOutcomeClaimV1 struct {
+	RunOutcomeMarkerV1
+	Result         RunResultV1       `json:"result"`
+	SourceCoverage RunCompletenessV1 `json:"source_coverage"`
+	Processing     RunCompletenessV1 `json:"processing"`
+	FailureCode    string            `json:"failure_code"`
+	FailureMessage string            `json:"failure_message"`
+}
+
+func (c RunOutcomeClaimV1) Validate() error {
+	probe := RunOutcomeV1{
+		RunOutcomeMarkerV1: c.RunOutcomeMarkerV1,
+		Result:             c.Result,
+		SourceCoverage:     c.SourceCoverage,
+		Processing:         c.Processing,
+		FailureCode:        c.FailureCode,
+		FailureMessage:     c.FailureMessage,
+		FinalizedAt:        time.Unix(1, 0).UTC(),
+	}
+	return probe.validateUnsealed()
+}
+
+// SealAt binds a validated semantic claim to a database-generated timestamp.
+func (c RunOutcomeClaimV1) SealAt(finalizedAt time.Time) (RunOutcomeV1, error) {
+	return (RunOutcomeV1{
+		RunOutcomeMarkerV1: c.RunOutcomeMarkerV1,
+		Result:             c.Result,
+		SourceCoverage:     c.SourceCoverage,
+		Processing:         c.Processing,
+		FailureCode:        c.FailureCode,
+		FailureMessage:     c.FailureMessage,
+		FinalizedAt:        finalizedAt,
+	}).Seal()
+}
+
+// Matches reports whether a stored immutable outcome represents this exact
+// semantic claim, intentionally ignoring the database-owned time and digest.
+func (c RunOutcomeClaimV1) Matches(o RunOutcomeV1) bool {
+	return c.RunOutcomeMarkerV1 == o.RunOutcomeMarkerV1 &&
+		c.Result == o.Result &&
+		c.SourceCoverage == o.SourceCoverage &&
+		c.Processing == o.Processing &&
+		c.FailureCode == o.FailureCode &&
+		c.FailureMessage == o.FailureMessage
+}
+
 // Seal normalizes the timestamp to PostgreSQL microsecond precision and binds
 // the complete finalized outcome with a SHA-256 digest.
 func (o RunOutcomeV1) Seal() (RunOutcomeV1, error) {

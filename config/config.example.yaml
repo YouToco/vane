@@ -51,6 +51,10 @@ pipeline:
   compiled_runtime_enabled: false
   compiled_runtime_canary_schedule_id: ""
   compiled_runtime_allow_all: false
+  # P1-B exact-run lifecycle is independent and remains dark by default.
+  run_outcome_enabled: false
+  run_outcome_canary_schedule_id: ""
+  run_outcome_allow_all: false
   # C2c-2: exact one-task shadow canary. Empty means fully off.
   snapshot_v2_shadow_canary_schedule_id: ""
   snapshot_v2_read_audit_canary_schedule_id: ""

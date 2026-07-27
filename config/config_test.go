@@ -9,6 +9,79 @@ import (
 	"github.com/spf13/viper"
 )
 
+func TestRunOutcomeRolloutValidation(t *testing.T) {
+	tests := []struct {
+		name            string
+		compiled        bool
+		compiledCanary  string
+		compiledAll     bool
+		enabled         bool
+		outcomeCanary   string
+		outcomeAllowAll bool
+		wantErr         bool
+	}{
+		{name: "off"},
+		{
+			name: "exact nested canary", compiled: true,
+			compiledCanary: "task-a", enabled: true,
+			outcomeCanary: " task-a ",
+		},
+		{
+			name:     "compiled all permits exact outcome canary",
+			compiled: true, compiledAll: true, enabled: true,
+			outcomeCanary: "task-a",
+		},
+		{
+			name:     "both allow all",
+			compiled: true, compiledAll: true,
+			enabled: true, outcomeAllowAll: true,
+		},
+		{
+			name: "requires compiled", enabled: true,
+			outcomeCanary: "task-a", wantErr: true,
+		},
+		{
+			name: "outside compiled canary", compiled: true,
+			compiledCanary: "task-a", enabled: true,
+			outcomeCanary: "task-b", wantErr: true,
+		},
+		{
+			name: "missing second key", compiled: true,
+			compiledAll: true, enabled: true, wantErr: true,
+		},
+		{
+			name: "canary and all conflict", compiled: true,
+			compiledAll: true, enabled: true,
+			outcomeCanary: "task-a", outcomeAllowAll: true, wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{
+				DB: DBConfig{URL: "postgres://test"},
+				Pipeline: PipelineConfig{
+					CompiledRuntimeEnabled:          test.compiled,
+					CompiledRuntimeCanaryScheduleID: test.compiledCanary,
+					CompiledRuntimeAllowAll:         test.compiledAll,
+					RunOutcomeEnabled:               test.enabled,
+					RunOutcomeCanaryScheduleID:      test.outcomeCanary,
+					RunOutcomeAllowAll:              test.outcomeAllowAll,
+				},
+			}
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr=%t", err, test.wantErr)
+			}
+			if err == nil && test.outcomeCanary != "" &&
+				cfg.Pipeline.RunOutcomeCanaryScheduleID !=
+					strings.TrimSpace(test.outcomeCanary) {
+				t.Fatalf("outcome canary = %q",
+					cfg.Pipeline.RunOutcomeCanaryScheduleID)
+			}
+		})
+	}
+}
+
 func TestSnapshotV2ShadowCanaryScheduleIDValidation(t *testing.T) {
 	tests := []struct {
 		name    string

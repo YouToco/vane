@@ -97,6 +97,22 @@ func (s *Store) CreatePendingRunOutcomeV1(
 	if err := lockCanonicalBriefRunV1(ctx, tx, ref.SnapshotID); err != nil {
 		return types.RunOutcomeMarkerV1{}, err
 	}
+	var recoveryAvailable bool
+	if err := tx.QueryRow(ctx, `
+		SELECT to_regprocedure(
+		    'read_stale_run_outcomes_v1(timestamptz,bigint,integer)'
+		) IS NOT NULL`,
+	).Scan(&recoveryAvailable); err != nil {
+		return types.RunOutcomeMarkerV1{},
+			canonicalBriefDatabaseError(
+				"check run outcome recovery capability", err)
+	}
+	if !recoveryAvailable {
+		return types.RunOutcomeMarkerV1{},
+			canonicalBriefDatabaseError(
+				"check run outcome recovery capability",
+				errors.New("run outcome recovery capability is unavailable"))
+	}
 
 	stored, found, err := loadRunOutcomeForSnapshotV1(
 		ctx, tx, ref.SnapshotID, false)
@@ -209,6 +225,101 @@ func (s *Store) FinalizeRunOutcomeV1(
 			canonicalBriefConflictError("run outcome finalization lost its CAS")
 	}
 	if err := commitCanonicalBriefTxV1(ctx, tx, "commit run outcome finalization"); err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	return outcome, nil
+}
+
+// FinalizeRunOutcomeClaimV1 performs the production pending->finalized CAS.
+// Workflow and recovery callers submit no timestamp or digest: both are bound
+// to database time while the exact run marker is locked. A response-lost retry
+// of the same semantic claim returns the original immutable result.
+func (s *Store) FinalizeRunOutcomeClaimV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	claim types.RunOutcomeClaimV1,
+) (types.RunOutcomeV1, error) {
+	if err := claim.Validate(); err != nil ||
+		claim.RunSnapshotID != ref.SnapshotID ||
+		claim.TenantID != expected.TenantID ||
+		claim.UserID != expected.UserID ||
+		claim.TaskID != expected.TaskID {
+		return types.RunOutcomeV1{},
+			canonicalBriefValidationError("run outcome claim is invalid")
+	}
+	tx, err := s.beginCanonicalBriefTxV1(ctx, expected, ref)
+	if err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+	return finalizeRunOutcomeClaimTxV1(ctx, tx, claim)
+}
+
+func finalizeRunOutcomeClaimTxV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	claim types.RunOutcomeClaimV1,
+) (types.RunOutcomeV1, error) {
+	if err := lockCanonicalBriefRunV1(
+		ctx, tx, claim.RunSnapshotID); err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	stored, found, err := loadRunOutcomeForSnapshotV1(
+		ctx, tx, claim.RunSnapshotID, true)
+	if err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	if !found || stored.ID != claim.ID {
+		return types.RunOutcomeV1{},
+			canonicalBriefNotFoundError("run outcome marker is unavailable")
+	}
+	if stored.Status == "finalized" {
+		replayed, err := stored.finalized()
+		if err != nil {
+			return types.RunOutcomeV1{}, err
+		}
+		if !claim.Matches(replayed) {
+			return types.RunOutcomeV1{},
+				canonicalBriefConflictError("run outcome already finalized differently")
+		}
+		if err := commitCanonicalBriefTxV1(ctx, tx, "replay run outcome claim"); err != nil {
+			return types.RunOutcomeV1{}, err
+		}
+		return replayed, nil
+	}
+	if stored.Status != "pending" {
+		return types.RunOutcomeV1{}, canonicalBriefIntegrityError()
+	}
+
+	var finalizedAt time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&finalizedAt); err != nil {
+		return types.RunOutcomeV1{},
+			canonicalBriefDatabaseError("read run outcome finalization time", err)
+	}
+	outcome, err := claim.SealAt(finalizedAt)
+	if err != nil {
+		return types.RunOutcomeV1{}, canonicalBriefIntegrityError()
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE task_run_outcomes
+		    SET status='finalized',result=$2,source_coverage=$3,
+		        processing=$4,failure_code=$5,failure_message=$6,
+		        finalized_at=$7,outcome_digest=$8
+		  WHERE id=$1 AND status='pending'`,
+		outcome.ID, outcome.Result, outcome.SourceCoverage,
+		outcome.Processing, outcome.FailureCode, outcome.FailureMessage,
+		outcome.FinalizedAt, outcome.Digest,
+	)
+	if err != nil {
+		return types.RunOutcomeV1{},
+			canonicalBriefDatabaseError("finalize run outcome claim", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return types.RunOutcomeV1{},
+			canonicalBriefConflictError("run outcome claim lost its CAS")
+	}
+	if err := commitCanonicalBriefTxV1(ctx, tx, "commit run outcome claim"); err != nil {
 		return types.RunOutcomeV1{}, err
 	}
 	return outcome, nil

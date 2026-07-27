@@ -872,7 +872,7 @@ func freezeTaskDefinitionEditBase(
 		!slices.Equal(params.Scope.SourceIDs, req.Base.Scope.SourceIDs) {
 		return PreparedTaskDefinitionEditSchedule{}, errors.New("temporal action does not match the approved base")
 	}
-	if params.RuntimeVersion != "" && params.RuntimeVersion != workflow.CompiledRuntimeSnapshotV1 {
+	if params.RuntimeVersion != "" && !workflow.IsCompiledRuntimeV1(params.RuntimeVersion) {
 		return PreparedTaskDefinitionEditSchedule{}, errors.New("temporal action runtime version is unsupported")
 	}
 	if err := validateTaskDefinitionEditBaseFingerprint(fingerprint, req.BaseHead, state.GetPaused(), state.GetNotes()); err != nil {
@@ -1338,7 +1338,7 @@ func validatePreparedTaskDefinitionEditSchedule(
 		params.ExecutionMode != types.ExecutionModeCompiled || params.Snapshot != nil {
 		return fmt.Errorf("%s workflow params do not match the task owner", name)
 	}
-	if params.RuntimeVersion != "" && params.RuntimeVersion != workflow.CompiledRuntimeSnapshotV1 {
+	if params.RuntimeVersion != "" && !workflow.IsCompiledRuntimeV1(params.RuntimeVersion) {
 		return fmt.Errorf("%s workflow runtime version is unsupported", name)
 	}
 	if err := validateTaskDefinitionEditActionParams(name, params); err != nil {

@@ -1492,6 +1492,17 @@ func TestPrepareTaskSchedule_FingerprintVersionFollowsCompiledRuntimeRollout(t *
 			wantMode:    types.ExecutionModeCompiled,
 		},
 		{
+			name: "nested run outcome canary writes combined runtime",
+			configure: func(s *Scheduler) {
+				WithCompiledRuntimeRollout(true, taskID, false)(s)
+				WithRunOutcomeRollout(true, taskID, false)(s)
+			},
+			wantVersion: taskScheduleFingerprintVersion,
+			wantRuntime: workflow.CompiledRuntimeRunOutcomeV1,
+			wantTenant:  req.TenantID,
+			wantMode:    types.ExecutionModeCompiled,
+		},
+		{
 			name: "nonmatching canary stays v1",
 			configure: func(s *Scheduler) {
 				WithCompiledRuntimeRollout(true, "task-v1-other", false)(s)

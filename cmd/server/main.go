@@ -35,6 +35,7 @@ import (
 	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/pusher"
 	"github.com/YouToco/vane/pushrecovery"
+	"github.com/YouToco/vane/runoutcome"
 	"github.com/YouToco/vane/runtimeconfig"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/scheduler"
@@ -207,6 +208,7 @@ func run() error {
 					TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
 				})
 			}, compiledModelResolver),
+		workflow.WithRunOutcomeStoreV1(st),
 		workflow.WithSnapshotV2ShadowCanary(
 			st, cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID),
 		workflow.WithSnapshotV2ReadAuditCanary(
@@ -244,13 +246,18 @@ func run() error {
 	// 那个测试会告诉你漏没漏。**
 	w.RegisterActivity(activities.AuthorizeRun)
 	w.RegisterActivity(activities.PrepareRun)
+	w.RegisterActivity(activities.BeginRunOutcomeV1)
+	w.RegisterActivity(activities.FinalizeRunOutcomeV1)
 	w.RegisterActivity(activities.EvolveProfile)
 	w.RegisterActivity(activities.Fetch)
+	w.RegisterActivity(activities.FetchOutcomeV1)
 	w.RegisterActivity(activities.Dedup)
 	w.RegisterActivity(activities.QualifyEvents)
 	w.RegisterActivity(activities.Score)
+	w.RegisterActivity(activities.ScoreOutcomeV1)
 	w.RegisterActivity(activities.Select)
 	w.RegisterActivity(activities.CardGen)
+	w.RegisterActivity(activities.CardGenOutcomeV1)
 	w.RegisterActivity(activities.RecordEmptyBatch)
 	w.RegisterActivity(activities.NotifyEmptyResult)
 	w.RegisterActivity(activities.Push)
@@ -262,6 +269,11 @@ func run() error {
 			cfg.Pipeline.CompiledRuntimeEnabled,
 			cfg.Pipeline.CompiledRuntimeCanaryScheduleID,
 			cfg.Pipeline.CompiledRuntimeAllowAll,
+		),
+		scheduler.WithRunOutcomeRollout(
+			cfg.Pipeline.RunOutcomeEnabled,
+			cfg.Pipeline.RunOutcomeCanaryScheduleID,
+			cfg.Pipeline.RunOutcomeAllowAll,
 		))
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
 	// C2b3-2c keeps definition editing dark at every ingress, but already owns
@@ -331,6 +343,24 @@ func run() error {
 		temporalClient.Close()
 		st.Close()
 		return fmt.Errorf("scheduler: 存量调度 Action reconcile 安全 Gate: %w", err)
+	}
+
+	// P1-B recovery is rollout-independent: disabling new marker creation must
+	// never strand pending rows created by an earlier deployment.
+	outcomeRecoveryRunner, err := runoutcome.NewRunner(
+		st,
+		runoutcome.TemporalInspector{Client: temporalClient},
+		slog.Default(),
+	)
+	if err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("装配 run outcome recovery: %w", err)
+	}
+	if err := outcomeRecoveryRunner.RunStartup(ctx); err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("run outcome recovery 首轮恢复 Gate: %w", err)
 	}
 
 	// Push-effect recovery has a separate exact-task switch from fresh sends.
@@ -659,6 +689,22 @@ func run() error {
 		}
 	}
 
+	outcomeRecoveryCtx, cancelOutcomeRecovery := context.WithCancel(ctx)
+	outcomeRecoveryDone := make(chan struct{})
+	go func() {
+		defer close(outcomeRecoveryDone)
+		outcomeRecoveryRunner.Run(outcomeRecoveryCtx)
+	}()
+	stopOutcomeRecovery := func() error {
+		cancelOutcomeRecovery()
+		select {
+		case <-outcomeRecoveryDone:
+			return nil
+		case <-time.After(30 * time.Second):
+			return errors.New("run outcome recovery 关停超时")
+		}
+	}
+
 	pushRecoveryCtx, cancelPushRecovery := context.WithCancel(ctx)
 	pushRecoveryDone := make(chan struct{})
 	if pushRecoveryRunner == nil {
@@ -751,6 +797,7 @@ func run() error {
 		recoveryErr := stopCreationRecovery()
 		definitionEditRecoveryErr := stopDefinitionEditRecovery()
 		scheduleCommandRecoveryErr := stopScheduleCommandRecovery()
+		outcomeRecoveryErr := stopOutcomeRecovery()
 		pushRecoveryErr := stopPushRecovery()
 		creationReceiptErr := stopReceiptDispatch()
 		definitionEditReceiptErr :=
@@ -764,6 +811,7 @@ func run() error {
 		drainErr := errors.Join(
 			recoveryErr, definitionEditRecoveryErr,
 			scheduleCommandRecoveryErr,
+			outcomeRecoveryErr,
 			pushRecoveryErr,
 			creationReceiptErr, definitionEditReceiptErr,
 			actionDispatcherErr,
@@ -902,6 +950,7 @@ func run() error {
 			recoveryErr := stopCreationRecovery()
 			definitionEditRecoveryErr := stopDefinitionEditRecovery()
 			scheduleCommandRecoveryErr := stopScheduleCommandRecovery()
+			outcomeRecoveryErr := stopOutcomeRecovery()
 			pushRecoveryErr := stopPushRecovery()
 			receiptErr := stopReceiptDispatch()
 			definitionEditReceiptErr :=
@@ -914,6 +963,7 @@ func run() error {
 			if drainErr != nil || recoveryErr != nil ||
 				definitionEditRecoveryErr != nil ||
 				scheduleCommandRecoveryErr != nil ||
+				outcomeRecoveryErr != nil ||
 				pushRecoveryErr != nil ||
 				receiptErr != nil || definitionEditReceiptErr != nil ||
 				actionDispatcherErr != nil || sessionErr != nil ||
@@ -922,7 +972,8 @@ func run() error {
 				// those resources underneath it; returning exits the process.
 				return errors.Join(fmt.Errorf("挂载 A2A server: %w", err),
 					drainErr, recoveryErr, definitionEditRecoveryErr,
-					scheduleCommandRecoveryErr, pushRecoveryErr, receiptErr,
+					scheduleCommandRecoveryErr, outcomeRecoveryErr,
+					pushRecoveryErr, receiptErr,
 					definitionEditReceiptErr, actionDispatcherErr,
 					sessionErr, maintenanceErr)
 			}
@@ -1020,6 +1071,11 @@ func run() error {
 	if err := stopScheduleCommandRecovery(); err != nil {
 		shutdownErrs = append(
 			shutdownErrs, fmt.Errorf("排空任务命令恢复器: %w", err),
+		)
+	}
+	if err := stopOutcomeRecovery(); err != nil {
+		shutdownErrs = append(
+			shutdownErrs, fmt.Errorf("排空 run outcome recovery: %w", err),
 		)
 	}
 	if err := stopPushRecovery(); err != nil {

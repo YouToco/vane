@@ -278,6 +278,16 @@ type CompiledRunStore interface {
 	SourceForContentFromIDs(context.Context, int64, []int64) (int64, bool, error)
 }
 
+type RunOutcomeStoreV1 interface {
+	CreatePendingRunOutcomeV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+	) (types.RunOutcomeMarkerV1, error)
+	FinalizeRunOutcomeClaimV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeClaimV1,
+	) (types.RunOutcomeV1, error)
+}
+
 type CompiledRunSnapshotShadowV2Store interface {
 	CreateOrGetCompiledRunSnapshotShadowV2(
 		context.Context, types.RunIdentity, runtimepolicy.BundleV1,
@@ -379,6 +389,7 @@ type Activities struct {
 	playbookPromptsEnabled           bool
 	playbookPromptCanaryScheduleID   string
 	compiledStore                    CompiledRunStore
+	runOutcomeStore                  RunOutcomeStoreV1
 	buildCompiledPolicyV1            CompiledPolicyBuilderV1
 	compiledModelResolverV1          CompiledModelResolverV1
 	compiledShadowStoreV2            CompiledRunSnapshotShadowV2Store
@@ -475,6 +486,12 @@ func WithCompiledRuntimeV1(
 	}
 }
 
+func WithRunOutcomeStoreV1(st RunOutcomeStoreV1) ActivitiesOption {
+	return func(a *Activities) {
+		a.runOutcomeStore = st
+	}
+}
+
 // WithSnapshotV2ShadowCanary enables C2c-2 for exactly one task. It changes
 // only the run-start persistence call; PrepareRun still returns and consumes
 // the sealed v1 reference.
@@ -563,6 +580,32 @@ type QualifyEventsIn struct {
 type QualifyEventsResult struct {
 	Items   []types.ContentItem `json:"items"`
 	Outcome string              `json:"outcome"`
+}
+
+type RunOutcomeBeginIn struct {
+	UserID int64              `json:"user_id"`
+	Run    CompiledRunInputV1 `json:"run"`
+}
+
+type RunOutcomeFinalizeIn struct {
+	UserID int64                   `json:"user_id"`
+	Run    CompiledRunInputV1      `json:"run"`
+	Claim  types.RunOutcomeClaimV1 `json:"claim"`
+}
+
+type FetchOutcomeResult struct {
+	Items          []types.ContentItem     `json:"items"`
+	SourceCoverage types.RunCompletenessV1 `json:"source_coverage"`
+}
+
+type ScoreOutcomeResult struct {
+	Items      []types.ScoredItem      `json:"items"`
+	Processing types.RunCompletenessV1 `json:"processing"`
+}
+
+type CardGenOutcomeResult struct {
+	Cards      []GeneratedCard         `json:"cards"`
+	Processing types.RunCompletenessV1 `json:"processing"`
 }
 
 // ScoreIn 是 Score Activity 的入参。
@@ -771,7 +814,7 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 		!compiledFetcherConfigured ||
 		p.Snapshot != nil || p.RunKind != PushRunKindScheduled ||
 		p.ExecutionMode != types.ExecutionModeCompiled ||
-		p.RuntimeVersion != CompiledRuntimeSnapshotV1 ||
+		!IsCompiledRuntimeV1(p.RuntimeVersion) ||
 		p.TenantID <= 0 || p.UserID <= 0 || strings.TrimSpace(p.ScheduleID) == "" ||
 		!activity.IsActivity(ctx) {
 		return PrepareRunResult{}, nonRetryable(types.NewAppError(types.CodeValidation,
@@ -851,6 +894,47 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 		return PrepareRunResult{}, nonRetryable(err)
 	}
 	return result, nil
+}
+
+// BeginRunOutcomeV1 is intentionally separate from PrepareRun so Temporal
+// history proves the pending marker exists before any later side-effecting
+// Activity command is scheduled.
+func (a *Activities) BeginRunOutcomeV1(
+	ctx context.Context, in RunOutcomeBeginIn,
+) (types.RunOutcomeMarkerV1, error) {
+	if a.runOutcomeStore == nil {
+		return types.RunOutcomeMarkerV1{}, nonRetryable(types.NewAppError(
+			types.CodeInternal, "run outcome store is not configured", nil))
+	}
+	expected, err := activityRunIdentityV1(ctx, in.UserID, &in.Run)
+	if err != nil {
+		return types.RunOutcomeMarkerV1{}, nonRetryable(err)
+	}
+	marker, err := a.runOutcomeStore.CreatePendingRunOutcomeV1(
+		ctx, expected, in.Run.Snapshot)
+	if err != nil {
+		return types.RunOutcomeMarkerV1{}, retryableOrNot(err)
+	}
+	return marker, nil
+}
+
+func (a *Activities) FinalizeRunOutcomeV1(
+	ctx context.Context, in RunOutcomeFinalizeIn,
+) (types.RunOutcomeV1, error) {
+	if a.runOutcomeStore == nil {
+		return types.RunOutcomeV1{}, nonRetryable(types.NewAppError(
+			types.CodeInternal, "run outcome store is not configured", nil))
+	}
+	expected, err := activityRunIdentityV1(ctx, in.UserID, &in.Run)
+	if err != nil {
+		return types.RunOutcomeV1{}, nonRetryable(err)
+	}
+	outcome, err := a.runOutcomeStore.FinalizeRunOutcomeClaimV1(
+		ctx, expected, in.Run.Snapshot, in.Claim)
+	if err != nil {
+		return types.RunOutcomeV1{}, retryableOrNot(err)
+	}
+	return outcome, nil
 }
 
 func (a *Activities) observationRolloutForTask(
@@ -1294,6 +1378,9 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 			items, ferr = a.fetcher.Fetch(ctx, src)
 		}
 		if ferr != nil {
+			if state, ok := ctx.Value(fetchOutcomeStateKey{}).(*fetchOutcomeState); ok {
+				state.complete = false
+			}
 			// 单源失败不拖垮整批：某个源挂了不该让当次推送整体失败；
 			// 同时自增 fail_count 并推进 next_fetch_at，避免调度紧循环重试。
 			var crossed, justDisabled bool
@@ -1388,6 +1475,28 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 		return a.store.ListUnpushedBySchedule(ctx, p.ScheduleID, maxScoreCandidates, maxPerSourceCandidates)
 	}
 	return a.store.ListUnpushedByUser(ctx, p.UserID, maxScoreCandidates, maxPerSourceCandidates)
+}
+
+type fetchOutcomeStateKey struct{}
+type fetchOutcomeState struct {
+	complete bool
+}
+
+// FetchOutcomeV1 preserves Fetch's payload and side effects while carrying the
+// independent due-source coverage fact needed by P1-B.
+func (a *Activities) FetchOutcomeV1(
+	ctx context.Context, p PushParams,
+) (FetchOutcomeResult, error) {
+	state := &fetchOutcomeState{complete: true}
+	items, err := a.Fetch(context.WithValue(ctx, fetchOutcomeStateKey{}, state), p)
+	if err != nil {
+		return FetchOutcomeResult{}, err
+	}
+	coverage := types.RunCompletenessPartial
+	if state.complete {
+		coverage = types.RunCompletenessComplete
+	}
+	return FetchOutcomeResult{Items: items, SourceCoverage: coverage}, nil
 }
 
 // markFetchResult 抓取一个源后推进其抓取状态，消除 UpdateSourceFetchState 从不被调用的死代码（#7）。
@@ -2449,6 +2558,20 @@ func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem,
 	return scored, nil
 }
 
+func (a *Activities) ScoreOutcomeV1(
+	ctx context.Context, in ScoreIn,
+) (ScoreOutcomeResult, error) {
+	items, err := a.Score(ctx, in)
+	if err != nil {
+		return ScoreOutcomeResult{}, err
+	}
+	processing := types.RunCompletenessComplete
+	if len(items) != len(in.Items) {
+		processing = types.RunCompletenessPartial
+	}
+	return ScoreOutcomeResult{Items: items, Processing: processing}, nil
+}
+
 // Select 取 TopN，复用 selector.RankTopN（显式同分裁决 + 新鲜度衰减排序，
 // 契约 §6）。activity 内取 time.Now() 合法：确定性约束只限 workflow 函数体。
 func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredItem, error) {
@@ -2606,6 +2729,20 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "整批卡片生成全部失败", nil)
 	}
 	return cards, nil
+}
+
+func (a *Activities) CardGenOutcomeV1(
+	ctx context.Context, in CardGenIn,
+) (CardGenOutcomeResult, error) {
+	cards, err := a.CardGen(ctx, in)
+	if err != nil {
+		return CardGenOutcomeResult{}, err
+	}
+	processing := types.RunCompletenessComplete
+	if len(cards) != len(in.Items) {
+		processing = types.RunCompletenessPartial
+	}
+	return CardGenOutcomeResult{Cards: cards, Processing: processing}, nil
 }
 
 // logPipelineItemFailure keeps arbitrary downstream error strings out of app

@@ -796,6 +796,43 @@ func TestFetch_ScheduleScoped(t *testing.T) {
 	})
 }
 
+func TestFetchOutcomeV1ReportsDueSourceCoverage(t *testing.T) {
+	makeActivities := func(st *fakeStore, fetch scriptedFetcher) *Activities {
+		return NewActivities(
+			fetch, fakeScorer{}, fakeCardGen{}, &fakePusher{},
+			st, noOwnerFeishu{}, nil, idNotice, nil, nil)
+	}
+	t.Run("one due source failure is partial", func(t *testing.T) {
+		st := &fakeStore{
+			dueSources: []types.Source{
+				fetchSrc(1, 0, "ok"), fetchSrc(2, 0, "failed"),
+			},
+			unpushed: []types.ContentItem{{ID: 77}},
+		}
+		result, err := makeActivities(st, scriptedFetcher{
+			errByID: map[int64]error{2: errors.New("provider failed")},
+		}).FetchOutcomeV1(t.Context(), PushParams{UserID: 7})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.SourceCoverage != types.RunCompletenessPartial ||
+			len(result.Items) != 1 {
+			t.Fatalf("fetch outcome = %+v", result)
+		}
+	})
+	t.Run("no due source is complete", func(t *testing.T) {
+		result, err := makeActivities(
+			&fakeStore{}, scriptedFetcher{}).
+			FetchOutcomeV1(t.Context(), PushParams{UserID: 7})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.SourceCoverage != types.RunCompletenessComplete {
+			t.Fatalf("fetch outcome = %+v", result)
+		}
+	})
+}
+
 type cancelBlockingFetcher struct {
 	mu      sync.Mutex
 	started chan struct{}

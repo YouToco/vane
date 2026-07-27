@@ -11,19 +11,39 @@ import (
 	"testing"
 )
 
-// P1-A is schema + Store only. Any production call site silently turns the
-// migration into a rollout and must be introduced by a later versioned batch.
-func TestCanonicalBriefP1AHasZeroProductionCallPoints(t *testing.T) {
+// P1-B may connect only Begin/Finalize/Recovery. Canonical Brief freezing and
+// reading remain dark until their separately reviewed phases.
+func TestCanonicalBriefP1BHasOnlyScopedProductionCallPoints(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate guard source")
 	}
 	root := filepath.Dir(filepath.Dir(thisFile))
 	protected := map[string]bool{
-		"CreatePendingRunOutcomeV1": true,
-		"FinalizeRunOutcomeV1":      true,
-		"FreezeBriefV1":             true,
-		"LoadBriefV1":               true,
+		"FreezeBriefV1": true,
+		"LoadBriefV1":   true,
+	}
+	scoped := map[string]map[string]bool{
+		"CreatePendingRunOutcomeV1": {
+			"workflow/activities.go": true,
+		},
+		"FinalizeRunOutcomeClaimV1": {
+			"workflow/activities.go": true,
+		},
+		"ListStaleRunOutcomeCandidatesV1": {
+			"runoutcome/runner.go": true,
+		},
+		"FinalizeRecoveredRunOutcomeClaimV1": {
+			"runoutcome/runner.go": true,
+		},
+		"BeginRunOutcomeV1": {
+			"workflow/workflow.go": true,
+			"cmd/server/main.go":   true,
+		},
+		"FinalizeRunOutcomeV1": {
+			"workflow/workflow.go": true,
+			"cmd/server/main.go":   true,
+		},
 	}
 	var calls []string
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
@@ -51,13 +71,29 @@ func TestCanonicalBriefP1AHasZeroProductionCallPoints(t *testing.T) {
 			}
 			calls = append(calls, relative+":"+name)
 		}
+		for name, allowedFiles := range scoped {
+			found := canonicalBriefProtectedSelectors(
+				file, map[string]bool{name: true})
+			if len(found) == 0 {
+				continue
+			}
+			relative, relErr := filepath.Rel(root, path)
+			if relErr != nil {
+				relative = path
+			}
+			if !allowedFiles[relative] {
+				for range found {
+					calls = append(calls, relative+":"+name)
+				}
+			}
+		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(calls) != 0 {
-		t.Fatalf("P1-A gained production call points: %v", calls)
+		t.Fatalf("P1-B production scope escaped: %v", calls)
 	}
 }
 
