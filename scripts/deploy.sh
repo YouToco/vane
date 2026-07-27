@@ -310,10 +310,11 @@ deploy_frontend_aliyun() {
       --delete --force
 
     if [[ -f $payload/dist/$owner_preview_object ]]; then
-      "$OSSUTIL_BIN" set-meta \
+      "$OSSUTIL_BIN" set-props \
         "oss://zhuoqidev-vane-web/$owner_preview_object" \
-        "Cache-Control:no-store" \
-        --update --force
+        --cache-control no-store \
+        --metadata-directive update \
+        --force
       owner_preview_meta=$(
         "$OSSUTIL_BIN" stat \
           "oss://zhuoqidev-vane-web/$owner_preview_object"

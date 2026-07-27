@@ -80,6 +80,17 @@ class FrontendAliyunTests(unittest.TestCase):
                 "\"${OSS_ACCESS_KEY_SECRET-}\" "
                 "\"${OSS_REGION-}\"\n"
                 "} >>\"$OSSUTIL_CALL_LOG\"\n"
+                "if [ \"$1\" = set-meta ]; then\n"
+                "  printf 'ossutil v2 set-meta alias received v1 syntax\\n' >&2\n"
+                "  exit 64\n"
+                "fi\n"
+                "if [ \"$1\" = set-props ]; then\n"
+                "  [ \"$3\" = --cache-control ] || exit 65\n"
+                "  [ \"$4\" = no-store ] || exit 66\n"
+                "  [ \"$5\" = --metadata-directive ] || exit 67\n"
+                "  [ \"$6\" = update ] || exit 68\n"
+                "  [ \"$7\" = --force ] || exit 69\n"
+                "fi\n"
                 "if [ \"$1\" = stat ]; then\n"
                 "  printf 'Cache-Control: no-store\\n'\n"
                 "fi\n"
@@ -130,18 +141,21 @@ class FrontendAliyunTests(unittest.TestCase):
             self.assertIn(f"\tOSS_ID={access_id}", ossutil_sync)
             self.assertIn(f"\tOSS_SECRET={access_secret}", ossutil_sync)
             self.assertIn("\tOSS_REGION=cn-shenzhen", ossutil_sync)
-            ossutil_set_meta = ossutil_calls[1]
-            self.assertIn("\tset-meta\t", ossutil_set_meta)
+            ossutil_set_props = ossutil_calls[1]
+            self.assertIn("\tset-props\t", ossutil_set_props)
             self.assertIn(
                 "\toss://zhuoqidev-vane-web/_preview/"
                 "p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html\t",
-                ossutil_set_meta,
+                ossutil_set_props,
             )
-            self.assertIn("\tCache-Control:no-store\t", ossutil_set_meta)
-            self.assertIn("\t--update\t--force\t", ossutil_set_meta)
-            self.assertIn(f"\tOSS_ID={access_id}", ossutil_set_meta)
-            self.assertIn(f"\tOSS_SECRET={access_secret}", ossutil_set_meta)
-            self.assertIn("\tOSS_REGION=cn-shenzhen", ossutil_set_meta)
+            self.assertIn(
+                "\t--cache-control\tno-store\t"
+                "--metadata-directive\tupdate\t--force\t",
+                ossutil_set_props,
+            )
+            self.assertIn(f"\tOSS_ID={access_id}", ossutil_set_props)
+            self.assertIn(f"\tOSS_SECRET={access_secret}", ossutil_set_props)
+            self.assertIn("\tOSS_REGION=cn-shenzhen", ossutil_set_props)
             ossutil_stat = ossutil_calls[2]
             self.assertIn("\tstat\t", ossutil_stat)
             self.assertIn(f"\tOSS_ID={access_id}", ossutil_stat)
