@@ -29,6 +29,8 @@ type runOutcomeWorkflowCase struct {
 	pushErr         error
 	finalizeErr     error
 	cancelAtEvolve  bool
+	canonical       bool
+	canonicalEmpty  bool
 }
 
 func executeRunOutcomeWorkflowCase(
@@ -127,6 +129,37 @@ func executeRunOutcomeWorkflowCase(
 			Processing: tc.cardProcessing,
 		}, nil
 	})
+	if tc.canonical {
+		reg("PrepareCanonicalBriefV1", func(
+			_ context.Context, in CanonicalBriefPrepareIn,
+		) (CanonicalBriefPrepareResult, error) {
+			if tc.canonicalEmpty {
+				return CanonicalBriefPrepareResult{
+					BatchID: 901, Empty: true,
+				}, nil
+			}
+			draft := types.BriefDraftV1{
+				SchemaVersion: types.BriefSchemaVersionV1,
+				RunOutcomeID:  in.Marker.ID,
+				RunSnapshotID: in.Run.Snapshot.SnapshotID,
+				PushBatchID:   901,
+				TenantID:      in.Run.TenantID,
+				UserID:        in.UserID,
+				TaskID:        in.Run.TaskID,
+				GeneratedAt:   in.GeneratedAt,
+				Insights: []types.InsightV1{{
+					ID: 1001, RankPosition: 1,
+					Title: "title", BodyMD: "body",
+					SourceTitle:  "source",
+					SourceURL:    "https://example.com/item",
+					DiscoveredAt: time.Unix(10, 0).UTC(),
+				}},
+			}
+			return CanonicalBriefPrepareResult{
+				Draft: &draft, BatchID: draft.PushBatchID,
+			}, nil
+		})
+	}
 	reg("Push", func(context.Context, PushIn) error { return tc.pushErr })
 	reg("RecordEmptyBatch", func(context.Context, RecordEmptyIn) error {
 		return nil
@@ -147,16 +180,57 @@ func executeRunOutcomeWorkflowCase(
 		}
 		return in.Claim.SealAt(time.Unix(1, 0).UTC())
 	})
+	runtimeVersion := CompiledRuntimeRunOutcomeV1
+	if tc.canonical {
+		runtimeVersion = CompiledRuntimeCanonicalBriefV1
+	}
 	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
 		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
 		ExecutionMode:  types.ExecutionModeCompiled,
-		RuntimeVersion: CompiledRuntimeRunOutcomeV1,
+		RuntimeVersion: runtimeVersion,
 		ScheduleID:     "task-run-outcome-matrix",
 	})
 	mu.Lock()
 	claim := finalized
 	mu.Unlock()
 	return claim, env.GetWorkflowError()
+}
+
+func TestPushPipelineWorkflow_CanonicalEmptyIsQuiet(t *testing.T) {
+	claim, err := executeRunOutcomeWorkflowCase(
+		t, runOutcomeWorkflowCase{
+			fetchItems: 2, fetchCoverage: types.RunCompletenessComplete,
+			scoreItems: 2, scoreProcessing: types.RunCompletenessComplete,
+			cardItems: 2, cardProcessing: types.RunCompletenessComplete,
+			canonical: true, canonicalEmpty: true,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Result != types.RunResultQuiet ||
+		claim.SourceCoverage != types.RunCompletenessComplete ||
+		claim.Processing != types.RunCompletenessComplete {
+		t.Fatalf("canonical empty claim = %+v", claim)
+	}
+}
+
+func TestPushPipelineWorkflow_CanonicalEmptyPushFailureIsFailed(t *testing.T) {
+	pushErr := temporal.NewNonRetryableApplicationError(
+		"empty receipt unavailable", string(types.CodeDatabase), nil)
+	claim, err := executeRunOutcomeWorkflowCase(
+		t, runOutcomeWorkflowCase{
+			fetchItems: 2, fetchCoverage: types.RunCompletenessComplete,
+			scoreItems: 2, scoreProcessing: types.RunCompletenessComplete,
+			cardItems: 2, cardProcessing: types.RunCompletenessComplete,
+			canonical: true, canonicalEmpty: true, pushErr: pushErr,
+		})
+	if err == nil {
+		t.Fatal("canonical empty receipt failure completed workflow")
+	}
+	if claim.Result != types.RunResultFailed ||
+		claim.Processing != types.RunCompletenessPartial {
+		t.Fatalf("canonical empty failure claim = %+v", claim)
+	}
 }
 
 func TestPushPipelineWorkflow_RunOutcomeFaultMatrix(t *testing.T) {
@@ -311,5 +385,160 @@ func TestRetryableActivityErrorPreservesControlledOutcomeCode(t *testing.T) {
 	if terminal.failureCode != string(types.CodeLLMUnavailable) ||
 		terminal.failureMessage != "sanitized model failure" {
 		t.Fatalf("terminal outcome = %+v", terminal)
+	}
+}
+
+func TestPushPipelineWorkflow_CanonicalBriefStagesBeforePush(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{
+		ID: "wf-canonical-brief-order",
+	})
+	var mu sync.Mutex
+	var sequence []string
+	var preparedMarker types.RunOutcomeMarkerV1
+	var pushed PushIn
+	reg := func(name string, fn any) {
+		env.RegisterActivityWithOptions(
+			fn, activity.RegisterOptions{Name: name})
+	}
+	reg("PrepareRun", func(
+		ctx context.Context, in PushParams,
+	) (PrepareRunResult, error) {
+		info := activity.GetInfo(ctx).WorkflowExecution
+		identity := types.RunIdentity{
+			TemporalWorkflowID: info.ID,
+			TemporalRunID:      info.RunID,
+			RunKind:            types.RunSnapshotKindScheduled,
+			TenantID:           in.TenantID,
+			UserID:             in.UserID,
+			TaskID:             in.ScheduleID,
+		}
+		return PrepareRunResult{
+			Authorized: true, Snapshot: mustCompiledRunRef(identity, 711),
+		}, nil
+	})
+	reg("BeginRunOutcomeV1", func(
+		_ context.Context, in RunOutcomeBeginIn,
+	) (types.RunOutcomeMarkerV1, error) {
+		preparedMarker = types.RunOutcomeMarkerV1{
+			ID: 811, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+			RunSnapshotID: in.Run.Snapshot.SnapshotID,
+			TenantID:      in.Run.TenantID, UserID: in.UserID,
+			TaskID: in.Run.TaskID,
+		}
+		return preparedMarker, nil
+	})
+	reg("EvolveProfile", func(context.Context, EvolveIn) error { return nil })
+	reg("FetchOutcomeV1", func(
+		context.Context, PushParams,
+	) (FetchOutcomeResult, error) {
+		return FetchOutcomeResult{
+			Items:          items(2),
+			SourceCoverage: types.RunCompletenessComplete,
+		}, nil
+	})
+	reg("Dedup", func(
+		_ context.Context, in DedupIn,
+	) ([]types.ContentItem, error) {
+		return in.Items, nil
+	})
+	reg("QualifyEvents", func(
+		_ context.Context, in QualifyEventsIn,
+	) (QualifyEventsResult, error) {
+		return QualifyEventsResult{
+			Items: in.Items, Outcome: "not_configured",
+		}, nil
+	})
+	reg("ScoreOutcomeV1", func(
+		context.Context, ScoreIn,
+	) (ScoreOutcomeResult, error) {
+		return ScoreOutcomeResult{
+			Items:      scoredItems(2),
+			Processing: types.RunCompletenessComplete,
+		}, nil
+	})
+	reg("Select", func(
+		_ context.Context, in SelectIn,
+	) ([]types.ScoredItem, error) {
+		return in.Scored, nil
+	})
+	reg("CardGenOutcomeV1", func(
+		context.Context, CardGenIn,
+	) (CardGenOutcomeResult, error) {
+		return CardGenOutcomeResult{
+			Cards:      cardsOf(2),
+			Processing: types.RunCompletenessComplete,
+		}, nil
+	})
+	reg("PrepareCanonicalBriefV1", func(
+		_ context.Context, in CanonicalBriefPrepareIn,
+	) (CanonicalBriefPrepareResult, error) {
+		mu.Lock()
+		sequence = append(sequence, "stage")
+		mu.Unlock()
+		draft := types.BriefDraftV1{
+			SchemaVersion: types.BriefSchemaVersionV1,
+			RunOutcomeID:  in.Marker.ID,
+			RunSnapshotID: in.Run.Snapshot.SnapshotID,
+			PushBatchID:   901,
+			TenantID:      in.Run.TenantID, UserID: in.UserID,
+			TaskID: in.Run.TaskID, GeneratedAt: in.GeneratedAt,
+			Insights: []types.InsightV1{{
+				ID: 1001, RankPosition: 1,
+				Title: "title", BodyMD: "body",
+				SourceTitle:  "source",
+				SourceURL:    "https://example.com/one",
+				DiscoveredAt: time.Unix(10, 0).UTC(),
+			}},
+		}
+		return CanonicalBriefPrepareResult{
+			Draft: &draft, BatchID: draft.PushBatchID,
+		}, nil
+	})
+	reg("Push", func(_ context.Context, in PushIn) error {
+		mu.Lock()
+		sequence = append(sequence, "push")
+		pushed = in
+		mu.Unlock()
+		return nil
+	})
+	reg("FinalizeRunOutcomeV1", func(
+		_ context.Context, in RunOutcomeFinalizeIn,
+	) (types.RunOutcomeV1, error) {
+		mu.Lock()
+		sequence = append(sequence, "finalize")
+		mu.Unlock()
+		return in.Claim.SealAt(time.Unix(20, 0).UTC())
+	})
+	reg("RecordEmptyBatch", func(context.Context, RecordEmptyIn) error {
+		return nil
+	})
+	reg("NotifyEmptyResult", func(context.Context, NotifyEmptyIn) error {
+		return nil
+	})
+
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
+		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeCanonicalBriefV1,
+		ScheduleID:     "task-canonical-brief",
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sequence) != 3 ||
+		sequence[0] != "stage" ||
+		sequence[1] != "push" ||
+		sequence[2] != "finalize" {
+		t.Fatalf("canonical command order = %v", sequence)
+	}
+	if pushed.CanonicalOutcome == nil ||
+		*pushed.CanonicalOutcome != preparedMarker ||
+		pushed.CanonicalBrief == nil ||
+		pushed.CanonicalBrief.RunOutcomeID != preparedMarker.ID {
+		t.Fatalf("canonical Push input = %+v", pushed)
 	}
 }

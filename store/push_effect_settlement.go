@@ -98,6 +98,42 @@ func (s *Store) CompleteEmptyPushEffectBatch(
 			"begin empty push effect batch receipt", err)
 	}
 	defer rollbackPushEffectTx(ctx, tx)
+	var canonicalCapability bool
+	if err := tx.QueryRow(ctx, `
+		SELECT to_regprocedure(
+		    'public.complete_canonical_empty_push_batch_v1(bigint,bigint,bigint,bigint)'
+		) IS NOT NULL`,
+	).Scan(&canonicalCapability); err != nil {
+		return pushEffectDatabaseError(
+			"check canonical empty receipt capability", err)
+	}
+	if canonicalCapability {
+		var decision string
+		if err := tx.QueryRow(ctx, `
+			SELECT public.complete_canonical_empty_push_batch_v1(
+			    $1,$2,$3,$4
+			)`,
+			scope.TenantID, scope.UserID, scope.BatchID, runSnapshotID,
+		).Scan(&decision); err != nil {
+			return pushEffectDatabaseError(
+				"complete canonical empty push batch", err)
+		}
+		switch decision {
+		case "done":
+			if err := tx.Commit(ctx); err != nil {
+				return pushEffectDatabaseError(
+					"commit canonical empty push batch", err)
+			}
+			return nil
+		case "legacy":
+			// Continue through the original open-batch settlement.
+		case "denied":
+			return pushEffectConflict(
+				"canonical empty push batch receipt differs")
+		default:
+			return pushEffectIntegrity()
+		}
+	}
 	status, err := lockPushEffectBatchAdmission(
 		ctx,
 		tx,
@@ -137,6 +173,7 @@ func (s *Store) CompleteEmptyPushEffectBatch(
 		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		   AND run_snapshot_id=$4
 		   AND delivery_authority=$6
+		   AND brief_state='open'
 		   AND status IN ($5,$7)`,
 		scope.BatchID,
 		scope.TenantID,

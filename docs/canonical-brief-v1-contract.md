@@ -1,9 +1,10 @@
 # Canonical RunOutcome / Brief V1 contract
 
-Status: P1-B exact-run lifecycle. Migration 063 adds recovery and the workflow
-may create/finalize RunOutcome only for the independent compiled-runtime
-canary. Brief freeze/read, API, renderer, and every user-visible surface remain
-dark.
+Status: P1-C exact-task canary implementation. Migration 064 adds a durable
+pre-render Brief stage. The workflow may stage only inside the nested
+compiled-runtime, RunOutcome, and durable push-effect canaries. Brief API/read
+surfaces and sending authority remain unchanged; the Brief renderer remains
+dark with zero production call points in P1-C.
 
 ## Identity
 
@@ -58,7 +59,7 @@ The V1 payload freezes:
 - canonical HTTP(S) source URL, source title, publication time, and discovery
   time.
 
-Before seal, a scope-checked `SECURITY DEFINER` evidence reader binds the
+Before stage, a scope-checked `SECURITY DEFINER` evidence reader binds the
 delivery to its durable `content_items` row and to a source present in the
 immutable run snapshot at delivery time. The Store compares title, body,
 canonical URL, frozen source title, publication time, and discovery time. The
@@ -68,23 +69,59 @@ the same 32 MiB limit in Go and PostgreSQL.
 
 It deliberately does not parse historical `body_md` or `card_json`, derive
 importance tiers from score, invent an executive summary, or add an LLM call.
-P1-C may write only when the structured inputs already exist at the
+P1-C writes only when the structured inputs already exist at the
 post-delivery/pre-render seam.
 
 ## Immutability and race fence
 
-Migration 061 adds `push_batches.brief_state=open|sealed`.
+Migration 061 adds `push_batches.brief_state=open|sealed`; migration 064 adds
+`canonical_brief_stages` with `staged→promoted|aborted`.
 
 Every delivery insert takes a key-share lock on its batch through a database
-trigger. Brief freeze takes an update lock, verifies that its insight IDs equal
-the complete durable delivery set, then changes `open→sealed` and inserts the
-Brief in the same transaction. Therefore:
+trigger. P1-C stage takes an update lock, verifies that its insight IDs equal
+the complete durable delivery set, stores the immutable canonical draft as
+exact `BYTEA`, then changes `open→sealed` in the same transaction. Therefore:
 
 - an earlier delivery commits first and must be included;
 - a later new delivery is rejected after seal;
 - an exact `(batch_id, content_item_id)` response-loss retry may still reach
   the retained unique arbiter and recover the existing row;
-- a failed Brief transaction rolls the seal back.
+- a failed stage transaction rolls the seal back.
+
+The Prepare result carries the exact physical `push_batches.id`; Push never
+reconstructs that identity from mutable events. A zero-insight plan seals that
+same batch without creating a stage. Its receipt path proves the exact
+run/snapshot/batch scope, effect authority, `done` state, and absence of both
+deliveries and effects. A lost empty receipt is therefore replayed as
+`quiet/partial`, not guessed from a newly planned mutable event set.
+
+Push still uses the legacy renderer and existing durable effect sender. The
+canonical renderer is not called in P1-C. Any future shadow integration must
+be independently bounded and must not change legacy card bytes, create an
+effect, call the provider, or fail Push.
+
+After Push, the common RunOutcome claim transaction resolves the stage:
+
+- `content` atomically inserts the final immutable `brief_snapshots` row and
+  moves the stage to `promoted`;
+- every non-content terminal result moves it to `aborted` without a Brief;
+- no-stage P1-B claims are a strict no-op;
+- a deferred database trigger rejects commit of a finalized outcome with an
+  unresolved stage.
+
+Workflow and recovery both use this same transaction path. Promotion trusts
+only the already-validated stage bytes and digest, never live content/source
+evidence that could drift during the provider call. Exact response-loss replay
+returns the same outcome, Brief ID, payload digest, and resolution time.
+If Push succeeded but its response or finalizer failed, the common claim path
+normalizes a generic `failed` receipt to `content/partial` only when the exact
+stage is already promoted, or to `quiet/partial` only when the exact sealed
+empty receipt is already durable. Different evidence remains a conflict.
+
+Prepared P1-C effects are not eligible for recovery send while their stage is
+pending or aborted. The recovery coordinator may claim them only after the
+exact stage is promoted by a finalized `content` outcome. Batches with no P1-C
+stage retain the P1-B recovery contract.
 
 `deliveries(batch_id,tenant_id,user_id)` also has a composite FK to the batch
 scope. Migration 061 audits existing rows before adding it, and the insert
@@ -114,7 +151,10 @@ database are not mutated. It can:
   global content tables;
 - insert and finalize outcomes;
 - insert immutable Brief snapshots;
-- update only `push_batches.brief_state`.
+- insert immutable pre-render stages and update only their terminal state;
+- update only `push_batches.brief_state`;
+- read only `push_batches.status`, `idempotency_key`, and
+  `delivery_authority` for the exact sealed-empty receipt.
 
 It cannot delete/truncate, mutate Brief payloads, send a message, call a model,
 or enter another runtime role. Tenant and exact-user restrictive boundaries
@@ -140,9 +180,36 @@ still installed before inserting, so neither side of the fence can strand a
 pending marker. Migration 061 Down still refuses to destroy any outcome or
 Brief evidence.
 
+Migration 064 Up/Down joins the same schema fence and producer-compatible lock
+order. Down refuses while any stage exists or an exact pending Outcome still
+owns sealed, zero-evidence empty-batch state that depends on the P1-C receipt
+functions. A sealed-empty batch becomes safe to downgrade only after its
+receipt and terminal Outcome are both durable. Store checks the stage
+capability only after taking the shared fence: P1-C fails closed if 064 is
+absent, while P1-B finalization remains valid and resolves no stage. Database
+triggers admit stage insert only for an exact pending outcome and sealed batch,
+promotion only for the exact finalized content outcome and Brief, and abort
+only for finalized non-content outcomes. Final Brief payload digests and stage
+request digests are validated against their canonical envelopes by Store; the
+stage request digest is additionally bound to its exact stored draft bytes by
+PostgreSQL SHA-256.
+
 The independent rollout keys are `run_outcome_enabled`,
 `run_outcome_canary_schedule_id`, and `run_outcome_allow_all`. Selection is
 valid only inside the compiled-runtime rollout. Turning it off stops new marker
 creation but recovery remains active. Initial production rollout is one exact
-compiled task; `allow_all` stays false. Brief, API, renderer, model, message,
-and sending authority remain unchanged.
+compiled task; `allow_all` stays false.
+
+P1-C adds `canonical_brief_enabled`,
+`canonical_brief_canary_schedule_id`, and `canonical_brief_allow_all`.
+Current validation permits only an exact-task canary, never allow-all, and
+requires that task to be simultaneously selected by compiled runtime,
+RunOutcome, fresh durable push effects, and push-effect recovery. Turning the
+selection off stops new P1-C Actions; an already-frozen P1-C history can still
+complete its stage/effect commands. Brief API, model calls, visible cards,
+message count, and sending authority remain unchanged.
+
+Both P1-C Temporal changes are versioned. The Prepare-result wire-version
+marker is recorded before the Prepare Activity command, so a pre-v2 execution
+can resume safely even when its history frontier is exactly the completed old
+Prepare result.

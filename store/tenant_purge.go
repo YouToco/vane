@@ -50,6 +50,7 @@ type purgeStep struct {
 //	agent_session_projection_authority_events /
 //	agent_events → agent_sessions
 //	push_effects                        → deliveries / push_batches / task_run_snapshots
+//	canonical_brief_stages             → brief_snapshots / task_run_outcomes / push_batches
 //	brief_snapshots                    → task_run_outcomes / push_batches / task_run_snapshots
 //	task_run_outcomes                  → task_run_snapshots
 //	task_observed_events               → deliveries / task_run_snapshots
@@ -104,6 +105,9 @@ var purgeOrder = []purgeStep{
 	// External effect checkpoints bind exact delivery, batch, and immutable run
 	// identities, so they must be removed before all three parent aggregates.
 	{"push_effects", "tenant_id = $1"},
+	// Pre-render stages may reference the promoted snapshot as well as the
+	// outcome and batch, so delete them before every canonical Brief parent.
+	{"canonical_brief_stages", "tenant_id = $1"},
 	// Canonical Briefs bind the finalized outcome, exact batch and immutable
 	// run. Delete the whole snapshot first, then its outcome marker, before any
 	// of the three retained parents.
@@ -200,6 +204,13 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	if err := lockPushEffectSchemaWriter(ctx, tx); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "锁定推送效果 schema 准入", err)
+	}
+	var canonicalBriefStagesAvailable bool
+	if err := tx.QueryRow(ctx,
+		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL`,
+	).Scan(&canonicalBriefStagesAvailable); err != nil {
+		return nil, types.NewAppError(
+			types.CodeDatabase, "检查 canonical Brief 清理能力", err)
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
@@ -357,6 +368,12 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 
 	rep := &PurgeReport{TenantID: tenantID, Rows: map[string]int64{}, DryRun: dryRun}
 	for _, st := range purgeOrder {
+		if st.table == "canonical_brief_stages" &&
+			!canonicalBriefStagesAvailable {
+			// A current binary may safely drain while migration 064 has
+			// already been rolled back to 063.
+			continue
+		}
 		// #nosec G201 -- table 与 where 都来自本文件的常量表，不含任何外部输入；
 		// tenant_id 走参数化的 $1。
 		tag, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s", st.table, st.where), tenantID)

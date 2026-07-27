@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 63
+const latestMigrationVersion int64 = 64
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -100,6 +100,8 @@ var wantTables = []string{
 	// 061 channel-neutral exact-run outcome and immutable whole-Brief snapshot.
 	"task_run_outcomes",
 	"brief_snapshots",
+	// 064 immutable pre-render stage promoted/aborted with RunOutcome CAS.
+	"canonical_brief_stages",
 	// 062 来源级画像纠正 ledger、状态与响应丢失回执。
 	"profile_claim_states",
 	"profile_claims",

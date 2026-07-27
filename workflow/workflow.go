@@ -460,17 +460,85 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 		return nil
 	}
 
+	var canonicalBrief *types.BriefDraftV1
+	var canonicalBatchID int64
+	canonicalBriefEmpty := false
+	canonicalBriefCommandV1 := false
+	canonicalBriefPrepareResultVersion := workflow.DefaultVersion
+	if outcomeMarker != nil && compiledRun != nil &&
+		HasCanonicalBriefV1(p.RuntimeVersion) &&
+		workflow.GetVersion(
+			ctx, "canonical-brief-stage-v1", workflow.DefaultVersion, 1,
+		) >= 1 {
+		// The result-shape version must precede the Activity command. An
+		// in-flight pre-v2 history may resume exactly after the old Prepare
+		// result; placing GetVersion after Get would treat that frontier as a
+		// new execution and misread the old nil-draft response.
+		canonicalBriefPrepareResultVersion = workflow.GetVersion(
+			ctx, "canonical-brief-prepare-result-v2",
+			workflow.DefaultVersion, 1,
+		)
+		stageCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
+		var prepared CanonicalBriefPrepareResult
+		if err := workflow.ExecuteActivity(
+			stageCtx,
+			a.PrepareCanonicalBriefV1,
+			CanonicalBriefPrepareIn{
+				UserID: p.UserID, TraceID: traceID,
+				Run: *compiledRun, Marker: *outcomeMarker,
+				Cards: cards, GeneratedAt: workflow.Now(ctx),
+			},
+		).Get(stageCtx, &prepared); err != nil {
+			return err
+		}
+		canonicalBriefCommandV1 = true
+		canonicalBrief = prepared.Draft
+		if canonicalBriefPrepareResultVersion >= 1 {
+			canonicalBatchID = prepared.BatchID
+			canonicalBriefEmpty = prepared.Empty
+			if canonicalBatchID <= 0 ||
+				(canonicalBrief == nil) != canonicalBriefEmpty ||
+				(canonicalBrief != nil &&
+					canonicalBrief.PushBatchID != canonicalBatchID) {
+				return types.NewAppError(
+					types.CodeValidation,
+					"canonical Brief preparation result is invalid", nil)
+			}
+		} else if canonicalBrief != nil {
+			// Histories recorded before result-v2 carry only Draft.
+			canonicalBatchID = canonicalBrief.PushBatchID
+		}
+	}
+
 	// 6. Push —— 网络 I/O，主动推送飞书卡片。
 	pushCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
-	if err := workflow.ExecuteActivity(pushCtx, a.Push, PushIn{UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID, Cards: cards, TaskTitle: p.NLDesc, Run: compiledRun}).Get(pushCtx, nil); err != nil {
+	pushIn := PushIn{
+		UserID: p.UserID, ScheduleID: p.ScheduleID,
+		TraceID: traceID, Cards: cards,
+		TaskTitle: p.NLDesc, Run: compiledRun,
+	}
+	if canonicalBriefCommandV1 {
+		pushIn.CanonicalOutcome = outcomeMarker
+		pushIn.CanonicalBrief = canonicalBrief
+		if canonicalBatchID > 0 {
+			pushIn.CanonicalBatchID = canonicalBatchID
+		}
+	}
+	if err := workflow.ExecuteActivity(
+		pushCtx, a.Push, pushIn).Get(pushCtx, nil); err != nil {
 		outcomeProcessing = types.RunCompletenessPartial
-		if !temporal.IsCanceledError(err) {
+		if !temporal.IsCanceledError(err) &&
+			(!canonicalBriefCommandV1 || !canonicalBriefEmpty) {
 			outcomeTerminal = contentRunOutcomeV1()
 		}
 		return err
 	}
 
-	outcomeTerminal = contentRunOutcomeV1()
+	if canonicalBriefCommandV1 && canonicalBriefEmpty {
+		outcomeTerminal = quietRunOutcomeV1()
+	} else {
+		outcomeTerminal = contentRunOutcomeV1()
+	}
 	log.Info("push pipeline 完成", "user_id", p.UserID, "trace_id", traceID, "pushed", len(cards))
 	return nil
 }

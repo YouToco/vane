@@ -82,6 +82,117 @@ func TestRunOutcomeRolloutValidation(t *testing.T) {
 	}
 }
 
+func TestCanonicalBriefRolloutValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		compiled       bool
+		compiledCanary string
+		compiledAll    bool
+		outcome        bool
+		outcomeCanary  string
+		outcomeAll     bool
+		brief          bool
+		briefCanary    string
+		briefAll       bool
+		effectCanary   string
+		recoveryCanary string
+		wantErr        bool
+	}{
+		{name: "off"},
+		{
+			name:     "exact nested canary",
+			compiled: true, compiledCanary: "task-a",
+			outcome: true, outcomeCanary: "task-a",
+			brief: true, briefCanary: " task-a ",
+			effectCanary: "task-a", recoveryCanary: "task-a",
+		},
+		{
+			name:     "outcome all permits exact brief canary",
+			compiled: true, compiledAll: true,
+			outcome: true, outcomeAll: true,
+			brief: true, briefCanary: "task-a",
+			effectCanary: "task-a", recoveryCanary: "task-a",
+		},
+		{
+			name:     "all layers allow all",
+			compiled: true, compiledAll: true,
+			outcome: true, outcomeAll: true,
+			brief: true, briefAll: true,
+			wantErr: true,
+		},
+		{
+			name:     "requires outcome",
+			compiled: true, compiledCanary: "task-a",
+			brief: true, briefCanary: "task-a", wantErr: true,
+		},
+		{
+			name:     "outside outcome canary",
+			compiled: true, compiledAll: true,
+			outcome: true, outcomeCanary: "task-a",
+			brief: true, briefCanary: "task-b", wantErr: true,
+		},
+		{
+			name:     "missing second key",
+			compiled: true, compiledAll: true,
+			outcome: true, outcomeAll: true,
+			brief: true, wantErr: true,
+		},
+		{
+			name:     "canary and all conflict",
+			compiled: true, compiledAll: true,
+			outcome: true, outcomeAll: true,
+			brief: true, briefCanary: "task-a", briefAll: true,
+			wantErr: true,
+		},
+		{
+			name:     "outside push effect fresh canary",
+			compiled: true, compiledAll: true,
+			outcome: true, outcomeAll: true,
+			brief: true, briefCanary: "task-a",
+			effectCanary: "task-b", recoveryCanary: "task-a",
+			wantErr: true,
+		},
+		{
+			name:     "outside push effect recovery canary",
+			compiled: true, compiledAll: true,
+			outcome: true, outcomeAll: true,
+			brief: true, briefCanary: "task-a",
+			effectCanary: "task-a", recoveryCanary: "task-b",
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{
+				DB: DBConfig{URL: "postgres://test"},
+				Pipeline: PipelineConfig{
+					CompiledRuntimeEnabled:             test.compiled,
+					CompiledRuntimeCanaryScheduleID:    test.compiledCanary,
+					CompiledRuntimeAllowAll:            test.compiledAll,
+					RunOutcomeEnabled:                  test.outcome,
+					RunOutcomeCanaryScheduleID:         test.outcomeCanary,
+					RunOutcomeAllowAll:                 test.outcomeAll,
+					CanonicalBriefEnabled:              test.brief,
+					CanonicalBriefCanaryScheduleID:     test.briefCanary,
+					CanonicalBriefAllowAll:             test.briefAll,
+					PushEffectCanaryScheduleID:         test.effectCanary,
+					PushEffectRecoveryCanaryScheduleID: test.recoveryCanary,
+				},
+			}
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr=%t", err, test.wantErr)
+			}
+			if err == nil && test.briefCanary != "" &&
+				cfg.Pipeline.CanonicalBriefCanaryScheduleID !=
+					strings.TrimSpace(test.briefCanary) {
+				t.Fatalf("brief canary = %q",
+					cfg.Pipeline.CanonicalBriefCanaryScheduleID)
+			}
+		})
+	}
+}
+
 func TestSnapshotV2ShadowCanaryScheduleIDValidation(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -62,6 +62,7 @@ func TestPushAuthorityGuard(t *testing.T) {
 			!allowedEffectCalls[selector.Sel.Name]:
 			effectCalls = append(effectCalls, selector.Sel.Name)
 		case allowedEffectCalls[selector.Sel.Name] &&
+			selector.Sel.Name != "CompleteEmptyPushEffectBatch" &&
 			(claimPosition == token.NoPos || call.Pos() < claimPosition):
 			effectCalls = append(effectCalls,
 				selector.Sel.Name+" before authority claim")

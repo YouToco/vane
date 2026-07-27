@@ -183,5 +183,89 @@ func (s *Store) FinalizeRecoveredRunOutcomeClaimV1(
 		return types.RunOutcomeV1{}, canonicalBriefDatabaseError(
 			"read recovered outcome identity", err)
 	}
-	return finalizeRunOutcomeClaimTxV1(ctx, tx, claim)
+	outcome, err := finalizeRunOutcomeClaimTxV1(ctx, tx, claim)
+	if err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	if err := commitCanonicalBriefTxV1(
+		ctx, tx, "commit recovered run outcome claim"); err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	return outcome, nil
+}
+
+// normalizeCanonicalBriefTerminalClaimV1 treats durable P1-C evidence as
+// stronger
+// terminal evidence than Temporal's generic FAILED/COMPLETED status. Once the
+// complete canonical content set was frozen, every non-cancellation Push
+// failure is semantically content/partial; a failed finalizer must not erase
+// that evidence merely because the workflow itself later reports FAILED.
+func normalizeCanonicalBriefTerminalClaimV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	claim types.RunOutcomeClaimV1,
+) (types.RunOutcomeClaimV1, error) {
+	if claim.Result != types.RunResultFailed {
+		return claim, nil
+	}
+	available, err := canonicalBriefStageCapabilityV1(ctx, tx)
+	if err != nil || !available {
+		return claim, err
+	}
+	stage, found, err := loadCanonicalBriefStageV1(ctx, tx, claim.ID)
+	if err != nil {
+		return claim, err
+	}
+	if !found {
+		var emptyTerminal bool
+		if err := tx.QueryRow(ctx, `
+			SELECT public.canonical_brief_empty_terminal_v1(
+			    $1,$2,$3,$4
+			)`,
+			claim.TenantID, claim.UserID, claim.TaskID,
+			claim.RunSnapshotID,
+		).Scan(&emptyTerminal); err != nil {
+			return types.RunOutcomeClaimV1{},
+				canonicalBriefDatabaseError(
+					"check empty canonical Brief terminal receipt", err)
+		}
+		if !emptyTerminal {
+			return claim, nil
+		}
+		claim.Result = types.RunResultQuiet
+		claim.Processing = types.RunCompletenessPartial
+		claim.FailureCode = ""
+		claim.FailureMessage = ""
+		if err := claim.Validate(); err != nil {
+			return types.RunOutcomeClaimV1{},
+				canonicalBriefIntegrityError()
+		}
+		return claim, nil
+	}
+	if stage.draft.RunOutcomeID != claim.ID ||
+		stage.draft.RunSnapshotID != claim.RunSnapshotID ||
+		stage.draft.TenantID != claim.TenantID ||
+		stage.draft.UserID != claim.UserID ||
+		stage.draft.TaskID != claim.TaskID {
+		return types.RunOutcomeClaimV1{}, canonicalBriefIntegrityError()
+	}
+	switch stage.status {
+	case "aborted":
+		// A pre-normalization worker may already have atomically committed
+		// failed+aborted and then lost the Finalize Activity response. Preserve
+		// the submitted claim so the stored finalized row below decides exact
+		// replay versus semantic conflict.
+		return claim, nil
+	case "staged", "promoted":
+	default:
+		return types.RunOutcomeClaimV1{}, canonicalBriefIntegrityError()
+	}
+	claim.Result = types.RunResultContent
+	claim.Processing = types.RunCompletenessPartial
+	claim.FailureCode = ""
+	claim.FailureMessage = ""
+	if err := claim.Validate(); err != nil {
+		return types.RunOutcomeClaimV1{}, canonicalBriefIntegrityError()
+	}
+	return claim, nil
 }

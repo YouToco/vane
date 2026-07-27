@@ -288,6 +288,25 @@ type RunOutcomeStoreV1 interface {
 	) (types.RunOutcomeV1, error)
 }
 
+type CanonicalBriefStoreV1 interface {
+	LoadPreparedBriefDraftV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1,
+	) (types.BriefDraftV1, bool, error)
+	LoadSealedEmptyBriefBatchV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1, string,
+	) (int64, bool, error)
+	PrepareBriefDraftV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1, int64, time.Time, []int64,
+	) (types.BriefDraftV1, error)
+	SealEmptyBriefBatchV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1, int64,
+	) error
+}
+
 type CompiledRunSnapshotShadowV2Store interface {
 	CreateOrGetCompiledRunSnapshotShadowV2(
 		context.Context, types.RunIdentity, runtimepolicy.BundleV1,
@@ -390,6 +409,7 @@ type Activities struct {
 	playbookPromptCanaryScheduleID   string
 	compiledStore                    CompiledRunStore
 	runOutcomeStore                  RunOutcomeStoreV1
+	canonicalBriefStore              CanonicalBriefStoreV1
 	buildCompiledPolicyV1            CompiledPolicyBuilderV1
 	compiledModelResolverV1          CompiledModelResolverV1
 	compiledShadowStoreV2            CompiledRunSnapshotShadowV2Store
@@ -489,6 +509,12 @@ func WithCompiledRuntimeV1(
 func WithRunOutcomeStoreV1(st RunOutcomeStoreV1) ActivitiesOption {
 	return func(a *Activities) {
 		a.runOutcomeStore = st
+	}
+}
+
+func WithCanonicalBriefStoreV1(st CanonicalBriefStoreV1) ActivitiesOption {
+	return func(a *Activities) {
+		a.canonicalBriefStore = st
 	}
 }
 
@@ -593,6 +619,21 @@ type RunOutcomeFinalizeIn struct {
 	Claim  types.RunOutcomeClaimV1 `json:"claim"`
 }
 
+type CanonicalBriefPrepareIn struct {
+	UserID      int64                    `json:"user_id"`
+	TraceID     string                   `json:"trace_id"`
+	Run         CompiledRunInputV1       `json:"run"`
+	Marker      types.RunOutcomeMarkerV1 `json:"marker"`
+	Cards       []GeneratedCard          `json:"cards"`
+	GeneratedAt time.Time                `json:"generated_at"`
+}
+
+type CanonicalBriefPrepareResult struct {
+	Draft   *types.BriefDraftV1 `json:"draft,omitempty"`
+	BatchID int64               `json:"batch_id"`
+	Empty   bool                `json:"empty"`
+}
+
 type FetchOutcomeResult struct {
 	Items          []types.ContentItem     `json:"items"`
 	SourceCoverage types.RunCompletenessV1 `json:"source_coverage"`
@@ -656,6 +697,12 @@ type PushIn struct {
 	// 空串合法（存量调度/即时推送无任务名），构卡落兜底标题。
 	TaskTitle string              `json:"task_title,omitempty"`
 	Run       *CompiledRunInputV1 `json:"run,omitempty"`
+	// CanonicalOutcome marks only the P1-C command shape. Draft is nil when
+	// every observation was already owned by another exact run and therefore
+	// no delivery/Brief exists.
+	CanonicalOutcome *types.RunOutcomeMarkerV1 `json:"canonical_outcome,omitempty"`
+	CanonicalBrief   *types.BriefDraftV1       `json:"canonical_brief,omitempty"`
+	CanonicalBatchID int64                     `json:"canonical_batch_id,omitempty"`
 }
 
 // RecordEmptyIn 是 RecordEmptyBatch Activity 的入参（009 / 契约 §16「空批次缺口」）。
@@ -935,6 +982,161 @@ func (a *Activities) FinalizeRunOutcomeV1(
 		return types.RunOutcomeV1{}, retryableOrNot(err)
 	}
 	return outcome, nil
+}
+
+// PrepareCanonicalBriefV1 is P1-C's only pre-render command. It creates or
+// recovers the exact batch and complete delivery set, then atomically freezes
+// the channel-neutral draft and seals the batch. No renderer or provider is
+// called here.
+func (a *Activities) PrepareCanonicalBriefV1(
+	ctx context.Context,
+	in CanonicalBriefPrepareIn,
+) (CanonicalBriefPrepareResult, error) {
+	if a.canonicalBriefStore == nil || a.compiledStore == nil {
+		return CanonicalBriefPrepareResult{}, nonRetryable(types.NewAppError(
+			types.CodeInternal, "canonical Brief store is not configured", nil))
+	}
+	if in.TraceID == "" || len(in.Cards) == 0 || in.GeneratedAt.IsZero() {
+		return CanonicalBriefPrepareResult{}, nonRetryable(types.NewAppError(
+			types.CodeValidation, "canonical Brief preparation is invalid", nil))
+	}
+	expected, err := activityRunIdentityV1(ctx, in.UserID, &in.Run)
+	if err != nil {
+		return CanonicalBriefPrepareResult{}, nonRetryable(err)
+	}
+	if err := in.Marker.Validate(); err != nil ||
+		in.Marker.RunSnapshotID != in.Run.Snapshot.SnapshotID ||
+		in.Marker.TenantID != expected.TenantID ||
+		in.Marker.UserID != expected.UserID ||
+		in.Marker.TaskID != expected.TaskID {
+		return CanonicalBriefPrepareResult{}, nonRetryable(types.NewAppError(
+			types.CodeValidation,
+			"canonical Brief marker differs from exact run", err))
+	}
+
+	// Response-loss replay must consult the immutable stage before mutable
+	// authorization/evidence. Once present, it is the sole source of truth.
+	if draft, found, loadErr := a.canonicalBriefStore.LoadPreparedBriefDraftV1(
+		ctx, expected, in.Run.Snapshot, in.Marker,
+	); loadErr != nil {
+		return CanonicalBriefPrepareResult{}, retryableOrNot(loadErr)
+	} else if found {
+		expectedGeneratedAt := in.GeneratedAt.Round(0).UTC().
+			Truncate(time.Microsecond)
+		if !draft.GeneratedAt.Equal(expectedGeneratedAt) ||
+			len(draft.Insights) > len(in.Cards) {
+			return CanonicalBriefPrepareResult{}, nonRetryable(
+				types.NewAppError(
+					types.CodeConflict,
+					"canonical Brief response-loss replay differs",
+					nil))
+		}
+		return CanonicalBriefPrepareResult{
+			Draft: &draft, BatchID: draft.PushBatchID,
+		}, nil
+	}
+	if batchID, empty, loadErr :=
+		a.canonicalBriefStore.LoadSealedEmptyBriefBatchV1(
+			ctx, expected, in.Run.Snapshot, in.Marker, in.TraceID,
+		); loadErr != nil {
+		return CanonicalBriefPrepareResult{}, retryableOrNot(loadErr)
+	} else if empty {
+		return CanonicalBriefPrepareResult{
+			BatchID: batchID, Empty: true,
+		}, nil
+	}
+
+	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(
+		ctx, in.UserID, &in.Run)
+	if err != nil {
+		return CanonicalBriefPrepareResult{}, retryableOrNot(err)
+	}
+	if !compiled {
+		return CanonicalBriefPrepareResult{}, nonRetryable(types.NewAppError(
+			types.CodeValidation,
+			"canonical Brief preparation requires compiled runtime", nil))
+	}
+	if a.pushEffectStore == nil {
+		return CanonicalBriefPrepareResult{}, nonRetryable(types.NewAppError(
+			types.CodeConflict,
+			"canonical Brief runtime requires durable push effect authority",
+			nil))
+	}
+	batchID, recoveryOnly, err :=
+		a.compiledStore.CreateOrRecoverPushBatchForTaskRunV1(
+			ctx, expected, in.Run.Snapshot, in.TraceID)
+	if err != nil {
+		return CanonicalBriefPrepareResult{}, retryableOrNot(err)
+	}
+	if recoveryOnly {
+		return CanonicalBriefPrepareResult{}, nonRetryable(types.NewAppError(
+			types.CodeConflict,
+			"canonical Brief stage is missing from a recovered push batch", nil))
+	}
+	scope := types.PushBatchScope{
+		TenantID: expected.TenantID,
+		UserID:   expected.UserID,
+		BatchID:  batchID,
+	}
+	authority, err := a.pushEffectStore.ClaimPushBatchDeliveryAuthority(
+		ctx, scope, types.PushBatchDeliveryAuthorityEffect)
+	if err != nil {
+		return CanonicalBriefPrepareResult{}, retryableOrNot(err)
+	}
+	if authority != types.PushBatchDeliveryAuthorityEffect {
+		return CanonicalBriefPrepareResult{}, nonRetryable(types.NewAppError(
+			types.CodeConflict,
+			"canonical Brief batch did not obtain durable effect authority", nil))
+	}
+
+	frozenSourceIDs := make([]int64, len(snapshot.Definition.Sources))
+	frozenSources := make(
+		map[int64]runcontext.SourceV1, len(snapshot.Definition.Sources))
+	for index, source := range snapshot.Definition.Sources {
+		frozenSourceIDs[index] = source.SourceID
+		frozenSources[source.SourceID] = source
+	}
+	if len(frozenSourceIDs) == 0 {
+		return CanonicalBriefPrepareResult{}, nonRetryable(types.NewAppError(
+			types.CodeValidation,
+			"canonical Brief run has no frozen sources", nil))
+	}
+	plan, err := a.preparePushDeliveries(
+		ctx,
+		PushIn{
+			UserID: in.UserID, ScheduleID: in.Run.TaskID,
+			TraceID: in.TraceID, Cards: in.Cards, Run: &in.Run,
+		},
+		true,
+		expected,
+		batchID,
+		frozenSourceIDs,
+		frozenSources,
+		true,
+		true,
+	)
+	if err != nil {
+		return CanonicalBriefPrepareResult{}, err
+	}
+	if len(plan.orderedDeliveryIDs) == 0 {
+		if err := a.canonicalBriefStore.SealEmptyBriefBatchV1(
+			ctx, expected, in.Run.Snapshot, in.Marker, batchID,
+		); err != nil {
+			return CanonicalBriefPrepareResult{}, retryableOrNot(err)
+		}
+		return CanonicalBriefPrepareResult{
+			BatchID: batchID, Empty: true,
+		}, nil
+	}
+	draft, err := a.canonicalBriefStore.PrepareBriefDraftV1(
+		ctx, expected, in.Run.Snapshot, in.Marker, batchID,
+		in.GeneratedAt, plan.orderedDeliveryIDs)
+	if err != nil {
+		return CanonicalBriefPrepareResult{}, retryableOrNot(err)
+	}
+	return CanonicalBriefPrepareResult{
+		Draft: &draft, BatchID: batchID,
+	}, nil
 }
 
 func (a *Activities) observationRolloutForTask(
@@ -2821,6 +3023,285 @@ type plannedPushChunk struct {
 	cardJSON string
 }
 
+type pushDeliveryPlan struct {
+	orderedDeliveryIDs []int64
+	pending            []pushPendingItem
+	anySent            bool
+	skippedEvents      int
+}
+
+func (a *Activities) preparePushDeliveries(
+	ctx context.Context,
+	in PushIn,
+	compiled bool,
+	compiledIdentity types.RunIdentity,
+	batchID int64,
+	frozenSourceIDs []int64,
+	frozenSources map[int64]runcontext.SourceV1,
+	effectAuthority bool,
+	failClosed bool,
+) (pushDeliveryPlan, error) {
+	var plan pushDeliveryPlan
+	for _, card := range in.Cards {
+		eventKey := card.Scored.Item.ObservationEventKey
+		if compiled && eventKey != "" {
+			if a.observationStore == nil {
+				return pushDeliveryPlan{}, nonRetryable(types.NewAppError(
+					types.CodeInternal,
+					"observation delivery store is not configured", nil))
+			}
+			event, eventErr := observedEventForPush(card.Scored.Item)
+			if eventErr != nil {
+				return pushDeliveryPlan{}, nonRetryable(eventErr)
+			}
+			accepted, reserveErr := a.observationStore.ReserveObservedEventV1(
+				ctx, compiledIdentity, in.Run.Snapshot, batchID, event)
+			if reserveErr != nil {
+				return pushDeliveryPlan{}, retryableOrNot(reserveErr)
+			}
+			if !accepted {
+				plan.skippedEvents++
+				continue
+			}
+		}
+		d := &types.Delivery{
+			BatchID: batchID,
+			UserID:  in.UserID,
+			Score:   card.Scored.Score,
+			BodyMD:  card.BodyMD,
+			Status:  types.DeliveryStatusPending,
+		}
+		if card.Scored.Item.ID != 0 {
+			contentID := card.Scored.Item.ID
+			d.ContentItemID = &contentID
+		}
+		var deliveryID int64
+		var existed, sentAlready bool
+		var insertErr error
+		if compiled {
+			deliveryID, existed, sentAlready, insertErr =
+				a.compiledStore.InsertDeliveryForTaskRunV1(
+					ctx, compiledIdentity, in.Run.Snapshot, in.TraceID, d)
+		} else {
+			deliveryID, existed, sentAlready, insertErr =
+				a.store.InsertDeliveryIdempotent(ctx, d)
+		}
+		if insertErr != nil {
+			if failClosed || compiled && eventKey != "" {
+				return pushDeliveryPlan{}, retryableOrNot(insertErr)
+			}
+			slog.Warn("push: 建投递记录失败，跳过",
+				"trace_id", in.TraceID, "err", insertErr)
+			continue
+		}
+		plan.orderedDeliveryIDs = append(
+			plan.orderedDeliveryIDs, deliveryID)
+		if compiled && eventKey != "" {
+			if err := a.observationStore.BindObservedEventDeliveryV1(
+				ctx, compiledIdentity, in.Run.Snapshot,
+				card.Scored.Item.ObservationPolicyDigest,
+				card.Scored.Item.ObservationEventKey, batchID, deliveryID,
+			); err != nil {
+				return pushDeliveryPlan{}, retryableOrNot(err)
+			}
+		}
+		if existed && sentAlready {
+			if compiled && eventKey != "" && !effectAuthority {
+				if err := a.observationStore.MarkObservedEventDeliveredV1(
+					ctx, compiledIdentity, in.Run.Snapshot, deliveryID,
+				); err != nil {
+					return pushDeliveryPlan{}, retryableOrNot(err)
+				}
+			}
+			plan.anySent = true
+			continue
+		}
+
+		input := feedback.CardInput{
+			BodyMD:      card.BodyMD,
+			DeliveryID:  deliveryID,
+			State:       feedback.CardState{},
+			Title:       card.Scored.Item.Title,
+			Score:       int(card.Scored.Score),
+			URL:         card.Scored.Item.URL,
+			PublishedAt: card.Scored.Item.PublishedAt,
+		}
+		displaySourceID := card.Scored.Item.SourceID
+		if compiled && card.Scored.Item.ID != 0 {
+			if sourceID, ok, sourceErr :=
+				a.compiledStore.SourceForContentFromIDs(
+					ctx, card.Scored.Item.ID, frozenSourceIDs,
+				); sourceErr == nil && ok {
+				displaySourceID = sourceID
+			} else if _, frozen := frozenSources[displaySourceID]; !frozen {
+				displaySourceID = 0
+			}
+		} else if in.ScheduleID != "" && card.Scored.Item.ID != 0 {
+			if sourceID, ok, sourceErr := a.store.ScheduleSourceForContent(
+				ctx, card.Scored.Item.ID, in.ScheduleID,
+			); sourceErr == nil && ok {
+				displaySourceID = sourceID
+			}
+		}
+		if displaySourceID != 0 {
+			if compiled {
+				if source, ok := frozenSources[displaySourceID]; ok {
+					input.SourceTitle = source.Title
+					input.Platform = source.Platform
+				}
+			} else if source, sourceErr :=
+				a.store.GetSource(ctx, displaySourceID); sourceErr == nil {
+				input.SourceTitle = source.Title
+				input.Platform = source.Platform
+			}
+		}
+		plan.pending = append(plan.pending, pushPendingItem{
+			delID: deliveryID, input: input, eventKey: eventKey,
+		})
+	}
+	return plan, nil
+}
+
+func validateCanonicalPushEnvelopeV1(
+	in PushIn,
+	identity types.RunIdentity,
+) error {
+	if in.CanonicalOutcome == nil {
+		if in.CanonicalBrief != nil || in.CanonicalBatchID != 0 {
+			return types.NewAppError(types.CodeValidation,
+				"canonical Brief is missing its outcome marker", nil)
+		}
+		return nil
+	}
+	marker := *in.CanonicalOutcome
+	if in.Run == nil || marker.Validate() != nil ||
+		in.CanonicalBatchID < 0 ||
+		marker.RunSnapshotID != in.Run.Snapshot.SnapshotID ||
+		marker.TenantID != identity.TenantID ||
+		marker.UserID != identity.UserID ||
+		marker.TaskID != identity.TaskID {
+		return types.NewAppError(types.CodeValidation,
+			"canonical push marker differs from exact run", nil)
+	}
+	if in.CanonicalBrief == nil {
+		return nil
+	}
+	draft, err := in.CanonicalBrief.Canonical()
+	if err != nil ||
+		draft.RunOutcomeID != marker.ID ||
+		draft.RunSnapshotID != marker.RunSnapshotID ||
+		(in.CanonicalBatchID > 0 &&
+			draft.PushBatchID != in.CanonicalBatchID) ||
+		draft.TenantID != marker.TenantID ||
+		draft.UserID != marker.UserID ||
+		draft.TaskID != marker.TaskID {
+		return types.NewAppError(types.CodeValidation,
+			"canonical push draft differs from exact outcome", err)
+	}
+	return nil
+}
+
+func validateCanonicalPushPlanV1(
+	in PushIn,
+	identity types.RunIdentity,
+	batchID int64,
+	orderedDeliveryIDs []int64,
+) error {
+	if err := validateCanonicalPushEnvelopeV1(in, identity); err != nil {
+		return err
+	}
+	if in.CanonicalBrief == nil {
+		if len(orderedDeliveryIDs) != 0 {
+			return types.NewAppError(types.CodeConflict,
+				"canonical push has deliveries without a frozen Brief", nil)
+		}
+		return nil
+	}
+	draft, _ := in.CanonicalBrief.Canonical()
+	if draft.PushBatchID != batchID ||
+		len(draft.Insights) != len(orderedDeliveryIDs) {
+		return types.NewAppError(types.CodeConflict,
+			"canonical push delivery set differs from frozen Brief", nil)
+	}
+	for index, deliveryID := range orderedDeliveryIDs {
+		if draft.Insights[index].ID != deliveryID {
+			return types.NewAppError(types.CodeConflict,
+				"canonical push delivery order differs from frozen Brief", nil)
+		}
+	}
+	return nil
+}
+
+func (a *Activities) renderCanonicalBriefShadowV1(
+	draft *types.BriefDraftV1,
+	pending []pushPendingItem,
+	marker string,
+	build func([]pushPendingItem, string) string,
+) (cards []string) {
+	if draft == nil {
+		return nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Warn("canonical Brief shadow renderer panicked",
+				"run_outcome_id", draft.RunOutcomeID)
+			cards = nil
+		}
+	}()
+	byDelivery := make(map[int64]pushPendingItem, len(pending))
+	for _, item := range pending {
+		byDelivery[item.delID] = item
+	}
+	shadow := make([]pushPendingItem, 0, len(draft.Insights))
+	semanticDiffs := 0
+	for _, insight := range draft.Insights {
+		legacy, ok := byDelivery[insight.ID]
+		if !ok {
+			semanticDiffs++
+			continue
+		}
+		canonicalInput := legacy.input
+		canonicalInput.BodyMD = insight.BodyMD
+		canonicalInput.DeliveryID = insight.ID
+		canonicalInput.Title = insight.Title
+		canonicalInput.URL = insight.SourceURL
+		canonicalInput.SourceTitle = insight.SourceTitle
+		canonicalInput.PublishedAt = insight.PublishedAt
+		if canonicalInput.BodyMD != legacy.input.BodyMD ||
+			canonicalInput.Title != legacy.input.Title ||
+			canonicalInput.URL != legacy.input.URL ||
+			canonicalInput.SourceTitle != legacy.input.SourceTitle ||
+			!canonicalBriefTimesEqualV1(
+				canonicalInput.PublishedAt, legacy.input.PublishedAt) {
+			semanticDiffs++
+		}
+		shadow = append(shadow, pushPendingItem{
+			delID: insight.ID, input: canonicalInput,
+			eventKey: legacy.eventKey,
+		})
+	}
+	if semanticDiffs != 0 || len(shadow) != len(pending) {
+		slog.Warn("canonical Brief shadow semantic mismatch",
+			"run_outcome_id", draft.RunOutcomeID,
+			"semantic_diffs", semanticDiffs,
+			"shadow_items", len(shadow),
+			"legacy_items", len(pending))
+	}
+	chunks := planPushChunks(shadow, marker, build)
+	cards = make([]string, len(chunks))
+	for index := range chunks {
+		cards[index] = chunks[index].cardJSON
+	}
+	return cards
+}
+
+func canonicalBriefTimesEqualV1(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
+}
+
 func planPushChunks(
 	pending []pushPendingItem,
 	marker string,
@@ -2846,6 +3327,36 @@ func planPushChunks(
 // 收件人是飞书 owner（M3 单用户）；无 owner 直接失败。单卡推送失败跳过，
 // 只要有一张成功就算 done，全失败则 failed 并返回错误。
 func (a *Activities) Push(ctx context.Context, in PushIn) error {
+	// A v2 nil-draft command is a receipt-only continuation. Preparation
+	// already froze the exact sealed empty batch, so completing it must not
+	// re-read mutable task/member authorization or re-run observation claims.
+	if in.CanonicalOutcome != nil && in.CanonicalBrief == nil &&
+		in.CanonicalBatchID > 0 {
+		if in.Run == nil || a.pushEffectStore == nil {
+			return nonRetryable(types.NewAppError(
+				types.CodeConflict,
+				"canonical empty push receipt is unavailable", nil))
+		}
+		expected, err := activityRunIdentityV1(ctx, in.UserID, in.Run)
+		if err != nil {
+			return nonRetryable(err)
+		}
+		if err := validateCanonicalPushEnvelopeV1(
+			in, expected); err != nil {
+			return nonRetryable(err)
+		}
+		return retryableOrNot(
+			a.pushEffectStore.CompleteEmptyPushEffectBatch(
+				ctx,
+				types.PushBatchScope{
+					TenantID: expected.TenantID,
+					UserID:   expected.UserID,
+					BatchID:  in.CanonicalBatchID,
+				},
+				in.Run.Snapshot.SnapshotID,
+			),
+		)
+	}
 	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
 		return retryableOrNot(err)
@@ -2875,6 +3386,18 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 				"compiled push has no frozen sources", nil))
 		}
 	}
+	if err := validateCanonicalPushEnvelopeV1(
+		in, compiledIdentity); err != nil {
+		return nonRetryable(err)
+	}
+	if in.CanonicalOutcome != nil {
+		if !compiled || a.pushEffectStore == nil {
+			return nonRetryable(types.NewAppError(
+				types.CodeConflict,
+				"canonical push requires durable compiled effect authority",
+				nil))
+		}
+	}
 	// D9 闸门（同 Score/CardGen，bug 狩猎 2026-07-19 HIGH）：卡片不发给已注销
 	// 租户的用户——这是整条管道最后也最用户可见的一道；返回 nil 是正常终态。
 	if !compiled && a.refuseIfTenantGone(ctx, in.UserID, "push") {
@@ -2900,6 +3423,12 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	if err != nil {
 		return err
 	}
+	if in.CanonicalOutcome != nil && in.CanonicalBatchID > 0 &&
+		batchID != in.CanonicalBatchID {
+		return nonRetryable(types.NewAppError(
+			types.CodeConflict,
+			"canonical push batch differs from prepared batch", nil))
+	}
 	effectAuthority := false
 	newEffectSendsEnabled := false
 	if compiled {
@@ -2908,9 +3437,10 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			UserID:   compiledIdentity.UserID,
 			BatchID:  batchID,
 		}
-		effectCanaryEnabled := a.pushEffectStore != nil &&
-			a.pushEffectCanaryTaskID != "" &&
-			a.pushEffectCanaryTaskID == compiledIdentity.TaskID
+		effectCanaryEnabled := in.CanonicalOutcome != nil ||
+			a.pushEffectStore != nil &&
+				a.pushEffectCanaryTaskID != "" &&
+				a.pushEffectCanaryTaskID == compiledIdentity.TaskID
 		desired := types.PushBatchDeliveryAuthorityLegacy
 		if effectCanaryEnabled {
 			desired = types.PushBatchDeliveryAuthorityEffect
@@ -3024,132 +3554,22 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	//
 	// 幂等语义相应调整：先为全部候选建 delivery（幂等），已 sent 的条目不再进新卡
 	// （它们已在上次重试成功发出的那张卡里）；只有存在未发条目时才推一张新聚合卡。
-	anySent := false
 	sentThisAttempt := false
-	var pending []pushPendingItem
-	skippedObservedEvents := 0
-	for _, card := range in.Cards {
-		eventKey := card.Scored.Item.ObservationEventKey
-		if compiled && eventKey != "" {
-			if a.observationStore == nil {
-				return nonRetryable(types.NewAppError(types.CodeInternal,
-					"observation delivery store is not configured", nil))
-			}
-			event, eventErr := observedEventForPush(card.Scored.Item)
-			if eventErr != nil {
-				return nonRetryable(eventErr)
-			}
-			accepted, reserveErr := a.observationStore.ReserveObservedEventV1(
-				ctx, compiledIdentity, in.Run.Snapshot, batchID, event)
-			if reserveErr != nil {
-				return retryableOrNot(reserveErr)
-			}
-			if !accepted {
-				// Another successful or still-live run already owns this exact
-				// task event. It must not create even a pending delivery.
-				skippedObservedEvents++
-				continue
-			}
+	deliveryPlan, err := a.preparePushDeliveries(
+		ctx, in, compiled, compiledIdentity, batchID,
+		frozenSourceIDs, frozenSources, effectAuthority, false)
+	if err != nil {
+		return err
+	}
+	pending := deliveryPlan.pending
+	anySent := deliveryPlan.anySent
+	skippedObservedEvents := deliveryPlan.skippedEvents
+	if in.CanonicalOutcome != nil {
+		if err := validateCanonicalPushPlanV1(
+			in, compiledIdentity, batchID, deliveryPlan.orderedDeliveryIDs,
+		); err != nil {
+			return nonRetryable(err)
 		}
-		d := &types.Delivery{
-			BatchID: batchID,
-			UserID:  in.UserID,
-			Score:   card.Scored.Score,
-			// 解读正文入 body_md；card_json 此时留空（store 归一为 '{}'）——
-			// 最终卡按钮 value 携带 delivery_id，只能在拿到 id 后构造，
-			// 由 MarkDeliverySent 回填（契约 §8.2）。
-			BodyMD: card.BodyMD,
-			Status: types.DeliveryStatusPending,
-		}
-		if card.Scored.Item.ID != 0 {
-			cid := card.Scored.Item.ID
-			d.ContentItemID = &cid
-		}
-		var delID int64
-		var existed, sentAlready bool
-		var ierr error
-		if compiled {
-			delID, existed, sentAlready, ierr = a.compiledStore.InsertDeliveryForTaskRunV1(
-				ctx, compiledIdentity, in.Run.Snapshot, in.TraceID, d)
-		} else {
-			delID, existed, sentAlready, ierr = a.store.InsertDeliveryIdempotent(ctx, d)
-		}
-		if ierr != nil {
-			if compiled && eventKey != "" {
-				// The event reservation is durable. Retrying the activity lets
-				// the same run reuse it; silently skipping would strand it.
-				return retryableOrNot(ierr)
-			}
-			slog.Warn("push: 建投递记录失败，跳过", "trace_id", in.TraceID, "err", ierr)
-			continue
-		}
-		if compiled && card.Scored.Item.ObservationEventKey != "" {
-			if a.observationStore == nil {
-				return nonRetryable(types.NewAppError(types.CodeInternal,
-					"observation delivery store is not configured", nil))
-			}
-			if err := a.observationStore.BindObservedEventDeliveryV1(
-				ctx, compiledIdentity, in.Run.Snapshot,
-				card.Scored.Item.ObservationPolicyDigest,
-				card.Scored.Item.ObservationEventKey, batchID, delID,
-			); err != nil {
-				return retryableOrNot(err)
-			}
-		}
-		if existed && sentAlready {
-			// 重试时该 (batch, content) 已发过：不进新卡，绝不重复推——幂等核心（#1 CRITICAL）。
-			if compiled && eventKey != "" && !effectAuthority {
-				if err := a.observationStore.MarkObservedEventDeliveredV1(
-					ctx, compiledIdentity, in.Run.Snapshot, delID,
-				); err != nil {
-					return retryableOrNot(err)
-				}
-			}
-			anySent = true
-			continue
-		}
-
-		ci := feedback.CardInput{
-			BodyMD:      card.BodyMD,
-			DeliveryID:  delID,
-			State:       feedback.CardState{},
-			Title:       card.Scored.Item.Title,
-			Score:       int(card.Scored.Score),
-			URL:         card.Scored.Item.URL,
-			PublishedAt: card.Scored.Item.PublishedAt,
-		}
-		// 源归属（#8）：legacy 默认用全局首发源，隔离任务再查当前任务命中源。
-		// compiled 运行只在冻结 source 集合里归属，并直接使用快照里的标题/平台；
-		// 任务在运行中改源或源元数据漂移都不能改变这一批卡片。
-		displaySourceID := card.Scored.Item.SourceID
-		if compiled && card.Scored.Item.ID != 0 {
-			if sourceID, ok, sourceErr := a.compiledStore.SourceForContentFromIDs(
-				ctx, card.Scored.Item.ID, frozenSourceIDs,
-			); sourceErr == nil && ok {
-				displaySourceID = sourceID
-			} else if _, frozen := frozenSources[displaySourceID]; !frozen {
-				displaySourceID = 0
-			}
-		} else if in.ScheduleID != "" && card.Scored.Item.ID != 0 {
-			if tsid, ok, terr := a.store.ScheduleSourceForContent(ctx, card.Scored.Item.ID, in.ScheduleID); terr == nil && ok {
-				displaySourceID = tsid
-			}
-		}
-		if displaySourceID != 0 {
-			if compiled {
-				if source, ok := frozenSources[displaySourceID]; ok {
-					ci.SourceTitle = source.Title
-					ci.Platform = source.Platform
-				}
-			} else if src, serr := a.store.GetSource(ctx, displaySourceID); serr == nil {
-				ci.SourceTitle = src.Title
-				ci.Platform = src.Platform
-			}
-		}
-		pending = append(pending, pushPendingItem{
-			delID: delID, input: ci,
-			eventKey: eventKey,
-		})
 	}
 	if len(pending) == 0 && skippedObservedEvents > 0 && !anySent {
 		// A concurrent/prior run already owns every qualified event. This is a
