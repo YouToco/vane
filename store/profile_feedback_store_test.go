@@ -312,7 +312,9 @@ func TestProfileStore(t *testing.T) {
 		); !errors.Is(err, types.ErrConflict) {
 			t.Fatalf("已有画像标签替换必须 fail-closed: %v", err)
 		}
-		return
+		if profileClaimAuthorityInstalled(t, st) {
+			return
+		}
 
 		// 删「乙」→ 入列。
 		p, err = st.UpsertProfileFields(ctx, uRM.ID, nil, nil, []string{"甲", "丙"})

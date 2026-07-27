@@ -245,7 +245,7 @@ func (s *Store) GetContentItem(ctx context.Context, id int64) (*types.ContentIte
   missing/empty tenant/user GUC 必须得到零行或拒写，不能触发 bigint cast 错误。
 - 062 Up 在任何 profile 回填前持有 profiles 的 writer fence 到提交，保证旧 UPDATE/INSERT
   要么先提交并被回填，要么在切换后失败；GET 永远只读，不承担“发现缺 ledger 再补写”。
-  062 Down 先按 producer 顺序对 states→claims→events→receipts 取 ACCESS EXCLUSIVE，
+  062 Down 先按 producer 顺序对 profiles→states→claims→events→receipts 取 ACCESS EXCLUSIVE，
   再做空表 fence，确保未提交 producer 提交后会阻止降级而不是被 DROP。
 - ledger 归属通过 profiles/claim_state 的 NO ACTION 外键固定，不依赖 membership 的
   ON DELETE CASCADE。撤销 membership 只撤访问，不删画像或审计；tenant purge 继续按
