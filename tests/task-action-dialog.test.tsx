@@ -214,6 +214,10 @@ async function draftAction(
     await Promise.resolve();
     await Promise.resolve();
   });
+  await vi.waitFor(() => {
+    expect(apiMock.proposeTaskAction).toHaveBeenCalledTimes(1);
+  });
+  await flushEffects();
 }
 
 describe("TaskActionDialog durable lifecycle", () => {
@@ -461,8 +465,10 @@ describe("TaskActionDialog durable lifecycle", () => {
         await Promise.resolve();
       });
 
-      const persistedBeforeResponse =
-        sessionStorage.getItem(storageKey()) ?? "";
+      await vi.waitFor(() => {
+        expect(sessionStorage.getItem(storageKey()) ?? "").toContain(actionID);
+      });
+      const persistedBeforeResponse = sessionStorage.getItem(storageKey()) ?? "";
       expect(persistedBeforeResponse).toContain(actionID);
       expect(persistedBeforeResponse).not.toContain("Durable proposal");
       await act(async () => first!.unmount());
@@ -525,7 +531,9 @@ describe("TaskActionDialog durable lifecycle", () => {
         />,
       );
     });
-    expect(onComplete).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(onComplete).toHaveBeenCalledTimes(1);
+    });
     await act(async () => first!.unmount());
 
     let second: ReactTestRenderer;
