@@ -3,15 +3,13 @@ import {
   ArrowLeft,
   Loader2,
   ExternalLink,
-  Send,
-  PlayCircle,
-  CircleSlash,
-  Coins,
+  Newspaper,
   Clock,
   Pencil,
   Pause,
   Play,
   Trash2,
+  MoreHorizontal,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -20,6 +18,12 @@ import TaskActionDialog from "@/components/TaskActionDialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Table,
   TableHeader,
@@ -32,7 +36,6 @@ import { api, ApiError } from "../api";
 import type {
   ScheduleDetail,
   ScheduleBatchItem,
-  PipelineCounts,
   ScheduleSourceInfo,
   ObservationPolicy,
   TaskActionStatus,
@@ -40,8 +43,8 @@ import type {
 import { fmt, useI18n, type Dict } from "@/i18n";
 import { fmtBeijing } from "@/lib/time";
 import DeliveriesTable from "@/components/DeliveriesTable";
-import { batchOutcomeLabel, batchOutcomeVariant } from "./TaskDashboard";
 import { SCHEDULE_COMMAND_STORAGE_PREFIX } from "@/lib/task-action-session";
+import { taskRunOutcome, type TaskRunOutcome } from "@/lib/task-detail-presentation";
 import {
   nextRunPresentation,
   taskDefinitionEditEnabled,
@@ -103,23 +106,25 @@ function commandMayHaveReachedServer(error: unknown): boolean {
   );
 }
 
-// 漏斗文本：只列**有记录**的阶段（缺席 = 那一步没跑，api.ts PipelineCounts 注释；
-// 补零会把「没跑」编成「跑了得 0」）。全部缺席 → "—"。
-function funnelText(c: PipelineCounts, d: Dict["app"]["taskDetail"]): string {
-  const stages: [string, number | undefined][] = [
-    [d.stageFetched, c.fetched],
-    [d.stageDeduped, c.deduped],
-    [d.stageScored, c.scored],
-    [d.stageSelected, c.selected],
-    [d.stageCards, c.cards],
-  ];
-  const parts = stages
-    .filter(([, v]) => typeof v === "number")
-    .map(([label, v]) => `${label} ${v}`);
-  return parts.length > 0 ? parts.join(" → ") : "—";
+function runOutcomeLabel(
+  outcome: TaskRunOutcome,
+  d: Dict["app"]["taskDetail"],
+): string {
+  if (outcome === "completed") return d.checkCompleted;
+  if (outcome === "no_important_change") return d.checkNoChange;
+  if (outcome === "not_run") return d.neverRan;
+  return d.checkIncomplete;
 }
 
-// 运行历史 Tab：单任务 push_batches 倒序 + 键集分页。三态齐全，错误≠空。
+function runOutcomeVariant(
+  outcome: TaskRunOutcome,
+): "secondary" | "outline" | "destructive" {
+  if (outcome === "incomplete") return "destructive";
+  return outcome === "completed" ? "secondary" : "outline";
+}
+
+// 运行与诊断：保留检查时间、用户可理解的结果和情报条数；batch id、发送状态、
+// 阶段漏斗等运维对象不进入普通任务页。
 function RunsTab({ scheduleID }: { scheduleID: string }) {
   const { t } = useI18n();
   const D = t.app.taskDetail;
@@ -203,28 +208,22 @@ function RunsTab({ scheduleID }: { scheduleID: string }) {
             <TableRow>
               <TableHead>{D.runsColTime}</TableHead>
               <TableHead>{D.runsColOutcome}</TableHead>
-              <TableHead className="text-right">{D.runsColPushed}</TableHead>
-              <TableHead>{D.runsColFunnel}</TableHead>
+              <TableHead className="text-right">{D.runsColInsights}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {items.map((b) => (
               <TableRow key={b.id} className={b.status === "failed" ? "bg-destructive/5" : ""}>
-                <TableCell className="text-sm whitespace-nowrap" title={`batch ${b.id}`}>
+                <TableCell className="text-sm whitespace-nowrap">
                   {fmtBeijing(b.created_at)}
                 </TableCell>
                 <TableCell>
-                  <Badge variant={batchOutcomeVariant(b.status)}>
-                    {batchOutcomeLabel(b.status, b.exit_gate, t.app.batch)}
+                  <Badge variant={runOutcomeVariant(taskRunOutcome(b.status))}>
+                    {runOutcomeLabel(taskRunOutcome(b.status), D)}
                   </Badge>
                 </TableCell>
                 <TableCell className="text-right font-mono text-sm whitespace-nowrap">
-                  {b.deliveries > 0
-                    ? fmt(D.sentOfDeliveries, { sent: b.sent, total: b.deliveries })
-                    : "—"}
-                </TableCell>
-                <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
-                  {funnelText(b.stage_counts, D)}
+                  {fmt(D.insightCount, { n: b.deliveries })}
                 </TableCell>
               </TableRow>
             ))}
@@ -563,25 +562,14 @@ export default function TaskDetail({
     );
   }
 
-  const { schedule, summary, sources, playbook, cost } = detail;
+  const { schedule, summary, sources, playbook } = detail;
   const editEnabled = taskDefinitionEditEnabled(detail);
   const nextRun = nextRunPresentation(schedule);
   // `observation` is the immutable runtime-policy projection; the alias keeps
   // this first read-only UI useful while older API deployments expose the
   // create-command spelling instead.
   const observation = schedule.scope.observation ?? schedule.scope.observation_policy;
-  const stats = [
-    { icon: Send, label: D.statSent7d, value: String(summary.sent_pushes_7d) },
-    { icon: PlayCircle, label: D.statRuns7d, value: String(summary.batches_7d) },
-    { icon: CircleSlash, label: D.statEmpty7d, value: String(summary.empty_batches_7d) },
-    {
-      icon: Coins,
-      label: D.statLLMCost,
-      value: `$${cost.llm_cost_usd.toFixed(4)}`,
-      sub: fmt(D.llmCalls, { n: cost.llm_calls }),
-      title: D.costNote,
-    },
-  ];
+  const lastOutcome = taskRunOutcome(summary.last_status);
 
   return (
     <div className="space-y-6">
@@ -595,27 +583,81 @@ export default function TaskDetail({
         </a>
         <div className="flex items-start justify-between gap-3 mt-2">
           <h1 className="text-xl font-semibold min-w-0">{schedule.nl_description || schedule.id}</h1>
-          <Badge
-            variant="outline"
-            className={
-              schedule.status === "active"
-                ? "text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-950/30 dark:border-emerald-800"
-                : "text-amber-600 border-amber-200 bg-amber-50 dark:bg-amber-950/30 dark:border-amber-800"
-            }
-          >
-            {schedule.status === "active" ? t.app.tasks.running : t.app.tasks.paused}
-          </Badge>
+          <div className="flex shrink-0 items-center gap-1">
+            <Badge
+              variant="outline"
+              className={
+                schedule.status === "active"
+                  ? "text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-950/30 dark:border-emerald-800"
+                  : "text-amber-600 border-amber-200 bg-amber-50 dark:bg-amber-950/30 dark:border-amber-800"
+              }
+            >
+              {schedule.status === "active" ? t.app.tasks.running : t.app.tasks.paused}
+            </Badge>
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={D.taskMenu}
+                    disabled={command !== ""}
+                  />
+                }
+              >
+                {command ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <MoreHorizontal className="size-4" />
+                )}
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  onClick={() => void runCommand("run")}
+                  disabled={schedule.status !== "active"}
+                >
+                  <Play className="size-4" />
+                  {D.runNow}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() =>
+                    void runCommand(schedule.status === "active" ? "pause" : "resume")
+                  }
+                >
+                  {schedule.status === "active" ? (
+                    <Pause className="size-4" />
+                  ) : (
+                    <Play className="size-4" />
+                  )}
+                  {schedule.status === "active" ? D.pauseTask : D.resumeTask}
+                </DropdownMenuItem>
+                {editEnabled && (
+                  <DropdownMenuItem onClick={() => setShowEdit(true)}>
+                    <Pencil className="size-4" />
+                    {D.editTask}
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem
+                  variant="destructive"
+                  onClick={() => void deleteTask()}
+                >
+                  <Trash2 className="size-4" />
+                  {D.deleteTask}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </div>
         <p className="text-sm text-muted-foreground mt-1">
-          {D.lastRun}{" "}
+          {D.lastCheck}{" "}
           {summary.last_run_at ? (
             <>
               {fmtBeijing(summary.last_run_at)}
               <Badge
-                variant={batchOutcomeVariant(summary.last_status)}
+                variant={runOutcomeVariant(lastOutcome)}
                 className="ml-2 px-1.5 py-0 text-[10px]"
               >
-                {batchOutcomeLabel(summary.last_status, summary.last_exit_gate, t.app.batch)}
+                {runOutcomeLabel(lastOutcome, D)}
               </Badge>
             </>
           ) : (
@@ -635,61 +677,6 @@ export default function TaskDetail({
                   : D.nextRunUnavailable}
           </span>
         </div>
-        <div className="mt-4 flex flex-wrap gap-2">
-          <Button
-            size="sm"
-            onClick={() => void runCommand("run")}
-            disabled={command !== "" || schedule.status !== "active"}
-          >
-            {command === "run" ? (
-              <Loader2 className="size-4 animate-spin" />
-            ) : (
-              <Play className="size-4" />
-            )}
-            {D.runNow}
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() =>
-              void runCommand(schedule.status === "active" ? "pause" : "resume")
-            }
-            disabled={command !== ""}
-          >
-            {command === "pause" || command === "resume" ? (
-              <Loader2 className="size-4 animate-spin" />
-            ) : schedule.status === "active" ? (
-              <Pause className="size-4" />
-            ) : (
-              <Play className="size-4" />
-            )}
-            {schedule.status === "active" ? D.pauseTask : D.resumeTask}
-          </Button>
-          {editEnabled && (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => setShowEdit(true)}
-              disabled={command !== ""}
-            >
-              <Pencil className="size-4" />
-              {D.editTask}
-            </Button>
-          )}
-          <Button
-            size="sm"
-            variant="destructive"
-            onClick={() => void deleteTask()}
-            disabled={command !== ""}
-          >
-            {command === "delete" ? (
-              <Loader2 className="size-4 animate-spin" />
-            ) : (
-              <Trash2 className="size-4" />
-            )}
-            {D.deleteTask}
-          </Button>
-        </div>
         {commandMessage && (
           <Alert className="mt-4">
             <AlertDescription>{commandMessage}</AlertDescription>
@@ -702,22 +689,17 @@ export default function TaskDetail({
         )}
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        {stats.map((s) => (
-          <Card key={s.label} title={s.title}>
-            <CardContent className="p-4 flex items-center gap-3">
-              <s.icon className="size-4 text-muted-foreground shrink-0" />
-              <div className="min-w-0">
-                <div className="text-lg font-semibold leading-tight">{s.value}</div>
-                <div className="text-xs text-muted-foreground truncate">
-                  {s.label}
-                  {s.sub ? ` · ${s.sub}` : ""}
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
+      <Card>
+        <CardContent className="flex items-center gap-3 p-4">
+          <Newspaper className="size-4 shrink-0 text-muted-foreground" />
+          <div>
+            <div className="font-medium">
+              {fmt(D.insights7d, { n: summary.sent_pushes_7d })}
+            </div>
+            <div className="text-xs text-muted-foreground">{D.insights7dDesc}</div>
+          </div>
+        </CardContent>
+      </Card>
 
       <Tabs defaultValue="pushes">
         <TabsList>
@@ -729,6 +711,7 @@ export default function TaskDetail({
         </TabsList>
         <TabsContent value="pushes">
           <DeliveriesTable
+            presentation="task-content"
             fetchPage={(pageSize, pageToken) =>
               api.scheduleDeliveries(scheduleID, pageSize, pageToken)
             }

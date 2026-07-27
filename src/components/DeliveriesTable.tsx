@@ -22,6 +22,7 @@ import {
 import { Loader2, ExternalLink } from "lucide-react";
 import { fmt, useI18n, type Dict } from "@/i18n";
 import { fmtBeijing } from "@/lib/time";
+import { taskContentTimestamp } from "@/lib/task-detail-presentation";
 
 const PAGE_SIZE = 20;
 
@@ -81,13 +82,17 @@ export default function DeliveriesTable({
   fetchPage,
   emptyText,
   onLoadingChange,
+  presentation = "history",
 }: {
   fetchPage: (pageSize: number, pageToken?: string) => Promise<DeliveriesResp>;
   emptyText: string;
   onLoadingChange?: (loading: boolean) => void;
+  presentation?: "history" | "task-content";
 }) {
   const { t } = useI18n();
   const H = t.app.history;
+  const D = t.app.taskDetail;
+  const isTaskContent = presentation === "task-content";
   const FEEDBACK_META = feedbackMeta(H);
   const [items, setItems] = useState<DeliveryHistoryItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -142,6 +147,44 @@ export default function DeliveriesTable({
     }
   }
 
+  function renderFeedbacks(it: DeliveryHistoryItem) {
+    if (it.feedbacks.length === 0) {
+      return <span className="text-muted-foreground">—</span>;
+    }
+    return (
+      <div className="flex flex-wrap gap-1">
+        {it.feedbacks.map((fb, i) => {
+          const meta = FEEDBACK_META[fb.action];
+          const reasonLabel = feedbackReasonLabel(fb.reason_code, H);
+          const tooltipText =
+            fmtBeijing(fb.created_at) +
+            (reasonLabel ? ` · ${reasonLabel}` : "") +
+            (fb.detail ? ` · ${clipDetail(fb.detail)}` : "");
+          return (
+            <Tooltip key={i}>
+              <TooltipTrigger render={<span />}>
+                <Badge variant={meta?.variant ?? "secondary"}>
+                  {reasonLabel ? H.fbIssue : meta?.label ?? fb.action}
+                  {reasonLabel && (
+                    <span className="ml-1 opacity-75">· {reasonLabel}</span>
+                  )}
+                  {meta?.showDetail && fb.detail && (
+                    <span className="ml-1 opacity-75">
+                      {clipDetail(fb.detail, 30)}
+                    </span>
+                  )}
+                </Badge>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p className="max-w-xs">{tooltipText}</p>
+              </TooltipContent>
+            </Tooltip>
+          );
+        })}
+      </div>
+    );
+  }
+
   if (loading) {
     return (
       <Card>
@@ -177,15 +220,51 @@ export default function DeliveriesTable({
         )
       ) : (
         <Card>
-          <div className="overflow-x-auto">
+          {isTaskContent && (
+            <div className="divide-y sm:hidden">
+              {items.map((it) => {
+                const href = safeExternalHref(it.url);
+                return (
+                  <article key={it.id} className="space-y-3 p-4">
+                    <div className="space-y-1">
+                      <time className="block text-xs text-muted-foreground">
+                        {fmtBeijing(taskContentTimestamp(it))}
+                      </time>
+                      {href ? (
+                        <a
+                          href={href}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-start gap-1 text-sm font-medium text-primary hover:underline"
+                        >
+                          <span>{it.title || H.noContent}</span>
+                          <ExternalLink className="mt-0.5 size-3 shrink-0" />
+                        </a>
+                      ) : (
+                        <span className="text-sm text-muted-foreground">
+                          {it.title || H.contentDeleted}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs">{renderFeedbacks(it)}</div>
+                  </article>
+                );
+              })}
+            </div>
+          )}
+          <div className={isTaskContent ? "hidden overflow-x-auto sm:block" : "overflow-x-auto"}>
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>{H.colTime}</TableHead>
-                  <TableHead>{H.colContent}</TableHead>
-                  <TableHead className="text-right">{H.colScore}</TableHead>
-                  <TableHead>{H.colStatus}</TableHead>
-                  <TableHead>{H.colFeedback}</TableHead>
+                  <TableHead>{isTaskContent ? D.contentColTime : H.colTime}</TableHead>
+                  <TableHead>{isTaskContent ? D.contentColContent : H.colContent}</TableHead>
+                  {!isTaskContent && (
+                    <>
+                      <TableHead className="text-right">{H.colScore}</TableHead>
+                      <TableHead>{H.colStatus}</TableHead>
+                    </>
+                  )}
+                  <TableHead>{isTaskContent ? D.contentColFeedback : H.colFeedback}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -194,13 +273,21 @@ export default function DeliveriesTable({
                   return (
                     <TableRow
                       key={it.id}
-                      className={it.status === "failed" ? "bg-destructive/5" : ""}
+                      className={!isTaskContent && it.status === "failed" ? "bg-destructive/5" : ""}
                     >
                       <TableCell
                         className="text-sm whitespace-nowrap"
-                        title={`delivery ${it.id} · batch ${it.batch_id}`}
+                        title={
+                          isTaskContent
+                            ? undefined
+                            : `delivery ${it.id} · batch ${it.batch_id}`
+                        }
                       >
-                        {fmtBeijing(it.sent_at ?? it.created_at)}
+                        {fmtBeijing(
+                          isTaskContent
+                            ? taskContentTimestamp(it)
+                            : it.sent_at ?? it.created_at,
+                        )}
                       </TableCell>
                       <TableCell className="max-w-[200px] truncate">
                         {href ? (
@@ -219,47 +306,18 @@ export default function DeliveriesTable({
                           </span>
                         )}
                       </TableCell>
-                      <TableCell className="text-right font-mono text-sm">
-                        {it.score}
-                      </TableCell>
+                      {!isTaskContent && (
+                        <>
+                          <TableCell className="text-right font-mono text-sm">
+                            {it.score}
+                          </TableCell>
+                          <TableCell>
+                            <Badge variant={statusBadge(it.status)}>{it.status}</Badge>
+                          </TableCell>
+                        </>
+                      )}
                       <TableCell>
-                        <Badge variant={statusBadge(it.status)}>{it.status}</Badge>
-                      </TableCell>
-                      <TableCell>
-                        {it.feedbacks.length === 0 ? (
-                          <span className="text-muted-foreground">—</span>
-                        ) : (
-                          <div className="flex flex-wrap gap-1">
-                            {it.feedbacks.map((fb, i) => {
-                              const meta = FEEDBACK_META[fb.action];
-                              const reasonLabel = feedbackReasonLabel(fb.reason_code, H);
-                              const tooltipText =
-                                fmtBeijing(fb.created_at) +
-                                (reasonLabel ? ` · ${reasonLabel}` : "") +
-                                (fb.detail ? ` · ${clipDetail(fb.detail)}` : "");
-                              return (
-                                <Tooltip key={i}>
-                                  <TooltipTrigger render={<span />}>
-                                    <Badge variant={meta?.variant ?? "secondary"}>
-                                      {reasonLabel ? H.fbIssue : meta?.label ?? fb.action}
-                                      {reasonLabel && (
-                                        <span className="ml-1 opacity-75">· {reasonLabel}</span>
-                                      )}
-                                      {meta?.showDetail && fb.detail && (
-                                        <span className="ml-1 opacity-75">
-                                          {clipDetail(fb.detail, 30)}
-                                        </span>
-                                      )}
-                                    </Badge>
-                                  </TooltipTrigger>
-                                  <TooltipContent>
-                                    <p className="max-w-xs">{tooltipText}</p>
-                                  </TooltipContent>
-                                </Tooltip>
-                              );
-                            })}
-                          </div>
-                        )}
+                        {renderFeedbacks(it)}
                       </TableCell>
                     </TableRow>
                   );
@@ -269,7 +327,10 @@ export default function DeliveriesTable({
           </div>
           <div className="flex items-center justify-between border-t px-4 py-3">
             <span className="text-sm text-muted-foreground">
-              {fmt(H.shown, { shown: items.length, total })}
+              {fmt(isTaskContent ? D.contentShown : H.shown, {
+                shown: items.length,
+                total,
+              })}
             </span>
             {nextToken && (
               <Button

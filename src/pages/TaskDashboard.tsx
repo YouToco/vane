@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Plus, Clock, Loader2, Activity, Send, PlayCircle } from "lucide-react";
+import { Plus, Clock, Loader2, Activity, Newspaper } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +14,7 @@ import type {
 } from "../api";
 import { fmt, useI18n, type Dict } from "@/i18n";
 import { fmtBeijing } from "@/lib/time";
+import { taskRunOutcome } from "@/lib/task-detail-presentation";
 
 // describeSpec 的 i18n 版：用户面所有任务文案都必须随语言走。
 function describeSpecI18n(spec: ScheduleSpec, s: Dict["app"]["schedule"]): string {
@@ -35,30 +36,6 @@ function describeSpecI18n(spec: ScheduleSpec, s: Dict["app"]["schedule"]): strin
     }
   }
   return s.custom;
-}
-
-// 批次结局的用户话术：done/failed/empty + 空批的提前退出闸门。
-// 任务列表「上次运行」与详情页运行历史共用同一词表（t.app.batch）。
-export function batchOutcomeLabel(
-  status: string,
-  exitGate: string,
-  b: Dict["app"]["batch"],
-): string {
-  if (status === "done") return b.done;
-  if (status === "failed") return b.failed;
-  if (status === "empty") {
-    const gate = (b.gate as Record<string, string>)[exitGate];
-    return gate ?? b.empty;
-  }
-  return status;
-}
-
-export function batchOutcomeVariant(
-  status: string,
-): "default" | "secondary" | "outline" | "destructive" {
-  if (status === "failed") return "destructive";
-  if (status === "done") return "default";
-  return "secondary"; // empty：正常终态，不渲染成事故
 }
 
 // 任务卡读的是真实 schedules：schedules.nl_description 本来就是用户当初
@@ -86,7 +63,7 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-// 顶部统计条：三格口径全部来自本页已取的数据（任务列表 + summary 接口），
+// 顶部概览只保留用户关心的任务数和情报数；运行批次等运维指标不进入普通界面。
 // 不另造前端推导值。summary 拉取失败时整条隐藏（下方卡片同样会降级），不显示 0 冒充真值。
 function StatsBar({
   tasks,
@@ -98,19 +75,16 @@ function StatsBar({
   const { t } = useI18n();
   const T = t.app.tasks;
   const active = tasks.filter((x) => x.status === "active").length;
-  let sent7d = 0;
-  let runs7d = 0;
+  let insights7d = 0;
   for (const s of summaries.values()) {
-    sent7d += s.sent_pushes_7d;
-    runs7d += s.batches_7d;
+    insights7d += s.sent_pushes_7d;
   }
   const cells = [
     { icon: Activity, label: T.statActive, value: active },
-    { icon: Send, label: T.statSent7d, value: sent7d },
-    { icon: PlayCircle, label: T.statRuns7d, value: runs7d },
+    { icon: Newspaper, label: T.statInsights7d, value: insights7d },
   ];
   return (
-    <div className="grid grid-cols-3 gap-3">
+    <div className="grid grid-cols-2 gap-3">
       {cells.map((c) => (
         <Card key={c.label}>
           <CardContent className="p-4 flex items-center gap-3">
@@ -129,7 +103,15 @@ function StatsBar({
 function TaskCard({ task, summary }: { task: Schedule; summary?: ScheduleRunSummary }) {
   const { t } = useI18n();
   const T = t.app.tasks;
+  const D = t.app.taskDetail;
   const specText = describeSpecI18n(task.spec, t.app.schedule);
+  const outcome = taskRunOutcome(summary?.last_status ?? "");
+  const outcomeLabel =
+    outcome === "completed"
+      ? D.checkCompleted
+      : outcome === "no_important_change"
+        ? D.checkNoChange
+        : D.checkIncomplete;
   return (
     <a href={`#/tasks/${encodeURIComponent(task.id)}`} className="block">
       <Card className="hover:border-ring/40 transition-colors cursor-pointer">
@@ -141,27 +123,27 @@ function TaskCard({ task, summary }: { task: Schedule; summary?: ScheduleRunSumm
             </div>
             <StatusBadge status={task.status} />
           </div>
-          {/* 密度行：上次运行 + 结局、近 7 天推送、信源数。summary 接口失败/缺行时
+          {/* 密度行：最近检查 + 用户结论、近 7 天情报、来源数。summary 接口失败/缺行时
               整行省略（老数据没有假装成 0 的必要），任务本体信息不受影响。 */}
           {summary && (
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-3 text-xs text-muted-foreground">
               <span className="inline-flex items-center gap-1.5">
-                {T.lastRun}{" "}
+                {T.lastCheck}{" "}
                 {summary.last_run_at ? (
                   <>
                     {fmtBeijing(summary.last_run_at)}
                     <Badge
-                      variant={batchOutcomeVariant(summary.last_status)}
+                      variant={outcome === "incomplete" ? "destructive" : "outline"}
                       className="px-1.5 py-0 text-[10px]"
                     >
-                      {batchOutcomeLabel(summary.last_status, summary.last_exit_gate, t.app.batch)}
+                      {outcomeLabel}
                     </Badge>
                   </>
                 ) : (
                   T.neverRan
                 )}
               </span>
-              <span>{fmt(T.sent7d, { n: summary.sent_pushes_7d })}</span>
+              <span>{fmt(T.insights7d, { n: summary.sent_pushes_7d })}</span>
               <span>{fmt(T.sourceCount, { n: summary.source_count })}</span>
             </div>
           )}
