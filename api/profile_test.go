@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -19,6 +22,115 @@ func newProfileMux(t *testing.T) (*http.ServeMux, *http.Cookie) {
 	deps, cookie := authedDeps(t, Deps{})
 	Mount(mux, deps)
 	return mux, cookie
+}
+
+func TestProfileWritesRejectMalformedRequestsBeforeStore(t *testing.T) {
+	mux, cookie := newProfileMux(t)
+	tests := []struct {
+		name, path, body, key string
+	}{
+		{"missing idempotency", profilePath, `{"expected_updated_at":null,"industry":"AI"}`, ""},
+		{"unknown summary", profilePath, `{"expected_updated_at":null,"summary":"forbidden"}`, "profile-1"},
+		{"removed tags read only", profilePath, `{"expected_updated_at":null,"removed_tags":[]}`, "profile-ro"},
+		{"industry null", profilePath, `{"expected_updated_at":null,"industry":null,"occupation":"x"}`, "profile-null-1"},
+		{"tags null", profilePath, `{"expected_updated_at":null,"tags":null,"occupation":"x"}`, "profile-null-2"},
+		{"duplicate key", profilePath, `{"expected_updated_at":null,"industry":"A","industry":"B"}`, "profile-dup"},
+		{"exact case", profilePath, `{"expected_updated_at":null,"Industry":"A"}`, "profile-case"},
+		{"missing expected", profilePath, `{"industry":"AI"}`, "profile-2"},
+		{"empty patch", profilePath, `{"expected_updated_at":null}`, "profile-3"},
+		{"trailing JSON", profilePath, `{"expected_updated_at":null,"industry":"AI"} {}`, "profile-4"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPatch, tc.path, bytes.NewBufferString(tc.body))
+			r.AddCookie(cookie)
+			if tc.key != "" {
+				r.Header.Set("Idempotency-Key", tc.key)
+			}
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			if strings.Contains(tc.name, "null") &&
+				!strings.Contains(w.Body.String(), "不能为 null") {
+				t.Fatalf("null must be rejected specifically: %s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestProfileHistoryRejectsUnknownQueryAndInvalidUndoID(t *testing.T) {
+	mux, cookie := newProfileMux(t)
+	r := httptest.NewRequest(http.MethodGet, profilePath+"/edits?cursor=secret", nil)
+	r.AddCookie(cookie)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown query status=%d", w.Code)
+	}
+
+	r = httptest.NewRequest(
+		http.MethodPost, profilePath+"/edits/not-an-id/undo",
+		bytes.NewBufferString(`{"expected_updated_at":"2026-07-27T00:00:00Z"}`))
+	r.AddCookie(cookie)
+	r.Header.Set("Idempotency-Key", "undo-invalid")
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid id status=%d", w.Code)
+	}
+}
+
+func TestCanonicalizeProfilePatch(t *testing.T) {
+	industry := "  AI 应用  "
+	occupation := " 独立开发者 "
+	tags := []string{" Go ", "Go", "AI"}
+	got, err := canonicalizeProfilePatch(patchProfileRequest{
+		Industry:   mustProfileRaw(t, industry),
+		Occupation: mustProfileRaw(t, occupation),
+		Tags:       mustProfileRaw(t, tags),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *got.Industry != "AI 应用" || *got.Occupation != "独立开发者" {
+		t.Fatalf("trim failed: %+v", got)
+	}
+	if len(*got.Tags) != 2 || (*got.Tags)[0] != "Go" || (*got.Tags)[1] != "AI" {
+		t.Fatalf("tags=%v", *got.Tags)
+	}
+}
+
+func TestCanonicalizeProfilePatchRejectsInvalidTags(t *testing.T) {
+	for _, tags := range [][]string{
+		{" "}, {"line\nbreak"}, {"tab\tinside"}, {"control\u0001"},
+		{"line\u2028separator"}, {"paragraph\u2029separator"},
+		{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"},
+	} {
+		if _, err := canonicalizeProfilePatch(
+			patchProfileRequest{Tags: mustProfileRaw(t, tags)}); err == nil {
+			t.Fatalf("tags=%q should fail", tags)
+		}
+	}
+	duplicates := []string{
+		"A", " A ", "A", "A", "A", "A", "A",
+		"A", "A", "A", "A", "A", "A",
+	}
+	got, err := canonicalizeProfilePatch(
+		patchProfileRequest{Tags: mustProfileRaw(t, duplicates)})
+	if err != nil || len(*got.Tags) != 1 || (*got.Tags)[0] != "A" {
+		t.Fatalf("dedupe after normalize=%v err=%v", got.Tags, err)
+	}
+}
+
+func mustProfileRaw(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 // TestProfileRequiresSession 验证 GET /api/profile 受会话中间件保护，

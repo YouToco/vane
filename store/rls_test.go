@@ -238,6 +238,7 @@ func TestRLS_PoliciesCoverAllTenantTables(t *testing.T) {
 		"task_definition_edit_operations", "task_definition_edit_receipts",
 		"agent_events", "agent_session_projection_authority_events",
 		"agent_turn_context_snapshots",
+		"profile_edit_revisions", "profile_edit_receipts",
 	}
 	for _, tbl := range want {
 		var enabled bool
