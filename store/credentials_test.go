@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -210,6 +211,7 @@ func TestSessionLifecycle(t *testing.T) {
 	st := tenantTestStore(t)
 	ctx := t.Context()
 	uid := testUser(t, st)
+	attachTenant(t, st, uid)
 	hash := []byte(fmt.Sprintf("hash-%d-abcdefghijklmnopqrstuv", time.Now().UnixNano()))[:32]
 
 	if err := st.CreateSession(ctx, hash, uid, 1, time.Now().Add(time.Hour)); err != nil {
@@ -261,6 +263,37 @@ func TestLookupSession_ExpiredIsInvisible(t *testing.T) {
 	}
 	if n < 1 {
 		t.Errorf("应至少清理 1 条过期会话，实得 %d", n)
+	}
+}
+
+func TestLookupSession_MembershipRevocationIsImmediatelyInvisible(t *testing.T) {
+	st := tenantTestStore(t)
+	ctx := t.Context()
+	uid := testUser(t, st)
+	attachTenant(t, st, uid)
+	hash := []byte(fmt.Sprintf(
+		"revoked-%d-abcdefghijklmnop", time.Now().UnixNano()))[:32]
+	if err := st.CreateSession(
+		ctx, hash, uid, 1, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.LookupSession(ctx, hash); err != nil {
+		t.Fatalf("live member session missing: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`DELETE FROM memberships WHERE tenant_id=1 AND user_id=$1`, uid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.LookupSession(ctx, hash); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("revoked membership kept old session live: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`INSERT INTO memberships(tenant_id,user_id,role) VALUES(1,$1,'owner')`,
+		uid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.LookupSession(ctx, hash); err != nil {
+		t.Fatalf("re-added exact membership did not restore session: %v", err)
 	}
 }
 

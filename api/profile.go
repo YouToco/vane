@@ -29,6 +29,14 @@ type undoProfileRequest struct {
 	ExpectedUpdatedAt json.RawMessage `json:"expected_updated_at"`
 }
 
+type profileClaimActionRequest struct {
+	ExpectedVersion int64  `json:"expected_version"`
+	Action          string `json:"action"`
+	ClaimID         string `json:"claim_id,omitempty"`
+	EventID         string `json:"event_id,omitempty"`
+	Value           string `json:"value,omitempty"`
+}
+
 func (s *server) handleProfile(w http.ResponseWriter, r *http.Request) {
 	p, err := auth.PrincipalFromContext(r.Context())
 	if err != nil {
@@ -173,6 +181,166 @@ func (s *server) handleUndoProfileEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, profile)
+}
+
+func (s *server) handleListProfileClaims(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	for key := range query {
+		if key != "event_limit" && key != "event_cursor" {
+			writeError(w, http.StatusBadRequest, "画像主张查询包含未知参数")
+			return
+		}
+	}
+	options := store.ProfileClaimEventPageOptions{Limit: 20}
+	if values, ok := query["event_limit"]; ok {
+		if len(values) != 1 {
+			writeError(w, http.StatusBadRequest, "event_limit 只能提供一次")
+			return
+		}
+		limit, err := strconv.Atoi(values[0])
+		if err != nil || limit < 1 || limit > 50 {
+			writeError(w, http.StatusBadRequest, "event_limit 必须是 1 到 50")
+			return
+		}
+		options.Limit = limit
+	}
+	if values, ok := query["event_cursor"]; ok {
+		if len(values) != 1 || values[0] == "" {
+			writeError(w, http.StatusBadRequest, "event_cursor 无效")
+			return
+		}
+		options.Cursor = values[0]
+	}
+	principal, err := auth.PrincipalFromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	var result *types.ProfileClaimList
+	if len(query) == 0 {
+		result, err = s.deps.Store.ListProfileClaims(
+			r.Context(), int64(principal.TenantID), principal.UserID)
+	} else {
+		result, err = s.deps.Store.ListProfileClaimsPage(
+			r.Context(), int64(principal.TenantID), principal.UserID, options)
+	}
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) handleProfileClaimAction(w http.ResponseWriter, r *http.Request) {
+	key, ok := scheduleCommandIdempotencyKey(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "缺少或无效的 Idempotency-Key")
+		return
+	}
+	var req profileClaimActionRequest
+	if !decodeProfileClaimActionJSON(w, r, &req) {
+		return
+	}
+	action := types.ProfileClaimAction{
+		ExpectedVersion: req.ExpectedVersion,
+		Action:          strings.TrimSpace(req.Action),
+		Value:           strings.TrimSpace(req.Value),
+	}
+	var err error
+	switch action.Action {
+	case "correct", "suppress", "pin":
+		action.ClaimID, err = strconv.ParseInt(req.ClaimID, 10, 64)
+		if err != nil || action.ClaimID <= 0 || req.EventID != "" {
+			writeError(w, http.StatusBadRequest, "该操作需要合法 claim_id，且不能提供 event_id")
+			return
+		}
+		if action.Action == "correct" {
+			if action.Value == "" || utf8.RuneCountInString(action.Value) > 240 {
+				writeError(w, http.StatusBadRequest, "correct 的 value 必须为 1 到 240 字")
+				return
+			}
+		} else if req.Value != "" {
+			writeError(w, http.StatusBadRequest, "suppress/pin 不能提供 value")
+			return
+		}
+	case "revoke":
+		action.EventID, err = strconv.ParseInt(req.EventID, 10, 64)
+		if err != nil || action.EventID <= 0 || req.ClaimID != "" || req.Value != "" {
+			writeError(w, http.StatusBadRequest, "revoke 只接受合法 event_id")
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, "action 必须是 correct、suppress、pin 或 revoke")
+		return
+	}
+	if action.ExpectedVersion < 0 {
+		writeError(w, http.StatusBadRequest, "expected_version 不能为负数")
+		return
+	}
+	principal, err := auth.PrincipalFromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	digest, err := store.ProfileEditRequestDigest(req)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	result, err := s.deps.Store.ApplyProfileClaimAction(
+		r.Context(), int64(principal.TenantID), principal.UserID,
+		action, key, digest)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func decodeProfileClaimActionJSON(
+	w http.ResponseWriter, r *http.Request, dst *profileClaimActionRequest,
+) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, profileEditBodyLimit)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "画像主张请求体过大或无法读取")
+		return false
+	}
+	keys, err := topLevelJSONKeys(data)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "请求体必须是单一 JSON 对象，且字段不能重复")
+		return false
+	}
+	allowed := map[string]bool{
+		"expected_version": true, "action": true, "claim_id": true,
+		"event_id": true, "value": true,
+	}
+	for key := range keys {
+		if !allowed[key] {
+			writeError(w, http.StatusBadRequest, "请求体包含未知字段")
+			return false
+		}
+	}
+	if _, ok := keys["expected_version"]; !ok {
+		writeError(w, http.StatusBadRequest, "缺少 expected_version")
+		return false
+	}
+	if _, ok := keys["action"]; !ok {
+		writeError(w, http.StatusBadRequest, "缺少 action")
+		return false
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法的画像主张 JSON")
+		return false
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "请求体只能包含一个 JSON 对象")
+		return false
+	}
+	return true
 }
 
 func decodeProfileJSON(w http.ResponseWriter, r *http.Request, dst any) bool {

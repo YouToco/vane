@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -535,7 +536,12 @@ func TestEvolveIntegration(t *testing.T) {
 			`DELETE FROM feedbacks WHERE user_id = ANY($1)`,
 			`DELETE FROM deliveries WHERE user_id = ANY($1)`,
 			`DELETE FROM push_batches WHERE user_id = ANY($1)`,
+			`DELETE FROM profile_claim_receipts WHERE user_id = ANY($1)`,
+			`DELETE FROM profile_claim_events WHERE user_id = ANY($1)`,
+			`DELETE FROM profile_claims WHERE user_id = ANY($1)`,
+			`DELETE FROM profile_claim_states WHERE user_id = ANY($1)`,
 			`DELETE FROM profiles WHERE user_id = ANY($1)`,
+			`DELETE FROM memberships WHERE user_id = ANY($1)`,
 		} {
 			_, _ = conn.Exec(cctx, sql, userIDs)
 		}
@@ -667,11 +673,12 @@ func TestEvolveIntegration(t *testing.T) {
 
 	t.Run("正常演化断言请求与写库", func(t *testing.T) {
 		uid, bid := newUser(t)
-		occ := "后端工程师"
-		if _, err := st.UpsertProfileFields(ctx, uid, nil, &occ, nil); err != nil {
+		ind, occ := "科技", "后端工程师"
+		before, err := st.UpsertProfileFields(
+			ctx, uid, &ind, &occ, []string{"Go"})
+		if err != nil {
 			t.Fatalf("UpsertProfileFields() 失败: %v", err)
 		}
-		before := newProfile(t, uid, []string{"Go"})
 
 		d1 := newDelivery(t, uid, bid, "Go 1.26 发布")
 		addFeedback(t, uid, d1, types.FeedbackActionInterested, "")
@@ -707,7 +714,7 @@ func TestEvolveIntegration(t *testing.T) {
 		user := req.Messages[1].Content
 		for _, want := range []string{
 			"当前画像（行业与职业仅供参考，不可修改）：",
-			"行业：科技", "职业：后端工程师", "标签：Go",
+			"行业：科技", "职业：后端工程师", "标签：无",
 			"反馈：感兴趣", "反馈：不感兴趣", "反馈：追问",
 			"标题：Go 1.26 发布", "标题：美股行情周报",
 			"当时打分：55", "备注：这是啥原理",
@@ -731,6 +738,74 @@ func TestEvolveIntegration(t *testing.T) {
 		}
 		if !got.UpdatedAt.After(before.UpdatedAt) {
 			t.Errorf("演化成功应刷新 updated_at：前 %v，后 %v", before.UpdatedAt, got.UpdatedAt)
+		}
+	})
+
+	t.Run("effective authority 从下一轮 LLM 输入移除污染而保留人工重编译", func(t *testing.T) {
+		uid, bid := newUser(t)
+		newProfile(t, uid, nil)
+		d1 := newDelivery(t, uid, bid, "首轮画像证据")
+		addFeedback(t, uid, d1, types.FeedbackActionInterested, "")
+		up.set(http.StatusOK,
+			`{"summary":"安全事实。污染画像？！","tags":["base"]}`)
+		if err := ev.Evolve(ctx, uid, "trace-authority-seed"); err != nil {
+			t.Fatal(err)
+		}
+		list, err := st.ListProfileClaims(ctx, 1, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimID := func(value string) int64 {
+			t.Helper()
+			for _, claim := range list.Claims {
+				if claim.Field == "summary" && claim.Value == value && claim.Active {
+					id, err := strconv.ParseInt(claim.ID, 10, 64)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return id
+				}
+			}
+			t.Fatalf("active summary claim %q missing: %+v", value, list.Claims)
+			return 0
+		}
+		suppressed, err := st.ApplyProfileClaimAction(
+			ctx, 1, uid,
+			types.ProfileClaimAction{
+				ExpectedVersion: 1, Action: "suppress",
+				ClaimID: claimID("污染画像？"),
+			},
+			"evolver-authority-suppress", strings.Repeat("a", 64),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ApplyProfileClaimAction(
+			ctx, 1, uid,
+			types.ProfileClaimAction{
+				ExpectedVersion: suppressed.Version, Action: "correct",
+				ClaimID: claimID("！"), Value: "已修正！",
+			},
+			"evolver-authority-correct", strings.Repeat("b", 64),
+		); err != nil {
+			t.Fatal(err)
+		}
+		d2 := newDelivery(t, uid, bid, "第二轮画像证据")
+		addFeedback(t, uid, d2, types.FeedbackActionInterested, "")
+		up.set(http.StatusOK, `{"summary":"第二代安全事实。","tags":["base"]}`)
+		if err := ev.Evolve(ctx, uid, "trace-authority-next"); err != nil {
+			t.Fatal(err)
+		}
+		prompt := up.last(t).Messages[1].Content
+		if !strings.Contains(prompt, "安全事实。") ||
+			strings.Contains(prompt, "污染画像") ||
+			strings.Contains(prompt, "已修正！") {
+			t.Fatalf("LLM received polluted/manual authority base:\n%s", prompt)
+		}
+		got := getProfile(t, uid)
+		if strings.Contains(got.Summary, "污染画像") ||
+			!strings.Contains(got.Summary, "已修正！") {
+			t.Fatalf("store did not recompile manual replacement: %q", got.Summary)
 		}
 	})
 
@@ -885,24 +960,24 @@ func TestEvolveIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("删除旧标签守门拒绝且推游标", func(t *testing.T) {
+	t.Run("模型遗漏manual标签仍由store重编译保留", func(t *testing.T) {
 		uid, bid := newUser(t)
 		before := newProfile(t, uid, []string{"Go", "AI"})
 		fid := addFeedback(t, uid, newDelivery(t, uid, bid, "删标签内容"), types.FeedbackActionNotInterested, "")
 
 		up.set(http.StatusOK, `{"summary":"想删掉 AI 标签","tags":["Go"]}`)
 		if err := ev.Evolve(ctx, uid, "trace-del-tag"); err != nil {
-			t.Fatalf("守门拒绝应吞掉返回 nil，实际: %v", err)
+			t.Fatalf("manual authority recompilation failed: %v", err)
 		}
 		got := getProfile(t, uid)
 		if len(got.Tags) != 2 || got.Tags[0] != "Go" || got.Tags[1] != "AI" {
-			t.Errorf("守门拒绝后标签不得变: %v", got.Tags)
+			t.Errorf("模型遗漏删除了 manual 标签: %v", got.Tags)
 		}
-		if got.Summary != before.Summary {
-			t.Errorf("守门拒绝后 summary 不得变: %q", got.Summary)
+		if got.Summary != "想删掉 AI 标签" || !got.UpdatedAt.After(before.UpdatedAt) {
+			t.Errorf("合法 evidence summary 未写入: %+v", got)
 		}
 		if got.LastEvolvedFeedbackID != fid {
-			t.Errorf("守门拒绝应推进游标到 %d，实际 %d", fid, got.LastEvolvedFeedbackID)
+			t.Errorf("演化应推进游标到 %d，实际 %d", fid, got.LastEvolvedFeedbackID)
 		}
 	})
 

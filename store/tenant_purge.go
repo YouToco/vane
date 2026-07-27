@@ -125,6 +125,10 @@ var purgeOrder = []purgeStep{
 	{"subscriptions", "tenant_id = $1"},
 	// HTTP response-loss receipts reference the append-only revision. Both are
 	// tenant evidence and must be removed before the profile/membership roots.
+	{"profile_claim_receipts", "tenant_id = $1"},
+	{"profile_claim_events", "tenant_id = $1"},
+	{"profile_claims", "tenant_id = $1"},
+	{"profile_claim_states", "tenant_id = $1"},
 	{"profile_edit_receipts", "tenant_id = $1"},
 	{"profile_edit_revisions", "tenant_id = $1"},
 	{"profiles", "tenant_id = $1"},

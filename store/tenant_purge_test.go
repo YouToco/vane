@@ -148,16 +148,9 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		t.Fatalf("建租户失败: %v", err)
 	}
 	// 塞一点租户数据，让清理有东西可删。
-	var profileUpdatedAt time.Time
-	if err := st.pool.QueryRow(ctx,
-		`INSERT INTO profiles (user_id, tenant_id, summary)
-		 VALUES ($1, $2, '测试画像') RETURNING updated_at`,
-		u.ID, tn.ID).Scan(&profileUpdatedAt); err != nil {
-		t.Fatalf("建画像失败: %v", err)
-	}
 	occupation := "清理测试职业"
 	if _, err := st.PatchProfile(
-		ctx, tn.ID, u.ID, &profileUpdatedAt,
+		ctx, tn.ID, u.ID, nil,
 		types.ProfileEditPatch{Occupation: &occupation},
 		"purge-profile-"+uuid.NewString(), strings.Repeat("c", 64),
 	); err != nil {
@@ -343,6 +336,10 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 		cleanupExec(c, t, st, `DELETE FROM schedule_commands WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM schedules WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM task_run_snapshots WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM profile_claim_receipts WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM profile_claim_events WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM profile_claims WHERE tenant_id = $1`, tn.ID)
+		cleanupExec(c, t, st, `DELETE FROM profile_claim_states WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM profile_edit_receipts WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM profile_edit_revisions WHERE tenant_id = $1`, tn.ID)
 		cleanupExec(c, t, st, `DELETE FROM profiles WHERE tenant_id = $1`, tn.ID)
@@ -658,17 +655,22 @@ func TestProfileEditAdmissionRootIsTenantScoped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	var userA, userB int64
-	var expectedB time.Time
 	if err := st.pool.QueryRow(ctx,
 		`SELECT user_id FROM profiles WHERE tenant_id=$1`,
 		tenantA).Scan(&userA); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.pool.QueryRow(ctx,
-		`SELECT user_id,updated_at FROM profiles WHERE tenant_id=$1`,
-		tenantB).Scan(&userB, &expectedB); err != nil {
+		`SELECT user_id FROM profiles WHERE tenant_id=$1`,
+		tenantB).Scan(&userB); err != nil {
 		t.Fatal(err)
 	}
+	claimsB, err := st.ListProfileClaims(ctx, tenantB, userB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	occupationB := findClaim(t, claimsB.Claims, "occupation", "清理测试职业", true)
+	occupationBID := parseTestID(t, occupationB.ID)
 	tenantATx, err := st.beginProfileEditWriteTx(ctx, tenantA, userA)
 	if err != nil {
 		t.Fatal(err)
@@ -678,10 +680,16 @@ func TestProfileEditAdmissionRootIsTenantScoped(t *testing.T) {
 	patchDone := make(chan error, 1)
 	industry := "跨租户不应阻塞"
 	go func() {
-		_, err := st.PatchProfile(
-			ctx, tenantB, userB, &expectedB,
-			types.ProfileEditPatch{Industry: &industry},
-			"cross-tenant-root-"+uuid.NewString(), strings.Repeat("f", 64))
+		_, err := st.ApplyProfileClaimAction(
+			ctx, tenantB, userB,
+			types.ProfileClaimAction{
+				ExpectedVersion: claimsB.Version,
+				Action:          "correct",
+				ClaimID:         occupationBID,
+				Value:           industry,
+			},
+			"cross-tenant-root-"+uuid.NewString(), strings.Repeat("f", 64),
+		)
 		patchDone <- err
 	}()
 	select {

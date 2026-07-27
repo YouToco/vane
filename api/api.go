@@ -229,11 +229,14 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	// M7 运行统计端点（功能 6.5）：只读，成本/token/延迟/缓存按 span 聚合。
 	inner.HandleFunc("GET /api/admin/runstats", s.handleRunstats)
 
-	// M7 画像 authority：summary 只读，结构化字段写入使用 CAS + 幂等回执 + 追加审计。
+	// M7 画像 authority：profile 是只读投影；来源级 claim 操作使用
+	// version CAS + 幂等回执 + append-only 补偿事件。
 	inner.HandleFunc("GET /api/profile", s.handleProfile)
 	inner.HandleFunc("PATCH /api/profile", s.handlePatchProfile)
 	inner.HandleFunc("GET /api/profile/edits", s.handleListProfileEdits)
 	inner.HandleFunc("POST /api/profile/edits/{id}/undo", s.handleUndoProfileEdit)
+	inner.HandleFunc("GET /api/profile/claims", s.handleListProfileClaims)
+	inner.HandleFunc("POST /api/profile/claims/actions", s.handleProfileClaimAction)
 
 	// 邀请码管理端点（D4 准入闸门的管理面）：替代 SSH 跑 useradmin invite。
 	// 全部锁 requirePlatformOwner（handler 内第一行，非 owner 404）。

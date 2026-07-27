@@ -82,6 +82,60 @@ func TestProfileHistoryRejectsUnknownQueryAndInvalidUndoID(t *testing.T) {
 	}
 }
 
+func TestProfileClaimActionsRejectMalformedRequestsBeforeStore(t *testing.T) {
+	mux, cookie := newProfileMux(t)
+	path := profilePath + "/claims/actions"
+	tests := []struct {
+		name, body, key string
+	}{
+		{"missing idempotency", `{"expected_version":0,"action":"pin","claim_id":"1"}`, ""},
+		{"missing version", `{"action":"pin","claim_id":"1"}`, "claim-1"},
+		{"unknown action", `{"expected_version":0,"action":"delete","claim_id":"1"}`, "claim-2"},
+		{"summary smuggling", `{"expected_version":0,"action":"pin","claim_id":"1","summary":"x"}`, "claim-3"},
+		{"pin value", `{"expected_version":0,"action":"pin","claim_id":"1","value":"x"}`, "claim-4"},
+		{"correct empty", `{"expected_version":0,"action":"correct","claim_id":"1","value":" "}`, "claim-5"},
+		{"revoke claim", `{"expected_version":0,"action":"revoke","claim_id":"1","event_id":"2"}`, "claim-6"},
+		{"duplicate action", `{"expected_version":0,"action":"pin","action":"suppress","claim_id":"1"}`, "claim-7"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(tc.body))
+			r.AddCookie(cookie)
+			if tc.key != "" {
+				r.Header.Set("Idempotency-Key", tc.key)
+			}
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestProfileClaimsPaginationRejectsInvalidQueryBeforeStore(t *testing.T) {
+	mux, cookie := newProfileMux(t)
+	for _, rawQuery := range []string{
+		"unknown=1",
+		"event_limit=0",
+		"event_limit=51",
+		"event_limit=abc",
+		"event_limit=20&event_limit=21",
+		"event_cursor=",
+		"event_cursor=a&event_cursor=b",
+	} {
+		r := httptest.NewRequest(
+			http.MethodGet, profilePath+"/claims?"+rawQuery, nil)
+		r.AddCookie(cookie)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("query=%q status=%d body=%s",
+				rawQuery, w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestCanonicalizeProfilePatch(t *testing.T) {
 	industry := "  AI 应用  "
 	occupation := " 独立开发者 "

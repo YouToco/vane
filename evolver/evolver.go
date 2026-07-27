@@ -213,10 +213,21 @@ func (e *Evolver) evolve(
 		return e.advanceCursorWithoutLearning(
 			ctx, p, userID, traceID, newCursor, writes)
 	}
+	// profiles.summary/tags are a derived projection and may contain manual
+	// authority. Feed the model only retained non-manual claims; manual
+	// correction/pin/suppress is reapplied by the store compiler after CAS.
+	modelProfile := *p
+	baseSummary, baseTags, err := e.st.GetProfileEvolutionBase(
+		ctx, tenantID, userID)
+	if err != nil {
+		return err
+	}
+	modelProfile.Summary = baseSummary
+	modelProfile.Tags = baseTags
 
 	req := llm.Request{
 		System:      execution.systemPrompt,
-		User:        buildEvolveUser(p, dedupLatest(learningRows)),
+		User:        buildEvolveUser(&modelProfile, dedupLatest(learningRows)),
 		Model:       execution.model,
 		Temperature: f32ptr(execution.temperature),
 		MaxTokens:   iptr(execution.maxTokens),
@@ -256,12 +267,12 @@ func (e *Evolver) evolve(
 		return e.discardBatch(ctx, p, userID, traceID, newCursor, writes, "summary 为空", resp.Content)
 	}
 	summary = promptguard.TruncateRunes(summary, maxSummaryRunes)
-	tags := normalizeTags(out.Tags, p.Tags)
+	tags := normalizeTags(out.Tags, modelProfile.Tags)
 	// 黑名单硬过滤先于守门：加回人工删除的标签是静默丢弃（summary 演化照常落库），
 	// 不是语义失败——为一个被拒标签丢掉整批反馈代价不对称。过滤后再守门，
 	// 新增计数看到的是最终集合。
-	tags = dropRemovedTags(tags, p.Tags, p.RemovedTags, userID, traceID)
-	if reason := checkTagGuard(p.Tags, tags); reason != "" {
+	tags = dropRemovedTags(tags, modelProfile.Tags, p.RemovedTags, userID, traceID)
+	if reason := checkTagGuard(modelProfile.Tags, tags); reason != "" {
 		return e.discardBatch(ctx, p, userID, traceID, newCursor, writes, reason, resp.Content)
 	}
 
