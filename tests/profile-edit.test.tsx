@@ -3,7 +3,6 @@
 import React from "react";
 import {
   cleanup,
-  fireEvent,
   render,
   screen,
   waitFor,
@@ -14,10 +13,11 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 const apiMock = vi.hoisted(() => ({
   profile: vi.fn(),
   profileEdits: vi.fn(),
+  profileClaims: vi.fn(),
   updateProfile: vi.fn(),
   undoProfileEdit: vi.fn(),
+  applyProfileClaimAction: vi.fn(),
 }));
-const i18nState = vi.hoisted(() => ({ desc: "说明" }));
 
 vi.mock("@/api", () => ({
   api: apiMock,
@@ -30,75 +30,108 @@ vi.mock("@/api", () => ({
   },
 }));
 
-vi.mock("@/i18n", () => {
-  const profile = {
-    title: "用户画像",
-    desc: "说明",
-    reload: "重新加载",
-    confirmReload: "确认重新加载",
-    confirmUndoDirty: "确认撤销并放弃草稿",
-    editTitle: "人工修正",
-    industry: "行业",
-    occupation: "职业",
-    notGenerated: "画像尚未生成",
-    tags: "兴趣标签",
-    tagHint: "标签提示",
-    currentTags: "当前兴趣标签",
-    removeTag: "移除标签 {tag}",
-    tagSeparator: "、",
-    emptyValue: "未填写",
-    editChange: "{field}：{before} → {after}",
-    tagPlaceholder: "输入标签",
-    addTag: "添加",
-    updatedAtValue: "更新于 {time}",
-    notSavedYet: "尚未创建画像",
-    discard: "放弃修改",
-    save: "保存修改",
-    saving: "保存中",
-    saveFailed: "保存失败",
-    saved: "画像已更新",
-    conflict: "画像已更新，重新加载后再改。",
-    tooManyTags: "最多12个标签",
-    tagTooLong: "标签 {tag} 太长",
-    invalidTagControl: "标签不能包含控制字符",
-    emptyTag: "标签不能为空",
-    systemExplanation: "系统学习解释",
-    summaryNote: "只读说明",
-    noSummary: "无摘要",
-    removedTags: "人工禁区",
-    removedNote: "禁区只读",
-    noRemovedTags: "无禁区",
-    editHistory: "最近人工修改",
-    kindEdit: "编辑",
-    kindUndo: "撤销记录",
-    loadingHistory: "加载记录",
-    noEdits: "无修改",
-    editAt: "{actor} · {time}",
-    you: "你",
-    noChangeDetails: "无详情",
-    undo: "撤销",
-    undoing: "撤销中",
-    undoFailed: "撤销失败",
-  };
-  return {
-    useI18n: () => ({
-      t: {
-        app: {
-          profile: { ...profile, desc: i18nState.desc },
-          common: { loadFailed: "加载失败" },
-        },
+const copy = {
+  title: "用户画像",
+  desc: "说明",
+  reload: "重新加载",
+  confirmReload: "确认重新加载",
+  confirmUndoDirty: "确认撤销并放弃草稿",
+  confirmClaimDirty: "确认操作依据并放弃草稿",
+  claimsTitle: "画像依据",
+  claimsNote: "依据说明",
+  loadingClaims: "加载画像依据",
+  noClaims: "暂无画像依据",
+  claimFieldTag: "标签",
+  claimFieldSummary: "系统摘要",
+  sourceManual: "人工纠正",
+  sourceUnavailable: "历史数据，原始来源不可用",
+  sourceEvidence: "由反馈演化生成",
+  sourceEvidenceRange: "由反馈演化生成（处理范围 {range}）",
+  claimActive: "生效中",
+  claimInactive: "已失效",
+  claimPinned: "已固定",
+  claimCorrect: "纠正",
+  claimSuppress: "排除",
+  claimPin: "固定",
+  claimCorrectionLabel: "纠正{field}",
+  claimConfirmCorrection: "确认纠正",
+  claimCorrectionHint: "输入一条 1–{limit} 个字符的短判断",
+  claimCorrectionTooLong: "纠正不能超过 {limit}",
+  claimHistory: "依据操作历史",
+  noClaimEvents: "无依据操作",
+  claimKindCorrect: "纠正记录",
+  claimKindSuppress: "排除记录",
+  claimKindPin: "固定记录",
+  claimKindRevoke: "撤销操作记录",
+  claimRevoked: "已撤销",
+  claimRevoke: "撤销此操作",
+  claimActionFailed: "依据操作失败",
+  editTitle: "首次创建画像",
+  industry: "行业",
+  occupation: "职业",
+  notGenerated: "画像尚未生成",
+  tags: "兴趣标签",
+  tagHint: "标签提示",
+  currentTags: "当前兴趣标签",
+  removeTag: "移除标签 {tag}",
+  tagSeparator: "、",
+  emptyValue: "未填写",
+  editChange: "{field}：{before} → {after}",
+  tagPlaceholder: "输入标签",
+  addTag: "添加",
+  updatedAtValue: "更新于 {time}",
+  notSavedYet: "尚未创建画像",
+  discard: "放弃修改",
+  save: "保存修改",
+  saving: "保存中",
+  saveFailed: "保存失败",
+  saved: "画像已更新",
+  conflict: "画像已更新，重新加载后再改。",
+  tooManyTags: "最多12个标签",
+  tagTooLong: "标签 {tag} 太长",
+  invalidTagControl: "标签不能包含控制字符",
+  emptyTag: "标签不能为空",
+  systemExplanation: "系统学习解释",
+  summaryNote: "只读说明",
+  noSummary: "无摘要",
+  removedTags: "人工禁区",
+  removedNote: "禁区只读",
+  noRemovedTags: "无禁区",
+  editHistory: "最近人工修改",
+  legacyEditHistory: "旧版修正记录",
+  legacyEditNote: "旧记录只读",
+  kindEdit: "编辑",
+  kindUndo: "撤销记录",
+  loadingHistory: "加载记录",
+  noEdits: "无修改",
+  editAt: "{actor} · {time}",
+  you: "你",
+  noChangeDetails: "无详情",
+  undo: "撤销",
+  undoing: "撤销中",
+  undoFailed: "撤销失败",
+};
+
+vi.mock("@/i18n", () => ({
+  useI18n: () => ({
+    t: {
+      app: {
+        profile: copy,
+        common: { loadFailed: "加载失败", loadMore: "加载更多" },
       },
-    }),
-    fmt: (template: string, vars: Record<string, string | number>) =>
-      template.replace(/\{(\w+)\}/g, (_: string, key: string) =>
-        String(vars[key] ?? ""),
-      ),
-  };
-});
+    },
+  }),
+  fmt: (template: string, vars: Record<string, string | number>) =>
+    template.replace(/\{(\w+)\}/g, (_: string, key: string) =>
+      String(vars[key] ?? ""),
+    ),
+}));
 
 vi.mock("@/components/ui/card", () => ({
   Card: ({ children }: { children: React.ReactNode }) => <section>{children}</section>,
-  CardContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  CardContent: ({ children, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+    <div {...props}>{children}</div>
+  ),
   CardHeader: ({ children }: { children: React.ReactNode }) => <header>{children}</header>,
   CardTitle: ({ children }: { children: React.ReactNode }) => <h3>{children}</h3>,
 }));
@@ -110,7 +143,9 @@ vi.mock("@/components/ui/badge", () => ({
 }));
 vi.mock("@/components/ui/alert", () => ({
   Alert: (props: React.HTMLAttributes<HTMLDivElement>) => <div {...props} />,
-  AlertDescription: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  AlertDescription: ({ children, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+    <div {...props}>{children}</div>
+  ),
 }));
 vi.mock("@/components/ui/skeleton", () => ({
   Skeleton: () => <span>loading</span>,
@@ -151,10 +186,6 @@ function pageText(): string {
   return document.body.textContent ?? "";
 }
 
-function button(label: string): HTMLButtonElement {
-  return screen.getByRole("button", { name: label }) as HTMLButtonElement;
-}
-
 async function renderLoaded() {
   const user = userEvent.setup();
   const view = render(<Profile />);
@@ -162,178 +193,80 @@ async function renderLoaded() {
   return { user, ...view };
 }
 
+function button(label: string): HTMLButtonElement {
+  return screen.getByRole("button", { name: label }) as HTMLButtonElement;
+}
+
+function claim(
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    id: "claim-1",
+    field: "tag",
+    value: "Agent",
+    source: { state: "evidence" },
+    active: true,
+    pinned: false,
+    created_at: "2026-07-27T01:00:00Z",
+    ...overrides,
+  };
+}
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
 
-describe("profile manual editing", () => {
+describe("profile claim authority UI", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    i18nState.desc = "说明";
     apiMock.profile.mockResolvedValue(baseProfile);
     apiMock.profileEdits.mockResolvedValue({ edits: [] });
-    apiMock.updateProfile.mockResolvedValue({
-      ...baseProfile,
-      industry: "AI 工具",
-      updated_at: "2026-07-27T02:00:00Z",
+    apiMock.profileClaims.mockResolvedValue({
+      version: 3,
+      claims: [],
+      events: [],
     });
-    apiMock.undoProfileEdit.mockResolvedValue(baseProfile);
+    apiMock.updateProfile.mockResolvedValue(baseProfile);
+    apiMock.applyProfileClaimAction.mockResolvedValue({
+      version: 4,
+      event_id: "event-1",
+      profile: baseProfile,
+      claims: [],
+    });
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
 
-  test("sends only changed fields with the current revision and an idempotency key", async () => {
-    const { user } = await renderLoaded();
-    const industry = screen.getByDisplayValue("AI");
-    await user.clear(industry);
-    await user.type(industry, "AI 工具");
-    await user.click(button("保存修改"));
-
-    await waitFor(() =>
-      expect(apiMock.updateProfile).toHaveBeenCalledWith(
-        {
-          expected_updated_at: baseProfile.updated_at,
-          industry: "AI 工具",
-        },
-        expect.stringMatching(/^profile-edit-/),
-      ),
-    );
-    await waitFor(() => expect(apiMock.profile).toHaveBeenCalledTimes(2));
-  });
-
-  test("does not canonicalize untouched legacy fields into an unrelated edit", async () => {
-    apiMock.profile.mockResolvedValue({
-      ...baseProfile,
-      industry: " AI ",
-      occupation: "开发者",
-      tags: [" Agent ", "Agent"],
-    });
-    const { user } = await renderLoaded();
-    const occupation = screen.getByDisplayValue("开发者");
-    await user.clear(occupation);
-    await user.type(occupation, "创始人");
-    await user.click(button("保存修改"));
-
-    await waitFor(() =>
-      expect(apiMock.updateProfile).toHaveBeenCalledWith(
-        {
-          expected_updated_at: baseProfile.updated_at,
-          occupation: "创始人",
-        },
-        expect.stringMatching(/^profile-edit-/),
-      ),
-    );
-  });
-
-  test("treats outer whitespace around a clean scalar as no semantic change", async () => {
-    const { user } = await renderLoaded();
-    const industry = screen.getByDisplayValue("AI");
-    await user.clear(industry);
-    await user.type(industry, " AI ");
-
-    expect(button("保存修改").disabled).toBe(true);
-    expect(apiMock.updateProfile).not.toHaveBeenCalled();
-  });
-
-  test("preserves exact tag spacing and rejects pasted control characters", async () => {
-    const { user } = await renderLoaded();
-    const tagInput = screen.getByPlaceholderText("输入标签");
-    await user.type(tagInput, "machine  learning");
-    await user.tab();
-    await user.click(button("保存修改"));
-    await waitFor(() =>
-      expect(apiMock.updateProfile).toHaveBeenCalledWith(
-        {
-          expected_updated_at: baseProfile.updated_at,
-          tags: ["Agent", "machine  learning"],
-        },
-        expect.stringMatching(/^profile-edit-/),
-      ),
-    );
-
-    apiMock.updateProfile.mockClear();
-    for (const invalid of [
-      "bad\tlabel",
-      "line\u2028separator",
-      "paragraph\u2029separator",
-    ]) {
-      const nextTagInput = screen.getByPlaceholderText(
-        "输入标签",
-      ) as HTMLInputElement;
-      fireEvent.change(nextTagInput, { target: { value: invalid } });
-      expect(pageText()).toContain("标签不能包含控制字符");
-      expect(nextTagInput.getAttribute("aria-invalid")).toBe("true");
-      expect(button("保存修改").disabled).toBe(true);
-    }
-    expect(
-      screen.getByPlaceholderText("输入标签").getAttribute("aria-describedby"),
-    ).toContain("-error");
-    expect(apiMock.updateProfile).not.toHaveBeenCalled();
-  });
-
-  test("distinguishes edit and undo revisions", async () => {
+  test("fails closed: existing profiles have no legacy edit or undo write path", async () => {
     apiMock.profileEdits.mockResolvedValue({
       edits: [
         {
-          id: "undo-1",
-          actor: "self",
-          kind: "undo",
-          created_at: "2026-07-27T03:00:00Z",
-          changes: [],
-          undoable: false,
-        },
-        {
-          id: "edit-1",
+          id: "old-1",
           actor: "self",
           kind: "edit",
-          created_at: "2026-07-27T02:00:00Z",
+          created_at: "2026-07-27T01:00:00Z",
           changes: [],
-          undoable: false,
+          undoable: true,
         },
       ],
     });
     await renderLoaded();
-    expect(pageText()).toContain("撤销记录");
-    expect(pageText()).toContain("编辑");
+
+    expect(pageText()).toContain("旧版修正记录");
+    expect(pageText()).toContain("旧记录只读");
+    expect(screen.queryAllByRole("textbox")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "保存修改" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "撤销" })).toBeNull();
+    expect(apiMock.updateProfile).not.toHaveBeenCalled();
+    expect(apiMock.undoProfileEdit).not.toHaveBeenCalled();
   });
 
-  test("keeps the draft on a 409 and never reloads or overwrites automatically", async () => {
-    apiMock.updateProfile.mockRejectedValue(new ApiError(409, "conflict"));
-    const { user } = await renderLoaded();
-    const industry = screen.getByDisplayValue("AI");
-    await user.clear(industry);
-    await user.type(industry, "机器人");
-    await user.click(button("保存修改"));
-
-    await screen.findByText("画像已更新，重新加载后再改。");
-    expect(screen.getByDisplayValue("机器人")).toBeDefined();
-    expect(apiMock.profile).toHaveBeenCalledTimes(1);
-    expect(apiMock.updateProfile).toHaveBeenCalledTimes(1);
-  });
-
-  test("reuses the idempotency key when retrying the same intent after a network error", async () => {
-    apiMock.updateProfile
-      .mockRejectedValueOnce(new ApiError(0, "offline"))
-      .mockResolvedValueOnce({ ...baseProfile, occupation: "创始人" });
-    const { user } = await renderLoaded();
-    const occupation = screen.getByDisplayValue("独立开发者");
-    await user.clear(occupation);
-    await user.type(occupation, "创始人");
-    await user.click(button("保存修改"));
-    await waitFor(() => expect(apiMock.updateProfile).toHaveBeenCalledTimes(1));
-    const firstKey = apiMock.updateProfile.mock.calls[0]?.[1];
-    await user.click(button("保存修改"));
-
-    await waitFor(() => expect(apiMock.updateProfile).toHaveBeenCalledTimes(2));
-    expect(apiMock.updateProfile.mock.calls[1]?.[1]).toBe(firstKey);
-  });
-
-  test("creates an absent profile with a null compare token", async () => {
-    apiMock.profile.mockRejectedValueOnce(new ApiError(404, "missing"));
+  test("keeps one-time onboarding only when both profile and claims are absent", async () => {
+    apiMock.profile.mockRejectedValue(new ApiError(404, "missing profile"));
+    apiMock.profileClaims.mockRejectedValue(new ApiError(404, "missing claims"));
     const { user } = await renderLoaded();
     expect(pageText()).toContain("画像尚未生成");
-    const industry = screen.getByLabelText("行业");
-    await user.type(industry, "AI");
+    await user.type(screen.getByLabelText("行业"), "AI");
     await user.click(button("保存修改"));
 
     await waitFor(() =>
@@ -342,87 +275,331 @@ describe("profile manual editing", () => {
         expect.stringMatching(/^profile-edit-/),
       ),
     );
+    await waitFor(() => expect(apiMock.profileClaims).toHaveBeenCalledTimes(2));
   });
 
-  test("shows undo only for the server-authorized latest revision", async () => {
-    apiMock.profileEdits.mockResolvedValue({
-      edits: [
-        {
-          id: "latest",
-          actor: "self",
-          kind: "edit",
-          created_at: "2026-07-27T02:00:00Z",
-          changes: [{ field: "industry", before: "AI", after: "机器人" }],
-          undoable: true,
-        },
-        {
-          id: "older",
-          actor: "self",
-          kind: "edit",
-          created_at: "2026-07-27T01:00:00Z",
-          changes: [],
-          undoable: false,
-        },
+  test("treats a legacy backend without pagination fields as a complete first page", async () => {
+    apiMock.profileClaims.mockResolvedValue({
+      version: 2,
+      claims: [claim({ value: "旧后端依据" })],
+      events: [],
+    });
+
+    await renderLoaded();
+
+    expect(pageText()).toContain("旧后端依据");
+    expect(screen.queryByRole("button", { name: "加载更多" })).toBeNull();
+    expect(apiMock.profileClaims).toHaveBeenCalledTimes(1);
+  });
+
+  test("shows honest per-sentence sources and uses active as the action authority", async () => {
+    apiMock.profileClaims.mockResolvedValue({
+      version: 7,
+      claims: [
+        claim({
+          id: "summary-1",
+          field: "summary",
+          value: "偏好短篇分析",
+          source: {
+            state: "evidence",
+            ref_type: "feedback_range",
+            ref: "feedbacks:(4,9]",
+          },
+        }),
+        claim({
+          id: "summary-2",
+          field: "summary",
+          value: "历史污染句",
+          source: { state: "source_unavailable" },
+          active: false,
+        }),
+        claim({
+          id: "tag-1",
+          source: { state: "manual" },
+          active: false,
+        }),
       ],
+      events: [],
     });
     const { user } = await renderLoaded();
-    expect(screen.getAllByRole("button", { name: "撤销" })).toHaveLength(1);
-    await user.click(button("撤销"));
+
+    expect(pageText()).toContain("由反馈演化生成（处理范围 5–9）");
+    expect(pageText()).toContain("历史数据，原始来源不可用");
+    expect(pageText()).toContain("人工纠正");
+    expect(pageText()).toContain("已失效");
+    expect(screen.getAllByRole("button", { name: "纠正" })).toHaveLength(1);
+    await user.click(button("纠正"));
+    const correction = screen.getByDisplayValue(
+      "偏好短篇分析",
+    ) as HTMLInputElement;
+    expect(correction.maxLength).toBe(240);
+    await user.clear(correction);
+    await user.type(correction, "偏好带结论的短篇分析");
+    await user.click(button("确认纠正"));
     await waitFor(() =>
-      expect(apiMock.undoProfileEdit).toHaveBeenCalledWith(
-        "latest",
-        baseProfile.updated_at,
-        expect.stringMatching(/^profile-undo-/),
+      expect(apiMock.applyProfileClaimAction).toHaveBeenCalledWith(
+        {
+          expected_version: 7,
+          action: "correct",
+          claim_id: "summary-1",
+          value: "偏好带结论的短篇分析",
+        },
+        expect.stringMatching(/^profile-claim-/),
       ),
     );
   });
 
-  test("does not undo or drop a pending tag when dirty-discard confirmation is cancelled", async () => {
-    apiMock.profileEdits.mockResolvedValue({
-      edits: [
+  test("sends expected version and random idempotency key, then refreshes", async () => {
+    apiMock.profileClaims.mockResolvedValue({
+      version: 11,
+      claims: [claim({ id: "claim/1" })],
+      events: [],
+    });
+    const { user } = await renderLoaded();
+    await user.click(button("排除"));
+
+    await waitFor(() =>
+      expect(apiMock.applyProfileClaimAction).toHaveBeenCalledWith(
         {
-          id: "latest",
-          actor: "self",
-          kind: "edit",
+          expected_version: 11,
+          action: "suppress",
+          claim_id: "claim/1",
+        },
+        expect.stringMatching(/^profile-claim-/),
+      ),
+    );
+    await waitFor(() => expect(apiMock.profileClaims).toHaveBeenCalledTimes(2));
+  });
+
+  test("keeps rendered claims on 409 and waits for explicit refresh", async () => {
+    apiMock.profileClaims.mockResolvedValue({
+      version: 12,
+      claims: [claim({ field: "industry", value: "机器人" })],
+      events: [],
+    });
+    apiMock.applyProfileClaimAction.mockRejectedValue(new ApiError(409, "conflict"));
+    const { user } = await renderLoaded();
+    await user.click(button("固定"));
+
+    await screen.findByText("画像已更新，重新加载后再改。");
+    expect(pageText()).toContain("机器人");
+    expect(apiMock.profileClaims).toHaveBeenCalledTimes(1);
+    await user.click(
+      screen.getAllByRole("button", { name: "重新加载" })[1],
+    );
+    await waitFor(() => expect(apiMock.profileClaims).toHaveBeenCalledTimes(2));
+  });
+
+  test("offers revoke only for server-revocable events and refreshes afterward", async () => {
+    apiMock.profileClaims.mockResolvedValue({
+      version: 13,
+      claims: [claim({ id: "1", pinned: true, source: { state: "manual" } })],
+      events: [
+        {
+          id: "event/1",
+          kind: "pin",
+          target_claim_id: "1",
           created_at: "2026-07-27T02:00:00Z",
-          changes: [{ field: "industry", before: null, after: "AI" }],
-          undoable: true,
+          revoked: false,
+          revocable: true,
+        },
+        {
+          id: "event/0",
+          kind: "correct",
+          target_claim_id: "1",
+          created_at: "2026-07-27T01:00:00Z",
+          revoked: false,
+          revocable: false,
         },
       ],
     });
     const { user } = await renderLoaded();
-    const tagInput = screen.getByPlaceholderText("输入标签");
-    fireEvent.change(tagInput, { target: { value: "新标签" } });
-    vi.mocked(window.confirm).mockReturnValue(false);
-    await user.click(button("撤销"));
+    expect(
+      screen.getAllByRole("button", { name: "撤销此操作" }),
+    ).toHaveLength(1);
+    await user.click(button("撤销此操作"));
 
-    expect(window.confirm).toHaveBeenCalledWith("确认撤销并放弃草稿");
-    expect(apiMock.undoProfileEdit).not.toHaveBeenCalled();
-    expect(screen.getByDisplayValue("新标签")).toBeDefined();
+    await waitFor(() =>
+      expect(apiMock.applyProfileClaimAction).toHaveBeenCalledWith(
+        {
+          expected_version: 13,
+          action: "revoke",
+          event_id: "event/1",
+        },
+        expect.stringMatching(/^profile-claim-/),
+      ),
+    );
+    await waitFor(() => expect(apiMock.profileClaims).toHaveBeenCalledTimes(2));
   });
 
-  test("asks before a reload would discard a dirty draft", async () => {
+  test("appends and deduplicates an older page, then revokes its hydrated event", async () => {
+    apiMock.profileClaims
+      .mockResolvedValueOnce({
+        version: 21,
+        claims: [claim({ id: "current", value: "当前依据" })],
+        events: [
+          {
+            id: "event-new",
+            kind: "pin",
+            target_claim_id: "current",
+            created_at: "2026-07-27T03:00:00Z",
+            revoked: false,
+            revocable: false,
+          },
+        ],
+        events_has_more: true,
+        events_next_cursor: "cursor/older",
+      })
+      .mockResolvedValueOnce({
+        version: 21,
+        claims: [
+          claim({ id: "current", value: "当前依据（同 ID 更新）" }),
+          claim({
+            id: "old-target",
+            value: "很早以前的依据",
+            active: false,
+            source: { state: "source_unavailable" },
+          }),
+        ],
+        events: [
+          {
+            id: "event-new",
+            kind: "pin",
+            target_claim_id: "current",
+            created_at: "2026-07-27T03:00:00Z",
+            revoked: false,
+            revocable: false,
+          },
+          {
+            id: "event-old",
+            kind: "suppress",
+            target_claim_id: "old-target",
+            created_at: "2026-07-01T03:00:00Z",
+            revoked: false,
+            revocable: true,
+          },
+        ],
+        events_has_more: false,
+      })
+      .mockResolvedValue({
+        version: 22,
+        claims: [claim({ id: "current", value: "撤销后依据" })],
+        events: [],
+        events_has_more: false,
+      });
     const { user } = await renderLoaded();
-    const occupation = screen.getByDisplayValue("独立开发者");
-    await user.clear(occupation);
-    await user.type(occupation, "创始人");
-    vi.mocked(window.confirm).mockReturnValue(false);
-    await user.click(button("重新加载"));
 
-    expect(window.confirm).toHaveBeenCalledWith("确认重新加载");
-    expect(apiMock.profile).toHaveBeenCalledTimes(1);
+    await user.click(button("加载更多"));
+    await waitFor(() =>
+      expect(apiMock.profileClaims).toHaveBeenNthCalledWith(2, "cursor/older"),
+    );
+    expect(screen.getAllByText("固定记录")).toHaveLength(1);
+    expect(screen.getAllByText("排除记录")).toHaveLength(1);
+    expect(screen.getAllByText("当前依据（同 ID 更新）", { exact: true })).toHaveLength(1);
+    expect(pageText()).toContain("历史数据，原始来源不可用");
+    expect(screen.queryByRole("button", { name: "加载更多" })).toBeNull();
+
+    await user.click(button("撤销此操作"));
+    await waitFor(() =>
+      expect(apiMock.applyProfileClaimAction).toHaveBeenCalledWith(
+        {
+          expected_version: 21,
+          action: "revoke",
+          event_id: "event-old",
+        },
+        expect.stringMatching(/^profile-claim-/),
+      ),
+    );
+    await waitFor(() => expect(apiMock.profileClaims).toHaveBeenCalledTimes(3));
+    expect(apiMock.profileClaims).toHaveBeenNthCalledWith(3);
   });
 
-  test("keeps a dirty draft when the locale rerenders the page", async () => {
-    const { user, rerender } = await renderLoaded();
-    const occupation = screen.getByDisplayValue("独立开发者");
-    await user.clear(occupation);
-    await user.type(occupation, "创始人");
-    i18nState.desc = "Localized description";
-    rerender(<Profile />);
+  test("restarts the initial page on an older-page 409 without replaying an action", async () => {
+    apiMock.profileClaims
+      .mockResolvedValueOnce({
+        version: 30,
+        claims: [claim({ id: "stale", value: "旧分页依据" })],
+        events: [],
+        events_has_more: true,
+        events_next_cursor: "stale-cursor",
+      })
+      .mockRejectedValueOnce(new ApiError(409, "stale cursor"))
+      .mockResolvedValueOnce({
+        version: 31,
+        claims: [claim({ id: "fresh", value: "刷新后的依据" })],
+        events: [],
+        events_has_more: false,
+      });
+    const { user } = await renderLoaded();
 
-    await screen.findByText("Localized description");
-    expect(screen.getByDisplayValue("创始人")).toBeDefined();
-    expect(apiMock.profile).toHaveBeenCalledTimes(1);
+    await user.click(button("加载更多"));
+
+    await screen.findByText("画像已更新，重新加载后再改。");
+    await screen.findByText("刷新后的依据");
+    expect(pageText()).not.toContain("旧分页依据");
+    expect(apiMock.profileClaims).toHaveBeenNthCalledWith(2, "stale-cursor");
+    expect(apiMock.profileClaims).toHaveBeenNthCalledWith(3);
+    expect(apiMock.applyProfileClaimAction).not.toHaveBeenCalled();
+  });
+
+  test("renders only the bounded first page of a 1000-event history", async () => {
+    const fullHistoryFixture = Array.from({ length: 1000 }, (_, index) => ({
+      id: `event-${1000 - index}`,
+      kind: "pin",
+      target_claim_id: "claim-1",
+      created_at: `2026-07-${String(27 - (index % 20)).padStart(2, "0")}T02:00:00Z`,
+      revoked: false,
+      revocable: false,
+    }));
+    const firstPage = fullHistoryFixture.slice(0, 20);
+    apiMock.profileClaims.mockResolvedValue({
+      version: 40,
+      claims: [claim()],
+      events: firstPage,
+      events_has_more: true,
+      events_next_cursor: "event-980",
+    });
+
+    await renderLoaded();
+
+    expect(screen.getAllByText("固定记录")).toHaveLength(20);
+    expect(
+      (screen.getByRole("button", { name: "加载更多" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+    expect(apiMock.profileClaims).toHaveBeenCalledTimes(1);
+  });
+
+  test("uses narrow-screen-safe wrapping on claim and history rows", async () => {
+    apiMock.profileClaims.mockResolvedValue({
+      version: 1,
+      claims: [claim({ value: "a".repeat(240) })],
+      events: [
+        {
+          id: "event-1",
+          kind: "pin",
+          target_claim_id: "claim-1",
+          created_at: "2026-07-27T02:00:00Z",
+          revoked: false,
+          revocable: true,
+        },
+      ],
+      events_has_more: true,
+      events_next_cursor: "narrow-cursor",
+    });
+    const { container } = await renderLoaded();
+    const rows = [...container.querySelectorAll("[class]")].filter(
+      (node) => {
+        const className = node.getAttribute("class") ?? "";
+        return (
+          className.includes("min-w-0") &&
+          className.includes("sm:flex-row")
+        );
+      },
+    );
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    expect(container.querySelector(".break-words")).not.toBeNull();
+    expect(button("加载更多").className).toContain("w-full");
+    expect(button("加载更多").className).toContain("sm:w-auto");
   });
 });

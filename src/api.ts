@@ -456,6 +456,75 @@ export interface ProfileEditsResponse {
   edits: ProfileEdit[];
 }
 
+export type ProfileClaimField = "industry" | "occupation" | "tag" | "summary";
+export type ProfileClaimSourceState =
+  | "evidence"
+  | "manual"
+  | "source_unavailable";
+
+export interface ProfileClaimSource {
+  state: ProfileClaimSourceState;
+  ref_type?: string;
+  ref?: string;
+}
+
+export interface ProfileClaim {
+  id: string;
+  field: ProfileClaimField;
+  value: string;
+  source: ProfileClaimSource;
+  supersedes_id?: string;
+  active: boolean;
+  pinned: boolean;
+  created_at: string;
+}
+
+export type ProfileClaimEventKind = "correct" | "suppress" | "pin" | "revoke";
+
+export interface ProfileClaimEvent {
+  id: string;
+  kind: ProfileClaimEventKind;
+  target_claim_id?: string;
+  result_claim_id?: string;
+  created_at: string;
+  revoked: boolean;
+  revocable: boolean;
+}
+
+export interface ProfileClaimsResponse {
+  version: number;
+  claims: ProfileClaim[];
+  events: ProfileClaimEvent[];
+  events_has_more?: boolean;
+  events_next_cursor?: string;
+}
+
+export type ProfileClaimActionRequest =
+  | {
+      expected_version: number;
+      action: "correct";
+      claim_id: string;
+      value: string;
+    }
+  | {
+      expected_version: number;
+      action: "suppress" | "pin";
+      claim_id: string;
+    }
+  | {
+      expected_version: number;
+      action: "revoke";
+      event_id: string;
+    };
+
+export interface ProfileClaimActionResponse {
+  version: number;
+  event_id: string;
+  profile: Profile;
+  claims: ProfileClaim[];
+  claims_complete?: boolean;
+}
+
 // ---- 平台管理：邀请码 ----
 // 字段逐字对齐后端 api/invites.go 的 DTO（vane#104 的接口文档）。这不是
 // types.Invite 直出：used/expired 是**服务端按其口径算好的状态**——
@@ -598,6 +667,27 @@ export function normalizeScheduleDetail(
 // 形状在 api 层收敛一次，页面只面对稳定数组。
 function arr<T>(v: T[] | null | undefined): T[] {
   return v ?? [];
+}
+
+const profileClaimSourceStates = new Set<ProfileClaimSourceState>([
+  "evidence",
+  "manual",
+  "source_unavailable",
+]);
+
+function normalizeProfileClaim(claim: ProfileClaim): ProfileClaim {
+  const sourceState: unknown = claim.source?.state;
+  const source =
+    typeof sourceState === "string" &&
+    profileClaimSourceStates.has(sourceState as ProfileClaimSourceState)
+      ? claim.source
+      : { state: "source_unavailable" as const };
+  return {
+    ...claim,
+    source,
+    active: claim.active === true,
+    pinned: claim.pinned === true,
+  };
 }
 
 // 008 之前的后端不返 stage_counts 这个键，取 b.stage_counts.fetched 会直接抛 TypeError
@@ -830,6 +920,51 @@ export const api = {
       ...p,
       tags: arr(p.tags),
       removed_tags: arr(p.removed_tags),
+    })),
+  // Roll out only after the backend accepts event_limit/event_cursor. The
+  // explicit limit opts this UI into bounded pages while parameterless legacy
+  // callers keep their pre-pagination response during the compatibility window.
+  profileClaims: (eventCursor?: string) =>
+    request<ProfileClaimsResponse>(
+      eventCursor
+        ? `/api/profile/claims?event_limit=20&event_cursor=${encodeURIComponent(eventCursor)}`
+        : "/api/profile/claims?event_limit=20",
+    ).then((r) => ({
+      ...r,
+      claims: arr(r.claims).map(normalizeProfileClaim),
+      events: arr(r.events).map((event) => ({
+        ...event,
+        revoked: event.revoked === true,
+        revocable: event.revocable === true,
+      })),
+      events_has_more:
+        r.events_has_more === true &&
+        typeof r.events_next_cursor === "string" &&
+        r.events_next_cursor.length > 0,
+      events_next_cursor:
+        typeof r.events_next_cursor === "string" && r.events_next_cursor.length > 0
+          ? r.events_next_cursor
+          : undefined,
+    })),
+  applyProfileClaimAction: (
+    input: ProfileClaimActionRequest,
+    idempotencyKey: string,
+  ) =>
+    request<ProfileClaimActionResponse>("/api/profile/claims/actions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(input),
+    }).then((r) => ({
+      ...r,
+      profile: {
+        ...r.profile,
+        tags: arr(r.profile.tags),
+        removed_tags: arr(r.profile.removed_tags),
+      },
+      claims: arr(r.claims).map(normalizeProfileClaim),
     })),
 
   // ---- 平台管理：邀请码（requirePlatformOwner 门控，非 owner 一律 404）----

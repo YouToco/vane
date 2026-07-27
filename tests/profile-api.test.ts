@@ -115,4 +115,167 @@ describe("profile API contract", () => {
       }),
     );
   });
+
+  test("reads claim and event envelopes without inventing server authority", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            version: 4,
+            claims: [
+              {
+                id: "claim-1",
+                field: "tag",
+                value: "Agent",
+                source: { state: "evidence" },
+                active: 1,
+                pinned: false,
+                created_at: "2026-07-27T01:00:00Z",
+              },
+              {
+                id: "claim-2",
+                field: "tag",
+                value: "Future",
+                source: {
+                  state: "future_provenance",
+                  ref_type: "internal",
+                  ref: "must-not-leak",
+                },
+                active: true,
+                pinned: true,
+                created_at: "2026-07-27T01:00:00Z",
+              },
+              {
+                id: "claim-3",
+                field: "tag",
+                value: "Missing",
+                active: true,
+                pinned: false,
+                created_at: "2026-07-27T01:00:00Z",
+              },
+            ],
+            events: [
+              {
+                id: "event-1",
+                kind: "pin",
+                target_claim_id: "claim-1",
+                created_at: "2026-07-27T02:00:00Z",
+                revoked: false,
+                revocable: 1,
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    const result = await api.profileClaims();
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/profile/claims?event_limit=20",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(result).toMatchObject({
+      version: 4,
+      events: [{ id: "event-1", revoked: false, revocable: false }],
+      events_has_more: false,
+    });
+    expect(result.events_next_cursor).toBeUndefined();
+    expect(result.claims[0]).toMatchObject({
+      id: "claim-1",
+      active: false,
+      pinned: false,
+    });
+    expect(result.claims.map((claim) => claim.source)).toEqual([
+      { state: "evidence" },
+      { state: "source_unavailable" },
+      { state: "source_unavailable" },
+    ]);
+  });
+
+  test("loads an older event page with an encoded opaque cursor", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          version: 4,
+          claims: [],
+          events: [],
+          events_has_more: true,
+          events_next_cursor: "v1:/older page",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.profileClaims("v1:/current page");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/profile/claims?event_limit=20&event_cursor=v1%3A%2Fcurrent%20page",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(result).toMatchObject({
+      events_has_more: true,
+      events_next_cursor: "v1:/older page",
+    });
+  });
+
+  test("claim actions carry CAS, exact body, and the supplied idempotency key", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          version: 5,
+          event_id: "event-2",
+          profile,
+          claims_complete: false,
+          claims: [
+            {
+              id: "claim-2",
+              field: "industry",
+              value: "AI",
+              source: { state: "new_backend_state", ref: "private-ref" },
+              active: true,
+              pinned: false,
+              created_at: "2026-07-27T01:00:00Z",
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.applyProfileClaimAction(
+      {
+        expected_version: 4,
+        action: "correct",
+        claim_id: "claim/1",
+        value: "Founder",
+      },
+      "profile-claim-123",
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/profile/claims/actions",
+      expect.objectContaining({
+        credentials: "include",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "profile-claim-123",
+        },
+        body: JSON.stringify({
+          expected_version: 4,
+          action: "correct",
+          claim_id: "claim/1",
+          value: "Founder",
+        }),
+      }),
+    );
+    expect(result.claims[0]?.source).toEqual({
+      state: "source_unavailable",
+    });
+    expect(result.claims_complete).toBe(false);
+  });
 });
