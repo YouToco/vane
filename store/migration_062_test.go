@@ -1,21 +1,21 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"io/fs"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pressly/goose/v3"
+
+	"github.com/YouToco/vane/types"
 )
 
-func TestMigration062DowngradeFailsClosedWithLedger(t *testing.T) {
-	freshURL := freshMigrationDatabase(t, "vane_profile_claim_062")
-	db, err := sql.Open("pgx", freshURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+func migration062Provider(t *testing.T, db *sql.DB) *goose.Provider {
+	t.Helper()
 	dir, err := fs.Sub(migrationsFS, "migrations")
 	if err != nil {
 		t.Fatal(err)
@@ -24,6 +24,17 @@ func TestMigration062DowngradeFailsClosedWithLedger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return provider
+}
+
+func TestMigration062DowngradeFailsClosedWithLedger(t *testing.T) {
+	freshURL := freshMigrationDatabase(t, "vane_profile_claim_062")
+	db, err := sql.Open("pgx", freshURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	provider := migration062Provider(t, db)
 	if _, err := provider.UpTo(t.Context(), 60); err != nil {
 		t.Fatalf("migrate to 060: %v", err)
 	}
@@ -41,7 +52,7 @@ func TestMigration062DowngradeFailsClosedWithLedger(t *testing.T) {
 	if _, err := db.ExecContext(t.Context(),
 		`INSERT INTO profiles(tenant_id,user_id,industry,tags,summary)
 		 VALUES (1,$1,'AI',ARRAY['safe'],$2)`,
-		userID, strings.Repeat("历史句子。", 100)); err != nil {
+		userID, "安全事实。污染画像？！"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := provider.UpTo(t.Context(), 62); err != nil {
@@ -66,9 +77,56 @@ func TestMigration062DowngradeFailsClosedWithLedger(t *testing.T) {
 	).Scan(&summaryClaims, &maxSummaryRunes); err != nil {
 		t.Fatal(err)
 	}
-	if summaryClaims < 2 || maxSummaryRunes > 240 {
+	if summaryClaims != 3 || maxSummaryRunes > 240 {
 		t.Fatalf("summary backfill claims=%d max_runes=%d",
 			summaryClaims, maxSummaryRunes)
+	}
+	st, err := New(t.Context(), freshURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, st)
+	list, err := st.ListProfileClaims(t.Context(), 1, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	polluted := findClaim(t, list.Claims, "summary", "污染画像？", true)
+	bang := findClaim(t, list.Claims, "summary", "！", true)
+	suppressed, err := st.ApplyProfileClaimAction(
+		t.Context(), 1, userID,
+		types.ProfileClaimAction{
+			ExpectedVersion: 0, Action: "suppress",
+			ClaimID: parseTestID(t, polluted.ID),
+		},
+		"migration-suppress", strings.Repeat("a", 64),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrected, err := st.ApplyProfileClaimAction(
+		t.Context(), 1, userID,
+		types.ProfileClaimAction{
+			ExpectedVersion: suppressed.Version, Action: "correct",
+			ClaimID: parseTestID(t, bang.ID), Value: "已修正！",
+		},
+		"migration-correct", strings.Repeat("b", 64),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EvolveProfile(
+		t.Context(), userID, "新增事实。污染画像？！", []string{"safe"},
+		10, corrected.Profile.UpdatedAt, 0,
+	); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := st.GetProfileForTenant(t.Context(), 1, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(profile.Summary, "污染画像") ||
+		!strings.Contains(profile.Summary, "已修正！") {
+		t.Fatalf("migration claim split mismatch revived pollution: %q", profile.Summary)
 	}
 	if _, err := provider.Down(t.Context()); err == nil ||
 		!strings.Contains(err.Error(), "refusing to drop non-empty profile claim authority ledger") {
@@ -82,6 +140,194 @@ func TestMigration062DowngradeFailsClosedWithLedger(t *testing.T) {
 	}
 	if version != 62 {
 		t.Fatalf("failed Down changed version=%d", version)
+	}
+}
+
+func TestMigration062BackfillFencesConcurrentLegacyProfileWrites(t *testing.T) {
+	dbURL := freshMigrationDatabase(t, "vane_profile_claim_up_fence")
+	db, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxOpenConns(8)
+	provider := migration062Provider(t, db)
+	if _, err := provider.UpTo(t.Context(), 60); err != nil {
+		t.Fatal(err)
+	}
+	var updateUser, createUser int64
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users(feishu_open_id,name)
+		VALUES ('claim-up-update','update') RETURNING id`,
+	).Scan(&updateUser); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users(feishu_open_id,name)
+		VALUES ('claim-up-create','create') RETURNING id`,
+	).Scan(&createUser); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO memberships(tenant_id,user_id,role)
+		VALUES (1,$1,'owner'),(1,$2,'member')`,
+		updateUser, createUser); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO profiles(tenant_id,user_id,industry)
+		VALUES (1,$1,'before')`, updateUser); err != nil {
+		t.Fatal(err)
+	}
+	beginLegacy := func(userID int64) *sql.Tx {
+		t.Helper()
+		tx, err := db.BeginTx(t.Context(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(t.Context(), `
+			SELECT set_config('app.tenant_id','1',true),
+			       set_config('app.user_id',$1,true)`,
+			strconv.FormatInt(userID, 10)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(t.Context(),
+			`SET LOCAL ROLE vane_profile_editor`); err != nil {
+			t.Fatal(err)
+		}
+		return tx
+	}
+	updateTx := beginLegacy(updateUser)
+	if _, err := updateTx.ExecContext(t.Context(), `
+		UPDATE profiles SET industry='late-update',updated_at=clock_timestamp()
+		 WHERE tenant_id=1 AND user_id=$1`, updateUser); err != nil {
+		t.Fatal(err)
+	}
+	createTx := beginLegacy(createUser)
+	if _, err := createTx.ExecContext(t.Context(), `
+		INSERT INTO profiles(tenant_id,user_id,industry,updated_at)
+		VALUES (1,$1,'late-create',clock_timestamp())`, createUser); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated := make(chan error, 1)
+	go func() {
+		_, err := provider.UpTo(context.Background(), 62)
+		migrated <- err
+	}()
+	select {
+	case err := <-migrated:
+		t.Fatalf("062 did not wait for in-flight legacy writers: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := updateTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := createTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-migrated:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("062 migration remained blocked after legacy commits")
+	}
+	for userID, want := range map[int64]string{
+		updateUser: "late-update",
+		createUser: "late-create",
+	} {
+		var profileValue, claimValue string
+		if err := db.QueryRowContext(t.Context(),
+			`SELECT industry FROM profiles WHERE user_id=$1`, userID,
+		).Scan(&profileValue); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRowContext(t.Context(), `
+			SELECT claim_value FROM profile_claims
+			 WHERE user_id=$1 AND field_name='industry'`, userID,
+		).Scan(&claimValue); err != nil {
+			t.Fatal(err)
+		}
+		if profileValue != want || claimValue != want {
+			t.Fatalf("profile/ledger fork user=%d profile=%q claim=%q want=%q",
+				userID, profileValue, claimValue, want)
+		}
+	}
+}
+
+func TestMigration062DownWaitsForUncommittedProducer(t *testing.T) {
+	dbURL := freshMigrationDatabase(t, "vane_profile_claim_down_fence")
+	db, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxOpenConns(6)
+	provider := migration062Provider(t, db)
+	if _, err := provider.UpTo(t.Context(), 62); err != nil {
+		t.Fatal(err)
+	}
+	var userID int64
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users(feishu_open_id,name)
+		VALUES ('claim-down-producer','producer') RETURNING id`,
+	).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO memberships(tenant_id,user_id,role)
+		VALUES(1,$1,'owner')`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO profiles(tenant_id,user_id) VALUES(1,$1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	producer, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := producer.ExecContext(t.Context(), `
+		INSERT INTO profile_claim_states(tenant_id,user_id) VALUES(1,$1)`,
+		userID); err != nil {
+		t.Fatal(err)
+	}
+	down := make(chan error, 1)
+	go func() {
+		_, err := provider.Down(context.Background())
+		down <- err
+	}()
+	select {
+	case err := <-down:
+		t.Fatalf("062 Down did not wait for producer: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := producer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-down:
+		if err == nil || !strings.Contains(
+			err.Error(), "refusing to drop non-empty profile claim authority ledger") {
+			t.Fatalf("Down deleted committed producer fact: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("062 Down remained blocked after producer commit")
+	}
+	var states, version int64
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM profile_claim_states`).Scan(&states); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT max(version_id) FROM goose_db_version WHERE is_applied`,
+	).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if states != 1 || version != 62 {
+		t.Fatalf("Down lost producer state=%d version=%d", states, version)
 	}
 }
 

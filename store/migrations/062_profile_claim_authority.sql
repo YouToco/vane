@@ -5,6 +5,14 @@
 
 -- +goose Up
 
+-- Fence every legacy profiles writer before taking the backfill snapshot.
+-- SHARE ROW EXCLUSIVE blocks INSERT/UPDATE/DELETE (ROW EXCLUSIVE) while still
+-- allowing the read surface to remain available, and is held to commit.
+LOCK TABLE profiles IN SHARE ROW EXCLUSIVE MODE;
+
+ALTER TABLE profiles
+    ADD CONSTRAINT uq_profiles_tenant_user UNIQUE (tenant_id,user_id);
+
 CREATE TABLE profile_claim_states (
     tenant_id          BIGINT      NOT NULL,
     user_id            BIGINT      NOT NULL,
@@ -15,9 +23,9 @@ CREATE TABLE profile_claim_states (
     PRIMARY KEY (tenant_id, user_id),
     CONSTRAINT ck_profile_claim_state_version CHECK (version >= 0),
     CONSTRAINT ck_profile_claim_state_generation CHECK (evidence_generation >= 0),
-    CONSTRAINT fk_profile_claim_state_membership
+    CONSTRAINT fk_profile_claim_state_profile
         FOREIGN KEY (tenant_id, user_id)
-        REFERENCES memberships (tenant_id, user_id) ON DELETE CASCADE
+        REFERENCES profiles (tenant_id, user_id)
 );
 
 CREATE TABLE profile_claims (
@@ -52,9 +60,9 @@ CREATE TABLE profile_claims (
           CASE WHEN field_name='summary' THEN 240 ELSE 4000 END
     ),
     CONSTRAINT uq_profile_claim_scope UNIQUE (tenant_id, user_id, id),
-    CONSTRAINT fk_profile_claim_membership
+    CONSTRAINT fk_profile_claim_state
         FOREIGN KEY (tenant_id, user_id)
-        REFERENCES memberships (tenant_id, user_id) ON DELETE CASCADE,
+        REFERENCES profile_claim_states (tenant_id, user_id),
     CONSTRAINT fk_profile_claim_supersedes_scope
         FOREIGN KEY (tenant_id, user_id, supersedes_claim_id)
         REFERENCES profile_claims (tenant_id, user_id, id)
@@ -92,9 +100,9 @@ CREATE TABLE profile_claim_events (
     CONSTRAINT ck_profile_claim_event_versions
         CHECK (expected_version >= 0 AND result_version=expected_version+1),
     CONSTRAINT uq_profile_claim_event_scope UNIQUE (tenant_id, user_id, id),
-    CONSTRAINT fk_profile_claim_event_membership
+    CONSTRAINT fk_profile_claim_event_state
         FOREIGN KEY (tenant_id, user_id)
-        REFERENCES memberships (tenant_id, user_id) ON DELETE CASCADE,
+        REFERENCES profile_claim_states (tenant_id, user_id),
     CONSTRAINT fk_profile_claim_event_target_claim_scope
         FOREIGN KEY (tenant_id, user_id, target_claim_id)
         REFERENCES profile_claims (tenant_id, user_id, id),
@@ -127,9 +135,9 @@ CREATE TABLE profile_claim_receipts (
         CHECK (request_digest ~ '^[0-9a-f]{64}$'),
     CONSTRAINT ck_profile_claim_receipt_response
         CHECK (jsonb_typeof(response_payload)='object'),
-    CONSTRAINT fk_profile_claim_receipt_membership
+    CONSTRAINT fk_profile_claim_receipt_state
         FOREIGN KEY (tenant_id, user_id)
-        REFERENCES memberships (tenant_id, user_id) ON DELETE CASCADE,
+        REFERENCES profile_claim_states (tenant_id, user_id),
     CONSTRAINT fk_profile_claim_receipt_event_scope
         FOREIGN KEY (tenant_id, user_id, event_id)
         REFERENCES profile_claim_events (tenant_id, user_id, id)
@@ -148,17 +156,63 @@ SELECT tenant_id,user_id,'occupation',occupation,'source_unavailable'
   FROM profiles WHERE occupation<>''
 UNION ALL
 SELECT p.tenant_id,p.user_id,'tag',t,'source_unavailable'
-  FROM profiles p CROSS JOIN LATERAL unnest(p.tags) t
-UNION ALL
-SELECT p.tenant_id,p.user_id,'summary',
-       substring(part FROM pos FOR 240),'source_unavailable'
-  FROM profiles p
-  CROSS JOIN LATERAL regexp_matches(
-      p.summary,'[^。！？!?；;\n.]+[。！？!?；;\n.]*','g'
-  ) match
-  CROSS JOIN LATERAL (SELECT btrim(match[1]) AS part) normalized
-  CROSS JOIN LATERAL generate_series(1,char_length(part),240) pos
- WHERE p.summary<>'' AND part<>'';
+  FROM profiles p CROSS JOIN LATERAL unnest(p.tags) t;
+
+-- Keep migration backfill byte-for-byte aligned with splitSummaryClaims:
+-- trim the whole string, consume one Unicode character at a time, flush after
+-- every delimiter (including consecutive punctuation) or 240 runes, and trim
+-- each emitted piece.
+WITH RECURSIVE inputs AS (
+    SELECT tenant_id,user_id,
+           regexp_replace(
+             regexp_replace(summary,'^[[:space:]]+','','g'),
+             '[[:space:]]+$','','g'
+           ) AS summary
+      FROM profiles
+     WHERE summary<>''
+), split AS (
+    SELECT tenant_id,user_id,summary,0 AS pos,char_length(summary) AS total,
+           ''::text AS current,0 AS current_len,NULL::text AS emitted
+      FROM inputs
+     WHERE summary<>''
+    UNION ALL
+    SELECT tenant_id,user_id,summary,pos+1,total,
+           CASE WHEN current_len+1=240 OR ch IN
+                     ('。','！','？','!','?','；',';',E'\n','.')
+                THEN '' ELSE current||ch END,
+           CASE WHEN current_len+1=240 OR ch IN
+                     ('。','！','？','!','?','；',';',E'\n','.')
+                THEN 0 ELSE current_len+1 END,
+           CASE WHEN current_len+1=240 OR ch IN
+                     ('。','！','？','!','?','；',';',E'\n','.')
+                THEN regexp_replace(
+                       regexp_replace(current||ch,'^[[:space:]]+','','g'),
+                       '[[:space:]]+$','','g'
+                     )
+                ELSE NULL END
+      FROM split
+      CROSS JOIN LATERAL (
+        SELECT substring(summary FROM pos+1 FOR 1) AS ch
+      ) next_char
+     WHERE pos<total
+), pieces AS (
+    SELECT tenant_id,user_id,pos AS end_pos,emitted AS value
+      FROM split WHERE emitted IS NOT NULL AND emitted<>''
+    UNION ALL
+    SELECT tenant_id,user_id,pos AS end_pos,
+           regexp_replace(
+             regexp_replace(current,'^[[:space:]]+','','g'),
+             '[[:space:]]+$','','g'
+           ) AS value
+      FROM split
+     WHERE pos=total AND current<>''
+)
+INSERT INTO profile_claims
+    (tenant_id,user_id,field_name,claim_value,source_state)
+SELECT tenant_id,user_id,'summary',value,'source_unavailable'
+  FROM pieces
+ WHERE value<>''
+ ORDER BY tenant_id,user_id,end_pos;
 
 -- 独立 claim authority：不能扩张 060 vane_profile_editor 的 summary 只读边界。
 -- +goose StatementBegin
@@ -343,6 +397,14 @@ CREATE POLICY profile_claim_editor_identity ON memberships AS RESTRICTIVE
 
 -- +goose Down
 
+-- Acquire producer tables in the same order as writers before checking
+-- emptiness. A concurrent uncommitted producer must finish first; its commit
+-- then becomes visible to the fence and prevents destructive downgrade.
+LOCK TABLE profile_claim_states IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE profile_claims IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE profile_claim_events IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE profile_claim_receipts IN ACCESS EXCLUSIVE MODE;
+
 -- +goose StatementBegin
 DO $$
 BEGIN
@@ -360,6 +422,7 @@ DROP TABLE profile_claim_receipts;
 DROP TABLE profile_claim_events;
 DROP TABLE profile_claims;
 DROP TABLE profile_claim_states;
+ALTER TABLE profiles DROP CONSTRAINT uq_profiles_tenant_user;
 DROP POLICY IF EXISTS profile_claim_editor_identity ON profiles;
 DROP POLICY IF EXISTS profile_claim_editor_identity ON memberships;
 ALTER POLICY tenant_isolation ON profiles

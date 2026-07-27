@@ -80,12 +80,20 @@ func (s *Store) UpsertProfileFields(ctx context.Context, userID int64, industry,
 	if len(tags) > maxProfileTags {
 		tags = tags[:maxProfileTags]
 	}
-	var tenantID int64
+	var tenantID, membershipCount int64
 	if err := s.pool.QueryRow(ctx,
-		`SELECT m.tenant_id FROM memberships m WHERE m.user_id=$1`,
-		userID).Scan(&tenantID); err != nil {
+		`SELECT COALESCE(min(tenant_id),0),count(*)
+		   FROM memberships WHERE user_id=$1`,
+		userID).Scan(&tenantID, &membershipCount); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("解析画像租户（user=%d）", userID), err)
+	}
+	if membershipCount == 0 {
+		return nil, types.NewAppError(types.CodeNotFound, "用户没有可用租户 membership", nil)
+	}
+	if membershipCount != 1 {
+		return nil, types.NewAppError(
+			types.CodeConflict, "用户存在多个租户 membership，旧画像首采入口拒绝猜测归属", nil)
 	}
 	tx, err := s.beginTx(ctx, pgx.TxOptions{})
 	if err != nil {

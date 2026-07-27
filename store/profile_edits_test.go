@@ -38,6 +38,10 @@ func TestProfileManualAuthority(t *testing.T) {
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claim_receipts WHERE user_id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claim_events WHERE user_id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claims WHERE user_id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claim_states WHERE user_id=$1`, u.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM profile_edit_receipts WHERE user_id=$1`, u.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM profile_edit_revisions WHERE user_id=$1`, u.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM profiles WHERE user_id=$1`, u.ID)
@@ -710,6 +714,14 @@ func TestProfileEditTxPinsSearchPath(t *testing.T) {
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(ctx, t, st,
+			`DELETE FROM profile_claim_receipts WHERE user_id=$1`, userID)
+		cleanupExec(ctx, t, st,
+			`DELETE FROM profile_claim_events WHERE user_id=$1`, userID)
+		cleanupExec(ctx, t, st,
+			`DELETE FROM profile_claims WHERE user_id=$1`, userID)
+		cleanupExec(ctx, t, st,
+			`DELETE FROM profile_claim_states WHERE user_id=$1`, userID)
 		cleanupExec(ctx, t, st,
 			`DELETE FROM profile_edit_receipts WHERE user_id=$1`, userID)
 		cleanupExec(ctx, t, st,

@@ -202,7 +202,7 @@ func TestProfileClaimAuthorityAndEvolverRegression(t *testing.T) {
 	baseSummary, baseTags, err := st.GetProfileEvolutionBase(
 		t.Context(), 1, u.ID)
 	if err != nil || baseSummary != "模型摘要" ||
-		strings.Join(baseTags, ",") != "A,C" {
+		strings.Join(baseTags, ",") != "C" {
 		t.Fatalf("pure evolution base summary=%q tags=%v err=%v",
 			baseSummary, baseTags, err)
 	}
@@ -578,6 +578,282 @@ func TestProfileClaimRevokeDependencyChain(t *testing.T) {
 	}
 	if recovered.Version != 4 || recovered.Profile.Industry != "AI" {
 		t.Fatalf("compensating chain recovery=%+v", recovered)
+	}
+}
+
+func TestProfileClaimLedgerSurvivesMembershipRevocation(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("未设置 DATABASE_URL")
+	}
+	if err := Migrate(t.Context(), dbURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, st)
+	u, err := st.UpsertUserByOpenID(
+		t.Context(), "claim_membership_"+uuid.NewString(), "claim-membership")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachTenant(t, st, u.ID)
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		for _, table := range []string{
+			"profile_claim_receipts", "profile_claim_events", "profile_claims",
+			"profile_claim_states", "profile_edit_receipts",
+			"profile_edit_revisions", "profiles",
+		} {
+			cleanupExec(ctx, t, st, "DELETE FROM "+table+" WHERE user_id=$1", u.ID)
+		}
+		cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE user_id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id=$1`, u.ID)
+	})
+	industry := "AI"
+	if _, err := st.PatchProfile(
+		t.Context(), 1, u.ID, nil,
+		types.ProfileEditPatch{Industry: &industry},
+		"membership-create", strings.Repeat("1", 64),
+	); err != nil {
+		t.Fatal(err)
+	}
+	list, err := st.ListProfileClaims(t.Context(), 1, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := findClaim(t, list.Claims, "industry", "AI", true)
+	pinned, err := st.ApplyProfileClaimAction(
+		t.Context(), 1, u.ID,
+		types.ProfileClaimAction{
+			ExpectedVersion: 0, Action: "pin",
+			ClaimID: parseTestID(t, claim.ID),
+		},
+		"membership-pin", strings.Repeat("2", 64),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(t.Context(),
+		`DELETE FROM memberships WHERE tenant_id=1 AND user_id=$1`, u.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var profiles, states, claims, events, receipts int
+	if err := st.pool.QueryRow(t.Context(), `
+		SELECT
+		  (SELECT count(*) FROM profiles WHERE user_id=$1),
+		  (SELECT count(*) FROM profile_claim_states WHERE user_id=$1),
+		  (SELECT count(*) FROM profile_claims WHERE user_id=$1),
+		  (SELECT count(*) FROM profile_claim_events WHERE user_id=$1),
+		  (SELECT count(*) FROM profile_claim_receipts WHERE user_id=$1)`,
+		u.ID,
+	).Scan(&profiles, &states, &claims, &events, &receipts); err != nil {
+		t.Fatal(err)
+	}
+	if profiles != 1 || states != 1 || claims == 0 || events != 1 || receipts != 1 {
+		t.Fatalf("membership revoke deleted audit profile/state/claims/events/receipts=%d/%d/%d/%d/%d",
+			profiles, states, claims, events, receipts)
+	}
+	if _, err := st.pool.Exec(t.Context(), `
+		INSERT INTO memberships(tenant_id,user_id,role) VALUES(1,$1,'owner')`,
+		u.ID); err != nil {
+		t.Fatal(err)
+	}
+	list, err = st.ListProfileClaims(t.Context(), 1, u.ID)
+	if err != nil || list.Version != 1 || len(list.Events) != 1 ||
+		list.Events[0].ID != pinned.EventID {
+		t.Fatalf("re-added member lost claim audit: %+v err=%v", list, err)
+	}
+}
+
+func TestProfileClaimMutationSummaryBoundAndDuplicatePin(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("未设置 DATABASE_URL")
+	}
+	if err := Migrate(t.Context(), dbURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, st)
+	u, err := st.UpsertUserByOpenID(
+		t.Context(), "claim_bound_"+uuid.NewString(), "claim-bound")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachTenant(t, st, u.ID)
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		for _, table := range []string{
+			"profile_claim_receipts", "profile_claim_events", "profile_claims",
+			"profile_claim_states", "profile_edit_receipts",
+			"profile_edit_revisions", "profiles",
+		} {
+			cleanupExec(ctx, t, st, "DELETE FROM "+table+" WHERE user_id=$1", u.ID)
+		}
+		cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE user_id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id=$1`, u.ID)
+	})
+	industry := "AI"
+	created, err := st.PatchProfile(
+		t.Context(), 1, u.ID, nil,
+		types.ProfileEditPatch{Industry: &industry},
+		"bound-create", strings.Repeat("1", 64),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSummary := strings.Repeat("甲", 240) +
+		strings.Repeat("乙", 240) + strings.Repeat("丙", 20)
+	if err := st.EvolveProfile(
+		t.Context(), u.ID, baseSummary, nil,
+		10, created.UpdatedAt, 0,
+	); err != nil {
+		t.Fatal(err)
+	}
+	list, err := st.ListProfileClaims(t.Context(), 1, u.ID)
+	if err != nil || list.Version != 1 {
+		t.Fatalf("500-rune generation=%+v err=%v", list, err)
+	}
+	short := findClaim(t, list.Claims, "summary", strings.Repeat("丙", 20), true)
+	if _, err := st.ApplyProfileClaimAction(
+		t.Context(), 1, u.ID,
+		types.ProfileClaimAction{
+			ExpectedVersion: 1, Action: "correct",
+			ClaimID: parseTestID(t, short.ID), Value: strings.Repeat("戊", 240),
+		},
+		"bound-overflow", strings.Repeat("2", 64),
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("summary overflow accepted: %v", err)
+	}
+	list, err = st.ListProfileClaims(t.Context(), 1, u.ID)
+	if err != nil || list.Version != 1 {
+		t.Fatalf("overflow was not atomic: %+v err=%v", list, err)
+	}
+	first := findClaim(t, list.Claims, "summary", strings.Repeat("甲", 240), true)
+	pinned, err := st.ApplyProfileClaimAction(
+		t.Context(), 1, u.ID,
+		types.ProfileClaimAction{
+			ExpectedVersion: 1, Action: "pin",
+			ClaimID: parseTestID(t, first.ID),
+		},
+		"bound-pin", strings.Repeat("3", 64),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyProfileClaimAction(
+		t.Context(), 1, u.ID,
+		types.ProfileClaimAction{
+			ExpectedVersion: 2, Action: "pin",
+			ClaimID: parseTestID(t, first.ID),
+		},
+		"bound-pin-again", strings.Repeat("4", 64),
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("duplicate pin accepted: %v", err)
+	}
+	if err := st.EvolveProfile(
+		t.Context(), u.ID, strings.Repeat("丁", 300), nil,
+		20, pinned.Profile.UpdatedAt, 10,
+	); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("multi-generation pinned summary overflow accepted: %v", err)
+	}
+	list, err = st.ListProfileClaims(t.Context(), 1, u.ID)
+	if err != nil || list.Version != 2 {
+		t.Fatalf("rejected evolution changed version: %+v err=%v", list, err)
+	}
+	p, err := st.GetProfileForTenant(t.Context(), 1, u.ID)
+	if err != nil || utf8.RuneCountInString(stripDerivedManualSegment(p.Summary)) != 500 ||
+		p.LastEvolvedFeedbackID != 10 {
+		t.Fatalf("rejected evolution changed projection: %+v err=%v", p, err)
+	}
+}
+
+func TestLegacyProfileTenantResolutionFailsClosed(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("未设置 DATABASE_URL")
+	}
+	if err := Migrate(t.Context(), dbURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, st)
+	u, err := st.UpsertUserByOpenID(
+		t.Context(), "claim_multi_member_"+uuid.NewString(), "multi-member")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachTenant(t, st, u.ID)
+	var tenant2 int64
+	if err := st.pool.QueryRow(t.Context(),
+		`INSERT INTO tenants DEFAULT VALUES RETURNING id`).Scan(&tenant2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(t.Context(), `
+		INSERT INTO memberships(tenant_id,user_id,role) VALUES($1,$2,'member')`,
+		tenant2, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		for _, table := range []string{
+			"profile_claim_receipts", "profile_claim_events", "profile_claims",
+			"profile_claim_states", "profiles",
+		} {
+			cleanupExec(ctx, t, st, "DELETE FROM "+table+" WHERE user_id=$1", u.ID)
+		}
+		cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE user_id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM tenants WHERE id=$1`, tenant2)
+	})
+	industry := "AI"
+	if _, err := st.UpsertProfileFields(
+		t.Context(), u.ID, &industry, nil, nil,
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("multi-membership first intake guessed a tenant: %v", err)
+	}
+	if _, err := st.pool.Exec(t.Context(),
+		`DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`, tenant2, u.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpsertProfileFields(
+		t.Context(), u.ID, &industry, nil, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(t.Context(), `
+		INSERT INTO memberships(tenant_id,user_id,role) VALUES($1,$2,'member')`,
+		tenant2, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.GetProfileEvolutionBase(
+		t.Context(), 0, u.ID,
+	); err != nil {
+		t.Fatalf("profile tenant did not win multi-membership resolution: %v", err)
+	}
+	if _, err := st.pool.Exec(t.Context(),
+		`DELETE FROM memberships WHERE tenant_id=1 AND user_id=$1`, u.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.GetProfileEvolutionBase(
+		t.Context(), 0, u.ID,
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("mismatched profile membership fell through to another tenant: %v", err)
 	}
 }
 

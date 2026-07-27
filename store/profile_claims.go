@@ -93,10 +93,26 @@ func (s *Store) GetProfileEvolutionBase(
 		return "", nil, types.NewAppError(types.CodeValidation, "画像演化基线范围无效", nil)
 	}
 	if tenantID <= 0 {
-		if err := s.pool.QueryRow(ctx,
-			`SELECT m.tenant_id FROM memberships m WHERE m.user_id=$1`, userID,
-		).Scan(&tenantID); err != nil {
+		err := s.pool.QueryRow(ctx,
+			`SELECT tenant_id FROM profiles WHERE user_id=$1`, userID,
+		).Scan(&tenantID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil, types.NewAppError(types.CodeNotFound, "画像不存在", nil)
+		}
+		if err != nil {
 			return "", nil, profileClaimDBError("resolve profile evolution tenant", err)
+		}
+		var matchingMemberships int
+		if err := s.pool.QueryRow(ctx,
+			`SELECT count(*) FROM memberships
+			  WHERE user_id=$1 AND tenant_id=$2`,
+			userID, tenantID,
+		).Scan(&matchingMemberships); err != nil {
+			return "", nil, profileClaimDBError("validate profile evolution owner", err)
+		}
+		if matchingMemberships != 1 {
+			return "", nil, types.NewAppError(
+				types.CodeConflict, "画像租户归属与当前 membership 不一致", nil)
 		}
 	}
 	tx, err := s.beginProfileClaimScopedTx(ctx, tenantID, false, userID)
@@ -110,60 +126,32 @@ func (s *Store) GetProfileEvolutionBase(
 		  WHERE tenant_id=$1 AND user_id=$2`, tenantID, userID,
 	).Scan(&generation)
 	if errors.Is(err, pgx.ErrNoRows) {
-		var p types.Profile
-		loadErr := scanProfileEdit(tx.QueryRow(ctx,
-			`SELECT `+profileEditColumns+` FROM profiles
-			  WHERE tenant_id=$1 AND user_id=$2`, tenantID, userID), &p)
-		if errors.Is(loadErr, pgx.ErrNoRows) {
+		var profileExists bool
+		if existsErr := tx.QueryRow(ctx,
+			`SELECT EXISTS(
+			   SELECT 1 FROM profiles WHERE tenant_id=$1 AND user_id=$2
+			 )`, tenantID, userID,
+		).Scan(&profileExists); existsErr != nil {
+			return "", nil, profileClaimDBError(
+				"distinguish missing evolution claim state", existsErr)
+		}
+		if !profileExists {
 			return "", nil, types.NewAppError(types.CodeNotFound, "画像不存在", nil)
 		}
-		if loadErr != nil {
-			return "", nil, profileClaimDBError("read profile evolution fallback", loadErr)
-		}
-		return stripDerivedManualSegment(p.Summary), append([]string(nil), p.Tags...), nil
+		return "", nil, types.NewAppError(
+			types.CodeConflict, "画像主张状态缺失，拒绝从派生投影推断基线", nil)
 	}
 	if err != nil {
 		return "", nil, profileClaimDBError("read profile evolution generation", err)
 	}
-	rows, err := tx.Query(ctx,
-		`SELECT field_name,claim_value
-		   FROM profile_claims c
-		  WHERE tenant_id=$1 AND user_id=$2
-		    AND source_state<>'manual'
-		    AND field_name IN ('summary','tag')
-		    AND generation=CASE
-		          WHEN $3::bigint>0 THEN $3::bigint
-		          ELSE (
-		            SELECT COALESCE(max(c2.generation),0)
-		              FROM profile_claims c2
-		             WHERE c2.tenant_id=c.tenant_id
-		               AND c2.user_id=c.user_id
-		               AND c2.field_name=c.field_name
-		               AND c2.source_state<>'manual'
-		          )
-		        END
-		  ORDER BY id`, tenantID, userID, generation)
+	claims, events, err := loadProfileClaimLedgerTx(
+		ctx, tx, tenantID, userID)
 	if err != nil {
-		return "", nil, profileClaimDBError("read profile evolution claims", err)
+		return "", nil, err
 	}
-	defer rows.Close()
-	var summaryParts []string
-	var tags []string
-	for rows.Next() {
-		var field, value string
-		if err := rows.Scan(&field, &value); err != nil {
-			return "", nil, profileClaimDBError("scan profile evolution claim", err)
-		}
-		if field == "summary" {
-			summaryParts = append(summaryParts, value)
-		} else {
-			tags = append(tags, value)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return "", nil, profileClaimDBError("iterate profile evolution claims", err)
-	}
-	return stripDerivedManualSegment(strings.Join(summaryParts, "")), tags, nil
+	projection := projectProfileClaims(claims, events, generation)
+	summary, tags := projectedNonManualEvolutionBase(claims, projection)
+	return summary, tags, nil
 }
 
 func stripDerivedManualSegment(summary string) string {
@@ -192,11 +180,11 @@ func (s *Store) ApplyProfileClaimAction(
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	p, err := lockProfileTx(ctx, tx, tenantID, userID)
+	_, err = lockProfileTx(ctx, tx, tenantID, userID)
 	if err != nil {
 		return nil, err
 	}
-	version, generation, err := ensureProfileClaimStateTx(ctx, tx, tenantID, userID, p)
+	version, generation, err := lockProfileClaimStateTx(ctx, tx, tenantID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -235,6 +223,9 @@ func (s *Store) ApplyProfileClaimAction(
 		}
 		if !beforeProjection.active[target.ID] {
 			return nil, types.NewAppError(types.CodeConflict, "只能操作当前生效的画像主张", nil)
+		}
+		if action.Action == "pin" && beforeProjection.pinned[target.ID] {
+			return nil, types.NewAppError(types.CodeValidation, "该画像主张已经固定", nil)
 		}
 		targetClaimID = &target.ID
 		if action.Action == "correct" {
@@ -303,19 +294,26 @@ func (s *Store) ApplyProfileClaimAction(
 	if err != nil {
 		return nil, profileClaimDBError("insert profile claim event", err)
 	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE profile_claim_states
-		    SET version=version+1,updated_at=clock_timestamp()
-		  WHERE tenant_id=$1 AND user_id=$2 AND version=$3`,
-		tenantID, userID, version); err != nil {
-		return nil, profileClaimDBError("advance profile claim version", err)
-	}
-
 	claims, events, err = loadProfileClaimLedgerTx(ctx, tx, tenantID, userID)
 	if err != nil {
 		return nil, err
 	}
 	projection := projectProfileClaims(claims, events, generation)
+	if activeSummaryRunes(claims, projection) > maxProjectedSummaryRunes {
+		return nil, types.NewAppError(
+			types.CodeValidation, "生效画像摘要不能超过 500 字", nil)
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE profile_claim_states
+		    SET version=version+1,updated_at=clock_timestamp()
+		  WHERE tenant_id=$1 AND user_id=$2 AND version=$3`,
+		tenantID, userID, version)
+	if err != nil {
+		return nil, profileClaimDBError("advance profile claim version", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, types.NewAppError(types.CodeConflict, "画像主张版本已变化，请刷新后重试", nil)
+	}
 	updated, err := writeProfileClaimProjectionTx(ctx, tx, tenantID, userID, projection)
 	if err != nil {
 		return nil, err
@@ -389,48 +387,17 @@ func (s *Store) beginProfileClaimScopedTx(
 	return tx, nil
 }
 
-func ensureProfileClaimStateTx(
-	ctx context.Context, tx pgx.Tx, tenantID, userID int64, p *types.Profile,
+func lockProfileClaimStateTx(
+	ctx context.Context, tx pgx.Tx, tenantID, userID int64,
 ) (version, generation int64, err error) {
-	tag, err := tx.Exec(ctx,
-		`INSERT INTO profile_claim_states (tenant_id,user_id)
-		 VALUES ($1,$2) ON CONFLICT DO NOTHING`, tenantID, userID)
-	if err != nil {
-		return 0, 0, profileClaimDBError("ensure profile claim state", err)
-	}
-	if tag.RowsAffected() > 0 {
-		insert := func(field, value string) error {
-			if value == "" {
-				return nil
-			}
-			_, err := tx.Exec(ctx,
-				`INSERT INTO profile_claims
-				    (tenant_id,user_id,field_name,claim_value,source_state)
-				 VALUES ($1,$2,$3,$4,'source_unavailable')`,
-				tenantID, userID, field, value)
-			return err
-		}
-		if err := insert("industry", p.Industry); err != nil {
-			return 0, 0, profileClaimDBError("backfill industry claim", err)
-		}
-		if err := insert("occupation", p.Occupation); err != nil {
-			return 0, 0, profileClaimDBError("backfill occupation claim", err)
-		}
-		for _, value := range p.Tags {
-			if err := insert("tag", value); err != nil {
-				return 0, 0, profileClaimDBError("backfill tag claim", err)
-			}
-		}
-		for _, statement := range splitSummaryClaims(p.Summary) {
-			if err := insert("summary", statement); err != nil {
-				return 0, 0, profileClaimDBError("backfill summary claim", err)
-			}
-		}
-	}
 	err = tx.QueryRow(ctx,
 		`SELECT version,evidence_generation FROM profile_claim_states
 		  WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE`,
 		tenantID, userID).Scan(&version, &generation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, 0, types.NewAppError(
+			types.CodeConflict, "画像主张状态缺失，拒绝从派生投影补写", nil)
+	}
 	if err != nil {
 		return 0, 0, profileClaimDBError("lock profile claim state", err)
 	}
@@ -611,6 +578,47 @@ func projectProfileClaims(
 			out.active[claim.ID] = true
 		}
 	}
+	activeByField := make(map[string]map[int64]bool)
+	activeBySemantic := make(map[string]map[int64]bool)
+	claimByID := func(id int64) profileClaimRow { return byID[id] }
+	setActive := func(id int64, active bool) {
+		claim := claimByID(id)
+		fieldSet := activeByField[claim.Field]
+		if fieldSet == nil {
+			fieldSet = make(map[int64]bool)
+			activeByField[claim.Field] = fieldSet
+		}
+		key := profileClaimSemanticKey(claim)
+		semanticSet := activeBySemantic[key]
+		if semanticSet == nil {
+			semanticSet = make(map[int64]bool)
+			activeBySemantic[key] = semanticSet
+		}
+		out.active[id] = active
+		if active {
+			fieldSet[id] = true
+			semanticSet[id] = true
+		} else {
+			delete(fieldSet, id)
+			delete(semanticSet, id)
+		}
+	}
+	for id, active := range out.active {
+		if active {
+			setActive(id, true)
+		}
+	}
+	deactivateIDs := func(ids map[int64]bool) {
+		for id := range ids {
+			setActive(id, false)
+		}
+	}
+	deactivateSemanticKey := func(key string) {
+		deactivateIDs(activeBySemantic[key])
+	}
+	deactivateFieldKey := func(field string) {
+		deactivateIDs(activeByField[field])
+	}
 	revoked := make(map[int64]bool)
 	for _, event := range events {
 		if event.Kind == "revoke" && event.TargetEventID != nil {
@@ -632,19 +640,19 @@ func projectProfileClaims(
 			if !ok {
 				continue
 			}
-			deactivateSemantic(out.active, claims, target)
+			deactivateSemanticKey(profileClaimSemanticKey(target))
 			if target.Field == "industry" || target.Field == "occupation" {
-				deactivateField(out.active, claims, target.Field)
+				deactivateFieldKey(target.Field)
 			}
-			out.active[result.ID] = true
+			setActive(result.ID, true)
 		case "suppress":
-			deactivateSemantic(out.active, claims, target)
+			deactivateSemanticKey(profileClaimSemanticKey(target))
 			effectiveSuppress[target.Field+"\x00"+target.Value] = target
 		case "pin":
 			if target.Field == "industry" || target.Field == "occupation" {
-				deactivateField(out.active, claims, target.Field)
+				deactivateFieldKey(target.Field)
 			}
-			out.active[target.ID] = true
+			setActive(target.ID, true)
 			out.pinned[target.ID] = true
 		}
 	}
@@ -679,9 +687,10 @@ func projectProfileClaims(
 	sort.SliceStable(pinnedTags, func(i, j int) bool { return pinnedTags[i].ID < pinnedTags[j].ID })
 	sort.SliceStable(manualTags, func(i, j int) bool { return manualTags[i].ID < manualTags[j].ID })
 	sort.SliceStable(baseTags, func(i, j int) bool { return baseTags[i].ID < baseTags[j].ID })
+	rootByID := profileClaimRootIDs(claims, byID)
 	sort.SliceStable(summaryClaims, func(i, j int) bool {
-		left := summaryClaimRootID(summaryClaims[i], byID)
-		right := summaryClaimRootID(summaryClaims[j], byID)
+		left := rootByID[summaryClaims[i].ID]
+		right := rootByID[summaryClaims[j].ID]
 		if left == right {
 			return summaryClaims[i].ID < summaryClaims[j].ID
 		}
@@ -714,7 +723,7 @@ func projectProfileClaims(
 	for _, claim := range claims {
 		if claim.Field == "tag" && out.active[claim.ID] &&
 			!selectedTagIDs[claim.ID] {
-			out.active[claim.ID] = false
+			setActive(claim.ID, false)
 		}
 	}
 	// Summary authority is a bounded view of final state, never an event log.
@@ -759,14 +768,7 @@ func projectProfileClaims(
 		if target.Field == "summary" {
 			continue
 		}
-		stillActive := false
-		for _, claim := range claims {
-			if out.active[claim.ID] && claim.Field == target.Field &&
-				claim.Value == target.Value {
-				stillActive = true
-				break
-			}
-		}
+		stillActive := len(activeBySemantic[profileClaimSemanticKey(target)]) > 0
 		note := fmt.Sprintf("排除%s=%s",
 			profileClaimFieldLabel(target.Field), target.Value)
 		if !stillActive && !noteSeen[note] && len(manualNotes) < 16 {
@@ -785,21 +787,93 @@ func projectProfileClaims(
 	return out
 }
 
-func summaryClaimRootID(
-	claim profileClaimRow, byID map[int64]profileClaimRow,
-) int64 {
-	root := claim.ID
-	seen := make(map[int64]bool)
-	for claim.SupersedesID != nil && !seen[*claim.SupersedesID] {
-		seen[*claim.SupersedesID] = true
-		parent, ok := byID[*claim.SupersedesID]
-		if !ok {
-			break
+func profileClaimRootIDs(
+	claims []profileClaimRow, byID map[int64]profileClaimRow,
+) map[int64]int64 {
+	roots := make(map[int64]int64, len(claims))
+	visiting := make(map[int64]bool)
+	var resolve func(int64) int64
+	resolve = func(id int64) int64 {
+		if root, ok := roots[id]; ok {
+			return root
 		}
-		root = parent.ID
-		claim = parent
+		if visiting[id] {
+			// Cycles are not produced by the API; fail deterministic if a
+			// privileged operator ever corrupts the chain.
+			return id
+		}
+		visiting[id] = true
+		root := id
+		if claim, ok := byID[id]; ok && claim.SupersedesID != nil {
+			if _, parentExists := byID[*claim.SupersedesID]; parentExists {
+				root = resolve(*claim.SupersedesID)
+			}
+		}
+		delete(visiting, id)
+		roots[id] = root
+		return root
 	}
-	return root
+	for _, claim := range claims {
+		resolve(claim.ID)
+	}
+	return roots
+}
+
+func projectedNonManualEvolutionBase(
+	claims []profileClaimRow, projection profileClaimProjection,
+) (string, []string) {
+	byID := make(map[int64]profileClaimRow, len(claims))
+	for _, claim := range claims {
+		byID[claim.ID] = claim
+	}
+	roots := profileClaimRootIDs(claims, byID)
+	var summaries, pinnedTags, baseTags []profileClaimRow
+	for _, claim := range claims {
+		if !projection.active[claim.ID] || claim.SourceState == "manual" {
+			continue
+		}
+		switch claim.Field {
+		case "summary":
+			summaries = append(summaries, claim)
+		case "tag":
+			if projection.pinned[claim.ID] {
+				pinnedTags = append(pinnedTags, claim)
+			} else {
+				baseTags = append(baseTags, claim)
+			}
+		}
+	}
+	sort.SliceStable(summaries, func(i, j int) bool {
+		if roots[summaries[i].ID] == roots[summaries[j].ID] {
+			return summaries[i].ID < summaries[j].ID
+		}
+		return roots[summaries[i].ID] < roots[summaries[j].ID]
+	})
+	sort.SliceStable(pinnedTags, func(i, j int) bool {
+		return pinnedTags[i].ID < pinnedTags[j].ID
+	})
+	sort.SliceStable(baseTags, func(i, j int) bool {
+		return baseTags[i].ID < baseTags[j].ID
+	})
+	summarySeen := make(map[string]bool)
+	var summaryParts []string
+	for _, claim := range summaries {
+		if !summarySeen[claim.Value] {
+			summarySeen[claim.Value] = true
+			summaryParts = append(summaryParts, claim.Value)
+		}
+	}
+	tagSeen := make(map[string]bool)
+	tags := []string{}
+	for _, group := range [][]profileClaimRow{pinnedTags, baseTags} {
+		for _, claim := range group {
+			if !tagSeen[claim.Value] {
+				tagSeen[claim.Value] = true
+				tags = append(tags, claim.Value)
+			}
+		}
+	}
+	return strings.Join(summaryParts, ""), tags
 }
 
 func derefClaim(
@@ -812,20 +886,8 @@ func derefClaim(
 	return claim, ok
 }
 
-func deactivateField(active map[int64]bool, claims []profileClaimRow, field string) {
-	for _, claim := range claims {
-		if claim.Field == field {
-			active[claim.ID] = false
-		}
-	}
-}
-
-func deactivateSemantic(active map[int64]bool, claims []profileClaimRow, target profileClaimRow) {
-	for _, claim := range claims {
-		if claim.Field == target.Field && claim.Value == target.Value {
-			active[claim.ID] = false
-		}
-	}
+func profileClaimSemanticKey(claim profileClaimRow) string {
+	return claim.Field + "\x00" + claim.Value
 }
 
 func profileClaimFieldLabel(field string) string {
@@ -1046,8 +1108,8 @@ func evolveProfileClaimsTx(
 		current.LastEvolvedFeedbackID != expectedCursor {
 		return types.NewAppError(types.CodeConflict, "画像演化 CAS 未命中", nil)
 	}
-	version, _, err := ensureProfileClaimStateTx(
-		ctx, tx, tenantID, userID, &current)
+	version, _, err := lockProfileClaimStateTx(
+		ctx, tx, tenantID, userID)
 	if err != nil {
 		return err
 	}
@@ -1096,6 +1158,10 @@ func evolveProfileClaimsTx(
 		return err
 	}
 	projection := projectProfileClaims(claims, events, newCursor)
+	if activeSummaryRunes(claims, projection) > maxProjectedSummaryRunes {
+		return types.NewAppError(
+			types.CodeValidation, "生效画像摘要不能超过 500 字", nil)
+	}
 	updateTag, err := tx.Exec(ctx,
 		`UPDATE profiles
 		    SET industry=$3,occupation=$4,tags=$5,summary=$6,
@@ -1121,7 +1187,25 @@ func evolveProfileClaimsTx(
 	return nil
 }
 
-const maxSummaryClaimRunes = 240
+const (
+	maxSummaryClaimRunes     = 240
+	maxProjectedSummaryRunes = 500
+)
+
+func activeSummaryRunes(
+	claims []profileClaimRow, projection profileClaimProjection,
+) int {
+	seen := make(map[string]bool)
+	total := 0
+	for _, claim := range claims {
+		if claim.Field == "summary" && projection.active[claim.ID] &&
+			!seen[claim.Value] {
+			seen[claim.Value] = true
+			total += utf8.RuneCountInString(claim.Value)
+		}
+	}
+	return total
+}
 
 func splitSummaryClaims(summary string) []string {
 	summary = strings.TrimSpace(summary)
