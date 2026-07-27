@@ -1,6 +1,6 @@
 # Canonical RunOutcome / Brief V1 contract
 
-Status: P1-B exact-run lifecycle. Migration 062 adds recovery and the workflow
+Status: P1-B exact-run lifecycle. Migration 063 adds recovery and the workflow
 may create/finalize RunOutcome only for the independent compiled-runtime
 canary. Brief freeze/read, API, renderer, and every user-visible surface remain
 dark.
@@ -133,7 +133,7 @@ a completed execution without a terminal receipt becomes
 already-admitted recovery work.
 
 Migration 061 Up and Down drain schema-aware writers and take
-producer-compatible access-exclusive locks. Migration 062 Down takes the same
+producer-compatible access-exclusive locks. Migration 063 Down takes the same
 exclusive admission fence and refuses while any outcome remains pending.
 A Begin admitted after that downgrade must also prove the recovery reader is
 still installed before inserting, so neither side of the fence can strand a

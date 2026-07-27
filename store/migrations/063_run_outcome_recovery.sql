@@ -1,4 +1,4 @@
--- 062: least-privilege recovery reader for stale pending RunOutcome rows.
+-- 063: least-privilege recovery reader for stale pending RunOutcome rows.
 --
 -- Recovery receives only the exact marker/snapshot/Temporal identity required
 -- to inspect an execution and submit a normal writer claim. It receives no
@@ -50,7 +50,7 @@ BEGIN
            'vane_brief_writer','vane_run_outcome_recovery','MEMBER'
        ) THEN
         RAISE EXCEPTION
-            '062: recovery, application, and brief writer roles must be unrelated';
+            '063: recovery, application, and brief writer roles must be unrelated';
     END IF;
     IF EXISTS (
         SELECT 1
@@ -61,7 +61,7 @@ BEGIN
            AND member_role.rolname<>CURRENT_USER
     ) THEN
         RAISE EXCEPTION
-            '062: only migration owner may enter recovery role';
+            '063: only migration owner may enter recovery role';
     END IF;
     IF EXISTS (
         SELECT 1
@@ -69,7 +69,7 @@ BEGIN
           JOIN pg_roles member_role ON member_role.oid=am.member
          WHERE member_role.rolname='vane_run_outcome_recovery'
     ) THEN
-        RAISE EXCEPTION '062: recovery role must not enter another role';
+        RAISE EXCEPTION '063: recovery role must not enter another role';
     END IF;
     IF EXISTS (
         SELECT 1
@@ -86,7 +86,7 @@ BEGIN
            )
     ) THEN
         RAISE EXCEPTION
-            '062: recovery role must not own database objects';
+            '063: recovery role must not own database objects';
     END IF;
     IF EXISTS (
         SELECT 1
@@ -110,7 +110,7 @@ BEGIN
            )
     ) THEN
         RAISE EXCEPTION
-            '062: recovery role has preexisting ACL in this database';
+            '063: recovery role has preexisting ACL in this database';
     END IF;
     IF EXISTS (
         SELECT 1
@@ -125,7 +125,7 @@ BEGIN
                )
     ) THEN
         RAISE EXCEPTION
-            '062: recovery role has unsafe cluster parameter ACL';
+            '063: recovery role has unsafe cluster parameter ACL';
     END IF;
 END $$;
 -- +goose StatementEnd
@@ -198,7 +198,7 @@ DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM task_run_outcomes WHERE status='pending') THEN
         RAISE EXCEPTION
-            '062: refusing downgrade while pending run outcomes exist';
+            '063: refusing downgrade while pending run outcomes exist';
     END IF;
 END $$;
 -- +goose StatementEnd

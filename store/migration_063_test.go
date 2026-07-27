@@ -16,7 +16,7 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-func TestMigration062RecoveryRoleIsReadOnlyAndKeysetBounded(t *testing.T) {
+func TestMigration063RecoveryRoleIsReadOnlyAndKeysetBounded(t *testing.T) {
 	first := newCanonicalBriefFixture(t, 0)
 	second := newCanonicalBriefFixture(t, 0)
 	oldest := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Microsecond)
@@ -122,7 +122,7 @@ func TestMigration062RecoveryRoleIsReadOnlyAndKeysetBounded(t *testing.T) {
 	}
 }
 
-func TestMigration062ReaderDoesNotExposeFreshPendingRows(t *testing.T) {
+func TestMigration063ReaderDoesNotExposeFreshPendingRows(t *testing.T) {
 	f := newCanonicalBriefFixture(t, 0)
 	marker, err := f.base.st.CreatePendingRunOutcomeV1(
 		t.Context(), f.identity, f.ref)
@@ -145,7 +145,7 @@ func TestMigration062ReaderDoesNotExposeFreshPendingRows(t *testing.T) {
 	}
 }
 
-func TestMigration062DownRefusesPendingOutcome(t *testing.T) {
+func TestMigration063DownRefusesPendingOutcome(t *testing.T) {
 	f := newCanonicalBriefFixture(t, 0)
 	if _, err := f.base.st.CreatePendingRunOutcomeV1(
 		t.Context(), f.identity, f.ref); err != nil {
@@ -164,7 +164,7 @@ func TestMigration062DownRefusesPendingOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.DownTo(t.Context(), 61); err == nil ||
+	if _, err := provider.DownTo(t.Context(), 62); err == nil ||
 		!strings.Contains(err.Error(),
 			"refusing downgrade while pending run outcomes exist") {
 		t.Fatalf("pending outcome downgrade error = %v", err)
@@ -176,12 +176,12 @@ func TestMigration062DownRefusesPendingOutcome(t *testing.T) {
 		  WHERE is_applied`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 62 {
+	if version != 63 {
 		t.Fatalf("failed Down changed migration version to %d", version)
 	}
 }
 
-func TestMigration062DownDrainsAdmittedOutcomeWriter(t *testing.T) {
+func TestMigration063DownDrainsAdmittedOutcomeWriter(t *testing.T) {
 	f := newCanonicalBriefFixture(t, 0)
 	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
 	if err != nil {
@@ -235,12 +235,12 @@ func TestMigration062DownDrainsAdmittedOutcomeWriter(t *testing.T) {
 
 	downDone := make(chan error, 1)
 	go func() {
-		_, downErr := provider.DownTo(t.Context(), 61)
+		_, downErr := provider.DownTo(t.Context(), 62)
 		downDone <- downErr
 	}()
 	select {
 	case err := <-downDone:
-		t.Fatalf("062 Down crossed an admitted outcome writer: %v", err)
+		t.Fatalf("063 Down crossed an admitted outcome writer: %v", err)
 	case <-time.After(200 * time.Millisecond):
 	}
 	if err := writer.Commit(); err != nil {
@@ -253,30 +253,30 @@ func TestMigration062DownDrainsAdmittedOutcomeWriter(t *testing.T) {
 		if err == nil || !strings.Contains(
 			err.Error(), "refusing downgrade while pending run outcomes exist",
 		) {
-			t.Fatalf("062 Down did not observe admitted pending marker: %v", err)
+			t.Fatalf("063 Down did not observe admitted pending marker: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("062 Down did not converge after admitted writer committed")
+		t.Fatal("063 Down did not converge after admitted writer committed")
 	}
 }
 
-func TestMigration062DownUsesCanonicalWriterFence(t *testing.T) {
+func TestMigration063DownUsesCanonicalWriterFence(t *testing.T) {
 	raw, err := fs.ReadFile(
-		migrationsFS, "migrations/062_run_outcome_recovery.sql")
+		migrationsFS, "migrations/063_run_outcome_recovery.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(raw),
 		"SELECT pg_advisory_xact_lock(6215335020355474248)") {
-		t.Fatal("062 Down lacks the canonical writer admission fence")
+		t.Fatal("063 Down lacks the canonical writer admission fence")
 	}
 	if strings.Contains(string(raw),
 		"REVOKE vane_run_outcome_recovery FROM CURRENT_USER") {
-		t.Fatal("062 Down must not remove preexisting cluster role membership")
+		t.Fatal("063 Down must not remove preexisting cluster role membership")
 	}
 }
 
-func TestMigration062DownRejectsBeginQueuedBehindFence(t *testing.T) {
+func TestMigration063DownRejectsBeginQueuedBehindFence(t *testing.T) {
 	f := newCanonicalBriefFixture(t, 0)
 	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
 	if err != nil {
@@ -292,8 +292,8 @@ func TestMigration062DownRejectsBeginQueuedBehindFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		if _, upErr := provider.UpTo(context.Background(), 62); upErr != nil {
-			t.Errorf("restore migration 062: %v", upErr)
+		if _, upErr := provider.UpTo(context.Background(), 63); upErr != nil {
+			t.Errorf("restore migration 063: %v", upErr)
 		}
 	}()
 
@@ -316,14 +316,14 @@ func TestMigration062DownRejectsBeginQueuedBehindFence(t *testing.T) {
 
 	downDone := make(chan error, 1)
 	go func() {
-		_, downErr := provider.DownTo(ctx, 61)
+		_, downErr := provider.DownTo(ctx, 62)
 		downDone <- downErr
 	}()
 	if !waitForScratchQueryLock(
 		ctx, db, "%refusing downgrade while pending run outcomes exist%",
 		5*time.Second,
 	) {
-		t.Fatal("062 Down did not hold the exclusive fence before its check")
+		t.Fatal("063 Down did not hold the exclusive fence before its check")
 	}
 
 	beginDone := make(chan error, 1)
@@ -335,7 +335,7 @@ func TestMigration062DownRejectsBeginQueuedBehindFence(t *testing.T) {
 	if !waitForScratchQueryLock(
 		ctx, db, "%pg_advisory_xact_lock_shared%", 5*time.Second,
 	) {
-		t.Fatal("queued Begin did not wait behind 062 Down")
+		t.Fatal("queued Begin did not wait behind 063 Down")
 	}
 	if err := blocker.Commit(); err != nil {
 		t.Fatal(err)
@@ -345,10 +345,10 @@ func TestMigration062DownRejectsBeginQueuedBehindFence(t *testing.T) {
 	select {
 	case err := <-downDone:
 		if err != nil {
-			t.Fatalf("062 Down with no pending markers: %v", err)
+			t.Fatalf("063 Down with no pending markers: %v", err)
 		}
 	case <-ctx.Done():
-		t.Fatal("062 Down did not converge")
+		t.Fatal("063 Down did not converge")
 	}
 	select {
 	case err := <-beginDone:
