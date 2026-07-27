@@ -258,6 +258,7 @@ write_frontend_receipt() {
 }
 
 deploy_frontend_aliyun() {
+  local owner_preview_object="_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/index.html"
   if frontend_state_check; then
     :
   elif [[ $? -eq 10 ]]; then
@@ -288,18 +289,41 @@ deploy_frontend_aliyun() {
     echo "verified frontend dist/index.html is missing" >&2
     exit 1
   }
+  if [[ -e $payload/dist/$owner_preview_object ]]; then
+    [[ -f $payload/dist/$owner_preview_object &&
+      ! -L $payload/dist/$owner_preview_object ]] || {
+      echo "owner preview HTML is not a regular file" >&2
+      exit 1
+    }
+  fi
 
   (
     # `aliyun oss` is the deprecated ossutil v1 bridge and does not understand
     # the outer CLI's --config-path flag. Use the separately SHA-pinned
     # ossutil v2 binary and its supported environment credential provider.
     # Both distribution commands keep secrets out of argv and credential files.
-    OSS_ACCESS_KEY_ID="$ALIYUN_ACCESS_KEY_ID" \
-      OSS_ACCESS_KEY_SECRET="$ALIYUN_ACCESS_KEY_SECRET" \
-      OSS_REGION=cn-shenzhen \
-      "$OSSUTIL_BIN" sync \
+    export OSS_ACCESS_KEY_ID="$ALIYUN_ACCESS_KEY_ID"
+    export OSS_ACCESS_KEY_SECRET="$ALIYUN_ACCESS_KEY_SECRET"
+    export OSS_REGION=cn-shenzhen
+    "$OSSUTIL_BIN" sync \
       "$payload/dist/" oss://zhuoqidev-vane-web/ \
       --delete --force
+
+    if [[ -f $payload/dist/$owner_preview_object ]]; then
+      "$OSSUTIL_BIN" set-meta \
+        "oss://zhuoqidev-vane-web/$owner_preview_object" \
+        "Cache-Control:no-store" \
+        --update --force
+      owner_preview_meta=$(
+        "$OSSUTIL_BIN" stat \
+          "oss://zhuoqidev-vane-web/$owner_preview_object"
+      )
+      if ! printf '%s\n' "$owner_preview_meta" |
+        grep -Eiq 'Cache-Control[^[:alnum:]]+no-store'; then
+        echo "owner preview OSS object is missing Cache-Control:no-store" >&2
+        exit 1
+      fi
+    fi
 
     for attempt in 1 2 3; do
       if ALIBABA_CLOUD_IGNORE_PROFILE=TRUE \
@@ -320,6 +344,7 @@ deploy_frontend_aliyun() {
 }
 
 deploy_frontend_cloudflare() {
+  local owner_preview_path="_preview/p0a-7d7f47e8506f4e49aa8cb4bfdab78e42/"
   if frontend_state_check; then
     :
   elif [[ $? -eq 10 ]]; then
@@ -346,12 +371,36 @@ deploy_frontend_cloudflare() {
     echo "verified frontend dist/index.html is missing" >&2
     exit 1
   }
+  command -v curl >/dev/null
 
   (
     cd "$payload"
     "$WRANGLER_BIN" pages deploy dist \
       --project-name vane-web \
       --branch main
+
+    if [[ -f $payload/dist/${owner_preview_path}index.html ]]; then
+      for attempt in 1 2 3 4 5; do
+        owner_preview_headers=$(
+          curl --fail --silent --show-error --head \
+            "https://vane-web.pages.dev/$owner_preview_path" || true
+        )
+        normalized_headers=$(printf '%s\n' "$owner_preview_headers" | tr -d '\r')
+        if printf '%s\n' "$normalized_headers" |
+          grep -Eiq '^Cache-Control:.*no-store' &&
+          printf '%s\n' "$normalized_headers" |
+            grep -Eiq '^X-Robots-Tag:.*noindex.*nofollow.*noarchive' &&
+          printf '%s\n' "$normalized_headers" |
+            grep -Eiq "^Content-Security-Policy:.*connect-src 'none'"; then
+          break
+        fi
+        [[ $attempt -lt 5 ]] || {
+          echo "Cloudflare owner preview headers did not converge" >&2
+          exit 1
+        }
+        sleep $((attempt * 3))
+      done
+    fi
   )
   write_frontend_receipt cloudflare
   echo "frontend Cloudflare line deployed: $source_sha"
