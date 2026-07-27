@@ -146,7 +146,7 @@ func TestViewProfileTool(t *testing.T) {
 }
 
 // ============================================================
-// update_profile（M5 契约 §12.3）：写工具，走 M4 标准确认卡（首采不特例）。
+// update_profile（M5 契约 §12.3）：仅首次画像采集，走 M4 标准确认卡。
 // ============================================================
 
 func TestUpdateProfileTool(t *testing.T) {
@@ -202,8 +202,23 @@ func TestUpdateProfileTool(t *testing.T) {
 		if c.tags != nil {
 			t.Fatalf("未提供的 tags 必须传 nil（nil=不改）, 实得 %+v", c.tags)
 		}
-		if !strings.Contains(got, "画像已更新") || !strings.Contains(got, "行业：金融") {
-			t.Fatalf("结果应回执更新后的画像, 实得 %q", got)
+		if !strings.Contains(got, "画像已首次创建") || !strings.Contains(got, "行业：金融") {
+			t.Fatalf("结果应回执首次创建的画像, 实得 %q", got)
+		}
+	})
+
+	t.Run("已有画像冲突返回可行动文案且不谎称更新", func(t *testing.T) {
+		fs := newFakeStore()
+		fs.upsertErr = types.NewAppError(types.CodeConflict, "claim authority active", nil)
+		got, err := (&updateProfileTool{st: fs}).Execute(
+			context.Background(), 7, json.RawMessage(`{"industry":"金融"}`))
+		if err != nil {
+			t.Fatalf("authority conflict should be user-actionable: %v", err)
+		}
+		if !strings.Contains(got, "本次未修改") ||
+			!strings.Contains(got, "画像依据") ||
+			strings.Contains(got, "画像已更新") {
+			t.Fatalf("dishonest conflict result: %q", got)
 		}
 	})
 

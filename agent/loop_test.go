@@ -88,8 +88,8 @@ func (f *fakeStore) GetProfile(_ context.Context, userID int64) (*types.Profile,
 	return &cp, nil
 }
 
-// UpsertProfileFields 对齐生产语义（store/profiles.go）：nil 不改、
-// 非 nil 整体替换（截前 12）、刷 updated_at、RETURNING 更新后全行。
+// UpsertProfileFields fake records first-intake arguments. Authority-active
+// behavior is injected through upsertErr in tool contract tests.
 func (f *fakeStore) UpsertProfileFields(_ context.Context, userID int64, industry, occupation *string, tags []string) (*types.Profile, error) {
 	f.upsertCalls = append(f.upsertCalls, upsertProfileRecord{
 		userID: userID, industry: industry, occupation: occupation, tags: tags,

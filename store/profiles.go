@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/types"
 )
@@ -30,7 +32,7 @@ func scanProfile(row pgx.Row, p *types.Profile) error {
 }
 
 // 写路径纪律（契约 §3.1，CAS 约定前提）：除本文件三个写方法外禁止任何代码直写 profiles。
-//   - 人工（UpsertProfileFields）：无条件写 + 刷 updated_at，人工恒赢；
+//   - 首采（UpsertProfileFields）：仅在 profile 不存在时原子创建 manual claims；
 //   - 演化（EvolveProfile / AdvanceProfileCursor）：(updated_at, 游标) 双条件 CAS，冲突即退让。
 
 // GetProfile 按 user_id 取画像；无行返回 CodeNotFound。
@@ -71,49 +73,92 @@ func (s *Store) GetProfileForTenant(ctx context.Context, tenantID, userID int64)
 	return &p, nil
 }
 
-// UpsertProfileFields 人工写路径（首采 2.1 与修正 2.3 共用）：nil 字段不改，
-// tags 为 nil 不改、非 nil 整体替换（截前 12）。不触碰 summary/游标/token 三件套
-// （summary 归演化独有，全字段覆盖会清掉演化产物——主控裁决）。
-// 必须是 INSERT ... ON CONFLICT (user_id) DO UPDATE：并发首采两张确认卡同时确认时
-// 后者命中 DO UPDATE 而非报错。无条件写 + updated_at=now()：人工恒赢，
-// 刷 updated_at 使并发演化的 CAS 失效退让。RETURNING 全列。
-//
-// removed_tags 黑名单（014，Gate ⑧）：tags 非 nil 时同语句维护——
-// 新黑名单 = (旧黑名单 ∪ 旧 tags) − 新 tags（集合语义）。被删的旧标签入列、
-// 人工加回的出列、仍在列上的保留；单语句维护无读-改-写窗口，与并发首采/演化
-// 的原子性约定一致。演化侧凭本列硬过滤"加回人工删除标签"（evolver.dropRemovedTags）。
+// UpsertProfileFields 保留原名以兼容 Agent 首采调用面，但 062 后仅允许首次创建。
+// profile、claim_state(v0) 与 manual seed claims 在同一事务提交；已有 profile
+// fail-closed，纠正必须走来源级 claim action，避免 profiles/ledger 双权威漂移。
 func (s *Store) UpsertProfileFields(ctx context.Context, userID int64, industry, occupation *string, tags []string) (*types.Profile, error) {
 	if len(tags) > maxProfileTags {
 		tags = tags[:maxProfileTags]
 	}
-	// nil 不改的实现：pgx 把 nil 指针 / nil 切片编码为 NULL，DO UPDATE 分支
-	// COALESCE(NULL, 旧值) 即保持原值；INSERT 分支 COALESCE 到列默认零值。
-	// 注意谓词区分的是 nil 与非 nil——非 nil 空串/空数组是合法的"置空"。
-	// $4::text[] 显式转型是必须的：COALESCE 参数不继承 INSERT 目标列类型，
-	// 不写会被 PG 解析为 text 报 42804。
-	// removed_tags 的 EXCEPT 子查询是集合语义（自带去重）；array_agg 加 ORDER BY
-	// 使黑名单顺序确定，便于测试与人读。
-	var p types.Profile
-	err := scanProfile(s.pool.QueryRow(ctx,
-		`INSERT INTO profiles (tenant_id, user_id, industry, occupation, tags, updated_at)
-		 VALUES (`+tenantOfUser+`$1), $1, COALESCE($2, ''), COALESCE($3, ''), COALESCE($4::text[], '{}'), now())
-		 ON CONFLICT (user_id) DO UPDATE SET
-		     industry     = COALESCE($2, profiles.industry),
-		     occupation   = COALESCE($3, profiles.occupation),
-		     tags         = COALESCE($4::text[], profiles.tags),
-		     removed_tags = CASE WHEN $4::text[] IS NULL THEN profiles.removed_tags ELSE
-		         (SELECT COALESCE(array_agg(t ORDER BY t), '{}'::text[]) FROM (
-		             SELECT unnest(profiles.removed_tags || profiles.tags) AS t
-		             EXCEPT
-		             SELECT unnest($4::text[])
-		         ) diff(t))
-		     END,
-		     updated_at   = now()
-		 RETURNING `+profileColumns,
-		userID, industry, occupation, tags), &p)
-	if err != nil {
+	var tenantID, membershipCount int64
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(min(tenant_id),0),count(*)
+		   FROM memberships WHERE user_id=$1`,
+		userID).Scan(&tenantID, &membershipCount); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("upsert 画像字段（user=%d）", userID), err)
+			fmt.Sprintf("解析画像租户（user=%d）", userID), err)
+	}
+	if membershipCount == 0 {
+		return nil, types.NewAppError(types.CodeNotFound, "用户没有可用租户 membership", nil)
+	}
+	if membershipCount != 1 {
+		return nil, types.NewAppError(
+			types.CodeConflict, "用户存在多个租户 membership，旧画像首采入口拒绝猜测归属", nil)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "开启画像首采事务", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SET LOCAL search_path = pg_catalog, public, pg_temp`); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "固定画像首采 search_path", err)
+	}
+	if exists, err := lockTenantAdmissionRoot(ctx, tx, tenantID); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "锁定画像首采租户准入", err)
+	} else if !exists {
+		return nil, types.NewAppError(types.CodeNotFound, "租户不存在", nil)
+	}
+	if err := lockExactProfileMembershipRoot(
+		ctx, tx, tenantID, userID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true),
+		        set_config('app.user_id',$2,true)`,
+		strconv.FormatInt(tenantID, 10), strconv.FormatInt(userID, 10)); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "设置画像首采范围", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_profile_claim_editor`); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "进入画像首采 authority", err)
+	}
+	var existingUserID int64
+	err = tx.QueryRow(ctx,
+		`SELECT user_id FROM profiles WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE`,
+		tenantID, userID).Scan(&existingUserID)
+	if err == nil {
+		return nil, types.NewAppError(
+			types.CodeConflict,
+			"来源级画像 authority 已启用，已有画像只能通过主张纠正",
+			nil,
+		)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, types.NewAppError(types.CodeDatabase, "检查画像首采状态", err)
+	}
+	var p types.Profile
+	p.UserID = userID
+	err = scanProfileEdit(tx.QueryRow(ctx,
+		`INSERT INTO profiles
+		    (tenant_id,user_id,industry,occupation,tags,updated_at)
+		 VALUES ($1,$2,COALESCE($3,''),COALESCE($4,''),
+		         COALESCE($5::text[],'{}'),now())
+		 RETURNING `+profileEditColumns,
+		tenantID, userID, industry, occupation, tags), &p)
+	if err != nil {
+		if pgErr := new(pgconn.PgError); errors.As(err, &pgErr) &&
+			pgErr.Code == "23505" {
+			return nil, types.NewAppError(types.CodeConflict, "画像已经存在", err)
+		}
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("创建画像字段（user=%d）", userID), err)
+	}
+	if err := seedInitialManualProfileClaimsTx(
+		ctx, tx, tenantID, userID, &p); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "提交画像首采事务", err)
 	}
 	return &p, nil
 }
@@ -125,22 +170,46 @@ func (s *Store) UpsertProfileFields(ctx context.Context, userID int64, industry,
 // 慢演化写回会把已推进的游标回退、反馈被二次消费（审查 F6）。
 // 0 行命中返回 CodeConflict，调用方丢弃本次演化（游标不动，下轮在新画像上重新消费）。
 func (s *Store) EvolveProfile(ctx context.Context, userID int64, summary string, tags []string, newCursor int64, expectedAt time.Time, expectedCursor int64) error {
-	// tags 列 NOT NULL：nil 归一为空数组，避免 pgx 编码 NULL 触发约束错误。
 	if tags == nil {
 		tags = []string{}
 	}
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE profiles
-		 SET summary = $2, tags = $3, last_evolved_feedback_id = $4, updated_at = now()
-		 WHERE user_id = $1 AND updated_at = $5 AND last_evolved_feedback_id = $6`,
-		userID, summary, tags, newCursor, expectedAt, expectedCursor)
+	var tenantID int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT tenant_id FROM profiles WHERE user_id=$1`, userID).Scan(&tenantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return types.NewAppError(types.CodeConflict,
+			fmt.Sprintf("画像演化 CAS 未命中（user=%d）", userID), nil)
+	}
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("演化写画像（user=%d）", userID), err)
+			fmt.Sprintf("查询演化画像租户（user=%d）", userID), err)
 	}
-	if tag.RowsAffected() == 0 {
-		return types.NewAppError(types.CodeConflict,
-			fmt.Sprintf("画像演化 CAS 未命中（user=%d）：画像已被并发修改或游标已推进", userID), nil)
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase, "开启画像演化事务", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SET LOCAL search_path = pg_catalog, public, pg_temp`); err != nil {
+		return types.NewAppError(types.CodeDatabase, "固定画像演化 search_path", err)
+	}
+	if exists, err := lockTenantAdmissionRoot(ctx, tx, tenantID); err != nil {
+		return types.NewAppError(types.CodeDatabase, "锁定画像演化租户准入", err)
+	} else if !exists {
+		return types.NewAppError(types.CodeNotFound, "租户不存在", nil)
+	}
+	if err := lockExactProfileMembershipRoot(
+		ctx, tx, tenantID, userID); err != nil {
+		return err
+	}
+	if err := evolveProfileClaimsTx(
+		ctx, tx, tenantID, userID, summary, tags, newCursor,
+		expectedAt, expectedCursor, false,
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.NewAppError(types.CodeDatabase, "提交画像演化事务", err)
 	}
 	return nil
 }
@@ -150,11 +219,36 @@ func (s *Store) EvolveProfile(ctx context.Context, userID int64, summary string,
 // （updated_at + 旧游标双条件），冲突返回 CodeConflict 由调用方静默跳过。
 // 用途：演化"语义失败"时标记该批反馈已消费防死循环（契约 §9）。
 func (s *Store) AdvanceProfileCursor(ctx context.Context, userID int64, newCursor int64, expectedAt time.Time, expectedCursor int64) error {
-	tag, err := s.pool.Exec(ctx,
+	var tenantID int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT tenant_id FROM profiles WHERE user_id=$1`, userID).Scan(&tenantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return types.NewAppError(types.CodeConflict,
+			fmt.Sprintf("画像游标推进 CAS 未命中（user=%d）", userID), nil)
+	}
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase, "查询画像游标租户", err)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase, "开启画像游标事务", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if exists, err := lockTenantAdmissionRoot(ctx, tx, tenantID); err != nil {
+		return types.NewAppError(types.CodeDatabase, "锁定画像游标租户准入", err)
+	} else if !exists {
+		return types.NewAppError(types.CodeNotFound, "租户不存在", nil)
+	}
+	if err := lockExactProfileMembershipRoot(
+		ctx, tx, tenantID, userID); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx,
 		`UPDATE profiles
-		 SET last_evolved_feedback_id = $2
-		 WHERE user_id = $1 AND updated_at = $3 AND last_evolved_feedback_id = $4`,
-		userID, newCursor, expectedAt, expectedCursor)
+		 SET last_evolved_feedback_id = $3
+		 WHERE tenant_id = $1 AND user_id = $2
+		   AND updated_at = $4 AND last_evolved_feedback_id = $5`,
+		tenantID, userID, newCursor, expectedAt, expectedCursor)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("推进画像演化游标（user=%d）", userID), err)
@@ -162,6 +256,9 @@ func (s *Store) AdvanceProfileCursor(ctx context.Context, userID int64, newCurso
 	if tag.RowsAffected() == 0 {
 		return types.NewAppError(types.CodeConflict,
 			fmt.Sprintf("画像游标推进 CAS 未命中（user=%d）：画像已被并发修改或游标已推进", userID), nil)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.NewAppError(types.CodeDatabase, "提交画像游标事务", err)
 	}
 	return nil
 }

@@ -212,12 +212,14 @@ func (s *Store) LookupSession(ctx context.Context, tokenHash []byte) (*types.Ses
 	// 且容易在某条分支上漏判。
 	err := s.pool.QueryRow(ctx,
 		`UPDATE user_sessions us SET last_seen_at = now()
-		   FROM tenants t
+		   FROM tenants t, memberships m
 		  WHERE us.token_hash = $1
 		    AND us.expires_at > now()
 		    AND t.id = us.tenant_id
 		    AND t.status = 'active'
 		    AND t.deleted_at IS NULL
+		    AND m.tenant_id = us.tenant_id
+		    AND m.user_id = us.user_id
 		RETURNING us.token_hash, us.user_id, us.tenant_id, us.created_at, us.expires_at, us.last_seen_at`,
 		tokenHash).Scan(&sess.TokenHash, &sess.UserID, &sess.TenantID,
 		&sess.CreatedAt, &sess.ExpiresAt, &sess.LastSeenAt)

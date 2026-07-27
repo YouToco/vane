@@ -1430,9 +1430,9 @@ func (t *viewProfileTool) Execute(ctx context.Context, userID int64, _ json.RawM
 func (t *viewProfileTool) Summarize(json.RawMessage) string { return "" }
 
 // ============================================================
-// update_profile：写工具，画像首采（2.1）与人工修正（2.3）共用，走 M4 标准确认卡
-// （首采不特例：AI 出预填、人点执行的不变式对写画像同样成立）。
-// summary 刻意不在工具面：归演化独有；标签删除只在这里发生（演化只增不减）。
+// update_profile：只用于画像首次采集（2.1），走 M4 标准确认卡。
+// 062 来源级 authority 启用后，已有画像只能在 Web「画像依据」逐条纠正；
+// Agent 不提供未经设计的多 claim 修改工具。
 // ============================================================
 
 // maxProfileTags 人工标签上限（契约 §2：与库内/演化上限统一为 12，超 12 截前 12——
@@ -1442,12 +1442,12 @@ const maxProfileTags = 12
 const updateProfileSchema = `{
   "type": "object",
   "properties": {
-    "industry": {"type": "string", "description": "所在行业，省略表示不修改"},
-    "occupation": {"type": "string", "description": "职业/岗位，省略表示不修改"},
+    "industry": {"type": "string", "description": "首次画像采集的所在行业"},
+    "occupation": {"type": "string", "description": "首次画像采集的职业/岗位"},
     "tags": {
       "type": "array",
       "items": {"type": "string"},
-      "description": "关注标签列表，整体替换现有标签：先用 view_profile 取现有标签、合并后完整提供（缺了的会被删除），最多 12 个；省略表示不修改"
+      "description": "首次画像采集的关注标签列表，最多 12 个"
     }
   }
 }`
@@ -1466,7 +1466,7 @@ type updateProfileTool struct {
 
 func (t *updateProfileTool) Name() string { return "update_profile" }
 func (t *updateProfileTool) Description() string {
-	return "更新用户画像：行业、职业、关注标签。tags 是整体替换，提交前先用 view_profile 查看现有标签并合并；省略的字段保持不变。"
+	return "仅用于首次创建用户画像（行业、职业、关注标签）。若画像已存在，不要调用；请引导用户到 Web「画像依据」逐条纠正、排除、固定或撤销。"
 }
 func (t *updateProfileTool) Parameters() json.RawMessage {
 	return json.RawMessage(updateProfileSchema)
@@ -1484,9 +1484,12 @@ func (t *updateProfileTool) Execute(ctx context.Context, userID int64, args json
 	}
 	p, err := t.st.UpsertProfileFields(ctx, userID, a.Industry, a.Occupation, capProfileTags(a.Tags))
 	if err != nil {
+		if errors.Is(err, types.ErrConflict) {
+			return "画像已经存在，本次未修改。请到 Web 的「画像依据」逐条纠正、排除、固定或撤销。", nil
+		}
 		return "", err
 	}
-	return "画像已更新。当前画像——" + renderProfile(p), nil
+	return "画像已首次创建。当前画像——" + renderProfile(p), nil
 }
 
 // Summarize 只列提供的字段（契约 §12.3）：确认卡如实展示本次会改什么，

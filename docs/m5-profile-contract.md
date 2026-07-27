@@ -204,6 +204,69 @@ func (s *Store) MarkDeliverySent(ctx context.Context, id int64, feishuMessageID 
 func (s *Store) GetContentItem(ctx context.Context, id int64) (*types.ContentItem, error)
 ```
 
+### 3.4 来源级画像纠正 authority（6.3-B，migration 062）
+
+`profiles` 从 062 起是派生读投影，不再是可被多条写路径任意覆盖的事实源。权威事实由
+`profile_claim_states`、`profile_claims`、`profile_claim_events` 和
+`profile_claim_receipts` 组成：
+
+- 来源对外只有 `evidence`、`manual`、`source_unavailable` 三态。迁移前已存在且无法
+  核验来源的字段只能回填为 `source_unavailable`，禁止补造 evidence。Evolver 写入的
+  `source_ref_type=feedback_range` 只表示“该 processing batch 产出了这一代画像”的
+  provenance，不表示范围内每条 feedback 都能逐句 entail 对应 statement。
+- summary 按确定性 Unicode 句界拆成最多 240 rune 的 statement claim；summary 整体
+  仍只读，但单条 statement 可 `correct`、`suppress`、`pin`，不会开放整段自由编辑。
+  migration backfill 与 Go splitter 必须同构：连续标点逐个 flush、每段 trim、240 rune
+  强制 flush，避免迁移 claim 与下一代 Evolver claim 的语义键不同而使污染复活。
+- 人工事件仅追加：`correct|suppress|pin|revoke`。`revoke` 是对同 tenant+user 的单个
+  未撤销人工事件的补偿，不删除 claim/event；已撤销、跨用户、revoke 事件和存在后续
+  依赖的目标必须拒绝。重复 pin 和其他不产生 authority 状态变化的 action 也必须拒绝，
+  不得追加空事件或递增 version。
+- mutation 必须携带 `Idempotency-Key` 与 `expected_version`。同键同摘要精确重放首次
+  响应且不再次递增版本；同键异请求冲突；状态行锁 + CAS 保证并发只有一个新写生效。
+  active summary claims 的总长度不超过 500 rune；mutation/跨代 pin 若突破上限必须整
+  事务拒绝，不能留下 claim/event/version/profile 任一侧的半提交。
+- GET 显式提供 `event_limit`/`event_cursor` 时启用 event id DESC keyset 分页；游标绑定
+  tenant/user/version/snapshot max/before/limit，版本或 snapshot 变化返回冲突。首屏返回
+  全部 active claims（硬上界 514）及本页 event target/result context（总上界 614），
+  续页只返回本页 context（上界 100）；revoked/revocable/dependent 仍按完整 ledger 计算。
+  backend-first 过渡期内，无查询参数 GET 暂保留旧返回语义，待 UI 切换后再翻转默认。
+- action 响应只返回 active claims 与本次 target/result context（上界 516），并显式标记
+  `claims_complete:false`；幂等 receipt 必须精确重放首次有界响应。
+- Evolver 的模型输入只能使用非 manual 的 evidence/base summary 与 tags；写回时先追加
+  新 evidence generation，再由 active claims + effective manual events 重编译 profile。
+  模型基线必须先应用 effective correct/suppress/pin 再过滤 manual，不能直接按 generation
+  原始查询，否则被纠正/排除的污染原句会再次进入 LLM；manual replacement 仅在 store
+  重编译阶段加回。
+  active correct/suppress/pin 必须跨后续 Evolver 保持效力。
+
+权限和切换边界：
+
+- 062 使用独立 `vane_profile_claim_editor`，不扩张 060 `vane_profile_editor` 的 summary
+  只读权限。claim role 是 NOLOGIN/NOINHERIT/NOBYPASSRLS，只有迁移 owner 可 SET；
+  所有 claim 表以及 profiles/memberships 均按精确 tenant+user RLS fail-closed；
+  missing/empty tenant/user GUC 必须得到零行或拒写，不能触发 bigint cast 错误。
+- 062 Up 在任何 profile 回填前持有 profiles 的 writer fence 到提交，保证旧 UPDATE/INSERT
+  要么先提交并被回填，要么在切换后失败；GET 永远只读，不承担“发现缺 ledger 再补写”。
+  062 Down 先按 producer 顺序对 profiles→states→claims→events→receipts 取 ACCESS EXCLUSIVE，
+  再做空表 fence，确保未提交 producer 提交后会阻止降级而不是被 DROP。
+- ledger 归属通过 profiles/claim_state 的 NO ACTION 外键固定，不依赖 membership 的
+  ON DELETE CASCADE。撤销 membership 只撤访问，不删画像或审计；tenant purge 继续按
+  receipts→events→claims→states→profiles 显式清理。
+- 完全没有 profile 的首次采集可通过旧入口兼容委托：同一事务创建 profile、
+  `claim_state(version=0)` 与 manual seed claims。创建完成后，旧 PATCH/undo 和 Agent
+  `update_profile` 更新路径一律 fail-closed；旧 revisions/history 仅保留只读审计，
+  对外 `undoable` 恒为 false，恢复只能追加 claim `revoke` 补偿事件。
+- Agent `update_profile` 只用于首次采集。已有画像需要纠正时必须引导用户到 Web
+  「画像依据」逐条纠正、排除、固定或撤销，不新增未经设计的多-claim Agent 工具。
+- 6.3-B 不实现 reset epoch、整库画像重置或历史硬删；这些属于 6.3-C。
+
+实现/Workmemory 同步建议：当前 projection 已把 semantic/field deactivate 建成 active
+索引，并 memo supersedes root，使单轮编译保持 `O(claims+events)`（排序除外）。但 ledger
+本身仍永久增长，读取完整历史与每次重编译最终会成为 checkpoint 风险；6.3-C 设计 reset
+epoch 时应同时定义可验证 snapshot/checkpoint、旧事件审计锚点和重放一致性测试，不能用
+静默截断 active/revocable authority 的方式“优化”。
+
 ## 4. 新包 `profilehint`（画像提示 + per-trace 缓存，scorer/cardgen 共享）
 
 ```go

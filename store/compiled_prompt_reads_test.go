@@ -14,12 +14,7 @@ func TestCompiledPromptReads_AreExactTenantScoped(t *testing.T) {
 	f := newCompiledRunWriteFixture(t)
 	ctx := t.Context()
 
-	if _, err := f.base.st.pool.Exec(ctx,
-		`INSERT INTO profiles (tenant_id, user_id, industry)
-		 VALUES ($1, $2, 'tenant-a-profile')`,
-		f.idA.TenantID, f.idA.UserID); err != nil {
-		t.Fatal(err)
-	}
+	f.createClaimProfile(t, "tenant-a-profile", "", nil)
 	profile, err := f.base.st.GetProfileForTenant(ctx, f.idA.TenantID, f.idA.UserID)
 	if err != nil || profile.Industry != "tenant-a-profile" {
 		t.Fatalf("tenant A exact profile = %+v, err=%v", profile, err)

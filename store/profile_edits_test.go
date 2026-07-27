@@ -16,6 +16,22 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+// profileClaimAuthorityInstalled keeps the pre-062 mutation assertions
+// runnable against a deliberately downgraded fixture while allowing the same
+// test to stop after its 062 fail-closed assertions on the current schema.
+// Querying the installed schema also avoids an unconditional-return tail that
+// go vet correctly reports as unreachable.
+func profileClaimAuthorityInstalled(t *testing.T, st *Store) bool {
+	t.Helper()
+	var installed bool
+	if err := st.pool.QueryRow(t.Context(),
+		`SELECT to_regclass('public.profile_claim_states') IS NOT NULL`,
+	).Scan(&installed); err != nil {
+		t.Fatal(err)
+	}
+	return installed
+}
+
 func TestProfileManualAuthority(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -38,6 +54,10 @@ func TestProfileManualAuthority(t *testing.T) {
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claim_receipts WHERE user_id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claim_events WHERE user_id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claims WHERE user_id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claim_states WHERE user_id=$1`, u.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM profile_edit_receipts WHERE user_id=$1`, u.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM profile_edit_revisions WHERE user_id=$1`, u.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM profiles WHERE user_id=$1`, u.ID)
@@ -78,9 +98,41 @@ func TestProfileManualAuthority(t *testing.T) {
 	); !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("PATCH key 跨端点复用于无效 target 应先冲突: %v", err)
 	}
+	claims, err := st.ListProfileClaims(t.Context(), 1, u.ID)
+	if err != nil || claims.Version != 0 {
+		t.Fatalf("initial create did not atomically seed claims: %+v err=%v", claims, err)
+	}
+	for _, claim := range claims.Claims {
+		if claim.Source.State != "manual" {
+			t.Fatalf("initial claim source=%+v", claim.Source)
+		}
+	}
+	tagsOnlyA := []string{"A"}
+	if _, err := st.PatchProfile(
+		t.Context(), 1, u.ID, &first.UpdatedAt,
+		types.ProfileEditPatch{Tags: &tagsOnlyA},
+		"edit-blocked", strings.Repeat("e", 64),
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("legacy edit after claim cutover must fail closed: %v", err)
+	}
+	history, err := st.ListProfileEdits(t.Context(), 1, u.ID, 20)
+	if err != nil || len(history) != 1 {
+		t.Fatalf("legacy history must remain readable: %+v err=%v", history, err)
+	}
+	if history[0].Undoable {
+		t.Fatalf("legacy audit history advertised disabled undo: %+v", history[0])
+	}
+	if _, err := st.UndoProfileEdit(
+		t.Context(), 1, u.ID, parseTestID(t, history[0].ID), first.UpdatedAt,
+		"undo-blocked", strings.Repeat("f", 64),
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("legacy undo after claim cutover must fail closed: %v", err)
+	}
+	if profileClaimAuthorityInstalled(t, st) {
+		return
+	}
 
 	// 人工删除 B：黑名单应为 B。
-	tagsOnlyA := []string{"A"}
 	second, err := st.PatchProfile(
 		t.Context(), 1, u.ID, &first.UpdatedAt,
 		types.ProfileEditPatch{Tags: &tagsOnlyA},
@@ -215,9 +267,14 @@ func TestProfileManualAuthorityConcurrentCAS(t *testing.T) {
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claim_receipts WHERE user_id=$1`, userID)
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claim_events WHERE user_id=$1`, userID)
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claims WHERE user_id=$1`, userID)
+		cleanupExec(ctx, t, st, `DELETE FROM profile_claim_states WHERE user_id=$1`, userID)
 		cleanupExec(ctx, t, st, `DELETE FROM profile_edit_receipts WHERE user_id=$1`, userID)
 		cleanupExec(ctx, t, st, `DELETE FROM profile_edit_revisions WHERE user_id=$1`, userID)
 		cleanupExec(ctx, t, st, `DELETE FROM profiles WHERE user_id=$1`, userID)
+		cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE user_id=$1`, userID)
 		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id=$1`, userID)
 	})
 	a, b := "A", "B"
@@ -271,8 +328,11 @@ func TestProfileManualAuthorityConcurrentCAS(t *testing.T) {
 			t.Fatalf("双 tab 异常: %v", r.err)
 		}
 	}
-	if success != 1 || conflicts != 1 {
+	if success != 0 || conflicts != 2 {
 		t.Fatalf("双tab success=%d conflict=%d", success, conflicts)
+	}
+	if profileClaimAuthorityInstalled(t, st) {
+		return
 	}
 
 	// 直接 SQL-CAS 竞态：两事务共享同一 expected token，只有一个 UPDATE
@@ -356,9 +416,14 @@ func TestProfileManualAuthorityEmptyArraysUndoAndExactUserRLS(t *testing.T) {
 		ctx, cancel := cleanupContext()
 		defer cancel()
 		for _, id := range []int64{user1, user2} {
+			cleanupExec(ctx, t, st, `DELETE FROM profile_claim_receipts WHERE user_id=$1`, id)
+			cleanupExec(ctx, t, st, `DELETE FROM profile_claim_events WHERE user_id=$1`, id)
+			cleanupExec(ctx, t, st, `DELETE FROM profile_claims WHERE user_id=$1`, id)
+			cleanupExec(ctx, t, st, `DELETE FROM profile_claim_states WHERE user_id=$1`, id)
 			cleanupExec(ctx, t, st, `DELETE FROM profile_edit_receipts WHERE user_id=$1`, id)
 			cleanupExec(ctx, t, st, `DELETE FROM profile_edit_revisions WHERE user_id=$1`, id)
 			cleanupExec(ctx, t, st, `DELETE FROM profiles WHERE user_id=$1`, id)
+			cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE user_id=$1`, id)
 			cleanupExec(ctx, t, st, `DELETE FROM users WHERE id=$1`, id)
 		}
 	})
@@ -371,27 +436,29 @@ func TestProfileManualAuthorityEmptyArraysUndoAndExactUserRLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	occupation := "builder"
-	edited, err := st.PatchProfile(
+	if _, err := st.PatchProfile(
 		t.Context(), 1, user1, &created.UpdatedAt,
 		types.ProfileEditPatch{Occupation: &occupation},
-		"empty-edit", strings.Repeat("3", 64))
-	if err != nil {
-		t.Fatal(err)
+		"empty-edit", strings.Repeat("3", 64),
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("legacy edit must fail closed: %v", err)
 	}
 	edits, err := st.ListProfileEdits(t.Context(), 1, user1, 5)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || len(edits) != 1 {
+		t.Fatalf("legacy create history unavailable: %+v err=%v", edits, err)
+	}
+	if edits[0].Undoable {
+		t.Fatalf("legacy create history advertised disabled undo: %+v", edits[0])
 	}
 	target, _ := strconv.ParseInt(edits[0].ID, 10, 64)
-	restored, err := st.UndoProfileEdit(
-		t.Context(), 1, user1, target, edited.UpdatedAt,
-		"empty-undo", strings.Repeat("4", 64))
-	if err != nil {
-		t.Fatal(err)
+	if _, err := st.UndoProfileEdit(
+		t.Context(), 1, user1, target, created.UpdatedAt,
+		"empty-undo", strings.Repeat("4", 64),
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("legacy undo must fail closed: %v", err)
 	}
-	if restored.Tags == nil || restored.RemovedTags == nil ||
-		len(restored.Tags) != 0 || len(restored.RemovedTags) != 0 {
-		t.Fatalf("empty arrays not preserved: %+v", restored)
+	if profileClaimAuthorityInstalled(t, st) {
+		return
 	}
 
 	otherIndustry := "other"
@@ -669,6 +736,14 @@ func TestProfileEditTxPinsSearchPath(t *testing.T) {
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(ctx, t, st,
+			`DELETE FROM profile_claim_receipts WHERE user_id=$1`, userID)
+		cleanupExec(ctx, t, st,
+			`DELETE FROM profile_claim_events WHERE user_id=$1`, userID)
+		cleanupExec(ctx, t, st,
+			`DELETE FROM profile_claims WHERE user_id=$1`, userID)
+		cleanupExec(ctx, t, st,
+			`DELETE FROM profile_claim_states WHERE user_id=$1`, userID)
 		cleanupExec(ctx, t, st,
 			`DELETE FROM profile_edit_receipts WHERE user_id=$1`, userID)
 		cleanupExec(ctx, t, st,

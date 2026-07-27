@@ -758,21 +758,11 @@ func (s *Store) EvolveProfileForTaskRunV1(
 		return err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
-	tag, err := tx.Exec(ctx,
-		`UPDATE profiles
-		    SET summary = $3, tags = $4,
-		        last_evolved_feedback_id = $5, updated_at = now()
-		  WHERE tenant_id = $1 AND user_id = $2
-		    AND updated_at = $6 AND last_evolved_feedback_id = $7`,
-		expected.TenantID, expected.UserID, summary, tags, newCursor,
-		expectedAt, expectedCursor,
-	)
-	if err != nil {
-		return taskRunDatabaseError("evolve compiled task profile", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return types.NewAppError(types.CodeConflict,
-			"compiled task profile evolution CAS did not match", nil)
+	if err := evolveProfileClaimsTx(
+		ctx, tx, expected.TenantID, expected.UserID,
+		summary, tags, newCursor, expectedAt, expectedCursor, true,
+	); err != nil {
+		return err
 	}
 	return commitCompiledRunWriteV1(ctx, tx, "commit compiled task profile evolution")
 }

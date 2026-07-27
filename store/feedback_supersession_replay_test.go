@@ -11,14 +11,7 @@ import (
 func TestLegacyFeedbackRepairReplaySuppressesPairedNegatives(t *testing.T) {
 	f := newCompiledRunWriteFixture(t)
 	ctx := t.Context()
-	if _, err := f.base.st.pool.Exec(ctx,
-		`INSERT INTO profiles (
-		     tenant_id,user_id,last_evolved_feedback_id
-		 ) VALUES ($1,$2,0)`,
-		f.idA.TenantID, f.idA.UserID,
-	); err != nil {
-		t.Fatal(err)
-	}
+	f.createClaimProfile(t, "", "", nil)
 
 	key := "legacy-paired-replay-" + uuid.NewString()
 	batchID, err := f.base.st.CreatePushBatchForTaskRunV1(
@@ -84,9 +77,6 @@ func TestLegacyFeedbackRepairReplaySuppressesPairedNegatives(t *testing.T) {
 		}
 		cleanupExec(cleanupCtx, t, f.base.st,
 			`DELETE FROM feedbacks WHERE id=ANY($1)`, feedbackIDs)
-		cleanupExec(cleanupCtx, t, f.base.st,
-			`DELETE FROM profiles WHERE tenant_id=$1 AND user_id=$2`,
-			f.idA.TenantID, f.idA.UserID)
 	})
 
 	preview, err := f.base.st.PreviewLegacyFeedbackRepair(
