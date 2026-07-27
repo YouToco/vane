@@ -1,7 +1,9 @@
 package store
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -10,6 +12,8 @@ import (
 	"time"
 
 	"github.com/pressly/goose/v3"
+
+	"github.com/YouToco/vane/types"
 )
 
 func TestMigration062RecoveryRoleIsReadOnlyAndKeysetBounded(t *testing.T) {
@@ -265,5 +269,103 @@ func TestMigration062DownUsesCanonicalWriterFence(t *testing.T) {
 	if !strings.Contains(string(raw),
 		"SELECT pg_advisory_xact_lock(6215335020355474248)") {
 		t.Fatal("062 Down lacks the canonical writer admission fence")
+	}
+	if strings.Contains(string(raw),
+		"REVOKE vane_run_outcome_recovery FROM CURRENT_USER") {
+		t.Fatal("062 Down must not remove preexisting cluster role membership")
+	}
+}
+
+func TestMigration062DownRejectsBeginQueuedBehindFence(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 0)
+	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, upErr := provider.UpTo(context.Background(), 62); upErr != nil {
+			t.Errorf("restore migration 062: %v", upErr)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	blocker, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockerDone := false
+	defer func() {
+		if !blockerDone {
+			_ = blocker.Rollback()
+		}
+	}()
+	if _, err := blocker.ExecContext(ctx,
+		`LOCK TABLE task_run_outcomes IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	downDone := make(chan error, 1)
+	go func() {
+		_, downErr := provider.DownTo(ctx, 61)
+		downDone <- downErr
+	}()
+	if !waitForScratchQueryLock(
+		ctx, db, "%refusing downgrade while pending run outcomes exist%",
+		5*time.Second,
+	) {
+		t.Fatal("062 Down did not hold the exclusive fence before its check")
+	}
+
+	beginDone := make(chan error, 1)
+	go func() {
+		_, beginErr := f.base.st.CreatePendingRunOutcomeV1(
+			ctx, f.identity, f.ref)
+		beginDone <- beginErr
+	}()
+	if !waitForScratchQueryLock(
+		ctx, db, "%pg_advisory_xact_lock_shared%", 5*time.Second,
+	) {
+		t.Fatal("queued Begin did not wait behind 062 Down")
+	}
+	if err := blocker.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	blockerDone = true
+
+	select {
+	case err := <-downDone:
+		if err != nil {
+			t.Fatalf("062 Down with no pending markers: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("062 Down did not converge")
+	}
+	select {
+	case err := <-beginDone:
+		if err == nil || !errors.Is(err, types.ErrDatabase) {
+			t.Fatalf("queued Begin after recovery teardown = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("queued Begin did not fail closed")
+	}
+
+	var pending int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM task_run_outcomes WHERE status='pending'`,
+	).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 {
+		t.Fatalf("queued Begin stranded %d pending markers", pending)
 	}
 }

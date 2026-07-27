@@ -1055,16 +1055,15 @@ func (s *Scheduler) buildPreparedTaskSchedule(req TaskScheduleRequest) (Prepared
 		scope.SourceIDs = slices.Clone(req.Scope.SourceIDs)
 	}
 	params := makePushParams(req.TenantID, req.UserID, taskID, scope, name)
-	runtimeVersion := s.compiledRuntime.runtimeVersionFor(taskID)
+	runtimeVersion := s.runtimeVersionFor(taskID, types.ExecutionModeCompiled)
 	fingerprintVersion := taskScheduleFingerprintVersionV1
-	if runtimeVersion == workflow.CompiledRuntimeSnapshotV1 {
+	if workflow.IsCompiledRuntimeV1(runtimeVersion) {
 		// A v2 checkpoint is written only for an explicitly selected C1b
 		// canary/all-task rollout. This keeps dark deployment expansion-safe:
 		// an older binary can still resume every checkpoint written before C1b
 		// is deliberately activated.
 		fingerprintVersion = taskScheduleFingerprintVersion
-		params.RuntimeVersion = s.runOutcome.runtimeVersionFor(
-			taskID, runtimeVersion)
+		params.RuntimeVersion = runtimeVersion
 	} else {
 		// Preserve the exact semantic v1 Action envelope. buildTaskScheduleExpected
 		// upgrades it deterministically before Temporal I/O, while the durable

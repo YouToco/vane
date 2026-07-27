@@ -132,10 +132,13 @@ a completed execution without a terminal receipt becomes
 `failed/outcome_missing_terminal_receipt`. Shutdown stops admission and drains
 already-admitted recovery work.
 
-Up and Down first drain schema-aware writers and take producer-compatible
-access-exclusive locks. Migration 062 Down refuses while any outcome remains
-pending; Migration 061 Down still refuses to destroy any outcome or Brief
-evidence.
+Migration 061 Up and Down drain schema-aware writers and take
+producer-compatible access-exclusive locks. Migration 062 Down takes the same
+exclusive admission fence and refuses while any outcome remains pending.
+A Begin admitted after that downgrade must also prove the recovery reader is
+still installed before inserting, so neither side of the fence can strand a
+pending marker. Migration 061 Down still refuses to destroy any outcome or
+Brief evidence.
 
 The independent rollout keys are `run_outcome_enabled`,
 `run_outcome_canary_schedule_id`, and `run_outcome_allow_all`. Selection is

@@ -2,6 +2,7 @@ package runoutcome
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,9 +16,10 @@ import (
 )
 
 type recoveryStoreFake struct {
-	mu         sync.Mutex
-	candidates []store.RunOutcomeRecoveryCandidateV1
-	claims     []types.RunOutcomeClaimV1
+	mu          sync.Mutex
+	candidates  []store.RunOutcomeRecoveryCandidateV1
+	claims      []types.RunOutcomeClaimV1
+	finalizeErr error
 }
 
 func (f *recoveryStoreFake) ListStaleRunOutcomeCandidatesV1(
@@ -45,6 +47,9 @@ func (f *recoveryStoreFake) FinalizeRecoveredRunOutcomeClaimV1(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claims = append(f.claims, claim)
+	if f.finalizeErr != nil {
+		return types.RunOutcomeV1{}, f.finalizeErr
+	}
 	return claim.SealAt(time.Now())
 }
 
@@ -186,5 +191,41 @@ func TestRecoveryClaimDoesNotPersistUnknownFailureText(t *testing.T) {
 		claim.FailureMessage !=
 			"workflow failed before a reliable terminal result" {
 		t.Fatalf("unknown failure claim = %+v terminal=%t", claim, terminal)
+	}
+}
+
+func TestRunnerTreatsConcurrentWorkflowFinalizationAsConverged(t *testing.T) {
+	st := &recoveryStoreFake{
+		candidates: []store.RunOutcomeRecoveryCandidateV1{
+			recoveryCandidate(1, "completed"),
+		},
+		finalizeErr: types.NewAppError(
+			types.CodeConflict, "run outcome is already finalized", nil),
+	}
+	runner, err := NewRunner(st, &inspectorFake{
+		executions: map[string]Execution{
+			"completed": {
+				Status: enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+			},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.RunStartup(t.Context()); err != nil {
+		t.Fatalf("concurrent finalization failed startup pass: %v", err)
+	}
+}
+
+func TestExactWorkflowFailureRejectsTransportErrors(t *testing.T) {
+	if _, ok := exactWorkflowFailure(context.DeadlineExceeded); ok {
+		t.Fatal("deadline error was treated as exact workflow failure")
+	}
+	if _, ok := exactWorkflowFailure(errors.New("temporal unavailable")); ok {
+		t.Fatal("transport error was treated as exact workflow failure")
+	}
+	workflowErr := &temporal.WorkflowExecutionError{}
+	if got, ok := exactWorkflowFailure(workflowErr); !ok || got != workflowErr {
+		t.Fatalf("workflow failure = %T, %t", got, ok)
 	}
 }

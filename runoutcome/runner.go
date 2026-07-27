@@ -62,10 +62,24 @@ func (i TemporalInspector) Inspect(
 	status := description.WorkflowExecutionInfo.Status
 	execution := Execution{Status: status}
 	if status == enumspb.WORKFLOW_EXECUTION_STATUS_FAILED {
-		execution.Err = i.Client.GetWorkflow(ctx, workflowID, runID).
+		failure := i.Client.GetWorkflow(ctx, workflowID, runID).
 			Get(ctx, nil)
+		exactFailure, ok := exactWorkflowFailure(failure)
+		if !ok {
+			// Describe proved the execution is terminal, but a second RPC is
+			// still required to obtain its controlled ApplicationError. A
+			// timeout/transport error here is not evidence of the workflow's
+			// failure semantics and must never be finalized irreversibly.
+			return Execution{}, failure
+		}
+		execution.Err = exactFailure
 	}
 	return execution, nil
+}
+
+func exactWorkflowFailure(err error) (error, bool) {
+	var workflowFailure *temporal.WorkflowExecutionError
+	return err, err != nil && errors.As(err, &workflowFailure)
 }
 
 type Runner struct {
@@ -197,6 +211,12 @@ func (r *Runner) recoverOne(
 	}
 	_, err = r.store.FinalizeRecoveredRunOutcomeClaimV1(
 		passCtx, candidate.Identity, claim)
+	if errors.Is(err, types.ErrConflict) {
+		// A normal workflow finalizer may win after the stale keyset read.
+		// Conflict proves the marker is already immutable; recovery has
+		// converged even when its inferred claim differs.
+		return nil
+	}
 	return err
 }
 

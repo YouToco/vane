@@ -210,4 +210,3 @@ REVOKE USAGE ON SCHEMA public FROM vane_run_outcome_recovery;
 DROP FUNCTION
     read_stale_run_outcomes_v1(TIMESTAMPTZ,BIGINT,INTEGER);
 DROP INDEX idx_task_run_outcomes_pending_recovery_v1;
-REVOKE vane_run_outcome_recovery FROM CURRENT_USER;

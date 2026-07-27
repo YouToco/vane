@@ -584,17 +584,25 @@ func nonRetryable(err error) error {
 	return err
 }
 
-// retryableOrNot 依据 types.IsRetryable 自动决定是否包成不可重试错误：
-// 可重试的错误原样返回（交给 RetryPolicy 正常退避重试），确定性失败的走 nonRetryable。
-// 用于 Activity 里"错误码不确定但想统一交给策略判定"的返回点。
+// retryableOrNot preserves a controlled AppError code as Temporal's
+// ApplicationError Type on both retryable and permanent paths. Retryability is
+// still governed by NonRetryable, while terminal RunOutcome mapping can now
+// retain the exact sanitized code after retries are exhausted.
 func retryableOrNot(err error) error {
 	if err == nil {
 		return nil
 	}
-	if types.IsRetryable(err) {
-		return err
+	var ae *types.AppError
+	if errors.As(err, &ae) {
+		return temporal.NewApplicationErrorWithOptions(
+			ae.Message, string(ae.Code),
+			temporal.ApplicationErrorOptions{
+				NonRetryable: !ae.Retryable,
+				Cause:        err,
+			},
+		)
 	}
-	return nonRetryable(err)
+	return err
 }
 
 // ioActivityOptions 用于网络 I/O 型 Activity（Fetch/Push）。

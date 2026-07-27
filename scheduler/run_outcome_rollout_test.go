@@ -3,6 +3,7 @@ package scheduler
 import (
 	"testing"
 
+	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
 
@@ -67,5 +68,21 @@ func TestRunOutcomeRolloutInvalidCombinationFailsClosed(t *testing.T) {
 		); got != workflow.CompiledRuntimeSnapshotV1 {
 			t.Fatalf("invalid rollout expanded runtime to %q", got)
 		}
+	}
+}
+
+func TestSchedulerRuntimeResolverComposesAndRejectsDynamicMode(t *testing.T) {
+	s := &Scheduler{}
+	WithCompiledRuntimeRollout(true, "task-a", false)(s)
+	WithRunOutcomeRollout(true, "task-a", false)(s)
+	if got := s.runtimeVersionFor(
+		"task-a", types.ExecutionModeCompiled,
+	); got != workflow.CompiledRuntimeRunOutcomeV1 {
+		t.Fatalf("composed runtime = %q", got)
+	}
+	if got := s.runtimeVersionFor(
+		"task-a", types.ExecutionModeDiscoverAtRun,
+	); got != "" {
+		t.Fatalf("dynamic task received compiled runtime %q", got)
 	}
 }

@@ -3,6 +3,7 @@ package scheduler
 import (
 	"strings"
 
+	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
 
@@ -41,4 +42,17 @@ func (r runOutcomeRollout) runtimeVersionFor(
 		return workflow.CompiledRuntimeRunOutcomeV1
 	}
 	return runtimeVersion
+}
+
+// runtimeVersionFor composes the independent rollout layers in one place so
+// every durable Action constructor, repair, and rename path makes the same
+// decision. RunOutcome can only decorate an already-selected compiled runtime.
+func (s *Scheduler) runtimeVersionFor(
+	taskID string, executionMode types.ExecutionMode,
+) string {
+	if executionMode != "" && executionMode != types.ExecutionModeCompiled {
+		return ""
+	}
+	compiled := s.compiledRuntime.runtimeVersionFor(taskID)
+	return s.runOutcome.runtimeVersionFor(taskID, compiled)
 }

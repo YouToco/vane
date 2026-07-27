@@ -291,3 +291,25 @@ func TestPushPipelineWorkflow_RunOutcomeFaultMatrix(t *testing.T) {
 		})
 	}
 }
+
+func TestRetryableActivityErrorPreservesControlledOutcomeCode(t *testing.T) {
+	err := retryableOrNot(types.NewAppError(
+		types.CodeLLMUnavailable,
+		"sanitized model failure",
+		errors.New("provider raw detail"),
+	))
+	var application *temporal.ApplicationError
+	if !errors.As(err, &application) {
+		t.Fatalf("retryable error type = %T", err)
+	}
+	if application.NonRetryable() ||
+		application.Type() != string(types.CodeLLMUnavailable) ||
+		application.Message() != "sanitized model failure" {
+		t.Fatalf("retryable ApplicationError = %+v", application)
+	}
+	terminal := terminalRunOutcomeForError(err)
+	if terminal.failureCode != string(types.CodeLLMUnavailable) ||
+		terminal.failureMessage != "sanitized model failure" {
+		t.Fatalf("terminal outcome = %+v", terminal)
+	}
+}

@@ -1711,6 +1711,101 @@ func TestReconcileActions_任务名漂移回写(t *testing.T) {
 	}
 }
 
+func TestCreatePush_ComposesRunOutcomeAllowAll(t *testing.T) {
+	trace := &createPushTrace{}
+	handle := &createPushScheduleHandle{trace: trace}
+	scheduleClient := &createPushScheduleClient{
+		trace: trace, handle: handle,
+	}
+	st := &createPushStore{trace: trace}
+	s := New(
+		&createPushTemporalClient{schedules: scheduleClient},
+		"vane-create-tq", st,
+		WithCompiledRuntimeRollout(true, "", true),
+		WithRunOutcomeRollout(true, "", true),
+	)
+	if _, err := s.CreatePush(
+		t.Context(), 42, ScheduleSpec{Cron: "15 8 * * *"},
+		workflow.PushScope{}, "canary",
+	); err != nil {
+		t.Fatal(err)
+	}
+	action := scheduleClient.createOpts.Action.(*client.ScheduleWorkflowAction)
+	params := action.Args[0].(workflow.PushParams)
+	if params.RuntimeVersion != workflow.CompiledRuntimeRunOutcomeV1 {
+		t.Fatalf("create runtime = %q", params.RuntimeVersion)
+	}
+}
+
+func TestReconcileActions_UpgradesAndPreservesRunOutcomeCanary(t *testing.T) {
+	const taskID = "task-run-outcome-reconcile"
+	snapshot := makePushParams(7, 1, taskID, workflow.PushScope{}, "canary")
+	snapshot.RuntimeVersion = workflow.CompiledRuntimeSnapshotV1
+	h := &fakeScheduleHandle{current: reconcileSchedule(
+		"wf-"+taskID, []interface{}{payloadArg(t, snapshot)},
+	)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{taskID: h},
+	}}
+	st := &fakeScheduleStore{active: []types.Schedule{{
+		ID: taskID, TenantID: 7, UserID: 1, NLDescription: "canary",
+		ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusActive,
+		ExecutionMode: types.ExecutionModeCompiled,
+	}}}
+	s := New(
+		fc, "tq", st,
+		WithCompiledRuntimeRollout(true, taskID, false),
+		WithRunOutcomeRollout(true, taskID, false),
+	)
+	if err := s.ReconcileActions(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.history) != 1 {
+		t.Fatalf("snapshot action updates = %d, want 1", len(h.history))
+	}
+	got := h.current.Action.(*client.ScheduleWorkflowAction).
+		Args[0].(workflow.PushParams)
+	if got.RuntimeVersion != workflow.CompiledRuntimeRunOutcomeV1 {
+		t.Fatalf("reconciled runtime = %q", got.RuntimeVersion)
+	}
+	h.current.Action.(*client.ScheduleWorkflowAction).Args[0] =
+		payloadArg(t, got)
+	if err := s.ReconcileActions(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.history) != 1 {
+		t.Fatalf("combined action was rewritten %d times", len(h.history))
+	}
+}
+
+func TestUpdatePush_RenamePreservesRunOutcomeCanary(t *testing.T) {
+	const taskID = "task-run-outcome-rename"
+	h := &fakeScheduleHandle{current: reconcileSchedule(
+		"wf-"+taskID,
+		[]interface{}{payloadArg(t, makePushParams(
+			1, 1, taskID, workflow.PushScope{}, "old",
+		))},
+	)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
+	st := &fakeScheduleStore{}
+	s := New(
+		fc, "tq", st,
+		WithCompiledRuntimeRollout(true, taskID, false),
+		WithRunOutcomeRollout(true, taskID, false),
+	)
+	name := "new"
+	if err := s.UpdatePush(
+		t.Context(), taskID, 1, ScheduleSpec{Cron: "30 9 * * *"}, &name,
+	); err != nil {
+		t.Fatal(err)
+	}
+	got := h.current.Action.(*client.ScheduleWorkflowAction).
+		Args[0].(workflow.PushParams)
+	if got.RuntimeVersion != workflow.CompiledRuntimeRunOutcomeV1 {
+		t.Fatalf("renamed runtime = %q", got.RuntimeVersion)
+	}
+}
+
 // TestReconcileActions_单条失败继续检查但最终拒绝启动：尽量收集完整诊断，
 // 但任何漏修都不得在 worker ingress 开放后静默遗留。
 func TestReconcileActions_单条失败聚合后FailClosed(t *testing.T) {

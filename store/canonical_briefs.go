@@ -97,6 +97,22 @@ func (s *Store) CreatePendingRunOutcomeV1(
 	if err := lockCanonicalBriefRunV1(ctx, tx, ref.SnapshotID); err != nil {
 		return types.RunOutcomeMarkerV1{}, err
 	}
+	var recoveryAvailable bool
+	if err := tx.QueryRow(ctx, `
+		SELECT to_regprocedure(
+		    'read_stale_run_outcomes_v1(timestamptz,bigint,integer)'
+		) IS NOT NULL`,
+	).Scan(&recoveryAvailable); err != nil {
+		return types.RunOutcomeMarkerV1{},
+			canonicalBriefDatabaseError(
+				"check run outcome recovery capability", err)
+	}
+	if !recoveryAvailable {
+		return types.RunOutcomeMarkerV1{},
+			canonicalBriefDatabaseError(
+				"check run outcome recovery capability",
+				errors.New("run outcome recovery capability is unavailable"))
+	}
 
 	stored, found, err := loadRunOutcomeForSnapshotV1(
 		ctx, tx, ref.SnapshotID, false)
