@@ -42,8 +42,11 @@ func ParseTestList(r io.Reader) ([]string, error) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		name := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(name, "Test") || strings.ContainsAny(name, " \t/") {
+		if name == "" {
 			continue
+		}
+		if !isTopLevelTest(name) {
+			return nil, fmt.Errorf("unsupported non-test runnable in list: %q", name)
 		}
 		if _, ok := seen[name]; ok {
 			return nil, fmt.Errorf("duplicate test in list: %s", name)

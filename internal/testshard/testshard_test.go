@@ -67,6 +67,32 @@ func TestParseTimingsUsesOnlyTopLevelTerminalEvents(t *testing.T) {
 	}
 }
 
+func TestParseTestListRejectsNonTestRunnables(t *testing.T) {
+	for _, runnable := range []string{
+		"BenchmarkStore",
+		"FuzzStore",
+		"ExampleStore",
+		"HelperRunnable",
+	} {
+		t.Run(runnable, func(t *testing.T) {
+			input := "TestStore\n" + runnable + "\n"
+			if _, err := ParseTestList(strings.NewReader(input)); err == nil {
+				t.Fatalf("ParseTestList accepted %q", runnable)
+			}
+		})
+	}
+}
+
+func TestParseTestListAcceptsAndSortsTests(t *testing.T) {
+	tests, err := ParseTestList(strings.NewReader("TestZulu\nTestAlpha\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(tests, ",") != "TestAlpha,TestZulu" {
+		t.Fatalf("tests = %v", tests)
+	}
+}
+
 func TestVerifyObservedRejectsMissingAndDuplicateTests(t *testing.T) {
 	plan, err := BuildPlan([]string{"TestA", "TestB"}, nil, 2)
 	if err != nil {

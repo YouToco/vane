@@ -2,14 +2,13 @@ name: Store race sharding experiment
 
 on:
   workflow_dispatch:
-    inputs:
-      timings_path:
-        description: Optional repository-relative prior go test -json artifact
-        required: false
-        type: string
 
 permissions:
   contents: read
+
+concurrency:
+  group: store-race-sharding-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -75,24 +74,13 @@ jobs:
 
       - name: Run store race shards
         shell: bash
-        env:
-          TIMINGS_PATH: ${{ inputs.timings_path }}
         run: |
           set -euo pipefail
-          timing_args=()
-          if [[ -n "${TIMINGS_PATH}" ]]; then
-            if [[ ! -f "${TIMINGS_PATH}" ]]; then
-              echo "timings_path does not exist: ${TIMINGS_PATH}" >&2
-              exit 1
-            fi
-            timing_args=(--timings "${TIMINGS_PATH}")
-          fi
           go run ./cmd/storetestshard run \
             --artifacts tmp/store-sharding \
             --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports[5432] }}/vane_test?sslmode=disable' \
             --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_1.ports[5432] }}/vane_test?sslmode=disable' \
-            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports[5432] }}/vane_test?sslmode=disable' \
-            "${timing_args[@]}"
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports[5432] }}/vane_test?sslmode=disable'
 
       - name: Test remaining packages
         shell: bash
@@ -120,7 +108,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: store-race-sharding-${{ github.run_id }}
+          name: store-race-sharding-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             tmp/store-sharding/*.json
             tmp/store-sharding/*.txt

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,9 @@ func (values *stringList) Set(value string) error {
 
 type runStatus struct {
 	ExitCode              int     `json:"exit_code"`
+	Phase                 string  `json:"phase"`
+	Error                 string  `json:"error,omitempty"`
+	FailedShards          []int   `json:"failed_shards,omitempty"`
 	Strategy              string  `json:"strategy"`
 	ExpectedTests         int     `json:"expected_tests"`
 	ObservedTests         int     `json:"observed_tests"`
@@ -67,7 +71,7 @@ func main() {
 	}
 }
 
-func run(args []string) error {
+func run(args []string) (runErr error) {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	var databaseURLs stringList
 	flags.Var(&databaseURLs, "database-url", "independent PostgreSQL URL; repeat once per shard")
@@ -78,14 +82,7 @@ func run(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if len(databaseURLs) == 0 {
-		return errors.New("at least one --database-url is required")
-	}
 
-	repo, err := filepath.Abs(*repoDir)
-	if err != nil {
-		return err
-	}
 	artifacts, err := filepath.Abs(*artifactDir)
 	if err != nil {
 		return err
@@ -95,6 +92,48 @@ func run(args []string) error {
 	}
 
 	started := time.Now()
+	phase := "setup"
+	status := runStatus{}
+	var buildElapsed time.Duration
+	var shardElapsed time.Duration
+	var failedShards []int
+	statusPath := filepath.Join(artifacts, "store-shard-status.json")
+	defer func() {
+		errorMessage := ""
+		if runErr != nil {
+			errorMessage = runErr.Error()
+		}
+		finalStatus := finalizeRunStatus(
+			status,
+			phase,
+			errorMessage,
+			buildElapsed,
+			shardElapsed,
+			time.Since(started),
+			failedShards,
+		)
+		if err := writeJSON(statusPath, finalStatus); err != nil {
+			runErr = errors.Join(
+				runErr,
+				fmt.Errorf("write store shard status: %w", err),
+			)
+		}
+	}()
+
+	if len(databaseURLs) == 0 {
+		return errors.New("at least one --database-url is required")
+	}
+
+	repo, err := filepath.Abs(*repoDir)
+	if err != nil {
+		return err
+	}
+	repo, err = filepath.EvalSymlinks(repo)
+	if err != nil {
+		return fmt.Errorf("resolve repository root: %w", err)
+	}
+
+	phase = "build"
 	buildStarted := time.Now()
 	binaryName := "store.test"
 	if runtime.GOOS == "windows" {
@@ -114,12 +153,14 @@ func run(args []string) error {
 	build.Stdout = os.Stdout
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
+		buildElapsed = time.Since(buildStarted)
 		return fmt.Errorf("build store test binary: %w", err)
 	}
-	buildElapsed := time.Since(buildStarted)
+	buildElapsed = time.Since(buildStarted)
 
+	phase = "list"
 	storeDir := filepath.Join(repo, "store")
-	listCommand := exec.Command(binaryPath, "-test.list=^Test")
+	listCommand := exec.Command(binaryPath, "-test.list=.")
 	listCommand.Dir = storeDir
 	listOutput, err := listCommand.Output()
 	if err != nil {
@@ -133,10 +174,15 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	status.ExpectedTests = len(tests)
 
 	timings := map[string]float64(nil)
 	if *timingPath != "" {
-		timingFile, err := os.Open(*timingPath)
+		resolvedTimingPath, err := resolveRepoRelativeFile(repo, *timingPath)
+		if err != nil {
+			return fmt.Errorf("resolve timing artifact: %w", err)
+		}
+		timingFile, err := os.Open(resolvedTimingPath)
 		if err != nil {
 			return fmt.Errorf("open timing artifact: %w", err)
 		}
@@ -150,10 +196,13 @@ func run(args []string) error {
 		}
 	}
 
+	phase = "plan"
 	plan, err := testshard.BuildPlan(tests, timings, len(databaseURLs))
 	if err != nil {
 		return err
 	}
+	status.Strategy = plan.Strategy
+	status.HistoricalTimingTests = plan.HistoricalTimings
 	if err := writeJSON(filepath.Join(artifacts, "store-shard-plan.json"), plan); err != nil {
 		return err
 	}
@@ -165,6 +214,7 @@ func run(args []string) error {
 		}
 	}
 
+	phase = "shards"
 	shardStarted := time.Now()
 	results := make(chan shardResult, len(plan.Shards))
 	var wait sync.WaitGroup
@@ -179,18 +229,21 @@ func run(args []string) error {
 	}
 	wait.Wait()
 	close(results)
-	shardElapsed := time.Since(shardStarted)
+	shardElapsed = time.Since(shardStarted)
 	var shardErrors []error
 	for result := range results {
 		fmt.Printf("store shard %d finished in %.3fs\n", result.index, result.elapsed.Seconds())
 		if result.err != nil {
+			failedShards = append(failedShards, result.index)
 			shardErrors = append(shardErrors, result.err)
 		}
 	}
+	sort.Ints(failedShards)
 	if len(shardErrors) > 0 {
 		return errors.Join(shardErrors...)
 	}
 
+	phase = "integrity"
 	observed := make([][]string, len(plan.Shards))
 	coveragePaths := make([]string, len(plan.Shards))
 	jsonPaths := make([]string, len(plan.Shards))
@@ -210,38 +263,30 @@ func run(args []string) error {
 		}
 		coveragePaths[i] = filepath.Join(artifacts, fmt.Sprintf("store-shard-%d.coverage.out", i))
 	}
+	status.ObservedTests, status.DuplicateTests, status.MissingTests =
+		observationStats(tests, observed)
 	if err := testshard.VerifyObserved(plan, observed); err != nil {
 		return fmt.Errorf("execution integrity: %w", err)
 	}
+
+	phase = "coverage"
 	if err := mergeProfiles(filepath.Join(artifacts, "store.coverage.out"), coveragePaths, true); err != nil {
 		return fmt.Errorf("merge store coverage: %w", err)
 	}
+
+	phase = "combine-json"
 	combinedJSON := filepath.Join(artifacts, "store.test.json")
 	if err := concatenate(combinedJSON, jsonPaths); err != nil {
 		return err
 	}
 
-	status := runStatus{
-		ExitCode:              0,
-		Strategy:              plan.Strategy,
-		ExpectedTests:         len(tests),
-		ObservedTests:         countObserved(observed),
-		DuplicateTests:        0,
-		MissingTests:          0,
-		BuildSeconds:          roundSeconds(buildElapsed),
-		ShardWallSeconds:      roundSeconds(shardElapsed),
-		TotalSeconds:          roundSeconds(time.Since(started)),
-		HistoricalTimingTests: plan.HistoricalTimings,
-	}
-	if err := writeJSON(filepath.Join(artifacts, "store-shard-status.json"), status); err != nil {
-		return err
-	}
+	phase = "complete"
 	fmt.Printf(
 		"store shard integrity verified: expected=%d observed=%d duplicate=0 missing=0 strategy=%s wall=%.3fs\n",
 		status.ExpectedTests,
 		status.ObservedTests,
 		status.Strategy,
-		status.ShardWallSeconds,
+		roundSeconds(shardElapsed),
 	)
 	return nil
 }
@@ -384,12 +429,92 @@ func closeFiles(files []*os.File) error {
 	return errors.Join(errs...)
 }
 
-func countObserved(observed [][]string) int {
-	count := 0
-	for _, tests := range observed {
-		count += len(tests)
+func finalizeRunStatus(
+	status runStatus,
+	phase string,
+	errorMessage string,
+	buildElapsed time.Duration,
+	shardElapsed time.Duration,
+	totalElapsed time.Duration,
+	failedShards []int,
+) runStatus {
+	status.Phase = phase
+	status.Error = errorMessage
+	status.BuildSeconds = roundSeconds(buildElapsed)
+	status.ShardWallSeconds = roundSeconds(shardElapsed)
+	status.TotalSeconds = roundSeconds(totalElapsed)
+	status.FailedShards = append([]int(nil), failedShards...)
+	if errorMessage == "" {
+		status.ExitCode = 0
+	} else {
+		status.ExitCode = 1
 	}
-	return count
+	return status
+}
+
+func observationStats(expected []string, observed [][]string) (
+	observedCount int,
+	duplicateCount int,
+	missingCount int,
+) {
+	counts := make(map[string]int)
+	for _, shardTests := range observed {
+		for _, name := range shardTests {
+			observedCount++
+			counts[name]++
+			if counts[name] > 1 {
+				duplicateCount++
+			}
+		}
+	}
+	for _, name := range expected {
+		if counts[name] == 0 {
+			missingCount++
+		}
+	}
+	return observedCount, duplicateCount, missingCount
+}
+
+func resolveRepoRelativeFile(repo, path string) (string, error) {
+	if path == "" {
+		return "", errors.New("path is empty")
+	}
+	if filepath.IsAbs(path) || filepath.VolumeName(path) != "" {
+		return "", fmt.Errorf("path must be repository-relative: %q", path)
+	}
+	for _, part := range strings.FieldsFunc(path, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if part == ".." {
+			return "", fmt.Errorf("path must not contain parent traversal: %q", path)
+		}
+	}
+
+	resolvedRepo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		return "", fmt.Errorf("resolve repository root: %w", err)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(
+		filepath.Join(resolvedRepo, filepath.Clean(path)),
+	)
+	if err != nil {
+		return "", err
+	}
+	relative, err := filepath.Rel(resolvedRepo, resolvedPath)
+	if err != nil {
+		return "", err
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("resolved path escapes repository: %q", path)
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("path is not a regular file: %q", path)
+	}
+	return resolvedPath, nil
 }
 
 func roundSeconds(duration time.Duration) float64 {

@@ -17,10 +17,21 @@ The runner:
 7. runs every non-store package with the normal race and coverage flags, then
    merges its coverage with the store profile.
 
-With no timing input, assignment is the stable FNV-1a hash of the test name. Pass
-the repository-relative path of a prior `go test -json` artifact as the
-`timings_path` workflow input to use deterministic longest-processing-time
-balancing. Tests absent from the history use the median known duration.
+The manual workflow always uses the stable FNV-1a hash of the test name. A fresh
+checkout has no honest historical timing artifact, so the workflow does not
+offer a timing-path input and does not download unverified state.
+
+Historical longest-processing-time balancing remains available to local or
+other explicit callers that first provide the timing file inside the checkout:
+
+```text
+go run ./cmd/storetestshard run ... --timings tmp/prior-store.test.json
+```
+
+`--timings` accepts only a repository-relative regular file whose resolved path
+remains inside the repository; absolute paths, parent traversal, and symlink
+escapes are rejected. Tests absent from supplied history use the median known
+duration.
 
 Do not replace the default CI test step until repeated measurements on the same
 runner show:
@@ -31,13 +42,17 @@ sharded p95 wall time <= 0.60 * baseline p95 wall time
 
 The uploaded artifact contains the authoritative list, shard manifests and plan,
 per-shard JSON, merged JSON, per-shard coverage, merged store coverage, final
-coverage, and the integrity/timing status.
+coverage, and the integrity/timing status. The runner writes
+`store-shard-status.json` on best effort after setup even when build, listing,
+shard execution, integrity verification, or coverage merge fails; `phase`,
+`error`, `failed_shards`, wall timings, and `exit_code` identify the stopping
+point.
 
-The experiment assumes the repository's `vane-test` label admits one job at a
-time. Service containers publish PostgreSQL 5432 to three dynamically allocated,
-distinct host ports, so jobs from other repositories cannot collide with fixed
-5432/5433/5434 bindings. GitHub Actions fails the job before test execution if a
-service cannot become healthy.
+Repository-scoped workflow concurrency serializes manual experiments from this
+repository. Service containers publish PostgreSQL 5432 to three dynamically
+allocated, distinct host ports, so jobs from other repositories cannot collide
+with fixed 5432/5433/5434 bindings. GitHub Actions fails the job before test
+execution if a service cannot become healthy.
 
 The artifact uploader is pinned to official `actions/upload-artifact` v7.0.1
 (Node.js 24). The self-hosted runner must be at least version 2.327.1; confirming
@@ -49,6 +64,12 @@ workflow is not a default gate.
 Environment: Windows/amd64, Go 1.26.4, Docker 29.6.1, three
 `postgres:18-alpine` containers. The baseline and final LPT run were serialized
 on the same machine with fresh databases.
+
+These measurements and the 576-test integrity count are bound to benchmark
+commit `e779b196` and its then-current store test set. This branch has since
+been rebased onto `40e10b8`, where the test set changed. The numbers below are
+historical experiment evidence, not a performance claim for the current commit;
+no expensive benchmark was rerun for this review fix.
 
 | sample | result | wall time |
 |---|---:|---:|
