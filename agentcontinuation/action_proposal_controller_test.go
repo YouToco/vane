@@ -92,6 +92,11 @@ func TestActionProposalController_AdoptsExactDatabaseResponseLoss(
 			"commit response lost",
 			errors.New("network reset"),
 		),
+		types.NewAppError(
+			types.CodeDatabase,
+			"replay connection unavailable",
+			errors.New("connection reset"),
+		),
 		nil,
 	}}
 	controller, err := NewActionProposalController(st)
@@ -105,7 +110,39 @@ func TestActionProposalController_AdoptsExactDatabaseResponseLoss(
 		Summary:   "重新启用信源（id=11）",
 		ExpiresAt: time.Now().Add(time.Hour),
 	})
-	if err != nil || got.ID != "stable-action" || st.calls != 2 {
+	if err != nil || got.ID != "stable-action" || st.calls != 3 {
 		t.Fatalf("proposal=%+v calls=%d err=%v", got, st.calls, err)
+	}
+}
+
+func TestActionProposalController_SurfacesDeterministicReplayFailure(
+	t *testing.T,
+) {
+	integrityCause := errors.New("partial durable evidence")
+	st := &fakeActionProposalStore{errs: []error{
+		types.NewAppError(
+			types.CodeDatabase,
+			"commit response lost",
+			errors.New("network reset"),
+		),
+		types.NewAppError(
+			types.CodeInternal,
+			"durable proposal evidence is inconsistent",
+			integrityCause,
+		),
+	}}
+	controller, err := NewActionProposalController(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = controller.Propose(t.Context(), ActionProposalInput{
+		ActionID: "stable-action", UserID: 7, SessionID: 9,
+		ToolName:  DurableActionToolName,
+		RawArgs:   []byte(`{"source_id":11}`),
+		Summary:   "重新启用信源（id=11）",
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if !errors.Is(err, integrityCause) || st.calls != 2 {
+		t.Fatalf("calls=%d error=%v", st.calls, err)
 	}
 }

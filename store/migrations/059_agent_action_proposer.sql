@@ -86,23 +86,23 @@ GRANT INSERT (
 ) ON pending_actions TO vane_agent_action_proposer;
 
 GRANT SELECT (
-    action_id,tenant_id,user_id,session_id,tool_name,source_id,
+    action_id,tenant_id,user_id,session_id,source_id,
     canonical_args,args_digest,tool_spec_version,tool_spec,tool_spec_digest,
     tool_policy_version,tool_policy,tool_policy_digest,adapter_version,
     success_messages,success_digest,not_found_messages,not_found_digest,
     status,terminal_code,lease_owner,lease_fence,lease_expires_at,
-    attempt_count,next_attempt_at,confirmed_at,completed_at,blocked_reason,
-    created_at,updated_at
+    attempt_count,next_attempt_at,confirmed_at,completed_at,blocked_reason
 ) ON agent_action_continuations TO vane_agent_action_proposer;
 GRANT INSERT (
     action_id,tenant_id,user_id,session_id,tool_name,source_id,
     canonical_args,args_digest,tool_spec_version,tool_spec,tool_spec_digest,
     tool_policy_version,tool_policy,tool_policy_digest,adapter_version,
-    success_messages,success_digest,not_found_messages,not_found_digest
+    success_messages,success_digest,not_found_messages,not_found_digest,
+    next_attempt_at
 ) ON agent_action_continuations TO vane_agent_action_proposer;
 
 GRANT SELECT (
-    tenant_id,user_id,action_id,generation,mode,evidence
+    action_id,generation,mode,evidence
 ) ON agent_action_continuation_authority_events
     TO vane_agent_action_proposer;
 GRANT INSERT (
@@ -123,7 +123,7 @@ REVOKE INSERT (
 ) ON agent_action_continuation_authority_events
     FROM vane_agent_action_proposer;
 REVOKE SELECT (
-    tenant_id,user_id,action_id,generation,mode,evidence
+    action_id,generation,mode,evidence
 ) ON agent_action_continuation_authority_events
     FROM vane_agent_action_proposer;
 
@@ -131,16 +131,16 @@ REVOKE INSERT (
     action_id,tenant_id,user_id,session_id,tool_name,source_id,
     canonical_args,args_digest,tool_spec_version,tool_spec,tool_spec_digest,
     tool_policy_version,tool_policy,tool_policy_digest,adapter_version,
-    success_messages,success_digest,not_found_messages,not_found_digest
+    success_messages,success_digest,not_found_messages,not_found_digest,
+    next_attempt_at
 ) ON agent_action_continuations FROM vane_agent_action_proposer;
 REVOKE SELECT (
-    action_id,tenant_id,user_id,session_id,tool_name,source_id,
+    action_id,tenant_id,user_id,session_id,source_id,
     canonical_args,args_digest,tool_spec_version,tool_spec,tool_spec_digest,
     tool_policy_version,tool_policy,tool_policy_digest,adapter_version,
     success_messages,success_digest,not_found_messages,not_found_digest,
     status,terminal_code,lease_owner,lease_fence,lease_expires_at,
-    attempt_count,next_attempt_at,confirmed_at,completed_at,blocked_reason,
-    created_at,updated_at
+    attempt_count,next_attempt_at,confirmed_at,completed_at,blocked_reason
 ) ON agent_action_continuations FROM vane_agent_action_proposer;
 
 REVOKE INSERT (

@@ -145,8 +145,10 @@ an exact-action canary control plane; it is not a bulk switch.
 Migration 059 changes only newly-issued `enable_source` cards. The Agent sends
 an internally generated action ID, exact session, strict arguments, visible
 summary and expiry to one proposal controller. Store derives the tenant from
-the user's canonical membership and, under the shared action admission lock,
-uses the independent `vane_agent_action_proposer` role to commit:
+that exact session, acquires the tenant admission root, and share-locks the
+live session/membership/active-tenant relation. A second membership of the
+same user can never choose the proposal tenant. Under the shared action
+admission lock, the independent `vane_agent_action_proposer` role commits:
 
 1. an execution-version 2 pending root with canonical `{source_id}` arguments;
 2. the complete frozen continuation payload used by B1;
@@ -155,7 +157,17 @@ uses the independent `vane_agent_action_proposer` role to commit:
 All three rows commit or roll back together. `CreatePendingAction → Activate`
 is forbidden for normal B2 cards. An exact retry after a lost commit response
 must verify the root, visible summary, expiry, every frozen payload byte and
-the sole authority event; it may not repair or recreate partial evidence.
+the sole authority event. The initial continuation control fields are also
+exact: no lease, attempt, terminal or timestamp drift is adoptable. Partial
+evidence is an integrity failure, never a retryable database ambiguity, and
+the controller retries transient database ambiguity with the same action ID
+inside one bounded convergence window; it may not repair or recreate evidence.
+
+Confirmation peeks the immutable tenant/session identity, acquires the same
+tenant admission root before locking the action, and revalidates the live
+membership before accepting. Membership revocation therefore linearizes
+against both proposal and confirmation; cancellation remains available because
+it cannot create an effect.
 
 The proposer has only specified-column SELECT/INSERT on those three tables and
 sequence USAGE for the authority event. It has no UPDATE/DELETE/TRUNCATE,

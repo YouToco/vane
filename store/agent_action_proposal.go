@@ -60,18 +60,14 @@ func (s *Store) ProposeAgentActionContinuation(
 			"lock Agent action proposal admission", err)
 	}
 
-	// Tenant is derived from the same canonical membership relation as legacy
-	// Agent writes. It is not accepted from the model or callback payload.
-	var tenantID int64
-	if err := tx.QueryRow(ctx,
-		`SELECT tenant_id FROM memberships WHERE user_id=$1`,
-		action.UserID,
-	).Scan(&tenantID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return agentEventNotFound()
-		}
-		return agentEventDatabaseError(
-			"resolve Agent action proposal tenant", err)
+	// Tenant is derived from the exact session, never from an arbitrary one of
+	// the user's memberships. The tenant admission root is taken before the
+	// live session/membership rows, matching tenant purge's lock order.
+	tenantID, err := lockAgentActionProposalScope(
+		ctx, tx, action.UserID, *action.SessionID,
+	)
+	if err != nil {
+		return err
 	}
 	if err := setAgentActionProposerContext(ctx, tx, tenantID); err != nil {
 		return err
@@ -143,10 +139,11 @@ func (s *Store) ProposeAgentActionContinuation(
 		     canonical_args,args_digest,tool_spec_version,tool_spec,
 		     tool_spec_digest,tool_policy_version,tool_policy,
 		     tool_policy_digest,adapter_version,success_messages,
-		     success_digest,not_found_messages,not_found_digest
+		     success_digest,not_found_messages,not_found_digest,
+		     next_attempt_at
 		 ) VALUES (
 		     $1,$2,$3,$4,'enable_source',$5,$6,$7,$8,$9,$10,$11,$12,
-		     $13,$14,$15,$16,$17,$18
+		     $13,$14,$15,$16,$17,$18,$19
 		 )`,
 		action.ID, tenantID, action.UserID, *action.SessionID, sourceID,
 		canonicalArgs, AgentActionPayloadDigest(canonicalArgs),
@@ -158,6 +155,7 @@ func (s *Store) ProposeAgentActionContinuation(
 		AgentActionPayloadDigest(frozen.successMessages),
 		frozen.notFoundMessages,
 		AgentActionPayloadDigest(frozen.notFoundMessages),
+		expiresAt,
 	); err != nil {
 		return agentEventDatabaseError(
 			"freeze Agent action durable proposal", err)
@@ -214,6 +212,9 @@ func replayAgentActionProposal(
 		want.ID, tenantID, want.UserID,
 	))
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return agentEventIntegrityError()
+		}
 		return agentEventDatabaseError(
 			"lock Agent action proposal continuation", err)
 	}
@@ -224,7 +225,13 @@ func replayAgentActionProposal(
 		string(action.ToolSpec) != string(frozen.toolSpec) ||
 		string(action.ToolPolicy) != string(frozen.toolPolicy) ||
 		string(action.SuccessMessages) != string(frozen.successMessages) ||
-		string(action.NotFoundMessages) != string(frozen.notFoundMessages) {
+		string(action.NotFoundMessages) != string(frozen.notFoundMessages) ||
+		action.TerminalCode != nil || action.LeaseOwner != nil ||
+		action.LeaseFence != 0 || action.LeaseExpiresAt != nil ||
+		action.AttemptCount != 0 ||
+		!action.NextAttemptAt.Equal(expiresAt) ||
+		action.ConfirmedAt != nil || action.CompletedAt != nil ||
+		action.BlockedReason != nil {
 		return agentEventIntegrityError()
 	}
 	if err := validateFrozenAgentAction(action); err != nil {
@@ -264,6 +271,67 @@ func replayAgentActionProposal(
 	if generation != 1 || mode != AgentActionAuthorityDurable ||
 		evidence != agentActionProposalEvidence {
 		return agentEventIntegrityError()
+	}
+	return nil
+}
+
+func lockAgentActionProposalScope(
+	ctx context.Context,
+	tx pgx.Tx,
+	userID, sessionID int64,
+) (int64, error) {
+	var tenantID int64
+	if err := tx.QueryRow(ctx,
+		`SELECT tenant_id
+		   FROM agent_sessions
+		  WHERE id=$1 AND user_id=$2`,
+		sessionID, userID,
+	).Scan(&tenantID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, agentEventNotFound()
+		}
+		return 0, agentEventDatabaseError(
+			"resolve Agent action proposal session", err)
+	}
+	exists, err := lockTenantAdmissionRoot(ctx, tx, tenantID)
+	if err != nil {
+		return 0, agentEventDatabaseError(
+			"lock Agent action proposal tenant admission", err)
+	}
+	if !exists {
+		return 0, agentEventNotFound()
+	}
+	if err := lockLiveAgentActionSession(
+		ctx, tx, tenantID, userID, sessionID,
+	); err != nil {
+		return 0, err
+	}
+	return tenantID, nil
+}
+
+func lockLiveAgentActionSession(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID, userID, sessionID int64,
+) error {
+	var live bool
+	err := tx.QueryRow(ctx,
+		`SELECT true
+		   FROM agent_sessions s
+		   JOIN memberships m
+		     ON m.tenant_id=s.tenant_id AND m.user_id=s.user_id
+		   JOIN tenants t ON t.id=s.tenant_id
+		  WHERE s.id=$1 AND s.tenant_id=$2 AND s.user_id=$3
+		    AND t.status='active' AND t.deleted_at IS NULL
+		  FOR SHARE OF s,m,t`,
+		sessionID, tenantID, userID,
+	).Scan(&live)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !live) {
+		return agentEventNotFound()
+	}
+	if err != nil {
+		return agentEventDatabaseError(
+			"lock live Agent action session", err)
 	}
 	return nil
 }

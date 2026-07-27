@@ -10,8 +10,10 @@ func TestMigration059ProposerHasOnlyCreateCapabilities(t *testing.T) {
 	}
 	var (
 		canRootInsert, canContinuationInsert, canAuthorityInsert bool
-		canRootUpdate, canContinuationUpdate, canRootDelete      bool
-		canSourceRead, canSessionRead, canSequenceUse            bool
+		canRootUpdate, canContinuationUpdate, canAuthorityUpdate bool
+		canRootDelete, canSourceRead, canSessionRead             bool
+		canSequenceUse, canUnusedContinuationRead                bool
+		canUnusedAuthorityRead                                   bool
 	)
 	if err := db.QueryRowContext(ctx, `
 		SELECT
@@ -25,12 +27,15 @@ func TestMigration059ProposerHasOnlyCreateCapabilities(t *testing.T) {
 		    'vane_agent_action_proposer',
 		    'agent_action_continuation_authority_events',
 		    'generation','INSERT'),
-		  has_column_privilege(
-		    'vane_agent_action_proposer','pending_actions',
-		    'execution_version','UPDATE'),
-		  has_column_privilege(
+		  has_any_column_privilege(
+		    'vane_agent_action_proposer','pending_actions','UPDATE'),
+		  has_any_column_privilege(
 		    'vane_agent_action_proposer','agent_action_continuations',
-		    'status','UPDATE'),
+		    'UPDATE'),
+		  has_any_column_privilege(
+		    'vane_agent_action_proposer',
+		    'agent_action_continuation_authority_events',
+		    'UPDATE'),
 		  has_table_privilege(
 		    'vane_agent_action_proposer','pending_actions','DELETE'),
 		  has_table_privilege(
@@ -40,25 +45,37 @@ func TestMigration059ProposerHasOnlyCreateCapabilities(t *testing.T) {
 		  has_sequence_privilege(
 		    'vane_agent_action_proposer',
 		    'agent_action_continuation_authority_events_id_seq',
-		    'USAGE')`,
+		    'USAGE'),
+		  has_column_privilege(
+		    'vane_agent_action_proposer','agent_action_continuations',
+		    'tool_name','SELECT'),
+		  has_column_privilege(
+		    'vane_agent_action_proposer',
+		    'agent_action_continuation_authority_events',
+		    'tenant_id','SELECT')`,
 	).Scan(
 		&canRootInsert, &canContinuationInsert, &canAuthorityInsert,
-		&canRootUpdate, &canContinuationUpdate, &canRootDelete,
-		&canSourceRead, &canSessionRead, &canSequenceUse,
+		&canRootUpdate, &canContinuationUpdate, &canAuthorityUpdate,
+		&canRootDelete, &canSourceRead, &canSessionRead,
+		&canSequenceUse, &canUnusedContinuationRead,
+		&canUnusedAuthorityRead,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if !canRootInsert || !canContinuationInsert ||
 		!canAuthorityInsert || !canSequenceUse ||
-		canRootUpdate || canContinuationUpdate || canRootDelete ||
-		canSourceRead || canSessionRead {
+		canRootUpdate || canContinuationUpdate || canAuthorityUpdate ||
+		canRootDelete || canSourceRead || canSessionRead ||
+		canUnusedContinuationRead || canUnusedAuthorityRead {
 		t.Fatalf(
 			"proposer capabilities root/continuation/authority/sequence="+
-				"%t/%t/%t/%t update/delete/source/session="+
-				"%t/%t/%t/%t/%t",
+				"%t/%t/%t/%t update/delete/source/session/unused="+
+				"%t/%t/%t/%t/%t/%t/%t/%t",
 			canRootInsert, canContinuationInsert, canAuthorityInsert,
 			canSequenceUse, canRootUpdate, canContinuationUpdate,
-			canRootDelete, canSourceRead, canSessionRead,
+			canAuthorityUpdate, canRootDelete, canSourceRead,
+			canSessionRead, canUnusedContinuationRead,
+			canUnusedAuthorityRead,
 		)
 	}
 	if _, err := provider.DownTo(ctx, 58); err != nil {

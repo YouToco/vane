@@ -288,6 +288,20 @@ func mergeSortedColumns(groups ...[]string) []string {
 	return values
 }
 
+func withoutColumns(values []string, excluded ...string) []string {
+	exclusion := make(map[string]struct{}, len(excluded))
+	for _, value := range excluded {
+		exclusion[value] = struct{}{}
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, omit := exclusion[value]; !omit {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
 func agentActionOperatorRootSelectColumns() []string {
 	return prefixedColumns(
 		"pending_actions",
@@ -348,8 +362,16 @@ func agentActionProposerSelectColumns() []string {
 			"args", "execution_version", "expires_at", "id", "session_id",
 			"status", "summary", "tenant_id", "tool_name", "user_id",
 		),
-		agentActionContinuationSelectColumns(),
-		agentActionAuthoritySelectColumns(),
+		withoutColumns(
+			agentActionContinuationSelectColumns(),
+			"agent_action_continuations.created_at",
+			"agent_action_continuations.tool_name",
+			"agent_action_continuations.updated_at",
+		),
+		prefixedColumns(
+			"agent_action_continuation_authority_events",
+			"action_id", "evidence", "generation", "mode",
+		),
 	)
 }
 
@@ -363,6 +385,7 @@ func agentActionProposerInsertColumns() []string {
 		prefixedColumns(
 			"agent_action_continuations",
 			"action_id", "adapter_version", "args_digest", "canonical_args",
+			"next_attempt_at",
 			"not_found_digest", "not_found_messages", "session_id", "source_id",
 			"success_digest", "success_messages", "tenant_id", "tool_name",
 			"tool_policy", "tool_policy_digest", "tool_policy_version",

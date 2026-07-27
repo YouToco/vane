@@ -12,7 +12,11 @@ import (
 
 const DurableActionToolName = "enable_source"
 
-const actionProposalConvergenceTimeout = 5 * time.Second
+const (
+	actionProposalConvergenceTimeout = 5 * time.Second
+	actionProposalRetryDelay         = 25 * time.Millisecond
+	actionProposalMaxRetryDelay      = 250 * time.Millisecond
+)
 
 type actionProposalStore interface {
 	ProposeAgentActionContinuation(
@@ -91,12 +95,34 @@ func (c *ActionProposalController) Propose(
 			context.WithoutCancel(ctx),
 			actionProposalConvergenceTimeout,
 		)
-		err = c.actionStore.ProposeAgentActionContinuation(
-			replayCtx, action,
-		)
-		cancel()
-		if err != nil {
-			return ActionProposal{}, originalErr
+		delay := actionProposalRetryDelay
+		for {
+			err = c.actionStore.ProposeAgentActionContinuation(
+				replayCtx, action,
+			)
+			if err == nil {
+				cancel()
+				break
+			}
+			if !errors.As(err, &appErr) ||
+				appErr.Code != types.CodeDatabase {
+				cancel()
+				return ActionProposal{}, err
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-replayCtx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				cancel()
+				return ActionProposal{}, originalErr
+			case <-timer.C:
+			}
+			delay = min(delay*2, actionProposalMaxRetryDelay)
 		}
 	}
 	return ActionProposal{ID: action.ID, Summary: action.Summary}, nil

@@ -1013,6 +1013,37 @@ func (s *Store) decideAgentActionContinuation(
 			"begin Agent action confirmation", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var peekTenantID int64
+	var peekSessionID *int64
+	var peekExecutionVersion int
+	err = tx.QueryRow(ctx,
+		`SELECT tenant_id,session_id,execution_version
+		   FROM pending_actions
+		  WHERE id=$1 AND user_id=$2`,
+		actionID, userID,
+	).Scan(
+		&peekTenantID, &peekSessionID, &peekExecutionVersion,
+	)
+	if errors.Is(err, pgx.ErrNoRows) ||
+		(err == nil &&
+			peekExecutionVersion != AgentActionExecutionVersion) {
+		return AgentActionConfirmation{}, ErrAgentActionNotRouted
+	}
+	if err != nil {
+		return AgentActionConfirmation{}, agentEventDatabaseError(
+			"inspect Agent action confirmation root", err)
+	}
+	if peekSessionID == nil || *peekSessionID <= 0 {
+		return AgentActionConfirmation{}, agentEventIntegrityError()
+	}
+	exists, err := lockTenantAdmissionRoot(ctx, tx, peekTenantID)
+	if err != nil {
+		return AgentActionConfirmation{}, agentEventDatabaseError(
+			"lock Agent action confirmation tenant admission", err)
+	}
+	if !exists {
+		return AgentActionConfirmation{}, agentEventNotFound()
+	}
 	var tenantID int64
 	var expiresAt time.Time
 	var executionVersion int
@@ -1038,6 +1069,17 @@ func (s *Store) decideAgentActionContinuation(
 	if err != nil {
 		return AgentActionConfirmation{}, agentEventDatabaseError(
 			"lock Agent action confirmation root", err)
+	}
+	if tenantID != peekTenantID || rootSessionID == nil ||
+		*rootSessionID != *peekSessionID {
+		return AgentActionConfirmation{}, agentEventIntegrityError()
+	}
+	if !cancel {
+		if err := lockLiveAgentActionSession(
+			ctx, tx, tenantID, userID, *rootSessionID,
+		); err != nil {
+			return AgentActionConfirmation{}, err
+		}
 	}
 	if err := setAgentActionContinuatorContext(ctx, tx, tenantID); err != nil {
 		return AgentActionConfirmation{}, err
