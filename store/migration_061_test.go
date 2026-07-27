@@ -865,7 +865,7 @@ func TestMigration061DownDoesNotDeadlockWithDeliveryInsert(t *testing.T) {
 	}
 }
 
-func TestMigration063PreventsReaching061DownWithPendingOutcome(t *testing.T) {
+func TestMigration063BlocksDowngradeWithPendingOutcome(t *testing.T) {
 	freshURL := freshMigrationDatabase(t, "vane_brief_down")
 	db, err := sql.Open("pgx", freshURL)
 	if err != nil {
@@ -938,7 +938,19 @@ func TestMigration063PreventsReaching061DownWithPendingOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.Down(context.Background()); err == nil ||
+	if _, err := provider.UpTo(t.Context(), 63); err != nil {
+		t.Fatalf("migrate fresh downgrade fixture to 063: %v", err)
+	}
+	var beforeDown int64
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT COALESCE(max(version_id),0)
+		   FROM goose_db_version WHERE is_applied`).Scan(&beforeDown); err != nil {
+		t.Fatal(err)
+	}
+	if beforeDown != 63 {
+		t.Fatalf("migration version before 063 Down = %d", beforeDown)
+	}
+	if _, err := provider.DownTo(context.Background(), 62); err == nil ||
 		!strings.Contains(err.Error(),
 			"refusing downgrade while pending run outcomes exist") {
 		t.Fatalf("063 Down accepted pending outcome evidence: %v", err)
