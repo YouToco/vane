@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -642,6 +643,20 @@ func TestProfileClaimLedgerSurvivesMembershipRevocation(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.ListProfileClaims(
+		t.Context(), 1, u.ID); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("revoked direct claim read remained authorized: %v", err)
+	}
+	if _, err := st.ApplyProfileClaimAction(
+		t.Context(), 1, u.ID,
+		types.ProfileClaimAction{
+			ExpectedVersion: 1, Action: "suppress",
+			ClaimID: parseTestID(t, claim.ID),
+		},
+		"membership-revoked", strings.Repeat("3", 64),
+	); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("revoked direct claim write remained authorized: %v", err)
+	}
 	var profiles, states, claims, events, receipts int
 	if err := st.pool.QueryRow(t.Context(), `
 		SELECT
@@ -667,6 +682,66 @@ func TestProfileClaimLedgerSurvivesMembershipRevocation(t *testing.T) {
 	if err != nil || list.Version != 1 || len(list.Events) != 1 ||
 		list.Events[0].ID != pinned.EventID {
 		t.Fatalf("re-added member lost claim audit: %+v err=%v", list, err)
+	}
+}
+
+func TestProfileClaimMembershipRevokeSerializesWithScopedTransaction(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("未设置 DATABASE_URL")
+	}
+	if err := Migrate(t.Context(), dbURL); err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerStoreClose(t, st)
+	u, err := st.UpsertUserByOpenID(
+		t.Context(), "claim_revoke_race_"+uuid.NewString(), "claim-revoke-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachTenant(t, st, u.ID)
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE user_id=$1`, u.ID)
+		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id=$1`, u.ID)
+	})
+
+	tx, err := st.beginProfileClaimScopedTx(t.Context(), 1, false, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted := make(chan error, 1)
+	go func() {
+		_, deleteErr := st.pool.Exec(context.Background(),
+			`DELETE FROM memberships WHERE tenant_id=1 AND user_id=$1`, u.ID)
+		deleted <- deleteErr
+	}()
+	select {
+	case err := <-deleted:
+		_ = tx.Rollback(t.Context())
+		t.Fatalf("membership revoke did not wait for authorized tx: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-deleted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("membership revoke stayed blocked after scoped tx commit")
+	}
+	if _, err := st.beginProfileClaimScopedTx(
+		t.Context(), 1, false, u.ID,
+	); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("post-revoke scoped transaction remained authorized: %v", err)
 	}
 }
 
@@ -760,20 +835,61 @@ func TestProfileClaimMutationSummaryBoundAndDuplicatePin(t *testing.T) {
 	); !errors.Is(err, types.ErrValidation) {
 		t.Fatalf("duplicate pin accepted: %v", err)
 	}
-	if err := st.EvolveProfile(
-		t.Context(), u.ID, strings.Repeat("丁", 300), nil,
-		20, pinned.Profile.UpdatedAt, 10,
+	// Simulate a later generation created by a pre-fit producer: it has a new
+	// physical claim ID but the same semantic value as the retained pin.
+	claimTx, err := st.beginProfileClaimScopedTx(t.Context(), 1, true, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var duplicateID int64
+	if err := claimTx.QueryRow(t.Context(), `
+		INSERT INTO profile_claims
+		    (tenant_id,user_id,field_name,claim_value,source_state,
+		     source_ref_type,source_ref,generation)
+		VALUES(1,$1,'summary',$2,'evidence',
+		       'feedback_range','feedbacks:(10,20]',20)
+		RETURNING id`,
+		u.ID, strings.Repeat("甲", 240)).Scan(&duplicateID); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimTx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ApplyProfileClaimAction(
+		t.Context(), 1, u.ID,
+		types.ProfileClaimAction{
+			ExpectedVersion: 2, Action: "pin", ClaimID: duplicateID,
+		},
+		"bound-semantic-pin", strings.Repeat("5", 64),
 	); !errors.Is(err, types.ErrValidation) {
-		t.Fatalf("multi-generation pinned summary overflow accepted: %v", err)
+		t.Fatalf("cross-generation semantic duplicate pin accepted: %v", err)
+	}
+	if err := st.EvolveProfile(
+		t.Context(), u.ID, strings.Repeat("丁", 500), nil,
+		20, pinned.Profile.UpdatedAt, 10,
+	); err != nil {
+		t.Fatalf("budget-fit evolution failed: %v", err)
 	}
 	list, err = st.ListProfileClaims(t.Context(), 1, u.ID)
-	if err != nil || list.Version != 2 {
-		t.Fatalf("rejected evolution changed version: %+v err=%v", list, err)
+	if err != nil || list.Version != 3 {
+		t.Fatalf("fit evolution did not advance version: %+v err=%v", list, err)
+	}
+	var semanticActive int
+	for _, claim := range list.Claims {
+		if claim.Field == "summary" &&
+			claim.Value == strings.Repeat("甲", 240) && claim.Active {
+			semanticActive++
+		}
+	}
+	if semanticActive != 1 {
+		t.Fatalf("duplicate summary representatives active=%d", semanticActive)
 	}
 	p, err := st.GetProfileForTenant(t.Context(), 1, u.ID)
 	if err != nil || utf8.RuneCountInString(stripDerivedManualSegment(p.Summary)) != 500 ||
-		p.LastEvolvedFeedbackID != 10 {
-		t.Fatalf("rejected evolution changed projection: %+v err=%v", p, err)
+		p.LastEvolvedFeedbackID != 20 ||
+		!strings.Contains(p.Summary, strings.Repeat("甲", 240)) ||
+		!strings.Contains(p.Summary, strings.Repeat("丁", 260)) {
+		t.Fatalf("fit evolution lost authority/budget/cursor: %+v err=%v", p, err)
 	}
 }
 

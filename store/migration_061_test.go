@@ -867,14 +867,15 @@ func TestMigration061DownDoesNotDeadlockWithDeliveryInsert(t *testing.T) {
 
 func TestMigration061DownRefusesDurableOutcomeEvidence(t *testing.T) {
 	freshURL := freshMigrationDatabase(t, "vane_brief_down")
-	if err := Migrate(t.Context(), freshURL); err != nil {
-		t.Fatal(err)
-	}
 	db, err := sql.Open("pgx", freshURL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	bootstrapProvider := migration062Provider(t, db)
+	if _, err := bootstrapProvider.UpTo(t.Context(), 61); err != nil {
+		t.Fatal(err)
+	}
 	var userID int64
 	if err := db.QueryRowContext(t.Context(),
 		`INSERT INTO users (feishu_open_id,name)

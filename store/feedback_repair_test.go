@@ -83,11 +83,7 @@ func TestFeedbackRepairDigestBindsEveryPreviewField(t *testing.T) {
 func TestApplyLegacyFeedbackRepairCreatesPendingOutdatedTriage(t *testing.T) {
 	f := newCompiledRunWriteFixture(t)
 	ctx := t.Context()
-	if _, err := f.base.st.pool.Exec(ctx,
-		`INSERT INTO profiles (tenant_id,user_id)
-		 VALUES ($1,$2)`, f.idA.TenantID, f.idA.UserID); err != nil {
-		t.Fatal(err)
-	}
+	f.createClaimProfile(t, "", "", nil)
 	key := "legacy-repair-" + uuid.NewString()
 	batchID, err := f.base.st.CreatePushBatchForTaskRunV1(
 		ctx, f.idA, f.refA, key)
@@ -117,9 +113,6 @@ func TestApplyLegacyFeedbackRepairCreatesPendingOutdatedTriage(t *testing.T) {
 		defer cancel()
 		cleanupExec(cleanupCtx, t, f.base.st,
 			`DELETE FROM feedbacks WHERE id=$1`, feedbackID)
-		cleanupExec(cleanupCtx, t, f.base.st,
-			`DELETE FROM profiles WHERE tenant_id=$1 AND user_id=$2`,
-			f.idA.TenantID, f.idA.UserID)
 	})
 	preview, err := f.base.st.PreviewLegacyFeedbackRepair(
 		ctx, f.idA.TenantID, f.idA.UserID)

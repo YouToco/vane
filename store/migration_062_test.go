@@ -257,6 +257,121 @@ func TestMigration062BackfillFencesConcurrentLegacyProfileWrites(t *testing.T) {
 	}
 }
 
+func TestMigration062QueuedLegacyWriterIsRejectedAfterCommit(t *testing.T) {
+	dbURL := freshMigrationDatabase(t, "vane_profile_claim_queued_writer")
+	db, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxOpenConns(8)
+	provider := migration062Provider(t, db)
+	if _, err := provider.UpTo(t.Context(), 60); err != nil {
+		t.Fatal(err)
+	}
+	var userID int64
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users(feishu_open_id,name)
+		VALUES ('claim-queued-writer','queued') RETURNING id`,
+	).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO memberships(tenant_id,user_id,role)
+		VALUES(1,$1,'owner')`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO profiles(tenant_id,user_id,industry)
+		VALUES(1,$1,'before')`, userID); err != nil {
+		t.Fatal(err)
+	}
+	// Hold a table touched late in 062 so the migration remains open after it
+	// has acquired the profiles fence, giving the queued legacy writer a
+	// deterministic place behind that fence.
+	blocker, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blocker.ExecContext(t.Context(),
+		`LOCK TABLE memberships IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	migrated := make(chan error, 1)
+	go func() {
+		_, migrateErr := provider.UpTo(context.Background(), 62)
+		migrated <- migrateErr
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var fenced bool
+		if err := db.QueryRowContext(t.Context(), `
+			SELECT EXISTS(
+			  SELECT 1
+			    FROM pg_locks
+			   WHERE database=(SELECT oid FROM pg_database
+			                    WHERE datname=current_database())
+			     AND relation='profiles'::regclass
+			     AND mode='ShareRowExclusiveLock'
+			     AND granted
+			)`).Scan(&fenced); err != nil {
+			t.Fatal(err)
+		}
+		if fenced {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("062 never acquired profiles migration fence")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	writer := make(chan error, 1)
+	go func() {
+		_, writeErr := db.ExecContext(context.Background(), `
+			UPDATE profiles SET industry='queued-legacy'
+			 WHERE tenant_id=1 AND user_id=$1`, userID)
+		writer <- writeErr
+	}()
+	select {
+	case err := <-writer:
+		t.Fatalf("legacy writer did not queue behind migration fence: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := blocker.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-migrated:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("062 remained blocked after late-table blocker committed")
+	}
+	select {
+	case err := <-writer:
+		if err == nil ||
+			!strings.Contains(err.Error(), "require vane_profile_claim_editor") {
+			t.Fatalf("queued legacy writer crossed committed trigger: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued legacy writer remained blocked after migration commit")
+	}
+	var industry, claim string
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT p.industry,c.claim_value
+		  FROM profiles p
+		  JOIN profile_claims c
+		    ON c.tenant_id=p.tenant_id AND c.user_id=p.user_id
+		   AND c.field_name='industry'
+		 WHERE p.user_id=$1`, userID).Scan(&industry, &claim); err != nil {
+		t.Fatal(err)
+	}
+	if industry != "before" || claim != "before" {
+		t.Fatalf("queued writer forked projection/ledger=%q/%q", industry, claim)
+	}
+}
+
 func TestMigration062DownWaitsForUncommittedProducer(t *testing.T) {
 	dbURL := freshMigrationDatabase(t, "vane_profile_claim_down_fence")
 	db, err := sql.Open("pgx", dbURL)
@@ -281,12 +396,24 @@ func TestMigration062DownWaitsForUncommittedProducer(t *testing.T) {
 		VALUES(1,$1,'owner')`, userID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(t.Context(), `
-		INSERT INTO profiles(tenant_id,user_id) VALUES(1,$1)`, userID); err != nil {
-		t.Fatal(err)
-	}
 	producer, err := db.BeginTx(t.Context(), nil)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := producer.ExecContext(t.Context(), `
+		SELECT set_config('app.tenant_id','1',true),
+		       set_config('app.user_id',$1,true)`,
+		strconv.FormatInt(userID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := producer.ExecContext(
+		t.Context(), `SET LOCAL ROLE vane_profile_claim_editor`); err != nil {
+		t.Fatal(err)
+	}
+	// Real producer order is profile first, ledger second.  Down must acquire
+	// the same first table so it waits without forming a lock cycle.
+	if _, err := producer.ExecContext(t.Context(), `
+		INSERT INTO profiles(tenant_id,user_id) VALUES(1,$1)`, userID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := producer.ExecContext(t.Context(), `
@@ -328,6 +455,153 @@ func TestMigration062DownWaitsForUncommittedProducer(t *testing.T) {
 	}
 	if states != 1 || version != 62 {
 		t.Fatalf("Down lost producer state=%d version=%d", states, version)
+	}
+}
+
+func TestMigration062ProfileProjectionTriggerFence(t *testing.T) {
+	dbURL := freshMigrationDatabase(t, "vane_profile_claim_trigger")
+	db, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	provider := migration062Provider(t, db)
+	if _, err := provider.UpTo(t.Context(), 62); err != nil {
+		t.Fatal(err)
+	}
+	var userID int64
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users(feishu_open_id,name)
+		VALUES ('claim-trigger-owner','owner') RETURNING id`,
+	).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO memberships(tenant_id,user_id,role)
+		VALUES(1,$1,'owner')`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO profiles(tenant_id,user_id,industry)
+		VALUES(1,$1,'legacy-insert')`, userID); err == nil ||
+		!strings.Contains(err.Error(), "require vane_profile_claim_editor") {
+		t.Fatalf("owner legacy INSERT crossed trigger fence: %v", err)
+	}
+	claimTx, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimTx.ExecContext(t.Context(), `
+		SELECT set_config('app.tenant_id','1',true),
+		       set_config('app.user_id',$1,true)`,
+		strconv.FormatInt(userID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimTx.ExecContext(
+		t.Context(), `SET LOCAL ROLE vane_profile_claim_editor`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimTx.ExecContext(t.Context(), `
+		INSERT INTO profiles(tenant_id,user_id,industry)
+		VALUES(1,$1,'claim-path')`, userID); err != nil {
+		t.Fatalf("claim role INSERT rejected: %v", err)
+	}
+	if _, err := claimTx.ExecContext(t.Context(), `
+		INSERT INTO profile_claim_states(tenant_id,user_id)
+		VALUES(1,$1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimTx.ExecContext(t.Context(), `
+		UPDATE profiles SET summary='claim-update'
+		 WHERE tenant_id=1 AND user_id=$1`, userID); err != nil {
+		t.Fatalf("claim role protected UPDATE rejected: %v", err)
+	}
+	if err := claimTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	for name, query := range map[string]string{
+		"old upsert update": `
+			UPDATE profiles SET industry='legacy-update'
+			 WHERE tenant_id=1 AND user_id=$1`,
+		"old evolve update": `
+			UPDATE profiles SET summary='legacy-evolve'
+			 WHERE tenant_id=1 AND user_id=$1`,
+	} {
+		if _, err := db.ExecContext(t.Context(), query, userID); err == nil ||
+			!strings.Contains(err.Error(), "require vane_profile_claim_editor") {
+			t.Fatalf("%s crossed trigger fence: %v", name, err)
+		}
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		UPDATE profiles SET last_evolved_feedback_id=7
+		 WHERE tenant_id=1 AND user_id=$1`, userID); err != nil {
+		t.Fatalf("owner cursor-only update was fenced: %v", err)
+	}
+	var cursor int64
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT last_evolved_feedback_id FROM profiles
+		 WHERE tenant_id=1 AND user_id=$1`, userID).Scan(&cursor); err != nil {
+		t.Fatal(err)
+	}
+	if cursor != 7 {
+		t.Fatalf("cursor-only update=%d want 7", cursor)
+	}
+}
+
+func TestMigration062From061AndEmptyDownRemovesTrigger(t *testing.T) {
+	dbURL := freshMigrationDatabase(t, "vane_profile_claim_061_062_down")
+	db, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	provider := migration062Provider(t, db)
+	if _, err := provider.UpTo(t.Context(), 61); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 62); err != nil {
+		t.Fatalf("061 -> 062: %v", err)
+	}
+	if _, err := provider.Down(t.Context()); err != nil {
+		t.Fatalf("empty 062 Down: %v", err)
+	}
+	var version int64
+	var triggerExists, functionExists bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT
+		  (SELECT max(version_id) FROM goose_db_version WHERE is_applied),
+		  EXISTS(
+		    SELECT 1 FROM pg_trigger
+		     WHERE tgrelid='profiles'::regclass
+		       AND tgname='enforce_profile_claim_editor_v1'
+		       AND NOT tgisinternal
+		  ),
+		  to_regprocedure(
+		    'public.enforce_profile_claim_editor_v1()'
+		  ) IS NOT NULL`,
+	).Scan(&version, &triggerExists, &functionExists); err != nil {
+		t.Fatal(err)
+	}
+	if version != 61 || triggerExists || functionExists {
+		t.Fatalf("empty Down version/trigger/function=%d/%t/%t",
+			version, triggerExists, functionExists)
+	}
+	var userID int64
+	if err := db.QueryRowContext(t.Context(), `
+		INSERT INTO users(feishu_open_id,name)
+		VALUES('claim-down-trigger-removed','removed') RETURNING id`,
+	).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO memberships(tenant_id,user_id,role)
+		VALUES(1,$1,'owner')`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO profiles(tenant_id,user_id,industry)
+		VALUES(1,$1,'legacy-after-down')`, userID); err != nil {
+		t.Fatalf("safe Down left trigger fence behind: %v", err)
 	}
 }
 

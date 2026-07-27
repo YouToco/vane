@@ -153,7 +153,16 @@ func (f *fakeAuthStore) LookupSession(_ context.Context, hash []byte) (*types.Se
 	defer f.mu.Unlock()
 	s, ok := f.sessions[string(hash)]
 	// 过期与不存在归一为同一结果（与 store 层同语义）。
-	if !ok || !s.ExpiresAt.After(time.Now()) {
+	hasExactMembership := false
+	if ok {
+		for _, membership := range f.members[s.UserID] {
+			if membership.TenantID == s.TenantID {
+				hasExactMembership = true
+				break
+			}
+		}
+	}
+	if !ok || !s.ExpiresAt.After(time.Now()) || !hasExactMembership {
 		return nil, types.NewAppError(types.CodeNotFound, "会话不存在或已过期", nil)
 	}
 	return s, nil
@@ -320,6 +329,32 @@ func TestSec_LogoutInvalidatesServerSide(t *testing.T) {
 	}
 	if fake.sessionCount() != 0 {
 		t.Error("登出应删除服务端会话记录")
+	}
+}
+
+func TestSec_MembershipRevocationImmediatelyInvalidatesOldSession(t *testing.T) {
+	mux, fake := newAuthTestServer(t)
+	user := fake.addUser(t, "revoked@example.com", "user-password-123", 1)
+	login := postJSON(t, mux, "/api/auth/login",
+		map[string]string{
+			"email": "revoked@example.com", "password": "user-password-123",
+		}, nil)
+	cookie := sessionCookieFrom(t, login)
+	fake.mu.Lock()
+	delete(fake.members, user.ID)
+	fake.mu.Unlock()
+
+	get := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	get.AddCookie(cookie)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, get)
+	if getRec.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked session GET status=%d", getRec.Code)
+	}
+	if rec := postJSON(
+		t, mux, "/api/auth/logout", nil, cookie,
+	); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked session POST status=%d", rec.Code)
 	}
 }
 

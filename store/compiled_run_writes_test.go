@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/YouToco/vane/types"
 )
@@ -74,6 +76,13 @@ func newCompiledRunWriteFixture(t *testing.T) *compiledRunWriteFixture {
 			`DELETE FROM deliveries WHERE tenant_id IN ($1, $2)`, base.tenantID, f.tenantB)
 		cleanupExec(cleanupCtx, t, base.st,
 			`DELETE FROM push_batches WHERE tenant_id IN ($1, $2)`, base.tenantID, f.tenantB)
+		for _, table := range []string{
+			"profile_claim_receipts", "profile_claim_events",
+			"profile_claims", "profile_claim_states",
+		} {
+			cleanupExec(cleanupCtx, t, base.st,
+				"DELETE FROM "+table+" WHERE user_id=$1", base.userID)
+		}
 		cleanupExec(cleanupCtx, t, base.st,
 			`DELETE FROM profiles WHERE user_id = $1`, base.userID)
 		for _, contentID := range f.content {
@@ -93,6 +102,73 @@ func newCompiledRunWriteFixture(t *testing.T) *compiledRunWriteFixture {
 			`DELETE FROM tenants WHERE id = $1`, f.tenantB)
 	})
 	return f
+}
+
+func (f *compiledRunWriteFixture) createClaimProfile(
+	t *testing.T, industry, summary string, tags []string,
+) {
+	t.Helper()
+	if tags == nil {
+		tags = []string{}
+	}
+	ctx := t.Context()
+	tx, err := f.base.st.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		SELECT set_config('app.tenant_id',$1,true),
+		       set_config('app.user_id',$2,true)`,
+		strconv.FormatInt(f.idA.TenantID, 10),
+		strconv.FormatInt(f.idA.UserID, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_profile_claim_editor`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO profiles(tenant_id,user_id,industry,tags)
+		VALUES($1,$2,$3,$4)`,
+		f.idA.TenantID, f.idA.UserID, industry, tags); err != nil {
+		t.Fatal(err)
+	}
+	if summary != "" {
+		if _, err := tx.Exec(ctx, `
+			UPDATE profiles SET summary=$3
+			 WHERE tenant_id=$1 AND user_id=$2`,
+			f.idA.TenantID, f.idA.UserID, summary); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO profile_claim_states(tenant_id,user_id)
+		VALUES($1,$2)`, f.idA.TenantID, f.idA.UserID); err != nil {
+		t.Fatal(err)
+	}
+	insertClaim := func(field, value string) {
+		t.Helper()
+		if value == "" {
+			return
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO profile_claims
+			    (tenant_id,user_id,field_name,claim_value,source_state)
+			VALUES($1,$2,$3,$4,'source_unavailable')`,
+			f.idA.TenantID, f.idA.UserID, field, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertClaim("industry", industry)
+	for _, value := range splitSummaryClaims(summary) {
+		insertClaim("summary", value)
+	}
+	for _, value := range tags {
+		insertClaim("tag", value)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func createApprovedTaskForScope(
@@ -284,13 +360,7 @@ func TestCompiledRunWrites_ExactTenantRevocationAndDurableReceipt(t *testing.T) 
 		}
 	}
 
-	if _, err := f.base.st.pool.Exec(ctx,
-		`INSERT INTO profiles
-		    (tenant_id, user_id, summary, tags, last_evolved_feedback_id)
-		 VALUES ($1, $2, 'before', ARRAY['old'], 0)`,
-		f.idA.TenantID, f.idA.UserID); err != nil {
-		t.Fatalf("create tenant A profile: %v", err)
-	}
+	f.createClaimProfile(t, "", "before", []string{"old"})
 	profile, err := f.base.st.GetProfile(ctx, f.idA.UserID)
 	if err != nil {
 		t.Fatal(err)

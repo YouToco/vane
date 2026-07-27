@@ -109,6 +109,10 @@ func (s *Store) UpsertProfileFields(ctx context.Context, userID int64, industry,
 	} else if !exists {
 		return nil, types.NewAppError(types.CodeNotFound, "租户不存在", nil)
 	}
+	if err := lockExactProfileMembershipRoot(
+		ctx, tx, tenantID, userID); err != nil {
+		return nil, err
+	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id',$1,true),
 		        set_config('app.user_id',$2,true)`,
@@ -194,6 +198,10 @@ func (s *Store) EvolveProfile(ctx context.Context, userID int64, summary string,
 	} else if !exists {
 		return types.NewAppError(types.CodeNotFound, "租户不存在", nil)
 	}
+	if err := lockExactProfileMembershipRoot(
+		ctx, tx, tenantID, userID); err != nil {
+		return err
+	}
 	if err := evolveProfileClaimsTx(
 		ctx, tx, tenantID, userID, summary, tags, newCursor,
 		expectedAt, expectedCursor, false,
@@ -211,11 +219,36 @@ func (s *Store) EvolveProfile(ctx context.Context, userID int64, summary string,
 // （updated_at + 旧游标双条件），冲突返回 CodeConflict 由调用方静默跳过。
 // 用途：演化"语义失败"时标记该批反馈已消费防死循环（契约 §9）。
 func (s *Store) AdvanceProfileCursor(ctx context.Context, userID int64, newCursor int64, expectedAt time.Time, expectedCursor int64) error {
-	tag, err := s.pool.Exec(ctx,
+	var tenantID int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT tenant_id FROM profiles WHERE user_id=$1`, userID).Scan(&tenantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return types.NewAppError(types.CodeConflict,
+			fmt.Sprintf("画像游标推进 CAS 未命中（user=%d）", userID), nil)
+	}
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase, "查询画像游标租户", err)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase, "开启画像游标事务", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if exists, err := lockTenantAdmissionRoot(ctx, tx, tenantID); err != nil {
+		return types.NewAppError(types.CodeDatabase, "锁定画像游标租户准入", err)
+	} else if !exists {
+		return types.NewAppError(types.CodeNotFound, "租户不存在", nil)
+	}
+	if err := lockExactProfileMembershipRoot(
+		ctx, tx, tenantID, userID); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx,
 		`UPDATE profiles
-		 SET last_evolved_feedback_id = $2
-		 WHERE user_id = $1 AND updated_at = $3 AND last_evolved_feedback_id = $4`,
-		userID, newCursor, expectedAt, expectedCursor)
+		 SET last_evolved_feedback_id = $3
+		 WHERE tenant_id = $1 AND user_id = $2
+		   AND updated_at = $4 AND last_evolved_feedback_id = $5`,
+		tenantID, userID, newCursor, expectedAt, expectedCursor)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("推进画像演化游标（user=%d）", userID), err)
@@ -223,6 +256,9 @@ func (s *Store) AdvanceProfileCursor(ctx context.Context, userID int64, newCurso
 	if tag.RowsAffected() == 0 {
 		return types.NewAppError(types.CodeConflict,
 			fmt.Sprintf("画像游标推进 CAS 未命中（user=%d）：画像已被并发修改或游标已推进", userID), nil)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return types.NewAppError(types.CodeDatabase, "提交画像游标事务", err)
 	}
 	return nil
 }

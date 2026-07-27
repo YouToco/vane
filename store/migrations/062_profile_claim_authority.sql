@@ -395,11 +395,40 @@ CREATE POLICY profile_claim_editor_identity ON memberships AS RESTRICTIVE
       user_id=NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
     );
 
+-- Keep legacy/owner binaries from bypassing the claim ledger after this
+-- migration commits.  This is deliberately an invoker trigger: SET ROLE must
+-- have entered the exact, non-login claim authority before a projection can
+-- create or change protected profile fields.  Cursor-only UPDATE and explicit
+-- DELETE/purge remain outside this fence.
+-- +goose StatementBegin
+CREATE FUNCTION public.enforce_profile_claim_editor_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+BEGIN
+    IF current_user <> 'vane_profile_claim_editor' THEN
+        RAISE EXCEPTION
+          'profiles protected fields require vane_profile_claim_editor'
+          USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+
+CREATE TRIGGER enforce_profile_claim_editor_v1
+BEFORE INSERT OR UPDATE OF industry,occupation,tags,removed_tags,summary
+ON public.profiles
+FOR EACH ROW
+EXECUTE FUNCTION public.enforce_profile_claim_editor_v1();
+
 -- +goose Down
 
 -- Acquire producer tables in the same order as writers before checking
 -- emptiness. A concurrent uncommitted producer must finish first; its commit
 -- then becomes visible to the fence and prevents destructive downgrade.
+LOCK TABLE profiles IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE profile_claim_states IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE profile_claims IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE profile_claim_events IN ACCESS EXCLUSIVE MODE;
@@ -418,6 +447,8 @@ BEGIN
 END $$;
 -- +goose StatementEnd
 
+DROP TRIGGER IF EXISTS enforce_profile_claim_editor_v1 ON public.profiles;
+DROP FUNCTION IF EXISTS public.enforce_profile_claim_editor_v1();
 DROP TABLE profile_claim_receipts;
 DROP TABLE profile_claim_events;
 DROP TABLE profile_claims;

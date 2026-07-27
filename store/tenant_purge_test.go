@@ -655,17 +655,22 @@ func TestProfileEditAdmissionRootIsTenantScoped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	var userA, userB int64
-	var expectedB time.Time
 	if err := st.pool.QueryRow(ctx,
 		`SELECT user_id FROM profiles WHERE tenant_id=$1`,
 		tenantA).Scan(&userA); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.pool.QueryRow(ctx,
-		`SELECT user_id,updated_at FROM profiles WHERE tenant_id=$1`,
-		tenantB).Scan(&userB, &expectedB); err != nil {
+		`SELECT user_id FROM profiles WHERE tenant_id=$1`,
+		tenantB).Scan(&userB); err != nil {
 		t.Fatal(err)
 	}
+	claimsB, err := st.ListProfileClaims(ctx, tenantB, userB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	occupationB := findClaim(t, claimsB.Claims, "occupation", "清理测试职业", true)
+	occupationBID := parseTestID(t, occupationB.ID)
 	tenantATx, err := st.beginProfileEditWriteTx(ctx, tenantA, userA)
 	if err != nil {
 		t.Fatal(err)
@@ -675,10 +680,16 @@ func TestProfileEditAdmissionRootIsTenantScoped(t *testing.T) {
 	patchDone := make(chan error, 1)
 	industry := "跨租户不应阻塞"
 	go func() {
-		_, err := st.PatchProfile(
-			ctx, tenantB, userB, &expectedB,
-			types.ProfileEditPatch{Industry: &industry},
-			"cross-tenant-root-"+uuid.NewString(), strings.Repeat("f", 64))
+		_, err := st.ApplyProfileClaimAction(
+			ctx, tenantB, userB,
+			types.ProfileClaimAction{
+				ExpectedVersion: claimsB.Version,
+				Action:          "correct",
+				ClaimID:         occupationBID,
+				Value:           industry,
+			},
+			"cross-tenant-root-"+uuid.NewString(), strings.Repeat("f", 64),
+		)
 		patchDone <- err
 	}()
 	select {

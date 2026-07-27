@@ -221,11 +221,19 @@ func (s *Store) ApplyProfileClaimAction(
 		if !ok {
 			return nil, types.NewAppError(types.CodeNotFound, "画像主张不存在", nil)
 		}
+		if action.Action == "pin" {
+			targetKey := profileClaimSemanticKey(target)
+			for _, claim := range claims {
+				if beforeProjection.active[claim.ID] &&
+					beforeProjection.pinned[claim.ID] &&
+					profileClaimSemanticKey(claim) == targetKey {
+					return nil, types.NewAppError(
+						types.CodeValidation, "同值画像主张已经固定", nil)
+				}
+			}
+		}
 		if !beforeProjection.active[target.ID] {
 			return nil, types.NewAppError(types.CodeConflict, "只能操作当前生效的画像主张", nil)
-		}
-		if action.Action == "pin" && beforeProjection.pinned[target.ID] {
-			return nil, types.NewAppError(types.CodeValidation, "该画像主张已经固定", nil)
 		}
 		targetClaimID = &target.ID
 		if action.Action == "correct" {
@@ -368,6 +376,11 @@ func (s *Store) beginProfileClaimScopedTx(
 			return nil, types.NewAppError(types.CodeNotFound, "租户不存在", nil)
 		}
 	}
+	if err := lockExactProfileMembershipRoot(
+		ctx, tx, tenantID, userID); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id',$1,true)`,
 		strconv.FormatInt(tenantID, 10)); err != nil {
@@ -385,6 +398,31 @@ func (s *Store) beginProfileClaimScopedTx(
 		return nil, profileClaimDBError("enter profile claim editor role", err)
 	}
 	return tx, nil
+}
+
+// lockExactProfileMembershipRoot is taken before entering either restricted
+// profile role.  FOR KEY SHARE makes revocation serialize with the whole
+// read/write transaction: either DELETE wins and this gate rejects, or DELETE
+// waits until the already-authorized operation commits.
+func lockExactProfileMembershipRoot(
+	ctx context.Context, tx pgx.Tx, tenantID, userID int64,
+) error {
+	var present bool
+	err := tx.QueryRow(ctx,
+		`SELECT true
+		   FROM memberships
+		  WHERE tenant_id=$1 AND user_id=$2
+		  FOR KEY SHARE`,
+		tenantID, userID,
+	).Scan(&present)
+	if errors.Is(err, pgx.ErrNoRows) || !present {
+		return types.NewAppError(
+			types.CodeNotFound, "用户不再属于该画像租户", nil)
+	}
+	if err != nil {
+		return profileClaimDBError("lock exact profile membership", err)
+	}
+	return nil
 }
 
 func lockProfileClaimStateTx(
@@ -407,6 +445,9 @@ func lockProfileClaimStateTx(
 func loadProfileClaimLedgerTx(
 	ctx context.Context, tx pgx.Tx, tenantID, userID int64,
 ) ([]profileClaimRow, []profileClaimEventRow, error) {
+	// 6.3-C retained risk: projection still reads the complete private ledger.
+	// Public responses are bounded and projection is linear, but durable
+	// compaction/pagination is intentionally a later authority-preserving cut.
 	rows, err := tx.Query(ctx,
 		`SELECT id,field_name,claim_value,source_state,source_ref_type,
 		        source_ref,generation,supersedes_claim_id,created_at
@@ -656,6 +697,25 @@ func projectProfileClaims(
 			out.pinned[target.ID] = true
 		}
 	}
+	// A semantic summary value has one active representative.  Authority wins
+	// over evidence, and newer evidence wins within the same authority class.
+	// Marking losers inactive (instead of merely suppressing duplicate output)
+	// keeps GET/action semantics aligned with the compiled projection.
+	summaryWinner := make(map[string]profileClaimRow)
+	for _, claim := range claims {
+		if claim.Field != "summary" || !out.active[claim.ID] {
+			continue
+		}
+		winner, exists := summaryWinner[claim.Value]
+		if !exists || preferSummaryClaim(claim, winner, out.pinned) {
+			if exists {
+				setActive(winner.ID, false)
+			}
+			summaryWinner[claim.Value] = claim
+		} else {
+			setActive(claim.ID, false)
+		}
+	}
 	var pinnedTags, manualTags, baseTags, summaryClaims []profileClaimRow
 	var selectedIndustry, selectedOccupation *profileClaimRow
 	for _, claim := range claims {
@@ -785,6 +845,29 @@ func projectProfileClaims(
 		}
 	}
 	return out
+}
+
+func preferSummaryClaim(
+	candidate, incumbent profileClaimRow, pinned map[int64]bool,
+) bool {
+	rank := func(claim profileClaimRow) int {
+		switch {
+		case pinned[claim.ID]:
+			return 3
+		case claim.SourceState == "manual":
+			return 2
+		default:
+			return 1
+		}
+	}
+	candidateRank, incumbentRank := rank(candidate), rank(incumbent)
+	if candidateRank != incumbentRank {
+		return candidateRank > incumbentRank
+	}
+	if candidate.Generation != incumbent.Generation {
+		return candidate.Generation > incumbent.Generation
+	}
+	return candidate.ID > incumbent.ID
 }
 
 func profileClaimRootIDs(
@@ -1108,10 +1191,24 @@ func evolveProfileClaimsTx(
 		current.LastEvolvedFeedbackID != expectedCursor {
 		return types.NewAppError(types.CodeConflict, "画像演化 CAS 未命中", nil)
 	}
-	version, _, err := lockProfileClaimStateTx(
+	version, generation, err := lockProfileClaimStateTx(
 		ctx, tx, tenantID, userID)
 	if err != nil {
 		return err
+	}
+	claims, events, err := loadProfileClaimLedgerTx(ctx, tx, tenantID, userID)
+	if err != nil {
+		return err
+	}
+	beforeProjection := projectProfileClaims(claims, events, generation)
+	authorityValues, authorityRunes := activeSummaryAuthority(
+		claims, beforeProjection)
+	if authorityRunes > maxProjectedSummaryRunes {
+		return types.NewAppError(
+			types.CodeInternal,
+			"生效人工/固定摘要权威超过 500 字，拒绝覆盖损坏状态",
+			nil,
+		)
 	}
 	ref := fmt.Sprintf("feedbacks:(%d,%d]", expectedCursor, newCursor)
 	insert := func(field, value string) error {
@@ -1131,7 +1228,10 @@ func evolveProfileClaimsTx(
 	// deterministic segment defensively so no caller can promote projection
 	// authority text back into evidence.
 	summary = stripDerivedManualSegment(summary)
-	for _, statement := range splitSummaryClaims(summary) {
+	for _, statement := range fitEvidenceSummaryClaims(
+		summary, authorityValues,
+		maxProjectedSummaryRunes-authorityRunes,
+	) {
 		if err := insert("summary", statement); err != nil {
 			return profileClaimDBError("insert evolved summary claim", err)
 		}
@@ -1153,14 +1253,14 @@ func evolveProfileClaimsTx(
 	if tag.RowsAffected() != 1 {
 		return types.NewAppError(types.CodeConflict, "画像主张版本已并发变化", nil)
 	}
-	claims, events, err := loadProfileClaimLedgerTx(ctx, tx, tenantID, userID)
+	claims, events, err = loadProfileClaimLedgerTx(ctx, tx, tenantID, userID)
 	if err != nil {
 		return err
 	}
 	projection := projectProfileClaims(claims, events, newCursor)
 	if activeSummaryRunes(claims, projection) > maxProjectedSummaryRunes {
 		return types.NewAppError(
-			types.CodeValidation, "生效画像摘要不能超过 500 字", nil)
+			types.CodeInternal, "画像摘要预算拟合不变量失效", nil)
 	}
 	updateTag, err := tx.Exec(ctx,
 		`UPDATE profiles
@@ -1205,6 +1305,56 @@ func activeSummaryRunes(
 		}
 	}
 	return total
+}
+
+func activeSummaryAuthority(
+	claims []profileClaimRow, projection profileClaimProjection,
+) (map[string]bool, int) {
+	values := make(map[string]bool)
+	total := 0
+	for _, claim := range claims {
+		if claim.Field != "summary" || !projection.active[claim.ID] ||
+			(claim.SourceState != "manual" && !projection.pinned[claim.ID]) ||
+			values[claim.Value] {
+			continue
+		}
+		values[claim.Value] = true
+		total += utf8.RuneCountInString(claim.Value)
+	}
+	return values, total
+}
+
+func fitEvidenceSummaryClaims(
+	summary string, authorityValues map[string]bool, budget int,
+) []string {
+	if budget <= 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(authorityValues))
+	for value := range authorityValues {
+		seen[value] = true
+	}
+	var fitted []string
+	for _, statement := range splitSummaryClaims(summary) {
+		if seen[statement] {
+			continue
+		}
+		runes := []rune(statement)
+		if len(runes) > budget {
+			statement = strings.TrimSpace(string(runes[:budget]))
+			runes = []rune(statement)
+		}
+		if statement == "" || seen[statement] {
+			continue
+		}
+		fitted = append(fitted, statement)
+		seen[statement] = true
+		budget -= len(runes)
+		if budget == 0 {
+			break
+		}
+	}
+	return fitted
 }
 
 func splitSummaryClaims(summary string) []string {

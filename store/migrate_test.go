@@ -14,8 +14,6 @@ import (
 	"time"
 
 	"github.com/pressly/goose/v3"
-
-	"github.com/YouToco/vane/types"
 )
 
 const latestMigrationVersion int64 = 62
@@ -207,7 +205,16 @@ func TestProfileEditDowngradeFenceLockOrder(t *testing.T) {
 	}
 	u.Path = "/" + name
 	freshURL := u.String()
-	if err := Migrate(t.Context(), freshURL); err != nil {
+	bootstrapDB, err := sql.Open("pgx", freshURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapProvider := migration062Provider(t, bootstrapDB)
+	if _, err := bootstrapProvider.UpTo(t.Context(), 60); err != nil {
+		_ = bootstrapDB.Close()
+		t.Fatal(err)
+	}
+	if err := bootstrapDB.Close(); err != nil {
 		t.Fatal(err)
 	}
 	st, err := New(t.Context(), freshURL)
@@ -215,11 +222,30 @@ func TestProfileEditDowngradeFenceLockOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	userID := testUserWithTenant(t, st, "profile-down")
-	value := "evidence"
-	if _, err := st.PatchProfile(
-		t.Context(), 1, userID, nil,
-		types.ProfileEditPatch{Industry: &value},
-		"down-fence", strings.Repeat("d", 64)); err != nil {
+	var revisionID int64
+	if err := st.pool.QueryRow(t.Context(), `
+		INSERT INTO profile_edit_revisions
+		    (tenant_id,user_id,actor_user_id,kind,before_fields,
+		     after_fields,result_updated_at)
+		VALUES(
+		  1,$1,$1,'edit',
+		  '{"exists":false,"industry":"","occupation":"","tags":[],"removed_tags":[]}',
+		  '{"exists":true,"industry":"evidence","occupation":"","tags":[],"removed_tags":[]}',
+		  clock_timestamp()
+		) RETURNING id`, userID).Scan(&revisionID); err != nil {
+		st.Close()
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(t.Context(), `
+		INSERT INTO profile_edit_receipts
+		    (tenant_id,user_id,idempotency_key,request_digest,revision_id,
+		     response_profile)
+		VALUES(
+		  1,$1,'down-fence',repeat('d',64),$2,
+		  '{"industry":"evidence","occupation":"","tags":[],"removed_tags":[],
+		    "summary":"","created_at":"2026-01-01T00:00:00Z",
+		    "updated_at":"2026-01-01T00:00:00Z"}'
+		)`, userID, revisionID); err != nil {
 		st.Close()
 		t.Fatal(err)
 	}
