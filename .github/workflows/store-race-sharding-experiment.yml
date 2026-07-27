@@ -1,0 +1,130 @@
+name: Store race sharding experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      timings_path:
+        description: Optional repository-relative prior go test -json artifact
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: [self-hosted, Linux, ARM64, vane-test]
+
+    services:
+      postgres_0:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: vane_test
+          POSTGRES_USER: vane
+          POSTGRES_PASSWORD: vane_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres_1:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: vane_test
+          POSTGRES_USER: vane
+          POSTGRES_PASSWORD: vane_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres_2:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: vane_test
+          POSTGRES_USER: vane
+          POSTGRES_PASSWORD: vane_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.26"
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Run store race shards
+        shell: bash
+        env:
+          TIMINGS_PATH: ${{ inputs.timings_path }}
+        run: |
+          set -euo pipefail
+          timing_args=()
+          if [[ -n "${TIMINGS_PATH}" ]]; then
+            if [[ ! -f "${TIMINGS_PATH}" ]]; then
+              echo "timings_path does not exist: ${TIMINGS_PATH}" >&2
+              exit 1
+            fi
+            timing_args=(--timings "${TIMINGS_PATH}")
+          fi
+          go run ./cmd/storetestshard run \
+            --artifacts tmp/store-sharding \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports[5432] }}/vane_test?sslmode=disable' \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_1.ports[5432] }}/vane_test?sslmode=disable' \
+            --database-url 'postgres://vane:vane_test@localhost:${{ job.services.postgres_2.ports[5432] }}/vane_test?sslmode=disable' \
+            "${timing_args[@]}"
+
+      - name: Test remaining packages
+        shell: bash
+        env:
+          DATABASE_URL: postgres://vane:vane_test@localhost:${{ job.services.postgres_0.ports[5432] }}/vane_test?sslmode=disable
+        run: |
+          set -euo pipefail
+          store_package="$(go list ./store)"
+          mapfile -t packages < <(go list ./... | grep -Fvx "${store_package}")
+          go test -race -covermode=atomic \
+            -coverprofile=tmp/store-sharding/non-store.coverage.out \
+            "${packages[@]}"
+
+      - name: Merge coverage
+        run: >-
+          go run ./cmd/storetestshard merge-coverage
+          --output coverage.txt
+          tmp/store-sharding/store.coverage.out
+          tmp/store-sharding/non-store.coverage.out
+
+      - name: Build
+        run: go build -o bin/vane ./cmd/server
+
+      - name: Upload timing and coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: store-race-sharding-${{ github.run_id }}
+          path: |
+            tmp/store-sharding/*.json
+            tmp/store-sharding/*.txt
+            tmp/store-sharding/*.out
+            coverage.txt
+          if-no-files-found: warn
+          retention-days: 14
