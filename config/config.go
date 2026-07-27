@@ -530,6 +530,18 @@ func (c *Config) Validate() error {
 			"config: push effect recovery canary 必须位于 compiled runtime rollout")
 	}
 	c.Pipeline.PushEffectRecoveryCanaryScheduleID = pushRecoveryCanaryID
+	if c.Pipeline.CanonicalBriefEnabled {
+		if c.Pipeline.CanonicalBriefAllowAll ||
+			canonicalBriefCanaryID == "" {
+			return errors.New(
+				"config: canonical brief 当前仅允许 exact-task canary")
+		}
+		if pushEffectCanaryID != canonicalBriefCanaryID ||
+			pushRecoveryCanaryID != canonicalBriefCanaryID {
+			return errors.New(
+				"config: canonical brief canary 必须同时位于 push effect fresh/recovery canary")
+		}
+	}
 
 	rawObservationShadow := c.Pipeline.ObservationShadowCanaryScheduleID
 	observationShadow := strings.TrimSpace(rawObservationShadow)

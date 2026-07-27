@@ -183,5 +183,13 @@ func (s *Store) FinalizeRecoveredRunOutcomeClaimV1(
 		return types.RunOutcomeV1{}, canonicalBriefDatabaseError(
 			"read recovered outcome identity", err)
 	}
-	return finalizeRunOutcomeClaimTxV1(ctx, tx, claim)
+	outcome, err := finalizeRunOutcomeClaimTxV1(ctx, tx, claim)
+	if err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	if err := commitCanonicalBriefTxV1(
+		ctx, tx, "commit recovered run outcome claim"); err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	return outcome, nil
 }

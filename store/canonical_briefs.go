@@ -253,7 +253,14 @@ func (s *Store) FinalizeRunOutcomeClaimV1(
 		return types.RunOutcomeV1{}, err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
-	return finalizeRunOutcomeClaimTxV1(ctx, tx, claim)
+	outcome, err := finalizeRunOutcomeClaimTxV1(ctx, tx, claim)
+	if err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	if err := commitCanonicalBriefTxV1(ctx, tx, "commit run outcome claim"); err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	return outcome, nil
 }
 
 func finalizeRunOutcomeClaimTxV1(
@@ -283,7 +290,7 @@ func finalizeRunOutcomeClaimTxV1(
 			return types.RunOutcomeV1{},
 				canonicalBriefConflictError("run outcome already finalized differently")
 		}
-		if err := commitCanonicalBriefTxV1(ctx, tx, "replay run outcome claim"); err != nil {
+		if err := resolveCanonicalBriefStageTxV1(ctx, tx, replayed); err != nil {
 			return types.RunOutcomeV1{}, err
 		}
 		return replayed, nil
@@ -319,10 +326,411 @@ func finalizeRunOutcomeClaimTxV1(
 		return types.RunOutcomeV1{},
 			canonicalBriefConflictError("run outcome claim lost its CAS")
 	}
-	if err := commitCanonicalBriefTxV1(ctx, tx, "commit run outcome claim"); err != nil {
+	if err := resolveCanonicalBriefStageTxV1(ctx, tx, outcome); err != nil {
 		return types.RunOutcomeV1{}, err
 	}
 	return outcome, nil
+}
+
+func resolveCanonicalBriefStageTxV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	outcome types.RunOutcomeV1,
+) error {
+	available, err := canonicalBriefStageCapabilityV1(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !available {
+		// P1-B histories and safely downgraded deployments have no stage.
+		return nil
+	}
+	stage, found, err := loadCanonicalBriefStageV1(ctx, tx, outcome.ID)
+	if err != nil || !found {
+		return err
+	}
+	if outcome.Result == types.RunResultContent {
+		switch stage.status {
+		case "promoted":
+			stored, found, err := loadBriefForOutcomeV1(ctx, tx, outcome.ID)
+			if err != nil {
+				return err
+			}
+			if !found || stored.requestDigest != stage.requestDigest ||
+				!stage.briefSnapshotID.Valid ||
+				stage.briefSnapshotID.Int64 != stored.brief.ID ||
+				!stage.resolvedAt.Valid ||
+				!stage.resolvedAt.Time.Equal(outcome.FinalizedAt) {
+				return canonicalBriefIntegrityError()
+			}
+			return nil
+		case "aborted":
+			return canonicalBriefIntegrityError()
+		case "staged":
+			return promoteCanonicalBriefStageTxV1(
+				ctx, tx, stage, outcome.FinalizedAt)
+		default:
+			return canonicalBriefIntegrityError()
+		}
+	}
+	switch stage.status {
+	case "aborted":
+		if !stage.resolvedAt.Valid ||
+			!stage.resolvedAt.Time.Equal(outcome.FinalizedAt) {
+			return canonicalBriefIntegrityError()
+		}
+		return nil
+	case "promoted":
+		return canonicalBriefIntegrityError()
+	case "staged":
+		tag, err := tx.Exec(ctx,
+			`UPDATE canonical_brief_stages
+			    SET status='aborted',resolved_at=$2
+			  WHERE run_outcome_id=$1 AND status='staged'`,
+			outcome.ID, outcome.FinalizedAt,
+		)
+		if err != nil {
+			return canonicalBriefDatabaseError(
+				"abort canonical Brief stage", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return canonicalBriefIntegrityError()
+		}
+		return nil
+	default:
+		return canonicalBriefIntegrityError()
+	}
+}
+
+func promoteCanonicalBriefStageTxV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	stage canonicalBriefStageV1,
+	resolvedAt time.Time,
+) error {
+	if existing, found, err := loadBriefForOutcomeV1(
+		ctx, tx, stage.draft.RunOutcomeID); err != nil {
+		return err
+	} else if found {
+		if existing.requestDigest != stage.requestDigest {
+			return canonicalBriefIntegrityError()
+		}
+		tag, err := tx.Exec(ctx,
+			`UPDATE canonical_brief_stages
+			    SET status='promoted',brief_snapshot_id=$2,resolved_at=$3
+			  WHERE run_outcome_id=$1 AND status='staged'`,
+			stage.draft.RunOutcomeID, existing.brief.ID, resolvedAt,
+		)
+		if err != nil {
+			return canonicalBriefDatabaseError(
+				"repair canonical Brief stage promotion", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return canonicalBriefIntegrityError()
+		}
+		return nil
+	}
+
+	var briefID int64
+	if err := tx.QueryRow(
+		ctx, `SELECT nextval('brief_snapshots_id_seq')`).Scan(&briefID); err != nil {
+		return canonicalBriefDatabaseError("allocate canonical Brief id", err)
+	}
+	brief, err := stage.draft.Seal(briefID)
+	if err != nil {
+		return canonicalBriefIntegrityError()
+	}
+	payload, err := json.Marshal(brief)
+	if err != nil {
+		return canonicalBriefIntegrityError()
+	}
+	_, err = tx.Exec(ctx,
+		`INSERT INTO brief_snapshots (
+		    id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,
+		    push_batch_id,schema_version,request_digest,payload_digest,
+		    payload,insight_count,generated_at
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		brief.ID, brief.TenantID, brief.UserID, brief.TaskID,
+		brief.RunOutcomeID, brief.RunSnapshotID, brief.PushBatchID,
+		brief.SchemaVersion, stage.requestDigest, brief.Digest, payload,
+		len(brief.Insights), brief.GeneratedAt,
+	)
+	if err != nil {
+		return canonicalBriefDatabaseError(
+			"promote canonical Brief stage", err)
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE canonical_brief_stages
+		    SET status='promoted',brief_snapshot_id=$2,resolved_at=$3
+		  WHERE run_outcome_id=$1 AND status='staged'`,
+		brief.RunOutcomeID, brief.ID, resolvedAt,
+	)
+	if err != nil {
+		return canonicalBriefDatabaseError(
+			"complete canonical Brief stage promotion", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return canonicalBriefIntegrityError()
+	}
+	return nil
+}
+
+// LoadPreparedBriefDraftV1 recovers immutable staged bytes before consulting
+// mutable task authorization or delivery evidence.
+func (s *Store) LoadPreparedBriefDraftV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	marker types.RunOutcomeMarkerV1,
+) (types.BriefDraftV1, bool, error) {
+	if err := marker.Validate(); err != nil ||
+		marker.RunSnapshotID != ref.SnapshotID ||
+		marker.TenantID != expected.TenantID ||
+		marker.UserID != expected.UserID ||
+		marker.TaskID != expected.TaskID {
+		return types.BriefDraftV1{}, false,
+			canonicalBriefValidationError("brief stage lookup is invalid")
+	}
+	tx, err := s.beginCanonicalBriefTxV1(ctx, expected, ref)
+	if err != nil {
+		return types.BriefDraftV1{}, false, err
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockCanonicalBriefRunV1(ctx, tx, ref.SnapshotID); err != nil {
+		return types.BriefDraftV1{}, false, err
+	}
+	available, err := canonicalBriefStageCapabilityV1(ctx, tx)
+	if err != nil {
+		return types.BriefDraftV1{}, false, err
+	}
+	if !available {
+		return types.BriefDraftV1{}, false,
+			canonicalBriefDatabaseError(
+				"check canonical Brief stage capability",
+				errors.New("canonical Brief stage capability is unavailable"))
+	}
+	outcomeRow, found, err := loadRunOutcomeForSnapshotV1(
+		ctx, tx, ref.SnapshotID, false)
+	if err != nil {
+		return types.BriefDraftV1{}, false, err
+	}
+	if !found || outcomeRow.ID != marker.ID ||
+		outcomeRow.marker() != marker {
+		return types.BriefDraftV1{}, false,
+			canonicalBriefNotFoundError("run outcome marker is unavailable")
+	}
+	stage, found, err := loadCanonicalBriefStageV1(ctx, tx, marker.ID)
+	if err != nil {
+		return types.BriefDraftV1{}, false, err
+	}
+	if found && stage.status != "staged" {
+		return types.BriefDraftV1{}, false, canonicalBriefIntegrityError()
+	}
+	if err := commitCanonicalBriefTxV1(
+		ctx, tx, "load canonical Brief stage"); err != nil {
+		return types.BriefDraftV1{}, false, err
+	}
+	if !found {
+		return types.BriefDraftV1{}, false, nil
+	}
+	return stage.draft, true, nil
+}
+
+// PrepareBriefDraftV1 durably stages the exact post-delivery/pre-render
+// payload while the RunOutcome is still pending. It seals the batch in the
+// same transaction, so no renderer or sender can observe an unfrozen delivery
+// set. Final outcome CAS later promotes the stage for content or aborts it for
+// failure/interruption.
+func (s *Store) PrepareBriefDraftV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	marker types.RunOutcomeMarkerV1,
+	batchID int64,
+	generatedAt time.Time,
+	orderedDeliveryIDs []int64,
+) (types.BriefDraftV1, error) {
+	if err := marker.Validate(); err != nil ||
+		marker.RunSnapshotID != ref.SnapshotID ||
+		marker.TenantID != expected.TenantID ||
+		marker.UserID != expected.UserID ||
+		marker.TaskID != expected.TaskID ||
+		batchID <= 0 || generatedAt.IsZero() ||
+		len(orderedDeliveryIDs) == 0 {
+		return types.BriefDraftV1{},
+			canonicalBriefValidationError("brief preparation input is invalid")
+	}
+	seen := make(map[int64]struct{}, len(orderedDeliveryIDs))
+	for _, deliveryID := range orderedDeliveryIDs {
+		if deliveryID <= 0 {
+			return types.BriefDraftV1{},
+				canonicalBriefValidationError(
+					"brief preparation delivery identity is invalid")
+		}
+		if _, exists := seen[deliveryID]; exists {
+			return types.BriefDraftV1{},
+				canonicalBriefValidationError(
+					"brief preparation delivery identity is duplicated")
+		}
+		seen[deliveryID] = struct{}{}
+	}
+
+	tx, err := s.beginCanonicalBriefTxV1(ctx, expected, ref)
+	if err != nil {
+		return types.BriefDraftV1{}, err
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+	if err := lockCanonicalBriefRunV1(ctx, tx, ref.SnapshotID); err != nil {
+		return types.BriefDraftV1{}, err
+	}
+	available, err := canonicalBriefStageCapabilityV1(ctx, tx)
+	if err != nil {
+		return types.BriefDraftV1{}, err
+	}
+	if !available {
+		return types.BriefDraftV1{},
+			canonicalBriefDatabaseError(
+				"check canonical Brief stage capability",
+				errors.New("canonical Brief stage capability is unavailable"))
+	}
+	outcomeRow, found, err := loadRunOutcomeForSnapshotV1(
+		ctx, tx, ref.SnapshotID, false)
+	if err != nil {
+		return types.BriefDraftV1{}, err
+	}
+	if !found || outcomeRow.ID != marker.ID ||
+		outcomeRow.marker() != marker {
+		return types.BriefDraftV1{},
+			canonicalBriefNotFoundError("run outcome marker is unavailable")
+	}
+	if existing, found, err := loadCanonicalBriefStageV1(
+		ctx, tx, marker.ID); err != nil {
+		return types.BriefDraftV1{}, err
+	} else if found {
+		if existing.status != "staged" ||
+			existing.draft.PushBatchID != batchID ||
+			existing.draft.GeneratedAt !=
+				generatedAt.Round(0).UTC().Truncate(time.Microsecond) ||
+			len(existing.draft.Insights) != len(orderedDeliveryIDs) {
+			return types.BriefDraftV1{},
+				canonicalBriefConflictError(
+					"canonical Brief stage already differs")
+		}
+		for index, deliveryID := range orderedDeliveryIDs {
+			if existing.draft.Insights[index].ID != deliveryID {
+				return types.BriefDraftV1{},
+					canonicalBriefConflictError(
+						"canonical Brief stage order already differs")
+			}
+		}
+		if err := commitCanonicalBriefTxV1(
+			ctx, tx, "replay canonical Brief stage"); err != nil {
+			return types.BriefDraftV1{}, err
+		}
+		return existing.draft, nil
+	}
+	var briefState string
+	err = tx.QueryRow(ctx,
+		`SELECT brief_state
+		   FROM push_batches
+		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		    AND schedule_id=$4 AND run_snapshot_id=$5
+		  FOR UPDATE`,
+		batchID, expected.TenantID, expected.UserID,
+		expected.TaskID, ref.SnapshotID,
+	).Scan(&briefState)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return types.BriefDraftV1{},
+			canonicalBriefNotFoundError("compiled brief batch is unavailable")
+	}
+	if err != nil {
+		return types.BriefDraftV1{},
+			canonicalBriefDatabaseError("lock compiled brief batch", err)
+	}
+	if briefState != "open" {
+		return types.BriefDraftV1{},
+			canonicalBriefConflictError("compiled brief batch is already sealed")
+	}
+
+	evidenceByID, err := readBriefEvidenceV1(ctx, tx, batchID, ref.SnapshotID)
+	if err != nil {
+		return types.BriefDraftV1{}, err
+	}
+	if len(evidenceByID) != len(orderedDeliveryIDs) {
+		return types.BriefDraftV1{},
+			canonicalBriefConflictError(
+				"brief preparation must cover the complete delivery set")
+	}
+	insights := make([]types.InsightV1, 0, len(orderedDeliveryIDs))
+	for index, deliveryID := range orderedDeliveryIDs {
+		stored, exists := evidenceByID[deliveryID]
+		if !exists || !stored.complete {
+			return types.BriefDraftV1{},
+				canonicalBriefConflictError(
+					"brief preparation evidence is incomplete")
+		}
+		insights = append(insights, types.InsightV1{
+			ID: deliveryID, RankPosition: index + 1,
+			Title: stored.title, BodyMD: stored.bodyMD,
+			SourceTitle:  stored.sourceTitle,
+			SourceURL:    stored.sourceURL,
+			PublishedAt:  stored.publishedAt,
+			DiscoveredAt: stored.discoveredAt,
+		})
+	}
+	draft, err := (types.BriefDraftV1{
+		SchemaVersion: types.BriefSchemaVersionV1,
+		RunOutcomeID:  marker.ID,
+		RunSnapshotID: marker.RunSnapshotID,
+		PushBatchID:   batchID,
+		TenantID:      marker.TenantID,
+		UserID:        marker.UserID,
+		TaskID:        marker.TaskID,
+		GeneratedAt:   generatedAt,
+		Insights:      insights,
+	}).Canonical()
+	if err != nil {
+		return types.BriefDraftV1{}, canonicalBriefIntegrityError()
+	}
+	requestDigest, err := draft.RequestDigest()
+	if err != nil {
+		return types.BriefDraftV1{}, canonicalBriefIntegrityError()
+	}
+	payload, err := json.Marshal(draft)
+	if err != nil {
+		return types.BriefDraftV1{}, canonicalBriefIntegrityError()
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE push_batches SET brief_state='sealed'
+		  WHERE id=$1 AND brief_state='open'`, batchID)
+	if err != nil {
+		return types.BriefDraftV1{},
+			canonicalBriefDatabaseError("seal canonical Brief stage batch", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return types.BriefDraftV1{},
+			canonicalBriefConflictError(
+				"canonical Brief stage batch seal lost its CAS")
+	}
+	_, err = tx.Exec(ctx,
+		`INSERT INTO canonical_brief_stages (
+		    run_outcome_id,tenant_id,user_id,task_id,run_snapshot_id,
+		    push_batch_id,schema_version,request_digest,payload,
+		    insight_count,generated_at
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		draft.RunOutcomeID, draft.TenantID, draft.UserID, draft.TaskID,
+		draft.RunSnapshotID, draft.PushBatchID, draft.SchemaVersion,
+		requestDigest, payload, len(draft.Insights), draft.GeneratedAt,
+	)
+	if err != nil {
+		return types.BriefDraftV1{},
+			canonicalBriefDatabaseError("stage canonical Brief", err)
+	}
+	if err := commitCanonicalBriefTxV1(
+		ctx, tx, "commit canonical Brief stage"); err != nil {
+		return types.BriefDraftV1{}, err
+	}
+	return draft, nil
 }
 
 // FreezeBriefV1 persists one immutable, channel-neutral whole-Brief snapshot.
@@ -353,6 +761,24 @@ func (s *Store) FreezeBriefV1(
 		return types.BriefV1{}, err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
+	brief, err := freezeBriefTxV1(ctx, tx, expected, ref, canonical, requestDigest)
+	if err != nil {
+		return types.BriefV1{}, err
+	}
+	if err := commitCanonicalBriefTxV1(ctx, tx, "commit canonical brief"); err != nil {
+		return types.BriefV1{}, err
+	}
+	return brief, nil
+}
+
+func freezeBriefTxV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	canonical types.BriefDraftV1,
+	requestDigest string,
+) (types.BriefV1, error) {
 	if err := lockCanonicalBriefRunV1(ctx, tx, ref.SnapshotID); err != nil {
 		return types.BriefV1{}, err
 	}
@@ -382,9 +808,6 @@ func (s *Store) FreezeBriefV1(
 		if existing.requestDigest != requestDigest {
 			return types.BriefV1{},
 				canonicalBriefConflictError("brief already frozen differently")
-		}
-		if err := commitCanonicalBriefTxV1(ctx, tx, "replay frozen brief"); err != nil {
-			return types.BriefV1{}, err
 		}
 		return existing.brief, nil
 	}
@@ -454,9 +877,6 @@ func (s *Store) FreezeBriefV1(
 	if err != nil {
 		return types.BriefV1{},
 			canonicalBriefDatabaseError("freeze canonical brief", err)
-	}
-	if err := commitCanonicalBriefTxV1(ctx, tx, "commit canonical brief"); err != nil {
-		return types.BriefV1{}, err
 	}
 	return brief, nil
 }
@@ -597,6 +1017,109 @@ func loadRunOutcomeForSnapshotV1(
 	return stored, true, nil
 }
 
+type canonicalBriefStageV1 struct {
+	draft           types.BriefDraftV1
+	requestDigest   string
+	status          string
+	briefSnapshotID sql.NullInt64
+	resolvedAt      sql.NullTime
+}
+
+func canonicalBriefStageCapabilityV1(
+	ctx context.Context,
+	tx pgx.Tx,
+) (bool, error) {
+	var available bool
+	if err := tx.QueryRow(ctx,
+		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL`,
+	).Scan(&available); err != nil {
+		return false, canonicalBriefDatabaseError(
+			"check canonical Brief stage capability", err)
+	}
+	return available, nil
+}
+
+func loadCanonicalBriefStageV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	runOutcomeID int64,
+) (canonicalBriefStageV1, bool, error) {
+	var (
+		stage                                 canonicalBriefStageV1
+		tenantID, userID, snapshotID, batchID int64
+		taskID, schemaVersion                 string
+		payload                               []byte
+		insightCount                          int
+		generatedAt                           time.Time
+	)
+	err := tx.QueryRow(ctx,
+		`SELECT tenant_id,user_id,task_id,run_snapshot_id,push_batch_id,
+		        schema_version,request_digest,payload,insight_count,
+		        generated_at,status,brief_snapshot_id,resolved_at
+		   FROM canonical_brief_stages
+		  WHERE run_outcome_id=$1
+		  FOR UPDATE`,
+		runOutcomeID,
+	).Scan(
+		&tenantID, &userID, &taskID, &snapshotID, &batchID,
+		&schemaVersion, &stage.requestDigest, &payload, &insightCount,
+		&generatedAt, &stage.status, &stage.briefSnapshotID,
+		&stage.resolvedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return canonicalBriefStageV1{}, false, nil
+	}
+	if err != nil {
+		return canonicalBriefStageV1{}, false,
+			canonicalBriefDatabaseError("load canonical Brief stage", err)
+	}
+	if err := json.Unmarshal(payload, &stage.draft); err != nil {
+		return canonicalBriefStageV1{}, false, canonicalBriefIntegrityError()
+	}
+	canonicalDraft, canonicalErr := stage.draft.Canonical()
+	if canonicalErr != nil ||
+		stage.draft.RunOutcomeID != runOutcomeID ||
+		stage.draft.TenantID != tenantID ||
+		stage.draft.UserID != userID ||
+		stage.draft.TaskID != taskID ||
+		stage.draft.RunSnapshotID != snapshotID ||
+		stage.draft.PushBatchID != batchID ||
+		stage.draft.SchemaVersion != schemaVersion ||
+		len(stage.draft.Insights) != insightCount ||
+		!stage.draft.GeneratedAt.Equal(generatedAt) {
+		return canonicalBriefStageV1{}, false, canonicalBriefIntegrityError()
+	}
+	canonicalPayload, err := json.Marshal(canonicalDraft)
+	if err != nil || !bytes.Equal(payload, canonicalPayload) {
+		return canonicalBriefStageV1{}, false, canonicalBriefIntegrityError()
+	}
+	stage.draft = canonicalDraft
+	requestDigest, err := stage.draft.RequestDigest()
+	if err != nil || requestDigest != stage.requestDigest {
+		return canonicalBriefStageV1{}, false, canonicalBriefIntegrityError()
+	}
+	switch stage.status {
+	case "staged":
+		if stage.briefSnapshotID.Valid || stage.resolvedAt.Valid {
+			return canonicalBriefStageV1{}, false,
+				canonicalBriefIntegrityError()
+		}
+	case "promoted":
+		if !stage.briefSnapshotID.Valid || !stage.resolvedAt.Valid {
+			return canonicalBriefStageV1{}, false,
+				canonicalBriefIntegrityError()
+		}
+	case "aborted":
+		if stage.briefSnapshotID.Valid || !stage.resolvedAt.Valid {
+			return canonicalBriefStageV1{}, false,
+				canonicalBriefIntegrityError()
+		}
+	default:
+		return canonicalBriefStageV1{}, false, canonicalBriefIntegrityError()
+	}
+	return stage, true, nil
+}
+
 type storedBriefV1 struct {
 	brief         types.BriefV1
 	requestDigest string
@@ -670,56 +1193,10 @@ func loadBriefV1(
 func verifyBriefDeliveriesV1(
 	ctx context.Context, tx pgx.Tx, draft types.BriefDraftV1,
 ) error {
-	rows, err := tx.Query(ctx,
-		`SELECT delivery_id,evidence_complete,body_md,discovered_at,content_title,
-		        canonical_url,published_at,source_title
-		   FROM read_canonical_brief_delivery_evidence_v1($1,$2)`,
-		draft.PushBatchID, draft.RunSnapshotID,
-	)
+	deliveries, err := readBriefEvidenceV1(
+		ctx, tx, draft.PushBatchID, draft.RunSnapshotID)
 	if err != nil {
-		return canonicalBriefDatabaseError("read brief delivery evidence", err)
-	}
-	defer rows.Close()
-	type evidence struct {
-		complete     bool
-		bodyMD       string
-		discoveredAt time.Time
-		title        string
-		sourceURL    string
-		publishedAt  *time.Time
-		sourceTitle  string
-	}
-	deliveries := make(map[int64]evidence, len(draft.Insights))
-	for rows.Next() {
-		var id int64
-		var complete bool
-		var bodyMD string
-		var discoveredAt time.Time
-		var title, sourceURL, sourceTitle string
-		var publishedAt sql.NullTime
-		if err := rows.Scan(
-			&id, &complete, &bodyMD, &discoveredAt, &title, &sourceURL,
-			&publishedAt, &sourceTitle,
-		); err != nil {
-			return canonicalBriefDatabaseError("scan brief delivery", err)
-		}
-		var canonicalPublishedAt *time.Time
-		if publishedAt.Valid {
-			value := publishedAt.Time.Round(0).UTC().Truncate(time.Microsecond)
-			canonicalPublishedAt = &value
-		}
-		deliveries[id] = evidence{
-			complete:     complete,
-			bodyMD:       bodyMD,
-			discoveredAt: discoveredAt.Round(0).UTC().Truncate(time.Microsecond),
-			title:        title,
-			sourceURL:    sourceURL,
-			publishedAt:  canonicalPublishedAt,
-			sourceTitle:  sourceTitle,
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return canonicalBriefDatabaseError("read brief delivery evidence", err)
+		return err
 	}
 	if len(deliveries) != len(draft.Insights) {
 		return canonicalBriefConflictError(
@@ -744,6 +1221,70 @@ func verifyBriefDeliveriesV1(
 		}
 	}
 	return nil
+}
+
+type briefEvidenceV1 struct {
+	complete     bool
+	bodyMD       string
+	discoveredAt time.Time
+	title        string
+	sourceURL    string
+	publishedAt  *time.Time
+	sourceTitle  string
+}
+
+func readBriefEvidenceV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	batchID int64,
+	runSnapshotID int64,
+) (map[int64]briefEvidenceV1, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT delivery_id,evidence_complete,body_md,discovered_at,content_title,
+		        canonical_url,published_at,source_title
+		   FROM read_canonical_brief_delivery_evidence_v1($1,$2)`,
+		batchID, runSnapshotID,
+	)
+	if err != nil {
+		return nil,
+			canonicalBriefDatabaseError("read brief delivery evidence", err)
+	}
+	defer rows.Close()
+	deliveries := make(map[int64]briefEvidenceV1)
+	for rows.Next() {
+		var id int64
+		var complete bool
+		var bodyMD string
+		var discoveredAt time.Time
+		var title, sourceURL, sourceTitle string
+		var publishedAt sql.NullTime
+		if err := rows.Scan(
+			&id, &complete, &bodyMD, &discoveredAt, &title, &sourceURL,
+			&publishedAt, &sourceTitle,
+		); err != nil {
+			return nil,
+				canonicalBriefDatabaseError("scan brief delivery", err)
+		}
+		var canonicalPublishedAt *time.Time
+		if publishedAt.Valid {
+			value := publishedAt.Time.Round(0).UTC().Truncate(time.Microsecond)
+			canonicalPublishedAt = &value
+		}
+		deliveries[id] = briefEvidenceV1{
+			complete:     complete,
+			bodyMD:       bodyMD,
+			discoveredAt: discoveredAt.Round(0).UTC().Truncate(time.Microsecond),
+			title:        title,
+			sourceURL:    sourceURL,
+			publishedAt:  canonicalPublishedAt,
+			sourceTitle:  sourceTitle,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil,
+			canonicalBriefDatabaseError("read brief delivery evidence", err)
+	}
+	return deliveries, nil
 }
 
 func canonicalBriefOptionalTimeEqual(left, right *time.Time) bool {

@@ -209,6 +209,7 @@ func run() error {
 				})
 			}, compiledModelResolver),
 		workflow.WithRunOutcomeStoreV1(st),
+		workflow.WithCanonicalBriefStoreV1(st),
 		workflow.WithSnapshotV2ShadowCanary(
 			st, cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID),
 		workflow.WithSnapshotV2ReadAuditCanary(
@@ -248,6 +249,7 @@ func run() error {
 	w.RegisterActivity(activities.PrepareRun)
 	w.RegisterActivity(activities.BeginRunOutcomeV1)
 	w.RegisterActivity(activities.FinalizeRunOutcomeV1)
+	w.RegisterActivity(activities.PrepareCanonicalBriefV1)
 	w.RegisterActivity(activities.EvolveProfile)
 	w.RegisterActivity(activities.Fetch)
 	w.RegisterActivity(activities.FetchOutcomeV1)

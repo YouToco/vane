@@ -11,9 +11,9 @@ import (
 	"testing"
 )
 
-// P1-B may connect only Begin/Finalize/Recovery. Canonical Brief freezing and
-// reading remain dark until their separately reviewed phases.
-func TestCanonicalBriefP1BHasOnlyScopedProductionCallPoints(t *testing.T) {
+// P1-C adds only the reviewed Stage/Finalize seam. Direct Freeze/Load, Brief
+// API reads, and renderer authority remain dark.
+func TestCanonicalBriefP1CHasOnlyScopedProductionCallPoints(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate guard source")
@@ -30,6 +30,12 @@ func TestCanonicalBriefP1BHasOnlyScopedProductionCallPoints(t *testing.T) {
 		"FinalizeRunOutcomeClaimV1": {
 			"workflow/activities.go": true,
 		},
+		"LoadPreparedBriefDraftV1": {
+			"workflow/activities.go": true,
+		},
+		"PrepareBriefDraftV1": {
+			"workflow/activities.go": true,
+		},
 		"ListStaleRunOutcomeCandidatesV1": {
 			"runoutcome/runner.go": true,
 		},
@@ -41,6 +47,10 @@ func TestCanonicalBriefP1BHasOnlyScopedProductionCallPoints(t *testing.T) {
 			"cmd/server/main.go":   true,
 		},
 		"FinalizeRunOutcomeV1": {
+			"workflow/workflow.go": true,
+			"cmd/server/main.go":   true,
+		},
+		"PrepareCanonicalBriefV1": {
 			"workflow/workflow.go": true,
 			"cmd/server/main.go":   true,
 		},
@@ -93,7 +103,7 @@ func TestCanonicalBriefP1BHasOnlyScopedProductionCallPoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(calls) != 0 {
-		t.Fatalf("P1-B production scope escaped: %v", calls)
+		t.Fatalf("P1-C production scope escaped: %v", calls)
 	}
 }
 

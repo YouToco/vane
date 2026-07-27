@@ -156,6 +156,7 @@ type compiledRunStoreFake struct {
 	fetchStateWrites   int
 	fetchDisables      int
 	recoveryOnly       bool
+	deliveryErr        error
 	deliveryReceiptErr error
 	authorityWinner    types.PushBatchDeliveryAuthority
 	authorityErr       error
@@ -739,6 +740,9 @@ func (f *compiledRunStoreFake) InsertDeliveryForTaskRunV1(
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deliveryErr != nil {
+		return 0, false, false, f.deliveryErr
+	}
 	f.deliveryWrites++
 	if len(f.deliveryIDSequence) > 0 {
 		id := f.deliveryIDSequence[0]

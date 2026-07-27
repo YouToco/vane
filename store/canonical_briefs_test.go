@@ -177,6 +177,14 @@ func newCanonicalBriefFixture(t *testing.T, deliveries int) *canonicalBriefFixtu
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
 		defer cancel()
+		var stageTableExists bool
+		if err := base.st.pool.QueryRow(ctx,
+			`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL`,
+		).Scan(&stageTableExists); err == nil && stageTableExists {
+			cleanupExec(ctx, t, base.st,
+				`DELETE FROM canonical_brief_stages WHERE tenant_id=$1`,
+				base.tenantID)
+		}
 		cleanupExec(ctx, t, base.st,
 			`DELETE FROM brief_snapshots WHERE tenant_id=$1`, base.tenantID)
 		cleanupExec(ctx, t, base.st,

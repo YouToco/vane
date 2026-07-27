@@ -460,9 +460,43 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 		return nil
 	}
 
+	var canonicalBrief *types.BriefDraftV1
+	canonicalBriefCommandV1 := false
+	if outcomeMarker != nil && compiledRun != nil &&
+		HasCanonicalBriefV1(p.RuntimeVersion) &&
+		workflow.GetVersion(
+			ctx, "canonical-brief-stage-v1", workflow.DefaultVersion, 1,
+		) >= 1 {
+		stageCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
+		var prepared CanonicalBriefPrepareResult
+		if err := workflow.ExecuteActivity(
+			stageCtx,
+			a.PrepareCanonicalBriefV1,
+			CanonicalBriefPrepareIn{
+				UserID: p.UserID, TraceID: traceID,
+				Run: *compiledRun, Marker: *outcomeMarker,
+				Cards: cards, GeneratedAt: workflow.Now(ctx),
+			},
+		).Get(stageCtx, &prepared); err != nil {
+			return err
+		}
+		canonicalBriefCommandV1 = true
+		canonicalBrief = prepared.Draft
+	}
+
 	// 6. Push —— 网络 I/O，主动推送飞书卡片。
 	pushCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
-	if err := workflow.ExecuteActivity(pushCtx, a.Push, PushIn{UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID, Cards: cards, TaskTitle: p.NLDesc, Run: compiledRun}).Get(pushCtx, nil); err != nil {
+	pushIn := PushIn{
+		UserID: p.UserID, ScheduleID: p.ScheduleID,
+		TraceID: traceID, Cards: cards,
+		TaskTitle: p.NLDesc, Run: compiledRun,
+	}
+	if canonicalBriefCommandV1 {
+		pushIn.CanonicalOutcome = outcomeMarker
+		pushIn.CanonicalBrief = canonicalBrief
+	}
+	if err := workflow.ExecuteActivity(
+		pushCtx, a.Push, pushIn).Get(pushCtx, nil); err != nil {
 		outcomeProcessing = types.RunCompletenessPartial
 		if !temporal.IsCanceledError(err) {
 			outcomeTerminal = contentRunOutcomeV1()

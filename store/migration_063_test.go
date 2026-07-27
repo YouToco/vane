@@ -291,9 +291,12 @@ func TestMigration063DownRejectsBeginQueuedBehindFence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := provider.DownTo(t.Context(), 63); err != nil {
+		t.Fatalf("prepare exact 063 downgrade fixture: %v", err)
+	}
 	defer func() {
-		if _, upErr := provider.UpTo(context.Background(), 63); upErr != nil {
-			t.Errorf("restore migration 063: %v", upErr)
+		if _, upErr := provider.UpTo(context.Background(), 64); upErr != nil {
+			t.Errorf("restore latest migration: %v", upErr)
 		}
 	}()
 
