@@ -18,7 +18,7 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-const latestMigrationVersion int64 = 60
+const latestMigrationVersion int64 = 61
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -99,6 +99,9 @@ var wantTables = []string{
 	// 060 Web 画像人工修正审计与响应丢失回执。
 	"profile_edit_revisions",
 	"profile_edit_receipts",
+	// 061 channel-neutral exact-run outcome and immutable whole-Brief snapshot.
+	"task_run_outcomes",
+	"brief_snapshots",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的
@@ -252,7 +255,7 @@ func TestProfileEditDowngradeFenceLockOrder(t *testing.T) {
 	}
 	downResult := make(chan error, 1)
 	go func() {
-		_, err := provider.Down(context.Background())
+		_, err := provider.DownTo(context.Background(), 59)
 		downResult <- err
 	}()
 
@@ -339,7 +342,7 @@ func TestProfileEditEmptyDowngradeTo59(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.Down(t.Context()); err != nil {
+	if _, err := provider.DownTo(t.Context(), 59); err != nil {
 		t.Fatalf("空审计 Down 60→59 应成功: %v", err)
 	}
 	var version int64

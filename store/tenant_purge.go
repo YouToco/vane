@@ -50,6 +50,8 @@ type purgeStep struct {
 //	agent_session_projection_authority_events /
 //	agent_events → agent_sessions
 //	push_effects                        → deliveries / push_batches / task_run_snapshots
+//	brief_snapshots                    → task_run_outcomes / push_batches / task_run_snapshots
+//	task_run_outcomes                  → task_run_snapshots
 //	task_observed_events               → deliveries / task_run_snapshots
 //	task_event_qualification_steps     → task_run_snapshots
 //	deliveries                            → push_batches
@@ -102,6 +104,11 @@ var purgeOrder = []purgeStep{
 	// External effect checkpoints bind exact delivery, batch, and immutable run
 	// identities, so they must be removed before all three parent aggregates.
 	{"push_effects", "tenant_id = $1"},
+	// Canonical Briefs bind the finalized outcome, exact batch and immutable
+	// run. Delete the whole snapshot first, then its outcome marker, before any
+	// of the three retained parents.
+	{"brief_snapshots", "tenant_id = $1"},
+	{"task_run_outcomes", "tenant_id = $1"},
 	// Observation admission and paid-step checkpoints bind immutable task/run
 	// identities. Events may additionally bind a delivery after it is created.
 	{"task_observed_events", "tenant_id = $1"},
