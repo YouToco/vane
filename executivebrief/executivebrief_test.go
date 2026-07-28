@@ -2,6 +2,7 @@ package executivebrief
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -83,6 +84,66 @@ func TestDeterministicFallbackV1PreservesCanonicalPrefix(t *testing.T) {
 		content.DecisionState != types.ExecutiveDecisionInsufficientEvidence {
 		t.Fatalf("fallback=%+v", content)
 	}
+}
+
+func TestPeriodicSynthesisUsesCanonicalPrefixesAndRejectsForeignRefs(
+	t *testing.T,
+) {
+	now := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
+	first := executiveTestBrief(t, 11, now.Add(-time.Hour), 30)
+	second := executiveTestBrief(t, 12, now.Add(-2*time.Hour), 30)
+	prompt, selected, partial, err := BuildPeriodicPromptV1(
+		"task-a", ProfileContextV1{}, now.Add(-24*time.Hour),
+		now, []types.BriefV1{second, first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prompt == "" || !partial || len(selected) != 2 ||
+		len(selected[0].Insights) != 25 ||
+		len(selected[1].Insights) != 25 {
+		t.Fatalf("unexpected deterministic selection: partial=%v sizes=%d,%d",
+			partial, len(selected[0].Insights), len(selected[1].Insights))
+	}
+	content, err := DeterministicPeriodicFallbackV1(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParsePeriodicContentV1(raw, selected); err != nil {
+		t.Fatal(err)
+	}
+	content.Signals[0].EvidenceRefs[0].BriefID = 999
+	raw, _ = json.Marshal(content)
+	if _, err := ParsePeriodicContentV1(raw, selected); err == nil {
+		t.Fatal("foreign Brief reference was accepted")
+	}
+}
+
+func executiveTestBrief(
+	t *testing.T,
+	id int64,
+	generatedAt time.Time,
+	count int,
+) types.BriefV1 {
+	t.Helper()
+	draft := testIssueDraft(t)
+	draft.GeneratedAt = generatedAt
+	draft.Insights = make([]types.InsightV1, count)
+	for index := range draft.Insights {
+		insight := testIssueDraft(t).Insights[0]
+		insight.ID = id*1000 + int64(index+1)
+		insight.RankPosition = index + 1
+		insight.Title = fmt.Sprintf("signal-%d-%d", id, index)
+		draft.Insights[index] = insight
+	}
+	brief, err := draft.Seal(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return brief
 }
 
 func TestProfileDigestV1CanonicalizesTagOrder(t *testing.T) {

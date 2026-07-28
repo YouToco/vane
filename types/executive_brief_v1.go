@@ -143,9 +143,18 @@ func (c ExecutiveBriefContentV1) validate(periodic bool) error {
 		!validBriefText(c.ExecutiveSummary, maxExecutiveTextBytes, false) ||
 		!c.DecisionState.Valid() ||
 		!validBriefText(c.WhyForYou, maxExecutiveTextBytes, false) ||
-		len(c.Signals) == 0 || len(c.Signals) > maxExecutiveSignals ||
+		len(c.Signals) > maxExecutiveSignals ||
 		len(c.NextSteps) > maxExecutiveNextSteps {
 		return errors.New("executive brief content is invalid")
+	}
+	if len(c.Signals) == 0 {
+		if !periodic ||
+			(c.DecisionState != ExecutiveDecisionNoAction &&
+				c.DecisionState != ExecutiveDecisionInsufficientEvidence) ||
+			len(c.NextSteps) != 0 {
+			return errors.New("executive brief content is empty")
+		}
+		return nil
 	}
 	refCount := 0
 	for _, signal := range c.Signals {
@@ -442,7 +451,9 @@ func (d PeriodicBriefReportDraftV1) Validate() error {
 		return errors.New("model periodic brief must be complete")
 	}
 	if d.GenerationMode == ExecutiveGenerationFallback &&
-		d.Processing != RunCompletenessPartial {
+		d.Processing != RunCompletenessPartial &&
+		!(len(d.Content.Signals) == 0 &&
+			d.Processing == RunCompletenessComplete) {
 		return errors.New("fallback periodic brief must be partial")
 	}
 	return nil

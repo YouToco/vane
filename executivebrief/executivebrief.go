@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/runtimepolicy"
@@ -15,9 +16,11 @@ import (
 )
 
 const (
-	RendererVersionV1  = "executive-brief.render/v1"
-	MaxIssueInsightsV1 = 50
-	MaxPromptBytesV1   = 128 << 10
+	RendererVersionV1     = "executive-brief.render/v1"
+	MaxIssueInsightsV1    = 50
+	MaxPeriodicBriefsV1   = 20
+	MaxPeriodicInsightsV1 = 50
+	MaxPromptBytesV1      = 128 << 10
 )
 
 const SystemPromptV1 = `你是持续情报分析员。你只能使用输入中已验证的结构化情报和用户画像。
@@ -108,6 +111,21 @@ type issuePromptV1 struct {
 	Insights []issueInsightV1 `json:"insights"`
 }
 
+type periodicPromptBriefV1 struct {
+	BriefID     int64            `json:"brief_id"`
+	GeneratedAt string           `json:"generated_at"`
+	Insights    []issueInsightV1 `json:"insights"`
+}
+
+type periodicPromptV1 struct {
+	TaskID      string                  `json:"task_id"`
+	Profile     ProfileContextV1        `json:"profile"`
+	Partial     bool                    `json:"partial"`
+	PeriodStart string                  `json:"period_start"`
+	PeriodEnd   string                  `json:"period_end"`
+	Briefs      []periodicPromptBriefV1 `json:"briefs"`
+}
+
 // BuildIssuePromptV1 exposes only verified structured fields and bounded
 // excerpts. Raw source bodies, provenance and renderer-owned URLs stay out.
 func BuildIssuePromptV1(
@@ -166,6 +184,152 @@ func BuildIssuePromptV1(
 	return string(payload), nil
 }
 
+// BuildPeriodicPromptV1 deterministically selects at most 20 recent canonical
+// Briefs and 50 Insights. Selection proceeds by canonical rank rounds across
+// recent Briefs, so every included Brief remains an ordered rank prefix.
+func BuildPeriodicPromptV1(
+	taskID string,
+	profile ProfileContextV1,
+	periodStart, periodEnd time.Time,
+	briefs []types.BriefV1,
+) (string, []types.BriefV1, bool, error) {
+	if taskID == "" || profile.Validate() != nil ||
+		periodStart.IsZero() || periodEnd.IsZero() ||
+		!periodStart.Before(periodEnd) {
+		return "", nil, false,
+			errors.New("periodic brief input is invalid")
+	}
+	ordered := append([]types.BriefV1(nil), briefs...)
+	for _, brief := range ordered {
+		if brief.Validate() != nil || brief.TaskID != taskID ||
+			brief.GeneratedAt.Before(periodStart) ||
+			!brief.GeneratedAt.Before(periodEnd) {
+			return "", nil, false,
+				errors.New("periodic brief input scope is invalid")
+		}
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].GeneratedAt.Equal(ordered[j].GeneratedAt) {
+			return ordered[i].ID > ordered[j].ID
+		}
+		return ordered[i].GeneratedAt.After(ordered[j].GeneratedAt)
+	})
+	partial := len(ordered) > MaxPeriodicBriefsV1
+	if len(ordered) > MaxPeriodicBriefsV1 {
+		ordered = ordered[:MaxPeriodicBriefsV1]
+	}
+	selected := make([]types.BriefV1, len(ordered))
+	for index, brief := range ordered {
+		selected[index] = brief
+		selected[index].Insights = nil
+	}
+	total := 0
+	for rank := 0; total < MaxPeriodicInsightsV1; rank++ {
+		added := false
+		for index, brief := range ordered {
+			if rank >= len(brief.Insights) {
+				continue
+			}
+			insight := brief.Insights[rank]
+			if insight.Structured == nil ||
+				len(insight.Structured.Claims) == 0 {
+				return "", nil, false,
+					errors.New("periodic brief requires claimed insights")
+			}
+			selected[index].Insights = append(
+				selected[index].Insights, insight)
+			total++
+			added = true
+			if total == MaxPeriodicInsightsV1 {
+				break
+			}
+		}
+		if !added {
+			break
+		}
+	}
+	for index := range ordered {
+		if len(selected[index].Insights) < len(ordered[index].Insights) {
+			partial = true
+		}
+	}
+	projected := periodicPromptV1{
+		TaskID: taskID,
+		Profile: ProfileContextV1{
+			Epoch: profile.Epoch, Version: profile.Version,
+			Industry:   promptguard.Sanitize(profile.Industry),
+			Occupation: promptguard.Sanitize(profile.Occupation),
+			Tags:       append([]string(nil), profile.Tags...),
+			Summary:    promptguard.Sanitize(profile.Summary),
+		},
+		Partial:     partial,
+		PeriodStart: periodStart.Round(0).UTC().Format(time.RFC3339Nano),
+		PeriodEnd:   periodEnd.Round(0).UTC().Format(time.RFC3339Nano),
+		Briefs:      make([]periodicPromptBriefV1, 0, len(selected)),
+	}
+	for _, brief := range selected {
+		if len(brief.Insights) == 0 {
+			continue
+		}
+		promptBrief := periodicPromptBriefV1{
+			BriefID:     brief.ID,
+			GeneratedAt: brief.GeneratedAt.Format(time.RFC3339Nano),
+			Insights:    make([]issueInsightV1, len(brief.Insights)),
+		}
+		for index, insight := range brief.Insights {
+			promptBrief.Insights[index] = projectIssueInsightV1(insight)
+		}
+		projected.Briefs = append(projected.Briefs, promptBrief)
+	}
+	for {
+		payload, err := json.Marshal(projected)
+		if err != nil {
+			return "", nil, false, err
+		}
+		if len(payload) <= MaxPromptBytesV1 {
+			return string(payload), selected, partial, nil
+		}
+		partial = true
+		projected.Partial = true
+		removed := false
+		for index := len(projected.Briefs) - 1; index >= 0; index-- {
+			if len(projected.Briefs[index].Insights) == 0 {
+				continue
+			}
+			projected.Briefs[index].Insights =
+				projected.Briefs[index].Insights[:len(projected.Briefs[index].Insights)-1]
+			selected[index].Insights =
+				selected[index].Insights[:len(selected[index].Insights)-1]
+			removed = true
+			break
+		}
+		if !removed {
+			return "", nil, false,
+				errors.New("periodic brief prompt is too large")
+		}
+	}
+}
+
+func projectIssueInsightV1(insight types.InsightV1) issueInsightV1 {
+	projected := issueInsightV1{
+		InsightID: insight.ID, RankPosition: insight.RankPosition,
+		Title:        promptguard.Sanitize(insight.Title),
+		WhatChanged:  promptguard.Sanitize(insight.Structured.WhatChanged),
+		WhyItMatters: promptguard.Sanitize(insight.Structured.WhyItMatters),
+		ImportanceReason: promptguard.Sanitize(
+			insight.Structured.ImportanceReason),
+		Claims: make([]issueClaimV1, len(insight.Structured.Claims)),
+	}
+	for index, claim := range insight.Structured.Claims {
+		projected.Claims[index] = issueClaimV1{
+			Index: index, Text: promptguard.Sanitize(claim.Text),
+			Excerpt:    promptguard.Sanitize(claim.Excerpt),
+			SourceRefs: append([]string(nil), claim.SourceRefs...),
+		}
+	}
+	return projected
+}
+
 func ParseIssueContentV1(
 	raw []byte,
 	draft types.BriefDraftV1,
@@ -186,6 +350,81 @@ func ParseIssueContentV1(
 		return types.ExecutiveBriefContentV1{}, err
 	}
 	return content, nil
+}
+
+func ParsePeriodicContentV1(
+	raw []byte,
+	briefs []types.BriefV1,
+) (types.ExecutiveBriefContentV1, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var content types.ExecutiveBriefContentV1
+	if err := dec.Decode(&content); err != nil {
+		return types.ExecutiveBriefContentV1{},
+			errors.New("periodic brief output is invalid")
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err == nil {
+		return types.ExecutiveBriefContentV1{},
+			errors.New("periodic brief output has trailing data")
+	}
+	if err := validatePeriodicReferencesV1(content, briefs); err != nil {
+		return types.ExecutiveBriefContentV1{}, err
+	}
+	return content, nil
+}
+
+func validatePeriodicReferencesV1(
+	content types.ExecutiveBriefContentV1,
+	briefs []types.BriefV1,
+) error {
+	claims := make(map[[2]int64]int)
+	for _, brief := range briefs {
+		if brief.ID <= 0 || brief.TaskID == "" ||
+			len(brief.Insights) == 0 {
+			return errors.New("periodic brief input is invalid")
+		}
+		for index, insight := range brief.Insights {
+			if insight.ID <= 0 || insight.RankPosition != index+1 ||
+				insight.Structured == nil ||
+				insight.Structured.Validate() != nil {
+				return errors.New("periodic brief insight is unstructured")
+			}
+			claims[[2]int64{brief.ID, insight.ID}] =
+				len(insight.Structured.Claims)
+		}
+	}
+	validate := func(refs []types.ExecutiveEvidenceRefV1) error {
+		for _, ref := range refs {
+			count, ok := claims[[2]int64{ref.BriefID, ref.InsightID}]
+			if !ok || len(ref.ClaimIndexes) == 0 {
+				return errors.New("periodic brief reference is unresolved")
+			}
+			last := -1
+			for _, claim := range ref.ClaimIndexes {
+				if claim < 0 || claim >= count || claim <= last {
+					return errors.New(
+						"periodic brief claim reference is unresolved")
+				}
+				last = claim
+			}
+		}
+		return nil
+	}
+	for _, signal := range content.Signals {
+		if err := validate(signal.EvidenceRefs); err != nil {
+			return err
+		}
+	}
+	for _, step := range content.NextSteps {
+		if err := validate(step.EvidenceRefs); err != nil {
+			return err
+		}
+	}
+	if content.ValidatePeriodic() != nil {
+		return errors.New("periodic brief content is invalid")
+	}
+	return nil
 }
 
 func validateIssueReferencesV1(
@@ -298,6 +537,58 @@ func DeterministicFallbackV1(
 		Signals:          signals, NextSteps: steps,
 	}
 	if err := validateIssueReferencesV1(content, draft); err != nil {
+		return types.ExecutiveBriefContentV1{}, err
+	}
+	return content, nil
+}
+
+func DeterministicPeriodicFallbackV1(
+	briefs []types.BriefV1,
+) (types.ExecutiveBriefContentV1, error) {
+	signals := make([]types.ExecutiveSignalV1, 0, 3)
+	for _, brief := range briefs {
+		for _, insight := range brief.Insights {
+			if insight.Structured == nil ||
+				len(insight.Structured.Claims) == 0 {
+				continue
+			}
+			signals = append(signals, types.ExecutiveSignalV1{
+				Kind:    types.ExecutiveSignalChange,
+				Title:   insight.Title,
+				Summary: insight.Structured.WhatChanged,
+				EvidenceRefs: []types.ExecutiveEvidenceRefV1{{
+					BriefID: brief.ID, InsightID: insight.ID,
+					ClaimIndexes: []int{0},
+				}},
+			})
+			if len(signals) == 3 {
+				break
+			}
+		}
+		if len(signals) == 3 {
+			break
+		}
+	}
+	if len(signals) == 0 {
+		return types.ExecutiveBriefContentV1{},
+			errors.New("periodic fallback has no claimed insight")
+	}
+	content := types.ExecutiveBriefContentV1{
+		Headline:         "本期变化值得继续观察",
+		ExecutiveSummary: "已按各期原始排名保留重点信号；跨期综合暂不可用，请查看完整证据。",
+		DecisionState:    types.ExecutiveDecisionInsufficientEvidence,
+		WhyForYou:        "当前画像依据或综合覆盖不足，请以各期已验证证据为准。",
+		Signals:          signals,
+		NextSteps: []types.ExecutiveNextStepV1{{
+			Kind:      types.ExecutiveNextStepDeepDive,
+			Label:     "查看最重要信号",
+			Rationale: "先核对排名最高的变化与其跨期证据。",
+			EvidenceRefs: append(
+				[]types.ExecutiveEvidenceRefV1(nil),
+				signals[0].EvidenceRefs...),
+		}},
+	}
+	if err := validatePeriodicReferencesV1(content, briefs); err != nil {
 		return types.ExecutiveBriefContentV1{}, err
 	}
 	return content, nil

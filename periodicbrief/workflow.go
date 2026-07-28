@@ -1,0 +1,293 @@
+package periodicbrief
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/workflow"
+
+	"github.com/YouToco/vane/executivebrief"
+	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/types"
+)
+
+const WorkflowNameV1 = "PeriodicBriefWorkflowV1"
+
+type WorkflowInputV1 struct {
+	IntentID int64 `json:"intent_id"`
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
+}
+
+type SynthesizeInputV1 struct {
+	WorkflowInputV1
+	TraceID string `json:"trace_id"`
+}
+
+type Store interface {
+	LoadPeriodicBriefIntentInputsV1(
+		context.Context, int64, int64, int64,
+	) (store.PeriodicBriefIntentInputsV1, error)
+	GetProfileForTenant(
+		context.Context, int64, int64,
+	) (*types.Profile, error)
+	ClaimPeriodicSynthesisSpendV1(
+		context.Context, int64, int64, int64, string,
+	) (store.PeriodicSynthesisReceiptV1, bool, error)
+	FinalizePeriodicBriefReportV1(
+		context.Context, int64, int64, int64, string,
+		types.PeriodicBriefReportDraftV1, bool,
+	) (types.PeriodicBriefReportV1, error)
+	AuthorizeAndConsumePeriodicSynthesisQuotaV1(
+		context.Context, int64, int64, int64, float64,
+	) error
+}
+
+type Activities struct {
+	store    Store
+	client   *llm.Client
+	recorder *llm.Recorder
+	model    string
+}
+
+func NewActivities(
+	st Store,
+	client *llm.Client,
+	recorder *llm.Recorder,
+	model string,
+) (*Activities, error) {
+	if st == nil || client == nil || recorder == nil || model == "" {
+		return nil, errors.New("periodic Brief dependencies are incomplete")
+	}
+	return &Activities{
+		store: st, client: client, recorder: recorder, model: model}, nil
+}
+
+func WorkflowV1(
+	ctx workflow.Context,
+	input WorkflowInputV1,
+) (types.PeriodicBriefReportV1, error) {
+	if input.IntentID <= 0 || input.TenantID <= 0 || input.UserID <= 0 {
+		return types.PeriodicBriefReportV1{},
+			temporal.NewNonRetryableApplicationError(
+				"周期报告输入无效", "validation", nil)
+	}
+	info := workflow.GetInfo(ctx)
+	options := workflow.ActivityOptions{
+		StartToCloseTimeout: 2 * time.Minute,
+		HeartbeatTimeout:    20 * time.Second,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts: 1,
+		},
+	}
+	ctx = workflow.WithActivityOptions(ctx, options)
+	var report types.PeriodicBriefReportV1
+	err := workflow.ExecuteActivity(
+		ctx, "SynthesizePeriodicBriefV1",
+		SynthesizeInputV1{
+			WorkflowInputV1: input,
+			TraceID:         info.WorkflowExecution.RunID,
+		},
+	).Get(ctx, &report)
+	return report, err
+}
+
+func (a *Activities) SynthesizePeriodicBriefV1(
+	ctx context.Context,
+	input SynthesizeInputV1,
+) (types.PeriodicBriefReportV1, error) {
+	if input.IntentID <= 0 || input.TenantID <= 0 ||
+		input.UserID <= 0 || input.TraceID == "" {
+		return types.PeriodicBriefReportV1{},
+			types.NewAppError(types.CodeValidation,
+				"周期报告综合输入无效", nil)
+	}
+	loaded, err := a.store.LoadPeriodicBriefIntentInputsV1(
+		ctx, input.TenantID, input.UserID, input.IntentID)
+	if err != nil {
+		return types.PeriodicBriefReportV1{}, err
+	}
+	profile := executivebrief.ProfileContextV1{}
+	storedProfile, profileErr := a.store.GetProfileForTenant(
+		ctx, input.TenantID, input.UserID)
+	if profileErr == nil {
+		profile = executivebrief.ProfileContextV1{
+			Epoch:      storedProfile.ProfileEpoch,
+			Version:    storedProfile.ProfileVersion,
+			Industry:   storedProfile.Industry,
+			Occupation: storedProfile.Occupation,
+			Tags:       append([]string(nil), storedProfile.Tags...),
+			Summary:    storedProfile.Summary,
+		}
+	} else if types.CodeOf(profileErr) != types.CodeNotFound {
+		return types.PeriodicBriefReportV1{}, profileErr
+	}
+	profileDigest, err := executivebrief.ProfileDigestV1(profile)
+	if err != nil {
+		return types.PeriodicBriefReportV1{}, err
+	}
+	prompt, selected, selectionPartial, promptErr :=
+		executivebrief.BuildPeriodicPromptV1(
+			loaded.Intent.TaskID, profile,
+			loaded.Intent.PeriodStart, loaded.Intent.PeriodEnd,
+			loaded.Briefs)
+	requestDigest, err := synthesisRequestDigestV1(
+		loaded.Intent.InputDigest, profileDigest, a.model)
+	if err != nil {
+		return types.PeriodicBriefReportV1{}, err
+	}
+	receipt, claimed, err := a.store.ClaimPeriodicSynthesisSpendV1(
+		ctx, input.TenantID, input.UserID, input.IntentID,
+		requestDigest)
+	if err != nil {
+		return types.PeriodicBriefReportV1{}, err
+	}
+	if !claimed {
+		if receipt.Status == store.ExecutiveSynthesisSpending {
+			return types.PeriodicBriefReportV1{},
+				types.NewAppError(types.CodeConflict,
+					"周期综合已领取，等待恢复", nil)
+		}
+		return types.PeriodicBriefReportV1{},
+			types.NewAppError(types.CodeConflict,
+				"周期综合已结束", nil)
+	}
+	fallback := promptErr != nil || len(selected) == 0
+	var content types.ExecutiveBriefContentV1
+	if len(selected) == 0 {
+		content = quietContentV1()
+	} else if promptErr != nil {
+		content, err =
+			executivebrief.DeterministicPeriodicFallbackV1(selected)
+		if err != nil {
+			return types.PeriodicBriefReportV1{}, err
+		}
+	} else {
+		temperature := float32(0.2)
+		maxTokens := 2400
+		tenantID, userID := input.TenantID, input.UserID
+		quotaRule := runtimepolicy.QuotaBucketV1{
+			Name:               string(store.QuotaLLMTokens),
+			Financial:          true,
+			EnforcementVersion: runtimepolicy.QuotaEnforcementLLMPrechargeV1,
+		}
+		response, callErr := llm.Do(
+			ctx, a.client, a.recorder,
+			llm.CallMeta{
+				TraceID: input.TraceID, TenantID: &tenantID,
+				UserID:    &userID,
+				SpanName:  runtimepolicy.ModelStagePeriodicSynthesis,
+				QuotaRule: &quotaRule,
+				BeforeSpend: func(
+					effectCtx context.Context,
+					amount float64,
+				) error {
+					return a.store.
+						AuthorizeAndConsumePeriodicSynthesisQuotaV1(
+							effectCtx, input.TenantID, input.UserID,
+							input.IntentID, amount)
+				},
+			},
+			llm.Request{
+				System: executivebrief.PeriodicSystemPromptV1,
+				User:   prompt, Model: a.model,
+				Temperature: &temperature, MaxTokens: &maxTokens,
+				DisableThinking: true,
+			},
+		)
+		if callErr == nil {
+			content, err = executivebrief.ParsePeriodicContentV1(
+				[]byte(response.Content), selected)
+		}
+		if callErr != nil || err != nil {
+			fallback = true
+			content, err =
+				executivebrief.DeterministicPeriodicFallbackV1(selected)
+			if err != nil {
+				return types.PeriodicBriefReportV1{}, err
+			}
+		}
+	}
+	processing := loaded.Intent.Processing
+	if fallback || selectionPartial {
+		processing = types.RunCompletenessPartial
+	}
+	if len(selected) == 0 && !selectionPartial &&
+		loaded.Intent.Processing == types.RunCompletenessComplete {
+		processing = types.RunCompletenessComplete
+	}
+	inputs := make([]types.PeriodicBriefInputV1, len(selected))
+	for index, brief := range selected {
+		inputs[index] = types.PeriodicBriefInputV1{
+			BriefID: brief.ID, Digest: brief.Digest}
+	}
+	draft := types.PeriodicBriefReportDraftV1{
+		SchemaVersion: types.PeriodicBriefSchemaVersionV1,
+		TenantID:      input.TenantID, UserID: input.UserID,
+		TaskID:         loaded.Intent.TaskID,
+		Cadence:        string(loaded.Intent.Cadence),
+		Timezone:       loaded.Intent.Timezone,
+		PeriodStart:    loaded.Intent.PeriodStart,
+		PeriodEnd:      loaded.Intent.PeriodEnd,
+		GeneratedAt:    time.Now().Round(0).UTC().Truncate(time.Microsecond),
+		ProfileEpoch:   profile.Epoch,
+		ProfileVersion: profile.Version,
+		ProfileDigest:  profileDigest,
+		InputDigest:    loaded.Intent.InputDigest,
+		Inputs:         inputs,
+		GenerationMode: types.ExecutiveGenerationModel,
+		SourceCoverage: loaded.Intent.SourceCoverage,
+		Processing:     processing,
+		Content:        content,
+	}
+	if fallback {
+		draft.GenerationMode = types.ExecutiveGenerationFallback
+	}
+	canonicalDraft, err := draft.Canonical()
+	if err != nil {
+		return types.PeriodicBriefReportV1{}, err
+	}
+	draft = canonicalDraft
+	return a.store.FinalizePeriodicBriefReportV1(
+		ctx, input.TenantID, input.UserID, input.IntentID,
+		requestDigest, draft, fallback)
+}
+
+func synthesisRequestDigestV1(
+	inputDigest, profileDigest, model string,
+) (string, error) {
+	payload, err := json.Marshal(struct {
+		SchemaVersion string `json:"schema_version"`
+		InputDigest   string `json:"input_digest"`
+		ProfileDigest string `json:"profile_digest"`
+		Renderer      string `json:"renderer"`
+		Model         string `json:"model"`
+	}{
+		SchemaVersion: types.PeriodicBriefSchemaVersionV1,
+		InputDigest:   inputDigest, ProfileDigest: profileDigest,
+		Renderer: "periodic-brief.render/v1", Model: model,
+	})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:]), nil
+}
+
+func quietContentV1() types.ExecutiveBriefContentV1 {
+	return types.ExecutiveBriefContentV1{
+		Headline:         "本期没有需要行动的新信号",
+		ExecutiveSummary: "本周期已完成检查，没有形成达到证据门槛的新情报。",
+		DecisionState:    types.ExecutiveDecisionNoAction,
+		WhyForYou:        "当前无需额外操作；后续出现有依据的变化时会继续更新。",
+		Signals:          []types.ExecutiveSignalV1{},
+		NextSteps:        []types.ExecutiveNextStepV1{},
+	}
+}

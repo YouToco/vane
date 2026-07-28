@@ -119,6 +119,12 @@ var wantTables = []string{
 	// Brief artifact.
 	"executive_brief_synthesis_receipts",
 	"executive_brief_artifacts",
+	// 071 task-scoped periodic report settings, durable workflow/spend
+	// identities and immutable cross-run reports.
+	"brief_report_settings",
+	"periodic_brief_intents",
+	"periodic_synthesis_receipts",
+	"periodic_brief_reports",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的
