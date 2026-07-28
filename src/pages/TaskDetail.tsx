@@ -451,6 +451,7 @@ export default function TaskDetail({
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [showEdit, setShowEdit] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
   const [command, setCommand] = useState("");
   const commandRef = useRef<ScheduleCommand | "">("");
   const [commandMessage, setCommandMessage] = useState("");
@@ -459,6 +460,7 @@ export default function TaskDetail({
     scheduleID: string;
     check?: TaskLatestCheck;
   }>();
+  const editEnabled = detail ? taskDefinitionEditEnabled(detail) : false;
 
   async function reloadDetail() {
     const next = await api.scheduleDetail(scheduleID);
@@ -487,6 +489,16 @@ export default function TaskDetail({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scheduleID]);
+
+  useEffect(() => {
+    const query = window.location.hash.split("?", 2)[1] ?? "";
+    if (
+      editEnabled &&
+      new URLSearchParams(query).get("brief_action") === "edit_task"
+    ) {
+      setShowEdit(true);
+    }
+  }, [editEnabled, scheduleID]);
 
   async function runCommand(kind: "run" | "pause" | "resume") {
     if (commandRef.current) return;
@@ -587,7 +599,6 @@ export default function TaskDetail({
   }
 
   const { schedule, summary, sources, playbook } = detail;
-  const editEnabled = taskDefinitionEditEnabled(detail);
   const nextRun = nextRunPresentation(schedule);
   // `observation` is the immutable runtime-policy projection; the alias keeps
   // this first read-only UI useful while older API deployments expose the
@@ -756,6 +767,10 @@ export default function TaskDetail({
               onLatestCheck={(check) =>
                 setLatestCheckState({ scheduleID, check })
               }
+              onAdjustTask={
+                editEnabled ? () => setShowEdit(true) : undefined
+              }
+              onCreateTask={() => setShowCreate(true)}
             />
           </Suspense>
         </TabsContent>
@@ -819,6 +834,31 @@ export default function TaskDetail({
           }}
         />
       )}
+      <TaskActionDialog
+        open={showCreate}
+        actorScope={actorScope}
+        onClose={() => setShowCreate(false)}
+        onComplete={() => {}}
+        labels={{
+          title: A.newTask,
+          description: A.dialogDesc,
+          placeholder: A.dialogPlaceholder,
+          inputLabel: A.dialogInputLabel,
+          draft: A.generate,
+          drafting: A.generating,
+          preview: A.preview,
+          confirm: A.confirmCreate,
+          confirming: A.confirming,
+          cancel: A.cancel,
+          close: A.close,
+          waiting: A.waiting,
+          checkAgain: A.checkAgain,
+          requestFailed: A.requestFailed,
+          resultStatus: A.resultStatus,
+          invalidProposal: A.invalidProposal,
+          status: A.actionStatus,
+        }}
+      />
     </div>
   );
 }

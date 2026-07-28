@@ -14,6 +14,15 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const apiMock = vi.hoisted(() => ({
   scheduleBriefs: vi.fn(),
+  scheduleReports: vi.fn(),
+  reportSettings: vi.fn(),
+  patchReportSettings: vi.fn(),
+  askBrief: vi.fn(),
+  askReport: vi.fn(),
+  deepDiveBrief: vi.fn(),
+  deepDiveReport: vi.fn(),
+  briefGrounding: vi.fn(),
+  reportGrounding: vi.fn(),
 }));
 
 vi.mock("@/api", () => ({
@@ -71,6 +80,7 @@ import type {
   TaskBriefsResp,
   TaskBriefStructuredInsight,
 } from "@/api";
+import { ApiError } from "@/api";
 import { briefDict } from "@/i18n/brief";
 
 function deferred<T>() {
@@ -125,6 +135,13 @@ function page(
 describe("TaskBriefFeed Markdown boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    apiMock.reportSettings.mockResolvedValue({
+      mode: "auto",
+      cadence: "weekly",
+      delivery: "important",
+      timezone: "Asia/Shanghai",
+    });
+    apiMock.scheduleReports.mockResolvedValue({ items: [] });
   });
 
   afterEach(() => {
@@ -378,6 +395,88 @@ describe("TaskBriefFeed Markdown boundary", () => {
     expect(view.container.innerHTML).not.toContain(
       "https://legacy.example/item",
     );
+  });
+
+  test("routes a frozen deep-dive step through existing feedback", async () => {
+    const response = page("executive", 41);
+    response.items[0].executive = {
+      generation_mode: "model",
+      processing: "complete",
+      generated_at: "2026-07-27T10:00:00Z",
+      content: {
+        headline: "Act on the supplier change",
+        executive_summary: "A verified change affects the buying window.",
+        decision_state: "act",
+        why_for_you: "Your monitored role owns this dependency.",
+        signals: [
+          {
+            kind: "risk",
+            title: "Lead time increased",
+            summary: "The supplier published a longer lead time.",
+            evidence_refs: [
+              { insight_id: 41, claim_indexes: [0] },
+            ],
+          },
+        ],
+        next_steps: [
+          {
+            kind: "deep_dive",
+            label: "Investigate now",
+            rationale: "Understand the operational impact.",
+            evidence_refs: [
+              { insight_id: 41, claim_indexes: [0] },
+            ],
+          },
+        ],
+      },
+    };
+    apiMock.scheduleBriefs.mockResolvedValue(response);
+    apiMock.deepDiveBrief.mockResolvedValue({
+      message: "Deep dive is being generated",
+      accepted: true,
+    });
+
+    render(<TaskBriefFeed scheduleID="task-executive" />);
+    await screen.findByText("Act on the supplier change");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Investigate now" }),
+    );
+
+    await waitFor(() => {
+      expect(apiMock.deepDiveBrief).toHaveBeenCalledWith(
+        "task-executive", 41, 41,
+      );
+    });
+    expect(await screen.findByText("Deep dive is being generated")).toBeTruthy();
+    expect(apiMock.askBrief).not.toHaveBeenCalled();
+  });
+
+  test("keeps P2-D controls dark when the task is outside rollout", async () => {
+    apiMock.scheduleBriefs.mockResolvedValue(page("dark", 51));
+    apiMock.reportSettings.mockRejectedValue(
+      new ApiError(404, "not enabled"),
+    );
+
+    render(<TaskBriefFeed scheduleID="task-dark" />);
+    await screen.findByText("dark insight 51");
+
+    expect(screen.queryByRole("tab", { name: "Daily" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Report settings" })).toBeNull();
+    expect(apiMock.scheduleReports).not.toHaveBeenCalled();
+  });
+
+  test("loads a daily report period for an enabled task", async () => {
+    apiMock.scheduleBriefs.mockResolvedValue(page("daily", 52));
+
+    render(<TaskBriefFeed scheduleID="task-daily" />);
+    const dailyTab = await screen.findByRole("tab", { name: "Daily" });
+    fireEvent.click(dailyTab);
+
+    await waitFor(() => {
+      expect(apiMock.scheduleReports).toHaveBeenCalledWith(
+        "task-daily", "daily",
+      );
+    });
   });
 
   test("falls back to body_md for an incomplete structured extension", () => {

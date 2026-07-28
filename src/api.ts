@@ -389,6 +389,49 @@ export interface TaskBriefInsight {
   feedback: TaskBriefFeedbackState;
 }
 
+export type ExecutiveDecisionState =
+  | "act"
+  | "watch"
+  | "no_action"
+  | "insufficient_evidence";
+
+export interface ExecutiveEvidenceRef {
+  brief_id?: number;
+  insight_id: number;
+  claim_indexes: number[];
+}
+
+export interface ExecutiveSignal {
+  kind: "opportunity" | "risk" | "change" | "trend";
+  lifecycle?: "new" | "persistent" | "intensified" | "faded";
+  title: string;
+  summary: string;
+  evidence_refs: ExecutiveEvidenceRef[];
+}
+
+export interface ExecutiveNextStep {
+  kind: "deep_dive" | "monitor" | "edit_task" | "create_task";
+  label: string;
+  rationale: string;
+  evidence_refs: ExecutiveEvidenceRef[];
+}
+
+export interface ExecutiveContent {
+  headline: string;
+  executive_summary: string;
+  decision_state: ExecutiveDecisionState;
+  why_for_you: string;
+  signals: ExecutiveSignal[];
+  next_steps: ExecutiveNextStep[];
+}
+
+export interface ExecutiveBriefArtifact {
+  generation_mode: "model" | "deterministic_fallback";
+  processing: CanonicalCompleteness;
+  generated_at: string;
+  content: ExecutiveContent;
+}
+
 export interface TaskBrief {
   id: number;
   push_batch_id: number;
@@ -396,6 +439,7 @@ export interface TaskBrief {
   source_coverage: CanonicalCompleteness;
   processing: CanonicalCompleteness;
   insights: TaskBriefInsight[];
+  executive?: ExecutiveBriefArtifact;
 }
 
 export interface TaskLatestCheck {
@@ -411,6 +455,59 @@ export interface TaskBriefsResp {
   total: number;
   next_page_token?: string;
   latest_check?: TaskLatestCheck;
+}
+
+export interface PeriodicBriefReport {
+  id: number;
+  cadence: "daily" | "weekly" | "monthly";
+  timezone: string;
+  period_start: string;
+  period_end: string;
+  generated_at: string;
+  generation_mode: "model" | "deterministic_fallback";
+  source_coverage: CanonicalCompleteness;
+  processing: CanonicalCompleteness;
+  content: ExecutiveContent;
+}
+
+export interface PeriodicBriefReportsResp {
+  items: PeriodicBriefReport[];
+  next_cursor?: string;
+}
+
+export interface BriefReportSettings {
+  mode: "auto" | "manual";
+  cadence: "daily" | "weekly" | "monthly";
+  delivery: "important" | "always" | "web_only";
+  timezone: string;
+  updated_at?: string;
+}
+
+export interface BriefFollowupResponse {
+  reply: string;
+}
+
+export interface BriefDeepDiveResponse {
+  message: string;
+  accepted: boolean;
+}
+
+export interface GroundedEvidenceBrief {
+  brief_id: number;
+  insights: TaskBriefInsight[];
+}
+
+export interface GroundedBriefContext {
+  kind: "brief" | "report";
+  id: number;
+  cadence?: "daily" | "weekly" | "monthly";
+  period_start?: string;
+  period_end?: string;
+  source_coverage: CanonicalCompleteness;
+  processing: CanonicalCompleteness;
+  generation_mode: "model" | "deterministic_fallback";
+  content: ExecutiveContent;
+  evidence: GroundedEvidenceBrief[];
 }
 
 // 任务累计 LLM 成本。**只覆盖推送管道的 LLM 调用**：工具费（Exa/TikHub）的
@@ -921,6 +1018,67 @@ export const api = {
       })),
     }));
   },
+  scheduleReports: (
+    id: string,
+    cadence?: "daily" | "weekly" | "monthly",
+    pageSize = 10,
+    cursor?: string,
+  ) => {
+    const params = new URLSearchParams({ page_size: String(pageSize) });
+    if (cadence) params.set("cadence", cadence);
+    if (cursor) params.set("cursor", cursor);
+    return request<PeriodicBriefReportsResp>(
+      `/api/schedules/${encodeURIComponent(id)}/reports?${params.toString()}`,
+    ).then((r) => ({ ...r, items: arr(r.items) }));
+  },
+  reportSettings: (id: string) =>
+    request<BriefReportSettings>(
+      `/api/schedules/${encodeURIComponent(id)}/report-settings`,
+    ),
+  patchReportSettings: (
+    id: string,
+    patch: Partial<Pick<BriefReportSettings, "mode" | "cadence" | "delivery">>,
+  ) =>
+    request<BriefReportSettings>(
+      `/api/schedules/${encodeURIComponent(id)}/report-settings`,
+      { method: "PATCH", body: JSON.stringify(patch) },
+    ),
+  askBrief: (scheduleID: string, briefID: number, question: string) =>
+    request<BriefFollowupResponse>(
+      `/api/schedules/${encodeURIComponent(scheduleID)}/briefs/${briefID}/ask`,
+      { method: "POST", body: JSON.stringify({ question }) },
+    ),
+  askReport: (scheduleID: string, reportID: number, question: string) =>
+    request<BriefFollowupResponse>(
+      `/api/schedules/${encodeURIComponent(scheduleID)}/reports/${reportID}/ask`,
+      { method: "POST", body: JSON.stringify({ question }) },
+    ),
+  deepDiveBrief: (
+    scheduleID: string,
+    briefID: number,
+    insightID: number,
+  ) =>
+    request<BriefDeepDiveResponse>(
+      `/api/schedules/${encodeURIComponent(scheduleID)}/briefs/${briefID}/deep-dive`,
+      { method: "POST", body: JSON.stringify({ insight_id: insightID }) },
+    ),
+  deepDiveReport: (
+    scheduleID: string,
+    reportID: number,
+    insightID: number,
+  ) =>
+    request<BriefDeepDiveResponse>(
+      `/api/schedules/${encodeURIComponent(scheduleID)}/reports/${reportID}/deep-dive`,
+      { method: "POST", body: JSON.stringify({ insight_id: insightID }) },
+    ),
+  briefGrounding: (scheduleID: string, briefID: number) =>
+    request<GroundedBriefContext>(
+      `/api/schedules/${encodeURIComponent(scheduleID)}/briefs/${briefID}`,
+    ),
+  reportGrounding: (scheduleID: string, reportID: number) =>
+    request<GroundedBriefContext>(
+      `/api/schedules/${encodeURIComponent(scheduleID)}/reports/${reportID}`,
+    ),
 
   proposeTaskAction: (text: string, taskId: string | undefined, requestId: string) =>
     post<TaskActionProposal>("/api/task-actions/propose", {
