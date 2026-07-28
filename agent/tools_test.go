@@ -766,59 +766,6 @@ func TestRemoveSourceSchema_BatchMaxConsistent(t *testing.T) {
 	}
 }
 
-// TestRemoveSourcesSequentially 钉死批量执行循环（审查 L-2）：每个 id 都被删、
-// 中途失败时最外层 AppError.Message 必须携带已删部分——feishu 两个用户可见出口
-// （卡片文案、会话回调）都只取 errors.As 命中的 AppError.Message（审查 M-1）。
-func TestRemoveSourcesSequentially(t *testing.T) {
-	ctx := context.Background()
-	t.Run("全部成功逐个删", func(t *testing.T) {
-		var removed []int64
-		result, err := removeSourcesSequentially(ctx, []int64{31, 32, 33},
-			func(_ context.Context, id int64) error {
-				removed = append(removed, id)
-				return nil
-			})
-		if err != nil {
-			t.Fatalf("err=%v", err)
-		}
-		if !reflect.DeepEqual(removed, []int64{31, 32, 33}) {
-			t.Fatalf("实删 %v，期望全部", removed)
-		}
-		if !strings.Contains(result, "id=31、32、33") {
-			t.Fatalf("结果文案应列全 id，实得 %q", result)
-		}
-	})
-	t.Run("中途失败报告已删部分", func(t *testing.T) {
-		boom := types.NewAppError(types.CodeDatabase, "移除订阅（user=1, source=33）", errors.New("db down"))
-		_, err := removeSourcesSequentially(ctx, []int64{31, 32, 33},
-			func(_ context.Context, id int64) error {
-				if id == 33 {
-					return boom
-				}
-				return nil
-			})
-		var ae *types.AppError
-		if !errors.As(err, &ae) {
-			t.Fatalf("应可 errors.As 到 AppError，实得 %v", err)
-		}
-		// errors.As 命中链上最外层 AppError：Message 必须带已删进度，否则
-		// 用户看到"执行失败"却不知道 31、32 已经删了。
-		for _, want := range []string{"id=31、32", "id=33 失败"} {
-			if !strings.Contains(ae.Message, want) {
-				t.Fatalf("AppError.Message 缺 %q：%s", want, ae.Message)
-			}
-		}
-	})
-	t.Run("首个就失败原样上抛", func(t *testing.T) {
-		boom := errors.New("db down")
-		_, err := removeSourcesSequentially(ctx, []int64{31},
-			func(context.Context, int64) error { return boom })
-		if !errors.Is(err, boom) {
-			t.Fatalf("首个失败应原样上抛，实得 %v", err)
-		}
-	})
-}
-
 // TestUpdateScheduleTool_契约 钉死 update_schedule 的工具面契约：
 // 它是写工具（必须走确认卡）、参数校验与 create_schedule 同源、
 // 且**不在 A2A 只读白名单里**（写工具漏进 A2A 就是越权）。

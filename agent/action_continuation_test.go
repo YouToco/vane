@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,15 +83,20 @@ func TestRunToolCalls_EnableSourceUsesOnlyAtomicDurableProposal(
 	}
 }
 
-func TestRunToolCalls_RemoveSourceUsesOnlyAtomicDurableProposal(
+func TestRunToolCalls_RemoveSourceExecutesInlineWithoutConfirmation(
 	t *testing.T,
 ) {
 	fs := newFakeStore()
 	tool := &fakeTool{
 		name: "remove_source", mutating: true,
-		result: "must not execute",
+		result: "已取消订阅信源（id=11、12），信源与历史内容保留。",
 	}
-	loop := newTestLoop(t, fs, (&scriptedChat{}).fn, tool)
+	spec := newToolSpec(tool, ownerPolicy(
+		Effects(EffectStateWrite, EffectDirectOwnerWrite),
+		ConfirmationNone,
+		BudgetNone,
+	))
+	loop := newTestLoop(t, fs, (&scriptedChat{}).fn, spec)
 	proposer := &fakeActionProposalController{}
 	loop.actionProposal = proposer
 	sessionID := int64(23)
@@ -104,20 +110,100 @@ func TestRunToolCalls_RemoveSourceUsesOnlyAtomicDurableProposal(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if proposer.calls != 1 || proposer.input.UserID != 9 ||
-		proposer.input.SessionID != sessionID ||
-		proposer.input.ToolName != "remove_source" ||
-		string(proposer.input.RawArgs) != `{"source_ids":[11,12]}` ||
-		time.Until(proposer.input.ExpiresAt) < 23*time.Hour {
-		t.Fatalf("proposal call drifted: %+v", proposer)
+	if proposer.calls != 0 {
+		t.Fatalf("remove_source must not create a confirmation proposal: %+v", proposer)
 	}
-	if pending == nil || pending.ID != proposer.outcome.ID ||
-		len(replies) != 1 || len(fs.actions) != 0 ||
-		len(tool.calls) != 0 {
+	if pending != nil || len(replies) != 1 || len(fs.actions) != 0 ||
+		len(tool.calls) != 1 ||
+		tool.calls[0].userID != 9 ||
+		tool.calls[0].args != `{"source_ids":[11,12]}` ||
+		replies[0].Content != tool.result {
 		t.Fatalf(
-			"pending=%+v replies=%+v legacy=%d executes=%d",
-			pending, replies, len(fs.actions), len(tool.calls),
+			"pending=%+v replies=%+v legacy=%d calls=%+v",
+			pending, replies, len(fs.actions), tool.calls,
 		)
+	}
+}
+
+func TestHandleMessage_DescriptionResolvesThenRemovesWithoutCard(t *testing.T) {
+	fs := newFakeStore()
+	list := &fakeTool{
+		name:   "list_sources",
+		result: "id=11｜标题=每天追踪 OpenAI 发布｜类型=rss｜状态=启用",
+	}
+	remove := &fakeTool{
+		name:   "remove_source",
+		result: "已取消订阅信源（id=11），信源与历史内容保留。",
+	}
+	removeSpec := newToolSpec(remove, ownerPolicy(
+		Effects(EffectStateWrite, EffectDirectOwnerWrite),
+		ConfirmationNone,
+		BudgetNone,
+	))
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			ToolCalls: []llm.ToolCall{{
+				ID: "list", Name: "list_sources", Arguments: `{}`,
+			}},
+			FinishReason: "tool_calls",
+		},
+		{
+			ToolCalls: []llm.ToolCall{{
+				ID: "remove", Name: "remove_source",
+				Arguments: `{"source_ids":[11]}`,
+			}},
+			FinishReason: "tool_calls",
+		},
+		{Content: "已经把“每天追踪 OpenAI 发布”这个订阅停掉了。", FinishReason: "stop"},
+	}}
+	loop := newTestLoop(t, fs, chat.fn, list, removeSpec)
+
+	out, err := loop.HandleMessage(
+		t.Context(),
+		9,
+		"把每天追 OpenAI 发布的那个订阅停掉",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Confirm != nil ||
+		out.Reply != "已经把“每天追踪 OpenAI 发布”这个订阅停掉了。" ||
+		len(list.calls) != 1 ||
+		len(remove.calls) != 1 ||
+		len(fs.actions) != 0 {
+		t.Fatalf(
+			"out=%+v list=%+v remove=%+v pending=%d",
+			out, list.calls, remove.calls, len(fs.actions),
+		)
+	}
+}
+
+func TestHandleMessage_AmbiguousDescriptionAsksByNameWithoutCard(
+	t *testing.T,
+) {
+	fs := newFakeStore()
+	remove := &fakeTool{name: "remove_source"}
+	removeSpec := newToolSpec(remove, ownerPolicy(
+		Effects(EffectStateWrite, EffectDirectOwnerWrite),
+		ConfirmationNone,
+		BudgetNone,
+	))
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		Content: "你是想停掉“OpenAI 每日发布”，还是“OpenAI API 状态”？",
+		FinishReason: "stop",
+	}}}
+	loop := newTestLoop(t, fs, chat.fn, removeSpec)
+
+	out, err := loop.HandleMessage(t.Context(), 9, "把 OpenAI 那个停掉")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Confirm != nil ||
+		!strings.Contains(out.Reply, "OpenAI 每日发布") ||
+		len(remove.calls) != 0 ||
+		len(fs.actions) != 0 {
+		t.Fatalf("out=%+v remove=%+v pending=%d",
+			out, remove.calls, len(fs.actions))
 	}
 }
 

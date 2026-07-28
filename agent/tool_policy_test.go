@@ -39,7 +39,7 @@ func TestProductionToolPolicyGolden(t *testing.T) {
 	want := []expectedToolPolicy{
 		{
 			name: "list_sources",
-			effects: Effects(EffectInternalRead, EffectTrustTaint),
+			effects: Effects(EffectInternalRead),
 			auth: AuthorizationOwner | AuthorizationA2AReadOnly,
 			confirmation: ConfirmationNone, budget: BudgetNone,
 			a2aAuthorized: true,
@@ -51,8 +51,9 @@ func TestProductionToolPolicyGolden(t *testing.T) {
 			budget: BudgetDownstreamManaged,
 		},
 		{
-			name: "remove_source", effects: Effects(EffectStateWrite),
-			auth: AuthorizationOwner, confirmation: ConfirmationRequired, budget: BudgetNone,
+			name: "remove_source",
+			effects: Effects(EffectStateWrite, EffectDirectOwnerWrite),
+			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
 			name: "enable_source", effects: Effects(EffectStateWrite),
@@ -69,8 +70,9 @@ func TestProductionToolPolicyGolden(t *testing.T) {
 			auth: AuthorizationOwner, confirmation: ConfirmationRequired, budget: BudgetNone,
 		},
 		{
-			name: "remove_schedule", effects: Effects(EffectStateWrite),
-			auth: AuthorizationOwner, confirmation: ConfirmationRequired, budget: BudgetNone,
+			name: "remove_schedule",
+			effects: Effects(EffectStateWrite, EffectDirectOwnerWrite),
+			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
 			name: "push_now", effects: Effects(EffectDelivery),
@@ -200,6 +202,34 @@ func TestPushNowRemainsInlineDespiteDeliveryEffect(t *testing.T) {
 	}
 	if !spec.Policy.Effects.Has(EffectDelivery) {
 		t.Fatal("push_now must declare delivery effect")
+	}
+}
+
+func TestDirectOwnerWritePolicyIsNarrow(t *testing.T) {
+	valid := ownerPolicy(
+		Effects(EffectStateWrite, EffectDirectOwnerWrite),
+		ConfirmationNone,
+		BudgetNone,
+	)
+	if err := valid.validate(); err != nil {
+		t.Fatalf("valid direct owner write rejected: %v", err)
+	}
+
+	tests := []ToolPolicy{
+		ownerPolicy(Effects(EffectDirectOwnerWrite), ConfirmationNone, BudgetNone),
+		ownerPolicy(
+			Effects(EffectStateWrite, EffectDirectOwnerWrite),
+			ConfirmationRequired,
+			BudgetNone,
+		),
+	}
+	a2a := valid
+	a2a.Authorization |= AuthorizationA2AReadOnly
+	tests = append(tests, a2a)
+	for i, policy := range tests {
+		if err := policy.validate(); err == nil {
+			t.Fatalf("invalid direct owner policy %d accepted: %+v", i, policy)
+		}
 	}
 }
 

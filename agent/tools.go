@@ -85,19 +85,21 @@ type playbookStore interface {
 // 工具面与该特性上线前完全一致（同 endpoints 的 nil 语义）。
 func BuildTools(st *store.Store, sched *scheduler.Scheduler, tasks taskCreator, pusher PushTrigger, endpoints *EndpointTools, prober sourceProber, exa *ExaTools, definitionEdits ...DefinitionEditController) []ToolSpec {
 	tools := []ToolSpec{
-		newToolSpec(&listSourcesTool{st: st}, a2aReadPolicy(Effects(EffectInternalRead, EffectTrustTaint))),
+		newToolSpec(&listSourcesTool{st: st}, a2aReadPolicy(Effects(EffectInternalRead))),
 		newToolSpec(&addSourceTool{st: st, prober: prober}, ownerPolicy(
 			Effects(EffectNetworkRead, EffectBillable, EffectStateWrite, EffectTrustTaint),
 			ConfirmationRequired, BudgetDownstreamManaged)),
 		newToolSpec(&removeSourceTool{st: st}, ownerPolicy(
-			Effects(EffectStateWrite), ConfirmationRequired, BudgetNone)),
+			Effects(EffectStateWrite, EffectDirectOwnerWrite),
+			ConfirmationNone, BudgetNone)),
 		newToolSpec(&enableSourceTool{st: st}, ownerPolicy(
 			Effects(EffectStateWrite), ConfirmationRequired, BudgetNone)),
 		newToolSpec(&listSchedulesTool{st: st}, a2aReadPolicy(Effects(EffectInternalRead))),
 		newToolSpec(&createScheduleTool{tasks: tasks}, ownerPolicy(
 			Effects(EffectDurableProposal, EffectStateWrite), ConfirmationRequired, BudgetNone)),
 		newToolSpec(&removeScheduleTool{sched: sched}, ownerPolicy(
-			Effects(EffectStateWrite), ConfirmationRequired, BudgetNone)),
+			Effects(EffectStateWrite, EffectDirectOwnerWrite),
+			ConfirmationNone, BudgetNone)),
 		newToolSpec(&pushNowTool{pusher: pusher}, ownerPolicy(
 			Effects(EffectDelivery), ConfirmationNone, BudgetDownstreamManaged)),
 		newToolSpec(&viewProfileTool{st: st}, ownerPolicy(
@@ -609,7 +611,7 @@ const removeSourceSchema = `{
       "items": {"type": "integer"},
       "minItems": 1,
       "maxItems": 20,
-      "description": "要取消订阅的信源 id 列表，一次最多 20 个（可先用 list_sources 查询）。用户一次要求退订多个时必须放进同一次调用，会合成一张确认卡一次确认。"
+      "description": "内部信源 id 列表，一次最多 20 个。用户不需要知道 id：根据用户记得的标题、平台、主题等描述先用 list_sources 定位；唯一匹配就调用，多个合理候选才按人类可读名称追问。批量目标放进同一次调用。"
     }
   },
   "required": ["source_ids"]
@@ -625,7 +627,7 @@ type removeSourceTool struct {
 
 func (t *removeSourceTool) Name() string { return "remove_source" }
 func (t *removeSourceTool) Description() string {
-	return "取消订阅一个或多个信源（信源本身与历史内容保留）。source_ids 可先用 list_sources 查询；批量退订放同一次调用，一张确认卡一次确认。"
+	return "直接取消订阅一个或多个信源，不再二次确认（信源本身与历史内容保留）。用户可只描述记得的标题、平台或主题；先用 list_sources 把描述解析为内部 source_ids，唯一匹配就执行，多个合理候选才用名称追问，绝不能要求用户查 ID。"
 }
 func (t *removeSourceTool) Parameters() json.RawMessage { return json.RawMessage(removeSourceSchema) }
 
@@ -675,37 +677,20 @@ func joinSourceIDs(ids []int64) string {
 	return strings.Join(parts, "、")
 }
 
-// Execute 复用 store.RemoveSubscription：按 (user_id, source_id) 删行，天然只能
-// 删自己的订阅，无需再校验信源归属；删不存在的订阅静默成功（与 API 幂等语义一致）。
-// 批量逐个删，中途失败如实报告已删部分——删除幂等，用户重新发起不会产生新副作用。
+// Execute 用单条 tenant-scoped DELETE 原子删除整批订阅。删不存在的订阅
+// 静默成功（与 API 幂等语义一致），信源与历史内容始终保留。
 func (t *removeSourceTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
 	ids, errText, _ := removeSourceIDs(args)
 	if errText != "" {
 		return errText, nil
 	}
-	return removeSourcesSequentially(ctx, ids, func(ctx context.Context, id int64) error {
-		return t.st.RemoveSubscription(ctx, userID, id)
-	})
-}
-
-// removeSourcesSequentially 抽出批量循环便于单测（工具持具体 *store.Store 不可
-// fake）。中途失败必须用**最外层** AppError 携带已删部分——feishu 卡片文案与
-// 会话回调都只取 errors.As 命中的 AppError.Message，fmt.Errorf 包装文本到不了
-// 用户面前，"如实报告已删部分"的承诺会变成只写日志的死话。
-func removeSourcesSequentially(
-	ctx context.Context, ids []int64, remove func(context.Context, int64) error,
-) (string, error) {
-	for i, id := range ids {
-		if err := remove(ctx, id); err != nil {
-			if i > 0 {
-				return "", types.NewAppError(types.CodeDatabase, fmt.Sprintf(
-					"已取消订阅信源（id=%s），但退订 id=%d 失败，其余未处理",
-					joinSourceIDs(ids[:i]), id), err)
-			}
-			return "", err
-		}
+	if err := t.st.RemoveSubscriptions(ctx, userID, ids); err != nil {
+		return "", err
 	}
-	return fmt.Sprintf("已取消订阅信源（id=%s），信源与历史内容保留。", joinSourceIDs(ids)), nil
+	return fmt.Sprintf(
+		"已取消订阅信源（id=%s），信源与历史内容保留。",
+		joinSourceIDs(ids),
+	), nil
 }
 
 func (t *removeSourceTool) Summarize(args json.RawMessage) string {
@@ -714,7 +699,7 @@ func (t *removeSourceTool) Summarize(args json.RawMessage) string {
 		return summarizeFallback("取消订阅信源", args)
 	}
 	if errText != "" {
-		// 能解析但校验不过：卡面必须诚实——这张卡点确认也不会执行。
+		// 新请求不会出卡；此摘要仅服务 B3 及更早已经落库的兼容动作。
 		return fmt.Sprintf("取消订阅信源（参数无效：%s；确认后也不会执行）", errText)
 	}
 	if len(ids) == 1 {
@@ -1313,7 +1298,7 @@ func (t *updateScheduleTool) Summarize(args json.RawMessage) string {
 const removeScheduleSchema = `{
   "type": "object",
   "properties": {
-    "schedule_id": {"type": "string", "description": "要删除的定时任务 id（可先用 list_schedules 查询）"}
+    "schedule_id": {"type": "string", "description": "内部任务 id。用户不需要知道 id：根据用户记得的任务描述、时间、主题等先用 list_schedules 定位；唯一匹配就调用，多个合理候选才按人类可读名称追问。"}
   },
   "required": ["schedule_id"]
 }`
@@ -1324,7 +1309,7 @@ type removeScheduleTool struct {
 
 func (t *removeScheduleTool) Name() string { return "remove_schedule" }
 func (t *removeScheduleTool) Description() string {
-	return "删除指定定时推送任务。schedule_id 可先用 list_schedules 查询。"
+	return "直接删除定时推送任务，不再二次确认。用户可只描述记得的任务内容、时间或主题；先用 list_schedules 解析为内部 schedule_id，唯一匹配就执行，多个合理候选才用名称追问，绝不能要求用户查 ID。"
 }
 func (t *removeScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(removeScheduleSchema)

@@ -436,7 +436,7 @@ func TestSystemPrompt_ExaNote条件注入(t *testing.T) {
 	}
 	// A2A 轨（自定义 prompt + 只读白名单，无 web_search）同样不得出现。
 	a2a := New(Deps{SystemPrompt: "A2A 语境", Tools: []ToolSpec{newToolSpec(
-		&listSourcesTool{}, a2aReadPolicy(Effects(EffectInternalRead, EffectTrustTaint)),
+		&listSourcesTool{}, a2aReadPolicy(Effects(EffectInternalRead)),
 	)}})
 	if strings.Contains(a2a.sys, marker) {
 		t.Error("A2A 轨不得注入飞书轨的分流引导")

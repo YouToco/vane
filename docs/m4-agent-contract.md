@@ -401,12 +401,12 @@ A2A 只读面按 `AuthorizationA2AReadOnly` 过滤，**不**用「无确认」�
 
 | 工具 | Confirmation | 关键 Effects | 底层调用 | 说明 |
 |---|---|---|---|---|
-| list_sources | none | internal_read + trust_taint | store.ListSubscribedSourcesByUser | 返回 id/类型/标题/状态的中文列表文本；A2A 可读 |
+| list_sources | none | internal_read | store.ListSubscribedSourcesByUser | 返回内部目录中的 id/类型/标题/状态供 Agent 按用户描述定位；A2A 可读。目录字段在 system prompt 中始终按数据处理，不触发“外部网页已读”隔离，否则同轮无法完成描述→定位→退订 |
 | add_source | **required** | state_write（确认后 probe 可 taint） | sourcespec.Build → store.UpsertSource + AddSubscription | 参数 schema 同 spike：{type(enum rss/exa/tikhub_xhs), url, query, keyword, title?, category?} |
-| remove_source | **required** | state_write | store.RemoveSubscription（逐 id，删除幂等） | {source_ids:[integer]}（1–20 个，去重保序，一张确认卡列全并一次确认；旧单数 {source_id} 仅为兼容存量 pending_actions 保留解析，schema 不再声明——2026-07-23 增补，批量意图不再被拆成 N 轮确认） |
+| remove_source | **none** | state_write + direct_owner_write | store.RemoveSubscriptions（单条 tenant-scoped DELETE，原子且幂等） | {source_ids:[integer]}（1–20 个，去重保序；意图与目标明确即直接执行，含糊则对话追问，不发确认卡；旧单数 {source_id} 仅为兼容存量 pending_actions 保留解析，schema 不再声明） |
 | list_schedules | none | internal_read | store.ListSchedulesByUser | 中文列表文本；A2A 可读 |
 | create_schedule | **required** | durable_proposal + state_write | CreationCoordinator.Propose → 人工确认 → creation saga | `{spec,intent,approved_fetch_plan:{existing_source_ids?,source_specs?},nl_description?,strictness?}`；`source_specs` 是 `vane.source-specs/v1` 原始规格，模型面不暴露 durable `sources/config/vane://`；cron/every 二选一且 every≥3600 |
-| remove_schedule | **required** | state_write | scheduler.DeletePush | {schedule_id:string} |
+| remove_schedule | **none** | state_write + direct_owner_write | scheduler.DeletePush（durable schedule command） | `{schedule_id:string}` 为内部定位参数；用户只需描述任务内容、时间或主题，Agent 先 list_schedules，唯一匹配直接删除，多候选才按名称追问，不要求用户提供 ID |
 | push_now | none | delivery | PushTrigger 接口（api push/now 同款触发） | 返回 run_id 文本；有副作用但现网免确认，不得因 delivery 误标 required |
 | web_search | none | network_read + billable + trust_taint | fetcher.ExaFetcher.Search（Exa /search，按次计费） | {query, num_results?(默认5/上限20), include_domains?}；一次性语义搜索，不建信源、不写内容库，结果只回当前对话（2026-07-20 增，见修订记录） |
 | read_page | none | network_read + billable + trust_taint | fetcher.ExaContentsFetcher.ReadPage（Exa /contents，maxAgeHours:0 活抓，按次计费） | {url}；一次性读取指定页面正文，不建信源、不写内容库（2026-07-20 增，见修订记录） |
@@ -628,3 +628,17 @@ TRUNCATE 或 proposer 权限；migration 070 有 durable remove action 时拒绝
 最低验证包括：真 PostgreSQL 18 批量删除、跨 Tenant/User、确认与投影重放、租约/fence、
 会话事实冲突导致 effect 整体回滚、取消/过期/损坏、070 权限矩阵与有数据降级拒绝，以及
 既有 `enable_source` 终态事实的原字节重放。
+
+### 15.1 7.10-B4 删除动作去确认卡
+
+Boss 于 2026-07-28 取消 `remove_source` / `remove_schedule` 的二次确认卡。用户只需
+说出自己记得的标题、主题、平台、时间或任务详情，Agent 先调用只读列表工具解析内部
+ID；唯一匹配时直接执行，多个合理候选才按人能看懂的名称自然追问，禁止要求用户查 ID，
+也不生成 pending action 或确认卡。退订执行使用一条同时带
+tenant、user 和完整 source id 集合谓词的 DELETE，整批原子、重复调用幂等；信源与
+历史内容不删除。删除任务复用 scheduler durable command。`EffectDirectOwnerWrite`
+只允许 owner-only、`ConfirmationNone` 的 state write，A2A 仍不可见。
+
+B3 及更早已经发出的 `remove_source` 卡片继续按冻结的
+`vane.remove-source/postgres/v1` 字节执行或重放；B4 不改写旧 action、authority、
+adapter、operation identity 或终态事实。

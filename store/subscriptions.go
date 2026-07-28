@@ -36,3 +36,27 @@ func (s *Store) RemoveSubscription(ctx context.Context, userID, sourceID int64) 
 	}
 	return nil
 }
+
+// RemoveSubscriptions atomically removes one owner's selected subscriptions.
+// The tenant predicate keeps the write scoped even if a future deployment no
+// longer treats user IDs as globally unique. An empty slice is a no-op.
+func (s *Store) RemoveSubscriptions(
+	ctx context.Context,
+	userID int64,
+	sourceIDs []int64,
+) error {
+	if len(sourceIDs) == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM subscriptions
+		  WHERE tenant_id = (`+tenantOfUser+`$1)
+		    AND user_id = $1
+		    AND source_id = ANY($2::bigint[])`,
+		userID, sourceIDs)
+	if err != nil {
+		return types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("批量移除订阅（user=%d）", userID), err)
+	}
+	return nil
+}
