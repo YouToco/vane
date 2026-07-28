@@ -345,6 +345,21 @@ export interface TaskBriefFeedbackState {
   deep_dive_requested: boolean;
 }
 
+export interface TaskBriefStructuredClaim {
+  text: string;
+  excerpt: string;
+  source_refs: string[];
+}
+
+export interface TaskBriefStructuredInsight {
+  schema_version: "vane.cardgen-insight/v1";
+  body_md: string;
+  what_changed: string;
+  why_it_matters: string;
+  importance_reason: string;
+  claims: TaskBriefStructuredClaim[];
+}
+
 export interface TaskBriefInsight {
   id: number;
   rank_position: number;
@@ -354,6 +369,7 @@ export interface TaskBriefInsight {
   source_url: string;
   published_at?: string;
   discovered_at: string;
+  structured?: TaskBriefStructuredInsight;
   feedback: TaskBriefFeedbackState;
 }
 

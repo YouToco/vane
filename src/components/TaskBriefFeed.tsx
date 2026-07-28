@@ -6,6 +6,7 @@ import { ExternalLink, Loader2 } from "lucide-react";
 import { api, ApiError } from "@/api";
 import type {
   TaskBrief,
+  TaskBriefInsight,
   TaskLatestCheck,
 } from "@/api";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -109,6 +110,76 @@ export function InsightBody({ markdown }: { markdown: string }) {
       >
         {markdown}
       </ReactMarkdown>
+    </div>
+  );
+}
+
+function hasStructuredProjection(insight: TaskBriefInsight): boolean {
+  const structured = insight.structured;
+  return Boolean(
+    structured &&
+      structured.schema_version === "vane.cardgen-insight/v1" &&
+      structured.body_md === insight.body_md &&
+      structured.what_changed &&
+      structured.why_it_matters &&
+      structured.importance_reason,
+  );
+}
+
+export function BriefInsightBody({
+  insight,
+  d,
+}: {
+  insight: TaskBriefInsight;
+  d: BriefDict;
+}) {
+  if (!hasStructuredProjection(insight)) {
+    return <InsightBody markdown={insight.body_md} />;
+  }
+  const structured = insight.structured!;
+  const claims = Array.isArray(structured.claims) ? structured.claims : [];
+  return (
+    <div className="space-y-4">
+      <dl className="grid gap-3 rounded-lg border bg-muted/20 p-4 sm:grid-cols-3">
+        {[
+          [d.briefWhatChanged, structured.what_changed],
+          [d.briefWhyItMatters, structured.why_it_matters],
+          [d.briefImportanceReason, structured.importance_reason],
+        ].map(([label, value]) => (
+          <div key={label} className="space-y-1">
+            <dt className="text-xs font-medium text-muted-foreground">
+              {label}
+            </dt>
+            <dd className="text-sm leading-6 text-foreground/90">{value}</dd>
+          </div>
+        ))}
+      </dl>
+      {claims.length > 0 && (
+        <section
+          className="space-y-2"
+          aria-label={d.briefEvidence}
+        >
+          <h4 className="text-xs font-medium text-muted-foreground">
+            {d.briefEvidence}
+          </h4>
+          <ul className="space-y-2">
+            {claims.map((claim, index) => (
+              <li
+                key={`${index}-${claim.text}`}
+                className="rounded-md border-l-2 border-primary/40 bg-muted/20 px-3 py-2"
+              >
+                <p className="text-sm leading-6">{claim.text}</p>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  <span className="font-medium">
+                    {d.briefEvidenceExcerpt}：
+                  </span>
+                  “{claim.excerpt}”
+                </p>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
     </div>
   );
 }
@@ -310,7 +381,7 @@ export default function TaskBriefFeed({
                                 insight.title
                               )}
                             </h3>
-                            <InsightBody markdown={insight.body_md} />
+                            <BriefInsightBody insight={insight} d={D} />
                             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                               <span>
                                 {insight.source_title || D.briefUnknownSource}

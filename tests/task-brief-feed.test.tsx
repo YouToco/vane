@@ -61,8 +61,16 @@ vi.mock("@/i18n", () => ({
   }),
 }));
 
-import TaskBriefFeed, { InsightBody } from "@/components/TaskBriefFeed";
-import type { TaskBrief, TaskBriefsResp } from "@/api";
+import TaskBriefFeed, {
+  BriefInsightBody,
+  InsightBody,
+} from "@/components/TaskBriefFeed";
+import type {
+  TaskBrief,
+  TaskBriefsResp,
+  TaskBriefStructuredInsight,
+} from "@/api";
+import { briefDict } from "@/i18n/brief";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -159,6 +167,72 @@ describe("TaskBriefFeed Markdown boundary", () => {
     expect(html).toContain("overflow-x-auto");
     expect(html).toContain("min-w-full");
     expect(html).toContain("break-all");
+  });
+
+  test("renders a frozen structured insight and its cited excerpts", () => {
+    const insight = page("structured", 7).items[0].insights[0];
+    insight.structured = {
+      schema_version: "vane.cardgen-insight/v1",
+      body_md: insight.body_md,
+      what_changed: "A new release changed the API.",
+      why_it_matters: "The monitored integration depends on it.",
+      importance_reason: "The source lists a breaking change.",
+      claims: [
+        {
+          text: "The release contains a breaking change.",
+          excerpt: "This release contains a breaking API change.",
+          source_refs: ["source-1"],
+        },
+      ],
+    };
+    const html = renderToStaticMarkup(
+      <BriefInsightBody insight={insight} d={briefDict("en")} />,
+    );
+
+    expect(html).toContain("What changed");
+    expect(html).toContain("A new release changed the API.");
+    expect(html).toContain("Why it matters");
+    expect(html).toContain("Why it is important");
+    expect(html).toContain("Verifiable evidence");
+    expect(html).toContain("This release contains a breaking API change.");
+    expect(html).not.toContain("structured body");
+    expect(html).not.toContain("source-1");
+  });
+
+  test("falls back to body_md for an incomplete structured extension", () => {
+    const insight = page("fallback", 8).items[0].insights[0];
+    insight.structured = {
+      schema_version: "vane.cardgen-insight/v1",
+      body_md: insight.body_md,
+      what_changed: "Only one field is present.",
+      why_it_matters: "",
+      importance_reason: "",
+      claims: [],
+    };
+    const html = renderToStaticMarkup(
+      <BriefInsightBody insight={insight} d={briefDict("en")} />,
+    );
+
+    expect(html).toContain("fallback body");
+    expect(html).not.toContain("What changed");
+  });
+
+  test("renders the structured trio safely when claims is null", () => {
+    const insight = page("structured-null-claims", 9).items[0].insights[0];
+    insight.structured = {
+      schema_version: "vane.cardgen-insight/v1",
+      body_md: insight.body_md,
+      what_changed: "A new release changed the API.",
+      why_it_matters: "The monitored integration depends on it.",
+      importance_reason: "The source lists a breaking change.",
+      claims: null as unknown as TaskBriefStructuredInsight["claims"],
+    };
+    const html = renderToStaticMarkup(
+      <BriefInsightBody insight={insight} d={briefDict("en")} />,
+    );
+
+    expect(html).toContain("A new release changed the API.");
+    expect(html).not.toContain("Verifiable evidence");
   });
 
   test("discards an old task load-more response after navigation", async () => {
