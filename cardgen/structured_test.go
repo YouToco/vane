@@ -1,8 +1,12 @@
 package cardgen
 
 import (
+	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/types"
 )
 
 func TestParseStructuredInsightV1(t *testing.T) {
@@ -56,5 +60,85 @@ func TestParseStructuredInsightV1AllowsBodyOnlyFallback(t *testing.T) {
 	}
 	if got.BodyMD != "安全正文" || got.WhatChanged != "" {
 		t.Fatalf("unexpected fallback: %+v", got)
+	}
+}
+
+func TestGenerateStructuredWithPolicyV2UsesOneFrozenCall(t *testing.T) {
+	prompts, models := validPolicyV1(t, true)
+	prompts.CardGen = StructuredPromptStageV2()
+	wantCall := StructuredModelCallV2("structured-model")
+	for index := range models.Calls {
+		if models.Calls[index].Stage == runtimepolicy.ModelStageCardGen {
+			models.Calls[index] = wantCall
+		}
+	}
+	policy, err := PreparePolicyV2(prompts, models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := `{"schema_version":"vane.cardgen-insight/v1","body_md":"**降价**","what_changed":"价格下降","why_it_matters":"成本降低","importance_reason":"影响单位成本","claims":[{"text":"下降 20%","excerpt":"下降 20%","source_refs":["source-1"]}]}`
+	cg, captured := newTestCardGen(t, http.StatusOK, reply, nil)
+	got, err := cg.GenerateStructuredWithPolicyV2(
+		t.Context(), 0, 1,
+		types.ScoredItem{Item: types.ContentItem{
+			ID: 7, Title: "价格公告", Content: "官方价格下降 20% 即日生效",
+		}},
+		"trace-structured", "只关注成本", policy, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WhatChanged != "价格下降" || captured.callCount() != 1 {
+		t.Fatalf("result=%+v calls=%d", got, captured.callCount())
+	}
+	system, user := captured.snapshot()
+	if system != structuredSystemPromptV1 ||
+		!strings.Contains(user, "来源标签：source-1\n标题：价格公告\n正文：官方价格下降 20% 即日生效") ||
+		!strings.Contains(user, "只关注成本") {
+		t.Fatalf("unexpected frozen prompts:\nsystem=%q\nuser=%q", system, user)
+	}
+	maxTokens, temperature, thinking := captured.paramsSnapshot()
+	if maxTokens == nil || *maxTokens != 900 ||
+		temperature == nil || *temperature != 0.2 || thinking != "disabled" {
+		t.Fatalf("unexpected request params: max=%v temp=%v thinking=%q",
+			maxTokens, temperature, thinking)
+	}
+}
+
+func TestGenerateStructuredWithPolicyV2DoesNotRetryInvalidEnvelope(t *testing.T) {
+	prompts, models := validPolicyV1(t, false)
+	prompts.CardGen = StructuredPromptStageV2()
+	for index := range models.Calls {
+		if models.Calls[index].Stage == runtimepolicy.ModelStageCardGen {
+			models.Calls[index] = StructuredModelCallV2("structured-model")
+		}
+	}
+	policy, err := PreparePolicyV2(prompts, models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := `{"schema_version":"vane.cardgen-insight/v1","body_md":"正文","what_changed":"变化","why_it_matters":"原因","importance_reason":"依据","claims":[{"text":"伪造","excerpt":"不存在","source_refs":["source-1"]}]}`
+	cg, captured := newTestCardGen(t, http.StatusOK, reply, nil)
+	_, err = cg.GenerateStructuredWithPolicyV2(
+		t.Context(), 0, 1,
+		types.ScoredItem{Item: types.ContentItem{Title: "标题", Content: "真实正文"}},
+		"trace-invalid", "", policy, nil,
+	)
+	if err == nil {
+		t.Fatal("expected invalid envelope rejection")
+	}
+	if captured.callCount() != 1 {
+		t.Fatalf("invalid envelope caused %d upstream calls", captured.callCount())
+	}
+}
+
+func TestGenerateStructuredWithPolicyV2RejectsZeroPolicyBeforeCall(t *testing.T) {
+	cg, captured := newTestCardGen(t, http.StatusOK, `{}`, nil)
+	_, err := cg.GenerateStructuredWithPolicyV2(
+		t.Context(), 0, 1, types.ScoredItem{}, "trace-zero", "",
+		PolicyV2{}, nil,
+	)
+	if err == nil || captured.callCount() != 0 {
+		t.Fatalf("err=%v calls=%d", err, captured.callCount())
 	}
 }
