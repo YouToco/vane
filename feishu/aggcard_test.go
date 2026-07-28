@@ -212,6 +212,24 @@ func TestCanonicalEvidenceMarkdownNormalizesValidatedURLAndUntrustedLabel(
 	}
 }
 
+func TestCanonicalEvidenceMarkdownFallsBackAfterInvisibleLabelRemoval(
+	t *testing.T,
+) {
+	got := canonicalEvidenceMarkdownV1(
+		[]feedback.CanonicalEvidenceSourceV1{{
+			Ref: "source-1", Title: "\u202e\u2066",
+			SourceTitle: "\u200b\u200c", Platform: "\ufeff",
+			SourceURL: "https://example.com/item",
+			DiscoveredAt: time.Date(
+				2026, 7, 28, 0, 0, 0, 0, time.UTC),
+		}},
+	)
+	if !strings.Contains(got, "[source-1]") ||
+		strings.Contains(got, "[]") {
+		t.Fatalf("invisible evidence label fallback = %q", got)
+	}
+}
+
 // TestAggregateCard_双form名互异 规格 A.4：两条同时待填时 form/input/submit 的 name
 // 必须按 delivery_id 互异——单条卡的硬编码 name 在 N 条 form 并存时必然重名，
 // 正是"对 B 条说推错、记到 A 条"的物理路径。

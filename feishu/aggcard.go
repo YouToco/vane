@@ -225,11 +225,11 @@ func canonicalEvidenceMarkdownV1(
 		if source.Ref != "source-"+strconv.Itoa(index+1) {
 			break
 		}
-		label := strings.TrimSpace(source.SourceTitle)
+		label := cleanEvidenceLabelPartV1(source.SourceTitle)
 		if label == "" {
-			label = strings.TrimSpace(source.Platform)
+			label = cleanEvidenceLabelPartV1(source.Platform)
 		}
-		title := strings.TrimSpace(source.Title)
+		title := cleanEvidenceLabelPartV1(source.Title)
 		if label != "" && title != "" {
 			label += " · " + title
 		} else if title != "" {
@@ -238,8 +238,8 @@ func canonicalEvidenceMarkdownV1(
 		if label == "" {
 			label = source.Ref
 		}
-		label = escapeEvidenceLabelV1(truncateRunesV1(
-			label, aggEvidenceLabelMaxRunes))
+		label = escapeEvidenceLabelV1(
+			truncateRunesV1(label, aggEvidenceLabelMaxRunes))
 		sourceURL, valid := canonicalEvidenceURLV1(source.SourceURL)
 		if !valid {
 			break
@@ -301,12 +301,16 @@ func canonicalEvidenceURLV1(raw string) (string, bool) {
 }
 
 func escapeEvidenceLabelV1(value string) string {
-	value = promptguard.SingleLine(promptguard.StripInvisible(value))
 	return strings.NewReplacer(
 		"(", "（", ")", "）", "://", "：／／",
 		"*", "＊", "_", "＿", "`", "｀", "~", "～",
 		"\\", "＼",
 	).Replace(escapeMarkdown(value))
+}
+
+func cleanEvidenceLabelPartV1(value string) string {
+	return strings.TrimSpace(
+		promptguard.SingleLine(promptguard.StripInvisible(value)))
 }
 
 func truncateRunesV1(value string, max int) string {
