@@ -14,10 +14,10 @@ import (
 
 const agentActionProposalEvidence = "agent-durable-proposal/v1"
 
-// ProposeAgentActionContinuation creates one newly-issued enable_source card
-// directly in the v2 durable lane. The pending root, frozen continuation and
-// generation-1 authority are one transaction; callers must never compose
-// CreatePendingAction with a later activation.
+// ProposeAgentActionContinuation creates one newly-issued supported DB-local
+// action card directly in the v2 durable lane. The pending root, frozen
+// continuation and generation-1 authority are one transaction; callers must
+// never compose CreatePendingAction with a later activation.
 //
 // Repeating the exact proposal after a lost commit response is read-only and
 // succeeds only when every persisted byte and authority field still matches.
@@ -27,7 +27,8 @@ func (s *Store) ProposeAgentActionContinuation(
 ) error {
 	if action == nil || action.ID == "" || len(action.ID) > 255 ||
 		action.UserID <= 0 || action.SessionID == nil ||
-		*action.SessionID <= 0 || action.ToolName != agentActionToolName ||
+		*action.SessionID <= 0 ||
+		!isDurableAgentActionToolName(action.ToolName) ||
 		action.ExpiresAt.IsZero() ||
 		strings.TrimSpace(action.Summary) != action.Summary ||
 		action.Summary == "" || len(action.Summary) > 4096 ||
@@ -36,11 +37,17 @@ func (s *Store) ProposeAgentActionContinuation(
 		return agentEventValidationError(
 			"Agent action durable proposal is invalid")
 	}
-	sourceID, canonicalArgs, err := canonicalEnableSourceArgs(action.Args)
+	sourceIDs, canonicalArgs, err := canonicalAgentActionArgs(
+		action.ToolName, action.Args,
+	)
 	if err != nil {
 		return err
 	}
-	frozen, err := freezeEnableSourceAction(sourceID)
+	frozen, err := freezeAgentAction(action.ToolName, sourceIDs)
+	if err != nil {
+		return err
+	}
+	adapterVersion, err := agentActionAdapterForTool(action.ToolName)
 	if err != nil {
 		return err
 	}
@@ -104,9 +111,10 @@ func (s *Store) ProposeAgentActionContinuation(
 	)
 	if err == nil {
 		if err := replayAgentActionProposal(
-			ctx, tx, action, tenantID, sourceID, canonicalArgs, frozen,
-			expiresAt, rootSessionID, rootToolName, rootArgs, rootSummary,
-			rootStatus, rootExpiresAt, rootExecutionVersion,
+			ctx, tx, action, tenantID, sourceIDs, canonicalArgs,
+			adapterVersion, frozen, expiresAt, rootSessionID,
+			rootToolName, rootArgs, rootSummary, rootStatus,
+			rootExpiresAt, rootExecutionVersion,
 		); err != nil {
 			return err
 		}
@@ -127,7 +135,7 @@ func (s *Store) ProposeAgentActionContinuation(
 		     expires_at,execution_version
 		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9)`,
 		action.ID, tenantID, action.UserID, *action.SessionID,
-		agentActionToolName, canonicalArgs, action.Summary, expiresAt,
+		action.ToolName, canonicalArgs, action.Summary, expiresAt,
 		AgentActionExecutionVersion,
 	); err != nil {
 		return agentEventDatabaseError(
@@ -142,16 +150,17 @@ func (s *Store) ProposeAgentActionContinuation(
 		     success_digest,not_found_messages,not_found_digest,
 		     next_attempt_at
 		 ) VALUES (
-		     $1,$2,$3,$4,'enable_source',$5,$6,$7,$8,$9,$10,$11,$12,
-		     $13,$14,$15,$16,$17,$18,$19
+		     $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+		     $16,$17,$18,$19,$20
 		 )`,
-		action.ID, tenantID, action.UserID, *action.SessionID, sourceID,
-		canonicalArgs, AgentActionPayloadDigest(canonicalArgs),
+		action.ID, tenantID, action.UserID, *action.SessionID,
+		action.ToolName, sourceIDs[0], canonicalArgs,
+		AgentActionPayloadDigest(canonicalArgs),
 		agentActionToolSpecVersion, frozen.toolSpec,
 		AgentActionPayloadDigest(frozen.toolSpec),
 		agentActionToolPolicyVersion, frozen.toolPolicy,
 		AgentActionPayloadDigest(frozen.toolPolicy),
-		agentActionAdapterVersion, frozen.successMessages,
+		adapterVersion, frozen.successMessages,
 		AgentActionPayloadDigest(frozen.successMessages),
 		frozen.notFoundMessages,
 		AgentActionPayloadDigest(frozen.notFoundMessages),
@@ -181,9 +190,11 @@ func replayAgentActionProposal(
 	ctx context.Context,
 	tx pgx.Tx,
 	want *types.PendingAction,
-	tenantID, sourceID int64,
+	tenantID int64,
+	sourceIDs []int64,
 	canonicalArgs []byte,
-	frozen frozenEnableSourceAction,
+	adapterVersion string,
+	frozen frozenAgentAction,
 	expiresAt time.Time,
 	rootSessionID *int64,
 	rootToolName string,
@@ -192,12 +203,12 @@ func replayAgentActionProposal(
 	rootExpiresAt time.Time,
 	rootExecutionVersion int,
 ) error {
-	rootSourceID, rootCanonicalArgs, err :=
-		canonicalEnableSourceArgs(rootArgs)
+	rootSourceIDs, rootCanonicalArgs, err :=
+		canonicalAgentActionArgs(rootToolName, rootArgs)
 	if err != nil || rootSessionID == nil ||
 		*rootSessionID != *want.SessionID ||
-		rootToolName != agentActionToolName ||
-		rootSourceID != sourceID ||
+		rootToolName != want.ToolName ||
+		!equalAgentActionSourceIDs(rootSourceIDs, sourceIDs) ||
 		string(rootCanonicalArgs) != string(canonicalArgs) ||
 		rootSummary != want.Summary ||
 		rootStatus != string(types.PendingActionStatusPending) ||
@@ -220,7 +231,10 @@ func replayAgentActionProposal(
 	}
 	if action.Status != AgentActionStatusPending ||
 		action.SessionID != *want.SessionID ||
-		action.SourceID != sourceID ||
+		action.ToolName != want.ToolName ||
+		action.SourceID != sourceIDs[0] ||
+		!equalAgentActionSourceIDs(action.SourceIDs, sourceIDs) ||
+		action.AdapterVersion != adapterVersion ||
 		string(action.CanonicalArgs) != string(canonicalArgs) ||
 		string(action.ToolSpec) != string(frozen.toolSpec) ||
 		string(action.ToolPolicy) != string(frozen.toolPolicy) ||

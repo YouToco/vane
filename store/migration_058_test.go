@@ -101,6 +101,16 @@ func TestMigration058DownSerializesWithProjection(t *testing.T) {
 	if _, err := provider.UpTo(ctx, 58); err != nil {
 		t.Fatalf("migrate to 058: %v", err)
 	}
+	// This test intentionally pins the schema at 058 to exercise that Down
+	// fence, while the current binary validates the 070 continuator
+	// capability before projection. Mirror only that later grant so the test
+	// remains scoped to 058 serialization rather than failing on role drift.
+	if _, err := db.ExecContext(ctx,
+		`GRANT DELETE ON subscriptions
+		    TO vane_agent_action_continuator`,
+	); err != nil {
+		t.Fatalf("grant current continuator capability: %v", err)
+	}
 	st, err := New(ctx, scratchURL)
 	if err != nil {
 		t.Fatal(err)

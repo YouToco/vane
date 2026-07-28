@@ -243,8 +243,8 @@ type ActionContinuationController interface {
 }
 
 // ActionProposalController is the only production ingress for newly-issued
-// v2 enable_source cards. The implementation commits the pending root, frozen
-// continuation and generation-1 authority atomically.
+// v2 DB-local action cards. The implementation commits the pending root,
+// frozen continuation and generation-1 authority atomically.
 type ActionProposalController interface {
 	Propose(
 		context.Context,
@@ -281,12 +281,13 @@ type Deps struct {
 	// When present it must be the same controller used to register
 	// edit_task_definition in BuildTools.
 	TaskDefinitionEdit DefinitionEditController
-	// ActionContinuation routes exact v2 enable_source callbacks before every
-	// historical action protocol. Production Feishu ingress always injects it.
+	// ActionContinuation routes exact supported v2 DB-local action callbacks
+	// before every historical action protocol. Production Feishu ingress
+	// always injects it.
 	ActionContinuation ActionContinuationController
-	// ActionProposal creates normal enable_source cards directly as v2. It is
-	// deliberately separate from legacy CreatePendingAction and the operator
-	// activation surface.
+	// ActionProposal creates supported normal DB-local action cards directly
+	// as v2. It is deliberately separate from legacy CreatePendingAction and
+	// the operator activation surface.
 	ActionProposal ActionProposalController
 	// SystemPrompt 覆盖默认 system 常量（M4 契约 §7.1，A2A 轨用）。零值回落包内
 	// systemPrompt 常量——飞书轨装配不传本字段，行为零变化。默认常量写死了飞书语境
@@ -1465,7 +1466,7 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			out = append(out, toolMsg(tc.ID, toolMsgConfirmCreated))
 			continue
 		}
-		if tc.Name == agentcontinuation.DurableActionToolName {
+		if agentcontinuation.IsDurableActionToolName(tc.Name) {
 			if l.actionProposal == nil {
 				return nil, out, errors.New(
 					"agent: durable action proposal controller is not configured",

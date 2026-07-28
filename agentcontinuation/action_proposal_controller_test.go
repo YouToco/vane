@@ -55,6 +55,30 @@ func TestActionProposalController_Propose(t *testing.T) {
 	}
 }
 
+func TestActionProposalController_ProposesRemoveSource(t *testing.T) {
+	st := &fakeActionProposalStore{}
+	controller, err := NewActionProposalController(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := time.Now().Add(time.Hour)
+	got, err := controller.Propose(t.Context(), ActionProposalInput{
+		ActionID: "remove-action", UserID: 7, SessionID: 9,
+		ToolName:  DurableActionRemoveSourceToolName,
+		RawArgs:   []byte(`{"source_ids":[11,12]}`),
+		Summary:   "取消订阅 2 个信源（id=11、12）",
+		ExpiresAt: expiresAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "remove-action" ||
+		st.action.ToolName != DurableActionRemoveSourceToolName ||
+		string(st.action.Args) != `{"source_ids":[11,12]}` {
+		t.Fatalf("proposal=%+v action=%+v", got, st.action)
+	}
+}
+
 func TestActionProposalController_FailsClosed(t *testing.T) {
 	sentinel := errors.New("proposal failed")
 	st := &fakeActionProposalStore{err: sentinel}
@@ -73,7 +97,7 @@ func TestActionProposalController_FailsClosed(t *testing.T) {
 	}
 	if _, err := controller.Propose(t.Context(), ActionProposalInput{
 		ActionID: "other", UserID: 7, SessionID: 9,
-		ToolName: "remove_source", Summary: "remove",
+		ToolName: "update_profile", Summary: "update",
 		ExpiresAt: time.Now().Add(time.Hour),
 	}); err == nil {
 		t.Fatal("non-durable tool reached proposal Store")

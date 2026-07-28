@@ -82,6 +82,45 @@ func TestRunToolCalls_EnableSourceUsesOnlyAtomicDurableProposal(
 	}
 }
 
+func TestRunToolCalls_RemoveSourceUsesOnlyAtomicDurableProposal(
+	t *testing.T,
+) {
+	fs := newFakeStore()
+	tool := &fakeTool{
+		name: "remove_source", mutating: true,
+		result: "must not execute",
+	}
+	loop := newTestLoop(t, fs, (&scriptedChat{}).fn, tool)
+	proposer := &fakeActionProposalController{}
+	loop.actionProposal = proposer
+	sessionID := int64(23)
+
+	pending, replies, err := loop.runToolCalls(
+		t.Context(), 9, &sessionID, []llm.ToolCall{{
+			ID: "call", Name: "remove_source",
+			Arguments: `{"source_ids":[11,12]}`,
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proposer.calls != 1 || proposer.input.UserID != 9 ||
+		proposer.input.SessionID != sessionID ||
+		proposer.input.ToolName != "remove_source" ||
+		string(proposer.input.RawArgs) != `{"source_ids":[11,12]}` ||
+		time.Until(proposer.input.ExpiresAt) < 23*time.Hour {
+		t.Fatalf("proposal call drifted: %+v", proposer)
+	}
+	if pending == nil || pending.ID != proposer.outcome.ID ||
+		len(replies) != 1 || len(fs.actions) != 0 ||
+		len(tool.calls) != 0 {
+		t.Fatalf(
+			"pending=%+v replies=%+v legacy=%d executes=%d",
+			pending, replies, len(fs.actions), len(tool.calls),
+		)
+	}
+}
+
 func TestRunToolCalls_EnableSourceMiswireDoesNotFallBackToLegacyRoot(
 	t *testing.T,
 ) {

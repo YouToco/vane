@@ -583,3 +583,48 @@ provider-neutral 包；固定版本为 `vane.agent-context/v1`、快照
 
 7.8-B 才能把 candidate 变成模型主读；本批没有宣称 token 预算、裁剪或材料引用已影响
 生产回复，也没有增加 LLM summary、长期记忆检索或 7.10 自动 continuation。
+
+## 15. 7.10-B2/B3 DB-local durable action continuation
+
+本节覆盖普通 Agent 新建的 `enable_source` 与 `remove_source` 确认卡。两者不再先落
+execution_version=0 的 generic pending action；Agent 必须经唯一
+`ActionProposalController` 在一个 PostgreSQL 事务中同时提交：
+
+1. execution_version=2 的 pending root；
+2. 完整冻结的 tool spec、ToolPolicy、canonical args、adapter 和两种终态会话事实；
+3. generation-1 `durable` authority event。
+
+相同 ActionID 的提交响应丢失只能用相同 root、冻结字节和 authority 精确只读收养；
+部分行、摘要/参数漂移、租约或终态污染一律 integrity failure，不做修补或 v0 fallback。
+确认/取消先由 v2 controller 判定；只有 Store 明确证明 execution_version 不是 2 才能进入
+旧协议。
+
+`enable_source` 保留 B2 的单目标 `{"source_id":N}`、adapter
+`vane.enable-source/postgres/v1` 以及既有
+`agent-action:enable-source:<ActionID>` 幂等身份字节。后续版本不得因 Go 工具名使用下划线
+而改写这条已部署身份。
+
+`remove_source` 使用严格 `{"source_ids":[...]}`，输入 1–20 个正整数，去重但保留首次出现
+顺序；未知/重复字段、`null`、旧单数字段和非法目标都在 proposal 前拒绝。完整目标集留在
+canonical args，`source_id` 只保留第一项作为兼容 carrier。冻结 adapter 为
+`vane.remove-source/postgres/v1`，幂等身份为
+`agent-action:remove-source:<ActionID>`。
+
+continuator 只能在受限 `vane_agent_action_continuator` 角色和 exact tenant context 中执行。
+`remove_source` 的所有目标必须用一条带 `(tenant_id,user_id)` 谓词的 DELETE 在业务 effect
+事务内完成；终态 checkpoint 与固定会话事实和该 DELETE 同成同败。删到一条以上记
+`removed`；全部已不存在记 `not_subscribed`，两者都属于幂等完成。信源和历史内容不删除，
+其他租户或用户对同一信源的订阅不受影响。该角色只有 subscriptions DELETE，没有 INSERT、
+TRUNCATE 或 proposer 权限；migration 070 有 durable remove action 时拒绝降级。
+
+本批仍明确排除：
+
+- `add_source` 的外部 probe、`remove_schedule` 的 Temporal 副作用等跨系统工具；这些必须先
+  单独设计 durable saga；
+- 动作完成后再次付费调用模型的自动回续；需先冻结 token/cost/causal authority；
+- 将所有 `ConfirmationRequired` 工具自动视为 durable。支持列表必须由本地代码显式维护，
+  未列入工具继续走既有协议或 fail-closed。
+
+最低验证包括：真 PostgreSQL 18 批量删除、跨 Tenant/User、确认与投影重放、租约/fence、
+会话事实冲突导致 effect 整体回滚、取消/过期/损坏、070 权限矩阵与有数据降级拒绝，以及
+既有 `enable_source` 终态事实的原字节重放。
