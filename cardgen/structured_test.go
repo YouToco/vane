@@ -4,7 +4,9 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/types"
 )
@@ -220,6 +222,100 @@ func TestGenerateStructuredWithPolicyV2RejectsZeroPolicyBeforeCall(t *testing.T)
 	_, err := cg.GenerateStructuredWithPolicyV2(
 		t.Context(), 0, 1, types.ScoredItem{}, "trace-zero", "",
 		PolicyV2{}, nil,
+	)
+	if err == nil || captured.callCount() != 0 {
+		t.Fatalf("err=%v calls=%d", err, captured.callCount())
+	}
+}
+
+func TestGenerateStructuredWithEvidencePolicyV3UsesOneMultiSourceCall(
+	t *testing.T,
+) {
+	prompts, models := validPolicyV1(t, true)
+	prompts.CardGen = StructuredPromptStageV2()
+	for index := range models.Calls {
+		if models.Calls[index].Stage == runtimepolicy.ModelStageCardGen {
+			models.Calls[index] = StructuredModelCallV2("structured-model")
+		}
+	}
+	policy, err := PreparePolicyV2(prompts, models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 28, 12, 0, 0, 123456789, time.UTC)
+	items := []types.ContentItem{
+		{
+			ID: 7, Title: "公告一", URL: "https://example.com/one",
+			Content: "第一份共同证据确认发布", CreatedAt: now,
+		},
+		{
+			ID: 8, Title: "公告二", URL: "https://example.com/two",
+			Content: "第二份共同证据补充细节", CreatedAt: now.Add(time.Minute),
+		},
+	}
+	sources := make([]EventEvidenceSourceV1, len(items))
+	for index, item := range items {
+		sources[index], err = NewEventEvidenceSourceV1(
+			index, item, runcontext.SourceV1{
+				SourceID: int64(index + 10), Platform: types.PlatformWeb,
+				Title: "官方源",
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	reply := `{"schema_version":"vane.cardgen-insight/v1","body_md":"**已发布**","what_changed":"正式发布","why_it_matters":"影响当前任务","importance_reason":"两份来源交叉确认","claims":[{"text":"已确认发布","excerpt":"共同证据","source_refs":["source-1","source-2"]}]}`
+	cg, captured := newTestCardGen(t, http.StatusOK, reply, nil)
+	got, err := cg.GenerateStructuredWithEvidencePolicyV3(
+		t.Context(), 2, 3, types.ScoredItem{Item: items[0]},
+		sources, "trace-event", "关注正式发布", policy, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WhatChanged != "正式发布" || len(got.Claims) != 1 ||
+		captured.callCount() != 1 {
+		t.Fatalf("result=%+v calls=%d", got, captured.callCount())
+	}
+	system, user := captured.snapshot()
+	if system != structuredEventEvidenceSystemPromptV1 ||
+		!strings.Contains(user, "来源标签：source-1") ||
+		!strings.Contains(user, "来源标签：source-2") ||
+		strings.Contains(user, `"content_item_id"`) ||
+		strings.Contains(user, "\n7\n") || strings.Contains(user, "\n8\n") {
+		t.Fatalf("unexpected multi-source prompts:\nsystem=%q\nuser=%q",
+			system, user)
+	}
+}
+
+func TestGenerateStructuredWithEvidencePolicyV3RejectsInventoryBeforeCall(
+	t *testing.T,
+) {
+	prompts, models := validPolicyV1(t, false)
+	prompts.CardGen = StructuredPromptStageV2()
+	for index := range models.Calls {
+		if models.Calls[index].Stage == runtimepolicy.ModelStageCardGen {
+			models.Calls[index] = StructuredModelCallV2("structured-model")
+		}
+	}
+	policy, err := PreparePolicyV2(prompts, models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cg, captured := newTestCardGen(t, http.StatusOK, `{}`, nil)
+	source := EventEvidenceSourceV1{
+		ContentItemID: 7,
+		Metadata: types.StructuredEvidenceSourceV1{
+			Ref: "source-2", Title: "标题", Platform: "web",
+			SourceURL:    "https://example.com/source",
+			DiscoveredAt: time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
+		},
+		EvidenceText: "正文",
+	}
+	_, err = cg.GenerateStructuredWithEvidencePolicyV3(
+		t.Context(), 2, 3,
+		types.ScoredItem{Item: types.ContentItem{ID: 7}},
+		[]EventEvidenceSourceV1{source}, "trace-invalid", "", policy, nil,
 	)
 	if err == nil || captured.callCount() != 0 {
 		t.Fatalf("err=%v calls=%d", err, captured.callCount())

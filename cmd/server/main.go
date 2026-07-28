@@ -282,6 +282,7 @@ func run() error {
 	w.RegisterActivity(activities.CardGen)
 	w.RegisterActivity(activities.CardGenOutcomeV1)
 	w.RegisterActivity(activities.CardGenOutcomeV2)
+	w.RegisterActivity(activities.CardGenOutcomeV3)
 	w.RegisterActivity(activities.RecordEmptyBatch)
 	w.RegisterActivity(activities.NotifyEmptyResult)
 	w.RegisterActivity(activities.Push)
@@ -311,6 +312,12 @@ func run() error {
 			cfg.Pipeline.StructuredInsightRendererEnabled,
 			cfg.Pipeline.StructuredInsightRendererCanaryScheduleID,
 			cfg.Pipeline.StructuredInsightRendererAllowAll,
+		),
+		scheduler.WithStructuredEventEvidenceRollout(
+			cfg.Pipeline.StructuredEventEvidenceEnabled,
+			cfg.Pipeline.StructuredEventEvidenceCanaryScheduleID,
+			cfg.Pipeline.StructuredEventEvidenceAllowAll,
+			cfg.Pipeline.ObservationAuthorityCanaryScheduleID,
 		))
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
 	// C2b3-2c keeps definition editing dark at every ingress, but already owns

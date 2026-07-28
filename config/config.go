@@ -149,6 +149,11 @@ type PipelineConfig struct {
 	StructuredInsightRendererEnabled          bool   `mapstructure:"structured_insight_renderer_enabled"`
 	StructuredInsightRendererCanaryScheduleID string `mapstructure:"structured_insight_renderer_canary_schedule_id"`
 	StructuredInsightRendererAllowAll         bool   `mapstructure:"structured_insight_renderer_allow_all"`
+	// StructuredEventEvidence* is P2-B1's independently default-off runtime.
+	// It may select only tasks already inside structured generation+renderer.
+	StructuredEventEvidenceEnabled          bool   `mapstructure:"structured_event_evidence_enabled"`
+	StructuredEventEvidenceCanaryScheduleID string `mapstructure:"structured_event_evidence_canary_schedule_id"`
+	StructuredEventEvidenceAllowAll         bool   `mapstructure:"structured_event_evidence_allow_all"`
 	// CanonicalBriefRendererCanaryScheduleID is P1-E's independent Feishu
 	// content-authority switch. Empty is the complete rollback state.
 	CanonicalBriefRendererCanaryScheduleID string `mapstructure:"canonical_brief_renderer_canary_schedule_id"`
@@ -345,6 +350,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.structured_insight_renderer_enabled", false)
 	v.SetDefault("pipeline.structured_insight_renderer_canary_schedule_id", "")
 	v.SetDefault("pipeline.structured_insight_renderer_allow_all", false)
+	v.SetDefault("pipeline.structured_event_evidence_enabled", false)
+	v.SetDefault("pipeline.structured_event_evidence_canary_schedule_id", "")
+	v.SetDefault("pipeline.structured_event_evidence_allow_all", false)
 	v.SetDefault("pipeline.canonical_brief_renderer_canary_schedule_id", "")
 	v.SetDefault("pipeline.snapshot_v2_shadow_canary_schedule_id", "")
 	v.SetDefault("pipeline.snapshot_v2_read_audit_canary_schedule_id", "")
@@ -554,6 +562,46 @@ func (c *Config) Validate() error {
 				structuredInsightCanaryID != structuredRendererCanaryID {
 			return errors.New(
 				"config: structured insight generation 必须位于独立 renderer rollout")
+		}
+	}
+	rawStructuredEventEvidenceCanaryID :=
+		c.Pipeline.StructuredEventEvidenceCanaryScheduleID
+	structuredEventEvidenceCanaryID :=
+		strings.TrimSpace(rawStructuredEventEvidenceCanaryID)
+	if c.Pipeline.StructuredEventEvidenceEnabled &&
+		rawStructuredEventEvidenceCanaryID != "" &&
+		structuredEventEvidenceCanaryID == "" {
+		return errors.New(
+			"config: pipeline.structured_event_evidence_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.StructuredEventEvidenceCanaryScheduleID =
+		structuredEventEvidenceCanaryID
+	if c.Pipeline.StructuredEventEvidenceEnabled {
+		if !c.Pipeline.StructuredInsightEnabled {
+			return errors.New(
+				"config: structured event evidence 要求 structured insight 已启用")
+		}
+		if structuredEventEvidenceCanaryID == "" {
+			return errors.New(
+				"config: structured event evidence 当前只允许精确 canary")
+		}
+		if c.Pipeline.StructuredEventEvidenceAllowAll {
+			return errors.New(
+				"config: structured event evidence 尚不允许 allow_all")
+		}
+		if !c.Pipeline.StructuredInsightAllowAll &&
+			structuredEventEvidenceCanaryID !=
+				structuredInsightCanaryID {
+			return errors.New(
+				"config: structured event evidence 必须位于 structured insight rollout")
+		}
+		if observationAuthority :=
+			strings.TrimSpace(
+				c.Pipeline.ObservationAuthorityCanaryScheduleID,
+			); observationAuthority == "" ||
+			observationAuthority != structuredEventEvidenceCanaryID {
+			return errors.New(
+				"config: structured event evidence 必须精确等于 observation authority canary")
 		}
 	}
 	rawCanonicalRendererCanaryID :=

@@ -34,10 +34,11 @@ func (s *Store) ReserveObservedEventV1(
 		"observed event admission kept changing")
 }
 
-// ReserveObservedEventProvenanceV1 is Phase 2-B0's zero-call-point Store
-// primitive. It preserves ReserveObservedEventV1's exact admission/replay/CAS
-// behavior while returning the immutable observed-event row identity and
-// evidence digest needed by a later versioned Brief wiring batch.
+// ReserveObservedEventProvenanceV1 is the Phase 2-B0 Store primitive wired
+// only by Phase 2-B1's versioned Activity path. It preserves
+// ReserveObservedEventV1's exact admission/replay/CAS behavior while returning
+// the immutable observed-event row identity and evidence digest needed by the
+// optional event-evidence Brief extension.
 func (s *Store) ReserveObservedEventProvenanceV1(
 	ctx context.Context,
 	expected types.RunIdentity,

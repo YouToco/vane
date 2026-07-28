@@ -5,17 +5,23 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	failurepb "go.temporal.io/api/failure/v1"
 	historypb "go.temporal.io/api/history/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/sdk/converter"
 	sdklog "go.temporal.io/sdk/log"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
+	cardgenpkg "github.com/YouToco/vane/cardgen"
+	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/types"
 )
 
@@ -232,6 +238,64 @@ func (b *historyBuilder) activity(name string, input, result any) {
 	b.workflowTask()
 }
 
+// activityFailure appends a terminal, non-retryable Activity failure and the
+// WorkflowTask that observes it. It returns the exact ActivityError-shaped
+// failure that the workflow emits if it preserves the original error.
+func (b *historyBuilder) activityFailure(
+	name string,
+	input any,
+	failure *failurepb.Failure,
+) *failurepb.Failure {
+	attrs := &historypb.ActivityTaskScheduledEventAttributes{
+		ActivityType: &commonpb.ActivityType{Name: name},
+		TaskQueue:    &taskqueuepb.TaskQueue{Name: replayTaskQueue},
+		Input:        b.payloads(input),
+	}
+	sched := b.add(&historypb.HistoryEvent{
+		EventType: enumspb.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED,
+		Attributes: &historypb.HistoryEvent_ActivityTaskScheduledEventAttributes{
+			ActivityTaskScheduledEventAttributes: attrs,
+		},
+	})
+	attrs.ActivityId = strconv.FormatInt(sched, 10)
+	started := b.add(&historypb.HistoryEvent{
+		EventType: enumspb.EVENT_TYPE_ACTIVITY_TASK_STARTED,
+		Attributes: &historypb.HistoryEvent_ActivityTaskStartedEventAttributes{
+			ActivityTaskStartedEventAttributes: &historypb.ActivityTaskStartedEventAttributes{
+				ScheduledEventId: sched,
+			},
+		},
+	})
+	b.add(&historypb.HistoryEvent{
+		EventType: enumspb.EVENT_TYPE_ACTIVITY_TASK_FAILED,
+		Attributes: &historypb.HistoryEvent_ActivityTaskFailedEventAttributes{
+			ActivityTaskFailedEventAttributes: &historypb.ActivityTaskFailedEventAttributes{
+				Failure:          failure,
+				ScheduledEventId: sched,
+				StartedEventId:   started,
+				RetryState: enumspb.
+					RETRY_STATE_NON_RETRYABLE_FAILURE,
+			},
+		},
+	})
+	b.workflowTask()
+	return &failurepb.Failure{
+		Message: "activity error",
+		Source:  "GoSDK",
+		Cause:   failure,
+		FailureInfo: &failurepb.Failure_ActivityFailureInfo{
+			ActivityFailureInfo: &failurepb.ActivityFailureInfo{
+				ScheduledEventId: sched,
+				StartedEventId:   started,
+				ActivityType:     &commonpb.ActivityType{Name: name},
+				ActivityId:       attrs.ActivityId,
+				RetryState: enumspb.
+					RETRY_STATE_NON_RETRYABLE_FAILURE,
+			},
+		},
+	}
+}
+
 // complete 收尾成功终态。重放器见到末事件是 WorkflowExecutionCompleted 时，会额外
 // 校验工作流确实产出了 CompleteWorkflowExecution 命令——故本夹具是端到端的，
 // 不只是"没报非确定性"。
@@ -240,6 +304,19 @@ func (b *historyBuilder) complete() *historypb.History {
 		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED,
 		Attributes: &historypb.HistoryEvent_WorkflowExecutionCompletedEventAttributes{
 			WorkflowExecutionCompletedEventAttributes: &historypb.WorkflowExecutionCompletedEventAttributes{},
+		},
+	})
+	return &historypb.History{Events: b.events}
+}
+
+func (b *historyBuilder) fail(failure *failurepb.Failure) *historypb.History {
+	b.add(&historypb.HistoryEvent{
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED,
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionFailedEventAttributes{
+			WorkflowExecutionFailedEventAttributes: &historypb.WorkflowExecutionFailedEventAttributes{
+				Failure:    failure,
+				RetryState: enumspb.RETRY_STATE_NON_RETRYABLE_FAILURE,
+			},
 		},
 	})
 	return &historypb.History{Events: b.events}
@@ -748,12 +825,53 @@ func structuredInsightV1HappyPathHistory(
 	t *testing.T,
 	execution sdkworkflow.Execution,
 ) *historypb.History {
+	return structuredInsightHappyPathHistory(
+		t, execution, false, types.RunCompletenessComplete, false)
+}
+
+func structuredEventEvidenceV1HappyPathHistory(
+	t *testing.T,
+	execution sdkworkflow.Execution,
+) *historypb.History {
+	return structuredInsightHappyPathHistory(
+		t, execution, true, types.RunCompletenessComplete, false)
+}
+
+func structuredEventEvidenceV1PartialHistory(
+	t *testing.T,
+	execution sdkworkflow.Execution,
+) *historypb.History {
+	return structuredInsightHappyPathHistory(
+		t, execution, true, types.RunCompletenessPartial, false)
+}
+
+func structuredEventEvidenceV1FailureHistory(
+	t *testing.T,
+	execution sdkworkflow.Execution,
+) *historypb.History {
+	return structuredInsightHappyPathHistory(
+		t, execution, true, types.RunCompletenessComplete, true)
+}
+
+func structuredInsightHappyPathHistory(
+	t *testing.T,
+	execution sdkworkflow.Execution,
+	eventEvidenceRuntime bool,
+	processing types.RunCompletenessV1,
+	failCardGen bool,
+) *historypb.History {
 	t.Helper()
+	runtimeVersion := CompiledRuntimeStructuredInsightV1
+	taskID := "task-p2a-replay"
+	if eventEvidenceRuntime {
+		runtimeVersion = CompiledRuntimeStructuredEventEvidenceV1
+		taskID = "task-p2b1-replay"
+	}
 	p := PushParams{
 		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
 		ExecutionMode:  types.ExecutionModeCompiled,
-		RuntimeVersion: CompiledRuntimeStructuredInsightV1,
-		ScheduleID:     "task-p2a-replay", NLDesc: "每日结构化情报",
+		RuntimeVersion: runtimeVersion,
+		ScheduleID:     taskID, NLDesc: "每日结构化情报",
 	}
 	identity := types.RunIdentity{
 		TemporalWorkflowID: execution.ID, TemporalRunID: execution.RunID,
@@ -783,10 +901,71 @@ func structuredInsightV1HappyPathHistory(
 			SourceRefs: []string{"source-1"},
 		}},
 	}
+	discoveredAt := time.Date(
+		2026, time.July, 28, 12, 0, 0, 0, time.UTC)
+	candidateItems := []types.ContentItem{{
+		ID: 1, SourceID: 11, URL: "https://example.com/item",
+		Title: "item", Content: "价格下降了 20%",
+		CreatedAt: discoveredAt,
+	}}
+	qualifiedItems := append([]types.ContentItem(nil), candidateItems...)
+	qualificationOutcome := "not_configured"
+	var frozenEventEvidence []cardgenpkg.EventEvidenceSourceV1
+	var briefEventEvidence *types.StructuredEventEvidenceV1
+	if eventEvidenceRuntime {
+		eventJSON := json.RawMessage(
+			`{"event_type":"model_release","subject":"vane","release_identifier":"v1","occurred_at":"2026-07-28T12:00:00Z","qualification":"official","evidence_content_ids":[1],"reason":"official release"}`)
+		qualifiedItems[0].ObservationPolicyDigest = strings.Repeat("a", 64)
+		qualifiedItems[0].ObservationEventKey = strings.Repeat("b", 64)
+		qualifiedItems[0].ObservationEventJSON = eventJSON
+		qualificationOutcome = "match"
+		metadata, err := runcontext.StructuredEventEvidenceMetadataV1(
+			0, qualifiedItems[0], runcontext.SourceV1{
+				SourceID: 11, Platform: types.PlatformWeb,
+				Title: "source", URL: "https://example.com",
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		frozenEventEvidence = []cardgenpkg.EventEvidenceSourceV1{{
+			ContentItemID: 1,
+			Metadata:      metadata,
+			EvidenceText: runcontext.StructuredEventEvidenceTextV1(
+				qualifiedItems[0].Content),
+		}}
+		corpus, err := cardgenpkg.EventEvidenceCorpusV1(frozenEventEvidence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		structured, err = types.SealStructuredInsightEvidenceV1(
+			structured, corpus)
+		if err != nil {
+			t.Fatal(err)
+		}
+		provenance, err := types.SealObservedEventProvenanceV1(
+			505, strings.Repeat("a", 64), strings.Repeat("b", 64),
+			"model_release", "vane", discoveredAt,
+			eventJSON)
+		if err != nil {
+			t.Fatal(err)
+		}
+		briefEventEvidence = &types.StructuredEventEvidenceV1{
+			SchemaVersion:  types.StructuredEventEvidenceSchemaVersionV1,
+			Provenance:     provenance,
+			EvidenceDigest: structured.EvidenceDigest,
+			Sources: []types.StructuredEvidenceSourceV1{
+				frozenEventEvidence[0].Metadata,
+			},
+		}
+	}
+	scored := []types.ScoredItem{{
+		Item: qualifiedItems[0], Score: 80,
+	}}
 	cards := []GeneratedCard{{
-		Scored:     scoredItems(1)[0],
-		BodyMD:     structured.BodyMD,
-		Structured: &structured,
+		Scored:        scored[0],
+		BodyMD:        structured.BodyMD,
+		Structured:    &structured,
+		EventEvidence: frozenEventEvidence,
 	}}
 	draft := types.BriefDraftV1{
 		SchemaVersion: types.BriefSchemaVersionV1,
@@ -796,8 +975,9 @@ func structuredInsightV1HappyPathHistory(
 		Insights: []types.InsightV1{{
 			ID: 405, RankPosition: 1, Title: "item",
 			BodyMD: structured.BodyMD, SourceTitle: "source",
-			SourceURL:  "https://example.com/item",
-			Structured: &structured,
+			SourceURL:     "https://example.com/item",
+			Structured:    &structured,
+			EventEvidence: briefEventEvidence,
 		}},
 	}
 	const traceID = "9f1d6c5e-0000-4000-8000-p2areplay000"
@@ -813,32 +993,61 @@ func structuredInsightV1HappyPathHistory(
 	b.activity("EvolveProfile",
 		EvolveIn{UserID: p.UserID, TraceID: traceID, Run: run}, nil)
 	b.activity("FetchOutcomeV1", preparedParams, FetchOutcomeResult{
-		Items: items(1), SourceCoverage: types.RunCompletenessComplete,
+		Items: candidateItems, SourceCoverage: types.RunCompletenessComplete,
 	})
 	b.activity("Dedup", DedupIn{
-		UserID: p.UserID, TraceID: traceID, Items: items(1), Run: run,
-	}, items(1))
+		UserID: p.UserID, TraceID: traceID, Items: candidateItems, Run: run,
+	}, candidateItems)
 	b.versionWithSearchAttributes("observation-qualification-v1", 1)
 	b.activity("QualifyEvents", QualifyEventsIn{
 		UserID: p.UserID, TraceID: traceID, ScheduleID: p.ScheduleID,
-		Items: items(1), Run: run,
-	}, QualifyEventsResult{Items: items(1), Outcome: "not_configured"})
+		Items: candidateItems, Run: run,
+	}, QualifyEventsResult{
+		Items: qualifiedItems, Outcome: qualificationOutcome,
+	})
 	b.activity("ScoreOutcomeV1", ScoreIn{
-		UserID: p.UserID, TraceID: traceID, Items: items(1),
+		UserID: p.UserID, TraceID: traceID, Items: qualifiedItems,
 		ScheduleID: p.ScheduleID, Run: run,
 	}, ScoreOutcomeResult{
-		Items: scoredItems(1), Processing: types.RunCompletenessComplete,
+		Items: scored, Processing: processing,
 	})
 	b.activity("Select", SelectIn{
 		UserID: p.UserID, TraceID: traceID, TopN: defaultTopN,
-		Scored: scoredItems(1), ScheduleID: p.ScheduleID, Run: run,
-	}, scoredItems(1))
-	b.versionWithSearchAttributes("structured-insight-cardgen-v1", 1)
-	b.activity("CardGenOutcomeV2", CardGenIn{
-		UserID: p.UserID, TraceID: traceID, Items: scoredItems(1),
+		Scored: scored, ScheduleID: p.ScheduleID, Run: run,
+	}, scored)
+	cardGenActivity := "CardGenOutcomeV2"
+	cardGenVersion := "structured-insight-cardgen-v1"
+	if eventEvidenceRuntime {
+		cardGenActivity = "CardGenOutcomeV3"
+		cardGenVersion = "structured-event-evidence-cardgen-v1"
+	}
+	b.versionWithSearchAttributes(cardGenVersion, 1)
+	cardIn := CardGenIn{
+		UserID: p.UserID, TraceID: traceID, Items: scored,
 		ScheduleID: p.ScheduleID, Run: run,
-	}, CardGenOutcomeResult{
-		Cards: cards, Processing: types.RunCompletenessComplete,
+	}
+	if failCardGen {
+		const failureMessage = "card generation unavailable"
+		applicationFailure := temporal.GetDefaultFailureConverter().
+			ErrorToFailure(temporal.NewNonRetryableApplicationError(
+				failureMessage, string(types.CodeLLMUnavailable), nil))
+		workflowFailure := b.activityFailure(
+			cardGenActivity, cardIn, applicationFailure)
+		b.activity("FinalizeRunOutcomeV1", RunOutcomeFinalizeIn{
+			UserID: p.UserID, Run: *run,
+			Claim: types.RunOutcomeClaimV1{
+				RunOutcomeMarkerV1: marker,
+				Result:             types.RunResultFailed,
+				SourceCoverage:     types.RunCompletenessComplete,
+				Processing:         types.RunCompletenessPartial,
+				FailureCode:        string(types.CodeLLMUnavailable),
+				FailureMessage:     failureMessage,
+			},
+		}, nil)
+		return b.fail(workflowFailure)
+	}
+	b.activity(cardGenActivity, cardIn, CardGenOutcomeResult{
+		Cards: cards, Processing: processing,
 	})
 	b.versionWithSearchAttributes("canonical-brief-stage-v1", 1)
 	b.versionWithSearchAttributes("canonical-brief-prepare-result-v2", 1)
@@ -860,7 +1069,7 @@ func structuredInsightV1HappyPathHistory(
 			RunOutcomeMarkerV1: marker,
 			Result:             types.RunResultContent,
 			SourceCoverage:     types.RunCompletenessComplete,
-			Processing:         types.RunCompletenessComplete,
+			Processing:         processing,
 		},
 	}, nil)
 	return b.complete()
@@ -875,6 +1084,82 @@ func TestPushPipelineWorkflow_ReplayStructuredInsightV1HappyPath(t *testing.T) {
 		t, structuredInsightV1HappyPathHistory(t, execution), execution,
 	); err != nil {
 		t.Fatalf("P2-A structured history must replay exactly: %v", err)
+	}
+}
+
+func TestPushPipelineWorkflow_ReplayStructuredEventEvidenceV1HappyPath(
+	t *testing.T,
+) {
+	execution := sdkworkflow.Execution{
+		ID:    "wf-task-p2b1-replay",
+		RunID: "00000000-0000-4000-8000-000000000106",
+	}
+	if err := replayWithExecution(
+		t,
+		structuredEventEvidenceV1HappyPathHistory(t, execution),
+		execution,
+	); err != nil {
+		t.Fatalf("P2-B1 structured event evidence history must replay exactly: %v",
+			err)
+	}
+}
+
+func TestPushPipelineWorkflow_ReplayStructuredEventEvidenceV1Partial(
+	t *testing.T,
+) {
+	execution := sdkworkflow.Execution{
+		ID:    "wf-task-p2b1-replay-partial",
+		RunID: "00000000-0000-4000-8000-000000000108",
+	}
+	if err := replayWithExecution(
+		t,
+		structuredEventEvidenceV1PartialHistory(t, execution),
+		execution,
+	); err != nil {
+		t.Fatalf("P2-B1 partial structured event evidence history must replay exactly: %v",
+			err)
+	}
+}
+
+func TestPushPipelineWorkflow_ReplayStructuredEventEvidenceV1Failure(
+	t *testing.T,
+) {
+	execution := sdkworkflow.Execution{
+		ID:    "wf-task-p2b1-replay-failure",
+		RunID: "00000000-0000-4000-8000-000000000109",
+	}
+	if err := replayWithExecution(
+		t,
+		structuredEventEvidenceV1FailureHistory(t, execution),
+		execution,
+	); err != nil {
+		t.Fatalf("P2-B1 failed structured event evidence history must replay exactly: %v",
+			err)
+	}
+}
+
+func TestPushPipelineWorkflow_ReplayStructuredEventEvidenceRejectsV3Mutation(
+	t *testing.T,
+) {
+	execution := sdkworkflow.Execution{
+		ID:    "wf-task-p2b1-replay",
+		RunID: "00000000-0000-4000-8000-000000000107",
+	}
+	history := structuredEventEvidenceV1HappyPathHistory(t, execution)
+	mutated := false
+	for _, event := range history.Events {
+		attributes := event.GetActivityTaskScheduledEventAttributes()
+		if attributes.GetActivityType().GetName() == "CardGenOutcomeV3" {
+			attributes.ActivityType.Name = "CardGenOutcomeV2"
+			mutated = true
+			break
+		}
+	}
+	if !mutated {
+		t.Fatal("P2-B1 replay fixture has no CardGenOutcomeV3 Activity")
+	}
+	if err := replayWithExecution(t, history, execution); err == nil {
+		t.Fatal("mutating P2-B1 CardGen command identity must trigger nondeterminism")
 	}
 }
 

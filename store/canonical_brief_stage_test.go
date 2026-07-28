@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/types"
 )
 
@@ -247,6 +249,244 @@ func TestStructuredBriefStageFirstWriteReplayAndConflict(t *testing.T) {
 	if brief.Insights[0].Structured == nil ||
 		brief.Insights[0].Structured.WhatChanged != "change" {
 		t.Fatalf("promoted structured Brief = %+v", brief)
+	}
+}
+
+func TestCanonicalBriefStageFreezesStructuredEventEvidence(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 1)
+	if _, err := f.base.st.pool.Exec(t.Context(),
+		`UPDATE content_items
+		    SET content='frozen evidence body',content_hash=$2
+		  WHERE id=$1`,
+		f.contentID[0], "hash-event-"+f.traceID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var item types.ContentItem
+	if err := f.base.st.pool.QueryRow(t.Context(),
+		`SELECT id,url,title,content,published_at,created_at
+		   FROM content_items WHERE id=$1`,
+		f.contentID[0],
+	).Scan(
+		&item.ID, &item.URL, &item.Title, &item.Content,
+		&item.PublishedAt, &item.CreatedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := runcontext.StructuredEventEvidenceMetadataV1(
+		0, item, runcontext.SourceV1{
+			SourceID: f.sourceID, Platform: types.PlatformWeb,
+			Title: f.sourceName,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus := map[string]string{
+		"source-1": runcontext.StructuredEventEvidenceTextV1(item.Content),
+	}
+	structured, err := types.SealStructuredInsightEvidenceV1(
+		types.StructuredInsightV1{
+			SchemaVersion: types.StructuredInsightSchemaVersionV1,
+			BodyMD:        f.bodyMD[0],
+		},
+		corpus,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventJSON := json.RawMessage(fmt.Sprintf(
+		`{"evidence_content_ids":[%d]}`, f.contentID[0]))
+	event := observation.QualifiedEvent{
+		PolicyDigest: strings.Repeat("a", 64),
+		EventKey:     strings.Repeat("b", 64),
+		EventType:    "model_release",
+		Subject:      "OpenAI models",
+		OccurredAt: time.Date(
+			2026, 7, 28, 12, 0, 0, 0, time.UTC),
+		EvidenceJSON: eventJSON,
+	}
+	authority, err := f.base.st.ClaimPushBatchDeliveryAuthority(
+		t.Context(),
+		types.PushBatchScope{
+			TenantID: f.identity.TenantID,
+			UserID:   f.identity.UserID,
+			BatchID:  f.batchID,
+		},
+		types.PushBatchDeliveryAuthorityEffect,
+	)
+	if err != nil ||
+		authority != types.PushBatchDeliveryAuthorityEffect {
+		t.Fatalf("claim push authority: authority=%q err=%v",
+			authority, err)
+	}
+	provenance, accepted, err :=
+		f.base.st.ReserveObservedEventProvenanceV1(
+			t.Context(), f.identity, f.ref, f.batchID, event)
+	if err != nil || !accepted {
+		t.Fatalf("reserve observed event: accepted=%t err=%v",
+			accepted, err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(ctx, t, f.base.st,
+			`DELETE FROM task_observed_events WHERE id=$1`, provenance.ID)
+	})
+	if err := f.base.st.BindObservedEventDeliveryV1(
+		t.Context(), f.identity, f.ref,
+		event.PolicyDigest, event.EventKey, f.batchID, f.deliveryID[0],
+	); err != nil {
+		t.Fatal(err)
+	}
+	generatedAt := time.Date(
+		2026, 7, 28, 13, 0, 0, 0, time.UTC)
+	structuredByDelivery := map[int64]types.StructuredInsightV1{
+		f.deliveryID[0]: structured,
+	}
+	corpusByDelivery := map[int64]map[string]string{
+		f.deliveryID[0]: corpus,
+	}
+	eventByDelivery := map[int64]StructuredEventEvidenceStageV1{
+		f.deliveryID[0]: {
+			Provenance: provenance,
+			Sources: []StructuredEventEvidenceStageSourceV1{{
+				ContentItemID: f.contentID[0],
+				Metadata:      metadata,
+				EvidenceText:  corpus["source-1"],
+			}},
+		},
+	}
+	assertConflict := func(
+		name string,
+		structuredInput map[int64]types.StructuredInsightV1,
+		corpusInput map[int64]map[string]string,
+		eventInput map[int64]StructuredEventEvidenceStageV1,
+	) {
+		t.Helper()
+		if _, err := f.base.st.PrepareBriefDraftV3(
+			t.Context(), f.identity, f.ref, marker, f.batchID, generatedAt,
+			f.deliveryID, structuredInput, corpusInput, eventInput,
+		); !errors.Is(err, types.ErrConflict) &&
+			!errors.Is(err, types.ErrValidation) {
+			t.Fatalf("%s error=%v want conflict/validation", name, err)
+		}
+	}
+	missingProvenance := eventByDelivery[f.deliveryID[0]]
+	missingProvenance.Provenance.ID++
+	assertConflict(
+		"missing provenance", structuredByDelivery, corpusByDelivery,
+		map[int64]StructuredEventEvidenceStageV1{
+			f.deliveryID[0]: missingProvenance,
+		})
+
+	forgedBody := "forged body from another content item"
+	forgedCorpus := map[string]string{"source-1": forgedBody}
+	forgedStructured, err := types.SealStructuredInsightEvidenceV1(
+		types.StructuredInsightV1{
+			SchemaVersion: types.StructuredInsightSchemaVersionV1,
+			BodyMD:        f.bodyMD[0],
+		},
+		forgedCorpus,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgedStage := eventByDelivery[f.deliveryID[0]]
+	forgedStage.Sources = append(
+		[]StructuredEventEvidenceStageSourceV1(nil),
+		forgedStage.Sources...)
+	forgedStage.Sources[0].EvidenceText = forgedBody
+	assertConflict(
+		"forged body",
+		map[int64]types.StructuredInsightV1{
+			f.deliveryID[0]: forgedStructured,
+		},
+		map[int64]map[string]string{
+			f.deliveryID[0]: forgedCorpus,
+		},
+		map[int64]StructuredEventEvidenceStageV1{
+			f.deliveryID[0]: forgedStage,
+		})
+
+	forgedMetadata := eventByDelivery[f.deliveryID[0]]
+	forgedMetadata.Sources = append(
+		[]StructuredEventEvidenceStageSourceV1(nil),
+		forgedMetadata.Sources...)
+	forgedMetadata.Sources[0].Metadata.Title = "forged title"
+	assertConflict(
+		"forged metadata", structuredByDelivery, corpusByDelivery,
+		map[int64]StructuredEventEvidenceStageV1{
+			f.deliveryID[0]: forgedMetadata,
+		})
+
+	forgedContentID := eventByDelivery[f.deliveryID[0]]
+	forgedContentID.Sources = append(
+		[]StructuredEventEvidenceStageSourceV1(nil),
+		forgedContentID.Sources...)
+	forgedContentID.Sources[0].ContentItemID++
+	assertConflict(
+		"forged content id", structuredByDelivery, corpusByDelivery,
+		map[int64]StructuredEventEvidenceStageV1{
+			f.deliveryID[0]: forgedContentID,
+		})
+
+	extraRef := eventByDelivery[f.deliveryID[0]]
+	extraSource := extraRef.Sources[0]
+	extraSource.ContentItemID++
+	extraSource.Metadata.Ref = "source-2"
+	extraRef.Sources = append(
+		append([]StructuredEventEvidenceStageSourceV1(nil),
+			extraRef.Sources...),
+		extraSource,
+	)
+	assertConflict(
+		"metadata ref without corpus", structuredByDelivery, corpusByDelivery,
+		map[int64]StructuredEventEvidenceStageV1{
+			f.deliveryID[0]: extraRef,
+		})
+
+	draft, err := f.base.st.PrepareBriefDraftV3(
+		t.Context(), f.identity, f.ref, marker, f.batchID, generatedAt,
+		f.deliveryID, structuredByDelivery, corpusByDelivery,
+		eventByDelivery,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(draft.Insights) != 1 ||
+		draft.Insights[0].EventEvidence == nil ||
+		draft.Insights[0].EventEvidence.Provenance.ID != provenance.ID {
+		t.Fatalf("staged event evidence = %+v", draft)
+	}
+	payload, err := json.Marshal(draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "content_item_id") ||
+		strings.Contains(string(payload), "frozen evidence body") {
+		t.Fatalf("Brief leaked raw evidence inventory: %s", payload)
+	}
+	if _, err := f.base.st.PrepareBriefDraftV3(
+		t.Context(), f.identity, f.ref, marker, f.batchID, generatedAt,
+		f.deliveryID, structuredByDelivery, corpusByDelivery,
+		eventByDelivery,
+	); err != nil {
+		t.Fatalf("exact event evidence replay failed: %v", err)
+	}
+	drifted := eventByDelivery[f.deliveryID[0]]
+	drifted.Provenance.ID++
+	eventByDelivery[f.deliveryID[0]] = drifted
+	if _, err := f.base.st.PrepareBriefDraftV3(
+		t.Context(), f.identity, f.ref, marker, f.batchID, generatedAt,
+		f.deliveryID, structuredByDelivery, corpusByDelivery,
+		eventByDelivery,
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("provenance drift error=%v want conflict", err)
 	}
 }
 

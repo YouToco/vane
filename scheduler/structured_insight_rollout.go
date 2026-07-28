@@ -59,3 +59,35 @@ func (r structuredInsightRollout) runtimeVersionFor(
 	}
 	return workflow.CompiledRuntimeStructuredInsightV1
 }
+
+func WithStructuredEventEvidenceRollout(
+	enabled bool,
+	canaryScheduleID string,
+	allowAll bool,
+	observationAuthorityCanaryScheduleID string,
+) SchedulerOption {
+	return func(s *Scheduler) {
+		canaryScheduleID = strings.TrimSpace(canaryScheduleID)
+		observationAuthorityCanaryScheduleID =
+			strings.TrimSpace(observationAuthorityCanaryScheduleID)
+		if !enabled || canaryScheduleID == "" || allowAll ||
+			canaryScheduleID != observationAuthorityCanaryScheduleID {
+			s.structuredEventEvidence = rolloutScopeV1{}
+			return
+		}
+		s.structuredEventEvidence = rolloutScopeV1{
+			enabled: true, canaryID: canaryScheduleID, allowAll: allowAll,
+		}
+	}
+}
+
+func (r rolloutScopeV1) runtimeVersionForEventEvidence(
+	taskID, runtimeVersion string,
+) string {
+	if !r.allows(taskID) ||
+		runtimeVersion != workflow.CompiledRuntimeStructuredInsightV1 ||
+		strings.TrimSpace(taskID) == "" {
+		return runtimeVersion
+	}
+	return workflow.CompiledRuntimeStructuredEventEvidenceV1
+}

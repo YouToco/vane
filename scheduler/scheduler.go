@@ -172,16 +172,17 @@ type scheduleCommandStore interface {
 
 // Scheduler 持有 Temporal client、任务队列名与 store（镜像用）。
 type Scheduler struct {
-	c                 client.Client
-	tq                string
-	st                scheduleStore
-	taskScheduleGates taskScheduleGateSet
-	taskScheduleEnv   taskScheduleEnvironment
-	compiledRuntime   compiledRuntimeRollout
-	runOutcome        runOutcomeRollout
-	canonicalBrief    canonicalBriefRollout
-	structuredInsight structuredInsightRollout
-	commandAttempt    time.Duration
+	c                       client.Client
+	tq                      string
+	st                      scheduleStore
+	taskScheduleGates       taskScheduleGateSet
+	taskScheduleEnv         taskScheduleEnvironment
+	compiledRuntime         compiledRuntimeRollout
+	runOutcome              runOutcomeRollout
+	canonicalBrief          canonicalBriefRollout
+	structuredInsight       structuredInsightRollout
+	structuredEventEvidence rolloutScopeV1
+	commandAttempt          time.Duration
 }
 
 // New 构造 Scheduler。client 由 cmd/server 用 client.Dial 建好后注入；

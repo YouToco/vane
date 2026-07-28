@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -21,6 +22,7 @@ const (
 	BriefSchemaVersionV1                      = "vane.brief/v1"
 	StructuredInsightSchemaVersionV1          = "vane.cardgen-insight/v1"
 	ObservedEventProvenanceSchemaVersionV1    = "vane.observed-event-provenance/v1"
+	StructuredEventEvidenceSchemaVersionV1    = "vane.structured-event-evidence/v1"
 	ObservedEventProvenanceMaxEvidenceBytesV1 = 256 << 10
 
 	maxBriefTaskIDBytes      = 255
@@ -235,15 +237,16 @@ func runOutcomeDigestEnvelope(o RunOutcomeV1) runOutcomeDigestV1 {
 // ID intentionally remains delivery_id in Phase 1 so feedback keeps one
 // identity. RankPosition is persisted and never recomputed from score or ID.
 type InsightV1 struct {
-	ID           int64                `json:"id"`
-	RankPosition int                  `json:"rank_position"`
-	Title        string               `json:"title"`
-	BodyMD       string               `json:"body_md"`
-	SourceTitle  string               `json:"source_title"`
-	SourceURL    string               `json:"source_url"`
-	PublishedAt  *time.Time           `json:"published_at,omitempty"`
-	DiscoveredAt time.Time            `json:"discovered_at"`
-	Structured   *StructuredInsightV1 `json:"structured,omitempty"`
+	ID            int64                      `json:"id"`
+	RankPosition  int                        `json:"rank_position"`
+	Title         string                     `json:"title"`
+	BodyMD        string                     `json:"body_md"`
+	SourceTitle   string                     `json:"source_title"`
+	SourceURL     string                     `json:"source_url"`
+	PublishedAt   *time.Time                 `json:"published_at,omitempty"`
+	DiscoveredAt  time.Time                  `json:"discovered_at"`
+	Structured    *StructuredInsightV1       `json:"structured,omitempty"`
+	EventEvidence *StructuredEventEvidenceV1 `json:"event_evidence,omitempty"`
 }
 
 type StructuredClaimV1 struct {
@@ -260,6 +263,64 @@ type StructuredInsightV1 struct {
 	ImportanceReason string              `json:"importance_reason"`
 	Claims           []StructuredClaimV1 `json:"claims"`
 	EvidenceDigest   string              `json:"evidence_digest,omitempty"`
+}
+
+// StructuredEvidenceSourceV1 freezes inventory-owned source presentation for
+// one opaque CardGen evidence reference. Raw bodies and content-item IDs remain
+// in the versioned Activity result and are deliberately absent from the Brief.
+type StructuredEvidenceSourceV1 struct {
+	Ref          string     `json:"ref"`
+	Title        string     `json:"title"`
+	SourceTitle  string     `json:"source_title"`
+	Platform     string     `json:"platform"`
+	SourceURL    string     `json:"source_url"`
+	PublishedAt  *time.Time `json:"published_at,omitempty"`
+	DiscoveredAt time.Time  `json:"discovered_at"`
+}
+
+func (s StructuredEvidenceSourceV1) Validate() error {
+	if !validBriefText(s.Ref, 255, false) ||
+		!validBriefText(s.Title, maxBriefTitleBytes, false) ||
+		!validBriefText(s.SourceTitle, maxBriefSourceTitleBytes, true) ||
+		!validBriefText(s.Platform, maxStructuredFieldBytes, false) ||
+		!validBriefSourceURL(s.SourceURL) ||
+		s.DiscoveredAt.IsZero() ||
+		s.DiscoveredAt != canonicalBriefTime(s.DiscoveredAt) {
+		return errors.New("structured event evidence source is invalid")
+	}
+	if s.PublishedAt != nil &&
+		(s.PublishedAt.IsZero() ||
+			*s.PublishedAt != canonicalBriefTime(*s.PublishedAt)) {
+		return errors.New(
+			"structured event evidence publication time is invalid")
+	}
+	return nil
+}
+
+// StructuredEventEvidenceV1 binds one structured Insight to the exact
+// first-writer observed-event reservation and the ordered inventory metadata
+// for every source whose bounded body bytes were supplied to CardGen.
+type StructuredEventEvidenceV1 struct {
+	SchemaVersion  string                       `json:"schema_version"`
+	Provenance     ObservedEventProvenanceV1    `json:"provenance"`
+	EvidenceDigest string                       `json:"evidence_digest"`
+	Sources        []StructuredEvidenceSourceV1 `json:"sources"`
+}
+
+func (e StructuredEventEvidenceV1) Validate() error {
+	if e.SchemaVersion != StructuredEventEvidenceSchemaVersionV1 ||
+		e.Provenance.Validate() != nil ||
+		!validBriefDigest(e.EvidenceDigest) ||
+		len(e.Sources) == 0 || len(e.Sources) > maxStructuredRefs {
+		return errors.New("structured event evidence is invalid")
+	}
+	for index, source := range e.Sources {
+		expectedRef := "source-" + strconv.Itoa(index+1)
+		if source.Ref != expectedRef || source.Validate() != nil {
+			return errors.New("structured event evidence source is invalid")
+		}
+	}
+	return nil
 }
 
 // ObservedEventProvenanceV1 is the immutable, channel-neutral identity of the
@@ -495,6 +556,20 @@ func (d BriefDraftV1) Canonical() (BriefDraftV1, error) {
 			}
 			d.Insights[i].Structured = &structured
 		}
+		if d.Insights[i].EventEvidence != nil {
+			eventEvidence := *d.Insights[i].EventEvidence
+			eventEvidence.Sources = append(
+				[]StructuredEvidenceSourceV1(nil), eventEvidence.Sources...)
+			for sourceIndex := range eventEvidence.Sources {
+				source := &eventEvidence.Sources[sourceIndex]
+				source.DiscoveredAt = canonicalBriefTime(source.DiscoveredAt)
+				if source.PublishedAt != nil {
+					published := canonicalBriefTime(*source.PublishedAt)
+					source.PublishedAt = &published
+				}
+			}
+			d.Insights[i].EventEvidence = &eventEvidence
+		}
 		d.Insights[i].DiscoveredAt = canonicalBriefTime(d.Insights[i].DiscoveredAt)
 		if d.Insights[i].PublishedAt != nil {
 			published := canonicalBriefTime(*d.Insights[i].PublishedAt)
@@ -531,6 +606,16 @@ func (d BriefDraftV1) Validate() error {
 			if err := insight.Structured.Validate(); err != nil ||
 				insight.Structured.BodyMD != insight.BodyMD {
 				return errors.New("brief structured insight is invalid")
+			}
+		}
+		if insight.EventEvidence != nil {
+			if insight.Structured == nil ||
+				insight.EventEvidence.Validate() != nil ||
+				!equalBriefDigest(
+					insight.EventEvidence.EvidenceDigest,
+					insight.Structured.EvidenceDigest,
+				) {
+				return errors.New("brief structured event evidence is invalid")
 			}
 		}
 		if insight.PublishedAt != nil &&

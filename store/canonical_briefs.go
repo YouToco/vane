@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/types"
 )
 
@@ -649,7 +650,7 @@ func (s *Store) PrepareBriefDraftV1(
 ) (types.BriefDraftV1, error) {
 	return s.prepareBriefDraft(
 		ctx, expected, ref, marker, batchID, generatedAt,
-		orderedDeliveryIDs, nil)
+		orderedDeliveryIDs, nil, nil, nil)
 }
 
 func (s *Store) PrepareBriefDraftV2(
@@ -673,7 +674,33 @@ func (s *Store) PrepareBriefDraftV2(
 	return s.prepareBriefDraft(
 		ctx, expected, ref, marker, batchID, generatedAt,
 		orderedDeliveryIDs, structuredByDelivery,
-		structuredEvidenceByDelivery)
+		structuredEvidenceByDelivery, nil)
+}
+
+func (s *Store) PrepareBriefDraftV3(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	marker types.RunOutcomeMarkerV1,
+	batchID int64,
+	generatedAt time.Time,
+	orderedDeliveryIDs []int64,
+	structuredByDelivery map[int64]types.StructuredInsightV1,
+	structuredEvidenceByDelivery map[int64]map[string]string,
+	structuredEventStageByDelivery map[int64]StructuredEventEvidenceStageV1,
+) (types.BriefDraftV1, error) {
+	if len(structuredByDelivery) == 0 ||
+		len(structuredByDelivery) != len(orderedDeliveryIDs) ||
+		len(structuredEvidenceByDelivery) != len(orderedDeliveryIDs) ||
+		len(structuredEventStageByDelivery) != len(orderedDeliveryIDs) {
+		return types.BriefDraftV1{},
+			canonicalBriefValidationError(
+				"structured event brief preparation is empty")
+	}
+	return s.prepareBriefDraft(
+		ctx, expected, ref, marker, batchID, generatedAt,
+		orderedDeliveryIDs, structuredByDelivery,
+		structuredEvidenceByDelivery, structuredEventStageByDelivery)
 }
 
 func (s *Store) prepareBriefDraft(
@@ -685,7 +712,8 @@ func (s *Store) prepareBriefDraft(
 	generatedAt time.Time,
 	orderedDeliveryIDs []int64,
 	structuredByDelivery map[int64]types.StructuredInsightV1,
-	structuredEvidenceByDelivery ...map[int64]map[string]string,
+	structuredEvidenceByDelivery map[int64]map[string]string,
+	structuredEventStageByDelivery map[int64]StructuredEventEvidenceStageV1,
 ) (types.BriefDraftV1, error) {
 	if err := marker.Validate(); err != nil ||
 		marker.RunSnapshotID != ref.SnapshotID ||
@@ -712,10 +740,7 @@ func (s *Store) prepareBriefDraft(
 		seen[deliveryID] = struct{}{}
 	}
 	for deliveryID, structured := range structuredByDelivery {
-		var sources map[string]string
-		if len(structuredEvidenceByDelivery) == 1 {
-			sources = structuredEvidenceByDelivery[0][deliveryID]
-		}
+		sources := structuredEvidenceByDelivery[deliveryID]
 		if _, exists := seen[deliveryID]; !exists ||
 			types.ValidateStructuredInsightEvidenceV1(
 				structured, sources) != nil {
@@ -723,6 +748,30 @@ func (s *Store) prepareBriefDraft(
 				canonicalBriefValidationError(
 					"structured brief delivery is invalid")
 		}
+	}
+	structuredEventByDelivery := make(
+		map[int64]types.StructuredEventEvidenceV1,
+		len(structuredEventStageByDelivery))
+	for deliveryID, eventStage := range structuredEventStageByDelivery {
+		structured, exists := structuredByDelivery[deliveryID]
+		eventEvidence, eventErr :=
+			eventStage.eventEvidence(structured.EvidenceDigest)
+		corpus := structuredEvidenceByDelivery[deliveryID]
+		if !exists || eventErr != nil ||
+			len(corpus) != len(eventStage.Sources) ||
+			eventEvidence.EvidenceDigest != structured.EvidenceDigest {
+			return types.BriefDraftV1{},
+				canonicalBriefValidationError(
+					"structured event brief delivery is invalid")
+		}
+		for _, source := range eventStage.Sources {
+			if corpus[source.Metadata.Ref] != source.EvidenceText {
+				return types.BriefDraftV1{},
+					canonicalBriefValidationError(
+						"structured event brief corpus differs")
+			}
+		}
+		structuredEventByDelivery[deliveryID] = eventEvidence
 	}
 
 	tx, err := s.beginCanonicalBriefTxV1(ctx, expected, ref)
@@ -784,6 +833,19 @@ func (s *Store) prepareBriefDraft(
 					canonicalBriefConflictError(
 						"canonical Brief structured stage already differs")
 			}
+			var expectedEventEvidence *types.StructuredEventEvidenceV1
+			if eventEvidence, ok :=
+				structuredEventByDelivery[deliveryID]; ok {
+				expectedEventEvidence = &eventEvidence
+			}
+			if !reflect.DeepEqual(
+				existing.draft.Insights[index].EventEvidence,
+				expectedEventEvidence,
+			) {
+				return types.BriefDraftV1{},
+					canonicalBriefConflictError(
+						"canonical Brief event evidence stage already differs")
+			}
 		}
 		if err := commitCanonicalBriefTxV1(
 			ctx, tx, "replay canonical Brief stage"); err != nil {
@@ -812,6 +874,13 @@ func (s *Store) prepareBriefDraft(
 	if briefState != "open" {
 		return types.BriefDraftV1{},
 			canonicalBriefConflictError("compiled brief batch is already sealed")
+	}
+	for deliveryID, eventStage := range structuredEventStageByDelivery {
+		if err := validateCanonicalBriefEventEvidenceV1(
+			ctx, tx, batchID, ref.SnapshotID, deliveryID, eventStage,
+		); err != nil {
+			return types.BriefDraftV1{}, err
+		}
 	}
 
 	evidenceByID, err := readBriefEvidenceV1(ctx, tx, batchID, ref.SnapshotID)
@@ -842,6 +911,14 @@ func (s *Store) prepareBriefDraft(
 		if structured, ok := structuredByDelivery[deliveryID]; ok {
 			copyStructured := structured
 			insight.Structured = &copyStructured
+		}
+		if eventEvidence, ok :=
+			structuredEventByDelivery[deliveryID]; ok {
+			copyEventEvidence := eventEvidence
+			copyEventEvidence.Sources = append(
+				[]types.StructuredEvidenceSourceV1(nil),
+				eventEvidence.Sources...)
+			insight.EventEvidence = &copyEventEvidence
 		}
 		insights = append(insights, insight)
 	}
@@ -1511,6 +1588,111 @@ type briefEvidenceV1 struct {
 	sourceURL    string
 	publishedAt  *time.Time
 	sourceTitle  string
+}
+
+func validateCanonicalBriefEventEvidenceV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	batchID, runSnapshotID, deliveryID int64,
+	stage StructuredEventEvidenceStageV1,
+) error {
+	if len(stage.Sources) == 0 || len(stage.Sources) > 8 {
+		return canonicalBriefValidationError(
+			"structured event evidence stage is invalid")
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT observed_event_id,policy_digest,event_key,event_type,subject,
+		        occurred_at,evidence_json,evidence_ordinal,
+		        delivery_content_item_id,content_item_id,content_title,
+		        canonical_url,published_at,discovered_at,content_body,
+		        frozen_source_id,frozen_source_title,frozen_source_platform
+		   FROM read_canonical_brief_event_evidence_v1($1,$2,$3,$4)`,
+		batchID, runSnapshotID, deliveryID, stage.Provenance.ID,
+	)
+	if err != nil {
+		return canonicalBriefDatabaseError(
+			"read structured event evidence", err)
+	}
+	defer rows.Close()
+
+	var authoritative types.ObservedEventProvenanceV1
+	count := 0
+	for rows.Next() {
+		var (
+			eventID, ordinal, deliveryContentID, contentID, sourceID int64
+			policyDigest, eventKey, eventType, subject               string
+			occurredAt, discoveredAt                                 time.Time
+			evidenceJSON                                             json.RawMessage
+			title, sourceURL, contentBody, sourceTitle, platform     string
+			publishedAt                                              sql.NullTime
+		)
+		if err := rows.Scan(
+			&eventID, &policyDigest, &eventKey, &eventType, &subject,
+			&occurredAt, &evidenceJSON, &ordinal,
+			&deliveryContentID, &contentID, &title, &sourceURL,
+			&publishedAt, &discoveredAt, &contentBody,
+			&sourceID, &sourceTitle, &platform,
+		); err != nil {
+			return canonicalBriefDatabaseError(
+				"scan structured event evidence", err)
+		}
+		provenance, sealErr := types.SealObservedEventProvenanceV1(
+			eventID, policyDigest, eventKey, eventType, subject,
+			occurredAt, evidenceJSON)
+		if sealErr != nil {
+			return canonicalBriefIntegrityError()
+		}
+		if count == 0 {
+			authoritative = provenance
+		} else if !reflect.DeepEqual(authoritative, provenance) {
+			return canonicalBriefIntegrityError()
+		}
+		if count >= len(stage.Sources) ||
+			ordinal != int64(count+1) ||
+			deliveryContentID != stage.Sources[0].ContentItemID ||
+			contentID != stage.Sources[count].ContentItemID {
+			return canonicalBriefConflictError(
+				"structured event evidence identity differs")
+		}
+		item := types.ContentItem{
+			ID: contentID, URL: sourceURL, Title: title,
+			Content: contentBody, CreatedAt: discoveredAt,
+		}
+		if publishedAt.Valid {
+			published := publishedAt.Time
+			item.PublishedAt = &published
+		}
+		metadata, metadataErr :=
+			runcontext.StructuredEventEvidenceMetadataV1(
+				count, item, runcontext.SourceV1{
+					SourceID: sourceID,
+					Platform: types.Platform(platform),
+					Title:    sourceTitle,
+				})
+		expected := StructuredEventEvidenceStageSourceV1{
+			ContentItemID: contentID,
+			Metadata:      metadata,
+			EvidenceText: runcontext.StructuredEventEvidenceTextV1(
+				contentBody),
+		}
+		if metadataErr != nil ||
+			!equalStructuredEventEvidenceStageSourceV1(
+				expected, stage.Sources[count]) {
+			return canonicalBriefConflictError(
+				"structured event evidence inventory differs")
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return canonicalBriefDatabaseError(
+			"iterate structured event evidence", err)
+	}
+	if count != len(stage.Sources) ||
+		!reflect.DeepEqual(authoritative, stage.Provenance) {
+		return canonicalBriefConflictError(
+			"structured event evidence first writer differs")
+	}
+	return nil
 }
 
 func readBriefEvidenceV1(
