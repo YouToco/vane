@@ -3474,8 +3474,9 @@ func (a *Activities) canonicalBriefAuthorityItemsV1(
 		items[index] = pushPendingItem{
 			delID: insight.ID,
 			input: feedback.CardInput{
-				BodyMD: insight.BodyMD, DeliveryID: insight.ID,
-				Title: insight.Title, URL: insight.SourceURL,
+				BodyMD:     feedback.CanonicalInsightBodyMDV1(insight),
+				DeliveryID: insight.ID,
+				Title:      insight.Title, URL: insight.SourceURL,
 				SourceTitle:  insight.SourceTitle,
 				PublishedAt:  insight.PublishedAt,
 				DiscoveredAt: insight.DiscoveredAt,

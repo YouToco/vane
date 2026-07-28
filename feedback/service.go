@@ -566,8 +566,9 @@ func (s *Service) rebuildAggregate(ctx context.Context, clicked *types.Delivery,
 				force(&st)
 			}
 			items[i] = CardInput{
-				BodyMD: insight.BodyMD, DeliveryID: insight.ID,
-				State: st, Title: insight.Title, URL: insight.SourceURL,
+				BodyMD:     CanonicalInsightBodyMDV1(insight),
+				DeliveryID: insight.ID,
+				State:      st, Title: insight.Title, URL: insight.SourceURL,
 				SourceTitle:  insight.SourceTitle,
 				PublishedAt:  insight.PublishedAt,
 				DiscoveredAt: insight.DiscoveredAt,

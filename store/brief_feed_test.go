@@ -241,6 +241,18 @@ func TestTaskBriefFeedPaginatesWholeBriefs(t *testing.T) {
 				SourceTitle: f.sourceName, SourceURL: secondURL,
 				DiscoveredAt: discoveredAt.Round(0).UTC().
 					Truncate(time.Microsecond),
+				Structured: &types.StructuredInsightV1{
+					SchemaVersion:    types.StructuredInsightSchemaVersionV1,
+					BodyMD:           "second body",
+					WhatChanged:      "second change",
+					WhyItMatters:     "second relevance",
+					ImportanceReason: "second evidence",
+					Claims: []types.StructuredClaimV1{{
+						Text:       "second claim",
+						Excerpt:    "second excerpt",
+						SourceRefs: []string{"source-1"},
+					}},
+				},
 			}},
 		})
 	if err != nil {
@@ -274,6 +286,14 @@ func TestTaskBriefFeedPaginatesWholeBriefs(t *testing.T) {
 		firstPage.Items[0].ID != secondBrief.ID ||
 		firstPage.NextPageToken == "" {
 		t.Fatalf("first page = %+v", firstPage)
+	}
+	if structured := firstPage.Items[0].Insights[0].Structured; structured == nil ||
+		structured.WhatChanged != "second change" ||
+		structured.WhyItMatters != "second relevance" ||
+		structured.ImportanceReason != "second evidence" ||
+		len(structured.Claims) != 1 ||
+		structured.Claims[0].SourceRefs[0] != "source-1" {
+		t.Fatalf("structured Web projection = %+v", structured)
 	}
 	secondPage, err := f.base.st.ListTaskBriefsV1(
 		t.Context(), f.identity.TenantID, f.identity.UserID,
