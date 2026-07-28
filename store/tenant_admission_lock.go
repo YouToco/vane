@@ -41,3 +41,27 @@ func lockTenantAdmissionRoot(
 	}
 	return exists, nil
 }
+
+// lockTenantAdmissionRootShared admits a read that must finish before an
+// irreversible tenant purge, while allowing same-tenant readers and writers
+// to proceed in their established membership -> schedule row-lock order.
+func lockTenantAdmissionRootShared(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID int64,
+) (bool, error) {
+	key := tenantAdmissionRootLockNamespace + strconv.FormatInt(tenantID, 10)
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock_shared(hashtextextended($1, $2))`,
+		key, tenantAdmissionRootLockSeed); err != nil {
+		return false, err
+	}
+
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1)`,
+		tenantID).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
