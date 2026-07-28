@@ -64,6 +64,7 @@ vi.mock("@/i18n", () => ({
 import TaskBriefFeed, {
   BriefInsightBody,
   InsightBody,
+  validatedEventEvidence,
 } from "@/components/TaskBriefFeed";
 import type {
   TaskBrief,
@@ -199,6 +200,186 @@ describe("TaskBriefFeed Markdown boundary", () => {
     expect(html).not.toContain("source-1");
   });
 
+  test("binds claims to the full ordered frozen evidence set", () => {
+    const insight = page("event", 10).items[0].insights[0];
+    insight.source_url = "https://legacy.example/item";
+    insight.structured = {
+      schema_version: "vane.cardgen-insight/v1",
+      body_md: insight.body_md,
+      what_changed: "Two sources confirm the release.",
+      why_it_matters: "The integration changes.",
+      importance_reason: "Independent evidence agrees.",
+      claims: [
+        {
+          text: "The release is available.",
+          excerpt: "Version 2 is now available.",
+          source_refs: ["source-2", "source-1"],
+        },
+      ],
+    };
+    insight.event_evidence = {
+      schema_version: "vane.structured-event-evidence/v1",
+      sources: [
+        {
+          ref: "source-1",
+          title: "Official release",
+          source_title: "Vendor",
+          platform: "web",
+          source_url: "https://vendor.example/release",
+          published_at: "2026-07-27T08:00:00Z",
+          discovered_at: "2026-07-27T09:00:00Z",
+        },
+        {
+          ref: "source-2",
+          title: "Release coverage",
+          source_title: "Industry Wire",
+          platform: "rss",
+          source_url: "https://wire.example/release",
+          discovered_at: "2026-07-27T09:05:00Z",
+        },
+      ],
+    };
+    const html = renderToStaticMarkup(
+      <BriefInsightBody insight={insight} d={briefDict("en")} />,
+    );
+
+    expect(html).toContain("Supporting sources");
+    expect(html).toContain("All evidence sources");
+    expect(html).toContain('href="https://vendor.example/release"');
+    expect(html).toContain('href="https://wire.example/release"');
+    expect(html.indexOf("Official release")).toBeLessThan(
+      html.indexOf("Release coverage"),
+    );
+    expect(html.indexOf(">Industry Wire<")).toBeLessThan(
+      html.indexOf(">Vendor<"),
+    );
+    expect(html).not.toContain("https://legacy.example/item");
+  });
+
+  test("fails an unsafe evidence extension closed to structured presentation", () => {
+    const insight = page("unsafe-event", 11).items[0].insights[0];
+    insight.structured = {
+      schema_version: "vane.cardgen-insight/v1",
+      body_md: insight.body_md,
+      what_changed: "Safe structured field.",
+      why_it_matters: "Safe relevance.",
+      importance_reason: "Safe reason.",
+      claims: [
+        {
+          text: "Safe claim.",
+          excerpt: "Safe excerpt.",
+          source_refs: ["source-1"],
+        },
+      ],
+    };
+    insight.event_evidence = {
+      schema_version: "vane.structured-event-evidence/v1",
+      sources: [
+        {
+          ref: "source-1",
+          title: "Unsafe target",
+          source_title: "Unsafe",
+          platform: "web",
+          source_url: "javascript:alert(1)",
+          discovered_at: "2026-07-27T09:00:00Z",
+        },
+      ],
+    };
+    const html = renderToStaticMarkup(
+      <BriefInsightBody insight={insight} d={briefDict("en")} />,
+    );
+
+    expect(html).toContain("Safe structured field.");
+    expect(html).toContain("Safe excerpt.");
+    expect(html).not.toContain("All evidence sources");
+    expect(html).not.toContain("Supporting sources");
+    expect(html).not.toContain("javascript:");
+  });
+
+  test("fails an unresolved claim reference closed without inventing a source", () => {
+    const insight = page("missing-ref", 12).items[0].insights[0];
+    insight.structured = {
+      schema_version: "vane.cardgen-insight/v1",
+      body_md: insight.body_md,
+      what_changed: "Structured field remains readable.",
+      why_it_matters: "Still useful.",
+      importance_reason: "Existing validated presentation.",
+      claims: [
+        {
+          text: "Claim with a missing mapping.",
+          excerpt: "Excerpt stays visible.",
+          source_refs: ["source-2"],
+        },
+      ],
+    };
+    insight.event_evidence = {
+      schema_version: "vane.structured-event-evidence/v1",
+      sources: [
+        {
+          ref: "source-1",
+          title: "Only source",
+          source_title: "Source",
+          platform: "web",
+          source_url: "https://source.example/item",
+          discovered_at: "2026-07-27T09:00:00Z",
+        },
+      ],
+    };
+    const html = renderToStaticMarkup(
+      <BriefInsightBody insight={insight} d={briefDict("en")} />,
+    );
+
+    expect(html).toContain("Structured field remains readable.");
+    expect(html).toContain("Excerpt stays visible.");
+    expect(html).not.toContain("All evidence sources");
+    expect(html).not.toContain("https://source.example/item");
+    expect(html).not.toContain("source-2");
+  });
+
+  test("full feed replaces the legacy source link with frozen evidence", async () => {
+    const response = page("channel", 13);
+    const insight = response.items[0].insights[0];
+    insight.source_url = "https://legacy.example/item";
+    insight.structured = {
+      schema_version: "vane.cardgen-insight/v1",
+      body_md: insight.body_md,
+      what_changed: "A release changed.",
+      why_it_matters: "The task depends on it.",
+      importance_reason: "The frozen source confirms it.",
+      claims: [
+        {
+          text: "A release changed.",
+          excerpt: "Release notes.",
+          source_refs: ["source-1"],
+        },
+      ],
+    };
+    insight.event_evidence = {
+      schema_version: "vane.structured-event-evidence/v1",
+      sources: [
+        {
+          ref: "source-1",
+          title: "Frozen release notes",
+          source_title: "Vendor",
+          platform: "web",
+          source_url: "https://vendor.example/release",
+          discovered_at: "2026-07-27T09:00:00Z",
+        },
+      ],
+    };
+    apiMock.scheduleBriefs.mockResolvedValue(response);
+
+    const view = render(<TaskBriefFeed scheduleID="task-channel" />);
+    await screen.findByText("channel insight 13");
+
+    expect(view.container.innerHTML).toContain(
+      'href="https://vendor.example/release"',
+    );
+    expect(view.container.innerHTML).not.toContain(
+      "https://legacy.example/item",
+    );
+  });
+
   test("falls back to body_md for an incomplete structured extension", () => {
     const insight = page("fallback", 8).items[0].insights[0];
     insight.structured = {
@@ -209,12 +390,26 @@ describe("TaskBriefFeed Markdown boundary", () => {
       importance_reason: "",
       claims: [],
     };
+    insight.event_evidence = {
+      schema_version: "vane.structured-event-evidence/v1",
+      sources: [
+        {
+          ref: "source-1",
+          title: "Source that must not suppress legacy presentation",
+          source_title: "Source",
+          platform: "web",
+          source_url: "https://source.example/item",
+          discovered_at: "2026-07-27T09:00:00Z",
+        },
+      ],
+    };
     const html = renderToStaticMarkup(
       <BriefInsightBody insight={insight} d={briefDict("en")} />,
     );
 
     expect(html).toContain("fallback body");
     expect(html).not.toContain("What changed");
+    expect(validatedEventEvidence(insight)).toBeNull();
   });
 
   test("renders the structured trio safely when claims is null", () => {

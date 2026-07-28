@@ -12,6 +12,8 @@ export interface BriefDict {
   briefImportanceReason: string;
   briefEvidence: string;
   briefEvidenceExcerpt: string;
+  briefClaimSources: string;
+  briefSources: string;
   briefFeedback: string;
   briefFeedbackInterested: string;
   briefFeedbackNotInterested: string;
@@ -35,6 +37,8 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefImportanceReason: "重要性依据",
     briefEvidence: "可核对证据",
     briefEvidenceExcerpt: "原文摘录",
+    briefClaimSources: "支持来源",
+    briefSources: "全部证据来源",
     briefFeedback: "当前反馈",
     briefFeedbackInterested: "感兴趣",
     briefFeedbackNotInterested: "不感兴趣",
@@ -56,6 +60,8 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefImportanceReason: "重要性依據",
     briefEvidence: "可核對證據",
     briefEvidenceExcerpt: "原文摘錄",
+    briefClaimSources: "支持來源",
+    briefSources: "全部證據來源",
     briefFeedback: "目前回饋",
     briefFeedbackInterested: "感興趣",
     briefFeedbackNotInterested: "不感興趣",
@@ -77,6 +83,8 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefImportanceReason: "Why it is important",
     briefEvidence: "Verifiable evidence",
     briefEvidenceExcerpt: "Source excerpt",
+    briefClaimSources: "Supporting sources",
+    briefSources: "All evidence sources",
     briefFeedback: "Current feedback",
     briefFeedbackInterested: "Interested",
     briefFeedbackNotInterested: "Not interested",
@@ -98,6 +106,8 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefImportanceReason: "重要性の根拠",
     briefEvidence: "確認可能な根拠",
     briefEvidenceExcerpt: "原文抜粋",
+    briefClaimSources: "裏付ける情報源",
+    briefSources: "すべての根拠情報源",
     briefFeedback: "現在のフィードバック",
     briefFeedbackInterested: "興味あり",
     briefFeedbackNotInterested: "興味なし",
@@ -119,6 +129,8 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefImportanceReason: "중요성 근거",
     briefEvidence: "확인 가능한 근거",
     briefEvidenceExcerpt: "원문 발췌",
+    briefClaimSources: "근거 출처",
+    briefSources: "전체 근거 출처",
     briefFeedback: "현재 피드백",
     briefFeedbackInterested: "관심 있음",
     briefFeedbackNotInterested: "관심 없음",
@@ -140,6 +152,8 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefImportanceReason: "Fundamento de importancia",
     briefEvidence: "Evidencia verificable",
     briefEvidenceExcerpt: "Extracto de la fuente",
+    briefClaimSources: "Fuentes de respaldo",
+    briefSources: "Todas las fuentes de evidencia",
     briefFeedback: "Comentarios actuales",
     briefFeedbackInterested: "Me interesa",
     briefFeedbackNotInterested: "No me interesa",
@@ -161,6 +175,8 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefImportanceReason: "Fondement de l'importance",
     briefEvidence: "Éléments vérifiables",
     briefEvidenceExcerpt: "Extrait de la source",
+    briefClaimSources: "Sources à l'appui",
+    briefSources: "Toutes les sources de preuve",
     briefFeedback: "Retours actuels",
     briefFeedbackInterested: "Intéressant",
     briefFeedbackNotInterested: "Pas intéressant",
@@ -182,6 +198,8 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefImportanceReason: "Grund für die Relevanz",
     briefEvidence: "Prüfbare Belege",
     briefEvidenceExcerpt: "Quellenauszug",
+    briefClaimSources: "Belegquellen",
+    briefSources: "Alle Belegquellen",
     briefFeedback: "Aktuelles Feedback",
     briefFeedbackInterested: "Interessant",
     briefFeedbackNotInterested: "Nicht interessant",

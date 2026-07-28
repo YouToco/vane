@@ -360,6 +360,21 @@ export interface TaskBriefStructuredInsight {
   claims: TaskBriefStructuredClaim[];
 }
 
+export interface TaskBriefEvidenceSource {
+  ref: string;
+  title: string;
+  source_title: string;
+  platform: string;
+  source_url: string;
+  published_at?: string;
+  discovered_at: string;
+}
+
+export interface TaskBriefEventEvidence {
+  schema_version: "vane.structured-event-evidence/v1";
+  sources: TaskBriefEvidenceSource[];
+}
+
 export interface TaskBriefInsight {
   id: number;
   rank_position: number;
@@ -370,6 +385,7 @@ export interface TaskBriefInsight {
   published_at?: string;
   discovered_at: string;
   structured?: TaskBriefStructuredInsight;
+  event_evidence?: TaskBriefEventEvidence;
   feedback: TaskBriefFeedbackState;
 }
 
@@ -888,6 +904,12 @@ export const api = {
         ...brief,
         insights: arr(brief.insights).map((insight) => ({
           ...insight,
+          event_evidence: insight.event_evidence
+            ? {
+                ...insight.event_evidence,
+                sources: arr(insight.event_evidence.sources),
+              }
+            : undefined,
           feedback: {
             preference: insight.feedback?.preference,
             misjudged: Boolean(insight.feedback?.misjudged),

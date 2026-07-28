@@ -6,6 +6,7 @@ import { ExternalLink, Loader2 } from "lucide-react";
 import { api, ApiError } from "@/api";
 import type {
   TaskBrief,
+  TaskBriefEvidenceSource,
   TaskBriefInsight,
   TaskLatestCheck,
 } from "@/api";
@@ -126,6 +127,79 @@ function hasStructuredProjection(insight: TaskBriefInsight): boolean {
   );
 }
 
+type ValidatedEvidenceSource = TaskBriefEvidenceSource & {
+  safeURL: string;
+};
+
+function validBriefTime(value: string | undefined): boolean {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    !Number.isNaN(Date.parse(value))
+  );
+}
+
+export function validatedEventEvidence(
+  insight: TaskBriefInsight,
+): ValidatedEvidenceSource[] | null {
+  const eventEvidence = insight.event_evidence;
+  const claims = insight.structured?.claims;
+  if (
+    !hasStructuredProjection(insight) ||
+    !eventEvidence ||
+    eventEvidence.schema_version !== "vane.structured-event-evidence/v1" ||
+    !Array.isArray(eventEvidence.sources) ||
+    eventEvidence.sources.length === 0 ||
+    !Array.isArray(claims)
+  ) {
+    return null;
+  }
+  const projected: ValidatedEvidenceSource[] = [];
+  const refs = new Set<string>();
+  for (const [index, source] of eventEvidence.sources.entries()) {
+    const expectedRef = `source-${index + 1}`;
+    const safeURL = safeBriefURL(source?.source_url);
+    if (
+      !source ||
+      source.ref !== expectedRef ||
+      typeof source.title !== "string" ||
+      !source.title ||
+      typeof source.source_title !== "string" ||
+      typeof source.platform !== "string" ||
+      !source.platform ||
+      typeof source.source_url !== "string" ||
+      source.source_url.trim() !== source.source_url ||
+      !safeURL ||
+      !validBriefTime(source.discovered_at) ||
+      (source.published_at !== undefined &&
+        !validBriefTime(source.published_at))
+    ) {
+      return null;
+    }
+    refs.add(source.ref);
+    projected.push({ ...source, safeURL });
+  }
+  for (const claim of claims) {
+    if (
+      !claim ||
+      !Array.isArray(claim.source_refs) ||
+      claim.source_refs.length === 0
+    ) {
+      return null;
+    }
+    const claimRefs = new Set(claim.source_refs);
+    if (
+      claimRefs.size !== claim.source_refs.length ||
+      claim.source_refs.some(
+        (ref) => typeof ref !== "string" || !refs.has(ref),
+      )
+    ) {
+      return null;
+    }
+  }
+  return projected;
+}
+
 export function BriefInsightBody({
   insight,
   d,
@@ -138,6 +212,10 @@ export function BriefInsightBody({
   }
   const structured = insight.structured!;
   const claims = Array.isArray(structured.claims) ? structured.claims : [];
+  const evidenceSources = validatedEventEvidence(insight);
+  const evidenceByRef = new Map(
+    evidenceSources?.map((source) => [source.ref, source]) ?? [],
+  );
   return (
     <div className="space-y-4">
       <dl className="grid gap-3 rounded-lg border bg-muted/20 p-4 sm:grid-cols-3">
@@ -175,9 +253,78 @@ export function BriefInsightBody({
                   </span>
                   “{claim.excerpt}”
                 </p>
+                {evidenceSources && (
+                  <div
+                    className="mt-2 flex flex-wrap items-center gap-1.5"
+                    aria-label={d.briefClaimSources}
+                  >
+                    {claim.source_refs.map((ref) => {
+                      const source = evidenceByRef.get(ref)!;
+                      return (
+                        <a
+                          key={ref}
+                          href={source.safeURL}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="rounded-full border px-2 py-0.5 text-xs text-primary hover:underline"
+                        >
+                          {source.source_title ||
+                            source.platform ||
+                            source.title}
+                        </a>
+                      );
+                    })}
+                  </div>
+                )}
               </li>
             ))}
           </ul>
+        </section>
+      )}
+      {evidenceSources && (
+        <section className="space-y-2" aria-label={d.briefSources}>
+          <h4 className="text-xs font-medium text-muted-foreground">
+            {d.briefSources}
+          </h4>
+          <ol className="space-y-2">
+            {evidenceSources.map((source) => (
+              <li
+                key={source.ref}
+                className="flex gap-2 rounded-md border bg-background px-3 py-2"
+              >
+                <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                  {source.ref.replace("source-", "")}.
+                </span>
+                <div className="min-w-0 space-y-1">
+                  <a
+                    href={source.safeURL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-start gap-1 text-sm font-medium text-primary hover:underline"
+                  >
+                    <span>{source.title}</span>
+                    <ExternalLink className="mt-1 size-3 shrink-0" />
+                  </a>
+                  <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                    <span>
+                      {source.source_title || d.briefUnknownSource}
+                      {source.platform ? ` · ${source.platform}` : ""}
+                    </span>
+                    {source.published_at && (
+                      <span>
+                        {d.briefPublished}{" "}
+                        {fmtBeijing(source.published_at)}
+                      </span>
+                    )}
+                    <span>
+                      {d.briefDiscovered}{" "}
+                      {fmtBeijing(source.discovered_at)}
+                    </span>
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ol>
         </section>
       )}
     </div>
@@ -355,7 +502,11 @@ export default function TaskBriefFeed({
                 </header>
                 <div className="divide-y">
                   {brief.insights.map((insight) => {
-                    const href = safeBriefURL(insight.source_url);
+                    const hasEventEvidence =
+                      validatedEventEvidence(insight) !== null;
+                    const href = hasEventEvidence
+                      ? null
+                      : safeBriefURL(insight.source_url);
                     return (
                       <article
                         key={insight.id}
@@ -382,21 +533,24 @@ export default function TaskBriefFeed({
                               )}
                             </h3>
                             <BriefInsightBody insight={insight} d={D} />
-                            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                              <span>
-                                {insight.source_title || D.briefUnknownSource}
-                              </span>
-                              {insight.published_at && (
+                            {!hasEventEvidence && (
+                              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                                 <span>
-                                  {D.briefPublished}{" "}
-                                  {fmtBeijing(insight.published_at)}
+                                  {insight.source_title ||
+                                    D.briefUnknownSource}
                                 </span>
-                              )}
-                              <span>
-                                {D.briefDiscovered}{" "}
-                                {fmtBeijing(insight.discovered_at)}
-                              </span>
-                            </div>
+                                {insight.published_at && (
+                                  <span>
+                                    {D.briefPublished}{" "}
+                                    {fmtBeijing(insight.published_at)}
+                                  </span>
+                                )}
+                                <span>
+                                  {D.briefDiscovered}{" "}
+                                  {fmtBeijing(insight.discovered_at)}
+                                </span>
+                              </div>
+                            )}
                             {(insight.feedback.preference ||
                               insight.feedback.misjudged ||
                               insight.feedback.deep_dive_requested) && (
