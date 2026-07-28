@@ -3767,6 +3767,8 @@ func (a *Activities) canonicalBriefAuthorityItemsV1(
 				SourceTitle:  insight.SourceTitle,
 				PublishedAt:  insight.PublishedAt,
 				DiscoveredAt: insight.DiscoveredAt,
+				EvidenceSources: feedback.
+					CanonicalInsightEvidenceSourcesV1(insight),
 			},
 			eventKey: legacy.eventKey,
 		}

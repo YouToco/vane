@@ -32,16 +32,17 @@ type TaskBriefQuery struct {
 // state projected onto Feishu cards. Feedback is intentionally not part of the
 // immutable Brief digest.
 type TaskBriefInsightV1 struct {
-	ID           int64                         `json:"id"`
-	RankPosition int                           `json:"rank_position"`
-	Title        string                        `json:"title"`
-	BodyMD       string                        `json:"body_md"`
-	SourceTitle  string                        `json:"source_title"`
-	SourceURL    string                        `json:"source_url"`
-	PublishedAt  *time.Time                    `json:"published_at,omitempty"`
-	DiscoveredAt time.Time                     `json:"discovered_at"`
-	Structured   *TaskBriefStructuredInsightV1 `json:"structured,omitempty"`
-	Feedback     TaskBriefFeedbackStateV1      `json:"feedback"`
+	ID            int64                         `json:"id"`
+	RankPosition  int                           `json:"rank_position"`
+	Title         string                        `json:"title"`
+	BodyMD        string                        `json:"body_md"`
+	SourceTitle   string                        `json:"source_title"`
+	SourceURL     string                        `json:"source_url"`
+	PublishedAt   *time.Time                    `json:"published_at,omitempty"`
+	DiscoveredAt  time.Time                     `json:"discovered_at"`
+	Structured    *TaskBriefStructuredInsightV1 `json:"structured,omitempty"`
+	EventEvidence *TaskBriefEventEvidenceV1     `json:"event_evidence,omitempty"`
+	Feedback      TaskBriefFeedbackStateV1      `json:"feedback"`
 }
 
 // TaskBriefStructuredInsightV1 deliberately omits the internal evidence
@@ -54,6 +55,24 @@ type TaskBriefStructuredInsightV1 struct {
 	WhyItMatters     string                    `json:"why_it_matters"`
 	ImportanceReason string                    `json:"importance_reason"`
 	Claims           []types.StructuredClaimV1 `json:"claims"`
+}
+
+// TaskBriefEventEvidenceV1 is the public, channel-neutral projection of the
+// inventory metadata already frozen in the immutable Brief. It deliberately
+// omits provenance, digests, database IDs and raw evidence bodies.
+type TaskBriefEventEvidenceV1 struct {
+	SchemaVersion string                      `json:"schema_version"`
+	Sources       []TaskBriefEvidenceSourceV1 `json:"sources"`
+}
+
+type TaskBriefEvidenceSourceV1 struct {
+	Ref          string     `json:"ref"`
+	Title        string     `json:"title"`
+	SourceTitle  string     `json:"source_title"`
+	Platform     string     `json:"platform"`
+	SourceURL    string     `json:"source_url"`
+	PublishedAt  *time.Time `json:"published_at,omitempty"`
+	DiscoveredAt time.Time  `json:"discovered_at"`
 }
 
 type TaskBriefFeedbackStateV1 struct {
@@ -336,6 +355,14 @@ func (s *Store) ListTaskBriefsV1(
 				projected.Structured = projectTaskBriefStructuredInsightV1(
 					frozen.Structured)
 			}
+			eventEvidence, projectErr :=
+				projectTaskBriefEventEvidenceV1(frozen)
+			if projectErr != nil {
+				return TaskBriefPageV1{}, types.NewAppError(
+					types.CodeInternal,
+					"任务简报证据映射完整性校验失败", nil)
+			}
+			projected.EventEvidence = eventEvidence
 			page.Items[len(page.Items)-1].Insights[i] = projected
 		}
 	}
@@ -365,6 +392,34 @@ func (s *Store) ListTaskBriefsV1(
 		return TaskBriefPageV1{}, briefFeedDBError("提交任务简报读取", err)
 	}
 	return page, nil
+}
+
+func projectTaskBriefEventEvidenceV1(
+	insight types.InsightV1,
+) (*TaskBriefEventEvidenceV1, error) {
+	if insight.EventEvidence == nil {
+		return nil, nil
+	}
+	sources, err := types.ProjectInsightEvidenceSourcesV1(insight)
+	if err != nil {
+		return nil, err
+	}
+	projected := &TaskBriefEventEvidenceV1{
+		SchemaVersion: insight.EventEvidence.SchemaVersion,
+		Sources: make(
+			[]TaskBriefEvidenceSourceV1,
+			len(sources),
+		),
+	}
+	for index, source := range sources {
+		projected.Sources[index] = TaskBriefEvidenceSourceV1{
+			Ref: source.Ref, Title: source.Title,
+			SourceTitle: source.SourceTitle, Platform: source.Platform,
+			SourceURL: source.SourceURL, PublishedAt: source.PublishedAt,
+			DiscoveredAt: source.DiscoveredAt,
+		}
+	}
+	return projected, nil
 }
 
 func projectTaskBriefStructuredInsightV1(

@@ -2,7 +2,9 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -412,18 +414,48 @@ func TestCanonicalBriefShadowPanicDoesNotBlockLegacyRender(t *testing.T) {
 
 func TestCanonicalBriefAuthorityProjectsFrozenStructuredInsight(t *testing.T) {
 	const deliveryID int64 = 301
+	structured, err := types.SealStructuredInsightEvidenceV1(
+		types.StructuredInsightV1{
+			SchemaVersion:    types.StructuredInsightSchemaVersionV1,
+			BodyMD:           "compatible body",
+			WhatChanged:      "frozen change",
+			WhyItMatters:     "frozen relevance",
+			ImportanceReason: "frozen evidence",
+			Claims: []types.StructuredClaimV1{{
+				Text: "claim", Excerpt: "shared excerpt",
+				SourceRefs: []string{"source-1"},
+			}},
+		},
+		map[string]string{"source-1": "shared excerpt"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := types.SealObservedEventProvenanceV1(
+		7, strings.Repeat("a", 64), strings.Repeat("b", 64),
+		"release", "subject", time.Unix(3, 0).UTC(),
+		json.RawMessage(`{"evidence_content_ids":[301]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	insight := types.InsightV1{
 		ID: deliveryID, RankPosition: 1,
 		Title: "canonical title", BodyMD: "compatible body",
 		SourceTitle:  "Frozen Source",
 		SourceURL:    "https://example.com/item",
 		DiscoveredAt: time.Unix(1, 0).UTC(),
-		Structured: &types.StructuredInsightV1{
-			SchemaVersion:    types.StructuredInsightSchemaVersionV1,
-			BodyMD:           "compatible body",
-			WhatChanged:      "frozen change",
-			WhyItMatters:     "frozen relevance",
-			ImportanceReason: "frozen evidence",
+		Structured:   &structured,
+		EventEvidence: &types.StructuredEventEvidenceV1{
+			SchemaVersion:  types.StructuredEventEvidenceSchemaVersionV1,
+			Provenance:     provenance,
+			EvidenceDigest: structured.EvidenceDigest,
+			Sources: []types.StructuredEvidenceSourceV1{{
+				Ref: "source-1", Title: "frozen source item",
+				SourceTitle: "Frozen Evidence", Platform: "web",
+				SourceURL:    "https://evidence.example/item",
+				DiscoveredAt: time.Unix(2, 0).UTC(),
+			}},
 		},
 	}
 	a := &Activities{
@@ -448,7 +480,11 @@ func TestCanonicalBriefAuthorityProjectsFrozenStructuredInsight(t *testing.T) {
 	if len(items) != 1 ||
 		items[0].input.BodyMD !=
 			feedback.CanonicalInsightBodyMDV1(insight) ||
-		items[0].input.BodyMD == insight.BodyMD {
+		items[0].input.BodyMD == insight.BodyMD ||
+		len(items[0].input.EvidenceSources) != 1 ||
+		items[0].input.EvidenceSources[0].Ref != "source-1" ||
+		items[0].input.EvidenceSources[0].SourceURL !=
+			"https://evidence.example/item" {
 		t.Fatalf("structured authority items = %+v", items)
 	}
 	if meta.BatchID != 401 || meta.TotalItems != 1 ||

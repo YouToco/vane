@@ -307,6 +307,59 @@ type StructuredEventEvidenceV1 struct {
 	Sources        []StructuredEvidenceSourceV1 `json:"sources"`
 }
 
+// EvidenceSourceProjectionV1 is the channel-safe, inventory-owned subset of a
+// frozen event source. It intentionally excludes provenance, digests,
+// database IDs and raw evidence bodies.
+type EvidenceSourceProjectionV1 struct {
+	Ref          string
+	Title        string
+	SourceTitle  string
+	Platform     string
+	SourceURL    string
+	PublishedAt  *time.Time
+	DiscoveredAt time.Time
+}
+
+// ProjectInsightEvidenceSourcesV1 is the single cross-channel integrity seam
+// for P2-C. Legacy Insights return (nil, nil); a present but malformed
+// extension returns an error so authoritative readers can fail closed.
+func ProjectInsightEvidenceSourcesV1(
+	insight InsightV1,
+) ([]EvidenceSourceProjectionV1, error) {
+	if insight.EventEvidence == nil {
+		return nil, nil
+	}
+	structured := insight.Structured
+	eventEvidence := insight.EventEvidence
+	if structured == nil ||
+		structured.Validate() != nil ||
+		eventEvidence.Validate() != nil ||
+		structured.EvidenceDigest == "" ||
+		!equalBriefDigest(
+			structured.EvidenceDigest, eventEvidence.EvidenceDigest) ||
+		!structuredEventEvidenceRefsResolveV1(
+			structured, eventEvidence) {
+		return nil, errors.New(
+			"structured event evidence projection is invalid")
+	}
+	sources := make(
+		[]EvidenceSourceProjectionV1, len(eventEvidence.Sources))
+	for index, source := range eventEvidence.Sources {
+		var publishedAt *time.Time
+		if source.PublishedAt != nil {
+			published := *source.PublishedAt
+			publishedAt = &published
+		}
+		sources[index] = EvidenceSourceProjectionV1{
+			Ref: source.Ref, Title: source.Title,
+			SourceTitle: source.SourceTitle, Platform: source.Platform,
+			SourceURL: source.SourceURL, PublishedAt: publishedAt,
+			DiscoveredAt: source.DiscoveredAt,
+		}
+	}
+	return sources, nil
+}
+
 func (e StructuredEventEvidenceV1) Validate() error {
 	if e.SchemaVersion != StructuredEventEvidenceSchemaVersionV1 ||
 		e.Provenance.Validate() != nil ||
@@ -614,7 +667,9 @@ func (d BriefDraftV1) Validate() error {
 				!equalBriefDigest(
 					insight.EventEvidence.EvidenceDigest,
 					insight.Structured.EvidenceDigest,
-				) {
+				) ||
+				!structuredEventEvidenceRefsResolveV1(
+					insight.Structured, insight.EventEvidence) {
 				return errors.New("brief structured event evidence is invalid")
 			}
 		}
@@ -639,6 +694,30 @@ func (d BriefDraftV1) Validate() error {
 		return errors.New("brief payload is too large")
 	}
 	return nil
+}
+
+// structuredEventEvidenceRefsResolveV1 binds every model-owned opaque claim
+// reference to one exact inventory-owned source frozen in the same Insight.
+// Phase 2-A Briefs have no event evidence extension and remain compatible.
+func structuredEventEvidenceRefsResolveV1(
+	structured *StructuredInsightV1,
+	eventEvidence *StructuredEventEvidenceV1,
+) bool {
+	if structured == nil || eventEvidence == nil {
+		return false
+	}
+	refs := make(map[string]struct{}, len(eventEvidence.Sources))
+	for _, source := range eventEvidence.Sources {
+		refs[source.Ref] = struct{}{}
+	}
+	for _, claim := range structured.Claims {
+		for _, ref := range claim.SourceRefs {
+			if _, ok := refs[ref]; !ok {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (d BriefDraftV1) RequestDigest() (string, error) {
