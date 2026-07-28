@@ -554,29 +554,37 @@ export interface ProfileClaimEvent {
 
 export interface ProfileClaimsResponse {
   version: number;
+  // Phase C authority. Older backends may omit these fields during the
+  // ordered rollout; callers must fail closed instead of guessing epoch 0.
+  profile_epoch?: number;
+  restore_allowed?: boolean;
   claims: ProfileClaim[];
   events: ProfileClaimEvent[];
   events_has_more?: boolean;
   events_next_cursor?: string;
 }
 
-export type ProfileClaimActionRequest =
-  | {
-      expected_version: number;
+type ProfileClaimActionAuthority = {
+  expected_epoch: number;
+  expected_version: number;
+};
+
+export type ProfileClaimActionRequest = ProfileClaimActionAuthority &
+  (
+    | {
       action: "correct";
       claim_id: string;
       value: string;
     }
-  | {
-      expected_version: number;
+    | {
       action: "suppress" | "pin";
       claim_id: string;
     }
-  | {
-      expected_version: number;
+    | {
       action: "revoke";
       event_id: string;
-    };
+    }
+  );
 
 export interface ProfileClaimActionResponse {
   version: number;
@@ -584,6 +592,30 @@ export interface ProfileClaimActionResponse {
   profile: Profile;
   claims: ProfileClaim[];
   claims_complete?: boolean;
+}
+
+export type ProfileEpochActionRequest =
+  | {
+      expected_epoch: number;
+      expected_version: number;
+      action: "reset";
+      scope: "history_learning";
+    }
+  | {
+      expected_epoch: number;
+      expected_version: number;
+      action: "restore";
+    };
+
+export interface ProfileEpochActionResponse {
+  action: "reset" | "restore";
+  profile_epoch: number;
+  version: number;
+  event_id: string;
+  profile: Profile;
+  // This is server authority, not a condition the browser may derive from
+  // timestamps, empty claims, or the action that just completed.
+  restore_allowed: boolean;
 }
 
 // ---- 平台管理：邀请码 ----
@@ -1030,6 +1062,12 @@ export const api = {
         typeof r.events_next_cursor === "string" && r.events_next_cursor.length > 0
           ? r.events_next_cursor
           : undefined,
+      profile_epoch:
+        Number.isSafeInteger(r.profile_epoch) && Number(r.profile_epoch) >= 0
+          ? r.profile_epoch
+          : undefined,
+      restore_allowed:
+        typeof r.restore_allowed === "boolean" ? r.restore_allowed : undefined,
     })),
   applyProfileClaimAction: (
     input: ProfileClaimActionRequest,
@@ -1050,6 +1088,26 @@ export const api = {
         removed_tags: arr(r.profile.removed_tags),
       },
       claims: arr(r.claims).map(normalizeProfileClaim),
+    })),
+  applyProfileEpochAction: (
+    input: ProfileEpochActionRequest,
+    idempotencyKey: string,
+  ) =>
+    request<ProfileEpochActionResponse>("/api/profile/epochs/actions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(input),
+    }).then((r) => ({
+      ...r,
+      profile: {
+        ...r.profile,
+        tags: arr(r.profile.tags),
+        removed_tags: arr(r.profile.removed_tags),
+      },
+      restore_allowed: r.restore_allowed === true,
     })),
 
   // ---- 平台管理：邀请码（requirePlatformOwner 门控，非 owner 一律 404）----

@@ -123,6 +123,8 @@ describe("profile API contract", () => {
         new Response(
           JSON.stringify({
             version: 4,
+            profile_epoch: 7,
+            restore_allowed: true,
             claims: [
               {
                 id: "claim-1",
@@ -178,6 +180,8 @@ describe("profile API contract", () => {
     );
     expect(result).toMatchObject({
       version: 4,
+      profile_epoch: 7,
+      restore_allowed: true,
       events: [{ id: "event-1", revoked: false, revocable: false }],
       events_has_more: false,
     });
@@ -248,6 +252,7 @@ describe("profile API contract", () => {
 
     const result = await api.applyProfileClaimAction(
       {
+        expected_epoch: 7,
         expected_version: 4,
         action: "correct",
         claim_id: "claim/1",
@@ -266,6 +271,7 @@ describe("profile API contract", () => {
           "Idempotency-Key": "profile-claim-123",
         },
         body: JSON.stringify({
+          expected_epoch: 7,
           expected_version: 4,
           action: "correct",
           claim_id: "claim/1",
@@ -277,5 +283,99 @@ describe("profile API contract", () => {
       state: "source_unavailable",
     });
     expect(result.claims_complete).toBe(false);
+  });
+
+  test("reset carries epoch CAS, fixed scope, and the supplied idempotency key", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          action: "reset",
+          profile_epoch: 8,
+          version: 5,
+          event_id: "epoch-event-1",
+          profile: { ...profile, tags: null, removed_tags: null },
+          restore_allowed: true,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.applyProfileEpochAction(
+      {
+        expected_epoch: 7,
+        expected_version: 4,
+        action: "reset",
+        scope: "history_learning",
+      },
+      "profile-epoch-reset-123",
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/profile/epochs/actions",
+      expect.objectContaining({
+        credentials: "include",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "profile-epoch-reset-123",
+        },
+        body: JSON.stringify({
+          expected_epoch: 7,
+          expected_version: 4,
+          action: "reset",
+          scope: "history_learning",
+        }),
+      }),
+    );
+    expect(result).toMatchObject({
+      action: "reset",
+      profile_epoch: 8,
+      version: 5,
+      event_id: "epoch-event-1",
+      restore_allowed: true,
+      profile: { tags: [], removed_tags: [] },
+    });
+  });
+
+  test("restore sends no reset scope and keeps false server authority", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          action: "restore",
+          profile_epoch: 9,
+          version: 6,
+          event_id: "epoch-event-2",
+          profile,
+          restore_allowed: false,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.applyProfileEpochAction(
+      {
+        expected_epoch: 8,
+        expected_version: 5,
+        action: "restore",
+      },
+      "profile-epoch-restore-123",
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/profile/epochs/actions",
+      expect.objectContaining({
+        body: JSON.stringify({
+          expected_epoch: 8,
+          expected_version: 5,
+          action: "restore",
+        }),
+      }),
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).not.toHaveProperty(
+      "scope",
+    );
+    expect(result.restore_allowed).toBe(false);
   });
 });

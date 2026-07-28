@@ -9,6 +9,8 @@ import type {
   ProfileClaimField,
   ProfileClaimsResponse,
   ProfileEdit,
+  ProfileEpochActionRequest,
+  ProfileEpochActionResponse,
   UpdateProfileRequest,
 } from "../api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -41,6 +43,7 @@ import {
   X,
 } from "lucide-react";
 import { fmt, useI18n } from "@/i18n";
+import { profileEpochCopy } from "@/i18n/profile-epoch";
 import { fmtBeijing } from "@/lib/time";
 import { cn } from "@/lib/utils";
 
@@ -80,8 +83,8 @@ function hasControlCharacter(value: string): boolean {
   return /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(value);
 }
 
-type WithoutExpectedVersion<T> = T extends unknown
-  ? Omit<T, "expected_version">
+type WithoutClaimAuthority<T> = T extends unknown
+  ? Omit<T, "expected_epoch" | "expected_version">
   : never;
 
 function evidenceRange(ref?: string): string {
@@ -137,9 +140,24 @@ function mergeProfileClaimPage(
   };
 }
 
+export function retireProfileClaims(
+  _current: ProfileClaimsResponse,
+  response: ProfileEpochActionResponse,
+): ProfileClaimsResponse {
+  return {
+    profile_epoch: response.profile_epoch,
+    version: response.version,
+    restore_allowed: response.restore_allowed,
+    claims: [],
+    events: [],
+    events_has_more: false,
+  };
+}
+
 export default function Profile() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const P = t.app.profile;
+  const E = profileEpochCopy(locale);
   const industryID = useId();
   const occupationID = useId();
   const tagInputID = useId();
@@ -147,6 +165,14 @@ export default function Profile() {
   loadFailedRef.current = t.app.common.loadFailed;
   const saveIntent = useRef<{ signature: string; key: string } | null>(null);
   const claimIntents = useRef(new Map<string, string>());
+  const epochIntent = useRef<{ signature: string; key: string } | null>(null);
+  const epochResetTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const epochRestoreTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const epochCancelRef = useRef<HTMLButtonElement | null>(null);
+  const conflictReloadRef = useRef<HTMLButtonElement | null>(null);
+  const epochNoticeRef = useRef<HTMLDivElement | null>(null);
+  const epochReturnFocus = useRef<"" | "reset" | "restore">("");
+  const shouldRestoreEpochFocus = useRef(false);
   const claimLoadEpoch = useRef(0);
   const [profile, setProfile] = useState<ProfileData | null>(null);
   const [draft, setDraft] = useState<EditableProfile | null>(null);
@@ -159,6 +185,9 @@ export default function Profile() {
   const [olderClaimsLoading, setOlderClaimsLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [claimActionID, setClaimActionID] = useState("");
+  const [epochAction, setEpochAction] = useState<"" | "reset" | "restore">("");
+  const [epochConfirm, setEpochConfirm] = useState<"" | "reset" | "restore">("");
+  const [epochNotice, setEpochNotice] = useState("");
   const [correctingClaimID, setCorrectingClaimID] = useState("");
   const [correctionValue, setCorrectionValue] = useState("");
   const [loadError, setLoadError] = useState("");
@@ -291,6 +320,18 @@ export default function Profile() {
     () => (profile && effectiveDraft ? buildUpdate(profile, effectiveDraft) : null),
     [effectiveDraft, profile],
   );
+  const epochAuthorityReady =
+    claims !== null &&
+    Number.isSafeInteger(claims.profile_epoch) &&
+    Number(claims.profile_epoch) >= 0 &&
+    Number.isSafeInteger(claims.version) &&
+    claims.version >= 0;
+  const claimMutationsLocked =
+    conflict ||
+    claimsLoading ||
+    Boolean(claimActionID) ||
+    Boolean(epochAction) ||
+    Boolean(epochConfirm);
   const tagValidation = useMemo(() => {
     if (!effectiveDraft || !profile) return "";
     if (hasControlCharacter(tagInput)) return P.invalidTagControl;
@@ -318,7 +359,23 @@ export default function Profile() {
 
   function requestReload() {
     if (update && !window.confirm(P.confirmReload)) return;
+    epochIntent.current = null;
+    shouldRestoreEpochFocus.current = false;
+    epochReturnFocus.current = "";
+    setEpochConfirm("");
+    setEpochNotice("");
     reload();
+  }
+
+  function openEpochConfirmation(action: "reset" | "restore") {
+    epochReturnFocus.current = action;
+    shouldRestoreEpochFocus.current = false;
+    setEpochConfirm(action);
+  }
+
+  function closeEpochConfirmation() {
+    shouldRestoreEpochFocus.current = true;
+    setEpochConfirm("");
   }
 
   function idempotencyKey(prefix: string): string {
@@ -371,13 +428,24 @@ export default function Profile() {
   }
 
   async function applyClaimAction(
-    input: WithoutExpectedVersion<ProfileClaimActionRequest>,
+    input: WithoutClaimAuthority<ProfileClaimActionRequest>,
     intentID: string,
   ) {
-    if (!claims || claimActionID) return;
+    if (
+      !claims ||
+      !epochAuthorityReady ||
+      conflict ||
+      claimsLoading ||
+      claimActionID ||
+      epochAction ||
+      epochConfirm
+    ) {
+      return;
+    }
     if (update && !window.confirm(P.confirmClaimDirty)) return;
     const request = {
       ...input,
+      expected_epoch: claims.profile_epoch as number,
       expected_version: claims.version,
     } as ProfileClaimActionRequest;
     const signature = JSON.stringify(request);
@@ -408,6 +476,121 @@ export default function Profile() {
       setClaimActionID("");
     }
   }
+
+  async function applyEpochAction(action: "reset" | "restore") {
+    if (
+      !claims ||
+      !epochAuthorityReady ||
+      epochAction ||
+      conflict ||
+      claimsLoading ||
+      claimActionID ||
+      update ||
+      (action === "restore" && claims.restore_allowed !== true)
+    ) {
+      return;
+    }
+    const authority = {
+      expected_epoch: claims.profile_epoch as number,
+      expected_version: claims.version,
+    };
+    const request: ProfileEpochActionRequest =
+      action === "reset"
+        ? {
+            ...authority,
+            action: "reset",
+            scope: "history_learning",
+          }
+        : {
+            ...authority,
+            action: "restore",
+          };
+    const signature = JSON.stringify(request);
+    if (!epochIntent.current || epochIntent.current.signature !== signature) {
+      epochIntent.current = {
+        signature,
+        key: idempotencyKey(`profile-epoch-${action}`),
+      };
+    }
+
+    setEpochAction(action);
+    setMutationError("");
+    setConflict(false);
+    setSaved(false);
+    setEpochNotice("");
+    try {
+      const response = await api.applyProfileEpochAction(
+        request,
+        epochIntent.current.key,
+      );
+      if (response.action !== action) throw new Error("profile epoch action mismatch");
+      epochIntent.current = null;
+      shouldRestoreEpochFocus.current = false;
+      epochReturnFocus.current = "";
+      setEpochConfirm("");
+      setEpochNotice(action === "reset" ? E.resetDone : E.restoreDone);
+      setProfile(response.profile);
+      setDraft(editableFrom(response.profile));
+      setTagInput("");
+      // Invalidate any old-epoch pagination synchronously with the authority
+      // transition. Waiting for reload()'s effect would leave a race where an
+      // in-flight old page could merge retired facts back into the new epoch.
+      claimLoadEpoch.current += 1;
+      setOlderClaimsLoading(false);
+      setOlderClaimsError("");
+      // Retire the old epoch's claim/event projection immediately. Keeping
+      // those rows while swapping only their authority would let a fast click
+      // address an inactive-epoch claim with the new epoch token.
+      setClaims((current) =>
+        current ? retireProfileClaims(current, response) : current,
+      );
+      // The action response intentionally does not duplicate current claims or
+      // events. Reload all three profile projections after committing the
+      // returned authority instead of pretending the old list is current.
+      reload();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        epochIntent.current = null;
+        shouldRestoreEpochFocus.current = false;
+        epochReturnFocus.current = "";
+        setEpochConfirm("");
+        setConflict(true);
+      } else {
+        setMutationError(err instanceof ApiError ? err.message : E.epochActionFailed);
+      }
+    } finally {
+      setEpochAction("");
+    }
+  }
+
+  useEffect(() => {
+    if (epochConfirm) {
+      epochCancelRef.current?.focus();
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (event.key !== "Escape" || epochAction) return;
+        event.preventDefault();
+        closeEpochConfirmation();
+      };
+      document.addEventListener("keydown", onKeyDown);
+      return () => document.removeEventListener("keydown", onKeyDown);
+    }
+    if (!shouldRestoreEpochFocus.current) return;
+    shouldRestoreEpochFocus.current = false;
+    const target =
+      epochReturnFocus.current === "restore"
+        ? epochRestoreTriggerRef.current
+        : epochResetTriggerRef.current;
+    epochReturnFocus.current = "";
+    target?.focus();
+  }, [epochAction, epochConfirm]);
+
+  useEffect(() => {
+    if (conflict) conflictReloadRef.current?.focus();
+  }, [conflict]);
+
+  useEffect(() => {
+    if (epochNotice) epochNoticeRef.current?.focus();
+  }, [epochNotice]);
 
   async function loadOlderClaimEvents() {
     const cursor = claims?.events_next_cursor;
@@ -504,7 +687,7 @@ export default function Profile() {
           variant="outline"
           size="sm"
           onClick={requestReload}
-          disabled={loading || saving || Boolean(claimActionID)}
+          disabled={loading || saving || Boolean(claimActionID) || Boolean(epochAction)}
           aria-label={P.reload}
         >
           {loading ? (
@@ -525,7 +708,12 @@ export default function Profile() {
         <Alert variant="destructive" role="alert">
           <AlertDescription className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <span>{P.conflict}</span>
-            <Button size="sm" variant="outline" onClick={requestReload}>
+            <Button
+              ref={conflictReloadRef}
+              size="sm"
+              variant="outline"
+              onClick={requestReload}
+            >
               <RefreshCw className="size-4" />
               {P.reload}
             </Button>
@@ -540,6 +728,11 @@ export default function Profile() {
       {saved && (
         <Alert role="status">
           <AlertDescription>{P.saved}</AlertDescription>
+        </Alert>
+      )}
+      {epochNotice && (
+        <Alert ref={epochNoticeRef} role="status" tabIndex={-1}>
+          <AlertDescription>{epochNotice}</AlertDescription>
         </Alert>
       )}
 
@@ -686,6 +879,143 @@ export default function Profile() {
           </Card>
           )}
 
+          {!notGenerated && (
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="flex flex-wrap items-center gap-2 text-base">
+                  <RotateCcw className="size-4" />
+                  {E.learningResetTitle}
+                  {epochAuthorityReady && (
+                    <Badge variant="outline">
+                      {fmt(E.currentEpoch, { epoch: claims.profile_epoch as number })}
+                    </Badge>
+                  )}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="space-y-1 text-sm text-muted-foreground">
+                  <p>{E.learningResetNote}</p>
+                  <p>{E.epochAuditNote}</p>
+                </div>
+
+                {claimsLoading ? (
+                  <Skeleton className="h-10 w-full" />
+                ) : !epochAuthorityReady ? (
+                  <Alert role="status">
+                    <AlertDescription className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <span>{E.epochUnavailable}</span>
+                      <Button size="sm" variant="outline" onClick={requestReload}>
+                        <RefreshCw className="size-4" />
+                        {P.reload}
+                      </Button>
+                    </AlertDescription>
+                  </Alert>
+                ) : epochConfirm ? (
+                  <div
+                    role="alertdialog"
+                    aria-label={
+                      epochConfirm === "reset" ? E.resetConfirmTitle : E.restoreConfirmTitle
+                    }
+                    className="space-y-4 rounded-lg border border-destructive/40 bg-destructive/5 p-4"
+                  >
+                    <div className="space-y-1">
+                      <p className="font-medium">
+                        {epochConfirm === "reset"
+                          ? E.resetConfirmTitle
+                          : E.restoreConfirmTitle}
+                      </p>
+                      <p className="text-sm text-muted-foreground">
+                        {epochConfirm === "reset"
+                          ? E.resetConfirmNote
+                          : E.restoreConfirmNote}
+                      </p>
+                    </div>
+                    <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        ref={epochCancelRef}
+                        onClick={closeEpochConfirmation}
+                        disabled={Boolean(epochAction)}
+                      >
+                        {E.cancelEpochAction}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant={epochConfirm === "reset" ? "destructive" : "default"}
+                        onClick={() => void applyEpochAction(epochConfirm)}
+                        disabled={
+                          Boolean(epochAction) ||
+                          Boolean(update) ||
+                          conflict ||
+                          claimsLoading
+                        }
+                      >
+                        {epochAction === epochConfirm && (
+                          <Loader2 className="size-4 animate-spin" />
+                        )}
+                        {epochConfirm === "reset"
+                          ? E.confirmReset
+                          : E.confirmRestore}
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {update && (
+                      <p className="text-sm text-destructive" role="status">
+                        {E.epochDirty}
+                      </p>
+                    )}
+                    <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+                      <Button
+                        type="button"
+                        variant="destructive"
+                        ref={epochResetTriggerRef}
+                        onClick={() => openEpochConfirmation("reset")}
+                        disabled={
+                          Boolean(update) ||
+                          saving ||
+                          Boolean(claimActionID) ||
+                          Boolean(epochAction) ||
+                          conflict ||
+                          claimsLoading
+                        }
+                      >
+                        <RotateCcw className="size-4" />
+                        {E.resetLearning}
+                      </Button>
+                      {claims.restore_allowed === true && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          ref={epochRestoreTriggerRef}
+                          onClick={() => openEpochConfirmation("restore")}
+                          disabled={
+                            Boolean(update) ||
+                            saving ||
+                            Boolean(claimActionID) ||
+                            Boolean(epochAction) ||
+                            conflict ||
+                            claimsLoading
+                          }
+                        >
+                          <History className="size-4" />
+                          {E.restoreLearning}
+                        </Button>
+                      )}
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {claims.restore_allowed === true
+                        ? E.restoreAvailable
+                        : E.restoreUnavailable}
+                    </p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="flex items-center gap-2 text-base">
@@ -715,7 +1045,7 @@ export default function Profile() {
               ) : (
                 <ol className="space-y-3">
                   {claims.claims.map((claim) => {
-                    const canCorrect = claim.active;
+                    const canCorrect = claim.active && epochAuthorityReady;
                     const isCorrecting = correctingClaimID === claim.id;
                     const correctionLimit =
                       claim.field === "summary" ? 240 : claim.field === "tag" ? 20 : 200;
@@ -747,7 +1077,7 @@ export default function Profile() {
                               {claimSource(claim)}
                             </p>
                           </div>
-                          {claim.active && (
+                          {claim.active && epochAuthorityReady && (
                             <div className="flex w-full flex-wrap gap-2 sm:w-auto sm:shrink-0">
                               {canCorrect && (
                                 <Button
@@ -757,7 +1087,7 @@ export default function Profile() {
                                     setCorrectingClaimID(isCorrecting ? "" : claim.id);
                                     setCorrectionValue(isCorrecting ? "" : claim.value);
                                   }}
-                                  disabled={Boolean(claimActionID)}
+                                  disabled={claimMutationsLocked}
                                 >
                                   <Pencil className="size-4" />
                                   {P.claimCorrect}
@@ -772,7 +1102,7 @@ export default function Profile() {
                                     `suppress-${claim.id}`,
                                   )
                                 }
-                                disabled={Boolean(claimActionID)}
+                                disabled={claimMutationsLocked}
                               >
                                 {claimActionID === `suppress-${claim.id}` ? (
                                   <Loader2 className="size-4 animate-spin" />
@@ -791,7 +1121,7 @@ export default function Profile() {
                                       `pin-${claim.id}`,
                                     )
                                   }
-                                  disabled={Boolean(claimActionID)}
+                                  disabled={claimMutationsLocked}
                                 >
                                   {claimActionID === `pin-${claim.id}` ? (
                                     <Loader2 className="size-4 animate-spin" />
@@ -818,7 +1148,7 @@ export default function Profile() {
                                 onChange={(event) => setCorrectionValue(event.target.value)}
                                 aria-invalid={correctionTooLong || undefined}
                                 maxLength={correctionLimit}
-                                disabled={Boolean(claimActionID)}
+                                disabled={claimMutationsLocked}
                               />
                               <Button
                                 onClick={() =>
@@ -834,7 +1164,7 @@ export default function Profile() {
                                 disabled={
                                   !correctionValue.trim() ||
                                   correctionTooLong ||
-                                  Boolean(claimActionID)
+                                  claimMutationsLocked
                                 }
                               >
                                 {claimActionID === `correct-${claim.id}` ? (
@@ -902,7 +1232,7 @@ export default function Profile() {
                               {fmtBeijing(event.created_at)}
                             </p>
                           </div>
-                          {event.revocable && (
+                          {event.revocable && epochAuthorityReady && (
                             <Button
                               size="sm"
                               variant="outline"
@@ -912,7 +1242,7 @@ export default function Profile() {
                                   `revoke-${event.id}`,
                                 )
                               }
-                              disabled={Boolean(claimActionID)}
+                              disabled={claimMutationsLocked}
                             >
                               {claimActionID === `revoke-${event.id}` ? (
                                 <Loader2 className="size-4 animate-spin" />

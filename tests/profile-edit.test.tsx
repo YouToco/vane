@@ -2,6 +2,7 @@
 
 import React from "react";
 import {
+  act,
   cleanup,
   render,
   screen,
@@ -17,6 +18,7 @@ const apiMock = vi.hoisted(() => ({
   updateProfile: vi.fn(),
   undoProfileEdit: vi.fn(),
   applyProfileClaimAction: vi.fn(),
+  applyProfileEpochAction: vi.fn(),
 }));
 
 vi.mock("@/api", () => ({
@@ -37,6 +39,26 @@ const copy = {
   confirmReload: "确认重新加载",
   confirmUndoDirty: "确认撤销并放弃草稿",
   confirmClaimDirty: "确认操作依据并放弃草稿",
+  learningResetTitle: "学习版本",
+  learningResetNote: "重置说明",
+  epochAuditNote: "旧记录只读审计",
+  currentEpoch: "当前版本 {epoch}",
+  epochUnavailable: "无法读取学习版本",
+  resetLearning: "重置历史学习",
+  restoreLearning: "恢复上一次重置",
+  restoreAvailable: "当前可以恢复",
+  restoreUnavailable: "当前不能恢复",
+  resetConfirmTitle: "确认重置历史学习？",
+  resetConfirmNote: "确认重置说明",
+  restoreConfirmTitle: "确认恢复重置前的画像？",
+  restoreConfirmNote: "确认恢复说明",
+  cancelEpochAction: "取消学习版本操作",
+  confirmReset: "确认重置",
+  confirmRestore: "确认恢复",
+  resetDone: "已清除历史学习，将仅从此后的反馈重新学习。",
+  restoreDone: "已恢复重置前的画像，并进入新的学习版本。",
+  epochDirty: "请先处理未保存修改",
+  epochActionFailed: "学习版本操作失败",
   claimsTitle: "画像依据",
   claimsNote: "依据说明",
   loadingClaims: "加载画像依据",
@@ -114,6 +136,7 @@ const copy = {
 
 vi.mock("@/i18n", () => ({
   useI18n: () => ({
+    locale: "zh",
     t: {
       app: {
         profile: copy,
@@ -169,8 +192,8 @@ vi.mock("@/components/ui/collapsible", () => ({
   CollapsibleContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
 }));
 
-import Profile from "@/pages/Profile";
-import { ApiError } from "@/api";
+import Profile, { retireProfileClaims } from "@/pages/Profile";
+import { ApiError, type ProfileClaimsResponse } from "@/api";
 
 const baseProfile = {
   industry: "AI",
@@ -186,6 +209,14 @@ function pageText(): string {
   return document.body.textContent ?? "";
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 async function renderLoaded() {
   const user = userEvent.setup();
   const view = render(<Profile />);
@@ -196,6 +227,46 @@ async function renderLoaded() {
 function button(label: string): HTMLButtonElement {
   return screen.getByRole("button", { name: label }) as HTMLButtonElement;
 }
+
+test("retires every claim and event when an epoch action succeeds", () => {
+  const retired = retireProfileClaims(
+    {
+      profile_epoch: 7,
+      version: 3,
+      restore_allowed: false,
+      claims: [claim({ id: "old-claim", value: "旧依据" })],
+      events: [
+        {
+          id: "old-event",
+          kind: "pin",
+          target_claim_id: "old-claim",
+          created_at: "2026-07-27T02:00:00Z",
+          revoked: false,
+          revocable: true,
+        },
+      ],
+      events_has_more: true,
+      events_next_cursor: "old-cursor",
+    },
+    {
+      action: "reset",
+      profile_epoch: 8,
+      version: 4,
+      event_id: "epoch-event",
+      profile: baseProfile,
+      restore_allowed: true,
+    },
+  );
+
+  expect(retired).toEqual({
+    profile_epoch: 8,
+    version: 4,
+    restore_allowed: true,
+    claims: [],
+    events: [],
+    events_has_more: false,
+  });
+});
 
 function claim(
   overrides: Record<string, unknown> = {},
@@ -224,6 +295,8 @@ describe("profile claim authority UI", () => {
     apiMock.profileEdits.mockResolvedValue({ edits: [] });
     apiMock.profileClaims.mockResolvedValue({
       version: 3,
+      profile_epoch: 7,
+      restore_allowed: false,
       claims: [],
       events: [],
     });
@@ -233,6 +306,14 @@ describe("profile claim authority UI", () => {
       event_id: "event-1",
       profile: baseProfile,
       claims: [],
+    });
+    apiMock.applyProfileEpochAction.mockResolvedValue({
+      action: "reset",
+      profile_epoch: 8,
+      version: 4,
+      event_id: "epoch-event-1",
+      profile: baseProfile,
+      restore_allowed: true,
     });
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
@@ -292,9 +373,295 @@ describe("profile claim authority UI", () => {
     expect(apiMock.profileClaims).toHaveBeenCalledTimes(1);
   });
 
+  test("fails closed when the read response has no epoch authority", async () => {
+    apiMock.profileClaims.mockResolvedValue({
+      version: 2,
+      claims: [claim()],
+      events: [
+        {
+          id: "event-no-epoch",
+          kind: "pin",
+          target_claim_id: "claim-1",
+          created_at: "2026-07-27T02:00:00Z",
+          revoked: false,
+          revocable: true,
+        },
+      ],
+    });
+
+    await renderLoaded();
+
+    await screen.findByText("暂时无法读取当前学习版本，请重新加载后再试。");
+    expect(screen.queryByRole("button", { name: "重置历史学习" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "恢复上一次重置" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "纠正" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "排除" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "固定" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "撤销此操作" })).toBeNull();
+    expect(apiMock.applyProfileEpochAction).not.toHaveBeenCalled();
+    expect(apiMock.applyProfileClaimAction).not.toHaveBeenCalled();
+  });
+
+  test("requires an explicit second confirmation and cancel sends no request", async () => {
+    const { user } = await renderLoaded();
+
+    await user.click(await screen.findByRole("button", { name: "重置历史学习" }));
+    expect(screen.getByRole("alertdialog", { name: "确认重置历史学习？" })).toBeTruthy();
+    expect(apiMock.applyProfileEpochAction).not.toHaveBeenCalled();
+
+    const cancel = button("取消");
+    await waitFor(() => expect(document.activeElement).toBe(cancel));
+    await user.click(cancel);
+    expect(
+      screen.queryByRole("alertdialog", { name: "确认重置历史学习？" }),
+    ).toBeNull();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(button("重置历史学习")),
+    );
+    expect(apiMock.applyProfileEpochAction).not.toHaveBeenCalled();
+  });
+
+  test("Escape closes the restore confirmation and returns focus to its trigger", async () => {
+    apiMock.profileClaims.mockResolvedValue({
+      version: 9,
+      profile_epoch: 8,
+      restore_allowed: true,
+      claims: [],
+      events: [],
+    });
+    const { user } = await renderLoaded();
+
+    await user.click(await screen.findByRole("button", { name: "恢复上一次重置" }));
+    await waitFor(() => expect(document.activeElement).toBe(button("取消")));
+    await user.keyboard("{Escape}");
+
+    expect(
+      screen.queryByRole("alertdialog", { name: "确认恢复重置前的画像？" }),
+    ).toBeNull();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(button("恢复上一次重置")),
+    );
+    expect(apiMock.applyProfileEpochAction).not.toHaveBeenCalled();
+  });
+
+  test("resets with exact epoch authority and refreshes projections after success", async () => {
+    apiMock.profileClaims
+      .mockResolvedValueOnce({
+        version: 3,
+        profile_epoch: 7,
+        restore_allowed: false,
+        claims: [claim({ id: "old-reset-claim", value: "旧 reset 依据" })],
+        events: [
+          {
+            id: "old-reset-event",
+            kind: "pin",
+            target_claim_id: "old-reset-claim",
+            created_at: "2026-07-27T02:00:00Z",
+            revoked: false,
+            revocable: true,
+          },
+        ],
+      })
+      .mockReturnValueOnce(new Promise(() => {}));
+    const { user } = await renderLoaded();
+
+    await screen.findByText("旧 reset 依据");
+    await user.click(await screen.findByRole("button", { name: "重置历史学习" }));
+    await user.click(button("确认重置"));
+
+    await waitFor(() =>
+      expect(apiMock.applyProfileEpochAction).toHaveBeenCalledWith(
+        {
+          expected_epoch: 7,
+          expected_version: 3,
+          action: "reset",
+          scope: "history_learning",
+        },
+        expect.stringMatching(/^profile-epoch-reset-/),
+      ),
+    );
+    const resetNotice = await screen.findByText(
+      "已清除历史学习，将仅从此后的反馈重新学习。",
+    );
+    await waitFor(() =>
+      expect(document.activeElement).toBe(resetNotice.closest('[role="status"]')),
+    );
+    expect(screen.queryByText("旧 reset 依据")).toBeNull();
+    expect(screen.queryByRole("button", { name: "排除" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "撤销此操作" })).toBeNull();
+    expect(apiMock.applyProfileClaimAction).not.toHaveBeenCalled();
+    await waitFor(() => expect(apiMock.profileClaims).toHaveBeenCalledTimes(2));
+  });
+
+  test("does not merge an in-flight old-epoch page after reset succeeds", async () => {
+    const oldPage = deferred<ProfileClaimsResponse>();
+    const epochResult = deferred<{
+      action: "reset";
+      profile_epoch: number;
+      version: number;
+      event_id: string;
+      profile: typeof baseProfile;
+      restore_allowed: boolean;
+    }>();
+    apiMock.applyProfileEpochAction.mockReturnValue(epochResult.promise);
+    apiMock.profileClaims
+      .mockResolvedValueOnce({
+        version: 3,
+        profile_epoch: 7,
+        restore_allowed: false,
+        claims: [claim({ id: "current", value: "当前 epoch 依据" })],
+        events: [],
+        events_has_more: true,
+        events_next_cursor: "cursor/old-epoch",
+      })
+      .mockReturnValueOnce(oldPage.promise)
+      .mockReturnValueOnce(new Promise(() => {}));
+    const { user } = await renderLoaded();
+
+    await user.click(button("加载更多"));
+    await waitFor(() =>
+      expect(apiMock.profileClaims).toHaveBeenNthCalledWith(
+        2,
+        "cursor/old-epoch",
+      ),
+    );
+    await user.click(button("重置历史学习"));
+    await user.click(button("确认重置"));
+    await waitFor(() =>
+      expect(apiMock.applyProfileEpochAction).toHaveBeenCalledTimes(1),
+    );
+
+    // Resolve the action continuation first, then the stale page in the same
+    // React act. Passive reload effects cannot run between these resolutions,
+    // so this fails if success does not invalidate pagination synchronously.
+    await act(async () => {
+      epochResult.resolve({
+        action: "reset",
+        profile_epoch: 8,
+        version: 4,
+        event_id: "epoch-event-race",
+        profile: baseProfile,
+        restore_allowed: true,
+      });
+      await Promise.resolve();
+      oldPage.resolve({
+        version: 3,
+        profile_epoch: 7,
+        restore_allowed: false,
+        claims: [claim({ id: "retired", value: "不得回流的旧 epoch 依据" })],
+        events: [
+          {
+            id: "retired-event",
+            kind: "suppress",
+            target_claim_id: "retired",
+            created_at: "2026-07-01T03:00:00Z",
+            revoked: false,
+            revocable: true,
+          },
+        ],
+        events_has_more: false,
+      });
+      await oldPage.promise;
+    });
+
+    await screen.findByText("已清除历史学习，将仅从此后的反馈重新学习。");
+    expect(screen.queryByText("不得回流的旧 epoch 依据")).toBeNull();
+    expect(screen.queryByText("当前 epoch 依据")).toBeNull();
+    expect(screen.queryByRole("button", { name: "撤销此操作" })).toBeNull();
+  });
+
+  test("shows restore only from server authority and sends no reset scope", async () => {
+    apiMock.profileClaims
+      .mockResolvedValueOnce({
+        version: 9,
+        profile_epoch: 8,
+        restore_allowed: true,
+        claims: [claim({ id: "old-restore-claim", value: "旧 restore 依据" })],
+        events: [
+          {
+            id: "old-restore-event",
+            kind: "pin",
+            target_claim_id: "old-restore-claim",
+            created_at: "2026-07-27T02:00:00Z",
+            revoked: false,
+            revocable: true,
+          },
+        ],
+      })
+      .mockReturnValueOnce(new Promise(() => {}));
+    apiMock.applyProfileEpochAction.mockResolvedValue({
+      action: "restore",
+      profile_epoch: 9,
+      version: 10,
+      event_id: "epoch-event-2",
+      profile: baseProfile,
+      restore_allowed: false,
+    });
+    const { user } = await renderLoaded();
+
+    await screen.findByText("旧 restore 依据");
+    await user.click(await screen.findByRole("button", { name: "恢复上一次重置" }));
+    expect(apiMock.applyProfileEpochAction).not.toHaveBeenCalled();
+    await user.click(button("确认恢复"));
+
+    await waitFor(() =>
+      expect(apiMock.applyProfileEpochAction).toHaveBeenCalledWith(
+        {
+          expected_epoch: 8,
+          expected_version: 9,
+          action: "restore",
+        },
+        expect.stringMatching(/^profile-epoch-restore-/),
+      ),
+    );
+    expect(apiMock.applyProfileEpochAction.mock.calls[0]?.[0]).not.toHaveProperty(
+      "scope",
+    );
+    const restoreNotice = await screen.findByText(
+      "已恢复重置前的画像，并进入新的学习版本。",
+    );
+    await waitFor(() =>
+      expect(document.activeElement).toBe(restoreNotice.closest('[role="status"]')),
+    );
+    expect(screen.queryByText("旧 restore 依据")).toBeNull();
+    expect(screen.queryByRole("button", { name: "排除" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "撤销此操作" })).toBeNull();
+    expect(apiMock.applyProfileClaimAction).not.toHaveBeenCalled();
+  });
+
+  test("keeps the rendered authority on 409 until the user explicitly reloads", async () => {
+    apiMock.applyProfileEpochAction.mockRejectedValue(
+      new ApiError(409, "stale epoch"),
+    );
+    const { user } = await renderLoaded();
+
+    await user.click(await screen.findByRole("button", { name: "重置历史学习" }));
+    await user.click(button("确认重置"));
+
+    const conflictMessage = await screen.findByText(
+      "画像已更新，重新加载后再改。",
+    );
+    const conflictReload = conflictMessage
+      .closest('[role="alert"]')
+      ?.querySelector("button");
+    await waitFor(() => expect(document.activeElement).toBe(conflictReload));
+    expect(pageText()).toContain("当前版本 7");
+    expect(apiMock.profileClaims).toHaveBeenCalledTimes(1);
+    expect(apiMock.applyProfileEpochAction).toHaveBeenCalledTimes(1);
+    const reset = button("重置历史学习");
+    expect(reset.disabled).toBe(true);
+    await user.click(reset);
+    expect(apiMock.applyProfileEpochAction).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getAllByRole("button", { name: "重新加载" })[1]!);
+    await waitFor(() => expect(apiMock.profileClaims).toHaveBeenCalledTimes(2));
+    expect(apiMock.applyProfileEpochAction).toHaveBeenCalledTimes(1);
+  });
+
   test("shows honest per-sentence sources and uses active as the action authority", async () => {
     apiMock.profileClaims.mockResolvedValue({
       version: 7,
+      profile_epoch: 7,
       claims: [
         claim({
           id: "summary-1",
@@ -339,6 +706,7 @@ describe("profile claim authority UI", () => {
     await waitFor(() =>
       expect(apiMock.applyProfileClaimAction).toHaveBeenCalledWith(
         {
+          expected_epoch: 7,
           expected_version: 7,
           action: "correct",
           claim_id: "summary-1",
@@ -352,6 +720,7 @@ describe("profile claim authority UI", () => {
   test("sends expected version and random idempotency key, then refreshes", async () => {
     apiMock.profileClaims.mockResolvedValue({
       version: 11,
+      profile_epoch: 7,
       claims: [claim({ id: "claim/1" })],
       events: [],
     });
@@ -361,6 +730,7 @@ describe("profile claim authority UI", () => {
     await waitFor(() =>
       expect(apiMock.applyProfileClaimAction).toHaveBeenCalledWith(
         {
+          expected_epoch: 7,
           expected_version: 11,
           action: "suppress",
           claim_id: "claim/1",
@@ -374,6 +744,7 @@ describe("profile claim authority UI", () => {
   test("keeps rendered claims on 409 and waits for explicit refresh", async () => {
     apiMock.profileClaims.mockResolvedValue({
       version: 12,
+      profile_epoch: 7,
       claims: [claim({ field: "industry", value: "机器人" })],
       events: [],
     });
@@ -381,9 +752,19 @@ describe("profile claim authority UI", () => {
     const { user } = await renderLoaded();
     await user.click(button("固定"));
 
-    await screen.findByText("画像已更新，重新加载后再改。");
+    const conflictMessage = await screen.findByText(
+      "画像已更新，重新加载后再改。",
+    );
+    const conflictReload = conflictMessage
+      .closest('[role="alert"]')
+      ?.querySelector("button");
+    await waitFor(() => expect(document.activeElement).toBe(conflictReload));
     expect(pageText()).toContain("机器人");
     expect(apiMock.profileClaims).toHaveBeenCalledTimes(1);
+    const pin = button("固定");
+    expect(pin.disabled).toBe(true);
+    await user.click(pin);
+    expect(apiMock.applyProfileClaimAction).toHaveBeenCalledTimes(1);
     await user.click(
       screen.getAllByRole("button", { name: "重新加载" })[1],
     );
@@ -393,6 +774,7 @@ describe("profile claim authority UI", () => {
   test("offers revoke only for server-revocable events and refreshes afterward", async () => {
     apiMock.profileClaims.mockResolvedValue({
       version: 13,
+      profile_epoch: 7,
       claims: [claim({ id: "1", pinned: true, source: { state: "manual" } })],
       events: [
         {
@@ -422,6 +804,7 @@ describe("profile claim authority UI", () => {
     await waitFor(() =>
       expect(apiMock.applyProfileClaimAction).toHaveBeenCalledWith(
         {
+          expected_epoch: 7,
           expected_version: 13,
           action: "revoke",
           event_id: "event/1",
@@ -436,6 +819,7 @@ describe("profile claim authority UI", () => {
     apiMock.profileClaims
       .mockResolvedValueOnce({
         version: 21,
+        profile_epoch: 7,
         claims: [claim({ id: "current", value: "当前依据" })],
         events: [
           {
@@ -452,6 +836,7 @@ describe("profile claim authority UI", () => {
       })
       .mockResolvedValueOnce({
         version: 21,
+        profile_epoch: 7,
         claims: [
           claim({ id: "current", value: "当前依据（同 ID 更新）" }),
           claim({
@@ -483,6 +868,7 @@ describe("profile claim authority UI", () => {
       })
       .mockResolvedValue({
         version: 22,
+        profile_epoch: 7,
         claims: [claim({ id: "current", value: "撤销后依据" })],
         events: [],
         events_has_more: false,
@@ -503,6 +889,7 @@ describe("profile claim authority UI", () => {
     await waitFor(() =>
       expect(apiMock.applyProfileClaimAction).toHaveBeenCalledWith(
         {
+          expected_epoch: 7,
           expected_version: 21,
           action: "revoke",
           event_id: "event-old",
