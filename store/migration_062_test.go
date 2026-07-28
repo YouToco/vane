@@ -81,6 +81,9 @@ func TestMigration062DowngradeFailsClosedWithLedger(t *testing.T) {
 		t.Fatalf("summary backfill claims=%d max_runes=%d",
 			summaryClaims, maxSummaryRunes)
 	}
+	if _, err := provider.UpTo(t.Context(), 66); err != nil {
+		t.Fatalf("migrate current Store schema to 066: %v", err)
+	}
 	st, err := New(t.Context(), freshURL)
 	if err != nil {
 		t.Fatal(err)
@@ -127,6 +130,9 @@ func TestMigration062DowngradeFailsClosedWithLedger(t *testing.T) {
 	if strings.Contains(profile.Summary, "污染画像") ||
 		!strings.Contains(profile.Summary, "已修正！") {
 		t.Fatalf("migration claim split mismatch revived pollution: %q", profile.Summary)
+	}
+	if _, err := provider.DownTo(t.Context(), 62); err != nil {
+		t.Fatalf("return to migration 062 for downgrade refusal: %v", err)
 	}
 	if _, err := provider.Down(t.Context()); err == nil ||
 		!strings.Contains(err.Error(), "refusing to drop non-empty profile claim authority ledger") {

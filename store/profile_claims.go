@@ -72,25 +72,27 @@ func (s *Store) ListProfileClaimsPage(
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var version, generation int64
+	var version, generation, profileEpoch int64
 	err = tx.QueryRow(ctx,
-		`SELECT version,evidence_generation FROM profile_claim_states
+		`SELECT version,evidence_generation,active_epoch FROM profile_claim_states
 		  WHERE tenant_id=$1 AND user_id=$2 FOR SHARE`,
-		tenantID, userID).Scan(&version, &generation)
+		tenantID, userID).Scan(&version, &generation, &profileEpoch)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, types.NewAppError(types.CodeNotFound, "画像主张尚未初始化", nil)
 	}
 	if err != nil {
 		return nil, profileClaimDBError("read profile claim state", err)
 	}
-	claims, events, err := loadProfileClaimLedgerTx(ctx, tx, tenantID, userID)
+	claims, events, err := loadProfileClaimLedgerTx(
+		ctx, tx, tenantID, userID, profileEpoch)
 	if err != nil {
 		return nil, err
 	}
 	snapshotMaxEventID := maxProfileClaimEventID(events)
 	beforeEventID := int64(0)
 	if continuation {
-		if cursor.SnapshotVersion != version ||
+		if cursor.ProfileEpoch != profileEpoch ||
+			cursor.SnapshotVersion != version ||
 			cursor.SnapshotMaxEventID != snapshotMaxEventID {
 			return nil, profileClaimCursorConflict()
 		}
@@ -101,6 +103,7 @@ func (s *Store) ListProfileClaimsPage(
 			Kind:               profileClaimEventCursorKind,
 			TenantID:           tenantID,
 			UserID:             userID,
+			ProfileEpoch:       profileEpoch,
 			SnapshotVersion:    version,
 			SnapshotMaxEventID: snapshotMaxEventID,
 			Limit:              options.Limit,
@@ -118,6 +121,7 @@ func (s *Store) ListProfileClaimsPage(
 		return nil, err
 	}
 	out := &types.ProfileClaimList{
+		ProfileEpoch:  profileEpoch,
 		Version:       version,
 		Claims:        publicClaims,
 		Events:        publicProfileClaimEventPage(events, pageEvents),
@@ -172,11 +176,11 @@ func (s *Store) GetProfileEvolutionBase(
 		return "", nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var generation int64
+	var generation, profileEpoch int64
 	err = tx.QueryRow(ctx,
-		`SELECT evidence_generation FROM profile_claim_states
+		`SELECT evidence_generation,active_epoch FROM profile_claim_states
 		  WHERE tenant_id=$1 AND user_id=$2`, tenantID, userID,
-	).Scan(&generation)
+	).Scan(&generation, &profileEpoch)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var profileExists bool
 		if existsErr := tx.QueryRow(ctx,
@@ -197,7 +201,7 @@ func (s *Store) GetProfileEvolutionBase(
 		return "", nil, profileClaimDBError("read profile evolution generation", err)
 	}
 	claims, events, err := loadProfileClaimLedgerTx(
-		ctx, tx, tenantID, userID)
+		ctx, tx, tenantID, userID, profileEpoch)
 	if err != nil {
 		return "", nil, err
 	}
@@ -236,13 +240,9 @@ func (s *Store) ApplyProfileClaimAction(
 	if err != nil {
 		return nil, err
 	}
-	version, generation, err := lockProfileClaimStateTx(ctx, tx, tenantID, userID)
-	if err != nil {
-		return nil, err
-	}
 	// The profile/state locks serialize same-key first attempts. Replay remains
-	// before expected-version comparison so response-loss retries return the
-	// exact first response even after that response advanced the version.
+	// before epoch/version comparison so response-loss retries return the exact
+	// first response across the whole profile lifetime, including after reset.
 	if result, found, err := replayProfileClaimActionTx(
 		ctx, tx, tenantID, userID, idempotencyKey, requestDigest,
 	); err != nil {
@@ -253,10 +253,19 @@ func (s *Store) ApplyProfileClaimAction(
 		}
 		return result, nil
 	}
+	version, generation, profileEpoch, err := lockProfileClaimStateTx(
+		ctx, tx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if err := bindProfileEpochTx(ctx, tx, profileEpoch); err != nil {
+		return nil, err
+	}
 	if version != action.ExpectedVersion {
 		return nil, types.NewAppError(types.CodeConflict, "画像主张版本已变化，请刷新后重试", nil)
 	}
-	claims, events, err := loadProfileClaimLedgerTx(ctx, tx, tenantID, userID)
+	claims, events, err := loadProfileClaimLedgerTx(
+		ctx, tx, tenantID, userID, profileEpoch)
 	if err != nil {
 		return nil, err
 	}
@@ -307,9 +316,10 @@ func (s *Store) ApplyProfileClaimAction(
 			var id int64
 			err := tx.QueryRow(ctx,
 				`INSERT INTO profile_claims
-				    (tenant_id,user_id,field_name,claim_value,source_state,supersedes_claim_id)
-				 VALUES ($1,$2,$3,$4,'manual',$5) RETURNING id`,
-				tenantID, userID, target.Field, value, target.ID,
+				    (tenant_id,user_id,profile_epoch,field_name,claim_value,
+				     source_state,supersedes_claim_id)
+				 VALUES ($1,$2,$3,$4,$5,'manual',$6) RETURNING id`,
+				tenantID, userID, profileEpoch, target.Field, value, target.ID,
 			).Scan(&id)
 			if err != nil {
 				return nil, profileClaimDBError("insert manual profile claim", err)
@@ -358,16 +368,17 @@ func (s *Store) ApplyProfileClaimAction(
 	var eventID int64
 	err = tx.QueryRow(ctx,
 		`INSERT INTO profile_claim_events
-		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		    (tenant_id,user_id,profile_epoch,actor_user_id,event_kind,target_claim_id,
 		     result_claim_id,target_event_id,expected_version,result_version)
-		 VALUES ($1,$2,$2,$3,$4,$5,$6,$7::bigint,$7::bigint+1) RETURNING id`,
-		tenantID, userID, action.Action, targetClaimID, resultClaimID,
+		 VALUES ($1,$2,$3,$2,$4,$5,$6,$7,$8::bigint,$8::bigint+1) RETURNING id`,
+		tenantID, userID, profileEpoch, action.Action, targetClaimID, resultClaimID,
 		targetEventID, version,
 	).Scan(&eventID)
 	if err != nil {
 		return nil, profileClaimDBError("insert profile claim event", err)
 	}
-	claims, events, err = loadProfileClaimLedgerTx(ctx, tx, tenantID, userID)
+	claims, events, err = loadProfileClaimLedgerTx(
+		ctx, tx, tenantID, userID, profileEpoch)
 	if err != nil {
 		return nil, err
 	}
@@ -384,8 +395,8 @@ func (s *Store) ApplyProfileClaimAction(
 	tag, err := tx.Exec(ctx,
 		`UPDATE profile_claim_states
 		    SET version=version+1,updated_at=clock_timestamp()
-		  WHERE tenant_id=$1 AND user_id=$2 AND version=$3`,
-		tenantID, userID, version)
+		  WHERE tenant_id=$1 AND user_id=$2 AND active_epoch=$3 AND version=$4`,
+		tenantID, userID, profileEpoch, version)
 	if err != nil {
 		return nil, profileClaimDBError("advance profile claim version", err)
 	}
@@ -397,10 +408,11 @@ func (s *Store) ApplyProfileClaimAction(
 		return nil, err
 	}
 	result := &types.ProfileClaimActionResult{
-		Version: version + 1,
-		EventID: strconv.FormatInt(eventID, 10),
-		Profile: publicProfile(updated),
-		Claims:  publicClaims,
+		ProfileEpoch: &profileEpoch,
+		Version:      version + 1,
+		EventID:      strconv.FormatInt(eventID, 10),
+		Profile:      publicProfile(updated),
+		Claims:       publicClaims,
 	}
 	payload, err := json.Marshal(result)
 	if err != nil {
@@ -408,9 +420,11 @@ func (s *Store) ApplyProfileClaimAction(
 	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO profile_claim_receipts
-		    (tenant_id,user_id,idempotency_key,request_digest,event_id,response_payload)
-		 VALUES ($1,$2,$3,$4,$5,$6)`,
-		tenantID, userID, idempotencyKey, requestDigest, eventID, payload,
+		    (tenant_id,user_id,profile_epoch,idempotency_key,request_digest,
+		     event_id,response_payload)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		tenantID, userID, profileEpoch, idempotencyKey, requestDigest,
+		eventID, payload,
 	); err != nil {
 		return nil, profileClaimDBError("insert profile claim receipt", err)
 	}
@@ -497,33 +511,48 @@ func lockExactProfileMembershipRoot(
 
 func lockProfileClaimStateTx(
 	ctx context.Context, tx pgx.Tx, tenantID, userID int64,
-) (version, generation int64, err error) {
+) (version, generation, profileEpoch int64, err error) {
 	err = tx.QueryRow(ctx,
-		`SELECT version,evidence_generation FROM profile_claim_states
+		`SELECT version,evidence_generation,active_epoch FROM profile_claim_states
 		  WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE`,
-		tenantID, userID).Scan(&version, &generation)
+		tenantID, userID).Scan(&version, &generation, &profileEpoch)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, 0, types.NewAppError(
+		return 0, 0, 0, types.NewAppError(
 			types.CodeConflict, "画像主张状态缺失，拒绝从派生投影补写", nil)
 	}
 	if err != nil {
-		return 0, 0, profileClaimDBError("lock profile claim state", err)
+		return 0, 0, 0, profileClaimDBError("lock profile claim state", err)
 	}
-	return version, generation, nil
+	return version, generation, profileEpoch, nil
+}
+
+func bindProfileEpochTx(
+	ctx context.Context, tx pgx.Tx, profileEpoch int64,
+) error {
+	if profileEpoch < 0 {
+		return types.NewAppError(
+			types.CodeConflict, "画像学习 epoch 损坏", nil)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.profile_epoch',$1,true)`,
+		strconv.FormatInt(profileEpoch, 10)); err != nil {
+		return profileClaimDBError("bind active profile epoch", err)
+	}
+	return nil
 }
 
 func loadProfileClaimLedgerTx(
-	ctx context.Context, tx pgx.Tx, tenantID, userID int64,
+	ctx context.Context, tx pgx.Tx, tenantID, userID, profileEpoch int64,
 ) ([]profileClaimRow, []profileClaimEventRow, error) {
-	// 6.3-C retained risk: projection still reads the complete private ledger.
-	// Public responses are bounded and projection is linear, but durable
-	// compaction/pagination is intentionally a later authority-preserving cut.
+	// Phase A reads the complete private ledger for the active epoch only.
+	// Public responses remain bounded; durable transition-watermark replay and
+	// compaction belong to the reset authority phase.
 	rows, err := tx.Query(ctx,
 		`SELECT id,field_name,claim_value,source_state,source_ref_type,
 		        source_ref,generation,supersedes_claim_id,created_at
 		   FROM profile_claims
-		  WHERE tenant_id=$1 AND user_id=$2 ORDER BY id`,
-		tenantID, userID)
+		  WHERE tenant_id=$1 AND user_id=$2 AND profile_epoch=$3 ORDER BY id`,
+		tenantID, userID, profileEpoch)
 	if err != nil {
 		return nil, nil, profileClaimDBError("load profile claims", err)
 	}
@@ -548,8 +577,8 @@ func loadProfileClaimLedgerTx(
 	eventRows, err := tx.Query(ctx,
 		`SELECT id,event_kind,target_claim_id,result_claim_id,target_event_id,created_at
 		   FROM profile_claim_events
-		  WHERE tenant_id=$1 AND user_id=$2 ORDER BY id`,
-		tenantID, userID)
+		  WHERE tenant_id=$1 AND user_id=$2 AND profile_epoch=$3 ORDER BY id`,
+		tenantID, userID, profileEpoch)
 	if err != nil {
 		return nil, nil, profileClaimDBError("load profile claim events", err)
 	}
@@ -1151,13 +1180,14 @@ func replayProfileClaimActionTx(
 	ctx context.Context, tx pgx.Tx, tenantID, userID int64, key, digest string,
 ) (*types.ProfileClaimActionResult, bool, error) {
 	var storedDigest string
+	var storedEpoch int64
 	var payload []byte
 	err := tx.QueryRow(ctx,
-		`SELECT request_digest,response_payload
+		`SELECT profile_epoch,request_digest,response_payload
 		   FROM profile_claim_receipts
 		  WHERE tenant_id=$1 AND user_id=$2 AND idempotency_key=$3`,
 		tenantID, userID, key,
-	).Scan(&storedDigest, &payload)
+	).Scan(&storedEpoch, &storedDigest, &payload)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -1182,9 +1212,17 @@ func seedInitialManualProfileClaimsTx(
 	ctx context.Context, tx pgx.Tx, tenantID, userID int64, p *types.Profile,
 ) error {
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO profile_claim_states(tenant_id,user_id)
-		 VALUES($1,$2)`, tenantID, userID); err != nil {
+		`INSERT INTO profile_epochs(tenant_id,user_id,profile_epoch)
+		 VALUES($1,$2,0)`, tenantID, userID); err != nil {
+		return profileClaimDBError("initialize profile epoch", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO profile_claim_states(tenant_id,user_id,active_epoch)
+		 VALUES($1,$2,0)`, tenantID, userID); err != nil {
 		return profileClaimDBError("initialize manual profile claim state", err)
+	}
+	if err := bindProfileEpochTx(ctx, tx, 0); err != nil {
+		return err
 	}
 	insert := func(field, value string) error {
 		value = strings.TrimSpace(value)
@@ -1193,8 +1231,8 @@ func seedInitialManualProfileClaimsTx(
 		}
 		_, err := tx.Exec(ctx,
 			`INSERT INTO profile_claims
-			    (tenant_id,user_id,field_name,claim_value,source_state)
-			 VALUES($1,$2,$3,$4,'manual')`,
+			    (tenant_id,user_id,profile_epoch,field_name,claim_value,source_state)
+			 VALUES($1,$2,0,$3,$4,'manual')`,
 			tenantID, userID, field, value)
 		return err
 	}
@@ -1261,12 +1299,16 @@ func evolveProfileClaimsTx(
 		current.LastEvolvedFeedbackID != expectedCursor {
 		return types.NewAppError(types.CodeConflict, "画像演化 CAS 未命中", nil)
 	}
-	version, generation, err := lockProfileClaimStateTx(
+	version, generation, profileEpoch, err := lockProfileClaimStateTx(
 		ctx, tx, tenantID, userID)
 	if err != nil {
 		return err
 	}
-	claims, events, err := loadProfileClaimLedgerTx(ctx, tx, tenantID, userID)
+	if err := bindProfileEpochTx(ctx, tx, profileEpoch); err != nil {
+		return err
+	}
+	claims, events, err := loadProfileClaimLedgerTx(
+		ctx, tx, tenantID, userID, profileEpoch)
 	if err != nil {
 		return err
 	}
@@ -1288,10 +1330,10 @@ func evolveProfileClaimsTx(
 		}
 		_, err := tx.Exec(ctx,
 			`INSERT INTO profile_claims
-			    (tenant_id,user_id,field_name,claim_value,source_state,
+			    (tenant_id,user_id,profile_epoch,field_name,claim_value,source_state,
 			     source_ref_type,source_ref,generation)
-			 VALUES ($1,$2,$3,$4,'evidence','feedback_range',$5,$6)`,
-			tenantID, userID, field, value, ref, newCursor)
+			 VALUES ($1,$2,$3,$4,$5,'evidence','feedback_range',$6,$7)`,
+			tenantID, userID, profileEpoch, field, value, ref, newCursor)
 		return err
 	}
 	// Evolver is expected to pass pure non-manual evidence summary. Strip the
@@ -1315,15 +1357,16 @@ func evolveProfileClaimsTx(
 		`UPDATE profile_claim_states
 		    SET version=version+1,evidence_generation=$3,
 		        updated_at=clock_timestamp()
-		  WHERE tenant_id=$1 AND user_id=$2 AND version=$4`,
-		tenantID, userID, newCursor, version)
+		  WHERE tenant_id=$1 AND user_id=$2 AND active_epoch=$4 AND version=$5`,
+		tenantID, userID, newCursor, profileEpoch, version)
 	if err != nil {
 		return profileClaimDBError("advance evolved claim generation", err)
 	}
 	if tag.RowsAffected() != 1 {
 		return types.NewAppError(types.CodeConflict, "画像主张版本已并发变化", nil)
 	}
-	claims, events, err = loadProfileClaimLedgerTx(ctx, tx, tenantID, userID)
+	claims, events, err = loadProfileClaimLedgerTx(
+		ctx, tx, tenantID, userID, profileEpoch)
 	if err != nil {
 		return err
 	}

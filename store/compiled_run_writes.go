@@ -781,12 +781,38 @@ func (s *Store) AdvanceProfileCursorForTaskRunV1(
 		return err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.user_id',$1,true)`,
+		strconv.FormatInt(expected.UserID, 10)); err != nil {
+		return taskRunDatabaseError("set compiled profile cursor user", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_profile_claim_editor`); err != nil {
+		return taskRunDatabaseError("enter compiled profile cursor role", err)
+	}
+	if _, err := lockProfileTx(
+		ctx, tx, expected.TenantID, expected.UserID); err != nil {
+		return err
+	}
+	_, _, profileEpoch, err := lockProfileClaimStateTx(
+		ctx, tx, expected.TenantID, expected.UserID)
+	if err != nil {
+		return err
+	}
+	if err := bindProfileEpochTx(ctx, tx, profileEpoch); err != nil {
+		return err
+	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE profiles
 		    SET last_evolved_feedback_id = $3
 		  WHERE tenant_id = $1 AND user_id = $2
-		    AND updated_at = $4 AND last_evolved_feedback_id = $5`,
+		    AND updated_at = $4 AND last_evolved_feedback_id = $5
+		    AND EXISTS (
+		      SELECT 1 FROM profile_claim_states s
+		       WHERE s.tenant_id=$1 AND s.user_id=$2
+		         AND s.active_epoch=$6
+		    )`,
 		expected.TenantID, expected.UserID, newCursor, expectedAt, expectedCursor,
+		profileEpoch,
 	)
 	if err != nil {
 		return taskRunDatabaseError("advance compiled task profile cursor", err)
@@ -794,6 +820,9 @@ func (s *Store) AdvanceProfileCursorForTaskRunV1(
 	if tag.RowsAffected() == 0 {
 		return types.NewAppError(types.CodeConflict,
 			"compiled task profile cursor CAS did not match", nil)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		return taskRunDatabaseError("restore compiled profile cursor role", err)
 	}
 	return commitCompiledRunWriteV1(ctx, tx, "commit compiled task profile cursor")
 }

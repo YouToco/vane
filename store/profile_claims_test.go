@@ -844,12 +844,15 @@ func TestProfileClaimMutationSummaryBoundAndDuplicatePin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := bindProfileEpochTx(t.Context(), claimTx, 0); err != nil {
+		t.Fatal(err)
+	}
 	var duplicateID int64
 	if err := claimTx.QueryRow(t.Context(), `
 		INSERT INTO profile_claims
-		    (tenant_id,user_id,field_name,claim_value,source_state,
+		    (tenant_id,user_id,profile_epoch,field_name,claim_value,source_state,
 		     source_ref_type,source_ref,generation)
-		VALUES(1,$1,'summary',$2,'evidence',
+		VALUES(1,$1,0,'summary',$2,'evidence',
 		       'feedback_range','feedbacks:(10,20]',20)
 		RETURNING id`,
 		u.ID, strings.Repeat("甲", 240)).Scan(&duplicateID); err != nil {
@@ -930,7 +933,7 @@ func TestLegacyProfileTenantResolutionFailsClosed(t *testing.T) {
 		defer cancel()
 		for _, table := range []string{
 			"profile_claim_receipts", "profile_claim_events", "profile_claims",
-			"profile_claim_states", "profiles",
+			"profile_claim_states", "profile_epochs", "profiles",
 		} {
 			cleanupExec(ctx, t, st, "DELETE FROM "+table+" WHERE user_id=$1", u.ID)
 		}
@@ -1084,31 +1087,39 @@ func TestProfileClaimEventPaginationAndBoundedActionReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := seedTx.Exec(t.Context(), `
+		INSERT INTO profile_epochs(tenant_id,user_id,profile_epoch)
+		VALUES(1,$1,0)`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seedTx.Exec(t.Context(), `
 		INSERT INTO profile_claim_states(tenant_id,user_id)
 		VALUES(1,$1)`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindProfileEpochTx(t.Context(), seedTx, 0); err != nil {
 		t.Fatal(err)
 	}
 	var originalClaimID, resultClaimID, dependentResultClaimID int64
 	if err := seedTx.QueryRow(t.Context(), `
 		INSERT INTO profile_claims
-		    (tenant_id,user_id,field_name,claim_value,source_state)
-		VALUES(1,$1,'industry','legacy-source','source_unavailable')
+		    (tenant_id,user_id,profile_epoch,field_name,claim_value,source_state)
+		VALUES(1,$1,0,'industry','legacy-source','source_unavailable')
 		RETURNING id`, u.ID).Scan(&originalClaimID); err != nil {
 		t.Fatal(err)
 	}
 	if err := seedTx.QueryRow(t.Context(), `
 		INSERT INTO profile_claims
-		    (tenant_id,user_id,field_name,claim_value,source_state,
+		    (tenant_id,user_id,profile_epoch,field_name,claim_value,source_state,
 		     supersedes_claim_id)
-		VALUES(1,$1,'industry','corrected-source','manual',$2)
+		VALUES(1,$1,0,'industry','corrected-source','manual',$2)
 		RETURNING id`, u.ID, originalClaimID).Scan(&resultClaimID); err != nil {
 		t.Fatal(err)
 	}
 	if err := seedTx.QueryRow(t.Context(), `
 		INSERT INTO profile_claims
-		    (tenant_id,user_id,field_name,claim_value,source_state,
+		    (tenant_id,user_id,profile_epoch,field_name,claim_value,source_state,
 		     supersedes_claim_id)
-		VALUES(1,$1,'industry','dependent-source','manual',$2)
+		VALUES(1,$1,0,'industry','dependent-source','manual',$2)
 		RETURNING id`,
 		u.ID, originalClaimID).Scan(&dependentResultClaimID); err != nil {
 		t.Fatal(err)
@@ -1116,27 +1127,27 @@ func TestProfileClaimEventPaginationAndBoundedActionReplay(t *testing.T) {
 	var correctEventID, dependentPinID, revokePinID int64
 	if err := seedTx.QueryRow(t.Context(), `
 		INSERT INTO profile_claim_events
-		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		    (tenant_id,user_id,profile_epoch,actor_user_id,event_kind,target_claim_id,
 		     result_claim_id,expected_version,result_version)
-		VALUES(1,$1,$1,'correct',$2,$3,0,1)
+		VALUES(1,$1,0,$1,'correct',$2,$3,0,1)
 		RETURNING id`,
 		u.ID, originalClaimID, resultClaimID).Scan(&correctEventID); err != nil {
 		t.Fatal(err)
 	}
 	if err := seedTx.QueryRow(t.Context(), `
 		INSERT INTO profile_claim_events
-		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		    (tenant_id,user_id,profile_epoch,actor_user_id,event_kind,target_claim_id,
 		     expected_version,result_version)
-		VALUES(1,$1,$1,'pin',$2,1,2)
+		VALUES(1,$1,0,$1,'pin',$2,1,2)
 		RETURNING id`,
 		u.ID, resultClaimID).Scan(&dependentPinID); err != nil {
 		t.Fatal(err)
 	}
 	if err := seedTx.QueryRow(t.Context(), `
 		INSERT INTO profile_claim_events
-		    (tenant_id,user_id,actor_user_id,event_kind,target_event_id,
+		    (tenant_id,user_id,profile_epoch,actor_user_id,event_kind,target_event_id,
 		     expected_version,result_version)
-		VALUES(1,$1,$1,'revoke',$2,2,3)
+		VALUES(1,$1,0,$1,'revoke',$2,2,3)
 		RETURNING id`,
 		u.ID, dependentPinID).Scan(&revokePinID); err != nil {
 		t.Fatal(err)
@@ -1144,9 +1155,9 @@ func TestProfileClaimEventPaginationAndBoundedActionReplay(t *testing.T) {
 	var dependentCorrectID, activeDependentPinID int64
 	if err := seedTx.QueryRow(t.Context(), `
 		INSERT INTO profile_claim_events
-		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		    (tenant_id,user_id,profile_epoch,actor_user_id,event_kind,target_claim_id,
 		     result_claim_id,expected_version,result_version)
-		VALUES(1,$1,$1,'correct',$2,$3,3,4)
+		VALUES(1,$1,0,$1,'correct',$2,$3,3,4)
 		RETURNING id`,
 		u.ID, originalClaimID, dependentResultClaimID,
 	).Scan(&dependentCorrectID); err != nil {
@@ -1154,18 +1165,18 @@ func TestProfileClaimEventPaginationAndBoundedActionReplay(t *testing.T) {
 	}
 	if err := seedTx.QueryRow(t.Context(), `
 		INSERT INTO profile_claim_events
-		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		    (tenant_id,user_id,profile_epoch,actor_user_id,event_kind,target_claim_id,
 		     expected_version,result_version)
-		VALUES(1,$1,$1,'pin',$2,4,5)
+		VALUES(1,$1,0,$1,'pin',$2,4,5)
 		RETURNING id`,
 		u.ID, dependentResultClaimID).Scan(&activeDependentPinID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := seedTx.Exec(t.Context(), `
 		INSERT INTO profile_claim_events
-		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		    (tenant_id,user_id,profile_epoch,actor_user_id,event_kind,target_claim_id,
 		     expected_version,result_version)
-		SELECT 1,$1,$1,'pin',$2,n-1,n
+		SELECT 1,$1,0,$1,'pin',$2,n-1,n
 		  FROM generate_series(6,1000) n`,
 		u.ID, originalClaimID); err != nil {
 		t.Fatal(err)
@@ -1357,7 +1368,7 @@ func TestProfileClaimEventPaginationAndBoundedActionReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	wrongSchema := decoded
-	wrongSchema.Schema = "vane.profile-claim-event-cursor/v2"
+	wrongSchema.Schema = "vane.profile-claim-event-cursor/v1"
 	wrongSchemaCursor, err := encodeProfileClaimEventCursor(wrongSchema)
 	if err != nil {
 		t.Fatal(err)
@@ -1395,11 +1406,14 @@ func TestProfileClaimEventPaginationAndBoundedActionReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := bindProfileEpochTx(t.Context(), concurrentTx, 0); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := concurrentTx.Exec(t.Context(), `
 		INSERT INTO profile_claim_events
-		    (tenant_id,user_id,actor_user_id,event_kind,target_claim_id,
+		    (tenant_id,user_id,profile_epoch,actor_user_id,event_kind,target_claim_id,
 		     expected_version,result_version)
-		VALUES(1,$1,$1,'pin',$2,1000,1001)`,
+		VALUES(1,$1,0,$1,'pin',$2,1000,1001)`,
 		u.ID, originalClaimID); err != nil {
 		t.Fatal(err)
 	}

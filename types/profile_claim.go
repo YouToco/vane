@@ -20,6 +20,7 @@ type ProfileClaim struct {
 }
 
 type ProfileClaimList struct {
+	ProfileEpoch     int64               `json:"profile_epoch"`
 	Version          int64               `json:"version"`
 	Claims           []ProfileClaim      `json:"claims"`
 	Events           []ProfileClaimEvent `json:"events"`
@@ -46,6 +47,9 @@ type ProfileClaimAction struct {
 }
 
 type ProfileClaimActionResult struct {
+	// Pointer preserves exact replay for receipts created before epoch support:
+	// absent stays absent, while every new response includes even epoch zero.
+	ProfileEpoch   *int64         `json:"profile_epoch,omitempty"`
 	Version        int64          `json:"version"`
 	EventID        string         `json:"event_id"`
 	Profile        ProfileView    `json:"profile"`

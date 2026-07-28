@@ -141,12 +141,36 @@ func (s *Store) ApplyLegacyFeedbackRepair(
 	}
 	if plan.ReplayFromID > 0 &&
 		plan.ReplayFromID <= plan.CurrentEvolutionCursor {
+		if _, err := tx.Exec(ctx,
+			`SELECT set_config('app.user_id',$1,true)`,
+			strconv.FormatInt(userID, 10)); err != nil {
+			return FeedbackRepairPlan{}, types.NewAppError(
+				types.CodeDatabase, "绑定反馈修复画像用户", err)
+		}
+		if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_profile_claim_editor`); err != nil {
+			return FeedbackRepairPlan{}, types.NewAppError(
+				types.CodeDatabase, "进入反馈修复画像 authority", err)
+		}
+		_, _, profileEpoch, err := lockProfileClaimStateTx(
+			ctx, tx, tenantID, userID)
+		if err != nil {
+			return FeedbackRepairPlan{}, err
+		}
+		if err := bindProfileEpochTx(ctx, tx, profileEpoch); err != nil {
+			return FeedbackRepairPlan{}, err
+		}
 		tag, err := tx.Exec(ctx,
 			`UPDATE profiles
 			    SET last_evolved_feedback_id = $1, updated_at = clock_timestamp()
 			  WHERE tenant_id = $2 AND user_id = $3
-			    AND last_evolved_feedback_id = $4`,
-			plan.ReplayFromID-1, tenantID, userID, plan.CurrentEvolutionCursor)
+			    AND last_evolved_feedback_id = $4
+			    AND EXISTS (
+			      SELECT 1 FROM profile_claim_states s
+			       WHERE s.tenant_id=$2 AND s.user_id=$3
+			         AND s.active_epoch=$5
+			    )`,
+			plan.ReplayFromID-1, tenantID, userID,
+			plan.CurrentEvolutionCursor, profileEpoch)
 		if err != nil {
 			return FeedbackRepairPlan{}, types.NewAppError(types.CodeDatabase, "重置反馈演化游标", err)
 		}
@@ -184,20 +208,49 @@ func buildLegacyFeedbackRepairPlan(
 	if err != nil {
 		return FeedbackRepairPlan{}, types.NewAppError(types.CodeDatabase, "读取反馈演化游标", err)
 	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.user_id',$1,true)`,
+		strconv.FormatInt(userID, 10)); err != nil {
+		return FeedbackRepairPlan{}, types.NewAppError(
+			types.CodeDatabase, "绑定反馈修复画像用户", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_profile_claim_editor`); err != nil {
+		return FeedbackRepairPlan{}, types.NewAppError(
+			types.CodeDatabase, "进入反馈修复画像读取 authority", err)
+	}
+	var profileEpoch int64
+	err = tx.QueryRow(ctx,
+		`SELECT active_epoch FROM profile_claim_states
+		  WHERE tenant_id=$1 AND user_id=$2`,
+		tenantID, userID).Scan(&profileEpoch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return FeedbackRepairPlan{}, types.NewAppError(
+			types.CodeConflict, "反馈修复画像状态缺失", types.ErrConflict)
+	}
+	if err != nil {
+		return FeedbackRepairPlan{}, types.NewAppError(
+			types.CodeDatabase, "读取反馈修复画像 epoch", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		return FeedbackRepairPlan{}, types.NewAppError(
+			types.CodeDatabase, "恢复反馈修复应用 authority", err)
+	}
 	rows, err := tx.Query(ctx,
 		`SELECT id, delivery_id, detail, created_at
 		   FROM (
-		       SELECT DISTINCT ON (delivery_id)
-		              id, delivery_id, action, reason_code, detail, created_at
-		         FROM feedbacks
-		        WHERE tenant_id = $1 AND user_id = $2
+		       SELECT DISTINCT ON (f.delivery_id)
+		              f.id, f.delivery_id, f.action, f.reason_code,
+		              f.detail, f.created_at
+		         FROM feedbacks f
+		        WHERE f.tenant_id = $1 AND f.user_id = $2
 		          AND action = 'misjudged'
-		        ORDER BY delivery_id, created_at DESC, id DESC
+		          AND f.profile_epoch = $3
+		        ORDER BY f.delivery_id, f.created_at DESC, f.id DESC
 		   ) latest
 		  WHERE reason_code IS NULL
 		    AND btrim(detail) <> ''
 		  ORDER BY id`,
-		tenantID, userID)
+		tenantID, userID, profileEpoch)
 	if err != nil {
 		return FeedbackRepairPlan{}, types.NewAppError(types.CodeDatabase, "查询历史反馈修复候选", err)
 	}

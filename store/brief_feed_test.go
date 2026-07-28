@@ -388,13 +388,31 @@ func TestMigration065BriefReaderRLSRejectsSameTenantOtherUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var otherFeedbackID int64
+	var otherBatchID, otherDeliveryID, otherFeedbackID int64
+	if err := f.base.st.pool.QueryRow(t.Context(), `
+		INSERT INTO push_batches (tenant_id,user_id)
+		VALUES ($1,$2) RETURNING id`,
+		f.identity.TenantID, otherUserID,
+	).Scan(&otherBatchID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.base.st.pool.QueryRow(t.Context(), `
+		INSERT INTO deliveries (tenant_id,batch_id,user_id)
+		VALUES ($1,$2,$3) RETURNING id`,
+		f.identity.TenantID, otherBatchID, otherUserID,
+	).Scan(&otherDeliveryID); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(ctx, t, f.base.st,
 			`DELETE FROM feedbacks WHERE id=ANY($1)`,
 			[]int64{ownFeedbackID, otherFeedbackID})
+		cleanupExec(ctx, t, f.base.st,
+			`DELETE FROM deliveries WHERE id=$1`, otherDeliveryID)
+		cleanupExec(ctx, t, f.base.st,
+			`DELETE FROM push_batches WHERE id=$1`, otherBatchID)
 		cleanupExec(ctx, t, f.base.st,
 			`DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`,
 			f.identity.TenantID, otherUserID)
@@ -406,7 +424,7 @@ func TestMigration065BriefReaderRLSRejectsSameTenantOtherUser(t *testing.T) {
 		     tenant_id,user_id,delivery_id,action
 		 ) VALUES ($1,$2,$3,'not_interested')
 		 RETURNING id`,
-		f.identity.TenantID, otherUserID, f.deliveryID[0],
+		f.identity.TenantID, otherUserID, otherDeliveryID,
 	).Scan(&otherFeedbackID); err != nil {
 		t.Fatal(err)
 	}

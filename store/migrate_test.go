@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 65
+const latestMigrationVersion int64 = 66
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -104,6 +104,7 @@ var wantTables = []string{
 	"canonical_brief_stages",
 	// 062 来源级画像纠正 ledger、状态与响应丢失回执。
 	"profile_claim_states",
+	"profile_epochs",
 	"profile_claims",
 	"profile_claim_events",
 	"profile_claim_receipts",

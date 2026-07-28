@@ -267,6 +267,124 @@ func (s *Store) GetContentItem(ctx context.Context, id int64) (*types.ContentIte
 epoch 时应同时定义可验证 snapshot/checkpoint、旧事件审计锚点和重放一致性测试，不能用
 静默截断 active/revocable authority 的方式“优化”。
 
+### 3.5 画像学习重置与单调 epoch（6.3-C）
+
+> 2026-07-27 冻结。Reset learning 不是首次创建画像的 Undo，也不是隐私删除。它停止旧证据
+> 继续参与学习，并从一个新的单调 epoch 重新开始；旧事实保留为只读审计。
+
+产品语义：
+
+- 默认 scope 是 `history_learning`：旧 `evidence` 与 `source_unavailable` 不进入新 epoch；
+  用户明确表达的有效 manual authority（人工填写、有效 correct/pin 的最终结果）和
+  `removed_tags` 保留，并以带来源 epoch/claim 血缘的新 manual seed 物化。若未来需要全清，
+  必须新增名称和确认文案都不同的 factory-reset scope，不能复用本动作。
+- reset 后即使只剩 manual seed 或为空，也是一个合法的已有画像 epoch；不得把它伪装成
+  “从未建立画像”，不得重新开放旧 PATCH/undo 或 Agent `update_profile`。用户文案固定表达：
+  “已清除历史学习，将仅从此后的反馈重新学习。”
+- inactive epoch 对本人只读可审计，默认界面折叠；任何历史 epoch 的 claim/event 都不可再
+  correct、suppress、pin、revoke。隐私 hard-delete/GDPR purge 是独立生命周期。
+
+权威与反 ABA：
+
+- `profiles` 永远只是当前 epoch 的派生投影。权威由 epoch/state、immutable
+  claims/events/receipts 和 epoch transitions/receipts 组成。transition 必须记录 predecessor
+  epoch、claim/event watermark、feedback cursor 和 projection digest，作为 snapshot identity。
+- epoch 只增不减。active epoch `K` 的 reset/restore 都创建 `K+1`，按被补偿 reset 记录的
+  transition snapshot identity 从 raw ledger@watermark 精确重建内容，绝不把 active 指针
+  倒回旧编号。跨 epoch 的 target、
+  supersedes、revoke、receipt event 关联必须由复合外键拒绝。
+- `profile_claim_states.version` 是跨 epoch 的全局 authority revision，每次有效
+  claim mutation/reset/restore 恰好加 1，永不归零。所有写请求必须携带
+  `expected_epoch` 和 `expected_version`；receipt replay 在 CAS 比较前执行，同 key 同摘要
+  精确重放首次响应，同 key 异摘要冲突。
+- 普通 GET、Evolver base、prompt cache、慢/快反馈通道和 claim mutation 只能使用 active
+  epoch。公开 cursor 必须绑定 tenant/user/epoch/version/snapshot/limit；reset 后旧 cursor
+  必须冲突，不能隐式映射。
+
+反馈与 Evolver 线性化：
+
+- 不能用 `MAX(feedbacks.id)` 或时间戳猜提交顺序。所有 feedback producer 必须在分配/插入
+  feedback id 前进入同一个 tenant+user epoch writer fence；数据库在该 fence 内把事实原子
+  标到当前 epoch。重复/冲突反馈也必须在 fence 内解析 epoch。migration 同样必须 fence 旧
+  writer，禁止旧 binary 在切换后写出无 epoch 的 feedback/claim 或只推进 legacy cursor。
+- 总锁序固定为：既有 feedback 全局 admission（仅相关路径）→ tenant admission →
+  exact membership → tenant+user feedback epoch fence → profile → claim state。某路径没有
+  某个 root 时可以跳过，但不得反序取得；feedback trigger 在 fence 内对 state 取共享锁，
+  reset/Evolver 对同一 state 取更新锁。
+- feedback 的 `(tenant,user,delivery)` 外键继续证明主体，`profile_epoch=0` 是显式 pre-profile
+  sentinel，不要求 profile/epoch row 已存在；migration 将历史无 profile feedback 诚实归 0。
+  首次采集在同事务创建 profile、claim state 和 epoch 0，并从 epoch 0 feedback 开始消费。
+  reset 对无 profile/state 恒 NotFound，绝不承担首次采集。reset 后 slow evolution 与最近
+  14 天 negative fast path 都只读当前 epoch，旧负反馈不能继续压分。
+- Evolver/reset 固定遵守上述总锁序。Evolver 的 CAS token 必须包含 active epoch、全局
+  version、profile
+  `updated_at` 和 epoch cursor。只允许两种线性化：Evolver 先提交并进入旧 epoch checkpoint；
+  或 reset 先提交、旧 Evolver/AdvanceCursor 冲突且零副作用。
+
+reset 是一个原子 append-only transition：
+
+1. 取得上述锁并进入精确 tenant/user authority；
+2. 先检查 receipt replay，再校验 expected epoch/version；
+3. 在 feedback writer fence 内冻结边界，为 retiring epoch 写 immutable checkpoint 与
+   audit anchor；
+4. 创建新 epoch，物化允许 carry 的 manual seed，追加 reset transition。carry 算法固定为：
+   只取 snapshot 时 active 的 direct-manual claim、effective correct result 与 effective pinned
+   claim，按 field/规范值稳定排序去重后成为带 `carried_from_epoch/claim` 的新 manual roots；
+   suppress/revoked/inactive 不 carry，摘要超过 500 rune、tags 超过 12 或单 claim 超限则整
+   事务拒绝。`removed_tags` 通过 epoch snapshot lineage 单独携带，不伪造 claim_id；
+5. 原子切换 active epoch、重编译 `profiles`、全局 version +1，写 response receipt；
+6. 任一步失败整事务回滚，不允许空 transition、半 checkpoint 或只变投影。
+
+restore 只补偿当前 active epoch 的直接创建 reset，并且该 reset 必须是最新未补偿 transition。
+当前 epoch 自 reset 后必须 pristine：无 feedback（即使尚未演化）、无 claim/event、无
+generation/cursor 推进、无 projection/authority mutation、无后续 reset/restore。满足时创建
+更大的新 epoch，按 transition 的 predecessor+watermark 从 raw ledger 精确重放旧投影，并追加
+restore transition；任一条件不满足均返回 Conflict，不提供强制恢复。restore 的“精确”只承诺
+画像投影字节一致：reset 前尚未消费的 feedback 被 reset 有意跳过，restore 新 epoch 的 feedback
+cursor 固定为原 reset fence boundary。旧 active evidence 以带 snapshot identity 的新 evidence
+roots 物化，effective manual authority 按上述 carry 算法物化；旧 epoch event 仍只读审计，
+其 revocability 不跨 epoch 复活。禁止 restore 的 feedback 条件是有意收紧的产品语义。
+
+checkpoint 只是不可变的加速与审计锚点，不是新事实源。它至少绑定 schema、epoch、version、
+generation、claim/event high-water、canonical projection digest、revocation/dependency 状态
+和前一 anchor。restore 的事实源永远是 raw ledger@transition watermark；verified
+checkpoint+tail 必须与 full replay 字节等价，缺失或损坏时 full replay，raw ledger 或
+transition identity 损坏才 fail-closed。本批不删除 raw ledger。
+
+安全与迁移：
+
+- 新表全部 `ENABLE/FORCE RLS`，missing/empty/半套 tenant/user GUC 得到零行或拒写且不能触发
+  bigint cast；专用 reset authority 为 NOLOGIN/NOINHERIT/NOBYPASSRLS，app/legacy claim
+  role 均不可进入。该 role 在 profiles、memberships、claims、feedbacks 等既有参与表上也只
+  获得 reset 所需精确列权限与 tenant+user restrictive policy；feedbacks 不能因 pristine
+  检查而对 reset role 变成跨主体可见。
+- migration Up 必须同时 fence legacy profile cursor、claim/evolution 和 feedback writers；
+  排在 fence 前的在途事务先完整提交并纳入旧 epoch，排在 fence 后的旧 writer 在新 schema
+  提交后 fail-closed。
+- Down 按 `profiles → claim_states → epochs → claims → claim_events → claim_receipts →
+  feedbacks → transition/checkpoint/receipt` 的 producer 兼容顺序取得 ACCESS EXCLUSIVE。
+  仅当全部 active/profile/claim/feedback epoch 都为 0，且不存在 epoch>0、transition、
+  reset receipt 或 checkpoint 时允许降级；epoch 0 的新 producer facts 仍能无损表示为 062
+  ledger，不是拒绝 sentinel。任一不可表示事实都必须以 `P0001` 拒绝并保持 goose 版本/数据。
+- membership revoke 只撤访问、不删 ledger；tenant purge 的画像子图固定按
+  `profile_epoch_receipts → profile_epoch_events → profile_epoch_checkpoints →
+  profile_claim_receipts → profile_claim_events → profile_claims →
+  profile_claim_states → profile_epochs → profiles` 删除。feedbacks 按既有
+  `feedback children → feedbacks → deliveries` 拓扑更早删除。迁移里的 purge-order 常量是
+  单一真相，测试必须用含两个 epoch 的 fixture 逐表断言，避免 state↔epoch 双向不可删环。
+
+feedback 的 attitude supersession、misjudged/deep-dive 部分唯一索引和幂等命中必须绑定 epoch。
+reset 后再次点击旧 delivery 是新 epoch 的新学习事实；deep-dive 已生成正文可以复用，但不能
+用 inactive epoch 的旧 feedback id 冒充当前 epoch 事实。
+
+交付拆分：
+
+- Phase A：固化本契约，建立 feedback/current-epoch writer fence、epoch 归属和 legacy writer
+  fail-closed 地基；零用户可见 reset 入口。
+- Phase B：epoch/checkpoint/reset/restore Store + API，真实 PostgreSQL 并发、RLS、Up/Down、
+  replay-equivalence 与 mutation Gate。
+- Phase C：Web 二次确认、只读历史 epoch、冲突刷新和 owner UAT；生产验收通过前不得标完成。
+
 ## 4. 新包 `profilehint`（画像提示 + per-trace 缓存，scorer/cardgen 共享）
 
 ```go

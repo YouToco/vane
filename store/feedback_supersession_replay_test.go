@@ -60,11 +60,14 @@ func TestLegacyFeedbackRepairReplaySuppressesPairedNegatives(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := f.base.st.pool.Exec(ctx,
-		`UPDATE profiles
-		    SET last_evolved_feedback_id=$1
-		  WHERE tenant_id=$2 AND user_id=$3`,
-		pairs[1].typedID, f.idA.TenantID, f.idA.UserID,
+	profile, err := f.base.st.GetProfileForTenant(
+		ctx, f.idA.TenantID, f.idA.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.base.st.AdvanceProfileCursor(
+		ctx, f.idA.UserID, pairs[1].typedID,
+		profile.UpdatedAt, profile.LastEvolvedFeedbackID,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +98,7 @@ func TestLegacyFeedbackRepairReplaySuppressesPairedNegatives(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	profile, err := f.base.st.GetProfileForTenant(
+	profile, err = f.base.st.GetProfileForTenant(
 		ctx, f.idA.TenantID, f.idA.UserID,
 	)
 	if err != nil {

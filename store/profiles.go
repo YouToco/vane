@@ -229,26 +229,33 @@ func (s *Store) AdvanceProfileCursor(ctx context.Context, userID int64, newCurso
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase, "查询画像游标租户", err)
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	tx, err := s.beginProfileClaimScopedTx(ctx, tenantID, true, userID)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase, "开启画像游标事务", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if exists, err := lockTenantAdmissionRoot(ctx, tx, tenantID); err != nil {
-		return types.NewAppError(types.CodeDatabase, "锁定画像游标租户准入", err)
-	} else if !exists {
-		return types.NewAppError(types.CodeNotFound, "租户不存在", nil)
+	if _, err := lockProfileTx(ctx, tx, tenantID, userID); err != nil {
+		return err
 	}
-	if err := lockExactProfileMembershipRoot(
-		ctx, tx, tenantID, userID); err != nil {
+	_, _, profileEpoch, err := lockProfileClaimStateTx(
+		ctx, tx, tenantID, userID)
+	if err != nil {
+		return err
+	}
+	if err := bindProfileEpochTx(ctx, tx, profileEpoch); err != nil {
 		return err
 	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE profiles
 		 SET last_evolved_feedback_id = $3
 		 WHERE tenant_id = $1 AND user_id = $2
-		   AND updated_at = $4 AND last_evolved_feedback_id = $5`,
-		tenantID, userID, newCursor, expectedAt, expectedCursor)
+		   AND updated_at = $4 AND last_evolved_feedback_id = $5
+		   AND EXISTS (
+		     SELECT 1 FROM profile_claim_states s
+		      WHERE s.tenant_id=$1 AND s.user_id=$2
+		        AND s.active_epoch=$6
+		   )`,
+		tenantID, userID, newCursor, expectedAt, expectedCursor, profileEpoch)
 	if err != nil {
 		return types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("推进画像演化游标（user=%d）", userID), err)
