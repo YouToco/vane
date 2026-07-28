@@ -1191,11 +1191,8 @@ func TestEnvOnlyObservationCanaries(t *testing.T) {
 // default silently leaves synthesis disabled even while systemd exposes the
 // requested variables to the process.
 func TestEnvOnlyExecutiveBriefCanary(t *testing.T) {
-	clearVaneEnv(t)
-	skipIfSystemConfigExists(t)
-	t.Chdir(t.TempDir())
 	const taskID = "task-executive-env"
-	for key, value := range map[string]string{
+	base := map[string]string{
 		"VANE_DB_URL":                                                  "postgres://env",
 		"VANE_PIPELINE_COMPILED_RUNTIME_ENABLED":                       "true",
 		"VANE_PIPELINE_COMPILED_RUNTIME_CANARY_SCHEDULE_ID":            taskID,
@@ -1217,24 +1214,52 @@ func TestEnvOnlyExecutiveBriefCanary(t *testing.T) {
 		"VANE_PIPELINE_EXECUTIVE_BRIEF_ENABLED":                        "true",
 		"VANE_PIPELINE_EXECUTIVE_BRIEF_CANARY_SCHEDULE_ID":             taskID,
 		"VANE_PIPELINE_EXECUTIVE_BRIEF_WEB_CANARY_SCHEDULE_ID":         taskID,
-	} {
-		t.Setenv(key, value)
+		"VANE_PIPELINE_EXECUTIVE_BRIEF_RENDERER_CANARY_SCHEDULE_ID":    taskID,
 	}
 
-	cfg, err := Load("")
-	if err != nil {
-		t.Fatalf("环境变量 executive Brief canary 配置应能启动: %v", err)
-	}
-	if !cfg.Pipeline.ExecutiveBriefEnabled ||
-		cfg.Pipeline.ExecutiveBriefCanaryScheduleID != taskID ||
-		cfg.Pipeline.ExecutiveBriefAllowAll ||
-		cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID != taskID ||
-		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID != "" {
-		t.Fatalf(
-			"VANE_PIPELINE_EXECUTIVE_BRIEF_* 未进入配置或被改写: %+v",
-			cfg.Pipeline,
-		)
-	}
+	t.Run("exact synthesis Web and renderer canary", func(t *testing.T) {
+		clearVaneEnv(t)
+		skipIfSystemConfigExists(t)
+		t.Chdir(t.TempDir())
+		for key, value := range base {
+			t.Setenv(key, value)
+		}
+
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatalf("环境变量 executive Brief canary 配置应能启动: %v", err)
+		}
+		if !cfg.Pipeline.ExecutiveBriefEnabled ||
+			cfg.Pipeline.ExecutiveBriefCanaryScheduleID != taskID ||
+			cfg.Pipeline.ExecutiveBriefAllowAll ||
+			cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID != taskID ||
+			cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID != taskID {
+			t.Fatalf(
+				"VANE_PIPELINE_EXECUTIVE_BRIEF_* 未进入配置或被改写: %+v",
+				cfg.Pipeline,
+			)
+		}
+	})
+
+	t.Run("allow all key reaches validation", func(t *testing.T) {
+		clearVaneEnv(t)
+		skipIfSystemConfigExists(t)
+		t.Chdir(t.TempDir())
+		for key, value := range base {
+			t.Setenv(key, value)
+		}
+		t.Setenv("VANE_PIPELINE_EXECUTIVE_BRIEF_ALLOW_ALL", "true")
+
+		_, err := Load("")
+		if err == nil || !strings.Contains(
+			err.Error(), "executive brief canary 与 allow_all 不能同时启用",
+		) {
+			t.Fatalf(
+				"环境变量 allow_all 应进入配置并触发 canary 冲突，实得 %v",
+				err,
+			)
+		}
+	})
 }
 
 // TestDefaults 验证内置默认值与 config.example.yaml 一致。
