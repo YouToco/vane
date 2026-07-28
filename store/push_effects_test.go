@@ -103,6 +103,16 @@ func newPushEffectFixtureAt(t *testing.T, version int64) pushEffectFixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
+	// The table validates this timestamp against its own created_at and caps
+	// the provider window at one hour. Derive the fixture from the same
+	// database clock and leave a full minute of margin: host/container clock
+	// skew or scheduler delay must not turn an unrelated recovery test into a
+	// push_effect_idempotency_window_valid failure.
+	var databaseNow time.Time
+	if err := db.QueryRowContext(ctx, `SELECT clock_timestamp()`).
+		Scan(&databaseNow); err != nil {
+		t.Fatal(err)
+	}
 	f := pushEffectFixture{
 		store: st, db: db, provider: provider,
 		prepared: pusheffect.Prepared{
@@ -114,8 +124,8 @@ func newPushEffectFixtureAt(t *testing.T, version int64) pushEffectFixture {
 			ProviderChatID: "oc_owner_p2p", Target: "ou_target",
 			Card:         []byte(`{"card":"frozen"}`),
 			ProviderUUID: uuid.NewString(),
-			IdempotencyExpiresAt: time.Now().UTC().
-				Truncate(time.Microsecond).Add(time.Hour),
+			IdempotencyExpiresAt: databaseNow.UTC().
+				Truncate(time.Microsecond).Add(59 * time.Minute),
 		},
 	}
 	if version >= 47 {
