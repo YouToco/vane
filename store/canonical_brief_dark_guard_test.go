@@ -103,7 +103,8 @@ func TestCanonicalBriefP1EHasOnlyScopedProductionCallPoints(t *testing.T) {
 			"api/briefs.go": true,
 		},
 		"LoadCanonicalBriefForFeedbackV1": {
-			"feedback/service.go": true,
+			"feedback/service.go":    true,
+			"store/brief_feedback.go": true,
 		},
 	}
 	var calls []string

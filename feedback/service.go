@@ -69,6 +69,15 @@ type canonicalBriefFeedbackStore interface {
 	) (types.BriefV1, bool, error)
 }
 
+type executiveBriefFeedbackStore interface {
+	LoadExecutiveBriefForFeedbackV1(
+		ctx context.Context,
+		userID int64,
+		deliveryID int64,
+		batchID int64,
+	) (types.ExecutiveBriefArtifactV1, bool, error)
+}
+
 // Sender 把 markdown 回复到指定消息下（生产实现 *feishu.Manager.ReplyMarkdown）。
 type Sender interface {
 	ReplyMarkdown(ctx context.Context, parentMessageID, markdown string) error
@@ -598,6 +607,27 @@ func (s *Service) rebuildAggregate(ctx context.Context, clicked *types.Delivery,
 			EffectID: effectID, Items: items,
 			CanonicalBrief: &briefMeta,
 		})
+		if executiveReader, ok :=
+			s.deps.Store.(executiveBriefFeedbackStore); ok {
+			artifact, executiveFound, loadErr :=
+				executiveReader.LoadExecutiveBriefForFeedbackV1(
+					ctx, clicked.UserID, clicked.ID, briefMeta.BatchID)
+			if loadErr != nil {
+				return "", loadErr
+			}
+			if executiveFound {
+				cardJSON = s.deps.BuildAggCard(AggregateCardInput{
+					HeaderTitle: title, HeaderTemplate: tmpl,
+					EffectID: effectID, Items: items,
+					CanonicalBrief: &briefMeta,
+					Executive:      &artifact.Content,
+					ExecutiveFallback: artifact.GenerationMode ==
+						types.ExecutiveGenerationFallback,
+					ExecutivePartial: artifact.Processing ==
+						types.RunCompletenessPartial,
+				})
+			}
+		}
 		if len(cardJSON) > AggregateCardMaxBytesV1 {
 			return "", errors.New("canonical Brief 反馈卡超过 provider 字节上限")
 		}

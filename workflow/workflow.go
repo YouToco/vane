@@ -590,6 +590,9 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 			pushIn.CanonicalBatchID = canonicalBatchID
 		}
 	}
+	if executiveArtifactDraft != nil {
+		pushIn.ExecutiveBrief = executiveArtifactDraft
+	}
 	if err := workflow.ExecuteActivity(
 		pushCtx, a.Push, pushIn).Get(pushCtx, nil); err != nil {
 		outcomeProcessing = types.RunCompletenessPartial

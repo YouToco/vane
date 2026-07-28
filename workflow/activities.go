@@ -836,9 +836,10 @@ type PushIn struct {
 	// CanonicalOutcome marks only the P1-C command shape. Draft is nil when
 	// every observation was already owned by another exact run and therefore
 	// no delivery/Brief exists.
-	CanonicalOutcome *types.RunOutcomeMarkerV1 `json:"canonical_outcome,omitempty"`
-	CanonicalBrief   *types.BriefDraftV1       `json:"canonical_brief,omitempty"`
-	CanonicalBatchID int64                     `json:"canonical_batch_id,omitempty"`
+	CanonicalOutcome *types.RunOutcomeMarkerV1            `json:"canonical_outcome,omitempty"`
+	CanonicalBrief   *types.BriefDraftV1                  `json:"canonical_brief,omitempty"`
+	CanonicalBatchID int64                                `json:"canonical_batch_id,omitempty"`
+	ExecutiveBrief   *types.ExecutiveBriefArtifactDraftV1 `json:"executive_brief,omitempty"`
 }
 
 // RecordEmptyIn 是 RecordEmptyBatch Activity 的入参（009 / 契约 §16「空批次缺口」）。
@@ -4265,6 +4266,18 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 					HeaderTitle: title, HeaderTemplate: tmpl,
 					EffectID: effectID, Items: items,
 					CanonicalBrief: &meta,
+					Executive: func() *types.ExecutiveBriefContentV1 {
+						if in.ExecutiveBrief == nil {
+							return nil
+						}
+						return &in.ExecutiveBrief.Content
+					}(),
+					ExecutiveFallback: in.ExecutiveBrief != nil &&
+						in.ExecutiveBrief.GenerationMode ==
+							types.ExecutiveGenerationFallback,
+					ExecutivePartial: in.ExecutiveBrief != nil &&
+						in.ExecutiveBrief.Processing ==
+							types.RunCompletenessPartial,
 				})
 			}
 			buildCanonicalCard = func(effectID string) string {
