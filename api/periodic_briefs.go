@@ -21,6 +21,10 @@ func (s *server) handleListPeriodicBriefReports(
 		writeError(w, http.StatusBadRequest, "缺少 schedule id")
 		return
 	}
+	if !s.executiveBriefTaskEnabled(taskID) {
+		writeError(w, http.StatusNotFound, "周期报告未启用")
+		return
+	}
 	query := store.PeriodicBriefReportQueryV1{
 		Cursor: r.URL.Query().Get("cursor"),
 		Cadence: store.BriefReportCadenceV1(
@@ -53,13 +57,17 @@ func (s *server) handleListPeriodicBriefReports(
 		writeAppError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, page)
+	writeJSON(w, http.StatusOK, publicPeriodicBriefReportPageV1(page))
 }
 
 func (s *server) handleGetBriefReportSettings(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
+	if !s.executiveBriefTaskEnabled(r.PathValue("id")) {
+		writeError(w, http.StatusNotFound, "周期报告未启用")
+		return
+	}
 	principal, err := auth.PrincipalFromContext(r.Context())
 	if err != nil {
 		writeAppError(w, err)
@@ -79,6 +87,10 @@ func (s *server) handlePatchBriefReportSettings(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
+	if !s.executiveBriefTaskEnabled(r.PathValue("id")) {
+		writeError(w, http.StatusNotFound, "周期报告未启用")
+		return
+	}
 	var patch store.BriefReportSettingsPatchV1
 	body := http.MaxBytesReader(w, r.Body, reportSettingsBodyLimit)
 	decoder := json.NewDecoder(body)

@@ -567,7 +567,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 			// synthesis is recovered to deterministic fallback out of band.
 			outcomeProcessing = types.RunCompletenessPartial
 			log.Warn("executive Brief synthesis unavailable; continuing push",
-				"trace_id", traceID, "err", err)
+				"trace_id", traceID, "error_code", types.CodeOf(err))
 		} else {
 			executiveArtifactDraft = &synthesized.ArtifactDraft
 			if synthesized.Fallback {

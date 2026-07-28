@@ -17,6 +17,7 @@ const (
 	maxExecutiveNextSteps     = 3
 	maxExecutiveRefs          = 32
 	maxPeriodicBriefInputs    = 20
+	maxPeriodicRunOutcomes    = 2048
 )
 
 type ExecutiveDecisionStateV1 string
@@ -39,6 +40,7 @@ func (s ExecutiveDecisionStateV1) Valid() bool {
 }
 
 type ExecutiveSignalKindV1 string
+type ExecutiveSignalLifecycleV1 string
 
 const (
 	ExecutiveSignalOpportunity ExecutiveSignalKindV1 = "opportunity"
@@ -51,6 +53,23 @@ func (k ExecutiveSignalKindV1) Valid() bool {
 	switch k {
 	case ExecutiveSignalOpportunity, ExecutiveSignalRisk,
 		ExecutiveSignalChange, ExecutiveSignalTrend:
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	ExecutiveSignalNew         ExecutiveSignalLifecycleV1 = "new"
+	ExecutiveSignalPersistent  ExecutiveSignalLifecycleV1 = "persistent"
+	ExecutiveSignalIntensified ExecutiveSignalLifecycleV1 = "intensified"
+	ExecutiveSignalFaded       ExecutiveSignalLifecycleV1 = "faded"
+)
+
+func (s ExecutiveSignalLifecycleV1) Valid() bool {
+	switch s {
+	case ExecutiveSignalNew, ExecutiveSignalPersistent,
+		ExecutiveSignalIntensified, ExecutiveSignalFaded:
 		return true
 	default:
 		return false
@@ -114,10 +133,11 @@ func (r ExecutiveEvidenceRefV1) validate(periodic bool) error {
 }
 
 type ExecutiveSignalV1 struct {
-	Kind         ExecutiveSignalKindV1    `json:"kind"`
-	Title        string                   `json:"title"`
-	Summary      string                   `json:"summary"`
-	EvidenceRefs []ExecutiveEvidenceRefV1 `json:"evidence_refs"`
+	Kind         ExecutiveSignalKindV1      `json:"kind"`
+	Lifecycle    ExecutiveSignalLifecycleV1 `json:"lifecycle,omitempty"`
+	Title        string                     `json:"title"`
+	Summary      string                     `json:"summary"`
+	EvidenceRefs []ExecutiveEvidenceRefV1   `json:"evidence_refs"`
 }
 
 type ExecutiveNextStepV1 struct {
@@ -159,6 +179,8 @@ func (c ExecutiveBriefContentV1) validate(periodic bool) error {
 	refCount := 0
 	for _, signal := range c.Signals {
 		if !signal.Kind.Valid() ||
+			(periodic && !signal.Lifecycle.Valid()) ||
+			(!periodic && signal.Lifecycle != "") ||
 			!validBriefText(signal.Title, maxExecutiveHeadlineBytes, false) ||
 			!validBriefText(signal.Summary, maxExecutiveTextBytes, false) ||
 			len(signal.EvidenceRefs) == 0 {
@@ -243,7 +265,7 @@ func (c ExecutiveBriefContentV1) BindBriefID(
 			ref.BriefID = briefID
 		}
 	}
-	if err := bound.ValidatePeriodic(); err != nil {
+	if err := bound.validate(false); err != nil {
 		return ExecutiveBriefContentV1{}, err
 	}
 	return bound, nil
@@ -330,6 +352,15 @@ type ExecutiveBriefArtifactV1 struct {
 	ExecutiveBriefArtifactDraftV1
 }
 
+// ExecutiveBriefRenderV1 is the minimal channel projection shared by an
+// immutable artifact and its already-terminal synthesis receipt during the
+// narrow Push→artifact-freeze window.
+type ExecutiveBriefRenderV1 struct {
+	GenerationMode ExecutiveGenerationModeV1 `json:"generation_mode"`
+	Processing     RunCompletenessV1         `json:"processing"`
+	Content        ExecutiveBriefContentV1   `json:"content"`
+}
+
 func (d ExecutiveBriefArtifactDraftV1) Seal(
 	id int64, briefSnapshotID int64,
 ) (ExecutiveBriefArtifactV1, error) {
@@ -395,6 +426,8 @@ type PeriodicBriefReportDraftV1 struct {
 	ProfileDigest  string                    `json:"profile_digest"`
 	InputDigest    string                    `json:"input_digest"`
 	Inputs         []PeriodicBriefInputV1    `json:"inputs"`
+	RunOutcomeIDs  []int64                   `json:"run_outcome_ids"`
+	OutcomeDigest  string                    `json:"outcome_digest"`
 	GenerationMode ExecutiveGenerationModeV1 `json:"generation_mode"`
 	SourceCoverage RunCompletenessV1         `json:"source_coverage"`
 	Processing     RunCompletenessV1         `json:"processing"`
@@ -410,6 +443,10 @@ func (d PeriodicBriefReportDraftV1) Canonical() (
 	d.Inputs = append([]PeriodicBriefInputV1(nil), d.Inputs...)
 	sort.Slice(d.Inputs, func(i, j int) bool {
 		return d.Inputs[i].BriefID < d.Inputs[j].BriefID
+	})
+	d.RunOutcomeIDs = append([]int64(nil), d.RunOutcomeIDs...)
+	sort.Slice(d.RunOutcomeIDs, func(i, j int) bool {
+		return d.RunOutcomeIDs[i] < d.RunOutcomeIDs[j]
 	})
 	if err := d.Validate(); err != nil {
 		return PeriodicBriefReportDraftV1{}, err
@@ -433,7 +470,9 @@ func (d PeriodicBriefReportDraftV1) Validate() error {
 		d.ProfileEpoch < 0 || d.ProfileVersion < 0 ||
 		!validBriefDigest(d.ProfileDigest) ||
 		!validBriefDigest(d.InputDigest) ||
+		!validBriefDigest(d.OutcomeDigest) ||
 		len(d.Inputs) > maxPeriodicBriefInputs ||
+		len(d.RunOutcomeIDs) > maxPeriodicRunOutcomes ||
 		!d.GenerationMode.Valid() ||
 		!d.SourceCoverage.Valid() || !d.Processing.Valid() ||
 		d.Content.validate(true) != nil {
@@ -445,6 +484,13 @@ func (d PeriodicBriefReportDraftV1) Validate() error {
 			return errors.New("periodic brief inputs are invalid")
 		}
 		lastID = input.BriefID
+	}
+	lastOutcomeID := int64(0)
+	for _, outcomeID := range d.RunOutcomeIDs {
+		if outcomeID <= lastOutcomeID {
+			return errors.New("periodic run outcome inputs are invalid")
+		}
+		lastOutcomeID = outcomeID
 	}
 	if d.GenerationMode == ExecutiveGenerationModel &&
 		d.Processing != RunCompletenessComplete {

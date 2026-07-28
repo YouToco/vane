@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/robfig/cron"
 
 	"github.com/YouToco/vane/types"
 )
@@ -84,6 +85,38 @@ type reportTaskScopeV1 struct {
 	SpecJSON json.RawMessage
 	Timezone string
 	Cadence  BriefReportCadenceV1
+}
+
+// lockPeriodicIntentMembershipV1 re-authorizes the durable intent against the
+// live membership and schedule, then holds KEY SHARE locks until the caller's
+// transaction commits. That prevents a revocation from racing a spend claim,
+// input read, or terminal artifact write.
+func lockPeriodicIntentMembershipV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID, userID, intentID int64,
+) (string, error) {
+	var taskID string
+	err := tx.QueryRow(ctx,
+		`SELECT i.task_id
+		   FROM periodic_brief_intents i
+		   JOIN schedules s
+		     ON s.tenant_id=i.tenant_id AND s.user_id=i.user_id
+		    AND s.id=i.task_id
+		   JOIN memberships m
+		     ON m.tenant_id=i.tenant_id AND m.user_id=i.user_id
+		  WHERE i.id=$3 AND i.tenant_id=$1 AND i.user_id=$2
+		  FOR KEY SHARE OF m,s`,
+		tenantID, userID, intentID,
+	).Scan(&taskID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", types.NewAppError(
+			types.CodeNotFound, "周期报告任务不存在", nil)
+	}
+	if err != nil {
+		return "", briefFeedDBError("校验周期报告当前权限", err)
+	}
+	return taskID, nil
 }
 
 func authorizeReportTaskV1(
@@ -162,16 +195,39 @@ func reportScopeFromSpecV1(raw []byte) (reportTaskScopeV1, error) {
 		return reportTaskScopeV1{}, types.NewAppError(
 			types.CodeInternal, "任务时区无效", nil)
 	}
-	cadence := BriefReportCadenceWeekly
+	cadence := BriefReportCadenceMonthly
 	switch {
 	case spec.EverySeconds > 0 && spec.EverySeconds <= 12*60*60:
 		cadence = BriefReportCadenceDaily
-	case spec.EverySeconds > 0 && spec.EverySeconds <= 4*24*60*60:
+	case spec.EverySeconds > 0 &&
+		spec.EverySeconds <= (7*24*60*60)/2:
 		cadence = BriefReportCadenceWeekly
 	case spec.EverySeconds > 0:
 		cadence = BriefReportCadenceMonthly
-	case strings.Contains(spec.Cron, "* * *"):
-		cadence = BriefReportCadenceDaily
+	case spec.Cron != "":
+		parsed, err := cron.ParseStandard(spec.Cron)
+		if err != nil {
+			return reportTaskScopeV1{}, types.NewAppError(
+				types.CodeInternal, "任务周期无效", nil)
+		}
+		location, _ := time.LoadLocation(spec.TZ)
+		// Start one minute before a natural Monday boundary so schedules that
+		// fire exactly at 00:00 are counted in the 28-day sample.
+		start := time.Date(2026, 1, 4, 23, 59, 0, 0, location)
+		end := start.AddDate(0, 0, 28)
+		count := 0
+		for next := parsed.Next(start); next.Before(end); next = parsed.Next(next) {
+			count++
+			if count > 56 {
+				break
+			}
+		}
+		switch {
+		case count >= 56:
+			cadence = BriefReportCadenceDaily
+		case count >= 8:
+			cadence = BriefReportCadenceWeekly
+		}
 	}
 	return reportTaskScopeV1{
 		SpecJSON: append(json.RawMessage(nil), raw...),
@@ -359,6 +415,49 @@ type PeriodicReportScheduleV1 struct {
 	Settings BriefReportSettingsV1
 }
 
+func (s *Store) ListPeriodicReportTaskIDsV1(
+	ctx context.Context,
+	afterTaskID string,
+	limit int,
+) ([]string, error) {
+	if afterTaskID != strings.TrimSpace(afterTaskID) ||
+		len(afterTaskID) > 255 || limit < 1 || limit > 100 {
+		return nil, types.NewAppError(
+			types.CodeValidation, "周期报告任务页无效", nil)
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT s.id
+		   FROM schedules s
+		   JOIN memberships m
+		     ON m.tenant_id=s.tenant_id AND m.user_id=s.user_id
+		  WHERE s.id > $1
+		    AND s.execution_mode='compiled'
+		    AND s.status IN ('active','paused')
+		  ORDER BY s.id
+		  LIMIT $2`,
+		afterTaskID, limit)
+	if err != nil {
+		return nil, briefFeedDBError("读取周期报告任务页", err)
+	}
+	defer rows.Close()
+	taskIDs := make([]string, 0, limit)
+	for rows.Next() {
+		var taskID string
+		if err := rows.Scan(&taskID); err != nil {
+			return nil, briefFeedDBError("扫描周期报告任务页", err)
+		}
+		if taskID == "" || taskID != strings.TrimSpace(taskID) ||
+			len(taskID) > 255 {
+			return nil, periodicIntegrityErrorV1()
+		}
+		taskIDs = append(taskIDs, taskID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, briefFeedDBError("读取周期报告任务页", err)
+	}
+	return taskIDs, nil
+}
+
 func (s *Store) GetPeriodicReportScheduleV1(
 	ctx context.Context,
 	taskID string,
@@ -414,6 +513,117 @@ func (s *Store) GetPeriodicReportScheduleV1(
 			"读取周期报告任务设置", err)
 	}
 	return candidate, nil
+}
+
+// EvaluatePeriodicReportCadenceV1 applies the bounded 28-day density rule.
+// Auto mode needs two consecutive weekly recommendations and a 28-day change
+// fence; manual mode is never changed.
+func (s *Store) EvaluatePeriodicReportCadenceV1(
+	ctx context.Context,
+	taskID string,
+	now time.Time,
+) error {
+	candidate, err := s.GetPeriodicReportScheduleV1(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if candidate.Settings.Mode == BriefReportModeManual {
+		return nil
+	}
+	now = now.Round(0).UTC().Truncate(time.Microsecond)
+	tx, scope, err := authorizeReportTaskV1(
+		ctx, s, candidate.TenantID, candidate.UserID, taskID,
+		"vane_periodic_brief_writer")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var insightCount int64
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(sum(insight_count),0)
+		   FROM brief_snapshots
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
+		    AND generated_at >= $4 AND generated_at < $5`,
+		candidate.TenantID, candidate.UserID, taskID,
+		now.AddDate(0, 0, -28), now,
+	).Scan(&insightCount); err != nil {
+		return briefFeedDBError("统计周期报告信号密度", err)
+	}
+	recommended := BriefReportCadenceMonthly
+	switch {
+	case insightCount >= 3*28:
+		recommended = BriefReportCadenceDaily
+	case insightCount >= 3*4:
+		recommended = BriefReportCadenceWeekly
+	case insightCount == 0:
+		recommended = scope.Cadence
+	}
+	var (
+		mode                   BriefReportModeV1
+		cadence                BriefReportCadenceV1
+		delivery               BriefReportDeliveryV1
+		autoCandidate          *BriefReportCadenceV1
+		streak                 int
+		evaluatedAt, changedAt *time.Time
+	)
+	err = tx.QueryRow(ctx,
+		`SELECT mode,cadence,delivery,auto_candidate,
+		        auto_candidate_streak,auto_evaluated_at,cadence_changed_at
+		   FROM brief_report_settings
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
+		  FOR UPDATE`,
+		candidate.TenantID, candidate.UserID, taskID,
+	).Scan(&mode, &cadence, &delivery, &autoCandidate,
+		&streak, &evaluatedAt, &changedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, err = tx.Exec(ctx,
+			`INSERT INTO brief_report_settings (
+			    tenant_id,user_id,task_id,mode,cadence,delivery,
+			    auto_candidate,auto_candidate_streak,auto_evaluated_at,
+			    cadence_changed_at
+			 ) VALUES ($1,$2,$3,'auto',$4,'important',$5,1,$6,$6)`,
+			candidate.TenantID, candidate.UserID, taskID,
+			scope.Cadence, recommended, now)
+		if err != nil {
+			return briefFeedDBError("初始化智能周期评估", err)
+		}
+		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return briefFeedDBError("锁定智能周期设置", err)
+	}
+	if mode == BriefReportModeManual ||
+		(evaluatedAt != nil && evaluatedAt.After(now.AddDate(0, 0, -7))) {
+		return tx.Commit(ctx)
+	}
+	if autoCandidate != nil && *autoCandidate == recommended {
+		if streak < 2 {
+			streak++
+		}
+	} else {
+		autoCandidate = &recommended
+		streak = 1
+	}
+	nextCadence := cadence
+	if streak >= 2 && cadence != recommended &&
+		(changedAt == nil || !changedAt.After(now.AddDate(0, 0, -28))) {
+		nextCadence = recommended
+	}
+	_, err = tx.Exec(ctx,
+		`UPDATE brief_report_settings
+		    SET cadence=$4,auto_candidate=$5,
+		        auto_candidate_streak=$6,auto_evaluated_at=$7,
+		        cadence_changed_at=CASE WHEN cadence IS DISTINCT FROM $4
+		            THEN $7 ELSE cadence_changed_at END,
+		        updated_at=clock_timestamp()
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
+		    AND mode='auto'`,
+		candidate.TenantID, candidate.UserID, taskID,
+		nextCadence, autoCandidate, streak, now)
+	if err != nil {
+		return briefFeedDBError("更新智能周期评估", err)
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) BindPeriodicBriefIntentRunV1(
@@ -550,11 +760,16 @@ func (s *Store) PreparePeriodicBriefIntentV1(
 	}
 	briefs := make([]briefIdentity, 0)
 	rows, err = tx.Query(ctx,
-		`SELECT id,payload_digest
-		   FROM brief_snapshots
-		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
-		    AND generated_at >= $4 AND generated_at < $5
-		  ORDER BY generated_at DESC,id DESC
+		`SELECT b.id,b.payload_digest
+		   FROM brief_snapshots b
+		   JOIN task_run_outcomes o
+		     ON o.id=b.run_outcome_id
+		    AND o.tenant_id=b.tenant_id AND o.user_id=b.user_id
+		    AND o.task_id=b.task_id
+		  WHERE b.tenant_id=$1 AND b.user_id=$2 AND b.task_id=$3
+		    AND o.status='finalized'
+		    AND o.finalized_at >= $4 AND o.finalized_at < $5
+		  ORDER BY o.finalized_at DESC,b.id DESC
 		  LIMIT 21`,
 		tenantID, userID, taskID, periodStart, periodEnd)
 	if err != nil {
@@ -672,6 +887,23 @@ func (s *Store) LoadPeriodicBriefIntentInputsV1(
 	ctx context.Context,
 	tenantID, userID, intentID int64,
 ) (PeriodicBriefIntentInputsV1, error) {
+	return s.loadPeriodicBriefIntentInputsV1(
+		ctx, tenantID, userID, intentID, "vane_periodic_brief_writer")
+}
+
+func (s *Store) LoadPeriodicBriefIntentInputsForRecoveryV1(
+	ctx context.Context,
+	tenantID, userID, intentID int64,
+) (PeriodicBriefIntentInputsV1, error) {
+	return s.loadPeriodicBriefIntentInputsV1(
+		ctx, tenantID, userID, intentID, "vane_brief_synthesis_recovery")
+}
+
+func (s *Store) loadPeriodicBriefIntentInputsV1(
+	ctx context.Context,
+	tenantID, userID, intentID int64,
+	role string,
+) (PeriodicBriefIntentInputsV1, error) {
 	if intentID <= 0 {
 		return PeriodicBriefIntentInputsV1{}, types.NewAppError(
 			types.CodeValidation, "周期报告意图无效", nil)
@@ -687,6 +919,11 @@ func (s *Store) LoadPeriodicBriefIntentInputsV1(
 		return PeriodicBriefIntentInputsV1{}, briefFeedDBError(
 			"固定周期报告输入路径", err)
 	}
+	_, err = lockPeriodicIntentMembershipV1(
+		ctx, tx, tenantID, userID, intentID)
+	if err != nil {
+		return PeriodicBriefIntentInputsV1{}, err
+	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id',$1,true),
 		        set_config('app.user_id',$2,true)`,
@@ -695,8 +932,7 @@ func (s *Store) LoadPeriodicBriefIntentInputsV1(
 		return PeriodicBriefIntentInputsV1{}, briefFeedDBError(
 			"设置周期报告输入范围", err)
 	}
-	if _, err := tx.Exec(ctx,
-		`SET LOCAL ROLE vane_periodic_brief_writer`); err != nil {
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE `+role); err != nil {
 		return PeriodicBriefIntentInputsV1{}, briefFeedDBError(
 			"进入周期报告输入角色", err)
 	}
@@ -769,6 +1005,10 @@ func (s *Store) LoadPeriodicBriefIntentInputsV1(
 type PeriodicSynthesisReceiptV1 struct {
 	IntentID          int64
 	RequestDigest     string
+	ProfileEpoch      int64
+	ProfileVersion    int64
+	ProfileDigest     string
+	InputDigest       string
 	Status            ExecutiveSynthesisStatusV1
 	GenerationMode    types.ExecutiveGenerationModeV1
 	Content           *types.ExecutiveBriefContentV1
@@ -782,8 +1022,13 @@ func (s *Store) ClaimPeriodicSynthesisSpendV1(
 	ctx context.Context,
 	tenantID, userID, intentID int64,
 	requestDigest string,
+	profileEpoch, profileVersion int64,
+	profileDigest, inputDigest string,
 ) (PeriodicSynthesisReceiptV1, bool, error) {
-	if intentID <= 0 || !validStoreDigestV1(requestDigest) {
+	if intentID <= 0 || !validStoreDigestV1(requestDigest) ||
+		profileEpoch < 0 || profileVersion < 0 ||
+		!validStoreDigestV1(profileDigest) ||
+		!validStoreDigestV1(inputDigest) {
 		return PeriodicSynthesisReceiptV1{}, false,
 			types.NewAppError(types.CodeValidation,
 				"周期综合付费请求无效", nil)
@@ -798,6 +1043,11 @@ func (s *Store) ClaimPeriodicSynthesisSpendV1(
 		`SET LOCAL search_path=pg_catalog,public,pg_temp`); err != nil {
 		return PeriodicSynthesisReceiptV1{}, false,
 			briefFeedDBError("固定周期综合路径", err)
+	}
+	authorizedTaskID, err := lockPeriodicIntentMembershipV1(
+		ctx, tx, tenantID, userID, intentID)
+	if err != nil {
+		return PeriodicSynthesisReceiptV1{}, false, err
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id',$1,true),
@@ -827,18 +1077,26 @@ func (s *Store) ClaimPeriodicSynthesisSpendV1(
 		return PeriodicSynthesisReceiptV1{}, false,
 			briefFeedDBError("锁定周期报告意图", err)
 	}
+	if taskID != authorizedTaskID {
+		return PeriodicSynthesisReceiptV1{}, false,
+			types.NewAppError(types.CodeConflict,
+				"周期报告任务身份已不同", nil)
+	}
 	_, err = tx.Exec(ctx,
 		`INSERT INTO periodic_synthesis_receipts (
-		    intent_id,tenant_id,user_id,task_id,request_digest
-		 ) VALUES ($1,$2,$3,$4,$5)
+		    intent_id,tenant_id,user_id,task_id,request_digest,
+		    profile_epoch,profile_version,profile_digest,input_digest
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		 ON CONFLICT (intent_id) DO NOTHING`,
-		intentID, tenantID, userID, taskID, requestDigest)
+		intentID, tenantID, userID, taskID, requestDigest,
+		profileEpoch, profileVersion, profileDigest, inputDigest)
 	if err != nil {
 		return PeriodicSynthesisReceiptV1{}, false,
 			briefFeedDBError("准备周期综合回执", err)
 	}
 	receipt, err := scanPeriodicSynthesisReceiptV1(tx.QueryRow(ctx,
-		`SELECT intent_id,request_digest,status,generation_mode,
+		`SELECT intent_id,request_digest,profile_epoch,profile_version,
+		        profile_digest,input_digest,status,generation_mode,
 		        content_payload,spending_started_at,finalized_at
 		   FROM periodic_synthesis_receipts
 		  WHERE intent_id=$1 FOR UPDATE`, intentID))
@@ -850,6 +1108,14 @@ func (s *Store) ClaimPeriodicSynthesisSpendV1(
 		return PeriodicSynthesisReceiptV1{}, false,
 			types.NewAppError(types.CodeConflict,
 				"周期综合请求已封存且不同", nil)
+	}
+	if receipt.ProfileEpoch != profileEpoch ||
+		receipt.ProfileVersion != profileVersion ||
+		receipt.ProfileDigest != profileDigest ||
+		receipt.InputDigest != inputDigest {
+		return PeriodicSynthesisReceiptV1{}, false,
+			types.NewAppError(types.CodeConflict,
+				"周期综合画像或输入已封存且不同", nil)
 	}
 	claimed := false
 	if receipt.Status == ExecutiveSynthesisPrepared {
@@ -872,7 +1138,8 @@ func (s *Store) ClaimPeriodicSynthesisSpendV1(
 				briefFeedDBError("标记周期报告运行中", updateErr)
 		}
 		receipt, err = scanPeriodicSynthesisReceiptV1(tx.QueryRow(ctx,
-			`SELECT intent_id,request_digest,status,generation_mode,
+			`SELECT intent_id,request_digest,profile_epoch,profile_version,
+			        profile_digest,input_digest,status,generation_mode,
 			        content_payload,spending_started_at,finalized_at
 			   FROM periodic_synthesis_receipts
 			  WHERE intent_id=$1`, intentID))
@@ -895,7 +1162,9 @@ func scanPeriodicSynthesisReceiptV1(
 	var generation *string
 	var payload []byte
 	err := row.Scan(
-		&receipt.IntentID, &receipt.RequestDigest, &receipt.Status,
+		&receipt.IntentID, &receipt.RequestDigest,
+		&receipt.ProfileEpoch, &receipt.ProfileVersion,
+		&receipt.ProfileDigest, &receipt.InputDigest, &receipt.Status,
 		&generation, &payload, &receipt.SpendingStartedAt,
 		&receipt.FinalizedAt)
 	if err != nil {
@@ -923,6 +1192,30 @@ func (s *Store) FinalizePeriodicBriefReportV1(
 	draft types.PeriodicBriefReportDraftV1,
 	fallback bool,
 ) (types.PeriodicBriefReportV1, error) {
+	return s.finalizePeriodicBriefReportV1(
+		ctx, tenantID, userID, intentID, requestDigest, draft,
+		fallback, "vane_periodic_brief_writer")
+}
+
+func (s *Store) RecoverPeriodicBriefReportV1(
+	ctx context.Context,
+	tenantID, userID, intentID int64,
+	requestDigest string,
+	draft types.PeriodicBriefReportDraftV1,
+) (types.PeriodicBriefReportV1, error) {
+	return s.finalizePeriodicBriefReportV1(
+		ctx, tenantID, userID, intentID, requestDigest, draft,
+		true, "vane_brief_synthesis_recovery")
+}
+
+func (s *Store) finalizePeriodicBriefReportV1(
+	ctx context.Context,
+	tenantID, userID, intentID int64,
+	requestDigest string,
+	draft types.PeriodicBriefReportDraftV1,
+	fallback bool,
+	role string,
+) (types.PeriodicBriefReportV1, error) {
 	if intentID <= 0 || !validStoreDigestV1(requestDigest) ||
 		draft.Validate() != nil || draft.TenantID != tenantID ||
 		draft.UserID != userID {
@@ -940,6 +1233,10 @@ func (s *Store) FinalizePeriodicBriefReportV1(
 		return types.PeriodicBriefReportV1{},
 			briefFeedDBError("固定周期报告终态路径", err)
 	}
+	if _, err := lockPeriodicIntentMembershipV1(
+		ctx, tx, tenantID, userID, intentID); err != nil {
+		return types.PeriodicBriefReportV1{}, err
+	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id',$1,true),
 		        set_config('app.user_id',$2,true)`,
@@ -948,8 +1245,7 @@ func (s *Store) FinalizePeriodicBriefReportV1(
 		return types.PeriodicBriefReportV1{},
 			briefFeedDBError("设置周期报告终态范围", err)
 	}
-	if _, err := tx.Exec(ctx,
-		`SET LOCAL ROLE vane_periodic_brief_writer`); err != nil {
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE `+role); err != nil {
 		return types.PeriodicBriefReportV1{},
 			briefFeedDBError("进入周期报告终态角色", err)
 	}
@@ -1001,11 +1297,27 @@ func (s *Store) FinalizePeriodicBriefReportV1(
 	if tag.RowsAffected() == 0 {
 		var existing types.PeriodicBriefReportV1
 		var existingPayload []byte
+		var existingRequestDigest string
 		err := tx.QueryRow(ctx,
-			`SELECT payload FROM periodic_brief_reports
-			  WHERE intent_id=$1`, intentID).Scan(&existingPayload)
+			`SELECT p.payload,r.request_digest
+			   FROM periodic_brief_reports p
+			   JOIN periodic_synthesis_receipts r
+			     ON r.intent_id=p.intent_id
+			  WHERE p.intent_id=$1`, intentID).Scan(
+			&existingPayload, &existingRequestDigest)
 		if err == nil && json.Unmarshal(existingPayload, &existing) == nil &&
-			existing.Validate() == nil {
+			existing.Validate() == nil &&
+			existingRequestDigest == requestDigest {
+			replayDraft := draft
+			replayDraft.GeneratedAt = existing.GeneratedAt
+			expected, sealErr := replayDraft.Seal(existing.ID)
+			expectedPayload, marshalErr := json.Marshal(expected)
+			if sealErr != nil || marshalErr != nil ||
+				!bytes.Equal(expectedPayload, existingPayload) {
+				return types.PeriodicBriefReportV1{},
+					types.NewAppError(types.CodeConflict,
+						"周期综合终态 claim 不同", nil)
+			}
 			if commitErr := tx.Commit(ctx); commitErr != nil {
 				return types.PeriodicBriefReportV1{}, commitErr
 			}
@@ -1110,6 +1422,101 @@ func (s *Store) AuthorizeAndConsumePeriodicSynthesisQuotaV1(
 			"扣减周期综合配额", err)
 	}
 	return nil
+}
+
+type PeriodicSynthesisRecoveryCursorV1 struct {
+	CandidateAt time.Time
+	IntentID    int64
+}
+
+type PeriodicSynthesisRecoveryCandidateV1 struct {
+	CandidateAt    time.Time
+	Kind           string
+	IntentID       int64
+	TenantID       int64
+	UserID         int64
+	WorkflowID     string
+	TemporalRunID  string
+	RequestDigest  string
+	ProfileEpoch   int64
+	ProfileVersion int64
+	ProfileDigest  string
+	InputDigest    string
+}
+
+func (s *Store) ListPeriodicSynthesisRecoveryCandidatesV1(
+	ctx context.Context,
+	cursor *PeriodicSynthesisRecoveryCursorV1,
+	limit int,
+) ([]PeriodicSynthesisRecoveryCandidateV1, error) {
+	if limit < 1 || limit > 100 {
+		return nil, types.NewAppError(types.CodeValidation,
+			"周期综合恢复页大小无效", nil)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, briefFeedDBError("开启周期综合恢复读取", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SET LOCAL search_path=pg_catalog,public,pg_temp`); err != nil {
+		return nil, briefFeedDBError("固定周期综合恢复路径", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SET LOCAL ROLE vane_brief_synthesis_recovery`); err != nil {
+		return nil, briefFeedDBError("进入周期综合恢复角色", err)
+	}
+	var afterAt any
+	var afterID int64
+	if cursor != nil {
+		afterAt = cursor.CandidateAt
+		afterID = cursor.IntentID
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT candidate_at,recovery_kind,intent_id,tenant_id,user_id,
+		        workflow_id,temporal_run_id,request_digest,profile_epoch,
+		        profile_version,profile_digest,input_digest
+		   FROM read_periodic_synthesis_recovery_v1($1,$2,$3)`,
+		afterAt, afterID, limit)
+	if err != nil {
+		return nil, briefFeedDBError("读取周期综合恢复候选", err)
+	}
+	defer rows.Close()
+	candidates := make([]PeriodicSynthesisRecoveryCandidateV1, 0)
+	for rows.Next() {
+		var candidate PeriodicSynthesisRecoveryCandidateV1
+		if err := rows.Scan(
+			&candidate.CandidateAt, &candidate.Kind,
+			&candidate.IntentID, &candidate.TenantID, &candidate.UserID,
+			&candidate.WorkflowID, &candidate.TemporalRunID,
+			&candidate.RequestDigest, &candidate.ProfileEpoch,
+			&candidate.ProfileVersion, &candidate.ProfileDigest,
+			&candidate.InputDigest); err != nil {
+			return nil, briefFeedDBError(
+				"扫描周期综合恢复候选", err)
+		}
+		candidate.CandidateAt = candidate.CandidateAt.
+			Round(0).UTC().Truncate(time.Microsecond)
+		if (candidate.Kind != "spending" &&
+			candidate.Kind != "prepared") ||
+			candidate.CandidateAt.IsZero() ||
+			candidate.IntentID <= 0 || candidate.TenantID <= 0 ||
+			candidate.UserID <= 0 || candidate.WorkflowID == "" ||
+			(candidate.Kind == "spending" &&
+				(!validStoreDigestV1(candidate.RequestDigest) ||
+					!validStoreDigestV1(candidate.ProfileDigest) ||
+					!validStoreDigestV1(candidate.InputDigest))) {
+			return nil, periodicIntegrityErrorV1()
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, briefFeedDBError("遍历周期综合恢复候选", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, briefFeedDBError("提交周期综合恢复读取", err)
+	}
+	return candidates, nil
 }
 
 type periodicBriefCursorV1 struct {

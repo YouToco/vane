@@ -261,7 +261,8 @@ func run() error {
 		workflow.WithPushEffectCanary(
 			st, cfg.Pipeline.PushEffectCanaryScheduleID))
 	periodicActivities, err := periodicbrief.NewActivities(
-		st, agentLLMClient, recorder, cfg.LLM.Model)
+		st, compiledModelResolver, recorder,
+		manager, cfg.Dashboard.Origin)
 	if err != nil {
 		temporalClient.Close()
 		st.Close()
@@ -316,6 +317,7 @@ func run() error {
 	w.RegisterActivity(activities.NotifyEmptyResult)
 	w.RegisterActivity(activities.Push)
 	w.RegisterActivity(periodicActivities.SynthesizePeriodicBriefV1)
+	w.RegisterActivity(periodicActivities.DeliverPeriodicBriefV1)
 
 	// scheduler 是唯一直接碰 SDK client 的调度封装（供 API 建/删/触发调度）。
 	sched := scheduler.New(temporalClient, cfg.Temporal.TaskQueue, st,
@@ -354,17 +356,23 @@ func run() error {
 			cfg.Pipeline.ExecutiveBriefCanaryScheduleID,
 			cfg.Pipeline.ExecutiveBriefAllowAll,
 		))
-	periodicTaskID := ""
-	if cfg.Pipeline.ExecutiveBriefEnabled {
-		periodicTaskID = cfg.Pipeline.ExecutiveBriefCanaryScheduleID
-	}
 	periodicCoordinator, err := periodicbrief.NewCoordinator(
 		st, temporalClient, cfg.Temporal.TaskQueue,
-		periodicTaskID, slog.Default())
+		cfg.Pipeline.ExecutiveBriefEnabled,
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID,
+		cfg.Pipeline.ExecutiveBriefAllowAll,
+		slog.Default())
 	if err != nil {
 		temporalClient.Close()
 		st.Close()
 		return fmt.Errorf("装配周期 Brief coordinator: %w", err)
+	}
+	periodicRecoveryRunner, err := periodicbrief.NewRecoveryRunner(
+		st, temporalClient, manager, cfg.Dashboard.Origin, slog.Default())
+	if err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("装配周期 Brief recovery: %w", err)
 	}
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
 	// C2b3-2c keeps definition editing dark at every ingress, but already owns
@@ -471,6 +479,11 @@ func run() error {
 		st.Close()
 		return fmt.Errorf("周期 Brief coordinator 首轮 Gate: %w", err)
 	}
+	if err := periodicRecoveryRunner.RunStartup(ctx); err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("周期 Brief recovery 首轮 Gate: %w", err)
+	}
 
 	// Push-effect recovery has a separate exact-task switch from fresh sends.
 	// When enabled, prepare outbound API authority without opening Feishu WS,
@@ -546,6 +559,9 @@ func run() error {
 	})
 	runMaintenance(func() {
 		periodicCoordinator.Run(ctx)
+	})
+	runMaintenance(func() {
+		periodicRecoveryRunner.Run(ctx)
 	})
 
 	// 配额 reconcile（契约 §2.7）：给缺配额行的租户补齐默认额度。同样后台跑、幂等。
@@ -994,8 +1010,13 @@ func run() error {
 		Manager:               manager,
 		Scheduler:             sched,
 		TaskAgent:             agentLoop,
+		BriefFeedback:         fbSvc,
 		TaskActions:           st,
 		DefinitionEditEnabled: cfg.Agent.DefinitionEditEnabled,
+		ExecutiveBriefEnabled: cfg.Pipeline.ExecutiveBriefEnabled,
+		ExecutiveBriefCanaryScheduleID: cfg.Pipeline.
+			ExecutiveBriefCanaryScheduleID,
+		ExecutiveBriefAllowAll: cfg.Pipeline.ExecutiveBriefAllowAll,
 		// HTTP 面的 principal 来自会话中间件注入的 ctx（企业级契约 §1.1 的最终形态）；
 		// a2a/gate 无 HTTP 会话，仍用 owner 回退——这正是把 principal 做成接口的价值。
 		Principal: auth.NewContextResolver(),

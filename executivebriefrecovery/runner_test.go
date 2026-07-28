@@ -49,6 +49,25 @@ func (f *recoveryStoreFake) LoadExecutiveSynthesisReceiptV1(
 	return f.receipt, nil
 }
 
+func (f *recoveryStoreFake) GetProfileForTenant(
+	context.Context, int64, int64,
+) (*types.Profile, error) {
+	return nil, types.NewAppError(types.CodeNotFound, "missing", nil)
+}
+
+func (f *recoveryStoreFake) PrepareExecutiveSynthesisRecoveryV1(
+	_ context.Context, _ types.RunIdentity, _ types.RunSnapshotRef,
+	prepare store.ExecutiveSynthesisPrepareV1,
+) (store.ExecutiveSynthesisReceiptV1, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.receipt = store.ExecutiveSynthesisReceiptV1{
+		ExecutiveSynthesisPrepareV1: prepare,
+		Status:                      store.ExecutiveSynthesisPrepared,
+	}
+	return f.receipt, nil
+}
+
 func (f *recoveryStoreFake) RecoverExecutiveSynthesisFallbackV1(
 	_ context.Context, _ types.RunIdentity, _ types.RunSnapshotRef,
 	_ types.RunOutcomeMarkerV1, content types.ExecutiveBriefContentV1,
@@ -65,7 +84,7 @@ func (f *recoveryStoreFake) RecoverExecutiveSynthesisFallbackV1(
 	return f.receipt, nil
 }
 
-func (f *recoveryStoreFake) FreezeExecutiveBriefArtifactV1(
+func (f *recoveryStoreFake) FreezeExecutiveBriefArtifactRecoveryV1(
 	_ context.Context, _ types.RunIdentity, _ types.RunSnapshotRef,
 	draft types.ExecutiveBriefArtifactDraftV1,
 ) (types.ExecutiveBriefArtifactV1, error) {

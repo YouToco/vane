@@ -38,8 +38,12 @@ type Store interface {
 	GetProfileForTenant(
 		context.Context, int64, int64,
 	) (*types.Profile, error)
+	LoadPeriodicSynthesisPolicyV1(
+		context.Context, int64, int64, string, int64,
+	) (store.PeriodicSynthesisPolicyV1, error)
 	ClaimPeriodicSynthesisSpendV1(
 		context.Context, int64, int64, int64, string,
+		int64, int64, string, string,
 	) (store.PeriodicSynthesisReceiptV1, bool, error)
 	FinalizePeriodicBriefReportV1(
 		context.Context, int64, int64, int64, string,
@@ -50,24 +54,37 @@ type Store interface {
 	) error
 }
 
+type ModelResolver interface {
+	ResolveRuntimeModelPolicyV1(
+		runtimepolicy.ModelPolicyV1,
+	) (*llm.Client, error)
+}
+
 type Activities struct {
-	store    Store
-	client   *llm.Client
-	recorder *llm.Recorder
-	model    string
+	store           Store
+	modelResolver   ModelResolver
+	recorder        *llm.Recorder
+	deliveryStore   DeliveryStore
+	sender          DeliverySender
+	dashboardOrigin string
 }
 
 func NewActivities(
 	st Store,
-	client *llm.Client,
+	modelResolver ModelResolver,
 	recorder *llm.Recorder,
-	model string,
+	sender DeliverySender,
+	dashboardOrigin string,
 ) (*Activities, error) {
-	if st == nil || client == nil || recorder == nil || model == "" {
+	deliveryStore, ok := st.(DeliveryStore)
+	if st == nil || modelResolver == nil || recorder == nil ||
+		!ok || sender == nil || dashboardOrigin == "" {
 		return nil, errors.New("periodic Brief dependencies are incomplete")
 	}
 	return &Activities{
-		store: st, client: client, recorder: recorder, model: model}, nil
+		store: st, modelResolver: modelResolver, recorder: recorder,
+		deliveryStore: deliveryStore, sender: sender,
+		dashboardOrigin: dashboardOrigin}, nil
 }
 
 func WorkflowV1(
@@ -96,7 +113,16 @@ func WorkflowV1(
 			TraceID:         info.WorkflowExecution.RunID,
 		},
 	).Get(ctx, &report)
-	return report, err
+	if err != nil {
+		return report, err
+	}
+	// Delivery is a separately durable effect. A channel failure never removes
+	// the already-frozen Web report; recovery continues from its receipt.
+	_ = workflow.ExecuteActivity(
+		ctx, "DeliverPeriodicBriefV1",
+		DeliverInputV1{Report: report},
+	).Get(ctx, nil)
+	return report, nil
 }
 
 func (a *Activities) SynthesizePeriodicBriefV1(
@@ -138,14 +164,29 @@ func (a *Activities) SynthesizePeriodicBriefV1(
 			loaded.Intent.TaskID, profile,
 			loaded.Intent.PeriodStart, loaded.Intent.PeriodEnd,
 			loaded.Briefs)
+	var policy store.PeriodicSynthesisPolicyV1
+	policyUnavailable := false
+	if len(selected) > 0 && promptErr == nil {
+		policy, err = a.store.LoadPeriodicSynthesisPolicyV1(
+			ctx, input.TenantID, input.UserID, loaded.Intent.TaskID,
+			selected[0].RunSnapshotID)
+		if types.CodeOf(err) == types.CodeNotFound {
+			policyUnavailable = true
+			err = nil
+		}
+		if err != nil {
+			return types.PeriodicBriefReportV1{}, err
+		}
+	}
 	requestDigest, err := synthesisRequestDigestV1(
-		loaded.Intent.InputDigest, profileDigest, a.model)
+		loaded.Intent.InputDigest, profileDigest, policy)
 	if err != nil {
 		return types.PeriodicBriefReportV1{}, err
 	}
 	receipt, claimed, err := a.store.ClaimPeriodicSynthesisSpendV1(
 		ctx, input.TenantID, input.UserID, input.IntentID,
-		requestDigest)
+		requestDigest, profile.Epoch, profile.Version,
+		profileDigest, loaded.Intent.InputDigest)
 	if err != nil {
 		return types.PeriodicBriefReportV1{}, err
 	}
@@ -159,7 +200,7 @@ func (a *Activities) SynthesizePeriodicBriefV1(
 			types.NewAppError(types.CodeConflict,
 				"周期综合已结束", nil)
 	}
-	fallback := promptErr != nil || len(selected) == 0
+	fallback := promptErr != nil || len(selected) == 0 || policyUnavailable
 	var content types.ExecutiveBriefContentV1
 	if len(selected) == 0 {
 		content = quietContentV1()
@@ -170,16 +211,25 @@ func (a *Activities) SynthesizePeriodicBriefV1(
 			return types.PeriodicBriefReportV1{}, err
 		}
 	} else {
-		temperature := float32(0.2)
-		maxTokens := 2400
-		tenantID, userID := input.TenantID, input.UserID
-		quotaRule := runtimepolicy.QuotaBucketV1{
-			Name:               string(store.QuotaLLMTokens),
-			Financial:          true,
-			EnforcementVersion: runtimepolicy.QuotaEnforcementLLMPrechargeV1,
+		modelClient, resolveErr :=
+			a.modelResolver.ResolveRuntimeModelPolicyV1(policy.ModelPolicy)
+		if resolveErr != nil {
+			fallback = true
+			content, err =
+				executivebrief.DeterministicPeriodicFallbackV1(selected)
+			if err != nil {
+				return types.PeriodicBriefReportV1{}, err
+			}
 		}
+		if fallback {
+			goto synthesisComplete
+		}
+		temperature := float32(policy.ModelCall.Temperature)
+		maxTokens := policy.ModelCall.MaxTokens
+		tenantID, userID := input.TenantID, input.UserID
+		quotaRule := policy.QuotaRule
 		response, callErr := llm.Do(
-			ctx, a.client, a.recorder,
+			ctx, modelClient, a.recorder,
 			llm.CallMeta{
 				TraceID: input.TraceID, TenantID: &tenantID,
 				UserID:    &userID,
@@ -196,10 +246,10 @@ func (a *Activities) SynthesizePeriodicBriefV1(
 				},
 			},
 			llm.Request{
-				System: executivebrief.PeriodicSystemPromptV1,
-				User:   prompt, Model: a.model,
+				System: policy.SystemPrompt,
+				User:   prompt, Model: policy.ModelCall.Model,
 				Temperature: &temperature, MaxTokens: &maxTokens,
-				DisableThinking: true,
+				DisableThinking: policy.ModelCall.DisableThinking,
 			},
 		)
 		if callErr == nil {
@@ -215,6 +265,7 @@ func (a *Activities) SynthesizePeriodicBriefV1(
 			}
 		}
 	}
+synthesisComplete:
 	processing := loaded.Intent.Processing
 	if fallback || selectionPartial {
 		processing = types.RunCompletenessPartial
@@ -242,6 +293,9 @@ func (a *Activities) SynthesizePeriodicBriefV1(
 		ProfileDigest:  profileDigest,
 		InputDigest:    loaded.Intent.InputDigest,
 		Inputs:         inputs,
+		RunOutcomeIDs: append(
+			[]int64(nil), loaded.Intent.RunOutcomeIDs...),
+		OutcomeDigest:  loaded.Intent.OutcomeDigest,
 		GenerationMode: types.ExecutiveGenerationModel,
 		SourceCoverage: loaded.Intent.SourceCoverage,
 		Processing:     processing,
@@ -261,18 +315,25 @@ func (a *Activities) SynthesizePeriodicBriefV1(
 }
 
 func synthesisRequestDigestV1(
-	inputDigest, profileDigest, model string,
+	inputDigest, profileDigest string,
+	policy store.PeriodicSynthesisPolicyV1,
 ) (string, error) {
+	renderer, model, policyDigest := "periodic-brief.quiet/v1", "none", ""
+	if policy.PolicyDigest != "" {
+		renderer, model, policyDigest =
+			policy.Renderer, policy.ModelCall.Model, policy.PolicyDigest
+	}
 	payload, err := json.Marshal(struct {
 		SchemaVersion string `json:"schema_version"`
 		InputDigest   string `json:"input_digest"`
 		ProfileDigest string `json:"profile_digest"`
 		Renderer      string `json:"renderer"`
 		Model         string `json:"model"`
+		PolicyDigest  string `json:"policy_digest,omitempty"`
 	}{
 		SchemaVersion: types.PeriodicBriefSchemaVersionV1,
 		InputDigest:   inputDigest, ProfileDigest: profileDigest,
-		Renderer: "periodic-brief.render/v1", Model: model,
+		Renderer: renderer, Model: model, PolicyDigest: policyDigest,
 	})
 	if err != nil {
 		return "", err

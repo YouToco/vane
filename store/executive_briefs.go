@@ -197,6 +197,27 @@ func (s *Store) PrepareExecutiveSynthesisV1(
 	ref types.RunSnapshotRef,
 	prepare ExecutiveSynthesisPrepareV1,
 ) (ExecutiveSynthesisReceiptV1, error) {
+	return s.prepareExecutiveSynthesisV1(
+		ctx, expected, ref, prepare, "vane_brief_synthesis_writer")
+}
+
+func (s *Store) PrepareExecutiveSynthesisRecoveryV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	prepare ExecutiveSynthesisPrepareV1,
+) (ExecutiveSynthesisReceiptV1, error) {
+	return s.prepareExecutiveSynthesisV1(
+		ctx, expected, ref, prepare, "vane_brief_synthesis_recovery")
+}
+
+func (s *Store) prepareExecutiveSynthesisV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	prepare ExecutiveSynthesisPrepareV1,
+	role string,
+) (ExecutiveSynthesisReceiptV1, error) {
 	if err := prepare.validate(expected, ref); err != nil {
 		return ExecutiveSynthesisReceiptV1{}, err
 	}
@@ -213,7 +234,8 @@ func (s *Store) PrepareExecutiveSynthesisV1(
 	if err != nil {
 		return ExecutiveSynthesisReceiptV1{}, err
 	}
-	if !found || stage.status != "staged" ||
+	if !found ||
+		(stage.status != "staged" && stage.status != "promoted") ||
 		stage.draft.PushBatchID != prepare.PushBatchID ||
 		stage.draft.RunSnapshotID != ref.SnapshotID {
 		return ExecutiveSynthesisReceiptV1{},
@@ -225,8 +247,14 @@ func (s *Store) PrepareExecutiveSynthesisV1(
 			canonicalBriefDatabaseError(
 				"leave canonical Brief writer role", err)
 	}
+	if role == "vane_brief_synthesis_recovery" {
+		if err := lockExecutiveRecoveryMembershipV1(
+			ctx, tx, expected); err != nil {
+			return ExecutiveSynthesisReceiptV1{}, err
+		}
+	}
 	if _, err := tx.Exec(
-		ctx, `SET LOCAL ROLE vane_brief_synthesis_writer`); err != nil {
+		ctx, `SET LOCAL ROLE `+role); err != nil {
 		return ExecutiveSynthesisReceiptV1{},
 			canonicalBriefDatabaseError(
 				"enter executive synthesis writer role", err)
@@ -303,6 +331,9 @@ func validateExecutiveContentReferencesV1(
 	}
 	validateRefs := func(refs []types.ExecutiveEvidenceRefV1) bool {
 		for _, ref := range refs {
+			if ref.BriefID != 0 {
+				return false
+			}
 			claimCount, ok := claimsByInsight[ref.InsightID]
 			if !ok {
 				return false
@@ -612,6 +643,27 @@ func (s *Store) FreezeExecutiveBriefArtifactV1(
 	ref types.RunSnapshotRef,
 	draft types.ExecutiveBriefArtifactDraftV1,
 ) (types.ExecutiveBriefArtifactV1, error) {
+	return s.freezeExecutiveBriefArtifactV1(
+		ctx, expected, ref, draft, false)
+}
+
+func (s *Store) FreezeExecutiveBriefArtifactRecoveryV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	draft types.ExecutiveBriefArtifactDraftV1,
+) (types.ExecutiveBriefArtifactV1, error) {
+	return s.freezeExecutiveBriefArtifactV1(
+		ctx, expected, ref, draft, true)
+}
+
+func (s *Store) freezeExecutiveBriefArtifactV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	draft types.ExecutiveBriefArtifactDraftV1,
+	recovery bool,
+) (types.ExecutiveBriefArtifactV1, error) {
 	if err := draft.Validate(); err != nil ||
 		draft.RunSnapshotID != ref.SnapshotID ||
 		draft.TenantID != expected.TenantID ||
@@ -621,7 +673,8 @@ func (s *Store) FreezeExecutiveBriefArtifactV1(
 			canonicalBriefValidationError(
 				"executive Brief artifact is invalid")
 	}
-	tx, err := s.beginExecutiveSynthesisTxV1(ctx, expected, ref, false)
+	tx, err := s.beginExecutiveSynthesisTxV1(
+		ctx, expected, ref, recovery)
 	if err != nil {
 		return types.ExecutiveBriefArtifactV1{}, err
 	}
@@ -774,6 +827,13 @@ func (s *Store) beginExecutiveSynthesisTxV1(
 		return nil, canonicalBriefDatabaseError(
 			"leave canonical Brief writer role", err)
 	}
+	if recovery {
+		if err := lockExecutiveRecoveryMembershipV1(
+			ctx, tx, expected); err != nil {
+			rollbackCompiledTaskTx(ctx, tx)
+			return nil, err
+		}
+	}
 	role := "vane_brief_synthesis_writer"
 	if recovery {
 		role = "vane_brief_synthesis_recovery"
@@ -785,6 +845,32 @@ func (s *Store) beginExecutiveSynthesisTxV1(
 			"enter executive synthesis role", err)
 	}
 	return tx, nil
+}
+
+func lockExecutiveRecoveryMembershipV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected types.RunIdentity,
+) error {
+	var authorized bool
+	err := tx.QueryRow(ctx,
+		`SELECT true
+		   FROM schedules s
+		   JOIN memberships m
+		     ON m.tenant_id=s.tenant_id AND m.user_id=s.user_id
+		  WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.id=$3
+		  FOR KEY SHARE OF s,m`,
+		expected.TenantID, expected.UserID, expected.TaskID,
+	).Scan(&authorized)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return canonicalBriefNotFoundError(
+			"executive synthesis recovery scope is unavailable")
+	}
+	if err != nil {
+		return canonicalBriefDatabaseError(
+			"lock executive synthesis recovery scope", err)
+	}
+	return nil
 }
 
 func ExecutiveSynthesisInputDigestV1(

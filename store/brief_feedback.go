@@ -15,21 +15,21 @@ import (
 func (s *Store) LoadExecutiveBriefForFeedbackV1(
 	ctx context.Context,
 	userID, deliveryID, batchID int64,
-) (types.ExecutiveBriefArtifactV1, bool, error) {
+) (types.ExecutiveBriefRenderV1, bool, error) {
 	brief, found, err := s.LoadCanonicalBriefForFeedbackV1(
 		ctx, userID, deliveryID, batchID)
 	if err != nil || !found {
-		return types.ExecutiveBriefArtifactV1{}, false, err
+		return types.ExecutiveBriefRenderV1{}, false, err
 	}
 	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
-		return types.ExecutiveBriefArtifactV1{}, false,
+		return types.ExecutiveBriefRenderV1{}, false,
 			briefFeedDBError("开启执行简报反馈读取事务", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx,
 		`SET LOCAL search_path=pg_catalog,public,pg_temp`); err != nil {
-		return types.ExecutiveBriefArtifactV1{}, false,
+		return types.ExecutiveBriefRenderV1{}, false,
 			briefFeedDBError("固定执行简报反馈读取路径", err)
 	}
 	if _, err := tx.Exec(ctx,
@@ -37,11 +37,11 @@ func (s *Store) LoadExecutiveBriefForFeedbackV1(
 		        set_config('app.user_id',$2,true)`,
 		strconv.FormatInt(brief.TenantID, 10),
 		strconv.FormatInt(userID, 10)); err != nil {
-		return types.ExecutiveBriefArtifactV1{}, false,
+		return types.ExecutiveBriefRenderV1{}, false,
 			briefFeedDBError("设置执行简报反馈读取范围", err)
 	}
 	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_brief_reader`); err != nil {
-		return types.ExecutiveBriefArtifactV1{}, false,
+		return types.ExecutiveBriefRenderV1{}, false,
 			briefFeedDBError("进入执行简报反馈读取角色", err)
 	}
 	var payload []byte
@@ -54,32 +54,81 @@ func (s *Store) LoadExecutiveBriefForFeedbackV1(
 		brief.ID, brief.TenantID, userID, brief.TaskID,
 	).Scan(&payload, &digest)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return types.ExecutiveBriefArtifactV1{}, false, nil
+		if _, resetErr := tx.Exec(ctx, `RESET ROLE`); resetErr != nil {
+			return types.ExecutiveBriefRenderV1{}, false,
+				briefFeedDBError("退出执行简报反馈读取角色", resetErr)
+		}
+		if _, roleErr := tx.Exec(ctx,
+			`SET LOCAL ROLE vane_brief_synthesis_recovery`); roleErr != nil {
+			return types.ExecutiveBriefRenderV1{}, false,
+				briefFeedDBError("进入执行简报回执读取角色", roleErr)
+		}
+		var generation types.ExecutiveGenerationModeV1
+		var processing types.RunCompletenessV1
+		err = tx.QueryRow(ctx,
+			`SELECT r.generation_mode,r.processing,r.content_payload
+			   FROM executive_brief_synthesis_receipts r
+			   JOIN brief_snapshots b
+			     ON b.run_outcome_id=r.run_outcome_id
+			    AND b.tenant_id=r.tenant_id
+			    AND b.user_id=r.user_id
+			    AND b.task_id=r.task_id
+			  WHERE b.id=$1 AND r.tenant_id=$2 AND r.user_id=$3
+			    AND r.task_id=$4 AND r.push_batch_id=$5
+			    AND r.status IN ('finalized','fallback')`,
+			brief.ID, brief.TenantID, userID, brief.TaskID, batchID,
+		).Scan(&generation, &processing, &payload)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return types.ExecutiveBriefRenderV1{}, false, nil
+		}
+		if err != nil {
+			return types.ExecutiveBriefRenderV1{}, false,
+				briefFeedDBError("读取执行简报终态回执", err)
+		}
+		var content types.ExecutiveBriefContentV1
+		if !generation.Valid() || !processing.Valid() ||
+			json.Unmarshal(payload, &content) != nil ||
+			content.ValidateIssue() != nil {
+			return types.ExecutiveBriefRenderV1{}, false,
+				canonicalBriefIntegrityError()
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return types.ExecutiveBriefRenderV1{}, false,
+				briefFeedDBError("提交执行简报回执读取", err)
+		}
+		return types.ExecutiveBriefRenderV1{
+			GenerationMode: generation,
+			Processing:     processing,
+			Content:        content,
+		}, true, nil
 	}
 	if err != nil {
-		return types.ExecutiveBriefArtifactV1{}, false,
+		return types.ExecutiveBriefRenderV1{}, false,
 			briefFeedDBError("读取执行简报反馈 artifact", err)
 	}
 	var artifact types.ExecutiveBriefArtifactV1
-	canonical, marshalErr := json.Marshal(artifact)
 	if json.Unmarshal(payload, &artifact) != nil {
-		return types.ExecutiveBriefArtifactV1{}, false,
+		return types.ExecutiveBriefRenderV1{}, false,
 			canonicalBriefIntegrityError()
 	}
-	canonical, marshalErr = json.Marshal(artifact)
+	canonical, marshalErr := json.Marshal(artifact)
 	if marshalErr != nil || !bytes.Equal(canonical, payload) ||
 		artifact.Validate() != nil || artifact.Digest != digest ||
 		artifact.BriefSnapshotID != brief.ID ||
 		artifact.PushBatchID != batchID ||
 		artifact.UserID != userID {
-		return types.ExecutiveBriefArtifactV1{}, false,
+		return types.ExecutiveBriefRenderV1{}, false,
 			canonicalBriefIntegrityError()
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return types.ExecutiveBriefArtifactV1{}, false,
+		return types.ExecutiveBriefRenderV1{}, false,
 			briefFeedDBError("提交执行简报反馈读取", err)
 	}
-	return artifact, true, nil
+	return types.ExecutiveBriefRenderV1{
+		GenerationMode: artifact.GenerationMode,
+		Processing:     artifact.Processing,
+		Content:        artifact.Content,
+	}, true, nil
 }
 
 // LoadCanonicalBriefForFeedbackV1 resolves one already-authorized delivery

@@ -95,6 +95,93 @@ func (m *Manager) ResolvePushEffectMessage(
 	)
 }
 
+// ResolvePeriodicReportMessage uses the same exact app/chat/time/card digest
+// fence as push-effect reconciliation. Periodic cards include their immutable
+// report ID in the frozen bytes, so no callback marker is needed.
+func (m *Manager) ResolvePeriodicReportMessage(
+	ctx context.Context,
+	query pusheffect.HistoryQuery,
+) (pusheffect.HistoryObservation, error) {
+	return m.resolveMessageByHistory(ctx, query, false)
+}
+
+func (m *Manager) resolveMessageByHistory(
+	ctx context.Context,
+	query pusheffect.HistoryQuery,
+	requireMarker bool,
+) (pusheffect.HistoryObservation, error) {
+	if !validPushHistoryQuery(query) {
+		return pusheffect.HistoryObservation{}, types.NewAppError(
+			types.CodeValidation,
+			"push effect history query is invalid", nil)
+	}
+	client, _, ok := m.apiForExpectedApp(query.AppIdentity)
+	if !ok {
+		return pusheffect.HistoryObservation{}, types.NewAppError(
+			types.CodeConflict,
+			"飞书 App 身份与 push effect 历史查询不一致", nil)
+	}
+	matches := make(map[string]struct{})
+	pageToken := ""
+	for page := 0; page < pushHistoryMaxPages; page++ {
+		builder := larkim.NewListMessageReqBuilder().
+			ContainerIdType("chat").
+			ContainerId(query.ProviderChatID).
+			StartTime(strconv.FormatInt(query.StartTime.Unix(), 10)).
+			EndTime(strconv.FormatInt(query.EndTime.Unix(), 10)).
+			SortType("ByCreateTimeAsc").
+			PageSize(pushHistoryPageSize).
+			CardMsgContentType("raw_card_content")
+		if pageToken != "" {
+			builder.PageToken(pageToken)
+		}
+		resp, err := client.Im.Message.List(ctx, builder.Build())
+		if err != nil || !resp.Success() || resp.Data == nil {
+			return pusheffect.HistoryObservation{}, types.NewAppError(
+				types.CodePushFailed, "飞书周期报告历史核对失败", nil)
+		}
+		for _, item := range resp.Data.Items {
+			if periodicHistoryItemMatches(item, query, requireMarker) {
+				matches[*item.MessageId] = struct{}{}
+			}
+		}
+		if resp.Data.HasMore == nil || !*resp.Data.HasMore {
+			return summarizePushHistoryMatches(matches), nil
+		}
+		if resp.Data.PageToken == nil || *resp.Data.PageToken == "" {
+			return pusheffect.HistoryObservation{}, types.NewAppError(
+				types.CodeConflict, "飞书周期报告历史分页不完整", nil)
+		}
+		pageToken = *resp.Data.PageToken
+	}
+	return pusheffect.HistoryObservation{}, types.NewAppError(
+		types.CodeConflict, "飞书周期报告历史超过核对上限", nil)
+}
+
+func periodicHistoryItemMatches(
+	item *larkim.Message,
+	query pusheffect.HistoryQuery,
+	requireMarker bool,
+) bool {
+	if item == nil || item.MessageId == nil || *item.MessageId == "" ||
+		item.ChatId == nil || *item.ChatId != query.ProviderChatID ||
+		item.MsgType == nil || *item.MsgType != "interactive" ||
+		item.Sender == nil || item.Sender.Id == nil ||
+		*item.Sender.Id != query.AppIdentity ||
+		item.Sender.IdType == nil || *item.Sender.IdType != "app_id" ||
+		item.Sender.SenderType == nil ||
+		*item.Sender.SenderType != "app" ||
+		item.Body == nil || item.Body.Content == nil ||
+		(item.Deleted != nil && *item.Deleted) {
+		return false
+	}
+	card := *item.Body.Content
+	if requireMarker && !cardHasExactEffectMarker(card, query.EffectID) {
+		return false
+	}
+	return pusheffect.CardMatchesDigest([]byte(card), query.CardDigest)
+}
+
 func validPushHistoryQuery(query pusheffect.HistoryQuery) bool {
 	return validStableMessageUUID(query.EffectID) &&
 		validOwnerChatID(query.ProviderChatID) &&

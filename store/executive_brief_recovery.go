@@ -127,7 +127,8 @@ func (s *Store) ListExecutiveSynthesisRecoveryCandidatesV1(
 			candidate.FinalizedAt = &value
 		}
 		if (candidate.Kind != "fallback" &&
-			candidate.Kind != "freeze") ||
+			candidate.Kind != "freeze" &&
+			candidate.Kind != "prepare") ||
 			candidate.CandidateAt.IsZero() ||
 			candidate.Marker.Validate() != nil ||
 			candidate.Identity.Validate() != nil ||
@@ -221,7 +222,7 @@ func (s *Store) RecoverExecutiveSynthesisFallbackV1(
 		       content_digest=encode(sha256($2),'hex'),
 		       finalized_at=clock_timestamp()
 		 WHERE run_outcome_id=$1
-		   AND status IN ('spending','ambiguous')`,
+		   AND status IN ('prepared','spending','ambiguous')`,
 		marker.ID, payload)
 	if err != nil {
 		return ExecutiveSynthesisReceiptV1{},

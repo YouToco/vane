@@ -13,7 +13,7 @@ func testExecutiveContentV1(periodic bool) ExecutiveBriefContentV1 {
 	if periodic {
 		ref.BriefID = 7
 	}
-	return ExecutiveBriefContentV1{
+	content := ExecutiveBriefContentV1{
 		Headline:         "本期有一项值得关注的变化",
 		ExecutiveSummary: "供应商调整了关键能力，可能影响当前产品路线。",
 		DecisionState:    ExecutiveDecisionWatch,
@@ -27,6 +27,10 @@ func testExecutiveContentV1(periodic bool) ExecutiveBriefContentV1 {
 			Rationale: "核对对现有路线的影响。", EvidenceRefs: []ExecutiveEvidenceRefV1{ref},
 		}},
 	}
+	if periodic {
+		content.Signals[0].Lifecycle = ExecutiveSignalNew
+	}
+	return content
 }
 
 func TestExecutiveBriefArtifactV1SealAndValidate(t *testing.T) {
@@ -111,6 +115,8 @@ func TestPeriodicBriefReportV1CanonicalizesInputsAndRequiresBriefRefs(t *testing
 			{BriefID: 9, Digest: strings.Repeat("c", 64)},
 			{BriefID: 7, Digest: strings.Repeat("d", 64)},
 		},
+		RunOutcomeIDs: []int64{6, 4},
+		OutcomeDigest: strings.Repeat("e", 64),
 		GenerationMode: ExecutiveGenerationModel,
 		SourceCoverage: RunCompletenessComplete,
 		Processing:     RunCompletenessComplete,
@@ -120,7 +126,8 @@ func TestPeriodicBriefReportV1CanonicalizesInputsAndRequiresBriefRefs(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Inputs[0].BriefID != 7 || report.Validate() != nil {
+	if report.Inputs[0].BriefID != 7 ||
+		report.RunOutcomeIDs[0] != 4 || report.Validate() != nil {
 		t.Fatalf("periodic report = %+v", report)
 	}
 	bad := draft

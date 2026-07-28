@@ -531,7 +531,7 @@ func (s *Store) LoadPreparedBriefDraftV1(
 	if err != nil {
 		return types.BriefDraftV1{}, false, err
 	}
-	if found && stage.status != "staged" {
+	if found && stage.status != "staged" && stage.status != "promoted" {
 		return types.BriefDraftV1{}, false, canonicalBriefIntegrityError()
 	}
 	if err := commitCanonicalBriefTxV1(

@@ -190,7 +190,7 @@ func TestExecutiveSynthesisAtMostOnceLifecycleAndArtifactReplay(
 		Processing:     types.RunCompletenessComplete,
 		GeneratedAt:    *finalized.FinalizedAt, Content: content,
 	}
-	artifact, err := f.base.st.FreezeExecutiveBriefArtifactV1(
+	artifact, err := f.base.st.FreezeExecutiveBriefArtifactRecoveryV1(
 		t.Context(), f.identity, f.ref, artifactDraft)
 	if err != nil {
 		t.Fatal(err)

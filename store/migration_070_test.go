@@ -52,12 +52,61 @@ func TestMigration070SynthesisRolesAreLeastPrivilegeAndEmptyDown(
 		"executive_brief_synthesis_receipts", "INSERT", true)
 	checkPrivilege("vane_brief_synthesis_writer",
 		"executive_brief_synthesis_receipts", "DELETE", false)
-	checkPrivilege("vane_brief_synthesis_recovery",
-		"executive_brief_synthesis_receipts", "SELECT", true)
+	var recoveryCanReadAny bool
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT has_any_column_privilege(
+		    'vane_brief_synthesis_recovery',
+		    'executive_brief_synthesis_receipts','SELECT')`,
+	).Scan(&recoveryCanReadAny); err != nil {
+		t.Fatal(err)
+	}
+	if !recoveryCanReadAny {
+		t.Fatal("recovery role cannot read receipt columns")
+	}
 	checkPrivilege("vane_brief_synthesis_recovery",
 		"executive_brief_synthesis_receipts", "INSERT", false)
+	var insertIdentity, insertStatus bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT has_column_privilege(
+		           'vane_brief_synthesis_recovery',
+		           'executive_brief_synthesis_receipts',
+		           'run_outcome_id','INSERT'),
+		       has_column_privilege(
+		           'vane_brief_synthesis_recovery',
+		           'executive_brief_synthesis_receipts',
+		           'status','INSERT')`,
+	).Scan(&insertIdentity, &insertStatus); err != nil {
+		t.Fatal(err)
+	}
+	if !insertIdentity || insertStatus {
+		t.Fatalf("recovery receipt INSERT boundary = %t/%t",
+			insertIdentity, insertStatus)
+	}
 	checkPrivilege("vane_brief_synthesis_recovery",
 		"executive_brief_artifacts", "SELECT", false)
+	var recoveryArtifactRead, recoveryArtifactInsert,
+		recoveryArtifactDelete bool
+	if err := db.QueryRowContext(t.Context(), `
+		SELECT has_column_privilege(
+		           'vane_brief_synthesis_recovery',
+		           'executive_brief_artifacts','payload','SELECT'),
+		       has_column_privilege(
+		           'vane_brief_synthesis_recovery',
+		           'executive_brief_artifacts','id','INSERT'),
+		       has_table_privilege(
+		           'vane_brief_synthesis_recovery',
+		           'executive_brief_artifacts','DELETE')`,
+	).Scan(
+		&recoveryArtifactRead, &recoveryArtifactInsert,
+		&recoveryArtifactDelete); err != nil {
+		t.Fatal(err)
+	}
+	if !recoveryArtifactRead || !recoveryArtifactInsert ||
+		recoveryArtifactDelete {
+		t.Fatalf("recovery artifact boundary = %t/%t/%t",
+			recoveryArtifactRead, recoveryArtifactInsert,
+			recoveryArtifactDelete)
+	}
 
 	if _, err := provider.DownTo(t.Context(), 69); err != nil {
 		t.Fatalf("empty 070 Down failed: %v", err)
@@ -76,19 +125,25 @@ func TestMigration070SynthesisRolesAreLeastPrivilegeAndEmptyDown(
 			t.Fatalf("070 Down left %s", object)
 		}
 	}
-	var roleCount int
+	var roleCount, privilegedRoleCount int
 	if err := db.QueryRowContext(t.Context(), `
-		SELECT count(*) FROM pg_roles
+		SELECT count(*),
+		       count(*) FILTER (
+		           WHERE has_any_column_privilege(
+		                     rolname,'brief_snapshots','SELECT')
+		       )
+		  FROM pg_roles
 		 WHERE rolname = ANY($1)`,
 		[]string{
 			"vane_brief_synthesis_writer",
 			"vane_brief_synthesis_recovery",
 		},
-	).Scan(&roleCount); err != nil {
+	).Scan(&roleCount, &privilegedRoleCount); err != nil {
 		t.Fatal(err)
 	}
-	if roleCount != 0 {
-		t.Fatalf("070 Down left synthesis roles: %d", roleCount)
+	if roleCount != 2 || privilegedRoleCount != 0 {
+		t.Fatalf("070 Down role boundary roles=%d privileged=%d",
+			roleCount, privilegedRoleCount)
 	}
 }
 

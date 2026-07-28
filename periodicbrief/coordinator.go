@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"go.temporal.io/api/enums/v1"
@@ -11,14 +12,23 @@ import (
 	"go.temporal.io/sdk/client"
 
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/types"
 )
 
 const (
 	CoordinatorInterval = 30 * time.Second
 	CoordinatorTimeout  = 30 * time.Second
+	CoordinatorPageSize = 100
+	CoordinatorWorkers  = 4
 )
 
 type CoordinatorStore interface {
+	ListPeriodicReportTaskIDsV1(
+		context.Context, string, int,
+	) ([]string, error)
+	EvaluatePeriodicReportCadenceV1(
+		context.Context, string, time.Time,
+	) error
 	GetPeriodicReportScheduleV1(
 		context.Context, string,
 	) (store.PeriodicReportScheduleV1, error)
@@ -35,6 +45,8 @@ type Coordinator struct {
 	store       CoordinatorStore
 	temporal    client.Client
 	taskQueue   string
+	enabled     bool
+	allowAll    bool
 	exactTaskID string
 	logger      *slog.Logger
 }
@@ -42,23 +54,30 @@ type Coordinator struct {
 func NewCoordinator(
 	st CoordinatorStore,
 	temporalClient client.Client,
-	taskQueue, exactTaskID string,
+	taskQueue string,
+	enabled bool,
+	exactTaskID string,
+	allowAll bool,
 	logger *slog.Logger,
 ) (*Coordinator, error) {
 	if st == nil || temporalClient == nil || taskQueue == "" {
 		return nil, errors.New("periodic Brief coordinator dependencies are incomplete")
+	}
+	if enabled && (exactTaskID == "") == !allowAll {
+		return nil, errors.New("periodic Brief rollout scope is invalid")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Coordinator{
 		store: st, temporal: temporalClient, taskQueue: taskQueue,
-		exactTaskID: exactTaskID, logger: logger,
+		enabled: enabled, exactTaskID: exactTaskID,
+		allowAll: allowAll, logger: logger,
 	}, nil
 }
 
 func (c *Coordinator) RunStartup(ctx context.Context) error {
-	if c.exactTaskID == "" {
+	if !c.enabled {
 		return nil
 	}
 	passCtx, cancel := context.WithTimeout(ctx, CoordinatorTimeout)
@@ -67,7 +86,7 @@ func (c *Coordinator) RunStartup(ctx context.Context) error {
 }
 
 func (c *Coordinator) Run(ctx context.Context) {
-	if c.exactTaskID == "" {
+	if !c.enabled {
 		return
 	}
 	ticker := time.NewTicker(CoordinatorInterval)
@@ -83,20 +102,73 @@ func (c *Coordinator) Run(ctx context.Context) {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				c.logger.WarnContext(ctx,
 					"periodic Brief coordinator pass failed",
-					"error", err)
+					"error_code", types.CodeOf(err))
 			}
 		}
 	}
 }
 
 func (c *Coordinator) runOnce(ctx context.Context) error {
+	if !c.allowAll {
+		return c.runTask(ctx, c.exactTaskID)
+	}
+	var (
+		after string
+		errs  []error
+	)
+	for {
+		taskIDs, err := c.store.ListPeriodicReportTaskIDsV1(
+			ctx, after, CoordinatorPageSize)
+		if err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+		if len(taskIDs) == 0 {
+			break
+		}
+		sem := make(chan struct{}, CoordinatorWorkers)
+		var wg sync.WaitGroup
+		var errMu sync.Mutex
+		for _, taskID := range taskIDs {
+			select {
+			case <-ctx.Done():
+				errs = append(errs, ctx.Err())
+				goto drain
+			case sem <- struct{}{}:
+			}
+			wg.Add(1)
+			go func(taskID string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if taskErr := c.runTask(ctx, taskID); taskErr != nil {
+					errMu.Lock()
+					errs = append(errs, taskErr)
+					errMu.Unlock()
+				}
+			}(taskID)
+		}
+	drain:
+		wg.Wait()
+		after = taskIDs[len(taskIDs)-1]
+		if len(taskIDs) < CoordinatorPageSize || ctx.Err() != nil {
+			break
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (c *Coordinator) runTask(ctx context.Context, taskID string) error {
+	now := time.Now()
+	if err := c.store.EvaluatePeriodicReportCadenceV1(
+		ctx, taskID, now); err != nil {
+		return err
+	}
 	candidate, err := c.store.GetPeriodicReportScheduleV1(
-		ctx, c.exactTaskID)
+		ctx, taskID)
 	if err != nil {
 		return err
 	}
 	start, end, err := previousNaturalPeriodV1(
-		time.Now(), candidate.Settings.Timezone,
+		now, candidate.Settings.Timezone,
 		candidate.Settings.Cadence)
 	if err != nil {
 		return err
@@ -122,7 +194,21 @@ func (c *Coordinator) runOnce(ctx context.Context) error {
 	if err != nil {
 		var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
 		if errors.As(err, &alreadyStarted) {
-			return nil
+			description, describeErr :=
+				c.temporal.DescribeWorkflowExecution(
+					ctx, intent.WorkflowID, intent.TemporalRunID)
+			if describeErr != nil {
+				return describeErr
+			}
+			info := description.GetWorkflowExecutionInfo()
+			if info == nil || info.GetExecution() == nil ||
+				info.GetExecution().GetRunId() == "" {
+				return errors.New(
+					"periodic Brief execution identity is unavailable")
+			}
+			return c.store.BindPeriodicBriefIntentRunV1(
+				ctx, intent.TenantID, intent.UserID, intent.ID,
+				info.GetExecution().GetRunId())
 		}
 		return err
 	}

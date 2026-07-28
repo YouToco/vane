@@ -190,7 +190,9 @@ CREATE TABLE executive_brief_artifacts (
         CHECK (request_digest ~ '^[0-9a-f]{64}$'),
     CONSTRAINT ck_executive_artifacts_payload_digest CHECK (
         payload_digest ~ '^[0-9a-f]{64}$' AND
-        payload_digest=encode(sha256(payload),'hex')
+        payload_digest=(
+            convert_from(payload,'UTF8')::jsonb->>'digest'
+        )
     ),
     CONSTRAINT ck_executive_artifacts_payload
         CHECK (octet_length(payload) BETWEEN 2 AND 262144)
@@ -280,14 +282,32 @@ GRANT SELECT (
     finalized_at,updated_at
 ) ON executive_brief_synthesis_receipts
     TO vane_brief_synthesis_recovery;
+GRANT INSERT (
+    run_outcome_id,tenant_id,user_id,task_id,run_snapshot_id,push_batch_id,
+    schema_version,profile_epoch,profile_version,profile_digest,input_digest,
+    request_digest
+) ON executive_brief_synthesis_receipts
+    TO vane_brief_synthesis_recovery;
 
 GRANT SELECT,INSERT ON executive_brief_artifacts
     TO vane_brief_synthesis_writer;
 GRANT USAGE,SELECT ON SEQUENCE executive_brief_artifacts_id_seq
     TO vane_brief_synthesis_writer;
 GRANT SELECT (
+    id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,
+    push_batch_id,brief_snapshot_id,schema_version,request_digest,
+    payload_digest,payload,generated_at,created_at
+), INSERT (
+    id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,
+    push_batch_id,brief_snapshot_id,schema_version,request_digest,
+    payload_digest,payload,generated_at
+) ON executive_brief_artifacts TO vane_brief_synthesis_recovery;
+GRANT USAGE,SELECT ON SEQUENCE executive_brief_artifacts_id_seq
+    TO vane_brief_synthesis_recovery;
+GRANT SELECT (
     id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id
-) ON brief_snapshots TO vane_brief_synthesis_writer;
+) ON brief_snapshots
+    TO vane_brief_synthesis_writer,vane_brief_synthesis_recovery;
 
 GRANT SELECT (
     id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,
@@ -416,6 +436,27 @@ AS $$
                 AND b.id IS NOT NULL
                 AND a.id IS NULL
             )
+        UNION ALL
+        SELECT o.finalized_at,'prepare',o.id,o.run_snapshot_id,
+               o.tenant_id,o.user_id,o.task_id,s.push_batch_id,
+               'prepared',0,0,repeat('0',64),repeat('0',64),NULL
+          FROM public.task_run_outcomes o
+          JOIN public.canonical_brief_stages s
+            ON s.run_outcome_id=o.id
+           AND s.run_snapshot_id=o.run_snapshot_id
+           AND s.tenant_id=o.tenant_id
+           AND s.user_id=o.user_id
+           AND s.task_id=o.task_id
+          JOIN public.brief_snapshots b ON b.run_outcome_id=o.id
+          LEFT JOIN public.executive_brief_synthesis_receipts r
+            ON r.run_outcome_id=o.id
+          LEFT JOIN public.executive_brief_artifacts a
+            ON a.run_outcome_id=o.id
+         WHERE o.status='finalized'
+           AND o.finalized_at<=clock_timestamp()-interval '2 minutes'
+           AND s.status='promoted'
+           AND r.run_outcome_id IS NULL
+           AND a.id IS NULL
     )
     SELECT c.candidate_at,c.recovery_kind,c.run_outcome_id,
            o.schema_version,c.run_snapshot_id,c.tenant_id,c.user_id,
@@ -426,6 +467,11 @@ AS $$
       FROM candidates c
       JOIN public.task_run_outcomes o ON o.id=c.run_outcome_id
       JOIN public.task_run_snapshots rs ON rs.id=c.run_snapshot_id
+      JOIN public.memberships m
+        ON m.tenant_id=c.tenant_id AND m.user_id=c.user_id
+      JOIN public.schedules s
+        ON s.tenant_id=c.tenant_id AND s.user_id=c.user_id
+       AND s.id=c.task_id
      WHERE after_candidate_at IS NULL OR
            (c.candidate_at,c.run_outcome_id)>
                (after_candidate_at,after_outcome_id)
@@ -486,7 +532,8 @@ REVOKE SELECT (
 ) ON executive_brief_artifacts FROM vane_brief_reader;
 REVOKE SELECT (
     id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id
-) ON brief_snapshots FROM vane_brief_synthesis_writer;
+) ON brief_snapshots
+    FROM vane_brief_synthesis_writer,vane_brief_synthesis_recovery;
 
 DROP TRIGGER executive_synthesis_transition_v1
     ON executive_brief_synthesis_receipts;
@@ -495,9 +542,8 @@ DROP FUNCTION enforce_executive_synthesis_transition_v1();
 DROP TABLE executive_brief_artifacts;
 DROP TABLE executive_brief_synthesis_receipts;
 
-REVOKE USAGE ON SCHEMA public
-    FROM vane_brief_synthesis_writer,vane_brief_synthesis_recovery;
-REVOKE vane_brief_synthesis_writer FROM CURRENT_USER;
-REVOKE vane_brief_synthesis_recovery FROM CURRENT_USER;
-DROP ROLE vane_brief_synthesis_writer;
-DROP ROLE vane_brief_synthesis_recovery;
+-- Roles and memberships are cluster-scoped while goose migrations are
+-- database-scoped. Keep the hardened NOLOGIN roles: another database in the
+-- same PostgreSQL cluster may still be running migration 070.
+DROP OWNED BY vane_brief_synthesis_writer;
+DROP OWNED BY vane_brief_synthesis_recovery;

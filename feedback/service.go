@@ -75,7 +75,7 @@ type executiveBriefFeedbackStore interface {
 		userID int64,
 		deliveryID int64,
 		batchID int64,
-	) (types.ExecutiveBriefArtifactV1, bool, error)
+	) (types.ExecutiveBriefRenderV1, bool, error)
 }
 
 // Sender 把 markdown 回复到指定消息下（生产实现 *feishu.Manager.ReplyMarkdown）。

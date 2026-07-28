@@ -31,11 +31,18 @@ type RecoveryStore interface {
 		context.Context, types.RunIdentity, types.RunSnapshotRef,
 		types.RunOutcomeMarkerV1,
 	) (store.ExecutiveSynthesisReceiptV1, error)
+	GetProfileForTenant(
+		context.Context, int64, int64,
+	) (*types.Profile, error)
+	PrepareExecutiveSynthesisRecoveryV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		store.ExecutiveSynthesisPrepareV1,
+	) (store.ExecutiveSynthesisReceiptV1, error)
 	RecoverExecutiveSynthesisFallbackV1(
 		context.Context, types.RunIdentity, types.RunSnapshotRef,
 		types.RunOutcomeMarkerV1, types.ExecutiveBriefContentV1,
 	) (store.ExecutiveSynthesisReceiptV1, error)
-	FreezeExecutiveBriefArtifactV1(
+	FreezeExecutiveBriefArtifactRecoveryV1(
 		context.Context, types.RunIdentity, types.RunSnapshotRef,
 		types.ExecutiveBriefArtifactDraftV1,
 	) (types.ExecutiveBriefArtifactV1, error)
@@ -165,10 +172,77 @@ func (r *Runner) recoverOne(
 		return types.NewAppError(types.CodeConflict,
 			"executive Brief recovery draft is unavailable", nil)
 	}
-	receipt, err := r.store.LoadExecutiveSynthesisReceiptV1(
-		ctx, candidate.Identity, candidate.Ref, candidate.Marker)
-	if err != nil {
-		return err
+	var receipt store.ExecutiveSynthesisReceiptV1
+	if candidate.Kind == "prepare" {
+		profile := executivebrief.ProfileContextV1{}
+		storedProfile, profileErr := r.store.GetProfileForTenant(
+			ctx, candidate.Identity.TenantID, candidate.Identity.UserID)
+		if profileErr == nil {
+			profile = executivebrief.ProfileContextV1{
+				Epoch:      storedProfile.ProfileEpoch,
+				Version:    storedProfile.ProfileVersion,
+				Industry:   storedProfile.Industry,
+				Occupation: storedProfile.Occupation,
+				Tags:       append([]string(nil), storedProfile.Tags...),
+				Summary:    storedProfile.Summary,
+			}
+		} else if types.CodeOf(profileErr) != types.CodeNotFound {
+			return profileErr
+		}
+		profileDigest, digestErr :=
+			executivebrief.ProfileDigestV1(profile)
+		if digestErr != nil {
+			return digestErr
+		}
+		inputDigest, digestErr :=
+			store.ExecutiveSynthesisInputDigestV1(draft)
+		if digestErr != nil {
+			return digestErr
+		}
+		requestDigest, digestErr :=
+			store.ExecutiveSynthesisRequestDigestV1(
+				profileDigest, inputDigest,
+				"executive-brief.recovery-fallback/v1")
+		if digestErr != nil {
+			return digestErr
+		}
+		receipt, err = r.store.PrepareExecutiveSynthesisRecoveryV1(
+			ctx, candidate.Identity, candidate.Ref,
+			store.ExecutiveSynthesisPrepareV1{
+				Marker:         candidate.Marker,
+				PushBatchID:    draft.PushBatchID,
+				ProfileEpoch:   profile.Epoch,
+				ProfileVersion: profile.Version,
+				ProfileDigest:  profileDigest,
+				InputDigest:    inputDigest,
+				RequestDigest:  requestDigest,
+			})
+		if err != nil {
+			if errors.Is(err, types.ErrConflict) {
+				return nil
+			}
+			return err
+		}
+		content, fallbackErr :=
+			executivebrief.DeterministicFallbackV1(profile, draft)
+		if fallbackErr != nil {
+			return fallbackErr
+		}
+		receipt, err = r.store.RecoverExecutiveSynthesisFallbackV1(
+			ctx, candidate.Identity, candidate.Ref,
+			candidate.Marker, content)
+		if err != nil {
+			if errors.Is(err, types.ErrConflict) {
+				return nil
+			}
+			return err
+		}
+	} else {
+		receipt, err = r.store.LoadExecutiveSynthesisReceiptV1(
+			ctx, candidate.Identity, candidate.Ref, candidate.Marker)
+		if err != nil {
+			return err
+		}
 	}
 	if candidate.Kind == "fallback" {
 		content, fallbackErr := executivebrief.DeterministicFallbackV1(
@@ -195,7 +269,7 @@ func (r *Runner) recoverOne(
 	if err != nil {
 		return err
 	}
-	_, err = r.store.FreezeExecutiveBriefArtifactV1(
+	_, err = r.store.FreezeExecutiveBriefArtifactRecoveryV1(
 		ctx, candidate.Identity, candidate.Ref, artifactDraft)
 	if errors.Is(err, types.ErrNotFound) ||
 		errors.Is(err, types.ErrConflict) {

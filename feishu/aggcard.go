@@ -36,6 +36,7 @@ const (
 	aggEvidenceMaxVisible       = 3
 	aggEvidenceMarkdownMaxBytes = 6 << 10
 	aggEvidenceLabelMaxRunes    = 120
+	periodicBriefCardMaxBytesV1 = 6 << 10
 )
 
 // aggHeaderTemplates 任务名哈希取色的调色板。蓝在首位：兜底与单任务期的默认色。
@@ -110,11 +111,19 @@ func BuildAggregateCard(in feedback.AggregateCardInput) string {
 			"tag": "markdown",
 			"content": fmt.Sprintf(
 				"**%s**　<font color='blue'>%s</font>\n%s\n<font color='grey'>与你有关：%s</font>%s",
-				escapeMarkdown(executive.Headline), state,
-				escapeMarkdown(executive.ExecutiveSummary),
-				escapeMarkdown(executive.WhyForYou), coverage,
+				escapeMarkdown(truncateRunesV1(executive.Headline, 120)), state,
+				escapeMarkdown(truncateRunesV1(
+					executive.ExecutiveSummary, 320)),
+				escapeMarkdown(truncateRunesV1(executive.WhyForYou, 220)),
+				coverage,
 			),
-		}, map[string]any{"tag": "hr"})
+		})
+		if brief := in.CanonicalBrief; validCanonicalBriefCardV1(
+			brief, len(in.Items),
+		) {
+			elements = append(elements, executiveActionColumnsV1(brief.WebURL))
+		}
+		elements = append(elements, map[string]any{"tag": "hr"})
 	}
 	for i, item := range in.Items {
 		if i > 0 {
@@ -153,6 +162,129 @@ func BuildAggregateCard(in feedback.AggregateCardInput) string {
 		"body": map[string]any{"elements": elements},
 	}
 	raw, _ := json.Marshal(card)
+	return string(raw)
+}
+
+func executiveActionColumnsV1(webURL string) map[string]any {
+	actionURL := func(action string) string {
+		parsed, err := url.Parse(webURL)
+		if err != nil {
+			return webURL
+		}
+		fragmentPath, rawQuery, _ := strings.Cut(parsed.Fragment, "?")
+		query, err := url.ParseQuery(rawQuery)
+		if err != nil {
+			return webURL
+		}
+		query.Set("brief_action", action)
+		parsed.Fragment = fragmentPath + "?" + query.Encode()
+		return parsed.String()
+	}
+	button := func(label, action string) any {
+		return map[string]any{
+			"tag": "column", "width": "auto",
+			"elements": []any{map[string]any{
+				"tag": "button", "type": "default", "width": "default",
+				"text": map[string]any{
+					"tag": "plain_text", "content": label},
+				"behaviors": []any{map[string]any{
+					"type":        "open_url",
+					"default_url": actionURL(action),
+				}},
+			}},
+		}
+	}
+	return map[string]any{
+		"tag": "column_set",
+		"columns": []any{
+			button("深入了解", "deep_dive"),
+			button("调整监控", "edit_task"),
+		},
+	}
+}
+
+func BuildPeriodicBriefCardV1(
+	report types.PeriodicBriefReportV1,
+	webURL string,
+) string {
+	if report.Validate() != nil {
+		return ""
+	}
+	parsed, err := url.Parse(webURL)
+	if err != nil || parsed == nil ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") ||
+		parsed.Host == "" || parsed.User != nil {
+		return ""
+	}
+	state := map[types.ExecutiveDecisionStateV1]string{
+		types.ExecutiveDecisionAct:                  "建议行动",
+		types.ExecutiveDecisionWatch:                "继续观察",
+		types.ExecutiveDecisionNoAction:             "暂不行动",
+		types.ExecutiveDecisionInsufficientEvidence: "证据不足",
+	}[report.Content.DecisionState]
+	lifecycle := map[types.ExecutiveSignalLifecycleV1]string{
+		types.ExecutiveSignalNew:         "新增",
+		types.ExecutiveSignalPersistent:  "持续",
+		types.ExecutiveSignalIntensified: "增强",
+		types.ExecutiveSignalFaded:       "消退",
+	}
+	elements := []any{map[string]any{
+		"tag": "markdown",
+		"content": fmt.Sprintf(
+			"**%s**　<font color='blue'>%s</font>\n%s\n<font color='grey'>与你有关：%s</font>",
+			escapeMarkdown(truncateRunesV1(report.Content.Headline, 120)),
+			state,
+			escapeMarkdown(truncateRunesV1(
+				report.Content.ExecutiveSummary, 320)),
+			escapeMarkdown(truncateRunesV1(report.Content.WhyForYou, 220)),
+		),
+	}}
+	if report.SourceCoverage == types.RunCompletenessPartial ||
+		report.Processing == types.RunCompletenessPartial {
+		elements = append(elements, map[string]any{
+			"tag":     "markdown",
+			"content": "<font color='orange'>本期覆盖不完整，请结合完整证据判断。</font>",
+		})
+	}
+	for index, signal := range report.Content.Signals {
+		if index >= 3 {
+			break
+		}
+		elements = append(elements, map[string]any{
+			"tag": "markdown",
+			"content": fmt.Sprintf(
+				"%d. **%s**　<font color='grey'>%s</font>\n%s",
+				index+1,
+				escapeMarkdown(truncateRunesV1(signal.Title, 100)),
+				lifecycle[signal.Lifecycle],
+				escapeMarkdown(truncateRunesV1(signal.Summary, 220)),
+			),
+		})
+	}
+	elements = append(elements,
+		executiveActionColumnsV1(webURL),
+		map[string]any{
+			"tag": "markdown",
+			"content": fmt.Sprintf(
+				"<font color='grey'>报告 #%d · [查看完整周期报告](%s)</font>",
+				report.ID, webURL),
+		})
+	card := map[string]any{
+		"schema": "2.0",
+		"config": map[string]any{},
+		"header": map[string]any{
+			"title": map[string]any{
+				"tag": "plain_text", "content": "📊 Vane 周期情报报告"},
+			"subtitle": map[string]any{
+				"tag": "plain_text", "content": report.Cadence},
+			"template": "blue",
+		},
+		"body": map[string]any{"elements": elements},
+	}
+	raw, _ := json.Marshal(card)
+	if len(raw) > periodicBriefCardMaxBytesV1 {
+		return ""
+	}
 	return string(raw)
 }
 

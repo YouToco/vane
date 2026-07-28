@@ -78,6 +78,11 @@ type toolCallRecKey struct{}
 // toolRunState 是一次 HandleMessage 的工具运行状态。
 type toolRunState struct {
 	activation *activationState
+	// groundedBrief confines a trusted internal Brief/report follow-up to the
+	// exact supplied artifact. It has no tool surface at declaration or
+	// execution time, so source text can inform an answer but can never trigger
+	// network research, a durable proposal, or a write.
+	groundedBrief bool
 	// directTaskCreation 表示用户已经明确要求按当前消息直接生成任务确认卡，
 	// 且没有要求先查询/核对。该模式只缩小当前消息的工具面到 create_schedule；
 	// 它不执行任务，仍须经过 durable proposal + 人工点击确认卡。

@@ -635,7 +635,12 @@ func (c *Config) Validate() error {
 			return errors.New(
 				"config: executive brief canary 与 allow_all 不能同时启用")
 		}
-		if c.Pipeline.ExecutiveBriefAllowAll ||
+		if c.Pipeline.ExecutiveBriefAllowAll &&
+			!c.Pipeline.StructuredEventEvidenceAllowAll {
+			return errors.New(
+				"config: executive brief allow_all 要求 structured event evidence allow_all")
+		}
+		if !c.Pipeline.ExecutiveBriefAllowAll &&
 			executiveBriefCanaryID !=
 				structuredEventEvidenceCanaryID {
 			return errors.New(
