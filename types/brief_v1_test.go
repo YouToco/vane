@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,74 @@ func TestRunOutcomeV1SealBindsIndependentCompleteness(t *testing.T) {
 	tampered.SourceCoverage = RunCompletenessComplete
 	if err := tampered.Validate(); err == nil {
 		t.Fatal("completeness mutation did not invalidate outcome digest")
+	}
+}
+
+func TestBriefV1FreezesOptionalStructuredInsight(t *testing.T) {
+	structured := &StructuredInsightV1{
+		SchemaVersion: StructuredInsightSchemaVersionV1,
+		BodyMD:        "**变化**", WhatChanged: "价格下降",
+		WhyItMatters: "降低成本", ImportanceReason: "直接影响单位经济性",
+		Claims: []StructuredClaimV1{{
+			Text: "下降 20%", Excerpt: "价格下降 20%",
+			SourceRefs: []string{"source-1"},
+		}},
+	}
+	draft := BriefDraftV1{
+		SchemaVersion: BriefSchemaVersionV1,
+		RunOutcomeID:  1, RunSnapshotID: 2, PushBatchID: 3,
+		TenantID: 4, UserID: 5, TaskID: "task-a",
+		GeneratedAt: time.Now(),
+		Insights: []InsightV1{{
+			ID: 6, RankPosition: 1, Title: "标题", BodyMD: "**变化**",
+			SourceURL: "https://example.com/source", DiscoveredAt: time.Now(),
+			Structured: structured,
+		}},
+	}
+	brief, err := draft.Seal(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	structured.Claims[0].SourceRefs[0] = "mutated"
+	if got := brief.Insights[0].Structured.Claims[0].SourceRefs[0]; got != "source-1" {
+		t.Fatalf("sealed structured source mutated through caller alias: %q", got)
+	}
+	tampered := brief
+	tampered.Insights = append([]InsightV1(nil), brief.Insights...)
+	copyStructured := *brief.Insights[0].Structured
+	copyStructured.WhatChanged = "另一变化"
+	tampered.Insights[0].Structured = &copyStructured
+	if err := tampered.Validate(); err == nil {
+		t.Fatal("structured mutation did not invalidate Brief digest")
+	}
+}
+
+func TestBriefV1StructuredBodyMustMatchCanonicalBody(t *testing.T) {
+	draft := BriefDraftV1{
+		SchemaVersion: BriefSchemaVersionV1,
+		RunOutcomeID:  1, RunSnapshotID: 2, PushBatchID: 3,
+		TenantID: 4, UserID: 5, TaskID: "task-a", GeneratedAt: time.Now(),
+		Insights: []InsightV1{{
+			ID: 6, RankPosition: 1, Title: "标题", BodyMD: "legacy body",
+			SourceURL: "https://example.com/source", DiscoveredAt: time.Now(),
+			Structured: &StructuredInsightV1{
+				SchemaVersion: StructuredInsightSchemaVersionV1,
+				BodyMD:        "different body",
+			},
+		}},
+	}
+	if _, err := draft.Seal(7); err == nil {
+		t.Fatal("structured body drift was accepted")
+	}
+}
+
+func TestGeneratedLegacyInsightJSONOmitsStructuredExtension(t *testing.T) {
+	payload, err := json.Marshal(InsightV1{ID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "structured") {
+		t.Fatalf("legacy Insight wire shape gained structured field: %s", payload)
 	}
 }
 

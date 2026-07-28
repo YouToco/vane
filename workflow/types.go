@@ -128,4 +128,8 @@ type GeneratedCard struct {
 	// 会让停在 CardGen 之后的 in-flight workflow 重放时解出空正文、静默推空卡
 	// （契约 §8.2 重放兼容）。
 	BodyMD string `json:"card_json"`
+	// Structured is absent on every historical/runtime-v1 payload. The
+	// omitempty tag keeps their encoded wire shape stable; a future versioned
+	// CardGen Activity may populate it without changing legacy replay.
+	Structured *types.StructuredInsightV1 `json:"structured,omitempty"`
 }
