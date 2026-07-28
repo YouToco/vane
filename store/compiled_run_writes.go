@@ -749,6 +749,8 @@ func (s *Store) EvolveProfileForTaskRunV1(
 	newCursor int64,
 	expectedAt time.Time,
 	expectedCursor int64,
+	expectedEpoch int64,
+	expectedVersion int64,
 ) error {
 	if tags == nil {
 		tags = []string{}
@@ -760,7 +762,8 @@ func (s *Store) EvolveProfileForTaskRunV1(
 	defer rollbackCompiledTaskTx(ctx, tx)
 	if err := evolveProfileClaimsTx(
 		ctx, tx, expected.TenantID, expected.UserID,
-		summary, tags, newCursor, expectedAt, expectedCursor, true,
+		summary, tags, newCursor, expectedAt, expectedCursor,
+		expectedEpoch, expectedVersion, true,
 	); err != nil {
 		return err
 	}
@@ -775,6 +778,8 @@ func (s *Store) AdvanceProfileCursorForTaskRunV1(
 	newCursor int64,
 	expectedAt time.Time,
 	expectedCursor int64,
+	expectedEpoch int64,
+	expectedVersion int64,
 ) error {
 	tx, err := s.beginAuthorizedCompiledRunWriteV1(ctx, expected, ref)
 	if err != nil {
@@ -793,13 +798,17 @@ func (s *Store) AdvanceProfileCursorForTaskRunV1(
 		ctx, tx, expected.TenantID, expected.UserID); err != nil {
 		return err
 	}
-	_, _, profileEpoch, err := lockProfileClaimStateTx(
+	version, _, profileEpoch, err := lockProfileClaimStateTx(
 		ctx, tx, expected.TenantID, expected.UserID)
 	if err != nil {
 		return err
 	}
 	if err := bindProfileEpochTx(ctx, tx, profileEpoch); err != nil {
 		return err
+	}
+	if profileEpoch != expectedEpoch || version != expectedVersion {
+		return types.NewAppError(types.CodeConflict,
+			"compiled task profile epoch/version CAS did not match", nil)
 	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE profiles

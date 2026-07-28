@@ -93,6 +93,7 @@ func TestCanonicalBriefP1EHasOnlyScopedProductionCallPoints(t *testing.T) {
 			if relErr != nil {
 				relative = path
 			}
+			relative = filepath.ToSlash(relative)
 			calls = append(calls, relative+":"+name)
 		}
 		for name, allowedFiles := range scoped {
@@ -105,6 +106,7 @@ func TestCanonicalBriefP1EHasOnlyScopedProductionCallPoints(t *testing.T) {
 			if relErr != nil {
 				relative = path
 			}
+			relative = filepath.ToSlash(relative)
 			if !allowedFiles[relative] {
 				for range found {
 					calls = append(calls, relative+":"+name)

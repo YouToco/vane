@@ -164,7 +164,8 @@ func TestProfileManualAuthority(t *testing.T) {
 	}
 	if err := st.AdvanceProfileCursor(
 		t.Context(), u.ID, cursorState.LastEvolvedFeedbackID+10,
-		cursorState.UpdatedAt, cursorState.LastEvolvedFeedbackID); err != nil {
+		cursorState.UpdatedAt, cursorState.LastEvolvedFeedbackID,
+		cursorState.ProfileEpoch, cursorState.ProfileVersion); err != nil {
 		t.Fatal(err)
 	}
 	edits, err := st.ListProfileEdits(t.Context(), 1, u.ID, 20)

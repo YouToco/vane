@@ -899,11 +899,11 @@ func TestEvolveIntegration(t *testing.T) {
 		}
 		up.set(http.StatusOK, `{"summary":"按快照演化","tags":["Go"]}`)
 		writes := CompiledProfileWritesV1{
-			Evolve: func(ctx context.Context, summary string, tags []string, newCursor int64, expectedAt time.Time, expectedCursor int64) error {
-				return st.EvolveProfile(ctx, uid, summary, tags, newCursor, expectedAt, expectedCursor)
+			Evolve: func(ctx context.Context, summary string, tags []string, newCursor int64, expectedAt time.Time, expectedCursor, expectedEpoch, expectedVersion int64) error {
+				return st.EvolveProfile(ctx, uid, summary, tags, newCursor, expectedAt, expectedCursor, expectedEpoch, expectedVersion)
 			},
-			AdvanceCursor: func(ctx context.Context, newCursor int64, expectedAt time.Time, expectedCursor int64) error {
-				return st.AdvanceProfileCursor(ctx, uid, newCursor, expectedAt, expectedCursor)
+			AdvanceCursor: func(ctx context.Context, newCursor int64, expectedAt time.Time, expectedCursor, expectedEpoch, expectedVersion int64) error {
+				return st.AdvanceProfileCursor(ctx, uid, newCursor, expectedAt, expectedCursor, expectedEpoch, expectedVersion)
 			},
 		}
 		if err := ev.EvolveWithPolicyV1(ctx, 0, uid, "trace-policy-v1", policy, nil, writes); err != nil {

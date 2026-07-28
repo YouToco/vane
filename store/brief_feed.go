@@ -431,26 +431,40 @@ func attachTaskBriefFeedbacksV1(
 		return nil
 	}
 	rows, err := tx.Query(ctx,
-		`SELECT target.delivery_id,COALESCE(preference.action,''),
+		`WITH subject_epoch AS (
+		   SELECT CASE WHEN EXISTS (
+		     SELECT 1 FROM profiles WHERE tenant_id=$1 AND user_id=$2
+		   ) THEN COALESCE((
+		     SELECT active_epoch FROM profile_claim_states
+		      WHERE tenant_id=$1 AND user_id=$2
+		   ),-1) ELSE 0 END AS profile_epoch
+		 )
+		 SELECT target.delivery_id,COALESCE(preference.action,''),
 		        EXISTS (
 		            SELECT 1 FROM feedbacks f
+		            CROSS JOIN subject_epoch e
 		             WHERE f.tenant_id=$1 AND f.user_id=$2
 		               AND f.delivery_id=target.delivery_id
 		               AND f.action='misjudged'
+		               AND f.profile_epoch=e.profile_epoch
 		        ),
 		        EXISTS (
 		            SELECT 1 FROM feedbacks f
+		            CROSS JOIN subject_epoch e
 		             WHERE f.tenant_id=$1 AND f.user_id=$2
 		               AND f.delivery_id=target.delivery_id
 		               AND f.action='deep_dive'
+		               AND f.profile_epoch=e.profile_epoch
 		        )
 		   FROM unnest($3::bigint[]) AS target(delivery_id)
 		   LEFT JOIN LATERAL (
 		       SELECT f.action
 		         FROM feedbacks f
+		         CROSS JOIN subject_epoch e
 		        WHERE f.tenant_id=$1 AND f.user_id=$2
 		          AND f.delivery_id=target.delivery_id
 		          AND f.action IN ('interested','not_interested')
+		          AND f.profile_epoch=e.profile_epoch
 		        ORDER BY f.created_at DESC,f.id DESC
 		        LIMIT 1
 		   ) preference ON true`,

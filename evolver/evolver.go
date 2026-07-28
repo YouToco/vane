@@ -277,9 +277,13 @@ func (e *Evolver) evolve(
 	}
 
 	if writes != nil {
-		err = writes.Evolve(ctx, summary, tags, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+		err = writes.Evolve(
+			ctx, summary, tags, newCursor, p.UpdatedAt,
+			p.LastEvolvedFeedbackID, p.ProfileEpoch, p.ProfileVersion)
 	} else {
-		err = e.st.EvolveProfile(ctx, userID, summary, tags, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+		err = e.st.EvolveProfile(
+			ctx, userID, summary, tags, newCursor, p.UpdatedAt,
+			p.LastEvolvedFeedbackID, p.ProfileEpoch, p.ProfileVersion)
 	}
 	if err != nil {
 		if errors.Is(err, types.ErrConflict) {
@@ -320,10 +324,12 @@ func (e *Evolver) advanceCursorWithoutLearning(
 	var err error
 	if writes != nil {
 		err = writes.AdvanceCursor(
-			ctx, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+			ctx, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID,
+			p.ProfileEpoch, p.ProfileVersion)
 	} else {
 		err = e.st.AdvanceProfileCursor(
-			ctx, userID, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+			ctx, userID, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID,
+			p.ProfileEpoch, p.ProfileVersion)
 	}
 	if errors.Is(err, types.ErrConflict) {
 		slog.Info("evolver: 诊断类反馈游标 CAS 冲突，交由下轮重读",
@@ -354,9 +360,13 @@ func (e *Evolver) discardBatch(
 		"raw", promptguard.TruncateRunes(raw, maxRawWarnRunes))
 	var err error
 	if writes != nil {
-		err = writes.AdvanceCursor(ctx, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+		err = writes.AdvanceCursor(
+			ctx, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID,
+			p.ProfileEpoch, p.ProfileVersion)
 	} else {
-		err = e.st.AdvanceProfileCursor(ctx, userID, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID)
+		err = e.st.AdvanceProfileCursor(
+			ctx, userID, newCursor, p.UpdatedAt, p.LastEvolvedFeedbackID,
+			p.ProfileEpoch, p.ProfileVersion)
 	}
 	if err != nil {
 		if errors.Is(err, types.ErrConflict) {

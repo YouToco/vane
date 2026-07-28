@@ -30,11 +30,19 @@ type undoProfileRequest struct {
 }
 
 type profileClaimActionRequest struct {
+	ExpectedEpoch   *int64 `json:"expected_epoch,omitempty"`
 	ExpectedVersion int64  `json:"expected_version"`
 	Action          string `json:"action"`
 	ClaimID         string `json:"claim_id,omitempty"`
 	EventID         string `json:"event_id,omitempty"`
 	Value           string `json:"value,omitempty"`
+}
+
+type profileEpochActionRequest struct {
+	ExpectedEpoch   int64  `json:"expected_epoch"`
+	ExpectedVersion int64  `json:"expected_version"`
+	Action          string `json:"action"`
+	Scope           string `json:"scope,omitempty"`
 }
 
 func (s *server) handleProfile(w http.ResponseWriter, r *http.Request) {
@@ -242,9 +250,13 @@ func (s *server) handleProfileClaimAction(w http.ResponseWriter, r *http.Request
 		return
 	}
 	action := types.ProfileClaimAction{
+		ExpectedEpoch:   -1,
 		ExpectedVersion: req.ExpectedVersion,
 		Action:          strings.TrimSpace(req.Action),
 		Value:           strings.TrimSpace(req.Value),
+	}
+	if req.ExpectedEpoch != nil {
+		action.ExpectedEpoch = *req.ExpectedEpoch
 	}
 	var err error
 	switch action.Action {
@@ -273,8 +285,8 @@ func (s *server) handleProfileClaimAction(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "action 必须是 correct、suppress、pin 或 revoke")
 		return
 	}
-	if action.ExpectedVersion < 0 {
-		writeError(w, http.StatusBadRequest, "expected_version 不能为负数")
+	if action.ExpectedEpoch < -1 || action.ExpectedVersion < 0 {
+		writeError(w, http.StatusBadRequest, "expected_epoch/expected_version 无效")
 		return
 	}
 	principal, err := auth.PrincipalFromContext(r.Context())
@@ -312,7 +324,7 @@ func decodeProfileClaimActionJSON(
 		return false
 	}
 	allowed := map[string]bool{
-		"expected_version": true, "action": true, "claim_id": true,
+		"expected_epoch": true, "expected_version": true, "action": true, "claim_id": true,
 		"event_id": true, "value": true,
 	}
 	for key := range keys {
@@ -333,6 +345,105 @@ func decodeProfileClaimActionJSON(
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		writeError(w, http.StatusBadRequest, "请求体不是合法的画像主张 JSON")
+		return false
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "请求体只能包含一个 JSON 对象")
+		return false
+	}
+	return true
+}
+
+func (s *server) handleProfileEpochAction(w http.ResponseWriter, r *http.Request) {
+	key, ok := scheduleCommandIdempotencyKey(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "缺少或无效的 Idempotency-Key")
+		return
+	}
+	var req profileEpochActionRequest
+	if !decodeProfileEpochActionJSON(w, r, &req) {
+		return
+	}
+	action := types.ProfileEpochAction{
+		ExpectedEpoch:   req.ExpectedEpoch,
+		ExpectedVersion: req.ExpectedVersion,
+		Action:          strings.TrimSpace(req.Action),
+		Scope:           strings.TrimSpace(req.Scope),
+	}
+	if action.ExpectedEpoch < 0 || action.ExpectedVersion < 0 {
+		writeError(w, http.StatusBadRequest, "expected_epoch/expected_version 不能为负数")
+		return
+	}
+	switch action.Action {
+	case "reset":
+		if action.Scope != "history_learning" {
+			writeError(w, http.StatusBadRequest, "reset 只接受 scope=history_learning")
+			return
+		}
+	case "restore":
+		if action.Scope != "" {
+			writeError(w, http.StatusBadRequest, "restore 不能提供 scope")
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, "action 必须是 reset 或 restore")
+		return
+	}
+	principal, err := auth.PrincipalFromContext(r.Context())
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	digest, err := store.ProfileEditRequestDigest(req)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	result, err := s.deps.Store.ApplyProfileEpochAction(
+		r.Context(), int64(principal.TenantID), principal.UserID,
+		action, key, digest)
+	if err != nil {
+		writeAppError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func decodeProfileEpochActionJSON(
+	w http.ResponseWriter, r *http.Request, dst *profileEpochActionRequest,
+) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, profileEditBodyLimit)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "画像学习请求体过大或无法读取")
+		return false
+	}
+	keys, err := topLevelJSONKeys(data)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "请求体必须是单一 JSON 对象，且字段不能重复")
+		return false
+	}
+	allowed := map[string]bool{
+		"expected_epoch": true, "expected_version": true,
+		"action": true, "scope": true,
+	}
+	for key := range keys {
+		if !allowed[key] {
+			writeError(w, http.StatusBadRequest, "请求体包含未知字段")
+			return false
+		}
+	}
+	for _, required := range []string{"expected_epoch", "expected_version", "action"} {
+		if _, ok := keys[required]; !ok {
+			writeError(w, http.StatusBadRequest, "缺少 "+required)
+			return false
+		}
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法的画像学习 JSON")
 		return false
 	}
 	var trailing any

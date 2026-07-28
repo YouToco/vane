@@ -200,7 +200,7 @@ func insertFeedbackFact(
 			     tenant_id,user_id,delivery_id,action,reason_code,detail
 			 )
 			 VALUES ($1,$2,$3,'misjudged',$4,$5)
-			 ON CONFLICT (delivery_id)
+			 ON CONFLICT (delivery_id,profile_epoch)
 			     WHERE action='misjudged' AND reason_code IS NOT NULL
 			     DO NOTHING
 			 RETURNING id`,
@@ -208,9 +208,19 @@ func insertFeedbackFact(
 		).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			err = tx.QueryRow(ctx,
-				`SELECT id,reason_code,detail FROM feedbacks
-				  WHERE delivery_id=$1 AND action='misjudged'
-				    AND reason_code IS NOT NULL`,
+				`SELECT f.id,f.reason_code,f.detail
+				   FROM feedbacks f
+				   JOIN deliveries d
+				     ON d.id=f.delivery_id AND d.tenant_id=f.tenant_id
+				    AND d.user_id=f.user_id
+				   LEFT JOIN profiles p
+				     ON p.tenant_id=f.tenant_id AND p.user_id=f.user_id
+				   LEFT JOIN profile_claim_states s
+				     ON s.tenant_id=f.tenant_id AND s.user_id=f.user_id
+				  WHERE f.delivery_id=$1 AND f.action='misjudged'
+				    AND f.reason_code IS NOT NULL
+				    AND f.profile_epoch=CASE WHEN p.user_id IS NULL
+				         THEN 0 ELSE COALESCE(s.active_epoch,-1) END`,
 				f.DeliveryID,
 			).Scan(&id, &frozenReason, &frozenDetail)
 			if err != nil {
@@ -331,7 +341,8 @@ func feedbackActionLabel(action types.FeedbackAction) string {
 
 // InsertDeepDiveFeedback 幂等插入 deep_dive 行。f.Detail 是生成正文（调用方截 4000 rune），
 // 幂等命中时回传既有 detail 供重发（审查 F4：烧钱结果永不丢失）。
-// ⚠️ ON CONFLICT 谓词必须与 006 部分唯一索引 uq_feedbacks_delivery_deep_dive 的
+// ⚠️ ON CONFLICT 谓词必须与 067 部分唯一索引
+// uq_feedbacks_delivery_epoch_deep_dive 的
 // WHERE 完全一致（action = 'deep_dive' 写作 SQL 字面量），Postgres 才能推断 arbiter；
 // action 同理直接写字面量，保证插入行恒落在该部分索引覆盖域内。
 //
@@ -339,19 +350,70 @@ func feedbackActionLabel(action types.FeedbackAction) string {
 // 插入成功→有行、existed=false；命中冲突→无行（pgx.ErrNoRows），按 delivery_id
 // 回查既有行的 id 与 detail，existed=true。
 func (s *Store) InsertDeepDiveFeedback(ctx context.Context, f *types.Feedback) (id int64, existingDetail string, existed bool, err error) {
+	if f == nil {
+		return 0, "", false, types.NewAppError(
+			types.CodeValidation, "深度解读反馈不能为空", nil)
+	}
 	if f.Action != types.FeedbackActionDeepDive {
 		return 0, "", false, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("InsertDeepDiveFeedback 只接受 deep_dive，实际 %q", f.Action), nil)
 	}
-	err = s.pool.QueryRow(ctx,
+	tx, err := s.beginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return 0, "", false, types.NewAppError(
+			types.CodeDatabase, "开始深度解读反馈事务", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock($1,$2)
+		   /* deep-dive feedback fact admission */`,
+		agentSessionFactAdmissionClass,
+		agentSessionFactAdmissionKey,
+	); err != nil {
+		return 0, "", false, types.NewAppError(
+			types.CodeDatabase, "锁定深度解读反馈事实准入", err)
+	}
+	var tenantID int64
+	if err := tx.QueryRow(ctx,
+		`SELECT tenant_id FROM deliveries WHERE id=$1 AND user_id=$2`,
+		f.DeliveryID, f.UserID,
+	).Scan(&tenantID); err != nil {
+		return 0, "", false, types.NewAppError(
+			types.CodeDatabase,
+			fmt.Sprintf("解析深度解读反馈租户（delivery=%d）", f.DeliveryID),
+			err)
+	}
+	if err := setFeedbackRuntimeContext(
+		ctx, tx, tenantID, f.UserID,
+	); err != nil {
+		return 0, "", false, err
+	}
+	id, existingDetail, existed, err = insertDeepDiveFeedbackFact(
+		ctx, tx, tenantID, f, nil)
+	if err != nil {
+		return 0, "", false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, "", false, types.NewAppError(
+			types.CodeDatabase, "提交深度解读反馈事务", err)
+	}
+	return id, existingDetail, existed, nil
+}
+
+func insertDeepDiveFeedbackFact(
+	ctx context.Context,
+	tx pgx.Tx,
+	tenantID int64,
+	f *types.Feedback,
+	afterConflict func(),
+) (id int64, existingDetail string, existed bool, err error) {
+	err = tx.QueryRow(ctx,
 		`INSERT INTO feedbacks (tenant_id, user_id, delivery_id, action, detail)
-		 VALUES (
-		     (SELECT tenant_id FROM deliveries WHERE id=$2 AND user_id=$1),
-		     $1, $2, 'deep_dive', $3
-		 )
-		 ON CONFLICT (delivery_id) WHERE action = 'deep_dive' DO NOTHING
+		 VALUES ($1,$2,$3,'deep_dive',$4)
+		 ON CONFLICT (delivery_id,profile_epoch)
+		     WHERE action = 'deep_dive' DO NOTHING
 		 RETURNING id`,
-		f.UserID, f.DeliveryID, f.Detail).Scan(&id)
+		tenantID, f.UserID, f.DeliveryID, f.Detail).Scan(&id)
 	if err == nil {
 		return id, "", false, nil
 	}
@@ -359,9 +421,20 @@ func (s *Store) InsertDeepDiveFeedback(ctx context.Context, f *types.Feedback) (
 		return 0, "", false, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("幂等插入深度解读反馈（delivery=%d）", f.DeliveryID), err)
 	}
+	if afterConflict != nil {
+		afterConflict()
+	}
 	// 命中部分唯一索引冲突：该 delivery 已有 deep_dive 行，回查其 id 与生成正文。
-	if qerr := s.pool.QueryRow(ctx,
-		`SELECT id, detail FROM feedbacks WHERE delivery_id = $1 AND action = 'deep_dive'`,
+	if qerr := tx.QueryRow(ctx,
+		`SELECT f.id,f.detail
+		   FROM feedbacks f
+		   LEFT JOIN profiles p
+		     ON p.tenant_id=f.tenant_id AND p.user_id=f.user_id
+		   LEFT JOIN profile_claim_states s
+		     ON s.tenant_id=f.tenant_id AND s.user_id=f.user_id
+		  WHERE f.delivery_id=$1 AND f.action='deep_dive'
+		    AND f.profile_epoch=CASE WHEN p.user_id IS NULL
+		         THEN 0 ELSE COALESCE(s.active_epoch,-1) END`,
 		f.DeliveryID).Scan(&id, &existingDetail); qerr != nil {
 		return 0, "", false, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("回查既有深度解读反馈（delivery=%d）", f.DeliveryID), qerr)
@@ -387,9 +460,19 @@ func (s *Store) LatestFeedbackAction(ctx context.Context, deliveryID int64, acti
 	}
 	var action types.FeedbackAction
 	err := s.pool.QueryRow(ctx,
-		`SELECT action FROM feedbacks
-		 WHERE delivery_id = $1 AND action = ANY($2)
-		 ORDER BY created_at DESC, id DESC
+		`SELECT f.action
+		   FROM feedbacks f
+		   JOIN deliveries d
+		     ON d.id=f.delivery_id AND d.tenant_id=f.tenant_id
+		    AND d.user_id=f.user_id
+		   LEFT JOIN profiles p
+		     ON p.tenant_id=f.tenant_id AND p.user_id=f.user_id
+		   LEFT JOIN profile_claim_states s
+		     ON s.tenant_id=d.tenant_id AND s.user_id=d.user_id
+		  WHERE f.delivery_id=$1 AND f.action=ANY($2)
+		    AND f.profile_epoch=CASE WHEN p.user_id IS NULL
+		         THEN 0 ELSE COALESCE(s.active_epoch,-1) END
+		  ORDER BY f.created_at DESC,f.id DESC
 		 LIMIT 1`,
 		deliveryID, strs).Scan(&action)
 	if err != nil {
@@ -407,7 +490,20 @@ func (s *Store) LatestFeedbackAction(ctx context.Context, deliveryID int64, acti
 func (s *Store) HasFeedback(ctx context.Context, deliveryID int64, action types.FeedbackAction) (bool, error) {
 	var exists bool
 	err := s.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM feedbacks WHERE delivery_id = $1 AND action = $2)`,
+		`SELECT EXISTS (
+		   SELECT 1
+		     FROM feedbacks f
+		     JOIN deliveries d
+		       ON d.id=f.delivery_id AND d.tenant_id=f.tenant_id
+		      AND d.user_id=f.user_id
+		     LEFT JOIN profiles p
+		       ON p.tenant_id=f.tenant_id AND p.user_id=f.user_id
+		     LEFT JOIN profile_claim_states s
+		       ON s.tenant_id=d.tenant_id AND s.user_id=d.user_id
+		    WHERE f.delivery_id=$1 AND f.action=$2
+		      AND f.profile_epoch=CASE WHEN p.user_id IS NULL
+		           THEN 0 ELSE COALESCE(s.active_epoch,-1) END
+		 )`,
 		deliveryID, action).Scan(&exists)
 	if err != nil {
 		return false, types.NewAppError(types.CodeDatabase,
@@ -423,9 +519,19 @@ func (s *Store) HasFeedback(ctx context.Context, deliveryID int64, action types.
 func (s *Store) GetFeedbackDetail(ctx context.Context, deliveryID int64, action types.FeedbackAction) (string, error) {
 	var detail string
 	err := s.pool.QueryRow(ctx,
-		`SELECT detail FROM feedbacks
-		 WHERE delivery_id = $1 AND action = $2
-		 ORDER BY created_at DESC, id DESC
+		`SELECT f.detail
+		   FROM feedbacks f
+		   JOIN deliveries d
+		     ON d.id=f.delivery_id AND d.tenant_id=f.tenant_id
+		    AND d.user_id=f.user_id
+		   LEFT JOIN profiles p
+		     ON p.tenant_id=f.tenant_id AND p.user_id=f.user_id
+		   LEFT JOIN profile_claim_states s
+		     ON s.tenant_id=d.tenant_id AND s.user_id=d.user_id
+		  WHERE f.delivery_id=$1 AND f.action=$2
+		    AND f.profile_epoch=CASE WHEN p.user_id IS NULL
+		         THEN 0 ELSE COALESCE(s.active_epoch,-1) END
+		  ORDER BY f.created_at DESC,f.id DESC
 		 LIMIT 1`,
 		deliveryID, action).Scan(&detail)
 	if err != nil {

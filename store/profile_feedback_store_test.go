@@ -107,7 +107,8 @@ func TestProfileStore(t *testing.T) {
 		}
 		// 先经演化写入 summary 与游标。
 		if err := st.EvolveProfile(ctx, u.ID, "对 Go 与 AI 工程实践感兴趣",
-			[]string{"Go", "AI", "LLM"}, 42, p.UpdatedAt, p.LastEvolvedFeedbackID); err != nil {
+			[]string{"Go", "AI", "LLM"}, 42, p.UpdatedAt, p.LastEvolvedFeedbackID,
+			p.ProfileEpoch, p.ProfileVersion); err != nil {
 			t.Fatalf("EvolveProfile() 失败: %v", err)
 		}
 
@@ -185,7 +186,8 @@ func TestProfileStore(t *testing.T) {
 			t.Fatalf("claim pin failed: %v", err)
 		}
 		err = st.EvolveProfile(ctx, u.ID, "过期演化不应写入", nil,
-			stale.LastEvolvedFeedbackID+1, stale.UpdatedAt, stale.LastEvolvedFeedbackID)
+			stale.LastEvolvedFeedbackID+1, stale.UpdatedAt, stale.LastEvolvedFeedbackID,
+			stale.ProfileEpoch, stale.ProfileVersion)
 		if !errors.Is(err, types.ErrConflict) {
 			t.Errorf("updated_at 已变，演化应 ErrConflict，实际: %v", err)
 		}
@@ -199,7 +201,8 @@ func TestProfileStore(t *testing.T) {
 		}
 		// updated_at 对、游标错 → 同样冲突（审查 F6：封死游标回退）。
 		err = st.EvolveProfile(ctx, u.ID, "游标错也不应写入", nil,
-			fresh.LastEvolvedFeedbackID+1, fresh.UpdatedAt, fresh.LastEvolvedFeedbackID+999)
+			fresh.LastEvolvedFeedbackID+1, fresh.UpdatedAt, fresh.LastEvolvedFeedbackID+999,
+			fresh.ProfileEpoch, fresh.ProfileVersion)
 		if !errors.Is(err, types.ErrConflict) {
 			t.Errorf("游标不符，演化应 ErrConflict，实际: %v", err)
 		}
@@ -207,7 +210,8 @@ func TestProfileStore(t *testing.T) {
 		// 双条件都对 → 成功，summary/tags/游标落库且 updated_at 刷新。
 		newTags := []string{"Go", "AI", "LLM", "Rust"}
 		if err := st.EvolveProfile(ctx, u.ID, "新摘要。不感兴趣：美股。", newTags,
-			fresh.LastEvolvedFeedbackID+7, fresh.UpdatedAt, fresh.LastEvolvedFeedbackID); err != nil {
+			fresh.LastEvolvedFeedbackID+7, fresh.UpdatedAt, fresh.LastEvolvedFeedbackID,
+			fresh.ProfileEpoch, fresh.ProfileVersion); err != nil {
 			t.Fatalf("EvolveProfile() 应成功，实际: %v", err)
 		}
 		got, err := st.GetProfile(ctx, u.ID)
@@ -237,7 +241,8 @@ func TestProfileStore(t *testing.T) {
 			t.Fatalf("GetProfile() 失败: %v", err)
 		}
 		if err := st.AdvanceProfileCursor(ctx, u.ID, p.LastEvolvedFeedbackID+10,
-			p.UpdatedAt, p.LastEvolvedFeedbackID); err != nil {
+			p.UpdatedAt, p.LastEvolvedFeedbackID,
+			p.ProfileEpoch, p.ProfileVersion); err != nil {
 			t.Fatalf("AdvanceProfileCursor() 应成功，实际: %v", err)
 		}
 		got, err := st.GetProfile(ctx, u.ID)
@@ -256,13 +261,15 @@ func TestProfileStore(t *testing.T) {
 		}
 		// 拿旧游标再推 → 冲突（游标已被上一次推进，双条件之一失败）。
 		err = st.AdvanceProfileCursor(ctx, u.ID, p.LastEvolvedFeedbackID+20,
-			p.UpdatedAt, p.LastEvolvedFeedbackID)
+			p.UpdatedAt, p.LastEvolvedFeedbackID,
+			p.ProfileEpoch, p.ProfileVersion)
 		if !errors.Is(err, types.ErrConflict) {
 			t.Errorf("旧游标推进应 ErrConflict，实际: %v", err)
 		}
 		// updated_at 未被推进动过 → 拿新游标可继续推。
 		if err := st.AdvanceProfileCursor(ctx, u.ID, p.LastEvolvedFeedbackID+20,
-			p.UpdatedAt, p.LastEvolvedFeedbackID+10); err != nil {
+			p.UpdatedAt, p.LastEvolvedFeedbackID+10,
+			p.ProfileEpoch, p.ProfileVersion); err != nil {
 			t.Errorf("正确游标续推应成功，实际: %v", err)
 		}
 	})

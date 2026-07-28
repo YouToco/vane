@@ -120,6 +120,7 @@ func TestMigration062DowngradeFailsClosedWithLedger(t *testing.T) {
 	if err := st.EvolveProfile(
 		t.Context(), userID, "新增事实。污染画像？！", []string{"safe"},
 		10, corrected.Profile.UpdatedAt, 0,
+		0, corrected.Version,
 	); err != nil {
 		t.Fatal(err)
 	}

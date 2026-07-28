@@ -22,6 +22,7 @@ type ProfileClaim struct {
 type ProfileClaimList struct {
 	ProfileEpoch     int64               `json:"profile_epoch"`
 	Version          int64               `json:"version"`
+	RestoreAllowed   bool                `json:"restore_allowed"`
 	Claims           []ProfileClaim      `json:"claims"`
 	Events           []ProfileClaimEvent `json:"events"`
 	EventsHasMore    bool                `json:"events_has_more"`
@@ -39,6 +40,7 @@ type ProfileClaimEvent struct {
 }
 
 type ProfileClaimAction struct {
+	ExpectedEpoch   int64
 	ExpectedVersion int64
 	Action          string
 	ClaimID         int64
@@ -55,4 +57,23 @@ type ProfileClaimActionResult struct {
 	Profile        ProfileView    `json:"profile"`
 	Claims         []ProfileClaim `json:"claims"`
 	ClaimsComplete bool           `json:"claims_complete"`
+}
+
+// ProfileEpochAction is the only public learning-history lifecycle command.
+// Both reset and restore create a strictly larger epoch and advance the global
+// claim version exactly once.
+type ProfileEpochAction struct {
+	ExpectedEpoch   int64
+	ExpectedVersion int64
+	Action          string
+	Scope           string
+}
+
+type ProfileEpochActionResult struct {
+	Action         string      `json:"action"`
+	ProfileEpoch   int64       `json:"profile_epoch"`
+	Version        int64       `json:"version"`
+	EventID        string      `json:"event_id"`
+	Profile        ProfileView `json:"profile"`
+	RestoreAllowed bool        `json:"restore_allowed"`
 }
