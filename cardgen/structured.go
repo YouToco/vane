@@ -9,7 +9,6 @@ import (
 	"io"
 	"strconv"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/YouToco/vane/promptguard"
@@ -63,24 +62,15 @@ func NewEventEvidenceSourceV1(
 	item types.ContentItem,
 	source runcontext.SourceV1,
 ) (EventEvidenceSourceV1, error) {
-	publishedAt := item.PublishedAt
-	if publishedAt != nil {
-		published := publishedAt.Round(0).UTC().Truncate(time.Microsecond)
-		publishedAt = &published
+	metadata, err := runcontext.StructuredEventEvidenceMetadataV1(
+		index, item, source)
+	if err != nil {
+		return EventEvidenceSourceV1{}, err
 	}
 	result := EventEvidenceSourceV1{
 		ContentItemID: item.ID,
-		Metadata: types.StructuredEvidenceSourceV1{
-			Ref:         "source-" + strconv.Itoa(index+1),
-			Title:       strings.TrimSpace(item.Title),
-			SourceTitle: strings.TrimSpace(source.Title),
-			Platform:    string(source.Platform),
-			SourceURL:   strings.TrimSpace(item.URL),
-			PublishedAt: publishedAt,
-			DiscoveredAt: item.CreatedAt.Round(0).UTC().
-				Truncate(time.Microsecond),
-		},
-		EvidenceText: StructuredEvidenceTextV1(item),
+		Metadata:      metadata,
+		EvidenceText:  StructuredEvidenceTextV1(item),
 	}
 	if result.Validate(index) != nil {
 		return EventEvidenceSourceV1{},
@@ -240,7 +230,7 @@ func structuredSourceTextV1(item types.ContentItem) string {
 // for claim excerpts. Titles remain visible to the model but are deliberately
 // excluded from factual evidence.
 func StructuredEvidenceTextV1(item types.ContentItem) string {
-	return promptguard.Sanitize(truncateRunes(item.Content, maxContentRunes))
+	return runcontext.StructuredEventEvidenceTextV1(item.Content)
 }
 
 type structuredInsightWireV1 struct {

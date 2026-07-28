@@ -581,24 +581,27 @@ func (c *Config) Validate() error {
 			return errors.New(
 				"config: structured event evidence 要求 structured insight 已启用")
 		}
-		if structuredEventEvidenceCanaryID == "" &&
-			!c.Pipeline.StructuredEventEvidenceAllowAll {
+		if structuredEventEvidenceCanaryID == "" {
 			return errors.New(
-				"config: 全量启用 structured event evidence 必须显式设置 allow_all=true")
+				"config: structured event evidence 当前只允许精确 canary")
 		}
-		if structuredEventEvidenceCanaryID != "" &&
-			c.Pipeline.StructuredEventEvidenceAllowAll {
+		if c.Pipeline.StructuredEventEvidenceAllowAll {
 			return errors.New(
-				"config: structured event evidence canary 与 allow_all 不能同时启用")
+				"config: structured event evidence 尚不允许 allow_all")
 		}
-		if c.Pipeline.StructuredEventEvidenceAllowAll &&
-			!c.Pipeline.StructuredInsightAllowAll ||
-			structuredEventEvidenceCanaryID != "" &&
-				!c.Pipeline.StructuredInsightAllowAll &&
-				structuredEventEvidenceCanaryID !=
-					structuredInsightCanaryID {
+		if !c.Pipeline.StructuredInsightAllowAll &&
+			structuredEventEvidenceCanaryID !=
+				structuredInsightCanaryID {
 			return errors.New(
 				"config: structured event evidence 必须位于 structured insight rollout")
+		}
+		if observationAuthority :=
+			strings.TrimSpace(
+				c.Pipeline.ObservationAuthorityCanaryScheduleID,
+			); observationAuthority == "" ||
+			observationAuthority != structuredEventEvidenceCanaryID {
+			return errors.New(
+				"config: structured event evidence 必须精确等于 observation authority canary")
 		}
 	}
 	rawCanonicalRendererCanaryID :=

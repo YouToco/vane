@@ -61,11 +61,17 @@ func (r structuredInsightRollout) runtimeVersionFor(
 }
 
 func WithStructuredEventEvidenceRollout(
-	enabled bool, canaryScheduleID string, allowAll bool,
+	enabled bool,
+	canaryScheduleID string,
+	allowAll bool,
+	observationAuthorityCanaryScheduleID string,
 ) SchedulerOption {
 	return func(s *Scheduler) {
 		canaryScheduleID = strings.TrimSpace(canaryScheduleID)
-		if !enabled || ((canaryScheduleID != "") == allowAll) {
+		observationAuthorityCanaryScheduleID =
+			strings.TrimSpace(observationAuthorityCanaryScheduleID)
+		if !enabled || canaryScheduleID == "" || allowAll ||
+			canaryScheduleID != observationAuthorityCanaryScheduleID {
 			s.structuredEventEvidence = rolloutScopeV1{}
 			return
 		}

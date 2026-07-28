@@ -1197,6 +1197,94 @@ func TestPrepareRun_StructuredRuntimeFreezesAlternatePolicy(t *testing.T) {
 	}
 }
 
+func TestPrepareRun_EventEvidenceRequiresFrozenEventAuthorityBeforeEffects(
+	t *testing.T,
+) {
+	identity, ref, snapshot := compiledActivityFixture(
+		"Structured Event Evidence Task")
+	snapshot.Definition.ScopeJSON = json.RawMessage(
+		`{"observation":{"mode":"event","event":{"event_kind":"release"}}}`)
+	snapshot.ObservationRollout = observation.RolloutAuthority
+	newActivity := func(
+		snapshot runcontext.CompiledSnapshotV1,
+	) (*Activities, *compiledRunStoreFake) {
+		compiledStore := &compiledRunStoreFake{
+			ref: ref, found: true, snapshot: snapshot, authorize: true,
+		}
+		return NewActivities(
+			new(compiledRouteFetcherFake), fakeScorer{}, fakeCardGen{},
+			&fakePusher{}, &fakeStore{}, fakeFeishu{},
+			nil, nil, nil, nil,
+			WithCompiledRuntimeV1(
+				compiledStore,
+				func(context.Context, int64, bool) (
+					runtimepolicy.BundleV1, error,
+				) {
+					return runtimepolicy.BundleV1{}, nil
+				},
+				new(compiledModelResolverFake)),
+			WithStructuredInsightRuntimeV1(
+				func(context.Context, int64, bool) (
+					runtimepolicy.BundleV1, error,
+				) {
+					return runtimepolicy.BundleV1{}, nil
+				}),
+		), compiledStore
+	}
+	execute := func(
+		t *testing.T, a *Activities,
+	) (PrepareRunResult, error) {
+		t.Helper()
+		var suite testsuite.WorkflowTestSuite
+		env := suite.NewTestActivityEnvironment()
+		env.RegisterActivity(a.PrepareRun)
+		return executePrepareRun(t, env, a, PushParams{
+			TenantID: identity.TenantID, UserID: identity.UserID,
+			RunKind:        PushRunKindScheduled,
+			ExecutionMode:  types.ExecutionModeCompiled,
+			RuntimeVersion: CompiledRuntimeStructuredEventEvidenceV1,
+			ScheduleID:     identity.TaskID,
+		})
+	}
+
+	a, compiledStore := newActivity(snapshot)
+	result, err := execute(t, a)
+	if err != nil || !result.Authorized {
+		t.Fatalf("exact event authority result=%+v err=%v", result, err)
+	}
+	_, _, _, authorize := compiledStore.counts()
+	if authorize != 1 {
+		t.Fatalf("exact event authority calls=%d want 1", authorize)
+	}
+
+	for name, mutate := range map[string]func(*runcontext.CompiledSnapshotV1){
+		"rollout shadow": func(candidate *runcontext.CompiledSnapshotV1) {
+			candidate.ObservationRollout = observation.RolloutShadow
+		},
+		"content mode": func(candidate *runcontext.CompiledSnapshotV1) {
+			candidate.Definition.ScopeJSON = json.RawMessage(
+				`{"observation":{"mode":"content"}}`)
+		},
+		"missing observation": func(candidate *runcontext.CompiledSnapshotV1) {
+			candidate.Definition.ScopeJSON = json.RawMessage(`{}`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := cloneCompiledSnapshot(snapshot)
+			mutate(&candidate)
+			a, compiledStore := newActivity(candidate)
+			if _, err := execute(t, a); err == nil {
+				t.Fatal("invalid event authority unexpectedly passed")
+			}
+			_, _, _, authorize := compiledStore.counts()
+			if authorize != 0 {
+				t.Fatalf("invalid event authority reached effects: %d",
+					authorize)
+			}
+		})
+	}
+}
+
 func TestQualifyEvents_ShadowUsesFrozenRolloutCallsOnceAndReturnsCandidates(
 	t *testing.T,
 ) {
@@ -3174,6 +3262,11 @@ func TestCardGenOutcomeV3RejectsForgedPrimaryBeforeInventoryOrModel(
 	})
 	if err == nil {
 		t.Fatal("forged primary evidence must fail")
+	}
+	var appErr *temporal.ApplicationError
+	if !errors.As(err, &appErr) ||
+		appErr.Type() != string(types.CodeValidation) {
+		t.Fatalf("forged primary error=%v want controlled validation", err)
 	}
 	if card.calls.Load() != 0 {
 		t.Fatalf("model calls=%d want 0", card.calls.Load())

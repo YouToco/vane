@@ -317,6 +317,7 @@ func run() error {
 			cfg.Pipeline.StructuredEventEvidenceEnabled,
 			cfg.Pipeline.StructuredEventEvidenceCanaryScheduleID,
 			cfg.Pipeline.StructuredEventEvidenceAllowAll,
+			cfg.Pipeline.ObservationAuthorityCanaryScheduleID,
 		))
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
 	// C2b3-2c keeps definition editing dark at every ingress, but already owns

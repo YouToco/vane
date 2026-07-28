@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
+	"reflect"
+	"strconv"
 
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/types"
@@ -13,6 +16,61 @@ import (
 type StructuredEventEvidenceContentV1 struct {
 	Item   types.ContentItem
 	Source runcontext.SourceV1
+}
+
+// StructuredEventEvidenceStageSourceV1 is the full Activity-owned source
+// claim supplied to the durable Brief boundary. Content IDs and bodies are
+// validated there but never copied into the Brief payload.
+type StructuredEventEvidenceStageSourceV1 struct {
+	ContentItemID int64
+	Metadata      types.StructuredEvidenceSourceV1
+	EvidenceText  string
+}
+
+type StructuredEventEvidenceStageV1 struct {
+	Provenance types.ObservedEventProvenanceV1
+	Sources    []StructuredEventEvidenceStageSourceV1
+}
+
+func (s StructuredEventEvidenceStageV1) eventEvidence(
+	evidenceDigest string,
+) (types.StructuredEventEvidenceV1, error) {
+	if s.Provenance.Validate() != nil ||
+		len(s.Sources) == 0 || len(s.Sources) > 8 {
+		return types.StructuredEventEvidenceV1{},
+			errors.New("structured event evidence stage is invalid")
+	}
+	sources := make(
+		[]types.StructuredEvidenceSourceV1, len(s.Sources))
+	for index, source := range s.Sources {
+		if source.ContentItemID <= 0 ||
+			source.Metadata.Validate() != nil ||
+			source.Metadata.Ref != "source-"+strconv.Itoa(index+1) ||
+			source.EvidenceText == "" {
+			return types.StructuredEventEvidenceV1{},
+				errors.New("structured event evidence stage source is invalid")
+		}
+		sources[index] = source.Metadata
+	}
+	eventEvidence := types.StructuredEventEvidenceV1{
+		SchemaVersion:  types.StructuredEventEvidenceSchemaVersionV1,
+		Provenance:     s.Provenance,
+		EvidenceDigest: evidenceDigest,
+		Sources:        sources,
+	}
+	if eventEvidence.Validate() != nil {
+		return types.StructuredEventEvidenceV1{},
+			errors.New("structured event evidence stage is invalid")
+	}
+	return eventEvidence, nil
+}
+
+func equalStructuredEventEvidenceStageSourceV1(
+	left, right StructuredEventEvidenceStageSourceV1,
+) bool {
+	return left.ContentItemID == right.ContentItemID &&
+		left.EvidenceText == right.EvidenceText &&
+		reflect.DeepEqual(left.Metadata, right.Metadata)
 }
 
 // LoadStructuredEventEvidenceForTaskRunV1 loads the ordered, bounded content

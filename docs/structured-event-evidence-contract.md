@@ -5,7 +5,8 @@
 - Phase: 2-B0 (dark Store foundation)
 - Risk: S (event identity, first-writer replay, future immutable Brief payload)
 - Production call points: zero
-- Migration: none
+- Migration: 068, adding only the restricted canonical-Brief event-evidence
+  reader described below
 - Rollout: none in 2-B0; the existing Phase 2-A exact canary is unchanged
 
 Phase 2-A has engineering and quiet-path production proof, but no natural
@@ -97,10 +98,13 @@ bookmarks, trends, reports, default experience changes or a wider user scope.
 
 2-B1 adds a separate durable runtime label and a separate CardGen Activity
 name. Its rollout is independently default-off and must be nested inside the
-existing Phase 2-A generation and renderer authority. The Phase 2-A exact-task
-canary remains selected in production until a natural non-empty run proves its
-current claims/evidence path. Deploying 2-B1 does not move that task to the new
-runtime and does not change any existing Temporal command sequence.
+existing Phase 2-A generation and renderer authority and the exact observation
+authority canary. Because observation authority is currently exact-task only,
+2-B1 `allow_all` is rejected until a later separately approved rollout design.
+The Phase 2-A exact-task canary remains selected in production until a natural
+non-empty run proves its current claims/evidence path. Deploying 2-B1 does not
+move that task to the new runtime and does not change any existing Temporal
+command sequence.
 
 ### Evidence inventory
 
@@ -149,6 +153,14 @@ The reservation still occurs in the existing pre-Brief delivery-planning
 transactional seam. Rejected cross-run duplicates do not acquire a Brief row.
 Stale takeover and frozen push-effect replay keep the same first-writer event
 identity guaranteed by 2-B0.
+
+Migration 068 adds one bounded `SECURITY DEFINER` reader executable only by
+`vane_brief_writer`. Inside the Brief staging transaction it returns exactly
+one delivery-bound first-writer observed event plus the ordered content rows
+and frozen snapshot source attribution named by that event. The writer retains
+no table-level access to observed events, content, sources, or run snapshots.
+The Store compares the complete Activity-owned IDs, bounded bodies, metadata,
+corpus refs and provenance before stripping bodies/IDs from the Brief.
 
 ### Temporal and paid-call invariants
 

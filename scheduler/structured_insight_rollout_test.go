@@ -74,7 +74,8 @@ func TestStructuredEventEvidenceRolloutIsNestedInsideStructuredInsight(
 		WithCanonicalBriefRollout(true, "task-a", false),
 		WithStructuredInsightRollout(
 			true, "task-a", false, true, "task-a", false),
-		WithStructuredEventEvidenceRollout(true, "task-a", false),
+		WithStructuredEventEvidenceRollout(
+			true, "task-a", false, "task-a"),
 	)
 	if got := s.runtimeVersionFor(
 		"task-a", types.ExecutionModeCompiled,
@@ -91,7 +92,8 @@ func TestStructuredEventEvidenceRolloutIsNestedInsideStructuredInsight(
 		WithCompiledRuntimeRollout(true, "task-a", false),
 		WithRunOutcomeRollout(true, "task-a", false),
 		WithCanonicalBriefRollout(true, "task-a", false),
-		WithStructuredEventEvidenceRollout(true, "task-a", false),
+		WithStructuredEventEvidenceRollout(
+			true, "task-a", false, "task-a"),
 	)
 	if got := withoutStructured.runtimeVersionFor(
 		"task-a", types.ExecutionModeCompiled,
@@ -113,9 +115,13 @@ func TestStructuredEventEvidenceRolloutIsNestedInsideStructuredInsight(
 	}
 
 	for _, option := range []SchedulerOption{
-		WithStructuredEventEvidenceRollout(true, "", false),
-		WithStructuredEventEvidenceRollout(true, "task-a", true),
-		WithStructuredEventEvidenceRollout(false, "task-a", false),
+		WithStructuredEventEvidenceRollout(true, "", false, "task-a"),
+		WithStructuredEventEvidenceRollout(
+			true, "task-a", true, "task-a"),
+		WithStructuredEventEvidenceRollout(
+			false, "task-a", false, "task-a"),
+		WithStructuredEventEvidenceRollout(
+			true, "task-a", false, "task-b"),
 	} {
 		invalid := New(nil, "queue", nil,
 			WithCompiledRuntimeRollout(true, "task-a", false),

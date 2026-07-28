@@ -291,6 +291,8 @@ func TestStructuredEventEvidenceRolloutValidation(t *testing.T) {
 				StructuredInsightRendererCanaryScheduleID: "task-a",
 				PushEffectCanaryScheduleID:                "task-a",
 				PushEffectRecoveryCanaryScheduleID:        "task-a",
+				ObservationShadowCanaryScheduleID:         "task-a",
+				ObservationAuthorityCanaryScheduleID:      "task-a",
 			},
 		}
 	}
@@ -321,6 +323,15 @@ func TestStructuredEventEvidenceRolloutValidation(t *testing.T) {
 		cfg.Pipeline.StructuredEventEvidenceCanaryScheduleID = "task-b"
 		if err := cfg.Validate(); err == nil {
 			t.Fatal("expected canary mismatch")
+		}
+	})
+	t.Run("requires exact observation authority", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ObservationAuthorityCanaryScheduleID = ""
+		cfg.Pipeline.StructuredEventEvidenceEnabled = true
+		cfg.Pipeline.StructuredEventEvidenceCanaryScheduleID = "task-a"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected observation authority nesting error")
 		}
 	})
 	t.Run("canary and allow all conflict", func(t *testing.T) {

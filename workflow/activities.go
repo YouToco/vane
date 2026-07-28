@@ -339,7 +339,7 @@ type CanonicalBriefStructuredEventStoreV1 interface {
 		types.RunOutcomeMarkerV1, int64, time.Time, []int64,
 		map[int64]types.StructuredInsightV1,
 		map[int64]map[string]string,
-		map[int64]types.StructuredEventEvidenceV1,
+		map[int64]storepkg.StructuredEventEvidenceStageV1,
 	) (types.BriefDraftV1, error)
 }
 
@@ -1008,6 +1008,23 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 	if err != nil {
 		return PrepareRunResult{}, retryableOrNot(err)
 	}
+	if p.RuntimeVersion == CompiledRuntimeStructuredEventEvidenceV1 {
+		var scope struct {
+			Observation *observation.PolicyV1 `json:"observation,omitempty"`
+		}
+		if json.Unmarshal(
+			snapshot.Definition.ScopeJSON, &scope,
+		) != nil ||
+			scope.Observation == nil ||
+			scope.Observation.Mode != observation.ModeEvent ||
+			scope.Observation.Event == nil ||
+			snapshot.ObservationRollout != observation.RolloutAuthority {
+			return PrepareRunResult{}, nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"structured event evidence requires exact event authority",
+				nil))
+		}
+	}
 	if err := a.validateCompiledSnapshotRoutesV1(snapshot); err != nil {
 		return PrepareRunResult{}, nonRetryable(err)
 	}
@@ -1215,7 +1232,7 @@ func (a *Activities) PrepareCanonicalBriefV1(
 	}
 	var draft types.BriefDraftV1
 	if len(plan.structuredByDelivery) > 0 {
-		if len(plan.structuredEventByDelivery) > 0 {
+		if len(plan.structuredEventStageByDelivery) > 0 {
 			structuredStore, ok :=
 				a.canonicalBriefStore.(CanonicalBriefStructuredEventStoreV1)
 			if !ok {
@@ -1228,7 +1245,7 @@ func (a *Activities) PrepareCanonicalBriefV1(
 				in.GeneratedAt, plan.orderedDeliveryIDs,
 				plan.structuredByDelivery,
 				plan.structuredEvidenceByDelivery,
-				plan.structuredEventByDelivery)
+				plan.structuredEventStageByDelivery)
 		} else {
 			structuredStore, ok :=
 				a.canonicalBriefStore.(CanonicalBriefStructuredStoreV1)
@@ -3044,6 +3061,8 @@ func (a *Activities) cardGen(
 	var structuredRejected atomic.Bool
 	var authorizationOnce sync.Once
 	var authorizationErr error
+	var evidencePreflightOnce sync.Once
+	var evidencePreflightErr error
 	cards := mapConcurrent(ctx, in.Items, parBatchFanout,
 		func(ctx context.Context, si types.ScoredItem) (GeneratedCard, error) {
 			var eventSources []cardgenpkg.EventEvidenceSourceV1
@@ -3053,6 +3072,9 @@ func (a *Activities) cardGen(
 					a.loadCardGenEventEvidenceV1(
 						ctx, expected, in.Run.Snapshot, si.Item)
 				if loadErr != nil {
+					evidencePreflightOnce.Do(func() {
+						evidencePreflightErr = loadErr
+					})
 					return GeneratedCard{}, loadErr
 				}
 			}
@@ -3138,6 +3160,9 @@ func (a *Activities) cardGen(
 	if len(cards) == 0 && len(in.Items) > 0 {
 		if authorizationErr != nil {
 			return nil, retryableOrNot(authorizationErr)
+		}
+		if evidencePreflightErr != nil {
+			return nil, evidencePreflightErr
 		}
 		if quotaHit.Load() {
 			return nil, nonRetryable(types.NewAppError(types.CodeQuotaExceeded,
@@ -3313,13 +3338,13 @@ type plannedPushChunk struct {
 }
 
 type pushDeliveryPlan struct {
-	orderedDeliveryIDs           []int64
-	structuredByDelivery         map[int64]types.StructuredInsightV1
-	structuredEvidenceByDelivery map[int64]map[string]string
-	structuredEventByDelivery    map[int64]types.StructuredEventEvidenceV1
-	pending                      []pushPendingItem
-	anySent                      bool
-	skippedEvents                int
+	orderedDeliveryIDs             []int64
+	structuredByDelivery           map[int64]types.StructuredInsightV1
+	structuredEvidenceByDelivery   map[int64]map[string]string
+	structuredEventStageByDelivery map[int64]storepkg.StructuredEventEvidenceStageV1
+	pending                        []pushPendingItem
+	anySent                        bool
+	skippedEvents                  int
 }
 
 func (a *Activities) preparePushDeliveries(
@@ -3473,22 +3498,27 @@ func (a *Activities) preparePushDeliveries(
 			plan.structuredEvidenceByDelivery[deliveryID] =
 				evidenceSources
 			if eventProvenance != nil {
-				if plan.structuredEventByDelivery == nil {
-					plan.structuredEventByDelivery =
-						make(map[int64]types.StructuredEventEvidenceV1)
+				if plan.structuredEventStageByDelivery == nil {
+					plan.structuredEventStageByDelivery =
+						make(map[int64]storepkg.StructuredEventEvidenceStageV1)
 				}
 				sources := make(
-					[]types.StructuredEvidenceSourceV1,
+					[]storepkg.StructuredEventEvidenceStageSourceV1,
 					len(card.EventEvidence))
 				for index := range card.EventEvidence {
-					sources[index] = card.EventEvidence[index].Metadata
+					sources[index] =
+						storepkg.StructuredEventEvidenceStageSourceV1{
+							ContentItemID: card.EventEvidence[index].
+								ContentItemID,
+							Metadata: card.EventEvidence[index].Metadata,
+							EvidenceText: card.EventEvidence[index].
+								EvidenceText,
+						}
 				}
-				plan.structuredEventByDelivery[deliveryID] =
-					types.StructuredEventEvidenceV1{
-						SchemaVersion:  types.StructuredEventEvidenceSchemaVersionV1,
-						Provenance:     *eventProvenance,
-						EvidenceDigest: card.Structured.EvidenceDigest,
-						Sources:        sources,
+				plan.structuredEventStageByDelivery[deliveryID] =
+					storepkg.StructuredEventEvidenceStageV1{
+						Provenance: *eventProvenance,
+						Sources:    sources,
 					}
 			}
 		} else if len(card.EventEvidence) > 0 {
