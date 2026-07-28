@@ -336,6 +336,51 @@ export interface ScheduleBatchesResp {
   next_page_token?: string;
 }
 
+export type CanonicalRunResult = "content" | "quiet" | "failed" | "interrupted";
+export type CanonicalCompleteness = "complete" | "partial";
+
+export interface TaskBriefFeedbackState {
+  preference?: "interested" | "not_interested";
+  misjudged: boolean;
+  deep_dive_requested: boolean;
+}
+
+export interface TaskBriefInsight {
+  id: number;
+  rank_position: number;
+  title: string;
+  body_md: string;
+  source_title: string;
+  source_url: string;
+  published_at?: string;
+  discovered_at: string;
+  feedback: TaskBriefFeedbackState;
+}
+
+export interface TaskBrief {
+  id: number;
+  push_batch_id: number;
+  generated_at: string;
+  source_coverage: CanonicalCompleteness;
+  processing: CanonicalCompleteness;
+  insights: TaskBriefInsight[];
+}
+
+export interface TaskLatestCheck {
+  finalized_at: string;
+  result: CanonicalRunResult;
+  source_coverage: CanonicalCompleteness;
+  processing: CanonicalCompleteness;
+  failure_code?: string;
+}
+
+export interface TaskBriefsResp {
+  items: TaskBrief[];
+  total: number;
+  next_page_token?: string;
+  latest_check?: TaskLatestCheck;
+}
+
 // 任务累计 LLM 成本。**只覆盖推送管道的 LLM 调用**：工具费（Exa/TikHub）的
 // trace 锚在写入侧尚未统一，后端刻意不归集（vane#142 审查结论）——前端文案
 // 必须写明「LLM 成本」，别标成「总成本」编造完整性。
@@ -780,6 +825,30 @@ export const api = {
     ).then((r) => ({
       ...r,
       items: arr(r.items).map((it) => ({ ...it, feedbacks: arr(it.feedbacks) })),
+    }));
+  },
+  scheduleBriefs: (id: string, pageSize?: number, pageToken?: string) => {
+    const params = new URLSearchParams();
+    if (pageSize) params.set("page_size", String(pageSize));
+    if (pageToken) params.set("page_token", pageToken);
+    const qs = params.toString();
+    return request<TaskBriefsResp>(
+      `/api/schedules/${encodeURIComponent(id)}/briefs${qs ? "?" + qs : ""}`,
+    ).then((r) => ({
+      ...r,
+      items: arr(r.items).map((brief) => ({
+        ...brief,
+        insights: arr(brief.insights).map((insight) => ({
+          ...insight,
+          feedback: {
+            preference: insight.feedback?.preference,
+            misjudged: Boolean(insight.feedback?.misjudged),
+            deep_dive_requested: Boolean(
+              insight.feedback?.deep_dive_requested,
+            ),
+          },
+        })),
+      })),
     }));
   },
 

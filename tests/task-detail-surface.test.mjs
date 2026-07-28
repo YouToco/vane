@@ -6,10 +6,10 @@ import { test } from "node:test";
 const root = resolve(import.meta.dirname, "..");
 
 test("task pages keep operational internals off the reader-facing surface", async () => {
-  const [dashboard, detail, deliveries] = await Promise.all([
+  const [dashboard, detail, briefs] = await Promise.all([
     readFile(resolve(root, "src/pages/TaskDashboard.tsx"), "utf8"),
     readFile(resolve(root, "src/pages/TaskDetail.tsx"), "utf8"),
-    readFile(resolve(root, "src/components/DeliveriesTable.tsx"), "utf8"),
+    readFile(resolve(root, "src/components/TaskBriefFeed.tsx"), "utf8"),
   ]);
 
   assert.doesNotMatch(dashboard, /batches_7d|last_exit_gate/);
@@ -21,8 +21,13 @@ test("task pages keep operational internals off the reader-facing surface", asyn
   assert.doesNotMatch(detail, /detail\.cost|\bcost\b/);
   assert.doesNotMatch(detail, /b\.sent|b\.stage_counts|funnelText/);
   assert.doesNotMatch(detail, /batchOutcomeLabel|batchOutcomeVariant/);
-  assert.match(detail, /presentation="task-content"/);
+  assert.match(detail, /TaskBriefFeed/);
+  assert.match(detail, /latestCheck\?\.finalized_at/);
 
-  assert.match(deliveries, /taskContentTimestamp\(it\)/);
-  assert.match(deliveries, /presentation === "task-content"/);
+  assert.match(briefs, /ReactMarkdown/);
+  assert.match(briefs, /skipHtml/);
+  assert.match(briefs, /allowedElements/);
+  assert.match(briefs, /BRIEF_MARKDOWN_ELEMENTS/);
+  assert.match(briefs, /safeBriefMarkdownURL/);
+  assert.match(briefs, /brief\.insights\.map/);
 });

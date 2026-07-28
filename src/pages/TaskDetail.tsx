@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   Loader2,
@@ -15,6 +15,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import TaskActionDialog from "@/components/TaskActionDialog";
+import DeliveriesTable from "@/components/DeliveriesTable";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -39,18 +40,24 @@ import type {
   ScheduleSourceInfo,
   ObservationPolicy,
   TaskActionStatus,
+  TaskLatestCheck,
 } from "../api";
 import { fmt, useI18n, type Dict } from "@/i18n";
+import { briefDict } from "@/i18n/brief";
 import { fmtBeijing } from "@/lib/time";
-import DeliveriesTable from "@/components/DeliveriesTable";
 import { SCHEDULE_COMMAND_STORAGE_PREFIX } from "@/lib/task-action-session";
-import { taskRunOutcome, type TaskRunOutcome } from "@/lib/task-detail-presentation";
+import {
+  canonicalCheckOutcome,
+  taskRunOutcome,
+  type TaskRunOutcome,
+} from "@/lib/task-detail-presentation";
 import {
   nextRunPresentation,
   taskDefinitionEditEnabled,
 } from "@/lib/task-detail-contract";
 
 const PAGE_SIZE = 20;
+const TaskBriefFeed = lazy(() => import("@/components/TaskBriefFeed"));
 type ScheduleCommand = "run" | "pause" | "resume" | "delete";
 
 function commandStorageKey(
@@ -126,8 +133,9 @@ function runOutcomeVariant(
 // 运行与诊断：保留检查时间、用户可理解的结果和情报条数；batch id、发送状态、
 // 阶段漏斗等运维对象不进入普通任务页。
 function RunsTab({ scheduleID }: { scheduleID: string }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const D = t.app.taskDetail;
+  const B = briefDict(locale);
   const [items, setItems] = useState<ScheduleBatchItem[]>([]);
   const [total, setTotal] = useState(0);
   const [nextToken, setNextToken] = useState("");
@@ -201,53 +209,65 @@ function RunsTab({ scheduleID }: { scheduleID: string }) {
     );
   }
   return (
-    <Card>
-      <div className="overflow-x-auto">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>{D.runsColTime}</TableHead>
-              <TableHead>{D.runsColOutcome}</TableHead>
-              <TableHead className="text-right">{D.runsColInsights}</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {items.map((b) => (
-              <TableRow key={b.id} className={b.status === "failed" ? "bg-destructive/5" : ""}>
-                <TableCell className="text-sm whitespace-nowrap">
-                  {fmtBeijing(b.created_at)}
-                </TableCell>
-                <TableCell>
-                  <Badge variant={runOutcomeVariant(taskRunOutcome(b.status))}>
-                    {runOutcomeLabel(taskRunOutcome(b.status), D)}
-                  </Badge>
-                </TableCell>
-                <TableCell className="text-right font-mono text-sm whitespace-nowrap">
-                  {fmt(D.insightCount, { n: b.deliveries })}
-                </TableCell>
+    <div className="space-y-5">
+      <Card>
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>{D.runsColTime}</TableHead>
+                <TableHead>{D.runsColOutcome}</TableHead>
+                <TableHead className="text-right">{D.runsColInsights}</TableHead>
               </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+            </TableHeader>
+            <TableBody>
+              {items.map((b) => (
+                <TableRow key={b.id} className={b.status === "failed" ? "bg-destructive/5" : ""}>
+                  <TableCell className="text-sm whitespace-nowrap">
+                    {fmtBeijing(b.created_at)}
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant={runOutcomeVariant(taskRunOutcome(b.status))}>
+                      {runOutcomeLabel(taskRunOutcome(b.status), D)}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-sm whitespace-nowrap">
+                    {fmt(D.insightCount, { n: b.deliveries })}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+        <div className="flex items-center justify-between border-t px-4 py-3">
+          <span className="text-sm text-muted-foreground">
+            {fmt(D.shownRuns, { shown: items.length, total })}
+          </span>
+          {nextToken && (
+            <Button variant="outline" size="sm" onClick={loadMore} disabled={loadingMore}>
+              {loadingMore ? (
+                <>
+                  <Loader2 className="mr-2 size-4 animate-spin" />
+                  {t.app.common.loading}
+                </>
+              ) : (
+                t.app.common.loadMore
+              )}
+            </Button>
+          )}
+        </div>
+      </Card>
+      <div className="space-y-2">
+        <h3 className="text-sm font-medium">{B.legacyDiscoveries}</h3>
+        <DeliveriesTable
+          presentation="task-content"
+          fetchPage={(pageSize, pageToken) =>
+            api.scheduleDeliveries(scheduleID, pageSize, pageToken)
+          }
+          emptyText={D.pushesEmpty}
+        />
       </div>
-      <div className="flex items-center justify-between border-t px-4 py-3">
-        <span className="text-sm text-muted-foreground">
-          {fmt(D.shownRuns, { shown: items.length, total })}
-        </span>
-        {nextToken && (
-          <Button variant="outline" size="sm" onClick={loadMore} disabled={loadingMore}>
-            {loadingMore ? (
-              <>
-                <Loader2 className="mr-2 size-4 animate-spin" />
-                {t.app.common.loading}
-              </>
-            ) : (
-              t.app.common.loadMore
-            )}
-          </Button>
-        )}
-      </div>
-    </Card>
+    </div>
   );
 }
 
@@ -435,6 +455,10 @@ export default function TaskDetail({
   const commandRef = useRef<ScheduleCommand | "">("");
   const [commandMessage, setCommandMessage] = useState("");
   const [commandError, setCommandError] = useState("");
+  const [latestCheckState, setLatestCheckState] = useState<{
+    scheduleID: string;
+    check?: TaskLatestCheck;
+  }>();
 
   async function reloadDetail() {
     const next = await api.scheduleDetail(scheduleID);
@@ -569,7 +593,14 @@ export default function TaskDetail({
   // this first read-only UI useful while older API deployments expose the
   // create-command spelling instead.
   const observation = schedule.scope.observation ?? schedule.scope.observation_policy;
-  const lastOutcome = taskRunOutcome(summary.last_status);
+  const latestCheck =
+    latestCheckState?.scheduleID === scheduleID
+      ? latestCheckState.check
+      : undefined;
+  const lastOutcome = latestCheck
+    ? canonicalCheckOutcome(latestCheck)
+    : taskRunOutcome(summary.last_status);
+  const lastCheckAt = latestCheck?.finalized_at ?? summary.last_run_at;
 
   return (
     <div className="space-y-6">
@@ -650,9 +681,9 @@ export default function TaskDetail({
         </div>
         <p className="text-sm text-muted-foreground mt-1">
           {D.lastCheck}{" "}
-          {summary.last_run_at ? (
+          {lastCheckAt ? (
             <>
-              {fmtBeijing(summary.last_run_at)}
+              {fmtBeijing(lastCheckAt)}
               <Badge
                 variant={runOutcomeVariant(lastOutcome)}
                 className="ml-2 px-1.5 py-0 text-[10px]"
@@ -710,13 +741,23 @@ export default function TaskDetail({
           {observation && <TabsTrigger value="observation">{D.tabObservation}</TabsTrigger>}
         </TabsList>
         <TabsContent value="pushes">
-          <DeliveriesTable
-            presentation="task-content"
-            fetchPage={(pageSize, pageToken) =>
-              api.scheduleDeliveries(scheduleID, pageSize, pageToken)
+          <Suspense
+            fallback={
+              <Card>
+                <CardContent className="py-8">
+                  <Skeleton className="h-24 w-full" />
+                </CardContent>
+              </Card>
             }
-            emptyText={D.pushesEmpty}
-          />
+          >
+            <TaskBriefFeed
+              key={scheduleID}
+              scheduleID={scheduleID}
+              onLatestCheck={(check) =>
+                setLatestCheckState({ scheduleID, check })
+              }
+            />
+          </Suspense>
         </TabsContent>
         <TabsContent value="runs">
           <RunsTab scheduleID={scheduleID} />
