@@ -1865,7 +1865,8 @@ type compiledWorkflowCapture struct {
 	notify         []NotifyEmptyIn
 	order          []string
 
-	selectEmpty bool
+	selectEmpty  bool
+	cardGenV2Err error
 }
 
 func (c *compiledWorkflowCapture) register(env *testsuite.TestWorkflowEnvironment) {
@@ -1983,6 +1984,9 @@ func (c *compiledWorkflowCapture) register(env *testsuite.TestWorkflowEnvironmen
 		defer c.mu.Unlock()
 		c.cardGen = append(c.cardGen, in)
 		c.cardGenV2++
+		if c.cardGenV2Err != nil {
+			return CardGenOutcomeResult{}, c.cardGenV2Err
+		}
 		return CardGenOutcomeResult{
 			Cards: cardsOf(1), Processing: types.RunCompletenessComplete,
 		}, nil
@@ -2133,6 +2137,38 @@ func TestPushPipelineWorkflow_StructuredRuntimeUsesVersionedCardActivity(t *test
 		capture.push[0].CanonicalBrief == nil ||
 		capture.push[0].CanonicalBatchID != 77 {
 		t.Fatalf("structured canonical push = %+v", capture.push)
+	}
+}
+
+func TestPushPipelineWorkflow_StructuredCardGenFailureIsNotRetried(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{
+		ID: "wf-task-structured-no-cardgen-retry",
+	})
+	capture := &compiledWorkflowCapture{
+		cardGenV2Err: errors.New("ambiguous CardGen completion"),
+	}
+	capture.register(env)
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
+		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeStructuredInsightV1,
+		ScheduleID:     "task-structured-no-cardgen-retry",
+	})
+	if err := env.GetWorkflowError(); err == nil {
+		t.Fatal("structured CardGen failure unexpectedly completed workflow")
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if capture.cardGenV2 != 1 || len(capture.cardGen) != 1 {
+		t.Fatalf("structured CardGen attempts v2=%d total=%d, want exactly one",
+			capture.cardGenV2, len(capture.cardGen))
+	}
+	if len(capture.finalize) != 1 ||
+		capture.finalize[0].Claim.Result != types.RunResultFailed ||
+		capture.finalize[0].Claim.Processing != types.RunCompletenessPartial {
+		t.Fatalf("failed structured outcome = %+v", capture.finalize)
 	}
 }
 

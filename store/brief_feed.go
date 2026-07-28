@@ -333,16 +333,8 @@ func (s *Store) ListTaskBriefsV1(
 				DiscoveredAt: frozen.DiscoveredAt,
 			}
 			if frozen.Structured != nil {
-				projected.Structured = &TaskBriefStructuredInsightV1{
-					SchemaVersion:    frozen.Structured.SchemaVersion,
-					BodyMD:           frozen.Structured.BodyMD,
-					WhatChanged:      frozen.Structured.WhatChanged,
-					WhyItMatters:     frozen.Structured.WhyItMatters,
-					ImportanceReason: frozen.Structured.ImportanceReason,
-					Claims: append(
-						[]types.StructuredClaimV1(nil),
-						frozen.Structured.Claims...),
-				}
+				projected.Structured = projectTaskBriefStructuredInsightV1(
+					frozen.Structured)
 			}
 			page.Items[len(page.Items)-1].Insights[i] = projected
 		}
@@ -373,6 +365,24 @@ func (s *Store) ListTaskBriefsV1(
 		return TaskBriefPageV1{}, briefFeedDBError("提交任务简报读取", err)
 	}
 	return page, nil
+}
+
+func projectTaskBriefStructuredInsightV1(
+	frozen *types.StructuredInsightV1,
+) *TaskBriefStructuredInsightV1 {
+	if frozen == nil {
+		return nil
+	}
+	return &TaskBriefStructuredInsightV1{
+		SchemaVersion:    frozen.SchemaVersion,
+		BodyMD:           frozen.BodyMD,
+		WhatChanged:      frozen.WhatChanged,
+		WhyItMatters:     frozen.WhyItMatters,
+		ImportanceReason: frozen.ImportanceReason,
+		// Reader JSON always uses [] for zero claims. Older frozen payloads
+		// and body-only fallback legitimately carry a nil slice.
+		Claims: append([]types.StructuredClaimV1{}, frozen.Claims...),
+	}
 }
 
 func trimBriefFeedPageV1(

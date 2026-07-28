@@ -95,7 +95,10 @@ The Store must reject:
 Use a new durable runtime label and `GetVersion` boundary before changing the
 CardGen activity/result wire shape. Pre-2-A histories keep the old activity name
 and payload. The new path uses an outcome-aware activity variant and preserves
-the existing processing-completeness rules.
+the existing processing-completeness rules. That new CardGen Activity has one
+Temporal attempt: an ambiguous completion or worker loss fails the run as
+partial instead of repeating already-paid model calls. Legacy LLM Activities
+retain their existing retry policy.
 
 Rollout controls are independent:
 

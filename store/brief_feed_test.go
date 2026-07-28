@@ -333,6 +333,21 @@ func TestBriefFeedPageSizeIsBounded(t *testing.T) {
 	}
 }
 
+func TestTaskBriefStructuredProjectionEncodesZeroClaimsAsArray(t *testing.T) {
+	projected := projectTaskBriefStructuredInsightV1(&types.StructuredInsightV1{
+		SchemaVersion: types.StructuredInsightSchemaVersionV1,
+		BodyMD:        "body",
+	})
+	payload, err := json.Marshal(projected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), `"claims":null`) ||
+		!strings.Contains(string(payload), `"claims":[]`) {
+		t.Fatalf("zero claims projection = %s, want JSON array", payload)
+	}
+}
+
 func TestBriefFeedByteCapKeepsShortPageAndCursorAdmission(t *testing.T) {
 	items := []TaskBriefItemV1{{
 		ID: 7, GeneratedAt: time.Date(
