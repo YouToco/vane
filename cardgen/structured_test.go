@@ -36,7 +36,11 @@ func TestParseStructuredInsightV1RejectsUntrustedOutput(t *testing.T) {
 		"duplicate field": strings.Replace(valid, `"body_md":"正文"`, `"body_md":"正文","body_md":"替换"`, 1),
 		"trailing object": valid + `{}`,
 		"bad schema":      strings.Replace(valid, StructuredInsightSchemaV1, "vane.cardgen-insight/v999", 1),
-		"empty body":      strings.Replace(valid, `"body_md":"正文"`, `"body_md":""`, 1),
+		"schema wrong type": strings.Replace(
+			valid, `"schema_version":"vane.cardgen-insight/v1"`, `"schema_version":1`, 1),
+		"empty body": strings.Replace(valid, `"body_md":"正文"`, `"body_md":""`, 1),
+		"body wrong type": strings.Replace(
+			valid, `"body_md":"正文"`, `"body_md":{}`, 1),
 	}
 	for name, raw := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -58,6 +62,22 @@ func TestParseStructuredInsightV1FallsBackToValidBody(t *testing.T) {
 			`"claims":[{"text":"主张","excerpt":"原文","source_refs":["forged"]}]`, 1),
 		"excerpt mismatch": strings.Replace(valid, `"claims":[]`,
 			`"claims":[{"text":"主张","excerpt":"不存在","source_refs":["source-1"]}]`, 1),
+		"optional number": strings.Replace(
+			valid, `"what_changed":"变化"`, `"what_changed":123`, 1),
+		"optional object": strings.Replace(
+			valid, `"why_it_matters":"原因"`, `"why_it_matters":{}`, 1),
+		"optional array": strings.Replace(
+			valid, `"importance_reason":"依据"`, `"importance_reason":[]`, 1),
+		"claims wrong type": strings.Replace(
+			valid, `"claims":[]`, `"claims":"invalid"`, 1),
+		"claim wrong type": strings.Replace(
+			valid, `"claims":[]`, `"claims":[123]`, 1),
+		"claim inner wrong type": strings.Replace(
+			valid, `"claims":[]`,
+			`"claims":[{"text":"主张","excerpt":"原文","source_refs":"source-1"}]`, 1),
+		"claim unknown field": strings.Replace(
+			valid, `"claims":[]`,
+			`"claims":[{"text":"主张","excerpt":"原文","source_refs":["source-1"],"extra":true}]`, 1),
 	}
 	for name, raw := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -76,14 +96,22 @@ func TestParseStructuredInsightV1FallsBackToValidBody(t *testing.T) {
 }
 
 func TestParseStructuredInsightV1AllowsBodyOnlyFallback(t *testing.T) {
-	raw := []byte(`{"schema_version":"vane.cardgen-insight/v1","body_md":"安全正文","what_changed":"","why_it_matters":"","importance_reason":"","claims":[]}`)
-	got, err := ParseStructuredInsightV1(
-		raw, map[string]string{"source-1": "正文"})
-	if err != nil {
-		t.Fatal(err)
+	tests := map[string]string{
+		"empty": `{"schema_version":"vane.cardgen-insight/v1","body_md":"安全正文","what_changed":"","why_it_matters":"","importance_reason":"","claims":[]}`,
+		"null":  `{"schema_version":"vane.cardgen-insight/v1","body_md":"安全正文","what_changed":null,"why_it_matters":null,"importance_reason":null,"claims":null}`,
 	}
-	if got.BodyMD != "安全正文" || got.WhatChanged != "" {
-		t.Fatalf("unexpected fallback: %+v", got)
+	for name, raw := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := ParseStructuredInsightV1(
+				[]byte(raw), map[string]string{"source-1": "正文"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.BodyMD != "安全正文" || got.WhatChanged != "" ||
+				got.EvidenceDigest == "" {
+				t.Fatalf("unexpected fallback: %+v", got)
+			}
+		})
 	}
 }
 

@@ -94,12 +94,12 @@ func StructuredEvidenceTextV1(item types.ContentItem) string {
 }
 
 type structuredInsightWireV1 struct {
-	SchemaVersion    string                    `json:"schema_version"`
-	BodyMD           string                    `json:"body_md"`
-	WhatChanged      string                    `json:"what_changed"`
-	WhyItMatters     string                    `json:"why_it_matters"`
-	ImportanceReason string                    `json:"importance_reason"`
-	Claims           []types.StructuredClaimV1 `json:"claims"`
+	SchemaVersion    string          `json:"schema_version"`
+	BodyMD           string          `json:"body_md"`
+	WhatChanged      json.RawMessage `json:"what_changed"`
+	WhyItMatters     json.RawMessage `json:"why_it_matters"`
+	ImportanceReason json.RawMessage `json:"importance_reason"`
+	Claims           json.RawMessage `json:"claims"`
 }
 
 // ParseStructuredInsightV1 validates one model response against the exact
@@ -123,13 +123,18 @@ func ParseStructuredInsightV1(raw []byte, sources map[string]string) (Structured
 		return StructuredInsightV1{}, err
 	}
 	insight := StructuredInsightV1{
-		SchemaVersion: wire.SchemaVersion, BodyMD: wire.BodyMD,
-		WhatChanged: wire.WhatChanged, WhyItMatters: wire.WhyItMatters,
-		ImportanceReason: wire.ImportanceReason, Claims: wire.Claims,
+		SchemaVersion: wire.SchemaVersion,
+		BodyMD:        wire.BodyMD,
 	}
 	if insight.SchemaVersion != StructuredInsightSchemaV1 ||
 		!validStructuredText(insight.BodyMD, maxStructuredBodyBytes, false) {
 		return StructuredInsightV1{}, errors.New("structured insight envelope is invalid")
+	}
+	var projectionOK bool
+	insight.WhatChanged, insight.WhyItMatters, insight.ImportanceReason,
+		insight.Claims, projectionOK = decodeStructuredProjectionV1(wire)
+	if !projectionOK {
+		return types.SealStructuredInsightEvidenceV1(insight, sources)
 	}
 	if !validStructuredProjectionV1(insight) {
 		insight.WhatChanged = ""
@@ -148,6 +153,59 @@ func ParseStructuredInsightV1(raw []byte, sources map[string]string) (Structured
 	insight.ImportanceReason = ""
 	insight.Claims = nil
 	return types.SealStructuredInsightEvidenceV1(insight, sources)
+}
+
+func decodeStructuredProjectionV1(wire structuredInsightWireV1) (
+	string,
+	string,
+	string,
+	[]types.StructuredClaimV1,
+	bool,
+) {
+	whatChanged, ok := decodeOptionalStructuredStringV1(wire.WhatChanged)
+	if !ok {
+		return "", "", "", nil, false
+	}
+	whyItMatters, ok := decodeOptionalStructuredStringV1(wire.WhyItMatters)
+	if !ok {
+		return "", "", "", nil, false
+	}
+	importanceReason, ok := decodeOptionalStructuredStringV1(wire.ImportanceReason)
+	if !ok {
+		return "", "", "", nil, false
+	}
+	claims, ok := decodeOptionalStructuredClaimsV1(wire.Claims)
+	if !ok {
+		return "", "", "", nil, false
+	}
+	return whatChanged, whyItMatters, importanceReason, claims, true
+}
+
+func decodeOptionalStructuredStringV1(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return "", true
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func decodeOptionalStructuredClaimsV1(raw json.RawMessage) ([]types.StructuredClaimV1, bool) {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, true
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var claims []types.StructuredClaimV1
+	if err := decoder.Decode(&claims); err != nil {
+		return nil, false
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return nil, false
+	}
+	return claims, true
 }
 
 func validStructuredProjectionV1(insight StructuredInsightV1) bool {

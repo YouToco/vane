@@ -61,6 +61,9 @@ Rules:
   valid or the structured projection is absent;
 - claims are optional in the first rollout, but every present claim has at
   least one reference and one source excerpt;
+- missing or JSON `null` optional fields are treated as absent; any other
+  optional-field type or shape error discards the complete structured
+  projection while retaining a valid `body_md`;
 - references must match request-owned opaque IDs; raw URLs, database IDs and
   model-invented IDs are rejected;
 - each cited excerpt must occur in the normalized source input represented by
