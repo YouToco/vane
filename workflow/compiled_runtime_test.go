@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -143,6 +144,9 @@ type compiledRunStoreFake struct {
 	candidates         []types.ContentItem
 	attributionID      int64
 	attributionOK      bool
+	eventEvidence      []store.StructuredEventEvidenceContentV1
+	eventEvidenceErr   error
+	eventEvidenceIDs   [][]int64
 	dueSourceIDs       [][]int64
 	candidateSourceID  [][]int64
 	attributionIDs     [][]int64
@@ -186,6 +190,7 @@ type observationRuntimeStoreFake struct {
 	uncertainCalls  int
 	reserveCalls    int
 	reserveBatchIDs []int64
+	provenance      types.ObservedEventProvenanceV1
 	bindBatchIDs    []int64
 	bindDeliveryIDs []int64
 	authorityOrder  *pushAuthorityOrder
@@ -284,6 +289,29 @@ func (f *observationRuntimeStoreFake) ReserveObservedEventV1(
 		f.authorityOrder.reserveBefore.Store(true)
 	}
 	return true, nil
+}
+
+func (f *observationRuntimeStoreFake) ReserveObservedEventProvenanceV1(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRef,
+	batchID int64,
+	event observation.QualifiedEvent,
+) (types.ObservedEventProvenanceV1, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reserveCalls++
+	f.reserveBatchIDs = append(f.reserveBatchIDs, batchID)
+	if f.authorityOrder != nil && !f.authorityOrder.claimed.Load() {
+		f.authorityOrder.reserveBefore.Store(true)
+	}
+	if f.provenance.Validate() == nil {
+		return f.provenance, true, nil
+	}
+	provenance, err := types.SealObservedEventProvenanceV1(
+		1, event.PolicyDigest, event.EventKey, event.EventType,
+		event.Subject, event.OccurredAt, event.EvidenceJSON)
+	return provenance, err == nil, err
 }
 
 func (f *observationRuntimeStoreFake) BindObservedEventDeliveryV1(
@@ -574,6 +602,35 @@ func (f *compiledStructuredCardGenFake) GenerateStructuredWithPolicyV2(
 	}
 	return types.SealStructuredInsightEvidenceV1(
 		result, map[string]string{"source-1": item.Item.Content})
+}
+
+func (f *compiledStructuredCardGenFake) GenerateStructuredWithEvidencePolicyV3(
+	_ context.Context,
+	_ int64,
+	_ int64,
+	item types.ScoredItem,
+	sources []cardgenpkg.EventEvidenceSourceV1,
+	_ string,
+	_ string,
+	_ cardgenpkg.PolicyV2,
+	_ func(context.Context, float64) error,
+) (types.StructuredInsightV1, error) {
+	f.calls.Add(1)
+	if err := f.failByID[item.Item.ID]; err != nil {
+		return types.StructuredInsightV1{}, err
+	}
+	corpus, err := cardgenpkg.EventEvidenceCorpusV1(sources)
+	if err != nil {
+		return types.StructuredInsightV1{}, err
+	}
+	result := types.StructuredInsightV1{
+		SchemaVersion:    types.StructuredInsightSchemaVersionV1,
+		BodyMD:           "**structured event body**",
+		WhatChanged:      "change",
+		WhyItMatters:     "reason",
+		ImportanceReason: "evidence",
+	}
+	return types.SealStructuredInsightEvidenceV1(result, corpus)
 }
 
 func (f *compiledRunStoreFake) EvolveProfileForTaskRunV1(
@@ -868,6 +925,25 @@ func (f *compiledRunStoreFake) SourceForContentFromIDs(
 	defer f.mu.Unlock()
 	f.attributionIDs = append(f.attributionIDs, append([]int64(nil), ids...))
 	return f.attributionID, f.attributionOK, nil
+}
+
+func (f *compiledRunStoreFake) LoadStructuredEventEvidenceForTaskRunV1(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRef,
+	contentIDs []int64,
+) ([]store.StructuredEventEvidenceContentV1, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.eventEvidenceIDs = append(
+		f.eventEvidenceIDs, append([]int64(nil), contentIDs...))
+	if f.eventEvidenceErr != nil {
+		return nil, f.eventEvidenceErr
+	}
+	return append(
+		[]store.StructuredEventEvidenceContentV1(nil),
+		f.eventEvidence...,
+	), nil
 }
 
 func (f *compiledRunStoreFake) counts() (loadRef, create, loadSnapshot, authorize int) {
@@ -1860,13 +1936,16 @@ type compiledWorkflowCapture struct {
 	selectIn       []SelectIn
 	cardGen        []CardGenIn
 	cardGenV2      int
+	cardGenV3      int
 	push           []PushIn
 	record         []RecordEmptyIn
 	notify         []NotifyEmptyIn
 	order          []string
 
-	selectEmpty  bool
-	cardGenV2Err error
+	selectEmpty         bool
+	cardGenV2Err        error
+	cardGenV3Err        error
+	cardGenV3Processing types.RunCompletenessV1
 }
 
 func (c *compiledWorkflowCapture) register(env *testsuite.TestWorkflowEnvironment) {
@@ -1989,6 +2068,22 @@ func (c *compiledWorkflowCapture) register(env *testsuite.TestWorkflowEnvironmen
 		}
 		return CardGenOutcomeResult{
 			Cards: cardsOf(1), Processing: types.RunCompletenessComplete,
+		}, nil
+	})
+	reg("CardGenOutcomeV3", func(_ context.Context, in CardGenIn) (CardGenOutcomeResult, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.cardGen = append(c.cardGen, in)
+		c.cardGenV3++
+		if c.cardGenV3Err != nil {
+			return CardGenOutcomeResult{}, c.cardGenV3Err
+		}
+		processing := c.cardGenV3Processing
+		if processing == "" {
+			processing = types.RunCompletenessComplete
+		}
+		return CardGenOutcomeResult{
+			Cards: cardsOf(1), Processing: processing,
 		}, nil
 	})
 	reg("PrepareCanonicalBriefV1", func(
@@ -2137,6 +2232,83 @@ func TestPushPipelineWorkflow_StructuredRuntimeUsesVersionedCardActivity(t *test
 		capture.push[0].CanonicalBrief == nil ||
 		capture.push[0].CanonicalBatchID != 77 {
 		t.Fatalf("structured canonical push = %+v", capture.push)
+	}
+}
+
+func TestPushPipelineWorkflow_EventEvidenceRuntimeUsesV3AndPropagatesPartial(
+	t *testing.T,
+) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{
+		ID: "wf-task-structured-event-evidence",
+	})
+	capture := &compiledWorkflowCapture{
+		cardGenV3Processing: types.RunCompletenessPartial,
+	}
+	capture.register(env)
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
+		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeStructuredEventEvidenceV1,
+		ScheduleID:     "task-structured-event-evidence",
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("event evidence workflow failed: %v", err)
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if capture.cardGenV3 != 1 || capture.cardGenV2 != 0 ||
+		len(capture.cardGen) != 1 {
+		t.Fatalf("card activities v3=%d v2=%d total=%d",
+			capture.cardGenV3, capture.cardGenV2, len(capture.cardGen))
+	}
+	if len(capture.push) != 1 ||
+		capture.push[0].CanonicalBrief == nil ||
+		capture.push[0].CanonicalBatchID != 77 {
+		t.Fatalf("event evidence canonical push = %+v", capture.push)
+	}
+	if len(capture.finalize) != 1 ||
+		capture.finalize[0].Claim.Result != types.RunResultContent ||
+		capture.finalize[0].Claim.Processing !=
+			types.RunCompletenessPartial {
+		t.Fatalf("partial event evidence outcome = %+v", capture.finalize)
+	}
+}
+
+func TestPushPipelineWorkflow_EventEvidenceCardGenFailureIsNotRetried(
+	t *testing.T,
+) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{
+		ID: "wf-task-event-evidence-no-cardgen-retry",
+	})
+	capture := &compiledWorkflowCapture{
+		cardGenV3Err: errors.New("ambiguous event evidence CardGen completion"),
+	}
+	capture.register(env)
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
+		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeStructuredEventEvidenceV1,
+		ScheduleID:     "task-event-evidence-no-cardgen-retry",
+	})
+	if err := env.GetWorkflowError(); err == nil {
+		t.Fatal("event evidence CardGen failure unexpectedly completed workflow")
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if capture.cardGenV3 != 1 || capture.cardGenV2 != 0 ||
+		len(capture.cardGen) != 1 {
+		t.Fatalf("event evidence CardGen attempts v3=%d v2=%d total=%d",
+			capture.cardGenV3, capture.cardGenV2, len(capture.cardGen))
+	}
+	if len(capture.finalize) != 1 ||
+		capture.finalize[0].Claim.Result != types.RunResultFailed ||
+		capture.finalize[0].Claim.Processing !=
+			types.RunCompletenessPartial {
+		t.Fatalf("failed event evidence outcome = %+v", capture.finalize)
 	}
 }
 
@@ -2832,6 +3004,188 @@ func TestCardGenOutcomeV2ReturnsStructuredPayloadWithoutLegacyCall(t *testing.T)
 	}
 }
 
+func TestCardGenOutcomeV3LoadsOrderedExactRunEvidenceBeforeOneModelCall(
+	t *testing.T,
+) {
+	identity, ref, snapshot := compiledActivityFixture(
+		"Structured Event Evidence Task")
+	policy, err := runtimeconfig.BuildStructuredInsightCompiledV1(
+		runtimeconfig.CurrentCompiledV1Input{
+			Model: "deepseek-chat", TaskInstructionEnabled: true,
+			ModelEndpointGeneration: 1, ModelCredentialGeneration: 1,
+			ExaCredentialGeneration: 1, TikHubCredentialGeneration: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Policy = policy
+	discoveredAt := time.Date(
+		2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+	compiledStore := &compiledRunStoreFake{
+		snapshot: snapshot, authorize: true,
+		eventEvidence: []store.StructuredEventEvidenceContentV1{
+			{
+				Item: types.ContentItem{
+					ID: 501, SourceID: 10,
+					URL:   "https://evidence.test/primary",
+					Title: "primary", Content: "primary evidence",
+					CreatedAt: discoveredAt,
+				},
+				Source: runcontext.SourceV1{
+					SourceID: 10, Platform: types.PlatformWeb,
+					Title: "Primary Source",
+				},
+			},
+			{
+				Item: types.ContentItem{
+					ID: 502, SourceID: 11,
+					URL:   "https://evidence.test/supporting",
+					Title: "supporting", Content: "supporting evidence",
+					CreatedAt: discoveredAt.Add(time.Second),
+				},
+				Source: runcontext.SourceV1{
+					SourceID: 11, Platform: types.PlatformWeb,
+					Title: "Supporting Source",
+				},
+			},
+		},
+	}
+	eventJSON, err := json.Marshal(eventqualifier.Event{
+		EventType: "release", Subject: "vane",
+		OccurredAt:         "2026-07-26T12:00:00Z",
+		EvidenceContentIDs: []int64{501, 502},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	card := new(compiledStructuredCardGenFake)
+	a := NewActivities(
+		fakeFetcher{}, fakeScorer{}, card, &fakePusher{}, new(fakeStore),
+		fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledRuntimeV1(
+			compiledStore,
+			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+				return runtimepolicy.BundleV1{}, nil
+			},
+			new(compiledModelResolverFake)),
+	)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.CardGenOutcomeV3)
+	value, err := env.ExecuteActivity(
+		a.CardGenOutcomeV3,
+		CardGenIn{
+			UserID: identity.UserID, TraceID: "trace-event-evidence",
+			Run: &CompiledRunInputV1{
+				TenantID: identity.TenantID,
+				TaskID:   identity.TaskID, Snapshot: ref,
+			},
+			Items: []types.ScoredItem{{
+				Item: types.ContentItem{
+					ID: 501, Title: "primary",
+					ObservationEventJSON: eventJSON,
+				},
+				Score: 88,
+			}},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result CardGenOutcomeResult
+	if err := value.Get(&result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Cards) != 1 ||
+		result.Cards[0].Structured == nil ||
+		result.Cards[0].BodyMD != "**structured event body**" ||
+		len(result.Cards[0].EventEvidence) != 2 ||
+		result.Cards[0].EventEvidence[0].ContentItemID != 501 ||
+		result.Cards[0].EventEvidence[1].ContentItemID != 502 ||
+		result.Cards[0].EventEvidence[0].Metadata.Ref != "source-1" ||
+		result.Cards[0].EventEvidence[1].Metadata.Ref != "source-2" ||
+		result.Processing != types.RunCompletenessComplete ||
+		card.calls.Load() != 1 {
+		t.Fatalf("result=%+v calls=%d", result, card.calls.Load())
+	}
+	compiledStore.mu.Lock()
+	requested := append(
+		[]int64(nil), compiledStore.eventEvidenceIDs[0]...)
+	compiledStore.mu.Unlock()
+	if !reflect.DeepEqual(requested, []int64{501, 502}) {
+		t.Fatalf("requested evidence ids=%v", requested)
+	}
+}
+
+func TestCardGenOutcomeV3RejectsForgedPrimaryBeforeInventoryOrModel(
+	t *testing.T,
+) {
+	identity, ref, snapshot := compiledActivityFixture(
+		"Structured Event Evidence Task")
+	policy, err := runtimeconfig.BuildStructuredInsightCompiledV1(
+		runtimeconfig.CurrentCompiledV1Input{
+			Model:                   "deepseek-chat",
+			ModelEndpointGeneration: 1, ModelCredentialGeneration: 1,
+			ExaCredentialGeneration: 1, TikHubCredentialGeneration: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Policy = policy
+	compiledStore := &compiledRunStoreFake{
+		snapshot: snapshot, authorize: true,
+	}
+	eventJSON, err := json.Marshal(eventqualifier.Event{
+		EventType:          "release",
+		Subject:            "vane",
+		OccurredAt:         "2026-07-26T12:00:00Z",
+		EvidenceContentIDs: []int64{502, 501},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	card := new(compiledStructuredCardGenFake)
+	a := NewActivities(
+		fakeFetcher{}, fakeScorer{}, card, &fakePusher{}, new(fakeStore),
+		fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledRuntimeV1(
+			compiledStore,
+			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+				return runtimepolicy.BundleV1{}, nil
+			},
+			new(compiledModelResolverFake)),
+	)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.CardGenOutcomeV3)
+	_, err = env.ExecuteActivity(a.CardGenOutcomeV3, CardGenIn{
+		UserID: identity.UserID, TraceID: "trace-forged-primary",
+		Run: &CompiledRunInputV1{
+			TenantID: identity.TenantID,
+			TaskID:   identity.TaskID, Snapshot: ref,
+		},
+		Items: []types.ScoredItem{{
+			Item: types.ContentItem{
+				ID: 501, Title: "primary",
+				ObservationEventJSON: eventJSON,
+			},
+			Score: 88,
+		}},
+	})
+	if err == nil {
+		t.Fatal("forged primary evidence must fail")
+	}
+	if card.calls.Load() != 0 {
+		t.Fatalf("model calls=%d want 0", card.calls.Load())
+	}
+	compiledStore.mu.Lock()
+	loads := len(compiledStore.eventEvidenceIDs)
+	compiledStore.mu.Unlock()
+	if loads != 0 {
+		t.Fatalf("inventory loads=%d want 0", loads)
+	}
+}
+
 func TestCardGenOutcomeV2PartialAndAllRejectedSemantics(t *testing.T) {
 	identity, ref, snapshot := compiledActivityFixture("Structured Task")
 	policy, err := runtimeconfig.BuildStructuredInsightCompiledV1(
@@ -2922,6 +3276,84 @@ func executePushActivity(t *testing.T, env *testsuite.TestActivityEnvironment, a
 	t.Helper()
 	_, err := env.ExecuteActivity(a.Push, in)
 	return err
+}
+
+func TestPreparePushDeliveriesRejectsFirstWriterOccurredAtDrift(
+	t *testing.T,
+) {
+	identity, ref, snapshot := compiledActivityFixture(
+		"Structured Event Evidence Task")
+	eventJSON := json.RawMessage(
+		`{"event_type":"release","subject":"vane","occurred_at":"2026-07-26T12:00:00Z","evidence_content_ids":[501]}`)
+	provenance, err := types.SealObservedEventProvenanceV1(
+		71, strings.Repeat("a", 64), strings.Repeat("b", 64),
+		"release", "vane",
+		time.Date(2026, time.July, 26, 13, 0, 0, 0, time.UTC),
+		eventJSON,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiledStore := &compiledRunStoreFake{
+		snapshot: snapshot, authorize: true,
+	}
+	observationStore := &observationRuntimeStoreFake{
+		provenance: provenance,
+	}
+	a := NewActivities(
+		fakeFetcher{}, fakeScorer{}, new(compiledStructuredCardGenFake),
+		&fakePusher{}, new(fakeStore), fakeFeishu{},
+		nil, nil, nil, nil,
+		WithCompiledRuntimeV1(
+			compiledStore,
+			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+				return runtimepolicy.BundleV1{}, nil
+			},
+			new(compiledModelResolverFake)),
+		WithObservationRuntime(observationStore, nil, "", ""),
+	)
+	_, err = a.preparePushDeliveries(
+		context.Background(),
+		PushIn{
+			UserID: identity.UserID, ScheduleID: identity.TaskID,
+			TraceID: "trace-occurred-at-drift",
+			Run: &CompiledRunInputV1{
+				TenantID: identity.TenantID,
+				TaskID:   identity.TaskID, Snapshot: ref,
+			},
+			Cards: []GeneratedCard{{
+				Scored: types.ScoredItem{
+					Item: types.ContentItem{
+						ID:                      501,
+						ObservationPolicyDigest: strings.Repeat("a", 64),
+						ObservationEventKey:     strings.Repeat("b", 64),
+						ObservationEventJSON:    eventJSON,
+					},
+					Score: 88,
+				},
+				EventEvidence: []cardgenpkg.EventEvidenceSourceV1{{
+					ContentItemID: 501,
+				}},
+			}},
+		},
+		true, identity, 301, []int64{10},
+		map[int64]runcontext.SourceV1{
+			10: {SourceID: 10, Platform: types.PlatformWeb},
+		},
+		false, true,
+	)
+	var appErr *temporal.ApplicationError
+	if !errors.As(err, &appErr) ||
+		appErr.Type() != string(types.CodeConflict) ||
+		!appErr.NonRetryable() {
+		t.Fatalf("occurred_at drift error=%v want non-retryable conflict", err)
+	}
+	compiledStore.mu.Lock()
+	writes := compiledStore.deliveryWrites
+	compiledStore.mu.Unlock()
+	if writes != 0 {
+		t.Fatalf("delivery writes=%d want 0", writes)
+	}
 }
 
 type authorityCheckingPusher struct {

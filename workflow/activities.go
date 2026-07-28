@@ -147,6 +147,14 @@ type compiledCardGeneratorV2 interface {
 	GenerateStructuredWithPolicyV2(context.Context, int64, int64, types.ScoredItem, string, string, cardgenpkg.PolicyV2, func(context.Context, float64) error) (types.StructuredInsightV1, error)
 }
 
+type compiledCardGeneratorV3 interface {
+	GenerateStructuredWithEvidencePolicyV3(
+		context.Context, int64, int64, types.ScoredItem,
+		[]cardgenpkg.EventEvidenceSourceV1, string, string,
+		cardgenpkg.PolicyV2, func(context.Context, float64) error,
+	) (types.StructuredInsightV1, error)
+}
+
 // ProfileEvolver 画像演化器（生产实现 evolver.Evolver）：推送前批量消费该用户
 // 的新反馈、演化画像 summary/tags（Boss 拍板①：演化随推送批量，非反馈即时）。
 type ProfileEvolver interface {
@@ -282,6 +290,9 @@ type CompiledRunStore interface {
 	ListDueSourcesByIDs(context.Context, []int64) ([]types.Source, error)
 	ListUnpushedForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, []int64, int, int) ([]types.ContentItem, error)
 	SourceForContentFromIDs(context.Context, int64, []int64) (int64, bool, error)
+	LoadStructuredEventEvidenceForTaskRunV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef, []int64,
+	) ([]storepkg.StructuredEventEvidenceContentV1, error)
 }
 
 type RunOutcomeStoreV1 interface {
@@ -319,6 +330,16 @@ type CanonicalBriefStructuredStoreV1 interface {
 		types.RunOutcomeMarkerV1, int64, time.Time, []int64,
 		map[int64]types.StructuredInsightV1,
 		map[int64]map[string]string,
+	) (types.BriefDraftV1, error)
+}
+
+type CanonicalBriefStructuredEventStoreV1 interface {
+	PrepareBriefDraftV3(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1, int64, time.Time, []int64,
+		map[int64]types.StructuredInsightV1,
+		map[int64]map[string]string,
+		map[int64]types.StructuredEventEvidenceV1,
 	) (types.BriefDraftV1, error)
 }
 
@@ -477,6 +498,13 @@ type ObservationRuntimeStore interface {
 	MarkObservedEventDeliveredV1(
 		context.Context, types.RunIdentity, types.RunSnapshotRef, int64,
 	) error
+}
+
+type ObservationEventProvenanceStoreV1 interface {
+	ReserveObservedEventProvenanceV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		int64, observation.QualifiedEvent,
+	) (types.ObservedEventProvenanceV1, bool, error)
 }
 
 // WithObservationRuntime enables the bounded qualifier for exactly one shadow
@@ -933,7 +961,9 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 	if !found {
 		observationRollout := a.observationRolloutForTask(p.ScheduleID)
 		builder := a.buildCompiledPolicyV1
-		if p.RuntimeVersion == CompiledRuntimeStructuredInsightV1 {
+		if p.RuntimeVersion == CompiledRuntimeStructuredInsightV1 ||
+			p.RuntimeVersion ==
+				CompiledRuntimeStructuredEventEvidenceV1 {
 			if a.buildStructuredPolicyV1 == nil {
 				return PrepareRunResult{}, nonRetryable(types.NewAppError(
 					types.CodeInternal,
@@ -1185,18 +1215,34 @@ func (a *Activities) PrepareCanonicalBriefV1(
 	}
 	var draft types.BriefDraftV1
 	if len(plan.structuredByDelivery) > 0 {
-		structuredStore, ok :=
-			a.canonicalBriefStore.(CanonicalBriefStructuredStoreV1)
-		if !ok {
-			return CanonicalBriefPrepareResult{}, nonRetryable(
-				types.NewAppError(types.CodeInternal,
-					"structured Brief store is unsupported", nil))
+		if len(plan.structuredEventByDelivery) > 0 {
+			structuredStore, ok :=
+				a.canonicalBriefStore.(CanonicalBriefStructuredEventStoreV1)
+			if !ok {
+				return CanonicalBriefPrepareResult{}, nonRetryable(
+					types.NewAppError(types.CodeInternal,
+						"structured event Brief store is unsupported", nil))
+			}
+			draft, err = structuredStore.PrepareBriefDraftV3(
+				ctx, expected, in.Run.Snapshot, in.Marker, batchID,
+				in.GeneratedAt, plan.orderedDeliveryIDs,
+				plan.structuredByDelivery,
+				plan.structuredEvidenceByDelivery,
+				plan.structuredEventByDelivery)
+		} else {
+			structuredStore, ok :=
+				a.canonicalBriefStore.(CanonicalBriefStructuredStoreV1)
+			if !ok {
+				return CanonicalBriefPrepareResult{}, nonRetryable(
+					types.NewAppError(types.CodeInternal,
+						"structured Brief store is unsupported", nil))
+			}
+			draft, err = structuredStore.PrepareBriefDraftV2(
+				ctx, expected, in.Run.Snapshot, in.Marker, batchID,
+				in.GeneratedAt, plan.orderedDeliveryIDs,
+				plan.structuredByDelivery,
+				plan.structuredEvidenceByDelivery)
 		}
-		draft, err = structuredStore.PrepareBriefDraftV2(
-			ctx, expected, in.Run.Snapshot, in.Marker, batchID,
-			in.GeneratedAt, plan.orderedDeliveryIDs,
-			plan.structuredByDelivery,
-			plan.structuredEvidenceByDelivery)
 	} else {
 		draft, err = a.canonicalBriefStore.PrepareBriefDraftV1(
 			ctx, expected, in.Run.Snapshot, in.Marker, batchID,
@@ -2911,13 +2957,14 @@ func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredIte
 // （Push 按本切片顺序拼卡），而 Score 的产出还要过一遍 RankTopN 重排。
 // 换句话说，这里若按完成先后收集，同一批内容每次推送的卡面顺序都会不一样。
 func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard, error) {
-	return a.cardGen(ctx, in, false)
+	return a.cardGen(ctx, in, false, false)
 }
 
 func (a *Activities) cardGen(
 	ctx context.Context,
 	in CardGenIn,
 	structured bool,
+	eventEvidence bool,
 ) ([]GeneratedCard, error) {
 	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
@@ -2931,18 +2978,38 @@ func (a *Activities) cardGen(
 	var compiledConsumer compiledCardGeneratorV1
 	var compiledPolicy cardgenpkg.PolicyV1
 	var structuredConsumer compiledCardGeneratorV2
+	var eventEvidenceConsumer compiledCardGeneratorV3
 	var structuredPolicy cardgenpkg.PolicyV2
+	var expected types.RunIdentity
 	if compiled {
 		modelClient, err := a.resolveCompiledModelPolicyV1(snapshot.Policy.ModelPolicy)
 		if err != nil {
 			return nil, retryableOrNot(err)
 		}
 		if structured {
-			var ok bool
-			structuredConsumer, ok = a.cardgen.(compiledCardGeneratorV2)
-			if !ok {
-				return nil, nonRetryable(types.NewAppError(types.CodeInternal,
-					"compiled card generator v2 is unsupported", nil))
+			if eventEvidence {
+				var ok bool
+				eventEvidenceConsumer, ok =
+					a.cardgen.(compiledCardGeneratorV3)
+				if !ok {
+					return nil, nonRetryable(types.NewAppError(
+						types.CodeInternal,
+						"compiled card generator v3 is unsupported", nil))
+				}
+				expected, err = activityRunIdentityV1(
+					ctx, in.UserID, in.Run)
+				if err != nil {
+					return nil, retryableOrNot(err)
+				}
+			} else {
+				var ok bool
+				structuredConsumer, ok =
+					a.cardgen.(compiledCardGeneratorV2)
+				if !ok {
+					return nil, nonRetryable(types.NewAppError(
+						types.CodeInternal,
+						"compiled card generator v2 is unsupported", nil))
+				}
 			}
 			structuredPolicy, err = cardgenpkg.PrepareCompiledPolicyV2(
 				snapshot.Policy.PromptPolicy, snapshot.Policy.ModelPolicy,
@@ -2966,6 +3033,11 @@ func (a *Activities) cardGen(
 			taskInstruction = snapshot.Definition.PlaybookContent
 		}
 	} else {
+		if eventEvidence {
+			return nil, nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"structured event evidence requires compiled runtime", nil))
+		}
 		taskInstruction = a.loadTaskInstruction(ctx, in.UserID, in.ScheduleID, in.TraceID, "cardgen")
 	}
 	var quotaHit atomic.Bool
@@ -2974,6 +3046,16 @@ func (a *Activities) cardGen(
 	var authorizationErr error
 	cards := mapConcurrent(ctx, in.Items, parBatchFanout,
 		func(ctx context.Context, si types.ScoredItem) (GeneratedCard, error) {
+			var eventSources []cardgenpkg.EventEvidenceSourceV1
+			if eventEvidence {
+				var loadErr error
+				eventSources, loadErr =
+					a.loadCardGenEventEvidenceV1(
+						ctx, expected, in.Run.Snapshot, si.Item)
+				if loadErr != nil {
+					return GeneratedCard{}, loadErr
+				}
+			}
 			authorize := func(effectCtx context.Context) error {
 				err := a.authorizeCompiledEffectV1(effectCtx, in.UserID, in.Run)
 				if err != nil {
@@ -2999,9 +3081,25 @@ func (a *Activities) cardGen(
 			var err error
 			if compiled {
 				if structured {
-					result, generateErr := structuredConsumer.GenerateStructuredWithPolicyV2(
-						ctx, snapshot.Definition.TenantID, in.UserID, si,
-						in.TraceID, taskInstruction, structuredPolicy, beforeSpend)
+					var (
+						result      types.StructuredInsightV1
+						generateErr error
+					)
+					if eventEvidence {
+						result, generateErr =
+							eventEvidenceConsumer.
+								GenerateStructuredWithEvidencePolicyV3(
+									ctx, snapshot.Definition.TenantID,
+									in.UserID, si, eventSources,
+									in.TraceID, taskInstruction,
+									structuredPolicy, beforeSpend)
+					} else {
+						result, generateErr =
+							structuredConsumer.GenerateStructuredWithPolicyV2(
+								ctx, snapshot.Definition.TenantID, in.UserID, si,
+								in.TraceID, taskInstruction,
+								structuredPolicy, beforeSpend)
+					}
 					err = generateErr
 					if generateErr == nil {
 						body = result.BodyMD
@@ -3028,6 +3126,7 @@ func (a *Activities) cardGen(
 			}
 			return GeneratedCard{
 				Scored: si, BodyMD: body, Structured: structuredResult,
+				EventEvidence: eventSources,
 			}, nil
 		},
 		func(si types.ScoredItem, err error) {
@@ -3071,7 +3170,7 @@ func (a *Activities) CardGenOutcomeV1(
 func (a *Activities) CardGenOutcomeV2(
 	ctx context.Context, in CardGenIn,
 ) (CardGenOutcomeResult, error) {
-	cards, err := a.cardGen(ctx, in, true)
+	cards, err := a.cardGen(ctx, in, true, false)
 	if err != nil {
 		return CardGenOutcomeResult{}, err
 	}
@@ -3080,6 +3179,61 @@ func (a *Activities) CardGenOutcomeV2(
 		processing = types.RunCompletenessPartial
 	}
 	return CardGenOutcomeResult{Cards: cards, Processing: processing}, nil
+}
+
+func (a *Activities) CardGenOutcomeV3(
+	ctx context.Context, in CardGenIn,
+) (CardGenOutcomeResult, error) {
+	cards, err := a.cardGen(ctx, in, true, true)
+	if err != nil {
+		return CardGenOutcomeResult{}, err
+	}
+	processing := types.RunCompletenessComplete
+	if len(cards) != len(in.Items) {
+		processing = types.RunCompletenessPartial
+	}
+	return CardGenOutcomeResult{Cards: cards, Processing: processing}, nil
+}
+
+func (a *Activities) loadCardGenEventEvidenceV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	item types.ContentItem,
+) ([]cardgenpkg.EventEvidenceSourceV1, error) {
+	if a.compiledStore == nil || item.ID <= 0 ||
+		len(item.ObservationEventJSON) == 0 {
+		return nil, nonRetryable(types.NewAppError(
+			types.CodeValidation,
+			"structured event evidence input is incomplete", nil))
+	}
+	var event eventqualifier.Event
+	if err := json.Unmarshal(item.ObservationEventJSON, &event); err != nil ||
+		len(event.EvidenceContentIDs) == 0 ||
+		len(event.EvidenceContentIDs) > 8 ||
+		event.EvidenceContentIDs[0] != item.ID {
+		return nil, nonRetryable(types.NewAppError(
+			types.CodeValidation,
+			"structured event evidence identity is invalid", nil))
+	}
+	loaded, err :=
+		a.compiledStore.LoadStructuredEventEvidenceForTaskRunV1(
+			ctx, expected, ref, event.EvidenceContentIDs)
+	if err != nil {
+		return nil, retryableOrNot(err)
+	}
+	sources := make(
+		[]cardgenpkg.EventEvidenceSourceV1, len(loaded))
+	for index, evidence := range loaded {
+		sources[index], err = cardgenpkg.NewEventEvidenceSourceV1(
+			index, evidence.Item, evidence.Source)
+		if err != nil {
+			return nil, nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"structured event evidence inventory is invalid", nil))
+		}
+	}
+	return sources, nil
 }
 
 // logPipelineItemFailure keeps arbitrary downstream error strings out of app
@@ -3162,6 +3316,7 @@ type pushDeliveryPlan struct {
 	orderedDeliveryIDs           []int64
 	structuredByDelivery         map[int64]types.StructuredInsightV1
 	structuredEvidenceByDelivery map[int64]map[string]string
+	structuredEventByDelivery    map[int64]types.StructuredEventEvidenceV1
 	pending                      []pushPendingItem
 	anySent                      bool
 	skippedEvents                int
@@ -3181,6 +3336,7 @@ func (a *Activities) preparePushDeliveries(
 	var plan pushDeliveryPlan
 	for _, card := range in.Cards {
 		eventKey := card.Scored.Item.ObservationEventKey
+		var eventProvenance *types.ObservedEventProvenanceV1
 		if compiled && eventKey != "" {
 			if a.observationStore == nil {
 				return pushDeliveryPlan{}, nonRetryable(types.NewAppError(
@@ -3191,8 +3347,49 @@ func (a *Activities) preparePushDeliveries(
 			if eventErr != nil {
 				return pushDeliveryPlan{}, nonRetryable(eventErr)
 			}
-			accepted, reserveErr := a.observationStore.ReserveObservedEventV1(
-				ctx, compiledIdentity, in.Run.Snapshot, batchID, event)
+			var (
+				accepted   bool
+				reserveErr error
+			)
+			if len(card.EventEvidence) > 0 {
+				provenanceStore, ok :=
+					a.observationStore.(ObservationEventProvenanceStoreV1)
+				if !ok {
+					return pushDeliveryPlan{}, nonRetryable(
+						types.NewAppError(
+							types.CodeInternal,
+							"observed event provenance store is unsupported",
+							nil))
+				}
+				var provenance types.ObservedEventProvenanceV1
+				provenance, accepted, reserveErr =
+					provenanceStore.
+						ReserveObservedEventProvenanceV1(
+							ctx, compiledIdentity, in.Run.Snapshot,
+							batchID, event)
+				if reserveErr == nil && accepted {
+					if provenance.PolicyDigest != event.PolicyDigest ||
+						provenance.EventKey != event.EventKey ||
+						provenance.EventType != event.EventType ||
+						provenance.Subject != event.Subject ||
+						provenance.OccurredAt != event.OccurredAt.
+							Round(0).UTC().Truncate(time.Microsecond) ||
+						!provenance.MatchesEvidenceJSON(
+							event.EvidenceJSON) {
+						return pushDeliveryPlan{}, nonRetryable(
+							types.NewAppError(
+								types.CodeConflict,
+								"observed event provenance differs from card evidence",
+								nil))
+					}
+					eventProvenance = &provenance
+				}
+			} else {
+				accepted, reserveErr =
+					a.observationStore.ReserveObservedEventV1(
+						ctx, compiledIdentity, in.Run.Snapshot,
+						batchID, event)
+			}
 			if reserveErr != nil {
 				return pushDeliveryPlan{}, retryableOrNot(reserveErr)
 			}
@@ -3240,6 +3437,32 @@ func (a *Activities) preparePushDeliveries(
 					types.CodeValidation,
 					"structured card differs from canonical body", err))
 			}
+			evidenceSources := map[string]string{
+				"source-1": cardgenpkg.StructuredEvidenceTextV1(
+					card.Scored.Item),
+			}
+			if len(card.EventEvidence) > 0 {
+				if eventProvenance == nil {
+					return pushDeliveryPlan{}, nonRetryable(
+						types.NewAppError(
+							types.CodeConflict,
+							"structured event evidence has no provenance",
+							nil))
+				}
+				var corpusErr error
+				evidenceSources, corpusErr =
+					cardgenpkg.EventEvidenceCorpusV1(
+						card.EventEvidence)
+				if corpusErr != nil ||
+					types.ValidateStructuredInsightEvidenceV1(
+						*card.Structured, evidenceSources) != nil {
+					return pushDeliveryPlan{}, nonRetryable(
+						types.NewAppError(
+							types.CodeValidation,
+							"structured event evidence differs from card",
+							nil))
+				}
+			}
 			if plan.structuredByDelivery == nil {
 				plan.structuredByDelivery =
 					make(map[int64]types.StructuredInsightV1)
@@ -3248,10 +3471,30 @@ func (a *Activities) preparePushDeliveries(
 			}
 			plan.structuredByDelivery[deliveryID] = *card.Structured
 			plan.structuredEvidenceByDelivery[deliveryID] =
-				map[string]string{
-					"source-1": cardgenpkg.StructuredEvidenceTextV1(
-						card.Scored.Item),
+				evidenceSources
+			if eventProvenance != nil {
+				if plan.structuredEventByDelivery == nil {
+					plan.structuredEventByDelivery =
+						make(map[int64]types.StructuredEventEvidenceV1)
 				}
+				sources := make(
+					[]types.StructuredEvidenceSourceV1,
+					len(card.EventEvidence))
+				for index := range card.EventEvidence {
+					sources[index] = card.EventEvidence[index].Metadata
+				}
+				plan.structuredEventByDelivery[deliveryID] =
+					types.StructuredEventEvidenceV1{
+						SchemaVersion:  types.StructuredEventEvidenceSchemaVersionV1,
+						Provenance:     *eventProvenance,
+						EvidenceDigest: card.Structured.EvidenceDigest,
+						Sources:        sources,
+					}
+			}
+		} else if len(card.EventEvidence) > 0 {
+			return pushDeliveryPlan{}, nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"event evidence requires a structured card", nil))
 		}
 		if compiled && eventKey != "" {
 			if err := a.observationStore.BindObservedEventDeliveryV1(

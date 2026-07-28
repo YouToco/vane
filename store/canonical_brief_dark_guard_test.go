@@ -38,6 +38,18 @@ func TestCanonicalBriefP1EHasOnlyScopedProductionCallPoints(t *testing.T) {
 		"PrepareBriefDraftV1": {
 			"workflow/activities.go": true,
 		},
+		"PrepareBriefDraftV2": {
+			"workflow/activities.go": true,
+		},
+		"PrepareBriefDraftV3": {
+			"workflow/activities.go": true,
+		},
+		"LoadStructuredEventEvidenceForTaskRunV1": {
+			"workflow/activities.go": true,
+		},
+		"GenerateStructuredWithEvidencePolicyV3": {
+			"workflow/activities.go": true,
+		},
 		"LoadSealedEmptyBriefBatchV1": {
 			"workflow/activities.go": true,
 		},
@@ -59,6 +71,10 @@ func TestCanonicalBriefP1EHasOnlyScopedProductionCallPoints(t *testing.T) {
 			"cmd/server/main.go":   true,
 		},
 		"PrepareCanonicalBriefV1": {
+			"workflow/workflow.go": true,
+			"cmd/server/main.go":   true,
+		},
+		"CardGenOutcomeV3": {
 			"workflow/workflow.go": true,
 			"cmd/server/main.go":   true,
 		},

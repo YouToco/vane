@@ -5,7 +5,9 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -16,6 +18,7 @@ import (
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
+	cardgenpkg "github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/types"
 )
 
@@ -748,12 +751,35 @@ func structuredInsightV1HappyPathHistory(
 	t *testing.T,
 	execution sdkworkflow.Execution,
 ) *historypb.History {
+	return structuredInsightHappyPathHistory(
+		t, execution, false)
+}
+
+func structuredEventEvidenceV1HappyPathHistory(
+	t *testing.T,
+	execution sdkworkflow.Execution,
+) *historypb.History {
+	return structuredInsightHappyPathHistory(
+		t, execution, true)
+}
+
+func structuredInsightHappyPathHistory(
+	t *testing.T,
+	execution sdkworkflow.Execution,
+	eventEvidenceRuntime bool,
+) *historypb.History {
 	t.Helper()
+	runtimeVersion := CompiledRuntimeStructuredInsightV1
+	taskID := "task-p2a-replay"
+	if eventEvidenceRuntime {
+		runtimeVersion = CompiledRuntimeStructuredEventEvidenceV1
+		taskID = "task-p2b1-replay"
+	}
 	p := PushParams{
 		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
 		ExecutionMode:  types.ExecutionModeCompiled,
-		RuntimeVersion: CompiledRuntimeStructuredInsightV1,
-		ScheduleID:     "task-p2a-replay", NLDesc: "每日结构化情报",
+		RuntimeVersion: runtimeVersion,
+		ScheduleID:     taskID, NLDesc: "每日结构化情报",
 	}
 	identity := types.RunIdentity{
 		TemporalWorkflowID: execution.ID, TemporalRunID: execution.RunID,
@@ -783,10 +809,43 @@ func structuredInsightV1HappyPathHistory(
 			SourceRefs: []string{"source-1"},
 		}},
 	}
+	var frozenEventEvidence []cardgenpkg.EventEvidenceSourceV1
+	var briefEventEvidence *types.StructuredEventEvidenceV1
+	if eventEvidenceRuntime {
+		structured.EvidenceDigest = strings.Repeat("c", 64)
+		discoveredAt := time.Date(
+			2026, time.July, 28, 12, 0, 0, 0, time.UTC)
+		frozenEventEvidence = []cardgenpkg.EventEvidenceSourceV1{{
+			ContentItemID: 1,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-1", Title: "item",
+				SourceTitle: "source", Platform: "web",
+				SourceURL:    "https://example.com/item",
+				DiscoveredAt: discoveredAt,
+			},
+			EvidenceText: "价格下降了 20%",
+		}}
+		provenance, err := types.SealObservedEventProvenanceV1(
+			505, strings.Repeat("a", 64), strings.Repeat("b", 64),
+			"model_release", "vane", discoveredAt,
+			json.RawMessage(`{"evidence_content_ids":[1]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		briefEventEvidence = &types.StructuredEventEvidenceV1{
+			SchemaVersion:  types.StructuredEventEvidenceSchemaVersionV1,
+			Provenance:     provenance,
+			EvidenceDigest: structured.EvidenceDigest,
+			Sources: []types.StructuredEvidenceSourceV1{
+				frozenEventEvidence[0].Metadata,
+			},
+		}
+	}
 	cards := []GeneratedCard{{
-		Scored:     scoredItems(1)[0],
-		BodyMD:     structured.BodyMD,
-		Structured: &structured,
+		Scored:        scoredItems(1)[0],
+		BodyMD:        structured.BodyMD,
+		Structured:    &structured,
+		EventEvidence: frozenEventEvidence,
 	}}
 	draft := types.BriefDraftV1{
 		SchemaVersion: types.BriefSchemaVersionV1,
@@ -796,8 +855,9 @@ func structuredInsightV1HappyPathHistory(
 		Insights: []types.InsightV1{{
 			ID: 405, RankPosition: 1, Title: "item",
 			BodyMD: structured.BodyMD, SourceTitle: "source",
-			SourceURL:  "https://example.com/item",
-			Structured: &structured,
+			SourceURL:     "https://example.com/item",
+			Structured:    &structured,
+			EventEvidence: briefEventEvidence,
 		}},
 	}
 	const traceID = "9f1d6c5e-0000-4000-8000-p2areplay000"
@@ -833,8 +893,14 @@ func structuredInsightV1HappyPathHistory(
 		UserID: p.UserID, TraceID: traceID, TopN: defaultTopN,
 		Scored: scoredItems(1), ScheduleID: p.ScheduleID, Run: run,
 	}, scoredItems(1))
-	b.versionWithSearchAttributes("structured-insight-cardgen-v1", 1)
-	b.activity("CardGenOutcomeV2", CardGenIn{
+	cardGenActivity := "CardGenOutcomeV2"
+	cardGenVersion := "structured-insight-cardgen-v1"
+	if eventEvidenceRuntime {
+		cardGenActivity = "CardGenOutcomeV3"
+		cardGenVersion = "structured-event-evidence-cardgen-v1"
+	}
+	b.versionWithSearchAttributes(cardGenVersion, 1)
+	b.activity(cardGenActivity, CardGenIn{
 		UserID: p.UserID, TraceID: traceID, Items: scoredItems(1),
 		ScheduleID: p.ScheduleID, Run: run,
 	}, CardGenOutcomeResult{
@@ -875,6 +941,48 @@ func TestPushPipelineWorkflow_ReplayStructuredInsightV1HappyPath(t *testing.T) {
 		t, structuredInsightV1HappyPathHistory(t, execution), execution,
 	); err != nil {
 		t.Fatalf("P2-A structured history must replay exactly: %v", err)
+	}
+}
+
+func TestPushPipelineWorkflow_ReplayStructuredEventEvidenceV1HappyPath(
+	t *testing.T,
+) {
+	execution := sdkworkflow.Execution{
+		ID:    "wf-task-p2b1-replay",
+		RunID: "00000000-0000-4000-8000-000000000106",
+	}
+	if err := replayWithExecution(
+		t,
+		structuredEventEvidenceV1HappyPathHistory(t, execution),
+		execution,
+	); err != nil {
+		t.Fatalf("P2-B1 structured event evidence history must replay exactly: %v",
+			err)
+	}
+}
+
+func TestPushPipelineWorkflow_ReplayStructuredEventEvidenceRejectsV3Mutation(
+	t *testing.T,
+) {
+	execution := sdkworkflow.Execution{
+		ID:    "wf-task-p2b1-replay",
+		RunID: "00000000-0000-4000-8000-000000000107",
+	}
+	history := structuredEventEvidenceV1HappyPathHistory(t, execution)
+	mutated := false
+	for _, event := range history.Events {
+		attributes := event.GetActivityTaskScheduledEventAttributes()
+		if attributes.GetActivityType().GetName() == "CardGenOutcomeV3" {
+			attributes.ActivityType.Name = "CardGenOutcomeV2"
+			mutated = true
+			break
+		}
+	}
+	if !mutated {
+		t.Fatal("P2-B1 replay fixture has no CardGenOutcomeV3 Activity")
+	}
+	if err := replayWithExecution(t, history, execution); err == nil {
+		t.Fatal("mutating P2-B1 CardGen command identity must trigger nondeterminism")
 	}
 }
 

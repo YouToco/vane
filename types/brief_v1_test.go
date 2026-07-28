@@ -129,6 +129,90 @@ func TestStructuredInsightEvidenceBindsExactSourcesAndEveryRef(t *testing.T) {
 	}
 }
 
+func TestBriefV1FreezesStructuredEventEvidence(t *testing.T) {
+	corpus := map[string]string{
+		"source-1": "第一份共同原文证据",
+		"source-2": "第二份共同原文证据",
+	}
+	structured, err := SealStructuredInsightEvidenceV1(
+		StructuredInsightV1{
+			SchemaVersion: StructuredInsightSchemaVersionV1,
+			BodyMD:        "正文", WhatChanged: "变化",
+			WhyItMatters: "原因", ImportanceReason: "依据",
+			Claims: []StructuredClaimV1{{
+				Text: "事实", Excerpt: "共同原文",
+				SourceRefs: []string{"source-1", "source-2"},
+			}},
+		},
+		corpus,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := SealObservedEventProvenanceV1(
+		9, strings.Repeat("a", 64), strings.Repeat("b", 64),
+		"model_release", "OpenAI models",
+		time.Date(2026, 7, 28, 12, 0, 0, 999, time.FixedZone("x", 3600)),
+		json.RawMessage(`{"evidence_content_ids":[11,12]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := time.Date(
+		2026, 7, 28, 11, 0, 0, 999, time.FixedZone("x", 3600))
+	eventEvidence := &StructuredEventEvidenceV1{
+		SchemaVersion:  StructuredEventEvidenceSchemaVersionV1,
+		Provenance:     provenance,
+		EvidenceDigest: structured.EvidenceDigest,
+		Sources: []StructuredEvidenceSourceV1{
+			{
+				Ref: "source-1", Title: "公告一",
+				SourceTitle: "官方博客", Platform: "web",
+				SourceURL:   "https://example.com/one",
+				PublishedAt: &published, DiscoveredAt: published.Add(time.Minute),
+			},
+			{
+				Ref: "source-2", Title: "公告二",
+				SourceTitle: "发布日志", Platform: "rss",
+				SourceURL:    "https://example.com/two",
+				DiscoveredAt: published.Add(2 * time.Minute),
+			},
+		},
+	}
+	draft := BriefDraftV1{
+		SchemaVersion: BriefSchemaVersionV1,
+		RunOutcomeID:  1, RunSnapshotID: 2, PushBatchID: 3,
+		TenantID: 4, UserID: 5, TaskID: "task-a", GeneratedAt: time.Now(),
+		Insights: []InsightV1{{
+			ID: 6, RankPosition: 1, Title: "标题", BodyMD: structured.BodyMD,
+			SourceURL: "https://example.com/source", DiscoveredAt: time.Now(),
+			Structured: &structured, EventEvidence: eventEvidence,
+		}},
+	}
+	brief, err := draft.Seal(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventEvidence.Sources[0].Title = "caller mutation"
+	if got := brief.Insights[0].EventEvidence.Sources[0].Title; got != "公告一" {
+		t.Fatalf("sealed event evidence mutated through caller alias: %q", got)
+	}
+	if brief.Insights[0].EventEvidence.Sources[0].PublishedAt.Location() !=
+		time.UTC {
+		t.Fatal("event evidence publication time was not canonicalized")
+	}
+	tampered := brief
+	tampered.Insights = append([]InsightV1(nil), brief.Insights...)
+	copyEvidence := *brief.Insights[0].EventEvidence
+	copyEvidence.Sources = append(
+		[]StructuredEvidenceSourceV1(nil), copyEvidence.Sources...)
+	copyEvidence.Sources[0].Ref = "source-2"
+	tampered.Insights[0].EventEvidence = &copyEvidence
+	if err := tampered.Validate(); err == nil {
+		t.Fatal("event evidence order/ref mutation did not invalidate Brief")
+	}
+}
+
 func TestGeneratedLegacyInsightJSONOmitsStructuredExtension(t *testing.T) {
 	payload, err := json.Marshal(InsightV1{ID: 1})
 	if err != nil {
@@ -136,6 +220,9 @@ func TestGeneratedLegacyInsightJSONOmitsStructuredExtension(t *testing.T) {
 	}
 	if strings.Contains(string(payload), "structured") {
 		t.Fatalf("legacy Insight wire shape gained structured field: %s", payload)
+	}
+	if strings.Contains(string(payload), "event_evidence") {
+		t.Fatalf("legacy Insight wire shape gained event evidence: %s", payload)
 	}
 }
 

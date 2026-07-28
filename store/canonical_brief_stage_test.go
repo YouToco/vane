@@ -250,6 +250,96 @@ func TestStructuredBriefStageFirstWriteReplayAndConflict(t *testing.T) {
 	}
 }
 
+func TestCanonicalBriefStageFreezesStructuredEventEvidence(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 1)
+	marker, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corpus := map[string]string{"source-1": "frozen evidence body"}
+	structured, err := types.SealStructuredInsightEvidenceV1(
+		types.StructuredInsightV1{
+			SchemaVersion: types.StructuredInsightSchemaVersionV1,
+			BodyMD:        f.bodyMD[0],
+		},
+		corpus,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventJSON := json.RawMessage(`{"evidence_content_ids":[1]}`)
+	provenance, err := types.SealObservedEventProvenanceV1(
+		77, strings.Repeat("a", 64), strings.Repeat("b", 64),
+		"model_release", "OpenAI models",
+		time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
+		eventJSON,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventEvidence := types.StructuredEventEvidenceV1{
+		SchemaVersion:  types.StructuredEventEvidenceSchemaVersionV1,
+		Provenance:     provenance,
+		EvidenceDigest: structured.EvidenceDigest,
+		Sources: []types.StructuredEvidenceSourceV1{{
+			Ref: "source-1", Title: f.itemTitle[0],
+			SourceTitle: f.sourceName, Platform: "web",
+			SourceURL: f.itemURL[0], PublishedAt: f.published[0],
+			DiscoveredAt: f.deliveryAt[0],
+		}},
+	}
+	generatedAt := time.Date(
+		2026, 7, 28, 13, 0, 0, 0, time.UTC)
+	structuredByDelivery := map[int64]types.StructuredInsightV1{
+		f.deliveryID[0]: structured,
+	}
+	corpusByDelivery := map[int64]map[string]string{
+		f.deliveryID[0]: corpus,
+	}
+	eventByDelivery := map[int64]types.StructuredEventEvidenceV1{
+		f.deliveryID[0]: eventEvidence,
+	}
+	draft, err := f.base.st.PrepareBriefDraftV3(
+		t.Context(), f.identity, f.ref, marker, f.batchID, generatedAt,
+		f.deliveryID, structuredByDelivery, corpusByDelivery,
+		eventByDelivery,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(draft.Insights) != 1 ||
+		draft.Insights[0].EventEvidence == nil ||
+		draft.Insights[0].EventEvidence.Provenance.ID != provenance.ID {
+		t.Fatalf("staged event evidence = %+v", draft)
+	}
+	payload, err := json.Marshal(draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "content_item_id") ||
+		strings.Contains(string(payload), "frozen evidence body") {
+		t.Fatalf("Brief leaked raw evidence inventory: %s", payload)
+	}
+	if _, err := f.base.st.PrepareBriefDraftV3(
+		t.Context(), f.identity, f.ref, marker, f.batchID, generatedAt,
+		f.deliveryID, structuredByDelivery, corpusByDelivery,
+		eventByDelivery,
+	); err != nil {
+		t.Fatalf("exact event evidence replay failed: %v", err)
+	}
+	drifted := eventEvidence
+	drifted.Provenance.ID++
+	eventByDelivery[f.deliveryID[0]] = drifted
+	if _, err := f.base.st.PrepareBriefDraftV3(
+		t.Context(), f.identity, f.ref, marker, f.batchID, generatedAt,
+		f.deliveryID, structuredByDelivery, corpusByDelivery,
+		eventByDelivery,
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("provenance drift error=%v want conflict", err)
+	}
+}
+
 func TestCanonicalBriefStageAbortsWithNonContentOutcome(t *testing.T) {
 	f := newCanonicalBriefFixture(t, 1)
 	marker, err := f.base.st.CreatePendingRunOutcomeV1(

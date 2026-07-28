@@ -14,7 +14,10 @@
 // 能直接复用 selector.RankTopN 而非各写一份 TopN。
 package workflow
 
-import "github.com/YouToco/vane/types"
+import (
+	cardgenpkg "github.com/YouToco/vane/cardgen"
+	"github.com/YouToco/vane/types"
+)
 
 // defaultTopN 是每批默认推送条数（PushScope.TopN 为 0 时取此值，见规格 B1）。
 const defaultTopN = 5
@@ -84,22 +87,29 @@ const CompiledRuntimeCanonicalBriefV1 = "compiled-snapshot/v1+run-outcome/v1+bri
 // CardGen policy and optional immutable Insight extension.
 const CompiledRuntimeStructuredInsightV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+structured-insight/v1"
 
+// CompiledRuntimeStructuredEventEvidenceV1 adds P2-B1's ordered multi-source
+// event evidence Activity and optional immutable Brief provenance extension.
+const CompiledRuntimeStructuredEventEvidenceV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+structured-insight/v1+event-evidence/v1"
+
 func IsCompiledRuntimeV1(version string) bool {
 	return version == CompiledRuntimeSnapshotV1 ||
 		version == CompiledRuntimeRunOutcomeV1 ||
 		version == CompiledRuntimeCanonicalBriefV1 ||
-		version == CompiledRuntimeStructuredInsightV1
+		version == CompiledRuntimeStructuredInsightV1 ||
+		version == CompiledRuntimeStructuredEventEvidenceV1
 }
 
 func HasRunOutcomeV1(version string) bool {
 	return version == CompiledRuntimeRunOutcomeV1 ||
 		version == CompiledRuntimeCanonicalBriefV1 ||
-		version == CompiledRuntimeStructuredInsightV1
+		version == CompiledRuntimeStructuredInsightV1 ||
+		version == CompiledRuntimeStructuredEventEvidenceV1
 }
 
 func HasCanonicalBriefV1(version string) bool {
 	return version == CompiledRuntimeCanonicalBriefV1 ||
-		version == CompiledRuntimeStructuredInsightV1
+		version == CompiledRuntimeStructuredInsightV1 ||
+		version == CompiledRuntimeStructuredEventEvidenceV1
 }
 
 // CompiledRunInputV1 carries the trusted stable scope copied from the Schedule
@@ -139,4 +149,8 @@ type GeneratedCard struct {
 	// omitempty tag keeps their encoded wire shape stable; a future versioned
 	// CardGen Activity may populate it without changing legacy replay.
 	Structured *types.StructuredInsightV1 `json:"structured,omitempty"`
+	// EventEvidence is populated only by the separately versioned P2-B1
+	// CardGen Activity. It freezes the bounded corpus and inventory metadata
+	// that the later Brief Activity independently validates.
+	EventEvidence []cardgenpkg.EventEvidenceSourceV1 `json:"event_evidence,omitempty"`
 }

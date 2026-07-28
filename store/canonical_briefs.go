@@ -649,7 +649,7 @@ func (s *Store) PrepareBriefDraftV1(
 ) (types.BriefDraftV1, error) {
 	return s.prepareBriefDraft(
 		ctx, expected, ref, marker, batchID, generatedAt,
-		orderedDeliveryIDs, nil)
+		orderedDeliveryIDs, nil, nil, nil)
 }
 
 func (s *Store) PrepareBriefDraftV2(
@@ -673,7 +673,33 @@ func (s *Store) PrepareBriefDraftV2(
 	return s.prepareBriefDraft(
 		ctx, expected, ref, marker, batchID, generatedAt,
 		orderedDeliveryIDs, structuredByDelivery,
-		structuredEvidenceByDelivery)
+		structuredEvidenceByDelivery, nil)
+}
+
+func (s *Store) PrepareBriefDraftV3(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	marker types.RunOutcomeMarkerV1,
+	batchID int64,
+	generatedAt time.Time,
+	orderedDeliveryIDs []int64,
+	structuredByDelivery map[int64]types.StructuredInsightV1,
+	structuredEvidenceByDelivery map[int64]map[string]string,
+	structuredEventByDelivery map[int64]types.StructuredEventEvidenceV1,
+) (types.BriefDraftV1, error) {
+	if len(structuredByDelivery) == 0 ||
+		len(structuredByDelivery) != len(orderedDeliveryIDs) ||
+		len(structuredEvidenceByDelivery) != len(orderedDeliveryIDs) ||
+		len(structuredEventByDelivery) != len(orderedDeliveryIDs) {
+		return types.BriefDraftV1{},
+			canonicalBriefValidationError(
+				"structured event brief preparation is empty")
+	}
+	return s.prepareBriefDraft(
+		ctx, expected, ref, marker, batchID, generatedAt,
+		orderedDeliveryIDs, structuredByDelivery,
+		structuredEvidenceByDelivery, structuredEventByDelivery)
 }
 
 func (s *Store) prepareBriefDraft(
@@ -685,7 +711,8 @@ func (s *Store) prepareBriefDraft(
 	generatedAt time.Time,
 	orderedDeliveryIDs []int64,
 	structuredByDelivery map[int64]types.StructuredInsightV1,
-	structuredEvidenceByDelivery ...map[int64]map[string]string,
+	structuredEvidenceByDelivery map[int64]map[string]string,
+	structuredEventByDelivery map[int64]types.StructuredEventEvidenceV1,
 ) (types.BriefDraftV1, error) {
 	if err := marker.Validate(); err != nil ||
 		marker.RunSnapshotID != ref.SnapshotID ||
@@ -712,16 +739,22 @@ func (s *Store) prepareBriefDraft(
 		seen[deliveryID] = struct{}{}
 	}
 	for deliveryID, structured := range structuredByDelivery {
-		var sources map[string]string
-		if len(structuredEvidenceByDelivery) == 1 {
-			sources = structuredEvidenceByDelivery[0][deliveryID]
-		}
+		sources := structuredEvidenceByDelivery[deliveryID]
 		if _, exists := seen[deliveryID]; !exists ||
 			types.ValidateStructuredInsightEvidenceV1(
 				structured, sources) != nil {
 			return types.BriefDraftV1{},
 				canonicalBriefValidationError(
 					"structured brief delivery is invalid")
+		}
+	}
+	for deliveryID, eventEvidence := range structuredEventByDelivery {
+		structured, exists := structuredByDelivery[deliveryID]
+		if !exists || eventEvidence.Validate() != nil ||
+			eventEvidence.EvidenceDigest != structured.EvidenceDigest {
+			return types.BriefDraftV1{},
+				canonicalBriefValidationError(
+					"structured event brief delivery is invalid")
 		}
 	}
 
@@ -784,6 +817,19 @@ func (s *Store) prepareBriefDraft(
 					canonicalBriefConflictError(
 						"canonical Brief structured stage already differs")
 			}
+			var expectedEventEvidence *types.StructuredEventEvidenceV1
+			if eventEvidence, ok :=
+				structuredEventByDelivery[deliveryID]; ok {
+				expectedEventEvidence = &eventEvidence
+			}
+			if !reflect.DeepEqual(
+				existing.draft.Insights[index].EventEvidence,
+				expectedEventEvidence,
+			) {
+				return types.BriefDraftV1{},
+					canonicalBriefConflictError(
+						"canonical Brief event evidence stage already differs")
+			}
 		}
 		if err := commitCanonicalBriefTxV1(
 			ctx, tx, "replay canonical Brief stage"); err != nil {
@@ -842,6 +888,14 @@ func (s *Store) prepareBriefDraft(
 		if structured, ok := structuredByDelivery[deliveryID]; ok {
 			copyStructured := structured
 			insight.Structured = &copyStructured
+		}
+		if eventEvidence, ok :=
+			structuredEventByDelivery[deliveryID]; ok {
+			copyEventEvidence := eventEvidence
+			copyEventEvidence.Sources = append(
+				[]types.StructuredEvidenceSourceV1(nil),
+				eventEvidence.Sources...)
+			insight.EventEvidence = &copyEventEvidence
 		}
 		insights = append(insights, insight)
 	}

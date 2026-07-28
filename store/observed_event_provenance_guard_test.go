@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestObservedEventProvenanceV1HasZeroProductionCallers(t *testing.T) {
+func TestObservedEventProvenanceV1HasOnlyP2B1CallPoint(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("resolve observed-event provenance guard")
@@ -63,9 +63,9 @@ func TestObservedEventProvenanceV1HasZeroProductionCallers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(callers) != 0 {
+	if len(callers) != 1 || callers[0] != "workflow/activities.go" {
 		t.Fatalf(
-			"observed-event provenance production callers=%v want none",
+			"observed-event provenance production callers=%v want only P2-B1 Activity",
 			callers)
 	}
 }

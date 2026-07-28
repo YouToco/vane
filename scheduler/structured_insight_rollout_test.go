@@ -64,3 +64,71 @@ func TestStructuredInsightRolloutInvalidCombinationFailsClosed(t *testing.T) {
 		}
 	}
 }
+
+func TestStructuredEventEvidenceRolloutIsNestedInsideStructuredInsight(
+	t *testing.T,
+) {
+	s := New(nil, "queue", nil,
+		WithCompiledRuntimeRollout(true, "task-a", false),
+		WithRunOutcomeRollout(true, "task-a", false),
+		WithCanonicalBriefRollout(true, "task-a", false),
+		WithStructuredInsightRollout(
+			true, "task-a", false, true, "task-a", false),
+		WithStructuredEventEvidenceRollout(true, "task-a", false),
+	)
+	if got := s.runtimeVersionFor(
+		"task-a", types.ExecutionModeCompiled,
+	); got != workflow.CompiledRuntimeStructuredEventEvidenceV1 {
+		t.Fatalf("event evidence runtime=%q", got)
+	}
+	if got := s.runtimeVersionFor(
+		"task-b", types.ExecutionModeCompiled,
+	); got == workflow.CompiledRuntimeStructuredEventEvidenceV1 {
+		t.Fatalf("out-of-scope task gained event evidence runtime=%q", got)
+	}
+
+	withoutStructured := New(nil, "queue", nil,
+		WithCompiledRuntimeRollout(true, "task-a", false),
+		WithRunOutcomeRollout(true, "task-a", false),
+		WithCanonicalBriefRollout(true, "task-a", false),
+		WithStructuredEventEvidenceRollout(true, "task-a", false),
+	)
+	if got := withoutStructured.runtimeVersionFor(
+		"task-a", types.ExecutionModeCompiled,
+	); got != workflow.CompiledRuntimeCanonicalBriefV1 {
+		t.Fatalf("event evidence escaped structured nesting: %q", got)
+	}
+
+	defaultOff := New(nil, "queue", nil,
+		WithCompiledRuntimeRollout(true, "task-a", false),
+		WithRunOutcomeRollout(true, "task-a", false),
+		WithCanonicalBriefRollout(true, "task-a", false),
+		WithStructuredInsightRollout(
+			true, "task-a", false, true, "task-a", false),
+	)
+	if got := defaultOff.runtimeVersionFor(
+		"task-a", types.ExecutionModeCompiled,
+	); got != workflow.CompiledRuntimeStructuredInsightV1 {
+		t.Fatalf("default-off event evidence changed runtime to %q", got)
+	}
+
+	for _, option := range []SchedulerOption{
+		WithStructuredEventEvidenceRollout(true, "", false),
+		WithStructuredEventEvidenceRollout(true, "task-a", true),
+		WithStructuredEventEvidenceRollout(false, "task-a", false),
+	} {
+		invalid := New(nil, "queue", nil,
+			WithCompiledRuntimeRollout(true, "task-a", false),
+			WithRunOutcomeRollout(true, "task-a", false),
+			WithCanonicalBriefRollout(true, "task-a", false),
+			WithStructuredInsightRollout(
+				true, "task-a", false, true, "task-a", false),
+			option,
+		)
+		if got := invalid.runtimeVersionFor(
+			"task-a", types.ExecutionModeCompiled,
+		); got != workflow.CompiledRuntimeStructuredInsightV1 {
+			t.Fatalf("invalid event evidence rollout changed runtime to %q", got)
+		}
+	}
+}
