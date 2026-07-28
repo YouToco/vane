@@ -281,8 +281,9 @@ type Deps struct {
 	// When present it must be the same controller used to register
 	// edit_task_definition in BuildTools.
 	TaskDefinitionEdit DefinitionEditController
-	// ActionContinuation routes exact v2 enable_source callbacks before every
-	// historical action protocol. Production Feishu ingress always injects it.
+	// ActionContinuation routes exact supported v2 DB-local action callbacks
+	// before every historical action protocol. Production Feishu ingress
+	// always injects it.
 	ActionContinuation ActionContinuationController
 	// ActionProposal creates supported normal DB-local action cards directly
 	// as v2. It is deliberately separate from legacy CreatePendingAction and

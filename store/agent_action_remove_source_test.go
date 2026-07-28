@@ -19,6 +19,7 @@ func TestRemoveSourceDurableContinuationAtomicBatchAndReplay(
 	ctx := t.Context()
 	var actionIDs []string
 	var sourceIDs []int64
+	var sameTenantUserID int64
 	t.Cleanup(func() {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
@@ -34,6 +35,17 @@ func TestRemoveSourceDurableContinuationAtomicBatchAndReplay(
 			cleanupCtx, t, f.store,
 			`DELETE FROM sources WHERE id=ANY($1)`, sourceIDs,
 		)
+		if sameTenantUserID != 0 {
+			cleanupExec(
+				cleanupCtx, t, f.store,
+				`DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`,
+				f.tenantA, sameTenantUserID,
+			)
+			cleanupExec(
+				cleanupCtx, t, f.store,
+				`DELETE FROM users WHERE id=$1`, sameTenantUserID,
+			)
+		}
 	})
 
 	createSource := func(label string) int64 {
@@ -61,6 +73,27 @@ func TestRemoveSourceDurableContinuationAtomicBatchAndReplay(
 		}
 	}
 	if err := f.store.AddSubscription(ctx, f.userB, sourceA); err != nil {
+		t.Fatal(err)
+	}
+	sameTenantUser, err := f.store.UpsertUserByOpenID(
+		ctx,
+		"remove-source-same-tenant-"+uuid.NewString(),
+		"remove source same tenant",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameTenantUserID = sameTenantUser.ID
+	if _, err := f.store.pool.Exec(ctx, `
+		INSERT INTO memberships (tenant_id,user_id,role)
+		VALUES ($1,$2,'member')`,
+		f.tenantA, sameTenantUserID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.AddSubscription(
+		ctx, sameTenantUserID, sourceA,
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -155,8 +188,8 @@ func TestRemoveSourceDurableContinuationAtomicBatchAndReplay(
 		t.Fatal(err)
 	}
 	var (
-		ownerRows, foreignRows, sourceRows int
-		terminalCode                       string
+		ownerRows, foreignRows, sameTenantRows, sourceRows int
+		terminalCode                                       string
 	)
 	if err := f.store.pool.QueryRow(ctx, `
 		SELECT
@@ -165,21 +198,27 @@ func TestRemoveSourceDurableContinuationAtomicBatchAndReplay(
 		      AND source_id=ANY($4)),
 		  (SELECT count(*) FROM subscriptions
 		    WHERE tenant_id=$3 AND user_id=$5 AND source_id=$6),
+		  (SELECT count(*) FROM subscriptions
+		    WHERE tenant_id=$1 AND user_id=$8 AND source_id=$6),
 		  (SELECT count(*) FROM sources WHERE id=ANY($4)),
 		  (SELECT terminal_code FROM agent_action_continuations
 		    WHERE action_id=$7)`,
 		f.tenantA, f.userA, f.tenantB,
 		[]int64{sourceA, sourceB}, f.userB, sourceA, actionID,
+		sameTenantUserID,
 	).Scan(
-		&ownerRows, &foreignRows, &sourceRows, &terminalCode,
+		&ownerRows, &foreignRows, &sameTenantRows,
+		&sourceRows, &terminalCode,
 	); err != nil {
 		t.Fatal(err)
 	}
-	if ownerRows != 0 || foreignRows != 1 || sourceRows != 2 ||
+	if ownerRows != 0 || foreignRows != 1 || sameTenantRows != 1 ||
+		sourceRows != 2 ||
 		terminalCode != agentActionTerminalRemoved {
 		t.Fatalf(
-			"owner/foreign/sources/terminal=%d/%d/%d/%s",
-			ownerRows, foreignRows, sourceRows, terminalCode,
+			"owner/foreign/same-tenant/sources/terminal=%d/%d/%d/%d/%s",
+			ownerRows, foreignRows, sameTenantRows,
+			sourceRows, terminalCode,
 		)
 	}
 

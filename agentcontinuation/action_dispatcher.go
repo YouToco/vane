@@ -24,7 +24,7 @@ const (
 
 // actionDispatcherStore is the exact-action durable execution boundary. Its Store
 // implementation independently verifies execution_version=2, the generation-1
-// durable authority event, frozen enable_source bytes, and confirmed status at
+// durable authority event, frozen tool/adapter bytes, and confirmed status at
 // acquisition and again in the effect transaction.
 type actionDispatcherStore interface {
 	ListDueAgentActionContinuationTenantIDs(
