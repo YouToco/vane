@@ -21,6 +21,9 @@ const maxProfileTags = 12
 const profileColumns = `id, user_id, industry, occupation, tags, removed_tags, summary,
 	token_budget_daily, tokens_used_today, token_reset_at,
 	last_evolved_feedback_id, created_at, updated_at`
+const profileColumnsQualified = `p.id,p.user_id,p.industry,p.occupation,p.tags,
+	p.removed_tags,p.summary,p.token_budget_daily,p.tokens_used_today,
+	p.token_reset_at,p.last_evolved_feedback_id,p.created_at,p.updated_at`
 
 // scanProfile 把一行 profiles 扫进 types.Profile（复用于单行与 RETURNING）。
 func scanProfile(row pgx.Row, p *types.Profile) error {
@@ -31,6 +34,15 @@ func scanProfile(row pgx.Row, p *types.Profile) error {
 	)
 }
 
+func scanProfileWithAuthority(row pgx.Row, p *types.Profile) error {
+	return row.Scan(
+		&p.ID, &p.UserID, &p.Industry, &p.Occupation, &p.Tags, &p.RemovedTags, &p.Summary,
+		&p.TokenBudgetDaily, &p.TokensUsedToday, &p.TokenResetAt,
+		&p.LastEvolvedFeedbackID, &p.CreatedAt, &p.UpdatedAt,
+		&p.ProfileEpoch, &p.ProfileVersion,
+	)
+}
+
 // 写路径纪律（契约 §3.1，CAS 约定前提）：除本文件三个写方法外禁止任何代码直写 profiles。
 //   - 首采（UpsertProfileFields）：仅在 profile 不存在时原子创建 manual claims；
 //   - 演化（EvolveProfile / AdvanceProfileCursor）：(updated_at, 游标) 双条件 CAS，冲突即退让。
@@ -38,8 +50,12 @@ func scanProfile(row pgx.Row, p *types.Profile) error {
 // GetProfile 按 user_id 取画像；无行返回 CodeNotFound。
 func (s *Store) GetProfile(ctx context.Context, userID int64) (*types.Profile, error) {
 	var p types.Profile
-	err := scanProfile(s.pool.QueryRow(ctx,
-		`SELECT `+profileColumns+` FROM profiles WHERE user_id = $1`, userID), &p)
+	err := scanProfileWithAuthority(s.pool.QueryRow(ctx,
+		`SELECT `+profileColumnsQualified+`,s.active_epoch,s.version
+		   FROM profiles p
+		   JOIN profile_claim_states s
+		     ON s.tenant_id=p.tenant_id AND s.user_id=p.user_id
+		  WHERE p.user_id = $1`, userID), &p)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, types.NewAppError(types.CodeNotFound,
@@ -59,8 +75,12 @@ func (s *Store) GetProfileForTenant(ctx context.Context, tenantID, userID int64)
 		return nil, types.NewAppError(types.CodeValidation, "画像租户范围无效", types.ErrValidation)
 	}
 	var p types.Profile
-	err := scanProfile(s.pool.QueryRow(ctx,
-		`SELECT `+profileColumns+` FROM profiles WHERE tenant_id = $1 AND user_id = $2`,
+	err := scanProfileWithAuthority(s.pool.QueryRow(ctx,
+		`SELECT `+profileColumnsQualified+`,s.active_epoch,s.version
+		   FROM profiles p
+		   JOIN profile_claim_states s
+		     ON s.tenant_id=p.tenant_id AND s.user_id=p.user_id
+		  WHERE p.tenant_id = $1 AND p.user_id = $2`,
 		tenantID, userID), &p)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -169,7 +189,11 @@ func (s *Store) UpsertProfileFields(ctx context.Context, userID int64, industry,
 // 游标入 CAS token 是因为 AdvanceProfileCursor 不刷 updated_at——若不校验游标，
 // 慢演化写回会把已推进的游标回退、反馈被二次消费（审查 F6）。
 // 0 行命中返回 CodeConflict，调用方丢弃本次演化（游标不动，下轮在新画像上重新消费）。
-func (s *Store) EvolveProfile(ctx context.Context, userID int64, summary string, tags []string, newCursor int64, expectedAt time.Time, expectedCursor int64) error {
+func (s *Store) EvolveProfile(
+	ctx context.Context, userID int64, summary string, tags []string,
+	newCursor int64, expectedAt time.Time, expectedCursor int64,
+	expectedEpoch, expectedVersion int64,
+) error {
 	if tags == nil {
 		tags = []string{}
 	}
@@ -204,7 +228,7 @@ func (s *Store) EvolveProfile(ctx context.Context, userID int64, summary string,
 	}
 	if err := evolveProfileClaimsTx(
 		ctx, tx, tenantID, userID, summary, tags, newCursor,
-		expectedAt, expectedCursor, false,
+		expectedAt, expectedCursor, expectedEpoch, expectedVersion, false,
 	); err != nil {
 		return err
 	}
@@ -218,7 +242,11 @@ func (s *Store) EvolveProfile(ctx context.Context, userID int64, summary string,
 // 不是"画像变更"，刷了会把并发人工修正的 CAS 语义搅浑）。CAS 谓词同 EvolveProfile
 // （updated_at + 旧游标双条件），冲突返回 CodeConflict 由调用方静默跳过。
 // 用途：演化"语义失败"时标记该批反馈已消费防死循环（契约 §9）。
-func (s *Store) AdvanceProfileCursor(ctx context.Context, userID int64, newCursor int64, expectedAt time.Time, expectedCursor int64) error {
+func (s *Store) AdvanceProfileCursor(
+	ctx context.Context, userID int64, newCursor int64,
+	expectedAt time.Time, expectedCursor int64,
+	expectedEpoch, expectedVersion int64,
+) error {
 	var tenantID int64
 	err := s.pool.QueryRow(ctx,
 		`SELECT tenant_id FROM profiles WHERE user_id=$1`, userID).Scan(&tenantID)
@@ -237,13 +265,17 @@ func (s *Store) AdvanceProfileCursor(ctx context.Context, userID int64, newCurso
 	if _, err := lockProfileTx(ctx, tx, tenantID, userID); err != nil {
 		return err
 	}
-	_, _, profileEpoch, err := lockProfileClaimStateTx(
+	version, _, profileEpoch, err := lockProfileClaimStateTx(
 		ctx, tx, tenantID, userID)
 	if err != nil {
 		return err
 	}
 	if err := bindProfileEpochTx(ctx, tx, profileEpoch); err != nil {
 		return err
+	}
+	if profileEpoch != expectedEpoch || version != expectedVersion {
+		return types.NewAppError(
+			types.CodeConflict, "画像游标 epoch/version CAS 未命中", nil)
 	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE profiles

@@ -89,6 +89,22 @@ func TestMigration062DowngradeFailsClosedWithLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	registerStoreClose(t, st)
+	compatTx, err := st.beginProfileClaimScopedTx(
+		t.Context(), 1, false, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compatClaims, _, err := loadProfileClaimLedgerTx(
+		t.Context(), compatTx, 1, userID, 0)
+	_ = compatTx.Rollback(t.Context())
+	if err != nil {
+		t.Fatalf("067 binary must read 066 ledger without lineage columns: %v", err)
+	}
+	for _, claim := range compatClaims {
+		if claim.CarriedFromEpoch != nil || claim.CarriedFromClaimID != nil {
+			t.Fatalf("066 ledger invented carry lineage: %+v", claim)
+		}
+	}
 	list, err := st.ListProfileClaims(t.Context(), 1, userID)
 	if err != nil {
 		t.Fatal(err)
@@ -120,6 +136,7 @@ func TestMigration062DowngradeFailsClosedWithLedger(t *testing.T) {
 	if err := st.EvolveProfile(
 		t.Context(), userID, "新增事实。污染画像？！", []string{"safe"},
 		10, corrected.Profile.UpdatedAt, 0,
+		0, corrected.Version,
 	); err != nil {
 		t.Fatal(err)
 	}

@@ -68,6 +68,7 @@ func TestLegacyFeedbackRepairReplaySuppressesPairedNegatives(t *testing.T) {
 	if err := f.base.st.AdvanceProfileCursor(
 		ctx, f.idA.UserID, pairs[1].typedID,
 		profile.UpdatedAt, profile.LastEvolvedFeedbackID,
+		profile.ProfileEpoch, profile.ProfileVersion,
 	); err != nil {
 		t.Fatal(err)
 	}

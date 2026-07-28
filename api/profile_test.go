@@ -113,6 +113,122 @@ func TestProfileClaimActionsRejectMalformedRequestsBeforeStore(t *testing.T) {
 	}
 }
 
+func TestProfileEpochActionsRejectMalformedRequestsBeforeStore(t *testing.T) {
+	mux, cookie := newProfileMux(t)
+	path := profilePath + "/epochs/actions"
+	tests := []struct {
+		name, body, key string
+	}{
+		{
+			"missing idempotency",
+			`{"expected_epoch":0,"expected_version":0,"action":"reset","scope":"history_learning"}`,
+			"",
+		},
+		{
+			"missing epoch",
+			`{"expected_version":0,"action":"reset","scope":"history_learning"}`,
+			"epoch-1",
+		},
+		{
+			"missing version",
+			`{"expected_epoch":0,"action":"reset","scope":"history_learning"}`,
+			"epoch-2",
+		},
+		{
+			"missing action",
+			`{"expected_epoch":0,"expected_version":0,"scope":"history_learning"}`,
+			"epoch-3",
+		},
+		{
+			"unknown field",
+			`{"expected_epoch":0,"expected_version":0,"action":"reset","scope":"history_learning","target_epoch":0}`,
+			"epoch-4",
+		},
+		{
+			"duplicate action",
+			`{"expected_epoch":0,"expected_version":0,"action":"reset","action":"restore","scope":"history_learning"}`,
+			"epoch-5",
+		},
+		{
+			"unknown action",
+			`{"expected_epoch":0,"expected_version":0,"action":"delete"}`,
+			"epoch-6",
+		},
+		{
+			"reset missing scope",
+			`{"expected_epoch":0,"expected_version":0,"action":"reset"}`,
+			"epoch-7",
+		},
+		{
+			"reset wrong scope",
+			`{"expected_epoch":0,"expected_version":0,"action":"reset","scope":"all"}`,
+			"epoch-8",
+		},
+		{
+			"restore with scope",
+			`{"expected_epoch":1,"expected_version":1,"action":"restore","scope":"history_learning"}`,
+			"epoch-9",
+		},
+		{
+			"negative epoch",
+			`{"expected_epoch":-1,"expected_version":0,"action":"restore"}`,
+			"epoch-10",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(
+				http.MethodPost, path, bytes.NewBufferString(tc.body))
+			r.AddCookie(cookie)
+			if tc.key != "" {
+				r.Header.Set("Idempotency-Key", tc.key)
+			}
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestDecodeProfileClaimActionExpectedEpochCompatibility(t *testing.T) {
+	t.Run("new client binds epoch", func(t *testing.T) {
+		r := httptest.NewRequest(
+			http.MethodPost, profilePath+"/claims/actions",
+			bytes.NewBufferString(
+				`{"expected_epoch":7,"expected_version":11,"action":"pin","claim_id":"19"}`))
+		w := httptest.NewRecorder()
+		var got profileClaimActionRequest
+		if !decodeProfileClaimActionJSON(w, r, &got) {
+			t.Fatalf("decode rejected new client JSON: status=%d body=%s",
+				w.Code, w.Body.String())
+		}
+		if got.ExpectedEpoch == nil || *got.ExpectedEpoch != 7 ||
+			got.ExpectedVersion != 11 || got.Action != "pin" ||
+			got.ClaimID != "19" {
+			t.Fatalf("decoded request=%+v", got)
+		}
+	})
+
+	t.Run("legacy epoch zero client remains parseable", func(t *testing.T) {
+		r := httptest.NewRequest(
+			http.MethodPost, profilePath+"/claims/actions",
+			bytes.NewBufferString(
+				`{"expected_version":3,"action":"suppress","claim_id":"23"}`))
+		w := httptest.NewRecorder()
+		var got profileClaimActionRequest
+		if !decodeProfileClaimActionJSON(w, r, &got) {
+			t.Fatalf("decode rejected legacy JSON: status=%d body=%s",
+				w.Code, w.Body.String())
+		}
+		if got.ExpectedEpoch != nil || got.ExpectedVersion != 3 ||
+			got.Action != "suppress" || got.ClaimID != "23" {
+			t.Fatalf("decoded legacy request=%+v", got)
+		}
+	})
+}
+
 func TestProfileClaimsPaginationRejectsInvalidQueryBeforeStore(t *testing.T) {
 	mux, cookie := newProfileMux(t)
 	for _, rawQuery := range []string{

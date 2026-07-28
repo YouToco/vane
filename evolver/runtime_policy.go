@@ -24,8 +24,8 @@ type PolicyV1 struct {
 // Activity. Each callback revalidates the sealed run and performs live
 // authorization plus the CAS write in one database transaction.
 type CompiledProfileWritesV1 struct {
-	Evolve        func(context.Context, string, []string, int64, time.Time, int64) error
-	AdvanceCursor func(context.Context, int64, time.Time, int64) error
+	Evolve        func(context.Context, string, []string, int64, time.Time, int64, int64, int64) error
+	AdvanceCursor func(context.Context, int64, time.Time, int64, int64, int64) error
 }
 
 type evolveExecutionV1 struct {

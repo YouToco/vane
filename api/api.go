@@ -238,6 +238,7 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("POST /api/profile/edits/{id}/undo", s.handleUndoProfileEdit)
 	inner.HandleFunc("GET /api/profile/claims", s.handleListProfileClaims)
 	inner.HandleFunc("POST /api/profile/claims/actions", s.handleProfileClaimAction)
+	inner.HandleFunc("POST /api/profile/epochs/actions", s.handleProfileEpochAction)
 
 	// 邀请码管理端点（D4 准入闸门的管理面）：替代 SSH 跑 useradmin invite。
 	// 全部锁 requirePlatformOwner（handler 内第一行，非 owner 404）。

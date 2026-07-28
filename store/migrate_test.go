@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 66
+const latestMigrationVersion int64 = 67
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -108,6 +108,11 @@ var wantTables = []string{
 	"profile_claims",
 	"profile_claim_events",
 	"profile_claim_receipts",
+	// 067 append-only reset/restore transitions and the feedback epoch fence.
+	"profile_feedback_epoch_fences",
+	"profile_epoch_checkpoints",
+	"profile_epoch_events",
+	"profile_epoch_receipts",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的

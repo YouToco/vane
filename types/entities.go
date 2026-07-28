@@ -206,6 +206,8 @@ type Profile struct {
 	TokensUsedToday       int       `json:"tokens_used_today"`        // NOT NULL DEFAULT 0
 	TokenResetAt          time.Time `json:"token_reset_at"`           // NOT NULL
 	LastEvolvedFeedbackID int64     `json:"last_evolved_feedback_id"` // 演化游标：已消费到的最大 feedbacks.id
+	ProfileEpoch          int64     `json:"-"`                        // internal Evolver snapshot CAS token
+	ProfileVersion        int64     `json:"-"`                        // internal global authority CAS token
 	CreatedAt             time.Time `json:"created_at"`
 	UpdatedAt             time.Time `json:"updated_at"`
 }

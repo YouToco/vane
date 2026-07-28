@@ -17,24 +17,29 @@ import (
 )
 
 type profileClaimRow struct {
-	ID            int64
-	Field         string
-	Value         string
-	SourceState   string
-	SourceRefType *string
-	SourceRef     *string
-	Generation    int64
-	SupersedesID  *int64
-	CreatedAt     time.Time
+	ID                 int64
+	Field              string
+	Value              string
+	SourceState        string
+	SourceRefType      *string
+	SourceRef          *string
+	Generation         int64
+	SupersedesID       *int64
+	CarriedFromEpoch   *int64
+	CarriedFromClaimID *int64
+	CreatedAt          time.Time
 }
 
 type profileClaimEventRow struct {
-	ID            int64
-	Kind          string
-	TargetClaimID *int64
-	ResultClaimID *int64
-	TargetEventID *int64
-	CreatedAt     time.Time
+	ID              int64
+	Kind            string
+	TargetClaimID   *int64
+	ResultClaimID   *int64
+	TargetEventID   *int64
+	ActorUserID     int64
+	ExpectedVersion int64
+	ResultVersion   int64
+	CreatedAt       time.Time
 }
 
 type profileClaimProjection struct {
@@ -126,6 +131,11 @@ func (s *Store) ListProfileClaimsPage(
 		Claims:        publicClaims,
 		Events:        publicProfileClaimEventPage(events, pageEvents),
 		EventsHasMore: hasMore,
+	}
+	out.RestoreAllowed, err = profileRestoreAllowedTx(
+		ctx, tx, tenantID, userID, profileEpoch, version)
+	if err != nil {
+		return nil, err
 	}
 	if hasMore {
 		cursor.BeforeEventID = pageEvents[len(pageEvents)-1].ID
@@ -226,7 +236,8 @@ func (s *Store) ApplyProfileClaimAction(
 	action types.ProfileClaimAction,
 	idempotencyKey, requestDigest string,
 ) (*types.ProfileClaimActionResult, error) {
-	if tenantID <= 0 || userID <= 0 || action.ExpectedVersion < 0 ||
+	if tenantID <= 0 || userID <= 0 || action.ExpectedEpoch < -1 ||
+		action.ExpectedVersion < 0 ||
 		idempotencyKey == "" || requestDigest == "" {
 		return nil, types.NewAppError(types.CodeValidation, "画像主张操作范围或幂等凭据无效", nil)
 	}
@@ -261,8 +272,16 @@ func (s *Store) ApplyProfileClaimAction(
 	if err := bindProfileEpochTx(ctx, tx, profileEpoch); err != nil {
 		return nil, err
 	}
-	if version != action.ExpectedVersion {
-		return nil, types.NewAppError(types.CodeConflict, "画像主张版本已变化，请刷新后重试", nil)
+	expectedEpoch := action.ExpectedEpoch
+	// One deployment window remains compatible with already-open legacy Web
+	// tabs. Absence is accepted only before the first reset; it can never write
+	// or replay into a nonzero epoch.
+	if expectedEpoch == -1 && profileEpoch == 0 {
+		expectedEpoch = 0
+	}
+	if profileEpoch != expectedEpoch || version != action.ExpectedVersion {
+		return nil, types.NewAppError(
+			types.CodeConflict, "画像 epoch 或版本已变化，请刷新后重试", nil)
 	}
 	claims, events, err := loadProfileClaimLedgerTx(
 		ctx, tx, tenantID, userID, profileEpoch)
@@ -548,10 +567,15 @@ func loadProfileClaimLedgerTx(
 	// Public responses remain bounded; durable transition-watermark replay and
 	// compaction belong to the reset authority phase.
 	rows, err := tx.Query(ctx,
-		`SELECT id,field_name,claim_value,source_state,source_ref_type,
-		        source_ref,generation,supersedes_claim_id,created_at
-		   FROM profile_claims
-		  WHERE tenant_id=$1 AND user_id=$2 AND profile_epoch=$3 ORDER BY id`,
+		`SELECT pc.id,pc.field_name,pc.claim_value,pc.source_state,
+		        pc.source_ref_type,pc.source_ref,pc.generation,
+		        pc.supersedes_claim_id,
+		        NULLIF(to_jsonb(pc)->>'carried_from_epoch','')::bigint,
+		        NULLIF(to_jsonb(pc)->>'carried_from_claim_id','')::bigint,
+		        pc.created_at
+		   FROM profile_claims pc
+		  WHERE pc.tenant_id=$1 AND pc.user_id=$2
+		    AND pc.profile_epoch=$3 ORDER BY pc.id`,
 		tenantID, userID, profileEpoch)
 	if err != nil {
 		return nil, nil, profileClaimDBError("load profile claims", err)
@@ -562,7 +586,8 @@ func loadProfileClaimLedgerTx(
 		if err := rows.Scan(
 			&claim.ID, &claim.Field, &claim.Value, &claim.SourceState,
 			&claim.SourceRefType, &claim.SourceRef, &claim.Generation,
-			&claim.SupersedesID, &claim.CreatedAt,
+			&claim.SupersedesID, &claim.CarriedFromEpoch,
+			&claim.CarriedFromClaimID, &claim.CreatedAt,
 		); err != nil {
 			rows.Close()
 			return nil, nil, profileClaimDBError("scan profile claim", err)
@@ -575,7 +600,8 @@ func loadProfileClaimLedgerTx(
 	}
 	rows.Close()
 	eventRows, err := tx.Query(ctx,
-		`SELECT id,event_kind,target_claim_id,result_claim_id,target_event_id,created_at
+		`SELECT id,event_kind,target_claim_id,result_claim_id,target_event_id,
+		        actor_user_id,expected_version,result_version,created_at
 		   FROM profile_claim_events
 		  WHERE tenant_id=$1 AND user_id=$2 AND profile_epoch=$3 ORDER BY id`,
 		tenantID, userID, profileEpoch)
@@ -588,7 +614,8 @@ func loadProfileClaimLedgerTx(
 		var event profileClaimEventRow
 		if err := eventRows.Scan(
 			&event.ID, &event.Kind, &event.TargetClaimID,
-			&event.ResultClaimID, &event.TargetEventID, &event.CreatedAt,
+			&event.ResultClaimID, &event.TargetEventID, &event.ActorUserID,
+			&event.ExpectedVersion, &event.ResultVersion, &event.CreatedAt,
 		); err != nil {
 			return nil, nil, profileClaimDBError("scan profile claim event", err)
 		}
@@ -1261,6 +1288,7 @@ func evolveProfileClaimsTx(
 	tenantID, userID int64,
 	summary string, tags []string, newCursor int64,
 	expectedAt time.Time, expectedCursor int64,
+	expectedEpoch, expectedVersion int64,
 	restoreCompiledRole bool,
 ) error {
 	if _, err := tx.Exec(ctx,
@@ -1303,6 +1331,11 @@ func evolveProfileClaimsTx(
 		ctx, tx, tenantID, userID)
 	if err != nil {
 		return err
+	}
+	if expectedEpoch >= 0 &&
+		(profileEpoch != expectedEpoch || version != expectedVersion) {
+		return types.NewAppError(
+			types.CodeConflict, "画像演化 epoch/version CAS 未命中", nil)
 	}
 	if err := bindProfileEpochTx(ctx, tx, profileEpoch); err != nil {
 		return err

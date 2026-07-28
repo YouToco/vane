@@ -265,8 +265,8 @@ type CompiledRunStore interface {
 	UpdateSourceFetchStateForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, time.Time, time.Time, int) (bool, error)
 	DisableSourceIfActiveForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64) (bool, error)
 	ListRecentSimhashesForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, time.Time, []int64) ([]int64, error)
-	EvolveProfileForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, []string, int64, time.Time, int64) error
-	AdvanceProfileCursorForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, time.Time, int64) error
+	EvolveProfileForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, []string, int64, time.Time, int64, int64, int64) error
+	AdvanceProfileCursorForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, time.Time, int64, int64, int64) error
 	CreatePushBatchForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string) (int64, error)
 	CreateOrRecoverPushBatchForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string) (int64, bool, error)
 	ClaimPushBatchDeliveryAuthority(
@@ -839,24 +839,28 @@ func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error {
 			},
 			evolverpkg.CompiledProfileWritesV1{
 				Evolve: func(effectCtx context.Context, summary string, tags []string,
-					newCursor int64, expectedAt time.Time, expectedCursor int64) error {
+					newCursor int64, expectedAt time.Time, expectedCursor,
+					expectedEpoch, expectedVersion int64) error {
 					expected, err := activityRunIdentityV1(effectCtx, in.UserID, in.Run)
 					if err != nil {
 						return err
 					}
 					return a.compiledStore.EvolveProfileForTaskRunV1(
 						effectCtx, expected, in.Run.Snapshot, summary, tags,
-						newCursor, expectedAt, expectedCursor)
+						newCursor, expectedAt, expectedCursor,
+						expectedEpoch, expectedVersion)
 				},
 				AdvanceCursor: func(effectCtx context.Context, newCursor int64,
-					expectedAt time.Time, expectedCursor int64) error {
+					expectedAt time.Time, expectedCursor,
+					expectedEpoch, expectedVersion int64) error {
 					expected, err := activityRunIdentityV1(effectCtx, in.UserID, in.Run)
 					if err != nil {
 						return err
 					}
 					return a.compiledStore.AdvanceProfileCursorForTaskRunV1(
 						effectCtx, expected, in.Run.Snapshot, newCursor,
-						expectedAt, expectedCursor)
+						expectedAt, expectedCursor,
+						expectedEpoch, expectedVersion)
 				},
 			},
 		))

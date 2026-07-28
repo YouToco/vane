@@ -376,6 +376,7 @@ func TestCompiledRunWrites_ExactTenantRevocationAndDurableReceipt(t *testing.T) 
 	if err := f.base.st.EvolveProfileForTaskRunV1(
 		ctx, f.idB, f.refB, "must not cross", []string{"bad"}, 1,
 		profile.UpdatedAt, profile.LastEvolvedFeedbackID,
+		profile.ProfileEpoch, profile.ProfileVersion,
 	); !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("tenant B profile write error = %v, want conflict", err)
 	}
@@ -447,6 +448,7 @@ func TestCompiledRunWrites_ExactTenantRevocationAndDurableReceipt(t *testing.T) 
 
 	if err := f.base.st.AdvanceProfileCursorForTaskRunV1(
 		ctx, f.idA, f.refA, 1, profile.UpdatedAt, profile.LastEvolvedFeedbackID,
+		profile.ProfileEpoch, profile.ProfileVersion,
 	); !errors.Is(err, types.ErrNotFound) {
 		t.Fatalf("revoked tenant A profile write error = %v, want not found", err)
 	}

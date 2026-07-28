@@ -191,6 +191,7 @@ func TestProfileClaimAuthorityAndEvolverRegression(t *testing.T) {
 	if err := st.EvolveProfile(
 		t.Context(), u.ID, "模型摘要", []string{"A", "C"}, 10,
 		correct.Profile.UpdatedAt, 0,
+		0, correct.Version,
 	); err != nil {
 		t.Fatalf("evolve after correction: %v", err)
 	}
@@ -241,6 +242,7 @@ func TestProfileClaimAuthorityAndEvolverRegression(t *testing.T) {
 	if err := st.EvolveProfile(
 		t.Context(), u.ID, "模型摘要 2\n人工纠正：不应沉淀",
 		[]string{"C", "D"}, 20, pinned.Profile.UpdatedAt, 10,
+		0, pinned.Version,
 	); err != nil {
 		t.Fatalf("evolve after pin: %v", err)
 	}
@@ -396,6 +398,7 @@ func TestSummaryClaimSentenceCorrectionsSurviveEvolution(t *testing.T) {
 	if err := st.EvolveProfile(
 		t.Context(), u.ID, "安全事实。污染画像！另一个事实。",
 		[]string{"A"}, 10, created.UpdatedAt, 0,
+		0, 0,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -448,6 +451,7 @@ func TestSummaryClaimSentenceCorrectionsSurviveEvolution(t *testing.T) {
 		t.Context(), u.ID,
 		"安全事实更新。污染画像！另一个事实。新增事实。",
 		[]string{"A", "B"}, 20, pinned.Profile.UpdatedAt, 10,
+		0, pinned.Version,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -794,6 +798,7 @@ func TestProfileClaimMutationSummaryBoundAndDuplicatePin(t *testing.T) {
 	if err := st.EvolveProfile(
 		t.Context(), u.ID, baseSummary, nil,
 		10, created.UpdatedAt, 0,
+		0, 0,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -873,6 +878,7 @@ func TestProfileClaimMutationSummaryBoundAndDuplicatePin(t *testing.T) {
 	if err := st.EvolveProfile(
 		t.Context(), u.ID, strings.Repeat("丁", 500), nil,
 		20, pinned.Profile.UpdatedAt, 10,
+		0, pinned.Version,
 	); err != nil {
 		t.Fatalf("budget-fit evolution failed: %v", err)
 	}

@@ -578,14 +578,14 @@ func (f *compiledStructuredCardGenFake) GenerateStructuredWithPolicyV2(
 
 func (f *compiledRunStoreFake) EvolveProfileForTaskRunV1(
 	context.Context, types.RunIdentity, types.RunSnapshotRef,
-	string, []string, int64, time.Time, int64,
+	string, []string, int64, time.Time, int64, int64, int64,
 ) error {
 	return nil
 }
 
 func (f *compiledRunStoreFake) AdvanceProfileCursorForTaskRunV1(
 	context.Context, types.RunIdentity, types.RunSnapshotRef,
-	int64, time.Time, int64,
+	int64, time.Time, int64, int64, int64,
 ) error {
 	return nil
 }

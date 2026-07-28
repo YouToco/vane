@@ -129,11 +129,15 @@ var purgeOrder = []purgeStep{
 	{"subscriptions", "tenant_id = $1"},
 	// HTTP response-loss receipts reference the append-only revision. Both are
 	// tenant evidence and must be removed before the profile/membership roots.
+	{"profile_epoch_receipts", "tenant_id = $1"},
+	{"profile_epoch_events", "tenant_id = $1"},
+	{"profile_epoch_checkpoints", "tenant_id = $1"},
 	{"profile_claim_receipts", "tenant_id = $1"},
 	{"profile_claim_events", "tenant_id = $1"},
 	{"profile_claims", "tenant_id = $1"},
 	{"profile_claim_states", "tenant_id = $1"},
 	{"profile_epochs", "tenant_id = $1"},
+	{"profile_feedback_epoch_fences", "tenant_id = $1"},
 	{"profile_edit_receipts", "tenant_id = $1"},
 	{"profile_edit_revisions", "tenant_id = $1"},
 	{"profiles", "tenant_id = $1"},
@@ -206,13 +210,39 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		return nil, types.NewAppError(
 			types.CodeDatabase, "锁定推送效果 schema 准入", err)
 	}
-	var canonicalBriefStagesAvailable, profileEpochsAvailable bool
+	var (
+		canonicalBriefStagesAvailable bool
+		profileEpochsAvailable        bool
+		profileEpochFencesAvailable   bool
+		profileCheckpointsAvailable   bool
+		profileEpochEventsAvailable   bool
+		profileEpochReceiptsAvailable bool
+	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
-		        to_regclass('public.profile_epochs') IS NOT NULL`,
-	).Scan(&canonicalBriefStagesAvailable, &profileEpochsAvailable); err != nil {
+		        to_regclass('public.profile_epochs') IS NOT NULL,
+		        to_regclass('public.profile_feedback_epoch_fences') IS NOT NULL,
+		        to_regclass('public.profile_epoch_checkpoints') IS NOT NULL,
+		        to_regclass('public.profile_epoch_events') IS NOT NULL,
+		        to_regclass('public.profile_epoch_receipts') IS NOT NULL`,
+	).Scan(
+		&canonicalBriefStagesAvailable,
+		&profileEpochsAvailable,
+		&profileEpochFencesAvailable,
+		&profileCheckpointsAvailable,
+		&profileEpochEventsAvailable,
+		&profileEpochReceiptsAvailable,
+	); err != nil {
 		return nil, types.NewAppError(
-			types.CodeDatabase, "检查 canonical Brief 清理能力", err)
+			types.CodeDatabase, "检查可选 schema 清理能力", err)
+	}
+	optionalPurgeTables := map[string]bool{
+		"canonical_brief_stages":        canonicalBriefStagesAvailable,
+		"profile_epochs":                profileEpochsAvailable,
+		"profile_feedback_epoch_fences": profileEpochFencesAvailable,
+		"profile_epoch_checkpoints":     profileCheckpointsAvailable,
+		"profile_epoch_events":          profileEpochEventsAvailable,
+		"profile_epoch_receipts":        profileEpochReceiptsAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
@@ -370,15 +400,10 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 
 	rep := &PurgeReport{TenantID: tenantID, Rows: map[string]int64{}, DryRun: dryRun}
 	for _, st := range purgeOrder {
-		if st.table == "canonical_brief_stages" &&
-			!canonicalBriefStagesAvailable {
-			// A current binary may safely drain while migration 064 has
-			// already been rolled back to 063.
-			continue
-		}
-		if st.table == "profile_epochs" && !profileEpochsAvailable {
-			// Current binaries may finish a tenant purge after migration 066
-			// has safely rolled back to an epoch-0-only schema.
+		if available, optional := optionalPurgeTables[st.table]; optional && !available {
+			// Current binaries may finish an already-admitted tenant purge
+			// while a safely reversible migration has rolled back the
+			// corresponding optional table.
 			continue
 		}
 		// #nosec G201 -- table 与 where 都来自本文件的常量表，不含任何外部输入；
