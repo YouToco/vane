@@ -567,11 +567,15 @@ func loadProfileClaimLedgerTx(
 	// Public responses remain bounded; durable transition-watermark replay and
 	// compaction belong to the reset authority phase.
 	rows, err := tx.Query(ctx,
-		`SELECT id,field_name,claim_value,source_state,source_ref_type,
-		        source_ref,generation,supersedes_claim_id,
-		        carried_from_epoch,carried_from_claim_id,created_at
-		   FROM profile_claims
-		  WHERE tenant_id=$1 AND user_id=$2 AND profile_epoch=$3 ORDER BY id`,
+		`SELECT pc.id,pc.field_name,pc.claim_value,pc.source_state,
+		        pc.source_ref_type,pc.source_ref,pc.generation,
+		        pc.supersedes_claim_id,
+		        NULLIF(to_jsonb(pc)->>'carried_from_epoch','')::bigint,
+		        NULLIF(to_jsonb(pc)->>'carried_from_claim_id','')::bigint,
+		        pc.created_at
+		   FROM profile_claims pc
+		  WHERE pc.tenant_id=$1 AND pc.user_id=$2
+		    AND pc.profile_epoch=$3 ORDER BY pc.id`,
 		tenantID, userID, profileEpoch)
 	if err != nil {
 		return nil, nil, profileClaimDBError("load profile claims", err)
