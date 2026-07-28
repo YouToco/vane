@@ -267,6 +267,198 @@ func TestPRBPushPreparesCompletePlanBeforeFirstProvider(t *testing.T) {
 	)
 }
 
+func TestP1ECanonicalRendererSendsOneFrozenPrefixWithWholeBriefReceipt(t *testing.T) {
+	identity, ref, snapshot := compiledActivityFixture(
+		"P1-E canonical task")
+	deliveryIDs := prbDeliveryIDs(351, 5)
+	compiledStore := &compiledRunStoreFake{
+		snapshot:           snapshot,
+		authorize:          true,
+		deliveryIDSequence: append([]int64(nil), deliveryIDs...),
+	}
+	log := new(prbPushCallLog)
+	effectStore := newPRBActivityEffectStore(log, nil)
+	pusher := &prbActivityPusher{
+		log: log, chatID: "oc_p1e",
+	}
+	feishu := &prbEffectFeishu{
+		owner: "ou_p1e", chat: "oc_p1e", app: "p1e-app",
+	}
+	activities := prbFullPushActivities(
+		compiledStore, effectStore, pusher, feishu,
+		&effectCountingStore{fakeStore: new(fakeStore)},
+		identity.TaskID,
+	)
+	WithCanonicalBriefRendererV1(
+		identity.TaskID, "https://vane.example",
+	)(activities)
+	var rendered []feedback.AggregateCardInput
+	activities.buildAggCard = func(in feedback.AggregateCardInput) string {
+		rendered = append(rendered, in)
+		return prbEffectCard(in)
+	}
+	marker := types.RunOutcomeMarkerV1{
+		ID: 71, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID,
+		TenantID:      identity.TenantID, UserID: identity.UserID,
+		TaskID: identity.TaskID,
+	}
+	insights := make([]types.InsightV1, len(deliveryIDs))
+	for i, deliveryID := range deliveryIDs {
+		insights[i] = types.InsightV1{
+			ID: deliveryID, RankPosition: i + 1,
+			Title:        fmt.Sprintf("frozen title %d", i),
+			BodyMD:       fmt.Sprintf("frozen body %d", i),
+			SourceTitle:  "Frozen Source",
+			SourceURL:    fmt.Sprintf("https://frozen.example/%d", i),
+			DiscoveredAt: time.Unix(int64(100+i), 0).UTC(),
+		}
+	}
+	draft := &types.BriefDraftV1{
+		SchemaVersion: types.BriefSchemaVersionV1,
+		RunOutcomeID:  marker.ID, RunSnapshotID: ref.SnapshotID,
+		PushBatchID: 101, TenantID: identity.TenantID,
+		UserID: identity.UserID, TaskID: identity.TaskID,
+		GeneratedAt: time.Unix(200, 0).UTC(),
+		Insights:    insights,
+	}
+
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.Push)
+	err := executePushActivity(t, env, activities, PushIn{
+		UserID: identity.UserID, ScheduleID: identity.TaskID,
+		TraceID: "trace-p1e-prefix",
+		Run: &CompiledRunInputV1{
+			TenantID: identity.TenantID, TaskID: identity.TaskID,
+			Snapshot: ref,
+		},
+		Cards:            prbGeneratedCards(len(deliveryIDs)),
+		CanonicalOutcome: &marker, CanonicalBrief: draft,
+		CanonicalBatchID: 101,
+	})
+	if err != nil {
+		t.Fatalf("canonical renderer Push: %v", err)
+	}
+	prepared, _, _ := effectStore.snapshot()
+	if len(prepared) != 1 {
+		t.Fatalf("canonical effects=%d, want one", len(prepared))
+	}
+	if !reflect.DeepEqual(prepared[0].DeliveryIDs, deliveryIDs) {
+		t.Fatalf("canonical receipt ids=%v want=%v",
+			prepared[0].DeliveryIDs, deliveryIDs)
+	}
+	providerCalls := pusher.snapshot()
+	if len(providerCalls) != 1 {
+		t.Fatalf("canonical provider calls=%d, want one",
+			len(providerCalls))
+	}
+	if len(rendered) < 2 {
+		t.Fatalf("canonical render calls=%d, want planning+effect",
+			len(rendered))
+	}
+	finalRender := rendered[len(rendered)-1]
+	if finalRender.CanonicalBrief == nil ||
+		finalRender.CanonicalBrief.TotalItems != len(deliveryIDs) ||
+		finalRender.CanonicalBrief.VisibleItems !=
+			canonicalBriefFeishuPrefixItemsV1 ||
+		len(finalRender.Items) != canonicalBriefFeishuPrefixItemsV1 {
+		t.Fatalf("canonical render envelope=%+v", finalRender)
+	}
+	for i, item := range finalRender.Items {
+		if item.DeliveryID != insights[i].ID ||
+			item.Title != insights[i].Title ||
+			item.BodyMD != insights[i].BodyMD ||
+			item.SourceTitle != insights[i].SourceTitle ||
+			item.URL != insights[i].SourceURL ||
+			item.Score != 0 || item.Platform != "" {
+			t.Fatalf("canonical render item[%d]=%+v want=%+v",
+				i, item, insights[i])
+		}
+	}
+	for i, deliveryID := range deliveryIDs {
+		visible := i < canonicalBriefFeishuPrefixItemsV1
+		if got := strings.Contains(
+			providerCalls[0].card,
+			strconv.FormatInt(deliveryID, 10),
+		); got != visible {
+			t.Fatalf("delivery %d visible=%v card=%s",
+				deliveryID, got, providerCalls[0].card)
+		}
+	}
+}
+
+func TestP1ERendererRollbackPreservesLegacyChunkPlan(t *testing.T) {
+	identity, ref, snapshot := compiledActivityFixture(
+		"P1-E rollback task")
+	deliveryIDs := prbDeliveryIDs(371, 5)
+	compiledStore := &compiledRunStoreFake{
+		snapshot: snapshot, authorize: true,
+		deliveryIDSequence: append([]int64(nil), deliveryIDs...),
+	}
+	effectStore := newPRBActivityEffectStore(nil, nil)
+	pusher := &prbActivityPusher{chatID: "oc_p1e_rollback"}
+	activities := prbFullPushActivities(
+		compiledStore, effectStore, pusher,
+		&prbEffectFeishu{
+			owner: "ou_p1e_rollback", chat: "oc_p1e_rollback",
+			app: "p1e-rollback-app",
+		},
+		&effectCountingStore{fakeStore: new(fakeStore)},
+		identity.TaskID,
+	)
+	// Empty renderer task ID is the explicit rollback state.
+	WithCanonicalBriefRendererV1("", "https://vane.example")(activities)
+	marker := types.RunOutcomeMarkerV1{
+		ID: 72, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID,
+		TenantID:      identity.TenantID, UserID: identity.UserID,
+		TaskID: identity.TaskID,
+	}
+	insights := make([]types.InsightV1, len(deliveryIDs))
+	for i, deliveryID := range deliveryIDs {
+		insights[i] = types.InsightV1{
+			ID: deliveryID, RankPosition: i + 1,
+			Title: fmt.Sprintf("frozen %d", i), BodyMD: "frozen",
+			SourceURL:    fmt.Sprintf("https://frozen.example/%d", i),
+			DiscoveredAt: time.Unix(int64(300+i), 0).UTC(),
+		}
+	}
+	draft := &types.BriefDraftV1{
+		SchemaVersion: types.BriefSchemaVersionV1,
+		RunOutcomeID:  marker.ID, RunSnapshotID: ref.SnapshotID,
+		PushBatchID: 101, TenantID: identity.TenantID,
+		UserID: identity.UserID, TaskID: identity.TaskID,
+		GeneratedAt: time.Unix(400, 0).UTC(), Insights: insights,
+	}
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.Push)
+	if err := executePushActivity(t, env, activities, PushIn{
+		UserID: identity.UserID, ScheduleID: identity.TaskID,
+		TraceID: "trace-p1e-rollback",
+		Run: &CompiledRunInputV1{
+			TenantID: identity.TenantID, TaskID: identity.TaskID,
+			Snapshot: ref,
+		},
+		Cards:            prbGeneratedCards(len(deliveryIDs)),
+		CanonicalOutcome: &marker, CanonicalBrief: draft,
+		CanonicalBatchID: 101,
+	}); err != nil {
+		t.Fatalf("rollback Push: %v", err)
+	}
+	prepared, _, _ := effectStore.snapshot()
+	if len(prepared) != 1 ||
+		len(prepared[0].DeliveryIDs) != len(deliveryIDs) {
+		t.Fatalf("legacy plan after rollback=%+v", prepared)
+	}
+	if calls := pusher.snapshot(); len(calls) != 1 ||
+		!strings.Contains(calls[0].card,
+			strconv.FormatInt(deliveryIDs[len(deliveryIDs)-1], 10)) {
+		t.Fatalf("rollback did not preserve full legacy card: %+v", calls)
+	}
+}
+
 func TestPRBPushCompletesPartialPreparedPlanExactly(t *testing.T) {
 	identity, ref, snapshot := compiledActivityFixture("PRB frozen task")
 	deliveryIDs := prbDeliveryIDs(401, aggMaxItemsPerCard+1)
@@ -327,6 +519,38 @@ func TestPRBPushCompletesPartialPreparedPlanExactly(t *testing.T) {
 		legacyStore,
 		identity.TaskID,
 	)
+	WithCanonicalBriefRendererV1(
+		identity.TaskID, "https://vane.example",
+	)(activities)
+	var rendered []feedback.AggregateCardInput
+	activities.buildAggCard = func(in feedback.AggregateCardInput) string {
+		rendered = append(rendered, in)
+		return prbEffectCard(in)
+	}
+	marker := types.RunOutcomeMarkerV1{
+		ID: 72, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID,
+		TenantID:      identity.TenantID, UserID: identity.UserID,
+		TaskID: identity.TaskID,
+	}
+	insights := make([]types.InsightV1, len(deliveryIDs))
+	for i, deliveryID := range deliveryIDs {
+		insights[i] = types.InsightV1{
+			ID: deliveryID, RankPosition: i + 1,
+			Title:        fmt.Sprintf("canonical retry title %d", i),
+			BodyMD:       fmt.Sprintf("canonical retry body %d", i),
+			SourceURL:    fmt.Sprintf("https://frozen.example/%d", i),
+			DiscoveredAt: time.Unix(int64(300+i), 0).UTC(),
+		}
+	}
+	draft := &types.BriefDraftV1{
+		SchemaVersion: types.BriefSchemaVersionV1,
+		RunOutcomeID:  marker.ID, RunSnapshotID: ref.SnapshotID,
+		PushBatchID: 101, TenantID: identity.TenantID,
+		UserID: identity.UserID, TaskID: identity.TaskID,
+		GeneratedAt: time.Unix(400, 0).UTC(),
+		Insights:    insights,
+	}
 
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestActivityEnvironment()
@@ -340,7 +564,9 @@ func TestPRBPushCompletesPartialPreparedPlanExactly(t *testing.T) {
 			TaskID:   identity.TaskID,
 			Snapshot: ref,
 		},
-		Cards: prbGeneratedCards(len(deliveryIDs)),
+		Cards:            prbGeneratedCards(len(deliveryIDs)),
+		CanonicalOutcome: &marker, CanonicalBrief: draft,
+		CanonicalBatchID: 101,
 	})
 	if err != nil {
 		t.Fatalf("partial prepared plan Push: %v", err)
@@ -391,11 +617,125 @@ func TestPRBPushCompletesPartialPreparedPlanExactly(t *testing.T) {
 	if calls := target.targetCallCount(); calls != 1 {
 		t.Fatalf("provider generation snapshots=%d, want one", calls)
 	}
+	for i, render := range rendered {
+		if render.CanonicalBrief != nil {
+			t.Fatalf(
+				"partial legacy plan switched to canonical render[%d]=%+v",
+				i, render.CanonicalBrief,
+			)
+		}
+	}
 	assertPRBZeroLegacyTerminalWriters(
 		t,
 		compiledStore,
 		legacyStore,
 	)
+}
+
+func TestP1ECanonicalRendererReservesWorstCaseFeedbackBytes(t *testing.T) {
+	identity, ref, snapshot := compiledActivityFixture(
+		"P1-E feedback byte reserve")
+	deliveryIDs := prbDeliveryIDs(451, 4)
+	compiledStore := &compiledRunStoreFake{
+		snapshot: snapshot, authorize: true,
+		deliveryIDSequence: append([]int64(nil), deliveryIDs...),
+	}
+	log := new(prbPushCallLog)
+	effectStore := newPRBActivityEffectStore(log, nil)
+	pusher := &prbActivityPusher{log: log, chatID: "oc_p1e_size"}
+	target := &prbEffectFeishu{
+		owner: "ou_p1e_size", chat: "oc_p1e_size", app: "p1e-size-app",
+	}
+	activities := prbFullPushActivities(
+		compiledStore, effectStore, pusher, target,
+		&effectCountingStore{fakeStore: new(fakeStore)}, identity.TaskID,
+	)
+	WithCanonicalBriefRendererV1(
+		identity.TaskID, "https://vane.example",
+	)(activities)
+	var rendered []feedback.AggregateCardInput
+	activities.buildAggCard = func(in feedback.AggregateCardInput) string {
+		rendered = append(rendered, in)
+		if len(in.Items) == canonicalBriefFeishuPrefixItemsV1 {
+			completeWorstCase := true
+			openForms := 0
+			for _, item := range in.Items {
+				if item.State.BadFeedbackOpen {
+					openForms++
+				} else if !item.State.Misjudged {
+					completeWorstCase = false
+				}
+				if item.State.Preference !=
+					types.FeedbackActionNotInterested ||
+					!item.State.DeepDiveRequested {
+					completeWorstCase = false
+				}
+			}
+			if completeWorstCase && openForms == 1 {
+				return strings.Repeat(
+					"x", feedback.AggregateCardMaxBytesV1+1)
+			}
+		}
+		return prbEffectCard(in)
+	}
+	marker := types.RunOutcomeMarkerV1{
+		ID: 73, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID,
+		TenantID:      identity.TenantID, UserID: identity.UserID,
+		TaskID: identity.TaskID,
+	}
+	insights := make([]types.InsightV1, len(deliveryIDs))
+	for i, deliveryID := range deliveryIDs {
+		insights[i] = types.InsightV1{
+			ID: deliveryID, RankPosition: i + 1,
+			Title:        fmt.Sprintf("size title %d", i),
+			BodyMD:       fmt.Sprintf("size body %d", i),
+			SourceURL:    fmt.Sprintf("https://size.example/%d", i),
+			DiscoveredAt: time.Unix(int64(500+i), 0).UTC(),
+		}
+	}
+	draft := &types.BriefDraftV1{
+		SchemaVersion: types.BriefSchemaVersionV1,
+		RunOutcomeID:  marker.ID, RunSnapshotID: ref.SnapshotID,
+		PushBatchID: 101, TenantID: identity.TenantID,
+		UserID: identity.UserID, TaskID: identity.TaskID,
+		GeneratedAt: time.Unix(600, 0).UTC(), Insights: insights,
+	}
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.Push)
+	err := executePushActivity(t, env, activities, PushIn{
+		UserID: identity.UserID, ScheduleID: identity.TaskID,
+		TraceID: "trace-p1e-size",
+		Run: &CompiledRunInputV1{
+			TenantID: identity.TenantID, TaskID: identity.TaskID,
+			Snapshot: ref,
+		},
+		Cards:            prbGeneratedCards(len(deliveryIDs)),
+		CanonicalOutcome: &marker, CanonicalBrief: draft,
+		CanonicalBatchID: 101,
+	})
+	if err != nil {
+		t.Fatalf("canonical feedback reserve Push: %v", err)
+	}
+	prepared, _, _ := effectStore.snapshot()
+	if len(prepared) != 1 {
+		t.Fatalf("prepared canonical effects=%d, want one", len(prepared))
+	}
+	var sent *feedback.AggregateCardInput
+	for i := range rendered {
+		render := &rendered[i]
+		if render.CanonicalBrief != nil &&
+			render.CanonicalBrief.VisibleItems == 2 &&
+			!render.Items[0].State.BadFeedbackOpen &&
+			!render.Items[1].State.BadFeedbackOpen {
+			sent = render
+		}
+	}
+	if sent == nil || len(sent.Items) != 2 {
+		t.Fatalf("canonical visible prefix did not reserve feedback bytes: %+v",
+			rendered)
+	}
 }
 
 func TestPRBPushRevokedBeforeSecondChunkStopsSecondProvider(t *testing.T) {

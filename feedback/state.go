@@ -5,10 +5,39 @@
 package feedback
 
 import (
+	"errors"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/YouToco/vane/types"
 )
+
+// AggregateCardMaxBytesV1 is the provider-safe hard limit shared by initial
+// Feishu projection and every callback rebuild. Keeping one leaf-package
+// constant prevents a feedback form from growing a previously valid card past
+// the limit.
+const AggregateCardMaxBytesV1 = 28 << 10
+
+// CanonicalBriefWebURLV1 builds the only trusted task deep-link shape used by
+// both initial render and callback verification.
+func CanonicalBriefWebURLV1(origin, taskID string) (string, error) {
+	origin = strings.TrimRight(strings.TrimSpace(origin), "/")
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed == nil ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") ||
+		parsed.Host == "" || parsed.User != nil ||
+		(parsed.Path != "" && parsed.Path != "/") ||
+		parsed.RawQuery != "" || parsed.Fragment != "" ||
+		taskID == "" {
+		return "", errors.New("canonical Brief dashboard origin is invalid")
+	}
+	escapedTaskID := url.PathEscape(taskID)
+	escapedTaskID = strings.NewReplacer(
+		"(", "%28", ")", "%29",
+	).Replace(escapedTaskID)
+	return origin + "/#/tasks/" + escapedTaskID, nil
+}
 
 // CardState 推送卡状态行的渲染输入（契约 §10.2），由 feishu.BuildDeliveryCard 消费。
 // 三字段均以库内查询为准、最终一致：同卡并发点击时两版卡片以飞书到达序为准，
@@ -41,6 +70,58 @@ type CardInput struct {
 	SourceTitle string         // sources.title → subtitle 栏目
 	Platform    types.Platform // sources.platform → subtitle emoji
 	PublishedAt *time.Time     // content_items.published_at → subtitle 相对时间
+	// DiscoveredAt is the immutable Brief observation time. Legacy cards leave
+	// it zero; the canonical renderer uses it only when PublishedAt is absent.
+	DiscoveredAt time.Time
+}
+
+// CanonicalBriefCardV1 is transport metadata for a Feishu prefix projection.
+// Content stays in BriefV1; this only preserves the exact batch identity,
+// visible prefix length, and Web deep link across feedback card rebuilds.
+type CanonicalBriefCardV1 struct {
+	BatchID      int64
+	TotalItems   int
+	VisibleItems int
+	WebURL       string
+}
+
+func (b CanonicalBriefCardV1) Validate(renderedItems int) error {
+	if b.BatchID <= 0 || b.TotalItems <= 0 || b.VisibleItems <= 0 ||
+		b.VisibleItems != renderedItems ||
+		b.VisibleItems > b.TotalItems ||
+		b.WebURL == "" || strings.TrimSpace(b.WebURL) != b.WebURL {
+		return errors.New("canonical Brief card identity is invalid")
+	}
+	parsed, err := url.Parse(b.WebURL)
+	if err != nil || parsed == nil ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") ||
+		parsed.Host == "" || parsed.User != nil ||
+		(parsed.Path != "" && parsed.Path != "/") ||
+		parsed.RawQuery != "" ||
+		!strings.HasPrefix(parsed.Fragment, "/tasks/") {
+		return errors.New("canonical Brief card URL is invalid")
+	}
+	if _, err := b.TaskID(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (b CanonicalBriefCardV1) TaskID() (string, error) {
+	parsed, err := url.Parse(b.WebURL)
+	if err != nil || parsed == nil {
+		return "", errors.New("canonical Brief card URL is invalid")
+	}
+	escapedFragment := parsed.EscapedFragment()
+	encoded := strings.TrimPrefix(escapedFragment, "/tasks/")
+	if encoded == "" || encoded == escapedFragment {
+		return "", errors.New("canonical Brief card task is invalid")
+	}
+	taskID, err := url.PathUnescape(encoded)
+	if err != nil || taskID == "" {
+		return "", errors.New("canonical Brief card task is invalid")
+	}
+	return taskID, nil
 }
 
 // AggregateCardInput 聚合卡（一个任务一张卡，卡内 N 条情报）的构卡全量输入
@@ -56,4 +137,7 @@ type AggregateCardInput struct {
 	HeaderTemplate string      // 飞书 header template 色名；空则 "blue"
 	EffectID       string      // durable push effect marker；空则保持历史卡字节形态
 	Items          []CardInput // 按分数降序；每项的 DeliveryID/State 各自独立
+	// CanonicalBrief is nil for every legacy/ad-hoc card. When present, Items
+	// must be the exact ordered prefix of the immutable Brief.
+	CanonicalBrief *CanonicalBriefCardV1
 }

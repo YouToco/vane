@@ -70,6 +70,10 @@ type fakeStore struct {
 	profileErr     error
 	auditErr       error
 	auditOutcome   types.FreshnessFeedbackAuditOutcome
+	canonicalBrief types.BriefV1
+	canonicalFound bool
+	canonicalErr   error
+	canonicalCalls int
 
 	// 调用留痕：断言"不查库""不重复生成"这类负向要求。
 	byMsgIDCalls   []string
@@ -82,6 +86,31 @@ type fakeStore struct {
 	// deadlineProbe 在 GetDeliveryByFeishuMessageID 里窥探调用方 ctx，
 	// 用来断言 WrapQuestion 确实给 DB 调用套了自己的预算（审查 F15）。
 	deadlineProbe func(context.Context)
+}
+
+func (f *fakeStore) LoadCanonicalBriefForFeedbackV1(
+	_ context.Context,
+	userID int64,
+	deliveryID int64,
+	batchID int64,
+) (types.BriefV1, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.canonicalCalls++
+	if f.canonicalErr != nil {
+		return types.BriefV1{}, false, f.canonicalErr
+	}
+	if !f.canonicalFound ||
+		f.canonicalBrief.UserID != userID ||
+		f.canonicalBrief.PushBatchID != batchID {
+		return types.BriefV1{}, false, nil
+	}
+	for _, insight := range f.canonicalBrief.Insights {
+		if insight.ID == deliveryID {
+			return f.canonicalBrief, true, nil
+		}
+	}
+	return types.BriefV1{}, false, nil
 }
 
 func newFakeStore() *fakeStore {
@@ -656,13 +685,14 @@ func newHarness(t *testing.T) *harness {
 	h.llm = fl
 	// Recorder 传 nil：Record 是 nil 接收者安全的 no-op，记账不需要数据库。
 	h.svc = New(Deps{
-		Store:         h.st,
-		Client:        cli,
-		Recorder:      nil,
-		Sender:        h.sender,
-		Notifier:      h.notifier,
-		BuildCard:     h.cards.build,
-		DeepDiveModel: "deepseek-v4-pro",
+		Store:           h.st,
+		Client:          cli,
+		Recorder:        nil,
+		Sender:          h.sender,
+		Notifier:        h.notifier,
+		BuildCard:       h.cards.build,
+		DashboardOrigin: "https://vane.example",
+		DeepDiveModel:   "deepseek-v4-pro",
 	})
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

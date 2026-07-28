@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"unicode"
@@ -138,6 +139,9 @@ type PipelineConfig struct {
 	CanonicalBriefEnabled          bool   `mapstructure:"canonical_brief_enabled"`
 	CanonicalBriefCanaryScheduleID string `mapstructure:"canonical_brief_canary_schedule_id"`
 	CanonicalBriefAllowAll         bool   `mapstructure:"canonical_brief_allow_all"`
+	// CanonicalBriefRendererCanaryScheduleID is P1-E's independent Feishu
+	// content-authority switch. Empty is the complete rollback state.
+	CanonicalBriefRendererCanaryScheduleID string `mapstructure:"canonical_brief_renderer_canary_schedule_id"`
 	// SnapshotV2ShadowCanaryScheduleID enables C2c-2 shadow persistence for
 	// exactly one task. Empty is the complete rollback/off state.
 	SnapshotV2ShadowCanaryScheduleID string `mapstructure:"snapshot_v2_shadow_canary_schedule_id"`
@@ -325,6 +329,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.canonical_brief_enabled", false)
 	v.SetDefault("pipeline.canonical_brief_canary_schedule_id", "")
 	v.SetDefault("pipeline.canonical_brief_allow_all", false)
+	v.SetDefault("pipeline.canonical_brief_renderer_canary_schedule_id", "")
 	v.SetDefault("pipeline.snapshot_v2_shadow_canary_schedule_id", "")
 	v.SetDefault("pipeline.snapshot_v2_read_audit_canary_schedule_id", "")
 	// Observation rollout remains exact-task only. Register both defaults so
@@ -462,6 +467,22 @@ func (c *Config) Validate() error {
 				"config: canonical brief canary 必须位于 run outcome rollout")
 		}
 	}
+	rawCanonicalRendererCanaryID :=
+		c.Pipeline.CanonicalBriefRendererCanaryScheduleID
+	canonicalRendererCanaryID :=
+		strings.TrimSpace(rawCanonicalRendererCanaryID)
+	if rawCanonicalRendererCanaryID != "" &&
+		canonicalRendererCanaryID == "" {
+		return errors.New(
+			"config: pipeline.canonical_brief_renderer_canary_schedule_id 不能仅含空白")
+	}
+	if canonicalRendererCanaryID != "" &&
+		!validSnapshotShadowCanaryID(canonicalRendererCanaryID) {
+		return errors.New(
+			"config: pipeline.canonical_brief_renderer_canary_schedule_id 无效")
+	}
+	c.Pipeline.CanonicalBriefRendererCanaryScheduleID =
+		canonicalRendererCanaryID
 	rawShadowCanaryID := c.Pipeline.SnapshotV2ShadowCanaryScheduleID
 	shadowCanaryID := strings.TrimSpace(rawShadowCanaryID)
 	if rawShadowCanaryID != "" && shadowCanaryID == "" {
@@ -540,6 +561,27 @@ func (c *Config) Validate() error {
 			pushRecoveryCanaryID != canonicalBriefCanaryID {
 			return errors.New(
 				"config: canonical brief canary 必须同时位于 push effect fresh/recovery canary")
+		}
+	}
+	if canonicalRendererCanaryID != "" {
+		if !c.Pipeline.CanonicalBriefEnabled ||
+			canonicalBriefCanaryID != canonicalRendererCanaryID {
+			return errors.New(
+				"config: canonical Brief renderer canary 必须精确位于 canonical Brief writer canary")
+		}
+		if pushEffectCanaryID != canonicalRendererCanaryID ||
+			pushRecoveryCanaryID != canonicalRendererCanaryID {
+			return errors.New(
+				"config: canonical Brief renderer canary 必须同时位于 push effect fresh/recovery canary")
+		}
+		origin, err := url.Parse(c.Dashboard.Origin)
+		if err != nil || origin == nil ||
+			(origin.Scheme != "https" && origin.Scheme != "http") ||
+			origin.Host == "" || origin.User != nil ||
+			(origin.Path != "" && origin.Path != "/") ||
+			origin.RawQuery != "" || origin.Fragment != "" {
+			return errors.New(
+				"config: canonical Brief renderer 要求 dashboard.origin 为 HTTP(S) 源")
 		}
 	}
 

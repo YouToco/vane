@@ -11,10 +11,10 @@ import (
 	"testing"
 )
 
-// P1-D adds only the reviewed authenticated Brief page reader. Direct
-// Freeze/Load and renderer authority remain dark; workflow/recovery call
-// points stay pinned to the P1-C/P1-B seams.
-func TestCanonicalBriefP1DHasOnlyScopedProductionCallPoints(t *testing.T) {
+// P1-E adds only the exact feedback rebuild reader and the in-Activity
+// canonical prefix renderer. Direct Freeze/Load remain dark; workflow/recovery
+// call points stay pinned to the P1-C/P1-B seams.
+func TestCanonicalBriefP1EHasOnlyScopedProductionCallPoints(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate guard source")
@@ -65,6 +65,9 @@ func TestCanonicalBriefP1DHasOnlyScopedProductionCallPoints(t *testing.T) {
 		"ListTaskBriefsV1": {
 			"api/briefs.go": true,
 		},
+		"LoadCanonicalBriefForFeedbackV1": {
+			"feedback/service.go": true,
+		},
 	}
 	var calls []string
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
@@ -114,7 +117,7 @@ func TestCanonicalBriefP1DHasOnlyScopedProductionCallPoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(calls) != 0 {
-		t.Fatalf("P1-D production scope escaped: %v", calls)
+		t.Fatalf("P1-E production scope escaped: %v", calls)
 	}
 }
 

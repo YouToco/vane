@@ -59,6 +59,8 @@ pipeline:
   canonical_brief_enabled: false
   canonical_brief_canary_schedule_id: ""
   canonical_brief_allow_all: false
+  # P1-E Feishu renderer authority; empty is the exact rollback state.
+  canonical_brief_renderer_canary_schedule_id: ""
   # C2c-2: exact one-task shadow canary. Empty means fully off.
   snapshot_v2_shadow_canary_schedule_id: ""
   snapshot_v2_read_audit_canary_schedule_id: ""
