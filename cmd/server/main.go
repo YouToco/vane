@@ -544,10 +544,11 @@ func run() error {
 		Sender:   manager,
 		// 056 owns attitude/misjudged continuation. Deep-dive is explicitly
 		// outside that outbox and still needs this legacy success callback.
-		Notifier:      agentLoop,
-		BuildCard:     feishu.BuildDeliveryCard,
-		BuildAggCard:  feishu.BuildAggregateCard,
-		DeepDiveModel: cfg.LLM.AgentModel,
+		Notifier:        agentLoop,
+		BuildCard:       feishu.BuildDeliveryCard,
+		BuildAggCard:    feishu.BuildAggregateCard,
+		DashboardOrigin: cfg.Dashboard.Origin,
+		DeepDiveModel:   cfg.LLM.AgentModel,
 		SessionTTL: time.Duration(
 			cfg.Agent.SessionTTLMinutes) * time.Minute,
 	})

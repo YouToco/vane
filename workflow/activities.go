@@ -75,7 +75,7 @@ const alertFetchFailThreshold = 3
 // 绝不静默截断条目。
 const (
 	aggMaxItemsPerCard                = 8
-	aggMaxCardBytes                   = 28 << 10
+	aggMaxCardBytes                   = feedback.AggregateCardMaxBytesV1
 	canonicalBriefFeishuPrefixItemsV1 = 3
 )
 
@@ -3358,14 +3358,17 @@ func (a *Activities) canonicalBriefAuthorityItemsV1(
 			eventKey: legacy.eventKey,
 		}
 	}
-	escapedTaskID := url.PathEscape(draft.TaskID)
-	escapedTaskID = strings.NewReplacer(
-		"(", "%28", ")", "%29",
-	).Replace(escapedTaskID)
+	webURL, err := feedback.CanonicalBriefWebURLV1(
+		a.canonicalBriefDashboardOrigin, draft.TaskID,
+	)
+	if err != nil {
+		return nil, feedback.CanonicalBriefCardV1{},
+			types.NewAppError(types.CodeValidation,
+				"canonical Brief dashboard origin is invalid", err)
+	}
 	return items, feedback.CanonicalBriefCardV1{
 		BatchID: draft.PushBatchID, TotalItems: len(items),
-		WebURL: a.canonicalBriefDashboardOrigin + "/#/tasks/" +
-			escapedTaskID,
+		WebURL: webURL,
 	}, nil
 }
 
@@ -3702,6 +3705,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	canonicalRendererAuthority :=
 		in.CanonicalBrief != nil &&
 			in.CanonicalOutcome != nil &&
+			len(partialEffectPlan) == 0 &&
 			a.canonicalBriefRendererTaskID != "" &&
 			compiledIdentity.TaskID == a.canonicalBriefRendererTaskID
 	var plannedChunks []plannedPushChunk
@@ -3731,6 +3735,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			len(canonicalItems),
 		)
 		var buildCanonicalCard func(string) string
+		var canonicalCardFitsProviderLimit func(string) bool
 		for {
 			briefMeta.VisibleItems = visibleCount
 			if err := briefMeta.Validate(visibleCount); err != nil {
@@ -3741,10 +3746,20 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 				))
 			}
 			visible := canonicalItems[:visibleCount]
-			buildCanonicalCard = func(effectID string) string {
+			buildCanonicalCardWithState := func(
+				effectID string,
+				worstCaseFeedbackIndex int,
+			) string {
 				items := make([]feedback.CardInput, len(visible))
 				for i := range visible {
 					items[i] = visible[i].input
+					if i == worstCaseFeedbackIndex {
+						items[i].State = feedback.CardState{
+							Preference:        types.FeedbackActionNotInterested,
+							BadFeedbackOpen:   true,
+							DeepDiveRequested: true,
+						}
+					}
 				}
 				var title, tmpl string
 				if a.aggHeader != nil {
@@ -3758,9 +3773,23 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 					CanonicalBrief: &meta,
 				})
 			}
-			if card := buildCanonicalCard(planningMarker); len(card) <= aggMaxCardBytes {
+			buildCanonicalCard = func(effectID string) string {
+				return buildCanonicalCardWithState(effectID, -1)
+			}
+			canonicalCardFitsProviderLimit = func(effectID string) bool {
+				for index := range visible {
+					if card := buildCanonicalCardWithState(
+						effectID, index,
+					); len(card) > aggMaxCardBytes {
+						return false
+					}
+				}
+				return true
+			}
+			if canonicalCardFitsProviderLimit(planningMarker) {
 				plannedChunks = []plannedPushChunk{{
-					items: canonicalItems, cardJSON: card,
+					items:    canonicalItems,
+					cardJSON: buildCanonicalCard(planningMarker),
 				}}
 				break
 			}

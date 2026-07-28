@@ -100,6 +100,9 @@ type Deps struct {
 	// BuildAggCard 聚合卡构造（生产装配传 feishu.BuildAggregateCard）。
 	// nil 时聚合重建退化为"不更新卡片"（toast 仍达）——灰度/测试装配安全。
 	BuildAggCard func(in AggregateCardInput) string
+	// DashboardOrigin is the trusted scheme+host used to reconstruct canonical
+	// Brief deep links. Stored card_json is never allowed to choose a host.
+	DashboardOrigin string
 	// DeepDiveModel deep_dive 生成用模型（cfg.LLM.AgentModel——Boss 拍板③：
 	// 深度解读值得 v4-pro，与打分/出卡的默认档分开）。
 	DeepDiveModel string
@@ -387,11 +390,17 @@ func (s *Service) rebuilt(ctx context.Context, d *types.Delivery, toast string, 
 			slog.Warn("feedback: 查兄弟投递失败，本次不更新卡片", "delivery_id", d.ID, "err", serr)
 			return res
 		}
-		if len(siblings) > 1 {
+		_, canonicalCard, _ := parseCanonicalBriefMetadata(d.CardJSON)
+		if len(siblings) > 1 || canonicalCard {
 			// toast 带被点条标题回显（附录 A.4 吸收项）：聚合卡 N 条并排，toast 是
 			// 用户确认"系统记到了我点的那条"的最后一道人眼防线。
-			if ci, cerr := s.contentOf(ctx, d); cerr == nil && ci != nil && ci.Title != "" {
-				res.Toast = toast + "《" + promptguard.TruncateRunes(ci.Title, 20) + "》"
+			// Canonical cards must not consult mutable content even for toast;
+			// the rebuilt frozen card already provides the visual confirmation.
+			if !canonicalCard {
+				if ci, cerr := s.contentOf(ctx, d); cerr == nil &&
+					ci != nil && ci.Title != "" {
+					res.Toast = toast + "《" + promptguard.TruncateRunes(ci.Title, 20) + "》"
+				}
 			}
 			if cardJSON, aerr := s.rebuildAggregate(ctx, d, siblings, force); aerr != nil {
 				slog.Warn("feedback: 聚合卡重建失败，本次不更新卡片", "delivery_id", d.ID, "err", aerr)
@@ -529,6 +538,12 @@ func (s *Service) rebuildAggregate(ctx context.Context, clicked *types.Delivery,
 		if err != nil || taskID != brief.TaskID {
 			return "", errors.New("canonical Brief 卡片深链与冻结任务不一致")
 		}
+		expectedWebURL, err := CanonicalBriefWebURLV1(
+			s.deps.DashboardOrigin, brief.TaskID,
+		)
+		if err != nil || briefMeta.WebURL != expectedWebURL {
+			return "", errors.New("canonical Brief 卡片深链来源不受信")
+		}
 		byID := make(map[int64]types.Delivery, len(siblings))
 		for i := range siblings {
 			byID[siblings[i].ID] = siblings[i]
@@ -558,11 +573,15 @@ func (s *Service) rebuildAggregate(ctx context.Context, clicked *types.Delivery,
 				DiscoveredAt: insight.DiscoveredAt,
 			}
 		}
-		return s.deps.BuildAggCard(AggregateCardInput{
+		cardJSON := s.deps.BuildAggCard(AggregateCardInput{
 			HeaderTitle: title, HeaderTemplate: tmpl,
 			EffectID: effectID, Items: items,
 			CanonicalBrief: &briefMeta,
-		}), nil
+		})
+		if len(cardJSON) > AggregateCardMaxBytesV1 {
+			return "", errors.New("canonical Brief 反馈卡超过 provider 字节上限")
+		}
+		return cardJSON, nil
 	}
 	items := make([]CardInput, 0, len(siblings))
 	for i := range siblings {

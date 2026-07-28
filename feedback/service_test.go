@@ -3,6 +3,7 @@ package feedback
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -444,6 +445,65 @@ func TestRebuilt_CanonicalBriefUsesFrozenOrderedPrefix(t *testing.T) {
 	}
 }
 
+func TestRebuilt_SingleInsightCanonicalCardDoesNotFallBackToLiveContent(
+	t *testing.T,
+) {
+	h := newHarness(t)
+	const batchID int64 = 902
+	h.delivery().BatchID = batchID
+	h.delivery().BodyMD = "mutable delivery body"
+	h.delivery().CardJSON = []byte(`{
+		"header":{"title":{"content":"📡 Canonical · 今日 1 条"},"template":"green"},
+		"body":{"elements":[{"behaviors":[{"value":{
+			"vane_action":"fb","delivery_id":"42",
+			"brief_batch_id":"902","brief_total":"1","brief_visible":"1",
+			"brief_url":"https://vane.example/#/tasks/task-single"
+		}}]}]}
+	}`)
+	frozen := types.InsightV1{
+		ID: testDeliveryID, RankPosition: 1,
+		Title: "frozen single", BodyMD: "frozen single body",
+		SourceTitle:  "Frozen Source",
+		SourceURL:    "https://frozen.example/single",
+		DiscoveredAt: time.Unix(500, 0).UTC(),
+	}
+	h.st.canonicalBrief = types.BriefV1{
+		ID: 78,
+		BriefDraftV1: types.BriefDraftV1{
+			PushBatchID: batchID, UserID: testUserID,
+			TaskID: "task-single", Insights: []types.InsightV1{frozen},
+		},
+	}
+	h.st.canonicalFound = true
+	var got *AggregateCardInput
+	h.svc.deps.BuildAggCard = func(in AggregateCardInput) string {
+		got = &in
+		return `{"canonical":"single"}`
+	}
+	singleBuilderCalled := false
+	h.svc.deps.BuildCard = func(CardInput) string {
+		singleBuilderCalled = true
+		return `{"legacy":"wrong"}`
+	}
+	res := h.click(t, types.FeedbackActionInterested)
+	if res.CardJSON != `{"canonical":"single"}` ||
+		got == nil || len(got.Items) != 1 {
+		t.Fatalf("single canonical rebuild=%+v input=%+v", res, got)
+	}
+	if singleBuilderCalled {
+		t.Fatal("single canonical card fell back to legacy BuildCard")
+	}
+	if got.Items[0].Title != frozen.Title ||
+		got.Items[0].BodyMD != frozen.BodyMD ||
+		got.Items[0].URL != frozen.SourceURL {
+		t.Fatalf("single canonical item drifted: %+v", got.Items[0])
+	}
+	if h.st.itemCalls != 0 {
+		t.Fatalf("single canonical rebuild read live content %d times",
+			h.st.itemCalls)
+	}
+}
+
 func TestRebuilt_InvalidCanonicalMetadataKeepsExistingCard(t *testing.T) {
 	h := newHarness(t)
 	sibID := testDeliveryID + 1
@@ -463,6 +523,106 @@ func TestRebuilt_InvalidCanonicalMetadataKeepsExistingCard(t *testing.T) {
 	if h.st.canonicalCalls != 0 {
 		t.Fatalf("invalid metadata reached canonical reader %d times",
 			h.st.canonicalCalls)
+	}
+}
+
+func TestRebuilt_CanonicalBriefRejectsUntrustedDeepLinkHost(t *testing.T) {
+	h := newHarness(t)
+	const batchID int64 = 903
+	h.delivery().BatchID = batchID
+	h.delivery().CardJSON = []byte(`{
+		"header":{"title":{"content":"Canonical"},"template":"green"},
+		"body":{"elements":[{"behaviors":[{"value":{
+			"vane_action":"fb","delivery_id":"42",
+			"brief_batch_id":"903","brief_total":"1","brief_visible":"1",
+			"brief_url":"https://attacker.example/#/tasks/task-1"
+		}}]}]}
+	}`)
+	h.st.canonicalBrief = types.BriefV1{
+		ID: 79,
+		BriefDraftV1: types.BriefDraftV1{
+			PushBatchID: batchID, UserID: testUserID,
+			TaskID: "task-1",
+			Insights: []types.InsightV1{{
+				ID: testDeliveryID, RankPosition: 1,
+				Title: "frozen", BodyMD: "frozen body",
+				SourceURL:    "https://source.example/item",
+				DiscoveredAt: time.Unix(700, 0).UTC(),
+			}},
+		},
+	}
+	h.st.canonicalFound = true
+	buildCalls := 0
+	h.svc.deps.BuildAggCard = func(in AggregateCardInput) string {
+		buildCalls++
+		return `{"wrong":"host"}`
+	}
+	res := h.click(t, types.FeedbackActionInterested)
+	if res.CardJSON != "" || buildCalls != 0 {
+		t.Fatalf("untrusted canonical link replaced card: %+v calls=%d",
+			res, buildCalls)
+	}
+}
+
+func TestRebuilt_CanonicalBriefRejectsOversizedFeedbackCard(t *testing.T) {
+	h := newHarness(t)
+	const batchID int64 = 904
+	h.delivery().BatchID = batchID
+	h.delivery().CardJSON = []byte(`{
+		"header":{"title":{"content":"Canonical"},"template":"green"},
+		"body":{"elements":[{"behaviors":[{"value":{
+			"vane_action":"fb","delivery_id":"42",
+			"brief_batch_id":"904","brief_total":"1","brief_visible":"1",
+			"brief_url":"https://vane.example/#/tasks/task-size"
+		}}]}]}
+	}`)
+	h.st.canonicalBrief = types.BriefV1{
+		ID: 80,
+		BriefDraftV1: types.BriefDraftV1{
+			PushBatchID: batchID, UserID: testUserID,
+			TaskID: "task-size",
+			Insights: []types.InsightV1{{
+				ID: testDeliveryID, RankPosition: 1,
+				Title: "frozen", BodyMD: "frozen body",
+				SourceURL:    "https://source.example/item",
+				DiscoveredAt: time.Unix(800, 0).UTC(),
+			}},
+		},
+	}
+	h.st.canonicalFound = true
+	h.svc.deps.BuildAggCard = func(in AggregateCardInput) string {
+		return strings.Repeat("x", AggregateCardMaxBytesV1+1)
+	}
+	res := h.click(t, types.FeedbackActionNotInterested)
+	if res.CardJSON != "" {
+		t.Fatalf("oversized canonical feedback card replaced existing card")
+	}
+}
+
+func TestCanonicalBriefCardTaskIDDecodesExactlyOnce(t *testing.T) {
+	webURL, err := CanonicalBriefWebURLV1(
+		"https://vane.example/", "task%2F(foo)",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if webURL !=
+		"https://vane.example/#/tasks/task%252F%28foo%29" {
+		t.Fatalf("canonical Web URL=%q", webURL)
+	}
+	meta := CanonicalBriefCardV1{
+		BatchID: 1, TotalItems: 1, VisibleItems: 1,
+		WebURL: webURL,
+	}
+	if err := meta.Validate(1); err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := meta.TaskID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taskID != "task%2F(foo)" {
+		t.Fatalf("task ID=%q, want exact once-decoded value", taskID)
 	}
 }
 

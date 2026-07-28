@@ -685,13 +685,14 @@ func newHarness(t *testing.T) *harness {
 	h.llm = fl
 	// Recorder 传 nil：Record 是 nil 接收者安全的 no-op，记账不需要数据库。
 	h.svc = New(Deps{
-		Store:         h.st,
-		Client:        cli,
-		Recorder:      nil,
-		Sender:        h.sender,
-		Notifier:      h.notifier,
-		BuildCard:     h.cards.build,
-		DeepDiveModel: "deepseek-v4-pro",
+		Store:           h.st,
+		Client:          cli,
+		Recorder:        nil,
+		Sender:          h.sender,
+		Notifier:        h.notifier,
+		BuildCard:       h.cards.build,
+		DashboardOrigin: "https://vane.example",
+		DeepDiveModel:   "deepseek-v4-pro",
 	})
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

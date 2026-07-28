@@ -13,6 +13,32 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+// AggregateCardMaxBytesV1 is the provider-safe hard limit shared by initial
+// Feishu projection and every callback rebuild. Keeping one leaf-package
+// constant prevents a feedback form from growing a previously valid card past
+// the limit.
+const AggregateCardMaxBytesV1 = 28 << 10
+
+// CanonicalBriefWebURLV1 builds the only trusted task deep-link shape used by
+// both initial render and callback verification.
+func CanonicalBriefWebURLV1(origin, taskID string) (string, error) {
+	origin = strings.TrimRight(strings.TrimSpace(origin), "/")
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed == nil ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") ||
+		parsed.Host == "" || parsed.User != nil ||
+		(parsed.Path != "" && parsed.Path != "/") ||
+		parsed.RawQuery != "" || parsed.Fragment != "" ||
+		taskID == "" {
+		return "", errors.New("canonical Brief dashboard origin is invalid")
+	}
+	escapedTaskID := url.PathEscape(taskID)
+	escapedTaskID = strings.NewReplacer(
+		"(", "%28", ")", "%29",
+	).Replace(escapedTaskID)
+	return origin + "/#/tasks/" + escapedTaskID, nil
+}
+
 // CardState 推送卡状态行的渲染输入（契约 §10.2），由 feishu.BuildDeliveryCard 消费。
 // 三字段均以库内查询为准、最终一致：同卡并发点击时两版卡片以飞书到达序为准，
 // 短暂缺项在下次点击时自愈。
@@ -86,8 +112,9 @@ func (b CanonicalBriefCardV1) TaskID() (string, error) {
 	if err != nil || parsed == nil {
 		return "", errors.New("canonical Brief card URL is invalid")
 	}
-	encoded := strings.TrimPrefix(parsed.Fragment, "/tasks/")
-	if encoded == "" || encoded == parsed.Fragment {
+	escapedFragment := parsed.EscapedFragment()
+	encoded := strings.TrimPrefix(escapedFragment, "/tasks/")
+	if encoded == "" || encoded == escapedFragment {
 		return "", errors.New("canonical Brief card task is invalid")
 	}
 	taskID, err := url.PathUnescape(encoded)

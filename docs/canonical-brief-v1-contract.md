@@ -270,12 +270,15 @@ content rows. The stage is the immutable byte envelope later promoted to the
 single `BriefV1`; Push validates its complete delivery IDs and order before
 rendering.
 
-The card contains at most the first three ranked Insights. If the card would
-exceed the provider byte budget, the visible prefix shrinks without reordering
-or truncating an Insight; a single oversized Insight fails before provider
-send. The header reports the whole Brief count, and the footer says “另有 N 条”
-with an exact task deep link to the Web `TaskBriefFeed`. No score or live
-platform label is injected into the canonical card.
+The card contains at most the first three ranked Insights. Prefix planning
+checks the 28 KiB provider budget with the worst-case transient feedback form
+opened on each visible Insight; this keeps every later callback rebuild inside
+the same hard limit. If the card would exceed that budget, the visible prefix
+shrinks without reordering or truncating an Insight; a single oversized
+Insight fails before provider send. The header reports the whole Brief count,
+and the footer says “另有 N 条” with an exact task deep link to the Web
+`TaskBriefFeed`. No score or live platform label is injected into the
+canonical card.
 
 The one durable provider effect still receipts the complete Brief delivery
 set. This is Phase 1's documented compatibility bridge while `InsightV1.ID`
@@ -283,12 +286,19 @@ remains the delivery ID and channel delivery is not yet physically split. The
 card bytes carry the batch ID, total count, visible prefix count, and Web URL
 in server-generated callback metadata. A feedback click reloads the promoted
 Brief through `vane_brief_reader`, proves the exact user/delivery/batch scope,
-and rebuilds the same frozen ordered prefix with current feedback state. If
-promotion is not yet visible or metadata differs, the feedback write succeeds
-but the existing card is left unchanged; it never falls back to mutable
-content/source rows.
+and rebuilds the same frozen ordered prefix with current feedback state. The
+reader takes the shared tenant purge-admission root before any delivery/batch
+row lock, then repeats the exact scope lookup under lock. The callback Web URL
+must exactly equal the canonical task URL reconstructed from the trusted
+configured dashboard origin; stored card bytes cannot select another host. If
+promotion is not yet visible, metadata differs, or a defensive rebuilt-card
+size check fails, the feedback write succeeds but the existing card is left
+unchanged; it never falls back to mutable content/source rows.
 
 P1-E adds no Workflow command and no model call. Pre-P1-E histories and every
 legacy/ad-hoc task retain the old renderer. The Activity-level selector is safe
 across retry because provider bytes are created before any external send and
-then replay only from the immutable effect row.
+then replay only from the immutable effect row. If a legacy multi-chunk effect
+plan was only partially prepared before the renderer canary changed, its
+existing plan identity wins and the retry completes the original legacy
+chunks; it never attempts to replace them with one canonical effect.

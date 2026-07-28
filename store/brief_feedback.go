@@ -24,9 +24,7 @@ func (s *Store) LoadCanonicalBriefForFeedbackV1(
 		return types.BriefV1{}, false, types.NewAppError(
 			types.CodeValidation, "canonical Brief 反馈范围无效", nil)
 	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{
-		IsoLevel: pgx.RepeatableRead,
-	})
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return types.BriefV1{}, false,
 			briefFeedDBError("开启 canonical Brief 反馈读取事务", err)
@@ -39,6 +37,35 @@ func (s *Store) LoadCanonicalBriefForFeedbackV1(
 	}
 
 	var tenantID int64
+	err = tx.QueryRow(ctx, `
+		SELECT d.tenant_id
+		  FROM deliveries d
+		  JOIN push_batches b
+		    ON b.id=d.batch_id
+		   AND b.tenant_id=d.tenant_id
+		   AND b.user_id=d.user_id
+		 WHERE d.id=$1 AND d.user_id=$2 AND d.batch_id=$3`,
+		deliveryID, userID, batchID,
+	).Scan(&tenantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return types.BriefV1{}, false, nil
+	}
+	if err != nil {
+		return types.BriefV1{}, false,
+			briefFeedDBError("校验 canonical Brief 反馈投递", err)
+	}
+	if tenantID <= 0 {
+		return types.BriefV1{}, false, nil
+	}
+	tenantExists, err := lockTenantAdmissionRootShared(ctx, tx, tenantID)
+	if err != nil {
+		return types.BriefV1{}, false,
+			briefFeedDBError("锁定 canonical Brief 反馈租户准入", err)
+	}
+	if !tenantExists {
+		return types.BriefV1{}, false, nil
+	}
+	var lockedTenantID int64
 	var taskID string
 	err = tx.QueryRow(ctx, `
 		SELECT d.tenant_id,COALESCE(b.schedule_id,'')
@@ -50,24 +77,16 @@ func (s *Store) LoadCanonicalBriefForFeedbackV1(
 		 WHERE d.id=$1 AND d.user_id=$2 AND d.batch_id=$3
 		 FOR KEY SHARE OF d,b`,
 		deliveryID, userID, batchID,
-	).Scan(&tenantID, &taskID)
+	).Scan(&lockedTenantID, &taskID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return types.BriefV1{}, false, nil
 	}
 	if err != nil {
 		return types.BriefV1{}, false,
-			briefFeedDBError("校验 canonical Brief 反馈投递", err)
+			briefFeedDBError("重校验 canonical Brief 反馈投递", err)
 	}
-	if tenantID <= 0 || taskID == "" {
-		return types.BriefV1{}, false, nil
-	}
-	tenantExists, err := lockTenantAdmissionRootShared(ctx, tx, tenantID)
-	if err != nil {
-		return types.BriefV1{}, false,
-			briefFeedDBError("锁定 canonical Brief 反馈租户准入", err)
-	}
-	if !tenantExists {
-		return types.BriefV1{}, false, nil
+	if lockedTenantID != tenantID || taskID == "" {
+		return types.BriefV1{}, false, canonicalBriefIntegrityError()
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id',$1,true),
