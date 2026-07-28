@@ -335,7 +335,8 @@ func ProjectInsightEvidenceSourcesV1(
 		structured.Validate() != nil ||
 		eventEvidence.Validate() != nil ||
 		structured.EvidenceDigest == "" ||
-		structured.EvidenceDigest != eventEvidence.EvidenceDigest ||
+		!equalBriefDigest(
+			structured.EvidenceDigest, eventEvidence.EvidenceDigest) ||
 		!structuredEventEvidenceRefsResolveV1(
 			structured, eventEvidence) {
 		return nil, errors.New(

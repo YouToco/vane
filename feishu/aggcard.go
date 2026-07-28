@@ -252,7 +252,10 @@ func canonicalEvidenceMarkdownV1(
 			index+1, label, sourceURL,
 			observedAt.UTC().Format("2006-01-02"),
 		)
-		if body.Len()+len(line) > aggEvidenceMarkdownMaxBytes {
+		remainingAfter := len(sources) - (visible + 1)
+		suffix := evidenceOmittedSuffixV1(remainingAfter)
+		if body.Len()+len(line)+len(suffix) >
+			aggEvidenceMarkdownMaxBytes {
 			break
 		}
 		body.WriteString(line)
@@ -262,15 +265,19 @@ func canonicalEvidenceMarkdownV1(
 		return heading + "<font color='grey'>多来源证据已冻结，请在 Web 查看</font>"
 	}
 	if remaining := len(sources) - visible; remaining > 0 {
-		suffix := fmt.Sprintf(
-			"<font color='grey'>另有 %d 个证据，请在 Web 查看</font>",
-			remaining,
-		)
-		if body.Len()+len(suffix) <= aggEvidenceMarkdownMaxBytes {
-			body.WriteString(suffix)
-		}
+		body.WriteString(evidenceOmittedSuffixV1(remaining))
 	}
 	return strings.TrimSuffix(body.String(), "\n")
+}
+
+func evidenceOmittedSuffixV1(remaining int) string {
+	if remaining <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"<font color='grey'>另有 %d 个证据，请在 Web 查看</font>",
+		remaining,
+	)
 }
 
 func canonicalEvidenceURLV1(raw string) (string, bool) {

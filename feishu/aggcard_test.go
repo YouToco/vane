@@ -140,6 +140,31 @@ func TestCanonicalEvidenceMarkdownOversizedOrInvalidFirstSourceFallsBack(
 	}
 }
 
+func TestCanonicalEvidenceMarkdownAlwaysReservesOmissionNotice(t *testing.T) {
+	now := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	got := canonicalEvidenceMarkdownV1(
+		[]feedback.CanonicalEvidenceSourceV1{
+			{
+				Ref: "source-1", Title: "first",
+				SourceURL: "https://example.com/" +
+					strings.Repeat("x", 5400),
+				DiscoveredAt: now,
+			},
+			{
+				Ref: "source-2", Title: "second",
+				SourceURL: "https://example.com/" +
+					strings.Repeat("y", 1000),
+				DiscoveredAt: now,
+			},
+		},
+	)
+	if len(got) > aggEvidenceMarkdownMaxBytes ||
+		(!strings.Contains(got, "另有") &&
+			!strings.Contains(got, "多来源证据已冻结")) {
+		t.Fatalf("bounded evidence omitted its Web fallback: %q", got)
+	}
+}
+
 // TestAggregateCard_双form名互异 规格 A.4：两条同时待填时 form/input/submit 的 name
 // 必须按 delivery_id 互异——单条卡的硬编码 name 在 N 条 form 并存时必然重名，
 // 正是"对 B 条说推错、记到 A 条"的物理路径。
