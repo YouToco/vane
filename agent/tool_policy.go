@@ -27,11 +27,17 @@ const (
 	EffectTrustTaint
 	EffectLocalHandleRead
 	EffectActivationWrite
+	// EffectDirectOwnerWrite is a deliberately narrow exception for an
+	// owner-only write whose model-visible schema contains every required
+	// target. The Agent may execute it inline after resolving ambiguity in
+	// conversation; it must never enter the A2A surface.
+	EffectDirectOwnerWrite
 )
 
 const knownEffects = EffectInternalRead | EffectNetworkRead | EffectBillable |
 	EffectStateWrite | EffectDelivery | EffectDurableProposal |
-	EffectTrustTaint | EffectLocalHandleRead | EffectActivationWrite
+	EffectTrustTaint | EffectLocalHandleRead | EffectActivationWrite |
+	EffectDirectOwnerWrite
 
 // EffectSet is the complete effect declaration for a tool. Zero is invalid.
 type EffectSet uint16
@@ -223,12 +229,19 @@ func (p ToolPolicy) validate() error {
 	}
 	if (p.Effects.Has(EffectStateWrite) || p.Effects.Has(EffectDurableProposal)) &&
 		p.Confirmation != ConfirmationRequired &&
-		!p.Effects.Has(EffectActivationWrite) {
+		!p.Effects.Has(EffectActivationWrite) &&
+		!p.Effects.Has(EffectDirectOwnerWrite) {
 		return errors.New("state write or durable proposal requires confirmation")
 	}
 	if p.Effects.Has(EffectDurableProposal) &&
 		p.Confirmation != ConfirmationRequired {
 		return errors.New("durable proposal requires confirmation")
+	}
+	if p.Effects.Has(EffectDirectOwnerWrite) &&
+		(!p.Effects.Has(EffectStateWrite) ||
+			p.Confirmation != ConfirmationNone ||
+			p.Authorization != AuthorizationOwner) {
+		return errors.New("direct owner write must be owner-only state write without confirmation")
 	}
 	if p.Effects.Has(EffectBillable) && p.Budget == BudgetNone {
 		return errors.New("billable effect requires a budget owner")
