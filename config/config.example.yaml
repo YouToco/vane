@@ -59,6 +59,10 @@ pipeline:
   canonical_brief_enabled: false
   canonical_brief_canary_schedule_id: ""
   canonical_brief_allow_all: false
+  # Phase 2-A structured CardGen is nested inside canonical Brief.
+  structured_insight_enabled: false
+  structured_insight_canary_schedule_id: ""
+  structured_insight_allow_all: false
   # P1-E Feishu renderer authority; empty is the exact rollback state.
   canonical_brief_renderer_canary_schedule_id: ""
   # C2c-2: exact one-task shadow canary. Empty means fully off.

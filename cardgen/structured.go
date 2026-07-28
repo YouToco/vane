@@ -61,9 +61,15 @@ func (cg *CardGen) GenerateStructuredWithPolicyV2(
 	if err != nil {
 		return StructuredInsightV1{}, err
 	}
-	return ParseStructuredInsightV1([]byte(raw), map[string]string{
+	insight, err := ParseStructuredInsightV1([]byte(raw), map[string]string{
 		"source-1": structuredSourceTextV1(item.Item),
 	})
+	if err != nil {
+		return StructuredInsightV1{}, types.NewAppError(
+			types.CodeValidation,
+			"structured CardGen output is invalid", nil)
+	}
+	return insight, nil
 }
 
 func buildStructuredCardUserV1(hint string, item types.ContentItem) string {

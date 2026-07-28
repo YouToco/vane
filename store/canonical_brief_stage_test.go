@@ -125,6 +125,92 @@ func TestCanonicalBriefStagePromotesAtomicallyAndReplays(t *testing.T) {
 	}
 }
 
+func TestStructuredBriefStageFirstWriteReplayAndConflict(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 2)
+	marker, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generatedAt := time.Date(
+		2026, 7, 28, 1, 2, 3, 456000, time.UTC)
+	order := []int64{f.deliveryID[1], f.deliveryID[0]}
+	structured := make(map[int64]types.StructuredInsightV1, len(order))
+	for index, deliveryID := range f.deliveryID {
+		structured[deliveryID] = types.StructuredInsightV1{
+			SchemaVersion: types.StructuredInsightSchemaVersionV1,
+			BodyMD: f.bodyMD[index], WhatChanged: "change",
+			WhyItMatters: "reason", ImportanceReason: "evidence",
+			Claims: []types.StructuredClaimV1{{
+				Text: "claim", Excerpt: "excerpt",
+				SourceRefs: []string{"source-1"},
+			}},
+		}
+	}
+	draft, err := f.base.st.PrepareBriefDraftV2(
+		t.Context(), f.identity, f.ref, marker,
+		f.batchID, generatedAt, order, structured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, insight := range draft.Insights {
+		if insight.Structured == nil ||
+			insight.Structured.BodyMD != insight.BodyMD {
+			t.Fatalf("structured draft lost projection: %+v", insight)
+		}
+	}
+	replayed, err := f.base.st.PrepareBriefDraftV2(
+		t.Context(), f.identity, f.ref, marker,
+		f.batchID, generatedAt, order, structured)
+	if err != nil {
+		t.Fatalf("exact structured replay failed: %v", err)
+	}
+	firstDigest, _ := draft.RequestDigest()
+	replayDigest, _ := replayed.RequestDigest()
+	if firstDigest != replayDigest {
+		t.Fatalf("structured replay digest = %q, want %q",
+			replayDigest, firstDigest)
+	}
+	changed := make(map[int64]types.StructuredInsightV1, len(structured))
+	for deliveryID, insight := range structured {
+		changed[deliveryID] = insight
+	}
+	mutated := changed[order[0]]
+	mutated.WhatChanged = "different terminal claim"
+	changed[order[0]] = mutated
+	if _, err := f.base.st.PrepareBriefDraftV2(
+		t.Context(), f.identity, f.ref, marker,
+		f.batchID, generatedAt, order, changed,
+	); err == nil {
+		t.Fatal("structured stage replay admitted different semantics")
+	}
+	if _, err := f.base.st.PrepareBriefDraftV1(
+		t.Context(), f.identity, f.ref, marker,
+		f.batchID, generatedAt, order,
+	); err == nil {
+		t.Fatal("legacy replay erased structured semantics")
+	}
+	claim := types.RunOutcomeClaimV1{
+		RunOutcomeMarkerV1: marker,
+		Result: types.RunResultContent,
+		SourceCoverage: types.RunCompletenessComplete,
+		Processing: types.RunCompletenessComplete,
+	}
+	if _, err := f.base.st.FinalizeRunOutcomeClaimV1(
+		t.Context(), f.identity, f.ref, claim); err != nil {
+		t.Fatal(err)
+	}
+	brief, found, err := f.base.st.LoadBriefV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil || !found {
+		t.Fatalf("load structured Brief: found=%t err=%v", found, err)
+	}
+	if brief.Insights[0].Structured == nil ||
+		brief.Insights[0].Structured.WhatChanged != "change" {
+		t.Fatalf("promoted structured Brief = %+v", brief)
+	}
+}
+
 func TestCanonicalBriefStageAbortsWithNonContentOutcome(t *testing.T) {
 	f := newCanonicalBriefFixture(t, 1)
 	marker, err := f.base.st.CreatePendingRunOutcomeV1(

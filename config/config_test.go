@@ -193,6 +193,61 @@ func TestCanonicalBriefRolloutValidation(t *testing.T) {
 	}
 }
 
+func TestStructuredInsightRolloutValidation(t *testing.T) {
+	base := func() Config {
+		return Config{
+			DB: DBConfig{URL: "postgres://test"},
+			Pipeline: PipelineConfig{
+				CompiledRuntimeEnabled:             true,
+				CompiledRuntimeCanaryScheduleID:    "task-a",
+				RunOutcomeEnabled:                  true,
+				RunOutcomeCanaryScheduleID:         "task-a",
+				CanonicalBriefEnabled:              true,
+				CanonicalBriefCanaryScheduleID:     "task-a",
+				PushEffectCanaryScheduleID:         "task-a",
+				PushEffectRecoveryCanaryScheduleID: "task-a",
+			},
+		}
+	}
+	t.Run("exact nested canary", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.StructuredInsightEnabled = true
+		cfg.Pipeline.StructuredInsightCanaryScheduleID = " task-a "
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Pipeline.StructuredInsightCanaryScheduleID != "task-a" {
+			t.Fatalf("canary = %q", cfg.Pipeline.StructuredInsightCanaryScheduleID)
+		}
+	})
+	t.Run("requires canonical brief", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.CanonicalBriefEnabled = false
+		cfg.Pipeline.StructuredInsightEnabled = true
+		cfg.Pipeline.StructuredInsightCanaryScheduleID = "task-a"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected nesting error")
+		}
+	})
+	t.Run("mismatched canary", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.StructuredInsightEnabled = true
+		cfg.Pipeline.StructuredInsightCanaryScheduleID = "task-b"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected canary mismatch")
+		}
+	})
+	t.Run("canary and allow all conflict", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.StructuredInsightEnabled = true
+		cfg.Pipeline.StructuredInsightCanaryScheduleID = "task-a"
+		cfg.Pipeline.StructuredInsightAllowAll = true
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected rollout conflict")
+		}
+	})
+}
+
 func TestCanonicalBriefRendererRolloutValidation(t *testing.T) {
 	valid := func() Config {
 		return Config{
@@ -974,6 +1029,9 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.observation_authority_canary_schedule_id", cfg.Pipeline.ObservationAuthorityCanaryScheduleID, ""},
 		{"pipeline.push_effect_recovery_canary_schedule_id", cfg.Pipeline.PushEffectRecoveryCanaryScheduleID, ""},
 		{"pipeline.canonical_brief_renderer_canary_schedule_id", cfg.Pipeline.CanonicalBriefRendererCanaryScheduleID, ""},
+		{"pipeline.structured_insight_enabled", cfg.Pipeline.StructuredInsightEnabled, false},
+		{"pipeline.structured_insight_canary_schedule_id", cfg.Pipeline.StructuredInsightCanaryScheduleID, ""},
+		{"pipeline.structured_insight_allow_all", cfg.Pipeline.StructuredInsightAllowAll, false},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
 		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 100000},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},

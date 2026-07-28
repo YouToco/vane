@@ -428,8 +428,17 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 	var cardErr error
 	if outcomeMarker != nil {
 		var result CardGenOutcomeResult
-		cardErr = workflow.ExecuteActivity(
-			cardCtx, a.CardGenOutcomeV1, cardIn).Get(cardCtx, &result)
+		if p.RuntimeVersion == CompiledRuntimeStructuredInsightV1 &&
+			workflow.GetVersion(
+				ctx, "structured-insight-cardgen-v1",
+				workflow.DefaultVersion, 1,
+			) >= 1 {
+			cardErr = workflow.ExecuteActivity(
+				cardCtx, a.CardGenOutcomeV2, cardIn).Get(cardCtx, &result)
+		} else {
+			cardErr = workflow.ExecuteActivity(
+				cardCtx, a.CardGenOutcomeV1, cardIn).Get(cardCtx, &result)
+		}
 		cards = result.Cards
 		if result.Processing == types.RunCompletenessPartial {
 			outcomeProcessing = types.RunCompletenessPartial
