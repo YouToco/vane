@@ -80,19 +80,26 @@ const CompiledRuntimeRunOutcomeV1 = "compiled-snapshot/v1+run-outcome/v1"
 // already-started P1-B histories from acquiring a new Activity command.
 const CompiledRuntimeCanonicalBriefV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1"
 
+// CompiledRuntimeStructuredInsightV1 adds Phase 2-A's one-call structured
+// CardGen policy and optional immutable Insight extension.
+const CompiledRuntimeStructuredInsightV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+structured-insight/v1"
+
 func IsCompiledRuntimeV1(version string) bool {
 	return version == CompiledRuntimeSnapshotV1 ||
 		version == CompiledRuntimeRunOutcomeV1 ||
-		version == CompiledRuntimeCanonicalBriefV1
+		version == CompiledRuntimeCanonicalBriefV1 ||
+		version == CompiledRuntimeStructuredInsightV1
 }
 
 func HasRunOutcomeV1(version string) bool {
 	return version == CompiledRuntimeRunOutcomeV1 ||
-		version == CompiledRuntimeCanonicalBriefV1
+		version == CompiledRuntimeCanonicalBriefV1 ||
+		version == CompiledRuntimeStructuredInsightV1
 }
 
 func HasCanonicalBriefV1(version string) bool {
-	return version == CompiledRuntimeCanonicalBriefV1
+	return version == CompiledRuntimeCanonicalBriefV1 ||
+		version == CompiledRuntimeStructuredInsightV1
 }
 
 // CompiledRunInputV1 carries the trusted stable scope copied from the Schedule
