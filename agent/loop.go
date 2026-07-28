@@ -551,8 +551,9 @@ func (l *Loop) HandleTaskDefinitionEditMessage(
 
 // HandleExternalContextMessage 处理「用户文字 + 外部内容」的合成输入（当前由飞书
 // 推送卡追问与引用消息调用）。外部正文在首次模型请求前就已存在，不能等工具执行后
-// 才 taint：本入口从第一轮起不读画像、不声明工具，避免正文诱导写 pending、读取
-// 内部数据或把上下文编码进 URL/query。
+// 才 taint：本入口从第一轮起不读画像/历史，不声明内部或写工具。唯一例外是当前用户
+// 自己的后缀明确要求最新核验时，可暴露一次 query 字节被本地固定的 web_search；
+// 引用正文不能改变查询，也不能触发第二次网络读取。
 func (l *Loop) HandleExternalContextMessage(ctx context.Context, userID int64, text string) (Outcome, error) {
 	return l.handleMessage(ctx, userID, "", "", text, true)
 }
@@ -628,6 +629,17 @@ func (l *Loop) handleMessage(
 		directActionID:             directActionID,
 		directTaskDefinitionEditID: directDefinitionEditTaskID,
 		untrustedExternalResult:    externalInput,
+	}
+	if externalInput {
+		if request, _, ok := splitExternalInput(text); ok {
+			if query, required := externalFollowupSearchQuery(request); required {
+				state.externalFollowupSearchRequired = true
+				if spec, exists := l.tools["web_search"]; exists &&
+					eligibleExternalFollowupSearchSpec(spec) {
+					state.externalFollowupSearchQuery = query
+				}
+			}
+		}
 	}
 
 	sid := sess.ID
@@ -716,6 +728,13 @@ func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMess
 // 写工具 pending_action 与工具记账归属：飞书轨传 &sess.ID，A2A 轨传 nil（记 NULL）。
 func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msgs []llm.ChatMessage, hint string, state *toolRunState) (Outcome, []llm.ChatMessage, int, error) {
 	ctx = context.WithValue(ctx, toolRunKey{}, state)
+	if state != nil && state.externalFollowupSearchRequired &&
+		state.externalFollowupSearchQuery == "" {
+		msgs = append(msgs, llm.ChatMessage{
+			Role: "assistant", Content: replyExternalFollowupSearchUnavailable,
+		})
+		return Outcome{Reply: replyExternalFollowupSearchUnavailable}, msgs, 0, nil
+	}
 
 	var directProposalBase []llm.ChatMessage
 	if state != nil && (state.directTaskCreation ||
@@ -784,6 +803,13 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				system += directTaskDefinitionEditResponseRetrySystemNote
 			}
 		}
+		if state.externalFollowupSearchQuery != "" &&
+			!state.externalFollowupSearchAttempted {
+			system += externalFollowupSearchSystemNote
+			if state.externalFollowupSearchResponseRejected {
+				system += externalFollowupSearchRetrySystemNote
+			}
+		}
 		request := llm.ChatRequest{
 			Model:    l.model,
 			Messages: withSystem(system, requestMessages, profileHint, renderProfile),
@@ -822,6 +848,17 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 
 		// 无 tool_calls 即收敛：模型给出了最终文字回复。
 		if len(resp.ToolCalls) == 0 {
+			if state.externalFollowupSearchQuery != "" &&
+				!state.externalFollowupSearchAttempted {
+				if !state.externalFollowupSearchResponseRejected {
+					state.externalFollowupSearchResponseRejected = true
+					continue
+				}
+				msgs = append(msgs, llm.ChatMessage{
+					Role: "assistant", Content: replyExternalFollowupSearchNotRun,
+				})
+				return Outcome{Reply: replyExternalFollowupSearchNotRun}, msgs, turns, nil
+			}
 			if state.directTaskCreation {
 				if !state.directTaskCreationResponseRejected {
 					// direct 模式不转发任何没有 proposal 的自由文本：开放式
@@ -878,6 +915,13 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		msgs = append(msgs, toolMsgs...)
 		if err != nil {
 			return Outcome{}, nil, 0, err
+		}
+		if state.externalFollowupSearchAttempted &&
+			!state.externalFollowupSearchSucceeded {
+			msgs = append(msgs, llm.ChatMessage{
+				Role: "assistant", Content: replyExternalFollowupSearchNotRun,
+			})
+			return Outcome{Reply: replyExternalFollowupSearchNotRun}, msgs, turns, nil
 		}
 		if !wasUntrusted && state.untrustedExternalResult {
 			// 外部结果下一轮只与当前用户问题同屏。此前会话、画像派生文本、
@@ -998,9 +1042,20 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 // 声明按激活顺序追加在后。顺序纪律的意义见 activationState 注释（缓存前缀稳定）。
 func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 	if state != nil && state.untrustedExternalResult {
-		// taint 后只保留不访问网络、不读取内部记忆的本地缓存续读工具。
-		// 只关闭写工具仍会留下 read_page URL / web_search query 等外带通道。
-		out := make([]llm.ToolDef, 0, 1)
+		// taint 后通常只保留不访问网络、不读取内部记忆的本地缓存续读工具。
+		// 类型化飞书追问若由当前用户后缀明确要求最新核验，可额外声明一次
+		// 零参数 web_search；真实 query 由 harness 绑定，模型没有 URL/query
+		// 外带通道。除此之外仍关闭全部网络、内部读和写工具。
+		out := make([]llm.ToolDef, 0, 2)
+		if !state.externalFollowupSearchAttempted {
+			if spec, ok := l.tools["web_search"]; ok {
+				if projected, ok := projectExternalFollowupSearchToolDef(
+					spec, state.externalFollowupSearchQuery,
+				); ok {
+					out = append(out, projected)
+				}
+			}
+		}
 		for _, def := range l.toolDefs {
 			if tool, ok := l.tools[def.Name]; ok && canDeclareAfterUntrusted(state, tool) {
 				out = append(out, def)
@@ -1200,6 +1255,17 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		// 清掉旧拒绝标记，避免下一轮把该声明过的协议也丢回基线。
 		state.directTaskCreationToolRejected = false
 	}
+	if state != nil && state.externalFollowupSearchQuery != "" &&
+		!state.externalFollowupSearchAttempted &&
+		len(calls) != 1 && containsExternalFollowupSearch(calls) {
+		state.externalFollowupSearchAttempted = true
+		for _, rejected := range calls {
+			out = append(out, toolMsg(
+				rejected.ID, toolMsgExternalFollowupSearchRejected,
+			))
+		}
+		return nil, out, nil
+	}
 	if len(calls) != 1 && (state == nil || !state.directTaskCreation) &&
 		l.batchMayProduceExternalResult(calls, state) {
 		for _, tc := range calls {
@@ -1228,22 +1294,37 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			out = append(out, toolMsg(tc.ID, fmt.Sprintf("工具 %s 不存在", tc.Name)))
 			continue
 		}
+		args := json.RawMessage(tc.Arguments)
 		// 外部网页结果可参与本轮回答，但之后不能再调用任何工具。这是 prompt
 		// 之外的确定性边界：即使模型服从恶意网页并调用 view_profile、
 		// create_schedule 或把上下文编码进第二个 URL，系统也只回固定拒绝，
 		// 不读内部数据、不访问外网、不执行、不落 pending。
 		if state := runStateFrom(ctx); state != nil && state.untrustedExternalResult {
-			args := json.RawMessage(tc.Arguments)
-			if localContinuationUsed || !canRunAfterUntrusted(state, spec, args) {
+			if tc.Name == "web_search" &&
+				state.externalFollowupSearchQuery != "" &&
+				!state.externalFollowupSearchAttempted {
+				allowed := canRunExternalFollowupSearch(state, spec, args)
+				state.externalFollowupSearchAttempted = true
+				if !allowed {
+					out = append(out, toolMsg(
+						tc.ID, toolMsgExternalFollowupSearchRejected,
+					))
+					continue
+				}
+				args = boundExternalFollowupSearchArgs(
+					state.externalFollowupSearchQuery,
+				)
+			} else if localContinuationUsed ||
+				!canRunAfterUntrusted(state, spec, args) {
 				out = append(out, toolMsg(tc.ID, toolMsgUntrustedBoundary))
 				continue
+			} else {
+				// 一个 assistant 批次最多续读一次。外部结果可诱导并列几十个
+				// 分页调用；逐个放行会在单轮撑爆上下文并枚举句柄。
+				localContinuationUsed = true
 			}
-			// 一个 assistant 批次最多续读一次。外部结果可诱导并列几十个
-			// 分页调用；逐个放行会在单轮撑爆上下文并枚举句柄。
-			localContinuationUsed = true
 		}
 
-		args := json.RawMessage(tc.Arguments)
 		if spec.Policy.Confirmation == ConfirmationNone {
 			result, err := l.execRecorded(ctx, userID, sessionID, spec, args)
 			if err != nil {
