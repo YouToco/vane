@@ -913,7 +913,11 @@ func agentActionDecisionSessionMessages(
 	case agentActionEnableSourceToolName:
 		actionText = "重新启用信源"
 	case agentActionRemoveSourceToolName:
-		actionText = "取消订阅信源"
+		if status == AgentActionStatusCancelled {
+			actionText = "退订信源"
+		} else {
+			actionText = "取消订阅信源"
+		}
 	default:
 		return nil
 	}

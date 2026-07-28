@@ -227,10 +227,7 @@ func TestRemoveSourceDurableContinuationAtomicBatchAndReplay(
 		t.Fatal(err)
 	}
 	key, _, err := agentSessionAppendIdentity(
-		agentActionOperationIdentity(AgentActionContinuation{
-			ActionID: actionID,
-			ToolName: agentActionRemoveSourceToolName,
-		}),
+		"agent-action:remove-source:"+actionID,
 		frozen.successMessages,
 	)
 	if err != nil {
@@ -370,7 +367,7 @@ func TestRemoveSourceDurableContinuationProjectionConflictRollsBackBatch(
 	}
 	if _, err := f.store.CommitAgentSessionAppend(
 		ctx, f.userA, f.sessionA,
-		agentActionOperationIdentity(*action),
+		"agent-action:remove-source:"+actionID,
 		json.RawMessage(
 			`[{"role":"user","content":"conflicting remove fact"}]`,
 		),
@@ -401,6 +398,200 @@ func TestRemoveSourceDurableContinuationProjectionConflictRollsBackBatch(
 			"subscriptions/status/reason=%d/%s/%s",
 			subscriptions, status, blockedReason,
 		)
+	}
+}
+
+func TestRemoveSourceDurableDecisionFactsAndProtocolBytes(t *testing.T) {
+	f := newAgentEventFixture(t)
+	ctx := t.Context()
+	var actionIDs []string
+	var sourceID int64
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(
+			cleanupCtx, t, f.store,
+			`DELETE FROM pending_actions WHERE id=ANY($1)`, actionIDs,
+		)
+		if sourceID != 0 {
+			cleanupExec(
+				cleanupCtx, t, f.store,
+				`DELETE FROM subscriptions WHERE source_id=$1`, sourceID,
+			)
+			cleanupExec(
+				cleanupCtx, t, f.store,
+				`DELETE FROM sources WHERE id=$1`, sourceID,
+			)
+		}
+	})
+
+	const protocolActionID = "018f86f0-4fd4-7de5-b30d-02a35f2f4662"
+	if got := agentActionOperationIdentity(AgentActionContinuation{
+		ActionID: protocolActionID,
+		ToolName: agentActionRemoveSourceToolName,
+	}); got != "agent-action:remove-source:"+protocolActionID {
+		t.Fatalf("remove_source operation identity=%q", got)
+	}
+
+	var err error
+	sourceID, _, err = f.store.UpsertSource(ctx, &types.Source{
+		Platform:   types.PlatformWeb,
+		Capability: types.CapFeed,
+		URL: "https://example.com/remove-source-decisions-" +
+			uuid.NewString(),
+		Title: "remove source decisions",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.AddSubscription(ctx, f.userA, sourceID); err != nil {
+		t.Fatal(err)
+	}
+
+	propose := func() string {
+		t.Helper()
+		actionID := uuid.NewString()
+		actionIDs = append(actionIDs, actionID)
+		if err := f.store.ProposeAgentActionContinuation(
+			ctx,
+			&types.PendingAction{
+				ID: actionID, UserID: f.userA, SessionID: &f.sessionA,
+				ToolName: agentActionRemoveSourceToolName,
+				Args: []byte(fmt.Sprintf(
+					`{"source_ids":[%d]}`, sourceID,
+				)),
+				Summary:   "取消订阅信源",
+				Status:    types.PendingActionStatusPending,
+				ExpiresAt: time.Now().Add(time.Hour),
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		return actionID
+	}
+	terminalEvents := func(actionID, messages string) int {
+		t.Helper()
+		key, _, err := agentSessionAppendIdentity(
+			"agent-action:remove-source:"+actionID,
+			json.RawMessage(messages),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var events int
+		if err := f.store.pool.QueryRow(ctx,
+			`SELECT count(*) FROM agent_events
+			  WHERE tenant_id=$1 AND session_id=$2
+			    AND batch_idempotency_key=$3`,
+			f.tenantA, f.sessionA, key,
+		).Scan(&events); err != nil {
+			t.Fatal(err)
+		}
+		return events
+	}
+
+	const cancelledMessages = `[{"role":"user","content":"[卡片回调] 用户已取消退订信源；未产生变更。"}]`
+	cancelID := propose()
+	cancelled, err := f.store.CancelAgentActionContinuation(
+		ctx, f.userA, cancelID,
+	)
+	if err != nil || cancelled.Status != AgentActionStatusCancelled {
+		t.Fatalf("cancel=%+v err=%v", cancelled, err)
+	}
+	cancelEvents := terminalEvents(cancelID, cancelledMessages)
+	if cancelEvents == 0 {
+		t.Fatal("cancelled terminal fact is absent")
+	}
+	cancelReplay, err := f.store.CancelAgentActionContinuation(
+		ctx, f.userA, cancelID,
+	)
+	if err != nil || !cancelReplay.Replayed ||
+		cancelReplay.Status != AgentActionStatusCancelled ||
+		terminalEvents(cancelID, cancelledMessages) != cancelEvents {
+		t.Fatalf("cancel replay=%+v err=%v", cancelReplay, err)
+	}
+
+	const expiredMessages = `[{"role":"user","content":"[卡片回调] 取消订阅信源确认卡已过期；未产生变更。"}]`
+	expiredID := propose()
+	if _, err := f.store.pool.Exec(ctx,
+		`UPDATE pending_actions
+		    SET expires_at=clock_timestamp()-interval '1 second'
+		  WHERE id=$1`,
+		expiredID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	expired, err := f.store.ConfirmAgentActionContinuation(
+		ctx, f.userA, expiredID,
+	)
+	if err != nil || expired.Status != AgentActionStatusExpired {
+		t.Fatalf("expire=%+v err=%v", expired, err)
+	}
+	expiredEvents := terminalEvents(expiredID, expiredMessages)
+	if expiredEvents == 0 {
+		t.Fatal("expired terminal fact is absent")
+	}
+	expiredReplay, err := f.store.ConfirmAgentActionContinuation(
+		ctx, f.userA, expiredID,
+	)
+	if err != nil || !expiredReplay.Replayed ||
+		expiredReplay.Status != AgentActionStatusExpired ||
+		terminalEvents(expiredID, expiredMessages) != expiredEvents {
+		t.Fatalf("expiry replay=%+v err=%v", expiredReplay, err)
+	}
+
+	const blockedMessages = `[{"role":"user","content":"[卡片回调] 取消订阅信源操作已因安全检查停止；未产生额外变更。"}]`
+	blockedID := propose()
+	if _, err := f.store.ConfirmAgentActionContinuation(
+		ctx, f.userA, blockedID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	action, err := f.store.AcquireAgentActionContinuation(
+		ctx, blockedID, f.tenantA, f.userA,
+		"remove-source-payload-block", time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := action.Lease()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx,
+		`UPDATE agent_action_continuations
+		    SET success_messages=
+		      '[{"role":"user","content":"mutated"}]'::bytea
+		  WHERE action_id=$1`,
+		blockedID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ProjectAgentActionContinuation(ctx, lease); err != nil {
+		t.Fatalf("payload damage should checkpoint blocked: %v", err)
+	}
+	var subscriptions int
+	var status, reason string
+	if err := f.store.pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT count(*) FROM subscriptions
+		    WHERE tenant_id=$1 AND user_id=$2 AND source_id=$3),
+		  status,blocked_reason
+		  FROM agent_action_continuations WHERE action_id=$4`,
+		f.tenantA, f.userA, sourceID, blockedID,
+	).Scan(&subscriptions, &status, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if subscriptions != 1 ||
+		status != AgentActionStatusBlocked ||
+		reason != "payload_integrity" {
+		t.Fatalf(
+			"subscriptions/status/reason=%d/%s/%s",
+			subscriptions, status, reason,
+		)
+	}
+	if events := terminalEvents(blockedID, blockedMessages); events == 0 {
+		t.Fatal("blocked terminal fact is absent")
 	}
 }
 
