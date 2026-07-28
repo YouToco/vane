@@ -691,6 +691,11 @@ func (c *Config) Validate() error {
 		return errors.New(
 			"config: executive brief renderer 必须位于 canonical Brief renderer canary")
 	}
+	if executiveRendererCanary != "" &&
+		executiveRendererCanary != executiveWebCanary {
+		return errors.New(
+			"config: executive brief renderer 必须位于 Web canary")
+	}
 	rawCanonicalRendererCanaryID :=
 		c.Pipeline.CanonicalBriefRendererCanaryScheduleID
 	canonicalRendererCanaryID :=

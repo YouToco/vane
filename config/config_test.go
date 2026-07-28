@@ -409,6 +409,15 @@ func TestExecutiveBriefRolloutValidation(t *testing.T) {
 			t.Fatal("expected Web rollout nesting error")
 		}
 	})
+	t.Run("renderer without Web canary is rejected", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = "task-a"
+		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID = "task-a"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected renderer/Web rollout nesting error")
+		}
+	})
 	t.Run("requires structured event evidence", func(t *testing.T) {
 		cfg := base()
 		cfg.Pipeline.StructuredEventEvidenceEnabled = false
