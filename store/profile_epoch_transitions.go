@@ -117,7 +117,8 @@ func (s *Store) ApplyProfileEpochAction(
 	// Feedback producers take this process-wide admission before tenant and
 	// subject fences. Taking it here first preserves the total order.
 	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock($1,$2)`,
+		`SELECT pg_advisory_xact_lock($1,$2)
+		   /* profile epoch action admission */`,
 		agentSessionFactAdmissionClass, agentSessionFactAdmissionKey,
 	); err != nil {
 		return nil, profileClaimDBError("lock feedback admission", err)
@@ -551,7 +552,10 @@ func profileRestoreStateTx(
 	if version != initial.Version {
 		return false, creator, initial, nil
 	}
-	var cursor, generation, claimHigh, eventHigh, feedbackCount int64
+	var (
+		cursor, generation, claimHigh, eventHigh int64
+		feedbackCount, activityCount             int64
+	)
 	lockClause := ""
 	if locked {
 		lockClause = " FOR SHARE"
@@ -591,10 +595,27 @@ func profileRestoreStateTx(
 		return false, creator, initial,
 			profileClaimDBError("check current epoch feedback", err)
 	}
+	var activitiesAvailable bool
+	if err := tx.QueryRow(ctx,
+		`SELECT to_regclass('public.profile_epoch_activities') IS NOT NULL`,
+	).Scan(&activitiesAvailable); err != nil {
+		return false, creator, initial,
+			profileClaimDBError("check epoch activity capability", err)
+	}
+	if activitiesAvailable {
+		if err := tx.QueryRow(ctx,
+			`SELECT count(profile_epoch) FROM profile_epoch_activities
+			  WHERE tenant_id=$1 AND user_id=$2 AND profile_epoch=$3`,
+			tenantID, userID, epoch).Scan(&activityCount); err != nil {
+			return false, creator, initial,
+				profileClaimDBError("check current epoch activity", err)
+		}
+	}
 	if cursor != initial.FeedbackCursor ||
 		generation != initial.EvidenceGeneration ||
 		claimHigh != initial.ClaimHighWater ||
-		eventHigh != initial.EventHighWater || feedbackCount != 0 {
+		eventHigh != initial.EventHighWater ||
+		feedbackCount != 0 || activityCount != 0 {
 		return false, creator, initial, nil
 	}
 	var projection profileEpochProjection

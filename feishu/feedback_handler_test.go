@@ -21,10 +21,12 @@ import (
 // wrapCall 记录一次 WrapQuestion 调用的入参（追问链路的分界面：
 // handler 传进去的是不是飞书事件里的 ParentId/RootId/原文）。
 type wrapCall struct {
-	userID   int64
-	parentID string
-	rootID   string
-	text     string
+	userID      int64
+	appIdentity string
+	inboundID   string
+	parentID    string
+	rootID      string
+	text        string
 }
 
 // fakeFeedbackRunner 是 FeedbackRunner 的假实现：记录调用并回放预设结果。
@@ -46,6 +48,7 @@ type fakeFeedbackRunner struct {
 	wraps       []wrapCall
 	wrapText    string
 	wrapMatched bool
+	wrapErr     error
 }
 
 func (f *fakeFeedbackRunner) HandleClick(_ context.Context, userID int64, click feedback.Click) (feedback.ClickResult, error) {
@@ -73,14 +76,28 @@ func (f *fakeFeedbackRunner) HandleReasonSubmit(_ context.Context, userID int64,
 	return res, err
 }
 
-func (f *fakeFeedbackRunner) WrapQuestion(_ context.Context, userID int64, parentMsgID, rootMsgID, text string) (string, bool) {
+func (f *fakeFeedbackRunner) WrapQuestion(
+	_ context.Context,
+	userID int64,
+	appIdentity string,
+	inboundMsgID string,
+	parentMsgID string,
+	rootMsgID string,
+	text string,
+) (string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.wraps = append(f.wraps, wrapCall{userID: userID, parentID: parentMsgID, rootID: rootMsgID, text: text})
-	if !f.wrapMatched {
-		return "", false
+	f.wraps = append(f.wraps, wrapCall{
+		userID: userID, appIdentity: appIdentity, inboundID: inboundMsgID,
+		parentID: parentMsgID, rootID: rootMsgID, text: text,
+	})
+	if f.wrapErr != nil {
+		return "", false, f.wrapErr
 	}
-	return f.wrapText, true
+	if !f.wrapMatched {
+		return "", false, nil
+	}
+	return f.wrapText, true, nil
 }
 
 func (f *fakeFeedbackRunner) clickCount() int {
@@ -698,13 +715,14 @@ func TestHandleQuestionWrapping(t *testing.T) {
 	const wrapped = "[追问上下文] 用户正在追问一条历史推送（delivery_id=42）…\n[追问上下文结束]\n用户的追问：这篇原文说了什么"
 
 	t.Run("命中追问时 agent 收到包装后文本", func(t *testing.T) {
+		const appIdentity = "cli_question_wrap_test"
 		m := NewManager(st, nil, nil)
 		m.setOwner(owner, "测试")
 		runner := &fakeRunner{}
 		m.SetAgent(runner)
 		fb := &fakeFeedbackRunner{wrapMatched: true, wrapText: wrapped}
 		m.SetFeedback(fb)
-		h := newHandler(m, context.Background())
+		h := newHandlerForApp(m, context.Background(), appIdentity)
 
 		h.handle(context.Background(), replyEvent(
 			"om_test_q_wrap_hit", "这篇原文说了什么", owner, "om_parent_card", "om_root_card"))
@@ -734,6 +752,33 @@ func TestHandleQuestionWrapping(t *testing.T) {
 		}
 		if wraps[0].userID == 0 {
 			t.Error("WrapQuestion 收到 userID = 0，期望 upsert 出的内部 user.ID")
+		}
+		if wraps[0].appIdentity != appIdentity ||
+			wraps[0].inboundID != "om_test_q_wrap_hit" {
+			t.Errorf("WrapQuestion app/inbound=%q/%q, want %q/%q",
+				wraps[0].appIdentity, wraps[0].inboundID,
+				appIdentity, "om_test_q_wrap_hit")
+		}
+	})
+
+	t.Run("追问事实持久化失败时不进入 agent", func(t *testing.T) {
+		m := NewManager(st, nil, nil)
+		m.setOwner(owner, "测试")
+		runner := &fakeRunner{}
+		m.SetAgent(runner)
+		m.SetFeedback(&fakeFeedbackRunner{
+			wrapErr: types.NewAppError(
+				types.CodeDatabase, "activity failed", nil),
+		})
+		h := newHandlerForApp(
+			m, context.Background(), "cli_question_failure_test")
+
+		h.handle(context.Background(), replyEvent(
+			"om_test_q_wrap_failure", "这条说了什么", owner,
+			"om_parent_card", "om_root_card"))
+
+		if got := runner.received(); len(got) != 0 {
+			t.Fatalf("追问事实失败不得进入 agent: %q", got)
 		}
 	})
 
