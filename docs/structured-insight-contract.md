@@ -44,6 +44,7 @@ The new renderer returns exactly one JSON object:
   "claims": [
     {
       "text": "可展示的事实主张",
+      "excerpt": "本次请求中可逐字定位的原文片段",
       "source_refs": ["source-1"]
     }
   ]
@@ -58,7 +59,7 @@ Rules:
 - `what_changed`, `why_it_matters` and `importance_reason` are either all
   valid or the structured projection is absent;
 - claims are optional in the first rollout, but every present claim has at
-  least one reference;
+  least one reference and one source excerpt;
 - references must match request-owned opaque IDs; raw URLs, database IDs and
   model-invented IDs are rejected;
 - each cited excerpt must occur in the normalized source input represented by
