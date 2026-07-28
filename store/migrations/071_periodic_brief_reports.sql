@@ -209,6 +209,96 @@ CREATE INDEX idx_periodic_brief_reports_keyset
         tenant_id,user_id,task_id,cadence,period_end DESC,id DESC
     );
 
+-- +goose StatementBegin
+CREATE FUNCTION enforce_periodic_brief_intent_transition_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+BEGIN
+    IF ROW(
+        NEW.id,NEW.tenant_id,NEW.user_id,NEW.task_id,NEW.cadence,
+        NEW.timezone,NEW.period_start,NEW.period_end,NEW.workflow_id,
+        NEW.input_brief_ids,NEW.input_digest,NEW.run_outcome_ids,
+        NEW.outcome_digest,NEW.source_coverage,NEW.processing,
+        NEW.partial_reason,NEW.created_at
+    ) IS DISTINCT FROM ROW(
+        OLD.id,OLD.tenant_id,OLD.user_id,OLD.task_id,OLD.cadence,
+        OLD.timezone,OLD.period_start,OLD.period_end,OLD.workflow_id,
+        OLD.input_brief_ids,OLD.input_digest,OLD.run_outcome_ids,
+        OLD.outcome_digest,OLD.source_coverage,OLD.processing,
+        OLD.partial_reason,OLD.created_at
+    ) THEN
+        RAISE EXCEPTION '071: periodic Brief intent identity is immutable';
+    END IF;
+    IF OLD.temporal_run_id IS NOT NULL AND
+       NEW.temporal_run_id IS DISTINCT FROM OLD.temporal_run_id THEN
+        RAISE EXCEPTION '071: periodic Brief Temporal run is immutable';
+    END IF;
+    IF NOT (
+        (OLD.status='prepared' AND NEW.status IN ('prepared','running')) OR
+        (OLD.status='running' AND NEW.status IN ('running','finalized','fallback')) OR
+        (OLD.status IN ('finalized','fallback') AND NEW IS NOT DISTINCT FROM OLD)
+    ) THEN
+        RAISE EXCEPTION '071: periodic Brief intent transition denied';
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+
+CREATE TRIGGER periodic_brief_intent_transition_v1
+BEFORE UPDATE ON periodic_brief_intents
+FOR EACH ROW EXECUTE FUNCTION enforce_periodic_brief_intent_transition_v1();
+
+-- +goose StatementBegin
+CREATE FUNCTION enforce_periodic_synthesis_transition_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+BEGIN
+    IF ROW(
+        NEW.intent_id,NEW.tenant_id,NEW.user_id,NEW.task_id,
+        NEW.request_digest,NEW.created_at
+    ) IS DISTINCT FROM ROW(
+        OLD.intent_id,OLD.tenant_id,OLD.user_id,OLD.task_id,
+        OLD.request_digest,OLD.created_at
+    ) THEN
+        RAISE EXCEPTION '071: periodic synthesis identity is immutable';
+    END IF;
+    IF NOT (
+        (OLD.status='prepared' AND NEW.status='spending') OR
+        (OLD.status='spending' AND NEW.status IN ('finalized','fallback')) OR
+        (OLD.status IN ('finalized','fallback') AND NEW IS NOT DISTINCT FROM OLD)
+    ) THEN
+        RAISE EXCEPTION '071: periodic synthesis transition denied';
+    END IF;
+    RETURN NEW;
+END
+$$;
+-- +goose StatementEnd
+
+CREATE TRIGGER periodic_synthesis_transition_v1
+BEFORE UPDATE ON periodic_synthesis_receipts
+FOR EACH ROW EXECUTE FUNCTION enforce_periodic_synthesis_transition_v1();
+
+-- +goose StatementBegin
+CREATE FUNCTION deny_periodic_brief_report_mutation_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+BEGIN
+    RAISE EXCEPTION '071: periodic Brief reports are immutable';
+END
+$$;
+-- +goose StatementEnd
+
+CREATE TRIGGER periodic_brief_report_immutable_v1
+BEFORE UPDATE OR DELETE ON periodic_brief_reports
+FOR EACH ROW EXECUTE FUNCTION deny_periodic_brief_report_mutation_v1();
+
 REVOKE ALL ON brief_report_settings,periodic_brief_intents,
     periodic_synthesis_receipts,periodic_brief_reports
     FROM PUBLIC,vane_app,vane_brief_reader,vane_periodic_brief_writer;
@@ -293,6 +383,18 @@ DROP TABLE periodic_brief_reports;
 DROP TABLE periodic_synthesis_receipts;
 DROP TABLE periodic_brief_intents;
 DROP TABLE brief_report_settings;
+DROP FUNCTION deny_periodic_brief_report_mutation_v1();
+DROP FUNCTION enforce_periodic_synthesis_transition_v1();
+DROP FUNCTION enforce_periodic_brief_intent_transition_v1();
+REVOKE SELECT (
+    id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,
+    push_batch_id,schema_version,request_digest,payload,payload_digest,
+    insight_count,generated_at
+) ON brief_snapshots FROM vane_periodic_brief_writer;
+REVOKE SELECT (
+    id,tenant_id,user_id,task_id,run_snapshot_id,status,result,
+    source_coverage,processing,finalized_at
+) ON task_run_outcomes FROM vane_periodic_brief_writer;
 REVOKE USAGE ON SCHEMA public FROM vane_periodic_brief_writer;
 REVOKE vane_periodic_brief_writer FROM CURRENT_USER;
 DROP ROLE vane_periodic_brief_writer;
