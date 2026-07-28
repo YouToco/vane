@@ -348,6 +348,98 @@ func TestTaskBriefStructuredProjectionEncodesZeroClaimsAsArray(t *testing.T) {
 	}
 }
 
+func TestTaskBriefEventEvidenceProjectionIsOrderedAndPublicOnly(t *testing.T) {
+	structured, err := types.SealStructuredInsightEvidenceV1(
+		types.StructuredInsightV1{
+			SchemaVersion:    types.StructuredInsightSchemaVersionV1,
+			BodyMD:           "body",
+			WhatChanged:      "change",
+			WhyItMatters:     "relevance",
+			ImportanceReason: "evidence",
+			Claims: []types.StructuredClaimV1{{
+				Text: "claim", Excerpt: "shared excerpt",
+				SourceRefs: []string{"source-2", "source-1"},
+			}},
+		},
+		map[string]string{
+			"source-1": "first shared excerpt",
+			"source-2": "second shared excerpt",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := types.SealObservedEventProvenanceV1(
+		41, strings.Repeat("a", 64), strings.Repeat("b", 64),
+		"release", "subject", time.Date(
+			2026, 7, 28, 12, 0, 0, 0, time.UTC),
+		json.RawMessage(`{"evidence_content_ids":[10,11]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstTime := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	secondTime := firstTime.Add(time.Hour)
+	insight := types.InsightV1{
+		Structured: &structured,
+		EventEvidence: &types.StructuredEventEvidenceV1{
+			SchemaVersion:  types.StructuredEventEvidenceSchemaVersionV1,
+			Provenance:     provenance,
+			EvidenceDigest: structured.EvidenceDigest,
+			Sources: []types.StructuredEvidenceSourceV1{
+				{
+					Ref: "source-1", Title: "first",
+					SourceTitle: "source one", Platform: "web",
+					SourceURL:   "https://example.com/first",
+					PublishedAt: &firstTime, DiscoveredAt: secondTime,
+				},
+				{
+					Ref: "source-2", Title: "second",
+					SourceTitle: "source two", Platform: "rss",
+					SourceURL:    "https://example.com/second",
+					DiscoveredAt: secondTime.Add(time.Hour),
+				},
+			},
+		},
+	}
+	projected, err := projectTaskBriefEventEvidenceV1(insight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projected == nil || len(projected.Sources) != 2 ||
+		projected.Sources[0].Ref != "source-1" ||
+		projected.Sources[1].Ref != "source-2" ||
+		projected.Sources[0].PublishedAt == nil ||
+		!projected.Sources[0].PublishedAt.Equal(firstTime) {
+		t.Fatalf("event evidence projection = %+v", projected)
+	}
+	payload, err := json.Marshal(projected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, privateField := range []string{
+		"provenance", "evidence_digest", "policy_digest",
+		"event_key", "content_item_id", "evidence_text",
+	} {
+		if strings.Contains(string(payload), privateField) {
+			t.Fatalf("public evidence leaked %q: %s", privateField, payload)
+		}
+	}
+
+	unresolved := structured
+	unresolved.Claims = append(
+		[]types.StructuredClaimV1(nil), structured.Claims...)
+	unresolved.Claims[0].SourceRefs = []string{"source-3"}
+	insight.Structured = &unresolved
+	if _, err := projectTaskBriefEventEvidenceV1(insight); err == nil {
+		t.Fatal("unresolved claim reference was projected")
+	}
+	if projected, err := projectTaskBriefEventEvidenceV1(
+		types.InsightV1{}); err != nil || projected != nil {
+		t.Fatalf("legacy projection = %+v, %v", projected, err)
+	}
+}
+
 func TestBriefFeedByteCapKeepsShortPageAndCursorAdmission(t *testing.T) {
 	items := []TaskBriefItemV1{{
 		ID: 7, GeneratedAt: time.Date(

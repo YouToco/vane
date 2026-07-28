@@ -2,6 +2,7 @@ package feedback
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -397,12 +398,42 @@ func TestRebuilt_CanonicalBriefUsesFrozenOrderedPrefix(t *testing.T) {
 			DiscoveredAt: time.Unix(int64(100+i), 0).UTC(),
 		}
 	}
-	insights[0].Structured = &types.StructuredInsightV1{
-		SchemaVersion:    types.StructuredInsightSchemaVersionV1,
-		BodyMD:           insights[0].BodyMD,
-		WhatChanged:      "frozen change",
-		WhyItMatters:     "frozen relevance",
-		ImportanceReason: "frozen evidence",
+	structured, err := types.SealStructuredInsightEvidenceV1(
+		types.StructuredInsightV1{
+			SchemaVersion:    types.StructuredInsightSchemaVersionV1,
+			BodyMD:           insights[0].BodyMD,
+			WhatChanged:      "frozen change",
+			WhyItMatters:     "frozen relevance",
+			ImportanceReason: "frozen evidence",
+			Claims: []types.StructuredClaimV1{{
+				Text: "claim", Excerpt: "shared excerpt",
+				SourceRefs: []string{"source-1"},
+			}},
+		},
+		map[string]string{"source-1": "shared excerpt"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := types.SealObservedEventProvenanceV1(
+		11, strings.Repeat("a", 64), strings.Repeat("b", 64),
+		"release", "subject", time.Unix(200, 0).UTC(),
+		json.RawMessage(`{"evidence_content_ids":[42]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insights[0].Structured = &structured
+	insights[0].EventEvidence = &types.StructuredEventEvidenceV1{
+		SchemaVersion:  types.StructuredEventEvidenceSchemaVersionV1,
+		Provenance:     provenance,
+		EvidenceDigest: structured.EvidenceDigest,
+		Sources: []types.StructuredEvidenceSourceV1{{
+			Ref: "source-1", Title: "frozen evidence item",
+			SourceTitle: "Frozen Evidence", Platform: "web",
+			SourceURL:    "https://evidence.example/item",
+			DiscoveredAt: time.Unix(201, 0).UTC(),
+		}},
 	}
 	h.st.canonicalBrief = types.BriefV1{
 		ID: 77,
@@ -445,6 +476,13 @@ func TestRebuilt_CanonicalBriefUsesFrozenOrderedPrefix(t *testing.T) {
 			t.Fatalf("canonical item[%d]=%+v want=%+v",
 				i, item, insights[i])
 		}
+	}
+	if len(got.Items[0].EvidenceSources) != 1 ||
+		got.Items[0].EvidenceSources[0].Ref != "source-1" ||
+		got.Items[0].EvidenceSources[0].SourceURL !=
+			"https://evidence.example/item" {
+		t.Fatalf("canonical rebuilt evidence = %+v",
+			got.Items[0].EvidenceSources)
 	}
 	if got.Items[0].State.Preference !=
 		types.FeedbackActionInterested {

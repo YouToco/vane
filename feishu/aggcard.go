@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -26,6 +27,12 @@ const (
 	// （附录 A.2 实测定稿——域名与路径是判断来源的唯一依据必须完整；被省的 query 要么是
 	// 追踪垃圾要么是读不了的票据）。路径本身超长才走这个硬上限。
 	aggURLPathHardLimit = 100
+	// P2-C evidence is a compact prefix of the full Web projection. Both caps
+	// are deterministic so initial delivery and callback rebuild stay equal,
+	// while one adversarial-but-valid URL cannot consume the provider limit.
+	aggEvidenceMaxVisible       = 3
+	aggEvidenceMarkdownMaxBytes = 6 << 10
+	aggEvidenceLabelMaxRunes    = 120
 )
 
 // aggHeaderTemplates 任务名哈希取色的调色板。蓝在首位：兜底与单任务期的默认色。
@@ -147,9 +154,17 @@ func aggItemElements(
 		els = append(els, map[string]any{"tag": "markdown", "content": input.BodyMD})
 	}
 
-	// 原文链接：截断显示 + 完整 href。附录 A.3 硬约束——绝不能出现裸的截断 URL 文本
-	//（飞书会把它自动识别成无效链接），必须包在 markdown 链接语法里。
-	if u := strings.TrimSpace(input.URL); u != "" {
+	// P2-C uses the immutable ordered evidence inventory and does not duplicate
+	// the legacy single-source link. The full source set remains available at
+	// the canonical Web link appended to the card.
+	if len(input.EvidenceSources) > 0 {
+		els = append(els, map[string]any{
+			"tag": "markdown", "content": canonicalEvidenceMarkdownV1(
+				input.EvidenceSources),
+		})
+	} else if u := strings.TrimSpace(input.URL); u != "" {
+		// 原文链接：截断显示 + 完整 href。附录 A.3 硬约束——绝不能出现裸的截断 URL 文本
+		//（飞书会把它自动识别成无效链接），必须包在 markdown 链接语法里。
 		els = append(els, map[string]any{"tag": "markdown",
 			"content": fmt.Sprintf("<font color='grey'>原文链接：</font>[%s](%s)", DisplayURL(u), u)})
 	}
@@ -187,6 +202,104 @@ func aggItemElements(
 		els = append(els, aggReasonForm(idStr, effectID))
 	}
 	return els
+}
+
+func canonicalEvidenceMarkdownV1(
+	sources []feedback.CanonicalEvidenceSourceV1,
+) string {
+	const heading = "**证据与原文**\n"
+	if len(sources) == 0 {
+		return ""
+	}
+	var body strings.Builder
+	body.WriteString(heading)
+	visible := 0
+	for index, source := range sources {
+		if visible >= aggEvidenceMaxVisible {
+			break
+		}
+		if source.Ref != "source-"+strconv.Itoa(index+1) {
+			break
+		}
+		label := strings.TrimSpace(source.SourceTitle)
+		if label == "" {
+			label = strings.TrimSpace(source.Platform)
+		}
+		title := strings.TrimSpace(source.Title)
+		if label != "" && title != "" {
+			label += " · " + title
+		} else if title != "" {
+			label = title
+		}
+		if label == "" {
+			label = source.Ref
+		}
+		label = escapeEvidenceLabelV1(truncateRunesV1(
+			label, aggEvidenceLabelMaxRunes))
+		sourceURL, valid := canonicalEvidenceURLV1(source.SourceURL)
+		if !valid {
+			break
+		}
+		observedAt := source.DiscoveredAt
+		if source.PublishedAt != nil {
+			observedAt = source.PublishedAt.UTC()
+		}
+		if observedAt.IsZero() {
+			break
+		}
+		line := fmt.Sprintf(
+			"%d. [%s](%s) · %s\n",
+			index+1, label, sourceURL,
+			observedAt.UTC().Format("2006-01-02"),
+		)
+		if body.Len()+len(line) > aggEvidenceMarkdownMaxBytes {
+			break
+		}
+		body.WriteString(line)
+		visible++
+	}
+	if visible == 0 {
+		return heading + "<font color='grey'>多来源证据已冻结，请在 Web 查看</font>"
+	}
+	if remaining := len(sources) - visible; remaining > 0 {
+		suffix := fmt.Sprintf(
+			"<font color='grey'>另有 %d 个证据，请在 Web 查看</font>",
+			remaining,
+		)
+		if body.Len()+len(suffix) <= aggEvidenceMarkdownMaxBytes {
+			body.WriteString(suffix)
+		}
+	}
+	return strings.TrimSuffix(body.String(), "\n")
+}
+
+func canonicalEvidenceURLV1(raw string) (string, bool) {
+	if raw == "" || strings.TrimSpace(raw) != raw {
+		return "", false
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed == nil ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") ||
+		parsed.Host == "" || parsed.User != nil {
+		return "", false
+	}
+	return strings.NewReplacer(
+		"(", "%28", ")", "%29",
+	).Replace(raw), true
+}
+
+func escapeEvidenceLabelV1(value string) string {
+	return strings.NewReplacer(
+		"(", "（", ")", "）", "://", "：／／",
+	).Replace(escapeMarkdown(value))
+}
+
+func truncateRunesV1(value string, max int) string {
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max]) + "…"
 }
 
 // aggReasonForm 该条专属的误判原因 form。结构与单条卡 form 相同，仅 name 唯一化。

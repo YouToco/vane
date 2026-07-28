@@ -211,6 +211,31 @@ func TestBriefV1FreezesStructuredEventEvidence(t *testing.T) {
 	if err := tampered.Validate(); err == nil {
 		t.Fatal("event evidence order/ref mutation did not invalidate Brief")
 	}
+
+	unresolved, err := SealStructuredInsightEvidenceV1(
+		StructuredInsightV1{
+			SchemaVersion: StructuredInsightSchemaVersionV1,
+			BodyMD:        "正文", WhatChanged: "变化",
+			WhyItMatters: "原因", ImportanceReason: "依据",
+			Claims: []StructuredClaimV1{{
+				Text: "事实", Excerpt: "第三份原文",
+				SourceRefs: []string{"source-3"},
+			}},
+		},
+		map[string]string{"source-3": "第三份原文"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unresolvedEvidence := *brief.Insights[0].EventEvidence
+	unresolvedEvidence.EvidenceDigest = unresolved.EvidenceDigest
+	unresolvedDraft := draft
+	unresolvedDraft.Insights = append([]InsightV1(nil), draft.Insights...)
+	unresolvedDraft.Insights[0].Structured = &unresolved
+	unresolvedDraft.Insights[0].EventEvidence = &unresolvedEvidence
+	if _, err := unresolvedDraft.Seal(8); err == nil {
+		t.Fatal("claim reference absent from frozen event sources was accepted")
+	}
 }
 
 func TestGeneratedLegacyInsightJSONOmitsStructuredExtension(t *testing.T) {

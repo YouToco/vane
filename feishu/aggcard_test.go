@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/feedback"
 )
@@ -51,6 +52,91 @@ func TestAggregateCard_href逐字符保留(t *testing.T) {
 	// 卡内不得出现裸的截断 URL 文本（不在 [] 里的 `?…` 结尾串会被飞书识别成无效链接）。
 	if strings.Contains(joined, "：https://") {
 		t.Errorf("疑似出现裸 URL 文本（v3 原型点不动的真因）：%s", joined)
+	}
+}
+
+func TestAggregateCardEventEvidenceUsesSafeBoundedOrderedPrefix(t *testing.T) {
+	published := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	sources := []feedback.CanonicalEvidenceSourceV1{
+		{
+			Ref: "source-1", SourceTitle: "[伪链接](https://evil.example)",
+			Title: "first", SourceURL: "https://one.example/release",
+			PublishedAt: &published, DiscoveredAt: published,
+		},
+		{
+			Ref: "source-2", SourceTitle: "Second",
+			Title: "second", SourceURL: "https://two.example/a(b)",
+			DiscoveredAt: published.Add(time.Hour),
+		},
+		{
+			Ref: "source-3", SourceTitle: "Third",
+			Title: "third", SourceURL: "https://three.example/item",
+			DiscoveredAt: published.Add(2 * time.Hour),
+		},
+		{
+			Ref: "source-4", SourceTitle: "Fourth",
+			Title: "fourth", SourceURL: "https://four.example/item",
+			DiscoveredAt: published.Add(3 * time.Hour),
+		},
+	}
+	card := BuildAggregateCard(feedback.AggregateCardInput{
+		Items: []feedback.CardInput{{
+			DeliveryID: 1, Title: "event", BodyMD: "body",
+			URL:             "https://legacy.example/item",
+			EvidenceSources: sources,
+		}},
+		CanonicalBrief: &feedback.CanonicalBriefCardV1{
+			BatchID: 1, TotalItems: 1, VisibleItems: 1,
+			WebURL: "https://vane.example/#/tasks/task-1",
+		},
+	})
+	joined := strings.Join(markdownContents(t, card), "\n")
+	for _, want := range []string{
+		"**证据与原文**",
+		"1. [［伪链接］（https：／／evil.example） · first](https://one.example/release) · 2026-07-28",
+		"2. [Second · second](https://two.example/a%28b%29) · 2026-07-28",
+		"3. [Third · third](https://three.example/item) · 2026-07-28",
+		"另有 1 个证据，请在 Web 查看",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("evidence projection missing %q: %s", want, joined)
+		}
+	}
+	for _, forbidden := range []string{
+		"https://legacy.example/item",
+		"https://four.example/item",
+		"[伪链接](https://evil.example)",
+		"原文链接：",
+	} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("evidence projection leaked %q: %s", forbidden, joined)
+		}
+	}
+}
+
+func TestCanonicalEvidenceMarkdownOversizedOrInvalidFirstSourceFallsBack(
+	t *testing.T,
+) {
+	now := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	for _, source := range []feedback.CanonicalEvidenceSourceV1{
+		{
+			Ref: "source-1", Title: "oversized",
+			SourceURL: "https://example.com/" +
+				strings.Repeat("x", aggEvidenceMarkdownMaxBytes),
+			DiscoveredAt: now,
+		},
+		{
+			Ref: "source-1", Title: "unsafe",
+			SourceURL: "javascript:alert(1)", DiscoveredAt: now,
+		},
+	} {
+		got := canonicalEvidenceMarkdownV1(
+			[]feedback.CanonicalEvidenceSourceV1{source})
+		if !strings.Contains(got, "多来源证据已冻结，请在 Web 查看") ||
+			len(got) > aggEvidenceMarkdownMaxBytes ||
+			strings.Contains(got, source.SourceURL) {
+			t.Fatalf("fallback evidence markdown = %q", got)
+		}
 	}
 }
 

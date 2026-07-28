@@ -38,3 +38,16 @@ func CanonicalInsightBodyMDV1(insight types.InsightV1) string {
 	body.WriteString(structured.ImportanceReason)
 	return body.String()
 }
+
+// CanonicalInsightEvidenceSourcesV1 exposes only the ordered inventory-owned
+// source presentation already sealed in the Brief. Invalid optional evidence
+// fails closed to the legacy single-source card/API presentation.
+func CanonicalInsightEvidenceSourcesV1(
+	insight types.InsightV1,
+) []CanonicalEvidenceSourceV1 {
+	sources, err := types.ProjectInsightEvidenceSourcesV1(insight)
+	if err != nil {
+		return nil
+	}
+	return sources
+}

@@ -1,7 +1,10 @@
 package feedback
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/types"
 )
@@ -62,5 +65,81 @@ func TestCanonicalInsightBodyMDV1Fallbacks(t *testing.T) {
 				t.Fatalf("fallback projection = %q", got)
 			}
 		})
+	}
+}
+
+func TestCanonicalInsightEvidenceSourcesV1(t *testing.T) {
+	structured, err := types.SealStructuredInsightEvidenceV1(
+		types.StructuredInsightV1{
+			SchemaVersion:    types.StructuredInsightSchemaVersionV1,
+			BodyMD:           "body",
+			WhatChanged:      "change",
+			WhyItMatters:     "relevance",
+			ImportanceReason: "reason",
+			Claims: []types.StructuredClaimV1{{
+				Text: "claim", Excerpt: "shared excerpt",
+				SourceRefs: []string{"source-2", "source-1"},
+			}},
+		},
+		map[string]string{
+			"source-1": "first shared excerpt",
+			"source-2": "second shared excerpt",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := types.SealObservedEventProvenanceV1(
+		5, strings.Repeat("a", 64), strings.Repeat("b", 64),
+		"release", "subject", time.Date(
+			2026, 7, 28, 12, 0, 0, 0, time.UTC),
+		json.RawMessage(`{"evidence_content_ids":[1,2]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	insight := types.InsightV1{
+		Structured: &structured,
+		EventEvidence: &types.StructuredEventEvidenceV1{
+			SchemaVersion:  types.StructuredEventEvidenceSchemaVersionV1,
+			Provenance:     provenance,
+			EvidenceDigest: structured.EvidenceDigest,
+			Sources: []types.StructuredEvidenceSourceV1{
+				{
+					Ref: "source-1", Title: "first",
+					SourceTitle: "one", Platform: "web",
+					SourceURL:   "https://example.com/first",
+					PublishedAt: &published, DiscoveredAt: published,
+				},
+				{
+					Ref: "source-2", Title: "second",
+					SourceTitle: "two", Platform: "rss",
+					SourceURL:    "https://example.com/second",
+					DiscoveredAt: published.Add(time.Hour),
+				},
+			},
+		},
+	}
+	sources := CanonicalInsightEvidenceSourcesV1(insight)
+	if len(sources) != 2 ||
+		sources[0].Ref != "source-1" ||
+		sources[1].Ref != "source-2" ||
+		sources[0].PublishedAt == nil ||
+		!sources[0].PublishedAt.Equal(published) {
+		t.Fatalf("canonical evidence sources = %+v", sources)
+	}
+
+	unresolved := structured
+	unresolved.Claims = append(
+		[]types.StructuredClaimV1(nil), structured.Claims...)
+	unresolved.Claims[0].SourceRefs = []string{"source-3"}
+	insight.Structured = &unresolved
+	if sources := CanonicalInsightEvidenceSourcesV1(insight); sources != nil {
+		t.Fatalf("unresolved evidence sources = %+v", sources)
+	}
+	if sources := CanonicalInsightEvidenceSourcesV1(
+		types.InsightV1{}); sources != nil {
+		t.Fatalf("legacy evidence sources = %+v", sources)
 	}
 }

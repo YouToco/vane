@@ -589,6 +589,8 @@ func (s *Service) rebuildAggregate(ctx context.Context, clicked *types.Delivery,
 				SourceTitle:  insight.SourceTitle,
 				PublishedAt:  insight.PublishedAt,
 				DiscoveredAt: insight.DiscoveredAt,
+				EvidenceSources: CanonicalInsightEvidenceSourcesV1(
+					insight),
 			}
 		}
 		cardJSON := s.deps.BuildAggCard(AggregateCardInput{

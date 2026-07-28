@@ -251,11 +251,14 @@ link. Link labels are treated as untrusted text and URLs must remain canonical
 HTTP(S). Provider byte-limit chunking continues to run on the final rendered
 card; evidence cannot bypass the existing hard limit.
 
-The visible Feishu evidence list must be an exact ordered projection of the
-same source objects returned by the Web API. The channels may differ in density
-but not source identity, order, title, URL or timestamps. Feedback rebuilds
-must preserve that list from the immutable Brief rather than current source or
-content tables.
+The visible Feishu evidence list is a deterministic ordered prefix of the same
+source objects returned by the Web API: at most three sources and at most 6 KiB
+of evidence Markdown per Insight. It shows an explicit Web fallback/count when
+the complete ordered set does not fit. The channels may differ in density but
+not source identity, order, title, URL or displayed timestamp derivation.
+Feedback rebuilds must preserve that prefix from the immutable Brief rather
+than current source or content tables. A single oversized first source degrades
+to the Web fallback instead of bypassing the provider hard limit.
 
 ### Required proof
 

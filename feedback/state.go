@@ -73,7 +73,12 @@ type CardInput struct {
 	// DiscoveredAt is the immutable Brief observation time. Legacy cards leave
 	// it zero; the canonical renderer uses it only when PublishedAt is absent.
 	DiscoveredAt time.Time
+	// EvidenceSources is the ordered public subset of an immutable P2-C event
+	// evidence extension. It never contains database IDs, digests or bodies.
+	EvidenceSources []CanonicalEvidenceSourceV1
 }
+
+type CanonicalEvidenceSourceV1 = types.EvidenceSourceProjectionV1
 
 // CanonicalBriefCardV1 is transport metadata for a Feishu prefix projection.
 // Content stays in BriefV1; this only preserves the exact batch identity,
