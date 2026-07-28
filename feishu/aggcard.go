@@ -16,8 +16,10 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/YouToco/vane/feedback"
+	"github.com/YouToco/vane/promptguard"
 )
 
 const (
@@ -40,6 +42,8 @@ var aggHeaderTemplates = []string{"blue", "wathet", "turquoise", "green", "orang
 
 // aggTaskEmojis 任务名哈希取 emoji 的候选集（人工挑选，避免任意 emoji 观感随机）。
 var aggTaskEmojis = []string{"🔮", "📮", "🗞️", "📡", "🧭", "🛰️"}
+
+var beijingEvidenceLocationV1 = time.FixedZone("Asia/Shanghai", 8*60*60)
 
 // AggHeaderForTask 由任务名派生聚合卡 header（Push 首发路径用）。
 // 任务名为空返回兜底标题与默认色。同名恒同色同 emoji（fnv 哈希，确定性）。
@@ -250,7 +254,7 @@ func canonicalEvidenceMarkdownV1(
 		line := fmt.Sprintf(
 			"%d. [%s](%s) · %s\n",
 			index+1, label, sourceURL,
-			observedAt.UTC().Format("2006-01-02"),
+			observedAt.In(beijingEvidenceLocationV1).Format("2006-01-02"),
 		)
 		remainingAfter := len(sources) - (visible + 1)
 		suffix := evidenceOmittedSuffixV1(remainingAfter)
@@ -290,14 +294,18 @@ func canonicalEvidenceURLV1(raw string) (string, bool) {
 		parsed.Host == "" || parsed.User != nil {
 		return "", false
 	}
+	markdownSafe := parsed.String()
 	return strings.NewReplacer(
 		"(", "%28", ")", "%29",
-	).Replace(raw), true
+	).Replace(markdownSafe), true
 }
 
 func escapeEvidenceLabelV1(value string) string {
+	value = promptguard.SingleLine(promptguard.StripInvisible(value))
 	return strings.NewReplacer(
 		"(", "（", ")", "）", "://", "：／／",
+		"*", "＊", "_", "＿", "`", "｀", "~", "～",
+		"\\", "＼",
 	).Replace(escapeMarkdown(value))
 }
 

@@ -259,6 +259,10 @@ not source identity, order, title, URL or displayed timestamp derivation.
 Feedback rebuilds must preserve that prefix from the immutable Brief rather
 than current source or content tables. A single oversized first source degrades
 to the Web fallback instead of bypassing the provider hard limit.
+Web shows the frozen publication and discovery timestamps in Beijing time.
+Feishu uses the same Beijing calendar and shows the publication date when
+present, otherwise the discovery date; this is a density difference, not a
+timezone or source-time reinterpretation.
 
 ### Required proof
 

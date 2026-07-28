@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/feedback"
+	"github.com/YouToco/vane/types"
 )
 
 // xhsTokenURL 带 xsec_token 访问票据的真实形状小红书 URL。规格 A.3 硬约束：
@@ -162,6 +163,52 @@ func TestCanonicalEvidenceMarkdownAlwaysReservesOmissionNotice(t *testing.T) {
 		(!strings.Contains(got, "另有") &&
 			!strings.Contains(got, "多来源证据已冻结")) {
 		t.Fatalf("bounded evidence omitted its Web fallback: %q", got)
+	}
+}
+
+func TestCanonicalEvidenceMarkdownNormalizesValidatedURLAndUntrustedLabel(
+	t *testing.T,
+) {
+	published := time.Date(
+		2026, 7, 27, 23, 30, 0, 0, time.UTC)
+	source := types.StructuredEvidenceSourceV1{
+		Ref:         "source-1",
+		Title:       "safe\u202eelpmaxe.live `code` ~~strike~~",
+		SourceTitle: "Vendor",
+		Platform:    "web",
+		SourceURL: "https://trusted.example/path with space" +
+			"?ticket=SECRET",
+		PublishedAt:  &published,
+		DiscoveredAt: published,
+	}
+	if err := source.Validate(); err != nil {
+		t.Fatalf("fixture must cross the valid Brief boundary: %v", err)
+	}
+	got := canonicalEvidenceMarkdownV1(
+		[]feedback.CanonicalEvidenceSourceV1{{
+			Ref: source.Ref, Title: source.Title,
+			SourceTitle: source.SourceTitle, Platform: source.Platform,
+			SourceURL: source.SourceURL, PublishedAt: source.PublishedAt,
+			DiscoveredAt: source.DiscoveredAt,
+		}},
+	)
+	for _, want := range []string{
+		"https://trusted.example/path%20with%20space?ticket=SECRET",
+		"2026-07-28",
+		"｀code｀", "～～strike～～",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("safe evidence projection missing %q: %q", want, got)
+		}
+	}
+	for _, forbidden := range []string{
+		"\u202e", "path with space", "`code`", "~~strike~~",
+		"2026-07-27",
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("unsafe evidence projection kept %q: %q",
+				forbidden, got)
+		}
 	}
 }
 
