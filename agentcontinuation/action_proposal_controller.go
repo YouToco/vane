@@ -10,7 +10,19 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-const DurableActionToolName = "enable_source"
+const (
+	DurableActionToolName             = "enable_source"
+	DurableActionRemoveSourceToolName = "remove_source"
+)
+
+func IsDurableActionToolName(name string) bool {
+	switch name {
+	case DurableActionToolName, DurableActionRemoveSourceToolName:
+		return true
+	default:
+		return false
+	}
+}
 
 const (
 	actionProposalConvergenceTimeout = 5 * time.Second
@@ -66,7 +78,7 @@ func (c *ActionProposalController) Propose(
 			"agentcontinuation: action proposal Store is required")
 	}
 	if in.ActionID == "" || in.UserID <= 0 || in.SessionID <= 0 ||
-		in.ToolName != DurableActionToolName ||
+		!IsDurableActionToolName(in.ToolName) ||
 		strings.TrimSpace(in.Summary) == "" ||
 		in.ExpiresAt.IsZero() {
 		return ActionProposal{}, errors.New(

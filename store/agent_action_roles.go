@@ -22,6 +22,7 @@ func validateAgentActionProposer(ctx context.Context, tx pgx.Tx) error {
 		agentActionProposerSelectColumns(),
 		agentActionProposerInsertColumns(),
 		nil,
+		nil,
 		[]string{
 			"agent_action_continuation_authority_events_id_seq:USAGE",
 		},
@@ -64,6 +65,7 @@ func validateAgentActionOperator(ctx context.Context, tx pgx.Tx) error {
 		agentActionOperatorSelectColumns(),
 		agentActionOperatorInsertColumns(),
 		agentActionOperatorUpdateColumns(),
+		nil,
 		[]string{
 			"agent_action_continuation_authority_events_id_seq:USAGE",
 		},
@@ -76,6 +78,7 @@ func validateAgentActionContinuator(ctx context.Context, tx pgx.Tx) error {
 		agentActionContinuatorSelectColumns(),
 		agentActionContinuatorInsertColumns(),
 		agentActionContinuatorUpdateColumns(),
+		[]string{"subscriptions"},
 		[]string{"agent_events_id_seq:USAGE"},
 	)
 }
@@ -84,7 +87,8 @@ func validateAgentActionRole(
 	ctx context.Context,
 	tx pgx.Tx,
 	roleName string,
-	expectedSelect, expectedInsert, expectedUpdate, expectedSequences []string,
+	expectedSelect, expectedInsert, expectedUpdate, expectedDelete,
+	expectedSequences []string,
 ) error {
 	var boundaryValid bool
 	err := tx.QueryRow(ctx, `
@@ -141,7 +145,7 @@ func validateAgentActionRole(
 		              c.relowner=r.oid OR
 		              has_table_privilege(
 		                r.oid,c.oid,
-		                'DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN'
+		                'TRUNCATE,REFERENCES,TRIGGER,MAINTAIN'
 		              )
 		            )
 		       ) AND
@@ -176,6 +180,15 @@ func validateAgentActionRole(
 			))
 		}
 	}
+	deleteTables, err := agentActionRoleTablePrivileges(
+		ctx, tx, roleName, "DELETE",
+	)
+	if err != nil || !slices.Equal(deleteTables, expectedDelete) {
+		return agentActionRoleDrift(roleName, fmt.Sprintf(
+			"DELETE actual=%v expected=%v err=%v",
+			deleteTables, expectedDelete, err,
+		))
+	}
 	sequences, err := agentActionRoleSequencePrivileges(
 		ctx, tx, roleName,
 	)
@@ -186,6 +199,37 @@ func validateAgentActionRole(
 		))
 	}
 	return nil
+}
+
+func agentActionRoleTablePrivileges(
+	ctx context.Context,
+	tx pgx.Tx,
+	roleName string,
+	privilege string,
+) ([]string, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT c.relname
+		  FROM pg_class c
+		  JOIN pg_namespace n ON n.oid=c.relnamespace
+		 WHERE n.nspname='public'
+		   AND c.relkind IN ('r','p','v','m','f')
+		   AND has_table_privilege($1::name,c.oid,$2)
+		 ORDER BY c.relname`,
+		roleName, privilege,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	values := make([]string, 0)
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
 }
 
 func agentActionRoleDrift(roleName, detail string) error {
@@ -365,7 +409,6 @@ func agentActionProposerSelectColumns() []string {
 		withoutColumns(
 			agentActionContinuationSelectColumns(),
 			"agent_action_continuations.created_at",
-			"agent_action_continuations.tool_name",
 			"agent_action_continuations.updated_at",
 		),
 		prefixedColumns(

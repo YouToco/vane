@@ -2297,12 +2297,12 @@ func (s *Store) ProjectAgentActionContinuation() {
 	var action actionState
 	_, replayed, err := commitAgentSessionAppendTx(
 		ctx, tx, action.TenantID, action.UserID, action.SessionID,
-		"agent-action:enable-source:"+action.ActionID,
+		agentActionOperationIdentity(action),
 		json.RawMessage(messages), true,
 	)
 	_, _, appendErr := commitAgentSessionAppendTx(
 		ctx, effectTx, action.TenantID, action.UserID, action.SessionID,
-		"agent-action:enable-source:"+action.ActionID,
+		agentActionOperationIdentity(action),
 		json.RawMessage(messages), false,
 	)
 	_, _, _, _ = replayed, err, appendErr, effectTx
@@ -2316,7 +2316,7 @@ func commitAgentActionTerminalSessionTx(
 	var messages any
 	_, replayed, err := commitAgentSessionAppendTx(
 		ctx, tx, action.TenantID, action.UserID, action.SessionID,
-		"agent-action:enable-source:"+action.ActionID,
+		agentActionOperationIdentity(action),
 		json.RawMessage(messages), replayOnly,
 	)
 	_, _ = replayed, err
@@ -2345,7 +2345,7 @@ func stageAgentActionBlockedSessionTx() {
 			"ctx, tx, action.TenantID", 1,
 		),
 		"identity drift": strings.Replace(
-			valid, `"agent-action:enable-source:"+action.ActionID`,
+			valid, `agentActionOperationIdentity(action)`,
 			`"agent-action:"+action.ActionID`, 1,
 		),
 		"wrong frozen session": strings.Replace(
@@ -3491,14 +3491,11 @@ func agentEventLedgerActionAppendScope(args []ast.Expr) bool {
 		!agentEventLedgerSelector(args[4], "action", "SessionID") {
 		return false
 	}
-	identity, ok := args[5].(*ast.BinaryExpr)
-	if !ok || identity.Op != token.ADD ||
-		!agentEventLedgerString(
-			identity.X, "agent-action:enable-source:",
-		) ||
-		!agentEventLedgerSelector(
-			identity.Y, "action", "ActionID",
-		) {
+	identity, ok := args[5].(*ast.CallExpr)
+	if !ok || len(identity.Args) != 1 ||
+		agentEventLedgerIdent(identity.Fun) !=
+			"agentActionOperationIdentity" ||
+		agentEventLedgerIdent(identity.Args[0]) != "action" {
 		return false
 	}
 	messages, ok := args[6].(*ast.CallExpr)

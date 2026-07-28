@@ -13,6 +13,7 @@ import (
 )
 
 const (
+	// Retained names keep the B1/B2 enable_source assertions readable.
 	agentActionCancelledSessionMessages = `[{"role":"user","content":"[卡片回调] 用户已取消重新启用信源；未产生变更。"}]`
 	agentActionExpiredSessionMessages   = `[{"role":"user","content":"[卡片回调] 重新启用信源确认卡已过期；未产生变更。"}]`
 	agentActionBlockedSessionMessages   = `[{"role":"user","content":"[卡片回调] 重新启用信源操作已因安全检查停止；未产生额外变更。"}]`
@@ -286,7 +287,9 @@ func (a AgentActionContinuation) Lease() (
 	error,
 ) {
 	if a.ActionID == "" || a.TenantID <= 0 || a.UserID <= 0 ||
-		a.SessionID <= 0 || a.SourceID <= 0 || a.LeaseOwner == nil ||
+		a.SessionID <= 0 || !isDurableAgentActionToolName(a.ToolName) ||
+		a.SourceID <= 0 || len(a.SourceIDs) == 0 ||
+		a.SourceIDs[0] != a.SourceID || a.LeaseOwner == nil ||
 		a.LeaseFence <= 0 {
 		return AgentActionContinuationLease{},
 			agentEventValidationError(
@@ -295,8 +298,10 @@ func (a AgentActionContinuation) Lease() (
 	return AgentActionContinuationLease{
 		ActionID: a.ActionID, TenantID: a.TenantID,
 		UserID: a.UserID, SessionID: a.SessionID,
-		SourceID: a.SourceID, Owner: *a.LeaseOwner,
-		Fence: a.LeaseFence,
+		ToolName: a.ToolName, SourceID: a.SourceID,
+		SourceIDs: append([]int64(nil), a.SourceIDs...),
+		Owner:     *a.LeaseOwner,
+		Fence:     a.LeaseFence,
 	}, nil
 }
 
@@ -434,7 +439,9 @@ func (s *Store) ProjectAgentActionContinuation(
 		return err
 	}
 	if action.SessionID != lease.SessionID ||
-		action.SourceID != lease.SourceID {
+		action.ToolName != lease.ToolName ||
+		action.SourceID != lease.SourceID ||
+		!equalAgentActionSourceIDs(action.SourceIDs, lease.SourceIDs) {
 		return agentEventIntegrityError()
 	}
 	if action.Status == AgentActionStatusCompleted {
@@ -444,7 +451,7 @@ func (s *Store) ProjectAgentActionContinuation(
 		}
 		_, replayed, err := commitAgentSessionAppendTx(
 			ctx, tx, action.TenantID, action.UserID, action.SessionID,
-			"agent-action:enable-source:"+action.ActionID,
+			agentActionOperationIdentity(action),
 			json.RawMessage(messages), true,
 		)
 		if err != nil {
@@ -480,41 +487,15 @@ func (s *Store) ProjectAgentActionContinuation(
 		return agentEventDatabaseError(
 			"begin Agent action effect savepoint", err)
 	}
-	tag, effectErr := effectTx.Exec(ctx,
-		`UPDATE sources
-		    SET status=$4,fail_count=0,next_fetch_at=clock_timestamp(),
-		        updated_at=clock_timestamp()
-		  WHERE id=$1
-		    AND (
-		      EXISTS (
-		        SELECT 1 FROM subscriptions
-		         WHERE tenant_id=$3 AND source_id=$1
-		           AND user_id=$2 AND status=$5
-		      )
-		      OR EXISTS (
-		        SELECT 1 FROM schedule_sources ss
-		        JOIN schedules sc ON sc.id=ss.schedule_id
-		         WHERE ss.source_id=$1 AND sc.tenant_id=$3
-		           AND sc.user_id=$2
-		      )
-		    )`,
-		action.SourceID, action.UserID, action.TenantID,
-		types.SourceStatusActive, types.SubscriptionStatusActive,
-	)
+	terminalCode, messages, effectErr :=
+		applyAgentActionEffect(ctx, effectTx, action)
 	if effectErr != nil {
 		_ = effectTx.Rollback(context.WithoutCancel(ctx))
-		return agentEventDatabaseError(
-			"apply enable_source durable effect", effectErr)
-	}
-	terminalCode := agentActionTerminalNotFound
-	messages := action.NotFoundMessages
-	if tag.RowsAffected() == 1 {
-		terminalCode = agentActionTerminalEnabled
-		messages = action.SuccessMessages
+		return effectErr
 	}
 	_, _, appendErr := commitAgentSessionAppendTx(
 		ctx, effectTx, action.TenantID, action.UserID, action.SessionID,
-		"agent-action:enable-source:"+action.ActionID,
+		agentActionOperationIdentity(action),
 		json.RawMessage(messages), false,
 	)
 	if appendErr != nil {
@@ -589,6 +570,76 @@ func (s *Store) ProjectAgentActionContinuation(
 			"commit Agent action projection", err)
 	}
 	return nil
+}
+
+func applyAgentActionEffect(
+	ctx context.Context,
+	tx pgx.Tx,
+	action AgentActionContinuation,
+) (string, []byte, error) {
+	switch action.ToolName {
+	case agentActionEnableSourceToolName:
+		tag, err := tx.Exec(ctx,
+			`UPDATE sources
+			    SET status=$4,fail_count=0,next_fetch_at=clock_timestamp(),
+			        updated_at=clock_timestamp()
+			  WHERE id=$1
+			    AND (
+			      EXISTS (
+			        SELECT 1 FROM subscriptions
+			         WHERE tenant_id=$3 AND source_id=$1
+			           AND user_id=$2 AND status=$5
+			      )
+			      OR EXISTS (
+			        SELECT 1 FROM schedule_sources ss
+			        JOIN schedules sc ON sc.id=ss.schedule_id
+			         WHERE ss.source_id=$1 AND sc.tenant_id=$3
+			           AND sc.user_id=$2
+			      )
+			    )`,
+			action.SourceID, action.UserID, action.TenantID,
+			types.SourceStatusActive, types.SubscriptionStatusActive,
+		)
+		if err != nil {
+			return "", nil, agentEventDatabaseError(
+				"apply enable_source durable effect", err)
+		}
+		if tag.RowsAffected() == 1 {
+			return agentActionTerminalEnabled, action.SuccessMessages, nil
+		}
+		return agentActionTerminalNotFound, action.NotFoundMessages, nil
+	case agentActionRemoveSourceToolName:
+		tag, err := tx.Exec(ctx,
+			`DELETE FROM subscriptions
+			  WHERE tenant_id=$1 AND user_id=$2
+			    AND source_id=ANY($3::bigint[])`,
+			action.TenantID, action.UserID, action.SourceIDs,
+		)
+		if err != nil {
+			return "", nil, agentEventDatabaseError(
+				"apply remove_source durable effect", err)
+		}
+		if tag.RowsAffected() > 0 {
+			return agentActionTerminalRemoved, action.SuccessMessages, nil
+		}
+		return agentActionTerminalNotSubscribed,
+			action.NotFoundMessages, nil
+	default:
+		return "", nil, agentEventIntegrityError()
+	}
+}
+
+func agentActionOperationIdentity(action AgentActionContinuation) string {
+	switch action.ToolName {
+	case agentActionEnableSourceToolName:
+		// Retain the exact B1/B2 identity bytes so deployed terminal facts
+		// continue to replay instead of conflicting after the B3 binary.
+		return "agent-action:enable-source:" + action.ActionID
+	case agentActionRemoveSourceToolName:
+		return "agent-action:remove-source:" + action.ActionID
+	default:
+		return "agent-action:unsupported:" + action.ActionID
+	}
 }
 
 func (s *Store) ReleaseAgentActionContinuation(
@@ -725,7 +776,10 @@ func validateAgentActionLease(
 ) error {
 	if lease.ActionID == "" || lease.TenantID <= 0 ||
 		lease.UserID <= 0 || lease.SessionID <= 0 ||
-		lease.SourceID <= 0 || lease.Owner == "" || lease.Fence <= 0 {
+		!isDurableAgentActionToolName(lease.ToolName) ||
+		lease.SourceID <= 0 || len(lease.SourceIDs) == 0 ||
+		lease.SourceIDs[0] != lease.SourceID ||
+		lease.Owner == "" || lease.Fence <= 0 {
 		return agentEventValidationError(
 			"Agent action lease is invalid")
 	}
@@ -737,20 +791,26 @@ func validateFrozenAgentAction(
 ) error {
 	if action.ActionID == "" || action.TenantID <= 0 ||
 		action.UserID <= 0 || action.SessionID <= 0 ||
-		action.SourceID <= 0 ||
+		!isDurableAgentActionToolName(action.ToolName) ||
+		action.SourceID <= 0 || len(action.SourceIDs) == 0 ||
+		action.SourceIDs[0] != action.SourceID ||
 		action.ToolSpecVersion != agentActionToolSpecVersion ||
-		action.ToolPolicyVersion != agentActionToolPolicyVersion ||
-		action.AdapterVersion != agentActionAdapterVersion {
+		action.ToolPolicyVersion != agentActionToolPolicyVersion {
 		return agentEventIntegrityError()
 	}
-	sourceID, canonicalArgs, err := canonicalEnableSourceArgs(
-		action.CanonicalArgs,
+	adapterVersion, err := agentActionAdapterForTool(action.ToolName)
+	if err != nil || action.AdapterVersion != adapterVersion {
+		return agentEventIntegrityError()
+	}
+	sourceIDs, canonicalArgs, err := canonicalAgentActionArgs(
+		action.ToolName, action.CanonicalArgs,
 	)
-	if err != nil || sourceID != action.SourceID ||
+	if err != nil || sourceIDs[0] != action.SourceID ||
+		!equalAgentActionSourceIDs(sourceIDs, action.SourceIDs) ||
 		string(canonicalArgs) != string(action.CanonicalArgs) {
 		return agentEventIntegrityError()
 	}
-	frozen, err := freezeEnableSourceAction(action.SourceID)
+	frozen, err := freezeAgentAction(action.ToolName, action.SourceIDs)
 	if err != nil {
 		return agentEventIntegrityError()
 	}
@@ -782,10 +842,18 @@ func terminalAgentActionMessages(
 	if action.TerminalCode == nil {
 		return nil, agentEventIntegrityError()
 	}
-	switch *action.TerminalCode {
-	case agentActionTerminalEnabled:
+	switch {
+	case action.ToolName == agentActionEnableSourceToolName &&
+		*action.TerminalCode == agentActionTerminalEnabled:
 		return action.SuccessMessages, nil
-	case agentActionTerminalNotFound:
+	case action.ToolName == agentActionEnableSourceToolName &&
+		*action.TerminalCode == agentActionTerminalNotFound:
+		return action.NotFoundMessages, nil
+	case action.ToolName == agentActionRemoveSourceToolName &&
+		*action.TerminalCode == agentActionTerminalRemoved:
+		return action.SuccessMessages, nil
+	case action.ToolName == agentActionRemoveSourceToolName &&
+		*action.TerminalCode == agentActionTerminalNotSubscribed:
 		return action.NotFoundMessages, nil
 	default:
 		return nil, agentEventIntegrityError()
@@ -808,17 +876,23 @@ func commitAgentActionTerminalSessionTx(
 			return err
 		}
 	case AgentActionStatusCancelled:
-		messages = []byte(agentActionCancelledSessionMessages)
+		messages = agentActionDecisionSessionMessages(
+			action.ToolName, AgentActionStatusCancelled,
+		)
 	case AgentActionStatusExpired:
-		messages = []byte(agentActionExpiredSessionMessages)
+		messages = agentActionDecisionSessionMessages(
+			action.ToolName, AgentActionStatusExpired,
+		)
 	case AgentActionStatusBlocked:
-		messages = []byte(agentActionBlockedSessionMessages)
+		messages = agentActionDecisionSessionMessages(
+			action.ToolName, AgentActionStatusBlocked,
+		)
 	default:
 		return agentEventIntegrityError()
 	}
 	_, replayed, err := commitAgentSessionAppendTx(
 		ctx, tx, action.TenantID, action.UserID, action.SessionID,
-		"agent-action:enable-source:"+action.ActionID,
+		agentActionOperationIdentity(action),
 		json.RawMessage(messages), replayOnly,
 	)
 	if err != nil {
@@ -828,6 +902,47 @@ func commitAgentActionTerminalSessionTx(
 		return agentEventIntegrityError()
 	}
 	return nil
+}
+
+func agentActionDecisionSessionMessages(
+	toolName string,
+	status string,
+) []byte {
+	var actionText string
+	switch toolName {
+	case agentActionEnableSourceToolName:
+		actionText = "重新启用信源"
+	case agentActionRemoveSourceToolName:
+		actionText = "取消订阅信源"
+	default:
+		return nil
+	}
+	var content string
+	switch status {
+	case AgentActionStatusCancelled:
+		content = fmt.Sprintf(
+			"[卡片回调] 用户已取消%s；未产生变更。", actionText,
+		)
+	case AgentActionStatusExpired:
+		content = fmt.Sprintf(
+			"[卡片回调] %s确认卡已过期；未产生变更。", actionText,
+		)
+	case AgentActionStatusBlocked:
+		content = fmt.Sprintf(
+			"[卡片回调] %s操作已因安全检查停止；未产生额外变更。",
+			actionText,
+		)
+	default:
+		return nil
+	}
+	messages, err := json.Marshal([]struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}{{Role: "user", Content: content}})
+	if err != nil {
+		return nil
+	}
+	return messages
 }
 
 func stageAgentActionBlockedSessionTx(

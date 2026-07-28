@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,16 +31,24 @@ const (
 	AgentActionAuthorityDurable = "durable"
 	AgentActionAuthorityLegacy  = "legacy"
 
-	agentActionToolName          = "enable_source"
-	agentActionToolSpecVersion   = "vane.agent-tool-spec/v1"
-	agentActionToolPolicyVersion = "vane.agent-tool-policy/v1"
-	agentActionAdapterVersion    = "vane.enable-source/postgres/v1"
-	agentActionTerminalEnabled   = "enabled"
-	agentActionTerminalNotFound  = "not_found"
-	agentActionAdmissionClass    = 1447120453
-	agentActionAdmissionKey      = 1095976528
-	maxAgentActionLease          = 24 * time.Hour
-	maxAgentActionPage           = 1000
+	agentActionEnableSourceToolName       = "enable_source"
+	agentActionRemoveSourceToolName       = "remove_source"
+	agentActionToolSpecVersion            = "vane.agent-tool-spec/v1"
+	agentActionToolPolicyVersion          = "vane.agent-tool-policy/v1"
+	agentActionEnableSourceAdapterVersion = "vane.enable-source/postgres/v1"
+	agentActionRemoveSourceAdapterVersion = "vane.remove-source/postgres/v1"
+	// Retained aliases keep the B1/B2 enable_source fixtures explicit while
+	// the production path dispatches by ToolName.
+	agentActionToolName              = agentActionEnableSourceToolName
+	agentActionAdapterVersion        = agentActionEnableSourceAdapterVersion
+	agentActionTerminalEnabled       = "enabled"
+	agentActionTerminalNotFound      = "not_found"
+	agentActionTerminalRemoved       = "removed"
+	agentActionTerminalNotSubscribed = "not_subscribed"
+	agentActionAdmissionClass        = 1447120453
+	agentActionAdmissionKey          = 1095976528
+	maxAgentActionLease              = 24 * time.Hour
+	maxAgentActionPage               = 1000
 )
 
 var (
@@ -53,7 +62,9 @@ type AgentActionContinuation struct {
 	TenantID          int64
 	UserID            int64
 	SessionID         int64
+	ToolName          string
 	SourceID          int64
+	SourceIDs         []int64
 	CanonicalArgs     []byte
 	ArgsDigest        string
 	ToolSpecVersion   string
@@ -84,7 +95,9 @@ type AgentActionContinuationLease struct {
 	TenantID  int64
 	UserID    int64
 	SessionID int64
+	ToolName  string
 	SourceID  int64
+	SourceIDs []int64
 	Owner     string
 	Fence     int64
 }
@@ -105,7 +118,9 @@ type AgentActionContinuationStatus struct {
 	UserID             int64      `json:"user_id"`
 	ActionID           string     `json:"action_id"`
 	SessionID          int64      `json:"session_id"`
+	ToolName           string     `json:"tool_name"`
 	SourceID           int64      `json:"source_id"`
+	SourceIDs          []int64    `json:"source_ids"`
 	ExecutionVersion   int        `json:"execution_version"`
 	Route              string     `json:"route"`
 	Generation         int64      `json:"generation"`
@@ -124,7 +139,7 @@ type AgentActionContinuationStatus struct {
 }
 
 const agentActionContinuationColumns = `action_id,tenant_id,user_id,
-	session_id,source_id,canonical_args,args_digest,tool_spec_version,
+	session_id,tool_name,source_id,canonical_args,args_digest,tool_spec_version,
 	tool_spec,tool_spec_digest,tool_policy_version,tool_policy,
 	tool_policy_digest,adapter_version,success_messages,success_digest,
 	not_found_messages,not_found_digest,status,terminal_code,lease_owner,
@@ -141,7 +156,8 @@ func scanAgentActionContinuation(
 	var action AgentActionContinuation
 	err := row.Scan(
 		&action.ActionID, &action.TenantID, &action.UserID,
-		&action.SessionID, &action.SourceID, &action.CanonicalArgs,
+		&action.SessionID, &action.ToolName, &action.SourceID,
+		&action.CanonicalArgs,
 		&action.ArgsDigest, &action.ToolSpecVersion, &action.ToolSpec,
 		&action.ToolSpecDigest, &action.ToolPolicyVersion,
 		&action.ToolPolicy, &action.ToolPolicyDigest,
@@ -152,6 +168,14 @@ func scanAgentActionContinuation(
 		&action.AttemptCount, &action.NextAttemptAt, &action.ConfirmedAt,
 		&action.CompletedAt, &action.BlockedReason,
 	)
+	if err == nil {
+		sourceIDs, _, parseErr := canonicalAgentActionArgs(
+			action.ToolName, action.CanonicalArgs,
+		)
+		if parseErr == nil {
+			action.SourceIDs = sourceIDs
+		}
+	}
 	return action, err
 }
 
@@ -213,17 +237,19 @@ func (s *Store) GetAgentActionContinuationStatus(
 			agentEventDatabaseError(
 				"read Agent action status root", err)
 	}
-	if rootSessionID == nil || *rootSessionID <= 0 ||
-		rootToolName != agentActionToolName {
+	if rootSessionID == nil || *rootSessionID <= 0 {
 		return AgentActionContinuationStatus{}, agentEventIntegrityError()
 	}
-	sourceID, canonicalArgs, err := canonicalEnableSourceArgs(rootArgs)
+	sourceIDs, canonicalArgs, err := canonicalAgentActionArgs(
+		rootToolName, rootArgs,
+	)
 	if err != nil {
 		return AgentActionContinuationStatus{}, agentEventIntegrityError()
 	}
 	status := AgentActionContinuationStatus{
 		TenantID: tenantID, UserID: userID, ActionID: actionID,
-		SessionID: *rootSessionID, SourceID: sourceID,
+		SessionID: *rootSessionID, ToolName: rootToolName,
+		SourceID: sourceIDs[0], SourceIDs: sourceIDs,
 		ExecutionVersion: executionVersion,
 		Route:            AgentActionAuthorityLegacy,
 		Status:           rootStatus,
@@ -249,6 +275,10 @@ func (s *Store) GetAgentActionContinuationStatus(
 	case 0:
 		if !continuationExists {
 			if generation != 0 || route != AgentActionAuthorityLegacy {
+				return AgentActionContinuationStatus{},
+					agentEventIntegrityError()
+			}
+			if rootToolName != agentActionEnableSourceToolName {
 				return AgentActionContinuationStatus{},
 					agentEventIntegrityError()
 			}
@@ -302,14 +332,18 @@ func (s *Store) GetAgentActionContinuationStatus(
 	}
 	if string(canonicalArgs) != string(action.CanonicalArgs) ||
 		action.SessionID != *rootSessionID ||
-		action.SourceID != sourceID {
+		action.ToolName != rootToolName ||
+		action.SourceID != sourceIDs[0] ||
+		!equalAgentActionSourceIDs(action.SourceIDs, sourceIDs) {
 		return AgentActionContinuationStatus{}, agentEventIntegrityError()
 	}
 	if err := validateFrozenAgentAction(action); err != nil {
 		return AgentActionContinuationStatus{}, err
 	}
 	status.SessionID = action.SessionID
+	status.ToolName = action.ToolName
 	status.SourceID = action.SourceID
+	status.SourceIDs = action.SourceIDs
 	status.Status = action.Status
 	status.TerminalCode = action.TerminalCode
 	status.AttemptCount = action.AttemptCount
@@ -909,22 +943,80 @@ func validateAgentActionRootBinding(
 	if err := validateFrozenAgentAction(action); err != nil {
 		return err
 	}
-	sourceID, canonicalArgs, err := canonicalEnableSourceArgs(rootArgs)
+	sourceIDs, canonicalArgs, err := canonicalAgentActionArgs(
+		rootToolName, rootArgs,
+	)
 	if err != nil || rootSessionID == nil ||
 		*rootSessionID != action.SessionID ||
-		rootToolName != agentActionToolName ||
-		sourceID != action.SourceID ||
+		rootToolName != action.ToolName ||
+		len(sourceIDs) == 0 ||
+		sourceIDs[0] != action.SourceID ||
+		!equalAgentActionSourceIDs(sourceIDs, action.SourceIDs) ||
 		string(canonicalArgs) != string(action.CanonicalArgs) {
 		return agentEventIntegrityError()
 	}
 	return nil
 }
 
-type frozenEnableSourceAction struct {
+func equalAgentActionSourceIDs(left, right []int64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+type frozenAgentAction struct {
 	toolSpec         []byte
 	toolPolicy       []byte
 	successMessages  []byte
 	notFoundMessages []byte
+}
+
+type frozenEnableSourceAction = frozenAgentAction
+
+func canonicalAgentActionArgs(
+	toolName string,
+	raw []byte,
+) ([]int64, []byte, error) {
+	switch toolName {
+	case agentActionEnableSourceToolName:
+		sourceID, canonical, err := canonicalEnableSourceArgs(raw)
+		if err != nil {
+			return nil, nil, err
+		}
+		return []int64{sourceID}, canonical, nil
+	case agentActionRemoveSourceToolName:
+		return canonicalRemoveSourceArgs(raw)
+	default:
+		return nil, nil, agentEventValidationError(
+			"Agent action tool is unsupported")
+	}
+}
+
+func isDurableAgentActionToolName(toolName string) bool {
+	switch toolName {
+	case agentActionEnableSourceToolName, agentActionRemoveSourceToolName:
+		return true
+	default:
+		return false
+	}
+}
+
+func agentActionAdapterForTool(toolName string) (string, error) {
+	switch toolName {
+	case agentActionEnableSourceToolName:
+		return agentActionEnableSourceAdapterVersion, nil
+	case agentActionRemoveSourceToolName:
+		return agentActionRemoveSourceAdapterVersion, nil
+	default:
+		return "", agentEventValidationError(
+			"Agent action tool is unsupported")
+	}
 }
 
 func canonicalEnableSourceArgs(raw []byte) (int64, []byte, error) {
@@ -938,6 +1030,63 @@ func canonicalEnableSourceArgs(raw []byte) (int64, []byte, error) {
 	}
 	canonical := []byte(fmt.Sprintf(`{"source_id":%d}`, args.SourceID))
 	return args.SourceID, canonical, nil
+}
+
+func canonicalRemoveSourceArgs(raw []byte) ([]int64, []byte, error) {
+	var args struct {
+		SourceIDs []int64 `json:"source_ids"`
+	}
+	if err := strictjson.DecodeExact(raw, &args); err != nil ||
+		len(args.SourceIDs) == 0 || len(args.SourceIDs) > 20 {
+		return nil, nil, agentEventValidationError(
+			"remove_source arguments are invalid")
+	}
+	seen := make(map[int64]struct{}, len(args.SourceIDs))
+	sourceIDs := make([]int64, 0, len(args.SourceIDs))
+	for _, sourceID := range args.SourceIDs {
+		if sourceID <= 0 {
+			return nil, nil, agentEventValidationError(
+				"remove_source arguments are invalid")
+		}
+		if _, ok := seen[sourceID]; ok {
+			continue
+		}
+		seen[sourceID] = struct{}{}
+		sourceIDs = append(sourceIDs, sourceID)
+	}
+	var canonical strings.Builder
+	canonical.WriteString(`{"source_ids":[`)
+	for index, sourceID := range sourceIDs {
+		if index > 0 {
+			canonical.WriteByte(',')
+		}
+		canonical.WriteString(strconv.FormatInt(sourceID, 10))
+	}
+	canonical.WriteString(`]}`)
+	return sourceIDs, []byte(canonical.String()), nil
+}
+
+func freezeAgentAction(
+	toolName string,
+	sourceIDs []int64,
+) (frozenAgentAction, error) {
+	if len(sourceIDs) == 0 {
+		return frozenAgentAction{}, agentEventValidationError(
+			"Agent action targets are invalid")
+	}
+	switch toolName {
+	case agentActionEnableSourceToolName:
+		if len(sourceIDs) != 1 {
+			return frozenAgentAction{}, agentEventValidationError(
+				"enable_source targets are invalid")
+		}
+		return freezeEnableSourceAction(sourceIDs[0])
+	case agentActionRemoveSourceToolName:
+		return freezeRemoveSourceAction(sourceIDs)
+	default:
+		return frozenAgentAction{}, agentEventValidationError(
+			"Agent action tool is unsupported")
+	}
 }
 
 func freezeEnableSourceAction(
@@ -975,6 +1124,62 @@ func freezeEnableSourceAction(
 		toolSpec: toolSpec, toolPolicy: toolPolicy,
 		successMessages: success, notFoundMessages: notFound,
 	}, nil
+}
+
+func freezeRemoveSourceAction(
+	sourceIDs []int64,
+) (frozenAgentAction, error) {
+	if len(sourceIDs) == 0 || len(sourceIDs) > 20 {
+		return frozenAgentAction{}, agentEventValidationError(
+			"remove_source targets are invalid")
+	}
+	for _, sourceID := range sourceIDs {
+		if sourceID <= 0 {
+			return frozenAgentAction{}, agentEventValidationError(
+				"remove_source targets are invalid")
+		}
+	}
+	toolSpec := []byte(
+		`{"description":"取消订阅一个或多个信源（信源本身与历史内容保留）。source_ids 可先用 list_sources 查询；批量退订放同一次调用，一张确认卡一次确认。","name":"remove_source","parameters":{"properties":{"source_ids":{"description":"要取消订阅的信源 id 列表，一次最多 20 个（可先用 list_sources 查询）。用户一次要求退订多个时必须放进同一次调用，会合成一张确认卡一次确认。","items":{"type":"integer"},"maxItems":20,"minItems":1,"type":"array"}},"required":["source_ids"],"type":"object"},"version":"vane.agent-tool-spec/v1"}`,
+	)
+	toolPolicy := []byte(
+		`{"authorization":"owner","budget":"none","concurrency":"sequential","confirmation":"required","effects":["state_write"],"retry":"none","version":"vane.agent-tool-policy/v1"}`,
+	)
+	message := func(content string) ([]byte, error) {
+		return json.Marshal([]struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}{{Role: "user", Content: content}})
+	}
+	joined := joinAgentActionSourceIDs(sourceIDs)
+	success, err := message(fmt.Sprintf(
+		"[卡片回调] 用户已确认取消订阅信源（id=%s）；订阅已取消，信源与历史内容保留。",
+		joined,
+	))
+	if err != nil {
+		return frozenAgentAction{}, agentEventValidationError(
+			"encode remove_source success fact")
+	}
+	notSubscribed, err := message(fmt.Sprintf(
+		"[卡片回调] 用户已确认取消订阅信源（id=%s）；这些信源原本就未订阅，未产生额外变更。",
+		joined,
+	))
+	if err != nil {
+		return frozenAgentAction{}, agentEventValidationError(
+			"encode remove_source no-op fact")
+	}
+	return frozenAgentAction{
+		toolSpec: toolSpec, toolPolicy: toolPolicy,
+		successMessages: success, notFoundMessages: notSubscribed,
+	}, nil
+}
+
+func joinAgentActionSourceIDs(sourceIDs []int64) string {
+	parts := make([]string, len(sourceIDs))
+	for index, sourceID := range sourceIDs {
+		parts[index] = strconv.FormatInt(sourceID, 10)
+	}
+	return strings.Join(parts, "、")
 }
 
 func (s *Store) ConfirmAgentActionContinuation(
