@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/sdk/activity"
@@ -42,6 +44,21 @@ func (p *temporalPeriodicActivityProbe) Synthesize(
 func TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges(
 	t *testing.T,
 ) {
+	workflowInput := WorkflowInputV1{
+		IntentID: 9, TenantID: 4, UserID: 5,
+	}
+	var (
+		postgresStore *store.Store
+		postgresTask  string
+	)
+	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		var setupErr error
+		postgresStore, postgresTask, workflowInput, setupErr =
+			preparePeriodicTemporalPostgresFixture(t, dbURL)
+		if setupErr != nil {
+			t.Fatal(setupErr)
+		}
+	}
 	namespace := fmt.Sprintf(
 		"vane-periodic-integration-%d", time.Now().UnixNano())
 	startCtx, cancelStart := context.WithTimeout(
@@ -96,10 +113,17 @@ func TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges(
 			ID: workflowID, TaskQueue: taskQueue,
 		},
 		WorkflowNameV1,
-		WorkflowInputV1{IntentID: 9, TenantID: 4, UserID: 5},
+		workflowInput,
 	)
 	if err != nil {
 		t.Fatalf("start periodic workflow: %v", err)
+	}
+	if postgresStore != nil {
+		if err := postgresStore.BindPeriodicBriefIntentRunV1(
+			t.Context(), workflowInput.TenantID, workflowInput.UserID,
+			workflowInput.IntentID, run.GetRunID()); err != nil {
+			t.Fatalf("bind real PostgreSQL Temporal run: %v", err)
+		}
 	}
 	select {
 	case <-probe.started:
@@ -146,6 +170,43 @@ func TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges(
 		history,
 	); err != nil {
 		t.Fatalf("replay terminated periodic history: %v", err)
+	}
+
+	if postgresStore != nil {
+		runner, runnerErr := NewRecoveryRunner(
+			postgresStore, server.Client(),
+			&periodicRecoverySenderFake{},
+			"https://vane.example", postgresTask, nil)
+		if runnerErr != nil {
+			t.Fatal(runnerErr)
+		}
+		if runnerErr = runner.recoverOne(
+			t.Context(),
+			store.PeriodicSynthesisRecoveryCandidateV1{
+				Kind: "prepared", IntentID: workflowInput.IntentID,
+				TenantID:   workflowInput.TenantID,
+				UserID:     workflowInput.UserID,
+				WorkflowID: run.GetID(), TemporalRunID: run.GetRunID(),
+			},
+		); runnerErr != nil {
+			t.Fatalf("recover real PostgreSQL report: %v", runnerErr)
+		}
+		page, listErr := postgresStore.ListPeriodicBriefReportsV1(
+			t.Context(), workflowInput.TenantID, workflowInput.UserID,
+			postgresTask, store.PeriodicBriefReportQueryV1{
+				Cadence:  store.BriefReportCadenceWeekly,
+				PageSize: 20,
+			})
+		if listErr != nil || len(page.Items) != 1 ||
+			page.Items[0].GenerationMode !=
+				types.ExecutiveGenerationFallback ||
+			page.Items[0].Processing !=
+				types.RunCompletenessPartial {
+			t.Fatalf("real PostgreSQL recovery page=%+v err=%v",
+				page, listErr)
+		}
+		releaseOnce.Do(func() { close(probe.release) })
+		return
 	}
 
 	brief := periodicRecoveryBriefFixture(t)
@@ -195,4 +256,82 @@ func TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges(
 		t.Fatalf("terminated recovery draft=%+v", fakeStore.recovered)
 	}
 	releaseOnce.Do(func() { close(probe.release) })
+}
+
+func preparePeriodicTemporalPostgresFixture(
+	t *testing.T,
+	dbURL string,
+) (*store.Store, string, WorkflowInputV1, error) {
+	t.Helper()
+	if err := store.Migrate(t.Context(), dbURL); err != nil {
+		return nil, "", WorkflowInputV1{}, err
+	}
+	st, err := store.New(t.Context(), dbURL)
+	if err != nil {
+		return nil, "", WorkflowInputV1{}, err
+	}
+	raw, err := pgxpool.New(t.Context(), dbURL)
+	if err != nil {
+		st.Close()
+		return nil, "", WorkflowInputV1{}, err
+	}
+	t.Cleanup(func() {
+		raw.Close()
+		st.Close()
+	})
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	var tenantID, userID int64
+	if err := raw.QueryRow(t.Context(),
+		`INSERT INTO tenants DEFAULT VALUES RETURNING id`,
+	).Scan(&tenantID); err != nil {
+		return nil, "", WorkflowInputV1{}, err
+	}
+	if err := raw.QueryRow(t.Context(),
+		`INSERT INTO users(feishu_open_id,name)
+		 VALUES($1,'P2-D Temporal integration') RETURNING id`,
+		"periodic-temporal-"+suffix).Scan(&userID); err != nil {
+		return nil, "", WorkflowInputV1{}, err
+	}
+	if _, err := raw.Exec(t.Context(),
+		`INSERT INTO memberships(tenant_id,user_id,role)
+		 VALUES($1,$2,'owner')`,
+		tenantID, userID); err != nil {
+		return nil, "", WorkflowInputV1{}, err
+	}
+	taskID := "task-periodic-temporal-" + suffix
+	if _, err := raw.Exec(t.Context(),
+		`INSERT INTO schedules(
+		    id,user_id,tenant_id,nl_description,spec_json,scope_json,
+		    status,execution_mode
+		 ) VALUES($1,$2,$3,'P2-D Temporal integration',
+		          '{"every_seconds":86400,"tz":"UTC"}','{}',
+		          'active','compiled')`,
+		taskID, userID, tenantID); err != nil {
+		return nil, "", WorkflowInputV1{}, err
+	}
+	end := time.Now().Round(0).UTC().Truncate(time.Microsecond).
+		AddDate(0, 0, -1)
+	start := end.AddDate(0, 0, -7)
+	intent, err := st.PreparePeriodicBriefIntentV1(
+		t.Context(), tenantID, userID, taskID,
+		store.BriefReportCadenceWeekly, start, end)
+	if err != nil {
+		return nil, "", WorkflowInputV1{}, err
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(), 10*time.Second)
+		defer cancel()
+		if _, cleanupErr := raw.Exec(cleanupCtx,
+			`UPDATE tenants
+			    SET status='deleting',
+			        purge_after=clock_timestamp()-interval '1 second'
+			  WHERE id=$1`,
+			tenantID); cleanupErr == nil {
+			_, _ = st.PurgeTenant(cleanupCtx, tenantID, false)
+		}
+	})
+	return st, taskID, WorkflowInputV1{
+		IntentID: intent.ID, TenantID: tenantID, UserID: userID,
+	}, nil
 }

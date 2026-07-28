@@ -174,7 +174,7 @@ func TestDeliveryAlwaysSendsQuietReport(t *testing.T) {
 	}
 	if err := deliverPeriodicBriefV1(
 		t.Context(), report, deliveryStore, sender,
-		"https://vane.example",
+		"https://vane.example", true,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestDeliveryUnknownStaysSendingForHistoryRecovery(t *testing.T) {
 	}
 	if err := deliverPeriodicBriefV1(
 		t.Context(), report, deliveryStore, sender,
-		"https://vane.example",
+		"https://vane.example", true,
 	); err == nil {
 		t.Fatal("ambiguous provider send unexpectedly succeeded")
 	}

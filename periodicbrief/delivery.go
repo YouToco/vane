@@ -122,13 +122,11 @@ func (a *Activities) DeliverPeriodicBriefV1(
 	ctx context.Context,
 	input DeliverInputV1,
 ) error {
-	if input.Report.TaskID == "" ||
-		input.Report.TaskID != a.deliveryTaskID {
-		return nil
-	}
 	return deliverPeriodicBriefV1(
 		ctx, input.Report, a.deliveryStore, a.sender,
-		a.dashboardOrigin)
+		a.dashboardOrigin,
+		input.Report.TaskID != "" &&
+			input.Report.TaskID == a.deliveryTaskID)
 }
 
 func deliverPeriodicBriefV1(
@@ -137,6 +135,7 @@ func deliverPeriodicBriefV1(
 	deliveryStore DeliveryStore,
 	sender DeliverySender,
 	dashboardOrigin string,
+	channelEnabled bool,
 ) error {
 	if report.Validate() != nil || deliveryStore == nil ||
 		sender == nil || dashboardOrigin == "" {
@@ -154,8 +153,9 @@ func deliverPeriodicBriefV1(
 	if err != nil {
 		return err
 	}
-	shouldSend :=
+	shouldSend := channelEnabled &&
 		settings.Delivery == store.BriefReportDeliveryAlways ||
+		channelEnabled &&
 			(len(report.Content.Signals) > 0 &&
 				settings.Delivery == store.BriefReportDeliveryImportant &&
 				(report.Content.DecisionState == types.ExecutiveDecisionAct ||

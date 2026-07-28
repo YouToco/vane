@@ -211,11 +211,9 @@ func (r *RecoveryRunner) runMissingDeliveryPass(ctx context.Context) error {
 			go func(report types.PeriodicBriefReportV1) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				if report.TaskID != r.deliveryTaskID {
-					return
-				}
 				if recoverErr := deliverPeriodicBriefV1(
 					ctx, report, r.store, r.sender, r.origin,
+					report.TaskID == r.deliveryTaskID,
 				); recoverErr != nil {
 					errMu.Lock()
 					errs = append(errs, recoverErr)

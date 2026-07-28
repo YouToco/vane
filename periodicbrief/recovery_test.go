@@ -387,9 +387,12 @@ func TestRecoveryKeepsMissingDeliveryDarkOutsideRendererCanary(
 	if err := runner.runMissingDeliveryPass(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if fakeStore.prepared || sender.sendCalls != 0 {
-		t.Fatalf("dark report prepared=%v sends=%d",
-			fakeStore.prepared, sender.sendCalls)
+	if !fakeStore.prepared ||
+		fakeStore.claimed.Status != store.PeriodicReportDeliverySkipped ||
+		sender.sendCalls != 0 {
+		t.Fatalf("dark report receipt=%v status=%s sends=%d",
+			fakeStore.prepared, fakeStore.claimed.Status,
+			sender.sendCalls)
 	}
 }
 
