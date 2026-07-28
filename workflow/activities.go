@@ -3753,10 +3753,14 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 				items := make([]feedback.CardInput, len(visible))
 				for i := range visible {
 					items[i] = visible[i].input
-					if i == worstCaseFeedbackIndex {
+					if worstCaseFeedbackIndex >= 0 {
+						// Every visible sibling may already carry the largest
+						// durable state line. Only the currently clicked item
+						// can also have the transient reason form open.
 						items[i].State = feedback.CardState{
 							Preference:        types.FeedbackActionNotInterested,
-							BadFeedbackOpen:   true,
+							Misjudged:         i != worstCaseFeedbackIndex,
+							BadFeedbackOpen:   i == worstCaseFeedbackIndex,
 							DeepDiveRequested: true,
 						}
 					}

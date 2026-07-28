@@ -657,11 +657,23 @@ func TestP1ECanonicalRendererReservesWorstCaseFeedbackBytes(t *testing.T) {
 	activities.buildAggCard = func(in feedback.AggregateCardInput) string {
 		rendered = append(rendered, in)
 		if len(in.Items) == canonicalBriefFeishuPrefixItemsV1 {
+			completeWorstCase := true
+			openForms := 0
 			for _, item := range in.Items {
 				if item.State.BadFeedbackOpen {
-					return strings.Repeat(
-						"x", feedback.AggregateCardMaxBytesV1+1)
+					openForms++
+				} else if !item.State.Misjudged {
+					completeWorstCase = false
 				}
+				if item.State.Preference !=
+					types.FeedbackActionNotInterested ||
+					!item.State.DeepDiveRequested {
+					completeWorstCase = false
+				}
+			}
+			if completeWorstCase && openForms == 1 {
+				return strings.Repeat(
+					"x", feedback.AggregateCardMaxBytesV1+1)
 			}
 		}
 		return prbEffectCard(in)

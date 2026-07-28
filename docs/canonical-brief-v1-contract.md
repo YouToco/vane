@@ -272,13 +272,14 @@ rendering.
 
 The card contains at most the first three ranked Insights. Prefix planning
 checks the 28 KiB provider budget with the worst-case transient feedback form
-opened on each visible Insight; this keeps every later callback rebuild inside
-the same hard limit. If the card would exceed that budget, the visible prefix
-shrinks without reordering or truncating an Insight; a single oversized
-Insight fails before provider send. The header reports the whole Brief count,
-and the footer says “另有 N 条” with an exact task deep link to the Web
-`TaskBriefFeed`. No score or live platform label is injected into the
-canonical card.
+opened on each possible clicked Insight while every other visible Insight
+carries its maximum persistent feedback-state line; this keeps every later
+callback rebuild inside the same hard limit. If the card would exceed that
+budget, the visible prefix shrinks without reordering or truncating an Insight;
+a single oversized Insight fails before provider send. The header reports the
+whole Brief count, and the footer says “另有 N 条” with an exact task deep link
+to the Web `TaskBriefFeed`. No score or live platform label is injected into
+the canonical card.
 
 The one durable provider effect still receipts the complete Brief delivery
 set. This is Phase 1's documented compatibility bridge while `InsightV1.ID`
