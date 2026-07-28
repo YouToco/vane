@@ -231,15 +231,12 @@ func (t *webSearchTool) Execute(ctx context.Context, userID int64, args json.Raw
 	if err != nil {
 		return exaToolError(err)
 	}
-	if state := runStateFrom(ctx); state != nil &&
-		state.externalFollowupSearchAttempted &&
-		state.externalFollowupSearchQuery == strings.TrimSpace(a.Query) {
-		// 只有真实上游无错返回才能授权本轮模型总结为检索结果。预算拒绝、
-		// 日限额检查失败、AppError 和基础设施错误都在此前返回，保持 false。
-		state.externalFollowupSearchSucceeded = true
-	}
 	if len(results) == 0 {
-		return "没有搜到相关结果。可以换个说法、放宽 include_domains，或改用 read_page 直接读已知页面。", nil
+		result := "没有搜到相关结果。可以换个说法、放宽 include_domains，或改用 read_page 直接读已知页面。"
+		markExternalFollowupSearchSuccess(
+			ctx, strings.TrimSpace(a.Query), result, nil,
+		)
+		return result, nil
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "搜到 %d 条结果：\n", len(results))
@@ -261,10 +258,44 @@ func (t *webSearchTool) Execute(ctx context.Context, userID int64, args json.Raw
 			fmt.Fprintf(&b, "%s\n", text)
 		}
 	}
-	return strings.TrimSuffix(b.String(), "\n"), nil
+	result := strings.TrimSuffix(b.String(), "\n")
+	markExternalFollowupSearchSuccess(
+		ctx, strings.TrimSpace(a.Query), result, results,
+	)
+	return result, nil
 }
 
 func (t *webSearchTool) Summarize(json.RawMessage) string { return "" }
+
+func markExternalFollowupSearchSuccess(
+	ctx context.Context,
+	query string,
+	result string,
+	results []fetcher.SearchResult,
+) {
+	if state := runStateFrom(ctx); state != nil &&
+		state.externalFollowupSearchAttempted &&
+		state.externalFollowupSearchQuery == query {
+		// 只有真实上游无错返回才能授权本轮模型总结为检索结果。预算拒绝、
+		// 日限额检查失败、AppError 和基础设施错误都在此前返回，保持 false。
+		state.externalFollowupSearchSucceeded = true
+		state.externalFollowupSearchResult = result
+		state.externalFollowupSearchEvidence = make(
+			[]externalFollowupSearchEvidence, 0, len(results),
+		)
+		for _, item := range results {
+			state.externalFollowupSearchEvidence = append(
+				state.externalFollowupSearchEvidence,
+				externalFollowupSearchEvidence{
+					URL:           truncateRunes(item.URL, exaOutURLMaxRunes),
+					Title:         truncateRunes(item.Title, exaOutMetaMaxRunes),
+					Text:          truncateRunes(item.Text, webSearchTextMaxRunes*4),
+					PublishedDate: truncateRunes(item.PublishedDate, exaOutMetaMaxRunes),
+				},
+			)
+		}
+	}
+}
 
 // oneLine 把标题压成一行（防空标题时输出裸行）。
 func oneLine(title, fallback string) string {

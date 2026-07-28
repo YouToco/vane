@@ -137,6 +137,13 @@ type toolRunState struct {
 	externalFollowupSearchResponseRejected bool
 	externalFollowupSearchAttempted        bool
 	externalFollowupSearchSucceeded        bool
+	// result is the exact bounded text returned by web_search. The final-answer
+	// harness validates citations against it instead of trusting the model to
+	// remember which URLs really appeared. GroundingFailures gives one
+	// tool-free correction turn, then fails closed.
+	externalFollowupSearchResult      string
+	externalFollowupSearchEvidence    []externalFollowupSearchEvidence
+	externalFollowupGroundingFailures int
 	// allowedLocalResultHandles 只登记本条消息的动态端点刚生成的截断句柄。
 	// 句柄 res-N 可猜且缓存按 user 共享；仅用 bool 会让恶意端点枚举同用户
 	// 其他会话的旧结果。taint 后 read_endpoint_result 必须命中这个集合。

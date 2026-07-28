@@ -811,6 +811,12 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				system += externalFollowupSearchRetrySystemNote
 			}
 		}
+		if state.externalFollowupSearchSucceeded {
+			system += externalFollowupSearchGroundingSystemNote
+			if state.externalFollowupGroundingFailures > 0 {
+				system += externalFollowupGroundingRetrySystemNote
+			}
+		}
 		request := llm.ChatRequest{
 			Model:    l.model,
 			Messages: withSystem(system, requestMessages, profileHint, renderProfile),
@@ -891,6 +897,21 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				}, msgs, turns, nil
 			}
 			reply := rejectUnbackedConfirmationClaim(resp.Content)
+			if state.externalFollowupSearchSucceeded &&
+				!externalFollowupReplyGrounded(
+					state.externalFollowupSearchQuery,
+					state.externalFollowupSearchEvidence,
+					reply,
+				) {
+				if state.externalFollowupGroundingFailures == 0 {
+					state.externalFollowupGroundingFailures++
+					continue
+				}
+				msgs = append(msgs, llm.ChatMessage{
+					Role: "assistant", Content: replyExternalFollowupUngrounded,
+				})
+				return Outcome{Reply: replyExternalFollowupUngrounded}, msgs, turns, nil
+			}
 			msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: reply})
 			return Outcome{Reply: reply}, msgs, turns, nil
 		}
@@ -923,6 +944,35 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				Role: "assistant", Content: replyExternalFollowupSearchNotRun,
 			})
 			return Outcome{Reply: replyExternalFollowupSearchNotRun}, msgs, turns, nil
+		}
+		if state.externalFollowupSearchSucceeded &&
+			len(state.externalFollowupSearchEvidence) == 0 {
+			// A zero-result search is a complete, trustworthy outcome but gives
+			// the model no evidence to summarize. Return a fixed answer here;
+			// never grant a free-text turn that could invent a price.
+			msgs = append(msgs, llm.ChatMessage{
+				Role: "assistant", Content: replyExternalFollowupNoEvidence,
+			})
+			return Outcome{Reply: replyExternalFollowupNoEvidence}, msgs, turns, nil
+		}
+		if state.externalFollowupSearchSucceeded &&
+			isGPTLiveAPIPricingQuery(state.externalFollowupSearchQuery) {
+			// This production-sensitive question has a deterministic
+			// evidence-to-answer projection. Do not grant the model a free-text
+			// opportunity to turn ChatGPT subscription facts into API pricing.
+			reply := deterministicGPTLiveAPIPricingReply(
+				state.externalFollowupSearchEvidence,
+			)
+			if !isSingleGPTLiveAPIPricingQuery(
+				state.externalFollowupSearchQuery,
+			) {
+				reply += "\n\n这个问题还包含其他产品或维度；为避免把不同证据混成一个价格结论，" +
+					"本轮只核验了 GPT-Live API 定价，请把其余部分单独提问。"
+			}
+			msgs = append(msgs, llm.ChatMessage{
+				Role: "assistant", Content: reply,
+			})
+			return Outcome{Reply: reply}, msgs, turns, nil
 		}
 		if !wasUntrusted && state.untrustedExternalResult {
 			// 外部结果下一轮只与当前用户问题同屏。此前会话、画像派生文本、
