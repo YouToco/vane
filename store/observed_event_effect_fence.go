@@ -20,6 +20,59 @@ func (s *Store) ReserveObservedEventV1(
 	batchID int64,
 	event observation.QualifiedEvent,
 ) (bool, error) {
+	if err := validateObservedEventReservationV1(batchID, event); err != nil {
+		return false, err
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		_, accepted, err := s.reserveObservedEventAttemptV1(
+			ctx, expected, ref, batchID, event, false)
+		if !errors.Is(err, errObservedEventAdmissionDrift) {
+			return accepted, err
+		}
+	}
+	return false, observationConflict(
+		"observed event admission kept changing")
+}
+
+// ReserveObservedEventProvenanceV1 is Phase 2-B0's zero-call-point Store
+// primitive. It preserves ReserveObservedEventV1's exact admission/replay/CAS
+// behavior while returning the immutable observed-event row identity and
+// evidence digest needed by a later versioned Brief wiring batch.
+func (s *Store) ReserveObservedEventProvenanceV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	batchID int64,
+	event observation.QualifiedEvent,
+) (types.ObservedEventProvenanceV1, bool, error) {
+	if len(event.EvidenceJSON) >
+		types.ObservedEventProvenanceMaxEvidenceBytesV1 {
+		return types.ObservedEventProvenanceV1{}, false,
+			taskRunValidationError(
+				"qualified event evidence is too large")
+	}
+	if err := validateObservedEventReservationV1(batchID, event); err != nil {
+		return types.ObservedEventProvenanceV1{}, false, err
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		provenance, accepted, err := s.reserveObservedEventAttemptV1(
+			ctx, expected, ref, batchID, event, true)
+		if errors.Is(err, errObservedEventAdmissionDrift) {
+			continue
+		}
+		if err != nil || !accepted {
+			return types.ObservedEventProvenanceV1{}, accepted, err
+		}
+		return provenance, true, nil
+	}
+	return types.ObservedEventProvenanceV1{}, false, observationConflict(
+		"observed event admission kept changing")
+}
+
+func validateObservedEventReservationV1(
+	batchID int64,
+	event observation.QualifiedEvent,
+) error {
 	if batchID <= 0 ||
 		!validObservationDigest(event.PolicyDigest) ||
 		!validObservationDigest(event.EventKey) ||
@@ -28,18 +81,9 @@ func (s *Store) ReserveObservedEventV1(
 		event.OccurredAt.IsZero() ||
 		len(event.EvidenceJSON) == 0 ||
 		!json.Valid(event.EvidenceJSON) {
-		return false, taskRunValidationError(
-			"qualified event is invalid")
+		return taskRunValidationError("qualified event is invalid")
 	}
-	for attempt := 0; attempt < 3; attempt++ {
-		accepted, err := s.reserveObservedEventAttemptV1(
-			ctx, expected, ref, batchID, event)
-		if !errors.Is(err, errObservedEventAdmissionDrift) {
-			return accepted, err
-		}
-	}
-	return false, observationConflict(
-		"observed event admission kept changing")
+	return nil
 }
 
 var errObservedEventAdmissionDrift = errors.New(
@@ -52,6 +96,16 @@ type observedEventAdmissionCandidate struct {
 	createdAt              time.Time
 	deliveryID, batchID    *int64
 	batchSnapshotID        *int64
+}
+
+type observedEventReservationV1 struct {
+	id           int64
+	policyDigest string
+	eventKey     string
+	eventType    string
+	subject      string
+	occurredAt   time.Time
+	evidenceJSON json.RawMessage
 }
 
 func (s *Store) loadObservedEventAdmissionCandidate(
@@ -104,11 +158,17 @@ func (s *Store) reserveObservedEventAttemptV1(
 	ref types.RunSnapshotRef,
 	batchID int64,
 	event observation.QualifiedEvent,
-) (bool, error) {
+	requireProvenance bool,
+) (types.ObservedEventProvenanceV1, bool, error) {
 	candidate, err := s.loadObservedEventAdmissionCandidate(
 		ctx, expected, event)
 	if err != nil {
-		return false, err
+		return types.ObservedEventProvenanceV1{}, false, err
+	}
+	if candidate.found && candidate.userID != expected.UserID {
+		return types.ObservedEventProvenanceV1{}, false,
+			observationConflict(
+				"observed event user scope does not match")
 	}
 	scopes := []types.PushBatchScope{{
 		TenantID: expected.TenantID,
@@ -120,7 +180,7 @@ func (s *Store) reserveObservedEventAttemptV1(
 		if candidate.userID != expected.UserID ||
 			candidate.batchID == nil ||
 			candidate.batchSnapshotID == nil {
-			return false, observationConflict(
+			return types.ObservedEventProvenanceV1{}, false, observationConflict(
 				"observed event delivery batch is unavailable")
 		}
 		scopes = append(scopes, types.PushBatchScope{
@@ -133,7 +193,7 @@ func (s *Store) reserveObservedEventAttemptV1(
 	tx, batchStatuses, err := s.beginObservedEventAdmissionV1(
 		ctx, expected, ref, scopes, snapshots, true)
 	if err != nil {
-		return false, err
+		return types.ObservedEventProvenanceV1{}, false, err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
 
@@ -144,15 +204,15 @@ func (s *Store) reserveObservedEventAttemptV1(
 	effectBatch, err := lockObservedEventPushEffects(
 		ctx, tx, expected.TenantID, expected.UserID, batchIDs)
 	if err != nil {
-		return false, err
+		return types.ObservedEventProvenanceV1{}, false, err
 	}
 
 	if !candidate.found {
 		if effectBatch[batchID] {
-			return false, observationConflict(
+			return types.ObservedEventProvenanceV1{}, false, observationConflict(
 				"push effect observed event aggregate is frozen")
 		}
-		var id int64
+		var reserved observedEventReservationV1
 		err = tx.QueryRow(ctx, `
 			INSERT INTO task_observed_events (
 			     tenant_id,user_id,task_id,policy_digest,event_key,event_type,
@@ -162,7 +222,8 @@ func (s *Store) reserveObservedEventAttemptV1(
 			ON CONFLICT (
 			    tenant_id,task_id,policy_digest,event_key
 			) DO NOTHING
-			RETURNING id`,
+			RETURNING id,policy_digest,event_key,event_type,subject,
+			          occurred_at,evidence_json`,
 			expected.TenantID,
 			expected.UserID,
 			expected.TaskID,
@@ -174,20 +235,34 @@ func (s *Store) reserveObservedEventAttemptV1(
 			event.EvidenceJSON,
 			ref.SnapshotID,
 			expected.TemporalRunID,
-		).Scan(&id)
+		).Scan(
+			&reserved.id,
+			&reserved.policyDigest,
+			&reserved.eventKey,
+			&reserved.eventType,
+			&reserved.subject,
+			&reserved.occurredAt,
+			&reserved.evidenceJSON,
+		)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return false, errObservedEventAdmissionDrift
+			return types.ObservedEventProvenanceV1{}, false,
+				errObservedEventAdmissionDrift
 		}
 		if err != nil {
-			return false, taskRunDatabaseError(
+			return types.ObservedEventProvenanceV1{}, false, taskRunDatabaseError(
 				"reserve qualified event", err)
+		}
+		provenance, err := sealObservedEventReservationV1(
+			reserved, requireProvenance)
+		if err != nil {
+			return types.ObservedEventProvenanceV1{}, false, err
 		}
 		if err := commitCompiledRunWriteV1(
 			ctx, tx, "commit qualified event reservation",
 		); err != nil {
-			return false, err
+			return types.ObservedEventProvenanceV1{}, false, err
 		}
-		return true, nil
+		return provenance, true, nil
 	}
 
 	var deliveryStatus types.DeliveryStatus
@@ -203,24 +278,28 @@ func (s *Store) reserveObservedEventAttemptV1(
 			expected.UserID,
 		).Scan(&lockedBatchID, &deliveryStatus); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return false, errObservedEventAdmissionDrift
+				return types.ObservedEventProvenanceV1{}, false,
+					errObservedEventAdmissionDrift
 			}
-			return false, taskRunDatabaseError(
+			return types.ObservedEventProvenanceV1{}, false, taskRunDatabaseError(
 				"lock observed event delivery candidate", err)
 		}
 		if candidate.batchID == nil ||
 			lockedBatchID != *candidate.batchID {
-			return false, errObservedEventAdmissionDrift
+			return types.ObservedEventProvenanceV1{}, false,
+				errObservedEventAdmissionDrift
 		}
 	}
 
 	var (
-		locked observedEventAdmissionCandidate
-		stale  bool
+		locked   observedEventAdmissionCandidate
+		reserved observedEventReservationV1
+		stale    bool
 	)
 	err = tx.QueryRow(ctx, `
 		SELECT id,user_id,run_snapshot_id,temporal_run_id,status,
-		       created_at,delivery_id,
+		       created_at,delivery_id,policy_digest,event_key,event_type,
+		       subject,occurred_at,evidence_json,
 		       created_at <= clock_timestamp()-interval '10 minutes'
 		  FROM task_observed_events
 		 WHERE tenant_id=$1 AND task_id=$2
@@ -238,48 +317,66 @@ func (s *Store) reserveObservedEventAttemptV1(
 		&locked.status,
 		&locked.createdAt,
 		&locked.deliveryID,
+		&reserved.policyDigest,
+		&reserved.eventKey,
+		&reserved.eventType,
+		&reserved.subject,
+		&reserved.occurredAt,
+		&reserved.evidenceJSON,
 		&stale,
 	)
+	reserved.id = locked.id
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, errObservedEventAdmissionDrift
+		return types.ObservedEventProvenanceV1{}, false,
+			errObservedEventAdmissionDrift
 	}
 	if err != nil {
-		return false, taskRunDatabaseError(
+		return types.ObservedEventProvenanceV1{}, false, taskRunDatabaseError(
 			"lock qualified event conflict", err)
 	}
 	if locked.id != candidate.id ||
+		locked.userID != expected.UserID ||
 		locked.userID != candidate.userID ||
 		locked.snapshotID != candidate.snapshotID ||
 		locked.runID != candidate.runID ||
 		locked.status != candidate.status ||
 		!locked.createdAt.Equal(candidate.createdAt) ||
 		!equalOptionalInt64(locked.deliveryID, candidate.deliveryID) {
-		return false, errObservedEventAdmissionDrift
+		return types.ObservedEventProvenanceV1{}, false,
+			errObservedEventAdmissionDrift
 	}
 
 	if effectBatch[batchID] {
-		if locked.snapshotID != ref.SnapshotID ||
+		if locked.userID != expected.UserID ||
+			locked.snapshotID != ref.SnapshotID ||
 			locked.runID != expected.TemporalRunID ||
 			locked.status != "qualified" ||
 			locked.deliveryID == nil ||
 			candidate.batchID == nil ||
 			*candidate.batchID != batchID ||
 			deliveryStatus != types.DeliveryStatusPending {
-			return false, observationConflict(
+			return types.ObservedEventProvenanceV1{}, false, observationConflict(
 				"push effect observed event reservation is frozen")
+		}
+		provenance, err := sealObservedEventReservationV1(
+			reserved, requireProvenance)
+		if err != nil {
+			return types.ObservedEventProvenanceV1{}, false, err
 		}
 		if err := commitCompiledRunWriteV1(
 			ctx, tx, "commit frozen observed event reservation replay",
 		); err != nil {
-			return false, err
+			return types.ObservedEventProvenanceV1{}, false, err
 		}
-		return true, nil
+		return provenance, true, nil
 	}
 
-	accepted := locked.snapshotID == ref.SnapshotID &&
+	accepted := locked.userID == expected.UserID &&
+		locked.snapshotID == ref.SnapshotID &&
 		locked.runID == expected.TemporalRunID &&
 		locked.status == "qualified"
-	reclaimable := locked.status == "qualified" && stale
+	reclaimable := locked.userID == expected.UserID &&
+		locked.status == "qualified" && stale
 	if candidate.deliveryID != nil {
 		previousBatchID := *candidate.batchID
 		reclaimable = reclaimable &&
@@ -300,15 +397,16 @@ func (s *Store) reserveObservedEventAttemptV1(
 			*candidate.batchID,
 		)
 		if updateErr != nil {
-			return false, taskRunDatabaseError(
+			return types.ObservedEventProvenanceV1{}, false, taskRunDatabaseError(
 				"retire stale observed event delivery", updateErr)
 		}
 		if tag.RowsAffected() != 1 {
-			return false, errObservedEventAdmissionDrift
+			return types.ObservedEventProvenanceV1{}, false,
+				errObservedEventAdmissionDrift
 		}
 	}
 	if !accepted && reclaimable {
-		tag, updateErr := tx.Exec(ctx, `
+		updateErr := tx.QueryRow(ctx, `
 			UPDATE task_observed_events
 			   SET event_type=$5,subject=$6,occurred_at=$7,
 			       evidence_json=$8,run_snapshot_id=$9,
@@ -316,7 +414,9 @@ func (s *Store) reserveObservedEventAttemptV1(
 			       created_at=clock_timestamp()
 			 WHERE tenant_id=$1 AND task_id=$2
 			   AND policy_digest=$3 AND event_key=$4
-			   AND status='qualified'`,
+			   AND status='qualified'
+			RETURNING id,policy_digest,event_key,event_type,subject,
+			          occurred_at,evidence_json`,
 			expected.TenantID,
 			expected.TaskID,
 			event.PolicyDigest,
@@ -327,19 +427,60 @@ func (s *Store) reserveObservedEventAttemptV1(
 			event.EvidenceJSON,
 			ref.SnapshotID,
 			expected.TemporalRunID,
+		).Scan(
+			&reserved.id,
+			&reserved.policyDigest,
+			&reserved.eventKey,
+			&reserved.eventType,
+			&reserved.subject,
+			&reserved.occurredAt,
+			&reserved.evidenceJSON,
 		)
+		if errors.Is(updateErr, pgx.ErrNoRows) {
+			return types.ObservedEventProvenanceV1{}, false,
+				errObservedEventAdmissionDrift
+		}
 		if updateErr != nil {
-			return false, taskRunDatabaseError(
+			return types.ObservedEventProvenanceV1{}, false, taskRunDatabaseError(
 				"reclaim qualified event", updateErr)
 		}
-		accepted = tag.RowsAffected() == 1
+		accepted = true
+	}
+	provenance, err := sealObservedEventReservationV1(
+		reserved, requireProvenance && accepted)
+	if err != nil {
+		return types.ObservedEventProvenanceV1{}, false, err
 	}
 	if err := commitCompiledRunWriteV1(
 		ctx, tx, "commit qualified event replay",
 	); err != nil {
-		return false, err
+		return types.ObservedEventProvenanceV1{}, false, err
 	}
-	return accepted, nil
+	return provenance, accepted, nil
+}
+
+func sealObservedEventReservationV1(
+	reserved observedEventReservationV1,
+	required bool,
+) (types.ObservedEventProvenanceV1, error) {
+	if !required {
+		return types.ObservedEventProvenanceV1{}, nil
+	}
+	provenance, err := types.SealObservedEventProvenanceV1(
+		reserved.id,
+		reserved.policyDigest,
+		reserved.eventKey,
+		reserved.eventType,
+		reserved.subject,
+		reserved.occurredAt,
+		reserved.evidenceJSON,
+	)
+	if err != nil {
+		return types.ObservedEventProvenanceV1{},
+			taskRunValidationError(
+				"observed event provenance cannot be sealed")
+	}
+	return provenance, nil
 }
 
 func equalOptionalInt64(a, b *int64) bool {

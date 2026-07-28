@@ -121,6 +121,7 @@ func TestAuthorizeObservationQualificationSpendV1_IsolatesShadowAndAtomicallyFen
 func TestObservationQualificationCheckpointAndEventLedger(t *testing.T) {
 	f := newCompiledRunWriteFixture(t)
 	ctx := t.Context()
+	corruptUserID := testUser(t, f.base.st)
 	t.Cleanup(func() {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
@@ -128,6 +129,8 @@ func TestObservationQualificationCheckpointAndEventLedger(t *testing.T) {
 			`DELETE FROM task_observed_events WHERE tenant_id = $1`, f.base.tenantID)
 		cleanupExec(cleanupCtx, t, f.base.st,
 			`DELETE FROM task_event_qualification_steps WHERE tenant_id = $1`, f.base.tenantID)
+		cleanupExec(cleanupCtx, t, f.base.st,
+			`DELETE FROM users WHERE id=$1`, corruptUserID)
 	})
 
 	requestDigest := strings.Repeat("a", 64)
@@ -179,6 +182,48 @@ func TestObservationQualificationCheckpointAndEventLedger(t *testing.T) {
 	}
 	batchA := createObservationBatch(
 		t, f, f.idA, f.refA, "observe-a-"+uuid.NewString())
+	invalidEvent := event
+	invalidEvent.EventKey = strings.Repeat("e", 64)
+	invalidEvent.EventType = " model_release "
+	if _, ok, err := f.base.st.ReserveObservedEventProvenanceV1(
+		ctx, f.idA, f.refA, batchA, invalidEvent,
+	); ok || !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("invalid provenance reserve accepted=%v err=%v", ok, err)
+	}
+	var invalidRows int
+	if err := f.base.st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_observed_events
+		  WHERE tenant_id=$1 AND task_id=$2 AND policy_digest=$3 AND event_key=$4`,
+		f.idA.TenantID,
+		f.idA.TaskID,
+		invalidEvent.PolicyDigest,
+		invalidEvent.EventKey,
+	).Scan(&invalidRows); err != nil || invalidRows != 0 {
+		t.Fatalf("invalid provenance rows=%d err=%v", invalidRows, err)
+	}
+	oversizedEvent := event
+	oversizedEvent.EventKey = strings.Repeat("f", 64)
+	oversizedEvent.EvidenceJSON = json.RawMessage(
+		`"` + strings.Repeat(
+			"x",
+			types.ObservedEventProvenanceMaxEvidenceBytesV1,
+		) + `"`,
+	)
+	if _, ok, err := f.base.st.ReserveObservedEventProvenanceV1(
+		ctx, f.idA, f.refA, batchA, oversizedEvent,
+	); ok || !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("oversized provenance accepted=%v err=%v", ok, err)
+	}
+	if err := f.base.st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_observed_events
+		  WHERE tenant_id=$1 AND task_id=$2 AND policy_digest=$3 AND event_key=$4`,
+		f.idA.TenantID,
+		f.idA.TaskID,
+		oversizedEvent.PolicyDigest,
+		oversizedEvent.EventKey,
+	).Scan(&invalidRows); err != nil || invalidRows != 0 {
+		t.Fatalf("oversized provenance rows=%d err=%v", invalidRows, err)
+	}
 	var accepted atomic.Int64
 	var wg sync.WaitGroup
 	for range 8 {
@@ -207,6 +252,52 @@ func TestObservationQualificationCheckpointAndEventLedger(t *testing.T) {
 		f.idA.TenantID, f.idA.TaskID, event.PolicyDigest, event.EventKey).
 		Scan(&rows); err != nil || rows != 1 {
 		t.Fatalf("ledger rows=%d err=%v", rows, err)
+	}
+	provenance, ok, err := f.base.st.ReserveObservedEventProvenanceV1(
+		ctx, f.idA, f.refA, batchA, observation.QualifiedEvent{
+			PolicyDigest: event.PolicyDigest,
+			EventKey:     event.EventKey,
+			EventType:    " caller-replay-must-not-win ",
+			Subject:      "caller replay must not win",
+			OccurredAt:   event.OccurredAt.Add(time.Hour),
+			EvidenceJSON: json.RawMessage(`{"content_ids":[999]}`),
+		},
+	)
+	if err != nil || !ok {
+		t.Fatalf("provenance replay accepted=%v err=%v", ok, err)
+	}
+	if provenance.ID <= 0 ||
+		provenance.EventType != event.EventType ||
+		provenance.Subject != event.Subject ||
+		!provenance.OccurredAt.Equal(event.OccurredAt) ||
+		!provenance.MatchesEvidenceJSON(event.EvidenceJSON) ||
+		provenance.MatchesEvidenceJSON(
+			json.RawMessage(`{"content_ids":[999]}`),
+		) {
+		t.Fatalf("provenance did not bind stored first writer: %+v", provenance)
+	}
+	if _, err := f.base.st.pool.Exec(ctx,
+		`UPDATE task_observed_events SET user_id=$1
+		  WHERE id=$2 AND tenant_id=$3`,
+		corruptUserID,
+		provenance.ID,
+		f.idA.TenantID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := f.base.st.ReserveObservedEventProvenanceV1(
+		ctx, f.idA, f.refA, batchA, event,
+	); ok || !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("cross-user provenance accepted=%v err=%v", ok, err)
+	}
+	if _, err := f.base.st.pool.Exec(ctx,
+		`UPDATE task_observed_events SET user_id=$1
+		  WHERE id=$2 AND tenant_id=$3`,
+		f.idA.UserID,
+		provenance.ID,
+		f.idA.TenantID,
+	); err != nil {
+		t.Fatal(err)
 	}
 
 	otherIdentity := scheduledRunIdentity(
