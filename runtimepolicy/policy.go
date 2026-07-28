@@ -60,6 +60,10 @@ const (
 	ModelStageCardGen = "cardgen"
 	// ModelStageProfileEvolve is the pre-run profile evolution LLM call.
 	ModelStageProfileEvolve = "profile_evolve"
+	// ModelStageIssueSynthesis is the one-call, exact-run executive Brief.
+	ModelStageIssueSynthesis = "issue_synthesis"
+	// ModelStagePeriodicSynthesis is the one-call cross-run period report.
+	ModelStagePeriodicSynthesis = "periodic_synthesis"
 )
 
 // CredentialIDV1 is a controlled logical alias resolved by the worker's
@@ -145,11 +149,13 @@ type ToolPolicyV1 struct {
 // PromptPolicyV1 freezes prompt bodies, renderer generations, and the
 // per-task result of the playbook rollout decision.
 type PromptPolicyV1 struct {
-	SchemaVersion          string        `json:"schema_version"`
-	Score                  PromptStageV1 `json:"score"`
-	CardGen                PromptStageV1 `json:"cardgen"`
-	ProfileEvolve          PromptStageV1 `json:"profile_evolve"`
-	TaskInstructionEnabled bool          `json:"task_instruction_enabled"`
+	SchemaVersion          string         `json:"schema_version"`
+	Score                  PromptStageV1  `json:"score"`
+	CardGen                PromptStageV1  `json:"cardgen"`
+	ProfileEvolve          PromptStageV1  `json:"profile_evolve"`
+	IssueSynthesis         *PromptStageV1 `json:"issue_synthesis,omitempty"`
+	PeriodicSynthesis      *PromptStageV1 `json:"periodic_synthesis,omitempty"`
+	TaskInstructionEnabled bool           `json:"task_instruction_enabled"`
 }
 
 // PromptStageV1 pins one system prompt and the deterministic renderer used to
@@ -221,16 +227,18 @@ type QuotaBucketV1 struct {
 // no generic config or credential-value slot. Tool policy is omitted entirely
 // because compiled V1 always has an empty tool allowlist.
 type BuildInputV1 struct {
-	AllowedCapabilities    []CapabilityV1    `json:"-"`
-	ScorePrompt            PromptStageV1     `json:"-"`
-	CardGenPrompt          PromptStageV1     `json:"-"`
-	ProfileEvolvePrompt    PromptStageV1     `json:"-"`
-	TaskInstructionEnabled bool              `json:"-"`
-	ModelProvider          ModelProviderIDV1 `json:"-"`
-	ModelEndpoint          EndpointRefV1     `json:"-"`
-	ModelCredentialRef     CredentialRefV1   `json:"-"`
-	ModelCalls             []ModelCallV1     `json:"-"`
-	QuotaBuckets           []QuotaBucketV1   `json:"-"`
+	AllowedCapabilities     []CapabilityV1    `json:"-"`
+	ScorePrompt             PromptStageV1     `json:"-"`
+	CardGenPrompt           PromptStageV1     `json:"-"`
+	ProfileEvolvePrompt     PromptStageV1     `json:"-"`
+	IssueSynthesisPrompt    *PromptStageV1    `json:"-"`
+	PeriodicSynthesisPrompt *PromptStageV1    `json:"-"`
+	TaskInstructionEnabled  bool              `json:"-"`
+	ModelProvider           ModelProviderIDV1 `json:"-"`
+	ModelEndpoint           EndpointRefV1     `json:"-"`
+	ModelCredentialRef      CredentialRefV1   `json:"-"`
+	ModelCalls              []ModelCallV1     `json:"-"`
+	QuotaBuckets            []QuotaBucketV1   `json:"-"`
 }
 
 // BuildV1 constructs a validated, canonically ordered compiled policy bundle.
@@ -251,6 +259,8 @@ func BuildV1(input BuildInputV1) (BundleV1, error) {
 			Score:                  input.ScorePrompt,
 			CardGen:                input.CardGenPrompt,
 			ProfileEvolve:          input.ProfileEvolvePrompt,
+			IssueSynthesis:         input.IssueSynthesisPrompt,
+			PeriodicSynthesis:      input.PeriodicSynthesisPrompt,
 			TaskInstructionEnabled: input.TaskInstructionEnabled,
 		},
 		ModelPolicy: ModelPolicyV1{

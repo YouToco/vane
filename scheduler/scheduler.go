@@ -182,6 +182,7 @@ type Scheduler struct {
 	canonicalBrief          canonicalBriefRollout
 	structuredInsight       structuredInsightRollout
 	structuredEventEvidence rolloutScopeV1
+	executiveBrief          rolloutScopeV1
 	commandAttempt          time.Duration
 }
 

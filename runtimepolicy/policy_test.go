@@ -227,7 +227,10 @@ func TestPolicyV1WireTagsAndFieldOrderArePinned(t *testing.T) {
 		}},
 		{name: "PromptPolicyV1", typ: reflect.TypeFor[PromptPolicyV1](), fields: []wireFieldV1{
 			{"SchemaVersion", "schema_version"}, {"Score", "score"}, {"CardGen", "cardgen"},
-			{"ProfileEvolve", "profile_evolve"}, {"TaskInstructionEnabled", "task_instruction_enabled"},
+			{"ProfileEvolve", "profile_evolve"},
+			{"IssueSynthesis", "issue_synthesis,omitempty"},
+			{"PeriodicSynthesis", "periodic_synthesis,omitempty"},
+			{"TaskInstructionEnabled", "task_instruction_enabled"},
 		}},
 		{name: "PromptStageV1", typ: reflect.TypeFor[PromptStageV1](), fields: []wireFieldV1{
 			{"SystemPrompt", "system_prompt"}, {"RendererVersion", "renderer_version"},
@@ -683,6 +686,8 @@ func TestBuildInputV1_HasTypedNonConfigBoundary(t *testing.T) {
 		{"ScorePrompt", reflect.TypeFor[PromptStageV1]()},
 		{"CardGenPrompt", reflect.TypeFor[PromptStageV1]()},
 		{"ProfileEvolvePrompt", reflect.TypeFor[PromptStageV1]()},
+		{"IssueSynthesisPrompt", reflect.TypeFor[*PromptStageV1]()},
+		{"PeriodicSynthesisPrompt", reflect.TypeFor[*PromptStageV1]()},
 		{"TaskInstructionEnabled", reflect.TypeFor[bool]()},
 		{"ModelProvider", reflect.TypeFor[ModelProviderIDV1]()},
 		{"ModelEndpoint", reflect.TypeFor[EndpointRefV1]()},

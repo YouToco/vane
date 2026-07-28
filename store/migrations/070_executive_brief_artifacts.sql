@@ -343,6 +343,109 @@ CREATE POLICY user_isolation ON executive_brief_artifacts
         NULLIF((SELECT current_setting('app.user_id',true)),'')::bigint
     );
 
+-- The global recovery reader exposes only exact identities that can make
+-- progress: stale spending/ambiguous receipts, or terminal receipts whose
+-- canonical Brief exists but artifact freeze was interrupted.
+-- +goose StatementBegin
+CREATE FUNCTION read_executive_synthesis_recovery_v1(
+    after_candidate_at TIMESTAMPTZ,
+    after_outcome_id BIGINT,
+    requested_limit INTEGER
+)
+RETURNS TABLE (
+    candidate_at TIMESTAMPTZ,
+    recovery_kind TEXT,
+    outcome_id BIGINT,
+    outcome_schema_version TEXT,
+    run_snapshot_id BIGINT,
+    tenant_id BIGINT,
+    user_id BIGINT,
+    task_id TEXT,
+    temporal_workflow_id TEXT,
+    temporal_run_id TEXT,
+    reference_schema_version TEXT,
+    reference_digest TEXT,
+    snapshot_payload_digest TEXT,
+    push_batch_id BIGINT,
+    receipt_status TEXT,
+    profile_epoch BIGINT,
+    profile_version BIGINT,
+    profile_digest TEXT,
+    input_digest TEXT,
+    finalized_at TIMESTAMPTZ
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path=pg_catalog,public,pg_temp
+AS $$
+    WITH candidates AS (
+        SELECT
+            CASE
+                WHEN r.status IN ('spending','ambiguous')
+                    THEN COALESCE(r.spending_started_at,r.finalized_at)
+                ELSE r.finalized_at
+            END AS candidate_at,
+            CASE
+                WHEN r.status IN ('spending','ambiguous')
+                    THEN 'fallback'
+                ELSE 'freeze'
+            END AS recovery_kind,
+            r.run_outcome_id,r.run_snapshot_id,r.tenant_id,r.user_id,
+            r.task_id,r.push_batch_id,r.status,r.profile_epoch,
+            r.profile_version,r.profile_digest,r.input_digest,
+            r.finalized_at
+          FROM public.executive_brief_synthesis_receipts r
+          JOIN public.task_run_outcomes o
+            ON o.id=r.run_outcome_id
+           AND o.tenant_id=r.tenant_id
+           AND o.user_id=r.user_id
+           AND o.task_id=r.task_id
+           AND o.run_snapshot_id=r.run_snapshot_id
+          LEFT JOIN public.executive_brief_artifacts a
+            ON a.run_outcome_id=r.run_outcome_id
+          LEFT JOIN public.brief_snapshots b
+            ON b.run_outcome_id=r.run_outcome_id
+         WHERE (
+                r.status IN ('spending','ambiguous')
+                AND COALESCE(r.spending_started_at,r.finalized_at)
+                    <=clock_timestamp()-interval '2 minutes'
+            ) OR (
+                r.status IN ('finalized','fallback')
+                AND o.status='finalized'
+                AND b.id IS NOT NULL
+                AND a.id IS NULL
+            )
+    )
+    SELECT c.candidate_at,c.recovery_kind,c.run_outcome_id,
+           o.schema_version,c.run_snapshot_id,c.tenant_id,c.user_id,
+           c.task_id,rs.temporal_workflow_id,rs.temporal_run_id,
+           rs.reference_schema_version,rs.reference_digest,
+           rs.payload_digest,c.push_batch_id,c.status,c.profile_epoch,
+           c.profile_version,c.profile_digest,c.input_digest,c.finalized_at
+      FROM candidates c
+      JOIN public.task_run_outcomes o ON o.id=c.run_outcome_id
+      JOIN public.task_run_snapshots rs ON rs.id=c.run_snapshot_id
+     WHERE after_candidate_at IS NULL OR
+           (c.candidate_at,c.run_outcome_id)>
+               (after_candidate_at,after_outcome_id)
+     ORDER BY c.candidate_at,c.run_outcome_id
+     LIMIT LEAST(GREATEST(COALESCE(requested_limit,0),0),100)
+$$;
+-- +goose StatementEnd
+
+REVOKE ALL ON FUNCTION
+    read_executive_synthesis_recovery_v1(
+        TIMESTAMPTZ,BIGINT,INTEGER
+    )
+    FROM PUBLIC,vane_app,vane_brief_synthesis_writer,
+         vane_brief_synthesis_recovery;
+GRANT EXECUTE ON FUNCTION
+    read_executive_synthesis_recovery_v1(
+        TIMESTAMPTZ,BIGINT,INTEGER
+    )
+    TO vane_brief_synthesis_recovery;
+
 -- +goose Down
 
 SELECT pg_advisory_xact_lock(6215335020355474248);
@@ -371,6 +474,10 @@ DROP POLICY IF EXISTS tenant_isolation
     ON executive_brief_synthesis_receipts;
 DROP POLICY IF EXISTS tenant_visible
     ON executive_brief_synthesis_receipts;
+
+DROP FUNCTION read_executive_synthesis_recovery_v1(
+    TIMESTAMPTZ,BIGINT,INTEGER
+);
 
 REVOKE SELECT (
     id,tenant_id,user_id,task_id,run_outcome_id,run_snapshot_id,

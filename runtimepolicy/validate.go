@@ -40,6 +40,12 @@ func (b BundleV1) Validate() error {
 	if err := b.ModelPolicy.Validate(); err != nil {
 		return err
 	}
+	_, issueCall := b.ModelPolicy.Call(ModelStageIssueSynthesis)
+	_, periodicCall := b.ModelPolicy.Call(ModelStagePeriodicSynthesis)
+	if issueCall != (b.PromptPolicy.IssueSynthesis != nil) ||
+		periodicCall != (b.PromptPolicy.PeriodicSynthesis != nil) {
+		return invalidPolicy("optional prompt and model stages differ")
+	}
 	return b.QuotaPolicy.Validate()
 }
 
@@ -90,6 +96,15 @@ func (p PromptPolicyV1) Validate() error {
 			return invalidPolicy("prompt stage is invalid")
 		}
 	}
+	for _, stage := range []*PromptStageV1{
+		p.IssueSynthesis, p.PeriodicSynthesis,
+	} {
+		if stage != nil &&
+			(!validPrompt(stage.SystemPrompt) ||
+				!validShortText(stage.RendererVersion)) {
+			return invalidPolicy("optional prompt stage is invalid")
+		}
+	}
 	return nil
 }
 
@@ -104,8 +119,8 @@ func (p ModelPolicyV1) Validate() error {
 	if err := p.CredentialRef.validateFor(CredentialIDLLMPrimaryV1); err != nil {
 		return err
 	}
-	if len(p.Calls) != 3 {
-		return invalidPolicy("compiled model policy must contain exactly three stages")
+	if len(p.Calls) < 3 || len(p.Calls) > 5 {
+		return invalidPolicy("compiled model policy stage count is invalid")
 	}
 	seen := make(map[string]struct{}, len(p.Calls))
 	for _, call := range p.Calls {
@@ -297,7 +312,8 @@ func normalizeQuotaPolicyV1(policy QuotaPolicyV1) (QuotaPolicyV1, error) {
 
 func validModelStage(stage string) bool {
 	switch stage {
-	case ModelStageScore, ModelStageCardGen, ModelStageProfileEvolve:
+	case ModelStageScore, ModelStageCardGen, ModelStageProfileEvolve,
+		ModelStageIssueSynthesis, ModelStagePeriodicSynthesis:
 		return true
 	default:
 		return false

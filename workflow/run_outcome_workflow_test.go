@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,20 +18,25 @@ import (
 )
 
 type runOutcomeWorkflowCase struct {
-	fetchItems      int
-	fetchCoverage   types.RunCompletenessV1
-	observation     string
-	scoreItems      int
-	scoreProcessing types.RunCompletenessV1
-	scoreErr        error
-	cardItems       int
-	cardProcessing  types.RunCompletenessV1
-	dedupErr        error
-	pushErr         error
-	finalizeErr     error
-	cancelAtEvolve  bool
-	canonical       bool
-	canonicalEmpty  bool
+	fetchItems        int
+	fetchCoverage     types.RunCompletenessV1
+	observation       string
+	scoreItems        int
+	scoreProcessing   types.RunCompletenessV1
+	scoreErr          error
+	cardItems         int
+	cardProcessing    types.RunCompletenessV1
+	dedupErr          error
+	pushErr           error
+	finalizeErr       error
+	cancelAtEvolve    bool
+	canonical         bool
+	canonicalEmpty    bool
+	executive         bool
+	synthesisErr      error
+	synthesisFallback bool
+	freezeErr         error
+	onFreeze          func(ExecutiveBriefFreezeIn)
 }
 
 func executeRunOutcomeWorkflowCase(
@@ -129,6 +135,14 @@ func executeRunOutcomeWorkflowCase(
 			Processing: tc.cardProcessing,
 		}, nil
 	})
+	reg("CardGenOutcomeV3", func(
+		context.Context, CardGenIn,
+	) (CardGenOutcomeResult, error) {
+		return CardGenOutcomeResult{
+			Cards:      cardsOf(tc.cardItems),
+			Processing: tc.cardProcessing,
+		}, nil
+	})
 	if tc.canonical {
 		reg("PrepareCanonicalBriefV1", func(
 			_ context.Context, in CanonicalBriefPrepareIn,
@@ -160,6 +174,56 @@ func executeRunOutcomeWorkflowCase(
 			}, nil
 		})
 	}
+	if tc.executive {
+		reg("SynthesizeExecutiveBriefV1", func(
+			_ context.Context, in ExecutiveBriefSynthesizeIn,
+		) (ExecutiveBriefSynthesizeResult, error) {
+			if tc.synthesisErr != nil {
+				return ExecutiveBriefSynthesizeResult{}, tc.synthesisErr
+			}
+			mode := types.ExecutiveGenerationModel
+			processing := types.RunCompletenessComplete
+			if tc.synthesisFallback {
+				mode = types.ExecutiveGenerationFallback
+				processing = types.RunCompletenessPartial
+			}
+			return ExecutiveBriefSynthesizeResult{
+				Fallback: tc.synthesisFallback,
+				ArtifactDraft: types.ExecutiveBriefArtifactDraftV1{
+					SchemaVersion: types.ExecutiveBriefSchemaVersionV1,
+					RunOutcomeID:  in.Marker.ID,
+					RunSnapshotID: in.Run.Snapshot.SnapshotID,
+					PushBatchID:   in.Draft.PushBatchID,
+					TenantID:      in.Run.TenantID, UserID: in.UserID,
+					TaskID:         in.Run.TaskID,
+					ProfileDigest:  strings.Repeat("a", 64),
+					InputDigest:    strings.Repeat("b", 64),
+					GenerationMode: mode, Processing: processing,
+					GeneratedAt: time.Unix(15, 0).UTC(),
+					Content: types.ExecutiveBriefContentV1{
+						Headline: "headline", ExecutiveSummary: "summary",
+						DecisionState: types.ExecutiveDecisionWatch,
+						WhyForYou:     "relevant",
+						Signals: []types.ExecutiveSignalV1{{
+							Kind:  types.ExecutiveSignalChange,
+							Title: "change", Summary: "summary",
+							EvidenceRefs: []types.ExecutiveEvidenceRefV1{{
+								InsightID: 1001, ClaimIndexes: []int{0},
+							}},
+						}},
+					},
+				},
+			}, nil
+		})
+		reg("FreezeExecutiveBriefV1", func(
+			_ context.Context, in ExecutiveBriefFreezeIn,
+		) (types.ExecutiveBriefArtifactV1, error) {
+			if tc.onFreeze != nil {
+				tc.onFreeze(in)
+			}
+			return types.ExecutiveBriefArtifactV1{}, tc.freezeErr
+		})
+	}
 	reg("Push", func(context.Context, PushIn) error { return tc.pushErr })
 	reg("RecordEmptyBatch", func(context.Context, RecordEmptyIn) error {
 		return nil
@@ -183,6 +247,9 @@ func executeRunOutcomeWorkflowCase(
 	runtimeVersion := CompiledRuntimeRunOutcomeV1
 	if tc.canonical {
 		runtimeVersion = CompiledRuntimeCanonicalBriefV1
+	}
+	if tc.executive {
+		runtimeVersion = CompiledRuntimeExecutiveBriefV1
 	}
 	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
 		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
@@ -230,6 +297,70 @@ func TestPushPipelineWorkflow_CanonicalEmptyPushFailureIsFailed(t *testing.T) {
 	if claim.Result != types.RunResultFailed ||
 		claim.Processing != types.RunCompletenessPartial {
 		t.Fatalf("canonical empty failure claim = %+v", claim)
+	}
+}
+
+func TestPushPipelineWorkflow_ExecutiveBriefFinalizesThenFreezes(
+	t *testing.T,
+) {
+	var frozen ExecutiveBriefFreezeIn
+	claim, err := executeRunOutcomeWorkflowCase(
+		t, runOutcomeWorkflowCase{
+			fetchItems: 1, fetchCoverage: types.RunCompletenessComplete,
+			scoreItems: 1, scoreProcessing: types.RunCompletenessComplete,
+			cardItems: 1, cardProcessing: types.RunCompletenessComplete,
+			canonical: true, executive: true,
+			onFreeze: func(in ExecutiveBriefFreezeIn) {
+				frozen = in
+			},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Result != types.RunResultContent ||
+		claim.Processing != types.RunCompletenessComplete ||
+		frozen.Draft.RunOutcomeID != claim.ID {
+		t.Fatalf("claim=%+v freeze=%+v", claim, frozen)
+	}
+}
+
+func TestPushPipelineWorkflow_ExecutiveFallbackMarksProcessingPartial(
+	t *testing.T,
+) {
+	claim, err := executeRunOutcomeWorkflowCase(
+		t, runOutcomeWorkflowCase{
+			fetchItems: 1, fetchCoverage: types.RunCompletenessComplete,
+			scoreItems: 1, scoreProcessing: types.RunCompletenessComplete,
+			cardItems: 1, cardProcessing: types.RunCompletenessComplete,
+			canonical: true, executive: true, synthesisFallback: true,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Result != types.RunResultContent ||
+		claim.Processing != types.RunCompletenessPartial {
+		t.Fatalf("fallback claim = %+v", claim)
+	}
+}
+
+func TestPushPipelineWorkflow_ExecutiveSynthesisFailureStillPushes(
+	t *testing.T,
+) {
+	synthesisErr := temporal.NewNonRetryableApplicationError(
+		"receipt unavailable", string(types.CodeDatabase), nil)
+	claim, err := executeRunOutcomeWorkflowCase(
+		t, runOutcomeWorkflowCase{
+			fetchItems: 1, fetchCoverage: types.RunCompletenessComplete,
+			scoreItems: 1, scoreProcessing: types.RunCompletenessComplete,
+			cardItems: 1, cardProcessing: types.RunCompletenessComplete,
+			canonical: true, executive: true, synthesisErr: synthesisErr,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Result != types.RunResultContent ||
+		claim.Processing != types.RunCompletenessPartial {
+		t.Fatalf("synthesis failure claim = %+v", claim)
 	}
 }
 

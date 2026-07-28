@@ -343,6 +343,36 @@ type CanonicalBriefStructuredEventStoreV1 interface {
 	) (types.BriefDraftV1, error)
 }
 
+type ExecutiveBriefStoreV1 interface {
+	GetProfileForTenant(
+		context.Context, int64, int64,
+	) (*types.Profile, error)
+	PrepareExecutiveSynthesisV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		storepkg.ExecutiveSynthesisPrepareV1,
+	) (storepkg.ExecutiveSynthesisReceiptV1, error)
+	ClaimExecutiveSynthesisSpendV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1,
+	) (storepkg.ExecutiveSynthesisReceiptV1, bool, error)
+	FinalizeExecutiveSynthesisV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1, types.ExecutiveBriefContentV1,
+	) (storepkg.ExecutiveSynthesisReceiptV1, error)
+	FinalizeExecutiveSynthesisFallbackV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1, types.ExecutiveBriefContentV1,
+	) (storepkg.ExecutiveSynthesisReceiptV1, error)
+	MarkExecutiveSynthesisAmbiguousV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1,
+	) error
+	FreezeExecutiveBriefArtifactV1(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.ExecutiveBriefArtifactDraftV1,
+	) (types.ExecutiveBriefArtifactV1, error)
+}
+
 type CompiledRunSnapshotShadowV2Store interface {
 	CreateOrGetCompiledRunSnapshotShadowV2(
 		context.Context, types.RunIdentity, runtimepolicy.BundleV1,
@@ -448,6 +478,9 @@ type Activities struct {
 	canonicalBriefStore              CanonicalBriefStoreV1
 	buildCompiledPolicyV1            CompiledPolicyBuilderV1
 	buildStructuredPolicyV1          CompiledPolicyBuilderV1
+	buildExecutiveBriefPolicyV1      CompiledPolicyBuilderV1
+	executiveBriefStore              ExecutiveBriefStoreV1
+	llmRecorder                      *llm.Recorder
 	compiledModelResolverV1          CompiledModelResolverV1
 	compiledShadowStoreV2            CompiledRunSnapshotShadowV2Store
 	snapshotV2ShadowCanaryTaskID     string
@@ -559,6 +592,20 @@ func WithStructuredInsightRuntimeV1(
 ) ActivitiesOption {
 	return func(a *Activities) {
 		a.buildStructuredPolicyV1 = builder
+	}
+}
+
+// WithExecutiveBriefRuntimeV1 installs P2-D's alternate immutable policy.
+// It is selected only by the dedicated durable runtime label.
+func WithExecutiveBriefRuntimeV1(
+	builder CompiledPolicyBuilderV1,
+	st ExecutiveBriefStoreV1,
+	recorder *llm.Recorder,
+) ActivitiesOption {
+	return func(a *Activities) {
+		a.buildExecutiveBriefPolicyV1 = builder
+		a.executiveBriefStore = st
+		a.llmRecorder = recorder
 	}
 }
 
@@ -702,6 +749,25 @@ type CanonicalBriefPrepareResult struct {
 	Draft   *types.BriefDraftV1 `json:"draft,omitempty"`
 	BatchID int64               `json:"batch_id"`
 	Empty   bool                `json:"empty"`
+}
+
+type ExecutiveBriefSynthesizeIn struct {
+	UserID  int64                    `json:"user_id"`
+	TraceID string                   `json:"trace_id"`
+	Run     CompiledRunInputV1       `json:"run"`
+	Marker  types.RunOutcomeMarkerV1 `json:"marker"`
+	Draft   types.BriefDraftV1       `json:"draft"`
+}
+
+type ExecutiveBriefSynthesizeResult struct {
+	ArtifactDraft types.ExecutiveBriefArtifactDraftV1 `json:"artifact_draft"`
+	Fallback      bool                                `json:"fallback"`
+}
+
+type ExecutiveBriefFreezeIn struct {
+	UserID int64                               `json:"user_id"`
+	Run    CompiledRunInputV1                  `json:"run"`
+	Draft  types.ExecutiveBriefArtifactDraftV1 `json:"draft"`
 }
 
 type FetchOutcomeResult struct {
@@ -971,6 +1037,14 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 			}
 			builder = a.buildStructuredPolicyV1
 		}
+		if p.RuntimeVersion == CompiledRuntimeExecutiveBriefV1 {
+			if a.buildExecutiveBriefPolicyV1 == nil {
+				return PrepareRunResult{}, nonRetryable(types.NewAppError(
+					types.CodeInternal,
+					"executive Brief runtime policy is not configured", nil))
+			}
+			builder = a.buildExecutiveBriefPolicyV1
+		}
 		policy, buildErr := builder(
 			ctx, p.TenantID, a.taskInstructionEnabled(p.ScheduleID))
 		if buildErr != nil {
@@ -1008,7 +1082,8 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 	if err != nil {
 		return PrepareRunResult{}, retryableOrNot(err)
 	}
-	if p.RuntimeVersion == CompiledRuntimeStructuredEventEvidenceV1 {
+	if p.RuntimeVersion == CompiledRuntimeStructuredEventEvidenceV1 ||
+		p.RuntimeVersion == CompiledRuntimeExecutiveBriefV1 {
 		var scope struct {
 			Observation *observation.PolicyV1 `json:"observation,omitempty"`
 		}

@@ -27,6 +27,7 @@ import (
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/eventqualifier"
 	"github.com/YouToco/vane/evolver"
+	"github.com/YouToco/vane/executivebriefrecovery"
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/fetcher"
@@ -225,6 +226,23 @@ func run() error {
 						TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
 					})
 			}),
+		workflow.WithExecutiveBriefRuntimeV1(
+			func(ctx context.Context, tenantID int64, taskInstructionEnabled bool) (runtimepolicy.BundleV1, error) {
+				quota, err := st.LoadQuotaRule(ctx, tenantID, store.QuotaLLMTokens)
+				if err != nil {
+					return runtimepolicy.BundleV1{}, err
+				}
+				_ = quota
+				return runtimeconfig.BuildExecutiveBriefCompiledV1(
+					runtimeconfig.CurrentCompiledV1Input{
+						Model:                      cfg.LLM.Model,
+						TaskInstructionEnabled:     taskInstructionEnabled,
+						ModelEndpointGeneration:    cfg.LLM.CompiledEndpointGeneration,
+						ModelCredentialGeneration:  cfg.LLM.CompiledCredentialGeneration,
+						ExaCredentialGeneration:    cfg.Fetch.CompiledExaCredentialGeneration,
+						TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
+					})
+			}, st, recorder),
 		workflow.WithRunOutcomeStoreV1(st),
 		workflow.WithCanonicalBriefStoreV1(st),
 		workflow.WithCanonicalBriefRendererV1(
@@ -271,6 +289,8 @@ func run() error {
 	w.RegisterActivity(activities.BeginRunOutcomeV1)
 	w.RegisterActivity(activities.FinalizeRunOutcomeV1)
 	w.RegisterActivity(activities.PrepareCanonicalBriefV1)
+	w.RegisterActivity(activities.SynthesizeExecutiveBriefV1)
+	w.RegisterActivity(activities.FreezeExecutiveBriefV1)
 	w.RegisterActivity(activities.EvolveProfile)
 	w.RegisterActivity(activities.Fetch)
 	w.RegisterActivity(activities.FetchOutcomeV1)
@@ -318,6 +338,11 @@ func run() error {
 			cfg.Pipeline.StructuredEventEvidenceCanaryScheduleID,
 			cfg.Pipeline.StructuredEventEvidenceAllowAll,
 			cfg.Pipeline.ObservationAuthorityCanaryScheduleID,
+		),
+		scheduler.WithExecutiveBriefRollout(
+			cfg.Pipeline.ExecutiveBriefEnabled,
+			cfg.Pipeline.ExecutiveBriefCanaryScheduleID,
+			cfg.Pipeline.ExecutiveBriefAllowAll,
 		))
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
 	// C2b3-2c keeps definition editing dark at every ingress, but already owns
@@ -406,6 +431,19 @@ func run() error {
 		st.Close()
 		return fmt.Errorf("run outcome recovery 首轮恢复 Gate: %w", err)
 	}
+	executiveRecoveryRunner, err :=
+		executivebriefrecovery.NewRunner(st, slog.Default())
+	if err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("装配 executive Brief recovery: %w", err)
+	}
+	if err := executiveRecoveryRunner.RunStartup(ctx); err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf(
+			"executive Brief recovery 首轮恢复 Gate: %w", err)
+	}
 
 	// Push-effect recovery has a separate exact-task switch from fresh sends.
 	// When enabled, prepare outbound API authority without opening Feishu WS,
@@ -476,6 +514,9 @@ func run() error {
 			return ctx.Err()
 		}
 	}
+	runMaintenance(func() {
+		executiveRecoveryRunner.Run(ctx)
+	})
 
 	// 配额 reconcile（契约 §2.7）：给缺配额行的租户补齐默认额度。同样后台跑、幂等。
 	//
