@@ -288,3 +288,104 @@ func TestBriefV1RejectsUnsafeOrNonCanonicalInputs(t *testing.T) {
 		})
 	}
 }
+
+func TestObservedEventProvenanceV1SealsCanonicalEvidence(t *testing.T) {
+	occurredAt := time.Date(
+		2026, 7, 28, 8, 30, 0, 123456789, time.FixedZone("test", 8*60*60))
+	first, err := SealObservedEventProvenanceV1(
+		41,
+		strings.Repeat("a", 64),
+		strings.Repeat("b", 64),
+		"model_release",
+		"OpenAI models",
+		occurredAt,
+		json.RawMessage(`{"content_ids":[7,9],"subject":"OpenAI"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if first.OccurredAt.Location() != time.UTC ||
+		first.OccurredAt.Nanosecond()%1000 != 0 {
+		t.Fatalf("occurred_at not canonical: %s", first.OccurredAt)
+	}
+	reordered := json.RawMessage(
+		"{\n \"subject\":\"OpenAI\", \"content_ids\" : [7,9] }")
+	if !first.MatchesEvidenceJSON(reordered) {
+		t.Fatal("canonical-equivalent evidence did not match")
+	}
+	if first.MatchesEvidenceJSON(
+		json.RawMessage(`{"content_ids":[7],"subject":"OpenAI"}`),
+	) {
+		t.Fatal("evidence mutation matched sealed provenance")
+	}
+}
+
+func TestObservedEventProvenanceV1RejectsInvalidInputs(t *testing.T) {
+	valid := func() ObservedEventProvenanceV1 {
+		provenance, err := SealObservedEventProvenanceV1(
+			1,
+			strings.Repeat("a", 64),
+			strings.Repeat("b", 64),
+			"release",
+			"subject",
+			time.Now(),
+			json.RawMessage(`{"content_ids":[1]}`),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return provenance
+	}
+	cases := map[string]func(*ObservedEventProvenanceV1){
+		"zero id": func(p *ObservedEventProvenanceV1) {
+			p.ID = 0
+		},
+		"bad schema": func(p *ObservedEventProvenanceV1) {
+			p.SchemaVersion = "vane.observed-event-provenance/v999"
+		},
+		"bad policy digest": func(p *ObservedEventProvenanceV1) {
+			p.PolicyDigest = strings.Repeat("A", 64)
+		},
+		"bad event key": func(p *ObservedEventProvenanceV1) {
+			p.EventKey = "bad"
+		},
+		"empty subject": func(p *ObservedEventProvenanceV1) {
+			p.Subject = ""
+		},
+		"noncanonical time": func(p *ObservedEventProvenanceV1) {
+			p.OccurredAt = p.OccurredAt.Add(time.Nanosecond)
+		},
+		"bad evidence digest": func(p *ObservedEventProvenanceV1) {
+			p.EvidenceDigest = "bad"
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid()
+			mutate(&candidate)
+			if err := candidate.Validate(); err == nil {
+				t.Fatal("invalid provenance was accepted")
+			}
+		})
+	}
+	for _, raw := range []json.RawMessage{
+		nil,
+		json.RawMessage(`{"content_ids":[1]} trailing`),
+		json.RawMessage{0xff},
+	} {
+		if _, err := SealObservedEventProvenanceV1(
+			1,
+			strings.Repeat("a", 64),
+			strings.Repeat("b", 64),
+			"release",
+			"subject",
+			time.Now(),
+			raw,
+		); err == nil {
+			t.Fatalf("invalid evidence %q was accepted", raw)
+		}
+	}
+}

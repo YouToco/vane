@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/url"
 	"reflect"
 	"sort"
@@ -16,9 +17,10 @@ import (
 )
 
 const (
-	RunOutcomeSchemaVersionV1        = "vane.run-outcome/v1"
-	BriefSchemaVersionV1             = "vane.brief/v1"
-	StructuredInsightSchemaVersionV1 = "vane.cardgen-insight/v1"
+	RunOutcomeSchemaVersionV1              = "vane.run-outcome/v1"
+	BriefSchemaVersionV1                   = "vane.brief/v1"
+	StructuredInsightSchemaVersionV1       = "vane.cardgen-insight/v1"
+	ObservedEventProvenanceSchemaVersionV1 = "vane.observed-event-provenance/v1"
 
 	maxBriefTaskIDBytes      = 255
 	maxBriefFailureCodeBytes = 128
@@ -257,6 +259,78 @@ type StructuredInsightV1 struct {
 	ImportanceReason string              `json:"importance_reason"`
 	Claims           []StructuredClaimV1 `json:"claims"`
 	EvidenceDigest   string              `json:"evidence_digest,omitempty"`
+}
+
+// ObservedEventProvenanceV1 is the immutable, channel-neutral identity of the
+// task_observed_events row that owns one future event-backed Insight. Phase
+// 2-B0 only exposes the sealed Store result; no workflow, Brief, API or
+// renderer consumes it until the later versioned wiring batch.
+type ObservedEventProvenanceV1 struct {
+	ID             int64     `json:"id"`
+	SchemaVersion  string    `json:"schema_version"`
+	PolicyDigest   string    `json:"policy_digest"`
+	EventKey       string    `json:"event_key"`
+	EventType      string    `json:"event_type"`
+	Subject        string    `json:"subject"`
+	OccurredAt     time.Time `json:"occurred_at"`
+	EvidenceDigest string    `json:"evidence_digest"`
+}
+
+// SealObservedEventProvenanceV1 binds a reserved observed-event row to the
+// canonical JSON value supplied to its evidence_json column. The Store calls
+// this only after the reservation transaction has committed.
+func SealObservedEventProvenanceV1(
+	id int64,
+	policyDigest, eventKey, eventType, subject string,
+	occurredAt time.Time,
+	evidenceJSON json.RawMessage,
+) (ObservedEventProvenanceV1, error) {
+	evidenceDigest, err := digestCanonicalJSON(evidenceJSON)
+	if err != nil {
+		return ObservedEventProvenanceV1{},
+			errors.New("observed event evidence is invalid")
+	}
+	provenance := ObservedEventProvenanceV1{
+		ID:             id,
+		SchemaVersion:  ObservedEventProvenanceSchemaVersionV1,
+		PolicyDigest:   policyDigest,
+		EventKey:       eventKey,
+		EventType:      eventType,
+		Subject:        subject,
+		OccurredAt:     canonicalBriefTime(occurredAt),
+		EvidenceDigest: evidenceDigest,
+	}
+	if err := provenance.Validate(); err != nil {
+		return ObservedEventProvenanceV1{}, err
+	}
+	return provenance, nil
+}
+
+func (p ObservedEventProvenanceV1) Validate() error {
+	if p.ID <= 0 ||
+		p.SchemaVersion != ObservedEventProvenanceSchemaVersionV1 ||
+		!validBriefDigest(p.PolicyDigest) ||
+		!validBriefDigest(p.EventKey) ||
+		!validBriefText(p.EventType, maxStructuredFieldBytes, false) ||
+		!validBriefText(p.Subject, maxStructuredFieldBytes, false) ||
+		p.OccurredAt.IsZero() ||
+		p.OccurredAt != canonicalBriefTime(p.OccurredAt) ||
+		!validBriefDigest(p.EvidenceDigest) {
+		return errors.New("observed event provenance is invalid")
+	}
+	return nil
+}
+
+// MatchesEvidenceJSON verifies that a later projection still refers to the
+// exact canonical evidence value sealed at reservation time.
+func (p ObservedEventProvenanceV1) MatchesEvidenceJSON(
+	evidenceJSON json.RawMessage,
+) bool {
+	if err := p.Validate(); err != nil {
+		return false
+	}
+	digest, err := digestCanonicalJSON(evidenceJSON)
+	return err == nil && equalBriefDigest(digest, p.EvidenceDigest)
 }
 
 func (s StructuredInsightV1) Validate() error {
@@ -577,6 +651,31 @@ func validBriefSourceURL(value string) bool {
 }
 
 func digestJSON(value any) (string, error) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func digestCanonicalJSON(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || !utf8.Valid(raw) {
+		return "", errors.New("canonical JSON is empty or invalid UTF-8")
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return "", err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return "", errors.New("canonical JSON has trailing data")
+		}
+		return "", err
+	}
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return "", err

@@ -11,6 +11,7 @@
 - M5 画像+反馈闭环契约：[docs/m5-profile-contract.md](docs/m5-profile-contract.md)（17 节签名级；第 16 节是 Gate 验证清单）
 - 双轨 Agent Runtime：[docs/agent-runtime-contract.md](docs/agent-runtime-contract.md)（ExecutionMode、运行快照、PlanFetch、预算与发布列车）
 - Phase 2 结构化 Insight：[docs/structured-insight-contract.md](docs/structured-insight-contract.md)（单次 CardGen、引用校验、Brief 冻结、Temporal/rollout 边界）
+- Phase 2 事件证据地基：[docs/structured-event-evidence-contract.md](docs/structured-event-evidence-contract.md)（零调用点 observed-event provenance、first-writer replay 与后续接线边界）
 
 ## 构建 / 测试 / 部署
 

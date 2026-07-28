@@ -208,6 +208,29 @@ func TestObservationQualificationCheckpointAndEventLedger(t *testing.T) {
 		Scan(&rows); err != nil || rows != 1 {
 		t.Fatalf("ledger rows=%d err=%v", rows, err)
 	}
+	provenance, ok, err := f.base.st.ReserveObservedEventProvenanceV1(
+		ctx, f.idA, f.refA, batchA, observation.QualifiedEvent{
+			PolicyDigest: event.PolicyDigest,
+			EventKey:     event.EventKey,
+			EventType:    "caller-replay-must-not-win",
+			Subject:      "caller replay must not win",
+			OccurredAt:   event.OccurredAt.Add(time.Hour),
+			EvidenceJSON: json.RawMessage(`{"content_ids":[999]}`),
+		},
+	)
+	if err != nil || !ok {
+		t.Fatalf("provenance replay accepted=%v err=%v", ok, err)
+	}
+	if provenance.ID <= 0 ||
+		provenance.EventType != event.EventType ||
+		provenance.Subject != event.Subject ||
+		!provenance.OccurredAt.Equal(event.OccurredAt) ||
+		!provenance.MatchesEvidenceJSON(event.EvidenceJSON) ||
+		provenance.MatchesEvidenceJSON(
+			json.RawMessage(`{"content_ids":[999]}`),
+		) {
+		t.Fatalf("provenance did not bind stored first writer: %+v", provenance)
+	}
 
 	otherIdentity := scheduledRunIdentity(
 		f.taskA, f.base.tenantID, f.base.userID, "run-observe-"+uuid.NewString())

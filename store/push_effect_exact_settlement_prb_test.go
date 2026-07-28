@@ -854,11 +854,13 @@ func TestPRBPushEffectAllowsBoundCurrentObservedEventReservationReplay(
 	key := "prb-freeze-reserve-replay-" + uuid.NewString()
 	batchID := createObservationBatch(t, f, f.idA, f.refA, key)
 	event := prbQualifiedEvent("9", "a")
-	accepted, err := f.base.st.ReserveObservedEventV1(
+	first, accepted, err := f.base.st.ReserveObservedEventProvenanceV1(
 		ctx, f.idA, f.refA, batchID, event,
 	)
-	if err != nil || !accepted {
-		t.Fatalf("initial reserve accepted=%v err=%v", accepted, err)
+	if err != nil || !accepted || first.ID <= 0 ||
+		!first.MatchesEvidenceJSON(event.EvidenceJSON) {
+		t.Fatalf("initial provenance=%+v accepted=%v err=%v",
+			first, accepted, err)
 	}
 	contentID := f.createContent(t, f.sourceA, "prb-freeze-reserve-replay")
 	deliveryID, _, _, err := f.base.st.InsertDeliveryForTaskRunV1(
@@ -893,12 +895,13 @@ func TestPRBPushEffectAllowsBoundCurrentObservedEventReservationReplay(
 	if _, err := f.base.st.CreatePushEffect(ctx, prepared); err != nil {
 		t.Fatal(err)
 	}
-	accepted, err = f.base.st.ReserveObservedEventV1(
+	replayed, accepted, err := f.base.st.ReserveObservedEventProvenanceV1(
 		ctx, f.idA, f.refA, batchID, event,
 	)
-	if err != nil || !accepted {
-		t.Fatalf("frozen exact reserve replay accepted=%v err=%v",
-			accepted, err)
+	if err != nil || !accepted || replayed != first {
+		t.Fatalf(
+			"frozen provenance replay=%+v want=%+v accepted=%v err=%v",
+			replayed, first, accepted, err)
 	}
 }
 
