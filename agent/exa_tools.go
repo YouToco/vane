@@ -231,6 +231,13 @@ func (t *webSearchTool) Execute(ctx context.Context, userID int64, args json.Raw
 	if err != nil {
 		return exaToolError(err)
 	}
+	if state := runStateFrom(ctx); state != nil &&
+		state.externalFollowupSearchAttempted &&
+		state.externalFollowupSearchQuery == strings.TrimSpace(a.Query) {
+		// 只有真实上游无错返回才能授权本轮模型总结为检索结果。预算拒绝、
+		// 日限额检查失败、AppError 和基础设施错误都在此前返回，保持 false。
+		state.externalFollowupSearchSucceeded = true
+	}
 	if len(results) == 0 {
 		return "没有搜到相关结果。可以换个说法、放宽 include_domains，或改用 read_page 直接读已知页面。", nil
 	}
