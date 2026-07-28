@@ -859,7 +859,7 @@ func TestFeedbackStore(t *testing.T) {
 				`DELETE FROM tenants WHERE id=$1`, tenantB)
 		})
 
-		var legacyID, foreignTypedID int64
+		var legacyID int64
 		if err := st.pool.QueryRow(ctx,
 			`INSERT INTO feedbacks (
 			     tenant_id,user_id,delivery_id,action
@@ -870,15 +870,15 @@ func TestFeedbackStore(t *testing.T) {
 		).Scan(&legacyID); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.pool.QueryRow(ctx,
+		if _, err := st.pool.Exec(ctx,
 			`INSERT INTO feedbacks (
 			     tenant_id,user_id,delivery_id,action,reason_code
 			 )
 			 VALUES ($1,$2,$3,'misjudged','outdated_or_out_of_window')
-			 RETURNING id`,
+			`,
 			tenantB, u.ID, deliveryID,
-		).Scan(&foreignTypedID); err != nil {
-			t.Fatal(err)
+		); err == nil {
+			t.Fatal("跨租户 delivery feedback 应被 subject scope 拒绝")
 		}
 
 		rows, err := st.ListFeedbacksForEvolutionForTenant(
@@ -907,9 +907,8 @@ func TestFeedbackStore(t *testing.T) {
 		if err != nil {
 			t.Fatalf("用户全局读取失败: %v", err)
 		}
-		if len(rows) != 2 || rows[0].ID != legacyID ||
-			rows[1].ID != foreignTypedID {
-			t.Fatalf("跨租户 typed 行不得压掉旧负兴趣，实际 %+v", rows)
+		if len(rows) != 1 || rows[0].ID != legacyID {
+			t.Fatalf("被拒绝的跨租户 typed 行不得出现，实际 %+v", rows)
 		}
 	})
 

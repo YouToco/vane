@@ -133,6 +133,7 @@ var purgeOrder = []purgeStep{
 	{"profile_claim_events", "tenant_id = $1"},
 	{"profile_claims", "tenant_id = $1"},
 	{"profile_claim_states", "tenant_id = $1"},
+	{"profile_epochs", "tenant_id = $1"},
 	{"profile_edit_receipts", "tenant_id = $1"},
 	{"profile_edit_revisions", "tenant_id = $1"},
 	{"profiles", "tenant_id = $1"},
@@ -205,10 +206,11 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		return nil, types.NewAppError(
 			types.CodeDatabase, "锁定推送效果 schema 准入", err)
 	}
-	var canonicalBriefStagesAvailable bool
+	var canonicalBriefStagesAvailable, profileEpochsAvailable bool
 	if err := tx.QueryRow(ctx,
-		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL`,
-	).Scan(&canonicalBriefStagesAvailable); err != nil {
+		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
+		        to_regclass('public.profile_epochs') IS NOT NULL`,
+	).Scan(&canonicalBriefStagesAvailable, &profileEpochsAvailable); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查 canonical Brief 清理能力", err)
 	}
@@ -372,6 +374,11 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			!canonicalBriefStagesAvailable {
 			// A current binary may safely drain while migration 064 has
 			// already been rolled back to 063.
+			continue
+		}
+		if st.table == "profile_epochs" && !profileEpochsAvailable {
+			// Current binaries may finish a tenant purge after migration 066
+			// has safely rolled back to an epoch-0-only schema.
 			continue
 		}
 		// #nosec G201 -- table 与 where 都来自本文件的常量表，不含任何外部输入；

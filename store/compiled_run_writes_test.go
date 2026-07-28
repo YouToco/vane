@@ -78,7 +78,7 @@ func newCompiledRunWriteFixture(t *testing.T) *compiledRunWriteFixture {
 			`DELETE FROM push_batches WHERE tenant_id IN ($1, $2)`, base.tenantID, f.tenantB)
 		for _, table := range []string{
 			"profile_claim_receipts", "profile_claim_events",
-			"profile_claims", "profile_claim_states",
+			"profile_claims", "profile_claim_states", "profile_epochs",
 		} {
 			cleanupExec(cleanupCtx, t, base.st,
 				"DELETE FROM "+table+" WHERE user_id=$1", base.userID)
@@ -133,6 +133,19 @@ func (f *compiledRunWriteFixture) createClaimProfile(
 		f.idA.TenantID, f.idA.UserID, industry, tags); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO profile_epochs(tenant_id,user_id,profile_epoch)
+		VALUES($1,$2,0)`, f.idA.TenantID, f.idA.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO profile_claim_states(tenant_id,user_id)
+		VALUES($1,$2)`, f.idA.TenantID, f.idA.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindProfileEpochTx(ctx, tx, 0); err != nil {
+		t.Fatal(err)
+	}
 	if summary != "" {
 		if _, err := tx.Exec(ctx, `
 			UPDATE profiles SET summary=$3
@@ -141,11 +154,6 @@ func (f *compiledRunWriteFixture) createClaimProfile(
 			t.Fatal(err)
 		}
 	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO profile_claim_states(tenant_id,user_id)
-		VALUES($1,$2)`, f.idA.TenantID, f.idA.UserID); err != nil {
-		t.Fatal(err)
-	}
 	insertClaim := func(field, value string) {
 		t.Helper()
 		if value == "" {
@@ -153,8 +161,8 @@ func (f *compiledRunWriteFixture) createClaimProfile(
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO profile_claims
-			    (tenant_id,user_id,field_name,claim_value,source_state)
-			VALUES($1,$2,$3,$4,'source_unavailable')`,
+			    (tenant_id,user_id,profile_epoch,field_name,claim_value,source_state)
+			VALUES($1,$2,0,$3,$4,'source_unavailable')`,
 			f.idA.TenantID, f.idA.UserID, field, value); err != nil {
 			t.Fatal(err)
 		}

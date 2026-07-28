@@ -85,7 +85,8 @@ func (s *Store) InsertFeedbackWithSessionCutoff(
 		return 0, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("解析反馈租户（delivery=%d）", f.DeliveryID), err)
 	}
-	if err := setAgentEventRuntimeContext(ctx, tx, tenantID); err != nil {
+	if err := setFeedbackRuntimeContext(
+		ctx, tx, tenantID, f.UserID); err != nil {
 		return 0, err
 	}
 
@@ -160,6 +161,25 @@ func (s *Store) InsertFeedbackWithSessionCutoff(
 			types.CodeDatabase, "提交反馈事实事务", err)
 	}
 	return id, nil
+}
+
+func setFeedbackRuntimeContext(
+	ctx context.Context, tx pgx.Tx, tenantID, userID int64,
+) error {
+	if tenantID <= 0 || userID <= 0 {
+		return types.NewAppError(
+			types.CodeValidation, "反馈事实主体范围无效", types.ErrValidation)
+	}
+	if err := setAgentEventRuntimeContext(ctx, tx, tenantID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT set_config('app.user_id',$1,true)`,
+		fmt.Sprintf("%d", userID)); err != nil {
+		return types.NewAppError(
+			types.CodeDatabase, "设置反馈事实用户上下文", err)
+	}
+	return nil
 }
 
 func insertFeedbackFact(

@@ -19,7 +19,7 @@ const (
 	maxPublicEventContextClaims   = 100
 	maxPublicFirstProfileClaims   = 614
 	maxPublicActionProfileClaims  = 516
-	profileClaimEventCursorSchema = "vane.profile-claim-event-cursor/v1"
+	profileClaimEventCursorSchema = "vane.profile-claim-event-cursor/v2"
 	profileClaimEventCursorKind   = "profile_claim_events"
 )
 
@@ -33,6 +33,7 @@ type profileClaimEventCursor struct {
 	Kind               string `json:"kind"`
 	TenantID           int64  `json:"tenant_id"`
 	UserID             int64  `json:"user_id"`
+	ProfileEpoch       int64  `json:"profile_epoch"`
 	SnapshotVersion    int64  `json:"snapshot_version"`
 	SnapshotMaxEventID int64  `json:"snapshot_max_event_id"`
 	BeforeEventID      int64  `json:"before_event_id"`
@@ -66,6 +67,7 @@ func decodeProfileClaimEventCursor(token string) (profileClaimEventCursor, error
 	if cursor.Schema != profileClaimEventCursorSchema ||
 		cursor.Kind != profileClaimEventCursorKind ||
 		cursor.TenantID <= 0 || cursor.UserID <= 0 ||
+		cursor.ProfileEpoch < 0 ||
 		cursor.SnapshotVersion < 0 || cursor.SnapshotMaxEventID <= 0 ||
 		cursor.BeforeEventID <= 0 ||
 		cursor.BeforeEventID > cursor.SnapshotMaxEventID ||
@@ -83,6 +85,7 @@ func validateProfileClaimCursorJSON(raw []byte) error {
 	}
 	allowed := map[string]bool{
 		"schema": true, "kind": true, "tenant_id": true, "user_id": true,
+		"profile_epoch":    true,
 		"snapshot_version": true, "snapshot_max_event_id": true,
 		"before_event_id": true, "limit": true,
 	}

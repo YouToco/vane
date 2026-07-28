@@ -54,9 +54,18 @@ func (s *Store) listFeedbacksForEvolution(
 		        COALESCE(ci.title, ''),
 		        COALESCE(left(ci.content, 200), '')
 		 FROM feedbacks f
+		 LEFT JOIN profile_claim_states pcs
+		   ON pcs.tenant_id=f.tenant_id AND pcs.user_id=f.user_id
+		 LEFT JOIN profiles p
+		   ON p.tenant_id=f.tenant_id AND p.user_id=f.user_id
 		 JOIN deliveries d ON d.id = f.delivery_id
 		 LEFT JOIN content_items ci ON ci.id = d.content_item_id
 		 WHERE f.user_id = $1 AND f.id > $2
+		   AND (
+		     (pcs.user_id IS NOT NULL AND pcs.active_epoch=f.profile_epoch)
+		     OR
+		     (pcs.user_id IS NULL AND p.user_id IS NULL AND f.profile_epoch=0)
+		   )
 		   AND NOT (
 		       f.action = 'not_interested'
 		       AND btrim(f.detail) = ''
@@ -65,6 +74,7 @@ func (s *Store) listFeedbacksForEvolution(
 		             FROM feedbacks superseding
 		            WHERE superseding.tenant_id = f.tenant_id
 		              AND superseding.user_id = f.user_id
+		              AND superseding.profile_epoch = f.profile_epoch
 		              AND superseding.delivery_id = f.delivery_id
 		              AND superseding.id > f.id
 		              AND superseding.action = 'misjudged'
@@ -81,10 +91,19 @@ func (s *Store) listFeedbacksForEvolution(
 		        COALESCE(ci.title, ''),
 		        COALESCE(left(ci.content, 200), '')
 		 FROM feedbacks f
+		 LEFT JOIN profile_claim_states pcs
+		   ON pcs.tenant_id=f.tenant_id AND pcs.user_id=f.user_id
+		 LEFT JOIN profiles p
+		   ON p.tenant_id=f.tenant_id AND p.user_id=f.user_id
 		 JOIN deliveries d
 		   ON d.id = f.delivery_id AND d.tenant_id = $1
 		 LEFT JOIN content_items ci ON ci.id = d.content_item_id
 		 WHERE f.tenant_id = $1 AND f.user_id = $2 AND f.id > $3
+		   AND (
+		     (pcs.user_id IS NOT NULL AND pcs.active_epoch=f.profile_epoch)
+		     OR
+		     (pcs.user_id IS NULL AND p.user_id IS NULL AND f.profile_epoch=0)
+		   )
 		   AND NOT (
 		       f.action = 'not_interested'
 		       AND btrim(f.detail) = ''
@@ -93,6 +112,7 @@ func (s *Store) listFeedbacksForEvolution(
 		             FROM feedbacks superseding
 		            WHERE superseding.tenant_id = f.tenant_id
 		              AND superseding.user_id = f.user_id
+		              AND superseding.profile_epoch = f.profile_epoch
 		              AND superseding.delivery_id = f.delivery_id
 		              AND superseding.id > f.id
 		              AND superseding.action = 'misjudged'
@@ -154,8 +174,17 @@ func (s *Store) ListRecentNegativeFeedbackTitles(ctx context.Context, userID int
 		     SELECT DISTINCT ON (f.delivery_id)
 		            f.delivery_id, f.action, f.reason_code, f.created_at
 		     FROM feedbacks f
+		     LEFT JOIN profile_claim_states pcs
+		       ON pcs.tenant_id=f.tenant_id AND pcs.user_id=f.user_id
+		     LEFT JOIN profiles p
+		       ON p.tenant_id=f.tenant_id AND p.user_id=f.user_id
 		     WHERE f.user_id = $1 AND f.created_at >= $2
 		       AND f.action IN ('interested', 'not_interested', 'misjudged')
+		       AND (
+		         (pcs.user_id IS NOT NULL AND pcs.active_epoch=f.profile_epoch)
+		         OR
+		         (pcs.user_id IS NULL AND p.user_id IS NULL AND f.profile_epoch=0)
+		       )
 		     ORDER BY f.delivery_id, f.created_at DESC, f.id DESC
 		 ) latest
 		 JOIN deliveries d ON d.id = latest.delivery_id
@@ -216,8 +245,17 @@ func (s *Store) ListRecentNegativeFeedbackTitlesForTenant(
 		     SELECT DISTINCT ON (f.delivery_id)
 		            f.delivery_id, f.action, f.reason_code, f.created_at
 		     FROM feedbacks f
+		     LEFT JOIN profile_claim_states pcs
+		       ON pcs.tenant_id=f.tenant_id AND pcs.user_id=f.user_id
+		     LEFT JOIN profiles p
+		       ON p.tenant_id=f.tenant_id AND p.user_id=f.user_id
 		     WHERE f.tenant_id = $1 AND f.user_id = $2 AND f.created_at >= $3
 		       AND f.action IN ('interested', 'not_interested', 'misjudged')
+		       AND (
+		         (pcs.user_id IS NOT NULL AND pcs.active_epoch=f.profile_epoch)
+		         OR
+		         (pcs.user_id IS NULL AND p.user_id IS NULL AND f.profile_epoch=0)
+		       )
 		     ORDER BY f.delivery_id, f.created_at DESC, f.id DESC
 		 ) latest
 		 JOIN deliveries d
