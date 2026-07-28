@@ -62,7 +62,7 @@ func (cg *CardGen) GenerateStructuredWithPolicyV2(
 		return StructuredInsightV1{}, err
 	}
 	insight, err := ParseStructuredInsightV1([]byte(raw), map[string]string{
-		"source-1": structuredSourceTextV1(item.Item),
+		"source-1": StructuredEvidenceTextV1(item.Item),
 	})
 	if err != nil {
 		return StructuredInsightV1{}, types.NewAppError(
@@ -83,8 +83,23 @@ func buildStructuredCardUserV1(hint string, item types.ContentItem) string {
 func structuredSourceTextV1(item types.ContentItem) string {
 	return "标题：" +
 		promptguard.Sanitize(promptguard.SingleLine(item.Title)) +
-		"\n正文：" +
-		promptguard.Sanitize(truncateRunes(item.Content, maxContentRunes))
+		"\n正文：" + StructuredEvidenceTextV1(item)
+}
+
+// StructuredEvidenceTextV1 is the exact request-owned body corpus accepted
+// for claim excerpts. Titles remain visible to the model but are deliberately
+// excluded from factual evidence.
+func StructuredEvidenceTextV1(item types.ContentItem) string {
+	return promptguard.Sanitize(truncateRunes(item.Content, maxContentRunes))
+}
+
+type structuredInsightWireV1 struct {
+	SchemaVersion    string                    `json:"schema_version"`
+	BodyMD           string                    `json:"body_md"`
+	WhatChanged      string                    `json:"what_changed"`
+	WhyItMatters     string                    `json:"why_it_matters"`
+	ImportanceReason string                    `json:"importance_reason"`
+	Claims           []types.StructuredClaimV1 `json:"claims"`
 }
 
 // ParseStructuredInsightV1 validates one model response against the exact
@@ -100,17 +115,42 @@ func ParseStructuredInsightV1(raw []byte, sources map[string]string) (Structured
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	var insight StructuredInsightV1
-	if err := decoder.Decode(&insight); err != nil {
+	var wire structuredInsightWireV1
+	if err := decoder.Decode(&wire); err != nil {
 		return StructuredInsightV1{}, fmt.Errorf("decode structured insight: %w", err)
 	}
 	if err := requireJSONEOF(decoder); err != nil {
 		return StructuredInsightV1{}, err
 	}
+	insight := StructuredInsightV1{
+		SchemaVersion: wire.SchemaVersion, BodyMD: wire.BodyMD,
+		WhatChanged: wire.WhatChanged, WhyItMatters: wire.WhyItMatters,
+		ImportanceReason: wire.ImportanceReason, Claims: wire.Claims,
+	}
 	if insight.SchemaVersion != StructuredInsightSchemaV1 ||
 		!validStructuredText(insight.BodyMD, maxStructuredBodyBytes, false) {
 		return StructuredInsightV1{}, errors.New("structured insight envelope is invalid")
 	}
+	if !validStructuredProjectionV1(insight) {
+		insight.WhatChanged = ""
+		insight.WhyItMatters = ""
+		insight.ImportanceReason = ""
+		insight.Claims = nil
+	}
+	sealed, err := types.SealStructuredInsightEvidenceV1(insight, sources)
+	if err == nil {
+		return sealed, nil
+	}
+	// A valid envelope/body survives any optional projection or provenance
+	// failure. This remains the same single model response: no repair call.
+	insight.WhatChanged = ""
+	insight.WhyItMatters = ""
+	insight.ImportanceReason = ""
+	insight.Claims = nil
+	return types.SealStructuredInsightEvidenceV1(insight, sources)
+}
+
+func validStructuredProjectionV1(insight StructuredInsightV1) bool {
 	structured := []string{insight.WhatChanged, insight.WhyItMatters, insight.ImportanceReason}
 	present := 0
 	for _, value := range structured {
@@ -118,50 +158,38 @@ func ParseStructuredInsightV1(raw []byte, sources map[string]string) (Structured
 			present++
 		}
 		if !validStructuredText(value, maxStructuredFieldBytes, true) {
-			return StructuredInsightV1{}, errors.New("structured insight field is invalid")
+			return false
 		}
 	}
 	if present != 0 && present != len(structured) {
-		return StructuredInsightV1{}, errors.New("structured insight projection is incomplete")
+		return false
 	}
 	if len(insight.Claims) > maxStructuredClaims || (len(insight.Claims) > 0 && present == 0) {
-		return StructuredInsightV1{}, errors.New("structured insight claims are invalid")
+		return false
 	}
 	for _, claim := range insight.Claims {
 		if !validStructuredText(claim.Text, maxStructuredFieldBytes, false) ||
 			!validStructuredText(claim.Excerpt, maxStructuredFieldBytes, false) ||
 			len(claim.SourceRefs) == 0 || len(claim.SourceRefs) > maxStructuredRefs {
-			return StructuredInsightV1{}, errors.New("structured insight claim is invalid")
+			return false
 		}
-		matched := false
 		seen := make(map[string]struct{}, len(claim.SourceRefs))
 		for _, ref := range claim.SourceRefs {
-			source, ok := sources[ref]
-			if !ok || !validStructuredText(ref, 255, false) {
-				return StructuredInsightV1{}, errors.New("structured insight source reference is invalid")
+			if !validStructuredText(ref, 255, false) {
+				return false
 			}
 			if _, exists := seen[ref]; exists {
-				return StructuredInsightV1{}, errors.New("structured insight source reference is duplicated")
+				return false
 			}
 			seen[ref] = struct{}{}
-			if strings.Contains(normalizeEvidenceText(source), normalizeEvidenceText(claim.Excerpt)) {
-				matched = true
-			}
-		}
-		if !matched {
-			return StructuredInsightV1{}, errors.New("structured insight excerpt is not cited")
 		}
 	}
-	return insight, nil
+	return true
 }
 
 func validStructuredText(value string, maxBytes int, allowEmpty bool) bool {
 	return (allowEmpty || value != "") && len(value) <= maxBytes &&
 		utf8.ValidString(value) && strings.TrimSpace(value) == value
-}
-
-func normalizeEvidenceText(value string) string {
-	return strings.Join(strings.Fields(value), " ")
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {

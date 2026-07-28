@@ -318,6 +318,7 @@ type CanonicalBriefStructuredStoreV1 interface {
 		context.Context, types.RunIdentity, types.RunSnapshotRef,
 		types.RunOutcomeMarkerV1, int64, time.Time, []int64,
 		map[int64]types.StructuredInsightV1,
+		map[int64]map[string]string,
 	) (types.BriefDraftV1, error)
 }
 
@@ -1190,7 +1191,8 @@ func (a *Activities) PrepareCanonicalBriefV1(
 		draft, err = structuredStore.PrepareBriefDraftV2(
 			ctx, expected, in.Run.Snapshot, in.Marker, batchID,
 			in.GeneratedAt, plan.orderedDeliveryIDs,
-			plan.structuredByDelivery)
+			plan.structuredByDelivery,
+			plan.structuredEvidenceByDelivery)
 	} else {
 		draft, err = a.canonicalBriefStore.PrepareBriefDraftV1(
 			ctx, expected, in.Run.Snapshot, in.Marker, batchID,
@@ -3153,11 +3155,12 @@ type plannedPushChunk struct {
 }
 
 type pushDeliveryPlan struct {
-	orderedDeliveryIDs   []int64
-	structuredByDelivery map[int64]types.StructuredInsightV1
-	pending              []pushPendingItem
-	anySent              bool
-	skippedEvents        int
+	orderedDeliveryIDs           []int64
+	structuredByDelivery         map[int64]types.StructuredInsightV1
+	structuredEvidenceByDelivery map[int64]map[string]string
+	pending                      []pushPendingItem
+	anySent                      bool
+	skippedEvents                int
 }
 
 func (a *Activities) preparePushDeliveries(
@@ -3236,8 +3239,15 @@ func (a *Activities) preparePushDeliveries(
 			if plan.structuredByDelivery == nil {
 				plan.structuredByDelivery =
 					make(map[int64]types.StructuredInsightV1)
+				plan.structuredEvidenceByDelivery =
+					make(map[int64]map[string]string)
 			}
 			plan.structuredByDelivery[deliveryID] = *card.Structured
+			plan.structuredEvidenceByDelivery[deliveryID] =
+				map[string]string{
+					"source-1": cardgenpkg.StructuredEvidenceTextV1(
+						card.Scored.Item),
+				}
 		}
 		if compiled && eventKey != "" {
 			if err := a.observationStore.BindObservedEventDeliveryV1(

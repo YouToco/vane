@@ -92,6 +92,43 @@ func TestBriefV1StructuredBodyMustMatchCanonicalBody(t *testing.T) {
 	}
 }
 
+func TestStructuredInsightEvidenceBindsExactSourcesAndEveryRef(t *testing.T) {
+	insight := StructuredInsightV1{
+		SchemaVersion: StructuredInsightSchemaVersionV1,
+		BodyMD:        "正文", WhatChanged: "变化",
+		WhyItMatters: "原因", ImportanceReason: "依据",
+		Claims: []StructuredClaimV1{{
+			Text: "事实", Excerpt: "共同原文",
+			SourceRefs: []string{"source-1", "source-2"},
+		}},
+	}
+	sources := map[string]string{
+		"source-1": "第一份共同原文证据",
+		"source-2": "第二份共同原文证据",
+	}
+	sealed, err := SealStructuredInsightEvidenceV1(insight, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sealed.EvidenceDigest == "" ||
+		ValidateStructuredInsightEvidenceV1(sealed, sources) != nil {
+		t.Fatalf("sealed evidence = %+v", sealed)
+	}
+	tampered := map[string]string{
+		"source-1": sources["source-1"],
+		"source-2": "第二份没有该摘录",
+	}
+	if err := ValidateStructuredInsightEvidenceV1(
+		sealed, tampered); err == nil {
+		t.Fatal("one unmatched cited source was accepted")
+	}
+	if err := ValidateStructuredInsightEvidenceV1(
+		sealed, map[string]string{"source-1": sources["source-1"]},
+	); err == nil {
+		t.Fatal("missing cited source was accepted")
+	}
+}
+
 func TestGeneratedLegacyInsightJSONOmitsStructuredExtension(t *testing.T) {
 	payload, err := json.Marshal(InsightV1{ID: 1})
 	if err != nil {

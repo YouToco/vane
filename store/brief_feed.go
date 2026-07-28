@@ -32,8 +32,28 @@ type TaskBriefQuery struct {
 // state projected onto Feishu cards. Feedback is intentionally not part of the
 // immutable Brief digest.
 type TaskBriefInsightV1 struct {
-	types.InsightV1
-	Feedback TaskBriefFeedbackStateV1 `json:"feedback"`
+	ID           int64                         `json:"id"`
+	RankPosition int                           `json:"rank_position"`
+	Title        string                        `json:"title"`
+	BodyMD       string                        `json:"body_md"`
+	SourceTitle  string                        `json:"source_title"`
+	SourceURL    string                        `json:"source_url"`
+	PublishedAt  *time.Time                    `json:"published_at,omitempty"`
+	DiscoveredAt time.Time                     `json:"discovered_at"`
+	Structured   *TaskBriefStructuredInsightV1 `json:"structured,omitempty"`
+	Feedback     TaskBriefFeedbackStateV1      `json:"feedback"`
+}
+
+// TaskBriefStructuredInsightV1 deliberately omits the internal evidence
+// digest. Readers receive the verified claims and excerpts, not a fingerprint
+// of private source body bytes.
+type TaskBriefStructuredInsightV1 struct {
+	SchemaVersion    string                    `json:"schema_version"`
+	BodyMD           string                    `json:"body_md"`
+	WhatChanged      string                    `json:"what_changed"`
+	WhyItMatters     string                    `json:"why_it_matters"`
+	ImportanceReason string                    `json:"importance_reason"`
+	Claims           []types.StructuredClaimV1 `json:"claims"`
 }
 
 type TaskBriefFeedbackStateV1 struct {
@@ -304,9 +324,27 @@ func (s *Store) ListTaskBriefsV1(
 			Insights: make([]TaskBriefInsightV1, len(brief.Insights)),
 		})
 		for i := range brief.Insights {
-			page.Items[len(page.Items)-1].Insights[i] = TaskBriefInsightV1{
-				InsightV1: brief.Insights[i],
+			frozen := brief.Insights[i]
+			projected := TaskBriefInsightV1{
+				ID: frozen.ID, RankPosition: frozen.RankPosition,
+				Title: frozen.Title, BodyMD: frozen.BodyMD,
+				SourceTitle: frozen.SourceTitle, SourceURL: frozen.SourceURL,
+				PublishedAt:  frozen.PublishedAt,
+				DiscoveredAt: frozen.DiscoveredAt,
 			}
+			if frozen.Structured != nil {
+				projected.Structured = &TaskBriefStructuredInsightV1{
+					SchemaVersion:    frozen.Structured.SchemaVersion,
+					BodyMD:           frozen.Structured.BodyMD,
+					WhatChanged:      frozen.Structured.WhatChanged,
+					WhyItMatters:     frozen.Structured.WhyItMatters,
+					ImportanceReason: frozen.Structured.ImportanceReason,
+					Claims: append(
+						[]types.StructuredClaimV1(nil),
+						frozen.Structured.Claims...),
+				}
+			}
+			page.Items[len(page.Items)-1].Insights[i] = projected
 		}
 	}
 	if err := rows.Err(); err != nil {

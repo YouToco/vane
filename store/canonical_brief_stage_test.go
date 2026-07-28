@@ -136,20 +136,33 @@ func TestStructuredBriefStageFirstWriteReplayAndConflict(t *testing.T) {
 		2026, 7, 28, 1, 2, 3, 456000, time.UTC)
 	order := []int64{f.deliveryID[1], f.deliveryID[0]}
 	structured := make(map[int64]types.StructuredInsightV1, len(order))
+	evidence := make(map[int64]map[string]string, len(order))
 	for index, deliveryID := range f.deliveryID {
-		structured[deliveryID] = types.StructuredInsightV1{
-			SchemaVersion: types.StructuredInsightSchemaVersionV1,
-			BodyMD: f.bodyMD[index], WhatChanged: "change",
-			WhyItMatters: "reason", ImportanceReason: "evidence",
-			Claims: []types.StructuredClaimV1{{
-				Text: "claim", Excerpt: "excerpt",
-				SourceRefs: []string{"source-1"},
-			}},
+		sourceText := fmt.Sprintf("verified excerpt %d", index)
+		if _, err := f.base.st.pool.Exec(t.Context(),
+			`UPDATE content_items SET content=$1 WHERE id=$2`,
+			sourceText, f.contentID[index]); err != nil {
+			t.Fatal(err)
 		}
+		evidence[deliveryID] = map[string]string{"source-1": sourceText}
+		value, err := types.SealStructuredInsightEvidenceV1(
+			types.StructuredInsightV1{
+				SchemaVersion: types.StructuredInsightSchemaVersionV1,
+				BodyMD:        f.bodyMD[index], WhatChanged: "change",
+				WhyItMatters: "reason", ImportanceReason: "evidence",
+				Claims: []types.StructuredClaimV1{{
+					Text: "claim", Excerpt: sourceText,
+					SourceRefs: []string{"source-1"},
+				}},
+			}, evidence[deliveryID])
+		if err != nil {
+			t.Fatal(err)
+		}
+		structured[deliveryID] = value
 	}
 	draft, err := f.base.st.PrepareBriefDraftV2(
 		t.Context(), f.identity, f.ref, marker,
-		f.batchID, generatedAt, order, structured)
+		f.batchID, generatedAt, order, structured, evidence)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +174,7 @@ func TestStructuredBriefStageFirstWriteReplayAndConflict(t *testing.T) {
 	}
 	replayed, err := f.base.st.PrepareBriefDraftV2(
 		t.Context(), f.identity, f.ref, marker,
-		f.batchID, generatedAt, order, structured)
+		f.batchID, generatedAt, order, structured, evidence)
 	if err != nil {
 		t.Fatalf("exact structured replay failed: %v", err)
 	}
@@ -180,9 +193,35 @@ func TestStructuredBriefStageFirstWriteReplayAndConflict(t *testing.T) {
 	changed[order[0]] = mutated
 	if _, err := f.base.st.PrepareBriefDraftV2(
 		t.Context(), f.identity, f.ref, marker,
-		f.batchID, generatedAt, order, changed,
+		f.batchID, generatedAt, order, changed, evidence,
 	); err == nil {
 		t.Fatal("structured stage replay admitted different semantics")
+	}
+	forged := make(map[int64]types.StructuredInsightV1, len(structured))
+	for deliveryID, insight := range structured {
+		insight.Claims = append([]types.StructuredClaimV1(nil), insight.Claims...)
+		for index := range insight.Claims {
+			insight.Claims[index].SourceRefs = append(
+				[]string(nil), insight.Claims[index].SourceRefs...)
+		}
+		forged[deliveryID] = insight
+	}
+	target := order[0]
+	forgedValue := forged[target]
+	forgedValue.Claims[0].SourceRefs = []string{"forged"}
+	forgedValue, err = types.SealStructuredInsightEvidenceV1(
+		forgedValue, map[string]string{
+			"forged": forgedValue.Claims[0].Excerpt,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged[target] = forgedValue
+	if _, err := f.base.st.PrepareBriefDraftV2(
+		t.Context(), f.identity, f.ref, marker,
+		f.batchID, generatedAt, order, forged, evidence,
+	); err == nil {
+		t.Fatal("structured stage admitted forged source provenance")
 	}
 	if _, err := f.base.st.PrepareBriefDraftV1(
 		t.Context(), f.identity, f.ref, marker,
@@ -192,9 +231,9 @@ func TestStructuredBriefStageFirstWriteReplayAndConflict(t *testing.T) {
 	}
 	claim := types.RunOutcomeClaimV1{
 		RunOutcomeMarkerV1: marker,
-		Result: types.RunResultContent,
-		SourceCoverage: types.RunCompletenessComplete,
-		Processing: types.RunCompletenessComplete,
+		Result:             types.RunResultContent,
+		SourceCoverage:     types.RunCompletenessComplete,
+		Processing:         types.RunCompletenessComplete,
 	}
 	if _, err := f.base.st.FinalizeRunOutcomeClaimV1(
 		t.Context(), f.identity, f.ref, claim); err != nil {

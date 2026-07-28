@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/url"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -255,6 +256,7 @@ type StructuredInsightV1 struct {
 	WhyItMatters     string              `json:"why_it_matters"`
 	ImportanceReason string              `json:"importance_reason"`
 	Claims           []StructuredClaimV1 `json:"claims"`
+	EvidenceDigest   string              `json:"evidence_digest,omitempty"`
 }
 
 func (s StructuredInsightV1) Validate() error {
@@ -264,6 +266,9 @@ func (s StructuredInsightV1) Validate() error {
 		!validBriefText(s.WhyItMatters, maxStructuredFieldBytes, true) ||
 		!validBriefText(s.ImportanceReason, maxStructuredFieldBytes, true) {
 		return errors.New("structured insight is invalid")
+	}
+	if s.EvidenceDigest != "" && !validBriefDigest(s.EvidenceDigest) {
+		return errors.New("structured insight evidence digest is invalid")
 	}
 	present := 0
 	for _, value := range []string{s.WhatChanged, s.WhyItMatters, s.ImportanceReason} {
@@ -294,6 +299,96 @@ func (s StructuredInsightV1) Validate() error {
 		}
 	}
 	return nil
+}
+
+type structuredEvidenceSourceDigestV1 struct {
+	Ref  string `json:"ref"`
+	Text string `json:"text"`
+}
+
+type structuredEvidenceDigestV1 struct {
+	SchemaVersion string                             `json:"schema_version"`
+	Sources       []structuredEvidenceSourceDigestV1 `json:"sources"`
+}
+
+// SealStructuredInsightEvidenceV1 binds a structured result to the exact
+// sanitized source bytes supplied to CardGen. The digest becomes part of the
+// immutable Brief payload; raw source content does not.
+func SealStructuredInsightEvidenceV1(
+	insight StructuredInsightV1,
+	sources map[string]string,
+) (StructuredInsightV1, error) {
+	insight.EvidenceDigest = ""
+	if err := insight.Validate(); err != nil {
+		return StructuredInsightV1{}, err
+	}
+	digest, err := structuredEvidenceDigest(sources)
+	if err != nil {
+		return StructuredInsightV1{}, err
+	}
+	insight.EvidenceDigest = digest
+	if err := ValidateStructuredInsightEvidenceV1(insight, sources); err != nil {
+		return StructuredInsightV1{}, err
+	}
+	return insight, nil
+}
+
+// ValidateStructuredInsightEvidenceV1 independently verifies the durable
+// evidence digest and requires every cited ref to contain the exact excerpt.
+func ValidateStructuredInsightEvidenceV1(
+	insight StructuredInsightV1,
+	sources map[string]string,
+) error {
+	if err := insight.Validate(); err != nil ||
+		!validBriefDigest(insight.EvidenceDigest) {
+		return errors.New("structured insight evidence is invalid")
+	}
+	digest, err := structuredEvidenceDigest(sources)
+	if err != nil || !equalBriefDigest(digest, insight.EvidenceDigest) {
+		return errors.New("structured insight evidence digest does not match")
+	}
+	for _, claim := range insight.Claims {
+		excerpt := normalizeStructuredEvidenceText(claim.Excerpt)
+		for _, ref := range claim.SourceRefs {
+			source, ok := sources[ref]
+			if !ok || !strings.Contains(
+				normalizeStructuredEvidenceText(source), excerpt,
+			) {
+				return errors.New(
+					"structured insight excerpt is not present in every cited source")
+			}
+		}
+	}
+	return nil
+}
+
+func structuredEvidenceDigest(sources map[string]string) (string, error) {
+	if len(sources) == 0 {
+		return "", errors.New("structured insight evidence sources are empty")
+	}
+	refs := make([]string, 0, len(sources))
+	for ref, text := range sources {
+		if !validBriefText(ref, 255, false) ||
+			!validBriefText(text, maxBriefBodyBytes, true) {
+			return "", errors.New("structured insight evidence source is invalid")
+		}
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	envelope := structuredEvidenceDigestV1{
+		SchemaVersion: StructuredInsightSchemaVersionV1,
+		Sources:       make([]structuredEvidenceSourceDigestV1, len(refs)),
+	}
+	for index, ref := range refs {
+		envelope.Sources[index] = structuredEvidenceSourceDigestV1{
+			Ref: ref, Text: sources[ref],
+		}
+	}
+	return digestJSON(envelope)
+}
+
+func normalizeStructuredEvidenceText(value string) string {
+	return strings.Join(strings.Fields(value), " ")
 }
 
 // BriefDraftV1 contains every caller-provided byte that becomes a canonical

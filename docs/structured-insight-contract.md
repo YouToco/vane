@@ -21,10 +21,11 @@ daily/weekly/monthly reports.
    model.
 4. Every structured factual claim must cite source material supplied in the
    same CardGen request. Code validates references before persistence.
-5. Invalid structured output fails closed to the validated `body_md` carried
-   by the same response. If the response itself is not a valid envelope, the
-   item follows the existing CardGen failure/partial-processing path; it never
-   triggers a second LLM call.
+5. Invalid optional structured fields, claims, refs, or excerpts fail closed
+   to the validated `body_md` carried by the same response. If the JSON
+   envelope, schema, or `body_md` itself is invalid, the item follows the
+   existing CardGen failure/partial-processing path. Neither case triggers a
+   second LLM call.
 6. Original title, source URL, source publication time and discovery time remain
    inventory-owned fields. The model cannot overwrite them.
 7. Rollout disablement stops new v2 production but readers/renderers continue
@@ -63,14 +64,20 @@ Rules:
 - references must match request-owned opaque IDs; raw URLs, database IDs and
   model-invented IDs are rejected;
 - each cited excerpt must occur in the normalized source input represented by
-  that opaque ID;
+  every opaque ID listed by that claim;
+- the title remains visible to CardGen but is not part of the excerpt evidence
+  corpus; claims must be supported by sanitized source body bytes;
 - no suggested action or importance tier is introduced in 2-A.
 
 ## Persistence
 
 Structured fields are an optional, versioned extension of an immutable Insight,
-not mutable delivery columns. The Brief digest covers the complete extension.
-Legacy `vane.brief/v1` rows remain byte-for-byte valid and readable.
+not mutable delivery columns. CardGen adds an internal `evidence_digest` over
+the exact opaque-ref/body corpus supplied to the model. The Store receives that
+same bounded corpus, independently verifies every excerpt/ref and the digest,
+then freezes only the digest with the structured payload. The Brief digest
+covers the complete extension. Legacy `vane.brief/v1` rows remain byte-for-byte
+valid and readable.
 
 The Store must reject:
 
@@ -93,8 +100,12 @@ Rollout controls are independent:
 - structured Brief reader/renderer exact-task canary;
 - explicit allow-all, which remains false during initial production UAT.
 
-The renderer canary may only target a task already inside the compiled runtime,
-RunOutcome, canonical Brief writer and canonical renderer scopes.
+Generation is the intersection of its own scope and the reader/renderer scope.
+The structured renderer canary may only target the exact task already inside
+the compiled runtime, RunOutcome, canonical Brief writer and canonical renderer
+scopes. Disabling generation stops new structured Briefs; readers continue to
+serve previously frozen structured payloads from their durable runtime/schema
+identity.
 
 ## Required proof
 

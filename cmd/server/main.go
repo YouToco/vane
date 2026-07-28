@@ -308,6 +308,9 @@ func run() error {
 			cfg.Pipeline.StructuredInsightEnabled,
 			cfg.Pipeline.StructuredInsightCanaryScheduleID,
 			cfg.Pipeline.StructuredInsightAllowAll,
+			cfg.Pipeline.StructuredInsightRendererEnabled,
+			cfg.Pipeline.StructuredInsightRendererCanaryScheduleID,
+			cfg.Pipeline.StructuredInsightRendererAllowAll,
 		))
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
 	// C2b3-2c keeps definition editing dark at every ingress, but already owns

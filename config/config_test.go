@@ -197,15 +197,21 @@ func TestStructuredInsightRolloutValidation(t *testing.T) {
 	base := func() Config {
 		return Config{
 			DB: DBConfig{URL: "postgres://test"},
+			Dashboard: DashboardConfig{
+				Origin: "https://vane.example",
+			},
 			Pipeline: PipelineConfig{
-				CompiledRuntimeEnabled:             true,
-				CompiledRuntimeCanaryScheduleID:    "task-a",
-				RunOutcomeEnabled:                  true,
-				RunOutcomeCanaryScheduleID:         "task-a",
-				CanonicalBriefEnabled:              true,
-				CanonicalBriefCanaryScheduleID:     "task-a",
-				PushEffectCanaryScheduleID:         "task-a",
-				PushEffectRecoveryCanaryScheduleID: "task-a",
+				CompiledRuntimeEnabled:                    true,
+				CompiledRuntimeCanaryScheduleID:           "task-a",
+				RunOutcomeEnabled:                         true,
+				RunOutcomeCanaryScheduleID:                "task-a",
+				CanonicalBriefEnabled:                     true,
+				CanonicalBriefCanaryScheduleID:            "task-a",
+				CanonicalBriefRendererCanaryScheduleID:    "task-a",
+				StructuredInsightRendererEnabled:          true,
+				StructuredInsightRendererCanaryScheduleID: "task-a",
+				PushEffectCanaryScheduleID:                "task-a",
+				PushEffectRecoveryCanaryScheduleID:        "task-a",
 			},
 		}
 	}
@@ -235,6 +241,22 @@ func TestStructuredInsightRolloutValidation(t *testing.T) {
 		cfg.Pipeline.StructuredInsightCanaryScheduleID = "task-b"
 		if err := cfg.Validate(); err == nil {
 			t.Fatal("expected canary mismatch")
+		}
+	})
+	t.Run("requires independent renderer", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.StructuredInsightEnabled = true
+		cfg.Pipeline.StructuredInsightCanaryScheduleID = "task-a"
+		cfg.Pipeline.StructuredInsightRendererEnabled = false
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected renderer nesting error")
+		}
+	})
+	t.Run("renderer must match canonical renderer", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.StructuredInsightRendererCanaryScheduleID = "task-b"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected renderer canary mismatch")
 		}
 	})
 	t.Run("canary and allow all conflict", func(t *testing.T) {
@@ -1032,6 +1054,9 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.structured_insight_enabled", cfg.Pipeline.StructuredInsightEnabled, false},
 		{"pipeline.structured_insight_canary_schedule_id", cfg.Pipeline.StructuredInsightCanaryScheduleID, ""},
 		{"pipeline.structured_insight_allow_all", cfg.Pipeline.StructuredInsightAllowAll, false},
+		{"pipeline.structured_insight_renderer_enabled", cfg.Pipeline.StructuredInsightRendererEnabled, false},
+		{"pipeline.structured_insight_renderer_canary_schedule_id", cfg.Pipeline.StructuredInsightRendererCanaryScheduleID, ""},
+		{"pipeline.structured_insight_renderer_allow_all", cfg.Pipeline.StructuredInsightRendererAllowAll, false},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
 		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 100000},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},

@@ -562,7 +562,7 @@ func (f *compiledStructuredCardGenFake) GenerateStructuredWithPolicyV2(
 	if err := f.failByID[item.Item.ID]; err != nil {
 		return types.StructuredInsightV1{}, err
 	}
-	return types.StructuredInsightV1{
+	result := types.StructuredInsightV1{
 		SchemaVersion: types.StructuredInsightSchemaVersionV1,
 		BodyMD:        "**structured body**",
 		WhatChanged:   "change", WhyItMatters: "reason",
@@ -571,7 +571,9 @@ func (f *compiledStructuredCardGenFake) GenerateStructuredWithPolicyV2(
 			Text: "claim", Excerpt: "excerpt",
 			SourceRefs: []string{"source-1"},
 		}},
-	}, nil
+	}
+	return types.SealStructuredInsightEvidenceV1(
+		result, map[string]string{"source-1": item.Item.Content})
 }
 
 func (f *compiledRunStoreFake) EvolveProfileForTaskRunV1(
@@ -2787,6 +2789,7 @@ func TestCardGenOutcomeV2ReturnsStructuredPayloadWithoutLegacyCall(t *testing.T)
 	if len(result.Cards) != 1 ||
 		result.Cards[0].BodyMD != "**structured body**" ||
 		result.Cards[0].Structured == nil ||
+		result.Cards[0].Structured.EvidenceDigest == "" ||
 		result.Processing != types.RunCompletenessComplete ||
 		card.calls.Load() != 1 {
 		t.Fatalf("result=%+v calls=%d", result, card.calls.Load())
@@ -2806,8 +2809,12 @@ func TestCardGenOutcomeV2PartialAndAllRejectedSemantics(t *testing.T) {
 	}
 	snapshot.Policy = policy
 	items := []types.ScoredItem{
-		{Item: types.ContentItem{ID: 501, Title: "kept"}, Score: 88},
-		{Item: types.ContentItem{ID: 502, Title: "rejected"}, Score: 87},
+		{Item: types.ContentItem{
+			ID: 501, Title: "kept", Content: "excerpt",
+		}, Score: 88},
+		{Item: types.ContentItem{
+			ID: 502, Title: "rejected", Content: "excerpt",
+		}, Score: 87},
 	}
 	run := &CompiledRunInputV1{
 		TenantID: identity.TenantID, TaskID: identity.TaskID, Snapshot: ref,

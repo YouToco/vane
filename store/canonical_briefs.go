@@ -661,16 +661,19 @@ func (s *Store) PrepareBriefDraftV2(
 	generatedAt time.Time,
 	orderedDeliveryIDs []int64,
 	structuredByDelivery map[int64]types.StructuredInsightV1,
+	structuredEvidenceByDelivery map[int64]map[string]string,
 ) (types.BriefDraftV1, error) {
 	if len(structuredByDelivery) == 0 ||
-		len(structuredByDelivery) != len(orderedDeliveryIDs) {
+		len(structuredByDelivery) != len(orderedDeliveryIDs) ||
+		len(structuredEvidenceByDelivery) != len(orderedDeliveryIDs) {
 		return types.BriefDraftV1{},
 			canonicalBriefValidationError(
 				"structured brief preparation is empty")
 	}
 	return s.prepareBriefDraft(
 		ctx, expected, ref, marker, batchID, generatedAt,
-		orderedDeliveryIDs, structuredByDelivery)
+		orderedDeliveryIDs, structuredByDelivery,
+		structuredEvidenceByDelivery)
 }
 
 func (s *Store) prepareBriefDraft(
@@ -682,6 +685,7 @@ func (s *Store) prepareBriefDraft(
 	generatedAt time.Time,
 	orderedDeliveryIDs []int64,
 	structuredByDelivery map[int64]types.StructuredInsightV1,
+	structuredEvidenceByDelivery ...map[int64]map[string]string,
 ) (types.BriefDraftV1, error) {
 	if err := marker.Validate(); err != nil ||
 		marker.RunSnapshotID != ref.SnapshotID ||
@@ -708,8 +712,13 @@ func (s *Store) prepareBriefDraft(
 		seen[deliveryID] = struct{}{}
 	}
 	for deliveryID, structured := range structuredByDelivery {
+		var sources map[string]string
+		if len(structuredEvidenceByDelivery) == 1 {
+			sources = structuredEvidenceByDelivery[0][deliveryID]
+		}
 		if _, exists := seen[deliveryID]; !exists ||
-			structured.Validate() != nil {
+			types.ValidateStructuredInsightEvidenceV1(
+				structured, sources) != nil {
 			return types.BriefDraftV1{},
 				canonicalBriefValidationError(
 					"structured brief delivery is invalid")

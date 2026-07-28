@@ -32,14 +32,11 @@ func TestParseStructuredInsightV1(t *testing.T) {
 func TestParseStructuredInsightV1RejectsUntrustedOutput(t *testing.T) {
 	valid := `{"schema_version":"vane.cardgen-insight/v1","body_md":"正文","what_changed":"变化","why_it_matters":"原因","importance_reason":"依据","claims":[]}`
 	tests := map[string]string{
-		"unknown field":      strings.Replace(valid, `"claims":[]`, `"claims":[],"extra":true`, 1),
-		"duplicate field":    strings.Replace(valid, `"body_md":"正文"`, `"body_md":"正文","body_md":"替换"`, 1),
-		"trailing object":    valid + `{}`,
-		"partial projection": strings.Replace(valid, `"why_it_matters":"原因"`, `"why_it_matters":""`, 1),
-		"forged ref": strings.Replace(valid, `"claims":[]`,
-			`"claims":[{"text":"主张","excerpt":"原文","source_refs":["forged"]}]`, 1),
-		"excerpt mismatch": strings.Replace(valid, `"claims":[]`,
-			`"claims":[{"text":"主张","excerpt":"不存在","source_refs":["source-1"]}]`, 1),
+		"unknown field":   strings.Replace(valid, `"claims":[]`, `"claims":[],"extra":true`, 1),
+		"duplicate field": strings.Replace(valid, `"body_md":"正文"`, `"body_md":"正文","body_md":"替换"`, 1),
+		"trailing object": valid + `{}`,
+		"bad schema":      strings.Replace(valid, StructuredInsightSchemaV1, "vane.cardgen-insight/v999", 1),
+		"empty body":      strings.Replace(valid, `"body_md":"正文"`, `"body_md":""`, 1),
 	}
 	for name, raw := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -52,9 +49,36 @@ func TestParseStructuredInsightV1RejectsUntrustedOutput(t *testing.T) {
 	}
 }
 
+func TestParseStructuredInsightV1FallsBackToValidBody(t *testing.T) {
+	valid := `{"schema_version":"vane.cardgen-insight/v1","body_md":"安全正文","what_changed":"变化","why_it_matters":"原因","importance_reason":"依据","claims":[]}`
+	tests := map[string]string{
+		"partial projection": strings.Replace(
+			valid, `"why_it_matters":"原因"`, `"why_it_matters":""`, 1),
+		"forged ref": strings.Replace(valid, `"claims":[]`,
+			`"claims":[{"text":"主张","excerpt":"原文","source_refs":["forged"]}]`, 1),
+		"excerpt mismatch": strings.Replace(valid, `"claims":[]`,
+			`"claims":[{"text":"主张","excerpt":"不存在","source_refs":["source-1"]}]`, 1),
+	}
+	for name, raw := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := ParseStructuredInsightV1(
+				[]byte(raw), map[string]string{"source-1": "原文内容"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.BodyMD != "安全正文" || got.WhatChanged != "" ||
+				got.WhyItMatters != "" || got.ImportanceReason != "" ||
+				len(got.Claims) != 0 || got.EvidenceDigest == "" {
+				t.Fatalf("unsafe projection did not fall back: %+v", got)
+			}
+		})
+	}
+}
+
 func TestParseStructuredInsightV1AllowsBodyOnlyFallback(t *testing.T) {
 	raw := []byte(`{"schema_version":"vane.cardgen-insight/v1","body_md":"安全正文","what_changed":"","why_it_matters":"","importance_reason":"","claims":[]}`)
-	got, err := ParseStructuredInsightV1(raw, nil)
+	got, err := ParseStructuredInsightV1(
+		raw, map[string]string{"source-1": "正文"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +129,7 @@ func TestGenerateStructuredWithPolicyV2UsesOneFrozenCall(t *testing.T) {
 	}
 }
 
-func TestGenerateStructuredWithPolicyV2DoesNotRetryInvalidEnvelope(t *testing.T) {
+func TestGenerateStructuredWithPolicyV2FallsBackWithoutRepairCall(t *testing.T) {
 	prompts, models := validPolicyV1(t, false)
 	prompts.CardGen = StructuredPromptStageV2()
 	for index := range models.Calls {
@@ -119,16 +143,47 @@ func TestGenerateStructuredWithPolicyV2DoesNotRetryInvalidEnvelope(t *testing.T)
 	}
 	reply := `{"schema_version":"vane.cardgen-insight/v1","body_md":"正文","what_changed":"变化","why_it_matters":"原因","importance_reason":"依据","claims":[{"text":"伪造","excerpt":"不存在","source_refs":["source-1"]}]}`
 	cg, captured := newTestCardGen(t, http.StatusOK, reply, nil)
-	_, err = cg.GenerateStructuredWithPolicyV2(
+	got, err := cg.GenerateStructuredWithPolicyV2(
 		t.Context(), 0, 1,
 		types.ScoredItem{Item: types.ContentItem{Title: "标题", Content: "真实正文"}},
 		"trace-invalid", "", policy, nil,
 	)
-	if err == nil {
-		t.Fatal("expected invalid envelope rejection")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if captured.callCount() != 1 {
-		t.Fatalf("invalid envelope caused %d upstream calls", captured.callCount())
+	if got.BodyMD != "正文" || got.WhatChanged != "" ||
+		len(got.Claims) != 0 || captured.callCount() != 1 {
+		t.Fatalf("fallback=%+v calls=%d", got, captured.callCount())
+	}
+}
+
+func TestGenerateStructuredWithPolicyV2DoesNotUseTitleAsEvidence(t *testing.T) {
+	prompts, models := validPolicyV1(t, false)
+	prompts.CardGen = StructuredPromptStageV2()
+	for index := range models.Calls {
+		if models.Calls[index].Stage == runtimepolicy.ModelStageCardGen {
+			models.Calls[index] = StructuredModelCallV2("structured-model")
+		}
+	}
+	policy, err := PreparePolicyV2(prompts, models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := `{"schema_version":"vane.cardgen-insight/v1","body_md":"正文","what_changed":"收购","why_it_matters":"影响市场","importance_reason":"交易规模","claims":[{"text":"已收购","excerpt":"以3万亿美元收购Apple","source_refs":["source-1"]}]}`
+	cg, _ := newTestCardGen(t, http.StatusOK, reply, nil)
+	got, err := cg.GenerateStructuredWithPolicyV2(
+		t.Context(), 0, 1,
+		types.ScoredItem{Item: types.ContentItem{
+			Title:   "OpenAI 以3万亿美元收购Apple",
+			Content: "官方否认该传闻",
+		}},
+		"trace-title-evidence", "", policy, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WhatChanged != "" || len(got.Claims) != 0 {
+		t.Fatalf("title was admitted as factual evidence: %+v", got)
 	}
 }
 

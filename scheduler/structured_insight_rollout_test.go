@@ -9,7 +9,8 @@ import (
 
 func TestStructuredInsightRolloutIsNestedInsideCanonicalBrief(t *testing.T) {
 	s := &Scheduler{}
-	WithStructuredInsightRollout(true, "task-a", false)(s)
+	WithStructuredInsightRollout(
+		true, "task-a", false, true, "task-a", false)(s)
 	if got := s.structuredInsight.runtimeVersionFor(
 		"task-a", workflow.CompiledRuntimeRunOutcomeV1,
 	); got != workflow.CompiledRuntimeRunOutcomeV1 {
@@ -27,7 +28,8 @@ func TestStructuredInsightRolloutComposesThroughScheduler(t *testing.T) {
 	WithCompiledRuntimeRollout(true, "task-a", false)(s)
 	WithRunOutcomeRollout(true, "task-a", false)(s)
 	WithCanonicalBriefRollout(true, "task-a", false)(s)
-	WithStructuredInsightRollout(true, "task-a", false)(s)
+	WithStructuredInsightRollout(
+		true, "task-a", false, true, "task-a", false)(s)
 	if got := s.runtimeVersionFor(
 		"task-a", types.ExecutionModeCompiled,
 	); got != workflow.CompiledRuntimeStructuredInsightV1 {
@@ -42,9 +44,16 @@ func TestStructuredInsightRolloutComposesThroughScheduler(t *testing.T) {
 
 func TestStructuredInsightRolloutInvalidCombinationFailsClosed(t *testing.T) {
 	for _, apply := range []SchedulerOption{
-		WithStructuredInsightRollout(true, "", false),
-		WithStructuredInsightRollout(true, "task-a", true),
-		WithStructuredInsightRollout(false, "task-a", false),
+		WithStructuredInsightRollout(
+			true, "", false, true, "task-a", false),
+		WithStructuredInsightRollout(
+			true, "task-a", true, true, "task-a", false),
+		WithStructuredInsightRollout(
+			false, "task-a", false, true, "task-a", false),
+		WithStructuredInsightRollout(
+			true, "task-a", false, false, "", false),
+		WithStructuredInsightRollout(
+			true, "task-a", false, true, "task-b", false),
 	} {
 		s := &Scheduler{}
 		apply(s)
