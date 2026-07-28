@@ -62,6 +62,34 @@ func TestBuildCurrentCompiledV1ReconstructsCurrentExecution(t *testing.T) {
 	}
 }
 
+func TestBuildStructuredInsightCompiledV1OnlyChangesCardGenPolicy(t *testing.T) {
+	input := currentCompiledInput("model-v2")
+	legacy, err := BuildCurrentCompiledV1(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	structured, err := BuildStructuredInsightCompiledV1(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if structured.PromptPolicy.CardGen != cardgen.StructuredPromptStageV2() {
+		t.Fatalf("structured card prompt = %+v", structured.PromptPolicy.CardGen)
+	}
+	call, ok := structured.ModelPolicy.Call(runtimepolicy.ModelStageCardGen)
+	if !ok || call != cardgen.StructuredModelCallV2("model-v2") {
+		t.Fatalf("structured card call = %+v, ok=%v", call, ok)
+	}
+	legacy.PromptPolicy.CardGen = structured.PromptPolicy.CardGen
+	for index := range legacy.ModelPolicy.Calls {
+		if legacy.ModelPolicy.Calls[index].Stage == runtimepolicy.ModelStageCardGen {
+			legacy.ModelPolicy.Calls[index] = call
+		}
+	}
+	if !reflect.DeepEqual(legacy, structured) {
+		t.Fatal("structured runtime changed policy outside CardGen")
+	}
+}
+
 func TestBuildCurrentCompiledV1IncludesEveryAvailableCapability(t *testing.T) {
 	bundle, err := BuildCurrentCompiledV1(currentCompiledInput("model-v1"))
 	if err != nil {

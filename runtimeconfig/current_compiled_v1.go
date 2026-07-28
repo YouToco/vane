@@ -31,6 +31,29 @@ type CurrentCompiledV1Input struct {
 // capabilities, prompts, model calls, and enforced quota rule. Capabilities
 // marked unavailable in sourcecatalog are intentionally omitted.
 func BuildCurrentCompiledV1(input CurrentCompiledV1Input) (runtimepolicy.BundleV1, error) {
+	return buildCompiledV1(
+		input, cardgen.CurrentPromptStageV1(),
+		cardgen.CurrentModelCallV1(input.Model),
+	)
+}
+
+// BuildStructuredInsightCompiledV1 preserves the compiled policy envelope but
+// freezes CardGen renderer v2 and its one-call request parameters. It is used
+// only by the independent exact-task Phase 2-A runtime.
+func BuildStructuredInsightCompiledV1(
+	input CurrentCompiledV1Input,
+) (runtimepolicy.BundleV1, error) {
+	return buildCompiledV1(
+		input, cardgen.StructuredPromptStageV2(),
+		cardgen.StructuredModelCallV2(input.Model),
+	)
+}
+
+func buildCompiledV1(
+	input CurrentCompiledV1Input,
+	cardPrompt runtimepolicy.PromptStageV1,
+	cardCall runtimepolicy.ModelCallV1,
+) (runtimepolicy.BundleV1, error) {
 	capabilities, err := currentCapabilitiesV1(
 		input.ExaCredentialGeneration,
 		input.TikHubCredentialGeneration,
@@ -43,7 +66,7 @@ func BuildCurrentCompiledV1(input CurrentCompiledV1Input) (runtimepolicy.BundleV
 	return runtimepolicy.BuildV1(runtimepolicy.BuildInputV1{
 		AllowedCapabilities:    capabilities,
 		ScorePrompt:            scorer.CurrentPromptStageV1(),
-		CardGenPrompt:          cardgen.CurrentPromptStageV1(),
+		CardGenPrompt:          cardPrompt,
 		ProfileEvolvePrompt:    evolver.CurrentPromptStageV1(),
 		TaskInstructionEnabled: input.TaskInstructionEnabled,
 		ModelProvider:          runtimepolicy.ModelProviderDeepSeekV1,
@@ -57,7 +80,7 @@ func BuildCurrentCompiledV1(input CurrentCompiledV1Input) (runtimepolicy.BundleV
 		},
 		ModelCalls: []runtimepolicy.ModelCallV1{
 			scorer.CurrentModelCallV1(input.Model),
-			cardgen.CurrentModelCallV1(input.Model),
+			cardCall,
 			evolver.CurrentModelCallV1(input.Model),
 		},
 		QuotaBuckets: quotas,
