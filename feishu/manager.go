@@ -62,7 +62,15 @@ type FeedbackRunner interface {
 	HandleReasonSubmit(ctx context.Context, userID int64, submit feedback.ReasonSubmit) (feedback.ClickResult, error)
 	// WrapQuestion 尝试把"回复推送卡"的消息识别为追问并包装上下文；
 	// matched=false 时调用方按普通消息原样处理。
-	WrapQuestion(ctx context.Context, userID int64, parentMsgID, rootMsgID, text string) (wrapped string, matched bool)
+	WrapQuestion(
+		ctx context.Context,
+		userID int64,
+		appIdentity string,
+		inboundMsgID string,
+		parentMsgID string,
+		rootMsgID string,
+		text string,
+	) (wrapped string, matched bool, err error)
 }
 
 // settings 表的两个已知 key（契约 §1）。导出供 api 层写入时复用，

@@ -288,7 +288,18 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 		// 包装无意义。未命中（回复的是普通消息/聊天卡）原样按普通消息处理。
 		externalContext := false
 		if fb := h.m.feedbackRunner(); fb != nil {
-			if w, ok := fb.WrapQuestion(ctx, user.ID, strVal(msg.ParentId), strVal(msg.RootId), text); ok {
+			w, ok, wrapErr := fb.WrapQuestion(
+				ctx, user.ID, h.appID, msgID,
+				strVal(msg.ParentId), strVal(msg.RootId), text,
+			)
+			if wrapErr != nil {
+				slog.Error("feishu: 追问事实持久化失败",
+					"err", wrapErr, "message_id", msgID)
+				h.reply(ctx, msgID, BuildReplyCard(
+					"这条追问未能可靠记录，请稍后重试。"))
+				return
+			}
+			if ok {
 				text = w
 				externalContext = true
 			}

@@ -24,6 +24,23 @@ type Store interface {
 	// ListDeliveriesByFeishuMessage 同一条飞书消息承载的全部投递（聚合卡重建用），
 	// 按分数降序；历史单条卡查回 1 行，重建路径据 len 分流。
 	ListDeliveriesByFeishuMessage(ctx context.Context, userID int64, msgID string) ([]types.Delivery, error)
+	LookupAggregateQuestionActivity(
+		ctx context.Context,
+		userID int64,
+		appIdentity string,
+		inboundKey string,
+		requestDigest string,
+	) (wrappedContext string, found bool, err error)
+	RecordAggregateQuestionActivity(
+		ctx context.Context,
+		userID int64,
+		appIdentity string,
+		inboundKey string,
+		sourceMessageID string,
+		requestDigest string,
+		expectedDeliveryIDs []int64,
+		wrappedContext string,
+	) (storedWrappedContext string, err error)
 	InsertFeedback(ctx context.Context, f *types.Feedback) (int64, error)
 	InsertFeedbackWithSessionCutoff(
 		ctx context.Context, f *types.Feedback, activeSince time.Time,

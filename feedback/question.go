@@ -2,8 +2,12 @@ package feedback
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -25,16 +29,38 @@ func newTraceID() string { return uuid.NewString() }
 //
 // 自带 DB 预算：调用点在 handleWithAgent 的消息预算之外，跑在无 deadline 的
 // 连接级 ctx 上（审查 F15）。
-func (s *Service) WrapQuestion(ctx context.Context, userID int64, parentMsgID, rootMsgID, text string) (string, bool) {
+func (s *Service) WrapQuestion(
+	ctx context.Context,
+	userID int64,
+	appIdentity string,
+	inboundMsgID string,
+	parentMsgID string,
+	rootMsgID string,
+	text string,
+) (string, bool, error) {
 	if parentMsgID == "" && rootMsgID == "" {
-		return "", false // 不是回复任何消息
+		return "", false, nil // 不是回复任何消息
 	}
 	ctx, cancel := context.WithTimeout(ctx, questionDBBudget)
 	defer cancel()
 
-	d := s.lookupDelivery(ctx, userID, parentMsgID, rootMsgID)
+	digest := aggregateQuestionRequestDigest(
+		appIdentity, inboundMsgID, parentMsgID, rootMsgID, text)
+	if replay, found, err := s.deps.Store.LookupAggregateQuestionActivity(
+		ctx, userID, appIdentity, inboundMsgID, digest,
+	); err != nil {
+		return "", false, err
+	} else if found {
+		return replay, true, nil
+	}
+
+	d, err := s.lookupDelivery(
+		ctx, userID, parentMsgID, rootMsgID)
+	if err != nil {
+		return "", false, err
+	}
 	if d == nil {
-		return "", false
+		return "", false, nil
 	}
 
 	// 聚合卡分流（附录 A / 对抗审查 CRITICAL）：一条消息承载 N 个 delivery 时，
@@ -43,8 +69,49 @@ func (s *Service) WrapQuestion(ctx context.Context, userID int64, parentMsgID, r
 	//   - 不落 feedback 行（宁可少一条演化信号，绝不落错误归属的信号）；
 	//   - 上下文携带全部兄弟条目的标题+解读，让 agent 自行对齐"第二条"这类指代。
 	if d.FeishuMessageID != "" {
-		if siblings, serr := s.deps.Store.ListDeliveriesByFeishuMessage(ctx, userID, d.FeishuMessageID); serr == nil && len(siblings) > 1 {
-			return s.buildAggQuestionContext(ctx, siblings, text), true
+		cardDeliveryIDs, cardErr := deliveryIDsFromCardJSON(d.CardJSON)
+		if cardErr != nil {
+			return "", false, types.NewAppError(
+				types.CodeConflict,
+				"推送卡片身份无法可靠解析，请稍后重试",
+				cardErr,
+			)
+		}
+		siblings, err := s.deps.Store.ListDeliveriesByFeishuMessage(
+			ctx, userID, d.FeishuMessageID)
+		if err != nil {
+			return "", false, err
+		}
+		if len(siblings) == 0 {
+			return "", false, types.NewAppError(
+				types.CodeConflict,
+				"聚合推送投递集合已变化，请重试",
+				types.ErrConflict,
+			)
+		}
+		siblingDeliveryIDs := make([]int64, len(siblings))
+		for i := range siblings {
+			siblingDeliveryIDs[i] = siblings[i].ID
+		}
+		if len(cardDeliveryIDs) > 1 || len(siblings) > 1 {
+			if len(cardDeliveryIDs) < 2 ||
+				!slices.Equal(cardDeliveryIDs, siblingDeliveryIDs) {
+				return "", false, types.NewAppError(
+					types.CodeConflict,
+					"聚合推送投递集合尚未完整，请稍后重试",
+					types.ErrConflict,
+				)
+			}
+			wrapped := s.buildAggQuestionContext(ctx, siblings, text)
+			stored, err := s.deps.Store.RecordAggregateQuestionActivity(
+				ctx, userID, appIdentity, inboundMsgID,
+				d.FeishuMessageID, digest, siblingDeliveryIDs,
+				wrapped,
+			)
+			if err != nil {
+				return "", false, err
+			}
+			return stored, true, nil
 		}
 	}
 
@@ -54,30 +121,100 @@ func (s *Service) WrapQuestion(ctx context.Context, userID int64, parentMsgID, r
 		UserID: userID, DeliveryID: d.ID, Action: types.FeedbackActionQuestion,
 		Detail: promptguard.TruncateRunes(text, questionDetailRunes),
 	}); err != nil {
-		slog.Error("feedback: 追问落库失败（不影响回答）", "delivery_id", d.ID, "err", err)
+		slog.Error(
+			"feedback: 单条追问落库失败（继续回答，避免诱导重复学习）",
+			"delivery_id", d.ID, "err", err,
+		)
 	}
 
-	return s.buildQuestionContext(ctx, d, text), true
+	return s.buildQuestionContext(ctx, d, text), true, nil
+}
+
+func aggregateQuestionRequestDigest(
+	appIdentity string,
+	inboundMsgID string,
+	parentMsgID string,
+	rootMsgID string,
+	text string,
+) string {
+	payload, _ := json.Marshal(struct {
+		Schema       string `json:"schema"`
+		AppIdentity  string `json:"app_identity"`
+		InboundMsgID string `json:"inbound_msg_id"`
+		ParentMsgID  string `json:"parent_msg_id"`
+		RootMsgID    string `json:"root_msg_id"`
+		Text         string `json:"text"`
+	}{
+		Schema:       "vane.aggregate-question-activity/v1",
+		AppIdentity:  appIdentity,
+		InboundMsgID: inboundMsgID,
+		ParentMsgID:  parentMsgID,
+		RootMsgID:    rootMsgID,
+		Text:         text,
+	})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+func deliveryIDsFromCardJSON(cardJSON json.RawMessage) ([]int64, error) {
+	if len(cardJSON) == 0 {
+		return nil, nil
+	}
+	var card any
+	if err := json.Unmarshal(cardJSON, &card); err != nil {
+		return nil, err
+	}
+	ids := make(map[int64]struct{})
+	var walk func(any)
+	walk = func(value any) {
+		switch typed := value.(type) {
+		case []any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case map[string]any:
+			for key, item := range typed {
+				if key == "delivery_id" {
+					if raw, ok := item.(string); ok {
+						if id, err := strconv.ParseInt(raw, 10, 64); err == nil && id > 0 {
+							ids[id] = struct{}{}
+						}
+					}
+				}
+				walk(item)
+			}
+		}
+	}
+	walk(card)
+	out := make([]int64, 0, len(ids))
+	for id := range ids {
+		out = append(out, id)
+	}
+	slices.Sort(out)
+	return out, nil
 }
 
 // lookupDelivery 按 ParentId 反查，未命中再试 RootId：用户回复的可能是深度解读
 // 结果卡（ParentId 指向解读卡、RootId 才指回原推送）。双未命中返回 nil。
-func (s *Service) lookupDelivery(ctx context.Context, userID int64, parentMsgID, rootMsgID string) *types.Delivery {
+func (s *Service) lookupDelivery(
+	ctx context.Context,
+	userID int64,
+	parentMsgID string,
+	rootMsgID string,
+) (*types.Delivery, error) {
 	for _, id := range []string{parentMsgID, rootMsgID} {
 		if id == "" {
 			continue
 		}
 		d, err := s.deps.Store.GetDeliveryByFeishuMessageID(ctx, userID, id)
 		if err == nil {
-			return d
+			return d, nil
 		}
 		if !errors.Is(err, types.ErrNotFound) {
-			// DB 故障不该把普通聊天也拖垮：记日志后按"不是追问"降级。
-			slog.Warn("feedback: 追问反查投递失败，按普通消息处理", "msg_id", id, "err", err)
-			return nil
+			return nil, err
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // buildQuestionContext 组装 [追问上下文] 包装（契约 §11 格式）。标题/解读/原文

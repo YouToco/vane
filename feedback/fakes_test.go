@@ -22,12 +22,14 @@ import (
 // ============================================================
 
 const (
-	testUserID     int64 = 7
-	testDeliveryID int64 = 42
-	testItemID     int64 = 100
-	testMsgID            = "om_delivery_42"
-	testBodyMD           = "**解读标题**\n一句话摘要。\n[阅读原文](https://example.com/a)"
-	testTitle            = "示例内容标题"
+	testUserID       int64 = 7
+	testDeliveryID   int64 = 42
+	testItemID       int64 = 100
+	testMsgID              = "om_delivery_42"
+	testAppIdentity        = "cli_feedback_test"
+	testInboundMsgID       = "om_inbound_question"
+	testBodyMD             = "**解读标题**\n一句话摘要。\n[阅读原文](https://example.com/a)"
+	testTitle              = "示例内容标题"
 	// testContent 必须长于 deepDiveMinRunes（178 rune > 150）：默认 harness 代表
 	// 一条"正文健全、值得深度解读"的内容，否则证据闸门会把每条 deep_dive 测试
 	// 都挡在生成之前，幂等/落库/送达全都测不到。要测闸门本身请显式改短这个字段
@@ -60,25 +62,31 @@ type fakeStore struct {
 	nextID    int64
 
 	// 错误注入（非 nil 时对应方法直接返回该错误）。
-	getDeliveryErr error
-	byMsgIDErr     error
-	insertErr      error
-	latestErr      error
-	hasErr         error
-	detailErr      error
-	itemErr        error
-	profileErr     error
-	auditErr       error
-	auditOutcome   types.FreshnessFeedbackAuditOutcome
-	canonicalBrief types.BriefV1
-	canonicalFound bool
-	canonicalErr   error
-	canonicalCalls int
+	getDeliveryErr    error
+	byMsgIDErr        error
+	listByMsgIDErr    error
+	insertErr         error
+	activityLookupErr error
+	activityErr       error
+	latestErr         error
+	hasErr            error
+	detailErr         error
+	itemErr           error
+	profileErr        error
+	auditErr          error
+	auditOutcome      types.FreshnessFeedbackAuditOutcome
+	canonicalBrief    types.BriefV1
+	canonicalFound    bool
+	canonicalErr      error
+	canonicalCalls    int
 
 	// 调用留痕：断言"不查库""不重复生成"这类负向要求。
-	byMsgIDCalls   []string
-	getDeliveryFor []int64
-	itemCalls      int
+	byMsgIDCalls     []string
+	getDeliveryFor   []int64
+	itemCalls        int
+	activityLookups  int
+	activityCalls    []aggregateQuestionActivityCall
+	activityReceipts map[string]aggregateQuestionActivityReceipt
 
 	// hookInsertDeepDive 在 InsertDeepDiveFeedback 进入时执行，用来模拟
 	// "并发对手在本次落行前抢先落行"（触发 existed=true 分支）。
@@ -86,6 +94,21 @@ type fakeStore struct {
 	// deadlineProbe 在 GetDeliveryByFeishuMessageID 里窥探调用方 ctx，
 	// 用来断言 WrapQuestion 确实给 DB 调用套了自己的预算（审查 F15）。
 	deadlineProbe func(context.Context)
+}
+
+type aggregateQuestionActivityCall struct {
+	userID          int64
+	appIdentity     string
+	inboundKey      string
+	sourceMessageID string
+	requestDigest   string
+	deliveryIDs     []int64
+	wrappedContext  string
+}
+
+type aggregateQuestionActivityReceipt struct {
+	requestDigest  string
+	wrappedContext string
 }
 
 func (f *fakeStore) LoadCanonicalBriefForFeedbackV1(
@@ -115,9 +138,10 @@ func (f *fakeStore) LoadCanonicalBriefForFeedbackV1(
 
 func newFakeStore() *fakeStore {
 	fs := &fakeStore{
-		deliveries: make(map[int64]*types.Delivery),
-		items:      make(map[int64]*types.ContentItem),
-		profiles:   make(map[int64]*types.Profile),
+		deliveries:       make(map[int64]*types.Delivery),
+		items:            make(map[int64]*types.ContentItem),
+		profiles:         make(map[int64]*types.Profile),
+		activityReceipts: make(map[string]aggregateQuestionActivityReceipt),
 	}
 	itemID := testItemID
 	fs.deliveries[testDeliveryID] = &types.Delivery{
@@ -155,6 +179,9 @@ func (f *fakeStore) GetDeliveryForUser(_ context.Context, id, userID int64) (*ty
 }
 
 func (f *fakeStore) ListDeliveriesByFeishuMessage(_ context.Context, userID int64, msgID string) ([]types.Delivery, error) {
+	if f.listByMsgIDErr != nil {
+		return nil, f.listByMsgIDErr
+	}
 	if msgID == "" {
 		return nil, nil
 	}
@@ -168,6 +195,84 @@ func (f *fakeStore) ListDeliveriesByFeishuMessage(_ context.Context, userID int6
 	// 且掩盖"重建序≠首发序"一类真错位。
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+func aggregateQuestionActivityReceiptKey(
+	userID int64, appIdentity, inboundKey string,
+) string {
+	return fmt.Sprintf("%d\x00%s\x00%s", userID, appIdentity, inboundKey)
+}
+
+func (f *fakeStore) LookupAggregateQuestionActivity(
+	_ context.Context,
+	userID int64,
+	appIdentity string,
+	inboundKey string,
+	requestDigest string,
+) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.activityLookups++
+	if f.activityLookupErr != nil {
+		return "", false, f.activityLookupErr
+	}
+	receipt, ok := f.activityReceipts[aggregateQuestionActivityReceiptKey(userID, appIdentity, inboundKey)]
+	if !ok {
+		return "", false, nil
+	}
+	if receipt.requestDigest != requestDigest {
+		return "", false, types.NewAppError(
+			types.CodeConflict, "fake: activity digest conflict",
+			types.ErrConflict)
+	}
+	return receipt.wrappedContext, true, nil
+}
+
+func (f *fakeStore) RecordAggregateQuestionActivity(
+	_ context.Context,
+	userID int64,
+	appIdentity string,
+	inboundKey string,
+	sourceMessageID string,
+	requestDigest string,
+	expectedDeliveryIDs []int64,
+	wrappedContext string,
+) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.activityCalls = append(
+		f.activityCalls,
+		aggregateQuestionActivityCall{
+			userID: userID, appIdentity: appIdentity,
+			inboundKey: inboundKey, sourceMessageID: sourceMessageID,
+			requestDigest:  requestDigest,
+			deliveryIDs:    append([]int64(nil), expectedDeliveryIDs...),
+			wrappedContext: wrappedContext,
+		},
+	)
+	if f.activityErr != nil {
+		return "", f.activityErr
+	}
+	key := aggregateQuestionActivityReceiptKey(
+		userID, appIdentity, inboundKey)
+	if receipt, ok := f.activityReceipts[key]; ok {
+		if receipt.requestDigest != requestDigest {
+			return "", types.NewAppError(
+				types.CodeConflict, "fake: activity digest conflict",
+				types.ErrConflict)
+		}
+		return receipt.wrappedContext, nil
+	}
+	f.activityReceipts[key] = aggregateQuestionActivityReceipt{
+		requestDigest: requestDigest, wrappedContext: wrappedContext,
+	}
+	return wrappedContext, nil
+}
+
+func (f *fakeStore) recordedAggregateQuestionActivities() []aggregateQuestionActivityCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]aggregateQuestionActivityCall(nil), f.activityCalls...)
 }
 
 func (f *fakeStore) GetDeliveryByFeishuMessageID(ctx context.Context, userID int64, msgID string) (*types.Delivery, error) {

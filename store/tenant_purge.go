@@ -132,6 +132,7 @@ var purgeOrder = []purgeStep{
 	{"profile_epoch_receipts", "tenant_id = $1"},
 	{"profile_epoch_events", "tenant_id = $1"},
 	{"profile_epoch_checkpoints", "tenant_id = $1"},
+	{"profile_epoch_activities", "tenant_id = $1"},
 	{"profile_claim_receipts", "tenant_id = $1"},
 	{"profile_claim_events", "tenant_id = $1"},
 	{"profile_claims", "tenant_id = $1"},
@@ -217,6 +218,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		profileCheckpointsAvailable   bool
 		profileEpochEventsAvailable   bool
 		profileEpochReceiptsAvailable bool
+		profileActivitiesAvailable    bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -224,7 +226,8 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.profile_feedback_epoch_fences') IS NOT NULL,
 		        to_regclass('public.profile_epoch_checkpoints') IS NOT NULL,
 		        to_regclass('public.profile_epoch_events') IS NOT NULL,
-		        to_regclass('public.profile_epoch_receipts') IS NOT NULL`,
+		        to_regclass('public.profile_epoch_receipts') IS NOT NULL,
+		        to_regclass('public.profile_epoch_activities') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -232,6 +235,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&profileCheckpointsAvailable,
 		&profileEpochEventsAvailable,
 		&profileEpochReceiptsAvailable,
+		&profileActivitiesAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
@@ -243,6 +247,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		"profile_epoch_checkpoints":     profileCheckpointsAvailable,
 		"profile_epoch_events":          profileEpochEventsAvailable,
 		"profile_epoch_receipts":        profileEpochReceiptsAvailable,
+		"profile_epoch_activities":      profileActivitiesAvailable,
 	}
 	if _, err := tx.Exec(ctx,
 		`SELECT set_config('app.tenant_id', $1, true)`,
