@@ -16,7 +16,7 @@ func TestAggregateQuestionActivityClosesRestoreWithoutLearning(
 ) {
 	dbURL, db, provider := openMigration066Database(
 		t, "vane_profile_activity_behavior")
-	if _, err := provider.UpTo(t.Context(), 68); err != nil {
+	if _, err := provider.UpTo(t.Context(), 69); err != nil {
 		t.Fatal(err)
 	}
 	st, err := New(t.Context(), dbURL)

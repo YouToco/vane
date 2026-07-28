@@ -75,7 +75,9 @@ func (s *Store) LookupAggregateQuestionActivity(
 	var storedDigest, wrappedContext string
 	err = tx.QueryRow(ctx, `
 		SELECT request_digest,wrapped_context
-		  FROM public.lookup_profile_epoch_activity_receipt_v1($1,$2,$3)`,
+		  FROM public.lookup_profile_epoch_activity_receipt_v1(
+		    $1::bigint,$2::text,$3::text
+		  )`,
 		userID, appIdentity, inboundKey,
 	).Scan(&storedDigest, &wrappedContext)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -176,9 +178,18 @@ func (s *Store) RecordAggregateQuestionActivity(
 	}
 	replayErr := tx.QueryRow(ctx, `
 		SELECT tenant_id,request_digest,wrapped_context
-		  FROM public.lookup_profile_epoch_activity_receipt_v1($1,$2,$3)`,
+		  FROM public.lookup_profile_epoch_activity_receipt_v1(
+		    $1::bigint,$2::text,$3::text
+		  )`,
 		userID, appIdentity, inboundKey,
 	).Scan(&storedTenantID, &storedDigest, &storedContext)
+	if replayErr != nil && !errors.Is(replayErr, pgx.ErrNoRows) {
+		// A failed statement aborts the transaction, so RESET ROLE would only
+		// mask the original PostgreSQL error. Rollback in the deferred cleanup
+		// restores the connection-local role safely.
+		return "", profileClaimDBError(
+			"load aggregate question activity lifetime receipt", replayErr)
+	}
 	if _, err := tx.Exec(ctx, `RESET ROLE`); err != nil {
 		return "", profileClaimDBError(
 			"reset aggregate question activity replay role", err)
@@ -213,11 +224,6 @@ func (s *Store) RecordAggregateQuestionActivity(
 		}
 		return storedContext, nil
 	}
-	if !errors.Is(replayErr, pgx.ErrNoRows) {
-		return "", profileClaimDBError(
-			"load aggregate question activity lifetime receipt", replayErr)
-	}
-
 	var tenantID, deliveryCount, tenantCount int64
 	var deliveryIDs []int64
 	if err := tx.QueryRow(ctx,
