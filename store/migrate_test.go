@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 71
+const latestMigrationVersion int64 = 72
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -115,11 +115,11 @@ var wantTables = []string{
 	"profile_epoch_receipts",
 	// 069 non-learning aggregate-question restore barriers.
 	"profile_epoch_activities",
-	// 070 exact-run at-most-once synthesis receipt and immutable executive
+	// 071 exact-run at-most-once synthesis receipt and immutable executive
 	// Brief artifact.
 	"executive_brief_synthesis_receipts",
 	"executive_brief_artifacts",
-	// 071 task-scoped periodic report settings, durable workflow/spend
+	// 072 task-scoped periodic report settings, durable workflow/spend
 	// identities and immutable cross-run reports.
 	"brief_report_settings",
 	"periodic_brief_intents",

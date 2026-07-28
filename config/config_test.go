@@ -383,6 +383,32 @@ func TestExecutiveBriefRolloutValidation(t *testing.T) {
 				cfg.Pipeline.ExecutiveBriefCanaryScheduleID)
 		}
 	})
+	t.Run("dark synthesis and independent channel canaries", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = "task-a"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("dark synthesis rejected: %v", err)
+		}
+		cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID = " task-a "
+		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID = "task-a"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("channel canaries rejected: %v", err)
+		}
+		if cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID != "task-a" {
+			t.Fatalf("Web canary=%q",
+				cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID)
+		}
+	})
+	t.Run("channel canary outside synthesis is rejected", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = "task-a"
+		cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID = "task-b"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected Web rollout nesting error")
+		}
+	})
 	t.Run("requires structured event evidence", func(t *testing.T) {
 		cfg := base()
 		cfg.Pipeline.StructuredEventEvidenceEnabled = false
@@ -1204,6 +1230,8 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.executive_brief_enabled", cfg.Pipeline.ExecutiveBriefEnabled, false},
 		{"pipeline.executive_brief_canary_schedule_id", cfg.Pipeline.ExecutiveBriefCanaryScheduleID, ""},
 		{"pipeline.executive_brief_allow_all", cfg.Pipeline.ExecutiveBriefAllowAll, false},
+		{"pipeline.executive_brief_web_canary_schedule_id", cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID, ""},
+		{"pipeline.executive_brief_renderer_canary_schedule_id", cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID, ""},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
 		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 100000},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},

@@ -170,7 +170,7 @@ func TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges(
 	runner, err := NewRecoveryRunner(
 		fakeStore, server.Client(),
 		&periodicRecoverySenderFake{},
-		"https://vane.example", nil)
+		"https://vane.example", "task-v1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

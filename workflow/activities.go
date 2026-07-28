@@ -480,6 +480,7 @@ type Activities struct {
 	buildStructuredPolicyV1          CompiledPolicyBuilderV1
 	buildExecutiveBriefPolicyV1      CompiledPolicyBuilderV1
 	executiveBriefStore              ExecutiveBriefStoreV1
+	executiveBriefRendererTaskID     string
 	llmRecorder                      *llm.Recorder
 	compiledModelResolverV1          CompiledModelResolverV1
 	compiledShadowStoreV2            CompiledRunSnapshotShadowV2Store
@@ -632,6 +633,15 @@ func WithCanonicalBriefRendererV1(
 		a.canonicalBriefRendererTaskID = strings.TrimSpace(taskID)
 		a.canonicalBriefDashboardOrigin =
 			strings.TrimRight(strings.TrimSpace(dashboardOrigin), "/")
+	}
+}
+
+// WithExecutiveBriefRendererV1 independently exposes an already-durable
+// executive artifact in the Feishu canonical card for one exact task. Empty
+// keeps synthesis dark while artifact creation and recovery continue.
+func WithExecutiveBriefRendererV1(taskID string) ActivitiesOption {
+	return func(a *Activities) {
+		a.executiveBriefRendererTaskID = strings.TrimSpace(taskID)
 	}
 }
 
@@ -4199,6 +4209,11 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			len(partialEffectPlan) == 0 &&
 			a.canonicalBriefRendererTaskID != "" &&
 			compiledIdentity.TaskID == a.canonicalBriefRendererTaskID
+	var renderedExecutive *types.ExecutiveBriefArtifactDraftV1
+	if in.ExecutiveBrief != nil &&
+		compiledIdentity.TaskID == a.executiveBriefRendererTaskID {
+		renderedExecutive = in.ExecutiveBrief
+	}
 	var plannedChunks []plannedPushChunk
 	buildEffectCard := func(
 		planned plannedPushChunk,
@@ -4267,16 +4282,16 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 					EffectID: effectID, Items: items,
 					CanonicalBrief: &meta,
 					Executive: func() *types.ExecutiveBriefContentV1 {
-						if in.ExecutiveBrief == nil {
+						if renderedExecutive == nil {
 							return nil
 						}
-						return &in.ExecutiveBrief.Content
+						return &renderedExecutive.Content
 					}(),
-					ExecutiveFallback: in.ExecutiveBrief != nil &&
-						in.ExecutiveBrief.GenerationMode ==
+					ExecutiveFallback: renderedExecutive != nil &&
+						renderedExecutive.GenerationMode ==
 							types.ExecutiveGenerationFallback,
-					ExecutivePartial: in.ExecutiveBrief != nil &&
-						in.ExecutiveBrief.Processing ==
+					ExecutivePartial: renderedExecutive != nil &&
+						renderedExecutive.Processing ==
 							types.RunCompletenessPartial,
 				})
 			}

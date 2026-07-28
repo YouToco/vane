@@ -202,6 +202,17 @@ func TestPeriodicReportRecoveryFreezesExactCanonicalInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	driftedOutcomeDraft := reportDraft
+	driftedOutcomeDraft.RunOutcomeIDs = []int64{
+		reportDraft.RunOutcomeIDs[0] + 1,
+	}
+	driftedOutcomeDraft.OutcomeDigest = strings.Repeat("9", 64)
+	if _, err := f.base.st.RecoverPeriodicBriefReportV1(
+		t.Context(), f.identity.TenantID, f.identity.UserID,
+		intent.ID, requestDigest, driftedOutcomeDraft,
+	); types.CodeOf(err) != types.CodeConflict {
+		t.Fatalf("drifted periodic outcome set error=%v", err)
+	}
 	report, err := f.base.st.RecoverPeriodicBriefReportV1(
 		t.Context(), f.identity.TenantID, f.identity.UserID,
 		intent.ID, requestDigest, reportDraft)

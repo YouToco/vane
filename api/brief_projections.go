@@ -36,6 +36,7 @@ type taskBriefPageResponseV1 struct {
 
 func publicTaskBriefPageV1(
 	page store.TaskBriefPageV1,
+	includeExecutive bool,
 ) taskBriefPageResponseV1 {
 	out := taskBriefPageResponseV1{
 		Items: make([]taskBriefItemResponseV1, len(page.Items)),
@@ -50,7 +51,7 @@ func publicTaskBriefPageV1(
 			Processing:     item.Processing,
 			Insights:       item.Insights,
 		}
-		if item.Executive != nil {
+		if includeExecutive && item.Executive != nil {
 			public.Executive = &executiveBriefResponseV1{
 				GenerationMode: item.Executive.GenerationMode,
 				Processing:     item.Executive.Processing,

@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-func TestMigration071PeriodicRolesRLSAndEmptyDown(t *testing.T) {
+func TestMigration072PeriodicRolesRLSAndEmptyDown(t *testing.T) {
 	_, db, provider := openMigration066Database(
-		t, "vane_periodic_brief_071_acl")
-	if _, err := provider.UpTo(t.Context(), 71); err != nil {
+		t, "vane_periodic_brief_072_acl")
+	if _, err := provider.UpTo(t.Context(), 72); err != nil {
 		t.Fatal(err)
 	}
 	var canLogin, inherit, bypassRLS, superuser bool
@@ -89,8 +89,8 @@ func TestMigration071PeriodicRolesRLSAndEmptyDown(t *testing.T) {
 		t.Fatalf("recovery report INSERT boundary = %t/%t",
 			recoveryReportInsert, recoveryReportIDInsert)
 	}
-	if _, err := provider.DownTo(t.Context(), 70); err != nil {
-		t.Fatalf("empty 071 Down failed: %v", err)
+	if _, err := provider.DownTo(t.Context(), 71); err != nil {
+		t.Fatalf("empty 072 Down failed: %v", err)
 	}
 	var writerExists, writerPrivileged bool
 	if err := db.QueryRowContext(t.Context(), `
@@ -108,15 +108,15 @@ func TestMigration071PeriodicRolesRLSAndEmptyDown(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !writerExists || writerPrivileged {
-		t.Fatalf("071 Down role boundary exists=%v privileged=%v",
+		t.Fatalf("072 Down role boundary exists=%v privileged=%v",
 			writerExists, writerPrivileged)
 	}
 }
 
-func TestMigration071DownRefusesPreparedIntent(t *testing.T) {
+func TestMigration072DownRefusesPreparedIntent(t *testing.T) {
 	_, db, provider := openMigration066Database(
-		t, "vane_periodic_brief_071_pending_down")
-	if _, err := provider.UpTo(t.Context(), 71); err != nil {
+		t, "vane_periodic_brief_072_pending_down")
+	if _, err := provider.UpTo(t.Context(), 72); err != nil {
 		t.Fatal(err)
 	}
 	var userID int64
@@ -156,12 +156,12 @@ func TestMigration071DownRefusesPreparedIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := provider.DownTo(
-		t.Context(), 70,
+		t.Context(), 71,
 	); err == nil || !strings.Contains(
 		err.Error(),
 		"refusing Down while periodic Brief state exists",
 	) {
-		t.Fatalf("071 pending Down error=%v", err)
+		t.Fatalf("072 pending Down error=%v", err)
 	}
 	var intentExists bool
 	if err := db.QueryRowContext(t.Context(),
@@ -170,6 +170,6 @@ func TestMigration071DownRefusesPreparedIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !intentExists {
-		t.Fatal("071 pending Down removed periodic state")
+		t.Fatal("072 pending Down removed periodic state")
 	}
 }

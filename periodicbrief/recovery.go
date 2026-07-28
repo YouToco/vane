@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,12 +61,13 @@ type WorkflowExecutionDescriber interface {
 }
 
 type RecoveryRunner struct {
-	store    RecoveryStore
-	temporal WorkflowExecutionDescriber
-	sender   DeliveryRecoverySender
-	origin   string
-	logger   *slog.Logger
-	pass     chan struct{}
+	store          RecoveryStore
+	temporal       WorkflowExecutionDescriber
+	sender         DeliveryRecoverySender
+	origin         string
+	deliveryTaskID string
+	logger         *slog.Logger
+	pass           chan struct{}
 }
 
 type DeliveryRecoverySender interface {
@@ -80,6 +82,7 @@ func NewRecoveryRunner(
 	temporal WorkflowExecutionDescriber,
 	sender DeliveryRecoverySender,
 	dashboardOrigin string,
+	deliveryTaskID string,
 	logger *slog.Logger,
 ) (*RecoveryRunner, error) {
 	if st == nil || temporal == nil || sender == nil ||
@@ -91,8 +94,10 @@ func NewRecoveryRunner(
 	}
 	runner := &RecoveryRunner{
 		store: st, temporal: temporal, sender: sender,
-		origin: dashboardOrigin, logger: logger,
-		pass: make(chan struct{}, 1)}
+		origin:         dashboardOrigin,
+		deliveryTaskID: strings.TrimSpace(deliveryTaskID),
+		logger:         logger,
+		pass:           make(chan struct{}, 1)}
 	runner.pass <- struct{}{}
 	return runner, nil
 }
@@ -206,6 +211,9 @@ func (r *RecoveryRunner) runMissingDeliveryPass(ctx context.Context) error {
 			go func(report types.PeriodicBriefReportV1) {
 				defer wg.Done()
 				defer func() { <-sem }()
+				if report.TaskID != r.deliveryTaskID {
+					return
+				}
 				if recoverErr := deliverPeriodicBriefV1(
 					ctx, report, r.store, r.sender, r.origin,
 				); recoverErr != nil {
@@ -289,24 +297,30 @@ func (r *RecoveryRunner) recoverDeliveryOne(
 		observation, sendErr := r.sender.SendCardWithUUIDResult(
 			ctx, claimed.AppIdentity, claimed.TargetOpenID,
 			string(claimed.CardPayload), claimed.ProviderUUID)
-		status := store.PeriodicReportDeliveryAmbiguous
-		messageID := ""
 		switch observation.Disposition {
 		case pusheffect.AttemptSent:
-			status = store.PeriodicReportDeliverySent
-			messageID = observation.MessageID
+			return r.store.FinalizePeriodicReportDeliveryV1(
+				ctx, claimed.TenantID, claimed.UserID,
+				claimed.ReportID, store.PeriodicReportDeliverySent,
+				observation.MessageID)
 		case pusheffect.AttemptDefiniteNotSent:
-			status = store.PeriodicReportDeliveryPrepared
-		}
-		finalizeErr := r.store.FinalizePeriodicReportDeliveryV1(
-			ctx, claimed.TenantID, claimed.UserID, claimed.ReportID,
-			status, messageID)
-		if sendErr != nil {
-			sendErr = types.NewAppError(
-				types.CodeOf(sendErr),
+			finalizeErr := r.store.FinalizePeriodicReportDeliveryV1(
+				ctx, claimed.TenantID, claimed.UserID,
+				claimed.ReportID, store.PeriodicReportDeliveryPrepared,
+				"")
+			return errors.Join(sendErr, finalizeErr)
+		default:
+			// An unknown boundary crossing remains sending. Neither an adapter
+			// error nor absence from provider history proves no send occurred.
+			if sendErr != nil {
+				return types.NewAppError(
+					types.CodeOf(sendErr),
+					"周期报告推送结果未完全确认", nil)
+			}
+			return types.NewAppError(
+				types.CodePushFailed,
 				"周期报告推送结果未完全确认", nil)
 		}
-		return errors.Join(sendErr, finalizeErr)
 	}
 	if delivery.Status != store.PeriodicReportDeliverySending ||
 		delivery.AttemptStartedAt == nil {
@@ -334,12 +348,9 @@ func (r *RecoveryRunner) recoverDeliveryOne(
 			return nil
 		}
 		if observation.MatchCount == 0 && observation.MessageID == "" {
-			// Retrying the same frozen card with the same provider UUID is the
-			// only safe no-positive-evidence path.
-			return r.store.FinalizePeriodicReportDeliveryV1(
-				ctx, delivery.TenantID, delivery.UserID,
-				delivery.ReportID, store.PeriodicReportDeliveryPrepared,
-				"")
+			// The protocol deliberately treats empty history as no positive
+			// evidence, not as proof that the original send failed.
+			return nil
 		}
 		if observation.MatchCount != 1 || observation.MessageID == "" {
 			return r.store.FinalizePeriodicReportDeliveryV1(

@@ -1,4 +1,4 @@
--- 070: exact-run executive Brief synthesis receipts and immutable artifacts.
+-- 071: exact-run executive Brief synthesis receipts and immutable artifacts.
 --
 -- The receipt owns at-most-once spend authority. A response-lost or stale
 -- spending claim can only converge to deterministic fallback; it can never be
@@ -223,10 +223,10 @@ BEGIN
         OLD.profile_epoch,OLD.profile_version,OLD.profile_digest,
         OLD.input_digest,OLD.request_digest,OLD.created_at
     ) THEN
-        RAISE EXCEPTION '070: executive synthesis identity is immutable';
+        RAISE EXCEPTION '071: executive synthesis identity is immutable';
     END IF;
     IF OLD.status IN ('finalized','fallback') THEN
-        RAISE EXCEPTION '070: terminal executive synthesis is immutable';
+        RAISE EXCEPTION '071: terminal executive synthesis is immutable';
     END IF;
     IF current_user='vane_brief_synthesis_writer' THEN
         IF NOT (
@@ -235,17 +235,17 @@ BEGIN
             (OLD.status='spending' AND
                 NEW.status IN ('finalized','ambiguous','fallback'))
         ) THEN
-            RAISE EXCEPTION '070: executive synthesis transition denied';
+            RAISE EXCEPTION '071: executive synthesis transition denied';
         END IF;
     ELSIF current_user='vane_brief_synthesis_recovery' THEN
         IF NOT (
             OLD.status IN ('spending','ambiguous') AND
             NEW.status='fallback'
         ) THEN
-            RAISE EXCEPTION '070: executive synthesis recovery denied';
+            RAISE EXCEPTION '071: executive synthesis recovery denied';
         END IF;
     ELSE
-        RAISE EXCEPTION '070: executive synthesis authority denied';
+        RAISE EXCEPTION '071: executive synthesis authority denied';
     END IF;
     NEW.updated_at=clock_timestamp();
     RETURN NEW;
@@ -506,7 +506,7 @@ BEGIN
     IF EXISTS (SELECT 1 FROM executive_brief_synthesis_receipts) OR
        EXISTS (SELECT 1 FROM executive_brief_artifacts) THEN
         RAISE EXCEPTION
-            '070: refusing Down while executive Brief state exists';
+            '071: refusing Down while executive Brief state exists';
     END IF;
 END $$;
 -- +goose StatementEnd
@@ -544,6 +544,6 @@ DROP TABLE executive_brief_synthesis_receipts;
 
 -- Roles and memberships are cluster-scoped while goose migrations are
 -- database-scoped. Keep the hardened NOLOGIN roles: another database in the
--- same PostgreSQL cluster may still be running migration 070.
+-- same PostgreSQL cluster may still be running migration 071.
 DROP OWNED BY vane_brief_synthesis_writer;
 DROP OWNED BY vane_brief_synthesis_recovery;

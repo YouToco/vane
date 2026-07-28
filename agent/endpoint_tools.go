@@ -130,6 +130,25 @@ type toolRunState struct {
 	// 不能借提示注入生成 pending action，也不能用 URL/query 外带上下文。
 	// 状态不持久化，下一条明确用户请求重新开始。
 	untrustedExternalResult bool
+	// externalFollowupSearchRequired 只由类型化飞书外部输入中拆出的当前用户后缀
+	// 决定。引用正文不参与判断，也不能进入 query。
+	externalFollowupSearchRequired bool
+	// externalFollowupSearchQuery 是允许送往 Exa 的唯一查询字节。非空表示
+	// web_search 已真实装配且通过本地效果策略校验。
+	externalFollowupSearchQuery string
+	// responseRejected 给模型一次从无工具猜答自纠为真实搜索的机会；attempted /
+	// succeeded 分开记录，确保参数改写、预算拒绝、上游失败或并列调用后不能再
+	// 输出伪“检索结果”。succeeded 只允许 webSearchTool 在上游无错返回后写入。
+	externalFollowupSearchResponseRejected bool
+	externalFollowupSearchAttempted        bool
+	externalFollowupSearchSucceeded        bool
+	// result is the exact bounded text returned by web_search. The final-answer
+	// harness validates citations against it instead of trusting the model to
+	// remember which URLs really appeared. GroundingFailures gives one
+	// tool-free correction turn, then fails closed.
+	externalFollowupSearchResult      string
+	externalFollowupSearchEvidence    []externalFollowupSearchEvidence
+	externalFollowupGroundingFailures int
 	// allowedLocalResultHandles 只登记本条消息的动态端点刚生成的截断句柄。
 	// 句柄 res-N 可猜且缓存按 user 共享；仅用 bool 会让恶意端点枚举同用户
 	// 其他会话的旧结果。taint 后 read_endpoint_result 必须命中这个集合。

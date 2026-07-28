@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
@@ -67,6 +68,7 @@ type Activities struct {
 	deliveryStore   DeliveryStore
 	sender          DeliverySender
 	dashboardOrigin string
+	deliveryTaskID  string
 }
 
 func NewActivities(
@@ -75,6 +77,7 @@ func NewActivities(
 	recorder *llm.Recorder,
 	sender DeliverySender,
 	dashboardOrigin string,
+	deliveryTaskID string,
 ) (*Activities, error) {
 	deliveryStore, ok := st.(DeliveryStore)
 	if st == nil || modelResolver == nil || recorder == nil ||
@@ -84,7 +87,8 @@ func NewActivities(
 	return &Activities{
 		store: st, modelResolver: modelResolver, recorder: recorder,
 		deliveryStore: deliveryStore, sender: sender,
-		dashboardOrigin: dashboardOrigin}, nil
+		dashboardOrigin: dashboardOrigin,
+		deliveryTaskID:  strings.TrimSpace(deliveryTaskID)}, nil
 }
 
 func WorkflowV1(

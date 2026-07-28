@@ -137,6 +137,7 @@ func (f periodicDescriberFake) DescribeWorkflowExecution(
 type periodicRecoverySenderFake struct {
 	sendCalls  int
 	send       pusheffect.ProviderObservation
+	sendErr    error
 	history    pusheffect.HistoryObservation
 	historyErr error
 }
@@ -148,7 +149,7 @@ func (f *periodicRecoverySenderFake) SendCardWithUUIDResult(
 	context.Context, string, string, string, string,
 ) (pusheffect.ProviderObservation, error) {
 	f.sendCalls++
-	return f.send, nil
+	return f.send, f.sendErr
 }
 func (f *periodicRecoverySenderFake) ResolvePeriodicReportMessage(
 	context.Context, pusheffect.HistoryQuery,
@@ -212,7 +213,7 @@ func TestRecoveryConvergesStaleSpendingToFallbackWithoutProvider(t *testing.T) {
 	sender := &periodicRecoverySenderFake{}
 	runner, err := NewRecoveryRunner(
 		fakeStore, periodicDescriberFake{}, sender,
-		"https://vane.example", nil)
+		"https://vane.example", "task-v1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +250,7 @@ func TestRecoverySkipsRunningExactTemporalExecution(t *testing.T) {
 				Status: enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
 			},
 		}},
-		sender, "https://vane.example", nil)
+		sender, "https://vane.example", "task-v1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +283,7 @@ func TestDeliveryRecoveryReusesUUIDAndFinalizesSent(t *testing.T) {
 	}
 	runner, err := NewRecoveryRunner(
 		fakeStore, periodicDescriberFake{err: errors.New("unused")},
-		sender, "https://vane.example", nil)
+		sender, "https://vane.example", "task-v1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +347,7 @@ func TestRecoveryCreatesMissingDeliveryReceiptAndSends(t *testing.T) {
 	}
 	runner, err := NewRecoveryRunner(
 		fakeStore, periodicDescriberFake{}, sender,
-		"https://vane.example", nil)
+		"https://vane.example", "task-v1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,6 +363,36 @@ func TestRecoveryCreatesMissingDeliveryReceiptAndSends(t *testing.T) {
 	}
 }
 
+func TestRecoveryKeepsMissingDeliveryDarkOutsideRendererCanary(
+	t *testing.T,
+) {
+	fakeStore := &periodicRecoveryStoreFake{
+		missing: []types.PeriodicBriefReportV1{
+			periodicDeliveryReportFixture(t),
+		},
+		settings: store.BriefReportSettingsV1{
+			Mode:     store.BriefReportModeAuto,
+			Cadence:  store.BriefReportCadenceDaily,
+			Delivery: store.BriefReportDeliveryAlways,
+			Timezone: "UTC",
+		},
+	}
+	sender := &periodicRecoverySenderFake{}
+	runner, err := NewRecoveryRunner(
+		fakeStore, periodicDescriberFake{}, sender,
+		"https://vane.example", "task-other", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.runMissingDeliveryPass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if fakeStore.prepared || sender.sendCalls != 0 {
+		t.Fatalf("dark report prepared=%v sends=%d",
+			fakeStore.prepared, sender.sendCalls)
+	}
+}
+
 func TestDeliveryRecoveryLeavesUnknownSendingWhenHistoryUnavailable(
 	t *testing.T,
 ) {
@@ -372,7 +403,7 @@ func TestDeliveryRecoveryLeavesUnknownSendingWhenHistoryUnavailable(
 	}
 	runner, err := NewRecoveryRunner(
 		fakeStore, periodicDescriberFake{}, sender,
-		"https://vane.example", nil)
+		"https://vane.example", "task-v1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +428,49 @@ func TestDeliveryRecoveryLeavesUnknownSendingWhenHistoryUnavailable(
 	}
 }
 
-func TestDeliveryRecoveryResetsPreparedOnlyAfterEmptyHistory(
+func TestPreparedDeliveryRecoveryLeavesUnknownSendInSending(
+	t *testing.T,
+) {
+	fakeStore := &periodicRecoveryStoreFake{
+		claimed: store.PeriodicReportDeliveryV1{
+			ReportID: 7, TenantID: 4, UserID: 5,
+			AppIdentity: "app", TargetOpenID: "open",
+			ProviderUUID: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+			CardPayload:  []byte(`{"schema":"2.0"}`),
+		},
+	}
+	sender := &periodicRecoverySenderFake{
+		send: pusheffect.ProviderObservation{
+			Disposition: pusheffect.AttemptAmbiguous,
+		},
+		sendErr: errors.New("provider boundary unknown"),
+	}
+	runner, err := NewRecoveryRunner(
+		fakeStore, periodicDescriberFake{}, sender,
+		"https://vane.example", "task-v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = runner.recoverDeliveryOne(
+		t.Context(),
+		store.PeriodicDeliveryRecoveryCandidateV1{
+			UpdatedAt: time.Now().Add(-3 * time.Minute),
+			PeriodicReportDeliveryV1: store.PeriodicReportDeliveryV1{
+				ReportID: 7, TenantID: 4, UserID: 5,
+				Status: store.PeriodicReportDeliveryPrepared,
+			},
+		},
+	)
+	if types.CodeOf(err) == "" {
+		t.Fatal("unknown recovery send unexpectedly succeeded")
+	}
+	if fakeStore.finalStatus != "" {
+		t.Fatalf("unknown prepared send finalized as %s",
+			fakeStore.finalStatus)
+	}
+}
+
+func TestDeliveryRecoveryLeavesSendingAfterEmptyHistory(
 	t *testing.T,
 ) {
 	at := time.Now().Add(-3 * time.Minute)
@@ -405,7 +478,7 @@ func TestDeliveryRecoveryResetsPreparedOnlyAfterEmptyHistory(
 	runner, err := NewRecoveryRunner(
 		fakeStore, periodicDescriberFake{},
 		&periodicRecoverySenderFake{},
-		"https://vane.example", nil)
+		"https://vane.example", "task-v1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -424,7 +497,8 @@ func TestDeliveryRecoveryResetsPreparedOnlyAfterEmptyHistory(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fakeStore.finalStatus != store.PeriodicReportDeliveryPrepared {
-		t.Fatalf("empty history reset status=%s", fakeStore.finalStatus)
+	if fakeStore.finalStatus != "" {
+		t.Fatalf("empty history finalized unknown send as %s",
+			fakeStore.finalStatus)
 	}
 }

@@ -178,12 +178,9 @@ type Deps struct {
 	// advertise or enter the definition-edit proposal path while the Agent
 	// feature flag is disabled, even though historical cards remain routable.
 	DefinitionEditEnabled bool
-	// P2-D transport exposure follows the same exact rollout as synthesis.
-	// Routes remain mounted for compatibility but non-rollout tasks are
-	// indistinguishable from absent resources.
-	ExecutiveBriefEnabled          bool
-	ExecutiveBriefCanaryScheduleID string
-	ExecutiveBriefAllowAll         bool
+	// P2-D Web exposure is independent from dark synthesis and Feishu render.
+	// Routes remain mounted, but every non-Web-canary task looks absent.
+	ExecutiveBriefWebCanaryScheduleID string
 	// Origin 是唯一放行 CORS 的前端源（VANE_DASHBOARD_ORIGIN，默认生产 Dashboard 域）。
 	// 前端迁 OSS+CDN 后与 API 跨源（vane.* → api.*），凭证请求要求逐字匹配的
 	// Allow-Origin + Allow-Credentials，不允许通配符。为空 = 不放行任何跨源。
@@ -199,9 +196,8 @@ type server struct {
 }
 
 func (s *server) executiveBriefTaskEnabled(taskID string) bool {
-	return s.deps.ExecutiveBriefEnabled && taskID != "" &&
-		(s.deps.ExecutiveBriefAllowAll ||
-			taskID == s.deps.ExecutiveBriefCanaryScheduleID)
+	return taskID != "" &&
+		taskID == s.deps.ExecutiveBriefWebCanaryScheduleID
 }
 
 // Mount 把 /api/* 路由挂到 mux。除 /api/auth/login 外全部要求会话 cookie；

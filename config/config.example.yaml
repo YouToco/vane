@@ -76,6 +76,8 @@ pipeline:
   executive_brief_enabled: false
   executive_brief_canary_schedule_id: ""
   executive_brief_allow_all: false
+  executive_brief_web_canary_schedule_id: ""
+  executive_brief_renderer_canary_schedule_id: ""
   # P1-E Feishu renderer authority; empty is the exact rollback state.
   canonical_brief_renderer_canary_schedule_id: ""
   # C2c-2: exact one-task shadow canary. Empty means fully off.

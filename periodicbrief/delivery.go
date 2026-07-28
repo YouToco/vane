@@ -122,6 +122,10 @@ func (a *Activities) DeliverPeriodicBriefV1(
 	ctx context.Context,
 	input DeliverInputV1,
 ) error {
+	if input.Report.TaskID == "" ||
+		input.Report.TaskID != a.deliveryTaskID {
+		return nil
+	}
 	return deliverPeriodicBriefV1(
 		ctx, input.Report, a.deliveryStore, a.sender,
 		a.dashboardOrigin)

@@ -138,7 +138,8 @@ func (f *fakeActionDispatchStore) ReleaseAgentActionContinuation(
 func fakeAction(id string) store.AgentActionContinuation {
 	return store.AgentActionContinuation{
 		ActionID: id, TenantID: 1, UserID: 2,
-		SessionID: 3, SourceID: 4,
+		SessionID: 3, ToolName: DurableActionToolName,
+		SourceID: 4, SourceIDs: []int64{4},
 		Status: store.AgentActionStatusConfirmed,
 	}
 }

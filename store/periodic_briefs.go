@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1266,7 +1267,9 @@ func (s *Store) finalizePeriodicBriefReportV1(
 		BriefReportCadenceV1(draft.Cadence) ||
 		!intent.PeriodStart.Equal(draft.PeriodStart) ||
 		!intent.PeriodEnd.Equal(draft.PeriodEnd) ||
-		intent.InputDigest != draft.InputDigest {
+		intent.InputDigest != draft.InputDigest ||
+		!slices.Equal(intent.RunOutcomeIDs, draft.RunOutcomeIDs) ||
+		intent.OutcomeDigest != draft.OutcomeDigest {
 		return types.PeriodicBriefReportV1{},
 			types.NewAppError(types.CodeConflict,
 				"周期报告终态与意图不同", nil)

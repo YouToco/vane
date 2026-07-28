@@ -250,6 +250,8 @@ func run() error {
 			cfg.Pipeline.CanonicalBriefRendererCanaryScheduleID,
 			cfg.Dashboard.Origin,
 		),
+		workflow.WithExecutiveBriefRendererV1(
+			cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID),
 		workflow.WithSnapshotV2ShadowCanary(
 			st, cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID),
 		workflow.WithSnapshotV2ReadAuditCanary(
@@ -262,7 +264,8 @@ func run() error {
 			st, cfg.Pipeline.PushEffectCanaryScheduleID))
 	periodicActivities, err := periodicbrief.NewActivities(
 		st, compiledModelResolver, recorder,
-		manager, cfg.Dashboard.Origin)
+		manager, cfg.Dashboard.Origin,
+		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID)
 	if err != nil {
 		temporalClient.Close()
 		st.Close()
@@ -368,7 +371,9 @@ func run() error {
 		return fmt.Errorf("装配周期 Brief coordinator: %w", err)
 	}
 	periodicRecoveryRunner, err := periodicbrief.NewRecoveryRunner(
-		st, temporalClient, manager, cfg.Dashboard.Origin, slog.Default())
+		st, temporalClient, manager, cfg.Dashboard.Origin,
+		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID,
+		slog.Default())
 	if err != nil {
 		temporalClient.Close()
 		st.Close()
@@ -1013,10 +1018,8 @@ func run() error {
 		BriefFeedback:         fbSvc,
 		TaskActions:           st,
 		DefinitionEditEnabled: cfg.Agent.DefinitionEditEnabled,
-		ExecutiveBriefEnabled: cfg.Pipeline.ExecutiveBriefEnabled,
-		ExecutiveBriefCanaryScheduleID: cfg.Pipeline.
-			ExecutiveBriefCanaryScheduleID,
-		ExecutiveBriefAllowAll: cfg.Pipeline.ExecutiveBriefAllowAll,
+		ExecutiveBriefWebCanaryScheduleID: cfg.Pipeline.
+			ExecutiveBriefWebCanaryScheduleID,
 		// HTTP 面的 principal 来自会话中间件注入的 ctx（企业级契约 §1.1 的最终形态）；
 		// a2a/gate 无 HTTP 会话，仍用 owner 回退——这正是把 principal 做成接口的价值。
 		Principal: auth.NewContextResolver(),

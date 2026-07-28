@@ -1,4 +1,4 @@
--- 071: task-scoped periodic Brief settings, durable intents and immutable reports.
+-- 072: task-scoped periodic Brief settings, durable intents and immutable reports.
 
 -- +goose Up
 
@@ -302,18 +302,18 @@ BEGIN
         OLD.outcome_digest,OLD.source_coverage,OLD.processing,
         OLD.partial_reason,OLD.created_at
     ) THEN
-        RAISE EXCEPTION '071: periodic Brief intent identity is immutable';
+        RAISE EXCEPTION '072: periodic Brief intent identity is immutable';
     END IF;
     IF OLD.temporal_run_id IS NOT NULL AND
        NEW.temporal_run_id IS DISTINCT FROM OLD.temporal_run_id THEN
-        RAISE EXCEPTION '071: periodic Brief Temporal run is immutable';
+        RAISE EXCEPTION '072: periodic Brief Temporal run is immutable';
     END IF;
     IF NOT (
         (OLD.status='prepared' AND NEW.status IN ('prepared','running')) OR
         (OLD.status='running' AND NEW.status IN ('running','finalized','fallback')) OR
         (OLD.status IN ('finalized','fallback') AND NEW IS NOT DISTINCT FROM OLD)
     ) THEN
-        RAISE EXCEPTION '071: periodic Brief intent transition denied';
+        RAISE EXCEPTION '072: periodic Brief intent transition denied';
     END IF;
     RETURN NEW;
 END
@@ -340,14 +340,14 @@ BEGIN
         OLD.request_digest,OLD.profile_epoch,OLD.profile_version,
         OLD.profile_digest,OLD.input_digest,OLD.created_at
     ) THEN
-        RAISE EXCEPTION '071: periodic synthesis identity is immutable';
+        RAISE EXCEPTION '072: periodic synthesis identity is immutable';
     END IF;
     IF NOT (
         (OLD.status='prepared' AND NEW.status='spending') OR
         (OLD.status='spending' AND NEW.status IN ('finalized','fallback')) OR
         (OLD.status IN ('finalized','fallback') AND NEW IS NOT DISTINCT FROM OLD)
     ) THEN
-        RAISE EXCEPTION '071: periodic synthesis transition denied';
+        RAISE EXCEPTION '072: periodic synthesis transition denied';
     END IF;
     RETURN NEW;
 END
@@ -376,9 +376,9 @@ BEGIN
            ) THEN
             RETURN OLD;
         END IF;
-        RAISE EXCEPTION '071: periodic Brief reports are immutable';
+        RAISE EXCEPTION '072: periodic Brief reports are immutable';
     END IF;
-    RAISE EXCEPTION '071: periodic Brief reports are immutable';
+    RAISE EXCEPTION '072: periodic Brief reports are immutable';
 END
 $$;
 -- +goose StatementEnd
@@ -405,14 +405,14 @@ BEGIN
         OLD.card_digest,OLD.provider_uuid,OLD.app_identity,
         OLD.target_open_id,OLD.provider_chat_id,OLD.created_at
     ) THEN
-        RAISE EXCEPTION '071: periodic report delivery identity is immutable';
+        RAISE EXCEPTION '072: periodic report delivery identity is immutable';
     END IF;
     IF NOT (
         (OLD.status='prepared' AND NEW.status IN ('prepared','sending')) OR
         (OLD.status='sending' AND NEW.status IN ('prepared','sent','ambiguous')) OR
         (OLD.status IN ('sent','ambiguous','skipped') AND NEW IS NOT DISTINCT FROM OLD)
     ) THEN
-        RAISE EXCEPTION '071: periodic report delivery transition denied';
+        RAISE EXCEPTION '072: periodic report delivery transition denied';
     END IF;
     RETURN NEW;
 END
@@ -716,7 +716,7 @@ BEGIN
        EXISTS (SELECT 1 FROM periodic_synthesis_receipts) OR
        EXISTS (SELECT 1 FROM periodic_brief_reports) OR
        EXISTS (SELECT 1 FROM periodic_report_deliveries) THEN
-        RAISE EXCEPTION '071: refusing Down while periodic Brief state exists';
+        RAISE EXCEPTION '072: refusing Down while periodic Brief state exists';
     END IF;
 END $$;
 -- +goose StatementEnd
@@ -757,5 +757,5 @@ REVOKE SELECT (
 ) ON brief_snapshots FROM vane_brief_synthesis_recovery;
 -- The role is cluster-scoped while this Down is database-scoped. Revoke all
 -- privileges owned in this database but keep the hardened NOLOGIN role and
--- owner membership for other databases that may still be on migration 071.
+-- owner membership for other databases that may still be on migration 072.
 DROP OWNED BY vane_periodic_brief_writer;

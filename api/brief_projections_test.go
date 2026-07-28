@@ -11,20 +11,13 @@ import (
 
 func TestExecutiveBriefTaskEnabledUsesExactRolloutScope(t *testing.T) {
 	s := &server{deps: Deps{
-		ExecutiveBriefEnabled:          true,
-		ExecutiveBriefCanaryScheduleID: "task-canary",
+		ExecutiveBriefWebCanaryScheduleID: "task-canary",
 	}}
 	if !s.executiveBriefTaskEnabled("task-canary") ||
 		s.executiveBriefTaskEnabled("task-other") {
 		t.Fatal("exact executive Brief rollout scope drifted")
 	}
-	s.deps.ExecutiveBriefAllowAll = true
-	s.deps.ExecutiveBriefCanaryScheduleID = ""
-	if !s.executiveBriefTaskEnabled("task-other") ||
-		s.executiveBriefTaskEnabled("") {
-		t.Fatal("allow-all executive Brief rollout scope drifted")
-	}
-	s.deps.ExecutiveBriefEnabled = false
+	s.deps.ExecutiveBriefWebCanaryScheduleID = ""
 	if s.executiveBriefTaskEnabled("task-other") {
 		t.Fatal("disabled executive Brief rollout remained visible")
 	}
@@ -49,9 +42,16 @@ func TestBriefPublicProjectionsDoNotExposeIntegrityMetadata(t *testing.T) {
 			},
 		}},
 	}
-	raw, err := json.Marshal(publicTaskBriefPageV1(page))
+	raw, err := json.Marshal(publicTaskBriefPageV1(page, true))
 	if err != nil {
 		t.Fatal(err)
+	}
+	darkRaw, err := json.Marshal(publicTaskBriefPageV1(page, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(darkRaw), `"executive"`) {
+		t.Fatalf("dark rollout exposed executive Brief: %s", darkRaw)
 	}
 	text := string(raw)
 	for _, forbidden := range []string{
