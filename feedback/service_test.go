@@ -2,6 +2,7 @@ package feedback
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -359,6 +360,109 @@ func TestRebuilt_聚合分流与状态隔离(t *testing.T) {
 	}
 	if sibling.State.Preference != "" || sibling.State.Misjudged {
 		t.Errorf("兄弟条目状态不得被串染，实得 %+v", sibling.State)
+	}
+}
+
+func TestRebuilt_CanonicalBriefUsesFrozenOrderedPrefix(t *testing.T) {
+	h := newHarness(t)
+	const batchID int64 = 901
+	h.delivery().BatchID = batchID
+	h.delivery().CardJSON = []byte(`{
+		"header":{"title":{"content":"📡 Canonical · 今日 5 条"},"template":"green"},
+		"body":{"elements":[{"behaviors":[{"value":{
+			"vane_action":"fb","delivery_id":"42",
+			"brief_batch_id":"901","brief_total":"5","brief_visible":"3",
+			"brief_url":"https://vane.example/#/tasks/task-1"
+		}}]}]}
+	}`)
+	insights := make([]types.InsightV1, 5)
+	for i := range insights {
+		id := testDeliveryID + int64(i)
+		if i > 0 {
+			h.st.deliveries[id] = &types.Delivery{
+				ID: id, BatchID: batchID, UserID: testUserID,
+				BodyMD:          "mutable delivery body",
+				FeishuMessageID: testMsgID,
+				Status:          types.DeliveryStatusSent,
+				CreatedAt:       time.Now(),
+			}
+		}
+		insights[i] = types.InsightV1{
+			ID: id, RankPosition: i + 1,
+			Title:        fmt.Sprintf("frozen-%d", i+1),
+			BodyMD:       fmt.Sprintf("frozen-body-%d", i+1),
+			SourceTitle:  "Frozen Source",
+			SourceURL:    fmt.Sprintf("https://example.com/%d", i+1),
+			DiscoveredAt: time.Unix(int64(100+i), 0).UTC(),
+		}
+	}
+	h.st.canonicalBrief = types.BriefV1{
+		ID: 77,
+		BriefDraftV1: types.BriefDraftV1{
+			PushBatchID: batchID, UserID: testUserID,
+			TaskID:   "task-1",
+			Insights: insights,
+		},
+	}
+	h.st.canonicalFound = true
+
+	var got *AggregateCardInput
+	h.svc.deps.BuildAggCard = func(in AggregateCardInput) string {
+		got = &in
+		return `{"canonical":"rebuilt"}`
+	}
+	res := h.click(t, types.FeedbackActionInterested)
+	if res.CardJSON != `{"canonical":"rebuilt"}` || got == nil {
+		t.Fatalf("canonical rebuild = %+v input=%+v", res, got)
+	}
+	if h.st.canonicalCalls != 1 {
+		t.Fatalf("canonical reader calls=%d, want 1", h.st.canonicalCalls)
+	}
+	if got.CanonicalBrief == nil ||
+		got.CanonicalBrief.BatchID != batchID ||
+		got.CanonicalBrief.TotalItems != 5 ||
+		got.CanonicalBrief.VisibleItems != 3 {
+		t.Fatalf("canonical metadata = %+v", got.CanonicalBrief)
+	}
+	if len(got.Items) != 3 {
+		t.Fatalf("canonical visible prefix len=%d, want 3", len(got.Items))
+	}
+	for i, item := range got.Items {
+		if item.DeliveryID != insights[i].ID ||
+			item.Title != insights[i].Title ||
+			item.BodyMD != insights[i].BodyMD ||
+			item.SourceTitle != insights[i].SourceTitle ||
+			item.URL != insights[i].SourceURL ||
+			!item.DiscoveredAt.Equal(insights[i].DiscoveredAt) {
+			t.Fatalf("canonical item[%d]=%+v want=%+v",
+				i, item, insights[i])
+		}
+	}
+	if got.Items[0].State.Preference !=
+		types.FeedbackActionInterested {
+		t.Fatalf("clicked canonical state=%+v", got.Items[0].State)
+	}
+}
+
+func TestRebuilt_InvalidCanonicalMetadataKeepsExistingCard(t *testing.T) {
+	h := newHarness(t)
+	sibID := testDeliveryID + 1
+	h.st.deliveries[sibID] = &types.Delivery{
+		ID: sibID, UserID: testUserID,
+		FeishuMessageID: testMsgID,
+		Status:          types.DeliveryStatusSent,
+	}
+	h.delivery().CardJSON = []byte(`{"body":{"elements":[{"value":{
+		"brief_batch_id":"bad","brief_total":"5","brief_visible":"3",
+		"brief_url":"javascript:alert(1)"
+	}}]}}`)
+	res := h.click(t, types.FeedbackActionInterested)
+	if res.CardJSON != "" {
+		t.Fatalf("invalid canonical metadata replaced card: %s", res.CardJSON)
+	}
+	if h.st.canonicalCalls != 0 {
+		t.Fatalf("invalid metadata reached canonical reader %d times",
+			h.st.canonicalCalls)
 	}
 }
 

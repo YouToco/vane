@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,18 @@ type Store interface {
 	GetContentItem(ctx context.Context, id int64) (*types.ContentItem, error)
 	GetSource(ctx context.Context, id int64) (*types.Source, error)
 	GetProfile(ctx context.Context, userID int64) (*types.Profile, error)
+}
+
+// canonicalBriefFeedbackStore is optional so legacy test fakes and deployments
+// remain source-compatible. A card that declares canonical metadata fails
+// closed on rebuild unless this exact immutable reader is available.
+type canonicalBriefFeedbackStore interface {
+	LoadCanonicalBriefForFeedbackV1(
+		ctx context.Context,
+		userID int64,
+		deliveryID int64,
+		batchID int64,
+	) (types.BriefV1, bool, error)
 }
 
 // Sender 把 markdown 回复到指定消息下（生产实现 *feishu.Manager.ReplyMarkdown）。
@@ -487,6 +500,70 @@ func (s *Service) rebuildAggregate(ctx context.Context, clicked *types.Delivery,
 	if s.deps.BuildAggCard == nil {
 		return "", errors.New("BuildAggCard 未装配")
 	}
+	title, tmpl, effectID := parseAggMetadata(clicked.CardJSON)
+	if briefMeta, present, err := parseCanonicalBriefMetadata(
+		clicked.CardJSON,
+	); present {
+		if err != nil {
+			return "", err
+		}
+		reader, ok := s.deps.Store.(canonicalBriefFeedbackStore)
+		if !ok {
+			return "", errors.New("canonical Brief feedback reader 未装配")
+		}
+		brief, found, err := reader.LoadCanonicalBriefForFeedbackV1(
+			ctx, clicked.UserID, clicked.ID, briefMeta.BatchID,
+		)
+		if err != nil {
+			return "", err
+		}
+		if !found {
+			return "", errors.New("canonical Brief 尚未完成冻结")
+		}
+		if brief.PushBatchID != briefMeta.BatchID ||
+			len(brief.Insights) != briefMeta.TotalItems ||
+			briefMeta.VisibleItems > len(brief.Insights) {
+			return "", errors.New("canonical Brief 卡片元数据与冻结内容不一致")
+		}
+		taskID, err := briefMeta.TaskID()
+		if err != nil || taskID != brief.TaskID {
+			return "", errors.New("canonical Brief 卡片深链与冻结任务不一致")
+		}
+		byID := make(map[int64]types.Delivery, len(siblings))
+		for i := range siblings {
+			byID[siblings[i].ID] = siblings[i]
+		}
+		items := make([]CardInput, briefMeta.VisibleItems)
+		for i := 0; i < briefMeta.VisibleItems; i++ {
+			insight := brief.Insights[i]
+			sibling, ok := byID[insight.ID]
+			if !ok {
+				return "", errors.New("canonical Brief 卡片投递集合不完整")
+			}
+			st, err := s.cardState(ctx, sibling.ID)
+			if err != nil {
+				return "", fmt.Errorf(
+					"查 canonical Brief 条目 %d 状态失败: %w",
+					sibling.ID, err,
+				)
+			}
+			if force != nil && sibling.ID == clicked.ID {
+				force(&st)
+			}
+			items[i] = CardInput{
+				BodyMD: insight.BodyMD, DeliveryID: insight.ID,
+				State: st, Title: insight.Title, URL: insight.SourceURL,
+				SourceTitle:  insight.SourceTitle,
+				PublishedAt:  insight.PublishedAt,
+				DiscoveredAt: insight.DiscoveredAt,
+			}
+		}
+		return s.deps.BuildAggCard(AggregateCardInput{
+			HeaderTitle: title, HeaderTemplate: tmpl,
+			EffectID: effectID, Items: items,
+			CanonicalBrief: &briefMeta,
+		}), nil
+	}
 	items := make([]CardInput, 0, len(siblings))
 	for i := range siblings {
 		sib := &siblings[i]
@@ -519,10 +596,74 @@ func (s *Service) rebuildAggregate(ctx context.Context, clicked *types.Delivery,
 		}
 		items = append(items, input)
 	}
-	title, tmpl, effectID := parseAggMetadata(clicked.CardJSON)
 	return s.deps.BuildAggCard(AggregateCardInput{
 		HeaderTitle: title, HeaderTemplate: tmpl, EffectID: effectID, Items: items,
 	}), nil
+}
+
+func parseCanonicalBriefMetadata(
+	cardJSON []byte,
+) (CanonicalBriefCardV1, bool, error) {
+	var raw any
+	if err := json.Unmarshal(cardJSON, &raw); err != nil {
+		return CanonicalBriefCardV1{}, false, nil
+	}
+	var markers []map[string]any
+	collectCanonicalBriefMarkers(raw, &markers)
+	if len(markers) == 0 {
+		return CanonicalBriefCardV1{}, false, nil
+	}
+	var canonical CanonicalBriefCardV1
+	for index, marker := range markers {
+		batchID, err := strconv.ParseInt(
+			stringMarker(marker, "brief_batch_id"), 10, 64,
+		)
+		total, totalErr := strconv.Atoi(
+			stringMarker(marker, "brief_total"))
+		visible, visibleErr := strconv.Atoi(
+			stringMarker(marker, "brief_visible"))
+		parsed := CanonicalBriefCardV1{
+			BatchID: batchID, TotalItems: total,
+			VisibleItems: visible,
+			WebURL:       stringMarker(marker, "brief_url"),
+		}
+		if err != nil || totalErr != nil || visibleErr != nil ||
+			parsed.Validate(parsed.VisibleItems) != nil {
+			return CanonicalBriefCardV1{}, true,
+				errors.New("canonical Brief 卡片元数据无效")
+		}
+		if index == 0 {
+			canonical = parsed
+		} else if parsed != canonical {
+			return CanonicalBriefCardV1{}, true,
+				errors.New("canonical Brief 卡片元数据发生漂移")
+		}
+	}
+	return canonical, true, nil
+}
+
+func collectCanonicalBriefMarkers(
+	value any,
+	markers *[]map[string]any,
+) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if _, ok := typed["brief_batch_id"]; ok {
+			*markers = append(*markers, typed)
+		}
+		for _, child := range typed {
+			collectCanonicalBriefMarkers(child, markers)
+		}
+	case []any:
+		for _, child := range typed {
+			collectCanonicalBriefMarkers(child, markers)
+		}
+	}
+}
+
+func stringMarker(marker map[string]any, key string) string {
+	value, _ := marker[key].(string)
+	return value
 }
 
 // parseAggMetadata 从库存 card_json 解析 header 与 durable effect marker；

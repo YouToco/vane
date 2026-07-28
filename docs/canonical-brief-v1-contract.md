@@ -1,10 +1,11 @@
 # Canonical RunOutcome / Brief V1 contract
 
-Status: P1-D authenticated Web read implementation. Migration 064 adds a
+Status: P1-E exact-task dual-channel implementation. Migration 064 adds a
 durable pre-render Brief stage; migration 065 adds the least-privilege Brief
-reader used by the task feed. The workflow may stage only inside the nested
-compiled-runtime, RunOutcome, and durable push-effect canaries. Sending
-authority remains unchanged and the Brief renderer for Feishu remains dark.
+reader used by the task feed and feedback rebuild. The workflow may stage only
+inside the nested compiled-runtime, RunOutcome, and durable push-effect
+canaries. Feishu canonical rendering has a separate exact-task rollback switch
+and remains off by default.
 
 ## Identity
 
@@ -95,10 +96,11 @@ run/snapshot/batch scope, effect authority, `done` state, and absence of both
 deliveries and effects. A lost empty receipt is therefore replayed as
 `quiet/partial`, not guessed from a newly planned mutable event set.
 
-Push still uses the legacy renderer and existing durable effect sender. The
-canonical renderer is not called in P1-C. Any future shadow integration must
-be independently bounded and must not change legacy card bytes, create an
-effect, call the provider, or fail Push.
+P1-C still uses the legacy renderer and existing durable effect sender. P1-E
+may replace only the not-yet-created durable card bytes for its exact selected
+task. Existing effect rows always retain authority and replay their stored
+bytes; disabling P1-E changes only future plans and never rewrites or abandons
+an already-prepared provider effect.
 
 After Push, the common RunOutcome claim transaction resolves the stage:
 
@@ -209,6 +211,12 @@ selection off stops new P1-C Actions; an already-frozen P1-C history can still
 complete its stage/effect commands. Brief API, model calls, visible cards,
 message count, and sending authority remain unchanged.
 
+P1-E adds `canonical_brief_renderer_canary_schedule_id`. Empty is the exact
+rollback state. A non-empty value must equal the canonical Brief writer,
+RunOutcome, compiled runtime, fresh push-effect, and push-effect recovery
+canaries. It also requires a path-free HTTP(S) `dashboard.origin`. No allow-all
+renderer key exists in P1-E.
+
 Both P1-C Temporal changes are versioned. The Prepare-result wire-version
 marker is recorded before the Prepare Activity command, so a pre-v2 execution
 can resume safely even when its history frontier is exactly the completed old
@@ -253,3 +261,34 @@ route must be healthy before the Web bundle is released; rollback reverses that
 order and removes the Web bundle before the route or migration. The P1-D Web
 bundle is not compatible with a backend still at migration 064, and the
 release gate verifies the authenticated endpoint before publishing Web.
+
+## P1-E Feishu prefix projection
+
+For a newly prepared exact-task effect, Feishu consumes the staged canonical
+Brief bytes rather than rebuilding title, body, source, URL, or time from live
+content rows. The stage is the immutable byte envelope later promoted to the
+single `BriefV1`; Push validates its complete delivery IDs and order before
+rendering.
+
+The card contains at most the first three ranked Insights. If the card would
+exceed the provider byte budget, the visible prefix shrinks without reordering
+or truncating an Insight; a single oversized Insight fails before provider
+send. The header reports the whole Brief count, and the footer says “另有 N 条”
+with an exact task deep link to the Web `TaskBriefFeed`. No score or live
+platform label is injected into the canonical card.
+
+The one durable provider effect still receipts the complete Brief delivery
+set. This is Phase 1's documented compatibility bridge while `InsightV1.ID`
+remains the delivery ID and channel delivery is not yet physically split. The
+card bytes carry the batch ID, total count, visible prefix count, and Web URL
+in server-generated callback metadata. A feedback click reloads the promoted
+Brief through `vane_brief_reader`, proves the exact user/delivery/batch scope,
+and rebuilds the same frozen ordered prefix with current feedback state. If
+promotion is not yet visible or metadata differs, the feedback write succeeds
+but the existing card is left unchanged; it never falls back to mutable
+content/source rows.
+
+P1-E adds no Workflow command and no model call. Pre-P1-E histories and every
+legacy/ad-hoc task retain the old renderer. The Activity-level selector is safe
+across retry because provider bytes are created before any external send and
+then replay only from the immutable effect row.

@@ -288,6 +288,8 @@ func buildSubtitle(input feedback.CardInput) string {
 	}
 	if input.PublishedAt != nil {
 		parts = append(parts, relativeTime(*input.PublishedAt))
+	} else if !input.DiscoveredAt.IsZero() {
+		parts = append(parts, relativeTime(input.DiscoveredAt))
 	}
 	if len(parts) == 0 {
 		return ""

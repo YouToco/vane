@@ -146,6 +146,56 @@ func TestAggregateCardEffectMarkerCoversEveryCallback(t *testing.T) {
 	}
 }
 
+func TestAggregateCardCanonicalBriefPrefixCarriesDeepLinkMetadata(t *testing.T) {
+	items := []feedback.CardInput{
+		{DeliveryID: 11, Title: "one", BodyMD: "body one"},
+		{DeliveryID: 12, Title: "two", BodyMD: "body two"},
+		{DeliveryID: 13, Title: "three", BodyMD: "body three"},
+	}
+	card := BuildAggregateCard(feedback.AggregateCardInput{
+		HeaderTitle: "canonical · 今日 5 条",
+		Items:       items,
+		CanonicalBrief: &feedback.CanonicalBriefCardV1{
+			BatchID: 91, TotalItems: 5, VisibleItems: 3,
+			WebURL: "https://vane.example/#/tasks/task-1",
+		},
+	})
+	if !strings.Contains(card, "另有 2 条，在 Web 查看完整简报") ||
+		!strings.Contains(card, "https://vane.example/#/tasks/task-1") {
+		t.Fatalf("canonical footer missing: %s", card)
+	}
+	for _, marker := range []string{
+		`"brief_batch_id":"91"`,
+		`"brief_total":"5"`,
+		`"brief_visible":"3"`,
+		`"brief_url":"https://vane.example/#/tasks/task-1"`,
+	} {
+		if !strings.Contains(card, marker) {
+			t.Fatalf("canonical callback metadata %s missing: %s", marker, card)
+		}
+	}
+	if strings.Contains(card, "four") || strings.Contains(card, "five") {
+		t.Fatalf("card rendered content outside the supplied prefix: %s", card)
+	}
+}
+
+func TestAggregateCardInvalidCanonicalMetadataStaysLegacy(t *testing.T) {
+	card := BuildAggregateCard(feedback.AggregateCardInput{
+		Items: []feedback.CardInput{{
+			DeliveryID: 11, Title: "one",
+		}},
+		CanonicalBrief: &feedback.CanonicalBriefCardV1{
+			BatchID: 91, TotalItems: 5, VisibleItems: 3,
+			WebURL: "javascript:alert(1)",
+		},
+	})
+	if strings.Contains(card, "brief_batch_id") ||
+		strings.Contains(card, "查看完整简报") ||
+		strings.Contains(card, "javascript:") {
+		t.Fatalf("invalid canonical metadata reached card: %s", card)
+	}
+}
+
 func TestAggregateCard_状态门控(t *testing.T) {
 	card := BuildAggregateCard(feedback.AggregateCardInput{Items: []feedback.CardInput{
 		{DeliveryID: 1, Title: "未表态"},

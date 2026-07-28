@@ -193,6 +193,96 @@ func TestCanonicalBriefRolloutValidation(t *testing.T) {
 	}
 }
 
+func TestCanonicalBriefRendererRolloutValidation(t *testing.T) {
+	valid := func() Config {
+		return Config{
+			DB: DBConfig{URL: "postgres://test"},
+			Dashboard: DashboardConfig{
+				Origin: "https://vane.example",
+			},
+			Pipeline: PipelineConfig{
+				CompiledRuntimeEnabled:             true,
+				CompiledRuntimeCanaryScheduleID:    "task-a",
+				RunOutcomeEnabled:                  true,
+				RunOutcomeCanaryScheduleID:         "task-a",
+				CanonicalBriefEnabled:              true,
+				CanonicalBriefCanaryScheduleID:     "task-a",
+				PushEffectCanaryScheduleID:         "task-a",
+				PushEffectRecoveryCanaryScheduleID: "task-a",
+			},
+		}
+	}
+	t.Run("exact nested canary", func(t *testing.T) {
+		cfg := valid()
+		cfg.Pipeline.CanonicalBriefRendererCanaryScheduleID =
+			" task-a "
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Pipeline.CanonicalBriefRendererCanaryScheduleID !=
+			"task-a" {
+			t.Fatalf("renderer canary=%q",
+				cfg.Pipeline.CanonicalBriefRendererCanaryScheduleID)
+		}
+	})
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"whitespace", func(c *Config) {
+			c.Pipeline.CanonicalBriefRendererCanaryScheduleID = " "
+		}},
+		{"outside writer", func(c *Config) {
+			c.Pipeline.CanonicalBriefRendererCanaryScheduleID = "task-b"
+		}},
+		{"writer disabled", func(c *Config) {
+			c.Pipeline.CanonicalBriefRendererCanaryScheduleID = "task-a"
+			c.Pipeline.CanonicalBriefEnabled = false
+		}},
+		{"bad dashboard origin", func(c *Config) {
+			c.Pipeline.CanonicalBriefRendererCanaryScheduleID = "task-a"
+			c.Dashboard.Origin = "https://user@example.com/path?x=1"
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := valid()
+			test.mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate() unexpectedly succeeded")
+			}
+		})
+	}
+}
+
+func TestEnvOnlyCanonicalBriefRendererCanary(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("VANE_DB_URL", "postgres://env")
+	t.Setenv("VANE_PIPELINE_COMPILED_RUNTIME_ENABLED", "true")
+	t.Setenv("VANE_PIPELINE_COMPILED_RUNTIME_CANARY_SCHEDULE_ID", "task-a")
+	t.Setenv("VANE_PIPELINE_RUN_OUTCOME_ENABLED", "true")
+	t.Setenv("VANE_PIPELINE_RUN_OUTCOME_CANARY_SCHEDULE_ID", "task-a")
+	t.Setenv("VANE_PIPELINE_CANONICAL_BRIEF_ENABLED", "true")
+	t.Setenv("VANE_PIPELINE_CANONICAL_BRIEF_CANARY_SCHEDULE_ID", "task-a")
+	t.Setenv("VANE_PIPELINE_PUSH_EFFECT_CANARY_SCHEDULE_ID", "task-a")
+	t.Setenv("VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID", "task-a")
+	t.Setenv(
+		"VANE_PIPELINE_CANONICAL_BRIEF_RENDERER_CANARY_SCHEDULE_ID",
+		" task-a ",
+	)
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pipeline.CanonicalBriefRendererCanaryScheduleID !=
+		"task-a" {
+		t.Fatalf("env-only renderer canary=%q",
+			cfg.Pipeline.CanonicalBriefRendererCanaryScheduleID)
+	}
+}
+
 func TestSnapshotV2ShadowCanaryScheduleIDValidation(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -883,6 +973,7 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.observation_shadow_canary_schedule_id", cfg.Pipeline.ObservationShadowCanaryScheduleID, ""},
 		{"pipeline.observation_authority_canary_schedule_id", cfg.Pipeline.ObservationAuthorityCanaryScheduleID, ""},
 		{"pipeline.push_effect_recovery_canary_schedule_id", cfg.Pipeline.PushEffectRecoveryCanaryScheduleID, ""},
+		{"pipeline.canonical_brief_renderer_canary_schedule_id", cfg.Pipeline.CanonicalBriefRendererCanaryScheduleID, ""},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
 		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 100000},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},

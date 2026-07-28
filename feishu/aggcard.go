@@ -83,7 +83,26 @@ func BuildAggregateCard(in feedback.AggregateCardInput) string {
 		if i > 0 {
 			elements = append(elements, map[string]any{"tag": "hr"})
 		}
-		elements = append(elements, aggItemElements(item, in.EffectID)...)
+		elements = append(elements,
+			aggItemElements(item, in.EffectID, in.CanonicalBrief)...)
+	}
+	if brief := in.CanonicalBrief; validCanonicalBriefCardV1(
+		brief, len(in.Items),
+	) {
+		label := "在 Web 查看完整简报"
+		if remaining := brief.TotalItems - brief.VisibleItems; remaining > 0 {
+			label = fmt.Sprintf("另有 %d 条，在 Web 查看完整简报", remaining)
+		}
+		elements = append(elements,
+			map[string]any{"tag": "hr"},
+			map[string]any{
+				"tag": "markdown",
+				"content": fmt.Sprintf(
+					"<font color='grey'>[%s](%s)</font>",
+					label, brief.WebURL,
+				),
+			},
+		)
 	}
 
 	card := map[string]any{
@@ -101,7 +120,11 @@ func BuildAggregateCard(in feedback.AggregateCardInput) string {
 }
 
 // aggItemElements 渲染卡内单条情报：标题行 / 来源行 / 解读 / 原文链接 / 按钮 / 状态行 / 条件 form。
-func aggItemElements(input feedback.CardInput, effectID string) []any {
+func aggItemElements(
+	input feedback.CardInput,
+	effectID string,
+	brief *feedback.CanonicalBriefCardV1,
+) []any {
 	idStr := strconv.FormatInt(input.DeliveryID, 10)
 	els := make([]any, 0, 7)
 
@@ -144,6 +167,7 @@ func aggItemElements(input feedback.CardInput, effectID string) []any {
 					"type": "callback",
 					"value": aggregateCallbackValue(
 						cardActionFeedback, string(b.action), idStr, effectID,
+						brief,
 					),
 				}},
 			}},
@@ -177,6 +201,7 @@ func aggregateCallbackValue(
 	feedbackAction string,
 	deliveryID string,
 	effectID string,
+	brief *feedback.CanonicalBriefCardV1,
 ) map[string]any {
 	value := map[string]any{
 		"vane_action": action,
@@ -188,7 +213,21 @@ func aggregateCallbackValue(
 	if effectID != "" {
 		value["effect_id"] = effectID
 	}
+	if brief != nil &&
+		validCanonicalBriefCardV1(brief, brief.VisibleItems) {
+		value["brief_batch_id"] = strconv.FormatInt(brief.BatchID, 10)
+		value["brief_total"] = strconv.Itoa(brief.TotalItems)
+		value["brief_visible"] = strconv.Itoa(brief.VisibleItems)
+		value["brief_url"] = brief.WebURL
+	}
 	return value
+}
+
+func validCanonicalBriefCardV1(
+	brief *feedback.CanonicalBriefCardV1,
+	renderedItems int,
+) bool {
+	return brief != nil && brief.Validate(renderedItems) == nil
 }
 
 // escapeMarkdown 中和标题里能改变 markdown/HTML 结构的字符（对抗审查：外部标题

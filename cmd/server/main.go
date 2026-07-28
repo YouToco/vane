@@ -210,6 +210,10 @@ func run() error {
 			}, compiledModelResolver),
 		workflow.WithRunOutcomeStoreV1(st),
 		workflow.WithCanonicalBriefStoreV1(st),
+		workflow.WithCanonicalBriefRendererV1(
+			cfg.Pipeline.CanonicalBriefRendererCanaryScheduleID,
+			cfg.Dashboard.Origin,
+		),
 		workflow.WithSnapshotV2ShadowCanary(
 			st, cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID),
 		workflow.WithSnapshotV2ReadAuditCanary(

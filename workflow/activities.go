@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -73,8 +74,9 @@ const alertFetchFailThreshold = 3
 // 条数封顶防一屏塞爆；字节上限对齐飞书卡片 ~30KB 限制留余量，超限对半拆卡，
 // 绝不静默截断条目。
 const (
-	aggMaxItemsPerCard = 8
-	aggMaxCardBytes    = 28 << 10
+	aggMaxItemsPerCard                = 8
+	aggMaxCardBytes                   = 28 << 10
+	canonicalBriefFeishuPrefixItemsV1 = 3
 )
 
 const (
@@ -423,6 +425,8 @@ type Activities struct {
 	observationAuthorityCanaryTaskID string
 	pushEffectStore                  PushEffectStore
 	pushEffectCanaryTaskID           string
+	canonicalBriefRendererTaskID     string
+	canonicalBriefDashboardOrigin    string
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding
@@ -515,6 +519,20 @@ func WithRunOutcomeStoreV1(st RunOutcomeStoreV1) ActivitiesOption {
 func WithCanonicalBriefStoreV1(st CanonicalBriefStoreV1) ActivitiesOption {
 	return func(a *Activities) {
 		a.canonicalBriefStore = st
+	}
+}
+
+// WithCanonicalBriefRendererV1 selects P1-E's sole Feishu content authority.
+// An empty task ID is the exact rollback state. The dashboard origin is used
+// only to build the immutable task deep link stored in the durable card bytes.
+func WithCanonicalBriefRendererV1(
+	taskID string,
+	dashboardOrigin string,
+) ActivitiesOption {
+	return func(a *Activities) {
+		a.canonicalBriefRendererTaskID = strings.TrimSpace(taskID)
+		a.canonicalBriefDashboardOrigin =
+			strings.TrimRight(strings.TrimSpace(dashboardOrigin), "/")
 	}
 }
 
@@ -3295,6 +3313,62 @@ func (a *Activities) renderCanonicalBriefShadowV1(
 	return cards
 }
 
+func (a *Activities) canonicalBriefAuthorityItemsV1(
+	draft *types.BriefDraftV1,
+	pending []pushPendingItem,
+) ([]pushPendingItem, feedback.CanonicalBriefCardV1, error) {
+	if draft == nil || draft.TaskID == "" ||
+		a.canonicalBriefDashboardOrigin == "" {
+		return nil, feedback.CanonicalBriefCardV1{},
+			types.NewAppError(types.CodeValidation,
+				"canonical Brief renderer input is invalid", nil)
+	}
+	origin, err := url.Parse(a.canonicalBriefDashboardOrigin)
+	if err != nil || origin == nil ||
+		(origin.Scheme != "https" && origin.Scheme != "http") ||
+		origin.Host == "" || origin.User != nil ||
+		(origin.Path != "" && origin.Path != "/") ||
+		origin.RawQuery != "" || origin.Fragment != "" {
+		return nil, feedback.CanonicalBriefCardV1{},
+			types.NewAppError(types.CodeValidation,
+				"canonical Brief dashboard origin is invalid", err)
+	}
+	if len(pending) != len(draft.Insights) {
+		return nil, feedback.CanonicalBriefCardV1{},
+			types.NewAppError(types.CodeConflict,
+				"canonical Brief renderer delivery set is incomplete", nil)
+	}
+	items := make([]pushPendingItem, len(draft.Insights))
+	for index, insight := range draft.Insights {
+		legacy := pending[index]
+		if legacy.delID != insight.ID {
+			return nil, feedback.CanonicalBriefCardV1{},
+				types.NewAppError(types.CodeConflict,
+					"canonical Brief renderer delivery order differs", nil)
+		}
+		items[index] = pushPendingItem{
+			delID: insight.ID,
+			input: feedback.CardInput{
+				BodyMD: insight.BodyMD, DeliveryID: insight.ID,
+				Title: insight.Title, URL: insight.SourceURL,
+				SourceTitle:  insight.SourceTitle,
+				PublishedAt:  insight.PublishedAt,
+				DiscoveredAt: insight.DiscoveredAt,
+			},
+			eventKey: legacy.eventKey,
+		}
+	}
+	escapedTaskID := url.PathEscape(draft.TaskID)
+	escapedTaskID = strings.NewReplacer(
+		"(", "%28", ")", "%29",
+	).Replace(escapedTaskID)
+	return items, feedback.CanonicalBriefCardV1{
+		BatchID: draft.PushBatchID, TotalItems: len(items),
+		WebURL: a.canonicalBriefDashboardOrigin + "/#/tasks/" +
+			escapedTaskID,
+	}, nil
+}
+
 func canonicalBriefTimesEqualV1(left, right *time.Time) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil
@@ -3625,7 +3699,90 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 	if effectAuthority {
 		planningMarker = pushEffectMarkerWidthSeed
 	}
-	plannedChunks := planPushChunks(pending, planningMarker, buildChunk)
+	canonicalRendererAuthority :=
+		in.CanonicalBrief != nil &&
+			in.CanonicalOutcome != nil &&
+			a.canonicalBriefRendererTaskID != "" &&
+			compiledIdentity.TaskID == a.canonicalBriefRendererTaskID
+	var plannedChunks []plannedPushChunk
+	buildEffectCard := func(
+		planned plannedPushChunk,
+		effectID string,
+	) string {
+		return buildChunk(planned.items, effectID)
+	}
+	if canonicalRendererAuthority {
+		if !effectAuthority || a.buildAggCard == nil {
+			return nonRetryable(types.NewAppError(
+				types.CodeConflict,
+				"canonical Brief renderer lacks durable effect authority",
+				nil,
+			))
+		}
+		canonicalItems, briefMeta, renderErr :=
+			a.canonicalBriefAuthorityItemsV1(
+				in.CanonicalBrief, pending,
+			)
+		if renderErr != nil {
+			return nonRetryable(renderErr)
+		}
+		visibleCount := min(
+			canonicalBriefFeishuPrefixItemsV1,
+			len(canonicalItems),
+		)
+		var buildCanonicalCard func(string) string
+		for {
+			briefMeta.VisibleItems = visibleCount
+			if err := briefMeta.Validate(visibleCount); err != nil {
+				return nonRetryable(types.NewAppError(
+					types.CodeValidation,
+					"canonical Brief card metadata is invalid",
+					err,
+				))
+			}
+			visible := canonicalItems[:visibleCount]
+			buildCanonicalCard = func(effectID string) string {
+				items := make([]feedback.CardInput, len(visible))
+				for i := range visible {
+					items[i] = visible[i].input
+				}
+				var title, tmpl string
+				if a.aggHeader != nil {
+					title, tmpl = a.aggHeader(
+						taskTitle, briefMeta.TotalItems)
+				}
+				meta := briefMeta
+				return a.buildAggCard(feedback.AggregateCardInput{
+					HeaderTitle: title, HeaderTemplate: tmpl,
+					EffectID: effectID, Items: items,
+					CanonicalBrief: &meta,
+				})
+			}
+			if card := buildCanonicalCard(planningMarker); len(card) <= aggMaxCardBytes {
+				plannedChunks = []plannedPushChunk{{
+					items: canonicalItems, cardJSON: card,
+				}}
+				break
+			}
+			if visibleCount == 1 {
+				return nonRetryable(types.NewAppError(
+					types.CodeValidation,
+					"canonical Brief card exceeds provider limit",
+					nil,
+				))
+			}
+			visibleCount--
+		}
+		buildEffectCard = func(
+			_ plannedPushChunk,
+			effectID string,
+		) string {
+			return buildCanonicalCard(effectID)
+		}
+	} else {
+		plannedChunks = planPushChunks(
+			pending, planningMarker, buildChunk)
+	}
 	if effectAuthority {
 		targetProvider, ok := a.feishu.(pushEffectTargetProvider)
 		if !ok {
@@ -3659,7 +3816,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 		effects := make([]*pusheffect.Effect, 0, len(plannedChunks))
 		for chunkIndex, planned := range plannedChunks {
 			effectID := pushEffectID(compiledIdentity, chunkIndex)
-			cardJSON := buildChunk(planned.items, effectID)
+			cardJSON := buildEffectCard(planned, effectID)
 			effect, prepareErr := a.prepareDurablePushChunk(
 				ctx,
 				compiledIdentity,
