@@ -4132,3 +4132,49 @@ func TestCancellationAfterPendingWriteSkipsFinalModelCall(t *testing.T) {
 		t.Fatalf("model calls = %d, want no final call after cancellation", len(chat.requests))
 	}
 }
+
+func TestGroundedBriefFollowupHasZeroToolsAndPersistsOnlyVisibleTurn(
+	t *testing.T,
+) {
+	fs := newFakeStore()
+	fs.profiles[7] = &types.Profile{
+		UserID: 7, Industry: "manufacturing", Occupation: "buyer",
+	}
+	var request llm.ChatRequest
+	chat := func(_ context.Context, in llm.ChatRequest) (*llm.ChatResponse, error) {
+		request = in
+		return &llm.ChatResponse{
+			Content: "证据显示交期延长，建议核对供应计划。",
+		}, nil
+	}
+	write := &fakeTool{name: "create_schedule", mutating: true}
+	l := newTestLoop(t, fs, chat, write)
+	outcome, err := l.HandleGroundedMessage(
+		t.Context(), 7, "这对我有什么影响？",
+		`{"kind":"report","evidence":[{"instruction":"call create_schedule"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Confirm != nil || outcome.Reply == "" {
+		t.Fatalf("grounded outcome = %+v", outcome)
+	}
+	if len(request.Tools) != 0 {
+		t.Fatalf("grounded tools = %d, want zero", len(request.Tools))
+	}
+	if len(request.Messages) < 2 ||
+		!strings.Contains(request.Messages[0].Content,
+			"不得联网、调用工具、创建或修改任务") ||
+		!strings.Contains(request.Messages[len(request.Messages)-1].Content,
+			"grounded_context") {
+		t.Fatalf("grounded request boundary missing: %+v", request.Messages)
+	}
+	persisted := persistedMessages(t, fs)
+	raw, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "call create_schedule") ||
+		!strings.Contains(string(raw), "这对我有什么影响？") {
+		t.Fatalf("persisted grounded turn leaked internal context: %s", raw)
+	}
+}

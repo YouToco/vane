@@ -57,6 +57,8 @@ func (s *Scheduler) runtimeVersionFor(
 	outcome := s.runOutcome.runtimeVersionFor(taskID, compiled)
 	brief := s.canonicalBrief.runtimeVersionFor(taskID, outcome)
 	structured := s.structuredInsight.runtimeVersionFor(taskID, brief)
-	return s.structuredEventEvidence.runtimeVersionForEventEvidence(
+	eventEvidence := s.structuredEventEvidence.runtimeVersionForEventEvidence(
 		taskID, structured)
+	return s.executiveBrief.runtimeVersionForExecutiveBrief(
+		taskID, eventEvidence)
 }

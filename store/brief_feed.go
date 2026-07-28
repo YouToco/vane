@@ -83,12 +83,13 @@ type TaskBriefFeedbackStateV1 struct {
 
 // TaskBriefItemV1 is the reader-facing projection of one canonical content run.
 type TaskBriefItemV1 struct {
-	ID             int64                   `json:"id"`
-	PushBatchID    int64                   `json:"push_batch_id"`
-	GeneratedAt    time.Time               `json:"generated_at"`
-	SourceCoverage types.RunCompletenessV1 `json:"source_coverage"`
-	Processing     types.RunCompletenessV1 `json:"processing"`
-	Insights       []TaskBriefInsightV1    `json:"insights"`
+	ID             int64                           `json:"id"`
+	PushBatchID    int64                           `json:"push_batch_id"`
+	GeneratedAt    time.Time                       `json:"generated_at"`
+	SourceCoverage types.RunCompletenessV1         `json:"source_coverage"`
+	Processing     types.RunCompletenessV1         `json:"processing"`
+	Insights       []TaskBriefInsightV1            `json:"insights"`
+	Executive      *types.ExecutiveBriefArtifactV1 `json:"executive,omitempty"`
 }
 
 // TaskLatestCheckV1 is independent from the newest non-empty Brief. Quiet,
@@ -263,13 +264,19 @@ func (s *Store) ListTaskBriefsV1(
 		`SELECT bs.id,bs.run_outcome_id,bs.run_snapshot_id,bs.push_batch_id,
 		        bs.schema_version,bs.request_digest,bs.payload,
 		        bs.payload_digest,bs.insight_count,bs.generated_at,
-		        o.status,o.result,o.source_coverage,o.processing
+		        o.status,o.result,o.source_coverage,o.processing,
+		        ea.id,ea.request_digest,ea.payload_digest,ea.payload
 		   FROM brief_snapshots bs
 		   JOIN task_run_outcomes o
 		     ON o.id=bs.run_outcome_id
 		    AND o.tenant_id=bs.tenant_id
 		    AND o.user_id=bs.user_id
 		    AND o.task_id=bs.task_id
+		   LEFT JOIN executive_brief_artifacts ea
+		     ON ea.brief_snapshot_id=bs.id
+		    AND ea.tenant_id=bs.tenant_id
+		    AND ea.user_id=bs.user_id
+		    AND ea.task_id=bs.task_id
 		  WHERE bs.tenant_id=$1 AND bs.user_id=$2 AND bs.task_id=$3`+
 			cursorSQL+
 			fmt.Sprintf(
@@ -296,12 +303,18 @@ func (s *Store) ListTaskBriefsV1(
 			outcomeResult                           types.RunResultV1
 			sourceCoverage                          types.RunCompletenessV1
 			processing                              types.RunCompletenessV1
+			executiveID                             *int64
+			executiveRequestDigest                  *string
+			executivePayloadDigest                  *string
+			executivePayload                        []byte
 		)
 		if err := rows.Scan(
 			&briefID, &outcomeID, &snapshotID, &batchID,
 			&schemaVersion, &requestDigest, &payload, &payloadDigest,
 			&insightCount, &generatedAt, &outcomeStatus, &outcomeResult,
-			&sourceCoverage, &processing,
+			&sourceCoverage, &processing, &executiveID,
+			&executiveRequestDigest, &executivePayloadDigest,
+			&executivePayload,
 		); err != nil {
 			return TaskBriefPageV1{}, briefFeedDBError("扫描任务简报页", err)
 		}
@@ -342,6 +355,32 @@ func (s *Store) ListTaskBriefsV1(
 			SourceCoverage: sourceCoverage, Processing: processing,
 			Insights: make([]TaskBriefInsightV1, len(brief.Insights)),
 		})
+		if executiveID != nil {
+			var artifact types.ExecutiveBriefArtifactV1
+			if executiveRequestDigest == nil || executivePayloadDigest == nil ||
+				json.Unmarshal(executivePayload, &artifact) != nil ||
+				artifact.Validate() != nil ||
+				artifact.ID != *executiveID ||
+				artifact.BriefSnapshotID != brief.ID ||
+				artifact.RunOutcomeID != outcomeID ||
+				artifact.RunSnapshotID != snapshotID ||
+				artifact.PushBatchID != batchID ||
+				artifact.TenantID != tenantID ||
+				artifact.UserID != userID ||
+				artifact.TaskID != taskID ||
+				artifact.Digest != *executivePayloadDigest {
+				return TaskBriefPageV1{}, types.NewAppError(
+					types.CodeInternal, "执行简报完整性校验失败", nil)
+			}
+			computedExecutiveRequest, requestErr := artifact.
+				ExecutiveBriefArtifactDraftV1.RequestDigest()
+			if requestErr != nil ||
+				computedExecutiveRequest != *executiveRequestDigest {
+				return TaskBriefPageV1{}, types.NewAppError(
+					types.CodeInternal, "执行简报完整性校验失败", nil)
+			}
+			page.Items[len(page.Items)-1].Executive = &artifact
+		}
 		for i := range brief.Insights {
 			frozen := brief.Insights[i]
 			projected := TaskBriefInsightV1{

@@ -154,6 +154,15 @@ type PipelineConfig struct {
 	StructuredEventEvidenceEnabled          bool   `mapstructure:"structured_event_evidence_enabled"`
 	StructuredEventEvidenceCanaryScheduleID string `mapstructure:"structured_event_evidence_canary_schedule_id"`
 	StructuredEventEvidenceAllowAll         bool   `mapstructure:"structured_event_evidence_allow_all"`
+	// ExecutiveBrief* is P2-D's independently default-off synthesis runtime.
+	// It may select only tasks already on structured event evidence.
+	ExecutiveBriefEnabled          bool   `mapstructure:"executive_brief_enabled"`
+	ExecutiveBriefCanaryScheduleID string `mapstructure:"executive_brief_canary_schedule_id"`
+	ExecutiveBriefAllowAll         bool   `mapstructure:"executive_brief_allow_all"`
+	// Synthesis, Web exposure and Feishu rendering are deliberately separate:
+	// an exact task may generate dark artifacts before either channel is on.
+	ExecutiveBriefWebCanaryScheduleID      string `mapstructure:"executive_brief_web_canary_schedule_id"`
+	ExecutiveBriefRendererCanaryScheduleID string `mapstructure:"executive_brief_renderer_canary_schedule_id"`
 	// CanonicalBriefRendererCanaryScheduleID is P1-E's independent Feishu
 	// content-authority switch. Empty is the complete rollback state.
 	CanonicalBriefRendererCanaryScheduleID string `mapstructure:"canonical_brief_renderer_canary_schedule_id"`
@@ -603,6 +612,89 @@ func (c *Config) Validate() error {
 			return errors.New(
 				"config: structured event evidence 必须精确等于 observation authority canary")
 		}
+	}
+	rawExecutiveBriefCanaryID :=
+		c.Pipeline.ExecutiveBriefCanaryScheduleID
+	executiveBriefCanaryID :=
+		strings.TrimSpace(rawExecutiveBriefCanaryID)
+	if c.Pipeline.ExecutiveBriefEnabled &&
+		rawExecutiveBriefCanaryID != "" &&
+		executiveBriefCanaryID == "" {
+		return errors.New(
+			"config: pipeline.executive_brief_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.ExecutiveBriefCanaryScheduleID = executiveBriefCanaryID
+	if c.Pipeline.ExecutiveBriefEnabled {
+		if !c.Pipeline.StructuredEventEvidenceEnabled {
+			return errors.New(
+				"config: executive brief 要求 structured event evidence 已启用")
+		}
+		if executiveBriefCanaryID == "" &&
+			!c.Pipeline.ExecutiveBriefAllowAll {
+			return errors.New(
+				"config: 全量启用 executive brief 必须显式设置 allow_all=true")
+		}
+		if executiveBriefCanaryID != "" &&
+			c.Pipeline.ExecutiveBriefAllowAll {
+			return errors.New(
+				"config: executive brief canary 与 allow_all 不能同时启用")
+		}
+		if c.Pipeline.ExecutiveBriefAllowAll &&
+			!c.Pipeline.StructuredEventEvidenceAllowAll {
+			return errors.New(
+				"config: executive brief allow_all 要求 structured event evidence allow_all")
+		}
+		if !c.Pipeline.ExecutiveBriefAllowAll &&
+			executiveBriefCanaryID !=
+				structuredEventEvidenceCanaryID {
+			return errors.New(
+				"config: executive brief 必须位于 structured event evidence rollout")
+		}
+	}
+	rawExecutiveWebCanary :=
+		c.Pipeline.ExecutiveBriefWebCanaryScheduleID
+	executiveWebCanary := strings.TrimSpace(rawExecutiveWebCanary)
+	if rawExecutiveWebCanary != "" && executiveWebCanary == "" {
+		return errors.New(
+			"config: pipeline.executive_brief_web_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.ExecutiveBriefWebCanaryScheduleID = executiveWebCanary
+	rawExecutiveRendererCanary :=
+		c.Pipeline.ExecutiveBriefRendererCanaryScheduleID
+	executiveRendererCanary :=
+		strings.TrimSpace(rawExecutiveRendererCanary)
+	if rawExecutiveRendererCanary != "" &&
+		executiveRendererCanary == "" {
+		return errors.New(
+			"config: pipeline.executive_brief_renderer_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.ExecutiveBriefRendererCanaryScheduleID =
+		executiveRendererCanary
+	for name, taskID := range map[string]string{
+		"Web":      executiveWebCanary,
+		"renderer": executiveRendererCanary,
+	} {
+		if taskID == "" {
+			continue
+		}
+		if !c.Pipeline.ExecutiveBriefEnabled ||
+			(!c.Pipeline.ExecutiveBriefAllowAll &&
+				taskID != executiveBriefCanaryID) {
+			return fmt.Errorf(
+				"config: executive brief %s canary 必须位于 synthesis rollout",
+				name)
+		}
+	}
+	if executiveRendererCanary != "" &&
+		executiveRendererCanary != strings.TrimSpace(
+			c.Pipeline.CanonicalBriefRendererCanaryScheduleID) {
+		return errors.New(
+			"config: executive brief renderer 必须位于 canonical Brief renderer canary")
+	}
+	if executiveRendererCanary != "" &&
+		executiveRendererCanary != executiveWebCanary {
+		return errors.New(
+			"config: executive brief renderer 必须位于 Web canary")
 	}
 	rawCanonicalRendererCanaryID :=
 		c.Pipeline.CanonicalBriefRendererCanaryScheduleID

@@ -243,7 +243,9 @@ func TestMigration064DownAllowsFinalizedSealedEmptyReceipt(t *testing.T) {
 		t.Fatalf("064 Down rejected settled empty evidence: %v", err)
 	}
 	defer func() {
-		if _, upErr := provider.UpTo(context.Background(), 64); upErr != nil {
+		if _, upErr := provider.UpTo(
+			context.Background(), latestMigrationVersion,
+		); upErr != nil {
 			t.Errorf("restore latest migration: %v", upErr)
 		}
 	}()

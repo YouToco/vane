@@ -8,6 +8,7 @@ import (
 
 	"github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/evolver"
+	"github.com/YouToco/vane/executivebrief"
 	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/scorer"
@@ -34,6 +35,7 @@ func BuildCurrentCompiledV1(input CurrentCompiledV1Input) (runtimepolicy.BundleV
 	return buildCompiledV1(
 		input, cardgen.CurrentPromptStageV1(),
 		cardgen.CurrentModelCallV1(input.Model),
+		nil, nil, nil,
 	)
 }
 
@@ -46,6 +48,26 @@ func BuildStructuredInsightCompiledV1(
 	return buildCompiledV1(
 		input, cardgen.StructuredPromptStageV2(),
 		cardgen.StructuredModelCallV2(input.Model),
+		nil, nil, nil,
+	)
+}
+
+// BuildExecutiveBriefCompiledV1 extends the structured evidence runtime with
+// exactly one issue synthesis stage and one periodic synthesis stage. Legacy
+// builders keep both optional fields absent, preserving their canonical bytes.
+func BuildExecutiveBriefCompiledV1(
+	input CurrentCompiledV1Input,
+) (runtimepolicy.BundleV1, error) {
+	issuePrompt := executivebrief.CurrentIssuePromptStageV1()
+	periodicPrompt := executivebrief.CurrentPeriodicPromptStageV1()
+	return buildCompiledV1(
+		input, cardgen.StructuredPromptStageV2(),
+		cardgen.StructuredModelCallV2(input.Model),
+		&issuePrompt, &periodicPrompt,
+		[]runtimepolicy.ModelCallV1{
+			executivebrief.CurrentIssueModelCallV1(input.Model),
+			executivebrief.CurrentPeriodicModelCallV1(input.Model),
+		},
 	)
 }
 
@@ -53,6 +75,9 @@ func buildCompiledV1(
 	input CurrentCompiledV1Input,
 	cardPrompt runtimepolicy.PromptStageV1,
 	cardCall runtimepolicy.ModelCallV1,
+	issuePrompt *runtimepolicy.PromptStageV1,
+	periodicPrompt *runtimepolicy.PromptStageV1,
+	optionalCalls []runtimepolicy.ModelCallV1,
 ) (runtimepolicy.BundleV1, error) {
 	capabilities, err := currentCapabilitiesV1(
 		input.ExaCredentialGeneration,
@@ -63,13 +88,21 @@ func buildCompiledV1(
 	}
 	quotas := currentQuotaBucketsV1()
 
+	modelCalls := []runtimepolicy.ModelCallV1{
+		scorer.CurrentModelCallV1(input.Model),
+		cardCall,
+		evolver.CurrentModelCallV1(input.Model),
+	}
+	modelCalls = append(modelCalls, optionalCalls...)
 	return runtimepolicy.BuildV1(runtimepolicy.BuildInputV1{
-		AllowedCapabilities:    capabilities,
-		ScorePrompt:            scorer.CurrentPromptStageV1(),
-		CardGenPrompt:          cardPrompt,
-		ProfileEvolvePrompt:    evolver.CurrentPromptStageV1(),
-		TaskInstructionEnabled: input.TaskInstructionEnabled,
-		ModelProvider:          runtimepolicy.ModelProviderDeepSeekV1,
+		AllowedCapabilities:     capabilities,
+		ScorePrompt:             scorer.CurrentPromptStageV1(),
+		CardGenPrompt:           cardPrompt,
+		ProfileEvolvePrompt:     evolver.CurrentPromptStageV1(),
+		IssueSynthesisPrompt:    issuePrompt,
+		PeriodicSynthesisPrompt: periodicPrompt,
+		TaskInstructionEnabled:  input.TaskInstructionEnabled,
+		ModelProvider:           runtimepolicy.ModelProviderDeepSeekV1,
 		ModelEndpoint: runtimepolicy.EndpointRefV1{
 			ID:         runtimepolicy.EndpointIDDeepSeekCompatiblePrimaryV1,
 			Generation: input.ModelEndpointGeneration,
@@ -78,11 +111,7 @@ func buildCompiledV1(
 			ID:         runtimepolicy.CredentialIDLLMPrimaryV1,
 			Generation: input.ModelCredentialGeneration,
 		},
-		ModelCalls: []runtimepolicy.ModelCallV1{
-			scorer.CurrentModelCallV1(input.Model),
-			cardCall,
-			evolver.CurrentModelCallV1(input.Model),
-		},
+		ModelCalls:   modelCalls,
 		QuotaBuckets: quotas,
 	})
 }

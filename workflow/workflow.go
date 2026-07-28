@@ -54,6 +54,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 	outcomeCoverage := types.RunCompletenessPartial
 	outcomeProcessing := types.RunCompletenessComplete
 	var outcomeTerminal *runOutcomeTerminalV1
+	outcomeFinalized := false
 
 	// New-format scheduled Actions carry an explicit tenant and a rollout-
 	// approved mode. GetVersion preserves already-started histories; the exact
@@ -167,6 +168,9 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 		}
 		outcomeMarker = &marker
 		defer func() {
+			if outcomeFinalized {
+				return
+			}
 			terminal := outcomeTerminal
 			if terminal == nil {
 				terminal = terminalRunOutcomeForError(retErr)
@@ -428,8 +432,9 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 	var cardErr error
 	if outcomeMarker != nil {
 		var result CardGenOutcomeResult
-		if p.RuntimeVersion ==
-			CompiledRuntimeStructuredEventEvidenceV1 &&
+		if (p.RuntimeVersion ==
+			CompiledRuntimeStructuredEventEvidenceV1 ||
+			p.RuntimeVersion == CompiledRuntimeExecutiveBriefV1) &&
 			workflow.GetVersion(
 				ctx, "structured-event-evidence-cardgen-v1",
 				workflow.DefaultVersion, 1,
@@ -488,6 +493,7 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 	}
 
 	var canonicalBrief *types.BriefDraftV1
+	var executiveArtifactDraft *types.ExecutiveBriefArtifactDraftV1
 	var canonicalBatchID int64
 	canonicalBriefEmpty := false
 	canonicalBriefCommandV1 := false
@@ -537,6 +543,39 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 		}
 	}
 
+	if canonicalBrief != nil && outcomeMarker != nil &&
+		compiledRun != nil &&
+		HasExecutiveBriefV1(p.RuntimeVersion) &&
+		workflow.GetVersion(
+			ctx, "executive-brief-synthesis-v1",
+			workflow.DefaultVersion, 1,
+		) >= 1 {
+		synthesisCtx := workflow.WithActivityOptions(
+			ctx, executiveSynthesisActivityOptions())
+		var synthesized ExecutiveBriefSynthesizeResult
+		err := workflow.ExecuteActivity(
+			synthesisCtx,
+			a.SynthesizeExecutiveBriefV1,
+			ExecutiveBriefSynthesizeIn{
+				UserID: p.UserID, TraceID: traceID,
+				Run: *compiledRun, Marker: *outcomeMarker,
+				Draft: *canonicalBrief,
+			},
+		).Get(synthesisCtx, &synthesized)
+		if err != nil {
+			// Existing intelligence remains useful. A failed/ambiguous
+			// synthesis is recovered to deterministic fallback out of band.
+			outcomeProcessing = types.RunCompletenessPartial
+			log.Warn("executive Brief synthesis unavailable; continuing push",
+				"trace_id", traceID, "error_code", types.CodeOf(err))
+		} else {
+			executiveArtifactDraft = &synthesized.ArtifactDraft
+			if synthesized.Fallback {
+				outcomeProcessing = types.RunCompletenessPartial
+			}
+		}
+	}
+
 	// 6. Push —— 网络 I/O，主动推送飞书卡片。
 	pushCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
 	pushIn := PushIn{
@@ -550,6 +589,9 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 		if canonicalBatchID > 0 {
 			pushIn.CanonicalBatchID = canonicalBatchID
 		}
+	}
+	if executiveArtifactDraft != nil {
+		pushIn.ExecutiveBrief = executiveArtifactDraft
 	}
 	if err := workflow.ExecuteActivity(
 		pushCtx, a.Push, pushIn).Get(pushCtx, nil); err != nil {
@@ -565,6 +607,36 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 		outcomeTerminal = quietRunOutcomeV1()
 	} else {
 		outcomeTerminal = contentRunOutcomeV1()
+	}
+	if executiveArtifactDraft != nil &&
+		outcomeMarker != nil && compiledRun != nil {
+		claim := types.RunOutcomeClaimV1{
+			RunOutcomeMarkerV1: *outcomeMarker,
+			Result:             outcomeTerminal.result,
+			SourceCoverage:     outcomeCoverage,
+			Processing:         outcomeProcessing,
+		}
+		finalizeCtx := workflow.WithActivityOptions(
+			ctx, quickActivityOptions())
+		if err := workflow.ExecuteActivity(
+			finalizeCtx, a.FinalizeRunOutcomeV1,
+			RunOutcomeFinalizeIn{
+				UserID: p.UserID, Run: *compiledRun, Claim: claim,
+			},
+		).Get(finalizeCtx, nil); err != nil {
+			return err
+		}
+		outcomeFinalized = true
+		freezeCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
+		if err := workflow.ExecuteActivity(
+			freezeCtx, a.FreezeExecutiveBriefV1,
+			ExecutiveBriefFreezeIn{
+				UserID: p.UserID, Run: *compiledRun,
+				Draft: *executiveArtifactDraft,
+			},
+		).Get(freezeCtx, nil); err != nil {
+			return err
+		}
 	}
 	log.Info("push pipeline 完成", "user_id", p.UserID, "trace_id", traceID, "pushed", len(cards))
 	return nil
@@ -728,6 +800,16 @@ func llmActivityOptions() workflow.ActivityOptions {
 func structuredCardGenActivityOptions() workflow.ActivityOptions {
 	return workflow.ActivityOptions{
 		StartToCloseTimeout: 120 * time.Second,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts:        1,
+			NonRetryableErrorTypes: nonRetryableCodes,
+		},
+	}
+}
+
+func executiveSynthesisActivityOptions() workflow.ActivityOptions {
+	return workflow.ActivityOptions{
+		StartToCloseTimeout: 180 * time.Second,
 		RetryPolicy: &temporal.RetryPolicy{
 			MaximumAttempts:        1,
 			NonRetryableErrorTypes: nonRetryableCodes,

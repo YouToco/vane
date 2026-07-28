@@ -145,4 +145,9 @@ type AggregateCardInput struct {
 	// CanonicalBrief is nil for every legacy/ad-hoc card. When present, Items
 	// must be the exact ordered prefix of the immutable Brief.
 	CanonicalBrief *CanonicalBriefCardV1
+	// Executive is the channel-neutral synthesis frozen for this exact Brief.
+	// It is nil for legacy cards and never carries profile text or provenance.
+	Executive         *types.ExecutiveBriefContentV1
+	ExecutiveFallback bool
+	ExecutivePartial  bool
 }

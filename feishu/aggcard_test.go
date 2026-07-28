@@ -470,3 +470,34 @@ func markdownContents(t *testing.T, card string) []string {
 	}
 	return out
 }
+
+func TestBuildAggregateCardExecutiveSummaryPrecedesCanonicalTopItems(
+	t *testing.T,
+) {
+	content := types.ExecutiveBriefContentV1{
+		Headline:         "需要关注的竞争变化",
+		ExecutiveSummary: "两条证据共同显示市场进入加速阶段。",
+		DecisionState:    types.ExecutiveDecisionWatch,
+		WhyForYou:        "这会影响你的产品发布时间。",
+		Signals: []types.ExecutiveSignalV1{{
+			Kind:  types.ExecutiveSignalTrend,
+			Title: "加速", Summary: "发布频率增加",
+			EvidenceRefs: []types.ExecutiveEvidenceRefV1{{
+				InsightID: 10, ClaimIndexes: []int{0},
+			}},
+		}},
+	}
+	card := BuildAggregateCard(feedback.AggregateCardInput{
+		Executive:        &content,
+		ExecutivePartial: true,
+		Items: []feedback.CardInput{{
+			DeliveryID: 10, Title: "第一条", BodyMD: "证据正文",
+		}},
+	})
+	if strings.Index(card, "需要关注的竞争变化") < 0 ||
+		strings.Index(card, "需要关注的竞争变化") >
+			strings.Index(card, "第一条") ||
+		!strings.Contains(card, "覆盖不完整") {
+		t.Fatalf("executive summary is not the card prefix: %s", card)
+	}
+}

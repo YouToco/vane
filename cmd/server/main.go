@@ -27,10 +27,12 @@ import (
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/eventqualifier"
 	"github.com/YouToco/vane/evolver"
+	"github.com/YouToco/vane/executivebriefrecovery"
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/llm"
+	"github.com/YouToco/vane/periodicbrief"
 	"github.com/YouToco/vane/profilehint"
 	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/pusher"
@@ -225,12 +227,31 @@ func run() error {
 						TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
 					})
 			}),
+		workflow.WithExecutiveBriefRuntimeV1(
+			func(ctx context.Context, tenantID int64, taskInstructionEnabled bool) (runtimepolicy.BundleV1, error) {
+				quota, err := st.LoadQuotaRule(ctx, tenantID, store.QuotaLLMTokens)
+				if err != nil {
+					return runtimepolicy.BundleV1{}, err
+				}
+				_ = quota
+				return runtimeconfig.BuildExecutiveBriefCompiledV1(
+					runtimeconfig.CurrentCompiledV1Input{
+						Model:                      cfg.LLM.Model,
+						TaskInstructionEnabled:     taskInstructionEnabled,
+						ModelEndpointGeneration:    cfg.LLM.CompiledEndpointGeneration,
+						ModelCredentialGeneration:  cfg.LLM.CompiledCredentialGeneration,
+						ExaCredentialGeneration:    cfg.Fetch.CompiledExaCredentialGeneration,
+						TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
+					})
+			}, st, recorder),
 		workflow.WithRunOutcomeStoreV1(st),
 		workflow.WithCanonicalBriefStoreV1(st),
 		workflow.WithCanonicalBriefRendererV1(
 			cfg.Pipeline.CanonicalBriefRendererCanaryScheduleID,
 			cfg.Dashboard.Origin,
 		),
+		workflow.WithExecutiveBriefRendererV1(
+			cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID),
 		workflow.WithSnapshotV2ShadowCanary(
 			st, cfg.Pipeline.SnapshotV2ShadowCanaryScheduleID),
 		workflow.WithSnapshotV2ReadAuditCanary(
@@ -241,6 +262,15 @@ func run() error {
 			cfg.Pipeline.ObservationAuthorityCanaryScheduleID),
 		workflow.WithPushEffectCanary(
 			st, cfg.Pipeline.PushEffectCanaryScheduleID))
+	periodicActivities, err := periodicbrief.NewActivities(
+		st, compiledModelResolver, recorder,
+		manager, cfg.Dashboard.Origin,
+		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID)
+	if err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("装配周期 Brief Activities: %w", err)
+	}
 	slog.Info("task playbook prompt policy configured",
 		"enabled", cfg.Pipeline.PlaybookPromptsEnabled,
 		"canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID,
@@ -255,6 +285,7 @@ func run() error {
 	// 保证 Stop 不会采用 SDK 的 0 秒默认值、在 Activity 仍收尾时就释放 DB/Temporal。
 	w := worker.New(temporalClient, cfg.Temporal.TaskQueue, temporalWorkerOptions())
 	w.RegisterWorkflow(workflow.PushPipelineWorkflow)
+	w.RegisterWorkflow(periodicbrief.WorkflowV1)
 	// 逐个注册（非整体 Register）：漏注册不会启动失败，而是每批推送在该活动上
 	// 重试到超时——EvolveProfile 的错误被 workflow 刻意吞掉，漏注册只会表现为
 	// 推送莫名变慢（M5 契约 §13 明示）。
@@ -271,6 +302,8 @@ func run() error {
 	w.RegisterActivity(activities.BeginRunOutcomeV1)
 	w.RegisterActivity(activities.FinalizeRunOutcomeV1)
 	w.RegisterActivity(activities.PrepareCanonicalBriefV1)
+	w.RegisterActivity(activities.SynthesizeExecutiveBriefV1)
+	w.RegisterActivity(activities.FreezeExecutiveBriefV1)
 	w.RegisterActivity(activities.EvolveProfile)
 	w.RegisterActivity(activities.Fetch)
 	w.RegisterActivity(activities.FetchOutcomeV1)
@@ -286,6 +319,8 @@ func run() error {
 	w.RegisterActivity(activities.RecordEmptyBatch)
 	w.RegisterActivity(activities.NotifyEmptyResult)
 	w.RegisterActivity(activities.Push)
+	w.RegisterActivity(periodicActivities.SynthesizePeriodicBriefV1)
+	w.RegisterActivity(periodicActivities.DeliverPeriodicBriefV1)
 
 	// scheduler 是唯一直接碰 SDK client 的调度封装（供 API 建/删/触发调度）。
 	sched := scheduler.New(temporalClient, cfg.Temporal.TaskQueue, st,
@@ -318,7 +353,32 @@ func run() error {
 			cfg.Pipeline.StructuredEventEvidenceCanaryScheduleID,
 			cfg.Pipeline.StructuredEventEvidenceAllowAll,
 			cfg.Pipeline.ObservationAuthorityCanaryScheduleID,
+		),
+		scheduler.WithExecutiveBriefRollout(
+			cfg.Pipeline.ExecutiveBriefEnabled,
+			cfg.Pipeline.ExecutiveBriefCanaryScheduleID,
+			cfg.Pipeline.ExecutiveBriefAllowAll,
 		))
+	periodicCoordinator, err := periodicbrief.NewCoordinator(
+		st, temporalClient, cfg.Temporal.TaskQueue,
+		cfg.Pipeline.ExecutiveBriefEnabled,
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID,
+		cfg.Pipeline.ExecutiveBriefAllowAll,
+		slog.Default())
+	if err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("装配周期 Brief coordinator: %w", err)
+	}
+	periodicRecoveryRunner, err := periodicbrief.NewRecoveryRunner(
+		st, temporalClient, manager, cfg.Dashboard.Origin,
+		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID,
+		slog.Default())
+	if err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("装配周期 Brief recovery: %w", err)
+	}
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
 	// C2b3-2c keeps definition editing dark at every ingress, but already owns
 	// recovery for durable operations left by a prior process. The coordinator is
@@ -406,6 +466,29 @@ func run() error {
 		st.Close()
 		return fmt.Errorf("run outcome recovery 首轮恢复 Gate: %w", err)
 	}
+	executiveRecoveryRunner, err :=
+		executivebriefrecovery.NewRunner(st, slog.Default())
+	if err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("装配 executive Brief recovery: %w", err)
+	}
+	if err := executiveRecoveryRunner.RunStartup(ctx); err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf(
+			"executive Brief recovery 首轮恢复 Gate: %w", err)
+	}
+	if err := periodicCoordinator.RunStartup(ctx); err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("周期 Brief coordinator 首轮 Gate: %w", err)
+	}
+	if err := periodicRecoveryRunner.RunStartup(ctx); err != nil {
+		temporalClient.Close()
+		st.Close()
+		return fmt.Errorf("周期 Brief recovery 首轮 Gate: %w", err)
+	}
 
 	// Push-effect recovery has a separate exact-task switch from fresh sends.
 	// When enabled, prepare outbound API authority without opening Feishu WS,
@@ -476,6 +559,15 @@ func run() error {
 			return ctx.Err()
 		}
 	}
+	runMaintenance(func() {
+		executiveRecoveryRunner.Run(ctx)
+	})
+	runMaintenance(func() {
+		periodicCoordinator.Run(ctx)
+	})
+	runMaintenance(func() {
+		periodicRecoveryRunner.Run(ctx)
+	})
 
 	// 配额 reconcile（契约 §2.7）：给缺配额行的租户补齐默认额度。同样后台跑、幂等。
 	//
@@ -923,8 +1015,11 @@ func run() error {
 		Manager:               manager,
 		Scheduler:             sched,
 		TaskAgent:             agentLoop,
+		BriefFeedback:         fbSvc,
 		TaskActions:           st,
 		DefinitionEditEnabled: cfg.Agent.DefinitionEditEnabled,
+		ExecutiveBriefWebCanaryScheduleID: cfg.Pipeline.
+			ExecutiveBriefWebCanaryScheduleID,
 		// HTTP 面的 principal 来自会话中间件注入的 ctx（企业级契约 §1.1 的最终形态）；
 		// a2a/gate 无 HTTP 会话，仍用 owner 回退——这正是把 principal 做成接口的价值。
 		Principal: auth.NewContextResolver(),

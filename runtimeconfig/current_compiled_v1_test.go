@@ -7,6 +7,7 @@ import (
 
 	"github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/evolver"
+	"github.com/YouToco/vane/executivebrief"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/scorer"
 	"github.com/YouToco/vane/sourcecatalog"
@@ -87,6 +88,51 @@ func TestBuildStructuredInsightCompiledV1OnlyChangesCardGenPolicy(t *testing.T) 
 	}
 	if !reflect.DeepEqual(legacy, structured) {
 		t.Fatal("structured runtime changed policy outside CardGen")
+	}
+}
+
+func TestBuildExecutiveBriefCompiledV1AddsOnlyBoundedSynthesisStages(
+	t *testing.T,
+) {
+	input := currentCompiledInput("model-v2")
+	structured, err := BuildStructuredInsightCompiledV1(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executive, err := BuildExecutiveBriefCompiledV1(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executive.PromptPolicy.IssueSynthesis == nil ||
+		*executive.PromptPolicy.IssueSynthesis !=
+			executivebrief.CurrentIssuePromptStageV1() ||
+		executive.PromptPolicy.PeriodicSynthesis == nil ||
+		*executive.PromptPolicy.PeriodicSynthesis !=
+			executivebrief.CurrentPeriodicPromptStageV1() {
+		t.Fatalf("executive prompt policy = %+v", executive.PromptPolicy)
+	}
+	for stage, want := range map[string]runtimepolicy.ModelCallV1{
+		runtimepolicy.ModelStageIssueSynthesis:    executivebrief.CurrentIssueModelCallV1("model-v2"),
+		runtimepolicy.ModelStagePeriodicSynthesis: executivebrief.CurrentPeriodicModelCallV1("model-v2"),
+	} {
+		got, ok := executive.ModelPolicy.Call(stage)
+		if !ok || got != want {
+			t.Fatalf("executive call %s = %+v/%t, want %+v",
+				stage, got, ok, want)
+		}
+	}
+	executive.PromptPolicy.IssueSynthesis = nil
+	executive.PromptPolicy.PeriodicSynthesis = nil
+	filtered := executive.ModelPolicy.Calls[:0]
+	for _, call := range executive.ModelPolicy.Calls {
+		if call.Stage != runtimepolicy.ModelStageIssueSynthesis &&
+			call.Stage != runtimepolicy.ModelStagePeriodicSynthesis {
+			filtered = append(filtered, call)
+		}
+	}
+	executive.ModelPolicy.Calls = filtered
+	if !reflect.DeepEqual(structured, executive) {
+		t.Fatal("executive runtime changed policy outside synthesis stages")
 	}
 }
 

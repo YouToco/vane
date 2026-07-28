@@ -13,6 +13,7 @@ import (
 
 	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/auth"
+	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/task"
@@ -126,6 +127,17 @@ type TaskActionStore interface {
 	) (*types.TaskDefinitionEditOperation, error)
 }
 
+// BriefFeedback is the existing explicit-user deep-dive control plane. P2-D
+// reuses it after proving the clicked Insight is an immutable evidence
+// reference of the exact Brief/report next step.
+type BriefFeedback interface {
+	HandleClick(
+		ctx context.Context,
+		userID int64,
+		click feedback.Click,
+	) (feedback.ClickResult, error)
+}
+
 // AuthStore 是认证路径所需的窄接口（生产实现 *store.Store）。
 //
 // 单独收窄而不直接用 Deps.Store（具体类型 *store.Store）：认证中间件在每个请求上
@@ -152,6 +164,10 @@ type Deps struct {
 	Manager   Manager
 	Scheduler Scheduler
 	TaskAgent TaskAgent
+	// BriefFeedback is separate from grounded read-only Agent follow-up:
+	// deep-dive is an explicit fixed action and keeps the existing durable
+	// feedback/idempotency/delivery behavior.
+	BriefFeedback BriefFeedback
 	// TaskActions is the narrow durable replay/identity reader. Production
 	// injects the same Store; tests can prove transport invariants without PG.
 	TaskActions TaskActionStore
@@ -162,6 +178,9 @@ type Deps struct {
 	// advertise or enter the definition-edit proposal path while the Agent
 	// feature flag is disabled, even though historical cards remain routable.
 	DefinitionEditEnabled bool
+	// P2-D Web exposure is independent from dark synthesis and Feishu render.
+	// Routes remain mounted, but every non-Web-canary task looks absent.
+	ExecutiveBriefWebCanaryScheduleID string
 	// Origin 是唯一放行 CORS 的前端源（VANE_DASHBOARD_ORIGIN，默认生产 Dashboard 域）。
 	// 前端迁 OSS+CDN 后与 API 跨源（vane.* → api.*），凭证请求要求逐字匹配的
 	// Allow-Origin + Allow-Credentials，不允许通配符。为空 = 不放行任何跨源。
@@ -174,6 +193,11 @@ type server struct {
 	taskActionLimiter *authLimiter
 	taskActionMu      sync.Mutex
 	taskActionActive  map[int64]struct{}
+}
+
+func (s *server) executiveBriefTaskEnabled(taskID string) bool {
+	return taskID != "" &&
+		taskID == s.deps.ExecutiveBriefWebCanaryScheduleID
 }
 
 // Mount 把 /api/* 路由挂到 mux。除 /api/auth/login 外全部要求会话 cookie；
@@ -207,6 +231,15 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("GET /api/schedules/{id}", s.handleGetScheduleDetail)
 	inner.HandleFunc("GET /api/schedules/{id}/batches", s.handleListScheduleBatches)
 	inner.HandleFunc("GET /api/schedules/{id}/briefs", s.handleListTaskBriefs)
+	inner.HandleFunc("GET /api/schedules/{id}/briefs/{target_id}", s.handleIssueBriefGrounding)
+	inner.HandleFunc("POST /api/schedules/{id}/briefs/{target_id}/ask", s.handleIssueBriefFollowup)
+	inner.HandleFunc("POST /api/schedules/{id}/briefs/{target_id}/deep-dive", s.handleIssueBriefDeepDive)
+	inner.HandleFunc("GET /api/schedules/{id}/reports", s.handleListPeriodicBriefReports)
+	inner.HandleFunc("GET /api/schedules/{id}/reports/{target_id}", s.handlePeriodicBriefGrounding)
+	inner.HandleFunc("POST /api/schedules/{id}/reports/{target_id}/ask", s.handlePeriodicBriefFollowup)
+	inner.HandleFunc("POST /api/schedules/{id}/reports/{target_id}/deep-dive", s.handlePeriodicBriefDeepDive)
+	inner.HandleFunc("GET /api/schedules/{id}/report-settings", s.handleGetBriefReportSettings)
+	inner.HandleFunc("PATCH /api/schedules/{id}/report-settings", s.handlePatchBriefReportSettings)
 	inner.HandleFunc("GET /api/schedules/{id}/deliveries", s.handleListScheduleDeliveries)
 	inner.HandleFunc("POST /api/schedules/{id}/run", s.handleRunScheduleNow)
 	inner.HandleFunc("POST /api/schedules/{id}/pause", s.handlePauseSchedule)

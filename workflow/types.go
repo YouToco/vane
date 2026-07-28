@@ -91,25 +91,36 @@ const CompiledRuntimeStructuredInsightV1 = "compiled-snapshot/v1+run-outcome/v1+
 // event evidence Activity and optional immutable Brief provenance extension.
 const CompiledRuntimeStructuredEventEvidenceV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+structured-insight/v1+event-evidence/v1"
 
+// CompiledRuntimeExecutiveBriefV1 adds P2-D's one-call executive synthesis.
+// It is valid only after the structured event evidence runtime.
+const CompiledRuntimeExecutiveBriefV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+structured-insight/v1+event-evidence/v1+executive-brief/v1"
+
 func IsCompiledRuntimeV1(version string) bool {
 	return version == CompiledRuntimeSnapshotV1 ||
 		version == CompiledRuntimeRunOutcomeV1 ||
 		version == CompiledRuntimeCanonicalBriefV1 ||
 		version == CompiledRuntimeStructuredInsightV1 ||
-		version == CompiledRuntimeStructuredEventEvidenceV1
+		version == CompiledRuntimeStructuredEventEvidenceV1 ||
+		version == CompiledRuntimeExecutiveBriefV1
 }
 
 func HasRunOutcomeV1(version string) bool {
 	return version == CompiledRuntimeRunOutcomeV1 ||
 		version == CompiledRuntimeCanonicalBriefV1 ||
 		version == CompiledRuntimeStructuredInsightV1 ||
-		version == CompiledRuntimeStructuredEventEvidenceV1
+		version == CompiledRuntimeStructuredEventEvidenceV1 ||
+		version == CompiledRuntimeExecutiveBriefV1
 }
 
 func HasCanonicalBriefV1(version string) bool {
 	return version == CompiledRuntimeCanonicalBriefV1 ||
 		version == CompiledRuntimeStructuredInsightV1 ||
-		version == CompiledRuntimeStructuredEventEvidenceV1
+		version == CompiledRuntimeStructuredEventEvidenceV1 ||
+		version == CompiledRuntimeExecutiveBriefV1
+}
+
+func HasExecutiveBriefV1(version string) bool {
+	return version == CompiledRuntimeExecutiveBriefV1
 }
 
 // CompiledRunInputV1 carries the trusted stable scope copied from the Schedule

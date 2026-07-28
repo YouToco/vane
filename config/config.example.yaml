@@ -68,6 +68,16 @@ pipeline:
   structured_insight_renderer_enabled: false
   structured_insight_renderer_canary_schedule_id: ""
   structured_insight_renderer_allow_all: false
+  # P2-B1 verified multi-source event evidence is exact-task only.
+  structured_event_evidence_enabled: false
+  structured_event_evidence_canary_schedule_id: ""
+  structured_event_evidence_allow_all: false
+  # P2-D executive synthesis is nested inside structured event evidence.
+  executive_brief_enabled: false
+  executive_brief_canary_schedule_id: ""
+  executive_brief_allow_all: false
+  executive_brief_web_canary_schedule_id: ""
+  executive_brief_renderer_canary_schedule_id: ""
   # P1-E Feishu renderer authority; empty is the exact rollback state.
   canonical_brief_renderer_canary_schedule_id: ""
   # C2c-2: exact one-task shadow canary. Empty means fully off.

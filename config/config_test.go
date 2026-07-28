@@ -345,6 +345,107 @@ func TestStructuredEventEvidenceRolloutValidation(t *testing.T) {
 	})
 }
 
+func TestExecutiveBriefRolloutValidation(t *testing.T) {
+	base := func() Config {
+		return Config{
+			DB:        DBConfig{URL: "postgres://test"},
+			Dashboard: DashboardConfig{Origin: "https://vane.example"},
+			Pipeline: PipelineConfig{
+				CompiledRuntimeEnabled:                    true,
+				CompiledRuntimeCanaryScheduleID:           "task-a",
+				RunOutcomeEnabled:                         true,
+				RunOutcomeCanaryScheduleID:                "task-a",
+				CanonicalBriefEnabled:                     true,
+				CanonicalBriefCanaryScheduleID:            "task-a",
+				CanonicalBriefRendererCanaryScheduleID:    "task-a",
+				StructuredInsightEnabled:                  true,
+				StructuredInsightCanaryScheduleID:         "task-a",
+				StructuredInsightRendererEnabled:          true,
+				StructuredInsightRendererCanaryScheduleID: "task-a",
+				StructuredEventEvidenceEnabled:            true,
+				StructuredEventEvidenceCanaryScheduleID:   "task-a",
+				ObservationShadowCanaryScheduleID:         "task-a",
+				ObservationAuthorityCanaryScheduleID:      "task-a",
+				PushEffectCanaryScheduleID:                "task-a",
+				PushEffectRecoveryCanaryScheduleID:        "task-a",
+			},
+		}
+	}
+	t.Run("exact nested canary", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = " task-a "
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Pipeline.ExecutiveBriefCanaryScheduleID != "task-a" {
+			t.Fatalf("canary = %q",
+				cfg.Pipeline.ExecutiveBriefCanaryScheduleID)
+		}
+	})
+	t.Run("dark synthesis and independent channel canaries", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = "task-a"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("dark synthesis rejected: %v", err)
+		}
+		cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID = " task-a "
+		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID = "task-a"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("channel canaries rejected: %v", err)
+		}
+		if cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID != "task-a" {
+			t.Fatalf("Web canary=%q",
+				cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID)
+		}
+	})
+	t.Run("channel canary outside synthesis is rejected", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = "task-a"
+		cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID = "task-b"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected Web rollout nesting error")
+		}
+	})
+	t.Run("renderer without Web canary is rejected", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = "task-a"
+		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID = "task-a"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected renderer/Web rollout nesting error")
+		}
+	})
+	t.Run("requires structured event evidence", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.StructuredEventEvidenceEnabled = false
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = "task-a"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected nesting error")
+		}
+	})
+	t.Run("mismatched canary", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = "task-b"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected canary mismatch")
+		}
+	})
+	t.Run("canary and allow all conflict", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = "task-a"
+		cfg.Pipeline.ExecutiveBriefAllowAll = true
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected rollout conflict")
+		}
+	})
+}
+
 func TestCanonicalBriefRendererRolloutValidation(t *testing.T) {
 	valid := func() Config {
 		return Config{
@@ -1135,6 +1236,11 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.structured_event_evidence_enabled", cfg.Pipeline.StructuredEventEvidenceEnabled, false},
 		{"pipeline.structured_event_evidence_canary_schedule_id", cfg.Pipeline.StructuredEventEvidenceCanaryScheduleID, ""},
 		{"pipeline.structured_event_evidence_allow_all", cfg.Pipeline.StructuredEventEvidenceAllowAll, false},
+		{"pipeline.executive_brief_enabled", cfg.Pipeline.ExecutiveBriefEnabled, false},
+		{"pipeline.executive_brief_canary_schedule_id", cfg.Pipeline.ExecutiveBriefCanaryScheduleID, ""},
+		{"pipeline.executive_brief_allow_all", cfg.Pipeline.ExecutiveBriefAllowAll, false},
+		{"pipeline.executive_brief_web_canary_schedule_id", cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID, ""},
+		{"pipeline.executive_brief_renderer_canary_schedule_id", cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID, ""},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
 		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 100000},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},

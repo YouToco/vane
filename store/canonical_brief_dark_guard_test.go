@@ -11,9 +11,8 @@ import (
 	"testing"
 )
 
-// P1-E adds only the exact feedback rebuild reader and the in-Activity
-// canonical prefix renderer. Direct Freeze/Load remain dark; workflow/recovery
-// call points stay pinned to the P1-C/P1-B seams.
+// P2-D keeps legacy direct Freeze/Load dark while adding only its explicit
+// synthesis, artifact and recovery seams.
 func TestCanonicalBriefP1EHasOnlyScopedProductionCallPoints(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -33,7 +32,8 @@ func TestCanonicalBriefP1EHasOnlyScopedProductionCallPoints(t *testing.T) {
 			"workflow/activities.go": true,
 		},
 		"LoadPreparedBriefDraftV1": {
-			"workflow/activities.go": true,
+			"workflow/activities.go":           true,
+			"executivebriefrecovery/runner.go": true,
 		},
 		"PrepareBriefDraftV1": {
 			"workflow/activities.go": true,
@@ -74,6 +74,27 @@ func TestCanonicalBriefP1EHasOnlyScopedProductionCallPoints(t *testing.T) {
 			"workflow/workflow.go": true,
 			"cmd/server/main.go":   true,
 		},
+		"SynthesizeExecutiveBriefV1": {
+			"workflow/workflow.go": true,
+			"cmd/server/main.go":   true,
+		},
+		"FreezeExecutiveBriefV1": {
+			"workflow/workflow.go": true,
+			"cmd/server/main.go":   true,
+		},
+		"ListExecutiveSynthesisRecoveryCandidatesV1": {
+			"executivebriefrecovery/runner.go": true,
+		},
+		"LoadExecutiveSynthesisReceiptV1": {
+			"executivebriefrecovery/runner.go": true,
+		},
+		"RecoverExecutiveSynthesisFallbackV1": {
+			"executivebriefrecovery/runner.go": true,
+		},
+		"FreezeExecutiveBriefArtifactV1": {
+			"workflow/executive_brief_activities.go": true,
+			"executivebriefrecovery/runner.go":       true,
+		},
 		"CardGenOutcomeV3": {
 			"workflow/workflow.go": true,
 			"cmd/server/main.go":   true,
@@ -82,7 +103,8 @@ func TestCanonicalBriefP1EHasOnlyScopedProductionCallPoints(t *testing.T) {
 			"api/briefs.go": true,
 		},
 		"LoadCanonicalBriefForFeedbackV1": {
-			"feedback/service.go": true,
+			"feedback/service.go":    true,
+			"store/brief_feedback.go": true,
 		},
 	}
 	var calls []string

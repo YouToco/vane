@@ -105,6 +105,17 @@ var purgeOrder = []purgeStep{
 	// External effect checkpoints bind exact delivery, batch, and immutable run
 	// identities, so they must be removed before all three parent aggregates.
 	{"push_effects", "tenant_id = $1"},
+	// P2-D reports own their delivery effect, immutable report and spend
+	// receipt. Remove the complete child chain before the task/run/Brief roots.
+	{"periodic_report_deliveries", "tenant_id = $1"},
+	{"periodic_brief_reports", "tenant_id = $1"},
+	{"periodic_synthesis_receipts", "tenant_id = $1"},
+	{"periodic_brief_intents", "tenant_id = $1"},
+	{"brief_report_settings", "tenant_id = $1"},
+	// Issue synthesis artifacts bind the canonical Brief, terminal outcome and
+	// receipt; both rows must be gone before any of those retained parents.
+	{"executive_brief_artifacts", "tenant_id = $1"},
+	{"executive_brief_synthesis_receipts", "tenant_id = $1"},
 	// Pre-render stages may reference the promoted snapshot as well as the
 	// outcome and batch, so delete them before every canonical Brief parent.
 	{"canonical_brief_stages", "tenant_id = $1"},
@@ -219,6 +230,13 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		profileEpochEventsAvailable   bool
 		profileEpochReceiptsAvailable bool
 		profileActivitiesAvailable    bool
+		executiveReceiptsAvailable    bool
+		executiveArtifactsAvailable   bool
+		reportSettingsAvailable       bool
+		periodicIntentsAvailable      bool
+		periodicReceiptsAvailable     bool
+		periodicReportsAvailable      bool
+		periodicDeliveriesAvailable   bool
 	)
 	if err := tx.QueryRow(ctx,
 		`SELECT to_regclass('public.canonical_brief_stages') IS NOT NULL,
@@ -227,7 +245,14 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		        to_regclass('public.profile_epoch_checkpoints') IS NOT NULL,
 		        to_regclass('public.profile_epoch_events') IS NOT NULL,
 		        to_regclass('public.profile_epoch_receipts') IS NOT NULL,
-		        to_regclass('public.profile_epoch_activities') IS NOT NULL`,
+		        to_regclass('public.profile_epoch_activities') IS NOT NULL,
+		        to_regclass('public.executive_brief_synthesis_receipts') IS NOT NULL,
+		        to_regclass('public.executive_brief_artifacts') IS NOT NULL,
+		        to_regclass('public.brief_report_settings') IS NOT NULL,
+		        to_regclass('public.periodic_brief_intents') IS NOT NULL,
+		        to_regclass('public.periodic_synthesis_receipts') IS NOT NULL,
+		        to_regclass('public.periodic_brief_reports') IS NOT NULL,
+		        to_regclass('public.periodic_report_deliveries') IS NOT NULL`,
 	).Scan(
 		&canonicalBriefStagesAvailable,
 		&profileEpochsAvailable,
@@ -236,21 +261,36 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 		&profileEpochEventsAvailable,
 		&profileEpochReceiptsAvailable,
 		&profileActivitiesAvailable,
+		&executiveReceiptsAvailable,
+		&executiveArtifactsAvailable,
+		&reportSettingsAvailable,
+		&periodicIntentsAvailable,
+		&periodicReceiptsAvailable,
+		&periodicReportsAvailable,
+		&periodicDeliveriesAvailable,
 	); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "检查可选 schema 清理能力", err)
 	}
 	optionalPurgeTables := map[string]bool{
-		"canonical_brief_stages":        canonicalBriefStagesAvailable,
-		"profile_epochs":                profileEpochsAvailable,
-		"profile_feedback_epoch_fences": profileEpochFencesAvailable,
-		"profile_epoch_checkpoints":     profileCheckpointsAvailable,
-		"profile_epoch_events":          profileEpochEventsAvailable,
-		"profile_epoch_receipts":        profileEpochReceiptsAvailable,
-		"profile_epoch_activities":      profileActivitiesAvailable,
+		"canonical_brief_stages":             canonicalBriefStagesAvailable,
+		"profile_epochs":                     profileEpochsAvailable,
+		"profile_feedback_epoch_fences":      profileEpochFencesAvailable,
+		"profile_epoch_checkpoints":          profileCheckpointsAvailable,
+		"profile_epoch_events":               profileEpochEventsAvailable,
+		"profile_epoch_receipts":             profileEpochReceiptsAvailable,
+		"profile_epoch_activities":           profileActivitiesAvailable,
+		"executive_brief_synthesis_receipts": executiveReceiptsAvailable,
+		"executive_brief_artifacts":          executiveArtifactsAvailable,
+		"brief_report_settings":              reportSettingsAvailable,
+		"periodic_brief_intents":             periodicIntentsAvailable,
+		"periodic_synthesis_receipts":        periodicReceiptsAvailable,
+		"periodic_brief_reports":             periodicReportsAvailable,
+		"periodic_report_deliveries":         periodicDeliveriesAvailable,
 	}
 	if _, err := tx.Exec(ctx,
-		`SELECT set_config('app.tenant_id', $1, true)`,
+		`SELECT set_config('app.tenant_id', $1, true),
+		        set_config('app.tenant_purge', 'on', true)`,
 		fmt.Sprintf("%d", tenantID)); err != nil {
 		return nil, types.NewAppError(
 			types.CodeDatabase, "设置租户清理上下文", err)

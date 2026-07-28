@@ -49,5 +49,13 @@ jobs:
         env:
           DATABASE_URL: postgres://vane:vane_test@localhost:5432/vane_test?sslmode=disable
 
+      - name: True Temporal termination with PostgreSQL recovery
+        run: >-
+          go test -tags=integration ./periodicbrief
+          -run TestPeriodicWorkflowExternalTerminationReplaysAndRecoveryConverges
+          -count=1
+        env:
+          DATABASE_URL: postgres://vane:vane_test@localhost:5432/vane_test?sslmode=disable
+
       - name: Build
         run: go build -o bin/vane ./cmd/server
