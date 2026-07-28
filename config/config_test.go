@@ -1186,6 +1186,57 @@ func TestEnvOnlyObservationCanaries(t *testing.T) {
 	}
 }
 
+// TestEnvOnlyExecutiveBriefCanary proves that every P2-D rollout key is
+// registered before AutomaticEnv. Production is environment-only; a missing
+// default silently leaves synthesis disabled even while systemd exposes the
+// requested variables to the process.
+func TestEnvOnlyExecutiveBriefCanary(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	const taskID = "task-executive-env"
+	for key, value := range map[string]string{
+		"VANE_DB_URL":                                                  "postgres://env",
+		"VANE_PIPELINE_COMPILED_RUNTIME_ENABLED":                       "true",
+		"VANE_PIPELINE_COMPILED_RUNTIME_CANARY_SCHEDULE_ID":            taskID,
+		"VANE_PIPELINE_RUN_OUTCOME_ENABLED":                            "true",
+		"VANE_PIPELINE_RUN_OUTCOME_CANARY_SCHEDULE_ID":                 taskID,
+		"VANE_PIPELINE_CANONICAL_BRIEF_ENABLED":                        "true",
+		"VANE_PIPELINE_CANONICAL_BRIEF_CANARY_SCHEDULE_ID":             taskID,
+		"VANE_PIPELINE_STRUCTURED_INSIGHT_ENABLED":                     "true",
+		"VANE_PIPELINE_STRUCTURED_INSIGHT_CANARY_SCHEDULE_ID":          taskID,
+		"VANE_PIPELINE_CANONICAL_BRIEF_RENDERER_CANARY_SCHEDULE_ID":    taskID,
+		"VANE_PIPELINE_STRUCTURED_INSIGHT_RENDERER_ENABLED":            "true",
+		"VANE_PIPELINE_STRUCTURED_INSIGHT_RENDERER_CANARY_SCHEDULE_ID": taskID,
+		"VANE_PIPELINE_OBSERVATION_SHADOW_CANARY_SCHEDULE_ID":          taskID,
+		"VANE_PIPELINE_OBSERVATION_AUTHORITY_CANARY_SCHEDULE_ID":       taskID,
+		"VANE_PIPELINE_PUSH_EFFECT_CANARY_SCHEDULE_ID":                 taskID,
+		"VANE_PIPELINE_PUSH_EFFECT_RECOVERY_CANARY_SCHEDULE_ID":        taskID,
+		"VANE_PIPELINE_STRUCTURED_EVENT_EVIDENCE_ENABLED":              "true",
+		"VANE_PIPELINE_STRUCTURED_EVENT_EVIDENCE_CANARY_SCHEDULE_ID":   taskID,
+		"VANE_PIPELINE_EXECUTIVE_BRIEF_ENABLED":                        "true",
+		"VANE_PIPELINE_EXECUTIVE_BRIEF_CANARY_SCHEDULE_ID":             taskID,
+		"VANE_PIPELINE_EXECUTIVE_BRIEF_WEB_CANARY_SCHEDULE_ID":         taskID,
+	} {
+		t.Setenv(key, value)
+	}
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("环境变量 executive Brief canary 配置应能启动: %v", err)
+	}
+	if !cfg.Pipeline.ExecutiveBriefEnabled ||
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID != taskID ||
+		cfg.Pipeline.ExecutiveBriefAllowAll ||
+		cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID != taskID ||
+		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID != "" {
+		t.Fatalf(
+			"VANE_PIPELINE_EXECUTIVE_BRIEF_* 未进入配置或被改写: %+v",
+			cfg.Pipeline,
+		)
+	}
+}
+
 // TestDefaults 验证内置默认值与 config.example.yaml 一致。
 func TestDefaults(t *testing.T) {
 	clearVaneEnv(t)
