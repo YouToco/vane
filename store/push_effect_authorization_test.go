@@ -1605,6 +1605,18 @@ func authorizedPushEffectFixtureWithExpiry(
 	); err != nil {
 		t.Fatal(err)
 	}
+	// The CHECK constraint compares this value with a database-generated
+	// created_at. An exact one-hour Go-clock value flakes if the test runner
+	// clock is even slightly ahead of the PostgreSQL container.
+	var idempotencyExpiresAt time.Time
+	if err := f.st.pool.QueryRow(t.Context(), `
+		SELECT clock_timestamp() +
+		       $1::double precision * interval '1 microsecond'`,
+		expiresAfter.Microseconds(),
+	).Scan(&idempotencyExpiresAt); err != nil {
+		t.Fatal(err)
+	}
+	idempotencyExpiresAt = idempotencyExpiresAt.UTC()
 	effect, err := f.st.CreatePushEffect(
 		t.Context(),
 		pusheffect.Prepared{
@@ -1619,8 +1631,7 @@ func authorizedPushEffectFixtureWithExpiry(
 			Card:                 []byte(`{"card":"authorization"}`),
 			ProviderUUID:         uuid.NewString(),
 			ObservationEventKeys: []string{eventKey},
-			IdempotencyExpiresAt: time.Now().UTC().
-				Truncate(time.Microsecond).Add(expiresAfter),
+			IdempotencyExpiresAt: idempotencyExpiresAt,
 		},
 	)
 	if err != nil {
