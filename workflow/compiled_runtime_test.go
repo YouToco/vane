@@ -543,7 +543,10 @@ func (f *compiledQuotaCardGenFake) GenerateWithPolicyV1(
 	return "body", nil
 }
 
-type compiledStructuredCardGenFake struct{ calls atomic.Int32 }
+type compiledStructuredCardGenFake struct {
+	calls    atomic.Int32
+	failByID map[int64]error
+}
 
 func (*compiledStructuredCardGenFake) Generate(
 	context.Context, int64, types.ScoredItem, string, string,
@@ -552,10 +555,13 @@ func (*compiledStructuredCardGenFake) Generate(
 }
 
 func (f *compiledStructuredCardGenFake) GenerateStructuredWithPolicyV2(
-	context.Context, int64, int64, types.ScoredItem, string, string,
-	cardgenpkg.PolicyV2, func(context.Context, float64) error,
+	_ context.Context, _ int64, _ int64, item types.ScoredItem, _ string, _ string,
+	_ cardgenpkg.PolicyV2, _ func(context.Context, float64) error,
 ) (types.StructuredInsightV1, error) {
 	f.calls.Add(1)
+	if err := f.failByID[item.Item.ID]; err != nil {
+		return types.StructuredInsightV1{}, err
+	}
 	return types.StructuredInsightV1{
 		SchemaVersion: types.StructuredInsightSchemaVersionV1,
 		BodyMD:        "**structured body**",
@@ -2785,6 +2791,88 @@ func TestCardGenOutcomeV2ReturnsStructuredPayloadWithoutLegacyCall(t *testing.T)
 		card.calls.Load() != 1 {
 		t.Fatalf("result=%+v calls=%d", result, card.calls.Load())
 	}
+}
+
+func TestCardGenOutcomeV2PartialAndAllRejectedSemantics(t *testing.T) {
+	identity, ref, snapshot := compiledActivityFixture("Structured Task")
+	policy, err := runtimeconfig.BuildStructuredInsightCompiledV1(
+		runtimeconfig.CurrentCompiledV1Input{
+			Model: "deepseek-chat", TaskInstructionEnabled: true,
+			ModelEndpointGeneration: 1, ModelCredentialGeneration: 1,
+			ExaCredentialGeneration: 1, TikHubCredentialGeneration: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Policy = policy
+	items := []types.ScoredItem{
+		{Item: types.ContentItem{ID: 501, Title: "kept"}, Score: 88},
+		{Item: types.ContentItem{ID: 502, Title: "rejected"}, Score: 87},
+	}
+	run := &CompiledRunInputV1{
+		TenantID: identity.TenantID, TaskID: identity.TaskID, Snapshot: ref,
+	}
+	newActivity := func(failByID map[int64]error) (*Activities, *compiledStructuredCardGenFake) {
+		card := &compiledStructuredCardGenFake{failByID: failByID}
+		return NewActivities(
+			fakeFetcher{}, fakeScorer{}, card, &fakePusher{}, new(fakeStore),
+			fakeFeishu{}, nil, nil, nil, nil,
+			WithCompiledRuntimeV1(
+				&compiledRunStoreFake{snapshot: snapshot, authorize: true},
+				func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+					return runtimepolicy.BundleV1{}, nil
+				},
+				new(compiledModelResolverFake)),
+		), card
+	}
+	rejected := types.NewAppError(
+		types.CodeValidation, "structured CardGen output is invalid", nil)
+
+	t.Run("partial", func(t *testing.T) {
+		a, card := newActivity(map[int64]error{502: rejected})
+		var suite testsuite.WorkflowTestSuite
+		env := suite.NewTestActivityEnvironment()
+		env.RegisterActivity(a.CardGenOutcomeV2)
+		value, err := env.ExecuteActivity(a.CardGenOutcomeV2, CardGenIn{
+			UserID: identity.UserID, TraceID: "trace-structured-partial",
+			Run: run, Items: items,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result CardGenOutcomeResult
+		if err := value.Get(&result); err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Cards) != 1 ||
+			result.Cards[0].Scored.Item.ID != 501 ||
+			result.Processing != types.RunCompletenessPartial ||
+			card.calls.Load() != 2 {
+			t.Fatalf("partial result=%+v calls=%d", result, card.calls.Load())
+		}
+	})
+
+	t.Run("all rejected", func(t *testing.T) {
+		a, card := newActivity(map[int64]error{
+			501: rejected,
+			502: rejected,
+		})
+		var suite testsuite.WorkflowTestSuite
+		env := suite.NewTestActivityEnvironment()
+		env.RegisterActivity(a.CardGenOutcomeV2)
+		_, err := env.ExecuteActivity(a.CardGenOutcomeV2, CardGenIn{
+			UserID: identity.UserID, TraceID: "trace-structured-rejected",
+			Run: run, Items: items,
+		})
+		var appErr *temporal.ApplicationError
+		if !errors.As(err, &appErr) ||
+			appErr.Type() != string(types.CodeValidation) ||
+			appErr.Message() != "structured CardGen output was rejected" ||
+			!appErr.NonRetryable() ||
+			card.calls.Load() != 2 {
+			t.Fatalf("all rejected err=%v calls=%d", err, card.calls.Load())
+		}
+	})
 }
 
 func executePushActivity(t *testing.T, env *testsuite.TestActivityEnvironment, a *Activities, in PushIn) error {
