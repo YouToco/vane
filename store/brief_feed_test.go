@@ -224,6 +224,24 @@ func TestTaskBriefFeedPaginatesWholeBriefs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	secondStructured, err := types.SealStructuredInsightEvidenceV1(
+		types.StructuredInsightV1{
+			SchemaVersion:    types.StructuredInsightSchemaVersionV1,
+			BodyMD:           "second body",
+			WhatChanged:      "second change",
+			WhyItMatters:     "second relevance",
+			ImportanceReason: "second evidence",
+			Claims: []types.StructuredClaimV1{{
+				Text:       "second claim",
+				Excerpt:    "second excerpt",
+				SourceRefs: []string{"source-1"},
+			}},
+		},
+		map[string]string{"source-1": "second excerpt"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	secondBrief, err := f.base.st.FreezeBriefV1(
 		t.Context(), secondIdentity, secondRef, types.BriefDraftV1{
 			SchemaVersion: types.BriefSchemaVersionV1,
@@ -241,6 +259,7 @@ func TestTaskBriefFeedPaginatesWholeBriefs(t *testing.T) {
 				SourceTitle: f.sourceName, SourceURL: secondURL,
 				DiscoveredAt: discoveredAt.Round(0).UTC().
 					Truncate(time.Microsecond),
+				Structured: &secondStructured,
 			}},
 		})
 	if err != nil {
@@ -275,6 +294,21 @@ func TestTaskBriefFeedPaginatesWholeBriefs(t *testing.T) {
 		firstPage.NextPageToken == "" {
 		t.Fatalf("first page = %+v", firstPage)
 	}
+	if structured := firstPage.Items[0].Insights[0].Structured; structured == nil ||
+		structured.WhatChanged != "second change" ||
+		structured.WhyItMatters != "second relevance" ||
+		structured.ImportanceReason != "second evidence" ||
+		len(structured.Claims) != 1 ||
+		structured.Claims[0].SourceRefs[0] != "source-1" {
+		t.Fatalf("structured Web projection = %+v", structured)
+	}
+	payload, err := json.Marshal(firstPage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "evidence_digest") {
+		t.Fatalf("Web projection leaked internal evidence digest: %s", payload)
+	}
 	secondPage, err := f.base.st.ListTaskBriefsV1(
 		t.Context(), f.identity.TenantID, f.identity.UserID,
 		f.identity.TaskID, TaskBriefQuery{
@@ -296,6 +330,21 @@ func TestBriefFeedPageSizeIsBounded(t *testing.T) {
 	}
 	if got := clampBriefFeedPageSizeV1(999); got != maxBriefFeedPageSizeV1 {
 		t.Fatalf("bounded page size = %d", got)
+	}
+}
+
+func TestTaskBriefStructuredProjectionEncodesZeroClaimsAsArray(t *testing.T) {
+	projected := projectTaskBriefStructuredInsightV1(&types.StructuredInsightV1{
+		SchemaVersion: types.StructuredInsightSchemaVersionV1,
+		BodyMD:        "body",
+	})
+	payload, err := json.Marshal(projected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), `"claims":null`) ||
+		!strings.Contains(string(payload), `"claims":[]`) {
+		t.Fatalf("zero claims projection = %s, want JSON array", payload)
 	}
 }
 

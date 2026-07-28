@@ -397,6 +397,13 @@ func TestRebuilt_CanonicalBriefUsesFrozenOrderedPrefix(t *testing.T) {
 			DiscoveredAt: time.Unix(int64(100+i), 0).UTC(),
 		}
 	}
+	insights[0].Structured = &types.StructuredInsightV1{
+		SchemaVersion:    types.StructuredInsightSchemaVersionV1,
+		BodyMD:           insights[0].BodyMD,
+		WhatChanged:      "frozen change",
+		WhyItMatters:     "frozen relevance",
+		ImportanceReason: "frozen evidence",
+	}
 	h.st.canonicalBrief = types.BriefV1{
 		ID: 77,
 		BriefDraftV1: types.BriefDraftV1{
@@ -431,7 +438,7 @@ func TestRebuilt_CanonicalBriefUsesFrozenOrderedPrefix(t *testing.T) {
 	for i, item := range got.Items {
 		if item.DeliveryID != insights[i].ID ||
 			item.Title != insights[i].Title ||
-			item.BodyMD != insights[i].BodyMD ||
+			item.BodyMD != CanonicalInsightBodyMDV1(insights[i]) ||
 			item.SourceTitle != insights[i].SourceTitle ||
 			item.URL != insights[i].SourceURL ||
 			!item.DiscoveredAt.Equal(insights[i].DiscoveredAt) {

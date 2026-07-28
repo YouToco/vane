@@ -180,6 +180,7 @@ type Scheduler struct {
 	compiledRuntime   compiledRuntimeRollout
 	runOutcome        runOutcomeRollout
 	canonicalBrief    canonicalBriefRollout
+	structuredInsight structuredInsightRollout
 	commandAttempt    time.Duration
 }
 

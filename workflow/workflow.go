@@ -428,8 +428,24 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 	var cardErr error
 	if outcomeMarker != nil {
 		var result CardGenOutcomeResult
-		cardErr = workflow.ExecuteActivity(
-			cardCtx, a.CardGenOutcomeV1, cardIn).Get(cardCtx, &result)
+		if p.RuntimeVersion == CompiledRuntimeStructuredInsightV1 &&
+			workflow.GetVersion(
+				ctx, "structured-insight-cardgen-v1",
+				workflow.DefaultVersion, 1,
+			) >= 1 {
+			// This renderer promises at most one paid CardGen call per
+			// selected item. Do not re-execute the whole Activity after an
+			// ambiguous Activity completion or worker loss: the run remains
+			// partial and the original error still propagates.
+			structuredCardCtx := workflow.WithActivityOptions(
+				ctx, structuredCardGenActivityOptions())
+			cardErr = workflow.ExecuteActivity(
+				structuredCardCtx, a.CardGenOutcomeV2, cardIn).
+				Get(structuredCardCtx, &result)
+		} else {
+			cardErr = workflow.ExecuteActivity(
+				cardCtx, a.CardGenOutcomeV1, cardIn).Get(cardCtx, &result)
+		}
 		cards = result.Cards
 		if result.Processing == types.RunCompletenessPartial {
 			outcomeProcessing = types.RunCompletenessPartial
@@ -690,6 +706,21 @@ func llmActivityOptions() workflow.ActivityOptions {
 	return workflow.ActivityOptions{
 		StartToCloseTimeout: 120 * time.Second,
 		RetryPolicy:         defaultRetryPolicy(),
+	}
+}
+
+// structuredCardGenActivityOptions is intentionally at-most-once at the
+// Temporal Activity boundary. CardGenOutcomeV2 may have already received and
+// paid for a model response when worker/completion acknowledgement is lost;
+// retrying the Activity would repeat those external calls. Other LLM stages
+// retain the legacy retry policy.
+func structuredCardGenActivityOptions() workflow.ActivityOptions {
+	return workflow.ActivityOptions{
+		StartToCloseTimeout: 120 * time.Second,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts:        1,
+			NonRetryableErrorTypes: nonRetryableCodes,
+		},
 	}
 }
 

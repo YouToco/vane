@@ -744,6 +744,140 @@ func TestPushPipelineWorkflow_ReplayPreResultV2PrepareFrontier(t *testing.T) {
 	}
 }
 
+func structuredInsightV1HappyPathHistory(
+	t *testing.T,
+	execution sdkworkflow.Execution,
+) *historypb.History {
+	t.Helper()
+	p := PushParams{
+		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeStructuredInsightV1,
+		ScheduleID:     "task-p2a-replay", NLDesc: "每日结构化情报",
+	}
+	identity := types.RunIdentity{
+		TemporalWorkflowID: execution.ID, TemporalRunID: execution.RunID,
+		RunKind:  types.RunSnapshotKindScheduled,
+		TenantID: p.TenantID, UserID: p.UserID, TaskID: p.ScheduleID,
+	}
+	ref := mustCompiledRunRef(identity, 105)
+	run := &CompiledRunInputV1{
+		TenantID: p.TenantID, TaskID: p.ScheduleID, Snapshot: ref,
+	}
+	preparedParams := p
+	preparedParams.Snapshot = &ref
+	marker := types.RunOutcomeMarkerV1{
+		ID: 205, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID, TenantID: p.TenantID,
+		UserID: p.UserID, TaskID: p.ScheduleID,
+	}
+	structured := types.StructuredInsightV1{
+		SchemaVersion:    types.StructuredInsightSchemaVersionV1,
+		BodyMD:           "兼容正文",
+		WhatChanged:      "价格下降",
+		WhyItMatters:     "影响当前成本",
+		ImportanceReason: "直接改变单位经济性",
+		Claims: []types.StructuredClaimV1{{
+			Text:       "价格下降 20%",
+			Excerpt:    "价格下降了 20%",
+			SourceRefs: []string{"source-1"},
+		}},
+	}
+	cards := []GeneratedCard{{
+		Scored:     scoredItems(1)[0],
+		BodyMD:     structured.BodyMD,
+		Structured: &structured,
+	}}
+	draft := types.BriefDraftV1{
+		SchemaVersion: types.BriefSchemaVersionV1,
+		RunOutcomeID:  marker.ID, RunSnapshotID: ref.SnapshotID,
+		PushBatchID: 305, TenantID: p.TenantID, UserID: p.UserID,
+		TaskID: p.ScheduleID,
+		Insights: []types.InsightV1{{
+			ID: 405, RankPosition: 1, Title: "item",
+			BodyMD: structured.BodyMD, SourceTitle: "source",
+			SourceURL:  "https://example.com/item",
+			Structured: &structured,
+		}},
+	}
+	const traceID = "9f1d6c5e-0000-4000-8000-p2areplay000"
+	b := newHistoryBuilder(t, p)
+	b.sideEffect(1, traceID)
+	b.versionWithSearchAttributes("scheduled-runtime-envelope-v1", 1)
+	b.versionWithSearchAttributes("compiled-run-snapshot-v1", 1)
+	b.activity("PrepareRun", p,
+		PrepareRunResult{Authorized: true, Snapshot: ref})
+	b.versionWithSearchAttributes("run-outcome-lifecycle-v1", 1)
+	b.activity("BeginRunOutcomeV1",
+		RunOutcomeBeginIn{UserID: p.UserID, Run: *run}, marker)
+	b.activity("EvolveProfile",
+		EvolveIn{UserID: p.UserID, TraceID: traceID, Run: run}, nil)
+	b.activity("FetchOutcomeV1", preparedParams, FetchOutcomeResult{
+		Items: items(1), SourceCoverage: types.RunCompletenessComplete,
+	})
+	b.activity("Dedup", DedupIn{
+		UserID: p.UserID, TraceID: traceID, Items: items(1), Run: run,
+	}, items(1))
+	b.versionWithSearchAttributes("observation-qualification-v1", 1)
+	b.activity("QualifyEvents", QualifyEventsIn{
+		UserID: p.UserID, TraceID: traceID, ScheduleID: p.ScheduleID,
+		Items: items(1), Run: run,
+	}, QualifyEventsResult{Items: items(1), Outcome: "not_configured"})
+	b.activity("ScoreOutcomeV1", ScoreIn{
+		UserID: p.UserID, TraceID: traceID, Items: items(1),
+		ScheduleID: p.ScheduleID, Run: run,
+	}, ScoreOutcomeResult{
+		Items: scoredItems(1), Processing: types.RunCompletenessComplete,
+	})
+	b.activity("Select", SelectIn{
+		UserID: p.UserID, TraceID: traceID, TopN: defaultTopN,
+		Scored: scoredItems(1), ScheduleID: p.ScheduleID, Run: run,
+	}, scoredItems(1))
+	b.versionWithSearchAttributes("structured-insight-cardgen-v1", 1)
+	b.activity("CardGenOutcomeV2", CardGenIn{
+		UserID: p.UserID, TraceID: traceID, Items: scoredItems(1),
+		ScheduleID: p.ScheduleID, Run: run,
+	}, CardGenOutcomeResult{
+		Cards: cards, Processing: types.RunCompletenessComplete,
+	})
+	b.versionWithSearchAttributes("canonical-brief-stage-v1", 1)
+	b.versionWithSearchAttributes("canonical-brief-prepare-result-v2", 1)
+	b.activity("PrepareCanonicalBriefV1", CanonicalBriefPrepareIn{
+		UserID: p.UserID, TraceID: traceID, Run: *run,
+		Marker: marker, Cards: cards,
+	}, CanonicalBriefPrepareResult{
+		Draft: &draft, BatchID: draft.PushBatchID,
+	})
+	b.activity("Push", PushIn{
+		UserID: p.UserID, ScheduleID: p.ScheduleID, TraceID: traceID,
+		Cards: cards, TaskTitle: p.NLDesc, Run: run,
+		CanonicalOutcome: &marker, CanonicalBrief: &draft,
+		CanonicalBatchID: draft.PushBatchID,
+	}, nil)
+	b.activity("FinalizeRunOutcomeV1", RunOutcomeFinalizeIn{
+		UserID: p.UserID, Run: *run,
+		Claim: types.RunOutcomeClaimV1{
+			RunOutcomeMarkerV1: marker,
+			Result:             types.RunResultContent,
+			SourceCoverage:     types.RunCompletenessComplete,
+			Processing:         types.RunCompletenessComplete,
+		},
+	}, nil)
+	return b.complete()
+}
+
+func TestPushPipelineWorkflow_ReplayStructuredInsightV1HappyPath(t *testing.T) {
+	execution := sdkworkflow.Execution{
+		ID:    "wf-task-p2a-replay",
+		RunID: "00000000-0000-4000-8000-000000000105",
+	}
+	if err := replayWithExecution(
+		t, structuredInsightV1HappyPathHistory(t, execution), execution,
+	); err != nil {
+		t.Fatalf("P2-A structured history must replay exactly: %v", err)
+	}
+}
+
 func TestPushPipelineWorkflow_ReplayCompiledV1RejectsPrepareMutation(t *testing.T) {
 	execution := sdkworkflow.Execution{
 		ID: "wf-task-c1b-replay", RunID: "00000000-0000-4000-8000-000000000101",

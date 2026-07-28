@@ -125,6 +125,131 @@ func TestCanonicalBriefStagePromotesAtomicallyAndReplays(t *testing.T) {
 	}
 }
 
+func TestStructuredBriefStageFirstWriteReplayAndConflict(t *testing.T) {
+	f := newCanonicalBriefFixture(t, 2)
+	marker, err := f.base.st.CreatePendingRunOutcomeV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generatedAt := time.Date(
+		2026, 7, 28, 1, 2, 3, 456000, time.UTC)
+	order := []int64{f.deliveryID[1], f.deliveryID[0]}
+	structured := make(map[int64]types.StructuredInsightV1, len(order))
+	evidence := make(map[int64]map[string]string, len(order))
+	for index, deliveryID := range f.deliveryID {
+		sourceText := fmt.Sprintf("verified excerpt %d", index)
+		if _, err := f.base.st.pool.Exec(t.Context(),
+			`UPDATE content_items SET content=$1 WHERE id=$2`,
+			sourceText, f.contentID[index]); err != nil {
+			t.Fatal(err)
+		}
+		evidence[deliveryID] = map[string]string{"source-1": sourceText}
+		value, err := types.SealStructuredInsightEvidenceV1(
+			types.StructuredInsightV1{
+				SchemaVersion: types.StructuredInsightSchemaVersionV1,
+				BodyMD:        f.bodyMD[index], WhatChanged: "change",
+				WhyItMatters: "reason", ImportanceReason: "evidence",
+				Claims: []types.StructuredClaimV1{{
+					Text: "claim", Excerpt: sourceText,
+					SourceRefs: []string{"source-1"},
+				}},
+			}, evidence[deliveryID])
+		if err != nil {
+			t.Fatal(err)
+		}
+		structured[deliveryID] = value
+	}
+	draft, err := f.base.st.PrepareBriefDraftV2(
+		t.Context(), f.identity, f.ref, marker,
+		f.batchID, generatedAt, order, structured, evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, insight := range draft.Insights {
+		if insight.Structured == nil ||
+			insight.Structured.BodyMD != insight.BodyMD {
+			t.Fatalf("structured draft lost projection: %+v", insight)
+		}
+	}
+	replayed, err := f.base.st.PrepareBriefDraftV2(
+		t.Context(), f.identity, f.ref, marker,
+		f.batchID, generatedAt, order, structured, evidence)
+	if err != nil {
+		t.Fatalf("exact structured replay failed: %v", err)
+	}
+	firstDigest, _ := draft.RequestDigest()
+	replayDigest, _ := replayed.RequestDigest()
+	if firstDigest != replayDigest {
+		t.Fatalf("structured replay digest = %q, want %q",
+			replayDigest, firstDigest)
+	}
+	changed := make(map[int64]types.StructuredInsightV1, len(structured))
+	for deliveryID, insight := range structured {
+		changed[deliveryID] = insight
+	}
+	mutated := changed[order[0]]
+	mutated.WhatChanged = "different terminal claim"
+	changed[order[0]] = mutated
+	if _, err := f.base.st.PrepareBriefDraftV2(
+		t.Context(), f.identity, f.ref, marker,
+		f.batchID, generatedAt, order, changed, evidence,
+	); err == nil {
+		t.Fatal("structured stage replay admitted different semantics")
+	}
+	forged := make(map[int64]types.StructuredInsightV1, len(structured))
+	for deliveryID, insight := range structured {
+		insight.Claims = append([]types.StructuredClaimV1(nil), insight.Claims...)
+		for index := range insight.Claims {
+			insight.Claims[index].SourceRefs = append(
+				[]string(nil), insight.Claims[index].SourceRefs...)
+		}
+		forged[deliveryID] = insight
+	}
+	target := order[0]
+	forgedValue := forged[target]
+	forgedValue.Claims[0].SourceRefs = []string{"forged"}
+	forgedValue, err = types.SealStructuredInsightEvidenceV1(
+		forgedValue, map[string]string{
+			"forged": forgedValue.Claims[0].Excerpt,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged[target] = forgedValue
+	if _, err := f.base.st.PrepareBriefDraftV2(
+		t.Context(), f.identity, f.ref, marker,
+		f.batchID, generatedAt, order, forged, evidence,
+	); err == nil {
+		t.Fatal("structured stage admitted forged source provenance")
+	}
+	if _, err := f.base.st.PrepareBriefDraftV1(
+		t.Context(), f.identity, f.ref, marker,
+		f.batchID, generatedAt, order,
+	); err == nil {
+		t.Fatal("legacy replay erased structured semantics")
+	}
+	claim := types.RunOutcomeClaimV1{
+		RunOutcomeMarkerV1: marker,
+		Result:             types.RunResultContent,
+		SourceCoverage:     types.RunCompletenessComplete,
+		Processing:         types.RunCompletenessComplete,
+	}
+	if _, err := f.base.st.FinalizeRunOutcomeClaimV1(
+		t.Context(), f.identity, f.ref, claim); err != nil {
+		t.Fatal(err)
+	}
+	brief, found, err := f.base.st.LoadBriefV1(
+		t.Context(), f.identity, f.ref)
+	if err != nil || !found {
+		t.Fatalf("load structured Brief: found=%t err=%v", found, err)
+	}
+	if brief.Insights[0].Structured == nil ||
+		brief.Insights[0].Structured.WhatChanged != "change" {
+		t.Fatalf("promoted structured Brief = %+v", brief)
+	}
+}
+
 func TestCanonicalBriefStageAbortsWithNonContentOutcome(t *testing.T) {
 	f := newCanonicalBriefFixture(t, 1)
 	marker, err := f.base.st.CreatePendingRunOutcomeV1(

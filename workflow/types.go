@@ -80,19 +80,26 @@ const CompiledRuntimeRunOutcomeV1 = "compiled-snapshot/v1+run-outcome/v1"
 // already-started P1-B histories from acquiring a new Activity command.
 const CompiledRuntimeCanonicalBriefV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1"
 
+// CompiledRuntimeStructuredInsightV1 adds Phase 2-A's one-call structured
+// CardGen policy and optional immutable Insight extension.
+const CompiledRuntimeStructuredInsightV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+structured-insight/v1"
+
 func IsCompiledRuntimeV1(version string) bool {
 	return version == CompiledRuntimeSnapshotV1 ||
 		version == CompiledRuntimeRunOutcomeV1 ||
-		version == CompiledRuntimeCanonicalBriefV1
+		version == CompiledRuntimeCanonicalBriefV1 ||
+		version == CompiledRuntimeStructuredInsightV1
 }
 
 func HasRunOutcomeV1(version string) bool {
 	return version == CompiledRuntimeRunOutcomeV1 ||
-		version == CompiledRuntimeCanonicalBriefV1
+		version == CompiledRuntimeCanonicalBriefV1 ||
+		version == CompiledRuntimeStructuredInsightV1
 }
 
 func HasCanonicalBriefV1(version string) bool {
-	return version == CompiledRuntimeCanonicalBriefV1
+	return version == CompiledRuntimeCanonicalBriefV1 ||
+		version == CompiledRuntimeStructuredInsightV1
 }
 
 // CompiledRunInputV1 carries the trusted stable scope copied from the Schedule
@@ -128,4 +135,8 @@ type GeneratedCard struct {
 	// 会让停在 CardGen 之后的 in-flight workflow 重放时解出空正文、静默推空卡
 	// （契约 §8.2 重放兼容）。
 	BodyMD string `json:"card_json"`
+	// Structured is absent on every historical/runtime-v1 payload. The
+	// omitempty tag keeps their encoded wire shape stable; a future versioned
+	// CardGen Activity may populate it without changing legacy replay.
+	Structured *types.StructuredInsightV1 `json:"structured,omitempty"`
 }

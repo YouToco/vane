@@ -11,11 +11,19 @@ import (
 
 // RendererVersionV1 identifies the deterministic card-generation user-prompt
 // renderer retained for historical V1 run snapshots.
-const RendererVersionV1 = "cardgen.render/v1"
+const (
+	RendererVersionV1 = "cardgen.render/v1"
+	RendererVersionV2 = "cardgen.render/v2"
+)
 
 // PolicyV1 is a validated card-generation execution policy. Private fields
 // prevent callers from bypassing PreparePolicyV1 with a partial policy.
 type PolicyV1 struct {
+	isPrepared bool
+	execution  cardExecutionV1
+}
+
+type PolicyV2 struct {
 	isPrepared bool
 	execution  cardExecutionV1
 }
@@ -58,6 +66,31 @@ func PrepareCompiledPolicyV1(
 	return policy, nil
 }
 
+func PrepareCompiledPolicyV2(
+	prompts runtimepolicy.PromptPolicyV1,
+	models runtimepolicy.ModelPolicyV1,
+	quotas runtimepolicy.QuotaPolicyV1,
+	client *llm.Client,
+) (PolicyV2, error) {
+	if client == nil {
+		return PolicyV2{}, fmt.Errorf("%w: cardgen model executor is missing", runtimepolicy.ErrInvalidPolicy)
+	}
+	policy, err := PreparePolicyV2(prompts, models)
+	if err != nil {
+		return PolicyV2{}, err
+	}
+	if err := quotas.Validate(); err != nil {
+		return PolicyV2{}, fmt.Errorf("cardgen: validate quota policy v2: %w", err)
+	}
+	quota, ok := quotas.Bucket("llm_tokens")
+	if !ok {
+		return PolicyV2{}, fmt.Errorf("%w: cardgen llm quota is missing", runtimepolicy.ErrInvalidPolicy)
+	}
+	policy.execution.quotaRule = &quota
+	policy.execution.client = client
+	return policy, nil
+}
+
 // CurrentPromptStageV1 returns the exact prompt and renderer used by legacy
 // card generation today.
 func CurrentPromptStageV1() runtimepolicy.PromptStageV1 {
@@ -76,6 +109,50 @@ func CurrentModelCallV1(model string) runtimepolicy.ModelCallV1 {
 		MaxTokens:       400,
 		DisableThinking: true,
 	}
+}
+
+func StructuredPromptStageV2() runtimepolicy.PromptStageV1 {
+	return runtimepolicy.PromptStageV1{
+		SystemPrompt:    structuredSystemPromptV1,
+		RendererVersion: RendererVersionV2,
+	}
+}
+
+func StructuredModelCallV2(model string) runtimepolicy.ModelCallV1 {
+	return runtimepolicy.ModelCallV1{
+		Stage: runtimepolicy.ModelStageCardGen, Model: model,
+		Temperature: 0.2, MaxTokens: 900, DisableThinking: true,
+	}
+}
+
+func PreparePolicyV2(
+	prompts runtimepolicy.PromptPolicyV1,
+	models runtimepolicy.ModelPolicyV1,
+) (PolicyV2, error) {
+	if err := prompts.Validate(); err != nil {
+		return PolicyV2{}, fmt.Errorf("cardgen: validate prompt policy v2: %w", err)
+	}
+	if err := models.Validate(); err != nil {
+		return PolicyV2{}, fmt.Errorf("cardgen: validate model policy v2: %w", err)
+	}
+	if prompts.CardGen.RendererVersion != RendererVersionV2 {
+		return PolicyV2{}, fmt.Errorf("%w: cardgen renderer version is unsupported",
+			runtimepolicy.ErrInvalidPolicy)
+	}
+	call, ok := models.Call(runtimepolicy.ModelStageCardGen)
+	if !ok {
+		return PolicyV2{}, fmt.Errorf("%w: cardgen model stage is missing",
+			runtimepolicy.ErrInvalidPolicy)
+	}
+	return PolicyV2{
+		isPrepared: true,
+		execution: cardExecutionV1{
+			systemPrompt: prompts.CardGen.SystemPrompt, model: call.Model,
+			temperature: float32(call.Temperature), maxTokens: call.MaxTokens,
+			disableThinking:        call.DisableThinking,
+			taskInstructionEnabled: prompts.TaskInstructionEnabled,
+		},
+	}, nil
 }
 
 // PreparePolicyV1 validates and narrows a complete snapshot policy to the

@@ -32,8 +32,28 @@ type TaskBriefQuery struct {
 // state projected onto Feishu cards. Feedback is intentionally not part of the
 // immutable Brief digest.
 type TaskBriefInsightV1 struct {
-	types.InsightV1
-	Feedback TaskBriefFeedbackStateV1 `json:"feedback"`
+	ID           int64                         `json:"id"`
+	RankPosition int                           `json:"rank_position"`
+	Title        string                        `json:"title"`
+	BodyMD       string                        `json:"body_md"`
+	SourceTitle  string                        `json:"source_title"`
+	SourceURL    string                        `json:"source_url"`
+	PublishedAt  *time.Time                    `json:"published_at,omitempty"`
+	DiscoveredAt time.Time                     `json:"discovered_at"`
+	Structured   *TaskBriefStructuredInsightV1 `json:"structured,omitempty"`
+	Feedback     TaskBriefFeedbackStateV1      `json:"feedback"`
+}
+
+// TaskBriefStructuredInsightV1 deliberately omits the internal evidence
+// digest. Readers receive the verified claims and excerpts, not a fingerprint
+// of private source body bytes.
+type TaskBriefStructuredInsightV1 struct {
+	SchemaVersion    string                    `json:"schema_version"`
+	BodyMD           string                    `json:"body_md"`
+	WhatChanged      string                    `json:"what_changed"`
+	WhyItMatters     string                    `json:"why_it_matters"`
+	ImportanceReason string                    `json:"importance_reason"`
+	Claims           []types.StructuredClaimV1 `json:"claims"`
 }
 
 type TaskBriefFeedbackStateV1 struct {
@@ -304,9 +324,19 @@ func (s *Store) ListTaskBriefsV1(
 			Insights: make([]TaskBriefInsightV1, len(brief.Insights)),
 		})
 		for i := range brief.Insights {
-			page.Items[len(page.Items)-1].Insights[i] = TaskBriefInsightV1{
-				InsightV1: brief.Insights[i],
+			frozen := brief.Insights[i]
+			projected := TaskBriefInsightV1{
+				ID: frozen.ID, RankPosition: frozen.RankPosition,
+				Title: frozen.Title, BodyMD: frozen.BodyMD,
+				SourceTitle: frozen.SourceTitle, SourceURL: frozen.SourceURL,
+				PublishedAt:  frozen.PublishedAt,
+				DiscoveredAt: frozen.DiscoveredAt,
 			}
+			if frozen.Structured != nil {
+				projected.Structured = projectTaskBriefStructuredInsightV1(
+					frozen.Structured)
+			}
+			page.Items[len(page.Items)-1].Insights[i] = projected
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -335,6 +365,24 @@ func (s *Store) ListTaskBriefsV1(
 		return TaskBriefPageV1{}, briefFeedDBError("提交任务简报读取", err)
 	}
 	return page, nil
+}
+
+func projectTaskBriefStructuredInsightV1(
+	frozen *types.StructuredInsightV1,
+) *TaskBriefStructuredInsightV1 {
+	if frozen == nil {
+		return nil
+	}
+	return &TaskBriefStructuredInsightV1{
+		SchemaVersion:    frozen.SchemaVersion,
+		BodyMD:           frozen.BodyMD,
+		WhatChanged:      frozen.WhatChanged,
+		WhyItMatters:     frozen.WhyItMatters,
+		ImportanceReason: frozen.ImportanceReason,
+		// Reader JSON always uses [] for zero claims. Older frozen payloads
+		// and body-only fallback legitimately carry a nil slice.
+		Claims: append([]types.StructuredClaimV1{}, frozen.Claims...),
+	}
 }
 
 func trimBriefFeedPageV1(

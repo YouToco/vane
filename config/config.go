@@ -139,6 +139,16 @@ type PipelineConfig struct {
 	CanonicalBriefEnabled          bool   `mapstructure:"canonical_brief_enabled"`
 	CanonicalBriefCanaryScheduleID string `mapstructure:"canonical_brief_canary_schedule_id"`
 	CanonicalBriefAllowAll         bool   `mapstructure:"canonical_brief_allow_all"`
+	// StructuredInsight* is Phase 2-A's independent CardGen/Brief rollout.
+	StructuredInsightEnabled          bool   `mapstructure:"structured_insight_enabled"`
+	StructuredInsightCanaryScheduleID string `mapstructure:"structured_insight_canary_schedule_id"`
+	StructuredInsightAllowAll         bool   `mapstructure:"structured_insight_allow_all"`
+	// StructuredInsightRenderer* is a separate authority key. Generation may
+	// only select tasks inside this scope; already-frozen Briefs remain readable
+	// after either rollout is disabled.
+	StructuredInsightRendererEnabled          bool   `mapstructure:"structured_insight_renderer_enabled"`
+	StructuredInsightRendererCanaryScheduleID string `mapstructure:"structured_insight_renderer_canary_schedule_id"`
+	StructuredInsightRendererAllowAll         bool   `mapstructure:"structured_insight_renderer_allow_all"`
 	// CanonicalBriefRendererCanaryScheduleID is P1-E's independent Feishu
 	// content-authority switch. Empty is the complete rollback state.
 	CanonicalBriefRendererCanaryScheduleID string `mapstructure:"canonical_brief_renderer_canary_schedule_id"`
@@ -329,6 +339,12 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.canonical_brief_enabled", false)
 	v.SetDefault("pipeline.canonical_brief_canary_schedule_id", "")
 	v.SetDefault("pipeline.canonical_brief_allow_all", false)
+	v.SetDefault("pipeline.structured_insight_enabled", false)
+	v.SetDefault("pipeline.structured_insight_canary_schedule_id", "")
+	v.SetDefault("pipeline.structured_insight_allow_all", false)
+	v.SetDefault("pipeline.structured_insight_renderer_enabled", false)
+	v.SetDefault("pipeline.structured_insight_renderer_canary_schedule_id", "")
+	v.SetDefault("pipeline.structured_insight_renderer_allow_all", false)
 	v.SetDefault("pipeline.canonical_brief_renderer_canary_schedule_id", "")
 	v.SetDefault("pipeline.snapshot_v2_shadow_canary_schedule_id", "")
 	v.SetDefault("pipeline.snapshot_v2_read_audit_canary_schedule_id", "")
@@ -465,6 +481,79 @@ func (c *Config) Validate() error {
 			runOutcomeCanaryID != canonicalBriefCanaryID {
 			return errors.New(
 				"config: canonical brief canary 必须位于 run outcome rollout")
+		}
+	}
+	rawStructuredInsightCanaryID :=
+		c.Pipeline.StructuredInsightCanaryScheduleID
+	structuredInsightCanaryID :=
+		strings.TrimSpace(rawStructuredInsightCanaryID)
+	if c.Pipeline.StructuredInsightEnabled &&
+		rawStructuredInsightCanaryID != "" &&
+		structuredInsightCanaryID == "" {
+		return errors.New(
+			"config: pipeline.structured_insight_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.StructuredInsightCanaryScheduleID = structuredInsightCanaryID
+	rawStructuredRendererCanaryID :=
+		c.Pipeline.StructuredInsightRendererCanaryScheduleID
+	structuredRendererCanaryID :=
+		strings.TrimSpace(rawStructuredRendererCanaryID)
+	if c.Pipeline.StructuredInsightRendererEnabled &&
+		rawStructuredRendererCanaryID != "" &&
+		structuredRendererCanaryID == "" {
+		return errors.New(
+			"config: pipeline.structured_insight_renderer_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.StructuredInsightRendererCanaryScheduleID =
+		structuredRendererCanaryID
+	if c.Pipeline.StructuredInsightRendererEnabled {
+		if structuredRendererCanaryID == "" &&
+			!c.Pipeline.StructuredInsightRendererAllowAll {
+			return errors.New(
+				"config: 全量启用 structured insight renderer 必须显式设置 allow_all=true")
+		}
+		if structuredRendererCanaryID != "" &&
+			c.Pipeline.StructuredInsightRendererAllowAll {
+			return errors.New(
+				"config: structured insight renderer canary 与 allow_all 不能同时启用")
+		}
+		canonicalRendererID := strings.TrimSpace(
+			c.Pipeline.CanonicalBriefRendererCanaryScheduleID)
+		if c.Pipeline.StructuredInsightRendererAllowAll ||
+			structuredRendererCanaryID != canonicalRendererID {
+			return errors.New(
+				"config: structured insight renderer 必须位于 exact canonical Brief renderer canary")
+		}
+	}
+	if c.Pipeline.StructuredInsightEnabled {
+		if !c.Pipeline.CanonicalBriefEnabled {
+			return errors.New(
+				"config: structured insight 要求 canonical brief 已启用")
+		}
+		if structuredInsightCanaryID == "" &&
+			!c.Pipeline.StructuredInsightAllowAll {
+			return errors.New(
+				"config: 全量启用 structured insight 必须显式设置 pipeline.structured_insight_allow_all=true")
+		}
+		if structuredInsightCanaryID != "" &&
+			c.Pipeline.StructuredInsightAllowAll {
+			return errors.New(
+				"config: structured insight 单任务 canary 与 allow_all 不能同时启用")
+		}
+		if structuredInsightCanaryID != "" &&
+			!c.Pipeline.CanonicalBriefAllowAll &&
+			canonicalBriefCanaryID != structuredInsightCanaryID {
+			return errors.New(
+				"config: structured insight canary 必须位于 canonical brief rollout")
+		}
+		if !c.Pipeline.StructuredInsightRendererEnabled ||
+			c.Pipeline.StructuredInsightAllowAll &&
+				!c.Pipeline.StructuredInsightRendererAllowAll ||
+			structuredInsightCanaryID != "" &&
+				!c.Pipeline.StructuredInsightRendererAllowAll &&
+				structuredInsightCanaryID != structuredRendererCanaryID {
+			return errors.New(
+				"config: structured insight generation 必须位于独立 renderer rollout")
 		}
 	}
 	rawCanonicalRendererCanaryID :=

@@ -29,13 +29,18 @@ func TestCompiledSnapshotV2AuditRouterCoversEveryCompiledActivity(t *testing.T) 
 		}
 	}
 	for _, name := range []string{
-		"EvolveProfile", "Fetch", "Dedup", "Score", "Select", "CardGen",
+		"EvolveProfile", "Fetch", "Dedup", "Score", "Select", "cardGen",
 		"RecordEmptyBatch", "Push", "NotifyEmptyResult",
 	} {
 		if got := countCallsInFunction(
 			functions[name], "loadAuthoritativeCompiledRun"); got != 1 {
 			t.Errorf("%s loadAuthoritativeCompiledRun calls = %d, want 1",
 				name, got)
+		}
+	}
+	for _, name := range []string{"CardGen", "CardGenOutcomeV2"} {
+		if got := countCallsInFunction(functions[name], "cardGen"); got != 1 {
+			t.Errorf("%s cardGen router calls = %d, want 1", name, got)
 		}
 	}
 	if got := countCallsInFunction(

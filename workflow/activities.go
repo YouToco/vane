@@ -143,6 +143,10 @@ type compiledCardGeneratorV1 interface {
 	GenerateWithPolicyV1(context.Context, int64, int64, types.ScoredItem, string, string, cardgenpkg.PolicyV1, func(context.Context, float64) error) (string, error)
 }
 
+type compiledCardGeneratorV2 interface {
+	GenerateStructuredWithPolicyV2(context.Context, int64, int64, types.ScoredItem, string, string, cardgenpkg.PolicyV2, func(context.Context, float64) error) (types.StructuredInsightV1, error)
+}
+
 // ProfileEvolver 画像演化器（生产实现 evolver.Evolver）：推送前批量消费该用户
 // 的新反馈、演化画像 summary/tags（Boss 拍板①：演化随推送批量，非反馈即时）。
 type ProfileEvolver interface {
@@ -309,6 +313,15 @@ type CanonicalBriefStoreV1 interface {
 	) error
 }
 
+type CanonicalBriefStructuredStoreV1 interface {
+	PrepareBriefDraftV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRef,
+		types.RunOutcomeMarkerV1, int64, time.Time, []int64,
+		map[int64]types.StructuredInsightV1,
+		map[int64]map[string]string,
+	) (types.BriefDraftV1, error)
+}
+
 type CompiledRunSnapshotShadowV2Store interface {
 	CreateOrGetCompiledRunSnapshotShadowV2(
 		context.Context, types.RunIdentity, runtimepolicy.BundleV1,
@@ -413,6 +426,7 @@ type Activities struct {
 	runOutcomeStore                  RunOutcomeStoreV1
 	canonicalBriefStore              CanonicalBriefStoreV1
 	buildCompiledPolicyV1            CompiledPolicyBuilderV1
+	buildStructuredPolicyV1          CompiledPolicyBuilderV1
 	compiledModelResolverV1          CompiledModelResolverV1
 	compiledShadowStoreV2            CompiledRunSnapshotShadowV2Store
 	snapshotV2ShadowCanaryTaskID     string
@@ -507,6 +521,16 @@ func WithCompiledRuntimeV1(
 		a.compiledStore = st
 		a.buildCompiledPolicyV1 = builder
 		a.compiledModelResolverV1 = modelResolver
+	}
+}
+
+// WithStructuredInsightRuntimeV1 installs Phase 2-A's alternate immutable
+// policy builder. It is selected only by the dedicated durable runtime label.
+func WithStructuredInsightRuntimeV1(
+	builder CompiledPolicyBuilderV1,
+) ActivitiesOption {
+	return func(a *Activities) {
+		a.buildStructuredPolicyV1 = builder
 	}
 }
 
@@ -904,7 +928,16 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 	}
 	if !found {
 		observationRollout := a.observationRolloutForTask(p.ScheduleID)
-		policy, buildErr := a.buildCompiledPolicyV1(
+		builder := a.buildCompiledPolicyV1
+		if p.RuntimeVersion == CompiledRuntimeStructuredInsightV1 {
+			if a.buildStructuredPolicyV1 == nil {
+				return PrepareRunResult{}, nonRetryable(types.NewAppError(
+					types.CodeInternal,
+					"structured Insight runtime policy is not configured", nil))
+			}
+			builder = a.buildStructuredPolicyV1
+		}
+		policy, buildErr := builder(
 			ctx, p.TenantID, a.taskInstructionEnabled(p.ScheduleID))
 		if buildErr != nil {
 			var appErr *types.AppError
@@ -1146,9 +1179,25 @@ func (a *Activities) PrepareCanonicalBriefV1(
 			BatchID: batchID, Empty: true,
 		}, nil
 	}
-	draft, err := a.canonicalBriefStore.PrepareBriefDraftV1(
-		ctx, expected, in.Run.Snapshot, in.Marker, batchID,
-		in.GeneratedAt, plan.orderedDeliveryIDs)
+	var draft types.BriefDraftV1
+	if len(plan.structuredByDelivery) > 0 {
+		structuredStore, ok :=
+			a.canonicalBriefStore.(CanonicalBriefStructuredStoreV1)
+		if !ok {
+			return CanonicalBriefPrepareResult{}, nonRetryable(
+				types.NewAppError(types.CodeInternal,
+					"structured Brief store is unsupported", nil))
+		}
+		draft, err = structuredStore.PrepareBriefDraftV2(
+			ctx, expected, in.Run.Snapshot, in.Marker, batchID,
+			in.GeneratedAt, plan.orderedDeliveryIDs,
+			plan.structuredByDelivery,
+			plan.structuredEvidenceByDelivery)
+	} else {
+		draft, err = a.canonicalBriefStore.PrepareBriefDraftV1(
+			ctx, expected, in.Run.Snapshot, in.Marker, batchID,
+			in.GeneratedAt, plan.orderedDeliveryIDs)
+	}
 	if err != nil {
 		return CanonicalBriefPrepareResult{}, retryableOrNot(err)
 	}
@@ -2858,6 +2907,14 @@ func (a *Activities) Select(ctx context.Context, in SelectIn) ([]types.ScoredIte
 // （Push 按本切片顺序拼卡），而 Score 的产出还要过一遍 RankTopN 重排。
 // 换句话说，这里若按完成先后收集，同一批内容每次推送的卡面顺序都会不一样。
 func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard, error) {
+	return a.cardGen(ctx, in, false)
+}
+
+func (a *Activities) cardGen(
+	ctx context.Context,
+	in CardGenIn,
+	structured bool,
+) ([]GeneratedCard, error) {
 	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
 		return nil, retryableOrNot(err)
@@ -2869,20 +2926,34 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 	taskInstruction := ""
 	var compiledConsumer compiledCardGeneratorV1
 	var compiledPolicy cardgenpkg.PolicyV1
+	var structuredConsumer compiledCardGeneratorV2
+	var structuredPolicy cardgenpkg.PolicyV2
 	if compiled {
 		modelClient, err := a.resolveCompiledModelPolicyV1(snapshot.Policy.ModelPolicy)
 		if err != nil {
 			return nil, retryableOrNot(err)
 		}
-		var ok bool
-		compiledConsumer, ok = a.cardgen.(compiledCardGeneratorV1)
-		if !ok {
-			return nil, nonRetryable(types.NewAppError(types.CodeInternal,
-				"compiled card generator v1 is unsupported", nil))
+		if structured {
+			var ok bool
+			structuredConsumer, ok = a.cardgen.(compiledCardGeneratorV2)
+			if !ok {
+				return nil, nonRetryable(types.NewAppError(types.CodeInternal,
+					"compiled card generator v2 is unsupported", nil))
+			}
+			structuredPolicy, err = cardgenpkg.PrepareCompiledPolicyV2(
+				snapshot.Policy.PromptPolicy, snapshot.Policy.ModelPolicy,
+				snapshot.Policy.QuotaPolicy, modelClient)
+		} else {
+			var ok bool
+			compiledConsumer, ok = a.cardgen.(compiledCardGeneratorV1)
+			if !ok {
+				return nil, nonRetryable(types.NewAppError(types.CodeInternal,
+					"compiled card generator v1 is unsupported", nil))
+			}
+			compiledPolicy, err = cardgenpkg.PrepareCompiledPolicyV1(
+				snapshot.Policy.PromptPolicy, snapshot.Policy.ModelPolicy,
+				snapshot.Policy.QuotaPolicy, modelClient)
 		}
-		compiledPolicy, err = cardgenpkg.PrepareCompiledPolicyV1(
-			snapshot.Policy.PromptPolicy, snapshot.Policy.ModelPolicy,
-			snapshot.Policy.QuotaPolicy, modelClient)
 		if err != nil {
 			return nil, nonRetryable(types.NewAppError(types.CodeValidation,
 				"compiled card policy is invalid", err))
@@ -2894,6 +2965,7 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 		taskInstruction = a.loadTaskInstruction(ctx, in.UserID, in.ScheduleID, in.TraceID, "cardgen")
 	}
 	var quotaHit atomic.Bool
+	var structuredRejected atomic.Bool
 	var authorizationOnce sync.Once
 	var authorizationErr error
 	cards := mapConcurrent(ctx, in.Items, parBatchFanout,
@@ -2919,18 +2991,40 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 				return err
 			}
 			var body string
+			var structuredResult *types.StructuredInsightV1
 			var err error
 			if compiled {
-				body, err = compiledConsumer.GenerateWithPolicyV1(
-					ctx, snapshot.Definition.TenantID, in.UserID, si,
-					in.TraceID, taskInstruction, compiledPolicy, beforeSpend)
+				if structured {
+					result, generateErr := structuredConsumer.GenerateStructuredWithPolicyV2(
+						ctx, snapshot.Definition.TenantID, in.UserID, si,
+						in.TraceID, taskInstruction, structuredPolicy, beforeSpend)
+					err = generateErr
+					if generateErr == nil {
+						body = result.BodyMD
+						structuredResult = &result
+					}
+				} else {
+					body, err = compiledConsumer.GenerateWithPolicyV1(
+						ctx, snapshot.Definition.TenantID, in.UserID, si,
+						in.TraceID, taskInstruction, compiledPolicy, beforeSpend)
+				}
 			} else {
+				if structured {
+					return GeneratedCard{}, types.NewAppError(
+						types.CodeValidation,
+						"structured card generation requires compiled runtime", nil)
+				}
 				body, err = a.cardgen.Generate(ctx, in.UserID, si, in.TraceID, taskInstruction)
 			}
 			if err != nil {
+				if structured && types.CodeOf(err) == types.CodeValidation {
+					structuredRejected.Store(true)
+				}
 				return GeneratedCard{}, err
 			}
-			return GeneratedCard{Scored: si, BodyMD: body}, nil
+			return GeneratedCard{
+				Scored: si, BodyMD: body, Structured: structuredResult,
+			}, nil
 		},
 		func(si types.ScoredItem, err error) {
 			if isQuotaErr(err) {
@@ -2946,6 +3040,11 @@ func (a *Activities) CardGen(ctx context.Context, in CardGenIn) ([]GeneratedCard
 			return nil, nonRetryable(types.NewAppError(types.CodeQuotaExceeded,
 				"本租户 LLM 额度已用尽，本轮跳过出卡", nil))
 		}
+		if structuredRejected.Load() {
+			return nil, nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"structured CardGen output was rejected", nil))
+		}
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "整批卡片生成全部失败", nil)
 	}
 	return cards, nil
@@ -2955,6 +3054,20 @@ func (a *Activities) CardGenOutcomeV1(
 	ctx context.Context, in CardGenIn,
 ) (CardGenOutcomeResult, error) {
 	cards, err := a.CardGen(ctx, in)
+	if err != nil {
+		return CardGenOutcomeResult{}, err
+	}
+	processing := types.RunCompletenessComplete
+	if len(cards) != len(in.Items) {
+		processing = types.RunCompletenessPartial
+	}
+	return CardGenOutcomeResult{Cards: cards, Processing: processing}, nil
+}
+
+func (a *Activities) CardGenOutcomeV2(
+	ctx context.Context, in CardGenIn,
+) (CardGenOutcomeResult, error) {
+	cards, err := a.cardGen(ctx, in, true)
 	if err != nil {
 		return CardGenOutcomeResult{}, err
 	}
@@ -3042,10 +3155,12 @@ type plannedPushChunk struct {
 }
 
 type pushDeliveryPlan struct {
-	orderedDeliveryIDs []int64
-	pending            []pushPendingItem
-	anySent            bool
-	skippedEvents      int
+	orderedDeliveryIDs           []int64
+	structuredByDelivery         map[int64]types.StructuredInsightV1
+	structuredEvidenceByDelivery map[int64]map[string]string
+	pending                      []pushPendingItem
+	anySent                      bool
+	skippedEvents                int
 }
 
 func (a *Activities) preparePushDeliveries(
@@ -3114,6 +3229,26 @@ func (a *Activities) preparePushDeliveries(
 		}
 		plan.orderedDeliveryIDs = append(
 			plan.orderedDeliveryIDs, deliveryID)
+		if card.Structured != nil {
+			if err := card.Structured.Validate(); err != nil ||
+				card.Structured.BodyMD != card.BodyMD {
+				return pushDeliveryPlan{}, nonRetryable(types.NewAppError(
+					types.CodeValidation,
+					"structured card differs from canonical body", err))
+			}
+			if plan.structuredByDelivery == nil {
+				plan.structuredByDelivery =
+					make(map[int64]types.StructuredInsightV1)
+				plan.structuredEvidenceByDelivery =
+					make(map[int64]map[string]string)
+			}
+			plan.structuredByDelivery[deliveryID] = *card.Structured
+			plan.structuredEvidenceByDelivery[deliveryID] =
+				map[string]string{
+					"source-1": cardgenpkg.StructuredEvidenceTextV1(
+						card.Scored.Item),
+				}
+		}
 		if compiled && eventKey != "" {
 			if err := a.observationStore.BindObservedEventDeliveryV1(
 				ctx, compiledIdentity, in.Run.Snapshot,
@@ -3349,8 +3484,9 @@ func (a *Activities) canonicalBriefAuthorityItemsV1(
 		items[index] = pushPendingItem{
 			delID: insight.ID,
 			input: feedback.CardInput{
-				BodyMD: insight.BodyMD, DeliveryID: insight.ID,
-				Title: insight.Title, URL: insight.SourceURL,
+				BodyMD:     feedback.CanonicalInsightBodyMDV1(insight),
+				DeliveryID: insight.ID,
+				Title:      insight.Title, URL: insight.SourceURL,
 				SourceTitle:  insight.SourceTitle,
 				PublishedAt:  insight.PublishedAt,
 				DiscoveredAt: insight.DiscoveredAt,

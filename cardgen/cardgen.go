@@ -78,6 +78,30 @@ func (cg *CardGen) generate(
 	execution cardExecutionV1,
 	beforeSpend func(context.Context, float64) error,
 ) (string, error) {
+	body, err := cg.generateResponse(
+		ctx, tenantID, userID, item, traceID, taskInstruction,
+		execution, beforeSpend, buildCardUser,
+	)
+	if err != nil {
+		return "", err
+	}
+	if body == "" {
+		body = fallbackBody(item.Item)
+	}
+	return body, nil
+}
+
+func (cg *CardGen) generateResponse(
+	ctx context.Context,
+	tenantID int64,
+	userID int64,
+	item types.ScoredItem,
+	traceID string,
+	taskInstruction string,
+	execution cardExecutionV1,
+	beforeSpend func(context.Context, float64) error,
+	buildUser func(string, types.ContentItem) string,
+) (string, error) {
 	if !execution.taskInstructionEnabled {
 		taskInstruction = ""
 	}
@@ -87,7 +111,7 @@ func (cg *CardGen) generate(
 	} else {
 		profileHint = cg.hints.Hint(ctx, userID, traceID)
 	}
-	userPrompt := buildCardUser(profileHint, item.Item)
+	userPrompt := buildUser(profileHint, item.Item)
 	req := llm.Request{
 		System:      execution.systemPrompt,
 		User:        promptguard.AppendTaskInstruction(userPrompt, taskInstruction),
@@ -123,13 +147,7 @@ func (cg *CardGen) generate(
 	if err != nil {
 		return "", err
 	}
-
-	body := strings.TrimSpace(resp.Content)
-	if body == "" {
-		body = fallbackBody(item.Item)
-	}
-
-	return body, nil
+	return strings.TrimSpace(resp.Content), nil
 }
 
 // fallbackBody 在模型无输出时给出最小可读正文。

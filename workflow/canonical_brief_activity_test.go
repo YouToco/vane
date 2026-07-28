@@ -409,3 +409,50 @@ func TestCanonicalBriefShadowPanicDoesNotBlockLegacyRender(t *testing.T) {
 		t.Fatalf("shadow mutated legacy input: %+v", pending[0].input)
 	}
 }
+
+func TestCanonicalBriefAuthorityProjectsFrozenStructuredInsight(t *testing.T) {
+	const deliveryID int64 = 301
+	insight := types.InsightV1{
+		ID: deliveryID, RankPosition: 1,
+		Title: "canonical title", BodyMD: "compatible body",
+		SourceTitle:  "Frozen Source",
+		SourceURL:    "https://example.com/item",
+		DiscoveredAt: time.Unix(1, 0).UTC(),
+		Structured: &types.StructuredInsightV1{
+			SchemaVersion:    types.StructuredInsightSchemaVersionV1,
+			BodyMD:           "compatible body",
+			WhatChanged:      "frozen change",
+			WhyItMatters:     "frozen relevance",
+			ImportanceReason: "frozen evidence",
+		},
+	}
+	a := &Activities{
+		canonicalBriefDashboardOrigin: "https://vane.example",
+	}
+	items, meta, err := a.canonicalBriefAuthorityItemsV1(
+		&types.BriefDraftV1{
+			PushBatchID: 401, TaskID: "task-structured",
+			Insights: []types.InsightV1{insight},
+		},
+		[]pushPendingItem{{
+			delID: deliveryID,
+			input: feedback.CardInput{
+				DeliveryID: deliveryID, BodyMD: "mutable body",
+			},
+			eventKey: "event-1",
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 ||
+		items[0].input.BodyMD !=
+			feedback.CanonicalInsightBodyMDV1(insight) ||
+		items[0].input.BodyMD == insight.BodyMD {
+		t.Fatalf("structured authority items = %+v", items)
+	}
+	if meta.BatchID != 401 || meta.TotalItems != 1 ||
+		meta.WebURL != "https://vane.example/#/tasks/task-structured" {
+		t.Fatalf("canonical metadata = %+v", meta)
+	}
+}

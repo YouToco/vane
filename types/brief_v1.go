@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/url"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -15,8 +16,9 @@ import (
 )
 
 const (
-	RunOutcomeSchemaVersionV1 = "vane.run-outcome/v1"
-	BriefSchemaVersionV1      = "vane.brief/v1"
+	RunOutcomeSchemaVersionV1        = "vane.run-outcome/v1"
+	BriefSchemaVersionV1             = "vane.brief/v1"
+	StructuredInsightSchemaVersionV1 = "vane.cardgen-insight/v1"
 
 	maxBriefTaskIDBytes      = 255
 	maxBriefFailureCodeBytes = 128
@@ -27,6 +29,10 @@ const (
 	maxBriefSourceURLBytes   = 8192
 	maxBriefInsights         = 100
 	maxBriefPayloadBytes     = 32 << 20
+	maxStructuredFieldBytes  = 4096
+	maxStructuredBodyBytes   = 16 << 10
+	maxStructuredClaims      = 16
+	maxStructuredRefs        = 8
 )
 
 // RunResultV1 separates user-visible content availability from completeness.
@@ -226,14 +232,163 @@ func runOutcomeDigestEnvelope(o RunOutcomeV1) runOutcomeDigestV1 {
 // ID intentionally remains delivery_id in Phase 1 so feedback keeps one
 // identity. RankPosition is persisted and never recomputed from score or ID.
 type InsightV1 struct {
-	ID           int64      `json:"id"`
-	RankPosition int        `json:"rank_position"`
-	Title        string     `json:"title"`
-	BodyMD       string     `json:"body_md"`
-	SourceTitle  string     `json:"source_title"`
-	SourceURL    string     `json:"source_url"`
-	PublishedAt  *time.Time `json:"published_at,omitempty"`
-	DiscoveredAt time.Time  `json:"discovered_at"`
+	ID           int64                `json:"id"`
+	RankPosition int                  `json:"rank_position"`
+	Title        string               `json:"title"`
+	BodyMD       string               `json:"body_md"`
+	SourceTitle  string               `json:"source_title"`
+	SourceURL    string               `json:"source_url"`
+	PublishedAt  *time.Time           `json:"published_at,omitempty"`
+	DiscoveredAt time.Time            `json:"discovered_at"`
+	Structured   *StructuredInsightV1 `json:"structured,omitempty"`
+}
+
+type StructuredClaimV1 struct {
+	Text       string   `json:"text"`
+	Excerpt    string   `json:"excerpt"`
+	SourceRefs []string `json:"source_refs"`
+}
+
+type StructuredInsightV1 struct {
+	SchemaVersion    string              `json:"schema_version"`
+	BodyMD           string              `json:"body_md"`
+	WhatChanged      string              `json:"what_changed"`
+	WhyItMatters     string              `json:"why_it_matters"`
+	ImportanceReason string              `json:"importance_reason"`
+	Claims           []StructuredClaimV1 `json:"claims"`
+	EvidenceDigest   string              `json:"evidence_digest,omitempty"`
+}
+
+func (s StructuredInsightV1) Validate() error {
+	if s.SchemaVersion != StructuredInsightSchemaVersionV1 ||
+		!validBriefText(s.BodyMD, maxStructuredBodyBytes, false) ||
+		!validBriefText(s.WhatChanged, maxStructuredFieldBytes, true) ||
+		!validBriefText(s.WhyItMatters, maxStructuredFieldBytes, true) ||
+		!validBriefText(s.ImportanceReason, maxStructuredFieldBytes, true) {
+		return errors.New("structured insight is invalid")
+	}
+	if s.EvidenceDigest != "" && !validBriefDigest(s.EvidenceDigest) {
+		return errors.New("structured insight evidence digest is invalid")
+	}
+	present := 0
+	for _, value := range []string{s.WhatChanged, s.WhyItMatters, s.ImportanceReason} {
+		if value != "" {
+			present++
+		}
+	}
+	if present != 0 && present != 3 ||
+		len(s.Claims) > maxStructuredClaims ||
+		(len(s.Claims) > 0 && present == 0) {
+		return errors.New("structured insight projection is invalid")
+	}
+	for _, claim := range s.Claims {
+		if !validBriefText(claim.Text, maxStructuredFieldBytes, false) ||
+			!validBriefText(claim.Excerpt, maxStructuredFieldBytes, false) ||
+			len(claim.SourceRefs) == 0 || len(claim.SourceRefs) > maxStructuredRefs {
+			return errors.New("structured insight claim is invalid")
+		}
+		seen := make(map[string]struct{}, len(claim.SourceRefs))
+		for _, ref := range claim.SourceRefs {
+			if !validBriefText(ref, 255, false) {
+				return errors.New("structured insight source reference is invalid")
+			}
+			if _, exists := seen[ref]; exists {
+				return errors.New("structured insight source reference is duplicated")
+			}
+			seen[ref] = struct{}{}
+		}
+	}
+	return nil
+}
+
+type structuredEvidenceSourceDigestV1 struct {
+	Ref  string `json:"ref"`
+	Text string `json:"text"`
+}
+
+type structuredEvidenceDigestV1 struct {
+	SchemaVersion string                             `json:"schema_version"`
+	Sources       []structuredEvidenceSourceDigestV1 `json:"sources"`
+}
+
+// SealStructuredInsightEvidenceV1 binds a structured result to the exact
+// sanitized source bytes supplied to CardGen. The digest becomes part of the
+// immutable Brief payload; raw source content does not.
+func SealStructuredInsightEvidenceV1(
+	insight StructuredInsightV1,
+	sources map[string]string,
+) (StructuredInsightV1, error) {
+	insight.EvidenceDigest = ""
+	if err := insight.Validate(); err != nil {
+		return StructuredInsightV1{}, err
+	}
+	digest, err := structuredEvidenceDigest(sources)
+	if err != nil {
+		return StructuredInsightV1{}, err
+	}
+	insight.EvidenceDigest = digest
+	if err := ValidateStructuredInsightEvidenceV1(insight, sources); err != nil {
+		return StructuredInsightV1{}, err
+	}
+	return insight, nil
+}
+
+// ValidateStructuredInsightEvidenceV1 independently verifies the durable
+// evidence digest and requires every cited ref to contain the exact excerpt.
+func ValidateStructuredInsightEvidenceV1(
+	insight StructuredInsightV1,
+	sources map[string]string,
+) error {
+	if err := insight.Validate(); err != nil ||
+		!validBriefDigest(insight.EvidenceDigest) {
+		return errors.New("structured insight evidence is invalid")
+	}
+	digest, err := structuredEvidenceDigest(sources)
+	if err != nil || !equalBriefDigest(digest, insight.EvidenceDigest) {
+		return errors.New("structured insight evidence digest does not match")
+	}
+	for _, claim := range insight.Claims {
+		excerpt := normalizeStructuredEvidenceText(claim.Excerpt)
+		for _, ref := range claim.SourceRefs {
+			source, ok := sources[ref]
+			if !ok || !strings.Contains(
+				normalizeStructuredEvidenceText(source), excerpt,
+			) {
+				return errors.New(
+					"structured insight excerpt is not present in every cited source")
+			}
+		}
+	}
+	return nil
+}
+
+func structuredEvidenceDigest(sources map[string]string) (string, error) {
+	if len(sources) == 0 {
+		return "", errors.New("structured insight evidence sources are empty")
+	}
+	refs := make([]string, 0, len(sources))
+	for ref, text := range sources {
+		if !validBriefText(ref, 255, false) ||
+			!validBriefText(text, maxBriefBodyBytes, true) {
+			return "", errors.New("structured insight evidence source is invalid")
+		}
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	envelope := structuredEvidenceDigestV1{
+		SchemaVersion: StructuredInsightSchemaVersionV1,
+		Sources:       make([]structuredEvidenceSourceDigestV1, len(refs)),
+	}
+	for index, ref := range refs {
+		envelope.Sources[index] = structuredEvidenceSourceDigestV1{
+			Ref: ref, Text: sources[ref],
+		}
+	}
+	return digestJSON(envelope)
+}
+
+func normalizeStructuredEvidenceText(value string) string {
+	return strings.Join(strings.Fields(value), " ")
 }
 
 // BriefDraftV1 contains every caller-provided byte that becomes a canonical
@@ -255,6 +410,15 @@ func (d BriefDraftV1) Canonical() (BriefDraftV1, error) {
 	d.GeneratedAt = canonicalBriefTime(d.GeneratedAt)
 	d.Insights = append([]InsightV1(nil), d.Insights...)
 	for i := range d.Insights {
+		if d.Insights[i].Structured != nil {
+			structured := *d.Insights[i].Structured
+			structured.Claims = append([]StructuredClaimV1(nil), structured.Claims...)
+			for claimIndex := range structured.Claims {
+				structured.Claims[claimIndex].SourceRefs = append(
+					[]string(nil), structured.Claims[claimIndex].SourceRefs...)
+			}
+			d.Insights[i].Structured = &structured
+		}
 		d.Insights[i].DiscoveredAt = canonicalBriefTime(d.Insights[i].DiscoveredAt)
 		if d.Insights[i].PublishedAt != nil {
 			published := canonicalBriefTime(*d.Insights[i].PublishedAt)
@@ -286,6 +450,12 @@ func (d BriefDraftV1) Validate() error {
 			insight.DiscoveredAt.IsZero() ||
 			insight.DiscoveredAt != canonicalBriefTime(insight.DiscoveredAt) {
 			return errors.New("brief insight is invalid")
+		}
+		if insight.Structured != nil {
+			if err := insight.Structured.Validate(); err != nil ||
+				insight.Structured.BodyMD != insight.BodyMD {
+				return errors.New("brief structured insight is invalid")
+			}
 		}
 		if insight.PublishedAt != nil &&
 			(insight.PublishedAt.IsZero() ||

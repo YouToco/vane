@@ -208,6 +208,23 @@ func run() error {
 					TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
 				})
 			}, compiledModelResolver),
+		workflow.WithStructuredInsightRuntimeV1(
+			func(ctx context.Context, tenantID int64, taskInstructionEnabled bool) (runtimepolicy.BundleV1, error) {
+				quota, err := st.LoadQuotaRule(ctx, tenantID, store.QuotaLLMTokens)
+				if err != nil {
+					return runtimepolicy.BundleV1{}, err
+				}
+				_ = quota
+				return runtimeconfig.BuildStructuredInsightCompiledV1(
+					runtimeconfig.CurrentCompiledV1Input{
+						Model:                      cfg.LLM.Model,
+						TaskInstructionEnabled:     taskInstructionEnabled,
+						ModelEndpointGeneration:    cfg.LLM.CompiledEndpointGeneration,
+						ModelCredentialGeneration:  cfg.LLM.CompiledCredentialGeneration,
+						ExaCredentialGeneration:    cfg.Fetch.CompiledExaCredentialGeneration,
+						TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
+					})
+			}),
 		workflow.WithRunOutcomeStoreV1(st),
 		workflow.WithCanonicalBriefStoreV1(st),
 		workflow.WithCanonicalBriefRendererV1(
@@ -264,6 +281,7 @@ func run() error {
 	w.RegisterActivity(activities.Select)
 	w.RegisterActivity(activities.CardGen)
 	w.RegisterActivity(activities.CardGenOutcomeV1)
+	w.RegisterActivity(activities.CardGenOutcomeV2)
 	w.RegisterActivity(activities.RecordEmptyBatch)
 	w.RegisterActivity(activities.NotifyEmptyResult)
 	w.RegisterActivity(activities.Push)
@@ -285,6 +303,14 @@ func run() error {
 			cfg.Pipeline.CanonicalBriefEnabled,
 			cfg.Pipeline.CanonicalBriefCanaryScheduleID,
 			cfg.Pipeline.CanonicalBriefAllowAll,
+		),
+		scheduler.WithStructuredInsightRollout(
+			cfg.Pipeline.StructuredInsightEnabled,
+			cfg.Pipeline.StructuredInsightCanaryScheduleID,
+			cfg.Pipeline.StructuredInsightAllowAll,
+			cfg.Pipeline.StructuredInsightRendererEnabled,
+			cfg.Pipeline.StructuredInsightRendererCanaryScheduleID,
+			cfg.Pipeline.StructuredInsightRendererAllowAll,
 		))
 	creationCoordinator := task.NewCreationCoordinator(st, sched, slog.Default())
 	// C2b3-2c keeps definition editing dark at every ingress, but already owns

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -646,6 +647,46 @@ func (s *Store) PrepareBriefDraftV1(
 	generatedAt time.Time,
 	orderedDeliveryIDs []int64,
 ) (types.BriefDraftV1, error) {
+	return s.prepareBriefDraft(
+		ctx, expected, ref, marker, batchID, generatedAt,
+		orderedDeliveryIDs, nil)
+}
+
+func (s *Store) PrepareBriefDraftV2(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	marker types.RunOutcomeMarkerV1,
+	batchID int64,
+	generatedAt time.Time,
+	orderedDeliveryIDs []int64,
+	structuredByDelivery map[int64]types.StructuredInsightV1,
+	structuredEvidenceByDelivery map[int64]map[string]string,
+) (types.BriefDraftV1, error) {
+	if len(structuredByDelivery) == 0 ||
+		len(structuredByDelivery) != len(orderedDeliveryIDs) ||
+		len(structuredEvidenceByDelivery) != len(orderedDeliveryIDs) {
+		return types.BriefDraftV1{},
+			canonicalBriefValidationError(
+				"structured brief preparation is empty")
+	}
+	return s.prepareBriefDraft(
+		ctx, expected, ref, marker, batchID, generatedAt,
+		orderedDeliveryIDs, structuredByDelivery,
+		structuredEvidenceByDelivery)
+}
+
+func (s *Store) prepareBriefDraft(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRef,
+	marker types.RunOutcomeMarkerV1,
+	batchID int64,
+	generatedAt time.Time,
+	orderedDeliveryIDs []int64,
+	structuredByDelivery map[int64]types.StructuredInsightV1,
+	structuredEvidenceByDelivery ...map[int64]map[string]string,
+) (types.BriefDraftV1, error) {
 	if err := marker.Validate(); err != nil ||
 		marker.RunSnapshotID != ref.SnapshotID ||
 		marker.TenantID != expected.TenantID ||
@@ -669,6 +710,19 @@ func (s *Store) PrepareBriefDraftV1(
 					"brief preparation delivery identity is duplicated")
 		}
 		seen[deliveryID] = struct{}{}
+	}
+	for deliveryID, structured := range structuredByDelivery {
+		var sources map[string]string
+		if len(structuredEvidenceByDelivery) == 1 {
+			sources = structuredEvidenceByDelivery[0][deliveryID]
+		}
+		if _, exists := seen[deliveryID]; !exists ||
+			types.ValidateStructuredInsightEvidenceV1(
+				structured, sources) != nil {
+			return types.BriefDraftV1{},
+				canonicalBriefValidationError(
+					"structured brief delivery is invalid")
+		}
 	}
 
 	tx, err := s.beginCanonicalBriefTxV1(ctx, expected, ref)
@@ -718,6 +772,18 @@ func (s *Store) PrepareBriefDraftV1(
 					canonicalBriefConflictError(
 						"canonical Brief stage order already differs")
 			}
+			var expectedStructured *types.StructuredInsightV1
+			if structured, ok := structuredByDelivery[deliveryID]; ok {
+				expectedStructured = &structured
+			}
+			if !reflect.DeepEqual(
+				existing.draft.Insights[index].Structured,
+				expectedStructured,
+			) {
+				return types.BriefDraftV1{},
+					canonicalBriefConflictError(
+						"canonical Brief structured stage already differs")
+			}
 		}
 		if err := commitCanonicalBriefTxV1(
 			ctx, tx, "replay canonical Brief stage"); err != nil {
@@ -765,14 +831,19 @@ func (s *Store) PrepareBriefDraftV1(
 				canonicalBriefConflictError(
 					"brief preparation evidence is incomplete")
 		}
-		insights = append(insights, types.InsightV1{
+		insight := types.InsightV1{
 			ID: deliveryID, RankPosition: index + 1,
 			Title: stored.title, BodyMD: stored.bodyMD,
 			SourceTitle:  stored.sourceTitle,
 			SourceURL:    stored.sourceURL,
 			PublishedAt:  stored.publishedAt,
 			DiscoveredAt: stored.discoveredAt,
-		})
+		}
+		if structured, ok := structuredByDelivery[deliveryID]; ok {
+			copyStructured := structured
+			insight.Structured = &copyStructured
+		}
+		insights = append(insights, insight)
 	}
 	draft, err := (types.BriefDraftV1{
 		SchemaVersion: types.BriefSchemaVersionV1,
