@@ -17,10 +17,11 @@ import (
 )
 
 const (
-	RunOutcomeSchemaVersionV1              = "vane.run-outcome/v1"
-	BriefSchemaVersionV1                   = "vane.brief/v1"
-	StructuredInsightSchemaVersionV1       = "vane.cardgen-insight/v1"
-	ObservedEventProvenanceSchemaVersionV1 = "vane.observed-event-provenance/v1"
+	RunOutcomeSchemaVersionV1                 = "vane.run-outcome/v1"
+	BriefSchemaVersionV1                      = "vane.brief/v1"
+	StructuredInsightSchemaVersionV1          = "vane.cardgen-insight/v1"
+	ObservedEventProvenanceSchemaVersionV1    = "vane.observed-event-provenance/v1"
+	ObservedEventProvenanceMaxEvidenceBytesV1 = 256 << 10
 
 	maxBriefTaskIDBytes      = 255
 	maxBriefFailureCodeBytes = 128
@@ -660,8 +661,11 @@ func digestJSON(value any) (string, error) {
 }
 
 func digestCanonicalJSON(raw json.RawMessage) (string, error) {
-	if len(raw) == 0 || !utf8.Valid(raw) {
-		return "", errors.New("canonical JSON is empty or invalid UTF-8")
+	if len(raw) == 0 ||
+		len(raw) > ObservedEventProvenanceMaxEvidenceBytesV1 ||
+		!utf8.Valid(raw) {
+		return "", errors.New(
+			"canonical JSON is empty, oversized, or invalid UTF-8")
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.UseNumber()

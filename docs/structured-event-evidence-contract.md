@@ -46,7 +46,9 @@ matches that stored row.
 
 The evidence digest canonicalizes JSON object key order and insignificant
 whitespace. It changes when the semantic evidence value changes. Raw evidence
-JSON and content bodies are not copied into the provenance object.
+JSON and content bodies are not copied into the provenance object. The
+provenance boundary rejects evidence larger than 256 KiB before reservation
+and canonical decoding.
 
 ## Invariants
 
@@ -57,7 +59,8 @@ JSON and content bodies are not copied into the provenance object.
 4. Cross-run duplicates remain rejected unless the existing bounded stale
    takeover rules admit the new exact run.
 5. The returned provenance is loaded under exact tenant, user, task, snapshot
-   and Temporal RunID scope.
+   and Temporal RunID scope; a mismatched persisted user is a conflict even
+   when an abnormal legacy row has no delivery.
 6. Driver error chains remain behind the existing controlled database error.
 7. No Brief schema, API DTO, renderer or Temporal payload changes in 2-B0.
 

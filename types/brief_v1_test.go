@@ -321,6 +321,22 @@ func TestObservedEventProvenanceV1SealsCanonicalEvidence(t *testing.T) {
 	) {
 		t.Fatal("evidence mutation matched sealed provenance")
 	}
+	if _, err := SealObservedEventProvenanceV1(
+		42,
+		strings.Repeat("a", 64),
+		strings.Repeat("b", 64),
+		"model_release",
+		"OpenAI models",
+		occurredAt,
+		json.RawMessage(
+			`"`+strings.Repeat(
+				"x",
+				ObservedEventProvenanceMaxEvidenceBytesV1-2,
+			)+`"`,
+		),
+	); err != nil {
+		t.Fatalf("evidence at byte limit was rejected: %v", err)
+	}
 }
 
 func TestObservedEventProvenanceV1RejectsInvalidInputs(t *testing.T) {
@@ -375,6 +391,12 @@ func TestObservedEventProvenanceV1RejectsInvalidInputs(t *testing.T) {
 		nil,
 		json.RawMessage(`{"content_ids":[1]} trailing`),
 		json.RawMessage{0xff},
+		json.RawMessage(
+			`"` + strings.Repeat(
+				"x",
+				ObservedEventProvenanceMaxEvidenceBytesV1,
+			) + `"`,
+		),
 	} {
 		if _, err := SealObservedEventProvenanceV1(
 			1,

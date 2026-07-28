@@ -47,14 +47,12 @@ func TestObservedEventProvenanceV1HasZeroProductionCallers(t *testing.T) {
 				return err
 			}
 			ast.Inspect(parsed, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
+				selector, ok := node.(*ast.SelectorExpr)
 				if !ok {
 					return true
 				}
-				selector, ok := call.Fun.(*ast.SelectorExpr)
-				if ok &&
-					selector.Sel.Name ==
-						"ReserveObservedEventProvenanceV1" {
+				if selector.Sel.Name ==
+					"ReserveObservedEventProvenanceV1" {
 					callers = append(
 						callers, filepath.ToSlash(relative))
 				}
