@@ -278,8 +278,9 @@ type ObservedEventProvenanceV1 struct {
 }
 
 // SealObservedEventProvenanceV1 binds a reserved observed-event row to the
-// canonical JSON value supplied to its evidence_json column. The Store calls
-// this only after the reservation transaction has committed.
+// canonical JSON value supplied to its evidence_json column. The Store seals
+// the authoritative row inside the reservation transaction so validation can
+// still roll back, and exposes the result only after commit.
 func SealObservedEventProvenanceV1(
 	id int64,
 	policyDigest, eventKey, eventType, subject string,
