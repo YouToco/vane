@@ -92,9 +92,11 @@ bookmarks, trends, reports, default experience changes or a wider user scope.
 ### Status and rollout
 
 - Risk: S (snapshot authority, paid-call replay, immutable Brief payload)
-- Production activation: off in the first deployment
-- Migration: none
-- User-visible behavior: none while the rollout is off
+- Production activation: first deployment off probe, then the existing exact
+  compiled-task canary only; `allow_all` remains false
+- Migration: 068
+- User-visible behavior: none on quiet runs; natural non-empty evidence remains
+  the exact-task production Gate
 
 2-B1 adds a separate durable runtime label and a separate CardGen Activity
 name. Its rollout is independently default-off and must be nested inside the
@@ -102,9 +104,10 @@ existing Phase 2-A generation and renderer authority and the exact observation
 authority canary. Because observation authority is currently exact-task only,
 2-B1 `allow_all` is rejected until a later separately approved rollout design.
 The Phase 2-A exact-task canary remains selected in production until a natural
-non-empty run proves its current claims/evidence path. Deploying 2-B1 does not
-move that task to the new runtime and does not change any existing Temporal
-command sequence.
+non-empty run proves its current claims/evidence path. Deploying 2-B1 alone
+does not move that task to the new runtime; after the rollout-off probe, an
+explicit exact-task activation advances only new Temporal histories and keeps
+all previous command sequences replayable.
 
 ### Evidence inventory
 
@@ -198,4 +201,81 @@ corpus refs and provenance before stripping bodies/IDs from the Brief.
 
 2-B1 still does not authorize batch summaries, extra model calls, search,
 bookmarks, trends, reports, default experience changes, wider user scope, or
-activation before the Phase 2-A natural non-empty Gate.
+activation beyond the existing exact task before the natural non-empty Gate.
+
+## Phase 2-C contract: channel-safe event evidence projection
+
+### Status and scope
+
+- Risk: S (immutable evidence authority, user-visible citations, cross-channel
+  parity)
+- Migration: none
+- LLM/Temporal/observation/push authority: unchanged
+- Rollout: no new switch; only already-frozen event evidence can appear, and
+  new evidence is still limited by the Phase 2-B1 exact-task canary
+
+2-C exposes the inventory-owned evidence source metadata already frozen by
+2-B1. It does not reconstruct evidence from mutable content rows, copy raw
+bodies, reveal database IDs or provenance digests, or add a model call.
+Legacy, structured-body-only and Phase 2-A Briefs remain byte-for-byte readable
+and keep their current single-source presentation.
+
+### Public projection
+
+The task Brief API may add one optional `event_evidence` object to an Insight:
+
+- `schema_version`;
+- ordered `sources`, each containing only opaque `ref`, inventory title,
+  frozen source title/platform, canonical HTTP(S) URL, publication time and
+  discovery time.
+
+The API omits observed-event row ID, event key, policy/evidence/corpus digests,
+Temporal identity, content-item IDs and raw evidence bodies. It projects the
+extension only after the immutable Brief validates and every structured claim
+reference resolves to one of the exact ordered sources. A malformed sealed row
+fails the whole Brief integrity check; readers never silently display an
+unverifiable structured claim.
+
+Web renders each claim excerpt with its referenced sources and separately
+lists the complete ordered evidence set. Unknown refs, unsafe URLs or an
+invalid optional extension fail closed to the existing validated Insight
+presentation. The browser never invents refs, reparses Markdown or fetches
+mutable source metadata to fill a missing mapping.
+
+### Feishu projection
+
+The canonical Feishu renderer and every feedback callback rebuild receive the
+same ordered frozen source DTO. When present, the card shows one compact
+“evidence and originals” list and does not also render the legacy single-source
+link. Link labels are treated as untrusted text and URLs must remain canonical
+HTTP(S). Provider byte-limit chunking continues to run on the final rendered
+card; evidence cannot bypass the existing hard limit.
+
+The visible Feishu evidence list must be an exact ordered projection of the
+same source objects returned by the Web API. The channels may differ in density
+but not source identity, order, title, URL or timestamps. Feedback rebuilds
+must preserve that list from the immutable Brief rather than current source or
+content tables.
+
+### Required proof
+
+- Store/API projection tests for exact order, claim-ref resolution, optional
+  compatibility, unsafe/tampered payload rejection and absence of private
+  provenance/digest/body/ID fields;
+- Feishu initial-render and feedback-rebuild tests proving identical evidence
+  order, safe labels, no duplicate legacy link and provider-size enforcement;
+- frontend behavior tests for multi-source claim links, full evidence list,
+  unsafe URL fallback, missing-ref fallback and legacy/Phase 2-A compatibility;
+- channel contract test proving the same frozen refs, titles, URLs and times in
+  API and card projections;
+- mutation proof: dropping claim-ref resolution or rebuilding sources from
+  mutable inventory must make the corresponding test fail;
+- affected and full repository race, frontend test/typecheck/build, two
+  independent reviews, complete CI, trusted deployment and an exact-task
+  quiet-path production probe with `allow_all=false`.
+
+Natural quiet runs prove compatibility only. The exact canary remains enabled
+until a normal content run proves event evidence, canonical card and Web
+projection end to end. 2-C does not authorize batch summaries, extra model
+calls, Web feedback writes, deep research, bookmarks, search, trends, reports,
+default-experience changes or wider user scope.
