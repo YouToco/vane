@@ -85,3 +85,105 @@ canary until a natural non-empty run proves claims/evidence end to end.
 
 2-B0 does not authorize 2-B1, batch summaries, extra LLM calls, search,
 bookmarks, trends, reports, default experience changes or a wider user scope.
+
+## Phase 2-B1 contract: default-off event evidence runtime
+
+### Status and rollout
+
+- Risk: S (snapshot authority, paid-call replay, immutable Brief payload)
+- Production activation: off in the first deployment
+- Migration: none
+- User-visible behavior: none while the rollout is off
+
+2-B1 adds a separate durable runtime label and a separate CardGen Activity
+name. Its rollout is independently default-off and must be nested inside the
+existing Phase 2-A generation and renderer authority. The Phase 2-A exact-task
+canary remains selected in production until a natural non-empty run proves its
+current claims/evidence path. Deploying 2-B1 does not move that task to the new
+runtime and does not change any existing Temporal command sequence.
+
+### Evidence inventory
+
+For one qualified event, the new Activity may use only the ordered,
+duplicate-free `evidence_content_ids` frozen in that event's canonical
+`evidence_json`. The list is bounded to eight sources. Every content ID must:
+
+1. exist in the exact run snapshot's candidate inventory;
+2. have an appearance in one of the exact frozen source IDs;
+3. be loaded under the exact tenant, user, task, snapshot, WorkflowID and
+   RunID authority;
+4. retain the qualifier's order, with opaque request references
+   `source-1` through `source-N`.
+
+The model receives bounded, sanitized body text plus inventory-owned titles.
+It never receives database IDs or mutable source configuration. The Activity
+freezes, in its Temporal result, the exact bounded evidence corpus used for
+claim validation and these inventory-owned fields:
+
+- opaque source reference;
+- title and canonical source URL;
+- frozen source title and platform;
+- publication and discovery time.
+
+The CardGen result may cite any supplied opaque source reference. Every claim
+excerpt must occur in every cited source. The existing evidence digest covers
+the complete ordered ref/body corpus; a later Store step independently
+revalidates the frozen Activity result before staging the Brief.
+
+### Durable Brief binding
+
+The canonical Brief freezes an optional event-evidence extension containing:
+
+- the first-writer `ObservedEventProvenanceV1` returned by the reservation
+  transaction;
+- the ordered inventory-owned evidence source metadata;
+- the structured evidence digest already validated against the exact Activity
+  corpus.
+
+Raw evidence bodies and database content IDs are not copied into the Brief or
+its API projection. The Brief request digest covers the complete extension.
+Response-lost replay must return the byte-identical first writer; a different
+provenance, source order, source metadata or evidence digest conflicts.
+
+The reservation still occurs in the existing pre-Brief delivery-planning
+transactional seam. Rejected cross-run duplicates do not acquire a Brief row.
+Stale takeover and frozen push-effect replay keep the same first-writer event
+identity guaranteed by 2-B0.
+
+### Temporal and paid-call invariants
+
+1. Pre-2-B1 histories keep `CardGenOutcomeV2` and their existing result shape.
+2. The new runtime records a `GetVersion` marker before scheduling the new
+   Activity name and result shape.
+3. Each selected item still causes at most one paid CardGen call. The new
+   Activity keeps one Temporal attempt; ambiguous completion fails partial and
+   does not retry the paid call.
+4. Evidence loading and authority validation happen before the paid call.
+   Missing, duplicated, out-of-snapshot or over-limit evidence fails closed
+   with zero CardGen spend.
+5. Rollout disablement stops new 2-B1 histories but readers and renderers keep
+   serving already-frozen optional event evidence.
+6. No extra LLM, observation, quota, push, feedback, API route or renderer
+   authority is introduced.
+
+### Required proof
+
+- pure validation tests for evidence order, bounds, opaque refs, canonical
+  times and tamper rejection;
+- PostgreSQL 18 tests for exact snapshot membership, cross-tenant/user/run
+  denial, source drift, missing/duplicate IDs and deterministic source
+  attribution;
+- CardGen tests proving multi-source citations, excerpt validation, zero spend
+  before invalid inventory rejection and exactly one model call;
+- Brief first seal, response-lost replay, provenance/source conflict and raw
+  body/content-ID absence tests;
+- Temporal replay for pre-2-B1 structured histories and new
+  success/partial/failure histories;
+- mutation proof: replacing the first-writer provenance or allowing an
+  out-of-snapshot evidence ID must make the corresponding test fail;
+- affected and full repository race, vet, build, two independent reviews,
+  complete CI and a production zero-behavior probe with the rollout off.
+
+2-B1 still does not authorize batch summaries, extra model calls, search,
+bookmarks, trends, reports, default experience changes, wider user scope, or
+activation before the Phase 2-A natural non-empty Gate.
