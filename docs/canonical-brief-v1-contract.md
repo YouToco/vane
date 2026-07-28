@@ -1,10 +1,10 @@
 # Canonical RunOutcome / Brief V1 contract
 
-Status: P1-C exact-task canary implementation. Migration 064 adds a durable
-pre-render Brief stage. The workflow may stage only inside the nested
-compiled-runtime, RunOutcome, and durable push-effect canaries. Brief API/read
-surfaces and sending authority remain unchanged; the Brief renderer remains
-dark with zero production call points in P1-C.
+Status: P1-D authenticated Web read implementation. Migration 064 adds a
+durable pre-render Brief stage; migration 065 adds the least-privilege Brief
+reader used by the task feed. The workflow may stage only inside the nested
+compiled-runtime, RunOutcome, and durable push-effect canaries. Sending
+authority remains unchanged and the Brief renderer for Feishu remains dark.
 
 ## Identity
 
@@ -213,3 +213,43 @@ Both P1-C Temporal changes are versioned. The Prepare-result wire-version
 marker is recorded before the Prepare Activity command, so a pre-v2 execution
 can resume safely even when its history frontier is exactly the completed old
 Prepare result.
+
+## P1-D authenticated read model
+
+`GET /api/schedules/{task_id}/briefs` pages immutable whole Briefs by
+`(generated_at,id)` descending. A page boundary never splits the ranked
+insights of one Brief. The opaque V1 cursor carries and validates the exact
+task ID, timestamp, and Brief ID, so a cursor from one task is rejected on
+another task.
+
+The response also returns `latest_check` from the newest finalized RunOutcome.
+It is deliberately independent from `items[0]`: a newer quiet, failed, or
+interrupted run advances the check projection without erasing or relabeling the
+most recent non-empty Brief. Historical legacy deliveries are not guessed into
+canonical Briefs.
+
+The Store starts an exact tenant/user/task transaction, takes the shared tenant
+purge-admission root, then locks membership and schedule in the established
+task-creation order. It sets both RLS identities and enters
+`vane_brief_reader`. That NOLOGIN/NOINHERIT/NOBYPASSRLS role can read only the
+required columns of `brief_snapshots`, `task_run_outcomes`, and `feedbacks`;
+its feedback access has an additional restrictive exact-user policy. It cannot
+read deliveries, content items, sources, schedules, memberships, or any
+sequence and has no write privilege. Every payload is decoded and its complete
+relational envelope, canonical JSON bytes, request digest, payload digest, and
+exact scope are revalidated before it reaches HTTP.
+
+Feedback remains a live projection keyed by the frozen delivery/Insight ID and
+is not added to the Brief digest. The projection matches the Feishu card state:
+latest `interested|not_interested` wins, while `misjudged` and requested
+deep-dive are durable booleans; historical feedback rows are not presented as
+simultaneous current states. Web renders `body_md` without raw HTML,
+external images, credential-bearing URLs, or non-HTTP(S) links. The API and
+Web read surface do not create model calls, messages, effects, or sending
+authority.
+
+P1-D has an explicit additive deployment order: migration 065 and the backend
+route must be healthy before the Web bundle is released; rollback reverses that
+order and removes the Web bundle before the route or migration. The P1-D Web
+bundle is not compatible with a backend still at migration 064, and the
+release gate verifies the authenticated endpoint before publishing Web.

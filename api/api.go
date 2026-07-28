@@ -206,6 +206,7 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("GET /api/schedules/summary", s.handleListScheduleSummaries)
 	inner.HandleFunc("GET /api/schedules/{id}", s.handleGetScheduleDetail)
 	inner.HandleFunc("GET /api/schedules/{id}/batches", s.handleListScheduleBatches)
+	inner.HandleFunc("GET /api/schedules/{id}/briefs", s.handleListTaskBriefs)
 	inner.HandleFunc("GET /api/schedules/{id}/deliveries", s.handleListScheduleDeliveries)
 	inner.HandleFunc("POST /api/schedules/{id}/run", s.handleRunScheduleNow)
 	inner.HandleFunc("POST /api/schedules/{id}/pause", s.handlePauseSchedule)

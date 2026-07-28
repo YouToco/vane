@@ -11,9 +11,10 @@ import (
 	"testing"
 )
 
-// P1-C adds only the reviewed Stage/Finalize seam. Direct Freeze/Load, Brief
-// API reads, and renderer authority remain dark.
-func TestCanonicalBriefP1CHasOnlyScopedProductionCallPoints(t *testing.T) {
+// P1-D adds only the reviewed authenticated Brief page reader. Direct
+// Freeze/Load and renderer authority remain dark; workflow/recovery call
+// points stay pinned to the P1-C/P1-B seams.
+func TestCanonicalBriefP1DHasOnlyScopedProductionCallPoints(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate guard source")
@@ -60,6 +61,9 @@ func TestCanonicalBriefP1CHasOnlyScopedProductionCallPoints(t *testing.T) {
 		"PrepareCanonicalBriefV1": {
 			"workflow/workflow.go": true,
 			"cmd/server/main.go":   true,
+		},
+		"ListTaskBriefsV1": {
+			"api/briefs.go": true,
 		},
 	}
 	var calls []string
@@ -110,7 +114,7 @@ func TestCanonicalBriefP1CHasOnlyScopedProductionCallPoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(calls) != 0 {
-		t.Fatalf("P1-C production scope escaped: %v", calls)
+		t.Fatalf("P1-D production scope escaped: %v", calls)
 	}
 }
 
