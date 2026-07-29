@@ -19,28 +19,28 @@ const (
 // canonical user-level Tool arguments, not materialized URLs, provider
 // endpoints, credentials, or Source IDs.
 type ToolInvocationV1 struct {
-	ToolName    string          `json:"tool_name"`
-	ToolVersion string          `json:"tool_version"`
-	Arguments   json.RawMessage `json:"arguments"`
-	Digest      string          `json:"invocation_digest"`
+	ToolName            string          `json:"tool_name"`
+	ToolContractVersion string          `json:"tool_contract_version"`
+	Arguments           json.RawMessage `json:"arguments"`
+	Digest              string          `json:"invocation_digest"`
 }
 
 type toolInvocationDigestEnvelopeV1 struct {
-	SchemaVersion string          `json:"schema_version"`
-	ToolName      string          `json:"tool_name"`
-	ToolVersion   string          `json:"tool_version"`
-	Arguments     json.RawMessage `json:"arguments"`
+	SchemaVersion       string          `json:"schema_version"`
+	ToolName            string          `json:"tool_name"`
+	ToolContractVersion string          `json:"tool_contract_version"`
+	Arguments           json.RawMessage `json:"arguments"`
 }
 
 // BuildToolInvocationV1 canonicalizes arguments and seals the exact logical
-// call. ToolVersion is the implementation contract selected by the compiler;
-// changing it intentionally produces a different invocation digest.
+// call. ToolContractVersion is the logical argument/result contract selected
+// by the compiler, not a provider route or worker build revision.
 func BuildToolInvocationV1(
 	toolName, toolVersion string,
 	arguments json.RawMessage,
 ) (ToolInvocationV1, error) {
 	invocation := ToolInvocationV1{
-		ToolName: toolName, ToolVersion: toolVersion, Arguments: arguments,
+		ToolName: toolName, ToolContractVersion: toolVersion, Arguments: arguments,
 	}
 	return normalizeToolInvocationV1(invocation)
 }
@@ -55,7 +55,7 @@ func normalizeToolInvocationV1(
 	invocation ToolInvocationV1,
 ) (ToolInvocationV1, error) {
 	if !validIdentifier(invocation.ToolName, maxToolNameBytes) ||
-		!validIdentifier(invocation.ToolVersion, maxToolVersionBytes) {
+		!validIdentifier(invocation.ToolContractVersion, maxToolContractVersionBytes) {
 		return ToolInvocationV1{}, invalidState("tool invocation identity is invalid")
 	}
 	arguments, err := canonicalJSONObject(invocation.Arguments, "tool invocation arguments")
@@ -64,7 +64,7 @@ func normalizeToolInvocationV1(
 	}
 	invocation.Arguments = arguments
 	digest, err := digestToolInvocationV1(
-		invocation.ToolName, invocation.ToolVersion, invocation.Arguments)
+		invocation.ToolName, invocation.ToolContractVersion, invocation.Arguments)
 	if err != nil {
 		return ToolInvocationV1{}, err
 	}
@@ -80,10 +80,10 @@ func digestToolInvocationV1(
 	arguments json.RawMessage,
 ) (string, error) {
 	payload, err := marshalBounded(toolInvocationDigestEnvelopeV1{
-		SchemaVersion: ToolInvocationSchemaVersionV1,
-		ToolName:      toolName,
-		ToolVersion:   toolVersion,
-		Arguments:     arguments,
+		SchemaVersion:       ToolInvocationSchemaVersionV1,
+		ToolName:            toolName,
+		ToolContractVersion: toolVersion,
+		Arguments:           arguments,
 	}, maxJSONObjectBytes, "tool invocation digest envelope")
 	if err != nil {
 		return "", err

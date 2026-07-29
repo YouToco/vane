@@ -16,9 +16,8 @@ const AdaptiveStateSchemaVersionV2 = "vane.task-adaptive-state/v2"
 type InvocationStatusV1 string
 
 const (
-	InvocationStatusActive   InvocationStatusV1 = "active"
-	InvocationStatusBackoff  InvocationStatusV1 = "backoff"
-	InvocationStatusDisabled InvocationStatusV1 = "disabled"
+	InvocationStatusActive  InvocationStatusV1 = "active"
+	InvocationStatusBackoff InvocationStatusV1 = "backoff"
 )
 
 // InvocationAdaptiveStateV1 is mutable acquisition state scoped to one exact
@@ -175,7 +174,7 @@ func normalizeAdaptiveStateV2(state AdaptiveStateV2) (AdaptiveStateV2, error) {
 
 func validInvocationStatusV1(status InvocationStatusV1) bool {
 	switch status {
-	case InvocationStatusActive, InvocationStatusBackoff, InvocationStatusDisabled:
+	case InvocationStatusActive, InvocationStatusBackoff:
 		return true
 	default:
 		return false

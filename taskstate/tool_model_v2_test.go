@@ -73,7 +73,6 @@ func TestApprovedDefinitionV2ContainsToolCallsWithoutSourceModel(t *testing.T) {
 	}
 	definition, err := BuildApprovedDefinitionV2(ApprovedDefinitionInputV2{
 		TenantID: 7, UserID: 11, TaskID: "boss-watch",
-		Intent:         "持续关注这些博主的新动态",
 		NLDescription:  "每天检查并在有更新时推送",
 		SpecJSON:       json.RawMessage(`{"tz":"Asia/Shanghai","cron":"0 8 * * *"}`),
 		ScopeJSON:      json.RawMessage(`{"max_items":10}`),
@@ -103,6 +102,42 @@ func TestApprovedDefinitionV2ContainsToolCallsWithoutSourceModel(t *testing.T) {
 	if err != nil || len(decoded.ToolCalls) != 2 ||
 		decoded.ToolCalls[0].Digest != weibo.Digest {
 		t.Fatalf("V2 definition round trip failed: decoded=%+v err=%v", decoded, err)
+	}
+}
+
+func TestApprovedDefinitionV2ReaderRetainsRetiredTools(t *testing.T) {
+	current, err := BuildToolInvocationV1("web_search", "v1",
+		json.RawMessage(`{"query":"history"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := BuildApprovedDefinitionV2(ApprovedDefinitionInputV2{
+		TenantID: 7, UserID: 11, TaskID: "history",
+		NLDescription: "retain history",
+		SpecJSON:      json.RawMessage(`{}`), ScopeJSON: json.RawMessage(`{}`),
+		TaskManual: "retain the approved historical call", ToolCalls: []ToolInvocationV1{current},
+		ExecutionMode:  types.ExecutionModeCompiled,
+		DeliveryPolicy: DeliveryPolicyOwnerFeishu,
+		BudgetPolicy:   BudgetPolicyInheritTenantQuota,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired, err := BuildToolInvocationV1("retired_acquisition_tool", "v7",
+		json.RawMessage(`{"historic":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition.ToolCalls = []ToolInvocationV1{retired}
+	payload, err := EncodeApprovedDefinitionV2(definition)
+	if err != nil {
+		t.Fatalf("frozen reader must encode a structurally valid retired call: %v", err)
+	}
+	if _, err := DecodeApprovedDefinitionV2(payload); err != nil {
+		t.Fatalf("frozen reader must retain retired calls: %v", err)
+	}
+	if err := ValidateApprovedDefinitionV2ForWrite(definition); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("current writer must reject retired calls: %v", err)
 	}
 }
 
