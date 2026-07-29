@@ -71,13 +71,11 @@ func (s *Store) ListExecutiveSynthesisRecoveryCandidatesV1(
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT candidate_at,recovery_kind,outcome_id,
-		       outcome_schema_version,run_snapshot_id,tenant_id,user_id,
-		       task_id,temporal_workflow_id,temporal_run_id,
-		       reference_schema_version,reference_digest,
-		       snapshot_payload_digest,push_batch_id,receipt_status,
+		       outcome_schema_version,snapshot_reference,
+		       push_batch_id,receipt_status,
 		       profile_epoch,profile_version,profile_digest,input_digest,
 		       finalized_at
-		  FROM read_executive_synthesis_recovery_v1($1,$2,$3)`,
+		  FROM read_executive_synthesis_recovery_v2($1,$2,$3)`,
 		afterAt, afterID, limit)
 	if err != nil {
 		return nil, canonicalBriefDatabaseError(
@@ -89,19 +87,13 @@ func (s *Store) ListExecutiveSynthesisRecoveryCandidatesV1(
 		var (
 			candidate     ExecutiveSynthesisRecoveryCandidateV1
 			outcomeSchema string
+			snapshotRef   []byte
 			finalized     sql.NullTime
 		)
 		if err := rows.Scan(
 			&candidate.CandidateAt, &candidate.Kind,
 			&candidate.Marker.ID, &outcomeSchema,
-			&candidate.Marker.RunSnapshotID,
-			&candidate.Marker.TenantID, &candidate.Marker.UserID,
-			&candidate.Marker.TaskID,
-			&candidate.Identity.TemporalWorkflowID,
-			&candidate.Identity.TemporalRunID,
-			&candidate.Ref.SchemaVersion,
-			&candidate.Ref.ReferenceDigest,
-			&candidate.Ref.PayloadDigest,
+			&snapshotRef,
 			&candidate.PushBatchID, &candidate.Status,
 			&candidate.ProfileEpoch, &candidate.ProfileVersion,
 			&candidate.ProfileDigest, &candidate.InputDigest,
@@ -112,16 +104,15 @@ func (s *Store) ListExecutiveSynthesisRecoveryCandidatesV1(
 		}
 		candidate.CandidateAt = candidate.CandidateAt.Round(0).UTC().
 			Truncate(time.Microsecond)
-		candidate.Marker.SchemaVersion = outcomeSchema
-		candidate.Ref.SnapshotID = candidate.Marker.RunSnapshotID
-		candidate.Identity = types.RunIdentity{
-			TemporalWorkflowID: candidate.Identity.TemporalWorkflowID,
-			TemporalRunID:      candidate.Identity.TemporalRunID,
-			RunKind:            types.RunSnapshotKindScheduled,
-			TenantID:           candidate.Marker.TenantID,
-			UserID:             candidate.Marker.UserID,
-			TaskID:             candidate.Marker.TaskID,
+		if err := json.Unmarshal(snapshotRef, &candidate.Ref); err != nil {
+			return nil, canonicalBriefIntegrityError()
 		}
+		candidate.Identity = candidate.Ref.Identity()
+		candidate.Marker.SchemaVersion = outcomeSchema
+		candidate.Marker.RunSnapshotID = candidate.Ref.SnapshotID
+		candidate.Marker.TenantID = candidate.Ref.TenantID
+		candidate.Marker.UserID = candidate.Ref.UserID
+		candidate.Marker.TaskID = candidate.Ref.TaskID
 		if finalized.Valid {
 			value := finalized.Time.Round(0).UTC().Truncate(time.Microsecond)
 			candidate.FinalizedAt = &value
