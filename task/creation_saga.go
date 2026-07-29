@@ -1198,7 +1198,7 @@ func materializeCreationToolCalls(
 ) ([]compiledFetchTarget, error) {
 	materialized := make([]compiledFetchTarget, 0, len(calls))
 	for i, raw := range calls {
-		spec, err := decodeCreationToolCall(raw)
+		spec, toolName, toolArgs, err := decodeCreationToolCall(raw)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"task: tool_calls[%d]: %w", i, err,
@@ -1240,6 +1240,7 @@ func materializeCreationToolCalls(
 		materialized = append(materialized, compiledFetchTarget{
 			Platform: string(source.Platform), Capability: string(source.Capability),
 			Title: source.Title, URL: source.URL, Config: config,
+			ToolName: toolName, ToolArgs: toolArgs,
 		})
 	}
 	return materialized, nil
@@ -1248,39 +1249,50 @@ func materializeCreationToolCalls(
 // decodeCreationToolCall accepts one exact Agent tool invocation and delegates
 // the arguments to that tool's strict input decoder. The temporary kind field
 // exists only inside this adapter; it is not part of the model-facing contract.
-func decodeCreationToolCall(raw json.RawMessage) (acquisitiontool.Requirement, error) {
+func decodeCreationToolCall(
+	raw json.RawMessage,
+) (acquisitiontool.Requirement, string, json.RawMessage, error) {
 	var call struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
 	}
 	if err := strictjson.DecodeExact(raw, &call); err != nil {
-		return acquisitiontool.Requirement{}, err
+		return acquisitiontool.Requirement{}, "", nil, err
 	}
 	if strings.TrimSpace(call.Name) == "" || call.Name != strings.TrimSpace(call.Name) {
-		return acquisitiontool.Requirement{}, errors.New("name must be a non-empty string")
+		return acquisitiontool.Requirement{}, "", nil,
+			errors.New("name must be a non-empty string")
 	}
 	var fields map[string]json.RawMessage
 	if err := strictjson.DecodeExact(call.Arguments, &fields); err != nil || fields == nil {
 		if err == nil {
 			err = errors.New("arguments must be a non-null JSON object")
 		}
-		return acquisitiontool.Requirement{}, err
+		return acquisitiontool.Requirement{}, "", nil, err
 	}
 	if _, exists := fields["kind"]; exists {
-		return acquisitiontool.Requirement{}, errors.New(
+		return acquisitiontool.Requirement{}, "", nil, errors.New(
 			"arguments.kind is forbidden; use the enclosing Tool name",
 		)
 	}
+	canonicalArguments, err := json.Marshal(fields)
+	if err != nil {
+		return acquisitiontool.Requirement{}, "", nil, err
+	}
 	kind, err := json.Marshal(call.Name)
 	if err != nil {
-		return acquisitiontool.Requirement{}, err
+		return acquisitiontool.Requirement{}, "", nil, err
 	}
 	fields["kind"] = kind
 	flattened, err := json.Marshal(fields)
 	if err != nil {
-		return acquisitiontool.Requirement{}, err
+		return acquisitiontool.Requirement{}, "", nil, err
 	}
-	return decodeCreationFetchRequirement(flattened)
+	requirement, err := decodeCreationFetchRequirement(flattened)
+	if err != nil {
+		return acquisitiontool.Requirement{}, "", nil, err
+	}
+	return requirement, call.Name, canonicalArguments, nil
 }
 
 var creationXHSIDRe = regexp.MustCompile(`^[0-9a-f]{24}$`)

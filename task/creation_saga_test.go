@@ -578,7 +578,7 @@ func TestCreationCoordinator_ProposalCanonicalizesBeforePersistence(t *testing.T
 	}
 	command, _, err := normalizeCreateScheduleCommand(store.op.Args)
 	if err != nil || !bytes.Equal(command.LegacyToolPlanV1, json.RawMessage(
-		`{"targets":[{"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"}}]}`,
+		`{"targets":[{"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"},"tool_name":"web_search","tool_arguments":{"category":"news","query":"AI"}}]}`,
 	)) {
 		t.Fatalf("durable canonical args invalid: command=%+v err=%v", command, err)
 	}
@@ -1294,7 +1294,7 @@ func TestCreationCoordinator_ConfirmHappyPathAndTerminalReplay(t *testing.T) {
 		t.Fatalf("result=%+v phase=%q activate=%d", result, store.op.Phase, schedules.activateCalls)
 	}
 	if !bytes.Equal(store.definition.FetchPlan, json.RawMessage(
-		`{"targets":[{"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"}}]}`,
+		`{"targets":[{"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"},"tool_name":"web_search","tool_arguments":{"category":"news","query":"AI"}}]}`,
 	)) {
 		t.Fatalf("final plan=%s", store.definition.FetchPlan)
 	}

@@ -151,6 +151,8 @@ type compiledFetchTarget struct {
 	Title      string          `json:"title,omitempty"`
 	URL        string          `json:"url"`
 	Config     json.RawMessage `json:"config"`
+	ToolName   string          `json:"tool_name,omitempty"`
+	ToolArgs   json.RawMessage `json:"tool_arguments,omitempty"`
 }
 
 // Prepare seals the canonical command, materializes only the user-approved

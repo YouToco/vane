@@ -39,6 +39,8 @@ type compiledPlanTarget struct {
 	Title      string          `json:"title,omitempty"`
 	URL        string          `json:"url"`
 	Config     json.RawMessage `json:"config,omitempty"`
+	ToolName   string          `json:"tool_name,omitempty"`
+	ToolArgs   json.RawMessage `json:"tool_arguments,omitempty"`
 }
 
 // InsertPausedCompiledTaskDefinition 原子写入一份已编译的稳定监控任务。
@@ -232,6 +234,27 @@ func validatePausedCompiledTaskDefinition(
 			len(target.URL) > maxCompiledTaskTargetURLBytes {
 			return nil, compiledTaskValidationError(
 				fmt.Sprintf("fetch_plan.targets[%d].url 必须是无首尾空白的非空字符串", i), nil)
+		}
+		if (target.ToolName == "") != (len(bytes.TrimSpace(target.ToolArgs)) == 0) {
+			return nil, compiledTaskValidationError(
+				fmt.Sprintf(
+					"fetch_plan.targets[%d] 的 tool_name 与 tool_arguments 必须同时存在或同时缺失",
+					i,
+				), nil,
+			)
+		}
+		if target.ToolName != "" {
+			if strings.TrimSpace(target.ToolName) != target.ToolName ||
+				len(target.ToolName) > maxCompiledTaskTargetTextBytes ||
+				!utf8.ValidString(target.ToolName) {
+				return nil, compiledTaskValidationError(
+					fmt.Sprintf("fetch_plan.targets[%d].tool_name 非法", i), nil,
+				)
+			}
+			if err := validateJSONObject(target.ToolArgs,
+				fmt.Sprintf("fetch_plan.targets[%d].tool_arguments", i)); err != nil {
+				return nil, err
+			}
 		}
 		if _, duplicate := seenURLs[target.URL]; duplicate {
 			return nil, compiledTaskValidationError(
