@@ -57,12 +57,14 @@ Each approved Tool call retains:
 - derived provider route/configuration.
 
 Cursor, retry timing, failure count and health are keyed to that exact
-tenant/user/task/invocation digest. Two users can monitor the same blogger
-without sharing mutable state.
+tenant/user/task/invocation digest inside the existing task adaptive-state
+aggregate. Two users can monitor the same blogger without sharing mutable
+state.
 
 A run freezes the exact approved Tool calls and implementation versions it
-will execute. Content observation and evidence records point to the frozen run
-Tool invocation, not to a mutable or globally shared Source row.
+will execute inside the existing immutable run snapshot. Content observation
+and evidence records point to the run snapshot plus invocation digest, not to
+a new Tool-call entity or a mutable global row.
 
 ## Cutover sequence
 
@@ -70,9 +72,9 @@ Tool invocation, not to a mutable or globally shared Source row.
    state. Implemented in `36d5011`.
 2. **Tool-call authority.** Preserve Tool name and canonical arguments on the
    approved task head. Implemented in `61c0b0f`.
-3. **Scoped state.** Add internal task Tool-call state and frozen run Tool-call
-   storage with tenant/user/task composite constraints and RLS. Do not expose
-   them as product entities.
+3. **Scoped state.** Store invocation-digest-keyed health/cursor state in the
+   existing `task_adaptive_states` payload and freeze calls in the existing run
+   snapshot. Do not add Source or Tool-invocation entity tables.
 4. **Writer/runtime cutover.** New task creation, edit, run admission, fetch,
    health and candidate selection use only sealed/scoped Tool calls.
 5. **Evidence cutover.** Card reconstruction and evidence rendering attribute
@@ -97,11 +99,12 @@ a target; only exact run/delivery/event evidence can establish provenance.
 4. Task edits replace the approved call set without mutating an already frozen
    run.
 5. Current runtime execution writes zero rows to legacy global target tables.
-6. Every new observation/evidence row traces to the same-scope run Tool call.
+6. Every new observation/evidence row traces to the same-scope run snapshot
+   and invocation digest.
 7. Tenant purge removes private Tool-call configuration/state/evidence without
    changing another tenant.
-8. Static guards forbid Source entities, Source CRUD and current-runtime use
-   of unscoped legacy target APIs.
+8. Static guards forbid Source/Tool-invocation entity tables, Source CRUD and
+   current-runtime use of unscoped legacy target APIs.
 
 7.10-B2 is accepted only when these gates pass. A renamed or hidden Source
 entity does not satisfy the decision.
