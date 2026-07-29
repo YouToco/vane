@@ -42,6 +42,17 @@ func TestExistingPeriodicBriefRunBindingIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestPeriodicBriefIntentNeedsStartUsesDurableBinding(t *testing.T) {
+	if periodicBriefIntentNeedsStart(store.PeriodicBriefIntentV1{
+		TemporalRunID: "sealed-run",
+	}) {
+		t.Fatal("sealed intent must not call Temporal again")
+	}
+	if !periodicBriefIntentNeedsStart(store.PeriodicBriefIntentV1{}) {
+		t.Fatal("unbound intent must start or recover its Temporal workflow")
+	}
+}
+
 func TestPreviousNaturalPeriodV1UsesCalendarAcrossDST(t *testing.T) {
 	now := time.Date(2026, 3, 9, 12, 0, 0, 0, time.UTC)
 	start, end, err := previousNaturalPeriodV1(
