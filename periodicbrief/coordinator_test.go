@@ -7,6 +7,41 @@ import (
 	"github.com/YouToco/vane/store"
 )
 
+func TestExistingPeriodicBriefRunBindingIsIdempotent(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		stored    string
+		reported  string
+		wantRunID string
+		wantBind  bool
+	}{
+		{
+			name:   "sealed identity survives process restart",
+			stored: "original-run", reported: "reset-run",
+		},
+		{
+			name:     "crash window binds Temporal reported identity",
+			reported: "started-run", wantRunID: "started-run",
+			wantBind: true,
+		},
+		{
+			name:     "legacy Temporal error falls back to describe",
+			wantBind: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runID, bind := existingPeriodicBriefRunBinding(
+				test.stored, test.reported)
+			if runID != test.wantRunID || bind != test.wantBind {
+				t.Fatalf(
+					"binding=(%q,%v), want (%q,%v)",
+					runID, bind, test.wantRunID, test.wantBind,
+				)
+			}
+		})
+	}
+}
+
 func TestPreviousNaturalPeriodV1UsesCalendarAcrossDST(t *testing.T) {
 	now := time.Date(2026, 3, 9, 12, 0, 0, 0, time.UTC)
 	start, end, err := previousNaturalPeriodV1(
