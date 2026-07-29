@@ -33,6 +33,9 @@ definition edit. A separate side-effect-free semantic adjudication first routes
 the current owner turn to edit, delete, run, create, profile update, one-off
 research, or an answer-only request such as advice, a hypothetical, negation,
 or cancellation.
+Natural first-profile intake, such as directly answering with an industry,
+role, and interests, uses the same semantic route; the profile store still
+rejects overwriting an existing profile.
 Lexical matches never authorize deletion. The edit then requires a second
 independent model decision to call the bound write tool. Other explicit actions
 expose only their matching side-effect capability; unrelated writes remain

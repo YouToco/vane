@@ -113,7 +113,7 @@ const taskDefinitionEditIntentSystemPrompt = `
 - run_task：用户明确命令立即运行已有任务。
 - create_task：用户明确命令立即创建新任务。
 - one_off_search：用户明确要求一次性联网查询，不创建或修改任务。
-- update_profile：用户明确命令修改自己的行业、职业、岗位或关注标签画像。
+- update_profile：用户明确命令首次建立画像；或在画像采集对话中直接提供自己的行业、职业/岗位或关注标签，信息已经足够首次创建。已有画像由存储层拒绝覆盖。
 - answer_only：询问是否合适、利弊、影响、怎么做、假设场景、表达否定/取消/不用改，或任何含糊情况。
 
 必须理解整句话和相邻对话，不能因为出现“把/改为/可以/任务/更新”等词就推断授权。含糊时一律 answer_only。`
@@ -2601,18 +2601,21 @@ func isNaturalTaskDefinitionEditCandidate(text string) bool {
 	)
 	hasTaskAction := containsAny(normalized,
 		"删除", "删掉", "移除",
-		"立即运行", "马上运行", "现在运行",
-		"立即推送", "现在推送", "马上推送",
-		"立即检查", "现在检查", "马上检查",
-		"创建任务", "新建任务", "新增任务", "生成任务",
-		"createatask", "createtask",
-		"deletetask", "removeschedule", "runnow", "pushnow",
-	) || (hasTaskTarget && containsAny(normalized,
-		"取消", "停止", "关掉", "停掉",
-	))
+		"运行", "执行", "启动", "跑一下",
+		"创建", "新建", "新增", "生成", "建立",
+		"设一个", "设置一个", "帮我设", "做一个",
+		"取消", "停止", "关掉", "停掉", "终止",
+		"create", "delete", "remove", "run", "execute", "launch", "stop",
+	)
+	hasProfileDeclaration := classifyOwnerIntents(text).HasAny(IntentProfile) &&
+		containsAny(normalized,
+			"我是", "我在", "我的行业", "我的职业", "我的岗位",
+			"我负责", "我从事", "我关注",
+			"iam", "i'm", "iworkin", "myrole", "myjob",
+		)
 	hasCapabilityIntent := classifyOwnerIntents(text).HasAny(IntentTasks)
 	return hasCapabilityIntent || hasExplicitEdit ||
-		hasTaskContinuation || hasTaskAction
+		hasTaskContinuation || hasTaskAction || hasProfileDeclaration
 }
 
 func isNaturalTaskDefinitionEditContinuation(history []llm.ChatMessage) bool {

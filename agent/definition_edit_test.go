@@ -551,12 +551,16 @@ func TestNaturalTaskDefinitionEditCandidate(t *testing.T) {
 		{"关掉 AI 日报", true},
 		{"运行一下 AI 日报", true},
 		{"执行 AI 日报", true},
+		{"运行竞品动态", true},
+		{"执行一下竞品动态", true},
 		{"关闭 AI 日报", true},
 		{"终止 AI 日报", true},
 		{"新增一个每天监控竞品的任务", true},
 		{"帮我设一个每天九点的任务", true},
+		{"建立一个竞品洞察", true},
 		{"更新我的岗位为产品经理", true},
 		{"修改我的关注标签", true},
+		{"我在互联网行业，是产品经理，关注 AI 和机器人", true},
 		{"创建任务：每天看官方博客", true},
 	} {
 		if got := isNaturalTaskDefinitionEditCandidate(test.text); got != test.want {
@@ -876,7 +880,7 @@ func TestTaskEditOtherOperationKeepsMatchingCapability(t *testing.T) {
 		},
 		{
 			name:     "run task without immediate keyword",
-			request:  "运行一下 AI 日报",
+			request:  "运行竞品动态",
 			decision: taskEditIntentRun,
 			tool: newToolSpec(
 				&fakeTool{name: "run_task_now"},
@@ -894,7 +898,7 @@ func TestTaskEditOtherOperationKeepsMatchingCapability(t *testing.T) {
 		},
 		{
 			name:     "natural create wording",
-			request:  "帮我设一个每天九点的任务",
+			request:  "建立一个竞品洞察",
 			decision: taskEditIntentCreate,
 			tool: newToolSpec(
 				&fakeTool{
@@ -912,8 +916,8 @@ func TestTaskEditOtherOperationKeepsMatchingCapability(t *testing.T) {
 			),
 		},
 		{
-			name:     "profile update",
-			request:  "更新我的岗位为产品经理",
+			name:     "first profile intake",
+			request:  "我在互联网行业，是产品经理，关注 AI 和机器人",
 			decision: taskEditIntentProfileUpdate,
 			tool: newToolSpec(
 				&fakeTool{name: "update_profile"},
