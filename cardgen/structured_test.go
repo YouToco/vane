@@ -147,6 +147,7 @@ func TestGenerateStructuredWithPolicyV2UsesOneFrozenCall(t *testing.T) {
 	}
 	system, user := captured.snapshot()
 	if system != structuredSystemPromptV1 ||
+		!strings.Contains(system, structuredProjectionClaimContractV1) ||
 		!strings.Contains(user, "来源标签：source-1\n标题：价格公告\n正文：官方价格下降 20% 即日生效") ||
 		!strings.Contains(user, "只关注成本") {
 		t.Fatalf("unexpected frozen prompts:\nsystem=%q\nuser=%q", system, user)
@@ -315,6 +316,7 @@ func TestGenerateStructuredWithEvidencePolicyV3UsesOneMultiSourceCall(
 			"单一来源事实只能引用含有该 excerpt 的标签") ||
 		!strings.Contains(system,
 			"禁止为了表示交叉验证而加入不含该逐字 excerpt 的来源") ||
+		!strings.Contains(system, structuredProjectionClaimContractV1) ||
 		!strings.Contains(user, "来源标签：source-1") ||
 		!strings.Contains(user, "来源标签：source-2") ||
 		strings.Contains(user, `"content_item_id"`) ||
