@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  GOSUMDB: sum.golang.org
+
 jobs:
   test:
     runs-on: [self-hosted, Linux, ARM64, vane-test]
@@ -35,11 +38,14 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: "1.26"
+          go-version: "1.26.5"
           cache: false
 
       - name: Download dependencies
         run: go mod download
+
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
       - name: Vet
         run: go vet ./...

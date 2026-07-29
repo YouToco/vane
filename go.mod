@@ -1,6 +1,6 @@
 module github.com/YouToco/vane
 
-go 1.26
+go 1.26.5
 
 // SDK v3.9.9 WS 模式静默丢弃 MessageTypeCard，卡片回调永远到达不了应用层。
 // 本地 patch：third_party/oapi-sdk-go/v3/ws/client.go 将 card 消息路由到 eventHandler.Do()。
@@ -8,7 +8,6 @@ go 1.26
 replace github.com/larksuite/oapi-sdk-go/v3 => ./third_party/oapi-sdk-go/v3
 
 require (
-	golang.org/x/crypto v0.53.0
 	github.com/PuerkitoBio/goquery v1.12.0
 	github.com/a2aproject/a2a-go/v2 v2.3.1
 	github.com/google/uuid v1.6.0
@@ -20,6 +19,7 @@ require (
 	github.com/spf13/viper v1.21.0
 	go.temporal.io/api v1.63.0
 	go.temporal.io/sdk v1.46.0
+	golang.org/x/crypto v0.53.0
 )
 
 require (
@@ -57,11 +57,11 @@ require (
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
+	golang.org/x/text v0.39.0 // indirect
 	golang.org/x/time v0.3.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260427160629-7cedc36a6bc4 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260427160629-7cedc36a6bc4 // indirect
-	google.golang.org/grpc v1.80.0 // indirect
+	google.golang.org/grpc v1.82.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
