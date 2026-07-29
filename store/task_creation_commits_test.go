@@ -516,6 +516,20 @@ func TestTaskCreationDefinitionCommit_ToolPlanCreatesNoSourceEntity(t *testing.T
 		record.Definition.TaskManual != p.Definition.PlaybookContent {
 		t.Fatalf("Source-free approved definition differs: %+v", record.Definition)
 	}
+	adaptive, err := st.GetToolAdaptiveStateForDefinition(
+		t.Context(), p.Lease.TenantID, p.Lease.UserID, p.Definition.TaskID,
+		ApprovedDefinitionFence{Version: record.Version, Digest: record.Digest})
+	if err != nil {
+		t.Fatalf("GetToolAdaptiveStateForDefinition: %v", err)
+	}
+	if adaptive.Version != 1 ||
+		adaptive.State.SchemaVersion != taskstate.AdaptiveStateSchemaVersionV2 ||
+		len(adaptive.State.InvocationStates) != 1 ||
+		adaptive.State.InvocationStates[0].InvocationDigest !=
+			record.Definition.ToolCalls[0].Digest ||
+		adaptive.State.InvocationStates[0].Status != taskstate.InvocationStatusActive {
+		t.Fatalf("initial invocation-scoped adaptive state differs: %+v", adaptive)
+	}
 	var taskLinks, globalTargets int
 	var projectionPlan []byte
 	if err := st.pool.QueryRow(t.Context(),

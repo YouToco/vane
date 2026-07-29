@@ -161,8 +161,13 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 		if err := insertPausedToolTaskDefinitionTx(ctx, tx, p.Definition); err != nil {
 			return err
 		}
-		if _, err := insertTaskCreationToolApprovedDefinitionTx(
-			ctx, tx, p.Definition, plan, p.Lease.ID); err != nil {
+		approved, err := insertTaskCreationToolApprovedDefinitionTx(
+			ctx, tx, p.Definition, plan, p.Lease.ID)
+		if err != nil {
+			return err
+		}
+		if _, err := insertInitialToolAdaptiveStateTx(
+			ctx, tx, approved); err != nil {
 			return err
 		}
 	} else {
