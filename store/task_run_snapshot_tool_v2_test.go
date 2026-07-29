@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/runcontext"
+	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -492,6 +494,51 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 			concurrentProvenanceRows, concurrentContentRows)
 	}
 
+	testSimhash := int64(424242)
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE content_items
+		    SET simhash=$2, fetched_at=now()
+		  WHERE id=$1`,
+		contentID, testSimhash); err != nil {
+		t.Fatal(err)
+	}
+	recentSimhashes, err := st.ListRecentSimhashesForTaskRunV2(
+		ctx, identity, ref, time.Now().Add(-time.Hour), []int64{})
+	if err != nil || !slices.Contains(recentSimhashes, testSimhash) {
+		t.Fatalf("Source-free simhash history=%v err=%v",
+			recentSimhashes, err)
+	}
+
+	candidates, err := st.ListContentCandidatesForTaskRunV2(
+		ctx, identity, ref, 256)
+	if err != nil || len(candidates) != 1 ||
+		candidates[0].InvocationDigest != invocationDigest ||
+		candidates[0].Item.ID != contentID ||
+		candidates[0].Item.SourceID != 0 {
+		t.Fatalf("Source-free candidates=%+v err=%v", candidates, err)
+	}
+	insertCompiledTestDelivery(
+		t, st, identity.TenantID, identity.UserID,
+		identity.TaskID, contentID)
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM deliveries
+			  WHERE tenant_id=$1 AND user_id=$2 AND content_item_id=$3`,
+			identity.TenantID, identity.UserID, contentID)
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM push_batches
+			  WHERE tenant_id=$1 AND user_id=$2 AND schedule_id=$3`,
+			identity.TenantID, identity.UserID, identity.TaskID)
+	})
+	candidates, err = st.ListContentCandidatesForTaskRunV2(
+		ctx, identity, ref, 256)
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("delivered Source-free candidate remained: %+v err=%v",
+			candidates, err)
+	}
+
 	rlsTx, err := st.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -548,6 +595,29 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		ctx, identity, tampered); err == nil {
 		t.Fatal("tampered Source-free reference reached live authorization")
 	}
+	setBucket(t, st, identity.TenantID, QuotaLLMTokens,
+		100, 0.000001, 100)
+	t.Cleanup(func() {
+		if _, err := st.pool.Exec(context.Background(),
+			`DELETE FROM tenant_quota WHERE tenant_id=$1`,
+			identity.TenantID); err != nil {
+			t.Errorf("cleanup Source-free quota: %v", err)
+		}
+	})
+	quotaRule := runtimepolicy.QuotaBucketV1{
+		Name: string(QuotaLLMTokens), Financial: true,
+		EnforcementVersion: runtimepolicy.QuotaEnforcementLLMPrechargeV1,
+	}
+	if err := st.AuthorizeAndConsumeTaskRunLLMQuotaV2(
+		ctx, identity, ref, quotaRule, 20); err != nil {
+		t.Fatalf("Source-free quota reserve: %v", err)
+	}
+	quotaBeforePause := runtimeQuotaTokens(
+		t, st, identity.TenantID, QuotaLLMTokens)
+	if quotaBeforePause < 79.9 || quotaBeforePause > 80.1 {
+		t.Fatalf("Source-free quota tokens=%.6f, want about 80",
+			quotaBeforePause)
+	}
 	if _, err := st.pool.Exec(ctx,
 		`UPDATE schedules SET status=$4
 		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
@@ -559,6 +629,18 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		ctx, identity, ref); err != nil || authorized {
 		t.Fatalf("paused Source-free run authorization: authorized=%v err=%v",
 			authorized, err)
+	}
+	if err := st.AuthorizeAndConsumeTaskRunLLMQuotaV2(
+		ctx, identity, ref, quotaRule, 1,
+	); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("paused Source-free quota reserve=%v, want quota denial", err)
+	}
+	quotaAfterPause := runtimeQuotaTokens(
+		t, st, identity.TenantID, QuotaLLMTokens)
+	if quotaAfterPause < quotaBeforePause ||
+		quotaAfterPause-quotaBeforePause > 0.01 {
+		t.Fatalf("paused Source-free quota mutated balance: before=%.6f after=%.6f",
+			quotaBeforePause, quotaAfterPause)
 	}
 	if recovered, found, err := st.LoadContentObservationForTaskRunV2(
 		ctx, identity, ref, invocationDigest,

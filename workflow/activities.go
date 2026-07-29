@@ -306,6 +306,17 @@ type CompiledToolRunStoreV2 interface {
 		context.Context, types.RunIdentity, types.RunSnapshotRefV2, string,
 		[]types.ContentItem,
 	) ([]types.ContentItem, error)
+	ListContentCandidatesForTaskRunV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2, int,
+	) ([]runcontext.ToolCandidateV1, error)
+	ListRecentSimhashesForTaskRunV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2,
+		time.Time, []int64,
+	) ([]int64, error)
+	AuthorizeAndConsumeTaskRunLLMQuotaV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2,
+		runtimepolicy.QuotaBucketV1, float64,
+	) error
 }
 
 type RunOutcomeStoreV1 interface {
@@ -1259,6 +1270,12 @@ func (a *Activities) PrepareToolRunV2(
 	result := PrepareToolRunV2Result{
 		Authorized: true,
 		Snapshot:   ref,
+		InvocationDigests: make(
+			[]string, len(snapshot.Definition.ToolCalls)),
+	}
+	for i := range snapshot.Definition.ToolCalls {
+		result.InvocationDigests[i] =
+			snapshot.Definition.ToolCalls[i].Digest
 	}
 	if err := result.ValidateFor(expected); err != nil {
 		return PrepareToolRunV2Result{}, nonRetryable(err)

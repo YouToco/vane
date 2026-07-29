@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.temporal.io/sdk/testsuite"
 
@@ -27,6 +29,7 @@ type compiledToolRunStoreFake struct {
 	authorize        bool
 	observation      []types.ContentItem
 	observationFound bool
+	recentSimhashes  []int64
 
 	loadRefErr           error
 	createErr            error
@@ -34,6 +37,8 @@ type compiledToolRunStoreFake struct {
 	authorizeErr         error
 	loadObservationErr   error
 	commitObservationErr error
+	recentSimhashErr     error
+	quotaErr             error
 
 	loadRefCalls           int
 	createCalls            int
@@ -41,6 +46,9 @@ type compiledToolRunStoreFake struct {
 	authorizeCalls         int
 	loadObservationCalls   int
 	commitObservationCalls int
+	listCandidateCalls     int
+	recentSimhashCalls     int
+	quotaCalls             int
 	createPolicies         []runtimepolicy.BundleV1
 }
 
@@ -79,6 +87,51 @@ func (f *compiledToolRunStoreFake) CommitContentObservationForTaskRunV2(
 	f.observation = append([]types.ContentItem(nil), items...)
 	f.observationFound = true
 	return append([]types.ContentItem(nil), items...), nil
+}
+
+func (f *compiledToolRunStoreFake) ListContentCandidatesForTaskRunV2(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRefV2,
+	_ int,
+) ([]runcontext.ToolCandidateV1, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listCandidateCalls++
+	out := make([]runcontext.ToolCandidateV1, len(f.observation))
+	for i := range f.observation {
+		out[i] = runcontext.ToolCandidateV1{
+			InvocationDigest: f.snapshot.Definition.ToolCalls[0].Digest,
+			Item:             f.observation[i],
+		}
+	}
+	return out, nil
+}
+
+func (f *compiledToolRunStoreFake) ListRecentSimhashesForTaskRunV2(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRefV2,
+	_ time.Time,
+	_ []int64,
+) ([]int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recentSimhashCalls++
+	return append([]int64(nil), f.recentSimhashes...), f.recentSimhashErr
+}
+
+func (f *compiledToolRunStoreFake) AuthorizeAndConsumeTaskRunLLMQuotaV2(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRefV2,
+	_ runtimepolicy.QuotaBucketV1,
+	_ float64,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.quotaCalls++
+	return f.quotaErr
 }
 
 type compiledToolFetcherV2Fake struct {
@@ -469,13 +522,16 @@ func TestPrepareToolRunV2_CreatesThenRecoversBeforeMutablePolicy(
 		ScheduleID:     identity.TaskID,
 	}
 	first, err := executePrepareToolRunV2(t, env, a, params)
-	if err != nil || !first.Authorized || first.Snapshot != ref {
+	if err != nil || !first.Authorized || first.Snapshot != ref ||
+		len(first.InvocationDigests) != 1 ||
+		first.InvocationDigests[0] !=
+			snapshot.Definition.ToolCalls[0].Digest {
 		t.Fatalf("first Tool prepare = %+v err=%v", first, err)
 	}
 	policyFailure := errors.New("mutable policy must not be rebuilt")
 	builderErr.Store(&policyFailure)
 	recovered, err := executePrepareToolRunV2(t, env, a, params)
-	if err != nil || recovered != first {
+	if err != nil || !reflect.DeepEqual(recovered, first) {
 		t.Fatalf("recovered Tool prepare = %+v err=%v", recovered, err)
 	}
 	if builderCalls.Load() != 1 {
@@ -613,5 +669,195 @@ func TestExecuteToolInvocationV2_CommitsThenRecoversWithoutProviderReplay(
 		st.observation[0].SourceID != 0 ||
 		st.observation[0].ID <= 0 {
 		t.Fatalf("Tool V2 observation calls/state: %+v", st)
+	}
+}
+
+func TestToolCandidatePipelineV2_PreservesInvocationProvenance(
+	t *testing.T,
+) {
+	identity := testActivityIdentity(7, 9, "task-tool-v2-pipeline")
+	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
+	st := &compiledToolRunStoreFake{
+		ref: ref, found: true, snapshot: snapshot, authorize: true,
+	}
+	scorer := new(compiledQuotaScorerFake)
+	cardgen := new(compiledQuotaCardGenFake)
+	a := NewActivities(
+		fakeFetcher{}, scorer, cardgen, &fakePusher{},
+		&fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledToolRuntimeV2(
+			st,
+			func(context.Context, int64, bool) (
+				runtimepolicy.BundleV1, error,
+			) {
+				return snapshot.Policy, nil
+			},
+			new(compiledModelResolverFake)))
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.DedupToolCandidatesV2)
+	env.RegisterActivity(a.ScoreToolCandidatesV2)
+	env.RegisterActivity(a.SelectToolCandidatesV2)
+	env.RegisterActivity(a.CardGenToolCandidatesV2)
+
+	run := CompiledToolRunInputV2{
+		TenantID: identity.TenantID,
+		TaskID:   identity.TaskID,
+		Snapshot: ref,
+	}
+	invocation := snapshot.Definition.ToolCalls[0].Digest
+	candidates := []runcontext.ToolCandidateV1{
+		{
+			InvocationDigest: invocation,
+			Item: types.ContentItem{
+				ID: 101, Kind: types.KindArticle,
+				Title: "same title", Content: "same body",
+				FetchedAt: time.Now().UTC(),
+			},
+		},
+		{
+			InvocationDigest: invocation,
+			Item: types.ContentItem{
+				ID: 102, Kind: types.KindArticle,
+				Title: "same title", Content: "same body",
+				FetchedAt: time.Now().UTC().Add(-time.Minute),
+			},
+		},
+	}
+	encoded, err := env.ExecuteActivity(
+		a.DedupToolCandidatesV2,
+		DedupToolCandidatesV2Input{
+			UserID: identity.UserID, TraceID: "trace-tool-v2",
+			Run: run, Candidates: candidates,
+		})
+	if err != nil {
+		t.Fatalf("dedup Tool candidates: %v", err)
+	}
+	var deduped []runcontext.ToolCandidateV1
+	if err := encoded.Get(&deduped); err != nil {
+		t.Fatal(err)
+	}
+	if len(deduped) != 1 ||
+		deduped[0].InvocationDigest != invocation ||
+		deduped[0].Item.Simhash == nil {
+		t.Fatalf("deduped candidates = %+v", deduped)
+	}
+
+	encoded, err = env.ExecuteActivity(
+		a.ScoreToolCandidatesV2,
+		ScoreToolCandidatesV2Input{
+			UserID: identity.UserID, TraceID: "trace-tool-v2",
+			Run: run, Candidates: deduped,
+		})
+	if err != nil {
+		t.Fatalf("score Tool candidates: %v", err)
+	}
+	var scored []runcontext.ToolScoredCandidateV1
+	if err := encoded.Get(&scored); err != nil {
+		t.Fatal(err)
+	}
+	if len(scored) != 1 ||
+		scored[0].InvocationDigest != invocation ||
+		scored[0].Scored.Score != 88 {
+		t.Fatalf("scored candidates = %+v", scored)
+	}
+
+	encoded, err = env.ExecuteActivity(
+		a.SelectToolCandidatesV2,
+		SelectToolCandidatesV2Input{
+			UserID: identity.UserID, TraceID: "trace-tool-v2",
+			Run: run, Candidates: scored,
+		})
+	if err != nil {
+		t.Fatalf("select Tool candidates: %v", err)
+	}
+	var selected []runcontext.ToolScoredCandidateV1
+	if err := encoded.Get(&selected); err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 1 ||
+		selected[0].InvocationDigest != invocation {
+		t.Fatalf("selected candidates = %+v", selected)
+	}
+
+	encoded, err = env.ExecuteActivity(
+		a.CardGenToolCandidatesV2,
+		CardGenToolCandidatesV2Input{
+			UserID: identity.UserID, TraceID: "trace-tool-v2",
+			Run: run, Candidates: selected,
+		})
+	if err != nil {
+		t.Fatalf("cardgen Tool candidates: %v", err)
+	}
+	var cards []ToolGeneratedCardV1
+	if err := encoded.Get(&cards); err != nil {
+		t.Fatal(err)
+	}
+	if len(cards) != 1 ||
+		cards[0].InvocationDigest != invocation ||
+		cards[0].Card.BodyMD != "body" ||
+		cards[0].Card.Scored.Item.SourceID != 0 {
+		t.Fatalf("Tool cards = %+v", cards)
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.recentSimhashCalls != 1 || st.quotaCalls != 2 ||
+		st.authorizeCalls != 2 {
+		t.Fatalf("Tool pipeline gates: simhash=%d quota=%d authorize=%d",
+			st.recentSimhashCalls, st.quotaCalls, st.authorizeCalls)
+	}
+}
+
+func TestScoreToolCandidatesV2_RejectsUnknownInvocationBeforeSpend(
+	t *testing.T,
+) {
+	identity := testActivityIdentity(7, 9, "task-tool-v2-provenance")
+	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
+	st := &compiledToolRunStoreFake{
+		ref: ref, found: true, snapshot: snapshot, authorize: true,
+	}
+	scorer := new(compiledQuotaScorerFake)
+	a := NewActivities(
+		fakeFetcher{}, scorer, fakeCardGen{}, &fakePusher{},
+		&fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledToolRuntimeV2(
+			st,
+			func(context.Context, int64, bool) (
+				runtimepolicy.BundleV1, error,
+			) {
+				return snapshot.Policy, nil
+			},
+			new(compiledModelResolverFake)))
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.ScoreToolCandidatesV2)
+	_, err := env.ExecuteActivity(
+		a.ScoreToolCandidatesV2,
+		ScoreToolCandidatesV2Input{
+			UserID: identity.UserID, TraceID: "trace-tool-v2-invalid",
+			Run: CompiledToolRunInputV2{
+				TenantID: identity.TenantID,
+				TaskID:   identity.TaskID,
+				Snapshot: ref,
+			},
+			Candidates: []runcontext.ToolCandidateV1{{
+				InvocationDigest: strings.Repeat("f", 64),
+				Item: types.ContentItem{
+					ID: 103, Kind: types.KindArticle,
+					Title: "tampered", Content: "tampered",
+				},
+			}},
+		})
+	if err == nil {
+		t.Fatal("unknown Tool invocation reached score")
+	}
+	if scorer.calls.Load() != 0 {
+		t.Fatal("unknown Tool invocation spent model quota")
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.quotaCalls != 0 || st.authorizeCalls != 0 {
+		t.Fatalf("unknown invocation reached gates: %+v", st)
 	}
 }

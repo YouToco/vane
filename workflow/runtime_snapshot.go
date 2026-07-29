@@ -1,6 +1,11 @@
 package workflow
 
-import "github.com/YouToco/vane/types"
+import (
+	"encoding/hex"
+	"strings"
+
+	"github.com/YouToco/vane/types"
+)
 
 // Workflow aliases keep the Activity wire contract close to its consumer while
 // Store and Workflow share one implementation of validation and hashing.
@@ -55,8 +60,9 @@ func (r PrepareRunResult) ValidateFor(expected RunIdentity) error {
 // PrepareToolRunV2Result is deliberately distinct from PrepareRunResult so a
 // retained Source runtime cannot receive or authorize a Source-free Tool ref.
 type PrepareToolRunV2Result struct {
-	Authorized bool             `json:"authorized"`
-	Snapshot   RunSnapshotRefV2 `json:"snapshot"`
+	Authorized        bool             `json:"authorized"`
+	Snapshot          RunSnapshotRefV2 `json:"snapshot"`
+	InvocationDigests []string         `json:"invocation_digests"`
 }
 
 // ExecuteToolInvocationV2Input carries only an immutable reference and one
@@ -70,6 +76,13 @@ type ExecuteToolInvocationV2Input struct {
 	InvocationDigest string           `json:"invocation_digest"`
 }
 
+type CollectToolRunContentV2Input struct {
+	TenantID int64            `json:"tenant_id"`
+	UserID   int64            `json:"user_id"`
+	TaskID   string           `json:"task_id"`
+	Snapshot RunSnapshotRefV2 `json:"snapshot"`
+}
+
 // ToolInvocationReceiptV1 is the small durable Activity result. Content bodies
 // remain in the append-only observation evidence row.
 type ToolInvocationReceiptV1 struct {
@@ -80,13 +93,33 @@ type ToolInvocationReceiptV1 struct {
 
 func (r PrepareToolRunV2Result) Validate() error {
 	if !r.Authorized {
-		if r.Snapshot != (RunSnapshotRefV2{}) {
+		if r.Snapshot != (RunSnapshotRefV2{}) ||
+			r.InvocationDigests != nil {
 			return types.NewAppError(types.CodeValidation,
-				"unauthorized Tool prepare result must carry a zero snapshot", nil)
+				"unauthorized Tool prepare result must carry no run data", nil)
 		}
 		return nil
 	}
-	return r.Snapshot.Validate()
+	if r.Snapshot.Validate() != nil ||
+		len(r.InvocationDigests) == 0 {
+		return types.NewAppError(types.CodeValidation,
+			"authorized Tool prepare result is invalid", nil)
+	}
+	seen := make(map[string]struct{}, len(r.InvocationDigests))
+	for _, digest := range r.InvocationDigests {
+		decoded, err := hex.DecodeString(digest)
+		if err != nil || len(decoded) != 32 ||
+			digest != strings.ToLower(digest) {
+			return types.NewAppError(types.CodeValidation,
+				"authorized Tool invocation digest is invalid", nil)
+		}
+		if _, duplicate := seen[digest]; duplicate {
+			return types.NewAppError(types.CodeValidation,
+				"authorized Tool invocation digest is duplicated", nil)
+		}
+		seen[digest] = struct{}{}
+	}
+	return nil
 }
 
 func (r PrepareToolRunV2Result) ValidateFor(expected RunIdentity) error {

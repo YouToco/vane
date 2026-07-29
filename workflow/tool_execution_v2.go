@@ -137,6 +137,52 @@ func (a *Activities) ExecuteToolInvocationV2(
 	return toolInvocationReceiptV1(input, persisted)
 }
 
+// CollectToolRunContentV2 returns only current-run immutable observations that
+// have not already been delivered to this user. It never consults a Source
+// candidate reader and performs no external effect.
+func (a *Activities) CollectToolRunContentV2(
+	ctx context.Context,
+	input CollectToolRunContentV2Input,
+) ([]runcontext.ToolCandidateV1, error) {
+	if a.compiledToolStoreV2 == nil ||
+		input.TenantID <= 0 || input.UserID <= 0 ||
+		strings.TrimSpace(input.TaskID) == "" ||
+		!activity.IsActivity(ctx) {
+		return nil, nonRetryable(types.NewAppError(
+			types.CodeValidation,
+			"compiled Tool content input is invalid", nil))
+	}
+	info := activity.GetInfo(ctx)
+	expected := types.RunIdentity{
+		TemporalWorkflowID: info.WorkflowExecution.ID,
+		TemporalRunID:      info.WorkflowExecution.RunID,
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           input.TenantID,
+		UserID:             input.UserID,
+		TaskID:             input.TaskID,
+	}
+	if input.Snapshot.ValidateFor(expected) != nil {
+		return nil, nonRetryable(types.NewAppError(
+			types.CodeValidation,
+			"compiled Tool content snapshot is invalid", nil))
+	}
+	authorized, err := a.compiledToolStoreV2.
+		AuthorizeTaskRunSideEffectV2(ctx, expected, input.Snapshot)
+	if err != nil {
+		return nil, retryableOrNot(err)
+	}
+	if !authorized {
+		return []runcontext.ToolCandidateV1{}, nil
+	}
+	items, err := a.compiledToolStoreV2.
+		ListContentCandidatesForTaskRunV2(
+			ctx, expected, input.Snapshot, maxScoreCandidates)
+	if err != nil {
+		return nil, retryableOrNot(err)
+	}
+	return items, nil
+}
+
 func frozenToolBindingV2(
 	snapshot runcontext.CompiledSnapshotV2,
 	invocationDigest string,

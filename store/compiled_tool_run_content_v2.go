@@ -45,6 +45,105 @@ func (s *Store) LoadContentObservationForTaskRunV2(
 	return items, found, nil
 }
 
+// ListContentCandidatesForTaskRunV2 reads the exact immutable observation
+// sets in frozen invocation order and removes content already delivered to the
+// same user. It never routes through Source/content_sources candidate readers.
+func (s *Store) ListContentCandidatesForTaskRunV2(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRefV2,
+	limit int,
+) ([]runcontext.ToolCandidateV1, error) {
+	if limit <= 0 || limit > runcontext.MaxToolObservationItemsV1 {
+		return nil, taskRunValidationError(
+			"Tool candidate limit is invalid")
+	}
+	tx, snapshot, err := s.beginCompiledToolRunReadV2(ctx, expected, ref)
+	if err != nil {
+		return nil, err
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+
+	ordered := make([]runcontext.ToolCandidateV1, 0)
+	seenContentIDs := make(map[int64]struct{})
+	for _, call := range snapshot.Definition.ToolCalls {
+		items, found, err := loadContentObservationV2(
+			ctx, tx, expected, ref, call.Digest)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, types.NewAppError(types.CodeConflict,
+				"Tool run observation set is incomplete", nil)
+		}
+		for _, item := range items {
+			if _, duplicate := seenContentIDs[item.ID]; duplicate {
+				continue
+			}
+			seenContentIDs[item.ID] = struct{}{}
+			ordered = append(ordered, runcontext.ToolCandidateV1{
+				InvocationDigest: call.Digest,
+				Item:             item,
+			})
+		}
+	}
+	if len(ordered) == 0 {
+		if err := commitCompiledRunWriteV1(
+			ctx, tx, "commit empty Tool candidate read"); err != nil {
+			return nil, err
+		}
+		return []runcontext.ToolCandidateV1{}, nil
+	}
+	contentIDs := make([]int64, len(ordered))
+	for i := range ordered {
+		contentIDs[i] = ordered[i].Item.ID
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT DISTINCT content_item_id
+		   FROM deliveries
+		  WHERE tenant_id=$1 AND user_id=$2
+		    AND content_item_id=ANY($3::bigint[])
+		    AND status<>'failed'`,
+		expected.TenantID, expected.UserID, contentIDs)
+	if err != nil {
+		return nil, taskRunDatabaseError(
+			"query delivered Tool content", err)
+	}
+	delivered := make(map[int64]struct{})
+	for rows.Next() {
+		var contentID int64
+		if err := rows.Scan(&contentID); err != nil {
+			rows.Close()
+			return nil, taskRunDatabaseError(
+				"scan delivered Tool content", err)
+		}
+		delivered[contentID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, taskRunDatabaseError(
+			"iterate delivered Tool content", err)
+	}
+	rows.Close()
+	candidates := make(
+		[]runcontext.ToolCandidateV1, 0, min(limit, len(ordered)))
+	for _, candidate := range ordered {
+		if _, alreadyDelivered :=
+			delivered[candidate.Item.ID]; alreadyDelivered {
+			continue
+		}
+		candidates = append(candidates, candidate)
+		if len(candidates) == limit {
+			break
+		}
+	}
+	if err := commitCompiledRunWriteV1(
+		ctx, tx, "commit Tool candidate read"); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
 // CommitContentObservationForTaskRunV2 atomically upserts globally shared
 // content with source_id=NULL and commits one immutable result set keyed by
 // (run_snapshot_id, invocation_digest). It never writes content_sources.
