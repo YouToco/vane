@@ -182,8 +182,10 @@ type Deps struct {
 	// feature flag is disabled, even though historical cards remain routable.
 	DefinitionEditEnabled bool
 	// P2-D Web exposure is independent from dark synthesis and Feishu render.
-	// Routes remain mounted, but every non-Web-canary task looks absent.
-	ExecutiveBriefWebCanaryScheduleID string
+	// Projection allow-all exposes only durable GET projections. Paid follow-up
+	// and settings/feedback writes remain exact-canary capabilities.
+	ExecutiveBriefWebCanaryScheduleID   string
+	ExecutiveBriefWebProjectionAllowAll bool
 	// Origin 是唯一放行 CORS 的前端源（VANE_DASHBOARD_ORIGIN，默认生产 Dashboard 域）。
 	// 前端迁 OSS+CDN 后与 API 跨源（vane.* → api.*），凭证请求要求逐字匹配的
 	// Allow-Origin + Allow-Credentials，不允许通配符。为空 = 不放行任何跨源。
@@ -201,6 +203,12 @@ type server struct {
 func (s *server) executiveBriefTaskEnabled(taskID string) bool {
 	return taskID != "" &&
 		taskID == s.deps.ExecutiveBriefWebCanaryScheduleID
+}
+
+func (s *server) executiveBriefProjectionEnabled(taskID string) bool {
+	return taskID != "" &&
+		(s.deps.ExecutiveBriefWebProjectionAllowAll ||
+			s.executiveBriefTaskEnabled(taskID))
 }
 
 // Mount 把 /api/* 路由挂到 mux。除 /api/auth/login 外全部要求会话 cookie；

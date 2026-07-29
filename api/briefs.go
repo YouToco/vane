@@ -48,5 +48,5 @@ func (s *server) handleListTaskBriefs(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK,
 		publicTaskBriefPageV1(
-			page, s.executiveBriefTaskEnabled(taskID)))
+			page, s.executiveBriefProjectionEnabled(taskID)))
 }

@@ -162,6 +162,7 @@ type PipelineConfig struct {
 	// Synthesis, Web exposure and Feishu rendering are deliberately separate:
 	// an exact task may generate dark artifacts before either channel is on.
 	ExecutiveBriefWebCanaryScheduleID      string `mapstructure:"executive_brief_web_canary_schedule_id"`
+	ExecutiveBriefWebProjectionAllowAll    bool   `mapstructure:"executive_brief_web_projection_allow_all"`
 	ExecutiveBriefRendererCanaryScheduleID string `mapstructure:"executive_brief_renderer_canary_schedule_id"`
 	// CanonicalBriefRendererCanaryScheduleID is P1-E's independent Feishu
 	// content-authority switch. Empty is the complete rollback state.
@@ -373,6 +374,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.executive_brief_canary_schedule_id", "")
 	v.SetDefault("pipeline.executive_brief_allow_all", false)
 	v.SetDefault("pipeline.executive_brief_web_canary_schedule_id", "")
+	v.SetDefault("pipeline.executive_brief_web_projection_allow_all", false)
 	v.SetDefault("pipeline.executive_brief_renderer_canary_schedule_id", "")
 	v.SetDefault("pipeline.canonical_brief_renderer_canary_schedule_id", "")
 	v.SetDefault("pipeline.snapshot_v2_shadow_canary_schedule_id", "")
@@ -674,6 +676,11 @@ func (c *Config) Validate() error {
 			"config: pipeline.executive_brief_web_canary_schedule_id 不能仅含空白")
 	}
 	c.Pipeline.ExecutiveBriefWebCanaryScheduleID = executiveWebCanary
+	if c.Pipeline.ExecutiveBriefWebProjectionAllowAll &&
+		!c.Pipeline.ExecutiveBriefEnabled {
+		return errors.New(
+			"config: executive brief Web projection allow_all 要求 synthesis 已启用")
+	}
 	rawExecutiveRendererCanary :=
 		c.Pipeline.ExecutiveBriefRendererCanaryScheduleID
 	executiveRendererCanary :=
@@ -707,6 +714,7 @@ func (c *Config) Validate() error {
 			"config: executive brief renderer 必须位于 canonical Brief renderer canary")
 	}
 	if executiveRendererCanary != "" &&
+		!c.Pipeline.ExecutiveBriefWebProjectionAllowAll &&
 		executiveRendererCanary != executiveWebCanary {
 		return errors.New(
 			"config: executive brief renderer 必须位于 Web canary")
