@@ -228,6 +228,38 @@ func TestGenerateStructuredWithPolicyV2RejectsZeroPolicyBeforeCall(t *testing.T)
 	}
 }
 
+func TestGenerateStructuredWithPolicyV2RejectsEmptyEvidenceBeforeCall(
+	t *testing.T,
+) {
+	prompts, models := validPolicyV1(t, false)
+	prompts.CardGen = StructuredPromptStageV2()
+	for index := range models.Calls {
+		if models.Calls[index].Stage == runtimepolicy.ModelStageCardGen {
+			models.Calls[index] = StructuredModelCallV2("structured-model")
+		}
+	}
+	policy, err := PreparePolicyV2(prompts, models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, content := range []string{
+		" \n\t ",
+		strings.Repeat(" ", 800) + "正文",
+	} {
+		cg, captured := newTestCardGen(t, http.StatusOK, `{}`, nil)
+		_, err = cg.GenerateStructuredWithPolicyV2(
+			t.Context(), 0, 1,
+			types.ScoredItem{Item: types.ContentItem{
+				ID: 7, Title: "标题", Content: content,
+			}},
+			"trace-empty-evidence", "", policy, nil,
+		)
+		if err == nil || captured.callCount() != 0 {
+			t.Fatalf("err=%v calls=%d", err, captured.callCount())
+		}
+	}
+}
+
 func TestGenerateStructuredWithEvidencePolicyV3UsesOneMultiSourceCall(
 	t *testing.T,
 ) {
@@ -319,5 +351,22 @@ func TestGenerateStructuredWithEvidencePolicyV3RejectsInventoryBeforeCall(
 	)
 	if err == nil || captured.callCount() != 0 {
 		t.Fatalf("err=%v calls=%d", err, captured.callCount())
+	}
+}
+
+func TestEventEvidenceSourceV1RejectsEmptyEvidence(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	_, err := NewEventEvidenceSourceV1(
+		0,
+		types.ContentItem{
+			ID: 7, Title: "公告", URL: "https://example.com/one",
+			Content: " \n\t ", CreatedAt: now,
+		},
+		runcontext.SourceV1{
+			SourceID: 10, Platform: types.PlatformWeb, Title: "官方源",
+		},
+	)
+	if err == nil {
+		t.Fatal("expected empty normalized evidence to be rejected")
 	}
 }

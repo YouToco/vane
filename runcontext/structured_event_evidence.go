@@ -19,7 +19,7 @@ func StructuredEventEvidenceTextV1(content string) string {
 	if len(runes) > structuredEventEvidenceMaxRunesV1 {
 		runes = runes[:structuredEventEvidenceMaxRunesV1]
 	}
-	return promptguard.Sanitize(string(runes))
+	return strings.TrimSpace(promptguard.Sanitize(string(runes)))
 }
 
 // StructuredEventEvidenceMetadataV1 derives only inventory-owned presentation
