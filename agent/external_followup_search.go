@@ -18,10 +18,10 @@ const (
 - 你刚才没有调用已声明的 web_search；该自由文本回复已被丢弃。现在必须调用一次 web_search，不能直接回答或声称已经检索。`
 	externalFollowupSearchGroundingSystemNote = `
 - web_search 返回的是候选网页摘要，不是自动成立的事实。回答当前事实、可用性、版本或定价时，优先采用结果中的第一方官方来源；第三方页面只能作为线索，不能推翻或扩写官方来源。
-- 每个核心结论都必须紧邻给出本轮结果中真实存在且直接支持它的 URL；没有直接证据的数字、价格、版本、日期、套餐权益或未来计价方式一律省略，不能用“可能”“预计”等推测补齐。
+- 每个核心结论都必须紧邻给出本轮结果中真实存在且直接支持它的 URL，并使用 [来源](URL) Markdown 链接而不是裸 URL，确保飞书可见；没有直接证据的数字、价格、版本、日期、套餐权益或未来计价方式一律省略，不能用“可能”“预计”等推测补齐。
 - 用户问 API 定价时，只回答 API 是否可用及 API 价格；ChatGPT 等消费订阅价格不能当作 API 定价，也不能据此推断 API 会如何收费。若官方只说 API 即将推出，就明确回答尚未提供 API 定价，并停止扩写。`
 	externalFollowupGroundingRetrySystemNote = `
-- 你刚才的整理没有通过本地证据校验，已被丢弃。只可引用本轮 web_search 结果中真实出现的 URL；删除消费订阅价格、无原文支持的数字和推测。若证据不足，明确说证据不足。`
+- 你刚才的整理没有通过本地证据校验，已被丢弃。只可引用本轮 web_search 结果中真实出现的 URL，并写成 [来源](URL) Markdown 链接；删除消费订阅价格、无原文支持的数字和推测。若证据不足，明确说证据不足。`
 	replyExternalFollowupSearchUnavailable = "这个问题需要最新网页证据，但当前没有可用的网页搜索能力；本次无法可靠核验，我不会用猜测代替检索。"
 	replyExternalFollowupSearchNotRun      = "这个问题需要最新网页证据，但这次没有完成真实搜索；本次无法可靠核验，我不会把推测当作检索结果。"
 	replyExternalFollowupNoEvidence        = "已完成网页搜索，但没有找到可引用的结果；我不会在没有证据时猜测。"
@@ -30,7 +30,7 @@ const (
 )
 
 var (
-	externalFollowupURLPattern            = regexp.MustCompile(`https?://[^\s<>"'）)\]]+`)
+	externalFollowupURLPattern            = regexp.MustCompile(`https?://[^\s<>"'\x60）)\]]+`)
 	externalFollowupAuthorityTokenPattern = regexp.MustCompile(
 		`(?i)\b(?:openai|chatgpt|anthropic|claude|google|gemini|microsoft|azure|kimi|neox|deepseek|cohere|xai|mistral)\b`,
 	)
@@ -359,6 +359,61 @@ func externalFollowupReplyGrounded(
 		}
 	}
 	return true
+}
+
+// renderGroundedReplyCitations makes already-validated citations visible in
+// Feishu card markdown. Feishu may omit a standalone bare URL from the rendered
+// card even though the grounding gate correctly found it in the model output.
+// Preserve the model body byte-for-byte and append links built from exact
+// structured evidence URLs. This cannot corrupt inline/reference Markdown,
+// titled links, or URLs that the model put inside code spans.
+func renderGroundedReplyCitations(
+	reply string,
+	evidence []externalFollowupSearchEvidence,
+) string {
+	cited := make(map[string]struct{})
+	for _, raw := range externalFollowupURLs(reply) {
+		if normalized := normalizeExternalFollowupURL(raw); normalized != "" {
+			cited[normalized] = struct{}{}
+		}
+	}
+	if len(cited) == 0 {
+		return reply
+	}
+
+	links := make([]string, 0, len(evidence))
+	seen := make(map[string]struct{}, len(evidence))
+	for _, item := range evidence {
+		exact := strings.TrimSpace(item.URL)
+		normalized := normalizeExternalFollowupURL(exact)
+		if exact == "" || normalized == "" {
+			continue
+		}
+		if _, ok := cited[normalized]; !ok {
+			continue
+		}
+		if _, ok := seen[exact]; ok {
+			continue
+		}
+		seen[exact] = struct{}{}
+		links = append(links, "- ["+groundedCitationLabel(exact)+"]("+exact+")")
+	}
+	if len(links) == 0 {
+		return reply
+	}
+	return reply + "\n\n**来源**\n" + strings.Join(links, "\n")
+}
+
+func groundedCitationLabel(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "来源"
+	}
+	host := strings.TrimPrefix(strings.ToLower(parsed.Hostname()), "www.")
+	if host == "" {
+		return "来源"
+	}
+	return "来源 · " + host
 }
 
 func externalFollowupURLs(text string) []string {
