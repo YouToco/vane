@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/capabilitycatalog"
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/tikhubcatalog"
 	"github.com/YouToco/vane/tikhubinvoke"
@@ -182,7 +182,7 @@ func TestBindingTemplates_Integrity(t *testing.T) {
 				t.Errorf("%s/%s: 未知 TimeFormat %q", key.P, key.C, spec.Fields.TimeFormat)
 			}
 		}
-		if want, ok := capabilitycatalog.KindOf(key.P, key.C); !ok || spec.Kind != want {
+		if want, ok := acquisitiontool.KindOf(key.P, key.C); !ok || spec.Kind != want {
 			t.Errorf("%s/%s: 模板 Kind=%q 与 capabilitycatalog 登记 %q 漂移", key.P, key.C, spec.Kind, want)
 		}
 

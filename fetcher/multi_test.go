@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/capabilitycatalog"
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/types"
 )
@@ -90,7 +90,7 @@ func TestMulti_UnavailableCapabilityCarriesReason(t *testing.T) {
 	if types.IsRetryable(err) {
 		t.Error("Unavailable 能力不应可重试")
 	}
-	entry, _ := capabilitycatalog.Lookup(types.PlatformX, types.CapSearch)
+	entry, _ := acquisitiontool.Lookup(types.PlatformX, types.CapSearch)
 	if entry.Reason == "" || !strings.Contains(err.Error(), entry.Reason) {
 		t.Errorf("报错未携带 capabilitycatalog Reason；err=%q，reason=%q", err.Error(), entry.Reason)
 	}
@@ -121,7 +121,7 @@ func TestMulti_EveryAvailableCapabilityIsWired(t *testing.T) {
 	m.exa.searchURL = dead.URL
 	m.binding = newTestBinding(dead.URL, nil, nil)
 
-	for _, e := range capabilitycatalog.List() {
+	for _, e := range acquisitiontool.List() {
 		if !e.Available() {
 			continue
 		}

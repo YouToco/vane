@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YouToco/vane/fetchspec"
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/types"
@@ -1097,7 +1097,7 @@ func TestMaterializeCreationFetchRequirements_CoversEveryAdvertisedKind(t *testi
 				Capability: types.Capability(got[0].Capability),
 				Title:      got[0].Title, URL: got[0].URL, Config: got[0].Config,
 			}
-			if message := fetchspec.ValidateMaterialized(source); message != "" {
+			if message := acquisitiontool.ValidateMaterialized(source); message != "" {
 				t.Fatalf("materialized source failed registry round-trip: source=%+v message=%q",
 					source, message)
 			}

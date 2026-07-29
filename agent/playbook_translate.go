@@ -20,7 +20,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/fetchspec"
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/types"
 )
@@ -164,7 +164,7 @@ func compilePlan(raw string) (json.RawMessage, error) {
 		if strings.TrimSpace(a.Platform) == "" || strings.TrimSpace(a.Capability) == "" {
 			continue // 缺 platform/capability 无从路由，直接跳过（不算致命）。
 		}
-		src, msg := fetchspec.BuildTarget(playbookSpecFromArgs(a))
+		src, msg := acquisitiontool.BuildTarget(playbookSpecFromArgs(a))
 		if msg != "" || src == nil {
 			slog.Warn("playbook: 抓取计划里的源校验不过，丢弃",
 				"platform", a.Platform, "capability", a.Capability, "reason", msg)
@@ -184,7 +184,7 @@ func compilePlan(raw string) (json.RawMessage, error) {
 	return out, nil
 }
 
-func playbookSpecFromArgs(a playbookFetchTargetArgs) fetchspec.Requirement {
+func playbookSpecFromArgs(a playbookFetchTargetArgs) acquisitiontool.Requirement {
 	params := make(map[string]string)
 	set := func(k, v string) {
 		if v != "" {
@@ -210,7 +210,7 @@ func playbookSpecFromArgs(a playbookFetchTargetArgs) fetchspec.Requirement {
 		domains, _ := json.Marshal(a.IncludeDomains)
 		params["include_domains"] = string(domains)
 	}
-	return fetchspec.Requirement{
+	return acquisitiontool.Requirement{
 		Platform:   a.Platform,
 		Capability: a.Capability,
 		Params:     params,

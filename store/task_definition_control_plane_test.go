@@ -16,7 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/fetchspec"
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -782,7 +782,7 @@ func buildApprovedDefinitionEditCandidate(
 	approvedSources = append(approvedSources, first)
 	sourceIDs := []int64{first.SourceID}
 	if addSource {
-		source, message := fetchspec.BuildTarget(fetchspec.Requirement{
+		source, message := acquisitiontool.BuildTarget(acquisitiontool.Requirement{
 			Platform: string(types.PlatformWeb), Capability: string(types.CapSearch),
 			Params: map[string]string{"query": "c2b2-extra-" + uuid.NewString()},
 			Title:  "C2b2 second source",

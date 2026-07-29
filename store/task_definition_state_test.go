@@ -20,7 +20,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/fetchspec"
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -51,7 +51,7 @@ func newTaskDefinitionStateFixture(t *testing.T) taskDefinitionStateFixture {
 	base := newCompiledTaskFixture(t, st)
 	taskID := base.taskID()
 	query := "c2a-" + uuid.NewString()
-	source, message := fetchspec.BuildTarget(fetchspec.Requirement{
+	source, message := acquisitiontool.BuildTarget(acquisitiontool.Requirement{
 		Platform: string(types.PlatformWeb), Capability: string(types.CapSearch),
 		Params: map[string]string{"query": query}, Title: "C2a approved search",
 	})

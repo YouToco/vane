@@ -19,7 +19,7 @@ import (
 
 	"github.com/mmcdole/gofeed"
 
-	"github.com/YouToco/vane/capabilitycatalog"
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/types"
 )
 
@@ -102,7 +102,7 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 	covered := map[string]bool{}
 	for _, tc := range cases {
 		covered[string(tc.platform)+"/"+string(tc.capability)] = true
-		want, ok := capabilitycatalog.KindOf(tc.platform, tc.capability)
+		want, ok := acquisitiontool.KindOf(tc.platform, tc.capability)
 		if !ok {
 			t.Errorf("%s/%s 在 capabilitycatalog 里不可用，无从比对 Kind", tc.platform, tc.capability)
 			continue
@@ -120,7 +120,7 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 	}
 	// 完备性：capabilitycatalog 每个 Available 能力都必须有比对用例——新增能力忘了配
 	// fixture 时在此变红，而不是让一致性锁静默漏一个能力。
-	for _, e := range capabilitycatalog.List() {
+	for _, e := range acquisitiontool.List() {
 		if e.Available() && !covered[string(e.Platform)+"/"+string(e.Capability)] {
 			t.Errorf("Available 能力 %s/%s 没有 Kind 一致性比对用例", e.Platform, e.Capability)
 		}
