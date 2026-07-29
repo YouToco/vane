@@ -17,6 +17,7 @@ package workflow
 import (
 	cardgenpkg "github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/workflowruntime"
 )
 
 // defaultTopN 是每批默认推送条数（PushScope.TopN 为 0 时取此值，见规格 B1）。
@@ -71,47 +72,42 @@ type PushParams struct {
 
 // CompiledRuntimeSnapshotV1 is the first immutable-snapshot implementation of
 // the Compiled execution mode. Unknown is never used as a rollout label.
-const CompiledRuntimeSnapshotV1 = "compiled-snapshot/v1"
+const CompiledRuntimeSnapshotV1 = workflowruntime.CompiledSnapshotV1
 
 // CompiledRuntimeRunOutcomeV1 selects the same compiled snapshot runtime plus
 // P1-B. A separate durable label preserves PushParams' frozen wire layout and
 // keeps every pre-P1-B Action/history on CompiledRuntimeSnapshotV1.
-const CompiledRuntimeRunOutcomeV1 = "compiled-snapshot/v1+run-outcome/v1"
+const CompiledRuntimeRunOutcomeV1 = workflowruntime.RunOutcomeV1
 
 // CompiledRuntimeCanonicalBriefV1 adds P1-C's durable pre-render Brief draft
 // and atomic outcome+Brief seal. Keeping a distinct durable label prevents
 // already-started P1-B histories from acquiring a new Activity command.
-const CompiledRuntimeCanonicalBriefV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1"
+const CompiledRuntimeCanonicalBriefV1 = workflowruntime.CanonicalBriefV1
 
 // CompiledRuntimeStructuredInsightV1 adds Phase 2-A's one-call structured
 // CardGen policy and optional immutable Insight extension.
-const CompiledRuntimeStructuredInsightV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+structured-insight/v1"
+const CompiledRuntimeStructuredInsightV1 = workflowruntime.StructuredInsightV1
 
 // CompiledRuntimeStructuredEventEvidenceV1 adds P2-B1's ordered multi-source
 // event evidence Activity and optional immutable Brief provenance extension.
-const CompiledRuntimeStructuredEventEvidenceV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+structured-insight/v1+event-evidence/v1"
+const CompiledRuntimeStructuredEventEvidenceV1 = workflowruntime.StructuredEventEvidenceV1
 
 // CompiledRuntimeExecutiveBriefV1 adds P2-D's one-call executive synthesis.
 // It is valid only after the structured event evidence runtime.
-const CompiledRuntimeExecutiveBriefV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+structured-insight/v1+event-evidence/v1+executive-brief/v1"
+const CompiledRuntimeExecutiveBriefV1 = workflowruntime.ExecutiveBriefV1
 
 // CompiledRuntimeToolSnapshotV2 selects the Source-free task Tool snapshot
 // protocol. It is dark until the versioned Tool execution and observation
 // provenance Activities are wired; defining the label does not make any
 // existing Schedule Action select it.
-const CompiledRuntimeToolSnapshotV2 = "compiled-tool-snapshot/v2"
+const CompiledRuntimeToolSnapshotV2 = workflowruntime.CompiledToolSnapshotV2
 
 func IsCompiledToolRuntimeV2(version string) bool {
-	return version == CompiledRuntimeToolSnapshotV2
+	return workflowruntime.IsCompiledToolV2(version)
 }
 
 func IsCompiledRuntimeV1(version string) bool {
-	return version == CompiledRuntimeSnapshotV1 ||
-		version == CompiledRuntimeRunOutcomeV1 ||
-		version == CompiledRuntimeCanonicalBriefV1 ||
-		version == CompiledRuntimeStructuredInsightV1 ||
-		version == CompiledRuntimeStructuredEventEvidenceV1 ||
-		version == CompiledRuntimeExecutiveBriefV1
+	return workflowruntime.IsCompiledV1(version)
 }
 
 func HasRunOutcomeV1(version string) bool {

@@ -23,6 +23,7 @@ import (
 
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/workflowruntime"
 )
 
 const (
@@ -41,7 +42,6 @@ const (
 	retainedIDScheme       = "v1"
 	retainedFingerprintV1  = "v1"
 	retainedFingerprintV2  = "v2"
-	retainedRuntime        = "compiled-snapshot/v1"
 	retainedEditNoteRoot   = "vane/task-definition-edit/v1"
 	retainedActivationNote = "vane/task-schedule/v1:definition-committed"
 )
@@ -849,7 +849,7 @@ func validateActionOwner(action PreparedActionV1, creation PreparedCreationV1) e
 	if params.TenantID != creation.TenantID || params.UserID != creation.UserID ||
 		params.RunKind != "scheduled" || params.ExecutionMode != "compiled" ||
 		params.ScheduleID != creation.TaskID || len(params.RunSnapshot) != 0 ||
-		(params.RuntimeVersion != "" && params.RuntimeVersion != retainedRuntime) {
+		!workflowruntime.IsDurableActionRuntime(params.RuntimeVersion) {
 		return errors.New("workflow params do not match the task owner")
 	}
 	if params.Scope.TopN < 0 || !validIdentifier(action.TaskQueue, maxReferenceBytes) ||

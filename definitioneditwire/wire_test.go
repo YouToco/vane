@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/YouToco/vane/taskstate"
+	"github.com/YouToco/vane/workflowruntime"
 )
 
 type componentFixtureV1 struct {
@@ -455,6 +456,46 @@ func TestValidateApprovedProjectionBindings_ObservationStaysOutsideTemporalProje
 		specRaw, invalid, nlDescription,
 	); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unknown observation field error = %v, want ErrInvalid", err)
+	}
+}
+
+func TestRetainedActionOwnerAcceptsEveryCurrentWriterRuntime(t *testing.T) {
+	creation := PreparedCreationV1{
+		TenantID: 7,
+		UserID:   42,
+		TaskID:   "task-v1-runtime-compat",
+	}
+	action := PreparedActionV1{
+		TaskQueue:    "vane-push",
+		WorkflowType: "PushPipelineWorkflow",
+		ActionID:     "push-task-v1-runtime-compat",
+		Params: PushParamsV1{
+			TenantID:      creation.TenantID,
+			UserID:        creation.UserID,
+			RunKind:       "scheduled",
+			ExecutionMode: "compiled",
+			ScheduleID:    creation.TaskID,
+		},
+	}
+	runtimes := []string{
+		"",
+		workflowruntime.CompiledSnapshotV1,
+		workflowruntime.RunOutcomeV1,
+		workflowruntime.CanonicalBriefV1,
+		workflowruntime.StructuredInsightV1,
+		workflowruntime.StructuredEventEvidenceV1,
+		workflowruntime.ExecutiveBriefV1,
+		workflowruntime.CompiledToolSnapshotV2,
+	}
+	for _, runtime := range runtimes {
+		action.Params.RuntimeVersion = runtime
+		if err := validateActionOwner(action, creation); err != nil {
+			t.Fatalf("current writer runtime %q rejected: %v", runtime, err)
+		}
+	}
+	action.Params.RuntimeVersion = "compiled-snapshot/v1+future/v1"
+	if err := validateActionOwner(action, creation); err == nil {
+		t.Fatal("unknown future runtime accepted")
 	}
 }
 
