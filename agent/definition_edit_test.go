@@ -122,7 +122,7 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 				ID:   "route-edit",
 				Name: taskDefinitionEditIntentTool.Name,
 				Arguments: `{
-					"decision":"execute"
+					"decision":"execute_edit"
 				}`,
 			}},
 		},
@@ -270,8 +270,8 @@ func TestNaturalTaskDefinitionEditSupportsPoliteShortName(t *testing.T) {
 	loop.taskEditIntentFn = func(
 		context.Context,
 		[]llm.ChatMessage,
-	) (bool, error) {
-		return true, nil
+	) (taskEditIntentDecision, error) {
+		return taskEditIntentExecute, nil
 	}
 
 	out, err := loop.HandleMessage(
@@ -369,12 +369,12 @@ func TestNaturalTaskDefinitionEditAmbiguityExposesNoWriteTool(t *testing.T) {
 	loop.taskEditIntentFn = func(
 		_ context.Context,
 		messages []llm.ChatMessage,
-	) (bool, error) {
+	) (taskEditIntentDecision, error) {
 		intentMessages = append(
 			intentMessages,
 			append([]llm.ChatMessage(nil), messages...),
 		)
-		return true, nil
+		return taskEditIntentExecute, nil
 	}
 
 	out, err := loop.HandleMessage(
@@ -469,12 +469,12 @@ func TestNaturalTaskDefinitionEditCancellationLeavesEditLane(t *testing.T) {
 	loop.taskEditIntentFn = func(
 		_ context.Context,
 		messages []llm.ChatMessage,
-	) (bool, error) {
+	) (taskEditIntentDecision, error) {
 		intentCalls++
 		if messages[len(messages)-1].Content == "AI 周报不用改了" {
-			return false, nil
+			return taskEditIntentAnswerOnly, nil
 		}
-		return true, nil
+		return taskEditIntentExecute, nil
 	}
 
 	first, err := loop.HandleMessage(
@@ -547,11 +547,26 @@ func TestNaturalTaskDefinitionEditCandidate(t *testing.T) {
 	}
 }
 
+func TestRemoveScheduleExplicitIntentRejectsNegation(t *testing.T) {
+	for _, text := range []string{
+		"不要删除任务，只把日报改成周报",
+		"别取消任务，我只是想修改频率",
+		"不用删除 AI 日报",
+	} {
+		if explicitOwnerToolIntent("remove_schedule", text) {
+			t.Errorf("negated removal treated as explicit: %q", text)
+		}
+	}
+	if !explicitOwnerToolIntent("remove_schedule", "删除“AI 更新”任务") {
+		t.Fatal("explicit removal was rejected")
+	}
+}
+
 func TestTaskDefinitionEditIntentClassifierRequiresExplicitExecute(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		response *llm.ChatResponse
-		want     bool
+		want     taskEditIntentDecision
 	}{
 		{
 			name: "execute",
@@ -559,35 +574,49 @@ func TestTaskDefinitionEditIntentClassifierRequiresExplicitExecute(t *testing.T)
 				ID:   "route-1",
 				Name: taskDefinitionEditIntentTool.Name,
 				Arguments: `{
-					"decision":"execute"
+					"decision":"execute_edit"
 				}`,
 			}}},
-			want: true,
+			want: taskEditIntentExecute,
 		},
 		{
-			name: "non execute",
+			name: "other operation",
 			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
 				ID:   "route-2",
 				Name: taskDefinitionEditIntentTool.Name,
 				Arguments: `{
-					"decision":"non_execute"
+					"decision":"other_operation"
 				}`,
 			}}},
+			want: taskEditIntentOtherOperation,
 		},
 		{
-			name:     "tool free",
-			response: &llm.ChatResponse{Content: "execute"},
-		},
-		{
-			name: "unknown field",
+			name: "answer only",
 			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
 				ID:   "route-3",
 				Name: taskDefinitionEditIntentTool.Name,
 				Arguments: `{
-					"decision":"execute",
+					"decision":"answer_only"
+				}`,
+			}}},
+			want: taskEditIntentAnswerOnly,
+		},
+		{
+			name:     "tool free",
+			response: &llm.ChatResponse{Content: "execute"},
+			want:     taskEditIntentUnavailable,
+		},
+		{
+			name: "unknown field",
+			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID:   "route-4",
+				Name: taskDefinitionEditIntentTool.Name,
+				Arguments: `{
+					"decision":"execute_edit",
 					"extra":true
 				}`,
 			}}},
+			want: taskEditIntentUnavailable,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -608,7 +637,7 @@ func TestTaskDefinitionEditIntentClassifierRequiresExplicitExecute(t *testing.T)
 				t.Fatal(err)
 			}
 			if got != test.want {
-				t.Fatalf("allowed=%v, want %v", got, test.want)
+				t.Fatalf("decision=%v, want %v", got, test.want)
 			}
 		})
 	}
@@ -623,7 +652,7 @@ func TestTaskDefinitionEditIntentAndMainCallsSealOrderedContextSteps(t *testing.
 				ID:   "route-shadow",
 				Name: taskDefinitionEditIntentTool.Name,
 				Arguments: `{
-					"decision":"non_execute"
+					"decision":"answer_only"
 				}`,
 			}},
 		},
@@ -698,8 +727,8 @@ func TestTaskDefinitionEditNonExecuteCannotWrite(t *testing.T) {
 			loop.taskEditIntentFn = func(
 				context.Context,
 				[]llm.ChatMessage,
-			) (bool, error) {
-				return false, nil
+			) (taskEditIntentDecision, error) {
+				return taskEditIntentAnswerOnly, nil
 			}
 			out, err := loop.HandleMessage(
 				t.Context(), 7, ownerRequest,
@@ -718,6 +747,104 @@ func TestTaskDefinitionEditNonExecuteCannotWrite(t *testing.T) {
 			if len(controller.proposeCalls) != 0 ||
 				len(controller.executeCalls) != 0 {
 				t.Fatal("non-execute request reached durable controller")
+			}
+		})
+	}
+}
+
+func TestTaskEditOtherOperationKeepsMatchingCapability(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		request string
+		tool    ToolSpec
+	}{
+		{
+			name:    "delete task whose name contains update",
+			request: "删除“AI 更新”任务",
+			tool: newToolSpec(
+				&fakeTool{name: "remove_schedule"},
+				ownerPolicy(
+					Effects(
+						EffectStateWrite,
+						EffectDirectOwnerWrite,
+					),
+					BudgetNone,
+				),
+			),
+		},
+		{
+			name:    "run task whose name contains update",
+			request: "立即运行“每周更新”任务",
+			tool: newToolSpec(
+				&fakeTool{name: "run_task_now"},
+				withToolSurface(
+					ownerPolicy(
+						Effects(EffectDelivery),
+						BudgetDownstreamManaged,
+					),
+					ExposureIntent,
+					IntentTasks,
+					ResultTrustLocal,
+					true,
+				),
+			),
+		},
+		{
+			name:    "one off update search",
+			request: "更新一下 OpenAI 最新消息",
+			tool: newToolSpec(
+				&fakeTool{name: "web_search"},
+				withToolSurface(
+					ownerPolicy(
+						Effects(
+							EffectNetworkRead,
+							EffectBillable,
+							EffectTrustTaint,
+						),
+						BudgetToolManaged,
+					),
+					ExposureIntent,
+					IntentWebResearch,
+					ResultTrustExternal,
+					false,
+				),
+			),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			loop := New(Deps{
+				Store:      newFakeStore(),
+				Tools:      []ToolSpec{test.tool},
+				Model:      "test-model",
+				MaxTurns:   20,
+				SessionTTL: 30 * time.Minute,
+			})
+			var request llm.ChatRequest
+			loop.chatFn = func(
+				_ context.Context,
+				got llm.ChatRequest,
+			) (*llm.ChatResponse, error) {
+				request = got
+				return &llm.ChatResponse{Content: "已理解该操作。"}, nil
+			}
+			loop.taskEditIntentFn = func(
+				context.Context,
+				[]llm.ChatMessage,
+			) (taskEditIntentDecision, error) {
+				return taskEditIntentOtherOperation, nil
+			}
+			if _, err := loop.HandleMessage(
+				t.Context(), 7, test.request,
+			); err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, name := range toolDefNames(request.Tools) {
+				found = found || name == test.tool.Name()
+			}
+			if !found {
+				t.Fatalf("tools=%v, want %s",
+					toolDefNames(request.Tools), test.tool.Name())
 			}
 		})
 	}
@@ -770,8 +897,9 @@ func TestTaskDefinitionEditAdjudicationFailureSuppressesAllWrites(t *testing.T) 
 	loop.taskEditIntentFn = func(
 		context.Context,
 		[]llm.ChatMessage,
-	) (bool, error) {
-		return false, errors.New("semantic gate unavailable")
+	) (taskEditIntentDecision, error) {
+		return taskEditIntentUnavailable,
+			errors.New("semantic gate unavailable")
 	}
 
 	out, err := loop.HandleMessage(

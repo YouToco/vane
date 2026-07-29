@@ -108,10 +108,11 @@ const taskDefinitionEditIntentSystemPrompt = `
 你是任务操作的只读意图裁决器。你不能执行任何操作，只能调用 route_task_edit_intent 一次。
 
 判断最后一条用户消息是否授权“现在立即修改已有任务定义”：
-- execute：用户本轮明确命令立即修改；或上一轮已明确命令修改、助手仅追问目标任务，本轮用户直接选择了一个候选且没有撤销。
-- non_execute：询问是否合适、利弊、影响、怎么做、假设场景、表达否定/取消/不用改；改为删除、运行、创建等其他动作；或任何含糊情况。
+- execute_edit：用户本轮明确命令立即修改；或上一轮已明确命令修改、助手仅追问目标任务，本轮用户直接选择了一个候选且没有撤销。
+- other_operation：用户明确要求删除、运行、创建任务，或一次性联网查询等不同操作。即使任务名称里含“更新”等词，也应选此项。
+- answer_only：询问是否合适、利弊、影响、怎么做、假设场景、表达否定/取消/不用改，或任何含糊情况。
 
-必须理解整句话和相邻对话，不能因为出现“把/改为/可以/任务”等词就推断授权。含糊时一律 non_execute。`
+必须理解整句话和相邻对话，不能因为出现“把/改为/可以/任务/更新”等词就推断授权。含糊时一律 answer_only。`
 
 var taskDefinitionEditIntentTool = llm.ToolDef{
 	Name:        "route_task_edit_intent",
@@ -121,7 +122,7 @@ var taskDefinitionEditIntentTool = llm.ToolDef{
 	  "properties": {
 	    "decision": {
 	      "type": "string",
-	      "enum": ["execute", "non_execute"]
+	      "enum": ["execute_edit", "other_operation", "answer_only"]
 	    }
 	  },
 	  "required": ["decision"],
@@ -313,6 +314,15 @@ type Outcome struct {
 	Reply string // 给用户的文字回复（恒非空）
 }
 
+type taskEditIntentDecision uint8
+
+const (
+	taskEditIntentUnavailable taskEditIntentDecision = iota
+	taskEditIntentExecute
+	taskEditIntentOtherOperation
+	taskEditIntentAnswerOnly
+)
+
 type creationReceiptSessionStore interface {
 	RecordTaskCreationReceiptSessionMessages(
 		ctx context.Context,
@@ -359,7 +369,7 @@ type Loop struct {
 	taskEditIntentFn func(
 		context.Context,
 		[]llm.ChatMessage,
-	) (bool, error)
+	) (taskEditIntentDecision, error)
 
 	// userMu 按 userID 串行化 HandleMessage（审查 #并发盲覆盖）：feishu 对每条消息
 	// 起独立 goroutine，而 HandleMessage 是 load→append→save 的读改写；
@@ -556,9 +566,9 @@ func agentChatRetryDelay(failedAttempt int) time.Duration {
 func (l *Loop) classifyTaskDefinitionEditIntent(
 	ctx context.Context,
 	messages []llm.ChatMessage,
-) (bool, error) {
+) (taskEditIntentDecision, error) {
 	if l == nil || l.chatFn == nil {
-		return false, nil
+		return taskEditIntentUnavailable, nil
 	}
 	resp, err := l.chatWithContextShadow(ctx, llm.ChatRequest{
 		Model: l.model,
@@ -573,11 +583,11 @@ func (l *Loop) classifyTaskDefinitionEditIntent(
 		DisableThinking: true,
 	}, nil, 1)
 	if err != nil {
-		return false, err
+		return taskEditIntentUnavailable, err
 	}
 	if resp == nil || len(resp.ToolCalls) != 1 ||
 		resp.ToolCalls[0].Name != taskDefinitionEditIntentTool.Name {
-		return false, nil
+		return taskEditIntentUnavailable, nil
 	}
 	var args struct {
 		Decision string `json:"decision"`
@@ -586,9 +596,18 @@ func (l *Loop) classifyTaskDefinitionEditIntent(
 		json.RawMessage(resp.ToolCalls[0].Arguments),
 		&args,
 	) != nil {
-		return false, nil
+		return taskEditIntentUnavailable, nil
 	}
-	return args.Decision == "execute", nil
+	switch args.Decision {
+	case "execute_edit":
+		return taskEditIntentExecute, nil
+	case "other_operation":
+		return taskEditIntentOtherOperation, nil
+	case "answer_only":
+		return taskEditIntentAnswerOnly, nil
+	default:
+		return taskEditIntentUnavailable, nil
+	}
 }
 
 func (l *Loop) chatWithContextShadow(
@@ -891,6 +910,7 @@ func (l *Loop) handleMessage(
 		(isNaturalTaskDefinitionEditCandidate(text) ||
 			naturalTaskDefinitionEditContinuation)
 	naturalTaskDefinitionEdit := false
+	taskEditDecision := taskEditIntentUnavailable
 	intentClassificationTurns := 0
 	if naturalTaskDefinitionEditCandidate {
 		intentMessages := []llm.ChatMessage{{
@@ -904,21 +924,28 @@ func (l *Loop) handleMessage(
 		}
 		if l.taskEditIntentFn != nil {
 			intentClassificationTurns = 1
-			allowed, classifyErr := l.taskEditIntentFn(ctx, intentMessages)
+			decision, classifyErr := l.taskEditIntentFn(
+				ctx, intentMessages,
+			)
 			if classifyErr != nil {
 				slog.Warn(
 					"agent: 任务编辑意图裁决失败，按非执行请求处理",
 					"user_id", userID,
 					"error", classifyErr,
 				)
+			} else {
+				taskEditDecision = decision
 			}
-			naturalTaskDefinitionEdit = classifyErr == nil && allowed
+			naturalTaskDefinitionEdit =
+				classifyErr == nil &&
+					decision == taskEditIntentExecute
 		}
 	}
 	directProposal := directTaskCreation || directDefinitionEdit ||
 		naturalTaskDefinitionEdit
 	sideEffectFreeTurn := naturalTaskDefinitionEditCandidate &&
-		!naturalTaskDefinitionEdit
+		(taskEditDecision == taskEditIntentUnavailable ||
+			taskEditDecision == taskEditIntentAnswerOnly)
 
 	// 外部上下文入口不读取画像：不是“读了但不渲染”，而是从数据访问层就不碰。
 	// direct-task-creation 同样从数据访问层跳过画像，防止模型把用户没有批准的

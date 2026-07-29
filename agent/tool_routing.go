@@ -52,9 +52,25 @@ func explicitOwnerToolIntent(toolName, text string) bool {
 	normalized := strings.ToLower(strings.Join(strings.Fields(text), ""))
 	switch toolName {
 	case "remove_schedule":
-		return containsAny(normalized,
+		if containsAny(normalized,
+			"不要删除", "别删除", "不删除", "无需删除", "不用删除",
+			"不要取消", "别取消", "不取消", "无需取消", "不用取消",
+			"donotdelete", "don'tdelete", "donotremove", "don'tremove",
+		) {
+			return false
+		}
+		if containsAny(normalized,
+			"为什么", "怎么删除", "如何删除", "是否", "要不要",
+			"会怎样", "有什么影响", "利弊", "why", "howto",
+		) {
+			return false
+		}
+		return startsWithAny(normalized,
+			"删除", "请删除", "帮我删除", "取消", "请取消",
+			"停止", "请停止", "关掉", "请关掉", "移除", "请移除",
+		) || containsAny(normalized,
 			"删除任务", "取消任务", "停止任务", "关掉任务", "移除任务",
-			"删除早报", "取消早报", "removeschedule", "deletetask",
+			"删除早报", "取消早报", "删掉", "removeschedule", "deletetask",
 		)
 	case "run_task_now":
 		return containsAny(normalized,
