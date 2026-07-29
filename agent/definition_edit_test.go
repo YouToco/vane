@@ -200,13 +200,25 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 		got[0] != "edit_task_definition" {
 		t.Fatalf("third tools=%v, want edit_task_definition only", got)
 	}
+	if chat.requests[3].ToolChoice != "" {
+		t.Fatalf("first resolved tool choice=%q, want provider default",
+			chat.requests[3].ToolChoice)
+	}
 	if got := toolDefNames(chat.requests[4].Tools); len(got) != 1 ||
 		got[0] != "edit_task_definition" {
 		t.Fatalf("fourth tools=%v, want edit_task_definition only", got)
 	}
+	if chat.requests[4].ToolChoice != llm.ToolChoiceRequired {
+		t.Fatalf("resolved retry tool choice=%q, want required",
+			chat.requests[4].ToolChoice)
+	}
 	if got := toolDefNames(chat.requests[5].Tools); len(got) != 1 ||
 		got[0] != "edit_task_definition" {
 		t.Fatalf("fifth tools=%v, want edit_task_definition only", got)
+	}
+	if chat.requests[5].ToolChoice != llm.ToolChoiceRequired {
+		t.Fatalf("second resolved retry tool choice=%q, want required",
+			chat.requests[5].ToolChoice)
 	}
 	if !strings.Contains(
 		chat.requests[5].Messages[0].Content,

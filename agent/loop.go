@@ -1319,6 +1319,16 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			// Temperature 保持 nil：用上游默认值。
 			DisableThinking: true,
 		}
+		if state.naturalTaskDefinitionEdit &&
+			state.naturalTaskDefinitionEditResponseRejected &&
+			len(tools) == 1 {
+			// The first response remains free to ask a genuine, targeted
+			// clarification. Once a non-question response was rejected, this
+			// isolated lane has exactly one stage-valid tool, so require a call
+			// instead of paying for more ordinary-text evasions. The harness
+			// still validates the tool name, target binding and full arguments.
+			request.ToolChoice = llm.ToolChoiceRequired
+		}
 		// 7.8-A is observation-only: synchronously build the provider-neutral
 		// candidate, send the already-built legacy request unchanged, and only
 		// then admit a bounded asynchronous seal. Store/root-lock latency cannot

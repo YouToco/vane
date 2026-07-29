@@ -48,6 +48,15 @@ type ToolDef struct {
 	Parameters  json.RawMessage `json:"parameters"` // JSON schema
 }
 
+// ToolChoice controls whether a request may finish without calling a declared
+// tool. Keep the zero value as provider-default "auto" behavior; constrained
+// agent lanes opt into required only after rejecting a non-tool response.
+type ToolChoice string
+
+const (
+	ToolChoiceRequired ToolChoice = "required"
+)
+
 // ChatRequest 多轮对话请求。与 Request 的差异：显式 messages（含历史）、
 // 可带 tools、可按次覆盖模型——agent 用 cfg.LLM.AgentModel（推理型），
 // 其余调用仍走 Client 默认 model，避免为一个调用面再建一个 Client。
@@ -55,6 +64,7 @@ type ChatRequest struct {
 	Model           string // 空串用 Client 默认 model；agent 传 cfg.LLM.AgentModel
 	Messages        []ChatMessage
 	Tools           []ToolDef
+	ToolChoice      ToolChoice
 	Temperature     *float32 // nil = 不传该字段
 	MaxTokens       *int     // nil = 不传该字段
 	DisableThinking bool     // 语义同 Request.DisableThinking（见 client.go 的事故注释）
@@ -114,6 +124,7 @@ type wireChatRequest struct {
 	Model       string            `json:"model"`
 	Messages    []wireChatMessage `json:"messages"`
 	Tools       []wireToolDef     `json:"tools,omitempty"`
+	ToolChoice  ToolChoice        `json:"tool_choice,omitempty"`
 	Temperature *float32          `json:"temperature,omitempty"`
 	MaxTokens   *int              `json:"max_tokens,omitempty"`
 	Thinking    *thinkingConfig   `json:"thinking,omitempty"`
@@ -205,6 +216,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		Model:       model,
 		Messages:    messages,
 		Tools:       tools,
+		ToolChoice:  req.ToolChoice,
 		Temperature: c.requestTemperature(model, req.Temperature),
 		MaxTokens:   req.MaxTokens,
 		Thinking:    thinking,

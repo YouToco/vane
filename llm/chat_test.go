@@ -158,10 +158,31 @@ func TestChatDefaultsOmitOptional(t *testing.T) {
 		t.Fatalf("Chat 返回错误: %v", err)
 	}
 
-	for _, field := range []string{"thinking", "tools", "temperature", "max_tokens"} {
+	for _, field := range []string{
+		"thinking", "tools", "tool_choice", "temperature", "max_tokens",
+	} {
 		if _, present := gotBody[field]; present {
 			t.Errorf("未设置时不应携带 %s 字段，实际 %v", field, gotBody[field])
 		}
+	}
+}
+
+func TestChatSerializesRequiredToolChoice(t *testing.T) {
+	var gotBody map[string]any
+	srv := newChatCaptureServer(t, chatOKBody, &gotBody)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, 5)
+	if _, err := c.Chat(context.Background(), ChatRequest{
+		Messages:   []ChatMessage{{Role: "user", Content: "edit it"}},
+		Tools:      []ToolDef{{Name: "edit_task_definition"}},
+		ToolChoice: ToolChoiceRequired,
+	}); err != nil {
+		t.Fatalf("Chat 返回错误: %v", err)
+	}
+
+	if gotBody["tool_choice"] != "required" {
+		t.Fatalf("tool_choice=%v, want required", gotBody["tool_choice"])
 	}
 }
 
