@@ -58,15 +58,10 @@ type definitionEditControllerFakeCoordinator struct {
 	prepareErr         error
 	validateProjection bool
 
-	confirmScopes   []types.TaskDefinitionEditScope
-	confirmReceipts []TaskDefinitionEditReceiptTarget
-	confirmOutcome  TaskDefinitionEditOutcome
-	confirmErr      error
-
-	cancelScopes   []types.TaskDefinitionEditScope
-	cancelReceipts []TaskDefinitionEditReceiptTarget
-	cancelOutcome  TaskDefinitionEditOutcome
-	cancelErr      error
+	executeScopes   []types.TaskDefinitionEditScope
+	executeReceipts []TaskDefinitionEditReceiptTarget
+	executeOutcome  TaskDefinitionEditOutcome
+	executeErr      error
 }
 
 func (f *definitionEditControllerFakeCoordinator) PrepareAndSealProposal(
@@ -82,24 +77,14 @@ func (f *definitionEditControllerFakeCoordinator) PrepareAndSealProposal(
 	return f.prepareOp, f.prepareErr
 }
 
-func (f *definitionEditControllerFakeCoordinator) Confirm(
+func (f *definitionEditControllerFakeCoordinator) Execute(
 	_ context.Context,
 	scope types.TaskDefinitionEditScope,
 	receipt TaskDefinitionEditReceiptTarget,
 ) (TaskDefinitionEditOutcome, error) {
-	f.confirmScopes = append(f.confirmScopes, scope)
-	f.confirmReceipts = append(f.confirmReceipts, receipt)
-	return f.confirmOutcome, f.confirmErr
-}
-
-func (f *definitionEditControllerFakeCoordinator) Cancel(
-	_ context.Context,
-	scope types.TaskDefinitionEditScope,
-	receipt TaskDefinitionEditReceiptTarget,
-) (TaskDefinitionEditOutcome, error) {
-	f.cancelScopes = append(f.cancelScopes, scope)
-	f.cancelReceipts = append(f.cancelReceipts, receipt)
-	return f.cancelOutcome, f.cancelErr
+	f.executeScopes = append(f.executeScopes, scope)
+	f.executeReceipts = append(f.executeReceipts, receipt)
+	return f.executeOutcome, f.executeErr
 }
 
 func TestDefinitionEditController_ProposeSealsExactPatchedDefinition(t *testing.T) {
@@ -125,7 +110,7 @@ func TestDefinitionEditController_ProposeSealsExactPatchedDefinition(t *testing.
 	}
 	controller := NewDefinitionEditController(store, coordinator)
 	sessionID := int64(91)
-	proposal, err := controller.Propose(t.Context(), DefinitionEditProposalInput{
+	proposal, err := controller.Prepare(t.Context(), DefinitionEditProposalInput{
 		ActionID: "edit-action-1", UserID: 11, SessionID: &sessionID,
 		RawArgs: json.RawMessage(`{
 			"task_id":"task-edit-1",
@@ -154,7 +139,7 @@ func TestDefinitionEditController_ProposeSealsExactPatchedDefinition(t *testing.
 	}
 	got := coordinator.prepareCalls[0]
 	if got.OperationID != "edit-action-1" ||
-		got.ApprovalRef != "definition-edit:edit-action-1" ||
+		got.OperationRef != "definition-edit:edit-action-1" ||
 		got.ActorTenantID != 7 || got.ActorUserID != 11 ||
 		got.TargetTenantID != 7 || got.TargetUserID != 11 ||
 		got.TaskID != "task-edit-1" || got.SessionID != sessionID ||
@@ -224,7 +209,7 @@ func TestDefinitionEditController_ProposeObservationPolicyReachesConfirmation(t 
 			"qualifier_prompt":"vane.qualify-events/v1"
 		}
 	}`)
-	proposal, err := controller.Propose(t.Context(), DefinitionEditProposalInput{
+	proposal, err := controller.Prepare(t.Context(), DefinitionEditProposalInput{
 		ActionID: "edit-observation-1", UserID: 11, SessionID: &sessionID,
 		RawArgs:   rawArgs,
 		ExpiresAt: time.Now().Add(time.Hour),
@@ -269,7 +254,7 @@ func TestDefinitionEditController_ProposeObservationPolicyReachesConfirmation(t 
 	)
 	secondArgs := bytes.Replace(rawArgs, []byte(`general_availability`),
 		[]byte(`official_announcement`), 1)
-	if _, err := secondController.Propose(
+	if _, err := secondController.Prepare(
 		t.Context(),
 		DefinitionEditProposalInput{
 			ActionID: "edit-observation-2", UserID: 11, SessionID: &sessionID,
@@ -293,7 +278,7 @@ func TestDefinitionEditController_ProposeRejectsNoopBeforeCoordinator(t *testing
 	coordinator := &definitionEditControllerFakeCoordinator{}
 	controller := NewDefinitionEditController(store, coordinator)
 	sessionID := int64(2)
-	_, err = controller.Propose(t.Context(), DefinitionEditProposalInput{
+	_, err = controller.Prepare(t.Context(), DefinitionEditProposalInput{
 		ActionID: "edit-noop", UserID: 11, SessionID: &sessionID,
 		RawArgs: json.RawMessage(`{
 			"task_id":"task-edit-1",
@@ -321,7 +306,7 @@ func TestDefinitionEditController_ProposeRejectsNullPatchFieldsBeforeStore(t *te
 		"null description": `{"task_id":"task-edit-1","nl_description":null}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := controller.Propose(
+			_, err := controller.Prepare(
 				t.Context(),
 				DefinitionEditProposalInput{
 					ActionID: "edit-null", UserID: 11, SessionID: &sessionID,
@@ -336,7 +321,7 @@ func TestDefinitionEditController_ProposeRejectsNullPatchFieldsBeforeStore(t *te
 	}
 }
 
-func TestDefinitionEditController_ConfirmAndCancelUseRecoveredScope(t *testing.T) {
+func TestDefinitionEditController_ExecuteUsesRecoveredScope(t *testing.T) {
 	scope := types.TaskDefinitionEditScope{
 		ID: "edit-action-2", TenantID: 7, UserID: 11,
 		TargetTenantID: 7, TargetUserID: 11, TaskID: "task-edit-1",
@@ -349,33 +334,23 @@ func TestDefinitionEditController_ConfirmAndCancelUseRecoveredScope(t *testing.T
 		},
 	}
 	coordinator := &definitionEditControllerFakeCoordinator{
-		confirmOutcome: TaskDefinitionEditOutcome{
+		executeOutcome: TaskDefinitionEditOutcome{
 			OperationID: scope.ID, TaskID: scope.TaskID,
 			Status: types.TaskDefinitionEditOperationStatusCompleted,
-		},
-		cancelOutcome: TaskDefinitionEditOutcome{
-			OperationID: scope.ID, TaskID: scope.TaskID,
-			Status: types.TaskDefinitionEditOperationStatusCancelled,
 		},
 	}
 	controller := NewDefinitionEditController(store, coordinator)
 	receipt := TaskDefinitionEditReceiptTarget{
 		Provider: "feishu_card_patch/app", Target: "om_original",
 	}
-	confirmed, err := controller.Confirm(t.Context(), 11, scope.ID, receipt)
+	confirmed, err := controller.Execute(t.Context(), 11, scope.ID, receipt)
 	if err != nil || confirmed.OperationID != scope.ID {
-		t.Fatalf("Confirm() = %+v, %v", confirmed, err)
+		t.Fatalf("Execute() = %+v, %v", confirmed, err)
 	}
-	cancelled, err := controller.Cancel(t.Context(), 11, scope.ID, receipt)
-	if err != nil || cancelled.Status != types.TaskDefinitionEditOperationStatusCancelled {
-		t.Fatalf("Cancel() = %+v, %v", cancelled, err)
-	}
-	if len(coordinator.confirmScopes) != 1 || coordinator.confirmScopes[0] != scope ||
-		len(coordinator.cancelScopes) != 1 || coordinator.cancelScopes[0] != scope ||
-		coordinator.confirmReceipts[0] != receipt ||
-		coordinator.cancelReceipts[0] != receipt {
-		t.Fatalf("coordinator routing drifted: confirm=%+v cancel=%+v",
-			coordinator.confirmScopes, coordinator.cancelScopes)
+	if len(coordinator.executeScopes) != 1 || coordinator.executeScopes[0] != scope ||
+		coordinator.executeReceipts[0] != receipt {
+		t.Fatalf("coordinator routing drifted: execute=%+v",
+			coordinator.executeScopes)
 	}
 }
 
@@ -385,8 +360,8 @@ func TestDefinitionEditController_NotFoundSentinelIsNarrow(t *testing.T) {
 		&definitionEditControllerFakeCoordinator{},
 	)
 	receipt := TaskDefinitionEditReceiptTarget{Provider: "p", Target: "t"}
-	if _, err := controller.Confirm(t.Context(), 11, "missing", receipt); !errors.Is(err, ErrDefinitionEditOperationNotFound) {
-		t.Fatalf("Confirm() error = %v, want narrow not-found sentinel", err)
+	if _, err := controller.Execute(t.Context(), 11, "missing", receipt); !errors.Is(err, ErrDefinitionEditOperationNotFound) {
+		t.Fatalf("Execute() error = %v, want narrow not-found sentinel", err)
 	}
 
 	databaseErr := types.NewAppError(types.CodeDatabase, "read failed", nil)
@@ -394,8 +369,8 @@ func TestDefinitionEditController_NotFoundSentinelIsNarrow(t *testing.T) {
 		&definitionEditControllerFakeStore{loadErr: databaseErr},
 		&definitionEditControllerFakeCoordinator{},
 	)
-	if _, err := controller.Cancel(t.Context(), 11, "broken", receipt); !errors.Is(err, databaseErr) || errors.Is(err, ErrDefinitionEditOperationNotFound) {
-		t.Fatalf("Cancel() error = %v, must not downgrade infrastructure failure", err)
+	if _, err := controller.Execute(t.Context(), 11, "broken", receipt); !errors.Is(err, databaseErr) || errors.Is(err, ErrDefinitionEditOperationNotFound) {
+		t.Fatalf("Execute() error = %v, must not downgrade infrastructure failure", err)
 	}
 }
 

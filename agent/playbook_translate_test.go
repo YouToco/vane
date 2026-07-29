@@ -38,7 +38,7 @@ func TestLLMPlaybookTranslator(t *testing.T) {
 		var gotBody map[string]any
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewDecoder(r.Body).Decode(&gotBody)
-			cannedPlan(w, `{"sources":[{"platform":"web","capability":"search","query":"Anthropic","include_domains":["anthropic.com"]}]}`)
+			cannedPlan(w, `{"targets":[{"platform":"web","capability":"search","query":"Anthropic","include_domains":["anthropic.com"]}]}`)
 		}))
 		defer srv.Close()
 
@@ -46,7 +46,7 @@ func TestLLMPlaybookTranslator(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Translate 失败: %v", err)
 		}
-		if n := countPlanSources(raw); n != 1 {
+		if n := countPlanTargets(raw); n != 1 {
 			t.Fatalf("应编译出 1 个源, 实得 %d: %s", n, raw)
 		}
 		// 关键回归守卫：thinking 必须 disabled（否则 V4 思维链吃光预算、content 恒空）。
@@ -77,7 +77,7 @@ func TestLLMPlaybookTranslator(t *testing.T) {
 		var hits int
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			hits++
-			cannedPlan(w, `{"sources":[]}`)
+			cannedPlan(w, `{"targets":[]}`)
 		}))
 		defer srv.Close()
 
@@ -88,7 +88,7 @@ func TestLLMPlaybookTranslator(t *testing.T) {
 		if hits != 0 {
 			t.Fatalf("空手册不该打 LLM, 实际调用 %d 次", hits)
 		}
-		if countPlanSources(raw) != 0 {
+		if countPlanTargets(raw) != 0 {
 			t.Fatalf("空手册应得零源计划: %s", raw)
 		}
 	})
@@ -105,7 +105,7 @@ func TestLLMPlaybookTranslator(t *testing.T) {
 	})
 }
 
-// compilePlan 是编译层纯函数核心：解析模型输出 + 逐源 sourcespec 校验。此处覆盖全部分支，
+// compilePlan 是编译层纯函数核心：解析模型输出 + 逐目标 fetchspec 校验。此处覆盖全部分支，
 // 无需真 LLM（真 Translate 只是"发一次 llm.Do 再把 Content 交给它"的薄胶水）。
 func TestCompilePlan(t *testing.T) {
 	parse := func(t *testing.T, raw json.RawMessage) FetchPlan {
@@ -118,15 +118,15 @@ func TestCompilePlan(t *testing.T) {
 	}
 
 	t.Run("单个 web/search 源正常编译", func(t *testing.T) {
-		raw, err := compilePlan(`{"sources":[{"platform":"web","capability":"search","query":"AI 新闻","include_domains":["anthropic.com"]}]}`)
+		raw, err := compilePlan(`{"targets":[{"platform":"web","capability":"search","query":"AI 新闻","include_domains":["anthropic.com"]}]}`)
 		if err != nil {
 			t.Fatalf("不应报错: %v", err)
 		}
 		p := parse(t, raw)
-		if len(p.Sources) != 1 {
-			t.Fatalf("应编译出 1 个源, 实得 %d", len(p.Sources))
+		if len(p.Targets) != 1 {
+			t.Fatalf("应编译出 1 个源, 实得 %d", len(p.Targets))
 		}
-		s := p.Sources[0]
+		s := p.Targets[0]
 		if s.Platform != "web" || s.Capability != "search" {
 			t.Fatalf("平台/能力不符: %+v", s)
 		}
@@ -140,21 +140,21 @@ func TestCompilePlan(t *testing.T) {
 	})
 
 	t.Run("多源全部有效", func(t *testing.T) {
-		raw, err := compilePlan(`{"sources":[
+		raw, err := compilePlan(`{"targets":[
 			{"platform":"web","capability":"feed","url":"https://openai.com/blog/rss.xml"},
 			{"platform":"web","capability":"search","query":"发布"}
 		]}`)
 		if err != nil {
 			t.Fatalf("不应报错: %v", err)
 		}
-		if p := parse(t, raw); len(p.Sources) != 2 {
-			t.Fatalf("应编译出 2 个源, 实得 %d", len(p.Sources))
+		if p := parse(t, raw); len(p.Targets) != 2 {
+			t.Fatalf("应编译出 2 个源, 实得 %d", len(p.Targets))
 		}
 	})
 
 	t.Run("校验不过的单源被丢弃、其余保留", func(t *testing.T) {
-		// 第一个缺 query（web/search 必填）→ sourcespec.Build 拒绝 → 丢弃；第二个有效。
-		raw, err := compilePlan(`{"sources":[
+		// 第一个缺 query（web/search 必填）→ fetchspec.BuildTarget 拒绝 → 丢弃；第二个有效。
+		raw, err := compilePlan(`{"targets":[
 			{"platform":"web","capability":"search"},
 			{"platform":"web","capability":"feed","url":"https://a.com/rss"}
 		]}`)
@@ -162,60 +162,60 @@ func TestCompilePlan(t *testing.T) {
 			t.Fatalf("坏源丢弃不算致命, 不应报错: %v", err)
 		}
 		p := parse(t, raw)
-		if len(p.Sources) != 1 || p.Sources[0].Capability != "feed" {
-			t.Fatalf("应只留下有效的 feed 源, 实得 %+v", p.Sources)
+		if len(p.Targets) != 1 || p.Targets[0].Capability != "feed" {
+			t.Fatalf("应只留下有效的 feed 源, 实得 %+v", p.Targets)
 		}
 	})
 
 	t.Run("缺 platform/capability 跳过", func(t *testing.T) {
-		raw, err := compilePlan(`{"sources":[{"query":"x"},{"platform":"web","capability":"search","query":"y"}]}`)
+		raw, err := compilePlan(`{"targets":[{"query":"x"},{"platform":"web","capability":"search","query":"y"}]}`)
 		if err != nil {
 			t.Fatalf("不应报错: %v", err)
 		}
-		if p := parse(t, raw); len(p.Sources) != 1 {
-			t.Fatalf("缺路由字段的源应跳过, 实得 %d", len(p.Sources))
+		if p := parse(t, raw); len(p.Targets) != 1 {
+			t.Fatalf("缺路由字段的源应跳过, 实得 %d", len(p.Targets))
 		}
 	})
 
-	t.Run("模型给了源但全部无效 → errAllSourcesDropped（软失败保留既有计划）", func(t *testing.T) {
+	t.Run("模型给了源但全部无效 → errAllTargetsDropped（软失败保留既有计划）", func(t *testing.T) {
 		// 缺 query 的 web/search 被 Build 丢弃 → 有源输入但零有效输出：这是翻译质量失败，
 		// 不是"无抓取意图"，必须软失败（让调用方保留既有计划），绝不用空计划把好计划冲掉。
-		if _, err := compilePlan(`{"sources":[{"platform":"web","capability":"search"}]}`); !errors.Is(err, errAllSourcesDropped) {
-			t.Fatalf("有源输入但全被丢应报 errAllSourcesDropped, 实得 %v", err)
+		if _, err := compilePlan(`{"targets":[{"platform":"web","capability":"search"}]}`); !errors.Is(err, errAllTargetsDropped) {
+			t.Fatalf("有源输入但全被丢应报 errAllTargetsDropped, 实得 %v", err)
 		}
 		// 全缺路由字段（被跳过而非 Build 失败）同样算翻译失败。
-		if _, err := compilePlan(`{"sources":[{"query":"x"}]}`); !errors.Is(err, errAllSourcesDropped) {
-			t.Fatalf("全缺 platform/capability 也应报 errAllSourcesDropped, 实得 %v", err)
+		if _, err := compilePlan(`{"targets":[{"query":"x"}]}`); !errors.Is(err, errAllTargetsDropped) {
+			t.Fatalf("全缺 platform/capability 也应报 errAllTargetsDropped, 实得 %v", err)
 		}
 	})
 
 	t.Run("模型本就返回零源 → 正当清空（空计划非错误）", func(t *testing.T) {
-		raw, err := compilePlan(`{"sources":[]}`)
+		raw, err := compilePlan(`{"targets":[]}`)
 		if err != nil {
 			t.Fatalf("模型无抓取意图返回零源是合法结果: %v", err)
 		}
-		if p := parse(t, raw); len(p.Sources) != 0 {
+		if p := parse(t, raw); len(p.Targets) != 0 {
 			t.Fatalf("应为空计划")
 		}
 	})
 
 	t.Run("容忍 markdown 代码块围栏", func(t *testing.T) {
-		raw, err := compilePlan("```json\n{\"sources\":[{\"platform\":\"xhs\",\"capability\":\"search\",\"keyword\":\"美妆\"}]}\n```")
+		raw, err := compilePlan("```json\n{\"targets\":[{\"platform\":\"xhs\",\"capability\":\"search\",\"keyword\":\"美妆\"}]}\n```")
 		if err != nil {
 			t.Fatalf("围栏应被剥离: %v", err)
 		}
-		if p := parse(t, raw); len(p.Sources) != 1 || p.Sources[0].Platform != "xhs" {
-			t.Fatalf("围栏内 JSON 未正确解析: %+v", p.Sources)
+		if p := parse(t, raw); len(p.Targets) != 1 || p.Targets[0].Platform != "xhs" {
+			t.Fatalf("围栏内 JSON 未正确解析: %+v", p.Targets)
 		}
 	})
 
 	t.Run("容忍前后散文", func(t *testing.T) {
-		raw, err := compilePlan(`好的，这是计划：{"sources":[{"platform":"x","capability":"user_posts","screen_name":"OpenAI"}]} 完成。`)
+		raw, err := compilePlan(`好的，这是计划：{"targets":[{"platform":"x","capability":"user_posts","screen_name":"OpenAI"}]} 完成。`)
 		if err != nil {
 			t.Fatalf("散文包裹应被截取: %v", err)
 		}
-		if p := parse(t, raw); len(p.Sources) != 1 || p.Sources[0].Capability != "user_posts" {
-			t.Fatalf("散文中 JSON 未正确解析: %+v", p.Sources)
+		if p := parse(t, raw); len(p.Targets) != 1 || p.Targets[0].Capability != "user_posts" {
+			t.Fatalf("散文中 JSON 未正确解析: %+v", p.Targets)
 		}
 	})
 
@@ -226,7 +226,7 @@ func TestCompilePlan(t *testing.T) {
 	})
 
 	t.Run("JSON 非法 → errPlanUnparsable", func(t *testing.T) {
-		if _, err := compilePlan(`{"sources": [不是合法}`); !errors.Is(err, errPlanUnparsable) {
+		if _, err := compilePlan(`{"targets": [不是合法}`); !errors.Is(err, errPlanUnparsable) {
 			t.Fatalf("非法 JSON 应报 errPlanUnparsable, 实得 %v", err)
 		}
 	})
@@ -248,16 +248,16 @@ func TestExtractJSONObject(t *testing.T) {
 }
 
 func TestCountPlanSources(t *testing.T) {
-	if n := countPlanSources(nil); n != 0 {
+	if n := countPlanTargets(nil); n != 0 {
 		t.Errorf("nil 计划应为 0, 实得 %d", n)
 	}
-	if n := countPlanSources(json.RawMessage(`{"sources":[]}`)); n != 0 {
+	if n := countPlanTargets(json.RawMessage(`{"targets":[]}`)); n != 0 {
 		t.Errorf("空计划应为 0, 实得 %d", n)
 	}
-	if n := countPlanSources(json.RawMessage(`{"sources":[{"platform":"web"},{"platform":"x"}]}`)); n != 2 {
+	if n := countPlanTargets(json.RawMessage(`{"targets":[{"platform":"web"},{"platform":"x"}]}`)); n != 2 {
 		t.Errorf("两源计划应为 2, 实得 %d", n)
 	}
-	if n := countPlanSources(json.RawMessage(`不是JSON`)); n != 0 {
+	if n := countPlanTargets(json.RawMessage(`不是JSON`)); n != 0 {
 		t.Errorf("坏 JSON 应为 0, 实得 %d", n)
 	}
 }

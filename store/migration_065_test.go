@@ -10,9 +10,6 @@ import (
 
 func TestMigration065DownRemovesDatabaseLocalReaderCapability(t *testing.T) {
 	freshURL := freshMigrationDatabase(t, "vane_brief_reader_down")
-	if err := Migrate(t.Context(), freshURL); err != nil {
-		t.Fatal(err)
-	}
 	db, err := sql.Open("pgx", freshURL)
 	if err != nil {
 		t.Fatal(err)
@@ -24,6 +21,9 @@ func TestMigration065DownRemovesDatabaseLocalReaderCapability(t *testing.T) {
 	}
 	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 65); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := provider.DownTo(t.Context(), 64); err != nil {

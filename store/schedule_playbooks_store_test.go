@@ -112,19 +112,19 @@ func TestSchedulePlaybookStore(t *testing.T) {
 	})
 
 	// —— P1 编译层：SetFetchPlan（只改 fetch_plan、归属进 SQL、依附已存在手册行）——
-	sourceCount := func(t *testing.T, raw json.RawMessage) int {
+	targetCount := func(t *testing.T, raw json.RawMessage) int {
 		t.Helper()
 		var p struct {
-			Sources []map[string]any `json:"sources"`
+			Targets []map[string]any `json:"targets"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			t.Fatalf("fetch_plan 不是合法计划 JSON: %v (%s)", err, raw)
 		}
-		return len(p.Sources)
+		return len(p.Targets)
 	}
 
 	t.Run("SetFetchPlan 只改计划不动正文", func(t *testing.T) {
-		plan := json.RawMessage(`{"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=ai"}]}`)
+		plan := json.RawMessage(`{"targets":[{"platform":"web","capability":"search","url":"vane://web/search?q=ai"}]}`)
 		ok, err := st.SetFetchPlan(ctx, u.ID, schedID, plan)
 		if err != nil {
 			t.Fatalf("SetFetchPlan 失败: %v", err)
@@ -139,24 +139,24 @@ func TestSchedulePlaybookStore(t *testing.T) {
 		if pb.Content != "改成每天九点半" {
 			t.Errorf("SetFetchPlan 不应改动 content, 实得 %q", pb.Content)
 		}
-		if n := sourceCount(t, pb.FetchPlan); n != 1 {
-			t.Errorf("fetch_plan 未写入预期计划（应 1 源）, 实得 %d: %s", n, pb.FetchPlan)
+		if n := targetCount(t, pb.FetchPlan); n != 1 {
+			t.Errorf("fetch_plan 未写入预期计划（应 1 个目标）, 实得 %d: %s", n, pb.FetchPlan)
 		}
 	})
 
-	t.Run("SetFetchPlan 空计划归一化为零源对象", func(t *testing.T) {
+	t.Run("SetFetchPlan 空计划归一化为零目标对象", func(t *testing.T) {
 		ok, err := st.SetFetchPlan(ctx, u.ID, schedID, nil)
 		if err != nil || !ok {
 			t.Fatalf("空计划应 ok=true 无错: ok=%v err=%v", ok, err)
 		}
 		pb, _ := st.GetSchedulePlaybook(ctx, u.ID, schedID)
-		if n := sourceCount(t, pb.FetchPlan); n != 0 {
-			t.Errorf("nil 应归一化为 {\"sources\":[]}, 实得 %d 源: %s", n, pb.FetchPlan)
+		if n := targetCount(t, pb.FetchPlan); n != 0 {
+			t.Errorf("nil 应归一化为 {\"targets\":[]}, 实得 %d 个目标: %s", n, pb.FetchPlan)
 		}
 	})
 
 	t.Run("SetFetchPlan 归属校验：拒绝非属主且不覆盖", func(t *testing.T) {
-		ok, err := st.SetFetchPlan(ctx, u2.ID, schedID, json.RawMessage(`{"sources":[{"platform":"web","capability":"feed","url":"https://x.com/rss"}]}`))
+		ok, err := st.SetFetchPlan(ctx, u2.ID, schedID, json.RawMessage(`{"targets":[{"platform":"web","capability":"feed","url":"https://x.com/rss"}]}`))
 		if err != nil {
 			t.Fatalf("非属主不应报基础设施错误: %v", err)
 		}
@@ -164,13 +164,13 @@ func TestSchedulePlaybookStore(t *testing.T) {
 			t.Fatal("非属主写他人计划应 ok=false")
 		}
 		pb, _ := st.GetSchedulePlaybook(ctx, u.ID, schedID)
-		if n := sourceCount(t, pb.FetchPlan); n != 0 {
-			t.Errorf("非属主写入不得覆盖属主计划（应仍为零源）, 实得 %d 源: %s", n, pb.FetchPlan)
+		if n := targetCount(t, pb.FetchPlan); n != 0 {
+			t.Errorf("非属主写入不得覆盖属主计划（应仍为零目标）, 实得 %d 个目标: %s", n, pb.FetchPlan)
 		}
 	})
 
 	t.Run("SetFetchPlan 到不存在的任务 ok=false", func(t *testing.T) {
-		ok, err := st.SetFetchPlan(ctx, u.ID, "push-no-such-sched", json.RawMessage(`{"sources":[]}`))
+		ok, err := st.SetFetchPlan(ctx, u.ID, "push-no-such-sched", json.RawMessage(`{"targets":[]}`))
 		if err != nil {
 			t.Fatalf("不存在任务不应报错: %v", err)
 		}
@@ -190,7 +190,7 @@ func TestSchedulePlaybookStore(t *testing.T) {
 			t.Fatalf("InsertSchedule 失败: %v", err)
 		}
 		defer cleanupExec(ctx, t, st, `DELETE FROM schedules WHERE id = $1`, schedNoPB)
-		ok, err := st.SetFetchPlan(ctx, u.ID, schedNoPB, json.RawMessage(`{"sources":[]}`))
+		ok, err := st.SetFetchPlan(ctx, u.ID, schedNoPB, json.RawMessage(`{"targets":[]}`))
 		if err != nil {
 			t.Fatalf("无手册行不应报错: %v", err)
 		}

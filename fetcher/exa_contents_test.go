@@ -20,8 +20,8 @@ func newTestExaContents(srvURL string) *ExaContentsFetcher {
 	return e
 }
 
-func contentsSource(cfg string) types.Source {
-	return types.Source{
+func contentsSource(cfg string) types.FetchTarget {
+	return types.FetchTarget{
 		ID: 11, Platform: types.PlatformWeb, Capability: types.CapContents,
 		Config: json.RawMessage(cfg),
 	}

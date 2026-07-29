@@ -95,60 +95,13 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM schedules WHERE user_id IN ($1, $2)`, userID, otherUserID)
 		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM pending_actions WHERE user_id IN ($1, $2)`, userID, otherUserID)
+			`DELETE FROM task_creation_operations WHERE user_id IN ($1, $2)`, userID, otherUserID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM agent_sessions WHERE user_id IN ($1, $2)`, userID, otherUserID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM memberships WHERE user_id IN ($1, $2)`, userID, otherUserID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM users WHERE id IN ($1, $2)`, userID, otherUserID)
-	})
-
-	t.Run("历史v0逐字兼容且不进入新协议", func(t *testing.T) {
-		id := insertTaskCreationTestAction(t, st, userID, "create_schedule", 0)
-		if _, err := st.AcquireTaskCreationOperation(ctx, acquireParams(id, userID, "worker-v0")); !errors.Is(err, types.ErrNotFound) {
-			t.Fatalf("v0 Acquire 应 ErrNotFound，实际 %v", err)
-		}
-		stale, err := st.ListStaleTaskCreationOperations(ctx, 1, time.Now().Add(time.Hour), 100)
-		if err != nil {
-			t.Fatalf("ListStaleTaskCreationOperations() 失败: %v", err)
-		}
-		assertOperationAbsent(t, stale, id)
-
-		// Migration 028 必须让旧 ClaimPendingAction 保持原有 pending→executed
-		// 行为；它既不读也不写任何 saga 列。
-		claimed, err := st.ClaimPendingAction(ctx, id, userID)
-		if err != nil {
-			t.Fatalf("历史 ClaimPendingAction() 被新列破坏: %v", err)
-		}
-		if claimed.Status != types.PendingActionStatusExecuted || claimed.ExecutedAt == nil {
-			t.Fatalf("历史 Claim 结果错误: %+v", claimed)
-		}
-		var version int16
-		var phase string
-		var fence int64
-		if err := st.pool.QueryRow(ctx,
-			`SELECT execution_version, phase, fence FROM pending_actions WHERE id=$1`, id,
-		).Scan(&version, &phase, &fence); err != nil {
-			t.Fatal(err)
-		}
-		if version != 0 || phase != "" || fence != 0 {
-			t.Fatalf("历史行 saga 默认值漂移: version=%d phase=%q fence=%d", version, phase, fence)
-		}
-
-		v1ID := insertTaskCreationTestAction(t, st, userID, "create_schedule", 1)
-		if _, err := st.ClaimPendingAction(ctx, v1ID, userID); !errors.Is(err, types.ErrNotFound) {
-			t.Fatalf("v1 不得被 legacy Claim 领取，实际 %v", err)
-		}
-		var v1Status types.PendingActionStatus
-		if err := st.pool.QueryRow(ctx,
-			`SELECT status FROM pending_actions WHERE id=$1`, v1ID,
-		).Scan(&v1Status); err != nil {
-			t.Fatal(err)
-		}
-		if v1Status != types.PendingActionStatusPending {
-			t.Fatalf("legacy Claim 改写了 v1 状态：%q", v1Status)
-		}
 	})
 
 	t.Run("双连接互斥与响应丢失同owner重放", func(t *testing.T) {
@@ -253,7 +206,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		}
 		oldLease := first.Lease()
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions
+			`UPDATE task_creation_operations
 			    SET lease_until=clock_timestamp()-interval '2 seconds',
 			        takeover_not_before=clock_timestamp()+interval '1 minute'
 			  WHERE id=$1`, id,
@@ -266,7 +219,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 			t.Fatalf("grace 内接管应 Busy，实际 %v", err)
 		}
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions
+			`UPDATE task_creation_operations
 			    SET takeover_not_before=clock_timestamp()-interval '1 second'
 			  WHERE id=$1`, id,
 		); err != nil {
@@ -334,7 +287,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions
+			`UPDATE task_creation_operations
 			    SET lease_until=clock_timestamp()-interval '1 minute',
 			        takeover_not_before=clock_timestamp()-interval '1 second'
 			  WHERE id=$1`,
@@ -370,7 +323,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		// boundary to lease expiry. Other tests prove production acquisition
 		// always writes the fixed, non-caller-controlled grace.
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions SET takeover_not_before=lease_until WHERE id=$1`, id,
+			`UPDATE task_creation_operations SET takeover_not_before=lease_until WHERE id=$1`, id,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -386,7 +339,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		defer rollbackTaskCreationTransaction(ctx, locker)
 		var lockedID string
 		if err := locker.QueryRow(ctx,
-			`SELECT id FROM pending_actions WHERE id=$1 FOR UPDATE`, id,
+			`SELECT id FROM task_creation_operations WHERE id=$1 FOR UPDATE`, id,
 		).Scan(&lockedID); err != nil {
 			t.Fatal(err)
 		}
@@ -457,7 +410,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 				defer rollbackTaskCreationTransaction(ctx, locker)
 				var locked string
 				if err := locker.QueryRow(ctx,
-					`SELECT id FROM pending_actions WHERE id=$1 FOR UPDATE`, id,
+					`SELECT id FROM task_creation_operations WHERE id=$1 FOR UPDATE`, id,
 				).Scan(&locked); err != nil {
 					t.Fatal(err)
 				}
@@ -474,7 +427,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if loaded.Status != types.PendingActionStatusExecuting || loaded.TombstonedAt != nil {
+				if loaded.Status != types.TaskOperationStatusExecuting || loaded.TombstonedAt != nil {
 					t.Fatalf("过期写产生副作用: %+v", loaded)
 				}
 			})
@@ -496,18 +449,8 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		if _, err := st.AcquireTaskCreationOperation(ctx, wrongUser); !errors.Is(err, types.ErrNotFound) {
 			t.Fatalf("跨 user 应 NotFound，实际 %v", err)
 		}
-		wrongToolID := insertTaskCreationTestAction(t, st, userID, "remove_schedule", 1)
-		if _, err := st.AcquireTaskCreationOperation(ctx,
-			acquireParams(wrongToolID, userID, "scope-worker")); !errors.Is(err, types.ErrNotFound) {
-			t.Fatalf("非 create_schedule 应 NotFound，实际 %v", err)
-		}
-		v0ID := insertTaskCreationTestAction(t, st, userID, "create_schedule", 0)
-		if _, err := st.AcquireTaskCreationOperation(ctx,
-			acquireParams(v0ID, userID, "scope-worker")); !errors.Is(err, types.ErrNotFound) {
-			t.Fatalf("v0 应 NotFound，实际 %v", err)
-		}
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions SET expires_at=now()-interval '1 second' WHERE id=$1`, id,
+			`UPDATE task_creation_operations SET expires_at=now()-interval '1 second' WHERE id=$1`, id,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -516,17 +459,17 @@ func TestTaskCreationOperationStore(t *testing.T) {
 			t.Fatalf("已到期 v1 应 Terminal，实际 %v", err)
 		}
 		var (
-			status     types.PendingActionStatus
+			status     types.TaskOperationStatus
 			phase      types.TaskCreationPhase
 			tombstoned bool
 		)
 		if err := st.pool.QueryRow(ctx,
 			`SELECT status, phase, tombstoned_at IS NOT NULL
-			   FROM pending_actions WHERE id=$1`, id,
+			   FROM task_creation_operations WHERE id=$1`, id,
 		).Scan(&status, &phase, &tombstoned); err != nil {
 			t.Fatal(err)
 		}
-		if status != types.PendingActionStatusExpired ||
+		if status != types.TaskOperationStatusExpired ||
 			phase != types.TaskCreationPhaseExpired || !tombstoned {
 			t.Fatalf("expiry 必须耐久 tombstone，status=%q phase=%q tombstone=%v",
 				status, phase, tombstoned)
@@ -634,7 +577,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 			t.Fatalf("schedule_ensured 不得越过 DB/Activate 直接 Complete，实际 %v", err)
 		}
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions SET phase=$2 WHERE id=$1`,
+			`UPDATE task_creation_operations SET phase=$2 WHERE id=$1`,
 			completeID, types.TaskCreationPhaseActivated,
 		); err != nil {
 			t.Fatal(err)
@@ -666,7 +609,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if completed.Status != types.PendingActionStatusExecuted ||
+		if completed.Status != types.TaskOperationStatusExecuted ||
 			completed.Phase != types.TaskCreationPhaseCompleted || completed.TombstonedAt == nil ||
 			completed.ExecutedAt == nil || completed.LeaseUntil != nil ||
 			completed.TakeoverNotBefore != nil || completed.TaskID != "task-prepared" {
@@ -683,7 +626,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 
 		blockedID := preparedOperation(t, st, userID, "block-worker")
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions SET task_id='reserved-before-side-effect' WHERE id=$1`, blockedID,
+			`UPDATE task_creation_operations SET task_id='reserved-before-side-effect' WHERE id=$1`, blockedID,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -721,7 +664,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 
 		failedID := preparedOperation(t, st, userID, "fail-worker")
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions
+			`UPDATE task_creation_operations
 			    SET task_id='reserved-before-side-effect', phase='definition_compiled',
 			        prepared_schedule=NULL
 			  WHERE id=$1`, failedID,
@@ -756,7 +699,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if sideEffectAfter.Status != types.PendingActionStatusExecuting || sideEffectAfter.TombstonedAt != nil {
+		if sideEffectAfter.Status != types.TaskOperationStatusExecuting || sideEffectAfter.TombstonedAt != nil {
 			t.Fatalf("有副作用 operation 被错误 tombstone: %+v", sideEffectAfter)
 		}
 
@@ -766,7 +709,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions
+			`UPDATE task_creation_operations
 			    SET status='executed', phase='completed', tombstoned_at=clock_timestamp(),
 			        lease_until=NULL, takeover_not_before=NULL, executed_at=NULL,
 			        task_id='task-incomplete', result='{"ok":true}'::jsonb,
@@ -795,7 +738,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions
+			`UPDATE task_creation_operations
 			    SET lease_until=clock_timestamp()-interval '2 minutes',
 			        takeover_not_before=clock_timestamp()-interval '1 minute'
 			  WHERE id=$1`, staleID,
@@ -811,7 +754,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions
+			`UPDATE task_creation_operations
 			    SET lease_until=clock_timestamp()-interval '1 minute',
 			        takeover_not_before=clock_timestamp()+interval '1 minute'
 			  WHERE id=$1`, graceID,
@@ -823,7 +766,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions
+			`UPDATE task_creation_operations
 			    SET phase=$2,
 			        lease_until=clock_timestamp()-interval '2 minutes',
 			        takeover_not_before=clock_timestamp()-interval '1 minute'
@@ -831,21 +774,6 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		); err != nil {
 			t.Fatal(err)
 		}
-		legacyExecutingID := insertTaskCreationTestAction(t, st, userID, "create_schedule", 0)
-		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions SET status='executing', lease_until=now()-interval '1 minute' WHERE id=$1`,
-			legacyExecutingID,
-		); err != nil {
-			t.Fatal(err)
-		}
-		wrongToolID := insertTaskCreationTestAction(t, st, userID, "remove_schedule", 1)
-		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions SET status='executing', lease_until=now()-interval '1 minute' WHERE id=$1`,
-			wrongToolID,
-		); err != nil {
-			t.Fatal(err)
-		}
-
 		// 恶意/错误 caller 即使把 before 传到未来，也不能越过数据库当前时间
 		// 和持久化的 takeover safety boundary。
 		operations, err := st2.ListStaleTaskCreationOperations(ctx, 1, time.Now().Add(24*time.Hour), 1000)
@@ -863,7 +791,7 @@ func TestTaskCreationOperationStore(t *testing.T) {
 		if !containsString(ids, cleanupID) {
 			t.Fatalf("cleanup_pending 必须保留恢复入口: %v", ids)
 		}
-		for _, forbidden := range []string{activeID, graceID, legacyExecutingID, wrongToolID} {
+		for _, forbidden := range []string{activeID, graceID} {
 			if containsString(ids, forbidden) {
 				t.Fatalf("扫描包含禁入行 %s: %v", forbidden, ids)
 			}
@@ -883,23 +811,24 @@ func insertTaskCreationTestAction(
 ) string {
 	t.Helper()
 	id := uuid.NewString()
-	action := &types.PendingAction{
-		ID:        id,
-		UserID:    userID,
-		ToolName:  toolName,
-		Args:      json.RawMessage(`{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"}}`),
-		Summary:   "测试任务",
-		ExpiresAt: time.Now().Add(24 * time.Hour),
+	if executionVersion != types.TaskCreationExecutionVersionV1 {
+		t.Fatalf("current fixture only supports task creation v1, got %d", executionVersion)
 	}
-	if err := st.CreatePendingAction(t.Context(), action); err != nil {
-		t.Fatalf("CreatePendingAction() 失败: %v", err)
-	}
-	if executionVersion != 0 {
-		if _, err := st.pool.Exec(t.Context(),
-			`UPDATE pending_actions SET execution_version=$2 WHERE id=$1`, id, executionVersion,
-		); err != nil {
-			t.Fatalf("升级测试 action execution_version 失败: %v", err)
-		}
+	if _, err := st.pool.Exec(t.Context(),
+		`INSERT INTO task_creation_operations
+			(id, tenant_id, user_id, tool_name, args, summary, status,
+			 expires_at, execution_version)
+		 SELECT $1, tenant_id, user_id, $2, $3, '测试任务', 'pending',
+		        clock_timestamp()+interval '24 hours', $4
+		   FROM memberships
+		  WHERE user_id=$5
+		  ORDER BY tenant_id
+		  LIMIT 1`,
+		id, toolName,
+		json.RawMessage(`{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"}}`),
+		executionVersion, userID,
+	); err != nil {
+		t.Fatalf("insert current task creation operation: %v", err)
 	}
 	return id
 }

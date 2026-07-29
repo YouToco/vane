@@ -32,7 +32,7 @@ const (
 
 // parseWindowHours 把 query 里的 window_hours 解析成统计窗口，缺省为 probe.DefaultWindow。
 //
-// 返回 (窗口, 人话错误)：与 sourcespec.Build 同形（subscriptions.go 的既有惯例）——
+// 返回 (窗口, 人话错误)：与 fetchspec.BuildTarget 同形——
 // 参数校验的失败是"用户填错了"，不是链路故障，造 AppError 再映射回 400 是绕远路。
 //
 // 空值（?window_hours=）按缺省处理而非报错：前端输入框清空后拼出来的就是这个形状，

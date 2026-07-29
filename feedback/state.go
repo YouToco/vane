@@ -67,8 +67,8 @@ type CardInput struct {
 	Title       string         // content_items.title → header title
 	Score       int            // round(deliveries.score) → ⚡ tag
 	URL         string         // content_items.url → 阅读原文按钮
-	SourceTitle string         // sources.title → subtitle 栏目
-	Platform    types.Platform // sources.platform → subtitle emoji
+	SourceTitle string         // fetch_targets.title → subtitle 栏目（证据展示）
+	Platform    types.Platform // fetch_targets.platform → subtitle emoji
 	PublishedAt *time.Time     // content_items.published_at → subtitle 相对时间
 	// DiscoveredAt is the immutable Brief observation time. Legacy cards leave
 	// it zero; the canonical renderer uses it only when PublishedAt is absent.

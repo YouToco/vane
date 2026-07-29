@@ -26,33 +26,6 @@ var testTaskDefinitionEditReceiptTarget = TaskDefinitionEditReceiptTarget{
 	Target:   "om_definition_edit_test",
 }
 
-func TestTaskDefinitionEditCoordinator_CancelReplayPreservesFinalCard(t *testing.T) {
-	frozen := definitionEditCoordinatorFrozenFixture(
-		t, types.ScheduleStatusActive,
-	)
-	store := newDefinitionEditCoordinatorFakeStore(
-		definitionEditCoordinatorOperation(frozen, false),
-	)
-	coordinator := newTestTaskDefinitionEditCoordinator(
-		store, &definitionEditCoordinatorFakeScheduler{},
-	)
-	scope := store.operation().Scope()
-	first, err := coordinator.Cancel(
-		t.Context(), scope, testTaskDefinitionEditReceiptTarget,
-	)
-	if err != nil || first.Replayed || !first.ReceiptBound ||
-		first.Status != types.TaskDefinitionEditOperationStatusCancelled {
-		t.Fatalf("first cancel=%+v err=%v", first, err)
-	}
-	replayed, err := coordinator.Cancel(
-		t.Context(), scope, testTaskDefinitionEditReceiptTarget,
-	)
-	if err != nil || !replayed.Replayed || !replayed.ReceiptBound ||
-		replayed.Status != types.TaskDefinitionEditOperationStatusCancelled {
-		t.Fatalf("replayed cancel=%+v err=%v", replayed, err)
-	}
-}
-
 func TestTaskDefinitionEditCoordinator_AttemptLifecycle(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -269,12 +242,12 @@ func TestTaskDefinitionEditCoordinator_AdoptsStoreResponseLoss(t *testing.T) {
 			store, &definitionEditCoordinatorFakeScheduler{},
 		)
 
-		outcome, err := coordinator.Confirm(
+		outcome, err := coordinator.Execute(
 			t.Context(), store.operation().Scope(), testTaskDefinitionEditReceiptTarget,
 		)
 		if err != nil || outcome.Status != types.TaskDefinitionEditOperationStatusCompleted ||
 			outcome.Recovering {
-			t.Fatalf("Confirm() outcome=%+v err=%v", outcome, err)
+			t.Fatalf("Execute() outcome=%+v err=%v", outcome, err)
 		}
 		if store.acquireCalls != 2 || store.completeCalls != 1 {
 			t.Fatalf("acquire=%d complete=%d, want replayed acquire and one terminal write",
@@ -453,12 +426,12 @@ func TestTaskDefinitionEditCoordinator_BusyAcquireAdoptsConcurrentTerminal(t *te
 				store, &definitionEditCoordinatorFakeScheduler{},
 			)
 
-			outcome, err := coordinator.Confirm(
+			outcome, err := coordinator.Execute(
 				t.Context(), store.operation().Scope(), testTaskDefinitionEditReceiptTarget,
 			)
 			if err != nil || outcome.Status != testCase.status ||
 				outcome.Phase != testCase.wantPhase || !outcome.Replayed || outcome.Recovering {
-				t.Fatalf("Confirm() outcome=%+v err=%v", outcome, err)
+				t.Fatalf("Execute() outcome=%+v err=%v", outcome, err)
 			}
 			if persisted := store.operation(); persisted.Status != testCase.status ||
 				persisted.ErrorCode != testCase.wantReason {
@@ -476,7 +449,7 @@ func TestTaskDefinitionEditCoordinator_PrepareAndSealRejectsMalformedScopeBefore
 	}
 	input := PrepareTaskDefinitionEditProposalInput{
 		OperationID:    fixture.prepared.OperationID,
-		ApprovalRef:    "approval-definition-edit-malformed-scope",
+		OperationRef:   "approval-definition-edit-malformed-scope",
 		ActorTenantID:  fixture.prepared.Creation.TenantID,
 		ActorUserID:    fixture.prepared.Creation.UserID,
 		TargetTenantID: fixture.prepared.Creation.TenantID,
@@ -993,24 +966,6 @@ func (s *definitionEditCoordinatorFakeStore) LoadTaskDefinitionEditOperation(
 	return cloneDefinitionEditCoordinatorOperation(s.op), nil
 }
 
-func (s *definitionEditCoordinatorFakeStore) CancelTaskDefinitionEditOperation(
-	_ context.Context,
-	params types.CancelTaskDefinitionEditOperationParams,
-) (*types.TaskDefinitionEditOperation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.op == nil || s.op.Scope() != params.Scope {
-		return nil, types.ErrNotFound
-	}
-	if s.op.Status != types.TaskDefinitionEditOperationStatusPending {
-		return cloneDefinitionEditCoordinatorOperation(s.op), types.ErrTaskDefinitionEditTerminal
-	}
-	s.op.Status = types.TaskDefinitionEditOperationStatusCancelled
-	s.op.ReceiptProvider = params.ReceiptProvider
-	s.op.ReceiptTarget = params.ReceiptTarget
-	return cloneDefinitionEditCoordinatorOperation(s.op), nil
-}
-
 func (s *definitionEditCoordinatorFakeStore) ExpireTaskDefinitionEditOperation(
 	_ context.Context,
 	params types.ExpireTaskDefinitionEditOperationParams,
@@ -1410,7 +1365,7 @@ func definitionEditCoordinatorOperation(
 ) *types.TaskDefinitionEditOperation {
 	proposal := frozen.Proposal
 	originalStatus := types.ScheduleStatusActive
-	if proposal.OriginalStatus == TaskDefinitionEditOriginalStatusV1Paused {
+	if proposal.OriginalStatus == TaskDefinitionEditOriginalStatusV2Paused {
 		originalStatus = types.ScheduleStatusPaused
 	}
 	op := &types.TaskDefinitionEditOperation{
@@ -1421,7 +1376,7 @@ func definitionEditCoordinatorOperation(
 		TargetUserID:   proposal.Target.UserID,
 		TaskID:         proposal.Target.TaskID,
 		SessionID:      proposal.SessionID,
-		ApprovalRef:    proposal.ApprovalRef,
+		OperationRef:   proposal.OperationRef,
 		Status:         types.TaskDefinitionEditOperationStatusPending,
 		Phase:          types.TaskDefinitionEditPhaseProposalSealed,
 		ExpiresAt:      time.UnixMicro(proposal.ExpiresAtUnixMicros),

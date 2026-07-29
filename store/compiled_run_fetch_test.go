@@ -49,7 +49,7 @@ func TestCompiledRunFetchWrites_ExactSourceAndAtomicHealth(t *testing.T) {
 
 	lastFetched := time.Now().UTC().Truncate(time.Microsecond)
 	nextFetch := lastFetched.Add(17 * time.Minute)
-	updated, err := f.base.st.UpdateSourceFetchStateForTaskRunV1(
+	updated, err := f.base.st.UpdateFetchTargetStateForTaskRunV1(
 		ctx, f.idA, f.refA, f.sourceA, lastFetched, nextFetch, 3)
 	if err != nil {
 		t.Fatalf("exact source health update: %v", err)
@@ -59,7 +59,7 @@ func TestCompiledRunFetchWrites_ExactSourceAndAtomicHealth(t *testing.T) {
 	}
 	var gotFailCount int
 	if err := f.base.st.pool.QueryRow(ctx,
-		`SELECT fail_count FROM sources WHERE id = $1`, f.sourceA,
+		`SELECT fail_count FROM fetch_targets WHERE id = $1`, f.sourceA,
 	).Scan(&gotFailCount); err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestCompiledRunFetchWrites_ConfigDriftWinningRaceIsZeroWrite(t *testing.T) 
 	}
 	defer locker.Rollback(ctx) //nolint:errcheck -- cleanup fallback
 	if _, err := locker.Exec(ctx,
-		`UPDATE sources SET config = $2::jsonb WHERE id = $1`,
+		`UPDATE fetch_targets SET config = $2::jsonb WHERE id = $1`,
 		f.sourceA, json.RawMessage(`{"query":"reconfigured-B"}`),
 	); err != nil {
 		t.Fatal(err)
@@ -116,7 +116,7 @@ func TestCompiledRunFetchWrites_ConfigDriftWinningRaceIsZeroWrite(t *testing.T) 
 	}
 	assertNoContentForCanonicalKey(t, f.base.st, item.CanonicalKey)
 
-	updated, err := f.base.st.UpdateSourceFetchStateForTaskRunV1(
+	updated, err := f.base.st.UpdateFetchTargetStateForTaskRunV1(
 		ctx, f.idA, f.refA, f.sourceA, time.Now().UTC(), time.Now().UTC().Add(time.Hour), 9)
 	if err != nil {
 		t.Fatalf("stale health update: %v", err)
@@ -125,16 +125,16 @@ func TestCompiledRunFetchWrites_ConfigDriftWinningRaceIsZeroWrite(t *testing.T) 
 		t.Fatal("stale snapshot advanced reconfigured source health")
 	}
 	var failCount int
-	var status types.SourceStatus
+	var status types.FetchTargetStatus
 	if err := f.base.st.pool.QueryRow(ctx,
-		`SELECT fail_count, status FROM sources WHERE id = $1`, f.sourceA,
+		`SELECT fail_count, status FROM fetch_targets WHERE id = $1`, f.sourceA,
 	).Scan(&failCount, &status); err != nil {
 		t.Fatal(err)
 	}
-	if failCount != 0 || status != types.SourceStatusActive {
+	if failCount != 0 || status != types.FetchTargetStatusActive {
 		t.Fatalf("stale health mutated source: fail_count=%d status=%q", failCount, status)
 	}
-	disabled, err := f.base.st.DisableSourceIfActiveForTaskRunV1(
+	disabled, err := f.base.st.DisableFetchTargetIfActiveForTaskRunV1(
 		ctx, f.idA, f.refA, f.sourceA)
 	if err != nil {
 		t.Fatalf("stale disable: %v", err)
@@ -294,7 +294,7 @@ func TestCompiledRunCandidates_ConfigDriftFiltersWholeSourceButKeepsSibling(t *t
 	})
 
 	if _, err := f.st.pool.Exec(ctx,
-		`UPDATE sources SET config = '{"query":"new-B"}'::jsonb WHERE id = $1`,
+		`UPDATE fetch_targets SET config = '{"query":"new-B"}'::jsonb WHERE id = $1`,
 		frozen[0]); err != nil {
 		t.Fatal(err)
 	}
@@ -311,8 +311,8 @@ func TestCompiledRunCandidates_ConfigDriftFiltersWholeSourceButKeepsSibling(t *t
 	// Status is health, not semantic identity. A disabled but otherwise exact
 	// sibling still contributes content already fetched before disablement.
 	if _, err := f.st.pool.Exec(ctx,
-		`UPDATE sources SET status = $2 WHERE id = $1`,
-		frozen[1], types.SourceStatusDisabled); err != nil {
+		`UPDATE fetch_targets SET status = $2 WHERE id = $1`,
+		frozen[1], types.FetchTargetStatusDisabled); err != nil {
 		t.Fatal(err)
 	}
 
@@ -513,7 +513,7 @@ func insertCompiledTestSource(
 	t.Helper()
 	var sourceID int64
 	if err := f.st.pool.QueryRow(t.Context(),
-		`INSERT INTO sources (platform, capability, url, title, config, status)
+		`INSERT INTO fetch_targets (platform, capability, url, title, config, status)
 		 VALUES ('web', 'search', $1, $2, '{}', 'active') RETURNING id`,
 		f.urlPrefix+"/"+suffix+"/"+uuid.NewString(), suffix,
 	).Scan(&sourceID); err != nil {

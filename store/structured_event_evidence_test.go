@@ -162,7 +162,7 @@ func TestStructuredEventEvidenceUsesLowestFrozenAttributionAndIgnoresLiveDrift(
 	// Live mutable source presentation must not replace the snapshot's frozen
 	// title, even though the deterministic lowest source ID remains selected.
 	if _, err := f.st.pool.Exec(t.Context(),
-		`UPDATE sources SET title='live drift' WHERE id=$1`, sourceIDs[0],
+		`UPDATE fetch_targets SET title='live drift' WHERE id=$1`, sourceIDs[0],
 	); err != nil {
 		t.Fatal(err)
 	}

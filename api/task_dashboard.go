@@ -1,5 +1,5 @@
 // 任务数据面只读端点（M7 功能 6.6/6.7）：任务详情页与任务列表页的任务级聚合读面。
-// 本文件仍只负责 Postgres 聚合读取；6.8 的确认式编辑与运行控制分别位于
+// 本文件仍只负责 Postgres 聚合读取；6.8 的直接编辑与运行控制分别位于
 // task_actions.go / schedule_actions.go。挂 /api/ 前缀后统一继承会话中间件。
 package api
 
@@ -42,15 +42,14 @@ type scheduleCapabilitiesDTO struct {
 
 // scheduleDetailResp 是 GET /api/schedules/{id} 的响应体。
 type scheduleDetailResp struct {
-	Schedule     scheduleDetailScheduleDTO  `json:"schedule"`
-	Summary      store.ScheduleRunSummary   `json:"summary"`
-	Sources      []store.ScheduleSourceInfo `json:"sources"`
-	Playbook     *schedulePlaybookDTO       `json:"playbook,omitempty"` // 无手册的老任务缺省
-	Cost         store.ScheduleRunCost      `json:"cost"`               // 口径见 store/schedule_dashboard.go
-	Capabilities scheduleCapabilitiesDTO    `json:"capabilities"`
+	Schedule     scheduleDetailScheduleDTO `json:"schedule"`
+	Summary      store.ScheduleRunSummary  `json:"summary"`
+	Playbook     *schedulePlaybookDTO      `json:"playbook,omitempty"` // 无手册的老任务缺省
+	Cost         store.ScheduleRunCost     `json:"cost"`               // 口径见 store/schedule_dashboard.go
+	Capabilities scheduleCapabilitiesDTO   `json:"capabilities"`
 }
 
-// handleGetScheduleDetail 返回单任务详情：本体 + 运行概览 + 绑定信源 + 手册 + 成本。
+// handleGetScheduleDetail 返回单任务详情：本体 + 运行概览 + 手册 + 成本。
 // GET /api/schedules/{id} → 200 scheduleDetailResp；不存在/非本人 → 404（GetSchedule 口径）。
 func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -76,14 +75,6 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		writeAppError(w, err)
 		return
-	}
-	sources, err := s.deps.Store.ListScheduleSourceInfos(r.Context(), userID, id)
-	if err != nil {
-		writeAppError(w, err)
-		return
-	}
-	if sources == nil {
-		sources = []store.ScheduleSourceInfo{} // 序列化出 [] 而非 null
 	}
 	cost, err := s.deps.Store.GetScheduleRunCost(r.Context(), userID, id)
 	if err != nil {
@@ -126,7 +117,7 @@ func (s *server) handleGetScheduleDetail(w http.ResponseWriter, r *http.Request)
 			NextRun:      nextRun,
 			NextRunState: nextRunState,
 		},
-		Summary: *summary, Sources: sources,
+		Summary:  *summary,
 		Playbook: playbook, Cost: *cost,
 		Capabilities: scheduleCapabilitiesDTO{
 			DefinitionEdit: s.deps.DefinitionEditEnabled,

@@ -204,11 +204,11 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 			confirmCtx, cancelConfirm := context.WithCancel(t.Context())
 			defer cancelConfirm()
 			fixture.killStore.setCancel(cancelConfirm)
-			outcome, err := fixture.coordinator.Confirm(
+			outcome, err := fixture.coordinator.Execute(
 				confirmCtx, fixture.operation.Scope(), fixture.receipt,
 			)
 			if err != nil {
-				t.Fatalf("Confirm(): %v", err)
+				t.Fatalf("Execute(): %v", err)
 			}
 			if !fixture.killStore.didTrip() &&
 				testCase.killPoint != definitionEditCoordinatorKillNone {
@@ -236,7 +236,7 @@ func TestTaskDefinitionEditCoordinatorIntegration_PostgreSQLTemporalKillPoints(t
 					t, fixture, fixture.targetHead, 3,
 				)
 				beforeReplay := fixture.temporalCalls.snapshot()
-				replay, replayErr := fixture.coordinator.Confirm(
+				replay, replayErr := fixture.coordinator.Execute(
 					t.Context(), fixture.operation.Scope(), fixture.receipt,
 				)
 				if replayErr != nil || !replay.Replayed ||
@@ -502,11 +502,8 @@ func newDefinitionEditCoordinatorIntegrationFixture(
 		t.Fatalf("create creation session: %v", err)
 	}
 	creationID := "c2b3-create-" + uuid.NewString()
-	creationTarget := CreationReceiptTarget{
-		Provider: FeishuCardPatchReceiptProviderForApp("c2b3-integration"),
-		Target:   "om_creation_" + uuid.NewString(),
-	}
-	if _, err := creation.Propose(ctx, CreationProposalInput{
+	creationTarget := AgentAutoReceiptTarget(creationID)
+	if _, err := creation.Prepare(ctx, CreationProposalInput{
 		ActionID: creationID, UserID: userID, SessionID: &creationSession.ID,
 		RawArgs: mustCreateArgs(
 			t, "持续监控 C2b3 coordinator 集成测试", "C2b3 coordinator base",
@@ -515,8 +512,8 @@ func newDefinitionEditCoordinatorIntegrationFixture(
 	}); err != nil {
 		t.Fatalf("create base proposal: %v", err)
 	}
-	creationResult, err := creation.Confirm(ctx, userID, creationID, creationTarget)
-	if err != nil || creationResult.Status != types.PendingActionStatusExecuted ||
+	creationResult, err := creation.Execute(ctx, userID, creationID, creationTarget)
+	if err != nil || creationResult.Status != types.TaskOperationStatusExecuted ||
 		creationResult.Recovering || creationResult.TaskID == "" {
 		t.Fatalf("create base task result=%+v err=%v", creationResult, err)
 	}
@@ -576,9 +573,10 @@ func newDefinitionEditCoordinatorIntegrationFixture(
 	if err != nil {
 		t.Fatalf("create edit session: %v", err)
 	}
+	operationID := "c2b3-edit-" + uuid.NewString()
 	receipt := TaskDefinitionEditReceiptTarget{
-		Provider: FeishuCardPatchReceiptProviderForApp("c2b3-integration"),
-		Target:   "om_definition_edit_" + uuid.NewString(),
+		Provider: AgentAutoReceiptProvider,
+		Target:   operationID,
 	}
 	wrapped := &definitionEditCoordinatorIntegrationKillStore{
 		Store: st, point: killPoint,
@@ -589,8 +587,8 @@ func newDefinitionEditCoordinatorIntegrationFixture(
 		wrapped.setCancel(cancelSeal)
 	}
 	op, err := coordinator.PrepareAndSealProposal(sealCtx, PrepareTaskDefinitionEditProposalInput{
-		OperationID:   "c2b3-edit-" + uuid.NewString(),
-		ApprovalRef:   "c2b3-approval-" + uuid.NewString(),
+		OperationID:   operationID,
+		OperationRef:  "c2b3-approval-" + uuid.NewString(),
 		ActorTenantID: tenantID, ActorUserID: userID,
 		TargetTenantID: tenantID, TargetUserID: userID, TaskID: taskID,
 		SessionID: editSession.ID, ExpiresAt: time.Now().Add(time.Hour),

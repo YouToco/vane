@@ -6,8 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/YouToco/vane/workflow"
 )
 
 type fakeScheduleActionController struct {
@@ -16,14 +14,6 @@ type fakeScheduleActionController struct {
 	userID  int64
 	key     string
 	err     error
-}
-
-func (f *fakeScheduleActionController) PushNow(
-	context.Context,
-	int64,
-	workflow.PushScope,
-) (string, error) {
-	return "", nil
 }
 
 func (f *fakeScheduleActionController) DeletePush(

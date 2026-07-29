@@ -24,7 +24,7 @@ func TestEffectGateDeniesEveryPrimaryUpstreamCall(t *testing.T) {
 			call: func(ctx context.Context, upstreamURL string) error {
 				_, err := newTestFetcher().fetchRSSWithEffectGate(
 					ctx,
-					types.Source{ID: 1, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: upstreamURL},
+					types.FetchTarget{ID: 1, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: upstreamURL},
 					enrichMaxPerRound,
 					deny,
 				)

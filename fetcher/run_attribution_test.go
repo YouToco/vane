@@ -33,14 +33,14 @@ func TestCompiledFetchRecordersPreserveExactRunAttribution(t *testing.T) {
 			name: "exa search",
 			record: func(rec *mockRecorder) {
 				NewExa(config.FetchConfig{}, rec).recordCall(
-					ctx, types.Source{ID: 1}, 200, 0, 0, 0, nil)
+					ctx, types.FetchTarget{ID: 1}, 200, 0, 0, 0, nil)
 			},
 		},
 		{
 			name: "exa contents",
 			record: func(rec *mockRecorder) {
 				NewExaContents(config.FetchConfig{}, rec).recordCall(
-					ctx, types.Source{ID: 2}, 200, 0, 0, 0, nil)
+					ctx, types.FetchTarget{ID: 2}, 200, 0, 0, 0, nil)
 			},
 		},
 		{
@@ -50,7 +50,7 @@ func TestCompiledFetchRecordersPreserveExactRunAttribution(t *testing.T) {
 					ctx,
 					tikhubcatalog.Entry{Name: "fixture", Path: "/fixture"},
 					map[string]any{"query": "safe"}, nil, nil,
-					types.Source{ID: 3},
+					types.FetchTarget{ID: 3},
 				)
 			},
 		},
@@ -81,7 +81,7 @@ func TestLegacyFetchAttributionDoesNotInventTenant(t *testing.T) {
 	ctx := WithBindingAttribution(context.Background(), "legacy-trace", 7)
 	rec := &mockRecorder{}
 	NewExa(config.FetchConfig{}, rec).recordCall(
-		ctx, types.Source{ID: 1}, 200, 0, 0, 0, nil)
+		ctx, types.FetchTarget{ID: 1}, 200, 0, 0, 0, nil)
 
 	got := rec.last()
 	if got == nil || got.UserID == nil || *got.UserID != 7 {

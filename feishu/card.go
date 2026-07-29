@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/types"
 )
 
@@ -41,77 +40,11 @@ func BuildReplyCard(markdown string) string {
 	return string(raw)
 }
 
-// vane_action 的三个合法取值：卡片按钮 value 与回调分发共用（契约 §9、M5 §10.1），
-// 常量化避免构卡与解析两处魔法字符串漂移。
-// confirm/cancel 走 M4 的确认卡链路（pending_actions）；fb 走 M5 的推送卡反馈链路
-// （feedbacks），两条链路在 onCardAction 里按此值分发，互不影响。
+// Feedback-card callback values.
 const (
-	cardActionConfirm        = "confirm"
-	cardActionCancel         = "cancel"
 	cardActionFeedback       = "fb"
 	cardActionFeedbackReason = "fbr" // form 提交：misjudged + detail
 )
-
-// BuildConfirmCard 构造写操作确认卡（JSON 2.0 schema）：plain_text 正文展示
-// 工具名+参数摘要，确认/取消两个 callback 按钮。摘要可能包含共享信源标题等
-// 不可信元数据，绝不能作为 Markdown 解释，否则能视觉伪造确认范围。按钮 value 只携带
-// vane_action 与 action_id——参数以服务端 pending_actions 为准，
-// 杜绝客户端篡改（契约 §10）。
-//
-// 2.0 下按钮交互挂在 behaviors（v1 的 value 直挂按钮写法不生效）；
-// 两个按钮经 column_set 并排，避免默认纵向堆叠的松散观感。
-func BuildConfirmCard(summary, actionID string) string {
-	// plain_text prevents Markdown interpretation, but Unicode bidi/Cf controls
-	// are still honored by renderers and can visually reorder trusted labels.
-	// Apply this at the final card boundary so every mutating tool is covered.
-	summary = promptguard.StripInvisible(summary)
-	confirmBtn := map[string]any{
-		"tag":   "button",
-		"type":  "primary",
-		"width": "default",
-		"text":  map[string]any{"tag": "plain_text", "content": "确认"},
-		"behaviors": []any{map[string]any{
-			"type":  "callback",
-			"value": map[string]any{"vane_action": cardActionConfirm, "action_id": actionID},
-		}},
-	}
-	cancelBtn := map[string]any{
-		"tag":   "button",
-		"type":  "default",
-		"width": "default",
-		"text":  map[string]any{"tag": "plain_text", "content": "取消"},
-		"behaviors": []any{map[string]any{
-			"type":  "callback",
-			"value": map[string]any{"vane_action": cardActionCancel, "action_id": actionID},
-		}},
-	}
-	card := map[string]any{
-		"schema": "2.0",
-		// 确认后最终结果原地更新这张卡，故首发时就必须声明 update_multi。
-		// 该能力不能等到终态卡才补：未声明的原卡根本不可 Patch。
-		"config": map[string]any{"update_multi": true},
-		"header": map[string]any{
-			"title": map[string]any{"tag": "plain_text", "content": cardTitle},
-		},
-		"body": map[string]any{
-			"elements": []any{
-				map[string]any{
-					"tag":  "div",
-					"text": map[string]any{"tag": "plain_text", "content": summary},
-				},
-				map[string]any{
-					"tag": "column_set",
-					"columns": []any{
-						map[string]any{"tag": "column", "width": "auto", "elements": []any{confirmBtn}},
-						map[string]any{"tag": "column", "width": "auto", "elements": []any{cancelBtn}},
-					},
-				},
-			},
-		},
-	}
-	raw, _ := json.Marshal(card)
-	return string(raw)
-}
 
 // feedbackButtons 推送卡的三个 emoji 反馈按钮。历史 callback value 仍用
 // not_interested，但服务端把 👎 解释为“打开问题面板”，点击本身不落反馈。

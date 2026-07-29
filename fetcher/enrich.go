@@ -84,7 +84,7 @@ type pageTextFetcher interface {
 		ctx context.Context,
 		pageURL string,
 		maxAgeHours int,
-		src *types.Source,
+		src *types.FetchTarget,
 		beforeEffect func(context.Context) error,
 	) ([]exaContentsResult, bool, error)
 }
@@ -127,14 +127,14 @@ func needsEnrichment(link, content string) bool {
 // maxEnrich 是本轮补全条数上限：周期抓取传 enrichMaxPerRound（10），probe 传更小的
 // probeEnrichCap（5）——试跑只需补够几条证明「补全管用、能产出内容」，无谓为一个未落库
 // 的准入判定付满额详情费，也让 probe 在 probeBudget 内稳定完成（对抗审查 A-F3/A-F4）。
-func (f *Fetcher) enrichItems(ctx context.Context, src types.Source, items []*gofeed.Item, maxEnrich int) (skippedSeen, enrichFailed int) {
+func (f *Fetcher) enrichItems(ctx context.Context, src types.FetchTarget, items []*gofeed.Item, maxEnrich int) (skippedSeen, enrichFailed int) {
 	skippedSeen, enrichFailed, _ = f.enrichItemsWithEffectGate(ctx, src, items, maxEnrich, nil)
 	return skippedSeen, enrichFailed
 }
 
 func (f *Fetcher) enrichItemsWithEffectGate(
 	ctx context.Context,
-	src types.Source,
+	src types.FetchTarget,
 	items []*gofeed.Item,
 	maxEnrich int,
 	beforeEffect func(context.Context) error,

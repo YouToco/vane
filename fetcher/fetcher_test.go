@@ -64,7 +64,7 @@ func TestFetchRSS_ParsesFeed(t *testing.T) {
 	// （见 CanonicalKey），缺 Platform 的源算不出身份、条目会被 finalize 全部丢弃。
 	// 生产上 sources.platform 为 NOT NULL 且 Multi.Fetch 会先拒掉未知组合，
 	// 故这里补全才是真实形态。
-	items, err := f.FetchRSS(context.Background(), types.Source{ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL})
+	items, err := f.FetchRSS(context.Background(), types.FetchTarget{ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL})
 	if err != nil {
 		t.Fatalf("FetchRSS 意外失败: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestFetchRSS_ParsesFeed(t *testing.T) {
 func TestFetchRSS_BlocksLoopback(t *testing.T) {
 	// 用默认（生产）拦截规则：指向 127.0.0.1 的源必须被拒。
 	f := New(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1})
-	_, err := f.FetchRSS(context.Background(), types.Source{ID: 1, URL: "http://127.0.0.1:9/feed.xml"})
+	_, err := f.FetchRSS(context.Background(), types.FetchTarget{ID: 1, URL: "http://127.0.0.1:9/feed.xml"})
 	if err == nil {
 		t.Fatal("私网地址应被拒绝，却返回 nil error")
 	}
@@ -134,7 +134,7 @@ func TestFetchRSS_BlocksZonedIPv6LiteralBeforeRequest(t *testing.T) {
 		"http://[fe80::1%25en0]:8080/feed.xml",
 	} {
 		t.Run(rawURL, func(t *testing.T) {
-			_, err := f.FetchRSS(t.Context(), types.Source{ID: 1, URL: rawURL})
+			_, err := f.FetchRSS(t.Context(), types.FetchTarget{ID: 1, URL: rawURL})
 			if !errors.Is(err, types.ErrValidation) ||
 				types.CodeOf(err) != types.CodeValidation {
 				t.Fatalf("zoned IPv6 literal must fail before request: err=%v", err)
@@ -157,7 +157,7 @@ func TestFetchRSS_RedirectCannotBypassDialerWithZonedIPv6(t *testing.T) {
 	f := newTestFetcher()
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	_, err := f.FetchRSS(ctx, types.Source{ID: 1, URL: srv.URL})
+	_, err := f.FetchRSS(ctx, types.FetchTarget{ID: 1, URL: srv.URL})
 	if !errors.Is(err, errBlockedDial) ||
 		!errors.Is(err, types.ErrValidation) ||
 		types.CodeOf(err) != types.CodeValidation {
@@ -167,7 +167,7 @@ func TestFetchRSS_RedirectCannotBypassDialerWithZonedIPv6(t *testing.T) {
 
 func TestFetchRSS_RejectsBadScheme(t *testing.T) {
 	f := newTestFetcher()
-	_, err := f.FetchRSS(context.Background(), types.Source{ID: 1, URL: "ftp://example.com/feed"})
+	_, err := f.FetchRSS(context.Background(), types.FetchTarget{ID: 1, URL: "ftp://example.com/feed"})
 	if !errors.Is(err, types.ErrValidation) {
 		t.Errorf("非 http(s) scheme 应判 ErrValidation，实际 %v", err)
 	}
@@ -185,7 +185,7 @@ func TestFetchRSS_RejectsOversize(t *testing.T) {
 	defer srv.Close()
 
 	f := newTestFetcher()
-	_, err := f.FetchRSS(context.Background(), types.Source{ID: 1, URL: srv.URL})
+	_, err := f.FetchRSS(context.Background(), types.FetchTarget{ID: 1, URL: srv.URL})
 	if err == nil {
 		t.Fatal("超大响应应被拒绝")
 	}
@@ -201,7 +201,7 @@ func TestFetchRSS_RateLimited(t *testing.T) {
 	defer srv.Close()
 
 	f := newTestFetcher()
-	_, err := f.FetchRSS(context.Background(), types.Source{ID: 1, URL: srv.URL})
+	_, err := f.FetchRSS(context.Background(), types.FetchTarget{ID: 1, URL: srv.URL})
 	if types.CodeOf(err) != types.CodeFetchRateLimit {
 		t.Errorf("429 期望 CodeFetchRateLimit，实际 %s", types.CodeOf(err))
 	}
@@ -223,7 +223,7 @@ func TestFetchRSS_Non2xxRetryability(t *testing.T) {
 			w.WriteHeader(tc.status)
 		}))
 		f := newTestFetcher()
-		_, err := f.FetchRSS(context.Background(), types.Source{ID: 1, URL: srv.URL})
+		_, err := f.FetchRSS(context.Background(), types.FetchTarget{ID: 1, URL: srv.URL})
 		if err == nil {
 			t.Errorf("status %d 应返回错误", tc.status)
 		}
@@ -241,7 +241,7 @@ func TestFetchRSS_ParseError(t *testing.T) {
 	defer srv.Close()
 
 	f := newTestFetcher()
-	_, err := f.FetchRSS(context.Background(), types.Source{ID: 1, URL: srv.URL})
+	_, err := f.FetchRSS(context.Background(), types.FetchTarget{ID: 1, URL: srv.URL})
 	if err == nil {
 		t.Fatal("非法内容应解析失败")
 	}
@@ -329,7 +329,7 @@ func TestFetchRSS_LookbackFiltersStaleItems(t *testing.T) {
 	f := newTestFetcher()
 
 	items, err := f.FetchRSS(context.Background(),
-		types.Source{ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL})
+		types.FetchTarget{ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL})
 	if err != nil {
 		t.Fatalf("FetchRSS 意外失败: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestFetchRSS_LookbackNegativeMeansUnlimited(t *testing.T) {
 	srv := lookbackServer(t)
 	f := newTestFetcher()
 
-	items, err := f.FetchRSS(context.Background(), types.Source{
+	items, err := f.FetchRSS(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
 		Config: json.RawMessage(`{"lookback_days":-1}`),
 	})
@@ -371,7 +371,7 @@ func TestFetchRSS_LookbackCustomWindow(t *testing.T) {
 	srv := lookbackServer(t)
 	f := newTestFetcher()
 
-	items, err := f.FetchRSS(context.Background(), types.Source{
+	items, err := f.FetchRSS(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
 		Config: json.RawMessage(`{"lookback_days":30}`),
 	})
@@ -396,7 +396,7 @@ func TestFetchRSS_LookbackEmptyConfigUsesDefault(t *testing.T) {
 	srv := lookbackServer(t)
 	f := newTestFetcher()
 
-	items, err := f.FetchRSS(context.Background(), types.Source{
+	items, err := f.FetchRSS(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
 		Config: json.RawMessage(`{}`),
 	})
@@ -414,7 +414,7 @@ func TestFetchRSS_InvalidConfigRejected(t *testing.T) {
 	srv := lookbackServer(t)
 	f := newTestFetcher()
 
-	_, err := f.FetchRSS(context.Background(), types.Source{
+	_, err := f.FetchRSS(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
 		Config: json.RawMessage(`{"lookback_days":"seven"}`),
 	})
@@ -456,7 +456,7 @@ func TestFetchRSS_CategoriesFilter(t *testing.T) {
 	defer srv.Close()
 	f := newTestFetcher()
 
-	items, err := f.FetchRSS(context.Background(), types.Source{
+	items, err := f.FetchRSS(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
 		Config: json.RawMessage(`{"categories":["Product"]}`),
 	})
@@ -474,7 +474,7 @@ func TestFetchRSS_CategoriesCaseInsensitive(t *testing.T) {
 	defer srv.Close()
 	f := newTestFetcher()
 
-	items, err := f.FetchRSS(context.Background(), types.Source{
+	items, err := f.FetchRSS(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
 		Config: json.RawMessage(`{"categories":["research"]}`),
 	})
@@ -492,7 +492,7 @@ func TestFetchRSS_CategoriesEmpty_NoFilter(t *testing.T) {
 	defer srv.Close()
 	f := newTestFetcher()
 
-	items, err := f.FetchRSS(context.Background(), types.Source{
+	items, err := f.FetchRSS(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL,
 		Config: json.RawMessage(`{}`),
 	})
@@ -520,7 +520,7 @@ func TestFetchRSS_FuturePubDateClampedToNow(t *testing.T) {
 
 	f := newTestFetcher()
 	items, err := f.FetchRSS(context.Background(),
-		types.Source{ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL})
+		types.FetchTarget{ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: srv.URL})
 	if err != nil {
 		t.Fatalf("FetchRSS 意外失败: %v", err)
 	}

@@ -21,7 +21,7 @@ const scheduleColumns = `id, tenant_id, user_id, nl_description, spec_json, scop
 // therefore remain visible.
 const matureSchedulePredicate = `NOT EXISTS (
 	SELECT 1
-	  FROM pending_actions p
+	  FROM task_creation_operations p
 	 WHERE p.task_id = s.id
 	   AND p.tenant_id = s.tenant_id AND p.user_id = s.user_id
 	   AND p.tool_name = 'create_schedule' AND p.execution_version = 1

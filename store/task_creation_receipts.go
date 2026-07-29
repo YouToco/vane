@@ -57,7 +57,7 @@ func scanTaskCreationReceipt(row pgx.Row, receipt *types.TaskCreationReceipt) er
 func taskCreationReceiptSelect(suffix string) string {
 	return `SELECT ` + taskCreationReceiptColumns + `
 		FROM task_creation_receipts r
-		JOIN pending_actions p ON p.id = r.operation_id ` + suffix
+		JOIN task_creation_operations p ON p.id = r.operation_id ` + suffix
 }
 
 func (s *Store) LoadTaskCreationReceiptByOperation(
@@ -543,7 +543,7 @@ func insertTaskCreationReceiptForTerminal(
 		            THEN $6 ELSE '' END,
 		       CASE WHEN p.receipt_provider = '' OR p.receipt_target = ''
 		            THEN clock_timestamp() ELSE NULL END
-		  FROM pending_actions p
+		  FROM task_creation_operations p
 		 WHERE p.id = $1 AND p.tenant_id = $2 AND p.user_id = $3
 		   AND p.tool_name = 'create_schedule' AND p.execution_version = 1
 		   AND p.tombstoned_at IS NOT NULL
@@ -573,7 +573,7 @@ func verifyTaskCreationReceiptForTerminal(
 	err := tx.QueryRow(ctx, `
 		SELECT count(*)
 		  FROM task_creation_receipts r
-		  JOIN pending_actions p ON p.id = r.operation_id
+		  JOIN task_creation_operations p ON p.id = r.operation_id
 		 WHERE r.operation_id = $1 AND r.tenant_id = $2 AND r.user_id = $3
 		   AND r.provider = p.receipt_provider AND r.target = p.receipt_target`,
 		operationID, tenantID, userID).Scan(&count)

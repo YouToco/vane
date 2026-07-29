@@ -26,15 +26,14 @@ const initialApprovedDefinitionVersion int64 = 1
 
 const legacyTaskProjectionDefaultStrictnessV1 types.PushStrictness = "loose"
 
-// legacyFetchPlanProjectionV1 freezes the exact pre-C2 compiled projection
-// accepted by the one-way baseline adapter. It must not reuse
-// compiledFetchPlan: that type remains the current A2 writer contract and may
-// evolve, while already-persisted JSON must keep its historical interpretation.
-type legacyFetchPlanProjectionV1 struct {
-	Sources []legacyFetchPlanSourceProjectionV1 `json:"sources"`
+// currentFetchPlanProjection is the mutable schedule_playbooks boundary. The
+// baseline adapter converts it into the immutable task-approved-definition/v1
+// wire, whose historical Sources field remains isolated in taskstate.
+type currentFetchPlanProjection struct {
+	Targets []currentFetchPlanTargetProjection `json:"targets"`
 }
 
-type legacyFetchPlanSourceProjectionV1 struct {
+type currentFetchPlanTargetProjection struct {
 	Platform   string          `json:"platform"`
 	Capability string          `json:"capability"`
 	Title      string          `json:"title,omitempty"`
@@ -46,12 +45,12 @@ type legacyFetchPlanSourceProjectionV1 struct {
 // Payload remains available for byte-for-byte shadow comparisons during C2c;
 // callers should otherwise consume the strictly decoded Definition.
 type ApprovedDefinitionVersionRecord struct {
-	Definition  taskstate.ApprovedDefinitionV1
-	Version     int64
-	Digest      string
-	Payload     []byte
-	ApprovalRef string
-	CreatedAt   time.Time
+	Definition   taskstate.ApprovedDefinitionV1
+	Version      int64
+	Digest       string
+	Payload      []byte
+	OperationRef string
+	CreatedAt    time.Time
 }
 
 // AdaptiveStateRecord is the current CAS-fenced low-risk state for one task.
@@ -84,14 +83,14 @@ type ApprovedDefinitionFence struct {
 func (s *Store) InsertInitialApprovedDefinition(
 	ctx context.Context,
 	definition taskstate.ApprovedDefinitionV1,
-	approvalRef string,
+	operationRef string,
 ) (ApprovedDefinitionVersionRecord, error) {
 	payload, digest, normalizedDefinition, err := encodeApprovedDefinitionForStore(definition)
 	if err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
 	definition = normalizedDefinition
-	if !validTaskStateReference(approvalRef, 1024) {
+	if !validTaskStateReference(operationRef, 1024) {
 		return ApprovedDefinitionVersionRecord{}, taskStateValidation(
 			"approved definition approval reference is invalid")
 	}
@@ -109,7 +108,7 @@ func (s *Store) InsertInitialApprovedDefinition(
 		return ApprovedDefinitionVersionRecord{}, err
 	}
 	record, err := insertInitialApprovedDefinitionTx(
-		ctx, tx, definition, payload, digest, approvalRef, head)
+		ctx, tx, definition, payload, digest, operationRef, head)
 	if err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
@@ -129,7 +128,7 @@ func insertInitialApprovedDefinitionTx(
 	tx pgx.Tx,
 	definition taskstate.ApprovedDefinitionV1,
 	payload []byte,
-	digest, approvalRef string,
+	digest, operationRef string,
 	head taskDefinitionHead,
 ) (ApprovedDefinitionVersionRecord, error) {
 	if definition.ExecutionMode != types.ExecutionModeCompiled {
@@ -140,8 +139,8 @@ func insertInitialApprovedDefinitionTx(
 	// current head. A response-lost initialization may be retried after a later
 	// confirmed edit has already advanced the head; it must still return the
 	// original version-1 result rather than manufacture a conflict or duplicate.
-	existingByApproval, err := loadApprovedDefinitionByApprovalRefTx(ctx, tx,
-		definition.TenantID, definition.UserID, definition.TaskID, approvalRef)
+	existingByApproval, err := loadApprovedDefinitionByOperationRefTx(ctx, tx,
+		definition.TenantID, definition.UserID, definition.TaskID, operationRef)
 	if err == nil {
 		if existingByApproval.Version != initialApprovedDefinitionVersion ||
 			existingByApproval.Digest != digest ||
@@ -170,7 +169,7 @@ func insertInitialApprovedDefinitionTx(
 		if loadErr != nil {
 			return ApprovedDefinitionVersionRecord{}, loadErr
 		}
-		if existing.Digest != digest || existing.ApprovalRef != approvalRef ||
+		if existing.Digest != digest || existing.OperationRef != operationRef ||
 			!bytes.Equal(existing.Payload, payload) {
 			return ApprovedDefinitionVersionRecord{}, taskStateConflict(
 				"approved definition initialization conflicts with the current head")
@@ -183,17 +182,17 @@ func insertInitialApprovedDefinitionTx(
 
 	record := ApprovedDefinitionVersionRecord{
 		Definition: definition, Version: initialApprovedDefinitionVersion,
-		Digest: digest, Payload: bytes.Clone(payload), ApprovalRef: approvalRef,
+		Digest: digest, Payload: bytes.Clone(payload), OperationRef: operationRef,
 	}
 	err = tx.QueryRow(ctx,
 		`INSERT INTO task_approved_definition_versions (
 			tenant_id, user_id, task_id, version, schema_version,
-			execution_mode, definition_digest, payload, approval_ref
+			execution_mode, definition_digest, payload, operation_ref
 		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING created_at`,
 		definition.TenantID, definition.UserID, definition.TaskID,
 		record.Version, definition.SchemaVersion, definition.ExecutionMode,
-		digest, payload, approvalRef,
+		digest, payload, operationRef,
 	).Scan(&record.CreatedAt)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -238,7 +237,7 @@ func (s *Store) GetCurrentApprovedDefinition(
 	}
 	return scanApprovedDefinitionVersion(s.pool.QueryRow(ctx,
 		`SELECT d.version, d.schema_version, d.execution_mode,
-		        d.definition_digest, d.payload, d.approval_ref, d.created_at
+		        d.definition_digest, d.payload, d.operation_ref, d.created_at
 		   FROM schedules s
 		   JOIN tenants t ON t.id = s.tenant_id
 		   JOIN memberships m ON m.tenant_id = s.tenant_id AND m.user_id = s.user_id
@@ -269,7 +268,7 @@ func (s *Store) GetApprovedDefinitionVersion(
 	}
 	return scanApprovedDefinitionVersion(s.pool.QueryRow(ctx,
 		`SELECT d.version, d.schema_version, d.execution_mode,
-		        d.definition_digest, d.payload, d.approval_ref, d.created_at
+		        d.definition_digest, d.payload, d.operation_ref, d.created_at
 		   FROM task_approved_definition_versions d
 		   JOIN schedules s
 		     ON s.tenant_id = d.tenant_id AND s.user_id = d.user_id AND s.id = d.task_id
@@ -536,24 +535,24 @@ func loadApprovedDefinitionVersionTx(
 ) (ApprovedDefinitionVersionRecord, error) {
 	return scanApprovedDefinitionVersion(tx.QueryRow(ctx,
 		`SELECT version, schema_version, execution_mode, definition_digest,
-		        payload, approval_ref, created_at
+		        payload, operation_ref, created_at
 		   FROM task_approved_definition_versions
 		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND version=$4`,
 		tenantID, userID, taskID, version), tenantID, userID, taskID)
 }
 
-func loadApprovedDefinitionByApprovalRefTx(
+func loadApprovedDefinitionByOperationRefTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	tenantID, userID int64,
-	taskID, approvalRef string,
+	taskID, operationRef string,
 ) (ApprovedDefinitionVersionRecord, error) {
 	return scanApprovedDefinitionVersion(tx.QueryRow(ctx,
 		`SELECT version, schema_version, execution_mode, definition_digest,
-		        payload, approval_ref, created_at
+		        payload, operation_ref, created_at
 		   FROM task_approved_definition_versions
-		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND approval_ref=$4`,
-		tenantID, userID, taskID, approvalRef), tenantID, userID, taskID)
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3 AND operation_ref=$4`,
+		tenantID, userID, taskID, operationRef), tenantID, userID, taskID)
 }
 
 func validateApprovedDefinitionProjectionTx(
@@ -593,8 +592,8 @@ func validateApprovedDefinitionProjectionTx(
 	linkedIDs := make(map[string]int64)
 	rows, err := tx.Query(ctx,
 		`SELECT src.url, src.id
-		   FROM schedule_sources ss
-		   JOIN sources src ON src.id = ss.source_id
+		   FROM task_fetch_targets ss
+		   JOIN fetch_targets src ON src.id = ss.fetch_target_id
 		  WHERE ss.schedule_id=$1
 		  ORDER BY src.url, src.id
 		  FOR SHARE OF ss, src`, definition.TaskID)
@@ -631,26 +630,21 @@ func validateApprovedDefinitionProjectionTx(
 	sourceScope := taskstate.SourceScopeApprovedPlan
 	approvedSources := make([]taskstate.ApprovedSourceV1, 0, len(linkedIDs))
 	if len(planObject) == 0 {
-		if len(linkedIDs) != 0 {
-			return taskStateConflict("empty fetch plan has materialized task sources")
-		}
-		sourceScope = taskstate.SourceScopeLegacySubscriptions
-		fetchPlan = json.RawMessage("{}")
-		approvedSources = []taskstate.ApprovedSourceV1{}
+		return taskStateConflict("task definition requires an approved fetch plan")
 	} else {
 		// Existing compiled plans predate the V1 immutable wire and allowed
 		// title/config to be omitted. Decode that compatibility shape, fill its
 		// deterministic defaults, then build a new exact V1 payload. Never loosen
 		// the retained V1 reader to make an old projection fit.
-		var legacyPlan legacyFetchPlanProjectionV1
-		if err := strictjson.Decode(fetchPlan, &legacyPlan); err != nil ||
-			legacyPlan.Sources == nil || len(legacyPlan.Sources) != len(linkedIDs) {
+		var currentPlan currentFetchPlanProjection
+		if err := strictjson.Decode(fetchPlan, &currentPlan); err != nil ||
+			currentPlan.Targets == nil || len(currentPlan.Targets) != len(linkedIDs) {
 			return taskStateConflict("fetch plan and task source links differ")
 		}
 		plan := taskstate.FetchPlanV1{
-			Sources: make([]taskstate.PlanSourceV1, 0, len(legacyPlan.Sources)),
+			Sources: make([]taskstate.PlanSourceV1, 0, len(currentPlan.Targets)),
 		}
-		for _, source := range legacyPlan.Sources {
+		for _, source := range currentPlan.Targets {
 			config := source.Config
 			if len(config) == 0 {
 				config = json.RawMessage("{}")
@@ -718,7 +712,7 @@ func scanApprovedDefinitionVersion(
 	var record ApprovedDefinitionVersionRecord
 	var schemaVersion, rawMode string
 	if err := row.Scan(&record.Version, &schemaVersion, &rawMode, &record.Digest,
-		&record.Payload, &record.ApprovalRef, &record.CreatedAt); err != nil {
+		&record.Payload, &record.OperationRef, &record.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ApprovedDefinitionVersionRecord{}, taskStateNotFound()
 		}
@@ -734,7 +728,7 @@ func scanApprovedDefinitionVersion(
 		schemaVersion != taskstate.ApprovedDefinitionSchemaVersionV1 ||
 		definition.SchemaVersion != schemaVersion || definition.TenantID != tenantID ||
 		definition.UserID != userID || definition.TaskID != taskID ||
-		record.Version <= 0 || !validTaskStateReference(record.ApprovalRef, 1024) ||
+		record.Version <= 0 || !validTaskStateReference(record.OperationRef, 1024) ||
 		!constantTimeDigestMatches(record.Digest, record.Payload) {
 		return ApprovedDefinitionVersionRecord{}, taskStateIntegrity()
 	}
@@ -840,9 +834,8 @@ func validateAdaptiveStateAgainstApproved(
 		state.TaskID != definition.TaskID {
 		return taskStateValidation("adaptive state scope differs from approved definition")
 	}
-	// Legacy subscriptions are an explicit compatibility behavior, not a
-	// user-approved long-term plan. They cannot seed automatic learning or LKG;
-	// the task must first be re-confirmed into an exact approved_plan definition.
+	// Historical subscription snapshots are reader-only and cannot seed
+	// automatic learning or LKG.
 	if definition.SourceScope != taskstate.SourceScopeApprovedPlan ||
 		len(definition.Sources) == 0 {
 		return taskStateValidation("adaptive state requires an exact approved source plan")

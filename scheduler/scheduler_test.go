@@ -543,25 +543,23 @@ func assertCreatePushSuccess(
 }
 
 // ============================================================
-// TriggerPushNow：嵌入 client.Client 的窄 fake 只拦截 ExecuteWorkflow
-// （其余方法继承 nil 接口，误调用即 panic），无需真 Temporal 连接。
-// ============================================================
-
-// fakeTemporalClient 记录传入的 StartWorkflowOptions 并按预设返回。
 type fakeTemporalClient struct {
 	client.Client
 	gotOptions client.StartWorkflowOptions
 	gotArgs    []interface{}
 	retRun     client.WorkflowRun
 	retErr     error
-	// sched 供 UpdatePush 一组用例注入 ScheduleClient 替身；
-	// 既有 TriggerPushNow 用例不设它（那条路径不碰 ScheduleClient）。
-	sched *fakeScheduleClient
+	sched      *fakeScheduleClient
 }
 
 func (f *fakeTemporalClient) ScheduleClient() client.ScheduleClient { return f.sched }
 
-func (f *fakeTemporalClient) ExecuteWorkflow(_ context.Context, options client.StartWorkflowOptions, _ interface{}, args ...interface{}) (client.WorkflowRun, error) {
+func (f *fakeTemporalClient) ExecuteWorkflow(
+	_ context.Context,
+	options client.StartWorkflowOptions,
+	_ interface{},
+	args ...interface{},
+) (client.WorkflowRun, error) {
 	f.gotOptions = options
 	f.gotArgs = append([]interface{}(nil), args...)
 	if f.retErr != nil {
@@ -570,114 +568,10 @@ func (f *fakeTemporalClient) ExecuteWorkflow(_ context.Context, options client.S
 	return f.retRun, nil
 }
 
-// fakeWorkflowRun 只实现 GetID。
-type fakeWorkflowRun struct {
-	client.WorkflowRun
-	id string
-}
-
-func (r *fakeWorkflowRun) GetID() string { return r.id }
-
-// TestTriggerPushNow_Success 校验确定性 workflow ID 与 AlreadyStarted 报错开关：
-// 开关不置 true 时 SDK 对同 ID 在跑的 workflow 静默 attach 并正常返回，
-// 并发护栏（下面的 AlreadyStarted 用例）形同虚设。
-func TestTriggerPushNow_Success(t *testing.T) {
-	fc := &fakeTemporalClient{retRun: &fakeWorkflowRun{id: "push-agent-42"}}
-	s := New(fc, "tq", nil)
-	got, err := s.TriggerPushNow(context.Background(), 42)
-	if err != nil {
-		t.Fatalf("TriggerPushNow 出错: %v", err)
-	}
-	if got != "push-agent-42" {
-		t.Errorf("返回 workflow ID=%q，期望 push-agent-42", got)
-	}
-	if fc.gotOptions.ID != "push-agent-42" {
-		t.Errorf("workflow ID=%q，期望确定性 ID push-agent-42", fc.gotOptions.ID)
-	}
-	if !fc.gotOptions.WorkflowExecutionErrorWhenAlreadyStarted {
-		t.Error("WorkflowExecutionErrorWhenAlreadyStarted 必须为 true，否则同 ID 在跑时 SDK 静默 attach")
-	}
-	if len(fc.gotArgs) != 1 {
-		t.Fatalf("workflow 参数数 = %d, 期望 1", len(fc.gotArgs))
-	}
-	params, ok := fc.gotArgs[0].(workflow.PushParams)
-	if !ok || params.RunKind != workflow.PushRunKindAdHoc || params.ScheduleID != "" {
-		t.Fatalf("TriggerPushNow params = %#v, 期望显式 ad_hoc 且无 schedule_id", fc.gotArgs[0])
-	}
-}
-
-func TestPushNowMarksExplicitAdHocRun(t *testing.T) {
-	fc := &fakeTemporalClient{retRun: &fakeWorkflowRun{id: "push-adhoc-42-run"}}
-	s := New(fc, "tq", nil)
-	if _, err := s.PushNow(t.Context(), 42, workflow.PushScope{TopN: 3}); err != nil {
-		t.Fatalf("PushNow 出错: %v", err)
-	}
-	if len(fc.gotArgs) != 1 {
-		t.Fatalf("workflow 参数数 = %d, 期望 1", len(fc.gotArgs))
-	}
-	params, ok := fc.gotArgs[0].(workflow.PushParams)
-	if !ok || params.RunKind != workflow.PushRunKindAdHoc || params.ScheduleID != "" || params.Scope.TopN != 3 {
-		t.Fatalf("PushNow params = %#v, 期望显式 ad_hoc 且保留 scope", fc.gotArgs[0])
-	}
-}
-
-// TestTriggerPushNow_AlreadyStarted 校验并发护栏：AlreadyStarted 翻译成不可重试的
-// ErrValidation，文案供模型自纠（agent pushNowTool 按 errors.Is(ErrValidation) 分流）。
-func TestTriggerPushNow_AlreadyStarted(t *testing.T) {
-	fc := &fakeTemporalClient{
-		retErr: serviceerror.NewWorkflowExecutionAlreadyStarted("already started", "req-1", "run-1"),
-	}
-	s := New(fc, "tq", nil)
-	if _, err := s.TriggerPushNow(context.Background(), 42); err == nil {
-		t.Fatal("同 ID 在跑应返回错误")
-	} else {
-		if !errors.Is(err, types.ErrValidation) {
-			t.Errorf("应为 ErrValidation，实际 %v", err)
-		}
-		var ae *types.AppError
-		if !errors.As(err, &ae) {
-			t.Fatalf("应为 *types.AppError，实际 %T", err)
-		}
-		if ae.Code != types.CodeValidation {
-			t.Errorf("Code=%s，期望 %s", ae.Code, types.CodeValidation)
-		}
-		if ae.Retryable {
-			t.Error("并发护栏拒绝不应可重试")
-		}
-		if !strings.Contains(ae.Message, "已有一次推送正在进行") {
-			t.Errorf("文案应含\"已有一次推送正在进行\"，实际 %q", ae.Message)
-		}
-	}
-}
-
-// TestTriggerPushNow_OtherError 校验非 AlreadyStarted 错误仍按基础设施错误上抛。
-func TestTriggerPushNow_OtherError(t *testing.T) {
-	fc := &fakeTemporalClient{retErr: errors.New("connection refused")}
-	s := New(fc, "tq", nil)
-	_, err := s.TriggerPushNow(context.Background(), 42)
-	if err == nil {
-		t.Fatal("基础设施错误应上抛")
-	}
-	if errors.Is(err, types.ErrValidation) {
-		t.Errorf("非 AlreadyStarted 错误不应翻译成 ErrValidation: %v", err)
-	}
-	if types.CodeOf(err) != types.CodeInternal {
-		t.Errorf("Code=%s，期望 %s", types.CodeOf(err), types.CodeInternal)
-	}
-}
-
-// ============================================================
-// UpdatePush：ScheduleClient / ScheduleHandle 双层 fake（二者都是接口）。
-// 这组替身让本包第一次能测到「Temporal 成功但镜像失败」的补偿分支——
-// 那是最需要验证、又最不可能在真库上自然发生的路径。
-// ============================================================
-
-// fakeScheduleClient 只拦截 GetHandle。默认返回同一个 handle（UpdatePush 单调度用例）；
-// 设了 handles 映射则按 id 返回对应 handle（ReconcileActions 多调度用例）。
 type fakeScheduleClient struct {
 	client.ScheduleClient
 	handle  *fakeScheduleHandle
-	handles map[string]*fakeScheduleHandle // 非 nil 时按 id 查；缺失回退 handle
+	handles map[string]*fakeScheduleHandle
 	gotID   string
 }
 
@@ -691,15 +585,13 @@ func (f *fakeScheduleClient) GetHandle(_ context.Context, id string) client.Sche
 	return f.handle
 }
 
-// fakeScheduleHandle 模拟服务端持有的当前 Schedule：Update 时真的调用 DoUpdate 回调，
-// 把返回的 Schedule 落成新的当前值——这样才能断言"只有 Spec 变了、Action/Policy 没丢"。
 type fakeScheduleHandle struct {
 	client.ScheduleHandle
 	current       client.Schedule
-	updateErr     error // 非 nil = 模拟 Temporal Update 失败
-	describeErr   error // 非 nil = 模拟 Temporal Describe 失败（reconcile 用例）
+	updateErr     error
+	describeErr   error
 	blockDescribe bool
-	history       []client.Schedule // 每次成功 Update 后的快照（用于验回滚发生过）
+	history       []client.Schedule
 	info          client.ScheduleInfo
 	triggerErr    error
 	pauseErr      error
@@ -709,7 +601,6 @@ type fakeScheduleHandle struct {
 	unpauseCalls  int
 }
 
-// Describe 返回当前持有的 Schedule 快照，供 ReconcileActions 判断是否已带 schedule_id。
 func (h *fakeScheduleHandle) Describe(ctx context.Context) (*client.ScheduleDescription, error) {
 	if h.blockDescribe {
 		<-ctx.Done()
@@ -721,7 +612,10 @@ func (h *fakeScheduleHandle) Describe(ctx context.Context) (*client.ScheduleDesc
 	return &client.ScheduleDescription{Schedule: h.current, Info: h.info}, nil
 }
 
-func (h *fakeScheduleHandle) Update(_ context.Context, o client.ScheduleUpdateOptions) error {
+func (h *fakeScheduleHandle) Update(
+	_ context.Context,
+	o client.ScheduleUpdateOptions,
+) error {
 	if h.updateErr != nil {
 		return h.updateErr
 	}

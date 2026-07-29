@@ -56,21 +56,21 @@ func TestScheduleDashboardStore(t *testing.T) {
 	schedID := mkSchedule(t, owner.ID)
 	foreignSchedID := mkSchedule(t, stranger.ID)
 
-	// 两个信源链接到 owner 的任务（source_count=2 的地基）。
+	// 两个内部抓取目标链接到 owner 的任务。
 	mkSource := func(t *testing.T) int64 {
 		t.Helper()
-		id, _, err := st.GetOrCreateSource(ctx, &types.Source{
+		id, _, err := st.GetOrCreateFetchTarget(ctx, &types.FetchTarget{
 			Platform: types.PlatformWeb, Capability: types.CapSearch,
 			URL: "vane://web/search?q=" + uuid.NewString(), Config: json.RawMessage(`{"query":"x"}`),
 		})
 		if err != nil {
-			t.Fatalf("GetOrCreateSource 失败: %v", err)
+			t.Fatalf("GetOrCreateFetchTarget 失败: %v", err)
 		}
 		return id
 	}
 	s1, s2 := mkSource(t), mkSource(t)
-	if err := st.ReplaceScheduleSources(ctx, owner.ID, schedID, []int64{s1, s2}); err != nil {
-		t.Fatalf("ReplaceScheduleSources 失败: %v", err)
+	if err := st.ReplaceTaskFetchTargets(ctx, owner.ID, schedID, []int64{s1, s2}); err != nil {
+		t.Fatalf("ReplaceTaskFetchTargets 失败: %v", err)
 	}
 
 	// 运行历史：b1 真实批次（2 投递、1 已发）→ b2 空批（fetch 闸门）。b2 后建，
@@ -127,9 +127,9 @@ func TestScheduleDashboardStore(t *testing.T) {
 		cleanupExec(cctx, t, st, `DELETE FROM llm_calls WHERE trace_id = ANY($1)`, []string{trace1, trace2, foreignTrace})
 		cleanupExec(cctx, t, st, `DELETE FROM deliveries WHERE user_id = ANY($1)`, ids)
 		cleanupExec(cctx, t, st, `DELETE FROM push_batches WHERE user_id = ANY($1)`, ids)
-		cleanupExec(cctx, t, st, `DELETE FROM schedule_sources WHERE schedule_id = ANY($1)`, []string{schedID, foreignSchedID})
+		cleanupExec(cctx, t, st, `DELETE FROM task_fetch_targets WHERE schedule_id = ANY($1)`, []string{schedID, foreignSchedID})
 		cleanupExec(cctx, t, st, `DELETE FROM schedules WHERE user_id = ANY($1)`, ids)
-		cleanupExec(cctx, t, st, `DELETE FROM sources WHERE id = ANY($1)`, []int64{s1, s2})
+		cleanupExec(cctx, t, st, `DELETE FROM fetch_targets WHERE id = ANY($1)`, []int64{s1, s2})
 		cleanupExec(cctx, t, st, `DELETE FROM memberships WHERE user_id = ANY($1)`, ids)
 		cleanupExec(cctx, t, st, `DELETE FROM users WHERE id = ANY($1)`, ids)
 	})
@@ -148,9 +148,9 @@ func TestScheduleDashboardStore(t *testing.T) {
 			t.Errorf("最近运行应为空批(fetch)，实得 at=%v status=%q gate=%q",
 				sum.LastRunAt, sum.LastStatus, sum.LastExitGate)
 		}
-		if sum.Batches7d != 2 || sum.EmptyBatches7d != 1 || sum.SentPushes7d != 1 || sum.SourceCount != 2 {
-			t.Errorf("计数不符: batches=%d empty=%d sent=%d sources=%d, 期望 2/1/1/2",
-				sum.Batches7d, sum.EmptyBatches7d, sum.SentPushes7d, sum.SourceCount)
+		if sum.Batches7d != 2 || sum.EmptyBatches7d != 1 || sum.SentPushes7d != 1 {
+			t.Errorf("计数不符: batches=%d empty=%d sent=%d, 期望 2/1/1",
+				sum.Batches7d, sum.EmptyBatches7d, sum.SentPushes7d)
 		}
 	})
 
@@ -166,8 +166,8 @@ func TestScheduleDashboardStore(t *testing.T) {
 			}
 			if it.ScheduleID == schedID {
 				found = true
-				if it.SentPushes7d != 1 || it.SourceCount != 2 {
-					t.Errorf("列表行计数与单查不一致: sent=%d sources=%d", it.SentPushes7d, it.SourceCount)
+				if it.SentPushes7d != 1 {
+					t.Errorf("列表行计数与单查不一致: sent=%d", it.SentPushes7d)
 				}
 			}
 		}
@@ -285,29 +285,4 @@ func TestScheduleDashboardStore(t *testing.T) {
 		}
 	})
 
-	t.Run("任务信源摘要", func(t *testing.T) {
-		infos, err := st.ListScheduleSourceInfos(ctx, owner.ID, schedID)
-		if err != nil {
-			t.Fatalf("ListScheduleSourceInfos 失败: %v", err)
-		}
-		if len(infos) != 2 {
-			t.Fatalf("应得 2 个信源, 实得 %d", len(infos))
-		}
-		for _, info := range infos {
-			if info.ID != s1 && info.ID != s2 {
-				t.Errorf("串源: %d 不在 {%d,%d}", info.ID, s1, s2)
-			}
-			if info.Platform != string(types.PlatformWeb) || info.Status == "" {
-				t.Errorf("信源摘要字段不完整: %+v", info)
-			}
-		}
-		// 外人查：空（归属谓词在 WHERE）。
-		finfos, err := st.ListScheduleSourceInfos(ctx, stranger.ID, schedID)
-		if err != nil {
-			t.Fatalf("外人信源查询失败: %v", err)
-		}
-		if len(finfos) != 0 {
-			t.Errorf("外人查 owner 任务信源应为空, 实得 %d 个", len(finfos))
-		}
-	})
 }

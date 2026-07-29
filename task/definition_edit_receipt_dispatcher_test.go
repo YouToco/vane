@@ -29,8 +29,8 @@ func newDefinitionEditReceiptFakeStore(
 	r := types.TaskDefinitionEditReceipt{
 		ID: 1, OperationID: "edit-operation-1", TenantID: 7, UserID: 11,
 		SessionID: 19,
-		Provider:  FeishuCardPatchReceiptProviderForApp("edit_dispatcher_test"),
-		Target:    "om_original_edit_card", ProviderKey: "provider-key",
+		Provider:  AgentAutoReceiptProvider,
+		Target:    "edit-operation-1", ProviderKey: "provider-key",
 		Status:          types.TaskDefinitionEditReceiptStatusPending,
 		NextAttemptAt:   time.Now().Add(-time.Minute),
 		OperationStatus: status, OperationPhase: phase, TaskID: "task-edit-1",
@@ -255,76 +255,16 @@ func (s *definitionEditReceiptFakeSessions) count() int {
 	return s.appends
 }
 
-type definitionEditReceiptFakeSender struct {
-	mu sync.Mutex
-
-	resources      map[string]string
-	calls          int
-	failAfterApply int
-	err            error
-}
-
-func (s *definitionEditReceiptFakeSender) SendDefinitionEditReceipt(
-	_ context.Context,
-	provider string,
-	target string,
-	cardJSON string,
-) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.resources == nil {
-		s.resources = make(map[string]string)
-	}
-	s.calls++
-	if provider == "" || target == "" {
-		return errors.New("missing immutable target")
-	}
-	if s.err != nil {
-		return s.err
-	}
-	s.resources[target] = cardJSON
-	if s.failAfterApply > 0 {
-		s.failAfterApply--
-		return types.NewAppError(
-			types.CodePushFailed, "provider response lost",
-			context.DeadlineExceeded,
-		)
-	}
-	return nil
-}
-
-func (s *definitionEditReceiptFakeSender) snapshot() (
-	int,
-	map[string]string,
-) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	resources := make(map[string]string, len(s.resources))
-	for key, value := range s.resources {
-		resources[key] = value
-	}
-	return s.calls, resources
-}
-
 func newDefinitionEditReceiptDispatcherForTest(
 	t *testing.T,
 	store *definitionEditReceiptFakeStore,
 	sessions *definitionEditReceiptFakeSessions,
-	sender *definitionEditReceiptFakeSender,
 ) *DefinitionEditReceiptDispatcher {
 	t.Helper()
 	sessions.store = store
 	dispatcher, err := NewDefinitionEditReceiptDispatcher(
 		DefinitionEditReceiptDispatcherDeps{
-			Store: store, Sender: sender, Sessions: sessions,
-			BuildCard: func(markdown string) string {
-				raw, _ := json.Marshal(map[string]any{
-					"schema": "2.0",
-					"config": map[string]any{"update_multi": true},
-					"body":   map[string]any{"text": markdown},
-				})
-				return string(raw)
-			},
+			Store: store, Sessions: sessions,
 		},
 	)
 	if err != nil {
@@ -333,77 +273,23 @@ func newDefinitionEditReceiptDispatcherForTest(
 	return dispatcher
 }
 
-func TestDefinitionEditReceiptDispatcher_AmbiguousPatchReplayKeepsOneResource(
+func TestDefinitionEditReceiptDispatcher_RecordsAgentSessionReceipt(
 	t *testing.T,
 ) {
-	store := newDefinitionEditReceiptFakeStore(
-		types.TaskDefinitionEditOperationStatusCancelled,
+	st := newDefinitionEditReceiptFakeStore(
+		types.TaskDefinitionEditOperationStatusCompleted,
 	)
 	sessions := &definitionEditReceiptFakeSessions{}
-	sender := &definitionEditReceiptFakeSender{failAfterApply: 1}
-	dispatcher := newDefinitionEditReceiptDispatcherForTest(
-		t, store, sessions, sender,
-	)
+	d := newDefinitionEditReceiptDispatcherForTest(t, st, sessions)
 
-	if err := dispatcher.DispatchOnce(t.Context()); err == nil {
-		t.Fatal("ambiguous provider response must be observable")
-	}
-	first := store.snapshot()
-	if first.Status != types.TaskDefinitionEditReceiptStatusPending ||
-		first.FailureClass !=
-			types.TaskDefinitionEditReceiptFailureAmbiguous ||
-		first.SessionRecordedAt == nil || len(first.Payload) == 0 ||
-		sessions.count() != 1 {
-		t.Fatalf("first checkpoint mismatch: %+v sessions=%d",
-			first, sessions.count())
-	}
-	store.makeDue()
-	if err := dispatcher.DispatchOnce(t.Context()); err != nil {
+	if err := d.DispatchOnce(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	final := store.snapshot()
-	calls, resources := sender.snapshot()
+	final := st.snapshot()
 	if final.Status != types.TaskDefinitionEditReceiptStatusSent ||
-		calls != 2 || len(resources) != 1 ||
-		resources["om_original_edit_card"] == "" || sessions.count() != 1 {
-		t.Fatalf("final=%+v calls=%d resources=%v sessions=%d",
-			final, calls, resources, sessions.count())
-	}
-}
-
-func TestDefinitionEditReceiptDispatcher_LocalReceiptsSkipExternalSender(
-	t *testing.T,
-) {
-	for _, provider := range []string{
-		WebActionReceiptProvider,
-		AgentAutoReceiptProvider,
-	} {
-		t.Run(provider, func(t *testing.T) {
-			st := newDefinitionEditReceiptFakeStore(
-				types.TaskDefinitionEditOperationStatusCompleted,
-			)
-			st.r.Provider = provider
-			st.r.Target = st.r.OperationID
-			sessions := &definitionEditReceiptFakeSessions{}
-			sender := &definitionEditReceiptFakeSender{}
-			d := newDefinitionEditReceiptDispatcherForTest(
-				t, st, sessions, sender,
-			)
-
-			if err := d.DispatchOnce(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-			final := st.snapshot()
-			calls, resources := sender.snapshot()
-			if final.Status != types.TaskDefinitionEditReceiptStatusSent ||
-				final.ProviderMessageID != final.OperationID ||
-				calls != 0 || len(resources) != 0 || sessions.count() != 1 {
-				t.Fatalf(
-					"final=%+v calls=%d resources=%v sessions=%d",
-					final, calls, resources, sessions.count(),
-				)
-			}
-		})
+		final.ProviderMessageID != final.OperationID ||
+		sessions.count() != 1 {
+		t.Fatalf("final=%+v sessions=%d", final, sessions.count())
 	}
 }
 
@@ -415,15 +301,11 @@ func TestDefinitionEditReceiptDispatcher_ResponseLossReplaysExactCheckpoints(
 			types.TaskDefinitionEditOperationStatusCancelled,
 		)
 		sessions := &definitionEditReceiptFakeSessions{failAfterApply: 1}
-		sender := &definitionEditReceiptFakeSender{}
 		dispatcher := newDefinitionEditReceiptDispatcherForTest(
-			t, store, sessions, sender,
+			t, store, sessions,
 		)
 		if err := dispatcher.DispatchOnce(t.Context()); err == nil {
 			t.Fatal("lost session response must retry")
-		}
-		if calls, _ := sender.snapshot(); calls != 0 {
-			t.Fatalf("provider called before session convergence: %d", calls)
 		}
 		store.makeDue()
 		if err := dispatcher.DispatchOnce(t.Context()); err != nil {
@@ -440,9 +322,8 @@ func TestDefinitionEditReceiptDispatcher_ResponseLossReplaysExactCheckpoints(
 		)
 		store.markFailures = 1
 		sessions := &definitionEditReceiptFakeSessions{}
-		sender := &definitionEditReceiptFakeSender{}
 		dispatcher := newDefinitionEditReceiptDispatcherForTest(
-			t, store, sessions, sender,
+			t, store, sessions,
 		)
 		if err := dispatcher.DispatchOnce(t.Context()); err == nil {
 			t.Fatal("lost sent response must be observable")
@@ -451,37 +332,10 @@ func TestDefinitionEditReceiptDispatcher_ResponseLossReplaysExactCheckpoints(
 		if err := dispatcher.DispatchOnce(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		calls, resources := sender.snapshot()
-		if calls != 2 || len(resources) != 1 || sessions.count() != 1 {
-			t.Fatalf("calls=%d resources=%v sessions=%d",
-				calls, resources, sessions.count())
+		if sessions.count() != 1 {
+			t.Fatalf("sessions=%d", sessions.count())
 		}
 	})
-}
-
-func TestDefinitionEditReceiptDispatcher_PermanentPatchFailureBlocks(t *testing.T) {
-	store := newDefinitionEditReceiptFakeStore(
-		types.TaskDefinitionEditOperationStatusCancelled,
-	)
-	sessions := &definitionEditReceiptFakeSessions{}
-	permanent := types.NewAppError(
-		types.CodePushFailed, "message recalled", nil,
-	)
-	permanent.Retryable = false
-	sender := &definitionEditReceiptFakeSender{err: permanent}
-	dispatcher := newDefinitionEditReceiptDispatcherForTest(
-		t, store, sessions, sender,
-	)
-	if err := dispatcher.DispatchOnce(t.Context()); err == nil {
-		t.Fatal("permanent provider error must be observable")
-	}
-	receipt := store.snapshot()
-	if receipt.Status != types.TaskDefinitionEditReceiptStatusBlocked ||
-		receipt.FailureClass !=
-			types.TaskDefinitionEditReceiptFailurePermanent ||
-		receipt.BlockedAt == nil {
-		t.Fatalf("receipt was not blocked: %+v", receipt)
-	}
 }
 
 func TestRenderDefinitionEditUserReceipt_UsesOnlyFrozenTerminalFacts(
@@ -503,13 +357,13 @@ func TestRenderDefinitionEditUserReceipt_UsesOnlyFrozenTerminalFacts(
 			name:        "cancelled",
 			status:      types.TaskDefinitionEditOperationStatusCancelled,
 			wantDisplay: "已取消本次任务编辑",
-			wantHistory: "任务定义编辑已取消",
+			wantHistory: "任务定义编辑操作已取消",
 		},
 		{
 			name:        "expired",
 			status:      types.TaskDefinitionEditOperationStatusExpired,
-			wantDisplay: "任务编辑确认已过期",
-			wantHistory: "任务定义编辑确认已过期",
+			wantDisplay: "任务编辑操作已过期",
+			wantHistory: "任务定义编辑操作已过期",
 		},
 		{
 			name:        "blocked",
@@ -564,8 +418,7 @@ func TestRenderDefinitionEditUserReceipt_UsesOnlyFrozenTerminalFacts(
 
 func TestDecodeDefinitionEditUserReceiptPayloadRejectsMutation(t *testing.T) {
 	raw := []byte(
-		`{"version":"vane.task-definition-edit-user-receipt/v1",` +
-			`"card_json":"{}",` +
+		`{"version":"vane.task-definition-edit-session-receipt/v2",` +
 			`"session_messages":[{"role":"user","content":"done"}]}`,
 	)
 	sum := sha256.Sum256(raw)

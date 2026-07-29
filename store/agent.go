@@ -2,14 +2,12 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/types"
 )
 
@@ -21,17 +19,6 @@ func scanAgentSession(row pgx.Row, as *types.AgentSession) error {
 	return row.Scan(
 		&as.ID, &as.TenantID, &as.UserID, &as.Status, &as.Messages,
 		&as.TurnCount, &as.ActivatedTools, &as.CreatedAt, &as.UpdatedAt,
-	)
-}
-
-// pendingActionColumns 是 pending_actions 表全列，SELECT 与 scanPendingAction 一一对应。
-const pendingActionColumns = `id, user_id, session_id, tool_name, args, summary, status, expires_at, executed_at, created_at`
-
-// scanPendingAction 把一行 pending_actions 扫进 types.PendingAction。
-func scanPendingAction(row pgx.Row, pa *types.PendingAction) error {
-	return row.Scan(
-		&pa.ID, &pa.UserID, &pa.SessionID, &pa.ToolName, &pa.Args,
-		&pa.Summary, &pa.Status, &pa.ExpiresAt, &pa.ExecutedAt, &pa.CreatedAt,
 	)
 }
 
@@ -111,90 +98,4 @@ func (s *Store) CreateAgentSession(ctx context.Context, userID int64) (*types.Ag
 			fmt.Sprintf("新建 agent 会话（user=%d）", userID), err)
 	}
 	return &as, nil
-}
-
-// CreatePendingAction 落一条待确认动作。id（uuid）与 expires_at 由调用方给定；
-// args NOT NULL DEFAULT '{}'，nil/空归一为 '{}'；status 空缺省 pending。
-func (s *Store) CreatePendingAction(ctx context.Context, a *types.PendingAction) error {
-	if a == nil {
-		return types.NewAppError(types.CodeValidation, "待确认动作不得为空", nil)
-	}
-	args := a.Args
-	if len(args) == 0 {
-		args = json.RawMessage("{}")
-	}
-	var argsObject map[string]json.RawMessage
-	if err := strictjson.Decode(args, &argsObject); err != nil || argsObject == nil {
-		return types.NewAppError(types.CodeValidation,
-			fmt.Sprintf("待确认动作参数必须是无重复字段的 JSON 对象（tool=%s）", a.ToolName), err)
-	}
-	status := a.Status
-	if status == "" {
-		status = types.PendingActionStatusPending
-	}
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO pending_actions
-		     (id, tenant_id, user_id, session_id, tool_name, args, summary, status, expires_at)
-		 VALUES ($1, `+tenantOfUser+`$2), $2, $3, $4, $5, $6, $7, $8)`,
-		a.ID, a.UserID, a.SessionID, a.ToolName, args, a.Summary, status, a.ExpiresAt)
-	if err != nil {
-		return types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("插入待确认动作（id=%s, tool=%s）", a.ID, a.ToolName), err)
-	}
-	return nil
-}
-
-// ClaimPendingAction 原子领取历史 v0 动作：单条 UPDATE ... WHERE
-// execution_version=0 AND status='pending' AND
-// expires_at > now() ... RETURNING。并发双击时行锁保证只有一次能改到行，
-// 第二次 WHERE 不再命中（status 已 executed）走 NotFound——天然幂等，无需事务。
-// 已执行/已取消/已过期/不存在/归属不符五种情况统一返回 CodeNotFound 的 AppError，
-// 调用方（agent.ExecuteAction）据此回"人话"文案即可。
-// userID 进 WHERE（安全红线 §10）：归属校验在领取原子操作内完成——若先领取后校验，
-// 越权请求会把别人的 pending 动作置为 executed（作废），校验前置到谓词则完全无副作用。
-// 时间过期只拦截领取，不顺带翻转 status（过期判定以 expires_at 为准，翻不翻转不影响语义）。
-func (s *Store) ClaimPendingAction(ctx context.Context, id string, userID int64) (*types.PendingAction, error) {
-	var pa types.PendingAction
-	err := scanPendingAction(s.pool.QueryRow(ctx,
-		`UPDATE pending_actions
-		 SET status = $2, executed_at = now()
-		 WHERE id = $1 AND user_id = $4 AND status = $3 AND expires_at > now()
-		   AND execution_version = 0
-		 RETURNING `+pendingActionColumns,
-		id, types.PendingActionStatusExecuted, types.PendingActionStatusPending, userID), &pa)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, types.NewAppError(types.CodeNotFound,
-				fmt.Sprintf("待确认动作 id=%s 不可领取（不存在/已执行/已取消/已过期/非本人）", id), err)
-		}
-		return nil, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("领取待确认动作（id=%s）", id), err)
-	}
-	return &pa, nil
-}
-
-// CancelPendingAction 只允许历史 v0 pending → cancelled，RETURNING 全列（调用方回写会话通告
-// 需要 Summary 等字段）；非 pending（已执行/已取消/不存在）或归属不符返回
-// CodeNotFound 的 AppError。与 Claim 同样用单条条件 UPDATE 保证原子性，
-// userID 与 execution_version=0 同样进 WHERE（安全红线 §10）。v1 取消必须
-// 由 CreationCoordinator 写完整 phase/tombstone；旧 SQL 碰它会留下不可恢复的半墓碑。
-// 刻意不校验 expires_at：已超时但 status 仍为 pending 的动作允许取消——
-// 语义无害，且用户点"取消"永远能得到明确反馈而非"动作不存在"。
-func (s *Store) CancelPendingAction(ctx context.Context, id string, userID int64) (*types.PendingAction, error) {
-	var pa types.PendingAction
-	err := scanPendingAction(s.pool.QueryRow(ctx,
-		`UPDATE pending_actions SET status = $2
-		 WHERE id = $1 AND user_id = $4 AND status = $3
-		   AND execution_version = 0
-		 RETURNING `+pendingActionColumns,
-		id, types.PendingActionStatusCancelled, types.PendingActionStatusPending, userID), &pa)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, types.NewAppError(types.CodeNotFound,
-				fmt.Sprintf("待确认动作 id=%s 非 pending 或非本人，无法取消", id), err)
-		}
-		return nil, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("取消待确认动作（id=%s）", id), err)
-	}
-	return &pa, nil
 }

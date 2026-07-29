@@ -46,7 +46,7 @@ func (s *Store) UpsertContentItemForTaskRunV1(
 	var sourceExact bool
 	if err := tx.QueryRow(ctx,
 		`SELECT true
-		   FROM sources s
+		   FROM fetch_targets s
 		  WHERE s.id = $1
 		    AND s.platform = $2 AND s.capability = $3
 		    AND s.title = $4 AND s.url = $5
@@ -54,7 +54,7 @@ func (s *Store) UpsertContentItemForTaskRunV1(
 		    AND s.status = $7
 		  FOR SHARE OF s`,
 		sourceID, frozen.Platform, frozen.Capability, frozen.Title, frozen.URL,
-		frozen.Config, types.SourceStatusActive,
+		frozen.Config, types.FetchTargetStatusActive,
 	).Scan(&sourceExact); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, false, taskRunNotFound()
@@ -112,11 +112,12 @@ func (s *Store) UpsertContentItemForTaskRunV1(
 	return id, isNew, nil
 }
 
-// UpdateSourceFetchStateForTaskRunV1 advances shared source health only when
-// the live source still has the exact identity/config frozen in this run. A
+// UpdateFetchTargetStateForTaskRunV1 advances shared target health only when
+// the live target still has the exact acquisition identity/config frozen in
+// this run. Display-only title differences are irrelevant. A
 // historical snapshot therefore cannot advance health for a reconfigured
 // global source. updated=false is the safe, expected stale-snapshot no-op.
-func (s *Store) UpdateSourceFetchStateForTaskRunV1(
+func (s *Store) UpdateFetchTargetStateForTaskRunV1(
 	ctx context.Context,
 	expected types.RunIdentity,
 	ref types.RunSnapshotRef,
@@ -140,17 +141,17 @@ func (s *Store) UpdateSourceFetchStateForTaskRunV1(
 	}
 
 	tag, err := tx.Exec(ctx,
-		`UPDATE sources s
+		`UPDATE fetch_targets s
 		    SET last_fetched_at = $2, next_fetch_at = $3,
 		        fail_count = $4, updated_at = now()
 		  WHERE s.id = $1
 		    AND s.platform = $5 AND s.capability = $6
-		    AND s.title = $7 AND s.url = $8
-		    AND s.config = $9::jsonb
-		    AND s.status = $10`,
+		    AND s.url = $7
+		    AND s.config = $8::jsonb
+		    AND s.status = $9`,
 		sourceID, lastFetched, nextFetch, failCount,
-		frozen.Platform, frozen.Capability, frozen.Title, frozen.URL, frozen.Config,
-		types.SourceStatusActive,
+		frozen.Platform, frozen.Capability, frozen.URL, frozen.Config,
+		types.FetchTargetStatusActive,
 	)
 	if err != nil {
 		return false, taskRunDatabaseError("update compiled source fetch state", err)
@@ -162,10 +163,10 @@ func (s *Store) UpdateSourceFetchStateForTaskRunV1(
 	return tag.RowsAffected() == 1, nil
 }
 
-// DisableSourceIfActiveForTaskRunV1 is the exact stale-snapshot-safe variant
-// of DisableSourceIfActive. The immutable source must belong to the run and its
+// DisableFetchTargetIfActiveForTaskRunV1 is the exact stale-snapshot-safe variant
+// of DisableFetchTargetIfActive. The immutable source must belong to the run and its
 // current global identity/config must still match before status can change.
-func (s *Store) DisableSourceIfActiveForTaskRunV1(
+func (s *Store) DisableFetchTargetIfActiveForTaskRunV1(
 	ctx context.Context,
 	expected types.RunIdentity,
 	ref types.RunSnapshotRef,
@@ -186,14 +187,14 @@ func (s *Store) DisableSourceIfActiveForTaskRunV1(
 	}
 
 	tag, err := tx.Exec(ctx,
-		`UPDATE sources s
+		`UPDATE fetch_targets s
 		    SET status = $2, updated_at = now()
 		  WHERE s.id = $1 AND s.status = $3
 		    AND s.platform = $4 AND s.capability = $5
-		    AND s.title = $6 AND s.url = $7
-		    AND s.config = $8::jsonb`,
-		sourceID, types.SourceStatusDisabled, types.SourceStatusActive,
-		frozen.Platform, frozen.Capability, frozen.Title, frozen.URL, frozen.Config,
+		    AND s.url = $6
+		    AND s.config = $7::jsonb`,
+		sourceID, types.FetchTargetStatusDisabled, types.FetchTargetStatusActive,
+		frozen.Platform, frozen.Capability, frozen.URL, frozen.Config,
 	)
 	if err != nil {
 		return false, taskRunDatabaseError("disable compiled source", err)
@@ -207,8 +208,8 @@ func (s *Store) DisableSourceIfActiveForTaskRunV1(
 
 // ListRecentSimhashesForTaskRunV1 preserves user-wide, cross-task near-dup
 // behavior inside one tenant. History is visible when the content belongs to
-// an active subscription, any task-private source owned by that tenant+user,
-// or an existing delivery. The delivery arm deliberately survives task/source
+// any task fetch target owned by that tenant+user or an existing delivery.
+// The delivery arm deliberately survives task/target
 // unlinking so previously pushed content cannot be reintroduced as new. The
 // explicit tenant predicates prevent a user with memberships in two tenants
 // from carrying one tenant's history into the other. The live run and sealed
@@ -239,15 +240,7 @@ func (s *Store) ListRecentSimhashesForTaskRunV1(
 		      EXISTS (
 		          SELECT 1
 		            FROM content_sources cs
-		            JOIN subscriptions sub ON sub.source_id = cs.source_id
-		           WHERE cs.content_item_id = ci.id
-		             AND sub.tenant_id = $1 AND sub.user_id = $2
-		             AND sub.status = $5
-		      )
-		      OR EXISTS (
-		          SELECT 1
-		            FROM content_sources cs
-		            JOIN schedule_sources ss ON ss.source_id = cs.source_id
+		            JOIN task_fetch_targets ss ON ss.fetch_target_id = cs.source_id
 		            JOIN schedules s ON s.id = ss.schedule_id
 		           WHERE cs.content_item_id = ci.id
 		             AND s.tenant_id = $1 AND s.user_id = $2
@@ -263,7 +256,6 @@ func (s *Store) ListRecentSimhashesForTaskRunV1(
 		    AND ci.id <> ALL($4)
 		  ORDER BY ci.fetched_at DESC, ci.id DESC`,
 		expected.TenantID, expected.UserID, since, excludeIDs,
-		types.SubscriptionStatusActive,
 	)
 	if err != nil {
 		return nil, taskRunDatabaseError("query compiled recent simhashes", err)

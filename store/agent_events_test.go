@@ -1169,7 +1169,7 @@ func projectionSnapshotBatch(
 	turnID string,
 	base agentledger.SessionProjection,
 	projection agentledger.SessionProjection,
-	confirmationAction string,
+	_ string,
 ) agentledger.AppendBatch {
 	t.Helper()
 	baseDigest, err := agentledger.ProjectionDigest(base)
@@ -1184,7 +1184,6 @@ func projectionSnapshotBatch(
 			Messages:             projection.Messages,
 			TurnCount:            projection.TurnCount,
 			ActivatedTools:       projection.ActivatedTools,
-			ConfirmationAction:   confirmationAction,
 		},
 	)
 	if err != nil {
@@ -3541,7 +3540,7 @@ func agentEventLedgerAgentLoopReferences(
 ) (map[token.Pos]struct{}, error) {
 	boundaries := map[string]string{
 		"CommitAgentSessionTurn":   "saveSession",
-		"CommitAgentSessionAppend": "appendCardCallback",
+		"CommitAgentSessionAppend": "NotifyEvent",
 	}
 	allowed := make(map[token.Pos]struct{}, 6)
 
@@ -3583,7 +3582,6 @@ func agentEventLedgerAgentLoopReferences(
 			}
 		case *ast.FuncDecl:
 			if typed.Name.Name == "saveSession" ||
-				typed.Name.Name == "appendCardCallback" ||
 				typed.Name.Name == "NotifyEvent" {
 				if functions[typed.Name.Name] != nil {
 					return nil, errors.New(

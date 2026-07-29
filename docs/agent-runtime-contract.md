@@ -3,6 +3,8 @@
 > 状态：正式演进契约，2026-07-21 起按 C0→C4 小步落地。本文描述运行时边界，
 > 不新增公开 HTTP/A2A wire contract。7.10-B5 起任务创建仍以 A5/A6 saga 为唯一生产
 > 写入口，但 Agent 以 server-owned receipt 自动授权推进，不再发行新确认卡。
+> 2026-07-29 起当前运行只接受 `approved_plan` 与精确
+> `task_fetch_targets`；`legacy_subscriptions` 只存在于不可变历史 wire 的读取器。
 
 ## 1. 产品语义
 
@@ -239,17 +241,17 @@ schema version 分派到固定 reader；不得先调用 current DTO validator，
 
 存量任务必须显式区分：
 
-- `approved_plan`：按已批准 fetch_plan 和精确 schedule_sources 执行；二者不一致即拒绝运行。
-  fetch_plan 中的 platform/capability/title/URL/config 是执行身份真相源，schedule_sources 与全局
+- `approved_plan`：按已批准 fetch_plan 和精确 task_fetch_targets 执行；二者不一致即拒绝运行。
+  fetch_plan 中的 platform/capability/title/URL/config 是执行身份真相源，task_fetch_targets 与全局
   sources 只提供稳定 SourceID 和可变健康状态；共享源元数据变化不得改写用户已批准的下一 run。
-- `legacy_subscriptions`：仅为存量兼容，快照创建时冻结当次订阅源身份，不能在运行中重新展开。
+- `legacy_subscriptions`：仅允许版本化读取器解释既有不可变快照；禁止创建新快照或当前运行。
 
 `discover_at_run` 的空计划永远不得进入 legacy“抓全部订阅源”分支。
 
 ### 3.2 C0/C1 的主体边界
 
-C0/C1 只为有持久 TaskID 的 scheduled run 建快照。现有 `push_now` 暂走 legacy compiled 路径，
-在设计出可审计的 synthetic task scope 前不得开启 `discover_at_run`，也不得借用其他任务的记忆、
+C0/C1 只为有持久 TaskID 的 scheduled/manual task run 建快照。账户级 ad-hoc run 已删除；
+不得用空 TaskID、`discover_at_run` 或 legacy scope 绕过，也不得借用其他任务的记忆、
 checkpoint 或 last-known-good。
 
 ## 4. Temporal 确定性边界

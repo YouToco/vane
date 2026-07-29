@@ -220,72 +220,6 @@ func TestContextShadowSlowStoreCannotDelayOrCancelLegacyCall(t *testing.T) {
 	}
 }
 
-func TestContextShadowAdmitsAdjacentSyntheticStepAndDrainWaits(t *testing.T) {
-	attempts := make(chan contextShadowAttempt, 2)
-	release := make(chan struct{})
-	store := &contextShadowStore{
-		fakeStore: newFakeStore(), attemptStarted: attempts,
-		sealRelease: release,
-	}
-	loop := newContextShadowLoop(
-		t, store,
-		func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
-			return &llm.ChatResponse{Content: "unused"}, nil
-		},
-	)
-	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{
-		traceID: "turn-adjacent", userID: 7,
-		scope: agentcontext.Scope{
-			TenantID: 1, UserID: 7, SessionID: 1,
-		},
-	})
-	request := llm.ChatRequest{
-		Model: loop.model,
-		Messages: []llm.ChatMessage{
-			{Role: "system", Content: loop.sys},
-			{Role: "user", Content: "change"},
-		},
-		MaxTokens: iptr(replyMaxTokens),
-	}
-	first := loop.prepareAgentContextShadow(
-		ctx, request, &toolRunState{activation: &activationState{}}, 1,
-	)
-	loop.sealPreparedAgentContextShadow(ctx, first)
-	loop.shadowFinalPendingContext(
-		ctx,
-		[]llm.ChatMessage{
-			{Role: "user", Content: "change"},
-			{Role: "assistant", Content: replyTaskCreationConfirm},
-		},
-		&toolRunState{activation: &activationState{}},
-		2,
-	)
-	seen := map[int]bool{}
-	for range 2 {
-		select {
-		case attempt := <-attempts:
-			seen[attempt.candidate.ContextStep] = true
-		case <-time.After(time.Second):
-			t.Fatal("blocked first seal structurally dropped adjacent context step")
-		}
-	}
-	if !seen[1] || !seen[2] {
-		t.Fatalf("admitted context steps=%v, want 1 and synthetic 2", seen)
-	}
-
-	drained := make(chan error, 1)
-	go func() { drained <- loop.DrainSessionWrites(t.Context()) }()
-	select {
-	case err := <-drained:
-		t.Fatalf("DrainSessionWrites returned before seals completed: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(release)
-	if err := <-drained; err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestContextShadowTracksToolsetTransitionAndRedactsTaintedStep(t *testing.T) {
 	store := &contextShadowStore{fakeStore: newFakeStore()}
 	const attack = "EXTERNAL-CONTENT-DO-NOT-SEAL"
@@ -537,7 +471,7 @@ func TestContextShadowDirectCreationHasNoHistoricalMessages(t *testing.T) {
 		},
 	}
 	_, _ = loop.HandleMessage(
-		t.Context(), 7, "确认创建，直接生成确认卡，不要再次搜索。",
+		t.Context(), 7, "直接创建任务，不要再次搜索。",
 	)
 	snapshots := drainContextShadows(t, loop, store)
 	if len(snapshots) == 0 {
@@ -546,41 +480,6 @@ func TestContextShadowDirectCreationHasNoHistoricalMessages(t *testing.T) {
 	raw, _ := json.Marshal(snapshots[0].CandidateMessages)
 	if strings.Contains(string(raw), "old secret") {
 		t.Fatal("direct creation shadow retained cropped history")
-	}
-}
-
-func TestContextShadowPendingFinalIsSyntheticContextStep(t *testing.T) {
-	store := &contextShadowStore{fakeStore: newFakeStore()}
-	chatCalls := 0
-	loop := newContextShadowLoop(
-		t, store,
-		func(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
-			chatCalls++
-			return &llm.ChatResponse{Content: "unused"}, nil
-		},
-	)
-	ctx := context.WithValue(t.Context(), chatMetaKey{}, chatMeta{
-		traceID: "turn-synthetic", userID: 7,
-		scope: agentcontext.Scope{
-			TenantID: 1, UserID: 7, SessionID: 1,
-		},
-	})
-	loop.shadowFinalPendingContext(
-		ctx,
-		[]llm.ChatMessage{
-			{Role: "user", Content: "change"},
-			{Role: "assistant", Content: replyTaskCreationConfirm},
-		},
-		&toolRunState{activation: &activationState{}},
-		2,
-	)
-	snapshots := drainContextShadows(t, loop, store)
-	if len(snapshots) != 1 ||
-		snapshots[0].ContextStep != 2 {
-		t.Fatalf("pending snapshots=%+v", snapshots)
-	}
-	if chatCalls != 0 {
-		t.Fatalf("synthetic post-outcome context invented an LLM call: %d", chatCalls)
 	}
 }
 
@@ -627,8 +526,7 @@ func newContextShadowLoop(
 		Store: store, Profiles: store,
 		Tools: testToolSpecs(tools...),
 		TaskCreation: &fakeCreationController{
-			confirmErr: task.ErrCreationOperationNotFound,
-			cancelErr:  task.ErrCreationOperationNotFound,
+			executeErr: task.ErrCreationOperationNotFound,
 		},
 		Model: "deepseek-v4-pro", MaxTurns: 5,
 		SessionTTL: 30 * time.Minute,

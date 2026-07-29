@@ -5,16 +5,13 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
-	"io/fs"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/pressly/goose/v3"
-
 	"github.com/YouToco/vane/definitioneditwire"
 	"github.com/YouToco/vane/types"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestMigration057RestrictedRebaseCapability(t *testing.T) {
@@ -206,7 +203,7 @@ func TestMigration057DeferredActivePinIntegrityRejectsNakedHeadAdvance(
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO task_approved_definition_versions (
 		    tenant_id,user_id,task_id,version,schema_version,
-		    execution_mode,definition_digest,payload,approval_ref
+		    execution_mode,definition_digest,payload,operation_ref
 		) VALUES ($1,$2,$3,$4,'approved-definition/v1','compiled',$5,$6,$7)`,
 		f.tenantID,
 		f.userID,
@@ -377,66 +374,6 @@ func TestMigration057CompleteDefinitionEditRebaseCommits(t *testing.T) {
 		)
 	}
 
-	sqlDB, provider := migration057ProviderForStore(t, runFixture.st)
-	if _, err := provider.DownTo(ctx, 56); err == nil ||
-		!strings.Contains(
-			err.Error(),
-			"refusing downgrade while definition-edit cutover history exists",
-		) {
-		t.Fatalf("057 downgrade accepted durable cutover history: %v", err)
-	}
-	var (
-		version                             int64
-		rebaseFunction, operationColumn     bool
-		finalIntegrityTrigger, ownedHistory bool
-	)
-	if err := sqlDB.QueryRowContext(ctx, `
-		SELECT
-		  COALESCE(MAX(version_id) FILTER (WHERE is_applied), 0),
-		  to_regprocedure(
-		      'task_run_snapshot_v2_rebase_definition_edit(text,bigint,text)'
-		  ) IS NOT NULL,
-		  EXISTS (
-		      SELECT 1
-		        FROM information_schema.columns
-		       WHERE table_schema='public'
-		         AND table_name='task_run_snapshot_v2_cutover_events'
-		         AND column_name='definition_edit_operation_id'
-		  ),
-		  EXISTS (
-		      SELECT 1
-		        FROM pg_trigger
-		       WHERE tgname='task_run_snapshot_v2_active_pin_final_integrity'
-		         AND NOT tgisinternal
-		  ),
-		  EXISTS (
-		      SELECT 1
-		        FROM task_run_snapshot_v2_cutover_events
-		       WHERE definition_edit_operation_id=$1
-		  )
-		  FROM goose_db_version`,
-		f.op.ID,
-	).Scan(
-		&version,
-		&rebaseFunction,
-		&operationColumn,
-		&finalIntegrityTrigger,
-		&ownedHistory,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if version != 57 || !rebaseFunction || !operationColumn ||
-		!finalIntegrityTrigger || !ownedHistory {
-		t.Fatalf(
-			"failed 057 Down leaked partial state: version=%d "+
-				"function=%v column=%v trigger=%v history=%v",
-			version,
-			rebaseFunction,
-			operationColumn,
-			finalIntegrityTrigger,
-			ownedHistory,
-		)
-	}
 }
 
 func TestMigration057EmptyHistoryDownRestoresMigration056Authority(
@@ -542,27 +479,6 @@ func TestMigration057RejectsPreexistingCorruptCutoverPointer(t *testing.T) {
 	if operationColumnExists {
 		t.Fatal("failed 057 migration leaked partial schema")
 	}
-}
-
-func migration057ProviderForStore(
-	t *testing.T,
-	st *Store,
-) (*sql.DB, *goose.Provider) {
-	t.Helper()
-	db, err := sql.Open("pgx", st.pool.Config().ConnString())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	dir, err := fs.Sub(migrationsFS, "migrations")
-	if err != nil {
-		t.Fatal(err)
-	}
-	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return db, provider
 }
 
 func assertMigration057Authority(t *testing.T, db *sql.DB, want bool) {

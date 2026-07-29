@@ -96,9 +96,9 @@ func validReadCapability(platform types.Platform, capability types.Capability) b
 	case "web/feed", "web/search", "web/contents", "x/user_posts",
 		"xhs/search", "xhs/user_posts", "xhs/hot_list", "xhs/topic_feed",
 		"xhs/faved_notes",
-		// 2026-07-23 增补（与 sourcecatalog/multi 路由同批）：缺席会让 weibo/wechat_mp
-		// 源通过 ValidateMaterialized、确认卡直到用户确认，却在提交事务构建 Approved
-		// head 时被拒——用户确认后期不可读失败（对抗审查 HIGH-1）。
+		// 2026-07-23 增补（与 capabilitycatalog/multi 路由同批）：缺席会让
+		// weibo/wechat_mp 抓取要求通过物化校验，却在提交事务构建 Approved head
+		// 时被拒。冻结 V1 reader 必须保留当时已批准的能力集合。
 		"weibo/user_posts", "weibo/hot_list", "wechat_mp/user_posts":
 		return true
 	}

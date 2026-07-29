@@ -19,49 +19,6 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-func TestTaskDefinitionEditCoordinatorIntegration_CancelBindsOriginalReceipt(
-	t *testing.T,
-) {
-	dbURL := definitionEditIntegrationDatabaseURL(t)
-	server, namespace, taskQueue := startDefinitionEditIntegrationServer(t)
-	fixture := newDefinitionEditCoordinatorIntegrationFixture(
-		t, dbURL, server.Client(), namespace, taskQueue,
-		definitionEditCoordinatorKillNone, types.ScheduleStatusActive, false, false,
-	)
-
-	outcome, err := fixture.coordinator.Cancel(
-		t.Context(), fixture.operation.Scope(), fixture.receipt,
-	)
-	if err != nil {
-		t.Fatalf("Cancel(): %v", err)
-	}
-	if outcome.Status != types.TaskDefinitionEditOperationStatusCancelled ||
-		!outcome.ReceiptBound || outcome.Recovering {
-		t.Fatalf("cancel outcome = %+v", outcome)
-	}
-	operation, err := fixture.store.LoadTaskDefinitionEditOperation(
-		t.Context(), fixture.operation.Scope(),
-	)
-	if err != nil {
-		t.Fatalf("load cancelled operation: %v", err)
-	}
-	if operation.Status != types.TaskDefinitionEditOperationStatusCancelled ||
-		operation.Phase != types.TaskDefinitionEditPhaseProposalSealed {
-		t.Fatalf("cancelled operation = %+v", operation)
-	}
-	receipt, err := fixture.store.LoadTaskDefinitionEditReceiptByOperation(
-		t.Context(), operation.ID, operation.TenantID, operation.UserID,
-	)
-	if err != nil {
-		t.Fatalf("load cancellation receipt: %v", err)
-	}
-	if receipt.Status != types.TaskDefinitionEditReceiptStatusPending ||
-		receipt.Provider != fixture.receipt.Provider ||
-		receipt.Target != fixture.receipt.Target {
-		t.Fatalf("cancellation receipt = %+v", receipt)
-	}
-}
-
 func TestTaskDefinitionEditCoordinatorIntegration_LegacyReconcileCannotOverwriteEdit(
 	t *testing.T,
 ) {
@@ -100,7 +57,7 @@ func TestTaskDefinitionEditCoordinatorIntegration_LegacyReconcileCannotOverwrite
 	}
 	confirmDone := make(chan confirmResult, 1)
 	go func() {
-		outcome, err := fixture.coordinator.Confirm(
+		outcome, err := fixture.coordinator.Execute(
 			t.Context(), fixture.operation.Scope(), fixture.receipt,
 		)
 		confirmDone <- confirmResult{outcome: outcome, err: err}
@@ -117,7 +74,7 @@ func TestTaskDefinitionEditCoordinatorIntegration_LegacyReconcileCannotOverwrite
 	}
 	result := <-confirmDone
 	if result.err != nil {
-		t.Fatalf("Confirm(): %v", result.err)
+		t.Fatalf("Execute(): %v", result.err)
 	}
 	if result.outcome.Status !=
 		types.TaskDefinitionEditOperationStatusCompleted {
@@ -135,28 +92,19 @@ func TestDefinitionEditReceiptDispatcherIntegration_PostgreSQLResponseLossRecove
 		t, dbURL, server.Client(), namespace, taskQueue,
 		definitionEditCoordinatorKillNone, types.ScheduleStatusActive, false, false,
 	)
-	outcome, err := fixture.coordinator.Confirm(
+	outcome, err := fixture.coordinator.Execute(
 		t.Context(), fixture.operation.Scope(), fixture.receipt,
 	)
 	if err != nil ||
 		outcome.Status != types.TaskDefinitionEditOperationStatusCompleted {
-		t.Fatalf("Confirm() outcome=%+v err=%v", outcome, err)
+		t.Fatalf("Execute() outcome=%+v err=%v", outcome, err)
 	}
 
-	sender := &definitionEditReceiptFakeSender{failAfterApply: 1}
 	dispatcher, err := NewDefinitionEditReceiptDispatcher(
 		DefinitionEditReceiptDispatcherDeps{
-			Store: fixture.store, Sender: sender,
+			Store: fixture.store,
 			Sessions: definitionEditPostgreSQLReceiptSessions{
 				store: fixture.store,
-			},
-			BuildCard: func(markdown string) string {
-				raw, _ := json.Marshal(map[string]any{
-					"schema": "2.0",
-					"config": map[string]any{"update_multi": true},
-					"body":   map[string]any{"text": markdown},
-				})
-				return string(raw)
 			},
 		},
 	)
@@ -164,23 +112,21 @@ func TestDefinitionEditReceiptDispatcherIntegration_PostgreSQLResponseLossRecove
 		t.Fatalf("NewDefinitionEditReceiptDispatcher(): %v", err)
 	}
 	firstDeadline := time.Now().Add(5 * time.Second)
-	var firstErr error
 	for {
-		err := dispatcher.DispatchOnce(t.Context())
-		if err != nil {
-			firstErr = err
+		if err := dispatcher.DispatchOnce(t.Context()); err != nil {
+			t.Fatalf("DispatchOnce(): %v", err)
 		}
-		calls, _ := sender.snapshot()
-		if calls > 0 {
+		receipt, loadErr := fixture.store.LoadTaskDefinitionEditReceiptByOperation(
+			t.Context(), fixture.operation.ID,
+			fixture.operation.TenantID, fixture.operation.UserID,
+		)
+		if loadErr == nil && receipt.Status == types.TaskDefinitionEditReceiptStatusSent {
 			break
 		}
 		if time.Now().After(firstDeadline) {
-			t.Fatal("terminal receipt never reached the original-card sender")
+			t.Fatal("terminal receipt was not recorded in the Agent session")
 		}
 		time.Sleep(25 * time.Millisecond)
-	}
-	if firstErr == nil {
-		t.Fatal("ambiguous original-card Patch response loss was not surfaced")
 	}
 
 	deadline := time.Now().Add(10 * time.Second)

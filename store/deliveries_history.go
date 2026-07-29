@@ -20,7 +20,7 @@ type DeliveryHistoryQuery struct {
 	PageToken string // (created_at,id) 键集游标，本包编解码，调用方视为不透明串
 	// ScheduleID 非空时只看该任务的投递（6.6 任务详情页）：经 batch_id →
 	// push_batches.schedule_id 过滤。020 之前的历史批次 schedule_id 为 NULL、
-	// push_now 批次亦然，均不属于任何任务——过滤是诚实的“该任务推了什么”，
+	// 历史账户级批次亦然，均不属于任何任务——过滤是诚实的“该任务推了什么”，
 	// 不是全账号历史的近似。空串 = 不过滤，行为与加列前逐字节一致。
 	ScheduleID string
 }

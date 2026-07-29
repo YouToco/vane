@@ -28,9 +28,9 @@ Instagram/Twitter 等 20 平台）。Boss 要求"全支持弄成 tool，agent �
   上限更好（per-endpoint schema 进 FC 声明）；代价是每轮 tools 数组变化。
   **Boss 拍板：动态注入**；缓存代价用 §4.3 的顺序纪律压到最低。
 
-### §0.3 与 sourcecatalog 的分界（两层注册表，各守各的准入）
+### §0.3 与 capabilitycatalog 的分界（两层注册表，各守各的准入）
 
-| | sourcecatalog（订阅信源层） | tikhubcatalog（lookup 层，本契约） |
+| | capabilitycatalog（长期抓取能力层） | tikhubcatalog（lookup 层，本契约） |
 |---|---|---|
 | 用途 | 追新入库 → 打分 → 推送 | 一次性查询，结果回给模型阅读 |
 | 准入 | 实测准入（M6 契约 §2，Available 是质量承诺） | spec 里存在即收录（未逐个实测） |
@@ -38,7 +38,7 @@ Instagram/Twitter 等 20 平台）。Boss 要求"全支持弄成 tool，agent �
 | 静默失败风险 | 有（坏源无声流进推送）→ 必须实测 | 无（错误被模型和用户直接看到） |
 
 准入门槛差异的唯一依据是**静默失败通道是否存在**。端点查询结果**永不**写入
-content_items；某端点若证明适合做订阅信源，走 sourcecatalog 实测准入另行实现。
+content_items；某端点若证明适合长期任务抓取，走 capabilitycatalog 实测准入。
 
 > 【2026-07-18 修订】「另行实现」已落地：endpoint-binding-contract.md。lookup 通道
 > 的「永不写入」不变；注册表端点可经绑定+试跑准入成为订阅信源（走信源通道与绑定
@@ -230,7 +230,7 @@ nil 的 ToolCallRecorder 全程安全（测试免装配）。
 
 1. 端点查询结果不进 content_items / 打分 / 推送管道（§0.3 的分界线）。
    【2026-07-18 收窄】限 lookup 通道；绑定通道见 endpoint-binding-contract.md §0。
-2. 不做订阅信源准入迁移：xhs 三缺口信源（热榜/话题流/收藏流）等仍走 sourcecatalog
+2. 不做长期抓取能力准入迁移：xhs 三缺口能力（热榜/话题流/收藏流）等仍走 capabilitycatalog
    实测路线。【2026-07-18 作废】准入迁移即 endpoint-binding-contract.md（三缺口为首批）。
 3. embedding 检索、检索词改写、端点描述 LLM 增强 → 二期，凭 §6 留痕数据立项。
 4. per-endpoint 价格表与 cost_usd 落列：TikHub 计价元数据未接入，本期以调用次数

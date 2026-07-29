@@ -438,8 +438,8 @@ func (f *fakeStore) GetContentItem(_ context.Context, id int64) (*types.ContentI
 	return &cp, nil
 }
 
-func (f *fakeStore) GetSource(_ context.Context, id int64) (*types.Source, error) {
-	return &types.Source{ID: id, Title: "fake-source", Platform: "rss"}, nil
+func (f *fakeStore) GetFetchTarget(_ context.Context, id int64) (*types.FetchTarget, error) {
+	return &types.FetchTarget{ID: id, Title: "fake-source", Platform: "rss"}, nil
 }
 
 func (f *fakeStore) GetProfile(_ context.Context, userID int64) (*types.Profile, error) {

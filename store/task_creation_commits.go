@@ -141,7 +141,7 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 		return err
 	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET task_id = $6, phase = $7, updated_at = clock_timestamp()
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		    AND tool_name = 'create_schedule' AND execution_version = $8
@@ -153,7 +153,7 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 		p.Lease.ID, p.Lease.TenantID, p.Lease.UserID,
 		p.Lease.LeaseOwner, p.Lease.Fence, p.Definition.TaskID,
 		types.TaskCreationPhaseDefinitionCommitted,
-		types.TaskCreationExecutionVersionV1, types.PendingActionStatusExecuting,
+		types.TaskCreationExecutionVersionV1, types.TaskOperationStatusExecuting,
 		types.TaskCreationPhaseScheduleEnsured, p.CompiledDigest,
 		p.PreparedSchedule, p.EnsureReceipt,
 	)
@@ -229,7 +229,7 @@ func (s *Store) BeginTaskCreationActivation(
 	}
 
 	tag, err := tx.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET phase = $6, updated_at = clock_timestamp()
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		    AND tool_name = 'create_schedule' AND execution_version = $7
@@ -238,7 +238,7 @@ func (s *Store) BeginTaskCreationActivation(
 		    AND phase = $9 AND task_id = $10`,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
 		types.TaskCreationPhaseActivationStarted,
-		types.TaskCreationExecutionVersionV1, types.PendingActionStatusExecuting,
+		types.TaskCreationExecutionVersionV1, types.TaskOperationStatusExecuting,
 		types.TaskCreationPhaseDefinitionCommitted, taskID,
 	)
 	if err != nil {
@@ -319,7 +319,7 @@ func (s *Store) CommitTaskCreationActivation(
 		return taskCreationConflict("activation target changed")
 	}
 	tag, err = tx.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET phase = $6, updated_at = clock_timestamp()
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		    AND tool_name = 'create_schedule' AND execution_version = $7
@@ -328,7 +328,7 @@ func (s *Store) CommitTaskCreationActivation(
 		    AND phase = $9 AND task_id = $10`,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
 		types.TaskCreationPhaseActivated,
-		types.TaskCreationExecutionVersionV1, types.PendingActionStatusExecuting,
+		types.TaskCreationExecutionVersionV1, types.TaskOperationStatusExecuting,
 		types.TaskCreationPhaseActivationStarted, taskID,
 	)
 	if err != nil {
@@ -381,7 +381,7 @@ func (s *Store) BlockTaskCreationOperationAfterSideEffect(
 	}
 	if op.TombstonedAt != nil || taskCreationStatusIsTerminal(op.Status) {
 		marker, markerOK := decodeTaskCreationQuarantineMarker(op.Result)
-		if op.Status == types.PendingActionStatusBlocked &&
+		if op.Status == types.TaskOperationStatusBlocked &&
 			op.Phase == types.TaskCreationPhaseBlocked &&
 			op.ErrorCode == errorCode && op.ErrorMessage == errorMessage &&
 			op.TombstonedAt != nil && op.LeaseUntil == nil &&
@@ -393,7 +393,7 @@ func (s *Store) BlockTaskCreationOperationAfterSideEffect(
 		}
 		return taskCreationConflict("side-effect quarantine tombstone differs")
 	}
-	if op.Status != types.PendingActionStatusExecuting || op.LeaseUntil == nil ||
+	if op.Status != types.TaskOperationStatusExecuting || op.LeaseUntil == nil ||
 		op.TakeoverNotBefore == nil || !databaseNow.Before(*op.LeaseUntil) {
 		return taskCreationLeaseLost()
 	}
@@ -452,7 +452,7 @@ func (s *Store) BlockTaskCreationOperationAfterSideEffect(
 		return taskCreationDatabaseError("encode side-effect quarantine marker", err)
 	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET status = $6, phase = $7, error_code = $8, error_message = $9,
 		        result = $10, executed_at = NULL,
 		        task_id = CASE WHEN $14 <> '' THEN $14 ELSE task_id END,
@@ -464,9 +464,9 @@ func (s *Store) BlockTaskCreationOperationAfterSideEffect(
 		    AND lease_owner = $4 AND fence = $5 AND lease_until > clock_timestamp()
 		    AND phase = $13 AND task_id = $15`,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
-		types.PendingActionStatusBlocked, types.TaskCreationPhaseBlocked,
+		types.TaskOperationStatusBlocked, types.TaskCreationPhaseBlocked,
 		errorCode, errorMessage, quarantineMarker, types.TaskCreationExecutionVersionV1,
-		types.PendingActionStatusExecuting, op.Phase, taskID, op.TaskID,
+		types.TaskOperationStatusExecuting, op.Phase, taskID, op.TaskID,
 	)
 	if err != nil {
 		return taskCreationDatabaseError("write side-effect quarantine", err)
@@ -568,7 +568,7 @@ func (s *Store) BeginTaskCreationCleanup(
 		return false, taskCreationDatabaseError("encode cleanup ownership marker", err)
 	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET phase = $6, error_code = $7, error_message = $8,
 		        result = $9, task_id = $13, updated_at = clock_timestamp()
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
@@ -580,7 +580,7 @@ func (s *Store) BeginTaskCreationCleanup(
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
 		types.TaskCreationPhaseCleanupPending, errorCode, errorMessage,
 		markerJSON,
-		types.TaskCreationExecutionVersionV1, types.PendingActionStatusExecuting,
+		types.TaskCreationExecutionVersionV1, types.TaskOperationStatusExecuting,
 		op.Phase, taskID,
 	)
 	if err != nil {
@@ -604,7 +604,7 @@ func (s *Store) FinishTaskCreationCleanup(
 	ctx context.Context,
 	lease types.TaskCreationLease,
 	taskID string,
-	terminalStatus types.PendingActionStatus,
+	terminalStatus types.TaskOperationStatus,
 ) error {
 	if err := validateTaskCreationLease(lease); err != nil {
 		return err
@@ -645,7 +645,7 @@ func (s *Store) FinishTaskCreationCleanup(
 		return verifyTaskCreationReceiptForTerminal(
 			ctx, tx, lease.ID, lease.TenantID, lease.UserID)
 	}
-	if op.Status != types.PendingActionStatusExecuting ||
+	if op.Status != types.TaskOperationStatusExecuting ||
 		op.Phase != types.TaskCreationPhaseCleanupPending ||
 		op.TaskID != taskID || op.ErrorCode == "" ||
 		op.LeaseUntil == nil || op.TakeoverNotBefore == nil ||
@@ -666,7 +666,7 @@ func (s *Store) FinishTaskCreationCleanup(
 	}
 	if marker.AggregateExpected {
 		for _, statement := range []string{
-			`DELETE FROM schedule_sources WHERE schedule_id = $1`,
+			`DELETE FROM task_fetch_targets WHERE schedule_id = $1`,
 			`DELETE FROM schedule_playbooks WHERE schedule_id = $1`,
 			`DELETE FROM schedules
 			  WHERE id = $1 AND tenant_id = $2 AND user_id = $3 AND status = $4
@@ -687,7 +687,7 @@ func (s *Store) FinishTaskCreationCleanup(
 		}
 	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET status = $6, phase = $7, result = NULL, executed_at = NULL,
 		        lease_until = NULL, takeover_not_before = NULL,
 		        tombstoned_at = clock_timestamp(), updated_at = clock_timestamp()
@@ -698,7 +698,7 @@ func (s *Store) FinishTaskCreationCleanup(
 		    AND phase = $10 AND task_id = $11 AND error_code <> ''`,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
 		terminalStatus, terminalPhase, types.TaskCreationExecutionVersionV1,
-		types.PendingActionStatusExecuting, types.TaskCreationPhaseCleanupPending, taskID,
+		types.TaskOperationStatusExecuting, types.TaskCreationPhaseCleanupPending, taskID,
 	)
 	if err != nil {
 		return taskCreationDatabaseError("write cleanup tombstone", err)
@@ -870,7 +870,7 @@ func countTaskCreationCapacity(
 		      WHERE user_id = $1 AND status = $2
 		     UNION
 		     SELECT 0, task_id
-		       FROM pending_actions
+		       FROM task_creation_operations
 		      WHERE user_id = $1
 		        AND tool_name = 'create_schedule' AND execution_version = $3
 		        AND status = $4 AND tombstoned_at IS NULL AND task_id <> ''
@@ -879,7 +879,7 @@ func countTaskCreationCapacity(
 		     SELECT
 		       CASE WHEN result->>'task_id_known' = 'true' THEN 0 ELSE 1 END,
 		       CASE WHEN result->>'task_id_known' = 'true' THEN task_id ELSE id END
-		       FROM pending_actions
+		       FROM task_creation_operations
 		      WHERE user_id = $1
 		        AND tool_name = 'create_schedule' AND execution_version = $3
 		        AND status = $8 AND phase = $9 AND tombstoned_at IS NOT NULL
@@ -887,11 +887,11 @@ func countTaskCreationCapacity(
 		        AND result->>'reservation_retained' = 'true'
 		   ) reserved`,
 		userID, types.ScheduleStatusActive,
-		types.TaskCreationExecutionVersionV1, types.PendingActionStatusExecuting,
+		types.TaskCreationExecutionVersionV1, types.TaskOperationStatusExecuting,
 		types.TaskCreationPhaseDefinitionCommitted,
 		types.TaskCreationPhaseActivationStarted,
 		types.TaskCreationPhaseActivated,
-		types.PendingActionStatusBlocked, types.TaskCreationPhaseBlocked,
+		types.TaskOperationStatusBlocked, types.TaskCreationPhaseBlocked,
 		taskCreationQuarantineMarkerVersion,
 	).Scan(&count)
 	if err != nil {
@@ -945,8 +945,8 @@ func pausedCompiledTaskDefinitionMatches(
 		!taskCreationJSONEqual(fetchPlan, def.FetchPlan) {
 		return false, nil
 	}
-	urls := make([]string, 0, len(plan.Sources))
-	for _, source := range plan.Sources {
+	urls := make([]string, 0, len(plan.Targets))
+	for _, source := range plan.Targets {
 		urls = append(urls, source.URL)
 	}
 	exact, err := compiledPlanLinksExact(ctx, tx, def.TaskID, urls)
@@ -1069,11 +1069,11 @@ func validateTaskCreationErrorMetadata(code, message string) error {
 	return nil
 }
 
-func cleanupTerminalPhase(status types.PendingActionStatus) (types.TaskCreationPhase, error) {
+func cleanupTerminalPhase(status types.TaskOperationStatus) (types.TaskCreationPhase, error) {
 	switch status {
-	case types.PendingActionStatusFailed:
+	case types.TaskOperationStatusFailed:
 		return types.TaskCreationPhaseFailed, nil
-	case types.PendingActionStatusBlocked:
+	case types.TaskOperationStatusBlocked:
 		return types.TaskCreationPhaseBlocked, nil
 	default:
 		return "", taskCreationValidation("cleanup terminal status must be failed or blocked")

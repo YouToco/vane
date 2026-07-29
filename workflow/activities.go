@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"reflect"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -55,7 +56,7 @@ const maxScoreCandidates = 50
 const maxPerSourceCandidates = 20
 
 // alertFetchFailThreshold 是"连续失败几次触发一次主动告警"的阈值（功能 5.2）。
-// sources.fail_count 每个包含该源的调度轮 +1、任一次抓成清零，故它就是"连续失败
+// fetch_targets.fail_count 每个包含该目标的调度轮 +1、任一次抓成清零，故它就是"连续失败
 // streak"。只在 fail_count 恰好等于本阈值那一轮发一次告警（见 markFetchResult 返回值）：
 // 跨阈后每轮恒真，若"≥阈值就发"会每轮刷屏；"恰好等于"让每个失败 streak 只告警一次，
 // 源恢复（fail_count 归零）后再坏可再次告警。取 3：滤掉单次瞬时抖动，又不至于坏太久
@@ -94,8 +95,8 @@ var pushEffectUUIDNamespace = uuid.MustParse(
 // disableFetchFailThreshold 是"连续失败达此值自动停用"的阈值（功能 5.2，Boss 拍板
 // 「告警后再宽限」）。刻意远高于告警阈值：先在 3 次发预警卡给 owner 一个人工介入窗口，
 // 短暂宕机的站点在 3→10 次之间恢复即清零、不会被误停；持续失败到 10 次才判定失效自动停用，
-// 并发一张"已暂停 + 如何重新启用"的卡。停用后 ListDueSourcesByUser 不再返回它（抓取停止），
-// 直到用户经 enable_source 工具或信源页按钮重新启用。
+// 并发一张"已暂停"告警。停用后任务级 due 查询不再返回它（抓取停止），
+// 直到任务定义被修复并重新材料化该目标。
 const disableFetchFailThreshold = 10
 
 // ============================================================
@@ -107,17 +108,17 @@ const disableFetchFailThreshold = 10
 // Fetcher 抓取单个信源的内容。生产实现是 fetcher.Multi——按 (Platform, Capability)
 // 分发到 RSS/Exa/TikHub 具体抓取器；Activity 侧不关心信源类型差异。
 type Fetcher interface {
-	Fetch(ctx context.Context, src types.Source) ([]types.ContentItem, error)
+	Fetch(ctx context.Context, src types.FetchTarget) ([]types.ContentItem, error)
 }
 
 type compiledFetcherV1 interface {
 	ValidateRuntimeFetchRouteV1(
 		runtimepolicy.CapabilityV1,
-		types.Source,
+		types.FetchTarget,
 	) error
 	FetchWithPolicyV1(
 		context.Context,
-		types.Source,
+		types.FetchTarget,
 		runtimepolicy.CapabilityV1,
 		func(context.Context) error,
 	) ([]types.ContentItem, error)
@@ -199,30 +200,18 @@ type Store interface {
 	// unpaused Temporal schedule must not spend money or push until the exact
 	// DB task is active, mature, and still belongs to an active tenant/member.
 	AuthorizeScheduledRun(ctx context.Context, scheduleID string, userID int64) (bool, error)
-	// ListDueSourcesByUser 只返回 next_fetch_at <= now() 的到期源（审查 #重复计费）：
-	// markFetchResult 成功后推进 next_fetch_at，Activity 超时重试时已抓成功的
-	// Exa/TikHub 付费调用自然被跳过，不重复计费。
-	ListDueSourcesByUser(ctx context.Context, userID int64) ([]types.Source, error)
 	// UpsertContentItem 按 canonical_key 落内容（全局一份）再登记本次出现的源
 	// （content_sources）。取代 InsertContentItemIfNew：改名是因为语义变了——
 	// isNew 现在表示**内容本身首次入库**，而非"这个源首次见到"。本包不依赖 isNew
 	// （见 Fetch 里的调用点），故无分支受影响。
 	UpsertContentItem(ctx context.Context, item *types.ContentItem) (id int64, isNew bool, err error)
-	// ListRecentSimhashesByUser 按 user 维度（跨该用户全部订阅源）查 72h simhash 历史
-	// （审查 #跨源去重）：Exa 搜索天然与 RSS 源内容重叠，per-source 历史拦不住
-	// "昨天 RSS 推过、今天 Exa 又抓到"的跨源重复推送。
-	ListRecentSimhashesByUser(ctx context.Context, userID int64, since time.Time, excludeIDs []int64) ([]int64, error)
-	// UpdateSourceFetchState / ListUnpushedByUser 在 store 里 M3 就已实现，但此前没进本接口，
-	// 于是 UpdateSourceFetchState 从没被 Activity 调用过（抓取状态死代码 #7）；Fetch 重构后启用。
-	UpdateSourceFetchState(ctx context.Context, id int64, lastFetched, nextFetch time.Time, failCount int) error
-	// DisableSourceIfActive 连续失败达停用阈值时把源置 disabled（仅当前 active 才翻转，
+	UpdateFetchTargetState(ctx context.Context, id int64, lastFetched, nextFetch time.Time, failCount int) error
+	// DisableFetchTargetIfActive 连续失败达停用阈值时把源置 disabled（仅当前 active 才翻转，
 	// 幂等）；disabled=true 表示本次真的翻转，用于只发一次停用告警（功能 5.2）。
-	DisableSourceIfActive(ctx context.Context, id int64) (disabled bool, err error)
-	ListUnpushedByUser(ctx context.Context, userID int64, limit, perSourceCap int) ([]types.ContentItem, error)
-	// 任务手册 P1b b3 —— 按本任务的软范围源隔离抓取与候选（决策 #3「情报任务自包含」）。
-	// ScheduleHasSources 是分流开关：有链接才走隔离路径，否则退回用户级（决策 #4 老任务不变）。
-	ScheduleHasSources(ctx context.Context, scheduleID string) (bool, error)
-	ListDueSourcesBySchedule(ctx context.Context, scheduleID string) ([]types.Source, error)
+	DisableFetchTargetIfActive(ctx context.Context, id int64) (disabled bool, err error)
+	// Every runtime fetch is scoped to one task. There is no account-wide
+	// subscription fallback in the current execution model.
+	ListDueFetchTargetsByTask(ctx context.Context, scheduleID string) ([]types.FetchTarget, error)
 	ListUnpushedBySchedule(ctx context.Context, scheduleID string, limit, perSourceCap int) ([]types.ContentItem, error)
 	// 幂等推送地基（FIX-A 新增实现）：重试时复用同一 batch、跳过已发条目，杜绝重复发卡（#1 CRITICAL）。
 	// 取代原 CreatePushBatch / InsertDelivery（store 仍保留其实现，只是 Activity 不再用）。
@@ -241,11 +230,11 @@ type Store interface {
 	// MarkDeliverySent 发送成功后回填 message_id 与最终卡 JSON（契约 §3.3：
 	// 最终卡在拿到 delivery id 后才构造，只能在此落库而非 Insert 时）。
 	MarkDeliverySent(ctx context.Context, id int64, feishuMessageID string, cardJSON json.RawMessage, sentAt time.Time) error
-	// GetSource 按 id 查信源（卡片改版：subtitle 需要 source.Title 和 Platform）。
-	GetSource(ctx context.Context, id int64) (*types.Source, error)
-	// ScheduleSourceForContent 取内容在本任务源集里的命中源（content_sources ∩ schedule_sources）。
+	// GetFetchTarget 按 id 查信源（卡片改版：subtitle 需要 source.Title 和 Platform）。
+	GetFetchTarget(ctx context.Context, id int64) (*types.FetchTarget, error)
+	// TaskFetchTargetForContent 取内容在本任务源集里的命中源（content_sources ∩ task_fetch_targets）。
 	// 隔离任务构卡时用它标源，而非全局首发源 content_items.source_id（#8 卡片源归属）。
-	ScheduleSourceForContent(ctx context.Context, contentItemID int64, scheduleID string) (int64, bool, error)
+	TaskFetchTargetForContent(ctx context.Context, contentItemID int64, scheduleID string) (int64, bool, error)
 	// TenantLiveForUser 报告该用户所属租户是否仍在服务中（D9 软删除的执行面）。
 	TenantLiveForUser(ctx context.Context, userID int64) (bool, error)
 	// GetScheduleStrictness 读任务的推送门槛档位（migration 025，Select 过滤用）。
@@ -270,8 +259,8 @@ type CompiledRunStore interface {
 	AuthorizeTaskRunSideEffect(context.Context, types.RunIdentity, types.RunSnapshotRef) (bool, error)
 	AuthorizeAndConsumeTaskRunLLMQuotaV1(context.Context, types.RunIdentity, types.RunSnapshotRef, runtimepolicy.QuotaBucketV1, float64) error
 	UpsertContentItemForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, *types.ContentItem) (int64, bool, error)
-	UpdateSourceFetchStateForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, time.Time, time.Time, int) (bool, error)
-	DisableSourceIfActiveForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64) (bool, error)
+	UpdateFetchTargetStateForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, time.Time, time.Time, int) (bool, error)
+	DisableFetchTargetIfActiveForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64) (bool, error)
 	ListRecentSimhashesForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, time.Time, []int64) ([]int64, error)
 	EvolveProfileForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, []string, int64, time.Time, int64, int64, int64) error
 	AdvanceProfileCursorForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, int64, time.Time, int64, int64, int64) error
@@ -287,9 +276,9 @@ type CompiledRunStore interface {
 	UpdatePushBatchStatusForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, int64, types.BatchStatus) error
 	MarkPushBatchDoneReceiptV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, int64) error
 	MarkDeliverySentForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, string, int64, int64, string, json.RawMessage, time.Time) error
-	ListDueSourcesByIDs(context.Context, []int64) ([]types.Source, error)
+	ListDueFetchTargetsByIDs(context.Context, []int64) ([]types.FetchTarget, error)
 	ListUnpushedForTaskRunV1(context.Context, types.RunIdentity, types.RunSnapshotRef, []int64, int, int) ([]types.ContentItem, error)
-	SourceForContentFromIDs(context.Context, int64, []int64) (int64, bool, error)
+	FetchTargetForContentFromIDs(context.Context, int64, []int64) (int64, bool, error)
 	LoadStructuredEventEvidenceForTaskRunV1(
 		context.Context, types.RunIdentity, types.RunSnapshotRef, []int64,
 	) ([]storepkg.StructuredEventEvidenceContentV1, error)
@@ -1535,7 +1524,7 @@ func (a *Activities) validateCompiledSnapshotRoutesV1(snapshot runcontext.Compil
 			return types.NewAppError(types.CodeValidation,
 				"compiled source capability is not allowed", nil)
 		}
-		if err := frozenFetcher.ValidateRuntimeFetchRouteV1(capability, types.Source{
+		if err := frozenFetcher.ValidateRuntimeFetchRouteV1(capability, types.FetchTarget{
 			Platform: source.Platform, Capability: source.Capability,
 		}); err != nil {
 			return types.NewAppError(types.CodeValidation,
@@ -1615,14 +1604,14 @@ func (a *Activities) authorizeCompiledEffectV1(
 	return nil
 }
 
-// Fetch 现查用户的 active 订阅源，逐源抓取入库并推进各源抓取状态，最后返回
-// 该用户"未投递候选"（带条数上限）。TraceID 由 workflow 生成后经后续 Activity
+// Fetch 读取当前任务冻结的 fetch target，逐目标抓取入库并推进抓取状态，最后返回
+// 该任务范围内的未投递候选（带条数上限）。TraceID 由 workflow 生成后经后续 Activity
 // 入参下传，Fetch 本身无 LLM 调用故不需要。
 //
 // 相比初版有三处关键修复：
 //   - #3 重试丢内容：原来只返回本次 isNew=true 的条目，一旦 Fetch 因重试/中断
 //     没走完 pipeline，已入库但未投递的内容就永久丢失（下次 isNew=false 不再返回）。
-//     改为返回 ListUnpushedByUser（DB 事实来源），重试可续、不丢内容。
+//     改为从任务范围的 DB 事实重新查询，重试可续、不丢内容。
 //   - #7 抓取状态死代码：每源抓取后调 markFetchResult 真正推进 fail_count / 时间戳。
 //   - #6 成本护栏：返回时用 maxScoreCandidates 截断候选，避免积压内容一次性打爆 LLM。
 func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentItem, error) {
@@ -1663,32 +1652,14 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	if !compiled && a.refuseIfTenantGone(ctx, p.UserID, "fetch") {
 		return nil, nil
 	}
-	// 任务手册 P1b b3 的分流开关：本次触发绑定的定时任务若已编译出源（schedule_sources 非空），
-	// 则「只按本任务的源抓/挑」（决策 #3 自包含）；否则退回用户级（决策 #4 老任务不变，push_now
-	// 的 ScheduleID 为空也走这里）。生产里没建过带源手册的任务时 planScoped 恒 false，b3 休眠。
-	//
-	// 用"有无 schedule_sources 链接"当开关（而非"有无 playbook"）是刻意的：所有 create_schedule
-	// 任务都带 P0 空 playbook，若以 playbook 分流，存量任务会全部转隔离、其空计划→抓 0 源→生产
-	// 推送全断。故只有真编译出源的任务才隔离。副作用（已知、可接受）：一个原本有源的 plan 任务
-	// 若手册被改成零源（schedule_sources 被清空），会退回用户级抓全部订阅，而非"什么都不抓"——
-	// 这是安全默认（不因清空手册而静默停推），代价是"清空手册的取材范围"语义偏softly。
-	//
-	// b3 只隔离**抓取 + 候选选材**两层；**去重（Dedup）仍是用户级**（ListRecentSimhashesByUser
-	// 按用户全部订阅源的 72h simhash 历史）——plan 内容会与用户订阅内容跨任务近似去重。这是本轮
-	// 刻意留的 scope 边界（完整"自包含"需按 schedule 隔离 simhash 历史，留后续）；打分/出卡的
-	// 按任务注入是 P1c。
-	planScoped := false
-	if !compiled && p.ScheduleID != "" {
-		has, herr := a.store.ScheduleHasSources(ctx, p.ScheduleID)
-		if herr != nil {
-			return nil, herr
-		}
-		planScoped = has
+	if !compiled && strings.TrimSpace(p.ScheduleID) == "" {
+		return nil, nonRetryable(types.NewAppError(
+			types.CodeValidation, "task-scoped fetch requires schedule_id", nil,
+		))
 	}
-
 	// 只抓到期源（next_fetch_at <= now()）：重试不重复计费，详见接口注释。
 	// 未到期源被跳过不影响推送——其已入库内容仍由下方候选查询捞出。
-	var sources []types.Source
+	var targets []types.FetchTarget
 	var frozenSourceIDs []int64
 	var frozenSources map[int64]runcontext.SourceV1
 	if compiled {
@@ -1701,28 +1672,34 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 		if len(frozenSourceIDs) == 0 {
 			return nil, nil
 		}
-		liveSources, loadErr := a.compiledStore.ListDueSourcesByIDs(ctx, frozenSourceIDs)
+		liveTargets, loadErr := a.compiledStore.ListDueFetchTargetsByIDs(ctx, frozenSourceIDs)
 		if loadErr != nil {
 			return nil, loadErr
 		}
-		sources = make([]types.Source, 0, len(liveSources))
-		for _, live := range liveSources {
+		targets = make([]types.FetchTarget, 0, len(liveTargets))
+		for _, live := range liveTargets {
 			frozen, ok := frozenSources[live.ID]
 			if !ok {
 				return nil, nonRetryable(types.NewAppError(types.CodeValidation,
 					"compiled source health escaped frozen scope", nil))
+			}
+			if !sameFetchAcquisitionIdentity(live, frozen) {
+				// Fail before the external fetch. A URL-dedup collision with
+				// different acquisition semantics must never spend money and
+				// only discover the drift during the write-back fence.
+				slog.Warn("workflow: 跳过抓取语义已漂移的冻结目标",
+					"task_id", p.ScheduleID, "fetch_target_id", live.ID)
+				continue
 			}
 			live.Platform = frozen.Platform
 			live.Capability = frozen.Capability
 			live.Title = frozen.Title
 			live.URL = frozen.URL
 			live.Config = append(json.RawMessage(nil), frozen.Config...)
-			sources = append(sources, live)
+			targets = append(targets, live)
 		}
-	} else if planScoped {
-		sources, err = a.store.ListDueSourcesBySchedule(ctx, p.ScheduleID) // 只抓本任务的源
 	} else {
-		sources, err = a.store.ListDueSourcesByUser(ctx, p.UserID)
+		targets, err = a.store.ListDueFetchTargetsByTask(ctx, p.ScheduleID)
 	}
 	if err != nil {
 		return nil, err
@@ -1734,10 +1711,10 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 				"compiled task scope is invalid", err))
 		}
 		if len(frozenScope.SourceIDs) > 0 {
-			sources = filterSources(sources, frozenScope.SourceIDs)
+			targets = filterFetchTargets(targets, frozenScope.SourceIDs)
 		}
 	} else if len(p.Scope.SourceIDs) > 0 {
-		sources = filterSources(sources, p.Scope.SourceIDs)
+		targets = filterFetchTargets(targets, p.Scope.SourceIDs)
 	}
 
 	// 绑定引擎记账的 trace 锚点（endpoint-binding-contract.md §5）：用 workflow
@@ -1760,7 +1737,7 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	// 若把入库推迟到循环之后，源 B 查库时 A 的内容还没落地，同一篇笔记会被重复付费。
 	var alertable []fetchFailure // 本轮"恰好"连续失败达告警阈值的源，循环后批量告警一次（功能 5.2）。
 	var disabled []fetchFailure  // 本轮达停用阈值、刚被自动停用的源，循环后单发一张停用卡（功能 5.2）。
-	for _, src := range sources {
+	for _, src := range targets {
 		// Fetcher 应尊重 ctx，但单个 provider 可能只在自己的网络超时后才返回。
 		// 一旦 Activity 已取消，绝不能继续启动后续按次计费的源调用。
 		if err := ctx.Err(); err != nil {
@@ -1829,10 +1806,10 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 		for i := range items {
 			// isNew 刻意丢弃：007 起它的语义是"内容本身首次入库"（canonical_key
 			// 全局唯一）而非"这个源首次见到"，跨源命中同一篇时为 false。本活动
-			// 不据此分支——候选一律由下方 ListUnpushedByUser 从 DB 事实重新捞
+			// 不据此分支——候选一律由下方任务范围查询从 DB 事实重新捞
 			// （修 #3 时就已改成这样），所以语义变化对这里无影响：跨源重复的
 			// 第二份不新建内容行，但 UpsertContentItem 会登记 content_sources，
-			// 用户仍能经自己订阅的源关联到那唯一一份。
+			// 任务仍能经自己的 fetch target 关联到那唯一一份。
 			if compiled {
 				if _, _, ierr := a.compiledStore.UpsertContentItemForTaskRunV1(
 					ctx, compiledIdentity, compiledInput.Snapshot, src.ID, &items[i],
@@ -1842,7 +1819,7 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 				continue
 			}
 			if _, _, ierr := a.store.UpsertContentItem(ctx, &items[i]); ierr != nil {
-				// 单条入库失败只 warn：已入库的其它条目仍会被后面的 ListUnpushedByUser 捞出。
+				// 单条入库失败只 warn：已入库的其它条目仍会被任务范围查询捞出。
 				slog.Warn("fetch: 内容入库失败，跳过", "source_id", src.ID, "err", ierr)
 			}
 		}
@@ -1886,17 +1863,14 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 
 	// 返回"未投递候选"而非"本次新入库"，让 Fetch 重试幂等可续（修 #3）；
 	// 全局上限 + 每源配额双重截断，控制单批打分规模且防高产源饿死低产源（修 #6）。
-	// planScoped：只在本任务的源见过、且用户未读过的内容里挑——取材按任务隔离（决策 #3，
-	// P1b b3），去重按用户级（决策 A：用户已读的内容任何路径都不再重推）。
 	if compiled {
 		return a.compiledStore.ListUnpushedForTaskRunV1(
 			ctx, compiledIdentity, compiledInput.Snapshot, frozenSourceIDs,
 			maxScoreCandidates, maxPerSourceCandidates)
 	}
-	if planScoped {
-		return a.store.ListUnpushedBySchedule(ctx, p.ScheduleID, maxScoreCandidates, maxPerSourceCandidates)
-	}
-	return a.store.ListUnpushedByUser(ctx, p.UserID, maxScoreCandidates, maxPerSourceCandidates)
+	return a.store.ListUnpushedBySchedule(
+		ctx, p.ScheduleID, maxScoreCandidates, maxPerSourceCandidates,
+	)
 }
 
 type fetchOutcomeStateKey struct{}
@@ -1921,31 +1895,31 @@ func (a *Activities) FetchOutcomeV1(
 	return FetchOutcomeResult{Items: items, SourceCoverage: coverage}, nil
 }
 
-// markFetchResult 抓取一个源后推进其抓取状态，消除 UpdateSourceFetchState 从不被调用的死代码（#7）。
+// markFetchResult 抓取一个源后推进其抓取状态，消除 UpdateFetchTargetState 从不被调用的死代码（#7）。
 //   - ok=true：清零 fail_count，last_fetched_at=now，next_fetch_at=now+interval（正常节奏）。
 //   - ok=false：fail_count 自增，保留上次 last_fetched_at（本次没抓成不算"抓过"），
 //     next_fetch_at 仍推进一个 interval——否则调度下一 tick 会立刻重试，形成紧循环。
 //
 // 返回 crossedAlertThreshold=本轮 fail_count 恰好跨过告警阈值（功能 5.2）：仅失败分支
 // 且 failCount==alertFetchFailThreshold 且状态成功落库时为 true——调用方据此发一次告警。
-// gate 在落库成功之上：若 UpdateSourceFetchState 失败，fail_count 没推进，下轮会再次算到
+// gate 在落库成功之上：若 UpdateFetchTargetState 失败，fail_count 没推进，下轮会再次算到
 // 阈值，此时告警会错乱重复，故落库失败一律不告警（保持"恰好一次"不变量）。
 //
 // 两级阈值（Boss 拍板「告警后再宽限」）：
 //   - failCount==alertFetchFailThreshold(3) → crossedAlertThreshold：发一次预警卡（人工窗口）。
 //   - failCount>=disableFetchFailThreshold(10) 且当前仍 active → justDisabled：自动停用 + 发停用卡。
 //
-// 两个返回值互斥地驱动两种告警卡（3 与 10 不重叠）。停用经 DisableSourceIfActive 幂等完成，
+// 两个返回值互斥地驱动两种告警卡（3 与 10 不重叠）。停用经 DisableFetchTargetIfActive 幂等完成，
 // justDisabled 仅在"这一刻从 active 翻成 disabled"时为 true，据此只发一次停用告警。
-func (a *Activities) markFetchResult(ctx context.Context, src types.Source, ok bool) (crossedAlertThreshold, justDisabled bool) {
+func (a *Activities) markFetchResult(ctx context.Context, src types.FetchTarget, ok bool) (crossedAlertThreshold, justDisabled bool) {
 	lastFetched, nextFetch, failCount, crossedAlertThreshold := fetchResultState(src, ok)
-	if err := a.store.UpdateSourceFetchState(ctx, src.ID, lastFetched, nextFetch, failCount); err != nil {
+	if err := a.store.UpdateFetchTargetState(ctx, src.ID, lastFetched, nextFetch, failCount); err != nil {
 		slog.Warn("fetch: 更新抓取状态失败", "source_id", src.ID, "err", err)
 		return false, false // 状态未落库：不告警、不停用，避免下轮重复算到阈值再报。
 	}
 	// 达停用阈值：自动停用（幂等，只翻转仍 active 的源）。停用失败不影响抓取，下轮会再试。
 	if !ok && failCount >= disableFetchFailThreshold {
-		disabled, derr := a.store.DisableSourceIfActive(ctx, src.ID)
+		disabled, derr := a.store.DisableFetchTargetIfActive(ctx, src.ID)
 		if derr != nil {
 			slog.Warn("fetch: 自动停用失败（不影响抓取）", "source_id", src.ID, "err", derr)
 		} else {
@@ -1964,18 +1938,18 @@ func (a *Activities) markCompiledFetchResultV1(
 	ctx context.Context,
 	expected types.RunIdentity,
 	ref types.RunSnapshotRef,
-	src types.Source,
+	src types.FetchTarget,
 	ok bool,
 ) (crossedAlertThreshold, justDisabled bool, err error) {
 	lastFetched, nextFetch, failCount, crossed := fetchResultState(src, ok)
-	updated, err := a.compiledStore.UpdateSourceFetchStateForTaskRunV1(
+	updated, err := a.compiledStore.UpdateFetchTargetStateForTaskRunV1(
 		ctx, expected, ref, src.ID, lastFetched, nextFetch, failCount,
 	)
 	if err != nil || !updated {
 		return false, false, err
 	}
 	if !ok && failCount >= disableFetchFailThreshold {
-		disabled, err := a.compiledStore.DisableSourceIfActiveForTaskRunV1(
+		disabled, err := a.compiledStore.DisableFetchTargetIfActiveForTaskRunV1(
 			ctx, expected, ref, src.ID,
 		)
 		if err != nil {
@@ -1987,7 +1961,7 @@ func (a *Activities) markCompiledFetchResultV1(
 }
 
 func fetchResultState(
-	src types.Source,
+	src types.FetchTarget,
 	ok bool,
 ) (lastFetched, nextFetch time.Time, failCount int, crossedAlertThreshold bool) {
 	now := time.Now()
@@ -2004,7 +1978,7 @@ func fetchResultState(
 
 // fetchFailure 承载一个"连续失败恰好达告警阈值"的信源及其对 owner 可见的失败原因（功能 5.2）。
 type fetchFailure struct {
-	src       types.Source
+	src       types.FetchTarget
 	failCount int    // 本轮跨阈后的连续失败次数（= src.FailCount+1，等于阈值）。
 	reason    string // 面向 owner 的可读原因（已按红线3 从 AppError.Message 提取）。
 }
@@ -2120,13 +2094,13 @@ func renderSourcesDisabledAlert(disabled []fetchFailure) string {
 			fmt.Fprintf(&b, "链接：%s\n", f.src.URL)
 		}
 	}
-	b.WriteString("\n修复来源后可重新启用：在「信源管理」页点该源的『重新启用』，或直接对我说「重新启用信源 <id>」。启用后失败计数清零、立即恢复抓取。")
+	b.WriteString("\n请直接告诉 Vane 要修复哪个任务以及新的抓取要求；任务手册重新批准后会自动恢复对应抓取目标，无需管理内部 ID。")
 	return b.String()
 }
 
 // Dedup 做近似去重：精确去重（canonical_key）已在 Fetch 的 UpsertContentItem
 // 完成，本步用 simhash + 72h 窗口过滤"改标题/转载"式近重复。跨批用 store 里的
-// 历史 simhash（user 维度、跨全部订阅源——审查 #跨源去重：Exa 搜索天然与 RSS 源
+// 历史 simhash（user 维度、跨全部任务目标——审查 #跨目标去重：Exa 搜索天然与 RSS
 // 内容重叠，per-source 历史拦不住"昨天 RSS 推过、今天 Exa 又抓到"的跨源同稿），
 // 批内用累积集合——两者合并比对，避免同批内互为近重复的漏网。
 //
@@ -2149,7 +2123,7 @@ func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem
 		}
 	}
 
-	// 用户级历史一次取齐（跨该用户全部订阅源的 72h simhash），替代原 per-source
+	// 用户级历史一次取齐（跨该用户全部任务目标的 72h simhash），替代原逐目标
 	// 逐源查询——既堵住跨源跨批重复推送，也把 N 源 N 次查询合并为 1 次。
 	var hist []int64
 	if compiled {
@@ -2160,8 +2134,6 @@ func (a *Activities) Dedup(ctx context.Context, in DedupIn) ([]types.ContentItem
 		hist, err = a.compiledStore.ListRecentSimhashesForTaskRunV1(
 			ctx, expected, in.Run.Snapshot, since, batchIDs,
 		)
-	} else {
-		hist, err = a.store.ListRecentSimhashesByUser(ctx, in.UserID, since, batchIDs)
 	}
 	if err != nil {
 		return nil, retryableOrNot(err)
@@ -3645,7 +3617,7 @@ func (a *Activities) preparePushDeliveries(
 		displaySourceID := card.Scored.Item.SourceID
 		if compiled && card.Scored.Item.ID != 0 {
 			if sourceID, ok, sourceErr :=
-				a.compiledStore.SourceForContentFromIDs(
+				a.compiledStore.FetchTargetForContentFromIDs(
 					ctx, card.Scored.Item.ID, frozenSourceIDs,
 				); sourceErr == nil && ok {
 				displaySourceID = sourceID
@@ -3653,7 +3625,7 @@ func (a *Activities) preparePushDeliveries(
 				displaySourceID = 0
 			}
 		} else if in.ScheduleID != "" && card.Scored.Item.ID != 0 {
-			if sourceID, ok, sourceErr := a.store.ScheduleSourceForContent(
+			if sourceID, ok, sourceErr := a.store.TaskFetchTargetForContent(
 				ctx, card.Scored.Item.ID, in.ScheduleID,
 			); sourceErr == nil && ok {
 				displaySourceID = sourceID
@@ -3666,7 +3638,7 @@ func (a *Activities) preparePushDeliveries(
 					input.Platform = source.Platform
 				}
 			} else if source, sourceErr :=
-				a.store.GetSource(ctx, displaySourceID); sourceErr == nil {
+				a.store.GetFetchTarget(ctx, displaySourceID); sourceErr == nil {
 				input.SourceTitle = source.Title
 				input.Platform = source.Platform
 			}
@@ -4858,19 +4830,38 @@ func validPushEffectSentObservation(
 			observation.ChatID == effect.ProviderChatID)
 }
 
-// filterSources 只保留 id ∈ want 的信源（PushScope.SourceIDs 非空时用）。
-func filterSources(sources []types.Source, want []int64) []types.Source {
+// filterFetchTargets 只保留 id ∈ want 的抓取目标（冻结 v1 的
+// PushScope.SourceIDs 非空时用）。
+func filterFetchTargets(targets []types.FetchTarget, want []int64) []types.FetchTarget {
 	set := make(map[int64]struct{}, len(want))
 	for _, id := range want {
 		set[id] = struct{}{}
 	}
-	out := sources[:0:0]
-	for _, s := range sources {
+	out := targets[:0:0]
+	for _, s := range targets {
 		if _, ok := set[s.ID]; ok {
 			out = append(out, s)
 		}
 	}
 	return out
+}
+
+func sameFetchAcquisitionIdentity(
+	live types.FetchTarget,
+	frozen runcontext.SourceV1,
+) bool {
+	if live.ID != frozen.SourceID ||
+		live.Platform != frozen.Platform ||
+		live.Capability != frozen.Capability ||
+		live.URL != frozen.URL {
+		return false
+	}
+	var liveConfig, frozenConfig any
+	if json.Unmarshal(live.Config, &liveConfig) != nil ||
+		json.Unmarshal(frozen.Config, &frozenConfig) != nil {
+		return false
+	}
+	return reflect.DeepEqual(liveConfig, frozenConfig)
 }
 
 // NotifyEmptyIn 是 NotifyEmptyResult Activity 的入参。
@@ -4891,7 +4882,7 @@ type NotifyEmptyIn struct {
 
 // NotifyEmptyResult 给用户发一张"本次没有新内容"的通知卡。
 //
-// 只服务**用户主动触发**的推送（"现在推"按钮 / agent push_now）——用户明确要了
+// 只服务**用户主动触发**的任务级运行——用户明确要了
 // 一次推送，管道跑完却一声不吭，空结果和故障在用户侧不可区分（2026-07-18 Boss
 // 点了立即推送等不到任何回音，来查"服务器是不是坏了"——服务其实完全正常）。
 // 定时任务的空批次保持静默：每天早上收一条"今天没新闻"是噪音不是信息。

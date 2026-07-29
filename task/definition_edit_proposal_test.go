@@ -23,7 +23,7 @@ type definitionEditProposalComponentFixtureV1 struct {
 	BaseSnapshot     json.RawMessage `json:"base_snapshot"`
 }
 
-const goldenTaskDefinitionEditProposalV1 = `{"wire_version":"vane.task-definition-edit-proposal/v1","operation_id":"edit-proposal-fixture","approval_ref":"approval-definition-edit-0001","actor":{"tenant_id":7,"user_id":42},"target":{"tenant_id":7,"user_id":42,"task_id":"task-v1-9e07ee1d79baaae1d8d4ad49fd72e449112a11961b7a534d4a913b9425fb62e8"},"session_id":91,"expires_at_unix_micros":1780000000123456,"original_status":"active","base_head":{"version":1,"digest":"93b3e82fc8ba406d715e3e157b285082774b186c61189983fa50bc05354a42e2"},"target_head":{"version":2,"digest":"d7e3c0a999459878b21ef0fc799fd81632bd9ef8e48aa704b20fb3a41189f3ae"},"target_definition_digest":"d7e3c0a999459878b21ef0fc799fd81632bd9ef8e48aa704b20fb3a41189f3ae","prepared_edit_digest":"b6d978020aeefee599eae5e58a57e1c8a4c94d19aa68287fb84c80ed2d820658","base_snapshot_digest":"331f8b0261dee63cd600e393f123b36fc43c36ae10f6a1641e2637de39264ebd"}`
+const goldenTaskDefinitionEditProposalV2 = `{"wire_version":"vane.task-definition-edit-proposal/v2","operation_id":"edit-proposal-fixture","operation_ref":"approval-definition-edit-0001","actor":{"tenant_id":7,"user_id":42},"target":{"tenant_id":7,"user_id":42,"task_id":"task-v1-9e07ee1d79baaae1d8d4ad49fd72e449112a11961b7a534d4a913b9425fb62e8"},"session_id":91,"expires_at_unix_micros":1780000000123456,"original_status":"active","base_head":{"version":1,"digest":"93b3e82fc8ba406d715e3e157b285082774b186c61189983fa50bc05354a42e2"},"target_head":{"version":2,"digest":"d7e3c0a999459878b21ef0fc799fd81632bd9ef8e48aa704b20fb3a41189f3ae"},"target_definition_digest":"d7e3c0a999459878b21ef0fc799fd81632bd9ef8e48aa704b20fb3a41189f3ae","prepared_edit_digest":"b6d978020aeefee599eae5e58a57e1c8a4c94d19aa68287fb84c80ed2d820658","base_snapshot_digest":"331f8b0261dee63cd600e393f123b36fc43c36ae10f6a1641e2637de39264ebd"}`
 
 type decodedDefinitionEditProposalFixture struct {
 	base         taskstate.ApprovedDefinitionV1
@@ -40,9 +40,9 @@ func TestFrozenTaskDefinitionEditProposal_CanonicalRoundTripAndBindings(t *testi
 	if err != nil {
 		t.Fatalf("BuildFrozenTaskDefinitionEditProposal() error = %v", err)
 	}
-	if string(frozen.CanonicalProposal) != goldenTaskDefinitionEditProposalV1 {
+	if string(frozen.CanonicalProposal) != goldenTaskDefinitionEditProposalV2 {
 		t.Fatalf("proposal V1 canonical wire drifted:\n got: %s\nwant: %s",
-			frozen.CanonicalProposal, goldenTaskDefinitionEditProposalV1)
+			frozen.CanonicalProposal, goldenTaskDefinitionEditProposalV2)
 	}
 
 	if frozen.Proposal.WireVersion != taskDefinitionEditProposalVersion ||
@@ -106,7 +106,7 @@ func TestFrozenTaskDefinitionEditProposal_RejectsExactWireViolations(t *testing.
 		{name: "duplicate field", raw: duplicateOperation},
 		{name: "case folded field", raw: bytes.Replace(frozen.CanonicalProposal, []byte(`"wire_version"`), []byte(`"WIRE_VERSION"`), 1)},
 		{name: "escaped field", raw: bytes.Replace(frozen.CanonicalProposal, []byte(`"wire_version"`), []byte(`"\u0077ire_version"`), 1)},
-		{name: "missing field", raw: bytes.Replace(frozen.CanonicalProposal, []byte(`"wire_version":"vane.task-definition-edit-proposal/v1",`), nil, 1)},
+		{name: "missing field", raw: bytes.Replace(frozen.CanonicalProposal, []byte(`"wire_version":"vane.task-definition-edit-proposal/v2",`), nil, 1)},
 		{name: "null scalar", raw: bytes.Replace(frozen.CanonicalProposal, []byte(`"session_id":91`), []byte(`"session_id":null`), 1)},
 		{name: "invalid utf8", raw: append(bytes.Clone(frozen.CanonicalProposal[:len(frozen.CanonicalProposal)-1]), 0xff, '}')},
 	}
@@ -126,39 +126,39 @@ func TestFrozenTaskDefinitionEditProposal_RejectsScopeHeadAndDigestSplices(t *te
 	frozen := buildDefinitionEditProposalFixture(t, fixture)
 	tests := []struct {
 		name   string
-		mutate func(*TaskDefinitionEditProposalV1)
+		mutate func(*TaskDefinitionEditProposalV2)
 	}{
-		{name: "operation", mutate: func(value *TaskDefinitionEditProposalV1) { value.OperationID += "-other" }},
-		{name: "approval ref", mutate: func(value *TaskDefinitionEditProposalV1) { value.ApprovalRef = "" }},
-		{name: "approval ref format character", mutate: func(value *TaskDefinitionEditProposalV1) {
-			value.ApprovalRef = "approval\u200bhidden"
+		{name: "operation", mutate: func(value *TaskDefinitionEditProposalV2) { value.OperationID += "-other" }},
+		{name: "operation ref", mutate: func(value *TaskDefinitionEditProposalV2) { value.OperationRef = "" }},
+		{name: "operation ref format character", mutate: func(value *TaskDefinitionEditProposalV2) {
+			value.OperationRef = "approval\u200bhidden"
 		}},
-		{name: "approval ref bidi override", mutate: func(value *TaskDefinitionEditProposalV1) {
-			value.ApprovalRef = "approval\u202ehidden"
+		{name: "operation ref bidi override", mutate: func(value *TaskDefinitionEditProposalV2) {
+			value.OperationRef = "approval\u202ehidden"
 		}},
-		{name: "operation too long", mutate: func(value *TaskDefinitionEditProposalV1) {
+		{name: "operation too long", mutate: func(value *TaskDefinitionEditProposalV2) {
 			value.OperationID = strings.Repeat("o", maxTaskDefinitionEditOperationIDBytes+1)
 		}},
-		{name: "actor tenant", mutate: func(value *TaskDefinitionEditProposalV1) { value.Actor.TenantID++ }},
-		{name: "actor user", mutate: func(value *TaskDefinitionEditProposalV1) { value.Actor.UserID++ }},
-		{name: "target tenant", mutate: func(value *TaskDefinitionEditProposalV1) { value.Target.TenantID++ }},
-		{name: "target user", mutate: func(value *TaskDefinitionEditProposalV1) { value.Target.UserID++ }},
-		{name: "target task", mutate: func(value *TaskDefinitionEditProposalV1) { value.Target.TaskID += "-other" }},
-		{name: "target task too long", mutate: func(value *TaskDefinitionEditProposalV1) {
+		{name: "actor tenant", mutate: func(value *TaskDefinitionEditProposalV2) { value.Actor.TenantID++ }},
+		{name: "actor user", mutate: func(value *TaskDefinitionEditProposalV2) { value.Actor.UserID++ }},
+		{name: "target tenant", mutate: func(value *TaskDefinitionEditProposalV2) { value.Target.TenantID++ }},
+		{name: "target user", mutate: func(value *TaskDefinitionEditProposalV2) { value.Target.UserID++ }},
+		{name: "target task", mutate: func(value *TaskDefinitionEditProposalV2) { value.Target.TaskID += "-other" }},
+		{name: "target task too long", mutate: func(value *TaskDefinitionEditProposalV2) {
 			value.Target.TaskID = strings.Repeat("t", maxTaskDefinitionEditTaskIDBytes+1)
 		}},
-		{name: "session", mutate: func(value *TaskDefinitionEditProposalV1) { value.SessionID = 0 }},
-		{name: "expiry", mutate: func(value *TaskDefinitionEditProposalV1) { value.ExpiresAtUnixMicros = 0 }},
-		{name: "original status", mutate: func(value *TaskDefinitionEditProposalV1) {
-			value.OriginalStatus = TaskDefinitionEditOriginalStatusV1Paused
+		{name: "session", mutate: func(value *TaskDefinitionEditProposalV2) { value.SessionID = 0 }},
+		{name: "expiry", mutate: func(value *TaskDefinitionEditProposalV2) { value.ExpiresAtUnixMicros = 0 }},
+		{name: "original status", mutate: func(value *TaskDefinitionEditProposalV2) {
+			value.OriginalStatus = TaskDefinitionEditOriginalStatusV2Paused
 		}},
-		{name: "base version", mutate: func(value *TaskDefinitionEditProposalV1) { value.BaseHead.Version++ }},
-		{name: "base digest", mutate: func(value *TaskDefinitionEditProposalV1) { value.BaseHead.Digest = strings.Repeat("c", 64) }},
-		{name: "target version", mutate: func(value *TaskDefinitionEditProposalV1) { value.TargetHead.Version++ }},
-		{name: "target digest", mutate: func(value *TaskDefinitionEditProposalV1) { value.TargetHead.Digest = strings.Repeat("c", 64) }},
-		{name: "target bytes digest", mutate: func(value *TaskDefinitionEditProposalV1) { value.TargetDefinitionDigest = strings.Repeat("c", 64) }},
-		{name: "prepared bytes digest", mutate: func(value *TaskDefinitionEditProposalV1) { value.PreparedEditDigest = strings.Repeat("c", 64) }},
-		{name: "snapshot bytes digest", mutate: func(value *TaskDefinitionEditProposalV1) { value.BaseSnapshotDigest = strings.Repeat("c", 64) }},
+		{name: "base version", mutate: func(value *TaskDefinitionEditProposalV2) { value.BaseHead.Version++ }},
+		{name: "base digest", mutate: func(value *TaskDefinitionEditProposalV2) { value.BaseHead.Digest = strings.Repeat("c", 64) }},
+		{name: "target version", mutate: func(value *TaskDefinitionEditProposalV2) { value.TargetHead.Version++ }},
+		{name: "target digest", mutate: func(value *TaskDefinitionEditProposalV2) { value.TargetHead.Digest = strings.Repeat("c", 64) }},
+		{name: "target bytes digest", mutate: func(value *TaskDefinitionEditProposalV2) { value.TargetDefinitionDigest = strings.Repeat("c", 64) }},
+		{name: "prepared bytes digest", mutate: func(value *TaskDefinitionEditProposalV2) { value.PreparedEditDigest = strings.Repeat("c", 64) }},
+		{name: "snapshot bytes digest", mutate: func(value *TaskDefinitionEditProposalV2) { value.BaseSnapshotDigest = strings.Repeat("c", 64) }},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -447,7 +447,7 @@ func validDefinitionEditProposalInput(
 ) BuildTaskDefinitionEditProposalInput {
 	return BuildTaskDefinitionEditProposalInput{
 		OperationID:      fixture.prepared.OperationID,
-		ApprovalRef:      "approval-definition-edit-0001",
+		OperationRef:     "approval-definition-edit-0001",
 		ActorTenantID:    fixture.prepared.Creation.TenantID,
 		ActorUserID:      fixture.prepared.Creation.UserID,
 		TargetTenantID:   fixture.prepared.Creation.TenantID,

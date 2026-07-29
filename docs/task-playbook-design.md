@@ -1,12 +1,17 @@
 # 任务手册（Task Playbook）设计方案 · RFC
 
+> **现行覆盖声明（2026-07-29）：** 当前材料化链路为
+> `task manual → fetchspec → capabilitycatalog → fetch_targets →
+> task_fetch_targets`，以 `task-playbook-fetch-target-cutover.md` 为准。下文
+> `sourcespec` / `sources` 是本 RFC 落地时的历史名，不得用于新代码。
+
 > 状态：**正式契约（7 个开放问题全部拍板，见 §10）· P0、P1a、P1b、P1c 均已实现**。
 > - **P0 + D-2 + D-5**：迁移 017 `schedule_playbooks`、store DAO、`view/edit_task_playbook` 工具、
 >   `create_schedule` 创建即初始化、`include_domains` 接进 sourcespec 配置+幂等键、M6 §5.3 lookback 提级。
 > - **P1a 编译层**：`create_schedule`/`edit_task_playbook`
 >   在存下手册正文后各发一次 LLM 调用，把正文**编译**成结构化 `fetch_plan`（逐源经 sourcespec 校验、
 >   归一化落库），`view_task_playbook` 渲染计划。
-> - **P1b 运行时消费**：Fetch 按本任务 `fetch_plan`/`schedule_sources` 取材；候选取材按任务隔离，
+> - **P1b 运行时消费**：Fetch 按本任务 `fetch_plan`/`task_fetch_targets` 取材；候选取材按任务隔离，
 >   用户级去重避免同一内容跨任务重复轰炸。
 > - **P1c 打分/出卡注入**：Score/CardGen 各自在 Activity 扇出前按属主读取一次已确认手册，
 >   经统一 promptguard 消毒和 800-rune 上限后追加到锁定 user prompt 末尾；默认暗发布，先单任务 canary。
@@ -49,8 +54,8 @@ Schedule 触发 → PushPipelineWorkflow
   → EvolveProfile → Fetch(按本任务已批准计划取材) → Dedup → Score(LLM逐条) → Select → CardGen(LLM) → Push
 ```
 
-- `Fetch` 活动根据 `schedule_id` 消费已编译计划与材料化 `schedule_sources`；没有任务范围的即时/存量路径
-  才沿用用户级来源。**源与参数在创建/编辑期已批准**，运行时不临时扩大长期信源。
+- `Fetch` 活动根据 `schedule_id` 消费已编译计划与材料化 `task_fetch_targets`；没有任务范围的
+  运行直接拒绝。**目标与参数在创建/编辑期已批准**，运行时不临时扩大范围。
 - LLM 只出现在 Score / CardGen / Evolve（逐条、确定性关进 Activity）。
 
 Boss 的愿景把抓取阶段从"抓全部订阅源"演进为"创建/编辑期由 agent 编译手册，运行期按批准计划抓"。
@@ -215,8 +220,8 @@ Activity type 负控必须触发 `TMPRL1100`，用于证明 replay 测试不是�
 - **翻译**：一次 `llm.Do`（`DisableThinking:true`、温度 0，client 默认模型，走 recorder 记账），
   system prompt 锚定可用 platform/capability 词汇（严格对齐 sourcespec 消费面）+ D-5 追新用
   `include_domains` 不用日期过滤的铁律 + 宁缺毋滥不编造。
-- **校验+落库形态**：模型输出的线形态复用 `addSourceArgs`（与 add_source/sourcespec 三者同源词汇），
-  逐源经 `specFromArgs`→`sourcespec.Build` 校验，**坏源丢弃并 warn**；落库存**归一化后**的
+- **校验+落库形态**：模型输出由独立的任务 fetch-target 编译参数承载，
+  逐目标经 `sourcespec.Build` 校验，**坏目标丢弃并 warn**；落库存**归一化后**的
   `PlannedSource{platform,capability,title,url(幂等键),config}`（即将来运行时抓取要消费的形态）。
 - **best-effort 铁律**：翻译/落库任何失败只 slog、绝不影响主效果（调度已建 / 手册正文已存）；
   `SetFetchPlan` 只改 `fetch_plan` 列不动 `content`，且用 `UPDATE…FROM schedules` 依附**已存在**手册行

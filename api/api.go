@@ -19,9 +19,7 @@ import (
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/feishu"
 	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
 )
 
 // Manager 抽象 feishu.Manager 中 API 层用到的能力。
@@ -36,7 +34,6 @@ type Manager interface {
 // Scheduler abstracts the remaining API-safe scheduler capabilities. Task
 // definition writes are intentionally absent from this consumer interface.
 type Scheduler interface {
-	PushNow(ctx context.Context, userID int64, scope workflow.PushScope) (runID string, err error)
 	DeletePush(ctx context.Context, schedID string, userID int64) error
 }
 
@@ -74,8 +71,7 @@ type scheduleNextRunReader interface {
 	NextRun(ctx context.Context, schedID string, userID int64) (*time.Time, error)
 }
 
-// TaskAgent is the existing confirmed-write control plane exposed to the Web
-// transport. The API never receives raw Store/coordinator phase methods.
+// TaskAgent is the direct natural-language task control plane exposed to Web.
 type TaskAgent interface {
 	HandleMessage(
 		ctx context.Context,
@@ -95,39 +91,6 @@ type TaskAgent interface {
 		taskID string,
 		text string,
 	) (agent.Outcome, error)
-	ExecuteActionWithReceipt(
-		ctx context.Context,
-		userID int64,
-		actionID string,
-		receipt task.CreationReceiptTarget,
-	) (agent.CardActionOutcome, error)
-	CancelActionWithReceipt(
-		ctx context.Context,
-		userID int64,
-		actionID string,
-		receipt task.CreationReceiptTarget,
-	) (agent.CardActionOutcome, error)
-}
-
-// TaskActionStore is the owner-scoped durable identity read boundary used by
-// the Web proposal/replay protocol. It prevents a transport retry from
-// re-running the model after the operation commit response was lost.
-type TaskActionStore interface {
-	GetSchedule(
-		ctx context.Context,
-		id string,
-		userID int64,
-	) (*types.Schedule, error)
-	LoadTaskCreationOperationByUser(
-		ctx context.Context,
-		id string,
-		userID int64,
-	) (*types.TaskCreationOperation, error)
-	LoadTaskDefinitionEditOperationByActor(
-		ctx context.Context,
-		actionID string,
-		userID int64,
-	) (*types.TaskDefinitionEditOperation, error)
 }
 
 // BriefFeedback is the existing explicit-user deep-dive control plane. P2-D
@@ -171,9 +134,6 @@ type Deps struct {
 	// deep-dive is an explicit fixed action and keeps the existing durable
 	// feedback/idempotency/delivery behavior.
 	BriefFeedback BriefFeedback
-	// TaskActions is the narrow durable replay/identity reader. Production
-	// injects the same Store; tests can prove transport invariants without PG.
-	TaskActions TaskActionStore
 	// Principal 是全系统唯一的 principal 来源（企业级契约 §1.1，不变量 I-A1）。
 	// 生产由 main.go 注入 auth.NewOwnerResolver；单测可注入假实现。
 	Principal auth.PrincipalResolver
@@ -247,16 +207,7 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("POST /api/schedules/{id}/run", s.handleRunScheduleNow)
 	inner.HandleFunc("POST /api/schedules/{id}/pause", s.handlePauseSchedule)
 	inner.HandleFunc("POST /api/schedules/{id}/resume", s.handleResumeSchedule)
-	inner.HandleFunc("POST /api/push/now", s.handlePushNow)
-	inner.HandleFunc("POST /api/task-actions/propose", s.handleProposeTaskAction)
-	inner.HandleFunc("GET /api/task-actions/{id}", s.handleGetTaskAction)
-	inner.HandleFunc("POST /api/task-actions/{id}/confirm", s.handleConfirmTaskAction)
-	inner.HandleFunc("POST /api/task-actions/{id}/cancel", s.handleCancelTaskAction)
-	inner.HandleFunc("GET /api/subscriptions", s.handleListSubscriptions)
-	inner.HandleFunc("POST /api/subscriptions", s.handleAddSubscription)
-	inner.HandleFunc("DELETE /api/subscriptions/{source_id}", s.handleRemoveSubscription)
-	inner.HandleFunc("POST /api/sources/{source_id}/enable", s.handleEnableSource)
-
+	inner.HandleFunc("POST /api/task-actions", s.handleExecuteTaskAction)
 	// M5 Gate 探针端点（契约 §16）：只读体检，与 cmd/gate 共用 probe 包同一份判定。
 	inner.HandleFunc("GET /api/admin/observability", s.handleObservability)
 
