@@ -2841,11 +2841,11 @@ func TestFetch_CompiledRunUsesFrozenSourcesAndCandidates(t *testing.T) {
 	exactUpserts := compiledStore.fetchUpserts
 	exactStateWrites := compiledStore.fetchStateWrites
 	compiledStore.mu.Unlock()
-	if len(dueIDs) != 1 || len(candidateIDs) != 1 || !reflect.DeepEqual(dueIDs[0], []int64{10}) || !reflect.DeepEqual(candidateIDs[0], []int64{10}) {
-		t.Fatalf("compiled source scope calls due=%v candidates=%v", dueIDs, candidateIDs)
+	if len(dueIDs) != 0 || len(candidateIDs) != 1 || !reflect.DeepEqual(candidateIDs[0], []int64{10}) {
+		t.Fatalf("compiled source scope calls shared_due=%v candidates=%v", dueIDs, candidateIDs)
 	}
-	if exactUpserts != 1 || exactStateWrites != 1 {
-		t.Fatalf("compiled Fetch exact writes: content=%d state=%d, want 1/1",
+	if exactUpserts != 1 || exactStateWrites != 0 {
+		t.Fatalf("compiled Fetch exact writes: content=%d shared_state=%d, want 1/0",
 			exactUpserts, exactStateWrites)
 	}
 	legacyUpserts, legacyUpdates, _, _, _, _, _ := legacyStore.effectCounts()
@@ -2855,7 +2855,7 @@ func TestFetch_CompiledRunUsesFrozenSourcesAndCandidates(t *testing.T) {
 	}
 }
 
-func TestFetch_CompiledAcquisitionDriftStopsBeforePaidFetch(t *testing.T) {
+func TestFetch_CompiledRunDoesNotConsultMutableGlobalSourceState(t *testing.T) {
 	identity, ref, snapshot := compiledActivityFixture("Frozen Task")
 	compiledStore := &compiledRunStoreFake{
 		snapshot: snapshot, authorize: true,
@@ -2866,7 +2866,9 @@ func TestFetch_CompiledAcquisitionDriftStopsBeforePaidFetch(t *testing.T) {
 			FetchIntervalSeconds: 60,
 		}},
 	}
-	fetcher := new(sourceCaptureFetcher)
+	fetcher := &sourceCaptureFetcher{items: []types.ContentItem{{
+		SourceID: 10, CanonicalKey: "https://frozen.example/item",
+	}}}
 	a := NewActivities(
 		fetcher, fakeScorer{}, fakeCardGen{}, &fakePusher{},
 		&effectCountingStore{fakeStore: new(fakeStore)}, fakeFeishu{},
@@ -2888,13 +2890,22 @@ func TestFetch_CompiledAcquisitionDriftStopsBeforePaidFetch(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacy, compiled, _ := fetcher.snapshot()
-	if len(legacy)+len(compiled) != 0 {
-		t.Fatal("drifted acquisition identity reached the paid fetcher")
+	if len(legacy) != 0 || len(compiled) != 1 {
+		t.Fatalf("compiled fetch calls legacy=%+v compiled=%+v", legacy, compiled)
+	}
+	want := snapshot.Definition.Sources[0]
+	if compiled[0].ID != want.SourceID || compiled[0].URL != want.URL ||
+		!reflect.DeepEqual(compiled[0].Config, want.Config) {
+		t.Fatalf("fetch did not use frozen task Source: got=%+v want=%+v", compiled[0], want)
 	}
 	compiledStore.mu.Lock()
 	defer compiledStore.mu.Unlock()
-	if compiledStore.fetchStateWrites != 0 || compiledStore.fetchUpserts != 0 {
-		t.Fatal("drifted acquisition identity produced fetch bookkeeping")
+	if len(compiledStore.dueSourceIDs) != 0 {
+		t.Fatalf("compiled fetch consulted shared due state: %+v", compiledStore.dueSourceIDs)
+	}
+	if compiledStore.fetchStateWrites != 0 || compiledStore.fetchUpserts != 1 {
+		t.Fatalf("compiled writes shared_state=%d content=%d, want 0/1",
+			compiledStore.fetchStateWrites, compiledStore.fetchUpserts)
 	}
 }
 

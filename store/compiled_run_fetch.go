@@ -38,7 +38,7 @@ func (s *Store) UpsertContentItemForTaskRunV1(
 	if err != nil {
 		return 0, false, err
 	}
-	// Hold the exact global source identity stable until its appearance is
+	// Hold the exact retained v1 provenance identity stable until its appearance is
 	// committed. If it changed while the network call was in flight, linking the
 	// old response to the reused source_id would make future tasks see source A's
 	// content as source B's. Fail closed before either the global content row or
@@ -51,10 +51,9 @@ func (s *Store) UpsertContentItemForTaskRunV1(
 		    AND s.platform = $2 AND s.capability = $3
 		    AND s.title = $4 AND s.url = $5
 		    AND s.config = $6::jsonb
-		    AND s.status = $7
 		  FOR SHARE OF s`,
 		sourceID, frozen.Platform, frozen.Capability, frozen.Title, frozen.URL,
-		frozen.Config, types.FetchTargetStatusActive,
+		frozen.Config,
 	).Scan(&sourceExact); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, false, taskRunNotFound()
