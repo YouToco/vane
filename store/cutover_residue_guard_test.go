@@ -95,6 +95,8 @@ func TestTaskToolRuntimeHasNoRetiredCurrentPackages(t *testing.T) {
 			"CREATE TABLE TASK_SOURCES",
 			"CREATE TABLE USER_SOURCES",
 			"CREATE TABLE SOURCE_INSTANCES",
+			"CREATE TABLE TASK_TOOL_INVOCATIONS",
+			"CREATE TABLE RUN_TOOL_INVOCATIONS",
 		} {
 			if strings.Contains(upper, forbidden) {
 				t.Errorf("Source entity schema %q is forbidden in %s",

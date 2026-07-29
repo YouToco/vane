@@ -60,7 +60,9 @@ derived execution data, not the task's authority.
 
 Tool arguments, provider configuration, cursor, failure count and next-run
 state belong to one exact tenant/user/task/Tool-call identity. They are
-internal task runtime state and follow the task's ownership and purge rules.
+stored inside the existing approved-definition/adaptive-state/run-snapshot
+aggregates and follow the task's ownership and purge rules. They do not get a
+new independently addressable table or lifecycle.
 
 Two users may monitor the same public blogger. Vane may de-duplicate public
 content bytes by canonical content identity, but the following never cross
@@ -117,10 +119,10 @@ This is a temporary compatibility root, not the target architecture.
 The remaining data-plane cutover is intentionally ordered:
 
 1. Seal canonical Tool calls directly in the approved task head.
-2. Scope Tool-call runtime state to tenant/user/task/call identity with
-   RLS/purge behavior and independent health/cursor state.
+2. Key Tool-call runtime state inside `task_adaptive_states` by the exact
+   invocation digest; do not create a new entity table.
 3. Build new run snapshots only from those sealed Tool calls.
-4. Add task/run/Tool-invocation provenance to content observations.
+4. Add task/run-snapshot/invocation-digest provenance to content observations.
 5. Route candidate selection, card reconstruction and evidence rendering
    through that provenance.
 6. Stop all current writers from materializing user configuration in the
