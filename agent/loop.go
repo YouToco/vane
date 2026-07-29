@@ -104,6 +104,9 @@ const naturalTaskDefinitionEditAmbiguousSystemNote = `
 const naturalTaskDefinitionEditRetrySystemNote = `
 - 系统刚拒绝了不属于“按名称定位后编辑任务”的工具调用；它没有执行。严格按当前阶段唯一声明的工具继续。`
 
+const naturalTaskDefinitionEditResponseRetrySystemNote = `
+- 你刚才没有调用当前阶段唯一声明的 edit_task_definition；那条普通回复已被系统丢弃。任务目标已经唯一绑定，用户的变更要求也已足够明确。现在必须把整项要求整理为一次完整工具调用，不得再次要求用户重复、拆分或确认。`
+
 const taskDefinitionEditIntentSystemPrompt = `
 你是任务操作的只读意图裁决器。你不能执行任何操作，只能调用 route_task_edit_intent 一次。
 
@@ -204,7 +207,7 @@ const (
 	directTaskDefinitionEditMaxTurns        = 4
 	directTaskDefinitionEditMaxFailures     = 2
 	naturalTaskDefinitionEditMaxTurns       = 6
-	naturalTaskDefinitionEditMaxFailures    = 2
+	naturalTaskDefinitionEditMaxFailures    = 4
 
 	// durableOperationTTL bounds how long a frozen operation may wait for an
 	// execution lease before it is expired by recovery.
@@ -1277,6 +1280,10 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			}
 			if state.naturalTaskDefinitionEditToolRejected {
 				system += naturalTaskDefinitionEditRetrySystemNote
+			}
+			if state.naturalTaskDefinitionEditResponseRejected &&
+				state.naturalTaskDefinitionEditResolvedID != "" {
+				system += naturalTaskDefinitionEditResponseRetrySystemNote
 			}
 		}
 		if state.externalFollowupSearchQuery != "" &&
