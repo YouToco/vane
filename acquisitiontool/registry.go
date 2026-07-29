@@ -1,4 +1,6 @@
-// Package capabilitycatalog 是「平台 × 能力」的**机器可读能力注册表**（M6 契约 §2）。
+// Package acquisitiontool defines the scheduled acquisition tools available
+// to the Agent and executes their input contract. A tool owns its name,
+// availability, output kind, validation and normalization in one place.
 //
 // 为什么要有这一层，而不是把可用性散落在各处的 switch 注释里（契约 §2.2）：
 // 现状把"某能力为什么不能用"写在 const 注释上（tikhub.go 记 get_video_note_detail
@@ -16,7 +18,7 @@
 //
 // 本包是**纯数据**，只依赖 types：Provider 实现是 fetcher 的内部细节，不进这里
 // （契约 §1：供应商既不进 types.FetchTarget，也不进身份，也不进本注册表）。
-package capabilitycatalog
+package acquisitiontool
 
 import "github.com/YouToco/vane/types"
 

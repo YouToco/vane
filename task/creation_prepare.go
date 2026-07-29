@@ -14,7 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/fetchspec"
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
@@ -627,7 +627,7 @@ func canonicalizeFetchPlan(raw json.RawMessage) (json.RawMessage, error) {
 			Title: target.Title, URL: target.URL, Config: target.Config,
 			Status: types.FetchTargetStatusActive,
 		}
-		if message := fetchspec.ValidateMaterialized(candidate); message != "" {
+		if message := acquisitiontool.ValidateMaterialized(candidate); message != "" {
 			return nil, fmt.Errorf("fetch_plan.targets[%d] is not materializable: %s", i, message)
 		}
 		if err := validateApprovedSourceNetworkBoundary(candidate); err != nil {
@@ -673,7 +673,7 @@ func validateApprovedSourceNetworkBoundary(source *types.FetchTarget) error {
 		if approvedSourceIPBlocked(ip) {
 			return errors.New("private or special-use IP addresses are forbidden")
 		}
-	} else if fetchspec.IsIPAddressLike(host) {
+	} else if acquisitiontool.IsIPAddressLike(host) {
 		return errors.New("non-canonical numeric IP addresses are forbidden")
 	}
 	return nil

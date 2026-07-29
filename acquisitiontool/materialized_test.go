@@ -1,4 +1,4 @@
-package fetchspec
+package acquisitiontool
 
 import (
 	"bytes"

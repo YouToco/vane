@@ -15,7 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/fetchspec"
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/promptguard"
@@ -1241,7 +1241,7 @@ func materializeCreationFetchRequirements(
 				"task: approved_fetch_plan.fetch_requirements.items[%d]: %w", i, err,
 			)
 		}
-		source, message := fetchspec.BuildTarget(spec)
+		source, message := acquisitiontool.BuildTarget(spec)
 		if message != "" || source == nil {
 			if message == "" {
 				message = "信源无法构造"
@@ -1258,7 +1258,7 @@ func materializeCreationFetchRequirements(
 		safeTitle = truncateCreationRunes(safeTitle, maxCompiledSourceRunes)
 		if safeTitle != source.Title {
 			spec.Title = safeTitle
-			source, message = fetchspec.BuildTarget(spec)
+			source, message = acquisitiontool.BuildTarget(spec)
 			if message != "" || source == nil {
 				if message == "" {
 					message = "信源安全标题无法构造"
@@ -1284,26 +1284,26 @@ func materializeCreationFetchRequirements(
 
 var creationXHSIDRe = regexp.MustCompile(`^[0-9a-f]{24}$`)
 
-func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement, error) {
+func decodeCreationFetchRequirement(raw json.RawMessage) (acquisitiontool.Requirement, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		return fetchspec.Requirement{}, errors.New("fetch requirement must be a JSON object")
+		return acquisitiontool.Requirement{}, errors.New("fetch requirement must be a JSON object")
 	}
 	var fields map[string]json.RawMessage
 	if err := decodeStrictJSON(raw, &fields); err != nil || fields == nil {
 		if err == nil {
 			err = errors.New("fetch requirement must be a non-null JSON object")
 		}
-		return fetchspec.Requirement{}, err
+		return acquisitiontool.Requirement{}, err
 	}
 	var kind string
 	kindRaw, ok := fields["kind"]
 	if !ok || json.Unmarshal(kindRaw, &kind) != nil || strings.TrimSpace(kind) != kind {
-		return fetchspec.Requirement{}, errors.New("kind must be a non-empty string")
+		return acquisitiontool.Requirement{}, errors.New("kind must be a non-empty string")
 	}
 	switch kind {
 	case "web_search":
 		if isExplicitJSONNull(fields["include_domains"]) {
-			return fetchspec.Requirement{}, errors.New("include_domains must be an array")
+			return acquisitiontool.Requirement{}, errors.New("include_domains must be an array")
 		}
 		var input struct {
 			Kind           string   `json:"kind"`
@@ -1312,7 +1312,7 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement,
 			IncludeDomains []string `json:"include_domains,omitempty"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return fetchspec.Requirement{}, err
+			return acquisitiontool.Requirement{}, err
 		}
 		params := map[string]string{"query": input.Query}
 		if input.Category != "" {
@@ -1321,18 +1321,18 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement,
 		if input.IncludeDomains != nil {
 			encoded, err := json.Marshal(input.IncludeDomains)
 			if err != nil {
-				return fetchspec.Requirement{}, fmt.Errorf("encode include_domains: %w", err)
+				return acquisitiontool.Requirement{}, fmt.Errorf("encode include_domains: %w", err)
 			}
 			params["include_domains"] = string(encoded)
 		}
-		return fetchspec.Requirement{
+		return acquisitiontool.Requirement{
 			Platform: string(types.PlatformWeb), Capability: string(types.CapSearch),
 			Params: params,
 		}, nil
 
 	case "web_feed":
 		if isExplicitJSONNull(fields["categories"]) {
-			return fetchspec.Requirement{}, errors.New("categories must be an array")
+			return acquisitiontool.Requirement{}, errors.New("categories must be an array")
 		}
 		var input struct {
 			Kind       string   `json:"kind"`
@@ -1340,17 +1340,17 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement,
 			Categories []string `json:"categories,omitempty"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return fetchspec.Requirement{}, err
+			return acquisitiontool.Requirement{}, err
 		}
 		params := map[string]string{"url": input.FeedURL}
 		if input.Categories != nil {
 			encoded, err := json.Marshal(input.Categories)
 			if err != nil {
-				return fetchspec.Requirement{}, fmt.Errorf("encode categories: %w", err)
+				return acquisitiontool.Requirement{}, fmt.Errorf("encode categories: %w", err)
 			}
 			params["categories"] = string(encoded)
 		}
-		return fetchspec.Requirement{
+		return acquisitiontool.Requirement{
 			Platform: string(types.PlatformWeb), Capability: string(types.CapFeed),
 			Params: params,
 		}, nil
@@ -1361,9 +1361,9 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement,
 			PageURL string `json:"page_url"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return fetchspec.Requirement{}, err
+			return acquisitiontool.Requirement{}, err
 		}
-		return fetchspec.Requirement{
+		return acquisitiontool.Requirement{
 			Platform: string(types.PlatformWeb), Capability: string(types.CapContents),
 			Params: map[string]string{"url": input.PageURL},
 		}, nil
@@ -1374,9 +1374,9 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement,
 			ScreenName string `json:"screen_name"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return fetchspec.Requirement{}, err
+			return acquisitiontool.Requirement{}, err
 		}
-		return fetchspec.Requirement{
+		return acquisitiontool.Requirement{
 			Platform: string(types.PlatformX), Capability: string(types.CapUserPosts),
 			Params: map[string]string{"screen_name": input.ScreenName},
 		}, nil
@@ -1387,9 +1387,9 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement,
 			Keyword string `json:"keyword"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return fetchspec.Requirement{}, err
+			return acquisitiontool.Requirement{}, err
 		}
-		return fetchspec.Requirement{
+		return acquisitiontool.Requirement{
 			Platform: string(types.PlatformXHS), Capability: string(types.CapSearch),
 			Params: map[string]string{"keyword": input.Keyword},
 		}, nil
@@ -1401,16 +1401,16 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement,
 			ProfileURL string `json:"profile_url,omitempty"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return fetchspec.Requirement{}, err
+			return acquisitiontool.Requirement{}, err
 		}
 		if (strings.TrimSpace(input.UserID) == "") ==
 			(strings.TrimSpace(input.ProfileURL) == "") {
-			return fetchspec.Requirement{}, errors.New(
+			return acquisitiontool.Requirement{}, errors.New(
 				"exactly one of user_id or profile_url is required",
 			)
 		}
 		if input.UserID != "" && !creationXHSIDRe.MatchString(input.UserID) {
-			return fetchspec.Requirement{}, errors.New(
+			return acquisitiontool.Requirement{}, errors.New(
 				"user_id must be exactly 24 lowercase hexadecimal characters",
 			)
 		}
@@ -1418,7 +1418,7 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement,
 		if kind == "xhs_faved_notes" {
 			capability = types.CapFavedNotes
 		}
-		return fetchspec.Requirement{
+		return acquisitiontool.Requirement{
 			Platform: string(types.PlatformXHS), Capability: string(capability),
 			Params: map[string]string{
 				"user_id": input.UserID, "profile_url": input.ProfileURL,
@@ -1430,9 +1430,9 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement,
 			Kind string `json:"kind"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return fetchspec.Requirement{}, err
+			return acquisitiontool.Requirement{}, err
 		}
-		return fetchspec.Requirement{
+		return acquisitiontool.Requirement{
 			Platform: string(types.PlatformXHS), Capability: string(types.CapHotList),
 			Params: map[string]string{},
 		}, nil
@@ -1444,20 +1444,20 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement,
 			TopicURL string `json:"topic_url,omitempty"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return fetchspec.Requirement{}, err
+			return acquisitiontool.Requirement{}, err
 		}
 		if (strings.TrimSpace(input.PageID) == "") ==
 			(strings.TrimSpace(input.TopicURL) == "") {
-			return fetchspec.Requirement{}, errors.New(
+			return acquisitiontool.Requirement{}, errors.New(
 				"exactly one of page_id or topic_url is required",
 			)
 		}
 		if input.PageID != "" && !creationXHSIDRe.MatchString(input.PageID) {
-			return fetchspec.Requirement{}, errors.New(
+			return acquisitiontool.Requirement{}, errors.New(
 				"page_id must be exactly 24 lowercase hexadecimal characters",
 			)
 		}
-		return fetchspec.Requirement{
+		return acquisitiontool.Requirement{
 			Platform: string(types.PlatformXHS), Capability: string(types.CapTopicFeed),
 			Params: map[string]string{
 				"page_id": input.PageID, "topic_url": input.TopicURL,
@@ -1465,7 +1465,7 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement,
 		}, nil
 
 	default:
-		return fetchspec.Requirement{}, fmt.Errorf("unsupported kind %q", kind)
+		return acquisitiontool.Requirement{}, fmt.Errorf("unsupported kind %q", kind)
 	}
 }
 

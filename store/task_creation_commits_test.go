@@ -15,7 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/fetchspec"
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -1853,7 +1853,7 @@ func preparedA5CommitWithSourcesAndStrictness(
 
 func validA5PlanSource(t *testing.T, query, title string) compiledPlanTarget {
 	t.Helper()
-	source, message := fetchspec.BuildTarget(fetchspec.Requirement{
+	source, message := acquisitiontool.BuildTarget(acquisitiontool.Requirement{
 		Platform: "web", Capability: "search", Title: title,
 		Params: map[string]string{"query": query},
 	})

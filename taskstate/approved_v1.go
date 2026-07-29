@@ -8,7 +8,7 @@ import (
 	"slices"
 	"sort"
 
-	"github.com/YouToco/vane/fetchspec"
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/types"
 )
@@ -379,7 +379,7 @@ func validCurrentMaterializedSourceV1(
 	url string,
 	config json.RawMessage,
 ) bool {
-	return fetchspec.ValidateMaterialized(&types.FetchTarget{
+	return acquisitiontool.ValidateMaterialized(&types.FetchTarget{
 		Platform: platform, Capability: capability, Title: title, URL: url, Config: config,
 	}) == ""
 }

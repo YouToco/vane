@@ -1,7 +1,4 @@
-// Package fetchspec 是 api 与 agent 工具共用的抓取目标构造层（M4 契约 §6）：
-// 把用户输入（HTTP 请求体或模型产出的工具参数）校验并构造成待 upsert 的
-// types.FetchTarget。两个入口共用同一份校验/幂等键规则，避免 agent 加源与 API 加源语义漂移。
-package fetchspec
+package acquisitiontool
 
 import (
 	"bytes"
@@ -14,7 +11,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/YouToco/vane/capabilitycatalog"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/types"
 )
@@ -56,7 +52,7 @@ func BuildTarget(spec Requirement) (*types.FetchTarget, string) {
 	// 能力门禁（契约 §2）：组合在注册表里但标记为不可用（如 x/search）时，直接把
 	// capabilitycatalog 的 Reason 回给用户/agent，绝不构造一个注定静默失败的坏源。
 	// 不在表里的组合（如 xhs/feed）不在此拦——交给下面各 build* 的 default 给出更贴切的提示。
-	if entry, ok := capabilitycatalog.Lookup(p, c); ok && !entry.Available() {
+	if entry, ok := Lookup(p, c); ok && !entry.Available() {
 		return nil, entry.Reason
 	}
 

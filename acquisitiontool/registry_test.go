@@ -1,4 +1,4 @@
-package capabilitycatalog
+package acquisitiontool
 
 import (
 	"testing"
