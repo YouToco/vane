@@ -9,6 +9,7 @@
 - 内容身份与去重：[docs/content-identity-contract.md](docs/content-identity-contract.md)（身份是 canonical_key，不是 external_id）
 - M4 agent loop 历史契约：[docs/m4-agent-contract.md](docs/m4-agent-contract.md)（冻结 v1 读协议）
 - 当前任务/Tool 运行契约：[docs/task-manual-tool-runtime.md](docs/task-manual-tool-runtime.md)
+- 任务级 Source 隔离迁移：[docs/task-source-isolation-migration.md](docs/task-source-isolation-migration.md)
 - M5 画像+反馈闭环契约：[docs/m5-profile-contract.md](docs/m5-profile-contract.md)（17 节签名级；第 16 节是 Gate 验证清单）
 - 双轨 Agent Runtime：[docs/agent-runtime-contract.md](docs/agent-runtime-contract.md)（ExecutionMode、运行快照、PlanFetch、预算与发布列车）
 - Phase 2 结构化 Insight：[docs/structured-insight-contract.md](docs/structured-insight-contract.md)（单次 CardGen、引用校验、Brief 冻结、Temporal/rollout 边界）
