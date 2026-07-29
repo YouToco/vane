@@ -976,6 +976,9 @@ func (l *Loop) handleMessage(
 	case taskEditIntentSearch:
 		allowBillableResearch = true
 	}
+	if directTaskCreation {
+		allowedSideEffectTool = "create_schedule"
+	}
 
 	// 外部上下文入口不读取画像：不是“读了但不渲染”，而是从数据访问层就不碰。
 	// direct-task-creation 同样从数据访问层跳过画像，防止模型把用户没有批准的
@@ -1705,13 +1708,36 @@ func (l *Loop) filterConstrainedSideEffectToolDefs(
 	out := make([]llm.ToolDef, 0, len(defs))
 	for _, def := range defs {
 		spec, ok := l.resolveTool(def.Name, state)
-		if !ok || (toolHasObservableSideEffect(spec) &&
-			!constrainedSideEffectAllowed(state, spec)) {
+		if !ok {
+			continue
+		}
+		if state.allowBillableResearch {
+			if !publicResearchToolAllowed(spec) {
+				continue
+			}
+		} else if toolHasObservableSideEffect(spec) &&
+			!constrainedSideEffectAllowed(state, spec) {
 			continue
 		}
 		out = append(out, def)
 	}
 	return out
+}
+
+func publicResearchToolAllowed(spec ToolSpec) bool {
+	effects := spec.Policy.Effects
+	if effects.Has(EffectInternalRead) ||
+		effects.Has(EffectStateWrite) ||
+		effects.Has(EffectDelivery) ||
+		effects.Has(EffectDurableProposal) ||
+		effects.Has(EffectDirectOwnerWrite) ||
+		effects.Has(EffectActivationWrite) {
+		return false
+	}
+	return effects.Has(EffectNetworkRead) ||
+		effects.Has(EffectBillable) ||
+		effects.Has(EffectTrustTaint) ||
+		effects.Has(EffectLocalHandleRead)
 }
 
 func constrainedSideEffectAllowed(
@@ -1728,17 +1754,7 @@ func constrainedSideEffectAllowed(
 	if !state.allowBillableResearch {
 		return false
 	}
-	effects := spec.Policy.Effects
-	if effects.Has(EffectStateWrite) ||
-		effects.Has(EffectDelivery) ||
-		effects.Has(EffectDurableProposal) ||
-		effects.Has(EffectDirectOwnerWrite) ||
-		effects.Has(EffectActivationWrite) {
-		return false
-	}
-	return effects.Has(EffectNetworkRead) ||
-		effects.Has(EffectBillable) ||
-		effects.Has(EffectTrustTaint)
+	return publicResearchToolAllowed(spec)
 }
 
 func appendToolDefs(prefix, suffix []llm.ToolDef) []llm.ToolDef {
@@ -1801,6 +1817,15 @@ func toolHasObservableSideEffect(spec ToolSpec) bool {
 		effects.Has(EffectBillable)
 }
 
+func requiresSemanticTaskAction(toolName string) bool {
+	switch toolName {
+	case "remove_schedule", "run_task_now", "create_schedule":
+		return true
+	default:
+		return false
+	}
+}
+
 func isSafeAfterUntrusted(spec ToolSpec) bool {
 	effects := spec.Policy.Effects
 	if effects.Has(EffectInternalRead) ||
@@ -1855,15 +1880,14 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 	// 写进下一轮消息，与随后返回的恶意网页同屏。
 	state := runStateFrom(ctx)
 	for _, call := range calls {
-		if call.Name != "remove_schedule" ||
-			(state != nil &&
-				state.allowedSideEffectTool == "remove_schedule") {
+		if !requiresSemanticTaskAction(call.Name) || (state != nil &&
+			state.allowedSideEffectTool == call.Name) {
 			continue
 		}
 		for _, rejected := range calls {
 			out = append(out, toolMsg(
 				rejected.ID,
-				"删除任务必须先通过当前用户消息的语义动作裁决；本批未执行。",
+				"任务创建、删除或立即运行必须先通过当前用户消息的语义动作裁决；本批未执行。",
 			))
 		}
 		return out, nil
@@ -1871,7 +1895,20 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 	if state != nil && state.sideEffectConstrainedTurn {
 		for _, call := range calls {
 			spec, ok := l.resolveTool(call.Name, state)
-			if !ok || !toolHasObservableSideEffect(spec) ||
+			if !ok {
+				continue
+			}
+			if state.allowBillableResearch &&
+				!publicResearchToolAllowed(spec) {
+				for _, rejected := range calls {
+					out = append(out, toolMsg(
+						rejected.ID,
+						"一次性公开查询不能读取画像、任务或其他内部状态；本批未执行。",
+					))
+				}
+				return out, nil
+			}
+			if !toolHasObservableSideEffect(spec) ||
 				constrainedSideEffectAllowed(state, spec) {
 				continue
 			}
@@ -2555,11 +2592,16 @@ func isNaturalTaskDefinitionEditCandidate(text string) bool {
 		"以后", "从现在", "频率", "只看", "只推", "不再推",
 	)
 	hasTaskAction := containsAny(normalized,
-		"删除", "删掉", "移除", "取消任务", "停止任务", "关掉任务",
-		"立即运行", "马上运行", "现在运行", "立即推送", "现在推送",
-		"创建任务", "新建任务", "createatask", "createtask",
+		"删除", "删掉", "移除",
+		"立即运行", "马上运行", "现在运行",
+		"立即推送", "现在推送", "马上推送",
+		"立即检查", "现在检查", "马上检查",
+		"创建任务", "新建任务", "新增任务", "生成任务",
+		"createatask", "createtask",
 		"deletetask", "removeschedule", "runnow", "pushnow",
-	)
+	) || (hasTaskTarget && containsAny(normalized,
+		"取消", "停止", "关掉", "停掉",
+	))
 	return hasExplicitEdit || hasTaskContinuation || hasTaskAction
 }
 

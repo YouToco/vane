@@ -48,19 +48,13 @@ func classifyOwnerIntents(text string) ToolIntent {
 	return intents
 }
 
-func explicitOwnerToolIntent(toolName, text string) bool {
-	normalized := strings.ToLower(strings.Join(strings.Fields(text), ""))
+func explicitOwnerToolIntent(toolName, _ string) bool {
 	switch toolName {
-	case "remove_schedule":
-		// Deletion is never authorized lexically. The isolated semantic action
-		// gate must classify the current owner turn as delete_task; toolVisible
-		// then admits only remove_schedule for that turn.
+	case "remove_schedule", "run_task_now", "create_schedule":
+		// Task mutations/delivery are never authorized lexically. The isolated
+		// semantic action gate (or the dedicated direct-creation lane) must name
+		// the exact allowed tool for this turn.
 		return false
-	case "run_task_now":
-		return containsAny(normalized,
-			"立即推送", "现在推送", "马上推送", "立即运行", "现在运行",
-			"马上运行", "立即检查", "现在检查", "pushnow", "runnow",
-		)
 	default:
 		return true
 	}
@@ -77,13 +71,14 @@ func toolVisibleForRequest(spec ToolSpec, state *toolRunState) bool {
 	case ExposureAlways:
 		return true
 	case ExposureIntent:
+		if spec.Policy.DirectOnExplicitIntent &&
+			state.allowedSideEffectTool == spec.Name() {
+			return true
+		}
 		if !spec.Policy.Intents.HasAny(state.intents) {
 			return false
 		}
 		if spec.Policy.DirectOnExplicitIntent {
-			if state.allowedSideEffectTool == spec.Name() {
-				return true
-			}
 			return explicitOwnerToolIntent(spec.Name(), state.ownerRequest)
 		}
 		return true

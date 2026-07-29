@@ -542,6 +542,13 @@ func TestNaturalTaskDefinitionEditCandidate(t *testing.T) {
 		{"不要删掉 AI 日报", true},
 		{"删除任务会有什么后果？", true},
 		{"立即运行“每周更新”任务", true},
+		{"不要马上推送 AI 日报", true},
+		{"不要立即检查 AI 日报", true},
+		{"不要现在检查 AI 日报", true},
+		{"不要新增任务", true},
+		{"取消 AI 日报", true},
+		{"停止 AI 日报", true},
+		{"关掉 AI 日报", true},
 		{"创建任务：每天看官方博客", true},
 	} {
 		if got := isNaturalTaskDefinitionEditCandidate(test.text); got != test.want {
@@ -817,7 +824,7 @@ func TestTaskEditOtherOperationKeepsMatchingCapability(t *testing.T) {
 	}{
 		{
 			name:     "delete task whose name contains update",
-			request:  "删除“AI 更新”任务",
+			request:  "删除 AI 更新",
 			decision: taskEditIntentDelete,
 			tool: newToolSpec(
 				&fakeTool{name: "remove_schedule"},
@@ -1012,6 +1019,167 @@ func TestSemanticDeleteGateExecutesPositiveOnce(t *testing.T) {
 	}
 	if len(remove.calls) != 1 {
 		t.Fatalf("semantic removal calls=%d, want 1", len(remove.calls))
+	}
+}
+
+func TestSemanticTaskActionGateRejectsNegatedRunAndCreate(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		request string
+		tool    *fakeTool
+		policy  ToolPolicy
+	}{
+		{
+			name:    "negated run",
+			request: "不要马上推送 AI 日报",
+			tool:    &fakeTool{name: "run_task_now"},
+			policy: withToolSurface(
+				ownerPolicy(
+					Effects(EffectDelivery),
+					BudgetDownstreamManaged,
+				),
+				ExposureIntent,
+				IntentTasks,
+				ResultTrustLocal,
+				true,
+			),
+		},
+		{
+			name:    "negated create",
+			request: "不要新增任务",
+			tool: &fakeTool{
+				name:       "create_schedule",
+				parameters: json.RawMessage(createScheduleSchema),
+			},
+			policy: ownerPolicy(
+				Effects(
+					EffectDurableProposal,
+					EffectStateWrite,
+					EffectDirectOwnerWrite,
+				),
+				BudgetNone,
+			),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			chat := &scriptedChat{responses: []*llm.ChatResponse{
+				{
+					FinishReason: "tool_calls",
+					ToolCalls: []llm.ToolCall{{
+						ID:        "hallucinated-action",
+						Name:      test.tool.Name(),
+						Arguments: `{}`,
+					}},
+				},
+				{Content: "好的，本轮不执行该操作。"},
+			}}
+			loop := New(Deps{
+				Store:      newFakeStore(),
+				Tools:      []ToolSpec{newToolSpec(test.tool, test.policy)},
+				Model:      "test-model",
+				MaxTurns:   20,
+				SessionTTL: 30 * time.Minute,
+			})
+			loop.chatFn = chat.fn
+			loop.taskEditIntentFn = func(
+				context.Context,
+				[]llm.ChatMessage,
+			) (taskEditIntentDecision, error) {
+				return taskEditIntentAnswerOnly, nil
+			}
+			if _, err := loop.HandleMessage(
+				t.Context(), 7, test.request,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if len(test.tool.calls) != 0 {
+				t.Fatalf("%s executed %d times",
+					test.tool.Name(), len(test.tool.calls))
+			}
+			for _, request := range chat.requests {
+				for _, name := range toolDefNames(request.Tools) {
+					if name == test.tool.Name() {
+						t.Fatalf("answer-only exposed %s", name)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestOneOffSearchExcludesInternalReadsAtBothBoundaries(t *testing.T) {
+	list := &fakeTool{
+		name:       "list_schedules",
+		parameters: json.RawMessage(listSchedulesSchema),
+	}
+	profile := &fakeTool{name: "view_profile"}
+	web := &fakeTool{name: "web_search", untrusted: true}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			FinishReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID: "hallucinated-internal", Name: "list_schedules",
+				Arguments: `{}`,
+			}},
+		},
+		{Content: "没有读取任何内部状态。"},
+	}}
+	loop := New(Deps{
+		Store: newFakeStore(),
+		Tools: []ToolSpec{
+			newToolSpec(list, withToolSurface(
+				a2aReadPolicy(Effects(EffectInternalRead)),
+				ExposureIntent, IntentTasks, ResultTrustLocal, false,
+			)),
+			newToolSpec(profile, withToolSurface(
+				ownerPolicy(Effects(EffectInternalRead), BudgetNone),
+				ExposureIntent, IntentProfile, ResultTrustLocal, false,
+			)),
+			newToolSpec(web, withToolSurface(
+				ownerPolicy(
+					Effects(
+						EffectNetworkRead,
+						EffectBillable,
+						EffectTrustTaint,
+					),
+					BudgetToolManaged,
+				),
+				ExposureIntent,
+				IntentWebResearch,
+				ResultTrustExternal,
+				false,
+			)),
+		},
+		Model:      "test-model",
+		MaxTurns:   20,
+		SessionTTL: 30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+	loop.taskEditIntentFn = func(
+		context.Context,
+		[]llm.ChatMessage,
+	) (taskEditIntentDecision, error) {
+		return taskEditIntentSearch, nil
+	}
+
+	if _, err := loop.HandleMessage(
+		t.Context(),
+		7,
+		"更新一下我的 AI 任务和岗位相关的最新消息",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.calls) != 0 || len(profile.calls) != 0 {
+		t.Fatalf("internal calls list=%d profile=%d, want zero",
+			len(list.calls), len(profile.calls))
+	}
+	for _, request := range chat.requests {
+		names := toolDefNames(request.Tools)
+		for _, name := range names {
+			if name == "list_schedules" || name == "view_profile" {
+				t.Fatalf("search tools=%v include internal read", names)
+			}
+		}
 	}
 }
 
