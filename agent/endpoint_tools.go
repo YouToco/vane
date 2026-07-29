@@ -186,7 +186,10 @@ type toolRunState struct {
 	// webResearchSucceeded generalizes the former one-off product branch:
 	// every successful web search/page read must finish with citations that
 	// occur in these structured results.
-	webResearchSucceeded bool
+	webResearchSucceeded        bool
+	webSearchSucceeded          bool
+	webPageReadSucceeded        bool
+	webPageReadResponseRejected bool
 	// allowedLocalResultHandles 只登记本条消息的动态端点刚生成的截断句柄。
 	// 句柄 res-N 可猜且缓存按 user 共享；仅用 bool 会让恶意端点枚举同用户
 	// 其他会话的旧结果。taint 后 read_endpoint_result 必须命中这个集合。
