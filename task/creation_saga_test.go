@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -912,6 +913,11 @@ func TestCreationCoordinator_ToolCallsAreStrictAtomicAndUnambiguous(t *testing.T
 			want:  "unknown exact field",
 		},
 		{
+			name:  "legacy kind cannot override Tool name",
+			calls: `[{"name":"web_search","arguments":{"kind":"web_contents","query":"AI"}}]`,
+			want:  "arguments.kind is forbidden",
+		},
+		{
 			name:  "null include domains",
 			calls: `[{"name":"web_search","arguments":{"query":"AI","include_domains":null}}]`,
 			want:  "include_domains must be an array",
@@ -1195,6 +1201,43 @@ func TestMaterializeCreationFetchRequirements_ValidatesXHSTopicPageID(t *testing
 			_, err := materialize("page_id", value)
 			if err == nil || !strings.Contains(err.Error(), "24 lowercase hexadecimal") {
 				t.Fatalf("invalid direct page_id must be rejected: value=%q err=%v", value, err)
+			}
+		})
+	}
+}
+
+func TestMaterializeCreationToolCalls_CoversRegisteredBloggerTools(t *testing.T) {
+	tests := []struct {
+		name       string
+		arguments  string
+		platform   types.Platform
+		capability types.Capability
+	}{
+		{
+			name: "weibo_user_posts", arguments: `{"uid":"2803301701"}`,
+			platform: types.PlatformWeibo, capability: types.CapUserPosts,
+		},
+		{
+			name: "weibo_hot_list", arguments: `{}`,
+			platform: types.PlatformWeibo, capability: types.CapHotList,
+		},
+		{
+			name: "wechat_mp_user_posts", arguments: `{"username":"gh_363b924965e9"}`,
+			platform: types.PlatformWechatMP, capability: types.CapUserPosts,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := json.RawMessage(
+				`{"name":` + strconv.Quote(tc.name) + `,"arguments":` + tc.arguments + `}`,
+			)
+			got, err := materializeCreationToolCalls([]json.RawMessage{raw})
+			if err != nil || len(got) != 1 {
+				t.Fatalf("materialize %s: got=%+v err=%v", tc.name, got, err)
+			}
+			if got[0].Platform != string(tc.platform) ||
+				got[0].Capability != string(tc.capability) {
+				t.Fatalf("materialize %s routed to %+v", tc.name, got[0])
 			}
 		})
 	}

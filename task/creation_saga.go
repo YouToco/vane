@@ -1266,6 +1266,11 @@ func decodeCreationToolCall(raw json.RawMessage) (acquisitiontool.Requirement, e
 		}
 		return acquisitiontool.Requirement{}, err
 	}
+	if _, exists := fields["kind"]; exists {
+		return acquisitiontool.Requirement{}, errors.New(
+			"arguments.kind is forbidden; use the enclosing Tool name",
+		)
+	}
 	kind, err := json.Marshal(call.Name)
 	if err != nil {
 		return acquisitiontool.Requirement{}, err
@@ -1458,6 +1463,53 @@ func decodeCreationFetchRequirement(raw json.RawMessage) (acquisitiontool.Requir
 			Params: map[string]string{
 				"page_id": input.PageID, "topic_url": input.TopicURL,
 			},
+		}, nil
+
+	case "weibo_user_posts":
+		var input struct {
+			Kind       string `json:"kind"`
+			UID        string `json:"uid,omitempty"`
+			ProfileURL string `json:"profile_url,omitempty"`
+		}
+		if err := strictjson.DecodeExact(raw, &input); err != nil {
+			return acquisitiontool.Requirement{}, err
+		}
+		if (strings.TrimSpace(input.UID) == "") ==
+			(strings.TrimSpace(input.ProfileURL) == "") {
+			return acquisitiontool.Requirement{}, errors.New(
+				"exactly one of uid or profile_url is required",
+			)
+		}
+		return acquisitiontool.Requirement{
+			Platform: string(types.PlatformWeibo), Capability: string(types.CapUserPosts),
+			Params: map[string]string{
+				"uid": input.UID, "profile_url": input.ProfileURL,
+			},
+		}, nil
+
+	case "weibo_hot_list":
+		var input struct {
+			Kind string `json:"kind"`
+		}
+		if err := strictjson.DecodeExact(raw, &input); err != nil {
+			return acquisitiontool.Requirement{}, err
+		}
+		return acquisitiontool.Requirement{
+			Platform: string(types.PlatformWeibo), Capability: string(types.CapHotList),
+			Params: map[string]string{},
+		}, nil
+
+	case "wechat_mp_user_posts":
+		var input struct {
+			Kind     string `json:"kind"`
+			Username string `json:"username"`
+		}
+		if err := strictjson.DecodeExact(raw, &input); err != nil {
+			return acquisitiontool.Requirement{}, err
+		}
+		return acquisitiontool.Requirement{
+			Platform: string(types.PlatformWechatMP), Capability: string(types.CapUserPosts),
+			Params: map[string]string{"username": input.Username},
 		}, nil
 
 	default:

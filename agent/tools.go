@@ -339,7 +339,7 @@ const createScheduleSchema = `{
         "properties": {
           "name": {
             "type": "string",
-            "enum": ["web_search", "web_feed", "web_contents", "x_user_posts", "xhs_search", "xhs_user_posts", "xhs_hot_list", "xhs_topic_feed", "xhs_faved_notes"],
+            "enum": ["web_search", "web_feed", "web_contents", "x_user_posts", "xhs_search", "xhs_user_posts", "xhs_hot_list", "xhs_topic_feed", "xhs_faved_notes", "weibo_user_posts", "weibo_hot_list", "wechat_mp_user_posts"],
             "description": "要调用的取材 Tool"
           },
           "arguments": {
@@ -354,10 +354,12 @@ const createScheduleSchema = `{
             "page_url": {"type": "string", "description": "仅 web_contents 必填：要监控的普通 http/https 页面地址"},
             "screen_name": {"type": "string", "description": "仅 x_user_posts 必填：X 用户名"},
             "keyword": {"type": "string", "description": "仅 xhs_search 必填：小红书搜索词"},
+            "uid": {"type": "string", "pattern": "^[0-9]+$", "description": "仅 weibo_user_posts：微博用户数字 ID"},
             "user_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "description": "仅 xhs_user_posts/xhs_faved_notes：24 位小写十六进制用户 ID"},
-            "profile_url": {"type": "string", "description": "仅 xhs_user_posts/xhs_faved_notes：小红书用户主页"},
+            "profile_url": {"type": "string", "description": "仅 xhs_user_posts/xhs_faved_notes/weibo_user_posts：对应平台用户主页"},
             "page_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "description": "仅 xhs_topic_feed"},
-            "topic_url": {"type": "string", "description": "仅 xhs_topic_feed"}
+            "topic_url": {"type": "string", "description": "仅 xhs_topic_feed"},
+            "username": {"type": "string", "pattern": "^gh_.+$", "description": "仅 wechat_mp_user_posts：公众号 gh_ 原始 ID"}
           },
           "additionalProperties": false
           }
