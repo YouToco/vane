@@ -182,6 +182,12 @@ func (c *Coordinator) runTask(ctx context.Context, taskID string) error {
 	if err != nil {
 		return err
 	}
+	// The durable intent is authoritative across Temporal retention, resets,
+	// and process restarts. Once a run identity is sealed, this period was
+	// already started and must never call ExecuteWorkflow again.
+	if !periodicBriefIntentNeedsStart(intent) {
+		return nil
+	}
 	run, err := c.temporal.ExecuteWorkflow(
 		ctx,
 		client.StartWorkflowOptions{
@@ -231,6 +237,10 @@ func (c *Coordinator) runTask(ctx context.Context, taskID string) error {
 	}
 	return c.store.BindPeriodicBriefIntentRunV1(
 		ctx, intent.TenantID, intent.UserID, intent.ID, run.GetRunID())
+}
+
+func periodicBriefIntentNeedsStart(intent store.PeriodicBriefIntentV1) bool {
+	return intent.TemporalRunID == ""
 }
 
 // existingPeriodicBriefRunBinding returns whether an already-started workflow
