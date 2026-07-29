@@ -719,78 +719,58 @@ func TestScheduleSchemas_含anchor_at(t *testing.T) {
 	}
 }
 
-func TestCreateScheduleSchema_RequiresApprovedIntentAndFetchPlan(t *testing.T) {
+func TestCreateScheduleSchema_RequiresIntentAndToolCalls(t *testing.T) {
 	var schema struct {
 		Required   []string `json:"required"`
 		Properties struct {
-			ApprovedFetchPlan struct {
-				Required   []string `json:"required"`
-				Properties struct {
-					ExistingSourceIDs json.RawMessage `json:"existing_source_ids"`
-					FetchRequirements struct {
-						Required   []string `json:"required"`
-						Properties struct {
-							Version struct {
-								Enum []string `json:"enum"`
-							} `json:"version"`
-							Items struct {
-								MinItems int `json:"minItems"`
-								MaxItems int `json:"maxItems"`
-								Items    struct {
-									Required   []string       `json:"required"`
-									Properties map[string]any `json:"properties"`
-								} `json:"items"`
-							} `json:"items"`
-						} `json:"properties"`
-					} `json:"fetch_requirements"`
-					LegacySources json.RawMessage `json:"sources"`
-				} `json:"properties"`
-			} `json:"approved_fetch_plan"`
+			ToolCalls struct {
+				MinItems int `json:"minItems"`
+				MaxItems int `json:"maxItems"`
+				Items    struct {
+					Required   []string `json:"required"`
+					Properties struct {
+						Name struct {
+							Enum []string `json:"enum"`
+						} `json:"name"`
+						Arguments struct {
+							Properties map[string]any `json:"properties"`
+						} `json:"arguments"`
+					} `json:"properties"`
+				} `json:"items"`
+			} `json:"tool_calls"`
 		} `json:"properties"`
 	}
 	if err := json.Unmarshal((&createScheduleTool{}).Parameters(), &schema); err != nil {
 		t.Fatalf("create_schedule schema 不是合法 JSON: %v", err)
 	}
-	for _, required := range []string{"spec", "intent", "approved_fetch_plan"} {
+	for _, required := range []string{"spec", "intent", "tool_calls"} {
 		if !slices.Contains(schema.Required, required) {
 			t.Fatalf("create_schedule 缺少根必填字段 %q：%v", required, schema.Required)
 		}
 	}
-	plan := schema.Properties.ApprovedFetchPlan
-	if !slices.Equal(plan.Required, []string{"fetch_requirements"}) {
-		t.Fatalf("approved_fetch_plan 必须且只能要求 fetch_requirements：%+v", plan.Required)
+	calls := schema.Properties.ToolCalls
+	if calls.MinItems != 1 || calls.MaxItems != 64 {
+		t.Fatalf("tool_calls 边界不完整：%+v", calls)
 	}
-	if len(plan.Properties.ExistingSourceIDs) != 0 {
-		t.Fatalf("existing_source_ids 不得继续暴露给模型：%s", plan.Properties.ExistingSourceIDs)
-	}
-	if len(plan.Properties.LegacySources) != 0 {
-		t.Fatalf("durable sources/config 不得继续暴露给模型：%s", plan.Properties.LegacySources)
-	}
-	specs := plan.Properties.FetchRequirements
-	if !slices.Contains(specs.Required, "version") || !slices.Contains(specs.Required, "items") ||
-		!slices.Equal(specs.Properties.Version.Enum, []string{"vane.fetch-requirements/v1"}) ||
-		specs.Properties.Items.MinItems != 1 || specs.Properties.Items.MaxItems != 64 {
-		t.Fatalf("fetch_requirements 版本或边界不完整：%+v", specs)
-	}
-	for _, required := range []string{"kind"} {
-		if !slices.Contains(specs.Properties.Items.Items.Required, required) {
-			t.Fatalf("fetch_requirements item 缺少必填字段 %q：%v",
-				required, specs.Properties.Items.Items.Required)
+	for _, required := range []string{"name", "arguments"} {
+		if !slices.Contains(calls.Items.Required, required) {
+			t.Fatalf("tool_calls item 缺少必填字段 %q：%v",
+				required, calls.Items.Required)
 		}
 	}
 	for _, forbidden := range []string{"config", "selectors", "url", "title"} {
-		if _, exposed := specs.Properties.Items.Items.Properties[forbidden]; exposed {
-			t.Fatalf("fetch_requirements 不得暴露内部或可伪造字段 %q", forbidden)
+		if _, exposed := calls.Items.Properties.Arguments.Properties[forbidden]; exposed {
+			t.Fatalf("tool_calls 不得暴露内部或可伪造字段 %q", forbidden)
 		}
 	}
 	for _, required := range []string{
-		"kind", "query", "include_domains", "feed_url", "page_url", "user_id",
+		"query", "include_domains", "feed_url", "page_url", "user_id",
 	} {
-		if _, ok := specs.Properties.Items.Items.Properties[required]; !ok {
-			t.Fatalf("fetch_requirements 缺少模型可理解字段 %q", required)
+		if _, ok := calls.Items.Properties.Arguments.Properties[required]; !ok {
+			t.Fatalf("tool_calls 缺少模型可理解字段 %q", required)
 		}
 	}
-	userID, ok := specs.Properties.Items.Items.Properties["user_id"].(map[string]any)
+	userID, ok := calls.Items.Properties.Arguments.Properties["user_id"].(map[string]any)
 	if !ok || userID["pattern"] != "^[0-9a-f]{24}$" ||
 		!strings.Contains(fmt.Sprint(userID["description"]), "24 位小写十六进制") {
 		t.Fatalf("xhs user_id schema 必须逐字暴露服务端格式约束：%+v", userID)

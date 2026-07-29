@@ -329,61 +329,42 @@ const createScheduleSchema = `{
       }
     },
     "intent": {"type": "string", "minLength": 1, "description": "用户已经明确表达的持续监控目标与筛选范围。必须完整、自包含；它会成为任务手册，冻结后不得由系统自行扩大主题或范围。"},
-    "approved_fetch_plan": {
-      "type": "object",
-      "description": "根据任务手册形成的完整长期抓取计划。只接受 fetch_requirements 中的人类可读要求，必须为 1-64 个；系统负责确定性物化并冻结内部执行目标，模型绝不能引用账号级对象或编写 config、selectors、vane:// URL、内部 id。",
-      "properties": {
-        "fetch_requirements": {
-          "type": "object",
-          "description": "任务手册中的长期抓取要求。只能使用下面的 kind 与对应的人类可读参数；内部 URL、配置和展示标题由系统生成。",
-          "properties": {
-            "version": {
-              "type": "string",
-              "enum": ["vane.fetch-requirements/v1"],
-              "description": "固定协议版本，必须逐字填写 vane.fetch-requirements/v1"
-            },
-            "items": {
-              "type": "array",
-              "minItems": 1,
-              "maxItems": 64,
-              "description": "信源规格。kind 与参数必须匹配，不能夹带其他 kind 的字段。常用精确模板：网页搜索={\"kind\":\"web_search\",\"query\":\"主题\",\"include_domains\":[\"openai.com\"]}；普通页面={\"kind\":\"web_contents\",\"page_url\":\"https://...\"}；已知 RSS={\"kind\":\"web_feed\",\"feed_url\":\"https://...xml\"}。",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "kind": {
-                    "type": "string",
-                    "enum": ["web_search", "web_feed", "web_contents", "x_user_posts", "xhs_search", "xhs_user_posts", "xhs_hot_list", "xhs_topic_feed", "xhs_faved_notes"],
-                    "description": "web_search=网页搜索；web_feed=已知 RSS/Atom 地址；web_contents=监控已知页面；x_user_posts=X 账号；其余为对应小红书能力"
-                  },
-                  "query": {"type": "string", "description": "仅 web_search 必填：搜索词"},
-                  "category": {"type": "string", "description": "仅 web_search 可选：公开网页搜索类别，如 news"},
-                  "include_domains": {
-                    "type": "array",
-                    "uniqueItems": true,
-                    "items": {"type": "string"},
-                    "description": "仅 web_search 可选：裸域名白名单，如 [\"openai.com\",\"anthropic.com\"]；不能含协议、路径、端口、通配符或 IP。用户只点名机构并要求官方来源时，可基于该机构填写对应官方根域名；系统会冻结精确域名，绝不能加入用户未点名的机构、媒体或社区。"
-                  },
-                  "feed_url": {"type": "string", "description": "仅 web_feed 必填：已知 RSS/Atom 的 http/https 地址；不要把普通网页猜成 feed"},
-                  "categories": {"type": "array", "items": {"type": "string"}, "description": "仅 web_feed 可选：RSS 分类过滤"},
-                  "page_url": {"type": "string", "description": "仅 web_contents 必填：要监控的普通 http/https 页面地址"},
-                  "screen_name": {"type": "string", "description": "仅 x_user_posts 必填：X 用户名"},
-                  "keyword": {"type": "string", "description": "仅 xhs_search 必填：小红书搜索词"},
-	                  "user_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "description": "仅 xhs_user_posts/xhs_faved_notes：24 位小写十六进制用户 ID，与 profile_url 二选一"},
-	                  "profile_url": {"type": "string", "description": "仅 xhs_user_posts/xhs_faved_notes：小红书用户主页 https://www.xiaohongshu.com/user/profile/<24位小写十六进制ID>，与 user_id 二选一"},
-	                  "page_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "description": "仅 xhs_topic_feed：24 位小写十六进制话题 ID，与 topic_url 二选一"},
-                  "topic_url": {"type": "string", "description": "仅 xhs_topic_feed：与 page_id 二选一"}
-                },
-                "required": ["kind"],
-                "additionalProperties": false
-              }
-            }
+    "tool_calls": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "description": "根据任务手册选择的长期取材 Tool 调用。每项直接填写 Tool 名称和参数；不要构造信源、计划、内部 URL 或内部 id。",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["web_search", "web_feed", "web_contents", "x_user_posts", "xhs_search", "xhs_user_posts", "xhs_hot_list", "xhs_topic_feed", "xhs_faved_notes"],
+            "description": "要调用的取材 Tool"
           },
-          "required": ["version", "items"],
+          "arguments": {
+          "type": "object",
+          "description": "对应 Tool 的人类可读参数；只填写该 Tool 使用的字段",
+          "properties": {
+            "query": {"type": "string", "description": "仅 web_search 必填：搜索词"},
+            "category": {"type": "string", "description": "仅 web_search 可选：公开网页搜索类别，如 news"},
+            "include_domains": {"type": "array","uniqueItems":true,"items":{"type":"string"},"description":"仅 web_search 可选：裸域名白名单"},
+            "feed_url": {"type": "string", "description": "仅 web_feed 必填：已知 RSS/Atom 的 http/https 地址"},
+            "categories": {"type": "array", "items": {"type": "string"}, "description": "仅 web_feed 可选：RSS 分类过滤"},
+            "page_url": {"type": "string", "description": "仅 web_contents 必填：要监控的普通 http/https 页面地址"},
+            "screen_name": {"type": "string", "description": "仅 x_user_posts 必填：X 用户名"},
+            "keyword": {"type": "string", "description": "仅 xhs_search 必填：小红书搜索词"},
+            "user_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "description": "仅 xhs_user_posts/xhs_faved_notes：24 位小写十六进制用户 ID"},
+            "profile_url": {"type": "string", "description": "仅 xhs_user_posts/xhs_faved_notes：小红书用户主页"},
+            "page_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "description": "仅 xhs_topic_feed"},
+            "topic_url": {"type": "string", "description": "仅 xhs_topic_feed"}
+          },
           "additionalProperties": false
-        }
-      },
-      "required": ["fetch_requirements"],
-      "additionalProperties": false
+          }
+        },
+        "required": ["name", "arguments"],
+        "additionalProperties": false
+      }
     },
     "observation_policy": {
       "type": "object",
@@ -431,7 +412,7 @@ const createScheduleSchema = `{
     "nl_description": {"type": "string", "description": "可选：该任务的自然语言描述（如\"每天早上 8 点推送\"），用于列表展示"},
     "strictness": {"type": "string", "enum": ["loose", "normal", "strict"], "description": "可选：推送门槛档位，从用户对相关度的要求推断——「只要非常相关的/重大更新才推」→ strict（仅 ≥60 分高相关才推）；「一般相关就行」→ normal（≥40 分）；「都推来看看/宽松点」→ loose（只过滤与画像无关的内容）。用户没表态就不传（按系统兜底，等价 loose）"}
   },
-  "required": ["spec", "intent", "approved_fetch_plan"],
+  "required": ["spec", "intent", "tool_calls"],
   "additionalProperties": false
 }`
 
@@ -444,7 +425,7 @@ type createScheduleArgs struct {
 		TZ           string `json:"tz"`
 	} `json:"spec"`
 	Intent            string                    `json:"intent"`
-	ApprovedFetchPlan json.RawMessage           `json:"approved_fetch_plan"`
+	ToolCalls         []json.RawMessage         `json:"tool_calls"`
 	ObservationPolicy *observation.PolicySpecV1 `json:"observation_policy"`
 	NLDescription     string                    `json:"nl_description"`
 	Strictness        string                    `json:"strictness"`
@@ -454,7 +435,7 @@ type createScheduleTool struct{}
 
 func (t *createScheduleTool) Name() string { return "create_schedule" }
 func (t *createScheduleTool) Description() string {
-	return "直接创建定时情报任务。必须同时提交用户明确表达的任务手册与完整长期抓取要求；抓取要求只能用版本化 fetch_requirements 的人类可读参数表达。系统会确定性生成并冻结内部执行目标，再立即推进可恢复的创建流程；模型不得引用账号级对象或编写 config、selectors、vane:// URL、内部 id。触发频率用 cron 或 every_seconds 二选一，频率不得高于每小时一次。"
+	return "直接创建定时情报任务。提交任务手册，并从可用取材 Tool 中选择调用；系统冻结 Tool 调用后立即推进可恢复的创建流程。不要构造信源、抓取计划、内部 URL 或内部 id。触发频率用 cron 或 every_seconds 二选一，频率不得高于每小时一次。"
 }
 func (t *createScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(createScheduleSchema)

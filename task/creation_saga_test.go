@@ -17,6 +17,40 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+// Retained test adapter: older fixtures describe the same acquisition calls
+// as flat requirement objects. Production accepts only {name,arguments}.
+const creationFetchRequirementsVersion = "vane.fetch-requirements/v1"
+
+type createScheduleFetchRequirements struct {
+	Version string
+	Items   []json.RawMessage
+}
+
+func materializeCreationFetchRequirements(
+	requirements *createScheduleFetchRequirements,
+) ([]compiledFetchTarget, error) {
+	if requirements == nil || requirements.Version != creationFetchRequirementsVersion {
+		return nil, errors.New("invalid test acquisition requirements")
+	}
+	calls := make([]json.RawMessage, 0, len(requirements.Items))
+	for _, item := range requirements.Items {
+		var fields map[string]any
+		if err := json.Unmarshal(item, &fields); err != nil {
+			return nil, err
+		}
+		name, _ := fields["kind"].(string)
+		delete(fields, "kind")
+		call, err := json.Marshal(map[string]any{
+			"name": name, "arguments": fields,
+		})
+		if err != nil {
+			return nil, err
+		}
+		calls = append(calls, call)
+	}
+	return materializeCreationToolCalls(calls)
+}
+
 var testCreationReceiptTarget = CreationReceiptTarget{
 	Provider: AgentAutoReceiptProvider,
 	Target:   "agent-session-test",
@@ -542,7 +576,7 @@ func TestCreationCoordinator_ProposalCanonicalizesBeforePersistence(t *testing.T
 		}
 	}
 	command, _, err := normalizeCreateScheduleCommand(store.op.Args)
-	if err != nil || !bytes.Equal(command.ApprovedFetchPlan, json.RawMessage(
+	if err != nil || !bytes.Equal(command.LegacyToolPlanV1, json.RawMessage(
 		`{"targets":[{"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"}}]}`,
 	)) {
 		t.Fatalf("durable canonical args invalid: command=%+v err=%v", command, err)
@@ -589,11 +623,11 @@ func TestCreationCoordinator_ProposalMaterializesVersionedFetchRequirementsBefor
 		t.Fatalf("normalize durable args: %v", err)
 	}
 	var frozen compiledFetchPlan
-	if err := decodeStrictJSON(command.ApprovedFetchPlan, &frozen); err != nil {
+	if err := decodeStrictJSON(command.LegacyToolPlanV1, &frozen); err != nil {
 		t.Fatalf("decode frozen plan: %v", err)
 	}
 	if len(frozen.Targets) != 2 {
-		t.Fatalf("frozen targets=%d want=2: %s", len(frozen.Targets), command.ApprovedFetchPlan)
+		t.Fatalf("frozen targets=%d want=2: %s", len(frozen.Targets), command.LegacyToolPlanV1)
 	}
 	search := frozen.Targets[0]
 	if search.URL != "vane://web/search?q=major+AI+model+API+pricing+deprecation+security+updates&include_domains=anthropic.com%2Cdeepmind.google%2Copenai.com" ||
@@ -620,7 +654,7 @@ func TestCreationCoordinator_ProposalMaterializesVersionedFetchRequirementsBefor
 
 	// Confirm and every recovery pass consume only the already frozen durable
 	// plan. They must not decode fetch_requirements or reinterpret the user's request.
-	frozenPlan := bytes.Clone(command.ApprovedFetchPlan)
+	frozenPlan := bytes.Clone(command.LegacyToolPlanV1)
 	result, err := coordinator.Execute(
 		t.Context(), 11, "action-fetch-requirements", testCreationReceiptTarget,
 	)
@@ -661,15 +695,13 @@ func TestCreationCoordinator_ProposalPreservesObservationPolicyAcrossCanonicalRe
 		"intent":         "仅监控 OpenAI 官方确认的重大 API 更新；没有重要更新就不发送",
 		"nl_description": "每周一上午 9 点检查 OpenAI API 重大更新",
 		"strictness":     "strict",
-		"approved_fetch_plan": map[string]any{
-			"fetch_requirements": map[string]any{
-				"version": creationFetchRequirementsVersion,
-				"items": []any{map[string]any{
-					"kind": "web_search", "query": "OpenAI API major updates",
-					"include_domains": []string{"openai.com"},
-				}},
+		"tool_calls": []any{map[string]any{
+			"name": "web_search",
+			"arguments": map[string]any{
+				"query":           "OpenAI API major updates",
+				"include_domains": []string{"openai.com"},
 			},
-		},
+		}},
 		"observation_policy": policy,
 	})
 
@@ -843,118 +875,88 @@ func TestSummarizeCreationObservationPolicy_RollingDurationIsExact(t *testing.T)
 	}
 }
 
-func TestCreationCoordinator_FetchRequirementsAreStrictAtomicAndUnambiguous(t *testing.T) {
-	valid := `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","include_domains":["openai.com"]}]}}`
+func TestCreationCoordinator_ToolCallsAreStrictAtomicAndUnambiguous(t *testing.T) {
 	cases := []struct {
-		name string
-		plan string
-		want string
+		name  string
+		calls string
+		want  string
 	}{
 		{
-			name: "wrong version",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v2","items":[{"kind":"web_search","query":"AI"}]}}`,
-			want: "version",
+			name:  "null arguments",
+			calls: `[{"name":"web_search","arguments":null}]`,
+			want:  "arguments",
 		},
 		{
-			name: "case folded version key",
-			plan: `{"fetch_requirements":{"VERSION":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
-			want: "unknown exact field",
+			name:  "unknown call field",
+			calls: `[{"name":"web_search","arguments":{"query":"AI"},"config":{}}]`,
+			want:  "unknown exact field",
 		},
 		{
-			name: "case folded fetch requirements key",
-			plan: `{"Source_Specs":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
-			want: "unknown exact field",
+			name:  "duplicate argument key",
+			calls: `[{"name":"web_search","arguments":{"query":"AI","query":"crypto"}}]`,
+			want:  "duplicate",
 		},
 		{
-			name: "retired materialized sources field",
-			plan: strings.TrimSuffix(valid, "}") + `,"sources":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=A","config":{"query":"A"}}]}`,
-			want: "unknown exact field",
+			name:  "escaped tool name key",
+			calls: `[{"\u006eame":"web_search","arguments":{"query":"AI"}}]`,
+			want:  "canonical",
 		},
 		{
-			name: "retired null materialized sources field",
-			plan: `{"sources":null,"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
-			want: "unknown exact field",
+			name:  "case alias name cannot collapse",
+			calls: `[{"name":"web_search","NAME":"web_contents","arguments":{"query":"AI"}}]`,
+			want:  "unknown exact field",
 		},
 		{
-			name: "null fetch requirements is not omission",
-			plan: `{"fetch_requirements":null,"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=AI","config":{"query":"AI"}}]}`,
-			want: "unknown exact field",
+			name:  "irrelevant argument",
+			calls: `[{"name":"web_contents","arguments":{"page_url":"https://openai.com/news","query":"AI"}}]`,
+			want:  "unknown exact field",
 		},
 		{
-			name: "null existing ids is not omission",
-			plan: `{"existing_source_ids":null,"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
-			want: "existing_source_ids",
+			name:  "null include domains",
+			calls: `[{"name":"web_search","arguments":{"query":"AI","include_domains":null}}]`,
+			want:  "include_domains must be an array",
 		},
 		{
-			name: "unknown field",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","config":{}}]}}`,
-			want: "unknown exact field",
+			name:  "null feed categories",
+			calls: `[{"name":"web_feed","arguments":{"feed_url":"https://openai.com/news/rss.xml","categories":null}}]`,
+			want:  "categories must be an array",
 		},
 		{
-			name: "duplicate inner key",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","query":"crypto"}]}}`,
-			want: "duplicate",
+			name:  "ambiguous identity alternatives",
+			calls: `[{"name":"xhs_user_posts","arguments":{"user_id":"6a5578b3000000000e03cc00","profile_url":"https://www.xiaohongshu.com/user/profile/6a5578b3000000000e03cc00"}}]`,
+			want:  "exactly one",
 		},
 		{
-			name: "escaped discriminator key",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"\u006bind":"web_search","query":"AI"}]}}`,
-			want: "canonical",
+			name:  "invalid xhs user id before any lookup",
+			calls: `[{"name":"xhs_faved_notes","arguments":{"user_id":"abc"}}]`,
+			want:  "24 lowercase hexadecimal",
 		},
 		{
-			name: "case alias discriminator cannot collapse",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","KIND":"web_contents","query":"AI"}]}}`,
-			want: "unknown exact field",
+			name:  "invalid include domain",
+			calls: `[{"name":"web_search","arguments":{"query":"AI","include_domains":["https://openai.com/news"]}}]`,
+			want:  "include_domains",
 		},
 		{
-			name: "irrelevant field",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_contents","page_url":"https://openai.com/news","query":"AI"}]}}`,
-			want: "unknown exact field",
+			name:  "one bad item rejects whole batch",
+			calls: `[{"name":"web_search","arguments":{"query":"AI"}},{"name":"web_contents","arguments":{"page_url":"http://127.0.0.1/private"}}]`,
+			want:  "network policy",
 		},
 		{
-			name: "null include domains",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","include_domains":null}]}}`,
-			want: "include_domains must be an array",
-		},
-		{
-			name: "null feed categories",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_feed","feed_url":"https://openai.com/news/rss.xml","categories":null}]}}`,
-			want: "categories must be an array",
-		},
-		{
-			name: "ambiguous identity alternatives",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"xhs_user_posts","user_id":"6a5578b3000000000e03cc00","profile_url":"https://www.xiaohongshu.com/user/profile/6a5578b3000000000e03cc00"}]}}`,
-			want: "exactly one",
-		},
-		{
-			name: "invalid xhs user id before any lookup",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"xhs_faved_notes","user_id":"abc"}]}}`,
-			want: "24 lowercase hexadecimal",
-		},
-		{
-			name: "invalid include domain",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","include_domains":["https://openai.com/news"]}]}}`,
-			want: "include_domains",
-		},
-		{
-			name: "one bad item rejects whole batch",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"},{"kind":"web_contents","page_url":"http://127.0.0.1/private"}]}}`,
-			want: "network policy",
-		},
-		{
-			name: "canonical duplicate",
-			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","include_domains":["OpenAI.com"]},{"kind":"web_search","query":"AI","include_domains":["openai.com"]}]}}`,
-			want: "duplicated",
+			name:  "canonical duplicate",
+			calls: `[{"name":"web_search","arguments":{"query":"AI","include_domains":["OpenAI.com"]}},{"name":"web_search","arguments":{"query":"AI","include_domains":["openai.com"]}}]`,
+			want:  "duplicated",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newCreationSagaFakeStore()
 			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
+			raw := json.RawMessage(`{"spec":{"every_seconds":3600,"tz":"UTC"},` +
+				`"intent":"监控官方更新","nl_description":"官方更新","strictness":"normal",` +
+				`"tool_calls":` + tc.calls + `}`)
 			_, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 				ActionID: "action-invalid-source-spec", UserID: 11,
-				RawArgs: mustCreateArgsWithPlan(
-					t, "监控官方更新", "官方更新", json.RawMessage(tc.plan),
-				),
+				RawArgs:   raw,
 				ExpiresAt: time.Now().Add(time.Hour),
 			})
 			if !errors.Is(err, types.ErrValidation) || !strings.Contains(err.Error(), tc.want) ||
@@ -999,8 +1001,8 @@ func TestCreationCoordinator_FetchRequirementsValidateCommonEnvelopeBeforeMateri
 	}
 }
 
-func TestCreationCoordinator_FetchRequirementsRejectNullOptionalEnvelopeFields(t *testing.T) {
-	plan := `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"}]}}`
+func TestCreationCoordinator_ToolCallsRejectNullOptionalEnvelopeFields(t *testing.T) {
+	calls := `[{"name":"web_search","arguments":{"query":"AI"}}]`
 	for _, tc := range []struct {
 		name  string
 		field string
@@ -1012,7 +1014,7 @@ func TestCreationCoordinator_FetchRequirementsRejectNullOptionalEnvelopeFields(t
 			store := newCreationSagaFakeStore()
 			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
 			raw := json.RawMessage(`{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
-				`"intent":"监控官方更新","approved_fetch_plan":` + plan + `,` + tc.field + `}`)
+				`"intent":"监控官方更新","tool_calls":` + calls + `,` + tc.field + `}`)
 			_, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 				ActionID: "action-null-envelope", UserID: 11, RawArgs: raw,
 				ExpiresAt: time.Now().Add(time.Hour),

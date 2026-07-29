@@ -103,7 +103,7 @@ type createScheduleCommandArgs struct {
 	Intent            string                     `json:"intent"`
 	NLDescription     string                     `json:"nl_description"`
 	Strictness        types.PushStrictness       `json:"strictness"`
-	ApprovedFetchPlan json.RawMessage            `json:"approved_fetch_plan"`
+	LegacyToolPlanV1  json.RawMessage            `json:"approved_fetch_plan"`
 	ObservationPolicy *observation.PolicySpecV1  `json:"observation_policy,omitempty"`
 }
 
@@ -120,7 +120,7 @@ type normalizedCreateScheduleCommand struct {
 	Intent            string                    `json:"intent"`
 	NLDescription     string                    `json:"nl_description"`
 	Strictness        types.PushStrictness      `json:"strictness,omitempty"`
-	ApprovedFetchPlan json.RawMessage           `json:"approved_fetch_plan"`
+	LegacyToolPlanV1  json.RawMessage           `json:"approved_fetch_plan"`
 	ObservationPolicy *observation.PolicySpecV1 `json:"observation_policy,omitempty"`
 }
 
@@ -253,7 +253,7 @@ func (p *CreationPreparer) Prepare(
 	}
 
 	playbook := command.Intent
-	canonicalPlan := bytes.Clone(command.ApprovedFetchPlan)
+	canonicalPlan := bytes.Clone(command.LegacyToolPlanV1)
 	var compiledObservation *observation.PolicyV1
 	if command.ObservationPolicy != nil {
 		policy, policyErr := observation.Compile(*command.ObservationPolicy, loaded.CreatedAt)
@@ -490,12 +490,12 @@ func normalizeCreateScheduleCommand(
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, nil, err
 	}
-	approvedPlan, err := canonicalizeFetchPlan(args.ApprovedFetchPlan)
+	approvedPlan, err := canonicalizeFetchPlan(args.LegacyToolPlanV1)
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, nil,
-			fmt.Errorf("task: approved_fetch_plan is invalid: %w", err)
+			fmt.Errorf("task: retained v1 tool plan is invalid: %w", err)
 	}
-	command.ApprovedFetchPlan = approvedPlan
+	command.LegacyToolPlanV1 = approvedPlan
 	canonical, err := json.Marshal(command)
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, nil,
@@ -768,7 +768,7 @@ func validateCompiledCheckpoint(
 	if err != nil || !bytes.Equal(plan, compiled.FetchPlan) {
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled fetch_plan is not canonical and valid")
 	}
-	if !bytes.Equal(compiled.FetchPlan, command.ApprovedFetchPlan) {
+	if !bytes.Equal(compiled.FetchPlan, command.LegacyToolPlanV1) {
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled fetch_plan differs from approved command")
 	}
 	materialized, err := pausedDefinitionFromCompiled(*compiled)
