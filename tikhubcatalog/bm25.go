@@ -113,9 +113,13 @@ func (ix *bm25Index) search(query, platform string, topK int) []Hit {
 	}
 
 	platform = strings.ToLower(strings.TrimSpace(platform))
+	allowAdvanced := explicitAdvancedAnalyticsQuery(query)
 	hits := make([]Hit, 0, len(scores))
 	for doc, s := range scores {
 		if platform != "" && entries[doc].Platform != platform {
+			continue
+		}
+		if advancedAnalyticsEntry(entries[doc]) && !allowAdvanced {
 			continue
 		}
 		hits = append(hits, Hit{Entry: entries[doc], Score: s})
@@ -131,6 +135,35 @@ func (ix *bm25Index) search(query, platform string, topK int) []Hit {
 		hits = hits[:topK]
 	}
 	return hits
+}
+
+func explicitAdvancedAnalyticsQuery(query string) bool {
+	normalized := strings.ToLower(query)
+	for _, marker := range []string{
+		"广告", "投放", "店铺", "电商", "带货", "创作者分析", "达人分析",
+		"ads", "advertising", "shop", "commerce", "creator analytics",
+		"merchant", "douplus", "星图", "xingtu",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func advancedAnalyticsEntry(entry Entry) bool {
+	normalized := strings.ToLower(strings.Join([]string{
+		entry.Name, entry.Tag, entry.Summary,
+	}, " "))
+	for _, marker := range []string{
+		"douplus", "xingtu", "星图", "广告", "投放", "shop", "commerce",
+		"merchant", "creator analytics", "创作者分析", "达人分析",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // tokenize 中英混合分词，规则见文件头注。

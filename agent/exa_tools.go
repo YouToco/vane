@@ -47,8 +47,8 @@ type exaCallCounter interface {
 
 // ExaTools 是 web_search / read_page 的装配句柄（与 EndpointTools 同风格）：
 // key 未配置时不装配（nil），agent 工具面与上线前一致，而不是装两个恒报「缺 key」的工具。
-// counter 为 nil 时不查日限额（单消息上限仍生效）；msgCap/dailyCap ≤0 视为不设限
-// （生产由 config 默认值兜底，见 config.AgentConfig）。
+// counter 为 nil 时不查滚动 24h 限额；msgCap 保留在构造签名中仅用于配置兼容，
+// 单条消息统一由 Agent 隐藏熔断器管理。dailyCap ≤0 视为不设限。
 type ExaTools struct {
 	searcher webSearcher
 	reader   pageReader
@@ -66,29 +66,25 @@ func NewExaTools(searcher webSearcher, reader pageReader, counter exaCallCounter
 
 // SearchTool 返回 web_search（进静态白名单，BuildTools 装配）。
 func (e *ExaTools) SearchTool() ToolSpec {
-	return newToolSpec(&webSearchTool{et: e}, ownerPolicy(
+	return newToolSpec(&webSearchTool{et: e}, withToolSurface(ownerPolicy(
 		Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
-		ConfirmationNone, BudgetToolManaged))
+		ConfirmationNone, BudgetToolManaged),
+		ExposureAlways, IntentWebResearch, ResultTrustExternal, false))
 }
 
 // ReadPageTool 返回 read_page（进静态白名单，BuildTools 装配）。
 func (e *ExaTools) ReadPageTool() ToolSpec {
-	return newToolSpec(&readPageTool{et: e}, ownerPolicy(
+	return newToolSpec(&readPageTool{et: e}, withToolSurface(ownerPolicy(
 		Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
-		ConfirmationNone, BudgetToolManaged))
+		ConfirmationNone, BudgetToolManaged),
+		ExposureAlways, IntentWebResearch, ResultTrustExternal, false))
 }
 
-// checkBudget 双重限额判定（契约 §8 增补；模板照 endpointTool.Execute 的限额段）。
+// checkBudget 只判定滚动 24h 限额；单消息成本由统一工具熔断器负责。
 // 返回 "" = 放行；非空 = 拒绝文案（记 budget_exceeded——没打上游，不计入日限额 COUNT，
-// 否则被拒绝的调用会把限额越顶越死）。判定顺序：先消息内计数（零 I/O），后日限额（DB）。
+// 否则被拒绝的调用会把限额越顶越死）。
 func (e *ExaTools) checkBudget(ctx context.Context) string {
 	rec := recFrom(ctx)
-	if state := runStateFrom(ctx); state != nil && e.msgCap > 0 && state.exaCalls >= e.msgCap {
-		if rec != nil {
-			rec.ErrorType = types.ToolErrBudgetExceeded
-		}
-		return fmt.Sprintf("本条消息的网页查询已达上限（%d 次）。请基于已有结果回答，或让用户再发一条消息继续。", e.msgCap)
-	}
 	if e.counter != nil && e.dailyCap > 0 {
 		n, err := e.counter.CountExaAdHocCallsSince(ctx, time.Now().Add(-dailyCapWindow))
 		if err != nil {
@@ -111,8 +107,6 @@ func (e *ExaTools) checkBudget(ctx context.Context) string {
 	return ""
 }
 
-// countCall 在参数校验通过、即将打上游时计数（与端点工具同一时机：打到上游才算，
-// 校验失败没发请求不吃限额）。
 func (e *ExaTools) countCall(ctx context.Context) {
 	if state := runStateFrom(ctx); state != nil {
 		state.exaCalls++
@@ -133,6 +127,9 @@ func markInvalidArgs(ctx context.Context) {
 func exaToolError(err error) (string, error) {
 	var ae *types.AppError
 	if errors.As(err, &ae) {
+		if ae.Retryable {
+			return "", err
+		}
 		return ae.Message, nil
 	}
 	return "", err
@@ -167,7 +164,7 @@ const (
 const webSearchSchema = `{
   "type": "object",
   "properties": {
-    "query": {"type": "string", "description": "搜索词（自然语言即可，Exa 是语义搜索）"},
+    "query": {"type": "string", "description": "搜索词（自然语言即可）"},
     "num_results": {"type": "integer", "description": "返回条数，默认 5，最多 20。先少后多：不够再加，别一次拉满"},
     "include_domains": {"type": "array", "items": {"type": "string"},
       "description": "可选：只搜这些域名（如 [\"openai.com\"]）。查某个特定网站的最新信息时用"}
@@ -181,7 +178,7 @@ type webSearchTool struct {
 
 func (t *webSearchTool) Name() string { return "web_search" }
 func (t *webSearchTool) Description() string {
-	return "一次性搜索网页（Exa 语义搜索，按次计费）。用于临时查资料、查最新信息——" +
+	return "一次性搜索互联网并返回标题、链接、发布日期和正文摘要（可能计费）。用于临时查资料、查最新信息——" +
 		"不需要把搜索词加成信源。返回标题/链接/发布日期/正文摘要。要读某个具体页面的完整正文用 read_page。"
 }
 func (t *webSearchTool) Parameters() json.RawMessage { return json.RawMessage(webSearchSchema) }
@@ -273,6 +270,17 @@ func markExternalFollowupSearchSuccess(
 	result string,
 	results []fetcher.SearchResult,
 ) {
+	if state := runStateFrom(ctx); state != nil {
+		state.webResearchSucceeded = true
+		for _, item := range results {
+			appendExternalFollowupEvidence(state, externalFollowupSearchEvidence{
+				URL:           truncateRunes(item.URL, exaOutURLMaxRunes),
+				Title:         truncateRunes(item.Title, exaOutMetaMaxRunes),
+				Text:          truncateRunes(item.Text, webSearchTextMaxRunes*4),
+				PublishedDate: truncateRunes(item.PublishedDate, exaOutMetaMaxRunes),
+			})
+		}
+	}
 	if state := runStateFrom(ctx); state != nil &&
 		state.externalFollowupSearchAttempted &&
 		state.externalFollowupSearchQuery == query {
@@ -280,21 +288,25 @@ func markExternalFollowupSearchSuccess(
 		// 日限额检查失败、AppError 和基础设施错误都在此前返回，保持 false。
 		state.externalFollowupSearchSucceeded = true
 		state.externalFollowupSearchResult = result
-		state.externalFollowupSearchEvidence = make(
-			[]externalFollowupSearchEvidence, 0, len(results),
-		)
-		for _, item := range results {
-			state.externalFollowupSearchEvidence = append(
-				state.externalFollowupSearchEvidence,
-				externalFollowupSearchEvidence{
-					URL:           truncateRunes(item.URL, exaOutURLMaxRunes),
-					Title:         truncateRunes(item.Title, exaOutMetaMaxRunes),
-					Text:          truncateRunes(item.Text, webSearchTextMaxRunes*4),
-					PublishedDate: truncateRunes(item.PublishedDate, exaOutMetaMaxRunes),
-				},
-			)
+	}
+}
+
+func appendExternalFollowupEvidence(
+	state *toolRunState,
+	item externalFollowupSearchEvidence,
+) {
+	if state == nil || strings.TrimSpace(item.URL) == "" {
+		return
+	}
+	for i, existing := range state.externalFollowupSearchEvidence {
+		if existing.URL == item.URL {
+			state.externalFollowupSearchEvidence[i] = item
+			return
 		}
 	}
+	state.externalFollowupSearchEvidence = append(
+		state.externalFollowupSearchEvidence, item,
+	)
 }
 
 // oneLine 把标题压成一行（防空标题时输出裸行）。
@@ -324,7 +336,7 @@ type readPageTool struct {
 
 func (t *readPageTool) Name() string { return "read_page" }
 func (t *readPageTool) Description() string {
-	return "一次性读取指定网页的正文（Exa /contents 强制活抓最新内容，按次计费）。" +
+	return "一次性读取指定公开网页的最新正文（可能计费）。" +
 		"用于临时查看某个页面写了什么（价格、在售情况、公告等）——不需要把页面加成信源。" +
 		"正文过长会截断；要持续监控页面变化才用 add_source（web/contents）。"
 }
@@ -381,7 +393,16 @@ func (t *readPageTool) Execute(ctx context.Context, userID int64, args json.RawM
 		b.WriteString("（注意：上游返回的是缓存副本，可能不是页面最新状态）\n")
 	}
 	b.WriteString(text)
-	return b.String(), nil
+	result := b.String()
+	if state := runStateFrom(ctx); state != nil {
+		state.webResearchSucceeded = true
+		appendExternalFollowupEvidence(state, externalFollowupSearchEvidence{
+			URL:   truncateRunes(u, exaOutURLMaxRunes),
+			Title: truncateRunes(title, exaOutMetaMaxRunes),
+			Text:  truncateRunes(text, webSearchTextMaxRunes*4),
+		})
+	}
+	return result, nil
 }
 
 func (t *readPageTool) Summarize(json.RawMessage) string { return "" }

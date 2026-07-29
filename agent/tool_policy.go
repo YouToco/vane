@@ -103,6 +103,61 @@ const (
 	ConcurrencySequential
 )
 
+// ExposurePolicy controls when a tool definition is sent to the model. It is
+// intentionally separate from authorization: hiding a schema improves tool
+// choice, but never grants or revokes execution permission.
+type ExposurePolicy uint8
+
+const (
+	ExposureInvalid ExposurePolicy = iota
+	// ExposureAlways is the small provider-neutral discovery surface that is
+	// useful before the harness knows which concrete capability is needed.
+	ExposureAlways
+	// ExposureIntent is included only when the trusted owner request matches at
+	// least one of the tool's intent tags.
+	ExposureIntent
+	// ExposureContext is injected only after this turn produced the required
+	// context, for example a local result handle or an activated social tool.
+	ExposureContext
+)
+
+// ToolIntent is a local capability taxonomy. Values are bits because a tool
+// may be relevant to more than one owner intent.
+type ToolIntent uint16
+
+const (
+	IntentInvalid     ToolIntent = 0
+	IntentWebResearch ToolIntent = 1 << iota
+	IntentSocialResearch
+	IntentSources
+	IntentTasks
+	IntentProfile
+)
+
+const knownToolIntents = IntentWebResearch | IntentSocialResearch |
+	IntentSources | IntentTasks | IntentProfile
+
+func Intents(values ...ToolIntent) ToolIntent {
+	var out ToolIntent
+	for _, value := range values {
+		out |= value
+	}
+	return out
+}
+
+func (i ToolIntent) HasAny(other ToolIntent) bool { return i&other != 0 }
+
+// ResultTrust describes the data returned to the model. It is not inferred
+// from network access: search_endpoints reads a local catalog, while
+// read_endpoint_result returns cached but externally sourced text.
+type ResultTrust uint8
+
+const (
+	ResultTrustInvalid ResultTrust = iota
+	ResultTrustLocal
+	ResultTrustExternal
+)
+
 // ToolPolicy is the local, trusted safety contract for one model-visible tool.
 // Its zero value is deliberately invalid and grants no execution permission.
 type ToolPolicy struct {
@@ -112,6 +167,17 @@ type ToolPolicy struct {
 	Budget        BudgetPolicy
 	Retry         RetryPolicy
 	Concurrency   ConcurrencyPolicy
+	Exposure      ExposurePolicy
+	Intents       ToolIntent
+	ResultTrust   ResultTrust
+	// RoutingConfigured distinguishes the production intent surface from
+	// locally registered compatibility/test tools. Authorization is unchanged;
+	// unconfigured tools keep the historical always-declared behavior.
+	RoutingConfigured bool
+	// DirectOnExplicitIntent means the model-visible call may execute inline
+	// only when the trusted owner request itself explicitly asks for this
+	// action. Tool output and quoted/external text never satisfy this gate.
+	DirectOnExplicitIntent bool
 }
 
 // Tool is only the executable implementation. Model-facing declaration and
@@ -223,6 +289,17 @@ func (p ToolPolicy) validate() error {
 	if p.Concurrency != ConcurrencySequential {
 		return errors.New("concurrency is invalid")
 	}
+	if p.Exposure != ExposureAlways && p.Exposure != ExposureIntent &&
+		p.Exposure != ExposureContext {
+		return errors.New("exposure is invalid")
+	}
+	if p.Intents == IntentInvalid || p.Intents&^knownToolIntents != 0 {
+		return errors.New("intents are empty or unknown")
+	}
+	if p.ResultTrust != ResultTrustLocal &&
+		p.ResultTrust != ResultTrustExternal {
+		return errors.New("result trust is invalid")
+	}
 	if p.Confirmation == ConfirmationRequired &&
 		!p.Effects.Has(EffectStateWrite) &&
 		!p.Effects.Has(EffectDurableProposal) {
@@ -244,6 +321,14 @@ func (p ToolPolicy) validate() error {
 			p.Confirmation != ConfirmationNone ||
 			p.Authorization != AuthorizationOwner) {
 		return errors.New("direct owner write must be owner-only state write without confirmation")
+	}
+	if p.DirectOnExplicitIntent &&
+		!p.Effects.Has(EffectDirectOwnerWrite) &&
+		!p.Effects.Has(EffectDelivery) {
+		return errors.New("direct explicit intent requires a direct owner write or delivery")
+	}
+	if p.Effects.Has(EffectDirectOwnerWrite) && !p.DirectOnExplicitIntent {
+		return errors.New("direct owner write must require explicit owner intent")
 	}
 	if p.Effects.Has(EffectBillable) && p.Budget == BudgetNone {
 		return errors.New("billable effect requires a budget owner")
@@ -269,12 +354,30 @@ func ownerPolicy(effects EffectSet, confirmation ConfirmationPolicy, budget Budg
 		Effects: effects, Authorization: AuthorizationOwner,
 		Confirmation: confirmation, Budget: budget,
 		Retry: RetryNone, Concurrency: ConcurrencySequential,
+		Exposure: ExposureIntent, Intents: IntentTasks,
+		ResultTrust:            ResultTrustLocal,
+		DirectOnExplicitIntent: effects.Has(EffectDirectOwnerWrite),
 	}
 }
 
 func a2aReadPolicy(effects EffectSet) ToolPolicy {
 	policy := ownerPolicy(effects, ConfirmationNone, BudgetNone)
 	policy.Authorization |= AuthorizationA2AReadOnly
+	return policy
+}
+
+func withToolSurface(
+	policy ToolPolicy,
+	exposure ExposurePolicy,
+	intents ToolIntent,
+	trust ResultTrust,
+	directOnExplicitIntent bool,
+) ToolPolicy {
+	policy.Exposure = exposure
+	policy.Intents = intents
+	policy.ResultTrust = trust
+	policy.DirectOnExplicitIntent = directOnExplicitIntent
+	policy.RoutingConfigured = true
 	return policy
 }
 

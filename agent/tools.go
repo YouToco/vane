@@ -95,34 +95,49 @@ type playbookStore interface {
 // 工具面与该特性上线前完全一致（同 endpoints 的 nil 语义）。
 func BuildTools(st *store.Store, sched *scheduler.Scheduler, tasks taskCreator, pusher PushTrigger, endpoints *EndpointTools, prober sourceProber, exa *ExaTools, definitionEdits ...DefinitionEditController) []ToolSpec {
 	tools := []ToolSpec{
-		newToolSpec(&listSourcesTool{st: st}, a2aReadPolicy(Effects(EffectInternalRead))),
-		newToolSpec(&addSourceTool{st: st, prober: prober}, ownerPolicy(
+		newToolSpec(&listSourcesTool{st: st}, withToolSurface(
+			a2aReadPolicy(Effects(EffectInternalRead)),
+			ExposureIntent, IntentSources, ResultTrustLocal, false)),
+		newToolSpec(&addSourceTool{st: st, prober: prober}, withToolSurface(ownerPolicy(
 			Effects(EffectNetworkRead, EffectBillable, EffectStateWrite, EffectTrustTaint, EffectDirectOwnerWrite),
-			ConfirmationNone, BudgetDownstreamManaged)),
-		newToolSpec(&removeSourceTool{st: st}, ownerPolicy(
+			ConfirmationNone, BudgetDownstreamManaged),
+			ExposureIntent, IntentSources, ResultTrustExternal, true)),
+		newToolSpec(&removeSourceTool{st: st}, withToolSurface(ownerPolicy(
 			Effects(EffectStateWrite, EffectDirectOwnerWrite),
-			ConfirmationNone, BudgetNone)),
-		newToolSpec(&enableSourceTool{st: st}, ownerPolicy(
-			Effects(EffectStateWrite, EffectDirectOwnerWrite), ConfirmationNone, BudgetNone)),
-		newToolSpec(&listSchedulesTool{st: st}, a2aReadPolicy(Effects(EffectInternalRead))),
-		newToolSpec(&createScheduleTool{tasks: tasks}, ownerPolicy(
-			Effects(EffectDurableProposal, EffectStateWrite, EffectDirectOwnerWrite), ConfirmationNone, BudgetNone)),
-		newToolSpec(&removeScheduleTool{sched: sched}, ownerPolicy(
+			ConfirmationNone, BudgetNone),
+			ExposureIntent, IntentSources, ResultTrustLocal, true)),
+		newToolSpec(&enableSourceTool{st: st}, withToolSurface(ownerPolicy(
+			Effects(EffectStateWrite, EffectDirectOwnerWrite), ConfirmationNone, BudgetNone),
+			ExposureIntent, IntentSources, ResultTrustLocal, true)),
+		newToolSpec(&listSchedulesTool{st: st}, withToolSurface(
+			a2aReadPolicy(Effects(EffectInternalRead)),
+			ExposureIntent, IntentTasks, ResultTrustLocal, false)),
+		newToolSpec(&createScheduleTool{tasks: tasks}, withToolSurface(ownerPolicy(
+			Effects(EffectDurableProposal, EffectStateWrite),
+			ConfirmationRequired, BudgetNone),
+			ExposureIntent, IntentTasks, ResultTrustLocal, false)),
+		newToolSpec(&removeScheduleTool{sched: sched}, withToolSurface(ownerPolicy(
 			Effects(EffectStateWrite, EffectDirectOwnerWrite),
-			ConfirmationNone, BudgetNone)),
-		newToolSpec(&pushNowTool{pusher: pusher}, ownerPolicy(
-			Effects(EffectDelivery), ConfirmationNone, BudgetDownstreamManaged)),
-		newToolSpec(&viewProfileTool{st: st}, ownerPolicy(
-			Effects(EffectInternalRead), ConfirmationNone, BudgetNone)),
-		newToolSpec(&updateProfileTool{st: st}, ownerPolicy(
-			Effects(EffectStateWrite, EffectDirectOwnerWrite), ConfirmationNone, BudgetNone)),
-		newToolSpec(&viewTaskPlaybookTool{st: st}, ownerPolicy(
-			Effects(EffectInternalRead), ConfirmationNone, BudgetNone)),
+			ConfirmationNone, BudgetNone),
+			ExposureIntent, IntentTasks, ResultTrustLocal, true)),
+		newToolSpec(&pushNowTool{pusher: pusher}, withToolSurface(ownerPolicy(
+			Effects(EffectDelivery), ConfirmationNone, BudgetDownstreamManaged),
+			ExposureIntent, IntentTasks, ResultTrustLocal, true)),
+		newToolSpec(&viewProfileTool{st: st}, withToolSurface(ownerPolicy(
+			Effects(EffectInternalRead), ConfirmationNone, BudgetNone),
+			ExposureIntent, IntentProfile, ResultTrustLocal, false)),
+		newToolSpec(&updateProfileTool{st: st}, withToolSurface(ownerPolicy(
+			Effects(EffectStateWrite), ConfirmationRequired, BudgetNone),
+			ExposureIntent, IntentProfile, ResultTrustLocal, false)),
+		newToolSpec(&viewTaskPlaybookTool{st: st}, withToolSurface(ownerPolicy(
+			Effects(EffectInternalRead), ConfirmationNone, BudgetNone),
+			ExposureIntent, IntentTasks, ResultTrustLocal, false)),
 	}
 	if len(definitionEdits) == 1 && definitionEdits[0] != nil {
-		tools = append(tools, newToolSpec(&editTaskDefinitionTool{}, ownerPolicy(
-			Effects(EffectDurableProposal, EffectStateWrite, EffectDirectOwnerWrite),
-			ConfirmationNone, BudgetNone)))
+		tools = append(tools, newToolSpec(&editTaskDefinitionTool{}, withToolSurface(ownerPolicy(
+			Effects(EffectDurableProposal, EffectStateWrite),
+			ConfirmationRequired, BudgetNone),
+			ExposureIntent, IntentTasks, ResultTrustLocal, false)))
 	}
 	if endpoints != nil {
 		tools = append(tools, endpoints.SearchTool(), endpoints.ReadResultTool())
@@ -221,7 +236,7 @@ type editTaskDefinitionTool struct{}
 
 func (*editTaskDefinitionTool) Name() string { return "edit_task_definition" }
 func (*editTaskDefinitionTool) Description() string {
-	return "直接编辑已有定时任务的完整已批准定义，不发确认卡。可一次修改触发频率、完整监控意图/手册、列表描述、推送门槛和新鲜度/事件判定策略；未提供的字段保持不变。系统会冻结当前 definition head 与目标定义，再立即交给唯一可恢复协调器执行。"
+	return "生成已有定时任务的完整编辑确认卡。可一次修改触发频率、完整监控意图/手册、列表描述、推送门槛和新鲜度/事件判定策略；未提供的字段保持不变。系统冻结当前 definition head 与目标定义，用户点击后由耐久协调器执行。"
 }
 func (*editTaskDefinitionTool) Parameters() json.RawMessage {
 	return json.RawMessage(editTaskDefinitionSchema)
@@ -334,10 +349,10 @@ const addSourceSchema = `{
     "capability": {
       "type": "string",
       "enum": ["feed", "search", "user_posts", "contents", "hot_list", "topic_feed", "faved_notes"],
-      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=Exa 网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主，weibo=微博账号需 uid 或 profile_url，wechat_mp=公众号需 username）；contents=监控指定网页内容变化（仅 web，如产品定价页——内容变了才推送）；hot_list=平台热榜追新（xhs=小红书热榜，weibo=微博热搜，均无参数）；topic_feed=某话题下的新笔记（仅 xhs，需 page_id 或 topic_url）；faved_notes=某账号公开收藏的新笔记（仅 xhs，需 user_id 或 profile_url，对方收藏须公开）。当前不支持的能力及原因见本工具说明（Description）。"
+      "description": "能力：feed=RSS/Atom 订阅（仅 web）；search=关键词/语义搜索（web=网页搜索，xhs=小红书关键词）；user_posts=订阅某账号的新发布（x=Twitter 账号，xhs=小红书博主，weibo=微博账号需 uid 或 profile_url，wechat_mp=公众号需 username）；contents=监控指定网页内容变化（仅 web，如产品定价页——内容变了才推送）；hot_list=平台热榜追新（xhs=小红书热榜，weibo=微博热搜，均无参数）；topic_feed=某话题下的新笔记（仅 xhs，需 page_id 或 topic_url）；faved_notes=某账号公开收藏的新笔记（仅 xhs，需 user_id 或 profile_url，对方收藏须公开）。当前不支持的能力及原因见本工具说明（Description）。"
     },
     "url": {"type": "string", "description": "网页地址（http/https）：platform=web capability=feed 时是 RSS 源地址，capability=contents 时是要监控变化的页面地址，均必填"},
-    "query": {"type": "string", "description": "Exa 搜索词，platform=web capability=search 时必填"},
+    "query": {"type": "string", "description": "网页搜索词，platform=web capability=search 时必填"},
     "keyword": {"type": "string", "description": "小红书搜索关键词，platform=xhs capability=search 时必填"},
     "screen_name": {"type": "string", "description": "X 用户名（如 OpenAI），platform=x capability=user_posts 时必填"},
     "user_id": {"type": "string", "description": "小红书用户 ID（24 位十六进制），platform=xhs 且 capability=user_posts/faved_notes 时必填（或改用 profile_url）"},
@@ -347,9 +362,9 @@ const addSourceSchema = `{
     "page_id": {"type": "string", "description": "小红书话题页面 ID（24 位十六进制），platform=xhs capability=topic_feed 时必填（或改用 topic_url）。可从笔记正文话题标签的深链（xhsdiscover://…topic/normal?id=…）或话题页链接中获得"},
     "topic_url": {"type": "string", "description": "小红书话题链接或深链，platform=xhs capability=topic_feed 时可替代 page_id（自动从中抽取 24 位十六进制 ID）"},
     "title": {"type": "string", "description": "可选：展示名，缺省按类型自动生成"},
-    "category": {"type": "string", "description": "可选：Exa 结果类别（如 news），仅 web/search 生效"},
+    "category": {"type": "string", "description": "可选：网页结果类别（如 news），仅 web/search 生效"},
     "categories": {"type": "array", "items": {"type": "string"}, "description": "可选：RSS 分类过滤（如 [\"Product\",\"Research\"]），仅 web/feed 生效；不传=不限"},
-    "include_domains": {"type": "array", "items": {"type": "string"}, "description": "可选：限定 Exa 搜索只返回这些域名的结果（如 [\"anthropic.com\",\"claude.com\"]），仅 web/search 生效；追新优先用它、避免日期过滤把无发布日期的官方页删光；不传=不限"}
+    "include_domains": {"type": "array", "items": {"type": "string"}, "description": "可选：限定网页搜索只返回这些域名的结果（如 [\"anthropic.com\",\"claude.com\"]），仅 web/search 生效；追新优先用它、避免日期过滤把无发布日期的官方页删光；不传=不限"}
   }
 }`
 
@@ -884,7 +899,7 @@ const createScheduleSchema = `{
                     "description": "web_search=网页搜索；web_feed=已知 RSS/Atom 地址；web_contents=监控已知页面；x_user_posts=X 账号；其余为对应小红书能力"
                   },
                   "query": {"type": "string", "description": "仅 web_search 必填：搜索词"},
-                  "category": {"type": "string", "description": "仅 web_search 可选：Exa 类别，如 news"},
+                  "category": {"type": "string", "description": "仅 web_search 可选：结果类别，如 news"},
                   "include_domains": {
                     "type": "array",
                     "uniqueItems": true,
@@ -1000,7 +1015,7 @@ type createScheduleTool struct {
 
 func (t *createScheduleTool) Name() string { return "create_schedule" }
 func (t *createScheduleTool) Description() string {
-	return "直接创建定时推送任务，不发确认卡。必须同时提交用户明确表达的监控意图与完整长期抓取计划；已有信源用 list_sources 返回的 id 放进 existing_source_ids，新信源用版本化 source_specs 提交原始参数。系统会确定性生成并冻结内部信源，再立即推进可恢复的创建流程；模型不得编写 config、selectors 或 vane:// URL。触发频率用 cron 或 every_seconds 二选一，频率不得高于每小时一次。"
+	return "生成一张定时推送任务确认卡。必须同时提交用户明确表达的监控意图与完整长期抓取计划；已有信源用 list_sources 返回的 id 放进 existing_source_ids，新信源用版本化 source_specs 提交原始参数。系统会确定性生成并冻结内部信源，用户点击后由耐久协调器执行；模型不得编写 config、selectors 或 vane:// URL。触发频率用 cron 或 every_seconds 二选一，频率不得高于每小时一次。"
 }
 func (t *createScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(createScheduleSchema)

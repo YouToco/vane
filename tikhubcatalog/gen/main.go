@@ -201,8 +201,9 @@ func buildEntries(sp *spec) ([]outEntry, error) {
 			}
 
 			name := toolName(path)
-			if excludedEndpoints[name] {
-				continue // 端点级精确排除（写端点/越界能力，见 excludedEndpoints）
+			if excludedEndpoints[name] ||
+				excludedByRisk(name, path, op) {
+				continue // 能力级排除，不以 GET/POST 推断安全性。
 			}
 			if !toolNameRe.MatchString(name) {
 				return nil, fmt.Errorf("生成的工具名 %q（来自 %s）不符合 FC 命名约束，需人工处理", name, path)
@@ -233,6 +234,53 @@ func buildEntries(sp *spec) ([]outEntry, error) {
 	// 排序保证 re-gen 产物确定性：diff 只反映 spec 真实变化，不含遍历序噪音。
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	return entries, nil
+}
+
+var forbiddenCapabilityMarkers = []string{
+	"guest_cookie",
+	"generate_real_mstoken",
+	"generate_wss_xb_signature",
+	"fetch_sec_token",
+	"register_device",
+	"private_message",
+	"login_request",
+	"encrypt_decrypt",
+	"ttencrypt",
+	"decrypt_strdata",
+	"encrypt_strdata",
+	"encrypt_uid",
+	"encrypt_user_id",
+	"get_sign_image",
+	"add_video_play_count",
+	"increase_post_view_count",
+}
+
+var remoteMutationName = regexp.MustCompile(
+	`(?:^|_)(?:add|increase|create|delete|remove|send|publish|upload|update|modify)(?:_|$)`,
+)
+
+// excludedByRisk classifies business capability, not transport method. Read-
+// looking endpoints that mint credentials, device identity, signatures or
+// social-engineering links are forbidden alongside genuine remote mutations.
+// Fetch/get/search/list analytics stay available even when their subject is a
+// like, follow or comment.
+func excludedByRisk(name, path string, op operation) bool {
+	haystack := strings.ToLower(strings.Join([]string{
+		name, path, op.Summary, op.Description,
+	}, " "))
+	for _, marker := range forbiddenCapabilityMarkers {
+		if strings.Contains(haystack, marker) {
+			return true
+		}
+	}
+	if remoteMutationName.MatchString(strings.ToLower(name)) &&
+		!strings.Contains(name, "_fetch_") &&
+		!strings.Contains(name, "_get_") &&
+		!strings.Contains(name, "_search_") &&
+		!strings.Contains(name, "_list_") {
+		return true
+	}
+	return false
 }
 
 // toolName 从 path 生成 FC 工具名：/api/v1/tiktok/web/fetch_post_detail →

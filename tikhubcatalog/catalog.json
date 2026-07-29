@@ -3546,7 +3546,7 @@
   "tag": "Douyin-Creator-V2-API",
   "platform": "douyin",
   "summary": "获取作品观众数据分析/Fetch item audience portrait",
-  "description": "# [中文]\n### 用途:\n- 获取抖音作品的观众数据分析\n- 了解观看作品的用户画像特征\n- 包含活跃分布、性别分布、地域分布、年龄分布等多维度数据\n- 帮助创作者精准定位目标受众，优化内容策略\n- **此接口需要用户提供有效的抖音创作者平台Cookie**\n- **使用 POST 方法，Cookie 在请求体中传输，更安全**\n\n### 请求体参数:\n- cookie: 用户的抖音创作者平台Cookie（必填，在请求体中传输）\n- item_id: 作品ID（必填）\n\n### 返回数据说明:\n返回作品的观众画像数据，包括以下维度：\n\n**1. 活跃分布 (active)**:\n- key: 活跃时段标识（\"2\"=上午, \"3\"=下午, \"4\"=晚上, \"-1\"=其他）\n- value: 该时段的活跃用户占比（0-1之间的小数）\n\n**2. 性别分布 (gender)**:\n- ratio_list: 性别占比列表\n  - key: \"male\"（男性）或 \"female\"（女性）\n  - value: 该性别用户占比（0-1之间的小数）\n- tgi_list: 性别TGI指数列表（Target Group Index，目标群体指数）\n  - key: 性别标识\n  - value: TGI值（100为平均水平，\u003e100表示高于平均）\n\n**3. 地域分布 (province)…",
+  "description": "# [中文]\n### 用途:\n- 获取抖音作品的观众数据分析\n- 了解观看作品的用户画像特征\n- 包含活跃分布、性别分布、地域分布、年龄分布等多维度数据\n- 帮助创作者精准定位目标受众，优化内容策略\n- **此接口需要用户提供有效的抖音创作者平台Cookie**\n- **使用 POST 方法，Cookie 在请求体中传输，更安全**\n\n### 请求体参数:\n- cookie: 用户的抖音创作者平台Cookie（必填，在请求体中传输）\n- item_id: 作品ID（必填）\n\n### 返回数据说明:\n返回作品的观众画像数据，包括以下维度：\n\n**1. 活跃分布 (active)**:\n- key: 活跃时段标识（\"2\"=上午, \"3\"=下午, \"4\"=晚上, \"-1\"=其他）\n- value: 该时段的活跃用户占比（0-1之间的小数）\n\n**2. 性别分布 (gender)**:\n- ratio_list: 性别占比列表\n  - key: \"male\"（男性）或 \"female\"（女性）\n  - value: 该性别用户占比（0-1之间的小数）\n- tgi_list: 性别TGI指数列表（Target Group Index，目标群体指数）\n  - key: 性别标识\n  - value: TGI值（100为平均水平，>100表示高于平均）\n\n**3. 地域分布 (province)…",
   "params": [
    {
     "name": "cookie",
@@ -3928,7 +3928,7 @@
   "tag": "Douyin-DouPlus-API",
   "platform": "douyin",
   "summary": "投放数据明细/Delivery analysis detail",
-  "description": "# [中文]\n### 用途:\n- DOU+ 投放数据明细（逐订单 / 逐作品的指标列表，支持分页与排序），账号 / 视频 / 直播由 query.analysisType 区分\n- **此接口需要用户提供有效的 www.douyin.com 网页版 Cookie**\n### 参数（query 透传）:\n- 字段同\"投放数据概览\"，额外 page（页码）、limit（每页数量）、orderByMetric（排序字段，如 create_time）、orderByType（排序方向）\n### 返回:\n- 明细列表数据（含分页信息）\n\n# [English]\n### Purpose:\n- DOU+ delivery analysis detail (per-order / per-item metric list with paging \u0026 sorting); account/video/live by query.analysisType\n- **Requires a valid www.douyin.com web Cookie**\n### Parameters (query passthrough):\n- Same fields as overview, plus page, limit, orderByMetric (e.g. create_time), orderByType\n#…",
+  "description": "# [中文]\n### 用途:\n- DOU+ 投放数据明细（逐订单 / 逐作品的指标列表，支持分页与排序），账号 / 视频 / 直播由 query.analysisType 区分\n- **此接口需要用户提供有效的 www.douyin.com 网页版 Cookie**\n### 参数（query 透传）:\n- 字段同\"投放数据概览\"，额外 page（页码）、limit（每页数量）、orderByMetric（排序字段，如 create_time）、orderByType（排序方向）\n### 返回:\n- 明细列表数据（含分页信息）\n\n# [English]\n### Purpose:\n- DOU+ delivery analysis detail (per-order / per-item metric list with paging & sorting); account/video/live by query.analysisType\n- **Requires a valid www.douyin.com web Cookie**\n### Parameters (query passthrough):\n- Same fields as overview, plus page, limit, orderByMetric (e.g. create_time), orderByType\n#…",
   "params": [
    {
     "name": "cookie",
@@ -4002,7 +4002,7 @@
   "path": "/api/v1/douyin/douplus/fetch_promotable_item_list",
   "tag": "Douyin-DouPlus-API",
   "platform": "douyin",
-  "summary": "获取可推广作品列表(含点赞评论量)/Get promotable item list (with like \u0026 comment counts)",
+  "summary": "获取可推广作品列表(含点赞评论量)/Get promotable item list (with like & comment counts)",
   "description": "# [中文]\n### 用途:\n- 获取指定抖音账号在 DOU+ 投放页可推广的作品列表，包含每个作品的点赞、评论、播放等数据\n### 参数:\n- sec_uid: 投放账号的 sec_uid（必填）\n- count: 返回作品数量，默认 30\n- target_id: 推广目标（DOU+ 页面上的目标卡片）ID，默认 31（点赞评论量）。31=点赞评论量, 32=粉丝量, 33=主页浏览量,\n  37=视频播放量, 40=直播间人气, 45=评论链接点击, 63=展示给粉丝, 78=高质量互动。**只拉作品列表的话用默认 31 即可**\n- aim_ids: 可选高级参数——投放优化目标编码（多个用逗号分隔）。**一般留空即可**，留空时按 target_id 自动匹配；仅高级场景需手动指定\n### 返回:\n- 可推广作品列表数据（含作品ID、标题、封面、点赞量、评论量、播放量等）\n\n# [English]\n### Purpose:\n- Get the promotable item (video) list for a given Douyin account on the DOU+ delivery page,\n  including like / comment / play counts per item\n### Parameters:\n- sec_uid: sec_uid…",
   "params": [
    {
@@ -4067,24 +4067,6 @@
   ]
  },
  {
-  "name": "douyin_douplus_fetch_sec_token",
-  "method": "POST",
-  "path": "/api/v1/douyin/douplus/fetch_sec_token",
-  "tag": "Douyin-DouPlus-API",
-  "platform": "douyin",
-  "summary": "获取DOU+ POST请求所需的sec_token/Get DOU+ sec_token for POST requests",
-  "description": "# [中文]\n### 用途:\n- 获取 DOU+ 需要鉴权的 POST 接口（如「成本计算」）所需的 sec_token\n- **此接口需要用户提供有效的 www.douyin.com 网页版 Cookie**\n### 参数:\n- cookie: 用户的 www.douyin.com 网页版 Cookie（必填）\n### 返回:\n- 含 sec_token 字段的数据，用于后续 DOU+ 鉴权 POST 接口\n\n# [English]\n### Purpose:\n- Get the sec_token required by DOU+ authenticated POST endpoints (e.g. cost estimation)\n- **Requires a valid www.douyin.com web Cookie**\n### Parameters:\n- cookie: User's www.douyin.com web Cookie (required)\n### Return:\n- Data containing the sec_token, used for subsequent DOU+ authenticated POST endpoints",
-  "params": [
-   {
-    "name": "cookie",
-    "in": "body",
-    "required": true,
-    "type": "string",
-    "desc": "用户 www.douyin.com 网页版 Cookie/User www.douyin.com web Cookie"
-   }
-  ]
- },
- {
   "name": "douyin_douplus_fetch_talent_categories",
   "method": "POST",
   "path": "/api/v1/douyin/douplus/fetch_talent_categories",
@@ -4108,7 +4090,7 @@
   "tag": "Douyin-DouPlus-API",
   "platform": "douyin",
   "summary": "按分类搜索达人/Search talents by category",
-  "description": "# [中文]\n### 用途:\n- 按分类搜索/筛选 DOU+ 达人\n### 参数:\n- name: 达人分类名/搜索词（取自\"获取达人分类\"接口）；留空为全部\n- page: 页码，从 0 开始，默认 0\n- limit: 每页数量，默认 20\n### 返回:\n- 达人列表\n\n# [English]\n### Purpose:\n- Search \u0026 filter DOU+ talents by category\n### Parameters:\n- name: Category name or keyword (from the talent category endpoint); empty for all\n- page: Page index from 0, default 0\n- limit: Page size, default 20\n### Return:\n- Talent list",
+  "description": "# [中文]\n### 用途:\n- 按分类搜索/筛选 DOU+ 达人\n### 参数:\n- name: 达人分类名/搜索词（取自\"获取达人分类\"接口）；留空为全部\n- page: 页码，从 0 开始，默认 0\n- limit: 每页数量，默认 20\n### 返回:\n- 达人列表\n\n# [English]\n### Purpose:\n- Search & filter DOU+ talents by category\n### Parameters:\n- name: Category name or keyword (from the talent category endpoint); empty for all\n- page: Page index from 0, default 0\n- limit: Page size, default 20\n### Return:\n- Talent list",
   "params": [
    {
     "name": "cookie",
@@ -5116,24 +5098,6 @@
     "type": "string",
     "desc": "返回数量/Return count",
     "default": "20"
-   }
-  ]
- },
- {
-  "name": "douyin_index_fetch_encrypt_user_id",
-  "method": "GET",
-  "path": "/api/v1/douyin/index/fetch_encrypt_user_id",
-  "tag": "Douyin-Index-API",
-  "platform": "douyin",
-  "summary": "抖音 uid 转加密 user_id/Encrypt Douyin uid to user_id",
-  "description": "# [中文]\n### 用途:\n- 将抖音 uid（纯数字）转换为抖音指数 API 内部使用的加密 user_id\n- 达人相关接口（如 fetch_daren_similar_users、fetch_daren_great_item_mile_info 等）\n  已自动处理此转换，通常无需手动调用本接口\n- 本接口仅用于调试或需要直接拿到加密 user_id 的特殊场景\n### 参数:\n- uid: 抖音 uid，纯数字字符串\n### 返回:\n- uid: 原始输入的抖音 uid\n- user_id: 加密后的 user_id\n\n# [English]\n### Purpose:\n- Convert a Douyin uid (numeric) to the encrypted user_id used internally by Douyin Index API\n- The daren-related endpoints already handle this conversion automatically,\n  so you usually do NOT need to call this endpoint manually\n- Only useful for debugging or when you need the encrypted user_id directly\n#…",
-  "params": [
-   {
-    "name": "uid",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "抖音 uid (纯数字) / Douyin uid (numeric). Example: 3100268042915212"
    }
   ]
  },
@@ -6838,24 +6802,6 @@
   ]
  },
  {
-  "name": "douyin_web_encrypt_uid_to_sec_user_id",
-  "method": "GET",
-  "path": "/api/v1/douyin/web/encrypt_uid_to_sec_user_id",
-  "tag": "Douyin-Web-API",
-  "platform": "douyin",
-  "summary": "加密用户uid到sec_user_id/Encrypt user uid to sec_user_id",
-  "description": "# [中文]\n### 用途:\n- 加密用户uid到sec_user_id\n### 参数:\n- uid: 用户uid，也就是抖音号的short_id\n### 返回:\n- 用户信息\n\n# [English]\n### Purpose:\n- Encrypt user uid to sec_user_id\n### Parameters:\n- uid: User uid, which is the short_id of the Douyin number\n### Return:\n- User information\n\n# [示例/Example]\nuid = \"1673937488185292\"",
-  "params": [
-   {
-    "name": "uid",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "用户uid(short_id)/User uid(short_id)"
-   }
-  ]
- },
- {
   "name": "douyin_web_fetch_batch_user_profile_v1",
   "method": "GET",
   "path": "/api/v1/douyin/web/fetch_batch_user_profile_v1",
@@ -6969,24 +6915,6 @@
   ]
  },
  {
-  "name": "douyin_web_fetch_douyin_web_guest_cookie",
-  "method": "GET",
-  "path": "/api/v1/douyin/web/fetch_douyin_web_guest_cookie",
-  "tag": "Douyin-Web-API",
-  "platform": "douyin",
-  "summary": "获取抖音Web的游客Cookie/Get the guest Cookie of Douyin Web",
-  "description": "# [中文]\n### 用途:\n- 获取抖音Web的游客Cookie\n- 可以用于爬取抖音Web的数据，如用户作品、合辑作品等。\n- 可以固定身份避免部分接口重复数据。\n- 请注意：游客Cookie无法爬取所有数据，有一定的限制。\n- 可以配合开源项目使用此接口实现抖音Web的数据爬取。\n### 参数:\n- user_agent: 用户浏览器代理\n### 返回:\n- 游客Cookie\n\n# [English]\n### Purpose:\n- Get the guest Cookie of Douyin Web\n- Can be used to crawl data of Douyin Web, such as user videos, mix videos, etc.\n- Can fix identity to avoid duplicate data for some interfaces.\n- Please note: Guest Cookie cannot crawl all data, there are certain restrictions.\n- Can be used with open source projects to implement data crawling of Douyin Web using this interface.\n### Parameter…",
-  "params": [
-   {
-    "name": "user_agent",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "用户浏览器代理/User browser agent"
-   }
-  ]
- },
- {
   "name": "douyin_web_fetch_food_aweme",
   "method": "GET",
   "path": "/api/v1/douyin/web/fetch_food_aweme",
@@ -7055,7 +6983,7 @@
   "tag": "Douyin-Web-API",
   "platform": "douyin",
   "summary": "获取首页推荐数据/Get home feed data",
-  "description": "# [中文]\n### 用途:\n- 获取首页推荐数据\n### 参数:\n- count: 数量，默认为10，建议保持不变。\n- refresh_index: 刷新/翻页索引，从 0 开始，每翻一页 +1。\n    - refresh_index=0：刷新（首次进入/下拉刷新）\n    - refresh_index\u003e0：翻页（下滑加载更多）\n- cookie: 可选，用户网页版抖音登录Cookie。传入后返回该账号的个性化推荐；不传则使用默认Cookie返回通用推荐。\n### 返回:\n- Feed数据\n\n# [English]\n### Purpose:\n- Get home feed data\n### Parameters:\n- count: Number, default is 10, it is recommended to keep it unchanged.\n- refresh_index: Refresh/paging index, start at 0 and +1 per page.\n    - refresh_index=0: refresh (first entry / pull-to-refresh)\n    - refresh_index\u003e0: load-more (scroll down)\n- cookie: Optional, your web version…",
+  "description": "# [中文]\n### 用途:\n- 获取首页推荐数据\n### 参数:\n- count: 数量，默认为10，建议保持不变。\n- refresh_index: 刷新/翻页索引，从 0 开始，每翻一页 +1。\n    - refresh_index=0：刷新（首次进入/下拉刷新）\n    - refresh_index>0：翻页（下滑加载更多）\n- cookie: 可选，用户网页版抖音登录Cookie。传入后返回该账号的个性化推荐；不传则使用默认Cookie返回通用推荐。\n### 返回:\n- Feed数据\n\n# [English]\n### Purpose:\n- Get home feed data\n### Parameters:\n- count: Number, default is 10, it is recommended to keep it unchanged.\n- refresh_index: Refresh/paging index, start at 0 and +1 per page.\n    - refresh_index=0: refresh (first entry / pull-to-refresh)\n    - refresh_index>0: load-more (scroll down)\n- cookie: Optional, your web version…",
   "params": [
    {
     "name": "cookie",
@@ -7075,7 +7003,7 @@
     "name": "refresh_index",
     "in": "body",
     "type": "integer",
-    "desc": "刷新/翻页索引：0=刷新(首页/下拉)，\u003e0=翻页(下滑加载更多)，每次+1取下一页 / Refresh-paging index: 0=refresh, \u003e0=load-more, increment by 1 for next page",
+    "desc": "刷新/翻页索引：0=刷新(首页/下拉)，>0=翻页(下滑加载更多)，每次+1取下一页 / Refresh-paging index: 0=refresh, >0=load-more, increment by 1 for next page",
     "default": 0
    }
   ]
@@ -8035,15 +7963,6 @@
   ]
  },
  {
-  "name": "douyin_web_generate_real_msToken",
-  "method": "GET",
-  "path": "/api/v1/douyin/web/generate_real_msToken",
-  "tag": "Douyin-Web-API",
-  "platform": "douyin",
-  "summary": "生成真实msToken/Generate real msToken",
-  "description": "# [中文]\n### 用途:\n- 生成真实msToken\n### 返回:\n- msToken\n\n# [English]\n### Purpose:\n- Generate real msToken\n### Return:\n- msToken"
- },
- {
   "name": "douyin_web_generate_s_v_web_id",
   "method": "GET",
   "path": "/api/v1/douyin/web/generate_s_v_web_id",
@@ -8079,45 +7998,13 @@
   "description": "# [中文]\n### 用途:\n- 生成verify_fp\n### 返回:\n- verify_fp\n\n# [English]\n### Purpose:\n- Generate verify_fp\n### Return:\n- verify_fp"
  },
  {
-  "name": "douyin_web_generate_wss_xb_signature",
-  "method": "GET",
-  "path": "/api/v1/douyin/web/generate_wss_xb_signature",
-  "tag": "Douyin-Web-API",
-  "platform": "douyin",
-  "summary": "生成弹幕xb签名/Generate barrage xb signature",
-  "description": "# [中文]\n### 用途:\n- 生成弹幕xb签名\n### 参数:\n- user_agent: 用户浏览器代理\n- room_id: 房间号\n- user_unique_id: 用户唯一ID\n### 返回:\n- 弹幕xb签名\n\n# [English]\n### Purpose:\n- Generate danmu xb signature\n### Parameters:\n- user_agent: User browser agent\n- room_id: Room ID\n- user_unique_id: User unique ID\n### Return:\n- Danmu xb signature\n\n# [示例/Example]\nuser_agent = \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0\"\nroom_id = \"7382517534467115826\"\nuser_unique_id = \"7382524529011246630\"",
-  "params": [
-   {
-    "name": "user_agent",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "用户浏览器代理/User browser agent"
-   },
-   {
-    "name": "room_id",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "房间号/Room ID"
-   },
-   {
-    "name": "user_unique_id",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "用户唯一ID/User unique ID"
-   }
-  ]
- },
- {
   "name": "douyin_web_generate_x_bogus",
   "method": "POST",
   "path": "/api/v1/douyin/web/generate_x_bogus",
   "tag": "Douyin-Web-API",
   "platform": "douyin",
   "summary": "使用接口网址生成X-Bogus参数/Generate X-Bogus parameter using API URL",
-  "description": "# [中文]\n### 用途:\n- 使用接口网址生成X-Bogus参数\n### 参数:\n- url: 接口网址\n\n# [English]\n### Purpose:\n- Generate X-Bogus parameter using API URL\n### Parameters:\n- url: API URL\n\n# [示例/Example]\n\n```json\n{\n\"url\": \"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=7148736076176215311\u0026device_platform=webapp\u0026aid=6383\u0026channel=channel_pc_web\u0026pc_client_type=1\u0026version_code=170400\u0026version_name=17.4.0\u0026cookie_enabled=true\u0026screen_width=1920\u0026screen_height=1080\u0026browser_language=zh-CN\u0026browser_platform=Win32\u0026browser_name=Edge\u0026browser_version=117.0.2045.47\u0026browser_online=true\u0026engine_name=Blink\u0026engine_version=117.0.0.0\u0026os_na…",
+  "description": "# [中文]\n### 用途:\n- 使用接口网址生成X-Bogus参数\n### 参数:\n- url: 接口网址\n\n# [English]\n### Purpose:\n- Generate X-Bogus parameter using API URL\n### Parameters:\n- url: API URL\n\n# [示例/Example]\n\n```json\n{\n\"url\": \"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=7148736076176215311&device_platform=webapp&aid=6383&channel=channel_pc_web&pc_client_type=1&version_code=170400&version_name=17.4.0&cookie_enabled=true&screen_width=1920&screen_height=1080&browser_language=zh-CN&browser_platform=Win32&browser_name=Edge&browser_version=117.0.2045.47&browser_online=true&engine_name=Blink&engine_version=117.0.0.0&os_na…",
   "params": [
    {
     "name": "url",
@@ -8142,7 +8029,7 @@
   "tag": "Douyin-Web-API",
   "platform": "douyin",
   "summary": "提取列表作品id/Extract list video id",
-  "description": "# [中文]\n ### 用途:\n - 提取列表作品id（最多支持20个链接）\n ### 参数:\n - url: 作品链接列表\n ### 返回:\n - 作品id列表\n\n # [English]\n ### Purpose:\n - Extract list video id (supports up to 20 links)\n ### Parameters:\n - url: Video link list\n ### Return:\n - Video id list\n\n # [示例/Example]\n ```json\n {\n\"urls\":[\n    \"0.53 02/26 I@v.sE Fus:/ 你别太帅了郑润泽# 现场版live # 音乐节 # 郑润泽  https://v.douyin.com/iRNBho6u/ 复制此链接，打开Dou音搜索，直接观看视频!\",\n    \"https://v.douyin.com/iRNBho6u/\",\n    \"https://www.iesdouyin.com/share/video/7298145681699622182/?region=CN\u0026mid=7298145762238565171\u0026u_code=l1j9bkbd\u0026did=MS4wLjABAAAAtqpCx0hpOERbdSzQdjRZw-wFPxaqdbAzsKDmbJMUI3KWlM…"
+  "description": "# [中文]\n ### 用途:\n - 提取列表作品id（最多支持20个链接）\n ### 参数:\n - url: 作品链接列表\n ### 返回:\n - 作品id列表\n\n # [English]\n ### Purpose:\n - Extract list video id (supports up to 20 links)\n ### Parameters:\n - url: Video link list\n ### Return:\n - Video id list\n\n # [示例/Example]\n ```json\n {\n\"urls\":[\n    \"0.53 02/26 I@v.sE Fus:/ 你别太帅了郑润泽# 现场版live # 音乐节 # 郑润泽  https://v.douyin.com/iRNBho6u/ 复制此链接，打开Dou音搜索，直接观看视频!\",\n    \"https://v.douyin.com/iRNBho6u/\",\n    \"https://www.iesdouyin.com/share/video/7298145681699622182/?region=CN&mid=7298145762238565171&u_code=l1j9bkbd&did=MS4wLjABAAAAtqpCx0hpOERbdSzQdjRZw-wFPxaqdbAzsKDmbJMUI3KWlM…"
  },
  {
   "name": "douyin_web_get_all_sec_user_id",
@@ -8160,7 +8047,7 @@
   "tag": "Douyin-Web-API",
   "platform": "douyin",
   "summary": "提取列表直播间号/Extract list webcast id",
-  "description": "# [中文]\n### 用途:\n- 提取列表直播间号\n### 参数:\n- url: 直播间链接列表（最多支持20个链接）\n### 返回:\n- 直播间号列表\n\n# [English]\n### Purpose:\n- Extract list webcast id\n### Parameters:\n- url: Room link list (supports up to 20 links)\n### Return:\n- Room id list\n\n# [示例/Example]\n```json\n{\n  \"urls\": [\n        \"https://live.douyin.com/775841227732\",\n        \"https://live.douyin.com/775841227732?room_id=7318296342189919011\u0026enter_from_merge=web_share_link\u0026enter_method=web_share_link\u0026previous_page=app_code_link\",\n        'https://webcast.amemv.com/douyin/webcast/reflow/7318296342189919011?u_code=l1j9bkbd\u0026did=MS4wLjABAAAAEs86TBQPNwAo-RGrcxWyC…"
+  "description": "# [中文]\n### 用途:\n- 提取列表直播间号\n### 参数:\n- url: 直播间链接列表（最多支持20个链接）\n### 返回:\n- 直播间号列表\n\n# [English]\n### Purpose:\n- Extract list webcast id\n### Parameters:\n- url: Room link list (supports up to 20 links)\n### Return:\n- Room id list\n\n# [示例/Example]\n```json\n{\n  \"urls\": [\n        \"https://live.douyin.com/775841227732\",\n        \"https://live.douyin.com/775841227732?room_id=7318296342189919011&enter_from_merge=web_share_link&enter_method=web_share_link&previous_page=app_code_link\",\n        'https://webcast.amemv.com/douyin/webcast/reflow/7318296342189919011?u_code=l1j9bkbd&did=MS4wLjABAAAAEs86TBQPNwAo-RGrcxWyC…"
  },
  {
   "name": "douyin_web_get_aweme_id",
@@ -8353,38 +8240,6 @@
     "required": true,
     "type": "string",
     "desc": "用户的kolId/User kolId"
-   }
-  ]
- },
- {
-  "name": "douyin_xingtu_get_sign_image",
-  "method": "GET",
-  "path": "/api/v1/douyin/xingtu/get_sign_image",
-  "tag": "Douyin-Xingtu-API",
-  "platform": "douyin",
-  "summary": "获取加密图片解析/Get Sign Image",
-  "description": "# [中文]\n### 用途:\n- 解析星图加密图片，获取可访问的图片URL\n- 价格：0.001$ / 次\n### 参数:\n- uri: 图片的uri，通常从其他星图接口返回的数据中获取\n    - 例如：`tos-cn-i-0813c000-ce/oMKzDA3A9QGAuebfsDIAwlDoAfCFEEzSEw8FQZ`\n- durationTS: 有效期时长（秒），默认86400（24小时）\n- format: 图片格式，默认webp，支持：webp、jpg、png等\n### 返回:\n- 解析后的图片数据，包含可访问的图片URL\n\n# [English]\n### Purpose:\n- Parse encrypted XingTu image and get accessible image URL\n- Price: 0.001$ / time\n### Parameters:\n- uri: Image URI, usually obtained from other XingTu API responses\n    - Example: `tos-cn-i-0813c000-ce/oMKzDA3A9QGAuebfsDIAwlDoAfCFEEzSEw8FQZ`\n- durationTS: Duration in seconds, default 86400 (24 hours)…",
-  "params": [
-   {
-    "name": "uri",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "图片的uri/Image URI"
-   },
-   {
-    "name": "durationTS",
-    "in": "query",
-    "type": "integer",
-    "desc": "有效期时长（秒）/Duration in seconds",
-    "default": 86400
-   },
-   {
-    "name": "format",
-    "in": "query",
-    "type": "string",
-    "desc": "图片格式/Image format",
-    "default": "webp"
    }
   ]
  },
@@ -13195,7 +13050,7 @@
   "tag": "Kuaishou-Web-API",
   "platform": "kuaishou",
   "summary": "获取用户ID/Fetch user ID",
-  "description": "# [中文]\n### 用途:\n- 通过用户分享链接获取用户ID\n### 参数:\n- share_link: 用户分享链接\n### 返回:\n- 用户ID\n\n# [English]\n### Purpose:\n- Fetch user ID via user share link\n### Parameters:\n- share_link: User share link\n### Returns:\n- User ID\n\n# [示例/Example]\nshare_link = \"https://v.kuaishou.com/KcdKDwFp\"\n\nshare_link = \"https://c.kuaishou.com/fw/user/3xcuu5habgc8z29\"\n\nshare_link = \"https://live.kuaishou.com/profile/3xcuu5habgc8z29?fid=2357689552\u0026cc=share_copylink\"\n\n# [返回示例/Example Response]\n```json\n```",
+  "description": "# [中文]\n### 用途:\n- 通过用户分享链接获取用户ID\n### 参数:\n- share_link: 用户分享链接\n### 返回:\n- 用户ID\n\n# [English]\n### Purpose:\n- Fetch user ID via user share link\n### Parameters:\n- share_link: User share link\n### Returns:\n- User ID\n\n# [示例/Example]\nshare_link = \"https://v.kuaishou.com/KcdKDwFp\"\n\nshare_link = \"https://c.kuaishou.com/fw/user/3xcuu5habgc8z29\"\n\nshare_link = \"https://live.kuaishou.com/profile/3xcuu5habgc8z29?fid=2357689552&cc=share_copylink\"\n\n# [返回示例/Example Response]\n```json\n```",
   "params": [
    {
     "name": "share_link",
@@ -13557,7 +13412,7 @@
   "tag": "Lemon8-App-API",
   "platform": "lemon8",
   "summary": "获取话题信息/Get topic information",
-  "description": "# [中文]\n### 用途:\n- 获取话题信息\n### 参数:\n- forum_id: 话题ID，可以从下面的接口获取\n    - 获取指定作品的信息：`/lemon8/app/fetch_post_detail`\n    - 获取发现页的 Editor's Picks：`/lemon8/app/fetch_discover_tab_information_tabs`\n    - 通过接口搜索 Hashtag：`/lemon8/app/fetch_search?search_tab=hashtag\u0026keyword=lemon8`\n### 返回:\n- 话题信息\n\n# [English]\n### Purpose:\n- Get topic information\n### Parameters:\n- forum_id: Topic ID, can be obtained from the following interfaces\n    - Get information of specified post: `/lemon8/app/fetch_post_detail`\n    - Get Editor's Picks of discover page: `/lemon8/app/fetch_discover_tab_information_tabs`\n    - Search Hash…",
+  "description": "# [中文]\n### 用途:\n- 获取话题信息\n### 参数:\n- forum_id: 话题ID，可以从下面的接口获取\n    - 获取指定作品的信息：`/lemon8/app/fetch_post_detail`\n    - 获取发现页的 Editor's Picks：`/lemon8/app/fetch_discover_tab_information_tabs`\n    - 通过接口搜索 Hashtag：`/lemon8/app/fetch_search?search_tab=hashtag&keyword=lemon8`\n### 返回:\n- 话题信息\n\n# [English]\n### Purpose:\n- Get topic information\n### Parameters:\n- forum_id: Topic ID, can be obtained from the following interfaces\n    - Get information of specified post: `/lemon8/app/fetch_post_detail`\n    - Get Editor's Picks of discover page: `/lemon8/app/fetch_discover_tab_information_tabs`\n    - Search Hash…",
   "params": [
    {
     "name": "forum_id",
@@ -15250,7 +15105,7 @@
   "tag": "LinkedIn-Web-V2-API",
   "platform": "linkedin",
   "summary": "按搜索 URL 抓取职位/Search jobs by URL",
-  "description": "# [中文]\n### 用途:\n- 解析 LinkedIn 职位搜索 URL 中的过滤条件并返回职位列表。\n\n### 参数:\n- url: LinkedIn 职位搜索 URL（/jobs/search?... 或 /jobs/\u003ccompany\u003e-jobs?f_C=...）。\n- count: 返回数量。\n\n### 返回:\n- { query, count, jobs: [...] }\n\n# [English]\n### Purpose:\n- Resolve a LinkedIn job-search URL's filters and return matching jobs.\n\n# [示例/Example]\nurl = \"https://www.linkedin.com/jobs/search?keywords=Software\u0026location=Tel%20Aviv-Yafo\u0026geoId=101570771\"",
+  "description": "# [中文]\n### 用途:\n- 解析 LinkedIn 职位搜索 URL 中的过滤条件并返回职位列表。\n\n### 参数:\n- url: LinkedIn 职位搜索 URL（/jobs/search?... 或 /jobs/<company>-jobs?f_C=...）。\n- count: 返回数量。\n\n### 返回:\n- { query, count, jobs: [...] }\n\n# [English]\n### Purpose:\n- Resolve a LinkedIn job-search URL's filters and return matching jobs.\n\n# [示例/Example]\nurl = \"https://www.linkedin.com/jobs/search?keywords=Software&location=Tel%20Aviv-Yafo&geoId=101570771\"",
   "params": [
    {
     "name": "url",
@@ -15661,7 +15516,7 @@
   "tag": "Reddit-APP-API",
   "platform": "reddit",
   "summary": "获取Reddit APP评论回复（二级评论）/Fetch Reddit APP Comment Replies (Sub-comments)",
-  "description": "# [中文]\n### 用途:\n- 获取Reddit APP指定评论下的回复（二级评论/子评论）\n- 当评论节点有 more.cursor 字段时，使用此接口获取该评论的子评论\n### 参数:\n- post_id: 帖子ID，格式如 \"t3_XXXXXX\"\n- cursor: 评论游标，从评论数据的 more.cursor 字段获取，格式如 \"commenttree:ex:(xxx)\"\n- sort_type: 排序方式，支持CONFIDENCE, NEW, TOP, HOT, CONTROVERSIAL, OLD, RANDOM\n### 返回:\n- 指定评论下的回复JSON数据，包含：\n  - 子评论列表\n  - 每个子评论的详细信息（内容、作者、点赞数等）\n  - 分页信息\n### 使用步骤:\n1. 先调用 fetch_post_comments 获取帖子的一级评论\n2. 在返回数据中找到有子评论的节点（childCount \u003e 0）\n3. 获取该节点的 more.cursor 值\n4. 使用该 cursor 调用本接口获取子评论\n### 注意:\n- cursor 值来自评论数据的 more.cursor 字段\n- 路径示例: $.data.postInfoById.commentForest.trees[*].more.cursor\n- cursor 格式类似: \"commen…",
+  "description": "# [中文]\n### 用途:\n- 获取Reddit APP指定评论下的回复（二级评论/子评论）\n- 当评论节点有 more.cursor 字段时，使用此接口获取该评论的子评论\n### 参数:\n- post_id: 帖子ID，格式如 \"t3_XXXXXX\"\n- cursor: 评论游标，从评论数据的 more.cursor 字段获取，格式如 \"commenttree:ex:(xxx)\"\n- sort_type: 排序方式，支持CONFIDENCE, NEW, TOP, HOT, CONTROVERSIAL, OLD, RANDOM\n### 返回:\n- 指定评论下的回复JSON数据，包含：\n  - 子评论列表\n  - 每个子评论的详细信息（内容、作者、点赞数等）\n  - 分页信息\n### 使用步骤:\n1. 先调用 fetch_post_comments 获取帖子的一级评论\n2. 在返回数据中找到有子评论的节点（childCount > 0）\n3. 获取该节点的 more.cursor 值\n4. 使用该 cursor 调用本接口获取子评论\n### 注意:\n- cursor 值来自评论数据的 more.cursor 字段\n- 路径示例: $.data.postInfoById.commentForest.trees[*].more.cursor\n- cursor 格式类似: \"commen…",
   "params": [
    {
     "name": "post_id",
@@ -16645,7 +16500,7 @@
   "tag": "Telegram-Web-API",
   "platform": "telegram",
   "summary": "获取频道消息(分页)/Get channel posts (paginated)",
-  "description": "# [中文]\n### 用途:\n- 抓取公开频道最近的消息列表（含文本、图片、视频、转发、回复、链接卡、表态、阅读量、时间）。\n\n### 参数:\n- channel: 频道用户名（必填）。\n- limit: 返回条数（1-100，默认 20；\u003e20 时服务端会自动向更老方向翻页累积）。\n- before: 翻页游标 —— 取「更老」的消息，回传上一页响应里的 `data.pagination.before_cursor`。\n- after: 翻页游标 —— 取「更新」的消息，回传上一页响应里的 `data.pagination.after_cursor`。\n\n### 返回:\n- `channel_info`（结构同 fetch_channel_info）、`messages` 数组、`pagination` 游标对象。\n- 媒体直链（cdn4.telesco.pe）带签名且会过期，请尽快下载/转存。\n\n# [English]\n### Purpose:\n- Fetch a public channel's recent posts (text, photos, videos, forwards, replies, link previews, reactions, views, time).\n\n### Parameters:\n- channel: Channel username (r…",
+  "description": "# [中文]\n### 用途:\n- 抓取公开频道最近的消息列表（含文本、图片、视频、转发、回复、链接卡、表态、阅读量、时间）。\n\n### 参数:\n- channel: 频道用户名（必填）。\n- limit: 返回条数（1-100，默认 20；>20 时服务端会自动向更老方向翻页累积）。\n- before: 翻页游标 —— 取「更老」的消息，回传上一页响应里的 `data.pagination.before_cursor`。\n- after: 翻页游标 —— 取「更新」的消息，回传上一页响应里的 `data.pagination.after_cursor`。\n\n### 返回:\n- `channel_info`（结构同 fetch_channel_info）、`messages` 数组、`pagination` 游标对象。\n- 媒体直链（cdn4.telesco.pe）带签名且会过期，请尽快下载/转存。\n\n# [English]\n### Purpose:\n- Fetch a public channel's recent posts (text, photos, videos, forwards, replies, link previews, reactions, views, time).\n\n### Parameters:\n- channel: Channel username (r…",
   "params": [
    {
     "name": "channel",
@@ -17498,68 +17353,6 @@
   ]
  },
  {
-  "name": "tiktok_app_v3_TTencrypt_algorithm",
-  "method": "POST",
-  "path": "/api/v1/tiktok/app/v3/TTencrypt_algorithm",
-  "tag": "TikTok-App-V3-API",
-  "platform": "tiktok",
-  "summary": "TikTok APP加密算法/TikTok APP encryption algorithm",
-  "description": "# [中文]\n### 用途:\n- TikTok APP加密算法，用于生成请求头中的加密参数。\n- 生成的加密参数列表：\n    - `x-ladon`\n    - `x-khronos`\n    - `x-argus`\n    - `x-gorgon` （8404）\n\n### 参数:\n- url: 需要加密的完整URL\n- data: 如果接口是POST请求，请填写POST请求的数据参与加密计算，GET请求时传入空字符串即可。\n- device_info: 设备信息，可选参数，如果不填写则使用默认设备信息，设备信息会修改传入的URL中的参数。\n\n### 返回:\n- 加密参数列表\n\n# [English]\n### Purpose:\n- TikTok APP encryption algorithm, used to generate encrypted parameters in the request header.\n- The generated encrypted parameter list:\n    - `x-ladon`\n    - `x-khronos`\n    - `x-argus`\n    - `x-gorgon` (8404)\n\n### Parameters:\n- url: Full URL to be encrypted\n- data: If the inter…",
-  "params": [
-   {
-    "name": "data",
-    "in": "body",
-    "type": "string",
-    "desc": "如果有POST请求，请填写POST请求的数据参与加密计算/If there is a POST request, please fill in the data of the POST request to participate in the encryption calculation",
-    "default": ""
-   },
-   {
-    "name": "device_info",
-    "in": "body",
-    "type": "object",
-    "desc": "设备信息，可选参数，如果不填写则使用默认设备信息/Device information, optional parameter, if not filled in, the default device information is used",
-    "default": {
-     "aid": "1233",
-     "cdid": "b820f79c-c74a-47b0-912f-ee3002ce60dc",
-     "channel": "googleplay",
-     "cookies": {},
-     "device_brand": "HONOR",
-     "device_id": "7423364899755607598",
-     "device_manufacturer": "HUAWEI",
-     "device_model": "HONOR V30",
-     "device_platform": "android",
-     "device_type": "OXF-AN00",
-     "dpi": 480,
-     "host_abi": "arm64-v8a",
-     "iid": "7423365134775469866",
-     "lanusk": "",
-     "manifest_version_code": "2023604040",
-     "mc": "7E:EE:BA:BC:5E:40",
-     "mssdk_token": "",
-     "openudid": "63401ab5140125d1",
-     "os_api": 29,
-     "os_version": "10",
-     "resolution": "2400*1080",
-     "rom": "11.0.0.185C00",
-     "rom_version": "OXF-AN00-user 11.0.0 HUAWEIOXF-AN00 185-CHN-LGRP3 release-keys",
-     "server_time": 1728386909,
-     "ua": "com.zhiliaoapp.musically/2023604040 (Linux; U; Android 10; zh_CN; OXF-AN00; Build/185-CHN-LGRP3;tt-ok/3.12.13.4-tiktok)",
-     "update_version_code": "2023604040",
-     "uuid": "350244698061054",
-     "version_code": "360404",
-     "version_name": "36.4.4"
-    }
-   },
-   {
-    "name": "url",
-    "in": "body",
-    "type": "string",
-    "desc": "需要加密的URL/URL to be encrypted",
-    "default": "https://api16-normal-useast5.tiktokv.us/tiktok/v1/upvote/item/list?user_id=6726034365602628610\u0026offset=0\u0026count=21\u0026scene=0\u0026iid=7425045478163400491\u0026device_id=7349721034012280362\u0026ac=WIFI\u0026channel=googleplay\u0026aid=1233\u0026app_name=musical_ly\u0026version_code=360704\u0026version_name=36.7.4\u0026device_platform=android\u0026os=android\u0026ab_version=36.7.4\u0026ssmix=a\u0026device_type=Pixel+6+Pro\u0026device_brand=google\u0026language=zh\u0026os_api=33\u0026os_version=13\u0026openudid=711192517a8bbf03\u0026manifest_version_code=2023607040\u0026resolution=1440*2891\u0026dpi=560\u0026update_version_code=2023607040\u0026_rticket=1728977220468\u0026is_pad=0\u0026app_type=normal\u0026sys_region=CN\u0026last_install_time=1728977141\u0026timezone_name=America%2FLos_Angeles\u0026app_language=zh-Hans\u0026ac2=wifi5g\u0026uoo=0\u0026op_region=CN\u0026timezone_offset=-28800\u0026build_number=36.7.4\u0026host_abi=arm64-v8a\u0026locale=zh-Hans\u0026region=CN\u0026content_language=en%2C\u0026ts=1728977220\u0026cdid=aa21524b-8633-49ca-8e6e-3275fe1672db"
-   }
-  ]
- },
- {
   "name": "tiktok_app_v3_check_live_room_online",
   "method": "GET",
   "path": "/api/v1/tiktok/app/v3/check_live_room_online",
@@ -17596,38 +17389,6 @@
      "7494514925034113835",
      "7494520590523517739"
     ]
-   }
-  ]
- },
- {
-  "name": "tiktok_app_v3_encrypt_decrypt_login_request",
-  "method": "POST",
-  "path": "/api/v1/tiktok/app/v3/encrypt_decrypt_login_request",
-  "tag": "TikTok-App-V3-API",
-  "platform": "tiktok",
-  "summary": "加密或解密 TikTok APP 登录请求体/Encrypt or Decrypt TikTok APP login request body",
-  "description": "# [中文]\n### 用途:\n- 加密/解密 TikTok APP 登录请求体，用于登录接口的请求体加密和解密。\n### 参数:\n- username: 用户名，可以是密文或明文。\n- password: 密码，可以是密文或明文。\n- mode: 模式\n    - `encrypt`: 加密\n    - `decrypt`: 解密\n### 返回:\n- 加密/解密后的请求体\n\n# [English]\n### Purpose:\n- Encrypt/decrypt the TikTok APP login request body, used for encrypting and decrypting the request body of the login interface.\n### Parameters:\n- username: Username, can be ciphertext or plaintext.\n- password: Password, can be ciphertext or plaintext.\n- mode: Mode\n    - `encrypt`: Encrypt\n    - `decrypt`: Decrypt\n### Return:\n- Encrypted/decrypted request body\n\n# [示例/Example]\n```json…",
-  "params": [
-   {
-    "name": "mode",
-    "in": "body",
-    "type": "string",
-    "desc": "Encrypt or decrypt the input string",
-    "default": "encrypt"
-   },
-   {
-    "name": "password",
-    "in": "body",
-    "type": "string",
-    "desc": "Plaintext or encrypted password",
-    "default": "example_password"
-   },
-   {
-    "name": "username",
-    "in": "body",
-    "type": "string",
-    "desc": "Plaintext or encrypted username",
-    "default": "example_username"
    }
   ]
  },
@@ -19244,7 +19005,7 @@
   "tag": "TikTok-App-V3-API",
   "platform": "tiktok",
   "summary": "获取用户主页作品数据 V1/Get user homepage video data V1",
-  "description": "# [中文]\n### 用途:\n- 获取用户主页作品数据\n### 参数:\n- sec_user_id: 用户sec_user_id，优先使用sec_user_id获取用户作品数据，如果sec_user_id为空，则使用unique_id获取用户作品数据。\n- max_cursor: 最大游标，用于翻页，第一页为0，第二页为第一次响应中的max_cursor值。\n- count: 最大数量，建议保持默认值20。\n- sort_type: 排序类型，0-最新，1-热门\n- unique_id: 用户unique_id，可选参数，如果sec_user_id为空，则使用unique_id获取用户作品数据，unique_id也是用户的用户名。\n- 关于用户ID的参数，优先级为sec_user_id \u003e unique_id，优先级越高速度越快，并且建议只使用sec_user_id获取用户数据。\n- region: 国家地区，可选参数，如果不传则默认使用美国地区数据，传递后会优先获取对应国家地区的数据，例如：US、GB、FR、CN、JP、SG、VN等。\n### 返回:\n- 用户作品数据\n\n# [English]\n### Purpose:\n- Get user homepage video data\n### Parameters:\n- sec_user_id: User sec_user_id, u…",
+  "description": "# [中文]\n### 用途:\n- 获取用户主页作品数据\n### 参数:\n- sec_user_id: 用户sec_user_id，优先使用sec_user_id获取用户作品数据，如果sec_user_id为空，则使用unique_id获取用户作品数据。\n- max_cursor: 最大游标，用于翻页，第一页为0，第二页为第一次响应中的max_cursor值。\n- count: 最大数量，建议保持默认值20。\n- sort_type: 排序类型，0-最新，1-热门\n- unique_id: 用户unique_id，可选参数，如果sec_user_id为空，则使用unique_id获取用户作品数据，unique_id也是用户的用户名。\n- 关于用户ID的参数，优先级为sec_user_id > unique_id，优先级越高速度越快，并且建议只使用sec_user_id获取用户数据。\n- region: 国家地区，可选参数，如果不传则默认使用美国地区数据，传递后会优先获取对应国家地区的数据，例如：US、GB、FR、CN、JP、SG、VN等。\n### 返回:\n- 用户作品数据\n\n# [English]\n### Purpose:\n- Get user homepage video data\n### Parameters:\n- sec_user_id: User sec_user_id, u…",
   "params": [
    {
     "name": "sec_user_id",
@@ -19297,7 +19058,7 @@
   "tag": "TikTok-App-V3-API",
   "platform": "tiktok",
   "summary": "获取用户主页作品数据 V2/Get user homepage video data V2",
-  "description": "# [中文]\n### 用途:\n- 获取用户主页作品数据\n### 参数:\n- sec_user_id: 用户sec_user_id，优先使用sec_user_id获取用户作品数据，如果sec_user_id为空，则使用unique_id获取用户作品数据。\n- max_cursor: 最大游标，用于翻页，第一页为0，第二页为第一次响应中的max_cursor值。\n- count: 最大数量，建议保持默认值20。\n- sort_type: 排序类型，0-最新，1-热门\n- unique_id: 用户unique_id，可选参数，如果sec_user_id为空，则使用unique_id获取用户作品数据，unique_id也是用户的用户名。\n- 关于用户ID的参数，优先级为sec_user_id \u003e unique_id，优先级越高速度越快，并且建议只使用sec_user_id获取用户数据。\n### 返回:\n- 用户作品数据\n\n# [English]\n### Purpose:\n- Get user homepage video data\n### Parameters:\n- sec_user_id: User sec_user_id, use sec_user_id to get user video data first, if sec_user_id is empty, use unique…",
+  "description": "# [中文]\n### 用途:\n- 获取用户主页作品数据\n### 参数:\n- sec_user_id: 用户sec_user_id，优先使用sec_user_id获取用户作品数据，如果sec_user_id为空，则使用unique_id获取用户作品数据。\n- max_cursor: 最大游标，用于翻页，第一页为0，第二页为第一次响应中的max_cursor值。\n- count: 最大数量，建议保持默认值20。\n- sort_type: 排序类型，0-最新，1-热门\n- unique_id: 用户unique_id，可选参数，如果sec_user_id为空，则使用unique_id获取用户作品数据，unique_id也是用户的用户名。\n- 关于用户ID的参数，优先级为sec_user_id > unique_id，优先级越高速度越快，并且建议只使用sec_user_id获取用户数据。\n### 返回:\n- 用户作品数据\n\n# [English]\n### Purpose:\n- Get user homepage video data\n### Parameters:\n- sec_user_id: User sec_user_id, use sec_user_id to get user video data first, if sec_user_id is empty, use unique…",
   "params": [
    {
     "name": "sec_user_id",
@@ -19343,7 +19104,7 @@
   "tag": "TikTok-App-V3-API",
   "platform": "tiktok",
   "summary": "获取用户主页作品数据 V3（精简数据-更快速）/Get user homepage video data V3 (simplified data - faster)",
-  "description": "# [中文]\n### 用途:\n- 获取用户主页作品数据\n### 参数:\n- sec_user_id: 用户sec_user_id，优先使用sec_user_id获取用户作品数据，如果sec_user_id为空，则使用unique_id获取用户作品数据。\n- max_cursor: 最大游标，用于翻页，第一页为0，第二页为第一次响应中的max_cursor值。\n- count: 最大数量，建议保持默认值20。\n- sort_type: 排序类型，0-最新，1-热门\n- unique_id: 用户unique_id，可选参数，如果sec_user_id为空，则使用unique_id获取用户作品数据，unique_id也是用户的用户名。\n- 关于用户ID的参数，优先级为sec_user_id \u003e unique_id，优先级越高速度越快，并且建议只使用sec_user_id获取用户数据。\n### 返回:\n- 用户作品数据\n\n# [English]\n### Purpose:\n- Get user homepage video data\n### Parameters:\n- sec_user_id: User sec_user_id, use sec_user_id to get user video data first, if sec_user_id is empty, use unique…",
+  "description": "# [中文]\n### 用途:\n- 获取用户主页作品数据\n### 参数:\n- sec_user_id: 用户sec_user_id，优先使用sec_user_id获取用户作品数据，如果sec_user_id为空，则使用unique_id获取用户作品数据。\n- max_cursor: 最大游标，用于翻页，第一页为0，第二页为第一次响应中的max_cursor值。\n- count: 最大数量，建议保持默认值20。\n- sort_type: 排序类型，0-最新，1-热门\n- unique_id: 用户unique_id，可选参数，如果sec_user_id为空，则使用unique_id获取用户作品数据，unique_id也是用户的用户名。\n- 关于用户ID的参数，优先级为sec_user_id > unique_id，优先级越高速度越快，并且建议只使用sec_user_id获取用户数据。\n### 返回:\n- 用户作品数据\n\n# [English]\n### Purpose:\n- Get user homepage video data\n### Parameters:\n- sec_user_id: User sec_user_id, use sec_user_id to get user video data first, if sec_user_id is empty, use unique…",
   "params": [
    {
     "name": "sec_user_id",
@@ -19598,7 +19359,7 @@
   "tag": "TikTok-App-V3-API",
   "platform": "tiktok",
   "summary": "获取指定 Webcast 用户的信息/Get information of specified Webcast user",
-  "description": "# [中文]\n### 用途:\n- 获取指定用户的信息\n### 参数:\n- sec_user_id: 用户sec_user_id，优先使用sec_user_id获取用户信息。\n- user_id: 用户uid，可选参数，纯数字，如果使用请保持sec_user_id以及unique_id为空。\n- 以上参数必须至少填写一个，优先级为sec_user_id \u003e user_id，优先级越高速度越快。\n### 返回:\n- 用户信息\n\n# [English]\n### Purpose:\n- Get information of specified user\n### Parameters:\n- sec_user_id: User sec_user_id\n- user_id: User uid, optional parameter, pure number, if used, please keep sec_user_id and unique_id empty.\n- At least one of the above parameters must be filled in, the priority is sec_user_id \u003e user_id, the higher the priority, the faster the speed.\n### Return:\n- User inform…",
+  "description": "# [中文]\n### 用途:\n- 获取指定用户的信息\n### 参数:\n- sec_user_id: 用户sec_user_id，优先使用sec_user_id获取用户信息。\n- user_id: 用户uid，可选参数，纯数字，如果使用请保持sec_user_id以及unique_id为空。\n- 以上参数必须至少填写一个，优先级为sec_user_id > user_id，优先级越高速度越快。\n### 返回:\n- 用户信息\n\n# [English]\n### Purpose:\n- Get information of specified user\n### Parameters:\n- sec_user_id: User sec_user_id\n- user_id: User uid, optional parameter, pure number, if used, please keep sec_user_id and unique_id empty.\n- At least one of the above parameters must be filled in, the priority is sec_user_id > user_id, the higher the priority, the faster the speed.\n### Return:\n- User inform…",
   "params": [
    {
     "name": "user_id",
@@ -19641,7 +19402,7 @@
   "tag": "TikTok-App-V3-API",
   "platform": "tiktok",
   "summary": "获取指定用户的信息/Get information of specified user",
-  "description": "# [中文]\n### 用途:\n- 获取指定用户的信息\n### 参数:\n- sec_user_id: 用户sec_user_id，优先使用sec_user_id获取用户信息。\n- user_id: 用户uid，可选参数，纯数字，如果使用请保持sec_user_id以及unique_id为空。\n- unique_id: 用户unique_id，可选参数，如果sec_user_id为空，则使用unique_id获取用户信息，unique_id也是用户的用户名，如果使用请保持sec_user_id以及user_id为空。\n- 以上参数必须至少填写一个，优先级为sec_user_id \u003e user_id \u003e unique_id，优先级越高速度越快。\n### 返回:\n- 用户信息\n\n# [English]\n### Purpose:\n- Get information of specified user\n### Parameters:\n- sec_user_id: User sec_user_id\n- user_id: User uid, optional parameter, pure number, if used, please keep sec_user_id and unique_id empty.\n- unique_id: User unique_id, optional param…",
+  "description": "# [中文]\n### 用途:\n- 获取指定用户的信息\n### 参数:\n- sec_user_id: 用户sec_user_id，优先使用sec_user_id获取用户信息。\n- user_id: 用户uid，可选参数，纯数字，如果使用请保持sec_user_id以及unique_id为空。\n- unique_id: 用户unique_id，可选参数，如果sec_user_id为空，则使用unique_id获取用户信息，unique_id也是用户的用户名，如果使用请保持sec_user_id以及user_id为空。\n- 以上参数必须至少填写一个，优先级为sec_user_id > user_id > unique_id，优先级越高速度越快。\n### 返回:\n- 用户信息\n\n# [English]\n### Purpose:\n- Get information of specified user\n### Parameters:\n- sec_user_id: User sec_user_id\n- user_id: User uid, optional parameter, pure number, if used, please keep sec_user_id and unique_id empty.\n- unique_id: User unique_id, optional param…",
   "params": [
    {
     "name": "user_id",
@@ -20733,42 +20494,6 @@
   ]
  },
  {
-  "name": "tiktok_web_decrypt_strData",
-  "method": "GET",
-  "path": "/api/v1/tiktok/web/decrypt_strData",
-  "tag": "TikTok-Web-API",
-  "platform": "tiktok",
-  "summary": "解密strData/Decrypt strData",
-  "description": "# [中文]\n### 用途:\n- 解密strData指纹数据，用于分析msToken请求中的指纹信息\n### 参数:\n- encrypted_data: 加密后的strData字符串，从浏览器自行抓包获取\n### 返回:\n- 解密后的原始指纹数据，包含浏览器指纹信息和环境信息等。\n\n# [English]\n### Purpose:\n- Decrypt strData fingerprint data to analyze fingerprint info in msToken request\n### Parameters:\n- encrypted_data: Encrypted strData string, obtained from browser packet capture\n### Return:\n- Decrypted raw fingerprint data, including browser fingerprint info and environment info, etc.",
-  "params": [
-   {
-    "name": "encrypted_data",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "加密后的strData字符串/Encrypted strData string"
-   }
-  ]
- },
- {
-  "name": "tiktok_web_encrypt_strData",
-  "method": "GET",
-  "path": "/api/v1/tiktok/web/encrypt_strData",
-  "tag": "TikTok-Web-API",
-  "platform": "tiktok",
-  "summary": "加密strData/Encrypt strData",
-  "description": "# [中文]\n### 用途:\n- 加密strData指纹数据，用于生成msToken请求\n### 参数:\n- data: 原始指纹数据字符串（请先将JSON格式然后转换成字符串进行请求）\n### 返回:\n- 加密后的strData\n\n# [English]\n### Purpose:\n- Encrypt strData fingerprint data for msToken request\n### Parameters:\n- data: Raw fingerprint data string (please convert JSON format to string before requesting)\n### Return:\n- Encrypted strData",
-  "params": [
-   {
-    "name": "data",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "原始指纹数据字符串（JSON格式或字典字符串）/Raw fingerprint data string (JSON format or dict string)"
-   }
-  ]
- },
- {
   "name": "tiktok_web_fetch_batch_check_live_alive",
   "method": "GET",
   "path": "/api/v1/tiktok/web/fetch_batch_check_live_alive",
@@ -21414,24 +21139,6 @@
   ]
  },
  {
-  "name": "tiktok_web_fetch_tiktok_web_guest_cookie",
-  "method": "GET",
-  "path": "/api/v1/tiktok/web/fetch_tiktok_web_guest_cookie",
-  "tag": "TikTok-Web-API",
-  "platform": "tiktok",
-  "summary": "获取游客 Cookie/Get the guest Cookie",
-  "description": "# [中文]\n### 用途:\n- 获取 TikTok Web的游客Cookie\n- 可以用于爬取 TikTok Web 的数据，如用户作品、合辑作品等。\n- 可以固定身份避免部分接口重复数据。\n- 请注意：游客Cookie无法爬取所有数据，有一定的限制。\n- 可以配合开源项目使用此接口实现TikTok Web的数据爬取。\n### 参数:\n- user_agent: 用户浏览器代理\n### 返回:\n- 游客Cookie\n\n# [English]\n### Purpose:\n- Get the guest Cookie of TikTok Web\n- Can be used to crawl data of TikTok Web, such as user videos, mix videos, etc.\n- Can fix identity to avoid duplicate data for some interfaces.\n- Please note: Guest Cookie cannot crawl all data, there are certain restrictions.\n- Can be used with open source projects to implement data crawling of TikTok Web using this interf…",
-  "params": [
-   {
-    "name": "user_agent",
-    "in": "query",
-    "required": true,
-    "type": "string",
-    "desc": "用户浏览器代理/User browser agent"
-   }
-  ]
- },
- {
   "name": "tiktok_web_fetch_trending_searchwords",
   "method": "GET",
   "path": "/api/v1/tiktok/web/fetch_trending_searchwords",
@@ -21837,28 +21544,6 @@
   ]
  },
  {
-  "name": "tiktok_web_generate_real_msToken",
-  "method": "GET",
-  "path": "/api/v1/tiktok/web/generate_real_msToken",
-  "tag": "TikTok-Web-API",
-  "platform": "tiktok",
-  "summary": "生成真实msToken/Generate real msToken",
-  "description": "# [中文]\n### 用途:\n- 生成真实msToken\n### 参数:\n- random_strData: 是否使用随机化的浏览器指纹数据（推荐开启以提高反爬虫能力）\n- browser_type: 指定浏览器类型，可选值:\n    - chrome_windows: Chrome + Windows\n    - chrome_mac: Chrome + macOS\n    - firefox_windows: Firefox + Windows\n    - firefox_mac: Firefox + macOS\n    - 不传则随机选择\n### 返回:\n- 真实msToken\n\n# [English]\n### Purpose:\n- Generate real msToken\n### Parameters:\n- random_strData: Whether to use randomized browser fingerprint data (recommended for better anti-bot)\n- browser_type: Specify browser type, options:\n    - chrome_windows: Chrome + Windows\n    - chrome_mac: Chrome + macOS\n    - firefox_wi…",
-  "params": [
-   {
-    "name": "random_strData",
-    "in": "query",
-    "type": "boolean",
-    "default": false
-   },
-   {
-    "name": "browser_type",
-    "in": "query",
-    "type": "string"
-   }
-  ]
- },
- {
   "name": "tiktok_web_generate_ttwid",
   "method": "GET",
   "path": "/api/v1/tiktok/web/generate_ttwid",
@@ -21922,23 +21607,6 @@
   ]
  },
  {
-  "name": "tiktok_web_generate_wss_xb_signature",
-  "method": "GET",
-  "path": "/api/v1/tiktok/web/generate_wss_xb_signature",
-  "tag": "TikTok-Web-API",
-  "platform": "tiktok",
-  "summary": "生成TikTok WSS X-Bogus签名/Generate TikTok WSS X-Bogus signature",
-  "description": "# [中文]\n### 用途:\n- 生成TikTok直播WSS连接所需的X-Bogus签名\n### 参数:\n- user_agent: 用户浏览器代理（可选，不填则使用默认UA）\n### 返回:\n- x_bogus: WSS X-Bogus签名字符串\n\n# [English]\n### Purpose:\n- Generate X-Bogus signature required for TikTok Live WSS connection\n### Parameters:\n- user_agent: User browser agent (optional, uses default UA if not provided)\n### Return:\n- x_bogus: WSS X-Bogus signature string\n\n# [示例/Example]\nuser_agent = \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0\"",
-  "params": [
-   {
-    "name": "user_agent",
-    "in": "query",
-    "type": "string",
-    "desc": "用户浏览器代理（可选）/User browser agent (optional)"
-   }
-  ]
- },
- {
   "name": "tiktok_web_generate_x_mssdk_info",
   "method": "POST",
   "path": "/api/v1/tiktok/web/generate_x_mssdk_info",
@@ -21962,7 +21630,7 @@
   "tag": "TikTok-Web-API",
   "platform": "tiktok",
   "summary": "生成 XBogus/Generate XBogus",
-  "description": "# [中文]\n### 用途:\n- 生成xbogus\n### 参数:\n- url: 未签名的API URL\n- user_agent: 用户浏览器User-Agent\n### 返回:\n- xbogus\n\n# [English]\n### Purpose:\n- Generate xbogus\n### Parameters:\n- url: Unsigned API URL\n- user_agent: User browser User-Agent\n### Return:\n- xbogus\n\n# [示例/Example]\n\n```json\n{\n    \"url\": \"https://www.tiktok.com/aweme/v1/web/aweme/detail/?aweme_id=7148736076176215311\u0026device_platform=webapp\u0026aid=6383\u0026channel=channel_pc_web\u0026pc_client_type=1\u0026version_code=170400\u0026version_name=17.4.0\u0026cookie_enabled=true\u0026screen_width=1920\u0026screen_height=1080\u0026browser_language=zh-CN\u0026browser_platform=Win32\u0026browser_name=Edge\u0026browse…",
+  "description": "# [中文]\n### 用途:\n- 生成xbogus\n### 参数:\n- url: 未签名的API URL\n- user_agent: 用户浏览器User-Agent\n### 返回:\n- xbogus\n\n# [English]\n### Purpose:\n- Generate xbogus\n### Parameters:\n- url: Unsigned API URL\n- user_agent: User browser User-Agent\n### Return:\n- xbogus\n\n# [示例/Example]\n\n```json\n{\n    \"url\": \"https://www.tiktok.com/aweme/v1/web/aweme/detail/?aweme_id=7148736076176215311&device_platform=webapp&aid=6383&channel=channel_pc_web&pc_client_type=1&version_code=170400&version_name=17.4.0&cookie_enabled=true&screen_width=1920&screen_height=1080&browser_language=zh-CN&browser_platform=Win32&browser_name=Edge&browse…",
   "params": [
    {
     "name": "url",
@@ -22842,7 +22510,7 @@
   "path": "/api/v1/wechat_channels/v2/fetch_user_profile",
   "tag": "WeChat-Channels-V2-API",
   "platform": "wechat",
-  "summary": "获取视频号账号主页资料+统计/Get WeChat Channels User Profile \u0026 Stats",
+  "summary": "获取视频号账号主页资料+统计/Get WeChat Channels User Profile & Stats",
   "description": "# [中文]\n### 用途:\n- 获取创作者的主页资料与互动统计。与 `fetch_channel_info`（认证主体 / 许可证）**互补**：本接口给昵称 / 签名 / 头像、粉丝 / 作品 / 获赞 / 收藏 / 转发数、直播时长、IP 属地、合集数、关联公众号等。\n- 价格：0.01$/次\n- ⏱️ 由于微信服务器原因，本接口响应较慢，请将客户端请求超时（timeout）设置为 30 秒；timeout 设置过小会造成已扣费但收不到响应的情况。\n### 参数:\n- username: 视频号 finder username（`v2_…@finder` 格式）。来源：`fetch_video_detail`、`fetch_user_videos` 响应里视频对象的 `username`；或 `fetch_channel_id_to_username` 把 `sph…` 短号转成 username。示例 `v2_060000231003b20faec8c6e4811dc1d4c602ee30b0771bbcf220c67926bb76ab7702ac335a53@finder`（人民日报）。\n- raw: 可选，默认 True。True=原始响应；False=精简解析结构。\n### 返回:\n- 账号主页资料与互动统计\n\n### 响应结构与 JSON Path:\n#### `r…",
   "params": [
    {
@@ -22939,7 +22607,7 @@
   "tag": "WeChat-Channels-V2-API",
   "platform": "wechat",
   "summary": "获取视频号作品详情/Get WeChat Channels Video Detail",
-  "description": "# [中文]\n### 用途:\n- 获取视频号作品详情，返回作品完整详情（媒体地址 `media` + `decode_key`）。\n- 支持三种入参，**三选一、优先级 object_id \u003e export_id \u003e share_url**。\n- 价格：0.01$/次\n- ⏱️ 由于微信服务器原因，本接口响应较慢，请将客户端请求超时（timeout）设置为 30 秒；timeout 设置过小会造成已扣费但收不到响应的情况。\n- ⚠️ 大整数 ID 精度：响应中的 `id` 等为 64 位大整数，超出 JavaScript 安全整数范围（2^53-1）。请始终以**字符串**方式接收 / 传递这类 ID（解析 JSON 用 json-bigint 或按文本取值），勿让其经过 JS `Number`。Swagger UI 文档页对超大整数会末位舍入显示，属正常现象，不影响接口实际返回的数据。\n### 参数:\n- object_id: 最优先，可选。作品 objectId（纯数字），示例 `14941130915890399732`。可从 `fetch_user_videos` / `fetch_collection_videos` 的视频 `id` 获取。\n- export_id: 其次，可选。搜索结果里的 `exportId`（须以 `export/` 开头）。搜索返回的视频项往往只…",
+  "description": "# [中文]\n### 用途:\n- 获取视频号作品详情，返回作品完整详情（媒体地址 `media` + `decode_key`）。\n- 支持三种入参，**三选一、优先级 object_id > export_id > share_url**。\n- 价格：0.01$/次\n- ⏱️ 由于微信服务器原因，本接口响应较慢，请将客户端请求超时（timeout）设置为 30 秒；timeout 设置过小会造成已扣费但收不到响应的情况。\n- ⚠️ 大整数 ID 精度：响应中的 `id` 等为 64 位大整数，超出 JavaScript 安全整数范围（2^53-1）。请始终以**字符串**方式接收 / 传递这类 ID（解析 JSON 用 json-bigint 或按文本取值），勿让其经过 JS `Number`。Swagger UI 文档页对超大整数会末位舍入显示，属正常现象，不影响接口实际返回的数据。\n### 参数:\n- object_id: 最优先，可选。作品 objectId（纯数字），示例 `14941130915890399732`。可从 `fetch_user_videos` / `fetch_collection_videos` 的视频 `id` 获取。\n- export_id: 其次，可选。搜索结果里的 `exportId`（须以 `export/` 开头）。搜索返回的视频项往往只…",
   "params": [
    {
     "name": "export_id",
@@ -23079,7 +22747,7 @@
   "path": "/api/v1/wechat_mp/v2/fetch_account_services",
   "tag": "WeChat-Media-Platform-V2-API",
   "platform": "wechat",
-  "summary": "获取公众号服务/自定义菜单/Get WeChat MP Account Services \u0026 Custom Menu",
+  "summary": "获取公众号服务/自定义菜单/Get WeChat MP Account Services & Custom Menu",
   "description": "# [中文]\n### 用途:\n- 传 `gh_username`，返回公众号底部的自定义菜单 / 服务入口。未配置自定义菜单的账号返回空菜单。\n- 价格：0.01$/次\n- ⏱️ 由于微信服务器原因，本接口响应较慢，请将客户端请求超时（timeout）设置为 30 秒；timeout 设置过小会造成已扣费但收不到响应的情况。\n### 参数:\n- username: 公众号 `gh_username`（`gh_…`）。示例 `gh_363b924965e9`\n- raw: 可选，默认 True。True=原始；False=精简解析。\n### 返回:\n- 公众号自定义菜单 / 服务入口\n\n### 响应结构与 JSON Path:\n#### `raw=false`（精简解析，snake_case）:\n- 公众号 username: `$.data.biz_username`\n- 菜单项列表（无菜单时为 `[]`）: `$.data.menu[]` —— 每项为菜单按钮（名称 / 类型 / 子菜单 / 跳转），无自定义菜单的账号该数组为空。\n#### `raw=true`（原始，本接口默认）:\n- `data` 为完整原始菜单结构。未配置菜单的账号返回空对象 `{}`。\n- 精简版的 `menu[]` 即由此原始结构提取而来。\n\n# [English]\n### Purpose:\n- Pas…",
   "params": [
    {
@@ -23212,7 +22880,7 @@
   "tag": "WeChat-Media-Platform-V2-API",
   "platform": "wechat",
   "summary": "获取公众号评论的二级回复/Get WeChat MP Comment Replies",
-  "description": "# [中文]\n### 用途:\n- 返回某条一级评论下的二级回复。\n- 链路：先调 `fetch_article_comments` 取到每条评论的 `content_id`，再把它喂给本接口。\n- 价格：0.01$/次\n- ⏱️ 由于微信服务器原因，本接口响应较慢，请将客户端请求超时（timeout）设置为 30 秒；timeout 设置过小会造成已扣费但收不到响应的情况。\n- ⚠️ 大整数 ID 精度：响应中的 `content_id` / `reply_id` 等为 64 位大整数，超出 JavaScript 安全整数范围（2^53-1）。请始终以**字符串**方式接收 / 传递这类 ID（解析 JSON 用 json-bigint 或按文本取值），勿让其经过 JS `Number`。Swagger UI 文档页对超大整数会末位舍入显示，属正常现象，不影响接口实际返回的数据。\n### 参数:\n- url: 公众号文章链接（`https://mp.weixin.qq.com/s/…`）。示例 `http://mp.weixin.qq.com/s?__biz=Mzk3NTA0MzM5NA==\u0026mid=2247483745\u0026idx=1\u0026sn=3f34e768cf457a501038991ed30be1f4#rd`\n- content_id: 可选（纯数字）。目标一级评论的 `cont…",
+  "description": "# [中文]\n### 用途:\n- 返回某条一级评论下的二级回复。\n- 链路：先调 `fetch_article_comments` 取到每条评论的 `content_id`，再把它喂给本接口。\n- 价格：0.01$/次\n- ⏱️ 由于微信服务器原因，本接口响应较慢，请将客户端请求超时（timeout）设置为 30 秒；timeout 设置过小会造成已扣费但收不到响应的情况。\n- ⚠️ 大整数 ID 精度：响应中的 `content_id` / `reply_id` 等为 64 位大整数，超出 JavaScript 安全整数范围（2^53-1）。请始终以**字符串**方式接收 / 传递这类 ID（解析 JSON 用 json-bigint 或按文本取值），勿让其经过 JS `Number`。Swagger UI 文档页对超大整数会末位舍入显示，属正常现象，不影响接口实际返回的数据。\n### 参数:\n- url: 公众号文章链接（`https://mp.weixin.qq.com/s/…`）。示例 `http://mp.weixin.qq.com/s?__biz=Mzk3NTA0MzM5NA==&mid=2247483745&idx=1&sn=3f34e768cf457a501038991ed30be1f4#rd`\n- content_id: 可选（纯数字）。目标一级评论的 `cont…",
   "params": [
    {
     "name": "all_pages",
@@ -23356,7 +23024,7 @@
   "tag": "WeChat-Search-V2-API",
   "platform": "wechat",
   "summary": "搜视频号视频（时长/排序/时间筛选）/WeChat Channels Video Search",
-  "description": "# [中文]\n### 用途:\n- 专搜视频号视频（`video` 垂类），并支持搜索结果页里的「时长」「不限/最新/最热」排序与「时间」下拉。\n- 等价于综合搜索 `/fetch_search`（`business_type=video`）再叠加筛选，筛选项均实测有效。\n- 价格：0.01$/次\n- ⏱️ 由于微信服务器原因，本接口响应较慢，请将客户端请求超时（timeout）设置为 30 秒；timeout 设置过小会造成已扣费但收不到响应的情况。\n- ⚠️ 大整数 ID 精度：响应中的 `docID` / `feedNonceId` 等为 64 位大整数，超出 JavaScript 安全整数范围（2^53-1）。请始终以**字符串**方式接收 / 传递这类 ID（解析 JSON 用 json-bigint 或按文本取值），勿让其经过 JS `Number`。Swagger UI 文档页对超大整数会末位舍入显示，属正常现象，不影响接口实际返回的数据。\n### 参数:\n- keyword: 搜索关键词（去空白后 1-100 字）。示例 `美食`\n- duration: 可选，默认 `all`。时长档（video 垂类专属）—— 不限 `all`/0 / 短(\u003c5min) `short`/1 / 中(5-10min) `medium`/2 / 长(20min+) `long`/3，字…",
+  "description": "# [中文]\n### 用途:\n- 专搜视频号视频（`video` 垂类），并支持搜索结果页里的「时长」「不限/最新/最热」排序与「时间」下拉。\n- 等价于综合搜索 `/fetch_search`（`business_type=video`）再叠加筛选，筛选项均实测有效。\n- 价格：0.01$/次\n- ⏱️ 由于微信服务器原因，本接口响应较慢，请将客户端请求超时（timeout）设置为 30 秒；timeout 设置过小会造成已扣费但收不到响应的情况。\n- ⚠️ 大整数 ID 精度：响应中的 `docID` / `feedNonceId` 等为 64 位大整数，超出 JavaScript 安全整数范围（2^53-1）。请始终以**字符串**方式接收 / 传递这类 ID（解析 JSON 用 json-bigint 或按文本取值），勿让其经过 JS `Number`。Swagger UI 文档页对超大整数会末位舍入显示，属正常现象，不影响接口实际返回的数据。\n### 参数:\n- keyword: 搜索关键词（去空白后 1-100 字）。示例 `美食`\n- duration: 可选，默认 `all`。时长档（video 垂类专属）—— 不限 `all`/0 / 短(<5min) `short`/1 / 中(5-10min) `medium`/2 / 长(20min+) `long`/3，字…",
   "params": [
    {
     "name": "cursor",
@@ -23368,7 +23036,7 @@
     "name": "duration",
     "in": "body",
     "type": "integer",
-    "desc": "时长档（video 垂类专属）：不限 all/0 / 短(\u003c5min) short/1 / 中(5-10min) medium/2 / 长(20min+) long/3，字符串键或整数均可/Duration tier (Channels video only): all/0 / short/1 (\u003c5min) / medium/2 (5-10min) / long/3 (20min+); stri…",
+    "desc": "时长档（video 垂类专属）：不限 all/0 / 短(<5min) short/1 / 中(5-10min) medium/2 / 长(20min+) long/3，字符串键或整数均可/Duration tier (Channels video only): all/0 / short/1 (<5min) / medium/2 (5-10min) / long/3 (20min+); stri…",
     "default": "all"
    },
    {
@@ -24263,7 +23931,7 @@
   "tag": "Weibo-Web-V2-API",
   "platform": "weibo",
   "summary": "获取微博文娱榜单/Get Weibo entertainment ranking",
-  "description": "# [中文]\n### 用途:\n- 获取微博文娱榜单数据（娱乐圈、影视、综艺等）。\n### 参数:\n- 无需额外参数\n### 返回:\n- 文娱话题列表，包含话题、热度值、排名、分类等\n### 注意:\n- 建议缓存5-10分钟\n\n# [English]\n### Purpose:\n- Get Weibo entertainment ranking data (entertainment, film \u0026 TV, variety shows).\n### Parameters:\n- No additional parameters required\n### Return:\n- Entertainment topic list, including topic, heat value, rank, category\n### Note:\n- Recommend caching for 5-10 minutes\n\n# [示例/Example]\n# No parameters needed"
+  "description": "# [中文]\n### 用途:\n- 获取微博文娱榜单数据（娱乐圈、影视、综艺等）。\n### 参数:\n- 无需额外参数\n### 返回:\n- 文娱话题列表，包含话题、热度值、排名、分类等\n### 注意:\n- 建议缓存5-10分钟\n\n# [English]\n### Purpose:\n- Get Weibo entertainment ranking data (entertainment, film & TV, variety shows).\n### Parameters:\n- No additional parameters required\n### Return:\n- Entertainment topic list, including topic, heat value, rank, category\n### Note:\n- Recommend caching for 5-10 minutes\n\n# [示例/Example]\n# No parameters needed"
  },
  {
   "name": "weibo_web_v2_fetch_hot_ranking_timeline",
@@ -25072,7 +24740,7 @@
   "tag": "Xiaohongshu-App-V2-API",
   "platform": "xiaohongshu",
   "summary": "获取图文笔记详情/Get image note detail",
-  "description": "# [中文]\n### 用途:\n- 获取图文笔记的完整详情数据\n### 接口优先级:\n- ⭐ 小红书接口推荐优先级: `App V2（本接口）` \u003e `App` \u003e `Web V2` \u003e `Web`\n### 参数:\n- note_id: 笔记ID，如 \"697c0eee000000000a03c308\"\n- share_text: 小红书分享链接（支持APP和Web端分享链接）\n- 优先使用`note_id`，如果没有则使用`share_text`，两个参数二选一，如都携带则以`note_id`为准。\n### 返回:\n- 图文笔记详情数据，包含笔记内容、图片列表、作者信息、互动数据等\n\n# [English]\n### Purpose:\n- Get full detail data of an image note\n### API Priority:\n- ⭐ Xiaohongshu API priority: `App V2 (this)` \u003e `App` \u003e `Web V2` \u003e `Web`\n### Parameters:\n- note_id: Note ID, e.g. \"697c0eee000000000a03c308\"\n- share_text: Xiaohongshu sharing link (support APP and Web sharing link)\n- Pref…",
+  "description": "# [中文]\n### 用途:\n- 获取图文笔记的完整详情数据\n### 接口优先级:\n- ⭐ 小红书接口推荐优先级: `App V2（本接口）` > `App` > `Web V2` > `Web`\n### 参数:\n- note_id: 笔记ID，如 \"697c0eee000000000a03c308\"\n- share_text: 小红书分享链接（支持APP和Web端分享链接）\n- 优先使用`note_id`，如果没有则使用`share_text`，两个参数二选一，如都携带则以`note_id`为准。\n### 返回:\n- 图文笔记详情数据，包含笔记内容、图片列表、作者信息、互动数据等\n\n# [English]\n### Purpose:\n- Get full detail data of an image note\n### API Priority:\n- ⭐ Xiaohongshu API priority: `App V2 (this)` > `App` > `Web V2` > `Web`\n### Parameters:\n- note_id: Note ID, e.g. \"697c0eee000000000a03c308\"\n- share_text: Xiaohongshu sharing link (support APP and Web sharing link)\n- Pref…",
   "params": [
    {
     "name": "note_id",
@@ -26120,7 +25788,7 @@
   "tag": "Xiaohongshu-Web-V3-API",
   "platform": "xiaohongshu",
   "summary": "获取首页推荐/Fetch homepage feed",
-  "description": "# [中文]\n### 用途:\n- 获取首页推荐笔记列表\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` \u003e `App` \u003e `Web V3（本接口）` \u003e `Web V2` \u003e `Web`\n### 参数:\n- num: 返回数量 (最大 40)\n- cursor_score: 翻页游标 (首次留空)\n- category: 分类频道 ID (从 /fetch_homefeed_categories 获取)\n- need_filter_image: true=只看图文, false=综合推荐(含视频)\n### 返回:\n- 推荐笔记列表\n\n# [English]\n### Purpose:\n- Get homepage recommended notes\n### API Priority:\n- Xiaohongshu API priority: `App V2` \u003e `App` \u003e `Web V3 (this)` \u003e `Web V2` \u003e `Web`\n### Parameters:\n- num (max 40), cursor_score, category, need_filter_image\n### Return:\n- Recommended notes list\n\n# [示例/Example]\nnum = 20\ncategory = \"homefeed_reco…",
+  "description": "# [中文]\n### 用途:\n- 获取首页推荐笔记列表\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` > `App` > `Web V3（本接口）` > `Web V2` > `Web`\n### 参数:\n- num: 返回数量 (最大 40)\n- cursor_score: 翻页游标 (首次留空)\n- category: 分类频道 ID (从 /fetch_homefeed_categories 获取)\n- need_filter_image: true=只看图文, false=综合推荐(含视频)\n### 返回:\n- 推荐笔记列表\n\n# [English]\n### Purpose:\n- Get homepage recommended notes\n### API Priority:\n- Xiaohongshu API priority: `App V2` > `App` > `Web V3 (this)` > `Web V2` > `Web`\n### Parameters:\n- num (max 40), cursor_score, category, need_filter_image\n### Return:\n- Recommended notes list\n\n# [示例/Example]\nnum = 20\ncategory = \"homefeed_reco…",
   "params": [
    {
     "name": "num",
@@ -26159,7 +25827,7 @@
   "tag": "Xiaohongshu-Web-V3-API",
   "platform": "xiaohongshu",
   "summary": "获取首页分类列表/Fetch homepage categories",
-  "description": "# [中文]\n### 用途:\n- 获取首页频道分类列表\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` \u003e `App` \u003e `Web V3（本接口）` \u003e `Web V2` \u003e `Web`\n### 返回:\n- 分类列表\n\n# [English]\n### Purpose:\n- Get homepage category channels\n### API Priority:\n- Xiaohongshu API priority: `App V2` \u003e `App` \u003e `Web V3 (this)` \u003e `Web V2` \u003e `Web`\n### Return:\n- Categories list"
+  "description": "# [中文]\n### 用途:\n- 获取首页频道分类列表\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` > `App` > `Web V3（本接口）` > `Web V2` > `Web`\n### 返回:\n- 分类列表\n\n# [English]\n### Purpose:\n- Get homepage category channels\n### API Priority:\n- Xiaohongshu API priority: `App V2` > `App` > `Web V3 (this)` > `Web V2` > `Web`\n### Return:\n- Categories list"
  },
  {
   "name": "xiaohongshu_web_v3_fetch_hot_list",
@@ -26168,7 +25836,7 @@
   "tag": "Xiaohongshu-Web-V3-API",
   "platform": "xiaohongshu",
   "summary": "获取小红书热榜/Fetch Xiaohongshu hot list",
-  "description": "# [中文]\n### 用途:\n- 获取小红书热榜（实时），即当日热门话题/关键词榜单\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` \u003e `App` \u003e `Web V3（本接口）` \u003e `Web V2` \u003e `Web`\n### 返回:\n- 热榜条目列表（名次/标题/链接/热度/趋势）\n\n# [English]\n### Purpose:\n- Get the Xiaohongshu hot list (realtime), i.e. today's trending topics/keywords\n### API Priority:\n- Xiaohongshu API priority: `App V2` \u003e `App` \u003e `Web V3 (this)` \u003e `Web V2` \u003e `Web`\n### Return:\n- Hot list items (rank/title/url/hot/trend)"
+  "description": "# [中文]\n### 用途:\n- 获取小红书热榜（实时），即当日热门话题/关键词榜单\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` > `App` > `Web V3（本接口）` > `Web V2` > `Web`\n### 返回:\n- 热榜条目列表（名次/标题/链接/热度/趋势）\n\n# [English]\n### Purpose:\n- Get the Xiaohongshu hot list (realtime), i.e. today's trending topics/keywords\n### API Priority:\n- Xiaohongshu API priority: `App V2` > `App` > `Web V3 (this)` > `Web V2` > `Web`\n### Return:\n- Hot list items (rank/title/url/hot/trend)"
  },
  {
   "name": "xiaohongshu_web_v3_fetch_note_detail",
@@ -26177,7 +25845,7 @@
   "tag": "Xiaohongshu-Web-V3-API",
   "platform": "xiaohongshu",
   "summary": "获取笔记详情/Fetch note detail",
-  "description": "# [中文]\n### 用途:\n- 获取笔记详情（图文/视频通用）\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` \u003e `App` \u003e `Web V3（本接口）` \u003e `Web V2` \u003e `Web`\n### 参数:\n- note_id: 笔记ID，可以从小红书的分享链接中获取\n- xsec_token: 安全令牌，可以从小红书的分享链接中获取\n### 返回:\n- 笔记详情数据\n\n# [English]\n### Purpose:\n- Get note detail (image/video)\n### API Priority:\n- Xiaohongshu API priority: `App V2` \u003e `App` \u003e `Web V3 (this)` \u003e `Web V2` \u003e `Web`\n### Parameters:\n- note_id: Note ID, can be obtained from the sharing link of Xiaohongshu\n- xsec_token: Security token, can be obtained from the sharing link of Xiaohongshu\n### Return:\n- Note detail data\n\n# [示例/Example]\nnote_id = \"6a2f423d0000…",
+  "description": "# [中文]\n### 用途:\n- 获取笔记详情（图文/视频通用）\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` > `App` > `Web V3（本接口）` > `Web V2` > `Web`\n### 参数:\n- note_id: 笔记ID，可以从小红书的分享链接中获取\n- xsec_token: 安全令牌，可以从小红书的分享链接中获取\n### 返回:\n- 笔记详情数据\n\n# [English]\n### Purpose:\n- Get note detail (image/video)\n### API Priority:\n- Xiaohongshu API priority: `App V2` > `App` > `Web V3 (this)` > `Web V2` > `Web`\n### Parameters:\n- note_id: Note ID, can be obtained from the sharing link of Xiaohongshu\n- xsec_token: Security token, can be obtained from the sharing link of Xiaohongshu\n### Return:\n- Note detail data\n\n# [示例/Example]\nnote_id = \"6a2f423d0000…",
   "params": [
    {
     "name": "note_id",
@@ -26202,7 +25870,7 @@
   "tag": "Xiaohongshu-Web-V3-API",
   "platform": "xiaohongshu",
   "summary": "获取搜索联想词/Fetch search suggestions",
-  "description": "# [中文]\n### 用途:\n- 获取搜索联想词，keyword 为空时返回热门推荐\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` \u003e `App` \u003e `Web V3（本接口）` \u003e `Web V2` \u003e `Web`\n### 参数:\n- keyword: 关键词 (可为空)\n### 返回:\n- 联想词列表\n\n# [English]\n### Purpose:\n- Get search suggestions, returns popular recommendations when keyword is empty\n### API Priority:\n- Xiaohongshu API priority: `App V2` \u003e `App` \u003e `Web V3 (this)` \u003e `Web V2` \u003e `Web`\n### Parameters:\n- keyword: Keyword (optional)\n### Return:\n- Suggestions list\n\n# [示例/Example]\nkeyword = \"口红\"",
+  "description": "# [中文]\n### 用途:\n- 获取搜索联想词，keyword 为空时返回热门推荐\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` > `App` > `Web V3（本接口）` > `Web V2` > `Web`\n### 参数:\n- keyword: 关键词 (可为空)\n### 返回:\n- 联想词列表\n\n# [English]\n### Purpose:\n- Get search suggestions, returns popular recommendations when keyword is empty\n### API Priority:\n- Xiaohongshu API priority: `App V2` > `App` > `Web V3 (this)` > `Web V2` > `Web`\n### Parameters:\n- keyword: Keyword (optional)\n### Return:\n- Suggestions list\n\n# [示例/Example]\nkeyword = \"口红\"",
   "params": [
    {
     "name": "keyword",
@@ -26220,7 +25888,7 @@
   "tag": "Xiaohongshu-Web-V3-API",
   "platform": "xiaohongshu",
   "summary": "获取用户信息/Fetch user info",
-  "description": "# [中文]\n### 用途:\n- 获取用户公开资料\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` \u003e `App` \u003e `Web V3（本接口）` \u003e `Web V2` \u003e `Web`\n### 参数:\n- user_id: 用户ID\n### 返回:\n- 用户信息\n\n# [English]\n### Purpose:\n- Get user public profile\n### API Priority:\n- Xiaohongshu API priority: `App V2` \u003e `App` \u003e `Web V3 (this)` \u003e `Web V2` \u003e `Web`\n### Parameters:\n- user_id: User ID\n### Return:\n- User info\n\n# [示例/Example]\nuser_id = \"5e3a8ee700000000010070c6\"",
+  "description": "# [中文]\n### 用途:\n- 获取用户公开资料\n### 接口优先级:\n- 小红书接口推荐优先级: `App V2` > `App` > `Web V3（本接口）` > `Web V2` > `Web`\n### 参数:\n- user_id: 用户ID\n### 返回:\n- 用户信息\n\n# [English]\n### Purpose:\n- Get user public profile\n### API Priority:\n- Xiaohongshu API priority: `App V2` > `App` > `Web V3 (this)` > `Web V2` > `Web`\n### Parameters:\n- user_id: User ID\n### Return:\n- User info\n\n# [示例/Example]\nuser_id = \"5e3a8ee700000000010070c6\"",
   "params": [
    {
     "name": "user_id",
@@ -27094,7 +26762,7 @@
   "tag": "YouTube-Web-V2-API",
   "platform": "youtube",
   "summary": "综合搜索V2/General search V2",
-  "description": "# [中文]\n### 用途:\n- 搜索 YouTube 视频、Shorts、频道、播放列表\n- 返回清洗后的结构化数据（相比 get_general_search 返回原始数据）\n- 支持多种过滤条件和排序方式\n- 支持分页加载更多结果\n\n### 参数:\n- keyword: 搜索关键词（首次请求必填）\n- continuation_token: 分页token（获取下一页时传入，从上一次返回结果中获取）\n- upload_date: 上传时间过滤 - last_hour/today/this_week/this_month/this_year\n- type: 结果类型过滤 - video/channel/playlist/movie\n- duration: 视频时长过滤 - short(\u003c4分钟)/medium(4-20分钟)/long(\u003e20分钟)\n- features: 特性过滤（多个用逗号分隔）- live/4k/hd/subtitles/creative_commons/360/vr180/3d/hdr\n- sort_by: 排序方式 - relevance(相关性)/upload_date(上传日期)/view_count(播放量)/rating(评分)\n\n### 返回数据:\n- videos: 视频列表（标题、时长、播放量、作者、频道ID、缩略图等）\n- shorts…",
+  "description": "# [中文]\n### 用途:\n- 搜索 YouTube 视频、Shorts、频道、播放列表\n- 返回清洗后的结构化数据（相比 get_general_search 返回原始数据）\n- 支持多种过滤条件和排序方式\n- 支持分页加载更多结果\n\n### 参数:\n- keyword: 搜索关键词（首次请求必填）\n- continuation_token: 分页token（获取下一页时传入，从上一次返回结果中获取）\n- upload_date: 上传时间过滤 - last_hour/today/this_week/this_month/this_year\n- type: 结果类型过滤 - video/channel/playlist/movie\n- duration: 视频时长过滤 - short(<4分钟)/medium(4-20分钟)/long(>20分钟)\n- features: 特性过滤（多个用逗号分隔）- live/4k/hd/subtitles/creative_commons/360/vr180/3d/hdr\n- sort_by: 排序方式 - relevance(相关性)/upload_date(上传日期)/view_count(播放量)/rating(评分)\n\n### 返回数据:\n- videos: 视频列表（标题、时长、播放量、作者、频道ID、缩略图等）\n- shorts…",
   "params": [
    {
     "name": "keyword",
@@ -27124,7 +26792,7 @@
     "name": "duration",
     "in": "query",
     "type": "string",
-    "desc": "时长过滤/Duration filter: short (\u003c4min), medium (4-20min), long (\u003e20min)"
+    "desc": "时长过滤/Duration filter: short (<4min), medium (4-20min), long (>20min)"
    },
    {
     "name": "features",
@@ -27299,7 +26967,7 @@
   "tag": "YouTube-Web-V2-API",
   "platform": "youtube",
   "summary": "获取搜索推荐词/Get search suggestions",
-  "description": "# [中文]\n### 用途:\n- 获取YouTube搜索推荐词（自动补全）\n- 类似于在YouTube搜索框输入时显示的推荐词\n\n### 参数:\n- keyword: 搜索关键词（必填）\n- language: 语言代码（可选，默认 en）\n  - en: 英语\n  - zh-cn: 简体中文\n  - ja: 日语\n  - ko: 韩语\n- region: 地区代码（可选，默认 US）\n  - US: 美国\n  - SG: 新加坡\n  - CN: 中国\n  - JP: 日本\n  - KR: 韩国\n\n### 返回数据包含:\n- keyword: 搜索关键词\n- suggestions: 推荐词列表（字符串数组）\n- total_count: 推荐词数量\n\n### 注意事项:\n- 推荐词会根据语言和地区有所不同\n- 通常返回 10-20 个推荐词\n- 响应速度非常快（\u003c 1秒）\n\n### 价格:\n- $0.0001 USD / 请求\n\n# [English]\n### Purpose:\n- Get YouTube search suggestions (autocomplete)\n- Similar to suggestions shown when typing in YouTube search box\n\n### Parameters:\n- keyword: Search keywo…",
+  "description": "# [中文]\n### 用途:\n- 获取YouTube搜索推荐词（自动补全）\n- 类似于在YouTube搜索框输入时显示的推荐词\n\n### 参数:\n- keyword: 搜索关键词（必填）\n- language: 语言代码（可选，默认 en）\n  - en: 英语\n  - zh-cn: 简体中文\n  - ja: 日语\n  - ko: 韩语\n- region: 地区代码（可选，默认 US）\n  - US: 美国\n  - SG: 新加坡\n  - CN: 中国\n  - JP: 日本\n  - KR: 韩国\n\n### 返回数据包含:\n- keyword: 搜索关键词\n- suggestions: 推荐词列表（字符串数组）\n- total_count: 推荐词数量\n\n### 注意事项:\n- 推荐词会根据语言和地区有所不同\n- 通常返回 10-20 个推荐词\n- 响应速度非常快（< 1秒）\n\n### 价格:\n- $0.0001 USD / 请求\n\n# [English]\n### Purpose:\n- Get YouTube search suggestions (autocomplete)\n- Similar to suggestions shown when typing in YouTube search box\n\n### Parameters:\n- keyword: Search keywo…",
   "params": [
    {
     "name": "keyword",
@@ -27331,7 +26999,7 @@
   "tag": "YouTube-Web-V2-API",
   "platform": "youtube",
   "summary": "Shorts搜索（原始数据，推荐使用V2）/Shorts search (raw data, recommend V2)",
-  "description": "# [中文]\n### ⚠️ 推荐使用 V2 版本:\n- 本接口返回 YouTube 原始数据结构，需要自行解析\n- **清洗过的数据版本请使用 `/get_shorts_search_v2` 接口**，返回结构化的 Shorts 列表数据，自动过滤非 Shorts 内容\n\n### 用途:\n- YouTube Shorts短视频专门搜索，使用原生YouTube API接口\n\n### 特点:\n- 🎬 专门搜索YouTube Shorts短视频（\u003c60秒）\n- 🔍 支持多种过滤条件和排序方式\n- 📱 优化的移动端短视频内容\n- ⚡ 智能过滤：首次请求可能返回混合内容（长视频+短视频），默认自动过滤长视频\n\n### 重要说明 - YouTube Shorts搜索机制:\n根据YouTube的搜索逻辑，Shorts搜索有以下特性：\n1. **首次请求**（无continuation_token）：可能返回混合内容（部分长视频 + 部分短视频）\n2. **后续请求**（有continuation_token）：仅返回纯短视频内容\n3. **解决方案**：\n   - 方案A：使用 `filter_mixed_content=true`（默认），自动过滤掉长视频\n   - 方案B：使用第一次返回的 continuation_token 进行第二次请求，获取纯Shorts内容\n   - 方案C：设置 …",
+  "description": "# [中文]\n### ⚠️ 推荐使用 V2 版本:\n- 本接口返回 YouTube 原始数据结构，需要自行解析\n- **清洗过的数据版本请使用 `/get_shorts_search_v2` 接口**，返回结构化的 Shorts 列表数据，自动过滤非 Shorts 内容\n\n### 用途:\n- YouTube Shorts短视频专门搜索，使用原生YouTube API接口\n\n### 特点:\n- 🎬 专门搜索YouTube Shorts短视频（<60秒）\n- 🔍 支持多种过滤条件和排序方式\n- 📱 优化的移动端短视频内容\n- ⚡ 智能过滤：首次请求可能返回混合内容（长视频+短视频），默认自动过滤长视频\n\n### 重要说明 - YouTube Shorts搜索机制:\n根据YouTube的搜索逻辑，Shorts搜索有以下特性：\n1. **首次请求**（无continuation_token）：可能返回混合内容（部分长视频 + 部分短视频）\n2. **后续请求**（有continuation_token）：仅返回纯短视频内容\n3. **解决方案**：\n   - 方案A：使用 `filter_mixed_content=true`（默认），自动过滤掉长视频\n   - 方案B：使用第一次返回的 continuation_token 进行第二次请求，获取纯Shorts内容\n   - 方案C：设置 …",
   "params": [
    {
     "name": "search_query",

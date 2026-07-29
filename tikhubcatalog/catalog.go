@@ -91,6 +91,12 @@ func Lookup(name string) (Entry, bool) {
 // Len 返回注册表端点总数。
 func Len() int { return len(entries) }
 
+// Entries returns a defensive copy for internal inventory and audit tooling.
+// Runtime agent selection should continue to use Search/Lookup.
+func Entries() []Entry {
+	return append([]Entry(nil), entries...)
+}
+
 // Platforms 返回全部平台名（字典序），供工具描述与参数校验枚举。
 func Platforms() []string {
 	out := make([]string, 0, len(platforms))

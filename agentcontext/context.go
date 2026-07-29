@@ -20,7 +20,7 @@ const (
 	CompilerVersion         = "vane.agent-context/v1"
 	SnapshotSchemaVersion   = "vane.agent-turn-context-snapshot/v1"
 	CompactorVersion        = "none/v1"
-	PolicyVersion           = "vane.agent-context-policy/v1"
+	PolicyVersion           = "vane.agent-context-policy/v2"
 	untrustedPlaceholder    = "[untrusted current-turn content omitted]"
 	defaultContextWindow    = 8192
 	messageFramingTokens    = 8
@@ -81,13 +81,17 @@ type ToolDefinition struct {
 }
 
 type PolicySnapshot struct {
-	Version       string `json:"version"`
-	Effects       uint16 `json:"effects"`
-	Authorization uint8  `json:"authorization"`
-	Confirmation  uint8  `json:"confirmation"`
-	Budget        uint8  `json:"budget"`
-	Retry         uint8  `json:"retry"`
-	Concurrency   uint8  `json:"concurrency"`
+	Version        string `json:"version"`
+	Effects        uint16 `json:"effects"`
+	Authorization  uint8  `json:"authorization"`
+	Confirmation   uint8  `json:"confirmation"`
+	Budget         uint8  `json:"budget"`
+	Retry          uint8  `json:"retry"`
+	Concurrency    uint8  `json:"concurrency"`
+	Exposure       uint8  `json:"exposure"`
+	Intents        uint16 `json:"intents"`
+	ResultTrust    uint8  `json:"result_trust"`
+	DirectExplicit bool   `json:"direct_on_explicit_intent"`
 }
 
 type Tool struct {

@@ -78,6 +78,17 @@ type toolCallRecKey struct{}
 // toolRunState 是一次 HandleMessage 的工具运行状态。
 type toolRunState struct {
 	activation *activationState
+	// ownerRequest is the trusted current-user suffix only. Quoted cards,
+	// previous assistant text and external tool results never participate in
+	// intent routing or direct-write authorization.
+	ownerRequest string
+	intents      ToolIntent
+	// Unified loop breaker state. Provider-specific message caps are not used
+	// for planning; this hidden ceiling only stops repeated or runaway calls.
+	toolExecutions  int
+	successfulCalls map[string]struct{}
+	failedCalls     map[string]int
+	loopBreakReason string
 	// groundedBrief confines a trusted internal Brief/report follow-up to the
 	// exact supplied artifact. It has no tool surface at declaration or
 	// execution time, so source text can inform an answer but can never trigger
@@ -128,10 +139,10 @@ type toolRunState struct {
 	// endpointCalls 本条消息内已发起的端点调用次数（限额判定用）。计数时机在
 	// 校验通过之后、发请求之前：打到上游才算（含 HTTP 错误——失败同样计费），
 	// 参数校验失败没打上游、不计费，不吃限额。
+	// Provider-family counters remain observation-only. They no longer enforce
+	// per-message quotas; the unified hidden fuse uses toolExecutions.
 	endpointCalls int
-	// exaCalls 本条消息内已发起的 Exa ad-hoc 调用（web_search/read_page）次数，
-	// 计数时机与 endpointCalls 相同（双重限额的消息内一重，见 exa_tools.go 头注）。
-	exaCalls int
+	exaCalls      int
 	// inlinedRunes 本条消息内已内联进上下文的端点结果字符数（累计预算，
 	// 见 llm.InlineLimits.MsgBudget）。只统计真正回给模型的部分，不含缓存全量。
 	inlinedRunes int
@@ -159,6 +170,10 @@ type toolRunState struct {
 	externalFollowupSearchResult      string
 	externalFollowupSearchEvidence    []externalFollowupSearchEvidence
 	externalFollowupGroundingFailures int
+	// webResearchSucceeded generalizes the former one-off product branch:
+	// every successful web search/page read must finish with citations that
+	// occur in these structured results.
+	webResearchSucceeded bool
 	// allowedLocalResultHandles 只登记本条消息的动态端点刚生成的截断句柄。
 	// 句柄 res-N 可猜且缓存按 user 共享；仅用 bool 会让恶意端点枚举同用户
 	// 其他会话的旧结果。taint 后 read_endpoint_result 必须命中这个集合。
@@ -301,17 +316,20 @@ func NewEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, 
 // SearchTool 返回检索元工具（进静态白名单，BuildTools 装配）。检索会修改
 // 本消息 activation，但现有调用与预算仍完全由工具自身管理。
 func (e *EndpointTools) SearchTool() ToolSpec {
-	return newToolSpec(&searchEndpointsTool{ep: e}, ownerPolicy(
+	return newToolSpec(&searchEndpointsTool{ep: e}, withToolSurface(ownerPolicy(
 		Effects(EffectNetworkRead, EffectBillable, EffectActivationWrite),
-		ConfirmationNone, BudgetToolManaged))
+		ConfirmationNone, BudgetToolManaged),
+		ExposureAlways, IntentSocialResearch, ResultTrustLocal, false))
 }
 
 // ReadResultTool 返回大结果取回工具（进静态白名单，BuildTools 装配；契约 §3.5）。
 func (e *EndpointTools) ReadResultTool() ToolSpec {
 	return newToolSpec(
 		&readEndpointResultTool{cache: e.results, perRead: e.limits.PerCall},
-		ownerPolicy(Effects(EffectLocalHandleRead, EffectTrustTaint),
+		withToolSurface(ownerPolicy(
+			Effects(EffectLocalHandleRead, EffectTrustTaint),
 			ConfirmationNone, BudgetNone),
+			ExposureContext, IntentSocialResearch, ResultTrustExternal, false),
 	)
 }
 
@@ -326,9 +344,10 @@ func (e *EndpointTools) Resolve(name string, act *activationState) (ToolSpec, bo
 	if !ok {
 		return ToolSpec{}, false
 	}
-	return newToolSpec(&endpointTool{ep: e, entry: entry}, ownerPolicy(
+	return newToolSpec(&endpointTool{ep: e, entry: entry}, withToolSurface(ownerPolicy(
 		Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
-		ConfirmationNone, BudgetToolManaged)), true
+		ConfirmationNone, BudgetToolManaged),
+		ExposureContext, IntentSocialResearch, ResultTrustExternal, false)), true
 }
 
 func isRegisteredEndpoint(name string) bool {
@@ -347,9 +366,10 @@ func (e *EndpointTools) Defs(act *activationState) []llm.ToolDef {
 		if !ok {
 			continue // 注册表下线的端点不再注入；Resolve 同步拒绝，两处口径一致
 		}
-		spec := newToolSpec(&endpointTool{ep: e, entry: entry}, ownerPolicy(
+		spec := newToolSpec(&endpointTool{ep: e, entry: entry}, withToolSurface(ownerPolicy(
 			Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
-			ConfirmationNone, BudgetToolManaged))
+			ConfirmationNone, BudgetToolManaged),
+			ExposureContext, IntentSocialResearch, ResultTrustExternal, false))
 		defs = append(defs, spec.Definition)
 	}
 	return defs
@@ -357,11 +377,39 @@ func (e *EndpointTools) Defs(act *activationState) []llm.ToolDef {
 
 // endpointDefDescription 动态工具的注入描述：摘要 + 截断说明 + 计费提醒。
 func endpointDefDescription(entry tikhubcatalog.Entry) string {
-	desc := entry.Summary
+	desc := publicEndpointText(entry.Summary)
 	if entry.Description != "" {
-		desc += "\n" + truncateRunes(entry.Description, endpointDefDescMaxRunes)
+		desc += "\n" + truncateRunes(
+			publicEndpointText(entry.Description),
+			endpointDefDescMaxRunes,
+		)
 	}
-	return desc + "\n（TikHub " + entry.Method + " " + entry.Path + "，按次计费，按需调用）"
+	return desc + "\n（社媒公开数据查询，可能计费，请按需调用）"
+}
+
+func publicEndpointText(value string) string {
+	lines := strings.Split(value, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if lower == "" {
+			continue
+		}
+		if strings.Contains(lower, "tikhub") ||
+			strings.Contains(lower, "/api/v") ||
+			strings.Contains(lower, "api priority") ||
+			strings.Contains(lower, "接口优先级") ||
+			strings.Contains(lower, "接口推荐") ||
+			strings.Contains(lower, "本接口") ||
+			strings.Contains(lower, "request method") ||
+			strings.Contains(lower, "请求方法") ||
+			strings.Contains(lower, "endpoint path") ||
+			strings.Contains(lower, "接口路径") {
+			continue
+		}
+		out = append(out, strings.TrimSpace(line))
+	}
+	return strings.Join(out, "\n")
 }
 
 // endpointParamsSchema 从注册表参数生成 FC JSON schema。类型映射保守：注册表的
@@ -388,7 +436,7 @@ func endpointParamsSchema(entry tikhubcatalog.Entry) json.RawMessage {
 			prop["type"] = "string"
 		}
 		if p.Desc != "" {
-			prop["description"] = p.Desc
+			prop["description"] = publicEndpointText(p.Desc)
 		}
 		if len(p.Enum) > 0 {
 			prop["enum"] = p.Enum
@@ -417,8 +465,8 @@ func endpointParamsSchema(entry tikhubcatalog.Entry) json.RawMessage {
 // 官方最佳实践：system prompt 写明「可搜索的工具类别」，模型才会主动想到去搜。
 func endpointSystemNote() string {
 	return "\n\n[社媒数据查询]\n用户想查询/调研社媒平台的内容、账号、评论、热榜等一次性问题时，" +
-		"先用 search_endpoints 在 TikHub 端点目录（" + fmt.Sprint(tikhubcatalog.Len()) + " 个端点，平台：" +
-		strings.Join(tikhubcatalog.Platforms(), "、") + "）中检索数据接口，命中的端点会成为你可直接调用的工具。" +
+		"先用 search_endpoints 搜索可用的社媒查询工具（覆盖内容、账号、搜索、热榜、评论、趋势和公开分析；平台：" +
+		strings.Join(tikhubcatalog.Platforms(), "、") + "），命中的具体能力会成为你可直接调用的工具。" +
 		"检索不到就换关键词（中英文都可）或加 platform 过滤再试。端点按次计费且有单条消息与每日限额，按需少量调用；" +
 		"用户要的是**持续追新**时不要用端点查询，改用 add_source 订阅信源。"
 }
@@ -442,9 +490,11 @@ const searchEndpointsSchema = `{
 
 func (t *searchEndpointsTool) Name() string { return "search_endpoints" }
 func (t *searchEndpointsTool) Description() string {
-	return "在 TikHub 社媒数据端点目录（" + fmt.Sprint(tikhubcatalog.Len()) +
-		" 个端点）中检索接口。返回最相关的 " + fmt.Sprint(searchTopK) +
-		" 个端点并注入为你可直接调用的工具。适用于一次性查询社媒内容/账号/热榜/评论；持续追新请用 add_source。"
+	return "搜索可用的社媒查询工具。支持 " +
+		strings.Join(tikhubcatalog.Platforms(), "、") +
+		" 等平台的内容、账号、搜索、热榜、评论、趋势与公开分析；返回最相关的 " +
+		fmt.Sprint(searchTopK) +
+		" 个具体工具并立即启用。适用于一次性查询；持续追新请用 add_source。"
 }
 func (t *searchEndpointsTool) Parameters() json.RawMessage {
 	return json.RawMessage(searchEndpointsSchema)
@@ -558,14 +608,8 @@ func (t *endpointTool) Execute(ctx context.Context, userID int64, args json.RawM
 		rec.EndpointPath = t.entry.Path
 	}
 
-	// 限额判定先于一切上游动作（契约 §7）。
+	// 滚动 24h 限额判定先于一切上游动作；单消息由统一熔断器负责。
 	state := runStateFrom(ctx)
-	if state != nil && state.endpointCalls >= t.ep.msgCap {
-		if rec != nil {
-			rec.ErrorType = types.ToolErrBudgetExceeded
-		}
-		return fmt.Sprintf("本条消息的端点调用已达上限（%d 次）。请基于已有结果回答，或让用户再发一条消息继续。", t.ep.msgCap), nil
-	}
 	if t.ep.counter != nil {
 		n, err := t.ep.counter.CountTikHubEndpointCallsSince(ctx, time.Now().Add(-dailyCapWindow))
 		if err != nil {
@@ -613,6 +657,9 @@ func (t *endpointTool) Execute(ctx context.Context, userID int64, args json.RawM
 		msg := "端点调用失败"
 		var ae *types.AppError
 		if errors.As(err, &ae) && ae.Message != "" {
+			if ae.Retryable {
+				return "", err
+			}
 			msg = "端点调用失败：" + ae.Message
 		}
 		return msg, nil
@@ -626,8 +673,21 @@ func (t *endpointTool) Execute(ctx context.Context, userID int64, args json.RawM
 		if rec != nil {
 			rec.ErrorType = types.ToolErrHTTP
 		}
-		return fmt.Sprintf("端点返回 HTTP %d：%s\n（4xx 多为参数问题，可修正后重试；429 是限流，请稍后或换端点）",
-			res.Status, truncateRunes(string(res.Body), 500)), nil
+		message := fmt.Sprintf(
+			"端点返回 HTTP %d：%s",
+			res.Status, truncateRunes(string(res.Body), 500),
+		)
+		if res.Status == 429 {
+			return "", types.NewAppError(
+				types.CodeFetchRateLimit, message, nil,
+			)
+		}
+		if res.Status >= 500 {
+			return "", types.NewAppError(
+				types.CodeFetchTimeout, message, nil,
+			)
+		}
+		return message + "\n（4xx 多为参数问题，可修正后重试）", nil
 	}
 
 	raw := string(res.Body)
@@ -648,9 +708,6 @@ func (t *endpointTool) Execute(ctx context.Context, userID int64, args json.RawM
 	return body, nil
 }
 
-// countEndpointCall 计入本条消息的端点调用数。state 为 nil 时静默跳过：
-// 端点工具只能经 HandleMessage 的动态解析到达（Resolve 依赖激活集），
-// state 恒在；nil 只在未来误用时出现，跳过比 panic 稳。
 func (s *toolRunState) countEndpointCall() {
 	if s != nil {
 		s.endpointCalls++
