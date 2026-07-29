@@ -470,10 +470,17 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		firstConcurrent, secondConcurrent,
 	}
 	var committed, conflicted int
+	var winnerCanonicalKey string
 	for _, result := range results {
 		switch {
 		case result.err == nil && len(result.items) == 1:
 			committed++
+			if winnerCanonicalKey == "" {
+				winnerCanonicalKey = result.items[0].CanonicalKey
+			} else if result.items[0].CanonicalKey != winnerCanonicalKey {
+				t.Fatalf("concurrent callers observed different winners: first=%q next=%q",
+					winnerCanonicalKey, result.items[0].CanonicalKey)
+			}
 		case errors.Is(result.err, types.ErrConflict) &&
 			len(result.items) == 0:
 			conflicted++
@@ -481,7 +488,13 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 			t.Fatalf("unexpected concurrent first-writer result: %+v", result)
 		}
 	}
-	if committed != 1 || conflicted != 1 {
+	// Both outcomes preserve the same first-writer contract. If both
+	// transactions reach the unique insert concurrently, the loser reports a
+	// conflict. If the second transaction reaches the recovery read after the
+	// first commits, it returns the already-frozen winner, just like a
+	// response-lost retry. Goroutine release cannot require one database
+	// interleaving over the other.
+	if committed < 1 || committed+conflicted != len(results) {
 		t.Fatalf("concurrent first-writer outcomes: committed=%d conflicted=%d",
 			committed, conflicted)
 	}
