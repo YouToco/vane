@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	neturl "net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/auth"
@@ -18,9 +20,66 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-const briefFollowupBodyLimit = 20 << 10
+const (
+	briefFollowupBodyLimit = 20 << 10
+
+	// A grounded follow-up may consume all three transient-LLM attempts before
+	// writeAppError serializes the final LLM_RATE_LIMIT response. Keep this
+	// route-local budget aligned with the Agent/LLM execution contract:
+	//
+	//   3 * (120s provider attempt + 10s detached accounting)
+	//     + 2s/5s retry backoff + 23s response headroom = 7m
+	//
+	// This replaces the server's 30s write deadline only for grounded asks. It
+	// is deliberately finite: client cancellation still owns r.Context(), and
+	// no global server timeout or unrelated API route is widened.
+	groundedBriefFollowupExecutionBudget  = agent.GroundedBriefExecutionBudget
+	groundedBriefFollowupResponseHeadroom = 23 * time.Second
+	groundedBriefFollowupWriteBudget      = groundedBriefFollowupExecutionBudget +
+		groundedBriefFollowupResponseHeadroom
+)
 
 var errInvalidBriefTarget = errors.New("invalid brief target")
+
+type briefFollowupWriteDeadlineContextKeyV1 struct{}
+
+func briefFollowupWriteDeadlineV1(
+	ctx context.Context,
+	now time.Time,
+) time.Time {
+	if deadline, ok := ctx.Value(
+		briefFollowupWriteDeadlineContextKeyV1{},
+	).(time.Time); ok && !deadline.IsZero() {
+		return deadline
+	}
+	return now.Add(groundedBriefFollowupWriteBudget)
+}
+
+func prepareBriefFollowupResponseV1(
+	w http.ResponseWriter,
+	ctx context.Context,
+	now time.Time,
+) error {
+	return http.NewResponseController(w).SetWriteDeadline(
+		briefFollowupWriteDeadlineV1(ctx, now))
+}
+
+func writeBriefFollowupAppErrorV1(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, context.Canceled):
+		// The peer is gone. Do not turn a normal disconnect into a misleading
+		// internal-error log or attempt a second write on the dead connection.
+		return
+	case errors.Is(err, context.DeadlineExceeded):
+		writeAppError(w, types.NewAppError(
+			types.CodeLLMUnavailable,
+			"简报追问处理超时，请稍后重试",
+			err,
+		))
+	default:
+		writeAppError(w, err)
+	}
+}
 
 type groundedTaskAgent interface {
 	HandleGroundedMessageGuarded(
@@ -459,6 +518,20 @@ func (s *server) handleBriefFollowup(
 	r *http.Request,
 	kind store.GroundedBriefKindV1,
 ) {
+	// Must run before parsing, storage, or Agent work. Once the inherited server
+	// deadline expires, net/http cannot reliably restore the response path, so a
+	// late extension would still turn a structured AppError into an upstream EOF.
+	if err := prepareBriefFollowupResponseV1(
+		w, r.Context(), time.Now(),
+	); err != nil {
+		slog.Error("api: 简报追问无法设置有界写超时", "err", err)
+		writeError(w, http.StatusServiceUnavailable, "简报追问暂时不可用，请稍后重试")
+		return
+	}
+	if err := r.Context().Err(); err != nil {
+		writeBriefFollowupAppErrorV1(w, err)
+		return
+	}
 	targetID, err := strconv.ParseInt(r.PathValue("target_id"), 10, 64)
 	if err != nil || targetID <= 0 {
 		writeError(w, http.StatusBadRequest, "简报追问目标无效")
@@ -480,7 +553,7 @@ func (s *server) handleBriefFollowup(
 	}
 	contextValue, err := s.loadBriefGrounding(r, kind)
 	if err != nil {
-		writeAppError(w, err)
+		writeBriefFollowupAppErrorV1(w, err)
 		return
 	}
 	grounding, err := renderBriefFollowupGroundingV1(contextValue)
@@ -495,14 +568,14 @@ func (s *server) handleBriefFollowup(
 	}
 	principal, err := auth.PrincipalFromContext(r.Context())
 	if err != nil {
-		writeAppError(w, err)
+		writeBriefFollowupAppErrorV1(w, err)
 		return
 	}
 	outcome, err := grounded.HandleGroundedMessageGuarded(
 		r.Context(), principal.UserID, request.Question, grounding,
 		guardBriefFollowupReplyV1)
 	if err != nil {
-		writeAppError(w, err)
+		writeBriefFollowupAppErrorV1(w, err)
 		return
 	}
 	if outcome.Confirm != nil {
