@@ -81,20 +81,27 @@ Free private repository.
 
 ## Runner provisioning
 
-All three runners are repository-scoped:
+All runner registrations are repository-scoped and implement three roles:
 
 - control-plane pull-request CI: `[self-hosted, Linux, ARM64, vane-test]`; this
   runner lives in `vane-test`, so PR-controlled checks never enter a trusted VM.
 - control-plane exact-`main` push and schedule CI:
-  `[self-hosted, Linux, ARM64, vane-build]`; only trusted default-branch
-  workflow code reaches this runner, avoiding a `vane-test` outage becoming a
-  production-control-plane single point of failure.
-- build VM: `[self-hosted, Linux, ARM64, vane-build]`; Docker is available for
-  the PostgreSQL service, and the pinned setup actions provide Go 1.26 and
-  Node 22.
+  `[self-hosted, Linux, vane-build]`; only trusted default-branch workflow code
+  reaches this runner, avoiding a `vane-test` outage becoming a
+  production-control-plane single point of failure. The label deliberately
+  permits both X64 and ARM64 Linux hosts.
+- build VM: `[self-hosted, Linux, vane-build]`; Docker is available for the
+  PostgreSQL service, and the pinned setup actions provide Go 1.26 and Node 22.
 - deploy VM: `[self-hosted, Linux, ARM64, vane-deploy]`; install Git, Python 3,
   OpenSSH, OpenSSL, `flock`, GNU `date`, `curl`, `sha256sum`, and `strings`.
   Do not install Docker access or `sudo` for the runner user.
+
+The optional Windows WSL2 build runner uses the same `vane-build` trust role
+without production secrets. Its systemd service must use a dedicated `HOME`
+under the runner directory, a Linux-only `PATH`, and make Windows mounts such
+as `/mnt/c` and `/mnt/d` inaccessible. This keeps trusted exact-`main` builds
+from inheriting workstation credentials while providing an X64 fallback when
+the ARM64 build runner is unavailable.
 
 Wrangler and its Node runtime are provisioned out-of-band on the deploy VM.
 [`tools/wrangler/package-lock.json`](tools/wrangler/package-lock.json) pins the

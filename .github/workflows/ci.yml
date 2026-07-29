@@ -24,7 +24,7 @@ jobs:
         fromJSON(
           github.event_name == 'pull_request'
           && '["self-hosted","Linux","ARM64","vane-test"]'
-          || '["self-hosted","Linux","ARM64","vane-build"]'
+          || '["self-hosted","Linux","vane-build"]'
         )
       }}
     timeout-minutes: 15

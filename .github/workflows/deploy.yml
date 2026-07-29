@@ -177,7 +177,7 @@ jobs:
   build:
     needs: plan
     if: needs.plan.outputs.any_changed == 'true'
-    runs-on: [self-hosted, Linux, ARM64, vane-build]
+    runs-on: [self-hosted, Linux, vane-build]
     timeout-minutes: 75
     env:
       BUILD_ROOT_NAME: vane-build-${{ github.run_id }}-${{ github.run_attempt }}
