@@ -9,17 +9,17 @@ import (
 	"testing"
 )
 
-// TestFetchTargetCutoverHasNoCurrentLegacyNamespaces keeps the old account
-// source model from returning through a production file or package. Applied
-// SQL migrations, immutable wire readers and explicit compatibility tests are
-// the only places allowed to know the retired names.
-func TestFetchTargetCutoverHasNoCurrentLegacyNamespaces(t *testing.T) {
+// TestTaskToolRuntimeHasNoRetiredCurrentPackages keeps the old catalog/spec
+// layers and account source product from returning as production packages.
+func TestTaskToolRuntimeHasNoRetiredCurrentPackages(t *testing.T) {
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("resolve guard file")
 	}
 	root := filepath.Dir(filepath.Dir(file))
 	for _, retiredPath := range []string{
+		"capabilitycatalog",
+		"fetchspec",
 		"sourcecatalog",
 		"sourcespec",
 		filepath.Join("store", "sources.go"),
@@ -64,5 +64,20 @@ func TestFetchTargetCutoverHasNoCurrentLegacyNamespaces(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	for _, rel := range []string{
+		filepath.Join("agent", "tools.go"),
+		filepath.Join("agent", "loop.go"),
+	} {
+		body, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, retired := range []string{"approved_fetch_plan", "fetch_requirements"} {
+			if strings.Contains(string(body), retired) {
+				t.Errorf("retired model field %q remains in %s", retired, rel)
+			}
+		}
 	}
 }

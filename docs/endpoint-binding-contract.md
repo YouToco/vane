@@ -6,17 +6,16 @@
 
 ## Boundary
 
-`tikhubcatalog` is the lookup catalog for one-off public research.
-`capabilitycatalog` is the allowlist for recurring acquisition capabilities.
-They are intentionally different:
+`tikhubcatalog` contains one-off public-research endpoints. Scheduled
+acquisition is exposed as versioned Agent Tools. They are intentionally
+different:
 
 - lookup results are untrusted text returned to the model and never enter
   `content_items`;
-- recurring acquisition uses only reviewed `capabilitycatalog` entries;
-- an approved task manual is compiled through `fetchspec`;
-- the compiler materializes internal `fetch_targets` and the exact
-  `task_fetch_targets` projection;
-- users never bind, list, enable, disable, or delete target instances.
+- scheduled acquisition uses only reviewed Tool definitions;
+- the Agent selects Tools directly from the task manual;
+- exact Tool calls are sealed in the approved task head and run snapshot;
+- users never bind, list, enable, disable, or delete acquisition instances.
 
 ## Binding model
 
@@ -42,12 +41,12 @@ declared parameter substitution. It does not admit regex, XPath, JavaScript,
 arbitrary predicates, or runtime-authored code.
 
 Provider endpoint names and transport details remain in trusted binding
-templates. `fetch_targets.config` contains only capability parameters from the
-task plan; provider-specific routing is never model-authored or user-authored.
+templates. Canonical Tool arguments contain only public capability parameters;
+provider-specific routing is never model-authored or user-authored.
 
 ## Admission
 
-A recurring capability may enter `capabilitycatalog` only after:
+A scheduled acquisition Tool may become available only after:
 
 1. fixture tests cover a real response shape;
 2. required identity fields are present;
@@ -56,23 +55,22 @@ A recurring capability may enter `capabilitycatalog` only after:
 5. parameter validation rejects unknown or missing fields;
 6. paid enrichment is protected by the shared cost gate.
 
-There is no per-user or per-target trial run. Exact acquisition identity is
-`{platform, capability, url, config}`; title is display-only. Materialization
-may reuse an existing target only when that full identity matches.
+There is no per-user or per-target trial run. Exact invocation identity is the
+versioned Tool name plus canonical arguments; display labels are not identity.
 
 ## Runtime
 
 Every run:
 
 1. loads the task’s frozen approved definition;
-2. verifies exact equality with its frozen target identities;
+2. verifies the exact frozen Tool invocations;
 3. resolves the trusted binding template;
-4. validates parameters against the current reviewed capability;
-5. stops before network or billing on identity drift;
+4. validates parameters against the retained Tool version;
+5. stops before network or billing on route drift;
 6. calls the provider with bounded timeout and response size;
 7. maps items through the declared binding;
 8. rejects empty identities and response-shape drift;
-9. records upstream attribution, cost, and failure health;
+9. records upstream attribution, cost, and the Tool invocation outcome;
 10. writes canonical content and provenance.
 
 Provider failure is explicit. In particular, X capabilities use only the
@@ -82,17 +80,15 @@ or another third-party X data service.
 ## Failure and health
 
 Network, authentication, rate-limit, endpoint-removal, parameter-drift, and
-response-shape failures increment internal target health. A successful fetch
-clears consecutive failure state. Task editing or re-approval resets automatic
-suspension only for that task’s approved targets.
+response-shape failures are recorded on the run's Tool invocation. They never
+mutate a shared global acquisition object.
 
 An empty or corrupt approved task plan fails closed before external calls,
 database business writes, model scoring, or delivery.
 
 ## Current references
 
-- `capabilitycatalog/`
-- `fetchspec/`
+- `acquisitiontool/`
 - `fetcher/binding.go`
 - `fetcher/identity.go`
-- `docs/task-playbook-fetch-target-cutover.md`
+- `docs/task-manual-tool-runtime.md`
