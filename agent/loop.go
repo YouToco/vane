@@ -86,7 +86,8 @@ const directTaskDefinitionEditResponseRetrySystemNote = `
 - 你刚才没有调用 edit_task_definition；该回复已被系统丢弃。若变更要求足够，现在调用 edit_task_definition；若确实不足，不得编造，应自然追问。`
 
 const naturalTaskDefinitionEditSystemNote = `
-- 用户已在当前消息中明确要求修改一个已有任务。整条消息是一项任务定义编辑，不得因为同时包含频率、任务手册、信息入口、推送门槛或输出格式而要求用户拆分。
+- 本隔离流程来自用户句首明确发出的任务修改命令，或紧接该命令后对可读候选的简短选择。原始命令与本次选择都在当前消息列表中；不得把咨询、假设或否定表达当成执行命令。
+- 整项请求是一项任务定义编辑，不得因为同时包含频率、任务手册、信息入口、推送门槛或输出格式而要求用户拆分。
 - 用户不需要提供内部 ID。按用户记得的名称、时间、主题或用途定位任务；得到唯一匹配后一次性编辑，完整承载本条消息要求。
 - 本轮不得调用 web_search、read_page、search_endpoints、create_schedule、画像工具或其他工具。任务手册中要求未来运行时打开网页，不代表现在要联网。
 - 若 list_schedules 后确有多个合理候选，只用人能看懂的任务名称做一次针对性追问。没有真实调用 edit_task_definition 就绝不能声称已修改。`
@@ -770,16 +771,28 @@ func (l *Loop) handleMessage(
 		return Outcome{}, err
 	}
 
+	// Decode and scrub before routing so a targeted clarification can resume
+	// the immediately preceding isolated edit turn without persisting an
+	// internal task ID. Only the original command and the readable assistant
+	// question are reused; task candidates are resolved again under the current
+	// owner on the follow-up turn.
+	history := l.scrubUntrustedHistory(decodeMessages(sess))
 	directDefinitionEdit := directDefinitionEditTaskID != ""
 	directTaskCreation := directActionID != "" && !directDefinitionEdit
 	if directActionID == "" {
 		directTaskCreation = !externalInput &&
 			isDirectTaskCreationRequest(text)
 	}
+	naturalTaskDefinitionEditContinuation :=
+		!externalInput &&
+			!directTaskCreation &&
+			!directDefinitionEdit &&
+			isNaturalTaskDefinitionEditContinuation(history)
 	naturalTaskDefinitionEdit := !externalInput &&
 		!directTaskCreation &&
 		!directDefinitionEdit &&
-		isNaturalTaskDefinitionEditRequest(text)
+		(isNaturalTaskDefinitionEditRequest(text) ||
+			naturalTaskDefinitionEditContinuation)
 	directProposal := directTaskCreation || directDefinitionEdit ||
 		naturalTaskDefinitionEdit
 
@@ -794,7 +807,6 @@ func (l *Loop) handleMessage(
 
 	// 兼容清洗部署前已经落库的外部 tool result：不能只保护新写入，否则旧会话
 	// 在下一条消息仍会与画像和完整工具面同屏。
-	history := l.scrubUntrustedHistory(decodeMessages(sess))
 	// 外部追问/引用正文的首轮模型请求不能看到既有会话：即使零工具、
 	// 零画像，恶意正文仍可直接要求模型复述旧私聊/任务结果。
 	// self-contained direct-task-creation 同样只给当前用户消息：历史里可能
@@ -803,6 +815,9 @@ func (l *Loop) handleMessage(
 	modelHistory := history
 	if externalInput || directProposal {
 		modelHistory = nil
+	}
+	if naturalTaskDefinitionEditContinuation {
+		modelHistory = naturalTaskDefinitionEditContinuationHistory(history)
 	}
 	msgs := append(modelHistory, llm.ChatMessage{Role: "user", Content: text})
 	msgs = truncateMessages(msgs)
@@ -1468,6 +1483,13 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 	}
 	static := make([]llm.ToolDef, 0, len(l.toolDefs))
 	for _, def := range l.toolDefs {
+		if def.Name == definitionEditToolName {
+			// ID-based definition editing is never a general-chat capability.
+			// It is projected only by the server-selected Web lane or the
+			// isolated name-resolution lane above, both of which bind the
+			// resulting ID before execution.
+			continue
+		}
 		spec, ok := l.tools[def.Name]
 		if ok && toolVisibleForRequest(spec, state) {
 			static = append(static, def)
@@ -1481,7 +1503,13 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 	if state == nil || state.intentToolkitsEnabled {
 		return candidate
 	}
-	legacy := appendToolDefs(l.toolDefs, dyn)
+	legacyStatic := make([]llm.ToolDef, 0, len(l.toolDefs))
+	for _, def := range l.toolDefs {
+		if def.Name != definitionEditToolName {
+			legacyStatic = append(legacyStatic, def)
+		}
+	}
+	legacy := appendToolDefs(legacyStatic, dyn)
 	if state.intentToolkitsShadow && !state.intentToolkitsShadowSeen {
 		state.intentToolkitsShadowSeen = true
 		state.intentToolkitsLegacyCount = len(legacy)
@@ -1703,6 +1731,21 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 				))
 				return out, nil
 			}
+		}
+	}
+	if state == nil || (state.directTaskDefinitionEditID == "" &&
+		!state.naturalTaskDefinitionEdit) {
+		for _, call := range calls {
+			if call.Name != definitionEditToolName {
+				continue
+			}
+			for _, rejected := range calls {
+				out = append(out, toolMsg(
+					rejected.ID,
+					"任务定义编辑只允许在系统已绑定唯一任务的编辑流程中执行；本批未执行。",
+				))
+			}
+			return out, nil
 		}
 	}
 	if state != nil && state.directTaskCreation {
@@ -2231,17 +2274,27 @@ func isNaturalTaskDefinitionEditRequest(text string) bool {
 	if normalized == "" {
 		return false
 	}
-	if containsAny(normalized,
-		"不要修改", "别修改", "不要更新", "别更新", "取消修改",
-		"不要把", "别把", "不要将", "别将", "不许把", "禁止把",
-		"不需要把", "无需把", "不用把", "不是要把",
-		"暂不修改", "先不修改", "donotedit", "don'tedit", "canceledit",
-	) {
+	// This is a high-confidence fast lane, not a general natural-language
+	// authorization classifier. Anchor it to ordinary command openings so
+	// negation ("我不想把…"), hypotheticals ("如果把…") and advice
+	// questions ("你觉得把…怎么样") stay in ordinary conversation. The
+	// model still interprets the requested change; the harness only decides
+	// whether it is safe to isolate the turn from unrelated tools.
+	startsAsCommand := startsWithAny(normalized,
+		"把", "请把", "帮我把", "麻烦把", "能不能把", "能否把", "可否把", "可以把",
+		"将", "请将", "帮我将", "麻烦将", "能不能将", "能否将", "可否将", "可以将",
+		"修改", "请修改", "帮我修改", "麻烦修改",
+		"更新", "请更新", "帮我更新", "麻烦更新",
+		"调整", "请调整", "帮我调整", "麻烦调整",
+		"change", "pleasechange", "update", "pleaseupdate",
+	)
+	if !startsAsCommand {
 		return false
 	}
 	if containsAny(normalized,
-		"为什么", "怎么修改", "怎么更新", "如何修改", "如何更新",
-		"什么是", "是否已经", "是否已", "why", "howdo", "howcan",
+		"你觉得", "是否应该", "应该吗", "要不要", "怎么样",
+		"会有什么影响", "会怎样", "可行吗",
+		"whatwouldhappen", "shouldwe", "doyouthink",
 	) {
 		return false
 	}
@@ -2256,6 +2309,29 @@ func isNaturalTaskDefinitionEditRequest(text string) bool {
 	return hasTaskTarget && hasEdit
 }
 
+func isNaturalTaskDefinitionEditContinuation(history []llm.ChatMessage) bool {
+	if len(history) < 2 {
+		return false
+	}
+	owner := history[len(history)-2]
+	assistant := history[len(history)-1]
+	if owner.Role != "user" || assistant.Role != "assistant" ||
+		!isNaturalTaskDefinitionEditRequest(owner.Content) {
+		return false
+	}
+	_, ok := directClarificationReply(assistant.Content)
+	return ok
+}
+
+func naturalTaskDefinitionEditContinuationHistory(
+	history []llm.ChatMessage,
+) []llm.ChatMessage {
+	if !isNaturalTaskDefinitionEditContinuation(history) {
+		return nil
+	}
+	return append([]llm.ChatMessage(nil), history[len(history)-2:]...)
+}
+
 func validNaturalEditScheduleQuery(raw json.RawMessage, ownerRequest string) bool {
 	var args struct {
 		Query string `json:"query"`
@@ -2264,12 +2340,11 @@ func validNaturalEditScheduleQuery(raw json.RawMessage, ownerRequest string) boo
 		return false
 	}
 	query := normalizeScheduleLookupText(args.Query)
-	if len([]rune(query)) < 4 {
+	if len([]rune(query)) < 2 {
 		return false
 	}
 	switch query {
-	case "任务", "日报", "周报", "月报", "早报", "每周", "每天",
-		"推送", "task", "schedule":
+	case "任务", "task", "schedule":
 		return false
 	}
 	lookupScope := naturalEditLookupScope(ownerRequest)
@@ -2295,7 +2370,11 @@ func naturalEditLookupScope(ownerRequest string) string {
 		}
 	}
 	if earliest == len(normalized) {
-		return ""
+		// A targeted follow-up such as “周报那个” intentionally contains no
+		// second edit marker. Its immediately preceding isolated turn has
+		// already established the edit operation; the current owner words only
+		// select the readable candidate and are safe as the lookup scope.
+		return normalized
 	}
 	return normalized[:earliest]
 }
