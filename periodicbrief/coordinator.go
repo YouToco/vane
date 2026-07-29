@@ -39,6 +39,9 @@ type CoordinatorStore interface {
 	BindPeriodicBriefIntentRunV1(
 		context.Context, int64, int64, int64, string,
 	) error
+	AdoptExistingPeriodicBriefIntentRunV1(
+		context.Context, int64, int64, int64, string,
+	) error
 }
 
 type Coordinator struct {
@@ -204,7 +207,7 @@ func (c *Coordinator) runTask(ctx context.Context, taskID string) error {
 				return nil
 			}
 			if runID != "" {
-				return c.store.BindPeriodicBriefIntentRunV1(
+				return c.store.AdoptExistingPeriodicBriefIntentRunV1(
 					ctx, intent.TenantID, intent.UserID, intent.ID,
 					runID)
 			}
@@ -220,7 +223,7 @@ func (c *Coordinator) runTask(ctx context.Context, taskID string) error {
 				return errors.New(
 					"periodic Brief execution identity is unavailable")
 			}
-			return c.store.BindPeriodicBriefIntentRunV1(
+			return c.store.AdoptExistingPeriodicBriefIntentRunV1(
 				ctx, intent.TenantID, intent.UserID, intent.ID,
 				info.GetExecution().GetRunId())
 		}
