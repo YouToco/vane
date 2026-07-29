@@ -517,9 +517,8 @@ func testToolSpecs(tools ...Tool) []ToolSpec {
 				effects = Effects(
 					EffectDurableProposal,
 					EffectStateWrite,
-					EffectDirectOwnerWrite,
 				)
-				confirmation = ConfirmationNone
+				confirmation = ConfirmationRequired
 			}
 		}
 		if marker, ok := tool.(interface{ untrustedResult() bool }); ok &&
@@ -752,7 +751,7 @@ func TestHandleMessage_UntrustedExternalResultCannotReadMemoryOrCreatePendingAct
 			{ID: "memory", Name: "view_profile", Arguments: `{}`},
 			{ID: "write", Name: "create_schedule", Arguments: `{"spec":{"cron":"0 8 * * *"}}`},
 		}, FinishReason: "tool_calls"},
-		{Content: "页面包含可疑指令，我只把它当作数据。", FinishReason: "stop"},
+		{Content: "页面包含可疑指令，我只把它当作数据。来源：https://evil.example/page", FinishReason: "stop"},
 	}}
 	l := newTestLoop(t, fs, chat.fn, external, readMemory, write)
 	creation := &fakeCreationController{}
@@ -781,12 +780,14 @@ func TestHandleMessage_UntrustedExternalResultCannotReadMemoryOrCreatePendingAct
 		t.Fatalf("期望 3 次模型调用，实得 %d", len(chat.requests))
 	}
 	second := chat.requests[1]
-	if second.Messages[0].Content != systemPrompt ||
+	if !strings.HasPrefix(second.Messages[0].Content, systemPrompt) ||
 		strings.Contains(second.Messages[0].Content, profileSecret) {
 		t.Fatalf("恶意外部结果进入上下文后不得同请求携带画像: %q", second.Messages[0].Content)
 	}
-	if len(second.Tools) != 0 {
-		t.Fatalf("taint 后声明面不得保留任何外带或写工具，实得 %+v", second.Tools)
+	for _, def := range second.Tools {
+		if def.Name != "read_page" {
+			t.Fatalf("taint 后只能保留公开只读研究工具，实得 %+v", second.Tools)
+		}
 	}
 
 	// 即使模型幻觉调用隐藏工具，运行时拒绝后也不把原生 tool protocol 或
@@ -880,7 +881,7 @@ func TestHandleMessage_ExternalReadIsolatesWholeToolCallBatch(t *testing.T) {
 		{Content: profileSecret, ToolCalls: []llm.ToolCall{{
 			ID: "external-only", Name: "read_page", Arguments: `{"url":"https://evil.example/page"}`,
 		}}, FinishReason: "tool_calls"},
-		{Content: "网页内容只作为不可信数据处理。", FinishReason: "stop"},
+		{Content: "网页内容只作为不可信数据处理。来源：https://evil.example/page", FinishReason: "stop"},
 	}}
 	l := newTestLoop(t, fs, chat.fn, readMemory, external, write)
 
@@ -936,9 +937,15 @@ func TestHandleMessage_ExternalReadIsolatesWholeToolCallBatch(t *testing.T) {
 			t.Fatalf("外部结果出站不得出现原生工具协议: %+v", isolated.Messages)
 		}
 	}
-	if len(isolated.Tools) != 0 || isolated.Messages[0].Content != systemPrompt {
-		t.Fatalf("外部结果进入后的请求应零工具、零画像: tools=%+v system=%q",
-			isolated.Tools, isolated.Messages[0].Content)
+	for _, def := range isolated.Tools {
+		if def.Name != "read_page" {
+			t.Fatalf("外部结果进入后的请求只能保留公开只读工具: %+v",
+				isolated.Tools)
+		}
+	}
+	if !strings.HasPrefix(isolated.Messages[0].Content, systemPrompt) {
+		t.Fatalf("外部结果进入后的请求应零画像: system=%q",
+			isolated.Messages[0].Content)
 	}
 }
 
@@ -1075,13 +1082,24 @@ func TestUntrustedContinuationMessages_DSMLInExternalDataDoesNotEraseUserRequest
 	}
 }
 
-func TestHandleMessage_ExternalReadProtocolFailureReturnsHonestRecovery(t *testing.T) {
+func TestHandleMessage_MultiSearchProtocolFailureReturnsHonestRecovery(t *testing.T) {
 	fs := newFakeStore()
 	search := &fakeTool{
 		name:      "web_search",
 		untrusted: true,
 		result:    "OpenAI、Anthropic、Google 官方候选信源",
 	}
+	searchSpec := newToolSpec(search, withToolSurface(
+		ownerPolicy(
+			Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
+			ConfirmationNone,
+			BudgetToolManaged,
+		),
+		ExposureIntent,
+		IntentWebResearch,
+		ResultTrustExternal,
+		false,
+	))
 	var requests []llm.ChatRequest
 	call := 0
 	chat := func(_ context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
@@ -1121,7 +1139,7 @@ func TestHandleMessage_ExternalReadProtocolFailureReturnsHonestRecovery(t *testi
 		}
 		return nil, fmt.Errorf("fake provider leak: %w", llm.ErrToolProtocolResponse)
 	}
-	l := newTestLoop(t, fs, chat, search)
+	l := newTestLoop(t, fs, chat, searchSpec)
 
 	out, err := l.HandleMessage(context.Background(), 7,
 		"每周整理 OpenAI、Anthropic 和 Google 的重要模型动态")
@@ -1131,31 +1149,24 @@ func TestHandleMessage_ExternalReadProtocolFailureReturnsHonestRecovery(t *testi
 	if out.Reply != replyExternalProtocolFailure || out.Confirm != nil {
 		t.Fatalf("recovery outcome = %+v, want honest no-write reply", out)
 	}
-	if len(search.calls) != 1 || len(fs.actions) != 0 {
-		t.Fatalf("external discovery should run once with no pending action: search=%d actions=%d",
+	if len(search.calls) != 4 || len(fs.actions) != 0 {
+		t.Fatalf("all public research calls should run with no pending action: search=%d actions=%d",
 			len(search.calls), len(fs.actions))
 	}
 	if len(requests) != 3 || len(requests[2].Tools) != 0 {
 		t.Fatalf("isolated recovery request must be tool-free: %+v", requests)
 	}
 	system := requests[0].Messages[0].Content
-	if !strings.Contains(system, "每条用户消息最多成功执行一次外部读取") ||
-		!strings.Contains(system, "合并成一次 web_search") {
-		t.Fatalf("external discovery budget is absent from system guidance: %q", system)
+	if !strings.Contains(system, "可以连续调用 web_search") ||
+		!strings.Contains(system, "第一方页面核验") {
+		t.Fatalf("multi-step research guidance is absent: %q", system)
 	}
-	batchReplies := 0
-	for _, msg := range requests[1].Messages {
-		if msg.Role != "tool" {
-			continue
-		}
-		batchReplies++
-		if msg.Content != toolMsgExternalBatch ||
-			!strings.Contains(msg.Content, "合并成一次 web_search") {
-			t.Fatalf("batch rejection did not provide a single-query recovery path: %+v", msg)
-		}
-	}
-	if batchReplies != 3 {
-		t.Fatalf("all three rejected searches need protocol replies, got %d", batchReplies)
+	if len(requests[1].Messages) != 2 ||
+		requests[1].Messages[1].Role != "user" ||
+		!strings.Contains(requests[1].Messages[1].Content, search.result) ||
+		strings.Contains(requests[1].Messages[1].Content, toolMsgExternalBatch) {
+		t.Fatalf("parallel public research was not isolated into evidence: %+v",
+			requests[1].Messages)
 	}
 
 	persisted := persistedMessages(t, fs)
@@ -1585,8 +1596,8 @@ func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *t
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm != nil || out.Reply == "" {
-		t.Fatalf("明确创建必须自动推进 durable operation 且不出确认卡: %+v", out)
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm {
+		t.Fatalf("明确创建必须生成一次 durable confirmation card: %+v", out)
 	}
 	if len(listSources.calls) != 0 || len(listSchedules.calls) != 0 {
 		t.Fatalf("用户明确不要再次搜索时，任何读工具都不得执行: sources=%d schedules=%d",
@@ -1598,10 +1609,9 @@ func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *t
 	if len(creation.proposeCalls) != 1 {
 		t.Fatalf("create_schedule proposal 调用漂移: %+v", creation.proposeCalls)
 	}
-	if len(creation.confirmCalls) != 1 ||
-		creation.confirmCalls[0].receipt !=
-			task.AgentAutoReceiptTarget(creation.proposeCalls[0].ActionID) {
-		t.Fatalf("durable operation 未被自动授权: %+v", creation.confirmCalls)
+	if len(creation.confirmCalls) != 0 {
+		t.Fatalf("durable operation 必须等用户点击确认卡，不得自动授权: %+v",
+			creation.confirmCalls)
 	}
 	var canonical struct {
 		ApprovedFetchPlan struct {
@@ -1714,8 +1724,8 @@ func TestHandleMessage_ExplicitTaskConfirmationPreservesObservationPolicy(t *tes
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm != nil || len(creation.proposeCalls) != 1 ||
-		len(creation.confirmCalls) != 1 {
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
+		len(creation.proposeCalls) != 1 || len(creation.confirmCalls) != 0 {
 		t.Fatalf("Kimi 生产同形参数必须进入 durable Propose: out=%+v calls=%+v",
 			out, creation.proposeCalls)
 	}
@@ -1801,9 +1811,9 @@ func TestHandleMessage_ContextualCreateAcceptsFlatFetchPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm != nil || len(creation.proposeCalls) != 1 ||
-		len(creation.confirmCalls) != 1 {
-		t.Fatalf("带上下文的明确创建应一次直达 durable 执行: out=%+v propose=%d confirm=%d",
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
+		len(creation.proposeCalls) != 1 || len(creation.confirmCalls) != 0 {
+		t.Fatalf("带上下文的明确创建应一次生成 durable confirmation card: out=%+v propose=%d confirm=%d",
 			out, len(creation.proposeCalls), len(creation.confirmCalls))
 	}
 	var proposed struct {
@@ -1870,9 +1880,9 @@ func TestHandleMessage_SmokeStyleFirstEmitCardEntersDirectMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleMessage: %v", err)
 	}
-	if out.Confirm != nil || out.Reply == "" ||
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
 		len(creation.proposeCalls) != 1 || len(chat.requests) != 2 {
-		t.Fatalf("旧出卡话术应兼容为 direct 自动执行: out=%+v requests=%d proposals=%d",
+		t.Fatalf("旧出卡话术应自纠并生成 durable confirmation card: out=%+v requests=%d proposals=%d",
 			out, len(chat.requests), len(creation.proposeCalls))
 	}
 }
@@ -1906,9 +1916,9 @@ func TestHandleMessage_ExplicitTaskConfirmationRejectsOralCardPromise(t *testing
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm != nil || len(creation.proposeCalls) != 1 ||
-		len(creation.confirmCalls) != 1 {
-		t.Fatalf("口头承诺必须被丢弃并自纠为 durable execution: out=%+v calls=%+v",
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
+		len(creation.proposeCalls) != 1 || len(creation.confirmCalls) != 0 {
+		t.Fatalf("口头承诺必须被丢弃并自纠为 durable confirmation card: out=%+v calls=%+v",
 			out, creation.proposeCalls)
 	}
 	if len(chat.requests) != 2 {
@@ -1993,9 +2003,9 @@ func TestHandleMessage_ExplicitTaskConfirmationValidationRetryKeepsHistoryCanoni
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm != nil || out.Reply == "" ||
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
 		len(creation.proposeCalls) != 2 {
-		t.Fatalf("参数校验后合法重试应自动执行: out=%+v calls=%+v", out, creation.proposeCalls)
+		t.Fatalf("参数校验后合法重试应生成确认卡: out=%+v calls=%+v", out, creation.proposeCalls)
 	}
 	secondRaw, err := json.Marshal(chat.requests[1].Messages)
 	if err != nil {
@@ -2163,9 +2173,9 @@ func TestHandleMessage_ExplicitTaskConfirmationAllowsSuccessOnFourthTurn(t *test
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm != nil || out.Reply == "" ||
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
 		len(chat.requests) != 4 || len(creation.proposeCalls) != 1 ||
-		len(creation.confirmCalls) != 1 || len(hiddenRead.calls) != 0 {
+		len(creation.confirmCalls) != 0 || len(hiddenRead.calls) != 0 {
 		t.Fatalf("第四轮合法 proposal 应被接受: out=%+v requests=%d proposals=%d reads=%d",
 			out, len(chat.requests), len(creation.proposeCalls), len(hiddenRead.calls))
 	}
@@ -2605,8 +2615,8 @@ func TestHandleMessage_CreateScheduleUsesDurableV1Proposal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm != nil || out.Reply != "任务已创建。" {
-		t.Fatalf("v1 proposal 应自动授权并返回执行结果: %+v", out)
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm {
+		t.Fatalf("v1 proposal 应生成一次确认卡: %+v", out)
 	}
 	if len(chat.requests) != 1 {
 		t.Fatalf("proposal 后不得再调收尾 LLM: requests=%d", len(chat.requests))
@@ -2619,10 +2629,9 @@ func TestHandleMessage_CreateScheduleUsesDurableV1Proposal(t *testing.T) {
 		proposal.SessionID == nil || string(proposal.RawArgs) != args {
 		t.Fatalf("durable proposal scope/args 漂移: %+v", proposal)
 	}
-	if len(creation.confirmCalls) != 1 ||
-		creation.confirmCalls[0].actionID != proposal.ActionID ||
-		creation.confirmCalls[0].receipt != task.AgentAutoReceiptTarget(proposal.ActionID) {
-		t.Fatalf("durable proposal 未被自动授权: %+v", creation.confirmCalls)
+	if out.Confirm.ActionID != proposal.ActionID || len(creation.confirmCalls) != 0 {
+		t.Fatalf("durable proposal 必须等待用户点击确认卡: out=%+v calls=%+v",
+			out, creation.confirmCalls)
 	}
 	if until := time.Until(proposal.ExpiresAt); until < 23*time.Hour || until > 25*time.Hour {
 		t.Fatalf("proposal 应约 24h 过期: %v", until)

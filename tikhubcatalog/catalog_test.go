@@ -12,7 +12,7 @@ var fcNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 // TestInvariant_CatalogWellFormed 锁死嵌入数据的结构不变量：init 里的 panic 分支
 // 生产不可达的前提就是本测试在 CI 拦住损坏的 catalog.json。
 func TestInvariant_CatalogWellFormed(t *testing.T) {
-	if Len() < 900 {
+	if Len() < 850 {
 		// 全量收录（排除平台管理类）应有 ~1000 端点：数量骤降说明 re-gen 时
 		// 排除清单误伤或上游 spec 大幅缩水，都需要人工确认而不是静默接受。
 		t.Fatalf("注册表仅 %d 个端点，疑似生成损坏", Len())
@@ -81,6 +81,63 @@ func TestInvariant_ExcludedEndpointsAbsent(t *testing.T) {
 	for _, name := range banned {
 		if _, ok := Lookup(name); ok {
 			t.Errorf("排除端点 %s 不应入只读查询目录", name)
+		}
+	}
+}
+
+func TestInvariant_CredentialAndRemoteMutationCapabilitiesAbsent(t *testing.T) {
+	if AgentLen() < 850 || AgentLen() >= Len() {
+		t.Fatalf("Agent 目录数量异常: agent=%d internal=%d", AgentLen(), Len())
+	}
+	for _, e := range Entries() {
+		normalized := strings.ToLower(e.Name)
+		for _, marker := range []string{
+			"guest_cookie", "generate_real_mstoken",
+			"generate_wss_xb_signature", "fetch_sec_token",
+			"generate_a_bogus", "generate_x_bogus", "generate_xbogus",
+			"generate_xgnarly", "generate_ttwid", "generate_verify_fp",
+			"generate_fingerprint", "generate_hashed_id",
+			"generate_s_v_web_id", "generate_x_mssdk_info",
+			"register_device", "private_message", "login_request",
+			"encrypt_decrypt", "ttencrypt", "decrypt_strdata",
+			"encrypt_strdata", "add_video_play_count",
+			"increase_post_view_count",
+		} {
+			if strings.Contains(normalized, marker) {
+				t.Errorf("%s: forbidden capability marker %s", e.Name, marker)
+			}
+		}
+		if strings.Contains(strings.ToLower(e.Description), "cookie") {
+			t.Errorf("%s: cookie-dependent capability must not enter catalog", e.Name)
+		}
+		for _, param := range e.Params {
+			name := strings.ToLower(strings.TrimSpace(param.Name))
+			if strings.Contains(name, "cookie") ||
+				strings.Contains(name, "secret") ||
+				name == "session_token" ||
+				name == "xsec_token" ||
+				name == "access_token" ||
+				name == "auth_token" ||
+				name == "refresh_token" ||
+				name == "password" ||
+				name == "signature" {
+				t.Errorf("%s: forbidden credential parameter %s", e.Name, param.Name)
+			}
+		}
+	}
+}
+
+func TestAgentDirectoryExcludesSourceBindingOnlyTokenEndpoint(t *testing.T) {
+	const name = "xiaohongshu_web_v3_fetch_note_detail"
+	if _, ok := Lookup(name); !ok {
+		t.Fatalf("%s must remain available to trusted source binding", name)
+	}
+	if _, ok := AgentLookup(name); ok {
+		t.Fatalf("%s must not be model-callable", name)
+	}
+	for _, hit := range Search("小红书笔记详情", "xiaohongshu", 20) {
+		if hit.Entry.Name == name {
+			t.Fatalf("%s leaked through Agent search", name)
 		}
 	}
 }

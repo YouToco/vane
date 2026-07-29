@@ -93,7 +93,7 @@ func (ix *bm25Index) search(query, platform string, topK int) []Hit {
 	// 查询词去重：BM25 对重复查询词累加没有检索意义，还会放大误拼权重。
 	seen := make(map[string]bool, len(qToks))
 	scores := make(map[int]float64)
-	n := float64(len(entries))
+	n := float64(len(agentEntries))
 	for _, tok := range qToks {
 		if seen[tok] {
 			continue
@@ -113,12 +113,16 @@ func (ix *bm25Index) search(query, platform string, topK int) []Hit {
 	}
 
 	platform = strings.ToLower(strings.TrimSpace(platform))
+	allowAdvanced := explicitAdvancedAnalyticsQuery(query)
 	hits := make([]Hit, 0, len(scores))
 	for doc, s := range scores {
-		if platform != "" && entries[doc].Platform != platform {
+		if platform != "" && agentEntries[doc].Platform != platform {
 			continue
 		}
-		hits = append(hits, Hit{Entry: entries[doc], Score: s})
+		if advancedAnalyticsEntry(agentEntries[doc]) && !allowAdvanced {
+			continue
+		}
+		hits = append(hits, Hit{Entry: agentEntries[doc], Score: s})
 	}
 	// 分数降序，同分按名字典序——检索结果给模型看，顺序不能因 map 遍历序抖动。
 	sort.Slice(hits, func(i, j int) bool {
@@ -131,6 +135,35 @@ func (ix *bm25Index) search(query, platform string, topK int) []Hit {
 		hits = hits[:topK]
 	}
 	return hits
+}
+
+func explicitAdvancedAnalyticsQuery(query string) bool {
+	normalized := strings.ToLower(query)
+	for _, marker := range []string{
+		"广告", "投放", "店铺", "电商", "带货", "创作者分析", "达人分析",
+		"ads", "advertising", "shop", "commerce", "creator analytics",
+		"merchant", "douplus", "星图", "xingtu",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func advancedAnalyticsEntry(entry Entry) bool {
+	normalized := strings.ToLower(strings.Join([]string{
+		entry.Name, entry.Tag, entry.Summary,
+	}, " "))
+	for _, marker := range []string{
+		"douplus", "xingtu", "星图", "广告", "投放", "shop", "commerce",
+		"merchant", "creator analytics", "创作者分析", "达人分析",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // tokenize 中英混合分词，规则见文件头注。

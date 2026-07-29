@@ -44,6 +44,9 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Verify agent tool inventory
+        run: go run ./cmd/agenttoolinventory -check
+
       - name: Test
         run: go test -race -coverprofile=coverage.txt -covermode=atomic ./...
         env:

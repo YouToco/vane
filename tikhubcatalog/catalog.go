@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 //go:embed catalog.json
@@ -55,6 +56,12 @@ type Entry struct {
 var (
 	entries []Entry
 	byName  map[string]int
+	// agentEntries is the provider-neutral, read-only discovery directory.
+	// entries/byName remain the complete internal invocation registry because
+	// long-running source bindings may rely on transport tokens that must never
+	// become model-callable parameters.
+	agentEntries []Entry
+	agentByName  map[string]int
 	// platforms 平台名 → 端点数，供 search_endpoints 工具描述枚举可搜索范围。
 	platforms map[string]int
 	idx       *bm25Index
@@ -68,15 +75,21 @@ func init() {
 		panic(fmt.Sprintf("tikhubcatalog: 嵌入的 catalog.json 解析失败: %v", err))
 	}
 	byName = make(map[string]int, len(entries))
+	agentByName = make(map[string]int, len(entries))
 	platforms = make(map[string]int)
 	for i, e := range entries {
 		if _, dup := byName[e.Name]; dup {
 			panic(fmt.Sprintf("tikhubcatalog: 端点名重复 %q（catalog.json 损坏，请重新生成）", e.Name))
 		}
 		byName[e.Name] = i
+		if !agentEligible(e) {
+			continue
+		}
+		agentByName[e.Name] = len(agentEntries)
+		agentEntries = append(agentEntries, e)
 		platforms[e.Platform]++
 	}
-	idx = buildIndex(entries)
+	idx = buildIndex(agentEntries)
 }
 
 // Lookup 按工具名取端点。ok=false 表示注册表里没有这个端点。
@@ -88,8 +101,27 @@ func Lookup(name string) (Entry, bool) {
 	return entries[i], true
 }
 
+// AgentLookup resolves only entries admitted to the model-callable discovery
+// directory. Use Lookup for trusted internal source-binding execution.
+func AgentLookup(name string) (Entry, bool) {
+	i, ok := agentByName[name]
+	if !ok {
+		return Entry{}, false
+	}
+	return agentEntries[i], true
+}
+
 // Len 返回注册表端点总数。
 func Len() int { return len(entries) }
+
+// Entries returns a defensive copy of the model-callable discovery directory.
+// Provider routing and source-binding-only entries remain internal.
+func Entries() []Entry {
+	return append([]Entry(nil), agentEntries...)
+}
+
+// AgentLen returns the number of model-callable dynamic tools.
+func AgentLen() int { return len(agentEntries) }
 
 // Platforms 返回全部平台名（字典序），供工具描述与参数校验枚举。
 func Platforms() []string {
@@ -103,6 +135,48 @@ func Platforms() []string {
 
 // PlatformCount 返回平台的端点数；未知平台返回 0。
 func PlatformCount(p string) int { return platforms[p] }
+
+var agentForbiddenCapabilityMarkers = []string{
+	"guest_cookie", "generate_real_mstoken", "generate_wss_xb_signature",
+	"generate_a_bogus", "generate_x_bogus", "generate_xbogus",
+	"generate_xgnarly", "generate_ttwid", "generate_verify_fp",
+	"generate_fingerprint", "generate_hashed_id", "generate_s_v_web_id",
+	"generate_x_mssdk_info", "fetch_sec_token", "register_device",
+	"private_message", "login_request", "encrypt_decrypt", "ttencrypt",
+	"decrypt_strdata", "encrypt_strdata", "encrypt_uid", "encrypt_user_id",
+	"get_sign_image", "add_video_play_count", "increase_post_view_count",
+}
+
+var agentForbiddenCredentialParams = map[string]bool{
+	"access_token": true, "auth_token": true, "authorization": true,
+	"csrf_token": true, "ms_token": true, "mstoken": true,
+	"password": true, "passwd": true, "refresh_token": true,
+	"sec_token": true, "session_token": true, "signature": true,
+	"xsec_token": true,
+}
+
+func agentEligible(entry Entry) bool {
+	haystack := strings.ToLower(strings.Join([]string{
+		entry.Name, entry.Path, entry.Summary, entry.Description,
+	}, " "))
+	if strings.Contains(haystack, "cookie") {
+		return false
+	}
+	for _, marker := range agentForbiddenCapabilityMarkers {
+		if strings.Contains(haystack, marker) {
+			return false
+		}
+	}
+	for _, param := range entry.Params {
+		name := strings.ToLower(strings.TrimSpace(param.Name))
+		if strings.Contains(name, "cookie") ||
+			strings.Contains(name, "secret") ||
+			agentForbiddenCredentialParams[name] {
+			return false
+		}
+	}
+	return true
+}
 
 // Hit 是一次搜索命中。
 type Hit struct {

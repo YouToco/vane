@@ -22,10 +22,10 @@ const (
 - 用户问 API 定价时，只回答 API 是否可用及 API 价格；ChatGPT 等消费订阅价格不能当作 API 定价，也不能据此推断 API 会如何收费。若官方只说 API 即将推出，就明确回答尚未提供 API 定价，并停止扩写。`
 	externalFollowupGroundingRetrySystemNote = `
 - 你刚才的整理没有通过本地证据校验，已被丢弃。只可引用本轮 web_search 结果中真实出现的 URL；删除消费订阅价格、无原文支持的数字和推测。若证据不足，明确说证据不足。`
-	replyExternalFollowupSearchUnavailable = "这个问题需要最新网页证据，但当前没有可用的网页搜索能力；我不会用猜测代替检索，请稍后重试。"
-	replyExternalFollowupSearchNotRun      = "这个问题需要最新网页证据，但这次没有完成真实搜索；我不会用猜测代替检索，请重新发送或稍后再试。"
+	replyExternalFollowupSearchUnavailable = "这个问题需要最新网页证据，但当前没有可用的网页搜索能力；本次无法可靠核验，我不会用猜测代替检索。"
+	replyExternalFollowupSearchNotRun      = "这个问题需要最新网页证据，但这次没有完成真实搜索；本次无法可靠核验，我不会把推测当作检索结果。"
 	replyExternalFollowupNoEvidence        = "已完成网页搜索，但没有找到可引用的结果；我不会在没有证据时猜测。"
-	replyExternalFollowupUngrounded        = "已经完成网页搜索，但这次回复没有通过来源校验；我不会发送无法可靠对应证据的结论，请稍后重试。"
+	replyExternalFollowupUngrounded        = "已经完成网页搜索，但现有证据不足以形成通过来源校验的结论；我不会发送无法可靠对应证据的内容。"
 	toolMsgExternalFollowupSearchRejected  = "本次网页查询未执行：引用消息场景只允许逐字搜索当前用户自己的问题，不能改写查询、附加域名或并列调用其他工具。"
 )
 
@@ -36,12 +36,6 @@ var (
 	)
 	externalFollowupOpenAIProductPattern = regexp.MustCompile(
 		`(?i)\b(?:codex|sora)\b|\bgpt (?:4(?:o)?|5(?:\.\d+)?)\b`,
-	)
-	externalFollowupConcretePricePattern = regexp.MustCompile(
-		`(?i)(?:[$€£¥￥]\s*\d+(?:[.,]\d+)?|\d+(?:[.,]\d+)?\s*(?:usd|eur|gbp|cny|rmb|美元|欧元|英镑|人民币|元))`,
-	)
-	externalFollowupOtherModelPattern = regexp.MustCompile(
-		`(?i)\b(?:gpt|o[1-9]|embedding|image|dall e|realtime|whisper|tts|claude|gemini)\b`,
 	)
 )
 
@@ -393,133 +387,6 @@ func externalFollowupHostMatchesDomain(host, domain string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	return host == domain || strings.HasSuffix(host, "."+domain)
-}
-
-func isGPTLiveAPIPricingQuery(query string) bool {
-	normalized := normalizeExternalFollowupProductText(query)
-	return strings.Contains(normalized, "gpt live") &&
-		followupContainsAny(normalized, "api", "接口") &&
-		followupContainsAny(normalized,
-			"价格", "定价", "收费", "费率", "多少", "多少钱",
-			"计费", "资费", "费用",
-			"price", "pricing", "cost", "how much",
-			"billing", "rate", "rates", "charged",
-		)
-}
-
-func isSingleGPTLiveAPIPricingQuery(query string) bool {
-	if !isGPTLiveAPIPricingQuery(query) {
-		return false
-	}
-	normalized := normalizeExternalFollowupProductText(query)
-	if externalFollowupComparisonIntent(normalized) ||
-		followupContainsAny(normalized,
-			"地区", "区域", "国家", "可用地区", "覆盖范围",
-			"region", "regions", "country", "countries", "geography",
-		) {
-		return false
-	}
-	return len(officialDomainGroupsForExternalFollowupQuery(query)) == 1
-}
-
-func deterministicGPTLiveAPIPricingReply(
-	evidence []externalFollowupSearchEvidence,
-) string {
-	var soonURL string
-	hasSoonEvidence := false
-	var directPricingURL string
-	var directPricingDate string
-	for _, item := range evidence {
-		parsed, err := url.Parse(item.URL)
-		if err != nil {
-			continue
-		}
-		host := strings.ToLower(parsed.Hostname())
-		if !externalFollowupHostMatchesDomain(host, "openai.com") {
-			continue
-		}
-		body := normalizeExternalFollowupProductText(
-			item.Title + "\n" + item.Text,
-		)
-		if !strings.Contains(body, "gpt live") {
-			continue
-		}
-		if directGPTLiveAPIPricingEvidence(item, body) &&
-			(directPricingURL == "" ||
-				item.PublishedDate > directPricingDate) {
-			directPricingURL = normalizeExternalFollowupURL(item.URL)
-			directPricingDate = item.PublishedDate
-		}
-		if followupContainsAny(body,
-			"bring them to the api soon",
-			"bring gpt live to the api soon",
-			"api version is coming soon",
-			"api 版本即将推出",
-			"计划很快提供 api",
-			"即将推出 api",
-		) {
-			hasSoonEvidence = true
-			soonURL = normalizeExternalFollowupURL(item.URL)
-		}
-	}
-	if directPricingURL != "" {
-		return "OpenAI 官方结果已出现 GPT-Live API 定价信息；为避免转述金额出错，" +
-			"请以官方页面为准：" + directPricingURL
-	}
-	if hasSoonEvidence && soonURL != "" {
-		return "本次 OpenAI 官方搜索未找到当前 GPT-Live API 定价页；能确认的是该发布页" +
-			"当时只写明计划很快提供 API，并未给出价格。历史公告不足以证明之后绝对没有更新：" +
-			soonURL
-	}
-	return "已完成 OpenAI 官方网页搜索，但现有结果不足以可靠确认 GPT-Live API 定价；" +
-		"我不会用 ChatGPT 订阅价格或推测代替 API 价格。"
-}
-
-func directGPTLiveAPIPricingEvidence(
-	item externalFollowupSearchEvidence,
-	normalizedBody string,
-) bool {
-	if !strings.Contains(normalizedBody, "gpt live") ||
-		!strings.Contains(normalizedBody, "api") {
-		return false
-	}
-	if followupContainsAny(normalizedBody,
-		"not yet available", "unavailable", "coming soon",
-		"尚未", "暂未", "即将", "计划", "soon",
-	) {
-		return false
-	}
-	lines := strings.Split(item.Title+"\n"+item.Text, "\n")
-	for i, line := range lines {
-		normalizedLine := normalizeExternalFollowupProductText(line)
-		if !externalFollowupConcretePricePattern.MatchString(line) ||
-			!followupContainsAny(normalizedLine,
-				"per 1m", "per million", "/ 1m", "每百万",
-				"per minute", "/minute", "每分钟",
-				"input tokens", "output tokens", "audio tokens",
-			) {
-			continue
-		}
-		window := normalizedLine
-		if i > 0 {
-			window = normalizeExternalFollowupProductText(lines[i-1]) +
-				" " + window
-		}
-		nonTargetWindow := strings.ReplaceAll(window, "gpt live", "")
-		if !strings.Contains(window, "gpt live") ||
-			externalFollowupOtherModelPattern.MatchString(nonTargetWindow) ||
-			followupContainsAny(window,
-				"chatgpt", "subscription", "per month", "/month",
-				"会员", "订阅", "月费", "套餐",
-				"gpt 4", "gpt 5", "claude", "gemini",
-				"gpt realtime", "realtime api",
-				"whisper", "tts", "text to speech", "speech to text",
-			) {
-			continue
-		}
-		return true
-	}
-	return false
 }
 
 func containsExternalFollowupSearch(calls []llm.ToolCall) bool {

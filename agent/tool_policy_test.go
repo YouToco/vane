@@ -67,8 +67,8 @@ func TestProductionToolPolicyGolden(t *testing.T) {
 		},
 		{
 			name:    "create_schedule",
-			effects: Effects(EffectDurableProposal, EffectStateWrite, EffectDirectOwnerWrite),
-			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
+			effects: Effects(EffectDurableProposal, EffectStateWrite),
+			auth:    AuthorizationOwner, confirmation: ConfirmationRequired, budget: BudgetNone,
 		},
 		{
 			name:    "remove_schedule",
@@ -85,8 +85,8 @@ func TestProductionToolPolicyGolden(t *testing.T) {
 			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
-			name: "update_profile", effects: Effects(EffectStateWrite, EffectDirectOwnerWrite),
-			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
+			name: "update_profile", effects: Effects(EffectStateWrite),
+			auth: AuthorizationOwner, confirmation: ConfirmationRequired, budget: BudgetNone,
 		},
 		{
 			name: "view_task_playbook", effects: Effects(EffectInternalRead),
@@ -94,13 +94,13 @@ func TestProductionToolPolicyGolden(t *testing.T) {
 		},
 		{
 			name:    "edit_task_definition",
-			effects: Effects(EffectDurableProposal, EffectStateWrite, EffectDirectOwnerWrite),
-			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
+			effects: Effects(EffectDurableProposal, EffectStateWrite),
+			auth:    AuthorizationOwner, confirmation: ConfirmationRequired, budget: BudgetNone,
 		},
 		{
 			name:    "search_endpoints",
-			effects: Effects(EffectNetworkRead, EffectBillable, EffectActivationWrite),
-			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetToolManaged,
+			effects: Effects(EffectActivationWrite),
+			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
 			name:    "read_endpoint_result",
