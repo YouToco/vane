@@ -4235,3 +4235,41 @@ func TestGroundedBriefFollowupHasZeroToolsAndPersistsOnlyVisibleTurn(
 		t.Fatalf("persisted grounded turn leaked internal context: %s", raw)
 	}
 }
+
+func TestGroundedBriefReplyGuardRunsBeforeVisibleTurnPersistence(
+	t *testing.T,
+) {
+	fs := newFakeStore()
+	chat := func(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		return &llm.ChatResponse{
+			Content: "依据 brief_id: 7 和 source ref source-1。",
+		}, nil
+	}
+	l := newTestLoop(t, fs, chat)
+	const safeReply = "依据两期已冻结简报，当前证据仍不足。"
+	outcome, err := l.HandleGroundedMessageGuarded(
+		t.Context(), 7, "依据是什么？",
+		`{"材料类型":"周期报告"}`,
+		func(raw string) (string, error) {
+			if !strings.Contains(raw, "brief_id") {
+				t.Fatalf("guard did not receive raw reply: %q", raw)
+			}
+			return safeReply, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Reply != safeReply {
+		t.Fatalf("guarded reply = %q, want %q", outcome.Reply, safeReply)
+	}
+	raw, err := json.Marshal(persistedMessages(t, fs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "brief_id") ||
+		strings.Contains(string(raw), "source-1") ||
+		!strings.Contains(string(raw), safeReply) {
+		t.Fatalf("raw reply crossed persistence guard: %s", raw)
+	}
+}
