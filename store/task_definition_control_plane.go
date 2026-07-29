@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"sort"
@@ -14,15 +15,13 @@ import (
 )
 
 // ApprovedDefinitionEditParams is the complete PostgreSQL-side input for one
-// immutable definition edit. ApprovalRef is an opaque, durable confirmation
-// identity and the idempotency key for the resulting version. This Store
-// primitive cannot prove that a user confirmed the candidate: a future durable
-// edit controller must bind the reference to its frozen proposal and confirmed
-// action before this method acquires a production call point.
+// immutable definition edit. OperationRef is an opaque durable identity and the
+// idempotency key for the resulting version. The controller binds it to the
+// frozen operation before this method acquires a production call point.
 type ApprovedDefinitionEditParams struct {
 	ExpectedHead ApprovedDefinitionFence
 	Definition   taskstate.ApprovedDefinitionV1
-	ApprovalRef  string
+	OperationRef string
 }
 
 type approvedDefinitionEditCommand struct {
@@ -30,7 +29,7 @@ type approvedDefinitionEditCommand struct {
 	definition   taskstate.ApprovedDefinitionV1
 	payload      []byte
 	digest       string
-	approvalRef  string
+	operationRef string
 }
 
 // CommitApprovedDefinitionEdit atomically appends one immutable compiled
@@ -40,7 +39,7 @@ type approvedDefinitionEditCommand struct {
 // PostgreSQL cannot atomically update a Temporal Schedule. In particular,
 // SpecJSON, ScopeJSON, and NLDescription must not reach this primitive from a
 // live entry point until a durable edit saga can pause, reconcile, and recover
-// the external schedule. Generic pending_actions v0 claims before execution
+// the external schedule. Generic task_creation_operations v0 claims before execution
 // and is therefore not a valid caller.
 func (s *Store) CommitApprovedDefinitionEdit(
 	ctx context.Context,
@@ -63,9 +62,9 @@ func (s *Store) CommitApprovedDefinitionEdit(
 	if err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
-	existing, err := loadApprovedDefinitionByApprovalRefTx(ctx, tx,
+	existing, err := loadApprovedDefinitionByOperationRefTx(ctx, tx,
 		command.definition.TenantID, command.definition.UserID,
-		command.definition.TaskID, command.approvalRef)
+		command.definition.TaskID, command.operationRef)
 	if err == nil {
 		record, replayErr := replayApprovedDefinitionEdit(
 			ctx, tx, head, command.expectedHead, existing,
@@ -118,16 +117,16 @@ func prepareApprovedDefinitionEditCurrent(
 		return approvedDefinitionEditCommand{}, taskStateValidation(
 			"approved definition edit requires an exact approved source plan")
 	}
-	if !validTaskStateReference(p.ApprovalRef, 1024) {
+	if !validTaskStateReference(p.OperationRef, 1024) {
 		return approvedDefinitionEditCommand{}, taskStateValidation(
-			"approved definition edit confirmation reference is invalid")
+			"approved definition edit operation reference is invalid")
 	}
 	return approvedDefinitionEditCommand{
 		expectedHead: p.ExpectedHead,
 		definition:   definition,
 		payload:      bytes.Clone(payload),
 		digest:       digest,
-		approvalRef:  p.ApprovalRef,
+		operationRef: p.OperationRef,
 	}, nil
 }
 
@@ -180,28 +179,28 @@ func appendApprovedDefinitionEditTx(
 	record := ApprovedDefinitionVersionRecord{
 		Definition: definition, Version: command.expectedHead.Version + 1,
 		Digest: command.digest, Payload: bytes.Clone(command.payload),
-		ApprovalRef: command.approvalRef,
+		OperationRef: command.operationRef,
 	}
 	err = tx.QueryRow(ctx,
 		`INSERT INTO task_approved_definition_versions (
 			tenant_id, user_id, task_id, version, schema_version,
-			execution_mode, definition_digest, payload, approval_ref
+			execution_mode, definition_digest, payload, operation_ref
 		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING created_at`,
 		definition.TenantID, definition.UserID, definition.TaskID,
 		record.Version, definition.SchemaVersion, definition.ExecutionMode,
-		record.Digest, record.Payload, record.ApprovalRef,
+		record.Digest, record.Payload, record.OperationRef,
 	).Scan(&record.CreatedAt)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return ApprovedDefinitionVersionRecord{}, taskStateConflict(
-				"approved definition edit version or confirmation already exists")
+				"approved definition edit version or operation already exists")
 		}
 		return ApprovedDefinitionVersionRecord{}, taskStateDatabaseError(
 			"append approved definition edit", err)
 	}
 
-	if err := updateApprovedDefinitionLegacyProjectionTx(
+	if err := updateApprovedDefinitionCurrentProjectionTx(
 		ctx, tx, definition, sourceIDs); err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
@@ -292,7 +291,7 @@ func replayApprovedDefinitionEdit(
 		!bytes.Equal(existing.Payload, payload) ||
 		existing.Definition.ExecutionMode != definition.ExecutionMode {
 		return ApprovedDefinitionVersionRecord{}, taskStateConflict(
-			"approved definition edit confirmation already has another result")
+			"approved definition edit operation already has another result")
 	}
 	base, err := loadApprovedDefinitionVersionTx(ctx, tx, definition.TenantID,
 		definition.UserID, definition.TaskID, expected.Version)
@@ -301,7 +300,7 @@ func replayApprovedDefinitionEdit(
 	}
 	if !constantTimeTaskStateDigestEqual(base.Digest, expected.Digest) {
 		return ApprovedDefinitionVersionRecord{}, taskStateConflict(
-			"approved definition edit confirmation has another base")
+			"approved definition edit operation has another base")
 	}
 	if head.Version == nil || head.Digest == nil || *head.Version < existing.Version {
 		return ApprovedDefinitionVersionRecord{}, taskStateIntegrity()
@@ -347,14 +346,14 @@ func lockApprovedDefinitionEditSources(
 	definition taskstate.ApprovedDefinitionV1,
 ) ([]int64, error) {
 	sourceIDs := make([]int64, 0, len(definition.Sources))
-	wantURLs := make(map[int64]string, len(definition.Sources))
+	wantSources := make(map[int64]taskstate.ApprovedSourceV1, len(definition.Sources))
 	for _, source := range definition.Sources {
 		sourceIDs = append(sourceIDs, source.SourceID)
-		wantURLs[source.SourceID] = source.URL
+		wantSources[source.SourceID] = source
 	}
 	rows, err := tx.Query(ctx,
-		`SELECT id, url
-		   FROM sources
+		`SELECT id, platform, capability, url, config
+		   FROM fetch_targets
 		  WHERE id=ANY($1::bigint[])
 		  ORDER BY url, id
 		  FOR KEY SHARE`, sourceIDs)
@@ -366,13 +365,20 @@ func lockApprovedDefinitionEditSources(
 	seen := make(map[int64]struct{}, len(sourceIDs))
 	for rows.Next() {
 		var sourceID int64
+		var platform types.Platform
+		var capability types.Capability
 		var sourceURL string
-		if err := rows.Scan(&sourceID, &sourceURL); err != nil {
+		var config json.RawMessage
+		if err := rows.Scan(
+			&sourceID, &platform, &capability, &sourceURL, &config,
+		); err != nil {
 			return nil, taskStateDatabaseError(
 				"scan approved definition edit source", err)
 		}
-		wantURL, ok := wantURLs[sourceID]
-		if !ok || wantURL != sourceURL {
+		want, ok := wantSources[sourceID]
+		if !ok || want.URL != sourceURL ||
+			want.Platform != platform || want.Capability != capability ||
+			!taskCreationJSONEqual(want.Config, config) {
 			return nil, taskStateConflict(
 				"approved definition source identity changed")
 		}
@@ -389,17 +395,21 @@ func lockApprovedDefinitionEditSources(
 	return sourceIDs, nil
 }
 
-func updateApprovedDefinitionLegacyProjectionTx(
+func updateApprovedDefinitionCurrentProjectionTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	definition taskstate.ApprovedDefinitionV1,
 	sourceIDs []int64,
 ) error {
+	currentFetchPlan, err := currentFetchPlanFromApprovedDefinitionV1(definition)
+	if err != nil {
+		return err
+	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE schedule_playbooks
 		    SET content=$2, fetch_plan=$3, updated_at=clock_timestamp()
 		  WHERE schedule_id=$1`,
-		definition.TaskID, definition.PlaybookContent, []byte(definition.FetchPlan),
+		definition.TaskID, definition.PlaybookContent, currentFetchPlan,
 	)
 	if err != nil {
 		return taskStateDatabaseError(
@@ -409,7 +419,7 @@ func updateApprovedDefinitionLegacyProjectionTx(
 		return taskStateIntegrity()
 	}
 	if _, err := tx.Exec(ctx,
-		`DELETE FROM schedule_sources WHERE schedule_id=$1`,
+		`DELETE FROM task_fetch_targets WHERE schedule_id=$1`,
 		definition.TaskID); err != nil {
 		return taskStateDatabaseError(
 			"clear approved definition source projection", err)
@@ -417,7 +427,7 @@ func updateApprovedDefinitionLegacyProjectionTx(
 	sort.Slice(sourceIDs, func(i, j int) bool { return sourceIDs[i] < sourceIDs[j] })
 	for _, sourceID := range sourceIDs {
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO schedule_sources (schedule_id, source_id)
+			`INSERT INTO task_fetch_targets (schedule_id, fetch_target_id)
 			 VALUES ($1, $2)`, definition.TaskID, sourceID); err != nil {
 			return taskStateDatabaseError(
 				"insert approved definition source projection", err)
@@ -426,17 +436,17 @@ func updateApprovedDefinitionLegacyProjectionTx(
 	var exact bool
 	if err := tx.QueryRow(ctx,
 		`SELECT
-			(SELECT count(*) FROM schedule_sources WHERE schedule_id=$1)
+			(SELECT count(*) FROM task_fetch_targets WHERE schedule_id=$1)
 			  = cardinality($2::bigint[])
 			AND NOT EXISTS (
-				(SELECT source_id FROM schedule_sources WHERE schedule_id=$1)
+				(SELECT fetch_target_id FROM task_fetch_targets WHERE schedule_id=$1)
 				EXCEPT
 				(SELECT source_id FROM unnest($2::bigint[]) AS wanted(source_id))
 			)
 			AND NOT EXISTS (
 				(SELECT source_id FROM unnest($2::bigint[]) AS wanted(source_id))
 				EXCEPT
-				(SELECT source_id FROM schedule_sources WHERE schedule_id=$1)
+				(SELECT fetch_target_id FROM task_fetch_targets WHERE schedule_id=$1)
 			)`, definition.TaskID, sourceIDs,
 	).Scan(&exact); err != nil {
 		return taskStateDatabaseError(
@@ -446,4 +456,32 @@ func updateApprovedDefinitionLegacyProjectionTx(
 		return taskStateIntegrity()
 	}
 	return nil
+}
+
+// currentFetchPlanFromApprovedDefinitionV1 is the only write-side adapter from
+// the deployed immutable v1 wire to mutable current state. The v1 payload keeps
+// its historical sources field; schedule_playbooks must store targets.
+func currentFetchPlanFromApprovedDefinitionV1(
+	definition taskstate.ApprovedDefinitionV1,
+) ([]byte, error) {
+	var frozen taskstate.FetchPlanV1
+	if err := json.Unmarshal(definition.FetchPlan, &frozen); err != nil ||
+		frozen.Sources == nil {
+		return nil, taskStateIntegrity()
+	}
+	current := currentFetchPlanProjection{
+		Targets: make([]currentFetchPlanTargetProjection, len(frozen.Sources)),
+	}
+	for index, source := range frozen.Sources {
+		current.Targets[index] = currentFetchPlanTargetProjection{
+			Platform: string(source.Platform), Capability: string(source.Capability),
+			Title: source.Title, URL: source.URL,
+			Config: bytes.Clone(source.Config),
+		}
+	}
+	raw, err := json.Marshal(current)
+	if err != nil {
+		return nil, taskStateIntegrity()
+	}
+	return raw, nil
 }

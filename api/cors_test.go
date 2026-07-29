@@ -20,7 +20,7 @@ const testOrigin = "https://vane.example.com"
 // TestCORS_预检不进会话中间件 验证放行源的 OPTIONS 预检：无 cookie 也 204 + 全套头。
 // 预检是浏览器自动请求、不带凭证；落进 requireSession 会 401，跨源 fetch 根本发不出来。
 func TestCORS_预检不进会话中间件(t *testing.T) {
-	req := httptest.NewRequest(http.MethodOptions, "/api/subscriptions", nil)
+	req := httptest.NewRequest(http.MethodOptions, "/api/schedules", nil)
 	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Access-Control-Request-Method", "POST")
 	req.Header.Set(
@@ -54,7 +54,7 @@ func TestCORS_预检不进会话中间件(t *testing.T) {
 // TestCORS_真请求带头且会话仍生效 验证放行源的真请求：CORS 头在，401 语义不变
 // ——浏览器要能读到这个 401（没有 Allow-Origin 时 fetch 拿到的是网络错误而非状态码）。
 func TestCORS_真请求带头且会话仍生效(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/api/subscriptions", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/schedules", nil)
 	req.Header.Set("Origin", testOrigin)
 	rec := httptest.NewRecorder()
 	corsMux(testOrigin).ServeHTTP(rec, req)
@@ -74,7 +74,7 @@ func TestCORS_真请求带头且会话仍生效(t *testing.T) {
 // 等于把带 cookie 的 API 开放给全网页面。
 func TestCORS_非放行源零头(t *testing.T) {
 	for _, evil := range []string{"https://evil.example.com", "http://vane.example.com", ""} {
-		req := httptest.NewRequest(http.MethodGet, "/api/subscriptions", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/schedules", nil)
 		if evil != "" {
 			req.Header.Set("Origin", evil)
 		}
@@ -92,7 +92,7 @@ func TestCORS_非放行源零头(t *testing.T) {
 
 // TestCORS_未配置源全关 验证 Origin 配置为空时任何源都拿不到 CORS 头（同源部署场景）。
 func TestCORS_未配置源全关(t *testing.T) {
-	req := httptest.NewRequest(http.MethodOptions, "/api/subscriptions", nil)
+	req := httptest.NewRequest(http.MethodOptions, "/api/schedules", nil)
 	req.Header.Set("Origin", testOrigin)
 	rec := httptest.NewRecorder()
 	corsMux("").ServeHTTP(rec, req)
@@ -144,10 +144,9 @@ func TestCORS_AuthenticatedUnsafeMethodsRejectSameSiteForeignOrigin(
 			actionAgent := &fakeTaskActionAgent{}
 			scheduleController := &fakeScheduleActionController{}
 			deps, cookie := authedDeps(t, Deps{
-				Origin:      testOrigin,
-				TaskAgent:   actionAgent,
-				TaskActions: newFakeTaskActionStore(),
-				Scheduler:   scheduleController,
+				Origin:    testOrigin,
+				TaskAgent: actionAgent,
+				Scheduler: scheduleController,
 			})
 			mux := http.NewServeMux()
 			Mount(mux, deps)
@@ -163,8 +162,8 @@ func TestCORS_AuthenticatedUnsafeMethodsRejectSameSiteForeignOrigin(
 					rec.Code, rec.Body.String(),
 				)
 			}
-			if actionAgent.executeCalls != 0 ||
-				actionAgent.cancelCalls != 0 ||
+			if actionAgent.createCalls != 0 ||
+				actionAgent.editCalls != 0 ||
 				scheduleController.command != "" {
 				t.Fatalf(
 					"foreign Origin reached a side effect: agent=%+v schedule=%+v",

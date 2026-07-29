@@ -55,14 +55,6 @@ func (s EffectSet) Has(effect Effect) bool {
 	return s&EffectSet(effect) != 0
 }
 
-type ConfirmationPolicy uint8
-
-const (
-	ConfirmationInvalid ConfirmationPolicy = iota
-	ConfirmationNone
-	ConfirmationRequired
-)
-
 // AuthorizationPolicy is a local allow-set. Remote tool metadata is never
 // consulted when selecting an execution surface.
 type AuthorizationPolicy uint8
@@ -129,13 +121,12 @@ const (
 	IntentInvalid     ToolIntent = 0
 	IntentWebResearch ToolIntent = 1 << iota
 	IntentSocialResearch
-	IntentSources
 	IntentTasks
 	IntentProfile
 )
 
 const knownToolIntents = IntentWebResearch | IntentSocialResearch |
-	IntentSources | IntentTasks | IntentProfile
+	IntentTasks | IntentProfile
 
 func Intents(values ...ToolIntent) ToolIntent {
 	var out ToolIntent
@@ -163,7 +154,6 @@ const (
 type ToolPolicy struct {
 	Effects       EffectSet
 	Authorization AuthorizationPolicy
-	Confirmation  ConfirmationPolicy
 	Budget        BudgetPolicy
 	Retry         RetryPolicy
 	Concurrency   ConcurrencyPolicy
@@ -275,10 +265,6 @@ func (p ToolPolicy) validate() error {
 	if !p.Authorization.Allows(AuthorizationOwner) {
 		return errors.New("owner authorization is required")
 	}
-	if p.Confirmation != ConfirmationNone &&
-		p.Confirmation != ConfirmationRequired {
-		return errors.New("confirmation is invalid")
-	}
 	if p.Budget != BudgetNone && p.Budget != BudgetToolManaged &&
 		p.Budget != BudgetDownstreamManaged {
 		return errors.New("budget is invalid")
@@ -300,27 +286,19 @@ func (p ToolPolicy) validate() error {
 		p.ResultTrust != ResultTrustExternal {
 		return errors.New("result trust is invalid")
 	}
-	if p.Confirmation == ConfirmationRequired &&
-		!p.Effects.Has(EffectStateWrite) &&
-		!p.Effects.Has(EffectDurableProposal) {
-		return errors.New("confirmation requires a write or durable proposal effect")
-	}
 	if (p.Effects.Has(EffectStateWrite) || p.Effects.Has(EffectDurableProposal)) &&
-		p.Confirmation != ConfirmationRequired &&
 		!p.Effects.Has(EffectActivationWrite) &&
 		!p.Effects.Has(EffectDirectOwnerWrite) {
-		return errors.New("state write or durable proposal requires confirmation")
+		return errors.New("state write or durable proposal requires direct owner execution")
 	}
 	if p.Effects.Has(EffectDurableProposal) &&
-		p.Confirmation != ConfirmationRequired &&
 		!p.Effects.Has(EffectDirectOwnerWrite) {
-		return errors.New("durable proposal requires confirmation or direct owner execution")
+		return errors.New("durable proposal requires direct owner execution")
 	}
 	if p.Effects.Has(EffectDirectOwnerWrite) &&
 		(!p.Effects.Has(EffectStateWrite) ||
-			p.Confirmation != ConfirmationNone ||
 			p.Authorization != AuthorizationOwner) {
-		return errors.New("direct owner write must be owner-only state write without confirmation")
+		return errors.New("direct owner write must be owner-only state write")
 	}
 	if p.DirectOnExplicitIntent &&
 		!p.Effects.Has(EffectDirectOwnerWrite) &&
@@ -342,18 +320,18 @@ func (p ToolPolicy) validate() error {
 	}
 	if p.Authorization.Allows(AuthorizationA2AReadOnly) {
 		allowed := Effects(EffectInternalRead, EffectTrustTaint)
-		if p.Confirmation != ConfirmationNone || p.Effects&^allowed != 0 {
+		if p.Effects&^allowed != 0 {
 			return errors.New("a2a-readonly authorization has non-readonly effects")
 		}
 	}
 	return nil
 }
 
-func ownerPolicy(effects EffectSet, confirmation ConfirmationPolicy, budget BudgetPolicy) ToolPolicy {
+func ownerPolicy(effects EffectSet, budget BudgetPolicy) ToolPolicy {
 	return ToolPolicy{
 		Effects: effects, Authorization: AuthorizationOwner,
-		Confirmation: confirmation, Budget: budget,
-		Retry: RetryNone, Concurrency: ConcurrencySequential,
+		Budget: budget,
+		Retry:  RetryNone, Concurrency: ConcurrencySequential,
 		Exposure: ExposureIntent, Intents: IntentTasks,
 		ResultTrust:            ResultTrustLocal,
 		DirectOnExplicitIntent: effects.Has(EffectDirectOwnerWrite),
@@ -361,7 +339,7 @@ func ownerPolicy(effects EffectSet, confirmation ConfirmationPolicy, budget Budg
 }
 
 func a2aReadPolicy(effects EffectSet) ToolPolicy {
-	policy := ownerPolicy(effects, ConfirmationNone, BudgetNone)
+	policy := ownerPolicy(effects, BudgetNone)
 	policy.Authorization |= AuthorizationA2AReadOnly
 	return policy
 }
@@ -382,7 +360,7 @@ func withToolSurface(
 }
 
 // FilterAuthorizedTools selects by the trusted local policy only. In
-// particular, callers must not infer A2A safety from effects or confirmation.
+// particular, callers must not infer A2A safety from effects alone.
 func FilterAuthorizedTools(specs []ToolSpec, scope AuthorizationPolicy) ([]ToolSpec, error) {
 	out := make([]ToolSpec, 0, len(specs))
 	for _, spec := range specs {

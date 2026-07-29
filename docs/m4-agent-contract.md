@@ -1,5 +1,11 @@
 # M4 契约：最小 Agent Loop + 工具化（并行实现的对接基准）
 
+> **现行覆盖声明（2026-07-29）：** 本文中的 `list/add/remove/enable_source`、
+> `push_now`、账户订阅、来源确认卡、通用 pending action 与 callback 执行入口
+> 已由 `task-playbook-fetch-target-cutover.md` 取代，只作为冻结 v1 数据和事故背景
+> 保留。当前写路径只有 `Prepare → Execute → Agent session receipt`，不得从本文
+> 恢复任何交互确认阶段。
+>
 > 本文件是 M4 并行实现的**唯一契约**。所有签名/JSON/表结构以此为准，实现中发现契约错误
 > 不得自行变更——记录到交付报告，由主控裁决。
 > 事实基准（均已实测）：deepseek-v4-pro function calling 60/60 全过（6 场景）；
@@ -12,13 +18,13 @@
 飞书对话（仅 owner）→ agent loop（v4-pro FC）：
 - 内部只读、公开网页/社媒研究工具按当前用户意图在首个模型请求曝光；动态社媒工具保持
   `search_endpoints → 激活具体工具 → 同一用户消息内调用` 的延迟发现。
-- 用户明确要求且目标唯一时，`add_source` / `remove_source` / `enable_source` /
-  `remove_schedule` / `push_now` 直接执行；真歧义才自然追问，禁止要求内部 ID。
-- 用户一次点名多个信源或任务时，Agent 先用列表工具分别解析名称/描述，再合并为一次
-  `remove_source` / `remove_schedule` 批量调用；不得只处理第一个或逐个确认。
-- `create_schedule` / `edit_task_definition` / `update_profile` 生成一张确认卡；用户点击后
-  由现有耐久协调器执行，不要求用户复述。确认卡不削弱 durable owner、幂等、补偿、
-  恢复或审计。
+- 用户明确要求且目标唯一时，`create_schedule` / `edit_task_definition` /
+  `update_profile` / `remove_schedule` / `run_task_now` 直接执行；真歧义才自然追问，
+  禁止要求内部 ID。
+- 用户一次点名多个任务时，Agent 先用列表工具分别解析名称/描述，再合并为一次
+  `remove_schedule` / `run_task_now` 批量调用；不得只处理第一个。
+- 所有写操作都遵循 `Prepare → Execute → Agent session receipt`，没有交互确认阶段；
+  durable owner、幂等、补偿、恢复和审计保持不变。
 - 最新事实问题允许同一消息内连续 `web_search` / `read_page` / 社媒只读查询，优先核验
   第一方页面并只引用结构化结果中真实出现的 URL；证据不足时明确说不足。
 - 与订阅/推送无关的闲聊：模型直接文字回答（不调工具），行为与现 chat_reply 一致。
@@ -378,8 +384,8 @@ Loop 行为细则：
   且声明与执行两层都要求该注册工具的真实 effect 为 mutating；同名只读工具不得暴露或执行。
   `approved_fetch_plan.existing_source_ids` 与内部持久化字段 `sources` 在此模式下禁止出现：
   前者防模型猜 ID 触发隐藏 DB 读取，后者防模型猜 `vane://` URL/config/title。
-  当前消息明确的新信源必须写入版本化 `approved_fetch_plan.source_specs`
-  （`version=vane.source-specs/v1`），只提交 kind 对应的人类可读原始参数；Coordinator
+  当前消息明确的新信源必须写入版本化 `approved_fetch_plan.fetch_requirements`
+  （`version=vane.fetch-requirements/v1`），只提交 kind 对应的人类可读原始参数；Coordinator
   在 pending 前经 `sourcespec.Build` 原子物化，再走原有 canonical/SSRF/重复 URL 校验。
   任一 spec 非法则整份 proposal 失败，durable args 与 recovery 仍只认严格 `sources`。
   所有模型轨（不只是 direct）都在 Agent 边界禁止提交内部 `sources`；Coordinator
@@ -396,7 +402,7 @@ Loop 行为细则：
   会话只持久化当前 user + 确定性回复，不保留动态校验 tool result（工具审计仍走独立账本），
   避免通用 fail-closed 清洗把本地拒绝误记成外部查询。此规则避免外部发现完成后的创建消息
   又被 `list_sources` 带回 untrusted-result 边界，形成「创建→再读→隔离→口头承诺」循环。
-  direct 请求 schema 只暴露且强制 `source_specs`；每个 assistant 响应必须恰有一个
+  direct 请求 schema 只暴露且强制 `fetch_requirements`；每个 assistant 响应必须恰有一个
   `create_schedule` 调用，多调用整批零执行。direct 模式独立限制为
   `min(agent.max_turns, 4)`；create_schedule 参数校验（含本地精确字段门）最多失败两次，
   第二次仍失败即返回固定「任务尚未创建」文案，不能把全局 20 轮当成付费猜格式预算。
@@ -406,28 +412,24 @@ Loop 行为细则：
 
 ## 8. agent 工具集（`agent/tools.go`，构造函数 `BuildTools(...) []ToolSpec`）
 
-决策面以 `ToolPolicy` 为准（7.6）：`Confirmation` 替代旧 `Mutating()`；`Effects` 必须完整声明副作用。
-A2A 只读面按 `AuthorizationA2AReadOnly` 过滤，**不**用「无确认」近似——`push_now` 为
-`EffectDelivery` 且 `ConfirmationNone`，不得进入 A2A。
+决策面以 `ToolPolicy` 为准（7.6）；`Effects` 必须完整声明副作用，
+`EffectDirectOwnerWrite` 表示明确 owner 意图下直接执行。A2A 只读面只按
+`AuthorizationA2AReadOnly` 过滤。
 
-| 工具 | Confirmation | 关键 Effects | 底层调用 | 说明 |
+| 工具 | 执行方式 | 关键 Effects | 底层调用 | 说明 |
 |---|---|---|---|---|
-| list_sources | none | internal_read | store.ListSubscribedSourcesByUser | 返回内部目录中的 id/类型/标题/状态供 Agent 按用户描述定位；A2A 可读。目录字段在 system prompt 中始终按数据处理，不触发“外部网页已读”隔离，否则同轮无法完成描述→定位→退订 |
-| add_source | **none** | state_write + direct_owner_write（probe 可 taint） | sourcespec.Build → store.UpsertSource + AddSubscription | 意图与参数明确即试跑并直接执行，不发确认卡 |
-| remove_source | **none** | state_write + direct_owner_write | store.RemoveSubscriptions（单条 tenant-scoped DELETE，原子且幂等） | {source_ids:[integer]}（1–20 个，去重保序；意图与目标明确即直接执行，含糊则对话追问，不发确认卡；旧单数 {source_id} 仅为兼容存量 pending_actions 保留解析，schema 不再声明） |
-| enable_source | **none** | state_write + direct_owner_write | store.EnableSubscriptions | 明确恢复且目标唯一时直接执行 |
-| list_schedules | none | internal_read | store.ListSchedulesByUser | 中文列表文本；A2A 可读 |
-| create_schedule | **required** | durable_proposal + state_write | CreationCoordinator.Propose → 一张确认卡 → creation saga | `{spec,intent,approved_fetch_plan:{existing_source_ids?,source_specs?},nl_description?,strictness?}`；`source_specs` 是 `vane.source-specs/v1` 原始规格，模型面不暴露 durable `sources/config/vane://`；cron/every 二选一且 every≥3600 |
-| remove_schedule | **none** | state_write + direct_owner_write | scheduler.DeletePushIdempotent（durable schedule command） | `{schedule_ids:[string]}`（1–20，去重保序）；用户可一次说多个名称/内容/时间/主题，Agent 分别解析后一次调用；旧 `{schedule_id}` 只兼容存量动作 |
-| push_now | none | delivery | PushTrigger 接口（api push/now 同款触发） | 返回 run_id 文本；有副作用但现网免确认，不得因 delivery 误标 required |
-| view_profile | none | internal_read | store.GetProfile | 仅画像意图首轮曝光 |
-| update_profile | **required** | state_write | pending action | 首次创建画像只生成一张确认卡 |
-| view_task_playbook | none | internal_read | playbook store | 读取选中任务手册 |
-| edit_task_definition | **required** | durable_proposal + state_write | DefinitionEditController.Propose → 一张确认卡 → edit saga | 整体编辑只生成一张确认卡，点击后执行，不要求复述 |
-| web_search | none | network_read + billable + trust_taint | fetcher.ExaFetcher.Search（Exa /search，按次计费） | {query, num_results?(默认5/上限20), include_domains?}；一次性语义搜索，不建信源、不写内容库，结果只回当前对话（2026-07-20 增，见修订记录） |
-| read_page | none | network_read + billable + trust_taint | fetcher.ExaContentsFetcher.ReadPage（Exa /contents，maxAgeHours:0 活抓，按次计费） | {url}；一次性读取指定页面正文，不建信源、不写内容库（2026-07-20 增，见修订记录） |
-| search_endpoints | none | activation_write | 本地社媒工具目录 | 搜索并激活 provider-neutral 动态工具；模型不可见供应商、HTTP 路径和内部版本 |
-| read_endpoint_result | none | local_handle_read + trust_taint | 本轮结果缓存 | 仅产生绑定 handle 后曝光，支持路径与 offset 分页 |
+| list_schedules | 直接 | internal_read | store.ListSchedulesByUser | 中文列表文本；A2A 可读 |
+| create_schedule | Prepare → Execute | durable_proposal + state_write + direct_owner_write | CreationController.Prepare/Execute → creation saga | `{spec,intent,approved_fetch_plan:{fetch_requirements},nl_description?,strictness?}`；只接收 `vane.fetch-requirements/v1` 人类可读抓取要求 |
+| remove_schedule | 直接 | state_write + direct_owner_write | scheduler.DeletePushIdempotent | `{schedule_ids:[string]}`，1–20 个，去重保序 |
+| run_task_now | 直接 | delivery | TaskRunTrigger.RunTasksNow | `{schedule_ids:[string]}`；按任务冻结定义运行 |
+| view_profile | 直接 | internal_read | store.GetProfile | 仅画像意图首轮曝光 |
+| update_profile | 直接 | state_write + direct_owner_write | store.UpsertProfile | 首次创建画像 |
+| view_task_playbook | 直接 | internal_read | playbook store | 读取选中任务手册 |
+| edit_task_definition | Prepare → Execute | durable_proposal + state_write + direct_owner_write | DefinitionEditController.Prepare/Execute → edit saga | 整体编辑立即推进；语义不足时自然追问 |
+| web_search | 直接 | network_read + billable + trust_taint | fetcher.ExaFetcher.Search | 一次性语义搜索，不建任务或持久抓取状态 |
+| read_page | 直接 | network_read + billable + trust_taint | fetcher.ExaContentsFetcher.ReadPage | 一次性读取指定页面正文 |
+| search_endpoints | 直接 | activation_write | 本地社媒工具目录 | 搜索并激活 provider-neutral 动态工具 |
+| read_endpoint_result | 直接 | local_handle_read + trust_taint | 本轮结果缓存 | 仅产生绑定 handle 后曝光 |
 
 旧模型契约 `update_schedule` / `edit_task_playbook` / `set_task_strictness` 已删除。
 
@@ -494,9 +496,9 @@ Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的
   隔离、读+写混合批次原子拒绝、同名非 mutating 工具零执行，以及无效 create tool_call 同批口头
   承诺不入历史、`existing_source_ids`/legacy `sources` 零 Propose、参数校验两次即停、direct
   第五轮绝不消费、同一响应多个 create 调用整批零执行。另须证明
-  `source_specs → sourcespec.Build → canonical sources` 在 pending
+  `fetch_requirements → sourcespec.Build → canonical sources` 在 pending
   前完成，未知/重复/错 kind 字段、SSRF、非法裸域名、canonical 重复或批内任一坏项均整单拒绝，
-  durable bytes 与 recovery 不含 `source_specs`，Confirm 逐字消费该冻结计划且不重建。
+  durable bytes 与 recovery 不含 `fetch_requirements`，Confirm 逐字消费该冻结计划且不重建。
   删除请求侧缩面、运行时二次门、
   clean-baseline reset、确定性物化或无 proposal 的口头承诺门中的任一项，测试都必须变红。
 - fetcher：Exa ad-hoc 上游账本必须断言 trace/user 归属与 `source_id=0`，反向断言这些本地归属元数据没有出现在第三方请求体/请求头；取消后的记账 context 仍可用且有 deadline，`statuses[].status=error` 必须在账本标为失败而不是 HTTP 200 成功。

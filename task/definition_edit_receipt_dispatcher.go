@@ -18,7 +18,7 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-const definitionEditReceiptPayloadVersion = "vane.task-definition-edit-user-receipt/v1"
+const definitionEditReceiptPayloadVersion = "vane.task-definition-edit-session-receipt/v2"
 
 // DefinitionEditReceiptStore is the complete and only Store surface consumed
 // by the C2b3-2d receipt dispatcher. It cannot mutate edit operations or
@@ -51,17 +51,6 @@ type DefinitionEditReceiptStore interface {
 	) error
 }
 
-// DefinitionEditReceiptSender must overwrite one existing immutable provider
-// target. Implementations may not create a new message on retry.
-type DefinitionEditReceiptSender interface {
-	SendDefinitionEditReceipt(
-		context.Context,
-		string,
-		string,
-		string,
-	) error
-}
-
 // DefinitionEditReceiptSessionRecorder serializes the fixed terminal fact
 // with Agent's per-user conversation lock. Store performs append+checkpoint in
 // one transaction, so a lost response is an exact replay.
@@ -74,21 +63,17 @@ type DefinitionEditReceiptSessionRecorder interface {
 }
 
 type DefinitionEditReceiptDispatcherDeps struct {
-	Store     DefinitionEditReceiptStore
-	Sender    DefinitionEditReceiptSender
-	Sessions  DefinitionEditReceiptSessionRecorder
-	BuildCard CreationReceiptCardBuilder
-	Logger    *slog.Logger
+	Store    DefinitionEditReceiptStore
+	Sessions DefinitionEditReceiptSessionRecorder
+	Logger   *slog.Logger
 }
 
 // DefinitionEditReceiptDispatcher consumes only terminal outbox rows. The
-// immutable payload is checkpointed before either session or provider effects.
+// immutable payload is checkpointed before the session effect.
 type DefinitionEditReceiptDispatcher struct {
-	store     DefinitionEditReceiptStore
-	sender    DefinitionEditReceiptSender
-	sessions  DefinitionEditReceiptSessionRecorder
-	buildCard CreationReceiptCardBuilder
-	logger    *slog.Logger
+	store    DefinitionEditReceiptStore
+	sessions DefinitionEditReceiptSessionRecorder
+	logger   *slog.Logger
 
 	dispatchMu sync.Mutex
 	cursor     int64
@@ -97,8 +82,7 @@ type DefinitionEditReceiptDispatcher struct {
 func NewDefinitionEditReceiptDispatcher(
 	deps DefinitionEditReceiptDispatcherDeps,
 ) (*DefinitionEditReceiptDispatcher, error) {
-	if deps.Store == nil || deps.Sender == nil || deps.Sessions == nil ||
-		deps.BuildCard == nil {
+	if deps.Store == nil || deps.Sessions == nil {
 		return nil, errors.New(
 			"task: definition edit receipt dispatcher dependencies are incomplete",
 		)
@@ -107,8 +91,7 @@ func NewDefinitionEditReceiptDispatcher(
 		deps.Logger = slog.Default()
 	}
 	return &DefinitionEditReceiptDispatcher{
-		store: deps.Store, sender: deps.Sender, sessions: deps.Sessions,
-		buildCard: deps.BuildCard, logger: deps.Logger,
+		store: deps.Store, sessions: deps.Sessions, logger: deps.Logger,
 	}, nil
 }
 
@@ -144,8 +127,7 @@ func (d *DefinitionEditReceiptDispatcher) dispatchAndLog(
 func (d *DefinitionEditReceiptDispatcher) DispatchOnce(
 	ctx context.Context,
 ) error {
-	if d == nil || d.store == nil || d.sender == nil ||
-		d.sessions == nil || d.buildCard == nil {
+	if d == nil || d.store == nil || d.sessions == nil {
 		return errors.New(
 			"task: definition edit receipt dispatcher dependencies are incomplete",
 		)
@@ -265,19 +247,19 @@ func (d *DefinitionEditReceiptDispatcher) dispatchReceipt(
 		}
 	}
 
-	if !validLocalActionReceiptTarget(
+	if !validAgentAutoReceiptTarget(
 		receipt.Provider, receipt.Target, receipt.OperationID,
 	) {
-		sendCtx, cancel := context.WithTimeout(
-			ctx, creationReceiptSendTimeout,
+		return d.finishFailure(
+			ctx,
+			lease,
+			types.NewAppError(
+				types.CodeValidation,
+				"task definition edit receipt provider is retired",
+				nil,
+			),
+			false,
 		)
-		err = d.sender.SendDefinitionEditReceipt(
-			sendCtx, receipt.Provider, receipt.Target, payload.CardJSON,
-		)
-		cancel()
-		if err != nil {
-			return d.finishFailure(ctx, lease, err, true)
-		}
 	}
 	if err := d.store.MarkTaskDefinitionEditReceiptSent(
 		ctx, lease, receipt.Target,
@@ -289,7 +271,6 @@ func (d *DefinitionEditReceiptDispatcher) dispatchReceipt(
 
 type definitionEditUserReceiptPayload struct {
 	Version         string          `json:"version"`
-	CardJSON        string          `json:"card_json"`
 	SessionMessages json.RawMessage `json:"session_messages"`
 }
 
@@ -302,19 +283,9 @@ func (d *DefinitionEditReceiptDispatcher) loadOrCheckpointPayload(
 			receipt.Payload, receipt.PayloadDigest,
 		)
 	}
-	display, history, err := renderDefinitionEditUserReceipt(*receipt)
+	_, history, err := renderDefinitionEditUserReceipt(*receipt)
 	if err != nil {
 		return definitionEditUserReceiptPayload{}, err
-	}
-	cardJSON := d.buildCard(display)
-	if strings.TrimSpace(cardJSON) == "" ||
-		len(cardJSON) > maxCreationReceiptCardBytes ||
-		!json.Valid([]byte(cardJSON)) {
-		return definitionEditUserReceiptPayload{},
-			types.NewAppError(
-				types.CodeValidation,
-				"task definition edit receipt card is invalid", nil,
-			)
 	}
 	messages, err := json.Marshal([]struct {
 		Role    string `json:"role"`
@@ -325,8 +296,7 @@ func (d *DefinitionEditReceiptDispatcher) loadOrCheckpointPayload(
 			fmt.Errorf("marshal definition edit session fact: %w", err)
 	}
 	payload := definitionEditUserReceiptPayload{
-		Version:  definitionEditReceiptPayloadVersion,
-		CardJSON: cardJSON, SessionMessages: messages,
+		Version: definitionEditReceiptPayloadVersion, SessionMessages: messages,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -366,9 +336,6 @@ func decodeDefinitionEditUserReceiptPayload(
 			)
 	}
 	if payload.Version != definitionEditReceiptPayloadVersion ||
-		strings.TrimSpace(payload.CardJSON) == "" ||
-		len(payload.CardJSON) > maxCreationReceiptCardBytes ||
-		!json.Valid([]byte(payload.CardJSON)) ||
 		len(payload.SessionMessages) == 0 {
 		return definitionEditUserReceiptPayload{},
 			types.NewAppError(
@@ -429,7 +396,7 @@ func renderDefinitionEditUserReceipt(
 			"任务编辑已完成（id=%s，定义版本 v%d）。",
 			checkpoint.TaskID, checkpoint.DefinitionVersion,
 		)
-		history = "[卡片回调] 用户已点击「确认」，任务定义编辑已完成。"
+		history = "[Agent执行] 用户已在当前消息中明确要求，任务定义编辑已完成。"
 	case types.TaskDefinitionEditOperationStatusCancelled:
 		if receipt.OperationPhase !=
 			types.TaskDefinitionEditPhaseProposalSealed {
@@ -438,7 +405,7 @@ func renderDefinitionEditUserReceipt(
 			)
 		}
 		display = "已取消本次任务编辑。"
-		history = "[卡片回调] 用户已点击「取消」，任务定义编辑已取消。"
+		history = "[Agent执行] 任务定义编辑操作已取消。"
 	case types.TaskDefinitionEditOperationStatusExpired:
 		if receipt.OperationPhase !=
 			types.TaskDefinitionEditPhaseProposalSealed {
@@ -446,8 +413,8 @@ func renderDefinitionEditUserReceipt(
 				"expired operation phase is invalid", nil,
 			)
 		}
-		display = "任务编辑确认已过期，请重新描述需要修改的内容。"
-		history = "[卡片回调] 用户点击原确认卡时，任务定义编辑确认已过期，变更未执行。"
+		display = "任务编辑操作已过期，请重新描述需要修改的内容。"
+		history = "[Agent执行] 任务定义编辑操作已过期，变更未执行。"
 	case types.TaskDefinitionEditOperationStatusBlocked:
 		if !validDefinitionEditReceiptProgressPhase(
 			receipt.OperationPhase,
@@ -459,7 +426,7 @@ func renderDefinitionEditUserReceipt(
 			)
 		}
 		display = "任务编辑已安全停止，任务保持在受保护状态，请稍后重试或联系管理员。"
-		history = "[卡片回调] 用户已点击「确认」，但任务定义编辑已安全停止。"
+		history = "[Agent执行] 用户已在当前消息中明确要求，但任务定义编辑已安全停止。"
 	case types.TaskDefinitionEditOperationStatusSuperseded:
 		if !validDefinitionEditReceiptProgressPhase(
 			receipt.OperationPhase,
@@ -469,25 +436,11 @@ func renderDefinitionEditUserReceipt(
 			)
 		}
 		display = "任务定义已发生更新，本次旧编辑方案未执行，请重新发起编辑。"
-		history = "[卡片回调] 用户已点击「确认」，但任务定义已更新，旧编辑方案未执行。"
+		history = "[Agent执行] 用户已在当前消息中明确要求，但任务定义已更新，旧编辑方案未执行。"
 	default:
 		return "", "", definitionEditReceiptRenderError(
 			"operation is not terminal", nil,
 		)
-	}
-	if validAgentAutoReceiptTarget(
-		receipt.Provider, receipt.Target, receipt.OperationID,
-	) {
-		switch receipt.OperationStatus {
-		case types.TaskDefinitionEditOperationStatusCompleted:
-			history = "[Agent执行] 用户已在当前消息中明确要求，任务定义编辑已完成。"
-		case types.TaskDefinitionEditOperationStatusBlocked:
-			history = "[Agent执行] 用户已在当前消息中明确要求，但任务定义编辑已安全停止。"
-		case types.TaskDefinitionEditOperationStatusSuperseded:
-			history = "[Agent执行] 用户已在当前消息中明确要求，但任务定义已更新，旧编辑方案未执行。"
-		case types.TaskDefinitionEditOperationStatusExpired:
-			history = "[Agent执行] 用户已在当前消息中明确要求，但任务编辑操作已过期，变更未执行。"
-		}
 	}
 	return display, history, nil
 }
@@ -534,7 +487,7 @@ func (d *DefinitionEditReceiptDispatcher) finishFailure(
 	ctx context.Context,
 	lease types.TaskDefinitionEditReceiptLease,
 	cause error,
-	providerCall bool,
+	_ bool,
 ) error {
 	class := types.TaskDefinitionEditReceiptFailureRetryable
 	retryAfter := creationReceiptBackoff(lease.Fence)
@@ -542,8 +495,6 @@ func (d *DefinitionEditReceiptDispatcher) finishFailure(
 	if errors.As(cause, &appError) && !appError.Retryable {
 		class = types.TaskDefinitionEditReceiptFailurePermanent
 		retryAfter = 0
-	} else if providerCall {
-		class = types.TaskDefinitionEditReceiptFailureAmbiguous
 	}
 	checkpointCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx), creationReceiptStoreTimeout,

@@ -83,14 +83,14 @@ func TestListDeliveryHistory(t *testing.T) {
 	}
 	attachTenant(t, st, other.ID)
 
-	srcID, _, err := st.UpsertSource(ctx, &types.Source{
+	srcID, _, err := st.GetOrCreateFetchTarget(ctx, &types.FetchTarget{
 		Platform:   types.PlatformWeb,
 		Capability: types.CapFeed,
 		URL:        "https://example.com/test-history-" + uuid.NewString(),
 		Title:      "history-test-source",
 	})
 	if err != nil {
-		t.Fatalf("UpsertSource() 失败: %v", err)
+		t.Fatalf("GetOrCreateFetchTarget() 失败: %v", err)
 	}
 
 	batchID, err := st.CreatePushBatch(ctx, owner.ID)
@@ -159,7 +159,7 @@ func TestListDeliveryHistory(t *testing.T) {
 		cleanupExec(ctx, t, st, `DELETE FROM push_batches WHERE id IN ($1, $2)`, batchID, otherBatch)
 		cleanupExec(ctx, t, st, `DELETE FROM content_sources WHERE source_id = $1`, srcID)
 		cleanupExec(ctx, t, st, `DELETE FROM content_items WHERE id IN ($1, $2, $3)`, titledItem, untitledItem, otherItem)
-		cleanupExec(ctx, t, st, `DELETE FROM sources WHERE id = $1`, srcID)
+		cleanupExec(ctx, t, st, `DELETE FROM fetch_targets WHERE id = $1`, srcID)
 		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id IN ($1, $2)`, owner.ID, other.ID)
 	})
 

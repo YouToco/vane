@@ -1,5 +1,9 @@
 # 企业级三接缝契约 — 多租户 / 多推送渠道 / 信源 SDK
 
+> **现行覆盖声明（2026-07-29）：** 本文账户级 `subscriptions` 和
+> `sourcecatalog` 接缝已由 `task-playbook-fetch-target-cutover.md` 取代。当前表为
+> `fetch_targets` / `task_fetch_targets`，租户可见性来自任务和投递，不来自订阅。
+>
 > 草案 2026-07-18（Mac 端）。**本文是接缝定义与迁移路径的契约,不是排期计划**。
 > 依据:业内调研 5 路（OpenClaw 源码实读 + Bot Framework/Apprise/Courier/Novu/HumanLayer
 > 渠道抽象 + Postgres RLS/pgx 多租户 + Airbyte/Singer/Steampipe 连接器 SDK）+ vane 现状

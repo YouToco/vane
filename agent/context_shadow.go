@@ -184,7 +184,7 @@ func (l *Loop) buildShadowAgentContext(
 				Version:        agentcontext.PolicyVersion,
 				Effects:        uint16(spec.Policy.Effects),
 				Authorization:  uint8(spec.Policy.Authorization),
-				Confirmation:   uint8(spec.Policy.Confirmation),
+				Confirmation:   0, // retained only in immutable v1 shadow bytes
 				Budget:         uint8(spec.Policy.Budget),
 				Retry:          uint8(spec.Policy.Retry),
 				Concurrency:    uint8(spec.Policy.Concurrency),

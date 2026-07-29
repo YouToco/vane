@@ -104,7 +104,7 @@ func TestRuntimeFetchRegistryRoutesExactTikHubGeneration(t *testing.T) {
 		},
 	)
 	multi := &Multi{runtimeV1: resolver}
-	source := types.Source{
+	source := types.FetchTarget{
 		ID: 7, Platform: types.PlatformXHS, Capability: types.CapSearch,
 		Config: json.RawMessage(`{"keyword":"vane"}`),
 	}
@@ -203,20 +203,20 @@ func TestValidateRuntimeFetchRouteV1UsesExactRegistryWithoutNetwork(t *testing.T
 
 	tests := []struct {
 		name       string
-		source     types.Source
+		source     types.FetchTarget
 		capability runtimepolicy.CapabilityV1
 		wantErr    bool
 	}{
 		{
 			name: "current Exa generation",
-			source: types.Source{
+			source: types.FetchTarget{
 				Platform: types.PlatformWeb, Capability: types.CapSearch,
 			},
 			capability: exaRuntimeCapability(types.CapSearch, 2),
 		},
 		{
 			name: "missing Exa generation",
-			source: types.Source{
+			source: types.FetchTarget{
 				Platform: types.PlatformWeb, Capability: types.CapSearch,
 			},
 			capability: exaRuntimeCapability(types.CapSearch, 1),
@@ -224,14 +224,14 @@ func TestValidateRuntimeFetchRouteV1UsesExactRegistryWithoutNetwork(t *testing.T
 		},
 		{
 			name: "current RSS dependency generation",
-			source: types.Source{
+			source: types.FetchTarget{
 				Platform: types.PlatformWeb, Capability: types.CapFeed,
 			},
 			capability: rssRuntimeCapability(2),
 		},
 		{
 			name: "missing RSS dependency generation",
-			source: types.Source{
+			source: types.FetchTarget{
 				Platform: types.PlatformWeb, Capability: types.CapFeed,
 			},
 			capability: rssRuntimeCapability(1),
@@ -307,7 +307,7 @@ func TestRuntimeFetchResolverRejectsDuplicateAndMismatchedExecutor(t *testing.T)
 
 func TestValidateRuntimeCapabilityV1AllowsAnyPositiveRetainedGeneration(t *testing.T) {
 	for _, generation := range []int64{1, 2, 99} {
-		source := types.Source{Platform: types.PlatformWeb, Capability: types.CapSearch}
+		source := types.FetchTarget{Platform: types.PlatformWeb, Capability: types.CapSearch}
 		if err := ValidateRuntimeCapabilityV1(
 			exaRuntimeCapability(types.CapSearch, generation), source,
 		); err != nil {
@@ -317,13 +317,13 @@ func TestValidateRuntimeCapabilityV1AllowsAnyPositiveRetainedGeneration(t *testi
 
 	missingDependency := rssRuntimeCapability(1)
 	missingDependency.DependencyCredentialRefs = nil
-	if err := ValidateRuntimeCapabilityV1(missingDependency, types.Source{
+	if err := ValidateRuntimeCapabilityV1(missingDependency, types.FetchTarget{
 		Platform: types.PlatformWeb, Capability: types.CapFeed,
 	}); err == nil {
 		t.Fatal("RSS without frozen Exa dependency must be rejected")
 	}
 	sourceMismatch := exaRuntimeCapability(types.CapSearch, 1)
-	if err := ValidateRuntimeCapabilityV1(sourceMismatch, types.Source{
+	if err := ValidateRuntimeCapabilityV1(sourceMismatch, types.FetchTarget{
 		Platform: types.PlatformWeb, Capability: types.CapContents,
 	}); err == nil {
 		t.Fatal("source mismatch must be rejected")
@@ -331,7 +331,7 @@ func TestValidateRuntimeCapabilityV1AllowsAnyPositiveRetainedGeneration(t *testi
 }
 
 func TestMultiFetchWithPolicyV1FailsBeforeNetworkWithoutRegistry(t *testing.T) {
-	source := types.Source{
+	source := types.FetchTarget{
 		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed,
 		URL: "https://must-not-be-called.invalid/feed",
 	}

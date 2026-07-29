@@ -25,7 +25,7 @@ import (
 
 const taskDefinitionEditOperationColumns = `
 	id, tenant_id, user_id, target_tenant_id, target_user_id, task_id,
-	session_id, approval_ref, status, phase, expires_at, confirmed_at,
+	session_id, operation_ref, status, phase, expires_at, execution_started_at,
 	original_status, base_definition_version, base_definition_digest,
 	base_definition, target_definition_version, target_definition_digest,
 	target_definition, canonical_proposal, proposal_digest, prepared_edit,
@@ -61,8 +61,8 @@ func scanTaskDefinitionEditOperation(
 ) error {
 	return row.Scan(
 		&op.ID, &op.TenantID, &op.UserID, &op.TargetTenantID,
-		&op.TargetUserID, &op.TaskID, &op.SessionID, &op.ApprovalRef,
-		&op.Status, &op.Phase, &op.ExpiresAt, &op.ConfirmedAt,
+		&op.TargetUserID, &op.TaskID, &op.SessionID, &op.OperationRef,
+		&op.Status, &op.Phase, &op.ExpiresAt, &op.ExecutionStartedAt,
 		&op.OriginalStatus, &op.BaseDefinitionVersion,
 		&op.BaseDefinitionDigest, &op.BaseDefinition,
 		&op.TargetDefinitionVersion, &op.TargetDefinitionDigest,
@@ -444,14 +444,14 @@ func validateTaskDefinitionEditCreationProvenance(
 	}
 	rows, err := tx.Query(ctx,
 		`SELECT prepared_schedule, compiled_digest
-		   FROM pending_actions
+		   FROM task_creation_operations
 		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
 		    AND tool_name='create_schedule' AND execution_version=$4
 		    AND status=$5 AND phase=$6 AND tombstoned_at IS NOT NULL
 		  ORDER BY id
 		  FOR SHARE`, frozen.Proposal.Target.TenantID,
 		frozen.Proposal.Target.UserID, frozen.Proposal.Target.TaskID,
-		types.TaskCreationExecutionVersionV1, types.PendingActionStatusExecuted,
+		types.TaskCreationExecutionVersionV1, types.TaskOperationStatusExecuted,
 		types.TaskCreationPhaseCompleted,
 	)
 	if err != nil {
@@ -549,7 +549,7 @@ func (s *Store) CreateTaskDefinitionEditOperation(
 
 	// The successful Task Creation operation is part of the frozen proposal's
 	// authority and is also the first root in tenant purge. Lock it before the
-	// schedule so new creation and purge share pending_action -> schedule. An
+	// schedule so new creation and purge share creation-operation -> schedule. An
 	// already-durable operation is a response replay: retain its historical
 	// schedule -> operation order and do not re-require mutable provenance.
 	var operationExists bool
@@ -608,7 +608,7 @@ func (s *Store) CreateTaskDefinitionEditOperation(
 	err = scanTaskDefinitionEditOperation(tx.QueryRow(ctx,
 		`INSERT INTO task_definition_edit_operations (
 			id, tenant_id, user_id, target_tenant_id, target_user_id,
-			task_id, session_id, approval_ref, expires_at, original_status,
+			task_id, session_id, operation_ref, expires_at, original_status,
 			base_definition_version, base_definition_digest, base_definition,
 			target_definition_version, target_definition_digest, target_definition,
 			canonical_proposal, proposal_digest, prepared_edit,
@@ -619,7 +619,7 @@ func (s *Store) CreateTaskDefinitionEditOperation(
 		 ) RETURNING `+taskDefinitionEditOperationColumns,
 		proposal.OperationID, proposal.Actor.TenantID, proposal.Actor.UserID,
 		proposal.Target.TenantID, proposal.Target.UserID, proposal.Target.TaskID,
-		proposal.SessionID, proposal.ApprovalRef, expiresAt, originalStatus,
+		proposal.SessionID, proposal.OperationRef, expiresAt, originalStatus,
 		proposal.BaseHead.Version, proposal.BaseHead.Digest,
 		frozen.BaseDefinitionBytes, proposal.TargetHead.Version,
 		proposal.TargetHead.Digest, frozen.TargetDefinitionBytes,
@@ -650,7 +650,7 @@ func taskDefinitionEditCreationReplayEqual(
 		op.TenantID == proposal.Actor.TenantID && op.UserID == proposal.Actor.UserID &&
 		op.TargetTenantID == proposal.Target.TenantID &&
 		op.TargetUserID == proposal.Target.UserID && op.TaskID == proposal.Target.TaskID &&
-		op.SessionID == proposal.SessionID && op.ApprovalRef == proposal.ApprovalRef &&
+		op.SessionID == proposal.SessionID && op.OperationRef == proposal.OperationRef &&
 		op.ExpiresAt.Equal(time.UnixMicro(proposal.ExpiresAtUnixMicros)) &&
 		op.OriginalStatus == originalStatus &&
 		op.BaseDefinitionVersion == proposal.BaseHead.Version &&
@@ -704,34 +704,20 @@ func (s *Store) LoadTaskDefinitionEditOperation(
 	return cloneTaskDefinitionEditOperation(&op), nil
 }
 
-// CancelTaskDefinitionEditOperation linearizes an explicit pre-confirmation
-// cancellation against acquisition. An executing edit is never cancelled.
-func (s *Store) CancelTaskDefinitionEditOperation(
-	ctx context.Context,
-	p types.CancelTaskDefinitionEditOperationParams,
-) (*types.TaskDefinitionEditOperation, error) {
-	return s.terminatePendingTaskDefinitionEdit(ctx, p.Scope,
-		p.ReceiptProvider, p.ReceiptTarget,
-		types.TaskDefinitionEditOperationStatusCancelled, false)
-}
-
 // ExpireTaskDefinitionEditOperation tombstones only a DB-clock-expired,
-// unconfirmed proposal. The call cannot expire a still-valid confirmation.
+// prepared operation. The call cannot expire a still-valid operation.
 func (s *Store) ExpireTaskDefinitionEditOperation(
 	ctx context.Context,
 	p types.ExpireTaskDefinitionEditOperationParams,
 ) (*types.TaskDefinitionEditOperation, error) {
-	return s.terminatePendingTaskDefinitionEdit(ctx, p.Scope,
-		p.ReceiptProvider, p.ReceiptTarget,
-		types.TaskDefinitionEditOperationStatusExpired, true)
+	return s.expirePendingTaskDefinitionEdit(
+		ctx, p.Scope, p.ReceiptProvider, p.ReceiptTarget)
 }
 
-func (s *Store) terminatePendingTaskDefinitionEdit(
+func (s *Store) expirePendingTaskDefinitionEdit(
 	ctx context.Context,
 	scope types.TaskDefinitionEditScope,
 	receiptProvider, receiptTarget string,
-	terminalStatus types.TaskDefinitionEditOperationStatus,
-	requireExpired bool,
 ) (*types.TaskDefinitionEditOperation, error) {
 	if !validTaskDefinitionEditScope(scope) {
 		return nil, taskDefinitionEditValidation("terminal operation scope is invalid")
@@ -740,10 +726,7 @@ func (s *Store) terminatePendingTaskDefinitionEdit(
 		receiptProvider, receiptTarget, true); err != nil {
 		return nil, err
 	}
-	if terminalStatus != types.TaskDefinitionEditOperationStatusCancelled &&
-		terminalStatus != types.TaskDefinitionEditOperationStatusExpired {
-		return nil, taskDefinitionEditValidation("pending terminal status is invalid")
-	}
+	const terminalStatus = types.TaskDefinitionEditOperationStatusExpired
 	tx, err := s.beginTaskDefinitionEditTx(ctx, scope.TenantID)
 	if err != nil {
 		return nil, taskDefinitionEditDatabaseError("begin pending termination", err)
@@ -758,14 +741,6 @@ func (s *Store) terminatePendingTaskDefinitionEdit(
 	op, err := loadTaskDefinitionEditOperationForUpdate(ctx, tx, scope)
 	if err != nil {
 		return nil, err
-	}
-	if !requireExpired &&
-		op.Status == types.TaskDefinitionEditOperationStatusPending {
-		if err := validateTaskDefinitionEditActiveActor(
-			ctx, tx, op.TenantID, op.UserID,
-		); err != nil {
-			return nil, err
-		}
 	}
 	databaseNow, err := taskDefinitionEditDatabaseClock(ctx, tx)
 	if err != nil {
@@ -791,7 +766,7 @@ func (s *Store) terminatePendingTaskDefinitionEdit(
 	if !pendingTaskDefinitionEditPristine(op) {
 		return nil, taskDefinitionEditConflict("pending operation has durable saga state")
 	}
-	if requireExpired && databaseNow.Before(op.ExpiresAt) {
+	if databaseNow.Before(op.ExpiresAt) {
 		return nil, taskDefinitionEditConflict("proposal has not expired")
 	}
 	var updated types.TaskDefinitionEditOperation
@@ -803,16 +778,16 @@ func (s *Store) terminatePendingTaskDefinitionEdit(
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		    AND target_tenant_id=$4 AND target_user_id=$5 AND task_id=$6
 		    AND status=$10 AND phase=$11 AND tombstoned_at IS NULL
-		    AND confirmed_at IS NULL AND lease_owner=''
+		    AND execution_started_at IS NULL AND lease_owner=''
 		    AND lease_until IS NULL AND takeover_not_before IS NULL
 		    AND fence=0 AND attempt=0
-		    AND ($12::boolean = false OR expires_at <= clock_timestamp())
+		    AND expires_at <= clock_timestamp()
 		  RETURNING `+taskDefinitionEditOperationColumns,
 		scope.ID, scope.TenantID, scope.UserID, scope.TargetTenantID,
 		scope.TargetUserID, scope.TaskID, terminalStatus,
 		receiptProvider, receiptTarget,
 		types.TaskDefinitionEditOperationStatusPending,
-		types.TaskDefinitionEditPhaseProposalSealed, requireExpired,
+		types.TaskDefinitionEditPhaseProposalSealed,
 	), &updated)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, taskDefinitionEditConflict("pending operation changed concurrently")
@@ -833,7 +808,7 @@ func (s *Store) terminatePendingTaskDefinitionEdit(
 func pendingTaskDefinitionEditPristine(op *types.TaskDefinitionEditOperation) bool {
 	return op != nil && op.Status == types.TaskDefinitionEditOperationStatusPending &&
 		op.Phase == types.TaskDefinitionEditPhaseProposalSealed &&
-		op.ConfirmedAt == nil && op.LeaseOwner == "" && op.LeaseUntil == nil &&
+		op.ExecutionStartedAt == nil && op.LeaseOwner == "" && op.LeaseUntil == nil &&
 		op.TakeoverNotBefore == nil && op.Fence == 0 && op.Attempt == 0 &&
 		op.TombstonedAt == nil && len(op.PauseSnapshot) == 0 &&
 		len(op.ApplySnapshot) == 0 && len(op.RestoreSnapshot) == 0
@@ -845,7 +820,7 @@ func pendingTaskDefinitionEditTerminalComplete(
 ) bool {
 	return op != nil && op.Status == status &&
 		op.Phase == types.TaskDefinitionEditPhaseProposalSealed &&
-		op.ConfirmedAt == nil && op.LeaseOwner == "" && op.LeaseUntil == nil &&
+		op.ExecutionStartedAt == nil && op.LeaseOwner == "" && op.LeaseUntil == nil &&
 		op.TakeoverNotBefore == nil && op.Fence == 0 && op.Attempt == 0 &&
 		op.TombstonedAt != nil && len(op.PauseSnapshot) == 0 &&
 		len(op.ApplySnapshot) == 0 && len(op.RestoreSnapshot) == 0
@@ -902,7 +877,7 @@ func assessTaskDefinitionEditSchedule(
 	return taskDefinitionEditScheduleExact
 }
 
-// AcquireTaskDefinitionEditOperation confirms a pending proposal or takes over
+// AcquireTaskDefinitionEditOperation starts a prepared operation or takes over
 // an expired execution. Quiescing PostgreSQL is intentionally a separate CAS.
 func (s *Store) AcquireTaskDefinitionEditOperation(
 	ctx context.Context,
@@ -953,7 +928,7 @@ func (s *Store) AcquireTaskDefinitionEditOperation(
 		}
 		assessment := assessTaskDefinitionEditSchedule(op, schedule)
 		if assessment != taskDefinitionEditScheduleExact {
-			return s.confirmAndTerminateTaskDefinitionEditDuringAcquire(
+			return s.startAndTerminateTaskDefinitionEditDuringAcquire(
 				ctx, tx, op, p, assessment)
 		}
 		return s.acquirePendingTaskDefinitionEdit(ctx, tx, op, p)
@@ -962,7 +937,7 @@ func (s *Store) AcquireTaskDefinitionEditOperation(
 		if op.ReceiptProvider != p.ReceiptProvider || op.ReceiptTarget != p.ReceiptTarget {
 			return nil, taskDefinitionEditConflict("operation receipt target differs")
 		}
-		if op.ConfirmedAt == nil || op.LeaseOwner == "" || op.LeaseUntil == nil ||
+		if op.ExecutionStartedAt == nil || op.LeaseOwner == "" || op.LeaseUntil == nil ||
 			op.TakeoverNotBefore == nil || op.Fence <= 0 || op.Attempt <= 0 {
 			return nil, taskDefinitionEditIntegrity()
 		}
@@ -1006,7 +981,7 @@ func (s *Store) expireTaskDefinitionEditDuringAcquire(
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		    AND target_tenant_id=$4 AND target_user_id=$5 AND task_id=$6
 		    AND status=$10 AND phase=$11 AND tombstoned_at IS NULL
-		    AND confirmed_at IS NULL AND fence=0 AND attempt=0
+		    AND execution_started_at IS NULL AND fence=0 AND attempt=0
 		    AND expires_at <= clock_timestamp()
 		  RETURNING `+taskDefinitionEditOperationColumns,
 		op.ID, op.TenantID, op.UserID, op.TargetTenantID, op.TargetUserID,
@@ -1031,7 +1006,7 @@ func (s *Store) expireTaskDefinitionEditDuringAcquire(
 	return cloneTaskDefinitionEditOperation(&updated), taskDefinitionEditTerminal()
 }
 
-func (s *Store) confirmAndTerminateTaskDefinitionEditDuringAcquire(
+func (s *Store) startAndTerminateTaskDefinitionEditDuringAcquire(
 	ctx context.Context,
 	tx pgx.Tx,
 	op *types.TaskDefinitionEditOperation,
@@ -1052,7 +1027,7 @@ func (s *Store) confirmAndTerminateTaskDefinitionEditDuringAcquire(
 	var updated types.TaskDefinitionEditOperation
 	err := scanTaskDefinitionEditOperation(tx.QueryRow(ctx,
 		`UPDATE task_definition_edit_operations
-		    SET status=$7, confirmed_at=clock_timestamp(),
+		    SET status=$7, execution_started_at=clock_timestamp(),
 		        receipt_provider=$8, receipt_target=$9,
 		        fence=1, attempt=1, error_code=$10, error_message=$11,
 		        lease_owner='', lease_until=NULL, takeover_not_before=NULL,
@@ -1060,7 +1035,7 @@ func (s *Store) confirmAndTerminateTaskDefinitionEditDuringAcquire(
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		    AND target_tenant_id=$4 AND target_user_id=$5 AND task_id=$6
 		    AND status=$12 AND phase=$13 AND tombstoned_at IS NULL
-		    AND confirmed_at IS NULL AND fence=0 AND attempt=0
+		    AND execution_started_at IS NULL AND fence=0 AND attempt=0
 		  RETURNING `+taskDefinitionEditOperationColumns,
 		op.ID, op.TenantID, op.UserID, op.TargetTenantID, op.TargetUserID,
 		op.TaskID, status, p.ReceiptProvider, p.ReceiptTarget,
@@ -1069,17 +1044,17 @@ func (s *Store) confirmAndTerminateTaskDefinitionEditDuringAcquire(
 		types.TaskDefinitionEditPhaseProposalSealed,
 	), &updated)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, taskDefinitionEditConflict("operation changed during terminal confirmation")
+		return nil, taskDefinitionEditConflict("operation changed during terminal start")
 	}
 	if err != nil {
-		return nil, taskDefinitionEditDatabaseError("write terminal confirmation", err)
+		return nil, taskDefinitionEditDatabaseError("write terminal start", err)
 	}
 	if err := insertTaskDefinitionEditReceiptForTerminal(
 		ctx, tx, updated.ID, updated.TenantID, updated.UserID); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, taskDefinitionEditDatabaseError("commit terminal confirmation", err)
+		return nil, taskDefinitionEditDatabaseError("commit terminal start", err)
 	}
 	return cloneTaskDefinitionEditOperation(&updated), taskDefinitionEditTerminal()
 }
@@ -1093,7 +1068,7 @@ func (s *Store) acquirePendingTaskDefinitionEdit(
 	var updated types.TaskDefinitionEditOperation
 	err := scanTaskDefinitionEditOperation(tx.QueryRow(ctx,
 		`UPDATE task_definition_edit_operations
-		    SET status=$7, confirmed_at=clock_timestamp(), lease_owner=$8,
+		    SET status=$7, execution_started_at=clock_timestamp(), lease_owner=$8,
 		        lease_until=clock_timestamp()+($9*interval '1 microsecond'),
 		        takeover_not_before=clock_timestamp()+($10*interval '1 microsecond'),
 		        fence=1, attempt=1, receipt_provider=$11, receipt_target=$12,
@@ -1101,7 +1076,7 @@ func (s *Store) acquirePendingTaskDefinitionEdit(
 		  WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		    AND target_tenant_id=$4 AND target_user_id=$5 AND task_id=$6
 		    AND status=$13 AND phase=$14 AND tombstoned_at IS NULL
-		    AND confirmed_at IS NULL AND expires_at > clock_timestamp()
+		    AND execution_started_at IS NULL AND expires_at > clock_timestamp()
 		    AND fence=0 AND attempt=0 AND lease_owner=''
 		  RETURNING `+taskDefinitionEditOperationColumns,
 		op.ID, op.TenantID, op.UserID, op.TargetTenantID, op.TargetUserID,
@@ -1379,7 +1354,7 @@ func (s *Store) ListStaleTaskDefinitionEditOperations(
 
 // QuiesceTaskDefinitionEdit atomically pauses the PostgreSQL mirror, installs
 // the operation/fence marker, and records db_quiesced. It performs no Temporal
-// call and is deliberately separate from confirmation/acquisition.
+// call and is deliberately separate from operation acquisition.
 func (s *Store) QuiesceTaskDefinitionEdit(
 	ctx context.Context,
 	lease types.TaskDefinitionEditLease,
@@ -2174,10 +2149,10 @@ func (s *Store) CommitTaskDefinitionEditDefinition(
 		expectedHead: ApprovedDefinitionFence{
 			Version: op.BaseDefinitionVersion, Digest: op.BaseDefinitionDigest,
 		},
-		definition:  target,
-		payload:     bytes.Clone(op.TargetDefinition),
-		digest:      op.TargetDefinitionDigest,
-		approvalRef: op.ApprovalRef,
+		definition:   target,
+		payload:      bytes.Clone(op.TargetDefinition),
+		digest:       op.TargetDefinitionDigest,
+		operationRef: op.OperationRef,
 	}
 	head := taskDefinitionHead{
 		Mode:    schedule.Mode,
@@ -2190,7 +2165,7 @@ func (s *Store) CommitTaskDefinitionEditDefinition(
 	}
 	if record.Version != op.TargetDefinitionVersion ||
 		record.Digest != op.TargetDefinitionDigest ||
-		record.ApprovalRef != op.ApprovalRef ||
+		record.OperationRef != op.OperationRef ||
 		!bytes.Equal(record.Payload, op.TargetDefinition) {
 		return taskDefinitionEditIntegrity()
 	}
@@ -2249,7 +2224,7 @@ func verifyCommittedTaskDefinitionEditTx(
 		return err
 	}
 	if record.Digest != op.TargetDefinitionDigest ||
-		record.ApprovalRef != op.ApprovalRef ||
+		record.OperationRef != op.OperationRef ||
 		!bytes.Equal(record.Payload, op.TargetDefinition) {
 		return taskDefinitionEditIntegrity()
 	}

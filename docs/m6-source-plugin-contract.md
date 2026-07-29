@@ -1,10 +1,13 @@
 # M6 契约：信源插件化（平台 × 能力 × 内容种类）
 
-> **历史设计记录，不是当前能力清单。** 本文保留 `web/page_watch`、
+> **历史设计记录，不是当前能力清单。** 2026-07-29 起，本文所有来源 CRUD、
+> 账户订阅、`sourcecatalog` 和实例 probe 条款均由
+> `task-playbook-fetch-target-cutover.md` 取代。当前能力注册表是
+> `capabilitycatalog/`，用户只编辑任务手册。本文保留 `web/page_watch`、
 > `page_snapshots`、`KindChange`、`SnapshotStore` 等内容用于解释当时的设计与下线决策；
 > 这些能力现已退役，不能据本文中的旧 schema、Gate 或排期重新实现。页面内容监控的现行能力是
 > `web/contents`：由 Exa `POST /contents` 抓取，统一走 data-feed 管道。当前代码真相源见
-> `sourcecatalog/`、`types/`、`sourcespec/` 与 `fetcher/exa_contents.go`。
+> `capabilitycatalog/`、`types/`、`fetchspec/` 与 `fetcher/exa_contents.go`。
 >
 > 事实基准：生产库 + 真实 API key 实测 2026-07-16。所有「实测」标注的数字都可复现。
 > 设计动机见 Boss 决策：**用户关注的是「来源平台」和「这个平台能给我什么功能」，

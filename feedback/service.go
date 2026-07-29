@@ -53,7 +53,7 @@ type Store interface {
 	HasFeedback(ctx context.Context, deliveryID int64, action types.FeedbackAction) (bool, error)
 	GetFeedbackDetail(ctx context.Context, deliveryID int64, action types.FeedbackAction) (string, error)
 	GetContentItem(ctx context.Context, id int64) (*types.ContentItem, error)
-	GetSource(ctx context.Context, id int64) (*types.Source, error)
+	GetFetchTarget(ctx context.Context, id int64) (*types.FetchTarget, error)
 	GetProfile(ctx context.Context, userID int64) (*types.Profile, error)
 }
 
@@ -456,7 +456,7 @@ func (s *Service) rebuilt(ctx context.Context, d *types.Delivery, toast string, 
 			input.Title = ci.Title
 			input.URL = ci.URL
 			input.PublishedAt = ci.PublishedAt
-			if src, err := s.deps.Store.GetSource(ctx, ci.SourceID); err == nil {
+			if src, err := s.deps.Store.GetFetchTarget(ctx, ci.SourceID); err == nil {
 				input.SourceTitle = src.Title
 				input.Platform = src.Platform
 			}
@@ -657,7 +657,7 @@ func (s *Service) rebuildAggregate(ctx context.Context, clicked *types.Delivery,
 				input.Title = ci.Title
 				input.URL = ci.URL
 				input.PublishedAt = ci.PublishedAt
-				if src, err := s.deps.Store.GetSource(ctx, ci.SourceID); err == nil {
+				if src, err := s.deps.Store.GetFetchTarget(ctx, ci.SourceID); err == nil {
 					input.SourceTitle = src.Title
 					input.Platform = src.Platform
 				}

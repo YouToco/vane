@@ -3,7 +3,7 @@ package types
 // 本文件集中定义 typed string 枚举，与数据库 TEXT 列一一对应。
 // 用 typed string 而非 iota：DB 存文本、JSON 序列化直观、增值不破坏兼容。
 
-// Platform 内容平台（sources.platform）。
+// Platform 抓取目标所属平台（fetch_targets.platform）。
 type Platform string
 
 const (
@@ -14,7 +14,7 @@ const (
 	PlatformWechatMP Platform = "wechat_mp" // 微信公众号：身份=app_msg_id_idx
 )
 
-// Capability 从平台取什么（sources.capability）。
+// Capability 描述从平台获取什么（fetch_targets.capability）。
 type Capability string
 
 const (
@@ -49,30 +49,12 @@ const (
 	KindPageContent Kind = "page_content"
 )
 
-// SourceType 旧信源类型枚举，008 迁移后 DB 不再有 type 列。
-// 仅供 sourcespec.BuildLegacy 和 api 兼容层使用，不得出现在新代码中。
-type SourceType string
+// FetchTargetStatus is the acquisition health state stored on fetch_targets.
+type FetchTargetStatus string
 
 const (
-	SourceTypeRSS       SourceType = "rss"
-	SourceTypeExa       SourceType = "exa"
-	SourceTypeTikHubXHS SourceType = "tikhub_xhs"
-)
-
-// SourceStatus 信源状态（sources.status）。
-type SourceStatus string
-
-const (
-	SourceStatusActive   SourceStatus = "active"   // 正常抓取
-	SourceStatusDisabled SourceStatus = "disabled" // 已停用（手动或连续失败自动停用）
-)
-
-// SubscriptionStatus 订阅状态（subscriptions.status）。
-type SubscriptionStatus string
-
-const (
-	SubscriptionStatusActive   SubscriptionStatus = "active"   // 生效中
-	SubscriptionStatusInactive SubscriptionStatus = "inactive" // 已取消（保留记录）
+	FetchTargetStatusActive   FetchTargetStatus = "active"
+	FetchTargetStatusDisabled FetchTargetStatus = "disabled"
 )
 
 // BatchStatus 推送批次状态（push_batches.status）。
@@ -116,12 +98,12 @@ const (
 type BatchExitGate string
 
 const (
-	BatchExitGateFetch  BatchExitGate = "fetch"  // 抓取后无候选：压根没抓到新内容
-	BatchExitGateDedup  BatchExitGate = "dedup"  // 去重后无候选：抓到了但全是重复
-	BatchExitGateObservationNoMatch BatchExitGate = "observation_no_match"
+	BatchExitGateFetch                BatchExitGate = "fetch" // 抓取后无候选：压根没抓到新内容
+	BatchExitGateDedup                BatchExitGate = "dedup" // 去重后无候选：抓到了但全是重复
+	BatchExitGateObservationNoMatch   BatchExitGate = "observation_no_match"
 	BatchExitGateObservationUncertain BatchExitGate = "observation_uncertain"
-	BatchExitGateScore  BatchExitGate = "score"  // 打分后无候选
-	BatchExitGateSelect BatchExitGate = "select" // 择优后无候选
+	BatchExitGateScore                BatchExitGate = "score"  // 打分后无候选
+	BatchExitGateSelect               BatchExitGate = "select" // 择优后无候选
 	// BatchExitGateQuota 额度用尽而非"没内容"。**必须与其它闸门区分开**：
 	// 走 score 闸门会告诉用户"打分后没有达标的"，而真相是根本没打分——
 	// 那是假话，且会让人以为是内容质量问题、跑去改画像或换信源。
@@ -215,14 +197,14 @@ const (
 	AgentSessionStatusClosed  AgentSessionStatus = "closed"  // 主动关闭
 )
 
-// PendingActionStatus 待确认动作状态（pending_actions.status，M4 契约 §3）。
-type PendingActionStatus string
+// TaskOperationStatus 任务创建耐久操作状态（task_creation_operations.status）。
+type TaskOperationStatus string
 
 const (
-	PendingActionStatusPending   PendingActionStatus = "pending"   // 待用户确认
-	PendingActionStatusExecuted  PendingActionStatus = "executed"  // 用户已确认，Claim 原子置位
-	PendingActionStatusCancelled PendingActionStatus = "cancelled" // 用户点了取消
-	PendingActionStatusExpired   PendingActionStatus = "expired"   // 超时未确认
+	TaskOperationStatusPending   TaskOperationStatus = "pending"   // 已冻结，等待执行器领取
+	TaskOperationStatusExecuted  TaskOperationStatus = "executed"  // 已被执行器原子领取
+	TaskOperationStatusCancelled TaskOperationStatus = "cancelled" // 执行前撤销
+	TaskOperationStatusExpired   TaskOperationStatus = "expired"   // 执行前超时
 )
 
 // ExecutionMode 是任务在一次运行内冻结的执行轨道。零值空串与显式 Unknown 常量

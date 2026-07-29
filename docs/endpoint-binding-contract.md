@@ -1,5 +1,11 @@
 # 端点绑定契约（注册表端点 → 订阅信源）
 
+> **现行覆盖声明（2026-07-29）：** 本文的固定运行期绑定引擎仍有效；实例级
+> `add_source` probe、来源确认卡和 `sourcecatalog` 准入已退役。当前能力准入归
+> `capabilitycatalog`，目标实例只由批准后的任务手册经 `fetchspec` 材料化。下文
+> 出现的 `sourcecatalog`、`sourcespec`、`sources` 与账户订阅均是切换前历史名，
+> 不得作为新入口。见 `task-playbook-fetch-target-cutover.md`。
+>
 > 2026-07-18 定稿。Boss 拍板「统一前门」：发现/绑定环节用 agent + 注册表，定时运行环节
 > 跑固化绑定（不每轮重新找工具）。本契约是 tikhub-endpoint-registry-contract.md §0.3
 > 所述「某端点若证明适合做订阅信源，走 sourcecatalog 实测准入**另行实现**」的那个另行实现，

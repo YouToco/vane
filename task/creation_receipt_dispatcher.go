@@ -19,73 +19,23 @@ import (
 )
 
 const (
-	// FeishuCardPatchReceiptProvider identifies the only A6 delivery adapter.
-	// The original confirmation message is replaced in place, so replaying an
-	// ambiguous PATCH cannot create a second user-visible message.
-	FeishuCardPatchReceiptProvider = "feishu_card_patch"
-	// WebActionReceiptProvider identifies a browser-polled durable action. The
-	// operation ID is both the immutable target and the polling key. Dispatchers
-	// still append the terminal fact to Agent history, but there is no external
-	// provider mutation to perform.
-	WebActionReceiptProvider = "web_action_poll/v1"
-	// AgentAutoReceiptProvider identifies a durable operation authorized by
-	// the owner's current natural-language request. Like browser polling it
-	// has no external provider mutation, but its history must not claim that a
-	// confirmation card was clicked.
+	// AgentAutoReceiptProvider identifies a durable operation authorized by the
+	// owner's current natural-language request. Completion is recorded in the
+	// Agent session; there is no confirmation UI or external message mutation.
 	AgentAutoReceiptProvider = "agent_auto/v1"
 
-	creationReceiptPayloadVersion = "vane.task-creation-user-receipt/v1"
+	creationReceiptPayloadVersion = "vane.task-creation-session-receipt/v2"
 	creationReceiptPollInterval   = 2 * time.Second
 	// Session checkpoint uses a non-blocking attempt on Agent's per-user mutex;
 	// a busy conversation releases the receipt for retry instead of holding the
-	// global scan. One minute covers the bounded provider call and DB checkpoints
-	// while keeping crash takeover latency short.
+	// global scan. One minute covers the bounded DB checkpoints while keeping
+	// crash takeover latency short.
 	creationReceiptLeaseDuration  = time.Minute
-	creationReceiptSendTimeout    = 10 * time.Second
 	creationReceiptStoreTimeout   = 5 * time.Second
 	creationReceiptTenantLimit    = 100
 	creationReceiptPerTenantLimit = 64
 	creationReceiptConcurrency    = 4
-	maxCreationReceiptCardBytes   = 30 << 10
 )
-
-// FeishuCardPatchReceiptProviderForApp binds a receipt to the Feishu app that
-// emitted the original card without persisting the app ID itself. Secret
-// rotation under the same app remains compatible; switching apps cannot make a
-// new credential mutate an old app's message resource.
-func FeishuCardPatchReceiptProviderForApp(appID string) string {
-	appID = strings.TrimSpace(appID)
-	if appID == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(appID))
-	return FeishuCardPatchReceiptProvider + ":" + hex.EncodeToString(sum[:16])
-}
-
-func validFeishuCardPatchReceiptProvider(provider string) bool {
-	prefix := FeishuCardPatchReceiptProvider + ":"
-	if !strings.HasPrefix(provider, prefix) || len(provider) != len(prefix)+32 {
-		return false
-	}
-	_, err := hex.DecodeString(strings.TrimPrefix(provider, prefix))
-	return err == nil
-}
-
-// IsFeishuCardPatchReceiptProvider reports whether provider is a structurally
-// valid app-bound Feishu Patch adapter identity.
-func IsFeishuCardPatchReceiptProvider(provider string) bool {
-	return validFeishuCardPatchReceiptProvider(provider)
-}
-
-// WebActionReceiptTarget returns the server-owned receipt identity for one
-// authenticated browser action. Callers must never accept provider/target from
-// request JSON.
-func WebActionReceiptTarget(actionID string) CreationReceiptTarget {
-	return CreationReceiptTarget{
-		Provider: WebActionReceiptProvider,
-		Target:   actionID,
-	}
-}
 
 func AgentAutoReceiptTarget(actionID string) CreationReceiptTarget {
 	return CreationReceiptTarget{
@@ -94,23 +44,12 @@ func AgentAutoReceiptTarget(actionID string) CreationReceiptTarget {
 	}
 }
 
-func validWebActionReceiptTarget(provider, target, actionID string) bool {
-	return provider == WebActionReceiptProvider &&
-		target == actionID &&
-		strings.TrimSpace(actionID) != "" &&
-		actionID == strings.TrimSpace(actionID)
-}
-
 func validAgentAutoReceiptTarget(provider, target, actionID string) bool {
 	return provider == AgentAutoReceiptProvider &&
-		target == actionID &&
+		strings.TrimSpace(target) != "" &&
+		target == strings.TrimSpace(target) &&
 		strings.TrimSpace(actionID) != "" &&
 		actionID == strings.TrimSpace(actionID)
-}
-
-func validLocalActionReceiptTarget(provider, target, actionID string) bool {
-	return validWebActionReceiptTarget(provider, target, actionID) ||
-		validAgentAutoReceiptTarget(provider, target, actionID)
 }
 
 // CreationReceiptStore is the durable A6 outbox boundary. Every mutable method
@@ -139,13 +78,6 @@ type CreationReceiptStore interface {
 	) error
 }
 
-// CreationReceiptSender applies one immutable terminal card to an existing
-// provider resource. Implementations must be replay-safe for the same target
-// and bytes; the Feishu adapter uses Message.Patch rather than Message.Create.
-type CreationReceiptSender interface {
-	SendCreationReceipt(ctx context.Context, provider, messageID, cardJSON string) error
-}
-
 // CreationReceiptSessionRecorder serializes the outbox append with Agent's
 // per-user load/modify/save lock. Its store transaction appends the message and
 // marks session_recorded_at together, making a lost database response replayable.
@@ -157,26 +89,19 @@ type CreationReceiptSessionRecorder interface {
 	) error
 }
 
-type CreationReceiptCardBuilder func(markdown string) string
-
 type CreationReceiptDispatcherDeps struct {
-	Store     CreationReceiptStore
-	Sender    CreationReceiptSender
-	Sessions  CreationReceiptSessionRecorder
-	BuildCard CreationReceiptCardBuilder
-	Logger    *slog.Logger
+	Store    CreationReceiptStore
+	Sessions CreationReceiptSessionRecorder
+	Logger   *slog.Logger
 }
 
 // CreationReceiptDispatcher drains terminal task-creation receipts. It owns no
 // business mutation: terminal rows are produced atomically by the A5 saga;
-// this component only freezes presentation, records conversation history, and
-// converges the provider card to that frozen terminal state.
+// this component only freezes and records the terminal conversation fact.
 type CreationReceiptDispatcher struct {
-	store     CreationReceiptStore
-	sender    CreationReceiptSender
-	sessions  CreationReceiptSessionRecorder
-	buildCard CreationReceiptCardBuilder
-	logger    *slog.Logger
+	store    CreationReceiptStore
+	sessions CreationReceiptSessionRecorder
+	logger   *slog.Logger
 
 	// A pass is serialized and advances a tenant keyset cursor. When it reaches
 	// the end it wraps to zero, so a permanently busy low-ID tenant cannot starve
@@ -188,15 +113,14 @@ type CreationReceiptDispatcher struct {
 func NewCreationReceiptDispatcher(
 	d CreationReceiptDispatcherDeps,
 ) (*CreationReceiptDispatcher, error) {
-	if d.Store == nil || d.Sender == nil || d.Sessions == nil || d.BuildCard == nil {
+	if d.Store == nil || d.Sessions == nil {
 		return nil, errors.New("task: creation receipt dispatcher dependencies are incomplete")
 	}
 	if d.Logger == nil {
 		d.Logger = slog.Default()
 	}
 	return &CreationReceiptDispatcher{
-		store: d.Store, sender: d.Sender, sessions: d.Sessions,
-		buildCard: d.BuildCard, logger: d.Logger,
+		store: d.Store, sessions: d.Sessions, logger: d.Logger,
 	}, nil
 }
 
@@ -228,7 +152,7 @@ func (d *CreationReceiptDispatcher) dispatchAndLog(ctx context.Context) {
 // DispatchOnce drains one bounded snapshot. The caller may invoke it directly
 // in crash/replay tests; production uses Run.
 func (d *CreationReceiptDispatcher) DispatchOnce(ctx context.Context) error {
-	if d == nil || d.store == nil || d.sender == nil || d.sessions == nil || d.buildCard == nil {
+	if d == nil || d.store == nil || d.sessions == nil {
 		return errors.New("task: creation receipt dispatcher dependencies are incomplete")
 	}
 	if err := ctx.Err(); err != nil {
@@ -328,24 +252,22 @@ func (d *CreationReceiptDispatcher) dispatchReceipt(
 		}
 	}
 
-	if !validLocalActionReceiptTarget(
+	if !validAgentAutoReceiptTarget(
 		receipt.Provider, receipt.Target, receipt.OperationID,
 	) {
-		sendCtx, cancel := context.WithTimeout(ctx, creationReceiptSendTimeout)
-		err = d.sender.SendCreationReceipt(
-			sendCtx, receipt.Provider, receipt.Target, payload.CardJSON,
+		return d.finishFailure(
+			ctx,
+			lease,
+			types.NewAppError(
+				types.CodeValidation,
+				"task creation receipt provider is retired",
+				nil,
+			),
+			false,
 		)
-		cancel()
-		if err != nil {
-			return d.finishFailure(ctx, lease, err, true)
-		}
 	}
 
-	// Message.Patch and browser polling both use an existing immutable target,
-	// so that target is also the sent checkpoint value.
 	if err := d.store.MarkTaskCreationReceiptSent(ctx, lease, receipt.Target); err != nil {
-		// A patch may already be visible while this DB response is lost. Leave the
-		// row replayable: the next owner applies the same bytes to the same message.
 		return err
 	}
 	return nil
@@ -353,7 +275,6 @@ func (d *CreationReceiptDispatcher) dispatchReceipt(
 
 type creationUserReceiptPayload struct {
 	Version         string          `json:"version"`
-	CardJSON        string          `json:"card_json"`
 	SessionMessages json.RawMessage `json:"session_messages"`
 }
 
@@ -364,15 +285,9 @@ func (d *CreationReceiptDispatcher) loadOrCheckpointPayload(
 	if len(receipt.Payload) != 0 {
 		return decodeCreationUserReceiptPayload(receipt.Payload, receipt.PayloadDigest)
 	}
-	display, history, err := renderCreationUserReceipt(*receipt)
+	_, history, err := renderCreationUserReceipt(*receipt)
 	if err != nil {
 		return creationUserReceiptPayload{}, err
-	}
-	cardJSON := d.buildCard(display)
-	if strings.TrimSpace(cardJSON) == "" || len(cardJSON) > maxCreationReceiptCardBytes ||
-		!json.Valid([]byte(cardJSON)) {
-		return creationUserReceiptPayload{},
-			types.NewAppError(types.CodeValidation, "task creation receipt card is invalid", nil)
 	}
 	messages, err := json.Marshal([]struct {
 		Role    string `json:"role"`
@@ -383,7 +298,6 @@ func (d *CreationReceiptDispatcher) loadOrCheckpointPayload(
 	}
 	payload := creationUserReceiptPayload{
 		Version:         creationReceiptPayloadVersion,
-		CardJSON:        cardJSON,
 		SessionMessages: messages,
 	}
 	raw, err := json.Marshal(payload)
@@ -417,9 +331,7 @@ func decodeCreationUserReceiptPayload(
 			types.NewAppError(types.CodeValidation, "task creation receipt payload is invalid", err)
 	}
 	if payload.Version != creationReceiptPayloadVersion ||
-		strings.TrimSpace(payload.CardJSON) == "" ||
-		len(payload.CardJSON) > maxCreationReceiptCardBytes ||
-		!json.Valid([]byte(payload.CardJSON)) || len(payload.SessionMessages) == 0 {
+		len(payload.SessionMessages) == 0 {
 		return creationUserReceiptPayload{},
 			types.NewAppError(types.CodeValidation, "task creation receipt payload fields are invalid", nil)
 	}
@@ -434,12 +346,12 @@ func decodeCreationUserReceiptPayload(
 func renderCreationUserReceipt(
 	receipt types.TaskCreationReceipt,
 ) (display string, history string, err error) {
-	expectedPhase := map[types.PendingActionStatus]types.TaskCreationPhase{
-		types.PendingActionStatusExecuted:  types.TaskCreationPhaseCompleted,
-		types.PendingActionStatusCancelled: types.TaskCreationPhaseCancelled,
-		types.PendingActionStatusExpired:   types.TaskCreationPhaseExpired,
-		types.PendingActionStatusBlocked:   types.TaskCreationPhaseBlocked,
-		types.PendingActionStatusFailed:    types.TaskCreationPhaseFailed,
+	expectedPhase := map[types.TaskOperationStatus]types.TaskCreationPhase{
+		types.TaskOperationStatusExecuted:  types.TaskCreationPhaseCompleted,
+		types.TaskOperationStatusCancelled: types.TaskCreationPhaseCancelled,
+		types.TaskOperationStatusExpired:   types.TaskCreationPhaseExpired,
+		types.TaskOperationStatusBlocked:   types.TaskCreationPhaseBlocked,
+		types.TaskOperationStatusFailed:    types.TaskCreationPhaseFailed,
 	}[receipt.OperationStatus]
 	if expectedPhase == "" || receipt.OperationPhase != expectedPhase {
 		return "", "", types.NewAppError(types.CodeValidation,
@@ -447,7 +359,7 @@ func renderCreationUserReceipt(
 	}
 
 	switch receipt.OperationStatus {
-	case types.PendingActionStatusExecuted:
+	case types.TaskOperationStatusExecuted:
 		var checkpoint creationSuccessCheckpoint
 		if err := decodeStrictJSON(receipt.Result, &checkpoint); err != nil ||
 			checkpoint.Version != creationResultVersion ||
@@ -458,36 +370,22 @@ func renderCreationUserReceipt(
 		}
 		display = strings.TrimSpace(checkpoint.Message)
 		// Session history is a privileged input on the next Agent turn. Never
-		// persist operation summary, source title/URL/config, provider errors, or
-		// rendered card text here: those fields may contain external content even
-		// when the user approved the task. The durable callback records only the
-		// fixed state transition; detail remains in the card and audit tables.
-		history = "[卡片回调] 用户已点击「确认」，任务已成功创建。"
-	case types.PendingActionStatusCancelled:
+		// persist operation summary, target title/URL/config, or errors here:
+		// those fields may contain external content. Record only the fixed state.
+		history = "[Agent执行] 用户已在当前消息中明确要求，任务已成功创建。"
+	case types.TaskOperationStatusCancelled:
 		display = "已取消本次任务创建。"
-		history = "[卡片回调] 用户已点击「取消」，任务创建已取消。"
-	case types.PendingActionStatusExpired:
-		display = "这张任务确认已过期，请重新描述需求。"
-		history = "[卡片回调] 用户已点击「确认」，但任务确认已过期，任务未创建。"
-	case types.PendingActionStatusBlocked, types.PendingActionStatusFailed:
+		history = "[Agent执行] 任务创建操作已取消。"
+	case types.TaskOperationStatusExpired:
+		display = "任务创建操作已过期，请重新描述需求。"
+		history = "[Agent执行] 任务创建操作已过期，任务未创建。"
+	case types.TaskOperationStatusBlocked, types.TaskOperationStatusFailed:
 		display = strings.TrimSpace(receipt.ErrorMessage)
 		if strings.TrimSpace(receipt.ErrorCode) == "" || display == "" {
 			return "", "", types.NewAppError(types.CodeValidation,
 				"task creation receipt failure checkpoint is invalid", nil)
 		}
-		history = "[卡片回调] 用户已点击「确认」，但任务创建已安全停止，任务未创建。"
-	}
-	if validAgentAutoReceiptTarget(
-		receipt.Provider, receipt.Target, receipt.OperationID,
-	) {
-		switch receipt.OperationStatus {
-		case types.PendingActionStatusExecuted:
-			history = "[Agent执行] 用户已在当前消息中明确要求，任务已成功创建。"
-		case types.PendingActionStatusBlocked, types.PendingActionStatusFailed:
-			history = "[Agent执行] 用户已在当前消息中明确要求，但任务创建已安全停止，任务未创建。"
-		case types.PendingActionStatusExpired:
-			history = "[Agent执行] 用户已在当前消息中明确要求，但任务创建操作已过期，任务未创建。"
-		}
+		history = "[Agent执行] 用户已在当前消息中明确要求，但任务创建已安全停止，任务未创建。"
 	}
 	return display, history, nil
 }
@@ -496,7 +394,7 @@ func (d *CreationReceiptDispatcher) finishFailure(
 	ctx context.Context,
 	lease types.TaskCreationReceiptLease,
 	cause error,
-	providerCall bool,
+	_ bool,
 ) error {
 	class := types.TaskCreationReceiptFailureRetryable
 	retryAfter := creationReceiptBackoff(1)
@@ -504,10 +402,6 @@ func (d *CreationReceiptDispatcher) finishFailure(
 	if errors.As(cause, &appErr) && !appErr.Retryable {
 		class = types.TaskCreationReceiptFailurePermanent
 		retryAfter = 0
-	} else if providerCall {
-		// A transport error or timeout cannot prove whether Feishu applied PATCH.
-		// It is nevertheless safe to retry because target and bytes are frozen.
-		class = types.TaskCreationReceiptFailureAmbiguous
 	}
 	if lease.Fence > 0 {
 		// Fence starts at one and attempt advances with every acquisition. The

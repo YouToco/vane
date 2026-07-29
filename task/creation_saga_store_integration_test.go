@@ -53,7 +53,7 @@ func (s *completeResponseLossStore) CompleteTaskCreationOperation(
 }
 
 // TestCreationCoordinator_PostgreSQLRoundTrip exercises the complete A5 saga
-// through a real Store. In particular, pending_actions.args and result are
+// through a real Store. In particular, task_creation_operations.args and result are
 // JSONB: PostgreSQL rewrites their object bytes, so raw-byte identity checks
 // would reject both the first proposal and the terminal replay.
 func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
@@ -73,7 +73,7 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 			t.Fatalf("canonicalize fixture: %v", err)
 		}
 
-		proposal, err := coordinator.Propose(t.Context(), CreationProposalInput{
+		proposal, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 			ActionID: actionID, UserID: userID, RawArgs: rawArgs,
 			ExpiresAt: time.Now().Add(time.Hour),
 		})
@@ -97,11 +97,11 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 			t.Fatalf("persisted args changed meaning: %s", persisted.Args)
 		}
 
-		result, err := coordinator.Confirm(t.Context(), userID, actionID, testCreationReceiptTarget)
+		result, err := coordinator.Execute(t.Context(), userID, actionID, testCreationReceiptTarget)
 		if err != nil {
-			t.Fatalf("Confirm() through PostgreSQL: %v", err)
+			t.Fatalf("Execute() through PostgreSQL: %v", err)
 		}
-		if result.Status != types.PendingActionStatusExecuted || result.TaskID == "" ||
+		if result.Status != types.TaskOperationStatusExecuted || result.TaskID == "" ||
 			result.Recovering || result.Replayed {
 			t.Fatalf("first confirmation result = %+v", result)
 		}
@@ -121,11 +121,11 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 		}
 
 		schedulerEvents := len(schedules.events)
-		replayed, err := coordinator.Confirm(t.Context(), userID, actionID, testCreationReceiptTarget)
+		replayed, err := coordinator.Execute(t.Context(), userID, actionID, testCreationReceiptTarget)
 		if err != nil {
-			t.Fatalf("Confirm() terminal replay: %v", err)
+			t.Fatalf("Execute() terminal replay: %v", err)
 		}
-		if replayed.Status != types.PendingActionStatusExecuted || !replayed.Replayed ||
+		if replayed.Status != types.TaskOperationStatusExecuted || !replayed.Replayed ||
 			replayed.TaskID != result.TaskID || replayed.Message != result.Message {
 			t.Fatalf("terminal replay result = %+v; first = %+v", replayed, result)
 		}
@@ -134,10 +134,9 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 				schedulerEvents, len(schedules.events), schedules.events)
 		}
 
-		// A6 cross-package proof: the same terminal transaction produced one
-		// delayed outbox row. Once callback response time has elapsed, a real
-		// Store + dispatcher freezes payload/history, patches one provider
-		// resource, and commits sent without any live request state.
+		// The same terminal transaction produced one delayed outbox row. A real
+		// Store + dispatcher freezes the session fact and commits the receipt
+		// without any live request state.
 		receipt, err := st.LoadTaskCreationReceiptByOperation(
 			t.Context(), actionID, tenantID, userID,
 		)
@@ -145,18 +144,9 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 			t.Fatalf("load terminal receipt: %v", err)
 		}
 		receipt = waitForDueTaskCreationReceipt(t, st, *receipt)
-		sender := &receiptDispatcherFakeSender{}
 		dispatcher, err := NewCreationReceiptDispatcher(CreationReceiptDispatcherDeps{
-			Store: st, Sender: sender,
+			Store:    st,
 			Sessions: postgresReceiptSessionRecorder{store: st},
-			BuildCard: func(markdown string) string {
-				raw, _ := json.Marshal(map[string]any{
-					"schema": "2.0",
-					"config": map[string]any{"update_multi": true},
-					"body":   map[string]any{"text": markdown},
-				})
-				return string(raw)
-			},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -171,10 +161,6 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 			receipt.SessionRecordedAt == nil || receipt.ProviderMessageID != testCreationReceiptTarget.Target {
 			t.Fatalf("terminal receipt did not converge: receipt=%+v err=%v", receipt, err)
 		}
-		if calls, resources := sender.snapshot(); calls != 1 || len(resources) != 1 ||
-			resources[testCreationReceiptTarget.Target] == "" {
-			t.Fatalf("provider state calls=%d resources=%v", calls, resources)
-		}
 	})
 
 	t.Run("complete response loss converges with detached readback", func(t *testing.T) {
@@ -185,7 +171,7 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 			responseLoss, &creationSagaFakeScheduler{}, nil,
 		)
 		actionID := "task-create-complete-loss-" + uuid.NewString()
-		if _, err := coordinator.Propose(ctx, CreationProposalInput{
+		if _, err := coordinator.Prepare(ctx, CreationProposalInput{
 			ActionID: actionID, UserID: userID,
 			RawArgs:   mustCreateArgs(t, "每天监控 AI 模型发布", "AI 模型发布"),
 			ExpiresAt: time.Now().Add(time.Hour),
@@ -193,24 +179,24 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 			t.Fatalf("Propose(): %v", err)
 		}
 
-		result, err := coordinator.Confirm(ctx, userID, actionID, testCreationReceiptTarget)
+		result, err := coordinator.Execute(ctx, userID, actionID, testCreationReceiptTarget)
 		if err != nil {
-			t.Fatalf("Confirm() should adopt committed terminal row: %v", err)
+			t.Fatalf("Execute() should adopt committed terminal row: %v", err)
 		}
 		if !errors.Is(ctx.Err(), context.Canceled) {
 			t.Fatalf("response-loss boundary did not cancel request context: %v", ctx.Err())
 		}
 		if responseLoss.completeCalls != 1 ||
-			result.Status != types.PendingActionStatusExecuted || result.TaskID == "" ||
+			result.Status != types.TaskOperationStatusExecuted || result.TaskID == "" ||
 			result.Recovering || result.Replayed {
 			t.Fatalf("result=%+v complete_calls=%d", result, responseLoss.completeCalls)
 		}
 
-		replayed, err := coordinator.Confirm(t.Context(), userID, actionID, testCreationReceiptTarget)
+		replayed, err := coordinator.Execute(t.Context(), userID, actionID, testCreationReceiptTarget)
 		if err != nil {
-			t.Fatalf("Confirm() after adopted response loss: %v", err)
+			t.Fatalf("Execute() after adopted response loss: %v", err)
 		}
-		if !replayed.Replayed || replayed.Status != types.PendingActionStatusExecuted ||
+		if !replayed.Replayed || replayed.Status != types.TaskOperationStatusExecuted ||
 			replayed.TaskID != result.TaskID || responseLoss.completeCalls != 1 {
 			t.Fatalf("replayed=%+v complete_calls=%d", replayed, responseLoss.completeCalls)
 		}

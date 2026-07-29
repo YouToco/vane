@@ -50,7 +50,7 @@ func (s *Store) CreatePushBatch(ctx context.Context, userID int64) (int64, error
 //
 // 复位不动幂等地基：arbiter、WHERE 谓词、RETURNING id 一字未改，新增的只是
 // SET 里两个赋值。正常 Push 重试时这两列本就是空值，写空是等值空更新。
-// scheduleID 记录触发本批的定时任务（P1b，可空："" → NULL，即 push_now/老任务的用户级语义）。
+// scheduleID 记录触发本批的任务。空值只用于读取历史账户级批次。
 // 冲突路径（Temporal 重试复用批次）刻意不更新 schedule_id：首次插入已定，归属不因重试改变。
 func (s *Store) CreatePushBatchIdempotent(ctx context.Context, userID int64, idempKey, scheduleID string) (int64, error) {
 	var id int64
@@ -67,7 +67,7 @@ func (s *Store) CreatePushBatchIdempotent(ctx context.Context, userID int64, ide
 }
 
 // nullableText 把空串归一为 SQL NULL：pgx 写 Go "" 是空串而非 NULL，而可空列
-// （如 push_batches.schedule_id）要用 NULL 表达"无归属任务"（push_now/老任务）。
+// （如 push_batches.schedule_id）用 NULL 表达历史的“无归属任务”。
 func nullableText(s string) any {
 	if s == "" {
 		return nil

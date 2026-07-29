@@ -15,11 +15,11 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/fetchspec"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/promptguard"
 	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
@@ -29,8 +29,8 @@ const (
 	creationAttemptTimeout     = 25 * time.Second
 	creationExternalRPCTimeout = 8 * time.Second
 	creationConvergenceTimeout = 5 * time.Second
-	// Compensation may outlive a cancelled card request so an already-issued
-	// Temporal mutation can converge. Keep the whole detached cleanup bounded;
+	// Compensation may outlive the originating request so an already-issued
+	// Temporal mutation can converge. Keep the detached cleanup bounded;
 	// Manager shutdown reserves enough time for this budget before closing DB.
 	creationCompensationTimeout  = 15 * time.Second
 	creationRecoveryInterval     = 15 * time.Second
@@ -45,13 +45,11 @@ const (
 )
 
 // ErrCreationOperationNotFound is deliberately narrower than types.ErrNotFound.
-// Agent may fall back to the historical v0 confirmation path only when this
-// sentinel proves that the action ID is not a v1 creation operation.
 var ErrCreationOperationNotFound = errors.New("task: creation operation not found")
 
 // CreationProposalInput is the trusted Agent-to-control-plane handoff. RawArgs
 // still come from the model, so the coordinator validates and canonicalizes
-// them before writing any durable confirmation action.
+// them before writing any durable operation.
 type CreationProposalInput struct {
 	ActionID  string
 	UserID    int64
@@ -65,28 +63,26 @@ type CreationProposal struct {
 	Summary string
 }
 
-// CreationReceiptTarget is the immutable provider resource on which A6 will
-// converge the terminal user receipt. Confirm/Cancel bind it in the same
-// transaction that accepts the click; a different target on replay conflicts.
+// CreationReceiptTarget is the immutable session resource on which the
+// terminal user receipt converges. Execute binds it while acquiring the
+// operation; a different target on replay conflicts.
 type CreationReceiptTarget struct {
 	Provider string
 	Target   string
 }
 
-// CreationResult is safe to render at the callback boundary. Recovering means
-// the operation owns durable checkpoints but did not finish inside this HTTP
-// callback; the background runner will continue it without a second task.
+// CreationResult is safe to render at the request boundary. Recovering means
+// the operation owns durable checkpoints but did not finish in the request;
+// the background runner will continue it without a second task.
 type CreationResult struct {
 	OperationID string
 	TaskID      string
 	Message     string
-	Status      types.PendingActionStatus
+	Status      types.TaskOperationStatus
 	Recovering  bool
 	Replayed    bool
-	// ReceiptBound is true only after the callback's provider resource was
-	// durably accepted with this operation. The Feishu handler may replace the
-	// buttons with a processing card only in this state; legacy A5 tombstones
-	// migrated without a target keep their historical synchronous response.
+	// ReceiptBound is true only after the session receipt resource was durably
+	// accepted with this operation.
 	ReceiptBound bool
 	SessionID    *int64
 	Summary      string
@@ -101,17 +97,15 @@ type CreationSagaStore interface {
 
 	ListMembershipsByUser(ctx context.Context, userID int64) ([]types.Membership, error)
 	GetTenant(ctx context.Context, id int64) (*types.Tenant, error)
-	ResolveTaskCreationSources(ctx context.Context, tenantID, userID int64, sourceIDs []int64) ([]types.Source, error)
 	LoadTaskCreationOperationByUser(ctx context.Context, id string, userID int64) (*types.TaskCreationOperation, error)
 	CreateTaskCreationOperation(ctx context.Context, p types.CreateTaskCreationOperationParams) (*types.TaskCreationOperation, error)
-	CancelTaskCreationOperation(ctx context.Context, p types.CancelTaskCreationOperationParams) (*types.TaskCreationOperation, error)
 	AcquireTaskCreationOperation(ctx context.Context, p types.AcquireTaskCreationOperationParams) (*types.TaskCreationOperation, error)
 	CheckpointTaskCreationEnsureReceipt(ctx context.Context, lease types.TaskCreationLease, receipt []byte, taskID string) error
 	CommitPausedCompiledTaskDefinitionForCreation(ctx context.Context, p types.CommitPausedCompiledTaskDefinitionForCreationParams) error
 	BeginTaskCreationActivation(ctx context.Context, lease types.TaskCreationLease, taskID string) (bool, error)
 	CommitTaskCreationActivation(ctx context.Context, lease types.TaskCreationLease, taskID string) error
 	BeginTaskCreationCleanup(ctx context.Context, lease types.TaskCreationLease, taskID, errorCode, errorMessage string) (bool, error)
-	FinishTaskCreationCleanup(ctx context.Context, lease types.TaskCreationLease, taskID string, terminalStatus types.PendingActionStatus) error
+	FinishTaskCreationCleanup(ctx context.Context, lease types.TaskCreationLease, taskID string, terminalStatus types.TaskOperationStatus) error
 	BlockTaskCreationOperationAfterSideEffect(ctx context.Context, lease types.TaskCreationLease, taskID, errorCode, errorMessage string) error
 	CompleteTaskCreationOperation(ctx context.Context, lease types.TaskCreationLease, taskID string, result json.RawMessage) error
 	ListStaleTaskCreationTenantIDs(ctx context.Context, before time.Time, afterTenantID int64, limit int) ([]int64, error)
@@ -144,7 +138,7 @@ func (p creationSchedulePreparer) Prepare(
 }
 
 // CreationCoordinator is the only production owner of v1 create_schedule.
-// Agent receives Propose/Confirm only; lease, fence and lifecycle methods are
+// Agent receives Prepare/Execute only; lease, fence and lifecycle methods are
 // intentionally not exposed through its dependency graph.
 type CreationCoordinator struct {
 	store     CreationSagaStore
@@ -175,10 +169,9 @@ func NewCreationCoordinator(
 	}
 }
 
-// Propose validates the complete approved definition before it creates a
-// confirmation action. There is no LLM, network discovery, or Temporal call on
-// this path.
-func (c *CreationCoordinator) Propose(
+// Prepare validates and freezes the complete definition. There is no LLM,
+// network discovery, or Temporal call on this path.
+func (c *CreationCoordinator) Prepare(
 	ctx context.Context,
 	in CreationProposalInput,
 ) (CreationProposal, error) {
@@ -190,94 +183,33 @@ func (c *CreationCoordinator) Propose(
 	}
 	if strings.TrimSpace(in.ActionID) == "" || in.ActionID != strings.TrimSpace(in.ActionID) ||
 		in.UserID <= 0 || in.ExpiresAt.IsZero() {
-		return CreationProposal{}, creationValidation("任务确认请求不完整", nil)
+		return CreationProposal{}, creationValidation("任务创建请求不完整", nil)
 	}
-	// Preserve the A0-observed path exactly: every pre-existing sources-only
-	// command first goes through the original full normalizer, including its
-	// validation precedence and error mapping. Only if that shape fails do we
-	// inspect the transient reference/source-spec proposal form.
-	command, _, legacyErr := normalizeCreateScheduleCommand(in.RawArgs)
-	var proposalArgs *createScheduleProposalArgs
-	var err error
-	if legacyErr != nil {
-		if !creationProposalHasTransientField(in.RawArgs) {
-			return CreationProposal{}, creationValidation(
-				"任务方案未通过校验："+legacyErr.Error(), legacyErr,
-			)
-		}
-		proposalArgs, err = decodeCreationProposalArgs(in.RawArgs)
-		if err != nil {
-			return CreationProposal{}, creationValidation(
-				"任务方案未通过校验："+err.Error(), err,
-			)
-		}
-		materialized, materializeErr := materializeCreationSourceSpecs(
-			proposalArgs.ApprovedFetchPlan.SourceSpecs,
+	proposalArgs, err := decodeCreationProposalArgs(in.RawArgs)
+	if err != nil {
+		return CreationProposal{}, creationValidation(
+			"任务方案未通过校验："+err.Error(), err,
 		)
-		if materializeErr != nil {
-			return CreationProposal{}, creationValidation(
-				"任务方案未通过校验："+materializeErr.Error(), materializeErr,
-			)
-		}
-		proposalArgs.ApprovedFetchPlan.Sources = append(
-			proposalArgs.ApprovedFetchPlan.Sources, materialized...,
-		)
-		proposalArgs.ApprovedFetchPlan.SourceSpecs = nil
 	}
-	var tenantID int64
-	var canonicalArgs json.RawMessage
-	var summary string
-	if proposalArgs == nil {
-		// Exact legacy order: every deterministic artifact is built before the
-		// first database lookup. A0 golden tests depend on failures here winning
-		// over membership/workspace failures.
-		canonicalArgs, summary, err = finalizeCreationProposal(command)
-		if err != nil {
-			return CreationProposal{}, err
-		}
-		tenantID, err = c.resolveActiveTenant(ctx, in.UserID)
-		if err != nil {
-			return CreationProposal{}, err
-		}
-	} else if len(proposalArgs.ApprovedFetchPlan.ExistingSourceIDs) == 0 {
-		// Pure source-spec proposals have no authorization-bearing references.
-		// Finish every deterministic build/network/summary check before the first
-		// tenant lookup, matching the legacy A0 validation precedence.
-		command, err = normalizeExpandedCreationProposal(proposalArgs, nil)
-		if err != nil {
-			return CreationProposal{}, err
-		}
-		canonicalArgs, summary, err = finalizeCreationProposal(command)
-		if err != nil {
-			return CreationProposal{}, err
-		}
-		tenantID, err = c.resolveActiveTenant(ctx, in.UserID)
-		if err != nil {
-			return CreationProposal{}, err
-		}
-	} else {
-		tenantID, err = c.resolveActiveTenant(ctx, in.UserID)
-		if err != nil {
-			return CreationProposal{}, err
-		}
-		command, err = c.freezeCreationProposal(
-			ctx, tenantID, in.UserID, proposalArgs,
+	materialized, err := materializeCreationFetchRequirements(
+		proposalArgs.ApprovedFetchPlan.FetchRequirements,
+	)
+	if err != nil {
+		return CreationProposal{}, creationValidation(
+			"任务方案未通过校验："+err.Error(), err,
 		)
-		if err != nil {
-			if errors.Is(err, types.ErrNotFound) {
-				return CreationProposal{}, creationValidation(
-					"所选已有信源当前不可用，请重新选择", err,
-				)
-			}
-			if errors.Is(err, types.ErrValidation) {
-				return CreationProposal{}, err
-			}
-			return CreationProposal{}, fmt.Errorf("freeze task creation proposal: %w", err)
-		}
-		canonicalArgs, summary, err = finalizeCreationProposal(command)
-		if err != nil {
-			return CreationProposal{}, err
-		}
+	}
+	command, err := normalizeExpandedCreationProposal(proposalArgs, materialized)
+	if err != nil {
+		return CreationProposal{}, err
+	}
+	canonicalArgs, summary, err := finalizeCreationProposal(command)
+	if err != nil {
+		return CreationProposal{}, err
+	}
+	tenantID, err := c.resolveActiveTenant(ctx, in.UserID)
+	if err != nil {
+		return CreationProposal{}, err
 	}
 	params := types.CreateTaskCreationOperationParams{
 		ID: in.ActionID, TenantID: tenantID, UserID: in.UserID,
@@ -302,7 +234,7 @@ func (c *CreationCoordinator) Propose(
 	}
 	if !proposalOperationMatches(op, params) {
 		return CreationProposal{}, types.NewAppError(
-			types.CodeConflict, "任务确认动作与已保存内容冲突", types.ErrConflict,
+			types.CodeConflict, "任务创建操作与已保存内容冲突", types.ErrConflict,
 		)
 	}
 	return CreationProposal{ID: op.ID, Summary: op.Summary}, nil
@@ -317,7 +249,7 @@ func finalizeCreationProposal(
 	}
 	summary, err := summarizeCreationProposal(command)
 	if err != nil {
-		return nil, "", creationValidation("任务方案无法生成确认摘要", err)
+		return nil, "", creationValidation("任务方案无法生成执行摘要", err)
 	}
 	return canonicalArgs, summary, nil
 }
@@ -329,9 +261,9 @@ func deterministicCreationProposalFailure(err error) bool {
 		errors.Is(err, types.ErrTaskCreationTerminal)
 }
 
-// Confirm resumes the same fenced operation on every click. Busy is a handled
-// v1 result, never permission to fall through to legacy v0 execution.
-func (c *CreationCoordinator) Confirm(
+// Execute resumes the same fenced operation on every retry. Busy is a handled
+// result, never permission to submit a duplicate operation.
+func (c *CreationCoordinator) Execute(
 	ctx context.Context,
 	userID int64,
 	actionID string,
@@ -358,7 +290,7 @@ func (c *CreationCoordinator) Confirm(
 		result.Replayed = done && err == nil
 		return result, err
 	}
-	owner := "confirm-" + uuid.NewString()
+	owner := "task-create-execute-" + uuid.NewString()
 	approved := op
 	op, err = c.acquireCreationOperation(ctx, types.AcquireTaskCreationOperationParams{
 		ID: actionID, TenantID: tenantID, UserID: userID,
@@ -370,8 +302,8 @@ func (c *CreationCoordinator) Confirm(
 		case errors.Is(err, types.ErrTaskCreationBusy):
 			// Store may have atomically attached the first A6 provider target to
 			// a pre-A6 in-flight operation before reporting its still-live owner.
-			// Prefer that returned row so the callback knows the durable receipt
-			// boundary is now armed; ordinary busy paths may return nil.
+			// Prefer that returned row so the caller knows the durable receipt
+			// boundary is armed; ordinary busy paths may return nil.
 			auditOp := op
 			if auditOp == nil {
 				auditOp = approved
@@ -392,7 +324,7 @@ func (c *CreationCoordinator) Confirm(
 			}
 			return CreationResult{
 				OperationID: actionID, Status: loaded.Status,
-				Message: "这张任务确认已过期，请重新描述需求。",
+				Message: "任务创建操作已过期，请重新描述需求。",
 			}, nil
 		default:
 			return CreationResult{}, err
@@ -405,98 +337,11 @@ func (c *CreationCoordinator) Confirm(
 		return attachCreationAudit(result, op), nil
 	}
 	// Once acquired, every mutation is checkpointed and the stale runner can
-	// finish it. The callback reports recovery instead of inviting a duplicate.
+	// finish it. The request reports recovery instead of inviting a duplicate.
 	c.logger.WarnContext(ctx, "task creation will continue in recovery",
 		"operation_id", actionID, "tenant_id", tenantID, "user_id", userID,
 		"phase", op.Phase, "err", runErr)
 	return attachCreationAudit(recoveringCreationResult(actionID, opTaskID(op)), op), nil
-}
-
-// Cancel linearizes a v1 cancellation with Acquire on the same durable row.
-// Only an exact proof that the ID is not v1 permits Agent to fall back to the
-// legacy pending-action path.
-func (c *CreationCoordinator) Cancel(
-	ctx context.Context,
-	userID int64,
-	actionID string,
-	receiptTarget CreationReceiptTarget,
-) (CreationResult, error) {
-	if err := ctx.Err(); err != nil {
-		return CreationResult{}, err
-	}
-	if c == nil || c.store == nil {
-		return CreationResult{}, errors.New("task: creation coordinator dependencies are incomplete")
-	}
-	op, err := c.store.LoadTaskCreationOperationByUser(ctx, actionID, userID)
-	if err != nil {
-		if errors.Is(err, types.ErrNotFound) {
-			return CreationResult{}, fmt.Errorf("%w: %s", ErrCreationOperationNotFound, actionID)
-		}
-		return CreationResult{}, err
-	}
-	if err := validateCreationReceiptTarget(op, receiptTarget); err != nil {
-		return CreationResult{}, err
-	}
-	if result, done, terminalErr := creationTerminalResult(op); done || terminalErr != nil {
-		result.Replayed = done && terminalErr == nil
-		return result, terminalErr
-	}
-
-	cancelled, cancelErr := c.store.CancelTaskCreationOperation(ctx,
-		types.CancelTaskCreationOperationParams{
-			ID: actionID, TenantID: op.TenantID, UserID: userID,
-			ReceiptProvider: receiptTarget.Provider, ReceiptTarget: receiptTarget.Target,
-		})
-	if cancelErr == nil {
-		result, done, resultErr := creationTerminalResult(cancelled)
-		if !done && resultErr == nil {
-			return CreationResult{}, errors.New("task: cancellation did not produce a terminal operation")
-		}
-		return result, resultErr
-	}
-	if errors.Is(cancelErr, types.ErrTaskCreationBusy) {
-		auditOp := cancelled
-		if auditOp == nil {
-			auditOp = op
-		}
-		result := attachCreationAudit(
-			recoveringCreationResult(actionID, opTaskID(auditOp)), auditOp,
-		)
-		result.Message = "任务已经开始创建，无法再取消；系统会自动完成或安全回滚。"
-		return result, nil
-	}
-	if errors.Is(cancelErr, types.ErrTaskCreationTerminal) {
-		loaded, loadErr := c.loadCreationOperationConvergent(
-			ctx, actionID, op.TenantID, userID,
-		)
-		if loadErr != nil {
-			return CreationResult{}, errors.Join(cancelErr, loadErr)
-		}
-		result, done, resultErr := creationTerminalResult(loaded)
-		if done || resultErr != nil {
-			result.Replayed = done && resultErr == nil
-			return result, resultErr
-		}
-		return CreationResult{}, cancelErr
-	}
-	if errors.Is(cancelErr, types.ErrValidation) ||
-		errors.Is(cancelErr, types.ErrConflict) ||
-		errors.Is(cancelErr, types.ErrNotFound) {
-		return CreationResult{}, cancelErr
-	}
-
-	// The cancellation commit may have succeeded while its response was lost.
-	// Exact readback adopts only the cancelled tombstone for this v1 operation.
-	loaded, loadErr := c.loadCreationOperationConvergent(
-		ctx, actionID, op.TenantID, userID,
-	)
-	if loadErr == nil && loaded.Status == types.PendingActionStatusCancelled {
-		result, done, resultErr := creationTerminalResult(loaded)
-		if done || resultErr != nil {
-			return result, resultErr
-		}
-	}
-	return CreationResult{}, errors.Join(cancelErr, loadErr)
 }
 
 func (c *CreationCoordinator) acquireCreationOperation(
@@ -521,7 +366,7 @@ func (c *CreationCoordinator) acquireCreationOperation(
 	loaded, loadErr := c.store.LoadTaskCreationOperation(
 		retryCtx, params.ID, params.TenantID, params.UserID,
 	)
-	if loadErr == nil && loaded.Status == types.PendingActionStatusExecuting &&
+	if loadErr == nil && loaded.Status == types.TaskOperationStatusExecuting &&
 		loaded.LeaseOwner == params.LeaseOwner && loaded.Fence > 0 {
 		return loaded, nil
 	}
@@ -642,7 +487,7 @@ func (c *CreationCoordinator) runAcquired(
 	}
 	return CreationResult{
 		OperationID: op.ID, TaskID: preparedResult.Schedule.TaskID,
-		Message: "任务已创建并开始监控。", Status: types.PendingActionStatusExecuted,
+		Message: "任务已创建并开始监控。", Status: types.TaskOperationStatusExecuted,
 	}, nil
 }
 
@@ -967,7 +812,7 @@ func (c *CreationCoordinator) finishCleanup(
 	commitCtx, cancelCommit := context.WithTimeout(compCtx, creationExternalRPCTimeout)
 	defer cancelCommit()
 	if err := c.store.FinishTaskCreationCleanup(
-		commitCtx, op.Lease(), prepared.TaskID, types.PendingActionStatusFailed,
+		commitCtx, op.Lease(), prepared.TaskID, types.TaskOperationStatusFailed,
 	); err != nil {
 		if adopted, done, adoptErr := c.adoptTerminalAfterWriteError(
 			commitCtx, op, err,
@@ -985,7 +830,7 @@ func (c *CreationCoordinator) finishCleanup(
 	}
 	return CreationResult{
 		OperationID: op.ID, TaskID: prepared.TaskID,
-		Message: op.ErrorMessage, Status: types.PendingActionStatusFailed,
+		Message: op.ErrorMessage, Status: types.TaskOperationStatusFailed,
 	}, nil
 }
 
@@ -1011,7 +856,7 @@ func (c *CreationCoordinator) blockUnsafeSideEffect(
 		"task_id", taskID, "error_code", code, "cause", cause)
 	return CreationResult{
 		OperationID: op.ID, TaskID: taskID, Message: message,
-		Status: types.PendingActionStatusBlocked,
+		Status: types.TaskOperationStatusBlocked,
 	}, nil
 }
 
@@ -1159,18 +1004,15 @@ func validateCreationReceiptTarget(
 		target.Provider != strings.TrimSpace(target.Provider) ||
 		strings.TrimSpace(target.Target) == "" ||
 		target.Target != strings.TrimSpace(target.Target) {
-		return creationValidation("任务回执目标缺失，请重新点击原确认卡。", nil)
+		return creationValidation("任务执行回执目标缺失，请重试。", nil)
 	}
-	if !validFeishuCardPatchReceiptProvider(target.Provider) &&
-		!validLocalActionReceiptTarget(
-			target.Provider, target.Target, op.ID,
-		) {
-		return creationValidation("任务回执通道不受支持，请重新点击原确认卡。", nil)
+	if !validAgentAutoReceiptTarget(target.Provider, target.Target, op.ID) {
+		return creationValidation("任务执行回执通道不受支持，请重试。", nil)
 	}
 	if op != nil && (op.ReceiptProvider != "" || op.ReceiptTarget != "") &&
 		(op.ReceiptProvider != target.Provider || op.ReceiptTarget != target.Target) {
 		return types.NewAppError(types.CodeConflict,
-			"任务确认卡与已接受的回执目标不一致。", nil)
+			"任务执行回执目标与已接受的操作不一致。", nil)
 	}
 	return nil
 }
@@ -1256,10 +1098,10 @@ func (c *CreationCoordinator) creationScopeActive(
 	return tenant.Status == types.TenantStatusActive && tenant.DeletedAt == nil, nil
 }
 
-// createScheduleProposalArgs is the transient model-facing shape. Durable
-// operation args deliberately use createScheduleCommandArgs instead: existing
-// ids are authorization-bearing references and must be expanded into a stable,
-// canonical source identity before a confirmation action exists.
+// createScheduleProposalArgs is the model-facing shape. Durable operation args
+// deliberately use createScheduleCommandArgs instead: human-readable specs are
+// deterministically materialized into a canonical target identity before an
+// operation exists.
 type createScheduleProposalArgs struct {
 	Spec              *createScheduleCommandSpec       `json:"spec"`
 	Intent            string                           `json:"intent"`
@@ -1270,14 +1112,12 @@ type createScheduleProposalArgs struct {
 }
 
 type createScheduleProposalFetchPlan struct {
-	ExistingSourceIDs []int64                    `json:"existing_source_ids,omitempty"`
-	Sources           []compiledFetchSource      `json:"sources,omitempty"`
-	SourceSpecs       *createScheduleSourceSpecs `json:"source_specs,omitempty"`
+	FetchRequirements *createScheduleFetchRequirements `json:"fetch_requirements,omitempty"`
 }
 
-const creationSourceSpecsVersion = "vane.source-specs/v1"
+const creationFetchRequirementsVersion = "vane.fetch-requirements/v1"
 
-type createScheduleSourceSpecs struct {
+type createScheduleFetchRequirements struct {
 	Version string            `json:"version"`
 	Items   []json.RawMessage `json:"items"`
 }
@@ -1289,26 +1129,6 @@ type createScheduleProposalExactEnvelope struct {
 	Strictness        json.RawMessage `json:"strictness,omitempty"`
 	ApprovedFetchPlan json.RawMessage `json:"approved_fetch_plan,omitempty"`
 	ObservationPolicy json.RawMessage `json:"observation_policy,omitempty"`
-}
-
-func creationProposalHasTransientField(raw json.RawMessage) bool {
-	var root map[string]json.RawMessage
-	if err := decodeStrictJSON(raw, &root); err != nil {
-		return false
-	}
-	planRaw, ok := root["approved_fetch_plan"]
-	if !ok {
-		return false
-	}
-	var plan map[string]json.RawMessage
-	if err := decodeStrictJSON(planRaw, &plan); err != nil {
-		return false
-	}
-	if _, ok = plan["existing_source_ids"]; ok {
-		return true
-	}
-	_, ok = plan["source_specs"]
-	return ok
 }
 
 func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArgs, error) {
@@ -1361,9 +1181,7 @@ func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArg
 		}
 		args.ObservationPolicy = &policy
 	}
-	// Preserve the legacy common-envelope precedence before inspecting any
-	// transient plan structure. Invalid spec/intent/strictness must win over a
-	// bad source_specs version, empty items, or invalid existing IDs.
+	// Validate the common envelope before the fetch-requirements payload.
 	if _, err := normalizeCreateScheduleEnvelope(&createScheduleCommandArgs{
 		Spec: args.Spec, Intent: args.Intent,
 		NLDescription: args.NLDescription, Strictness: args.Strictness,
@@ -1384,105 +1202,69 @@ func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArg
 		planFields == nil {
 		return nil, errors.New("task: approved_fetch_plan must be a JSON object")
 	}
-	existingRaw, hasExisting := planFields["existing_source_ids"]
-	sourcesRaw, hasSources := planFields["sources"]
-	sourceSpecsRaw, hasSourceSpecs := planFields["source_specs"]
-	if hasExisting && bytes.Equal(bytes.TrimSpace(existingRaw), []byte("null")) {
-		return nil, errors.New(
-			"task: approved_fetch_plan.existing_source_ids must be an array",
-		)
+	fetchRequirementsRaw, hasFetchRequirements := planFields["fetch_requirements"]
+	if hasFetchRequirements && bytes.Equal(bytes.TrimSpace(fetchRequirementsRaw), []byte("null")) {
+		return nil, errors.New("task: approved_fetch_plan.fetch_requirements must be an object")
 	}
-	if hasSources && bytes.Equal(bytes.TrimSpace(sourcesRaw), []byte("null")) {
-		return nil, errors.New("task: approved_fetch_plan.sources must be an array")
-	}
-	if hasSourceSpecs && bytes.Equal(bytes.TrimSpace(sourceSpecsRaw), []byte("null")) {
-		return nil, errors.New("task: approved_fetch_plan.source_specs must be an object")
-	}
-	if hasSourceSpecs && hasSources {
-		return nil, errors.New(
-			"task: approved_fetch_plan.source_specs cannot be mixed with materialized sources",
-		)
-	}
-	sourceSpecCount := 0
-	if hasSourceSpecs {
-		if plan.SourceSpecs == nil ||
-			plan.SourceSpecs.Version != creationSourceSpecsVersion {
-			return nil, fmt.Errorf(
-				"task: approved_fetch_plan.source_specs.version must be %q",
-				creationSourceSpecsVersion,
-			)
-		}
-		sourceSpecCount = len(plan.SourceSpecs.Items)
-		if sourceSpecCount == 0 {
-			return nil, errors.New(
-				"task: approved_fetch_plan.source_specs.items must be non-empty",
-			)
-		}
-	}
-	combined := len(plan.ExistingSourceIDs) + len(plan.Sources) + sourceSpecCount
-	if combined == 0 {
-		return nil, errors.New("task: approved_fetch_plan must contain at least one source")
-	}
-	if combined > maxCompiledSources {
+	if !hasFetchRequirements || plan.FetchRequirements == nil ||
+		plan.FetchRequirements.Version != creationFetchRequirementsVersion {
 		return nil, fmt.Errorf(
-			"task: approved_fetch_plan exceeds %d combined sources", maxCompiledSources,
+			"task: approved_fetch_plan.fetch_requirements.version must be %q",
+			creationFetchRequirementsVersion,
 		)
 	}
-	seen := make(map[int64]struct{}, len(plan.ExistingSourceIDs))
-	for i, sourceID := range plan.ExistingSourceIDs {
-		if sourceID <= 0 {
-			return nil, fmt.Errorf(
-				"task: approved_fetch_plan.existing_source_ids[%d] must be positive", i,
-			)
-		}
-		if _, duplicate := seen[sourceID]; duplicate {
-			return nil, fmt.Errorf(
-				"task: approved_fetch_plan.existing_source_ids[%d] is duplicated", i,
-			)
-		}
-		seen[sourceID] = struct{}{}
+	requirementCount := len(plan.FetchRequirements.Items)
+	if requirementCount == 0 {
+		return nil, errors.New(
+			"task: approved_fetch_plan.fetch_requirements.items must be non-empty",
+		)
+	}
+	if requirementCount > maxCompiledSources {
+		return nil, fmt.Errorf(
+			"task: approved_fetch_plan exceeds %d fetch requirements", maxCompiledSources,
+		)
 	}
 	return args, nil
 }
 
-func materializeCreationSourceSpecs(
-	sourceSpecs *createScheduleSourceSpecs,
-) ([]compiledFetchSource, error) {
-	if sourceSpecs == nil {
+func materializeCreationFetchRequirements(
+	fetchRequirements *createScheduleFetchRequirements,
+) ([]compiledFetchTarget, error) {
+	if fetchRequirements == nil {
 		return nil, nil
 	}
-	materialized := make([]compiledFetchSource, 0, len(sourceSpecs.Items))
-	for i, raw := range sourceSpecs.Items {
-		spec, err := decodeCreationSourceSpec(raw)
+	materialized := make([]compiledFetchTarget, 0, len(fetchRequirements.Items))
+	for i, raw := range fetchRequirements.Items {
+		spec, err := decodeCreationFetchRequirement(raw)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"task: approved_fetch_plan.source_specs.items[%d]: %w", i, err,
+				"task: approved_fetch_plan.fetch_requirements.items[%d]: %w", i, err,
 			)
 		}
-		source, message := sourcespec.Build(spec)
+		source, message := fetchspec.BuildTarget(spec)
 		if message != "" || source == nil {
 			if message == "" {
 				message = "信源无法构造"
 			}
 			return nil, fmt.Errorf(
-				"task: approved_fetch_plan.source_specs.items[%d]: %s", i, message,
+				"task: approved_fetch_plan.fetch_requirements.items[%d]: %s", i, message,
 			)
 		}
 		// Model-facing specs never control presentation titles. Build derives a
 		// deterministic title from the real query/URL; normalize that derived
-		// label before it reaches a plain-text confirmation card, then rebuild
+		// label before it reaches the user-facing operation summary, then rebuild
 		// with the exact safe title so ValidateMaterialized remains a proof.
 		safeTitle := promptguard.SingleLine(promptguard.StripInvisible(source.Title))
 		safeTitle = truncateCreationRunes(safeTitle, maxCompiledSourceRunes)
 		if safeTitle != source.Title {
 			spec.Title = safeTitle
-			source, message = sourcespec.Build(spec)
+			source, message = fetchspec.BuildTarget(spec)
 			if message != "" || source == nil {
 				if message == "" {
 					message = "信源安全标题无法构造"
 				}
 				return nil, fmt.Errorf(
-					"task: approved_fetch_plan.source_specs.items[%d]: %s", i, message,
+					"task: approved_fetch_plan.fetch_requirements.items[%d]: %s", i, message,
 				)
 			}
 		}
@@ -1492,7 +1274,7 @@ func materializeCreationSourceSpecs(
 			// is always a JSON object. Normalize feed's empty config explicitly.
 			config = json.RawMessage(`{}`)
 		}
-		materialized = append(materialized, compiledFetchSource{
+		materialized = append(materialized, compiledFetchTarget{
 			Platform: string(source.Platform), Capability: string(source.Capability),
 			Title: source.Title, URL: source.URL, Config: config,
 		})
@@ -1502,26 +1284,26 @@ func materializeCreationSourceSpecs(
 
 var creationXHSIDRe = regexp.MustCompile(`^[0-9a-f]{24}$`)
 
-func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
+func decodeCreationFetchRequirement(raw json.RawMessage) (fetchspec.Requirement, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		return sourcespec.Spec{}, errors.New("source spec must be a JSON object")
+		return fetchspec.Requirement{}, errors.New("fetch requirement must be a JSON object")
 	}
 	var fields map[string]json.RawMessage
 	if err := decodeStrictJSON(raw, &fields); err != nil || fields == nil {
 		if err == nil {
-			err = errors.New("source spec must be a non-null JSON object")
+			err = errors.New("fetch requirement must be a non-null JSON object")
 		}
-		return sourcespec.Spec{}, err
+		return fetchspec.Requirement{}, err
 	}
 	var kind string
 	kindRaw, ok := fields["kind"]
 	if !ok || json.Unmarshal(kindRaw, &kind) != nil || strings.TrimSpace(kind) != kind {
-		return sourcespec.Spec{}, errors.New("kind must be a non-empty string")
+		return fetchspec.Requirement{}, errors.New("kind must be a non-empty string")
 	}
 	switch kind {
 	case "web_search":
 		if isExplicitJSONNull(fields["include_domains"]) {
-			return sourcespec.Spec{}, errors.New("include_domains must be an array")
+			return fetchspec.Requirement{}, errors.New("include_domains must be an array")
 		}
 		var input struct {
 			Kind           string   `json:"kind"`
@@ -1530,7 +1312,7 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 			IncludeDomains []string `json:"include_domains,omitempty"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return sourcespec.Spec{}, err
+			return fetchspec.Requirement{}, err
 		}
 		params := map[string]string{"query": input.Query}
 		if input.Category != "" {
@@ -1539,18 +1321,18 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 		if input.IncludeDomains != nil {
 			encoded, err := json.Marshal(input.IncludeDomains)
 			if err != nil {
-				return sourcespec.Spec{}, fmt.Errorf("encode include_domains: %w", err)
+				return fetchspec.Requirement{}, fmt.Errorf("encode include_domains: %w", err)
 			}
 			params["include_domains"] = string(encoded)
 		}
-		return sourcespec.Spec{
+		return fetchspec.Requirement{
 			Platform: string(types.PlatformWeb), Capability: string(types.CapSearch),
 			Params: params,
 		}, nil
 
 	case "web_feed":
 		if isExplicitJSONNull(fields["categories"]) {
-			return sourcespec.Spec{}, errors.New("categories must be an array")
+			return fetchspec.Requirement{}, errors.New("categories must be an array")
 		}
 		var input struct {
 			Kind       string   `json:"kind"`
@@ -1558,17 +1340,17 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 			Categories []string `json:"categories,omitempty"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return sourcespec.Spec{}, err
+			return fetchspec.Requirement{}, err
 		}
 		params := map[string]string{"url": input.FeedURL}
 		if input.Categories != nil {
 			encoded, err := json.Marshal(input.Categories)
 			if err != nil {
-				return sourcespec.Spec{}, fmt.Errorf("encode categories: %w", err)
+				return fetchspec.Requirement{}, fmt.Errorf("encode categories: %w", err)
 			}
 			params["categories"] = string(encoded)
 		}
-		return sourcespec.Spec{
+		return fetchspec.Requirement{
 			Platform: string(types.PlatformWeb), Capability: string(types.CapFeed),
 			Params: params,
 		}, nil
@@ -1579,9 +1361,9 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 			PageURL string `json:"page_url"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return sourcespec.Spec{}, err
+			return fetchspec.Requirement{}, err
 		}
-		return sourcespec.Spec{
+		return fetchspec.Requirement{
 			Platform: string(types.PlatformWeb), Capability: string(types.CapContents),
 			Params: map[string]string{"url": input.PageURL},
 		}, nil
@@ -1592,9 +1374,9 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 			ScreenName string `json:"screen_name"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return sourcespec.Spec{}, err
+			return fetchspec.Requirement{}, err
 		}
-		return sourcespec.Spec{
+		return fetchspec.Requirement{
 			Platform: string(types.PlatformX), Capability: string(types.CapUserPosts),
 			Params: map[string]string{"screen_name": input.ScreenName},
 		}, nil
@@ -1605,9 +1387,9 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 			Keyword string `json:"keyword"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return sourcespec.Spec{}, err
+			return fetchspec.Requirement{}, err
 		}
-		return sourcespec.Spec{
+		return fetchspec.Requirement{
 			Platform: string(types.PlatformXHS), Capability: string(types.CapSearch),
 			Params: map[string]string{"keyword": input.Keyword},
 		}, nil
@@ -1619,16 +1401,16 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 			ProfileURL string `json:"profile_url,omitempty"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return sourcespec.Spec{}, err
+			return fetchspec.Requirement{}, err
 		}
 		if (strings.TrimSpace(input.UserID) == "") ==
 			(strings.TrimSpace(input.ProfileURL) == "") {
-			return sourcespec.Spec{}, errors.New(
+			return fetchspec.Requirement{}, errors.New(
 				"exactly one of user_id or profile_url is required",
 			)
 		}
 		if input.UserID != "" && !creationXHSIDRe.MatchString(input.UserID) {
-			return sourcespec.Spec{}, errors.New(
+			return fetchspec.Requirement{}, errors.New(
 				"user_id must be exactly 24 lowercase hexadecimal characters",
 			)
 		}
@@ -1636,7 +1418,7 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 		if kind == "xhs_faved_notes" {
 			capability = types.CapFavedNotes
 		}
-		return sourcespec.Spec{
+		return fetchspec.Requirement{
 			Platform: string(types.PlatformXHS), Capability: string(capability),
 			Params: map[string]string{
 				"user_id": input.UserID, "profile_url": input.ProfileURL,
@@ -1648,9 +1430,9 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 			Kind string `json:"kind"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return sourcespec.Spec{}, err
+			return fetchspec.Requirement{}, err
 		}
-		return sourcespec.Spec{
+		return fetchspec.Requirement{
 			Platform: string(types.PlatformXHS), Capability: string(types.CapHotList),
 			Params: map[string]string{},
 		}, nil
@@ -1662,20 +1444,20 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 			TopicURL string `json:"topic_url,omitempty"`
 		}
 		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return sourcespec.Spec{}, err
+			return fetchspec.Requirement{}, err
 		}
 		if (strings.TrimSpace(input.PageID) == "") ==
 			(strings.TrimSpace(input.TopicURL) == "") {
-			return sourcespec.Spec{}, errors.New(
+			return fetchspec.Requirement{}, errors.New(
 				"exactly one of page_id or topic_url is required",
 			)
 		}
 		if input.PageID != "" && !creationXHSIDRe.MatchString(input.PageID) {
-			return sourcespec.Spec{}, errors.New(
+			return fetchspec.Requirement{}, errors.New(
 				"page_id must be exactly 24 lowercase hexadecimal characters",
 			)
 		}
-		return sourcespec.Spec{
+		return fetchspec.Requirement{
 			Platform: string(types.PlatformXHS), Capability: string(types.CapTopicFeed),
 			Params: map[string]string{
 				"page_id": input.PageID, "topic_url": input.TopicURL,
@@ -1683,7 +1465,7 @@ func decodeCreationSourceSpec(raw json.RawMessage) (sourcespec.Spec, error) {
 		}, nil
 
 	default:
-		return sourcespec.Spec{}, fmt.Errorf("unsupported kind %q", kind)
+		return fetchspec.Requirement{}, fmt.Errorf("unsupported kind %q", kind)
 	}
 }
 
@@ -1691,69 +1473,16 @@ func isExplicitJSONNull(raw json.RawMessage) bool {
 	return len(raw) != 0 && bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
-// freezeCreationProposal resolves authorized references exactly once and then
-// runs the existing full-plan normalizer. The returned command contains only
-// canonical materialized identities, so Confirm and every recovery path remain
-// independent of later authorization changes. Runtime-only tuning fields are
-// deliberately excluded: globally shared source rows own those mutable knobs,
-// while the task plan owns the URL/config fields that define source identity.
-func (c *CreationCoordinator) freezeCreationProposal(
-	ctx context.Context,
-	tenantID, userID int64,
-	proposal *createScheduleProposalArgs,
-) (normalizedCreateScheduleCommand, error) {
-	if proposal == nil || proposal.ApprovedFetchPlan == nil {
-		return normalizedCreateScheduleCommand{}, creationValidation(
-			"任务方案未通过校验", nil,
-		)
-	}
-	plan := proposal.ApprovedFetchPlan
-	resolved := make([]types.Source, 0, len(plan.ExistingSourceIDs))
-	if len(plan.ExistingSourceIDs) != 0 {
-		var err error
-		resolved, err = c.store.ResolveTaskCreationSources(
-			ctx, tenantID, userID, plan.ExistingSourceIDs,
-		)
-		if err != nil {
-			return normalizedCreateScheduleCommand{}, err
-		}
-		if len(resolved) != len(plan.ExistingSourceIDs) {
-			return normalizedCreateScheduleCommand{}, types.NewAppError(
-				types.CodeInternal, "任务已有信源解析结果不完整", types.ErrInternal,
-			)
-		}
-	}
-
-	return normalizeExpandedCreationProposal(proposal, resolved)
-}
-
 func normalizeExpandedCreationProposal(
 	proposal *createScheduleProposalArgs,
-	resolved []types.Source,
+	targets []compiledFetchTarget,
 ) (normalizedCreateScheduleCommand, error) {
 	if proposal == nil || proposal.ApprovedFetchPlan == nil {
 		return normalizedCreateScheduleCommand{}, creationValidation(
 			"任务方案未通过校验", nil,
 		)
 	}
-	plan := proposal.ApprovedFetchPlan
-	sources := make([]compiledFetchSource, 0, len(resolved)+len(plan.Sources))
-	for i, source := range resolved {
-		if source.ID != plan.ExistingSourceIDs[i] || source.Status != types.SourceStatusActive {
-			return normalizedCreateScheduleCommand{}, types.NewAppError(
-				types.CodeInternal, "任务已有信源解析结果损坏", types.ErrInternal,
-			)
-		}
-		projected, err := projectExistingSourceIdentity(source)
-		if err != nil {
-			return normalizedCreateScheduleCommand{}, creationValidation(
-				"所选已有信源当前无法用于任务，请重新选择", err,
-			)
-		}
-		sources = append(sources, projected)
-	}
-	sources = append(sources, plan.Sources...)
-	fullPlan, err := json.Marshal(compiledFetchPlan{Sources: sources})
+	fullPlan, err := json.Marshal(compiledFetchPlan{Targets: targets})
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, fmt.Errorf(
 			"marshal expanded task creation fetch plan: %w", err,
@@ -1777,87 +1506,6 @@ func normalizeExpandedCreationProposal(
 		)
 	}
 	return command, nil
-}
-
-// projectExistingSourceIdentity converts the wider persisted-source contract
-// into the narrower approved-plan contract. Persisted rows may legitimately
-// carry fetcher tuning that is not part of their global URL identity; feeding
-// those keys directly into the strict task compiler would make a source visible
-// in list_sources but impossible to reference. Titles are presentation metadata
-// from an untrusted shared row, so normalize whitespace and bound them before
-// they enter a confirmation summary.
-func projectExistingSourceIdentity(source types.Source) (compiledFetchSource, error) {
-	config, err := projectExistingSourceIdentityConfig(
-		source.Platform, source.Capability, source.Config,
-	)
-	if err != nil {
-		return compiledFetchSource{}, err
-	}
-	title := promptguard.SingleLine(promptguard.StripInvisible(source.Title))
-	if title == "" {
-		// Persisted title is optional metadata, while the strict task plan needs
-		// a stable display label for capabilities whose builder would otherwise
-		// synthesize one. Platform/capability is deterministic and cannot be
-		// influenced by external page metadata.
-		title = string(source.Platform) + "/" + string(source.Capability)
-	}
-	title = truncateCreationRunes(title, maxCompiledSourceRunes)
-	return compiledFetchSource{
-		Platform: string(source.Platform), Capability: string(source.Capability),
-		Title: title, URL: source.URL, Config: config,
-	}, nil
-}
-
-func projectExistingSourceIdentityConfig(
-	platform types.Platform,
-	capability types.Capability,
-	raw json.RawMessage,
-) (json.RawMessage, error) {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		raw = json.RawMessage(`{}`)
-	}
-	var fields map[string]json.RawMessage
-	if err := decodeStrictJSON(raw, &fields); err != nil || fields == nil {
-		return nil, errors.New("task: existing source config is not a JSON object")
-	}
-
-	var runtimeIntegerKeys, runtimeStringKeys []string
-	switch {
-	case platform == types.PlatformWeb && capability == types.CapFeed:
-		runtimeIntegerKeys = []string{"lookback_days"}
-	case platform == types.PlatformWeb && capability == types.CapSearch:
-		runtimeIntegerKeys = []string{"lookback_days", "num_results"}
-		runtimeStringKeys = []string{"type"}
-	case platform == types.PlatformXHS && capability == types.CapSearch:
-		runtimeStringKeys = []string{"sort_type", "note_type"}
-	}
-	for _, key := range runtimeIntegerKeys {
-		value, ok := fields[key]
-		if !ok {
-			continue
-		}
-		var integer int64
-		if err := json.Unmarshal(value, &integer); err != nil {
-			return nil, fmt.Errorf("task: existing source %s must be an integer: %w", key, err)
-		}
-		delete(fields, key)
-	}
-	for _, key := range runtimeStringKeys {
-		value, ok := fields[key]
-		if !ok {
-			continue
-		}
-		var text string
-		if err := json.Unmarshal(value, &text); err != nil {
-			return nil, fmt.Errorf("task: existing source %s must be a string: %w", key, err)
-		}
-		delete(fields, key)
-	}
-	canonical, err := json.Marshal(fields)
-	if err != nil {
-		return nil, fmt.Errorf("task: marshal existing source identity config: %w", err)
-	}
-	return canonical, nil
 }
 
 func canonicalCreationProposalArgs(
@@ -1904,7 +1552,7 @@ func canonicalCreationProposalArgs(
 
 func summarizeCreationProposal(command normalizedCreateScheduleCommand) (string, error) {
 	var plan compiledFetchPlan
-	if err := decodeStrictJSON(command.ApprovedFetchPlan, &plan); err != nil || len(plan.Sources) == 0 {
+	if err := decodeStrictJSON(command.ApprovedFetchPlan, &plan); err != nil || len(plan.Targets) == 0 {
 		return "", errors.New("approved plan cannot be summarized")
 	}
 	var builder strings.Builder
@@ -1926,17 +1574,17 @@ func summarizeCreationProposal(command normalizedCreateScheduleCommand) (string,
 			*command.ObservationPolicy,
 		))
 	}
-	builder.WriteString(fmt.Sprintf("\n信息范围（%d）：", len(plan.Sources)))
-	for _, source := range plan.Sources {
+	builder.WriteString(fmt.Sprintf("\n抓取目标（%d）：", len(plan.Targets)))
+	for _, source := range plan.Targets {
 		builder.WriteString("\n- ")
-		builder.WriteString(summarizeApprovedSource(source))
+		builder.WriteString(summarizeApprovedTarget(source))
 	}
 	// The body is plain_text, but Unicode bidi/Cf controls can still reorder
 	// neighboring trusted labels and URLs. Strip them from the complete rendered
 	// summary so every dynamic field (not only title) shares the same boundary.
 	summary := promptguard.StripInvisible(builder.String())
 	if len(summary) > maxCreationSummaryBytes {
-		return "", fmt.Errorf("confirmation summary exceeds %d bytes", maxCreationSummaryBytes)
+		return "", fmt.Errorf("operation summary exceeds %d bytes", maxCreationSummaryBytes)
 	}
 	return summary, nil
 }
@@ -2029,7 +1677,7 @@ func summarizeCreationStrictness(strictness types.PushStrictness) string {
 	}
 }
 
-func summarizeApprovedSource(source compiledFetchSource) string {
+func summarizeApprovedTarget(source compiledFetchTarget) string {
 	label := strings.TrimSpace(source.Title)
 	if label == "" {
 		label = source.Platform + "/" + source.Capability
@@ -2075,7 +1723,7 @@ func proposalOperationMatches(
 	if op == nil || op.ID != p.ID || op.TenantID != p.TenantID || op.UserID != p.UserID ||
 		op.ToolName != "create_schedule" ||
 		op.ExecutionVersion != types.TaskCreationExecutionVersionV1 ||
-		op.Status != types.PendingActionStatusPending || op.Phase != "" ||
+		op.Status != types.TaskOperationStatusPending || op.Phase != "" ||
 		op.Summary != p.Summary || !creationProposalArgsEqual(op.Args, p.Args) ||
 		!op.ExpiresAt.Equal(p.ExpiresAt) {
 		return false
@@ -2088,7 +1736,7 @@ func proposalOperationMatches(
 
 // PostgreSQL JSONB does not preserve object key order or whitespace. Proposal
 // identity must therefore compare the normalized command, never raw bytes read
-// back from pending_actions.args.
+// back from task_creation_operations.args.
 func creationProposalArgsEqual(left, right json.RawMessage) bool {
 	leftCommand, _, err := normalizeCreateScheduleCommand(left)
 	if err != nil {
@@ -2128,12 +1776,12 @@ func creationTerminalResult(
 	result := attachCreationAudit(CreationResult{
 		OperationID: op.ID, TaskID: op.TaskID, Status: op.Status,
 	}, op)
-	expectedPhase := map[types.PendingActionStatus]types.TaskCreationPhase{
-		types.PendingActionStatusExecuted:  types.TaskCreationPhaseCompleted,
-		types.PendingActionStatusCancelled: types.TaskCreationPhaseCancelled,
-		types.PendingActionStatusExpired:   types.TaskCreationPhaseExpired,
-		types.PendingActionStatusBlocked:   types.TaskCreationPhaseBlocked,
-		types.PendingActionStatusFailed:    types.TaskCreationPhaseFailed,
+	expectedPhase := map[types.TaskOperationStatus]types.TaskCreationPhase{
+		types.TaskOperationStatusExecuted:  types.TaskCreationPhaseCompleted,
+		types.TaskOperationStatusCancelled: types.TaskCreationPhaseCancelled,
+		types.TaskOperationStatusExpired:   types.TaskCreationPhaseExpired,
+		types.TaskOperationStatusBlocked:   types.TaskCreationPhaseBlocked,
+		types.TaskOperationStatusFailed:    types.TaskCreationPhaseFailed,
 	}[op.Status]
 	if expectedPhase != "" && (op.Phase != expectedPhase || op.TombstonedAt == nil ||
 		op.LeaseUntil != nil || op.TakeoverNotBefore != nil) {
@@ -2141,7 +1789,7 @@ func creationTerminalResult(
 			fmt.Errorf("%w: terminal operation tombstone is incomplete", ErrCreationCheckpointInvalid)
 	}
 	switch op.Status {
-	case types.PendingActionStatusExecuted:
+	case types.TaskOperationStatusExecuted:
 		if strings.TrimSpace(op.TaskID) == "" || op.ExecutedAt == nil ||
 			op.ErrorCode != "" || op.ErrorMessage != "" {
 			return CreationResult{}, true,
@@ -2159,7 +1807,7 @@ func creationTerminalResult(
 		// canonicality cannot survive a database round trip.
 		result.Message = checkpoint.Message
 		return result, true, nil
-	case types.PendingActionStatusFailed, types.PendingActionStatusBlocked:
+	case types.TaskOperationStatusFailed, types.TaskOperationStatusBlocked:
 		if strings.TrimSpace(op.ErrorCode) == "" || strings.TrimSpace(op.ErrorMessage) == "" ||
 			op.ExecutedAt != nil {
 			return CreationResult{}, true,
@@ -2170,7 +1818,7 @@ func creationTerminalResult(
 			result.Message = "任务创建已安全停止，请重新发起。"
 		}
 		return result, true, nil
-	case types.PendingActionStatusCancelled:
+	case types.TaskOperationStatusCancelled:
 		if op.LeaseOwner != "" || op.Fence != 0 || op.Attempt != 0 ||
 			op.TaskID != "" || len(op.Result) != 0 || op.ExecutedAt != nil {
 			return CreationResult{}, true,
@@ -2178,13 +1826,13 @@ func creationTerminalResult(
 		}
 		result.Message = "已取消本次任务创建。"
 		return result, true, nil
-	case types.PendingActionStatusExpired:
+	case types.TaskOperationStatusExpired:
 		if op.LeaseOwner != "" || op.Fence != 0 || op.Attempt != 0 ||
 			op.TaskID != "" || len(op.Result) != 0 || op.ExecutedAt != nil {
 			return CreationResult{}, true,
 				fmt.Errorf("%w: expired operation metadata is invalid", ErrCreationCheckpointInvalid)
 		}
-		result.Message = "这张任务确认已过期，请重新描述需求。"
+		result.Message = "任务创建操作已过期，请重新描述需求。"
 		return result, true, nil
 	default:
 		return CreationResult{}, false, nil
@@ -2194,8 +1842,8 @@ func creationTerminalResult(
 func recoveringCreationResult(operationID, taskID string) CreationResult {
 	return CreationResult{
 		OperationID: operationID, TaskID: taskID,
-		Message: "任务正在创建，系统会自动继续处理，无需重复确认。",
-		Status:  types.PendingActionStatusExecuting, Recovering: true,
+		Message: "任务正在创建，系统会自动继续处理，无需重复发送。",
+		Status:  types.TaskOperationStatusExecuting, Recovering: true,
 	}
 }
 

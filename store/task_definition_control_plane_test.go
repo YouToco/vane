@@ -16,7 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/sourcespec"
+	"github.com/YouToco/vane/fetchspec"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -27,14 +27,14 @@ func TestCommitApprovedDefinitionEdit_ExactProjectionAndReplay(t *testing.T) {
 	params := ApprovedDefinitionEditParams{
 		ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
 		Definition:   candidate,
-		ApprovalRef:  "c2b2-edit-" + uuid.NewString(),
+		OperationRef: "c2b2-edit-" + uuid.NewString(),
 	}
 
 	created, err := f.store.CommitApprovedDefinitionEdit(t.Context(), params)
 	if err != nil {
 		t.Fatalf("CommitApprovedDefinitionEdit: %v", err)
 	}
-	if created.Version != 2 || created.ApprovalRef != params.ApprovalRef {
+	if created.Version != 2 || created.OperationRef != params.OperationRef {
 		t.Fatalf("created record=%+v", created)
 	}
 	wantPayload, err := taskstate.EncodeApprovedDefinitionV1(created.Definition)
@@ -69,7 +69,7 @@ func TestCommitApprovedDefinitionEdit_RejectsStaleDriftAndIdentityReuse(t *testi
 				Version: base.Version,
 				Digest:  "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 			},
-			Definition: candidate, ApprovalRef: "c2b2-stale-" + uuid.NewString(),
+			Definition: candidate, OperationRef: "c2b2-stale-" + uuid.NewString(),
 		}
 		if _, err := f.store.CommitApprovedDefinitionEdit(
 			t.Context(), wrong); !errors.Is(err, types.ErrConflict) {
@@ -78,7 +78,7 @@ func TestCommitApprovedDefinitionEdit_RejectsStaleDriftAndIdentityReuse(t *testi
 		wrong.ExpectedHead = ApprovedDefinitionFence{
 			Version: base.Version + 1, Digest: base.Digest,
 		}
-		wrong.ApprovalRef = "c2b2-stale-version-" + uuid.NewString()
+		wrong.OperationRef = "c2b2-stale-version-" + uuid.NewString()
 		if _, err := f.store.CommitApprovedDefinitionEdit(
 			t.Context(), wrong); !errors.Is(err, types.ErrConflict) {
 			t.Fatalf("stale version error=%v, want Conflict", err)
@@ -98,7 +98,7 @@ func TestCommitApprovedDefinitionEdit_RejectsStaleDriftAndIdentityReuse(t *testi
 		candidate, _ := buildApprovedDefinitionEditCandidate(t, f, "不可修复漂移", false)
 		_, err := f.store.CommitApprovedDefinitionEdit(t.Context(), ApprovedDefinitionEditParams{
 			ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-			Definition:   candidate, ApprovalRef: "c2b2-drift-" + uuid.NewString(),
+			Definition:   candidate, OperationRef: "c2b2-drift-" + uuid.NewString(),
 		})
 		if !errors.Is(err, types.ErrConflict) {
 			t.Fatalf("projection drift error=%v, want Conflict", err)
@@ -123,7 +123,7 @@ func TestCommitApprovedDefinitionEdit_RejectsStaleDriftAndIdentityReuse(t *testi
 		candidate, _ := buildApprovedDefinitionEditCandidate(t, f, "不可覆盖 playbook 漂移", false)
 		_, err := f.store.CommitApprovedDefinitionEdit(t.Context(), ApprovedDefinitionEditParams{
 			ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-			Definition:   candidate, ApprovalRef: "c2b2-playbook-drift-" + uuid.NewString(),
+			Definition:   candidate, OperationRef: "c2b2-playbook-drift-" + uuid.NewString(),
 		})
 		if !errors.Is(err, types.ErrConflict) {
 			t.Fatalf("playbook drift error=%v, want Conflict", err)
@@ -140,20 +140,20 @@ func TestCommitApprovedDefinitionEdit_RejectsStaleDriftAndIdentityReuse(t *testi
 	t.Run("source-set drift is not silently repaired", func(t *testing.T) {
 		f, base := newApprovedDefinitionEditFixture(t)
 		if _, err := f.store.pool.Exec(t.Context(),
-			`DELETE FROM schedule_sources WHERE schedule_id=$1`, f.taskID); err != nil {
+			`DELETE FROM task_fetch_targets WHERE schedule_id=$1`, f.taskID); err != nil {
 			t.Fatal(err)
 		}
 		candidate, _ := buildApprovedDefinitionEditCandidate(t, f, "不可覆盖 source 漂移", false)
 		_, err := f.store.CommitApprovedDefinitionEdit(t.Context(), ApprovedDefinitionEditParams{
 			ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-			Definition:   candidate, ApprovalRef: "c2b2-source-drift-" + uuid.NewString(),
+			Definition:   candidate, OperationRef: "c2b2-source-drift-" + uuid.NewString(),
 		})
 		if !errors.Is(err, types.ErrConflict) {
 			t.Fatalf("source drift error=%v, want Conflict", err)
 		}
 		var retained int
 		if err := f.store.pool.QueryRow(t.Context(),
-			`SELECT count(*) FROM schedule_sources WHERE schedule_id=$1`, f.taskID,
+			`SELECT count(*) FROM task_fetch_targets WHERE schedule_id=$1`, f.taskID,
 		).Scan(&retained); err != nil || retained != 0 {
 			t.Fatalf("source drift was repaired: retained=%d err=%v", retained, err)
 		}
@@ -165,7 +165,7 @@ func TestCommitApprovedDefinitionEdit_RejectsStaleDriftAndIdentityReuse(t *testi
 		candidate, _ := buildApprovedDefinitionEditCandidate(t, f, "原始确认编辑", false)
 		params := ApprovedDefinitionEditParams{
 			ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-			Definition:   candidate, ApprovalRef: "c2b2-reuse-" + uuid.NewString(),
+			Definition:   candidate, OperationRef: "c2b2-reuse-" + uuid.NewString(),
 		}
 		created, err := f.store.CommitApprovedDefinitionEdit(t.Context(), params)
 		if err != nil {
@@ -188,7 +188,7 @@ func TestCommitApprovedDefinitionEdit_RejectsStaleDriftAndIdentityReuse(t *testi
 		candidate, _ := buildApprovedDefinitionEditCandidate(t, f, "已落库的 v2", false)
 		params := ApprovedDefinitionEditParams{
 			ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-			Definition:   candidate, ApprovalRef: "c2b2-base-reuse-" + uuid.NewString(),
+			Definition:   candidate, OperationRef: "c2b2-base-reuse-" + uuid.NewString(),
 		}
 		created, err := f.store.CommitApprovedDefinitionEdit(t.Context(), params)
 		if err != nil {
@@ -213,7 +213,7 @@ func TestCommitApprovedDefinitionEdit_RejectsStaleDriftAndIdentityReuse(t *testi
 		candidate, _ := buildApprovedDefinitionEditCandidate(t, f, "固定 confirmation 的 v2", false)
 		params := ApprovedDefinitionEditParams{
 			ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-			Definition:   candidate, ApprovalRef: "c2b2-base-digest-" + uuid.NewString(),
+			Definition:   candidate, OperationRef: "c2b2-base-digest-" + uuid.NewString(),
 		}
 		created, err := f.store.CommitApprovedDefinitionEdit(t.Context(), params)
 		if err != nil {
@@ -240,7 +240,7 @@ func TestCommitApprovedDefinitionEdit_RejectsStaleDriftAndIdentityReuse(t *testi
 		candidate.Sources[0].SourceID += 999999
 		_, err := f.store.CommitApprovedDefinitionEdit(t.Context(), ApprovedDefinitionEditParams{
 			ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-			Definition:   candidate, ApprovalRef: "c2b2-source-" + uuid.NewString(),
+			Definition:   candidate, OperationRef: "c2b2-source-" + uuid.NewString(),
 		})
 		if !errors.Is(err, types.ErrConflict) {
 			t.Fatalf("source identity error=%v, want Conflict", err)
@@ -259,7 +259,7 @@ func TestCommitApprovedDefinitionEdit_RejectsStaleDriftAndIdentityReuse(t *testi
 			candidate.Sources[1].SourceID, candidate.Sources[0].SourceID
 		_, err := f.store.CommitApprovedDefinitionEdit(t.Context(), ApprovedDefinitionEditParams{
 			ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-			Definition:   candidate, ApprovalRef: "c2b2-source-swap-" + uuid.NewString(),
+			Definition:   candidate, OperationRef: "c2b2-source-swap-" + uuid.NewString(),
 		})
 		if !errors.Is(err, types.ErrConflict) {
 			t.Fatalf("source identity swap error=%v, want Conflict", err)
@@ -275,7 +275,7 @@ func TestCommitApprovedDefinitionEdit_ConcurrentCASAndLateReplay(t *testing.T) {
 		candidate, _ := buildApprovedDefinitionEditCandidate(t, f, "并发相同确认", false)
 		params := ApprovedDefinitionEditParams{
 			ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-			Definition:   candidate, ApprovalRef: "c2b2-same-race-" + uuid.NewString(),
+			Definition:   candidate, OperationRef: "c2b2-same-race-" + uuid.NewString(),
 		}
 		start := make(chan struct{})
 		results := make(chan struct {
@@ -333,8 +333,8 @@ func TestCommitApprovedDefinitionEdit_ConcurrentCASAndLateReplay(t *testing.T) {
 						ExpectedHead: ApprovedDefinitionFence{
 							Version: base.Version, Digest: base.Digest,
 						},
-						Definition:  candidate,
-						ApprovalRef: fmt.Sprintf("c2b2-race-%d-%s", index, uuid.NewString()),
+						Definition:   candidate,
+						OperationRef: fmt.Sprintf("c2b2-race-%d-%s", index, uuid.NewString()),
 					})
 				results <- struct {
 					record ApprovedDefinitionVersionRecord
@@ -370,7 +370,7 @@ func TestCommitApprovedDefinitionEdit_ConcurrentCASAndLateReplay(t *testing.T) {
 		v2Candidate, _ := buildApprovedDefinitionEditCandidate(t, f, "已确认 v2", false)
 		v2Params := ApprovedDefinitionEditParams{
 			ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-			Definition:   v2Candidate, ApprovalRef: "c2b2-v2-" + uuid.NewString(),
+			Definition:   v2Candidate, OperationRef: "c2b2-v2-" + uuid.NewString(),
 		}
 		v2, err := f.store.CommitApprovedDefinitionEdit(t.Context(), v2Params)
 		if err != nil {
@@ -383,7 +383,7 @@ func TestCommitApprovedDefinitionEdit_ConcurrentCASAndLateReplay(t *testing.T) {
 		v3, err := f.store.CommitApprovedDefinitionEdit(t.Context(),
 			ApprovedDefinitionEditParams{
 				ExpectedHead: ApprovedDefinitionFence{Version: v2.Version, Digest: v2.Digest},
-				Definition:   v3Candidate, ApprovalRef: "c2b2-v3-" + uuid.NewString(),
+				Definition:   v3Candidate, OperationRef: "c2b2-v3-" + uuid.NewString(),
 			})
 		if err != nil {
 			t.Fatal(err)
@@ -445,7 +445,7 @@ func TestCommitApprovedDefinitionEdit_HoldsScheduleLockAcrossTransaction(t *test
 	candidate, sourceIDs := buildApprovedDefinitionEditCandidate(t, f, "持锁编辑", true)
 	params := ApprovedDefinitionEditParams{
 		ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-		Definition:   candidate, ApprovalRef: "c2b2-lock-" + uuid.NewString(),
+		Definition:   candidate, OperationRef: "c2b2-lock-" + uuid.NewString(),
 	}
 	ready := make(chan struct{})
 	release := make(chan struct{})
@@ -502,15 +502,15 @@ func TestCommitApprovedDefinitionEdit_FailsClosedAtUnsupportedBoundaries(t *test
 		cases := []ApprovedDefinitionEditParams{
 			{
 				ExpectedHead: ApprovedDefinitionFence{Version: 0, Digest: base.Digest},
-				Definition:   candidate, ApprovalRef: "c2b2-zero-" + uuid.NewString(),
+				Definition:   candidate, OperationRef: "c2b2-zero-" + uuid.NewString(),
 			},
 			{
 				ExpectedHead: ApprovedDefinitionFence{Version: math.MaxInt64, Digest: base.Digest},
-				Definition:   candidate, ApprovalRef: "c2b2-overflow-" + uuid.NewString(),
+				Definition:   candidate, OperationRef: "c2b2-overflow-" + uuid.NewString(),
 			},
 			{
 				ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-				Definition:   candidate, ApprovalRef: " leading-space",
+				Definition:   candidate, OperationRef: " leading-space",
 			},
 		}
 		for index, params := range cases {
@@ -532,7 +532,7 @@ func TestCommitApprovedDefinitionEdit_FailsClosedAtUnsupportedBoundaries(t *test
 		_, err := f.store.CommitApprovedDefinitionEdit(t.Context(),
 			ApprovedDefinitionEditParams{
 				ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-				Definition:   candidate, ApprovalRef: "c2b2-legacy-" + uuid.NewString(),
+				Definition:   candidate, OperationRef: "c2b2-legacy-" + uuid.NewString(),
 			})
 		if !errors.Is(err, types.ErrValidation) {
 			t.Fatalf("legacy-scope edit error=%v, want Validation", err)
@@ -548,7 +548,7 @@ func TestCommitApprovedDefinitionEdit_FailsClosedAtUnsupportedBoundaries(t *test
 		_, err := f.store.CommitApprovedDefinitionEdit(t.Context(),
 			ApprovedDefinitionEditParams{
 				ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-				Definition:   candidate, ApprovalRef: "c2b2-intent-" + uuid.NewString(),
+				Definition:   candidate, OperationRef: "c2b2-intent-" + uuid.NewString(),
 			})
 		if !errors.Is(err, types.ErrValidation) {
 			t.Fatalf("unrepresentable intent error=%v, want Validation", err)
@@ -562,7 +562,7 @@ func TestCommitApprovedDefinitionEdit_FailsClosedAtUnsupportedBoundaries(t *test
 		_, err := f.store.CommitApprovedDefinitionEdit(t.Context(),
 			ApprovedDefinitionEditParams{
 				ExpectedHead: ApprovedDefinitionFence{Version: base.Version, Digest: base.Digest},
-				Definition:   candidate, ApprovalRef: "c2b2-dynamic-" + uuid.NewString(),
+				Definition:   candidate, OperationRef: "c2b2-dynamic-" + uuid.NewString(),
 			})
 		if !errors.Is(err, types.ErrValidation) {
 			t.Fatalf("dynamic edit error=%v, want Validation", err)
@@ -581,7 +581,7 @@ func TestCommitApprovedDefinitionEdit_FailsClosedAtUnsupportedBoundaries(t *test
 		_, err := f.store.CommitApprovedDefinitionEdit(t.Context(),
 			ApprovedDefinitionEditParams{
 				ExpectedHead: basis, Definition: candidate,
-				ApprovalRef: "c2b2-adaptive-" + uuid.NewString(),
+				OperationRef: "c2b2-adaptive-" + uuid.NewString(),
 			})
 		if !errors.Is(err, types.ErrConflict) {
 			t.Fatalf("adaptive edit error=%v, want Conflict", err)
@@ -601,7 +601,7 @@ func TestCommitApprovedDefinitionEdit_FailsClosedAtUnsupportedBoundaries(t *test
 		_, err = f.store.CommitApprovedDefinitionEdit(t.Context(),
 			ApprovedDefinitionEditParams{
 				ExpectedHead: base, Definition: candidate,
-				ApprovalRef: "c2b2-headless-" + uuid.NewString(),
+				OperationRef: "c2b2-headless-" + uuid.NewString(),
 			})
 		if !errors.Is(err, types.ErrConflict) {
 			t.Fatalf("headless edit error=%v, want Conflict", err)
@@ -610,7 +610,7 @@ func TestCommitApprovedDefinitionEdit_FailsClosedAtUnsupportedBoundaries(t *test
 		_, err = f.store.CommitApprovedDefinitionEdit(t.Context(),
 			ApprovedDefinitionEditParams{
 				ExpectedHead: base, Definition: candidate,
-				ApprovalRef: "c2b2-foreign-" + uuid.NewString(),
+				OperationRef: "c2b2-foreign-" + uuid.NewString(),
 			})
 		if !errors.Is(err, types.ErrNotFound) {
 			t.Fatalf("foreign edit error=%v, want NotFound", err)
@@ -625,7 +625,7 @@ func TestCommitApprovedDefinitionEdit_AdaptiveCASSerializesWithEdit(t *testing.T
 	candidate, _ := buildApprovedDefinitionEditCandidate(t, f, "与 adaptive 竞争", false)
 	params := ApprovedDefinitionEditParams{
 		ExpectedHead: basis, Definition: candidate,
-		ApprovalRef: "c2b2-adaptive-race-" + uuid.NewString(),
+		OperationRef: "c2b2-adaptive-race-" + uuid.NewString(),
 	}
 
 	type result struct {
@@ -703,8 +703,8 @@ func TestCommitApprovedDefinitionEdit_StatementFailuresRollbackEverything(t *tes
 	}{
 		{name: "immutable append", failContains: "INSERT INTO task_approved_definition_versions"},
 		{name: "playbook projection", failContains: "UPDATE schedule_playbooks"},
-		{name: "clear source projection", failContains: "DELETE FROM schedule_sources"},
-		{name: "insert source projection", failContains: "INSERT INTO schedule_sources"},
+		{name: "clear source projection", failContains: "DELETE FROM task_fetch_targets"},
+		{name: "insert source projection", failContains: "INSERT INTO task_fetch_targets"},
 		{name: "advance head", failContains: "UPDATE schedules s"},
 		{name: "commit after caller cancellation", commitErr: errInjectedCompiledTask,
 			cancelOnCommit: true},
@@ -738,7 +738,7 @@ func TestCommitApprovedDefinitionEdit_StatementFailuresRollbackEverything(t *tes
 					ExpectedHead: ApprovedDefinitionFence{
 						Version: base.Version, Digest: base.Digest,
 					},
-					Definition: candidate, ApprovalRef: "c2b2-fault-" + uuid.NewString(),
+					Definition: candidate, OperationRef: "c2b2-fault-" + uuid.NewString(),
 				})
 			if !errors.Is(err, types.ErrDatabase) {
 				t.Fatalf("fault error=%v, want Database", err)
@@ -782,7 +782,7 @@ func buildApprovedDefinitionEditCandidate(
 	approvedSources = append(approvedSources, first)
 	sourceIDs := []int64{first.SourceID}
 	if addSource {
-		source, message := sourcespec.Build(sourcespec.Spec{
+		source, message := fetchspec.BuildTarget(fetchspec.Requirement{
 			Platform: string(types.PlatformWeb), Capability: string(types.CapSearch),
 			Params: map[string]string{"query": "c2b2-extra-" + uuid.NewString()},
 			Title:  "C2b2 second source",
@@ -790,16 +790,16 @@ func buildApprovedDefinitionEditCandidate(
 		if message != "" || source == nil {
 			t.Fatalf("build second source: %q", message)
 		}
-		sourceID, _, err := f.store.GetOrCreateSource(t.Context(), source)
+		sourceID, _, err := f.store.GetOrCreateFetchTarget(t.Context(), source)
 		if err != nil {
 			t.Fatalf("materialize second source: %v", err)
 		}
 		t.Cleanup(func() {
 			_, _ = f.store.pool.Exec(context.Background(),
-				`DELETE FROM schedule_sources WHERE schedule_id=$1 AND source_id=$2`,
+				`DELETE FROM task_fetch_targets WHERE schedule_id=$1 AND fetch_target_id=$2`,
 				f.taskID, sourceID)
 			_, _ = f.store.pool.Exec(context.Background(),
-				`DELETE FROM sources WHERE id=$1`, sourceID)
+				`DELETE FROM fetch_targets WHERE id=$1`, sourceID)
 		})
 		// Preserve a deliberately non-canonical execution order. The immutable
 		// Sources set will sort by URL, while FetchPlan must retain this order.
@@ -884,11 +884,15 @@ func assertApprovedDefinitionEditProjection(
 			headVersion, headDigest)
 	}
 	playbook, err := f.store.GetSchedulePlaybook(t.Context(), f.userID, f.taskID)
+	currentFetchPlan, adapterErr :=
+		currentFetchPlanFromApprovedDefinitionV1(definition)
 	if err != nil || playbook.Content != definition.PlaybookContent ||
-		!jsonBytesEqual(t, playbook.FetchPlan, definition.FetchPlan) {
-		t.Fatalf("playbook projection=%+v err=%v", playbook, err)
+		adapterErr != nil ||
+		!jsonBytesEqual(t, playbook.FetchPlan, currentFetchPlan) {
+		t.Fatalf("playbook projection=%+v load_err=%v adapter_err=%v",
+			playbook, err, adapterErr)
 	}
-	gotSourceIDs, err := f.store.ListScheduleSourceIDs(t.Context(), f.userID, f.taskID)
+	gotSourceIDs, err := f.store.ListTaskFetchTargetIDs(t.Context(), f.userID, f.taskID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -143,8 +143,7 @@ func TestHandleExternalContextMessage_FreshQuestionUsesOneExactUserBoundSearch(
 	if err != nil {
 		t.Fatalf("HandleExternalContextMessage: %v", err)
 	}
-	if out.Confirm != nil ||
-		!strings.Contains(out.Reply, official) ||
+	if !strings.Contains(out.Reply, official) ||
 		!strings.Contains(out.Reply, "未提供 API 定价") {
 		t.Fatalf("out=%+v", out)
 	}

@@ -43,8 +43,8 @@ func serveFeed(t *testing.T, body string) string {
 	return srv.URL
 }
 
-func feedSource(url string) types.Source {
-	return types.Source{ID: 42, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: url}
+func feedSource(url string) types.FetchTarget {
+	return types.FetchTarget{ID: 42, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: url}
 }
 
 // TestFetchRSS_AllDroppedIsAnError 是本次修复的核心守卫。

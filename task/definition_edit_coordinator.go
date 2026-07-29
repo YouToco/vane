@@ -37,8 +37,8 @@ const (
 )
 
 // TaskDefinitionEditStore is the complete C2b3 operation boundary. Receipt
-// delivery intentionally is not part of this interface; authenticated card and
-// session wiring remains dark until C2b3-2d.
+// delivery intentionally is not part of this interface; the Agent session
+// receipt is handled above the saga boundary.
 type TaskDefinitionEditStore interface {
 	CreateTaskDefinitionEditOperation(
 		context.Context,
@@ -47,10 +47,6 @@ type TaskDefinitionEditStore interface {
 	LoadTaskDefinitionEditOperation(
 		context.Context,
 		types.TaskDefinitionEditScope,
-	) (*types.TaskDefinitionEditOperation, error)
-	CancelTaskDefinitionEditOperation(
-		context.Context,
-		types.CancelTaskDefinitionEditOperationParams,
 	) (*types.TaskDefinitionEditOperation, error)
 	ExpireTaskDefinitionEditOperation(
 		context.Context,
@@ -130,7 +126,7 @@ type TaskDefinitionEditStore interface {
 
 // TaskDefinitionEditScheduler is the only production-facing reference to the
 // C2b3-1 raw Temporal surface. Prepare is read-only and runs before a proposal
-// is sealed. Each post-confirmation coordinator attempt calls at most one of
+// is sealed. Each post-acquisition coordinator attempt calls at most one of
 // the three mutating/observing phase methods.
 type TaskDefinitionEditScheduler interface {
 	PrepareTaskDefinitionEdit(
@@ -167,7 +163,7 @@ type TaskDefinitionEditScheduler interface {
 // them from the raw read-only prepare API.
 type PrepareTaskDefinitionEditProposalInput struct {
 	OperationID      string
-	ApprovalRef      string
+	OperationRef     string
 	ActorTenantID    int64
 	ActorUserID      int64
 	TargetTenantID   int64
@@ -183,10 +179,8 @@ type PrepareTaskDefinitionEditProposalInput struct {
 	Creation         scheduler.PreparedTaskSchedule
 }
 
-// TaskDefinitionEditReceiptTarget is the already-authenticated provider
-// resource accepted by the Store in the same transaction as confirmation.
-// Agent derives it from the original Feishu App fingerprint and message ID;
-// the coordinator never constructs or trusts callback identity itself.
+// TaskDefinitionEditReceiptTarget is the server-owned session resource accepted
+// by the Store in the same transaction as operation acquisition.
 type TaskDefinitionEditReceiptTarget struct {
 	Provider string
 	Target   string
@@ -203,9 +197,8 @@ type TaskDefinitionEditOutcome struct {
 	Phase       types.TaskDefinitionEditPhase
 	Recovering  bool
 	Replayed    bool
-	// ReceiptBound proves that the original provider card identity was accepted
-	// durably with the operation. The callback must then leave terminal delivery
-	// to the outbox dispatcher.
+	// ReceiptBound proves that the session receipt identity was accepted
+	// durably with the operation.
 	ReceiptBound bool
 }
 
@@ -321,7 +314,7 @@ func validateTaskDefinitionEditPreflightBudget(scanned, maximum int) error {
 	return nil
 }
 
-// PrepareAndSealProposal performs the only legal pre-confirmation Temporal
+// PrepareAndSealProposal performs the only legal pre-execution Temporal
 // read, binds it to the exact Approved definitions, and persists the five
 // canonical checkpoints. Only DefinitionEditController may call it from a
 // default-off authenticated Agent proposal.
@@ -383,7 +376,7 @@ func (c *TaskDefinitionEditCoordinator) prepareTaskDefinitionEditProposal(
 	}
 	return BuildFrozenTaskDefinitionEditProposal(
 		BuildTaskDefinitionEditProposalInput{
-			OperationID: in.OperationID, ApprovalRef: in.ApprovalRef,
+			OperationID: in.OperationID, OperationRef: in.OperationRef,
 			ActorTenantID: in.ActorTenantID, ActorUserID: in.ActorUserID,
 			TargetTenantID: in.TargetTenantID, TargetUserID: in.TargetUserID,
 			TaskID: in.TaskID, SessionID: in.SessionID, ExpiresAt: in.ExpiresAt,
@@ -405,7 +398,7 @@ func validateTaskDefinitionEditPrepareInput(
 	if !validTaskDefinitionEditIdentifier(
 		in.OperationID, maxTaskDefinitionEditOperationIDBytes,
 	) || !validTaskDefinitionEditIdentifier(
-		in.ApprovalRef, maxTaskDefinitionEditReferenceBytes,
+		in.OperationRef, maxTaskDefinitionEditReferenceBytes,
 	) || !validTaskDefinitionEditIdentifier(
 		in.TaskID, maxTaskDefinitionEditTaskIDBytes,
 	) || in.ActorTenantID <= 0 || in.ActorUserID <= 0 ||
@@ -513,11 +506,11 @@ func (c *TaskDefinitionEditCoordinator) sealTaskDefinitionEditProposal(
 	return nil, errors.Join(createErr, replayErr, loadErr)
 }
 
-// Confirm acquires the exact frozen operation, then runs bounded local
+// Execute acquires the exact frozen operation, then runs bounded local
 // attempts. Each runTaskDefinitionEditAttempt advances one durable transition
 // and invokes at most one raw Temporal phase. Once acquired, a transient error
 // is reported as durable recovery rather than permission to submit a duplicate.
-func (c *TaskDefinitionEditCoordinator) Confirm(
+func (c *TaskDefinitionEditCoordinator) Execute(
 	ctx context.Context,
 	scope types.TaskDefinitionEditScope,
 	receipt TaskDefinitionEditReceiptTarget,
@@ -545,7 +538,7 @@ func (c *TaskDefinitionEditCoordinator) Confirm(
 		return outcome, nil
 	}
 
-	owner := "definition-edit-confirm-" + uuid.NewString()
+	owner := "definition-edit-execute-" + uuid.NewString()
 	op, err := c.acquireTaskDefinitionEdit(ctx,
 		types.AcquireTaskDefinitionEditOperationParams{
 			Scope: scope, LeaseOwner: owner,
@@ -631,44 +624,6 @@ func (c *TaskDefinitionEditCoordinator) Confirm(
 	outcome := taskDefinitionEditOutcome(op)
 	outcome.Recovering = true
 	return outcome, nil
-}
-
-// Cancel linearizes an authenticated pre-confirmation cancellation. It cannot
-// stop an operation which already owns an execution lease.
-func (c *TaskDefinitionEditCoordinator) Cancel(
-	ctx context.Context,
-	scope types.TaskDefinitionEditScope,
-	receipt TaskDefinitionEditReceiptTarget,
-) (TaskDefinitionEditOutcome, error) {
-	if err := ctx.Err(); err != nil {
-		return TaskDefinitionEditOutcome{}, err
-	}
-	if err := c.validateDependencies(false); err != nil {
-		return TaskDefinitionEditOutcome{}, err
-	}
-	op, err := c.store.CancelTaskDefinitionEditOperation(ctx,
-		types.CancelTaskDefinitionEditOperationParams{
-			Scope: scope, ReceiptProvider: receipt.Provider,
-			ReceiptTarget: receipt.Target,
-		})
-	if err == nil {
-		return taskDefinitionEditOutcome(op), nil
-	}
-	if errors.Is(err, types.ErrTaskDefinitionEditTerminal) && op != nil &&
-		op.Status == types.TaskDefinitionEditOperationStatusCancelled {
-		if op.ReceiptProvider != receipt.Provider ||
-			op.ReceiptTarget != receipt.Target {
-			return TaskDefinitionEditOutcome{}, types.NewAppError(
-				types.CodeConflict,
-				"task definition edit: terminal receipt target differs",
-				types.ErrConflict,
-			)
-		}
-		outcome := taskDefinitionEditOutcome(op)
-		outcome.Replayed = true
-		return outcome, nil
-	}
-	return taskDefinitionEditOutcome(op), err
 }
 
 // Expire tombstones only a proposal proven expired by the database clock.
@@ -1102,7 +1057,7 @@ func (c *TaskDefinitionEditCoordinator) loadTaskDefinitionEditConvergent(
 
 // RunRecovery provides the C2b3-2c startup and periodic dark recovery loop.
 // The composition root may call only this method; authenticated proposal,
-// confirmation, cancellation, and receipt delivery remain C2b3-2d work.
+// execution, cancellation, and receipt delivery remain separate work.
 func (c *TaskDefinitionEditCoordinator) RunRecovery(ctx context.Context) {
 	if c.validateDependencies(true) != nil {
 		return
@@ -1464,12 +1419,12 @@ func definitionEditOperationMatchesFrozen(
 	}
 	proposal := frozen.Proposal
 	originalStatus := types.ScheduleStatusActive
-	if proposal.OriginalStatus == TaskDefinitionEditOriginalStatusV1Paused {
+	if proposal.OriginalStatus == TaskDefinitionEditOriginalStatusV2Paused {
 		originalStatus = types.ScheduleStatusPaused
 	}
 	return op.Scope() == definitionEditProposalScope(frozen) &&
 		op.SessionID == proposal.SessionID &&
-		op.ApprovalRef == proposal.ApprovalRef &&
+		op.OperationRef == proposal.OperationRef &&
 		op.ExpiresAt.Equal(time.UnixMicro(proposal.ExpiresAtUnixMicros)) &&
 		op.OriginalStatus == originalStatus &&
 		op.BaseDefinitionVersion == proposal.BaseHead.Version &&

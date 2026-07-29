@@ -11,7 +11,7 @@ import (
 
 // Cache 按 traceID 缓存画像提示：同一 pipeline（Score 50 次 + CardGen 5 次）
 // 共用同一画像快照，画像中途被修改也不会出现"前 30 条按旧画像、后 20 条按新画像"
-// 的撕裂打分。FIFO 上限 maxEntries，push_now 与定时 pipeline 并跑时互不挤兑。
+// 的撕裂打分。FIFO 上限 maxEntries，手动任务运行与定时 pipeline 并跑时互不挤兑。
 type Cache struct {
 	st Store
 
@@ -42,7 +42,7 @@ func NewCache(st Store) *Cache {
 //   - 空串同样入缓存：降级结果也是本 trace 的一致快照，且避免 50 次打分反复打失败查询。
 //
 // 锁内查库是刻意的：同 trace 并发首查只打一次 DB；不同 trace 间短暂互斥，
-// 单实例低并发（至多 push_now + 定时两条 pipeline）下代价可忽略。
+// 单实例低并发（手动任务运行 + 定时任务）下代价可忽略。
 func (c *Cache) Hint(ctx context.Context, userID int64, traceID string) string {
 	return c.hint(ctx, cacheKey{userID: userID, traceID: traceID})
 }

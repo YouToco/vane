@@ -31,7 +31,7 @@ import (
 // 007 回填写的就是裸值，加前缀会让存量行的键与运行时算出的不相等 → 全库重复。
 //
 // 返回空串表示这条内容没有可用身份，调用方必须丢弃（见 finalize）。
-func CanonicalKey(src types.Source, item types.ContentItem) string {
+func CanonicalKey(src types.FetchTarget, item types.ContentItem) string {
 	switch src.Platform {
 	case types.PlatformXHS:
 		return xhsKey(item.ExternalID)

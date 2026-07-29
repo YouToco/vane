@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	taskDefinitionEditProposalVersion     = "vane.task-definition-edit-proposal/v1"
+	taskDefinitionEditProposalVersion     = "vane.task-definition-edit-proposal/v2"
 	maxTaskDefinitionEditProposalBytes    = 64 << 10
 	maxTaskDefinitionEditReferenceBytes   = 1024
 	maxTaskDefinitionEditOperationIDBytes = 512
@@ -35,45 +35,45 @@ var ErrDefinitionEditProposalInvalid = errors.New(
 	"task: frozen definition edit proposal is invalid",
 )
 
-// TaskDefinitionEditProposalActorV1 is the authenticated internal principal.
+// TaskDefinitionEditProposalActorV2 is the authenticated internal principal.
 // Provider callback identifiers never substitute for this scope.
-type TaskDefinitionEditProposalActorV1 struct {
+type TaskDefinitionEditProposalActorV2 struct {
 	TenantID int64 `json:"tenant_id"`
 	UserID   int64 `json:"user_id"`
 }
 
-// TaskDefinitionEditProposalTargetV1 is the immutable resource scope. V1 is
+// TaskDefinitionEditProposalTargetV2 is the immutable resource scope. V2 is
 // owner-only, but actor and target remain distinct fields so a later team
 // protocol cannot reinterpret old bytes.
-type TaskDefinitionEditProposalTargetV1 struct {
+type TaskDefinitionEditProposalTargetV2 struct {
 	TenantID int64  `json:"tenant_id"`
 	UserID   int64  `json:"user_id"`
 	TaskID   string `json:"task_id"`
 }
 
-// TaskDefinitionEditOriginalStatusV1 is the frozen database status spelling
-// carried by proposal/v1. Current ScheduleStatus names are translated only at
+// TaskDefinitionEditOriginalStatusV2 is the frozen database status spelling
+// carried by proposal/v2. Current ScheduleStatus names are translated only at
 // seal time so a future current enum rename cannot strand historical bytes.
-type TaskDefinitionEditOriginalStatusV1 string
+type TaskDefinitionEditOriginalStatusV2 string
 
 const (
-	TaskDefinitionEditOriginalStatusV1Active TaskDefinitionEditOriginalStatusV1 = "active"
-	TaskDefinitionEditOriginalStatusV1Paused TaskDefinitionEditOriginalStatusV1 = "paused"
+	TaskDefinitionEditOriginalStatusV2Active TaskDefinitionEditOriginalStatusV2 = "active"
+	TaskDefinitionEditOriginalStatusV2Paused TaskDefinitionEditOriginalStatusV2 = "paused"
 )
 
-// TaskDefinitionEditProposalV1 is the small canonical approval envelope. The
+// TaskDefinitionEditProposalV2 is the small canonical operation envelope. The
 // exact target definition, prepared Temporal edit, and base snapshot remain
 // separate BYTEA checkpoints; their digests make this envelope bind all three
 // without duplicating multi-megabyte payloads.
-type TaskDefinitionEditProposalV1 struct {
+type TaskDefinitionEditProposalV2 struct {
 	WireVersion            string                             `json:"wire_version"`
 	OperationID            string                             `json:"operation_id"`
-	ApprovalRef            string                             `json:"approval_ref"`
-	Actor                  TaskDefinitionEditProposalActorV1  `json:"actor"`
-	Target                 TaskDefinitionEditProposalTargetV1 `json:"target"`
+	OperationRef           string                             `json:"operation_ref"`
+	Actor                  TaskDefinitionEditProposalActorV2  `json:"actor"`
+	Target                 TaskDefinitionEditProposalTargetV2 `json:"target"`
 	SessionID              int64                              `json:"session_id"`
 	ExpiresAtUnixMicros    int64                              `json:"expires_at_unix_micros"`
-	OriginalStatus         TaskDefinitionEditOriginalStatusV1 `json:"original_status"`
+	OriginalStatus         TaskDefinitionEditOriginalStatusV2 `json:"original_status"`
 	BaseHead               scheduler.TaskDefinitionEditHead   `json:"base_head"`
 	TargetHead             scheduler.TaskDefinitionEditHead   `json:"target_head"`
 	TargetDefinitionDigest string                             `json:"target_definition_digest"`
@@ -82,12 +82,12 @@ type TaskDefinitionEditProposalV1 struct {
 }
 
 // BuildTaskDefinitionEditProposalInput contains every value that must be
-// cross-checked before an approval operation may be inserted. ExpiresAt is
+// cross-checked before an edit operation may be inserted. ExpiresAt is
 // converted to integer microseconds; no process-local clock participates in
 // the durable bytes.
 type BuildTaskDefinitionEditProposalInput struct {
 	OperationID      string
-	ApprovalRef      string
+	OperationRef     string
 	ActorTenantID    int64
 	ActorUserID      int64
 	TargetTenantID   int64
@@ -108,7 +108,7 @@ type BuildTaskDefinitionEditProposalInput struct {
 // Byte slices are exact canonical database payloads; typed values are decoded
 // from those same bytes rather than retained aliases of caller-owned memory.
 type FrozenTaskDefinitionEditProposal struct {
-	Proposal              TaskDefinitionEditProposalV1
+	Proposal              TaskDefinitionEditProposalV2
 	CanonicalProposal     []byte
 	ProposalDigest        string
 	BaseDefinition        taskstate.ApprovedDefinitionV1
@@ -123,7 +123,7 @@ type FrozenTaskDefinitionEditProposal struct {
 
 // BuildFrozenTaskDefinitionEditProposal validates both immutable Approved
 // definitions, the complete prepared Temporal wire, and the observed base
-// snapshot before producing any bytes that can be shown for confirmation.
+// snapshot before producing any bytes that can be persisted or summarized.
 func BuildFrozenTaskDefinitionEditProposal(
 	in BuildTaskDefinitionEditProposalInput,
 ) (FrozenTaskDefinitionEditProposal, error) {
@@ -207,15 +207,15 @@ func BuildFrozenTaskDefinitionEditProposal(
 			"encode base snapshot", err,
 		)
 	}
-	proposal := TaskDefinitionEditProposalV1{
-		WireVersion: taskDefinitionEditProposalVersion,
-		OperationID: in.OperationID,
-		ApprovalRef: in.ApprovalRef,
-		Actor: TaskDefinitionEditProposalActorV1{
+	proposal := TaskDefinitionEditProposalV2{
+		WireVersion:  taskDefinitionEditProposalVersion,
+		OperationID:  in.OperationID,
+		OperationRef: in.OperationRef,
+		Actor: TaskDefinitionEditProposalActorV2{
 			TenantID: in.ActorTenantID,
 			UserID:   in.ActorUserID,
 		},
-		Target: TaskDefinitionEditProposalTargetV1{
+		Target: TaskDefinitionEditProposalTargetV2{
 			TenantID: in.TargetTenantID,
 			UserID:   in.TargetUserID,
 			TaskID:   in.TaskID,
@@ -277,7 +277,7 @@ func DecodeFrozenTaskDefinitionEditProposal(
 		return FrozenTaskDefinitionEditProposal{}, err
 	}
 
-	var proposal TaskDefinitionEditProposalV1
+	var proposal TaskDefinitionEditProposalV2
 	if err := strictjson.DecodeExact(canonicalProposal, &proposal); err != nil {
 		return FrozenTaskDefinitionEditProposal{}, invalidDefinitionEditProposal(
 			"decode proposal", err,
@@ -354,7 +354,7 @@ func validateFrozenTaskDefinitionEditProposal(
 	proposal := frozen.Proposal
 	if proposal.WireVersion != taskDefinitionEditProposalVersion ||
 		!validTaskDefinitionEditIdentifier(proposal.OperationID, maxTaskDefinitionEditOperationIDBytes) ||
-		!validTaskDefinitionEditIdentifier(proposal.ApprovalRef, maxTaskDefinitionEditReferenceBytes) ||
+		!validTaskDefinitionEditIdentifier(proposal.OperationRef, maxTaskDefinitionEditReferenceBytes) ||
 		proposal.Actor.TenantID <= 0 || proposal.Actor.UserID <= 0 ||
 		proposal.Target.TenantID <= 0 || proposal.Target.UserID <= 0 ||
 		!validTaskDefinitionEditIdentifier(proposal.Target.TaskID, maxTaskDefinitionEditTaskIDBytes) ||
@@ -527,24 +527,24 @@ func decodeDefinitionEditApprovedScope(
 
 func definitionEditOriginalStatusForWrite(
 	status types.ScheduleStatus,
-) (TaskDefinitionEditOriginalStatusV1, scheduler.TaskDefinitionEditOriginalState, error) {
+) (TaskDefinitionEditOriginalStatusV2, scheduler.TaskDefinitionEditOriginalState, error) {
 	switch status {
 	case types.ScheduleStatusActive:
-		return TaskDefinitionEditOriginalStatusV1Active, scheduler.TaskDefinitionEditOriginalStateActive, nil
+		return TaskDefinitionEditOriginalStatusV2Active, scheduler.TaskDefinitionEditOriginalStateActive, nil
 	case types.ScheduleStatusPaused:
-		return TaskDefinitionEditOriginalStatusV1Paused, scheduler.TaskDefinitionEditOriginalStatePaused, nil
+		return TaskDefinitionEditOriginalStatusV2Paused, scheduler.TaskDefinitionEditOriginalStatePaused, nil
 	default:
 		return "", scheduler.TaskDefinitionEditOriginalStateUnknown, errors.New("status must be active or paused")
 	}
 }
 
 func definitionEditOriginalState(
-	status TaskDefinitionEditOriginalStatusV1,
+	status TaskDefinitionEditOriginalStatusV2,
 ) (scheduler.TaskDefinitionEditOriginalState, error) {
 	switch status {
-	case TaskDefinitionEditOriginalStatusV1Active:
+	case TaskDefinitionEditOriginalStatusV2Active:
 		return scheduler.TaskDefinitionEditOriginalStateActive, nil
-	case TaskDefinitionEditOriginalStatusV1Paused:
+	case TaskDefinitionEditOriginalStatusV2Paused:
 		return scheduler.TaskDefinitionEditOriginalStatePaused, nil
 	default:
 		return scheduler.TaskDefinitionEditOriginalStateUnknown, errors.New("frozen status must be active or paused")

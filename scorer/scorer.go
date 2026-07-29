@@ -53,7 +53,7 @@ const (
 	// negTitleMaxRunes 单条标题截断上限。
 	negTitleMaxRunes = 50
 	// negCacheMaxEntries per-trace 负面清单缓存 FIFO 容量，与 profilehint.Cache
-	// 同构：push_now 与定时 pipeline 并跑时互不挤兑。
+	// 同构：手动任务运行与定时 pipeline 并跑时互不挤兑。
 	negCacheMaxEntries = 16
 )
 

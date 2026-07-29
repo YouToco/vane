@@ -44,11 +44,10 @@ func TestGroundedResearchCompletesSearchReadAndAnswerInOneMessage(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Confirm != nil ||
-		!strings.Contains(
-			out.Reply,
-			"**来源**\n- [来源 · openai.com](https://openai.com/index/introducing-gpt-live/)",
-		) {
+	if !strings.Contains(
+		out.Reply,
+		"**来源**\n- [来源 · openai.com](https://openai.com/index/introducing-gpt-live/)",
+	) {
 		t.Fatalf("outcome=%+v", out)
 	}
 	if searcher.calls != 1 || reader.calls != 1 || len(chat.requests) != 3 {
@@ -279,7 +278,7 @@ func TestGroundedResearchRejectsToolsOnReservedFinalRound(t *testing.T) {
 func TestIntentToolkitsNarrowFirstRequest(t *testing.T) {
 	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)
 	loop := New(Deps{Tools: BuildTools(
-		nil, nil, nil, nil, nil, nil, exa,
+		nil, nil, nil, nil, exa,
 	)})
 	state := &toolRunState{
 		ownerRequest:          "GPT-Live 是否已提供 API 定价？",
@@ -295,7 +294,7 @@ func TestIntentToolkitsNarrowFirstRequest(t *testing.T) {
 		t.Fatalf("web toolkit missing: %v", got)
 	}
 	for _, hidden := range []string{
-		"view_profile", "list_sources", "list_schedules", "create_schedule",
+		"view_profile", "list_schedules", "create_schedule",
 	} {
 		if got[hidden] {
 			t.Errorf("unrelated tool %s was exposed", hidden)
@@ -306,7 +305,7 @@ func TestIntentToolkitsNarrowFirstRequest(t *testing.T) {
 func TestIntentToolkitsShadowPreservesLegacyExposure(t *testing.T) {
 	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)
 	loop := New(Deps{Tools: BuildTools(
-		nil, nil, nil, nil, nil, nil, exa,
+		nil, nil, nil, nil, exa,
 	)})
 	state := &toolRunState{
 		ownerRequest:         "GPT-Live 是否已提供 API 定价？",
@@ -319,7 +318,7 @@ func TestIntentToolkitsShadowPreservesLegacyExposure(t *testing.T) {
 		got[def.Name] = true
 	}
 	if !got["web_search"] || !got["read_page"] ||
-		!got["view_profile"] || !got["list_sources"] {
+		!got["view_profile"] || !got["list_schedules"] {
 		t.Fatalf("shadow must preserve legacy exposure: %v", got)
 	}
 	if !state.intentToolkitsShadowSeen ||
@@ -338,7 +337,7 @@ func TestIntentToolkitsRolloutPropagatesIntoRunOnce(t *testing.T) {
 		Content: "基于当前信息回答。",
 	}}}
 	loop := New(Deps{
-		Tools:                 BuildTools(nil, nil, nil, nil, nil, nil, exa),
+		Tools:                 BuildTools(nil, nil, nil, nil, exa),
 		IntentToolkitsEnabled: true,
 	})
 	loop.chatFn = chat.fn
@@ -355,7 +354,7 @@ func TestIntentToolkitsRolloutPropagatesIntoRunOnce(t *testing.T) {
 		got[def.Name] = true
 	}
 	if !got["web_search"] || !got["read_page"] ||
-		got["view_profile"] || got["list_sources"] {
+		got["view_profile"] || got["list_schedules"] {
 		t.Fatalf("owner canary tool exposure = %v", got)
 	}
 }
@@ -363,7 +362,7 @@ func TestIntentToolkitsRolloutPropagatesIntoRunOnce(t *testing.T) {
 func TestUnifiedLoopFuseRejectsDuplicateAndCap(t *testing.T) {
 	tool := &fakeTool{name: "read_once", result: "ok"}
 	spec := newToolSpec(tool, ownerPolicy(
-		Effects(EffectInternalRead), ConfirmationNone, BudgetNone,
+		Effects(EffectInternalRead), BudgetNone,
 	))
 	loop := New(Deps{})
 	state := &toolRunState{}
@@ -409,7 +408,7 @@ func TestProductionToolSchemasHideProvidersAndTransport(t *testing.T) {
 	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)
 	endpoints := NewEndpointTools(nil, nil, 0, 0, 1_000_000)
 	static := BuildTools(
-		nil, nil, nil, nil, endpoints, nil, exa,
+		nil, nil, nil, endpoints, exa,
 		&fakeDefinitionEditController{},
 	)
 	for _, spec := range static {

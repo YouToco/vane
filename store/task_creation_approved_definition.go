@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/jackc/pgx/v5"
@@ -11,7 +12,7 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-const taskCreationApprovalRefPrefix = "pending-action:"
+const taskCreationOperationRefPrefix = "task-creation-operation:"
 
 // insertTaskCreationApprovedDefinitionTx installs the immutable compiled
 // definition which was approved by one durable create_schedule action. The
@@ -34,24 +35,24 @@ func insertTaskCreationApprovedDefinitionTx(
 	if err != nil {
 		return ApprovedDefinitionVersionRecord{}, err
 	}
-	approvalRef := taskCreationApprovalRefPrefix + operationID
-	if !validTaskStateReference(approvalRef, 1024) {
+	operationRef := taskCreationOperationRefPrefix + operationID
+	if !validTaskStateReference(operationRef, 1024) {
 		return ApprovedDefinitionVersionRecord{}, taskStateValidation(
-			"task creation approval reference is invalid")
+			"task creation operation reference is invalid")
 	}
 	record := ApprovedDefinitionVersionRecord{
 		Definition: definition, Version: initialApprovedDefinitionVersion,
-		Digest: digest, Payload: bytes.Clone(payload), ApprovalRef: approvalRef,
+		Digest: digest, Payload: bytes.Clone(payload), OperationRef: operationRef,
 	}
 	err = tx.QueryRow(ctx,
 		`INSERT INTO task_approved_definition_versions (
 			tenant_id, user_id, task_id, version, schema_version,
-			execution_mode, definition_digest, payload, approval_ref
+			execution_mode, definition_digest, payload, operation_ref
 		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING created_at`,
 		definition.TenantID, definition.UserID, definition.TaskID,
 		record.Version, definition.SchemaVersion, definition.ExecutionMode,
-		record.Digest, record.Payload, record.ApprovalRef,
+		record.Digest, record.Payload, record.OperationRef,
 	).Scan(&record.CreatedAt)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -101,7 +102,7 @@ func taskCreationApprovedDefinitionMatchesTx(
 	if err != nil {
 		return false, err
 	}
-	approvalRef := taskCreationApprovalRefPrefix + operationID
+	operationRef := taskCreationOperationRefPrefix + operationID
 	var headVersion *int64
 	var headDigest *string
 	var rawMode string
@@ -124,8 +125,8 @@ func taskCreationApprovedDefinitionMatchesTx(
 		rawMode != string(types.ExecutionModeCompiled) {
 		return false, nil
 	}
-	record, err := loadApprovedDefinitionByApprovalRefTx(ctx, tx,
-		legacy.TenantID, legacy.UserID, legacy.TaskID, approvalRef)
+	record, err := loadApprovedDefinitionByOperationRefTx(ctx, tx,
+		legacy.TenantID, legacy.UserID, legacy.TaskID, operationRef)
 	if err != nil {
 		if errors.Is(err, types.ErrNotFound) {
 			return false, nil
@@ -144,15 +145,15 @@ func buildTaskCreationApprovedDefinitionTx(
 	legacy types.PausedCompiledTaskDefinition,
 	plan *compiledFetchPlan,
 ) (taskstate.ApprovedDefinitionV1, error) {
-	if plan == nil || len(plan.Sources) == 0 {
+	if plan == nil || len(plan.Targets) == 0 {
 		return taskstate.ApprovedDefinitionV1{}, taskStateValidation(
 			"task creation approved plan is empty")
 	}
-	linkedIDs := make(map[string]int64, len(plan.Sources))
+	linkedIDs := make(map[string]int64, len(plan.Targets))
 	rows, err := tx.Query(ctx,
 		`SELECT src.url, src.id
-		   FROM schedule_sources ss
-		   JOIN sources src ON src.id=ss.source_id
+		   FROM task_fetch_targets ss
+		   JOIN fetch_targets src ON src.id=ss.fetch_target_id
 		  WHERE ss.schedule_id=$1
 		  ORDER BY src.url, src.id
 		  FOR SHARE OF ss, src`, legacy.TaskID)
@@ -180,12 +181,15 @@ func buildTaskCreationApprovedDefinitionTx(
 		return taskstate.ApprovedDefinitionV1{}, taskStateDatabaseError(
 			"iterate task creation materialized sources", err)
 	}
-	if len(linkedIDs) != len(plan.Sources) {
+	if len(linkedIDs) != len(plan.Targets) {
 		return taskstate.ApprovedDefinitionV1{}, taskStateConflict(
 			"task creation plan and materialized sources differ")
 	}
-	approvedSources := make([]taskstate.ApprovedSourceV1, 0, len(plan.Sources))
-	for _, source := range plan.Sources {
+	approvedSources := make([]taskstate.ApprovedSourceV1, 0, len(plan.Targets))
+	legacyPlan := taskstate.FetchPlanV1{
+		Sources: make([]taskstate.PlanSourceV1, 0, len(plan.Targets)),
+	}
+	for _, source := range plan.Targets {
 		sourceID, ok := linkedIDs[source.URL]
 		if !ok {
 			return taskstate.ApprovedDefinitionV1{}, taskStateConflict(
@@ -196,6 +200,16 @@ func buildTaskCreationApprovedDefinitionTx(
 			Capability: types.Capability(source.Capability), Title: source.Title,
 			URL: source.URL, Config: bytes.Clone(source.Config),
 		})
+		legacyPlan.Sources = append(legacyPlan.Sources, taskstate.PlanSourceV1{
+			Platform:   types.Platform(source.Platform),
+			Capability: types.Capability(source.Capability),
+			Title:      source.Title, URL: source.URL,
+			Config: bytes.Clone(source.Config),
+		})
+	}
+	legacyFetchPlan, err := json.Marshal(legacyPlan)
+	if err != nil {
+		return taskstate.ApprovedDefinitionV1{}, taskStateIntegrity()
 	}
 	definition, err := taskstate.BuildApprovedDefinitionV1(
 		taskstate.ApprovedDefinitionInputV1{
@@ -204,7 +218,7 @@ func buildTaskCreationApprovedDefinitionTx(
 			SpecJSON: legacy.SpecJSON, ScopeJSON: legacy.ScopeJSON,
 			PlaybookContent: legacy.PlaybookContent,
 			SourceScope:     taskstate.SourceScopeApprovedPlan,
-			FetchPlan:       legacy.FetchPlan, Strictness: legacy.Strictness,
+			FetchPlan:       legacyFetchPlan, Strictness: legacy.Strictness,
 			Sources: approvedSources, ExecutionMode: types.ExecutionModeCompiled,
 			DeliveryPolicy: taskstate.DeliveryPolicyOwnerFeishu,
 			BudgetPolicy:   taskstate.BudgetPolicyInheritTenantQuota,

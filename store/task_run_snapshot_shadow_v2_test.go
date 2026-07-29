@@ -634,8 +634,8 @@ func TestTaskRunSnapshotShadowV2HasOnlyExplicitRuntimeConsumers(t *testing.T) {
 	}
 
 	for _, table := range []string{
-		"schedules", "schedule_playbooks", "schedule_sources", "subscriptions",
-		"sources", "task_approved_definition_versions", "task_adaptive_states",
+		"schedules", "schedule_playbooks", "task_fetch_targets",
+		"fetch_targets", "task_approved_definition_versions", "task_adaptive_states",
 	} {
 		t.Run("reject raw sql "+table, func(t *testing.T) {
 			source := []byte("package store\nfunc injected() { _ = `SELECT * FROM " +
@@ -650,7 +650,6 @@ func TestTaskRunSnapshotShadowV2HasOnlyExplicitRuntimeConsumers(t *testing.T) {
 		"package store\nfunc injected() { alias := loadApprovedDefinitionVersionTx; _ = alias }\n",
 		"package store\nfunc injected(s *Store) { _ = s.GetAdaptiveStateForDefinition }\n",
 		"package store\nfunc injected(s *Store) { _ = s.GetSchedulePlaybook }\n",
-		"package store\nfunc injected(s *Store) { alias := s.ListDueSourcesByUser; _ = alias }\n",
 		"package store\nfunc injected() { _ = `SELECT * FROM audit_unapproved_table` }\n",
 	} {
 		if violations := retainedV2CurrentStateViolations([]byte(source)); len(violations) == 0 {
@@ -665,26 +664,23 @@ func retainedV2CurrentStateViolations(source []byte) []string {
 		return []string{"parse_error"}
 	}
 	forbiddenTables := []string{
-		"schedules", "schedule_playbooks", "schedule_sources", "subscriptions",
-		"sources", "task_approved_definition_versions", "task_adaptive_states",
+		"schedules", "schedule_playbooks", "task_fetch_targets",
+		"fetch_targets", "task_approved_definition_versions", "task_adaptive_states",
 	}
 	forbiddenHelpers := map[string]bool{
-		"loadTaskRunDefinition":                 true,
-		"loadApprovedTaskRunSources":            true,
-		"loadLegacyTaskRunSources":              true,
-		"GetSchedule":                           true,
-		"GetScheduleStrictness":                 true,
-		"GetSchedulePlaybook":                   true,
-		"ListDueSourcesBySchedule":              true,
-		"ListDueSourcesByUser":                  true,
-		"ListSubscribedSourcesByUser":           true,
-		"ListDueSourcesByIDs":                   true,
-		"GetCurrentApprovedDefinition":          true,
-		"GetApprovedDefinitionVersion":          true,
-		"GetAdaptiveStateForDefinition":         true,
-		"loadApprovedDefinitionVersionTx":       true,
-		"loadApprovedDefinitionByApprovalRefTx": true,
-		"loadAdaptiveStateTx":                   true,
+		"loadTaskRunDefinition":                  true,
+		"loadApprovedTaskRunSources":             true,
+		"loadLegacyTaskRunSources":               true,
+		"GetSchedule":                            true,
+		"GetScheduleStrictness":                  true,
+		"GetSchedulePlaybook":                    true,
+		"ListDueFetchTargetsByTask":              true,
+		"GetCurrentApprovedDefinition":           true,
+		"GetApprovedDefinitionVersion":           true,
+		"GetAdaptiveStateForDefinition":          true,
+		"loadApprovedDefinitionVersionTx":        true,
+		"loadApprovedDefinitionByOperationRefTx": true,
+		"loadAdaptiveStateTx":                    true,
 	}
 	var violations []string
 	sqlTable := regexp.MustCompile(`(?i)\b(?:from|join)\s+([a-z_][a-z0-9_]*)`)

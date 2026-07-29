@@ -319,7 +319,7 @@ func (s *Store) reconcileTaskDefinitionBaseline(
 
 	record, err := insertInitialApprovedDefinitionTx(
 		ctx, tx, definition, payload, digest,
-		taskDefinitionBaselineApprovalRef(scope), head)
+		taskDefinitionBaselineOperationRef(scope), head)
 	if err != nil {
 		return TaskDefinitionBaselineResult{}, err
 	}
@@ -399,7 +399,7 @@ func taskDefinitionBaselineMatureTx(
 	return mature, nil
 }
 
-func taskDefinitionBaselineApprovalRef(
+func taskDefinitionBaselineOperationRef(
 	scope TaskDefinitionBaselineCursor,
 ) string {
 	return fmt.Sprintf("%s:%d:%d:%s", taskDefinitionBaselineApprovalV1,
@@ -458,8 +458,8 @@ func buildTaskDefinitionBaselineV1Tx(
 	linkedIDs := make(map[string]int64)
 	rows, err := tx.Query(ctx,
 		`SELECT src.url, src.id
-		   FROM schedule_sources ss
-		   JOIN sources src ON src.id=ss.source_id
+		   FROM task_fetch_targets ss
+		   JOIN fetch_targets src ON src.id=ss.fetch_target_id
 		  WHERE ss.schedule_id=$1
 		  ORDER BY src.url, src.id
 		  FOR SHARE OF ss, src`,
@@ -501,24 +501,20 @@ func buildTaskDefinitionBaselineV1Tx(
 	sourceScope := taskstate.SourceScopeApprovedPlan
 	approvedSources := make([]taskstate.ApprovedSourceV1, 0, len(linkedIDs))
 	if len(planObject) == 0 {
-		if len(linkedIDs) != 0 {
-			return taskstate.ApprovedDefinitionV1{},
-				TaskDefinitionBaselineReasonProjection, nil
-		}
-		sourceScope = taskstate.SourceScopeLegacySubscriptions
-		fetchPlan = json.RawMessage("{}")
+		return taskstate.ApprovedDefinitionV1{},
+			TaskDefinitionBaselineReasonProjection, nil
 	} else {
-		var legacyPlan legacyFetchPlanProjectionV1
-		if err := strictjson.Decode(fetchPlan, &legacyPlan); err != nil ||
-			legacyPlan.Sources == nil ||
-			len(legacyPlan.Sources) != len(linkedIDs) {
+		var currentPlan currentFetchPlanProjection
+		if err := strictjson.Decode(fetchPlan, &currentPlan); err != nil ||
+			currentPlan.Targets == nil ||
+			len(currentPlan.Targets) != len(linkedIDs) {
 			return taskstate.ApprovedDefinitionV1{},
 				TaskDefinitionBaselineReasonProjection, nil
 		}
 		plan := taskstate.FetchPlanV1{
-			Sources: make([]taskstate.PlanSourceV1, 0, len(legacyPlan.Sources)),
+			Sources: make([]taskstate.PlanSourceV1, 0, len(currentPlan.Targets)),
 		}
-		for _, source := range legacyPlan.Sources {
+		for _, source := range currentPlan.Targets {
 			config := source.Config
 			if len(config) == 0 {
 				config = json.RawMessage("{}")

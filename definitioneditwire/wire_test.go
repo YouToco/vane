@@ -50,9 +50,53 @@ func TestDecodeFrozenProposal_CanonicalBindings(t *testing.T) {
 	}
 }
 
+func TestDecodeFrozenProposal_RetainsLegacyV1ApprovalRefReader(t *testing.T) {
+	fixture, currentRaw := loadFixture(t)
+	var current ProposalV2
+	if err := json.Unmarshal(currentRaw, &current); err != nil {
+		t.Fatal(err)
+	}
+	legacyRaw := mustMarshal(t, legacyProposalV1{
+		WireVersion: proposalWireVersionV1,
+		OperationID: current.OperationID,
+		ApprovalRef: current.OperationRef,
+		Actor: legacyProposalActorV1{
+			TenantID: current.Actor.TenantID,
+			UserID:   current.Actor.UserID,
+		},
+		Target: legacyProposalTargetV1{
+			TenantID: current.Target.TenantID,
+			UserID:   current.Target.UserID,
+			TaskID:   current.Target.TaskID,
+		},
+		SessionID:              current.SessionID,
+		ExpiresAtUnixMicros:    current.ExpiresAtUnixMicros,
+		OriginalStatus:         current.OriginalStatus,
+		BaseHead:               current.BaseHead,
+		TargetHead:             current.TargetHead,
+		TargetDefinitionDigest: current.TargetDefinitionDigest,
+		PreparedEditDigest:     current.PreparedEditDigest,
+		BaseSnapshotDigest:     current.BaseSnapshotDigest,
+	})
+	frozen, err := DecodeFrozenProposal(
+		legacyRaw,
+		fixture.BaseDefinition,
+		fixture.TargetDefinition,
+		fixture.PreparedEdit,
+		fixture.BaseSnapshot,
+	)
+	if err != nil {
+		t.Fatalf("legacy proposal/v1 reader failed: %v", err)
+	}
+	if frozen.Proposal.WireVersion != proposalWireVersionV1 ||
+		frozen.Proposal.OperationRef != current.OperationRef {
+		t.Fatalf("legacy proposal was not normalized: %+v", frozen.Proposal)
+	}
+}
+
 func TestDecodeFrozenProposal_AcceptsTerminalPausedMarkerAfterActivation(t *testing.T) {
 	fixture, proposalRaw := loadFixture(t)
-	var proposal ProposalV1
+	var proposal ProposalV2
 	if err := json.Unmarshal(proposalRaw, &proposal); err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +154,7 @@ func TestDecodeFrozenProposal_AcceptsTerminalPausedMarkerAfterActivation(t *test
 
 func TestDecodeFrozenProposal_RejectsExactAndCrossSplicedWire(t *testing.T) {
 	fixture, proposalRaw := loadFixture(t)
-	var proposal ProposalV1
+	var proposal ProposalV2
 	if err := json.Unmarshal(proposalRaw, &proposal); err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +290,7 @@ func TestDecodePhaseSnapshotBytes_BindsExactPreparedRepresentation(t *testing.T)
 
 func TestDecodeFrozenProposal_RecomputesSemanticDigests(t *testing.T) {
 	fixture, proposalRaw := loadFixture(t)
-	var proposal ProposalV1
+	var proposal ProposalV2
 	if err := json.Unmarshal(proposalRaw, &proposal); err != nil {
 		t.Fatal(err)
 	}
@@ -487,15 +531,15 @@ func loadFixture(t *testing.T) (componentFixtureV1, []byte) {
 	if err := json.Unmarshal(fixture.PreparedEdit, &prepared); err != nil {
 		t.Fatalf("decode prepared fixture: %v", err)
 	}
-	proposal := ProposalV1{
-		WireVersion: proposalWireVersion,
-		OperationID: prepared.OperationID,
-		ApprovalRef: "approval-definition-edit-0001",
-		Actor: ProposalActorV1{
+	proposal := ProposalV2{
+		WireVersion:  proposalWireVersionV2,
+		OperationID:  prepared.OperationID,
+		OperationRef: "approval-definition-edit-0001",
+		Actor: ProposalActorV2{
 			TenantID: prepared.Creation.TenantID,
 			UserID:   prepared.Creation.UserID,
 		},
-		Target: ProposalTargetV1{
+		Target: ProposalTargetV2{
 			TenantID: prepared.Creation.TenantID,
 			UserID:   prepared.Creation.UserID,
 			TaskID:   prepared.Creation.TaskID,

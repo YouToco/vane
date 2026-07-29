@@ -27,8 +27,8 @@ func periodicCardReportFixture(t *testing.T) types.PeriodicBriefReportV1 {
 		Inputs: []types.PeriodicBriefInputV1{{
 			BriefID: 3, Digest: strings.Repeat("c", 64),
 		}},
-		RunOutcomeIDs: []int64{4},
-		OutcomeDigest: strings.Repeat("d", 64),
+		RunOutcomeIDs:  []int64{4},
+		OutcomeDigest:  strings.Repeat("d", 64),
 		GenerationMode: types.ExecutiveGenerationModel,
 		SourceCoverage: types.RunCompletenessComplete,
 		Processing:     types.RunCompletenessComplete,

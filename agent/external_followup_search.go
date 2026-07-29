@@ -156,7 +156,6 @@ func boundedExternalFollowupQuery(query string) (string, bool) {
 
 func eligibleExternalFollowupSearchSpec(spec ToolSpec) bool {
 	return spec.Name() == "web_search" &&
-		spec.Policy.Confirmation == ConfirmationNone &&
 		spec.Policy.Budget == BudgetToolManaged &&
 		spec.Policy.Effects.Has(EffectNetworkRead) &&
 		spec.Policy.Effects.Has(EffectBillable) &&

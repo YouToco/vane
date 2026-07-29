@@ -20,7 +20,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/YouToco/vane/sourcespec"
+	"github.com/YouToco/vane/fetchspec"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -32,22 +32,6 @@ type taskDefinitionStateFixture struct {
 	taskID     string
 	sourceID   int64
 	definition taskstate.ApprovedDefinitionV1
-}
-
-// historicalCompiledPlanFixture is deliberately test-owned rather than an
-// alias of either the current A2 writer or the frozen C2 adapter. If either
-// production shape drifts, this fixture keeps exercising the bytes that were
-// already persisted before C2.
-type historicalCompiledPlanFixture struct {
-	Sources []historicalCompiledSourceFixture `json:"sources"`
-}
-
-type historicalCompiledSourceFixture struct {
-	Platform   string          `json:"platform"`
-	Capability string          `json:"capability"`
-	Title      string          `json:"title,omitempty"`
-	URL        string          `json:"url"`
-	Config     json.RawMessage `json:"config,omitempty"`
 }
 
 func newTaskDefinitionStateFixture(t *testing.T) taskDefinitionStateFixture {
@@ -67,20 +51,20 @@ func newTaskDefinitionStateFixture(t *testing.T) taskDefinitionStateFixture {
 	base := newCompiledTaskFixture(t, st)
 	taskID := base.taskID()
 	query := "c2a-" + uuid.NewString()
-	source, message := sourcespec.Build(sourcespec.Spec{
+	source, message := fetchspec.BuildTarget(fetchspec.Requirement{
 		Platform: string(types.PlatformWeb), Capability: string(types.CapSearch),
 		Params: map[string]string{"query": query}, Title: "C2a approved search",
 	})
 	if message != "" || source == nil {
 		t.Fatalf("build source: %q", message)
 	}
-	planBytes, err := json.Marshal(historicalCompiledPlanFixture{
-		Sources: []historicalCompiledSourceFixture{{
+	planBytes, err := json.Marshal(compiledFetchPlan{
+		Targets: []compiledPlanTarget{{
 			Platform: string(source.Platform), Capability: string(source.Capability),
 			Title: source.Title, URL: source.URL, Config: source.Config,
 		}}})
 	if err != nil {
-		t.Fatalf("marshal legacy plan: %v", err)
+		t.Fatalf("marshal current fetch-target plan: %v", err)
 	}
 	legacyDefinition := types.PausedCompiledTaskDefinition{
 		TaskID: taskID, TenantID: base.tenantID, UserID: base.userID,
@@ -93,7 +77,7 @@ func newTaskDefinitionStateFixture(t *testing.T) taskDefinitionStateFixture {
 	}
 	var sourceID int64
 	if err := st.pool.QueryRow(t.Context(),
-		`SELECT source_id FROM schedule_sources WHERE schedule_id=$1`, taskID,
+		`SELECT fetch_target_id FROM task_fetch_targets WHERE schedule_id=$1`, taskID,
 	).Scan(&sourceID); err != nil {
 		t.Fatalf("load materialized source id: %v", err)
 	}
@@ -101,10 +85,10 @@ func newTaskDefinitionStateFixture(t *testing.T) taskDefinitionStateFixture {
 		ctx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(ctx, t, st,
-			`DELETE FROM schedule_sources WHERE schedule_id=$1 AND source_id=$2`,
+			`DELETE FROM task_fetch_targets WHERE schedule_id=$1 AND fetch_target_id=$2`,
 			taskID, sourceID)
 		cleanupExec(ctx, t, st,
-			`DELETE FROM sources WHERE id=$1`, sourceID)
+			`DELETE FROM fetch_targets WHERE id=$1`, sourceID)
 	})
 	exactPlan, err := json.Marshal(taskstate.FetchPlanV1{Sources: []taskstate.PlanSourceV1{{
 		Platform: source.Platform, Capability: source.Capability,
@@ -359,7 +343,7 @@ func advanceApprovedDefinitionForTest(
 	if _, err := f.store.pool.Exec(t.Context(), `
 		INSERT INTO task_approved_definition_versions (
 			tenant_id, user_id, task_id, version, schema_version,
-			execution_mode, definition_digest, payload, approval_ref
+			execution_mode, definition_digest, payload, operation_ref
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		f.tenantID, f.userID, f.taskID, version, definition.SchemaVersion,
 		definition.ExecutionMode, digest, payload,
@@ -425,23 +409,11 @@ func TestAdaptiveStateConcurrentDifferentCASHasOneWinner(t *testing.T) {
 	}
 }
 
-func TestAdaptiveStateRejectsLegacySubscriptionBasis(t *testing.T) {
-	f := newTaskDefinitionStateFixture(t)
-	ctx := t.Context()
+func TestCurrentApprovedDefinitionWriterRejectsLegacySubscriptionBasis(t *testing.T) {
 	taskID := "c2a-legacy-" + uuid.NewString()
 	const playbook = "继续兼容既有订阅，但尚未确认长期信源"
-	if err := f.store.InsertSchedule(ctx, &types.Schedule{
-		ID: taskID, UserID: f.userID, NLDescription: "存量订阅兼容任务",
-		SpecJSON:  json.RawMessage(`{"cron":"0 9 * * *"}`),
-		ScopeJSON: json.RawMessage(`{}`), Status: types.ScheduleStatusPaused,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if ok, err := f.store.UpsertSchedulePlaybook(ctx, f.userID, taskID, playbook); err != nil || !ok {
-		t.Fatalf("seed legacy playbook ok=%v err=%v", ok, err)
-	}
-	definition, err := taskstate.BuildApprovedDefinitionV1(taskstate.ApprovedDefinitionInputV1{
-		TenantID: f.tenantID, UserID: f.userID, TaskID: taskID,
+	_, err := taskstate.BuildApprovedDefinitionV1(taskstate.ApprovedDefinitionInputV1{
+		TenantID: 1, UserID: 1, TaskID: taskID,
 		Intent: playbook, NLDescription: "存量订阅兼容任务",
 		SpecJSON: json.RawMessage(`{"cron":"0 9 * * *"}`), ScopeJSON: json.RawMessage(`{}`),
 		PlaybookContent: playbook, SourceScope: taskstate.SourceScopeLegacySubscriptions,
@@ -450,27 +422,8 @@ func TestAdaptiveStateRejectsLegacySubscriptionBasis(t *testing.T) {
 		DeliveryPolicy: taskstate.DeliveryPolicyOwnerFeishu,
 		BudgetPolicy:   taskstate.BudgetPolicyInheritTenantQuota,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	approved, err := f.store.InsertInitialApprovedDefinition(
-		ctx, definition, "c2a-legacy:"+taskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state, err := taskstate.BuildAdaptiveStateV1(taskstate.AdaptiveStateInputV1{
-		TenantID: f.tenantID, UserID: f.userID, TaskID: taskID,
-		QueryVariants:   []taskstate.QueryVariantV1{},
-		CapabilityOrder: []taskstate.ReadCapabilityV1{}, SourceOrder: []int64{},
-		RunStats: taskstate.RunStatsV1{},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	basis := ApprovedDefinitionFence{Version: approved.Version, Digest: approved.Digest}
-	if _, err := f.store.CompareAndSwapAdaptiveState(
-		ctx, 0, basis, state, &approved.Version); !errors.Is(err, types.ErrValidation) {
-		t.Fatalf("legacy subscriptions adaptive/LKG error=%v, want Validation", err)
+	if !errors.Is(err, taskstate.ErrInvalidState) {
+		t.Fatalf("current writer accepted reader-only legacy subscription basis: %v", err)
 	}
 }
 
@@ -556,7 +509,7 @@ func TestTaskDefinitionBaselineAdapterDoesNotReuseCurrentPlanTypes(t *testing.T)
 	}
 	forbidden := map[string]struct{}{
 		"compiledFetchPlan":  {},
-		"compiledPlanSource": {},
+		"compiledPlanTarget": {},
 	}
 	sourceFiles := []string{
 		strings.TrimSuffix(thisFile, "_test.go") + ".go",
@@ -601,7 +554,7 @@ func TestTaskStatePayloadMutationIsDetectedOnRead(t *testing.T) {
 	row := approvedDefinitionTestRow{
 		version: 1, schemaVersion: taskstate.ApprovedDefinitionSchemaVersionV1,
 		mode: string(types.ExecutionModeCompiled), digest: created.Digest,
-		payload: mutated, approvalRef: created.ApprovalRef, createdAt: time.Now(),
+		payload: mutated, approvalRef: created.OperationRef, createdAt: time.Now(),
 	}
 	if _, err := scanApprovedDefinitionVersion(
 		row, f.tenantID, f.userID, f.taskID); !errors.Is(err, types.ErrInternal) {

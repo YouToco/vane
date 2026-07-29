@@ -24,9 +24,9 @@ var (
 )
 
 const (
-	PendingActionStatusExecuting PendingActionStatus = "executing"
-	PendingActionStatusBlocked   PendingActionStatus = "blocked"
-	PendingActionStatusFailed    PendingActionStatus = "failed"
+	TaskOperationStatusExecuting TaskOperationStatus = "executing"
+	TaskOperationStatusBlocked   TaskOperationStatus = "blocked"
+	TaskOperationStatusFailed    TaskOperationStatus = "failed"
 )
 
 // TaskCreationPhase is the monotonic checkpoint within a v1 create_schedule
@@ -82,16 +82,8 @@ type AcquireTaskCreationOperationParams struct {
 	ReceiptTarget   string
 }
 
-type CancelTaskCreationOperationParams struct {
-	ID              string
-	TenantID        int64
-	UserID          int64
-	ReceiptProvider string
-	ReceiptTarget   string
-}
-
 // CreateTaskCreationOperationParams is the explicit tenant/user boundary for
-// creating a v1 create_schedule confirmation. Status, tool name, execution
+// creating a v1 create_schedule operation. Status, tool name, execution
 // version, and all saga fields are Store-owned and cannot be supplied by a
 // caller. Args must be a strict JSON object (duplicate keys are rejected).
 type CreateTaskCreationOperationParams struct {
@@ -128,7 +120,7 @@ type TaskCreationOperation struct {
 	ToolName   string
 	Args       json.RawMessage
 	Summary    string
-	Status     PendingActionStatus
+	Status     TaskOperationStatus
 	ExpiresAt  time.Time
 	ExecutedAt *time.Time
 	CreatedAt  time.Time

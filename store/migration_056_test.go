@@ -374,7 +374,7 @@ func TestMigration056DownRefusesDurableFacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.Up(ctx); err != nil {
+	if _, err := provider.UpTo(ctx, 56); err != nil {
 		t.Fatal(err)
 	}
 	var tenantID, userID, sessionID int64
@@ -428,7 +428,25 @@ func TestMigration056EmptyOutboxDownConvergesWithAdmittedProducer(
 	defer cancel()
 	scratchURL, drop := createScratchDB(ctx, t, dbURL)
 	defer drop()
-	if err := Migrate(ctx, scratchURL); err != nil {
+	migrationDB, err := sql.Open("pgx", scratchURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrationProvider, err := goose.NewProvider(
+		goose.DialectPostgres, migrationDB, dir,
+		goose.WithAllowOutofOrder(true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrationProvider.UpTo(ctx, 56); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrationDB.Close(); err != nil {
 		t.Fatal(err)
 	}
 	st, err := New(ctx, scratchURL)
@@ -513,7 +531,7 @@ func TestMigration056EmptyOutboxDownConvergesWithAdmittedProducer(
 		t.Fatal(err)
 	}
 	defer db.Close()
-	dir, err := fs.Sub(migrationsFS, "migrations")
+	dir, err = fs.Sub(migrationsFS, "migrations")
 	if err != nil {
 		t.Fatal(err)
 	}

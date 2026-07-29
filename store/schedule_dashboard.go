@@ -1,5 +1,5 @@
 // 任务数据面查询（M7 功能 6.6/6.7）：任务详情页与任务列表页的任务级聚合读面。
-// 只读——本文件不写任何表；写路径在 push_batches.go / deliveries.go / schedule_sources.go。
+// 只读——本文件不写任何表；写路径在 push_batches.go / deliveries.go / task_fetch_targets.go。
 //
 // 归集口径（成本）：推送管道以 workflow 确定性 traceID 同时作为
 // push_batches.idempotency_key（CreatePushBatchIdempotent / RecordEmptyPushBatch）与
@@ -25,19 +25,6 @@ import (
 
 	"github.com/YouToco/vane/types"
 )
-
-// ScheduleSourceInfo 任务绑定信源的展示摘要。刻意不含 config：其中可能承载检索词等
-// 内部参数，详情页只需要“这是什么源、健康与否”；要看全量配置走信源管理页。
-type ScheduleSourceInfo struct {
-	ID            int64      `json:"id"`
-	Platform      string     `json:"platform"`
-	Capability    string     `json:"capability"`
-	URL           string     `json:"url"`
-	Title         string     `json:"title"`
-	Status        string     `json:"status"`
-	FailCount     int        `json:"fail_count"`
-	LastFetchedAt *time.Time `json:"last_fetched_at,omitempty"`
-}
 
 // ScheduleBatchItem 任务的一次运行（push_batches 行 + 投递计数）。
 // Status/ExitGate 语义见 types.BatchStatus / types.BatchExitGate：status 是结局，
@@ -68,7 +55,6 @@ type ScheduleRunSummary struct {
 	Batches7d      int64      `json:"batches_7d"`
 	EmptyBatches7d int64      `json:"empty_batches_7d"`
 	SentPushes7d   int64      `json:"sent_pushes_7d"`
-	SourceCount    int64      `json:"source_count"`
 }
 
 // ScheduleRunCost 任务运行 LLM 成本（口径见文件头注释：仅推送管道运行，trace 归集；
@@ -76,41 +62,6 @@ type ScheduleRunSummary struct {
 type ScheduleRunCost struct {
 	LLMCostUSD float64 `json:"llm_cost_usd"`
 	LLMCalls   int64   `json:"llm_calls"`
-}
-
-// ListScheduleSourceInfos 返回某任务绑定信源的展示摘要（归属校验进 WHERE，沿用
-// ListScheduleSourceIDs 先例）。任务不存在/非本人 → 空切片，与该方法口径一致；
-// “任务存在与否”的 404 语义由调用方先 GetSchedule 把关。
-func (s *Store) ListScheduleSourceInfos(ctx context.Context, userID int64, scheduleID string) ([]ScheduleSourceInfo, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT src.id, src.platform, src.capability, src.url, src.title, src.status,
-		        src.fail_count, src.last_fetched_at
-		   FROM schedule_sources ss
-		   JOIN sources src ON src.id = ss.source_id
-		   JOIN schedules s ON s.id = ss.schedule_id
-		  WHERE ss.schedule_id = $1 AND s.user_id = $2
-		    AND `+matureSchedulePredicate+`
-		  ORDER BY src.id`,
-		scheduleID, userID)
-	if err != nil {
-		return nil, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("查询任务信源摘要（schedule_id=%s）", scheduleID), err)
-	}
-	defer rows.Close()
-
-	var out []ScheduleSourceInfo
-	for rows.Next() {
-		var info ScheduleSourceInfo
-		if err := rows.Scan(&info.ID, &info.Platform, &info.Capability, &info.URL,
-			&info.Title, &info.Status, &info.FailCount, &info.LastFetchedAt); err != nil {
-			return nil, types.NewAppError(types.CodeDatabase, "扫描任务信源摘要行", err)
-		}
-		out = append(out, info)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "遍历任务信源摘要结果集", err)
-	}
-	return out, nil
 }
 
 // ListScheduleBatches 按任务倒序返回运行历史（push_batches + 每批投递计数）。
@@ -193,8 +144,7 @@ SELECT s.id,
        (SELECT count(*) FROM deliveries d
           JOIN push_batches pb ON pb.id = d.batch_id
          WHERE pb.schedule_id = s.id AND d.status = $3
-           AND d.created_at >= now() - interval '7 days'),
-       (SELECT count(*) FROM schedule_sources ss WHERE ss.schedule_id = s.id)
+           AND d.created_at >= now() - interval '7 days')
   FROM schedules s
   LEFT JOIN LATERAL (
        SELECT pb.created_at, pb.status, pb.exit_gate
@@ -208,7 +158,7 @@ SELECT s.id,
 
 func scanScheduleRunSummary(row pgx.Row, sum *ScheduleRunSummary) error {
 	return row.Scan(&sum.ScheduleID, &sum.LastRunAt, &sum.LastStatus, &sum.LastExitGate,
-		&sum.Batches7d, &sum.EmptyBatches7d, &sum.SentPushes7d, &sum.SourceCount)
+		&sum.Batches7d, &sum.EmptyBatches7d, &sum.SentPushes7d)
 }
 
 // ListScheduleRunSummaries 返回该用户全部可见任务的运行概览（列表页 6.7 的数据面），

@@ -2,7 +2,7 @@
 //
 // 为什么是「生成后提交」而不是运行时拉取：注册表是 agent 工具面的一部分，必须随二进制
 // 确定性发布——上游 spec 变更（加端点/改描述）只能经 re-gen + code review 进入生产，
-// 不能让上游一次 spec 发布静默改变 agent 能调用什么（与 sourcecatalog「能力变更必须过
+// 不能让上游一次 spec 发布静默改变 agent 能调用什么（与 capabilitycatalog「能力变更必须过
 // 代码评审」同一价值观）。刷新方式：
 //
 //	go run ./tikhubcatalog/gen -spec <openapi.json 本地路径> -out tikhubcatalog/catalog.json

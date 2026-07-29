@@ -57,14 +57,14 @@ type countingCompiledFetcher struct {
 	fetchCalls    atomic.Int32
 }
 
-func (f *countingCompiledFetcher) Fetch(context.Context, types.Source) ([]types.ContentItem, error) {
+func (f *countingCompiledFetcher) Fetch(context.Context, types.FetchTarget) ([]types.ContentItem, error) {
 	f.fetchCalls.Add(1)
 	return nil, errors.New("legacy fetch must not be called during PrepareRun")
 }
 
 func (f *countingCompiledFetcher) ValidateRuntimeFetchRouteV1(
 	capability runtimepolicy.CapabilityV1,
-	source types.Source,
+	source types.FetchTarget,
 ) error {
 	f.validateCalls.Add(1)
 	return f.inner.ValidateRuntimeFetchRouteV1(capability, source)
@@ -72,7 +72,7 @@ func (f *countingCompiledFetcher) ValidateRuntimeFetchRouteV1(
 
 func (f *countingCompiledFetcher) FetchWithPolicyV1(
 	context.Context,
-	types.Source,
+	types.FetchTarget,
 	runtimepolicy.CapabilityV1,
 	func(context.Context) error,
 ) ([]types.ContentItem, error) {
@@ -80,13 +80,13 @@ func (f *countingCompiledFetcher) FetchWithPolicyV1(
 	return nil, errors.New("compiled fetch must not be called during PrepareRun")
 }
 
-func (*compiledRouteFetcherFake) Fetch(context.Context, types.Source) ([]types.ContentItem, error) {
+func (*compiledRouteFetcherFake) Fetch(context.Context, types.FetchTarget) ([]types.ContentItem, error) {
 	return nil, errors.New("legacy fetch must not be called")
 }
 
 func (f *compiledRouteFetcherFake) ValidateRuntimeFetchRouteV1(
 	runtimepolicy.CapabilityV1,
-	types.Source,
+	types.FetchTarget,
 ) error {
 	f.validateCalls.Add(1)
 	return f.validateErr
@@ -94,7 +94,7 @@ func (f *compiledRouteFetcherFake) ValidateRuntimeFetchRouteV1(
 
 func (f *compiledRouteFetcherFake) FetchWithPolicyV1(
 	context.Context,
-	types.Source,
+	types.FetchTarget,
 	runtimepolicy.CapabilityV1,
 	func(context.Context) error,
 ) ([]types.ContentItem, error) {
@@ -140,7 +140,7 @@ type compiledRunStoreFake struct {
 	auditErr               error
 	auditBlock             bool
 
-	dueSources         []types.Source
+	dueSources         []types.FetchTarget
 	candidates         []types.ContentItem
 	attributionID      int64
 	attributionOK      bool
@@ -670,7 +670,7 @@ func (f *compiledRunStoreFake) UpsertContentItemForTaskRunV1(
 	return int64(f.fetchUpserts), true, nil
 }
 
-func (f *compiledRunStoreFake) UpdateSourceFetchStateForTaskRunV1(
+func (f *compiledRunStoreFake) UpdateFetchTargetStateForTaskRunV1(
 	_ context.Context,
 	_ types.RunIdentity,
 	_ types.RunSnapshotRef,
@@ -692,7 +692,7 @@ func (f *compiledRunStoreFake) UpdateSourceFetchStateForTaskRunV1(
 	return true, nil
 }
 
-func (f *compiledRunStoreFake) DisableSourceIfActiveForTaskRunV1(
+func (f *compiledRunStoreFake) DisableFetchTargetIfActiveForTaskRunV1(
 	_ context.Context,
 	_ types.RunIdentity,
 	_ types.RunSnapshotRef,
@@ -896,11 +896,11 @@ func (f *compiledRunStoreFake) MarkDeliverySentForTaskRunV1(
 	return f.deliveryReceiptErr
 }
 
-func (f *compiledRunStoreFake) ListDueSourcesByIDs(_ context.Context, ids []int64) ([]types.Source, error) {
+func (f *compiledRunStoreFake) ListDueFetchTargetsByIDs(_ context.Context, ids []int64) ([]types.FetchTarget, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.dueSourceIDs = append(f.dueSourceIDs, append([]int64(nil), ids...))
-	return append([]types.Source(nil), f.dueSources...), nil
+	return append([]types.FetchTarget(nil), f.dueSources...), nil
 }
 
 func (f *compiledRunStoreFake) ListUnpushedForTaskRunV1(
@@ -916,7 +916,7 @@ func (f *compiledRunStoreFake) ListUnpushedForTaskRunV1(
 	return append([]types.ContentItem(nil), f.candidates...), nil
 }
 
-func (f *compiledRunStoreFake) SourceForContentFromIDs(
+func (f *compiledRunStoreFake) FetchTargetForContentFromIDs(
 	_ context.Context,
 	_ int64,
 	ids []int64,
@@ -2581,11 +2581,11 @@ func (s *effectCountingStore) UpsertContentItem(ctx context.Context, item *types
 	return s.fakeStore.UpsertContentItem(ctx, item)
 }
 
-func (s *effectCountingStore) UpdateSourceFetchState(ctx context.Context, id int64, last, next time.Time, failCount int) error {
+func (s *effectCountingStore) UpdateFetchTargetState(ctx context.Context, id int64, last, next time.Time, failCount int) error {
 	s.muEffects.Lock()
 	s.updates++
 	s.muEffects.Unlock()
-	return s.fakeStore.UpdateSourceFetchState(ctx, id, last, next, failCount)
+	return s.fakeStore.UpdateFetchTargetState(ctx, id, last, next, failCount)
 }
 
 func (s *effectCountingStore) CreatePushBatchIdempotent(ctx context.Context, userID int64, key, taskID string) (int64, error) {
@@ -2616,11 +2616,11 @@ func (s *effectCountingStore) UpdatePushBatchStatus(ctx context.Context, id int6
 	return s.fakeStore.UpdatePushBatchStatus(ctx, id, status)
 }
 
-func (s *effectCountingStore) GetSource(ctx context.Context, id int64) (*types.Source, error) {
+func (s *effectCountingStore) GetFetchTarget(ctx context.Context, id int64) (*types.FetchTarget, error) {
 	s.muEffects.Lock()
 	s.getSource++
 	s.muEffects.Unlock()
-	return s.fakeStore.GetSource(ctx, id)
+	return s.fakeStore.GetFetchTarget(ctx, id)
 }
 
 func (s *effectCountingStore) effectCounts() (upserts, updates, batches, inserts, marks, statuses, getSource int) {
@@ -2631,8 +2631,8 @@ func (s *effectCountingStore) effectCounts() (upserts, updates, batches, inserts
 
 type sourceCaptureFetcher struct {
 	mu              sync.Mutex
-	legacySources   []types.Source
-	compiledSources []types.Source
+	legacySources   []types.FetchTarget
+	compiledSources []types.FetchTarget
 	capabilities    []runtimepolicy.CapabilityV1
 	legacyRuns      []capturedBindingRunAttribution
 	compiledRuns    []capturedBindingRunAttribution
@@ -2651,18 +2651,18 @@ type gatedSequenceFetcher struct {
 
 func (*gatedSequenceFetcher) ValidateRuntimeFetchRouteV1(
 	runtimepolicy.CapabilityV1,
-	types.Source,
+	types.FetchTarget,
 ) error {
 	return nil
 }
 
-func (*gatedSequenceFetcher) Fetch(context.Context, types.Source) ([]types.ContentItem, error) {
+func (*gatedSequenceFetcher) Fetch(context.Context, types.FetchTarget) ([]types.ContentItem, error) {
 	return nil, errors.New("legacy fetch must not be called")
 }
 
 func (f *gatedSequenceFetcher) FetchWithPolicyV1(
 	ctx context.Context,
-	_ types.Source,
+	_ types.FetchTarget,
 	_ runtimepolicy.CapabilityV1,
 	beforeEffect func(context.Context) error,
 ) ([]types.ContentItem, error) {
@@ -2677,7 +2677,7 @@ func (f *gatedSequenceFetcher) FetchWithPolicyV1(
 	return nil, nil
 }
 
-func (f *sourceCaptureFetcher) Fetch(ctx context.Context, source types.Source) ([]types.ContentItem, error) {
+func (f *sourceCaptureFetcher) Fetch(ctx context.Context, source types.FetchTarget) ([]types.ContentItem, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.legacySources = append(f.legacySources, source)
@@ -2687,7 +2687,7 @@ func (f *sourceCaptureFetcher) Fetch(ctx context.Context, source types.Source) (
 
 func (f *sourceCaptureFetcher) FetchWithPolicyV1(
 	ctx context.Context,
-	source types.Source,
+	source types.FetchTarget,
 	capability runtimepolicy.CapabilityV1,
 	_ func(context.Context) error,
 ) ([]types.ContentItem, error) {
@@ -2709,16 +2709,16 @@ func captureBindingRunAttribution(ctx context.Context) capturedBindingRunAttribu
 
 func (*sourceCaptureFetcher) ValidateRuntimeFetchRouteV1(
 	runtimepolicy.CapabilityV1,
-	types.Source,
+	types.FetchTarget,
 ) error {
 	return nil
 }
 
-func (f *sourceCaptureFetcher) snapshot() (legacy, compiled []types.Source, capabilities []runtimepolicy.CapabilityV1) {
+func (f *sourceCaptureFetcher) snapshot() (legacy, compiled []types.FetchTarget, capabilities []runtimepolicy.CapabilityV1) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]types.Source(nil), f.legacySources...),
-		append([]types.Source(nil), f.compiledSources...),
+	return append([]types.FetchTarget(nil), f.legacySources...),
+		append([]types.FetchTarget(nil), f.compiledSources...),
 		append([]runtimepolicy.CapabilityV1(nil), f.capabilities...)
 }
 
@@ -2778,15 +2778,15 @@ func TestFetch_CompiledRunUsesFrozenSourcesAndCandidates(t *testing.T) {
 	compiledStore := &compiledRunStoreFake{
 		snapshot:  snapshot,
 		authorize: true,
-		dueSources: []types.Source{{
-			ID: 10, Platform: types.PlatformXHS, Capability: types.CapSearch,
-			Title: "MUTATED SOURCE", URL: "https://mutated.invalid", Config: json.RawMessage(`{"mutated":true}`),
+		dueSources: []types.FetchTarget{{
+			ID: 10, Platform: types.PlatformWeb, Capability: types.CapFeed,
+			Title: "MUTATED DISPLAY TITLE", URL: "https://frozen.example/feed", Config: json.RawMessage(`{"frozen":true}`),
 			FetchIntervalSeconds: 60,
 		}},
 		candidates: []types.ContentItem{{ID: 501, SourceID: 10, Title: "frozen candidate"}},
 	}
 	legacyStore := &effectCountingStore{fakeStore: &fakeStore{
-		dueSources: []types.Source{{ID: 99, Title: "LEGACY CANARY"}},
+		dueSources: []types.FetchTarget{{ID: 99, Title: "LEGACY CANARY"}},
 		unpushed:   []types.ContentItem{{ID: 999, Title: "legacy candidate"}},
 	}}
 	fetcher := &sourceCaptureFetcher{items: []types.ContentItem{{
@@ -2855,8 +2855,51 @@ func TestFetch_CompiledRunUsesFrozenSourcesAndCandidates(t *testing.T) {
 	}
 }
 
-func TestFetch_LegacyRunAttributionDoesNotInventTenant(t *testing.T) {
-	legacyStore := &fakeStore{dueSources: []types.Source{{
+func TestFetch_CompiledAcquisitionDriftStopsBeforePaidFetch(t *testing.T) {
+	identity, ref, snapshot := compiledActivityFixture("Frozen Task")
+	compiledStore := &compiledRunStoreFake{
+		snapshot: snapshot, authorize: true,
+		dueSources: []types.FetchTarget{{
+			ID: 10, Platform: types.PlatformWeb, Capability: types.CapFeed,
+			URL:                  "https://frozen.example/feed",
+			Config:               json.RawMessage(`{"frozen":false}`),
+			FetchIntervalSeconds: 60,
+		}},
+	}
+	fetcher := new(sourceCaptureFetcher)
+	a := NewActivities(
+		fetcher, fakeScorer{}, fakeCardGen{}, &fakePusher{},
+		&effectCountingStore{fakeStore: new(fakeStore)}, fakeFeishu{},
+		nil, nil, nil, nil,
+		WithCompiledRuntimeV1(compiledStore,
+			func(context.Context, int64, bool) (runtimepolicy.BundleV1, error) {
+				return runtimepolicy.BundleV1{}, nil
+			},
+			new(compiledModelResolverFake)),
+	)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.Fetch)
+	if _, err := executeFetchActivity(t, env, a, PushParams{
+		TenantID: identity.TenantID, UserID: identity.UserID,
+		RunKind: PushRunKindScheduled, ScheduleID: identity.TaskID,
+		Snapshot: &ref,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	legacy, compiled, _ := fetcher.snapshot()
+	if len(legacy)+len(compiled) != 0 {
+		t.Fatal("drifted acquisition identity reached the paid fetcher")
+	}
+	compiledStore.mu.Lock()
+	defer compiledStore.mu.Unlock()
+	if compiledStore.fetchStateWrites != 0 || compiledStore.fetchUpserts != 0 {
+		t.Fatal("drifted acquisition identity produced fetch bookkeeping")
+	}
+}
+
+func TestFetch_AccountWideLegacyRunIsRejected(t *testing.T) {
+	legacyStore := &fakeStore{dueSources: []types.FetchTarget{{
 		ID: 17, Platform: types.PlatformWeb, Capability: types.CapSearch,
 		FetchIntervalSeconds: 60,
 	}}}
@@ -2868,16 +2911,12 @@ func TestFetch_LegacyRunAttributionDoesNotInventTenant(t *testing.T) {
 
 	if _, err := executeFetchActivity(t, env, a, PushParams{
 		UserID: 9, RunKind: PushRunKindAdHoc,
-	}); err != nil {
-		t.Fatalf("legacy Fetch failed: %v", err)
+	}); err == nil {
+		t.Fatal("account-wide legacy fetch must be rejected")
 	}
 	legacyRuns, compiledRuns := fetcher.runAttributions()
-	if len(legacyRuns) != 1 || len(compiledRuns) != 0 {
+	if len(legacyRuns) != 0 || len(compiledRuns) != 0 {
 		t.Fatalf("fetch run attributions legacy=%+v compiled=%+v", legacyRuns, compiledRuns)
-	}
-	gotRun := legacyRuns[0]
-	if gotRun.traceID != testActivityWorkflowID || gotRun.hasTenant || gotRun.tenantID != 0 || gotRun.hasUser {
-		t.Fatalf("legacy fetch invented immutable run attribution: %+v", gotRun)
 	}
 }
 
@@ -2886,8 +2925,10 @@ func TestFetch_CompiledRevocationStopsBeforePaidFetchAndWrites(t *testing.T) {
 	compiledStore := &compiledRunStoreFake{
 		snapshot:  snapshot,
 		authorize: false,
-		dueSources: []types.Source{{
-			ID: 10, FetchIntervalSeconds: 60,
+		dueSources: []types.FetchTarget{{
+			ID: 10, Platform: types.PlatformWeb, Capability: types.CapFeed,
+			URL: "https://frozen.example/feed", Config: json.RawMessage(`{"frozen":true}`),
+			FetchIntervalSeconds: 60,
 		}},
 	}
 	legacyStore := &effectCountingStore{fakeStore: new(fakeStore)}
@@ -2925,8 +2966,9 @@ func TestFetch_CompiledRevocationBetweenFetcherEffectsPropagates(t *testing.T) {
 		// Source-loop precheck, first upstream call, then revoke before the
 		// fetcher's second upstream call.
 		authorizeScript: []bool{true, true, false},
-		dueSources: []types.Source{{
+		dueSources: []types.FetchTarget{{
 			ID: 10, Platform: types.PlatformWeb, Capability: types.CapFeed,
+			URL: "https://frozen.example/feed", Config: json.RawMessage(`{"frozen":true}`),
 			FetchIntervalSeconds: 60,
 		}},
 	}
@@ -3514,7 +3556,7 @@ func TestPush_CompiledRunUsesFrozenTaskTitleAndSourceAttribution(t *testing.T) {
 	}
 	_, _, _, _, _, _, getSource := legacyStore.effectCounts()
 	if getSource != 0 {
-		t.Fatalf("compiled Push consulted mutable GetSource %d times", getSource)
+		t.Fatalf("compiled Push consulted mutable GetFetchTarget %d times", getSource)
 	}
 	compiledStore.mu.Lock()
 	attributionIDs := append([][]int64(nil), compiledStore.attributionIDs...)

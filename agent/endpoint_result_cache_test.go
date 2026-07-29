@@ -156,7 +156,7 @@ func TestToolCountBudget(t *testing.T) {
 	// 按生产满配计数（endpoints + exa 都非 nil）：任一为 nil 会把静态面算小，
 	// 账单就对不上真实在场工具数（2026-07-20 web_search/read_page 入列教训——
 	// 加工具的人必须过这张账单，而账单必须按满配开）。
-	static := len(BuildTools(nil, nil, nil, nil, ep, nil, NewExaTools(nil, nil, nil, 0, 0)))
+	static := len(BuildTools(nil, nil, nil, ep, NewExaTools(nil, nil, nil, 0, 0)))
 	if got := static + maxActivatedEndpoints; got >= 30 {
 		t.Errorf("在场工具数 %d（静态 %d + 激活上限 %d）触及 30 工具退化线（RAG-MCP 证据，契约 §4.1）",
 			got, static, maxActivatedEndpoints)

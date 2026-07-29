@@ -11,15 +11,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/fetchspec"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/types"
 )
 
 var testCreationReceiptTarget = CreationReceiptTarget{
-	Provider: FeishuCardPatchReceiptProviderForApp("cli_task_test"),
-	Target:   "om_task_creation_test",
+	Provider: AgentAutoReceiptProvider,
+	Target:   "agent-session-test",
 }
 
 type creationSagaFakeStore struct {
@@ -42,7 +42,7 @@ type creationSagaFakeStore struct {
 	resolveTenantID          int64
 	resolveUserID            int64
 	resolveSourceIDs         []int64
-	resolveSources           map[int64]types.Source
+	resolveSources           map[int64]types.FetchTarget
 	resolveErr               error
 	membershipCalls          int
 	tenantCalls              int
@@ -72,7 +72,7 @@ func (s *creationSagaFakeStore) ResolveTaskCreationSources(
 	_ context.Context,
 	tenantID, userID int64,
 	sourceIDs []int64,
-) ([]types.Source, error) {
+) ([]types.FetchTarget, error) {
 	s.resolveCalls++
 	s.resolveTenantID = tenantID
 	s.resolveUserID = userID
@@ -80,7 +80,7 @@ func (s *creationSagaFakeStore) ResolveTaskCreationSources(
 	if s.resolveErr != nil {
 		return nil, s.resolveErr
 	}
-	resolved := make([]types.Source, 0, len(sourceIDs))
+	resolved := make([]types.FetchTarget, 0, len(sourceIDs))
 	for _, sourceID := range sourceIDs {
 		source, ok := s.resolveSources[sourceID]
 		if !ok {
@@ -118,51 +118,11 @@ func (s *creationSagaFakeStore) CreateTaskCreationOperation(
 	s.op = types.TaskCreationOperation{
 		ID: p.ID, TenantID: p.TenantID, UserID: p.UserID, SessionID: p.SessionID,
 		ToolName: "create_schedule", Args: bytes.Clone(p.Args), Summary: p.Summary,
-		Status: types.PendingActionStatusPending, ExpiresAt: p.ExpiresAt,
+		Status: types.TaskOperationStatusPending, ExpiresAt: p.ExpiresAt,
 		ExecutionVersion: types.TaskCreationExecutionVersionV1,
 	}
 	clone := s.op
 	return &clone, nil
-}
-
-func (s *creationSagaFakeStore) CancelTaskCreationOperation(
-	_ context.Context,
-	p types.CancelTaskCreationOperationParams,
-) (*types.TaskCreationOperation, error) {
-	if s.op.ID != p.ID || s.op.TenantID != p.TenantID || s.op.UserID != p.UserID ||
-		s.op.ExecutionVersion != types.TaskCreationExecutionVersionV1 {
-		return nil, types.ErrNotFound
-	}
-	if s.op.ReceiptProvider != "" &&
-		(s.op.ReceiptProvider != p.ReceiptProvider || s.op.ReceiptTarget != p.ReceiptTarget) {
-		return nil, types.ErrConflict
-	}
-	switch s.op.Status {
-	case types.PendingActionStatusCancelled:
-		clone := s.op
-		return &clone, nil
-	case types.PendingActionStatusExecuting:
-		if s.op.ReceiptProvider == "" && s.op.ReceiptTarget == "" {
-			s.op.ReceiptProvider = p.ReceiptProvider
-			s.op.ReceiptTarget = p.ReceiptTarget
-		} else if s.op.ReceiptProvider != p.ReceiptProvider ||
-			s.op.ReceiptTarget != p.ReceiptTarget {
-			return nil, types.ErrConflict
-		}
-		clone := s.op
-		return &clone, types.ErrTaskCreationBusy
-	case types.PendingActionStatusPending:
-		s.op.ReceiptProvider = p.ReceiptProvider
-		s.op.ReceiptTarget = p.ReceiptTarget
-		s.op.Status = types.PendingActionStatusCancelled
-		s.op.Phase = types.TaskCreationPhaseCancelled
-		now := time.Now()
-		s.op.TombstonedAt = &now
-		clone := s.op
-		return &clone, nil
-	default:
-		return nil, types.ErrTaskCreationTerminal
-	}
 }
 
 func (s *creationSagaFakeStore) AcquireTaskCreationOperation(
@@ -178,15 +138,15 @@ func (s *creationSagaFakeStore) AcquireTaskCreationOperation(
 		return nil, injectedErr
 	}
 	switch s.op.Status {
-	case types.PendingActionStatusPending:
+	case types.TaskOperationStatusPending:
 		s.op.ReceiptProvider = p.ReceiptProvider
 		s.op.ReceiptTarget = p.ReceiptTarget
-		s.op.Status = types.PendingActionStatusExecuting
+		s.op.Status = types.TaskOperationStatusExecuting
 		s.op.Phase = types.TaskCreationPhaseClaimed
 		s.op.LeaseOwner = p.LeaseOwner
 		s.op.Fence++
 		s.op.Attempt++
-	case types.PendingActionStatusExecuting:
+	case types.TaskOperationStatusExecuting:
 		if s.op.ReceiptProvider == "" && s.op.ReceiptTarget == "" &&
 			p.ReceiptProvider != "" && p.ReceiptTarget != "" {
 			s.op.ReceiptProvider = p.ReceiptProvider
@@ -315,7 +275,7 @@ func (s *creationSagaFakeStore) FinishTaskCreationCleanup(
 	_ context.Context,
 	lease types.TaskCreationLease,
 	_ string,
-	status types.PendingActionStatus,
+	status types.TaskOperationStatus,
 ) error {
 	if err := s.checkLease(lease); err != nil {
 		return err
@@ -345,7 +305,7 @@ func (s *creationSagaFakeStore) BlockTaskCreationOperationAfterSideEffect(
 	}
 	s.events = append(s.events, "block_side_effect")
 	s.op.ErrorCode, s.op.ErrorMessage = errorCode, errorMessage
-	s.op.Status = types.PendingActionStatusBlocked
+	s.op.Status = types.TaskOperationStatusBlocked
 	s.op.Phase = types.TaskCreationPhaseBlocked
 	now := time.Now()
 	s.op.TombstonedAt = &now
@@ -370,7 +330,7 @@ func (s *creationSagaFakeStore) CompleteTaskCreationOperation(
 		}
 	}
 	s.op.Result = bytes.Clone(result)
-	s.op.Status = types.PendingActionStatusExecuted
+	s.op.Status = types.TaskOperationStatusExecuted
 	s.op.Phase = types.TaskCreationPhaseCompleted
 	now := time.Now()
 	s.op.ExecutedAt = &now
@@ -538,13 +498,36 @@ func (s *creationSagaFakeScheduler) DeleteTask(
 	return nil
 }
 
+func mustCreateProposalArgs(
+	t *testing.T,
+	intent string,
+	description string,
+) json.RawMessage {
+	t.Helper()
+	return mustCreateArgsWithPlan(
+		t,
+		intent,
+		description,
+		json.RawMessage(`{
+			"fetch_requirements":{
+				"version":"vane.fetch-requirements/v1",
+				"items":[{
+					"kind":"web_search",
+					"query":"AI",
+					"category":"news"
+				}]
+			}
+		}`),
+	)
+}
+
 func TestCreationCoordinator_ProposalCanonicalizesBeforePersistence(t *testing.T) {
 	store := newCreationSagaFakeStore()
 	schedules := &creationSagaFakeScheduler{}
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 
-	proposal, err := coordinator.Propose(t.Context(), CreationProposalInput{
-		ActionID: "action-1", UserID: 11, RawArgs: mustCreateArgs(t, "每天寻找全球 AI 热点", "每天 AI"),
+	proposal, err := coordinator.Prepare(t.Context(), CreationProposalInput{
+		ActionID: "action-1", UserID: 11, RawArgs: mustCreateProposalArgs(t, "每天寻找全球 AI 热点", "每天 AI"),
 		ExpiresAt: time.Now().Add(time.Hour),
 	})
 	if err != nil {
@@ -560,19 +543,19 @@ func TestCreationCoordinator_ProposalCanonicalizesBeforePersistence(t *testing.T
 	}
 	command, _, err := normalizeCreateScheduleCommand(store.op.Args)
 	if err != nil || !bytes.Equal(command.ApprovedFetchPlan, json.RawMessage(
-		`{"sources":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"}}]}`,
+		`{"targets":[{"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"}}]}`,
 	)) {
 		t.Fatalf("durable canonical args invalid: command=%+v err=%v", command, err)
 	}
 }
 
-func TestCreationCoordinator_ProposalMaterializesVersionedSourceSpecsBeforePersistence(t *testing.T) {
+func TestCreationCoordinator_ProposalMaterializesVersionedFetchRequirementsBeforePersistence(t *testing.T) {
 	store := newCreationSagaFakeStore()
 	schedules := &creationSagaFakeScheduler{}
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	plan := json.RawMessage(`{
-		"source_specs":{
-			"version":"vane.source-specs/v1",
+		"fetch_requirements":{
+			"version":"vane.fetch-requirements/v1",
 			"items":[{
 				"kind":"web_search",
 				"query":"major AI model API pricing deprecation security updates",
@@ -584,8 +567,8 @@ func TestCreationCoordinator_ProposalMaterializesVersionedSourceSpecsBeforePersi
 		}
 	}`)
 
-	proposal, err := coordinator.Propose(t.Context(), CreationProposalInput{
-		ActionID: "action-source-specs", UserID: 11,
+	proposal, err := coordinator.Prepare(t.Context(), CreationProposalInput{
+		ActionID: "action-fetch-requirements", UserID: 11,
 		RawArgs: mustCreateArgsWithPlan(
 			t, "只监控三家公司官方确认的重大更新", "三家官方 AI 动态", plan,
 		),
@@ -595,11 +578,11 @@ func TestCreationCoordinator_ProposalMaterializesVersionedSourceSpecsBeforePersi
 		t.Fatalf("Propose: %v", err)
 	}
 	if store.createCalls != 1 || store.resolveCalls != 0 {
-		t.Fatalf("纯 source_specs 应直接物化且不读取现有信源: create=%d resolve=%d",
+		t.Fatalf("纯 fetch_requirements 应直接物化且不读取现有信源: create=%d resolve=%d",
 			store.createCalls, store.resolveCalls)
 	}
-	if bytes.Contains(store.op.Args, []byte("source_specs")) {
-		t.Fatalf("durable args 不得保存 transient source_specs: %s", store.op.Args)
+	if bytes.Contains(store.op.Args, []byte("fetch_requirements")) {
+		t.Fatalf("durable args 不得保存 transient fetch_requirements: %s", store.op.Args)
 	}
 	command, _, err := normalizeCreateScheduleCommand(store.op.Args)
 	if err != nil {
@@ -609,23 +592,23 @@ func TestCreationCoordinator_ProposalMaterializesVersionedSourceSpecsBeforePersi
 	if err := decodeStrictJSON(command.ApprovedFetchPlan, &frozen); err != nil {
 		t.Fatalf("decode frozen plan: %v", err)
 	}
-	if len(frozen.Sources) != 2 {
-		t.Fatalf("frozen sources=%d want=2: %s", len(frozen.Sources), command.ApprovedFetchPlan)
+	if len(frozen.Targets) != 2 {
+		t.Fatalf("frozen targets=%d want=2: %s", len(frozen.Targets), command.ApprovedFetchPlan)
 	}
-	search := frozen.Sources[0]
+	search := frozen.Targets[0]
 	if search.URL != "vane://web/search?q=major+AI+model+API+pricing+deprecation+security+updates&include_domains=anthropic.com%2Cdeepmind.google%2Copenai.com" ||
 		search.Title != "搜索: major AI model API pricing deprecation security updates" ||
 		string(search.Config) != `{"include_domains":["anthropic.com","deepmind.google","openai.com"],"query":"major AI model API pricing deprecation security updates"}` {
 		t.Fatalf("web_search 未确定性物化: %+v", search)
 	}
-	contents := frozen.Sources[1]
+	contents := frozen.Targets[1]
 	if contents.URL != "vane://web/contents?url=https%3A%2F%2Fai.google.dev%2Fgemini-api%2Fdocs%2Fchangelog" ||
 		contents.Title != "页面监控: https://ai.google.dev/gemini-api/docs/changelog" ||
 		string(contents.Config) != `{"url":"https://ai.google.dev/gemini-api/docs/changelog"}` {
 		t.Fatalf("web_contents 未确定性物化: %+v", contents)
 	}
 	for _, want := range []string{
-		"信息范围（2）",
+		"抓取目标（2）",
 		"搜索“major AI model API pricing deprecation security updates”",
 		"仅限 anthropic.com、deepmind.google、openai.com",
 		"页面 https://ai.google.dev/gemini-api/docs/changelog",
@@ -636,15 +619,15 @@ func TestCreationCoordinator_ProposalMaterializesVersionedSourceSpecsBeforePersi
 	}
 
 	// Confirm and every recovery pass consume only the already frozen durable
-	// plan. They must not decode source_specs or reinterpret the user's request.
+	// plan. They must not decode fetch_requirements or reinterpret the user's request.
 	frozenPlan := bytes.Clone(command.ApprovedFetchPlan)
-	result, err := coordinator.Confirm(
-		t.Context(), 11, "action-source-specs", testCreationReceiptTarget,
+	result, err := coordinator.Execute(
+		t.Context(), 11, "action-fetch-requirements", testCreationReceiptTarget,
 	)
-	if err != nil || result.Status != types.PendingActionStatusExecuted ||
+	if err != nil || result.Status != types.TaskOperationStatusExecuted ||
 		schedules.activateCalls != 1 ||
 		!bytes.Equal(store.definition.FetchPlan, frozenPlan) ||
-		bytes.Contains(store.definition.FetchPlan, []byte("source_specs")) {
+		bytes.Contains(store.definition.FetchPlan, []byte("fetch_requirements")) {
 		t.Fatalf("Confirm must execute the exact frozen plan: result=%+v err=%v activate=%d frozen=%s final=%s",
 			result, err, schedules.activateCalls, frozenPlan, store.definition.FetchPlan)
 	}
@@ -679,8 +662,8 @@ func TestCreationCoordinator_ProposalPreservesObservationPolicyAcrossCanonicalRe
 		"nl_description": "每周一上午 9 点检查 OpenAI API 重大更新",
 		"strictness":     "strict",
 		"approved_fetch_plan": map[string]any{
-			"source_specs": map[string]any{
-				"version": creationSourceSpecsVersion,
+			"fetch_requirements": map[string]any{
+				"version": creationFetchRequirementsVersion,
 				"items": []any{map[string]any{
 					"kind": "web_search", "query": "OpenAI API major updates",
 					"include_domains": []string{"openai.com"},
@@ -690,7 +673,7 @@ func TestCreationCoordinator_ProposalPreservesObservationPolicyAcrossCanonicalRe
 		"observation_policy": policy,
 	})
 
-	proposal, err := coordinator.Propose(t.Context(), CreationProposalInput{
+	proposal, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 		ActionID: "action-observation-policy", UserID: 11, RawArgs: raw,
 		ExpiresAt: time.Now().Add(time.Hour),
 	})
@@ -748,10 +731,10 @@ func TestCreationCoordinator_ProposalPreservesObservationPolicyAcrossCanonicalRe
 	}
 
 	store.op.CreatedAt = time.Date(2026, 7, 26, 9, 8, 21, 0, time.UTC)
-	result, err := coordinator.Confirm(
+	result, err := coordinator.Execute(
 		t.Context(), 11, "action-observation-policy", testCreationReceiptTarget,
 	)
-	if err != nil || result.Status != types.PendingActionStatusExecuted {
+	if err != nil || result.Status != types.TaskOperationStatusExecuted {
 		t.Fatalf("Confirm: result=%+v err=%v", result, err)
 	}
 	var scope compiledTaskScopeV1
@@ -766,12 +749,12 @@ func TestCreationCoordinator_ProposalPreservesObservationPolicyAcrossCanonicalRe
 	}
 }
 
-func TestCreationCoordinator_SourceSpecsRejectNonCanonicalObservationPolicyFields(t *testing.T) {
+func TestCreationCoordinator_FetchRequirementsRejectNonCanonicalObservationPolicyFields(t *testing.T) {
 	valid := json.RawMessage(`{
 		"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},
 		"intent":"监控官方更新",
-		"approved_fetch_plan":{"source_specs":{
-			"version":"vane.source-specs/v1",
+		"approved_fetch_plan":{"fetch_requirements":{
+			"version":"vane.fetch-requirements/v1",
 			"items":[{"kind":"web_search","query":"official updates"}]
 		}},
 		"observation_policy":{
@@ -817,7 +800,7 @@ func TestCreationCoordinator_SourceSpecsRejectNonCanonicalObservationPolicyField
 			coordinator := NewCreationCoordinator(
 				store, &creationSagaFakeScheduler{}, nil,
 			)
-			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+			_, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 				ActionID: "action-invalid-observation-field", UserID: 11,
 				RawArgs:   testCase.mutate(bytes.Clone(valid)),
 				ExpiresAt: time.Now().Add(time.Hour),
@@ -860,8 +843,8 @@ func TestSummarizeCreationObservationPolicy_RollingDurationIsExact(t *testing.T)
 	}
 }
 
-func TestCreationCoordinator_SourceSpecsAreStrictAtomicAndUnambiguous(t *testing.T) {
-	valid := `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","include_domains":["openai.com"]}]}}`
+func TestCreationCoordinator_FetchRequirementsAreStrictAtomicAndUnambiguous(t *testing.T) {
+	valid := `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","include_domains":["openai.com"]}]}}`
 	cases := []struct {
 		name string
 		plan string
@@ -869,97 +852,97 @@ func TestCreationCoordinator_SourceSpecsAreStrictAtomicAndUnambiguous(t *testing
 	}{
 		{
 			name: "wrong version",
-			plan: `{"source_specs":{"version":"vane.source-specs/v2","items":[{"kind":"web_search","query":"AI"}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v2","items":[{"kind":"web_search","query":"AI"}]}}`,
 			want: "version",
 		},
 		{
 			name: "case folded version key",
-			plan: `{"source_specs":{"VERSION":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
+			plan: `{"fetch_requirements":{"VERSION":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
 			want: "unknown exact field",
 		},
 		{
-			name: "case folded source specs key",
-			plan: `{"Source_Specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
-			want: "unknown field",
+			name: "case folded fetch requirements key",
+			plan: `{"Source_Specs":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
+			want: "unknown exact field",
 		},
 		{
-			name: "mixed with materialized sources",
+			name: "retired materialized sources field",
 			plan: strings.TrimSuffix(valid, "}") + `,"sources":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=A","config":{"query":"A"}}]}`,
-			want: "cannot be mixed",
+			want: "unknown exact field",
 		},
 		{
-			name: "null materialized sources cannot hide mixing",
-			plan: `{"sources":null,"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
-			want: "sources must be an array",
+			name: "retired null materialized sources field",
+			plan: `{"sources":null,"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
+			want: "unknown exact field",
 		},
 		{
-			name: "null source specs is not omission",
-			plan: `{"source_specs":null,"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=AI","config":{"query":"AI"}}]}`,
-			want: "source_specs must be an object",
+			name: "null fetch requirements is not omission",
+			plan: `{"fetch_requirements":null,"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=AI","config":{"query":"AI"}}]}`,
+			want: "unknown exact field",
 		},
 		{
 			name: "null existing ids is not omission",
-			plan: `{"existing_source_ids":null,"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
-			want: "existing_source_ids must be an array",
+			plan: `{"existing_source_ids":null,"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"}]}}`,
+			want: "existing_source_ids",
 		},
 		{
 			name: "unknown field",
-			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","config":{}}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","config":{}}]}}`,
 			want: "unknown exact field",
 		},
 		{
 			name: "duplicate inner key",
-			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","query":"crypto"}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","query":"crypto"}]}}`,
 			want: "duplicate",
 		},
 		{
 			name: "escaped discriminator key",
-			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"\u006bind":"web_search","query":"AI"}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"\u006bind":"web_search","query":"AI"}]}}`,
 			want: "canonical",
 		},
 		{
 			name: "case alias discriminator cannot collapse",
-			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","KIND":"web_contents","query":"AI"}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","KIND":"web_contents","query":"AI"}]}}`,
 			want: "unknown exact field",
 		},
 		{
 			name: "irrelevant field",
-			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_contents","page_url":"https://openai.com/news","query":"AI"}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_contents","page_url":"https://openai.com/news","query":"AI"}]}}`,
 			want: "unknown exact field",
 		},
 		{
 			name: "null include domains",
-			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","include_domains":null}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","include_domains":null}]}}`,
 			want: "include_domains must be an array",
 		},
 		{
 			name: "null feed categories",
-			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_feed","feed_url":"https://openai.com/news/rss.xml","categories":null}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_feed","feed_url":"https://openai.com/news/rss.xml","categories":null}]}}`,
 			want: "categories must be an array",
 		},
 		{
 			name: "ambiguous identity alternatives",
-			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"xhs_user_posts","user_id":"6a5578b3000000000e03cc00","profile_url":"https://www.xiaohongshu.com/user/profile/6a5578b3000000000e03cc00"}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"xhs_user_posts","user_id":"6a5578b3000000000e03cc00","profile_url":"https://www.xiaohongshu.com/user/profile/6a5578b3000000000e03cc00"}]}}`,
 			want: "exactly one",
 		},
 		{
 			name: "invalid xhs user id before any lookup",
-			plan: `{"existing_source_ids":[12],"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"xhs_faved_notes","user_id":"abc"}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"xhs_faved_notes","user_id":"abc"}]}}`,
 			want: "24 lowercase hexadecimal",
 		},
 		{
 			name: "invalid include domain",
-			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","include_domains":["https://openai.com/news"]}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","include_domains":["https://openai.com/news"]}]}}`,
 			want: "include_domains",
 		},
 		{
 			name: "one bad item rejects whole batch",
-			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"},{"kind":"web_contents","page_url":"http://127.0.0.1/private"}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"},{"kind":"web_contents","page_url":"http://127.0.0.1/private"}]}}`,
 			want: "network policy",
 		},
 		{
 			name: "canonical duplicate",
-			plan: `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI","include_domains":["OpenAI.com"]},{"kind":"web_search","query":"AI","include_domains":["openai.com"]}]}}`,
+			plan: `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI","include_domains":["OpenAI.com"]},{"kind":"web_search","query":"AI","include_domains":["openai.com"]}]}}`,
 			want: "duplicated",
 		},
 	}
@@ -967,7 +950,7 @@ func TestCreationCoordinator_SourceSpecsAreStrictAtomicAndUnambiguous(t *testing
 		t.Run(tc.name, func(t *testing.T) {
 			store := newCreationSagaFakeStore()
 			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
-			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+			_, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 				ActionID: "action-invalid-source-spec", UserID: 11,
 				RawArgs: mustCreateArgsWithPlan(
 					t, "监控官方更新", "官方更新", json.RawMessage(tc.plan),
@@ -985,13 +968,13 @@ func TestCreationCoordinator_SourceSpecsAreStrictAtomicAndUnambiguous(t *testing
 	}
 }
 
-func TestCreationCoordinator_SourceSpecsValidateCommonEnvelopeBeforeMaterializing(t *testing.T) {
+func TestCreationCoordinator_FetchRequirementsValidateCommonEnvelopeBeforeMaterializing(t *testing.T) {
 	plans := []json.RawMessage{
-		json.RawMessage(`{"source_specs":{"version":"bad","items":[]}}`),
-		json.RawMessage(`{"source_specs":{"version":"vane.source-specs/v1","items":[]}}`),
-		json.RawMessage(`{"existing_source_ids":"not-an-array","source_specs":{
-			"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`),
-		json.RawMessage(`{"source_specs":{"version":"vane.source-specs/v1","items":[{
+		json.RawMessage(`{"fetch_requirements":{"version":"bad","items":[]}}`),
+		json.RawMessage(`{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[]}}`),
+		json.RawMessage(`{"existing_source_ids":"not-an-array","fetch_requirements":{
+			"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"}]}}`),
+		json.RawMessage(`{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{
 			"kind":"web_search","query":"AI","include_domains":["https://openai.com"]
 		}]}}`),
 	}
@@ -1000,7 +983,7 @@ func TestCreationCoordinator_SourceSpecsValidateCommonEnvelopeBeforeMaterializin
 			store := newCreationSagaFakeStore()
 			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
 			raw := mustCreateArgsWithPlan(t, "   ", "无效意图", plan)
-			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+			_, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 				ActionID: "action-invalid-envelope-order", UserID: 11, RawArgs: raw,
 				ExpiresAt: time.Now().Add(time.Hour),
 			})
@@ -1016,8 +999,8 @@ func TestCreationCoordinator_SourceSpecsValidateCommonEnvelopeBeforeMaterializin
 	}
 }
 
-func TestCreationCoordinator_SourceSpecsRejectNullOptionalEnvelopeFields(t *testing.T) {
-	plan := `{"source_specs":{"version":"vane.source-specs/v1","items":[{"kind":"web_search","query":"AI"}]}}`
+func TestCreationCoordinator_FetchRequirementsRejectNullOptionalEnvelopeFields(t *testing.T) {
+	plan := `{"fetch_requirements":{"version":"vane.fetch-requirements/v1","items":[{"kind":"web_search","query":"AI"}]}}`
 	for _, tc := range []struct {
 		name  string
 		field string
@@ -1030,7 +1013,7 @@ func TestCreationCoordinator_SourceSpecsRejectNullOptionalEnvelopeFields(t *test
 			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
 			raw := json.RawMessage(`{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
 				`"intent":"监控官方更新","approved_fetch_plan":` + plan + `,` + tc.field + `}`)
-			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+			_, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 				ActionID: "action-null-envelope", UserID: 11, RawArgs: raw,
 				ExpiresAt: time.Now().Add(time.Hour),
 			})
@@ -1045,7 +1028,7 @@ func TestCreationCoordinator_SourceSpecsRejectNullOptionalEnvelopeFields(t *test
 	}
 }
 
-func TestMaterializeCreationSourceSpecs_CoversEveryAdvertisedKind(t *testing.T) {
+func TestMaterializeCreationFetchRequirements_CoversEveryAdvertisedKind(t *testing.T) {
 	const hexID = "6a5578b3000000000e03cc00"
 	cases := []struct {
 		name       string
@@ -1102,19 +1085,19 @@ func TestMaterializeCreationSourceSpecs_CoversEveryAdvertisedKind(t *testing.T) 
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := materializeCreationSourceSpecs(&createScheduleSourceSpecs{
-				Version: creationSourceSpecsVersion,
+			got, err := materializeCreationFetchRequirements(&createScheduleFetchRequirements{
+				Version: creationFetchRequirementsVersion,
 				Items:   []json.RawMessage{json.RawMessage(tc.item)},
 			})
 			if err != nil || len(got) != 1 || got[0].URL != tc.wantURL {
 				t.Fatalf("materialize=%+v err=%v want_url=%q", got, err, tc.wantURL)
 			}
-			source := &types.Source{
+			source := &types.FetchTarget{
 				Platform:   types.Platform(got[0].Platform),
 				Capability: types.Capability(got[0].Capability),
 				Title:      got[0].Title, URL: got[0].URL, Config: got[0].Config,
 			}
-			if message := sourcespec.ValidateMaterialized(source); message != "" {
+			if message := fetchspec.ValidateMaterialized(source); message != "" {
 				t.Fatalf("materialized source failed registry round-trip: source=%+v message=%q",
 					source, message)
 			}
@@ -1125,13 +1108,13 @@ func TestMaterializeCreationSourceSpecs_CoversEveryAdvertisedKind(t *testing.T) 
 	}
 }
 
-func TestMaterializeCreationSourceSpecs_ValidatesXHSUserIDs(t *testing.T) {
+func TestMaterializeCreationFetchRequirements_ValidatesXHSUserIDs(t *testing.T) {
 	const userID = "6a5578b3000000000e03cc00"
 	profileURL := "https://www.xiaohongshu.com/user/profile/" + userID
 	for _, kind := range []string{"xhs_user_posts", "xhs_faved_notes"} {
 		t.Run(kind+"/valid_direct_and_profile_url_match", func(t *testing.T) {
-			direct, err := materializeCreationSourceSpecs(&createScheduleSourceSpecs{
-				Version: creationSourceSpecsVersion,
+			direct, err := materializeCreationFetchRequirements(&createScheduleFetchRequirements{
+				Version: creationFetchRequirementsVersion,
 				Items: []json.RawMessage{json.RawMessage(
 					`{"kind":"` + kind + `","user_id":"` + userID + `"}`,
 				)},
@@ -1139,8 +1122,8 @@ func TestMaterializeCreationSourceSpecs_ValidatesXHSUserIDs(t *testing.T) {
 			if err != nil || len(direct) != 1 {
 				t.Fatalf("direct user_id materialization=%+v err=%v", direct, err)
 			}
-			profile, err := materializeCreationSourceSpecs(&createScheduleSourceSpecs{
-				Version: creationSourceSpecsVersion,
+			profile, err := materializeCreationFetchRequirements(&createScheduleFetchRequirements{
+				Version: creationFetchRequirementsVersion,
 				Items: []json.RawMessage{json.RawMessage(
 					`{"kind":"` + kind + `","profile_url":"` + profileURL + `"}`,
 				)},
@@ -1163,8 +1146,8 @@ func TestMaterializeCreationSourceSpecs_ValidatesXHSUserIDs(t *testing.T) {
 		}
 		for _, value := range invalid {
 			t.Run(kind+"/reject/"+value, func(t *testing.T) {
-				_, err := materializeCreationSourceSpecs(&createScheduleSourceSpecs{
-					Version: creationSourceSpecsVersion,
+				_, err := materializeCreationFetchRequirements(&createScheduleFetchRequirements{
+					Version: creationFetchRequirementsVersion,
 					Items: []json.RawMessage{mustMarshal(t, map[string]any{
 						"kind": kind, "user_id": value,
 					})},
@@ -1177,12 +1160,12 @@ func TestMaterializeCreationSourceSpecs_ValidatesXHSUserIDs(t *testing.T) {
 	}
 }
 
-func TestMaterializeCreationSourceSpecs_ValidatesXHSTopicPageID(t *testing.T) {
+func TestMaterializeCreationFetchRequirements_ValidatesXHSTopicPageID(t *testing.T) {
 	const pageID = "6301c499df9bea0001dc6f47"
 	topicURL := "xhsdiscover://rn/sns-discover/topic/normal?id=" + pageID + "&page_source=note_feed"
-	materialize := func(field, value string) ([]compiledFetchSource, error) {
-		return materializeCreationSourceSpecs(&createScheduleSourceSpecs{
-			Version: creationSourceSpecsVersion,
+	materialize := func(field, value string) ([]compiledFetchTarget, error) {
+		return materializeCreationFetchRequirements(&createScheduleFetchRequirements{
+			Version: creationFetchRequirementsVersion,
 			Items: []json.RawMessage{mustMarshal(t, map[string]any{
 				"kind": "xhs_topic_feed", field: value,
 			})},
@@ -1215,372 +1198,6 @@ func TestMaterializeCreationSourceSpecs_ValidatesXHSTopicPageID(t *testing.T) {
 	}
 }
 
-func TestCreationCoordinator_ProposalCombinesExistingSourcesAndSourceSpecs(t *testing.T) {
-	store := newCreationSagaFakeStore()
-	store.resolveSources = map[int64]types.Source{
-		12: {
-			ID: 12, Platform: types.PlatformWeb, Capability: types.CapSearch,
-			Title: "现有源", URL: "vane://web/search?q=existing",
-			Config: json.RawMessage(`{"query":"existing"}`), Status: types.SourceStatusActive,
-		},
-	}
-	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
-	plan := json.RawMessage(`{
-		"existing_source_ids":[12],
-		"source_specs":{
-			"version":"vane.source-specs/v1",
-			"items":[{"kind":"web_feed","feed_url":"https://example.com/feed.xml"}]
-		}
-	}`)
-	_, err := coordinator.Propose(t.Context(), CreationProposalInput{
-		ActionID: "action-existing-and-spec", UserID: 11,
-		RawArgs:   mustCreateArgsWithPlan(t, "监控已有源和新 RSS", "混合来源", plan),
-		ExpiresAt: time.Now().Add(time.Hour),
-	})
-	if err != nil {
-		t.Fatalf("Propose: %v", err)
-	}
-	if store.resolveCalls != 1 || store.createCalls != 1 ||
-		bytes.Contains(store.op.Args, []byte("source_specs")) ||
-		bytes.Contains(store.op.Args, []byte("existing_source_ids")) {
-		t.Fatalf("引用与 source_specs 应一次冻结为 durable sources: resolve=%d create=%d args=%s",
-			store.resolveCalls, store.createCalls, store.op.Args)
-	}
-	command, _, err := normalizeCreateScheduleCommand(store.op.Args)
-	if err != nil {
-		t.Fatalf("normalize durable args: %v", err)
-	}
-	var frozen compiledFetchPlan
-	if err := decodeStrictJSON(command.ApprovedFetchPlan, &frozen); err != nil {
-		t.Fatalf("decode frozen plan: %v", err)
-	}
-	if len(frozen.Sources) != 2 || frozen.Sources[0].URL != "vane://web/search?q=existing" ||
-		frozen.Sources[1].URL != "https://example.com/feed.xml" ||
-		string(frozen.Sources[1].Config) != `{}` {
-		t.Fatalf("frozen plan 顺序或 feed 空 config 漂移: %+v", frozen.Sources)
-	}
-}
-
-func TestCreationCoordinator_LegacyValidationStillPrecedesTenantLookup(t *testing.T) {
-	store := newCreationSagaFakeStore()
-	store.tenant.Status = types.TenantStatusSuspended
-	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
-	raw := mustMarshal(t, map[string]any{
-		"spec":                map[string]any{"every_seconds": 1, "tz": "UTC"},
-		"intent":              "监控 AI",
-		"nl_description":      "无效频率",
-		"strictness":          "normal",
-		"approved_fetch_plan": json.RawMessage(validApprovedFetchPlan()),
-	})
-
-	_, err := coordinator.Propose(t.Context(), CreationProposalInput{
-		ActionID: "action-invalid-legacy", UserID: 11, RawArgs: raw,
-		ExpiresAt: time.Now().Add(time.Hour),
-	})
-	if err == nil || !strings.Contains(err.Error(), "invalid schedule spec") ||
-		strings.Contains(err.Error(), "工作空间") || store.createCalls != 0 {
-		t.Fatalf("legacy validation order changed: err=%v create_calls=%d", err, store.createCalls)
-	}
-
-	// The new proposal decoder must not reorder two deterministic legacy
-	// failures: the original normalizer checks intent before an empty plan.
-	raw = mustMarshal(t, map[string]any{
-		"spec":                map[string]any{"every_seconds": 3600, "tz": "UTC"},
-		"intent":              "   ",
-		"nl_description":      "无效旧参数",
-		"strictness":          "normal",
-		"approved_fetch_plan": map[string]any{"sources": []any{}},
-	})
-	_, err = coordinator.Propose(t.Context(), CreationProposalInput{
-		ActionID: "action-invalid-legacy-precedence", UserID: 11, RawArgs: raw,
-		ExpiresAt: time.Now().Add(time.Hour),
-	})
-	if err == nil || !strings.Contains(err.Error(), "approved intent") ||
-		strings.Contains(err.Error(), "at least one source") {
-		t.Fatalf("legacy error precedence changed: %v", err)
-	}
-
-	longSources := make([]map[string]any, 6)
-	for i := range longSources {
-		query := fmt.Sprintf("legacy-long-%d", i)
-		longSources[i] = map[string]any{
-			"platform": "web", "capability": "search",
-			"title":  strings.Repeat("长", maxCompiledSourceRunes),
-			"url":    "vane://web/search?q=" + query,
-			"config": map[string]any{"query": query},
-		}
-	}
-	raw = mustCreateArgsWithPlan(t, "监控旧任务", "超长摘要", mustMarshal(t, map[string]any{
-		"sources": longSources,
-	}))
-	_, err = coordinator.Propose(t.Context(), CreationProposalInput{
-		ActionID: "action-invalid-legacy-summary", UserID: 11, RawArgs: raw,
-		ExpiresAt: time.Now().Add(time.Hour),
-	})
-	if err == nil || !strings.Contains(err.Error(), "confirmation summary exceeds") ||
-		strings.Contains(err.Error(), "工作空间") || store.createCalls != 0 {
-		t.Fatalf("legacy summary validation order changed: err=%v create_calls=%d",
-			err, store.createCalls)
-	}
-}
-
-func TestCreationCoordinator_ProposalFreezesExistingSourceIdentitiesByValue(t *testing.T) {
-	store := newCreationSagaFakeStore()
-	store.resolveSources = map[int64]types.Source{
-		22: {
-			ID: 22, Platform: types.PlatformWeb, Capability: types.CapSearch,
-			Title: " \n现有 \u202e**B**\u2066\t ", URL: "vane://web/search?q=existing-b",
-			Config: json.RawMessage(
-				`{"query":"existing-b","lookback_days":-1,"num_results":15,"type":"auto"}`,
-			),
-			Status: types.SourceStatusActive,
-		},
-		11: {
-			ID: 11, Platform: types.PlatformWeb, Capability: types.CapSearch,
-			Title: "", URL: "vane://web/search?q=existing-a",
-			Config: json.RawMessage(`{"query":"existing-a"}`), Status: types.SourceStatusActive,
-		},
-		33: {
-			ID: 33, Platform: types.PlatformXHS, Capability: types.CapSearch,
-			Title: "现有小红书", URL: "vane://xhs/search?keyword=AI",
-			Config: json.RawMessage(
-				`{"keyword":"AI","sort_type":"time_descending","note_type":"video"}`,
-			),
-			Status: types.SourceStatusActive,
-		},
-		44: {
-			ID: 44, Platform: types.PlatformWeb, Capability: types.CapFeed,
-			Title: "现有 RSS", URL: "https://example.com/feed#vane-categories=ai,news",
-			Config: json.RawMessage(
-				`{"categories":["ai","news"],"lookback_days":-1}`,
-			),
-			Status: types.SourceStatusActive,
-		},
-	}
-	schedules := &creationSagaFakeScheduler{}
-	coordinator := NewCreationCoordinator(store, schedules, nil)
-	plan := json.RawMessage(`{
-		"existing_source_ids":[22,11,33,44],
-		"sources":[{
-			"platform":"web","capability":"search","title":"新增 C",
-			"url":"vane://web/search?q=new-c","config":{"query":"new-c"}
-		}]
-	}`)
-	proposal, err := coordinator.Propose(t.Context(), CreationProposalInput{
-		ActionID: "action-existing-sources", UserID: 11,
-		RawArgs:   mustCreateArgsWithPlan(t, "监控三个主题", "三源任务", plan),
-		ExpiresAt: time.Now().Add(time.Hour),
-	})
-	if err != nil {
-		t.Fatalf("Propose: %v", err)
-	}
-	if store.resolveCalls != 1 || store.resolveTenantID != 7 || store.resolveUserID != 11 ||
-		!slices.Equal(store.resolveSourceIDs, []int64{22, 11, 33, 44}) {
-		t.Fatalf("resolver scope/calls mismatch: calls=%d tenant=%d user=%d ids=%v",
-			store.resolveCalls, store.resolveTenantID, store.resolveUserID, store.resolveSourceIDs)
-	}
-	if store.createCalls != 1 || bytes.Contains(store.op.Args, []byte("existing_source_ids")) {
-		t.Fatalf("durable args must contain only frozen sources: create=%d args=%s",
-			store.createCalls, store.op.Args)
-	}
-	for _, forbidden := range [][]byte{
-		[]byte("lookback_days"), []byte("num_results"), []byte(`"type"`),
-		[]byte("sort_type"), []byte("note_type"),
-	} {
-		if bytes.Contains(store.op.Args, forbidden) {
-			t.Fatalf("runtime tuning leaked into task identity plan: key=%s args=%s",
-				forbidden, store.op.Args)
-		}
-	}
-	if !bytes.Contains(store.op.Args, []byte(`"categories":["ai","news"]`)) {
-		t.Fatalf("feed identity config was not preserved: %s", store.op.Args)
-	}
-	command, _, err := normalizeCreateScheduleCommand(store.op.Args)
-	if err != nil {
-		t.Fatalf("normalize durable args: %v", err)
-	}
-	var frozen compiledFetchPlan
-	if err := decodeStrictJSON(command.ApprovedFetchPlan, &frozen); err != nil {
-		t.Fatalf("decode frozen plan: %v", err)
-	}
-	gotURLs := make([]string, 0, len(frozen.Sources))
-	for _, source := range frozen.Sources {
-		gotURLs = append(gotURLs, source.URL)
-	}
-	wantURLs := []string{
-		"vane://web/search?q=existing-b",
-		"vane://web/search?q=existing-a",
-		"vane://xhs/search?keyword=AI",
-		"https://example.com/feed#vane-categories=ai,news",
-		"vane://web/search?q=new-c",
-	}
-	if !slices.Equal(gotURLs, wantURLs) {
-		t.Fatalf("frozen source order=%v want=%v", gotURLs, wantURLs)
-	}
-	for _, want := range []string{
-		"信息范围（5）", "现有 **B**", "web/search [web/search]", "现有小红书", "现有 RSS", "新增 C",
-	} {
-		if !strings.Contains(proposal.Summary, want) {
-			t.Fatalf("summary missing %q: %s", want, proposal.Summary)
-		}
-	}
-	for _, bidi := range []string{"\u202e", "\u2066"} {
-		if strings.Contains(proposal.Summary, bidi) || bytes.Contains(store.op.Args, []byte(bidi)) {
-			t.Fatalf("bidi control leaked into confirmation snapshot: %q", bidi)
-		}
-	}
-
-	// Losing the live entitlement after the confirmation card was displayed
-	// must not change the approved bytes or make recovery consult the source
-	// resolver again. The proposal snapshot is the sole input from here on.
-	store.resolveSources = nil
-	result, err := coordinator.Confirm(
-		t.Context(), 11, "action-existing-sources", testCreationReceiptTarget,
-	)
-	if err != nil || result.Status != types.PendingActionStatusExecuted ||
-		store.resolveCalls != 1 || !bytes.Equal(store.definition.FetchPlan, command.ApprovedFetchPlan) {
-		t.Fatalf("confirm after entitlement loss: result=%+v err=%v resolve_calls=%d final_plan=%s",
-			result, err, store.resolveCalls, store.definition.FetchPlan)
-	}
-}
-
-func TestCreationCoordinator_ProposalRejectsInvalidExistingSourceTuning(t *testing.T) {
-	cases := []struct {
-		name       string
-		platform   types.Platform
-		capability types.Capability
-		url        string
-		config     json.RawMessage
-	}{
-		{
-			name: "integer tuning has string value", platform: types.PlatformWeb,
-			capability: types.CapSearch, url: "vane://web/search?q=broken-int",
-			config: json.RawMessage(`{"query":"broken-int","num_results":"many"}`),
-		},
-		{
-			name: "web search type is not string", platform: types.PlatformWeb,
-			capability: types.CapSearch, url: "vane://web/search?q=broken-type",
-			config: json.RawMessage(`{"query":"broken-type","type":7}`),
-		},
-		{
-			name: "xhs sort is not string", platform: types.PlatformXHS,
-			capability: types.CapSearch, url: "vane://xhs/search?keyword=broken",
-			config: json.RawMessage(`{"keyword":"broken","sort_type":{}}`),
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			store := newCreationSagaFakeStore()
-			store.resolveSources = map[int64]types.Source{7: {
-				ID: 7, Platform: tc.platform, Capability: tc.capability,
-				URL: tc.url, Config: tc.config, Status: types.SourceStatusActive,
-			}}
-			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
-			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
-				ActionID: "action-broken-existing-source", UserID: 11,
-				RawArgs: mustCreateArgsWithPlan(t, "监控已有源", "已有源", json.RawMessage(
-					`{"existing_source_ids":[7]}`,
-				)),
-				ExpiresAt: time.Now().Add(time.Hour),
-			})
-			var appErr *types.AppError
-			if !errors.As(err, &appErr) || appErr.Code != types.CodeValidation ||
-				appErr.Message != "所选已有信源当前无法用于任务，请重新选择" || store.createCalls != 0 {
-				t.Fatalf("err=%v create_calls=%d", err, store.createCalls)
-			}
-		})
-	}
-}
-
-func TestCreationCoordinator_ProposalReferenceFailuresCreateNothing(t *testing.T) {
-	t.Run("unavailable reference is generic", func(t *testing.T) {
-		store := newCreationSagaFakeStore()
-		store.resolveErr = types.NewAppError(
-			types.CodeNotFound, "一个或多个已有信源当前不可用", nil,
-		)
-		coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
-		_, err := coordinator.Propose(t.Context(), CreationProposalInput{
-			ActionID: "action-missing-source", UserID: 11,
-			RawArgs: mustCreateArgsWithPlan(t, "监控已有源", "已有源", json.RawMessage(
-				`{"existing_source_ids":[999999]}`,
-			)),
-			ExpiresAt: time.Now().Add(time.Hour),
-		})
-		var appErr *types.AppError
-		if !errors.As(err, &appErr) || appErr.Code != types.CodeValidation ||
-			appErr.Message != "所选已有信源当前不可用，请重新选择" || store.createCalls != 0 {
-			t.Fatalf("err=%v create_calls=%d", err, store.createCalls)
-		}
-	})
-
-	t.Run("duplicate URL across reference and new source", func(t *testing.T) {
-		store := newCreationSagaFakeStore()
-		store.resolveSources = map[int64]types.Source{1: {
-			ID: 1, Platform: types.PlatformWeb, Capability: types.CapSearch,
-			URL: "vane://web/search?q=same", Config: json.RawMessage(`{"query":"same"}`),
-			Status: types.SourceStatusActive,
-		}}
-		coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
-		plan := json.RawMessage(`{
-			"existing_source_ids":[1],
-			"sources":[{"platform":"web","capability":"search",
-				"url":"vane://web/search?q=same","config":{"query":"same"}}]
-		}`)
-		_, err := coordinator.Propose(t.Context(), CreationProposalInput{
-			ActionID: "action-duplicate-source", UserID: 11,
-			RawArgs:   mustCreateArgsWithPlan(t, "监控重复源", "重复源", plan),
-			ExpiresAt: time.Now().Add(time.Hour),
-		})
-		if !errors.Is(err, types.ErrValidation) || store.createCalls != 0 {
-			t.Fatalf("err=%v create_calls=%d", err, store.createCalls)
-		}
-	})
-}
-
-func TestDecodeCreationProposalArgs_SourceBoundaries(t *testing.T) {
-	ids := func(n int) []int64 {
-		out := make([]int64, n)
-		for i := range out {
-			out[i] = int64(i + 1)
-		}
-		return out
-	}
-	newSource := map[string]any{
-		"platform": "web", "capability": "search",
-		"url": "vane://web/search?q=new", "config": map[string]any{"query": "new"},
-	}
-	cases := []struct {
-		name    string
-		plan    any
-		wantErr bool
-	}{
-		{name: "one reference", plan: map[string]any{"existing_source_ids": []int64{1}}},
-		{name: "one new source", plan: map[string]any{"sources": []any{newSource}}},
-		{name: "mixed maximum", plan: map[string]any{
-			"existing_source_ids": ids(maxCompiledSources - 1), "sources": []any{newSource},
-		}},
-		{name: "empty", plan: map[string]any{}, wantErr: true},
-		{name: "zero id", plan: map[string]any{"existing_source_ids": []int64{0}}, wantErr: true},
-		{name: "duplicate id", plan: map[string]any{"existing_source_ids": []int64{7, 7}}, wantErr: true},
-		{name: "combined over maximum", plan: map[string]any{
-			"existing_source_ids": ids(maxCompiledSources), "sources": []any{newSource},
-		}, wantErr: true},
-		{name: "unknown plan field", plan: map[string]any{
-			"existing_source_ids": []int64{1}, "source_ids": []int64{1},
-		}, wantErr: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			raw := mustCreateArgsWithPlan(t, "监控", "任务", mustMarshal(t, tc.plan))
-			_, err := decodeCreationProposalArgs(raw)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("decodeCreationProposalArgs() err=%v want_err=%v raw=%s",
-					err, tc.wantErr, raw)
-			}
-		})
-	}
-}
-
 func TestCreationCoordinator_RejectsSSRFBeforePendingAction(t *testing.T) {
 	for _, rawURL := range []string{
 		"http://127.0.0.1/rss",
@@ -1597,12 +1214,14 @@ func TestCreationCoordinator_RejectsSSRFBeforePendingAction(t *testing.T) {
 			store := newCreationSagaFakeStore()
 			coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
 			raw := mustCreateArgsWithPlan(t, "监控本地服务", "本地", mustMarshal(t, map[string]any{
-				"sources": []map[string]any{{
-					"platform": "web", "capability": "feed",
-					"url": rawURL, "config": map[string]any{},
-				}},
+				"fetch_requirements": map[string]any{
+					"version": "vane.fetch-requirements/v1",
+					"items": []map[string]any{{
+						"kind": "web_feed", "feed_url": rawURL,
+					}},
+				},
 			}))
-			_, err := coordinator.Propose(t.Context(), CreationProposalInput{
+			_, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 				ActionID: "action-ssrf", UserID: 11, RawArgs: raw,
 				ExpiresAt: time.Now().Add(time.Hour),
 			})
@@ -1621,27 +1240,27 @@ func TestCreationCoordinator_ConfirmHappyPathAndTerminalReplay(t *testing.T) {
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-happy")
 
-	result, err := coordinator.Confirm(t.Context(), 11, "action-happy", testCreationReceiptTarget)
+	result, err := coordinator.Execute(t.Context(), 11, "action-happy", testCreationReceiptTarget)
 	if err != nil {
 		t.Fatalf("Confirm: %v", err)
 	}
-	if result.Status != types.PendingActionStatusExecuted || result.Recovering || !result.ReceiptBound ||
+	if result.Status != types.TaskOperationStatusExecuted || result.Recovering || !result.ReceiptBound ||
 		store.op.Phase != types.TaskCreationPhaseCompleted || schedules.activateCalls != 1 {
 		t.Fatalf("result=%+v phase=%q activate=%d", result, store.op.Phase, schedules.activateCalls)
 	}
 	if !bytes.Equal(store.definition.FetchPlan, json.RawMessage(
-		`{"sources":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"}}]}`,
+		`{"targets":[{"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"}}]}`,
 	)) {
 		t.Fatalf("final plan=%s", store.definition.FetchPlan)
 	}
 	events := append([]string(nil), store.events...)
-	replayed, err := coordinator.Confirm(t.Context(), 11, "action-happy", testCreationReceiptTarget)
+	replayed, err := coordinator.Execute(t.Context(), 11, "action-happy", testCreationReceiptTarget)
 	if err != nil || replayed.TaskID != result.TaskID || !bytes.Equal(mustMarshal(t, events), mustMarshal(t, store.events)) {
 		t.Fatalf("terminal replay=%+v err=%v before=%v after=%v", replayed, err, events, store.events)
 	}
 	differentTarget := testCreationReceiptTarget
 	differentTarget.Target = "om_forwarded_copy"
-	if _, err := coordinator.Confirm(t.Context(), 11, "action-happy", differentTarget); !errors.Is(err, types.ErrConflict) {
+	if _, err := coordinator.Execute(t.Context(), 11, "action-happy", differentTarget); !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("terminal replay on a different provider resource must conflict: %v", err)
 	}
 }
@@ -1652,7 +1271,7 @@ func TestCreationCoordinator_BusyLegacyOperationBindsDurableReceipt(t *testing.T
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-busy-legacy")
 
-	store.op.Status = types.PendingActionStatusExecuting
+	store.op.Status = types.TaskOperationStatusExecuting
 	store.op.Phase = types.TaskCreationPhaseClaimed
 	store.op.LeaseOwner = "pre-a6-worker"
 	store.op.Fence = 1
@@ -1660,11 +1279,11 @@ func TestCreationCoordinator_BusyLegacyOperationBindsDurableReceipt(t *testing.T
 	leaseUntil := time.Now().Add(time.Minute)
 	store.op.LeaseUntil = &leaseUntil
 
-	result, err := coordinator.Confirm(
+	result, err := coordinator.Execute(
 		t.Context(), 11, "action-busy-legacy", testCreationReceiptTarget,
 	)
 	if err != nil || !result.Recovering || !result.ReceiptBound ||
-		result.Status != types.PendingActionStatusExecuting {
+		result.Status != types.TaskOperationStatusExecuting {
 		t.Fatalf("busy result=%+v err=%v", result, err)
 	}
 	if store.op.ReceiptProvider != testCreationReceiptTarget.Provider ||
@@ -1682,13 +1301,13 @@ func TestCreationCoordinator_ActivationResponseLossAdoptsWithoutSecondWrite(t *t
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-recover")
 
-	first, err := coordinator.Confirm(t.Context(), 11, "action-recover", testCreationReceiptTarget)
+	first, err := coordinator.Execute(t.Context(), 11, "action-recover", testCreationReceiptTarget)
 	if err != nil || !first.Recovering || store.op.Phase != types.TaskCreationPhaseActivationStarted {
 		t.Fatalf("first=%+v phase=%q err=%v", first, store.op.Phase, err)
 	}
 	store.allowTakeover = true
-	second, err := coordinator.Confirm(t.Context(), 11, "action-recover", testCreationReceiptTarget)
-	if err != nil || second.Status != types.PendingActionStatusExecuted || schedules.activateCalls != 1 {
+	second, err := coordinator.Execute(t.Context(), 11, "action-recover", testCreationReceiptTarget)
+	if err != nil || second.Status != types.TaskOperationStatusExecuted || schedules.activateCalls != 1 {
 		t.Fatalf("second=%+v activate_calls=%d err=%v", second, schedules.activateCalls, err)
 	}
 	if !containsString(schedules.events, "describe") {
@@ -1703,8 +1322,8 @@ func TestCreationCoordinator_TaskLimitDeletesPausedTaskAndFails(t *testing.T) {
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-limit")
 
-	result, err := coordinator.Confirm(t.Context(), 11, "action-limit", testCreationReceiptTarget)
-	if err != nil || result.Status != types.PendingActionStatusFailed ||
+	result, err := coordinator.Execute(t.Context(), 11, "action-limit", testCreationReceiptTarget)
+	if err != nil || result.Status != types.TaskOperationStatusFailed ||
 		schedules.deleteCalls != 1 || schedules.activateCalls != 0 {
 		t.Fatalf("result=%+v delete=%d activate=%d err=%v",
 			result, schedules.deleteCalls, schedules.activateCalls, err)
@@ -1717,8 +1336,8 @@ func TestCreationCoordinator_DeterministicEnsureFailureDoesNotLoop(t *testing.T)
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-ensure-conflict")
 
-	result, err := coordinator.Confirm(t.Context(), 11, "action-ensure-conflict", testCreationReceiptTarget)
-	if err != nil || result.Status != types.PendingActionStatusFailed ||
+	result, err := coordinator.Execute(t.Context(), 11, "action-ensure-conflict", testCreationReceiptTarget)
+	if err != nil || result.Status != types.TaskOperationStatusFailed ||
 		schedules.deleteCalls != 1 || containsString(schedules.events, "activate") {
 		t.Fatalf("result=%+v events=%v delete=%d err=%v",
 			result, schedules.events, schedules.deleteCalls, err)
@@ -1733,9 +1352,9 @@ func TestCreationCoordinator_CleanupFinalizationConflictQuarantines(t *testing.T
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-cleanup-finalize-conflict")
 
-	result, err := coordinator.Confirm(t.Context(), 11, store.op.ID, testCreationReceiptTarget)
-	if err != nil || result.Status != types.PendingActionStatusBlocked ||
-		store.op.Status != types.PendingActionStatusBlocked ||
+	result, err := coordinator.Execute(t.Context(), 11, store.op.ID, testCreationReceiptTarget)
+	if err != nil || result.Status != types.TaskOperationStatusBlocked ||
+		store.op.Status != types.TaskOperationStatusBlocked ||
 		store.op.ErrorCode != "cleanup_finalization_invalid" || schedules.deleteCalls != 1 {
 		t.Fatalf("result=%+v op=%+v delete=%d err=%v",
 			result, store.op, schedules.deleteCalls, err)
@@ -1750,9 +1369,9 @@ func TestCreationCoordinator_CleanupCheckpointConflictQuarantinesWithoutDelete(t
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-cleanup-checkpoint-conflict")
 
-	result, err := coordinator.Confirm(t.Context(), 11, store.op.ID, testCreationReceiptTarget)
-	if err != nil || result.Status != types.PendingActionStatusBlocked ||
-		store.op.Status != types.PendingActionStatusBlocked ||
+	result, err := coordinator.Execute(t.Context(), 11, store.op.ID, testCreationReceiptTarget)
+	if err != nil || result.Status != types.TaskOperationStatusBlocked ||
+		store.op.Status != types.TaskOperationStatusBlocked ||
 		store.op.ErrorCode != "cleanup_checkpoint_invalid" || schedules.deleteCalls != 0 {
 		t.Fatalf("result=%+v op=%+v delete=%d err=%v",
 			result, store.op, schedules.deleteCalls, err)
@@ -1766,9 +1385,9 @@ func TestCreationCoordinator_DeleteBlockedQuarantinesCleanup(t *testing.T) {
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-delete-blocked")
 
-	result, err := coordinator.Confirm(t.Context(), 11, store.op.ID, testCreationReceiptTarget)
-	if err != nil || result.Status != types.PendingActionStatusBlocked ||
-		store.op.Status != types.PendingActionStatusBlocked || schedules.deleteCalls != 1 {
+	result, err := coordinator.Execute(t.Context(), 11, store.op.ID, testCreationReceiptTarget)
+	if err != nil || result.Status != types.TaskOperationStatusBlocked ||
+		store.op.Status != types.TaskOperationStatusBlocked || schedules.deleteCalls != 1 {
 		t.Fatalf("result=%+v op=%+v delete=%d err=%v",
 			result, store.op, schedules.deleteCalls, err)
 	}
@@ -1781,8 +1400,8 @@ func TestCreationCoordinator_ActivationCommitValidationDeletesActiveTask(t *test
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-activation-commit")
 
-	result, err := coordinator.Confirm(t.Context(), 11, "action-activation-commit", testCreationReceiptTarget)
-	if err != nil || result.Status != types.PendingActionStatusFailed ||
+	result, err := coordinator.Execute(t.Context(), 11, "action-activation-commit", testCreationReceiptTarget)
+	if err != nil || result.Status != types.TaskOperationStatusFailed ||
 		schedules.activateCalls != 1 || schedules.deleteCalls != 1 ||
 		schedules.state != scheduler.TaskScheduleStateUnknown {
 		t.Fatalf("result=%+v state=%q activate=%d delete=%d err=%v",
@@ -1797,8 +1416,8 @@ func TestCreationCoordinator_CompletionConflictQuarantinesActivatedTask(t *testi
 	coordinator := NewCreationCoordinator(store, schedules, nil)
 	mustProposeCreation(t, coordinator, "action-complete-conflict")
 
-	result, err := coordinator.Confirm(t.Context(), 11, "action-complete-conflict", testCreationReceiptTarget)
-	if err != nil || result.Status != types.PendingActionStatusBlocked ||
+	result, err := coordinator.Execute(t.Context(), 11, "action-complete-conflict", testCreationReceiptTarget)
+	if err != nil || result.Status != types.TaskOperationStatusBlocked ||
 		schedules.activateCalls != 1 || schedules.deleteCalls != 0 ||
 		store.op.Phase != types.TaskCreationPhaseBlocked {
 		t.Fatalf("result=%+v activate=%d delete=%d err=%v",
@@ -1806,81 +1425,17 @@ func TestCreationCoordinator_CompletionConflictQuarantinesActivatedTask(t *testi
 	}
 }
 
-func TestCreationCoordinator_CancelV1IsScopedAndLinearized(t *testing.T) {
-	store := newCreationSagaFakeStore()
-	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
-	mustProposeCreation(t, coordinator, "action-cancel")
-
-	result, err := coordinator.Cancel(t.Context(), 11, "action-cancel", testCreationReceiptTarget)
-	if err != nil || result.Status != types.PendingActionStatusCancelled ||
-		store.op.Status != types.PendingActionStatusCancelled ||
-		store.op.Phase != types.TaskCreationPhaseCancelled {
-		t.Fatalf("cancel result=%+v op=%+v err=%v", result, store.op, err)
-	}
-	replayed, err := coordinator.Cancel(t.Context(), 11, "action-cancel", testCreationReceiptTarget)
-	if err != nil || replayed.Status != types.PendingActionStatusCancelled || !replayed.Replayed {
-		t.Fatalf("cancel replay=%+v err=%v", replayed, err)
-	}
-	if _, err := coordinator.Cancel(t.Context(), 12, "action-cancel", testCreationReceiptTarget); !errors.Is(err, ErrCreationOperationNotFound) {
-		t.Fatalf("foreign user must get exact v1-not-found sentinel, got %v", err)
-	}
-}
-
-func TestCreationCoordinator_CancelRacingAcquireDoesNotUndoCreation(t *testing.T) {
-	store := newCreationSagaFakeStore()
-	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
-	mustProposeCreation(t, coordinator, "action-cancel-busy")
-	if _, err := store.AcquireTaskCreationOperation(t.Context(), types.AcquireTaskCreationOperationParams{
-		ID: store.op.ID, TenantID: store.op.TenantID, UserID: store.op.UserID,
-		LeaseOwner: "worker", LeaseDuration: time.Minute,
-		ReceiptProvider: testCreationReceiptTarget.Provider,
-		ReceiptTarget:   testCreationReceiptTarget.Target,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	result, err := coordinator.Cancel(t.Context(), 11, "action-cancel-busy", testCreationReceiptTarget)
-	if err != nil || !result.Recovering || result.Status != types.PendingActionStatusExecuting ||
-		store.op.Status != types.PendingActionStatusExecuting {
-		t.Fatalf("busy cancel result=%+v op=%+v err=%v", result, store.op, err)
-	}
-}
-
-func TestCreationCoordinator_CancelBusyLegacyOperationBindsDurableReceipt(t *testing.T) {
-	store := newCreationSagaFakeStore()
-	coordinator := NewCreationCoordinator(store, &creationSagaFakeScheduler{}, nil)
-	mustProposeCreation(t, coordinator, "action-cancel-busy-legacy")
-	store.op.Status = types.PendingActionStatusExecuting
-	store.op.Phase = types.TaskCreationPhaseClaimed
-	store.op.LeaseOwner = "pre-a6-worker"
-	store.op.Fence = 1
-	store.op.Attempt = 1
-	leaseUntil := time.Now().Add(time.Minute)
-	store.op.LeaseUntil = &leaseUntil
-
-	result, err := coordinator.Cancel(
-		t.Context(), 11, "action-cancel-busy-legacy", testCreationReceiptTarget,
-	)
-	if err != nil || !result.Recovering || !result.ReceiptBound ||
-		result.Status != types.PendingActionStatusExecuting {
-		t.Fatalf("busy cancel result=%+v err=%v", result, err)
-	}
-	if store.op.ReceiptProvider != testCreationReceiptTarget.Provider ||
-		store.op.ReceiptTarget != testCreationReceiptTarget.Target {
-		t.Fatalf("busy cancel did not retain receipt target: %+v", store.op)
-	}
-}
-
 func TestCreationCoordinator_AdoptsPreparationTerminalAfterCancelledResponseLoss(t *testing.T) {
 	tests := []struct {
 		name        string
 		scheduleErr error
-		wantStatus  types.PendingActionStatus
+		wantStatus  types.TaskOperationStatus
 		configure   func(*creationSagaFakeStore)
 	}{
 		{
 			name:        "fail",
 			scheduleErr: scheduler.ErrTaskScheduleInvalid,
-			wantStatus:  types.PendingActionStatusFailed,
+			wantStatus:  types.TaskOperationStatusFailed,
 			configure: func(s *creationSagaFakeStore) {
 				s.failErr = errors.New("commit applied but response lost")
 				s.failApplyBeforeError = true
@@ -1889,7 +1444,7 @@ func TestCreationCoordinator_AdoptsPreparationTerminalAfterCancelledResponseLoss
 		{
 			name:        "block",
 			scheduleErr: scheduler.ErrTaskScheduleBlocked,
-			wantStatus:  types.PendingActionStatusBlocked,
+			wantStatus:  types.TaskOperationStatusBlocked,
 			configure: func(s *creationSagaFakeStore) {
 				s.blockErr = errors.New("commit applied but response lost")
 				s.blockApplyBeforeError = true
@@ -1907,7 +1462,7 @@ func TestCreationCoordinator_AdoptsPreparationTerminalAfterCancelledResponseLoss
 			store.honorLoadContext = true
 			tt.configure(store)
 
-			result, err := coordinator.Confirm(ctx, 11, store.op.ID, testCreationReceiptTarget)
+			result, err := coordinator.Execute(ctx, 11, store.op.ID, testCreationReceiptTarget)
 			if err != nil || result.Status != tt.wantStatus || store.op.Status != tt.wantStatus {
 				t.Fatalf("result=%+v op=%+v err=%v", result, store.op, err)
 			}
@@ -1925,9 +1480,9 @@ func TestCreationCoordinator_AdoptsCompletedTerminalAfterCancelledResponseLoss(t
 	store.completeErr = errors.New("commit applied but response lost")
 	store.completeApplyBeforeError = true
 
-	result, err := coordinator.Confirm(ctx, 11, store.op.ID, testCreationReceiptTarget)
-	if err != nil || result.Status != types.PendingActionStatusExecuted ||
-		store.op.Status != types.PendingActionStatusExecuted {
+	result, err := coordinator.Execute(ctx, 11, store.op.ID, testCreationReceiptTarget)
+	if err != nil || result.Status != types.TaskOperationStatusExecuted ||
+		store.op.Status != types.TaskOperationStatusExecuted {
 		t.Fatalf("result=%+v op=%+v err=%v", result, store.op, err)
 	}
 }
@@ -1952,7 +1507,7 @@ func TestCreationCoordinator_RecoveryAdoptsAcquireResponseLossSamePass(t *testin
 	if err := coordinator.recoverOperation(t.Context(), *stale); err != nil {
 		t.Fatalf("same recovery pass should adopt takeover: %v", err)
 	}
-	if store.op.Status != types.PendingActionStatusExecuted || store.op.Attempt != 2 || store.op.Fence != 2 {
+	if store.op.Status != types.TaskOperationStatusExecuted || store.op.Attempt != 2 || store.op.Fence != 2 {
 		t.Fatalf("op=%+v; takeover must increment fence/attempt exactly once", store.op)
 	}
 }
@@ -2041,11 +1596,11 @@ func TestCreationTerminalResultRejectsIncompleteTombstones(t *testing.T) {
 	now := time.Now()
 	valid := &types.TaskCreationOperation{
 		ID: "op", TenantID: 7, UserID: 11,
-		Status: types.PendingActionStatusCancelled,
+		Status: types.TaskOperationStatusCancelled,
 		Phase:  types.TaskCreationPhaseCancelled, TombstonedAt: &now,
 	}
 	if result, done, err := creationTerminalResult(valid); err != nil || !done ||
-		result.Status != types.PendingActionStatusCancelled {
+		result.Status != types.TaskOperationStatusCancelled {
 		t.Fatalf("valid cancellation rejected: result=%+v done=%v err=%v", result, done, err)
 	}
 	corruptions := []struct {
@@ -2094,7 +1649,7 @@ func TestCreationCoordinator_LateCheckpointCorruptionCleansOrQuarantines(t *test
 		if err := coordinator.recoverOperation(t.Context(), store.op); err != nil {
 			t.Fatal(err)
 		}
-		if store.op.Status != types.PendingActionStatusFailed || schedules.deleteCalls != 1 {
+		if store.op.Status != types.TaskOperationStatusFailed || schedules.deleteCalls != 1 {
 			t.Fatalf("status=%q delete=%d", store.op.Status, schedules.deleteCalls)
 		}
 	})
@@ -2123,7 +1678,7 @@ func TestCreationCoordinator_LateCheckpointCorruptionCleansOrQuarantines(t *test
 		if err := coordinator.recoverOperation(t.Context(), store.op); err != nil {
 			t.Fatal(err)
 		}
-		if store.op.Status != types.PendingActionStatusBlocked || schedules.deleteCalls != 0 ||
+		if store.op.Status != types.TaskOperationStatusBlocked || schedules.deleteCalls != 0 ||
 			!containsString(store.events, "block_side_effect") {
 			t.Fatalf("status=%q store_events=%v delete=%d",
 				store.op.Status, store.events, schedules.deleteCalls)
@@ -2140,14 +1695,14 @@ func TestCreationCoordinator_ScopeRevokedBeforeEnsureConvergesThroughExactDelete
 
 	// Recovery acquires by the operation's durable scope even though normal
 	// intake would no longer resolve this tenant as active.
-	store.op.Status = types.PendingActionStatusExecuting
+	store.op.Status = types.TaskOperationStatusExecuting
 	store.op.Phase = types.TaskCreationPhaseClaimed
 	store.allowTakeover = true
 	err := coordinator.recoverOperation(t.Context(), store.op)
 	if err != nil {
 		t.Fatalf("recoverOperation: %v", err)
 	}
-	if store.op.Status != types.PendingActionStatusFailed || schedules.deleteCalls != 1 ||
+	if store.op.Status != types.TaskOperationStatusFailed || schedules.deleteCalls != 1 ||
 		containsString(schedules.events, "ensure") || containsString(schedules.events, "activate") {
 		t.Fatalf("status=%q scheduler_events=%v delete_calls=%d",
 			store.op.Status, schedules.events, schedules.deleteCalls)
@@ -2156,8 +1711,8 @@ func TestCreationCoordinator_ScopeRevokedBeforeEnsureConvergesThroughExactDelete
 
 func mustProposeCreation(t *testing.T, coordinator *CreationCoordinator, id string) {
 	t.Helper()
-	if _, err := coordinator.Propose(t.Context(), CreationProposalInput{
-		ActionID: id, UserID: 11, RawArgs: mustCreateArgs(t, "每天寻找全球 AI 热点", "每天 AI"),
+	if _, err := coordinator.Prepare(t.Context(), CreationProposalInput{
+		ActionID: id, UserID: 11, RawArgs: mustCreateProposalArgs(t, "每天寻找全球 AI 热点", "每天 AI"),
 		ExpiresAt: time.Now().Add(time.Hour),
 	}); err != nil {
 		t.Fatalf("Propose: %v", err)
@@ -2173,8 +1728,16 @@ func TestValidateCreationReceiptTarget_AcceptsAgentAutoIdentity(t *testing.T) {
 	}
 	if err := validateCreationReceiptTarget(
 		op, AgentAutoReceiptTarget("another-operation"),
+	); err != nil {
+		t.Fatalf("server-owned session checkpoint key rejected: %v", err)
+	}
+	if err := validateCreationReceiptTarget(
+		op, CreationReceiptTarget{
+			Provider: AgentAutoReceiptProvider,
+			Target:   " invalid ",
+		},
 	); err == nil {
-		t.Fatal("agent auto receipt must be bound to the exact operation id")
+		t.Fatal("non-canonical session checkpoint key must be rejected")
 	}
 }
 

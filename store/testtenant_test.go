@@ -2,9 +2,14 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/YouToco/vane/types"
 )
 
 // attachTenant 把用户挂进平台租户（id=1）。
@@ -53,8 +58,12 @@ func TestInvariant_TenantDerivedOnWrite(t *testing.T) {
 	uid := testUserWithTenant(t, st, "derive")
 
 	// 走真实写入路径造几类行。
-	if err := st.AddSubscription(ctx, uid, seedSource(t, st)); err != nil {
-		t.Fatalf("加订阅失败: %v", err)
+	if err := st.InsertSchedule(ctx, &types.Schedule{
+		ID: "tenant-derive-" + uuid.NewString(), UserID: uid,
+		SpecJSON: json.RawMessage(`{}`), ScopeJSON: json.RawMessage(`{}`),
+		Status: types.ScheduleStatusPaused,
+	}); err != nil {
+		t.Fatalf("建任务失败: %v", err)
 	}
 	if _, err := st.CreatePushBatch(ctx, uid); err != nil {
 		t.Fatalf("建批次失败: %v", err)
@@ -64,7 +73,7 @@ func TestInvariant_TenantDerivedOnWrite(t *testing.T) {
 	}
 
 	// 逐表比对：tenant_id 必须与 memberships 一致，一行都不许漂。
-	for _, tbl := range []string{"subscriptions", "push_batches", "agent_sessions"} {
+	for _, tbl := range []string{"schedules", "push_batches", "agent_sessions"} {
 		var bad int
 		err := st.pool.QueryRow(ctx, `SELECT count(*) FROM `+tbl+` t
 			 JOIN memberships m ON m.user_id = t.user_id
@@ -98,8 +107,12 @@ func TestInvariant_NoTenantNoWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 刻意不 attachTenant。
-	if err := st.AddSubscription(ctx, u.ID, seedSource(t, st)); err == nil {
-		t.Error("无租户归属的用户不应能写入订阅")
+	if err := st.InsertSchedule(ctx, &types.Schedule{
+		ID: "tenant-orphan-" + uuid.NewString(), UserID: u.ID,
+		SpecJSON: json.RawMessage(`{}`), ScopeJSON: json.RawMessage(`{}`),
+		Status: types.ScheduleStatusPaused,
+	}); err == nil {
+		t.Error("无租户归属的用户不应能写入任务")
 	}
 	if _, err := st.CreatePushBatch(ctx, u.ID); err == nil {
 		t.Error("无租户归属的用户不应能建推送批次")
@@ -111,14 +124,14 @@ func seedSource(t *testing.T, st *Store) int64 {
 	t.Helper()
 	var id int64
 	err := st.pool.QueryRow(t.Context(),
-		`INSERT INTO sources (platform, capability, url, title, status)
+		`INSERT INTO fetch_targets (platform, capability, url, title, status)
 		 VALUES ('web', 'feed', $1, '租户测试源', 'active') RETURNING id`,
 		fmt.Sprintf("https://example.com/tenant-test-%d", time.Now().UnixNano())).Scan(&id)
 	if err != nil {
 		t.Fatalf("建测试信源失败: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = st.pool.Exec(context.WithoutCancel(t.Context()), `DELETE FROM sources WHERE id = $1`, id)
+		_, _ = st.pool.Exec(context.WithoutCancel(t.Context()), `DELETE FROM fetch_targets WHERE id = $1`, id)
 	})
 	return id
 }

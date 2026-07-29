@@ -1,5 +1,9 @@
 # Agent durable continuation contract
 
+> **退役边界（2026-07-29）：** 本文的通用会话事实投影仍有效；专用于
+> `enable_source/remove_source` 的 action proposal、confirmation、continuation 和
+> dispatcher 已由 `task-playbook-fetch-target-cutover.md` 删除，不得重新接回。
+
 ## 7.10-A scope
 
 This batch covers ordinary attitude and reason feedback facts only. It does not

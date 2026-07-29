@@ -679,10 +679,10 @@ func newTaskDefinitionEditCutoverFixture(
 	ctx := t.Context()
 	var sourceID int64
 	if err := runFixture.st.pool.QueryRow(ctx,
-		`SELECT source_id
-		   FROM schedule_sources
+		`SELECT fetch_target_id
+		   FROM task_fetch_targets
 		  WHERE schedule_id=$1
-		  ORDER BY source_id
+		  ORDER BY fetch_target_id
 		  LIMIT 1`,
 		taskID,
 	).Scan(&sourceID); err != nil {
@@ -725,7 +725,7 @@ func newTaskDefinitionEditCutoverFixture(
 		runFixture.st.pool.QueryRow(ctx, `
 			INSERT INTO task_definition_edit_operations (
 				id, tenant_id, user_id, target_tenant_id, target_user_id,
-				task_id, session_id, approval_ref, expires_at, original_status,
+				task_id, session_id, operation_ref, expires_at, original_status,
 				base_definition_version, base_definition_digest, base_definition,
 				target_definition_version, target_definition_digest, target_definition,
 				canonical_proposal, proposal_digest, prepared_edit,

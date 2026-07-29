@@ -24,7 +24,7 @@ func (f *fakeEnricher) pageResultsWithEffectGate(
 	ctx context.Context,
 	pageURL string,
 	_ int,
-	_ *types.Source,
+	_ *types.FetchTarget,
 	beforeEffect func(context.Context) error,
 ) ([]exaContentsResult, bool, error) {
 	if err := checkEffectGate(ctx, beforeEffect); err != nil {

@@ -13,8 +13,41 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"github.com/YouToco/vane/feedback"
+	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/types"
 )
+
+func TestSameFetchAcquisitionIdentity(t *testing.T) {
+	frozen := runcontext.SourceV1{
+		SourceID: 7, Platform: types.PlatformWeb,
+		Capability: types.CapSearch, URL: "https://example.com/query",
+		Title:  "frozen display title",
+		Config: json.RawMessage(`{"query":"ai","limit":10}`),
+	}
+	base := types.FetchTarget{
+		ID: 7, Platform: types.PlatformWeb,
+		Capability: types.CapSearch, URL: "https://example.com/query",
+		Title:  "current display title",
+		Config: json.RawMessage(`{"limit":10,"query":"ai"}`),
+	}
+	if !sameFetchAcquisitionIdentity(base, frozen) {
+		t.Fatal("display title and JSON key order must not change acquisition identity")
+	}
+	for name, mutate := range map[string]func(*types.FetchTarget){
+		"platform":   func(target *types.FetchTarget) { target.Platform = types.PlatformX },
+		"capability": func(target *types.FetchTarget) { target.Capability = types.CapFeed },
+		"url":        func(target *types.FetchTarget) { target.URL += "/other" },
+		"config":     func(target *types.FetchTarget) { target.Config = json.RawMessage(`{"query":"other","limit":10}`) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			drifted := base
+			mutate(&drifted)
+			if sameFetchAcquisitionIdentity(drifted, frozen) {
+				t.Fatal("acquisition drift was accepted before paid fetch")
+			}
+		})
+	}
+}
 
 // ============================================================
 // 消费方接口的测试替身。fake 一律带锁：Temporal 测试环境在独立
@@ -23,7 +56,7 @@ import (
 
 type fakeFetcher struct{}
 
-func (fakeFetcher) Fetch(context.Context, types.Source) ([]types.ContentItem, error) {
+func (fakeFetcher) Fetch(context.Context, types.FetchTarget) ([]types.ContentItem, error) {
 	return nil, nil
 }
 
@@ -153,22 +186,22 @@ type fakeStore struct {
 	// P1b b3 分流捕获：hasSchedSources 决定走隔离还是用户级；两个 bySchedule 是隔离路径的返回；
 	// gotSchedDueID/gotSchedUnpushedID 记录隔离路径收到的 scheduleID，供断言"确实走了本任务隔离"。
 	hasSchedSources    bool
-	dueBySchedule      []types.Source
+	dueBySchedule      []types.FetchTarget
 	unpushedBySchedule []types.ContentItem
 	gotSchedDueID      string
 	gotSchedUnpushedID string
 	// 抓取失败告警测试用（功能 5.2）：dueSources 供 ListDueSourcesByUser 返回，
-	// updateFetchErr 模拟 UpdateSourceFetchState 落库失败（验"状态没落库不告警"）。
-	dueSources     []types.Source
+	// updateFetchErr 模拟 UpdateFetchTargetState 落库失败（验"状态没落库不告警"）。
+	dueSources     []types.FetchTarget
 	updateFetchErr error
 	statusSet      []types.BatchStatus // UpdatePushBatchStatus 调用记录（部分失败矩阵用）
-	// 自动停用测试用（功能 5.2）：disableResult 是 DisableSourceIfActive 的返回
+	// 自动停用测试用（功能 5.2）：disableResult 是 DisableFetchTargetIfActive 的返回
 	// （true=本次真从 active 翻成 disabled），disableErr 模拟落库失败，disableCalls 记录入参。
 	disableResult bool
 	disableErr    error
 	disableCalls  []int64
 	// #8 卡片源归属：schedSrcForContent 映射 content_item_id→本任务命中源 id；
-	// 命中即 ScheduleSourceForContent 返回 (id,true)，缺失返回 (0,false) 让调用方回退首发源。
+	// 命中即 TaskFetchTargetForContent 返回 (id,true)，缺失返回 (0,false) 让调用方回退首发源。
 	schedSrcForContent map[int64]int64
 }
 
@@ -252,7 +285,7 @@ func (f *fakeStore) TenantLiveForUser(context.Context, int64) (bool, error) {
 	return true, nil
 }
 
-func (s *fakeStore) DisableSourceIfActive(_ context.Context, id int64) (bool, error) {
+func (s *fakeStore) DisableFetchTargetIfActive(_ context.Context, id int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.disableCalls = append(s.disableCalls, id)
@@ -280,12 +313,12 @@ func (s *fakeStore) emptyBatchCalls() []emptyBatchCall {
 	return append([]emptyBatchCall(nil), s.emptyCalls...)
 }
 
-func (s *fakeStore) GetSource(_ context.Context, id int64) (*types.Source, error) {
+func (s *fakeStore) GetFetchTarget(_ context.Context, id int64) (*types.FetchTarget, error) {
 	// Title 编码 id（src-<id>），便于断言构卡用了哪个源（首发源 vs 任务命中源）。
-	return &types.Source{ID: id, Title: fmt.Sprintf("src-%d", id), Platform: "rss"}, nil
+	return &types.FetchTarget{ID: id, Title: fmt.Sprintf("src-%d", id), Platform: "rss"}, nil
 }
 
-func (s *fakeStore) ScheduleSourceForContent(_ context.Context, contentItemID int64, _ string) (int64, bool, error) {
+func (s *fakeStore) TaskFetchTargetForContent(_ context.Context, contentItemID int64, _ string) (int64, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if sid, ok := s.schedSrcForContent[contentItemID]; ok {
@@ -294,7 +327,7 @@ func (s *fakeStore) ScheduleSourceForContent(_ context.Context, contentItemID in
 	return 0, false, nil
 }
 
-func (s *fakeStore) ListDueSourcesByUser(context.Context, int64) ([]types.Source, error) {
+func (s *fakeStore) ListDueSourcesByUser(context.Context, int64) ([]types.FetchTarget, error) {
 	return s.dueSources, nil // 默认 nil：不涉及抓取的既有测试行为不变。
 }
 
@@ -306,7 +339,7 @@ func (s *fakeStore) ListRecentSimhashesByUser(context.Context, int64, time.Time,
 	return nil, nil
 }
 
-func (s *fakeStore) UpdateSourceFetchState(context.Context, int64, time.Time, time.Time, int) error {
+func (s *fakeStore) UpdateFetchTargetState(context.Context, int64, time.Time, time.Time, int) error {
 	return s.updateFetchErr // 默认 nil；置非 nil 模拟落库失败（功能 5.2 gating 测试）。
 }
 
@@ -318,18 +351,24 @@ func (s *fakeStore) ScheduleHasSources(_ context.Context, _ string) (bool, error
 	return s.hasSchedSources, nil
 }
 
-func (s *fakeStore) ListDueSourcesBySchedule(_ context.Context, scheduleID string) ([]types.Source, error) {
+func (s *fakeStore) ListDueFetchTargetsByTask(_ context.Context, scheduleID string) ([]types.FetchTarget, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gotSchedDueID = scheduleID
-	return s.dueBySchedule, nil
+	if s.dueBySchedule != nil {
+		return s.dueBySchedule, nil
+	}
+	return s.dueSources, nil
 }
 
 func (s *fakeStore) ListUnpushedBySchedule(_ context.Context, scheduleID string, _, _ int) ([]types.ContentItem, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gotSchedUnpushedID = scheduleID
-	return s.unpushedBySchedule, nil
+	if s.unpushedBySchedule != nil {
+		return s.unpushedBySchedule, nil
+	}
+	return s.unpushed, nil
 }
 
 func (s *fakeStore) CreatePushBatchIdempotent(_ context.Context, _ int64, _, scheduleID string) (int64, error) {
@@ -607,7 +646,7 @@ func TestPush_ThreadsScheduleID(t *testing.T) {
 }
 
 // TestPush_IsolatedCardSourceAttribution 守 #8：隔离任务（ScheduleID 非空）构卡时源归属
-// 取 content_sources ∩ schedule_sources 的命中源，而非全局首发源 content_items.source_id；
+// 取 content_sources ∩ task_fetch_targets 的命中源，而非全局首发源 content_items.source_id；
 // 非隔离 / 无交集时回退首发源。
 func TestPush_IsolatedCardSourceAttribution(t *testing.T) {
 	run := func(schedID string, itemFirstSrc int64, mapping map[int64]int64) string {
@@ -720,7 +759,7 @@ func TestGeneratedCard_ReplayCompatTag(t *testing.T) {
 // scriptedFetcher 按 source.ID 返回预设错误：map 里非 nil=该源抓取失败，否则抓成返回空内容。
 type scriptedFetcher struct{ errByID map[int64]error }
 
-func (f scriptedFetcher) Fetch(_ context.Context, src types.Source) ([]types.ContentItem, error) {
+func (f scriptedFetcher) Fetch(_ context.Context, src types.FetchTarget) ([]types.ContentItem, error) {
 	return nil, f.errByID[src.ID]
 }
 
@@ -732,16 +771,15 @@ func (noOwnerFeishu) OwnerOpenID() string { return "" }
 // idNotice 身份构卡器：把 markdown 原样当卡 JSON 返回，便于对推送内容做子串断言。
 func idNotice(md string) string { return md }
 
-func fetchSrc(id int64, failCount int, title string) types.Source {
-	return types.Source{
+func fetchSrc(id int64, failCount int, title string) types.FetchTarget {
+	return types.FetchTarget{
 		ID: id, Title: title, Platform: "rss", Capability: "feed",
 		URL:       fmt.Sprintf("https://example.com/%d", id),
 		FailCount: failCount, FetchIntervalSeconds: 1800,
 	}
 }
 
-// TestFetch_ScheduleScoped 守 P1b b3 的分流：有源手册任务走本任务隔离
-// （ListDueSourcesBySchedule + ListUnpushedBySchedule），无源任务/push_now 退回用户级。
+// TestFetch_ScheduleScoped pins the task-only runtime boundary.
 func TestFetch_ScheduleScoped(t *testing.T) {
 	mk := func(st *fakeStore) *Activities {
 		return NewActivities(scriptedFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, nil, idNotice, nil, nil)
@@ -750,9 +788,9 @@ func TestFetch_ScheduleScoped(t *testing.T) {
 	t.Run("有源手册任务：只抓/挑本任务的源", func(t *testing.T) {
 		st := &fakeStore{
 			hasSchedSources:    true,
-			dueBySchedule:      []types.Source{fetchSrc(1, 0, "本任务源")},
+			dueBySchedule:      []types.FetchTarget{fetchSrc(1, 0, "本任务源")},
 			unpushedBySchedule: []types.ContentItem{{ID: 77}},
-			dueSources:         []types.Source{fetchSrc(2, 0, "用户级源")}, // 走错路径才会用它
+			dueSources:         []types.FetchTarget{fetchSrc(2, 0, "用户级源")}, // 走错路径才会用它
 			unpushed:           []types.ContentItem{{ID: 88}},
 		}
 		got, err := mk(st).Fetch(context.Background(), PushParams{UserID: 7, ScheduleID: "push-7-x"})
@@ -767,31 +805,31 @@ func TestFetch_ScheduleScoped(t *testing.T) {
 		}
 	})
 
-	t.Run("无源手册任务：退回用户级（决策#4 老任务不变）", func(t *testing.T) {
+	t.Run("无源任务仍停留在任务范围", func(t *testing.T) {
 		st := &fakeStore{hasSchedSources: false, unpushed: []types.ContentItem{{ID: 88}}}
 		got, err := mk(st).Fetch(context.Background(), PushParams{UserID: 7, ScheduleID: "push-7-x"})
 		if err != nil {
 			t.Fatalf("Fetch 报错: %v", err)
 		}
-		if st.gotSchedDueID != "" {
-			t.Errorf("无源手册不该走隔离抓取, 实得 %q", st.gotSchedDueID)
+		if st.gotSchedDueID != "push-7-x" {
+			t.Errorf("无源任务也必须走任务级抓取, 实得 %q", st.gotSchedDueID)
 		}
 		if len(got) != 1 || got[0].ID != 88 {
 			t.Errorf("应返回用户级候选(88), 实得 %+v", got)
 		}
 	})
 
-	t.Run("push_now 空 ScheduleID：连开关都不查、直接用户级", func(t *testing.T) {
+	t.Run("空 ScheduleID fail closed", func(t *testing.T) {
 		st := &fakeStore{hasSchedSources: true, unpushed: []types.ContentItem{{ID: 88}}}
 		got, err := mk(st).Fetch(context.Background(), PushParams{UserID: 7}) // ScheduleID=""
-		if err != nil {
-			t.Fatalf("Fetch 报错: %v", err)
+		if err == nil {
+			t.Fatal("account-wide fetch must be rejected")
 		}
 		if st.gotSchedDueID != "" || st.gotSchedUnpushedID != "" {
-			t.Errorf("空 ScheduleID 应完全不碰隔离路径, 实得 due=%q unpushed=%q", st.gotSchedDueID, st.gotSchedUnpushedID)
+			t.Errorf("空 ScheduleID 应零抓取, 实得 due=%q unpushed=%q", st.gotSchedDueID, st.gotSchedUnpushedID)
 		}
-		if len(got) != 1 || got[0].ID != 88 {
-			t.Errorf("应用户级候选(88), 实得 %+v", got)
+		if got != nil {
+			t.Errorf("拒绝时不得返回候选, 实得 %+v", got)
 		}
 	})
 }
@@ -804,14 +842,14 @@ func TestFetchOutcomeV1ReportsDueSourceCoverage(t *testing.T) {
 	}
 	t.Run("one due source failure is partial", func(t *testing.T) {
 		st := &fakeStore{
-			dueSources: []types.Source{
+			dueSources: []types.FetchTarget{
 				fetchSrc(1, 0, "ok"), fetchSrc(2, 0, "failed"),
 			},
 			unpushed: []types.ContentItem{{ID: 77}},
 		}
 		result, err := makeActivities(st, scriptedFetcher{
 			errByID: map[int64]error{2: errors.New("provider failed")},
-		}).FetchOutcomeV1(t.Context(), PushParams{UserID: 7})
+		}).FetchOutcomeV1(t.Context(), PushParams{UserID: 7, ScheduleID: "test-task"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -823,7 +861,7 @@ func TestFetchOutcomeV1ReportsDueSourceCoverage(t *testing.T) {
 	t.Run("no due source is complete", func(t *testing.T) {
 		result, err := makeActivities(
 			&fakeStore{}, scriptedFetcher{}).
-			FetchOutcomeV1(t.Context(), PushParams{UserID: 7})
+			FetchOutcomeV1(t.Context(), PushParams{UserID: 7, ScheduleID: "test-task"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -839,7 +877,7 @@ type cancelBlockingFetcher struct {
 	calls   int
 }
 
-func (f *cancelBlockingFetcher) Fetch(ctx context.Context, _ types.Source) ([]types.ContentItem, error) {
+func (f *cancelBlockingFetcher) Fetch(ctx context.Context, _ types.FetchTarget) ([]types.ContentItem, error) {
 	f.mu.Lock()
 	f.calls++
 	call := f.calls
@@ -852,7 +890,7 @@ func (f *cancelBlockingFetcher) Fetch(ctx context.Context, _ types.Source) ([]ty
 }
 
 func TestFetchCancellationDoesNotStartAnotherPaidSource(t *testing.T) {
-	st := &fakeStore{dueSources: []types.Source{
+	st := &fakeStore{dueSources: []types.FetchTarget{
 		fetchSrc(1, 0, "first"), fetchSrc(2, 0, "second"), fetchSrc(3, 0, "third"),
 	}}
 	fetcher := &cancelBlockingFetcher{started: make(chan struct{})}
@@ -860,7 +898,7 @@ func TestFetchCancellationDoesNotStartAnotherPaidSource(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
-		_, err := a.Fetch(ctx, PushParams{UserID: 7})
+		_, err := a.Fetch(ctx, PushParams{UserID: 7, ScheduleID: "test-task"})
 		done <- err
 	}()
 	select {
@@ -888,7 +926,7 @@ func TestFetchCancellationDoesNotStartAnotherPaidSource(t *testing.T) {
 // 跨过阈值"的源进告警，未到阈值的、抓成功的都不进；多个跨阈源合并成一次告警。
 func TestFetch_AlertsExactlyOnThresholdCrossing(t *testing.T) {
 	push := &fakePusher{}
-	st := &fakeStore{dueSources: []types.Source{
+	st := &fakeStore{dueSources: []types.FetchTarget{
 		fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源"), // 失败后 = 阈值 → 告警
 		fetchSrc(2, 0, "刚开始失败的源"),                       // 失败后 = 1 < 阈值 → 不告警
 		fetchSrc(3, alertFetchFailThreshold-1, "抓成功的源"), // 抓成功 → 清零，不告警
@@ -900,7 +938,7 @@ func TestFetch_AlertsExactlyOnThresholdCrossing(t *testing.T) {
 	}}
 	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
 
-	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1, ScheduleID: "test-task"}); err != nil {
 		t.Fatalf("Fetch 意外报错: %v", err)
 	}
 
@@ -936,10 +974,10 @@ func TestFetch_NoAlertBelowOrAboveThreshold(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			push := &fakePusher{}
-			st := &fakeStore{dueSources: []types.Source{fetchSrc(1, c.failCount, "坏源")}}
+			st := &fakeStore{dueSources: []types.FetchTarget{fetchSrc(1, c.failCount, "坏源")}}
 			fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "超时", nil)}}
 			a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
-			if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+			if _, err := a.Fetch(context.Background(), PushParams{UserID: 1, ScheduleID: "test-task"}); err != nil {
 				t.Fatalf("Fetch 意外报错: %v", err)
 			}
 			if n := len(push.sentCards()); n != 0 {
@@ -954,12 +992,12 @@ func TestFetch_NoAlertBelowOrAboveThreshold(t *testing.T) {
 func TestFetch_NoAlertWhenStateWriteFails(t *testing.T) {
 	push := &fakePusher{}
 	st := &fakeStore{
-		dueSources:     []types.Source{fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源")},
+		dueSources:     []types.FetchTarget{fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源")},
 		updateFetchErr: errors.New("db 挂了"),
 	}
 	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "超时", nil)}}
 	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
-	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1, ScheduleID: "test-task"}); err != nil {
 		t.Fatalf("Fetch 意外报错: %v", err)
 	}
 	if n := len(push.sentCards()); n != 0 {
@@ -971,14 +1009,14 @@ func TestFetch_NoAlertWhenStateWriteFails(t *testing.T) {
 // 降级为 no-op，绝不报错——把"飞书没配好"当正常态（同 Push 对无 owner 的约定）。
 func TestFetch_SilentWithoutOwnerOrBuilder(t *testing.T) {
 	mkStore := func() *fakeStore {
-		return &fakeStore{dueSources: []types.Source{fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源")}}
+		return &fakeStore{dueSources: []types.FetchTarget{fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源")}}
 	}
 	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "超时", nil)}}
 
 	t.Run("无owner", func(t *testing.T) {
 		push := &fakePusher{}
 		a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, mkStore(), noOwnerFeishu{}, nil, idNotice, nil, nil)
-		if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+		if _, err := a.Fetch(context.Background(), PushParams{UserID: 1, ScheduleID: "test-task"}); err != nil {
 			t.Fatalf("Fetch 意外报错: %v", err)
 		}
 		if n := len(push.sentCards()); n != 0 {
@@ -988,7 +1026,7 @@ func TestFetch_SilentWithoutOwnerOrBuilder(t *testing.T) {
 	t.Run("未注入构卡器", func(t *testing.T) {
 		push := &fakePusher{}
 		a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, mkStore(), fakeFeishu{}, nil, nil, nil, nil)
-		if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+		if _, err := a.Fetch(context.Background(), PushParams{UserID: 1, ScheduleID: "test-task"}); err != nil {
 			t.Fatalf("Fetch 意外报错: %v", err)
 		}
 		if n := len(push.sentCards()); n != 0 {
@@ -1010,8 +1048,8 @@ func TestFetchFailureReason(t *testing.T) {
 // TestRenderFetchFailureAlert：告警正文含标题/平台/能力/次数/原因/链接；无标题源退回用 URL。
 func TestRenderFetchFailureAlert(t *testing.T) {
 	md := renderFetchFailureAlert([]fetchFailure{
-		{src: types.Source{Title: "某博主", Platform: "xhs", Capability: "user_posts", URL: "https://xhs/u/1"}, failCount: 3, reason: "抓取超时"},
-		{src: types.Source{Title: "", Platform: "rss", Capability: "feed", URL: "https://blog/feed"}, failCount: 3, reason: "解析失败"},
+		{src: types.FetchTarget{Title: "某博主", Platform: "xhs", Capability: "user_posts", URL: "https://xhs/u/1"}, failCount: 3, reason: "抓取超时"},
+		{src: types.FetchTarget{Title: "", Platform: "rss", Capability: "feed", URL: "https://blog/feed"}, failCount: 3, reason: "解析失败"},
 	})
 	for _, want := range []string{"某博主", "xhs", "user_posts", "连续失败 3 次", "抓取超时", "https://xhs/u/1", "解析失败"} {
 		if !strings.Contains(md, want) {
@@ -1032,11 +1070,11 @@ func TestFetch_AlertDeferredThenSentAfterStateRecovers(t *testing.T) {
 	// 第一轮：落库失败 → 不告警（fail_count 未推进）。
 	push1 := &fakePusher{}
 	st1 := &fakeStore{
-		dueSources:     []types.Source{fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源")},
+		dueSources:     []types.FetchTarget{fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源")},
 		updateFetchErr: errors.New("db 挂了"),
 	}
 	a1 := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push1, st1, fakeFeishu{}, nil, idNotice, nil, nil)
-	if _, err := a1.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+	if _, err := a1.Fetch(context.Background(), PushParams{UserID: 1, ScheduleID: "test-task"}); err != nil {
 		t.Fatalf("第一轮 Fetch 意外报错: %v", err)
 	}
 	if n := len(push1.sentCards()); n != 0 {
@@ -1045,9 +1083,9 @@ func TestFetch_AlertDeferredThenSentAfterStateRecovers(t *testing.T) {
 
 	// 第二轮：上轮未推进，源仍是同一 fail_count；这次落库成功 → 补发一次告警。
 	push2 := &fakePusher{}
-	st2 := &fakeStore{dueSources: []types.Source{fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源")}}
+	st2 := &fakeStore{dueSources: []types.FetchTarget{fetchSrc(1, alertFetchFailThreshold-1, "将跨阈的源")}}
 	a2 := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push2, st2, fakeFeishu{}, nil, idNotice, nil, nil)
-	if _, err := a2.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+	if _, err := a2.Fetch(context.Background(), PushParams{UserID: 1, ScheduleID: "test-task"}); err != nil {
 		t.Fatalf("第二轮 Fetch 意外报错: %v", err)
 	}
 	if n := len(push2.sentCards()); n != 1 {
@@ -1059,29 +1097,29 @@ func TestFetch_AlertDeferredThenSentAfterStateRecovers(t *testing.T) {
 // 连续失败自动停用（功能 5.2，「告警后再宽限」）
 // ============================================================
 
-// TestFetch_AutoDisablesAtThreshold：连续失败达停用阈值 → 调 DisableSourceIfActive 停用
-// 该源，并发一张「已暂停 + 如何重新启用」卡（措辞与预警卡不同）。
+// TestFetch_AutoDisablesAtThreshold：连续失败达停用阈值 → 调 DisableFetchTargetIfActive 停用
+// 该目标，并发一张「已暂停 + 如何通过任务手册修复」卡（措辞与预警卡不同）。
 func TestFetch_AutoDisablesAtThreshold(t *testing.T) {
 	push := &fakePusher{}
 	st := &fakeStore{
-		dueSources:    []types.Source{fetchSrc(1, disableFetchFailThreshold-1, "长期失效的源")},
-		disableResult: true, // DisableSourceIfActive 真从 active 翻成 disabled。
+		dueSources:    []types.FetchTarget{fetchSrc(1, disableFetchFailThreshold-1, "长期失效的源")},
+		disableResult: true, // DisableFetchTargetIfActive 真从 active 翻成 disabled。
 	}
 	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "域名解析失败", nil)}}
 	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
 
-	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1, ScheduleID: "test-task"}); err != nil {
 		t.Fatalf("Fetch 意外报错: %v", err)
 	}
 	if len(st.disableCalls) != 1 || st.disableCalls[0] != 1 {
-		t.Fatalf("达阈值应对 source 1 调一次 DisableSourceIfActive，实得 %+v", st.disableCalls)
+		t.Fatalf("达阈值应对 source 1 调一次 DisableFetchTargetIfActive，实得 %+v", st.disableCalls)
 	}
 	cards := push.sentCards()
 	if len(cards) != 1 {
 		t.Fatalf("应恰好发一张停用卡，实得 %d 张", len(cards))
 	}
 	card := cards[0]
-	for _, want := range []string{"已自动暂停", "长期失效的源", "域名解析失败", "重新启用"} {
+	for _, want := range []string{"已自动暂停", "长期失效的源", "域名解析失败", "任务手册", "无需管理内部 ID"} {
 		if !strings.Contains(card, want) {
 			t.Errorf("停用卡应含 %q，实得:\n%s", want, card)
 		}
@@ -1092,17 +1130,17 @@ func TestFetch_AutoDisablesAtThreshold(t *testing.T) {
 	}
 }
 
-// TestFetch_NoDisableAlertWhenNotTransitioned：DisableSourceIfActive 返回 false（已是
+// TestFetch_NoDisableAlertWhenNotTransitioned：DisableFetchTargetIfActive 返回 false（已是
 // disabled，未翻转）时不重复发停用卡——幂等，避免每轮刷屏。
 func TestFetch_NoDisableAlertWhenNotTransitioned(t *testing.T) {
 	push := &fakePusher{}
 	st := &fakeStore{
-		dueSources:    []types.Source{fetchSrc(1, disableFetchFailThreshold, "已停用的源")}, // 失败后 > 阈值
-		disableResult: false,                                                           // WHERE status='active' 命不中：未翻转。
+		dueSources:    []types.FetchTarget{fetchSrc(1, disableFetchFailThreshold, "已停用的源")}, // 失败后 > 阈值
+		disableResult: false,                                                                // WHERE status='active' 命不中：未翻转。
 	}
 	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "超时", nil)}}
 	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
-	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1, ScheduleID: "test-task"}); err != nil {
 		t.Fatalf("Fetch 意外报错: %v", err)
 	}
 	if n := len(push.sentCards()); n != 0 {
@@ -1114,28 +1152,33 @@ func TestFetch_NoDisableAlertWhenNotTransitioned(t *testing.T) {
 // 不停用——「告警后再宽限」的核心，短暂宕机的站点在这个窗口内恢复即清零。
 func TestFetch_NoDisableBelowThreshold(t *testing.T) {
 	push := &fakePusher{}
-	st := &fakeStore{dueSources: []types.Source{fetchSrc(1, disableFetchFailThreshold-2, "还在宽限窗口的源")}}
+	st := &fakeStore{dueSources: []types.FetchTarget{fetchSrc(1, disableFetchFailThreshold-2, "还在宽限窗口的源")}}
 	fetcher := scriptedFetcher{errByID: map[int64]error{1: types.NewAppError(types.CodeFetchTimeout, "超时", nil)}}
 	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, push, st, fakeFeishu{}, nil, idNotice, nil, nil)
-	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1}); err != nil {
+	if _, err := a.Fetch(context.Background(), PushParams{UserID: 1, ScheduleID: "test-task"}); err != nil {
 		t.Fatalf("Fetch 意外报错: %v", err)
 	}
 	if len(st.disableCalls) != 0 {
-		t.Errorf("未达停用阈值不该调 DisableSourceIfActive，实得 %+v", st.disableCalls)
+		t.Errorf("未达停用阈值不该调 DisableFetchTargetIfActive，实得 %+v", st.disableCalls)
 	}
 	if n := len(push.sentCards()); n != 0 {
 		t.Errorf("宽限窗口内不该发停用卡，却发了 %d 张", n)
 	}
 }
 
-// TestRenderSourcesDisabledAlert：停用卡正文含阈值/源信息/两条恢复路径（信源页 + 对 AI 说）。
+// TestRenderSourcesDisabledAlert：停用卡正文只引导用户修改任务，不暴露内部目标 CRUD。
 func TestRenderSourcesDisabledAlert(t *testing.T) {
 	md := renderSourcesDisabledAlert([]fetchFailure{
-		{src: types.Source{Title: "某站", Platform: "web", Capability: "feed", URL: "https://s/feed"}, failCount: disableFetchFailThreshold, reason: "连续超时"},
+		{src: types.FetchTarget{Title: "某站", Platform: "web", Capability: "feed", URL: "https://s/feed"}, failCount: disableFetchFailThreshold, reason: "连续超时"},
 	})
-	for _, want := range []string{"已自动暂停", "某站", "连续超时", "信源管理", "重新启用信源"} {
+	for _, want := range []string{"已自动暂停", "某站", "连续超时", "任务手册", "无需管理内部 ID"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("停用卡正文应含 %q，实得:\n%s", want, md)
+		}
+	}
+	for _, forbidden := range []string{"信源管理", "重新启用信源", "source_id"} {
+		if strings.Contains(md, forbidden) {
+			t.Errorf("停用卡正文不应暴露旧来源操作 %q，实得:\n%s", forbidden, md)
 		}
 	}
 }
@@ -1150,7 +1193,7 @@ func TestFetchAlertHelpersAuthorizeAfterCardBuildAndBeforeSend(t *testing.T) {
 			name: "failure alert",
 			run: func(a *Activities, before func(context.Context) error) error {
 				return a.alertFetchFailures(t.Context(), []fetchFailure{{
-					src: types.Source{ID: 1, Title: "source"}, failCount: 3,
+					src: types.FetchTarget{ID: 1, Title: "source"}, failCount: 3,
 				}}, before)
 			},
 		},
@@ -1158,7 +1201,7 @@ func TestFetchAlertHelpersAuthorizeAfterCardBuildAndBeforeSend(t *testing.T) {
 			name: "disabled alert",
 			run: func(a *Activities, before func(context.Context) error) error {
 				return a.alertSourcesDisabled(t.Context(), []fetchFailure{{
-					src: types.Source{ID: 1, Title: "source"}, failCount: 10,
+					src: types.FetchTarget{ID: 1, Title: "source"}, failCount: 10,
 				}}, before)
 			},
 		},
@@ -1404,7 +1447,7 @@ func TestActivities_RefusesSpendingForDeletedTenant(t *testing.T) {
 	// 用例看着在测、其实测不出闸门有没有生效（探针实测确认过这一点）。
 	st := &fakeStore{
 		tenantGone: true,
-		dueSources: []types.Source{{ID: 1, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: "https://x.example/rss"}},
+		dueSources: []types.FetchTarget{{ID: 1, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: "https://x.example/rss"}},
 	}
 	a := NewActivities(fetcher, fakeScorer{}, fakeCardGen{}, &fakePusher{}, st, fakeFeishu{}, ev, nil, nil, nil)
 
@@ -1415,7 +1458,7 @@ func TestActivities_RefusesSpendingForDeletedTenant(t *testing.T) {
 		t.Errorf("已注销租户不得跑画像演化（花 LLM 的钱），实得 %d 次", ev.calls)
 	}
 
-	items, err := a.Fetch(t.Context(), PushParams{UserID: 1})
+	items, err := a.Fetch(t.Context(), PushParams{UserID: 1, ScheduleID: "test-task"})
 	if err != nil {
 		t.Errorf("已注销租户应返回空候选而非报错：%v", err)
 	}
@@ -1451,7 +1494,7 @@ func (c *countingEvolver) Evolve(context.Context, int64, string) error { c.calls
 
 type countingFetcher struct{ calls int }
 
-func (c *countingFetcher) Fetch(context.Context, types.Source) ([]types.ContentItem, error) {
+func (c *countingFetcher) Fetch(context.Context, types.FetchTarget) ([]types.ContentItem, error) {
 	c.calls++
 	return nil, nil
 }

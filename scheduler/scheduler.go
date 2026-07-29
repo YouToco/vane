@@ -336,9 +336,9 @@ func makePushParams(tenantID, userID int64, schedID string, scope workflow.PushS
 // 冻结进 schedule spec，b1 只在 CreatePush 时把 ScheduleID 写进 Action.Args。b1 之前建的
 // 存量调度（如 07-14 建的早报任务）Action.Args 里没有 schedule_id，每次定时触发 workflow
 // 都拿到空 ScheduleID → b3 的 planScoped 恒 false → 隔离永不激活。于是决策 #4 的"老任务
-// 补手册→自包含"迁移成了死胡同：手册编译写了 schedule_sources，调度触发却照旧抓全部订阅。
+// 补手册→自包含"迁移成了死胡同：手册编译写了 task_fetch_targets，调度触发却照旧抓全部订阅。
 // 本方法在启动时给存量调度补上 schedule_id，让已编译手册的任务真正走隔离；**b3 仍以
-// ScheduleHasSources 门禁把关**——无手册任务的 schedule_id 到了 workflow 也因 schedule_sources
+// ScheduleHasSources 门禁把关**——无手册任务的 schedule_id 到了 workflow 也因 task_fetch_targets
 // 为空而回落用户级，决策 #4「无手册老任务抓全部订阅」不破。
 //
 // 同时以数据库镜像的 TenantID 升级旧 tenant=0 Action，并补齐显式 scheduled RunKind、
@@ -515,63 +515,6 @@ func actionMatchesParams(action client.ScheduleAction, want workflow.PushParams)
 	return got.TenantID == want.TenantID && got.RunKind == want.RunKind &&
 		got.ExecutionMode == want.ExecutionMode && got.RuntimeVersion == want.RuntimeVersion &&
 		got.ScheduleID == want.ScheduleID && got.NLDesc == want.NLDesc, nil
-}
-
-// PushNow 立即触发一次推送（不建调度），供"现在推"按钮用。
-// 返回 workflow ID（含 uuid，唯一），调用方可据此在 Temporal 查该次执行。
-func (s *Scheduler) PushNow(ctx context.Context, userID int64, scope workflow.PushScope) (string, error) {
-	params := workflow.PushParams{UserID: userID, RunKind: workflow.PushRunKindAdHoc, Scope: scope}
-	run, err := s.c.ExecuteWorkflow(ctx,
-		client.StartWorkflowOptions{
-			ID:        fmt.Sprintf("push-adhoc-%d-%s", userID, uuid.NewString()),
-			TaskQueue: s.tq,
-		},
-		workflow.PushPipelineWorkflow, params)
-	if err != nil {
-		return "", types.NewAppError(types.CodeInternal, "触发即时推送失败", err)
-	}
-	return run.GetID(), nil
-}
-
-// TriggerPushNow 是 agent push_now 工具的窄入口（M4 契约 §8 PushTrigger 接口）：
-// 行为等价于 API POST /api/push/now 空 body（零值 scope = 该用户全部 active 订阅）。
-// 单独包一层而非让 agent 直接调 PushNow：PushTrigger 只暴露 userID，
-// 不把 workflow.PushScope 这类管道内部结构泄进 agent 工具面（agent 也被禁止 import api）。
-//
-// 与 API 路径的关键差异（审查 #push_now 扇出）：workflow ID 用**确定性** ID 而非 uuid。
-// push_now 是免确认工具，模型一轮可产出任意多个调用——每个都是一整条烧 LLM 的推送管道。
-// 确定性 ID 依赖 Temporal 的 WorkflowExecutionAlreadyStarted 把并发钉死为 1：
-// 同一用户同时只有一条 agent 触发的管道在跑，跑完 ID 可复用（默认重用策略）。
-// API 的 PushNow 保持 uuid：按钮触发天然低频，且每次独立 run_id 便于排查。
-//
-// SDK 坑：同 ID workflow 正在运行时 ExecuteWorkflow 默认**不返回错误**，而是静默
-// attach 到现有 execution 并正常返回其 run 句柄——AlreadyStarted 只有显式置
-// WorkflowExecutionErrorWhenAlreadyStarted:true 才会抛出（sdk v1.46.0 internal/client.go），
-// 否则下方拒绝分支永远走不到，重复触发会返回与成功相同的文案。
-func (s *Scheduler) TriggerPushNow(ctx context.Context, userID int64) (string, error) {
-	params := workflow.PushParams{UserID: userID, RunKind: workflow.PushRunKindAdHoc, Scope: workflow.PushScope{}}
-	run, err := s.c.ExecuteWorkflow(ctx,
-		client.StartWorkflowOptions{
-			ID:        fmt.Sprintf("push-agent-%d", userID),
-			TaskQueue: s.tq,
-			// 见函数注释：不置 true 则同 ID 在跑时 SDK 静默 attach，并发护栏失效。
-			// 不影响"跑完 ID 复用"：默认 WorkflowIDReusePolicy=AllowDuplicate 允许
-			// 对已完成的同 ID re-run，本开关只在策略禁止 re-run 时才报错。
-			WorkflowExecutionErrorWhenAlreadyStarted: true,
-		},
-		workflow.PushPipelineWorkflow, params)
-	if err != nil {
-		var already *serviceerror.WorkflowExecutionAlreadyStarted
-		if errors.As(err, &already) {
-			// 确定性拒绝：文案回给模型自纠（不再重复触发），不可重试。
-			ae := types.NewAppError(types.CodeValidation,
-				"已有一次推送正在进行，请等它完成后再触发", err)
-			ae.Retryable = false
-			return "", ae
-		}
-		return "", types.NewAppError(types.CodeInternal, "触发即时推送失败", err)
-	}
-	return run.GetID(), nil
 }
 
 // TriggerScheduleNow retains the pre-6.8 internal signature. HTTP callers use

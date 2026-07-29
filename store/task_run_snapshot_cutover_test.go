@@ -279,7 +279,7 @@ func TestTaskRunSnapshotCutoverRecreatedTaskUsesNextGeneration(t *testing.T) {
 		ctx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(ctx, t, f.base.st,
-			`DELETE FROM sources WHERE url LIKE $1`, oldPrefix+"%")
+			`DELETE FROM fetch_targets WHERE url LIKE $1`, oldPrefix+"%")
 	})
 	f.base.urlPrefix += "/recreated"
 	f.base.createApprovedTask(t, f.taskID, 1)

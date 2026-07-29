@@ -41,7 +41,7 @@ func TestContextShadowWiringGuardsEveryLoopChatCall(t *testing.T) {
 		calls++
 		searchFrom = callAt + len(call)
 	}
-	if calls != 2 {
-		t.Fatalf("Loop chatFn call count=%d, want exactly main + final", calls)
+	if calls != 1 {
+		t.Fatalf("Loop chatFn call count=%d, want exactly one guarded call site", calls)
 	}
 }

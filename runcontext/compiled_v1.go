@@ -17,8 +17,8 @@ const (
 	// SourceScopeApprovedPlan identifies a task whose exact compiled plan and
 	// materialized sources were approved by the user.
 	SourceScopeApprovedPlan = "approved_plan"
-	// SourceScopeLegacySubscriptions identifies the explicit compatibility
-	// snapshot of the subscriptions that existed when the run began.
+	// SourceScopeLegacySubscriptions identifies a frozen historical snapshot
+	// written before account subscriptions were retired.
 	SourceScopeLegacySubscriptions = "legacy_subscriptions"
 )
 

@@ -12,7 +12,9 @@ func classifyOwnerIntents(text string) ToolIntent {
 		"信源", "订阅源", "rss", "feed", "公众号", "微博源", "来源",
 		"订阅这个", "持续关注", "持续追踪", "盯住", "监控这个页面",
 	) {
-		intents |= IntentSources
+		// Legacy user vocabulary still means a recurring task; it no longer
+		// exposes a separate source-management toolkit.
+		intents |= IntentTasks
 	}
 	if containsAny(normalized,
 		"任务", "定时", "日程", "计划", "早报", "日报", "周报", "月报",
@@ -49,28 +51,12 @@ func classifyOwnerIntents(text string) ToolIntent {
 func explicitOwnerToolIntent(toolName, text string) bool {
 	normalized := strings.ToLower(strings.Join(strings.Fields(text), ""))
 	switch toolName {
-	case "add_source":
-		return containsAny(normalized,
-			"订阅", "添加信源", "加信源", "加入信源", "持续关注",
-			"持续追踪", "盯住", "监控这个页面", "addsource",
-		)
-	case "remove_source":
-		return containsAny(normalized,
-			"取消订阅", "退订", "删除信源", "移除信源", "不再关注",
-			"停掉", "停止追踪", "停止关注", "关掉订阅",
-			"removesource", "unsubscribe",
-		)
-	case "enable_source":
-		return containsAny(normalized,
-			"重新启用", "恢复信源", "启用信源", "恢复订阅",
-			"enablesource", "re-enable",
-		)
 	case "remove_schedule":
 		return containsAny(normalized,
 			"删除任务", "取消任务", "停止任务", "关掉任务", "移除任务",
 			"删除早报", "取消早报", "removeschedule", "deletetask",
 		)
-	case "push_now":
+	case "run_task_now":
 		return containsAny(normalized,
 			"立即推送", "现在推送", "马上推送", "立即运行", "现在运行",
 			"马上运行", "立即检查", "现在检查", "pushnow", "runnow",

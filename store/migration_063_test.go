@@ -1,19 +1,11 @@
 package store
 
 import (
-	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/pressly/goose/v3"
-
-	"github.com/YouToco/vane/types"
 )
 
 func TestMigration063RecoveryRoleIsReadOnlyAndKeysetBounded(t *testing.T) {
@@ -145,121 +137,6 @@ func TestMigration063ReaderDoesNotExposeFreshPendingRows(t *testing.T) {
 	}
 }
 
-func TestMigration063DownRefusesPendingOutcome(t *testing.T) {
-	f := newCanonicalBriefFixture(t, 0)
-	if _, err := f.base.st.CreatePendingRunOutcomeV1(
-		t.Context(), f.identity, f.ref); err != nil {
-		t.Fatal(err)
-	}
-	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	dir, err := fs.Sub(migrationsFS, "migrations")
-	if err != nil {
-		t.Fatal(err)
-	}
-	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := provider.DownTo(t.Context(), 62); err == nil ||
-		!strings.Contains(err.Error(),
-			"refusing downgrade while pending run outcomes exist") {
-		t.Fatalf("pending outcome downgrade error = %v", err)
-	}
-	var version int64
-	if err := db.QueryRowContext(t.Context(),
-		`SELECT max(version_id)
-		   FROM goose_db_version
-		  WHERE is_applied`).Scan(&version); err != nil {
-		t.Fatal(err)
-	}
-	if version != 63 {
-		t.Fatalf("failed Down changed migration version to %d", version)
-	}
-}
-
-func TestMigration063DownDrainsAdmittedOutcomeWriter(t *testing.T) {
-	f := newCanonicalBriefFixture(t, 0)
-	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	dir, err := fs.Sub(migrationsFS, "migrations")
-	if err != nil {
-		t.Fatal(err)
-	}
-	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	writer, err := db.BeginTx(t.Context(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writerDone := false
-	defer func() {
-		if !writerDone {
-			_ = writer.Rollback()
-		}
-	}()
-	if _, err := writer.ExecContext(t.Context(),
-		`SELECT pg_advisory_xact_lock_shared(6215335020355474248)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := writer.ExecContext(t.Context(), `
-		SELECT set_config('app.tenant_id',$1,true),
-		       set_config('app.user_id',$2,true)`,
-		fmt.Sprint(f.identity.TenantID),
-		fmt.Sprint(f.identity.UserID),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := writer.ExecContext(t.Context(),
-		`SET LOCAL ROLE vane_brief_writer`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := writer.ExecContext(t.Context(), `
-		INSERT INTO task_run_outcomes (
-		    tenant_id,user_id,task_id,run_snapshot_id,schema_version
-		) VALUES ($1,$2,$3,$4,'vane.run-outcome/v1')`,
-		f.identity.TenantID, f.identity.UserID,
-		f.identity.TaskID, f.ref.SnapshotID,
-	); err != nil {
-		t.Fatal(err)
-	}
-
-	downDone := make(chan error, 1)
-	go func() {
-		_, downErr := provider.DownTo(t.Context(), 62)
-		downDone <- downErr
-	}()
-	select {
-	case err := <-downDone:
-		t.Fatalf("063 Down crossed an admitted outcome writer: %v", err)
-	case <-time.After(200 * time.Millisecond):
-	}
-	if err := writer.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	writerDone = true
-
-	select {
-	case err := <-downDone:
-		if err == nil || !strings.Contains(
-			err.Error(), "refusing downgrade while pending run outcomes exist",
-		) {
-			t.Fatalf("063 Down did not observe admitted pending marker: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("063 Down did not converge after admitted writer committed")
-	}
-}
-
 func TestMigration063DownUsesCanonicalWriterFence(t *testing.T) {
 	raw, err := fs.ReadFile(
 		migrationsFS, "migrations/063_run_outcome_recovery.sql")
@@ -273,102 +150,5 @@ func TestMigration063DownUsesCanonicalWriterFence(t *testing.T) {
 	if strings.Contains(string(raw),
 		"REVOKE vane_run_outcome_recovery FROM CURRENT_USER") {
 		t.Fatal("063 Down must not remove preexisting cluster role membership")
-	}
-}
-
-func TestMigration063DownRejectsBeginQueuedBehindFence(t *testing.T) {
-	f := newCanonicalBriefFixture(t, 0)
-	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	dir, err := fs.Sub(migrationsFS, "migrations")
-	if err != nil {
-		t.Fatal(err)
-	}
-	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := provider.DownTo(t.Context(), 63); err != nil {
-		t.Fatalf("prepare exact 063 downgrade fixture: %v", err)
-	}
-	defer func() {
-		if _, upErr := provider.UpTo(context.Background(), 64); upErr != nil {
-			t.Errorf("restore latest migration: %v", upErr)
-		}
-	}()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
-	defer cancel()
-	blocker, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	blockerDone := false
-	defer func() {
-		if !blockerDone {
-			_ = blocker.Rollback()
-		}
-	}()
-	if _, err := blocker.ExecContext(ctx,
-		`LOCK TABLE task_run_outcomes IN ACCESS EXCLUSIVE MODE`); err != nil {
-		t.Fatal(err)
-	}
-
-	downDone := make(chan error, 1)
-	go func() {
-		_, downErr := provider.DownTo(ctx, 62)
-		downDone <- downErr
-	}()
-	if !waitForScratchQueryLock(
-		ctx, db, "%refusing downgrade while pending run outcomes exist%",
-		5*time.Second,
-	) {
-		t.Fatal("063 Down did not hold the exclusive fence before its check")
-	}
-
-	beginDone := make(chan error, 1)
-	go func() {
-		_, beginErr := f.base.st.CreatePendingRunOutcomeV1(
-			ctx, f.identity, f.ref)
-		beginDone <- beginErr
-	}()
-	if !waitForScratchQueryLock(
-		ctx, db, "%pg_advisory_xact_lock_shared%", 5*time.Second,
-	) {
-		t.Fatal("queued Begin did not wait behind 063 Down")
-	}
-	if err := blocker.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	blockerDone = true
-
-	select {
-	case err := <-downDone:
-		if err != nil {
-			t.Fatalf("063 Down with no pending markers: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("063 Down did not converge")
-	}
-	select {
-	case err := <-beginDone:
-		if err == nil || !errors.Is(err, types.ErrDatabase) {
-			t.Fatalf("queued Begin after recovery teardown = %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("queued Begin did not fail closed")
-	}
-
-	var pending int
-	if err := db.QueryRowContext(ctx,
-		`SELECT count(*) FROM task_run_outcomes WHERE status='pending'`,
-	).Scan(&pending); err != nil {
-		t.Fatal(err)
-	}
-	if pending != 0 {
-		t.Fatalf("queued Begin stranded %d pending markers", pending)
 	}
 }

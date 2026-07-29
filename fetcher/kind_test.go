@@ -2,7 +2,7 @@ package fetcher
 
 // 本文件守卫 M6 契约 §7.2(b) 的 Kind 语义：Kind 由抓取器在**构造 item 处**显式
 // 赋值，finalize 只校验不兜底。钉死两件事：
-//   1. 每个 Available 能力实际产出的 Kind 与 sourcecatalog 登记一致（一致性锁）；
+//   1. 每个 Available 能力实际产出的 Kind 与 capabilitycatalog 登记一致（一致性锁）；
 //   2. finalize 对空 Kind 一律拒绝（单条跳过，不炸整批）。
 // 背景是 2026-07-16 生产事故：008 加列后全链路无人赋值，Go 零值 "" 被显式 INSERT
 // 覆盖 DB 的 DEFAULT 'article'，全部新内容 kind 落成空串（存量由 012 回填）。
@@ -19,7 +19,7 @@ import (
 
 	"github.com/mmcdole/gofeed"
 
-	"github.com/YouToco/vane/sourcecatalog"
+	"github.com/YouToco/vane/capabilitycatalog"
 	"github.com/YouToco/vane/types"
 )
 
@@ -52,7 +52,7 @@ func TestMapExaResults_ProducesKindArticle(t *testing.T) {
 	requireAllKindArticle(t, items)
 }
 
-// TestCatalogKindMatchesFetcherEmittedKind 是 sourcecatalog 登记的 Kind 与各抓取器
+// TestCatalogKindMatchesFetcherEmittedKind 是 capabilitycatalog 登记的 Kind 与各抓取器
 // **实际产出**的 Kind 之间的一致性锁。手写 map 函数的能力（rss/exa/contents）直接调
 // map 函数；绑定能力走引擎全链路（fixture 假服务端），确保「模板声明的 Kind」真的
 // 落到了产出条目上，而不是只在声明层一致。
@@ -86,7 +86,7 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 		}},
 		{types.PlatformWeb, types.CapContents, func(*testing.T) []types.ContentItem {
 			return contentsItems(
-				types.Source{ID: 1, Platform: types.PlatformWeb, Capability: types.CapContents},
+				types.FetchTarget{ID: 1, Platform: types.PlatformWeb, Capability: types.CapContents},
 				[]exaContentsResult{{ID: "c1", URL: "https://x.example/pricing", Title: "定价", Text: "正文"}})
 		}},
 		{types.PlatformXHS, types.CapSearch, bindingItems(b, types.PlatformXHS, types.CapSearch, `{"keyword":"k"}`)},
@@ -102,9 +102,9 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 	covered := map[string]bool{}
 	for _, tc := range cases {
 		covered[string(tc.platform)+"/"+string(tc.capability)] = true
-		want, ok := sourcecatalog.KindOf(tc.platform, tc.capability)
+		want, ok := capabilitycatalog.KindOf(tc.platform, tc.capability)
 		if !ok {
-			t.Errorf("%s/%s 在 sourcecatalog 里不可用，无从比对 Kind", tc.platform, tc.capability)
+			t.Errorf("%s/%s 在 capabilitycatalog 里不可用，无从比对 Kind", tc.platform, tc.capability)
 			continue
 		}
 		items := tc.items(t)
@@ -113,14 +113,14 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 		}
 		for i, it := range items {
 			if it.Kind != want {
-				t.Errorf("%s/%s 第 %d 条产出 Kind=%q，但 sourcecatalog.KindOf=%q，二者漂移",
+				t.Errorf("%s/%s 第 %d 条产出 Kind=%q，但 capabilitycatalog.KindOf=%q，二者漂移",
 					tc.platform, tc.capability, i, it.Kind, want)
 			}
 		}
 	}
-	// 完备性：sourcecatalog 每个 Available 能力都必须有比对用例——新增能力忘了配
+	// 完备性：capabilitycatalog 每个 Available 能力都必须有比对用例——新增能力忘了配
 	// fixture 时在此变红，而不是让一致性锁静默漏一个能力。
-	for _, e := range sourcecatalog.List() {
+	for _, e := range capabilitycatalog.List() {
 		if e.Available() && !covered[string(e.Platform)+"/"+string(e.Capability)] {
 			t.Errorf("Available 能力 %s/%s 没有 Kind 一致性比对用例", e.Platform, e.Capability)
 		}
@@ -131,7 +131,7 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 func bindingItems(b *BindingFetcher, p types.Platform, c types.Capability, cfg string) func(t *testing.T) []types.ContentItem {
 	return func(t *testing.T) []types.ContentItem {
 		t.Helper()
-		items, err := b.Fetch(context.Background(), types.Source{
+		items, err := b.Fetch(context.Background(), types.FetchTarget{
 			ID: 1, Platform: p, Capability: c, Config: json.RawMessage(cfg),
 		})
 		if err != nil {
@@ -158,7 +158,7 @@ func TestFinalize_DropsItemWithoutKind(t *testing.T) {
 }
 
 // contentsItems 把 mapExaContents 的 (item, dropReason) 适配成切片，供 kind 一致性锁复用。
-func contentsItems(src types.Source, results []exaContentsResult) []types.ContentItem {
+func contentsItems(src types.FetchTarget, results []exaContentsResult) []types.ContentItem {
 	it, dr := mapExaContents(src, "https://x.example/pricing", "", results)
 	if dr != dropNone {
 		return nil

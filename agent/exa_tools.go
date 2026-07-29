@@ -1,7 +1,7 @@
 // web_search / read_page：Exa 两个 ad-hoc 只读工具（M4 契约 §8 扩展）。
 //
 // 解决的形态（2026-07-20 Boss 生产实测撞见）：用户临时问「这个页面写了什么」
-// 「帮我查一下 X 的价格」时，agent 此前没有即时读取能力，只能把页面 add_source 加成
+// 「帮我查一下 X 的价格」时，Agent 用本文件的一次性读取能力，不创建长期任务。
 // 信源再抓——一次性需求被迫走订阅设施（信源成了"固定点"）。两个工具把 Exa /search
 // 与 /contents 接成即时能力：**不建信源、不写内容库、结果只回给当前对话**。
 //
@@ -68,7 +68,7 @@ func NewExaTools(searcher webSearcher, reader pageReader, counter exaCallCounter
 func (e *ExaTools) SearchTool() ToolSpec {
 	return newToolSpec(&webSearchTool{et: e}, withToolSurface(ownerPolicy(
 		Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
-		ConfirmationNone, BudgetToolManaged),
+		BudgetToolManaged),
 		ExposureAlways, IntentWebResearch, ResultTrustExternal, false))
 }
 
@@ -76,7 +76,7 @@ func (e *ExaTools) SearchTool() ToolSpec {
 func (e *ExaTools) ReadPageTool() ToolSpec {
 	return newToolSpec(&readPageTool{et: e}, withToolSurface(ownerPolicy(
 		Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
-		ConfirmationNone, BudgetToolManaged),
+		BudgetToolManaged),
 		ExposureAlways, IntentWebResearch, ResultTrustExternal, false))
 }
 
@@ -344,7 +344,7 @@ func (t *readPageTool) Name() string { return "read_page" }
 func (t *readPageTool) Description() string {
 	return "一次性读取指定公开网页的最新正文（可能计费）。" +
 		"用于临时查看某个页面写了什么（价格、在售情况、公告等）——不需要把页面加成信源。" +
-		"正文过长会截断；要持续监控页面变化才用 add_source（web/contents）。"
+		"正文过长会截断；要持续监控页面变化则创建带 web_contents 取材目标的任务。"
 }
 func (t *readPageTool) Parameters() json.RawMessage { return json.RawMessage(readPageSchema) }
 func (t *readPageTool) untrustedResult() bool       { return true }

@@ -29,33 +29,26 @@ type User struct {
 	EmailVerified bool `json:"email_verified"`
 }
 
-// Source 信源（sources 表）。
+// FetchTarget is one globally de-duplicated acquisition endpoint
+// (fetch_targets table). It is internal derived state, never a user-owned
+// product object.
 // 关键设计：next_fetch_at 为预计算的下次抓取时间（替代表达式索引），
 // 抓取完成时由 store 层同时更新 last_fetched_at 与 next_fetch_at；
 // 调度查询 WHERE status='active' AND next_fetch_at <= now() 命中 (status, next_fetch_at) 索引。
-type Source struct {
-	ID                   int64           `json:"id"`
-	Platform             Platform        `json:"platform"`   // 008 起取代 Type
-	Capability           Capability      `json:"capability"` // 008 起取代 Type
-	URL                  string          `json:"url"`
-	Title                string          `json:"title"`
-	Config               json.RawMessage `json:"config"` // JSONB，按 Platform+Capability 各自定义结构
-	Status               SourceStatus    `json:"status"`
-	FetchIntervalSeconds int             `json:"fetch_interval_seconds"`
-	NextFetchAt          time.Time       `json:"next_fetch_at"`             // NOT NULL DEFAULT now()
-	LastFetchedAt        *time.Time      `json:"last_fetched_at,omitempty"` // 从未抓取过时为 NULL
-	FailCount            int             `json:"fail_count"`                // 连续失败计数，达阈值自动 disabled
-	CreatedAt            time.Time       `json:"created_at"`
-	UpdatedAt            time.Time       `json:"updated_at"`
-}
-
-// Subscription 用户订阅关系（subscriptions 表），UNIQUE(user_id, source_id)。
-type Subscription struct {
-	ID        int64              `json:"id"`
-	UserID    int64              `json:"user_id"`
-	SourceID  int64              `json:"source_id"`
-	Status    SubscriptionStatus `json:"status"`
-	CreatedAt time.Time          `json:"created_at"`
+type FetchTarget struct {
+	ID                   int64             `json:"id"`
+	Platform             Platform          `json:"platform"`   // 008 起取代 Type
+	Capability           Capability        `json:"capability"` // 008 起取代 Type
+	URL                  string            `json:"url"`
+	Title                string            `json:"title"`
+	Config               json.RawMessage   `json:"config"` // JSONB，按 Platform+Capability 各自定义结构
+	Status               FetchTargetStatus `json:"status"`
+	FetchIntervalSeconds int               `json:"fetch_interval_seconds"`
+	NextFetchAt          time.Time         `json:"next_fetch_at"`             // NOT NULL DEFAULT now()
+	LastFetchedAt        *time.Time        `json:"last_fetched_at,omitempty"` // 从未抓取过时为 NULL
+	FailCount            int               `json:"fail_count"`                // 连续失败计数，达阈值自动 disabled
+	CreatedAt            time.Time         `json:"created_at"`
+	UpdatedAt            time.Time         `json:"updated_at"`
 }
 
 // ContentItem 抓取到的内容条目（content_items 表），UNIQUE(canonical_key)。
@@ -90,7 +83,7 @@ type ContentItem struct {
 	ObservationPolicyDigest string          `json:"observation_policy_digest,omitempty"`
 	ObservationEventJSON    json.RawMessage `json:"observation_event_json,omitempty"`
 	// ObservationScorePenalty is a runtime-only deterministic adjustment for
-	// content whose source supplied no date under a confirmed "deprioritize"
+	// content whose acquisition target supplied no date under a "deprioritize"
 	// policy. It is never persisted as an objective content fact.
 	ObservationScorePenalty float64 `json:"observation_score_penalty,omitempty"`
 }
@@ -112,7 +105,7 @@ type ContentItem struct {
 // 不承担过滤职责。
 //
 // 与 001 "JSONB → json.RawMessage（延迟解析）" 的约定不冲突：那条针对的是
-// **多态**载荷（sources.config 按 type 各自定义、pending_actions.args 是模型产出），
+// **多态**载荷（fetch_targets.config 按 kind 各自定义、task_creation_operations.args 是模型产出），
 // 消费方各不相同故不能在 types 里定死。漏斗计数恰恰相反——形状固定且全系统唯一，
 // 定成结构体才能让 store/probe/前端共用一份、编译期对齐。
 type PipelineCounts struct {
@@ -257,7 +250,7 @@ type LLMCall struct {
 type ToolCallKind string
 
 const (
-	ToolCallKindStatic         ToolCallKind = "static"          // 静态白名单工具（add_source/push_now/…）
+	ToolCallKindStatic         ToolCallKind = "static"          // 静态白名单任务工具
 	ToolCallKindTikHubSearch   ToolCallKind = "tikhub_search"   // search_endpoints 检索元工具
 	ToolCallKindTikHubEndpoint ToolCallKind = "tikhub_endpoint" // 动态注入的 TikHub 端点工具（按次计费面）
 	// ToolCallKindBindingFetch 绑定引擎（调度面）的上游调用：list/enrich/probe 每次
@@ -291,7 +284,7 @@ type ToolCall struct {
 	TenantID       *int64          `json:"-"`
 	TraceID        string          `json:"trace_id"`
 	UserID         *int64          `json:"user_id,omitempty"`
-	SessionID      *int64          `json:"session_id,omitempty"` // 可空：确认卡回调等无会话来源
+	SessionID      *int64          `json:"session_id,omitempty"` // 可空：后台恢复等无会话来源
 	ToolName       string          `json:"tool_name"`
 	ToolKind       ToolCallKind    `json:"tool_kind"`
 	EndpointPath   string          `json:"endpoint_path"`         // 仅 tikhub_endpoint
@@ -337,7 +330,7 @@ type Schedule struct {
 	ScopeJSON     json.RawMessage `json:"scope_json"`     // JSONB：PushScope 序列化
 	Status        ScheduleStatus  `json:"status"`         // active/paused
 	// ExecutionMode is an internal Approved Definition field. It is deliberately
-	// excluded from the current public schedule wire until the confirmed-control-
+	// excluded from the current public schedule wire until the durable-control-
 	// plane cutover; C2a only makes the persisted compatibility mode explicit.
 	ExecutionMode ExecutionMode `json:"-"`
 	CreatedAt     time.Time     `json:"created_at"`
@@ -371,23 +364,6 @@ type AgentSession struct {
 	ActivatedTools json.RawMessage `json:"activated_tools"`
 	CreatedAt      time.Time       `json:"created_at"`
 	UpdatedAt      time.Time       `json:"updated_at"` // 最后活跃时间，TTL 过期判定依据
-}
-
-// PendingAction 待确认的写工具动作（pending_actions 表，M4 migration 005）。
-// 交互基调"AI 出预填、人点执行"：写工具不直接执行，先落本表并发确认卡；
-// 卡片按钮 value 只携带 ID，参数以库中 Args 为准，杜绝客户端篡改（契约 §10）。
-// 主键 ID 为 TEXT（uuid）而非 001 的 BIGSERIAL 数值主键。
-type PendingAction struct {
-	ID         string              `json:"id"`                   // uuid
-	UserID     int64               `json:"user_id"`              // 归属用户，回调时必须校验一致
-	SessionID  *int64              `json:"session_id,omitempty"` // 可空：产生该动作的会话
-	ToolName   string              `json:"tool_name"`            // 工具注册表内的白名单名
-	Args       json.RawMessage     `json:"args"`                 // JSONB，模型产出的 arguments 原始 JSON
-	Summary    string              `json:"summary"`              // 卡片上展示过的人类可读摘要
-	Status     PendingActionStatus `json:"status"`
-	ExpiresAt  time.Time           `json:"expires_at"`            // 超过后不可再领取
-	ExecutedAt *time.Time          `json:"executed_at,omitempty"` // 未执行时为 NULL
-	CreatedAt  time.Time           `json:"created_at"`
 }
 
 // A2ATask 是 A2A server 任务（a2a_tasks 表，migration 013）。Task 列是 SDK a2a.Task 的

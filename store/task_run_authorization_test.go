@@ -173,7 +173,7 @@ func TestResolveScheduledRunIdentity_QueryShapeAndFailures(t *testing.T) {
 			"WHERE s.id = $1 AND s.user_id = $2",
 			"s.status = $3",
 			"t.status = $4 AND t.deleted_at IS NULL",
-			"FROM pending_actions p",
+			"FROM task_creation_operations p",
 			"p.task_id = s.id",
 			"p.tenant_id = s.tenant_id AND p.user_id = s.user_id",
 			"p.tool_name = 'create_schedule' AND p.execution_version = 1",
@@ -288,7 +288,7 @@ func TestAuthorizeLiveTaskRunSideEffect_QueryShapeAndFailures(t *testing.T) {
 			"s.user_id = $3",
 			"s.status = $4",
 			"t.status = $5 AND t.deleted_at IS NULL",
-			"FROM pending_actions p",
+			"FROM task_creation_operations p",
 			"p.task_id = s.id",
 			"p.tenant_id = s.tenant_id AND p.user_id = s.user_id",
 			"p.tool_name = 'create_schedule' AND p.execution_version = 1",
@@ -641,7 +641,7 @@ func newTaskRunAuthorizationFixture(t *testing.T) *taskRunAuthorizationFixture {
 		ctx, cancel := cleanupContext()
 		defer cancel()
 		for _, tenantID := range f.tenantIDs {
-			cleanupExec(ctx, t, st, `DELETE FROM pending_actions WHERE tenant_id = $1`, tenantID)
+			cleanupExec(ctx, t, st, `DELETE FROM task_creation_operations WHERE tenant_id = $1`, tenantID)
 			cleanupExec(ctx, t, st, `DELETE FROM schedules WHERE tenant_id = $1`, tenantID)
 			cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE tenant_id = $1`, tenantID)
 		}
@@ -698,7 +698,7 @@ func (f *taskRunAuthorizationFixture) createOperation(
 ) {
 	t.Helper()
 	f.exec(t,
-		`INSERT INTO pending_actions
+		`INSERT INTO task_creation_operations
 		    (id, tenant_id, user_id, tool_name, args, summary, status, expires_at,
 		     execution_version, phase, task_id)
 		 VALUES ($1, $2, $3, 'create_schedule', '{}', 'authorization test', $4,

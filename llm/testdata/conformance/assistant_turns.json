@@ -19,7 +19,7 @@
         "id": "call_1",
         "type": "function",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": "{}"
         }
       }
@@ -50,7 +50,7 @@
         "id": "call_native",
         "type": "function",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": "{}"
         }
       }
@@ -76,7 +76,7 @@
         "id": "call_1",
         "type": "function",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": "{}"
         }
       }
@@ -94,7 +94,7 @@
         "id": "call_1",
         "type": "function",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": "{}"
         }
       }
@@ -112,7 +112,7 @@
         "id": "",
         "type": "function",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": "{}"
         }
       }
@@ -130,7 +130,7 @@
         "id": "call_dup",
         "type": "function",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": "{}"
         }
       },
@@ -156,7 +156,7 @@
         "id": "call_1",
         "type": "function",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": "[]"
         }
       }
@@ -174,7 +174,7 @@
         "id": "call_1",
         "type": "function",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": "{"
         }
       }
@@ -192,7 +192,7 @@
         "id": "call_1",
         "type": "function",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": {}
         }
       }
@@ -228,7 +228,7 @@
         "id": "call_1",
         "type": "custom",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": "{}"
         }
       }
@@ -246,7 +246,7 @@
         "id": "call_1",
         "type": "function",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": "{}"
         }
       }
@@ -264,7 +264,7 @@
         "id": "call_1",
         "type": "function",
         "function": {
-          "name": "list_sources",
+          "name": "list_schedules",
           "arguments": "{}"
         }
       }

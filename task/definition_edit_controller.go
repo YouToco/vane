@@ -16,7 +16,7 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-const taskDefinitionEditApprovalRefPrefix = "definition-edit:"
+const taskDefinitionEditOperationRefPrefix = "definition-edit:"
 
 // ErrDefinitionEditOperationNotFound is the only result which permits the
 // Agent callback router to continue to another protocol generation.
@@ -61,7 +61,7 @@ type definitionEditControllerStore interface {
 	) (*types.TaskDefinitionEditOperation, error)
 }
 
-// definitionEditCoordinatorBoundary deliberately exposes only the three
+// definitionEditCoordinatorBoundary deliberately exposes only the two
 // authenticated ingress methods. Recovery, expiration, phase execution and
 // raw Store/Temporal APIs are not reachable from the Agent dependency graph.
 type definitionEditCoordinatorBoundary interface {
@@ -69,12 +69,7 @@ type definitionEditCoordinatorBoundary interface {
 		context.Context,
 		PrepareTaskDefinitionEditProposalInput,
 	) (*types.TaskDefinitionEditOperation, error)
-	Confirm(
-		context.Context,
-		types.TaskDefinitionEditScope,
-		TaskDefinitionEditReceiptTarget,
-	) (TaskDefinitionEditOutcome, error)
-	Cancel(
+	Execute(
 		context.Context,
 		types.TaskDefinitionEditScope,
 		TaskDefinitionEditReceiptTarget,
@@ -96,7 +91,7 @@ func NewDefinitionEditController(
 	return &DefinitionEditController{store: store, coordinator: coordinator}
 }
 
-func (c *DefinitionEditController) Propose(
+func (c *DefinitionEditController) Prepare(
 	ctx context.Context,
 	in DefinitionEditProposalInput,
 ) (DefinitionEditProposal, error) {
@@ -113,7 +108,7 @@ func (c *DefinitionEditController) Propose(
 		in.UserID <= 0 || in.SessionID == nil || *in.SessionID <= 0 ||
 		in.ExpiresAt.IsZero() {
 		return DefinitionEditProposal{}, definitionEditControllerValidation(
-			"任务编辑确认请求不完整",
+			"任务编辑请求不完整",
 		)
 	}
 	command, err := decodeDefinitionEditCommand(in.RawArgs)
@@ -165,7 +160,7 @@ func (c *DefinitionEditController) Propose(
 	}
 	if bytes.Equal(baseBytes, targetBytes) {
 		return DefinitionEditProposal{}, definitionEditControllerValidation(
-			"没有检测到需要确认的任务变更",
+			"没有检测到任务变更",
 		)
 	}
 	var creation scheduler.PreparedTaskSchedule
@@ -192,7 +187,7 @@ func (c *DefinitionEditController) Propose(
 		ctx,
 		PrepareTaskDefinitionEditProposalInput{
 			OperationID:   in.ActionID,
-			ApprovalRef:   taskDefinitionEditApprovalRefPrefix + in.ActionID,
+			OperationRef:  taskDefinitionEditOperationRefPrefix + in.ActionID,
 			ActorTenantID: tenantID, ActorUserID: in.UserID,
 			TargetTenantID: tenantID, TargetUserID: in.UserID,
 			TaskID: command.TaskID, SessionID: *in.SessionID,
@@ -220,7 +215,7 @@ func (c *DefinitionEditController) Propose(
 	return DefinitionEditProposal{ID: op.ID, Summary: summary}, nil
 }
 
-func (c *DefinitionEditController) Confirm(
+func (c *DefinitionEditController) Execute(
 	ctx context.Context,
 	userID int64,
 	actionID string,
@@ -230,20 +225,7 @@ func (c *DefinitionEditController) Confirm(
 	if err != nil {
 		return TaskDefinitionEditOutcome{}, err
 	}
-	return c.coordinator.Confirm(ctx, scope, receipt)
-}
-
-func (c *DefinitionEditController) Cancel(
-	ctx context.Context,
-	userID int64,
-	actionID string,
-	receipt TaskDefinitionEditReceiptTarget,
-) (TaskDefinitionEditOutcome, error) {
-	scope, err := c.loadScope(ctx, userID, actionID)
-	if err != nil {
-		return TaskDefinitionEditOutcome{}, err
-	}
-	return c.coordinator.Cancel(ctx, scope, receipt)
+	return c.coordinator.Execute(ctx, scope, receipt)
 }
 
 func (c *DefinitionEditController) loadScope(

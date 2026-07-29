@@ -115,13 +115,13 @@ type exaContentsStatus struct {
 // Fetch 抓一个 web/contents 源。失败语义对齐 exa.go：缺 key / 缺 url / 非法 config /
 // 401/403 → CodeValidation（不可重试）；超时 → CodeFetchTimeout；429 → CodeFetchRateLimit；
 // statuses[].status=="error" → CodeFetchTimeout（可重试，抓取瞬态）。
-func (e *ExaContentsFetcher) Fetch(ctx context.Context, src types.Source) ([]types.ContentItem, error) {
+func (e *ExaContentsFetcher) Fetch(ctx context.Context, src types.FetchTarget) ([]types.ContentItem, error) {
 	return e.fetchWithEffectGate(ctx, src, nil)
 }
 
 func (e *ExaContentsFetcher) fetchWithEffectGate(
 	ctx context.Context,
-	src types.Source,
+	src types.FetchTarget,
 	beforeEffect func(context.Context) error,
 ) ([]types.ContentItem, error) {
 	if e.apiKey == "" {
@@ -185,7 +185,7 @@ func (e *ExaContentsFetcher) fetchWithEffectGate(
 //
 // 第二个返回值 cached 报告 Exa 是否返回了缓存，由调用方按自己的语义处理
 // （监控要为此记 WARN，补全不需要）。
-func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, maxAgeHours int, src *types.Source) ([]exaContentsResult, bool, error) {
+func (e *ExaContentsFetcher) pageResults(ctx context.Context, pageURL string, maxAgeHours int, src *types.FetchTarget) ([]exaContentsResult, bool, error) {
 	return e.pageResultsWithEffectGate(ctx, pageURL, maxAgeHours, src, nil)
 }
 
@@ -193,7 +193,7 @@ func (e *ExaContentsFetcher) pageResultsWithEffectGate(
 	ctx context.Context,
 	pageURL string,
 	maxAgeHours int,
-	src *types.Source,
+	src *types.FetchTarget,
 	beforeEffect func(context.Context) error,
 ) ([]exaContentsResult, bool, error) {
 	reqBody := exaContentsRequest{URLs: []string{pageURL}, Text: true, MaxAgeHours: maxAgeHours}
@@ -312,7 +312,7 @@ func (e *ExaContentsFetcher) ReadPage(ctx context.Context, pageURL string) (titl
 	if pageURL == "" {
 		return "", "", false, types.NewAppError(types.CodeValidation, "url 不能为空", nil)
 	}
-	results, cached, err := e.pageResults(ctx, pageURL, 0, &types.Source{})
+	results, cached, err := e.pageResults(ctx, pageURL, 0, &types.FetchTarget{})
 	if err != nil {
 		return "", "", false, err
 	}
@@ -338,7 +338,7 @@ func (e *ExaContentsFetcher) ReadPage(ctx context.Context, pageURL string) (titl
 //
 // 两者都退化成静默的 `return nil, nil`，正是本文件上方注释警告过的
 // 「被静默拒收 → 监控永久失效无信号」。分开才能只对后者报警。
-func mapExaContents(src types.Source, pageURL, titleOverride string, results []exaContentsResult) (types.ContentItem, dropReason) {
+func mapExaContents(src types.FetchTarget, pageURL, titleOverride string, results []exaContentsResult) (types.ContentItem, dropReason) {
 	var r exaContentsResult
 	for i := range results {
 		if strings.TrimSpace(results[i].Text) != "" {
@@ -404,7 +404,7 @@ func sanitizeContentsText(s string) string {
 }
 
 // recordCall 写一行 tool_calls（与 exa.go recordCall 同纪律：旁路，失败不放大）。
-func (e *ExaContentsFetcher) recordCall(ctx context.Context, src types.Source, status int, elapsed time.Duration, bodySize int, costTotal float64, callErr error) {
+func (e *ExaContentsFetcher) recordCall(ctx context.Context, src types.FetchTarget, status int, elapsed time.Duration, bodySize int, costTotal float64, callErr error) {
 	if e.rec == nil {
 		return
 	}

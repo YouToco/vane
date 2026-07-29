@@ -99,42 +99,7 @@ func TestTaskDefinitionEditEntrypoints_CreateReplayAndValidation(t *testing.T) {
 	})
 }
 
-func TestTaskDefinitionEditEntrypoints_CancelAndExpireTerminalOutbox(t *testing.T) {
-	t.Run("cancel exact replay", func(t *testing.T) {
-		f := newTaskDefinitionEditEntrypointFixture(t, true)
-		op := f.createOperation(t, f.databaseNow(t).Add(time.Hour),
-			"entrypoint-cancel")
-		params := types.CancelTaskDefinitionEditOperationParams{
-			Scope: op.Scope(), ReceiptProvider: "feishu_card_patch:entrypoint",
-			ReceiptTarget: "om_entrypoint_cancel",
-		}
-
-		cancelled, err := f.store.CancelTaskDefinitionEditOperation(t.Context(), params)
-		if err != nil {
-			t.Fatalf("CancelTaskDefinitionEditOperation: %v", err)
-		}
-		assertTaskDefinitionEditEntrypointTerminal(
-			t, f, cancelled, types.TaskDefinitionEditOperationStatusCancelled,
-			params.ReceiptProvider, params.ReceiptTarget)
-		replayed, err := f.store.CancelTaskDefinitionEditOperation(t.Context(), params)
-		if err != nil {
-			t.Fatalf("cancel response-loss replay: %v", err)
-		}
-		if replayed.TombstonedAt == nil || cancelled.TombstonedAt == nil ||
-			!replayed.TombstonedAt.Equal(*cancelled.TombstonedAt) {
-			t.Fatalf("cancel replay changed tombstone: first=%+v replay=%+v",
-				cancelled, replayed)
-		}
-		f.assertReceiptCount(t, 1)
-
-		different := params
-		different.ReceiptTarget += "-different"
-		if _, err := f.store.CancelTaskDefinitionEditOperation(
-			t.Context(), different); !errors.Is(err, types.ErrConflict) {
-			t.Fatalf("different cancel replay error=%v, want conflict", err)
-		}
-	})
-
+func TestTaskDefinitionEditEntrypoints_ExpireTerminalOutbox(t *testing.T) {
 	t.Run("expire exact replay", func(t *testing.T) {
 		f := newTaskDefinitionEditEntrypointFixture(t, true)
 		op := f.createOperation(t, f.databaseNow(t).Add(250*time.Millisecond),
@@ -297,7 +262,7 @@ func newTaskDefinitionEditEntrypointFixture(
 		baseSnapshotBytes: bytes.Clone(components.BaseSnapshot),
 	}
 	registerTaskDefinitionEditEntrypointCleanup(t, f)
-	f.insertScopeAndLegacyProjection(t)
+	f.insertScopeAndCurrentProjection(t)
 	baseRecord, err := st.InsertInitialApprovedDefinition(
 		t.Context(), base, "entrypoint-base:"+base.TaskID)
 	if err != nil {
@@ -378,7 +343,7 @@ func assertTaskDefinitionEditEntrypointFixtureAvailable(
 		  (SELECT count(*) FROM users WHERE id=$2) +
 		  (SELECT count(*) FROM schedules WHERE id=$3) +
 		  (SELECT count(*) FROM task_definition_edit_operations WHERE id=$4) +
-		  (SELECT count(*) FROM sources
+		  (SELECT count(*) FROM fetch_targets
 		    WHERE id=ANY($5::bigint[]) OR url=ANY($6::text[]))`,
 		base.TenantID, base.UserID, base.TaskID, "edit-proposal-fixture",
 		sourceIDs, sourceURLs,
@@ -406,7 +371,7 @@ func registerTaskDefinitionEditEntrypointCleanup(
 		cleanupExec(ctx, t, f.store,
 			`DELETE FROM task_definition_edit_operations WHERE tenant_id=$1`, f.base.TenantID)
 		cleanupExec(ctx, t, f.store,
-			`DELETE FROM pending_actions WHERE tenant_id=$1`, f.base.TenantID)
+			`DELETE FROM task_creation_operations WHERE tenant_id=$1`, f.base.TenantID)
 		cleanupExec(ctx, t, f.store,
 			`DELETE FROM agent_sessions WHERE tenant_id=$1`, f.base.TenantID)
 		cleanupExec(ctx, t, f.store,
@@ -418,13 +383,13 @@ func registerTaskDefinitionEditEntrypointCleanup(
 		for _, definition := range []taskstate.ApprovedDefinitionV1{f.base, f.target} {
 			for _, source := range definition.Sources {
 				cleanupExec(ctx, t, f.store,
-					`DELETE FROM sources WHERE id=$1`, source.SourceID)
+					`DELETE FROM fetch_targets WHERE id=$1`, source.SourceID)
 			}
 		}
 	})
 }
 
-func (f *taskDefinitionEditEntrypointFixture) insertScopeAndLegacyProjection(
+func (f *taskDefinitionEditEntrypointFixture) insertScopeAndCurrentProjection(
 	t *testing.T,
 ) {
 	t.Helper()
@@ -464,7 +429,7 @@ func (f *taskDefinitionEditEntrypointFixture) insertScopeAndLegacyProjection(
 	}
 	for _, source := range sources {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO sources (id,url,title,config,platform,capability)
+			INSERT INTO fetch_targets (id,url,title,config,platform,capability)
 			VALUES ($1,$2,$3,$4,$5,$6)`, source.SourceID, source.URL,
 			source.Title, source.Config, source.Platform, source.Capability); err != nil {
 			t.Fatalf("insert entrypoint source %d: %v", source.SourceID, err)
@@ -483,12 +448,12 @@ func (f *taskDefinitionEditEntrypointFixture) insertScopeAndLegacyProjection(
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO schedule_playbooks (schedule_id,content,fetch_plan)
 		VALUES ($1,$2,$3)`, f.base.TaskID, f.base.PlaybookContent,
-		f.base.FetchPlan); err != nil {
+		mustCurrentFetchPlanFromApprovedDefinitionV1(t, f.base)); err != nil {
 		t.Fatalf("insert entrypoint playbook: %v", err)
 	}
 	for _, source := range f.base.Sources {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO schedule_sources (schedule_id,source_id) VALUES ($1,$2)`,
+			INSERT INTO task_fetch_targets (schedule_id,fetch_target_id) VALUES ($1,$2)`,
 			f.base.TaskID, source.SourceID); err != nil {
 			t.Fatalf("insert entrypoint schedule source: %v", err)
 		}
@@ -496,6 +461,18 @@ func (f *taskDefinitionEditEntrypointFixture) insertScopeAndLegacyProjection(
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("commit entrypoint fixture: %v", err)
 	}
+}
+
+func mustCurrentFetchPlanFromApprovedDefinitionV1(
+	t *testing.T,
+	definition taskstate.ApprovedDefinitionV1,
+) []byte {
+	t.Helper()
+	plan, err := currentFetchPlanFromApprovedDefinitionV1(definition)
+	if err != nil {
+		t.Fatalf("project current entrypoint fetch plan: %v", err)
+	}
+	return plan
 }
 
 func (f *taskDefinitionEditEntrypointFixture) insertSuccessfulCreationProvenance(
@@ -509,7 +486,7 @@ func (f *taskDefinitionEditEntrypointFixture) insertSuccessfulCreationProvenance
 	}
 	f.provenanceID = "entrypoint-create-provenance-" + uuid.NewString()
 	if _, err := f.store.pool.Exec(t.Context(), `
-		INSERT INTO pending_actions (
+		INSERT INTO task_creation_operations (
 			id,tenant_id,user_id,session_id,tool_name,args,summary,status,
 			expires_at,executed_at,execution_version,phase,fence,attempt,
 			normalized_command,compiled_definition,compiled_digest,
@@ -519,7 +496,7 @@ func (f *taskDefinitionEditEntrypointFixture) insertSuccessfulCreationProvenance
 			clock_timestamp()+interval '1 hour',clock_timestamp(),$7,$8,1,1,
 			$9,$10,$11,$12,$13,$14,$15,clock_timestamp()
 		)`, f.provenanceID, f.base.TenantID, f.base.UserID, f.sessionID,
-		"successful retained creation provenance", types.PendingActionStatusExecuted,
+		"successful retained creation provenance", types.TaskOperationStatusExecuted,
 		types.TaskCreationExecutionVersionV1, types.TaskCreationPhaseCompleted,
 		[]byte(`{"command":"create schedule"}`), f.baseRecord.Payload,
 		f.prepared.Creation.PreparedDigest, creation, []byte(`{"ensured":true}`),
@@ -534,13 +511,13 @@ func (f *taskDefinitionEditEntrypointFixture) buildProposal(
 	approvalRef string,
 ) definitioneditwire.FrozenProposal {
 	t.Helper()
-	proposal := definitioneditwire.ProposalV1{
-		WireVersion: "vane.task-definition-edit-proposal/v1",
-		OperationID: f.prepared.OperationID, ApprovalRef: approvalRef,
-		Actor: definitioneditwire.ProposalActorV1{
+	proposal := definitioneditwire.ProposalV2{
+		WireVersion: "vane.task-definition-edit-proposal/v2",
+		OperationID: f.prepared.OperationID, OperationRef: approvalRef,
+		Actor: definitioneditwire.ProposalActorV2{
 			TenantID: f.base.TenantID, UserID: f.base.UserID,
 		},
-		Target: definitioneditwire.ProposalTargetV1{
+		Target: definitioneditwire.ProposalTargetV2{
 			TenantID: f.base.TenantID, UserID: f.base.UserID, TaskID: f.base.TaskID,
 		},
 		SessionID: f.sessionID, ExpiresAtUnixMicros: expiresAt.UnixMicro(),
@@ -671,7 +648,7 @@ func (f *taskDefinitionEditEntrypointFixture) advanceHeadPastTarget(t *testing.T
 		if _, err := tx.Exec(t.Context(), `
 			INSERT INTO task_approved_definition_versions (
 				tenant_id,user_id,task_id,version,schema_version,execution_mode,
-				definition_digest,payload,approval_ref
+				definition_digest,payload,operation_ref
 			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 			f.base.TenantID, f.base.UserID, f.base.TaskID, row.version,
 			row.definition.SchemaVersion, row.definition.ExecutionMode,
@@ -737,7 +714,7 @@ func assertTaskDefinitionEditEntrypointTerminal(
 	t.Helper()
 	if op.Status != wantStatus ||
 		op.Phase != types.TaskDefinitionEditPhaseProposalSealed ||
-		op.TombstonedAt == nil || op.ConfirmedAt != nil || op.LeaseOwner != "" ||
+		op.TombstonedAt == nil || op.ExecutionStartedAt != nil || op.LeaseOwner != "" ||
 		op.LeaseUntil != nil || op.TakeoverNotBefore != nil ||
 		op.Fence != 0 || op.Attempt != 0 {
 		t.Fatalf("pending terminal operation=%+v", op)

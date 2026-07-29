@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YouToco/vane/capabilitycatalog"
 	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/tikhubcatalog"
 	"github.com/YouToco/vane/tikhubinvoke"
 	"github.com/YouToco/vane/types"
@@ -118,12 +118,12 @@ func newTestBinding(srvURL string, seen SeenChecker, rec BindingCallRecorder) *B
 	return b
 }
 
-func bindingSrc(c types.Capability, cfg string) types.Source {
+func bindingSrc(c types.Capability, cfg string) types.FetchTarget {
 	p := types.PlatformXHS
 	if c == types.CapUserPosts && strings.Contains(cfg, "screen_name") {
 		p = types.PlatformX
 	}
-	return types.Source{ID: 7, Platform: p, Capability: c, Config: json.RawMessage(cfg)}
+	return types.FetchTarget{ID: 7, Platform: p, Capability: c, Config: json.RawMessage(cfg)}
 }
 
 const (
@@ -143,7 +143,7 @@ const (
 
 // TestBindingTemplates_Integrity 是注册表 re-gen 与模板之间的防漂移锁：
 // 模板引用的端点必须 Lookup 命中，模板可发送的参数必须都被 Entry 声明，
-// Entry 的必填参数必须都在模板参数集里，Kind 必须与 sourcecatalog 登记一致。
+// Entry 的必填参数必须都在模板参数集里，Kind 必须与 capabilitycatalog 登记一致。
 // 上游 spec 改名/删端点/改参数时，re-gen 提交在 CI 就红，而不是生产静默断供。
 func TestBindingTemplates_Integrity(t *testing.T) {
 	for key, spec := range bindingTemplates {
@@ -182,8 +182,8 @@ func TestBindingTemplates_Integrity(t *testing.T) {
 				t.Errorf("%s/%s: 未知 TimeFormat %q", key.P, key.C, spec.Fields.TimeFormat)
 			}
 		}
-		if want, ok := sourcecatalog.KindOf(key.P, key.C); !ok || spec.Kind != want {
-			t.Errorf("%s/%s: 模板 Kind=%q 与 sourcecatalog 登记 %q 漂移", key.P, key.C, spec.Kind, want)
+		if want, ok := capabilitycatalog.KindOf(key.P, key.C); !ok || spec.Kind != want {
+			t.Errorf("%s/%s: 模板 Kind=%q 与 capabilitycatalog 登记 %q 漂移", key.P, key.C, spec.Kind, want)
 		}
 
 		if es := spec.Enrich; es != nil {
@@ -322,7 +322,7 @@ func TestBinding_Twitter_UnwrapAndAuthorFallback(t *testing.T) {
 	defer srv.Close()
 
 	b := newTestBinding(srv.URL, nil, nil)
-	items, err := b.Fetch(context.Background(), types.Source{
+	items, err := b.Fetch(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformX, Capability: types.CapUserPosts,
 		Config: json.RawMessage(`{"screen_name":"OpenAI"}`),
 	})
@@ -438,8 +438,8 @@ func TestBinding_FavedNotes(t *testing.T) {
 
 // ────────── 微博 / 微信公众号（契约 §8.2，2026-07-23 实测样本）──────────
 
-func weiboSrc(c types.Capability, cfg string) types.Source {
-	return types.Source{ID: 7, Platform: types.PlatformWeibo, Capability: c, Config: json.RawMessage(cfg)}
+func weiboSrc(c types.Capability, cfg string) types.FetchTarget {
+	return types.FetchTarget{ID: 7, Platform: types.PlatformWeibo, Capability: c, Config: json.RawMessage(cfg)}
 }
 
 func TestBinding_WeiboUserPosts_MapsAndUnwrapsRetweet(t *testing.T) {
@@ -537,7 +537,7 @@ func TestBinding_WechatMP_CompositeIDAndDigestFallback(t *testing.T) {
 	defer srv.Close()
 
 	b := newTestBinding(srv.URL, nil, nil)
-	items, err := b.Fetch(context.Background(), types.Source{
+	items, err := b.Fetch(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformWechatMP, Capability: types.CapUserPosts,
 		Config: json.RawMessage(`{"username":"gh_363b924965e9"}`),
 	})
@@ -599,7 +599,7 @@ func TestBinding_WechatMP_MissingIDFieldIsDriftNotGarbageKey(t *testing.T) {
 	defer srv.Close()
 
 	b := newTestBinding(srv.URL, nil, nil)
-	_, err := b.Fetch(context.Background(), types.Source{
+	_, err := b.Fetch(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformWechatMP, Capability: types.CapUserPosts,
 		Config: json.RawMessage(`{"username":"gh_363b924965e9"}`),
 	})
@@ -728,7 +728,7 @@ func TestBinding_Drift_ParamValidation(t *testing.T) {
 	if !ok {
 		t.Fatal("端点缺失")
 	}
-	src := types.Source{ID: 1}
+	src := types.FetchTarget{ID: 1}
 	// 未声明参数（模拟 re-gen 改名后我方仍发旧名）→ 显式失败，而不是被 buildRequest
 	// 静默丢弃后上游用默认值返回 200 但数据错误。
 	if err := validateAgainstEntry(entry, map[string]any{"page_id": "x", "sort_v2": "time"}, src); err == nil {
@@ -757,71 +757,6 @@ func TestBinding_BusinessFailureCarriesMsg(t *testing.T) {
 }
 
 // ────────── probe 准入（契约 §2.2/§8.7）──────────
-
-func TestBinding_Probe_OK(t *testing.T) {
-	up := newFakeUpstream()
-	up.bodies[pathTopic] = sampleTopicFeedResponse
-	srv := httptest.NewServer(up.handler())
-	defer srv.Close()
-
-	b := newTestBinding(srv.URL, nil, nil)
-	report, err := b.Probe(context.Background(), bindingSrc(types.CapTopicFeed, `{"page_id":"6301c499df9bea0001dc6f47"}`))
-	if err != nil {
-		t.Fatalf("probe 应通过: %v", err)
-	}
-	if report.Extracted != 3 || report.Newest == nil || len(report.SampleTitles) == 0 {
-		t.Errorf("报告不完整: %+v", report)
-	}
-}
-
-func TestBinding_Probe_RejectsEmpty(t *testing.T) {
-	up := newFakeUpstream()
-	up.bodies[pathFaved] = `{"code":200,"data":{"success":true,"msg":null,"data":{"notes":[]}}}`
-	srv := httptest.NewServer(up.handler())
-	defer srv.Close()
-
-	b := newTestBinding(srv.URL, nil, nil)
-	_, err := b.Probe(context.Background(), bindingSrc(types.CapFavedNotes, `{"user_id":"u"}`))
-	if !errors.Is(err, types.ErrValidation) {
-		t.Fatalf("0 条应拒绝准入，实际 %v", err)
-	}
-	if !strings.Contains(err.Error(), "未公开") {
-		t.Errorf("拒绝话术应提示收藏可能未公开: %v", err)
-	}
-}
-
-func TestBinding_Probe_RejectsOutOfOrder(t *testing.T) {
-	// OrderCheck 模板（topic_feed）遇到升序 → 拒（x/search 乱序教训的可检面）。
-	body := `{"code":200,"data":{"success":true,"msg":null,"data":{"items":[
-	  {"id":"aaaaaaaaaaaaaaaaaaaaaaaa","title":"旧","desc":"x","create_time":1000000000000,"user":{"nickname":"n"}},
-	  {"id":"bbbbbbbbbbbbbbbbbbbbbbbb","title":"新","desc":"x","create_time":2000000000000,"user":{"nickname":"n"}}
-	]}}}`
-	up := newFakeUpstream()
-	up.bodies[pathTopic] = body
-	srv := httptest.NewServer(up.handler())
-	defer srv.Close()
-
-	b := newTestBinding(srv.URL, nil, nil)
-	_, err := b.Probe(context.Background(), bindingSrc(types.CapTopicFeed, `{"page_id":"x"}`))
-	if !errors.Is(err, types.ErrValidation) || !strings.Contains(err.Error(), "降序") {
-		t.Fatalf("时序违例应拒绝准入，实际 %v", err)
-	}
-}
-
-func TestBinding_Probe_FavedNonMonotonicAccepted(t *testing.T) {
-	// faved 的 create_time 实测非单调（收藏序≠创建序），OrderCheck 关——不得误拒。
-	up := newFakeUpstream()
-	up.bodies[pathFaved] = sampleFavedNotesResponse
-	srv := httptest.NewServer(up.handler())
-	defer srv.Close()
-
-	b := newTestBinding(srv.URL, nil, nil)
-	if _, err := b.Probe(context.Background(), bindingSrc(types.CapFavedNotes, `{"user_id":"u"}`)); err != nil {
-		t.Fatalf("faved 非单调不该被时序检查误拒: %v", err)
-	}
-}
-
-// ────────── enrich（计费闸门/串号/空值保旧/记账）──────────
 
 func enrichSearchBody(desc string) string {
 	return `{"code":200,"data":{"success":true,"msg":null,"data":{"items":[
@@ -1092,7 +1027,7 @@ func TestBinding_Twitter_NullTimelineIsQuietRound(t *testing.T) {
 	defer srv.Close()
 
 	b := newTestBinding(srv.URL, nil, nil)
-	items, err := b.Fetch(context.Background(), types.Source{
+	items, err := b.Fetch(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformX, Capability: types.CapUserPosts,
 		Config: json.RawMessage(`{"screen_name":"quiet"}`),
 	})
@@ -1101,7 +1036,7 @@ func TestBinding_Twitter_NullTimelineIsQuietRound(t *testing.T) {
 	}
 
 	up.bodies[pathTwitter] = `{"code":200,"data":{"status":"ok"}}`
-	if _, err := b.Fetch(context.Background(), types.Source{
+	if _, err := b.Fetch(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformX, Capability: types.CapUserPosts,
 		Config: json.RawMessage(`{"screen_name":"quiet"}`),
 	}); !errors.Is(err, types.ErrValidation) {
@@ -1121,7 +1056,7 @@ func TestBinding_Twitter_LongContentNotTruncated(t *testing.T) {
 	defer srv.Close()
 
 	b := newTestBinding(srv.URL, nil, nil)
-	items, err := b.Fetch(context.Background(), types.Source{
+	items, err := b.Fetch(context.Background(), types.FetchTarget{
 		ID: 7, Platform: types.PlatformX, Capability: types.CapUserPosts,
 		Config: json.RawMessage(`{"screen_name":"OpenAI"}`),
 	})
@@ -1152,29 +1087,6 @@ func TestBinding_XHSContentTruncatedAt4000(t *testing.T) {
 		t.Errorf("xhs 正文应截断到 4000 字节（成本护栏），实际 %d", len(items[0].Content))
 	}
 }
-
-func TestBinding_ProbeRejectionMarksUserFacing(t *testing.T) {
-	// HIGH-3 的机制锁定：准入拒绝带 ProbeRejection 标记（可透出）；
-	// 漂移类错误不带标记（调用方必须映射固定话术）。
-	up := newFakeUpstream()
-	up.bodies[pathFaved] = `{"code":200,"data":{"success":true,"msg":null,"data":{"notes":[]}}}`
-	up.bodies[pathHotList] = `{"code":200,"data":{"renamed":[]}}`
-	srv := httptest.NewServer(up.handler())
-	defer srv.Close()
-
-	b := newTestBinding(srv.URL, nil, nil)
-	var pr *ProbeRejection
-	_, err := b.Probe(context.Background(), bindingSrc(types.CapFavedNotes, `{"user_id":"u"}`))
-	if !errors.As(err, &pr) {
-		t.Errorf("0 条拒绝应带 ProbeRejection 标记（用户话术可透出）: %v", err)
-	}
-	_, err = b.Probe(context.Background(), bindingSrc(types.CapHotList, `{}`))
-	if errors.As(err, &pr) {
-		t.Errorf("结构漂移不该带 ProbeRejection 标记（含内部端点名，须映射固定话术）: %v", err)
-	}
-}
-
-// ────────── TikHub 记账：cost_usd + source_id ──────────
 
 func TestBinding_RecorderCostAndSourceID(t *testing.T) {
 	up := newFakeUpstream()

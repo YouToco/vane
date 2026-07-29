@@ -15,7 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/YouToco/vane/sourcespec"
+	"github.com/YouToco/vane/fetchspec"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -32,7 +32,7 @@ func TestCreateTaskCreationOperation_V1Boundary(t *testing.T) {
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM task_creation_receipts WHERE tenant_id = $1`, f.tenantID)
 		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM pending_actions WHERE tenant_id = $1`, f.tenantID)
+			`DELETE FROM task_creation_operations WHERE tenant_id = $1`, f.tenantID)
 	})
 
 	p := taskCreationCreateParams(f, uuid.NewString())
@@ -41,7 +41,7 @@ func TestCreateTaskCreationOperation_V1Boundary(t *testing.T) {
 		t.Fatalf("CreateTaskCreationOperation() 失败: %v", err)
 	}
 	if op.ExecutionVersion != types.TaskCreationExecutionVersionV1 ||
-		op.ToolName != "create_schedule" || op.Status != types.PendingActionStatusPending ||
+		op.ToolName != "create_schedule" || op.Status != types.TaskOperationStatusPending ||
 		op.Phase != "" || op.Fence != 0 || op.TenantID != f.tenantID ||
 		op.UserID != f.userID {
 		t.Fatalf("v1 pending 初态错误: %+v", op)
@@ -55,19 +55,13 @@ func TestCreateTaskCreationOperation_V1Boundary(t *testing.T) {
 	if _, err := st.CreateTaskCreationOperation(ctx, different); !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("相同 id 不同 payload 必须 conflict: %v", err)
 	}
-	if _, err := st.ClaimPendingAction(ctx, op.ID, f.userID); !errors.Is(err, types.ErrNotFound) {
-		t.Fatalf("legacy Claim 不得领取 v1: %v", err)
-	}
-	if _, err := st.CancelPendingAction(ctx, op.ID, f.userID); !errors.Is(err, types.ErrNotFound) {
-		t.Fatalf("legacy Cancel 不得取消 v1: %v", err)
-	}
 	unchanged, err := st.LoadTaskCreationOperation(ctx, op.ID, f.tenantID, f.userID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if unchanged.Status != types.PendingActionStatusPending || unchanged.Phase != "" ||
+	if unchanged.Status != types.TaskOperationStatusPending || unchanged.Phase != "" ||
 		unchanged.TombstonedAt != nil || unchanged.Fence != 0 || unchanged.Attempt != 0 {
-		t.Fatalf("legacy Cancel 尝试后 v1 初态必须逐字段不变: %+v", unchanged)
+		t.Fatalf("v1 初态必须逐字段不变: %+v", unchanged)
 	}
 
 	duplicate := taskCreationCreateParams(f, uuid.NewString())
@@ -77,7 +71,7 @@ func TestCreateTaskCreationOperation_V1Boundary(t *testing.T) {
 	}
 	var duplicateRows int
 	if err := st.pool.QueryRow(ctx,
-		`SELECT count(*) FROM pending_actions WHERE id = $1`, duplicate.ID,
+		`SELECT count(*) FROM task_creation_operations WHERE id = $1`, duplicate.ID,
 	).Scan(&duplicateRows); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +177,7 @@ func TestCreateTaskCreationOperation_V1Boundary(t *testing.T) {
 	}
 	var commitRows int
 	if err := st.pool.QueryRow(ctx,
-		`SELECT count(*) FROM pending_actions WHERE id = $1`, commitID,
+		`SELECT count(*) FROM task_creation_operations WHERE id = $1`, commitID,
 	).Scan(&commitRows); err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +240,7 @@ func TestCreateTaskCreationOperation_CrossTenantReplayProbeDoesNotLockForeignOpe
 
 	var operationID string
 	if err := st.pool.QueryRow(ctx, `
-		SELECT id FROM pending_actions
+		SELECT id FROM task_creation_operations
 		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
 		 FOR UPDATE NOWAIT`,
 		paramsA.ID, tenantA.tenantID, tenantA.userID,
@@ -273,7 +267,7 @@ func TestCreateTaskCreationOperation_CrossTenantReplayProbeDoesNotLockForeignOpe
 	}
 	var tenantBRows int
 	if err := st.pool.QueryRow(ctx, `
-		SELECT count(*) FROM pending_actions
+		SELECT count(*) FROM task_creation_operations
 		 WHERE id=$1 AND tenant_id=$2`,
 		paramsA.ID, tenantB.tenantID,
 	).Scan(&tenantBRows); err != nil {
@@ -313,173 +307,6 @@ func TestTaskCreationReplayRootQueryRequiresExactTenantProtocolScope(t *testing.
 	}
 }
 
-func TestTaskCreationLookupAndCancel_V1IsolationAndLinearization(t *testing.T) {
-	st := tenantTestStore(t)
-	f := newCompiledTaskFixture(t, st)
-	cleanupA5Fixture(t, st, f)
-	ctx := t.Context()
-
-	legacyID := uuid.NewString()
-	if err := st.CreatePendingAction(ctx, &types.PendingAction{
-		ID: legacyID, UserID: f.userID, ToolName: "create_schedule",
-		Args: json.RawMessage(`{"spec":{"cron":"0 8 * * *"}}`), Summary: "legacy",
-		ExpiresAt: time.Now().Add(time.Hour),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.CancelTaskCreationOperation(
-		ctx, taskCreationCancelParams(legacyID, f.tenantID, f.userID, "om-legacy")); !errors.Is(err, types.ErrNotFound) {
-		t.Fatalf("v0 action 不得被 v1 cancel 触碰: %v", err)
-	}
-	var legacyStatus types.PendingActionStatus
-	if err := st.pool.QueryRow(ctx,
-		`SELECT status FROM pending_actions WHERE id = $1`, legacyID).Scan(&legacyStatus); err != nil {
-		t.Fatal(err)
-	}
-	if legacyStatus != types.PendingActionStatusPending {
-		t.Fatalf("v0 action 被 v1 cancel 修改: %s", legacyStatus)
-	}
-
-	params := taskCreationCreateParams(f, uuid.NewString())
-	created, err := st.CreateTaskCreationOperation(ctx, params)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.LoadTaskCreationOperationByUser(
-		ctx, created.ID, f.userID+9999); !errors.Is(err, types.ErrNotFound) {
-		t.Fatalf("lookup 不得泄露给其他 user: %v", err)
-	}
-	if _, err := st.CancelTaskCreationOperation(
-		ctx, taskCreationCancelParams(created.ID, f.tenantID+9999, f.userID, "om-wrong-tenant")); !errors.Is(err, types.ErrNotFound) {
-		t.Fatalf("cancel 跨 tenant 必须 NotFound: %v", err)
-	}
-
-	var secondTenantID int64
-	if err := st.pool.QueryRow(ctx,
-		`INSERT INTO tenants (status, plan) VALUES ('active', 'free') RETURNING id`,
-	).Scan(&secondTenantID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.pool.Exec(ctx,
-		`INSERT INTO memberships (tenant_id, user_id, role) VALUES ($1, $2, 'member')`,
-		secondTenantID, f.userID); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx, cancel := cleanupContext()
-		defer cancel()
-		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM task_creation_receipts WHERE tenant_id = $1`, secondTenantID)
-		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
-			secondTenantID, f.userID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM tenants WHERE id = $1`, secondTenantID)
-	})
-	if _, err := st.pool.Exec(ctx,
-		`UPDATE tenants SET status = 'suspended' WHERE id = $1`, f.tenantID); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx, cancel := cleanupContext()
-		defer cancel()
-		cleanupExec(cleanupCtx, t, st,
-			`UPDATE tenants SET status = 'active' WHERE id = $1`, f.tenantID)
-	})
-	lookedUp, err := st.LoadTaskCreationOperationByUser(ctx, created.ID, f.userID)
-	if err != nil || lookedUp.TenantID != f.tenantID {
-		t.Fatalf("suspended+multi-membership lookup 必须采用 durable tenant: op=%+v err=%v", lookedUp, err)
-	}
-	cancelParams := taskCreationCancelParams(created.ID, f.tenantID, f.userID, "om-cancelled")
-	cancelled, err := st.CancelTaskCreationOperation(ctx, cancelParams)
-	if err != nil || cancelled.Status != types.PendingActionStatusCancelled ||
-		cancelled.Phase != types.TaskCreationPhaseCancelled || cancelled.TombstonedAt == nil {
-		t.Fatalf("v1 cancel tombstone 错误: op=%+v err=%v", cancelled, err)
-	}
-	if replay, err := st.CancelTaskCreationOperation(ctx, cancelParams); err != nil || replay.ID != created.ID {
-		t.Fatalf("cancel exact replay: op=%+v err=%v", replay, err)
-	}
-
-	lostParams := taskCreationCreateParams(f, uuid.NewString())
-	// Create still requires an active membership; the durable cancel itself does not.
-	if _, err := st.pool.Exec(ctx,
-		`UPDATE tenants SET status = 'active' WHERE id = $1`, f.tenantID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.CreateTaskCreationOperation(ctx, lostParams); err != nil {
-		t.Fatal(err)
-	}
-	lostStore := storeWithCommitResponseLost(st)
-	lostCancel := taskCreationCancelParams(lostParams.ID, f.tenantID, f.userID, "om-lost")
-	if _, err := lostStore.CancelTaskCreationOperation(ctx, lostCancel); !errors.Is(err, types.ErrDatabase) {
-		t.Fatalf("cancel response lost 应返回 database: %v", err)
-	}
-	if replay, err := st.CancelTaskCreationOperation(ctx, lostCancel); err != nil || replay.Status != types.PendingActionStatusCancelled {
-		t.Fatalf("cancel response-lost readback/adopt: op=%+v err=%v", replay, err)
-	}
-}
-
-func TestTaskCreationCancelRacesAcquire(t *testing.T) {
-	st := tenantTestStore(t)
-	f := newCompiledTaskFixture(t, st)
-	cleanupA5Fixture(t, st, f)
-	ctx := t.Context()
-	st2, err := New(ctx, os.Getenv("DATABASE_URL"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	registerStoreClose(t, st2)
-	p := taskCreationCreateParams(f, uuid.NewString())
-	if _, err := st.CreateTaskCreationOperation(ctx, p); err != nil {
-		t.Fatal(err)
-	}
-	type cancelOutcome struct {
-		op  *types.TaskCreationOperation
-		err error
-	}
-	type acquireOutcome struct {
-		op  *types.TaskCreationOperation
-		err error
-	}
-	start := make(chan struct{})
-	cancelled := make(chan cancelOutcome, 1)
-	acquired := make(chan acquireOutcome, 1)
-	go func() {
-		<-start
-		op, err := st.CancelTaskCreationOperation(ctx,
-			taskCreationCancelParams(p.ID, f.tenantID, f.userID, "om-race"))
-		cancelled <- cancelOutcome{op: op, err: err}
-	}()
-	go func() {
-		<-start
-		op, err := st2.AcquireTaskCreationOperation(ctx, types.AcquireTaskCreationOperationParams{
-			ID: p.ID, TenantID: f.tenantID, UserID: f.userID,
-			LeaseOwner: "cancel-race-" + uuid.NewString(), LeaseDuration: time.Minute,
-			ReceiptProvider: "feishu_message_patch", ReceiptTarget: "om-race",
-		})
-		acquired <- acquireOutcome{op: op, err: err}
-	}()
-	close(start)
-	cancelResult := <-cancelled
-	acquireResult := <-acquired
-	switch {
-	case cancelResult.err == nil:
-		if cancelResult.op == nil ||
-			!errors.Is(acquireResult.err, types.ErrTaskCreationTerminal) {
-			t.Fatalf("cancel 赢时 acquire 必须看见 terminal: cancel=%+v acquire=%+v",
-				cancelResult, acquireResult)
-		}
-	case acquireResult.err == nil:
-		if acquireResult.op == nil ||
-			!errors.Is(cancelResult.err, types.ErrTaskCreationBusy) {
-			t.Fatalf("acquire 赢时 cancel 必须看见 busy: cancel=%+v acquire=%+v",
-				cancelResult, acquireResult)
-		}
-	default:
-		t.Fatalf("cancel/acquire 必须恰有一个线性化成功: cancel=%+v acquire=%+v",
-			cancelResult, acquireResult)
-	}
-}
-
 func TestTaskCreationAcquire_ExpiresDurablyAtDatabaseClock(t *testing.T) {
 	st := tenantTestStore(t)
 	f := newCompiledTaskFixture(t, st)
@@ -490,7 +317,7 @@ func TestTaskCreationAcquire_ExpiresDurablyAtDatabaseClock(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.pool.Exec(ctx,
-		`UPDATE pending_actions SET expires_at = clock_timestamp() WHERE id = $1`,
+		`UPDATE task_creation_operations SET expires_at = clock_timestamp() WHERE id = $1`,
 		params.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +337,7 @@ func TestTaskCreationAcquire_ExpiresDurablyAtDatabaseClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if op.Status != types.PendingActionStatusExpired ||
+	if op.Status != types.TaskOperationStatusExpired ||
 		op.Phase != types.TaskCreationPhaseExpired || op.TombstonedAt == nil ||
 		op.LeaseUntil != nil || op.TakeoverNotBefore != nil {
 		t.Fatalf("expiry 未耐久线性化: %+v", op)
@@ -526,21 +353,21 @@ func TestTaskCreationRecoveryTenantEnumeration_OnlyTrulyStale(t *testing.T) {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM pending_actions WHERE tenant_id = $1`, f.tenantID)
+			`DELETE FROM task_creation_operations WHERE tenant_id = $1`, f.tenantID)
 	})
 
 	stale := createAndAcquireA5Operation(t, st, f, "recovery-stale")
 	active := createAndAcquireA5Operation(t, st, f, "recovery-active")
 	corrupt := createAndAcquireA5Operation(t, st, f, "recovery-corrupt")
 	if _, err := st.pool.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET lease_until = clock_timestamp() - interval '2 minutes',
 		        takeover_not_before = clock_timestamp() - interval '1 minute'
 		  WHERE id = $1`, stale.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.pool.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET lease_until = clock_timestamp() - interval '2 minutes',
 		        takeover_not_before = clock_timestamp() - interval '1 minute',
 		        lease_owner = ''
@@ -680,7 +507,7 @@ func TestTaskCreationCompiledSagaRejectsDynamicAggregate(t *testing.T) {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO task_approved_definition_versions (
 				tenant_id, user_id, task_id, version, schema_version,
-				execution_mode, definition_digest, payload, approval_ref
+				execution_mode, definition_digest, payload, operation_ref
 			) VALUES ($1, $2, $3, 2, 'test.dynamic/v1', $4, $5, $6, $7)`,
 			f.tenantID, f.userID, taskID, types.ExecutionModeDiscoverAtRun,
 			digest, payload, "test-dynamic:"+taskID); err != nil {
@@ -775,7 +602,7 @@ func TestTaskCreationDefinitionReplayRejectsApprovedHeadDrift(t *testing.T) {
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO task_approved_definition_versions (
 			tenant_id, user_id, task_id, version, schema_version,
-			execution_mode, definition_digest, payload, approval_ref
+			execution_mode, definition_digest, payload, operation_ref
 		) VALUES ($1, $2, $3, 2, $4, $5, $6, $7, $8)`,
 		p.Lease.TenantID, p.Lease.UserID, p.Definition.TaskID,
 		drifted.SchemaVersion, types.ExecutionModeCompiled, digest, payload,
@@ -858,7 +685,7 @@ func TestTaskCreationCompletion_ResponseLostExactAdoptKeepsActiveAggregate(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if op.Status != types.PendingActionStatusExecuted ||
+	if op.Status != types.TaskOperationStatusExecuted ||
 		op.Phase != types.TaskCreationPhaseCompleted || op.TombstonedAt == nil {
 		t.Fatalf("completion tombstone incomplete: %+v", op)
 	}
@@ -1001,7 +828,7 @@ func TestTaskCreationDefinitionCommit_ResponseLostAndRollback(t *testing.T) {
 			`{"definition_digest":"%064d","definition_digest":"%064d"}`, 1, 2)
 		corruptDigest := digestOf(corrupt)
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions
+			`UPDATE task_creation_operations
 			    SET compiled_definition = $2, compiled_digest = $3
 			  WHERE id = $1`, p.Lease.ID, corrupt, corruptDigest); err != nil {
 			t.Fatal(err)
@@ -1118,7 +945,7 @@ func TestTaskCreationDefinitionCommit_LockOrderAvoidsCreateReplayDeadlock(t *tes
 			return nil, err
 		}
 		return &taskCreationObservedTx{
-			Tx: tx, pauseAfter: "FROM pending_actions", paused: operationLocked,
+			Tx: tx, pauseAfter: "FROM task_creation_operations", paused: operationLocked,
 			release: releaseCommit,
 		}, nil
 	}
@@ -1186,14 +1013,14 @@ func TestTaskCreationCapacity_SerializesNineteenToTwenty(t *testing.T) {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM pending_actions WHERE tenant_id = $1`, secondTenantID)
+			`DELETE FROM task_creation_operations WHERE tenant_id = $1`, secondTenantID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM schedules WHERE tenant_id = $1`, secondTenantID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
 			secondTenantID, f.userID)
 		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM sources WHERE url LIKE $1`, f2.urlRoot+"%")
+			`DELETE FROM fetch_targets WHERE url LIKE $1`, f2.urlRoot+"%")
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM tenants WHERE id = $1`, secondTenantID)
 	})
@@ -1256,7 +1083,7 @@ func TestTaskCreationCapacity_SerializesNineteenToTwenty(t *testing.T) {
 	}
 	var committed int
 	if err := st.pool.QueryRow(ctx,
-		`SELECT count(*) FROM pending_actions
+		`SELECT count(*) FROM task_creation_operations
 		  WHERE id IN ($1, $2) AND phase = $3`,
 		p1.Lease.ID, p2.Lease.ID, types.TaskCreationPhaseDefinitionCommitted,
 	).Scan(&committed); err != nil {
@@ -1331,7 +1158,7 @@ func TestTaskCreationCapacity_QuarantineRetainsReservation(t *testing.T) {
 	}
 	unknownLease, _ := preparedA5ScheduleOnly(t, st, f, "quarantine-capacity-unknown")
 	if _, err := st.pool.Exec(ctx,
-		`UPDATE pending_actions SET prepared_schedule = $2 WHERE id = $1`,
+		`UPDATE task_creation_operations SET prepared_schedule = $2 WHERE id = $1`,
 		unknownLease.ID, []byte(`{"task_id":"a","task_id":"b"}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -1366,7 +1193,7 @@ func TestTaskCreationCleanup_FencedAtomicAndReplayable(t *testing.T) {
 	}
 	var sourceID int64
 	if err := st.pool.QueryRow(ctx,
-		`SELECT source_id FROM schedule_sources WHERE schedule_id = $1`, p.Definition.TaskID,
+		`SELECT fetch_target_id FROM task_fetch_targets WHERE schedule_id = $1`, p.Definition.TaskID,
 	).Scan(&sourceID); err != nil {
 		t.Fatal(err)
 	}
@@ -1384,11 +1211,11 @@ func TestTaskCreationCleanup_FencedAtomicAndReplayable(t *testing.T) {
 	stale := p.Lease
 	stale.Fence++
 	if err := st.FinishTaskCreationCleanup(
-		ctx, stale, p.Definition.TaskID, types.PendingActionStatusFailed); !errors.Is(err, types.ErrTaskCreationLeaseLost) {
+		ctx, stale, p.Definition.TaskID, types.TaskOperationStatusFailed); !errors.Is(err, types.ErrTaskCreationLeaseLost) {
 		t.Fatalf("stale fence 不得清理: %v", err)
 	}
 	if err := st.FinishTaskCreationCleanup(
-		ctx, p.Lease, p.Definition.TaskID, types.PendingActionStatusExecuted); !errors.Is(err, types.ErrValidation) {
+		ctx, p.Lease, p.Definition.TaskID, types.TaskOperationStatusExecuted); !errors.Is(err, types.ErrValidation) {
 		t.Fatalf("cleanup terminal 只收 failed/blocked: %v", err)
 	}
 
@@ -1403,7 +1230,7 @@ func TestTaskCreationCleanup_FencedAtomicAndReplayable(t *testing.T) {
 		}, nil
 	}
 	if err := faultStore.FinishTaskCreationCleanup(
-		ctx, p.Lease, p.Definition.TaskID, types.PendingActionStatusBlocked); !errors.Is(err, types.ErrDatabase) {
+		ctx, p.Lease, p.Definition.TaskID, types.TaskOperationStatusBlocked); !errors.Is(err, types.ErrDatabase) {
 		t.Fatalf("cleanup statement fault: %v", err)
 	}
 	assertCreationPhaseAndScheduleStatus(t, st, p.Lease.ID, p.Definition.TaskID,
@@ -1411,15 +1238,15 @@ func TestTaskCreationCleanup_FencedAtomicAndReplayable(t *testing.T) {
 
 	lostStore := storeWithCommitResponseLost(st)
 	if err := lostStore.FinishTaskCreationCleanup(
-		ctx, p.Lease, p.Definition.TaskID, types.PendingActionStatusBlocked); !errors.Is(err, types.ErrDatabase) {
+		ctx, p.Lease, p.Definition.TaskID, types.TaskOperationStatusBlocked); !errors.Is(err, types.ErrDatabase) {
 		t.Fatalf("cleanup response lost 应返回 database: %v", err)
 	}
 	if err := st.FinishTaskCreationCleanup(
-		ctx, p.Lease, p.Definition.TaskID, types.PendingActionStatusBlocked); err != nil {
+		ctx, p.Lease, p.Definition.TaskID, types.TaskOperationStatusBlocked); err != nil {
 		t.Fatalf("cleanup exact replay: %v", err)
 	}
 	assertTaskCreationReceiptExactlyOne(t, st, p.Lease.ID)
-	for _, table := range []string{"schedules", "schedule_playbooks", "schedule_sources"} {
+	for _, table := range []string{"schedules", "schedule_playbooks", "task_fetch_targets"} {
 		column := "id"
 		if table != "schedules" {
 			column = "schedule_id"
@@ -1436,7 +1263,7 @@ func TestTaskCreationCleanup_FencedAtomicAndReplayable(t *testing.T) {
 	}
 	var sourceCount int
 	if err := st.pool.QueryRow(ctx,
-		`SELECT count(*) FROM sources WHERE id = $1`, sourceID).Scan(&sourceCount); err != nil {
+		`SELECT count(*) FROM fetch_targets WHERE id = $1`, sourceID).Scan(&sourceCount); err != nil {
 		t.Fatal(err)
 	}
 	if sourceCount != 1 {
@@ -1497,7 +1324,7 @@ func TestTaskCreationCleanup_PreEnsureDeterministicDeleteCheckpoint(t *testing.T
 			t.Fatalf("schedule_prepared cleanup replay: started=%v err=%v", started, err)
 		}
 		if err := st.FinishTaskCreationCleanup(
-			ctx, lease, taskID, types.PendingActionStatusFailed); err != nil {
+			ctx, lease, taskID, types.TaskOperationStatusFailed); err != nil {
 			t.Fatalf("pre-ensure NotFound delete 应收敛: %v", err)
 		}
 	})
@@ -1564,7 +1391,7 @@ func TestTaskCreationCleanup_ScheduleEnsuredNeverAdoptsLateAggregate(t *testing.
 			t.Fatal(err)
 		}
 		if err := st.FinishTaskCreationCleanup(
-			ctx, p.Lease, p.Definition.TaskID, types.PendingActionStatusFailed,
+			ctx, p.Lease, p.Definition.TaskID, types.TaskOperationStatusFailed,
 		); !errors.Is(err, types.ErrConflict) {
 			t.Fatalf("late aggregate 必须保留并阻止 tombstone: %v", err)
 		}
@@ -1608,7 +1435,7 @@ func TestTaskCreationCleanup_RefusesSameScopeReplacementGeneration(t *testing.T)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	for _, statement := range []string{
-		`DELETE FROM schedule_sources WHERE schedule_id = $1`,
+		`DELETE FROM task_fetch_targets WHERE schedule_id = $1`,
 		`DELETE FROM schedule_playbooks WHERE schedule_id = $1`,
 		`DELETE FROM schedules WHERE id = $1`,
 	} {
@@ -1627,7 +1454,7 @@ func TestTaskCreationCleanup_RefusesSameScopeReplacementGeneration(t *testing.T)
 		t.Fatal(err)
 	}
 	if err := st.FinishTaskCreationCleanup(
-		ctx, p.Lease, p.Definition.TaskID, types.PendingActionStatusFailed,
+		ctx, p.Lease, p.Definition.TaskID, types.TaskOperationStatusFailed,
 	); !errors.Is(err, types.ErrConflict) {
 		t.Fatalf("same-scope replacement generation 必须拒绝: %v", err)
 	}
@@ -1705,11 +1532,11 @@ func TestBlockTaskCreationOperationAfterSideEffect_QuarantinesWithoutDeletion(t 
 			"OWNERSHIP_UNKNOWN", "cannot prove owner"); err != nil {
 			t.Fatalf("quarantine exact replay: %v", err)
 		}
-		var status types.PendingActionStatus
+		var status types.TaskOperationStatus
 		var phase types.TaskCreationPhase
 		var scheduleCount int
 		if err := st.pool.QueryRow(ctx,
-			`SELECT status, phase FROM pending_actions WHERE id = $1`, p.Lease.ID,
+			`SELECT status, phase FROM task_creation_operations WHERE id = $1`, p.Lease.ID,
 		).Scan(&status, &phase); err != nil {
 			t.Fatal(err)
 		}
@@ -1718,7 +1545,7 @@ func TestBlockTaskCreationOperationAfterSideEffect_QuarantinesWithoutDeletion(t 
 		).Scan(&scheduleCount); err != nil {
 			t.Fatal(err)
 		}
-		if status != types.PendingActionStatusBlocked ||
+		if status != types.TaskOperationStatusBlocked ||
 			phase != types.TaskCreationPhaseBlocked || scheduleCount != 1 {
 			t.Fatalf("quarantine 不得删除证据: status=%s phase=%s schedules=%d",
 				status, phase, scheduleCount)
@@ -1795,7 +1622,7 @@ func TestBlockTaskCreationOperationAfterSideEffect_QuarantinesWithoutDeletion(t 
 		if !ok || marker.PrimaryErrorCode != "TASK_LIMIT_REACHED" ||
 			marker.PrimaryErrorMessage != "task limit reached" ||
 			op.ErrorCode != "UNSAFE_CLEANUP_TARGET" ||
-			op.Status != types.PendingActionStatusBlocked {
+			op.Status != types.TaskOperationStatusBlocked {
 			t.Fatalf("cleanup escalation audit marker 错误: op=%+v marker=%+v", op, marker)
 		}
 		stale, err := st.ListStaleTaskCreationOperations(
@@ -1813,7 +1640,7 @@ func TestBlockTaskCreationOperationAfterSideEffect_QuarantinesWithoutDeletion(t 
 	t.Run("corrupt prepared checkpoint uses explicit unknown reservation", func(t *testing.T) {
 		lease, _ := preparedA5ScheduleOnly(t, st, f, "block-prepared-unknown")
 		if _, err := st.pool.Exec(ctx,
-			`UPDATE pending_actions SET prepared_schedule = $2 WHERE id = $1`,
+			`UPDATE task_creation_operations SET prepared_schedule = $2 WHERE id = $1`,
 			lease.ID, []byte(`{"task_id":"broken","task_id":"duplicate"}`)); err != nil {
 			t.Fatal(err)
 		}
@@ -1873,7 +1700,7 @@ func TestBlockTaskCreationOperationAfterSideEffect_QuarantinesWithoutDeletion(t 
 			`SELECT
 			   (SELECT count(*) FROM schedules WHERE id = $1 AND status = 'active'),
 			   COALESCE((SELECT (result->>'reservation_retained')::boolean
-			               FROM pending_actions WHERE id = $2), false)`,
+			               FROM task_creation_operations WHERE id = $2), false)`,
 			p.Definition.TaskID, p.Lease.ID,
 		).Scan(&activeRows, &reservationRetained); err != nil {
 			t.Fatal(err)
@@ -1948,7 +1775,7 @@ func preparedA5CommitWithSources(
 	st *Store,
 	f *compiledTaskFixture,
 	suffix string,
-	sources ...compiledPlanSource,
+	sources ...compiledPlanTarget,
 ) types.CommitPausedCompiledTaskDefinitionForCreationParams {
 	return preparedA5CommitWithSourcesAndStrictness(
 		t, st, f, suffix, types.StrictnessStrict, sources...)
@@ -1960,12 +1787,12 @@ func preparedA5CommitWithSourcesAndStrictness(
 	f *compiledTaskFixture,
 	suffix string,
 	strictness types.PushStrictness,
-	sources ...compiledPlanSource,
+	sources ...compiledPlanTarget,
 ) types.CommitPausedCompiledTaskDefinitionForCreationParams {
 	t.Helper()
 	op := createAndAcquireA5Operation(t, st, f, "a5-"+suffix)
 	lease := op.Lease()
-	plan, err := json.Marshal(compiledFetchPlan{Sources: sources})
+	plan, err := json.Marshal(compiledFetchPlan{Targets: sources})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2024,16 +1851,16 @@ func preparedA5CommitWithSourcesAndStrictness(
 	}
 }
 
-func validA5PlanSource(t *testing.T, query, title string) compiledPlanSource {
+func validA5PlanSource(t *testing.T, query, title string) compiledPlanTarget {
 	t.Helper()
-	source, message := sourcespec.Build(sourcespec.Spec{
+	source, message := fetchspec.BuildTarget(fetchspec.Requirement{
 		Platform: "web", Capability: "search", Title: title,
 		Params: map[string]string{"query": query},
 	})
 	if message != "" || source == nil {
 		t.Fatalf("build valid A5 source: source=%+v message=%q", source, message)
 	}
-	return compiledPlanSource{
+	return compiledPlanTarget{
 		Platform: string(source.Platform), Capability: string(source.Capability),
 		Title: source.Title, URL: source.URL,
 		Config: append(json.RawMessage(nil), source.Config...),
@@ -2052,7 +1879,7 @@ func assertTaskCreationApprovedDefinition(
 		t.Fatalf("GetCurrentApprovedDefinition: %v", err)
 	}
 	if record.Version != initialApprovedDefinitionVersion ||
-		record.ApprovalRef != taskCreationApprovalRefPrefix+p.Lease.ID ||
+		record.OperationRef != taskCreationOperationRefPrefix+p.Lease.ID ||
 		record.Definition.ExecutionMode != types.ExecutionModeCompiled ||
 		record.Definition.SourceScope != taskstate.SourceScopeApprovedPlan ||
 		record.Definition.Intent != p.Definition.PlaybookContent ||
@@ -2060,26 +1887,40 @@ func assertTaskCreationApprovedDefinition(
 		record.Definition.NLDescription != p.Definition.NLDescription {
 		t.Fatalf("approved definition differs: %+v", record)
 	}
-	var plan taskstate.FetchPlanV1
-	if err := json.Unmarshal(p.Definition.FetchPlan, &plan); err != nil {
-		t.Fatalf("decode independently expected approved plan: %v", err)
+	var currentPlan compiledFetchPlan
+	if err := json.Unmarshal(p.Definition.FetchPlan, &currentPlan); err != nil {
+		t.Fatalf("decode current fetch-target plan: %v", err)
 	}
-	expectedSources := make([]taskstate.ApprovedSourceV1, 0, len(plan.Sources))
-	for _, source := range plan.Sources {
+	legacyPlan := taskstate.FetchPlanV1{
+		Sources: make([]taskstate.PlanSourceV1, 0, len(currentPlan.Targets)),
+	}
+	expectedSources := make([]taskstate.ApprovedSourceV1, 0, len(currentPlan.Targets))
+	for _, target := range currentPlan.Targets {
 		var sourceID int64
 		if err := st.pool.QueryRow(t.Context(),
 			`SELECT src.id
-			   FROM schedule_sources ss JOIN sources src ON src.id=ss.source_id
+			   FROM task_fetch_targets ss JOIN fetch_targets src ON src.id=ss.fetch_target_id
 			  WHERE ss.schedule_id=$1 AND src.url=$2`,
-			p.Definition.TaskID, source.URL,
+			p.Definition.TaskID, target.URL,
 		).Scan(&sourceID); err != nil {
 			t.Fatal(err)
 		}
-		expectedSources = append(expectedSources, taskstate.ApprovedSourceV1{
-			SourceID: sourceID, Platform: source.Platform, Capability: source.Capability,
-			Title: source.Title, URL: source.URL,
-			Config: append(json.RawMessage(nil), source.Config...),
+		legacyPlan.Sources = append(legacyPlan.Sources, taskstate.PlanSourceV1{
+			Platform:   types.Platform(target.Platform),
+			Capability: types.Capability(target.Capability),
+			Title:      target.Title, URL: target.URL,
+			Config: append(json.RawMessage(nil), target.Config...),
 		})
+		expectedSources = append(expectedSources, taskstate.ApprovedSourceV1{
+			SourceID: sourceID, Platform: types.Platform(target.Platform),
+			Capability: types.Capability(target.Capability),
+			Title:      target.Title, URL: target.URL,
+			Config: append(json.RawMessage(nil), target.Config...),
+		})
+	}
+	legacyPlanJSON, err := json.Marshal(legacyPlan)
+	if err != nil {
+		t.Fatal(err)
 	}
 	expected, err := taskstate.BuildApprovedDefinitionV1(taskstate.ApprovedDefinitionInputV1{
 		TenantID: p.Definition.TenantID, UserID: p.Definition.UserID,
@@ -2088,7 +1929,7 @@ func assertTaskCreationApprovedDefinition(
 		SpecJSON:      p.Definition.SpecJSON, ScopeJSON: p.Definition.ScopeJSON,
 		PlaybookContent: p.Definition.PlaybookContent,
 		SourceScope:     taskstate.SourceScopeApprovedPlan,
-		FetchPlan:       p.Definition.FetchPlan, Strictness: p.Definition.Strictness,
+		FetchPlan:       legacyPlanJSON, Strictness: p.Definition.Strictness,
 		Sources: expectedSources, ExecutionMode: types.ExecutionModeCompiled,
 		DeliveryPolicy: taskstate.DeliveryPolicyOwnerFeishu,
 		BudgetPolicy:   taskstate.BudgetPolicyInheritTenantQuota,
@@ -2133,7 +1974,7 @@ func assertTaskCreationApprovedDefinition(
 		var sourceID int64
 		if err := st.pool.QueryRow(t.Context(),
 			`SELECT src.id
-			   FROM schedule_sources ss JOIN sources src ON src.id=ss.source_id
+			   FROM task_fetch_targets ss JOIN fetch_targets src ON src.id=ss.fetch_target_id
 			  WHERE ss.schedule_id=$1 AND src.url=$2`,
 			p.Definition.TaskID, source.URL,
 		).Scan(&sourceID); err != nil {
@@ -2206,7 +2047,7 @@ func cleanupA5Fixture(t *testing.T, st *Store, f *compiledTaskFixture) {
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM task_creation_receipts WHERE tenant_id = $1`, f.tenantID)
 		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM pending_actions WHERE tenant_id = $1`, f.tenantID)
+			`DELETE FROM task_creation_operations WHERE tenant_id = $1`, f.tenantID)
 	})
 }
 
@@ -2223,7 +2064,7 @@ func assertCreationPhaseAndScheduleStatus(
 	var status types.ScheduleStatus
 	if err := st.pool.QueryRow(t.Context(),
 		`SELECT p.phase, s.status
-		   FROM pending_actions p JOIN schedules s ON s.id = p.task_id
+		   FROM task_creation_operations p JOIN schedules s ON s.id = p.task_id
 		  WHERE p.id = $1 AND s.id = $2`, operationID, taskID,
 	).Scan(&phase, &status); err != nil {
 		t.Fatal(err)
@@ -2270,7 +2111,7 @@ func assertProvisioningScheduleIsNotUserManageable(
 	if err := st.pool.QueryRow(ctx,
 		`SELECT s.nl_description, s.spec_json, s.push_strictness,
 		        p.content, p.fetch_plan,
-		        (SELECT count(*) FROM schedule_sources ss WHERE ss.schedule_id = s.id)
+		        (SELECT count(*) FROM task_fetch_targets ss WHERE ss.schedule_id = s.id)
 		   FROM schedules s JOIN schedule_playbooks p ON p.schedule_id = s.id
 		  WHERE s.id = $1`, taskID,
 	).Scan(&nlDescription, &specJSON, &strictness, &playbook, &fetchPlan, &linkCount); err != nil {
@@ -2301,13 +2142,13 @@ func assertProvisioningScheduleIsNotUserManageable(
 		t.Fatalf("provisioning playbook Upsert 必须无写入: ok=%v err=%v", ok, err)
 	}
 	if ok, err := st.SetFetchPlan(
-		ctx, userID, taskID, json.RawMessage(`{"sources":[]}`)); err != nil || ok {
+		ctx, userID, taskID, json.RawMessage(`{"targets":[]}`)); err != nil || ok {
 		t.Fatalf("provisioning fetch plan 修改必须无写入: ok=%v err=%v", ok, err)
 	}
-	if err := st.ReplaceScheduleSources(ctx, userID, taskID, nil); err != nil {
+	if err := st.ReplaceTaskFetchTargets(ctx, userID, taskID, nil); err != nil {
 		t.Fatalf("provisioning source Replace 应安全 no-op: %v", err)
 	}
-	ids, err := st.ListScheduleSourceIDs(ctx, userID, taskID)
+	ids, err := st.ListTaskFetchTargetIDs(ctx, userID, taskID)
 	if err != nil || len(ids) != 0 {
 		t.Fatalf("provisioning source List 必须隐藏: ids=%v err=%v", ids, err)
 	}
@@ -2322,7 +2163,7 @@ func assertProvisioningScheduleIsNotUserManageable(
 	if err := st.pool.QueryRow(ctx,
 		`SELECT s.nl_description, s.spec_json, s.push_strictness,
 		        p.content, p.fetch_plan,
-		        (SELECT count(*) FROM schedule_sources ss WHERE ss.schedule_id = s.id)
+		        (SELECT count(*) FROM task_fetch_targets ss WHERE ss.schedule_id = s.id)
 		   FROM schedules s JOIN schedule_playbooks p ON p.schedule_id = s.id
 		  WHERE s.id = $1`, taskID,
 	).Scan(&gotNL, &gotSpec, &gotStrictness, &gotPlaybook, &gotFetchPlan, &gotLinks); err != nil {

@@ -60,7 +60,7 @@ func (s *Store) LoadTaskDefinitionEditProposalBasis(
 		    AND d.execution_mode=s.execution_mode
 		   JOIN LATERAL (
 		     SELECT p.prepared_schedule
-		       FROM pending_actions p
+		       FROM task_creation_operations p
 		      WHERE p.tenant_id=s.tenant_id AND p.user_id=s.user_id
 		        AND p.task_id=s.id AND p.tool_name='create_schedule'
 		        AND p.execution_version=$3 AND p.status=$4 AND p.phase=$5
@@ -72,7 +72,7 @@ func (s *Store) LoadTaskDefinitionEditProposalBasis(
 		    AND t.status='active' AND t.deleted_at IS NULL
 		    AND `+matureSchedulePredicate,
 		userID, taskID, types.TaskCreationExecutionVersionV1,
-		types.PendingActionStatusExecuted, types.TaskCreationPhaseCompleted,
+		types.TaskOperationStatusExecuted, types.TaskCreationPhaseCompleted,
 	).Scan(&tenantID, &status, &version, &digest, &payload, &preparedBytes)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
