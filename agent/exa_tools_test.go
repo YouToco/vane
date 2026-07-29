@@ -176,12 +176,12 @@ func TestWebSearch_上游可控字段截断(t *testing.T) {
 }
 
 func TestWebSearch_错误翻译(t *testing.T) {
-	// AppError → Message 人话回模型（nil error）。
+	// Retryable AppError is surfaced so the unified loop can retry it.
 	fs := &fakeWebSearcher{err: types.NewAppError(types.CodeFetchRateLimit, "Exa 搜索被限流(429)", nil)}
 	tl := &webSearchTool{et: newTestExaTools(fs, nil)}
 	out, err := tl.Execute(context.Background(), 1, json.RawMessage(`{"query":"x"}`))
-	if err != nil || !strings.Contains(out, "限流") {
-		t.Errorf("AppError 应翻译成文案通道，实得 out=%q err=%v", out, err)
+	if err == nil || out != "" || !types.IsRetryable(err) {
+		t.Errorf("retryable error should reach harness: out=%q err=%v", out, err)
 	}
 	// 非 AppError（真基础设施失败）→ 向上抛。
 	fs.err = errors.New("dial tcp: connection refused")
@@ -302,9 +302,9 @@ func TestReadPage_错误翻译(t *testing.T) {
 // 双重限额（对抗审查 HIGH）：按次计费 + 免确认就必须有频率护栏。
 // ============================================================
 
-// TestExaTools_消息内限额 钉住第一重：一条消息内 exaCalls 达 msgCap 后拒绝，
-// 不打上游、记 budget_exceeded（不计入日限额 COUNT）。
-func TestExaTools_消息内限额(t *testing.T) {
+// msgCap remains constructor-compatible but no longer imposes a planning
+// quota; the Agent loop owns the unified hidden fuse.
+func TestExaTools_消息内旧限额不再拦截(t *testing.T) {
 	fs := &fakeWebSearcher{}
 	et := &ExaTools{searcher: fs, msgCap: 2}
 	tl := &webSearchTool{et: et}
@@ -320,26 +320,22 @@ func TestExaTools_消息内限额(t *testing.T) {
 	if fs.calls != 2 || state.exaCalls != 2 {
 		t.Fatalf("前 2 次应放行且计数，实得 upstream=%d exaCalls=%d", fs.calls, state.exaCalls)
 	}
-	// 第 3 次：消息内上限，拒绝且不打上游。
+	// 第 3 次仍放行；provider-family count is observation-only.
 	rec := &types.ToolCall{}
 	out, err := tl.Execute(ctxWithRun(state, rec), 1, json.RawMessage(`{"query":"x"}`))
 	if err != nil {
-		t.Fatalf("限额拒绝应走文案通道，实得 %v", err)
+		t.Fatal(err)
 	}
-	if !strings.Contains(out, "本条消息的网页查询已达上限") {
-		t.Errorf("应有消息内限额文案，实得 %q", out)
-	}
-	if fs.calls != 2 {
-		t.Errorf("限额拒绝绝不能打上游，实得 %d 次", fs.calls)
-	}
-	if rec.ErrorType != types.ToolErrBudgetExceeded {
-		t.Errorf("限额拒绝应记 budget_exceeded，实得 %q", rec.ErrorType)
+	if !strings.Contains(out, "没有搜到") || fs.calls != 3 ||
+		rec.ErrorType != "" {
+		t.Errorf("legacy cap should not reject: out=%q calls=%d type=%q",
+			out, fs.calls, rec.ErrorType)
 	}
 	// 参数校验失败不吃限额（没打上游）。
 	if _, err := tl.Execute(ctxWithRun(state, &types.ToolCall{}), 1, json.RawMessage(`{"query":" "}`)); err != nil {
 		t.Fatal(err)
 	}
-	if state.exaCalls != 2 {
+	if state.exaCalls != 3 {
 		t.Errorf("校验失败不该增加计数，实得 %d", state.exaCalls)
 	}
 }

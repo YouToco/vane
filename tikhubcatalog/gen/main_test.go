@@ -6,6 +6,9 @@ func TestExcludedByRiskClassifiesCapabilityNotMethod(t *testing.T) {
 	for _, name := range []string{
 		"douyin_web_fetch_douyin_web_guest_cookie",
 		"tiktok_web_generate_wss_xb_signature",
+		"douyin_web_generate_x_bogus",
+		"tiktok_web_generate_fingerprint",
+		"douyin_web_generate_ttwid",
 		"tiktok_app_v3_encrypt_decrypt_login_request",
 		"douyin_app_v3_register_device",
 		"douyin_app_v3_open_douyin_app_to_send_private_message",

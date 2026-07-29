@@ -93,7 +93,7 @@ func (ix *bm25Index) search(query, platform string, topK int) []Hit {
 	// 查询词去重：BM25 对重复查询词累加没有检索意义，还会放大误拼权重。
 	seen := make(map[string]bool, len(qToks))
 	scores := make(map[int]float64)
-	n := float64(len(entries))
+	n := float64(len(agentEntries))
 	for _, tok := range qToks {
 		if seen[tok] {
 			continue
@@ -116,13 +116,13 @@ func (ix *bm25Index) search(query, platform string, topK int) []Hit {
 	allowAdvanced := explicitAdvancedAnalyticsQuery(query)
 	hits := make([]Hit, 0, len(scores))
 	for doc, s := range scores {
-		if platform != "" && entries[doc].Platform != platform {
+		if platform != "" && agentEntries[doc].Platform != platform {
 			continue
 		}
-		if advancedAnalyticsEntry(entries[doc]) && !allowAdvanced {
+		if advancedAnalyticsEntry(agentEntries[doc]) && !allowAdvanced {
 			continue
 		}
-		hits = append(hits, Hit{Entry: entries[doc], Score: s})
+		hits = append(hits, Hit{Entry: agentEntries[doc], Score: s})
 	}
 	// 分数降序，同分按名字典序——检索结果给模型看，顺序不能因 map 遍历序抖动。
 	sort.Slice(hits, func(i, j int) bool {

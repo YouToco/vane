@@ -27,7 +27,7 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 
 ## Dynamic social research tools
 
-981 read-only catalog tools are discovered lazily through `search_endpoints`; schemas are not placed in the first model request.
+883 read-only catalog tools are discovered lazily through `search_endpoints`; schemas are not placed in the first model request.
 
 | Tool | Platform | Capability | Parameters | Risk | Exposure | Confirmation | Production |
 |---|---|---|---|---|---|---|---|
@@ -71,7 +71,6 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 | `bilibili_web_fetch_video_play_info` | bilibili | 公开数据查询 | url* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `bilibili_web_fetch_video_playurl` | bilibili | 公开数据查询 | bv_id*, cid* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `bilibili_web_fetch_video_subtitle` | bilibili | 公开数据查询 | a_id*, c_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `bilibili_web_fetch_vip_video_playurl` | bilibili | 公开数据查询 | bv_id*, cid*, cookie* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_app_v3_fetch_brand_hot_search_list` | douyin | 搜索 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_app_v3_fetch_brand_hot_search_list_detail` | douyin | 搜索 | category_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_app_v3_fetch_hashtag_detail` | douyin | 内容详情 | ch_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
@@ -156,35 +155,9 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 | `douyin_creator_fetch_mission_task_list` | douyin | 内容列表 | cursor, limit, mission_type, tab_scene, industry_lv1, industry_lv2, platform_channel, pay_type, greater_than_cost_progress, publish_time_start, quick_selector_scene, keyword | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_creator_fetch_user_search` | douyin | 搜索 | user_name* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_creator_fetch_video_danmaku_list` | douyin | 内容列表 | item_id*, count, offset, order_type, is_blocked | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_author_diagnosis` | douyin | 公开数据查询 | cookie* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_analysis_involved_vertical` | douyin | 公开数据查询 | cookie*, end_date*, start_date* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_analysis_item_performance` | douyin | 公开数据查询 | cookie*, end_date*, genres, metric_type, primary_verticals*, start_date* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_analysis_overview` | douyin | 公开数据查询 | cookie*, end_date*, genres, primary_verticals*, start_date* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_audience_others` | douyin | 公开数据查询 | cookie*, item_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_audience_portrait` | douyin | 公开数据查询 | cookie*, item_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_danmaku_analysis` | douyin | 公开数据查询 | cookie*, item_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_list` | douyin | 内容列表 | cookie*, count, cursor, end_time*, fields, need_cooperation, need_long_article, order_by, start_time* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_list_download` | douyin | 内容列表 | cookie*, max_cursor*, min_cursor*, need_long_article, type_filters | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_overview_data` | douyin | 公开数据查询 | cookie*, fields, ids* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_play_source` | douyin | 公开数据查询 | cookie*, item_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_search_keyword` | douyin | 搜索 | cookie*, item_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_item_watch_trend` | douyin | 趋势 | analysis_type, cookie*, item_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_creator_v2_fetch_live_room_history_list` | douyin | 内容列表 | cookie*, download, end_date*, limit, need_living, start_date* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_calculate_cost` | douyin | 公开数据查询 | cookie*, item_ids*, sec_uid*, target_id | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_fetch_analyse_detail` | douyin | 内容详情 | cookie*, query* | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_fetch_analyse_graph` | douyin | 趋势 | cookie*, query* | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_fetch_analyse_overview` | douyin | 公开数据查询 | cookie*, query* | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `douyin_douplus_fetch_promotable_item_list` | douyin | 评论 | aim_ids, count, sec_uid*, target_id | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_fetch_promoted_accounts` | douyin | 公开数据查询 | cookie*, cursor, limit | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_fetch_talent_categories` | douyin | 公开数据查询 | cookie | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_fetch_talents_by_category` | douyin | 搜索 | cookie, limit, name, page | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_fetch_user_posts` | douyin | 账号 | cookie, count, cursor, sec_uid* | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_fetch_video_detail` | douyin | 内容详情 | cookie, video* | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `douyin_douplus_fetch_video_ranking` | douyin | 公开数据查询 | adv_id, dim_type, tag_id, time_range | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_search_live_room` | douyin | 搜索 | cookie, count, cursor, keyword* | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `douyin_douplus_search_user` | douyin | 搜索 | count, cursor, keyword* | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_search_user_v2` | douyin | 搜索 | cookie, count, cursor, keyword*, scope | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_douplus_search_video` | douyin | 搜索 | cookie, count, cursor, keyword* | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `douyin_index_fetch_all_area` | douyin | 内容列表 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_index_fetch_all_valid_date` | douyin | 公开数据查询 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_index_fetch_brand_cycles` | douyin | 公开数据查询 | brand_name*, start_date*, end_date*, app_name | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
@@ -255,49 +228,30 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 | `douyin_web_douyin_live_room` | douyin | 公开数据查询 | live_room_url*, danmaku_type* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_batch_user_profile_v1` | douyin | 账号 | sec_user_ids* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_batch_user_profile_v2` | douyin | 账号 | sec_user_ids* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_cartoon_aweme` | douyin | 公开数据查询 | count*, refresh_index, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_challenge_posts` | douyin | 公开数据查询 | challenge_id, cookie, count, cursor, sort_type | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_food_aweme` | douyin | 公开数据查询 | count*, refresh_index, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_game_aweme` | douyin | 公开数据查询 | count*, refresh_index, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_home_feed` | douyin | 公开数据查询 | cookie, count, refresh_index | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_hot_search_result` | douyin | 搜索 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_knowledge_aweme` | douyin | 公开数据查询 | count*, refresh_index, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_live_gift_ranking` | douyin | 账号 | room_id*, rank_type | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_live_im_fetch` | douyin | 公开数据查询 | room_id*, user_unique_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_live_room_product_result` | douyin | 公开数据查询 | room_id*, author_id*, offset, limit | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_multi_video` | douyin | 公开数据查询 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_multi_video_high_quality_play_url` | douyin | 公开数据查询 | aweme_ids, region | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_music_aweme` | douyin | 公开数据查询 | count*, refresh_index, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_one_video` | douyin | 公开数据查询 | aweme_id*, need_anchor_info | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_one_video_by_share_url` | douyin | 公开数据查询 | share_url* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_one_video_danmaku` | douyin | 公开数据查询 | item_id*, duration*, end_time*, start_time* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_one_video_v2` | douyin | 公开数据查询 | aweme_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_query_user` | douyin | 账号 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_related_posts` | douyin | 公开数据查询 | aweme_id*, refresh_index, count | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_series_aweme` | douyin | 公开数据查询 | offset*, count*, content_type*, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_user_collection_videos` | douyin | 账号 | cookie*, counts, max_cursor | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_user_collects` | douyin | 账号 | cookie*, counts, max_cursor | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_user_collects_videos` | douyin | 账号 | collects_id*, max_cursor, counts | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_user_fans_list` | douyin | 账号 | sec_user_id, max_time, count, source_type | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_user_following_list` | douyin | 账号 | sec_user_id, max_time, count, source_type | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_user_like_videos` | douyin | 账号 | cookie, counts, max_cursor, sec_user_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_user_live_info_by_uid` | douyin | 账号 | uid* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_user_live_videos` | douyin | 账号 | webcast_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_user_live_videos_by_room_id_v2` | douyin | 账号 | room_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_user_live_videos_by_sec_uid` | douyin | 账号 | sec_uid* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_user_mix_videos` | douyin | 账号 | mix_id*, max_cursor, counts | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_fetch_user_post_videos` | douyin | 账号 | sec_user_id*, max_cursor, count, filter_type, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_user_profile_by_short_id` | douyin | 账号 | short_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_user_profile_by_uid` | douyin | 账号 | uid* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_video_channel_result` | douyin | 公开数据查询 | tag_id*, count, refresh_index | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_video_comment_replies` | douyin | 评论 | item_id*, comment_id*, cursor, count | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_video_comments` | douyin | 评论 | aweme_id*, cursor, count | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_fetch_video_high_quality_play_url` | douyin | 公开数据查询 | aweme_id, share_url, region | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_generate_a_bogus` | douyin | 公开数据查询 | data*, index_0, index_1, index_2, url*, user_agent* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_generate_s_v_web_id` | douyin | 公开数据查询 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_generate_ttwid` | douyin | 公开数据查询 | user_agent | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_generate_verify_fp` | douyin | 公开数据查询 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `douyin_web_generate_x_bogus` | douyin | 公开数据查询 | url*, user_agent* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_get_all_aweme_id` | douyin | 内容列表 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_get_all_sec_user_id` | douyin | 账号 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `douyin_web_get_all_webcast_id` | douyin | 内容列表 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
@@ -342,7 +296,6 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 | `douyin_xingtu_v2_get_author_show_items` | douyin | 公开数据查询 | o_author_id*, platform_source, platform_channel, only_assign, flow_type | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `douyin_xingtu_v2_get_author_spread_info` | douyin | 公开数据查询 | o_author_id*, platform_source, platform_channel, type, flow_type, only_assign, range | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `douyin_xingtu_v2_get_author_touch_distribution` | douyin | 公开数据查询 | o_author_id*, platform_source, platform_channel | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
-| `douyin_xingtu_v2_get_content_trend_guide` | douyin | 趋势 |  | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `douyin_xingtu_v2_get_demander_mcn_list` | douyin | 内容列表 | mcn_name, page, order_by | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `douyin_xingtu_v2_get_excellent_case_category_list` | douyin | 内容列表 | platform_source | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `douyin_xingtu_v2_get_ip_activity_detail` | douyin | 内容详情 | id* | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
@@ -451,7 +404,6 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 | `instagram_v3_search_hashtags` | instagram | 搜索 | query*, rank_token | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `instagram_v3_search_users` | instagram | 搜索 | query*, rank_token | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `instagram_v3_shortcode_to_media_id` | instagram | 公开数据查询 | shortcode* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `instagram_v3_translate_comment` | instagram | 评论 | comment_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `instagram_v3_user_id_to_username` | instagram | 账号 | user_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `kuaishou_app_fetch_brand_top_list` | kuaishou | 内容列表 | subTabId, subTabName | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `kuaishou_app_fetch_hot_board_categories` | kuaishou | 热榜/趋势 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
@@ -648,12 +600,8 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 | `tiktok_app_v3_fetch_hashtag_detail` | tiktok | 内容详情 | ch_id*, region | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_app_v3_fetch_hashtag_search_result` | tiktok | 搜索 | keyword*, offset, count | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_app_v3_fetch_hashtag_video_list` | tiktok | 内容列表 | ch_id*, cursor, count, region | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_app_v3_fetch_home_feed` | tiktok | 公开数据查询 | cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_app_v3_fetch_live_daily_rank` | tiktok | 公开数据查询 | anchor_id, room_id, rank_type, region_type, gap_interval, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_app_v3_fetch_live_ranking_list` | tiktok | 内容列表 | room_id*, anchor_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_app_v3_fetch_live_room_info` | tiktok | 公开数据查询 | room_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_app_v3_fetch_live_room_product_list` | tiktok | 内容列表 | room_id*, author_id*, page_size, offset, region, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_app_v3_fetch_live_room_product_list_v2` | tiktok | 内容列表 | room_id*, author_id*, page_size, offset, region, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_app_v3_fetch_live_search_result` | tiktok | 搜索 | keyword*, offset, count, region | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_app_v3_fetch_location_search` | tiktok | 搜索 | keyword*, offset, count | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_app_v3_fetch_multi_video` | tiktok | 公开数据查询 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
@@ -706,20 +654,6 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 | `tiktok_app_v3_open_tiktok_app_to_video_detail` | tiktok | 内容详情 | aweme_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_app_v3_search_follower_list` | tiktok | 搜索 | user_id*, keyword* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_app_v3_search_following_list` | tiktok | 搜索 | user_id*, keyword* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_account_health_status` | tiktok | 公开数据查询 | cookie, proxy | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_account_insights_overview` | tiktok | 公开数据查询 | cookie, proxy, start_date | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_account_violation_list` | tiktok | 内容列表 | cookie, page, proxy | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_creator_account_info` | tiktok | 公开数据查询 | cookie, proxy | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_live_analytics_summary` | tiktok | 公开分析 | cookie, proxy, start_date | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_product_analytics_list` | tiktok | 内容列表 | cookie, end_date, page, proxy, start_date | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_product_related_videos` | tiktok | 公开数据查询 | cookie, item_id*, product_id*, proxy, start_date | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_showcase_product_list` | tiktok | 内容列表 | cookie, count, offset, proxy | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_video_analytics_summary` | tiktok | 公开分析 | cookie, proxy | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_video_associated_product_list` | tiktok | 内容列表 | cookie, item_ids*, proxy, start_date | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_video_audience_stats` | tiktok | 公开数据查询 | cookie, item_id*, proxy, start_date | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_video_detailed_stats` | tiktok | 内容详情 | cookie, item_id*, proxy, start_date | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_video_list_analytics` | tiktok | 内容列表 | cookie, page, proxy, rules, start_date | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_creator_get_video_to_product_stats` | tiktok | 公开数据查询 | cookie, item_id*, product_id*, proxy, start_date | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_shop_web_fetch_hot_selling_products_list` | tiktok | 热榜/趋势 | region, count | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `tiktok_shop_web_fetch_product_detail` | tiktok | 内容详情 | product_id*, seller_id, region | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `tiktok_shop_web_fetch_product_detail_v2` | tiktok | 内容详情 | product_id*, seller_id, region | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
@@ -735,46 +669,17 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 | `tiktok_shop_web_fetch_seller_products_list_v2` | tiktok | 内容列表 | seller_id*, searchParams, region | 公开数据只读/可能计费 | 明确广告/店铺/创作者分析意图且搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_batch_check_live_alive` | tiktok | 公开数据查询 | room_ids* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_check_live_alive` | tiktok | 公开数据查询 | room_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_explore_post` | tiktok | 公开数据查询 | categoryType, count | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_general_search` | tiktok | 搜索 | keyword*, offset, search_id, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_gift_name_by_id` | tiktok | 公开数据查询 | gift_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_gift_names_by_ids` | tiktok | 公开数据查询 | gift_ids* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_home_feed` | tiktok | 公开数据查询 | cookie, count, region | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_live_gift_list` | tiktok | 内容列表 | room_id | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_live_im_fetch` | tiktok | 公开数据查询 | room_id*, user_unique_id, resp_content_type | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_live_recommend` | tiktok | 内容列表 | related_live_tag* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_live_recommend_tabs` | tiktok | 公开数据查询 | logid | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_post_comment` | tiktok | 评论 | aweme_id*, cursor, count, current_region | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_post_comment_reply` | tiktok | 评论 | item_id*, comment_id*, cursor, count, current_region | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_post_detail` | tiktok | 内容详情 | itemId*, region | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_post_detail_v2` | tiktok | 内容详情 | itemId*, region | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_search_keyword_suggest` | tiktok | 搜索 | keyword* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_search_live` | tiktok | 搜索 | keyword*, count, offset, search_id, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_search_photo` | tiktok | 搜索 | keyword*, count, offset, search_id, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_search_user` | tiktok | 搜索 | keyword*, cursor, search_id, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_search_video` | tiktok | 搜索 | keyword*, count, offset, search_id, cookie | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_tag_detail` | tiktok | 内容详情 | tag_name* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_tag_post` | tiktok | 公开数据查询 | challengeID*, count, cursor | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_tiktok_live_data` | tiktok | 公开数据查询 | live_room_url* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_trending_searchwords` | tiktok | 搜索 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_user_collect` | tiktok | 账号 | cookie*, secUid*, cursor, count, coverFormat | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_user_fans` | tiktok | 账号 | secUid*, count, maxCursor, minCursor | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_user_follow` | tiktok | 账号 | secUid*, count, maxCursor, minCursor | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_user_like` | tiktok | 账号 | secUid*, cursor, count, coverFormat, post_item_list_request_type | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_user_live_detail` | tiktok | 账号 | uniqueId* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_user_mix` | tiktok | 账号 | mixId*, cursor, count | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_user_play_list` | tiktok | 账号 | secUid*, cursor, count | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_user_post` | tiktok | 账号 | secUid*, cursor, count, coverFormat, post_item_list_request_type | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_fetch_user_profile` | tiktok | 账号 | uniqueId, secUid | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_fetch_user_repost` | tiktok | 账号 | secUid*, cursor, count, coverFormat | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_generate_fingerprint` | tiktok | 公开数据查询 | browser_type | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_generate_hashed_id` | tiktok | 公开数据查询 | email* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_generate_ttwid` | tiktok | 公开数据查询 | user_agent | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_generate_webid` | tiktok | 公开数据查询 | cookie, user_agent, url, referer, user_unique_id, app_id | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_generate_x_mssdk_info` | tiktok | 公开数据查询 | user_agent | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_generate_xbogus` | tiktok | 公开数据查询 | url*, user_agent* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_generate_xgnarly` | tiktok | 公开数据查询 | body, url* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `tiktok_web_generate_xgnarly_and_xbogus` | tiktok | 公开数据查询 | body, url* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_get_all_aweme_id` | tiktok | 内容列表 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_get_all_sec_user_id` | tiktok | 账号 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `tiktok_web_get_all_unique_id` | tiktok | 内容列表 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
@@ -852,7 +757,6 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 | `weibo_web_fetch_hot_search` | weibo | 搜索 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `weibo_web_fetch_post_comments` | weibo | 评论 | post_id*, mid*, max_id, max_id_type | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `weibo_web_fetch_post_detail` | weibo | 内容详情 | post_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `weibo_web_fetch_search` | weibo | 搜索 | keyword*, page, search_type, time_scope | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `weibo_web_fetch_search_topics` | weibo | 搜索 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `weibo_web_fetch_trend_top` | weibo | 趋势 | containerid*, page | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `weibo_web_fetch_user_info` | weibo | 账号 | uid* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
@@ -923,7 +827,6 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 | `xiaohongshu_web_v3_fetch_homefeed` | xiaohongshu | 公开数据查询 | num, cursor_score, category, need_filter_image | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `xiaohongshu_web_v3_fetch_homefeed_categories` | xiaohongshu | 公开数据查询 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `xiaohongshu_web_v3_fetch_hot_list` | xiaohongshu | 热榜/趋势 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `xiaohongshu_web_v3_fetch_note_detail` | xiaohongshu | 内容详情 | note_id*, xsec_token* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `xiaohongshu_web_v3_fetch_search_suggest` | xiaohongshu | 搜索 | keyword | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `xiaohongshu_web_v3_fetch_user_info` | xiaohongshu | 账号 | user_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `xigua_app_v2_fetch_one_video` | xigua | 公开数据查询 | item_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
@@ -983,7 +886,6 @@ Removed legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_str
 | `zhihu_web_fetch_comment_v5` | zhihu | 评论 | answer_id*, order_by, limit, offset | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `zhihu_web_fetch_ebook_search_v3` | zhihu | 搜索 | keyword*, offset, limit, search_hash_id | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `zhihu_web_fetch_hot_list` | zhihu | 热榜/趋势 | limit, desktop | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
-| `zhihu_web_fetch_hot_recommend` | zhihu | 热榜/趋势 | offset, page_number, session_token | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `zhihu_web_fetch_pin_comments` | zhihu | 评论 | pin_id*, order_by, limit, offset | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `zhihu_web_fetch_pin_detail` | zhihu | 内容详情 | pin_id* | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |
 | `zhihu_web_fetch_preset_search` | zhihu | 搜索 |  | 公开数据只读/可能计费 | 搜索命中后 | 无 | 目录启用 |

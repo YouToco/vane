@@ -57,6 +57,7 @@ func explicitOwnerToolIntent(toolName, text string) bool {
 	case "remove_source":
 		return containsAny(normalized,
 			"取消订阅", "退订", "删除信源", "移除信源", "不再关注",
+			"停掉", "停止追踪", "停止关注", "关掉订阅",
 			"removesource", "unsubscribe",
 		)
 	case "enable_source":

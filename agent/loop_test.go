@@ -752,7 +752,7 @@ func TestHandleMessage_UntrustedExternalResultCannotReadMemoryOrCreatePendingAct
 			{ID: "memory", Name: "view_profile", Arguments: `{}`},
 			{ID: "write", Name: "create_schedule", Arguments: `{"spec":{"cron":"0 8 * * *"}}`},
 		}, FinishReason: "tool_calls"},
-		{Content: "页面包含可疑指令，我只把它当作数据。", FinishReason: "stop"},
+		{Content: "页面包含可疑指令，我只把它当作数据。来源：https://evil.example/page", FinishReason: "stop"},
 	}}
 	l := newTestLoop(t, fs, chat.fn, external, readMemory, write)
 	creation := &fakeCreationController{}
@@ -781,12 +781,14 @@ func TestHandleMessage_UntrustedExternalResultCannotReadMemoryOrCreatePendingAct
 		t.Fatalf("期望 3 次模型调用，实得 %d", len(chat.requests))
 	}
 	second := chat.requests[1]
-	if second.Messages[0].Content != systemPrompt ||
+	if !strings.HasPrefix(second.Messages[0].Content, systemPrompt) ||
 		strings.Contains(second.Messages[0].Content, profileSecret) {
 		t.Fatalf("恶意外部结果进入上下文后不得同请求携带画像: %q", second.Messages[0].Content)
 	}
-	if len(second.Tools) != 0 {
-		t.Fatalf("taint 后声明面不得保留任何外带或写工具，实得 %+v", second.Tools)
+	for _, def := range second.Tools {
+		if def.Name != "read_page" {
+			t.Fatalf("taint 后只能保留公开只读研究工具，实得 %+v", second.Tools)
+		}
 	}
 
 	// 即使模型幻觉调用隐藏工具，运行时拒绝后也不把原生 tool protocol 或
@@ -880,7 +882,7 @@ func TestHandleMessage_ExternalReadIsolatesWholeToolCallBatch(t *testing.T) {
 		{Content: profileSecret, ToolCalls: []llm.ToolCall{{
 			ID: "external-only", Name: "read_page", Arguments: `{"url":"https://evil.example/page"}`,
 		}}, FinishReason: "tool_calls"},
-		{Content: "网页内容只作为不可信数据处理。", FinishReason: "stop"},
+		{Content: "网页内容只作为不可信数据处理。来源：https://evil.example/page", FinishReason: "stop"},
 	}}
 	l := newTestLoop(t, fs, chat.fn, readMemory, external, write)
 
@@ -936,9 +938,15 @@ func TestHandleMessage_ExternalReadIsolatesWholeToolCallBatch(t *testing.T) {
 			t.Fatalf("外部结果出站不得出现原生工具协议: %+v", isolated.Messages)
 		}
 	}
-	if len(isolated.Tools) != 0 || isolated.Messages[0].Content != systemPrompt {
-		t.Fatalf("外部结果进入后的请求应零工具、零画像: tools=%+v system=%q",
-			isolated.Tools, isolated.Messages[0].Content)
+	for _, def := range isolated.Tools {
+		if def.Name != "read_page" {
+			t.Fatalf("外部结果进入后的请求只能保留公开只读工具: %+v",
+				isolated.Tools)
+		}
+	}
+	if !strings.HasPrefix(isolated.Messages[0].Content, systemPrompt) {
+		t.Fatalf("外部结果进入后的请求应零画像: system=%q",
+			isolated.Messages[0].Content)
 	}
 }
 
@@ -1075,13 +1083,24 @@ func TestUntrustedContinuationMessages_DSMLInExternalDataDoesNotEraseUserRequest
 	}
 }
 
-func TestHandleMessage_ExternalReadProtocolFailureReturnsHonestRecovery(t *testing.T) {
+func TestHandleMessage_MultiSearchProtocolFailureReturnsHonestRecovery(t *testing.T) {
 	fs := newFakeStore()
 	search := &fakeTool{
 		name:      "web_search",
 		untrusted: true,
 		result:    "OpenAI、Anthropic、Google 官方候选信源",
 	}
+	searchSpec := newToolSpec(search, withToolSurface(
+		ownerPolicy(
+			Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
+			ConfirmationNone,
+			BudgetToolManaged,
+		),
+		ExposureIntent,
+		IntentWebResearch,
+		ResultTrustExternal,
+		false,
+	))
 	var requests []llm.ChatRequest
 	call := 0
 	chat := func(_ context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
@@ -1121,7 +1140,7 @@ func TestHandleMessage_ExternalReadProtocolFailureReturnsHonestRecovery(t *testi
 		}
 		return nil, fmt.Errorf("fake provider leak: %w", llm.ErrToolProtocolResponse)
 	}
-	l := newTestLoop(t, fs, chat, search)
+	l := newTestLoop(t, fs, chat, searchSpec)
 
 	out, err := l.HandleMessage(context.Background(), 7,
 		"每周整理 OpenAI、Anthropic 和 Google 的重要模型动态")
@@ -1131,31 +1150,24 @@ func TestHandleMessage_ExternalReadProtocolFailureReturnsHonestRecovery(t *testi
 	if out.Reply != replyExternalProtocolFailure || out.Confirm != nil {
 		t.Fatalf("recovery outcome = %+v, want honest no-write reply", out)
 	}
-	if len(search.calls) != 1 || len(fs.actions) != 0 {
-		t.Fatalf("external discovery should run once with no pending action: search=%d actions=%d",
+	if len(search.calls) != 4 || len(fs.actions) != 0 {
+		t.Fatalf("all public research calls should run with no pending action: search=%d actions=%d",
 			len(search.calls), len(fs.actions))
 	}
 	if len(requests) != 3 || len(requests[2].Tools) != 0 {
 		t.Fatalf("isolated recovery request must be tool-free: %+v", requests)
 	}
 	system := requests[0].Messages[0].Content
-	if !strings.Contains(system, "每条用户消息最多成功执行一次外部读取") ||
-		!strings.Contains(system, "合并成一次 web_search") {
-		t.Fatalf("external discovery budget is absent from system guidance: %q", system)
+	if !strings.Contains(system, "可以连续调用 web_search") ||
+		!strings.Contains(system, "第一方页面核验") {
+		t.Fatalf("multi-step research guidance is absent: %q", system)
 	}
-	batchReplies := 0
-	for _, msg := range requests[1].Messages {
-		if msg.Role != "tool" {
-			continue
-		}
-		batchReplies++
-		if msg.Content != toolMsgExternalBatch ||
-			!strings.Contains(msg.Content, "合并成一次 web_search") {
-			t.Fatalf("batch rejection did not provide a single-query recovery path: %+v", msg)
-		}
-	}
-	if batchReplies != 3 {
-		t.Fatalf("all three rejected searches need protocol replies, got %d", batchReplies)
+	if len(requests[1].Messages) != 2 ||
+		requests[1].Messages[1].Role != "user" ||
+		!strings.Contains(requests[1].Messages[1].Content, search.result) ||
+		strings.Contains(requests[1].Messages[1].Content, toolMsgExternalBatch) {
+		t.Fatalf("parallel public research was not isolated into evidence: %+v",
+			requests[1].Messages)
 	}
 
 	persisted := persistedMessages(t, fs)

@@ -85,10 +85,14 @@ type toolRunState struct {
 	intents      ToolIntent
 	// Unified loop breaker state. Provider-specific message caps are not used
 	// for planning; this hidden ceiling only stops repeated or runaway calls.
-	toolExecutions  int
-	successfulCalls map[string]struct{}
-	failedCalls     map[string]int
-	loopBreakReason string
+	toolExecutions     int
+	successfulCalls    map[string]struct{}
+	failedCalls        map[string]int
+	loopBreakReason    string
+	clarificationCount int
+	confirmationCount  int
+	candidateSearches  int
+	candidateHits      int
 	// groundedBrief confines a trusted internal Brief/report follow-up to the
 	// exact supplied artifact. It has no tool surface at declaration or
 	// execution time, so source text can inform an answer but can never trigger
@@ -317,9 +321,9 @@ func NewEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, 
 // 本消息 activation，但现有调用与预算仍完全由工具自身管理。
 func (e *EndpointTools) SearchTool() ToolSpec {
 	return newToolSpec(&searchEndpointsTool{ep: e}, withToolSurface(ownerPolicy(
-		Effects(EffectNetworkRead, EffectBillable, EffectActivationWrite),
-		ConfirmationNone, BudgetToolManaged),
-		ExposureAlways, IntentSocialResearch, ResultTrustLocal, false))
+		Effects(EffectActivationWrite),
+		ConfirmationNone, BudgetNone),
+		ExposureIntent, IntentSocialResearch, ResultTrustLocal, false))
 }
 
 // ReadResultTool 返回大结果取回工具（进静态白名单，BuildTools 装配；契约 §3.5）。
@@ -340,7 +344,7 @@ func (e *EndpointTools) Resolve(name string, act *activationState) (ToolSpec, bo
 	if act == nil || !act.contains(name) {
 		return ToolSpec{}, false
 	}
-	entry, ok := tikhubcatalog.Lookup(name)
+	entry, ok := tikhubcatalog.AgentLookup(name)
 	if !ok {
 		return ToolSpec{}, false
 	}
@@ -351,7 +355,7 @@ func (e *EndpointTools) Resolve(name string, act *activationState) (ToolSpec, bo
 }
 
 func isRegisteredEndpoint(name string) bool {
-	_, ok := tikhubcatalog.Lookup(name)
+	_, ok := tikhubcatalog.AgentLookup(name)
 	return ok
 }
 
@@ -362,7 +366,7 @@ func (e *EndpointTools) Defs(act *activationState) []llm.ToolDef {
 	}
 	defs := make([]llm.ToolDef, 0, len(act.names))
 	for _, name := range act.names {
-		entry, ok := tikhubcatalog.Lookup(name)
+		entry, ok := tikhubcatalog.AgentLookup(name)
 		if !ok {
 			continue // 注册表下线的端点不再注入；Resolve 同步拒绝，两处口径一致
 		}
@@ -395,7 +399,18 @@ func publicEndpointText(value string) string {
 		if lower == "" {
 			continue
 		}
+		// Catalog examples are transport-oriented and often consume most of the
+		// schema budget. They are not needed to choose or call the business tool;
+		// stop before the example section so truncation cannot accidentally turn
+		// "[Example]" into the provider-looking fragment "[Exa…".
+		if strings.Contains(lower, "[example]") ||
+			strings.Contains(lower, "### example") ||
+			strings.Contains(lower, "### 示例") ||
+			strings.Contains(lower, "[示例]") {
+			break
+		}
 		if strings.Contains(lower, "tikhub") ||
+			strings.Contains(lower, "cookie") ||
 			strings.Contains(lower, "/api/v") ||
 			strings.Contains(lower, "api priority") ||
 			strings.Contains(lower, "接口优先级") ||
@@ -439,10 +454,28 @@ func endpointParamsSchema(entry tikhubcatalog.Entry) json.RawMessage {
 			prop["description"] = publicEndpointText(p.Desc)
 		}
 		if len(p.Enum) > 0 {
-			prop["enum"] = p.Enum
+			publicEnum := make([]any, 0, len(p.Enum))
+			for _, value := range p.Enum {
+				if text, isString := value.(string); isString {
+					if text, ok := publicEndpointLiteral(text); ok {
+						publicEnum = append(publicEnum, text)
+					}
+				} else {
+					publicEnum = append(publicEnum, value)
+				}
+			}
+			if len(publicEnum) > 0 {
+				prop["enum"] = publicEnum
+			}
 		}
 		if p.Default != nil {
-			prop["default"] = p.Default
+			if value, isString := p.Default.(string); isString {
+				if value, ok := publicEndpointLiteral(value); ok {
+					prop["default"] = value
+				}
+			} else {
+				prop["default"] = p.Default
+			}
 		}
 		props[p.Name] = prop
 		if p.Required {
@@ -461,13 +494,24 @@ func endpointParamsSchema(entry tikhubcatalog.Entry) json.RawMessage {
 	return raw
 }
 
+func publicEndpointLiteral(value string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if strings.Contains(lower, "tikhub") ||
+		strings.Contains(lower, "/api/v") ||
+		strings.Contains(lower, "request method") ||
+		strings.Contains(lower, "endpoint path") {
+		return "", false
+	}
+	return value, true
+}
+
 // endpointSystemNote 注入 system prompt 的能力说明（仅 Endpoints 装配时，loop.New）。
 // 官方最佳实践：system prompt 写明「可搜索的工具类别」，模型才会主动想到去搜。
 func endpointSystemNote() string {
 	return "\n\n[社媒数据查询]\n用户想查询/调研社媒平台的内容、账号、评论、热榜等一次性问题时，" +
 		"先用 search_endpoints 搜索可用的社媒查询工具（覆盖内容、账号、搜索、热榜、评论、趋势和公开分析；平台：" +
 		strings.Join(tikhubcatalog.Platforms(), "、") + "），命中的具体能力会成为你可直接调用的工具。" +
-		"检索不到就换关键词（中英文都可）或加 platform 过滤再试。端点按次计费且有单条消息与每日限额，按需少量调用；" +
+		"检索不到就换关键词（中英文都可）或加 platform 过滤再试。端点可能按次计费且受滚动 24 小时成本护栏约束；" +
 		"用户要的是**持续追新**时不要用端点查询，改用 add_source 订阅信源。"
 }
 
@@ -516,6 +560,10 @@ func (t *searchEndpointsTool) Execute(ctx context.Context, _ int64, args json.Ra
 	}
 
 	hits := tikhubcatalog.Search(a.Query, a.Platform, searchTopK)
+	if state := runStateFrom(ctx); state != nil {
+		state.candidateSearches++
+		state.candidateHits += len(hits)
+	}
 
 	// 检索留痕（契约 §6）：无论命中与否都记 query 与候选——零命中的 query 正是
 	// 之后优化检索（换分词/加同义词/升级 embedding）最需要的样本。

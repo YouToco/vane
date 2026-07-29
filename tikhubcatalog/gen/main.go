@@ -211,7 +211,6 @@ func buildEntries(sp *spec) ([]outEntry, error) {
 			if prev, dup := seen[name]; dup {
 				return nil, fmt.Errorf("工具名冲突: %q 同时来自 %s 与 %s", name, prev, path)
 			}
-			seen[name] = path
 
 			e := outEntry{
 				Name:        name,
@@ -228,6 +227,7 @@ func buildEntries(sp *spec) ([]outEntry, error) {
 				return nil, fmt.Errorf("%s %s: %w", method, path, err)
 			}
 			e.Params = append(e.Params, bodyParams...)
+			seen[name] = path
 			entries = append(entries, e)
 		}
 	}
@@ -240,6 +240,16 @@ var forbiddenCapabilityMarkers = []string{
 	"guest_cookie",
 	"generate_real_mstoken",
 	"generate_wss_xb_signature",
+	"generate_a_bogus",
+	"generate_x_bogus",
+	"generate_xbogus",
+	"generate_xgnarly",
+	"generate_ttwid",
+	"generate_verify_fp",
+	"generate_fingerprint",
+	"generate_hashed_id",
+	"generate_s_v_web_id",
+	"generate_x_mssdk_info",
 	"fetch_sec_token",
 	"register_device",
 	"private_message",

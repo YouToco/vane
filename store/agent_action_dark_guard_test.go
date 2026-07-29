@@ -786,6 +786,14 @@ func agentActionRegisteredEnableSourceContract(
 			return true
 		}
 		policyName, ok := policy.Fun.(*ast.Ident)
+		if ok && policyName.Name == "withToolSurface" &&
+			len(policy.Args) == 5 {
+			policy, ok = policy.Args[0].(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			policyName, ok = policy.Fun.(*ast.Ident)
+		}
 		if !ok || policyName.Name != "ownerPolicy" ||
 			len(policy.Args) != 3 {
 			return true

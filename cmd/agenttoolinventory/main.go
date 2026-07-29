@@ -71,7 +71,7 @@ func render() []byte {
 	}
 	b.WriteString("\nRemoved legacy contracts: `update_schedule`, `edit_task_playbook`, `set_task_strictness`.\n\n")
 	b.WriteString("## Dynamic social research tools\n\n")
-	fmt.Fprintf(&b, "%d read-only catalog tools are discovered lazily through `search_endpoints`; schemas are not placed in the first model request.\n\n", tikhubcatalog.Len())
+	fmt.Fprintf(&b, "%d read-only catalog tools are discovered lazily through `search_endpoints`; schemas are not placed in the first model request.\n\n", tikhubcatalog.AgentLen())
 	b.WriteString("| Tool | Platform | Capability | Parameters | Risk | Exposure | Confirmation | Production |\n")
 	b.WriteString("|---|---|---|---|---|---|---|---|\n")
 	entries := tikhubcatalog.Entries()
