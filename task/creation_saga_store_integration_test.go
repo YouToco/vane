@@ -63,19 +63,12 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 		schedules := &creationSagaFakeScheduler{}
 		coordinator := NewCreationCoordinator(st, schedules, nil)
 		actionID := "task-create-jsonb-" + uuid.NewString()
-		rawArgs := mustCreateArgs(t, "每天寻找全球 AI 热点", "每天 AI")
-		command, _, err := normalizeCreateScheduleCommand(rawArgs)
-		if err != nil {
-			t.Fatalf("normalize fixture: %v", err)
-		}
-		canonicalArgs, err := canonicalCreationProposalArgs(command)
-		if err != nil {
-			t.Fatalf("canonicalize fixture: %v", err)
-		}
+		rawArgs := mustCreateProposalArgs(t, "每天寻找全球 AI 热点", "每天 AI")
+		expiresAt := time.Now().Add(time.Hour)
 
 		proposal, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 			ActionID: actionID, UserID: userID, RawArgs: rawArgs,
-			ExpiresAt: time.Now().Add(time.Hour),
+			ExpiresAt: expiresAt,
 		})
 		if err != nil {
 			t.Fatalf("Propose() through PostgreSQL: %v", err)
@@ -89,6 +82,14 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 		)
 		if err != nil {
 			t.Fatalf("LoadTaskCreationOperation() after proposal: %v", err)
+		}
+		command, _, err := normalizeCreateScheduleCommand(persisted.Args)
+		if err != nil {
+			t.Fatalf("normalize persisted fixture: %v", err)
+		}
+		canonicalArgs, err := canonicalCreationProposalArgs(command)
+		if err != nil {
+			t.Fatalf("canonicalize persisted fixture: %v", err)
 		}
 		if bytes.Equal(persisted.Args, canonicalArgs) {
 			t.Fatalf("fixture did not exercise JSONB byte rewriting: %s", persisted.Args)
@@ -173,7 +174,7 @@ func TestCreationCoordinator_PostgreSQLRoundTrip(t *testing.T) {
 		actionID := "task-create-complete-loss-" + uuid.NewString()
 		if _, err := coordinator.Prepare(ctx, CreationProposalInput{
 			ActionID: actionID, UserID: userID,
-			RawArgs:   mustCreateArgs(t, "每天监控 AI 模型发布", "AI 模型发布"),
+			RawArgs:   mustCreateProposalArgs(t, "每天监控 AI 模型发布", "AI 模型发布"),
 			ExpiresAt: time.Now().Add(time.Hour),
 		}); err != nil {
 			t.Fatalf("Propose(): %v", err)

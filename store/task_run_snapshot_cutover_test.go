@@ -908,7 +908,7 @@ INSERT INTO task_run_snapshots (
     'scheduled','compiled',0,repeat('0',64),repeat('1',64),
     repeat('2',64),repeat('3',64),repeat('4',64),repeat('5',64),
     repeat('6',64),encode(sha256(convert_to('{}','UTF8')),'hex'),
-    repeat('8',64),'old-worker/v1',convert_to('{}','UTF8'),'{}'::jsonb
+    repeat('8',64),'vane.run-snapshot-ref/v1',convert_to('{}','UTF8'),'{}'::jsonb
 )`
 
 func TestTaskRunSnapshotCutoverMigrationPrivileges(t *testing.T) {
@@ -953,7 +953,7 @@ func TestTaskRunSnapshotCutoverMigrationPrivileges(t *testing.T) {
 	}
 	defer rows.Close()
 	wantSecurityDefiner := map[string]bool{
-		"task_run_snapshot_v2_admission_fence":            false,
+		"task_run_snapshot_v2_admission_fence":            true,
 		"task_run_snapshot_v2_cutover_event_integrity":    true,
 		"task_run_snapshot_v2_cutover_pointer_transition": true,
 		"task_run_snapshot_v2_marker_integrity":           false,

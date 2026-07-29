@@ -625,6 +625,23 @@ func canonicalizeFetchPlan(raw json.RawMessage) (json.RawMessage, error) {
 			return nil, fmt.Errorf("fetch_plan.targets[%d].config: %w", i, err)
 		}
 		target.Config = canonical
+		if target.ToolName == "" {
+			if len(bytes.TrimSpace(target.ToolArgs)) != 0 {
+				return nil, fmt.Errorf(
+					"fetch_plan.targets[%d] has arguments without a Tool", i)
+			}
+		} else {
+			// This path also replays already-frozen operations. Canonicalize
+			// the JSON bytes without consulting today's writable registry, so
+			// a retired versioned Tool remains readable and recoverable.
+			toolArgs, err := canonicalJSONObject(target.ToolArgs)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"fetch_plan.targets[%d] Tool arguments are not an object: %w",
+					i, err)
+			}
+			target.ToolArgs = toolArgs
+		}
 		candidate := &types.FetchTarget{
 			Platform: types.Platform(target.Platform), Capability: types.Capability(target.Capability),
 			Title: target.Title, URL: target.URL, Config: target.Config,

@@ -381,7 +381,7 @@ func TestCreationPreparer_PrepareHappyPath(t *testing.T) {
 		result.Definition.PlaybookContent != "每天寻找全球 AI 热点" {
 		t.Fatalf("definition=%+v", result.Definition)
 	}
-	wantPlan := `{"targets":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"},"tool_name":"web_search","tool_arguments":{"query":"AI","category":"news"}}]}`
+	wantPlan := `{"targets":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"},"tool_name":"web_search","tool_arguments":{"category":"news","query":"AI"}}]}`
 	if string(result.Definition.FetchPlan) != wantPlan {
 		t.Fatalf("canonical fetch plan=%s want=%s", result.Definition.FetchPlan, wantPlan)
 	}
@@ -393,6 +393,20 @@ func TestCreationPreparer_PrepareHappyPath(t *testing.T) {
 	if checkpoint.TaskID != wantTaskID || schedules.deriveCalls != 1 {
 		t.Fatalf("frozen task ID=%q want=%q derive_calls=%d",
 			checkpoint.TaskID, wantTaskID, schedules.deriveCalls)
+	}
+}
+
+func TestCanonicalizeFetchPlanKeepsRetiredToolReplayReadable(t *testing.T) {
+	raw := strings.Replace(
+		validApprovedFetchPlan(), `"web_search"`, `"retired_web_search"`, 1)
+	got, err := canonicalizeFetchPlan(json.RawMessage(raw))
+	if err != nil {
+		t.Fatalf("retired frozen Tool replay: %v", err)
+	}
+	if !bytes.Contains(got, []byte(
+		`"tool_name":"retired_web_search","tool_arguments":{"category":"news","query":"AI"}`,
+	)) {
+		t.Fatalf("retired Tool arguments were not canonically preserved: %s", got)
 	}
 }
 

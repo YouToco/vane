@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
 
@@ -115,6 +117,91 @@ func TestTaskDefinitionBaselineDryRunApplyVerifyAndReplay(t *testing.T) {
 	if err != nil || late.Version != applied.Version ||
 		late.Digest != applied.Digest {
 		t.Fatalf("late baseline replay=%+v err=%v", late, err)
+	}
+}
+
+func TestTaskDefinitionBaselineScopesSkipExactCurrentV2Head(t *testing.T) {
+	f := newTaskDefinitionStateFixture(t)
+	taskID := "baseline-v2-" + uuid.NewString()
+	call, err := taskstate.BuildToolInvocationV1(
+		"web_search", "v1", json.RawMessage(`{"query":"baseline isolation"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := taskstate.BuildApprovedDefinitionV2(
+		taskstate.ApprovedDefinitionInputV2{
+			TenantID: f.tenantID, UserID: f.userID, TaskID: taskID,
+			NLDescription:  "V2 baseline isolation",
+			SpecJSON:       json.RawMessage(`{"cron":"0 8 * * *"}`),
+			ScopeJSON:      json.RawMessage(`{}`),
+			TaskManual:     "监控 baseline isolation",
+			Strictness:     types.StrictnessNormal,
+			ToolCalls:      []taskstate.ToolInvocationV1{call},
+			ExecutionMode:  types.ExecutionModeCompiled,
+			DeliveryPolicy: taskstate.DeliveryPolicyOwnerFeishu,
+			BudgetPolicy:   taskstate.BudgetPolicyInheritTenantQuota,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := taskstate.EncodeApprovedDefinitionV2(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := digestTaskStatePayload(payload)
+	if _, err := f.store.pool.Exec(t.Context(), `
+		INSERT INTO schedules (
+		    id, tenant_id, user_id, nl_description, spec_json, scope_json,
+		    status, execution_mode
+		) VALUES ($1, $2, $3, $4, $5, $6, 'paused', 'compiled')`,
+		taskID, f.tenantID, f.userID, definition.NLDescription,
+		definition.SpecJSON, definition.ScopeJSON); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(ctx, t, f.store, `
+			UPDATE schedules
+			   SET approved_definition_version=NULL,
+			       approved_definition_digest=NULL
+			 WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+			f.tenantID, f.userID, taskID)
+		cleanupExec(ctx, t, f.store, `
+			DELETE FROM task_approved_definition_versions
+			 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`,
+			f.tenantID, f.userID, taskID)
+		cleanupExec(ctx, t, f.store, `
+			DELETE FROM schedules
+			 WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+			f.tenantID, f.userID, taskID)
+	})
+	if _, err := f.store.pool.Exec(t.Context(), `
+		INSERT INTO task_approved_definition_versions (
+		    tenant_id, user_id, task_id, version, schema_version,
+		    execution_mode, definition_digest, payload, operation_ref
+		) VALUES ($1, $2, $3, 1, $4, 'compiled', $5, $6, $7)`,
+		f.tenantID, f.userID, taskID, definition.SchemaVersion,
+		digest, payload, "baseline-v2-test:"+taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(t.Context(), `
+		UPDATE schedules
+		   SET approved_definition_version=1,
+		       approved_definition_digest=$4
+		 WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+		f.tenantID, f.userID, taskID, digest); err != nil {
+		t.Fatal(err)
+	}
+	scopes, _, err := f.store.listTaskDefinitionBaselineScopes(
+		t.Context(), TaskDefinitionBaselineCursor{}, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range scopes {
+		if scope.TaskID == taskID {
+			t.Fatalf("exact current V2 head leaked into V1 baseline scan: %+v", scope)
+		}
 	}
 }
 

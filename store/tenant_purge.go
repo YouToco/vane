@@ -127,6 +127,10 @@ var purgeOrder = []purgeStep{
 	{"task_observed_events", "tenant_id = $1"},
 	{"task_event_qualification_steps", "tenant_id = $1"},
 	{"deliveries", "tenant_id = $1"},
+	// Source-free Tool content provenance owns tenant-scoped evidence and
+	// references both the immutable run snapshot and shared content facts.
+	// Remove it before snapshots; shared content remains outside tenant purge.
+	{"task_run_content_provenance", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},
 	// Compiled push batches retain the immutable run snapshot through migration
 	// 031, so batches must be gone before either the marked parent or its

@@ -295,7 +295,7 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 			$1, $2, $3, $4, $5, 'scheduled', 'compiled', 0,
 			repeat('0', 64), repeat('1', 64), repeat('2', 64), repeat('3', 64),
 			repeat('4', 64), repeat('5', 64), repeat('6', 64), repeat('7', 64),
-			repeat('8', 64), 'purge-fixture/v1', convert_to('{}', 'UTF8'), '{}'::jsonb
+			repeat('8', 64), 'vane.run-snapshot-ref/v1', convert_to('{}', 'UTF8'), '{}'::jsonb
 		 )`,
 		tn.ID, u.ID, taskID, "purge-workflow-"+uuid.NewString(),
 		"purge-run-"+uuid.NewString()); err != nil {

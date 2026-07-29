@@ -160,9 +160,21 @@ func (s *Store) listTaskDefinitionBaselineScopes(
 		   FROM schedules s
 		  WHERE (s.tenant_id, s.user_id, s.id) > ($1, $2, $3)
 		    AND `+matureSchedulePredicate+`
+		    AND NOT EXISTS (
+		        SELECT 1
+		          FROM task_approved_definition_versions d
+		         WHERE d.tenant_id = s.tenant_id
+		           AND d.user_id = s.user_id
+		           AND d.task_id = s.id
+		           AND d.version = s.approved_definition_version
+		           AND d.definition_digest = s.approved_definition_digest
+		           AND d.execution_mode = s.execution_mode
+		           AND d.schema_version = $4
+		    )
 		  ORDER BY s.tenant_id, s.user_id, s.id
-		  LIMIT $4`,
-		after.TenantID, after.UserID, after.TaskID, limit+1)
+		  LIMIT $5`,
+		after.TenantID, after.UserID, after.TaskID,
+		taskstate.ApprovedDefinitionSchemaVersionV2, limit+1)
 	if err != nil {
 		return nil, false, taskStateDatabaseError(
 			"list task definition baseline page", err)
