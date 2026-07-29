@@ -1411,7 +1411,9 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 						return Outcome{Reply: reply}, msgs, turns, nil
 					}
 				}
-				if !state.naturalTaskDefinitionEditResponseRejected {
+				state.naturalTaskDefinitionEditFailures++
+				if state.naturalTaskDefinitionEditFailures <
+					naturalTaskDefinitionEditMaxFailures {
 					state.naturalTaskDefinitionEditResponseRejected = true
 					if !state.naturalTaskDefinitionEditTaskListed {
 						msgs = append([]llm.ChatMessage(nil), directProposalBase...)

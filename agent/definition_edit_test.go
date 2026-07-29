@@ -126,7 +126,7 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 				}`,
 			}},
 		},
-		{Content: replyMaxTurns},
+		{Content: "任务尚未修改；请补充具体要改的内容。"},
 		{
 			FinishReason: "tool_calls",
 			ToolCalls: []llm.ToolCall{{
@@ -134,7 +134,8 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 				Arguments: `{"query":"每周一上午9:00推送AI官方重大更新"}`,
 			}},
 		},
-		{Content: replyMaxTurns},
+		{Content: "任务尚未修改；请补充具体要改的内容。"},
+		{Content: "任务尚未修改；请补充具体要改的内容。"},
 		{
 			FinishReason: "tool_calls",
 			ToolCalls: []llm.ToolCall{{
@@ -179,8 +180,8 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 	if out.Reply != "已修改定时推送任务（id=task-edit-1）。" {
 		t.Fatalf("Reply=%q", out.Reply)
 	}
-	if len(chat.requests) != 5 {
-		t.Fatalf("model calls=%d, want route + 4 edit calls",
+	if len(chat.requests) != 6 {
+		t.Fatalf("model calls=%d, want route + 5 edit calls",
 			len(chat.requests))
 	}
 	if got := toolDefNames(chat.requests[0].Tools); len(got) != 1 ||
@@ -203,8 +204,12 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 		got[0] != "edit_task_definition" {
 		t.Fatalf("fourth tools=%v, want edit_task_definition only", got)
 	}
+	if got := toolDefNames(chat.requests[5].Tools); len(got) != 1 ||
+		got[0] != "edit_task_definition" {
+		t.Fatalf("fifth tools=%v, want edit_task_definition only", got)
+	}
 	if !strings.Contains(
-		chat.requests[4].Messages[0].Content,
+		chat.requests[5].Messages[0].Content,
 		"不得再次要求用户重复、拆分或确认",
 	) {
 		t.Fatal("resolved no-tool retry lacks explicit execution guidance")
@@ -222,6 +227,77 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 		[]byte("请把需求拆小"),
 	) {
 		t.Fatal("natural edit lane must not instruct the user to split one edit")
+	}
+}
+
+func TestNaturalTaskDefinitionEditUniqueTargetPreservesSemanticClarification(
+	t *testing.T,
+) {
+	fs := newFakeStore()
+	list := &fakeTool{
+		name:       "list_schedules",
+		parameters: json.RawMessage(listSchedulesSchema),
+		result: "- id=task-brief 按 cron「0 8 * * *」触发" +
+			"（状态: active，描述: AI早报）",
+	}
+	controller := &fakeDefinitionEditController{}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			FinishReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID: "list-brief", Name: "list_schedules",
+				Arguments: `{"query":"AI早报"}`,
+			}},
+		},
+		{Content: "你希望降低推送频率，还是保持频率但减少内容？"},
+	}}
+	loop := New(Deps{
+		Store: fs,
+		Tools: []ToolSpec{
+			newToolSpec(list, ownerPolicy(
+				Effects(EffectInternalRead), BudgetNone)),
+			newToolSpec(&editTaskDefinitionTool{}, ownerPolicy(
+				Effects(
+					EffectDurableProposal,
+					EffectStateWrite,
+					EffectDirectOwnerWrite,
+				),
+				BudgetNone,
+			)),
+		},
+		TaskDefinitionEdit: controller,
+		Model:              "test-model",
+		MaxTurns:           20,
+		SessionTTL:         30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+	loop.taskEditIntentFn = func(
+		context.Context,
+		[]llm.ChatMessage,
+	) (taskEditIntentDecision, error) {
+		return taskEditIntentExecute, nil
+	}
+
+	out, err := loop.HandleMessage(
+		t.Context(), 7, "把“AI早报”减少一点。",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply != "你希望降低推送频率，还是保持频率但减少内容？" {
+		t.Fatalf("Reply=%q", out.Reply)
+	}
+	if len(chat.requests) != 2 {
+		t.Fatalf("model calls=%d, want locate + clarification",
+			len(chat.requests))
+	}
+	if got := toolDefNames(chat.requests[1].Tools); len(got) != 1 ||
+		got[0] != definitionEditToolName {
+		t.Fatalf("resolved tools=%v, want edit tool", got)
+	}
+	if len(controller.proposeCalls) != 0 ||
+		len(controller.executeCalls) != 0 {
+		t.Fatal("semantic clarification reached durable edit controller")
 	}
 }
 
