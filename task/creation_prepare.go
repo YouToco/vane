@@ -24,7 +24,8 @@ import (
 
 const (
 	creationCommandVersion      = "vane.create-schedule-command/v1"
-	compiledDefinitionVersion   = "vane.compiled-task-definition/v1"
+	compiledDefinitionVersionV1 = "vane.compiled-task-definition/v1"
+	compiledDefinitionVersion   = "vane.compiled-task-definition/v2"
 	maxCreationCommandBytes     = 64 << 10
 	maxCreationOperationBytes   = 512
 	maxCreationPlaybookRunes    = 4000
@@ -740,7 +741,9 @@ func validateCompiledCheckpoint(
 	if err != nil || !bytes.Equal(canonical, op.CompiledDefinition) {
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled definition bytes are not canonical")
 	}
-	if compiled.Version != compiledDefinitionVersion || compiled.TenantID != in.TenantID ||
+	if (compiled.Version != compiledDefinitionVersionV1 &&
+		compiled.Version != compiledDefinitionVersion) ||
+		compiled.TenantID != in.TenantID ||
 		compiled.UserID != in.UserID || compiled.OperationID != in.OperationID {
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled definition scope differs")
 	}
@@ -769,6 +772,19 @@ func validateCompiledCheckpoint(
 	plan, err := canonicalizeFetchPlan(compiled.FetchPlan)
 	if err != nil || !bytes.Equal(plan, compiled.FetchPlan) {
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled fetch_plan is not canonical and valid")
+	}
+	if compiled.Version == compiledDefinitionVersion {
+		var protocolPlan compiledFetchPlan
+		if err := decodeStrictJSON(plan, &protocolPlan); err != nil {
+			return compiledTaskDefinitionCheckpoint{},
+				errors.New("Source-free compiled definition Tool plan is invalid")
+		}
+		for _, target := range protocolPlan.Targets {
+			if target.ToolName == "" || len(bytes.TrimSpace(target.ToolArgs)) == 0 {
+				return compiledTaskDefinitionCheckpoint{},
+					errors.New("Source-free compiled definition is missing a Tool call")
+			}
+		}
 	}
 	if !bytes.Equal(compiled.FetchPlan, command.LegacyToolPlanV1) {
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled fetch_plan differs from approved command")

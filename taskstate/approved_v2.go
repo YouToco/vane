@@ -20,7 +20,6 @@ type ApprovedDefinitionV2 struct {
 	TenantID       int64                `json:"tenant_id"`
 	UserID         int64                `json:"user_id"`
 	TaskID         string               `json:"task_id"`
-	Intent         string               `json:"intent"`
 	NLDescription  string               `json:"nl_description"`
 	SpecJSON       json.RawMessage      `json:"spec_json"`
 	ScopeJSON      json.RawMessage      `json:"scope_json"`
@@ -36,7 +35,6 @@ type ApprovedDefinitionInputV2 struct {
 	TenantID       int64
 	UserID         int64
 	TaskID         string
-	Intent         string
 	NLDescription  string
 	SpecJSON       json.RawMessage
 	ScopeJSON      json.RawMessage
@@ -51,20 +49,45 @@ type ApprovedDefinitionInputV2 struct {
 type approvedDefinitionV2Wire ApprovedDefinitionV2
 
 func BuildApprovedDefinitionV2(input ApprovedDefinitionInputV2) (ApprovedDefinitionV2, error) {
-	return normalizeApprovedDefinitionV2(ApprovedDefinitionV2{
+	definition, err := normalizeApprovedDefinitionV2(ApprovedDefinitionV2{
 		SchemaVersion: ApprovedDefinitionSchemaVersionV2,
 		TenantID:      input.TenantID, UserID: input.UserID, TaskID: input.TaskID,
-		Intent: input.Intent, NLDescription: input.NLDescription,
-		SpecJSON: input.SpecJSON, ScopeJSON: input.ScopeJSON,
+		NLDescription: input.NLDescription,
+		SpecJSON:      input.SpecJSON, ScopeJSON: input.ScopeJSON,
 		TaskManual: input.TaskManual, Strictness: input.Strictness,
 		ToolCalls: input.ToolCalls, ExecutionMode: input.ExecutionMode,
 		DeliveryPolicy: input.DeliveryPolicy, BudgetPolicy: input.BudgetPolicy,
 	})
+	if err != nil {
+		return ApprovedDefinitionV2{}, err
+	}
+	if err := ValidateApprovedDefinitionV2ForWrite(definition); err != nil {
+		return ApprovedDefinitionV2{}, err
+	}
+	return definition, nil
 }
 
 func (d ApprovedDefinitionV2) Validate() error {
 	_, err := normalizeApprovedDefinitionV2(d)
 	return err
+}
+
+// ValidateApprovedDefinitionV2ForWrite applies today's compiler registry
+// without changing the frozen V2 reader. Retired tools therefore remain
+// readable and replayable even after new definitions can no longer select
+// them.
+func ValidateApprovedDefinitionV2ForWrite(definition ApprovedDefinitionV2) error {
+	normalized, err := normalizeApprovedDefinitionV2(definition)
+	if err != nil {
+		return err
+	}
+	for _, call := range normalized.ToolCalls {
+		if call.ToolContractVersion != "v1" ||
+			!validApprovedAcquisitionToolV2ForWrite(call.ToolName) {
+			return invalidState("approved tool call is not writable")
+		}
+	}
+	return nil
 }
 
 func (d ApprovedDefinitionV2) MarshalJSON() ([]byte, error) {
@@ -126,8 +149,7 @@ func normalizeApprovedDefinitionV2(
 		!validIdentifier(definition.TaskID, maxTaskIDBytes) {
 		return ApprovedDefinitionV2{}, invalidState("approved definition identity is invalid")
 	}
-	if !validMultilineText(definition.Intent, maxIntentBytes, false) ||
-		!validMultilineText(definition.NLDescription, maxDescriptionBytes, false) ||
+	if !validMultilineText(definition.NLDescription, maxDescriptionBytes, false) ||
 		!validMultilineText(definition.TaskManual, maxPlaybookBytes, false) {
 		return ApprovedDefinitionV2{}, invalidState("approved definition text is invalid")
 	}
@@ -171,4 +193,16 @@ func normalizeApprovedDefinitionV2(
 		return ApprovedDefinitionV2{}, err
 	}
 	return definition, nil
+}
+
+func validApprovedAcquisitionToolV2ForWrite(name string) bool {
+	switch name {
+	case "web_search", "web_feed", "web_contents", "x_user_posts",
+		"xhs_search", "xhs_user_posts", "xhs_hot_list", "xhs_topic_feed",
+		"xhs_faved_notes", "weibo_user_posts", "weibo_hot_list",
+		"wechat_mp_user_posts":
+		return true
+	default:
+		return false
+	}
 }

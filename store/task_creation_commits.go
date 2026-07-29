@@ -53,6 +53,10 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 	if err != nil {
 		return err
 	}
+	usesToolInvocations, err := compiledPlanUsesToolInvocations(plan)
+	if err != nil {
+		return err
+	}
 	canonicalPlan, err := json.Marshal(plan)
 	if err != nil {
 		return taskCreationValidation("definition fetch plan cannot be canonicalized")
@@ -91,6 +95,15 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 	if err := validateTaskCreationDefinitionCommitBinding(op, p); err != nil {
 		return err
 	}
+	protocol, err := taskCreationCheckpointDefinitionProtocol(op.CompiledDefinition)
+	if err != nil {
+		return taskCreationConflict("compiled checkpoint protocol is invalid")
+	}
+	useToolModel := protocol == compiledTaskDefinitionProtocolV2
+	if useToolModel && !usesToolInvocations {
+		return taskCreationConflict(
+			"Source-free compiled checkpoint is missing complete Tool calls")
+	}
 
 	switch op.Phase {
 	case types.TaskCreationPhaseDefinitionCommitted,
@@ -100,16 +113,27 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 		if op.Phase == types.TaskCreationPhaseActivated {
 			expectedStatus = types.ScheduleStatusActive
 		}
-		matches, err := pausedCompiledTaskDefinitionMatches(
-			ctx, tx, p.Definition, plan, expectedStatus)
+		var matches bool
+		if useToolModel {
+			matches, err = pausedToolTaskDefinitionMatches(
+				ctx, tx, p.Definition, expectedStatus)
+		} else {
+			matches, err = pausedCompiledTaskDefinitionMatches(
+				ctx, tx, p.Definition, plan, expectedStatus)
+		}
 		if err != nil {
 			return err
 		}
 		if !matches {
 			return taskCreationConflict("committed definition aggregate differs")
 		}
-		matches, err = taskCreationApprovedDefinitionMatchesTx(
-			ctx, tx, p.Definition, plan, p.Lease.ID)
+		if useToolModel {
+			matches, err = taskCreationToolApprovedDefinitionMatchesTx(
+				ctx, tx, p.Definition, plan, p.Lease.ID)
+		} else {
+			matches, err = taskCreationApprovedDefinitionMatchesTx(
+				ctx, tx, p.Definition, plan, p.Lease.ID)
+		}
 		if err != nil {
 			return err
 		}
@@ -133,12 +157,23 @@ func (s *Store) CommitPausedCompiledTaskDefinitionForCreation(
 			types.ErrTaskCreationLimit)
 	}
 
-	if err := insertPausedCompiledTaskDefinitionTx(ctx, tx, p.Definition, plan); err != nil {
-		return err
-	}
-	if _, err := insertTaskCreationApprovedDefinitionTx(
-		ctx, tx, p.Definition, plan, p.Lease.ID); err != nil {
-		return err
+	if useToolModel {
+		if err := insertPausedToolTaskDefinitionTx(ctx, tx, p.Definition); err != nil {
+			return err
+		}
+		if _, err := insertTaskCreationToolApprovedDefinitionTx(
+			ctx, tx, p.Definition, plan, p.Lease.ID); err != nil {
+			return err
+		}
+	} else {
+		if err := insertPausedCompiledTaskDefinitionTx(
+			ctx, tx, p.Definition, plan); err != nil {
+			return err
+		}
+		if _, err := insertTaskCreationApprovedDefinitionTx(
+			ctx, tx, p.Definition, plan, p.Lease.ID); err != nil {
+			return err
+		}
 	}
 	tag, err := tx.Exec(ctx,
 		`UPDATE task_creation_operations
@@ -753,6 +788,27 @@ func taskCreationCheckpointDefinitionDigest(checkpoint []byte) (string, error) {
 		return "", errors.New("compiled checkpoint definition_digest is invalid")
 	}
 	return digest, nil
+}
+
+func taskCreationCheckpointDefinitionProtocol(checkpoint []byte) (string, error) {
+	var fields map[string]json.RawMessage
+	if err := strictjson.Decode(checkpoint, &fields); err != nil || fields == nil {
+		return "", errors.New("compiled checkpoint is not a strict JSON object")
+	}
+	raw, ok := fields["version"]
+	if !ok {
+		return "", errors.New("compiled checkpoint version is missing")
+	}
+	var version string
+	if err := json.Unmarshal(raw, &version); err != nil {
+		return "", errors.New("compiled checkpoint version is invalid")
+	}
+	switch version {
+	case compiledTaskDefinitionProtocolV1, compiledTaskDefinitionProtocolV2:
+		return version, nil
+	default:
+		return "", errors.New("compiled checkpoint version is unsupported")
+	}
 }
 
 func taskCreationBindingStateComplete(op *types.TaskCreationOperation) bool {

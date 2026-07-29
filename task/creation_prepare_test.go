@@ -381,7 +381,7 @@ func TestCreationPreparer_PrepareHappyPath(t *testing.T) {
 		result.Definition.PlaybookContent != "每天寻找全球 AI 热点" {
 		t.Fatalf("definition=%+v", result.Definition)
 	}
-	wantPlan := `{"targets":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"}}]}`
+	wantPlan := `{"targets":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"},"tool_name":"web_search","tool_arguments":{"query":"AI","category":"news"}}]}`
 	if string(result.Definition.FetchPlan) != wantPlan {
 		t.Fatalf("canonical fetch plan=%s want=%s", result.Definition.FetchPlan, wantPlan)
 	}
@@ -995,7 +995,7 @@ func mustCreateArgsWithPlan(
 }
 
 func validApprovedFetchPlan() string {
-	return `{"targets":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI&category=news","config":{"query":"AI","category":"news"}}]}`
+	return `{"targets":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI&category=news","config":{"query":"AI","category":"news"},"tool_name":"web_search","tool_arguments":{"query":"AI","category":"news"}}]}`
 }
 
 func mustMarshal(t *testing.T, value any) []byte {

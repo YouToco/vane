@@ -489,6 +489,62 @@ func TestTaskCreationDefinitionActivation_AtomicAndVisibleOnlyWhenComplete(t *te
 	assertScheduleVisibility(t, st, f.userID, legacyTask, true)
 }
 
+func TestTaskCreationDefinitionCommit_ToolPlanCreatesNoSourceEntity(t *testing.T) {
+	st := tenantTestStore(t)
+	f := newCompiledTaskFixture(t, st)
+	cleanupA5Fixture(t, st, f)
+	query := "source-free-" + uuid.NewString()
+	target := validA5PlanSource(t, query, "Source-free Tool call")
+	target.ToolName = "web_search"
+	target.ToolArgs = json.RawMessage(`{"query":"` + query + `"}`)
+	p := preparedA5CommitWithSources(t, st, f, "tool-source-free", target)
+
+	if err := st.CommitPausedCompiledTaskDefinitionForCreation(t.Context(), p); err != nil {
+		t.Fatalf("CommitPausedCompiledTaskDefinitionForCreation: %v", err)
+	}
+	if err := st.CommitPausedCompiledTaskDefinitionForCreation(t.Context(), p); err != nil {
+		t.Fatalf("Source-free definition replay: %v", err)
+	}
+	record, err := st.GetCurrentToolApprovedDefinition(
+		t.Context(), p.Lease.TenantID, p.Lease.UserID, p.Definition.TaskID)
+	if err != nil {
+		t.Fatalf("GetCurrentToolApprovedDefinition: %v", err)
+	}
+	if record.Definition.SchemaVersion != taskstate.ApprovedDefinitionSchemaVersionV2 ||
+		len(record.Definition.ToolCalls) != 1 ||
+		record.Definition.ToolCalls[0].ToolName != "web_search" ||
+		record.Definition.TaskManual != p.Definition.PlaybookContent {
+		t.Fatalf("Source-free approved definition differs: %+v", record.Definition)
+	}
+	var taskLinks, globalTargets int
+	var projectionPlan []byte
+	if err := st.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM task_fetch_targets WHERE schedule_id=$1`,
+		p.Definition.TaskID).Scan(&taskLinks); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM fetch_targets WHERE url=$1`,
+		target.URL).Scan(&globalTargets); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.pool.QueryRow(t.Context(),
+		`SELECT fetch_plan FROM schedule_playbooks WHERE schedule_id=$1`,
+		p.Definition.TaskID).Scan(&projectionPlan); err != nil {
+		t.Fatal(err)
+	}
+	if taskLinks != 0 || globalTargets != 0 {
+		t.Fatalf("Tool plan created Source-era rows: links=%d targets=%d",
+			taskLinks, globalTargets)
+	}
+	if !taskCreationJSONEqual(projectionPlan, []byte(`{}`)) ||
+		bytes.Contains(projectionPlan, []byte(`tool_arguments`)) ||
+		bytes.Contains(projectionPlan, []byte(`url`)) {
+		t.Fatalf("mutable schedule projection retained private Tool plan: %s",
+			projectionPlan)
+	}
+}
+
 func TestTaskCreationCompiledSagaRejectsDynamicAggregate(t *testing.T) {
 	st := tenantTestStore(t)
 	f := newCompiledTaskFixture(t, st)
@@ -1808,12 +1864,21 @@ func preparedA5CommitWithSourcesAndStrictness(
 	if err != nil {
 		t.Fatal(err)
 	}
+	protocol := compiledTaskDefinitionProtocolV1
+	allToolCalls := len(sources) > 0
+	for _, source := range sources {
+		allToolCalls = allToolCalls && source.ToolName != "" &&
+			len(bytes.TrimSpace(source.ToolArgs)) > 0
+	}
+	if allToolCalls {
+		protocol = compiledTaskDefinitionProtocolV2
+	}
 	definition, err := json.Marshal(struct {
 		Version          string                             `json:"version"`
 		DefinitionDigest string                             `json:"definition_digest"`
 		Definition       types.PausedCompiledTaskDefinition `json:"definition"`
 	}{
-		Version: "test-compiled/v1", DefinitionDigest: definitionDigest, Definition: def,
+		Version: protocol, DefinitionDigest: definitionDigest, Definition: def,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2007,7 +2072,8 @@ func preparedA5ScheduleOnly(
 		DefinitionDigest string                             `json:"definition_digest"`
 		Definition       types.PausedCompiledTaskDefinition `json:"definition"`
 	}{
-		Version: "test-compiled/v1", DefinitionDigest: definitionDigest, Definition: def,
+		Version:          compiledTaskDefinitionProtocolV1,
+		DefinitionDigest: definitionDigest, Definition: def,
 	})
 	if err != nil {
 		t.Fatal(err)

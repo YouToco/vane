@@ -13,23 +13,23 @@ import (
 )
 
 const (
-	maxTaskIDBytes       = 255
-	maxIntentBytes       = 16 << 10
-	maxDescriptionBytes  = 16 << 10
-	maxPlaybookBytes     = 256 << 10
-	maxJSONObjectBytes   = 256 << 10
-	maxDefinitionBytes   = 2 << 20
-	maxAdaptiveBytes     = 256 << 10
-	maxSourceCount       = 64
-	maxSourceURLBytes    = 4096
-	maxSourceTextBytes   = 4096
-	maxQueryVariantCount = 64
-	maxQueryBytes        = 4096
-	maxCapabilityCount   = 256
-	maxToolNameBytes     = 255
-	maxToolVersionBytes  = 255
-	maxToolCallCount     = 64
-	maxCursorBytes       = 64 << 10
+	maxTaskIDBytes              = 255
+	maxIntentBytes              = 16 << 10
+	maxDescriptionBytes         = 16 << 10
+	maxPlaybookBytes            = 256 << 10
+	maxJSONObjectBytes          = 256 << 10
+	maxDefinitionBytes          = 2 << 20
+	maxAdaptiveBytes            = 256 << 10
+	maxSourceCount              = 64
+	maxSourceURLBytes           = 4096
+	maxSourceTextBytes          = 4096
+	maxQueryVariantCount        = 64
+	maxQueryBytes               = 4096
+	maxCapabilityCount          = 256
+	maxToolNameBytes            = 255
+	maxToolContractVersionBytes = 255
+	maxToolCallCount            = 64
+	maxCursorBytes              = 64 << 10
 )
 
 // ErrInvalidState identifies malformed, unsupported, or non-canonical task
