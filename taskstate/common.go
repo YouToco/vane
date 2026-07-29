@@ -26,6 +26,10 @@ const (
 	maxQueryVariantCount = 64
 	maxQueryBytes        = 4096
 	maxCapabilityCount   = 256
+	maxToolNameBytes     = 255
+	maxToolVersionBytes  = 255
+	maxToolCallCount     = 64
+	maxCursorBytes       = 64 << 10
 )
 
 // ErrInvalidState identifies malformed, unsupported, or non-canonical task
