@@ -212,6 +212,10 @@ function ExecutivePanel({
   onCreateTask?: () => void;
 }) {
   const copy = executiveCopy(locale);
+  const signals = Array.isArray(content.signals) ? content.signals : [];
+  const nextSteps = Array.isArray(content.next_steps)
+    ? content.next_steps
+    : [];
   const [question, setQuestion] = useState("");
   const [reply, setReply] = useState("");
   const [askError, setAskError] = useState("");
@@ -313,13 +317,13 @@ function ExecutivePanel({
         <p className="text-xs font-medium text-muted-foreground">{copy.why}</p>
         <p className="text-sm leading-6">{content.why_for_you}</p>
       </div>
-      {content.signals.length > 0 && (
+      {signals.length > 0 && (
         <div className="space-y-2">
           <p className="text-xs font-medium text-muted-foreground">
             {copy.signals}
           </p>
           <ol className="space-y-2">
-            {content.signals.slice(0, 3).map((signal, index) => (
+            {signals.slice(0, 3).map((signal, index) => (
               <li key={`${signal.kind}-${index}`} className="text-sm">
                 <span className="mr-2 font-mono text-muted-foreground">
                   {index + 1}
@@ -423,13 +427,13 @@ function ExecutivePanel({
           </ol>
         </div>
       )}
-      {content.next_steps.length > 0 && (
+      {nextSteps.length > 0 && (
         <div className="space-y-2">
           <p className="text-xs font-medium text-muted-foreground">
             {copy.next}
           </p>
           <div className="flex flex-wrap gap-2">
-            {content.next_steps.map((step, index) => (
+            {nextSteps.map((step, index) => (
               <Button
                 key={`${step.kind}-${index}`}
                 variant="outline"

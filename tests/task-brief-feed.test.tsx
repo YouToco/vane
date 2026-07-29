@@ -76,6 +76,7 @@ import TaskBriefFeed, {
   validatedEventEvidence,
 } from "@/components/TaskBriefFeed";
 import type {
+  ExecutiveContent,
   TaskBrief,
   TaskBriefsResp,
   TaskBriefStructuredInsight,
@@ -449,6 +450,35 @@ describe("TaskBriefFeed Markdown boundary", () => {
     });
     expect(await screen.findByText("Deep dive is being generated")).toBeTruthy();
     expect(apiMock.askBrief).not.toHaveBeenCalled();
+  });
+
+  test("renders historical fallback content with nullable arrays", async () => {
+    const response = page("fallback", 42);
+    response.items[0].executive = {
+      generation_mode: "deterministic_fallback",
+      processing: "partial",
+      generated_at: "2026-07-27T10:00:00Z",
+      content: {
+        headline: "Evidence is not sufficient yet",
+        executive_summary: "The original item remains available.",
+        decision_state: "insufficient_evidence",
+        why_for_you: "No reliable personal impact can be stated yet.",
+        signals: null as unknown as ExecutiveContent["signals"],
+        next_steps: null as unknown as ExecutiveContent["next_steps"],
+      },
+    };
+    apiMock.scheduleBriefs.mockResolvedValue(response);
+
+    render(<TaskBriefFeed scheduleID="task-fallback" />);
+
+    expect(
+      await screen.findByText("Evidence is not sufficient yet"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "A conservative summary was used. Check the underlying evidence.",
+      ),
+    ).toBeTruthy();
   });
 
   test("keeps P2-D controls dark when the task is outside rollout", async () => {

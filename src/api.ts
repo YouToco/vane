@@ -425,6 +425,16 @@ export interface ExecutiveContent {
   next_steps: ExecutiveNextStep[];
 }
 
+function normalizeExecutiveContent(
+  content: ExecutiveContent,
+): ExecutiveContent {
+  return {
+    ...content,
+    signals: arr(content.signals),
+    next_steps: arr(content.next_steps),
+  };
+}
+
 export interface ExecutiveBriefArtifact {
   generation_mode: "model" | "deterministic_fallback";
   processing: CanonicalCompleteness;
@@ -999,6 +1009,12 @@ export const api = {
       ...r,
       items: arr(r.items).map((brief) => ({
         ...brief,
+        executive: brief.executive
+          ? {
+              ...brief.executive,
+              content: normalizeExecutiveContent(brief.executive.content),
+            }
+          : undefined,
         insights: arr(brief.insights).map((insight) => ({
           ...insight,
           event_evidence: insight.event_evidence
@@ -1029,7 +1045,13 @@ export const api = {
     if (cursor) params.set("cursor", cursor);
     return request<PeriodicBriefReportsResp>(
       `/api/schedules/${encodeURIComponent(id)}/reports?${params.toString()}`,
-    ).then((r) => ({ ...r, items: arr(r.items) }));
+    ).then((r) => ({
+      ...r,
+      items: arr(r.items).map((report) => ({
+        ...report,
+        content: normalizeExecutiveContent(report.content),
+      })),
+    }));
   },
   reportSettings: (id: string) =>
     request<BriefReportSettings>(
