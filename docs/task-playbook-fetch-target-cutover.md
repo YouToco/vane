@@ -22,6 +22,12 @@ information work.
 The word "source" is retired from the current control plane because it
 previously referred to three different concepts.
 
+| Retired name | What it actually was | Current name |
+|---|---|---|
+| `sources` | Global materialized acquisition table | `fetch_targets` |
+| `schedule_sources` | Exact task-to-acquisition join table | `task_fetch_targets` |
+| `sourcecatalog` | Trusted Go capability registry, not a database table | `capabilitycatalog` |
+
 1. `capabilitycatalog` is trusted code describing what the runtime can fetch.
 2. `fetch_targets` are globally shared, materialized acquisition endpoints with
    mutable health and due state. Sharing avoids duplicate upstream calls and
@@ -100,6 +106,11 @@ The schema migration renames current physical acquisition tables but does not
 rewrite immutable historical payload bytes. Versioned readers retain the old
 `source_id`, `sources`, and `legacy_subscriptions` wire vocabulary only inside
 those immutable formats.
+
+The old physical table names may otherwise appear only in applied migrations
+and migration tests that prove an existing database upgrades without aliases.
+The old Agent tool names may otherwise appear only in immutable ledger/history
+readers and explicit “retired tool stays absent” guards.
 
 ## Cutover gates
 

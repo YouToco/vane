@@ -86,10 +86,10 @@ content_items；某端点若证明适合长期任务抓取，走 capabilitycatal
   schema（enum/default/required 齐全；未知类型退化 string——schema 是给模型的提示，
   权威校验在 Execute 参数校验 + 上游 422）。注入描述 = summary + description 截
   300 rune + 计费提醒（600 全文只出现在检索结果文本里，不随每轮请求重复发送）。
-- **端点工具全部 Mutating=false**：查询不改系统状态，免确认卡（Boss 拍板）；
-  推论：永不进 pending_actions，ExecuteAction 路径只需静态白名单。
+- **端点工具全部只读**：查询不改系统状态，只进入公开研究工具面；
+  推论：不能创建任务、修改任务手册或写入内部抓取目标。
 - system prompt 仅在装配了端点工具面时追加能力说明段（可搜索平台清单 + 计费/
-  限额提示 + "持续追新用 add_source 不用端点查询"）。
+  限额提示 + “持续追新应创建带任务手册的定时任务”）。
 
 ### §3.5 大结果：缓存句柄 + read_endpoint_result（2026-07-18 增补）
 

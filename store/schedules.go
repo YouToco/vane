@@ -66,7 +66,7 @@ func (s *Store) InsertSchedule(ctx context.Context, sc *types.Schedule) error {
 	}
 	// InsertSchedule is the legacy/compatibility compiled-task mirror writer.
 	// Mapping its Go zero value is explicit at this boundary; accepting a dynamic
-	// mode here would bypass the future confirmed Approved Definition control plane.
+	// mode here would bypass the Approved Definition control plane.
 	if sc.ExecutionMode != "" && sc.ExecutionMode != types.ExecutionModeCompiled {
 		return types.NewAppError(types.CodeValidation,
 			"旧调度镜像入口只允许 compiled 执行模式", types.ErrValidation)

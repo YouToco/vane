@@ -68,7 +68,7 @@ type AdaptiveStateRecord struct {
 
 // ApprovedDefinitionFence identifies the exact immutable definition bytes a
 // caller consumed. Adaptive writes must carry the fence from their run
-// snapshot so work started under an older confirmed intent cannot update state
+// snapshot so work started under an older authorized intent cannot update state
 // after the user approves a new definition.
 type ApprovedDefinitionFence struct {
 	Version int64
@@ -76,8 +76,8 @@ type ApprovedDefinitionFence struct {
 }
 
 // InsertInitialApprovedDefinition installs only a baseline version-1 head.
-// It is a C2a database primitive, not proof of user confirmation and not an
-// edit API. C2b must add the confirmed proposal/CAS writer that atomically
+// It is a C2a database primitive, not proof of owner authorization and not an
+// edit API. C2b must add the authorized command/CAS writer that atomically
 // updates every legacy projection. Until then an AST guard keeps this method
 // at zero production call points.
 func (s *Store) InsertInitialApprovedDefinition(
@@ -137,7 +137,7 @@ func insertInitialApprovedDefinitionTx(
 	}
 	// Resolve the immutable approval identity before inspecting the movable
 	// current head. A response-lost initialization may be retried after a later
-	// confirmed edit has already advanced the head; it must still return the
+	// authorized edit has already advanced the head; it must still return the
 	// original version-1 result rather than manufacture a conflict or duplicate.
 	existingByApproval, err := loadApprovedDefinitionByOperationRefTx(ctx, tx,
 		definition.TenantID, definition.UserID, definition.TaskID, operationRef)
@@ -282,7 +282,7 @@ func (s *Store) GetApprovedDefinitionVersion(
 // GetAdaptiveStateForDefinition returns found=false for the explicit version-0
 // state (no persisted learning yet). The expected definition fence is checked
 // while the schedule row is locked, so a caller can never read v1 adaptive
-// state as if it belonged to a newly-confirmed v2 definition. C2c must still
+// state as if it belonged to a newly-authorized v2 definition. C2c must still
 // build the final run snapshot in one database transaction rather than compose
 // independent reads in memory.
 func (s *Store) GetAdaptiveStateForDefinition(
@@ -678,7 +678,7 @@ func validateApprovedDefinitionProjectionTx(
 		strictness = types.PushStrictness(*rawStrictness)
 	}
 	// The current aggregate has no separate intent column. Since A5 writes the
-	// confirmed intent into playbook.content and every later manual edit confirms
+	// authorized intent into playbook.content and every later manual edit freezes
 	// that whole content, it is the only lossless migration surrogate. Missing or
 	// empty playbooks remain headless and are reported by C2c instead of inventing
 	// an intent from a display label.

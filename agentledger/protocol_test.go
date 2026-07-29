@@ -74,7 +74,7 @@ func TestDecodeFailsClosed(t *testing.T) {
 
 	event, err := Canonicalize(Input{
 		Kind: KindToolCall,
-		Body: []byte(`{"call_id":"call-1","name":"list_sources","arguments":{}}`),
+		Body: []byte(`{"call_id":"call-1","name":"view_profile","arguments":{}}`),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +89,7 @@ func TestDecodeFailsClosed(t *testing.T) {
 			name: "noncanonical bytes",
 			payload: []byte(
 				`{"kind":"tool_call","schema_version":"vane.agent-event/v1",` +
-					`"body":{"arguments":{},"call_id":"call-1","name":"list_sources"}}`,
+					`"body":{"arguments":{},"call_id":"call-1","name":"view_profile"}}`,
 			),
 			digest: event.Digest(),
 		},

@@ -100,7 +100,7 @@ func TestChatMalformedChoicePreservesAccountingMetadata(t *testing.T) {
 				"tool_calls":[{
 					"id":"call_1",
 					"type":"function",
-					"function":{"name":"list_sources","arguments":{}}
+					"function":{"name":"view_profile","arguments":{}}
 				}]
 			}
 		}],
@@ -120,7 +120,7 @@ func TestChatMalformedChoicePreservesAccountingMetadata(t *testing.T) {
 
 	resp, err := newTestClient(srv.URL, 1).Chat(t.Context(), ChatRequest{
 		Messages: []ChatMessage{{Role: "user", Content: "list"}},
-		Tools:    []ToolDef{{Name: "list_sources"}},
+		Tools:    []ToolDef{{Name: "view_profile"}},
 	})
 	if !errors.Is(err, ErrToolProtocolResponse) {
 		t.Fatalf("error = %v, want ErrToolProtocolResponse", err)

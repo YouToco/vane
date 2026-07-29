@@ -373,7 +373,7 @@ func TestInvariant_XTikHubFailureDoesNotFallBack(t *testing.T) {
 				ctx, cancel = context.WithTimeout(ctx, tt.contextTTL)
 				defer cancel()
 			}
-			_, err := multi.Fetch(ctx, types.Source{
+			_, err := multi.Fetch(ctx, types.FetchTarget{
 				ID:         7,
 				Platform:   types.PlatformX,
 				Capability: types.CapUserPosts,

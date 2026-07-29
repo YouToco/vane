@@ -13,7 +13,7 @@ func TestBuildAndProjectLatestSessionSnapshot(t *testing.T) {
 		Messages: json.RawMessage(`[
 			{"role":"user","content":"hello"},
 			{"role":"assistant","content":"","tool_calls":[
-				{"id":"call-1","name":"list_sources","arguments":"{}"}
+				{"id":"call-1","name":"view_profile","arguments":"{}"}
 			]},
 			{"role":"tool","content":"none","tool_call_id":"call-1"},
 			{"role":"assistant","content":"done"}
