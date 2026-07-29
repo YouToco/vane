@@ -222,8 +222,11 @@ func taskCreationToolApprovedDefinitionMatchesTx(
 		}
 		return false, err
 	}
-	return record.Version == initialApprovedDefinitionVersion &&
-		record.Digest == digest && bytes.Equal(record.Payload, payload), nil
+	if record.Version != initialApprovedDefinitionVersion ||
+		record.Digest != digest || !bytes.Equal(record.Payload, payload) {
+		return false, nil
+	}
+	return taskCreationInitialToolAdaptiveStateMatchesTx(ctx, tx, record)
 }
 
 // GetCurrentToolApprovedDefinition loads only the Source-free V2 head. A V1
