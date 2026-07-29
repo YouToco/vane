@@ -917,9 +917,9 @@ func (m *Multi) KindOf(p types.Platform, c types.Capability) (types.Kind, bool)
 ```go
 // CanonicalKey 算出内容的全局身份（content_items.canonical_key，UNIQUE）。
 //
-// 按 **platform** 分派而非 provider：这正是"换供应商不产生重复内容"的承载者
-// （契约 §18 不变量 I1）。tweet_id 是 X 平台的事实，不是 TikHub 的事实——
-// 换成官方 X API 或 syndication 旁路，同一条推算出的键逐字节相同。
+// 按 **platform** 分派而非 provider：tweet_id 是 X 平台的事实，不是 TikHub 的事实，
+// 所以 canonical identity 不携带供应商名。注意：身份模型 provider-neutral 不代表允
+// 许替换供应商；2026-07-29 起，X 数据访问的现行政策是 TikHub-only（见 §17.2）。
 //
 // **键是裸值，不加命名空间前缀**（web=url 原文、xhs=note_id 原文）：007 迁移的回填
 // 写的就是裸值，加前缀会让存量 231 条的键与运行时算出的键永不相等，全库内容立刻
@@ -1068,7 +1068,7 @@ for _, item := range in.Items {
 
 ---
 
-## 9. `x/user_posts` 实现（`fetcher/x.go`）
+## 9. `x/user_posts` 历史实现说明（现已迁入 `fetcher/binding.go`）
 
 > 全节依据 2026-07-16 真实 key 实测（11 个请求，报文级）。
 > **每一条"不要照抄小红书"都对应一个实测到的不兼容。**
@@ -1966,29 +1966,21 @@ VPS 打包产物复验含 4 处 ``===`rss`` + 4 处 `tikhub_xhs`。
                         AND ps.canonical_key LIKE '%#->' || a.prev_hash);  -- 首轮基线
     ```
 
-### 17.2 供应商可替换性——**这条能真验，不是纸面承诺**
+### 17.2 X 供应商政策（2026-07-29 修订：TikHub-only）
 
-实测发现 `(x, user_posts)` **至少有两个可用供应商**：TikHub（$0.001/次）与
-`syndication.twitter.com/srv/timeline-profile/screen-name/<handle>`（**免鉴权**，
-实测 200 + `__NEXT_DATA__` 解析出 24 条结构化推文，含 `id_str`/`full_text`/`created_at`）。
-两者**身份空间相同**（都是 tweet id）。
+本节原先记录过第二供应商候选，但该方向已经撤销。`(x, user_posts)` 保留平台与
+canonical identity，生产数据访问则**只允许 TikHub**：
 
-> **Gate ⑨（度量已修正）**：用同一个 handle 分别跑两个 provider，断言 canonical_key 的**子集关系**：
->
-> ```
-> 较小的键集合 ⊆ 较大的键集合
-> ```
->
-> **初稿的「交并比 ≥ 0.9」是个注定失败的指标**（对抗审查用事实基准自己的数字算出来的）：
-> AnthropicAI 实测 TikHub 返回 **13 条**、syndication 返回 **24 条**
-> → 交并比**上界 = 13/24 ≈ 0.54** → **正确的实现也会报红** → 下一步必然是调阈值 → **调成恒绿**。
-> 一个"永远不可能过"的 Gate 与"永远绿"的 Gate 一样没用，且更危险（它教会人忽略红灯）。
->
-> 子集关系才是 I1 的正确表述：**两个 provider 对同一条推文必须算出同一个键**。
-> 条数差异来自时间窗/分页，不是身份不一致——子集断言对条数差异免疫，对身份漂移零容忍。
->
-> **前置**：需先补一条 syndication 侧的实测（其 `id_str` 与 TikHub 的 `tweet_id` 是否同一空间、
-> 转推在 syndication 里的字段形态）。**未补此实测前，I1 仍是纸面承诺**（记录在 §18 遗留）。
+- 唯一订阅端点是 TikHub 的 `twitter_web_fetch_user_post_tweet`；
+- 禁止官方 X/Twitter API、公开 syndication 接口和其他第三方 X API；
+- TikHub key 缺失、鉴权失败、限流、超时或响应漂移时显式失败，不做 provider fallback；
+- `x/search` 继续 Unavailable，不得静默改走 Exa/RSS；
+- `x.com/<author>/status/<id>` 仅是证据展示链接，不是抓取 API；
+- 通用 Web 搜索偶然返回公开 x.com 页面不等于 X 信源接入，也不得据此创建 X provider。
+
+CI 以固定绑定端点、运行策略、credential、禁止生产覆盖 TikHub base URL 和故障不回退
+测试证明主链；域名/凭证 denylist 只是辅助 tripwire，不冒充完整网络出口白名单。不得按
+`twitter`、`X API` 或 `Twitter-Web-API` 标签批删，因为这些词也存在于合法 TikHub 目录。
 
 ### 17.3 真人实测清单（Boss 飞书操作）
 
@@ -2007,7 +1999,7 @@ VPS 打包产物复验含 4 处 ``===`rss`` + 4 处 `tikhub_xhs`。
   不产生假变化推送**；
 ⑧ Anthropic 动态：`web/search` + `include_domains:["anthropic.com","claude.com"]`
   → push_now → **推的是 anthropic.com 官方文章，不再是 xix.ai / vallettasoftware.com**；
-⑨ Gate ⑨（§17.2）跑通；
+⑨ 清空 TikHub key 或注入 TikHub 故障 → `x/user_posts` 显式失败，且不调用第二供应商；
 ⑩ **vane-web 未更新时** dashboard 的 Sources 页仍能正常展示三个存量源、仍能加源（垫片生效）；
 ⑪ **配置覆盖必须可见**（§5.2 死结的真人验）：先订 `openai.com/news/rss.xml` +
   `categories:["Product"]`，再对 agent 说"我也想看 OpenAI 的政策动态" →
@@ -2137,9 +2129,8 @@ VPS 打包产物复验含 4 处 ``===`rss`` + 4 处 `tikhub_xhs`。
     候选是「LLM 门直接读 diff 生成人话」（§10.6 已有该环节，只是未针对散文验证）
     → **留 P3 实测后再定，不在此承诺**。
 - **第四个平台的碰撞分析**是人工纪律（§7.3），没有机器强制。
-- **I1 在补上 syndication 侧实测前仍是纸面承诺**（§17.2）：已实测 syndication 返回
-  `id_str`/`full_text`/`created_at`，但**未验证**它与 TikHub 的 `tweet_id` 是否同一空间、
-  转推在它那里的字段形态。Gate ⑨ 落地前必须补这条实测。
+- **I1 的跨供应商替换验证已撤销**（§17.2）：canonical identity 仍保持 provider-neutral，
+  但 X 的生产 provider 已冻结为 TikHub-only，不再以接入第二供应商验证该不变量。
 - **`min_rows` 闸门与散文文档页不兼容**（见上条目标 ③ 修正）。
 
 ### 未来方向拍板（2026-07-17）：agent 代码执行沙箱 = microVM

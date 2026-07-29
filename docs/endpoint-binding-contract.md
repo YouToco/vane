@@ -6,6 +6,14 @@
 > 并修订该契约 §10.1/§10.2/§10.5 与 M6 契约 §2/§5.3/§18-I2 的对应条款（见 §10 修订清单）。
 > 同日 Boss 拍板：被通用引擎替代的 bespoke fetcher **删除干净**（§6）。
 
+> **2026-07-29 X 供应商政策（现行）**：X 平台能力保留，但 X 专属 provider / 能力
+> 的生产数据访问只允许通过 TikHub（`https://api.tikhub.io`）。禁止接入官方 X/Twitter API、syndication、第三方
+> X API，也禁止在 TikHub 失败时降级到这些供应商。TikHub key 缺失、鉴权失败、限流、
+> 超时或响应漂移均须显式失败。`x.com/<author>/status/<id>` 只用于内容证据链接，不是
+> 抓取 API；通用 Web 搜索偶然命中公开 x.com 页面也不构成 X 信源 provider。CI 通过
+> 固定绑定端点、运行策略、credential、禁止生产覆盖 TikHub base URL 和故障不回退测试
+> 证明主链；域名/凭证 denylist 仅是辅助 tripwire，不冒充网络出口白名单。
+
 ## §0 分界怎么变（对 §0.3 的修订）
 
 不变的部分：lookup 层（agent 会话内动态端点调用）的查询结果**仍然永不**直接写入
@@ -116,6 +124,8 @@ sub-Turing 红线不动。
    上游用默认值返回 200 但数据错误」的唯一防线（漂移场景：re-gen 改了参数名）。
 3. **调用**：复用 `tikhubinvoke.Invoker`（无状态并发安全）。非 2xx → `CodeFetchFailed`
    类映射（fail_count 链路）。大整数经 json.Number（UseNumber）全程不过 float64。
+   对 `x/user_posts`，该 Invoker 是唯一允许的 provider；失败后不得尝试 Exa、RSS、
+   官方 X/Twitter API 或其他 X 数据接口。
 4. **归一化**：映射产物必须填 ExternalID（身份槽）；CanonicalKey 按**平台既有规则**
    构造（I1 不变：xhs=裸 note_id/条目 id，x=裸 tweet_id）；Kind 来自 Binding.Kind；
    最后过 `finalize`（既有守卫复用）。平台内撞击分析：热榜 item_id 为十进制数字串，
