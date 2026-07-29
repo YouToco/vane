@@ -143,6 +143,14 @@ type toolRunState struct {
 	directTaskDefinitionEditResponseRejected bool
 	directTaskDefinitionEditFailures         int
 	directTaskDefinitionEditResult           string
+	// naturalTaskDefinitionEdit is the Feishu/name-based edit lane. It first
+	// resolves the readable task description with list_schedules, then exposes
+	// only edit_task_definition. The user never has to provide an internal ID.
+	naturalTaskDefinitionEdit                 bool
+	naturalTaskDefinitionEditTaskListed       bool
+	naturalTaskDefinitionEditToolRejected     bool
+	naturalTaskDefinitionEditResponseRejected bool
+	naturalTaskDefinitionEditFailures         int
 	// A direct write may return probe detail that is safe
 	// to show once but unsafe to feed into another model turn or persist. The
 	// loop returns it deterministically and the normal history scrub replaces

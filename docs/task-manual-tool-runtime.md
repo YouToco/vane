@@ -26,6 +26,14 @@ state of the task, not separately managed user objects.
 True ambiguity is resolved with one targeted natural-language question.
 Otherwise the Agent executes directly.
 
+Natural-language edits are one user operation even when the request changes
+several fields of the same task. The Agent first resolves the task from the
+user's remembered name, schedule, topic or purpose, then submits one complete
+definition edit. That lane exposes only `list_schedules` followed by
+`edit_task_definition`; a requirement that future runs open official pages does
+not authorize ad-hoc web research during the edit. The user is never asked for
+an internal task ID or to split one task/manual edit into smaller requests.
+
 ## Current writer contract
 
 `create_schedule` accepts:
