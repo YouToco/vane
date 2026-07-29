@@ -2164,6 +2164,20 @@ func mustProposeCreation(t *testing.T, coordinator *CreationCoordinator, id stri
 	}
 }
 
+func TestValidateCreationReceiptTarget_AcceptsAgentAutoIdentity(t *testing.T) {
+	op := &types.TaskCreationOperation{ID: "operation-auto"}
+	if err := validateCreationReceiptTarget(
+		op, AgentAutoReceiptTarget(op.ID),
+	); err != nil {
+		t.Fatalf("agent auto receipt rejected: %v", err)
+	}
+	if err := validateCreationReceiptTarget(
+		op, AgentAutoReceiptTarget("another-operation"),
+	); err == nil {
+		t.Fatal("agent auto receipt must be bound to the exact operation id")
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

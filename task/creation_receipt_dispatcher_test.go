@@ -353,26 +353,33 @@ func TestCreationReceiptDispatcher_AmbiguousPatchReplayKeepsOneResource(t *testi
 	}
 }
 
-func TestCreationReceiptDispatcher_WebPollingSkipsExternalSender(t *testing.T) {
-	st := newReceiptDispatcherFakeStore(types.PendingActionStatusExecuted)
-	st.r.Provider = WebActionReceiptProvider
-	st.r.Target = st.r.OperationID
-	sessions := &receiptDispatcherFakeSessions{}
-	sender := &receiptDispatcherFakeSender{}
-	d := newReceiptDispatcherForTest(t, st, sessions, sender)
+func TestCreationReceiptDispatcher_LocalReceiptsSkipExternalSender(t *testing.T) {
+	for _, provider := range []string{
+		WebActionReceiptProvider,
+		AgentAutoReceiptProvider,
+	} {
+		t.Run(provider, func(t *testing.T) {
+			st := newReceiptDispatcherFakeStore(types.PendingActionStatusExecuted)
+			st.r.Provider = provider
+			st.r.Target = st.r.OperationID
+			sessions := &receiptDispatcherFakeSessions{}
+			sender := &receiptDispatcherFakeSender{}
+			d := newReceiptDispatcherForTest(t, st, sessions, sender)
 
-	if err := d.DispatchOnce(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	final := st.snapshot()
-	calls, resources := sender.snapshot()
-	if final.Status != types.TaskCreationReceiptStatusSent ||
-		final.ProviderMessageID != final.OperationID ||
-		calls != 0 || len(resources) != 0 || sessions.count() != 1 {
-		t.Fatalf(
-			"final=%+v calls=%d resources=%v sessions=%d",
-			final, calls, resources, sessions.count(),
-		)
+			if err := d.DispatchOnce(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			final := st.snapshot()
+			calls, resources := sender.snapshot()
+			if final.Status != types.TaskCreationReceiptStatusSent ||
+				final.ProviderMessageID != final.OperationID ||
+				calls != 0 || len(resources) != 0 || sessions.count() != 1 {
+				t.Fatalf(
+					"final=%+v calls=%d resources=%v sessions=%d",
+					final, calls, resources, sessions.count(),
+				)
+			}
+		})
 	}
 }
 
@@ -482,6 +489,18 @@ func TestRenderCreationUserReceipt_TerminalSemantics(t *testing.T) {
 	if _, _, err := renderCreationUserReceipt(corrupt); err == nil {
 		t.Fatal("status/phase mismatch must fail closed")
 	}
+
+	t.Run("agent auto authorization records no fictional card click", func(t *testing.T) {
+		r := newReceiptDispatcherFakeStore(types.PendingActionStatusExecuted).snapshot()
+		r.Provider = AgentAutoReceiptProvider
+		r.Target = r.OperationID
+		_, history, err := renderCreationUserReceipt(r)
+		if err != nil || !strings.HasPrefix(history, "[Agent执行]") ||
+			strings.Contains(history, "点击") ||
+			strings.Contains(history, "确认卡") {
+			t.Fatalf("history=%q err=%v", history, err)
+		}
+	})
 }
 
 func TestRenderCreationUserReceipt_DoesNotPersistUntrustedDetailInSession(t *testing.T) {

@@ -265,7 +265,7 @@ func (d *DefinitionEditReceiptDispatcher) dispatchReceipt(
 		}
 	}
 
-	if !validWebActionReceiptTarget(
+	if !validLocalActionReceiptTarget(
 		receipt.Provider, receipt.Target, receipt.OperationID,
 	) {
 		sendCtx, cancel := context.WithTimeout(
@@ -474,6 +474,20 @@ func renderDefinitionEditUserReceipt(
 		return "", "", definitionEditReceiptRenderError(
 			"operation is not terminal", nil,
 		)
+	}
+	if validAgentAutoReceiptTarget(
+		receipt.Provider, receipt.Target, receipt.OperationID,
+	) {
+		switch receipt.OperationStatus {
+		case types.TaskDefinitionEditOperationStatusCompleted:
+			history = "[Agent执行] 用户已在当前消息中明确要求，任务定义编辑已完成。"
+		case types.TaskDefinitionEditOperationStatusBlocked:
+			history = "[Agent执行] 用户已在当前消息中明确要求，但任务定义编辑已安全停止。"
+		case types.TaskDefinitionEditOperationStatusSuperseded:
+			history = "[Agent执行] 用户已在当前消息中明确要求，但任务定义已更新，旧编辑方案未执行。"
+		case types.TaskDefinitionEditOperationStatusExpired:
+			history = "[Agent执行] 用户已在当前消息中明确要求，但任务编辑操作已过期，变更未执行。"
+		}
 	}
 	return display, history, nil
 }

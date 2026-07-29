@@ -7,12 +7,17 @@
 > action.Value 为 map[string]interface{}，返回 *callback.CardActionTriggerResponse 可原地更新卡片）；
 > DeepSeek V4 默认思维链，结构化输出必须 thinking:{type:"disabled"}（llm.Request.DisableThinking 已存在）。
 
-## 0. 产品行为（Boss 定的交互基调：AI 出预填、人点执行）
+## 0. 产品行为（当前基线：自然语言授权、Agent 直接执行）
 
 飞书对话（仅 owner）→ agent loop（v4-pro FC）：
 - **读工具**（list_sources / list_schedules / push_now）：直接执行，结果回给模型继续多轮。
-- **写工具**（add_source / remove_source / create_schedule / remove_schedule）：**不执行**，
-  生成「确认卡」（展示工具名+参数摘要+确认/取消按钮）；用户点确认 → 卡片回调 → 真正执行 → 原地更新卡片为结果。
+- **所有 owner 写工具直接执行，不生成确认卡**。用户当前消息表达了清晰意图和目标即构成授权；
+  真歧义才用自然语言追问，禁止要求用户提供内部 ID。
+- 用户一次点名多个信源或任务时，Agent 先用列表工具分别解析名称/描述，再合并为一次
+  `remove_source` / `remove_schedule` 批量调用；不得只处理第一个或逐个确认。
+- `create_schedule` / `edit_task_definition` 仍先冻结 durable operation，但由 Agent
+  立即以 server-owned receipt 自动授权并推进同一个 saga；去掉的是交互确认，不是
+  durable owner、幂等、补偿、恢复或审计。
 - 与订阅/推送无关的闲聊：模型直接文字回答（不调工具），行为与现 chat_reply 一致。
 - maxTurns（config agent.max_turns，默认 20）内未收敛 → 回复兜底文案。
 - 会话：同一 owner 30 分钟内的消息共享一个 agent 会话（多轮上下文），超时新开。
@@ -32,7 +37,7 @@ CREATE TABLE agent_sessions (
 );
 CREATE INDEX idx_agent_sessions_user_status ON agent_sessions (user_id, status, updated_at DESC);
 
--- 待确认动作：确认卡按钮 value 只带 id，参数服务端存取（防客户端篡改参数）
+-- 历史待确认动作兼容表：仅收敛升级前已经发出的卡片，新请求不得写入
 CREATE TABLE pending_actions (
     id          TEXT        PRIMARY KEY,               -- uuid
     user_id     BIGINT      NOT NULL REFERENCES users (id),
@@ -307,8 +312,9 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 func (l *Loop) CancelAction(ctx context.Context, userID int64, actionID string) (string, error)
 ```
 Loop 行为细则：
-- system prompt 常量（中文）：声明角色=见微 Vane 助理、只在需要时调工具、写操作会出确认卡由用户确认、
-  无关问题直接回答。外部内容注入防护措辞对齐 scorer 的写法。
+- system prompt 常量（中文）：声明角色=见微 Vane 助理、只在需要时调工具、owner 写操作在
+  意图明确时直接执行、真歧义才自然追问，禁止要求内部 ID；无关问题直接回答。外部内容
+  注入防护措辞对齐 scorer 的写法。
   **§7.1 增补（2026-07-18 PR-4）**：`Deps.SystemPrompt` 可覆盖该常量（零值回落，飞书轨零行为变化）；
   [用户画像] 段只跟随默认 prompt 渲染（自定义 prompt 的 A2A 轨不渲染——画像是 A2A 非目标）。
 - 会话消息即 []llm.ChatMessage 的 JSON；system 消息**不入库**，每次调用时动态前置。
@@ -316,11 +322,10 @@ Loop 行为细则：
   共享 MaxTokens 并导致复杂 FC 空输出；工具选择在关闭后无退化），MaxTokens 2048，
   Temperature nil（默认）。
 - 模型返回未注册工具名：以 role=tool 回错误文本"工具 X 不存在"，继续循环（模型自纠）。
-- 一轮多个 tool_calls：顺序处理；读工具执行并回结果；遇到**首个**写工具：建 pending_action
-  （24h 过期，summary=tool.Summarize(args)），该 tool_call 的 role=tool 结果写
-  "已生成确认卡，等待用户确认"，**其后未处理的 tool_calls 也各回一条 role=tool
-  "本轮已挂起，等待用户确认后再操作"**（协议要求每个 tool_call 必须有对应 tool 消息），
-  然后再调一次模型拿收尾文案（不带 tools，防再触发），Outcome.Reply=收尾文案、Confirm 非 nil，结束。
+- 一轮多个 tool_calls：顺序处理；读工具直接执行；普通 owner 写工具直接进入各自幂等
+  执行入口。`create_schedule` / `edit_task_definition` 由专用 controller 冻结 exact command，
+  再以 server-owned receipt 自动推进同一 durable saga。旧 pending action 分支只兼容升级前
+  已发卡片的 callback，不得被新请求触发。
 - `web_search`、`read_page`、动态 TikHub 端点、`read_endpoint_result` 和含外部标题的
   `list_sources` 把外部结果送入模型后，本条用户消息进入 **untrusted-result 边界**：
   后续模型请求不再附加动态画像，且不声明网络、内部数据或写工具；只有本轮动态端点确实
@@ -360,8 +365,7 @@ Loop 行为细则：
   在加载时迁移清洗。历史判定不依赖当前工具是否装配或仍在目录中；同时只有出现真实
   `role=tool` 外部回执才压平，单纯生成 add_source pending 确认卡不误删。清洗完成后，
   下一条明确用户消息才恢复正常工具面。
-- 下一条用户消息若以强肯定命令明确要求按当前消息**直接生成任务确认卡**（如「确认创建，
-  直接生成确认卡」），且没有要求先搜索、查询、检查或核对，则本消息进入
+- 下一条用户消息若明确要求创建任务，且没有要求先搜索、查询、检查或核对，则本消息进入
   `direct-task-creation` 缩面：从数据访问层跳过画像，模型请求只声明 `create_schedule`，
   请求消息只保留当前 user turn（原有已清洗历史在本轮结束后再合并持久化），
   且声明与执行两层都要求该注册工具的真实 effect 为 mutating；同名只读工具不得暴露或执行。
@@ -376,15 +380,15 @@ Loop 行为细则：
   plan 与每种 spec 的字段名逐字匹配，大小写别名、转义键、重复键、未知字段和显式
   `null` 均拒绝；URL/域名还须在 pending 前拒绝十进制、八进制、十六进制及缩写 IPv4。
   运行时对任何幻觉的其他已注册工具调用也返回固定本地拒绝，不执行、不 taint。
-  用户明确说「不要再搜索／直接出确认卡」
+  用户明确说「不要再搜索／直接创建」
   时优先按此缩面；明确否定创建或要求先核对时不得进入。该模式只减少读取能力，不增加权限：
-  `create_schedule` 仍只落 durable proposal，任务仍须用户点击确认卡才执行。任何无工具自由文本
+  `create_schedule` 先落 durable proposal，再由 server-owned receipt 自动推进。任何无工具自由文本
   都会被丢弃并回到 clean baseline 自纠一次（不尝试用词法区分“追问”与“口头承诺”），连续两次
   没有真实 proposal 则返回固定的「任务尚未创建」文案；带 tool_calls 的 assistant content 也
   强制清空，避免参数校验失败时把同批的「卡已生成」承诺留进历史。整轮无论是否成功，
   会话只持久化当前 user + 确定性回复，不保留动态校验 tool result（工具审计仍走独立账本），
-  避免通用 fail-closed 清洗把本地拒绝误记成外部查询。此规则避免外部发现完成后的确认消息
-  又被 `list_sources` 带回 untrusted-result 边界，形成「确认→再读→隔离→口头承诺」循环。
+  避免通用 fail-closed 清洗把本地拒绝误记成外部查询。此规则避免外部发现完成后的创建消息
+  又被 `list_sources` 带回 untrusted-result 边界，形成「创建→再读→隔离→口头承诺」循环。
   direct 请求 schema 只暴露且强制 `source_specs`；每个 assistant 响应必须恰有一个
   `create_schedule` 调用，多调用整批零执行。direct 模式独立限制为
   `min(agent.max_turns, 4)`；create_schedule 参数校验（含本地精确字段门）最多失败两次，
@@ -402,11 +406,11 @@ A2A 只读面按 `AuthorizationA2AReadOnly` 过滤，**不**用「无确认」�
 | 工具 | Confirmation | 关键 Effects | 底层调用 | 说明 |
 |---|---|---|---|---|
 | list_sources | none | internal_read | store.ListSubscribedSourcesByUser | 返回内部目录中的 id/类型/标题/状态供 Agent 按用户描述定位；A2A 可读。目录字段在 system prompt 中始终按数据处理，不触发“外部网页已读”隔离，否则同轮无法完成描述→定位→退订 |
-| add_source | **required** | state_write（确认后 probe 可 taint） | sourcespec.Build → store.UpsertSource + AddSubscription | 参数 schema 同 spike：{type(enum rss/exa/tikhub_xhs), url, query, keyword, title?, category?} |
+| add_source | **none** | state_write + direct_owner_write（probe 可 taint） | sourcespec.Build → store.UpsertSource + AddSubscription | 意图与参数明确即试跑并直接执行，不发确认卡 |
 | remove_source | **none** | state_write + direct_owner_write | store.RemoveSubscriptions（单条 tenant-scoped DELETE，原子且幂等） | {source_ids:[integer]}（1–20 个，去重保序；意图与目标明确即直接执行，含糊则对话追问，不发确认卡；旧单数 {source_id} 仅为兼容存量 pending_actions 保留解析，schema 不再声明） |
 | list_schedules | none | internal_read | store.ListSchedulesByUser | 中文列表文本；A2A 可读 |
-| create_schedule | **required** | durable_proposal + state_write | CreationCoordinator.Propose → 人工确认 → creation saga | `{spec,intent,approved_fetch_plan:{existing_source_ids?,source_specs?},nl_description?,strictness?}`；`source_specs` 是 `vane.source-specs/v1` 原始规格，模型面不暴露 durable `sources/config/vane://`；cron/every 二选一且 every≥3600 |
-| remove_schedule | **none** | state_write + direct_owner_write | scheduler.DeletePush（durable schedule command） | `{schedule_id:string}` 为内部定位参数；用户只需描述任务内容、时间或主题，Agent 先 list_schedules，唯一匹配直接删除，多候选才按名称追问，不要求用户提供 ID |
+| create_schedule | **none** | durable_proposal + state_write + direct_owner_write | CreationCoordinator.Propose → Agent auto-authorize → creation saga | `{spec,intent,approved_fetch_plan:{existing_source_ids?,source_specs?},nl_description?,strictness?}`；`source_specs` 是 `vane.source-specs/v1` 原始规格，模型面不暴露 durable `sources/config/vane://`；cron/every 二选一且 every≥3600 |
+| remove_schedule | **none** | state_write + direct_owner_write | scheduler.DeletePushIdempotent（durable schedule command） | `{schedule_ids:[string]}`（1–20，去重保序）；用户可一次说多个名称/内容/时间/主题，Agent 分别解析后一次调用；旧 `{schedule_id}` 只兼容存量动作 |
 | push_now | none | delivery | PushTrigger 接口（api push/now 同款触发） | 返回 run_id 文本；有副作用但现网免确认，不得因 delivery 误标 required |
 | web_search | none | network_read + billable + trust_taint | fetcher.ExaFetcher.Search（Exa /search，按次计费） | {query, num_results?(默认5/上限20), include_domains?}；一次性语义搜索，不建信源、不写内容库，结果只回当前对话（2026-07-20 增，见修订记录） |
 | read_page | none | network_read + billable + trust_taint | fetcher.ExaContentsFetcher.ReadPage（Exa /contents，maxAgeHours:0 活抓，按次计费） | {url}；一次性读取指定页面正文，不建信源、不写内容库（2026-07-20 增，见修订记录） |
@@ -437,7 +441,8 @@ Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的
 
 - Manager 增加字段 `agent *agent.Loop`（NewManager 增参或 SetAgent 二选一，实现者定，main.go 装配）。
 - handler.handle：owner 校验后，原 chat_reply 调用替换为 `agent.HandleMessage`；
-  Reply 文本用现有 BuildReplyCard 回复；Outcome.Confirm 非 nil 时**再发一张**确认卡（新消息，非回复）。
+  Reply 文本用现有 BuildReplyCard 回复。当前生产工具不得产生 `Outcome.Confirm`；
+  `Confirm` 分支只用于部署前已发行卡片的兼容收敛。
 - `BuildConfirmCard(summary, actionID string) string`：JSON 2.0 卡片，正文 markdown 展示 summary，
   两个按钮：确认（callback value {"vane_action":"confirm","action_id":...}，type=primary）、
   取消（value {"vane_action":"cancel","action_id":...}）。schema 细节以飞书 JSON 2.0 卡片文档/现有 card.go 为准。
@@ -642,3 +647,28 @@ tenant、user 和完整 source id 集合谓词的 DELETE，整批原子、重复
 B3 及更早已经发出的 `remove_source` 卡片继续按冻结的
 `vane.remove-source/postgres/v1` 字节执行或重放；B4 不改写旧 action、authority、
 adapter、operation identity 或终态事实。
+
+### 15.2 7.10-B5 全写操作无确认 + 多名称批量删除
+
+Boss 于 2026-07-28 明确取消 Agent 全阶段确认机制。`BuildTools` 中所有生产工具的
+`Confirmation` 必须为 `none`；任何新增生产工具若重新引入
+`ConfirmationRequired`，policy golden 必须失败。`pending_actions`、确认卡渲染和
+callback API 仅用于兼容已发出的历史卡片，不得成为新请求入口。
+
+自然语言是用户入口，内部 ID 只是模型调用列表工具后的定位结果。一个请求点名多个信源
+或任务时，Agent 必须完整解析全部名称/描述并发起一个批量删除调用：
+
+- `remove_source.source_ids`：1–20，去重保序，单条 tenant/user scoped DELETE 原子执行；
+- `remove_schedule.schedule_ids`：1–20，去重保序；每个目标使用由
+  `(user_id,schedule_id)` 派生的稳定 idempotency key 调用 durable schedule command，
+  中途失败后的整批重试会从已完成目标安全续进；
+- 某个描述有多个合理候选时只追问该歧义，展示人类可读名称，不要求 ID；无歧义目标不再
+  额外确认。
+
+`add_source`、`enable_source`、`update_profile` 作为 owner-only DB 写直接执行。
+`create_schedule` 与 `edit_task_definition` 不绕过既有控制面：先 `Propose` 冻结 exact
+command，再用 operation ID 构造 server-owned `agent_auto/v1` receipt 立即
+`Confirm`，由同一个 durable coordinator 继续执行/恢复。终态历史写成
+`[Agent执行]`，不得伪造“用户点击确认卡”。
+外部内容 taint 后禁止同轮写、
+A2A 只读白名单、tenant/user 归属校验、预算和幂等边界全部保持不变。

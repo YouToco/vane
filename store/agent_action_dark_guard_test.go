@@ -630,7 +630,7 @@ func TestAgentActionFrozenEnableSourceMatchesRegisteredToolGolden(
 	if frozenSpec.Name != registered.name ||
 		frozenSpec.Description != registered.description ||
 		!agentActionJSONEqual(frozenSpec.Parameters, registered.schema) ||
-		!registered.ownerStateWriteConfirmation {
+		!registered.directOwnerNoConfirmation {
 		t.Fatalf(
 			"registered/frozen contract mismatch: registered=%+v frozen=%+v",
 			registered, frozenSpec,
@@ -685,10 +685,10 @@ func agentActionMutateEnableSourceSchema(
 }
 
 type registeredEnableSourceContract struct {
-	name                        string
-	description                 string
-	schema                      map[string]any
-	ownerStateWriteConfirmation bool
+	name                      string
+	description               string
+	schema                    map[string]any
+	directOwnerNoConfirmation bool
 }
 
 func agentActionRegisteredEnableSourceContract(
@@ -798,12 +798,13 @@ func agentActionRegisteredEnableSourceContract(
 		confirmation, confirmationOK := policy.Args[1].(*ast.Ident)
 		budget, budgetOK := policy.Args[2].(*ast.Ident)
 		if effectOK && effectName.Name == "Effects" &&
-			len(effects.Args) == 1 &&
+			len(effects.Args) == 2 &&
 			agentActionIdentName(effects.Args[0]) == "EffectStateWrite" &&
+			agentActionIdentName(effects.Args[1]) == "EffectDirectOwnerWrite" &&
 			confirmationOK &&
-			confirmation.Name == "ConfirmationRequired" &&
+			confirmation.Name == "ConfirmationNone" &&
 			budgetOK && budget.Name == "BudgetNone" {
-			contract.ownerStateWriteConfirmation = true
+			contract.directOwnerNoConfirmation = true
 		}
 		return true
 	})

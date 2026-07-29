@@ -514,8 +514,12 @@ func testToolSpecs(tools ...Tool) []ToolSpec {
 			// register a same-named impostor with mutating=false to prove
 			// direct-mode refuses non-durable create_schedule.
 			if !isFake || fake.mutating {
-				effects = Effects(EffectDurableProposal, EffectStateWrite)
-				confirmation = ConfirmationRequired
+				effects = Effects(
+					EffectDurableProposal,
+					EffectStateWrite,
+					EffectDirectOwnerWrite,
+				)
+				confirmation = ConfirmationNone
 			}
 		}
 		if marker, ok := tool.(interface{ untrustedResult() bool }); ok &&
@@ -1581,8 +1585,8 @@ func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *t
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm {
-		t.Fatalf("明确确认必须落 durable proposal 并返回确认卡: %+v", out)
+	if out.Confirm != nil || out.Reply == "" {
+		t.Fatalf("明确创建必须自动推进 durable operation 且不出确认卡: %+v", out)
 	}
 	if len(listSources.calls) != 0 || len(listSchedules.calls) != 0 {
 		t.Fatalf("用户明确不要再次搜索时，任何读工具都不得执行: sources=%d schedules=%d",
@@ -1593,6 +1597,11 @@ func TestHandleMessage_ExplicitTaskConfirmationSkipsReadsAndCreatesProposal(t *t
 	}
 	if len(creation.proposeCalls) != 1 {
 		t.Fatalf("create_schedule proposal 调用漂移: %+v", creation.proposeCalls)
+	}
+	if len(creation.confirmCalls) != 1 ||
+		creation.confirmCalls[0].receipt !=
+			task.AgentAutoReceiptTarget(creation.proposeCalls[0].ActionID) {
+		t.Fatalf("durable operation 未被自动授权: %+v", creation.confirmCalls)
 	}
 	var canonical struct {
 		ApprovedFetchPlan struct {
@@ -1705,7 +1714,8 @@ func TestHandleMessage_ExplicitTaskConfirmationPreservesObservationPolicy(t *tes
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm == nil || len(creation.proposeCalls) != 1 {
+	if out.Confirm != nil || len(creation.proposeCalls) != 1 ||
+		len(creation.confirmCalls) != 1 {
 		t.Fatalf("Kimi 生产同形参数必须进入 durable Propose: out=%+v calls=%+v",
 			out, creation.proposeCalls)
 	}
@@ -1812,9 +1822,9 @@ func TestHandleMessage_SmokeStyleFirstEmitCardEntersDirectMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleMessage: %v", err)
 	}
-	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
+	if out.Confirm != nil || out.Reply == "" ||
 		len(creation.proposeCalls) != 1 || len(chat.requests) != 2 {
-		t.Fatalf("先出确认卡话术应进 direct 并自纠出卡: out=%+v requests=%d proposals=%d",
+		t.Fatalf("旧出卡话术应兼容为 direct 自动执行: out=%+v requests=%d proposals=%d",
 			out, len(chat.requests), len(creation.proposeCalls))
 	}
 }
@@ -1848,8 +1858,9 @@ func TestHandleMessage_ExplicitTaskConfirmationRejectsOralCardPromise(t *testing
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm == nil || len(creation.proposeCalls) != 1 {
-		t.Fatalf("口头承诺必须被丢弃并自纠为 durable proposal: out=%+v calls=%+v",
+	if out.Confirm != nil || len(creation.proposeCalls) != 1 ||
+		len(creation.confirmCalls) != 1 {
+		t.Fatalf("口头承诺必须被丢弃并自纠为 durable execution: out=%+v calls=%+v",
 			out, creation.proposeCalls)
 	}
 	if len(chat.requests) != 2 {
@@ -1934,9 +1945,9 @@ func TestHandleMessage_ExplicitTaskConfirmationValidationRetryKeepsHistoryCanoni
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
+	if out.Confirm != nil || out.Reply == "" ||
 		len(creation.proposeCalls) != 2 {
-		t.Fatalf("参数校验后合法重试应产生确认卡: out=%+v calls=%+v", out, creation.proposeCalls)
+		t.Fatalf("参数校验后合法重试应自动执行: out=%+v calls=%+v", out, creation.proposeCalls)
 	}
 	secondRaw, err := json.Marshal(chat.requests[1].Messages)
 	if err != nil {
@@ -2104,9 +2115,9 @@ func TestHandleMessage_ExplicitTaskConfirmationAllowsSuccessOnFourthTurn(t *test
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
+	if out.Confirm != nil || out.Reply == "" ||
 		len(chat.requests) != 4 || len(creation.proposeCalls) != 1 ||
-		len(hiddenRead.calls) != 0 {
+		len(creation.confirmCalls) != 1 || len(hiddenRead.calls) != 0 {
 		t.Fatalf("第四轮合法 proposal 应被接受: out=%+v requests=%d proposals=%d reads=%d",
 			out, len(chat.requests), len(creation.proposeCalls), len(hiddenRead.calls))
 	}
@@ -2546,11 +2557,8 @@ func TestHandleMessage_CreateScheduleUsesDurableV1Proposal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm {
-		t.Fatalf("v1 proposal 应直接得到固定确认出口: %+v", out)
-	}
-	if got, want := out.Confirm.Summary, "待确认操作：create_schedule\n"+durableSummary; got != want {
-		t.Fatalf("确认卡必须逐字采用 durable summary:\n got %q\nwant %q", got, want)
+	if out.Confirm != nil || out.Reply != "任务已创建。" {
+		t.Fatalf("v1 proposal 应自动授权并返回执行结果: %+v", out)
 	}
 	if len(chat.requests) != 1 {
 		t.Fatalf("proposal 后不得再调收尾 LLM: requests=%d", len(chat.requests))
@@ -2559,9 +2567,14 @@ func TestHandleMessage_CreateScheduleUsesDurableV1Proposal(t *testing.T) {
 		t.Fatalf("Propose 调用次数=%d, want 1", len(creation.proposeCalls))
 	}
 	proposal := creation.proposeCalls[0]
-	if proposal.ActionID != out.Confirm.ActionID || proposal.UserID != 7 ||
+	if proposal.ActionID == "" || proposal.UserID != 7 ||
 		proposal.SessionID == nil || string(proposal.RawArgs) != args {
 		t.Fatalf("durable proposal scope/args 漂移: %+v", proposal)
+	}
+	if len(creation.confirmCalls) != 1 ||
+		creation.confirmCalls[0].actionID != proposal.ActionID ||
+		creation.confirmCalls[0].receipt != task.AgentAutoReceiptTarget(proposal.ActionID) {
+		t.Fatalf("durable proposal 未被自动授权: %+v", creation.confirmCalls)
 	}
 	if until := time.Until(proposal.ExpiresAt); until < 23*time.Hour || until > 25*time.Hour {
 		t.Fatalf("proposal 应约 24h 过期: %v", until)
@@ -2571,21 +2584,6 @@ func TestHandleMessage_CreateScheduleUsesDurableV1Proposal(t *testing.T) {
 			fs.createCalls, fs.claimCalls, len(fs.actions), len(legacyTool.calls))
 	}
 
-	// 即使同 ID 下存在一张可领取的 v0 卡，也必须由 v1 result 截住，不能误回退。
-	fs.actions[out.Confirm.ActionID] = newPendingAction(
-		out.Confirm.ActionID, 7, proposal.SessionID, "create_schedule", "legacy",
-	)
-	result, err := l.ExecuteAction(t.Context(), 7, out.Confirm.ActionID)
-	if err != nil || result != creation.confirmResult.Message {
-		t.Fatalf("v1 Confirm() = %q, %v", result, err)
-	}
-	if len(creation.confirmCalls) != 1 || fs.claimCalls != 0 || len(legacyTool.calls) != 0 {
-		t.Fatalf("v1 confirm 不得 Claim/Execute: confirms=%+v claim=%d execute=%d",
-			creation.confirmCalls, fs.claimCalls, len(legacyTool.calls))
-	}
-	if len(chat.requests) != 1 {
-		t.Fatalf("卡片确认不得产生 LLM 调用: requests=%d", len(chat.requests))
-	}
 }
 
 func TestExecuteAction_ReplayedV1RepairsConversationReceiptAndRecordsAudit(t *testing.T) {
@@ -2899,6 +2897,7 @@ func TestTaskCreationControllerMissingBlocksNewProposalButKeepsLegacyNonCreation
 // A0 legacy 夹具在 A5 后只用于证明历史 create_schedule 卡被原子消费但绝不
 // 进入 active-first 创建链；用户必须重新描述需求生成完整 v1 定义。
 func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testing.T) {
+	t.Skip("new Agent requests no longer issue confirmation cards; legacy callback compatibility is covered separately")
 	const args = `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
 		`"nl_description":"每天看两个官方源","strictness":"strict"}`
 
@@ -3049,6 +3048,7 @@ func TestHandleMessage_CreateScheduleConfirmAndExecute_CurrentBehavior(t *testin
 }
 
 func TestHandleMessage_CreateScheduleConfirmFailureStages_CurrentBehavior(t *testing.T) {
+	t.Skip("new Agent requests no longer issue confirmation cards; legacy callback compatibility is covered separately")
 	const args = `{"spec":{"cron":"0 8 * * *"},"nl_description":"每天看官方源"}`
 	toolCall := llm.ToolCall{ID: "create-failure", Name: "create_schedule", Arguments: args}
 

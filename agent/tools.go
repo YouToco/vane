@@ -9,6 +9,7 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,6 +50,15 @@ type scheduleDeleter interface {
 	DeletePush(ctx context.Context, schedID string, userID int64) error
 }
 
+type idempotentScheduleDeleter interface {
+	DeletePushIdempotent(
+		ctx context.Context,
+		schedID string,
+		userID int64,
+		idempotencyKey string,
+	) error
+}
+
 // profileStore 是画像两工具依赖的窄接口（M5 契约 §12.3，*store.Store 已实现），
 // 收窄后 Execute 分支可用内存假实现覆盖，不依赖数据库。
 type profileStore interface {
@@ -87,16 +97,16 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, tasks taskCreator, 
 	tools := []ToolSpec{
 		newToolSpec(&listSourcesTool{st: st}, a2aReadPolicy(Effects(EffectInternalRead))),
 		newToolSpec(&addSourceTool{st: st, prober: prober}, ownerPolicy(
-			Effects(EffectNetworkRead, EffectBillable, EffectStateWrite, EffectTrustTaint),
-			ConfirmationRequired, BudgetDownstreamManaged)),
+			Effects(EffectNetworkRead, EffectBillable, EffectStateWrite, EffectTrustTaint, EffectDirectOwnerWrite),
+			ConfirmationNone, BudgetDownstreamManaged)),
 		newToolSpec(&removeSourceTool{st: st}, ownerPolicy(
 			Effects(EffectStateWrite, EffectDirectOwnerWrite),
 			ConfirmationNone, BudgetNone)),
 		newToolSpec(&enableSourceTool{st: st}, ownerPolicy(
-			Effects(EffectStateWrite), ConfirmationRequired, BudgetNone)),
+			Effects(EffectStateWrite, EffectDirectOwnerWrite), ConfirmationNone, BudgetNone)),
 		newToolSpec(&listSchedulesTool{st: st}, a2aReadPolicy(Effects(EffectInternalRead))),
 		newToolSpec(&createScheduleTool{tasks: tasks}, ownerPolicy(
-			Effects(EffectDurableProposal, EffectStateWrite), ConfirmationRequired, BudgetNone)),
+			Effects(EffectDurableProposal, EffectStateWrite, EffectDirectOwnerWrite), ConfirmationNone, BudgetNone)),
 		newToolSpec(&removeScheduleTool{sched: sched}, ownerPolicy(
 			Effects(EffectStateWrite, EffectDirectOwnerWrite),
 			ConfirmationNone, BudgetNone)),
@@ -105,14 +115,14 @@ func BuildTools(st *store.Store, sched *scheduler.Scheduler, tasks taskCreator, 
 		newToolSpec(&viewProfileTool{st: st}, ownerPolicy(
 			Effects(EffectInternalRead), ConfirmationNone, BudgetNone)),
 		newToolSpec(&updateProfileTool{st: st}, ownerPolicy(
-			Effects(EffectStateWrite), ConfirmationRequired, BudgetNone)),
+			Effects(EffectStateWrite, EffectDirectOwnerWrite), ConfirmationNone, BudgetNone)),
 		newToolSpec(&viewTaskPlaybookTool{st: st}, ownerPolicy(
 			Effects(EffectInternalRead), ConfirmationNone, BudgetNone)),
 	}
 	if len(definitionEdits) == 1 && definitionEdits[0] != nil {
 		tools = append(tools, newToolSpec(&editTaskDefinitionTool{}, ownerPolicy(
-			Effects(EffectDurableProposal, EffectStateWrite),
-			ConfirmationRequired, BudgetNone)))
+			Effects(EffectDurableProposal, EffectStateWrite, EffectDirectOwnerWrite),
+			ConfirmationNone, BudgetNone)))
 	}
 	if endpoints != nil {
 		tools = append(tools, endpoints.SearchTool(), endpoints.ReadResultTool())
@@ -161,7 +171,7 @@ const editTaskDefinitionSchema = `{
     },
     "observation_policy": {
       "type": "object",
-      "description": "可选：完整替换新鲜度/事件判定策略；修改后从确认时刻起生效，不补推更早内容",
+      "description": "可选：完整替换新鲜度/事件判定策略；修改成功时起生效，不补推更早内容",
       "properties": {
         "schema": {"type":"string","enum":["vane.observation-policy/v1"]},
         "mode": {"type":"string","enum":["content","event"]},
@@ -211,7 +221,7 @@ type editTaskDefinitionTool struct{}
 
 func (*editTaskDefinitionTool) Name() string { return "edit_task_definition" }
 func (*editTaskDefinitionTool) Description() string {
-	return "编辑已有定时任务的完整已批准定义。可一次修改触发频率、完整监控意图/手册、列表描述、推送门槛和新鲜度/事件判定策略；未提供的字段保持不变。系统会冻结当前 definition head 与目标定义，先发原确认卡，确认后由唯一可恢复协调器执行。"
+	return "直接编辑已有定时任务的完整已批准定义，不发确认卡。可一次修改触发频率、完整监控意图/手册、列表描述、推送门槛和新鲜度/事件判定策略；未提供的字段保持不变。系统会冻结当前 definition head 与目标定义，再立即交给唯一可恢复协调器执行。"
 }
 func (*editTaskDefinitionTool) Parameters() json.RawMessage {
 	return json.RawMessage(editTaskDefinitionSchema)
@@ -374,10 +384,10 @@ func (t *addSourceTool) Name() string { return "add_source" }
 func (t *addSourceTool) untrustedResult() bool { return true }
 func (t *addSourceTool) Description() string {
 	return "添加一个信源并建立订阅。指定 platform（web/xhs/x/weibo/wechat_mp）和 capability（feed/search/user_posts/contents/hot_list/topic_feed/faved_notes）。" +
-		"绑定类能力与 URL 类 web 能力（feed/contents）在确认后会先真实试跑一次，通过才落库。" +
+		"绑定类能力与 URL 类 web 能力（feed/contents）会先真实试跑一次，通过才落库；意图与参数明确时直接执行，不发确认卡。" +
 		"用户给了一个网址但不确定是什么来源时：先按 web/feed 尝试（免费、增量语义最好）；" +
 		"若试跑被拒，拒绝话术会给出解析结果与替代建议（页面声明的真实 feed 地址、或改用 " +
-		"web/contents 监控页面变化、或改用 web/search 关键词订阅）——把建议转述给用户确认后按建议重新添加，" +
+		"web/contents 监控页面变化、或改用 web/search 关键词订阅）——把建议转述给用户明确选择后按建议重新添加，" +
 		"不要不经用户同意就换成别的能力或地址。" +
 		unavailableCapabilitiesNote()
 }
@@ -688,8 +698,8 @@ func (t *removeSourceTool) Execute(ctx context.Context, userID int64, args json.
 		return "", err
 	}
 	return fmt.Sprintf(
-		"已取消订阅信源（id=%s），信源与历史内容保留。",
-		joinSourceIDs(ids),
+		"已取消订阅 %d 个信源，信源与历史内容保留。",
+		len(ids),
 	), nil
 }
 
@@ -839,10 +849,10 @@ const createScheduleSchema = `{
         "tz": {"type": "string", "description": "可选：IANA 时区名，缺省 Asia/Shanghai"}
       }
     },
-    "intent": {"type": "string", "minLength": 1, "description": "用户已经确认的持续监控目标与筛选范围。必须完整、自包含；它会成为任务手册，确认后不得由系统自行扩大主题或范围。"},
+    "intent": {"type": "string", "minLength": 1, "description": "用户已经明确表达的持续监控目标与筛选范围。必须完整、自包含；它会成为任务手册，冻结后不得由系统自行扩大主题或范围。"},
     "approved_fetch_plan": {
       "type": "object",
-      "description": "待用户确认的完整长期抓取计划。可以用 existing_source_ids 引用 list_sources 返回的本人现有信源，也可以用 source_specs 提交新的原始信源规格；两者合计必须为 1-64 个。系统会在出确认卡前把规格确定性物化并冻结，模型绝不能编写 config、selectors 或 vane:// URL。",
+      "description": "根据用户明确需求形成的完整长期抓取计划。可以用 existing_source_ids 引用 list_sources 返回的本人现有信源，也可以用 source_specs 提交新的原始信源规格；两者合计必须为 1-64 个。系统会在执行前把规格确定性物化并冻结，模型绝不能编写 config、selectors 或 vane:// URL。",
       "properties": {
         "existing_source_ids": {
           "type": "array",
@@ -879,7 +889,7 @@ const createScheduleSchema = `{
                     "type": "array",
                     "uniqueItems": true,
                     "items": {"type": "string"},
-                    "description": "仅 web_search 可选：裸域名白名单，如 [\"openai.com\",\"anthropic.com\"]；不能含协议、路径、端口、通配符或 IP。用户只点名机构并要求官方来源时，可基于该机构填写对应官方根域名；确认卡会展示并冻结精确域名，绝不能加入用户未点名的机构、媒体或社区。"
+                    "description": "仅 web_search 可选：裸域名白名单，如 [\"openai.com\",\"anthropic.com\"]；不能含协议、路径、端口、通配符或 IP。用户只点名机构并要求官方来源时，可基于该机构填写对应官方根域名；系统会冻结精确域名，绝不能加入用户未点名的机构、媒体或社区。"
                   },
                   "feed_url": {"type": "string", "description": "仅 web_feed 必填：已知 RSS/Atom 的 http/https 地址；不要把普通网页猜成 feed"},
                   "categories": {"type": "array", "items": {"type": "string"}, "description": "仅 web_feed 可选：RSS 分类过滤"},
@@ -904,10 +914,10 @@ const createScheduleSchema = `{
     },
     "observation_policy": {
       "type": "object",
-      "description": "可选：任务的新鲜度/事件判定策略。用户说“上新才推”“没有就不推”“只看今天/最近N天”时必须填写。模型只负责提取并交用户确认，运行时代码拥有最终放行权。",
+      "description": "可选：任务的新鲜度/事件判定策略。用户说“上新才推”“没有就不推”“只看今天/最近N天”时必须填写。模型从用户明确需求中提取；存在实质歧义时先自然追问，运行时代码拥有最终放行权。",
       "properties": {
         "schema": {"type":"string","enum":["vane.observation-policy/v1"]},
-        "mode": {"type":"string","enum":["content","event"],"description":"content=时间范围内的普通内容；event=只有确认的事件发生才推"},
+        "mode": {"type":"string","enum":["content","event"],"description":"content=时间范围内的普通内容；event=只有满足证据与资格条件的事件发生才推"},
         "window": {
           "type":"object",
           "properties":{
@@ -990,7 +1000,7 @@ type createScheduleTool struct {
 
 func (t *createScheduleTool) Name() string { return "create_schedule" }
 func (t *createScheduleTool) Description() string {
-	return "创建定时推送任务。必须同时提交用户批准的监控意图与长期抓取计划；已有信源用 list_sources 返回的 id 放进 existing_source_ids，新信源用版本化 source_specs 提交原始参数。系统会在确认卡前确定性生成并冻结内部信源，模型不得编写 config、selectors 或 vane:// URL。触发频率用 cron 或 every_seconds 二选一，频率不得高于每小时一次。"
+	return "直接创建定时推送任务，不发确认卡。必须同时提交用户明确表达的监控意图与完整长期抓取计划；已有信源用 list_sources 返回的 id 放进 existing_source_ids，新信源用版本化 source_specs 提交原始参数。系统会确定性生成并冻结内部信源，再立即推进可恢复的创建流程；模型不得编写 config、selectors 或 vane:// URL。触发频率用 cron 或 every_seconds 二选一，频率不得高于每小时一次。"
 }
 func (t *createScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(createScheduleSchema)
@@ -1298,10 +1308,18 @@ func (t *updateScheduleTool) Summarize(args json.RawMessage) string {
 const removeScheduleSchema = `{
   "type": "object",
   "properties": {
-    "schedule_id": {"type": "string", "description": "内部任务 id。用户不需要知道 id：根据用户记得的任务描述、时间、主题等先用 list_schedules 定位；唯一匹配就调用，多个合理候选才按人类可读名称追问。"}
+    "schedule_ids": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1,
+      "maxItems": 20,
+      "description": "内部任务 id 列表，一次最多 20 个。用户不需要知道 id：根据用户记得的任务描述、时间、主题等先用 list_schedules 定位；每个名称唯一匹配后合并到同一次调用，只有某个名称存在多个合理候选时才按人类可读名称追问。"
+    }
   },
-  "required": ["schedule_id"]
+  "required": ["schedule_ids"]
 }`
+
+const removeScheduleBatchMax = 20
 
 type removeScheduleTool struct {
 	sched scheduleDeleter
@@ -1309,7 +1327,7 @@ type removeScheduleTool struct {
 
 func (t *removeScheduleTool) Name() string { return "remove_schedule" }
 func (t *removeScheduleTool) Description() string {
-	return "直接删除定时推送任务，不再二次确认。用户可只描述记得的任务内容、时间或主题；先用 list_schedules 解析为内部 schedule_id，唯一匹配就执行，多个合理候选才用名称追问，绝不能要求用户查 ID。"
+	return "直接删除一个或多个定时推送任务，不再二次确认。用户可一次说出多个记得的任务名称、内容、时间或主题；先用 list_schedules 分别解析为内部 schedule_ids，唯一匹配就合并执行，只有某个描述存在多个合理候选时才用名称追问，绝不能要求用户查 ID。"
 }
 func (t *removeScheduleTool) Parameters() json.RawMessage {
 	return json.RawMessage(removeScheduleSchema)
@@ -1324,27 +1342,83 @@ func (t *removeScheduleTool) Parameters() json.RawMessage {
 // （抓来的正文、用户消息），提示注入完全可能让它去删一个别人的 id。
 // 守卫见 store/schedule_ownership_test.go。
 func (t *removeScheduleTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
-	var a struct {
-		ScheduleID string `json:"schedule_id"`
+	ids, errText, _ := removeScheduleIDs(args)
+	if errText != "" {
+		return errText, nil
 	}
-	if err := json.Unmarshal(args, &a); err != nil || strings.TrimSpace(a.ScheduleID) == "" {
-		return "schedule_id 必须是非空字符串", nil
+	for _, schedID := range ids {
+		var err error
+		if durable, ok := t.sched.(idempotentScheduleDeleter); ok {
+			err = durable.DeletePushIdempotent(
+				ctx, schedID, userID,
+				removeScheduleIdempotencyKey(userID, schedID),
+			)
+		} else {
+			// Narrow test doubles and pre-command adapters retain the historical
+			// interface; production *scheduler.Scheduler always takes the
+			// idempotent durable-command branch above.
+			err = t.sched.DeletePush(ctx, schedID, userID)
+		}
+		if err != nil {
+			return "", err
+		}
 	}
-	schedID := strings.TrimSpace(a.ScheduleID)
-	if err := t.sched.DeletePush(ctx, schedID, userID); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("已删除定时推送任务（id=%s）。", schedID), nil
+	return fmt.Sprintf("已删除 %d 个定时推送任务。", len(ids)), nil
+}
+
+func removeScheduleIdempotencyKey(userID int64, scheduleID string) string {
+	sum := sha256.Sum256([]byte(
+		strconv.FormatInt(userID, 10) + "\x00" + scheduleID,
+	))
+	return fmt.Sprintf("agent.remove_schedule.v1:%x", sum[:16])
 }
 
 func (t *removeScheduleTool) Summarize(args json.RawMessage) string {
-	var a struct {
-		ScheduleID string `json:"schedule_id"`
-	}
-	if err := json.Unmarshal(args, &a); err != nil {
+	ids, errText, malformed := removeScheduleIDs(args)
+	if malformed {
 		return summarizeFallback("删除定时推送任务", args)
 	}
-	return fmt.Sprintf("删除定时推送任务（id=%s）", strings.TrimSpace(a.ScheduleID))
+	if errText != "" {
+		return fmt.Sprintf("删除定时推送任务（参数无效：%s；不会执行）", errText)
+	}
+	return fmt.Sprintf("删除 %d 个定时推送任务（id=%s）",
+		len(ids), strings.Join(ids, "、"))
+}
+
+// removeScheduleIDs accepts the historical singular field only for old
+// pending-action replay. New model-visible calls always use schedule_ids.
+func removeScheduleIDs(args json.RawMessage) (ids []string, errText string, malformed bool) {
+	var a struct {
+		ScheduleID  string   `json:"schedule_id"`
+		ScheduleIDs []string `json:"schedule_ids"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, "schedule_ids 必须是非空字符串数组", true
+	}
+	in := a.ScheduleIDs
+	if len(in) == 0 && strings.TrimSpace(a.ScheduleID) != "" {
+		in = []string{a.ScheduleID}
+	}
+	if len(in) == 0 {
+		return nil, "schedule_ids 必须是非空字符串数组", false
+	}
+	if len(in) > removeScheduleBatchMax {
+		return nil, fmt.Sprintf("一次最多删除 %d 个定时任务", removeScheduleBatchMax), false
+	}
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			return nil, "schedule_ids 必须是非空字符串数组", false
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out, "", false
 }
 
 // ============================================================
@@ -1415,7 +1489,7 @@ func (t *viewProfileTool) Execute(ctx context.Context, userID int64, _ json.RawM
 func (t *viewProfileTool) Summarize(json.RawMessage) string { return "" }
 
 // ============================================================
-// update_profile：只用于画像首次采集（2.1），走 M4 标准确认卡。
+// update_profile：只用于画像首次采集（2.1），由 owner 明确表达后直接执行。
 // 062 来源级 authority 启用后，已有画像只能在 Web「画像依据」逐条纠正；
 // Agent 不提供未经设计的多 claim 修改工具。
 // ============================================================
