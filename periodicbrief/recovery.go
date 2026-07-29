@@ -440,6 +440,7 @@ func (r *RecoveryRunner) recoverOne(
 		}
 		candidate.InputDigest = loaded.Intent.InputDigest
 		candidate.RequestDigest, err = synthesisRequestDigestV1(
+			loaded.Intent,
 			candidate.InputDigest, candidate.ProfileDigest, policy)
 		if err != nil {
 			return err

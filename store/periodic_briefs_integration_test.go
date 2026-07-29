@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -237,6 +238,30 @@ func TestPeriodicReportRecoveryFreezesExactCanonicalInputs(t *testing.T) {
 	if report.Validate() != nil || report.ID <= 0 ||
 		report.Inputs[0].BriefID != brief.ID {
 		t.Fatalf("periodic report = %+v", report)
+	}
+	duplicateIntent, err := f.base.st.PreparePeriodicBriefIntentV1(
+		t.Context(), f.identity.TenantID, f.identity.UserID,
+		f.identity.TaskID, BriefReportCadenceWeekly,
+		periodStart.Add(-time.Minute), periodEnd.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicateIntent.InputDigest != intent.InputDigest {
+		t.Fatalf("duplicate input digest=%q want=%q",
+			duplicateIntent.InputDigest, intent.InputDigest)
+	}
+	if err := f.base.st.BindPeriodicBriefIntentRunV1(
+		t.Context(), f.identity.TenantID, f.identity.UserID,
+		duplicateIntent.ID, "periodic-run-duplicate-request"); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, claimErr := f.base.st.ClaimPeriodicSynthesisSpendV1(
+		t.Context(), f.identity.TenantID, f.identity.UserID,
+		duplicateIntent.ID, requestDigest, 0, 0, profileDigest,
+		duplicateIntent.InputDigest,
+	); claimed || !errors.Is(claimErr, types.ErrConflict) ||
+		types.CodeOf(claimErr) != types.CodeConflict {
+		t.Fatalf("duplicate request claimed=%t err=%v", claimed, claimErr)
 	}
 	replayed, err := f.base.st.RecoverPeriodicBriefReportV1(
 		t.Context(), f.identity.TenantID, f.identity.UserID,

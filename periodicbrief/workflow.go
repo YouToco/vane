@@ -183,6 +183,7 @@ func (a *Activities) SynthesizePeriodicBriefV1(
 		}
 	}
 	requestDigest, err := synthesisRequestDigestV1(
+		loaded.Intent,
 		loaded.Intent.InputDigest, profileDigest, policy)
 	if err != nil {
 		return types.PeriodicBriefReportV1{}, err
@@ -319,9 +320,21 @@ synthesisComplete:
 }
 
 func synthesisRequestDigestV1(
+	intent store.PeriodicBriefIntentV1,
 	inputDigest, profileDigest string,
 	policy store.PeriodicSynthesisPolicyV1,
 ) (string, error) {
+	taskID := strings.TrimSpace(intent.TaskID)
+	timezone := strings.TrimSpace(intent.Timezone)
+	cadence := strings.TrimSpace(string(intent.Cadence))
+	periodStart := intent.PeriodStart.Round(0).UTC().
+		Truncate(time.Microsecond)
+	periodEnd := intent.PeriodEnd.Round(0).UTC().
+		Truncate(time.Microsecond)
+	if taskID == "" || timezone == "" || cadence == "" ||
+		!periodStart.Before(periodEnd) {
+		return "", errors.New("periodic synthesis request scope is invalid")
+	}
 	renderer, model, policyDigest := "periodic-brief.quiet/v1", "none", ""
 	if policy.PolicyDigest != "" {
 		renderer, model, policyDigest =
@@ -329,6 +342,11 @@ func synthesisRequestDigestV1(
 	}
 	payload, err := json.Marshal(struct {
 		SchemaVersion string `json:"schema_version"`
+		TaskID        string `json:"task_id"`
+		Cadence       string `json:"cadence"`
+		Timezone      string `json:"timezone"`
+		PeriodStart   string `json:"period_start"`
+		PeriodEnd     string `json:"period_end"`
 		InputDigest   string `json:"input_digest"`
 		ProfileDigest string `json:"profile_digest"`
 		Renderer      string `json:"renderer"`
@@ -336,6 +354,11 @@ func synthesisRequestDigestV1(
 		PolicyDigest  string `json:"policy_digest,omitempty"`
 	}{
 		SchemaVersion: types.PeriodicBriefSchemaVersionV1,
+		TaskID:        taskID,
+		Cadence:       cadence,
+		Timezone:      timezone,
+		PeriodStart:   periodStart.Format(time.RFC3339Nano),
+		PeriodEnd:     periodEnd.Format(time.RFC3339Nano),
 		InputDigest:   inputDigest, ProfileDigest: profileDigest,
 		Renderer: renderer, Model: model, PolicyDigest: policyDigest,
 	})

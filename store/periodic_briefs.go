@@ -1092,6 +1092,13 @@ func (s *Store) ClaimPeriodicSynthesisSpendV1(
 		intentID, tenantID, userID, taskID, requestDigest,
 		profileEpoch, profileVersion, profileDigest, inputDigest)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return PeriodicSynthesisReceiptV1{}, false,
+				types.NewAppError(
+					types.CodeConflict,
+					"周期综合请求已由其他报告领取",
+					types.ErrConflict)
+		}
 		return PeriodicSynthesisReceiptV1{}, false,
 			briefFeedDBError("准备周期综合回执", err)
 	}
