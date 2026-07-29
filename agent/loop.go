@@ -1590,15 +1590,15 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 				return nil, out, errors.New("agent: task creation controller is not configured")
 			}
 			state := runStateFrom(ctx)
-			if state != nil && state.directTaskCreation {
-				var normalized bool
-				args, normalized = normalizeDirectTaskCreationArgs(args)
-				if !normalized {
+			var normalized bool
+			args, normalized = normalizeTaskCreationArgs(args)
+			if !normalized {
+				if state != nil && state.directTaskCreation {
 					state.directTaskCreationValidationFailures++
-					out = append(out, toolMsg(tc.ID,
-						"create_schedule 字段名必须与 schema 完全一致，不能使用大小写别名、转义键或未知字段。"))
-					continue
 				}
+				out = append(out, toolMsg(tc.ID,
+					"create_schedule 字段名必须与 schema 完全一致，不能使用大小写别名、转义键或未知字段。"))
+				continue
 			}
 			plan, exact := inspectModelTaskCreationPlan(args)
 			if !exact {
@@ -1736,16 +1736,14 @@ func (l *Loop) executeDirectTaskCreation(
 		return "", errors.New("agent: task creation controller is not configured")
 	}
 	state := runStateFrom(ctx)
-	if state != nil && state.directTaskCreation {
-		var normalized bool
-		args, normalized = normalizeDirectTaskCreationArgs(args)
-		if !normalized {
-			return "", types.NewAppError(
-				types.CodeValidation,
-				"create_schedule 字段名必须与 schema 完全一致，不能使用大小写别名、转义键或未知字段。",
-				types.ErrValidation,
-			)
-		}
+	var normalized bool
+	args, normalized = normalizeTaskCreationArgs(args)
+	if !normalized {
+		return "", types.NewAppError(
+			types.CodeValidation,
+			"create_schedule 字段名必须与 schema 完全一致，不能使用大小写别名、转义键或未知字段。",
+			types.ErrValidation,
+		)
 	}
 	plan, exact := inspectModelTaskCreationPlan(args)
 	if !exact {
@@ -1894,11 +1892,12 @@ func directDefinitionEditTargetsTask(
 	return envelope.TaskID == taskID
 }
 
-// normalizeDirectTaskCreationArgs 把直建模式刻意简化的模型工具面恢复成
-// controller 的稳定内部契约。普通模式和已按旧 schema 生成的嵌套参数原样保留；
-// 只有精确匹配 {version,items} 的扁平 plan 才会被包进 source_specs。
+// normalizeTaskCreationArgs 把简化的模型工具面恢复成 controller 的稳定内部契约。
+// 直接创建与普通对话共享这条兼容边界：用户在明确创建请求前补一句上下文，不应
+// 让同一份合法 {version,items} 方案从可执行变成 20 轮无效自纠。已按稳定 schema
+// 生成的嵌套参数原样保留；只有精确匹配的扁平 plan 才会被包进 source_specs。
 // 两层都用 DecodeExact，避免兼容层重新引入大小写别名、转义键或未知字段。
-func normalizeDirectTaskCreationArgs(args json.RawMessage) (json.RawMessage, bool) {
+func normalizeTaskCreationArgs(args json.RawMessage) (json.RawMessage, bool) {
 	if _, exact := inspectModelTaskCreationPlan(args); exact {
 		return args, true
 	}
