@@ -68,17 +68,21 @@ print_vane_startup_diagnostics() {
   fi
 }
 
-wait_for_vane_active() {
+vane_ready() {
+  curl -fsS --max-time 5 http://127.0.0.1:8080/readyz >/dev/null
+}
+
+wait_for_vane_ready() {
   local attempt state
   for attempt in {1..12}; do
     state=$(vane_service_state)
-    if [[ $state == active ]]; then
+    if [[ $state == active ]] && vane_ready; then
       return 0
     fi
-    echo "waiting for vane startup: state=$state attempt=$attempt/12"
+    echo "waiting for vane readiness: state=$state attempt=$attempt/12"
     sleep 5
   done
-  echo "vane did not become active within 60 seconds" >&2
+  echo "vane did not become ready within 60 seconds" >&2
   print_vane_startup_diagnostics
   return 1
 }
@@ -154,8 +158,7 @@ fi
 
 echo "old vane worker drain verified; starting roll-forward binary"
 systemctl start vane
-wait_for_vane_active
-curl -fsS --max-time 5 http://127.0.0.1:8080/readyz
+wait_for_vane_ready
 
 ctype=$(
   curl -sSL -o /dev/null -w '%{content_type}' --max-time 10 \

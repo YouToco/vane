@@ -24,11 +24,15 @@ def extract_startup_wait() -> str:
 
 
 class BackendStartupRecoveryTest(unittest.TestCase):
-    def run_wait(self, states: list[str]) -> subprocess.CompletedProcess[bytes]:
+    def run_wait(
+        self, states: list[str], readiness: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
         with tempfile.TemporaryDirectory() as tempdir:
             state_file = Path(tempdir) / "states"
+            ready_file = Path(tempdir) / "readiness"
             wait_log = Path(tempdir) / "wait.log"
             state_file.write_text("\n".join(states) + "\n", encoding="utf-8")
+            ready_file.write_text("\n".join(readiness) + "\n", encoding="utf-8")
             script = (
                 "set -euo pipefail\n"
                 f"{extract_startup_wait()}\n"
@@ -39,16 +43,24 @@ class BackendStartupRecoveryTest(unittest.TestCase):
                 "  mv \"$STATE_FILE.next\" \"$STATE_FILE\"\n"
                 "  printf '%s' \"$state\"\n"
                 "}\n"
+                "vane_ready() {\n"
+                "  local ready\n"
+                "  ready=$(head -n 1 \"$READY_FILE\")\n"
+                "  tail -n +2 \"$READY_FILE\" >\"$READY_FILE.next\"\n"
+                "  mv \"$READY_FILE.next\" \"$READY_FILE\"\n"
+                "  [[ $ready == ready ]]\n"
+                "}\n"
                 "sleep() { printf 'sleep\\n' >>\"$WAIT_LOG\"; }\n"
                 "print_vane_startup_diagnostics() {\n"
                 "  printf 'diagnostics\\n' >>\"$WAIT_LOG\"\n"
                 "}\n"
-                "wait_for_vane_active\n"
+                "wait_for_vane_ready\n"
             )
             env = os.environ.copy()
             env.update(
                 {
                     "STATE_FILE": state_file.as_posix(),
+                    "READY_FILE": ready_file.as_posix(),
                     "WAIT_LOG": wait_log.as_posix(),
                 }
             )
@@ -60,17 +72,27 @@ class BackendStartupRecoveryTest(unittest.TestCase):
                 check=False,
             )
 
-    def test_waits_through_activating_and_accepts_active(self) -> None:
-        result = self.run_wait(["activating", "active"])
+    def test_waits_through_activating_and_accepts_ready(self) -> None:
+        result = self.run_wait(["activating", "active"], ["ready"])
 
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertIn(b"state=activating attempt=1/12", result.stdout)
 
+    def test_waits_when_systemd_is_active_but_http_is_not_ready(self) -> None:
+        result = self.run_wait(
+            ["active", "active", "active"],
+            ["not-ready", "not-ready", "ready"],
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn(b"state=active attempt=1/12", result.stdout)
+        self.assertIn(b"state=active attempt=2/12", result.stdout)
+
     def test_fails_after_bounded_attempts(self) -> None:
-        result = self.run_wait(["activating"] * 12)
+        result = self.run_wait(["activating"] * 12, ["not-ready"] * 12)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(b"did not become active within 60 seconds", result.stderr)
+        self.assertIn(b"did not become ready within 60 seconds", result.stderr)
 
 
 if __name__ == "__main__":
