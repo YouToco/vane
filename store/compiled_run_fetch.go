@@ -90,6 +90,15 @@ func (s *Store) UpsertContentItemForTaskRunV1(
 	if !isNew {
 		if _, err := tx.Exec(ctx,
 			`UPDATE content_items
+			    SET source_id=COALESCE(source_id,$2)
+			  WHERE id=$1`,
+			id, sourceID,
+		); err != nil {
+			return 0, false, taskRunDatabaseError(
+				"freeze first legacy content source", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE content_items
 			    SET content = $2, content_hash = $3, simhash = $4
 			  WHERE id = $1 AND char_length(content) < char_length($2)`,
 			id, item.Content, item.ContentHash, item.Simhash,

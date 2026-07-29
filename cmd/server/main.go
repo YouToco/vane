@@ -316,6 +316,7 @@ func run() error {
 	w.RegisterActivity(activities.AuthorizeRun)
 	w.RegisterActivity(activities.PrepareRun)
 	w.RegisterActivity(activities.PrepareToolRunV2)
+	w.RegisterActivity(activities.ExecuteToolInvocationV2)
 	w.RegisterActivity(activities.BeginRunOutcomeV1)
 	w.RegisterActivity(activities.FinalizeRunOutcomeV1)
 	w.RegisterActivity(activities.PrepareCanonicalBriefV1)

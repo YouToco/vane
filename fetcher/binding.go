@@ -158,9 +158,10 @@ type bindingKey struct {
 
 var xhsEnvelope = []envelopeCheck{{Path: "code", Want: "200"}, {Path: "data.success", Want: "true"}}
 
-// bindingTemplates 是全部绑定能力的唯一事实来源。CI 不变量（契约 §8.1）：
-// 每个模板的 Endpoint（含 Enrich.Endpoint）必须在 tikhubcatalog 里 Lookup 命中。
-var bindingTemplates = map[bindingKey]bindingSpec{
+// bindingTemplatesV1 is the retained fetcher.binding/v1 response contract.
+// Existing entries are immutable; a semantic change adds a V2 implementation
+// and keeps this map for snapshots already sealed to V1.
+var bindingTemplatesV1 = map[bindingKey]bindingSpec{
 	// ── 迁移自 fetcher/tikhub.go（2026-07-14 实测契约见 git 史该文件头注）──
 	// desc 上游截 60 rune，详情补全是把「证据不足→模型编造」从根上消灭的唯一手段，
 	// 代价按次计费，故有 SeenChecker 闸门只为新笔记付费。
@@ -421,7 +422,7 @@ var bindingTemplates = map[bindingKey]bindingSpec{
 // IsBindingBacked 报告 (platform, capability) 是否由绑定引擎承载
 // （agent 的试跑准入只对绑定能力生效，rss/exa 路径行为不变）。
 func IsBindingBacked(p types.Platform, c types.Capability) bool {
-	_, ok := bindingTemplates[bindingKey{p, c}]
+	_, ok := bindingTemplatesV1[bindingKey{p, c}]
 	return ok
 }
 
@@ -554,7 +555,7 @@ func NewBinding(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorde
 	// 真实预算在 callAndDecode 由 ctx 控制（默认 timeout，模板声明了 TimeoutSeconds
 	// 用声明值）。不抬的话模板级 30s 声明会被 client 级 20s 抢先掐断。
 	clientTimeout := timeout
-	for _, spec := range bindingTemplates {
+	for _, spec := range bindingTemplatesV1 {
 		if d := time.Duration(spec.TimeoutSeconds) * time.Second; d > clientTimeout {
 			clientTimeout = d
 		}
@@ -596,24 +597,55 @@ func (b *BindingFetcher) run(
 	src types.FetchTarget,
 	beforeEffect func(context.Context) error,
 ) ([]types.ContentItem, error) {
-	spec, ok := bindingTemplates[bindingKey{src.Platform, src.Capability}]
+	spec, ok := bindingTemplatesV1[bindingKey{src.Platform, src.Capability}]
 	if !ok {
 		// Multi 只对模板里有的能力分派到此；走到这里是装配漂移，不是数据问题。
 		return nil, types.NewAppError(types.CodeInternal,
 			fmt.Sprintf("能力 %q/%q 无绑定模板（装配漂移，source_id=%d）", src.Platform, src.Capability, src.ID), nil)
 	}
-	if !b.apiKeySet {
-		return nil, types.NewAppError(types.CodeValidation,
-			"TikHub 信源需要配置 VANE_FETCH_TIKHUB_API_KEY，当前为空", nil)
-	}
-
 	// 反漂移防线 1：端点每轮对注册表校验（契约 §3.1/§3.2）。
 	entry, ok := tikhubcatalog.Lookup(spec.Endpoint)
 	if !ok {
 		return nil, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("绑定失效：端点 %s 已从注册表移除（re-gen 漂移，source_id=%d）", spec.Endpoint, src.ID), nil)
 	}
+	var enrichEntry *tikhubcatalog.Entry
+	if spec.Enrich != nil {
+		if resolved, found := tikhubcatalog.Lookup(spec.Enrich.Endpoint); found {
+			enrichEntry = &resolved
+		}
+	}
+	return b.runResolved(
+		ctx, src, spec, entry, enrichEntry, beforeEffect)
+}
 
+// fetchWithRetainedRouteV1 executes an exact binding template and transport
+// entry retained by fetcher.binding/v1. It never consults bindingTemplatesV1
+// or the current generated TikHub catalog.
+func (b *BindingFetcher) fetchWithRetainedRouteV1(
+	ctx context.Context,
+	src types.FetchTarget,
+	spec bindingSpec,
+	entry tikhubcatalog.Entry,
+	enrichEntry *tikhubcatalog.Entry,
+	beforeEffect func(context.Context) error,
+) ([]types.ContentItem, error) {
+	return b.runResolved(
+		ctx, src, spec, entry, enrichEntry, beforeEffect)
+}
+
+func (b *BindingFetcher) runResolved(
+	ctx context.Context,
+	src types.FetchTarget,
+	spec bindingSpec,
+	entry tikhubcatalog.Entry,
+	enrichEntry *tikhubcatalog.Entry,
+	beforeEffect func(context.Context) error,
+) ([]types.ContentItem, error) {
+	if !b.apiKeySet {
+		return nil, types.NewAppError(types.CodeValidation,
+			"TikHub 信源需要配置 VANE_FETCH_TIKHUB_API_KEY，当前为空", nil)
+	}
 	cfgMap, err := decodeConfigMap(src.Config)
 	if err != nil {
 		return nil, types.NewAppError(types.CodeValidation,
@@ -815,7 +847,10 @@ func (b *BindingFetcher) run(
 			ids[i] = cands[i].id
 			raws[i] = cands[i].raw
 		}
-		if err := b.enrich(ctx, src, spec.Enrich, ids, raws, contents, beforeEffect); err != nil {
+		if err := b.enrich(
+			ctx, src, spec.Enrich, enrichEntry,
+			ids, raws, contents, beforeEffect,
+		); err != nil {
 			return nil, err
 		}
 	}
@@ -957,7 +992,6 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 		}
 	}
 	args, _ := json.Marshal(clean)
-	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
 		TenantID:     tenantID,
@@ -966,7 +1000,10 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 		ToolKind:     types.ToolCallKindBindingFetch,
 		EndpointPath: entry.Path,
 		Arguments:    args,
-		SourceID:     &srcID,
+	}
+	if src.ID > 0 {
+		srcID := src.ID
+		rec.SourceID = &srcID
 	}
 	if res != nil {
 		status := res.Status
@@ -1004,6 +1041,7 @@ func (b *BindingFetcher) enrich(
 	ctx context.Context,
 	src types.FetchTarget,
 	es *enrichSpec,
+	retainedEntry *tikhubcatalog.Entry,
 	ids []string,
 	raws []any,
 	contents []*string,
@@ -1012,12 +1050,12 @@ func (b *BindingFetcher) enrich(
 	if b.seen == nil {
 		return nil // 无从判断新旧就不补：宁可不补，也不为一库老笔记重复付费。
 	}
-	entry, ok := tikhubcatalog.Lookup(es.Endpoint)
-	if !ok {
+	if retainedEntry == nil {
 		slog.Warn("binding: 详情端点已从注册表移除，跳过本轮补全",
 			"source_id", src.ID, "endpoint", es.Endpoint)
 		return nil
 	}
+	entry := *retainedEntry
 	// 与主调用同一道反漂移防线（契约 §3.6「同样每轮 Lookup + 参数校验」）：
 	// re-gen 改了详情端点参数名时显式跳过（降级不失败），而不是静默丢参白花钱。
 	nameProbe := map[string]any{es.KeyParam: ""}

@@ -59,6 +59,25 @@ type PrepareToolRunV2Result struct {
 	Snapshot   RunSnapshotRefV2 `json:"snapshot"`
 }
 
+// ExecuteToolInvocationV2Input carries only an immutable reference and one
+// invocation digest. Tool arguments and materialized requests stay in the
+// Store snapshot and never enter Temporal history.
+type ExecuteToolInvocationV2Input struct {
+	TenantID         int64            `json:"tenant_id"`
+	UserID           int64            `json:"user_id"`
+	TaskID           string           `json:"task_id"`
+	Snapshot         RunSnapshotRefV2 `json:"snapshot"`
+	InvocationDigest string           `json:"invocation_digest"`
+}
+
+// ToolInvocationReceiptV1 is the small durable Activity result. Content bodies
+// remain in the append-only observation evidence row.
+type ToolInvocationReceiptV1 struct {
+	InvocationDigest  string `json:"invocation_digest"`
+	ObservationDigest string `json:"observation_digest"`
+	ContentCount      int    `json:"content_count"`
+}
+
 func (r PrepareToolRunV2Result) Validate() error {
 	if !r.Authorized {
 		if r.Snapshot != (RunSnapshotRefV2{}) {

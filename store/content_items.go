@@ -21,9 +21,9 @@ import (
 // 而实测两个方向都挡不住——BBC 更新文章换 guid（同一篇存 3 份）、同一篇笔记命中
 // 不同任务目标（存两份且详情补全被付两次钱）。身份改由 canonical_key 承载。
 //
-// content_items.source_id 只在首次插入时写入，之后不再改：它是**首发源**（谁先发现
-// 这条内容），后来的源只在 content_sources 里追加一行 appearance。ON CONFLICT
-// DO NOTHING 天然保证这点——冲突时不 UPDATE，首发源不会被后来者覆盖。
+// content_items.source_id 是 legacy **首发源**。V2 Source-free 可能先以 NULL 发现内容；
+// 第一个 retained V1 appearance 会用 COALESCE 原子补上正数，之后不再覆盖。后来的源
+// 只在 content_sources 里追加 appearance。
 //
 // first_seen_at / fetched_at 都不由 Go 传入而走 DB 默认 now()：两者的差是信源滞后量
 // （信源质量分析的核心指标），必须同一个时钟，混入应用侧时间会让差值含机器间时钟偏移。
@@ -70,6 +70,14 @@ func (s *Store) UpsertContentItem(ctx context.Context, item *types.ContentItem) 
 	// 精确去重与近似去重都按旧版本判，静默失准。
 	// 不动 source_id（首发源）、不动 title（标题来自搜索结果，详情未必更好）。
 	if !isNew {
+		if _, uerr := s.pool.Exec(ctx,
+			`UPDATE content_items
+			    SET source_id=COALESCE(source_id,$2)
+			  WHERE id=$1`,
+			id, item.SourceID); uerr != nil {
+			return 0, false, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("固化内容首个 legacy 信源（content_item=%d）", id), uerr)
+		}
 		if _, uerr := s.pool.Exec(ctx,
 			`UPDATE content_items
 			 SET content = $2, content_hash = $3, simhash = $4
@@ -149,7 +157,7 @@ func (s *Store) EnrichedCanonicalKeys(ctx context.Context, keys []string, minRun
 func (s *Store) GetContentItem(ctx context.Context, id int64) (*types.ContentItem, error) {
 	var ci types.ContentItem
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, source_id, external_id, canonical_key, url, title, content, author,
+		`SELECT id, COALESCE(source_id, 0), external_id, canonical_key, url, title, content, author,
 		        published_at, content_hash, simhash, fetched_at, created_at, kind
 		 FROM content_items WHERE id = $1`, id).Scan(
 		&ci.ID, &ci.SourceID, &ci.ExternalID, &ci.CanonicalKey, &ci.URL, &ci.Title, &ci.Content,
@@ -186,16 +194,23 @@ func (s *Store) ListUnpushedBySchedule(ctx context.Context, scheduleID string, l
 		`SELECT id, source_id, external_id, canonical_key, url, title, content, author,
 		        published_at, content_hash, simhash, fetched_at, created_at, kind
 		 FROM (
-		     SELECT ci.id, ci.source_id, ci.external_id, ci.canonical_key, ci.url, ci.title,
+		     SELECT ci.id, COALESCE(ci.source_id, matched.source_id) AS source_id,
+		            ci.external_id, ci.canonical_key, ci.url, ci.title,
 		            ci.content, ci.author, ci.published_at, ci.content_hash, ci.simhash,
 		            ci.fetched_at, ci.created_at, ci.kind,
-		            ROW_NUMBER() OVER (PARTITION BY ci.source_id ORDER BY ci.fetched_at DESC, ci.id DESC) AS rn
+		            ROW_NUMBER() OVER (
+		                PARTITION BY matched.source_id
+		                ORDER BY ci.fetched_at DESC, ci.id DESC
+		            ) AS rn
 		     FROM content_items ci
-		     WHERE EXISTS (
-		         SELECT 1 FROM content_sources cs
-		         JOIN task_fetch_targets ss ON ss.fetch_target_id = cs.source_id
-		         WHERE cs.content_item_id = ci.id AND ss.schedule_id = $1
-		     )
+		     JOIN LATERAL (
+		         SELECT MIN(cs.source_id) AS source_id
+		           FROM content_sources cs
+		           JOIN task_fetch_targets ss
+		             ON ss.fetch_target_id = cs.source_id
+		          WHERE cs.content_item_id = ci.id
+		            AND ss.schedule_id = $1
+		     ) matched ON matched.source_id IS NOT NULL
 		       AND NOT EXISTS (
 		           SELECT 1 FROM deliveries d
 		           WHERE d.content_item_id = ci.id
@@ -247,7 +262,7 @@ func (s *Store) SearchContentItems(ctx context.Context, keyword string, since ti
 	if limit <= 0 {
 		limit = 20
 	}
-	query := `SELECT id, source_id, external_id, canonical_key, url, title, content, author,
+	query := `SELECT id, COALESCE(source_id, 0), external_id, canonical_key, url, title, content, author,
 	                 published_at, content_hash, simhash, fetched_at, created_at, kind
 	          FROM content_items
 	          WHERE COALESCE(published_at, fetched_at) >= $1`

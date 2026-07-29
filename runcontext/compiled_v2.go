@@ -1,8 +1,13 @@
 package runcontext
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"reflect"
+	"strings"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/taskstate"
@@ -16,6 +21,18 @@ type ToolBindingV1 struct {
 	InvocationDigest string                     `json:"invocation_digest"`
 	Contract         ToolContractBindingV1      `json:"contract"`
 	Capability       runtimepolicy.CapabilityV1 `json:"capability"`
+	Request          ToolFetchRequestV1         `json:"request"`
+}
+
+// ToolFetchRequestV1 is the exact Source-free request compiled at snapshot
+// creation. Historical execution consumes this DTO directly and never rebuilds
+// it through the mutable current-write Tool registry.
+type ToolFetchRequestV1 struct {
+	Platform   string          `json:"platform"`
+	Capability string          `json:"capability"`
+	URL        string          `json:"url"`
+	Title      string          `json:"title"`
+	Config     json.RawMessage `json:"config"`
 }
 
 // ToolContractBindingV1 freezes the logical contract selected by the current
@@ -108,7 +125,8 @@ func (s CompiledSnapshotV2) ValidateFor(expected types.RunIdentity) error {
 			binding.Contract.Capability != binding.Capability.Capability ||
 			binding.Contract.Kind != binding.Capability.Kind ||
 			binding.Contract.ImplementationVersion !=
-				binding.Capability.ImplementationVersion {
+				binding.Capability.ImplementationVersion ||
+			binding.Request.validateFor(binding.Contract) != nil {
 			return types.NewAppError(types.CodeValidation,
 				"compiled Tool snapshot binding differs", nil)
 		}
@@ -128,6 +146,29 @@ func (s CompiledSnapshotV2) ValidateFor(expected types.RunIdentity) error {
 		seal.PayloadDigest != s.Ref.PayloadDigest {
 		return types.NewAppError(types.CodeValidation,
 			"compiled Tool snapshot seal differs", nil)
+	}
+	return nil
+}
+
+func (r ToolFetchRequestV1) validateFor(
+	contract ToolContractBindingV1,
+) error {
+	if strings.TrimSpace(r.Platform) == "" ||
+		strings.TrimSpace(r.Platform) != r.Platform ||
+		strings.TrimSpace(r.Capability) == "" ||
+		strings.TrimSpace(r.Capability) != r.Capability ||
+		strings.TrimSpace(r.URL) == "" ||
+		r.Platform != contract.Platform ||
+		r.Capability != contract.Capability {
+		return errors.New("frozen Tool fetch request is invalid")
+	}
+	var object map[string]any
+	if strictjson.Decode(r.Config, &object) != nil || object == nil {
+		return errors.New("frozen Tool fetch request config is invalid")
+	}
+	canonical, err := json.Marshal(object)
+	if err != nil || !bytes.Equal(canonical, r.Config) {
+		return errors.New("frozen Tool fetch request config is not canonical")
 	}
 	return nil
 }

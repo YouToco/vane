@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -271,6 +273,251 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		compiled.Policy.ModelPolicy.CredentialRef.Generation != 1 {
 		t.Fatalf("Source-free compiled snapshot did not remain frozen: %+v", compiled)
 	}
+	invocationDigest := compiled.Definition.ToolCalls[0].Digest
+	if recovered, found, err := st.LoadContentObservationForTaskRunV2(
+		ctx, identity, ref, invocationDigest,
+	); err != nil || found || recovered != nil {
+		t.Fatalf("unexpected Source-free observation before commit: items=%+v found=%v err=%v",
+			recovered, found, err)
+	}
+	observed := []types.ContentItem{{
+		ExternalID:   uuid.NewString(),
+		CanonicalKey: "https://source-free.example/" + uuid.NewString(),
+		Kind:         types.KindArticle, URL: "https://source-free.example/post",
+		Title: "Source-free content", Content: "exact observed body",
+		ContentHash: strings.Repeat("c", 64), FetchedAt: time.Now().UTC(),
+	}}
+	persisted, err := st.CommitContentObservationForTaskRunV2(
+		ctx, identity, ref, invocationDigest, observed)
+	if err != nil || len(persisted) != 1 || persisted[0].ID <= 0 ||
+		persisted[0].SourceID != 0 {
+		t.Fatalf("commit Source-free observation: items=%+v err=%v",
+			persisted, err)
+	}
+	contentID := persisted[0].ID
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM task_run_content_provenance
+			  WHERE run_snapshot_id=$1 AND invocation_digest=$2`,
+			ref.SnapshotID, invocationDigest)
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM content_items WHERE id=$1`, contentID)
+	})
+	recoveredObservation, found, err :=
+		st.LoadContentObservationForTaskRunV2(
+			ctx, identity, ref, invocationDigest)
+	if err != nil || !found || len(recoveredObservation) != 1 ||
+		recoveredObservation[0].ID != contentID ||
+		recoveredObservation[0].Content != observed[0].Content {
+		t.Fatalf("recover Source-free observation: items=%+v found=%v err=%v",
+			recoveredObservation, found, err)
+	}
+	replayedObservation, err := st.CommitContentObservationForTaskRunV2(
+		ctx, identity, ref, invocationDigest,
+		[]types.ContentItem{{
+			ExternalID:   "must-not-replace",
+			CanonicalKey: "https://must-not-replace.example",
+			Kind:         types.KindArticle, URL: "https://must-not-replace.example",
+			ContentHash: strings.Repeat("d", 64),
+		}})
+	if err != nil || len(replayedObservation) != 1 ||
+		replayedObservation[0].ID != contentID ||
+		replayedObservation[0].CanonicalKey != observed[0].CanonicalKey {
+		t.Fatalf("first-writer observation replay drifted: items=%+v err=%v",
+			replayedObservation, err)
+	}
+	var nullSource, provenanceRows, appearanceRows int
+	if err := st.pool.QueryRow(ctx,
+		`SELECT
+		    (SELECT count(*) FROM content_items
+		      WHERE id=$1 AND source_id IS NULL),
+		    (SELECT count(*) FROM task_run_content_provenance
+		      WHERE run_snapshot_id=$2 AND invocation_digest=$3),
+		    (SELECT count(*) FROM content_sources WHERE content_item_id=$1)`,
+		contentID, ref.SnapshotID, invocationDigest,
+	).Scan(&nullSource, &provenanceRows, &appearanceRows); err != nil {
+		t.Fatal(err)
+	}
+	if nullSource != 1 || provenanceRows != 1 || appearanceRows != 0 {
+		t.Fatalf("Source-free observation leaked source state: null=%d provenance=%d appearances=%d",
+			nullSource, provenanceRows, appearanceRows)
+	}
+
+	nonmemberDigest := strings.Repeat("f", 64)
+	_, nonmemberPayload, nonmemberObservationDigest, err :=
+		runcontext.BuildToolObservationSetV1(
+			ref.SnapshotID, nonmemberDigest, []types.ContentItem{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.pool.Exec(ctx,
+		`INSERT INTO task_run_content_provenance (
+		    tenant_id,user_id,task_id,run_snapshot_id,invocation_digest,
+		    content_item_ids,observation_payload,observation_digest
+		 ) VALUES ($1,$2,$3,$4,$5,'{}',$6,$7)`,
+		identity.TenantID, identity.UserID, identity.TaskID,
+		ref.SnapshotID, nonmemberDigest,
+		nonmemberPayload, nonmemberObservationDigest)
+	var pgErr *pgconn.PgError
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("database admitted invocation outside frozen Tool plan: %v", err)
+	}
+
+	_, validEmptyPayload, _, err := runcontext.BuildToolObservationSetV1(
+		nextRef.SnapshotID, invocationDigest, []types.ContentItem{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.pool.Exec(ctx,
+		`INSERT INTO task_run_content_provenance (
+		    tenant_id,user_id,task_id,run_snapshot_id,invocation_digest,
+		    content_item_ids,observation_payload,observation_digest
+		 ) VALUES ($1,$2,$3,$4,$5,'{}',$6,$7)`,
+		nextIdentity.TenantID, nextIdentity.UserID, nextIdentity.TaskID,
+		nextRef.SnapshotID, invocationDigest,
+		validEmptyPayload, strings.Repeat("0", 64))
+	pgErr = nil
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("database admitted forged observation digest: %v", err)
+	}
+
+	_, mismatchedPayload, mismatchedObservationDigest, err :=
+		runcontext.BuildToolObservationSetV1(
+			nextRef.SnapshotID+1, invocationDigest, []types.ContentItem{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.pool.Exec(ctx,
+		`INSERT INTO task_run_content_provenance (
+		    tenant_id,user_id,task_id,run_snapshot_id,invocation_digest,
+		    content_item_ids,observation_payload,observation_digest
+		 ) VALUES ($1,$2,$3,$4,$5,'{}',$6,$7)`,
+		nextIdentity.TenantID, nextIdentity.UserID, nextIdentity.TaskID,
+		nextRef.SnapshotID, invocationDigest,
+		mismatchedPayload, mismatchedObservationDigest)
+	pgErr = nil
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("database admitted mismatched observation identity: %v", err)
+	}
+
+	type concurrentObservationResult struct {
+		items []types.ContentItem
+		err   error
+	}
+	concurrentItems := [2]types.ContentItem{
+		{
+			ExternalID:   uuid.NewString(),
+			CanonicalKey: "https://source-free.example/race-a-" + uuid.NewString(),
+			Kind:         types.KindArticle,
+			URL:          "https://source-free.example/race-a",
+			Title:        "race A",
+			Content:      "first writer A",
+			ContentHash:  strings.Repeat("a", 64),
+			FetchedAt:    time.Now().UTC(),
+		},
+		{
+			ExternalID:   uuid.NewString(),
+			CanonicalKey: "https://source-free.example/race-b-" + uuid.NewString(),
+			Kind:         types.KindArticle,
+			URL:          "https://source-free.example/race-b",
+			Title:        "race B",
+			Content:      "first writer B",
+			ContentHash:  strings.Repeat("b", 64),
+			FetchedAt:    time.Now().UTC(),
+		},
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM task_run_content_provenance
+			  WHERE run_snapshot_id=$1 AND invocation_digest=$2`,
+			nextRef.SnapshotID, invocationDigest)
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM content_items WHERE canonical_key IN ($1,$2)`,
+			concurrentItems[0].CanonicalKey, concurrentItems[1].CanonicalKey)
+	})
+	startConcurrentCommit := make(chan struct{})
+	concurrentResults := make(chan concurrentObservationResult, 2)
+	for i := range concurrentItems {
+		item := concurrentItems[i]
+		go func() {
+			<-startConcurrentCommit
+			got, commitErr := st.CommitContentObservationForTaskRunV2(
+				context.Background(), nextIdentity, nextRef,
+				invocationDigest, []types.ContentItem{item})
+			concurrentResults <- concurrentObservationResult{
+				items: got, err: commitErr,
+			}
+		}()
+	}
+	close(startConcurrentCommit)
+	firstConcurrent := <-concurrentResults
+	secondConcurrent := <-concurrentResults
+	results := []concurrentObservationResult{
+		firstConcurrent, secondConcurrent,
+	}
+	var committed, conflicted int
+	for _, result := range results {
+		switch {
+		case result.err == nil && len(result.items) == 1:
+			committed++
+		case errors.Is(result.err, types.ErrConflict) &&
+			len(result.items) == 0:
+			conflicted++
+		default:
+			t.Fatalf("unexpected concurrent first-writer result: %+v", result)
+		}
+	}
+	if committed != 1 || conflicted != 1 {
+		t.Fatalf("concurrent first-writer outcomes: committed=%d conflicted=%d",
+			committed, conflicted)
+	}
+	var concurrentProvenanceRows, concurrentContentRows int
+	if err := st.pool.QueryRow(ctx,
+		`SELECT
+		    (SELECT count(*) FROM task_run_content_provenance
+		      WHERE run_snapshot_id=$1 AND invocation_digest=$2),
+		    (SELECT count(*) FROM content_items
+		      WHERE canonical_key IN ($3,$4))`,
+		nextRef.SnapshotID, invocationDigest,
+		concurrentItems[0].CanonicalKey, concurrentItems[1].CanonicalKey,
+	).Scan(&concurrentProvenanceRows, &concurrentContentRows); err != nil {
+		t.Fatal(err)
+	}
+	if concurrentProvenanceRows != 1 || concurrentContentRows != 1 {
+		t.Fatalf("concurrent observation rows: provenance=%d content=%d, want 1/1",
+			concurrentProvenanceRows, concurrentContentRows)
+	}
+
+	rlsTx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rlsTx.Rollback(ctx) }()
+	if _, err := rlsTx.Exec(ctx,
+		`SELECT set_config('app.tenant_id',$1,true)`,
+		fmt.Sprintf("%d", identity.TenantID+1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rlsTx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		t.Fatal(err)
+	}
+	var crossTenantVisible int
+	if err := rlsTx.QueryRow(ctx,
+		`SELECT count(*) FROM task_run_content_provenance
+		  WHERE run_snapshot_id=$1`, ref.SnapshotID,
+	).Scan(&crossTenantVisible); err != nil {
+		t.Fatal(err)
+	}
+	if crossTenantVisible != 0 {
+		t.Fatalf("cross-tenant provenance rows visible=%d", crossTenantVisible)
+	}
+	if err := rlsTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	var parentCount, shadowCount, taskLinks, globalTargets int
 	if err := st.pool.QueryRow(ctx,
@@ -312,6 +559,12 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		ctx, identity, ref); err != nil || authorized {
 		t.Fatalf("paused Source-free run authorization: authorized=%v err=%v",
 			authorized, err)
+	}
+	if recovered, found, err := st.LoadContentObservationForTaskRunV2(
+		ctx, identity, ref, invocationDigest,
+	); err != nil || !found || len(recovered) != 1 {
+		t.Fatalf("revoked observation receipt was not recoverable: items=%+v found=%v err=%v",
+			recovered, found, err)
 	}
 }
 

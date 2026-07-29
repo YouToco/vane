@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/tikhubcatalog"
 	"github.com/YouToco/vane/types"
 )
 
@@ -45,11 +46,14 @@ type RuntimeFetchRouteV1 struct {
 }
 
 type runtimeFetchExecutorV1 struct {
-	kind        runtimeFetchExecutorKindV1
-	rss         *Fetcher
-	exaSearch   *ExaFetcher
-	exaContents *ExaContentsFetcher
-	binding     *BindingFetcher
+	kind               runtimeFetchExecutorKindV1
+	rss                *Fetcher
+	exaSearch          *ExaFetcher
+	exaContents        *ExaContentsFetcher
+	binding            *BindingFetcher
+	bindingSpec        bindingSpec
+	bindingEntry       tikhubcatalog.Entry
+	bindingEnrichEntry *tikhubcatalog.Entry
 }
 
 // RuntimeFetchResolverV1 is immutable after construction and safe for
@@ -123,6 +127,17 @@ func (route RuntimeFetchRouteV1) executorV1(
 		return runtimeFetchExecutorV1{}, fmt.Errorf(
 			"fetcher: retained runtime executor does not match capability")
 	}
+	if want == runtimeFetchExecutorBindingV1 {
+		retained, err := resolveRetainedBindingRouteV1(
+			types.Platform(route.Capability.Platform),
+			types.Capability(route.Capability.Capability))
+		if err != nil {
+			return runtimeFetchExecutorV1{}, err
+		}
+		executor.bindingSpec = retained.spec
+		executor.bindingEntry = retained.entry
+		executor.bindingEnrichEntry = retained.enrichEntry
+	}
 	return executor, nil
 }
 
@@ -150,7 +165,9 @@ func (executor runtimeFetchExecutorV1) fetch(
 	case runtimeFetchExecutorExaContentsV1:
 		return executor.exaContents.fetchWithEffectGate(ctx, source, beforeEffect)
 	case runtimeFetchExecutorBindingV1:
-		return executor.binding.fetchWithEffectGate(ctx, source, beforeEffect)
+		return executor.binding.fetchWithRetainedRouteV1(
+			ctx, source, executor.bindingSpec, executor.bindingEntry,
+			executor.bindingEnrichEntry, beforeEffect)
 	default:
 		return nil, types.NewAppError(types.CodeInternal,
 			"compiled fetch capability v1 has an invalid retained executor", nil)

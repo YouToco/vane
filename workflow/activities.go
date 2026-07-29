@@ -299,6 +299,13 @@ type CompiledToolRunStoreV2 interface {
 	AuthorizeTaskRunSideEffectV2(
 		context.Context, types.RunIdentity, types.RunSnapshotRefV2,
 	) (bool, error)
+	LoadContentObservationForTaskRunV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2, string,
+	) ([]types.ContentItem, bool, error)
+	CommitContentObservationForTaskRunV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2, string,
+		[]types.ContentItem,
+	) ([]types.ContentItem, error)
 }
 
 type RunOutcomeStoreV1 interface {

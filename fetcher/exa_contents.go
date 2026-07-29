@@ -411,7 +411,6 @@ func (e *ExaContentsFetcher) recordCall(ctx context.Context, src types.FetchTarg
 	ctx, cancel := detachedBindingRecordContext(ctx)
 	defer cancel()
 	trace, tenantID, userID := bindingAttribution(ctx)
-	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
 		TenantID:     tenantID,
@@ -422,7 +421,10 @@ func (e *ExaContentsFetcher) recordCall(ctx context.Context, src types.FetchTarg
 		DurationMs:   int(elapsed.Milliseconds()),
 		ResultSize:   bodySize,
 		HTTPStatus:   &status,
-		SourceID:     &srcID,
+	}
+	if src.ID > 0 {
+		srcID := src.ID
+		rec.SourceID = &srcID
 	}
 	if costTotal > 0 {
 		rec.CostUSD = &costTotal

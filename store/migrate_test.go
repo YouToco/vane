@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 75
+const latestMigrationVersion int64 = 76
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -63,6 +63,8 @@ var wantTables = []string{
 	"task_creation_receipts",
 	// 030 每次定时任务运行的不可变执行快照（Agent Runtime C0）
 	"task_run_snapshots",
+	// 076 exact Source-free Tool result relationship/evidence.
+	"task_run_content_provenance",
 	// 032 Approved Definition / Adaptive State 分离（Agent Runtime C2a）
 	"task_approved_definition_versions",
 	"task_adaptive_states",

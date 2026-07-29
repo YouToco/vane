@@ -123,6 +123,60 @@ func TestRuntimeFetchRegistryRoutesExactTikHubGeneration(t *testing.T) {
 	}
 }
 
+func TestRuntimeFetchRegistryFreezesBindingRouteAndOmitsSourceAttribution(
+	t *testing.T,
+) {
+	server, calls := tikHubRuntimeServer(t, "tikhub-key-1")
+	recorder := &fakeRecorder{}
+	binding := NewBinding(
+		config.FetchConfig{TikhubAPIKey: "tikhub-key-1"}, nil, recorder,
+		tikhubinvoke.WithBaseURL(server.URL),
+	)
+	capability := bindingRuntimeCapability(
+		types.PlatformXHS, types.CapSearch, 1)
+	resolver := mustRuntimeFetchResolver(t, RuntimeFetchRouteV1{
+		Capability: capability, Binding: binding,
+	})
+
+	key := bindingKey{types.PlatformXHS, types.CapSearch}
+	originalTemplate := bindingTemplatesV1[key]
+	originalCatalog := retainedBindingCatalogV1[originalTemplate.Endpoint]
+	t.Cleanup(func() {
+		bindingTemplatesV1[key] = originalTemplate
+		retainedBindingCatalogV1[originalTemplate.Endpoint] = originalCatalog
+	})
+	mutatedTemplate := originalTemplate
+	mutatedTemplate.Endpoint = "must_not_be_consulted_after_resolution"
+	bindingTemplatesV1[key] = mutatedTemplate
+	mutatedCatalog := originalCatalog
+	mutatedCatalog.Path = "/must-not-be-consulted-after-resolution"
+	retainedBindingCatalogV1[originalTemplate.Endpoint] = mutatedCatalog
+
+	multi := &Multi{runtimeV1: resolver}
+	items, err := multi.FetchWithPolicyV1(
+		t.Context(),
+		types.FetchTarget{
+			Platform: types.PlatformXHS, Capability: types.CapSearch,
+			Config: json.RawMessage(`{"keyword":"vane"}`),
+		},
+		capability,
+		nil,
+	)
+	if err != nil || len(items) == 0 {
+		t.Fatalf("frozen Binding route failed: items=%d err=%v",
+			len(items), err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("frozen Binding route calls=%d, want 1", calls.Load())
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.rows) != 1 || recorder.rows[0].SourceID != nil {
+		t.Fatalf("Source-free Binding attribution=%+v, want nil source_id",
+			recorder.rows)
+	}
+}
+
 func TestRuntimeFetchRegistryRSSFreezesExaEnrichmentGeneration(t *testing.T) {
 	server1, calls1 := exaContentsRuntimeServer(t, "exa-key-1")
 	server2, calls2 := exaContentsRuntimeServer(t, "exa-key-2")

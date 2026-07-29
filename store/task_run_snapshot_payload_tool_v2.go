@@ -59,6 +59,15 @@ func buildTaskRunToolBindingsV1(
 			return nil, errors.New(
 				"runtime policy binds an incompatible Tool implementation")
 		}
+		target, err := acquisitiontool.MaterializeApprovedToolCallV1(
+			call.ToolName, call.ToolContractVersion, call.Arguments)
+		if err != nil || target == nil {
+			return nil, errors.New("approved Tool call cannot be materialized")
+		}
+		config := append(json.RawMessage(nil), target.Config...)
+		if len(bytes.TrimSpace(config)) == 0 {
+			config = json.RawMessage(`{}`)
+		}
 		bindings = append(bindings, runcontext.ToolBindingV1{
 			InvocationDigest: call.Digest,
 			Contract: runcontext.ToolContractBindingV1{
@@ -68,6 +77,12 @@ func buildTaskRunToolBindingsV1(
 				ImplementationVersion: contract.ImplementationVersion,
 			},
 			Capability: capability,
+			Request: runcontext.ToolFetchRequestV1{
+				Platform:   string(target.Platform),
+				Capability: string(target.Capability),
+				URL:        target.URL, Title: target.Title,
+				Config: config,
+			},
 		})
 	}
 	return bindings, nil

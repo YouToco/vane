@@ -77,6 +77,48 @@ func TestCompiledRunFetchWrites_ExactSourceAndAtomicHealth(t *testing.T) {
 	assertNoContentForCanonicalKey(t, f.base.st, outside.CanonicalKey)
 }
 
+func TestCompiledRunFetchWrites_AdoptsSourceFreeCanonicalForV1(
+	t *testing.T,
+) {
+	f := newCompiledRunWriteFixture(t)
+	ctx := t.Context()
+	item := compiledFetchTestItem(f.sourceA, "source-free-first")
+	cleanupCompiledTestContentByCanonical(t, f.base.st, item.CanonicalKey)
+
+	var sourceFreeID int64
+	if err := f.base.st.pool.QueryRow(ctx,
+		`INSERT INTO content_items (
+		    source_id,external_id,canonical_key,url,title,content,
+		    content_hash,kind
+		 ) VALUES (NULL,$1,$2,$3,$4,$5,$6,$7)
+		 RETURNING id`,
+		item.ExternalID, item.CanonicalKey, item.URL, item.Title,
+		"short", item.ContentHash, item.Kind,
+	).Scan(&sourceFreeID); err != nil {
+		t.Fatal(err)
+	}
+	f.content = append(f.content, sourceFreeID)
+
+	gotID, isNew, err := f.base.st.UpsertContentItemForTaskRunV1(
+		ctx, f.idA, f.refA, f.sourceA, &item)
+	if err != nil || isNew || gotID != sourceFreeID {
+		t.Fatalf("V1 adoption=(id=%d new=%v err=%v), want existing %d",
+			gotID, isNew, err, sourceFreeID)
+	}
+	var legacySourceID int64
+	if err := f.base.st.pool.QueryRow(ctx,
+		`SELECT source_id FROM content_items WHERE id=$1`, sourceFreeID,
+	).Scan(&legacySourceID); err != nil {
+		t.Fatalf("V1 reader still sees nullable source_id: %v", err)
+	}
+	if legacySourceID != f.sourceA {
+		t.Fatalf("adopted legacy source=%d, want %d",
+			legacySourceID, f.sourceA)
+	}
+	assertCompiledContentAppearance(
+		t, f.base.st, sourceFreeID, f.sourceA, 1)
+}
+
 func TestCompiledRunFetchWrites_ConfigDriftWinningRaceIsZeroWrite(t *testing.T) {
 	f := newCompiledRunWriteFixture(t)
 	ctx := t.Context()

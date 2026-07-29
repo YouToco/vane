@@ -240,8 +240,8 @@ func TestExaAdHoc_RecordsAttributionWithoutSendingContext(t *testing.T) {
 		if got.TraceID != traceID || got.UserID == nil || *got.UserID != 7007 {
 			t.Fatalf("上游账本归属不完整: trace=%q user=%v", got.TraceID, got.UserID)
 		}
-		if got.SourceID == nil || *got.SourceID != 0 {
-			t.Fatalf("ad-hoc 调用必须是 source_id=0，实得 %v", got.SourceID)
+		if got.SourceID != nil {
+			t.Fatalf("ad-hoc 调用必须省略 source_id，实得 %v", got.SourceID)
 		}
 	}
 

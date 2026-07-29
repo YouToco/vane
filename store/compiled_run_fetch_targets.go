@@ -120,7 +120,8 @@ func (s *Store) ListUnpushedForTaskRunV1(
 		`SELECT id, source_id, external_id, canonical_key, url, title, content, author,
 		        published_at, content_hash, simhash, fetched_at, created_at, kind
 		   FROM (
-		       SELECT ci.id, ci.source_id, ci.external_id, ci.canonical_key, ci.url, ci.title,
+		       SELECT ci.id, COALESCE(ci.source_id, matched.source_id) AS source_id,
+		              ci.external_id, ci.canonical_key, ci.url, ci.title,
 		              ci.content, ci.author, ci.published_at, ci.content_hash, ci.simhash,
 		              ci.fetched_at, ci.created_at, ci.kind,
 		              ROW_NUMBER() OVER (

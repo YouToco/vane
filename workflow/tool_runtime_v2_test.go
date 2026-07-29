@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,21 +21,117 @@ import (
 type compiledToolRunStoreFake struct {
 	mu sync.Mutex
 
-	ref       types.RunSnapshotRefV2
-	found     bool
-	snapshot  runcontext.CompiledSnapshotV2
-	authorize bool
+	ref              types.RunSnapshotRefV2
+	found            bool
+	snapshot         runcontext.CompiledSnapshotV2
+	authorize        bool
+	observation      []types.ContentItem
+	observationFound bool
 
-	loadRefErr   error
-	createErr    error
-	loadErr      error
-	authorizeErr error
+	loadRefErr           error
+	createErr            error
+	loadErr              error
+	authorizeErr         error
+	loadObservationErr   error
+	commitObservationErr error
 
-	loadRefCalls   int
-	createCalls    int
-	loadCalls      int
-	authorizeCalls int
-	createPolicies []runtimepolicy.BundleV1
+	loadRefCalls           int
+	createCalls            int
+	loadCalls              int
+	authorizeCalls         int
+	loadObservationCalls   int
+	commitObservationCalls int
+	createPolicies         []runtimepolicy.BundleV1
+}
+
+func (f *compiledToolRunStoreFake) LoadContentObservationForTaskRunV2(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRefV2,
+	_ string,
+) ([]types.ContentItem, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.loadObservationCalls++
+	return append([]types.ContentItem(nil), f.observation...),
+		f.observationFound, f.loadObservationErr
+}
+
+func (f *compiledToolRunStoreFake) CommitContentObservationForTaskRunV2(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRefV2,
+	_ string,
+	items []types.ContentItem,
+) ([]types.ContentItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commitObservationCalls++
+	if f.commitObservationErr != nil {
+		return nil, f.commitObservationErr
+	}
+	for i := range items {
+		if items[i].ID == 0 {
+			items[i].ID = int64(100 + i)
+		}
+		items[i].SourceID = 0
+	}
+	f.observation = append([]types.ContentItem(nil), items...)
+	f.observationFound = true
+	return append([]types.ContentItem(nil), items...), nil
+}
+
+type compiledToolFetcherV2Fake struct {
+	mu              sync.Mutex
+	items           []types.ContentItem
+	err             error
+	validateErr     error
+	validateCalls   int
+	fetchCalls      int
+	effectGateCalls int
+}
+
+func (f *compiledToolFetcherV2Fake) Fetch(
+	context.Context,
+	types.FetchTarget,
+) ([]types.ContentItem, error) {
+	return nil, errors.New("legacy Fetch must not execute a Tool V2 call")
+}
+
+func (f *compiledToolFetcherV2Fake) ValidateRuntimeFetchRouteV1(
+	_ runtimepolicy.CapabilityV1,
+	target types.FetchTarget,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.validateCalls++
+	if target.ID != 0 {
+		return errors.New("Tool V2 request carried a Source identity")
+	}
+	return f.validateErr
+}
+
+func (f *compiledToolFetcherV2Fake) FetchWithPolicyV1(
+	ctx context.Context,
+	target types.FetchTarget,
+	_ runtimepolicy.CapabilityV1,
+	beforeEffect func(context.Context) error,
+) ([]types.ContentItem, error) {
+	f.mu.Lock()
+	f.fetchCalls++
+	f.mu.Unlock()
+	if target.ID != 0 {
+		return nil, errors.New("Tool V2 request carried a Source ID")
+	}
+	if beforeEffect != nil {
+		f.mu.Lock()
+		f.effectGateCalls++
+		f.mu.Unlock()
+		if err := beforeEffect(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return append([]types.ContentItem(nil), f.items...), f.err
 }
 
 func (f *compiledToolRunStoreFake) LoadCompiledRunSnapshotRefV2(
@@ -217,6 +314,11 @@ func compiledToolActivityFixtureV2(
 				ImplementationVersion: runtimepolicy.CapabilityImplementationExaV1,
 			},
 			Capability: capability,
+			Request: runcontext.ToolFetchRequestV1{
+				Platform: "web", Capability: "search",
+				URL: "vane://web/search?q=AI", Title: "搜索: AI",
+				Config: json.RawMessage(`{"query":"AI"}`),
+			},
 		}},
 		Policy: policy,
 	}
@@ -285,6 +387,13 @@ func TestCompiledToolSnapshotV2_SealRejectsExecutionViewTampering(
 				snapshot.ToolBindings[0].Capability.CredentialRef.Generation++
 				snapshot.Policy.CapabilityCatalog.Allowed[0].
 					CredentialRef.Generation++
+			},
+		},
+		{
+			name: "materialized request",
+			mutate: func(snapshot *runcontext.CompiledSnapshotV2) {
+				snapshot.ToolBindings[0].Request.Config =
+					json.RawMessage(`{"query":"changed"}`)
 			},
 		},
 		{
@@ -417,5 +526,92 @@ func TestPrepareToolRunV2_RejectsFrozenBindingDrift(t *testing.T) {
 	defer st.mu.Unlock()
 	if st.authorizeCalls != 0 {
 		t.Fatal("invalid frozen Tool snapshot reached live authorization")
+	}
+}
+
+func executeToolInvocationV2(
+	t *testing.T,
+	env *testsuite.TestActivityEnvironment,
+	a *Activities,
+	input ExecuteToolInvocationV2Input,
+) (ToolInvocationReceiptV1, error) {
+	t.Helper()
+	encoded, err := env.ExecuteActivity(a.ExecuteToolInvocationV2, input)
+	if err != nil {
+		return ToolInvocationReceiptV1{}, err
+	}
+	var result ToolInvocationReceiptV1
+	if err := encoded.Get(&result); err != nil {
+		t.Fatalf("decode Tool invocation receipt: %v", err)
+	}
+	return result, nil
+}
+
+func TestExecuteToolInvocationV2_CommitsThenRecoversWithoutProviderReplay(
+	t *testing.T,
+) {
+	identity := testActivityIdentity(7, 9, "task-tool-v2-execute")
+	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
+	st := &compiledToolRunStoreFake{
+		ref: ref, found: true, snapshot: snapshot, authorize: true,
+	}
+	frozenFetcher := &compiledToolFetcherV2Fake{
+		items: []types.ContentItem{{
+			ExternalID:   "result-1",
+			CanonicalKey: "https://example.com/result-1",
+			Kind:         types.KindArticle, URL: "https://example.com/result-1",
+			Title: "Result", Content: "exact body",
+			ContentHash: strings.Repeat("e", 64),
+		}},
+	}
+	a := NewActivities(
+		frozenFetcher, fakeScorer{}, fakeCardGen{}, &fakePusher{},
+		&fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledToolRuntimeV2(
+			st,
+			func(context.Context, int64, bool) (
+				runtimepolicy.BundleV1, error,
+			) {
+				return snapshot.Policy, nil
+			},
+			new(compiledModelResolverFake)))
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.ExecuteToolInvocationV2)
+	input := ExecuteToolInvocationV2Input{
+		TenantID: identity.TenantID, UserID: identity.UserID,
+		TaskID: identity.TaskID, Snapshot: ref,
+		InvocationDigest: snapshot.Definition.ToolCalls[0].Digest,
+	}
+	first, err := executeToolInvocationV2(t, env, a, input)
+	if err != nil || first.ContentCount != 1 ||
+		first.InvocationDigest != input.InvocationDigest ||
+		len(first.ObservationDigest) != 64 {
+		t.Fatalf("first Tool V2 receipt=%+v err=%v", first, err)
+	}
+	second, err := executeToolInvocationV2(t, env, a, input)
+	if err != nil ||
+		second.ObservationDigest != first.ObservationDigest ||
+		second.ContentCount != first.ContentCount ||
+		second != first {
+		t.Fatalf("recovered Tool V2 receipt=%+v err=%v", second, err)
+	}
+	frozenFetcher.mu.Lock()
+	validateCalls := frozenFetcher.validateCalls
+	fetchCalls := frozenFetcher.fetchCalls
+	effectCalls := frozenFetcher.effectGateCalls
+	frozenFetcher.mu.Unlock()
+	if validateCalls != 1 || fetchCalls != 1 || effectCalls != 1 {
+		t.Fatalf("Tool V2 provider calls: validate=%d fetch=%d effect=%d",
+			validateCalls, fetchCalls, effectCalls)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.loadObservationCalls != 2 ||
+		st.commitObservationCalls != 1 ||
+		len(st.observation) != 1 ||
+		st.observation[0].SourceID != 0 ||
+		st.observation[0].ID <= 0 {
+		t.Fatalf("Tool V2 observation calls/state: %+v", st)
 	}
 }

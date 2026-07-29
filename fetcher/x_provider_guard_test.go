@@ -53,7 +53,7 @@ var forbiddenXCredentialName = regexp.MustCompile(
 func TestInvariant_XUserPostsUsesTikHubOnly(t *testing.T) {
 	const endpointName = "twitter_web_fetch_user_post_tweet"
 
-	template, ok := bindingTemplates[bindingKey{
+	template, ok := bindingTemplatesV1[bindingKey{
 		P: types.PlatformX, C: types.CapUserPosts,
 	}]
 	if !ok {

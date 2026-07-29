@@ -146,7 +146,7 @@ const (
 // Entry 的必填参数必须都在模板参数集里，Kind 必须与 capabilitycatalog 登记一致。
 // 上游 spec 改名/删端点/改参数时，re-gen 提交在 CI 就红，而不是生产静默断供。
 func TestBindingTemplates_Integrity(t *testing.T) {
-	for key, spec := range bindingTemplates {
+	for key, spec := range bindingTemplatesV1 {
 		entry, ok := tikhubcatalog.Lookup(spec.Endpoint)
 		if !ok {
 			t.Errorf("%s/%s: 端点 %s 不在注册表（re-gen 漂移？）", key.P, key.C, spec.Endpoint)
@@ -666,11 +666,11 @@ func TestBinding_WeiboHotSearch_ExplicitIsAdZeroIsFiltered(t *testing.T) {
 func TestBinding_SpecTimeoutOverride(t *testing.T) {
 	// 微信公众号上游明示 30s（否则「已扣费但收不到响应」）；其余模板用配置默认。
 	b := newTestBinding("http://unused", nil, nil) // cfg TimeoutSeconds=10
-	wechat := bindingTemplates[bindingKey{types.PlatformWechatMP, types.CapUserPosts}]
+	wechat := bindingTemplatesV1[bindingKey{types.PlatformWechatMP, types.CapUserPosts}]
 	if got := b.specTimeout(wechat); got != 30*time.Second {
 		t.Errorf("微信模板超时应为声明的 30s，实际 %v", got)
 	}
-	weibo := bindingTemplates[bindingKey{types.PlatformWeibo, types.CapUserPosts}]
+	weibo := bindingTemplatesV1[bindingKey{types.PlatformWeibo, types.CapUserPosts}]
 	if got := b.specTimeout(weibo); got != 10*time.Second {
 		t.Errorf("未声明超时的模板应用配置默认 10s，实际 %v", got)
 	}
