@@ -30,6 +30,7 @@ type periodicRecoveryStoreFake struct {
 	finalMessage string
 	policyCalls  int
 	claimDigest  string
+	claimErr     error
 	profile      *types.Profile
 }
 
@@ -64,6 +65,9 @@ func (f *periodicRecoveryStoreFake) ClaimPeriodicSynthesisSpendV1(
 	_ int64, _ int64, _ string, _ string,
 ) (store.PeriodicSynthesisReceiptV1, bool, error) {
 	f.claimDigest = requestDigest
+	if f.claimErr != nil {
+		return store.PeriodicSynthesisReceiptV1{}, false, f.claimErr
+	}
 	return store.PeriodicSynthesisReceiptV1{}, true, nil
 }
 func (f *periodicRecoveryStoreFake) RecoverPeriodicBriefReportV1(
@@ -384,6 +388,11 @@ func TestRecoveryConvergesClaimlessPreparedWithWorkflowDigestSemantics(
 		t.Fatal(err)
 	}
 	expectedDigest, err := synthesisRequestDigestV1(
+		store.PeriodicBriefIntentV1{
+			TaskID: "task-v1", Cadence: "weekly", Timezone: "UTC",
+			PeriodStart: brief.GeneratedAt.AddDate(0, 0, -1),
+			PeriodEnd:   brief.GeneratedAt.AddDate(0, 0, 1),
+		},
 		inputDigest, profileDigest, store.PeriodicSynthesisPolicyV1{})
 	if err != nil {
 		t.Fatal(err)
@@ -428,6 +437,58 @@ func TestRecoverySkipsRunningExactTemporalExecution(t *testing.T) {
 	}
 	if fakeStore.loadCalls != 0 {
 		t.Fatal("running execution was recovered")
+	}
+}
+
+func TestRecoveryTreatsDuplicatePreparedRequestAsContainedConflict(
+	t *testing.T,
+) {
+	brief := periodicRecoveryBriefFixture(t)
+	fakeStore := &periodicRecoveryStoreFake{
+		claimErr: types.NewAppError(
+			types.CodeConflict, "duplicate request", types.ErrConflict),
+		loaded: store.PeriodicBriefIntentInputsV1{
+			Intent: store.PeriodicBriefIntentV1{
+				ID: 9, TenantID: 4, UserID: 5, TaskID: "task-v1",
+				Cadence: "weekly", Timezone: "UTC",
+				PeriodStart:    brief.GeneratedAt.AddDate(0, 0, -1),
+				PeriodEnd:      brief.GeneratedAt.AddDate(0, 0, 1),
+				InputDigest:    strings.Repeat("a", 64),
+				RunOutcomeIDs:  []int64{8},
+				OutcomeDigest:  strings.Repeat("d", 64),
+				SourceCoverage: types.RunCompletenessComplete,
+				Processing:     types.RunCompletenessComplete,
+			},
+			Briefs: []types.BriefV1{brief},
+		},
+	}
+	runner, err := NewRecoveryRunner(
+		fakeStore,
+		periodicDescriberFake{
+			response: &workflowservice.DescribeWorkflowExecutionResponse{
+				WorkflowExecutionInfo: &workflowpb.WorkflowExecutionInfo{
+					Execution: &commonpb.WorkflowExecution{
+						WorkflowId: "wf", RunId: "run"},
+					Status: enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+				},
+			},
+		},
+		&periodicRecoverySenderFake{},
+		"https://vane.example", "task-v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.recoverOne(
+		t.Context(),
+		store.PeriodicSynthesisRecoveryCandidateV1{
+			Kind: "prepared", IntentID: 9, TenantID: 4, UserID: 5,
+			WorkflowID: "wf", TemporalRunID: "run",
+		},
+	); err != nil {
+		t.Fatalf("duplicate request escaped recovery pass: %v", err)
+	}
+	if fakeStore.recovered != nil {
+		t.Fatal("duplicate request created a second report")
 	}
 }
 
