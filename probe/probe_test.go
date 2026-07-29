@@ -168,7 +168,7 @@ func TestJudgeDiscrimination(t *testing.T) {
 			[]types.ScoreTraceStat{flat("t1", 5, "21", 1)}, StatusRed},
 		// tokens 高于单数字量级 = 思维链泄漏之类的异常，证据不齐按可疑。
 		{"低分但 tokens 异常高维持红",
-			[]types.ScoreTraceStat{flat("t1", 5, "0", benignMaxCompletionTokens + 1)}, StatusRed},
+			[]types.ScoreTraceStat{flat("t1", 5, "0", benignMaxCompletionTokens+1)}, StatusRed},
 		{"tokens=0 记账不完整按可疑处理",
 			[]types.ScoreTraceStat{flat("t1", 5, "0", 0)}, StatusRed},
 		{"带解释文字的同分不良性",
@@ -804,6 +804,40 @@ func TestRun_ProfileNotFoundIsNotAnError(t *testing.T) {
 	if got := rep.Worst(); got != StatusYellow {
 		t.Errorf("无画像的空报告应是 yellow 而非 %s——vacuously green 正是本设计要防的", got)
 	}
+}
+
+// Reset learning 保留 profiles 审计行但清空全部可渲染字段。运行时会把它当
+// 无画像；Gate 必须同形，否则重置后的第一条正常打分会把部署误报成红灯。
+func TestRun_BlankProfileRowMatchesRuntimeNoProfileSemantics(t *testing.T) {
+	now := time.Date(2026, 7, 29, 3, 15, 0, 0, time.UTC)
+	f := &fakeStore{
+		profile: &types.Profile{
+			UserID:    1,
+			CreatedAt: now.Add(-30 * 24 * time.Hour),
+			UpdatedAt: now.Add(-time.Hour),
+		},
+		inj: types.ProfileInjectionStat{Total: 1, Absent: 1},
+	}
+
+	rep, err := Run(t.Context(), f, 1, now, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("Run() 失败: %v", err)
+	}
+	if rep.Evolve.HasProfile || rep.Evolve.ProfileUpdatedAt != nil {
+		t.Fatalf("全空画像行必须与运行时一致地视为无画像: %+v", rep.Evolve)
+	}
+	if want := now.Add(-24 * time.Hour); !f.gotInjSince.Equal(want) {
+		t.Fatalf("空画像不得用旧行 created_at 钳窗口: got=%v want=%v", f.gotInjSince, want)
+	}
+	if f.gotTail != "" {
+		t.Fatalf("空画像不应产生负面句期望: %q", f.gotTail)
+	}
+	byID := map[string]Result{}
+	for _, r := range rep.Results {
+		byID[r.ID] = r
+	}
+	checkStatus(t, byID["profile_injection"], StatusYellow)
+	checkStatus(t, byID["evolve_health"], StatusYellow)
 }
 
 // 画像创建时刻落在探针窗口**之内**时，注入统计的起点必须钳到创建时刻：

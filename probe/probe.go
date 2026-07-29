@@ -163,7 +163,7 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 		UserID:      userID,
 	}
 
-	// 画像先取：探针 ④⑤⑦ 的判定都以"owner 到底有没有画像"为前提。
+	// 画像先取：探针 ④⑤⑦ 的判定都以"owner 到底有没有可用画像"为前提。
 	// NotFound 不是错误——首采前画像本就不存在（profilehint/cache.go:35 同此语义）。
 	prof, err := st.GetProfile(ctx, userID)
 	if err != nil && !errors.Is(err, types.ErrNotFound) {
@@ -172,6 +172,10 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 	if err != nil {
 		prof = nil // NotFound：GetProfile 已返回 nil，这里显式归零免得后续误用
 	}
+	// 画像重置会保留 append-only 审计与 profiles 行，但清空所有可渲染字段。
+	// 运行时 profilehint.Build 对这种行返回空串，打分 prompt 正确写「暂无」；
+	// Gate 必须复用同一个定义，不能把“数据库有一行”误报成“注入失效”。
+	hasProfile := profilehint.Build(prof) != ""
 
 	if rep.ScoreTraces, err = st.ListScoreTraceStats(ctx, since, minTraceN); err != nil {
 		return rep, err
@@ -196,7 +200,7 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 	// 无历史表无法定位改写时刻（同 judgeEvolve 的超集不可验证限制），出现时以
 	// Detail 里的期望串人工比对窗口内 prompt 即可辨认。
 	injSince := since
-	if prof != nil && prof.CreatedAt.After(injSince) {
+	if hasProfile && prof.CreatedAt.After(injSince) {
 		injSince = prof.CreatedAt
 	}
 	if rep.Injection, err = st.GetProfileInjectionStat(ctx, injSince); err != nil {
@@ -216,8 +220,8 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 	if err != nil {
 		return rep, err
 	}
-	rep.Evolve = EvolveView{EvolveCallStat: evolveStat, HasProfile: prof != nil}
-	if prof != nil {
+	rep.Evolve = EvolveView{EvolveCallStat: evolveStat, HasProfile: hasProfile}
+	if hasProfile {
 		rep.Evolve.ProfileUpdatedAt = &prof.UpdatedAt
 		rep.Evolve.Cursor = prof.LastEvolvedFeedbackID
 		rep.Evolve.TagCount = len(prof.Tags)
@@ -233,7 +237,7 @@ func Run(ctx context.Context, st Store, userID int64, now time.Time, window time
 		judgeDiscrimination(rep.ScoreTraces),
 		judgeFallbackRate(rep.Quality),
 		judgeEmptyOutput(rep.Quality),
-		judgeInjection(rep.Injection, prof != nil),
+		judgeInjection(rep.Injection, hasProfile),
 		judgeNegTail(rep.NegTail),
 		judgeCost(rep.Costs),
 		judgeEvolve(rep.Evolve),
