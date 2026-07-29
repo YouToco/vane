@@ -158,7 +158,10 @@ type ExecutiveBriefContentV1 struct {
 	NextSteps        []ExecutiveNextStepV1    `json:"next_steps"`
 }
 
-func (c ExecutiveBriefContentV1) validate(periodic bool) error {
+func (c ExecutiveBriefContentV1) validate(
+	periodic bool,
+	allowClaimlessFallback bool,
+) error {
 	if !validBriefText(c.Headline, maxExecutiveHeadlineBytes, false) ||
 		!validBriefText(c.ExecutiveSummary, maxExecutiveTextBytes, false) ||
 		!c.DecisionState.Valid() ||
@@ -168,10 +171,18 @@ func (c ExecutiveBriefContentV1) validate(periodic bool) error {
 		return errors.New("executive brief content is invalid")
 	}
 	if len(c.Signals) == 0 {
-		if !periodic ||
-			(c.DecisionState != ExecutiveDecisionNoAction &&
-				c.DecisionState != ExecutiveDecisionInsufficientEvidence) ||
-			len(c.NextSteps) != 0 {
+		// Evidence-free terminal content is reserved for trusted deterministic
+		// fallback. Model output must always contain an evidence-bound signal.
+		validEmptyDecision := false
+		if allowClaimlessFallback {
+			validEmptyDecision = c.DecisionState ==
+				ExecutiveDecisionInsufficientEvidence
+			if periodic {
+				validEmptyDecision = validEmptyDecision ||
+					c.DecisionState == ExecutiveDecisionNoAction
+			}
+		}
+		if !validEmptyDecision || len(c.NextSteps) != 0 {
 			return errors.New("executive brief content is empty")
 		}
 		return nil
@@ -217,13 +228,27 @@ func (c ExecutiveBriefContentV1) validate(periodic bool) error {
 // BriefID until the canonical Brief is frozen, but it must name exact Insights
 // and claim indexes.
 func (c ExecutiveBriefContentV1) ValidateIssue() error {
-	return c.validate(false)
+	return c.validate(false, false)
+}
+
+// ValidateIssueFallback permits the one evidence-free terminal shape produced
+// by trusted deterministic fallback: insufficient_evidence with no signals or
+// actions. Model parsing must use ValidateIssue instead.
+func (c ExecutiveBriefContentV1) ValidateIssueFallback() error {
+	return c.validate(false, true)
 }
 
 // ValidatePeriodic verifies content for a cross-run report. Every evidence
 // reference must include its immutable canonical Brief identity.
 func (c ExecutiveBriefContentV1) ValidatePeriodic() error {
-	return c.validate(true)
+	return c.validate(true, false)
+}
+
+// ValidatePeriodicFallback permits the evidence-free no-action and
+// insufficient-evidence terminal shapes produced by trusted deterministic
+// fallback. Model parsing must use ValidatePeriodic instead.
+func (c ExecutiveBriefContentV1) ValidatePeriodicFallback() error {
+	return c.validate(true, true)
 }
 
 // BindBriefID returns a deep copy whose evidence references are attached to
@@ -231,7 +256,24 @@ func (c ExecutiveBriefContentV1) ValidatePeriodic() error {
 func (c ExecutiveBriefContentV1) BindBriefID(
 	briefID int64,
 ) (ExecutiveBriefContentV1, error) {
-	if briefID <= 0 || c.ValidateIssue() != nil {
+	return c.bindBriefID(briefID, false)
+}
+
+// BindBriefIDFallback is the deterministic-fallback counterpart of
+// BindBriefID. Its only additional accepted shape is the claimless
+// insufficient-evidence terminal content validated above.
+func (c ExecutiveBriefContentV1) BindBriefIDFallback(
+	briefID int64,
+) (ExecutiveBriefContentV1, error) {
+	return c.bindBriefID(briefID, true)
+}
+
+func (c ExecutiveBriefContentV1) bindBriefID(
+	briefID int64,
+	allowClaimlessIssueFallback bool,
+) (ExecutiveBriefContentV1, error) {
+	if briefID <= 0 ||
+		c.validate(false, allowClaimlessIssueFallback) != nil {
 		return ExecutiveBriefContentV1{},
 			errors.New("executive brief identity binding is invalid")
 	}
@@ -265,7 +307,9 @@ func (c ExecutiveBriefContentV1) BindBriefID(
 			ref.BriefID = briefID
 		}
 	}
-	if err := bound.validate(false); err != nil {
+	if err := bound.validate(
+		false, allowClaimlessIssueFallback,
+	); err != nil {
 		return ExecutiveBriefContentV1{}, err
 	}
 	return bound, nil
@@ -313,6 +357,10 @@ func (d ExecutiveBriefArtifactDraftV1) Canonical() (
 }
 
 func (d ExecutiveBriefArtifactDraftV1) Validate() error {
+	contentErr := d.Content.ValidateIssue()
+	if d.GenerationMode == ExecutiveGenerationFallback {
+		contentErr = d.Content.ValidateIssueFallback()
+	}
 	if d.SchemaVersion != ExecutiveBriefSchemaVersionV1 ||
 		d.RunOutcomeID <= 0 || d.RunSnapshotID <= 0 || d.PushBatchID <= 0 ||
 		d.TenantID <= 0 || d.UserID <= 0 ||
@@ -323,7 +371,7 @@ func (d ExecutiveBriefArtifactDraftV1) Validate() error {
 		!d.GenerationMode.Valid() || !d.Processing.Valid() ||
 		d.GeneratedAt.IsZero() ||
 		d.GeneratedAt != canonicalBriefTime(d.GeneratedAt) ||
-		d.Content.validate(false) != nil {
+		contentErr != nil {
 		return errors.New("executive brief artifact draft is invalid")
 	}
 	if d.GenerationMode == ExecutiveGenerationModel &&
@@ -455,6 +503,10 @@ func (d PeriodicBriefReportDraftV1) Canonical() (
 }
 
 func (d PeriodicBriefReportDraftV1) Validate() error {
+	contentErr := d.Content.ValidatePeriodic()
+	if d.GenerationMode == ExecutiveGenerationFallback {
+		contentErr = d.Content.ValidatePeriodicFallback()
+	}
 	if d.SchemaVersion != PeriodicBriefSchemaVersionV1 ||
 		d.TenantID <= 0 || d.UserID <= 0 ||
 		!validBriefText(d.TaskID, maxBriefTaskIDBytes, false) ||
@@ -475,7 +527,7 @@ func (d PeriodicBriefReportDraftV1) Validate() error {
 		len(d.RunOutcomeIDs) > maxPeriodicRunOutcomes ||
 		!d.GenerationMode.Valid() ||
 		!d.SourceCoverage.Valid() || !d.Processing.Valid() ||
-		d.Content.validate(true) != nil {
+		contentErr != nil {
 		return errors.New("periodic brief report draft is invalid")
 	}
 	lastID := int64(0)

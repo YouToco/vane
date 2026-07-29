@@ -501,3 +501,36 @@ func TestBuildAggregateCardExecutiveSummaryPrecedesCanonicalTopItems(
 		t.Fatalf("executive summary is not the card prefix: %s", card)
 	}
 }
+
+func TestBuildAggregateCardRendersClaimlessExecutiveFallbackOnlyWhenMarked(
+	t *testing.T,
+) {
+	content := types.ExecutiveBriefContentV1{
+		Headline:         "最高优先级内容证据不足",
+		ExecutiveSummary: "本期仍可阅读逐条情报，但暂不形成行动判断。",
+		DecisionState:    types.ExecutiveDecisionInsufficientEvidence,
+		WhyForYou:        "等待更多可验证证据后再判断。",
+		Signals:          []types.ExecutiveSignalV1{},
+		NextSteps:        []types.ExecutiveNextStepV1{},
+	}
+	input := feedback.AggregateCardInput{
+		Executive: &content,
+		Items: []feedback.CardInput{{
+			DeliveryID: 10, Title: "第一条", BodyMD: "证据正文",
+		}},
+	}
+	if card := BuildAggregateCard(input); strings.Contains(
+		card, "最高优先级内容证据不足",
+	) {
+		t.Fatalf("claimless model content was rendered: %s", card)
+	}
+	input.ExecutiveFallback = true
+	input.ExecutivePartial = true
+	card := BuildAggregateCard(input)
+	if !strings.Contains(card, "最高优先级内容证据不足") ||
+		!strings.Contains(card, "覆盖不完整") ||
+		strings.Index(card, "最高优先级内容证据不足") >
+			strings.Index(card, "第一条") {
+		t.Fatalf("claimless fallback was not rendered as prefix: %s", card)
+	}
+}

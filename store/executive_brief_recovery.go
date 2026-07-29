@@ -193,7 +193,7 @@ func (s *Store) RecoverExecutiveSynthesisFallbackV1(
 		expected, ref, marker); err != nil {
 		return ExecutiveSynthesisReceiptV1{}, err
 	}
-	if err := content.ValidateIssue(); err != nil {
+	if err := content.ValidateIssueFallback(); err != nil {
 		return ExecutiveSynthesisReceiptV1{},
 			canonicalBriefValidationError(
 				"executive synthesis recovery content is invalid")

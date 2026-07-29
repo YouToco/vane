@@ -94,7 +94,7 @@ func (f *recoveryStoreFake) FreezeExecutiveBriefArtifactRecoveryV1(
 	return draft.Seal(1, 2)
 }
 
-func TestRunnerConvergesStaleSpendToFallbackAndFreeze(t *testing.T) {
+func TestRunnerConvergesClaimlessStaleSpendToFallbackAndFreeze(t *testing.T) {
 	marker := types.RunOutcomeMarkerV1{
 		ID: 1, SchemaVersion: types.RunOutcomeSchemaVersionV1,
 		RunSnapshotID: 2, TenantID: 3, UserID: 4, TaskID: "task-a",
@@ -112,13 +112,10 @@ func TestRunnerConvergesStaleSpendToFallbackAndFreeze(t *testing.T) {
 	structured, err := types.SealStructuredInsightEvidenceV1(
 		types.StructuredInsightV1{
 			SchemaVersion: types.StructuredInsightSchemaVersionV1,
-			BodyMD:        "body", WhatChanged: "change",
-			WhyItMatters: "reason", ImportanceReason: "importance",
-			Claims: []types.StructuredClaimV1{{
-				Text: "claim", Excerpt: "excerpt",
-				SourceRefs: []string{"source-1"},
-			}},
-		}, map[string]string{"source-1": "excerpt"})
+			BodyMD:        "body",
+			WhatChanged:   "", WhyItMatters: "",
+			ImportanceReason: "", Claims: nil,
+		}, map[string]string{"source-1": "evidence"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,5 +159,12 @@ func TestRunnerConvergesStaleSpendToFallbackAndFreeze(t *testing.T) {
 	if fake.recovered != 1 || fake.frozen != 1 {
 		t.Fatalf("recovered=%d frozen=%d",
 			fake.recovered, fake.frozen)
+	}
+	if fake.receipt.Content == nil ||
+		fake.receipt.Content.DecisionState !=
+			types.ExecutiveDecisionInsufficientEvidence ||
+		len(fake.receipt.Content.Signals) != 0 ||
+		len(fake.receipt.Content.NextSteps) != 0 {
+		t.Fatalf("claimless recovery content=%+v", fake.receipt.Content)
 	}
 }

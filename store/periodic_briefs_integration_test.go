@@ -74,7 +74,7 @@ func TestPeriodicSynthesisPolicyLoadsExactSnapshotAndRevocationFailsClosed(
 }
 
 func TestPeriodicReportRecoveryFreezesExactCanonicalInputs(t *testing.T) {
-	f, marker, briefDraft := executiveSynthesisFixtureV1(t)
+	f, marker, briefDraft := executiveSynthesisFixtureV1(t, true)
 	prepare := prepareExecutiveSynthesisReceiptV1(
 		t, f, marker, briefDraft)
 	issueContent := executiveSynthesisContentV1(f.deliveryID[0])
@@ -201,6 +201,21 @@ func TestPeriodicReportRecoveryFreezesExactCanonicalInputs(t *testing.T) {
 	reportDraft, err = reportDraft.Canonical()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := f.base.st.FinalizePeriodicBriefReportV1(
+		t.Context(), f.identity.TenantID, f.identity.UserID,
+		intent.ID, requestDigest, reportDraft, false,
+	); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("fallback draft with model receipt error=%v", err)
+	}
+	modelDraft := reportDraft
+	modelDraft.GenerationMode = types.ExecutiveGenerationModel
+	modelDraft.Processing = types.RunCompletenessComplete
+	if _, err := f.base.st.RecoverPeriodicBriefReportV1(
+		t.Context(), f.identity.TenantID, f.identity.UserID,
+		intent.ID, requestDigest, modelDraft,
+	); types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("model draft with fallback receipt error=%v", err)
 	}
 	driftedOutcomeDraft := reportDraft
 	driftedOutcomeDraft.RunOutcomeIDs = []int64{

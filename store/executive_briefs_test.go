@@ -10,6 +10,7 @@ import (
 
 func executiveSynthesisFixtureV1(
 	t *testing.T,
+	withClaims bool,
 ) (*canonicalBriefFixture, types.RunOutcomeMarkerV1, types.BriefDraftV1) {
 	t.Helper()
 	f := newCanonicalBriefFixture(t, 1)
@@ -34,20 +35,22 @@ func executiveSynthesisFixtureV1(
 	if err != nil {
 		t.Fatal(err)
 	}
+	structuredInput := types.StructuredInsightV1{
+		SchemaVersion: types.StructuredInsightSchemaVersionV1,
+		BodyMD:        f.bodyMD[0],
+	}
+	if withClaims {
+		structuredInput.WhatChanged = "A verified change occurred."
+		structuredInput.WhyItMatters = "It affects the monitored decision."
+		structuredInput.ImportanceReason =
+			"The source directly supports the claim."
+		structuredInput.Claims = []types.StructuredClaimV1{{
+			Text: "A verified change occurred.", Excerpt: excerpt,
+			SourceRefs: []string{"source-1"},
+		}}
+	}
 	structured, err := types.SealStructuredInsightEvidenceV1(
-		types.StructuredInsightV1{
-			SchemaVersion:    types.StructuredInsightSchemaVersionV1,
-			BodyMD:           f.bodyMD[0],
-			WhatChanged:      "A verified change occurred.",
-			WhyItMatters:     "It affects the monitored decision.",
-			ImportanceReason: "The source directly supports the claim.",
-			Claims: []types.StructuredClaimV1{{
-				Text: "A verified change occurred.", Excerpt: excerpt,
-				SourceRefs: []string{"source-1"},
-			}},
-		},
-		map[string]string{"source-1": excerpt},
-	)
+		structuredInput, map[string]string{"source-1": excerpt})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +133,7 @@ func prepareExecutiveSynthesisReceiptV1(
 func TestExecutiveSynthesisAtMostOnceLifecycleAndArtifactReplay(
 	t *testing.T,
 ) {
-	f, marker, briefDraft := executiveSynthesisFixtureV1(t)
+	f, marker, briefDraft := executiveSynthesisFixtureV1(t, true)
 	prepare := prepareExecutiveSynthesisReceiptV1(
 		t, f, marker, briefDraft)
 	spending, claimed, err := f.base.st.ClaimExecutiveSynthesisSpendV1(
@@ -156,6 +159,19 @@ func TestExecutiveSynthesisAtMostOnceLifecycleAndArtifactReplay(
 	if _, err := f.base.st.FinalizeExecutiveSynthesisV1(
 		t.Context(), f.identity, f.ref, marker, forged); err == nil {
 		t.Fatal("finalize admitted an out-of-range frozen claim reference")
+	}
+	claimlessModel := types.ExecutiveBriefContentV1{
+		Headline:         "证据不足",
+		ExecutiveSummary: "未经引用的模型判断。",
+		DecisionState:    types.ExecutiveDecisionInsufficientEvidence,
+		WhyForYou:        "未经引用的个人影响。",
+		Signals:          []types.ExecutiveSignalV1{},
+		NextSteps:        []types.ExecutiveNextStepV1{},
+	}
+	if _, err := f.base.st.FinalizeExecutiveSynthesisV1(
+		t.Context(), f.identity, f.ref, marker, claimlessModel,
+	); err == nil {
+		t.Fatal("model finalize admitted claimless content")
 	}
 	finalized, err := f.base.st.FinalizeExecutiveSynthesisV1(
 		t.Context(), f.identity, f.ref, marker, content)
@@ -208,7 +224,7 @@ func TestExecutiveSynthesisAtMostOnceLifecycleAndArtifactReplay(
 }
 
 func TestExecutiveSynthesisFallbackDoesNotRequireSpendClaim(t *testing.T) {
-	f, marker, draft := executiveSynthesisFixtureV1(t)
+	f, marker, draft := executiveSynthesisFixtureV1(t, true)
 	prepareExecutiveSynthesisReceiptV1(t, f, marker, draft)
 	fallback := executiveSynthesisContentV1(f.deliveryID[0])
 	fallback.DecisionState = types.ExecutiveDecisionInsufficientEvidence
@@ -220,5 +236,72 @@ func TestExecutiveSynthesisFallbackDoesNotRequireSpendClaim(t *testing.T) {
 	if err != nil || receipt.Status != ExecutiveSynthesisFallback ||
 		receipt.SpendingStartedAt != nil {
 		t.Fatalf("fallback = %+v, err=%v", receipt, err)
+	}
+}
+
+func TestExecutiveSynthesisClaimlessSpendingRecoveryFreezesArtifact(
+	t *testing.T,
+) {
+	f, marker, draft := executiveSynthesisFixtureV1(t, false)
+	prepare := prepareExecutiveSynthesisReceiptV1(t, f, marker, draft)
+	if _, claimed, err := f.base.st.ClaimExecutiveSynthesisSpendV1(
+		t.Context(), f.identity, f.ref, marker,
+	); err != nil || !claimed {
+		t.Fatalf("claim spending = %t, err=%v", claimed, err)
+	}
+	content := types.ExecutiveBriefContentV1{
+		Headline:         "最高优先级内容证据不足，暂不形成综合判断",
+		ExecutiveSummary: "逐条情报已保留，但最高优先级内容缺少可验证的结构化主张；本期不生成未经证据支持的共同信号或下一步。",
+		DecisionState:    types.ExecutiveDecisionInsufficientEvidence,
+		WhyForYou:        "当前证据无法可靠解释个人影响，请以完整简报中的原始内容为准。",
+		Signals:          []types.ExecutiveSignalV1{},
+		NextSteps:        []types.ExecutiveNextStepV1{},
+	}
+	receipt, err := f.base.st.RecoverExecutiveSynthesisFallbackV1(
+		t.Context(), f.identity, f.ref, marker, content)
+	if err != nil || receipt.Status != ExecutiveSynthesisFallback ||
+		receipt.FinalizedAt == nil {
+		t.Fatalf("recover fallback = %+v, err=%v", receipt, err)
+	}
+	if _, err := f.base.st.FinalizeRunOutcomeClaimV1(
+		t.Context(), f.identity, f.ref, types.RunOutcomeClaimV1{
+			RunOutcomeMarkerV1: marker,
+			Result:             types.RunResultContent,
+			SourceCoverage:     types.RunCompletenessComplete,
+			Processing:         types.RunCompletenessPartial,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := f.base.st.FreezeExecutiveBriefArtifactRecoveryV1(
+		t.Context(), f.identity, f.ref,
+		types.ExecutiveBriefArtifactDraftV1{
+			SchemaVersion:  types.ExecutiveBriefSchemaVersionV1,
+			RunOutcomeID:   marker.ID,
+			RunSnapshotID:  f.ref.SnapshotID,
+			PushBatchID:    f.batchID,
+			TenantID:       f.identity.TenantID,
+			UserID:         f.identity.UserID,
+			TaskID:         f.identity.TaskID,
+			ProfileEpoch:   prepare.ProfileEpoch,
+			ProfileVersion: prepare.ProfileVersion,
+			ProfileDigest:  prepare.ProfileDigest,
+			InputDigest:    prepare.InputDigest,
+			GenerationMode: types.ExecutiveGenerationFallback,
+			Processing:     types.RunCompletenessPartial,
+			GeneratedAt:    *receipt.FinalizedAt,
+			Content:        content,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact.BriefSnapshotID <= 0 ||
+		artifact.GenerationMode != types.ExecutiveGenerationFallback ||
+		artifact.Content.DecisionState !=
+			types.ExecutiveDecisionInsufficientEvidence ||
+		len(artifact.Content.Signals) != 0 ||
+		len(artifact.Content.NextSteps) != 0 {
+		t.Fatalf("claimless recovery artifact=%+v", artifact)
 	}
 }

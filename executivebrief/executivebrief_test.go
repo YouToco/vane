@@ -72,6 +72,25 @@ func TestParseIssueContentV1RejectsForgedReference(t *testing.T) {
 	}
 }
 
+func TestParseIssueContentV1RejectsClaimlessModelOutput(t *testing.T) {
+	draft := testIssueDraft(t)
+	content := types.ExecutiveBriefContentV1{
+		Headline:         "证据不足",
+		ExecutiveSummary: "未经引用的模型判断。",
+		DecisionState:    types.ExecutiveDecisionInsufficientEvidence,
+		WhyForYou:        "未经引用的个人影响。",
+		Signals:          []types.ExecutiveSignalV1{},
+		NextSteps:        []types.ExecutiveNextStepV1{},
+	}
+	raw, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseIssueContentV1(raw, draft); err == nil {
+		t.Fatal("claimless model output was accepted")
+	}
+}
+
 func TestDeterministicFallbackV1PreservesCanonicalPrefix(t *testing.T) {
 	draft := testIssueDraft(t)
 	content, err := DeterministicFallbackV1(
@@ -83,6 +102,59 @@ func TestDeterministicFallbackV1PreservesCanonicalPrefix(t *testing.T) {
 		content.Signals[0].EvidenceRefs[0].InsightID != draft.Insights[0].ID ||
 		content.DecisionState != types.ExecutiveDecisionInsufficientEvidence {
 		t.Fatalf("fallback=%+v", content)
+	}
+}
+
+func TestDeterministicFallbackV1FailsClosedWithoutClaims(t *testing.T) {
+	draft := testIssueDraft(t)
+	draft.Insights[0].Structured.Claims = nil
+	draft.Insights[0].Structured.WhatChanged = ""
+	draft.Insights[0].Structured.WhyItMatters = ""
+	draft.Insights[0].Structured.ImportanceReason = ""
+	if err := draft.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	content, err := DeterministicFallbackV1(ProfileContextV1{}, draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content.DecisionState !=
+		types.ExecutiveDecisionInsufficientEvidence ||
+		len(content.Signals) != 0 || len(content.NextSteps) != 0 ||
+		content.ValidateIssueFallback() != nil {
+		t.Fatalf("claimless fallback=%+v", content)
+	}
+}
+
+func TestDeterministicPeriodicFallbackV1FailsClosedWithoutClaims(
+	t *testing.T,
+) {
+	draft := testIssueDraft(t)
+	draft.Insights[0].Structured.Claims = nil
+	draft.Insights[0].Structured.WhatChanged = ""
+	draft.Insights[0].Structured.WhyItMatters = ""
+	draft.Insights[0].Structured.ImportanceReason = ""
+	brief, err := draft.Seal(17)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := DeterministicPeriodicFallbackV1(
+		[]types.BriefV1{brief})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content.DecisionState !=
+		types.ExecutiveDecisionInsufficientEvidence ||
+		len(content.Signals) != 0 || len(content.NextSteps) != 0 ||
+		content.ValidatePeriodicFallback() != nil {
+		t.Fatalf("claimless periodic fallback=%+v", content)
+	}
+	raw, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParsePeriodicContentV1(raw, []types.BriefV1{brief}); err == nil {
+		t.Fatal("claimless periodic model output was accepted")
 	}
 }
 
