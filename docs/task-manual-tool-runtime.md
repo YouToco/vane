@@ -108,6 +108,14 @@ Migration 075 separates database admission as well: ref/v1 retains the old
 shadow marker/sidecar fence, while ref/v2 requires an active Approved V2 head
 and the exact current Adaptive V2 basis and writes no legacy shadow.
 
+The registered `PrepareToolRunV2` Activity is the dark run-start boundary for
+this protocol. It first recovers an exact committed ref by Temporal RunID,
+before reading current policy, and then validates the frozen definition,
+adaptive basis, logical Tool contracts and selected capability routes. It has
+its own Store interface and cannot call retained Source-ID effects. No
+Schedule Action or Workflow selects the V2 runtime label until Tool execution
+and observation provenance are complete.
+
 Every accepted content item and every delivery must trace to:
 
 ```text

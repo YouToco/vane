@@ -283,6 +283,24 @@ type CompiledRunStore interface {
 	) ([]storepkg.StructuredEventEvidenceContentV1, error)
 }
 
+// CompiledToolRunStoreV2 is intentionally disjoint from CompiledRunStore.
+// Source-free refs can never reach retained Source-ID effect methods.
+type CompiledToolRunStoreV2 interface {
+	LoadCompiledRunSnapshotRefV2(
+		context.Context, types.RunIdentity,
+	) (types.RunSnapshotRefV2, bool, error)
+	CreateOrGetCompiledRunSnapshotV2(
+		context.Context, types.RunIdentity, runtimepolicy.BundleV1,
+		...observation.RolloutMode,
+	) (types.RunSnapshotRefV2, error)
+	LoadCompiledTaskRunSnapshotV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2,
+	) (runcontext.CompiledSnapshotV2, error)
+	AuthorizeTaskRunSideEffectV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2,
+	) (bool, error)
+}
+
 type RunOutcomeStoreV1 interface {
 	CreatePendingRunOutcomeV1(
 		context.Context, types.RunIdentity, types.RunSnapshotRef,
@@ -462,15 +480,18 @@ type Activities struct {
 	playbookPromptsEnabled           bool
 	playbookPromptCanaryScheduleID   string
 	compiledStore                    CompiledRunStore
+	compiledToolStoreV2              CompiledToolRunStoreV2
 	runOutcomeStore                  RunOutcomeStoreV1
 	canonicalBriefStore              CanonicalBriefStoreV1
 	buildCompiledPolicyV1            CompiledPolicyBuilderV1
+	buildCompiledToolPolicyV2        CompiledPolicyBuilderV1
 	buildStructuredPolicyV1          CompiledPolicyBuilderV1
 	buildExecutiveBriefPolicyV1      CompiledPolicyBuilderV1
 	executiveBriefStore              ExecutiveBriefStoreV1
 	executiveBriefRendererTaskID     string
 	llmRecorder                      *llm.Recorder
 	compiledModelResolverV1          CompiledModelResolverV1
+	compiledToolModelResolverV2      CompiledModelResolverV1
 	compiledShadowStoreV2            CompiledRunSnapshotShadowV2Store
 	snapshotV2ShadowCanaryTaskID     string
 	compiledSnapshotV2AuditReader    CompiledRunSnapshotV2AuditReader
@@ -571,6 +592,20 @@ func WithCompiledRuntimeV1(
 		a.compiledStore = st
 		a.buildCompiledPolicyV1 = builder
 		a.compiledModelResolverV1 = modelResolver
+	}
+}
+
+// WithCompiledToolRuntimeV2 installs the dark Source-free run-start boundary.
+// No Schedule Action selects it until Tool execution and provenance are wired.
+func WithCompiledToolRuntimeV2(
+	st CompiledToolRunStoreV2,
+	builder CompiledPolicyBuilderV1,
+	modelResolver CompiledModelResolverV1,
+) ActivitiesOption {
+	return func(a *Activities) {
+		a.compiledToolStoreV2 = st
+		a.buildCompiledToolPolicyV2 = builder
+		a.compiledToolModelResolverV2 = modelResolver
 	}
 }
 
@@ -1115,6 +1150,111 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 	result := PrepareRunResult{Authorized: true, Snapshot: ref}
 	if err := result.ValidateFor(expected); err != nil {
 		return PrepareRunResult{}, nonRetryable(err)
+	}
+	return result, nil
+}
+
+// PrepareToolRunV2 is the dark Source-free run-start producer. It recovers an
+// already committed ref before consulting mutable policy and returns only the
+// V2 safe reference; Tool arguments and policy bodies remain outside Temporal
+// history. No existing Schedule Action selects this Activity yet.
+func (a *Activities) PrepareToolRunV2(
+	ctx context.Context,
+	p PushParams,
+) (PrepareToolRunV2Result, error) {
+	if a.compiledToolStoreV2 == nil ||
+		a.buildCompiledToolPolicyV2 == nil ||
+		a.compiledToolModelResolverV2 == nil ||
+		p.Snapshot != nil ||
+		p.RunKind != PushRunKindScheduled ||
+		p.ExecutionMode != types.ExecutionModeCompiled ||
+		!IsCompiledToolRuntimeV2(p.RuntimeVersion) ||
+		p.TenantID <= 0 || p.UserID <= 0 ||
+		strings.TrimSpace(p.ScheduleID) == "" ||
+		!activity.IsActivity(ctx) {
+		return PrepareToolRunV2Result{}, nonRetryable(types.NewAppError(
+			types.CodeValidation,
+			"compiled Tool scheduled run input is invalid", nil))
+	}
+	info := activity.GetInfo(ctx)
+	expected := types.RunIdentity{
+		TemporalWorkflowID: info.WorkflowExecution.ID,
+		TemporalRunID:      info.WorkflowExecution.RunID,
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           p.TenantID,
+		UserID:             p.UserID,
+		TaskID:             p.ScheduleID,
+	}
+	if err := expected.Validate(); err != nil {
+		return PrepareToolRunV2Result{}, nonRetryable(err)
+	}
+
+	ref, found, err := a.compiledToolStoreV2.
+		LoadCompiledRunSnapshotRefV2(ctx, expected)
+	if err != nil {
+		return PrepareToolRunV2Result{}, retryableOrNot(err)
+	}
+	if !found {
+		policy, buildErr := a.buildCompiledToolPolicyV2(
+			ctx, p.TenantID, a.taskInstructionEnabled(p.ScheduleID))
+		if buildErr != nil {
+			var appErr *types.AppError
+			if errors.As(buildErr, &appErr) {
+				return PrepareToolRunV2Result{}, retryableOrNot(buildErr)
+			}
+			return PrepareToolRunV2Result{}, nonRetryable(types.NewAppError(
+				types.CodeInternal,
+				"compiled Tool runtime policy is invalid", buildErr))
+		}
+		if _, err := a.compiledToolModelResolverV2.
+			ResolveRuntimeModelPolicyV1(policy.ModelPolicy); err != nil {
+			return PrepareToolRunV2Result{}, nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"compiled Tool model route is unavailable", err))
+		}
+		ref, err = a.compiledToolStoreV2.CreateOrGetCompiledRunSnapshotV2(
+			ctx, expected, policy,
+			a.observationRolloutForTask(p.ScheduleID))
+		if err != nil {
+			if errors.Is(err, types.ErrNotFound) {
+				return PrepareToolRunV2Result{}, nil
+			}
+			return PrepareToolRunV2Result{}, retryableOrNot(err)
+		}
+	}
+	snapshot, err := a.compiledToolStoreV2.
+		LoadCompiledTaskRunSnapshotV2(ctx, expected, ref)
+	if err != nil {
+		return PrepareToolRunV2Result{}, retryableOrNot(err)
+	}
+	if snapshot.Ref != ref {
+		return PrepareToolRunV2Result{}, nonRetryable(types.NewAppError(
+			types.CodeConflict,
+			"compiled Tool snapshot differs from the prepared run", nil))
+	}
+	if err := snapshot.ValidateFor(expected); err != nil {
+		return PrepareToolRunV2Result{}, nonRetryable(err)
+	}
+	if _, err := a.compiledToolModelResolverV2.
+		ResolveRuntimeModelPolicyV1(snapshot.Policy.ModelPolicy); err != nil {
+		return PrepareToolRunV2Result{}, nonRetryable(types.NewAppError(
+			types.CodeValidation,
+			"compiled Tool model route is unavailable", err))
+	}
+	authorized, err := a.compiledToolStoreV2.
+		AuthorizeTaskRunSideEffectV2(ctx, expected, ref)
+	if err != nil {
+		return PrepareToolRunV2Result{}, retryableOrNot(err)
+	}
+	if !authorized {
+		return PrepareToolRunV2Result{}, nil
+	}
+	result := PrepareToolRunV2Result{
+		Authorized: true,
+		Snapshot:   ref,
+	}
+	if err := result.ValidateFor(expected); err != nil {
+		return PrepareToolRunV2Result{}, nonRetryable(err)
 	}
 	return result, nil
 }

@@ -95,6 +95,16 @@ const CompiledRuntimeStructuredEventEvidenceV1 = "compiled-snapshot/v1+run-outco
 // It is valid only after the structured event evidence runtime.
 const CompiledRuntimeExecutiveBriefV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+structured-insight/v1+event-evidence/v1+executive-brief/v1"
 
+// CompiledRuntimeToolSnapshotV2 selects the Source-free task Tool snapshot
+// protocol. It is dark until the versioned Tool execution and observation
+// provenance Activities are wired; defining the label does not make any
+// existing Schedule Action select it.
+const CompiledRuntimeToolSnapshotV2 = "compiled-tool-snapshot/v2"
+
+func IsCompiledToolRuntimeV2(version string) bool {
+	return version == CompiledRuntimeToolSnapshotV2
+}
+
 func IsCompiledRuntimeV1(version string) bool {
 	return version == CompiledRuntimeSnapshotV1 ||
 		version == CompiledRuntimeRunOutcomeV1 ||

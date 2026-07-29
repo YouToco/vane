@@ -13,18 +13,13 @@ import (
 
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/types"
 )
 
 type taskRunBudget = types.PlannerBudget
 
-type taskRunPolicyPayloads struct {
-	CapabilityCatalog json.RawMessage `json:"capability_catalog"`
-	ToolPolicy        json.RawMessage `json:"tool_policy"`
-	PromptPolicy      json.RawMessage `json:"prompt_policy"`
-	ModelPolicy       json.RawMessage `json:"model_policy"`
-	QuotaPolicy       json.RawMessage `json:"quota_policy"`
-}
+type taskRunPolicyPayloads = runcontext.PolicyPayloadsV1
 
 type taskRunPolicyDigestSet struct {
 	CapabilityCatalog string

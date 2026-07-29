@@ -69,6 +69,12 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		ref.ValidateFor(identity) != nil {
 		t.Fatalf("Source-free run reference differs: %+v", ref)
 	}
+	if authorized, err := st.AuthorizeTaskRunSideEffectV2(
+		ctx, identity, ref); err != nil || !authorized {
+		t.Fatalf("authorize Source-free run: authorized=%v err=%v",
+			authorized, err)
+	}
+	assertToolRunSnapshotV2RecoveryWaitsForWriter(t, st, identity)
 	assertToolRunSnapshotV2AdmissionRejects(t, st, identity, ref.SnapshotID,
 		"non-v2 adaptive schema",
 		`UPDATE task_adaptive_states
@@ -241,6 +247,9 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 	if err != nil {
 		t.Fatalf("load Source-free compiled snapshot: %v", err)
 	}
+	if err := compiled.ValidateFor(identity); err != nil {
+		t.Fatalf("validate Source-free compiled snapshot: %v", err)
+	}
 	if compiled.DefinitionVersion != 1 || compiled.AdaptiveVersion != 1 ||
 		compiled.AdaptiveBasisDefinitionVersion !=
 			compiled.DefinitionVersion ||
@@ -287,6 +296,98 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 	if _, err := st.LoadCompiledTaskRunSnapshotV2(
 		ctx, identity, tampered); err == nil {
 		t.Fatal("tampered Source-free reference was accepted")
+	}
+	if _, err := st.AuthorizeTaskRunSideEffectV2(
+		ctx, identity, tampered); err == nil {
+		t.Fatal("tampered Source-free reference reached live authorization")
+	}
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE schedules SET status=$4
+		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+		identity.TenantID, identity.UserID, identity.TaskID,
+		types.ScheduleStatusPaused); err != nil {
+		t.Fatalf("pause Source-free task: %v", err)
+	}
+	if authorized, err := st.AuthorizeTaskRunSideEffectV2(
+		ctx, identity, ref); err != nil || authorized {
+		t.Fatalf("paused Source-free run authorization: authorized=%v err=%v",
+			authorized, err)
+	}
+}
+
+func assertToolRunSnapshotV2RecoveryWaitsForWriter(
+	t *testing.T,
+	st *Store,
+	identity types.RunIdentity,
+) {
+	t.Helper()
+	ctx := t.Context()
+	waitingIdentity := identity
+	waitingIdentity.TemporalRunID = uuid.NewString()
+	lockTx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := setTaskRunTenantContext(
+		ctx, lockTx, identity.TenantID); err != nil {
+		_ = lockTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := lockTaskRunSnapshotRun(
+		ctx, lockTx, waitingIdentity.TemporalRunID); err != nil {
+		_ = lockTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	type loadResult struct {
+		found bool
+		err   error
+	}
+	result := make(chan loadResult, 1)
+	go func() {
+		_, found, loadErr := st.LoadCompiledRunSnapshotRefV2(
+			context.Background(), waitingIdentity)
+		result <- loadResult{found: found, err: loadErr}
+	}()
+	waiting := false
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		select {
+		case early := <-result:
+			_ = lockTx.Rollback(ctx)
+			t.Fatalf("V2 recovery bypassed the first-writer fence: %+v", early)
+		default:
+		}
+		var count int
+		if err := st.pool.QueryRow(ctx,
+			`SELECT count(*)
+			   FROM pg_stat_activity
+			  WHERE datname=current_database()
+			    AND pid<>pg_backend_pid()
+			    AND wait_event_type='Lock'
+			    AND query LIKE '%pg_advisory_xact_lock(hashtextextended%'`,
+		).Scan(&count); err != nil {
+			_ = lockTx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if count > 0 {
+			waiting = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waiting {
+		_ = lockTx.Rollback(ctx)
+		t.Fatal("V2 recovery did not wait behind the first-writer fence")
+	}
+	if err := lockTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case loaded := <-result:
+		if loaded.err != nil || loaded.found {
+			t.Fatalf("empty fenced V2 recovery = %+v", loaded)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("V2 recovery remained blocked after writer rollback")
 	}
 }
 

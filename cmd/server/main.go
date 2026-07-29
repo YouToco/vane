@@ -210,6 +210,22 @@ func run() error {
 					TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
 				})
 			}, compiledModelResolver),
+		workflow.WithCompiledToolRuntimeV2(st,
+			func(ctx context.Context, tenantID int64, taskInstructionEnabled bool) (runtimepolicy.BundleV1, error) {
+				quota, err := st.LoadQuotaRule(ctx, tenantID, store.QuotaLLMTokens)
+				if err != nil {
+					return runtimepolicy.BundleV1{}, err
+				}
+				_ = quota
+				return runtimeconfig.BuildCurrentCompiledV1(runtimeconfig.CurrentCompiledV1Input{
+					Model:                      cfg.LLM.Model,
+					TaskInstructionEnabled:     taskInstructionEnabled,
+					ModelEndpointGeneration:    cfg.LLM.CompiledEndpointGeneration,
+					ModelCredentialGeneration:  cfg.LLM.CompiledCredentialGeneration,
+					ExaCredentialGeneration:    cfg.Fetch.CompiledExaCredentialGeneration,
+					TikHubCredentialGeneration: cfg.Fetch.CompiledTikHubCredentialGeneration,
+				})
+			}, compiledModelResolver),
 		workflow.WithStructuredInsightRuntimeV1(
 			func(ctx context.Context, tenantID int64, taskInstructionEnabled bool) (runtimepolicy.BundleV1, error) {
 				quota, err := st.LoadQuotaRule(ctx, tenantID, store.QuotaLLMTokens)
@@ -299,6 +315,7 @@ func run() error {
 	// 那个测试会告诉你漏没漏。**
 	w.RegisterActivity(activities.AuthorizeRun)
 	w.RegisterActivity(activities.PrepareRun)
+	w.RegisterActivity(activities.PrepareToolRunV2)
 	w.RegisterActivity(activities.BeginRunOutcomeV1)
 	w.RegisterActivity(activities.FinalizeRunOutcomeV1)
 	w.RegisterActivity(activities.PrepareCanonicalBriefV1)

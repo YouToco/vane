@@ -20,7 +20,10 @@ func (s *Store) LoadCompiledRunSnapshotRefV2(
 			"scheduled v2 run identity is invalid")
 	}
 	lookup := taskRunLookupFromIdentity(expected)
-	snapshot, found, err := s.loadTaskRunSnapshotScopedV2(ctx, lookup)
+	// Serialize with an in-flight first writer before deciding the snapshot is
+	// absent. Otherwise a response-lost retry could rebuild mutable policy in
+	// the narrow window between the original INSERT and COMMIT.
+	snapshot, found, err := s.loadTaskRunSnapshotBehindFenceV2(ctx, lookup)
 	if err != nil || !found {
 		return types.RunSnapshotRefV2{}, found, err
 	}
@@ -73,6 +76,7 @@ func (s *Store) LoadCompiledTaskRunSnapshotV2(
 		Mode:                           payload.Mode,
 		DefinitionVersion:              payload.DefinitionVersion,
 		AdaptiveVersion:                payload.AdaptiveVersion,
+		AdaptiveDigest:                 payload.AdaptiveDigest,
 		AdaptiveBasisDefinitionVersion: payload.AdaptiveBasisDefinitionVersion,
 		AdaptiveBasisDefinitionDigest:  payload.AdaptiveBasisDefinitionDigest,
 		ObservationRollout:             payload.ObservationRollout,

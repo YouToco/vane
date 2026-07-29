@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
@@ -235,32 +236,19 @@ func taskRunLookupFromIdentity(identity types.RunIdentity) CreateOrGetTaskRunSna
 func encodeTaskRunPolicyBundleV1(
 	policy runtimepolicy.BundleV1,
 ) (taskRunPolicyPayloads, taskRunPolicyDigestSet, runtimepolicy.BundleV1, error) {
-	if err := policy.Validate(); err != nil {
-		return taskRunPolicyPayloads{}, taskRunPolicyDigestSet{},
-			runtimepolicy.BundleV1{}, err
-	}
-	capability, capabilityErr :=
-		runtimepolicy.EncodeCapabilityCatalogV1(policy.CapabilityCatalog)
-	tools, toolErr := runtimepolicy.EncodeToolPolicyV1(policy.ToolPolicy)
-	prompts, promptErr := runtimepolicy.EncodePromptPolicyV1(policy.PromptPolicy)
-	models, modelErr := runtimepolicy.EncodeModelPolicyV1(policy.ModelPolicy)
-	quotas, quotaErr := runtimepolicy.EncodeQuotaPolicyV1(policy.QuotaPolicy)
-	if capabilityErr != nil || toolErr != nil || promptErr != nil ||
-		modelErr != nil || quotaErr != nil {
-		return taskRunPolicyPayloads{}, taskRunPolicyDigestSet{},
-			runtimepolicy.BundleV1{}, errors.New("runtime policy cannot be encoded")
-	}
-	payloads := taskRunPolicyPayloads{
-		CapabilityCatalog: capability, ToolPolicy: tools,
-		PromptPolicy: prompts, ModelPolicy: models, QuotaPolicy: quotas,
-	}
-	digests, err := canonicalizeTaskRunPolicyPayloads(&payloads)
+	payloads, sharedDigests, decoded, err :=
+		runcontext.EncodePolicyBundleV1(policy)
 	if err != nil {
 		return taskRunPolicyPayloads{}, taskRunPolicyDigestSet{},
 			runtimepolicy.BundleV1{}, err
 	}
-	decoded, _, err := decodeTaskRunPolicyBundleV1(&payloads)
-	return payloads, digests, decoded, err
+	return payloads, taskRunPolicyDigestSet{
+		CapabilityCatalog: sharedDigests.CapabilityCatalogDigest,
+		ToolPolicy:        sharedDigests.ToolPolicyDigest,
+		PromptPolicy:      sharedDigests.PromptPolicyDigest,
+		ModelPolicy:       sharedDigests.ModelPolicyDigest,
+		QuotaPolicy:       sharedDigests.QuotaPolicyDigest,
+	}, decoded, nil
 }
 
 func loadCurrentToolApprovedDefinitionTx(
