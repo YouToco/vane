@@ -6,9 +6,9 @@ import (
 	"testing"
 )
 
-// The command sequence is now replay-safe and callable by an explicitly
-// versioned Action, but production Action writers remain on V1 until the
-// dedicated canary selector is deliberately enabled.
+// The command sequence is replay-safe and callable only by an explicitly
+// versioned Action. Production selection remains a single-task canary rather
+// than an allow-all rollout; rollback pauses the task before removing the ID.
 func TestCompiledToolPipelineV2CutoverGuards(t *testing.T) {
 	workflowSource, err := os.ReadFile("workflow.go")
 	if err != nil {
@@ -39,19 +39,21 @@ func TestCompiledToolPipelineV2CutoverGuards(t *testing.T) {
 		}
 	}
 
-	for _, name := range []string{
-		"../scheduler/scheduler.go",
-		"../scheduler/task_schedule.go",
+	rolloutSource, err := os.ReadFile(
+		"../scheduler/tool_runtime_rollout.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"canaryID string",
+		`if r.canaryID == "" || taskID != r.canaryID`,
+		"CompiledRuntimeToolSnapshotV2",
 	} {
-		source, err := os.ReadFile(name)
-		if err != nil {
-			t.Fatal(err)
+		if !strings.Contains(string(rolloutSource), required) {
+			t.Fatalf("Tool V2 production canary lacks %q", required)
 		}
-		if strings.Contains(
-			string(source), "CompiledRuntimeToolSnapshotV2",
-		) {
-			t.Fatalf("production Action writer enabled Tool V2 before canary: %s",
-				name)
-		}
+	}
+	if strings.Contains(string(rolloutSource), "allowAll") {
+		t.Fatal("Tool V2 production canary gained an allow-all path")
 	}
 }

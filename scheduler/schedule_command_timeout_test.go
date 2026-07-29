@@ -8,11 +8,14 @@ import (
 	"time"
 
 	schedulepb "go.temporal.io/api/schedule/v1"
+	"go.temporal.io/api/serviceerror"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"google.golang.org/grpc"
 
 	"github.com/YouToco/vane/types"
+	"github.com/YouToco/vane/workflow"
 )
 
 type scheduleCommandTimeoutClient struct {
@@ -31,6 +34,7 @@ type scheduleCommandFirstRPCBlackhole struct {
 	paused      bool
 	deleted     bool
 	remoteCalls int
+	action      *schedulepb.ScheduleAction
 }
 
 func (s *scheduleCommandFirstRPCBlackhole) waitFirst(
@@ -72,9 +76,56 @@ func (s *scheduleCommandFirstRPCBlackhole) DescribeSchedule(
 	}
 	return &workflowservice.DescribeScheduleResponse{
 		Schedule: &schedulepb.Schedule{
-			State: &schedulepb.ScheduleState{Paused: s.paused},
+			Action: s.action,
+			State:  &schedulepb.ScheduleState{Paused: s.paused},
 		},
 	}, nil
+}
+
+type scheduleCommandStaticDescribe struct {
+	workflowservice.WorkflowServiceClient
+	action *schedulepb.ScheduleAction
+}
+
+type scheduleCommandNotFoundDescribe struct {
+	workflowservice.WorkflowServiceClient
+}
+
+func (*scheduleCommandNotFoundDescribe) DescribeSchedule(
+	context.Context,
+	*workflowservice.DescribeScheduleRequest,
+	...grpc.CallOption,
+) (*workflowservice.DescribeScheduleResponse, error) {
+	return nil, serviceerror.NewNotFound("schedule does not exist")
+}
+
+func (s *scheduleCommandStaticDescribe) DescribeSchedule(
+	context.Context,
+	*workflowservice.DescribeScheduleRequest,
+	...grpc.CallOption,
+) (*workflowservice.DescribeScheduleResponse, error) {
+	return &workflowservice.DescribeScheduleResponse{
+		Schedule: &schedulepb.Schedule{Action: s.action},
+	}, nil
+}
+
+func rawResumeScheduleAction(
+	taskID, runtimeVersion string,
+) *schedulepb.ScheduleAction {
+	return rawScheduleActionFromClient(
+		&client.ScheduleWorkflowAction{
+			ID: "wf-" + taskID,
+			Args: []interface{}{workflow.PushParams{
+				TenantID:       1,
+				UserID:         7,
+				RunKind:        workflow.PushRunKindScheduled,
+				ExecutionMode:  types.ExecutionModeCompiled,
+				RuntimeVersion: runtimeVersion,
+				ScheduleID:     taskID,
+			}},
+		},
+		converter.GetDefaultDataConverter(),
+	)
 }
 
 func (s *scheduleCommandFirstRPCBlackhole) PatchSchedule(
@@ -130,9 +181,11 @@ func (s *scheduleCommandFirstRPCBlackhole) DeleteSchedule(
 
 type scheduleCommandTimeoutStore struct {
 	scheduleStore
-	mu      sync.Mutex
-	command *types.ScheduleCommand
-	locked  bool
+	mu             sync.Mutex
+	command        *types.ScheduleCommand
+	locked         bool
+	toolDefinition bool
+	schedule       types.Schedule
 }
 
 func (s *scheduleCommandTimeoutStore) ResolveActiveTenantForUser(
@@ -175,6 +228,14 @@ func (s *scheduleCommandTimeoutStore) LoadScheduleCommand(
 	defer s.mu.Unlock()
 	copy := *s.command
 	return &copy, nil
+}
+
+func (s *scheduleCommandTimeoutStore) HasCurrentToolApprovedDefinition(
+	context.Context,
+	int64, int64,
+	string,
+) (bool, error) {
+	return s.toolDefinition, nil
 }
 
 func (s *scheduleCommandTimeoutStore) BeginScheduleCommandAttempt(
@@ -227,7 +288,8 @@ func (s *scheduleCommandTimeoutStore) BeginScheduleCommandAttempt(
 		release()
 		return nil
 	}
-	return &copy, &types.Schedule{}, complete, block, rollback, nil
+	schedule := s.schedule
+	return &copy, &schedule, complete, block, rollback, nil
 }
 
 func (s *scheduleCommandTimeoutStore) ListPendingScheduleCommands(
@@ -269,6 +331,10 @@ func TestScheduleCommandFirstRPCBlackholeUsesSharedAttemptBudget(
 			st := &scheduleCommandTimeoutStore{}
 			remote := &scheduleCommandFirstRPCBlackhole{
 				paused: kind == types.ScheduleCommandResume,
+				action: rawResumeScheduleAction(
+					"blackhole-task",
+					workflow.CompiledRuntimeSnapshotV1,
+				),
 			}
 			s := New(
 				&scheduleCommandTimeoutClient{service: remote},
@@ -316,5 +382,64 @@ func TestScheduleCommandFirstRPCBlackholeUsesSharedAttemptBudget(
 				t.Fatalf("after recovery status=%s locked=%t", status, locked)
 			}
 		})
+	}
+}
+
+func TestDurableResumeBlocksToolTaskAfterCanaryRemoval(t *testing.T) {
+	const taskID = "task-tool-resume-durable"
+	st := &scheduleCommandTimeoutStore{
+		toolDefinition: true,
+		schedule: types.Schedule{
+			ID: taskID, TenantID: 1, UserID: 7,
+			Status:        types.ScheduleStatusPaused,
+			ExecutionMode: types.ExecutionModeCompiled,
+		},
+	}
+	s := New(
+		&scheduleCommandTimeoutClient{
+			service: &scheduleCommandStaticDescribe{
+				action: rawResumeScheduleAction(
+					taskID,
+					workflow.CompiledRuntimeToolSnapshotV2,
+				),
+			},
+		},
+		"unused", st,
+		WithCompiledRuntimeRollout(true, taskID, false),
+	)
+	err := s.ResumePushIdempotent(
+		t.Context(), taskID, 7, "resume-without-tool-canary")
+	if err == nil {
+		t.Fatal("durable resume bypassed disabled Tool canary")
+	}
+	status, locked := st.state()
+	if status != types.ScheduleCommandBlocked || locked {
+		t.Fatalf("blocked resume state=%s locked=%v", status, locked)
+	}
+}
+
+func TestDurableResumeBlocksMissingTemporalSchedule(t *testing.T) {
+	const taskID = "task-resume-missing-remote"
+	st := &scheduleCommandTimeoutStore{
+		schedule: types.Schedule{
+			ID: taskID, TenantID: 1, UserID: 7,
+			Status:        types.ScheduleStatusPaused,
+			ExecutionMode: types.ExecutionModeCompiled,
+		},
+	}
+	s := New(
+		&scheduleCommandTimeoutClient{
+			service: &scheduleCommandNotFoundDescribe{},
+		},
+		"unused", st,
+	)
+	err := s.ResumePushIdempotent(
+		t.Context(), taskID, 7, "resume-missing-remote")
+	if err == nil || !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("missing Temporal schedule error=%v", err)
+	}
+	status, locked := st.state()
+	if status != types.ScheduleCommandBlocked || locked {
+		t.Fatalf("missing remote resume state=%s locked=%v", status, locked)
 	}
 }

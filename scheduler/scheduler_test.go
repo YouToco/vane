@@ -656,7 +656,8 @@ func (h *fakeScheduleHandle) Unpause(
 
 type lifecycleScheduleStore struct {
 	scheduleStore
-	status types.ScheduleStatus
+	status         types.ScheduleStatus
+	toolDefinition bool
 
 	beginCalls    int
 	commitCalls   int
@@ -670,8 +671,17 @@ func (s *lifecycleScheduleStore) GetSchedule(
 	userID int64,
 ) (*types.Schedule, error) {
 	return &types.Schedule{
-		ID: id, UserID: userID, Status: s.status,
+		ID: id, TenantID: 7, UserID: userID, Status: s.status,
+		ExecutionMode: types.ExecutionModeCompiled,
 	}, nil
+}
+
+func (s *lifecycleScheduleStore) HasCurrentToolApprovedDefinition(
+	context.Context,
+	int64, int64,
+	string,
+) (bool, error) {
+	return s.toolDefinition, nil
 }
 
 func (s *lifecycleScheduleStore) BeginScheduleStatusChange(
@@ -710,7 +720,19 @@ func (s *lifecycleScheduleStore) BeginScheduleStatusChange(
 }
 
 func TestTaskLifecycleActionsPreserveSelectedScheduleIdentity(t *testing.T) {
-	handle := &fakeScheduleHandle{}
+	handle := &fakeScheduleHandle{current: client.Schedule{
+		Action: &client.ScheduleWorkflowAction{
+			ID: "wf-task-web-1",
+			Args: []interface{}{workflow.PushParams{
+				TenantID:       7,
+				UserID:         7,
+				RunKind:        workflow.PushRunKindScheduled,
+				ExecutionMode:  types.ExecutionModeCompiled,
+				RuntimeVersion: workflow.CompiledRuntimeSnapshotV1,
+				ScheduleID:     "task-web-1",
+			}},
+		},
+	}}
 	store := &lifecycleScheduleStore{status: types.ScheduleStatusActive}
 	temporal := &fakeTemporalClient{
 		sched: &fakeScheduleClient{handle: handle},
@@ -761,6 +783,54 @@ func TestTaskLifecycleActionsPreserveSelectedScheduleIdentity(t *testing.T) {
 	}
 }
 
+func TestLegacyResumeKeepsToolTaskPausedUntilCanaryReenabled(t *testing.T) {
+	const taskID = "task-tool-resume-legacy"
+	handle := &fakeScheduleHandle{current: client.Schedule{
+		Action: &client.ScheduleWorkflowAction{
+			ID: "wf-" + taskID,
+			Args: []interface{}{workflow.PushParams{
+				TenantID:       7,
+				UserID:         7,
+				RunKind:        workflow.PushRunKindScheduled,
+				ExecutionMode:  types.ExecutionModeCompiled,
+				RuntimeVersion: workflow.CompiledRuntimeToolSnapshotV2,
+				ScheduleID:     taskID,
+			}},
+		},
+	}}
+	store := &lifecycleScheduleStore{
+		status: types.ScheduleStatusPaused, toolDefinition: true,
+	}
+	s := New(
+		&fakeTemporalClient{
+			sched: &fakeScheduleClient{handle: handle},
+		},
+		"tq", store,
+		WithCompiledRuntimeRollout(true, taskID, false),
+	)
+	if err := s.ResumePush(
+		t.Context(), taskID, 7,
+	); err == nil {
+		t.Fatal("legacy resume bypassed disabled Tool canary")
+	}
+	if store.status != types.ScheduleStatusPaused ||
+		handle.unpauseCalls != 0 || store.beginCalls != 0 {
+		t.Fatalf("blocked Tool resume mutated state: status=%s unpause=%d begin=%d",
+			store.status, handle.unpauseCalls, store.beginCalls)
+	}
+	WithCompiledToolRuntimeCanary(taskID)(s)
+	if err := s.ResumePush(
+		t.Context(), taskID, 7,
+	); err != nil {
+		t.Fatalf("reenabled Tool canary resume: %v", err)
+	}
+	if store.status != types.ScheduleStatusActive ||
+		handle.unpauseCalls != 1 {
+		t.Fatalf("reenabled Tool resume: status=%s unpause=%d",
+			store.status, handle.unpauseCalls)
+	}
+}
+
 func TestNextRunReadsTemporalAfterOwnershipCheck(t *testing.T) {
 	want := time.Date(2026, 7, 26, 9, 30, 0, 0, time.UTC)
 	handle := &fakeScheduleHandle{
@@ -803,6 +873,8 @@ type fakeScheduleStore struct {
 	reconcileReleaseCalls int
 	reconcileAcquireErr   error
 	reconcileReleaseErr   error
+	toolDefinition        bool
+	toolDefinitionErr     error
 }
 
 // ListActiveSchedules 供 ReconcileActions 用例注入存量调度集合。
@@ -852,10 +924,21 @@ func (f *fakeScheduleStore) AcquireScheduleReconcile(
 	return nil, release, nil
 }
 
+func (f *fakeScheduleStore) HasCurrentToolApprovedDefinition(
+	_ context.Context,
+	_, _ int64,
+	_ string,
+) (bool, error) {
+	return f.toolDefinition, f.toolDefinitionErr
+}
+
 // GetSchedule 一律放行：本组用例聚焦「更新 Spec 时不弄丢 Action/Policy」，
 // 归属校验由 TestOwnershipCheckedBeforeTemporal 专门覆盖，不在此重复。
 func (f *fakeScheduleStore) GetSchedule(_ context.Context, id string, userID int64) (*types.Schedule, error) {
-	return &types.Schedule{ID: id, UserID: userID}, nil
+	return &types.Schedule{
+		ID: id, TenantID: 7, UserID: userID,
+		ExecutionMode: types.ExecutionModeCompiled,
+	}, nil
 }
 
 func (f *fakeScheduleStore) UpdateScheduleSpec(_ context.Context, id string, spec json.RawMessage, nlDesc *string) error {
@@ -1697,6 +1780,217 @@ func TestUpdatePush_RenamePreservesRunOutcomeCanary(t *testing.T) {
 		Args[0].(workflow.PushParams)
 	if got.RuntimeVersion != workflow.CompiledRuntimeRunOutcomeV1 {
 		t.Fatalf("renamed runtime = %q", got.RuntimeVersion)
+	}
+}
+
+func TestReconcileActions_SelectsAndRollsBackToolRuntimeCanary(t *testing.T) {
+	const taskID = "task-tool-runtime-reconcile"
+	initial := makePushParams(7, 1, taskID, workflow.PushScope{}, "canary")
+	initial.RuntimeVersion = workflow.CompiledRuntimeSnapshotV1
+	h := &fakeScheduleHandle{current: reconcileSchedule(
+		"wf-"+taskID, []interface{}{payloadArg(t, initial)},
+	)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{taskID: h},
+	}}
+	st := &fakeScheduleStore{active: []types.Schedule{{
+		ID: taskID, TenantID: 7, UserID: 1, NLDescription: "canary",
+		ScopeJSON:     json.RawMessage(`{}`),
+		Status:        types.ScheduleStatusActive,
+		ExecutionMode: types.ExecutionModeCompiled,
+	}}, toolDefinition: true}
+	s := New(
+		fc, "tq", st,
+		WithCompiledRuntimeRollout(true, taskID, false),
+		WithCompiledToolRuntimeCanary(taskID),
+	)
+	if err := s.ReconcileActions(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	got := h.current.Action.(*client.ScheduleWorkflowAction).
+		Args[0].(workflow.PushParams)
+	if got.RuntimeVersion != workflow.CompiledRuntimeToolSnapshotV2 {
+		t.Fatalf("reconciled Tool runtime=%q", got.RuntimeVersion)
+	}
+
+	WithCompiledToolRuntimeCanary("")(s)
+	h.current.Action.(*client.ScheduleWorkflowAction).Args[0] =
+		payloadArg(t, got)
+	if err := s.ReconcileActions(t.Context()); err == nil {
+		t.Fatal("active Tool task was relabeled as V1 during rollback")
+	}
+	got, found, decodeErr := decodeScheduleActionPushParams(
+		h.current.Action)
+	if decodeErr != nil || !found {
+		t.Fatalf("decode blocked Tool Action: found=%v err=%v",
+			found, decodeErr)
+	}
+	if got.RuntimeVersion != workflow.CompiledRuntimeToolSnapshotV2 {
+		t.Fatalf("blocked rollback mutated Tool runtime=%q", got.RuntimeVersion)
+	}
+	st.active = nil // owner paused the task before clearing the canary ID.
+	if err := s.ReconcileActions(t.Context()); err != nil {
+		t.Fatalf("paused Tool rollback should be inert: %v", err)
+	}
+}
+
+func TestUpdatePush_RenamePreservesToolRuntimeCanary(t *testing.T) {
+	const taskID = "task-tool-runtime-rename"
+	h := &fakeScheduleHandle{current: reconcileSchedule(
+		"wf-"+taskID,
+		[]interface{}{payloadArg(t, makePushParams(
+			1, 1, taskID, workflow.PushScope{}, "old",
+		))},
+	)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
+	st := &fakeScheduleStore{toolDefinition: true}
+	s := New(
+		fc, "tq", st,
+		WithCompiledRuntimeRollout(true, taskID, false),
+		WithCompiledToolRuntimeCanary(taskID),
+	)
+	name := "new"
+	if err := s.UpdatePush(
+		t.Context(), taskID, 1,
+		ScheduleSpec{Cron: "30 9 * * *"}, &name,
+	); err != nil {
+		t.Fatal(err)
+	}
+	got := h.current.Action.(*client.ScheduleWorkflowAction).
+		Args[0].(workflow.PushParams)
+	if got.RuntimeVersion != workflow.CompiledRuntimeToolSnapshotV2 {
+		t.Fatalf("renamed Tool runtime=%q", got.RuntimeVersion)
+	}
+}
+
+func TestReconcileActions_RejectsV1OnlyTaskFromToolCanary(t *testing.T) {
+	const taskID = "task-v1-only-tool-canary"
+	initial := makePushParams(7, 1, taskID, workflow.PushScope{}, "legacy")
+	initial.RuntimeVersion = workflow.CompiledRuntimeSnapshotV1
+	h := &fakeScheduleHandle{current: reconcileSchedule(
+		"wf-"+taskID, []interface{}{payloadArg(t, initial)},
+	)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{taskID: h},
+	}}
+	st := &fakeScheduleStore{active: []types.Schedule{{
+		ID: taskID, TenantID: 7, UserID: 1, NLDescription: "legacy",
+		ScopeJSON:     json.RawMessage(`{}`),
+		Status:        types.ScheduleStatusActive,
+		ExecutionMode: types.ExecutionModeCompiled,
+	}}}
+	s := New(
+		fc, "tq", st,
+		WithCompiledRuntimeRollout(true, taskID, false),
+		WithCompiledToolRuntimeCanary(taskID),
+	)
+	if err := s.ReconcileActions(t.Context()); err == nil {
+		t.Fatal("V1-only task entered Tool runtime without definition preflight")
+	}
+	if len(h.history) != 0 {
+		t.Fatalf("failed Tool preflight mutated Action %d times", len(h.history))
+	}
+}
+
+func TestUpdatePush_DoesNotRelabelActiveToolTaskAsV1(t *testing.T) {
+	const taskID = "task-tool-runtime-rename-rollback"
+	current := makePushParams(
+		7, 1, taskID, workflow.PushScope{}, "old")
+	current.RuntimeVersion = workflow.CompiledRuntimeToolSnapshotV2
+	h := &fakeScheduleHandle{current: reconcileSchedule(
+		"wf-"+taskID, []interface{}{payloadArg(t, current)},
+	)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{handle: h}}
+	st := &fakeScheduleStore{}
+	s := New(
+		fc, "tq", st,
+		WithCompiledRuntimeRollout(true, taskID, false),
+	)
+	name := "new"
+	if err := s.UpdatePush(
+		t.Context(), taskID, 1,
+		ScheduleSpec{Cron: "30 9 * * *"}, &name,
+	); err == nil {
+		t.Fatal("rename relabeled an active Tool task as V1")
+	}
+	if len(h.history) != 0 {
+		t.Fatalf("blocked Tool rename mutated Action %d times", len(h.history))
+	}
+}
+
+func TestToolRuntimeResumeRequiresCanaryToBeReenabled(t *testing.T) {
+	const taskID = "task-tool-runtime-resume"
+	params := makePushParams(
+		7, 1, taskID, workflow.PushScope{}, "paused Tool task")
+	params.RuntimeVersion = workflow.CompiledRuntimeToolSnapshotV2
+	h := &fakeScheduleHandle{current: reconcileSchedule(
+		"wf-"+taskID, []interface{}{payloadArg(t, params)},
+	)}
+	fc := &fakeTemporalClient{sched: &fakeScheduleClient{
+		handles: map[string]*fakeScheduleHandle{taskID: h},
+	}}
+	st := &fakeScheduleStore{toolDefinition: true}
+	s := New(
+		fc, "tq", st,
+		WithCompiledRuntimeRollout(true, taskID, false),
+	)
+	sc := &types.Schedule{
+		ID: taskID, TenantID: 7, UserID: 1,
+		Status:        types.ScheduleStatusPaused,
+		ExecutionMode: types.ExecutionModeCompiled,
+	}
+	if err := s.authorizeToolRuntimeResume(
+		t.Context(), sc); err == nil {
+		t.Fatal("paused Tool task resumed while canary was disabled")
+	}
+	WithCompiledToolRuntimeCanary(taskID)(s)
+	if err := s.authorizeToolRuntimeResume(
+		t.Context(), sc); err != nil {
+		t.Fatalf("reenabled Tool canary could not resume: %v", err)
+	}
+}
+
+func TestToolRuntimeResumeBindsFrozenActionIdentity(t *testing.T) {
+	const taskID = "task-tool-runtime-resume-identity"
+	baseline := makePushParams(
+		7, 1, taskID, workflow.PushScope{}, "paused Tool task")
+	baseline.RuntimeVersion = workflow.CompiledRuntimeToolSnapshotV2
+	sc := &types.Schedule{
+		ID: taskID, TenantID: 7, UserID: 1,
+		Status:        types.ScheduleStatusPaused,
+		ExecutionMode: types.ExecutionModeCompiled,
+	}
+	cases := map[string]func(*workflow.PushParams){
+		"tenant":         func(p *workflow.PushParams) { p.TenantID++ },
+		"user":           func(p *workflow.PushParams) { p.UserID++ },
+		"schedule":       func(p *workflow.PushParams) { p.ScheduleID = "other-task" },
+		"run kind":       func(p *workflow.PushParams) { p.RunKind = workflow.PushRunKindAdHoc },
+		"execution mode": func(p *workflow.PushParams) { p.ExecutionMode = types.ExecutionModeDiscoverAtRun },
+		"snapshot": func(p *workflow.PushParams) {
+			p.Snapshot = &workflow.RunSnapshotRef{}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			params := baseline
+			mutate(&params)
+			h := &fakeScheduleHandle{current: reconcileSchedule(
+				"wf-"+taskID, []interface{}{payloadArg(t, params)},
+			)}
+			s := New(
+				&fakeTemporalClient{sched: &fakeScheduleClient{
+					handles: map[string]*fakeScheduleHandle{taskID: h},
+				}},
+				"tq",
+				&fakeScheduleStore{toolDefinition: true},
+				WithCompiledRuntimeRollout(true, taskID, false),
+				WithCompiledToolRuntimeCanary(taskID),
+			)
+			if err := s.authorizeToolRuntimeResume(
+				t.Context(), sc); !errors.Is(err, types.ErrConflict) {
+				t.Fatalf("mismatched %s action error=%v", name, err)
+			}
+		})
 	}
 }
 

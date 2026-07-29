@@ -170,6 +170,12 @@ type scheduleCommandStore interface {
 	) ([]types.ScheduleCommand, error)
 }
 
+type toolRuntimeCapabilityStore interface {
+	HasCurrentToolApprovedDefinition(
+		context.Context, int64, int64, string,
+	) (bool, error)
+}
+
 // Scheduler 持有 Temporal client、任务队列名与 store（镜像用）。
 type Scheduler struct {
 	c                       client.Client
@@ -178,6 +184,7 @@ type Scheduler struct {
 	taskScheduleGates       taskScheduleGateSet
 	taskScheduleEnv         taskScheduleEnvironment
 	compiledRuntime         compiledRuntimeRollout
+	toolRuntime             toolRuntimeRollout
 	runOutcome              runOutcomeRollout
 	canonicalBrief          canonicalBriefRollout
 	structuredInsight       structuredInsightRollout
@@ -212,6 +219,31 @@ func (s *Scheduler) scheduleCommandAttemptTimeout() time.Duration {
 		return defaultScheduleCommandAttemptTimeout
 	}
 	return s.commandAttempt
+}
+
+func requireToolRuntimeDefinition(
+	ctx context.Context,
+	st scheduleStore,
+	tenantID, userID int64,
+	taskID string,
+) error {
+	capabilities, ok := st.(toolRuntimeCapabilityStore)
+	if !ok {
+		return types.NewAppError(
+			types.CodeConflict,
+			"Tool runtime definition preflight is unavailable", nil)
+	}
+	available, err := capabilities.HasCurrentToolApprovedDefinition(
+		ctx, tenantID, userID, taskID)
+	if err != nil {
+		return err
+	}
+	if !available {
+		return types.NewAppError(
+			types.CodeConflict,
+			"task has no current Tool-approved definition", nil)
+	}
+	return nil
 }
 
 func (s *Scheduler) newScheduleCommandWorkContext(
@@ -459,6 +491,25 @@ func (s *Scheduler) reconcileOne(ctx context.Context, listed types.Schedule) (up
 	if err != nil {
 		return false, err
 	}
+	current, found, err := decodeScheduleActionPushParams(
+		desc.Schedule.Action)
+	if err != nil {
+		return false, err
+	}
+	if found &&
+		workflow.IsCompiledToolRuntimeV2(current.RuntimeVersion) &&
+		!workflow.IsCompiledToolRuntimeV2(want.RuntimeVersion) {
+		return false, fmt.Errorf(
+			"Tool runtime task %s must be paused before canary removal",
+			sc.ID)
+	}
+	if workflow.IsCompiledToolRuntimeV2(want.RuntimeVersion) {
+		if err := requireToolRuntimeDefinition(
+			attemptCtx, s.st,
+			sc.TenantID, sc.UserID, sc.ID); err != nil {
+			return false, err
+		}
+	}
 	matches, err := actionMatchesParams(desc.Schedule.Action, want)
 	if err != nil {
 		return false, err
@@ -500,21 +551,236 @@ func (s *Scheduler) reconcileOne(ctx context.Context, listed types.Schedule) (up
 // Snapshot 不属于漂移自愈字段：A5 构造器确保持久 Action 始终为 nil，每轮引用只能
 // 由 PrepareRun 在 workflow 内存中产生；异常非 nil 入参会在 PrepareRun 中 fail-closed。
 func actionMatchesParams(action client.ScheduleAction, want workflow.PushParams) (bool, error) {
-	wf, ok := action.(*client.ScheduleWorkflowAction)
-	if !ok || len(wf.Args) == 0 {
-		return false, nil
-	}
-	pl, ok := wf.Args[0].(*commonpb.Payload)
-	if !ok {
-		return false, nil
-	}
-	var got workflow.PushParams
-	if err := converter.GetDefaultDataConverter().FromPayload(pl, &got); err != nil {
-		return false, fmt.Errorf("解码调度 Action 入参: %w", err)
+	got, found, err := decodeScheduleActionPushParams(action)
+	if err != nil || !found {
+		return false, err
 	}
 	return got.TenantID == want.TenantID && got.RunKind == want.RunKind &&
-		got.ExecutionMode == want.ExecutionMode && got.RuntimeVersion == want.RuntimeVersion &&
-		got.ScheduleID == want.ScheduleID && got.NLDesc == want.NLDesc, nil
+		got.ExecutionMode == want.ExecutionMode &&
+		got.RuntimeVersion == want.RuntimeVersion &&
+		got.ScheduleID == want.ScheduleID &&
+		got.NLDesc == want.NLDesc, nil
+}
+
+func decodeScheduleActionPushParams(
+	action client.ScheduleAction,
+) (workflow.PushParams, bool, error) {
+	wf, ok := action.(*client.ScheduleWorkflowAction)
+	if !ok || len(wf.Args) == 0 {
+		return workflow.PushParams{}, false, nil
+	}
+	switch first := wf.Args[0].(type) {
+	case workflow.PushParams:
+		return first, true, nil
+	case *commonpb.Payload:
+		var got workflow.PushParams
+		if err := converter.GetDefaultDataConverter().FromPayload(
+			first, &got); err != nil {
+			return workflow.PushParams{}, false,
+				fmt.Errorf("解码调度 Action 入参: %w", err)
+		}
+		return got, true, nil
+	default:
+		return workflow.PushParams{}, false, nil
+	}
+}
+
+func (s *Scheduler) decodeRawScheduleActionPushParams(
+	response *workflowservice.DescribeScheduleResponse,
+	taskID string,
+) (workflow.PushParams, bool, error) {
+	start := response.GetSchedule().GetAction().GetStartWorkflow()
+	if start == nil || start.GetInput() == nil ||
+		len(start.GetInput().GetPayloads()) != 1 {
+		return workflow.PushParams{}, false, nil
+	}
+	s.taskScheduleEnv.mu.Lock()
+	namespace := s.taskScheduleEnv.namespace
+	candidates := []converter.DataConverter{
+		converter.GetDefaultDataConverter(),
+		s.taskScheduleEnv.dc,
+	}
+	for _, dc := range s.taskScheduleEnv.decoders {
+		candidates = append(candidates, dc)
+	}
+	s.taskScheduleEnv.mu.Unlock()
+	decode := func(dc converter.DataConverter) (
+		workflow.PushParams, error,
+	) {
+		if dc == nil {
+			return workflow.PushParams{},
+				errors.New("task schedule decoder is unavailable")
+		}
+		prepared := PreparedTaskSchedule{
+			Namespace: namespace,
+			Action: PreparedTaskScheduleAction{
+				ActionID: start.GetWorkflowId(),
+			},
+		}
+		actionDC, err := taskScheduleActionDataConverter(prepared, dc)
+		if err != nil {
+			return workflow.PushParams{}, err
+		}
+		var params workflow.PushParams
+		if err := actionDC.FromPayloads(
+			start.GetInput(), &params); err != nil {
+			return workflow.PushParams{}, err
+		}
+		return params, nil
+	}
+
+	memoPayload := start.GetMemo().GetFields()[taskScheduleMemoKey]
+	if memoPayload == nil {
+		params, err := decode(converter.GetDefaultDataConverter())
+		if err != nil {
+			return workflow.PushParams{}, false,
+				fmt.Errorf("解码旧调度 Action 入参: %w", err)
+		}
+		return params, true, nil
+	}
+
+	for _, candidate := range candidates {
+		if candidate == nil {
+			continue
+		}
+		prepared := PreparedTaskSchedule{
+			Namespace: namespace,
+			Action: PreparedTaskScheduleAction{
+				ActionID: start.GetWorkflowId(),
+			},
+		}
+		actionDC, err := taskScheduleActionDataConverter(
+			prepared, candidate)
+		if err != nil {
+			continue
+		}
+		var fingerprint taskScheduleFingerprint
+		if err := actionDC.FromPayload(
+			memoPayload, &fingerprint); err != nil ||
+			fingerprint.TaskID != taskID ||
+			fingerprint.ConverterID == "" {
+			continue
+		}
+		params, err := decode(
+			s.taskScheduleDecoder(fingerprint.ConverterID))
+		if err != nil {
+			return workflow.PushParams{}, false,
+				fmt.Errorf("解码版本化调度 Action 入参: %w", err)
+		}
+		return params, true, nil
+	}
+	return workflow.PushParams{}, false,
+		errors.New("恢复任务无法解析版本化 Temporal Action")
+}
+
+func (s *Scheduler) authorizeToolRuntimeResume(
+	ctx context.Context,
+	sc *types.Schedule,
+) error {
+	if sc == nil {
+		return types.NewAppError(
+			types.CodeConflict,
+			"恢复任务缺少调度定义", types.ErrConflict)
+	}
+	description, err := s.c.ScheduleClient().GetHandle(
+		ctx, sc.ID).Describe(ctx)
+	if err != nil {
+		return err
+	}
+	if description == nil {
+		return types.NewAppError(
+			types.CodeConflict,
+			"恢复任务无法验证 Temporal Action",
+			types.ErrConflict)
+	}
+	params, found, err := decodeScheduleActionPushParams(
+		description.Schedule.Action)
+	if err != nil {
+		return err
+	}
+	return s.validateToolRuntimeResume(
+		ctx, sc, found, params)
+}
+
+func (s *Scheduler) validateToolRuntimeResume(
+	ctx context.Context,
+	sc *types.Schedule,
+	actionFound bool,
+	params workflow.PushParams,
+) error {
+	capabilities, ok := s.st.(toolRuntimeCapabilityStore)
+	if !ok {
+		return types.NewAppError(
+			types.CodeConflict,
+			"恢复任务无法验证 Tool runtime 定义",
+			types.ErrConflict)
+	}
+	isToolTask, err := capabilities.HasCurrentToolApprovedDefinition(
+		ctx, sc.TenantID, sc.UserID, sc.ID)
+	if err != nil {
+		return err
+	}
+	actionIsTool := actionFound &&
+		workflow.IsCompiledToolRuntimeV2(params.RuntimeVersion)
+	if !actionFound || actionIsTool != isToolTask {
+		return types.NewAppError(
+			types.CodeConflict,
+			"恢复任务的 Action 与 Tool runtime 定义不一致",
+			types.ErrConflict)
+	}
+	if !actionIsTool {
+		return nil
+	}
+	if params.TenantID != sc.TenantID ||
+		params.UserID != sc.UserID ||
+		params.ScheduleID != sc.ID ||
+		params.RunKind != workflow.PushRunKindScheduled ||
+		params.ExecutionMode != types.ExecutionModeCompiled ||
+		params.Snapshot != nil {
+		return types.NewAppError(
+			types.CodeConflict,
+			"恢复任务的 Tool runtime Action 身份与任务不一致",
+			types.ErrConflict)
+	}
+	if !workflow.IsCompiledToolRuntimeV2(
+		s.runtimeVersionFor(sc.ID, sc.ExecutionMode),
+	) {
+		return types.NewAppError(
+			types.CodeConflict,
+			"Tool runtime canary 已关闭，任务保持暂停",
+			types.ErrConflict)
+	}
+	return nil
+}
+
+func (s *Scheduler) authorizeToolRuntimeResumeRemote(
+	ctx context.Context,
+	sc *types.Schedule,
+) error {
+	namespace, _, _ := s.taskScheduleEnvironment()
+	response, err := s.describeTaskSchedule(
+		ctx,
+		taskScheduleExpected{
+			taskID: sc.ID,
+			prepared: PreparedTaskSchedule{
+				Namespace: namespace,
+			},
+		},
+	)
+	if err != nil {
+		return err
+	}
+	params, found, err := s.decodeRawScheduleActionPushParams(
+		response, sc.ID)
+	if err != nil {
+		return types.NewAppError(
+			types.CodeConflict,
+			"恢复任务无法验证版本化 Temporal Action",
+			errors.Join(types.ErrConflict, err),
+		)
+	}
+	return s.validateToolRuntimeResume(
+		ctx, sc, found, params)
 }
 
 // TriggerScheduleNow retains the pre-6.8 internal signature. HTTP callers use
@@ -654,6 +920,11 @@ func (s *Scheduler) changePushPausedLegacy(
 			types.ErrConflict,
 		)
 	}
+	if !paused {
+		if err := s.authorizeToolRuntimeResume(ctx, sc); err != nil {
+			return err
+		}
+	}
 	statusStore, ok := s.st.(scheduleStatusStore)
 	if !ok {
 		return types.NewAppError(
@@ -773,7 +1044,7 @@ func (s *Scheduler) runScheduleCommandAttempt(
 		return err
 	}
 	defer releaseMemory()
-	command, _, complete, block, rollback, err :=
+	command, schedule, complete, block, rollback, err :=
 		commandStore.BeginScheduleCommandAttempt(
 			ctx, expected.TenantID, expected.UserID, expected.IdempotencyKey,
 		)
@@ -806,6 +1077,43 @@ func (s *Scheduler) runScheduleCommandAttempt(
 			"任务命令恢复身份不一致",
 			types.ErrConflict,
 		)
+	}
+	if command.Kind == types.ScheduleCommandResume {
+		if schedule == nil {
+			return types.NewAppError(
+				types.CodeConflict,
+				"恢复任务缺少已锁定的调度定义",
+				types.ErrConflict)
+		}
+		if err := s.authorizeToolRuntimeResumeRemote(
+			ctx, schedule); err != nil {
+			if isTaskScheduleNotFound(err) {
+				finishCtx, cancelFinish := scheduleCommandDetachedContext(
+					ctx, scheduleCommandFactReadbackTimeout)
+				blockErr := block(
+					finishCtx,
+					"temporal_schedule_not_found",
+					"Temporal 中不存在对应任务调度",
+				)
+				cancelFinish()
+				return errors.Join(
+					scheduleCommandNotFound(command.TaskID, err),
+					blockErr,
+				)
+			}
+			if !errors.Is(err, types.ErrConflict) {
+				return err
+			}
+			finishCtx, cancelFinish := scheduleCommandDetachedContext(
+				ctx, scheduleCommandFactReadbackTimeout)
+			blockErr := block(
+				finishCtx,
+				"tool_runtime_canary_disabled",
+				"Tool runtime canary 已关闭，任务保持暂停",
+			)
+			cancelFinish()
+			return errors.Join(err, blockErr)
+		}
 	}
 
 	remoteErr := s.applyScheduleCommandRemote(ctx, command)
@@ -1111,6 +1419,13 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64
 		}
 		params.RuntimeVersion = s.runtimeVersionFor(
 			schedID, params.ExecutionMode)
+		if workflow.IsCompiledToolRuntimeV2(params.RuntimeVersion) {
+			if err := requireToolRuntimeDefinition(
+				ctx, s.st,
+				sc.TenantID, userID, schedID); err != nil {
+				return err
+			}
+		}
 		wantArgs = []interface{}{params}
 	}
 
@@ -1128,6 +1443,21 @@ func (s *Scheduler) UpdatePush(ctx context.Context, schedID string, userID int64
 				wf, ok := sch.Action.(*client.ScheduleWorkflowAction)
 				if !ok {
 					return nil, fmt.Errorf("调度 %s 的 Action 非 workflow 类型，无法回写任务名", schedID)
+				}
+				current, found, decodeErr :=
+					decodeScheduleActionPushParams(sch.Action)
+				if decodeErr != nil {
+					return nil, decodeErr
+				}
+				desired := wantArgs[0].(workflow.PushParams)
+				if found &&
+					workflow.IsCompiledToolRuntimeV2(
+						current.RuntimeVersion) &&
+					!workflow.IsCompiledToolRuntimeV2(
+						desired.RuntimeVersion) {
+					return nil, fmt.Errorf(
+						"Tool runtime task %s must be paused before canary removal",
+						schedID)
 				}
 				oldArgs = wf.Args
 				na := *wf // 值拷贝 Action 结构体，只换入参，其余字段（ID/TaskQueue）原样

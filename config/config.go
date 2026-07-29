@@ -129,6 +129,11 @@ type PipelineConfig struct {
 	CompiledRuntimeCanaryScheduleID string `mapstructure:"compiled_runtime_canary_schedule_id"`
 	// CompiledRuntimeAllowAll is the deliberate second key for broad rollout.
 	CompiledRuntimeAllowAll bool `mapstructure:"compiled_runtime_allow_all"`
+	// ToolRuntimeCanaryScheduleID replaces the retained Source runtime with the
+	// Source-free compiled Tool runtime for exactly one durable task. Rollback
+	// is pause-task first, then clear this ID; V2 deliberately has no allow-all
+	// switch and cannot be relabeled as the incompatible retained V1 runtime.
+	ToolRuntimeCanaryScheduleID string `mapstructure:"tool_runtime_canary_schedule_id"`
 	// RunOutcome* is the independent P1-B lifecycle rollout. It may select only
 	// Actions already selected by the compiled runtime rollout.
 	RunOutcomeEnabled          bool   `mapstructure:"run_outcome_enabled"`
@@ -354,6 +359,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.compiled_runtime_enabled", false)
 	v.SetDefault("pipeline.compiled_runtime_canary_schedule_id", "")
 	v.SetDefault("pipeline.compiled_runtime_allow_all", false)
+	v.SetDefault("pipeline.tool_runtime_canary_schedule_id", "")
 	v.SetDefault("pipeline.run_outcome_enabled", false)
 	v.SetDefault("pipeline.run_outcome_canary_schedule_id", "")
 	v.SetDefault("pipeline.run_outcome_allow_all", false)
@@ -457,6 +463,24 @@ func (c *Config) Validate() error {
 		}
 		if compiledCanaryID != "" && c.Pipeline.CompiledRuntimeAllowAll {
 			return errors.New("config: compiled runtime 单任务 canary 与 allow_all 不能同时启用")
+		}
+	}
+	rawToolRuntimeCanaryID := c.Pipeline.ToolRuntimeCanaryScheduleID
+	toolRuntimeCanaryID := strings.TrimSpace(rawToolRuntimeCanaryID)
+	if rawToolRuntimeCanaryID != "" && toolRuntimeCanaryID == "" {
+		return errors.New(
+			"config: pipeline.tool_runtime_canary_schedule_id 不能仅含空白")
+	}
+	c.Pipeline.ToolRuntimeCanaryScheduleID = toolRuntimeCanaryID
+	if toolRuntimeCanaryID != "" {
+		if !c.Pipeline.CompiledRuntimeEnabled {
+			return errors.New(
+				"config: Tool runtime canary 要求 compiled runtime 已启用")
+		}
+		if !c.Pipeline.CompiledRuntimeAllowAll &&
+			compiledCanaryID != toolRuntimeCanaryID {
+			return errors.New(
+				"config: Tool runtime canary 必须位于 compiled runtime rollout")
 		}
 	}
 	rawRunOutcomeCanaryID := c.Pipeline.RunOutcomeCanaryScheduleID

@@ -355,6 +355,9 @@ func run() error {
 			cfg.Pipeline.CompiledRuntimeCanaryScheduleID,
 			cfg.Pipeline.CompiledRuntimeAllowAll,
 		),
+		scheduler.WithCompiledToolRuntimeCanary(
+			cfg.Pipeline.ToolRuntimeCanaryScheduleID,
+		),
 		scheduler.WithRunOutcomeRollout(
 			cfg.Pipeline.RunOutcomeEnabled,
 			cfg.Pipeline.RunOutcomeCanaryScheduleID,

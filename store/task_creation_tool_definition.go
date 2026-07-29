@@ -264,6 +264,25 @@ func (s *Store) GetCurrentToolApprovedDefinition(
 		tenantID, userID, taskID)
 }
 
+// HasCurrentToolApprovedDefinition is the scheduler canary preflight. It
+// distinguishes a retained V1-only task from a Source-free Tool task without
+// exposing definition payloads across the scheduler boundary.
+func (s *Store) HasCurrentToolApprovedDefinition(
+	ctx context.Context,
+	tenantID, userID int64,
+	taskID string,
+) (bool, error) {
+	_, err := s.GetCurrentToolApprovedDefinition(
+		ctx, tenantID, userID, taskID)
+	if errors.Is(err, types.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func scanToolApprovedDefinitionVersion(
 	row pgx.Row,
 	tenantID, userID int64,

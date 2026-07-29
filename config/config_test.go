@@ -9,6 +9,90 @@ import (
 	"github.com/spf13/viper"
 )
 
+func TestToolRuntimeCanaryValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		compiled       bool
+		compiledCanary string
+		compiledAll    bool
+		toolCanary     string
+		wantErr        bool
+	}{
+		{name: "off"},
+		{
+			name: "exact nested canary", compiled: true,
+			compiledCanary: "task-a", toolCanary: " task-a ",
+		},
+		{
+			name:     "compiled all permits one Tool canary",
+			compiled: true, compiledAll: true, toolCanary: "task-a",
+		},
+		{
+			name:       "requires compiled rollout",
+			toolCanary: "task-a", wantErr: true,
+		},
+		{
+			name:     "must be inside compiled canary",
+			compiled: true, compiledCanary: "task-a",
+			toolCanary: "task-b", wantErr: true,
+		},
+		{
+			name:     "blank canary is invalid",
+			compiled: true, compiledAll: true,
+			toolCanary: "   ", wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{
+				DB: DBConfig{URL: "postgres://test"},
+				Pipeline: PipelineConfig{
+					CompiledRuntimeEnabled:          test.compiled,
+					CompiledRuntimeCanaryScheduleID: test.compiledCanary,
+					CompiledRuntimeAllowAll:         test.compiledAll,
+					ToolRuntimeCanaryScheduleID:     test.toolCanary,
+				},
+			}
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Validate() error=%v, wantErr=%t",
+					err, test.wantErr)
+			}
+			if err == nil {
+				want := strings.TrimSpace(test.toolCanary)
+				if cfg.Pipeline.ToolRuntimeCanaryScheduleID != want {
+					t.Fatalf("Tool runtime canary=%q, want %q",
+						cfg.Pipeline.ToolRuntimeCanaryScheduleID, want)
+				}
+			}
+		})
+	}
+}
+
+func TestEnvOnlyToolRuntimeCanary(t *testing.T) {
+	clearVaneEnv(t)
+	skipIfSystemConfigExists(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("VANE_DB_URL", "postgres://env")
+	t.Setenv("VANE_PIPELINE_COMPILED_RUNTIME_ENABLED", "true")
+	t.Setenv(
+		"VANE_PIPELINE_COMPILED_RUNTIME_CANARY_SCHEDULE_ID",
+		"task-tool",
+	)
+	t.Setenv(
+		"VANE_PIPELINE_TOOL_RUNTIME_CANARY_SCHEDULE_ID",
+		" task-tool ",
+	)
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Pipeline.ToolRuntimeCanaryScheduleID != "task-tool" {
+		t.Fatalf("env-only Tool canary=%q",
+			cfg.Pipeline.ToolRuntimeCanaryScheduleID)
+	}
+}
+
 func TestRunOutcomeRolloutValidation(t *testing.T) {
 	tests := []struct {
 		name            string

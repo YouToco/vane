@@ -54,6 +54,13 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		json.RawMessage(`{"created":true}`)); err != nil {
 		t.Fatalf("complete Source-free task: %v", err)
 	}
+	if available, err := st.HasCurrentToolApprovedDefinition(
+		ctx, creation.Lease.TenantID, creation.Lease.UserID,
+		creation.Definition.TaskID,
+	); err != nil || !available {
+		t.Fatalf("Tool runtime scheduler preflight: available=%v err=%v",
+			available, err)
+	}
 
 	policy := testCompiledRunPolicyV1(t)
 	identity := types.RunIdentity{

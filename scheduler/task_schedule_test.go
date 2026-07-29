@@ -1055,6 +1055,20 @@ type taskScheduleTestScheduler struct {
 	fake *taskScheduleFakeClient
 }
 
+type toolRuntimeCapabilityScheduleStore struct {
+	scheduleStore
+	available bool
+	err       error
+}
+
+func (s *toolRuntimeCapabilityScheduleStore) HasCurrentToolApprovedDefinition(
+	context.Context,
+	int64, int64,
+	string,
+) (bool, error) {
+	return s.available, s.err
+}
+
 type taskScheduleConverterRecorder struct {
 	mu      sync.Mutex
 	encoded []converter.WorkflowSerializationContext
@@ -1503,6 +1517,17 @@ func TestPrepareTaskSchedule_FingerprintVersionFollowsCompiledRuntimeRollout(t *
 			wantMode:    types.ExecutionModeCompiled,
 		},
 		{
+			name: "matching Tool canary writes Source-free runtime",
+			configure: func(s *Scheduler) {
+				WithCompiledRuntimeRollout(true, taskID, false)(s)
+				WithCompiledToolRuntimeCanary(taskID)(s)
+			},
+			wantVersion: taskScheduleFingerprintVersion,
+			wantRuntime: workflow.CompiledRuntimeToolSnapshotV2,
+			wantTenant:  req.TenantID,
+			wantMode:    types.ExecutionModeCompiled,
+		},
+		{
 			name: "nonmatching canary stays v1",
 			configure: func(s *Scheduler) {
 				WithCompiledRuntimeRollout(true, "task-v1-other", false)(s)
@@ -1527,6 +1552,37 @@ func TestPrepareTaskSchedule_FingerprintVersionFollowsCompiledRuntimeRollout(t *
 				t.Fatalf("validate prepared rollout checkpoint: %v", err)
 			}
 		})
+	}
+}
+
+func TestActivateTask_ToolRuntimeRequiresCommittedToolDefinition(t *testing.T) {
+	req := validTaskScheduleRequest()
+	taskID, err := TaskIDForOperation(
+		req.TenantID, req.UserID, req.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := newTaskScheduleFakeClient()
+	s := newTaskScheduleTestScheduler(fake)
+	capabilities := &toolRuntimeCapabilityScheduleStore{}
+	s.st = capabilities
+	WithCompiledRuntimeRollout(true, taskID, false)(s.Scheduler)
+	WithCompiledToolRuntimeCanary(taskID)(s.Scheduler)
+	prepared := preparedTaskSchedule(t, s, req)
+	ensured, err := s.Scheduler.EnsurePausedTask(t.Context(), prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Scheduler.ActivateTask(
+		t.Context(), prepared, ensured.Snapshot,
+	); err == nil {
+		t.Fatal("Tool schedule activated before Tool definition commit")
+	}
+	capabilities.available = true
+	if _, err := s.Scheduler.ActivateTask(
+		t.Context(), prepared, ensured.Snapshot,
+	); err != nil {
+		t.Fatalf("activate committed Tool task: %v", err)
 	}
 }
 

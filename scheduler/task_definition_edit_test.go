@@ -32,11 +32,23 @@ func newTaskDefinitionEditFixture(
 	t *testing.T,
 	state TaskDefinitionEditOriginalState,
 ) *taskDefinitionEditFixture {
+	return newTaskDefinitionEditFixtureWithOptions(t, state)
+}
+
+func newTaskDefinitionEditFixtureWithOptions(
+	t *testing.T,
+	state TaskDefinitionEditOriginalState,
+	options ...SchedulerOption,
+) *taskDefinitionEditFixture {
 	t.Helper()
 
 	fake := newTaskScheduleFakeClient()
 	scheduler := newTaskScheduleTestScheduler(fake)
+	scheduler.st = &toolRuntimeCapabilityScheduleStore{available: true}
 	WithCompiledRuntimeRollout(true, "", true)(scheduler.Scheduler)
+	for _, option := range options {
+		option(scheduler.Scheduler)
+	}
 
 	request := validTaskScheduleRequest()
 	creation := preparedTaskSchedule(t, scheduler, request)
@@ -72,6 +84,44 @@ func newTaskDefinitionEditFixture(
 			Scope:         cloneTaskDefinitionEditScope(request.Scope),
 			NLDescription: request.NLDescription,
 		},
+	}
+}
+
+func TestTaskDefinitionEdit_PreservesToolRuntimeCanary(t *testing.T) {
+	request := validTaskScheduleRequest()
+	taskID, err := TaskIDForOperation(
+		request.TenantID, request.UserID, request.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newTaskDefinitionEditFixtureWithOptions(
+		t, TaskDefinitionEditOriginalStateActive,
+		WithCompiledToolRuntimeCanary(taskID),
+	)
+	if got := fixture.creation.Action.Params.RuntimeVersion; got != workflow.CompiledRuntimeToolSnapshotV2 {
+		t.Fatalf("Tool creation runtime=%q", got)
+	}
+	prepared, snapshot := fixture.prepare(
+		t, "edit-tool-runtime",
+		taskDefinitionEditHead(1, "a"),
+		taskDefinitionEditHead(2, "b"),
+		fixture.base,
+		changedTaskDefinitionEditDefinition(fixture.base, "tool"),
+	)
+	if prepared.BaseOriginal.Action.Params.RuntimeVersion !=
+		workflow.CompiledRuntimeToolSnapshotV2 ||
+		prepared.TargetFinal.Action.Params.RuntimeVersion !=
+			workflow.CompiledRuntimeToolSnapshotV2 {
+		t.Fatalf("definition edit changed Tool runtime: base=%q target=%q",
+			prepared.BaseOriginal.Action.Params.RuntimeVersion,
+			prepared.TargetFinal.Action.Params.RuntimeVersion)
+	}
+	if _, err := fixture.scheduler.PauseTaskDefinitionEdit(
+		t.Context(), prepared); err != nil {
+		t.Fatalf("pause Tool definition edit: %v", err)
+	}
+	if snapshot.Phase != TaskDefinitionEditPhaseBaseOriginal {
+		t.Fatalf("Tool definition edit snapshot=%+v", snapshot)
 	}
 }
 
