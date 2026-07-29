@@ -104,6 +104,31 @@ const naturalTaskDefinitionEditAmbiguousSystemNote = `
 const naturalTaskDefinitionEditRetrySystemNote = `
 - 系统刚拒绝了不属于“按名称定位后编辑任务”的工具调用；它没有执行。严格按当前阶段唯一声明的工具继续。`
 
+const taskDefinitionEditIntentSystemPrompt = `
+你是任务操作的只读意图裁决器。你不能执行任何操作，只能调用 route_task_edit_intent 一次。
+
+判断最后一条用户消息是否授权“现在立即修改已有任务定义”：
+- execute：用户本轮明确命令立即修改；或上一轮已明确命令修改、助手仅追问目标任务，本轮用户直接选择了一个候选且没有撤销。
+- non_execute：询问是否合适、利弊、影响、怎么做、假设场景、表达否定/取消/不用改；改为删除、运行、创建等其他动作；或任何含糊情况。
+
+必须理解整句话和相邻对话，不能因为出现“把/改为/可以/任务”等词就推断授权。含糊时一律 non_execute。`
+
+var taskDefinitionEditIntentTool = llm.ToolDef{
+	Name:        "route_task_edit_intent",
+	Description: "只读判断当前用户是否授权立即修改已有任务；不执行修改。",
+	Parameters: json.RawMessage(`{
+	  "type": "object",
+	  "properties": {
+	    "decision": {
+	      "type": "string",
+	      "enum": ["execute", "non_execute"]
+	    }
+	  },
+	  "required": ["decision"],
+	  "additionalProperties": false
+	}`),
+}
+
 // 契约 §7 固定的回复/占位文案。
 const (
 	// replyMaxTurns 是 MaxTurns 内未收敛时的兜底回复（契约原文，勿改）。
@@ -326,6 +351,15 @@ type Loop struct {
 	sessionTTL            time.Duration
 	intentToolkitsEnabled bool
 	intentToolkitsShadow  bool
+	// taskEditIntentFn is an isolated, side-effect-free semantic gate. It is separate
+	// from the main Agent call so a durable edit requires two agreeing model
+	// decisions: classify the current owner turn as an immediate edit, then
+	// explicitly call the uniquely bound edit tool. Tests may replace it with
+	// a deterministic decision without weakening the production default.
+	taskEditIntentFn func(
+		context.Context,
+		[]llm.ChatMessage,
+	) (bool, error)
 
 	// userMu 按 userID 串行化 HandleMessage（审查 #并发盲覆盖）：feishu 对每条消息
 	// 起独立 goroutine，而 HandleMessage 是 load→append→save 的读改写；
@@ -506,6 +540,7 @@ func NewChecked(d Deps) (*Loop, error) {
 				return llm.DoChat(cctx, d.Client, d.Recorder, meta, req)
 			})
 	}
+	l.taskEditIntentFn = l.classifyTaskDefinitionEditIntent
 	return l, nil
 }
 
@@ -516,6 +551,58 @@ func agentChatRetryDelay(failedAttempt int) time.Duration {
 	default:
 		return agentChatLaterRetryWait
 	}
+}
+
+func (l *Loop) classifyTaskDefinitionEditIntent(
+	ctx context.Context,
+	messages []llm.ChatMessage,
+) (bool, error) {
+	if l == nil || l.chatFn == nil {
+		return false, nil
+	}
+	resp, err := l.chatWithContextShadow(ctx, llm.ChatRequest{
+		Model: l.model,
+		Messages: withSystem(
+			taskDefinitionEditIntentSystemPrompt,
+			messages,
+			"",
+			false,
+		),
+		Tools:           []llm.ToolDef{taskDefinitionEditIntentTool},
+		MaxTokens:       iptr(64),
+		DisableThinking: true,
+	}, nil, 0)
+	if err != nil {
+		return false, err
+	}
+	if resp == nil || len(resp.ToolCalls) != 1 ||
+		resp.ToolCalls[0].Name != taskDefinitionEditIntentTool.Name {
+		return false, nil
+	}
+	var args struct {
+		Decision string `json:"decision"`
+	}
+	if strictjson.DecodeExact(
+		json.RawMessage(resp.ToolCalls[0].Arguments),
+		&args,
+	) != nil {
+		return false, nil
+	}
+	return args.Decision == "execute", nil
+}
+
+func (l *Loop) chatWithContextShadow(
+	ctx context.Context,
+	request llm.ChatRequest,
+	state *toolRunState,
+	contextStep int,
+) (*llm.ChatResponse, error) {
+	contextShadow := l.prepareAgentContextShadow(
+		ctx, request, state, contextStep,
+	)
+	resp, err := l.chatFn(ctx, request)
+	l.sealPreparedAgentContextShadow(ctx, contextShadow)
+	return resp, err
 }
 
 // retryAgentChat keeps transient provider failures inside the same owner
@@ -777,6 +864,16 @@ func (l *Loop) handleMessage(
 	// question are reused; task candidates are resolved again under the current
 	// owner on the follow-up turn.
 	history := l.scrubUntrustedHistory(decodeMessages(sess))
+	// 同一条消息内的所有模型调用（含只读意图裁决）共享 trace_id。
+	turnID := uuid.NewString()
+	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{
+		traceID: turnID,
+		userID:  userID,
+		scope: agentcontext.Scope{
+			TenantID: sess.TenantID, UserID: sess.UserID,
+			SessionID: sess.ID,
+		},
+	})
 	directDefinitionEdit := directDefinitionEditTaskID != ""
 	directTaskCreation := directActionID != "" && !directDefinitionEdit
 	if directActionID == "" {
@@ -788,11 +885,36 @@ func (l *Loop) handleMessage(
 			!directTaskCreation &&
 			!directDefinitionEdit &&
 			isNaturalTaskDefinitionEditContinuation(history)
-	naturalTaskDefinitionEdit := !externalInput &&
+	naturalTaskDefinitionEditCandidate := !externalInput &&
 		!directTaskCreation &&
 		!directDefinitionEdit &&
-		(isNaturalTaskDefinitionEditRequest(text) ||
+		(isNaturalTaskDefinitionEditCandidate(text) ||
 			naturalTaskDefinitionEditContinuation)
+	naturalTaskDefinitionEdit := false
+	intentClassificationTurns := 0
+	if naturalTaskDefinitionEditCandidate {
+		intentMessages := []llm.ChatMessage{{
+			Role: "user", Content: text,
+		}}
+		if naturalTaskDefinitionEditContinuation {
+			intentMessages = append(
+				naturalTaskDefinitionEditContinuationHistory(history),
+				intentMessages...,
+			)
+		}
+		if l.taskEditIntentFn != nil {
+			intentClassificationTurns = 1
+			allowed, classifyErr := l.taskEditIntentFn(ctx, intentMessages)
+			if classifyErr != nil {
+				slog.Warn(
+					"agent: 任务编辑意图裁决失败，按非执行请求处理",
+					"user_id", userID,
+					"error", classifyErr,
+				)
+			}
+			naturalTaskDefinitionEdit = classifyErr == nil && allowed
+		}
+	}
 	directProposal := directTaskCreation || directDefinitionEdit ||
 		naturalTaskDefinitionEdit
 
@@ -821,18 +943,6 @@ func (l *Loop) handleMessage(
 	}
 	msgs := append(modelHistory, llm.ChatMessage{Role: "user", Content: text})
 	msgs = truncateMessages(msgs)
-
-	// 同一条消息内的多轮模型调用共享 trace_id，llm_calls/tool_calls 里可按 trace
-	// 回放整个 loop。
-	turnID := uuid.NewString()
-	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{
-		traceID: turnID,
-		userID:  userID,
-		scope: agentcontext.Scope{
-			TenantID: sess.TenantID, UserID: sess.UserID,
-			SessionID: sess.ID,
-		},
-	})
 
 	// 端点注册表契约 §4：激活集随会话持久化，本条消息的工具运行状态经 ctx 旁路
 	// 传给工具 Execute（工具是全局单例，不能携带 per-message 状态）。
@@ -873,6 +983,7 @@ func (l *Loop) handleMessage(
 	if err != nil {
 		return Outcome{}, err
 	}
+	turns += intentClassificationTurns
 	if externalInput {
 		// 本轮从第一条请求起就含飞书卡片/引用消息等外部正文，即使模型没有
 		// 调工具也必须把整轮压平。不能依赖文本前缀：调用者已经通过类型化入口
@@ -1109,11 +1220,9 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		// candidate, send the already-built legacy request unchanged, and only
 		// then admit a bounded asynchronous seal. Store/root-lock latency cannot
 		// consume chatFn's context or alter its Outcome.
-		contextShadow := l.prepareAgentContextShadow(
+		resp, err := l.chatWithContextShadow(
 			ctx, request, state, turns,
 		)
-		resp, err := l.chatFn(ctx, request)
-		l.sealPreparedAgentContextShadow(ctx, contextShadow)
 		if err != nil {
 			if errors.Is(err, llm.ErrToolProtocolResponse) && state.untrustedExternalResult {
 				slog.Warn("agent: 外部读取后模型协议异常，返回确定性恢复文案",
@@ -2269,42 +2378,24 @@ func isDirectTaskCreationRequest(text string) bool {
 	return true
 }
 
-func isNaturalTaskDefinitionEditRequest(text string) bool {
+func isNaturalTaskDefinitionEditCandidate(text string) bool {
 	normalized := strings.ToLower(strings.Join(strings.Fields(text), ""))
 	if normalized == "" {
 		return false
 	}
-	// This is a high-confidence fast lane, not a general natural-language
-	// authorization classifier. Anchor it to ordinary command openings so
-	// negation ("我不想把…"), hypotheticals ("如果把…") and advice
-	// questions ("你觉得把…怎么样") stay in ordinary conversation. The
-	// model still interprets the requested change; the harness only decides
-	// whether it is safe to isolate the turn from unrelated tools.
-	startsAsCommand := startsWithAny(normalized,
-		"把", "请把", "帮我把", "麻烦把", "能不能把", "能否把", "可否把", "可以把",
-		"将", "请将", "帮我将", "麻烦将", "能不能将", "能否将", "可否将", "可以将",
-		"修改", "请修改", "帮我修改", "麻烦修改",
-		"更新", "请更新", "帮我更新", "麻烦更新",
-		"调整", "请调整", "帮我调整", "麻烦调整",
-		"change", "pleasechange", "update", "pleaseupdate",
-	)
-	if !startsAsCommand {
-		return false
-	}
-	if containsAny(normalized,
-		"你觉得", "是否应该", "应该吗", "要不要", "怎么样",
-		"会有什么影响", "会怎样", "可行吗",
-		"whatwouldhappen", "shouldwe", "doyouthink",
-	) {
-		return false
-	}
+	// Candidate detection only decides whether to pay for the isolated semantic
+	// adjudicator. It is deliberately broad and grants no capability. Negated,
+	// hypothetical and consultative wording is included here so authorization
+	// is based on sentence meaning, not an open-ended lexical blacklist.
 	hasTaskTarget := containsAny(normalized,
-		"任务", "早报", "日报", "周报", "月报", "定时推送", "监控",
+		"任务", "早报", "日报", "周报", "月报", "定时推送",
+		"监控", "监测", "情报", "跟踪", "关注",
 		"schedule", "task",
 	)
 	hasEdit := containsAny(normalized,
 		"更新为", "改为", "调整为", "换成", "改成",
-		"updateto", "changeto",
+		"修改", "更新", "调整", "编辑",
+		"updateto", "changeto", "change", "update", "edit",
 	)
 	return hasTaskTarget && hasEdit
 }
@@ -2316,7 +2407,7 @@ func isNaturalTaskDefinitionEditContinuation(history []llm.ChatMessage) bool {
 	owner := history[len(history)-2]
 	assistant := history[len(history)-1]
 	if owner.Role != "user" || assistant.Role != "assistant" ||
-		!isNaturalTaskDefinitionEditRequest(owner.Content) {
+		!isNaturalTaskDefinitionEditCandidate(owner.Content) {
 		return false
 	}
 	_, ok := directClarificationReply(assistant.Content)
@@ -2370,10 +2461,36 @@ func naturalEditLookupScope(ownerRequest string) string {
 		}
 	}
 	if earliest == len(normalized) {
+		for _, prefix := range []string{
+			"请修改", "帮我修改", "麻烦修改", "修改",
+			"请更新", "帮我更新", "麻烦更新", "更新",
+			"请调整", "帮我调整", "麻烦调整", "调整",
+			"请编辑", "帮我编辑", "麻烦编辑", "编辑",
+			"pleasechange", "change", "pleaseupdate", "update",
+			"pleaseedit", "edit",
+		} {
+			if !strings.HasPrefix(normalized, prefix) {
+				continue
+			}
+			scope := strings.TrimPrefix(normalized, prefix)
+			cut := len(scope)
+			for _, separator := range []string{
+				"：", ":", "；", ";", "。", "，", ",",
+				"以后", "从现在", "只看", "只推", "改成", "改为",
+			} {
+				if at := strings.Index(scope, separator); at >= 0 &&
+					at < cut {
+					cut = at
+				}
+			}
+			if cut > 0 {
+				return scope[:cut]
+			}
+			return ""
+		}
 		// A targeted follow-up such as “周报那个” intentionally contains no
-		// second edit marker. Its immediately preceding isolated turn has
-		// already established the edit operation; the current owner words only
-		// select the readable candidate and are safe as the lookup scope.
+		// second edit marker. The semantic gate has already verified that the
+		// immediately preceding isolated turn established this edit operation.
 		return normalized
 	}
 	return normalized[:earliest]

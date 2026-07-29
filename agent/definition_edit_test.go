@@ -116,6 +116,16 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 		},
 	}
 	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			FinishReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID:   "route-edit",
+				Name: taskDefinitionEditIntentTool.Name,
+				Arguments: `{
+					"decision":"execute"
+				}`,
+			}},
+		},
 		{Content: replyMaxTurns},
 		{
 			FinishReason: "tool_calls",
@@ -168,19 +178,23 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 	if out.Reply != "已修改定时推送任务（id=task-edit-1）。" {
 		t.Fatalf("Reply=%q", out.Reply)
 	}
-	if len(chat.requests) != 3 {
-		t.Fatalf("model calls=%d, want 3 including one bounded retry",
+	if len(chat.requests) != 4 {
+		t.Fatalf("model calls=%d, want route + 3 edit calls",
 			len(chat.requests))
 	}
 	if got := toolDefNames(chat.requests[0].Tools); len(got) != 1 ||
-		got[0] != "list_schedules" {
-		t.Fatalf("first tools=%v, want list_schedules only", got)
+		got[0] != taskDefinitionEditIntentTool.Name {
+		t.Fatalf("route tools=%v, want semantic intent gate", got)
 	}
 	if got := toolDefNames(chat.requests[1].Tools); len(got) != 1 ||
 		got[0] != "list_schedules" {
-		t.Fatalf("retry tools=%v, want list_schedules only", got)
+		t.Fatalf("first tools=%v, want list_schedules only", got)
 	}
 	if got := toolDefNames(chat.requests[2].Tools); len(got) != 1 ||
+		got[0] != "list_schedules" {
+		t.Fatalf("retry tools=%v, want list_schedules only", got)
+	}
+	if got := toolDefNames(chat.requests[3].Tools); len(got) != 1 ||
 		got[0] != "edit_task_definition" {
 		t.Fatalf("third tools=%v, want edit_task_definition only", got)
 	}
@@ -193,7 +207,7 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 			len(controller.proposeCalls), len(controller.executeCalls))
 	}
 	if bytes.Contains(
-		[]byte(chat.requests[0].Messages[0].Content),
+		[]byte(chat.requests[1].Messages[0].Content),
 		[]byte("请把需求拆小"),
 	) {
 		t.Fatal("natural edit lane must not instruct the user to split one edit")
@@ -253,6 +267,12 @@ func TestNaturalTaskDefinitionEditSupportsPoliteShortName(t *testing.T) {
 		SessionTTL:         30 * time.Minute,
 	})
 	loop.chatFn = chat.fn
+	loop.taskEditIntentFn = func(
+		context.Context,
+		[]llm.ChatMessage,
+	) (bool, error) {
+		return true, nil
+	}
 
 	out, err := loop.HandleMessage(
 		t.Context(), 7,
@@ -345,6 +365,17 @@ func TestNaturalTaskDefinitionEditAmbiguityExposesNoWriteTool(t *testing.T) {
 		SessionTTL:         30 * time.Minute,
 	})
 	loop.chatFn = chat.fn
+	var intentMessages [][]llm.ChatMessage
+	loop.taskEditIntentFn = func(
+		_ context.Context,
+		messages []llm.ChatMessage,
+	) (bool, error) {
+		intentMessages = append(
+			intentMessages,
+			append([]llm.ChatMessage(nil), messages...),
+		)
+		return true, nil
+	}
 
 	out, err := loop.HandleMessage(
 		t.Context(),
@@ -383,36 +414,266 @@ func TestNaturalTaskDefinitionEditAmbiguityExposesNoWriteTool(t *testing.T) {
 		t.Fatalf("followup prepare=%d execute=%d, want 1/1",
 			len(controller.proposeCalls), len(controller.executeCalls))
 	}
+	if len(intentMessages) != 2 || len(intentMessages[1]) != 3 ||
+		intentMessages[1][0].Content !=
+			"请把“AI更新”任务更新为每周一只推重大官方发布。" ||
+		intentMessages[1][2].Content != "周报那个" {
+		t.Fatalf("intent continuation context=%+v", intentMessages)
+	}
 }
 
-func TestNaturalTaskDefinitionEditClassifier(t *testing.T) {
+func TestNaturalTaskDefinitionEditCancellationLeavesEditLane(t *testing.T) {
+	fs := newFakeStore()
+	list := &fakeTool{
+		name:       "list_schedules",
+		parameters: json.RawMessage(listSchedulesSchema),
+		result: strings.Join([]string{
+			"共 2 个定时推送任务：",
+			"- id=task-ai-daily 按 cron「0 8 * * *」触发（状态: active，描述: AI更新日报）",
+			"- id=task-ai-weekly 按 cron「0 9 * * 1」触发（状态: active，描述: AI更新周报）",
+		}, "\n"),
+	}
+	controller := &fakeDefinitionEditController{}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			FinishReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID: "list-cancel", Name: "list_schedules",
+				Arguments: `{"query":"AI更新"}`,
+			}},
+		},
+		{Content: "你要修改“AI更新日报”还是“AI更新周报”？"},
+		{Content: "好的，AI 更新周报保持不变。"},
+	}}
+	loop := New(Deps{
+		Store: fs,
+		Tools: []ToolSpec{
+			newToolSpec(list, ownerPolicy(
+				Effects(EffectInternalRead), BudgetNone)),
+			newToolSpec(&editTaskDefinitionTool{}, ownerPolicy(
+				Effects(
+					EffectDurableProposal,
+					EffectStateWrite,
+					EffectDirectOwnerWrite,
+				),
+				BudgetNone,
+			)),
+		},
+		TaskDefinitionEdit: controller,
+		Model:              "test-model",
+		MaxTurns:           20,
+		SessionTTL:         30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+	intentCalls := 0
+	loop.taskEditIntentFn = func(
+		_ context.Context,
+		messages []llm.ChatMessage,
+	) (bool, error) {
+		intentCalls++
+		if messages[len(messages)-1].Content == "AI 周报不用改了" {
+			return false, nil
+		}
+		return true, nil
+	}
+
+	first, err := loop.HandleMessage(
+		t.Context(),
+		7,
+		"请把“AI更新”任务更新为每周一只推重大官方发布。",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Reply != "你要修改“AI更新日报”还是“AI更新周报”？" {
+		t.Fatalf("first Reply=%q", first.Reply)
+	}
+	second, err := loop.HandleMessage(
+		t.Context(), 7, "AI 周报不用改了",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Reply != "好的，AI 更新周报保持不变。" {
+		t.Fatalf("second Reply=%q", second.Reply)
+	}
+	if intentCalls != 2 || len(list.calls) != 1 {
+		t.Fatalf("intent calls=%d list calls=%d, want 2/1",
+			intentCalls, len(list.calls))
+	}
+	for _, name := range toolDefNames(chat.requests[2].Tools) {
+		if name == definitionEditToolName {
+			t.Fatal("cancelled continuation exposed definition edit")
+		}
+	}
+	if len(controller.proposeCalls) != 0 ||
+		len(controller.executeCalls) != 0 {
+		t.Fatal("cancelled continuation reached durable controller")
+	}
+}
+
+func TestNaturalTaskDefinitionEditCandidate(t *testing.T) {
 	for _, test := range []struct {
 		text string
 		want bool
 	}{
 		{"请把“每周 AI 更新”任务更新为只看官方博客", true},
 		{"把日报改成每周一推送", true},
-		{"如何修改这个任务？", false},
-		{"不要修改这个任务", false},
-		{"不要把日报改成周报", false},
-		{"别把 AI 周报改为每天", false},
-		{"我不是要把日报改成周报", false},
-		{"我不想把 AI 日报改为周报", false},
-		{"请勿把 AI 日报改为周报", false},
-		{"我并非要把 AI 日报改成周报", false},
-		{"你觉得把 AI 日报改为周报怎么样？", false},
-		{"如果把 AI 日报改为周报，会有什么影响？", false},
-		{"AI 日报是否应该改为周报？", false},
-		{"可以把 AI 日报改为周报吗，如果这样会有什么影响？", false},
+		{"如何修改这个任务？", true},
+		{"不要修改这个任务", true},
+		{"不要把日报改成周报", true},
+		{"别把 AI 周报改为每天", true},
+		{"我不是要把日报改成周报", true},
+		{"我不想把 AI 日报改为周报", true},
+		{"请勿把 AI 日报改为周报", true},
+		{"我并非要把 AI 日报改成周报", true},
+		{"你觉得把 AI 日报改为周报怎么样？", true},
+		{"如果把 AI 日报改为周报，会有什么影响？", true},
+		{"AI 日报是否应该改为周报？", true},
+		{"可以把 AI 日报改为周报吗，如果这样会有什么影响？", true},
 		{"可以把 AI 日报改成每周一推送吗？", true},
 		{"能不能把早报改为只看官方博客？", true},
 		{"能否把早报改为只看官方博客？", true},
+		{"修改竞品情报：以后只看官方博客", true},
 		{"创建任务：每天看官方博客", false},
 	} {
-		if got := isNaturalTaskDefinitionEditRequest(test.text); got != test.want {
-			t.Errorf("isNaturalTaskDefinitionEditRequest(%q)=%v, want %v",
+		if got := isNaturalTaskDefinitionEditCandidate(test.text); got != test.want {
+			t.Errorf("isNaturalTaskDefinitionEditCandidate(%q)=%v, want %v",
 				test.text, got, test.want)
 		}
+	}
+}
+
+func TestTaskDefinitionEditIntentClassifierRequiresExplicitExecute(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		response *llm.ChatResponse
+		want     bool
+	}{
+		{
+			name: "execute",
+			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID:   "route-1",
+				Name: taskDefinitionEditIntentTool.Name,
+				Arguments: `{
+					"decision":"execute"
+				}`,
+			}}},
+			want: true,
+		},
+		{
+			name: "non execute",
+			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID:   "route-2",
+				Name: taskDefinitionEditIntentTool.Name,
+				Arguments: `{
+					"decision":"non_execute"
+				}`,
+			}}},
+		},
+		{
+			name:     "tool free",
+			response: &llm.ChatResponse{Content: "execute"},
+		},
+		{
+			name: "unknown field",
+			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID:   "route-3",
+				Name: taskDefinitionEditIntentTool.Name,
+				Arguments: `{
+					"decision":"execute",
+					"extra":true
+				}`,
+			}}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			loop := &Loop{model: "test-model"}
+			loop.chatFn = func(
+				context.Context,
+				llm.ChatRequest,
+			) (*llm.ChatResponse, error) {
+				return test.response, nil
+			}
+			got, err := loop.classifyTaskDefinitionEditIntent(
+				t.Context(),
+				[]llm.ChatMessage{{
+					Role: "user", Content: "请把 AI 日报改为周报",
+				}},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("allowed=%v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestTaskDefinitionEditNonExecuteCannotWrite(t *testing.T) {
+	for _, ownerRequest := range []string{
+		"请把 AI 日报改为周报是否合适？",
+		"把 AI 日报改为周报的利弊列一下",
+		"可以把 AI 日报改为周报好不好？",
+	} {
+		t.Run(ownerRequest, func(t *testing.T) {
+			controller := &fakeDefinitionEditController{}
+			loop := New(Deps{
+				Store: newFakeStore(),
+				Tools: []ToolSpec{
+					newToolSpec(
+						&editTaskDefinitionTool{},
+						ownerPolicy(
+							Effects(
+								EffectDurableProposal,
+								EffectStateWrite,
+								EffectDirectOwnerWrite,
+							),
+							BudgetNone,
+						),
+					),
+				},
+				TaskDefinitionEdit: controller,
+				Model:              "test-model",
+				MaxTurns:           20,
+				SessionTTL:         30 * time.Minute,
+			})
+			var request llm.ChatRequest
+			loop.chatFn = func(
+				_ context.Context,
+				got llm.ChatRequest,
+			) (*llm.ChatResponse, error) {
+				request = got
+				return &llm.ChatResponse{
+					Content: "这是咨询，不执行修改。",
+				}, nil
+			}
+			loop.taskEditIntentFn = func(
+				context.Context,
+				[]llm.ChatMessage,
+			) (bool, error) {
+				return false, nil
+			}
+			out, err := loop.HandleMessage(
+				t.Context(), 7, ownerRequest,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out.Reply != "这是咨询，不执行修改。" {
+				t.Fatalf("Reply=%q", out.Reply)
+			}
+			for _, name := range toolDefNames(request.Tools) {
+				if name == definitionEditToolName {
+					t.Fatal("non-execute request exposed definition edit")
+				}
+			}
+			if len(controller.proposeCalls) != 0 ||
+				len(controller.executeCalls) != 0 {
+				t.Fatal("non-execute request reached durable controller")
+			}
+		})
 	}
 }
 
