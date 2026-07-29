@@ -240,10 +240,65 @@ func TestPeriodicSynthesisUsesCanonicalPrefixesAndRejectsForeignRefs(
 	if _, err := ParsePeriodicContentV1(raw, selected); err != nil {
 		t.Fatal(err)
 	}
+	content.Signals[0].Lifecycle = types.ExecutiveSignalPersistent
+	raw, _ = json.Marshal(content)
+	if _, err := ParsePeriodicContentV1(raw, selected); err == nil {
+		t.Fatal("single-Brief persistent signal was accepted")
+	}
+	content.Signals[0].EvidenceRefs = append(
+		content.Signals[0].EvidenceRefs,
+		types.ExecutiveEvidenceRefV1{
+			BriefID:      selected[1].ID,
+			InsightID:    selected[1].Insights[0].ID,
+			ClaimIndexes: []int{0},
+		},
+	)
+	raw, _ = json.Marshal(content)
+	if _, err := ParsePeriodicContentV1(raw, selected); err != nil {
+		t.Fatalf("two-Brief persistent signal was rejected: %v", err)
+	}
 	content.Signals[0].EvidenceRefs[0].BriefID = 999
 	raw, _ = json.Marshal(content)
 	if _, err := ParsePeriodicContentV1(raw, selected); err == nil {
 		t.Fatal("foreign Brief reference was accepted")
+	}
+}
+
+func TestPeriodicSystemPromptDefinesExactOutputEnvelope(t *testing.T) {
+	for _, contract := range []string{
+		"顶层字段必须且只能是 headline、executive_summary、decision_state、why_for_you、signals、next_steps",
+		"signals 必须直接是 JSON 数组",
+		"不得包装为 signals.periodic_signals、periodic_signals 或任何额外对象",
+		"signals 必须包含 1 至 5 项",
+		"每项必须且只能包含 kind、lifecycle、title、summary、evidence_refs",
+		"evidence_refs 不得为空",
+		"只输出证据支持的 lifecycle，不必凑齐四类",
+		"persistent、intensified、faded 必须引用至少两个不同 brief_id",
+		"next_steps 必须直接是 JSON 数组且最多 3 项",
+		"每个 evidence_ref 必须且只能包含 brief_id、insight_id、claim_indexes",
+		"同一个 Brief 层级下的配对，不得交叉拼接",
+		"有效 0-based 索引并严格递增，不要求首项为 0",
+		"evidence_ref 总数不得超过 32",
+	} {
+		if !strings.Contains(PeriodicSystemPromptV1, contract) {
+			t.Fatalf("periodic prompt is missing %q", contract)
+		}
+	}
+}
+
+func TestParsePeriodicContentV1RejectsWrappedSignalsEnvelope(t *testing.T) {
+	now := time.Date(2026, 7, 29, 8, 0, 0, 0, time.UTC)
+	brief := executiveTestBrief(t, 11, now.Add(-time.Hour), 1)
+	raw := []byte(`{
+		"headline":"本期信号",
+		"executive_summary":"出现一项变化。",
+		"decision_state":"watch",
+		"why_for_you":"值得继续观察。",
+		"signals":{"periodic_signals":[]},
+		"next_steps":[]
+	}`)
+	if _, err := ParsePeriodicContentV1(raw, []types.BriefV1{brief}); err == nil {
+		t.Fatal("wrapped periodic signals envelope was accepted")
 	}
 }
 
