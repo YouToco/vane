@@ -2,14 +2,11 @@ package store
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 
 	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/taskstate"
@@ -17,37 +14,11 @@ import (
 )
 
 const (
-	taskRunSnapshotPayloadSchemaV2 = "vane.task-run-snapshot-payload/v2"
-	taskRunToolPlanDigestVersionV1 = "vane.task-run-tool-plan/v1"
+	taskRunSnapshotPayloadSchemaV2 = runcontext.CompiledSnapshotPayloadSchemaV2
+	taskRunToolPlanDigestVersionV1 = runcontext.ToolPlanDigestVersionV1
 )
 
-type taskRunSnapshotPayloadV2 struct {
-	SchemaVersion                  string                         `json:"schema_version"`
-	TenantID                       int64                          `json:"tenant_id"`
-	UserID                         int64                          `json:"user_id"`
-	TaskID                         string                         `json:"task_id"`
-	RunKind                        types.RunSnapshotKind          `json:"run_kind"`
-	Mode                           types.ExecutionMode            `json:"mode"`
-	DefinitionVersion              int64                          `json:"definition_version"`
-	DefinitionDigest               string                         `json:"definition_digest"`
-	AdaptiveVersion                int64                          `json:"adaptive_version"`
-	AdaptiveDigest                 string                         `json:"adaptive_digest"`
-	AdaptiveBasisDefinitionVersion int64                          `json:"adaptive_basis_definition_version"`
-	AdaptiveBasisDefinitionDigest  string                         `json:"adaptive_basis_definition_digest"`
-	ObservationRollout             observation.RolloutMode        `json:"observation_rollout"`
-	Policies                       taskRunPolicyPayloads          `json:"policies"`
-	Budget                         taskRunBudget                  `json:"budget"`
-	Definition                     taskstate.ApprovedDefinitionV2 `json:"definition"`
-	Adaptive                       taskstate.AdaptiveStateV2      `json:"adaptive"`
-	ToolBindings                   []runcontext.ToolBindingV1     `json:"tool_bindings"`
-	ReferenceSchemaVersion         string                         `json:"reference_schema_version"`
-}
-
-type taskRunToolPlanDigestEnvelopeV1 struct {
-	Version      string                       `json:"version"`
-	ToolCalls    []taskstate.ToolInvocationV1 `json:"tool_calls"`
-	ToolBindings []runcontext.ToolBindingV1   `json:"tool_bindings"`
-}
+type taskRunSnapshotPayloadV2 = runcontext.CompiledSnapshotPayloadV2
 
 type taskRunSnapshotPayloadV2Read struct {
 	Payload       taskRunSnapshotPayloadV2
@@ -106,15 +77,7 @@ func digestTaskRunToolPlanV1(
 	calls []taskstate.ToolInvocationV1,
 	bindings []runcontext.ToolBindingV1,
 ) (string, error) {
-	payload, err := json.Marshal(taskRunToolPlanDigestEnvelopeV1{
-		Version:   taskRunToolPlanDigestVersionV1,
-		ToolCalls: calls, ToolBindings: bindings,
-	})
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(payload)
-	return hex.EncodeToString(sum[:]), nil
+	return runcontext.DigestToolPlanV1(calls, bindings)
 }
 
 func encodeTaskRunSnapshotPayloadV2(

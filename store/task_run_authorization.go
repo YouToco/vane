@@ -127,6 +127,33 @@ func (s *Store) AuthorizeTaskRunSideEffect(
 	return authorizeLiveTaskRunSideEffectV1(ctx, s.pool, expected)
 }
 
+// AuthorizeTaskRunSideEffectV2 is the Source-free Tool runtime's final
+// live-state gate. Its distinct reference type prevents retained V1 effects
+// from accepting a Tool snapshot (and vice versa).
+func (s *Store) AuthorizeTaskRunSideEffectV2(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRefV2,
+) (bool, error) {
+	if err := validateTaskRunSnapshotReferenceForExpectedV2(ref, expected); err != nil {
+		return false, taskRunValidationError(
+			"task run v2 snapshot reference is invalid")
+	}
+	lookup := taskRunLookupFromIdentity(expected)
+	snapshot, found, err := loadTaskRunSnapshot(ctx, s.pool, lookup)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+	storedRef, err := snapshot.safeRefV2()
+	if err != nil || storedRef != ref {
+		return false, taskRunIntegrityError()
+	}
+	return authorizeLiveTaskRunSideEffectV1(ctx, s.pool, expected)
+}
+
 func authorizeLiveTaskRunSideEffectV1(
 	ctx context.Context,
 	q taskRunAuthorizationQueryer,

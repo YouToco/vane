@@ -97,6 +97,13 @@ remains replayable but cannot be selected for a new definition.
 7. **Removal.** After v1 recovery and historical readers drain, delete the
    legacy global target projections and unscoped APIs.
 
+The first part of step 4 is deliberately dark: `PrepareToolRunV2` is
+registered and production-composed, but no durable Schedule Action selects its
+runtime label yet. This proves exact RunID recovery, frozen-route validation
+and live task authorization without creating a half-working production path.
+The label may be selected only after the Tool executor and
+run-snapshot/invocation-digest observation writes are available.
+
 Do not dual-write new private Tool arguments into the legacy global tables.
 Do not backfill a historical observation to every task that happened to share
 a target; only exact run/delivery/event evidence can establish provenance.

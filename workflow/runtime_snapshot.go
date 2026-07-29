@@ -11,6 +11,7 @@ type RunIdentity = types.RunIdentity
 type RuntimePolicySnapshot = types.RuntimePolicyDigests
 type PlannerBudgetSnapshot = types.PlannerBudget
 type RunSnapshotRef = types.RunSnapshotRef
+type RunSnapshotRefV2 = types.RunSnapshotRefV2
 
 const RunSnapshotKindScheduled = types.RunSnapshotKindScheduled
 
@@ -39,6 +40,37 @@ func (r PrepareRunResult) Validate() error {
 // identity. expected is validated even for an unauthorized result, so missing
 // expected scope can never act as a wildcard.
 func (r PrepareRunResult) ValidateFor(expected RunIdentity) error {
+	if err := expected.Validate(); err != nil {
+		return err
+	}
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	if !r.Authorized {
+		return nil
+	}
+	return r.Snapshot.ValidateFor(expected)
+}
+
+// PrepareToolRunV2Result is deliberately distinct from PrepareRunResult so a
+// retained Source runtime cannot receive or authorize a Source-free Tool ref.
+type PrepareToolRunV2Result struct {
+	Authorized bool             `json:"authorized"`
+	Snapshot   RunSnapshotRefV2 `json:"snapshot"`
+}
+
+func (r PrepareToolRunV2Result) Validate() error {
+	if !r.Authorized {
+		if r.Snapshot != (RunSnapshotRefV2{}) {
+			return types.NewAppError(types.CodeValidation,
+				"unauthorized Tool prepare result must carry a zero snapshot", nil)
+		}
+		return nil
+	}
+	return r.Snapshot.Validate()
+}
+
+func (r PrepareToolRunV2Result) ValidateFor(expected RunIdentity) error {
 	if err := expected.Validate(); err != nil {
 		return err
 	}
