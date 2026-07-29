@@ -37,6 +37,30 @@ command -v flock >/dev/null
 exec 9>"$state_dir/control-plane.lock"
 flock 9
 
+# Backend deployment cleanup runs from an EXIT trap after deploy_backend's
+# local scope has unwound. Keep its state at script scope; Bash removes local
+# variables before invoking the EXIT trap, which previously turned a real Gate
+# failure into an additional "unbound variable" error and leaked remote_stage.
+backend_ssh_dir=
+backend_remote_stage=
+backend_ssh_target=
+backend_remote_stage_created=false
+declare -a backend_ssh_opts=()
+
+cleanup_backend() {
+  local status=$?
+  trap - EXIT
+  if [[ $backend_remote_stage_created == true &&
+        -n $backend_remote_stage ]]; then
+    ssh "${backend_ssh_opts[@]}" "$backend_ssh_target" \
+      rm -rf -- "$backend_remote_stage" >/dev/null 2>&1 || true
+  fi
+  if [[ -n $backend_ssh_dir ]]; then
+    rm -rf -- "$backend_ssh_dir"
+  fi
+  exit "$status"
+}
+
 require_env() {
   local name
   for name in "$@"; do
@@ -138,35 +162,26 @@ deploy_backend() {
     }
   done
 
-  local ssh_dir remote_stage ssh_target actual_fingerprint
-  local remote_stage_created=false
-  local -a ssh_opts scp_opts
-  ssh_dir=$(mktemp -d "$RUNNER_TEMP/vane-ssh.XXXXXX")
-  remote_stage="/opt/vane/.deploy-${source_sha}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-  ssh_target="$VPS_USER@$VPS_HOST"
-  cleanup_backend() {
-    local status=$?
-    trap - EXIT
-    if [[ $remote_stage_created == true && -n ${remote_stage:-} ]]; then
-      ssh "${ssh_opts[@]}" "$ssh_target" \
-        rm -rf -- "$remote_stage" >/dev/null 2>&1 || true
-    fi
-    rm -rf -- "$ssh_dir"
-    exit "$status"
-  }
+  local actual_fingerprint
+  local -a scp_opts
+  backend_ssh_dir=$(mktemp -d "$RUNNER_TEMP/vane-ssh.XXXXXX")
+  backend_remote_stage="/opt/vane/.deploy-${source_sha}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+  backend_ssh_target="$VPS_USER@$VPS_HOST"
+  backend_remote_stage_created=false
+  backend_ssh_opts=()
   trap cleanup_backend EXIT
 
-  chmod 700 "$ssh_dir"
-  printf '%s\n' "$VPS_SSH_KEY" >"$ssh_dir/id"
-  chmod 600 "$ssh_dir/id"
+  chmod 700 "$backend_ssh_dir"
+  printf '%s\n' "$VPS_SSH_KEY" >"$backend_ssh_dir/id"
+  chmod 600 "$backend_ssh_dir/id"
   ssh-keyscan -p "$VPS_PORT" -t ed25519 "$VPS_HOST" \
-    2>/dev/null >"$ssh_dir/known_hosts"
-  [[ $(wc -l <"$ssh_dir/known_hosts") -eq 1 ]] || {
+    2>/dev/null >"$backend_ssh_dir/known_hosts"
+  [[ $(wc -l <"$backend_ssh_dir/known_hosts") -eq 1 ]] || {
     echo "expected exactly one VPS Ed25519 host key" >&2
     exit 1
   }
   actual_fingerprint=$(
-    ssh-keygen -lf "$ssh_dir/known_hosts" -E sha256 |
+    ssh-keygen -lf "$backend_ssh_dir/known_hosts" -E sha256 |
       awk 'NR == 1 { print $2 }'
   )
   [[ $actual_fingerprint == "$VPS_SSH_HOST_ED25519_FINGERPRINT" ]] || {
@@ -174,52 +189,54 @@ deploy_backend() {
     exit 1
   }
 
-  ssh_opts=(
-    -i "$ssh_dir/id"
+  backend_ssh_opts=(
+    -i "$backend_ssh_dir/id"
     -p "$VPS_PORT"
     -o BatchMode=yes
     -o IdentitiesOnly=yes
     -o StrictHostKeyChecking=yes
-    -o "UserKnownHostsFile=$ssh_dir/known_hosts"
+    -o "UserKnownHostsFile=$backend_ssh_dir/known_hosts"
     -o ConnectTimeout=15
     -o ServerAliveInterval=15
     -o ServerAliveCountMax=4
   )
   scp_opts=(
-    -i "$ssh_dir/id"
+    -i "$backend_ssh_dir/id"
     -P "$VPS_PORT"
     -o BatchMode=yes
     -o IdentitiesOnly=yes
     -o StrictHostKeyChecking=yes
-    -o "UserKnownHostsFile=$ssh_dir/known_hosts"
+    -o "UserKnownHostsFile=$backend_ssh_dir/known_hosts"
     -o ConnectTimeout=15
   )
 
-  ssh "${ssh_opts[@]}" "$ssh_target" \
-    mkdir -p "$remote_stage/bin" "$remote_stage/dynamicconfig"
-  remote_stage_created=true
+  ssh "${backend_ssh_opts[@]}" "$backend_ssh_target" \
+    mkdir -p "$backend_remote_stage/bin" "$backend_remote_stage/dynamicconfig"
+  backend_remote_stage_created=true
   scp "${scp_opts[@]}" \
     "$payload/bin/vane" \
     "$payload/bin/useradmin" \
     "$payload/bin/gate" \
     "$payload/bin/runtimeadmin" \
-    "$ssh_target:$remote_stage/bin/"
+    "$backend_ssh_target:$backend_remote_stage/bin/"
   scp "${scp_opts[@]}" \
     "$payload/deploy/Caddyfile" \
     "$payload/deploy/docker-compose.yml" \
     "$payload/deploy/vane.service" \
-    "$ssh_target:$remote_stage/"
+    "$backend_ssh_target:$backend_remote_stage/"
   scp "${scp_opts[@]}" \
     "$payload/deploy/dynamicconfig/development-sql.yaml" \
-    "$ssh_target:$remote_stage/dynamicconfig/"
+    "$backend_ssh_target:$backend_remote_stage/dynamicconfig/"
 
-  ssh "${ssh_opts[@]}" "$ssh_target" \
-    bash -s -- "$remote_stage" \
+  ssh "${backend_ssh_opts[@]}" "$backend_ssh_target" \
+    bash -s -- "$backend_remote_stage" \
     <"$(dirname "$0")/remote-backend-deploy.sh"
-  remote_stage=
-  remote_stage_created=false
+  backend_remote_stage=
+  backend_remote_stage_created=false
   trap - EXIT
-  rm -rf -- "$ssh_dir"
+  rm -rf -- "$backend_ssh_dir"
+  backend_ssh_dir=
+  backend_ssh_opts=()
 
   # remote-backend-deploy.sh ends with the production Gate. Only that complete
   # success advances durable deployment state.
