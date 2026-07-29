@@ -14,10 +14,10 @@ class WranglerLockTest(unittest.TestCase):
         lock = json.loads(
             (ROOT / "tools/wrangler/package-lock.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(package["dependencies"], {"wrangler": "4.111.0"})
+        self.assertEqual(package["dependencies"], {"wrangler": "4.115.0"})
         self.assertEqual(lock["lockfileVersion"], 3)
         self.assertEqual(
-            lock["packages"]["node_modules/wrangler"]["version"], "4.111.0"
+            lock["packages"]["node_modules/wrangler"]["version"], "4.115.0"
         )
         for path, entry in lock["packages"].items():
             if not path:

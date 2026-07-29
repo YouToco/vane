@@ -6,7 +6,7 @@ version=2.3.0
 archive_name=ossutil-2.3.0-linux-arm64.zip
 archive_sha256=f6c95ba0c2d2ef30290af686ce4d706c701f4734ce8090bee4288a77e3f1d764
 archive_url="https://gosspublic.alicdn.com/ossutil/v2/${version}/${archive_name}"
-install_dir="$RUNNER_TEMP/aliyun-3.4.8"
+install_dir="$RUNNER_TEMP/aliyun-3.4.10"
 binary_path="$install_dir/ossutil"
 
 mkdir -p "$install_dir"

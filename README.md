@@ -102,15 +102,15 @@ checks SHA256
 `0294e8b915ab75f92c7513d2fcb830ae06e10684e6c603e99a87dbf8835389c1`,
 and uses that exact Node/npm with the committed lock. npm runs as
 `vane-deploy-runner` with dependency lifecycle scripts disabled. After Wrangler
-version and Pages-command verification, Node and the `4.111.0` dependency tree
+version and Pages-command verification, Node and the `4.115.0` dependency tree
 become root-owned/read-only. `/opt/vane-deploy-tools/wrangler` is a root-owned
 wrapper that explicitly executes the pinned Node and Wrangler entrypoint; it
 does not depend on `PATH`. Workflows verify the exact Wrangler version and never
 run npm on the deployment VM.
 
-Aliyun CLI is installed per run below `RUNNER_TEMP` from the exact `3.4.8`
+Aliyun CLI is installed per run below `RUNNER_TEMP` from the exact `3.4.10`
 ARM64 release archive after checking the official SHA256
-`a8b22c72c1984e0ef4db441ab1e7f1720a03553fae79cff9fb113806229e7876`.
+`349f3d31af9cc85aa2b444899e7d805f6409f5a53d667ce74d00dafbc17f9ae5`.
 No `latest` lookup, `curl | sh`, container action, or local `sudo` is used.
 
 The VPS SSH principal is separate from the runner Unix user and must retain the

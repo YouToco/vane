@@ -40,7 +40,7 @@ class FrontendCloudflareTests(unittest.TestCase):
             wrangler.write_text(
                 "#!/bin/sh\n"
                 "if [ \"$1\" = \"--version\" ]; then\n"
-                "  printf '4.111.0\\n'\n"
+                "  printf '4.115.0\\n'\n"
                 "  exit 0\n"
                 "fi\n"
                 "printf '%s\\n' \"$*\" >>\"$WRANGLER_CALL_LOG\"\n"

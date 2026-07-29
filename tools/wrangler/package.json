@@ -6,6 +6,6 @@
     "node": "22.x"
   },
   "dependencies": {
-    "wrangler": "4.111.0"
+    "wrangler": "4.115.0"
   }
 }

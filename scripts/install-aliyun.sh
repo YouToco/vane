@@ -2,9 +2,9 @@
 set -euo pipefail
 umask 077
 
-version=3.4.8
-archive_name=aliyun-cli-linux-3.4.8-arm64.tgz
-archive_sha256=a8b22c72c1984e0ef4db441ab1e7f1720a03553fae79cff9fb113806229e7876
+version=3.4.10
+archive_name=aliyun-cli-linux-3.4.10-arm64.tgz
+archive_sha256=349f3d31af9cc85aa2b444899e7d805f6409f5a53d667ce74d00dafbc17f9ae5
 archive_url="https://github.com/aliyun/aliyun-cli/releases/download/v${version}/${archive_name}"
 install_dir="$RUNNER_TEMP/aliyun-$version"
 

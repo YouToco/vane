@@ -505,7 +505,7 @@ deploy_frontend_cloudflare() {
     exit 1
   }
   wrangler_version=$("$WRANGLER_BIN" --version | tail -n 1)
-  [[ $wrangler_version == "4.111.0" ]] || {
+  [[ $wrangler_version == "4.115.0" ]] || {
     echo "unexpected preinstalled Wrangler version: $wrangler_version" >&2
     exit 1
   }

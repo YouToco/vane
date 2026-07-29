@@ -9,7 +9,7 @@ fi
 
 runner_user=${VANE_DEPLOY_RUNNER_USER:-vane-deploy-runner}
 install_root=/opt/vane-deploy-tools
-wrangler_version=4.111.0
+wrangler_version=4.115.0
 node_version=22.23.1
 node_archive_name=node-v${node_version}-linux-arm64.tar.xz
 node_archive_sha256=0294e8b915ab75f92c7513d2fcb830ae06e10684e6c603e99a87dbf8835389c1
