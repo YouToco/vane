@@ -17,8 +17,16 @@ env:
 jobs:
   test:
     # PR-controlled code must not execute in the trusted exact-main build VM.
-    # This runner is repo-scoped to vane-deploy but lives in vane-test.
-    runs-on: [self-hosted, Linux, ARM64, vane-test]
+    # Exact-main push/schedule runs may use vane-build, avoiding a vane-test
+    # outage becoming a production control-plane single point of failure.
+    runs-on: >-
+      ${{
+        fromJSON(
+          github.event_name == 'pull_request'
+          && '["self-hosted","Linux","ARM64","vane-test"]'
+          || '["self-hosted","Linux","ARM64","vane-build"]'
+        )
+      }}
     timeout-minutes: 15
 
     steps:

@@ -83,9 +83,12 @@ Free private repository.
 
 All three runners are repository-scoped:
 
-- control-plane CI: `[self-hosted, Linux, ARM64, vane-test]`; this runner lives
-  in `vane-test`, so PR-controlled control-plane checks never enter the trusted
-  exact-main build VM.
+- control-plane pull-request CI: `[self-hosted, Linux, ARM64, vane-test]`; this
+  runner lives in `vane-test`, so PR-controlled checks never enter a trusted VM.
+- control-plane exact-`main` push and schedule CI:
+  `[self-hosted, Linux, ARM64, vane-build]`; only trusted default-branch
+  workflow code reaches this runner, avoiding a `vane-test` outage becoming a
+  production-control-plane single point of failure.
 - build VM: `[self-hosted, Linux, ARM64, vane-build]`; Docker is available for
   the PostgreSQL service, and the pinned setup actions provide Go 1.26 and
   Node 22.
