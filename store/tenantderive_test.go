@@ -96,7 +96,7 @@ func TestTenantDerive_CallTables(t *testing.T) {
 	t.Run("tool_calls 有归属写租户", func(t *testing.T) {
 		id, err := st.InsertToolCall(ctx, &types.ToolCall{
 			TraceID: "tenant-derive-tool", UserID: &uid,
-			ToolName: "list_sources", ToolKind: types.ToolCallKindStatic,
+			ToolName: "view_profile", ToolKind: types.ToolCallKindStatic,
 		})
 		if err != nil {
 			t.Fatalf("InsertToolCall() 失败: %v", err)
@@ -117,7 +117,7 @@ func TestTenantDerive_CallTables(t *testing.T) {
 	t.Run("tool_calls 系统级保持 NULL", func(t *testing.T) {
 		id, err := st.InsertToolCall(ctx, &types.ToolCall{
 			TraceID: "tenant-derive-tool-sys", UserID: nil,
-			ToolName: "list_sources", ToolKind: types.ToolCallKindStatic,
+			ToolName: "view_profile", ToolKind: types.ToolCallKindStatic,
 		})
 		if err != nil {
 			t.Fatalf("InsertToolCall() 失败: %v", err)

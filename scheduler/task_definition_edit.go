@@ -145,7 +145,7 @@ type PreparedTaskDefinitionEditSchedule struct {
 
 // PreparedTaskDefinitionEdit is the immutable wire that the future durable
 // coordinator must checkpoint before any Temporal mutation. BaseRevision is an
-// opaque conflict token observed before confirmation; every phase receipt
+// opaque conflict token observed before execution; every phase receipt
 // supplies the only revision accepted by the next phase.
 type PreparedTaskDefinitionEdit struct {
 	WireVersion            string                             `json:"wire_version"`
@@ -175,9 +175,8 @@ type TaskDefinitionEditSnapshot struct {
 }
 
 // PrepareTaskDefinitionEdit freezes the exact base and target Temporal
-// representations without mutating Temporal. C2b3-1 intentionally has no
-// production caller; authenticated confirmation and the PostgreSQL lease/fence
-// are supplied by a later coordinator.
+// representations without mutating Temporal. The authenticated owner command
+// and PostgreSQL lease/fence are supplied by the coordinator.
 func (s *Scheduler) PrepareTaskDefinitionEdit(
 	ctx context.Context,
 	req TaskDefinitionEditRequest,

@@ -111,7 +111,7 @@ func prepareApprovedDefinitionEditCurrent(
 			"approved definition intent is not representable by the legacy projection")
 	}
 	// legacy_subscriptions is a one-way compatibility marker for old/baseline
-	// definitions, not a user-approved long-term source plan. A confirmed v2+
+	// definitions, not a user-authorized long-term acquisition plan. A v2+
 	// edit must materialize the exact sources it authorizes.
 	if definition.SourceScope != taskstate.SourceScopeApprovedPlan {
 		return approvedDefinitionEditCommand{}, taskStateValidation(

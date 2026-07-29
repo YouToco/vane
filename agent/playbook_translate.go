@@ -1,6 +1,6 @@
 // 任务手册 P1（编译层）：把自然语言手册翻译成结构化抓取计划（fetch_plan）。
 //
-// 落点（RFC docs/task-playbook-design.md §6/§8，决策 D1「先 A 后 B」）：
+// 落点（docs/task-playbook-fetch-target-cutover.md）：
 // create_schedule / edit_task_definition 在存下手册正文后，各发**一次** LLM 调用把正文
 // 翻译成计划，经 fetchspec 校验后落库 schedule_playbooks.fetch_plan。运行时"按计划抓"
 // （Fetch 消费 fetch_plan）本轮**不接线**——编译层只做「翻译 + 校验 + 存 + 看」。
