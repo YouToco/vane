@@ -1028,6 +1028,11 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				})
 				return Outcome{Reply: replyExternalFollowupUngrounded}, msgs, turns, nil
 			}
+			if state.webResearchSucceeded {
+				reply = renderGroundedReplyCitations(
+					reply, state.externalFollowupSearchEvidence,
+				)
+			}
 			msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: reply})
 			return Outcome{Reply: reply}, msgs, turns, nil
 		}

@@ -275,6 +275,22 @@ func TestExternalFollowupReplyGrounded_OnlyAdmitsStructuredResultURL(
 	}
 }
 
+func TestRenderGroundedReplyCitationsMakesBareEvidenceLinksVisible(
+	t *testing.T,
+) {
+	const official = "https://openai.com/index/introducing-gpt-live/"
+	evidence := []externalFollowupSearchEvidence{{URL: official}}
+	got := renderGroundedReplyCitations(
+		"官方说明："+official+"。\n"+
+			"已有链接：[OpenAI](https://openai.com/index/introducing-gpt-live/)",
+		evidence,
+	)
+	if want := "官方说明：[来源 · openai.com](" + official + ")。\n" +
+		"已有链接：[OpenAI](" + official + ")"; got != want {
+		t.Fatalf("rendered reply = %q, want %q", got, want)
+	}
+}
+
 func TestHandleExternalContextMessage_ZeroSearchResultsUseFixedReply(
 	t *testing.T,
 ) {

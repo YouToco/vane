@@ -45,7 +45,10 @@ func TestGroundedResearchCompletesSearchReadAndAnswerInOneMessage(t *testing.T) 
 		t.Fatal(err)
 	}
 	if out.Confirm != nil ||
-		!strings.Contains(out.Reply, "https://openai.com/") {
+		!strings.Contains(
+			out.Reply,
+			"[来源 · openai.com](https://openai.com/index/introducing-gpt-live/)",
+		) {
 		t.Fatalf("outcome=%+v", out)
 	}
 	if searcher.calls != 1 || reader.calls != 1 || len(chat.requests) != 3 {
