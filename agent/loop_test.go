@@ -775,9 +775,8 @@ func TestScrubUntrustedHistory_LegacyInputsCallbacksAndPending(t *testing.T) {
 
 func TestNormalizeTaskCreationArgs_ObservationPolicyBoundary(t *testing.T) {
 	const base = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
-		`"intent":"监控官方更新","approved_fetch_plan":{` +
-		`"version":"vane.fetch-requirements/v1","items":[{` +
-		`"kind":"web_search","query":"official updates"}]}}`
+		`"intent":"监控官方更新","tool_calls":[{` +
+		`"name":"web_search","arguments":{"query":"official updates"}}]}`
 	tests := []struct {
 		name string
 		args string

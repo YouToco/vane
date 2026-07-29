@@ -43,7 +43,7 @@ func TestNormalizeCreateScheduleCommandObservationWindows(t *testing.T) {
 					},
 					QualifierPrompt: observation.QualifierPromptV1,
 				},
-				ApprovedFetchPlan: json.RawMessage(validApprovedFetchPlan()),
+				LegacyToolPlanV1: json.RawMessage(validApprovedFetchPlan()),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -959,6 +959,32 @@ func mustCreateArgsWithPlan(
 	plan json.RawMessage,
 ) json.RawMessage {
 	t.Helper()
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(plan, &envelope); err == nil {
+		if requirements, ok := envelope["fetch_requirements"]; ok {
+			var decoded struct {
+				Items []map[string]any `json:"items"`
+			}
+			if err := json.Unmarshal(requirements, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			calls := make([]map[string]any, 0, len(decoded.Items))
+			for _, item := range decoded.Items {
+				name, _ := item["kind"].(string)
+				delete(item, "kind")
+				calls = append(calls, map[string]any{
+					"name": name, "arguments": item,
+				})
+			}
+			return mustMarshal(t, map[string]any{
+				"spec":           map[string]any{"every_seconds": 3600, "tz": "UTC"},
+				"intent":         intent,
+				"nl_description": description,
+				"strictness":     "normal",
+				"tool_calls":     calls,
+			})
+		}
+	}
 	return mustMarshal(t, map[string]any{
 		"spec":                map[string]any{"every_seconds": 3600, "tz": "UTC"},
 		"intent":              intent,

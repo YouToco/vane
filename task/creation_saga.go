@@ -191,9 +191,7 @@ func (c *CreationCoordinator) Prepare(
 			"任务方案未通过校验："+err.Error(), err,
 		)
 	}
-	materialized, err := materializeCreationFetchRequirements(
-		proposalArgs.ApprovedFetchPlan.FetchRequirements,
-	)
+	materialized, err := materializeCreationToolCalls(proposalArgs.ToolCalls)
 	if err != nil {
 		return CreationProposal{}, creationValidation(
 			"任务方案未通过校验："+err.Error(), err,
@@ -1098,28 +1096,17 @@ func (c *CreationCoordinator) creationScopeActive(
 	return tenant.Status == types.TenantStatusActive && tenant.DeletedAt == nil, nil
 }
 
-// createScheduleProposalArgs is the model-facing shape. Durable operation args
-// deliberately use createScheduleCommandArgs instead: human-readable specs are
-// deterministically materialized into a canonical target identity before an
-// operation exists.
+// createScheduleProposalArgs is the model-facing shape. The Agent selects
+// acquisition tools directly from their schemas. Durable v1 operation args
+// remain an internal compatibility envelope until the snapshot migration
+// removes the old wire.
 type createScheduleProposalArgs struct {
-	Spec              *createScheduleCommandSpec       `json:"spec"`
-	Intent            string                           `json:"intent"`
-	NLDescription     string                           `json:"nl_description"`
-	Strictness        types.PushStrictness             `json:"strictness"`
-	ApprovedFetchPlan *createScheduleProposalFetchPlan `json:"approved_fetch_plan"`
-	ObservationPolicy *observation.PolicySpecV1        `json:"observation_policy,omitempty"`
-}
-
-type createScheduleProposalFetchPlan struct {
-	FetchRequirements *createScheduleFetchRequirements `json:"fetch_requirements,omitempty"`
-}
-
-const creationFetchRequirementsVersion = "vane.fetch-requirements/v1"
-
-type createScheduleFetchRequirements struct {
-	Version string            `json:"version"`
-	Items   []json.RawMessage `json:"items"`
+	Spec              *createScheduleCommandSpec `json:"spec"`
+	Intent            string                     `json:"intent"`
+	NLDescription     string                     `json:"nl_description"`
+	Strictness        types.PushStrictness       `json:"strictness"`
+	ToolCalls         []json.RawMessage          `json:"tool_calls"`
+	ObservationPolicy *observation.PolicySpecV1  `json:"observation_policy,omitempty"`
 }
 
 type createScheduleProposalExactEnvelope struct {
@@ -1127,7 +1114,7 @@ type createScheduleProposalExactEnvelope struct {
 	Intent            json.RawMessage `json:"intent,omitempty"`
 	NLDescription     json.RawMessage `json:"nl_description,omitempty"`
 	Strictness        json.RawMessage `json:"strictness,omitempty"`
-	ApprovedFetchPlan json.RawMessage `json:"approved_fetch_plan,omitempty"`
+	ToolCalls         json.RawMessage `json:"tool_calls,omitempty"`
 	ObservationPolicy json.RawMessage `json:"observation_policy,omitempty"`
 }
 
@@ -1181,7 +1168,7 @@ func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArg
 		}
 		args.ObservationPolicy = &policy
 	}
-	// Validate the common envelope before the fetch-requirements payload.
+	// Validate the common task envelope before acquisition tool arguments.
 	if _, err := normalizeCreateScheduleEnvelope(&createScheduleCommandArgs{
 		Spec: args.Spec, Intent: args.Intent,
 		NLDescription: args.NLDescription, Strictness: args.Strictness,
@@ -1189,56 +1176,32 @@ func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArg
 	}); err != nil {
 		return nil, err
 	}
-	if len(envelope.ApprovedFetchPlan) == 0 {
-		return nil, errors.New("task: approved_fetch_plan is required")
+	if len(envelope.ToolCalls) == 0 || isExplicitJSONNull(envelope.ToolCalls) {
+		return nil, errors.New("task: tool_calls is required")
 	}
-	var plan createScheduleProposalFetchPlan
-	if err := strictjson.DecodeExact(envelope.ApprovedFetchPlan, &plan); err != nil {
-		return nil, fmt.Errorf("task: decode exact approved_fetch_plan: %w", err)
+	if err := strictjson.DecodeExact(envelope.ToolCalls, &args.ToolCalls); err != nil {
+		return nil, fmt.Errorf("task: decode exact tool_calls: %w", err)
 	}
-	args.ApprovedFetchPlan = &plan
-	var planFields map[string]json.RawMessage
-	if err := decodeStrictJSON(envelope.ApprovedFetchPlan, &planFields); err != nil ||
-		planFields == nil {
-		return nil, errors.New("task: approved_fetch_plan must be a JSON object")
+	if len(args.ToolCalls) == 0 {
+		return nil, errors.New("task: tool_calls must be non-empty")
 	}
-	fetchRequirementsRaw, hasFetchRequirements := planFields["fetch_requirements"]
-	if hasFetchRequirements && bytes.Equal(bytes.TrimSpace(fetchRequirementsRaw), []byte("null")) {
-		return nil, errors.New("task: approved_fetch_plan.fetch_requirements must be an object")
-	}
-	if !hasFetchRequirements || plan.FetchRequirements == nil ||
-		plan.FetchRequirements.Version != creationFetchRequirementsVersion {
+	if len(args.ToolCalls) > maxCompiledSources {
 		return nil, fmt.Errorf(
-			"task: approved_fetch_plan.fetch_requirements.version must be %q",
-			creationFetchRequirementsVersion,
-		)
-	}
-	requirementCount := len(plan.FetchRequirements.Items)
-	if requirementCount == 0 {
-		return nil, errors.New(
-			"task: approved_fetch_plan.fetch_requirements.items must be non-empty",
-		)
-	}
-	if requirementCount > maxCompiledSources {
-		return nil, fmt.Errorf(
-			"task: approved_fetch_plan exceeds %d fetch requirements", maxCompiledSources,
+			"task: tool_calls exceeds %d entries", maxCompiledSources,
 		)
 	}
 	return args, nil
 }
 
-func materializeCreationFetchRequirements(
-	fetchRequirements *createScheduleFetchRequirements,
+func materializeCreationToolCalls(
+	calls []json.RawMessage,
 ) ([]compiledFetchTarget, error) {
-	if fetchRequirements == nil {
-		return nil, nil
-	}
-	materialized := make([]compiledFetchTarget, 0, len(fetchRequirements.Items))
-	for i, raw := range fetchRequirements.Items {
-		spec, err := decodeCreationFetchRequirement(raw)
+	materialized := make([]compiledFetchTarget, 0, len(calls))
+	for i, raw := range calls {
+		spec, err := decodeCreationToolCall(raw)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"task: approved_fetch_plan.fetch_requirements.items[%d]: %w", i, err,
+				"task: tool_calls[%d]: %w", i, err,
 			)
 		}
 		source, message := acquisitiontool.BuildTarget(spec)
@@ -1247,7 +1210,7 @@ func materializeCreationFetchRequirements(
 				message = "信源无法构造"
 			}
 			return nil, fmt.Errorf(
-				"task: approved_fetch_plan.fetch_requirements.items[%d]: %s", i, message,
+				"task: tool_calls[%d]: %s", i, message,
 			)
 		}
 		// Model-facing specs never control presentation titles. Build derives a
@@ -1264,7 +1227,7 @@ func materializeCreationFetchRequirements(
 					message = "信源安全标题无法构造"
 				}
 				return nil, fmt.Errorf(
-					"task: approved_fetch_plan.fetch_requirements.items[%d]: %s", i, message,
+					"task: tool_calls[%d]: %s", i, message,
 				)
 			}
 		}
@@ -1280,6 +1243,39 @@ func materializeCreationFetchRequirements(
 		})
 	}
 	return materialized, nil
+}
+
+// decodeCreationToolCall accepts one exact Agent tool invocation and delegates
+// the arguments to that tool's strict input decoder. The temporary kind field
+// exists only inside this adapter; it is not part of the model-facing contract.
+func decodeCreationToolCall(raw json.RawMessage) (acquisitiontool.Requirement, error) {
+	var call struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := strictjson.DecodeExact(raw, &call); err != nil {
+		return acquisitiontool.Requirement{}, err
+	}
+	if strings.TrimSpace(call.Name) == "" || call.Name != strings.TrimSpace(call.Name) {
+		return acquisitiontool.Requirement{}, errors.New("name must be a non-empty string")
+	}
+	var fields map[string]json.RawMessage
+	if err := strictjson.DecodeExact(call.Arguments, &fields); err != nil || fields == nil {
+		if err == nil {
+			err = errors.New("arguments must be a non-null JSON object")
+		}
+		return acquisitiontool.Requirement{}, err
+	}
+	kind, err := json.Marshal(call.Name)
+	if err != nil {
+		return acquisitiontool.Requirement{}, err
+	}
+	fields["kind"] = kind
+	flattened, err := json.Marshal(fields)
+	if err != nil {
+		return acquisitiontool.Requirement{}, err
+	}
+	return decodeCreationFetchRequirement(flattened)
 }
 
 var creationXHSIDRe = regexp.MustCompile(`^[0-9a-f]{24}$`)
@@ -1477,7 +1473,7 @@ func normalizeExpandedCreationProposal(
 	proposal *createScheduleProposalArgs,
 	targets []compiledFetchTarget,
 ) (normalizedCreateScheduleCommand, error) {
-	if proposal == nil || proposal.ApprovedFetchPlan == nil {
+	if proposal == nil || len(targets) == 0 {
 		return normalizedCreateScheduleCommand{}, creationValidation(
 			"任务方案未通过校验", nil,
 		)
@@ -1491,7 +1487,7 @@ func normalizeExpandedCreationProposal(
 	legacyArgs, err := json.Marshal(createScheduleCommandArgs{
 		Spec: proposal.Spec, Intent: proposal.Intent,
 		NLDescription: proposal.NLDescription, Strictness: proposal.Strictness,
-		ApprovedFetchPlan: fullPlan,
+		LegacyToolPlanV1:  fullPlan,
 		ObservationPolicy: proposal.ObservationPolicy,
 	})
 	if err != nil {
@@ -1516,12 +1512,12 @@ func canonicalCreationProposalArgs(
 		Intent            string                    `json:"intent"`
 		NLDescription     string                    `json:"nl_description"`
 		Strictness        types.PushStrictness      `json:"strictness"`
-		ApprovedFetchPlan json.RawMessage           `json:"approved_fetch_plan"`
+		LegacyToolPlanV1  json.RawMessage           `json:"approved_fetch_plan"`
 		ObservationPolicy *observation.PolicySpecV1 `json:"observation_policy,omitempty"`
 	}{
 		Spec: command.Spec, Intent: command.Intent,
 		NLDescription: command.NLDescription, Strictness: command.Strictness,
-		ApprovedFetchPlan: bytes.Clone(command.ApprovedFetchPlan),
+		LegacyToolPlanV1:  bytes.Clone(command.LegacyToolPlanV1),
 		ObservationPolicy: command.ObservationPolicy,
 	}
 	canonical, err := json.Marshal(args)
@@ -1544,7 +1540,7 @@ func canonicalCreationProposalArgs(
 		verification.NLDescription != command.NLDescription ||
 		verification.Strictness != command.Strictness ||
 		!bytes.Equal(verificationPolicy, commandPolicy) ||
-		!bytes.Equal(verification.ApprovedFetchPlan, command.ApprovedFetchPlan) {
+		!bytes.Equal(verification.LegacyToolPlanV1, command.LegacyToolPlanV1) {
 		return nil, errors.New("canonical proposal args changed the approved command")
 	}
 	return canonical, nil
@@ -1552,7 +1548,7 @@ func canonicalCreationProposalArgs(
 
 func summarizeCreationProposal(command normalizedCreateScheduleCommand) (string, error) {
 	var plan compiledFetchPlan
-	if err := decodeStrictJSON(command.ApprovedFetchPlan, &plan); err != nil || len(plan.Targets) == 0 {
+	if err := decodeStrictJSON(command.LegacyToolPlanV1, &plan); err != nil || len(plan.Targets) == 0 {
 		return "", errors.New("approved plan cannot be summarized")
 	}
 	var builder strings.Builder
