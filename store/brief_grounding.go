@@ -20,8 +20,9 @@ const (
 )
 
 type GroundedEvidenceBriefV1 struct {
-	BriefID  int64                `json:"brief_id"`
-	Insights []TaskBriefInsightV1 `json:"insights"`
+	BriefID     int64                `json:"brief_id"`
+	GeneratedAt time.Time            `json:"generated_at"`
+	Insights    []TaskBriefInsightV1 `json:"insights"`
 }
 
 type GroundedBriefContextV1 struct {
@@ -41,7 +42,7 @@ func projectGroundedEvidenceBriefV1(
 	brief types.BriefV1,
 ) (GroundedEvidenceBriefV1, error) {
 	out := GroundedEvidenceBriefV1{
-		BriefID:  brief.ID,
+		BriefID: brief.ID, GeneratedAt: brief.GeneratedAt,
 		Insights: make([]TaskBriefInsightV1, len(brief.Insights)),
 	}
 	for index, frozen := range brief.Insights {

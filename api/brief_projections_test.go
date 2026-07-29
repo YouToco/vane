@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -135,5 +136,165 @@ func TestGroundedContextDeepDiveRequiresExactFrozenReference(t *testing.T) {
 	contextValue.Evidence = nil
 	if groundedContextAllowsDeepDiveV1(contextValue, 41) {
 		t.Fatal("missing immutable evidence accepted deep-dive")
+	}
+}
+
+func TestBriefFollowupGroundingOmitsInternalProvenance(t *testing.T) {
+	published := time.Date(2026, 7, 29, 3, 12, 39, 0, time.UTC)
+	contextValue := store.GroundedBriefContextV1{
+		Kind:           store.GroundedBriefReport,
+		ID:             9001,
+		Cadence:        "daily",
+		PeriodStart:    "2026-07-28T00:00:00Z",
+		PeriodEnd:      "2026-07-29T00:00:00Z",
+		SourceCoverage: types.RunCompletenessComplete,
+		Processing:     types.RunCompletenessPartial,
+		GenerationMode: types.ExecutiveGenerationFallback,
+		Content: types.ExecutiveBriefContentV1{
+			Headline:         "关注成本变化",
+			ExecutiveSummary: "两期内容指向同一变化。",
+			DecisionState:    types.ExecutiveDecisionWatch,
+			WhyForYou:        "可能影响模型预算。",
+			Signals: []types.ExecutiveSignalV1{{
+				Kind:      types.ExecutiveSignalTrend,
+				Lifecycle: types.ExecutiveSignalPersistent,
+				Title:     "成本效率持续改善",
+				Summary:   "两期均提到更低估算成本。",
+				EvidenceRefs: []types.ExecutiveEvidenceRefV1{{
+					BriefID: 77, InsightID: 88,
+					ClaimIndexes: []int{0},
+				}},
+			}},
+			NextSteps: []types.ExecutiveNextStepV1{{
+				Kind:      types.ExecutiveNextStepDeepDive,
+				Label:     "查看成本数据",
+				Rationale: "核对是否影响当前选择。",
+				EvidenceRefs: []types.ExecutiveEvidenceRefV1{{
+					BriefID: 77, InsightID: 88,
+					ClaimIndexes: []int{0},
+				}},
+			}},
+		},
+		Evidence: []store.GroundedEvidenceBriefV1{{
+			BriefID: 77, GeneratedAt: published.Add(2 * time.Hour),
+			Insights: []store.TaskBriefInsightV1{{
+				ID:           88,
+				RankPosition: 1,
+				Title:        "GPT-5.6 Luna 一般可用",
+				BodyMD:       "Luna 强调 source-1 成本效率。",
+				SourceTitle:  "OpenAI",
+				SourceURL:    "https://openai.com/index/gpt-5-6/",
+				PublishedAt:  &published,
+				DiscoveredAt: published.Add(time.Hour),
+				Structured: &store.TaskBriefStructuredInsightV1{
+					SchemaVersion:    "internal-schema",
+					BodyMD:           "Luna 强调成本效率。",
+					WhatChanged:      "Luna 已一般可用。",
+					WhyItMatters:     "profile_epoch=3",
+					ImportanceReason: "属于正式模型更新。",
+					Claims: []types.StructuredClaimV1{{
+						Text:       "Luna 是成本效率型号。",
+						Excerpt:    "raw frozen excerpt",
+						SourceRefs: []string{"source-1"},
+					}},
+				},
+			}},
+		}},
+	}
+	grounding, err := renderBriefFollowupGroundingV1(contextValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, wanted := range []string{
+		"GPT-5.6 Luna 一般可用", "Luna 是成本效率型号。",
+		"raw frozen excerpt", "https://openai.com/index/gpt-5-6/",
+		"不得输出数据库编号", `"来源覆盖":"完整"`,
+		`"处理覆盖":"不完整"`, `"期次":1`,
+		`"情报序号":1`, `"事实序号":[1]`,
+		groundedHiddenTextV1,
+	} {
+		if !strings.Contains(grounding, wanted) {
+			t.Fatalf("grounding omitted %q: %s", wanted, grounding)
+		}
+	}
+	for _, forbidden := range []string{
+		"9001", "77", "88", "brief_id", "insight_id",
+		"claim_indexes", "source-1",
+		"internal-schema", "generation_mode", "profile_epoch",
+		"deterministic_fallback", "rank_position", "discovered_at",
+		"xsec_token", "temporary-secret", "#luna",
+	} {
+		if strings.Contains(grounding, forbidden) {
+			t.Fatalf("grounding leaked %q: %s", forbidden, grounding)
+		}
+	}
+}
+
+func TestBriefFollowupSafeSourceURLV1(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+		want string
+	}{
+		{
+			name: "clean exact URL",
+			url:  "https://openai.com/index/gpt-5-6/",
+			want: "https://openai.com/index/gpt-5-6/",
+		},
+		{
+			name: "query may identify another resource",
+			url:  "https://example.com/article?id=123",
+		},
+		{
+			name: "fragment may identify another resource",
+			url:  "https://example.com/article#section",
+		},
+		{
+			name: "userinfo must not reach the model",
+			url:  "https://secret@example.com/article",
+		},
+		{
+			name: "internal field in URL",
+			url:  "https://example.com/brief_id/7",
+		},
+		{
+			name: "unsupported scheme",
+			url:  "file:///tmp/evidence",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := briefFollowupSafeSourceURLV1(tc.url); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGroundedReplyInternalReferenceGuardFailsClosed(t *testing.T) {
+	for _, reply := range []string{
+		"依据 brief_id: 7 和 insight_id: 9。",
+		"brief IDs 分别是 7 和 9。",
+		"详情见 source ref source-1。",
+		"证据标签是 source-2。",
+		"详情见 source reference。",
+		"claim_indexes 为 0。",
+		"claim indices 为 0。",
+		"report_id 3 对应 request_digest。",
+		"profile_epoch 为 3。",
+		"tenant_id 与 workflow_id 不应展示。",
+		"discovered_at 是 2026-07-29。",
+	} {
+		if !groundedInternalReferenceV1.MatchString(reply) {
+			t.Fatalf("internal reference was not blocked: %q", reply)
+		}
+	}
+	for _, reply := range []string{
+		"这份日报依据两期简报：GPT-5.6 正式发布与 Luna 一般可用。",
+		"来源覆盖不完整，因此暂不形成跨期趋势。",
+		"这是每日 news digest，公开采用 schema version 2 和 workflow ID。",
+	} {
+		if groundedInternalReferenceV1.MatchString(reply) {
+			t.Fatalf("user-facing answer was blocked: %q", reply)
+		}
 	}
 }
