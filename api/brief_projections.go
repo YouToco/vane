@@ -56,7 +56,8 @@ func publicTaskBriefPageV1(
 				GenerationMode: item.Executive.GenerationMode,
 				Processing:     item.Executive.Processing,
 				GeneratedAt:    item.Executive.GeneratedAt,
-				Content:        item.Executive.Content,
+				Content: publicExecutiveBriefContentV1(
+					item.Executive.Content),
 			}
 		}
 		out.Items[index] = public
@@ -97,8 +98,22 @@ func publicPeriodicBriefReportPageV1(
 			GeneratedAt:    report.GeneratedAt,
 			GenerationMode: report.GenerationMode,
 			SourceCoverage: report.SourceCoverage,
-			Processing:     report.Processing, Content: report.Content,
+			Processing:     report.Processing,
+			Content:        publicExecutiveBriefContentV1(report.Content),
 		}
 	}
 	return out
+}
+
+// publicExecutiveBriefContentV1 keeps the JSON contract array-shaped even for
+// artifacts written before empty fallback slices were canonicalized. Storage
+// remains immutable; only the user-facing projection normalizes nil to [].
+func publicExecutiveBriefContentV1(
+	content types.ExecutiveBriefContentV1,
+) types.ExecutiveBriefContentV1 {
+	content.Signals = append(
+		[]types.ExecutiveSignalV1{}, content.Signals...)
+	content.NextSteps = append(
+		[]types.ExecutiveNextStepV1{}, content.NextSteps...)
+	return content
 }
