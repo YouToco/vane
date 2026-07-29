@@ -173,6 +173,22 @@ func TestPeriodicReportRecoveryFreezesExactCanonicalInputs(t *testing.T) {
 		intent.ID, "periodic-run-1"); err != nil {
 		t.Fatal(err)
 	}
+	if err := f.base.st.AdoptExistingPeriodicBriefIntentRunV1(
+		t.Context(), f.identity.TenantID, f.identity.UserID,
+		intent.ID, "periodic-run-from-restart"); err != nil {
+		t.Fatal(err)
+	}
+	sealedIntent, err := f.base.st.PreparePeriodicBriefIntentV1(
+		t.Context(), f.identity.TenantID, f.identity.UserID,
+		f.identity.TaskID, BriefReportCadenceWeekly,
+		periodStart, periodEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sealedIntent.TemporalRunID != "periodic-run-1" {
+		t.Fatalf("adopt rewrote sealed run ID: %q",
+			sealedIntent.TemporalRunID)
+	}
 	requestDigest := strings.Repeat("e", 64)
 	profileDigest := strings.Repeat("f", 64)
 	_, claimed, err := f.base.st.ClaimPeriodicSynthesisSpendV1(

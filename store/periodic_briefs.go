@@ -653,6 +653,42 @@ func (s *Store) BindPeriodicBriefIntentRunV1(
 	return nil
 }
 
+// AdoptExistingPeriodicBriefIntentRunV1 closes the crash/restart race after
+// Temporal has proved the deterministic workflow ID already exists. It fills a
+// missing run identity, but an identity sealed by another process wins without
+// being rewritten. Fresh ExecuteWorkflow calls must continue using the strict
+// BindPeriodicBriefIntentRunV1 path above.
+func (s *Store) AdoptExistingPeriodicBriefIntentRunV1(
+	ctx context.Context,
+	tenantID, userID, intentID int64,
+	temporalRunID string,
+) error {
+	if tenantID <= 0 || userID <= 0 || intentID <= 0 ||
+		temporalRunID == "" || len(temporalRunID) > 255 {
+		return types.NewAppError(types.CodeValidation,
+			"周期报告运行身份无效", nil)
+	}
+	var sealedRunID string
+	err := s.pool.QueryRow(ctx,
+		`UPDATE periodic_brief_intents
+		    SET temporal_run_id=COALESCE(temporal_run_id,$4)
+		  WHERE id=$3 AND tenant_id=$1 AND user_id=$2
+		  RETURNING temporal_run_id`,
+		tenantID, userID, intentID, temporalRunID).Scan(&sealedRunID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return types.NewAppError(types.CodeNotFound,
+			"周期报告意图不存在", nil)
+	}
+	if err != nil {
+		return briefFeedDBError("接纳既有周期报告运行身份", err)
+	}
+	if sealedRunID == "" {
+		return types.NewAppError(types.CodeConflict,
+			"周期报告运行身份仍为空", nil)
+	}
+	return nil
+}
+
 func PeriodicBriefWorkflowIDV1(
 	tenantID, userID int64,
 	taskID string,
