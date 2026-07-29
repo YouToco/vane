@@ -54,6 +54,12 @@ func TestBriefPublicProjectionsDoNotExposeIntegrityMetadata(t *testing.T) {
 		t.Fatalf("dark rollout exposed executive Brief: %s", darkRaw)
 	}
 	text := string(raw)
+	if !strings.Contains(text, `"signals":[]`) ||
+		!strings.Contains(text, `"next_steps":[]`) ||
+		strings.Contains(text, `"signals":null`) ||
+		strings.Contains(text, `"next_steps":null`) {
+		t.Fatalf("public Brief response exposed nullable arrays: %s", text)
+	}
 	for _, forbidden := range []string{
 		"tenant_id", "user_id", "run_snapshot_id", "run_outcome_id",
 		"profile_digest", "input_digest", "request_digest",
@@ -80,6 +86,12 @@ func TestBriefPublicProjectionsDoNotExposeIntegrityMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	text = string(reportRaw)
+	if !strings.Contains(text, `"signals":[]`) ||
+		!strings.Contains(text, `"next_steps":[]`) ||
+		strings.Contains(text, `"signals":null`) ||
+		strings.Contains(text, `"next_steps":null`) {
+		t.Fatalf("public report response exposed nullable arrays: %s", text)
+	}
 	for _, forbidden := range []string{
 		"tenant_id", "user_id", "profile_epoch", "profile_version",
 		"profile_digest", "input_digest", "inputs", "digest",

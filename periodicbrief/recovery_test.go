@@ -12,6 +12,7 @@ import (
 	workflowpb "go.temporal.io/api/workflow/v1"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 
+	"github.com/YouToco/vane/executivebrief"
 	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -27,6 +28,9 @@ type periodicRecoveryStoreFake struct {
 	claimed      store.PeriodicReportDeliveryV1
 	finalStatus  store.PeriodicReportDeliveryStatusV1
 	finalMessage string
+	policyCalls  int
+	claimDigest  string
+	profile      *types.Profile
 }
 
 func (f *periodicRecoveryStoreFake) ListPeriodicSynthesisRecoveryCandidatesV1(
@@ -43,18 +47,23 @@ func (f *periodicRecoveryStoreFake) LoadPeriodicBriefIntentInputsForRecoveryV1(
 func (f *periodicRecoveryStoreFake) GetProfileForTenant(
 	context.Context, int64, int64,
 ) (*types.Profile, error) {
+	if f.profile != nil {
+		return f.profile, nil
+	}
 	return nil, types.NewAppError(types.CodeNotFound, "none", nil)
 }
 func (f *periodicRecoveryStoreFake) LoadPeriodicSynthesisPolicyV1(
 	context.Context, int64, int64, string, int64,
 ) (store.PeriodicSynthesisPolicyV1, error) {
+	f.policyCalls++
 	return store.PeriodicSynthesisPolicyV1{},
 		types.NewAppError(types.CodeNotFound, "none", nil)
 }
 func (f *periodicRecoveryStoreFake) ClaimPeriodicSynthesisSpendV1(
-	context.Context, int64, int64, int64, string,
-	int64, int64, string, string,
+	_ context.Context, _, _, _ int64, requestDigest string,
+	_ int64, _ int64, _ string, _ string,
 ) (store.PeriodicSynthesisReceiptV1, bool, error) {
+	f.claimDigest = requestDigest
 	return store.PeriodicSynthesisReceiptV1{}, true, nil
 }
 func (f *periodicRecoveryStoreFake) RecoverPeriodicBriefReportV1(
@@ -235,6 +244,162 @@ func TestRecoveryConvergesStaleSpendingToFallbackWithoutProvider(t *testing.T) {
 	}
 	if sender.sendCalls != 0 {
 		t.Fatalf("synthesis recovery made %d provider sends", sender.sendCalls)
+	}
+}
+
+func TestRecoveryConvergesClaimlessSpendingWithExactBriefInput(t *testing.T) {
+	brief := periodicRecoveryBriefFixture(t)
+	draft := brief.BriefDraftV1
+	draft.Insights = append([]types.InsightV1(nil), brief.Insights...)
+	draft.Insights[0].Structured = nil
+	var err error
+	brief, err = draft.Seal(brief.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeStore := &periodicRecoveryStoreFake{
+		loaded: store.PeriodicBriefIntentInputsV1{
+			Intent: store.PeriodicBriefIntentV1{
+				ID: 9, TenantID: 4, UserID: 5, TaskID: "task-v1",
+				Cadence: "weekly", Timezone: "UTC",
+				PeriodStart:    brief.GeneratedAt.AddDate(0, 0, -1),
+				PeriodEnd:      brief.GeneratedAt.AddDate(0, 0, 1),
+				InputDigest:    strings.Repeat("a", 64),
+				RunOutcomeIDs:  []int64{8},
+				OutcomeDigest:  strings.Repeat("d", 64),
+				SourceCoverage: types.RunCompletenessComplete,
+				Processing:     types.RunCompletenessComplete,
+			},
+			Briefs: []types.BriefV1{brief},
+		},
+	}
+	sender := &periodicRecoverySenderFake{}
+	runner, err := NewRecoveryRunner(
+		fakeStore, periodicDescriberFake{}, sender,
+		"https://vane.example", "task-v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = runner.recoverOne(t.Context(),
+		store.PeriodicSynthesisRecoveryCandidateV1{
+			Kind: "spending", IntentID: 9, TenantID: 4, UserID: 5,
+			RequestDigest: strings.Repeat("b", 64),
+			ProfileDigest: strings.Repeat("c", 64),
+			InputDigest:   strings.Repeat("a", 64),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := fakeStore.recovered
+	if recovered == nil ||
+		recovered.GenerationMode != types.ExecutiveGenerationFallback ||
+		recovered.Processing != types.RunCompletenessPartial ||
+		len(recovered.Inputs) != 1 ||
+		recovered.Inputs[0].BriefID != brief.ID ||
+		recovered.Inputs[0].Digest != brief.Digest ||
+		recovered.Content.DecisionState !=
+			types.ExecutiveDecisionInsufficientEvidence ||
+		len(recovered.Content.Signals) != 0 ||
+		len(recovered.Content.NextSteps) != 0 {
+		t.Fatalf("claimless recovered draft = %+v", recovered)
+	}
+	if sender.sendCalls != 0 {
+		t.Fatalf("claimless recovery made %d provider sends", sender.sendCalls)
+	}
+}
+
+func TestRecoveryConvergesClaimlessPreparedWithWorkflowDigestSemantics(
+	t *testing.T,
+) {
+	brief := periodicRecoveryBriefFixture(t)
+	draft := brief.BriefDraftV1
+	draft.Insights = append([]types.InsightV1(nil), brief.Insights...)
+	structured := *draft.Insights[0].Structured
+	structured.Claims = nil
+	structured.WhatChanged = ""
+	structured.WhyItMatters = ""
+	structured.ImportanceReason = ""
+	draft.Insights[0].Structured = &structured
+	var err error
+	brief, err = draft.Seal(brief.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputDigest := strings.Repeat("a", 64)
+	fakeStore := &periodicRecoveryStoreFake{
+		profile: &types.Profile{
+			Industry:       "工业软件",
+			Occupation:     "产品负责人",
+			Tags:           []string{"AI"},
+			Summary:        "关注可信自动化",
+			ProfileEpoch:   3,
+			ProfileVersion: 5,
+		},
+		loaded: store.PeriodicBriefIntentInputsV1{
+			Intent: store.PeriodicBriefIntentV1{
+				ID: 9, TenantID: 4, UserID: 5, TaskID: "task-v1",
+				Cadence: "weekly", Timezone: "UTC",
+				PeriodStart:    brief.GeneratedAt.AddDate(0, 0, -1),
+				PeriodEnd:      brief.GeneratedAt.AddDate(0, 0, 1),
+				InputDigest:    inputDigest,
+				RunOutcomeIDs:  []int64{8},
+				OutcomeDigest:  strings.Repeat("d", 64),
+				SourceCoverage: types.RunCompletenessComplete,
+				Processing:     types.RunCompletenessComplete,
+			},
+			Briefs: []types.BriefV1{brief},
+		},
+	}
+	runner, err := NewRecoveryRunner(
+		fakeStore,
+		periodicDescriberFake{
+			response: &workflowservice.DescribeWorkflowExecutionResponse{
+				WorkflowExecutionInfo: &workflowpb.WorkflowExecutionInfo{
+					Execution: &commonpb.WorkflowExecution{
+						WorkflowId: "wf", RunId: "run"},
+					Status: enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+				},
+			},
+		},
+		&periodicRecoverySenderFake{},
+		"https://vane.example", "task-v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = runner.recoverOne(t.Context(),
+		store.PeriodicSynthesisRecoveryCandidateV1{
+			Kind: "prepared", IntentID: 9, TenantID: 4, UserID: 5,
+			WorkflowID: "wf", TemporalRunID: "run",
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := executivebrief.ProfileContextV1{
+		Epoch: 3, Version: 5,
+		Industry: "工业软件", Occupation: "产品负责人",
+		Tags: []string{"AI"}, Summary: "关注可信自动化",
+	}
+	profileDigest, err := executivebrief.ProfileDigestV1(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedDigest, err := synthesisRequestDigestV1(
+		inputDigest, profileDigest, store.PeriodicSynthesisPolicyV1{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fakeStore.recovered == nil ||
+		len(fakeStore.recovered.Inputs) != 1 ||
+		fakeStore.recovered.Inputs[0].BriefID != brief.ID ||
+		fakeStore.recovered.ProfileEpoch != profile.Epoch ||
+		fakeStore.recovered.ProfileVersion != profile.Version ||
+		fakeStore.recovered.ProfileDigest != profileDigest ||
+		fakeStore.policyCalls != 0 ||
+		fakeStore.claimDigest != expectedDigest {
+		t.Fatalf(
+			"prepared claimless recovery draft=%+v policyCalls=%d digest=%q want=%q",
+			fakeStore.recovered, fakeStore.policyCalls,
+			fakeStore.claimDigest, expectedDigest)
 	}
 }
 

@@ -410,21 +410,24 @@ func (r *RecoveryRunner) recoverOne(
 		} else if types.CodeOf(profileErr) != types.CodeNotFound {
 			return profileErr
 		}
+		candidate.ProfileEpoch = profile.Epoch
+		candidate.ProfileVersion = profile.Version
 		candidate.ProfileDigest, err =
 			executivebrief.ProfileDigestV1(profile)
 		if err != nil {
 			return err
 		}
 	}
-	_, selected, partial, err := executivebrief.BuildPeriodicPromptV1(
+	_, selected, partial, promptErr := executivebrief.BuildPeriodicPromptV1(
 		loaded.Intent.TaskID, profile,
 		loaded.Intent.PeriodStart, loaded.Intent.PeriodEnd, loaded.Briefs)
-	if err != nil {
-		return err
+	if promptErr != nil && len(selected) == 0 {
+		return promptErr
 	}
+	partial = partial || promptErr != nil
 	if candidate.Kind == "prepared" {
 		var policy store.PeriodicSynthesisPolicyV1
-		if len(selected) > 0 {
+		if len(selected) > 0 && promptErr == nil {
 			policy, err = r.store.LoadPeriodicSynthesisPolicyV1(
 				ctx, candidate.TenantID, candidate.UserID,
 				loaded.Intent.TaskID, selected[0].RunSnapshotID)

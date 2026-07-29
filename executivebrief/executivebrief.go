@@ -234,7 +234,24 @@ func BuildPeriodicPromptV1(
 			insight := brief.Insights[rank]
 			if insight.Structured == nil ||
 				len(insight.Structured.Claims) == 0 {
-				return "", nil, false,
+				// Preserve the exact canonical Brief identities for the
+				// deterministic fallback. Returning nil here would turn a
+				// claimless non-empty period into a false quiet report and
+				// sever the report from its durable intent inputs.
+				selected[index].Insights = append(
+					selected[index].Insights, insight)
+				// A periodic fallback is bound to every selected canonical
+				// Brief. Keep one canonical Insight from later Briefs too, so
+				// an early claimless Insight cannot leave trailing empty
+				// Brief shells that fail reference validation.
+				for fillIndex := range selected {
+					if len(selected[fillIndex].Insights) == 0 {
+						selected[fillIndex].Insights = append(
+							selected[fillIndex].Insights,
+							ordered[fillIndex].Insights[0])
+					}
+				}
+				return "", selected, partial,
 					errors.New("periodic brief requires claimed insights")
 			}
 			selected[index].Insights = append(
@@ -392,9 +409,16 @@ func validatePeriodicReferencesV1(
 		}
 		for index, insight := range brief.Insights {
 			if insight.ID <= 0 || insight.RankPosition != index+1 ||
-				insight.Structured == nil ||
-				insight.Structured.Validate() != nil {
+				(insight.Structured != nil &&
+					insight.Structured.Validate() != nil) {
 				return errors.New("periodic brief insight is unstructured")
+			}
+			if insight.Structured == nil {
+				if generationMode != types.ExecutiveGenerationFallback {
+					return errors.New(
+						"periodic brief insight is unstructured")
+				}
+				continue
 			}
 			claims[[2]int64{brief.ID, insight.ID}] =
 				len(insight.Structured.Claims)
@@ -448,7 +472,11 @@ func validateIssueReferencesV1(
 	claimsByInsight := make(map[int64]int, len(draft.Insights))
 	for _, insight := range draft.Insights {
 		if insight.Structured == nil {
-			return errors.New("executive brief insight is unstructured")
+			if generationMode != types.ExecutiveGenerationFallback {
+				return errors.New(
+					"executive brief insight is unstructured")
+			}
+			continue
 		}
 		claimsByInsight[insight.ID] = len(insight.Structured.Claims)
 	}
