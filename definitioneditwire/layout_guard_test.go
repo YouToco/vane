@@ -1,13 +1,18 @@
 package definitioneditwire_test
 
 import (
+	"encoding/json"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/definitioneditwire"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/task"
+	"github.com/YouToco/vane/taskstate"
+	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
 
@@ -49,6 +54,72 @@ func TestRetainedReaderMirrorsFrozenSourceLayouts(t *testing.T) {
 				t.Fatalf("retained layout=%v, authority=%v", got, want)
 			}
 		})
+	}
+}
+
+func TestRetainedReaderAcceptsCurrentWriterCheckpoints(t *testing.T) {
+	raw, err := os.ReadFile("../task/testdata/definition_edit_proposal_components_v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var components struct {
+		BaseDefinition   json.RawMessage `json:"base_definition"`
+		TargetDefinition json.RawMessage `json:"target_definition"`
+		PreparedEdit     json.RawMessage `json:"prepared_edit"`
+		BaseSnapshot     json.RawMessage `json:"base_snapshot"`
+	}
+	if err := json.Unmarshal(raw, &components); err != nil {
+		t.Fatal(err)
+	}
+	base, err := taskstate.DecodeApprovedDefinitionV1(components.BaseDefinition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := taskstate.DecodeApprovedDefinitionV1(components.TargetDefinition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := scheduler.DecodePreparedTaskDefinitionEdit(components.PreparedEdit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := scheduler.DecodeTaskDefinitionEditBaseSnapshot(
+		prepared, components.BaseSnapshot,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := task.BuildFrozenTaskDefinitionEditProposal(
+		task.BuildTaskDefinitionEditProposalInput{
+			OperationID:      prepared.OperationID,
+			OperationRef:     "approval-definition-edit-0001",
+			ActorTenantID:    prepared.Creation.TenantID,
+			ActorUserID:      prepared.Creation.UserID,
+			TargetTenantID:   prepared.Creation.TenantID,
+			TargetUserID:     prepared.Creation.UserID,
+			TaskID:           prepared.Creation.TaskID,
+			SessionID:        91,
+			ExpiresAt:        time.UnixMicro(1_780_000_000_123_456).UTC(),
+			OriginalStatus:   types.ScheduleStatusActive,
+			BaseHead:         prepared.BaseHead,
+			TargetHead:       prepared.TargetHead,
+			BaseDefinition:   base,
+			TargetDefinition: target,
+			PreparedEdit:     prepared,
+			BaseSnapshot:     snapshot,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := definitioneditwire.DecodeFrozenProposal(
+		frozen.CanonicalProposal,
+		frozen.BaseDefinitionBytes,
+		frozen.TargetDefinitionBytes,
+		frozen.PreparedEditBytes,
+		frozen.BaseSnapshotBytes,
+	); err != nil {
+		t.Fatalf("retained reader rejected current writer checkpoints: %v", err)
 	}
 }
 

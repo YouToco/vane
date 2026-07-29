@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
 	"time"
@@ -492,6 +493,14 @@ func (s *Store) CreateTaskDefinitionEditOperation(
 		p.PreparedEdit, p.BaseSnapshot,
 	)
 	if err != nil {
+		// The caller receives a stable validation error, while operators retain
+		// the non-payload decoder stage needed to diagnose writer/reader drift.
+		// definitioneditwire errors contain only fixed stage names and validation
+		// summaries; none of the checkpoint bytes are logged.
+		slog.Warn(
+			"store: definition edit retained reader rejected current checkpoints",
+			"error", err,
+		)
 		return nil, taskDefinitionEditValidation("proposal checkpoints are invalid")
 	}
 	originalStatus, err := taskDefinitionEditOriginalStatus(frozen)
