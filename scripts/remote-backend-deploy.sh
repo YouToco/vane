@@ -48,6 +48,42 @@ fi
 
 test -x /opt/vane/bin/runtimeadmin
 
+# test-anchor: vane-startup-wait-begin
+vane_service_state() {
+  systemctl is-active vane 2>/dev/null || true
+}
+
+print_vane_startup_diagnostics() {
+  local invocation
+  invocation=$(systemctl show vane --property=InvocationID --value || true)
+  echo "vane service status after startup failure:" >&2
+  systemctl status vane --no-pager --full >&2 || true
+  if [[ -n $invocation ]]; then
+    echo "vane startup journal for invocation=$invocation:" >&2
+    journalctl "_SYSTEMD_INVOCATION_ID=$invocation" \
+      --no-pager -o cat -n 100 >&2 || true
+  else
+    echo "vane startup journal (no invocation ID available):" >&2
+    journalctl -u vane --no-pager -o cat -n 100 >&2 || true
+  fi
+}
+
+wait_for_vane_active() {
+  local attempt state
+  for attempt in {1..12}; do
+    state=$(vane_service_state)
+    if [[ $state == active ]]; then
+      return 0
+    fi
+    echo "waiting for vane startup: state=$state attempt=$attempt/12"
+    sleep 5
+  done
+  echo "vane did not become active within 60 seconds" >&2
+  print_vane_startup_diagnostics
+  return 1
+}
+# test-anchor: vane-startup-wait-end
+
 # Migration 047's cross-version writer fence requires proof that the previous
 # worker completed its own graceful shutdown before the new binary starts.
 if systemctl is-active --quiet vane; then
@@ -80,7 +116,19 @@ if systemctl is-active --quiet vane; then
     exit 1
   fi
 else
-  stopped_state=$(systemctl is-active vane || true)
+  stopped_state=$(vane_service_state)
+  if [[ $stopped_state == activating ||
+        $stopped_state == deactivating ||
+        $stopped_state == failed ]]; then
+    # A previous deployment can leave systemd retrying a binary that never
+    # reached active. It has no healthy old worker to drain. Stop the failed
+    # invocation explicitly; the process scan below still proves no writer
+    # survived before the roll-forward binary starts.
+    echo "stopping unhealthy vane invocation (state=$stopped_state)"
+    print_vane_startup_diagnostics
+    systemctl stop vane
+    stopped_state=$(vane_service_state)
+  fi
   if [[ $stopped_state != inactive ]]; then
     echo "vane has no active invocation but is not inactive (state=$stopped_state)" >&2
     exit 1
@@ -106,8 +154,7 @@ fi
 
 echo "old vane worker drain verified; starting roll-forward binary"
 systemctl start vane
-sleep 5
-systemctl is-active vane
+wait_for_vane_active
 curl -fsS --max-time 5 http://127.0.0.1:8080/readyz
 
 ctype=$(
