@@ -19,14 +19,14 @@ const (
 	bbcGUIDNew = "https://www.bbc.co.uk/news/articles/c9q28dlyxrzo#1"
 )
 
-func rssSource(id int64) types.Source {
-	return types.Source{ID: id, Platform: types.PlatformWeb, Capability: types.CapFeed}
+func rssSource(id int64) types.FetchTarget {
+	return types.FetchTarget{ID: id, Platform: types.PlatformWeb, Capability: types.CapFeed}
 }
-func exaSource(id int64) types.Source {
-	return types.Source{ID: id, Platform: types.PlatformWeb, Capability: types.CapSearch}
+func exaSource(id int64) types.FetchTarget {
+	return types.FetchTarget{ID: id, Platform: types.PlatformWeb, Capability: types.CapSearch}
 }
-func xhsSource(id int64) types.Source {
-	return types.Source{ID: id, Platform: types.PlatformXHS, Capability: types.CapSearch}
+func xhsSource(id int64) types.FetchTarget {
+	return types.FetchTarget{ID: id, Platform: types.PlatformXHS, Capability: types.CapSearch}
 }
 
 // TestCanonicalKey_Golden 固定三类信源的键输出（契约 §5）。这是签名级断言：键一旦变了，
@@ -38,7 +38,7 @@ func xhsSource(id int64) types.Source {
 func TestCanonicalKey_Golden(t *testing.T) {
 	cases := []struct {
 		name string
-		src  types.Source
+		src  types.FetchTarget
 		item types.ContentItem
 		want string
 	}{
@@ -137,7 +137,7 @@ func TestCanonicalKey_CrossSourceSameContent(t *testing.T) {
 func TestCanonicalKey_EmptyWhenNoIdentityField(t *testing.T) {
 	cases := []struct {
 		name string
-		src  types.Source
+		src  types.FetchTarget
 		item types.ContentItem
 	}{
 		{
@@ -167,7 +167,7 @@ func TestCanonicalKey_EmptyWhenNoIdentityField(t *testing.T) {
 		},
 		{
 			name: "未知平台不猜身份字段",
-			src:  types.Source{ID: 9, Platform: "carrier_pigeon"},
+			src:  types.FetchTarget{ID: 9, Platform: "carrier_pigeon"},
 			item: types.ContentItem{SourceID: 9, ExternalID: "x", URL: bbcURL},
 		},
 	}

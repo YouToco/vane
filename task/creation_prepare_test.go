@@ -43,7 +43,7 @@ func TestNormalizeCreateScheduleCommandObservationWindows(t *testing.T) {
 					},
 					QualifierPrompt: observation.QualifierPromptV1,
 				},
-				ApprovedFetchPlan: json.RawMessage(validApprovedFetchPlan()),
+				LegacyToolPlanV1: json.RawMessage(validApprovedFetchPlan()),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -249,7 +249,7 @@ func (s *creationPrepareFakeStore) BlockTaskCreationOperation(
 		len(s.op.PreparedSchedule) != 0 || len(s.op.EnsureReceipt) != 0 || s.op.TaskID != "" {
 		return types.ErrConflict
 	}
-	s.op.Status = types.PendingActionStatusBlocked
+	s.op.Status = types.TaskOperationStatusBlocked
 	s.op.Phase = types.TaskCreationPhaseBlocked
 	s.op.ErrorCode = errorCode
 	s.op.ErrorMessage = errorMessage
@@ -280,7 +280,7 @@ func (s *creationPrepareFakeStore) FailTaskCreationOperation(
 	if s.failErr != nil && !s.failApplyBeforeError {
 		return s.failErr
 	}
-	s.op.Status = types.PendingActionStatusFailed
+	s.op.Status = types.TaskOperationStatusFailed
 	s.op.Phase = types.TaskCreationPhaseFailed
 	s.op.ErrorCode = errorCode
 	s.op.ErrorMessage = errorMessage
@@ -381,7 +381,7 @@ func TestCreationPreparer_PrepareHappyPath(t *testing.T) {
 		result.Definition.PlaybookContent != "每天寻找全球 AI 热点" {
 		t.Fatalf("definition=%+v", result.Definition)
 	}
-	wantPlan := `{"sources":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"}}]}`
+	wantPlan := `{"targets":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI\u0026category=news","config":{"category":"news","query":"AI"},"tool_name":"web_search","tool_arguments":{"category":"news","query":"AI"}}]}`
 	if string(result.Definition.FetchPlan) != wantPlan {
 		t.Fatalf("canonical fetch plan=%s want=%s", result.Definition.FetchPlan, wantPlan)
 	}
@@ -393,6 +393,20 @@ func TestCreationPreparer_PrepareHappyPath(t *testing.T) {
 	if checkpoint.TaskID != wantTaskID || schedules.deriveCalls != 1 {
 		t.Fatalf("frozen task ID=%q want=%q derive_calls=%d",
 			checkpoint.TaskID, wantTaskID, schedules.deriveCalls)
+	}
+}
+
+func TestCanonicalizeFetchPlanKeepsRetiredToolReplayReadable(t *testing.T) {
+	raw := strings.Replace(
+		validApprovedFetchPlan(), `"web_search"`, `"retired_web_search"`, 1)
+	got, err := canonicalizeFetchPlan(json.RawMessage(raw))
+	if err != nil {
+		t.Fatalf("retired frozen Tool replay: %v", err)
+	}
+	if !bytes.Contains(got, []byte(
+		`"tool_name":"retired_web_search","tool_arguments":{"category":"news","query":"AI"}`,
+	)) {
+		t.Fatalf("retired Tool arguments were not canonically preserved: %s", got)
 	}
 }
 
@@ -622,21 +636,21 @@ func TestCreationPreparer_RejectsInvalidFetchPlanBeforeA3(t *testing.T) {
 	}{
 		{name: "null", plan: `null`},
 		{name: "missing sources", plan: `{}`},
-		{name: "empty sources", plan: `{"sources":[]}`},
-		{name: "duplicate URL", plan: `{"sources":[{"platform":"web","capability":"feed","url":"https://a","config":{}},{"platform":"web","capability":"contents","url":"https://a","config":{}}]}`},
-		{name: "trimmed platform", plan: `{"sources":[{"platform":" web","capability":"feed","url":"https://a","config":{}}]}`},
-		{name: "null config", plan: `{"sources":[{"platform":"web","capability":"feed","url":"https://a","config":null}]}`},
-		{name: "unknown source field", plan: `{"sources":[{"platform":"web","capability":"feed","url":"https://a","config":{},"write":true}]}`},
-		{name: "duplicate config key", plan: `{"sources":[{"platform":"web","capability":"feed","url":"https://a","config":{"q":1,"q":2}}]}`},
-		{name: "unknown capability", plan: `{"sources":[{"platform":"web","capability":"invented","url":"vane://web/invented","config":{}}]}`},
-		{name: "unavailable capability", plan: `{"sources":[{"platform":"x","capability":"search","url":"vane://x/search?q=ai","config":{}}]}`},
-		{name: "synthetic URL mismatch", plan: `{"sources":[{"platform":"web","capability":"search","url":"vane://x/search?q=ai","config":{}}]}`},
-		{name: "URL credentials", plan: `{"sources":[{"platform":"web","capability":"feed","url":"https://user:secret@example.com/feed","config":{}}]}`},
-		{name: "loopback feed", plan: `{"sources":[{"platform":"web","capability":"feed","url":"http://127.0.0.1/feed","config":{}}]}`},
-		{name: "metadata feed", plan: `{"sources":[{"platform":"web","capability":"feed","url":"http://169.254.169.254/latest","config":{}}]}`},
-		{name: "localhost feed", plan: `{"sources":[{"platform":"web","capability":"feed","url":"http://service.localhost/feed","config":{}}]}`},
-		{name: "URL config mismatch", plan: `{"sources":[{"platform":"web","capability":"search","title":"搜索: approved","url":"vane://web/search?q=approved","config":{"query":"different"}}]}`},
-		{name: "missing capability config", plan: `{"sources":[{"platform":"web","capability":"search","title":"搜索: approved","url":"vane://web/search?q=approved","config":{}}]}`},
+		{name: "empty targets", plan: `{"targets":[]}`},
+		{name: "duplicate URL", plan: `{"targets":[{"platform":"web","capability":"feed","url":"https://a","config":{}},{"platform":"web","capability":"contents","url":"https://a","config":{}}]}`},
+		{name: "trimmed platform", plan: `{"targets":[{"platform":" web","capability":"feed","url":"https://a","config":{}}]}`},
+		{name: "null config", plan: `{"targets":[{"platform":"web","capability":"feed","url":"https://a","config":null}]}`},
+		{name: "unknown source field", plan: `{"targets":[{"platform":"web","capability":"feed","url":"https://a","config":{},"write":true}]}`},
+		{name: "duplicate config key", plan: `{"targets":[{"platform":"web","capability":"feed","url":"https://a","config":{"q":1,"q":2}}]}`},
+		{name: "unknown capability", plan: `{"targets":[{"platform":"web","capability":"invented","url":"vane://web/invented","config":{}}]}`},
+		{name: "unavailable capability", plan: `{"targets":[{"platform":"x","capability":"search","url":"vane://x/search?q=ai","config":{}}]}`},
+		{name: "synthetic URL mismatch", plan: `{"targets":[{"platform":"web","capability":"search","url":"vane://x/search?q=ai","config":{}}]}`},
+		{name: "URL credentials", plan: `{"targets":[{"platform":"web","capability":"feed","url":"https://user:secret@example.com/feed","config":{}}]}`},
+		{name: "loopback feed", plan: `{"targets":[{"platform":"web","capability":"feed","url":"http://127.0.0.1/feed","config":{}}]}`},
+		{name: "metadata feed", plan: `{"targets":[{"platform":"web","capability":"feed","url":"http://169.254.169.254/latest","config":{}}]}`},
+		{name: "localhost feed", plan: `{"targets":[{"platform":"web","capability":"feed","url":"http://service.localhost/feed","config":{}}]}`},
+		{name: "URL config mismatch", plan: `{"targets":[{"platform":"web","capability":"search","title":"搜索: approved","url":"vane://web/search?q=approved","config":{"query":"different"}}]}`},
+		{name: "missing capability config", plan: `{"targets":[{"platform":"web","capability":"search","title":"搜索: approved","url":"vane://web/search?q=approved","config":{}}]}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -661,7 +675,7 @@ func TestCreationPreparer_RejectsUnregisteredWideConfigFields(t *testing.T) {
 	service, store, compiler, _, input := newCreationPrepareFixture(t)
 	store.op.Args = mustCreateArgsWithPlan(
 		t, "AI", "AI", json.RawMessage(
-			`{"sources":[{"platform":"web","capability":"feed","url":"https://a","config":{"id":9007199254740993}}]}`,
+			`{"targets":[{"platform":"web","capability":"feed","url":"https://a","config":{"id":9007199254740993}}]}`,
 		),
 	)
 
@@ -782,7 +796,7 @@ func TestCreationPreparer_RejectsCrossScopeAndTamperedCheckpoints(t *testing.T) 
 			}
 			if compiler.calls != 0 || schedules.calls != 1 ||
 				store.blockCalls != tt.wantBlockAttempt ||
-				store.op.Status != types.PendingActionStatusExecuting {
+				store.op.Status != types.TaskOperationStatusExecuting {
 				t.Fatalf("compiler=%d schedules=%d block=%d status=%q",
 					compiler.calls, schedules.calls, store.blockCalls, store.op.Status)
 			}
@@ -887,7 +901,7 @@ func newCreationPrepareFixture(t *testing.T) (
 	}
 	store := &creationPrepareFakeStore{op: types.TaskCreationOperation{
 		ID: lease.ID, TenantID: lease.TenantID, UserID: lease.UserID,
-		ToolName: "create_schedule", Status: types.PendingActionStatusExecuting,
+		ToolName: "create_schedule", Status: types.TaskOperationStatusExecuting,
 		ExecutionVersion: types.TaskCreationExecutionVersionV1,
 		Phase:            types.TaskCreationPhaseClaimed, LeaseOwner: lease.LeaseOwner, Fence: lease.Fence, Attempt: 1,
 		Args: mustCreateArgs(t, "每天寻找全球 AI 热点", "每天 AI"),
@@ -959,6 +973,32 @@ func mustCreateArgsWithPlan(
 	plan json.RawMessage,
 ) json.RawMessage {
 	t.Helper()
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(plan, &envelope); err == nil {
+		if requirements, ok := envelope["fetch_requirements"]; ok {
+			var decoded struct {
+				Items []map[string]any `json:"items"`
+			}
+			if err := json.Unmarshal(requirements, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			calls := make([]map[string]any, 0, len(decoded.Items))
+			for _, item := range decoded.Items {
+				name, _ := item["kind"].(string)
+				delete(item, "kind")
+				calls = append(calls, map[string]any{
+					"name": name, "arguments": item,
+				})
+			}
+			return mustMarshal(t, map[string]any{
+				"spec":           map[string]any{"every_seconds": 3600, "tz": "UTC"},
+				"intent":         intent,
+				"nl_description": description,
+				"strictness":     "normal",
+				"tool_calls":     calls,
+			})
+		}
+	}
 	return mustMarshal(t, map[string]any{
 		"spec":                map[string]any{"every_seconds": 3600, "tz": "UTC"},
 		"intent":              intent,
@@ -969,7 +1009,7 @@ func mustCreateArgsWithPlan(
 }
 
 func validApprovedFetchPlan() string {
-	return `{"sources":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI&category=news","config":{"query":"AI","category":"news"}}]}`
+	return `{"targets":[{"platform":"web","capability":"search","title":"A","url":"vane://web/search?q=AI&category=news","config":{"query":"AI","category":"news"},"tool_name":"web_search","tool_arguments":{"query":"AI","category":"news"}}]}`
 }
 
 func mustMarshal(t *testing.T, value any) []byte {

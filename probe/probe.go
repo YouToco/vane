@@ -503,7 +503,7 @@ func judgeNegTail(n types.NegTailStat) Result {
 	if n.ExpectedTail == "" {
 		r.Status = StatusYellow
 		r.Summary = "当前画像没有「不感兴趣：」句，探针不适用"
-		r.Detail = "慢通道演化尚未产出负面清单。Gate 清单 ⑦（push_now 触发演化）跑过之后再复跑。"
+		r.Detail = "慢通道演化尚未产出负面清单。运行一次具体任务并产生反馈后再复跑。"
 		return r
 	}
 	if n.Total == 0 {
@@ -613,7 +613,7 @@ func judgeEvolve(e EvolveView) Result {
 		r.Summary = "窗口内无演化调用"
 		r.Detail = "三种可能且从 DB 无法区分：无新反馈（evolver 在调模型前就短路，不留任何行）、" +
 			"evolver 未装配（nil 时整步 no-op）、窗口内没跑过 pipeline。" +
-			"想验证请先点几条反馈再 push_now。" + tagsNote
+			"想验证请先点几条反馈，再手动运行对应任务。" + tagsNote
 		return r
 	}
 	if e.Errored == e.Calls {

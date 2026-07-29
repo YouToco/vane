@@ -35,8 +35,8 @@ const chatToolCallsBody = `{
 			"role": "assistant",
 			"content": "",
 			"tool_calls": [
-				{"id": "call_abc", "type": "function", "function": {"name": "list_sources", "arguments": "{}"}},
-				{"id": "call_def", "type": "function", "function": {"name": "remove_source", "arguments": "{\"source_id\":3}"}}
+				{"id": "call_abc", "type": "function", "function": {"name": "view_profile", "arguments": "{}"}},
+				{"id": "call_def", "type": "function", "function": {"name": "remove_schedule", "arguments": "{\"task_ids\":[\"task-3\"]}"}}
 			]
 		}
 	}],
@@ -69,18 +69,18 @@ func TestChatMessagesAndToolsSerialization(t *testing.T) {
 	srv := newChatCaptureServer(t, chatOKBody, &gotBody)
 	defer srv.Close()
 
-	schema := json.RawMessage(`{"type":"object","properties":{"source_id":{"type":"integer"}},"required":["source_id"]}`)
+	schema := json.RawMessage(`{"type":"object","properties":{"task_ids":{"type":"array","items":{"type":"string"}}},"required":["task_ids"]}`)
 	c := newTestClient(srv.URL, 5)
 	if _, err := c.Chat(context.Background(), ChatRequest{
 		Messages: []ChatMessage{
 			{Role: "system", Content: "你是见微助理"},
 			{Role: "user", Content: "删掉源 3"},
 			{Role: "assistant", Content: "", ToolCalls: []ToolCall{
-				{ID: "call_abc", Name: "remove_source", Arguments: `{"source_id":3}`},
+				{ID: "call_abc", Name: "remove_schedule", Arguments: `{"task_ids":["task-3"]}`},
 			}},
 			{Role: "tool", ToolCallID: "call_abc", Content: "已删除"},
 		},
-		Tools: []ToolDef{{Name: "remove_source", Description: "删除一个信源", Parameters: schema}},
+		Tools: []ToolDef{{Name: "remove_schedule", Description: "删除一个任务", Parameters: schema}},
 	}); err != nil {
 		t.Fatalf("Chat 返回错误: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestChatMessagesAndToolsSerialization(t *testing.T) {
 		t.Errorf("tools[0].type = %v, 期望 function", tool0["type"])
 	}
 	fn, _ := tool0["function"].(map[string]any)
-	if fn["name"] != "remove_source" || fn["description"] != "删除一个信源" {
+	if fn["name"] != "remove_schedule" || fn["description"] != "删除一个任务" {
 		t.Errorf("tools[0].function = %v, name/description 不符", fn)
 	}
 	params, _ := fn["parameters"].(map[string]any)
@@ -127,10 +127,10 @@ func TestChatMessagesAndToolsSerialization(t *testing.T) {
 		t.Errorf("tool_calls[0] id/type = %v/%v, 期望 call_abc/function", tc0["id"], tc0["type"])
 	}
 	tcFn, _ := tc0["function"].(map[string]any)
-	if tcFn["name"] != "remove_source" {
-		t.Errorf("tool_calls[0].function.name = %v, 期望 remove_source", tcFn["name"])
+	if tcFn["name"] != "remove_schedule" {
+		t.Errorf("tool_calls[0].function.name = %v, 期望 remove_schedule", tcFn["name"])
 	}
-	if tcFn["arguments"] != `{"source_id":3}` {
+	if tcFn["arguments"] != `{"task_ids":["task-3"]}` {
 		t.Errorf("tool_calls[0].function.arguments = %v, 期望原始 JSON 字符串原样携带", tcFn["arguments"])
 	}
 
@@ -287,8 +287,8 @@ func TestChatToolCallsParsing(t *testing.T) {
 	resp, err := c.Chat(context.Background(), ChatRequest{
 		Messages: []ChatMessage{{Role: "user", Content: "列出我的信源，然后删掉源 3"}},
 		Tools: []ToolDef{
-			{Name: "list_sources", Parameters: json.RawMessage(`{"type":"object"}`)},
-			{Name: "remove_source", Parameters: json.RawMessage(`{"type":"object"}`)},
+			{Name: "view_profile", Parameters: json.RawMessage(`{"type":"object"}`)},
+			{Name: "remove_schedule", Parameters: json.RawMessage(`{"type":"object"}`)},
 		},
 	})
 	if err != nil {
@@ -304,10 +304,10 @@ func TestChatToolCallsParsing(t *testing.T) {
 	if len(resp.ToolCalls) != 2 {
 		t.Fatalf("ToolCalls 长度 = %d, 期望 2", len(resp.ToolCalls))
 	}
-	if tc := resp.ToolCalls[0]; tc.ID != "call_abc" || tc.Name != "list_sources" || tc.Arguments != "{}" {
-		t.Errorf("ToolCalls[0] = %+v, 期望 {call_abc list_sources {}}", tc)
+	if tc := resp.ToolCalls[0]; tc.ID != "call_abc" || tc.Name != "view_profile" || tc.Arguments != "{}" {
+		t.Errorf("ToolCalls[0] = %+v, 期望 {call_abc view_profile {}}", tc)
 	}
-	if tc := resp.ToolCalls[1]; tc.ID != "call_def" || tc.Name != "remove_source" || tc.Arguments != `{"source_id":3}` {
+	if tc := resp.ToolCalls[1]; tc.ID != "call_def" || tc.Name != "remove_schedule" || tc.Arguments != `{"task_ids":["task-3"]}` {
 		t.Errorf("ToolCalls[1] = %+v, 期望 arguments 原始 JSON 字符串", tc)
 	}
 	if resp.PromptTokens != 30 || resp.CompletionTokens != 12 {
@@ -378,8 +378,8 @@ func TestDoChatPassthrough(t *testing.T) {
 		Model:    "deepseek-v4-pro",
 		Messages: []ChatMessage{{Role: "user", Content: "列出信源"}},
 		Tools: []ToolDef{
-			{Name: "list_sources", Parameters: json.RawMessage(`{"type":"object"}`)},
-			{Name: "remove_source", Parameters: json.RawMessage(`{"type":"object"}`)},
+			{Name: "view_profile", Parameters: json.RawMessage(`{"type":"object"}`)},
+			{Name: "remove_schedule", Parameters: json.RawMessage(`{"type":"object"}`)},
 		},
 	})
 	if err != nil {
@@ -536,7 +536,7 @@ func TestDoChatCancellationAfterReservationRefundsBeforeSend(t *testing.T) {
 func TestChatMessageRoundtripJSON(t *testing.T) {
 	in := []ChatMessage{
 		{Role: "user", Content: "删掉源 3"},
-		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_abc", Name: "remove_source", Arguments: `{"source_id":3}`}}},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_abc", Name: "remove_schedule", Arguments: `{"task_ids":["task-3"]}`}}},
 		{Role: "tool", ToolCallID: "call_abc", Content: "已删除"},
 	}
 	raw, err := json.Marshal(in)

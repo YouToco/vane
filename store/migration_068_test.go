@@ -53,9 +53,6 @@ func TestMigration068EventEvidenceReaderIsLeastPrivilege(t *testing.T) {
 
 func TestMigration068DownRemovesEventEvidenceCapability(t *testing.T) {
 	freshURL := freshMigrationDatabase(t, "brief_event_evidence_down")
-	if err := Migrate(t.Context(), freshURL); err != nil {
-		t.Fatal(err)
-	}
 	db, err := sql.Open("pgx", freshURL)
 	if err != nil {
 		t.Fatal(err)
@@ -67,6 +64,9 @@ func TestMigration068DownRemovesEventEvidenceCapability(t *testing.T) {
 	}
 	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 68); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := provider.DownTo(t.Context(), 67); err != nil {

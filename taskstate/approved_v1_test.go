@@ -179,30 +179,35 @@ func TestApprovedDefinitionV1_SourceScopeAndWriterGate(t *testing.T) {
 	legacy.SourceScope = SourceScopeLegacySubscriptions
 	legacy.FetchPlan = json.RawMessage(` { } `)
 	legacy.Sources = []ApprovedSourceV1{}
-	legacyDefinition, err := BuildApprovedDefinitionV1(legacy)
-	if err != nil {
-		t.Fatalf("legacy build error = %v", err)
-	}
-	if string(legacyDefinition.FetchPlan) != "{}" || legacyDefinition.Sources == nil {
-		t.Fatalf("legacy definition not canonical: %+v", legacyDefinition)
+	if _, err := BuildApprovedDefinitionV1(legacy); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("current builder accepted reader-only legacy scope: %v", err)
 	}
 
-	invalidLegacyPlans := []json.RawMessage{
-		json.RawMessage(`null`),
-		json.RawMessage(`{"sources":[]}`),
-		json.RawMessage(`{"source":"live-subscription"}`),
+	current, err := BuildApprovedDefinitionV1(validApprovedDefinitionInputV1())
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, raw := range invalidLegacyPlans {
-		input := legacy
-		input.FetchPlan = raw
-		if _, err := BuildApprovedDefinitionV1(input); !errors.Is(err, ErrInvalidState) {
-			t.Fatalf("legacy plan %s error = %v", raw, err)
-		}
+	historicalPayload, err := EncodeApprovedDefinitionV1(current)
+	if err != nil {
+		t.Fatal(err)
 	}
-	withSource := legacy
-	withSource.Sources = []ApprovedSourceV1{approvedSearchSourceV1(1, "AI")}
-	if _, err := BuildApprovedDefinitionV1(withSource); !errors.Is(err, ErrInvalidState) {
-		t.Fatalf("legacy source smuggling error = %v", err)
+	historicalPayload = bytes.Replace(
+		historicalPayload,
+		[]byte(`"source_scope":"approved_plan"`),
+		[]byte(`"source_scope":"legacy_subscriptions"`),
+		1,
+	)
+	historicalPayload = replaceJSONFieldValue(historicalPayload, "fetch_plan", `{}`)
+	historicalPayload = replaceJSONFieldValue(historicalPayload, "sources", `[]`)
+	historical, err := DecodeApprovedDefinitionV1(historicalPayload)
+	if err != nil {
+		t.Fatalf("retained reader rejected historical v1: %v", err)
+	}
+	if err := historical.Validate(); err != nil {
+		t.Fatalf("frozen validator rejected historical v1: %v", err)
+	}
+	if err := ValidateApprovedDefinitionV1ForWrite(historical); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("current writer gate accepted reader-only historical v1: %v", err)
 	}
 
 	compiled, err := BuildApprovedDefinitionV1(validApprovedDefinitionInputV1())

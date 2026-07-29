@@ -355,7 +355,7 @@ func TestLoadCompiledTaskRunSnapshotV1_ReturnsFrozenTypedBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := f.st.pool.Exec(t.Context(),
-		`UPDATE sources
+		`UPDATE fetch_targets
 		    SET title='MUTATED CURRENT SOURCE', config='{"query":"mutated"}'
 		  WHERE id = ANY($1)`, sourceIDs); err != nil {
 		t.Fatal(err)
@@ -421,7 +421,9 @@ func assertCompiledSnapshotConsumerBody(
 			t.Errorf("source[%d] = %+v config=%s", i, source, source.Config)
 		}
 	}
-	var plan compiledFetchPlan
+	// task-run-snapshot/v1 freezes the deployed historical wire. Current
+	// schedule_playbooks use targets, but this reader must decode sources.
+	var plan taskRunFetchPlanV1
 	if err := json.Unmarshal(definition.FetchPlan, &plan); err != nil {
 		t.Fatalf("decode frozen fetch plan: %v", err)
 	}

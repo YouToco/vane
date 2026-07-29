@@ -6,13 +6,13 @@ package runtimeconfig
 import (
 	"fmt"
 
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/evolver"
 	"github.com/YouToco/vane/executivebrief"
 	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/scorer"
-	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
@@ -30,7 +30,7 @@ type CurrentCompiledV1Input struct {
 
 // BuildCurrentCompiledV1 snapshots the exact currently supported compiled
 // capabilities, prompts, model calls, and enforced quota rule. Capabilities
-// marked unavailable in sourcecatalog are intentionally omitted.
+// marked unavailable by their tool definition are intentionally omitted.
 func BuildCurrentCompiledV1(input CurrentCompiledV1Input) (runtimepolicy.BundleV1, error) {
 	return buildCompiledV1(
 		input, cardgen.CurrentPromptStageV1(),
@@ -120,7 +120,7 @@ func currentCapabilitiesV1(
 	exaCredentialGeneration int64,
 	tikHubCredentialGeneration int64,
 ) ([]runtimepolicy.CapabilityV1, error) {
-	entries := sourcecatalog.List()
+	entries := acquisitiontool.List()
 	capabilities := make([]runtimepolicy.CapabilityV1, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.Available() {
@@ -140,7 +140,7 @@ func currentCapabilitiesV1(
 }
 
 func currentCapabilityV1(
-	entry sourcecatalog.Entry,
+	entry acquisitiontool.Entry,
 	exaCredentialGeneration int64,
 	tikHubCredentialGeneration int64,
 ) (runtimepolicy.CapabilityV1, error) {

@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -57,13 +56,11 @@ func newTaskRunSnapshotFixture(t *testing.T) *taskRunSnapshotFixture {
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM schedules WHERE tenant_id = $1`, tenantID)
 		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM subscriptions WHERE tenant_id = $1`, tenantID)
-		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM memberships WHERE tenant_id = $1`, tenantID)
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM tenant_quota WHERE tenant_id = $1`, tenantID)
 		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM sources WHERE url LIKE $1`, f.urlPrefix+"%")
+			`DELETE FROM fetch_targets WHERE url LIKE $1`, f.urlPrefix+"%")
 		cleanupExec(cleanupCtx, t, st,
 			`DELETE FROM users WHERE id = $1`, userID)
 		cleanupExec(cleanupCtx, t, st,
@@ -99,25 +96,25 @@ func (f *taskRunSnapshotFixture) createApprovedTask(t *testing.T, taskID string,
 	t.Helper()
 	ctx := t.Context()
 	sourceIDs := make([]int64, 0, count)
-	planned := make([]compiledPlanSource, 0, count)
+	planned := make([]compiledPlanTarget, 0, count)
 	for i := range count {
 		sourceURL := fmt.Sprintf("%s/approved/%s/%d", f.urlPrefix, taskID, i)
 		config := json.RawMessage(fmt.Sprintf(`{"query":"topic-%d","num_results":%d}`, i, i+3))
 		var sourceID int64
 		if err := f.st.pool.QueryRow(ctx,
-			`INSERT INTO sources (platform, capability, url, title, config, status)
+			`INSERT INTO fetch_targets (platform, capability, url, title, config, status)
 			 VALUES ('web', 'search', $1, $2, $3, 'active') RETURNING id`,
 			sourceURL, fmt.Sprintf("approved %d", i), config,
 		).Scan(&sourceID); err != nil {
 			t.Fatalf("创建 approved source: %v", err)
 		}
 		sourceIDs = append(sourceIDs, sourceID)
-		planned = append(planned, compiledPlanSource{
+		planned = append(planned, compiledPlanTarget{
 			Platform: "web", Capability: "search", Title: fmt.Sprintf("approved %d", i),
 			URL: sourceURL, Config: config,
 		})
 	}
-	plan, err := json.Marshal(compiledFetchPlan{Sources: planned})
+	plan, err := json.Marshal(compiledFetchPlan{Targets: planned})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,59 +134,12 @@ func (f *taskRunSnapshotFixture) createApprovedTask(t *testing.T, taskID string,
 	}
 	for _, sourceID := range sourceIDs {
 		if _, err := f.st.pool.Exec(ctx,
-			`INSERT INTO schedule_sources (schedule_id, source_id) VALUES ($1, $2)`,
+			`INSERT INTO task_fetch_targets (schedule_id, fetch_target_id) VALUES ($1, $2)`,
 			taskID, sourceID); err != nil {
 			t.Fatalf("创建 approved source link: %v", err)
 		}
 	}
 	return sourceIDs
-}
-
-func (f *taskRunSnapshotFixture) createLegacyTask(t *testing.T, taskID string) []int64 {
-	t.Helper()
-	ctx := t.Context()
-	if _, err := f.st.pool.Exec(ctx,
-		`INSERT INTO schedules
-			(id, tenant_id, user_id, nl_description, spec_json, scope_json, status)
-		 VALUES ($1, $2, $3, 'legacy monitor', '{"every_seconds":3600}', '{}', 'active')`,
-		taskID, f.tenantID, f.userID); err != nil {
-		t.Fatalf("创建 legacy schedule: %v", err)
-	}
-	if _, err := f.st.pool.Exec(ctx,
-		`INSERT INTO schedule_playbooks (schedule_id, content, fetch_plan)
-		 VALUES ($1, 'legacy playbook', '{}')`, taskID); err != nil {
-		t.Fatalf("创建 legacy playbook: %v", err)
-	}
-
-	statuses := []struct {
-		source       string
-		subscription string
-	}{
-		{source: "active", subscription: "active"},
-		{source: "disabled", subscription: "active"},
-		{source: "active", subscription: "inactive"},
-	}
-	ids := make([]int64, 0, len(statuses))
-	for i, statuses := range statuses {
-		var sourceID int64
-		if err := f.st.pool.QueryRow(ctx,
-			`INSERT INTO sources (platform, capability, url, title, config, status)
-			 VALUES ('web', 'feed', $1, $2, $3, $4) RETURNING id`,
-			fmt.Sprintf("%s/legacy/%s/%d", f.urlPrefix, taskID, i),
-			fmt.Sprintf("legacy %d", i), json.RawMessage(fmt.Sprintf(`{"slot":%d}`, i)),
-			statuses.source,
-		).Scan(&sourceID); err != nil {
-			t.Fatalf("创建 legacy source: %v", err)
-		}
-		ids = append(ids, sourceID)
-		if _, err := f.st.pool.Exec(ctx,
-			`INSERT INTO subscriptions (tenant_id, user_id, source_id, status)
-			 VALUES ($1, $2, $3, $4)`,
-			f.tenantID, f.userID, sourceID, statuses.subscription); err != nil {
-			t.Fatalf("创建 legacy subscription: %v", err)
-		}
-	}
-	return ids
 }
 
 func TestCreateOrGetTaskRunSnapshot_CreateRetryAndNewRun(t *testing.T) {
@@ -255,13 +205,13 @@ func TestCreateOrGetTaskRunSnapshot_CreateRetryAndNewRun(t *testing.T) {
 		`UPDATE schedule_playbooks
 		    SET content = 'edited live playbook',
 		        fetch_plan = jsonb_set(
-		            fetch_plan, '{sources,0,config,lookback_days}', '30'::jsonb, true)
+		            fetch_plan, '{targets,0,config,lookback_days}', '30'::jsonb, true)
 		  WHERE schedule_id = $1`,
 		taskID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.st.pool.Exec(t.Context(),
-		`UPDATE sources SET config = config || '{"lookback_days":30}'::jsonb WHERE id = $1`,
+		`UPDATE fetch_targets SET config = config || '{"lookback_days":30}'::jsonb WHERE id = $1`,
 		sourceIDs[0]); err != nil {
 		t.Fatal(err)
 	}
@@ -636,7 +586,7 @@ func TestCreateOrGetTaskRunSnapshot_FailsClosed(t *testing.T) {
 		taskID := f.taskID()
 		sourceIDs := f.createApprovedTask(t, taskID, 2)
 		if _, err := f.st.pool.Exec(t.Context(),
-			`DELETE FROM schedule_sources WHERE schedule_id=$1 AND source_id=$2`,
+			`DELETE FROM task_fetch_targets WHERE schedule_id=$1 AND fetch_target_id=$2`,
 			taskID, sourceIDs[0]); err != nil {
 			t.Fatal(err)
 		}
@@ -671,32 +621,24 @@ func TestCreateOrGetTaskRunSnapshot_FailsClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := f.st.createOrGetTaskRunSnapshot(
-			t.Context(), f.params(taskID, "run-"+uuid.NewString())); !errors.Is(err, types.ErrInternal) {
+			t.Context(), f.params(taskID, "run-"+uuid.NewString())); !errors.Is(err, types.ErrValidation) {
 			t.Fatalf("缺 playbook 但仍有 approved links 必须 fail closed，实际 %v", err)
 		}
 	})
 
-	t.Run("legacy schedule without playbook remains runnable", func(t *testing.T) {
+	t.Run("task without playbook fails closed", func(t *testing.T) {
 		f := newTaskRunSnapshotFixture(t)
 		taskID := f.taskID()
-		sourceIDs := f.createLegacyTask(t, taskID)
-		if _, err := f.st.pool.Exec(t.Context(),
-			`DELETE FROM schedule_playbooks WHERE schedule_id=$1`, taskID); err != nil {
+		if _, err := f.st.pool.Exec(t.Context(), `
+			INSERT INTO schedules
+			    (id,tenant_id,user_id,nl_description,spec_json,scope_json,status)
+			VALUES($1,$2,$3,'missing plan','{"every_seconds":3600}','{}','active')`,
+			taskID, f.tenantID, f.userID); err != nil {
 			t.Fatal(err)
 		}
-		snapshot, err := f.st.createOrGetTaskRunSnapshot(
-			t.Context(), f.params(taskID, "run-"+uuid.NewString()))
-		if err != nil {
-			t.Fatalf("存量无 playbook 任务应按空手册 legacy 快照继续运行: %v", err)
-		}
-		var payload taskRunSnapshotPayload
-		if err := json.Unmarshal(snapshot.Payload, &payload); err != nil {
-			t.Fatal(err)
-		}
-		if payload.Definition.SourceScope != taskRunSourceScopeLegacy ||
-			len(payload.Definition.Sources) != 1 ||
-			payload.Definition.Sources[0].SourceID != sourceIDs[0] {
-			t.Fatalf("无 playbook legacy 快照范围错误: %+v", payload.Definition)
+		if _, err := f.st.createOrGetTaskRunSnapshot(
+			t.Context(), f.params(taskID, "run-"+uuid.NewString())); !errors.Is(err, types.ErrValidation) {
+			t.Fatalf("无手册/计划任务必须 fail closed，实际 %v", err)
 		}
 	})
 
@@ -710,8 +652,8 @@ func TestCreateOrGetTaskRunSnapshot_FailsClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := f.st.createOrGetTaskRunSnapshot(
-			t.Context(), f.params(taskID, "run-"+uuid.NewString())); !errors.Is(err, types.ErrInternal) {
-			t.Fatalf("{} + schedule_sources 不得回退全用户订阅，实际 %v", err)
+			t.Context(), f.params(taskID, "run-"+uuid.NewString())); !errors.Is(err, types.ErrValidation) {
+			t.Fatalf("{} + task_fetch_targets 必须 fail closed，实际 %v", err)
 		}
 	})
 
@@ -720,13 +662,13 @@ func TestCreateOrGetTaskRunSnapshot_FailsClosed(t *testing.T) {
 		taskID := f.taskID()
 		f.createApprovedTask(t, taskID, 1)
 		if _, err := f.st.pool.Exec(t.Context(),
-			`UPDATE schedule_playbooks SET fetch_plan='{"sources":[]}'::jsonb
+			`UPDATE schedule_playbooks SET fetch_plan='{"targets":[]}'::jsonb
 			  WHERE schedule_id=$1`, taskID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := f.st.createOrGetTaskRunSnapshot(
 			t.Context(), f.params(taskID, "run-"+uuid.NewString())); !errors.Is(err, types.ErrInternal) {
-			t.Fatalf("空 approved sources 不得被当 legacy，实际 %v", err)
+			t.Fatalf("空 targets 必须 fail closed，实际 %v", err)
 		}
 	})
 }
@@ -746,11 +688,11 @@ func TestCreateOrGetTaskRunSnapshot_ApprovedPlanIgnoresGlobalMetadataMutation(t 
 	}
 	approvedSource := firstPayload.Definition.Sources[0]
 
-	// sources is a global materialization table. Another tenant/entry point may
+	// fetch_targets is a global materialization table. Another tenant/entry point may
 	// tune the same URL, but an approved task must continue using its fetch_plan
 	// fields until the owner confirms a definition change.
 	if _, err := f.st.pool.Exec(t.Context(),
-		`UPDATE sources
+		`UPDATE fetch_targets
 		    SET platform='unapproved-platform', capability='unapproved-capability',
 		        title='unapproved title', config='{"query":"unapproved"}'::jsonb
 		  WHERE id=$1`, sourceIDs[0]); err != nil {
@@ -856,88 +798,6 @@ func TestTaskRunSnapshots_RLSScopeBehavior(t *testing.T) {
 			t.Fatal("无 tenant context 必须 fail closed，不能 INSERT snapshot")
 		}
 	})
-}
-
-func TestCreateOrGetTaskRunSnapshot_LegacySourcesAndAdaptiveState(t *testing.T) {
-	f := newTaskRunSnapshotFixture(t)
-	taskID := f.taskID()
-	sourceIDs := f.createLegacyTask(t, taskID)
-	var foreignTenantID, foreignSourceID int64
-	if err := f.st.pool.QueryRow(t.Context(),
-		`INSERT INTO tenants (status, plan) VALUES ('active', 'free') RETURNING id`,
-	).Scan(&foreignTenantID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.st.pool.Exec(t.Context(),
-		`INSERT INTO memberships (tenant_id, user_id, role) VALUES ($1, $2, 'member')`,
-		foreignTenantID, f.userID); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.st.pool.QueryRow(t.Context(),
-		`INSERT INTO sources (platform, capability, url, title, config, status)
-		 VALUES ('web', 'feed', $1, 'foreign tenant source', '{}', 'active') RETURNING id`,
-		f.urlPrefix+"/foreign-tenant",
-	).Scan(&foreignSourceID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.st.pool.Exec(t.Context(),
-		`INSERT INTO subscriptions (tenant_id, user_id, source_id, status)
-		 VALUES ($1, $2, $3, 'active')`, foreignTenantID, f.userID, foreignSourceID); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := cleanupContext()
-		defer cancel()
-		cleanupExec(ctx, t, f.st, `DELETE FROM subscriptions WHERE tenant_id=$1`, foreignTenantID)
-		cleanupExec(ctx, t, f.st, `DELETE FROM memberships WHERE tenant_id=$1`, foreignTenantID)
-		cleanupExec(ctx, t, f.st, `DELETE FROM tenants WHERE id=$1`, foreignTenantID)
-	})
-
-	first, err := f.st.createOrGetTaskRunSnapshot(
-		t.Context(), f.params(taskID, "run-"+uuid.NewString()))
-	if err != nil {
-		t.Fatalf("创建 legacy snapshot: %v", err)
-	}
-	var payload taskRunSnapshotPayload
-	if err := json.Unmarshal(first.Payload, &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload.Definition.SourceScope != taskRunSourceScopeLegacy ||
-		len(payload.Definition.Sources) != 1 ||
-		payload.Definition.Sources[0].SourceID != sourceIDs[0] {
-		t.Fatalf("legacy 只应冻结同 Tenant/User 的 active source，实际 %d 条",
-			len(payload.Definition.Sources))
-	}
-
-	// Fetch scheduling state is Adaptive runtime state and must not affect the
-	// next run's frozen plan identity.
-	if _, err := f.st.pool.Exec(t.Context(),
-		`UPDATE sources SET next_fetch_at=$2, fail_count=99,
-		 last_fetched_at=$2 WHERE id=$1`, sourceIDs[0], time.Now().Add(24*time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	second, err := f.st.createOrGetTaskRunSnapshot(
-		t.Context(), f.params(taskID, "run-"+uuid.NewString()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second.DefinitionDigest != first.DefinitionDigest || second.PlanDigest != first.PlanDigest {
-		t.Fatal("next_fetch_at/fail_count/last_fetched_at 不应进入快照 digest")
-	}
-
-	if _, err := f.st.pool.Exec(t.Context(),
-		`UPDATE sources SET config=config || '{"lookback_days":7}'::jsonb WHERE id=$1`,
-		sourceIDs[0]); err != nil {
-		t.Fatal(err)
-	}
-	third, err := f.st.createOrGetTaskRunSnapshot(
-		t.Context(), f.params(taskID, "run-"+uuid.NewString()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if third.PlanDigest == second.PlanDigest {
-		t.Fatal("source config 是冻结身份的一部分，新 run 应观察变化")
-	}
 }
 
 func TestSortTaskRunSources_UsesGoByteOrder(t *testing.T) {

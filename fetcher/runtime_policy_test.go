@@ -104,7 +104,7 @@ func TestRuntimeFetchRegistryRoutesExactTikHubGeneration(t *testing.T) {
 		},
 	)
 	multi := &Multi{runtimeV1: resolver}
-	source := types.Source{
+	source := types.FetchTarget{
 		ID: 7, Platform: types.PlatformXHS, Capability: types.CapSearch,
 		Config: json.RawMessage(`{"keyword":"vane"}`),
 	}
@@ -120,6 +120,60 @@ func TestRuntimeFetchRegistryRoutesExactTikHubGeneration(t *testing.T) {
 	}
 	if got := calls2.Load(); got != 1 {
 		t.Fatalf("generation 2 endpoint calls = %d, want 1", got)
+	}
+}
+
+func TestRuntimeFetchRegistryFreezesBindingRouteAndOmitsSourceAttribution(
+	t *testing.T,
+) {
+	server, calls := tikHubRuntimeServer(t, "tikhub-key-1")
+	recorder := &fakeRecorder{}
+	binding := NewBinding(
+		config.FetchConfig{TikhubAPIKey: "tikhub-key-1"}, nil, recorder,
+		tikhubinvoke.WithBaseURL(server.URL),
+	)
+	capability := bindingRuntimeCapability(
+		types.PlatformXHS, types.CapSearch, 1)
+	resolver := mustRuntimeFetchResolver(t, RuntimeFetchRouteV1{
+		Capability: capability, Binding: binding,
+	})
+
+	key := bindingKey{types.PlatformXHS, types.CapSearch}
+	originalTemplate := bindingTemplatesV1[key]
+	originalCatalog := retainedBindingCatalogV1[originalTemplate.Endpoint]
+	t.Cleanup(func() {
+		bindingTemplatesV1[key] = originalTemplate
+		retainedBindingCatalogV1[originalTemplate.Endpoint] = originalCatalog
+	})
+	mutatedTemplate := originalTemplate
+	mutatedTemplate.Endpoint = "must_not_be_consulted_after_resolution"
+	bindingTemplatesV1[key] = mutatedTemplate
+	mutatedCatalog := originalCatalog
+	mutatedCatalog.Path = "/must-not-be-consulted-after-resolution"
+	retainedBindingCatalogV1[originalTemplate.Endpoint] = mutatedCatalog
+
+	multi := &Multi{runtimeV1: resolver}
+	items, err := multi.FetchWithPolicyV1(
+		t.Context(),
+		types.FetchTarget{
+			Platform: types.PlatformXHS, Capability: types.CapSearch,
+			Config: json.RawMessage(`{"keyword":"vane"}`),
+		},
+		capability,
+		nil,
+	)
+	if err != nil || len(items) == 0 {
+		t.Fatalf("frozen Binding route failed: items=%d err=%v",
+			len(items), err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("frozen Binding route calls=%d, want 1", calls.Load())
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.rows) != 1 || recorder.rows[0].SourceID != nil {
+		t.Fatalf("Source-free Binding attribution=%+v, want nil source_id",
+			recorder.rows)
 	}
 }
 
@@ -203,20 +257,20 @@ func TestValidateRuntimeFetchRouteV1UsesExactRegistryWithoutNetwork(t *testing.T
 
 	tests := []struct {
 		name       string
-		source     types.Source
+		source     types.FetchTarget
 		capability runtimepolicy.CapabilityV1
 		wantErr    bool
 	}{
 		{
 			name: "current Exa generation",
-			source: types.Source{
+			source: types.FetchTarget{
 				Platform: types.PlatformWeb, Capability: types.CapSearch,
 			},
 			capability: exaRuntimeCapability(types.CapSearch, 2),
 		},
 		{
 			name: "missing Exa generation",
-			source: types.Source{
+			source: types.FetchTarget{
 				Platform: types.PlatformWeb, Capability: types.CapSearch,
 			},
 			capability: exaRuntimeCapability(types.CapSearch, 1),
@@ -224,14 +278,14 @@ func TestValidateRuntimeFetchRouteV1UsesExactRegistryWithoutNetwork(t *testing.T
 		},
 		{
 			name: "current RSS dependency generation",
-			source: types.Source{
+			source: types.FetchTarget{
 				Platform: types.PlatformWeb, Capability: types.CapFeed,
 			},
 			capability: rssRuntimeCapability(2),
 		},
 		{
 			name: "missing RSS dependency generation",
-			source: types.Source{
+			source: types.FetchTarget{
 				Platform: types.PlatformWeb, Capability: types.CapFeed,
 			},
 			capability: rssRuntimeCapability(1),
@@ -307,7 +361,7 @@ func TestRuntimeFetchResolverRejectsDuplicateAndMismatchedExecutor(t *testing.T)
 
 func TestValidateRuntimeCapabilityV1AllowsAnyPositiveRetainedGeneration(t *testing.T) {
 	for _, generation := range []int64{1, 2, 99} {
-		source := types.Source{Platform: types.PlatformWeb, Capability: types.CapSearch}
+		source := types.FetchTarget{Platform: types.PlatformWeb, Capability: types.CapSearch}
 		if err := ValidateRuntimeCapabilityV1(
 			exaRuntimeCapability(types.CapSearch, generation), source,
 		); err != nil {
@@ -317,13 +371,13 @@ func TestValidateRuntimeCapabilityV1AllowsAnyPositiveRetainedGeneration(t *testi
 
 	missingDependency := rssRuntimeCapability(1)
 	missingDependency.DependencyCredentialRefs = nil
-	if err := ValidateRuntimeCapabilityV1(missingDependency, types.Source{
+	if err := ValidateRuntimeCapabilityV1(missingDependency, types.FetchTarget{
 		Platform: types.PlatformWeb, Capability: types.CapFeed,
 	}); err == nil {
 		t.Fatal("RSS without frozen Exa dependency must be rejected")
 	}
 	sourceMismatch := exaRuntimeCapability(types.CapSearch, 1)
-	if err := ValidateRuntimeCapabilityV1(sourceMismatch, types.Source{
+	if err := ValidateRuntimeCapabilityV1(sourceMismatch, types.FetchTarget{
 		Platform: types.PlatformWeb, Capability: types.CapContents,
 	}); err == nil {
 		t.Fatal("source mismatch must be rejected")
@@ -331,7 +385,7 @@ func TestValidateRuntimeCapabilityV1AllowsAnyPositiveRetainedGeneration(t *testi
 }
 
 func TestMultiFetchWithPolicyV1FailsBeforeNetworkWithoutRegistry(t *testing.T) {
-	source := types.Source{
+	source := types.FetchTarget{
 		ID: 7, Platform: types.PlatformWeb, Capability: types.CapFeed,
 		URL: "https://must-not-be-called.invalid/feed",
 	}

@@ -96,7 +96,7 @@ func TestInvariant_PurgeListNeverTouchesSharedFacts(t *testing.T) {
 
 // TestInvariant_PurgeCoversScheduleChildren 补的是「按 tenant_id 列对账」看不见的那一类。
 //
-// schedule_playbooks / schedule_sources **没有 tenant_id 列**，只经 schedules 反查归属。
+// schedule_playbooks / task_fetch_targets **没有 tenant_id 列**，只经 schedules 反查归属。
 // 上面那条守卫扫的是 tenant_id 列，扫不到它们——2026-07-19 实测发现这个盲区。
 // 漏删它们的后果：删 schedules 时撞外键（整个清理事务失败），或残留孤儿行。
 func TestInvariant_PurgeCoversScheduleChildren(t *testing.T) {
@@ -193,7 +193,7 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO task_approved_definition_versions (
 			tenant_id, user_id, task_id, version, schema_version,
-			execution_mode, definition_digest, payload, approval_ref
+			execution_mode, definition_digest, payload, operation_ref
 		) VALUES (
 			$2, $3, $1, 1, 'approved-definition/v1', 'compiled',
 			encode(sha256(convert_to('{"task":"purge"}', 'UTF8')), 'hex'),
@@ -225,7 +225,7 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO task_definition_edit_operations (
 			id, tenant_id, user_id, target_tenant_id, target_user_id,
-				task_id, session_id, approval_ref, expires_at, original_status,
+				task_id, session_id, operation_ref, expires_at, original_status,
 			base_definition_version, base_definition_digest, base_definition,
 			target_definition_version, target_definition_digest,
 			target_definition,
@@ -295,7 +295,7 @@ func seedPurgeTenant(t *testing.T, st *Store) int64 {
 			$1, $2, $3, $4, $5, 'scheduled', 'compiled', 0,
 			repeat('0', 64), repeat('1', 64), repeat('2', 64), repeat('3', 64),
 			repeat('4', 64), repeat('5', 64), repeat('6', 64), repeat('7', 64),
-			repeat('8', 64), 'purge-fixture/v1', convert_to('{}', 'UTF8'), '{}'::jsonb
+			repeat('8', 64), 'vane.run-snapshot-ref/v1', convert_to('{}', 'UTF8'), '{}'::jsonb
 		 )`,
 		tn.ID, u.ID, taskID, "purge-workflow-"+uuid.NewString(),
 		"purge-run-"+uuid.NewString()); err != nil {
@@ -831,7 +831,7 @@ func TestPurgeTenant_DefinitionEditLockOrderDoesNotDeadlock(t *testing.T) {
 	if _, err := st.pool.Exec(ctx, `
 		UPDATE task_definition_edit_operations
 		   SET status='executing', phase='db_quiesced',
-		       confirmed_at=clock_timestamp(), tombstoned_at=NULL,
+		       execution_started_at=clock_timestamp(), tombstoned_at=NULL,
 		       lease_owner='purge-lock-order-worker',
 		       lease_until=clock_timestamp()+interval '10 minutes',
 		       takeover_not_before=clock_timestamp()+interval '11 minutes',
@@ -971,14 +971,9 @@ func TestPurgeTenant_TaskCreationReceiptWorkerDoesNotDeadlock(t *testing.T) {
 	if _, err := st.CreateTaskCreationOperation(ctx, create); err != nil {
 		t.Fatalf("建 Task Creation operation 失败: %v", err)
 	}
-	if _, err := st.CancelTaskCreationOperation(
-		ctx,
-		taskCreationCancelParams(
-			operationID, tenantID, userID, "om_purge_creation_receipt",
-		),
-	); err != nil {
-		t.Fatalf("终态化 Task Creation operation 失败: %v", err)
-	}
+	seedHistoricalCancelledTaskCreationReceipt(
+		t, st, ctx, operationID, tenantID, userID,
+		"om_purge_creation_receipt")
 	receipt, err := st.LoadTaskCreationReceiptByOperation(
 		ctx, operationID, tenantID, userID,
 	)
@@ -1015,7 +1010,7 @@ func TestPurgeTenant_TaskCreationReceiptWorkerDoesNotDeadlock(t *testing.T) {
 		},
 	)
 	if report.Rows["task_creation_receipts"] != 1 ||
-		report.Rows["pending_actions"] != 1 ||
+		report.Rows["task_creation_operations"] != 1 ||
 		report.Rows["agent_sessions"] == 0 {
 		t.Fatalf("Task Creation receipt purge report=%+v", report)
 	}
@@ -1058,7 +1053,7 @@ func TestPurgeTenant_TaskCreationCoordinatorOperationFirstDoesNotDeadlock(t *tes
 
 	var lockedOperationID string
 	err = st.pool.QueryRow(ctx, `
-		SELECT id FROM pending_actions
+		SELECT id FROM task_creation_operations
 		 WHERE id=$1 AND tenant_id=$2
 		 FOR UPDATE NOWAIT`,
 		commit.Lease.ID, fixture.tenantID,
@@ -1102,7 +1097,7 @@ func TestPurgeTenant_TaskCreationCoordinatorOperationFirstDoesNotDeadlock(t *tes
 				result.err)
 		}
 		if result.report == nil || result.report.Rows["tenants"] != 1 ||
-			result.report.Rows["pending_actions"] != 1 {
+			result.report.Rows["task_creation_operations"] != 1 {
 			t.Fatalf("tenant purge 报告异常: %+v", result.report)
 		}
 	case <-time.After(10 * time.Second):
@@ -1464,222 +1459,6 @@ func TestPurgeTenantRemovesSideWriterCommittedBeforeSessionFence(
 	}
 }
 
-func TestPurgeTenantSerializesWithAgentActionProjection(t *testing.T) {
-	st := purgeStore(t)
-	tenantID := seedPurgeTenant(t, st)
-	ctx := t.Context()
-	var userID, sessionID int64
-	if err := st.pool.QueryRow(ctx, `
-		SELECT m.user_id,s.id
-		  FROM memberships m
-		  JOIN agent_sessions s
-		    ON s.tenant_id=m.tenant_id AND s.user_id=m.user_id
-		 WHERE m.tenant_id=$1
-		 ORDER BY s.id
-		 LIMIT 1`,
-		tenantID,
-	).Scan(&userID, &sessionID); err != nil {
-		t.Fatal(err)
-	}
-	sourceID, _, err := st.UpsertSource(ctx, &types.Source{
-		Platform: types.PlatformWeb, Capability: types.CapFeed,
-		URL:   "https://example.com/action-purge-" + uuid.NewString(),
-		Title: "action purge projection",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx, cancel := cleanupContext()
-		defer cancel()
-		cleanupExec(
-			cleanupCtx, t, st,
-			`DELETE FROM sources WHERE id=$1`, sourceID,
-		)
-	})
-	if err := st.AddSubscription(ctx, userID, sourceID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.pool.Exec(ctx,
-		`UPDATE sources SET status='disabled',fail_count=9 WHERE id=$1`,
-		sourceID,
-	); err != nil {
-		t.Fatal(err)
-	}
-	actionID := uuid.NewString()
-	if err := st.CreatePendingAction(ctx, &types.PendingAction{
-		ID: actionID, UserID: userID, SessionID: &sessionID,
-		ToolName:  "enable_source",
-		Args:      []byte(fmt.Sprintf(`{"source_id":%d}`, sourceID)),
-		Summary:   "purge projection",
-		Status:    types.PendingActionStatusPending,
-		ExpiresAt: time.Now().Add(time.Hour),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.ActivateAgentActionContinuation(
-		ctx, tenantID, userID, actionID, "purge projection",
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.ConfirmAgentActionContinuation(
-		ctx, userID, actionID,
-	); err != nil {
-		t.Fatal(err)
-	}
-	acquired, err := st.AcquireAgentActionContinuation(
-		ctx, actionID, tenantID, userID,
-		"purge-projection-"+actionID, time.Minute,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease, err := acquired.Lease()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	continuationLocked := make(chan struct{})
-	resumeProject := make(chan struct{})
-	var resumeOnce sync.Once
-	resume := func() {
-		resumeOnce.Do(func() { close(resumeProject) })
-	}
-	t.Cleanup(resume)
-	projectStore := *st
-	projectStore.beginTx = func(
-		ctx context.Context,
-		options pgx.TxOptions,
-	) (pgx.Tx, error) {
-		tx, err := st.pool.BeginTx(ctx, options)
-		if err != nil {
-			return nil, err
-		}
-		return &pauseAgentActionProjectAfterContinuationTx{
-			Tx: tx, locked: continuationLocked, resume: resumeProject,
-		}, nil
-	}
-	projectDone := make(chan error, 1)
-	go func() {
-		projectDone <- projectStore.ProjectAgentActionContinuation(ctx, lease)
-	}()
-	select {
-	case <-continuationLocked:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Agent action projector did not lock continuation")
-	}
-
-	type purgeResult struct {
-		report *PurgeReport
-		err    error
-	}
-	purgeDone := make(chan purgeResult, 1)
-	go func() {
-		report, err := st.PurgeTenant(ctx, tenantID, false)
-		purgeDone <- purgeResult{report: report, err: err}
-	}()
-	waitForDatabaseLockQuery(
-		t, st,
-		"%tenant purge task-creation lock order%",
-		"tenant purge did not wait behind Agent action root",
-	)
-	resume()
-	select {
-	case err := <-projectDone:
-		if err != nil {
-			t.Fatalf("Agent action projection with purge: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("Agent action projection did not converge")
-	}
-	select {
-	case result := <-purgeDone:
-		if result.err != nil {
-			t.Fatalf("tenant purge with Agent action: %v", result.err)
-		}
-		if result.report == nil ||
-			result.report.Rows["agent_action_continuation_authority_events"] != 1 ||
-			result.report.Rows["agent_action_continuations"] != 1 {
-			t.Fatalf("tenant purge report=%+v", result.report)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("tenant purge did not converge after projection")
-	}
-	var (
-		sourceStatus                                         string
-		actions, continuations, authority, sessions, tenants int
-	)
-	if err := st.pool.QueryRow(ctx, `
-		SELECT
-			(SELECT status FROM sources WHERE id=$1),
-			(SELECT count(*) FROM pending_actions WHERE tenant_id=$2),
-			(SELECT count(*) FROM agent_action_continuations WHERE tenant_id=$2),
-			(SELECT count(*) FROM agent_action_continuation_authority_events
-			  WHERE tenant_id=$2),
-			(SELECT count(*) FROM agent_sessions WHERE tenant_id=$2),
-			(SELECT count(*) FROM tenants WHERE id=$2)`,
-		sourceID, tenantID,
-	).Scan(
-		&sourceStatus, &actions, &continuations,
-		&authority, &sessions, &tenants,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if sourceStatus != string(types.SourceStatusActive) ||
-		actions != 0 || continuations != 0 || authority != 0 ||
-		sessions != 0 || tenants != 0 {
-		t.Fatalf(
-			"source/actions/continuations/authority/sessions/tenants="+
-				"%s/%d/%d/%d/%d/%d",
-			sourceStatus, actions, continuations, authority,
-			sessions, tenants,
-		)
-	}
-}
-
-type pauseAgentActionProjectAfterContinuationTx struct {
-	pgx.Tx
-	locked chan struct{}
-	resume <-chan struct{}
-	once   sync.Once
-}
-
-func (tx *pauseAgentActionProjectAfterContinuationTx) QueryRow(
-	ctx context.Context,
-	query string,
-	args ...any,
-) pgx.Row {
-	row := tx.Tx.QueryRow(ctx, query, args...)
-	if !strings.Contains(query, "FROM agent_action_continuations") ||
-		!strings.Contains(query, "FOR UPDATE") {
-		return row
-	}
-	return pauseAgentActionProjectAfterContinuationRow{
-		Row: row,
-		pause: func() {
-			tx.once.Do(func() {
-				close(tx.locked)
-				<-tx.resume
-			})
-		},
-	}
-}
-
-type pauseAgentActionProjectAfterContinuationRow struct {
-	pgx.Row
-	pause func()
-}
-
-func (row pauseAgentActionProjectAfterContinuationRow) Scan(
-	dest ...any,
-) error {
-	if err := row.Row.Scan(dest...); err != nil {
-		return err
-	}
-	row.pause()
-	return nil
-}
-
 type pauseAfterReceiptLockTx struct {
 	pgx.Tx
 	table   string
@@ -1844,7 +1623,7 @@ func assertPurgedReceiptWorkerRows(
 			(SELECT count(*) FROM task_definition_edit_receipts WHERE tenant_id=$1),
 			(SELECT count(*) FROM task_definition_edit_operations WHERE tenant_id=$1),
 			(SELECT count(*) FROM task_creation_receipts WHERE tenant_id=$1),
-			(SELECT count(*) FROM pending_actions WHERE tenant_id=$1),
+			(SELECT count(*) FROM task_creation_operations WHERE tenant_id=$1),
 			(SELECT count(*) FROM schedules WHERE tenant_id=$1),
 			(SELECT count(*) FROM agent_sessions WHERE tenant_id=$1),
 			(SELECT count(*) FROM agent_events WHERE tenant_id=$1),
@@ -1969,7 +1748,7 @@ func TestPurgeTenant_LeavesSharedFactsIntact(t *testing.T) {
 			"同一篇内容可能被多个租户的信源指向，删了别人也看不到了——不可逆。实得 %d 行", n)
 	}
 	if err := st.pool.QueryRow(ctx,
-		`SELECT count(*) FROM sources WHERE id = $1`, srcID).Scan(&n); err != nil {
+		`SELECT count(*) FROM fetch_targets WHERE id = $1`, srcID).Scan(&n); err != nil {
 		t.Fatalf("查信源失败: %v", err)
 	}
 	if n != 1 {

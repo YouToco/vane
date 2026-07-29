@@ -86,7 +86,7 @@ func TestToolCalls_InsertAndCount(t *testing.T) {
 
 	// 不计入限额的三类：static、invalid_args、budget_exceeded。
 	for _, c := range []*types.ToolCall{
-		{ToolName: "list_sources", ToolKind: types.ToolCallKindStatic},
+		{ToolName: "view_profile", ToolKind: types.ToolCallKindStatic},
 		{ToolName: "ep", ToolKind: types.ToolCallKindTikHubEndpoint, ErrorType: types.ToolErrInvalidArgs},
 		{ToolName: "ep", ToolKind: types.ToolCallKindTikHubEndpoint, ErrorType: types.ToolErrBudgetExceeded},
 	} {

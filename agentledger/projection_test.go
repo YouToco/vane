@@ -13,7 +13,7 @@ func TestBuildAndProjectLatestSessionSnapshot(t *testing.T) {
 		Messages: json.RawMessage(`[
 			{"role":"user","content":"hello"},
 			{"role":"assistant","content":"","tool_calls":[
-				{"id":"call-1","name":"list_sources","arguments":"{}"}
+				{"id":"call-1","name":"view_profile","arguments":"{}"}
 			]},
 			{"role":"tool","content":"none","tool_call_id":"call-1"},
 			{"role":"assistant","content":"done"}
@@ -26,11 +26,10 @@ func TestBuildAndProjectLatestSessionSnapshot(t *testing.T) {
 		TurnID: "turn-2",
 		Messages: json.RawMessage(`[
 			{"role":"user","content":"new"},
-			{"role":"assistant","content":"confirm"}
+			{"role":"assistant","content":"done"}
 		]`),
-		TurnCount:          3,
-		ActivatedTools:     json.RawMessage(`["endpoint_a","endpoint_b"]`),
-		ConfirmationAction: "action-1",
+		TurnCount:      3,
+		ActivatedTools: json.RawMessage(`["endpoint_a","endpoint_b"]`),
 	})
 
 	events := append(materializeProjectionBatch(t, first, 1),
@@ -41,7 +40,7 @@ func TestBuildAndProjectLatestSessionSnapshot(t *testing.T) {
 	}
 	want := SessionProjection{
 		Messages: json.RawMessage(
-			`[{"role":"user","content":"new"},{"role":"assistant","content":"confirm"}]`,
+			`[{"role":"user","content":"new"},{"role":"assistant","content":"done"}]`,
 		),
 		TurnCount:      3,
 		ActivatedTools: json.RawMessage(`["endpoint_a","endpoint_b"]`),
@@ -95,13 +94,12 @@ func TestBuildProjectionSnapshotBatchBounds(t *testing.T) {
 		TurnID:               "turn-at-limit",
 		BaseProjectionDigest: baseDigest,
 		Messages:             raw,
-		ConfirmationAction:   "action-at-limit",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(batch.Events) != 63 {
-		t.Fatalf("event count=%d want=63", len(batch.Events))
+	if len(batch.Events) != 62 {
+		t.Fatalf("event count=%d want=62", len(batch.Events))
 	}
 }
 

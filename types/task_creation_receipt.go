@@ -86,7 +86,7 @@ type TaskCreationReceipt struct {
 	CreatedAt             time.Time
 	UpdatedAt             time.Time
 	OperationSummary      string
-	OperationStatus       PendingActionStatus
+	OperationStatus       TaskOperationStatus
 	OperationPhase        TaskCreationPhase
 	TaskID                string
 	Result                json.RawMessage

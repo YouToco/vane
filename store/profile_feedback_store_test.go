@@ -396,14 +396,14 @@ func TestFeedbackStore(t *testing.T) {
 	attachTenant(t, st, u2.ID)
 	userIDs := []int64{u.ID, u2.ID}
 
-	srcID, _, err := st.UpsertSource(ctx, &types.Source{
+	srcID, _, err := st.GetOrCreateFetchTarget(ctx, &types.FetchTarget{
 		Platform:   types.PlatformWeb,
 		Capability: types.CapFeed,
 		URL:        "https://example.com/test-feedback-" + uuid.NewString(),
 		Title:      "feedback-test-source",
 	})
 	if err != nil {
-		t.Fatalf("UpsertSource() 失败: %v", err)
+		t.Fatalf("GetOrCreateFetchTarget() 失败: %v", err)
 	}
 	batchID, err := st.CreatePushBatch(ctx, u.ID)
 	if err != nil {
@@ -422,7 +422,7 @@ func TestFeedbackStore(t *testing.T) {
 		cleanupExec(ctx, t, st, `DELETE FROM deliveries WHERE user_id = ANY($1)`, userIDs)
 		cleanupExec(ctx, t, st, `DELETE FROM push_batches WHERE user_id = ANY($1)`, userIDs)
 		cleanupExec(ctx, t, st, `DELETE FROM content_items WHERE source_id = $1`, srcID)
-		cleanupExec(ctx, t, st, `DELETE FROM sources WHERE id = $1`, srcID)
+		cleanupExec(ctx, t, st, `DELETE FROM fetch_targets WHERE id = $1`, srcID)
 		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id = ANY($1)`, userIDs)
 	})
 

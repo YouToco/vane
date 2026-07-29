@@ -113,13 +113,13 @@ type exaResult struct {
 // 失败语义：缺 key / 缺 query / 非法 config / 401/403 鉴权失败 → CodeValidation
 // （不可重试）；超时 → CodeFetchTimeout；429 → CodeFetchRateLimit；
 // 其余非 2xx 按 5xx/4xx 定可否重试。
-func (e *ExaFetcher) Fetch(ctx context.Context, src types.Source) ([]types.ContentItem, error) {
+func (e *ExaFetcher) Fetch(ctx context.Context, src types.FetchTarget) ([]types.ContentItem, error) {
 	return e.fetchWithEffectGate(ctx, src, nil)
 }
 
 func (e *ExaFetcher) fetchWithEffectGate(
 	ctx context.Context,
-	src types.Source,
+	src types.FetchTarget,
 	beforeEffect func(context.Context) error,
 ) ([]types.ContentItem, error) {
 	if e.apiKey == "" {
@@ -181,14 +181,14 @@ func (e *ExaFetcher) fetchWithEffectGate(
 // doSearch 是 POST /search 的 HTTP 核心：请求→错误语义→记账，Fetch（信源周期抓取）
 // 与 Search（agent ad-hoc 一次性搜索）共用。src 只用于记账（tool_calls 的 source_id），
 // ad-hoc 调用传零值 Source（SourceID=0 无源口径）。
-func (e *ExaFetcher) doSearch(ctx context.Context, reqBody exaRequest, src types.Source) (*exaResponse, error) {
+func (e *ExaFetcher) doSearch(ctx context.Context, reqBody exaRequest, src types.FetchTarget) (*exaResponse, error) {
 	return e.doSearchWithEffectGate(ctx, reqBody, src, nil)
 }
 
 func (e *ExaFetcher) doSearchWithEffectGate(
 	ctx context.Context,
 	reqBody exaRequest,
-	src types.Source,
+	src types.FetchTarget,
 	beforeEffect func(context.Context) error,
 ) (*exaResponse, error) {
 	payload, err := json.Marshal(reqBody)
@@ -299,7 +299,7 @@ func (e *ExaFetcher) Search(ctx context.Context, query string, numResults int, i
 		NumResults:     numResults,
 		IncludeDomains: includeDomains,
 		Contents:       exaContentsReq{Text: true},
-	}, types.Source{})
+	}, types.FetchTarget{})
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +321,7 @@ func (e *ExaFetcher) Search(ctx context.Context, query string, numResults int, i
 
 // mapExaResults 把 Exa 结果映射为 ContentItem，正文过长时截断，指纹由 finalize 统一补齐。
 // 第二个返回值是本轮各原因的丢弃计数，供调用方判定「全灭」（见 drop.go）。
-func mapExaResults(src types.Source, results []exaResult) ([]types.ContentItem, dropTally) {
+func mapExaResults(src types.FetchTarget, results []exaResult) ([]types.ContentItem, dropTally) {
 	now := time.Now().UTC()
 	var tally dropTally
 	out := make([]types.ContentItem, 0, len(results))
@@ -355,14 +355,13 @@ func mapExaResults(src types.Source, results []exaResult) ([]types.ContentItem, 
 }
 
 // recordCall 写一行 tool_calls（与 binding.record 同纪律：旁路，失败不放大）。
-func (e *ExaFetcher) recordCall(ctx context.Context, src types.Source, status int, elapsed time.Duration, bodySize int, costTotal float64, callErr error) {
+func (e *ExaFetcher) recordCall(ctx context.Context, src types.FetchTarget, status int, elapsed time.Duration, bodySize int, costTotal float64, callErr error) {
 	if e.rec == nil {
 		return
 	}
 	ctx, cancel := detachedBindingRecordContext(ctx)
 	defer cancel()
 	trace, tenantID, userID := bindingAttribution(ctx)
-	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
 		TenantID:     tenantID,
@@ -373,7 +372,10 @@ func (e *ExaFetcher) recordCall(ctx context.Context, src types.Source, status in
 		DurationMs:   int(elapsed.Milliseconds()),
 		ResultSize:   bodySize,
 		HTTPStatus:   &status,
-		SourceID:     &srcID,
+	}
+	if src.ID > 0 {
+		srcID := src.ID
+		rec.SourceID = &srcID
 	}
 	if costTotal > 0 {
 		rec.CostUSD = &costTotal

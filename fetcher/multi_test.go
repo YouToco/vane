@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/config"
-	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/types"
 )
 
@@ -45,13 +45,13 @@ func TestMulti_DispatchesByType(t *testing.T) {
 
 	cases := []struct {
 		name string
-		src  types.Source
+		src  types.FetchTarget
 		want int // 期望条数
 	}{
-		{"rss", types.Source{ID: 1, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: rssSrv.URL}, 2},
-		{"exa", types.Source{ID: 2, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(`{"query":"x"}`)}, 2},
-		{"tikhub", types.Source{ID: 3, Platform: types.PlatformXHS, Capability: types.CapSearch, Config: json.RawMessage(`{"keyword":"x"}`)}, 1},
-		{"xhs_user", types.Source{ID: 4, Platform: types.PlatformXHS, Capability: types.CapUserPosts, Config: json.RawMessage(`{"user_id":"6a5578b3000000000e03cc00"}`)}, 2},
+		{"rss", types.FetchTarget{ID: 1, Platform: types.PlatformWeb, Capability: types.CapFeed, URL: rssSrv.URL}, 2},
+		{"exa", types.FetchTarget{ID: 2, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(`{"query":"x"}`)}, 2},
+		{"tikhub", types.FetchTarget{ID: 3, Platform: types.PlatformXHS, Capability: types.CapSearch, Config: json.RawMessage(`{"keyword":"x"}`)}, 1},
+		{"xhs_user", types.FetchTarget{ID: 4, Platform: types.PlatformXHS, Capability: types.CapUserPosts, Config: json.RawMessage(`{"user_id":"6a5578b3000000000e03cc00"}`)}, 2},
 	}
 	for _, tc := range cases {
 		items, err := m.Fetch(context.Background(), tc.src)
@@ -67,7 +67,7 @@ func TestMulti_DispatchesByType(t *testing.T) {
 
 func TestMulti_UnknownPlatform(t *testing.T) {
 	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil, nil)
-	_, err := m.Fetch(context.Background(), types.Source{ID: 1, Platform: "carrier_pigeon"})
+	_, err := m.Fetch(context.Background(), types.FetchTarget{ID: 1, Platform: "carrier_pigeon"})
 	if !errors.Is(err, types.ErrValidation) {
 		t.Errorf("未知平台应判 ErrValidation，实际 %v", err)
 	}
@@ -77,11 +77,11 @@ func TestMulti_UnknownPlatform(t *testing.T) {
 }
 
 // TestMulti_UnavailableCapabilityCarriesReason 验证：注册为 Unavailable 的能力（x/search）
-// 被抓取时返回 CodeValidation，且**报错里带得出 sourcecatalog 的 Reason**——这正是契约 §2.2
+// 被抓取时返回 CodeValidation，且**报错里带得出 capabilitycatalog 的 Reason**——这正是契约 §2.2
 // 要的"机器可读的不可用原因"，让 agent 能解释为何不支持，而不是静默改道。
 func TestMulti_UnavailableCapabilityCarriesReason(t *testing.T) {
 	m := NewMulti(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1}, nil, nil)
-	_, err := m.Fetch(context.Background(), types.Source{
+	_, err := m.Fetch(context.Background(), types.FetchTarget{
 		ID: 9, Platform: types.PlatformX, Capability: types.CapSearch,
 	})
 	if !errors.Is(err, types.ErrValidation) {
@@ -90,16 +90,16 @@ func TestMulti_UnavailableCapabilityCarriesReason(t *testing.T) {
 	if types.IsRetryable(err) {
 		t.Error("Unavailable 能力不应可重试")
 	}
-	entry, _ := sourcecatalog.Lookup(types.PlatformX, types.CapSearch)
+	entry, _ := acquisitiontool.Lookup(types.PlatformX, types.CapSearch)
 	if entry.Reason == "" || !strings.Contains(err.Error(), entry.Reason) {
-		t.Errorf("报错未携带 sourcecatalog Reason；err=%q，reason=%q", err.Error(), entry.Reason)
+		t.Errorf("报错未携带 capabilitycatalog Reason；err=%q，reason=%q", err.Error(), entry.Reason)
 	}
 }
 
 // TestMulti_EveryAvailableCapabilityIsWired 是**注册表↔装配的漂移守护**：
-// 遍历 sourcecatalog 里每个 Available 条目，用空 config 调 Multi.Fetch，断言绝不返回
+// 遍历 capabilitycatalog 里每个 Available 条目，用空 config 调 Multi.Fetch，断言绝不返回
 // CodeInternal（那是"注册为可用却没接抓取器"的漂移信号）。有了它，任何人将来在
-// sourcecatalog 加一行 Available 却忘了在 multi.go 接 case，CI 立刻红。
+// capabilitycatalog 加一行 Available 却忘了在 multi.go 接 case，CI 立刻红。
 //
 // 不触网的保证分两层，别只靠"provider 恰好先校验"这条隐性约定（对抗审查 CONFIRMED：
 // 那条约定不成文，将来某个无 key、空配置即打固定端点的 provider 会让本测试真发外网请求）：
@@ -121,18 +121,18 @@ func TestMulti_EveryAvailableCapabilityIsWired(t *testing.T) {
 	m.exa.searchURL = dead.URL
 	m.binding = newTestBinding(dead.URL, nil, nil)
 
-	for _, e := range sourcecatalog.List() {
+	for _, e := range acquisitiontool.List() {
 		if !e.Available() {
 			continue
 		}
-		_, err := m.Fetch(context.Background(), types.Source{
+		_, err := m.Fetch(context.Background(), types.FetchTarget{
 			ID: 1, Platform: e.Platform, Capability: e.Capability,
 		})
 		if err == nil {
 			continue // 空 config 仍成功也无妨（只是不该是 CodeInternal）。
 		}
 		if errors.Is(err, types.ErrInternal) {
-			t.Errorf("能力 %s/%s 在 sourcecatalog 标记 Available，但 multi.go 未接抓取器（漂移）：%v",
+			t.Errorf("能力 %s/%s 在 capabilitycatalog 标记 Available，但 multi.go 未接抓取器（漂移）：%v",
 				e.Platform, e.Capability, err)
 		}
 	}

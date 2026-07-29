@@ -11,8 +11,8 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-// UpsertSchedulePlaybook 写入/更新某定时任务的手册正文（P0 只管 content），服务三条路径：
-// create_schedule 创建即初始化、edit_task_playbook 修改、老任务补手册（决策 #4）。
+// UpsertSchedulePlaybook 写入/更新某定时任务的手册正文（P0 只管 content）。
+// 任务创建与任务定义编辑都维护这一份手册；它是当前唯一可编辑产品真相。
 //
 // 归属与存在性由 SQL 内的 schedules 子查询一并把关（沿用 EnableSource 先例，归属谓词进
 // WHERE）：目标 schedule 不存在、或不属于 userID 时，INSERT...SELECT 的 SELECT 产 0 行 →
@@ -47,10 +47,10 @@ func (s *Store) UpsertSchedulePlaybook(ctx context.Context, userID int64, schedu
 // （schedules.user_id 谓词，沿用 UpsertSchedulePlaybook/EnableSource 先例）：目标任务不存在、
 // 非本人、或还没有手册行 → 匹配 0 行 → ok=false（未写任何行）。err 只在基础设施失败时非 nil。
 //
-// plan 为空/nil 时归一化为规范零源计划 '{"sources":[]}'（列非空约束 + 语义明确）。
+// plan 为空/nil 时归一化为规范零目标计划 '{"targets":[]}'（列非空约束 + 语义明确）。
 func (s *Store) SetFetchPlan(ctx context.Context, userID int64, scheduleID string, plan json.RawMessage) (ok bool, err error) {
 	if len(plan) == 0 {
-		plan = json.RawMessage(`{"sources":[]}`)
+		plan = json.RawMessage(`{"targets":[]}`)
 	}
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE schedule_playbooks p

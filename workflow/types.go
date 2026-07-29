@@ -24,7 +24,7 @@ const defaultTopN = 5
 
 // PushParams 是 PushPipelineWorkflow 的唯一入参，也是 Schedule.Action.Args 的元素。
 // 铁律：只放稳定标识符（UserID+ScheduleID+Scope），绝不放候选内容 / batch_id——每次触发时
-// 由 Fetch Activity 在"触发时刻"现查订阅源，否则定时任务会反复推送陈旧内容。
+// 由 Fetch Activity 在触发时读取任务冻结范围，否则定时任务会反复推送陈旧内容。
 //
 // RunKind 显式区分定时与即时执行。不能再用 ScheduleID=="" 推断即时执行：存量
 // Temporal Schedule 的冻结 Action 在 reconcile 前同样可能缺 ScheduleID，把它当即时
@@ -38,7 +38,7 @@ const (
 )
 
 // ScheduleID 是触发本次推送的定时任务 id（任务手册 P1b）：定时触发时由 scheduler 填入其
-// schedule id，据此让"按任务的源抓/挑/投"成为可能（b3 消费）。push_now / 即时触发为空串，
+// schedule id，据此让"按任务的取材目标抓/挑/投"成为可能。
 // 但其身份由 RunKind=ad_hoc 明确声明，而不是从空串猜测。
 type PushParams struct {
 	// TenantID is populated only by a trusted scheduled-task Action. It stays
@@ -95,6 +95,16 @@ const CompiledRuntimeStructuredEventEvidenceV1 = "compiled-snapshot/v1+run-outco
 // It is valid only after the structured event evidence runtime.
 const CompiledRuntimeExecutiveBriefV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+structured-insight/v1+event-evidence/v1+executive-brief/v1"
 
+// CompiledRuntimeToolSnapshotV2 selects the Source-free task Tool snapshot
+// protocol. It is dark until the versioned Tool execution and observation
+// provenance Activities are wired; defining the label does not make any
+// existing Schedule Action select it.
+const CompiledRuntimeToolSnapshotV2 = "compiled-tool-snapshot/v2"
+
+func IsCompiledToolRuntimeV2(version string) bool {
+	return version == CompiledRuntimeToolSnapshotV2
+}
+
 func IsCompiledRuntimeV1(version string) bool {
 	return version == CompiledRuntimeSnapshotV1 ||
 		version == CompiledRuntimeRunOutcomeV1 ||
@@ -136,14 +146,10 @@ type CompiledRunInputV1 struct {
 
 // PushScope 推送范围过滤。
 //
-// ⚠️ SourceIDs 目前只约束「本轮去抓哪些源」（Fetch Activity 的 filterSources），
-// 不约束候选检索——候选一律走 ListUnpushedByUser 捞该用户全部订阅的未投递内容。
-// 即：非空 SourceIDs = 只抓这些源，但推的是所有源的积压，不是「只推这些源」。
-// 当前生产调用方（agent push_now、前端）都传零值 scope，故此语义差异未暴露；
-// 若将来要「真正只推指定源」，需给 ListUnpushedByUser 加 sourceIDs 过滤参数，
-// 别指望改这里的注释就够（见代码审计 D-4）。
+// SourceIDs 只允许进一步收窄当前任务的冻结 fetch target 集合，绝不能扩大到
+// 任务之外。零值表示使用该任务完整冻结范围。
 type PushScope struct {
-	SourceIDs []int64 `json:"source_ids,omitempty"` // 空=全部订阅；非空=只【抓取】这些源（见上：不过滤候选）
+	SourceIDs []int64 `json:"source_ids,omitempty"` // 空=任务完整范围；非空=进一步收窄
 	TopN      int     `json:"top_n,omitempty"`      // 每批最多推几条；0=defaultTopN
 }
 

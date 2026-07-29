@@ -11,10 +11,16 @@ import (
 	"unicode/utf8"
 )
 
-// RunSnapshotSchemaVersion identifies the stable safe-reference payload. A new
-// incompatible shape must use a new value rather than reinterpret persisted
-// Temporal history.
-const RunSnapshotSchemaVersion = "vane.run-snapshot-ref/v1"
+const (
+	// RunSnapshotSchemaVersionV1 identifies the retained Source-based safe
+	// reference carried by existing Temporal histories.
+	RunSnapshotSchemaVersionV1 = "vane.run-snapshot-ref/v1"
+	// RunSnapshotSchemaVersionV2 identifies the Source-free Tool-call runtime.
+	RunSnapshotSchemaVersionV2 = "vane.run-snapshot-ref/v2"
+	// RunSnapshotSchemaVersion remains the V1 alias until every existing
+	// Workflow call site dispatches explicitly by task head protocol.
+	RunSnapshotSchemaVersion = RunSnapshotSchemaVersionV1
+)
 
 const (
 	maxRunSnapshotRefBytes    = 512
@@ -271,7 +277,7 @@ type runSnapshotReferenceEnvelope struct {
 }
 
 func (s RunSnapshotRef) validateUnsealed() error {
-	if s.SchemaVersion != RunSnapshotSchemaVersion {
+	if s.SchemaVersion != RunSnapshotSchemaVersionV1 {
 		return runSnapshotValidationError("run snapshot schema version is unsupported")
 	}
 	if s.SnapshotID <= 0 {

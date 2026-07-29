@@ -23,12 +23,10 @@ import (
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 )
 
-// AgentRunner 是 feishu 对 agent loop 的窄依赖面（契约 §9）：消息入口 +
-// 确认卡的两个回调入口。用接口而非 *agent.Loop：feishu 只依赖这三个方法，
+// AgentRunner is the Feishu natural-language message boundary.
 // handler 单测可注入假实现；直接引用 agent.Outcome 不构成循环
 // （agent 不 import feishu，依赖单向）。
 type AgentRunner interface {
@@ -36,22 +34,6 @@ type AgentRunner interface {
 	// HandleExternalContextMessage 用于已经拼入推送正文/引用消息的输入。它与
 	// 普通用户文本是不同的信任类型，agent 从首轮就关闭画像与工具面。
 	HandleExternalContextMessage(ctx context.Context, userID int64, text string) (agent.Outcome, error)
-	ExecuteAction(ctx context.Context, userID int64, actionID string) (string, error)
-	CancelAction(ctx context.Context, userID int64, actionID string) (string, error)
-}
-
-// DurableAgentRunner is the A6 extension implemented by the production Agent
-// loop. Keeping it separate preserves the narrow legacy runner seam for v0
-// tests while making provider-target binding explicit on the real path.
-type DurableAgentRunner interface {
-	ExecuteActionWithReceipt(
-		ctx context.Context, userID int64, actionID string,
-		receipt task.CreationReceiptTarget,
-	) (agent.CardActionOutcome, error)
-	CancelActionWithReceipt(
-		ctx context.Context, userID int64, actionID string,
-		receipt task.CreationReceiptTarget,
-	) (agent.CardActionOutcome, error)
 }
 
 // FeedbackRunner 是 feishu 对 feedback 服务的窄依赖面（M5 契约 §10.4）：

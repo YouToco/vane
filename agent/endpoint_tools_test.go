@@ -611,12 +611,12 @@ func TestRunToolCalls_TaintedAllowsCurrentCacheReadsWithinUnifiedFuse(t *testing
 	l := newTestLoop(t, fs, (&scriptedChat{}).fn, ep.ReadResultTool())
 	ctx := context.WithValue(context.Background(), toolRunKey{}, state)
 
-	pending, replies, err := l.runToolCalls(ctx, 1, nil, []llm.ToolCall{
+	replies, err := l.runToolCalls(ctx, 1, nil, []llm.ToolCall{
 		{ID: "first", Name: "read_endpoint_result", Arguments: fmt.Sprintf(`{"handle":%q}`, h1)},
 		{ID: "second", Name: "read_endpoint_result", Arguments: fmt.Sprintf(`{"handle":%q}`, h2)},
 	})
-	if err != nil || pending != nil {
-		t.Fatalf("runToolCalls: pending=%+v err=%v", pending, err)
+	if err != nil {
+		t.Fatalf("runToolCalls: %v", err)
 	}
 	if len(replies) != 2 || !strings.Contains(replies[0].Content, "CURRENT-ONE") ||
 		!strings.Contains(replies[1].Content, "CURRENT-TWO") {

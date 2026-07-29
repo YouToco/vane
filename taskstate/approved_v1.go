@@ -8,8 +8,8 @@ import (
 	"slices"
 	"sort"
 
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/internal/strictjson"
-	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/types"
 )
 
@@ -29,9 +29,8 @@ const (
 	// SourceScopeApprovedPlan means FetchPlan and Sources are the exact,
 	// user-approved long-term source set.
 	SourceScopeApprovedPlan SourceScope = "approved_plan"
-	// SourceScopeLegacySubscriptions is an explicit compatibility marker. It
-	// carries no approved plan or source identities; a run-start compatibility
-	// adapter may freeze live subscriptions without relabeling them as approved.
+	// SourceScopeLegacySubscriptions is a frozen reader-only marker for rows
+	// written before account subscriptions were retired.
 	SourceScopeLegacySubscriptions SourceScope = "legacy_subscriptions"
 )
 
@@ -41,8 +40,7 @@ type DeliveryPolicy string
 // BudgetPolicy is an approved non-secret budget policy identifier.
 type BudgetPolicy string
 
-// SourceScope distinguishes an exact approved plan from the retained legacy
-// subscriptions compatibility behavior.
+// SourceScope distinguishes an exact approved plan from historical v1 rows.
 type SourceScope string
 
 // PlanSourceV1 is one exact, approved source in execution-plan order. Config
@@ -353,7 +351,7 @@ func validateApprovedDefinitionV1CurrentWriter(definition ApprovedDefinitionV1) 
 		return invalidState("approved definition execution mode is not writable")
 	}
 	if definition.SourceScope == SourceScopeLegacySubscriptions {
-		return nil
+		return invalidState("legacy subscription scope is reader-only")
 	}
 	var plan FetchPlanV1
 	if err := strictjson.DecodeExact(definition.FetchPlan, &plan); err != nil {
@@ -381,7 +379,7 @@ func validCurrentMaterializedSourceV1(
 	url string,
 	config json.RawMessage,
 ) bool {
-	return sourcespec.ValidateMaterialized(&types.Source{
+	return acquisitiontool.ValidateMaterialized(&types.FetchTarget{
 		Platform: platform, Capability: capability, Title: title, URL: url, Config: config,
 	}) == ""
 }

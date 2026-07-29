@@ -54,14 +54,14 @@ func TestSearchContentItems(t *testing.T) {
 	}
 	registerStoreClose(t, st)
 
-	srcID, _, err := st.UpsertSource(ctx, &types.Source{
+	srcID, _, err := st.GetOrCreateFetchTarget(ctx, &types.FetchTarget{
 		Platform:   types.PlatformWeb,
 		Capability: types.CapFeed,
 		URL:        "https://example.com/test-search-" + uuid.NewString(),
 		Title:      "search-test-source",
 	})
 	if err != nil {
-		t.Fatalf("UpsertSource() 失败: %v", err)
+		t.Fatalf("GetOrCreateFetchTarget() 失败: %v", err)
 	}
 	t.Cleanup(func() {
 		ctx, cancel := cleanupContext()
@@ -69,7 +69,7 @@ func TestSearchContentItems(t *testing.T) {
 		// FK 逆序：content_sources → content_items → sources。
 		cleanupExec(ctx, t, st, `DELETE FROM content_sources WHERE source_id = $1`, srcID)
 		cleanupExec(ctx, t, st, `DELETE FROM content_items WHERE source_id = $1`, srcID)
-		cleanupExec(ctx, t, st, `DELETE FROM sources WHERE id = $1`, srcID)
+		cleanupExec(ctx, t, st, `DELETE FROM fetch_targets WHERE id = $1`, srcID)
 	})
 
 	// 关键词带 uuid 后缀：检索打的是共享库全表，唯一标记保证谓词只命中本测试的行。

@@ -919,7 +919,7 @@ func advanceCurrentApprovedObservationPolicy(
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO task_approved_definition_versions (
 			tenant_id,user_id,task_id,version,schema_version,
-			execution_mode,definition_digest,payload,approval_ref
+			execution_mode,definition_digest,payload,operation_ref
 		 ) VALUES ($1,$2,$3,2,$4,$5,$6,$7,$8)`,
 		f.idA.TenantID, f.idA.UserID, f.taskA,
 		definition.SchemaVersion, definition.ExecutionMode,

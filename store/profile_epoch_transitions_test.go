@@ -51,9 +51,9 @@ func TestProfileEpochResetRestoreRawReplayAndAuthority(t *testing.T) {
 		cleanupExec(ctx, t, st, `DELETE FROM push_batches WHERE user_id=$1`, u.ID)
 		cleanupExec(ctx, t, st, `
 			DELETE FROM content_items
-			 WHERE source_id IN (SELECT id FROM sources WHERE url=$1)`,
+			 WHERE source_id IN (SELECT id FROM fetch_targets WHERE url=$1)`,
 			feedbackURL)
-		cleanupExec(ctx, t, st, `DELETE FROM sources WHERE url=$1`, feedbackURL)
+		cleanupExec(ctx, t, st, `DELETE FROM fetch_targets WHERE url=$1`, feedbackURL)
 		for _, table := range []string{
 			"profile_epoch_receipts", "profile_epoch_events",
 			"profile_epoch_checkpoints", "profile_claim_receipts",
@@ -331,8 +331,8 @@ func TestProfileEpochFeedbackIsolationAndPerEpochIdempotency(t *testing.T) {
 		cleanupExec(ctx, t, st, `DELETE FROM push_batches WHERE user_id=$1`, u.ID)
 		cleanupExec(ctx, t, st, `
 			DELETE FROM content_items
-			 WHERE source_id IN (SELECT id FROM sources WHERE url=$1)`, sourceURL)
-		cleanupExec(ctx, t, st, `DELETE FROM sources WHERE url=$1`, sourceURL)
+			 WHERE source_id IN (SELECT id FROM fetch_targets WHERE url=$1)`, sourceURL)
+		cleanupExec(ctx, t, st, `DELETE FROM fetch_targets WHERE url=$1`, sourceURL)
 		cleanupExec(ctx, t, st, `DELETE FROM memberships WHERE user_id=$1`, u.ID)
 		cleanupExec(ctx, t, st, `DELETE FROM users WHERE id=$1`, u.ID)
 	})

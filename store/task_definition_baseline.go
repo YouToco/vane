@@ -160,9 +160,21 @@ func (s *Store) listTaskDefinitionBaselineScopes(
 		   FROM schedules s
 		  WHERE (s.tenant_id, s.user_id, s.id) > ($1, $2, $3)
 		    AND `+matureSchedulePredicate+`
+		    AND NOT EXISTS (
+		        SELECT 1
+		          FROM task_approved_definition_versions d
+		         WHERE d.tenant_id = s.tenant_id
+		           AND d.user_id = s.user_id
+		           AND d.task_id = s.id
+		           AND d.version = s.approved_definition_version
+		           AND d.definition_digest = s.approved_definition_digest
+		           AND d.execution_mode = s.execution_mode
+		           AND d.schema_version = $4
+		    )
 		  ORDER BY s.tenant_id, s.user_id, s.id
-		  LIMIT $4`,
-		after.TenantID, after.UserID, after.TaskID, limit+1)
+		  LIMIT $5`,
+		after.TenantID, after.UserID, after.TaskID,
+		taskstate.ApprovedDefinitionSchemaVersionV2, limit+1)
 	if err != nil {
 		return nil, false, taskStateDatabaseError(
 			"list task definition baseline page", err)
@@ -319,7 +331,7 @@ func (s *Store) reconcileTaskDefinitionBaseline(
 
 	record, err := insertInitialApprovedDefinitionTx(
 		ctx, tx, definition, payload, digest,
-		taskDefinitionBaselineApprovalRef(scope), head)
+		taskDefinitionBaselineOperationRef(scope), head)
 	if err != nil {
 		return TaskDefinitionBaselineResult{}, err
 	}
@@ -399,7 +411,7 @@ func taskDefinitionBaselineMatureTx(
 	return mature, nil
 }
 
-func taskDefinitionBaselineApprovalRef(
+func taskDefinitionBaselineOperationRef(
 	scope TaskDefinitionBaselineCursor,
 ) string {
 	return fmt.Sprintf("%s:%d:%d:%s", taskDefinitionBaselineApprovalV1,
@@ -458,8 +470,8 @@ func buildTaskDefinitionBaselineV1Tx(
 	linkedIDs := make(map[string]int64)
 	rows, err := tx.Query(ctx,
 		`SELECT src.url, src.id
-		   FROM schedule_sources ss
-		   JOIN sources src ON src.id=ss.source_id
+		   FROM task_fetch_targets ss
+		   JOIN fetch_targets src ON src.id=ss.fetch_target_id
 		  WHERE ss.schedule_id=$1
 		  ORDER BY src.url, src.id
 		  FOR SHARE OF ss, src`,
@@ -501,24 +513,20 @@ func buildTaskDefinitionBaselineV1Tx(
 	sourceScope := taskstate.SourceScopeApprovedPlan
 	approvedSources := make([]taskstate.ApprovedSourceV1, 0, len(linkedIDs))
 	if len(planObject) == 0 {
-		if len(linkedIDs) != 0 {
-			return taskstate.ApprovedDefinitionV1{},
-				TaskDefinitionBaselineReasonProjection, nil
-		}
-		sourceScope = taskstate.SourceScopeLegacySubscriptions
-		fetchPlan = json.RawMessage("{}")
+		return taskstate.ApprovedDefinitionV1{},
+			TaskDefinitionBaselineReasonProjection, nil
 	} else {
-		var legacyPlan legacyFetchPlanProjectionV1
-		if err := strictjson.Decode(fetchPlan, &legacyPlan); err != nil ||
-			legacyPlan.Sources == nil ||
-			len(legacyPlan.Sources) != len(linkedIDs) {
+		var currentPlan currentFetchPlanProjection
+		if err := strictjson.Decode(fetchPlan, &currentPlan); err != nil ||
+			currentPlan.Targets == nil ||
+			len(currentPlan.Targets) != len(linkedIDs) {
 			return taskstate.ApprovedDefinitionV1{},
 				TaskDefinitionBaselineReasonProjection, nil
 		}
 		plan := taskstate.FetchPlanV1{
-			Sources: make([]taskstate.PlanSourceV1, 0, len(legacyPlan.Sources)),
+			Sources: make([]taskstate.PlanSourceV1, 0, len(currentPlan.Targets)),
 		}
-		for _, source := range legacyPlan.Sources {
+		for _, source := range currentPlan.Targets {
 			config := source.Config
 			if len(config) == 0 {
 				config = json.RawMessage("{}")

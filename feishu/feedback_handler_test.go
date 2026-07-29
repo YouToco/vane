@@ -455,32 +455,6 @@ func TestOnCardActionIgnoresBadFeedbackValue(t *testing.T) {
 	}
 }
 
-// TestOnCardActionConfirmPathNotStolenByFeedback 是 M4 路径的防回归：
-// 反馈分流插在 agent 就绪检查之前（契约 §10.3），必须只截走 vane_action=fb。
-// 注入了 FeedbackRunner 之后，确认/取消卡的回调仍须原样走 M4 分支
-// （agent 未注入 → 「助手尚未就绪」），且一次都不许落进反馈链路。
-func TestOnCardActionConfirmPathNotStolenByFeedback(t *testing.T) {
-	for _, verb := range []string{"confirm", "cancel"} {
-		t.Run(verb+" 仍走 M4 路径", func(t *testing.T) {
-			m := NewManager(nil, nil, nil)
-			m.setOwner("ou_owner", "主人")
-			fb := &fakeFeedbackRunner{}
-			m.SetFeedback(fb) // 反馈已就绪，但与确认卡无关
-			h := newHandler(m, context.Background())
-
-			value := map[string]interface{}{"vane_action": verb, "action_id": "act-1"}
-			resp, err := h.onCardAction(context.Background(), cardEvent("ou_owner", value))
-			if err != nil {
-				t.Fatalf("onCardAction 不应返回 error，实际: %v", err)
-			}
-			assertToast(t, resp, "助手尚未就绪，请稍后重试")
-			if n := fb.clickCount(); n != 0 {
-				t.Errorf("确认卡回调不得进反馈链路，实际 HandleClick 被调用 %d 次", n)
-			}
-		})
-	}
-}
-
 // TestOnFeedbackActionNotReady 验证 FeedbackRunner 未注入时的兜底 toast
 // （契约 §10.3）：装配不全时按钮点击要给人话，不能崩也不能沉默。
 func TestOnFeedbackActionNotReady(t *testing.T) {
@@ -647,7 +621,7 @@ func TestOnFeedbackActionSyncBudgetTimeout(t *testing.T) {
 	}
 	m := NewManager(nil, nil, nil)
 	fb := &fakeFeedbackRunner{
-		delay:  cardActionSyncBudget + 500*time.Millisecond,
+		delay:  feedbackCallbackSyncBudget + 500*time.Millisecond,
 		result: feedback.ClickResult{Toast: "已记录：感兴趣", ToastOK: true, CardJSON: `{"schema":"2.0"}`},
 	}
 	m.SetFeedback(fb)

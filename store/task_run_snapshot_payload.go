@@ -13,18 +13,13 @@ import (
 
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/types"
 )
 
 type taskRunBudget = types.PlannerBudget
 
-type taskRunPolicyPayloads struct {
-	CapabilityCatalog json.RawMessage `json:"capability_catalog"`
-	ToolPolicy        json.RawMessage `json:"tool_policy"`
-	PromptPolicy      json.RawMessage `json:"prompt_policy"`
-	ModelPolicy       json.RawMessage `json:"model_policy"`
-	QuotaPolicy       json.RawMessage `json:"quota_policy"`
-}
+type taskRunPolicyPayloads = runcontext.PolicyPayloadsV1
 
 type taskRunPolicyDigestSet struct {
 	CapabilityCatalog string
@@ -622,12 +617,12 @@ func canonicalTaskRunCompiledPlan(plan *compiledFetchPlan) (json.RawMessage, err
 	if plan == nil {
 		return nil, errors.New("compiled plan is missing")
 	}
-	for i := range plan.Sources {
-		canonical, err := canonicalTaskRunJSONObject(plan.Sources[i].Config)
+	for i := range plan.Targets {
+		canonical, err := canonicalTaskRunJSONObject(plan.Targets[i].Config)
 		if err != nil {
 			return nil, err
 		}
-		plan.Sources[i].Config = canonical
+		plan.Targets[i].Config = canonical
 	}
 	canonical, err := json.Marshal(plan)
 	if err != nil {

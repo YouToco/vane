@@ -16,15 +16,14 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 73
+const latestMigrationVersion int64 = 77
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
 var wantTables = []string{
 	// 001 Step 5 schema 九张业务表
 	"users",
-	"sources",
-	"subscriptions",
+	"fetch_targets",
 	"content_items",
 	"push_batches",
 	"deliveries",
@@ -39,7 +38,7 @@ var wantTables = []string{
 	"schedules",
 	// 005 M4 agent（欠账补记，a2a-contract §9.5）
 	"agent_sessions",
-	"pending_actions",
+	"task_creation_operations",
 	// 007 内容身份关联表（欠账补记）
 	"content_sources",
 	// 013 A2A server 任务持久化
@@ -55,7 +54,7 @@ var wantTables = []string{
 	// 017 情报任务手册（Task Playbook P0）
 	"schedule_playbooks",
 	// 020 任务手册 P1b：「任务 ↔ 源」软范围绑定
-	"schedule_sources",
+	"task_fetch_targets",
 	// 026 per-tenant 配额（企业级契约 §2.7，D3 下的财务护栏）
 	"tenant_quota",
 	// 027 probewatch 告警指纹落盘（M5 契约 §16 修订，探针实现债 P2）
@@ -64,6 +63,8 @@ var wantTables = []string{
 	"task_creation_receipts",
 	// 030 每次定时任务运行的不可变执行快照（Agent Runtime C0）
 	"task_run_snapshots",
+	// 076 exact Source-free Tool result relationship/evidence.
+	"task_run_content_provenance",
 	// 032 Approved Definition / Adaptive State 分离（Agent Runtime C2a）
 	"task_approved_definition_versions",
 	"task_adaptive_states",
@@ -80,10 +81,7 @@ var wantTables = []string{
 	"agent_turn_context_snapshots",
 	// 056 durable business-fact to exact Agent-session continuation.
 	"agent_session_fact_outbox",
-	// 058 exact-action durable terminal convergence for enable_source.
-	"agent_action_continuations",
-	"agent_action_continuation_authority_events",
-	// 059 adds only the least-privilege durable-action proposer role.
+	// 058/059/070 are retired by 074 together with the account-source product.
 	// 036 C2c-2 immutable run-snapshot v2 shadow sidecar.
 	"task_run_snapshot_v2_shadows",
 	// 037 C2c-3b-1 durable per-run v2 authority fence.
@@ -134,7 +132,16 @@ var wantTables = []string{
 // 真正的漏账生效——只豁免这里显式声明的、有意下线的表。
 //   - page_snapshots：011 为 page_watch 建，016 随 page_watch 下线删除。
 var droppedTables = map[string]bool{
-	"page_snapshots": true,
+	"page_snapshots":                             true,
+	"subscriptions":                              true,
+	"agent_action_continuations":                 true,
+	"agent_action_continuation_authority_events": true,
+}
+
+var renamedTables = map[string]string{
+	"sources":          "fetch_targets",
+	"schedule_sources": "task_fetch_targets",
+	"pending_actions":  "task_creation_operations",
 }
 
 // TestMigrationsCoverWantTables 是对账守卫（a2a-contract §9.5）：扫 migrations/*.sql 的
@@ -161,6 +168,12 @@ func TestMigrationsCoverWantTables(t *testing.T) {
 		}
 		for _, m := range re.FindAllStringSubmatch(string(data), -1) {
 			created[strings.ToLower(m[1])] = name
+		}
+	}
+	for oldName, newName := range renamedTables {
+		if file, ok := created[oldName]; ok {
+			delete(created, oldName)
+			created[newName] = file
 		}
 	}
 
@@ -378,9 +391,6 @@ func TestProfileEditDowngradeFenceLockOrder(t *testing.T) {
 
 func TestProfileEditEmptyDowngradeTo59(t *testing.T) {
 	freshURL := freshMigrationDatabase(t, "vane_profile_empty_down")
-	if err := Migrate(t.Context(), freshURL); err != nil {
-		t.Fatal(err)
-	}
 	db, err := sql.Open("pgx", freshURL)
 	if err != nil {
 		t.Fatal(err)
@@ -392,6 +402,9 @@ func TestProfileEditEmptyDowngradeTo59(t *testing.T) {
 	}
 	provider, err := goose.NewProvider(goose.DialectPostgres, db, dir)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(t.Context(), 60); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := provider.DownTo(t.Context(), 59); err != nil {

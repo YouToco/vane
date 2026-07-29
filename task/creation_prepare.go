@@ -14,17 +14,18 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/types"
 	"github.com/YouToco/vane/workflow"
 )
 
 const (
 	creationCommandVersion      = "vane.create-schedule-command/v1"
-	compiledDefinitionVersion   = "vane.compiled-task-definition/v1"
+	compiledDefinitionVersionV1 = "vane.compiled-task-definition/v1"
+	compiledDefinitionVersion   = "vane.compiled-task-definition/v2"
 	maxCreationCommandBytes     = 64 << 10
 	maxCreationOperationBytes   = 512
 	maxCreationPlaybookRunes    = 4000
@@ -65,7 +66,7 @@ type TaskSchedulePreparer interface {
 // CreationPreparer deterministically validates and freezes the user-approved
 // fetch plan into two immutable preparation checkpoints. It never calls
 // an LLM, discovers a source, creates a Temporal schedule, or writes the A2
-// aggregate. Discovery must happen before the confirmation action is created.
+// aggregate. Discovery must happen before the durable operation is created.
 type CreationPreparer struct {
 	store     CreationPrepareStore
 	schedules TaskSchedulePreparer
@@ -103,7 +104,7 @@ type createScheduleCommandArgs struct {
 	Intent            string                     `json:"intent"`
 	NLDescription     string                     `json:"nl_description"`
 	Strictness        types.PushStrictness       `json:"strictness"`
-	ApprovedFetchPlan json.RawMessage            `json:"approved_fetch_plan"`
+	LegacyToolPlanV1  json.RawMessage            `json:"approved_fetch_plan"`
 	ObservationPolicy *observation.PolicySpecV1  `json:"observation_policy,omitempty"`
 }
 
@@ -120,7 +121,7 @@ type normalizedCreateScheduleCommand struct {
 	Intent            string                    `json:"intent"`
 	NLDescription     string                    `json:"nl_description"`
 	Strictness        types.PushStrictness      `json:"strictness,omitempty"`
-	ApprovedFetchPlan json.RawMessage           `json:"approved_fetch_plan"`
+	LegacyToolPlanV1  json.RawMessage           `json:"approved_fetch_plan"`
 	ObservationPolicy *observation.PolicySpecV1 `json:"observation_policy,omitempty"`
 }
 
@@ -142,15 +143,17 @@ type compiledTaskDefinitionCheckpoint struct {
 }
 
 type compiledFetchPlan struct {
-	Sources []compiledFetchSource `json:"sources"`
+	Targets []compiledFetchTarget `json:"targets"`
 }
 
-type compiledFetchSource struct {
+type compiledFetchTarget struct {
 	Platform   string          `json:"platform"`
 	Capability string          `json:"capability"`
 	Title      string          `json:"title,omitempty"`
 	URL        string          `json:"url"`
 	Config     json.RawMessage `json:"config"`
+	ToolName   string          `json:"tool_name,omitempty"`
+	ToolArgs   json.RawMessage `json:"tool_arguments,omitempty"`
 }
 
 // Prepare seals the canonical command, materializes only the user-approved
@@ -185,7 +188,7 @@ func (p *CreationPreparer) Prepare(
 		}
 		return CreationPrepareResult{}, p.failKnownFailure(
 			ctx, in.Lease, "command_invalid",
-			"已确认的任务参数无效，未创建任务", cause,
+			"任务参数无效，未创建任务", cause,
 		)
 	}
 	if err := p.store.SealTaskCreationCommand(ctx, in.Lease, commandBytes); err != nil {
@@ -253,7 +256,7 @@ func (p *CreationPreparer) Prepare(
 	}
 
 	playbook := command.Intent
-	canonicalPlan := bytes.Clone(command.ApprovedFetchPlan)
+	canonicalPlan := bytes.Clone(command.LegacyToolPlanV1)
 	var compiledObservation *observation.PolicyV1
 	if command.ObservationPolicy != nil {
 		policy, policyErr := observation.Compile(*command.ObservationPolicy, loaded.CreatedAt)
@@ -453,7 +456,7 @@ func (p *CreationPreparer) loadScopedOperation(
 	if op.Attempt <= 0 || op.Fence <= 0 {
 		return nil, fmt.Errorf("%w: operation lease counters are invalid", ErrCreationCheckpointInvalid)
 	}
-	if op.Status != types.PendingActionStatusExecuting || creationPhaseTerminal(op.Phase) {
+	if op.Status != types.TaskOperationStatusExecuting || creationPhaseTerminal(op.Phase) {
 		return nil, fmt.Errorf("%w: operation is terminal", types.ErrTaskCreationTerminal)
 	}
 	return op, nil
@@ -490,12 +493,12 @@ func normalizeCreateScheduleCommand(
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, nil, err
 	}
-	approvedPlan, err := canonicalizeFetchPlan(args.ApprovedFetchPlan)
+	approvedPlan, err := canonicalizeFetchPlan(args.LegacyToolPlanV1)
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, nil,
-			fmt.Errorf("task: approved_fetch_plan is invalid: %w", err)
+			fmt.Errorf("task: retained v1 tool plan is invalid: %w", err)
 	}
-	command.ApprovedFetchPlan = approvedPlan
+	command.LegacyToolPlanV1 = approvedPlan
 	canonical, err := json.Marshal(command)
 	if err != nil {
 		return normalizedCreateScheduleCommand{}, nil,
@@ -584,54 +587,71 @@ func canonicalizeFetchPlan(raw json.RawMessage) (json.RawMessage, error) {
 	if err := decodeStrictJSON(raw, &plan); err != nil {
 		return nil, err
 	}
-	if plan == nil || len(plan.Sources) == 0 {
-		return nil, errors.New("fetch_plan.sources must be non-empty")
+	if plan == nil || len(plan.Targets) == 0 {
+		return nil, errors.New("fetch_plan.targets must be non-empty")
 	}
-	if len(plan.Sources) > maxCompiledSources {
-		return nil, fmt.Errorf("fetch_plan.sources exceeds %d entries", maxCompiledSources)
+	if len(plan.Targets) > maxCompiledSources {
+		return nil, fmt.Errorf("fetch_plan.targets exceeds %d entries", maxCompiledSources)
 	}
-	seenURLs := make(map[string]struct{}, len(plan.Sources))
-	for i := range plan.Sources {
-		source := &plan.Sources[i]
-		if strings.TrimSpace(source.Platform) == "" || strings.TrimSpace(source.Platform) != source.Platform ||
-			utf8.RuneCountInString(source.Platform) > maxCompiledSourceRunes {
-			return nil, fmt.Errorf("fetch_plan.sources[%d].platform is invalid", i)
+	seenURLs := make(map[string]struct{}, len(plan.Targets))
+	for i := range plan.Targets {
+		target := &plan.Targets[i]
+		if strings.TrimSpace(target.Platform) == "" || strings.TrimSpace(target.Platform) != target.Platform ||
+			utf8.RuneCountInString(target.Platform) > maxCompiledSourceRunes {
+			return nil, fmt.Errorf("fetch_plan.targets[%d].platform is invalid", i)
 		}
-		if strings.TrimSpace(source.Capability) == "" || strings.TrimSpace(source.Capability) != source.Capability ||
-			utf8.RuneCountInString(source.Capability) > maxCompiledSourceRunes {
-			return nil, fmt.Errorf("fetch_plan.sources[%d].capability is invalid", i)
+		if strings.TrimSpace(target.Capability) == "" || strings.TrimSpace(target.Capability) != target.Capability ||
+			utf8.RuneCountInString(target.Capability) > maxCompiledSourceRunes {
+			return nil, fmt.Errorf("fetch_plan.targets[%d].capability is invalid", i)
 		}
-		if strings.TrimSpace(source.Title) != source.Title ||
-			utf8.RuneCountInString(source.Title) > maxCompiledSourceRunes {
-			return nil, fmt.Errorf("fetch_plan.sources[%d].title is invalid", i)
+		if strings.TrimSpace(target.Title) != target.Title ||
+			utf8.RuneCountInString(target.Title) > maxCompiledSourceRunes {
+			return nil, fmt.Errorf("fetch_plan.targets[%d].title is invalid", i)
 		}
-		if strings.TrimSpace(source.URL) == "" || strings.TrimSpace(source.URL) != source.URL ||
-			len(source.URL) > maxCompiledSourceURLBytes {
-			return nil, fmt.Errorf("fetch_plan.sources[%d].url is invalid", i)
+		if strings.TrimSpace(target.URL) == "" || strings.TrimSpace(target.URL) != target.URL ||
+			len(target.URL) > maxCompiledSourceURLBytes {
+			return nil, fmt.Errorf("fetch_plan.targets[%d].url is invalid", i)
 		}
-		if _, duplicate := seenURLs[source.URL]; duplicate {
-			return nil, fmt.Errorf("fetch_plan.sources[%d].url is duplicated", i)
+		if _, duplicate := seenURLs[target.URL]; duplicate {
+			return nil, fmt.Errorf("fetch_plan.targets[%d].url is duplicated", i)
 		}
-		seenURLs[source.URL] = struct{}{}
-		config := source.Config
+		seenURLs[target.URL] = struct{}{}
+		config := target.Config
 		if len(bytes.TrimSpace(config)) == 0 {
 			config = json.RawMessage(`{}`)
 		}
 		canonical, err := canonicalJSONObject(config)
 		if err != nil {
-			return nil, fmt.Errorf("fetch_plan.sources[%d].config: %w", i, err)
+			return nil, fmt.Errorf("fetch_plan.targets[%d].config: %w", i, err)
 		}
-		source.Config = canonical
-		candidate := &types.Source{
-			Platform: types.Platform(source.Platform), Capability: types.Capability(source.Capability),
-			Title: source.Title, URL: source.URL, Config: source.Config,
-			Status: types.SourceStatusActive,
+		target.Config = canonical
+		if target.ToolName == "" {
+			if len(bytes.TrimSpace(target.ToolArgs)) != 0 {
+				return nil, fmt.Errorf(
+					"fetch_plan.targets[%d] has arguments without a Tool", i)
+			}
+		} else {
+			// This path also replays already-frozen operations. Canonicalize
+			// the JSON bytes without consulting today's writable registry, so
+			// a retired versioned Tool remains readable and recoverable.
+			toolArgs, err := canonicalJSONObject(target.ToolArgs)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"fetch_plan.targets[%d] Tool arguments are not an object: %w",
+					i, err)
+			}
+			target.ToolArgs = toolArgs
 		}
-		if message := sourcespec.ValidateMaterialized(candidate); message != "" {
-			return nil, fmt.Errorf("fetch_plan.sources[%d] is not materializable: %s", i, message)
+		candidate := &types.FetchTarget{
+			Platform: types.Platform(target.Platform), Capability: types.Capability(target.Capability),
+			Title: target.Title, URL: target.URL, Config: target.Config,
+			Status: types.FetchTargetStatusActive,
+		}
+		if message := acquisitiontool.ValidateMaterialized(candidate); message != "" {
+			return nil, fmt.Errorf("fetch_plan.targets[%d] is not materializable: %s", i, message)
 		}
 		if err := validateApprovedSourceNetworkBoundary(candidate); err != nil {
-			return nil, fmt.Errorf("fetch_plan.sources[%d] violates network policy: %w", i, err)
+			return nil, fmt.Errorf("fetch_plan.targets[%d] violates network policy: %w", i, err)
 		}
 	}
 	canonical, err := json.Marshal(plan)
@@ -644,7 +664,7 @@ func canonicalizeFetchPlan(raw json.RawMessage) (json.RawMessage, error) {
 	return canonical, nil
 }
 
-func validateApprovedSourceNetworkBoundary(source *types.Source) error {
+func validateApprovedSourceNetworkBoundary(source *types.FetchTarget) error {
 	var rawURL string
 	switch {
 	case source.Platform == types.PlatformWeb && source.Capability == types.CapFeed:
@@ -673,7 +693,7 @@ func validateApprovedSourceNetworkBoundary(source *types.Source) error {
 		if approvedSourceIPBlocked(ip) {
 			return errors.New("private or special-use IP addresses are forbidden")
 		}
-	} else if sourcespec.IsIPAddressLike(host) {
+	} else if acquisitiontool.IsIPAddressLike(host) {
 		return errors.New("non-canonical numeric IP addresses are forbidden")
 	}
 	return nil
@@ -738,7 +758,9 @@ func validateCompiledCheckpoint(
 	if err != nil || !bytes.Equal(canonical, op.CompiledDefinition) {
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled definition bytes are not canonical")
 	}
-	if compiled.Version != compiledDefinitionVersion || compiled.TenantID != in.TenantID ||
+	if (compiled.Version != compiledDefinitionVersionV1 &&
+		compiled.Version != compiledDefinitionVersion) ||
+		compiled.TenantID != in.TenantID ||
 		compiled.UserID != in.UserID || compiled.OperationID != in.OperationID {
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled definition scope differs")
 	}
@@ -768,7 +790,20 @@ func validateCompiledCheckpoint(
 	if err != nil || !bytes.Equal(plan, compiled.FetchPlan) {
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled fetch_plan is not canonical and valid")
 	}
-	if !bytes.Equal(compiled.FetchPlan, command.ApprovedFetchPlan) {
+	if compiled.Version == compiledDefinitionVersion {
+		var protocolPlan compiledFetchPlan
+		if err := decodeStrictJSON(plan, &protocolPlan); err != nil {
+			return compiledTaskDefinitionCheckpoint{},
+				errors.New("Source-free compiled definition Tool plan is invalid")
+		}
+		for _, target := range protocolPlan.Targets {
+			if target.ToolName == "" || len(bytes.TrimSpace(target.ToolArgs)) == 0 {
+				return compiledTaskDefinitionCheckpoint{},
+					errors.New("Source-free compiled definition is missing a Tool call")
+			}
+		}
+	}
+	if !bytes.Equal(compiled.FetchPlan, command.LegacyToolPlanV1) {
 		return compiledTaskDefinitionCheckpoint{}, errors.New("compiled fetch_plan differs from approved command")
 	}
 	materialized, err := pausedDefinitionFromCompiled(*compiled)

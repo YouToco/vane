@@ -57,10 +57,11 @@ func newCompiledTaskFixture(t *testing.T, st *Store) *compiledTaskFixture {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM task_run_snapshots WHERE tenant_id = $1`, tenantID)
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM schedules WHERE tenant_id = $1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM subscriptions WHERE tenant_id = $1`, tenantID)
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM memberships WHERE tenant_id = $1`, tenantID)
-		cleanupExec(cleanupCtx, t, st, `DELETE FROM sources WHERE url LIKE $1`, f.urlRoot+"%")
+		cleanupExec(cleanupCtx, t, st, `DELETE FROM fetch_targets WHERE url LIKE $1`, f.urlRoot+"%")
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM users WHERE id = $1`, userID)
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM tenants WHERE id = $1`, tenantID)
 	})
@@ -80,9 +81,9 @@ func (f *compiledTaskFixture) definition(
 	strictness types.PushStrictness,
 	urls ...string,
 ) types.PausedCompiledTaskDefinition {
-	sources := make([]compiledPlanSource, 0, len(urls))
+	sources := make([]compiledPlanTarget, 0, len(urls))
 	for i, sourceURL := range urls {
-		sources = append(sources, compiledPlanSource{
+		sources = append(sources, compiledPlanTarget{
 			Platform:   "web",
 			Capability: "search",
 			Title:      fmt.Sprintf("计划源 %d", i+1),
@@ -90,7 +91,7 @@ func (f *compiledTaskFixture) definition(
 			Config:     json.RawMessage(fmt.Sprintf(`{"query":"topic-%d"}`, i+1)),
 		})
 	}
-	plan, err := json.Marshal(compiledFetchPlan{Sources: sources})
+	plan, err := json.Marshal(compiledFetchPlan{Targets: sources})
 	if err != nil {
 		panic(err)
 	}
@@ -115,7 +116,7 @@ func TestValidatePausedCompiledTaskDefinition(t *testing.T) {
 		SpecJSON:        json.RawMessage(`{}`),
 		ScopeJSON:       json.RawMessage(`{}`),
 		PlaybookContent: "x",
-		FetchPlan: json.RawMessage(`{"sources":[{
+		FetchPlan: json.RawMessage(`{"targets":[{
 			"platform":"web","capability":"search","url":"vane://web/search?q=ai"
 		}]}`),
 		Strictness: "",
@@ -125,8 +126,8 @@ func TestValidatePausedCompiledTaskDefinition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("合法定义被拒绝: %v", err)
 	}
-	if len(plan.Sources) != 1 || string(plan.Sources[0].Config) != "{}" {
-		t.Fatalf("省略 config 应归一为 {}，实得 %+v", plan.Sources)
+	if len(plan.Targets) != 1 || string(plan.Targets[0].Config) != "{}" {
+		t.Fatalf("省略 config 应归一为 {}，实得 %+v", plan.Targets)
 	}
 
 	cases := []struct {
@@ -156,65 +157,65 @@ func TestValidatePausedCompiledTaskDefinition(t *testing.T) {
 		{"计划非对象", func(d *types.PausedCompiledTaskDefinition) { d.FetchPlan = json.RawMessage(`[]`) }},
 		{"sources 缺失", func(d *types.PausedCompiledTaskDefinition) { d.FetchPlan = json.RawMessage(`{}`) }},
 		{"sources null", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":null}`)
+			d.FetchPlan = json.RawMessage(`{"targets":null}`)
 		}},
 		{"sources 空", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[]}`)
+			d.FetchPlan = json.RawMessage(`{"targets":[]}`)
 		}},
 		{"sources 过多", func(d *types.PausedCompiledTaskDefinition) {
-			sources := make([]compiledPlanSource, maxCompiledTaskSources+1)
+			sources := make([]compiledPlanTarget, maxCompiledTaskTargets+1)
 			for i := range sources {
-				sources[i] = compiledPlanSource{
+				sources[i] = compiledPlanTarget{
 					Platform: "web", Capability: "feed", URL: fmt.Sprintf("vane://many/%d", i),
 				}
 			}
-			raw, err := json.Marshal(compiledFetchPlan{Sources: sources})
+			raw, err := json.Marshal(compiledFetchPlan{Targets: sources})
 			if err != nil {
 				panic(err)
 			}
 			d.FetchPlan = raw
 		}},
 		{"计划重复 sources key", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[],"sources":[]}`)
+			d.FetchPlan = json.RawMessage(`{"targets":[],"targets":[]}`)
 		}},
 		{"URL 重复", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[
+			d.FetchPlan = json.RawMessage(`{"targets":[
 				{"platform":"web","capability":"search","url":"vane://same"},
 				{"platform":"web","capability":"search","url":"vane://same"}
 			]}`)
 		}},
 		{"platform 缺失", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[
+			d.FetchPlan = json.RawMessage(`{"targets":[
 				{"capability":"search","url":"vane://one"}
 			]}`)
 		}},
 		{"capability 首尾空白", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[
+			d.FetchPlan = json.RawMessage(`{"targets":[
 				{"platform":"web","capability":" search ","url":"vane://one"}
 			]}`)
 		}},
 		{"URL 缺失", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[
+			d.FetchPlan = json.RawMessage(`{"targets":[
 				{"platform":"web","capability":"search"}
 			]}`)
 		}},
 		{"URL 首尾空白", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[
+			d.FetchPlan = json.RawMessage(`{"targets":[
 				{"platform":"web","capability":"search","url":" vane://one "}
 			]}`)
 		}},
 		{"config null", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[
+			d.FetchPlan = json.RawMessage(`{"targets":[
 				{"platform":"web","capability":"search","url":"vane://one","config":null}
 			]}`)
 		}},
 		{"config 非对象", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[
+			d.FetchPlan = json.RawMessage(`{"targets":[
 				{"platform":"web","capability":"search","url":"vane://one","config":[]}
 			]}`)
 		}},
 		{"config 嵌套重复 key", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[
+			d.FetchPlan = json.RawMessage(`{"targets":[
 				{"platform":"web","capability":"search","url":"vane://one","config":{"query":"a","query":"b"}}
 			]}`)
 		}},
@@ -243,7 +244,7 @@ func TestInsertPausedCompiledTaskDefinition_RejectsInvalidInputBeforeBegin(t *te
 		SpecJSON:        json.RawMessage(`{}`),
 		ScopeJSON:       json.RawMessage(`{}`),
 		PlaybookContent: "x",
-		FetchPlan: json.RawMessage(`{"sources":[{
+		FetchPlan: json.RawMessage(`{"targets":[{
 			"platform":"web","capability":"search","url":"vane://web/search?q=ai"
 		}]}`),
 		Strictness: types.StrictnessNormal,
@@ -260,13 +261,13 @@ func TestInsertPausedCompiledTaskDefinition_RejectsInvalidInputBeforeBegin(t *te
 			d.FetchPlan = json.RawMessage(`{}`)
 		}},
 		{"null sources", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":null}`)
+			d.FetchPlan = json.RawMessage(`{"targets":null}`)
 		}},
 		{"empty sources", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[]}`)
+			d.FetchPlan = json.RawMessage(`{"targets":[]}`)
 		}},
 		{"duplicate URL", func(d *types.PausedCompiledTaskDefinition) {
-			d.FetchPlan = json.RawMessage(`{"sources":[
+			d.FetchPlan = json.RawMessage(`{"targets":[
 				{"platform":"web","capability":"search","url":"vane://same"},
 				{"platform":"web","capability":"search","url":"vane://same"}
 			]}`)
@@ -317,6 +318,21 @@ func TestInsertPausedCompiledTaskDefinition_CanonicalizesGlobalSourceLockOrder(t
 	slices.Reverse(reversed)
 	leftDef := left.definition(left.taskID(), types.StrictnessNormal, urls...)
 	rightDef := right.definition(right.taskID(), types.StrictnessNormal, reversed...)
+	var rightPlan compiledFetchPlan
+	if err := json.Unmarshal(rightDef.FetchPlan, &rightPlan); err != nil {
+		t.Fatal(err)
+	}
+	for i := range rightPlan.Targets {
+		// The test exercises inverse lock order, not semantic conflict. Match
+		// each shared URL's acquisition config while leaving display titles free.
+		rightPlan.Targets[i].Config = json.RawMessage(
+			fmt.Sprintf(`{"query":"topic-%d"}`, len(rightPlan.Targets)-i),
+		)
+	}
+	rightDef.FetchPlan, err = json.Marshal(rightPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	go func() {
@@ -354,7 +370,7 @@ func TestInsertPausedCompiledTaskDefinition_WritesExactAggregate(t *testing.T) {
 	existingURL := f.url("existing")
 	var existingID int64
 	if err := st.pool.QueryRow(ctx,
-		`INSERT INTO sources
+		`INSERT INTO fetch_targets
 			(platform, capability, url, title, config, status,
 			 fetch_interval_seconds, next_fetch_at, last_fetched_at, fail_count)
 		 VALUES ('web', 'search', $1, '原展示名',
@@ -368,13 +384,14 @@ func TestInsertPausedCompiledTaskDefinition_WritesExactAggregate(t *testing.T) {
 
 	newURL := f.url("new")
 	def := f.definition(f.taskID(), types.StrictnessStrict, existingURL, newURL)
-	// 同 URL 携带不同 title/config；A2 必须只引用既有全局行，不能把它改成任务私有形态。
+	// 同 URL 可携带不同展示 title；抓取语义必须一致。A2 只引用既有
+	// 全局行，不能把它改成任务私有形态。
 	var plan compiledFetchPlan
 	if err := json.Unmarshal(def.FetchPlan, &plan); err != nil {
 		t.Fatal(err)
 	}
-	plan.Sources[0].Title = "不得覆写"
-	plan.Sources[0].Config = json.RawMessage(`{"query":"same"}`)
+	plan.Targets[0].Title = "不得覆写"
+	plan.Targets[0].Config = json.RawMessage(`{"lookback_days":7,"query":"same"}`)
 	def.FetchPlan, _ = json.Marshal(plan)
 
 	if err := st.InsertPausedCompiledTaskDefinition(ctx, def); err != nil {
@@ -436,7 +453,7 @@ func TestInsertPausedCompiledTaskDefinition_WritesExactAggregate(t *testing.T) {
 	if newSource.Platform != types.PlatformWeb ||
 		newSource.Capability != types.CapSearch ||
 		newSource.Title != "计划源 2" ||
-		newSource.Status != types.SourceStatusActive ||
+		newSource.Status != types.FetchTargetStatusActive ||
 		newSource.FetchIntervalSeconds != 1800 ||
 		newSource.FailCount != 0 ||
 		newSource.LastFetchedAt != nil ||
@@ -447,17 +464,41 @@ func TestInsertPausedCompiledTaskDefinition_WritesExactAggregate(t *testing.T) {
 	}
 	assertCompiledJSONEqual(t, newSource.Config, []byte(`{"query":"topic-2"}`))
 
-	var subscriptionCount int
-	if err := st.pool.QueryRow(ctx,
-		`SELECT count(*)
-		   FROM subscriptions sub
-		   JOIN sources s ON s.id = sub.source_id
-		  WHERE sub.user_id = $1 AND s.url = ANY($2::text[])`,
-		def.UserID, wantLinked).Scan(&subscriptionCount); err != nil {
-		t.Fatalf("回查 subscriptions: %v", err)
+}
+
+func TestInsertPausedCompiledTaskDefinition_RejectsURLWithDifferentAcquisitionSemantics(t *testing.T) {
+	st := tenantTestStore(t)
+	f := newCompiledTaskFixture(t, st)
+	ctx := t.Context()
+
+	targetURL := f.url("semantic-conflict")
+	if _, err := st.pool.Exec(ctx,
+		`INSERT INTO fetch_targets (platform, capability, url, title, config)
+		 VALUES ('web', 'search', $1, 'existing', '{"query":"existing"}')`,
+		targetURL,
+	); err != nil {
+		t.Fatal(err)
 	}
-	if subscriptionCount != 0 {
-		t.Errorf("A2 材料化源不得创建 subscriptions，实得 %d", subscriptionCount)
+	def := f.definition(f.taskID(), types.StrictnessStrict, targetURL)
+	var plan compiledFetchPlan
+	if err := json.Unmarshal(def.FetchPlan, &plan); err != nil {
+		t.Fatal(err)
+	}
+	plan.Targets[0].Config = json.RawMessage(`{"query":"different"}`)
+	def.FetchPlan, _ = json.Marshal(plan)
+
+	err := st.InsertPausedCompiledTaskDefinition(ctx, def)
+	if !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("同 URL 不同抓取语义应 fail closed: %v", err)
+	}
+	var count int
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM schedules WHERE id=$1`, def.TaskID,
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("语义冲突后不应留下半写任务")
 	}
 }
 
@@ -662,13 +703,14 @@ func TestInsertPausedCompiledTaskDefinition_AllFailuresRollback(t *testing.T) {
 		{name: "membership query", failContains: "FROM memberships m", expectedError: types.ErrDatabase},
 		{name: "schedule insert", failContains: "INSERT INTO schedules", expectedError: types.ErrDatabase},
 		{name: "playbook insert", failContains: "INSERT INTO schedule_playbooks", expectedError: types.ErrDatabase},
-		{name: "source insert", failContains: "INSERT INTO sources", expectedError: types.ErrDatabase},
+		{name: "source insert", failContains: "INSERT INTO fetch_targets", expectedError: types.ErrDatabase},
 		{
-			name: "existing source lookup", failContains: "SELECT id FROM sources",
+			name:            "existing source lookup",
+			failContains:    "SELECT id, platform, capability, config",
 			precreateSource: true, expectedExisting: 1, expectedError: types.ErrDatabase,
 		},
 		{
-			name: "schedule source link", failContains: "INSERT INTO schedule_sources",
+			name: "schedule source link", failContains: "INSERT INTO task_fetch_targets",
 			expectedError: types.ErrDatabase,
 		},
 		{
@@ -676,7 +718,7 @@ func TestInsertPausedCompiledTaskDefinition_AllFailuresRollback(t *testing.T) {
 			expectedError: types.ErrDatabase,
 		},
 		{
-			name: "plan-link mismatch", skipContains: "INSERT INTO schedule_sources",
+			name: "plan-link mismatch", skipContains: "INSERT INTO task_fetch_targets",
 			expectedError: types.ErrInternal,
 		},
 		{name: "commit", commitErr: errInjectedCompiledTask, expectedError: types.ErrDatabase},
@@ -688,8 +730,8 @@ func TestInsertPausedCompiledTaskDefinition_AllFailuresRollback(t *testing.T) {
 			sourceURL := f.url("rollback")
 			if tc.precreateSource {
 				if _, err := st.pool.Exec(ctx,
-					`INSERT INTO sources (platform, capability, url, title, config)
-					 VALUES ('web', 'search', $1, '既有', '{}')`,
+					`INSERT INTO fetch_targets (platform, capability, url, title, config)
+					 VALUES ('web', 'search', $1, '既有', '{"query":"topic-1"}')`,
 					sourceURL); err != nil {
 					t.Fatalf("预置 existing source: %v", err)
 				}
@@ -880,8 +922,8 @@ func linkedSourceURLs(t *testing.T, st *Store, taskID string) []string {
 	t.Helper()
 	rows, err := st.pool.Query(t.Context(),
 		`SELECT s.url
-		   FROM schedule_sources ss
-		   JOIN sources s ON s.id = ss.source_id
+		   FROM task_fetch_targets ss
+		   JOIN fetch_targets s ON s.id = ss.fetch_target_id
 		  WHERE ss.schedule_id = $1
 		  ORDER BY s.url`,
 		taskID)
@@ -903,22 +945,22 @@ func linkedSourceURLs(t *testing.T, st *Store, taskID string) []string {
 	return urls
 }
 
-func sourceByID(t *testing.T, st *Store, sourceID int64) types.Source {
+func sourceByID(t *testing.T, st *Store, sourceID int64) types.FetchTarget {
 	t.Helper()
-	var source types.Source
-	if err := scanSource(st.pool.QueryRow(t.Context(),
-		`SELECT `+sourceColumns+` FROM sources s WHERE s.id = $1`,
+	var source types.FetchTarget
+	if err := scanFetchTarget(st.pool.QueryRow(t.Context(),
+		`SELECT `+fetchTargetColumns+` FROM fetch_targets s WHERE s.id = $1`,
 		sourceID), &source); err != nil {
 		t.Fatalf("按 id 回查 source: %v", err)
 	}
 	return source
 }
 
-func sourceByURL(t *testing.T, st *Store, sourceURL string) types.Source {
+func sourceByURL(t *testing.T, st *Store, sourceURL string) types.FetchTarget {
 	t.Helper()
-	var source types.Source
-	if err := scanSource(st.pool.QueryRow(t.Context(),
-		`SELECT `+sourceColumns+` FROM sources s WHERE s.url = $1`,
+	var source types.FetchTarget
+	if err := scanFetchTarget(st.pool.QueryRow(t.Context(),
+		`SELECT `+fetchTargetColumns+` FROM fetch_targets s WHERE s.url = $1`,
 		sourceURL), &source); err != nil {
 		t.Fatalf("按 URL 回查 source: %v", err)
 	}
@@ -931,8 +973,8 @@ func planURLs(t *testing.T, raw json.RawMessage) []string {
 	if err := json.Unmarshal(raw, &plan); err != nil {
 		t.Fatalf("解析测试 fetch_plan: %v", err)
 	}
-	urls := make([]string, 0, len(plan.Sources))
-	for _, src := range plan.Sources {
+	urls := make([]string, 0, len(plan.Targets))
+	for _, src := range plan.Targets {
 		urls = append(urls, src.URL)
 	}
 	return urls
@@ -943,7 +985,7 @@ func assertNoCompiledTaskAggregate(t *testing.T, st *Store, taskID string) {
 	for table, column := range map[string]string{
 		"schedules":                         "id",
 		"schedule_playbooks":                "schedule_id",
-		"schedule_sources":                  "schedule_id",
+		"task_fetch_targets":                "schedule_id",
 		"task_approved_definition_versions": "task_id",
 	} {
 		var count int
@@ -961,7 +1003,7 @@ func assertSourceURLCount(t *testing.T, st *Store, urls []string, want int) {
 	t.Helper()
 	var count int
 	if err := st.pool.QueryRow(t.Context(),
-		`SELECT count(*) FROM sources WHERE url = ANY($1::text[])`,
+		`SELECT count(*) FROM fetch_targets WHERE url = ANY($1::text[])`,
 		urls).Scan(&count); err != nil {
 		t.Fatalf("回查 source URL: %v", err)
 	}

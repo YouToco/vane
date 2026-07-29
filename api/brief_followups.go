@@ -578,10 +578,6 @@ func (s *server) handleBriefFollowup(
 		writeBriefFollowupAppErrorV1(w, err)
 		return
 	}
-	if outcome.Confirm != nil {
-		writeError(w, http.StatusConflict, "简报追问仅支持只读回答")
-		return
-	}
 	writeJSON(w, http.StatusOK, map[string]string{"reply": outcome.Reply})
 }
 

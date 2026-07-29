@@ -151,6 +151,10 @@ type taskRunSnapshotReferenceV1 struct {
 }
 
 func (s *taskRunSnapshot) safeRef() (types.RunSnapshotRef, error) {
+	return s.safeRefV1()
+}
+
+func (s *taskRunSnapshot) safeRefV1() (types.RunSnapshotRef, error) {
 	if s == nil || s.ReferenceSchemaVersion != taskRunReferenceSchemaVersionV1 {
 		return types.RunSnapshotRef{}, taskRunIntegrityError()
 	}

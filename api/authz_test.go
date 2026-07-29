@@ -27,9 +27,6 @@ type spyScheduler struct {
 func (s *spyScheduler) CreatePush(context.Context, int64, scheduler.ScheduleSpec, workflow.PushScope, string) (string, error) {
 	return "sched-x", nil
 }
-func (s *spyScheduler) PushNow(context.Context, int64, workflow.PushScope) (string, error) {
-	return "run-x", nil
-}
 func (s *spyScheduler) UpdatePush(_ context.Context, id string, _ int64, _ scheduler.ScheduleSpec, _ *string) error {
 	s.updated = id
 	return nil
@@ -105,34 +102,4 @@ func TestAuthz_ScheduleOwnershipIsChecked(t *testing.T) {
 			t.Fatal("会话有效却被拒，脚手架有问题")
 		}
 	})
-}
-
-// TestAuthz_NoHandlerFallsBackToGlobalOwner 是不变量 I-A1 在 HTTP 层的守卫：
-// 所有 handler 的 userID 都必须来自会话 principal，不得有任何「全局 owner」回退。
-//
-// 判据：以 user 12345 登录后，凡是把 userID 透传给依赖的端点，
-// 拿到的都必须是 12345——若某个 handler 仍走 owner 回退，这里会看到别的值。
-func TestAuthz_NoHandlerFallsBackToGlobalOwner(t *testing.T) {
-	var gotUserID int64 = -1
-	sched := &userIDCapturingScheduler{onPushNow: func(uid int64) { gotUserID = uid }}
-	mux, cookie := authzMux(t, 12345, 12345, sched)
-
-	r := httptest.NewRequest(http.MethodPost, "/api/push/now", strings.NewReader(`{}`))
-	r.AddCookie(cookie)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, r)
-
-	if gotUserID != 12345 {
-		t.Errorf("handler 传下去的 userID = %d，期望会话里的 12345 —— 疑似仍走全局 owner 回退", gotUserID)
-	}
-}
-
-type userIDCapturingScheduler struct {
-	spyScheduler
-	onPushNow func(int64)
-}
-
-func (s *userIDCapturingScheduler) PushNow(_ context.Context, userID int64, _ workflow.PushScope) (string, error) {
-	s.onPushNow(userID)
-	return "run-x", nil
 }

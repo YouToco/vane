@@ -22,9 +22,9 @@ func TestRetainedReaderMirrorsFrozenSourceLayouts(t *testing.T) {
 		retained  any
 		authority any
 	}{
-		{"proposal", definitioneditwire.ProposalV1{}, task.TaskDefinitionEditProposalV1{}},
-		{"proposal actor", definitioneditwire.ProposalActorV1{}, task.TaskDefinitionEditProposalActorV1{}},
-		{"proposal target", definitioneditwire.ProposalTargetV1{}, task.TaskDefinitionEditProposalTargetV1{}},
+		{"proposal", definitioneditwire.ProposalV2{}, task.TaskDefinitionEditProposalV2{}},
+		{"proposal actor", definitioneditwire.ProposalActorV2{}, task.TaskDefinitionEditProposalActorV2{}},
+		{"proposal target", definitioneditwire.ProposalTargetV2{}, task.TaskDefinitionEditProposalTargetV2{}},
 		{"head", definitioneditwire.HeadV1{}, scheduler.TaskDefinitionEditHead{}},
 		{"schedule spec", definitioneditwire.ScheduleSpecV1{}, scheduler.ScheduleSpec{}},
 		{"prepared edit", definitioneditwire.PreparedEditV1{}, scheduler.PreparedTaskDefinitionEdit{}},

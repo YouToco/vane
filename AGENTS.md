@@ -7,7 +7,9 @@
 
 - 分支/提交/PR 规范：[docs/git-workflow.md](docs/git-workflow.md)（trunk-based、squash merge、Conventional Commits）
 - 内容身份与去重：[docs/content-identity-contract.md](docs/content-identity-contract.md)（身份是 canonical_key，不是 external_id）
-- M4 agent loop 契约：[docs/m4-agent-contract.md](docs/m4-agent-contract.md)（工具、确认卡、回调链路）
+- M4 agent loop 历史契约：[docs/m4-agent-contract.md](docs/m4-agent-contract.md)（冻结 v1 读协议）
+- 当前任务/Tool 运行契约：[docs/task-manual-tool-runtime.md](docs/task-manual-tool-runtime.md)
+- 任务 Tool 调用隔离迁移：[docs/task-tool-invocation-isolation.md](docs/task-tool-invocation-isolation.md)
 - M5 画像+反馈闭环契约：[docs/m5-profile-contract.md](docs/m5-profile-contract.md)（17 节签名级；第 16 节是 Gate 验证清单）
 - 双轨 Agent Runtime：[docs/agent-runtime-contract.md](docs/agent-runtime-contract.md)（ExecutionMode、运行快照、PlanFetch、预算与发布列车）
 - Phase 2 结构化 Insight：[docs/structured-insight-contract.md](docs/structured-insight-contract.md)（单次 CardGen、引用校验、Brief 冻结、Temporal/rollout 边界）
@@ -27,7 +29,7 @@
 1. **DeepSeek V4 结构化输出必须 `thinking: disabled`** — 默认 reasoning 吃光小 max_tokens 预算致 content 恒空，曾造成三批假 50 分静默照推（M3 事故）。
 2. **Temporal `ExecuteWorkflow` 对运行中同 ID workflow 默认静默 attach 不报错** — 需显式 `WorkflowExecutionErrorWhenAlreadyStarted: true`（M4 Gate ⑦ 假"已触发"事故）。
 3. **错误卫生**：原始 error 链（可能含连接串、Temporal 服务端原文）不得喂进模型上下文或用户文案，只落 `AppError.Message`。
-4. **卡片回调路径的动作必须回写 agent 会话**（`[卡片回调]` user 消息），否则模型对已处理动作产生状态幻觉。
+4. **任务写操作只走 Prepare → Execute → Agent 会话回执**；不得重新引入确认卡、轮询确认资源或通用 pending action。历史 `[卡片回调]` 只能由只读兼容层解释。
 5. **数据是资产不清理**：内容表无 TTL，不要加"过期清理"逻辑。
 6. **查 VPS 日志**：`journalctl --since` 按主机本地时区（EDT）解释，DB 是 UTC，北京时间差 12 小时——先 `date` 核对再查；"grep 计数为 0"下结论前先用已知存在的记录验证查询窗口。
 7. **核对 DB 行数只认 `count(*)`，不认 `pg_stat_user_tables.n_live_tup`** — 后者是 autovacuum 维护的估算值，会谎报：#28 验证测试库残留时它报 `users=1`，实际为 0。与第 6 条同源——计数类结论落地前先验证来源本身可信。
@@ -44,7 +46,7 @@
 | 等级 | 适用范围 | 必需 Gate | 默认不做 |
 |---|---|---|---|
 | **S：安全/一致性关键** | migration/RLS/租户与权限、鉴权、配额计费；Temporal lease/fence/recovery；outbox/幂等/跨系统事务；确认后执行不可逆副作用 | 受影响包 + 全仓 race；相关时真 PG/Temporal 故障测试；直接证明不变量的最小 mutation；两名不同视角独立审查；完整 CI；部署探针与对应生产 Gate | 第三名及更多审查者，除非前两名存在未解决分歧或已确认 HIGH |
-| **A：核心产品行为** | Agent 工具路由、模型协议与 prompt；任务 proposal/编辑；sourcespec；打分、推送、反馈等可恢复业务行为 | 受影响包定向 race；至少一条行为级集成/replay 测试；一名独立审查者；合并前全仓 CI 一次；用户可见变化做一次针对性 smoke | 多轮 mutation、双终审、真故障矩阵、完整生产 Gate，除非测试或首轮审查给出具体高风险证据 |
+| **A：核心产品行为** | Agent 工具路由、模型协议与 prompt；任务 prepare/编辑；acquisition Tool；打分、推送、反馈等可恢复业务行为 | 受影响包定向 race；至少一条行为级集成/replay 测试；一名独立审查者；合并前全仓 CI 一次；用户可见变化做一次针对性 smoke | 多轮 mutation、双终审、真故障矩阵、完整生产 Gate，除非测试或首轮审查给出具体高风险证据 |
 | **B：低风险** | UI 样式/文案/i18n、文档、测试夹具、生成物、已证明不改行为的局部重构 | 相关单测、lint 或 build；一次自审或普通 review | 真 DB/Temporal、mutation、多 agent 审查、全套生产 Gate |
 
 ### 收口与停止规则

@@ -1,5 +1,5 @@
 // 绑定引擎（endpoint-binding-contract.md）：把「TikHub 注册表端点 + 声明式字段映射」
-// 执行成一个订阅信源抓取器。它取代了逐端点手写 HTTP/信封/映射的 bespoke fetcher
+// 执行成一个任务抓取目标执行器。它取代了逐端点手写 HTTP/信封/映射的 bespoke fetcher
 // （原 tikhub.go / xhs_user.go / x.go，2026-07-18 删除），三份重复的请求装配与错误
 // 分类收敛到 tikhubinvoke + 本文件各一份。
 //
@@ -57,7 +57,7 @@ type bindingSpec struct {
 	// TimeoutSeconds 单端点调用超时覆盖（0=用 cfg/兜底 20s）。wechat_mp 官方文档明示
 	// 「请将 timeout 设置为 30 秒；设置过小会造成已扣费但收不到响应」——按次计费面
 	// 超时即白花钱，此字段是把上游的超时契约声明进模板（契约 §1 特性清单 2026-07-23 增补）。
-	// 已知取舍：本值只能**收紧**外层 ctx、不能放宽——add_source 试跑受飞书卡片执行
+	// 已知取舍：本值只能**收紧**外层 ctx、不能放宽——任务抓取受上层执行
 	// 预算约束（agent probeBudget=25s），wechat_mp 的 probe 实际上限 25s，超时可能已扣费
 	// （probe 话术已如实告知）；周期抓取（Fetch activity 120s）不受此限，30s 完整生效。
 	TimeoutSeconds int
@@ -158,9 +158,10 @@ type bindingKey struct {
 
 var xhsEnvelope = []envelopeCheck{{Path: "code", Want: "200"}, {Path: "data.success", Want: "true"}}
 
-// bindingTemplates 是全部绑定能力的唯一事实来源。CI 不变量（契约 §8.1）：
-// 每个模板的 Endpoint（含 Enrich.Endpoint）必须在 tikhubcatalog 里 Lookup 命中。
-var bindingTemplates = map[bindingKey]bindingSpec{
+// bindingTemplatesV1 is the retained fetcher.binding/v1 response contract.
+// Existing entries are immutable; a semantic change adds a V2 implementation
+// and keeps this map for snapshots already sealed to V1.
+var bindingTemplatesV1 = map[bindingKey]bindingSpec{
 	// ── 迁移自 fetcher/tikhub.go（2026-07-14 实测契约见 git 史该文件头注）──
 	// desc 上游截 60 rune，详情补全是把「证据不足→模型编造」从根上消灭的唯一手段，
 	// 代价按次计费，故有 SeenChecker 闸门只为新笔记付费。
@@ -347,7 +348,7 @@ var bindingTemplates = map[bindingKey]bindingSpec{
 		Unwrap: []string{"retweeted_status"},
 		Fields: bindingFields{
 			ID:      []string{"mblogid"},
-			Title:   nil, // 微博无标题（x 同款）
+			Title:   nil,                  // 微博无标题（x 同款）
 			Content: []string{"text_raw"}, // 纯文本；text 是 HTML，不用
 			Author:  []string{"user.screen_name"},
 			// 桌面权威链接需要 uid+mblogid 双段；{user.idstr} 是字段占位符（拆包后
@@ -421,7 +422,7 @@ var bindingTemplates = map[bindingKey]bindingSpec{
 // IsBindingBacked 报告 (platform, capability) 是否由绑定引擎承载
 // （agent 的试跑准入只对绑定能力生效，rss/exa 路径行为不变）。
 func IsBindingBacked(p types.Platform, c types.Capability) bool {
-	_, ok := bindingTemplates[bindingKey{p, c}]
+	_, ok := bindingTemplatesV1[bindingKey{p, c}]
 	return ok
 }
 
@@ -554,7 +555,7 @@ func NewBinding(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorde
 	// 真实预算在 callAndDecode 由 ctx 控制（默认 timeout，模板声明了 TimeoutSeconds
 	// 用声明值）。不抬的话模板级 30s 声明会被 client 级 20s 抢先掐断。
 	clientTimeout := timeout
-	for _, spec := range bindingTemplates {
+	for _, spec := range bindingTemplatesV1 {
 		if d := time.Duration(spec.TimeoutSeconds) * time.Second; d > clientTimeout {
 			clientTimeout = d
 		}
@@ -579,103 +580,95 @@ func NewBinding(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorde
 }
 
 // Fetch 实现订阅信源抓取（workflow.Fetcher 分派到此）。
-func (b *BindingFetcher) Fetch(ctx context.Context, src types.Source) ([]types.ContentItem, error) {
+func (b *BindingFetcher) Fetch(ctx context.Context, src types.FetchTarget) ([]types.ContentItem, error) {
 	return b.fetchWithEffectGate(ctx, src, nil)
 }
 
 func (b *BindingFetcher) fetchWithEffectGate(
 	ctx context.Context,
-	src types.Source,
+	src types.FetchTarget,
 	beforeEffect func(context.Context) error,
 ) ([]types.ContentItem, error) {
-	items, _, err := b.run(ctx, src, false, beforeEffect)
-	return items, err
-}
-
-// ProbeReport 是试跑结果摘要（进确认回执，用户看得见首批统计——契约 §2.2）。
-type ProbeReport struct {
-	Extracted       int        // 提取并通过身份校验的条目数
-	IdentityMissing int        // 身份字段为空被丢弃的条目数（契约 §2.2 计数项）
-	Newest          *time.Time // 最新一条时间（模板无 Time 时为 nil）
-	SampleTitles    []string   // 标题样例（≤3，可能为空串列表——推文无标题）
-}
-
-// ProbeRejection 标记「给用户看的准入拒绝」（红线 3 的实现载体，对抗审查 HIGH-3）：
-// 只有带此标记的错误，其 Message 才允许原样进用户/模型面；其余错误（漂移/网络/
-// 鉴权——内嵌端点名、上游 body、内部 id）一律由调用方按错误码映射固定话术，
-// 原文只进 slog 与 tool_calls。errors.Is/As 经 Unwrap 照常穿透。
-type ProbeRejection struct{ AE *types.AppError }
-
-func (p *ProbeRejection) Error() string { return p.AE.Error() }
-func (p *ProbeRejection) Unwrap() error { return p.AE }
-
-func probeReject(msg string) error {
-	return &ProbeRejection{AE: types.NewAppError(types.CodeValidation, msg, nil)}
-}
-
-// Probe 试跑一次绑定源（真调上游，计费且记账）。任何准入检查不过都返回
-// CodeValidation 且不落任何库行；错误 Message 是给用户看的人话（红线 3）。
-// probe 跳过 enrich：准入判定不需要全文，没必要为未落库的内容付详情费。
-func (b *BindingFetcher) Probe(ctx context.Context, src types.Source) (*ProbeReport, error) {
-	_, report, err := b.run(ctx, src, true, nil)
-	return report, err
+	return b.run(ctx, src, beforeEffect)
 }
 
 func (b *BindingFetcher) run(
 	ctx context.Context,
-	src types.Source,
-	probe bool,
+	src types.FetchTarget,
 	beforeEffect func(context.Context) error,
-) ([]types.ContentItem, *ProbeReport, error) {
-	spec, ok := bindingTemplates[bindingKey{src.Platform, src.Capability}]
+) ([]types.ContentItem, error) {
+	spec, ok := bindingTemplatesV1[bindingKey{src.Platform, src.Capability}]
 	if !ok {
 		// Multi 只对模板里有的能力分派到此；走到这里是装配漂移，不是数据问题。
-		return nil, nil, types.NewAppError(types.CodeInternal,
+		return nil, types.NewAppError(types.CodeInternal,
 			fmt.Sprintf("能力 %q/%q 无绑定模板（装配漂移，source_id=%d）", src.Platform, src.Capability, src.ID), nil)
 	}
-	if !b.apiKeySet {
-		return nil, nil, types.NewAppError(types.CodeValidation,
-			"TikHub 信源需要配置 VANE_FETCH_TIKHUB_API_KEY，当前为空", nil)
-	}
-
 	// 反漂移防线 1：端点每轮对注册表校验（契约 §3.1/§3.2）。
 	entry, ok := tikhubcatalog.Lookup(spec.Endpoint)
 	if !ok {
-		return nil, nil, types.NewAppError(types.CodeValidation,
+		return nil, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("绑定失效：端点 %s 已从注册表移除（re-gen 漂移，source_id=%d）", spec.Endpoint, src.ID), nil)
 	}
+	var enrichEntry *tikhubcatalog.Entry
+	if spec.Enrich != nil {
+		if resolved, found := tikhubcatalog.Lookup(spec.Enrich.Endpoint); found {
+			enrichEntry = &resolved
+		}
+	}
+	return b.runResolved(
+		ctx, src, spec, entry, enrichEntry, beforeEffect)
+}
 
+// fetchWithRetainedRouteV1 executes an exact binding template and transport
+// entry retained by fetcher.binding/v1. It never consults bindingTemplatesV1
+// or the current generated TikHub catalog.
+func (b *BindingFetcher) fetchWithRetainedRouteV1(
+	ctx context.Context,
+	src types.FetchTarget,
+	spec bindingSpec,
+	entry tikhubcatalog.Entry,
+	enrichEntry *tikhubcatalog.Entry,
+	beforeEffect func(context.Context) error,
+) ([]types.ContentItem, error) {
+	return b.runResolved(
+		ctx, src, spec, entry, enrichEntry, beforeEffect)
+}
+
+func (b *BindingFetcher) runResolved(
+	ctx context.Context,
+	src types.FetchTarget,
+	spec bindingSpec,
+	entry tikhubcatalog.Entry,
+	enrichEntry *tikhubcatalog.Entry,
+	beforeEffect func(context.Context) error,
+) ([]types.ContentItem, error) {
+	if !b.apiKeySet {
+		return nil, types.NewAppError(types.CodeValidation,
+			"TikHub 信源需要配置 VANE_FETCH_TIKHUB_API_KEY，当前为空", nil)
+	}
 	cfgMap, err := decodeConfigMap(src.Config)
 	if err != nil {
-		return nil, nil, types.NewAppError(types.CodeValidation,
+		return nil, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("解析信源 config 失败（source_id=%d）", src.ID), err)
 	}
 	params, err := resolveParams(spec.Params, cfgMap, src)
 	if err != nil {
-		// 缺参数的话术本就是给人看的（「信源缺少必填参数 user_id」）——probe 面
-		// 标记为可透出（其余错误在 probe 面一律映射固定话术，见 ProbeRejection）。
-		if probe {
-			var ae *types.AppError
-			if errors.As(err, &ae) {
-				err = &ProbeRejection{AE: ae}
-			}
-		}
-		return nil, nil, err
+		return nil, err
 	}
 	if err := validateAgainstEntry(entry, params, src); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	root, err := b.callAndDecode(
 		ctx, entry, params, spec.Envelope, spec.MsgPath, src, beforeEffect, b.specTimeout(spec))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// 反漂移防线 2：条目数组必须解析得到（契约 §3.5）。
 	rawItems, ok := resolveList(root, spec.ItemsPath)
 	if !ok {
-		return nil, nil, types.NewAppError(types.CodeValidation,
+		return nil, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("响应结构漂移：路径 %q 不是数组（endpoint=%s，source_id=%d）",
 				spec.ItemsPath, spec.Endpoint, src.ID), nil)
 	}
@@ -803,7 +796,7 @@ func (b *BindingFetcher) run(
 	// **只有** ItemFilter 挡掉的不算（一屏全是广告位是多态流的合法形态）；
 	// rootMisses/identityMissing 都是漂移证据，必须触发防线而非豁免。
 	if len(rawItems) > 0 && len(cands) == 0 && filtered < len(rawItems) {
-		return nil, nil, types.NewAppError(types.CodeValidation,
+		return nil, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("条目全部无法提取（%d 条：下钻失败 %d、身份缺失 %d，endpoint=%s，source_id=%d）——疑似响应结构漂移",
 				len(rawItems), rootMisses, identityMissing, spec.Endpoint, src.ID), nil)
 	}
@@ -819,17 +812,10 @@ func (b *BindingFetcher) run(
 			"source_id", src.ID, "endpoint", spec.Endpoint, "identity_missing", identityMissing)
 	}
 	if len(spec.Fields.Time) > 0 && len(cands) > 0 && timeFailures == len(cands) {
-		return nil, nil, types.NewAppError(types.CodeValidation,
+		return nil, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("时间字段 %q 全部解析失败（格式 %s，endpoint=%s，source_id=%d）——疑似响应结构漂移",
 				spec.Fields.Time[0], spec.Fields.TimeFormat, spec.Endpoint, src.ID), nil)
 	}
-	if probe {
-		report, err := buildProbeReport(spec, len(cands), identityMissing, func(i int) (*time.Time, string) {
-			return cands[i].item.PublishedAt, cands[i].item.Title
-		})
-		return nil, report, err
-	}
-
 	// 运行期时序断言（契约 §4 表第 4 行，对抗审查 HIGH-2）：OrderCheck 模板的
 	// sort=time 语义承诺降序；准入后上游排序腐坏（x/search 教训本尊：probe 单次
 	// 全绿、多轮才暴露）唯一可检面就是每轮这条——失败走 fail_count 告警链。
@@ -842,7 +828,7 @@ func (b *BindingFetcher) run(
 				continue
 			}
 			if prev != nil && t.After(*prev) {
-				return nil, nil, types.NewAppError(types.CodeValidation,
+				return nil, types.NewAppError(types.CodeValidation,
 					fmt.Sprintf("条目时间序列非降序（endpoint=%s，source_id=%d）——上游排序疑似腐坏，无法继续追新",
 						spec.Endpoint, src.ID), nil)
 			}
@@ -861,8 +847,11 @@ func (b *BindingFetcher) run(
 			ids[i] = cands[i].id
 			raws[i] = cands[i].raw
 		}
-		if err := b.enrich(ctx, src, spec.Enrich, ids, raws, contents, beforeEffect); err != nil {
-			return nil, nil, err
+		if err := b.enrich(
+			ctx, src, spec.Enrich, enrichEntry,
+			ids, raws, contents, beforeEffect,
+		); err != nil {
+			return nil, err
 		}
 	}
 
@@ -885,40 +874,7 @@ func (b *BindingFetcher) run(
 	slog.Info("binding: 抓取完成",
 		"source_id", src.ID, "endpoint", spec.Endpoint,
 		"raw_count", len(rawItems), "items_count", len(out), "filtered", filtered)
-	return out, nil, nil
-}
-
-// buildProbeReport 执行准入检查并汇总试跑摘要（契约 §2.2）。
-// 拒绝一律走 probeReject（用户话术，可透出）；不含端点名/上游原文。
-func buildProbeReport(spec bindingSpec, n, identityMissing int, get func(int) (*time.Time, string)) (*ProbeReport, error) {
-	if n == 0 {
-		return nil, probeReject(
-			"试跑返回 0 条内容：请检查参数是否正确（话题 page_id / 用户 user_id），或目标（如收藏列表）可能未公开")
-	}
-	report := &ProbeReport{Extracted: n, IdentityMissing: identityMissing}
-	var prev *time.Time
-	orderOK := true
-	for i := 0; i < n; i++ {
-		t, title := get(i)
-		if len(report.SampleTitles) < 3 && strings.TrimSpace(title) != "" {
-			report.SampleTitles = append(report.SampleTitles, title)
-		}
-		if t != nil {
-			if report.Newest == nil || t.After(*report.Newest) {
-				report.Newest = t
-			}
-			if prev != nil && t.After(*prev) {
-				orderOK = false
-			}
-			prev = t
-		}
-	}
-	if spec.OrderCheck && !orderOK {
-		// x/search 教训：端点 200、条目像样，但时序乱掉的源做不了追新——
-		// 单次试跑对顺序病唯一可检的就是这条，检不过宁可拒。
-		return nil, probeReject("试跑内容的时间序列不是降序，该端点当前不适合做追新订阅（上游排序异常）")
-	}
-	return report, nil
+	return out, nil
 }
 
 // specTimeout 取本次调用的 ctx 预算：模板声明了 TimeoutSeconds 用声明值，否则用默认。
@@ -938,7 +894,7 @@ func (b *BindingFetcher) callAndDecode(
 	params map[string]any,
 	checks []envelopeCheck,
 	msgPath string,
-	src types.Source,
+	src types.FetchTarget,
 	beforeEffect func(context.Context) error,
 	timeout time.Duration,
 ) (any, error) {
@@ -1020,7 +976,7 @@ func (b *BindingFetcher) callAndDecode(
 // 两处加固（对抗审查 parity-7 / cs-13）：
 //   - WithoutCancel：超时/取消的调用恰恰最该记账，不能因业务 ctx 已死而丢行；
 //   - 参数净化：config 值可能带 NUL（Postgres JSONB 拒收 \x00），落库前剥离。
-func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, params map[string]any, res *tikhubinvoke.Result, callErr error, src types.Source) {
+func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, params map[string]any, res *tikhubinvoke.Result, callErr error, src types.FetchTarget) {
 	if b.rec == nil {
 		return
 	}
@@ -1036,7 +992,6 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 		}
 	}
 	args, _ := json.Marshal(clean)
-	srcID := src.ID
 	rec := &types.ToolCall{
 		TraceID:      trace,
 		TenantID:     tenantID,
@@ -1045,7 +1000,10 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 		ToolKind:     types.ToolCallKindBindingFetch,
 		EndpointPath: entry.Path,
 		Arguments:    args,
-		SourceID:     &srcID,
+	}
+	if src.ID > 0 {
+		srcID := src.ID
+		rec.SourceID = &srcID
 	}
 	if res != nil {
 		status := res.Status
@@ -1081,8 +1039,9 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 // 撤权被误当成一条可吞的详情失败后继续调用后续付费端点。
 func (b *BindingFetcher) enrich(
 	ctx context.Context,
-	src types.Source,
+	src types.FetchTarget,
 	es *enrichSpec,
+	retainedEntry *tikhubcatalog.Entry,
 	ids []string,
 	raws []any,
 	contents []*string,
@@ -1091,12 +1050,12 @@ func (b *BindingFetcher) enrich(
 	if b.seen == nil {
 		return nil // 无从判断新旧就不补：宁可不补，也不为一库老笔记重复付费。
 	}
-	entry, ok := tikhubcatalog.Lookup(es.Endpoint)
-	if !ok {
+	if retainedEntry == nil {
 		slog.Warn("binding: 详情端点已从注册表移除，跳过本轮补全",
 			"source_id", src.ID, "endpoint", es.Endpoint)
 		return nil
 	}
+	entry := *retainedEntry
 	// 与主调用同一道反漂移防线（契约 §3.6「同样每轮 Lookup + 参数校验」）：
 	// re-gen 改了详情端点参数名时显式跳过（降级不失败），而不是静默丢参白花钱。
 	nameProbe := map[string]any{es.KeyParam: ""}
@@ -1207,7 +1166,7 @@ func (b *BindingFetcher) waitDetailSlot(ctx context.Context, interval time.Durat
 // （补全尽力而为，重试只会加剧限流并翻倍成本）。
 func (b *BindingFetcher) fetchDetail(
 	ctx context.Context,
-	src types.Source,
+	src types.FetchTarget,
 	entry tikhubcatalog.Entry,
 	es *enrichSpec,
 	id string,
@@ -1263,7 +1222,7 @@ func decodeConfigMap(raw json.RawMessage) (map[string]string, error) {
 	return out, nil
 }
 
-func resolveParams(specs []bindingParam, cfg map[string]string, src types.Source) (map[string]any, error) {
+func resolveParams(specs []bindingParam, cfg map[string]string, src types.FetchTarget) (map[string]any, error) {
 	out := map[string]any{}
 	for _, p := range specs {
 		var val string
@@ -1290,7 +1249,7 @@ func resolveParams(specs []bindingParam, cfg map[string]string, src types.Source
 // validateAgainstEntry 按**当前**注册表 Entry 校验参数（契约 §3.2，反漂移防线）：
 // 发送的参数必须都在 Entry.Params 里（防 buildRequest 静默丢参 → 200 但数据错误），
 // Entry 的必填参数必须都在发送集里。
-func validateAgainstEntry(entry tikhubcatalog.Entry, params map[string]any, src types.Source) error {
+func validateAgainstEntry(entry tikhubcatalog.Entry, params map[string]any, src types.FetchTarget) error {
 	known := map[string]bool{}
 	for _, p := range entry.Params {
 		known[p.Name] = true

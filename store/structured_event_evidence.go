@@ -128,7 +128,8 @@ func (s *Store) LoadStructuredEventEvidenceForTaskRunV1(
 		       FROM unnest($1::bigint[]) WITH ORDINALITY
 		            AS input(content_item_id, ordinal)
 		 )
-		 SELECT ci.id, ci.source_id, ci.external_id, ci.canonical_key,
+		 SELECT ci.id, COALESCE(ci.source_id, matched.source_id) AS source_id,
+		        ci.external_id, ci.canonical_key,
 		        ci.url, ci.title, ci.content, ci.author, ci.published_at,
 		        ci.content_hash, ci.simhash, ci.fetched_at, ci.created_at,
 		        ci.kind, matched.source_id

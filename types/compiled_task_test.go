@@ -13,7 +13,7 @@ func TestDigestPausedCompiledTaskDefinition_StableAndComplete(t *testing.T) {
 		ScopeJSON:       json.RawMessage(`{"max_items":5}`),
 		PlaybookContent: "只看官方来源",
 		FetchPlan: json.RawMessage(
-			`{"sources":[{"platform":"web","capability":"feed","url":"https://example.com/feed","config":{}}]}`),
+			`{"targets":[{"platform":"web","capability":"feed","url":"https://example.com/feed","config":{}}]}`),
 		Strictness: StrictnessNormal,
 	}
 	first, err := DigestPausedCompiledTaskDefinition(def)
@@ -40,7 +40,7 @@ func TestDigestPausedCompiledTaskDefinition_StableAndComplete(t *testing.T) {
 	}
 	duplicate := def
 	duplicate.FetchPlan = json.RawMessage(
-		`{"sources":[{"platform":"web","capability":"feed","url":"https://example.com/feed","config":{"x":1,"x":2}}]}`)
+		`{"targets":[{"platform":"web","capability":"feed","url":"https://example.com/feed","config":{"x":1,"x":2}}]}`)
 	if _, err := DigestPausedCompiledTaskDefinition(duplicate); err == nil {
 		t.Fatal("digest 不得授权 JSONB 会折叠的重复 key")
 	}

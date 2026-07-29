@@ -66,7 +66,7 @@ func TestExaFetch_RecordsCost(t *testing.T) {
 	e := NewExa(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "k"}, rec)
 	e.searchURL = srv.URL
 
-	src := types.Source{ID: 42, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(`{"query":"x"}`)}
+	src := types.FetchTarget{ID: 42, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(`{"query":"x"}`)}
 	_, err := e.Fetch(context.Background(), src)
 	if err != nil {
 		t.Fatalf("Fetch 失败: %v", err)
@@ -109,7 +109,7 @@ func TestExaFetch_NoCostField_RecordsZero(t *testing.T) {
 	e := NewExa(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "k"}, rec)
 	e.searchURL = srv.URL
 
-	_, err := e.Fetch(context.Background(), types.Source{ID: 7, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(`{"query":"x"}`)})
+	_, err := e.Fetch(context.Background(), types.FetchTarget{ID: 7, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(`{"query":"x"}`)})
 	if err != nil {
 		t.Fatalf("响应里没有 costDollars 时不应报错: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestExaFetch_NilRecorder_NoPanic(t *testing.T) {
 	e := NewExa(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "k"}, nil)
 	e.searchURL = srv.URL
 
-	_, err := e.Fetch(context.Background(), types.Source{ID: 1, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(`{"query":"x"}`)})
+	_, err := e.Fetch(context.Background(), types.FetchTarget{ID: 1, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(`{"query":"x"}`)})
 	if err != nil {
 		t.Fatalf("recorder 为 nil 时不应影响 Fetch: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestExaContents_RecordsCost(t *testing.T) {
 	e := NewExaContents(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "k"}, rec)
 	e.contentURL = srv.URL
 
-	src := types.Source{ID: 99, Platform: types.PlatformWeb, Capability: types.CapContents, Config: json.RawMessage(`{"url":"https://x.com/pricing"}`)}
+	src := types.FetchTarget{ID: 99, Platform: types.PlatformWeb, Capability: types.CapContents, Config: json.RawMessage(`{"url":"https://x.com/pricing"}`)}
 	_, err := e.Fetch(context.Background(), src)
 	if err != nil {
 		t.Fatalf("Fetch 失败: %v", err)
@@ -197,7 +197,7 @@ func TestExaContents_NoCostField_RecordsZero(t *testing.T) {
 	e := NewExaContents(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "k"}, rec)
 	e.contentURL = srv.URL
 
-	_, err := e.Fetch(context.Background(), types.Source{ID: 5, Platform: types.PlatformWeb, Capability: types.CapContents, Config: json.RawMessage(`{"url":"https://x.com/p"}`)})
+	_, err := e.Fetch(context.Background(), types.FetchTarget{ID: 5, Platform: types.PlatformWeb, Capability: types.CapContents, Config: json.RawMessage(`{"url":"https://x.com/p"}`)})
 	if err != nil {
 		t.Fatalf("无 costDollars 不应报错: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestExaContents_NilRecorder_NoPanic(t *testing.T) {
 	e := NewExaContents(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "k"}, nil)
 	e.contentURL = srv.URL
 
-	_, err := e.Fetch(context.Background(), types.Source{ID: 1, Platform: types.PlatformWeb, Capability: types.CapContents, Config: json.RawMessage(`{"url":"https://x.com/p"}`)})
+	_, err := e.Fetch(context.Background(), types.FetchTarget{ID: 1, Platform: types.PlatformWeb, Capability: types.CapContents, Config: json.RawMessage(`{"url":"https://x.com/p"}`)})
 	if err != nil {
 		t.Fatalf("recorder 为 nil 时不应影响 Fetch: %v", err)
 	}
@@ -240,8 +240,8 @@ func TestExaAdHoc_RecordsAttributionWithoutSendingContext(t *testing.T) {
 		if got.TraceID != traceID || got.UserID == nil || *got.UserID != 7007 {
 			t.Fatalf("上游账本归属不完整: trace=%q user=%v", got.TraceID, got.UserID)
 		}
-		if got.SourceID == nil || *got.SourceID != 0 {
-			t.Fatalf("ad-hoc 调用必须是 source_id=0，实得 %v", got.SourceID)
+		if got.SourceID != nil {
+			t.Fatalf("ad-hoc 调用必须省略 source_id，实得 %v", got.SourceID)
 		}
 	}
 
@@ -294,7 +294,7 @@ func TestExaRecordCall_DetachesCancellationWithBoundedDeadline(t *testing.T) {
 
 	rec := &mockRecorder{}
 	e := NewExa(config.FetchConfig{}, rec)
-	e.recordCall(ctx, types.Source{}, 200, 0, 0, 0, nil)
+	e.recordCall(ctx, types.FetchTarget{}, 200, 0, 0, 0, nil)
 
 	got := rec.last()
 	if got == nil || got.TraceID != "trace-cancel" || got.UserID == nil || *got.UserID != 7 {
@@ -343,7 +343,7 @@ func TestExaFetch_CostParsing_BreaksIfFieldRemoved(t *testing.T) {
 	e := NewExa(config.FetchConfig{TimeoutSeconds: 10, MaxResponseMB: 1, ExaAPIKey: "k"}, rec)
 	e.searchURL = srv.URL
 
-	_, _ = e.Fetch(context.Background(), types.Source{ID: 1, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(`{"query":"x"}`)})
+	_, _ = e.Fetch(context.Background(), types.FetchTarget{ID: 1, Platform: types.PlatformWeb, Capability: types.CapSearch, Config: json.RawMessage(`{"query":"x"}`)})
 
 	got := rec.last()
 	if got == nil {

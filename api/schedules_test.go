@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/workflow"
 )
 
 type fakeScheduler struct {
@@ -17,10 +16,6 @@ type fakeScheduler struct {
 	gotNLDesc *string
 	retErr    error
 	calls     int
-}
-
-func (f *fakeScheduler) PushNow(context.Context, int64, workflow.PushScope) (string, error) {
-	return "", nil
 }
 
 func (f *fakeScheduler) DeletePush(context.Context, string, int64) error { return nil }

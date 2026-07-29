@@ -135,7 +135,7 @@ func TestTaskRunSnapshotCutoverControlAuditsHistoricalDefinitionPin(
 	if err := f.st.pool.QueryRow(t.Context(), `
 		INSERT INTO task_approved_definition_versions (
 		    tenant_id,user_id,task_id,version,schema_version,
-		    execution_mode,definition_digest,payload,approval_ref
+		    execution_mode,definition_digest,payload,operation_ref
 		)
 		SELECT tenant_id,user_id,task_id,2,schema_version,
 		       execution_mode,definition_digest,payload,

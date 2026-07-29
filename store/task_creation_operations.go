@@ -55,7 +55,7 @@ func scanTaskCreationOperation(row pgx.Row, op *types.TaskCreationOperation) err
 	)
 }
 
-// CreateTaskCreationOperation inserts a v1 create_schedule confirmation under
+// CreateTaskCreationOperation inserts a v1 create_schedule operation under
 // an explicit active tenant membership. Legacy CreatePendingAction remains v0
 // and is intentionally untouched. Store owns every protocol field so callers
 // cannot smuggle an already-claimed phase, fence, or terminal status into the
@@ -109,14 +109,14 @@ func (s *Store) CreateTaskCreationOperation(
 
 	var op types.TaskCreationOperation
 	err = scanTaskCreationOperation(tx.QueryRow(ctx,
-		`INSERT INTO pending_actions
+		`INSERT INTO task_creation_operations
 			(id, tenant_id, user_id, session_id, tool_name, args, summary, status,
 			 expires_at, execution_version)
 		 VALUES ($1, $2, $3, $4, 'create_schedule', $5, $6, $7, $8, $9)
 		 ON CONFLICT (id) DO NOTHING
 		 RETURNING `+taskCreationOperationColumns,
 		p.ID, p.TenantID, p.UserID, p.SessionID, []byte(p.Args), p.Summary,
-		types.PendingActionStatusPending, p.ExpiresAt,
+		types.TaskOperationStatusPending, p.ExpiresAt,
 		types.TaskCreationExecutionVersionV1,
 	), &op)
 	if err != nil {
@@ -146,7 +146,7 @@ func loadTaskCreationOperationForCreationReplay(
 	var op types.TaskCreationOperation
 	err := scanTaskCreationOperation(tx.QueryRow(ctx,
 		`SELECT `+taskCreationOperationColumns+`
-		   FROM pending_actions
+		   FROM task_creation_operations
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		    AND tool_name = 'create_schedule' AND execution_version = $4
 		  FOR SHARE /* task creation replay operation lock order */`,
@@ -240,129 +240,6 @@ func (s *Store) loadTaskCreationOperationCreationReplay(
 	return op, nil
 }
 
-// CancelTaskCreationOperation linearizes a user's pre-claim cancellation with
-// Acquire on the same v1 row. It never touches a legacy/v0 pending action. An
-// exact replay adopts the durable cancelled tombstone (including after a lost
-// commit response); an executing operation is Busy and any other completed
-// operation is Terminal.
-func (s *Store) CancelTaskCreationOperation(
-	ctx context.Context,
-	p types.CancelTaskCreationOperationParams,
-) (*types.TaskCreationOperation, error) {
-	if strings.TrimSpace(p.ID) == "" || p.ID != strings.TrimSpace(p.ID) ||
-		len(p.ID) > 255 || p.TenantID <= 0 || p.UserID <= 0 {
-		return nil, taskCreationValidation("invalid cancellation scope")
-	}
-	if err := validateTaskCreationReceiptTarget(p.ReceiptProvider, p.ReceiptTarget); err != nil {
-		return nil, err
-	}
-	tx, err := s.beginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return nil, taskCreationDatabaseError("begin operation cancellation", err)
-	}
-	defer rollbackTaskCreationTransaction(ctx, tx)
-
-	var op types.TaskCreationOperation
-	err = scanTaskCreationOperation(tx.QueryRow(ctx,
-		`SELECT `+taskCreationOperationColumns+`
-		   FROM pending_actions
-		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
-		    AND tool_name = 'create_schedule' AND execution_version = $4
-		  FOR UPDATE`,
-		p.ID, p.TenantID, p.UserID, types.TaskCreationExecutionVersionV1,
-	), &op)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, taskCreationNotFound()
-		}
-		return nil, taskCreationDatabaseError("load cancellation target", err)
-	}
-	switch op.Status {
-	case types.PendingActionStatusCancelled:
-		if !cancelledTaskCreationOperationComplete(&op) {
-			return nil, taskCreationConflict("cancelled operation tombstone is incomplete")
-		}
-		if op.ReceiptProvider != p.ReceiptProvider || op.ReceiptTarget != p.ReceiptTarget {
-			return nil, taskCreationConflict("cancelled operation receipt target differs")
-		}
-		if err := verifyTaskCreationReceiptForTerminal(
-			ctx, tx, p.ID, p.TenantID, p.UserID); err != nil {
-			return nil, err
-		}
-		return &op, nil
-	case types.PendingActionStatusExecuting:
-		if op.ReceiptProvider != "" || op.ReceiptTarget != "" {
-			if op.ReceiptProvider != p.ReceiptProvider || op.ReceiptTarget != p.ReceiptTarget {
-				return nil, taskCreationConflict("operation receipt target differs")
-			}
-			return &op, taskCreationBusy()
-		}
-		err = scanTaskCreationOperation(tx.QueryRow(ctx, `
-			UPDATE pending_actions
-			   SET receipt_provider = $5, receipt_target = $6,
-			       updated_at = clock_timestamp()
-			 WHERE id = $1 AND tenant_id = $2 AND user_id = $3
-			   AND tool_name = 'create_schedule' AND execution_version = $4
-			   AND status = $7 AND tombstoned_at IS NULL AND fence = $8
-			   AND receipt_provider = '' AND receipt_target = ''
-			 RETURNING `+taskCreationOperationColumns,
-			p.ID, p.TenantID, p.UserID, types.TaskCreationExecutionVersionV1,
-			p.ReceiptProvider, p.ReceiptTarget,
-			types.PendingActionStatusExecuting, op.Fence,
-		), &op)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil, taskCreationConflict("operation changed during cancellation receipt binding")
-			}
-			return nil, taskCreationDatabaseError("bind executing cancellation receipt target", err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return nil, taskCreationDatabaseError("commit executing cancellation receipt target", err)
-		}
-		return &op, taskCreationBusy()
-	case types.PendingActionStatusPending:
-		if !pendingTaskCreationOperationPristine(&op) {
-			return nil, taskCreationConflict("pending operation already has saga state")
-		}
-	default:
-		if taskCreationStatusIsTerminal(op.Status) {
-			return nil, taskCreationTerminal()
-		}
-		return nil, taskCreationConflict("operation status cannot be cancelled")
-	}
-
-	err = scanTaskCreationOperation(tx.QueryRow(ctx,
-		`UPDATE pending_actions
-		    SET status = $5, phase = $6,
-		        receipt_provider = $8, receipt_target = $9,
-		        lease_owner = '', lease_until = NULL, takeover_not_before = NULL,
-		        result = NULL, error_code = '', error_message = '', executed_at = NULL,
-		        tombstoned_at = clock_timestamp(), updated_at = clock_timestamp()
-		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
-		    AND tool_name = 'create_schedule' AND execution_version = $4
-		    AND status = $7 AND phase = '' AND tombstoned_at IS NULL
-		    AND lease_owner = '' AND lease_until IS NULL AND takeover_not_before IS NULL
-		  RETURNING `+taskCreationOperationColumns,
-		p.ID, p.TenantID, p.UserID, types.TaskCreationExecutionVersionV1,
-		types.PendingActionStatusCancelled, types.TaskCreationPhaseCancelled,
-		types.PendingActionStatusPending, p.ReceiptProvider, p.ReceiptTarget,
-	), &op)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, taskCreationConflict("operation changed during cancellation")
-		}
-		return nil, taskCreationDatabaseError("write cancellation tombstone", err)
-	}
-	if err := insertTaskCreationReceiptForTerminal(
-		ctx, tx, p.ID, p.TenantID, p.UserID); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, taskCreationDatabaseError("commit operation cancellation", err)
-	}
-	return &op, nil
-}
-
 // AcquireTaskCreationOperation atomically claims a v1 create_schedule action.
 // The caller creates LeaseOwner before entering this method. Replaying the same
 // owner while its lease is active returns the original fence without extending
@@ -388,7 +265,7 @@ func (s *Store) AcquireTaskCreationOperation(
 	var op types.TaskCreationOperation
 	err = scanTaskCreationOperation(tx.QueryRow(ctx,
 		`SELECT `+taskCreationOperationColumns+`
-		   FROM pending_actions
+		   FROM task_creation_operations
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		    AND tool_name = 'create_schedule' AND execution_version = $4
 		  FOR UPDATE`,
@@ -412,12 +289,12 @@ func (s *Store) AcquireTaskCreationOperation(
 		if op.ReceiptProvider != p.ReceiptProvider || op.ReceiptTarget != p.ReceiptTarget {
 			return nil, taskCreationConflict("operation receipt target differs")
 		}
-	} else if op.Status == types.PendingActionStatusPending &&
+	} else if op.Status == types.TaskOperationStatusPending &&
 		(p.ReceiptProvider == "" || p.ReceiptTarget == "") {
 		return nil, taskCreationValidation("pending operation requires a receipt target")
 	}
 	switch op.Status {
-	case types.PendingActionStatusPending:
+	case types.TaskOperationStatusPending:
 		if !pendingTaskCreationOperationPristine(&op) {
 			return nil, taskCreationConflict("pending operation has saga state")
 		}
@@ -426,7 +303,7 @@ func (s *Store) AcquireTaskCreationOperation(
 		}
 		return s.acquirePendingTaskCreation(ctx, tx, p, op.Fence)
 
-	case types.PendingActionStatusExecuting:
+	case types.TaskOperationStatusExecuting:
 		if op.LeaseUntil == nil || op.TakeoverNotBefore == nil || op.LeaseOwner == "" ||
 			op.Fence <= 0 || op.Attempt <= 0 {
 			return nil, taskCreationConflict("executing operation has incomplete lease metadata")
@@ -434,7 +311,7 @@ func (s *Store) AcquireTaskCreationOperation(
 		receiptBoundNow := false
 		if op.ReceiptProvider == "" && p.ReceiptProvider != "" {
 			err = scanTaskCreationOperation(tx.QueryRow(ctx, `
-				UPDATE pending_actions
+				UPDATE task_creation_operations
 				   SET receipt_provider = $5, receipt_target = $6,
 				       updated_at = clock_timestamp()
 				 WHERE id = $1 AND tenant_id = $2 AND user_id = $3
@@ -444,7 +321,7 @@ func (s *Store) AcquireTaskCreationOperation(
 				 RETURNING `+taskCreationOperationColumns,
 				p.ID, p.TenantID, p.UserID, types.TaskCreationExecutionVersionV1,
 				p.ReceiptProvider, p.ReceiptTarget,
-				types.PendingActionStatusExecuting, op.Fence,
+				types.TaskOperationStatusExecuting, op.Fence,
 			), &op)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
@@ -500,7 +377,7 @@ func expirePendingTaskCreationOperation(
 ) (*types.TaskCreationOperation, error) {
 	var op types.TaskCreationOperation
 	err := scanTaskCreationOperation(tx.QueryRow(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET status = $5, phase = $6,
 		        receipt_provider = $9, receipt_target = $10,
 		        lease_owner = '', lease_until = NULL, takeover_not_before = NULL,
@@ -513,8 +390,8 @@ func expirePendingTaskCreationOperation(
 		    AND fence = $8 AND expires_at <= clock_timestamp()
 		  RETURNING `+taskCreationOperationColumns,
 		p.ID, p.TenantID, p.UserID, types.TaskCreationExecutionVersionV1,
-		types.PendingActionStatusExpired, types.TaskCreationPhaseExpired,
-		types.PendingActionStatusPending, oldFence,
+		types.TaskOperationStatusExpired, types.TaskCreationPhaseExpired,
+		types.TaskOperationStatusPending, oldFence,
 		p.ReceiptProvider, p.ReceiptTarget,
 	), &op)
 	if err != nil {
@@ -538,7 +415,7 @@ func (s *Store) acquirePendingTaskCreation(
 ) (*types.TaskCreationOperation, error) {
 	var op types.TaskCreationOperation
 	err := scanTaskCreationOperation(tx.QueryRow(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET status = $6, phase = $7, lease_owner = $5,
 		        receipt_provider = $12, receipt_target = $13,
 		        lease_until = clock_timestamp() + ($8 * interval '1 microsecond'),
@@ -551,10 +428,10 @@ func (s *Store) acquirePendingTaskCreation(
 		    AND receipt_provider = '' AND receipt_target = ''
 		  RETURNING `+taskCreationOperationColumns,
 		p.ID, p.TenantID, p.UserID, types.TaskCreationExecutionVersionV1,
-		p.LeaseOwner, types.PendingActionStatusExecuting,
+		p.LeaseOwner, types.TaskOperationStatusExecuting,
 		types.TaskCreationPhaseClaimed, p.LeaseDuration.Microseconds(),
 		(p.LeaseDuration+taskCreationTakeoverSafetyGrace).Microseconds(),
-		types.PendingActionStatusPending, oldFence,
+		types.TaskOperationStatusPending, oldFence,
 		p.ReceiptProvider, p.ReceiptTarget,
 	), &op)
 	if err != nil {
@@ -577,7 +454,7 @@ func (s *Store) takeOverTaskCreation(
 ) (*types.TaskCreationOperation, error) {
 	var op types.TaskCreationOperation
 	err := scanTaskCreationOperation(tx.QueryRow(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET lease_owner = $5,
 		        receipt_provider = CASE WHEN receipt_provider = '' AND receipt_target = ''
 		                                THEN $10 ELSE receipt_provider END,
@@ -595,7 +472,7 @@ func (s *Store) takeOverTaskCreation(
 		p.ID, p.TenantID, p.UserID, types.TaskCreationExecutionVersionV1,
 		p.LeaseOwner, p.LeaseDuration.Microseconds(),
 		(p.LeaseDuration+taskCreationTakeoverSafetyGrace).Microseconds(),
-		types.PendingActionStatusExecuting, oldFence,
+		types.TaskOperationStatusExecuting, oldFence,
 		p.ReceiptProvider, p.ReceiptTarget,
 	), &op)
 	if err != nil {
@@ -625,7 +502,7 @@ func (s *Store) LoadTaskCreationOperation(
 	var op types.TaskCreationOperation
 	err := scanTaskCreationOperation(s.pool.QueryRow(ctx,
 		`SELECT `+taskCreationOperationColumns+`
-		   FROM pending_actions
+		   FROM task_creation_operations
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		    AND tool_name = 'create_schedule' AND execution_version = $4`,
 		id, tenantID, userID, types.TaskCreationExecutionVersionV1,
@@ -642,7 +519,7 @@ func (s *Store) LoadTaskCreationOperation(
 // LoadTaskCreationOperationByUser resolves the durable tenant scope from the
 // v1 operation itself. It deliberately does not route through the user's
 // current/active memberships: a suspended or multi-membership user must still
-// be able to resume, cancel, or clean up the exact operation they confirmed.
+// be able to resume or clean up the exact operation they started.
 // Wrong-user, v0, wrong-tool and missing rows are indistinguishable.
 func (s *Store) LoadTaskCreationOperationByUser(
 	ctx context.Context,
@@ -656,7 +533,7 @@ func (s *Store) LoadTaskCreationOperationByUser(
 	var op types.TaskCreationOperation
 	err := scanTaskCreationOperation(s.pool.QueryRow(ctx,
 		`SELECT `+taskCreationOperationColumns+`
-		   FROM pending_actions
+		   FROM task_creation_operations
 		  WHERE id = $1 AND user_id = $2
 		    AND tool_name = 'create_schedule' AND execution_version = $3`,
 		id, userID, types.TaskCreationExecutionVersionV1,
@@ -693,7 +570,7 @@ func (s *Store) RenewTaskCreationLease(
 		return err
 	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET lease_until = clock_timestamp() + ($6 * interval '1 microsecond'),
 		        takeover_not_before = clock_timestamp() + ($7 * interval '1 microsecond'),
 		        updated_at = clock_timestamp()
@@ -705,7 +582,7 @@ func (s *Store) RenewTaskCreationLease(
 		duration.Microseconds(),
 		(duration + taskCreationTakeoverSafetyGrace).Microseconds(),
 		types.TaskCreationExecutionVersionV1,
-		types.PendingActionStatusExecuting,
+		types.TaskOperationStatusExecuting,
 	)
 	if err != nil {
 		return taskCreationDatabaseError("renew operation lease", err)
@@ -734,7 +611,7 @@ func (s *Store) SealTaskCreationCommand(
 		from: types.TaskCreationPhaseClaimed,
 		to:   types.TaskCreationPhaseCommandSealed,
 		get:  func(op *types.TaskCreationOperation) []byte { return op.NormalizedCommand },
-		update: `UPDATE pending_actions
+		update: `UPDATE task_creation_operations
 		             SET normalized_command = $6, phase = $7, updated_at = clock_timestamp()
 		           WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		             AND tool_name = 'create_schedule' AND execution_version = $8
@@ -778,7 +655,7 @@ func (s *Store) BeginTaskCreationTranslation(
 	}
 
 	tag, err := tx.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET phase = $6, updated_at = clock_timestamp()
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		    AND tool_name = 'create_schedule' AND execution_version = $7
@@ -787,7 +664,7 @@ func (s *Store) BeginTaskCreationTranslation(
 		    AND phase = $9 AND normalized_command IS NOT NULL`,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
 		types.TaskCreationPhaseTranslationStarted,
-		types.TaskCreationExecutionVersionV1, types.PendingActionStatusExecuting,
+		types.TaskCreationExecutionVersionV1, types.TaskOperationStatusExecuting,
 		types.TaskCreationPhaseCommandSealed,
 	)
 	if err != nil {
@@ -840,7 +717,7 @@ func (s *Store) CheckpointTaskCreationSchedule(
 		from: types.TaskCreationPhaseDefinitionCompiled,
 		to:   types.TaskCreationPhaseSchedulePrepared,
 		get:  func(op *types.TaskCreationOperation) []byte { return op.PreparedSchedule },
-		update: `UPDATE pending_actions
+		update: `UPDATE task_creation_operations
 		             SET prepared_schedule = $6, phase = $7, updated_at = clock_timestamp()
 		           WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		             AND tool_name = 'create_schedule' AND execution_version = $8
@@ -879,7 +756,7 @@ func (s *Store) BlockTaskCreationOperation(
 	errorMessage string,
 ) error {
 	return s.terminateTaskCreationOperation(ctx, lease, taskCreationTermination{
-		status:       types.PendingActionStatusBlocked,
+		status:       types.TaskOperationStatusBlocked,
 		phase:        types.TaskCreationPhaseBlocked,
 		errorCode:    errorCode,
 		errorMessage: errorMessage,
@@ -895,7 +772,7 @@ func (s *Store) FailTaskCreationOperation(
 	errorMessage string,
 ) error {
 	return s.terminateTaskCreationOperation(ctx, lease, taskCreationTermination{
-		status:       types.PendingActionStatusFailed,
+		status:       types.TaskOperationStatusFailed,
 		phase:        types.TaskCreationPhaseFailed,
 		errorCode:    errorCode,
 		errorMessage: errorMessage,
@@ -917,7 +794,7 @@ func (s *Store) CompleteTaskCreationOperation(
 		return taskCreationValidation("operation result is invalid")
 	}
 	return s.terminateTaskCreationOperation(ctx, lease, taskCreationTermination{
-		status: types.PendingActionStatusExecuted,
+		status: types.TaskOperationStatusExecuted,
 		phase:  types.TaskCreationPhaseCompleted,
 		taskID: taskID,
 		result: result,
@@ -943,7 +820,7 @@ func (s *Store) ListStaleTaskCreationTenantIDs(
 	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT DISTINCT tenant_id
-		   FROM pending_actions
+		   FROM task_creation_operations
 		  WHERE tool_name = 'create_schedule'
 		    AND execution_version = $1 AND status = $2
 		    AND tenant_id > $4
@@ -955,7 +832,7 @@ func (s *Store) ListStaleTaskCreationTenantIDs(
 		  ORDER BY tenant_id
 		  LIMIT $5`,
 		types.TaskCreationExecutionVersionV1,
-		types.PendingActionStatusExecuting, before, afterTenantID, limit,
+		types.TaskOperationStatusExecuting, before, afterTenantID, limit,
 	)
 	if err != nil {
 		return nil, taskCreationDatabaseError("list stale tenant shards", err)
@@ -990,7 +867,7 @@ func (s *Store) ListStaleTaskCreationOperations(
 	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT `+taskCreationOperationColumns+`
-		   FROM pending_actions
+		   FROM task_creation_operations
 		  WHERE tenant_id = $1 AND tool_name = 'create_schedule'
 		    AND execution_version = $2 AND status = $3
 		    AND tombstoned_at IS NULL
@@ -1001,7 +878,7 @@ func (s *Store) ListStaleTaskCreationOperations(
 		  ORDER BY takeover_not_before, id
 		  LIMIT $5`,
 		tenantID, types.TaskCreationExecutionVersionV1,
-		types.PendingActionStatusExecuting, before, limit,
+		types.TaskOperationStatusExecuting, before, limit,
 	)
 	if err != nil {
 		return nil, taskCreationDatabaseError("list stale operations", err)
@@ -1062,7 +939,7 @@ func (s *Store) checkpointTaskCreationBytes(
 	tag, err := tx.Exec(ctx, cp.update,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
 		payload, cp.to, types.TaskCreationExecutionVersionV1,
-		types.PendingActionStatusExecuting, cp.from,
+		types.TaskOperationStatusExecuting, cp.from,
 	)
 	if err != nil {
 		return taskCreationDatabaseError("write immutable checkpoint", err)
@@ -1107,7 +984,7 @@ func (s *Store) checkpointTaskCreationDefinition(
 	}
 
 	tag, err := tx.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET compiled_definition = $6, compiled_digest = $7,
 		        phase = $8, updated_at = clock_timestamp()
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
@@ -1117,7 +994,7 @@ func (s *Store) checkpointTaskCreationDefinition(
 		    AND phase = $11 AND compiled_definition IS NULL AND compiled_digest = ''`,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
 		definition, digest, types.TaskCreationPhaseDefinitionCompiled,
-		types.TaskCreationExecutionVersionV1, types.PendingActionStatusExecuting,
+		types.TaskCreationExecutionVersionV1, types.TaskOperationStatusExecuting,
 		types.TaskCreationPhaseTranslationStarted,
 	)
 	if err != nil {
@@ -1163,7 +1040,7 @@ func (s *Store) checkpointTaskCreationEnsureReceipt(
 	}
 
 	tag, err := tx.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET ensure_receipt = $6, task_id = $7, phase = $8, updated_at = clock_timestamp()
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		    AND tool_name = 'create_schedule' AND execution_version = $9
@@ -1172,7 +1049,7 @@ func (s *Store) checkpointTaskCreationEnsureReceipt(
 		    AND phase = $11 AND ensure_receipt IS NULL AND task_id = ''`,
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
 		receipt, taskID, types.TaskCreationPhaseScheduleEnsured,
-		types.TaskCreationExecutionVersionV1, types.PendingActionStatusExecuting,
+		types.TaskCreationExecutionVersionV1, types.TaskOperationStatusExecuting,
 		types.TaskCreationPhaseSchedulePrepared,
 	)
 	if err != nil {
@@ -1188,7 +1065,7 @@ func (s *Store) checkpointTaskCreationEnsureReceipt(
 }
 
 type taskCreationTermination struct {
-	status       types.PendingActionStatus
+	status       types.TaskOperationStatus
 	phase        types.TaskCreationPhase
 	errorCode    string
 	errorMessage string
@@ -1208,10 +1085,10 @@ func (s *Store) terminateTaskCreationOperation(
 		len(termination.errorMessage) > maxTaskCreationErrorText {
 		return taskCreationValidation("terminal error metadata is too long")
 	}
-	if termination.status != types.PendingActionStatusExecuted && termination.errorCode == "" {
+	if termination.status != types.TaskOperationStatusExecuted && termination.errorCode == "" {
 		return taskCreationValidation("terminal error code is empty")
 	}
-	if termination.status != types.PendingActionStatusExecuted &&
+	if termination.status != types.TaskOperationStatusExecuted &&
 		(termination.errorCode != strings.TrimSpace(termination.errorCode) ||
 			termination.errorMessage != strings.TrimSpace(termination.errorMessage)) {
 		return taskCreationValidation("terminal error metadata is not normalized")
@@ -1240,7 +1117,7 @@ func (s *Store) terminateTaskCreationOperation(
 		return verifyTaskCreationReceiptForTerminal(
 			ctx, tx, lease.ID, lease.TenantID, lease.UserID)
 	}
-	if op.Status != types.PendingActionStatusExecuting || op.LeaseUntil == nil ||
+	if op.Status != types.TaskOperationStatusExecuting || op.LeaseUntil == nil ||
 		op.TakeoverNotBefore == nil ||
 		!databaseNow.Before(*op.LeaseUntil) {
 		return taskCreationLeaseLost()
@@ -1248,7 +1125,7 @@ func (s *Store) terminateTaskCreationOperation(
 	if err := validateTaskCreationTerminationPhase(op.Phase, termination.status); err != nil {
 		return err
 	}
-	if termination.status == types.PendingActionStatusExecuted {
+	if termination.status == types.TaskOperationStatusExecuted {
 		row, found, err := loadCreationScheduleForUpdate(ctx, tx, termination.taskID)
 		if err != nil {
 			return err
@@ -1258,13 +1135,13 @@ func (s *Store) terminateTaskCreationOperation(
 			return taskCreationConflict("completed operation has no exact active aggregate")
 		}
 	}
-	if termination.status == types.PendingActionStatusExecuted &&
+	if termination.status == types.TaskOperationStatusExecuted &&
 		op.TaskID != "" && op.TaskID != termination.taskID {
 		return taskCreationConflict("completed task id differs from ensure checkpoint")
 	}
 
 	tag, err := tx.Exec(ctx,
-		`UPDATE pending_actions
+		`UPDATE task_creation_operations
 		    SET status = $6, phase = $7,
 		        task_id = CASE WHEN $6 = 'executed' THEN $8 ELSE task_id END,
 		        result = CASE WHEN $6 = 'executed' THEN $9 ELSE result END,
@@ -1281,7 +1158,7 @@ func (s *Store) terminateTaskCreationOperation(
 		lease.ID, lease.TenantID, lease.UserID, lease.LeaseOwner, lease.Fence,
 		termination.status, termination.phase, termination.taskID,
 		termination.result, termination.errorCode, termination.errorMessage,
-		types.TaskCreationExecutionVersionV1, types.PendingActionStatusExecuting,
+		types.TaskCreationExecutionVersionV1, types.TaskOperationStatusExecuting,
 	)
 	if err != nil {
 		return taskCreationDatabaseError("write terminal tombstone", err)
@@ -1311,12 +1188,12 @@ func adoptTaskCreationTermination(
 		return taskCreationTerminal()
 	}
 	switch termination.status {
-	case types.PendingActionStatusExecuted:
+	case types.TaskOperationStatusExecuted:
 		if op.ExecutedAt != nil && op.ErrorCode == "" && op.ErrorMessage == "" &&
 			op.TaskID == termination.taskID && taskCreationJSONEqual(op.Result, termination.result) {
 			return nil
 		}
-	case types.PendingActionStatusBlocked, types.PendingActionStatusFailed:
+	case types.TaskOperationStatusBlocked, types.TaskOperationStatusFailed:
 		if op.ExecutedAt == nil && len(op.Result) == 0 &&
 			op.ErrorCode == termination.errorCode && op.ErrorMessage == termination.errorMessage {
 			return nil
@@ -1340,7 +1217,7 @@ func loadLeasedTaskCreationOperation(
 	if op.TombstonedAt != nil || taskCreationStatusIsTerminal(op.Status) {
 		return nil, time.Time{}, taskCreationTerminal()
 	}
-	if op.Status != types.PendingActionStatusExecuting || op.LeaseUntil == nil ||
+	if op.Status != types.TaskOperationStatusExecuting || op.LeaseUntil == nil ||
 		op.TakeoverNotBefore == nil ||
 		!databaseNow.Before(*op.LeaseUntil) {
 		return nil, time.Time{}, taskCreationLeaseLost()
@@ -1356,7 +1233,7 @@ func loadScopedTaskCreationOperationForUpdate(
 	var op types.TaskCreationOperation
 	err := scanTaskCreationOperation(tx.QueryRow(ctx,
 		`SELECT `+taskCreationOperationColumns+`
-		   FROM pending_actions
+		   FROM task_creation_operations
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 		    AND tool_name = 'create_schedule' AND execution_version = $4
 		  FOR UPDATE /* task creation operation lock order */`,
@@ -1430,7 +1307,7 @@ func taskCreationCreationRequestEqual(
 	if op == nil || op.ID != p.ID || op.TenantID != p.TenantID || op.UserID != p.UserID ||
 		op.ToolName != "create_schedule" ||
 		op.ExecutionVersion != types.TaskCreationExecutionVersionV1 ||
-		op.Status != types.PendingActionStatusPending || op.Phase != "" ||
+		op.Status != types.TaskOperationStatusPending || op.Phase != "" ||
 		op.LeaseOwner != "" || op.LeaseUntil != nil || op.TakeoverNotBefore != nil ||
 		op.Fence != 0 || op.Attempt != 0 || op.ReceiptProvider != "" ||
 		op.ReceiptTarget != "" || op.TombstonedAt != nil ||
@@ -1462,14 +1339,14 @@ func validateTaskCreationDuration(duration, maximum time.Duration, label string)
 
 func validateTaskCreationTerminationPhase(
 	phase types.TaskCreationPhase,
-	status types.PendingActionStatus,
+	status types.TaskOperationStatus,
 ) error {
 	switch status {
-	case types.PendingActionStatusExecuted:
+	case types.TaskOperationStatusExecuted:
 		if phase != types.TaskCreationPhaseActivated {
 			return taskCreationConflict("operation is not activated")
 		}
-	case types.PendingActionStatusBlocked, types.PendingActionStatusFailed:
+	case types.TaskOperationStatusBlocked, types.TaskOperationStatusFailed:
 		rank := taskCreationPhaseRank(phase)
 		if rank < taskCreationPhaseRank(types.TaskCreationPhaseClaimed) ||
 			rank > taskCreationPhaseRank(types.TaskCreationPhaseDefinitionCompiled) {
@@ -1575,13 +1452,13 @@ func validSHA256Digest(digest string) bool {
 	return err == nil && len(decoded) == 32
 }
 
-func taskCreationStatusIsTerminal(status types.PendingActionStatus) bool {
+func taskCreationStatusIsTerminal(status types.TaskOperationStatus) bool {
 	switch status {
-	case types.PendingActionStatusExecuted,
-		types.PendingActionStatusCancelled,
-		types.PendingActionStatusExpired,
-		types.PendingActionStatusBlocked,
-		types.PendingActionStatusFailed:
+	case types.TaskOperationStatusExecuted,
+		types.TaskOperationStatusCancelled,
+		types.TaskOperationStatusExpired,
+		types.TaskOperationStatusBlocked,
+		types.TaskOperationStatusFailed:
 		return true
 	default:
 		return false
@@ -1589,7 +1466,7 @@ func taskCreationStatusIsTerminal(status types.PendingActionStatus) bool {
 }
 
 func pendingTaskCreationOperationPristine(op *types.TaskCreationOperation) bool {
-	return op != nil && op.Status == types.PendingActionStatusPending &&
+	return op != nil && op.Status == types.TaskOperationStatusPending &&
 		op.Phase == "" && op.LeaseOwner == "" && op.LeaseUntil == nil &&
 		op.TakeoverNotBefore == nil && op.Fence == 0 && op.Attempt == 0 &&
 		len(op.NormalizedCommand) == 0 && len(op.CompiledDefinition) == 0 &&
@@ -1597,18 +1474,6 @@ func pendingTaskCreationOperationPristine(op *types.TaskCreationOperation) bool 
 		len(op.EnsureReceipt) == 0 && op.TaskID == "" && len(op.Result) == 0 &&
 		op.ErrorCode == "" && op.ErrorMessage == "" && op.ReceiptProvider == "" &&
 		op.ReceiptTarget == "" && op.ExecutedAt == nil && op.TombstonedAt == nil
-}
-
-func cancelledTaskCreationOperationComplete(op *types.TaskCreationOperation) bool {
-	return op != nil && op.Status == types.PendingActionStatusCancelled &&
-		op.Phase == types.TaskCreationPhaseCancelled &&
-		op.LeaseOwner == "" && op.LeaseUntil == nil && op.TakeoverNotBefore == nil &&
-		op.Fence == 0 && op.Attempt == 0 && len(op.NormalizedCommand) == 0 &&
-		len(op.CompiledDefinition) == 0 && op.CompiledDigest == "" &&
-		len(op.PreparedSchedule) == 0 && len(op.EnsureReceipt) == 0 &&
-		op.TaskID == "" && len(op.Result) == 0 && op.ErrorCode == "" &&
-		op.ErrorMessage == "" && op.ReceiptProvider != "" && op.ReceiptTarget != "" &&
-		op.ExecutedAt == nil && op.TombstonedAt != nil
 }
 
 func taskCreationPhaseAtLeast(current, target types.TaskCreationPhase) bool {

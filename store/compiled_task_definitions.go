@@ -22,23 +22,25 @@ const (
 	maxCompiledTaskJSONBytes        = 256 << 10
 	maxCompiledTaskPlaybookBytes    = 256 << 10
 	maxCompiledTaskDescriptionBytes = 16 << 10
-	maxCompiledTaskSources          = 64
-	maxCompiledTaskSourceURLBytes   = 4096
-	maxCompiledTaskSourceTextBytes  = 4096
+	maxCompiledTaskTargets          = 64
+	maxCompiledTaskTargetURLBytes   = 4096
+	maxCompiledTaskTargetTextBytes  = 4096
 )
 
 // compiledFetchPlan 是 schedule_playbooks.fetch_plan 在数据边界上的最小稳定形态。
 // agent 包拥有编译过程；store 不反向依赖 agent，只消费其持久化 wire contract。
 type compiledFetchPlan struct {
-	Sources []compiledPlanSource `json:"sources"`
+	Targets []compiledPlanTarget `json:"targets"`
 }
 
-type compiledPlanSource struct {
+type compiledPlanTarget struct {
 	Platform   string          `json:"platform"`
 	Capability string          `json:"capability"`
 	Title      string          `json:"title,omitempty"`
 	URL        string          `json:"url"`
 	Config     json.RawMessage `json:"config,omitempty"`
+	ToolName   string          `json:"tool_name,omitempty"`
+	ToolArgs   json.RawMessage `json:"tool_arguments,omitempty"`
 }
 
 // InsertPausedCompiledTaskDefinition 原子写入一份已编译的稳定监控任务。
@@ -47,9 +49,9 @@ type compiledPlanSource struct {
 // paused。A-2 刻意不接 Temporal，也不接受一个可伪造的 paused 布尔值；A-3 将提供创建、
 // Describe 与指纹核对原语。这里把 Postgres 镜像状态硬编码为 paused，绝不激活任务。
 //
-// fetch_plan 是任务源集合的唯一真相源：本方法从计划材料化全局 sources，再写出精确相等的
-// schedule_sources 集合并在提交前反向核对。命中既有 URL 只引用原行，绝不覆盖其元数据或
-// 抓取状态，也不会创建 subscriptions。TaskID 冲突返回 CodeConflict，且不会采用或改写
+// fetch_plan 是任务抓取目标集合的唯一真相源：本方法从计划材料化全局 fetch_targets，再写出精确相等的
+// task_fetch_targets 集合并在提交前反向核对。命中既有 URL 只引用原行，绝不覆盖其元数据或
+// 抓取状态。TaskID 冲突返回 CodeConflict，且不会采用或改写
 // 原聚合；digest/adopt/任务上限及生产接线属于后续 saga。
 //
 // Commit 返回错误时本方法会用独立短 context 尝试 Rollback 并把错误上抛。若错误来自网络
@@ -121,38 +123,41 @@ func insertPausedCompiledTaskDefinitionTx(
 	// Global source URLs are unique across every tenant. Different users can
 	// commit inverse plan orders concurrently, so always acquire those unique
 	// index/row locks in canonical URL order. The stored fetch_plan itself keeps
-	// its approved order; schedule_sources is a set.
-	materializationSources := append([]compiledPlanSource(nil), plan.Sources...)
-	sort.Slice(materializationSources, func(i, j int) bool {
-		return materializationSources[i].URL < materializationSources[j].URL
+	// its approved order; task_fetch_targets is a set.
+	materializationTargets := append([]compiledPlanTarget(nil), plan.Targets...)
+	sort.Slice(materializationTargets, func(i, j int) bool {
+		return materializationTargets[i].URL < materializationTargets[j].URL
 	})
-	sourceIDs := make([]int64, 0, len(materializationSources))
-	planURLs := make([]string, 0, len(materializationSources))
-	for _, planned := range materializationSources {
-		sourceID, err := getOrCreateCompiledPlanSource(ctx, tx, planned)
+	targetIDs := make([]int64, 0, len(materializationTargets))
+	planURLs := make([]string, 0, len(materializationTargets))
+	for _, planned := range materializationTargets {
+		targetID, err := getOrCreateCompiledPlanTarget(ctx, tx, planned)
 		if err != nil {
+			if errors.Is(err, types.ErrConflict) {
+				return err
+			}
 			return compiledTaskDatabaseError(
-				fmt.Sprintf("材料化计划信源（url=%s）", planned.URL), def.TaskID, err)
+				fmt.Sprintf("材料化计划抓取目标（url=%s）", planned.URL), def.TaskID, err)
 		}
-		sourceIDs = append(sourceIDs, sourceID)
+		targetIDs = append(targetIDs, targetID)
 		planURLs = append(planURLs, planned.URL)
 	}
 
-	for _, sourceID := range sourceIDs {
+	for _, targetID := range targetIDs {
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO schedule_sources (schedule_id, source_id) VALUES ($1, $2)`,
-			def.TaskID, sourceID); err != nil {
-			return compiledTaskDatabaseError("写入任务信源链接", def.TaskID, err)
+			`INSERT INTO task_fetch_targets (schedule_id, fetch_target_id) VALUES ($1, $2)`,
+			def.TaskID, targetID); err != nil {
+			return compiledTaskDatabaseError("写入任务抓取目标链接", def.TaskID, err)
 		}
 	}
 
 	exact, err := compiledPlanLinksExact(ctx, tx, def.TaskID, planURLs)
 	if err != nil {
-		return compiledTaskDatabaseError("核对抓取计划与任务信源链接", def.TaskID, err)
+		return compiledTaskDatabaseError("核对抓取计划与任务抓取目标链接", def.TaskID, err)
 	}
 	if !exact {
 		return types.NewAppError(types.CodeInternal,
-			fmt.Sprintf("抓取计划与任务信源链接不一致（task_id=%s）", def.TaskID), nil)
+			fmt.Sprintf("抓取计划与任务抓取目标链接不一致（task_id=%s）", def.TaskID), nil)
 	}
 	return nil
 }
@@ -198,50 +203,71 @@ func validatePausedCompiledTaskDefinition(
 	if err := strictjson.Decode(raw, &plan); err != nil {
 		return nil, compiledTaskValidationError("fetch_plan 必须是合法 JSON 对象", err)
 	}
-	if plan == nil || len(plan.Sources) == 0 {
-		return nil, compiledTaskValidationError("fetch_plan.sources 不得缺失、为 null 或为空", nil)
+	if plan == nil || len(plan.Targets) == 0 {
+		return nil, compiledTaskValidationError("fetch_plan.targets 不得缺失、为 null 或为空", nil)
 	}
-	if len(plan.Sources) > maxCompiledTaskSources {
+	if len(plan.Targets) > maxCompiledTaskTargets {
 		return nil, compiledTaskValidationError(
-			fmt.Sprintf("fetch_plan.sources 不得超过 %d 个", maxCompiledTaskSources), nil)
+			fmt.Sprintf("fetch_plan.targets 不得超过 %d 个", maxCompiledTaskTargets), nil)
 	}
 
-	seenURLs := make(map[string]struct{}, len(plan.Sources))
-	for i := range plan.Sources {
-		src := &plan.Sources[i]
-		if len(src.Platform) > maxCompiledTaskSourceTextBytes ||
-			len(src.Capability) > maxCompiledTaskSourceTextBytes ||
-			len(src.Title) > maxCompiledTaskSourceTextBytes ||
-			!utf8.ValidString(src.Platform) || !utf8.ValidString(src.Capability) ||
-			!utf8.ValidString(src.Title) || !utf8.ValidString(src.URL) {
+	seenURLs := make(map[string]struct{}, len(plan.Targets))
+	for i := range plan.Targets {
+		target := &plan.Targets[i]
+		if len(target.Platform) > maxCompiledTaskTargetTextBytes ||
+			len(target.Capability) > maxCompiledTaskTargetTextBytes ||
+			len(target.Title) > maxCompiledTaskTargetTextBytes ||
+			!utf8.ValidString(target.Platform) || !utf8.ValidString(target.Capability) ||
+			!utf8.ValidString(target.Title) || !utf8.ValidString(target.URL) {
 			return nil, compiledTaskValidationError(
-				fmt.Sprintf("fetch_plan.sources[%d] 文本大小或编码非法", i), nil)
+				fmt.Sprintf("fetch_plan.targets[%d] 文本大小或编码非法", i), nil)
 		}
-		if strings.TrimSpace(src.Platform) == "" || strings.TrimSpace(src.Platform) != src.Platform {
+		if strings.TrimSpace(target.Platform) == "" || strings.TrimSpace(target.Platform) != target.Platform {
 			return nil, compiledTaskValidationError(
-				fmt.Sprintf("fetch_plan.sources[%d].platform 必须是无首尾空白的非空字符串", i), nil)
+				fmt.Sprintf("fetch_plan.targets[%d].platform 必须是无首尾空白的非空字符串", i), nil)
 		}
-		if strings.TrimSpace(src.Capability) == "" || strings.TrimSpace(src.Capability) != src.Capability {
+		if strings.TrimSpace(target.Capability) == "" || strings.TrimSpace(target.Capability) != target.Capability {
 			return nil, compiledTaskValidationError(
-				fmt.Sprintf("fetch_plan.sources[%d].capability 必须是无首尾空白的非空字符串", i), nil)
+				fmt.Sprintf("fetch_plan.targets[%d].capability 必须是无首尾空白的非空字符串", i), nil)
 		}
-		if strings.TrimSpace(src.URL) == "" || strings.TrimSpace(src.URL) != src.URL ||
-			len(src.URL) > maxCompiledTaskSourceURLBytes {
+		if strings.TrimSpace(target.URL) == "" || strings.TrimSpace(target.URL) != target.URL ||
+			len(target.URL) > maxCompiledTaskTargetURLBytes {
 			return nil, compiledTaskValidationError(
-				fmt.Sprintf("fetch_plan.sources[%d].url 必须是无首尾空白的非空字符串", i), nil)
+				fmt.Sprintf("fetch_plan.targets[%d].url 必须是无首尾空白的非空字符串", i), nil)
 		}
-		if _, duplicate := seenURLs[src.URL]; duplicate {
+		if (target.ToolName == "") != (len(bytes.TrimSpace(target.ToolArgs)) == 0) {
 			return nil, compiledTaskValidationError(
-				fmt.Sprintf("fetch_plan 含重复 URL：%s", src.URL), nil)
+				fmt.Sprintf(
+					"fetch_plan.targets[%d] 的 tool_name 与 tool_arguments 必须同时存在或同时缺失",
+					i,
+				), nil,
+			)
 		}
-		seenURLs[src.URL] = struct{}{}
+		if target.ToolName != "" {
+			if strings.TrimSpace(target.ToolName) != target.ToolName ||
+				len(target.ToolName) > maxCompiledTaskTargetTextBytes ||
+				!utf8.ValidString(target.ToolName) {
+				return nil, compiledTaskValidationError(
+					fmt.Sprintf("fetch_plan.targets[%d].tool_name 非法", i), nil,
+				)
+			}
+			if err := validateJSONObject(target.ToolArgs,
+				fmt.Sprintf("fetch_plan.targets[%d].tool_arguments", i)); err != nil {
+				return nil, err
+			}
+		}
+		if _, duplicate := seenURLs[target.URL]; duplicate {
+			return nil, compiledTaskValidationError(
+				fmt.Sprintf("fetch_plan 含重复 URL：%s", target.URL), nil)
+		}
+		seenURLs[target.URL] = struct{}{}
 
-		if len(bytes.TrimSpace(src.Config)) == 0 {
-			src.Config = json.RawMessage("{}")
+		if len(bytes.TrimSpace(target.Config)) == 0 {
+			target.Config = json.RawMessage("{}")
 			continue
 		}
-		if err := validateJSONObject(src.Config,
-			fmt.Sprintf("fetch_plan.sources[%d].config", i)); err != nil {
+		if err := validateJSONObject(target.Config,
+			fmt.Sprintf("fetch_plan.targets[%d].config", i)); err != nil {
 			return nil, err
 		}
 	}
@@ -290,14 +316,14 @@ func lockValidMembership(ctx context.Context, tx pgx.Tx, tenantID, userID int64)
 	return nil
 }
 
-func getOrCreateCompiledPlanSource(
+func getOrCreateCompiledPlanTarget(
 	ctx context.Context,
 	tx pgx.Tx,
-	src compiledPlanSource,
+	src compiledPlanTarget,
 ) (int64, error) {
 	var id int64
 	err := tx.QueryRow(ctx,
-		`INSERT INTO sources (platform, capability, url, title, config)
+		`INSERT INTO fetch_targets (platform, capability, url, title, config)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (url) DO NOTHING
 		 RETURNING id`,
@@ -309,9 +335,22 @@ func getOrCreateCompiledPlanSource(
 		return 0, err
 	}
 
-	// 同 URL 已存在：只取 id，不更新任何全局源字段或抓取状态。
-	if err := tx.QueryRow(ctx, `SELECT id FROM sources WHERE url = $1`, src.URL).Scan(&id); err != nil {
+	// URL is the global dedup key. Reuse is allowed only when acquisition
+	// semantics match; title is display-only and is deliberately excluded.
+	var platform, capability string
+	var config json.RawMessage
+	if err := tx.QueryRow(ctx,
+		`SELECT id, platform, capability, config
+		   FROM fetch_targets WHERE url = $1
+		   FOR KEY SHARE`,
+		src.URL,
+	).Scan(&id, &platform, &capability, &config); err != nil {
 		return 0, err
+	}
+	if platform != src.Platform || capability != src.Capability ||
+		!taskCreationJSONEqual(config, src.Config) {
+		return 0, types.NewAppError(types.CodeConflict,
+			fmt.Sprintf("同一 URL 已存在不同抓取语义（url=%s）", src.URL), nil)
 	}
 	return id, nil
 }
@@ -325,20 +364,20 @@ func compiledPlanLinksExact(
 	var exact bool
 	err := tx.QueryRow(ctx,
 		`SELECT
-		    (SELECT count(*) FROM schedule_sources WHERE schedule_id = $1)
+		    (SELECT count(*) FROM task_fetch_targets WHERE schedule_id = $1)
 		      = cardinality($2::text[])
 		    AND NOT EXISTS (
 		        (SELECT planned_url FROM unnest($2::text[]) AS planned(planned_url))
 		        EXCEPT
 		        (SELECT s.url
-		           FROM schedule_sources ss
-		           JOIN sources s ON s.id = ss.source_id
+		           FROM task_fetch_targets ss
+		           JOIN fetch_targets s ON s.id = ss.fetch_target_id
 		          WHERE ss.schedule_id = $1)
 		    )
 		    AND NOT EXISTS (
 		        (SELECT s.url
-		           FROM schedule_sources ss
-		           JOIN sources s ON s.id = ss.source_id
+		           FROM task_fetch_targets ss
+		           JOIN fetch_targets s ON s.id = ss.fetch_target_id
 		          WHERE ss.schedule_id = $1)
 		        EXCEPT
 		        (SELECT planned_url FROM unnest($2::text[]) AS planned(planned_url))

@@ -3,8 +3,8 @@
 // 暴露给 agent——agent 用 search_endpoints 元工具按需发现端点，命中的端点被动态
 // 注入为一等 FC 工具（agent/toolset.go）。
 //
-// 与 sourcecatalog 的分界（契约 §1）：
-//   - sourcecatalog：订阅信源（追新入库→打分→推送）的实测准入注册表，每行背后是
+// 与 capabilitycatalog 的分界（契约 §1）：
+//   - capabilitycatalog：订阅信源（追新入库→打分→推送）的实测准入注册表，每行背后是
 //     手写 fetcher + 归一化 + 实测结论，Available 是质量承诺。
 //   - tikhubcatalog（本包）：一次性查询（lookup）的端点目录，**未逐个实测**，
 //     结果原样回给 agent 阅读、不进 content_items——错误会被模型和用户直接看到，

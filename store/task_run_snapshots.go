@@ -27,7 +27,6 @@ const (
 	taskRunPolicyDigestVersion     = "vane.runtime-policy-digest/v1"
 
 	taskRunSourceScopeApproved = "approved_plan"
-	taskRunSourceScopeLegacy   = "legacy_subscriptions"
 
 	maxTaskRunReferenceBytes = 512
 	maxTaskRunPayloadBytes   = 2 << 20
@@ -526,7 +525,7 @@ func loadTaskRunDefinition(
 	var strictness *string
 	// Pre-A2 schedules may legitimately have no playbook row; the legacy
 	// runtime treated that exactly like an empty playbook. Preserve that
-	// behavior only when schedule_sources is also empty (checked below).
+	// behavior only when task_fetch_targets is also empty (checked below).
 	err := tx.QueryRow(ctx,
 		`SELECT s.nl_description, s.spec_json, s.scope_json, s.push_strictness,
 		        COALESCE(pb.content, ''), COALESCE(pb.fetch_plan, '{}'::jsonb)
@@ -573,27 +572,8 @@ func loadTaskRunDefinition(
 	}
 	var definitionDigest string
 	if len(planObject) == 0 {
-		canonicalEmpty, canonicalErr := canonicalTaskRunJSONObject(definition.FetchPlan)
-		if canonicalErr != nil || !bytes.Equal(canonicalEmpty, []byte("{}")) {
-			return taskRunDefinitionPayload{}, "", "", taskRunIntegrityError()
-		}
-		linksEmpty, linksErr := taskRunScheduleLinksEmpty(ctx, tx, p.TaskID)
-		if linksErr != nil {
-			return taskRunDefinitionPayload{}, "", "", linksErr
-		}
-		if !linksEmpty {
-			return taskRunDefinitionPayload{}, "", "", taskRunIntegrityError()
-		}
-		definition.SourceScope = taskRunSourceScopeLegacy
-		definition.FetchPlan = canonicalEmpty
-		definition.Sources, err = loadLegacyTaskRunSources(ctx, tx, p.TenantID, p.UserID)
-		if err != nil {
-			return taskRunDefinitionPayload{}, "", "", err
-		}
-		definitionDigest, err = digestTaskRunLegacyDefinition(definition)
-		if err != nil {
-			return taskRunDefinitionPayload{}, "", "", taskRunIntegrityError()
-		}
+		return taskRunDefinitionPayload{}, "", "",
+			taskRunValidationError("task run requires an approved fetch plan")
 	} else {
 		definition.SourceScope = taskRunSourceScopeApproved
 		compiledDef := types.PausedCompiledTaskDefinition{
@@ -611,18 +591,35 @@ func loadTaskRunDefinition(
 		if validateErr != nil {
 			return taskRunDefinitionPayload{}, "", "", taskRunIntegrityError()
 		}
-		canonicalPlan, marshalErr := canonicalTaskRunCompiledPlan(plan)
+		_, marshalErr := canonicalTaskRunCompiledPlan(plan)
 		if marshalErr != nil {
 			return taskRunDefinitionPayload{}, "", "", taskRunIntegrityError()
 		}
-		definition.FetchPlan = canonicalPlan
-		compiledDef.FetchPlan = canonicalPlan
+		// The mutable task model uses fetch_plan.targets. The immutable
+		// task-run-snapshot/v1 wire is already deployed with fetch_plan.sources,
+		// so adapt explicitly at this boundary instead of reinterpreting v1.
+		legacyPlan := taskRunFetchPlanV1{
+			Sources: make([]taskRunPlanSourceV1, len(plan.Targets)),
+		}
+		for index, target := range plan.Targets {
+			legacyPlan.Sources[index] = taskRunPlanSourceV1{
+				Platform: target.Platform, Capability: target.Capability,
+				Title: target.Title, URL: target.URL, Config: target.Config,
+			}
+		}
+		canonicalLegacyPlan, marshalErr :=
+			canonicalTaskRunCompiledPlanV1(&legacyPlan)
+		if marshalErr != nil {
+			return taskRunDefinitionPayload{}, "", "", taskRunIntegrityError()
+		}
+		definition.FetchPlan = canonicalLegacyPlan
+		compiledDef.FetchPlan = canonicalLegacyPlan
 		definition.Sources, err = loadApprovedTaskRunSources(
-			ctx, tx, p.TaskID, plan.Sources)
+			ctx, tx, p.TaskID, plan.Targets)
 		if err != nil {
 			return taskRunDefinitionPayload{}, "", "", err
 		}
-		if len(definition.Sources) != len(plan.Sources) {
+		if len(definition.Sources) != len(plan.Targets) {
 			return taskRunDefinitionPayload{}, "", "", taskRunIntegrityError()
 		}
 		definitionDigest, err = types.DigestPausedCompiledTaskDefinition(compiledDef)
@@ -641,12 +638,12 @@ func loadApprovedTaskRunSources(
 	ctx context.Context,
 	tx pgx.Tx,
 	taskID string,
-	planned []compiledPlanSource,
+	planned []compiledPlanTarget,
 ) ([]taskRunSourceIdentity, error) {
 	rows, err := tx.Query(ctx,
 		`SELECT s.id, s.url
-		   FROM schedule_sources ss
-		   JOIN sources s ON s.id = ss.source_id
+		   FROM task_fetch_targets ss
+		   JOIN fetch_targets s ON s.id = ss.fetch_target_id
 		  WHERE ss.schedule_id = $1
 		  ORDER BY s.url, s.id
 		  FOR SHARE OF ss, s`, taskID)
@@ -662,7 +659,7 @@ func loadApprovedTaskRunSources(
 		if err := rows.Scan(&sourceID, &sourceURL); err != nil {
 			return nil, taskRunDatabaseError("scan approved task run source link", err)
 		}
-		if sourceID <= 0 || !validTaskRunSourceText(sourceURL, maxCompiledTaskSourceURLBytes) {
+		if sourceID <= 0 || !validTaskRunSourceText(sourceURL, maxCompiledTaskTargetURLBytes) {
 			return nil, taskRunIntegrityError()
 		}
 		if _, duplicate := linkedIDs[sourceURL]; duplicate {
@@ -700,42 +697,6 @@ func loadApprovedTaskRunSources(
 	return sources, nil
 }
 
-func taskRunScheduleLinksEmpty(
-	ctx context.Context,
-	tx pgx.Tx,
-	taskID string,
-) (bool, error) {
-	var empty bool
-	if err := tx.QueryRow(ctx,
-		`SELECT NOT EXISTS (
-			SELECT 1 FROM schedule_sources WHERE schedule_id = $1
-		)`, taskID).Scan(&empty); err != nil {
-		return false, taskRunDatabaseError("validate legacy task run source links", err)
-	}
-	return empty, nil
-}
-
-func loadLegacyTaskRunSources(
-	ctx context.Context,
-	tx pgx.Tx,
-	tenantID, userID int64,
-) ([]taskRunSourceIdentity, error) {
-	rows, err := tx.Query(ctx,
-		`SELECT s.id, s.platform, s.capability, s.title, s.url, s.config
-		   FROM subscriptions sub
-		   JOIN sources s ON s.id = sub.source_id
-		  WHERE sub.tenant_id = $1 AND sub.user_id = $2
-		    AND sub.status = $3 AND s.status = $4
-		  ORDER BY s.url, s.id
-		  FOR SHARE OF sub, s`,
-		tenantID, userID, types.SubscriptionStatusActive, types.SourceStatusActive)
-	if err != nil {
-		return nil, taskRunDatabaseError("load legacy task run sources", err)
-	}
-	defer rows.Close()
-	return collectTaskRunSources(rows)
-}
-
 func collectTaskRunSources(rows pgx.Rows) ([]taskRunSourceIdentity, error) {
 	sources := make([]taskRunSourceIdentity, 0)
 	for rows.Next() {
@@ -770,6 +731,23 @@ func sortTaskRunSources(sources []taskRunSourceIdentity) {
 }
 
 func validateStoredTaskRunSnapshot(
+	snapshot *taskRunSnapshot,
+	p CreateOrGetTaskRunSnapshotParams,
+) error {
+	if snapshot == nil {
+		return taskRunIntegrityError()
+	}
+	switch snapshot.ReferenceSchemaVersion {
+	case taskRunReferenceSchemaVersionV1:
+		return validateStoredTaskRunSnapshotV1(snapshot, p)
+	case types.RunSnapshotSchemaVersionV2:
+		return validateStoredTaskRunSnapshotV2(snapshot, p)
+	default:
+		return taskRunIntegrityError()
+	}
+}
+
+func validateStoredTaskRunSnapshotV1(
 	snapshot *taskRunSnapshot,
 	p CreateOrGetTaskRunSnapshotParams,
 ) error {
@@ -839,10 +817,10 @@ func validTaskRunReference(value string) bool {
 }
 
 func validTaskRunSourceIdentity(source taskRunSourceIdentity) bool {
-	return source.SourceID > 0 && validTaskRunSourceText(source.Platform, maxCompiledTaskSourceTextBytes) &&
-		validTaskRunSourceText(source.Capability, maxCompiledTaskSourceTextBytes) &&
-		validTaskRunSourceText(source.URL, maxCompiledTaskSourceURLBytes) &&
-		len(source.Title) <= maxCompiledTaskSourceTextBytes && utf8.ValidString(source.Title)
+	return source.SourceID > 0 && validTaskRunSourceText(source.Platform, maxCompiledTaskTargetTextBytes) &&
+		validTaskRunSourceText(source.Capability, maxCompiledTaskTargetTextBytes) &&
+		validTaskRunSourceText(source.URL, maxCompiledTaskTargetURLBytes) &&
+		len(source.Title) <= maxCompiledTaskTargetTextBytes && utf8.ValidString(source.Title)
 }
 
 func validTaskRunSourceText(value string, maxBytes int) bool {

@@ -30,7 +30,6 @@ import (
 	"github.com/YouToco/vane/agent"
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
 )
 
@@ -310,7 +309,7 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 				externalContext = true
 			}
 		}
-		h.handleWithAgent(ctx, runner, msgID, openID, user.ID, text, externalContext)
+		h.handleWithAgent(ctx, runner, msgID, user.ID, text, externalContext)
 		return
 	}
 
@@ -334,10 +333,9 @@ func (h *handler) handle(ctx context.Context, event *larkim.P2MessageReceiveV1) 
 	h.reply(ctx, msgID, BuildReplyCard(resp.Content))
 }
 
-// handleWithAgent 把消息交给 agent loop 并回复 Outcome.Reply；Confirm 非 nil
-// 时追加发一张确认卡。确认卡走 SendCard 新消息而非 reply：它有独立生命周期
-// （按钮回调后原地更新为结果），挂在原消息的回复串里会把两种语义搅在一起。
-func (h *handler) handleWithAgent(ctx context.Context, runner AgentRunner, msgID, openID string, userID int64, text string, externalContext bool) {
+// handleWithAgent sends one natural-language request through the direct Agent
+// control plane and replies with its terminal result.
+func (h *handler) handleWithAgent(ctx context.Context, runner AgentRunner, msgID string, userID int64, text string, externalContext bool) {
 	// 整条消息的总预算（审查 #信号量瘫痪的纵深防御）：agent 单次模型调用已有
 	// 120s 超时，这里再兜住工具执行/DB 调用同类挂死——连接级 ctx 无 deadline，
 	// 没有这层预算时任何一环黑洞都会让 goroutine 永久滞留。
@@ -357,15 +355,6 @@ func (h *handler) handleWithAgent(ctx context.Context, runner AgentRunner, msgID
 		return
 	}
 	h.reply(ctx, msgID, BuildReplyCard(out.Reply))
-	if out.Confirm == nil {
-		return
-	}
-	card := BuildConfirmCard(out.Confirm.Summary, out.Confirm.ActionID)
-	if _, err := h.m.SendCard(ctx, openID, card); err != nil {
-		// 确认卡丢失意味着动作永远无法被确认（24h 后过期），必须明确告知用户。
-		slog.Error("feishu: 发送确认卡失败", "err", err, "action_id", out.Confirm.ActionID)
-		h.reply(ctx, msgID, BuildReplyCard("确认卡发送失败，本次操作未生效，请稍后重试。"))
-	}
 }
 
 // typingEmoji 是打字指示器使用的表情类型。处理消息期间在用户消息上展示，
@@ -411,10 +400,7 @@ func (h *handler) removeTypingIndicator(ctx context.Context, msgID, reactionID s
 
 // botMenuCommands 将菜单 event_key 映射到交给 agent 的合成指令。
 // 菜单项在飞书开发者后台「机器人 → 机器人菜单」配置，event_key 需一致。
-var botMenuCommands = map[string]string{
-	"push_now":     "请立即执行一次推送",
-	"list_sources": "请列出当前所有订阅源的状态",
-}
+var botMenuCommands = map[string]string{}
 
 // handleBotMenu 处理机器人菜单点击事件：将菜单 event_key 转换为合成消息，
 // 交给 agent loop 统一处理，结果以新消息送达。
@@ -468,292 +454,17 @@ func (h *handler) handleBotMenu(ctx context.Context, event *larkapplication.P2Bo
 		return
 	}
 	h.m.SendCard(ctx, openID, BuildReplyCard(out.Reply))
-	if out.Confirm != nil {
-		card := BuildConfirmCard(out.Confirm.Summary, out.Confirm.ActionID)
-		if _, err := h.m.SendCard(ctx, openID, card); err != nil {
-			slog.Error("feishu: 菜单确认卡发送失败", "err", err, "action_id", out.Confirm.ActionID)
-		}
-	}
 }
 
-// cardActionSyncBudget 是卡片回调的同步等待预算。飞书要求回调 3 秒内响应，
-// 否则重推事件；预留网络与前置查库的余量后取 2.5s。v1 超时只回 toast，
-// 终态由耐久 outbox 原地 Patch；历史 v0 仍走有界异步补发。
-const cardActionSyncBudget = 2500 * time.Millisecond
+// feedbackCallbackSyncBudget leaves room under Feishu's callback deadline.
+const feedbackCallbackSyncBudget = 2500 * time.Millisecond
 
 // agentMessageBudget 是一条 agent 消息端到端的硬预算（多轮模型调用 + 工具执行）。
 // 5 分钟容得下 maxTurns 内的正常循环，同时保证任何一环挂死都不会永久滞留。
 const agentMessageBudget = 5 * time.Minute
 
-// cardActionExecBudget 是确认动作执行（Claim 之后）的硬预算：脱离连接级 ctx 后
-// 必须有自己的上限，防工具内 DB/Temporal 调用无限阻塞。
-const cardActionExecBudget = 30 * time.Second
+const feedbackCallbackExecBudget = 30 * time.Second
 
-// cardActionLifecycleBudget 覆盖动作执行及历史 v0 的超时结果补发。两段各自
-// 仍有独立 deadline；多留 1 秒只用于 goroutine 调度与阶段切换。
-const cardActionLifecycleBudget = cardActionExecBudget + 15*time.Second + time.Second
-
-// cardActionResult 是确认/取消动作的执行结果：text 恒为可直接展示的人话
-// （含失败话术），ok 仅用于区分 toast 的成功/失败样式。
-type cardActionResult struct {
-	text     string
-	ok       bool
-	durable  bool
-	preserve bool
-}
-
-// onCardAction 处理确认卡按钮回调（契约 §9）：owner 校验 → confirm/cancel。
-// v1 在接受动作的同一事务中绑定原卡 message ID，终态仅由 outbox Patch；v0
-// 保留原同步更新/超时补发行为。恒返回 nil error，避免飞书无意义重推。
-func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTriggerEvent) (resp *callback.CardActionTriggerResponse, _ error) {
-	finish, accepted := h.m.beginCallback()
-	if !accepted {
-		return toastResponse("error", "服务正在重启，请稍后重试"), nil
-	}
-	defer finish()
-
-	// 与 handle 相同的 panic 兜底：WS 回调链上的 panic 会带崩整个进程。
-	// 命名返回值让 recover 后仍能给用户一个失败 toast 而非静默。
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Error("feishu: 卡片回调处理 panic", "recover", r)
-			resp = toastResponse("error", "内部错误，请稍后重试")
-		}
-	}()
-
-	if event == nil || event.Event == nil || event.Event.Action == nil {
-		return toastResponse("error", "回调数据缺失"), nil
-	}
-	verb, actionID := parseCardActionValue(event.Event.Action.Value)
-	fbAction, deliveryID, isFeedback := parseFeedbackValue(event.Event.Action.Value)
-	reasonDeliveryID, reasonCode, isReasonSubmit := parseFeedbackReasonValue(event.Event.Action.Value)
-	// 四类 value 之外（含 value 结构不识别）静默忽略，不弹错误打扰。
-	if !isFeedback && !isReasonSubmit && (actionID == "" || (verb != cardActionConfirm && verb != cardActionCancel)) {
-		return &callback.CardActionTriggerResponse{}, nil
-	}
-
-	var operatorID string
-	if event.Event.Operator != nil {
-		operatorID = event.Event.Operator.OpenID
-	}
-	// owner 为空（进程重启后缓存未预热等）时同样拒绝：宁可让主人重点一次，
-	// 也不能让白名单出现空窗（契约 §10：写动作只有 owner 能确认）。
-	// 反馈按钮共用这道校验：反馈会驱动画像演化与深度解读（付费调用）。
-	if owner := h.m.ownerID(); operatorID == "" || owner == "" || operatorID != owner {
-		return toastResponse("error", "仅主人可操作"), nil
-	}
-
-	// 推送卡反馈（M5）在此与确认卡（M4）分流：分流点放在 agent 就绪检查之前，
-	// 且自带一次 UpsertUserByOpenID——反馈不依赖 agent loop（Notifier 缺席只是
-	// 少一条会话通告），下面 M4 路径的每一行则保持原样不动。
-	if isFeedback {
-		user, err := h.m.st.UpsertUserByOpenID(h.ctx, operatorID, "")
-		if err != nil {
-			slog.Error("feishu: 反馈回调 upsert 用户失败", "err", err, "open_id", operatorID)
-			return toastResponse("error", "内部数据错误，请稍后重试"), nil
-		}
-		return h.onFeedbackAction(user.ID, fbAction, deliveryID), nil
-	}
-	if isReasonSubmit {
-		user, err := h.m.st.UpsertUserByOpenID(h.ctx, operatorID, "")
-		if err != nil {
-			slog.Error("feishu: 反馈原因回调 upsert 用户失败", "err", err, "open_id", operatorID)
-			return toastResponse("error", "内部数据错误，请稍后重试"), nil
-		}
-		detail, rerr := extractReasonFromForm(event.Event.Action.Name, event.Event.Action.FormValue, reasonDeliveryID, reasonCode)
-		if rerr != nil {
-			// 三重对齐失败 = 提交按钮与 value 指向的条目对不上。绝不猜、绝不静默落库
-			// ——错误归属的 misjudged 不可撤销且会毒化画像演化（附录 A.4 红线）。
-			slog.Error("feishu: 反馈原因表单对齐校验失败，拒绝落库",
-				"action_name", event.Event.Action.Name, "delivery_id", reasonDeliveryID, "err", rerr)
-			return toastResponse("error", "表单数据异常，请重新点击 👎 后再试"), nil
-		}
-		return h.onFeedbackReasonSubmit(user.ID, reasonDeliveryID, reasonCode, detail), nil
-	}
-
-	runner := h.m.agentRunner()
-	if runner == nil {
-		return toastResponse("error", "助手尚未就绪，请稍后重试"), nil
-	}
-	durableRunner, durableCapable := runner.(DurableAgentRunner)
-	var openMessageID string
-	if event.Event.Context != nil {
-		openMessageID = strings.TrimSpace(event.Event.Context.OpenMessageID)
-	}
-	if durableCapable && openMessageID == "" {
-		// A v1 click without the exact original card resource cannot acquire the
-		// saga: accepting it would recreate A5's "operation finished but no
-		// durable place to report it" failure mode. Legacy test runners keep the
-		// old seam; the production Loop always implements DurableAgentRunner.
-		return toastResponse("error", "确认卡身份缺失，请在原卡片上重试"), nil
-	}
-	receiptTarget := task.CreationReceiptTarget{
-		Provider: task.FeishuCardPatchReceiptProviderForApp(h.appID),
-		Target:   openMessageID,
-	}
-	if durableCapable && receiptTarget.Provider == "" {
-		return toastResponse("error", "确认卡通道身份缺失，请在重新连接后重试"), nil
-	}
-
-	// 拿内部 user.ID：ExecuteAction/CancelAction 还会用它比对
-	// pending_action.user_id（服务端二次校验，契约 §10）。
-	user, err := h.m.st.UpsertUserByOpenID(h.ctx, operatorID, "")
-	if err != nil {
-		slog.Error("feishu: 卡片回调 upsert 用户失败", "err", err, "open_id", operatorID)
-		return toastResponse("error", "内部数据错误，请稍后重试"), nil
-	}
-
-	// 动作放受 Manager 跟踪的 goroutine 执行：既是 2.5s 预算的实现载体，
-	// 也让优雅停机先等待已接纳动作，不在 DB/Temporal 仍被使用时关闭资源。
-	// ctx 与连接生命周期解耦（审查 #Reconfigure 丢执行）：Claim 一旦成功动作即被
-	// 置为 executed 且不可再领取，此后的执行不能随 WS 换代（Dashboard 保存配置触发
-	// Reconfigure → h.ctx 取消）被中断，否则动作永久标记已执行但实际没执行、
-	// 结果也无处送达。startAsync 的 detachParent 摆脱连接取消，但动作与补发各自
-	// 仍有 deadline，并在 Manager 停机宽限耗尽时收到取消。
-	done := make(chan cardActionResult, 1)
-	followUp := make(chan bool, 1)
-	if !h.m.startAsync(h.ctx, cardActionLifecycleBudget, true, "card_action", func(workCtx context.Context) {
-		res := func() (res cardActionResult) {
-			execCtx, cancel := context.WithTimeout(workCtx, cardActionExecBudget)
-			defer cancel()
-			defer func() {
-				if recovered := recover(); recovered != nil {
-					slog.Error("feishu: 卡片动作执行 panic", "recover", recovered, "action_id", actionID)
-					// A durable-capable production runner may have panicked either
-					// before or after binding the provider target. In both cases the
-					// only safe callback response is a toast: replacing the card would
-					// remove the user's retry path or race a terminal outbox PATCH.
-					res = cardActionResult{
-						text: "内部错误，请稍后重试。", preserve: durableCapable,
-					}
-				}
-			}()
-			var outcome agent.CardActionOutcome
-			var actionErr error
-			if durableCapable && verb == cardActionConfirm {
-				outcome, actionErr = durableRunner.ExecuteActionWithReceipt(
-					execCtx, user.ID, actionID, receiptTarget,
-				)
-			} else if durableCapable {
-				outcome, actionErr = durableRunner.CancelActionWithReceipt(
-					execCtx, user.ID, actionID, receiptTarget,
-				)
-			} else if verb == cardActionConfirm {
-				outcome.Text, actionErr = runner.ExecuteAction(execCtx, user.ID, actionID)
-			} else {
-				outcome.Text, actionErr = runner.CancelAction(execCtx, user.ID, actionID)
-			}
-			if actionErr != nil {
-				slog.Error("feishu: 卡片动作执行失败", "err", actionErr, "action_id", actionID, "vane_action", verb)
-				return cardActionResult{
-					text:    "执行失败：" + humanizeLLMError(actionErr),
-					durable: outcome.DurableReceipt, preserve: outcome.PreserveCard,
-				}
-			}
-			return cardActionResult{
-				text: outcome.Text, ok: true,
-				durable: outcome.DurableReceipt, preserve: outcome.PreserveCard,
-			}
-		}()
-
-		done <- res
-		select {
-		case shouldSend := <-followUp:
-			if !shouldSend {
-				return
-			}
-		case <-workCtx.Done():
-			return
-		}
-
-		if res.durable || res.preserve {
-			// Durable v1 results are delivered by the fenced outbox. PreserveCard
-			// is a pre-accept failure: no mutation was promised and the user must
-			// retain the original buttons for retry. Neither path may create a new
-			// message here.
-			return
-		}
-		// Historical v0 tools retain their bounded best-effort follow-up.
-		sendCtx, cancel := context.WithTimeout(workCtx, 15*time.Second)
-		defer cancel()
-		if _, sendErr := h.m.SendCard(sendCtx, operatorID, BuildReplyCard(res.text)); sendErr != nil {
-			slog.Error("feishu: 补发卡片动作结果失败", "err", sendErr, "action_id", actionID)
-		}
-	}) {
-		return toastResponse("error", "服务正在重启，请稍后重试"), nil
-	}
-
-	timer := time.NewTimer(cardActionSyncBudget)
-	defer timer.Stop()
-	select {
-	case res := <-done:
-		followUp <- false
-		if res.preserve {
-			toastType := "error"
-			if res.ok {
-				toastType = "success"
-			}
-			return toastResponse(toastType, res.text), nil
-		}
-		if res.durable {
-			// Besides immediate feedback, this upgrades any pre-A6 confirmation
-			// card to update_multi=true before the delayed REST PATCH. A replayed
-			// terminal callback sets preserve above, so it can never overwrite an
-			// already-final card with this processing state.
-			return &callback.CardActionTriggerResponse{
-				Toast: &callback.Toast{Type: "success", Content: res.text},
-				Card: &callback.Card{
-					Type: "raw",
-					Data: json.RawMessage(BuildReplyCard("正在可靠处理，最终结果会更新在这张卡片上。")),
-				},
-			}, nil
-		}
-		toastType, toastText := "success", "已处理"
-		if !res.ok {
-			toastType, toastText = "error", "执行失败"
-		}
-		// 原地把卡片更新为结果文本，正文样式沿用 BuildReplyCard；
-		// type=raw 表示 data 是完整卡片 JSON（SDK callback.Card 约定）。
-		return &callback.CardActionTriggerResponse{
-			Toast: &callback.Toast{Type: toastType, Content: toastText},
-			Card: &callback.Card{
-				Type: "raw",
-				Data: json.RawMessage(BuildReplyCard(res.text)),
-			},
-		}, nil
-	case <-timer.C:
-		followUp <- true
-		if durableCapable {
-			// Do not replace the card in the callback response. A terminal PATCH
-			// may already have succeeded when this callback is retried; returning a
-			// processing card here could overwrite that final state. The outbox is
-			// first due after the callback response window.
-			return toastResponse("info", "正在受理；若卡片未更新，请重试"), nil
-		}
-		// Toast + 撤下按钮（审查 #二次点击误导）：只回 toast 时按钮仍在，用户再点会
-		// 命中 Claim 幂等拒绝、卡片被替换成"已处理过"的三义文案，随后真结果又以新消息
-		// 到达——顺序错乱像失败。原地把卡片换成"执行中"说明，消除整个二次点击窗口。
-		return &callback.CardActionTriggerResponse{
-			Toast: &callback.Toast{Type: "info", Content: "执行中，稍后看结果消息"},
-			Card: &callback.Card{
-				Type: "raw",
-				Data: json.RawMessage(BuildReplyCard("执行中，结果稍后以新消息送达。")),
-			},
-		}, nil
-	}
-}
-
-// parseCardActionValue 从按钮 value（SDK 定型 map[string]interface{}）提取
-// vane_action 与 action_id；非字符串值按缺失处理（value 可被客户端伪造，
-// 类型断言失败不能 panic）。
-func parseCardActionValue(value map[string]interface{}) (verb, actionID string) {
-	verb, _ = value["vane_action"].(string)
-	actionID, _ = value["action_id"].(string)
-	return verb, actionID
-}
-
-// feedbackButtonActions 是按钮 value 里 fb 字段的白名单（M5 契约 §10.1）：
-// question 不出现在按钮上（它由回复消息产生）。
 var feedbackButtonActions = map[string]types.FeedbackAction{
 	string(types.FeedbackActionInterested):    types.FeedbackActionInterested,
 	string(types.FeedbackActionNotInterested): types.FeedbackActionNotInterested,
@@ -761,52 +472,95 @@ var feedbackButtonActions = map[string]types.FeedbackAction{
 	string(types.FeedbackActionDeepDive):      types.FeedbackActionDeepDive,
 }
 
-// parseFeedbackValue 解析推送卡反馈按钮的 value（M5 契约 §10.1）。
-// 任何字段缺失/类型不符/不在白名单/id 非法 → ok=false（调用方静默忽略）：
-// value 完全由客户端提供，解析层只做形状校验，语义与归属由服务端库内裁决。
-func parseFeedbackValue(value map[string]interface{}) (action types.FeedbackAction, deliveryID int64, ok bool) {
+func parseFeedbackValue(value map[string]interface{}) (types.FeedbackAction, int64, bool) {
 	if verb, _ := value["vane_action"].(string); verb != cardActionFeedback {
 		return "", 0, false
 	}
-	raw, _ := value["fb"].(string)
-	action, known := feedbackButtonActions[raw]
+	action, known := feedbackButtonActions[valueString(value, "fb")]
 	if !known {
 		return "", 0, false
 	}
-	// delivery_id 恒为字符串（构卡侧 FormatInt）：JSON number 经 SDK 会变 float64，
-	// 大 id 有精度隐患。
-	idStr, _ := value["delivery_id"].(string)
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil || id <= 0 {
+	deliveryID, err := strconv.ParseInt(valueString(value, "delivery_id"), 10, 64)
+	if err != nil || deliveryID <= 0 {
 		return "", 0, false
 	}
-	return action, id, true
+	return action, deliveryID, true
 }
 
-// parseFeedbackReasonValue 解析 form 提交的"fbr" value：只需 delivery_id，
-// 原因文本在 FormValue 里（由调用方提取）。
-func parseFeedbackReasonValue(value map[string]interface{}) (
-	deliveryID int64,
-	reasonCode types.FeedbackReason,
-	ok bool,
-) {
+func parseFeedbackReasonValue(value map[string]interface{}) (int64, types.FeedbackReason, bool) {
 	if verb, _ := value["vane_action"].(string); verb != cardActionFeedbackReason {
 		return 0, "", false
 	}
-	idStr, _ := value["delivery_id"].(string)
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil || id <= 0 {
+	deliveryID, err := strconv.ParseInt(valueString(value, "delivery_id"), 10, 64)
+	if err != nil || deliveryID <= 0 {
 		return 0, "", false
 	}
-	rawReason, _ := value["reason_code"].(string)
-	reasonCode = types.FeedbackReason(rawReason)
-	if reasonCode != "" && !reasonCode.Valid() {
+	reason := types.FeedbackReason(valueString(value, "reason_code"))
+	if reason != "" && !reason.Valid() {
 		return 0, "", false
 	}
-	return id, reasonCode, true
+	return deliveryID, reason, true
 }
 
-// onFeedbackReasonSubmit 处理 👎 后 form 提交的反馈原因。
+func valueString(value map[string]interface{}, key string) string {
+	result, _ := value[key].(string)
+	return result
+}
+
+// onCardAction accepts feedback-card callbacks only.
+func (h *handler) onCardAction(_ context.Context, event *callback.CardActionTriggerEvent) (resp *callback.CardActionTriggerResponse, _ error) {
+	finish, accepted := h.m.beginCallback()
+	if !accepted {
+		return toastResponse("error", "服务正在重启，请稍后重试"), nil
+	}
+	defer finish()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Error("feishu: feedback callback panic", "recover", recovered)
+			resp = toastResponse("error", "内部错误，请稍后重试")
+		}
+	}()
+	if event == nil || event.Event == nil || event.Event.Action == nil {
+		return toastResponse("error", "回调数据缺失"), nil
+	}
+	feedbackAction, deliveryID, isFeedback := parseFeedbackValue(event.Event.Action.Value)
+	reasonDeliveryID, reasonCode, isReasonSubmit := parseFeedbackReasonValue(event.Event.Action.Value)
+	if !isFeedback && !isReasonSubmit {
+		return &callback.CardActionTriggerResponse{}, nil
+	}
+	var operatorID string
+	if event.Event.Operator != nil {
+		operatorID = event.Event.Operator.OpenID
+	}
+	if owner := h.m.ownerID(); operatorID == "" || owner == "" || operatorID != owner {
+		return toastResponse("error", "仅主人可操作"), nil
+	}
+	user, err := h.m.st.UpsertUserByOpenID(h.ctx, operatorID, "")
+	if err != nil {
+		slog.Error("feishu: feedback callback user lookup failed", "err", err, "open_id", operatorID)
+		return toastResponse("error", "内部数据错误，请稍后重试"), nil
+	}
+	if isFeedback {
+		return h.onFeedbackAction(user.ID, feedbackAction, deliveryID), nil
+	}
+	detail, err := extractReasonFromForm(
+		event.Event.Action.Name,
+		event.Event.Action.FormValue,
+		reasonDeliveryID,
+		reasonCode,
+	)
+	if err != nil {
+		slog.Error("feishu: feedback reason form mismatch",
+			"action_name", event.Event.Action.Name,
+			"delivery_id", reasonDeliveryID,
+			"err", err,
+		)
+		return toastResponse("error", "表单数据异常，请重新点击 👎 后再试"), nil
+	}
+	return h.onFeedbackReasonSubmit(
+		user.ID, reasonDeliveryID, reasonCode, detail,
+	), nil
+}
 func (h *handler) onFeedbackReasonSubmit(
 	userID, deliveryID int64,
 	reasonCode types.FeedbackReason,
@@ -818,7 +572,7 @@ func (h *handler) onFeedbackReasonSubmit(
 	}
 
 	done := make(chan feedback.ClickResult, 1)
-	if !h.m.startAsync(h.ctx, cardActionExecBudget, true, "feedback_reason", func(execCtx context.Context) {
+	if !h.m.startAsync(h.ctx, feedbackCallbackExecBudget, true, "feedback_reason", func(execCtx context.Context) {
 		res := func() (res feedback.ClickResult) {
 			defer func() {
 				if recovered := recover(); recovered != nil {
@@ -840,7 +594,7 @@ func (h *handler) onFeedbackReasonSubmit(
 		return toastResponse("error", "服务正在重启，请稍后重试")
 	}
 
-	timer := time.NewTimer(cardActionSyncBudget)
+	timer := time.NewTimer(feedbackCallbackSyncBudget)
 	defer timer.Stop()
 	select {
 	case res := <-done:
@@ -862,11 +616,8 @@ func (h *handler) onFeedbackReasonSubmit(
 
 // onFeedbackAction 处理推送卡反馈按钮点击（M5 契约 §10.3）。
 //
-// 与 M4 确认卡回调的两点刻意差异：
-//  1. 超时后**丢弃结果不补发**——态度/误判是纯 DB 快路径，超时即异常态；且反馈
-//     幂等，用户重点一次即可自愈。确认卡则不同：Claim 成功后动作不可重复领取，
-//     结果不补发就永久丢失，所以那边必须补发。
-//  2. 卡片更新用 feedback 服务返回的整卡 JSON（正文原样保留），而非替换成结果文本。
+// 超时后丢弃同步结果：态度/误判是幂等 DB 快路径，用户重试即可自愈。
+// 卡片更新使用 feedback 服务返回的整卡 JSON，正文原样保留。
 func (h *handler) onFeedbackAction(userID int64, action types.FeedbackAction, deliveryID int64) *callback.CardActionTriggerResponse {
 	fb := h.m.feedbackRunner()
 	if fb == nil {
@@ -874,8 +625,8 @@ func (h *handler) onFeedbackAction(userID int64, action types.FeedbackAction, de
 	}
 
 	done := make(chan feedback.ClickResult, 1)
-	if !h.m.startAsync(h.ctx, cardActionExecBudget, true, "feedback", func(execCtx context.Context) {
-		// 与连接生命周期解耦（同 M4 卡片动作）：deep_dive 会在 HandleClick 内再起
+	if !h.m.startAsync(h.ctx, feedbackCallbackExecBudget, true, "feedback", func(execCtx context.Context) {
+		// 与连接生命周期解耦：deep_dive 会在 HandleClick 内再起
 		// 生成 goroutine，回调链结束不能中断它。
 		res := func() (res feedback.ClickResult) {
 			defer func() {
@@ -896,7 +647,7 @@ func (h *handler) onFeedbackAction(userID int64, action types.FeedbackAction, de
 		return toastResponse("error", "服务正在重启，请稍后重试")
 	}
 
-	timer := time.NewTimer(cardActionSyncBudget)
+	timer := time.NewTimer(feedbackCallbackSyncBudget)
 	defer timer.Stop()
 	select {
 	case res := <-done:
@@ -1221,7 +972,7 @@ func parsePostContent(raw string) string {
 				continue
 			}
 			sb.WriteString(node.Text)
-			// 超链接的目标不能静默丢失：agent 的工具（如 add_source）要的
+			// 超链接的目标不能静默丢失：任务理解需要的
 			// 正是 URL，锚文本与 href 不同时以"锚文本 (href)"并入正文；
 			// 相同（裸链接粘贴的常态）则不重复。
 			if node.Tag == "a" && node.Href != "" && node.Href != node.Text {

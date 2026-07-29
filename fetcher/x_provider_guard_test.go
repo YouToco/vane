@@ -53,7 +53,7 @@ var forbiddenXCredentialName = regexp.MustCompile(
 func TestInvariant_XUserPostsUsesTikHubOnly(t *testing.T) {
 	const endpointName = "twitter_web_fetch_user_post_tweet"
 
-	template, ok := bindingTemplates[bindingKey{
+	template, ok := bindingTemplatesV1[bindingKey{
 		P: types.PlatformX, C: types.CapUserPosts,
 	}]
 	if !ok {
@@ -373,7 +373,7 @@ func TestInvariant_XTikHubFailureDoesNotFallBack(t *testing.T) {
 				ctx, cancel = context.WithTimeout(ctx, tt.contextTTL)
 				defer cancel()
 			}
-			_, err := multi.Fetch(ctx, types.Source{
+			_, err := multi.Fetch(ctx, types.FetchTarget{
 				ID:         7,
 				Platform:   types.PlatformX,
 				Capability: types.CapUserPosts,

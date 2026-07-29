@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"strconv"
 	"strings"
@@ -212,9 +213,20 @@ func seedMigration066DeliveryForUser(
 ) (deliveryID int64) {
 	t.Helper()
 	var sourceID, contentID int64
+	var targetTable string
 	if err := db.QueryRowContext(t.Context(), `
-		INSERT INTO sources(platform,capability,url,title,config,status)
+		SELECT CASE
+		         WHEN to_regclass('public.fetch_targets') IS NOT NULL
+		         THEN 'fetch_targets'
+		         ELSE 'sources'
+		       END`).Scan(&targetTable); err != nil {
+		t.Fatal(err)
+	}
+	insertTarget := fmt.Sprintf(`
+		INSERT INTO %s(platform,capability,url,title,config,status)
 		VALUES('web','search',$1,$2,'{}','active') RETURNING id`,
+		targetTable)
+	if err := db.QueryRowContext(t.Context(), insertTarget,
 		"https://migration-066.example/"+suffix,
 		"migration-066-"+suffix,
 	).Scan(&sourceID); err != nil {

@@ -555,6 +555,18 @@ func (s *Scheduler) ActivateTask(
 	if err != nil {
 		return TaskScheduleSnapshot{}, err
 	}
+	if workflow.IsCompiledToolRuntimeV2(
+		prepared.Action.Params.RuntimeVersion,
+	) {
+		if err := requireToolRuntimeDefinition(
+			ctx, s.st,
+			prepared.TenantID, prepared.UserID, prepared.TaskID,
+		); err != nil {
+			return TaskScheduleSnapshot{}, newTaskScheduleError(
+				TaskScheduleErrorBlocked, "activate",
+				prepared.TaskID, err)
+		}
+	}
 	if err := validateTaskScheduleActivationReceipt(expected, ensured); err != nil {
 		return TaskScheduleSnapshot{}, newTaskScheduleError(
 			TaskScheduleErrorInvalid, "activate", expected.taskID, err,
@@ -1057,7 +1069,8 @@ func (s *Scheduler) buildPreparedTaskSchedule(req TaskScheduleRequest) (Prepared
 	params := makePushParams(req.TenantID, req.UserID, taskID, scope, name)
 	runtimeVersion := s.runtimeVersionFor(taskID, types.ExecutionModeCompiled)
 	fingerprintVersion := taskScheduleFingerprintVersionV1
-	if workflow.IsCompiledRuntimeV1(runtimeVersion) {
+	if workflow.IsCompiledRuntimeV1(runtimeVersion) ||
+		workflow.IsCompiledToolRuntimeV2(runtimeVersion) {
 		// A v2 checkpoint is written only for an explicitly selected C1b
 		// canary/all-task rollout. This keeps dark deployment expansion-safe:
 		// an older binary can still resume every checkpoint written before C1b
@@ -1339,7 +1352,9 @@ func validatePreparedTaskSchedule(prepared PreparedTaskSchedule) error {
 		if params.TenantID != prepared.TenantID || params.ExecutionMode != types.ExecutionModeCompiled {
 			return errors.New("v2 workflow params do not match the prepared tenant and compiled mode")
 		}
-		if params.RuntimeVersion != "" && !workflow.IsCompiledRuntimeV1(params.RuntimeVersion) {
+		if params.RuntimeVersion != "" &&
+			!workflow.IsCompiledRuntimeV1(params.RuntimeVersion) &&
+			!workflow.IsCompiledToolRuntimeV2(params.RuntimeVersion) {
 			return errors.New("prepared Schedule Action runtime version is unsupported")
 		}
 	}

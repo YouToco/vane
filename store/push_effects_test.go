@@ -913,6 +913,12 @@ func TestPushEffectConcurrentClaimHasOneFence(t *testing.T) {
 func TestPushEffectCreateFirstSerializesTenantPurge(t *testing.T) {
 	f := newPushEffectFixture(t)
 	ctx := t.Context()
+	if _, err := f.db.ExecContext(ctx,
+		`UPDATE schedules SET status='paused' WHERE id=$1`,
+		f.prepared.TaskID,
+	); err != nil {
+		t.Fatalf("pause migration-only fixture task: %v", err)
+	}
 	if _, err := f.provider.Up(ctx); err != nil {
 		t.Fatalf("migrate purge fixture to latest: %v", err)
 	}
@@ -992,6 +998,12 @@ func TestPushEffectCreateFirstSerializesTenantPurge(t *testing.T) {
 func TestPushEffectPurgeFirstRejectsWaitingCreate(t *testing.T) {
 	f := newPushEffectFixture(t)
 	ctx := t.Context()
+	if _, err := f.db.ExecContext(ctx,
+		`UPDATE schedules SET status='paused' WHERE id=$1`,
+		f.prepared.TaskID,
+	); err != nil {
+		t.Fatalf("pause migration-only fixture task: %v", err)
+	}
 	if _, err := f.provider.Up(ctx); err != nil {
 		t.Fatalf("migrate purge fixture to latest: %v", err)
 	}

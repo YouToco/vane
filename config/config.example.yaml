@@ -51,6 +51,9 @@ pipeline:
   compiled_runtime_enabled: false
   compiled_runtime_canary_schedule_id: ""
   compiled_runtime_allow_all: false
+  # Source-free Tool runtime is deliberately single-task only. To roll back:
+  # pause the task first, then clear this ID (V2 definitions cannot run on V1).
+  tool_runtime_canary_schedule_id: ""
   # P1-B exact-run lifecycle is independent and remains dark by default.
   run_outcome_enabled: false
   run_outcome_canary_schedule_id: ""

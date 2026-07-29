@@ -395,19 +395,18 @@ func TestBuildTools_Exa装配(t *testing.T) {
 		}
 		return m
 	}
-	with := names(BuildTools(nil, nil, nil, nil, nil, nil, NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)))
+	with := names(BuildTools(nil, nil, nil, nil, NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)))
 	if !with["web_search"] || !with["read_page"] {
 		t.Errorf("exa 非 nil 时 web_search/read_page 必须在白名单，实得 %v", with)
 	}
-	without := names(BuildTools(nil, nil, nil, nil, nil, nil, nil))
+	without := names(BuildTools(nil, nil, nil, nil, nil))
 	if without["web_search"] || without["read_page"] {
 		t.Errorf("exa=nil 时两工具不得出现（缺 key 不广告），实得 %v", without)
 	}
-	// 两工具都由策略声明免确认，且成本由工具现有 cap 管理。
-	for _, tl := range BuildTools(nil, nil, nil, nil, nil, nil, NewExaTools(nil, nil, nil, 0, 0)) {
+	// 两工具成本由工具现有 cap 管理。
+	for _, tl := range BuildTools(nil, nil, nil, nil, NewExaTools(nil, nil, nil, 0, 0)) {
 		if (tl.Name() == "web_search" || tl.Name() == "read_page") &&
-			(tl.Policy.Confirmation != ConfirmationNone ||
-				tl.Policy.Budget != BudgetToolManaged) {
+			tl.Policy.Budget != BudgetToolManaged {
 			t.Errorf("%s 策略不符: %+v", tl.Name(), tl.Policy)
 		}
 	}
@@ -417,11 +416,11 @@ func TestBuildTools_Exa装配(t *testing.T) {
 // 真装配时出现——缺 key 环境 prompt 不得广告白名单里不存在的工具（否则模型按
 // prompt 调用被白名单拒绝，浪费一轮还向用户食言）。
 func TestSystemPrompt_ExaNote条件注入(t *testing.T) {
-	const marker = "不要为一次性需求新建信源"
+	const marker = "一次性需求"
 	with := New(Deps{Tools: []ToolSpec{newToolSpec(
 		&webSearchTool{et: newTestExaTools(nil, nil)},
 		ownerPolicy(Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
-			ConfirmationNone, BudgetToolManaged),
+			BudgetToolManaged),
 	)}})
 	if !strings.Contains(with.sys, marker) {
 		t.Error("web_search 在场时分流引导行必须注入")
@@ -432,7 +431,7 @@ func TestSystemPrompt_ExaNote条件注入(t *testing.T) {
 	}
 	// A2A 轨（自定义 prompt + 只读白名单，无 web_search）同样不得出现。
 	a2a := New(Deps{SystemPrompt: "A2A 语境", Tools: []ToolSpec{newToolSpec(
-		&listSourcesTool{}, a2aReadPolicy(Effects(EffectInternalRead)),
+		&listSchedulesTool{}, a2aReadPolicy(Effects(EffectInternalRead)),
 	)}})
 	if strings.Contains(a2a.sys, marker) {
 		t.Error("A2A 轨不得注入飞书轨的分流引导")

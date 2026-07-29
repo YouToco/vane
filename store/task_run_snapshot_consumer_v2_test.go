@@ -227,10 +227,10 @@ func TestCompiledSourceSideEffectsUseAuthoritativeSnapshot(t *testing.T) {
 	}
 	storeDir := filepath.Dir(thisFile)
 	want := map[string]int{
-		"UpsertContentItemForTaskRunV1":      1,
-		"UpdateSourceFetchStateForTaskRunV1": 1,
-		"DisableSourceIfActiveForTaskRunV1":  1,
-		"ListUnpushedForTaskRunV1":           1,
+		"UpsertContentItemForTaskRunV1":          1,
+		"UpdateFetchTargetStateForTaskRunV1":     1,
+		"DisableFetchTargetIfActiveForTaskRunV1": 1,
+		"ListUnpushedForTaskRunV1":               1,
 	}
 	got := make(map[string]int)
 	err := filepath.WalkDir(storeDir, func(path string, entry os.DirEntry, err error) error {

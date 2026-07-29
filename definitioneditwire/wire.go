@@ -26,7 +26,8 @@ import (
 )
 
 const (
-	proposalWireVersion   = "vane.task-definition-edit-proposal/v1"
+	proposalWireVersionV1 = "vane.task-definition-edit-proposal/v1"
+	proposalWireVersionV2 = "vane.task-definition-edit-proposal/v2"
 	preparedWireVersionV1 = "v1"
 	preparedWireVersionV2 = "v2"
 
@@ -70,24 +71,25 @@ type HeadV1 struct {
 	Digest  string `json:"digest"`
 }
 
-type ProposalActorV1 struct {
+type ProposalActorV2 struct {
 	TenantID int64 `json:"tenant_id"`
 	UserID   int64 `json:"user_id"`
 }
 
-type ProposalTargetV1 struct {
+type ProposalTargetV2 struct {
 	TenantID int64  `json:"tenant_id"`
 	UserID   int64  `json:"user_id"`
 	TaskID   string `json:"task_id"`
 }
 
-// ProposalV1 is the small authenticated envelope emitted by the task layer.
-type ProposalV1 struct {
+// ProposalV2 is the current small authenticated envelope emitted by the task
+// layer. V1 used approval_ref and is decoded only by legacyProposalV1 below.
+type ProposalV2 struct {
 	WireVersion            string           `json:"wire_version"`
 	OperationID            string           `json:"operation_id"`
-	ApprovalRef            string           `json:"approval_ref"`
-	Actor                  ProposalActorV1  `json:"actor"`
-	Target                 ProposalTargetV1 `json:"target"`
+	OperationRef           string           `json:"operation_ref"`
+	Actor                  ProposalActorV2  `json:"actor"`
+	Target                 ProposalTargetV2 `json:"target"`
 	SessionID              int64            `json:"session_id"`
 	ExpiresAtUnixMicros    int64            `json:"expires_at_unix_micros"`
 	OriginalStatus         OriginalStatusV1 `json:"original_status"`
@@ -96,6 +98,33 @@ type ProposalV1 struct {
 	TargetDefinitionDigest string           `json:"target_definition_digest"`
 	PreparedEditDigest     string           `json:"prepared_edit_digest"`
 	BaseSnapshotDigest     string           `json:"base_snapshot_digest"`
+}
+
+type legacyProposalV1 struct {
+	WireVersion            string                 `json:"wire_version"`
+	OperationID            string                 `json:"operation_id"`
+	ApprovalRef            string                 `json:"approval_ref"`
+	Actor                  legacyProposalActorV1  `json:"actor"`
+	Target                 legacyProposalTargetV1 `json:"target"`
+	SessionID              int64                  `json:"session_id"`
+	ExpiresAtUnixMicros    int64                  `json:"expires_at_unix_micros"`
+	OriginalStatus         OriginalStatusV1       `json:"original_status"`
+	BaseHead               HeadV1                 `json:"base_head"`
+	TargetHead             HeadV1                 `json:"target_head"`
+	TargetDefinitionDigest string                 `json:"target_definition_digest"`
+	PreparedEditDigest     string                 `json:"prepared_edit_digest"`
+	BaseSnapshotDigest     string                 `json:"base_snapshot_digest"`
+}
+
+type legacyProposalActorV1 struct {
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
+}
+
+type legacyProposalTargetV1 struct {
+	TenantID int64  `json:"tenant_id"`
+	UserID   int64  `json:"user_id"`
+	TaskID   string `json:"task_id"`
 }
 
 type PushScopeV1 struct {
@@ -291,7 +320,7 @@ type approvedProjectionV1 struct {
 // five caller checkpoints. Approved Definition semantics remain owned by
 // taskstate and the Store's immutable-history corroboration.
 type FrozenProposal struct {
-	Proposal              ProposalV1
+	Proposal              ProposalV2
 	CanonicalProposal     []byte
 	ProposalDigest        string
 	BaseDefinitionBytes   []byte
@@ -323,8 +352,8 @@ func DecodeFrozenProposal(
 		return FrozenProposal{}, err
 	}
 
-	var proposal ProposalV1
-	if err := decodeCanonical("proposal", canonicalProposal, &proposal); err != nil {
+	proposal, err := decodeCanonicalProposal(canonicalProposal)
+	if err != nil {
 		return FrozenProposal{}, err
 	}
 	var prepared PreparedEditV1
@@ -393,9 +422,9 @@ func DecodePhaseSnapshotBytes(preparedRaw, snapshotRaw []byte) (SnapshotV1, erro
 	// definition/proposal digests were already corroborated when the operation
 	// row was sealed; the prepared wire's own identities and phases are checked
 	// again here before a later remote checkpoint can be accepted.
-	proposal := ProposalV1{
+	proposal := ProposalV2{
 		OperationID: prepared.OperationID,
-		Target: ProposalTargetV1{
+		Target: ProposalTargetV2{
 			TenantID: prepared.Creation.TenantID,
 			UserID:   prepared.Creation.UserID,
 			TaskID:   prepared.Creation.TaskID,
@@ -537,12 +566,13 @@ func projectionMatchesAction(
 }
 
 func validateProposal(
-	proposal ProposalV1,
+	proposal ProposalV2,
 	baseDefinition, targetDefinition, preparedEdit, baseSnapshot []byte,
 ) error {
-	if proposal.WireVersion != proposalWireVersion ||
+	if (proposal.WireVersion != proposalWireVersionV1 &&
+		proposal.WireVersion != proposalWireVersionV2) ||
 		!validIdentifier(proposal.OperationID, maxOperationIDBytes) ||
-		!validIdentifier(proposal.ApprovalRef, maxReferenceBytes) ||
+		!validIdentifier(proposal.OperationRef, maxReferenceBytes) ||
 		proposal.Actor.TenantID <= 0 || proposal.Actor.UserID <= 0 ||
 		proposal.Target.TenantID <= 0 || proposal.Target.UserID <= 0 ||
 		!validIdentifier(proposal.Target.TaskID, maxTaskIDBytes) ||
@@ -574,7 +604,7 @@ func validateProposal(
 	return nil
 }
 
-func validatePrepared(proposal ProposalV1, prepared PreparedEditV1) error {
+func validatePrepared(proposal ProposalV2, prepared PreparedEditV1) error {
 	if prepared.OperationID != proposal.OperationID ||
 		!validIdentifier(prepared.OperationID, maxOperationIDBytes) {
 		return invalid("validate prepared identity", errors.New("operation identity differs"))
@@ -1014,6 +1044,58 @@ func bounded(name string, value []byte, maximum int) error {
 		return invalid("validate "+name+" size", fmt.Errorf("size %d is outside the supported bound", len(value)))
 	}
 	return nil
+}
+
+func decodeCanonicalProposal(raw []byte) (ProposalV2, error) {
+	var envelope struct {
+		WireVersion string `json:"wire_version"`
+	}
+	if err := strictjson.Validate(raw); err != nil {
+		return ProposalV2{}, invalid("decode proposal", err)
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return ProposalV2{}, invalid("decode proposal", err)
+	}
+	switch envelope.WireVersion {
+	case proposalWireVersionV2:
+		var proposal ProposalV2
+		if err := decodeCanonical("proposal", raw, &proposal); err != nil {
+			return ProposalV2{}, err
+		}
+		return proposal, nil
+	case proposalWireVersionV1:
+		var legacy legacyProposalV1
+		if err := decodeCanonical("legacy proposal", raw, &legacy); err != nil {
+			return ProposalV2{}, err
+		}
+		return ProposalV2{
+			WireVersion:  legacy.WireVersion,
+			OperationID:  legacy.OperationID,
+			OperationRef: legacy.ApprovalRef,
+			Actor: ProposalActorV2{
+				TenantID: legacy.Actor.TenantID,
+				UserID:   legacy.Actor.UserID,
+			},
+			Target: ProposalTargetV2{
+				TenantID: legacy.Target.TenantID,
+				UserID:   legacy.Target.UserID,
+				TaskID:   legacy.Target.TaskID,
+			},
+			SessionID:              legacy.SessionID,
+			ExpiresAtUnixMicros:    legacy.ExpiresAtUnixMicros,
+			OriginalStatus:         legacy.OriginalStatus,
+			BaseHead:               legacy.BaseHead,
+			TargetHead:             legacy.TargetHead,
+			TargetDefinitionDigest: legacy.TargetDefinitionDigest,
+			PreparedEditDigest:     legacy.PreparedEditDigest,
+			BaseSnapshotDigest:     legacy.BaseSnapshotDigest,
+		}, nil
+	default:
+		return ProposalV2{}, invalid(
+			"decode proposal",
+			errors.New("wire version is unsupported"),
+		)
+	}
 }
 
 func decodeCanonical(name string, raw []byte, destination any) error {

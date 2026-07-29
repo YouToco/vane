@@ -511,14 +511,14 @@ func TestEvolveIntegration(t *testing.T) {
 	// Recorder 传 nil store：Record 是 no-op，测试不写 llm_calls。
 	ev := New(cli, llm.NewRecorder(nil), st)
 
-	srcID, _, err := st.UpsertSource(ctx, &types.Source{
+	srcID, _, err := st.GetOrCreateFetchTarget(ctx, &types.FetchTarget{
 		Platform:   types.PlatformWeb,
 		Capability: types.CapFeed,
 		URL:        "https://example.com/test-evolver-" + uuid.NewString(),
 		Title:      "evolver-test-source",
 	})
 	if err != nil {
-		t.Fatalf("UpsertSource() 失败: %v", err)
+		t.Fatalf("GetOrCreateFetchTarget() 失败: %v", err)
 	}
 
 	var userIDs []int64
@@ -546,7 +546,7 @@ func TestEvolveIntegration(t *testing.T) {
 			_, _ = conn.Exec(cctx, sql, userIDs)
 		}
 		_, _ = conn.Exec(cctx, `DELETE FROM content_items WHERE source_id = $1`, srcID)
-		_, _ = conn.Exec(cctx, `DELETE FROM sources WHERE id = $1`, srcID)
+		_, _ = conn.Exec(cctx, `DELETE FROM fetch_targets WHERE id = $1`, srcID)
 		_, _ = conn.Exec(cctx, `DELETE FROM users WHERE id = ANY($1)`, userIDs)
 	})
 

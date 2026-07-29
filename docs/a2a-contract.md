@@ -1,5 +1,8 @@
 # A2A 契约：vane 作为 Agent2Agent Server（第一期 content.query）
 
+> **工具面修订（2026-07-29）：** A2A `assistant.chat` 只保留
+> `list_schedules` 任务级只读能力，不暴露内部抓取目标。
+>
 > 本文件是 A2A 集成并行实现的**唯一契约**。所有签名/JSON/表结构以此为准，实现中发现契约错误不得自行变更——记录到交付报告，由主控裁决。
 > 事实基准：worktree @ ada0f6e（origin/main，2026-07-16 重新核实全部代码事实——方案定稿后 main 又前进，migration 编号与 wantTables 欠账均与方案原文不同，见 §2/§9.5）。2026-07-17 复核 @ e2136d5：012 已被 kind_backfill 占用，A2A migration 顺延为 **013**（§2）；wantTables 欠账清单不变（012 为纯回填不建表）。
 > 设计过程：多 agent 调研 → 双怀疑者对抗审查（2×CRITICAL+12×MINOR 全处置）→ Boss 拍板 8 项（§13）→ 契约起草期双怀疑者再审（5×CRITICAL+7×MINOR，全部处置，见 §14）。方案全文原引用 workmemory `work/2026/2026-07-16-自研-见微Vane-A2A协议集成调研/a2a-integration-plan.md`，经 2026-07-17 双机核查（Windows 本地含未跟踪/stash + 远端）**该文件从未落盘**——设计过程的存档以本契约与 workmemory `journal/2026/2026-07-16.md`、`journal/2026/2026-07-17.md` 的记录为准。
@@ -14,7 +17,7 @@ A2A（Agent2Agent，LF 治理）是 agent 间互操作协议：server 发布 Age
 
 **能力面为什么这么窄（数据盘点结论）**：content_items（001_init.sql:66-83，007 加 canonical_key、008 加 kind）只有原始字段，无 score/summary 列；唯一持久化的分数是 deliveries.score（001_init.sql:115），且是按 owner 画像打的**个性化分**（main.go:98-99 hints 注入 scorer）——暴露它即泄露画像偏好，撞 §8 红线。故第一期诚实降级为纯内容检索。
 
-**非目标（第一期不做）**：vane 作为 A2A client；streaming（SSE）与 push notification（card 声明 false 且 handler 显式拒绝，启用前置见 §12）；gRPC/REST binding（只做 JSON-RPC 一种即合规）；extended card / card JWS 签名 / 多 peer 差异化授权；任何 Mutating 能力（确认卡语义无法映射给外部 agent）；画像与个性化分。（原列于此的 `assistant.chat` 已于 2026-07-18 随 PR-4 实施——只读工具白名单 + RunOnce 无会话形态，见 §12）
+**非目标（第一期不做）**：vane 作为 A2A client；streaming（SSE）与 push notification（card 声明 false 且 handler 显式拒绝，启用前置见 §12）；gRPC/REST binding（只做 JSON-RPC 一种即合规）；extended card / card JWS 签名 / 多 peer 差异化授权；任何写能力；画像与个性化分。（原列于此的 `assistant.chat` 已于 2026-07-18 随 PR-4 实施——只读工具白名单 + RunOnce 无会话形态，见 §12）
 
 **第一个对接方**：Boss 本机 Claude Code。Claude Code 无原生 A2A client（官方互操作只有 MCP），走官方 `a2a` CLI（`go install github.com/a2aproject/a2a-go/v2/cmd/a2a@latest`）+ 本机 skill 封装，token 走 my-credentials，零开发当天可用。注意：CLI 与 server 同源 SDK，**不构成 Gate ⑦ 的"异构客户端"验证**（§10）。
 
@@ -266,10 +269,10 @@ func newExecutor(deps Deps) *executor // 实现 SDK a2asrv.AgentExecutor（Execu
 | `TASK_STATE_FAILED` | 内部错误，message 只含脱敏文案 | Execute yield error（经 errors.go） |
 | `TASK_STATE_REJECTED` | 显式 `skill` 键 ≠ content.query，或消息无 text part（§5.4 两种触发，可构造可测试） | Execute 前置判定 |
 | `TASK_STATE_CANCELED` | CancelTask | Cancel 实现（yield canceled 事件） |
-| `TASK_STATE_INPUT_REQUIRED` | **不使用**：agent.Outcome 只有 Reply+Confirm（agent/loop.go:129-136），不存在"这是澄清问句"的结构化信号，映射不可实现。启用前置 = 先定义 Outcome 的结构化澄清字段（§12） | — |
+| `TASK_STATE_INPUT_REQUIRED` | **不使用**：Agent 自然语言澄清没有结构化状态信号。启用前置 = 先定义 Outcome 的结构化澄清字段（§12） | — |
 | `TASK_STATE_AUTH_REQUIRED` | 不使用（单 token 模型） | — |
 
-**不变式**：taskId/contextId 只由服务端生成（SDK 保证）；终态任务拒收消息（SDK 保证 + Gate ⑤ 实测）；Mutating 语义（Outcome.Confirm / pending_actions）在 A2A 轨**永不出现**——第一期不接 agent loop 天然成立，并以测试钉死防 P2 破坏（§9.1）。
+**不变式**：taskId/contextId 只由服务端生成（SDK 保证）；终态任务拒收消息（SDK 保证 + Gate ⑤ 实测）；A2A 轨只注册任务级只读工具，任何写调用都必须在执行前拒绝。
 
 ### 5.6 错误卫生（`a2a/errors.go`，唯一翻译点）
 
@@ -502,15 +505,14 @@ PR-2 与 PR-3 无同包文件耦合可真并行（SDK 触点全在 PR-3）；PR-
 - **streaming 启用前置**：仅需 `/a2a` 路由用 `http.ResponseController.SetWriteDeadline` 逐路由放宽 WriteTimeout=30s（main.go:188，唯一服务端障碍）+ 补 streaming 测试。**Caddy 零工作**：当前 Caddy 对 text/event-stream 自动逐段直通。
 - **push notification 启用前置**（三条全满足才解禁）：SDK 升级到含 #373/#374 的 release + 自建 webhook 域名白名单 + 拒 RFC1918/localhost/云 metadata。启用时补 push 配置表（凭证入库问题届时正面处理）。
 - **INPUT_REQUIRED 启用前置**：先给 agent.Outcome 定义结构化澄清字段（"这是澄清问句"的判定来源），无它则映射不可实现（§5.5）。
-- **P2 `assistant.chat`（✅ 2026-07-18 已实施，PR-4）**——实现与下述设计的对照：RunOnce 已落地（签名同下，M4 §7.1）；system prompt 参数化已落地（Deps.SystemPrompt 零值回落）；工具白名单收紧为显式 list_sources/list_schedules（比"只读子集"更严：push_now 有副作用、view_profile 涉画像，均排除）；多轮历史按 contextId 跨任务重建（终态不可续写 ⇒ 追问=同 context 新任务，每任务折叠一对 user/assistant、上限 8 对）；同步返回靠 /a2a 路由级写超时放宽（150s>chatBudget 120s），超预算走 GetTask 兜底。原设计记录如下：不复用 agent_sessions、不共享 owner Loop 实例（写工具挂起等确认卡外部 agent 点不了；GetActiveAgentSession 会把 A2A 消息混进 owner 飞书上下文；userMu 让两轨互相排队）。改造范围（触碰 M4 契约 §7 签名面，PR-4 时修订 M4 契约）：
+- **P2 `assistant.chat`（✅ 2026-07-18 已实施，PR-4）**——RunOnce 已落地（签名同下，M4 §7.1）；system prompt 参数化已落地（Deps.SystemPrompt 零值回落）；工具白名单只保留 `list_schedules`；多轮历史按 contextId 跨任务重建（终态不可续写 ⇒ 追问=同 context 新任务，每任务折叠一对 user/assistant、上限 8 对）；同步返回靠 /a2a 路由级写超时放宽（150s>chatBudget 120s），超预算走 GetTask 兜底。不复用 agent_sessions、不共享 owner Loop 实例，避免外部只读轨与 Owner 写轨共享会话和用户锁。
   ```go
   // agent 包新增（HandleMessage 签名不变，内部改为 load→RunOnce→save）：
   // RunOnce 在给定历史上执行一轮多轮 FC，不碰 store 会话。userID 必须入参（Tool.Execute 带
-  // userID，agent/loop.go:91）；A2A 轨填 owner userID = 外部 agent 以 owner 身份读订阅/计划，
-  // 此数据边界已随拍板 §13.2 确认。
+  // userID）；A2A 轨填 owner userID，只读取该 owner 的任务列表。
   func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMessage, text string) (Outcome, []llm.ChatMessage, error)
   ```
-  三项前置改造：消息类型用 `llm.ChatMessage`（llm/chat.go:24，llm 包无 Message 类型）；**system prompt 参数化**（现为包级 const 写死飞书语境，agent/loop.go:31，withSystem 无条件前置 :595-603——改 `Deps.SystemPrompt string` 零值回落现常量，飞书轨零行为变化）；sessionID 传 0 并测试钉死"A2A 轨永不产生 pending_actions"（工具子集全只读：list_sources/list_schedules）。
+  三项前置改造：消息类型用 `llm.ChatMessage`；system prompt 参数化；sessionID 传 nil 并测试钉死“A2A 轨只允许 `list_schedules`，永不产生耐久写操作”。
   **P2 关停纪律**：`returnImmediately` 下 Execute goroutine 脱离请求生命周期——PR-4 开工前实测 SDK goroutine 宿主 ctx；a2a 包维护在飞 WaitGroup 有界等待；超预算任务留 WORKING 不强写终态（重启后可查可 Cancel，进 Gate ⑧ 扩展语义）；executor 预算 120s（对齐 chatCallTimeout，agent/loop.go:75-77）；DB 写自带超时。
 - **vane 作为 A2A client：不做**（无对接对象，完全独立的工程面）。
 - **多 peer 触发点**：需要第二个 token 时再加 peer 列 + 复查 SDK #351 IDOR（§1）。
@@ -578,6 +580,4 @@ probe.Run 报错中断模式、cmd/gate 退出码语义、CHANGELOG 最新已发
 - **B-F3**：`contextId` 客户端可控，`chatHistory` 仅按 contextId 取历史、无 per-caller 隔离。若一枚 token 被多个外部 agent 共用，agent A 复用 B 的 contextId 可把 B 的既往对话读进自己这轮 LLM 历史。与 §1「多 peer 升级前复查 #351 IDOR」同族——加第二个 token / 多对端前必须给 contextId 绑定调用方身份或强制服务端生成。
 - **B-F6/A-7**：`/a2a` 无 `MaxBytesReader`（既存，content.query 时代就在）；chat 的 text 直送 LLM、contextId 无界入库放大滥用面。多对端前补 body 上限。
 - **A-7(hist)**：`chatHistory` 只扫首页（≤50 行），同 context 混大量 content.query 任务时 chat 轮次可能被挤出窗口——与「历史是增强不是门槛」一致，可接受。
-- **B-F5**：`list_sources` 在 title 空时打印 source URL，若 URL 内嵌鉴权 query 参数会回给外部 agent（凭证主载体 Config JSONB 未输出，数据边界主体干净）。
-
-**攻过未破（明确排除）**：A2A 轨产生写操作/pending_action（显式白名单 + 未注册自纠 + Confirm 出口报错，三重）；REJECTED/FAILED 任务折叠进历史（DB 层 Status=COMPLETED 过滤 + 双校验）；converse 抽取后飞书轨行为变化（逐行核对零变化）；取消/断连场景兜底（detached 继续、终态落库、GetTask 可取）。
+**攻过未破（明确排除）**：A2A 轨产生写操作（显式只读白名单 + 未注册自纠）；REJECTED/FAILED 任务折叠进历史（DB 层 Status=COMPLETED 过滤 + 双校验）；converse 抽取后飞书轨行为变化（逐行核对零变化）；取消/断连场景兜底（detached 继续、终态落库、GetTask 可取）。

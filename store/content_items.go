@@ -19,11 +19,11 @@ import (
 //
 // 取代 InsertContentItemIfNew：旧的 (source_id, external_id) 唯一把"源内 id"当身份，
 // 而实测两个方向都挡不住——BBC 更新文章换 guid（同一篇存 3 份）、同一篇笔记命中
-// 两个用户的不同订阅源（存两份且详情补全被付两次钱）。身份改由 canonical_key 承载。
+// 不同任务目标（存两份且详情补全被付两次钱）。身份改由 canonical_key 承载。
 //
-// content_items.source_id 只在首次插入时写入，之后不再改：它是**首发源**（谁先发现
-// 这条内容），后来的源只在 content_sources 里追加一行 appearance。ON CONFLICT
-// DO NOTHING 天然保证这点——冲突时不 UPDATE，首发源不会被后来者覆盖。
+// content_items.source_id 是 legacy **首发源**。V2 Source-free 可能先以 NULL 发现内容；
+// 第一个 retained V1 appearance 会用 COALESCE 原子补上正数，之后不再覆盖。后来的源
+// 只在 content_sources 里追加 appearance。
 //
 // first_seen_at / fetched_at 都不由 Go 传入而走 DB 默认 now()：两者的差是信源滞后量
 // （信源质量分析的核心指标），必须同一个时钟，混入应用侧时间会让差值含机器间时钟偏移。
@@ -72,6 +72,14 @@ func (s *Store) UpsertContentItem(ctx context.Context, item *types.ContentItem) 
 	if !isNew {
 		if _, uerr := s.pool.Exec(ctx,
 			`UPDATE content_items
+			    SET source_id=COALESCE(source_id,$2)
+			  WHERE id=$1`,
+			id, item.SourceID); uerr != nil {
+			return 0, false, types.NewAppError(types.CodeDatabase,
+				fmt.Sprintf("固化内容首个 legacy 信源（content_item=%d）", id), uerr)
+		}
+		if _, uerr := s.pool.Exec(ctx,
+			`UPDATE content_items
 			 SET content = $2, content_hash = $3, simhash = $4
 			 WHERE id = $1 AND char_length(content) < char_length($2)`,
 			id, item.Content, item.ContentHash, item.Simhash); uerr != nil {
@@ -83,7 +91,7 @@ func (s *Store) UpsertContentItem(ctx context.Context, item *types.ContentItem) 
 	}
 
 	// 登记 appearance：无论内容是不是新的都要写——"这个源见过这条内容"正是跨源
-	// 场景下用户能收到它的唯一凭据（ListUnpushedByUser 经 content_sources 反查）。
+	// 场景下任务能收到它的唯一凭据（经 content_sources 反查）。
 	// 同源重复抓到时 DO NOTHING，保住首次出现的 first_seen_at 不被刷新。
 	if _, cerr := s.pool.Exec(ctx,
 		`INSERT INTO content_sources (content_item_id, source_id, external_id, url)
@@ -149,7 +157,7 @@ func (s *Store) EnrichedCanonicalKeys(ctx context.Context, keys []string, minRun
 func (s *Store) GetContentItem(ctx context.Context, id int64) (*types.ContentItem, error) {
 	var ci types.ContentItem
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, source_id, external_id, canonical_key, url, title, content, author,
+		`SELECT id, COALESCE(source_id, 0), external_id, canonical_key, url, title, content, author,
 		        published_at, content_hash, simhash, fetched_at, created_at, kind
 		 FROM content_items WHERE id = $1`, id).Scan(
 		&ci.ID, &ci.SourceID, &ci.ExternalID, &ci.CanonicalKey, &ci.URL, &ci.Title, &ci.Content,
@@ -166,132 +174,9 @@ func (s *Store) GetContentItem(ctx context.Context, id int64) (*types.ContentIte
 	return &ci, nil
 }
 
-// ListRecentSimhashesByUser 取该用户 active 订阅的全部信源在 since 之后、
-// 已算出 simhash 的指纹集合，供近似去重。since 由调用方按 72h 窗口传入（now-72h）。
-//
-// 历史按 user 维度（跨源）而非 per-source 查（审查 #跨源去重）：引入 Exa/TikHub 后
-// 跨源内容重叠成为常态——Exa 搜索天然覆盖用户 RSS 源的文章，per-source 历史会让
-// 周一从 RSS 推过的文章周二经 Exa 源再推一次。跨源合并后任一源推过/抓过的内容
-// 对所有源的去重都可见；同时 N 源 N 次查询合并为 1 次。
-//
-// 007 起经 content_sources 反查（原按 ci.source_id 直连 subscriptions）：内容不再挂在
-// 单个订阅源下，直连只能看见首发源，用户订的是二手源时就查不到自己的历史。
-// 必须用 EXISTS 而非 JOIN：一条内容命中该用户多个订阅源时 JOIN 会返回多行，
-// 同一个 simhash 被重复算进历史（不致错但白跑）。
-//
-// excludeIDs 排除"本批正在去重的内容"自身——关键修复：Fetch 已在抓取时把 simhash
-// 写入 content_items，若不排除，Dedup 对每条内容查到的"历史"里就包含它自己刚入库
-// 的 simhash，HammingDistance(自己,自己)=0 必判近重复，导致整批被全部删光、pipeline
-// 在"去重后无内容"早退、永远推不出卡片。空切片时 `<> ALL('{}')` 恒真，不排除任何行。
-func (s *Store) ListRecentSimhashesByUser(ctx context.Context, userID int64, since time.Time, excludeIDs []int64) ([]int64, error) {
-	if excludeIDs == nil {
-		excludeIDs = []int64{}
-	}
-	rows, err := s.pool.Query(ctx,
-		`SELECT ci.simhash FROM content_items ci
-		 WHERE EXISTS (
-		     SELECT 1 FROM content_sources cs
-		     JOIN subscriptions sub ON sub.source_id = cs.source_id
-		     WHERE cs.content_item_id = ci.id AND sub.user_id = $1 AND sub.status = $4
-		 )
-		   AND ci.fetched_at >= $2 AND ci.simhash IS NOT NULL
-		   AND ci.id <> ALL($3)
-		 ORDER BY ci.fetched_at DESC`,
-		userID, since, excludeIDs, types.SubscriptionStatusActive)
-	if err != nil {
-		return nil, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("查询用户 %d 近期 simhash", userID), err)
-	}
-	defer rows.Close()
-
-	var out []int64
-	for rows.Next() {
-		var sh int64
-		if err := rows.Scan(&sh); err != nil {
-			return nil, types.NewAppError(types.CodeDatabase, "扫描 simhash 行", err)
-		}
-		out = append(out, sh)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "遍历 simhash 结果集", err)
-	}
-	return out, nil
-}
-
-// ListUnpushedByUser 返回该用户 active 订阅源里、尚未向该用户投递过的内容，
-// 按抓取时间倒序取最近 limit 条。NOT EXISTS 子查询排除已在 deliveries 里
-// 投递过（content_item_id 相同）的条目，避免重复推送同一内容。
-//
-// perSourceCap 限制每个源最多进入候选窗口的条数（审查 #候选公平性）：候选按
-// fetched_at DESC 全局截断，而同一 run 内后抓的源（大 id，通常是 exa/tikhub）
-// 条目恒新于先抓的——高产源（tikhub 单页 20 条/轮）会把先抓的 RSS 源永远挤出
-// 窗口：内容不丢库但永不被打分/推送。窗口函数按源限额保证每源都有配额。
-//
-// 007 起订阅经 content_sources 反查（原按 ci.source_id 直连 subscriptions）：内容全局
-// 一份后不再挂在单个订阅源下，直连只能看见首发源——用户订的若是二手源，他就再也
-// 收不到这条内容。
-//
-// **必须用 EXISTS 而非 JOIN**：一条内容可能命中该用户的多个订阅源，JOIN 会为每个
-// 命中的源各返回一行 → 同一条内容被重复打分（多花钱）、重复推送（用户收到多张同样
-// 的卡）。EXISTS 只判"存在与否"，恒定一条内容一行。
-//
-// perSourceCap 仍按 ci.source_id（**首发源**）分区，取舍是刻意的：一条内容出现在多个
-// 订阅源时只占首发源的配额，语义清晰且不会重复计数；副作用是首发源可能不是用户订的
-// 那个（用户仍能收到，只是配额记在别处），单用户下不可见。
-func (s *Store) ListUnpushedByUser(ctx context.Context, userID int64, limit, perSourceCap int) ([]types.ContentItem, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, source_id, external_id, canonical_key, url, title, content, author,
-		        published_at, content_hash, simhash, fetched_at, created_at, kind
-		 FROM (
-		     SELECT ci.id, ci.source_id, ci.external_id, ci.canonical_key, ci.url, ci.title,
-		            ci.content, ci.author, ci.published_at, ci.content_hash, ci.simhash,
-		            ci.fetched_at, ci.created_at, ci.kind,
-		            ROW_NUMBER() OVER (PARTITION BY ci.source_id ORDER BY ci.fetched_at DESC, ci.id DESC) AS rn
-		     FROM content_items ci
-		     WHERE EXISTS (
-		         SELECT 1 FROM content_sources cs
-		         JOIN subscriptions sub ON sub.source_id = cs.source_id
-		         WHERE cs.content_item_id = ci.id AND sub.user_id = $1 AND sub.status = $2
-		     )
-		       AND NOT EXISTS (
-		           SELECT 1 FROM deliveries d
-		           WHERE d.user_id = $1 AND d.content_item_id = ci.id
-		       )
-		 ) t
-		 WHERE t.rn <= $4
-		 ORDER BY fetched_at DESC
-		 LIMIT $3`,
-		userID, types.SubscriptionStatusActive, limit, perSourceCap)
-	if err != nil {
-		return nil, types.NewAppError(types.CodeDatabase,
-			fmt.Sprintf("查询用户 %d 未投递内容", userID), err)
-	}
-	defer rows.Close()
-
-	var out []types.ContentItem
-	for rows.Next() {
-		var ci types.ContentItem
-		if err := rows.Scan(
-			&ci.ID, &ci.SourceID, &ci.ExternalID, &ci.CanonicalKey, &ci.URL, &ci.Title, &ci.Content,
-			&ci.Author, &ci.PublishedAt, &ci.ContentHash, &ci.Simhash, &ci.FetchedAt, &ci.CreatedAt,
-			&ci.Kind,
-		); err != nil {
-			return nil, types.NewAppError(types.CodeDatabase, "扫描 content_item 行", err)
-		}
-		out = append(out, ci)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, types.NewAppError(types.CodeDatabase, "遍历 content_item 结果集", err)
-	}
-	return out, nil
-}
-
-// ListUnpushedBySchedule 是 ListUnpushedByUser 的**按任务隔离**版本（P1b b3）：候选只在
-// 本任务的软范围源（schedule_sources）见过的内容里挑。
-//
-// 与用户级版**只差一处**——EXISTS 从 `content_sources JOIN subscriptions（用户订阅）` 换成
-// `content_sources JOIN schedule_sources（本任务的源）`，即**取材范围**按任务隔离。
-// **去重不隔离**：NOT EXISTS 与用户级版一致，排除该用户**已投递过的全部内容**（任意批次/
+// ListUnpushedBySchedule 只在本任务的 fetch target 见过的内容里挑，
+// 取材范围始终按任务隔离。
+// **去重不隔离**：NOT EXISTS 排除该用户**已投递过的全部内容**（任意批次/
 // 任意状态），而非只排除本任务自己投过的。
 //
 // 为什么去重用用户级而非 per-schedule 账本（决策 A，2026-07-19 Boss 拍板改）：早期用
@@ -309,16 +194,23 @@ func (s *Store) ListUnpushedBySchedule(ctx context.Context, scheduleID string, l
 		`SELECT id, source_id, external_id, canonical_key, url, title, content, author,
 		        published_at, content_hash, simhash, fetched_at, created_at, kind
 		 FROM (
-		     SELECT ci.id, ci.source_id, ci.external_id, ci.canonical_key, ci.url, ci.title,
+		     SELECT ci.id, COALESCE(ci.source_id, matched.source_id) AS source_id,
+		            ci.external_id, ci.canonical_key, ci.url, ci.title,
 		            ci.content, ci.author, ci.published_at, ci.content_hash, ci.simhash,
 		            ci.fetched_at, ci.created_at, ci.kind,
-		            ROW_NUMBER() OVER (PARTITION BY ci.source_id ORDER BY ci.fetched_at DESC, ci.id DESC) AS rn
+		            ROW_NUMBER() OVER (
+		                PARTITION BY matched.source_id
+		                ORDER BY ci.fetched_at DESC, ci.id DESC
+		            ) AS rn
 		     FROM content_items ci
-		     WHERE EXISTS (
-		         SELECT 1 FROM content_sources cs
-		         JOIN schedule_sources ss ON ss.source_id = cs.source_id
-		         WHERE cs.content_item_id = ci.id AND ss.schedule_id = $1
-		     )
+		     JOIN LATERAL (
+		         SELECT MIN(cs.source_id) AS source_id
+		           FROM content_sources cs
+		           JOIN task_fetch_targets ss
+		             ON ss.fetch_target_id = cs.source_id
+		          WHERE cs.content_item_id = ci.id
+		            AND ss.schedule_id = $1
+		     ) matched ON matched.source_id IS NOT NULL
 		       AND NOT EXISTS (
 		           SELECT 1 FROM deliveries d
 		           WHERE d.content_item_id = ci.id
@@ -370,7 +262,7 @@ func (s *Store) SearchContentItems(ctx context.Context, keyword string, since ti
 	if limit <= 0 {
 		limit = 20
 	}
-	query := `SELECT id, source_id, external_id, canonical_key, url, title, content, author,
+	query := `SELECT id, COALESCE(source_id, 0), external_id, canonical_key, url, title, content, author,
 	                 published_at, content_hash, simhash, fetched_at, created_at, kind
 	          FROM content_items
 	          WHERE COALESCE(published_at, fetched_at) >= $1`

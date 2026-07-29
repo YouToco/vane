@@ -57,7 +57,6 @@ type ProjectionSnapshotInput struct {
 	Messages             json.RawMessage
 	TurnCount            int
 	ActivatedTools       json.RawMessage
-	ConfirmationAction   string
 }
 
 type projectionToolCallV1 struct {
@@ -130,9 +129,6 @@ func BuildProjectionSnapshotBatch(
 	}
 
 	eventCount := len(messages) + 2
-	if input.ConfirmationAction != "" {
-		eventCount++
-	}
 	// This mirrors migration 035's immutable batch bound. Refuse the complete
 	// write instead of silently dropping semantic events and reporting match.
 	if eventCount > 64 {
@@ -167,33 +163,13 @@ func BuildProjectionSnapshotBatch(
 		events = append(events, Input{Kind: kind, Body: body})
 	}
 
-	outcome := "reply"
-	if input.ConfirmationAction != "" {
-		if !validProjectionActionID(input.ConfirmationAction) {
-			return AppendBatch{}, invalidProjection("confirmation action id is invalid")
-		}
-		body, err := projectionBody(projectionConfirmationV1{
-			SchemaVersion: ProjectionSchemaVersion,
-			TurnID:        input.TurnID,
-			ActionID:      input.ConfirmationAction,
-		})
-		if err != nil {
-			return AppendBatch{}, err
-		}
-		events = append(events, Input{
-			Kind: KindConfirmationRequested,
-			Body: body,
-		})
-		outcome = "confirmation_requested"
-	}
-
 	completed, err := projectionBody(projectionCompletedV1{
 		SchemaVersion:  ProjectionSchemaVersion,
 		Generation:     ProjectionFullSnapshot,
 		TurnID:         input.TurnID,
 		TurnCount:      input.TurnCount,
 		ActivatedTools: activatedTools,
-		Outcome:        outcome,
+		Outcome:        "reply",
 	})
 	if err != nil {
 		return AppendBatch{}, err

@@ -512,13 +512,13 @@ func TestValidateStoredTaskRunSnapshotUsesOnlyPinnedReaders(t *testing.T) {
 	var target *ast.FuncDecl
 	for _, declaration := range file.Decls {
 		function, isFunction := declaration.(*ast.FuncDecl)
-		if isFunction && function.Name.Name == "validateStoredTaskRunSnapshot" {
+		if isFunction && function.Name.Name == "validateStoredTaskRunSnapshotV1" {
 			target = function
 			break
 		}
 	}
 	if target == nil || target.Body == nil {
-		t.Fatal("validateStoredTaskRunSnapshot is missing")
+		t.Fatal("validateStoredTaskRunSnapshotV1 is missing")
 	}
 	var violations []string
 	ast.Inspect(target.Body, func(node ast.Node) bool {

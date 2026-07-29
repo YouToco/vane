@@ -5,81 +5,101 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/YouToco/vane/fetcher"
 	"github.com/YouToco/vane/scheduler"
-	"github.com/YouToco/vane/sourcecatalog"
-	"github.com/YouToco/vane/sourcespec"
 	"github.com/YouToco/vane/store"
-	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
-	"github.com/YouToco/vane/workflow"
 )
 
-// fakePushTrigger 是 PushTrigger 的可编程假实现。
-type fakePushTrigger struct {
-	runID string
+type fakeTaskRunTrigger struct {
 	err   error
-	calls int
+	calls []string
 }
 
-func (f *fakePushTrigger) TriggerPushNow(_ context.Context, _ int64) (string, error) {
-	f.calls++
-	return f.runID, f.err
+func (f *fakeTaskRunTrigger) TriggerScheduleNowIdempotent(
+	_ context.Context,
+	scheduleID string,
+	_ int64,
+	key string,
+) error {
+	f.calls = append(f.calls, scheduleID+"\x00"+key)
+	return f.err
 }
 
-// push_now 的错误分流：并发护栏的确定性拒绝（CodeValidation）要把文案回给模型
-// 自纠而不是上抛——该分支在 TriggerPushNow 加 WorkflowExecutionErrorWhenAlreadyStarted
-// 之前是死代码，专门补消费端覆盖，防契约在 scheduler 与 tools 两端各自漂移。
-func TestPushNowTool_Execute(t *testing.T) {
-	t.Run("成功触发返回用户友好文案", func(t *testing.T) {
-		ft := &fakePushTrigger{runID: "push-agent-7"}
-		tool := &pushNowTool{pusher: ft}
-		got, err := tool.Execute(context.Background(), 7, json.RawMessage("{}"))
-		if err != nil || !strings.Contains(got, "已触发") || strings.Contains(got, "push-agent") {
-			t.Fatalf("成功触发应返回用户友好文案且不暴露 run_id, 实得 got=%q err=%v", got, err)
+func TestRunTaskNowTool_Execute(t *testing.T) {
+	t.Run("批量任务使用调用身份生成稳定命令键", func(t *testing.T) {
+		runner := &fakeTaskRunTrigger{}
+		tool := &runTaskNowTool{runner: runner}
+		ctx := withToolInvocationID(context.Background(), "call-stable")
+		args := json.RawMessage(`{"schedule_ids":["task-a","task-b","task-a"]}`)
+		got, err := tool.Execute(ctx, 7, args)
+		if err != nil || !strings.Contains(got, "2 个任务") {
+			t.Fatalf("批量立即运行失败: got=%q err=%v", got, err)
 		}
-		if ft.calls != 1 {
-			t.Fatalf("应恰好触发 1 次, 实得 %d", ft.calls)
+		if len(runner.calls) != 2 {
+			t.Fatalf("调用数=%d want=2: %v", len(runner.calls), runner.calls)
 		}
-	})
-
-	t.Run("已在进行按文案回模型不上抛", func(t *testing.T) {
-		// Cause 按生产形态给：TriggerPushNow 恒以 Temporal serviceerror 为 Cause，
-		// 服务端原文不得跟着 Error() 一起进模型上下文。
-		ae := types.NewAppError(types.CodeValidation,
-			"已有一次推送正在进行，请等它完成后再触发",
-			fmt.Errorf("Workflow execution is already running. WorkflowId: push-agent-7"))
-		ae.Retryable = false
-		tool := &pushNowTool{pusher: &fakePushTrigger{err: ae}}
-		got, err := tool.Execute(context.Background(), 7, json.RawMessage("{}"))
-		if err != nil {
-			t.Fatalf("确定性拒绝不应上抛, 实得 err=%v", err)
+		keyA := strings.Split(runner.calls[0], "\x00")[1]
+		if keyA != runTaskNowIdempotencyKey(7, "call-stable", "task-a") {
+			t.Fatalf("幂等键漂移: %q", keyA)
 		}
-		if !strings.Contains(got, "已有一次推送正在进行") {
-			t.Fatalf("应把拒绝文案回给模型, 实得 %q", got)
+		replay := &fakeTaskRunTrigger{}
+		tool.runner = replay
+		if _, err := tool.Execute(ctx, 7, args); err != nil {
+			t.Fatal(err)
 		}
-		if strings.Contains(got, "already running") || strings.Contains(got, "VALIDATION") {
-			t.Fatalf("拒绝文案不得携带错误链/错误码, 实得 %q", got)
+		if replay.calls[0] != runner.calls[0] ||
+			replay.calls[1] != runner.calls[1] {
+			t.Fatalf("相同工具调用重放未复用命令身份: %v vs %v",
+				runner.calls, replay.calls)
 		}
 	})
 
-	t.Run("基础设施错误照旧上抛", func(t *testing.T) {
-		cause := types.NewAppError(types.CodeInternal, "触发即时推送失败", fmt.Errorf("temporal down"))
-		tool := &pushNowTool{pusher: &fakePushTrigger{err: cause}}
-		got, err := tool.Execute(context.Background(), 7, json.RawMessage("{}"))
-		if err == nil || got != "" {
-			t.Fatalf("基础设施错误应上抛, 实得 got=%q err=%v", got, err)
-		}
-		if !errors.Is(err, types.ErrInternal) {
-			t.Fatalf("应保留原错误链, 实得 %v", err)
+	t.Run("缺少调用身份在任何副作用前拒绝", func(t *testing.T) {
+		runner := &fakeTaskRunTrigger{}
+		tool := &runTaskNowTool{runner: runner}
+		got, err := tool.Execute(
+			context.Background(), 7,
+			json.RawMessage(`{"schedule_ids":["task-a"]}`),
+		)
+		if err == nil || got != "" || len(runner.calls) != 0 {
+			t.Fatalf("缺少调用身份未 fail closed: got=%q err=%v calls=%v",
+				got, err, runner.calls)
 		}
 	})
+
+	t.Run("控制面错误原样上抛", func(t *testing.T) {
+		cause := types.NewAppError(
+			types.CodeInternal, "触发任务立即运行失败",
+			fmt.Errorf("temporal down"),
+		)
+		runner := &fakeTaskRunTrigger{err: cause}
+		tool := &runTaskNowTool{runner: runner}
+		ctx := withToolInvocationID(context.Background(), "call-error")
+		got, err := tool.Execute(
+			ctx, 7, json.RawMessage(`{"schedule_ids":["task-a"]}`),
+		)
+		if err == nil || got != "" || !errors.Is(err, types.ErrInternal) {
+			t.Fatalf("控制面错误应上抛: got=%q err=%v", got, err)
+		}
+	})
+}
+
+func TestRemoveScheduleIDsRejectsRemovedAndUnknownFields(t *testing.T) {
+	for _, args := range []json.RawMessage{
+		json.RawMessage(`{"schedule_id":"task-a"}`),
+		json.RawMessage(`{"schedule_ids":["task-a"],"unexpected":true}`),
+		json.RawMessage(`{"schedule_ids":["task-a"]} {}`),
+	} {
+		ids, message, malformed := removeScheduleIDs(args)
+		if !malformed || message == "" || len(ids) != 0 {
+			t.Fatalf("已移除或未知字段必须 fail closed: args=%s ids=%v message=%q malformed=%v",
+				args, ids, message, malformed)
+		}
+	}
 }
 
 // ============================================================
@@ -146,7 +166,7 @@ func TestViewProfileTool(t *testing.T) {
 }
 
 // ============================================================
-// update_profile（M5 契约 §12.3）：仅首次画像采集，走 M4 标准确认卡。
+// update_profile（M5 契约 §12.3）：仅首次画像采集，明确意图下直接执行。
 // ============================================================
 
 func TestUpdateProfileTool(t *testing.T) {
@@ -311,9 +331,8 @@ func TestUpdateProfileTool(t *testing.T) {
 	})
 }
 
-// Summarize 只列提供的字段（契约 §12.3）：确认卡如实展示本次会改什么。
-// 未提供的字段绝不出现——「不改」与「清空」在卡面上必须可区分，否则用户是在为
-// 一个自己看不见的变更点确认。
+// Summarize 只列提供的字段（契约 §12.3），供审计回执如实展示本次改动。
+// 未提供的字段绝不出现；「不改」与「清空」必须可区分。
 func TestUpdateProfileTool_Summarize(t *testing.T) {
 	tool := &updateProfileTool{}
 
@@ -323,7 +342,7 @@ func TestUpdateProfileTool_Summarize(t *testing.T) {
 			t.Fatalf("摘要不符, 实得 %q", got)
 		}
 		if strings.Contains(got, "职业") || strings.Contains(got, "标签") {
-			t.Fatalf("未提供的字段绝不能出现在确认卡上, 实得 %q", got)
+			t.Fatalf("未提供的字段绝不能出现在操作摘要中, 实得 %q", got)
 		}
 	})
 
@@ -350,25 +369,25 @@ func TestUpdateProfileTool_Summarize(t *testing.T) {
 	})
 
 	t.Run("展示截断后的实际生效值", func(t *testing.T) {
-		// 卡面列 13 个而只落 12 个是对用户撒谎。
+		// 摘要列 13 个而只落 12 个是对用户撒谎。
 		got := tool.Summarize(json.RawMessage(tagsArgs(13)))
 		if !strings.Contains(got, "tag12") {
 			t.Fatalf("摘要应含第 12 个标签, 实得 %q", got)
 		}
 		if strings.Contains(got, "tag13") {
-			t.Fatalf("卡面不得列出会被截掉的标签, 实得 %q", got)
+			t.Fatalf("摘要不得列出会被截掉的标签, 实得 %q", got)
 		}
 	})
 
 	t.Run("全缺省时明说不会有变更", func(t *testing.T) {
 		got := tool.Summarize(json.RawMessage(`{}`))
-		if got != "更新画像（未提供任何字段，确认后不会有变更）" {
+		if got != "更新画像（未提供任何字段，不会产生变更）" {
 			t.Fatalf("摘要不符, 实得 %q", got)
 		}
 	})
 
 	t.Run("非法 JSON 兜底展示原始参数", func(t *testing.T) {
-		// Summarize 无 error 通道，不能失败：卡片恒有内容可读。
+		// Summarize 无 error 通道，不能失败：审计摘要恒有内容可读。
 		got := tool.Summarize(json.RawMessage(`{"industry":`))
 		if !strings.Contains(got, "更新画像") || !strings.Contains(got, "参数未能解析") {
 			t.Fatalf("应走 summarizeFallback, 实得 %q", got)
@@ -387,412 +406,6 @@ func tagsArgs(n int) string {
 		panic(err)
 	}
 	return string(raw)
-}
-
-// TestAddSourceDescriptionDerivesUnavailableFromCatalog 锁住审计修复：add_source 工具说明里
-// 「不支持的能力及原因」必须**派生自 sourcecatalog**，而非手抄进 schema 的会漂移的副本。
-// 这是「注册表被 fetcher/sourcespec/agent 三处共用」中 agent 那一处的真接线证明——
-// 若有人把 x/search 的 Reason 改回硬编码、或 Description 不再读注册表，本用例会红。
-func TestAddSourceDescriptionDerivesUnavailableFromCatalog(t *testing.T) {
-	desc := (&addSourceTool{}).Description()
-
-	entry, ok := sourcecatalog.Lookup(types.PlatformX, types.CapSearch)
-	if !ok || entry.Available() {
-		t.Fatal("前提失效：x/search 应是 sourcecatalog 里的 Unavailable 条目")
-	}
-	// 说明必须逐字包含注册表里的 Reason（派生而非改写），且点名该能力。
-	if !strings.Contains(desc, entry.Reason) {
-		t.Errorf("工具说明未含注册表派生的 x/search Reason（疑似硬编码/未读注册表）。\ndesc=%q\nreason=%q", desc, entry.Reason)
-	}
-	if !strings.Contains(desc, "x/search") {
-		t.Errorf("工具说明应点名 x/search，实际：%q", desc)
-	}
-}
-
-// fakeProber 是 sourceProber 的测试替身。
-type fakeProber struct {
-	rep *fetcher.ProbeReport
-	err error
-}
-
-func (f *fakeProber) Probe(context.Context, types.Source) (*fetcher.ProbeReport, error) {
-	return f.rep, f.err
-}
-
-// TestAddSource_ProbeRejectionReachesUserVerbatim 锁 1.5 的「解析失败诚实告知 + 替代建议」：
-// ProbeRejection 的话术（含替代建议）必须原样进回执，且**绝不落库**——st 传 nil，
-// 若 Execute 在拒绝后仍去碰 store 会直接 panic，本用例即红。web/feed 此前不试跑直接
-// 落库（「假装成功，用户误以为已订阅」），这里同时守住门禁已从 IsBindingBacked 扩到
-// URL 类 web 能力。
-func TestAddSource_ProbeRejectionReachesUserVerbatim(t *testing.T) {
-	rejection := &fetcher.ProbeRejection{AE: types.NewAppError(types.CodeValidation,
-		"该地址返回的内容不是 RSS/Atom feed，但页面声明了 feed 地址：https://e.com/rss.xml。建议把 url 换成该地址重新添加（web/feed）。", nil)}
-	tool := &addSourceTool{st: nil, prober: &fakeProber{err: rejection}}
-
-	out, err := tool.Execute(context.Background(), 1,
-		json.RawMessage(`{"platform":"web","capability":"feed","url":"https://e.com/blog"}`))
-	if err != nil {
-		t.Fatalf("准入拒绝应作为回执文本返回而非 error: %v", err)
-	}
-	for _, want := range []string{"未添加信源", "https://e.com/rss.xml", "web/feed"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("回执缺少 %q：%s", want, out)
-		}
-	}
-}
-
-// TestAddSource_TransientProbeErrorGetsFixedText 瞬态失败（超时/限流）不透出原始
-// Message（红线 3），映射固定人话；同样不落库（st=nil 不 panic 即证明）。
-func TestAddSource_TransientProbeErrorGetsFixedText(t *testing.T) {
-	tool := &addSourceTool{st: nil, prober: &fakeProber{
-		err: types.NewAppError(types.CodeFetchRateLimit, "上游 429 raw body: {...}", nil)}}
-
-	out, err := tool.Execute(context.Background(), 1,
-		json.RawMessage(`{"platform":"web","capability":"contents","url":"https://e.com/pricing"}`))
-	if err != nil {
-		t.Fatalf("瞬态失败应作为回执文本返回而非 error: %v", err)
-	}
-	if !strings.Contains(out, "限流") || strings.Contains(out, "raw body") {
-		t.Errorf("瞬态失败应映射固定人话且不泄漏原始错误：%s", out)
-	}
-}
-
-// TestSpecFromArgs_ParamMapping 守住 add_source 的 **agent 独有映射层**（审计 M-3）：
-// 每个 capability 的入参必须落到 sourcespec.Build 认得的 param 键上。addSourceTool.Execute
-// 持具体 *store.Store 不可 fake，此前这层「8 字段 → params」的翻译零测试——拼错键名
-// （screen_name→screenname）不会被 sourcespec 自己的用例发现，只会在生产里产出错误的
-// 确认卡预填。抽出纯函数 specFromArgs 后逐 capability 断言：映射产出的 spec 能被 Build 成
-// 合法 Source，且关键入参进了幂等键（键名映错则 Build 因缺必填参数而拒绝，本用例即红）。
-func TestSpecFromArgs_ParamMapping(t *testing.T) {
-	cases := []struct {
-		name     string
-		args     addSourceArgs
-		platform types.Platform
-		cap      types.Capability
-		wantIn   string // 关键入参必须出现在产出 Source 的 URL（幂等键）里
-	}{
-		{"web/feed", addSourceArgs{Platform: "web", Capability: "feed", URL: "https://example.com/feed.xml"}, types.PlatformWeb, types.CapFeed, "example.com/feed.xml"},
-		{"web/search", addSourceArgs{Platform: "web", Capability: "search", Query: "OpenAI"}, types.PlatformWeb, types.CapSearch, "OpenAI"},
-		{"xhs/search", addSourceArgs{Platform: "xhs", Capability: "search", Keyword: "meizhuang"}, types.PlatformXHS, types.CapSearch, "meizhuang"},
-		{"xhs/user_posts", addSourceArgs{Platform: "xhs", Capability: "user_posts", UserID: "6a5578b3000000000e03cc00"}, types.PlatformXHS, types.CapUserPosts, "6a5578b3000000000e03cc00"},
-		{"x/user_posts", addSourceArgs{Platform: "x", Capability: "user_posts", ScreenName: "OpenAI"}, types.PlatformX, types.CapUserPosts, "OpenAI"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			src, msg := sourcespec.Build(specFromArgs(tc.args))
-			if msg != "" {
-				t.Fatalf("映射后 Build 应成功（键名拼错会在此暴露）, 实得拒绝: %s", msg)
-			}
-			if src.Platform != tc.platform || src.Capability != tc.cap {
-				t.Fatalf("平台/能力不符: %s/%s, 期望 %s/%s", src.Platform, src.Capability, tc.platform, tc.cap)
-			}
-			if !strings.Contains(src.URL, tc.wantIn) {
-				t.Fatalf("关键入参未进入幂等键（疑似映射到错误 param 键）: URL=%q 期望含 %q", src.URL, tc.wantIn)
-			}
-		})
-	}
-}
-
-// TestSpecFromArgs_CategoriesMarshaled 单独守 categories 的 JSON 序列化分支
-// （唯一非直传的映射：[]string → JSON 字符串进 params["categories"]）。
-func TestSpecFromArgs_CategoriesMarshaled(t *testing.T) {
-	spec := specFromArgs(addSourceArgs{
-		Platform: "web", Capability: "feed", URL: "https://example.com/feed.xml",
-		Categories: []string{"Product", "Research"},
-	})
-	if got := spec.Params["categories"]; got != `["Product","Research"]` {
-		t.Fatalf("categories 应序列化为 JSON 数组字符串, 实得 %q", got)
-	}
-}
-
-// TestSpecFromArgs_IncludeDomainsMarshaled 守 D-2 的 include_domains 映射分支
-// （[]string → JSON 字符串进 params，与 categories 同路径），并端到端进幂等键。
-func TestSpecFromArgs_IncludeDomainsMarshaled(t *testing.T) {
-	spec := specFromArgs(addSourceArgs{
-		Platform: "web", Capability: "search", Query: "Claude release",
-		IncludeDomains: []string{"anthropic.com", "claude.com"},
-	})
-	if got := spec.Params["include_domains"]; got != `["anthropic.com","claude.com"]` {
-		t.Fatalf("include_domains 应序列化为 JSON 数组字符串, 实得 %q", got)
-	}
-	src, msg := sourcespec.Build(spec)
-	if msg != "" {
-		t.Fatalf("Build 应成功: %s", msg)
-	}
-	if !strings.Contains(src.URL, "include_domains=") {
-		t.Fatalf("include_domains 未进幂等键: %q", src.URL)
-	}
-}
-
-// TestAddSourceTool_Summarize 覆盖确认卡文案的每个 capability 分支（审计 M-3）：
-// 预填错内容用户照点即加错源，故每条分支都逐字钉住。
-func TestAddSourceTool_Summarize(t *testing.T) {
-	tool := &addSourceTool{}
-	cases := []struct{ name, args, want string }{
-		{"web/feed", `{"platform":"web","capability":"feed","url":"https://x.com/feed"}`, "添加 RSS 信源：https://x.com/feed"},
-		{"web/search", `{"platform":"web","capability":"search","query":"AI"}`, "添加搜索信源：搜索词「AI」"},
-		{"web/search 带类别", `{"platform":"web","capability":"search","query":"AI","category":"news"}`, "添加搜索信源：搜索词「AI」，类别「news」"},
-		{"xhs/search", `{"platform":"xhs","capability":"search","keyword":"美妆"}`, "添加小红书关键词信源：「美妆」"},
-		{"xhs/user_posts", `{"platform":"xhs","capability":"user_posts","user_id":"abc123"}`, "添加小红书博主信源：abc123"},
-		{"x/user_posts", `{"platform":"x","capability":"user_posts","screen_name":"OpenAI"}`, "添加 X 用户时间线信源：@OpenAI"},
-		{"带展示名", `{"platform":"web","capability":"feed","url":"https://x.com/feed","title":"某博客"}`, "添加 RSS 信源：https://x.com/feed，展示名「某博客」"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tool.Summarize(json.RawMessage(tc.args)); got != tc.want {
-				t.Fatalf("Summarize 不符:\n实得 %q\n期望 %q", got, tc.want)
-			}
-		})
-	}
-	t.Run("非法 JSON 走兜底不 panic", func(t *testing.T) {
-		if got := tool.Summarize(json.RawMessage(`{"platform":`)); !strings.Contains(got, "添加信源") {
-			t.Fatalf("应走 summarizeFallback, 实得 %q", got)
-		}
-	})
-}
-
-// TestEnableSourceTool 覆盖 enable_source（功能 5.2 重启用入口）：写工具直接执行，
-// Summarize 如实展示会启用哪个源。Execute 的归属校验（EnableSource 的 SQL WHERE）由
-// store 集成测试覆盖（enable_source 持具体 *store.Store 不可 fake）。
-func TestEnableSourceTool(t *testing.T) {
-	got := (&enableSourceTool{}).Summarize(json.RawMessage(`{"source_id":7}`))
-	if got != "重新启用信源（id=7）" {
-		t.Fatalf("Summarize 实得 %q", got)
-	}
-	if fb := (&enableSourceTool{}).Summarize(json.RawMessage(`{`)); !strings.Contains(fb, "重新启用信源") {
-		t.Fatalf("非法 JSON 应走 summarizeFallback, 实得 %q", fb)
-	}
-}
-
-// TestOtherTools_Summarize 覆盖此前零测试的三个写工具 Summarize（审计 M-3）。
-func TestOtherTools_Summarize(t *testing.T) {
-	t.Run("remove_source 单个", func(t *testing.T) {
-		got := (&removeSourceTool{}).Summarize(json.RawMessage(`{"source_ids":[42]}`))
-		if got != "取消订阅信源（id=42）" {
-			t.Fatalf("实得 %q", got)
-		}
-	})
-	// 部署前落库的 pending_actions 仍是单数 source_id；换 schema 不能废掉已发出的卡。
-	t.Run("remove_source 兼容旧单数入参", func(t *testing.T) {
-		got := (&removeSourceTool{}).Summarize(json.RawMessage(`{"source_id":42}`))
-		if got != "取消订阅信源（id=42）" {
-			t.Fatalf("实得 %q", got)
-		}
-	})
-	// 批量是本工具的核心承诺：一次调用完整列出并处理每个 id。
-	t.Run("remove_source 批量列出全部 id", func(t *testing.T) {
-		got := (&removeSourceTool{}).Summarize(json.RawMessage(`{"source_ids":[31,32,33]}`))
-		if got != "取消订阅 3 个信源（id=31、32、33）" {
-			t.Fatalf("实得 %q", got)
-		}
-	})
-	t.Run("remove_schedule", func(t *testing.T) {
-		got := (&removeScheduleTool{}).Summarize(json.RawMessage(`{"schedule_id":"sched-7"}`))
-		if got != "删除 1 个定时推送任务（id=sched-7）" {
-			t.Fatalf("实得 %q", got)
-		}
-	})
-	t.Run("create_schedule cron", func(t *testing.T) {
-		got := (&createScheduleTool{}).Summarize(json.RawMessage(
-			`{"spec":{"cron":"0 30 8 * * *"},"nl_description":"每天早八"}`))
-		want := "创建定时推送任务：按 cron「0 30 8 * * *」触发（时区 Asia/Shanghai），描述「每天早八」\n" +
-			"推送门槛：宽松（只过滤与你画像无关的内容）"
-		if got != want {
-			t.Fatalf("实得 %q\n期望 %q", got, want)
-		}
-	})
-	t.Run("create_schedule every_seconds", func(t *testing.T) {
-		got := (&createScheduleTool{}).Summarize(json.RawMessage(`{"spec":{"every_seconds":3600}}`))
-		// 文案刻意点明 epoch 对齐：不说的话用户会以为是"从现在起每小时"。
-		if got != "创建定时推送任务：每 3600 秒触发一次（时区 Asia/Shanghai，按 epoch 对齐）\n"+
-			"推送门槛：宽松（只过滤与你画像无关的内容）" {
-			t.Fatalf("实得 %q", got)
-		}
-	})
-	t.Run("create_schedule 展示批准意图门槛和完整信源", func(t *testing.T) {
-		got := (&createScheduleTool{}).Summarize(json.RawMessage(`{
-			"spec":{"cron":"0 8 * * *"},
-			"intent":"只监控 Anthropic 官方状态故障",
-			"strictness":"strict",
-			"approved_fetch_plan":{"sources":[{
-				"platform":"web","capability":"feed","title":"Anthropic Status",
-				"url":"https://status.anthropic.com/history.rss","config":{"format":"rss"}
-			}]}
-		}`))
-		for _, want := range []string{
-			"监控意图：只监控 Anthropic 官方状态故障",
-			"推送门槛：严格（仅 ≥60 分的高相关内容才推送）",
-			"批准信源（1）",
-			"Anthropic Status [web/feed] https://status.anthropic.com/history.rss；参数 {\"format\":\"rss\"}",
-		} {
-			if !strings.Contains(got, want) {
-				t.Fatalf("确认摘要缺少 %q：%s", want, got)
-			}
-		}
-	})
-	t.Run("update_schedule 只改频率", func(t *testing.T) {
-		got := (&updateScheduleTool{}).Summarize(json.RawMessage(
-			`{"schedule_id":"push-1-abc","spec":{"cron":"30 8 * * *"}}`))
-		want := "修改定时推送任务（id=push-1-abc）：触发频率改为 按 cron「30 8 * * *」触发（时区 Asia/Shanghai）"
-		if got != want {
-			t.Fatalf("实得 %q\n期望 %q", got, want)
-		}
-	})
-	// 省略 nl_description = 不改描述，卡面绝不能提它——否则用户以为描述会被动。
-	t.Run("update_schedule 省略描述不上卡", func(t *testing.T) {
-		got := (&updateScheduleTool{}).Summarize(json.RawMessage(
-			`{"schedule_id":"s1","spec":{"every_seconds":7200}}`))
-		if strings.Contains(got, "描述") {
-			t.Fatalf("省略 nl_description 时卡面不该提描述，实得 %q", got)
-		}
-	})
-	t.Run("update_schedule 显式改描述", func(t *testing.T) {
-		got := (&updateScheduleTool{}).Summarize(json.RawMessage(
-			`{"schedule_id":"s1","spec":{"cron":"0 9 * * *"},"nl_description":"改成九点"}`))
-		if !strings.Contains(got, "描述改为「改成九点」") {
-			t.Fatalf("实得 %q", got)
-		}
-	})
-	t.Run("update_schedule 显式清空描述", func(t *testing.T) {
-		got := (&updateScheduleTool{}).Summarize(json.RawMessage(
-			`{"schedule_id":"s1","spec":{"cron":"0 9 * * *"},"nl_description":""}`))
-		if !strings.Contains(got, "清空描述") {
-			t.Fatalf("显式空串应显示为清空（与省略可区分），实得 %q", got)
-		}
-	})
-	// Summarize 无 error 通道：非法参数必须兜底成可读文案而非 panic/空串。
-	t.Run("非法 JSON 兜底", func(t *testing.T) {
-		if got := (&removeSourceTool{}).Summarize(json.RawMessage(`{`)); !strings.Contains(got, "取消订阅信源") {
-			t.Fatalf("应走 summarizeFallback, 实得 %q", got)
-		}
-	})
-	// 能解析但校验不过（如超上限）：卡面必须诚实说明确认也不会执行，
-	// 不能落成一段截断 JSON 的垃圾卡（审查 M-2）。
-	t.Run("remove_source 超上限卡面诚实", func(t *testing.T) {
-		ids := make([]string, removeSourceBatchMax+1)
-		for i := range ids {
-			ids[i] = strconv.Itoa(i + 1)
-		}
-		got := (&removeSourceTool{}).Summarize(json.RawMessage(`{"source_ids":[` + strings.Join(ids, ",") + `]}`))
-		for _, want := range []string{"参数无效", "确认后也不会执行"} {
-			if !strings.Contains(got, want) {
-				t.Fatalf("卡面缺 %q：%s", want, got)
-			}
-		}
-	})
-}
-
-// TestRemoveSourceIDs 钉死批量入参的规范化契约：Execute 与 Summarize 共用同一
-// 解析器，卡面摘要与真正执行的 id 集合不可能漂移。
-func TestRemoveSourceIDs(t *testing.T) {
-	cases := []struct {
-		name    string
-		args    string
-		want    []int64
-		wantErr bool
-	}{
-		{name: "批量", args: `{"source_ids":[31,32,33]}`, want: []int64{31, 32, 33}},
-		{name: "旧单数兼容", args: `{"source_id":7}`, want: []int64{7}},
-		{name: "去重保序", args: `{"source_ids":[5,3,5,3]}`, want: []int64{5, 3}},
-		// source_ids 优先：两者并存时旧字段不得混入，否则卡面与执行集合不一致。
-		{name: "数组优先于单数", args: `{"source_id":1,"source_ids":[2]}`, want: []int64{2}},
-		{name: "空数组拒绝", args: `{"source_ids":[]}`, wantErr: true},
-		{name: "两者皆缺拒绝", args: `{}`, wantErr: true},
-		{name: "非正数拒绝", args: `{"source_ids":[3,0]}`, wantErr: true},
-		{name: "负数拒绝", args: `{"source_ids":[-1]}`, wantErr: true},
-		{name: "非法 JSON 拒绝", args: `{`, wantErr: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, errText, _ := removeSourceIDs(json.RawMessage(tc.args))
-			if tc.wantErr {
-				if errText == "" {
-					t.Fatalf("期望拒绝，实得 ids=%v", got)
-				}
-				return
-			}
-			if errText != "" {
-				t.Fatalf("期望通过，实得错误 %q", errText)
-			}
-			if len(got) != len(tc.want) {
-				t.Fatalf("ids=%v，期望 %v", got, tc.want)
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Fatalf("ids=%v，期望 %v", got, tc.want)
-				}
-			}
-		})
-	}
-	t.Run("超过上限拒绝", func(t *testing.T) {
-		ids := make([]string, removeSourceBatchMax+1)
-		for i := range ids {
-			ids[i] = strconv.Itoa(i + 1)
-		}
-		args := `{"source_ids":[` + strings.Join(ids, ",") + `]}`
-		if got, errText, _ := removeSourceIDs(json.RawMessage(args)); errText == "" {
-			t.Fatalf("超上限应拒绝，实得 ids=%v", got)
-		}
-	})
-	// malformed 标志决定卡面走兜底还是把校验文案上卡，两态必须可区分。
-	t.Run("JSON 坏是 malformed", func(t *testing.T) {
-		if _, _, malformed := removeSourceIDs(json.RawMessage(`{`)); !malformed {
-			t.Fatal("非法 JSON 应标记 malformed")
-		}
-	})
-	t.Run("校验不过不是 malformed", func(t *testing.T) {
-		if _, errText, malformed := removeSourceIDs(json.RawMessage(`{"source_ids":[]}`)); malformed || errText == "" {
-			t.Fatalf("空数组应是校验失败非 malformed，errText=%q malformed=%v", errText, malformed)
-		}
-	})
-}
-
-// TestRemoveSourceSchema_BatchMaxConsistent 钉死常量与 schema maxItems 的一致性：
-// 改 schema 忘改常量会让 strict 模型能发出确认后才被拦的批量（审查 L-1）。
-func TestRemoveSourceSchema_BatchMaxConsistent(t *testing.T) {
-	var schema struct {
-		Properties struct {
-			SourceIDs struct {
-				MaxItems int `json:"maxItems"`
-			} `json:"source_ids"`
-		} `json:"properties"`
-	}
-	if err := json.Unmarshal((&removeSourceTool{}).Parameters(), &schema); err != nil {
-		t.Fatalf("schema 不是合法 JSON: %v", err)
-	}
-	if schema.Properties.SourceIDs.MaxItems != removeSourceBatchMax {
-		t.Fatalf("schema maxItems=%d 与 removeSourceBatchMax=%d 漂移",
-			schema.Properties.SourceIDs.MaxItems, removeSourceBatchMax)
-	}
-}
-
-// TestUpdateScheduleTool_契约 钉死 update_schedule 的工具面契约：
-// 它是写工具（必须走确认卡）、参数校验与 create_schedule 同源、
-// 且**不在 A2A 只读白名单里**（写工具漏进 A2A 就是越权）。
-func TestUpdateScheduleTool_契约(t *testing.T) {
-	tool := &updateScheduleTool{}
-
-	if tool.Name() != "update_schedule" {
-		t.Errorf("工具名不符: %s", tool.Name())
-	}
-	// schema 必须是合法 JSON object schema，且把两个必填项声明出来。
-	var schema map[string]any
-	if err := json.Unmarshal(tool.Parameters(), &schema); err != nil {
-		t.Fatalf("schema 不是合法 JSON: %v", err)
-	}
-	req, _ := schema["required"].([]any)
-	if len(req) != 2 {
-		t.Errorf("schedule_id 与 spec 都应必填，实得 %v", req)
-	}
-	// 工具描述必须点明"原地改、不要删了重建"——这正是它存在的理由，
-	// 模型看不到这句就会退回 remove+create 的老路。
-	if !strings.Contains(tool.Description(), "原地改") {
-		t.Errorf("Description 应说明原地改，实得 %q", tool.Description())
-	}
-	// every_seconds 的 epoch 对齐语义必须写进 schema，否则模型会把它当"从现在起每 N 秒"。
-	if !strings.Contains(string(tool.Parameters()), "epoch") {
-		t.Error("schema 应说明 every_seconds 的 epoch 对齐语义")
-	}
 }
 
 // TestValidateScheduleSpecFields_共用 验证 create 与 update 走的是同一套 spec 判据——
@@ -834,21 +447,25 @@ func TestValidateScheduleSpecFields_共用(t *testing.T) {
 	}
 }
 
-// TestBuildTools_DefinitionWritesRetired keeps every pre-C2b definition writer
-// out of the Agent allowlist. Existing pending actions for these names are
-// consequently consumed by Loop's registered-tool gate without execution.
-func TestBuildTools_DefinitionWritesRetired(t *testing.T) {
+// TestBuildTools_RetiredToolsStayAbsent keeps every retired definition/source
+// surface out of the current Agent allowlist. Immutable historical tool calls
+// remain audit data, but they can never become executable again.
+func TestBuildTools_RetiredToolsStayAbsent(t *testing.T) {
 	names := map[string]bool{}
 	// Use the same non-nil dependency shape as production. A conditional
 	// registration such as `if sched != nil` must not make this guard vacuous.
-	for _, tl := range BuildTools(&store.Store{}, &scheduler.Scheduler{}, nil, nil, nil, nil, nil) {
+	for _, tl := range BuildTools(&store.Store{}, &scheduler.Scheduler{}, nil, nil, nil) {
 		names[tl.Name()] = true
 	}
 	for _, retired := range []string{
-		"update_schedule", "edit_task_playbook", "set_task_strictness",
+		"set_task_strictness",
+		"list_sources",
+		"add_source",
+		"remove_source",
+		"edit_task_playbook",
 	} {
 		if names[retired] {
-			t.Errorf("BuildTools must not register retired definition writer %s", retired)
+			t.Errorf("BuildTools must not register retired tool %s", retired)
 		}
 	}
 	for _, want := range []string{
@@ -857,64 +474,6 @@ func TestBuildTools_DefinitionWritesRetired(t *testing.T) {
 		if !names[want] {
 			t.Errorf("BuildTools should retain %s", want)
 		}
-	}
-}
-
-type recordingTaskCreator struct {
-	calls int
-	input task.CreateInput
-}
-
-func (f *recordingTaskCreator) Create(
-	_ context.Context,
-	input task.CreateInput,
-) (task.CreateResult, error) {
-	f.calls++
-	f.input = input
-	return task.CreateResult{
-		ScheduleID:        "push-7-via-build-tools",
-		StrictnessApplied: true,
-	}, nil
-}
-
-// TestBuildTools_CreateSchedule委托注入服务 防组合根到工具白名单之间的接线假绿：
-// 只检查工具名无法发现 tasks 被漏填/填成 nil；必须从 BuildTools 取出真实工具并执行一次。
-func TestBuildTools_CreateSchedule委托注入服务(t *testing.T) {
-	tasks := &recordingTaskCreator{}
-	var create Tool
-	for _, tl := range BuildTools(nil, nil, tasks, nil, nil, nil, nil) {
-		if tl.Name() == "create_schedule" {
-			create = tl
-			break
-		}
-	}
-	if create == nil {
-		t.Fatal("BuildTools 未注册 create_schedule")
-	}
-
-	got, err := create.Execute(t.Context(), 7, json.RawMessage(
-		`{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},`+
-			`"nl_description":"每日 AI 情报","strictness":"normal"}`,
-	))
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-	if tasks.calls != 1 {
-		t.Fatalf("注入的 task service 调用次数 = %d, want 1", tasks.calls)
-	}
-	wantSpec := scheduler.ScheduleSpec{Cron: "0 8 * * *", TZ: "Asia/Shanghai"}
-	if tasks.input.UserID != 7 ||
-		tasks.input.Spec != wantSpec ||
-		tasks.input.NLDescription != "每日 AI 情报" ||
-		tasks.input.PlaybookContent != "每日 AI 情报" ||
-		tasks.input.Strictness != types.StrictnessNormal {
-		t.Fatalf("BuildTools 委托入参漂移: %+v", tasks.input)
-	}
-	const wantReply = "已创建定时推送任务（id=push-7-via-build-tools）：" +
-		"按 cron「0 8 * * *」触发（时区 Asia/Shanghai），" +
-		"推送门槛「标准」（≥40 分才推送，弱相关不打扰）"
-	if got != wantReply {
-		t.Fatalf("Execute() = %q, want %q", got, wantReply)
 	}
 }
 
@@ -941,36 +500,36 @@ type fakePlaybookStore struct {
 		plan       string
 	}
 	// P1b b2：材料化 + 链接同步的捕获。
-	srcByURL   map[string]int64 // url → 分配的 source id（模拟 GetOrCreateSource 幂等）
-	nextSrcID  int64
-	gotSrcURLs []string           // GetOrCreateSource 收到的 url（按序）
-	links      map[string][]int64 // scheduleID → 最后一次 ReplaceScheduleSources 的 sourceIDs
-	srcErr     error              // 非 nil = GetOrCreateSource 失败
-	linkErr    error              // 非 nil = ReplaceScheduleSources 失败
-	linkCalls  int
+	targetByURL   map[string]int64 // url → 分配的抓取目标 id（模拟 GetOrCreateFetchTarget 幂等）
+	nextTargetID  int64
+	gotTargetURLs []string           // GetOrCreateFetchTarget 收到的 url（按序）
+	links         map[string][]int64 // scheduleID → 最后一次 ReplaceTaskFetchTargets 的 targetIDs
+	targetErr     error              // 非 nil = GetOrCreateFetchTarget 失败
+	linkErr       error              // 非 nil = ReplaceTaskFetchTargets 失败
+	linkCalls     int
 }
 
 func newFakePlaybookStore() *fakePlaybookStore {
 	return &fakePlaybookStore{
 		books: map[string]*types.SchedulePlaybook{}, owner: map[string]int64{},
-		srcByURL: map[string]int64{}, links: map[string][]int64{},
+		targetByURL: map[string]int64{}, links: map[string][]int64{},
 	}
 }
 
-func (f *fakePlaybookStore) GetOrCreateSource(_ context.Context, src *types.Source) (int64, bool, error) {
-	f.gotSrcURLs = append(f.gotSrcURLs, src.URL)
-	if f.srcErr != nil {
-		return 0, false, f.srcErr
+func (f *fakePlaybookStore) GetOrCreateFetchTarget(_ context.Context, target *types.FetchTarget) (int64, bool, error) {
+	f.gotTargetURLs = append(f.gotTargetURLs, target.URL)
+	if f.targetErr != nil {
+		return 0, false, f.targetErr
 	}
-	if id, ok := f.srcByURL[src.URL]; ok {
+	if id, ok := f.targetByURL[target.URL]; ok {
 		return id, false, nil // 已存在：原样返回，不覆写。
 	}
-	f.nextSrcID++
-	f.srcByURL[src.URL] = f.nextSrcID
-	return f.nextSrcID, true, nil
+	f.nextTargetID++
+	f.targetByURL[target.URL] = f.nextTargetID
+	return f.nextTargetID, true, nil
 }
 
-func (f *fakePlaybookStore) ReplaceScheduleSources(_ context.Context, userID int64, scheduleID string, sourceIDs []int64) error {
+func (f *fakePlaybookStore) ReplaceTaskFetchTargets(_ context.Context, userID int64, scheduleID string, targetIDs []int64) error {
 	f.linkCalls++
 	if f.linkErr != nil {
 		return f.linkErr
@@ -978,7 +537,7 @@ func (f *fakePlaybookStore) ReplaceScheduleSources(_ context.Context, userID int
 	if o, ok := f.owner[scheduleID]; ok && o != userID {
 		return nil // 非本人：归属未命中，不动链接（真 store 靠 SQL EXISTS 门禁）。
 	}
-	f.links[scheduleID] = append([]int64(nil), sourceIDs...)
+	f.links[scheduleID] = append([]int64(nil), targetIDs...)
 	return nil
 }
 
@@ -1077,17 +636,17 @@ func TestViewTaskPlaybookTool(t *testing.T) {
 		fs.books["s1"] = &types.SchedulePlaybook{
 			ScheduleID: "s1",
 			Content:    "AI 官方新闻",
-			FetchPlan:  json.RawMessage(`{"sources":[{"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=ai"}]}`),
+			FetchPlan:  json.RawMessage(`{"targets":[{"platform":"web","capability":"search","title":"搜索: AI","url":"vane://web/search?q=ai"}]}`),
 		}
 		fs.owner["s1"] = 7
 		got, _ := (&viewTaskPlaybookTool{st: fs}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":"s1"}`))
-		if !strings.Contains(got, "抓取计划（1 个源）") || !strings.Contains(got, "[web/search]") {
+		if !strings.Contains(got, "抓取计划（1 个目标）") || !strings.Contains(got, "[web/search]") {
 			t.Fatalf("应渲染抓取计划: %q", got)
 		}
 	})
 	t.Run("空 fetch_plan 不赘述计划", func(t *testing.T) {
 		fs := newFakePlaybookStore()
-		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1", Content: "x", FetchPlan: json.RawMessage(`{"sources":[]}`)}
+		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1", Content: "x", FetchPlan: json.RawMessage(`{"targets":[]}`)}
 		fs.owner["s1"] = 7
 		got, _ := (&viewTaskPlaybookTool{st: fs}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":"s1"}`))
 		if strings.Contains(got, "抓取计划") {
@@ -1119,341 +678,106 @@ func TestViewTaskPlaybookTool(t *testing.T) {
 	})
 }
 
-func TestEditTaskPlaybookTool(t *testing.T) {
-	t.Run("正常写入", func(t *testing.T) {
-		fs := newFakePlaybookStore()
-		fs.owner["s1"] = 7 // 已存在且属本人
-		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1"}
-		got, err := (&editTaskPlaybookTool{st: fs}).Execute(context.Background(), 7,
-			json.RawMessage(`{"schedule_id":"s1","content":"只要官方源"}`))
-		if err != nil {
-			t.Fatalf("意外报错: %v", err)
-		}
-		if len(fs.upserts) != 1 || fs.upserts[0].content != "只要官方源" || fs.upserts[0].userID != 7 {
-			t.Fatalf("upsert 入参不符: %+v", fs.upserts)
-		}
-		if !strings.Contains(got, "已更新定时任务") {
-			t.Fatalf("回执不符: %q", got)
-		}
-	})
-	t.Run("空 content 自纠不触库", func(t *testing.T) {
-		fs := newFakePlaybookStore()
-		got, err := (&editTaskPlaybookTool{st: fs}).Execute(context.Background(), 7,
-			json.RawMessage(`{"schedule_id":"s1","content":"  "}`))
-		if err != nil || !strings.Contains(got, "手册内容不能为空") {
-			t.Fatalf("应回自纠文案, got=%q err=%v", got, err)
-		}
-		if len(fs.upserts) != 0 {
-			t.Fatalf("空内容不得触库: %+v", fs.upserts)
-		}
-	})
-	t.Run("content 超上限截断", func(t *testing.T) {
-		fs := newFakePlaybookStore()
-		fs.owner["s1"] = 7
-		long := strings.Repeat("字", maxPlaybookContentRunes+50)
-		if _, err := (&editTaskPlaybookTool{st: fs}).Execute(context.Background(), 7,
-			json.RawMessage(`{"schedule_id":"s1","content":"`+long+`"}`)); err != nil {
-			t.Fatalf("超限应截断而非报错: %v", err)
-		}
-		if got := len([]rune(fs.upserts[0].content)); got != maxPlaybookContentRunes {
-			t.Fatalf("content 应截到 %d rune, 实得 %d", maxPlaybookContentRunes, got)
-		}
-	})
-	t.Run("归属未命中回文案不报错", func(t *testing.T) {
-		fs := newFakePlaybookStore()
-		fs.owner["s1"] = 99 // 属别人
-		got, err := (&editTaskPlaybookTool{st: fs}).Execute(context.Background(), 7,
-			json.RawMessage(`{"schedule_id":"s1","content":"x"}`))
-		if err != nil {
-			t.Fatalf("归属未命中不应上抛: %v", err)
-		}
-		if !strings.Contains(got, "没找到你的定时任务") {
-			t.Fatalf("应回自纠文案: %q", got)
-		}
-	})
-	t.Run("DB 错误上抛", func(t *testing.T) {
-		fs := newFakePlaybookStore()
-		fs.upsertErr = types.NewAppError(types.CodeDatabase, "写入失败", nil)
-		got, err := (&editTaskPlaybookTool{st: fs}).Execute(context.Background(), 7,
-			json.RawMessage(`{"schedule_id":"s1","content":"x"}`))
-		if err == nil || got != "" {
-			t.Fatalf("基础设施错误应上抛, got=%q err=%v", got, err)
-		}
-	})
-}
-
-func TestEditTaskPlaybookTool_Summarize(t *testing.T) {
-	tool := &editTaskPlaybookTool{}
-	t.Run("正常展示内容片段", func(t *testing.T) {
-		got := tool.Summarize(json.RawMessage(`{"schedule_id":"s1","content":"只要官方源"}`))
-		if got != "修改定时任务手册（id=s1）：新内容「只要官方源」" {
-			t.Fatalf("摘要不符: %q", got)
-		}
-	})
-	t.Run("超预览上限截断带省略号", func(t *testing.T) {
-		long := strings.Repeat("字", playbookSummaryPreviewRunes+20)
-		got := tool.Summarize(json.RawMessage(`{"schedule_id":"s1","content":"` + long + `"}`))
-		if !strings.Contains(got, "…") {
-			t.Fatalf("超预览上限应截断带省略号: %q", got)
-		}
-	})
-	t.Run("非法 JSON 走兜底", func(t *testing.T) {
-		if got := tool.Summarize(json.RawMessage(`{`)); !strings.Contains(got, "修改任务手册") {
-			t.Fatalf("应走 summarizeFallback: %q", got)
-		}
-	})
-}
-
-// newCreateScheduleToolForTest 让 A0 的行为刻画继续贯穿真实 task.Service，
-// 避免重构后 golden matrix 只测到 Agent 的参数外壳。
-func newCreateScheduleToolForTest(
-	schedules task.ScheduleCreator,
-	playbooks playbookStore,
-	translator playbookTranslator,
-	strictness task.StrictnessWriter,
-) *createScheduleTool {
-	var compiler task.PlaybookCompiler
-	if playbooks != nil {
-		compiler = NewTaskPlaybookCompiler(playbooks, translator)
-	}
-	return &createScheduleTool{tasks: task.New(task.Deps{
-		Schedules:  schedules,
-		Playbooks:  playbooks,
-		Compiler:   compiler,
-		Strictness: strictness,
-	})}
-}
-
-// fakeScheduleCreator 是 task.ScheduleCreator 的假实现：返回预设 schedID / err，
-// 并记录 CreatePush 收到的 nlDesc（用于验证手册初始化用它作内容）。
-type fakeScheduleCreator struct {
-	schedID   string
-	err       error
-	gotNLDesc string
-	calls     int
-}
-
-func (f *fakeScheduleCreator) CreatePush(_ context.Context, _ int64, _ scheduler.ScheduleSpec, _ workflow.PushScope, nlDesc string) (string, error) {
-	f.calls++
-	f.gotNLDesc = nlDesc
-	if f.err != nil {
-		return "", f.err
-	}
-	return f.schedID, nil
-}
-
-// TestCreateScheduleTool_InitializesPlaybook 守决策 D2 的胶水（创建即初始化手册）：
-// CreatePush 成功后，用 nl_description 初始化 schedID 对应的手册；best-effort——
-// 手册写失败不回滚调度、仍回成功。此前这条接线零测试（Execute 依赖真 Temporal）。
-func TestCreateScheduleTool_InitializesPlaybook(t *testing.T) {
-	args := json.RawMessage(`{"spec":{"cron":"0 30 8 * * *"},"nl_description":"每天早八 AI 官方新闻"}`)
-
-	t.Run("成功时用 nl 意图初始化手册", func(t *testing.T) {
-		sc := &fakeScheduleCreator{schedID: "push-7-abc"}
-		pb := newFakePlaybookStore()
-		tool := newCreateScheduleToolForTest(sc, pb, nil, nil)
-		got, err := tool.Execute(context.Background(), 7, args)
-		if err != nil {
-			t.Fatalf("意外报错: %v", err)
-		}
-		if !strings.Contains(got, "push-7-abc") {
-			t.Fatalf("回执应含 schedID: %q", got)
-		}
-		if len(pb.upserts) != 1 {
-			t.Fatalf("应恰好初始化一次手册, 实得 %d", len(pb.upserts))
-		}
-		u := pb.upserts[0]
-		if u.userID != 7 || u.scheduleID != "push-7-abc" || u.content != "每天早八 AI 官方新闻" {
-			t.Fatalf("手册初始化入参不符: %+v", u)
-		}
-	})
-
-	t.Run("调度保留原文而手册按独立上限截断", func(t *testing.T) {
-		sc := &fakeScheduleCreator{schedID: "push-7-long"}
-		pb := newFakePlaybookStore()
-		long := strings.Repeat("字", maxPlaybookContentRunes+50)
-		raw := json.RawMessage(`{"spec":{"cron":"0 8 * * *"},"nl_description":"` + long + `"}`)
-
-		if _, err := newCreateScheduleToolForTest(sc, pb, nil, nil).
-			Execute(context.Background(), 7, raw); err != nil {
-			t.Fatalf("意外报错: %v", err)
-		}
-		if sc.gotNLDesc != long {
-			t.Fatalf("scheduler 应收到未截断原文: got=%d rune want=%d",
-				len([]rune(sc.gotNLDesc)), len([]rune(long)))
-		}
-		if got := len([]rune(pb.upserts[0].content)); got != maxPlaybookContentRunes {
-			t.Fatalf("playbook content = %d rune, want %d", got, maxPlaybookContentRunes)
-		}
-	})
-
-	t.Run("手册写失败仍回成功（best-effort，不回滚调度）", func(t *testing.T) {
-		sc := &fakeScheduleCreator{schedID: "push-7-def"}
-		pb := newFakePlaybookStore()
-		pb.upsertErr = types.NewAppError(types.CodeDatabase, "写入失败", nil)
-		tool := newCreateScheduleToolForTest(sc, pb, nil, nil)
-		got, err := tool.Execute(context.Background(), 7, args)
-		if err != nil {
-			t.Fatalf("手册写失败不应让 create_schedule 上抛（best-effort）: %v", err)
-		}
-		if !strings.Contains(got, "push-7-def") {
-			t.Fatalf("调度是主效果，仍应回成功: %q", got)
-		}
-	})
-
-	t.Run("CreatePush 失败则不建手册", func(t *testing.T) {
-		sc := &fakeScheduleCreator{err: types.NewAppError(types.CodeValidation, "频率过高", nil)}
-		pb := newFakePlaybookStore()
-		tool := newCreateScheduleToolForTest(sc, pb, nil, nil)
-		got, _ := tool.Execute(context.Background(), 7, args)
-		if !strings.Contains(got, "频率过高") {
-			t.Fatalf("CodeValidation 应回文案: %q", got)
-		}
-		if len(pb.upserts) != 0 {
-			t.Fatalf("调度没建成不该初始化手册, 实得 %+v", pb.upserts)
-		}
-	})
-}
-
-// TestSummarize_锚点上卡 打在**真实调用点**（两个工具的 Summarize），而不是内部的
-// formatScheduleSpec——对抗审查实测：只测格式化函数时，updateScheduleTool.Summarize
-// 漏传 AnchorAt 的真 bug 照样全绿，卡面对用户说"按 epoch 对齐"而实际锚定，主动说反话。
-// 确认卡是写操作的人类同意闸门，它说的必须是即将发生的事。
+// TestSummarize_锚点上卡 pins the current task-creation surface.
 func TestSummarize_锚点上卡(t *testing.T) {
 	const anchored = `{"schedule_id":"push-1-abc","spec":{"every_seconds":259200,"anchor_at":"2026-07-19T20:00:00+08:00"}}`
 	const plain = `{"schedule_id":"push-1-abc","spec":{"every_seconds":259200}}`
 
-	for name, sum := range map[string]func(json.RawMessage) string{
-		"create": (&createScheduleTool{}).Summarize,
-		"update": (&updateScheduleTool{}).Summarize,
-	} {
-		t.Run(name+" 有锚点说出锚点", func(t *testing.T) {
-			got := sum(json.RawMessage(anchored))
-			if !strings.Contains(got, "2026-07-19T20:00:00+08:00") || !strings.Contains(got, "起") {
-				t.Errorf("卡面应说明从何时起，实得 %q", got)
-			}
-			if strings.Contains(got, "epoch") {
-				t.Errorf("有锚点却说 epoch 对齐＝对用户说反话，实得 %q", got)
-			}
-		})
-		t.Run(name+" 无锚点点明 epoch", func(t *testing.T) {
-			got := sum(json.RawMessage(plain))
-			if !strings.Contains(got, "epoch") {
-				t.Errorf("无锚点应点明 epoch 对齐（否则用户以为从现在起），实得 %q", got)
-			}
-		})
-	}
+	t.Run("有锚点说出锚点", func(t *testing.T) {
+		got := (&createScheduleTool{}).Summarize(json.RawMessage(anchored))
+		if !strings.Contains(got, "2026-07-19T20:00:00+08:00") || !strings.Contains(got, "起") {
+			t.Errorf("卡面应说明从何时起，实得 %q", got)
+		}
+		if strings.Contains(got, "epoch") {
+			t.Errorf("有锚点却说 epoch 对齐＝对用户说反话，实得 %q", got)
+		}
+	})
+	t.Run("无锚点点明 epoch", func(t *testing.T) {
+		got := (&createScheduleTool{}).Summarize(json.RawMessage(plain))
+		if !strings.Contains(got, "epoch") {
+			t.Errorf("无锚点应点明 epoch 对齐（否则用户以为从现在起），实得 %q", got)
+		}
+	})
 }
 
-// TestScheduleSchemas_含anchor_at 防"底层支持了但工具面没暴露"：create 与 update
-// 两个 schema 都要有 anchor_at，否则模型根本用不上这个能力。
+// TestScheduleSchemas_含anchor_at prevents the creation surface from dropping
+// the anchor that the task runtime supports.
 func TestScheduleSchemas_含anchor_at(t *testing.T) {
-	for name, raw := range map[string]json.RawMessage{
-		"create_schedule": (&createScheduleTool{}).Parameters(),
-		"update_schedule": (&updateScheduleTool{}).Parameters(),
-	} {
-		var schema struct {
-			Properties struct {
-				Spec struct {
-					Properties map[string]any `json:"properties"`
-				} `json:"spec"`
-			} `json:"properties"`
-		}
-		if err := json.Unmarshal(raw, &schema); err != nil {
-			t.Fatalf("%s schema 不是合法 JSON: %v", name, err)
-		}
-		if _, ok := schema.Properties.Spec.Properties["anchor_at"]; !ok {
-			t.Errorf("%s 的 spec 应暴露 anchor_at", name)
-		}
+	name, raw := "create_schedule", (&createScheduleTool{}).Parameters()
+	var schema struct {
+		Properties struct {
+			Spec struct {
+				Properties map[string]any `json:"properties"`
+			} `json:"spec"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("%s schema 不是合法 JSON: %v", name, err)
+	}
+	if _, ok := schema.Properties.Spec.Properties["anchor_at"]; !ok {
+		t.Errorf("%s 的 spec 应暴露 anchor_at", name)
 	}
 }
 
-func TestCreateScheduleSchema_RequiresApprovedIntentAndFetchPlan(t *testing.T) {
+func TestCreateScheduleSchema_RequiresIntentAndToolCalls(t *testing.T) {
 	var schema struct {
 		Required   []string `json:"required"`
 		Properties struct {
-			ApprovedFetchPlan struct {
-				Required   []string `json:"required"`
-				Properties struct {
-					ExistingSourceIDs struct {
-						MaxItems    int  `json:"maxItems"`
-						UniqueItems bool `json:"uniqueItems"`
-						Items       struct {
-							Minimum int `json:"minimum"`
-						} `json:"items"`
-					} `json:"existing_source_ids"`
-					SourceSpecs struct {
-						Required   []string `json:"required"`
-						Properties struct {
-							Version struct {
-								Enum []string `json:"enum"`
-							} `json:"version"`
-							Items struct {
-								MinItems int `json:"minItems"`
-								MaxItems int `json:"maxItems"`
-								Items    struct {
-									Required   []string       `json:"required"`
-									Properties map[string]any `json:"properties"`
-								} `json:"items"`
-							} `json:"items"`
-						} `json:"properties"`
-					} `json:"source_specs"`
-					LegacySources json.RawMessage `json:"sources"`
-				} `json:"properties"`
-			} `json:"approved_fetch_plan"`
+			ToolCalls struct {
+				MinItems int `json:"minItems"`
+				MaxItems int `json:"maxItems"`
+				Items    struct {
+					Required   []string `json:"required"`
+					Properties struct {
+						Name struct {
+							Enum []string `json:"enum"`
+						} `json:"name"`
+						Arguments struct {
+							Properties map[string]any `json:"properties"`
+						} `json:"arguments"`
+					} `json:"properties"`
+				} `json:"items"`
+			} `json:"tool_calls"`
 		} `json:"properties"`
 	}
 	if err := json.Unmarshal((&createScheduleTool{}).Parameters(), &schema); err != nil {
 		t.Fatalf("create_schedule schema 不是合法 JSON: %v", err)
 	}
-	for _, required := range []string{"spec", "intent", "approved_fetch_plan"} {
+	for _, required := range []string{"spec", "intent", "tool_calls"} {
 		if !slices.Contains(schema.Required, required) {
 			t.Fatalf("create_schedule 缺少根必填字段 %q：%v", required, schema.Required)
 		}
 	}
-	plan := schema.Properties.ApprovedFetchPlan
-	if len(plan.Required) != 0 {
-		t.Fatalf("approved_fetch_plan 的两种平坦输入都应可选，组合下限由 Go 校验：%+v", plan.Required)
+	calls := schema.Properties.ToolCalls
+	if calls.MinItems != 1 || calls.MaxItems != 64 {
+		t.Fatalf("tool_calls 边界不完整：%+v", calls)
 	}
-	refs := plan.Properties.ExistingSourceIDs
-	if refs.MaxItems != 64 || !refs.UniqueItems || refs.Items.Minimum != 1 {
-		t.Fatalf("existing_source_ids 边界不完整：%+v", refs)
-	}
-	if len(plan.Properties.LegacySources) != 0 {
-		t.Fatalf("durable sources/config 不得继续暴露给模型：%s", plan.Properties.LegacySources)
-	}
-	specs := plan.Properties.SourceSpecs
-	if !slices.Contains(specs.Required, "version") || !slices.Contains(specs.Required, "items") ||
-		!slices.Equal(specs.Properties.Version.Enum, []string{"vane.source-specs/v1"}) ||
-		specs.Properties.Items.MinItems != 1 || specs.Properties.Items.MaxItems != 64 {
-		t.Fatalf("source_specs 版本或边界不完整：%+v", specs)
-	}
-	for _, required := range []string{"kind"} {
-		if !slices.Contains(specs.Properties.Items.Items.Required, required) {
-			t.Fatalf("source_specs item 缺少必填字段 %q：%v",
-				required, specs.Properties.Items.Items.Required)
+	for _, required := range []string{"name", "arguments"} {
+		if !slices.Contains(calls.Items.Required, required) {
+			t.Fatalf("tool_calls item 缺少必填字段 %q：%v",
+				required, calls.Items.Required)
 		}
 	}
 	for _, forbidden := range []string{"config", "selectors", "url", "title"} {
-		if _, exposed := specs.Properties.Items.Items.Properties[forbidden]; exposed {
-			t.Fatalf("source_specs 不得暴露内部或可伪造字段 %q", forbidden)
+		if _, exposed := calls.Items.Properties.Arguments.Properties[forbidden]; exposed {
+			t.Fatalf("tool_calls 不得暴露内部或可伪造字段 %q", forbidden)
 		}
 	}
 	for _, required := range []string{
-		"kind", "query", "include_domains", "feed_url", "page_url", "user_id",
+		"query", "include_domains", "feed_url", "page_url", "user_id",
 	} {
-		if _, ok := specs.Properties.Items.Items.Properties[required]; !ok {
-			t.Fatalf("source_specs 缺少模型可理解字段 %q", required)
+		if _, ok := calls.Items.Properties.Arguments.Properties[required]; !ok {
+			t.Fatalf("tool_calls 缺少模型可理解字段 %q", required)
 		}
 	}
-	userID, ok := specs.Properties.Items.Items.Properties["user_id"].(map[string]any)
+	userID, ok := calls.Items.Properties.Arguments.Properties["user_id"].(map[string]any)
 	if !ok || userID["pattern"] != "^[0-9a-f]{24}$" ||
 		!strings.Contains(fmt.Sprint(userID["description"]), "24 位小写十六进制") {
 		t.Fatalf("xhs user_id schema 必须逐字暴露服务端格式约束：%+v", userID)
 	}
 }
 
-// fakeSchedulePusher 捕获工具真正传给 scheduler 的 spec（schedulePusher 收窄成接口就是为了它）。
+// fakeSchedulePusher captures task deletion calls.
 type fakeSchedulePusher struct {
 	gotSpec   scheduler.ScheduleSpec
 	gotID     string
@@ -1461,13 +785,6 @@ type fakeSchedulePusher struct {
 	gotNLDesc *string
 	gotKeys   []string
 	calls     int
-}
-
-func (f *fakeSchedulePusher) CreatePush(_ context.Context, _ int64, spec scheduler.ScheduleSpec,
-	_ workflow.PushScope, _ string) (string, error) {
-	f.calls++
-	f.gotSpec = spec
-	return "push-1-created", nil
 }
 
 func (f *fakeSchedulePusher) UpdatePush(_ context.Context, id string, _ int64, spec scheduler.ScheduleSpec,
@@ -1497,58 +814,7 @@ func (f *fakeSchedulePusher) DeletePushIdempotent(
 	return nil
 }
 
-// TestScheduleTools_接线透传 钉死"工具面广告的字段真的到达 scheduler"。
-//
-// 为什么必须断言在**捕获到的 spec** 上而不是 schema 里有没有那个 key（对抗审查实测）：
-// 删掉 Execute 里的 `AnchorAt: a.Spec.AnchorAt`、或把 DTO 的 json tag 拼错，
-// 全仓测试照样绿——用户/模型给了 anchor_at，后端 200 正常返回，调度却静默按 epoch
-// 触发，无任何错误信号。这类"接线漏一行"的 bug 只有捕获真实入参才抓得到。
-func TestScheduleTools_接线透传(t *testing.T) {
-	const anchor = "2026-07-19T20:00:00+08:00"
-
-	t.Run("create 透传 anchor_at", func(t *testing.T) {
-		f := &fakeSchedulePusher{}
-		_, err := newCreateScheduleToolForTest(f, newFakePlaybookStore(), nil, nil).Execute(context.Background(), 1,
-			json.RawMessage(`{"spec":{"every_seconds":259200,"anchor_at":"`+anchor+`","tz":"Asia/Shanghai"}}`))
-		if err != nil {
-			t.Fatalf("Execute 失败: %v", err)
-		}
-		if f.calls != 1 {
-			t.Fatalf("应调用一次 CreatePush，实得 %d", f.calls)
-		}
-		if f.gotSpec.AnchorAt != anchor {
-			t.Errorf("anchor_at 没到达 scheduler（能力静默失效），实得 %q", f.gotSpec.AnchorAt)
-		}
-		if f.gotSpec.EverySeconds != 259200 || f.gotSpec.TZ != "Asia/Shanghai" {
-			t.Errorf("spec 透传不全: %+v", f.gotSpec)
-		}
-	})
-
-	t.Run("update 透传 anchor_at", func(t *testing.T) {
-		f := &fakeSchedulePusher{}
-		_, err := (&updateScheduleTool{sched: f}).Execute(context.Background(), 1,
-			json.RawMessage(`{"schedule_id":"push-1-abc","spec":{"every_seconds":259200,"anchor_at":"`+anchor+`"}}`))
-		if err != nil {
-			t.Fatalf("Execute 失败: %v", err)
-		}
-		if f.gotID != "push-1-abc" {
-			t.Errorf("schedule_id 透传错: %q", f.gotID)
-		}
-		if f.gotSpec.AnchorAt != anchor {
-			t.Errorf("anchor_at 没到达 scheduler（能力静默失效），实得 %q", f.gotSpec.AnchorAt)
-		}
-	})
-
-	t.Run("无锚点时不得凭空造出锚点", func(t *testing.T) {
-		f := &fakeSchedulePusher{}
-		if _, err := newCreateScheduleToolForTest(f, newFakePlaybookStore(), nil, nil).Execute(context.Background(), 1,
-			json.RawMessage(`{"spec":{"every_seconds":7200}}`)); err != nil {
-			t.Fatalf("Execute 失败: %v", err)
-		}
-		if f.gotSpec.AnchorAt != "" {
-			t.Errorf("未给锚点时应为空（保持 epoch 对齐语义），实得 %q", f.gotSpec.AnchorAt)
-		}
-	})
+func TestRemoveScheduleTool_批量删除接线(t *testing.T) {
 
 	t.Run("remove 批量去重并透传全部 id", func(t *testing.T) {
 		f := &fakeSchedulePusher{}
@@ -1569,754 +835,4 @@ func TestScheduleTools_接线透传(t *testing.T) {
 		}
 	})
 
-	t.Run("remove 兼容旧单数 id", func(t *testing.T) {
-		f := &fakeSchedulePusher{}
-		if _, err := (&removeScheduleTool{sched: f}).Execute(context.Background(), 1,
-			json.RawMessage(`{"schedule_id":"push-1-legacy"}`)); err != nil {
-			t.Fatalf("Execute 失败: %v", err)
-		}
-		if !slices.Equal(f.gotIDs, []string{"push-1-legacy"}) {
-			t.Errorf("legacy schedule_id 透传错: %v", f.gotIDs)
-		}
-	})
-}
-
-// TestCreateScheduleTool_CompilesPlan 守 P1 编译层：create 初始化手册后，用同一份 content
-// 调翻译器编译计划并落库（best-effort，绝不影响调度主效果）。
-func TestCreateScheduleTool_CompilesPlan(t *testing.T) {
-	args := json.RawMessage(`{"spec":{"cron":"0 30 8 * * *"},"nl_description":"每天早八 AI 官方新闻"}`)
-
-	t.Run("初始化手册后据此编译计划落库", func(t *testing.T) {
-		sc := &fakeScheduleCreator{schedID: "push-7-abc"}
-		pb := newFakePlaybookStore()
-		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=ai"}]}`)}
-		tool := newCreateScheduleToolForTest(sc, pb, tr, nil)
-		if _, err := tool.Execute(context.Background(), 7, args); err != nil {
-			t.Fatalf("意外报错: %v", err)
-		}
-		if tr.calls != 1 || tr.gotUser != 7 || tr.gotText != "每天早八 AI 官方新闻" {
-			t.Fatalf("翻译器入参不符: calls=%d user=%d text=%q", tr.calls, tr.gotUser, tr.gotText)
-		}
-		if len(pb.plans) != 1 || pb.plans[0].scheduleID != "push-7-abc" || pb.plans[0].userID != 7 {
-			t.Fatalf("应把计划落库到刚建的任务: %+v", pb.plans)
-		}
-		// b2：create 路径也经 syncPlaybookSources 材料化源 + 填链接（与 edit 共用同一 helper）。
-		if len(pb.gotSrcURLs) != 1 || len(pb.links["push-7-abc"]) != 1 {
-			t.Fatalf("create 路径应材料化 1 源并链接: urls=%v links=%v", pb.gotSrcURLs, pb.links["push-7-abc"])
-		}
-	})
-
-	t.Run("翻译失败不影响调度（best-effort）", func(t *testing.T) {
-		sc := &fakeScheduleCreator{schedID: "push-7-x"}
-		pb := newFakePlaybookStore()
-		tr := &fakeTranslator{err: errors.New("llm 超时")}
-		tool := newCreateScheduleToolForTest(sc, pb, tr, nil)
-		got, err := tool.Execute(context.Background(), 7, args)
-		if err != nil {
-			t.Fatalf("翻译失败不应上抛: %v", err)
-		}
-		if !strings.Contains(got, "push-7-x") {
-			t.Fatalf("调度仍应回成功: %q", got)
-		}
-		if len(pb.plans) != 0 {
-			t.Fatalf("翻译失败不该落计划: %+v", pb.plans)
-		}
-	})
-
-	t.Run("手册初始化失败则根本不调翻译器", func(t *testing.T) {
-		sc := &fakeScheduleCreator{schedID: "push-7-y"}
-		pb := newFakePlaybookStore()
-		pb.upsertErr = types.NewAppError(types.CodeDatabase, "写入失败", nil)
-		tr := &fakeTranslator{plan: emptyPlanJSON()}
-		tool := newCreateScheduleToolForTest(sc, pb, tr, nil)
-		if _, err := tool.Execute(context.Background(), 7, args); err != nil {
-			t.Fatalf("best-effort 不应上抛: %v", err)
-		}
-		if tr.calls != 0 {
-			t.Fatalf("手册没存成不该编译计划, calls=%d", tr.calls)
-		}
-	})
-}
-
-// createScheduleCharacterizationDeps 是 A0 的阶段化替身：同一事件序列同时刻画
-// create_schedule 当前的调用顺序、best-effort 截断点和已经发生的部分副作用。
-// 这些是 legacy/current behavior，不代表 A3+ 创建 saga 的目标语义。
-type characterizationTargetCall struct {
-	userID     int64
-	scheduleID string
-	content    string
-}
-
-type characterizationPlanCall struct {
-	userID     int64
-	scheduleID string
-	plan       json.RawMessage
-}
-
-type characterizationLinksCall struct {
-	userID     int64
-	scheduleID string
-	sourceIDs  []int64
-}
-
-type characterizationStrictnessCall struct {
-	userID     int64
-	scheduleID string
-	value      types.PushStrictness
-}
-
-const characterizationDefaultPlan = `{"sources":[` +
-	`{"platform":"web","capability":"feed","title":"One Official","url":"https://one.example/rss","config":{"etag":"one"}},` +
-	`{"platform":"web","capability":"feed","title":"Two Official","url":"https://two.example/rss","config":{"etag":"two"}}` +
-	`]}`
-
-type createScheduleCharacterizationDeps struct {
-	failAt         string
-	events         []string
-	materialized   int
-	translatedPlan json.RawMessage
-	onSchedule     func()
-	gotUserID      int64
-	gotSpec        scheduler.ScheduleSpec
-	gotScope       workflow.PushScope
-	gotNLDesc      string
-
-	playbookAttempt   characterizationTargetCall
-	playbookCommitted bool
-	translateAttempt  characterizationTargetCall
-	planAttempt       characterizationPlanCall
-	planCommitted     bool
-	sourceAttempts    []types.Source
-	linksAttempt      characterizationLinksCall
-	linksCommitted    bool
-	committedLinks    []int64
-	strictAttempt     characterizationStrictnessCall
-	strictCommitted   bool
-}
-
-func (f *createScheduleCharacterizationDeps) stage(name string) error {
-	f.events = append(f.events, name)
-	if f.failAt == name {
-		return errors.New("injected " + name)
-	}
-	return nil
-}
-
-func (f *createScheduleCharacterizationDeps) CreatePush(_ context.Context, userID int64,
-	spec scheduler.ScheduleSpec, scope workflow.PushScope, nlDesc string) (string, error) {
-	if f.onSchedule != nil {
-		f.onSchedule()
-	}
-	f.gotUserID, f.gotSpec, f.gotScope, f.gotNLDesc = userID, spec, scope, nlDesc
-	if f.failAt == "schedule_validation" {
-		f.events = append(f.events, "schedule")
-		return "", types.NewAppError(types.CodeValidation, "legacy validation", nil)
-	}
-	if err := f.stage("schedule"); err != nil {
-		return "", types.NewAppError(types.CodeInternal, "legacy scheduler failure", err)
-	}
-	return "push-7-current", nil
-}
-
-func (f *createScheduleCharacterizationDeps) GetSchedulePlaybook(
-	context.Context, int64, string,
-) (*types.SchedulePlaybook, error) {
-	return nil, types.NewAppError(types.CodeNotFound, "unused", nil)
-}
-
-func (f *createScheduleCharacterizationDeps) UpsertSchedulePlaybook(
-	_ context.Context, userID int64, scheduleID, content string,
-) (bool, error) {
-	f.playbookAttempt = characterizationTargetCall{
-		userID: userID, scheduleID: scheduleID, content: content,
-	}
-	if err := f.stage("playbook"); err != nil {
-		return false, err
-	}
-	if f.failAt == "playbook_miss" ||
-		userID != 7 || scheduleID != "push-7-current" {
-		return false, nil
-	}
-	f.playbookCommitted = true
-	return true, nil
-}
-
-func (f *createScheduleCharacterizationDeps) Translate(
-	_ context.Context, userID int64, content string,
-) (json.RawMessage, error) {
-	f.translateAttempt = characterizationTargetCall{userID: userID, content: content}
-	if err := f.stage("translate"); err != nil {
-		return nil, err
-	}
-	if f.translatedPlan != nil {
-		return append(json.RawMessage(nil), f.translatedPlan...), nil
-	}
-	return json.RawMessage(characterizationDefaultPlan), nil
-}
-
-func (f *createScheduleCharacterizationDeps) SetFetchPlan(
-	_ context.Context, userID int64, scheduleID string, plan json.RawMessage,
-) (bool, error) {
-	f.planAttempt = characterizationPlanCall{
-		userID: userID, scheduleID: scheduleID,
-		plan: append(json.RawMessage(nil), plan...),
-	}
-	if err := f.stage("plan"); err != nil {
-		return false, err
-	}
-	if f.failAt == "plan_miss" ||
-		userID != 7 || scheduleID != "push-7-current" {
-		return false, nil
-	}
-	f.planCommitted = true
-	return true, nil
-}
-
-func (f *createScheduleCharacterizationDeps) GetOrCreateSource(
-	_ context.Context, src *types.Source,
-) (int64, bool, error) {
-	got := *src
-	got.Config = append(json.RawMessage(nil), src.Config...)
-	f.sourceAttempts = append(f.sourceAttempts, got)
-	stage := fmt.Sprintf("source_%d", f.materialized)
-	if err := f.stage(stage); err != nil {
-		return 0, false, err
-	}
-	f.materialized++
-	return 100 + int64(f.materialized), true, nil
-}
-
-func (f *createScheduleCharacterizationDeps) ReplaceScheduleSources(
-	_ context.Context, userID int64, scheduleID string, sourceIDs []int64,
-) error {
-	f.linksAttempt = characterizationLinksCall{
-		userID: userID, scheduleID: scheduleID,
-		sourceIDs: append([]int64(nil), sourceIDs...),
-	}
-	if err := f.stage("links"); err != nil {
-		return err
-	}
-	if userID != 7 || scheduleID != "push-7-current" {
-		return types.NewAppError(types.CodeNotFound, "wrong characterization target", nil)
-	}
-	f.linksCommitted = true
-	f.committedLinks = append([]int64(nil), sourceIDs...)
-	return nil
-}
-
-func (f *createScheduleCharacterizationDeps) SetScheduleStrictness(
-	_ context.Context, scheduleID string, userID int64, v types.PushStrictness,
-) error {
-	f.strictAttempt = characterizationStrictnessCall{
-		userID: userID, scheduleID: scheduleID, value: v,
-	}
-	if err := f.stage("strictness"); err != nil {
-		return err
-	}
-	if userID != 7 || scheduleID != "push-7-current" {
-		return types.NewAppError(types.CodeNotFound, "wrong characterization target", nil)
-	}
-	f.strictCommitted = true
-	return nil
-}
-
-type characterizationCommittedState struct {
-	playbook       bool
-	plan           bool
-	sourceAttempts int
-	materialized   int
-	links          bool
-	strictness     bool
-	linkIDs        []int64
-}
-
-func TestCreateScheduleTool_CurrentFailureStages(t *testing.T) {
-	const (
-		args = `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
-			`"nl_description":"每天看两个官方源","strictness":"strict"}`
-		argsWithoutStrictness = `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
-			`"nl_description":"每天看两个官方源"}`
-		invalidStrictnessArgs = `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
-			`"nl_description":"每天看两个官方源","strictness":"extreme"}`
-		baseReply = "已创建定时推送任务（id=push-7-current）：" +
-			"按 cron「0 8 * * *」触发（时区 Asia/Shanghai）"
-		strictReply = baseReply + "，推送门槛「严格」（仅 ≥60 分的高相关内容才推送）"
-	)
-	successEvents := []string{
-		"schedule", "playbook", "translate", "plan",
-		"source_0", "source_1", "links", "strictness",
-	}
-	tests := []struct {
-		name           string
-		args           string
-		failAt         string
-		translatedPlan json.RawMessage
-		wantEvents     []string
-		wantReply      string
-		wantErr        bool
-		wantState      characterizationCommittedState
-	}{
-		{
-			name:       "全部成功",
-			wantEvents: successEvents,
-			wantReply:  strictReply,
-			wantState: characterizationCommittedState{
-				playbook: true, plan: true, sourceAttempts: 2, materialized: 2,
-				links: true, strictness: true, linkIDs: []int64{101, 102},
-			},
-		},
-		{
-			name:      "参数不是 JSON 对象时副作用为零",
-			args:      `[]`,
-			wantReply: "参数不是合法 JSON，请修正后重试",
-		},
-		{
-			name:      "非法门槛在创建调度前拒绝",
-			args:      invalidStrictnessArgs,
-			wantReply: "strictness 只能是 loose / normal / strict 之一（或不传）",
-		},
-		{
-			name:       "省略门槛不写默认值",
-			args:       argsWithoutStrictness,
-			wantEvents: successEvents[:len(successEvents)-1],
-			wantReply:  baseReply,
-			wantState: characterizationCommittedState{
-				playbook: true, plan: true, sourceAttempts: 2, materialized: 2,
-				links: true, linkIDs: []int64{101, 102},
-			},
-		},
-		{
-			name:           "合法零源计划仍以空列表替换链接",
-			translatedPlan: json.RawMessage(`{"sources":[]}`),
-			wantEvents:     []string{"schedule", "playbook", "translate", "plan", "links", "strictness"},
-			wantReply:      strictReply,
-			wantState: characterizationCommittedState{
-				playbook: true, plan: true, links: true, strictness: true,
-			},
-		},
-		{
-			name:       "scheduler validation 转成人话且无后置调用",
-			failAt:     "schedule_validation",
-			wantEvents: []string{"schedule"},
-			wantReply:  "legacy validation",
-		},
-		{
-			name:       "scheduler 基础设施错误上抛且无后置调用",
-			failAt:     "schedule",
-			wantEvents: []string{"schedule"},
-			wantErr:    true,
-		},
-		{
-			name:       "手册写失败仍设门槛并回成功",
-			failAt:     "playbook",
-			wantEvents: []string{"schedule", "playbook", "strictness"},
-			wantReply:  strictReply,
-			wantState:  characterizationCommittedState{strictness: true},
-		},
-		{
-			name:       "手册归属未命中不编译仍回成功",
-			failAt:     "playbook_miss",
-			wantEvents: []string{"schedule", "playbook", "strictness"},
-			wantReply:  strictReply,
-			wantState:  characterizationCommittedState{strictness: true},
-		},
-		{
-			name:       "翻译失败保留调度仍设门槛",
-			failAt:     "translate",
-			wantEvents: []string{"schedule", "playbook", "translate", "strictness"},
-			wantReply:  strictReply,
-			wantState:  characterizationCommittedState{playbook: true, strictness: true},
-		},
-		{
-			name:       "计划写失败不材料化仍设门槛",
-			failAt:     "plan",
-			wantEvents: []string{"schedule", "playbook", "translate", "plan", "strictness"},
-			wantReply:  strictReply,
-			wantState:  characterizationCommittedState{playbook: true, strictness: true},
-		},
-		{
-			name:       "计划写未命中不材料化仍设门槛",
-			failAt:     "plan_miss",
-			wantEvents: []string{"schedule", "playbook", "translate", "plan", "strictness"},
-			wantReply:  strictReply,
-			wantState:  characterizationCommittedState{playbook: true, strictness: true},
-		},
-		{
-			name:       "第一个源失败不替换链接仍设门槛",
-			failAt:     "source_0",
-			wantEvents: []string{"schedule", "playbook", "translate", "plan", "source_0", "strictness"},
-			wantReply:  strictReply,
-			wantState: characterizationCommittedState{
-				playbook: true, plan: true, sourceAttempts: 1, strictness: true,
-			},
-		},
-		{
-			name:       "第二个源失败保留第一个全局源但不替换链接",
-			failAt:     "source_1",
-			wantEvents: []string{"schedule", "playbook", "translate", "plan", "source_0", "source_1", "strictness"},
-			wantReply:  strictReply,
-			wantState: characterizationCommittedState{
-				playbook: true, plan: true, sourceAttempts: 2, materialized: 1, strictness: true,
-			},
-		},
-		{
-			name:       "链接替换失败时计划与全局源已写仍回成功",
-			failAt:     "links",
-			wantEvents: successEvents,
-			wantReply:  strictReply,
-			wantState: characterizationCommittedState{
-				playbook: true, plan: true, sourceAttempts: 2, materialized: 2, strictness: true,
-			},
-		},
-		{
-			name:       "门槛写失败回成功但回复省略门槛",
-			failAt:     "strictness",
-			wantEvents: successEvents,
-			wantReply:  baseReply,
-			wantState: characterizationCommittedState{
-				playbook: true, plan: true, sourceAttempts: 2, materialized: 2,
-				links: true, linkIDs: []int64{101, 102},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			deps := &createScheduleCharacterizationDeps{
-				failAt: tt.failAt, translatedPlan: tt.translatedPlan,
-			}
-			tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
-			testArgs := tt.args
-			if testArgs == "" {
-				testArgs = args
-			}
-
-			got, err := tool.Execute(t.Context(), 7, json.RawMessage(testArgs))
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("Execute() error = %v, wantErr %v", err, tt.wantErr)
-			}
-			if got != tt.wantReply {
-				t.Fatalf("Execute() reply = %q, want %q", got, tt.wantReply)
-			}
-			if !slices.Equal(deps.events, tt.wantEvents) {
-				t.Fatalf("阶段序列 = %v, want %v", deps.events, tt.wantEvents)
-			}
-			gotState := characterizationCommittedState{
-				playbook:       deps.playbookCommitted,
-				plan:           deps.planCommitted,
-				sourceAttempts: len(deps.sourceAttempts),
-				materialized:   deps.materialized,
-				links:          deps.linksCommitted,
-				strictness:     deps.strictCommitted,
-				linkIDs:        deps.committedLinks,
-			}
-			if gotState.playbook != tt.wantState.playbook ||
-				gotState.plan != tt.wantState.plan ||
-				gotState.sourceAttempts != tt.wantState.sourceAttempts ||
-				gotState.materialized != tt.wantState.materialized ||
-				gotState.links != tt.wantState.links ||
-				gotState.strictness != tt.wantState.strictness ||
-				!slices.Equal(gotState.linkIDs, tt.wantState.linkIDs) {
-				t.Fatalf("最终持久化状态 = %+v, want %+v", gotState, tt.wantState)
-			}
-
-			if slices.Contains(tt.wantEvents, "schedule") {
-				wantSpec := scheduler.ScheduleSpec{Cron: "0 8 * * *", TZ: "Asia/Shanghai"}
-				if deps.gotUserID != 7 || deps.gotSpec != wantSpec ||
-					deps.gotNLDesc != "每天看两个官方源" ||
-					len(deps.gotScope.SourceIDs) != 0 || deps.gotScope.TopN != 0 {
-					t.Fatalf("Scheduler 透传不符: %+v", deps)
-				}
-			}
-			if slices.Contains(tt.wantEvents, "playbook") {
-				if deps.playbookAttempt != (characterizationTargetCall{
-					userID: 7, scheduleID: "push-7-current", content: "每天看两个官方源",
-				}) {
-					t.Fatalf("手册目标/正文不符: %+v", deps.playbookAttempt)
-				}
-			}
-			if slices.Contains(tt.wantEvents, "translate") {
-				if deps.translateAttempt != (characterizationTargetCall{
-					userID: 7, content: "每天看两个官方源",
-				}) {
-					t.Fatalf("翻译身份/正文不符: %+v", deps.translateAttempt)
-				}
-			}
-			if slices.Contains(tt.wantEvents, "plan") {
-				wantPlan := characterizationDefaultPlan
-				if tt.translatedPlan != nil {
-					wantPlan = string(tt.translatedPlan)
-				}
-				if deps.planAttempt.userID != 7 ||
-					deps.planAttempt.scheduleID != "push-7-current" ||
-					string(deps.planAttempt.plan) != wantPlan {
-					t.Fatalf("计划目标/内容不符: %+v", deps.planAttempt)
-				}
-			}
-			wantSources := []types.Source{
-				{
-					Platform: types.PlatformWeb, Capability: types.CapFeed,
-					Title: "One Official", URL: "https://one.example/rss",
-					Config: json.RawMessage(`{"etag":"one"}`),
-				},
-				{
-					Platform: types.PlatformWeb, Capability: types.CapFeed,
-					Title: "Two Official", URL: "https://two.example/rss",
-					Config: json.RawMessage(`{"etag":"two"}`),
-				},
-			}
-			for i, source := range deps.sourceAttempts {
-				if i >= len(wantSources) || !reflect.DeepEqual(source, wantSources[i]) {
-					t.Fatalf("材料化源[%d] = %+v, want %+v", i, source, wantSources[i])
-				}
-			}
-			if slices.Contains(tt.wantEvents, "links") {
-				wantAttemptIDs := []int64{101, 102}
-				if tt.translatedPlan != nil {
-					wantAttemptIDs = nil
-				}
-				if deps.linksAttempt.userID != 7 ||
-					deps.linksAttempt.scheduleID != "push-7-current" ||
-					!slices.Equal(deps.linksAttempt.sourceIDs, wantAttemptIDs) {
-					t.Fatalf("链接目标/入参不符: %+v", deps.linksAttempt)
-				}
-			}
-			if slices.Contains(tt.wantEvents, "strictness") {
-				if deps.strictAttempt != (characterizationStrictnessCall{
-					userID: 7, scheduleID: "push-7-current", value: types.StrictnessStrict,
-				}) {
-					t.Fatalf("门槛目标/入参不符: %+v", deps.strictAttempt)
-				}
-			}
-		})
-	}
-}
-
-// A0 hardening：合法非空门槛不只要“调用过”，还必须逐值透传。
-// strict 主路径之外再用 normal 锁住映射，防重构把所有合法值静默写成 strict。
-func TestCreateScheduleTool_CurrentNormalStrictnessPassthrough(t *testing.T) {
-	deps := &createScheduleCharacterizationDeps{}
-	tool := newCreateScheduleToolForTest(deps, deps, deps, deps)
-	args := json.RawMessage(
-		`{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
-			`"nl_description":"每天看两个官方源","strictness":"normal"}`,
-	)
-
-	got, err := tool.Execute(t.Context(), 7, args)
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-	const want = "已创建定时推送任务（id=push-7-current）：" +
-		"按 cron「0 8 * * *」触发（时区 Asia/Shanghai），" +
-		"推送门槛「标准」（≥40 分才推送，弱相关不打扰）"
-	if got != want {
-		t.Fatalf("Execute() = %q, want %q", got, want)
-	}
-	if deps.strictAttempt != (characterizationStrictnessCall{
-		userID: 7, scheduleID: "push-7-current", value: types.StrictnessNormal,
-	}) || !deps.strictCommitted {
-		t.Fatalf("normal 门槛未精确落到目标任务: attempt=%+v committed=%v",
-			deps.strictAttempt, deps.strictCommitted)
-	}
-}
-
-// TestEditTaskPlaybookTool_CompilesPlan 守 P1 编译层：edit 存下正文后据此重编译计划，
-// 回执按编译出的源数分档，翻译失败静默降级为普通成功。
-func TestEditTaskPlaybookTool_CompilesPlan(t *testing.T) {
-	setup := func(tr playbookTranslator) (*fakePlaybookStore, *editTaskPlaybookTool) {
-		fs := newFakePlaybookStore()
-		fs.owner["s1"] = 7
-		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1"}
-		return fs, &editTaskPlaybookTool{st: fs, tr: tr}
-	}
-	args := json.RawMessage(`{"schedule_id":"s1","content":"只要 Anthropic 官方"}`)
-
-	t.Run("编译出源时回执带源数", func(t *testing.T) {
-		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=a"},{"platform":"web","capability":"feed","url":"https://a.com/rss"}]}`)}
-		fs, tool := setup(tr)
-		got, err := tool.Execute(context.Background(), 7, args)
-		if err != nil {
-			t.Fatalf("意外报错: %v", err)
-		}
-		if tr.gotText != "只要 Anthropic 官方" {
-			t.Fatalf("翻译器应收到手册正文: %q", tr.gotText)
-		}
-		if len(fs.plans) != 1 {
-			t.Fatalf("应落库计划一次: %+v", fs.plans)
-		}
-		if !strings.Contains(got, "2 个抓取源") {
-			t.Fatalf("回执应含编译出的源数: %q", got)
-		}
-	})
-
-	t.Run("零源计划回执不提计划", func(t *testing.T) {
-		tr := &fakeTranslator{plan: emptyPlanJSON()}
-		_, tool := setup(tr)
-		got, _ := tool.Execute(context.Background(), 7, args)
-		if strings.Contains(got, "抓取源") {
-			t.Fatalf("零源不该提计划: %q", got)
-		}
-		if !strings.Contains(got, "已更新定时任务") {
-			t.Fatalf("仍应回更新成功: %q", got)
-		}
-	})
-
-	t.Run("翻译失败降级为普通成功、不落计划", func(t *testing.T) {
-		tr := &fakeTranslator{err: errors.New("boom")}
-		fs, tool := setup(tr)
-		got, err := tool.Execute(context.Background(), 7, args)
-		if err != nil {
-			t.Fatalf("翻译失败不应上抛: %v", err)
-		}
-		if len(fs.plans) != 0 {
-			t.Fatalf("翻译失败不该落计划: %+v", fs.plans)
-		}
-		if !strings.Contains(got, "已更新定时任务") || strings.Contains(got, "抓取源") {
-			t.Fatalf("应降级为普通成功文案: %q", got)
-		}
-	})
-
-	t.Run("content 归属未命中就不编译计划", func(t *testing.T) {
-		tr := &fakeTranslator{plan: emptyPlanJSON()}
-		fs := newFakePlaybookStore()
-		fs.owner["s1"] = 99 // 属别人
-		tool := &editTaskPlaybookTool{st: fs, tr: tr}
-		got, _ := tool.Execute(context.Background(), 7, args)
-		if tr.calls != 0 {
-			t.Fatalf("content upsert 未命中就不该翻译, calls=%d", tr.calls)
-		}
-		if !strings.Contains(got, "没找到你的定时任务") {
-			t.Fatalf("应回归属未命中文案: %q", got)
-		}
-	})
-
-	t.Run("计划落库报基础设施错误被吞、不污染主效果", func(t *testing.T) {
-		// best-effort 铁律：手册正文已存成，SetFetchPlan 报 CodeDatabase 时工具仍回普通成功、
-		// 绝不上抛（守 compilePlaybookPlan 的 serr!=nil 分支）。
-		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=a"}]}`)}
-		fs, tool := setup(tr)
-		fs.setPlanErr = types.NewAppError(types.CodeDatabase, "连接池耗尽", nil)
-		got, err := tool.Execute(context.Background(), 7, args)
-		if err != nil {
-			t.Fatalf("计划落库失败不应上抛（best-effort）: %v", err)
-		}
-		if !strings.Contains(got, "已更新定时任务") || strings.Contains(got, "抓取源") {
-			t.Fatalf("应降级为普通成功文案（计划没落成不提源数）: %q", got)
-		}
-	})
-
-	t.Run("翻译器收到的是 cap 截断后的正文（与落库正文一致）", func(t *testing.T) {
-		// 超限手册：翻译器必须收到 capPlaybookContent 截断后的正文，且与 Upsert 落库的正文一致，
-		// 否则会把未设边界的超长文本整体发给 LLM（token/成本失控）且编译源与库内正文漂移。
-		tr := &fakeTranslator{plan: emptyPlanJSON()}
-		fs, tool := setup(tr)
-		long := strings.Repeat("字", maxPlaybookContentRunes+50)
-		if _, err := tool.Execute(context.Background(), 7,
-			json.RawMessage(`{"schedule_id":"s1","content":"`+long+`"}`)); err != nil {
-			t.Fatalf("超限应截断而非报错: %v", err)
-		}
-		if n := len([]rune(tr.gotText)); n != maxPlaybookContentRunes {
-			t.Fatalf("翻译器应收到截断到 %d rune 的正文, 实得 %d", maxPlaybookContentRunes, n)
-		}
-		if tr.gotText != fs.upserts[0].content {
-			t.Fatalf("翻译器输入与落库正文必须逐字一致（否则计划与库内正文漂移）")
-		}
-	})
-}
-
-// TestPlaybookB2_MaterializesSourcesAndLinks 守 P1b b2：改手册编译出计划后，把计划里的源
-// 材料化成真源行（GetOrCreateSource）并把本任务的 schedule_sources 链接整体替换为这些源。
-func TestPlaybookB2_MaterializesSourcesAndLinks(t *testing.T) {
-	setup := func(tr playbookTranslator) (*fakePlaybookStore, *editTaskPlaybookTool) {
-		fs := newFakePlaybookStore()
-		fs.owner["s1"] = 7
-		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1"}
-		return fs, &editTaskPlaybookTool{st: fs, tr: tr}
-	}
-	args := json.RawMessage(`{"schedule_id":"s1","content":"c"}`)
-
-	t.Run("两源都材料化 + 链接到其 id", func(t *testing.T) {
-		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[
-			{"platform":"web","capability":"search","url":"vane://web/search?q=a"},
-			{"platform":"web","capability":"feed","url":"https://x.com/rss"}
-		]}`)}
-		fs, tool := setup(tr)
-		if _, err := tool.Execute(context.Background(), 7, args); err != nil {
-			t.Fatalf("edit 失败: %v", err)
-		}
-		if len(fs.gotSrcURLs) != 2 {
-			t.Fatalf("应材料化 2 个源, 实得 %d: %v", len(fs.gotSrcURLs), fs.gotSrcURLs)
-		}
-		if got := fs.links["s1"]; len(got) != 2 {
-			t.Fatalf("schedule_sources 应链接 2 个源, 实得 %v", got)
-		}
-	})
-
-	t.Run("改手册减少源 → 链接整体替换", func(t *testing.T) {
-		fs, _ := setup(nil)
-		// 先编译出 2 源。
-		e2 := &editTaskPlaybookTool{st: fs, tr: &fakeTranslator{plan: json.RawMessage(`{"sources":[
-			{"platform":"web","capability":"search","url":"vane://web/search?q=a"},
-			{"platform":"web","capability":"feed","url":"https://x.com/rss"}
-		]}`)}}
-		if _, err := e2.Execute(context.Background(), 7, args); err != nil {
-			t.Fatalf("首次 edit 失败: %v", err)
-		}
-		if len(fs.links["s1"]) != 2 {
-			t.Fatalf("首次应链接 2 源, 实得 %v", fs.links["s1"])
-		}
-		// 再编译成 1 源：链接整体替换为 1。
-		e1 := &editTaskPlaybookTool{st: fs, tr: &fakeTranslator{plan: json.RawMessage(`{"sources":[
-			{"platform":"web","capability":"search","url":"vane://web/search?q=a"}
-		]}`)}}
-		if _, err := e1.Execute(context.Background(), 7, args); err != nil {
-			t.Fatalf("二次 edit 失败: %v", err)
-		}
-		if got := fs.links["s1"]; len(got) != 1 {
-			t.Fatalf("减少源后链接应整体替换为 1, 实得 %v", got)
-		}
-	})
-
-	t.Run("材料化失败则跳过链接同步、不半更新（保留既有链接）", func(t *testing.T) {
-		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[
-			{"platform":"web","capability":"search","url":"vane://web/search?q=a"},
-			{"platform":"web","capability":"feed","url":"https://x.com/rss"}
-		]}`)}
-		fs, tool := setup(tr)
-		fs.links["s1"] = []int64{99} // 预置既有链接（上次成功编译的结果）
-		fs.srcErr = errors.New("建源挂了")
-		got, err := tool.Execute(context.Background(), 7, args)
-		if err != nil {
-			t.Fatalf("材料化失败不应上抛（best-effort）: %v", err)
-		}
-		if !strings.Contains(got, "已更新定时任务") {
-			t.Fatalf("手册仍应更新成功: %q", got)
-		}
-		// 关键：材料化失败 → **不调 Replace**（不半更新）→ 既有链接原样保留，不与 fetch_plan 分叉。
-		if fs.linkCalls != 0 {
-			t.Fatalf("材料化失败应跳过链接同步，实得 linkCalls=%d", fs.linkCalls)
-		}
-		if got := fs.links["s1"]; len(got) != 1 || got[0] != 99 {
-			t.Fatalf("材料化失败不得改动既有链接，应仍为 [99]，实得 %v", got)
-		}
-	})
-
-	t.Run("链接同步失败不影响主效果（best-effort，fetch_plan 已落库）", func(t *testing.T) {
-		tr := &fakeTranslator{plan: json.RawMessage(`{"sources":[{"platform":"web","capability":"search","url":"vane://web/search?q=a"}]}`)}
-		fs, tool := setup(tr)
-		fs.linkErr = errors.New("写链接挂了") // ReplaceScheduleSources 失败
-		got, err := tool.Execute(context.Background(), 7, args)
-		if err != nil {
-			t.Fatalf("链接同步失败不应上抛（best-effort）: %v", err)
-		}
-		if !strings.Contains(got, "已更新定时任务") {
-			t.Fatalf("手册仍应更新成功: %q", got)
-		}
-		if fs.linkCalls != 1 {
-			t.Fatalf("材料化成功应调一次 Replace（它才返回错误）, 实得 %d", fs.linkCalls)
-		}
-		if len(fs.plans) != 1 {
-			t.Fatalf("fetch_plan 应已落库、不受链接同步失败影响, 实得 %+v", fs.plans)
-		}
-	})
 }

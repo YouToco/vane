@@ -149,13 +149,13 @@ func New(cfg config.FetchConfig) *Fetcher {
 // 失败语义：私网/非法 URL、非法 config → CodeValidation（不可重试）；超时 →
 // CodeFetchTimeout；HTTP 429 → CodeFetchRateLimit；其余（非 2xx、超限、解析失败）
 // 归入 fetch 类但按确定性/瞬态区分 Retryable。解析失败只返回 error，绝不 panic。
-func (f *Fetcher) FetchRSS(ctx context.Context, src types.Source) ([]types.ContentItem, error) {
+func (f *Fetcher) FetchRSS(ctx context.Context, src types.FetchTarget) ([]types.ContentItem, error) {
 	return f.fetchRSS(ctx, src, enrichMaxPerRound)
 }
 
 // fetchRSS 是 FetchRSS 的内部实现，多一个补全上限参数：周期抓取用 enrichMaxPerRound，
 // probe 用 probeEnrichCap（对抗审查 A-F3）。除补全条数外行为完全一致（含全灭防线）。
-func (f *Fetcher) fetchRSS(ctx context.Context, src types.Source, enrichCap int) ([]types.ContentItem, error) {
+func (f *Fetcher) fetchRSS(ctx context.Context, src types.FetchTarget, enrichCap int) ([]types.ContentItem, error) {
 	return f.fetchRSSWithEffectGate(ctx, src, enrichCap, nil)
 }
 
@@ -165,7 +165,7 @@ func (f *Fetcher) fetchRSS(ctx context.Context, src types.Source, enrichCap int)
 // passes nil and therefore retains the original behavior.
 func (f *Fetcher) fetchRSSWithEffectGate(
 	ctx context.Context,
-	src types.Source,
+	src types.FetchTarget,
 	enrichCap int,
 	beforeEffect func(context.Context) error,
 ) ([]types.ContentItem, error) {
@@ -339,7 +339,7 @@ type rssSourceConfig struct {
 //
 // 为什么 RSS 必须做这层过滤（2026-07-16 生产实证）：feed 常把全部历史塞在一份文档里
 // （openai.com/news/rss.xml 实测 1038 条，最早回溯到 2023 年）。首抓会把它们一次性入库
-// 且 fetched_at 全部相同，而候选窗口 ListUnpushedByUser 按 (fetched_at DESC, id DESC)
+// 且 fetched_at 全部相同，而任务候选窗口按 (fetched_at DESC, id DESC)
 // 取——feed 按时间倒序解析、越老的条目 id 越大，于是候选窗口恰好被最老的条目占满。
 // 下游两道闸门都拦不住：scorer 的 prompt 不含发布时间（模型看不出是旧闻），selector
 // 的新鲜度衰减封顶 12 分（85 分的 2023 年旧闻扣完仍有 73 分照样出线）。净效果是首批
@@ -348,7 +348,7 @@ type rssSourceConfig struct {
 // 无 PublishedParsed 的条目一律保留：feed 不给日期时无从判断新旧，丢弃会让这类源静默
 // 颗粒无收——那比放进几条旧闻更难发现。代价是无日期的 feed 仍可能带进历史条目（已知
 // 取舍，实测 openai / blog.google 均提供 pubDate）。
-func (f *Fetcher) applyLookback(src types.Source, items []*gofeed.Item) ([]*gofeed.Item, error) {
+func (f *Fetcher) applyLookback(src types.FetchTarget, items []*gofeed.Item) ([]*gofeed.Item, error) {
 	var sc rssSourceConfig
 	if len(src.Config) > 0 {
 		if err := json.Unmarshal(src.Config, &sc); err != nil {
@@ -401,7 +401,7 @@ func (f *Fetcher) applyLookback(src types.Source, items []*gofeed.Item) ([]*gofe
 	return out, nil
 }
 
-func (f *Fetcher) applyCategories(src types.Source, items []*gofeed.Item) []*gofeed.Item {
+func (f *Fetcher) applyCategories(src types.FetchTarget, items []*gofeed.Item) []*gofeed.Item {
 	var sc rssSourceConfig
 	if len(src.Config) > 0 {
 		_ = json.Unmarshal(src.Config, &sc)
@@ -446,7 +446,7 @@ func matchesCategory(itemCats []string, want map[string]struct{}) bool {
 // 从不写回 content_items，导致两列恒为空、跨批去重全失效（审查 CRITICAL 数据链）。
 // 在此落库前算好，才能让 ListRecentSimhashes 拿到历史、UNIQUE 精确去重生效。
 // 第二个返回值是本轮各原因的丢弃计数，供调用方判定「全灭」（见 drop.go）。
-func mapItems(src types.Source, items []*gofeed.Item) ([]types.ContentItem, dropTally) {
+func mapItems(src types.FetchTarget, items []*gofeed.Item) ([]types.ContentItem, dropTally) {
 	now := time.Now().UTC()
 	var tally dropTally
 	out := make([]types.ContentItem, 0, len(items))
@@ -527,7 +527,7 @@ func noRedirect(_ *http.Request, _ []*http.Request) error {
 // 返回 dropNone 表示该条可以入库；否则返回丢弃原因，供调用方累计成 dropTally
 // 并在「全灭」时组装用户可读的诊断（见 drop.go）。原先返回 bool，只够决定去留、
 // 不够回答「为什么一条都没剩下」——而那正是 HN 静默零产出事故里唯一缺的信息。
-func finalize(src types.Source, item *types.ContentItem) dropReason {
+func finalize(src types.FetchTarget, item *types.ContentItem) dropReason {
 	if item.FetchedAt.IsZero() {
 		item.FetchedAt = time.Now().UTC()
 	}

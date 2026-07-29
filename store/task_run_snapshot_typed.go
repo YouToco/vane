@@ -112,7 +112,10 @@ func (s *Store) createOrGetCompiledTaskRunSnapshotV1(
 			ctx, lookup); loadErr != nil {
 			return types.RunSnapshotRef{}, loadErr
 		} else if found {
-			return existing.safeRef()
+			if existing.ReferenceSchemaVersion != taskRunReferenceSchemaVersionV1 {
+				return types.RunSnapshotRef{}, taskRunIntegrityError()
+			}
+			return existing.safeRefV1()
 		}
 		return types.RunSnapshotRef{}, invalidTypedTaskRunPolicy()
 	}
@@ -134,7 +137,10 @@ func (s *Store) createOrGetCompiledTaskRunSnapshotV1(
 	if err != nil {
 		return types.RunSnapshotRef{}, err
 	}
-	return snapshot.safeRef()
+	if snapshot.ReferenceSchemaVersion != taskRunReferenceSchemaVersionV1 {
+		return types.RunSnapshotRef{}, taskRunIntegrityError()
+	}
+	return snapshot.safeRefV1()
 }
 
 func observationRolloutArgument(

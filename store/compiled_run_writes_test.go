@@ -193,12 +193,12 @@ func createApprovedTaskForScope(
 	config := json.RawMessage(`{"query":"tenant-b"}`)
 	var sourceID int64
 	if err := st.pool.QueryRow(ctx,
-		`INSERT INTO sources (platform, capability, url, title, config, status)
+		`INSERT INTO fetch_targets (platform, capability, url, title, config, status)
 		 VALUES ('web', 'search', $1, 'tenant B source', $2, 'active')
 		 RETURNING id`, url, config).Scan(&sourceID); err != nil {
 		t.Fatalf("create tenant B source: %v", err)
 	}
-	plan, err := json.Marshal(compiledFetchPlan{Sources: []compiledPlanSource{{
+	plan, err := json.Marshal(compiledFetchPlan{Targets: []compiledPlanTarget{{
 		Platform: "web", Capability: "search", Title: "tenant B source",
 		URL: url, Config: config,
 	}}})
@@ -219,7 +219,7 @@ func createApprovedTaskForScope(
 		t.Fatalf("create tenant B playbook: %v", err)
 	}
 	if _, err := st.pool.Exec(ctx,
-		`INSERT INTO schedule_sources (schedule_id, source_id) VALUES ($1, $2)`,
+		`INSERT INTO task_fetch_targets (schedule_id, fetch_target_id) VALUES ($1, $2)`,
 		taskID, sourceID); err != nil {
 		t.Fatalf("create tenant B source link: %v", err)
 	}

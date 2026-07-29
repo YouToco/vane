@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
 
@@ -24,7 +26,7 @@ func TestTaskDefinitionBaselineDryRunApplyVerifyAndReplay(t *testing.T) {
 	f := newTaskDefinitionStateFixture(t)
 	ctx := t.Context()
 
-	before := loadTaskDefinitionBaselineLegacyBytes(t, f)
+	before := loadTaskDefinitionBaselineProjectionBytes(t, f)
 	dryRun := taskDefinitionBaselineResultForTask(
 		t, f.store, TaskDefinitionBaselineDryRun, f.taskID)
 	if dryRun.Status != TaskDefinitionBaselineWouldApply ||
@@ -43,7 +45,7 @@ func TestTaskDefinitionBaselineDryRunApplyVerifyAndReplay(t *testing.T) {
 		applied.Version != dryRun.Version || applied.Digest != dryRun.Digest {
 		t.Fatalf("apply=%+v dry-run=%+v", applied, dryRun)
 	}
-	after := loadTaskDefinitionBaselineLegacyBytes(t, f)
+	after := loadTaskDefinitionBaselineProjectionBytes(t, f)
 	if !bytes.Equal(before, after) {
 		t.Fatal("baseline apply changed retained legacy projection")
 	}
@@ -56,11 +58,11 @@ func TestTaskDefinitionBaselineDryRunApplyVerifyAndReplay(t *testing.T) {
 		head.Definition.Strictness != types.PushStrictness("loose") {
 		t.Fatalf("applied head=%+v result=%+v", head, applied)
 	}
-	if head.ApprovalRef != taskDefinitionBaselineApprovalRef(
+	if head.OperationRef != taskDefinitionBaselineOperationRef(
 		TaskDefinitionBaselineCursor{
 			TenantID: f.tenantID, UserID: f.userID, TaskID: f.taskID,
 		}) {
-		t.Fatalf("approval_ref=%q", head.ApprovalRef)
+		t.Fatalf("operation_ref=%q", head.OperationRef)
 	}
 
 	replay := taskDefinitionBaselineResultForTask(
@@ -98,8 +100,8 @@ func TestTaskDefinitionBaselineDryRunApplyVerifyAndReplay(t *testing.T) {
 				Version: applied.Version,
 				Digest:  applied.Digest,
 			},
-			Definition:  target,
-			ApprovalRef: "baseline-late-edit:" + f.taskID,
+			Definition:   target,
+			OperationRef: "baseline-late-edit:" + f.taskID,
 		})
 	if err != nil {
 		t.Fatalf("advance head after baseline: %v", err)
@@ -108,7 +110,7 @@ func TestTaskDefinitionBaselineDryRunApplyVerifyAndReplay(t *testing.T) {
 		t.Fatalf("advanced version=%d", advanced.Version)
 	}
 	late, err := f.store.InsertInitialApprovedDefinition(
-		ctx, f.definition, taskDefinitionBaselineApprovalRef(
+		ctx, f.definition, taskDefinitionBaselineOperationRef(
 			TaskDefinitionBaselineCursor{
 				TenantID: f.tenantID, UserID: f.userID, TaskID: f.taskID,
 			}))
@@ -118,11 +120,96 @@ func TestTaskDefinitionBaselineDryRunApplyVerifyAndReplay(t *testing.T) {
 	}
 }
 
+func TestTaskDefinitionBaselineScopesSkipExactCurrentV2Head(t *testing.T) {
+	f := newTaskDefinitionStateFixture(t)
+	taskID := "baseline-v2-" + uuid.NewString()
+	call, err := taskstate.BuildToolInvocationV1(
+		"web_search", "v1", json.RawMessage(`{"query":"baseline isolation"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := taskstate.BuildApprovedDefinitionV2(
+		taskstate.ApprovedDefinitionInputV2{
+			TenantID: f.tenantID, UserID: f.userID, TaskID: taskID,
+			NLDescription:  "V2 baseline isolation",
+			SpecJSON:       json.RawMessage(`{"cron":"0 8 * * *"}`),
+			ScopeJSON:      json.RawMessage(`{}`),
+			TaskManual:     "监控 baseline isolation",
+			Strictness:     types.StrictnessNormal,
+			ToolCalls:      []taskstate.ToolInvocationV1{call},
+			ExecutionMode:  types.ExecutionModeCompiled,
+			DeliveryPolicy: taskstate.DeliveryPolicyOwnerFeishu,
+			BudgetPolicy:   taskstate.BudgetPolicyInheritTenantQuota,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := taskstate.EncodeApprovedDefinitionV2(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := digestTaskStatePayload(payload)
+	if _, err := f.store.pool.Exec(t.Context(), `
+		INSERT INTO schedules (
+		    id, tenant_id, user_id, nl_description, spec_json, scope_json,
+		    status, execution_mode
+		) VALUES ($1, $2, $3, $4, $5, $6, 'paused', 'compiled')`,
+		taskID, f.tenantID, f.userID, definition.NLDescription,
+		definition.SpecJSON, definition.ScopeJSON); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(ctx, t, f.store, `
+			UPDATE schedules
+			   SET approved_definition_version=NULL,
+			       approved_definition_digest=NULL
+			 WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+			f.tenantID, f.userID, taskID)
+		cleanupExec(ctx, t, f.store, `
+			DELETE FROM task_approved_definition_versions
+			 WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`,
+			f.tenantID, f.userID, taskID)
+		cleanupExec(ctx, t, f.store, `
+			DELETE FROM schedules
+			 WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+			f.tenantID, f.userID, taskID)
+	})
+	if _, err := f.store.pool.Exec(t.Context(), `
+		INSERT INTO task_approved_definition_versions (
+		    tenant_id, user_id, task_id, version, schema_version,
+		    execution_mode, definition_digest, payload, operation_ref
+		) VALUES ($1, $2, $3, 1, $4, 'compiled', $5, $6, $7)`,
+		f.tenantID, f.userID, taskID, definition.SchemaVersion,
+		digest, payload, "baseline-v2-test:"+taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(t.Context(), `
+		UPDATE schedules
+		   SET approved_definition_version=1,
+		       approved_definition_digest=$4
+		 WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+		f.tenantID, f.userID, taskID, digest); err != nil {
+		t.Fatal(err)
+	}
+	scopes, _, err := f.store.listTaskDefinitionBaselineScopes(
+		t.Context(), TaskDefinitionBaselineCursor{}, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range scopes {
+		if scope.TaskID == taskID {
+			t.Fatalf("exact current V2 head leaked into V1 baseline scan: %+v", scope)
+		}
+	}
+}
+
 func TestTaskDefinitionBaselineUsesRetainedProjectionWithoutRewritingSources(t *testing.T) {
 	f := newTaskDefinitionStateFixture(t)
 	const changedGlobalTitle = "mutable global source title"
 	if _, err := f.store.pool.Exec(t.Context(),
-		`UPDATE sources SET title=$2 WHERE id=$1`,
+		`UPDATE fetch_targets SET title=$2 WHERE id=$1`,
 		f.sourceID, changedGlobalTitle); err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +230,7 @@ func TestTaskDefinitionBaselineUsesRetainedProjectionWithoutRewritingSources(t *
 	}
 	var title string
 	if err := f.store.pool.QueryRow(t.Context(),
-		`SELECT title FROM sources WHERE id=$1`, f.sourceID).Scan(&title); err != nil {
+		`SELECT title FROM fetch_targets WHERE id=$1`, f.sourceID).Scan(&title); err != nil {
 		t.Fatal(err)
 	}
 	if title != changedGlobalTitle {
@@ -194,7 +281,7 @@ func TestTaskDefinitionBaselineUnsupportedReasons(t *testing.T) {
 			name: "plan link mismatch",
 			mutate: func(t *testing.T, f taskDefinitionStateFixture) {
 				if _, err := f.store.pool.Exec(t.Context(),
-					`DELETE FROM schedule_sources WHERE schedule_id=$1`,
+					`DELETE FROM task_fetch_targets WHERE schedule_id=$1`,
 					f.taskID); err != nil {
 					t.Fatal(err)
 				}
@@ -330,7 +417,7 @@ func TestTaskDefinitionBaselineRejectsProvisioningTask(t *testing.T) {
 	f := newTaskDefinitionStateFixture(t)
 	operationID := uuid.NewString()
 	if _, err := f.store.pool.Exec(t.Context(), `
-		INSERT INTO pending_actions (
+		INSERT INTO task_creation_operations (
 			id, tenant_id, user_id, tool_name, args, summary, status, expires_at,
 			execution_version, phase, task_id
 		) VALUES (
@@ -345,7 +432,7 @@ func TestTaskDefinitionBaselineRejectsProvisioningTask(t *testing.T) {
 		ctx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(ctx, t, f.store,
-			`DELETE FROM pending_actions WHERE id=$1`, operationID)
+			`DELETE FROM task_creation_operations WHERE id=$1`, operationID)
 	})
 	result, err := f.store.reconcileTaskDefinitionBaseline(
 		t.Context(), TaskDefinitionBaselineApply, TaskDefinitionBaselineCursor{
@@ -548,7 +635,7 @@ func taskDefinitionBaselineResultForTaskE(
 	return TaskDefinitionBaselineResult{}, errors.New("baseline test task was not listed")
 }
 
-func loadTaskDefinitionBaselineLegacyBytes(
+func loadTaskDefinitionBaselineProjectionBytes(
 	t *testing.T,
 	f taskDefinitionStateFixture,
 ) []byte {
@@ -560,8 +647,8 @@ func loadTaskDefinitionBaselineLegacyBytes(
 			s.scope_json::text || '|' || coalesce(s.push_strictness, '<NULL>') || '|' ||
 			p.content || '|' || p.fetch_plan::text || '|' ||
 			coalesce((
-				SELECT string_agg(source_id::text, ',' ORDER BY source_id)
-				  FROM schedule_sources
+				SELECT string_agg(fetch_target_id::text, ',' ORDER BY fetch_target_id)
+				  FROM task_fetch_targets
 				 WHERE schedule_id=s.id
 			), ''),
 			'UTF8')

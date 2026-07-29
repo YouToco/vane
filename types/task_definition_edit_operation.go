@@ -95,7 +95,7 @@ type CreateTaskDefinitionEditOperationParams struct {
 	BaseSnapshot      []byte
 }
 
-// AcquireTaskDefinitionEditOperationParams confirms or recovers one exact
+// AcquireTaskDefinitionEditOperationParams starts or recovers one exact
 // operation. LeaseOwner is generated once before the call so a response-lost
 // replay by the same owner can recover the same active fence. The Store owns
 // all database-clock deadlines and the fixed takeover grace.
@@ -107,18 +107,10 @@ type AcquireTaskDefinitionEditOperationParams struct {
 	ReceiptTarget   string
 }
 
-// CancelTaskDefinitionEditOperationParams linearizes a pre-confirmation
-// cancellation against acquisition on the same operation row.
-type CancelTaskDefinitionEditOperationParams struct {
-	Scope           TaskDefinitionEditScope
-	ReceiptProvider string
-	ReceiptTarget   string
-}
-
-// ExpireTaskDefinitionEditOperationParams tombstones an expired, unconfirmed
+// ExpireTaskDefinitionEditOperationParams tombstones an expired, unstarted
 // proposal. Provider and target may both be empty for an audit-only suppressed
 // receipt, or both be present when an authenticated callback supplied the
-// original confirmation resource.
+// original operation resource.
 type ExpireTaskDefinitionEditOperationParams struct {
 	Scope           TaskDefinitionEditScope
 	ReceiptProvider string
@@ -141,19 +133,19 @@ const (
 // proposal and Temporal fields are exact PostgreSQL BYTEA checkpoints; their
 // sibling digest fields are database-verified SHA-256 values.
 type TaskDefinitionEditOperation struct {
-	ID             string
-	TenantID       int64
-	UserID         int64
-	TargetTenantID int64
-	TargetUserID   int64
-	TaskID         string
-	SessionID      int64
-	ApprovalRef    string
-	Status         TaskDefinitionEditOperationStatus
-	Phase          TaskDefinitionEditPhase
-	ExpiresAt      time.Time
-	ConfirmedAt    *time.Time
-	OriginalStatus ScheduleStatus
+	ID                 string
+	TenantID           int64
+	UserID             int64
+	TargetTenantID     int64
+	TargetUserID       int64
+	TaskID             string
+	SessionID          int64
+	OperationRef       string
+	Status             TaskDefinitionEditOperationStatus
+	Phase              TaskDefinitionEditPhase
+	ExpiresAt          time.Time
+	ExecutionStartedAt *time.Time
+	OriginalStatus     ScheduleStatus
 
 	BaseDefinitionVersion   int64
 	BaseDefinitionDigest    string
@@ -257,7 +249,7 @@ type RecordTaskDefinitionEditReceiptSendFailureParams struct {
 	RetryAfter time.Duration
 }
 
-// TaskDefinitionEditReceipt is one durable patch of the original confirmation
+// TaskDefinitionEditReceipt is one durable session receipt for the operation
 // resource. Joined operation fields let a renderer build a fixed terminal card
 // without a second, potentially differently scoped lookup.
 type TaskDefinitionEditReceipt struct {

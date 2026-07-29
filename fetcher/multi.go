@@ -1,8 +1,8 @@
 // Multi 是多信源分发器：按 (Platform, Capability) 把抓取请求路由到具体抓取器。
 // workflow 的 Fetch Activity 只依赖单方法接口 Fetch(ctx, src)，新增信源类型
-// 只需在 sourcecatalog 注册一行 + 这里接一个 case，pipeline 与装配代码零改动。
+// 只需注册一个 acquisition tool + 这里接一个 case，pipeline 与装配代码零改动。
 //
-// 分发前先过 sourcecatalog 门禁（契约 §2/§6）：未注册的组合与"注册了但 Unavailable"
+// 分发前先过 acquisition tool 门禁（契约 §2/§6）：未注册的组合与"注册了但 Unavailable"
 // 是两种不同的错误——前者是"没这个东西"，后者是"有但故意不做，且带得出原因"。
 // 把 Unavailable 的 Reason 带进报错，agent 就能主动回答"X 关键词搜索为何不支持"，
 // 而不是静默改用别的能力凑合（契约 §2.2 的核心动机）。
@@ -12,9 +12,9 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/runtimepolicy"
-	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/types"
 )
 
@@ -205,12 +205,12 @@ func (m *Multi) ExaContents() *ExaContentsFetcher { return m.exaContents }
 
 // Fetch 按 (Platform, Capability) 分发。
 //
-//   - 组合不在 sourcecatalog 里          → CodeValidation（"未知能力"，数据问题，不可重试）
+//   - 组合没有对应 acquisition tool           → CodeValidation（"未知能力"，数据问题，不可重试）
 //   - 在表里但 Status != Available       → CodeValidation，Message 带 Entry.Reason
 //     （让"为什么这个源不工作"进到用户/agent 看得见的地方，不再只是 const 注释）
 //   - Available 但下面 switch 没接上      → CodeInternal（注册表与装配漂移，装配漏接了 provider）
-func (m *Multi) Fetch(ctx context.Context, src types.Source) ([]types.ContentItem, error) {
-	entry, ok := sourcecatalog.Lookup(src.Platform, src.Capability)
+func (m *Multi) Fetch(ctx context.Context, src types.FetchTarget) ([]types.ContentItem, error) {
+	entry, ok := acquisitiontool.Lookup(src.Platform, src.Capability)
 	if !ok {
 		return nil, types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("未知信源能力 %q/%q（source_id=%d）", src.Platform, src.Capability, src.ID), nil)
@@ -257,7 +257,7 @@ func (m *Multi) Fetch(ctx context.Context, src types.Source) ([]types.ContentIte
 		}
 	}
 
-	// 走到这里说明 sourcecatalog 标记该组合 Available，但上面的 switch 没有对应 provider
+	// 走到这里说明 tool 标记该组合 Available，但上面的 switch 没有对应 provider
 	// ——即注册表与装配漂移（新注册了能力却忘了在此接抓取器）。这是编程/装配错误，不是
 	// 数据错误，故用 CodeInternal 而非 CodeValidation，让它在探针里显性暴露而非静默当作坏源。
 	return nil, types.NewAppError(types.CodeInternal,

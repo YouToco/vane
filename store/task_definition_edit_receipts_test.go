@@ -509,7 +509,7 @@ func newTaskDefinitionEditReceiptFixture(
 	if _, err := st.pool.Exec(ctx, `
 		INSERT INTO task_definition_edit_operations (
 			id, tenant_id, user_id, target_tenant_id, target_user_id,
-			task_id, session_id, approval_ref, status, phase, expires_at,
+			task_id, session_id, operation_ref, status, phase, expires_at,
 			original_status,
 			base_definition_version, base_definition_digest, base_definition,
 			target_definition_version, target_definition_digest, target_definition,

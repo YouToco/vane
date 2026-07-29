@@ -5,12 +5,12 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/evolver"
 	"github.com/YouToco/vane/executivebrief"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/scorer"
-	"github.com/YouToco/vane/sourcecatalog"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
@@ -147,7 +147,7 @@ func TestBuildCurrentCompiledV1IncludesEveryAvailableCapability(t *testing.T) {
 		got[capability.Platform+"/"+capability.Capability] = capability
 	}
 	available := 0
-	for _, entry := range sourcecatalog.List() {
+	for _, entry := range acquisitiontool.List() {
 		key := string(entry.Platform) + "/" + string(entry.Capability)
 		capability, found := got[key]
 		if !entry.Available() {
@@ -221,7 +221,7 @@ func TestBuildCurrentCompiledV1FreezesTaskInstructionDecision(t *testing.T) {
 
 func assertCurrentCapabilityV1(
 	t *testing.T,
-	entry sourcecatalog.Entry,
+	entry acquisitiontool.Entry,
 	capability runtimepolicy.CapabilityV1,
 ) {
 	t.Helper()

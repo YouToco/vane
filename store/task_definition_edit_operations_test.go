@@ -125,7 +125,7 @@ func newTaskDefinitionEditOperationFixture(
 	err = scanTaskDefinitionEditOperation(state.store.pool.QueryRow(ctx,
 		`INSERT INTO task_definition_edit_operations (
 			id, tenant_id, user_id, target_tenant_id, target_user_id,
-			task_id, session_id, approval_ref, expires_at, original_status,
+			task_id, session_id, operation_ref, expires_at, original_status,
 			base_definition_version, base_definition_digest, base_definition,
 			target_definition_version, target_definition_digest, target_definition,
 			canonical_proposal, proposal_digest, prepared_edit,
@@ -220,7 +220,7 @@ func TestTaskDefinitionEditAcquireQuiesceTakeoverAndTerminalOutbox(
 	}
 	if acquired.Status != types.TaskDefinitionEditOperationStatusExecuting ||
 		acquired.Phase != types.TaskDefinitionEditPhaseProposalSealed ||
-		acquired.Fence != 1 || acquired.Attempt != 1 || acquired.ConfirmedAt == nil {
+		acquired.Fence != 1 || acquired.Attempt != 1 || acquired.ExecutionStartedAt == nil {
 		t.Fatalf("first acquisition=%+v", acquired)
 	}
 	firstLeaseUntil := *acquired.LeaseUntil
@@ -417,66 +417,8 @@ func TestTaskDefinitionEditAcquireRejectsConcurrentMembershipRevocation(
 		t.Fatal(err)
 	}
 	if op.Status != types.TaskDefinitionEditOperationStatusPending ||
-		op.ConfirmedAt != nil {
+		op.ExecutionStartedAt != nil {
 		t.Fatalf("revoked confirmation mutated operation: %+v", op)
-	}
-}
-
-func TestTaskDefinitionEditCancelRejectsConcurrentMembershipRevocation(
-	t *testing.T,
-) {
-	f := newTaskDefinitionEditOperationFixture(t)
-	ctx := t.Context()
-	t.Cleanup(func() {
-		if _, err := f.state.store.pool.Exec(context.Background(),
-			`INSERT INTO memberships (tenant_id,user_id,role)
-			 VALUES ($1,$2,'owner') ON CONFLICT DO NOTHING`,
-			f.op.TenantID, f.op.UserID,
-		); err != nil {
-			t.Errorf("restore cancelled actor membership: %v", err)
-		}
-	})
-	holder, err := f.state.store.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer holder.Rollback(context.Background())
-	if _, err := holder.Exec(ctx,
-		`DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`,
-		f.op.TenantID, f.op.UserID,
-	); err != nil {
-		t.Fatal(err)
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := f.state.store.CancelTaskDefinitionEditOperation(
-			ctx, types.CancelTaskDefinitionEditOperationParams{
-				Scope:           f.op.Scope(),
-				ReceiptProvider: "feishu_card_patch:app-test",
-				ReceiptTarget:   "message-revoked-cancel",
-			},
-		)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		t.Fatalf("cancel did not serialize with membership revocation: %v", err)
-	case <-time.After(200 * time.Millisecond):
-	}
-	if err := holder.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-done; !errors.Is(err, types.ErrValidation) {
-		t.Fatalf("cancel after concurrent membership revocation = %v", err)
-	}
-	op, err := f.state.store.LoadTaskDefinitionEditOperation(ctx, f.op.Scope())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if op.Status != types.TaskDefinitionEditOperationStatusPending ||
-		op.TombstonedAt != nil {
-		t.Fatalf("revoked cancellation mutated operation: %+v", op)
 	}
 }
 
@@ -572,11 +514,11 @@ func TestTaskDefinitionEditCheckpointCommitAndCompleteAtomic(t *testing.T) {
 		t.Fatalf("decode fixture target: %v", err)
 	}
 	targetRecord := ApprovedDefinitionVersionRecord{
-		Definition:  targetDefinition,
-		Version:     f.op.TargetDefinitionVersion,
-		Digest:      f.op.TargetDefinitionDigest,
-		Payload:     bytes.Clone(f.op.TargetDefinition),
-		ApprovalRef: f.op.ApprovalRef,
+		Definition:   targetDefinition,
+		Version:      f.op.TargetDefinitionVersion,
+		Digest:       f.op.TargetDefinitionDigest,
+		Payload:      bytes.Clone(f.op.TargetDefinition),
+		OperationRef: f.op.OperationRef,
 	}
 	assertApprovedDefinitionEditProjection(t, f.state, targetRecord,
 		[]int64{f.state.sourceID})
@@ -898,11 +840,11 @@ func TestTaskDefinitionEditCommitRejectsHistoricalApprovalReplay(t *testing.T) {
 	if _, err := f.state.store.pool.Exec(ctx,
 		`INSERT INTO task_approved_definition_versions (
 			tenant_id, user_id, task_id, version, schema_version,
-			execution_mode, definition_digest, payload, approval_ref
+			execution_mode, definition_digest, payload, operation_ref
 		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 		f.op.TargetTenantID, f.op.TargetUserID, f.op.TaskID,
 		f.op.TargetDefinitionVersion, target.SchemaVersion, target.ExecutionMode,
-		f.op.TargetDefinitionDigest, f.op.TargetDefinition, f.op.ApprovalRef,
+		f.op.TargetDefinitionDigest, f.op.TargetDefinition, f.op.OperationRef,
 	); err != nil {
 		t.Fatalf("seed historical approved row: %v", err)
 	}
@@ -982,7 +924,7 @@ func TestTaskDefinitionEditAcquireScheduleOutcomeWins(t *testing.T) {
 			}
 			if terminal == nil || terminal.Status != tt.wantStatus ||
 				terminal.ErrorCode != tt.wantCode || terminal.TombstonedAt == nil ||
-				terminal.ConfirmedAt == nil || terminal.Fence != 1 ||
+				terminal.ExecutionStartedAt == nil || terminal.Fence != 1 ||
 				terminal.Attempt != 1 || terminal.LeaseOwner != "" {
 				t.Fatalf("terminal schedule outcome=%+v", terminal)
 			}

@@ -401,7 +401,7 @@ func currentApprovedObservationPolicyTx(
 	}
 	record, err := scanApprovedDefinitionVersion(tx.QueryRow(ctx,
 		`SELECT d.version,d.schema_version,d.execution_mode,
-		        d.definition_digest,d.payload,d.approval_ref,d.created_at
+		        d.definition_digest,d.payload,d.operation_ref,d.created_at
 		   FROM task_approved_definition_versions d
 		  WHERE d.tenant_id=$1 AND d.user_id=$2 AND d.task_id=$3
 		    AND d.version=$4 AND d.definition_digest=$5`,

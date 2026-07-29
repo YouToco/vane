@@ -15,7 +15,7 @@ import (
 //
 // 这是全仓**唯一不可逆**的批量删除路径，红线是契约 I-A3：
 //
-//	硬删只删「租户所有表」。sources / content_items / content_sources
+//	硬删只删「租户所有表」。fetch_targets / content_items / content_sources
 //	是**跨租户客观事实**——同一篇文章可能被多个租户的信源指向，删了会伤到别人。
 //
 // 三道结构性保证（不是纪律要求）：
@@ -32,7 +32,7 @@ import (
 // purgeStep 是硬删的一步：一张表 + 它的租户归属判据。
 //
 // where 里的 $1 是 tenant_id。**不能统一写成 `tenant_id = $1`**：
-// schedule_playbooks / schedule_sources 没有 tenant_id 列，只能经 schedules 反查——
+// schedule_playbooks / task_fetch_targets 没有 tenant_id 列，只能经 schedules 反查——
 // 而它们同样是租户数据，漏删会在 tenants 行被删时撞外键（失败），或残留孤儿行。
 type purgeStep struct {
 	table string
@@ -43,9 +43,9 @@ type purgeStep struct {
 //
 // 顺序由 information_schema 的外键关系推导（2026-07-19 实测）：
 //
-//	schedule_playbooks / schedule_sources → schedules
+//	schedule_playbooks / task_fetch_targets → schedules
 //	feedbacks                             → deliveries
-//	task_creation_receipts               → pending_actions → agent_sessions
+//	task_creation_receipts               → task_creation_operations → agent_sessions
 //	agent_turn_context_snapshots / agent_session_fact_outbox /
 //	agent_session_projection_authority_events /
 //	agent_events → agent_sessions
@@ -81,7 +81,7 @@ var purgeOrder = []purgeStep{
 	// 无 tenant_id、经 schedules 反查的两张（正因为没有 tenant_id，
 	// 「按 tenant_id 列对账」的守卫看不见它们，必须靠外键可达性那条守卫兜住）。
 	{"schedule_playbooks", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
-	{"schedule_sources", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
+	{"task_fetch_targets", "schedule_id IN (SELECT id FROM schedules WHERE tenant_id = $1)"},
 	// Adaptive 的 last-known-good 外键指向 immutable definition，因此必须先删。
 	{"task_adaptive_states", "tenant_id = $1"},
 	// 删除当前 definition 会由 FK 把 schedules 收敛为 compiled/headless，随后
@@ -91,9 +91,7 @@ var purgeOrder = []purgeStep{
 	{"feedback_freshness_triage", "tenant_id = $1"},
 	{"feedbacks", "tenant_id = $1"},
 	{"task_creation_receipts", "tenant_id = $1"},
-	{"agent_action_continuation_authority_events", "tenant_id = $1"},
-	{"agent_action_continuations", "tenant_id = $1"},
-	{"pending_actions", "tenant_id = $1"},
+	{"task_creation_operations", "tenant_id = $1"},
 	{"agent_turn_context_snapshots", "tenant_id = $1"},
 	{"agent_session_fact_outbox", "tenant_id = $1"},
 	// Projection authority and semantic events reference agent_sessions by the
@@ -129,6 +127,10 @@ var purgeOrder = []purgeStep{
 	{"task_observed_events", "tenant_id = $1"},
 	{"task_event_qualification_steps", "tenant_id = $1"},
 	{"deliveries", "tenant_id = $1"},
+	// Source-free Tool content provenance owns tenant-scoped evidence and
+	// references both the immutable run snapshot and shared content facts.
+	// Remove it before snapshots; shared content remains outside tenant purge.
+	{"task_run_content_provenance", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},
 	// Compiled push batches retain the immutable run snapshot through migration
 	// 031, so batches must be gone before either the marked parent or its
@@ -137,7 +139,6 @@ var purgeOrder = []purgeStep{
 	{"task_run_snapshot_v2_shadows", "tenant_id = $1"},
 	{"task_run_snapshots", "tenant_id = $1"},
 	{"agent_sessions", "tenant_id = $1"},
-	{"subscriptions", "tenant_id = $1"},
 	// HTTP response-loss receipts reference the append-only revision. Both are
 	// tenant evidence and must be removed before the profile/membership roots.
 	{"profile_epoch_receipts", "tenant_id = $1"},
@@ -171,7 +172,7 @@ var purgeOrder = []purgeStep{
 
 // purgeSharedTables 是**绝不能出现在 purgeOrder 里**的跨租户客观事实表（红线 I-A3）。
 // 单列出来是为了让守卫测试能直接断言，而不是靠 review 时肉眼比对。
-var purgeSharedTables = []string{"sources", "content_items", "content_sources"}
+var purgeSharedTables = []string{"fetch_targets", "content_items", "content_sources"}
 
 // PurgeReport 是一次清理的结果。dry-run 与真删返回同样的结构，
 // 便于运维先看一眼「会删掉什么」再决定要不要执行。
@@ -317,7 +318,7 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 	// user capacity row. Tenant is the FK parent reached last by normal turns
 	// and definition-edit creation, while users can span tenants and must never
 	// be pulled into a tenant-wide purge. Existing Task Creation sagas use their
-	// pending_action as the root before any identity/capacity or aggregate lock.
+	// task creation operation as the root before any identity/capacity or aggregate lock.
 	//
 	// The two receipt dispatchers really lock their receipt before updating the
 	// session. Definition-edit coordinators lock schedule -> operation before
@@ -364,18 +365,11 @@ func (s *Store) PurgeTenant(ctx context.Context, tenantID int64, dryRun bool) (*
 			         FOR UPDATE /* tenant purge observed event lock order */`,
 		},
 		{
-			name: "pending_actions",
-			query: `SELECT id FROM pending_actions
+			name: "task_creation_operations",
+			query: `SELECT id FROM task_creation_operations
 			         WHERE tenant_id = $1
 			         ORDER BY id
 			         FOR UPDATE /* tenant purge task-creation lock order */`,
-		},
-		{
-			name: "agent_action_continuations",
-			query: `SELECT action_id FROM agent_action_continuations
-			         WHERE tenant_id = $1
-			         ORDER BY action_id
-			         FOR UPDATE /* tenant purge Agent action lock order */`,
 		},
 		{
 			name: "schedules",

@@ -5,16 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/YouToco/vane/llm"
-	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/task"
 	"github.com/YouToco/vane/types"
-	"github.com/google/uuid"
 )
 
 type fakeDefinitionEditController struct {
@@ -22,13 +19,9 @@ type fakeDefinitionEditController struct {
 	proposal     task.DefinitionEditProposal
 	proposeErr   error
 
-	confirmCalls []fakeDefinitionEditCall
-	confirm      task.TaskDefinitionEditOutcome
-	confirmErr   error
-
-	cancelCalls []fakeDefinitionEditCall
-	cancel      task.TaskDefinitionEditOutcome
-	cancelErr   error
+	executeCalls []fakeDefinitionEditCall
+	execute      task.TaskDefinitionEditOutcome
+	executeErr   error
 }
 
 type fakeDefinitionEditCall struct {
@@ -37,7 +30,7 @@ type fakeDefinitionEditCall struct {
 	receipt  task.TaskDefinitionEditReceiptTarget
 }
 
-func (f *fakeDefinitionEditController) Propose(
+func (f *fakeDefinitionEditController) Prepare(
 	_ context.Context,
 	in task.DefinitionEditProposalInput,
 ) (task.DefinitionEditProposal, error) {
@@ -55,394 +48,16 @@ func (f *fakeDefinitionEditController) Propose(
 	return result, nil
 }
 
-func (f *fakeDefinitionEditController) Confirm(
+func (f *fakeDefinitionEditController) Execute(
 	_ context.Context,
 	userID int64,
 	actionID string,
 	receipt task.TaskDefinitionEditReceiptTarget,
 ) (task.TaskDefinitionEditOutcome, error) {
-	f.confirmCalls = append(f.confirmCalls, fakeDefinitionEditCall{
+	f.executeCalls = append(f.executeCalls, fakeDefinitionEditCall{
 		userID: userID, actionID: actionID, receipt: receipt,
 	})
-	return f.confirm, f.confirmErr
-}
-
-func (f *fakeDefinitionEditController) Cancel(
-	_ context.Context,
-	userID int64,
-	actionID string,
-	receipt task.TaskDefinitionEditReceiptTarget,
-) (task.TaskDefinitionEditOutcome, error) {
-	f.cancelCalls = append(f.cancelCalls, fakeDefinitionEditCall{
-		userID: userID, actionID: actionID, receipt: receipt,
-	})
-	return f.cancel, f.cancelErr
-}
-
-func TestBuildTools_DefinitionEditFlagBoundary(t *testing.T) {
-	disabled := BuildTools(nil, nil, nil, nil, nil, nil, nil)
-	if toolNamed(disabled, "edit_task_definition") != nil {
-		t.Fatal("default BuildTools must keep definition editing absent")
-	}
-	explicitlyDisabled := BuildTools(
-		nil, nil, nil, nil, nil, nil, nil, nil,
-	)
-	baselineLoop := New(Deps{Tools: disabled})
-	disabledLoop := New(Deps{
-		Tools: explicitlyDisabled,
-		// Callback compatibility remains wired during a flag rollback, but it
-		// must not expose a proposal tool to the model.
-		TaskDefinitionEdit: &fakeDefinitionEditController{},
-	})
-	baselineDefs, err := json.Marshal(baselineLoop.toolDefs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	disabledDefs, err := json.Marshal(disabledLoop.toolDefs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(baselineDefs, disabledDefs) ||
-		baselineLoop.sys != disabledLoop.sys {
-		t.Fatalf("disabled flag changed Agent request bytes:\nbaseline tools=%s\n disabled tools=%s",
-			baselineDefs, disabledDefs)
-	}
-
-	controller := &fakeDefinitionEditController{}
-	enabled := BuildTools(nil, &scheduler.Scheduler{}, nil, nil, nil, nil, nil, controller)
-	tool := toolNamed(enabled, "edit_task_definition")
-	if tool == nil {
-		t.Fatal("enabled BuildTools did not register edit_task_definition")
-	}
-	if tool.Policy.Confirmation != ConfirmationRequired ||
-		!tool.Policy.Effects.Has(EffectDurableProposal) ||
-		tool.Policy.Effects.Has(EffectDirectOwnerWrite) {
-		t.Fatal("edit_task_definition must produce exactly one confirmation")
-	}
-	var schema struct {
-		Required []string `json:"required"`
-	}
-	if err := json.Unmarshal(tool.Definition.Parameters, &schema); err != nil {
-		t.Fatalf("tool schema is invalid: %v", err)
-	}
-	if len(schema.Required) != 1 || schema.Required[0] != "task_id" {
-		t.Fatalf("schema required = %v, want task_id only", schema.Required)
-	}
-}
-
-func TestLoop_DefinitionEditProposalUsesControllerNotGenericPending(t *testing.T) {
-	store := newFakeStore()
-	session, err := store.CreateAgentSession(t.Context(), 11)
-	if err != nil {
-		t.Fatal(err)
-	}
-	controller := &fakeDefinitionEditController{}
-	tools := BuildTools(nil, nil, nil, nil, nil, nil, nil, controller)
-	loop := New(Deps{
-		Store: store, Tools: tools, TaskDefinitionEdit: controller,
-	})
-	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
-		return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
-			ID: "call-edit", Name: "edit_task_definition",
-			Arguments: `{"task_id":"task-edit-1","strictness":"strict"}`,
-		}}}, nil
-	}
-
-	out, err := loop.HandleMessage(t.Context(), 11, "把这个任务改严格")
-	if err != nil {
-		t.Fatalf("HandleMessage() error = %v", err)
-	}
-	if out.Confirm == nil || out.Reply == "" {
-		t.Fatalf("outcome = %+v", out)
-	}
-	if len(controller.proposeCalls) != 1 {
-		t.Fatalf("controller Propose calls = %d", len(controller.proposeCalls))
-	}
-	call := controller.proposeCalls[0]
-	if call.UserID != 11 || call.SessionID == nil || *call.SessionID != session.ID ||
-		string(call.RawArgs) != `{"task_id":"task-edit-1","strictness":"strict"}` ||
-		time.Until(call.ExpiresAt) < 23*time.Hour {
-		t.Fatalf("proposal input drifted: %+v", call)
-	}
-	if store.createCalls != 0 {
-		t.Fatalf("definition edit used generic pending action: %d calls", store.createCalls)
-	}
-	if out.Confirm.ActionID != controller.proposeCalls[0].ActionID ||
-		len(controller.confirmCalls) != 0 {
-		t.Fatalf("confirmation card/controller calls drifted: out=%+v confirm=%+v",
-			out, controller.confirmCalls)
-	}
-}
-
-func TestLoop_WebDefinitionEditIsolatesHistoryAndPinsToolAndTask(
-	t *testing.T,
-) {
-	store := newFakeStore()
-	session, err := store.CreateAgentSession(t.Context(), 11)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session.Messages = json.RawMessage(
-		`[{"role":"user","content":"PRIVATE_HISTORY_SENTINEL"}]`,
-	)
-	store.sessions[session.ID].Messages = session.Messages
-	controller := &fakeDefinitionEditController{}
-	tools := BuildTools(nil, nil, nil, nil, nil, nil, nil, controller)
-	loop := New(Deps{
-		Store: store, Tools: tools, TaskDefinitionEdit: controller,
-	})
-	actionID := uuid.NewString()
-	var requests []llm.ChatRequest
-	loop.chatFn = func(
-		_ context.Context,
-		req llm.ChatRequest,
-	) (*llm.ChatResponse, error) {
-		requests = append(requests, req)
-		if len(requests) == 1 {
-			return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
-				ID: "hidden-read", Name: "list_schedules",
-				Arguments: `{}`,
-			}}}, nil
-		}
-		return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
-			ID: "edit", Name: "edit_task_definition",
-			Arguments: `{"task_id":"task-edit-1","strictness":"strict"}`,
-		}}}, nil
-	}
-
-	out, err := loop.HandleTaskDefinitionEditMessage(
-		t.Context(), 11, actionID, "task-edit-1", "改成严格模式",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.Confirm == nil || out.Reply == "" {
-		t.Fatalf("outcome=%+v", out)
-	}
-	if len(requests) != 2 {
-		t.Fatalf("model requests=%d, want bounded retry", len(requests))
-	}
-	for i, req := range requests {
-		if len(req.Tools) != 1 ||
-			req.Tools[0].Name != "edit_task_definition" {
-			t.Fatalf("request %d tools=%+v", i+1, req.Tools)
-		}
-		raw, marshalErr := json.Marshal(req.Messages)
-		if marshalErr != nil {
-			t.Fatal(marshalErr)
-		}
-		if bytes.Contains(raw, []byte("PRIVATE_HISTORY_SENTINEL")) ||
-			bytes.Contains(raw, []byte("hidden-read")) {
-			t.Fatalf("request %d leaked isolated history/protocol: %s", i+1, raw)
-		}
-	}
-	if len(controller.proposeCalls) != 1 ||
-		controller.proposeCalls[0].ActionID != actionID ||
-		string(controller.proposeCalls[0].RawArgs) !=
-			`{"task_id":"task-edit-1","strictness":"strict"}` {
-		t.Fatalf("proposal calls=%+v", controller.proposeCalls)
-	}
-	if out.Confirm.ActionID != actionID || len(controller.confirmCalls) != 0 {
-		t.Fatalf("confirmation card/controller calls drifted: out=%+v confirm=%+v",
-			out, controller.confirmCalls)
-	}
-}
-
-func TestLoop_WebDefinitionEditRejectsMismatchedTaskBeforeController(
-	t *testing.T,
-) {
-	store := newFakeStore()
-	controller := &fakeDefinitionEditController{}
-	tools := BuildTools(nil, nil, nil, nil, nil, nil, nil, controller)
-	loop := New(Deps{
-		Store: store, Tools: tools, TaskDefinitionEdit: controller,
-	})
-	loop.chatFn = func(
-		context.Context,
-		llm.ChatRequest,
-	) (*llm.ChatResponse, error) {
-		return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
-			ID: "edit", Name: "edit_task_definition",
-			Arguments: `{"task_id":"another-task","strictness":"strict"}`,
-		}}}, nil
-	}
-
-	out, err := loop.HandleTaskDefinitionEditMessage(
-		t.Context(), 11, uuid.NewString(), "task-edit-1", "改成严格模式",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.Confirm != nil ||
-		out.Reply != replyTaskDefinitionEditNotCreated ||
-		len(controller.proposeCalls) != 0 {
-		t.Fatalf(
-			"outcome=%+v propose=%+v",
-			out, controller.proposeCalls,
-		)
-	}
-}
-
-func TestLoop_WebCreationUsesTrustedActionIdentity(t *testing.T) {
-	store := newFakeStore()
-	controller := &fakeCreationController{}
-	tools := BuildTools(nil, nil, nil, nil, nil, nil, nil)
-	loop := New(Deps{
-		Store: store, Tools: tools, TaskCreation: controller,
-	})
-	loop.chatFn = func(
-		context.Context,
-		llm.ChatRequest,
-	) (*llm.ChatResponse, error) {
-		return &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
-			ID: "create", Name: "create_schedule",
-			Arguments: `{"spec":{"cron":"0 8 * * *","tz":"Asia/Shanghai"},` +
-				`"intent":"每天追踪官方更新","approved_fetch_plan":{"source_specs":{` +
-				`"version":"vane.source-specs/v1","items":[{"kind":"web_search",` +
-				`"query":"官方更新"}]}}}`,
-		}}}, nil
-	}
-	actionID := uuid.NewString()
-	out, err := loop.HandleTaskCreationMessage(
-		t.Context(), 11, actionID,
-		"确认创建，直接生成确认卡。任务需求：每天追踪官方更新",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.Confirm == nil || len(controller.proposeCalls) != 1 ||
-		controller.proposeCalls[0].ActionID != actionID {
-		t.Fatalf(
-			"outcome=%+v calls=%+v",
-			out, controller.proposeCalls,
-		)
-	}
-	if out.Confirm.ActionID != actionID || len(controller.confirmCalls) != 0 {
-		t.Fatalf("confirmation card/controller calls drifted: out=%+v confirm=%+v",
-			out, controller.confirmCalls)
-	}
-}
-
-func TestLoop_DefinitionEditConfirmAndCancelDoNotDowngradeErrors(t *testing.T) {
-	receipt := task.CreationReceiptTarget{
-		Provider: "feishu_card_patch/app", Target: "om_original",
-	}
-	target := task.TaskDefinitionEditReceiptTarget{
-		Provider: receipt.Provider, Target: receipt.Target,
-	}
-	t.Run("confirm routes to edit controller", func(t *testing.T) {
-		store := newFakeStore()
-		session, err := store.CreateAgentSession(t.Context(), 11)
-		if err != nil {
-			t.Fatal(err)
-		}
-		controller := &fakeDefinitionEditController{
-			confirm: task.TaskDefinitionEditOutcome{
-				OperationID: "edit-1", TaskID: "task-edit-1",
-				SessionID: session.ID, ReceiptBound: true,
-				Status: types.TaskDefinitionEditOperationStatusCompleted,
-			},
-		}
-		loop := New(Deps{Store: store, TaskDefinitionEdit: controller})
-		out, err := loop.ExecuteActionWithReceipt(
-			t.Context(), 11, "edit-1", receipt,
-		)
-		if err != nil {
-			t.Fatalf("ExecuteActionWithReceipt() error = %v", err)
-		}
-		if len(controller.confirmCalls) != 1 ||
-			controller.confirmCalls[0].receipt != target ||
-			store.claimCalls != 0 || !strings.Contains(out.Text, "最终结果") ||
-			!out.DurableReceipt || out.PreserveCard {
-			t.Fatalf("confirm routing drifted: calls=%+v outcome=%+v claim=%d",
-				controller.confirmCalls, out, store.claimCalls)
-		}
-		if store.appendCount() != 0 {
-			t.Fatalf("terminal session fact must be owned by outbox, appends=%d",
-				store.appendCount())
-		}
-	})
-
-	t.Run("cancel routes to edit controller", func(t *testing.T) {
-		store := newFakeStore()
-		controller := &fakeDefinitionEditController{
-			cancel: task.TaskDefinitionEditOutcome{
-				OperationID: "edit-2", TaskID: "task-edit-1",
-				Status:       types.TaskDefinitionEditOperationStatusCancelled,
-				ReceiptBound: true,
-			},
-		}
-		loop := New(Deps{Store: store, TaskDefinitionEdit: controller})
-		out, err := loop.CancelActionWithReceipt(
-			t.Context(), 11, "edit-2", receipt,
-		)
-		if err != nil {
-			t.Fatalf("CancelActionWithReceipt() error = %v", err)
-		}
-		if len(controller.cancelCalls) != 1 ||
-			controller.cancelCalls[0].receipt != target ||
-			store.claimCalls != 0 || !strings.Contains(out.Text, "已取消") ||
-			!out.DurableReceipt || out.PreserveCard {
-			t.Fatalf("cancel routing drifted: calls=%+v outcome=%+v claim=%d",
-				controller.cancelCalls, out, store.claimCalls)
-		}
-	})
-
-	t.Run("infrastructure failure never reaches creation or legacy", func(t *testing.T) {
-		store := newFakeStore()
-		store.actions["edit-broken"] = &types.PendingAction{
-			ID: "edit-broken", UserID: 11, ToolName: "remove_schedule",
-			Status:    types.PendingActionStatusPending,
-			ExpiresAt: time.Now().Add(time.Hour),
-		}
-		boom := types.NewAppError(types.CodeDatabase, "read failed", nil)
-		controller := &fakeDefinitionEditController{confirmErr: boom}
-		creation := &fakeCreationController{
-			confirmErr: task.ErrCreationOperationNotFound,
-		}
-		loop := New(Deps{
-			Store: store, TaskDefinitionEdit: controller, TaskCreation: creation,
-		})
-		if _, err := loop.ExecuteActionWithReceipt(
-			t.Context(), 11, "edit-broken", receipt,
-		); !errors.Is(err, boom) {
-			t.Fatalf("error = %v, want infrastructure failure", err)
-		}
-		if len(creation.confirmCalls) != 1 || store.claimCalls != 0 {
-			t.Fatalf("routing/downgrade drifted: creation=%d legacy=%d",
-				len(creation.confirmCalls), store.claimCalls)
-		}
-	})
-
-	t.Run("cancel infrastructure failure never reaches legacy", func(t *testing.T) {
-		store := newFakeStore()
-		store.actions["edit-cancel-broken"] = &types.PendingAction{
-			ID: "edit-cancel-broken", UserID: 11,
-			ToolName:  "remove_schedule",
-			Status:    types.PendingActionStatusPending,
-			ExpiresAt: time.Now().Add(time.Hour),
-		}
-		boom := types.NewAppError(types.CodeDatabase, "cancel read failed", nil)
-		controller := &fakeDefinitionEditController{cancelErr: boom}
-		creation := &fakeCreationController{
-			cancelErr: task.ErrCreationOperationNotFound,
-		}
-		loop := New(Deps{
-			Store: store, TaskDefinitionEdit: controller, TaskCreation: creation,
-		})
-		if _, err := loop.CancelActionWithReceipt(
-			t.Context(), 11, "edit-cancel-broken", receipt,
-		); !errors.Is(err, boom) {
-			t.Fatalf("error = %v, want infrastructure failure", err)
-		}
-		if len(creation.cancelCalls) != 1 ||
-			store.actions["edit-cancel-broken"].Status !=
-				types.PendingActionStatusPending {
-			t.Fatalf("cancel error downgraded: creation=%d status=%s",
-				len(creation.cancelCalls),
-				store.actions["edit-cancel-broken"].Status)
-		}
-	})
+	return f.execute, f.executeErr
 }
 
 type fakeDefinitionEditReceiptSessionStore struct {
@@ -452,6 +67,38 @@ type fakeDefinitionEditReceiptSessionStore struct {
 	calls    int
 	lease    types.TaskDefinitionEditReceiptLease
 	messages json.RawMessage
+}
+
+func TestDirectTaskDefinitionEditPreservesTargetedClarification(t *testing.T) {
+	fs := newFakeStore()
+	controller := &fakeDefinitionEditController{}
+	loop := New(Deps{
+		Store:              fs,
+		TaskDefinitionEdit: controller,
+		Model:              "test-model",
+		MaxTurns:           4,
+		SessionTTL:         30 * time.Minute,
+	})
+	loop.chatFn = func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+		return &llm.ChatResponse{
+			Content: "你说的“减少推送”是改为每周一次，还是保留频率但只推重大事件？",
+		}, nil
+	}
+	out, err := loop.HandleTaskDefinitionEditMessage(
+		t.Context(), 7,
+		"beff990d-9ed6-4a5d-8f72-9e6987516dda",
+		"task-edit-1",
+		"减少这个任务的推送",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply != "你说的“减少推送”是改为每周一次，还是保留频率但只推重大事件？" {
+		t.Fatalf("针对性编辑澄清被改写: %q", out.Reply)
+	}
+	if len(controller.proposeCalls) != 0 || len(controller.executeCalls) != 0 {
+		t.Fatal("澄清问题不得产生定义编辑副作用")
+	}
 }
 
 func (s *fakeDefinitionEditReceiptSessionStore) RecordTaskDefinitionEditReceiptSessionMessages(
@@ -478,7 +125,8 @@ func TestRecordDefinitionEditReceiptSessionUsesAgentUserLock(t *testing.T) {
 	messages := json.RawMessage(
 		`[{"role":"user","content":"[卡片回调] fixed edit fact"}]`,
 	)
-	userMu := loop.lockForUser(7)
+	muValue, _ := loop.userMu.LoadOrStore(int64(7), newUserTurnLock())
+	userMu := muValue.(*userTurnLock)
 	if err := userMu.Lock(t.Context()); err != nil {
 		t.Fatal(err)
 	}
