@@ -84,7 +84,7 @@ func (s EventEvidenceSourceV1) Validate(index int) error {
 		s.ContentItemID <= 0 ||
 		s.Metadata.Ref != "source-"+strconv.Itoa(index+1) ||
 		s.Metadata.Validate() != nil ||
-		!validStructuredText(s.EvidenceText, maxStructuredBodyBytes, true) {
+		!validStructuredText(s.EvidenceText, maxStructuredBodyBytes, false) {
 		return errors.New("structured event evidence source is invalid")
 	}
 	return nil
@@ -123,6 +123,12 @@ func (cg *CardGen) GenerateStructuredWithPolicyV2(
 		return StructuredInsightV1{},
 			fmt.Errorf("%w: cardgen policy v2 is not prepared", runtimepolicy.ErrInvalidPolicy)
 	}
+	evidence := StructuredEvidenceTextV1(item.Item)
+	if !validStructuredText(evidence, maxStructuredBodyBytes, false) {
+		return StructuredInsightV1{}, types.NewAppError(
+			types.CodeValidation,
+			"structured CardGen evidence is invalid", nil)
+	}
 	raw, err := cg.generateResponse(
 		ctx, tenantID, userID, item, traceID, taskInstruction,
 		policy.execution, beforeSpend, buildStructuredCardUserV1,
@@ -131,7 +137,7 @@ func (cg *CardGen) GenerateStructuredWithPolicyV2(
 		return StructuredInsightV1{}, err
 	}
 	insight, err := ParseStructuredInsightV1([]byte(raw), map[string]string{
-		"source-1": StructuredEvidenceTextV1(item.Item),
+		"source-1": evidence,
 	})
 	if err != nil {
 		return StructuredInsightV1{}, types.NewAppError(
