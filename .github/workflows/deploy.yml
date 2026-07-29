@@ -55,6 +55,7 @@ jobs:
           trap 'rm -rf -- "$secret_dir"' EXIT
 
           ssh-keyscan -t ed25519 github.com 2>/dev/null |
+            awk '$1 == "github.com" && $2 == "ssh-ed25519" && NF == 3' |
             sort -u >"$secret_dir/known_hosts"
           [[ $(wc -l <"$secret_dir/known_hosts") -eq 1 ]]
           fingerprint=$(

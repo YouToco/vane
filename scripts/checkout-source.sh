@@ -41,6 +41,7 @@ printf '%s\n' "$SOURCE_READ_KEY" >"$checkout_secret_dir/id"
 chmod 600 "$checkout_secret_dir/id"
 
 ssh-keyscan -t ed25519 github.com 2>/dev/null |
+  awk '$1 == "github.com" && $2 == "ssh-ed25519" && NF == 3' |
   sort -u >"$checkout_secret_dir/known_hosts"
 [[ $(wc -l <"$checkout_secret_dir/known_hosts") -eq 1 ]] || {
   echo "expected exactly one GitHub Ed25519 host key" >&2
