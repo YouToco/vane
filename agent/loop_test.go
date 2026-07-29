@@ -1745,7 +1745,7 @@ func TestHandleMessage_ExplicitTaskConfirmationPreservesObservationPolicy(t *tes
 	}
 }
 
-func TestNormalizeDirectTaskCreationArgs_ObservationPolicyBoundary(t *testing.T) {
+func TestNormalizeTaskCreationArgs_ObservationPolicyBoundary(t *testing.T) {
 	const base = `{"spec":{"cron":"0 9 * * 1","tz":"Asia/Shanghai"},` +
 		`"intent":"监控官方更新","approved_fetch_plan":{` +
 		`"version":"vane.source-specs/v1","items":[{` +
@@ -1764,11 +1764,59 @@ func TestNormalizeDirectTaskCreationArgs_ObservationPolicyBoundary(t *testing.T)
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, ok := normalizeDirectTaskCreationArgs(json.RawMessage(tt.args))
+			_, ok := normalizeTaskCreationArgs(json.RawMessage(tt.args))
 			if ok != tt.ok {
-				t.Fatalf("normalizeDirectTaskCreationArgs() ok=%v, want %v", ok, tt.ok)
+				t.Fatalf("normalizeTaskCreationArgs() ok=%v, want %v", ok, tt.ok)
 			}
 		})
+	}
+}
+
+func TestHandleMessage_ContextualCreateAcceptsFlatFetchPlan(t *testing.T) {
+	const request = "刚才服务重启中断了。现在请创建 B5无卡批删验收乙，每12小时检查 IANA 页面变化。"
+	const args = `{"spec":{"every_seconds":43200},` +
+		`"intent":"持续监控 IANA 保留域名页面变化，有变化才推送",` +
+		`"approved_fetch_plan":{"version":"vane.source-specs/v1","items":[{` +
+		`"kind":"web_contents","page_url":"https://www.iana.org/domains/reserved"}]},` +
+		`"nl_description":"B5无卡批删验收乙：每12小时检查 IANA 页面变化"}`
+
+	fs := newFakeStore()
+	create := &fakeTool{name: "create_schedule", mutating: true}
+	creation := &fakeCreationController{
+		proposeResult: task.CreationProposal{Summary: "IANA 页面变化任务"},
+	}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		ToolCalls: []llm.ToolCall{{
+			ID: "contextual-create", Name: "create_schedule", Arguments: args,
+		}},
+		FinishReason: "tool_calls",
+	}}}
+	l := newTestLoop(t, fs, chat.fn, create)
+	l.taskCreation = creation
+	if isDirectTaskCreationConfirmation(request) {
+		t.Fatal("测试前提失效：带上下文请求必须覆盖普通对话路径")
+	}
+
+	out, err := l.HandleMessage(t.Context(), 7, request)
+	if err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if out.Confirm != nil || len(creation.proposeCalls) != 1 ||
+		len(creation.confirmCalls) != 1 {
+		t.Fatalf("带上下文的明确创建应一次直达 durable 执行: out=%+v propose=%d confirm=%d",
+			out, len(creation.proposeCalls), len(creation.confirmCalls))
+	}
+	var proposed struct {
+		ApprovedFetchPlan struct {
+			SourceSpecs json.RawMessage `json:"source_specs"`
+		} `json:"approved_fetch_plan"`
+	}
+	if err := json.Unmarshal(creation.proposeCalls[0].RawArgs, &proposed); err != nil {
+		t.Fatalf("Propose RawArgs 非法: %v", err)
+	}
+	if len(proposed.ApprovedFetchPlan.SourceSpecs) == 0 {
+		t.Fatalf("普通对话扁平 approved_fetch_plan 未规范化: %s",
+			creation.proposeCalls[0].RawArgs)
 	}
 }
 
