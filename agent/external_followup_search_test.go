@@ -280,13 +280,29 @@ func TestRenderGroundedReplyCitationsMakesBareEvidenceLinksVisible(
 ) {
 	const official = "https://openai.com/index/introducing-gpt-live/"
 	evidence := []externalFollowupSearchEvidence{{URL: official}}
+	body := "官方说明：" + official + "。\n" +
+		"已有链接：[OpenAI](" + official + ` "official")` + "\n" +
+		"引用链接：[OpenAI][src]\n[src]: " + official + "\n" +
+		"代码：`" + official + "`"
 	got := renderGroundedReplyCitations(
-		"官方说明："+official+"。\n"+
-			"已有链接：[OpenAI](https://openai.com/index/introducing-gpt-live/)",
+		body,
 		evidence,
 	)
-	if want := "官方说明：[来源 · openai.com](" + official + ")。\n" +
-		"已有链接：[OpenAI](" + official + ")"; got != want {
+	if want := body + "\n\n**来源**\n- [来源 · openai.com](" +
+		official + ")"; got != want {
+		t.Fatalf("rendered reply = %q, want %q", got, want)
+	}
+}
+
+func TestRenderGroundedReplyCitationsPreservesExactEvidenceURL(t *testing.T) {
+	const exact = "https://example.com/query?"
+	got := renderGroundedReplyCitations(
+		"证据：`"+exact+"`",
+		[]externalFollowupSearchEvidence{{URL: exact}, {URL: exact}},
+	)
+	want := "证据：`" + exact + "`\n\n**来源**\n- [来源 · example.com](" +
+		exact + ")"
+	if got != want {
 		t.Fatalf("rendered reply = %q, want %q", got, want)
 	}
 }

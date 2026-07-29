@@ -30,7 +30,7 @@ const (
 )
 
 var (
-	externalFollowupURLPattern            = regexp.MustCompile(`https?://[^\s<>"'）)\]]+`)
+	externalFollowupURLPattern            = regexp.MustCompile(`https?://[^\s<>"'\x60）)\]]+`)
 	externalFollowupAuthorityTokenPattern = regexp.MustCompile(
 		`(?i)\b(?:openai|chatgpt|anthropic|claude|google|gemini|microsoft|azure|kimi|neox|deepseek|cohere|xai|mistral)\b`,
 	)
@@ -364,69 +364,44 @@ func externalFollowupReplyGrounded(
 // renderGroundedReplyCitations makes already-validated citations visible in
 // Feishu card markdown. Feishu may omit a standalone bare URL from the rendered
 // card even though the grounding gate correctly found it in the model output.
-// Only exact structured evidence URLs are rewritten; existing Markdown links
-// and autolinks remain byte-for-byte unchanged.
+// Preserve the model body byte-for-byte and append links built from exact
+// structured evidence URLs. This cannot corrupt inline/reference Markdown,
+// titled links, or URLs that the model put inside code spans.
 func renderGroundedReplyCitations(
 	reply string,
 	evidence []externalFollowupSearchEvidence,
 ) string {
-	allowed := make(map[string]string, len(evidence))
+	cited := make(map[string]struct{})
+	for _, raw := range externalFollowupURLs(reply) {
+		if normalized := normalizeExternalFollowupURL(raw); normalized != "" {
+			cited[normalized] = struct{}{}
+		}
+	}
+	if len(cited) == 0 {
+		return reply
+	}
+
+	links := make([]string, 0, len(evidence))
+	seen := make(map[string]struct{}, len(evidence))
 	for _, item := range evidence {
-		normalized := normalizeExternalFollowupURL(item.URL)
-		if normalized == "" {
+		exact := strings.TrimSpace(item.URL)
+		normalized := normalizeExternalFollowupURL(exact)
+		if exact == "" || normalized == "" {
 			continue
 		}
-		allowed[normalized] = groundedCitationLabel(normalized)
-	}
-	if len(allowed) == 0 {
-		return reply
-	}
-
-	indexes := externalFollowupURLPattern.FindAllStringIndex(reply, -1)
-	if len(indexes) == 0 {
-		return reply
-	}
-	var out strings.Builder
-	out.Grow(len(reply) + len(indexes)*16)
-	last := 0
-	for _, index := range indexes {
-		start, end := index[0], index[1]
-		raw := reply[start:end]
-		normalized := normalizeExternalFollowupURL(raw)
-		label, ok := allowed[normalized]
-		if !ok || groundedCitationAlreadyLinked(reply, start, end) {
+		if _, ok := cited[normalized]; !ok {
 			continue
 		}
-		out.WriteString(reply[last:start])
-		out.WriteByte('[')
-		out.WriteString(label)
-		out.WriteString("](")
-		out.WriteString(normalized)
-		out.WriteByte(')')
-		out.WriteString(strings.TrimPrefix(raw, normalized))
-		last = end
+		if _, ok := seen[exact]; ok {
+			continue
+		}
+		seen[exact] = struct{}{}
+		links = append(links, "- ["+groundedCitationLabel(exact)+"]("+exact+")")
 	}
-	if last == 0 {
+	if len(links) == 0 {
 		return reply
 	}
-	out.WriteString(reply[last:])
-	return out.String()
-}
-
-func groundedCitationAlreadyLinked(reply string, start, end int) bool {
-	if start >= 2 && reply[start-2:start] == "](" &&
-		end < len(reply) && reply[end] == ')' {
-		return true
-	}
-	if start > 0 && end < len(reply) {
-		if reply[start-1] == '<' && reply[end] == '>' {
-			return true
-		}
-		if reply[start-1] == '[' && reply[end] == ']' {
-			return true
-		}
-	}
-	return false
+	return reply + "\n\n**来源**\n" + strings.Join(links, "\n")
 }
 
 func groundedCitationLabel(rawURL string) string {
