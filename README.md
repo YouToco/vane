@@ -102,9 +102,10 @@ All runner registrations are repository-scoped and implement three roles:
 The optional Windows WSL2 build runner uses the same `vane-build` trust role
 without production secrets. Its systemd service must use a dedicated `HOME`
 under the runner directory, a Linux-only `PATH`, and make Windows mounts such
-as `/mnt/c` and `/mnt/d` inaccessible. This keeps trusted exact-`main` builds
-from inheriting workstation credentials while providing an X64 fallback when
-the ARM64 build runner is unavailable.
+as `/mnt/c` and `/mnt/d` inaccessible. Install `build-essential` so Go race
+tests retain CGO support. This keeps trusted exact-`main` builds from inheriting
+workstation credentials while providing an X64 fallback when the ARM64 build
+runner is unavailable.
 
 Wrangler and its Node runtime are provisioned out-of-band on the deploy VM.
 [`tools/wrangler/package-lock.json`](tools/wrangler/package-lock.json) pins the
