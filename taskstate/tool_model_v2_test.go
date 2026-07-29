@@ -141,6 +141,28 @@ func TestApprovedDefinitionV2ReaderRetainsRetiredTools(t *testing.T) {
 	}
 }
 
+func TestApprovedDefinitionV2WriteRejectsSecretToolArguments(t *testing.T) {
+	call, err := BuildToolInvocationV1(
+		"web_search", "v1",
+		json.RawMessage(`{"query":"AI","api_key":"SECRET-CANARY"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = BuildApprovedDefinitionV2(ApprovedDefinitionInputV2{
+		TenantID: 1, UserID: 2, TaskID: "secret-arguments",
+		SpecJSON: json.RawMessage(`{}`), ScopeJSON: json.RawMessage(`{}`),
+		NLDescription: "monitor AI",
+		TaskManual:    "monitor AI", Strictness: types.StrictnessNormal,
+		ToolCalls:      []ToolInvocationV1{call},
+		ExecutionMode:  types.ExecutionModeCompiled,
+		DeliveryPolicy: DeliveryPolicyOwnerFeishu,
+		BudgetPolicy:   BudgetPolicyInheritTenantQuota,
+	})
+	if !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("secret Tool arguments were accepted: %v", err)
+	}
+}
+
 func TestAdaptiveStateV2IsInvocationDigestScopedAndCanonical(t *testing.T) {
 	left, err := BuildToolInvocationV1("x_user_posts", "v1",
 		json.RawMessage(`{"screen_name":"openai"}`))

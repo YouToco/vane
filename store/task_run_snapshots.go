@@ -734,6 +734,23 @@ func validateStoredTaskRunSnapshot(
 	snapshot *taskRunSnapshot,
 	p CreateOrGetTaskRunSnapshotParams,
 ) error {
+	if snapshot == nil {
+		return taskRunIntegrityError()
+	}
+	switch snapshot.ReferenceSchemaVersion {
+	case taskRunReferenceSchemaVersionV1:
+		return validateStoredTaskRunSnapshotV1(snapshot, p)
+	case types.RunSnapshotSchemaVersionV2:
+		return validateStoredTaskRunSnapshotV2(snapshot, p)
+	default:
+		return taskRunIntegrityError()
+	}
+}
+
+func validateStoredTaskRunSnapshotV1(
+	snapshot *taskRunSnapshot,
+	p CreateOrGetTaskRunSnapshotParams,
+) error {
 	if snapshot == nil || snapshot.CreatedAt.IsZero() {
 		return taskRunIntegrityError()
 	}

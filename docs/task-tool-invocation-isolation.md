@@ -66,6 +66,19 @@ will execute inside the existing immutable run snapshot. Content observation
 and evidence records point to the run snapshot plus invocation digest, not to
 a new Tool-call entity or a mutable global row.
 
+The freeze contains two separate layers:
+
+1. a logical binding of Tool name/version to platform, capability, output kind
+   and allowed implementation contract;
+2. the selected runtime capability, including its implementation revision and
+   opaque credential generation references.
+
+Current write validation uses the exact Tool argument decoder and rejects
+unknown fields, duplicate keys, explicit invalid nulls and credential-shaped
+extras before approval. Frozen readers validate the persisted logical binding
+without consulting the mutable current Tool registry, so a retired Tool
+remains replayable but cannot be selected for a new definition.
+
 ## Cutover sequence
 
 1. **Containment.** Compiled runs stop reading and writing global due/health

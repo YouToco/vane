@@ -91,6 +91,23 @@ Historical snapshots never consult the current Tool definitions. A current
 Tool may change only by creating a new versioned route; it cannot reinterpret
 old snapshot bytes.
 
+The wire boundary is explicitly split:
+
+- retained Source execution uses `vane.run-snapshot-ref/v1` and the frozen
+  `RunSnapshotRef` reader;
+- Source-free Tool execution uses `vane.run-snapshot-ref/v2` and the distinct
+  `RunSnapshotRefV2` type.
+
+A V1-only authorization/effect path must never accept the V2 Go type. The V2
+payload freezes the Approved version/digest, Adaptive version/digest and its
+exact Approved basis, plus one logical Tool contract and selected runtime
+capability per invocation. The capability includes implementation revision and
+opaque credential generation references, never credential values.
+
+Migration 075 separates database admission as well: ref/v1 retains the old
+shadow marker/sidecar fence, while ref/v2 requires an active Approved V2 head
+and the exact current Adaptive V2 basis and writes no legacy shadow.
+
 Every accepted content item and every delivery must trace to:
 
 ```text

@@ -6,6 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
 
@@ -97,6 +98,26 @@ func (s *Store) ControlTaskRunSnapshotCutover(
 		return TaskRunSnapshotCutoverResult{}, types.NewAppError(
 			types.CodeConflict,
 			"task run snapshot cutover conflicts with a definition edit",
+			nil,
+		)
+	}
+	var approvedSchema *string
+	if err := tx.QueryRow(ctx,
+		`SELECT d.schema_version
+		   FROM schedules s
+		   LEFT JOIN task_approved_definition_versions d
+		     ON d.tenant_id=s.tenant_id AND d.user_id=s.user_id
+		    AND d.task_id=s.id AND d.version=s.approved_definition_version
+		    AND d.definition_digest=s.approved_definition_digest
+		  WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.id=$3`,
+		tenantID, userID, taskID).Scan(&approvedSchema); err != nil {
+		return TaskRunSnapshotCutoverResult{}, taskRunIntegrityError()
+	}
+	if approvedSchema != nil &&
+		*approvedSchema == taskstate.ApprovedDefinitionSchemaVersionV2 {
+		return TaskRunSnapshotCutoverResult{}, types.NewAppError(
+			types.CodeConflict,
+			"legacy snapshot shadow cutover does not apply to Tool runtime tasks",
 			nil,
 		)
 	}
@@ -299,8 +320,9 @@ func strictAuditTaskRunSnapshotCutoverV2(
 		`SELECT id,temporal_workflow_id,temporal_run_id
 		   FROM task_run_snapshots
 		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3
+		    AND reference_schema_version=$4
 		  ORDER BY id`,
-		tenantID, userID, taskID)
+		tenantID, userID, taskID, taskRunReferenceSchemaVersionV1)
 	if err != nil {
 		return taskRunDatabaseError(
 			"freeze snapshot cutover typed audit", err)

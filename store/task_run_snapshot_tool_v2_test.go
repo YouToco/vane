@@ -1,0 +1,381 @@
+package store
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/taskstate"
+	"github.com/YouToco/vane/types"
+)
+
+func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
+	t *testing.T,
+) {
+	st := tenantTestStore(t)
+	f := newCompiledTaskFixture(t, st)
+	cleanupA5Fixture(t, st, f)
+	query := "snapshot-v2-" + uuid.NewString()
+	target := validA5PlanSource(t, query, "Source-free snapshot Tool")
+	target.ToolName = "web_search"
+	target.ToolArgs = json.RawMessage(`{"query":"` + query + `"}`)
+	creation := preparedA5CommitWithSources(
+		t, st, f, "snapshot-tool-v2", target)
+	ctx := t.Context()
+
+	if err := st.CommitPausedCompiledTaskDefinitionForCreation(
+		ctx, creation); err != nil {
+		t.Fatalf("commit Source-free task: %v", err)
+	}
+	started, err := st.BeginTaskCreationActivation(
+		ctx, creation.Lease, creation.Definition.TaskID)
+	if err != nil || !started {
+		t.Fatalf("begin Source-free task activation: started=%v err=%v", started, err)
+	}
+	if err := st.CommitTaskCreationActivation(
+		ctx, creation.Lease, creation.Definition.TaskID); err != nil {
+		t.Fatalf("activate Source-free task: %v", err)
+	}
+	if err := st.CompleteTaskCreationOperation(
+		ctx, creation.Lease, creation.Definition.TaskID,
+		json.RawMessage(`{"created":true}`)); err != nil {
+		t.Fatalf("complete Source-free task: %v", err)
+	}
+
+	policy := testCompiledRunPolicyV1(t)
+	identity := types.RunIdentity{
+		TemporalWorkflowID: scheduledTaskWorkflowID(creation.Definition.TaskID),
+		TemporalRunID:      uuid.NewString(),
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           creation.Lease.TenantID,
+		UserID:             creation.Lease.UserID,
+		TaskID:             creation.Definition.TaskID,
+	}
+	ref, err := st.CreateOrGetCompiledRunSnapshotV2(
+		ctx, identity, policy, observation.RolloutAuthority)
+	if err != nil {
+		t.Fatalf("create Source-free run snapshot: %v", err)
+	}
+	if ref.SchemaVersion != types.RunSnapshotSchemaVersionV2 ||
+		ref.AdaptiveVersion != 1 || ref.PlannerBudget != (types.PlannerBudget{}) ||
+		ref.ValidateFor(identity) != nil {
+		t.Fatalf("Source-free run reference differs: %+v", ref)
+	}
+	assertToolRunSnapshotV2AdmissionRejects(t, st, identity, ref.SnapshotID,
+		"non-v2 adaptive schema",
+		`UPDATE task_adaptive_states
+		    SET schema_version='vane.task-adaptive-state/not-v2'
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`,
+		types.ExecutionModeCompiled)
+	assertToolRunSnapshotV2AdmissionRejects(t, st, identity, ref.SnapshotID,
+		"adaptive state with legacy fallback",
+		`UPDATE task_adaptive_states
+		    SET last_known_good_definition_version=basis_definition_version
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`,
+		types.ExecutionModeCompiled)
+	assertToolRunSnapshotV2AdmissionRejects(t, st, identity, ref.SnapshotID,
+		"non-compiled snapshot mode", "", types.ExecutionModeDiscoverAtRun)
+	tx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id',$1,true)`,
+		fmt.Sprintf("%d", identity.TenantID)); err != nil {
+		t.Fatal(err)
+	}
+	var legacyPointer int64
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO task_run_snapshot_v2_cutover_events (
+			tenant_id,user_id,task_id,generation,action,
+			approved_definition_version,approved_definition_digest,
+			snapshot_high_watermark,audit_from_snapshot_id,
+			audit_count,audit_through_id
+		 ) VALUES ($1,$2,$3,1,'activate',1,$4,$5,$5,1,$5)
+		 RETURNING id`,
+		identity.TenantID, identity.UserID, identity.TaskID,
+		ref.DefinitionDigest, ref.SnapshotID).Scan(&legacyPointer); err != nil {
+		t.Fatalf("seed legacy cutover pointer event: %v", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE schedules SET run_snapshot_cutover_event_id=$4
+		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+		identity.TenantID, identity.UserID, identity.TaskID,
+		legacyPointer); err != nil {
+		t.Fatalf("attach legacy cutover pointer: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ControlTaskRunSnapshotCutover(
+		ctx, identity.TenantID, identity.UserID, identity.TaskID,
+		TaskRunSnapshotCutoverRollback); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("legacy cutover accepted a Tool runtime task: %v", err)
+	}
+
+	approved, err := st.GetCurrentToolApprovedDefinition(
+		ctx, identity.TenantID, identity.UserID, identity.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adaptive, err := st.GetToolAdaptiveStateForDefinition(
+		ctx, identity.TenantID, identity.UserID, identity.TaskID,
+		ApprovedDefinitionFence{Version: approved.Version, Digest: approved.Digest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adaptive.State.InvocationStates[0].Cursor =
+		json.RawMessage(`{"next":"live-state-after-snapshot"}`)
+	adaptivePayload, err := taskstate.EncodeAdaptiveStateV2(adaptive.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE task_adaptive_states
+		    SET version=2, payload=$4, payload_digest=$5
+		  WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3`,
+		identity.TenantID, identity.UserID, identity.TaskID,
+		adaptivePayload, digestTaskStatePayload(adaptivePayload)); err != nil {
+		t.Fatalf("mutate live adaptive state: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE schedule_playbooks SET content='live manual changed after snapshot'
+		  WHERE schedule_id=$1`, identity.TaskID); err != nil {
+		t.Fatalf("mutate live task manual: %v", err)
+	}
+	changedPolicy := testCompiledRunPolicyV1(t)
+	changedPolicy.CapabilityCatalog.Allowed[0].CredentialRef.Generation = 9
+	changedPolicy.ModelPolicy.CredentialRef.Generation = 9
+	changedPolicy.ModelPolicy.Endpoint.Generation = 9
+	replayed, err := st.CreateOrGetCompiledRunSnapshotV2(
+		ctx, identity, changedPolicy, observation.RolloutOff)
+	if err != nil || replayed != ref {
+		t.Fatalf("exact RunID replay changed snapshot: ref=%+v err=%v",
+			replayed, err)
+	}
+	nextIdentity := identity
+	nextIdentity.TemporalRunID = uuid.NewString()
+	nextRef, err := st.CreateOrGetCompiledRunSnapshotV2(
+		ctx, nextIdentity, changedPolicy, observation.RolloutOff)
+	if err != nil || nextRef.AdaptiveVersion != 2 {
+		t.Fatalf("Tool run after legacy pointer failed: ref=%+v err=%v",
+			nextRef, err)
+	}
+	purgeTx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := purgeTx.Exec(ctx,
+		`SELECT 1 FROM schedules
+		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3 FOR UPDATE`,
+		identity.TenantID, identity.UserID, identity.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	blockedIdentity := identity
+	blockedIdentity.TemporalRunID = uuid.NewString()
+	snapshotResult := make(chan error, 1)
+	go func() {
+		_, createErr := st.CreateOrGetCompiledRunSnapshotV2(
+			context.Background(), blockedIdentity, changedPolicy,
+			observation.RolloutOff)
+		snapshotResult <- createErr
+	}()
+	waiting := false
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		var count int
+		if err := st.pool.QueryRow(ctx,
+			`SELECT count(*)
+			   FROM pg_stat_activity
+			  WHERE datname=current_database()
+			    AND pid<>pg_backend_pid()
+			    AND wait_event_type='Lock'
+			    AND query LIKE '%JOIN task_approved_definition_versions d%'`,
+		).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count > 0 {
+			waiting = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waiting {
+		_ = purgeTx.Rollback(ctx)
+		t.Fatal("snapshot writer did not reach the schedule lock pause point")
+	}
+	deleteCtx, cancelDelete := context.WithTimeout(ctx, time.Second)
+	_, deleteErr := purgeTx.Exec(deleteCtx,
+		`DELETE FROM memberships WHERE tenant_id=$1 AND user_id=$2`,
+		identity.TenantID, identity.UserID)
+	cancelDelete()
+	if deleteErr != nil {
+		_ = purgeTx.Rollback(ctx)
+		t.Fatalf("snapshot held membership before schedule and can deadlock purge: %v",
+			deleteErr)
+	}
+	if err := purgeTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case createErr := <-snapshotResult:
+		if createErr != nil {
+			t.Fatalf("snapshot did not resume after purge rollback: %v", createErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("snapshot remained blocked after purge rollback")
+	}
+
+	recovered, found, err := st.LoadCompiledRunSnapshotRefV2(ctx, identity)
+	if err != nil || !found || recovered != ref {
+		t.Fatalf("recover Source-free ref: ref=%+v found=%v err=%v",
+			recovered, found, err)
+	}
+	compiled, err := st.LoadCompiledTaskRunSnapshotV2(ctx, identity, ref)
+	if err != nil {
+		t.Fatalf("load Source-free compiled snapshot: %v", err)
+	}
+	if compiled.DefinitionVersion != 1 || compiled.AdaptiveVersion != 1 ||
+		compiled.AdaptiveBasisDefinitionVersion !=
+			compiled.DefinitionVersion ||
+		compiled.AdaptiveBasisDefinitionDigest != ref.DefinitionDigest ||
+		compiled.ObservationRollout != observation.RolloutAuthority ||
+		compiled.Definition.TaskManual != creation.Definition.PlaybookContent ||
+		len(compiled.Definition.ToolCalls) != 1 ||
+		len(compiled.Adaptive.InvocationStates) != 1 ||
+		!bytes.Equal(compiled.Adaptive.InvocationStates[0].Cursor, []byte(`{}`)) ||
+		len(compiled.ToolBindings) != 1 ||
+		compiled.ToolBindings[0].InvocationDigest !=
+			compiled.Definition.ToolCalls[0].Digest ||
+		compiled.ToolBindings[0].Contract.ToolName != "web_search" ||
+		compiled.ToolBindings[0].Contract.ImplementationVersion !=
+			"fetcher.exa/v1" ||
+		compiled.ToolBindings[0].Capability.ImplementationVersion !=
+			"fetcher.exa/v1" ||
+		compiled.ToolBindings[0].Capability.CredentialRef.Generation != 1 ||
+		compiled.Policy.ModelPolicy.CredentialRef.Generation != 1 {
+		t.Fatalf("Source-free compiled snapshot did not remain frozen: %+v", compiled)
+	}
+
+	var parentCount, shadowCount, taskLinks, globalTargets int
+	if err := st.pool.QueryRow(ctx,
+		`SELECT
+		    (SELECT count(*) FROM task_run_snapshots
+		      WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3),
+		    (SELECT count(*) FROM task_run_snapshot_v2_shadows
+		      WHERE tenant_id=$1 AND user_id=$2 AND task_id=$3),
+		    (SELECT count(*) FROM task_fetch_targets WHERE schedule_id=$3),
+		    (SELECT count(*) FROM fetch_targets WHERE url=$4)`,
+		identity.TenantID, identity.UserID, identity.TaskID, target.URL,
+	).Scan(&parentCount, &shadowCount, &taskLinks, &globalTargets); err != nil {
+		t.Fatal(err)
+	}
+	if parentCount != 3 || shadowCount != 0 ||
+		taskLinks != 0 || globalTargets != 0 {
+		t.Fatalf("Source-free persistence leaked legacy state: parent=%d shadow=%d links=%d targets=%d",
+			parentCount, shadowCount, taskLinks, globalTargets)
+	}
+
+	tampered := ref
+	tampered.AdaptiveVersion++
+	if _, err := st.LoadCompiledTaskRunSnapshotV2(
+		ctx, identity, tampered); err == nil {
+		t.Fatal("tampered Source-free reference was accepted")
+	}
+}
+
+func assertToolRunSnapshotV2AdmissionRejects(
+	t *testing.T,
+	st *Store,
+	identity types.RunIdentity,
+	sourceSnapshotID int64,
+	name string,
+	adaptiveMutation string,
+	mode types.ExecutionMode,
+) {
+	t.Helper()
+	ctx := t.Context()
+	tx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id',$1,true)`,
+		fmt.Sprintf("%d", identity.TenantID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE vane_app`); err != nil {
+		t.Fatal(err)
+	}
+	if adaptiveMutation != "" {
+		if _, err := tx.Exec(ctx, adaptiveMutation,
+			identity.TenantID, identity.UserID, identity.TaskID); err != nil {
+			t.Fatalf("%s fixture mutation: %v", name, err)
+		}
+	}
+	_, err = tx.Exec(ctx,
+		`INSERT INTO task_run_snapshots (
+			id, tenant_id, user_id, task_id, temporal_workflow_id, temporal_run_id,
+			run_kind, execution_mode, adaptive_version, capability_catalog_digest,
+			tool_policy_digest, prompt_policy_digest, model_policy_digest,
+			quota_policy_digest, definition_digest, plan_digest, payload_digest,
+			reference_digest, reference_schema_version, payload, budget
+		 )
+		 SELECT nextval('task_run_snapshots_id_seq'),
+		        tenant_id, user_id, task_id, $2, $3,
+		        run_kind, $4, adaptive_version, capability_catalog_digest,
+		        tool_policy_digest, prompt_policy_digest, model_policy_digest,
+		        quota_policy_digest, definition_digest, plan_digest, payload_digest,
+		        reference_digest, reference_schema_version, payload, budget
+		   FROM task_run_snapshots
+		  WHERE id=$1`,
+		sourceSnapshotID,
+		identity.TemporalWorkflowID+"-admission-negative",
+		uuid.NewString(),
+		string(mode),
+	)
+	var pgErr *pgconn.PgError
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("%s was not rejected by V2 admission fence: %v", name, err)
+	}
+}
+
+func TestTaskRunToolBindingRejectsIncompatibleImplementation(t *testing.T) {
+	call, err := taskstate.BuildToolInvocationV1(
+		"web_search", "v1", json.RawMessage(`{"query":"AI"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := taskstate.BuildApprovedDefinitionV2(
+		taskstate.ApprovedDefinitionInputV2{
+			TenantID: 1, UserID: 2, TaskID: "route-mismatch",
+			SpecJSON: json.RawMessage(`{}`), ScopeJSON: json.RawMessage(`{}`),
+			NLDescription: "monitor AI",
+			TaskManual:    "monitor AI", Strictness: types.StrictnessNormal,
+			ToolCalls:      []taskstate.ToolInvocationV1{call},
+			ExecutionMode:  types.ExecutionModeCompiled,
+			DeliveryPolicy: taskstate.DeliveryPolicyOwnerFeishu,
+			BudgetPolicy:   taskstate.BudgetPolicyInheritTenantQuota,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := testCompiledRunPolicyV1(t)
+	policy.CapabilityCatalog.Allowed[0].ImplementationVersion =
+		"fetcher.binding/v1"
+	policy.CapabilityCatalog.Allowed[0].CredentialRef.ID =
+		"tikhub-primary"
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("mismatched policy must be otherwise structurally valid: %v", err)
+	}
+	if _, err := buildTaskRunToolBindingsV1(
+		definition, policy); err == nil {
+		t.Fatal("web_search accepted the binding implementation")
+	}
+}

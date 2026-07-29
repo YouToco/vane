@@ -16,11 +16,14 @@
 // 单一事实来源 + 三处共用 = 新增/下线一个能力只改这一张表，不会与分发实现漂移
 // （漂移由 fetcher 的一致性测试与 Multi.Fetch 的兜底分支兜住）。
 //
-// 本包是**纯数据**，只依赖 types：Provider 实现是 fetcher 的内部细节，不进这里
-// （契约 §1：供应商既不进 types.FetchTarget，也不进身份，也不进本注册表）。
+// 本包是**纯契约数据**，只依赖 types 与不含密钥的 runtimepolicy DTO。Provider
+// 名称/端点仍是 fetcher 的内部细节；这里只冻结可审计的实现契约版本。
 package acquisitiontool
 
-import "github.com/YouToco/vane/types"
+import (
+	"github.com/YouToco/vane/runtimepolicy"
+	"github.com/YouToco/vane/types"
+)
 
 // Status 是一个 (平台, 能力) 条目的可用状态。
 //
@@ -53,6 +56,76 @@ type Entry struct {
 	// Reason 在 Status != Available 时**必填**：它会进到用户/agent 看得见的报错与工具
 	// 描述里，是"为什么这个能力不能用"的唯一机器可读载体。Available 时留空。
 	Reason string
+}
+
+// ToolContractV1 maps the user-level acquisition Tool name frozen in a task
+// definition to the capability selected by runtime policy. Provider routes,
+// endpoints, credentials, and implementation revisions are deliberately not
+// part of this logical contract.
+type ToolContractV1 struct {
+	Name                  string
+	Platform              types.Platform
+	Capability            types.Capability
+	Kind                  types.Kind
+	ImplementationVersion runtimepolicy.CapabilityImplementationIDV1
+}
+
+var toolContractsV1 = map[string]ToolContractV1{
+	"web_search": {
+		Name: "web_search", Platform: types.PlatformWeb, Capability: types.CapSearch,
+		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationExaV1,
+	},
+	"web_feed": {
+		Name: "web_feed", Platform: types.PlatformWeb, Capability: types.CapFeed,
+		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationRSSV1,
+	},
+	"web_contents": {
+		Name: "web_contents", Platform: types.PlatformWeb, Capability: types.CapContents,
+		Kind: types.KindPageContent, ImplementationVersion: runtimepolicy.CapabilityImplementationExaV1,
+	},
+	"x_user_posts": {
+		Name: "x_user_posts", Platform: types.PlatformX, Capability: types.CapUserPosts,
+		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
+	},
+	"xhs_search": {
+		Name: "xhs_search", Platform: types.PlatformXHS, Capability: types.CapSearch,
+		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
+	},
+	"xhs_user_posts": {
+		Name: "xhs_user_posts", Platform: types.PlatformXHS, Capability: types.CapUserPosts,
+		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
+	},
+	"xhs_hot_list": {
+		Name: "xhs_hot_list", Platform: types.PlatformXHS, Capability: types.CapHotList,
+		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
+	},
+	"xhs_topic_feed": {
+		Name: "xhs_topic_feed", Platform: types.PlatformXHS, Capability: types.CapTopicFeed,
+		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
+	},
+	"xhs_faved_notes": {
+		Name: "xhs_faved_notes", Platform: types.PlatformXHS, Capability: types.CapFavedNotes,
+		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
+	},
+	"weibo_user_posts": {
+		Name: "weibo_user_posts", Platform: types.PlatformWeibo, Capability: types.CapUserPosts,
+		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
+	},
+	"weibo_hot_list": {
+		Name: "weibo_hot_list", Platform: types.PlatformWeibo, Capability: types.CapHotList,
+		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
+	},
+	"wechat_mp_user_posts": {
+		Name: "wechat_mp_user_posts", Platform: types.PlatformWechatMP, Capability: types.CapUserPosts,
+		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
+	},
+}
+
+// LookupToolContractV1 resolves only the frozen logical V1 contract. A future
+// contract version gets a separate resolver instead of changing this map.
+func LookupToolContractV1(name string) (ToolContractV1, bool) {
+	contract, ok := toolContractsV1[name]
+	return contract, ok
 }
 
 // Available 是 Status == StatusAvailable 的便捷判定。
