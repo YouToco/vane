@@ -538,7 +538,11 @@ func TestNaturalTaskDefinitionEditCandidate(t *testing.T) {
 		{"把“竞品动态”改成每周一次", true},
 		{"把早报频率设成每周一", true},
 		{"早报以后只看官方博客", true},
-		{"创建任务：每天看官方博客", false},
+		{"删除“AI 更新”任务", true},
+		{"不要删掉 AI 日报", true},
+		{"删除任务会有什么后果？", true},
+		{"立即运行“每周更新”任务", true},
+		{"创建任务：每天看官方博客", true},
 	} {
 		if got := isNaturalTaskDefinitionEditCandidate(test.text); got != test.want {
 			t.Errorf("isNaturalTaskDefinitionEditCandidate(%q)=%v, want %v",
@@ -552,13 +556,32 @@ func TestRemoveScheduleExplicitIntentRejectsNegation(t *testing.T) {
 		"不要删除任务，只把日报改成周报",
 		"别取消任务，我只是想修改频率",
 		"不用删除 AI 日报",
+		"不要删掉 AI 日报",
+		"请勿删除任务",
+		"不要移除任务",
+		"别关掉任务",
+		"取消删除任务",
+		"删除任务会有什么后果？",
+		"删除任务好不好？",
+		"删除“AI 更新”任务",
 	} {
 		if explicitOwnerToolIntent("remove_schedule", text) {
-			t.Errorf("negated removal treated as explicit: %q", text)
+			t.Errorf("lexical removal authorization escaped: %q", text)
 		}
 	}
-	if !explicitOwnerToolIntent("remove_schedule", "删除“AI 更新”任务") {
-		t.Fatal("explicit removal was rejected")
+	spec := newToolSpec(
+		&fakeTool{name: "remove_schedule"},
+		ownerPolicy(
+			Effects(EffectStateWrite, EffectDirectOwnerWrite),
+			BudgetNone,
+		),
+	)
+	if !toolVisibleForRequest(spec, &toolRunState{
+		ownerRequest:          "删除“AI 更新”任务",
+		intents:               IntentTasks,
+		allowedSideEffectTool: "remove_schedule",
+	}) {
+		t.Fatal("semantic delete authorization did not expose remove tool")
 	}
 }
 
@@ -580,20 +603,53 @@ func TestTaskDefinitionEditIntentClassifierRequiresExplicitExecute(t *testing.T)
 			want: taskEditIntentExecute,
 		},
 		{
-			name: "other operation",
+			name: "delete task",
 			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
 				ID:   "route-2",
 				Name: taskDefinitionEditIntentTool.Name,
 				Arguments: `{
-					"decision":"other_operation"
+					"decision":"delete_task"
 				}`,
 			}}},
-			want: taskEditIntentOtherOperation,
+			want: taskEditIntentDelete,
+		},
+		{
+			name: "run task",
+			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID:   "route-3",
+				Name: taskDefinitionEditIntentTool.Name,
+				Arguments: `{
+					"decision":"run_task"
+				}`,
+			}}},
+			want: taskEditIntentRun,
+		},
+		{
+			name: "create task",
+			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID:   "route-create",
+				Name: taskDefinitionEditIntentTool.Name,
+				Arguments: `{
+					"decision":"create_task"
+				}`,
+			}}},
+			want: taskEditIntentCreate,
+		},
+		{
+			name: "one off search",
+			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID:   "route-4",
+				Name: taskDefinitionEditIntentTool.Name,
+				Arguments: `{
+					"decision":"one_off_search"
+				}`,
+			}}},
+			want: taskEditIntentSearch,
 		},
 		{
 			name: "answer only",
 			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
-				ID:   "route-3",
+				ID:   "route-5",
 				Name: taskDefinitionEditIntentTool.Name,
 				Arguments: `{
 					"decision":"answer_only"
@@ -609,7 +665,7 @@ func TestTaskDefinitionEditIntentClassifierRequiresExplicitExecute(t *testing.T)
 		{
 			name: "unknown field",
 			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
-				ID:   "route-4",
+				ID:   "route-6",
 				Name: taskDefinitionEditIntentTool.Name,
 				Arguments: `{
 					"decision":"execute_edit",
@@ -754,13 +810,15 @@ func TestTaskDefinitionEditNonExecuteCannotWrite(t *testing.T) {
 
 func TestTaskEditOtherOperationKeepsMatchingCapability(t *testing.T) {
 	for _, test := range []struct {
-		name    string
-		request string
-		tool    ToolSpec
+		name     string
+		request  string
+		decision taskEditIntentDecision
+		tool     ToolSpec
 	}{
 		{
-			name:    "delete task whose name contains update",
-			request: "删除“AI 更新”任务",
+			name:     "delete task whose name contains update",
+			request:  "删除“AI 更新”任务",
+			decision: taskEditIntentDelete,
 			tool: newToolSpec(
 				&fakeTool{name: "remove_schedule"},
 				ownerPolicy(
@@ -773,8 +831,9 @@ func TestTaskEditOtherOperationKeepsMatchingCapability(t *testing.T) {
 			),
 		},
 		{
-			name:    "run task whose name contains update",
-			request: "立即运行“每周更新”任务",
+			name:     "run task whose name contains update",
+			request:  "立即运行“每周更新”任务",
+			decision: taskEditIntentRun,
 			tool: newToolSpec(
 				&fakeTool{name: "run_task_now"},
 				withToolSurface(
@@ -790,8 +849,9 @@ func TestTaskEditOtherOperationKeepsMatchingCapability(t *testing.T) {
 			),
 		},
 		{
-			name:    "one off update search",
-			request: "更新一下 OpenAI 最新消息",
+			name:     "one off update search",
+			request:  "更新一下 OpenAI 最新消息",
+			decision: taskEditIntentSearch,
 			tool: newToolSpec(
 				&fakeTool{name: "web_search"},
 				withToolSurface(
@@ -831,7 +891,7 @@ func TestTaskEditOtherOperationKeepsMatchingCapability(t *testing.T) {
 				context.Context,
 				[]llm.ChatMessage,
 			) (taskEditIntentDecision, error) {
-				return taskEditIntentOtherOperation, nil
+				return test.decision, nil
 			}
 			if _, err := loop.HandleMessage(
 				t.Context(), 7, test.request,
@@ -847,6 +907,111 @@ func TestTaskEditOtherOperationKeepsMatchingCapability(t *testing.T) {
 					toolDefNames(request.Tools), test.tool.Name())
 			}
 		})
+	}
+}
+
+func TestSemanticDeleteGateRejectsNegatedHallucination(t *testing.T) {
+	remove := &fakeTool{name: "remove_schedule", result: "must not run"}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			FinishReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID:   "hallucinated-delete",
+				Name: "remove_schedule",
+				Arguments: `{
+					"schedule_ids":["task-ai-daily"]
+				}`,
+			}},
+		},
+		{Content: "好的，不删除 AI 日报。"},
+	}}
+	loop := New(Deps{
+		Store: newFakeStore(),
+		Tools: []ToolSpec{
+			newToolSpec(remove, ownerPolicy(
+				Effects(EffectStateWrite, EffectDirectOwnerWrite),
+				BudgetNone,
+			)),
+		},
+		Model:      "test-model",
+		MaxTurns:   20,
+		SessionTTL: 30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+	loop.taskEditIntentFn = func(
+		context.Context,
+		[]llm.ChatMessage,
+	) (taskEditIntentDecision, error) {
+		return taskEditIntentAnswerOnly, nil
+	}
+
+	out, err := loop.HandleMessage(
+		t.Context(), 7, "不要删掉 AI 日报",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply != "好的，不删除 AI 日报。" {
+		t.Fatalf("Reply=%q", out.Reply)
+	}
+	if len(remove.calls) != 0 {
+		t.Fatalf("negated removal executed %d times", len(remove.calls))
+	}
+	for _, request := range chat.requests {
+		for _, name := range toolDefNames(request.Tools) {
+			if name == "remove_schedule" {
+				t.Fatal("answer-only turn exposed remove_schedule")
+			}
+		}
+	}
+}
+
+func TestSemanticDeleteGateExecutesPositiveOnce(t *testing.T) {
+	remove := &fakeTool{name: "remove_schedule", result: "已删除任务。"}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			FinishReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID:   "semantic-delete",
+				Name: "remove_schedule",
+				Arguments: `{
+					"schedule_ids":["task-ai-daily"]
+				}`,
+			}},
+		},
+		{Content: "已删除 AI 更新任务。"},
+	}}
+	loop := New(Deps{
+		Store: newFakeStore(),
+		Tools: []ToolSpec{
+			newToolSpec(remove, ownerPolicy(
+				Effects(EffectStateWrite, EffectDirectOwnerWrite),
+				BudgetNone,
+			)),
+		},
+		Model:      "test-model",
+		MaxTurns:   20,
+		SessionTTL: 30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+	loop.taskEditIntentFn = func(
+		context.Context,
+		[]llm.ChatMessage,
+	) (taskEditIntentDecision, error) {
+		return taskEditIntentDelete, nil
+	}
+
+	out, err := loop.HandleMessage(
+		t.Context(), 7, "删除“AI 更新”任务",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply != "已删除 AI 更新任务。" {
+		t.Fatalf("Reply=%q", out.Reply)
+	}
+	if len(remove.calls) != 1 {
+		t.Fatalf("semantic removal calls=%d, want 1", len(remove.calls))
 	}
 }
 

@@ -101,12 +101,14 @@ type toolRunState struct {
 	clarificationCount int
 	candidateSearches  int
 	candidateHits      int
-	// sideEffectFreeTurn is set when a possible task edit was classified as
-	// answer-only or its semantic gate was unavailable. A separately
-	// classified delete/run/search request keeps its own normal policy. In an
-	// answer-only turn, every state write, delivery, billable call and
-	// activation is removed at declaration and execution time.
-	sideEffectFreeTurn bool
+	// sideEffectConstrainedTurn is set for every semantically routed task
+	// action except a uniquely bound definition edit. Only the side-effecting
+	// tool named by allowedSideEffectTool may survive; one-off research instead
+	// uses allowBillableResearch. Answer-only/unavailable decisions set neither,
+	// producing a fully side-effect-free turn.
+	sideEffectConstrainedTurn bool
+	allowedSideEffectTool     string
+	allowBillableResearch     bool
 	// contextStepOffset reserves context step 1 for semantic adjudication so
 	// the main Agent's first request is sealed as step 2 on the same trace.
 	contextStepOffset int

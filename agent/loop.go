@@ -109,7 +109,10 @@ const taskDefinitionEditIntentSystemPrompt = `
 
 判断最后一条用户消息是否授权“现在立即修改已有任务定义”：
 - execute_edit：用户本轮明确命令立即修改；或上一轮已明确命令修改、助手仅追问目标任务，本轮用户直接选择了一个候选且没有撤销。
-- other_operation：用户明确要求删除、运行、创建任务，或一次性联网查询等不同操作。即使任务名称里含“更新”等词，也应选此项。
+- delete_task：用户明确命令立即删除已有任务。
+- run_task：用户明确命令立即运行已有任务。
+- create_task：用户明确命令立即创建新任务。
+- one_off_search：用户明确要求一次性联网查询，不创建或修改任务。
 - answer_only：询问是否合适、利弊、影响、怎么做、假设场景、表达否定/取消/不用改，或任何含糊情况。
 
 必须理解整句话和相邻对话，不能因为出现“把/改为/可以/任务/更新”等词就推断授权。含糊时一律 answer_only。`
@@ -122,7 +125,14 @@ var taskDefinitionEditIntentTool = llm.ToolDef{
 	  "properties": {
 	    "decision": {
 	      "type": "string",
-	      "enum": ["execute_edit", "other_operation", "answer_only"]
+	      "enum": [
+	        "execute_edit",
+	        "delete_task",
+	        "run_task",
+	        "create_task",
+	        "one_off_search",
+	        "answer_only"
+	      ]
 	    }
 	  },
 	  "required": ["decision"],
@@ -319,7 +329,10 @@ type taskEditIntentDecision uint8
 const (
 	taskEditIntentUnavailable taskEditIntentDecision = iota
 	taskEditIntentExecute
-	taskEditIntentOtherOperation
+	taskEditIntentDelete
+	taskEditIntentRun
+	taskEditIntentCreate
+	taskEditIntentSearch
 	taskEditIntentAnswerOnly
 )
 
@@ -601,8 +614,14 @@ func (l *Loop) classifyTaskDefinitionEditIntent(
 	switch args.Decision {
 	case "execute_edit":
 		return taskEditIntentExecute, nil
-	case "other_operation":
-		return taskEditIntentOtherOperation, nil
+	case "delete_task":
+		return taskEditIntentDelete, nil
+	case "run_task":
+		return taskEditIntentRun, nil
+	case "create_task":
+		return taskEditIntentCreate, nil
+	case "one_off_search":
+		return taskEditIntentSearch, nil
 	case "answer_only":
 		return taskEditIntentAnswerOnly, nil
 	default:
@@ -943,9 +962,20 @@ func (l *Loop) handleMessage(
 	}
 	directProposal := directTaskCreation || directDefinitionEdit ||
 		naturalTaskDefinitionEdit
-	sideEffectFreeTurn := naturalTaskDefinitionEditCandidate &&
-		(taskEditDecision == taskEditIntentUnavailable ||
-			taskEditDecision == taskEditIntentAnswerOnly)
+	sideEffectConstrainedTurn := naturalTaskDefinitionEditCandidate &&
+		!naturalTaskDefinitionEdit
+	allowedSideEffectTool := ""
+	allowBillableResearch := false
+	switch taskEditDecision {
+	case taskEditIntentDelete:
+		allowedSideEffectTool = "remove_schedule"
+	case taskEditIntentRun:
+		allowedSideEffectTool = "run_task_now"
+	case taskEditIntentCreate:
+		allowedSideEffectTool = "create_schedule"
+	case taskEditIntentSearch:
+		allowBillableResearch = true
+	}
 
 	// 外部上下文入口不读取画像：不是“读了但不渲染”，而是从数据访问层就不碰。
 	// direct-task-creation 同样从数据访问层跳过画像，防止模型把用户没有批准的
@@ -993,7 +1023,9 @@ func (l *Loop) handleMessage(
 		directActionID:             directActionID,
 		directTaskDefinitionEditID: directDefinitionEditTaskID,
 		naturalTaskDefinitionEdit:  naturalTaskDefinitionEdit,
-		sideEffectFreeTurn:         sideEffectFreeTurn,
+		sideEffectConstrainedTurn:  sideEffectConstrainedTurn,
+		allowedSideEffectTool:      allowedSideEffectTool,
+		allowBillableResearch:      allowBillableResearch,
 		contextStepOffset:          intentClassificationTurns,
 		untrustedExternalResult:    externalInput,
 	}
@@ -1640,7 +1672,7 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		dyn = l.endpoints.Defs(state.activation)
 	}
 	candidate := appendToolDefs(static, dyn)
-	candidate = l.filterSideEffectFreeToolDefs(candidate, state)
+	candidate = l.filterConstrainedSideEffectToolDefs(candidate, state)
 	if state == nil || state.intentToolkitsEnabled {
 		return candidate
 	}
@@ -1651,7 +1683,7 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		}
 	}
 	legacy := appendToolDefs(legacyStatic, dyn)
-	legacy = l.filterSideEffectFreeToolDefs(legacy, state)
+	legacy = l.filterConstrainedSideEffectToolDefs(legacy, state)
 	if state.intentToolkitsShadow && !state.intentToolkitsShadowSeen {
 		state.intentToolkitsShadowSeen = true
 		state.intentToolkitsLegacyCount = len(legacy)
@@ -1663,22 +1695,50 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 	return legacy
 }
 
-func (l *Loop) filterSideEffectFreeToolDefs(
+func (l *Loop) filterConstrainedSideEffectToolDefs(
 	defs []llm.ToolDef,
 	state *toolRunState,
 ) []llm.ToolDef {
-	if state == nil || !state.sideEffectFreeTurn {
+	if state == nil || !state.sideEffectConstrainedTurn {
 		return defs
 	}
 	out := make([]llm.ToolDef, 0, len(defs))
 	for _, def := range defs {
 		spec, ok := l.resolveTool(def.Name, state)
-		if !ok || toolHasObservableSideEffect(spec) {
+		if !ok || (toolHasObservableSideEffect(spec) &&
+			!constrainedSideEffectAllowed(state, spec)) {
 			continue
 		}
 		out = append(out, def)
 	}
 	return out
+}
+
+func constrainedSideEffectAllowed(
+	state *toolRunState,
+	spec ToolSpec,
+) bool {
+	if state == nil {
+		return false
+	}
+	if state.allowedSideEffectTool != "" &&
+		spec.Name() == state.allowedSideEffectTool {
+		return true
+	}
+	if !state.allowBillableResearch {
+		return false
+	}
+	effects := spec.Policy.Effects
+	if effects.Has(EffectStateWrite) ||
+		effects.Has(EffectDelivery) ||
+		effects.Has(EffectDurableProposal) ||
+		effects.Has(EffectDirectOwnerWrite) ||
+		effects.Has(EffectActivationWrite) {
+		return false
+	}
+	return effects.Has(EffectNetworkRead) ||
+		effects.Has(EffectBillable) ||
+		effects.Has(EffectTrustTaint)
 }
 
 func appendToolDefs(prefix, suffix []llm.ToolDef) []llm.ToolDef {
@@ -1794,16 +1854,31 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 	// 模型单独重试。只“放行一个、拒绝其余”仍会把被拒调用的 args/content
 	// 写进下一轮消息，与随后返回的恶意网页同屏。
 	state := runStateFrom(ctx)
-	if state != nil && state.sideEffectFreeTurn {
+	for _, call := range calls {
+		if call.Name != "remove_schedule" ||
+			(state != nil &&
+				state.allowedSideEffectTool == "remove_schedule") {
+			continue
+		}
+		for _, rejected := range calls {
+			out = append(out, toolMsg(
+				rejected.ID,
+				"删除任务必须先通过当前用户消息的语义动作裁决；本批未执行。",
+			))
+		}
+		return out, nil
+	}
+	if state != nil && state.sideEffectConstrainedTurn {
 		for _, call := range calls {
 			spec, ok := l.resolveTool(call.Name, state)
-			if !ok || !toolHasObservableSideEffect(spec) {
+			if !ok || !toolHasObservableSideEffect(spec) ||
+				constrainedSideEffectAllowed(state, spec) {
 				continue
 			}
 			for _, rejected := range calls {
 				out = append(out, toolMsg(
 					rejected.ID,
-					"本轮任务编辑意图未获得明确执行裁决，只允许只读回答；本批写入、投递或计费调用均未执行。",
+					"本轮语义裁决只授权了当前明确动作；本批其他写入、投递或计费调用均未执行。",
 				))
 			}
 			return out, nil
@@ -2003,7 +2078,10 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		if spec.Policy.RoutingConfigured &&
 			spec.Policy.DirectOnExplicitIntent &&
 			(state == nil ||
-				!explicitOwnerToolIntent(spec.Name(), state.ownerRequest)) {
+				(state.allowedSideEffectTool != spec.Name() &&
+					!explicitOwnerToolIntent(
+						spec.Name(), state.ownerRequest,
+					))) {
 			out = append(out, toolMsg(tc.ID, toolMsgExplicitIntent))
 			continue
 		}
@@ -2476,7 +2554,13 @@ func isNaturalTaskDefinitionEditCandidate(text string) bool {
 	hasTaskContinuation := hasTaskTarget && containsAny(normalized,
 		"以后", "从现在", "频率", "只看", "只推", "不再推",
 	)
-	return hasExplicitEdit || hasTaskContinuation
+	hasTaskAction := containsAny(normalized,
+		"删除", "删掉", "移除", "取消任务", "停止任务", "关掉任务",
+		"立即运行", "马上运行", "现在运行", "立即推送", "现在推送",
+		"创建任务", "新建任务", "createatask", "createtask",
+		"deletetask", "removeschedule", "runnow", "pushnow",
+	)
+	return hasExplicitEdit || hasTaskContinuation || hasTaskAction
 }
 
 func isNaturalTaskDefinitionEditContinuation(history []llm.ChatMessage) bool {

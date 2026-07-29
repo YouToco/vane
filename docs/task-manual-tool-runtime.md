@@ -29,15 +29,15 @@ Otherwise the Agent executes directly.
 Natural-language edits are one user operation even when the request changes
 several fields of the same task. The Agent first resolves the task from the
 user's remembered name, schedule, topic or purpose, then submits one complete
-definition edit. A separate side-effect-free semantic adjudication must first classify
-the current owner turn as an immediate edit, a different explicit operation, or
-an answer-only request such as advice, a hypothetical, negation, or
-cancellation. The edit then requires a second independent model decision to
-call the bound write tool. Different explicit operations return to their own
-normal tool policy. Answer-only decisions and any adjudication error fail
-closed into a side-effect-free turn: all writes, deliveries, activation
-changes, and billable tools are absent at both declaration and execution
-boundaries. The isolated edit lane
+definition edit. A separate side-effect-free semantic adjudication first routes
+the current owner turn to edit, delete, run, create, one-off research, or an
+answer-only request such as advice, a hypothetical, negation, or cancellation.
+Lexical matches never authorize deletion. The edit then requires a second
+independent model decision to call the bound write tool. Other explicit actions
+expose only their matching side-effect capability; unrelated writes remain
+closed. Answer-only decisions and any adjudication error fail closed into a
+side-effect-free turn: all writes, deliveries, activation changes, and billable
+tools are absent at both declaration and execution boundaries. The isolated edit lane
 exposes only `list_schedules` followed by `edit_task_definition`; a requirement
 that future runs open official pages does not authorize ad-hoc web research
 during the edit. The user is never asked for an internal task ID or to split one
