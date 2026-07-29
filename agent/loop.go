@@ -113,6 +113,7 @@ const taskDefinitionEditIntentSystemPrompt = `
 - run_task：用户明确命令立即运行已有任务。
 - create_task：用户明确命令立即创建新任务。
 - one_off_search：用户明确要求一次性联网查询，不创建或修改任务。
+- update_profile：用户明确命令修改自己的行业、职业、岗位或关注标签画像。
 - answer_only：询问是否合适、利弊、影响、怎么做、假设场景、表达否定/取消/不用改，或任何含糊情况。
 
 必须理解整句话和相邻对话，不能因为出现“把/改为/可以/任务/更新”等词就推断授权。含糊时一律 answer_only。`
@@ -131,6 +132,7 @@ var taskDefinitionEditIntentTool = llm.ToolDef{
 	        "run_task",
 	        "create_task",
 	        "one_off_search",
+	        "update_profile",
 	        "answer_only"
 	      ]
 	    }
@@ -333,6 +335,7 @@ const (
 	taskEditIntentRun
 	taskEditIntentCreate
 	taskEditIntentSearch
+	taskEditIntentProfileUpdate
 	taskEditIntentAnswerOnly
 )
 
@@ -622,6 +625,8 @@ func (l *Loop) classifyTaskDefinitionEditIntent(
 		return taskEditIntentCreate, nil
 	case "one_off_search":
 		return taskEditIntentSearch, nil
+	case "update_profile":
+		return taskEditIntentProfileUpdate, nil
 	case "answer_only":
 		return taskEditIntentAnswerOnly, nil
 	default:
@@ -975,6 +980,8 @@ func (l *Loop) handleMessage(
 		allowedSideEffectTool = "create_schedule"
 	case taskEditIntentSearch:
 		allowBillableResearch = true
+	case taskEditIntentProfileUpdate:
+		allowedSideEffectTool = "update_profile"
 	}
 	if directTaskCreation {
 		allowedSideEffectTool = "create_schedule"
@@ -1817,9 +1824,10 @@ func toolHasObservableSideEffect(spec ToolSpec) bool {
 		effects.Has(EffectBillable)
 }
 
-func requiresSemanticTaskAction(toolName string) bool {
+func requiresSemanticOwnerAction(toolName string) bool {
 	switch toolName {
-	case "remove_schedule", "run_task_now", "create_schedule":
+	case "remove_schedule", "run_task_now", "create_schedule",
+		"update_profile":
 		return true
 	default:
 		return false
@@ -1880,14 +1888,14 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 	// 写进下一轮消息，与随后返回的恶意网页同屏。
 	state := runStateFrom(ctx)
 	for _, call := range calls {
-		if !requiresSemanticTaskAction(call.Name) || (state != nil &&
+		if !requiresSemanticOwnerAction(call.Name) || (state != nil &&
 			state.allowedSideEffectTool == call.Name) {
 			continue
 		}
 		for _, rejected := range calls {
 			out = append(out, toolMsg(
 				rejected.ID,
-				"任务创建、删除或立即运行必须先通过当前用户消息的语义动作裁决；本批未执行。",
+				"任务创建、删除、立即运行或画像更新必须先通过当前用户消息的语义动作裁决；本批未执行。",
 			))
 		}
 		return out, nil
@@ -2602,7 +2610,9 @@ func isNaturalTaskDefinitionEditCandidate(text string) bool {
 	) || (hasTaskTarget && containsAny(normalized,
 		"取消", "停止", "关掉", "停掉",
 	))
-	return hasExplicitEdit || hasTaskContinuation || hasTaskAction
+	hasCapabilityIntent := classifyOwnerIntents(text).HasAny(IntentTasks)
+	return hasCapabilityIntent || hasExplicitEdit ||
+		hasTaskContinuation || hasTaskAction
 }
 
 func isNaturalTaskDefinitionEditContinuation(history []llm.ChatMessage) bool {

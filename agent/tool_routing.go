@@ -50,7 +50,8 @@ func classifyOwnerIntents(text string) ToolIntent {
 
 func explicitOwnerToolIntent(toolName, _ string) bool {
 	switch toolName {
-	case "remove_schedule", "run_task_now", "create_schedule":
+	case "remove_schedule", "run_task_now", "create_schedule",
+		"update_profile":
 		// Task mutations/delivery are never authorized lexically. The isolated
 		// semantic action gate (or the dedicated direct-creation lane) must name
 		// the exact allowed tool for this turn.

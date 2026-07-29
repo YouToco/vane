@@ -549,6 +549,14 @@ func TestNaturalTaskDefinitionEditCandidate(t *testing.T) {
 		{"取消 AI 日报", true},
 		{"停止 AI 日报", true},
 		{"关掉 AI 日报", true},
+		{"运行一下 AI 日报", true},
+		{"执行 AI 日报", true},
+		{"关闭 AI 日报", true},
+		{"终止 AI 日报", true},
+		{"新增一个每天监控竞品的任务", true},
+		{"帮我设一个每天九点的任务", true},
+		{"更新我的岗位为产品经理", true},
+		{"修改我的关注标签", true},
 		{"创建任务：每天看官方博客", true},
 	} {
 		if got := isNaturalTaskDefinitionEditCandidate(test.text); got != test.want {
@@ -652,6 +660,17 @@ func TestTaskDefinitionEditIntentClassifierRequiresExplicitExecute(t *testing.T)
 				}`,
 			}}},
 			want: taskEditIntentSearch,
+		},
+		{
+			name: "profile update",
+			response: &llm.ChatResponse{ToolCalls: []llm.ToolCall{{
+				ID:   "route-profile",
+				Name: taskDefinitionEditIntentTool.Name,
+				Arguments: `{
+					"decision":"update_profile"
+				}`,
+			}}},
+			want: taskEditIntentProfileUpdate,
 		},
 		{
 			name: "answer only",
@@ -850,6 +869,64 @@ func TestTaskEditOtherOperationKeepsMatchingCapability(t *testing.T) {
 					),
 					ExposureIntent,
 					IntentTasks,
+					ResultTrustLocal,
+					true,
+				),
+			),
+		},
+		{
+			name:     "run task without immediate keyword",
+			request:  "运行一下 AI 日报",
+			decision: taskEditIntentRun,
+			tool: newToolSpec(
+				&fakeTool{name: "run_task_now"},
+				withToolSurface(
+					ownerPolicy(
+						Effects(EffectDelivery),
+						BudgetDownstreamManaged,
+					),
+					ExposureIntent,
+					IntentTasks,
+					ResultTrustLocal,
+					true,
+				),
+			),
+		},
+		{
+			name:     "natural create wording",
+			request:  "帮我设一个每天九点的任务",
+			decision: taskEditIntentCreate,
+			tool: newToolSpec(
+				&fakeTool{
+					name:       "create_schedule",
+					parameters: json.RawMessage(createScheduleSchema),
+				},
+				ownerPolicy(
+					Effects(
+						EffectDurableProposal,
+						EffectStateWrite,
+						EffectDirectOwnerWrite,
+					),
+					BudgetNone,
+				),
+			),
+		},
+		{
+			name:     "profile update",
+			request:  "更新我的岗位为产品经理",
+			decision: taskEditIntentProfileUpdate,
+			tool: newToolSpec(
+				&fakeTool{name: "update_profile"},
+				withToolSurface(
+					ownerPolicy(
+						Effects(
+							EffectStateWrite,
+							EffectDirectOwnerWrite,
+						),
+						BudgetNone,
+					),
+					ExposureIntent,
+					IntentProfile,
 					ResultTrustLocal,
 					true,
 				),
