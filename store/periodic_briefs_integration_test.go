@@ -124,8 +124,13 @@ func TestPeriodicReportRecoveryFreezesExactCanonicalInputs(t *testing.T) {
 	if err := json.Unmarshal(briefPayload, &brief); err != nil {
 		t.Fatal(err)
 	}
-	periodStart := brief.GeneratedAt.AddDate(0, 0, -1)
-	periodEnd := brief.GeneratedAt.AddDate(0, 0, 1)
+	if receipt.FinalizedAt == nil {
+		t.Fatal("executive synthesis receipt is not finalized")
+	}
+	// Period membership is defined by the run outcome's database-clock
+	// finalized_at, not the Brief fixture's intentionally frozen GeneratedAt.
+	periodStart := receipt.FinalizedAt.AddDate(0, 0, -1)
+	periodEnd := receipt.FinalizedAt.AddDate(0, 0, 1)
 	intent, err := f.base.st.PreparePeriodicBriefIntentV1(
 		t.Context(), f.identity.TenantID, f.identity.UserID,
 		f.identity.TaskID, BriefReportCadenceWeekly,
