@@ -923,6 +923,22 @@ func (l *Loop) handleMessage(
 		directTaskCreation = !externalInput &&
 			isDirectTaskCreationRequest(text)
 	}
+	// A short answer such as "互联网，产品经理，AI、机器人" only means
+	// profile intake when the immediately preceding assistant turn actually
+	// asked for profile fields and the profile is still empty. Load the hint
+	// once here for that narrow continuation; all other turns retain the
+	// normal later read point.
+	var hint string
+	hintLoaded := false
+	profileIntakeContinuation := false
+	if !externalInput &&
+		!directTaskCreation &&
+		!directDefinitionEdit &&
+		isProfileIntakePrompt(history) {
+		hint = l.profileHint(ctx, userID)
+		hintLoaded = true
+		profileIntakeContinuation = hint == ""
+	}
 	naturalTaskDefinitionEditContinuation :=
 		!externalInput &&
 			!directTaskCreation &&
@@ -932,7 +948,8 @@ func (l *Loop) handleMessage(
 		!directTaskCreation &&
 		!directDefinitionEdit &&
 		(isNaturalTaskDefinitionEditCandidate(text) ||
-			naturalTaskDefinitionEditContinuation)
+			naturalTaskDefinitionEditContinuation ||
+			profileIntakeContinuation)
 	naturalTaskDefinitionEdit := false
 	taskEditDecision := taskEditIntentUnavailable
 	intentClassificationTurns := 0
@@ -943,6 +960,11 @@ func (l *Loop) handleMessage(
 		if naturalTaskDefinitionEditContinuation {
 			intentMessages = append(
 				naturalTaskDefinitionEditContinuationHistory(history),
+				intentMessages...,
+			)
+		} else if profileIntakeContinuation {
+			intentMessages = append(
+				profileIntakeContinuationHistory(history),
 				intentMessages...,
 			)
 		}
@@ -991,9 +1013,10 @@ func (l *Loop) handleMessage(
 	// direct-task-creation 同样从数据访问层跳过画像，防止模型把用户没有批准的
 	// 行业/岗位/标签扩写进 proposal。其余普通消息仍每条现查一次，本条消息内
 	// 的多轮模型调用共享同一快照。
-	var hint string
 	if !externalInput && !directProposal {
-		hint = l.profileHint(ctx, userID)
+		if !hintLoaded {
+			hint = l.profileHint(ctx, userID)
+		}
 	}
 
 	// 兼容清洗部署前已经落库的外部 tool result：不能只保护新写入，否则旧会话
@@ -2639,6 +2662,39 @@ func naturalTaskDefinitionEditContinuationHistory(
 		return nil
 	}
 	return append([]llm.ChatMessage(nil), history[len(history)-2:]...)
+}
+
+func isProfileIntakePrompt(history []llm.ChatMessage) bool {
+	if len(history) == 0 {
+		return false
+	}
+	assistant := history[len(history)-1]
+	if assistant.Role != "assistant" {
+		return false
+	}
+	normalized := strings.ToLower(strings.Join(
+		strings.Fields(assistant.Content), "",
+	))
+	if !containsAny(normalized,
+		"行业", "职业", "岗位", "关注的主题", "关注主题", "关注标签",
+		"industry", "occupation", "role", "interests", "topics",
+	) {
+		return false
+	}
+	return containsAny(normalized,
+		"?", "？", "请介绍", "请告诉", "告诉我", "方便说",
+		"是什么", "哪些", "什么主题", "可以说",
+		"tellme", "what", "which", "share",
+	)
+}
+
+func profileIntakeContinuationHistory(
+	history []llm.ChatMessage,
+) []llm.ChatMessage {
+	if !isProfileIntakePrompt(history) {
+		return nil
+	}
+	return append([]llm.ChatMessage(nil), history[len(history)-1])
 }
 
 func validNaturalEditScheduleQuery(raw json.RawMessage, ownerRequest string) bool {

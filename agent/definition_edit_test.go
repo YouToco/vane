@@ -604,6 +604,110 @@ func TestRemoveScheduleExplicitIntentRejectsNegation(t *testing.T) {
 	}
 }
 
+func TestProfileIntakePromptRecognizesShortAnswerContext(t *testing.T) {
+	history := []llm.ChatMessage{
+		{Role: "user", Content: "你好"},
+		{
+			Role:    "assistant",
+			Content: "你所在的行业和职业/岗位是什么？另外最关注哪些主题？",
+		},
+	}
+	if !isProfileIntakePrompt(history) {
+		t.Fatal("explicit profile intake question was not recognized")
+	}
+	got := profileIntakeContinuationHistory(history)
+	if len(got) != 1 ||
+		got[0].Role != history[1].Role ||
+		got[0].Content != history[1].Content {
+		t.Fatalf("profile continuation history=%+v", got)
+	}
+}
+
+func TestShortProfileIntakeAnswerReachesSemanticUpdate(t *testing.T) {
+	fs := newFakeStore()
+	update := &fakeTool{
+		name:   "update_profile",
+		result: "画像已建立",
+	}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			Content: "你所在的行业和职业/岗位是什么？另外最关注哪些主题？",
+		},
+		{
+			FinishReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID:   "profile-intake",
+				Name: "update_profile",
+				Arguments: `{
+					"industry":"互联网",
+					"occupation":"产品经理",
+					"tags":["AI","机器人"]
+				}`,
+			}},
+		},
+		{Content: "画像已建立。"},
+	}}
+	loop := New(Deps{
+		Store:    fs,
+		Profiles: fs,
+		Tools: []ToolSpec{newToolSpec(
+			update,
+			withToolSurface(
+				ownerPolicy(
+					Effects(
+						EffectStateWrite,
+						EffectDirectOwnerWrite,
+					),
+					BudgetNone,
+				),
+				ExposureIntent,
+				IntentProfile,
+				ResultTrustLocal,
+				true,
+			),
+		)},
+		Model:      "test-model",
+		MaxTurns:   4,
+		SessionTTL: 30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+	var intentMessages []llm.ChatMessage
+	loop.taskEditIntentFn = func(
+		_ context.Context,
+		messages []llm.ChatMessage,
+	) (taskEditIntentDecision, error) {
+		intentMessages = append([]llm.ChatMessage(nil), messages...)
+		return taskEditIntentProfileUpdate, nil
+	}
+
+	first, err := loop.HandleMessage(t.Context(), 7, "你好")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Reply !=
+		"你所在的行业和职业/岗位是什么？另外最关注哪些主题？" {
+		t.Fatalf("first Reply=%q", first.Reply)
+	}
+
+	second, err := loop.HandleMessage(
+		t.Context(), 7, "互联网，产品经理，AI、机器人",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Reply != "画像已建立。" {
+		t.Fatalf("second Reply=%q", second.Reply)
+	}
+	if len(update.calls) != 1 {
+		t.Fatalf("update_profile calls=%d, want 1", len(update.calls))
+	}
+	if len(intentMessages) != 2 ||
+		intentMessages[0].Role != "assistant" ||
+		intentMessages[1].Content != "互联网，产品经理，AI、机器人" {
+		t.Fatalf("intent messages=%+v", intentMessages)
+	}
+}
+
 func TestTaskDefinitionEditIntentClassifierRequiresExplicitExecute(t *testing.T) {
 	for _, test := range []struct {
 		name     string
