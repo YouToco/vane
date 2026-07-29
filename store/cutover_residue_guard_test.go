@@ -80,4 +80,26 @@ func TestTaskToolRuntimeHasNoRetiredCurrentPackages(t *testing.T) {
 			}
 		}
 	}
+
+	migrationFiles, err := filepath.Glob(filepath.Join(root, "store", "migrations", "*.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range migrationFiles {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upper := strings.ToUpper(string(body))
+		for _, forbidden := range []string{
+			"CREATE TABLE TASK_SOURCES",
+			"CREATE TABLE USER_SOURCES",
+			"CREATE TABLE SOURCE_INSTANCES",
+		} {
+			if strings.Contains(upper, forbidden) {
+				t.Errorf("Source entity schema %q is forbidden in %s",
+					forbidden, filepath.Base(path))
+			}
+		}
+	}
 }

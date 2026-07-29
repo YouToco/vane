@@ -2896,7 +2896,7 @@ func TestFetch_CompiledRunDoesNotConsultMutableGlobalSourceState(t *testing.T) {
 	want := snapshot.Definition.Sources[0]
 	if compiled[0].ID != want.SourceID || compiled[0].URL != want.URL ||
 		!reflect.DeepEqual(compiled[0].Config, want.Config) {
-		t.Fatalf("fetch did not use frozen task Source: got=%+v want=%+v", compiled[0], want)
+		t.Fatalf("fetch did not use frozen task Tool call: got=%+v want=%+v", compiled[0], want)
 	}
 	compiledStore.mu.Lock()
 	defer compiledStore.mu.Unlock()

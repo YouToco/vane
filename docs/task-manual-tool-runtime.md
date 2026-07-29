@@ -10,26 +10,21 @@ The user owns only a task and its manual. The Agent owns tool selection.
 ```text
 task manual
     ↓ Agent selects versioned tools
-task-owned Source instances
+sealed Tool calls
     ↓ scheduled run
 run snapshot
     ↓ authorized tool execution
 evidence and delivery
 ```
 
-There is no account-wide source collection, source catalog, confirmation card,
-or internal-ID workflow. A Source is still a first-class task concept: it is
-one task-owned, canonical invocation of a Tool, such as “monitor posts from
-blogger X”. The user manages it by editing the task manual in natural language,
-not by operating a separate CRUD console. True ambiguity is resolved with one
-targeted natural-language question. Otherwise the Agent executes directly.
+There is no Source product entity, source collection, source catalog,
+confirmation card, or internal-ID workflow. Monitoring one blogger or many
+bloggers is expressed directly in the task manual. The Agent compiles that
+manual into one or more internal Tool calls. Those calls are implementation
+state of the task, not separately managed user objects.
 
-The terms are deliberately distinct:
-
-- a **Tool** is a versioned capability Vane knows how to execute;
-- a **Source** is one tenant/user/task-owned configuration of that Tool;
-- a **run snapshot** freezes the exact Source and Tool route used by one run;
-- an **appearance** records that content was observed through that Source.
+True ambiguity is resolved with one targeted natural-language question.
+Otherwise the Agent executes directly.
 
 ## Current writer contract
 
@@ -57,30 +52,28 @@ Each acquisition Tool owns one definition containing:
 
 No second catalog or specification compiler may restate those facts.
 
-The accepted Tool calls are stored on the task Source without losing the Tool
-name or canonical arguments. Materialized provider URL/config is derived
-execution data, not the task's authority.
+The accepted Tool calls are stored on the approved task head without losing
+the Tool name or canonical arguments. Materialized provider URL/config is
+derived execution data, not the task's authority.
 
 ## Isolation invariants
 
-Source identity, title, Tool arguments, provider configuration, cursor,
-status, failure count and next-run state belong to exactly one
-tenant/user/task. They must be protected by the same ownership and purge rules
-as the task.
+Tool arguments, provider configuration, cursor, failure count and next-run
+state belong to one exact tenant/user/task/Tool-call identity. They are
+internal task runtime state and follow the task's ownership and purge rules.
 
 Two users may monitor the same public blogger. Vane may de-duplicate public
 content bytes by canonical content identity, but the following never cross
 that boundary:
 
 - private query terms, URLs, credentials or Tool arguments;
-- source enable/disable and failure state;
+- Tool-call health and failure state;
 - acquisition cursors and retry timing;
-- display metadata;
 - content appearance and evidence attribution.
 
-Deleting a task removes its current Source instances and private configuration.
+Deleting a task removes its current Tool calls, state and private configuration.
 Historical delivery/evidence retention follows the explicit evidence policy;
-it is never achieved by retaining an unscoped global Source row.
+it is never achieved by retaining an unscoped global acquisition row.
 
 ## Run invariants
 
@@ -99,8 +92,8 @@ old snapshot bytes.
 Every accepted content item and every delivery must trace to:
 
 ```text
-tenant/user/task → task Source → run snapshot
-                 → Tool invocation → canonical Tool arguments → appearance/evidence
+tenant/user/task → approved Tool invocation → run snapshot
+                 → canonical Tool arguments → observation/evidence
 ```
 
 Display labels are not acquisition identity.
@@ -114,7 +107,7 @@ IDs. Until their evidence is migrated, the old physical acquisition tables are:
 - read/write only for retained v1 execution and recovery;
 - forbidden in the Agent/model protocol;
 - forbidden as a current control-plane truth source;
-- not product objects and not reusable for new task Source materialization;
+- not product objects and not reusable for new task Tool-call compilation;
 - forbidden from receiving new private query, URL or configuration data.
 
 This is a temporary compatibility root, not the target architecture.
@@ -123,12 +116,11 @@ This is a temporary compatibility root, not the target architecture.
 
 The remaining data-plane cutover is intentionally ordered:
 
-1. Seal canonical Tool calls directly in task-owned Source rows and the
-   approved task head.
-2. Give Source rows tenant/user/task ownership, RLS/purge behavior and
-   independent health/cursor state.
-3. Build new run snapshots only from those sealed Source rows.
-4. Add task-Source/run/Tool-invocation provenance to content appearances.
+1. Seal canonical Tool calls directly in the approved task head.
+2. Scope Tool-call runtime state to tenant/user/task/call identity with
+   RLS/purge behavior and independent health/cursor state.
+3. Build new run snapshots only from those sealed Tool calls.
+4. Add task/run/Tool-invocation provenance to content observations.
 5. Route candidate selection, card reconstruction and evidence rendering
    through that provenance.
 6. Stop all current writers from materializing user configuration in the
@@ -144,9 +136,9 @@ claim cannot be represented exactly.
 ## Forbidden regressions
 
 - reintroducing `approved_fetch_plan` or `fetch_requirements` to Agent tools;
-- creating account-level Source CRUD or Source screens;
-- sharing Source identity, configuration, health or display metadata across
-  tenant/user/task boundaries;
+- creating a Source entity, Source CRUD, Source screen or Source ID workflow;
+- sharing Tool-call arguments, configuration or health across
+  tenant/user/task/call boundaries;
 - asking the user for task, source or target IDs;
 - reconstructing execution from mutable current Tool definitions;
 - deleting provenance rows to make a migration pass;
