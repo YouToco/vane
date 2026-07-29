@@ -13,41 +13,8 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"github.com/YouToco/vane/feedback"
-	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/types"
 )
-
-func TestSameFetchAcquisitionIdentity(t *testing.T) {
-	frozen := runcontext.SourceV1{
-		SourceID: 7, Platform: types.PlatformWeb,
-		Capability: types.CapSearch, URL: "https://example.com/query",
-		Title:  "frozen display title",
-		Config: json.RawMessage(`{"query":"ai","limit":10}`),
-	}
-	base := types.FetchTarget{
-		ID: 7, Platform: types.PlatformWeb,
-		Capability: types.CapSearch, URL: "https://example.com/query",
-		Title:  "current display title",
-		Config: json.RawMessage(`{"limit":10,"query":"ai"}`),
-	}
-	if !sameFetchAcquisitionIdentity(base, frozen) {
-		t.Fatal("display title and JSON key order must not change acquisition identity")
-	}
-	for name, mutate := range map[string]func(*types.FetchTarget){
-		"platform":   func(target *types.FetchTarget) { target.Platform = types.PlatformX },
-		"capability": func(target *types.FetchTarget) { target.Capability = types.CapFeed },
-		"url":        func(target *types.FetchTarget) { target.URL += "/other" },
-		"config":     func(target *types.FetchTarget) { target.Config = json.RawMessage(`{"query":"other","limit":10}`) },
-	} {
-		t.Run(name, func(t *testing.T) {
-			drifted := base
-			mutate(&drifted)
-			if sameFetchAcquisitionIdentity(drifted, frozen) {
-				t.Fatal("acquisition drift was accepted before paid fetch")
-			}
-		})
-	}
-}
 
 // ============================================================
 // 消费方接口的测试替身。fake 一律带锁：Temporal 测试环境在独立

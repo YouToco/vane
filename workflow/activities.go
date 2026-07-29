@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"reflect"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -1665,38 +1664,22 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 	if compiled {
 		frozenSourceIDs = make([]int64, len(snapshot.Definition.Sources))
 		frozenSources = make(map[int64]runcontext.SourceV1, len(snapshot.Definition.Sources))
+		targets = make([]types.FetchTarget, 0, len(snapshot.Definition.Sources))
 		for i, source := range snapshot.Definition.Sources {
 			frozenSourceIDs[i] = source.SourceID
 			frozenSources[source.SourceID] = source
+			// A scheduled Tool invocation belongs to this task run. Shared
+			// target due/health state must not let another user's run postpone,
+			// disable or otherwise mutate this task's acquisition.
+			targets = append(targets, types.FetchTarget{
+				ID: source.SourceID, Platform: source.Platform,
+				Capability: source.Capability, Title: source.Title,
+				URL: source.URL, Config: append(json.RawMessage(nil), source.Config...),
+				Status: types.FetchTargetStatusActive,
+			})
 		}
 		if len(frozenSourceIDs) == 0 {
 			return nil, nil
-		}
-		liveTargets, loadErr := a.compiledStore.ListDueFetchTargetsByIDs(ctx, frozenSourceIDs)
-		if loadErr != nil {
-			return nil, loadErr
-		}
-		targets = make([]types.FetchTarget, 0, len(liveTargets))
-		for _, live := range liveTargets {
-			frozen, ok := frozenSources[live.ID]
-			if !ok {
-				return nil, nonRetryable(types.NewAppError(types.CodeValidation,
-					"compiled source health escaped frozen scope", nil))
-			}
-			if !sameFetchAcquisitionIdentity(live, frozen) {
-				// Fail before the external fetch. A URL-dedup collision with
-				// different acquisition semantics must never spend money and
-				// only discover the drift during the write-back fence.
-				slog.Warn("workflow: 跳过抓取语义已漂移的冻结目标",
-					"task_id", p.ScheduleID, "fetch_target_id", live.ID)
-				continue
-			}
-			live.Platform = frozen.Platform
-			live.Capability = frozen.Capability
-			live.Title = frozen.Title
-			live.URL = frozen.URL
-			live.Config = append(json.RawMessage(nil), frozen.Config...)
-			targets = append(targets, live)
 		}
 	} else {
 		targets, err = a.store.ListDueFetchTargetsByTask(ctx, p.ScheduleID)
@@ -1783,13 +1766,7 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 			// 单源失败不拖垮整批：某个源挂了不该让当次推送整体失败；
 			// 同时自增 fail_count 并推进 next_fetch_at，避免调度紧循环重试。
 			var crossed, justDisabled bool
-			if compiled {
-				crossed, justDisabled, err = a.markCompiledFetchResultV1(
-					ctx, compiledIdentity, compiledInput.Snapshot, src, false)
-				if err != nil {
-					return nil, retryableOrNot(err)
-				}
-			} else {
+			if !compiled {
 				crossed, justDisabled = a.markFetchResult(ctx, src, false)
 			}
 			slog.Warn("fetch: 单源抓取失败，跳过", "source_id", src.ID, "platform", src.Platform, "capability", src.Capability, "url", src.URL, "err", ferr)
@@ -1823,13 +1800,7 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 				slog.Warn("fetch: 内容入库失败，跳过", "source_id", src.ID, "err", ierr)
 			}
 		}
-		if compiled {
-			if _, _, err := a.markCompiledFetchResultV1(
-				ctx, compiledIdentity, compiledInput.Snapshot, src, true,
-			); err != nil {
-				return nil, retryableOrNot(err)
-			}
-		} else {
+		if !compiled {
 			a.markFetchResult(ctx, src, true) // 成功：清零 fail_count、推进 last/next_fetch_at。
 		}
 	}
@@ -4844,24 +4815,6 @@ func filterFetchTargets(targets []types.FetchTarget, want []int64) []types.Fetch
 		}
 	}
 	return out
-}
-
-func sameFetchAcquisitionIdentity(
-	live types.FetchTarget,
-	frozen runcontext.SourceV1,
-) bool {
-	if live.ID != frozen.SourceID ||
-		live.Platform != frozen.Platform ||
-		live.Capability != frozen.Capability ||
-		live.URL != frozen.URL {
-		return false
-	}
-	var liveConfig, frozenConfig any
-	if json.Unmarshal(live.Config, &liveConfig) != nil ||
-		json.Unmarshal(frozen.Config, &frozenConfig) != nil {
-		return false
-	}
-	return reflect.DeepEqual(liveConfig, frozenConfig)
 }
 
 // NotifyEmptyIn 是 NotifyEmptyResult Activity 的入参。

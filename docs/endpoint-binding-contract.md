@@ -1,8 +1,8 @@
 # Endpoint Binding Contract
 
 > Status: current. This document describes only the deterministic runtime
-> binding engine. User-facing source CRUD, account subscriptions, instance
-> probes, and confirmation cards are retired.
+> binding engine. Account-wide source CRUD, account subscriptions, instance
+> probes, and confirmation cards are retired. Task-owned Sources remain.
 
 ## Boundary
 
@@ -14,8 +14,9 @@ different:
   `content_items`;
 - scheduled acquisition uses only reviewed Tool definitions;
 - the Agent selects Tools directly from the task manual;
-- exact Tool calls are sealed in the approved task head and run snapshot;
-- users never bind, list, enable, disable, or delete acquisition instances.
+- exact Tool calls are sealed in task-owned Sources, the approved task head
+  and run snapshot;
+- users manage Sources by natural-language task edits, never by internal ID.
 
 ## Binding model
 
@@ -55,8 +56,9 @@ A scheduled acquisition Tool may become available only after:
 5. parameter validation rejects unknown or missing fields;
 6. paid enrichment is protected by the shared cost gate.
 
-There is no per-user or per-target trial run. Exact invocation identity is the
-versioned Tool name plus canonical arguments; display labels are not identity.
+There is no confirmation-card trial run. Exact invocation identity is the
+versioned Tool name plus canonical arguments, scoped to one tenant/user/task
+Source; display labels are not identity.
 
 ## Runtime
 
@@ -70,8 +72,9 @@ Every run:
 6. calls the provider with bounded timeout and response size;
 7. maps items through the declared binding;
 8. rejects empty identities and response-shape drift;
-9. records upstream attribution, cost, and the Tool invocation outcome;
-10. writes canonical content and provenance.
+9. records upstream attribution, cost, and the task Source/Tool invocation
+   outcome;
+10. writes canonical content plus task-isolated appearance provenance.
 
 Provider failure is explicit. In particular, X capabilities use only the
 reviewed TikHub route; they never fall back to an official X API, syndication,
