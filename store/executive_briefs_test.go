@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -303,5 +304,57 @@ func TestExecutiveSynthesisClaimlessSpendingRecoveryFreezesArtifact(
 		len(artifact.Content.Signals) != 0 ||
 		len(artifact.Content.NextSteps) != 0 {
 		t.Fatalf("claimless recovery artifact=%+v", artifact)
+	}
+}
+
+func TestExecutiveSynthesisRecoveryCandidateCarriesCompleteSnapshotReference(
+	t *testing.T,
+) {
+	f, marker, draft := executiveSynthesisFixtureV1(t, true)
+	prepareExecutiveSynthesisReceiptV1(t, f, marker, draft)
+	tx, err := f.base.st.pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(t.Context()) }()
+	if _, err := tx.Exec(t.Context(), `
+		SELECT set_config('app.tenant_id',$1,true),
+		       set_config('app.user_id',$2,true)`,
+		fmt.Sprint(f.identity.TenantID), fmt.Sprint(f.identity.UserID),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(
+		t.Context(), `SET LOCAL ROLE vane_brief_synthesis_writer`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `
+		UPDATE executive_brief_synthesis_receipts
+		   SET status='spending',
+		       spending_started_at=clock_timestamp()-interval '3 minutes'
+		 WHERE run_outcome_id=$1 AND status='prepared'`,
+		marker.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	candidates, err := f.base.st.ListExecutiveSynthesisRecoveryCandidatesV1(
+		t.Context(), nil, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("recovery candidates = %d, want 1", len(candidates))
+	}
+	candidate := candidates[0]
+	if candidate.Ref != f.ref ||
+		candidate.Identity != f.identity ||
+		candidate.Marker != marker ||
+		candidate.Kind != "fallback" {
+		t.Fatalf("recovery candidate lost immutable identity: %+v", candidate)
 	}
 }
