@@ -156,6 +156,59 @@ func TestDeterministicPeriodicFallbackV1FailsClosedWithoutClaims(
 	if _, err := ParsePeriodicContentV1(raw, []types.BriefV1{brief}); err == nil {
 		t.Fatal("claimless periodic model output was accepted")
 	}
+	prompt, selected, partial, err := BuildPeriodicPromptV1(
+		draft.TaskID, ProfileContextV1{},
+		draft.GeneratedAt.Add(-time.Hour), draft.GeneratedAt.Add(time.Hour),
+		[]types.BriefV1{brief},
+	)
+	if err == nil || prompt != "" || partial ||
+		len(selected) != 1 || selected[0].ID != brief.ID ||
+		selected[0].Digest != brief.Digest ||
+		len(selected[0].Insights) != 1 ||
+		selected[0].Insights[0].ID != brief.Insights[0].ID {
+		t.Fatalf(
+			"claimless prompt fallback lost canonical input: prompt=%q selected=%+v partial=%v err=%v",
+			prompt, selected, partial, err)
+	}
+	content, err = DeterministicPeriodicFallbackV1(selected)
+	if err != nil || content.DecisionState !=
+		types.ExecutiveDecisionInsufficientEvidence {
+		t.Fatalf("selected claimless fallback=%+v err=%v", content, err)
+	}
+
+	unstructuredDraft := draft
+	unstructuredDraft.Insights = append(
+		[]types.InsightV1(nil), draft.Insights...)
+	unstructuredDraft.Insights[0].Structured = nil
+	unstructured, err := unstructuredDraft.Seal(18)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt, selected, _, err = BuildPeriodicPromptV1(
+		draft.TaskID, ProfileContextV1{},
+		draft.GeneratedAt.Add(-time.Hour), draft.GeneratedAt.Add(time.Hour),
+		[]types.BriefV1{unstructured},
+	)
+	if err == nil || prompt != "" || len(selected) != 1 {
+		t.Fatalf(
+			"unstructured prompt fallback prompt=%q selected=%+v err=%v",
+			prompt, selected, err)
+	}
+	content, err = DeterministicPeriodicFallbackV1(selected)
+	if err != nil || content.DecisionState !=
+		types.ExecutiveDecisionInsufficientEvidence ||
+		len(content.Signals) != 0 || len(content.NextSteps) != 0 {
+		t.Fatalf("unstructured periodic fallback=%+v err=%v", content, err)
+	}
+	raw, err = json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParsePeriodicContentV1(
+		raw, []types.BriefV1{unstructured},
+	); err == nil {
+		t.Fatal("unstructured periodic model output was accepted")
+	}
 }
 
 func TestPeriodicSynthesisUsesCanonicalPrefixesAndRejectsForeignRefs(
@@ -191,6 +244,55 @@ func TestPeriodicSynthesisUsesCanonicalPrefixesAndRejectsForeignRefs(
 	raw, _ = json.Marshal(content)
 	if _, err := ParsePeriodicContentV1(raw, selected); err == nil {
 		t.Fatal("foreign Brief reference was accepted")
+	}
+}
+
+func TestClaimlessPeriodicPromptPreservesEveryCanonicalBriefForFallback(
+	t *testing.T,
+) {
+	now := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
+	first := executiveTestBrief(t, 11, now.Add(-time.Hour), 2)
+	second := executiveTestBrief(t, 12, now.Add(-2*time.Hour), 2)
+	third := executiveTestBrief(t, 13, now.Add(-3*time.Hour), 2)
+	firstDraft := first.BriefDraftV1
+	firstDraft.Insights = append([]types.InsightV1(nil), first.Insights...)
+	structured := *firstDraft.Insights[0].Structured
+	structured.Claims = nil
+	structured.WhatChanged = ""
+	structured.WhyItMatters = ""
+	structured.ImportanceReason = ""
+	firstDraft.Insights[0].Structured = &structured
+	var err error
+	first, err = firstDraft.Seal(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prompt, selected, partial, promptErr := BuildPeriodicPromptV1(
+		"task-a", ProfileContextV1{}, now.Add(-24*time.Hour),
+		now, []types.BriefV1{third, first, second})
+	if promptErr == nil || prompt != "" || partial ||
+		len(selected) != 3 {
+		t.Fatalf(
+			"claimless multi-Brief selection prompt=%q selected=%d partial=%v err=%v",
+			prompt, len(selected), partial, promptErr)
+	}
+	expected := []types.BriefV1{first, second, third}
+	for index, brief := range selected {
+		if brief.ID != expected[index].ID ||
+			brief.Digest != expected[index].Digest ||
+			len(brief.Insights) == 0 {
+			t.Fatalf("selected[%d]=%+v", index, brief)
+		}
+	}
+	content, err := DeterministicPeriodicFallbackV1(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content.DecisionState !=
+		types.ExecutiveDecisionInsufficientEvidence ||
+		content.ValidatePeriodicFallback() != nil {
+		t.Fatalf("claimless multi-Brief fallback=%+v", content)
 	}
 }
 
