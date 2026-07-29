@@ -28,6 +28,11 @@ const (
 	// still append the terminal fact to Agent history, but there is no external
 	// provider mutation to perform.
 	WebActionReceiptProvider = "web_action_poll/v1"
+	// AgentAutoReceiptProvider identifies a durable operation authorized by
+	// the owner's current natural-language request. Like browser polling it
+	// has no external provider mutation, but its history must not claim that a
+	// confirmation card was clicked.
+	AgentAutoReceiptProvider = "agent_auto/v1"
 
 	creationReceiptPayloadVersion = "vane.task-creation-user-receipt/v1"
 	creationReceiptPollInterval   = 2 * time.Second
@@ -82,11 +87,30 @@ func WebActionReceiptTarget(actionID string) CreationReceiptTarget {
 	}
 }
 
+func AgentAutoReceiptTarget(actionID string) CreationReceiptTarget {
+	return CreationReceiptTarget{
+		Provider: AgentAutoReceiptProvider,
+		Target:   actionID,
+	}
+}
+
 func validWebActionReceiptTarget(provider, target, actionID string) bool {
 	return provider == WebActionReceiptProvider &&
 		target == actionID &&
 		strings.TrimSpace(actionID) != "" &&
 		actionID == strings.TrimSpace(actionID)
+}
+
+func validAgentAutoReceiptTarget(provider, target, actionID string) bool {
+	return provider == AgentAutoReceiptProvider &&
+		target == actionID &&
+		strings.TrimSpace(actionID) != "" &&
+		actionID == strings.TrimSpace(actionID)
+}
+
+func validLocalActionReceiptTarget(provider, target, actionID string) bool {
+	return validWebActionReceiptTarget(provider, target, actionID) ||
+		validAgentAutoReceiptTarget(provider, target, actionID)
 }
 
 // CreationReceiptStore is the durable A6 outbox boundary. Every mutable method
@@ -304,7 +328,7 @@ func (d *CreationReceiptDispatcher) dispatchReceipt(
 		}
 	}
 
-	if !validWebActionReceiptTarget(
+	if !validLocalActionReceiptTarget(
 		receipt.Provider, receipt.Target, receipt.OperationID,
 	) {
 		sendCtx, cancel := context.WithTimeout(ctx, creationReceiptSendTimeout)
@@ -452,6 +476,18 @@ func renderCreationUserReceipt(
 				"task creation receipt failure checkpoint is invalid", nil)
 		}
 		history = "[卡片回调] 用户已点击「确认」，但任务创建已安全停止，任务未创建。"
+	}
+	if validAgentAutoReceiptTarget(
+		receipt.Provider, receipt.Target, receipt.OperationID,
+	) {
+		switch receipt.OperationStatus {
+		case types.PendingActionStatusExecuted:
+			history = "[Agent执行] 用户已在当前消息中明确要求，任务已成功创建。"
+		case types.PendingActionStatusBlocked, types.PendingActionStatusFailed:
+			history = "[Agent执行] 用户已在当前消息中明确要求，但任务创建已安全停止，任务未创建。"
+		case types.PendingActionStatusExpired:
+			history = "[Agent执行] 用户已在当前消息中明确要求，但任务创建操作已过期，任务未创建。"
+		}
 	}
 	return display, history, nil
 }

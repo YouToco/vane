@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/YouToco/vane/scheduler"
@@ -38,41 +39,41 @@ func TestProductionToolPolicyGolden(t *testing.T) {
 
 	want := []expectedToolPolicy{
 		{
-			name: "list_sources",
-			effects: Effects(EffectInternalRead),
-			auth: AuthorizationOwner | AuthorizationA2AReadOnly,
+			name:         "list_sources",
+			effects:      Effects(EffectInternalRead),
+			auth:         AuthorizationOwner | AuthorizationA2AReadOnly,
 			confirmation: ConfirmationNone, budget: BudgetNone,
 			a2aAuthorized: true,
 		},
 		{
-			name: "add_source",
-			effects: Effects(EffectNetworkRead, EffectBillable, EffectStateWrite, EffectTrustTaint),
-			auth: AuthorizationOwner, confirmation: ConfirmationRequired,
+			name:    "add_source",
+			effects: Effects(EffectNetworkRead, EffectBillable, EffectStateWrite, EffectTrustTaint, EffectDirectOwnerWrite),
+			auth:    AuthorizationOwner, confirmation: ConfirmationNone,
 			budget: BudgetDownstreamManaged,
 		},
 		{
-			name: "remove_source",
+			name:    "remove_source",
 			effects: Effects(EffectStateWrite, EffectDirectOwnerWrite),
-			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
+			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
-			name: "enable_source", effects: Effects(EffectStateWrite),
-			auth: AuthorizationOwner, confirmation: ConfirmationRequired, budget: BudgetNone,
+			name: "enable_source", effects: Effects(EffectStateWrite, EffectDirectOwnerWrite),
+			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
 			name: "list_schedules", effects: Effects(EffectInternalRead),
-			auth: AuthorizationOwner | AuthorizationA2AReadOnly,
+			auth:         AuthorizationOwner | AuthorizationA2AReadOnly,
 			confirmation: ConfirmationNone, budget: BudgetNone, a2aAuthorized: true,
 		},
 		{
-			name: "create_schedule",
-			effects: Effects(EffectDurableProposal, EffectStateWrite),
-			auth: AuthorizationOwner, confirmation: ConfirmationRequired, budget: BudgetNone,
+			name:    "create_schedule",
+			effects: Effects(EffectDurableProposal, EffectStateWrite, EffectDirectOwnerWrite),
+			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
-			name: "remove_schedule",
+			name:    "remove_schedule",
 			effects: Effects(EffectStateWrite, EffectDirectOwnerWrite),
-			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
+			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
 			name: "push_now", effects: Effects(EffectDelivery),
@@ -84,37 +85,37 @@ func TestProductionToolPolicyGolden(t *testing.T) {
 			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
-			name: "update_profile", effects: Effects(EffectStateWrite),
-			auth: AuthorizationOwner, confirmation: ConfirmationRequired, budget: BudgetNone,
+			name: "update_profile", effects: Effects(EffectStateWrite, EffectDirectOwnerWrite),
+			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
 			name: "view_task_playbook", effects: Effects(EffectInternalRead),
 			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
-			name: "edit_task_definition",
-			effects: Effects(EffectDurableProposal, EffectStateWrite),
-			auth: AuthorizationOwner, confirmation: ConfirmationRequired, budget: BudgetNone,
+			name:    "edit_task_definition",
+			effects: Effects(EffectDurableProposal, EffectStateWrite, EffectDirectOwnerWrite),
+			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
-			name: "search_endpoints",
+			name:    "search_endpoints",
 			effects: Effects(EffectNetworkRead, EffectBillable, EffectActivationWrite),
-			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetToolManaged,
+			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetToolManaged,
 		},
 		{
-			name: "read_endpoint_result",
+			name:    "read_endpoint_result",
 			effects: Effects(EffectLocalHandleRead, EffectTrustTaint),
-			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
+			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
-			name: "web_search",
+			name:    "web_search",
 			effects: Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
-			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetToolManaged,
+			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetToolManaged,
 		},
 		{
-			name: "read_page",
+			name:    "read_page",
 			effects: Effects(EffectNetworkRead, EffectBillable, EffectTrustTaint),
-			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetToolManaged,
+			auth:    AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetToolManaged,
 		},
 	}
 
@@ -126,6 +127,17 @@ func TestProductionToolPolicyGolden(t *testing.T) {
 		byName[spec.Name()] = spec
 		if err := spec.validate(); err != nil {
 			t.Fatalf("production tool %q invalid: %v", spec.Name(), err)
+		}
+		modelContract := spec.Definition.Description + string(spec.Definition.Parameters)
+		for _, forbidden := range []string{
+			"待用户确认",
+			"先发原确认卡",
+			"点击确认",
+			"确认后由",
+		} {
+			if strings.Contains(modelContract, forbidden) {
+				t.Fatalf("production tool %q leaks retired confirmation UX %q", spec.Name(), forbidden)
+			}
 		}
 	}
 	if len(byName) != len(want) {

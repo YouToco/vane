@@ -1,31 +1,33 @@
 # Agent Runtime 双轨执行契约
 
 > 状态：正式演进契约，2026-07-21 起按 C0→C4 小步落地。本文描述运行时边界，
-> 不新增公开 HTTP/A2A wire contract。任务创建仍以 Agent 确认卡和 A5/A6 saga 为唯一生产写入口。
+> 不新增公开 HTTP/A2A wire contract。7.10-B5 起任务创建仍以 A5/A6 saga 为唯一生产
+> 写入口，但 Agent 以 server-owned receipt 自动授权推进，不再发行新确认卡。
 
 ## 1. 产品语义
 
-Vane 按用户确认的意图选择两种内部执行模式：
+Vane 按用户明确表达的意图选择两种内部执行模式：
 
-- `compiled`：稳定监控任务。创建或编辑时编译并确认计划，每次触发直接运行已批准计划。
+- `compiled`：稳定监控任务。创建或编辑时编译并冻结计划，每次触发直接运行已批准计划。
 - `discover_at_run`：动态研究任务。每次触发先运行受限 `PlanFetch` Activity，再把合法计划交给固定流水线。
 - `unknown`：只作零值和损坏数据哨兵，任何运行路径都必须 fail-closed，绝不能隐式退化为 `compiled`。
 
 存量任务由兼容解析器**显式**映射为 `compiled`。模式是 Approved Definition 的一部分；
-系统确认时须用用户语言说明，用户可用自然语言改选并再次确认。
+系统冻结时须用用户语言说明，用户可用自然语言继续修改。
 
 ## 2. Approved Definition 与 Adaptive State
 
 两类状态必须物理和语义分离：
 
 - Approved Definition：主题、范围、日程、预算、渠道、长期信源、执行模式和呈现要求。
-  只能经用户确认改变。
+  只能经用户明确提出的自然语言写请求改变。
 - Adaptive State：同一已批准意图内的查询变体、只读能力排序、运行统计、健康状态和
   可回滚故障恢复状态。只能在受限规则内自动更新。last-known-good 指针只能指向已批准计划，
   或经固定代码判定为同主体、同 canonical domain 的等价恢复；动态单次发现计划不得跨 run 晋升。
 
 动态发现的新源默认仅本次运行可用。除同一主体、同一 canonical domain 的等价端点恢复外，
-长期新增信源、订阅、主题、日程、预算、渠道、账号或任何写操作都必须重新确认；用户不在线时拒绝改变。
+长期新增信源、订阅、主题、日程、预算、渠道、账号或任何写操作都必须由新的明确用户请求触发；
+运行时不得自行扩大范围。
 
 **C2 持久化不变量**：`discover_at_run` 必须带精确的 Approved Definition head；只有
 `compiled` 可作为兼容期 headless 状态。每次 Adaptive 写入都携带其运行快照消费的 definition
@@ -82,6 +84,13 @@ message ID。第 3 步现已接通独立 terminal outbox dispatcher：只消费
 与固定 session 事实，先原子 checkpoint session、再 Patch 原卡、最后 checkpoint sent；响应丢失只会
 以相同 target+bytes 精确 replay，不会新发卡或重复 session 消息。dispatcher 无论 feature flag 状态均在
 所有 ingress 前启动，用于收敛历史 outbox；生产和普通用户行为仍因 flag 默认关闭而不暴露编辑工具。
+
+7.10-B5 起，新 Agent 编辑请求不再发行确认卡：模型给出的 exact edit command 仍先经
+`Propose` 冻结 base/target 与审计身份，随后由 Agent 用 server-owned
+`agent_auto/v1` receipt 自动调用 `Confirm` 推进原 durable coordinator；终态会话事实
+使用 `[Agent执行]`，不得伪造卡片点击。旧卡片的
+App fingerprint + message ID 绑定、Confirm/Cancel callback 与 outbox 继续只负责历史
+动作收敛；去掉交互确认不得复活任何 retired writer，也不得改变单一 durable owner。
 
 这里的 **attempt** 专指一次代码级 `runTaskDefinitionEditAttempt` 调用：它从一个已持久化 phase 开始，最多
 调用一次 Pause/Apply/Restore raw phase，并在一次本地事务推进或一次远端 checkpoint 后立即返回。同一条仍

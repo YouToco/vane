@@ -27,10 +27,11 @@ const (
 	EffectTrustTaint
 	EffectLocalHandleRead
 	EffectActivationWrite
-	// EffectDirectOwnerWrite is a deliberately narrow exception for an
-	// owner-only write whose model-visible schema contains every required
-	// target. The Agent may execute it inline after resolving ambiguity in
-	// conversation; it must never enter the A2A surface.
+	// EffectDirectOwnerWrite marks an owner-only write whose model-visible
+	// schema contains every required target or complete desired state. The
+	// Agent executes it inline after resolving ambiguity in conversation; it
+	// must never enter the A2A surface. Cross-system implementations may still
+	// create and immediately advance a durable operation internally.
 	EffectDirectOwnerWrite
 )
 
@@ -234,8 +235,9 @@ func (p ToolPolicy) validate() error {
 		return errors.New("state write or durable proposal requires confirmation")
 	}
 	if p.Effects.Has(EffectDurableProposal) &&
-		p.Confirmation != ConfirmationRequired {
-		return errors.New("durable proposal requires confirmation")
+		p.Confirmation != ConfirmationRequired &&
+		!p.Effects.Has(EffectDirectOwnerWrite) {
+		return errors.New("durable proposal requires confirmation or direct owner execution")
 	}
 	if p.Effects.Has(EffectDirectOwnerWrite) &&
 		(!p.Effects.Has(EffectStateWrite) ||

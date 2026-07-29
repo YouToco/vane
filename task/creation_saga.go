@@ -1162,7 +1162,7 @@ func validateCreationReceiptTarget(
 		return creationValidation("任务回执目标缺失，请重新点击原确认卡。", nil)
 	}
 	if !validFeishuCardPatchReceiptProvider(target.Provider) &&
-		!validWebActionReceiptTarget(
+		!validLocalActionReceiptTarget(
 			target.Provider, target.Target, op.ID,
 		) {
 		return creationValidation("任务回执通道不受支持，请重新点击原确认卡。", nil)

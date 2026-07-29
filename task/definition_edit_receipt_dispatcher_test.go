@@ -371,32 +371,39 @@ func TestDefinitionEditReceiptDispatcher_AmbiguousPatchReplayKeepsOneResource(
 	}
 }
 
-func TestDefinitionEditReceiptDispatcher_WebPollingSkipsExternalSender(
+func TestDefinitionEditReceiptDispatcher_LocalReceiptsSkipExternalSender(
 	t *testing.T,
 ) {
-	st := newDefinitionEditReceiptFakeStore(
-		types.TaskDefinitionEditOperationStatusCompleted,
-	)
-	st.r.Provider = WebActionReceiptProvider
-	st.r.Target = st.r.OperationID
-	sessions := &definitionEditReceiptFakeSessions{}
-	sender := &definitionEditReceiptFakeSender{}
-	d := newDefinitionEditReceiptDispatcherForTest(
-		t, st, sessions, sender,
-	)
+	for _, provider := range []string{
+		WebActionReceiptProvider,
+		AgentAutoReceiptProvider,
+	} {
+		t.Run(provider, func(t *testing.T) {
+			st := newDefinitionEditReceiptFakeStore(
+				types.TaskDefinitionEditOperationStatusCompleted,
+			)
+			st.r.Provider = provider
+			st.r.Target = st.r.OperationID
+			sessions := &definitionEditReceiptFakeSessions{}
+			sender := &definitionEditReceiptFakeSender{}
+			d := newDefinitionEditReceiptDispatcherForTest(
+				t, st, sessions, sender,
+			)
 
-	if err := d.DispatchOnce(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	final := st.snapshot()
-	calls, resources := sender.snapshot()
-	if final.Status != types.TaskDefinitionEditReceiptStatusSent ||
-		final.ProviderMessageID != final.OperationID ||
-		calls != 0 || len(resources) != 0 || sessions.count() != 1 {
-		t.Fatalf(
-			"final=%+v calls=%d resources=%v sessions=%d",
-			final, calls, resources, sessions.count(),
-		)
+			if err := d.DispatchOnce(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			final := st.snapshot()
+			calls, resources := sender.snapshot()
+			if final.Status != types.TaskDefinitionEditReceiptStatusSent ||
+				final.ProviderMessageID != final.OperationID ||
+				calls != 0 || len(resources) != 0 || sessions.count() != 1 {
+				t.Fatalf(
+					"final=%+v calls=%d resources=%v sessions=%d",
+					final, calls, resources, sessions.count(),
+				)
+			}
+		})
 	}
 }
 
@@ -539,6 +546,20 @@ func TestRenderDefinitionEditUserReceipt_UsesOnlyFrozenTerminalFacts(
 			}
 		})
 	}
+
+	t.Run("agent auto authorization records no fictional card click", func(t *testing.T) {
+		receipt := newDefinitionEditReceiptFakeStore(
+			types.TaskDefinitionEditOperationStatusCompleted,
+		).snapshot()
+		receipt.Provider = AgentAutoReceiptProvider
+		receipt.Target = receipt.OperationID
+		_, history, err := renderDefinitionEditUserReceipt(receipt)
+		if err != nil || !strings.HasPrefix(history, "[Agent执行]") ||
+			strings.Contains(history, "点击") ||
+			strings.Contains(history, "确认卡") {
+			t.Fatalf("history=%q err=%v", history, err)
+		}
+	})
 }
 
 func TestDecodeDefinitionEditUserReceiptPayloadRejectsMutation(t *testing.T) {

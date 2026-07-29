@@ -551,7 +551,7 @@ func TestAddSourceTool_Summarize(t *testing.T) {
 	})
 }
 
-// TestEnableSourceTool 覆盖 enable_source（功能 5.2 重启用入口）：写工具须走确认卡，
+// TestEnableSourceTool 覆盖 enable_source（功能 5.2 重启用入口）：写工具直接执行，
 // Summarize 如实展示会启用哪个源。Execute 的归属校验（EnableSource 的 SQL WHERE）由
 // store 集成测试覆盖（enable_source 持具体 *store.Store 不可 fake）。
 func TestEnableSourceTool(t *testing.T) {
@@ -579,7 +579,7 @@ func TestOtherTools_Summarize(t *testing.T) {
 			t.Fatalf("实得 %q", got)
 		}
 	})
-	// 批量是本工具的核心承诺：一张卡完整列出每个 id，用户点一次确认全部。
+	// 批量是本工具的核心承诺：一次调用完整列出并处理每个 id。
 	t.Run("remove_source 批量列出全部 id", func(t *testing.T) {
 		got := (&removeSourceTool{}).Summarize(json.RawMessage(`{"source_ids":[31,32,33]}`))
 		if got != "取消订阅 3 个信源（id=31、32、33）" {
@@ -588,7 +588,7 @@ func TestOtherTools_Summarize(t *testing.T) {
 	})
 	t.Run("remove_schedule", func(t *testing.T) {
 		got := (&removeScheduleTool{}).Summarize(json.RawMessage(`{"schedule_id":"sched-7"}`))
-		if got != "删除定时推送任务（id=sched-7）" {
+		if got != "删除 1 个定时推送任务（id=sched-7）" {
 			t.Fatalf("实得 %q", got)
 		}
 	})
@@ -1457,7 +1457,9 @@ func TestCreateScheduleSchema_RequiresApprovedIntentAndFetchPlan(t *testing.T) {
 type fakeSchedulePusher struct {
 	gotSpec   scheduler.ScheduleSpec
 	gotID     string
+	gotIDs    []string
 	gotNLDesc *string
+	gotKeys   []string
 	calls     int
 }
 
@@ -1478,6 +1480,20 @@ func (f *fakeSchedulePusher) UpdatePush(_ context.Context, id string, _ int64, s
 func (f *fakeSchedulePusher) DeletePush(_ context.Context, id string, _ int64) error {
 	f.calls++
 	f.gotID = id
+	f.gotIDs = append(f.gotIDs, id)
+	return nil
+}
+
+func (f *fakeSchedulePusher) DeletePushIdempotent(
+	_ context.Context,
+	id string,
+	_ int64,
+	key string,
+) error {
+	f.calls++
+	f.gotID = id
+	f.gotIDs = append(f.gotIDs, id)
+	f.gotKeys = append(f.gotKeys, key)
 	return nil
 }
 
@@ -1534,14 +1550,33 @@ func TestScheduleTools_接线透传(t *testing.T) {
 		}
 	})
 
-	t.Run("remove 透传 id", func(t *testing.T) {
+	t.Run("remove 批量去重并透传全部 id", func(t *testing.T) {
 		f := &fakeSchedulePusher{}
-		if _, err := (&removeScheduleTool{sched: f}).Execute(context.Background(), 1,
-			json.RawMessage(`{"schedule_id":"push-1-xyz"}`)); err != nil {
+		result, err := (&removeScheduleTool{sched: f}).Execute(context.Background(), 1,
+			json.RawMessage(`{"schedule_ids":["push-1-a","push-1-b","push-1-a"]}`))
+		if err != nil {
 			t.Fatalf("Execute 失败: %v", err)
 		}
-		if f.gotID != "push-1-xyz" {
-			t.Errorf("schedule_id 透传错: %q", f.gotID)
+		if !slices.Equal(f.gotIDs, []string{"push-1-a", "push-1-b"}) {
+			t.Errorf("schedule_ids 透传错: %v", f.gotIDs)
+		}
+		if len(f.gotKeys) != 2 || f.gotKeys[0] == f.gotKeys[1] ||
+			f.gotKeys[0] != removeScheduleIdempotencyKey(1, "push-1-a") {
+			t.Errorf("批量删除必须为每个目标生成稳定且不同的幂等键: %v", f.gotKeys)
+		}
+		if result != "已删除 2 个定时推送任务。" {
+			t.Errorf("批量回执不符: %q", result)
+		}
+	})
+
+	t.Run("remove 兼容旧单数 id", func(t *testing.T) {
+		f := &fakeSchedulePusher{}
+		if _, err := (&removeScheduleTool{sched: f}).Execute(context.Background(), 1,
+			json.RawMessage(`{"schedule_id":"push-1-legacy"}`)); err != nil {
+			t.Fatalf("Execute 失败: %v", err)
+		}
+		if !slices.Equal(f.gotIDs, []string{"push-1-legacy"}) {
+			t.Errorf("legacy schedule_id 透传错: %v", f.gotIDs)
 		}
 	})
 }

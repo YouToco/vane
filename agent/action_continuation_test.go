@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -125,15 +127,16 @@ func TestRunToolCalls_RemoveSourceExecutesInlineWithoutConfirmation(
 	}
 }
 
-func TestHandleMessage_DescriptionResolvesThenRemovesWithoutCard(t *testing.T) {
+func TestHandleMessage_MultipleNamesResolveIntoOneBatchRemovalWithoutCard(t *testing.T) {
 	fs := newFakeStore()
 	list := &fakeTool{
-		name:   "list_sources",
-		result: "id=11｜标题=每天追踪 OpenAI 发布｜类型=rss｜状态=启用",
+		name: "list_sources",
+		result: "id=11｜标题=每天追踪 OpenAI 发布｜类型=rss｜状态=启用\n" +
+			"id=12｜标题=Anthropic 状态更新｜类型=rss｜状态=启用",
 	}
 	remove := &fakeTool{
 		name:   "remove_source",
-		result: "已取消订阅信源（id=11），信源与历史内容保留。",
+		result: "已取消订阅信源（id=11、12），信源与历史内容保留。",
 	}
 	removeSpec := newToolSpec(remove, ownerPolicy(
 		Effects(EffectStateWrite, EffectDirectOwnerWrite),
@@ -150,26 +153,27 @@ func TestHandleMessage_DescriptionResolvesThenRemovesWithoutCard(t *testing.T) {
 		{
 			ToolCalls: []llm.ToolCall{{
 				ID: "remove", Name: "remove_source",
-				Arguments: `{"source_ids":[11]}`,
+				Arguments: `{"source_ids":[11,12]}`,
 			}},
 			FinishReason: "tool_calls",
 		},
-		{Content: "已经把“每天追踪 OpenAI 发布”这个订阅停掉了。", FinishReason: "stop"},
+		{Content: "已经一次停掉“每天追踪 OpenAI 发布”和“Anthropic 状态更新”。", FinishReason: "stop"},
 	}}
 	loop := newTestLoop(t, fs, chat.fn, list, removeSpec)
 
 	out, err := loop.HandleMessage(
 		t.Context(),
 		9,
-		"把每天追 OpenAI 发布的那个订阅停掉",
+		"把每天追 OpenAI 发布和 Anthropic 状态更新这两个订阅都停掉",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if out.Confirm != nil ||
-		out.Reply != "已经把“每天追踪 OpenAI 发布”这个订阅停掉了。" ||
+		out.Reply != "已经一次停掉“每天追踪 OpenAI 发布”和“Anthropic 状态更新”。" ||
 		len(list.calls) != 1 ||
 		len(remove.calls) != 1 ||
+		remove.calls[0].args != `{"source_ids":[11,12]}` ||
 		len(fs.actions) != 0 {
 		t.Fatalf(
 			"out=%+v list=%+v remove=%+v pending=%d",
@@ -189,7 +193,7 @@ func TestHandleMessage_AmbiguousDescriptionAsksByNameWithoutCard(
 		BudgetNone,
 	))
 	chat := &scriptedChat{responses: []*llm.ChatResponse{{
-		Content: "你是想停掉“OpenAI 每日发布”，还是“OpenAI API 状态”？",
+		Content:      "你是想停掉“OpenAI 每日发布”，还是“OpenAI API 状态”？",
 		FinishReason: "stop",
 	}}}
 	loop := newTestLoop(t, fs, chat.fn, removeSpec)
@@ -204,6 +208,55 @@ func TestHandleMessage_AmbiguousDescriptionAsksByNameWithoutCard(
 		len(fs.actions) != 0 {
 		t.Fatalf("out=%+v remove=%+v pending=%d",
 			out, remove.calls, len(fs.actions))
+	}
+}
+
+func TestHandleMessage_DirectTaintedWriteReturnsOnceAndScrubsHistory(
+	t *testing.T,
+) {
+	fs := newFakeStore()
+	add := &fakeTool{
+		name: "add_source", mutating: true, untrusted: true,
+		result: "已添加并订阅信源（id=21）；试跑样例「EXTERNAL-INJECTION-CANARY」",
+	}
+	addSpec := newToolSpec(add, ownerPolicy(
+		Effects(
+			EffectNetworkRead,
+			EffectBillable,
+			EffectStateWrite,
+			EffectTrustTaint,
+			EffectDirectOwnerWrite,
+		),
+		ConfirmationNone,
+		BudgetDownstreamManaged,
+	))
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		ToolCalls: []llm.ToolCall{{
+			ID: "add", Name: "add_source",
+			Arguments: `{"platform":"web","capability":"feed","url":"https://example.com/rss"}`,
+		}},
+		FinishReason: "tool_calls",
+	}}}
+	loop := newTestLoop(t, fs, chat.fn, addSpec)
+
+	out, err := loop.HandleMessage(
+		t.Context(), 9, "订阅 https://example.com/rss",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Confirm != nil || out.Reply != add.result ||
+		len(chat.requests) != 1 || len(add.calls) != 1 {
+		t.Fatalf("out=%+v requests=%d calls=%+v",
+			out, len(chat.requests), add.calls)
+	}
+	raw, err := json.Marshal(persistedMessages(t, fs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("EXTERNAL-INJECTION-CANARY")) ||
+		!bytes.Contains(raw, []byte(untrustedSourceWritePlaceholder)) {
+		t.Fatalf("tainted write detail leaked into future history: %s", raw)
 	}
 }
 

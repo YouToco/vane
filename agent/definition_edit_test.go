@@ -114,9 +114,10 @@ func TestBuildTools_DefinitionEditFlagBoundary(t *testing.T) {
 	if tool == nil {
 		t.Fatal("enabled BuildTools did not register edit_task_definition")
 	}
-	if tool.Policy.Confirmation != ConfirmationRequired ||
-		!tool.Policy.Effects.Has(EffectDurableProposal) {
-		t.Fatal("edit_task_definition must require a confirmation card")
+	if tool.Policy.Confirmation != ConfirmationNone ||
+		!tool.Policy.Effects.Has(EffectDurableProposal) ||
+		!tool.Policy.Effects.Has(EffectDirectOwnerWrite) {
+		t.Fatal("edit_task_definition must auto-authorize its durable operation")
 	}
 	var schema struct {
 		Required []string `json:"required"`
@@ -151,9 +152,8 @@ func TestLoop_DefinitionEditProposalUsesControllerNotGenericPending(t *testing.T
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm == nil || out.Confirm.ActionID == "" ||
-		!strings.Contains(out.Confirm.Summary, "edit_task_definition") {
-		t.Fatalf("confirmation = %+v", out.Confirm)
+	if out.Confirm != nil || out.Reply == "" {
+		t.Fatalf("outcome = %+v", out)
 	}
 	if len(controller.proposeCalls) != 1 {
 		t.Fatalf("controller Propose calls = %d", len(controller.proposeCalls))
@@ -166,6 +166,11 @@ func TestLoop_DefinitionEditProposalUsesControllerNotGenericPending(t *testing.T
 	}
 	if store.createCalls != 0 {
 		t.Fatalf("definition edit used generic pending action: %d calls", store.createCalls)
+	}
+	if len(controller.confirmCalls) != 1 ||
+		controller.confirmCalls[0].actionID != controller.proposeCalls[0].ActionID ||
+		controller.confirmCalls[0].receipt.Provider != task.AgentAutoReceiptProvider {
+		t.Fatalf("auto-authorization calls=%+v", controller.confirmCalls)
 	}
 }
 
@@ -211,7 +216,7 @@ func TestLoop_WebDefinitionEditIsolatesHistoryAndPinsToolAndTask(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Confirm == nil || out.Confirm.ActionID != actionID {
+	if out.Confirm != nil || out.Reply == "" {
 		t.Fatalf("outcome=%+v", out)
 	}
 	if len(requests) != 2 {
@@ -236,6 +241,11 @@ func TestLoop_WebDefinitionEditIsolatesHistoryAndPinsToolAndTask(
 		string(controller.proposeCalls[0].RawArgs) !=
 			`{"task_id":"task-edit-1","strictness":"strict"}` {
 		t.Fatalf("proposal calls=%+v", controller.proposeCalls)
+	}
+	if len(controller.confirmCalls) != 1 ||
+		controller.confirmCalls[0].actionID != actionID ||
+		controller.confirmCalls[0].receipt.Provider != task.AgentAutoReceiptProvider {
+		t.Fatalf("auto-authorization calls=%+v", controller.confirmCalls)
 	}
 }
 
@@ -301,13 +311,17 @@ func TestLoop_WebCreationUsesTrustedActionIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Confirm == nil || out.Confirm.ActionID != actionID ||
-		len(controller.proposeCalls) != 1 ||
+	if out.Confirm != nil || len(controller.proposeCalls) != 1 ||
 		controller.proposeCalls[0].ActionID != actionID {
 		t.Fatalf(
 			"outcome=%+v calls=%+v",
 			out, controller.proposeCalls,
 		)
+	}
+	if len(controller.confirmCalls) != 1 ||
+		controller.confirmCalls[0].actionID != actionID ||
+		controller.confirmCalls[0].receipt != task.AgentAutoReceiptTarget(actionID) {
+		t.Fatalf("auto-authorization calls=%+v", controller.confirmCalls)
 	}
 }
 
