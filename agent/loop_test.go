@@ -42,10 +42,11 @@ type fakeStore struct {
 	upsertErr     error                 // 注入 UpsertProfileFields 的失败
 	upsertCalls   []upsertProfileRecord // UpsertProfileFields 入参留痕，断言截断与 nil 语义
 
-	updateCalls   int
-	lastMessages  json.RawMessage
-	lastTurnCount int
-	eventBatches  []agentledger.AppendBatch
+	updateCalls    int
+	lastMessages   json.RawMessage
+	lastTurnCount  int
+	eventBatches   []agentledger.AppendBatch
+	commitTurnHook func(context.Context) error
 
 	// mu 保护 appendCalls、getActiveCalls 与 sessions 内容：卡片回调/事件通告回写
 	// 在独立 goroutine 里执行，与测试主 goroutine 的断言读取并发。
@@ -170,10 +171,15 @@ func (f *fakeStore) CreateAgentSession(_ context.Context, userID int64) (*types.
 }
 
 func (f *fakeStore) CommitAgentSessionTurn(
-	_ context.Context,
+	ctx context.Context,
 	projection agentledger.SessionProjection,
 	batch agentledger.AppendBatch,
 ) (agentledger.ProjectionShadowAudit, error) {
+	if f.commitTurnHook != nil {
+		if err := f.commitTurnHook(ctx); err != nil {
+			return agentledger.ProjectionShadowAudit{}, err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	s, ok := f.sessions[batch.Scope.SessionID]
@@ -2807,9 +2813,10 @@ func TestRecordCreationReceiptSessionUsesAgentUserLock(t *testing.T) {
 		LeaseOwner: "receipt-worker", Fence: 3,
 	}
 	messages := json.RawMessage(`[{"role":"user","content":"[卡片回调] done"}]`)
-	muVal, _ := l.userMu.LoadOrStore(int64(7), &sync.Mutex{})
-	userMu := muVal.(*sync.Mutex)
-	userMu.Lock()
+	userMu := l.lockForUser(7)
+	if err := userMu.Lock(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	started := time.Now()
 	err := l.RecordCreationReceiptSession(t.Context(), receipt, messages)
 	if !errors.Is(err, errCreationReceiptSessionBusy) {
@@ -4120,8 +4127,10 @@ func TestAsyncSessionWritePanicRecovered(t *testing.T) {
 
 func TestDrainSessionWritesClosesAdmissionAndWaits(t *testing.T) {
 	l := New(Deps{})
-	mu := &sync.Mutex{}
-	mu.Lock()
+	mu := l.lockForUser(42)
+	if err := mu.Lock(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	l.userMu.Store(int64(42), mu)
 	firstRan := make(chan struct{})
 	l.asyncSessionWrite(context.Background(), 42, func(context.Context) {
@@ -4337,5 +4346,186 @@ func TestGroundedBriefReplyGuardRunsBeforeVisibleTurnPersistence(
 		strings.Contains(string(raw), "source-1") ||
 		!strings.Contains(string(raw), safeReply) {
 		t.Fatalf("raw reply crossed persistence guard: %s", raw)
+	}
+}
+
+func TestGroundedBriefQueuedTurnCancellationDoesNoWork(t *testing.T) {
+	fs := newFakeStore()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var providerCalls atomic.Int32
+	chat := func(ctx context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		call := providerCalls.Add(1)
+		if call != 1 {
+			return &llm.ChatResponse{Content: "unexpected second call"}, nil
+		}
+		close(entered)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-release:
+			return &llm.ChatResponse{Content: "first turn complete"}, nil
+		}
+	}
+	l := newTestLoop(t, fs, chat)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := l.HandleMessage(context.Background(), 7, "first turn")
+		firstDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first turn did not reach provider while holding user lock")
+	}
+	baselineReads := fs.getActiveCount()
+	baselineSessions := fs.sessionCount()
+
+	assertNoQueuedWork := func(
+		name string,
+		ctx context.Context,
+		cancel context.CancelFunc,
+		want error,
+	) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() {
+			_, err := l.HandleGroundedMessageGuarded(
+				ctx,
+				7,
+				"这份日报依据了哪些简报？",
+				`{"材料类型":"周期报告"}`,
+				func(reply string) (string, error) { return reply, nil },
+			)
+			done <- err
+		}()
+		if cancel != nil {
+			// Give the second turn an opportunity to reach the occupied lock.
+			time.Sleep(20 * time.Millisecond)
+			cancel()
+		}
+		select {
+		case err := <-done:
+			if !errors.Is(err, want) {
+				t.Fatalf("%s error = %v, want %v", name, err, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s queued turn did not leave the occupied lock", name)
+		}
+		if got := providerCalls.Load(); got != 1 {
+			t.Fatalf("%s provider calls = %d, want only first turn", name, got)
+		}
+		if got := fs.getActiveCount(); got != baselineReads {
+			t.Fatalf("%s session reads = %d, want baseline %d",
+				name, got, baselineReads)
+		}
+		if got := fs.sessionCount(); got != baselineSessions {
+			t.Fatalf("%s sessions = %d, want baseline %d",
+				name, got, baselineSessions)
+		}
+		if fs.updateCalls != 0 {
+			t.Fatalf("%s persisted turns = %d before first release, want 0",
+				name, fs.updateCalls)
+		}
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	assertNoQueuedWork(
+		"client cancellation", cancelCtx, cancel, context.Canceled)
+
+	deadlineCtx, deadlineCancel := context.WithTimeout(
+		context.Background(), 30*time.Millisecond)
+	defer deadlineCancel()
+	assertNoQueuedWork(
+		"execution deadline",
+		deadlineCtx, nil, context.DeadlineExceeded)
+
+	close(release)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first turn failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first turn did not finish after release")
+	}
+	if got := providerCalls.Load(); got != 1 {
+		t.Fatalf("provider calls after release = %d, want 1", got)
+	}
+	if fs.updateCalls != 1 {
+		t.Fatalf("persisted turns after release = %d, want only first turn",
+			fs.updateCalls)
+	}
+}
+
+func TestGroundedBriefExpiredProviderResultIsNotPersisted(t *testing.T) {
+	fs := newFakeStore()
+	var providerCalls atomic.Int32
+	chat := func(ctx context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+		providerCalls.Add(1)
+		<-ctx.Done()
+		// Simulate a provider/transport which races cancellation and still hands
+		// back a decoded response. The Agent boundary must discard it.
+		return &llm.ChatResponse{Content: "late response"}, nil
+	}
+	l := newTestLoop(t, fs, chat)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	_, err := l.HandleGroundedMessageGuarded(
+		ctx,
+		7,
+		"这份日报依据了哪些简报？",
+		`{"材料类型":"周期报告"}`,
+		func(reply string) (string, error) { return reply, nil },
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline exceeded", err)
+	}
+	if got := providerCalls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want the already-started call only", got)
+	}
+	if fs.updateCalls != 0 {
+		t.Fatalf("late provider response persisted %d turns, want 0",
+			fs.updateCalls)
+	}
+}
+
+func TestGroundedBriefCommitCrossingDeadlineCannotReturnSuccess(t *testing.T) {
+	fs := newFakeStore()
+	fs.commitTurnHook = func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	var providerCalls atomic.Int32
+	chat := func(
+		_ context.Context,
+		_ llm.ChatRequest,
+	) (*llm.ChatResponse, error) {
+		providerCalls.Add(1)
+		return &llm.ChatResponse{Content: "timely provider response"}, nil
+	}
+	l := newTestLoop(t, fs, chat)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	outcome, err := l.HandleGroundedMessageGuarded(
+		ctx,
+		7,
+		"这份日报依据了哪些简报？",
+		`{"材料类型":"周期报告"}`,
+		func(reply string) (string, error) { return reply, nil },
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline exceeded; outcome=%+v",
+			err, outcome)
+	}
+	if got := providerCalls.Load(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+	if fs.updateCalls != 0 {
+		t.Fatalf("deadline-crossing commit persisted %d turns, want 0",
+			fs.updateCalls)
 	}
 }

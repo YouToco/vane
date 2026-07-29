@@ -3,11 +3,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
+	neturl "net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -279,7 +282,168 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("POST /api/admin/invites", s.handleCreateInvite)
 	inner.HandleFunc("DELETE /api/admin/invites/{code}", s.handleDeleteInvite)
 
-	mux.Handle("/api/", s.cors(s.requireSession(inner)))
+	apiHandler := s.cors(
+		groundedBriefFollowupDeadlineV1(s.requireSession(inner)),
+	)
+	mux.Handle("/api/", apiHandler)
+}
+
+// groundedBriefFollowupDeadlineV1 is deliberately outside session auth (and
+// inside the non-blocking CORS boundary), but only acts on the two exact
+// grounded ask route shapes. Slow session lookup must not consume the server's
+// inherited 30s WriteTimeout before the handler gets a chance to widen it. The
+// shorter execution context leaves 23s nominal write headroom; even when the
+// last detached accounting tail consumes its full 10s after context expiry,
+// at least 13s remains for the bounded JSON response.
+func groundedBriefFollowupDeadlineV1(next http.Handler) http.Handler {
+	return groundedBriefFollowupDeadlineWithBudgetV1(
+		next,
+		groundedBriefFollowupExecutionBudget,
+		groundedBriefFollowupResponseHeadroom,
+	)
+}
+
+func groundedBriefFollowupDeadlineWithBudgetV1(
+	next http.Handler,
+	executionBudget time.Duration,
+	responseHeadroom time.Duration,
+) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isGroundedBriefFollowupRequestV1(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		now := time.Now()
+		writeDeadline := now.Add(executionBudget + responseHeadroom)
+		if err := http.NewResponseController(w).SetWriteDeadline(
+			writeDeadline,
+		); err != nil {
+			slog.Error(
+				"api: 简报追问无法在鉴权前设置有界写超时",
+				"err", err,
+			)
+			writeError(
+				w, http.StatusServiceUnavailable,
+				"简报追问暂时不可用，请稍后重试",
+			)
+			return
+		}
+		executionDeadline := now.Add(executionBudget)
+		ctx, cancel := context.WithDeadline(r.Context(), executionDeadline)
+		defer cancel()
+		ctx = context.WithValue(
+			ctx,
+			briefFollowupWriteDeadlineContextKeyV1{},
+			writeDeadline,
+		)
+		buffered := newGroundedBriefResponseBufferV1(w)
+		next.ServeHTTP(buffered, r.WithContext(ctx))
+		switch ctx.Err() {
+		case context.Canceled:
+			// The peer is gone. Discard any response auth/handler raced to
+			// produce instead of writing a misleading error to a dead socket.
+			return
+		case context.DeadlineExceeded:
+			// requireSession intentionally maps every lookup failure to 401.
+			// At this exact route boundary we still know the true cause and can
+			// replace that buffered response before any bytes reach the peer.
+			buffered.resetBody()
+			writeAppError(buffered, types.NewAppError(
+				types.CodeLLMUnavailable,
+				"简报追问处理超时，请稍后重试",
+				context.DeadlineExceeded,
+			))
+		}
+		if err := buffered.flush(); err != nil {
+			slog.Error("api: 简报追问写入最终响应失败", "err", err)
+		}
+	})
+}
+
+type groundedBriefResponseBufferV1 struct {
+	dst    http.ResponseWriter
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func newGroundedBriefResponseBufferV1(
+	dst http.ResponseWriter,
+) *groundedBriefResponseBufferV1 {
+	return &groundedBriefResponseBufferV1{
+		dst: dst, header: make(http.Header),
+	}
+}
+
+func (w *groundedBriefResponseBufferV1) Header() http.Header {
+	return w.header
+}
+
+func (w *groundedBriefResponseBufferV1) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *groundedBriefResponseBufferV1) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(p)
+}
+
+func (w *groundedBriefResponseBufferV1) Unwrap() http.ResponseWriter {
+	return w.dst
+}
+
+func (w *groundedBriefResponseBufferV1) resetBody() {
+	w.body.Reset()
+	w.status = 0
+	w.header.Del("Content-Length")
+}
+
+func (w *groundedBriefResponseBufferV1) flush() error {
+	for key, values := range w.header {
+		w.dst.Header()[key] = append([]string(nil), values...)
+	}
+	status := w.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.dst.WriteHeader(status)
+	_, err := w.dst.Write(w.body.Bytes())
+	return err
+}
+
+func isGroundedBriefFollowupRequestV1(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	parts := strings.Split(
+		strings.TrimPrefix(r.URL.EscapedPath(), "/"), "/")
+	if len(parts) != 6 ||
+		!briefFollowupPathSegmentEqualsV1(parts[0], "api") ||
+		!briefFollowupPathSegmentEqualsV1(parts[1], "schedules") ||
+		!briefFollowupPathSegmentNonEmptyV1(parts[2]) ||
+		!briefFollowupPathSegmentNonEmptyV1(parts[4]) ||
+		!briefFollowupPathSegmentEqualsV1(parts[5], "ask") {
+		return false
+	}
+	return briefFollowupPathSegmentEqualsV1(parts[3], "briefs") ||
+		briefFollowupPathSegmentEqualsV1(parts[3], "reports")
+}
+
+func briefFollowupPathSegmentEqualsV1(
+	escaped string,
+	want string,
+) bool {
+	value, err := neturl.PathUnescape(escaped)
+	return err == nil && value == want
+}
+
+func briefFollowupPathSegmentNonEmptyV1(escaped string) bool {
+	value, err := neturl.PathUnescape(escaped)
+	return err == nil && value != ""
 }
 
 // cors 处理 Dashboard 前端的跨源请求（前端在 vane.*、API 在 api.*，同站不同源）。

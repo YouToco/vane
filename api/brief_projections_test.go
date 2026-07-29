@@ -1,7 +1,12 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +14,423 @@ import (
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
 )
+
+type briefFollowupDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+	setErr    error
+}
+
+type briefFollowupSlowAuthStore struct {
+	AuthStore
+	delay time.Duration
+}
+
+func (s *briefFollowupSlowAuthStore) LookupSession(
+	ctx context.Context,
+	_ []byte,
+) (*types.Session, error) {
+	timer := time.NewTimer(s.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, types.NewAppError(
+			types.CodeNotFound, "fake: session not found", nil)
+	}
+}
+
+func (w *briefFollowupDeadlineRecorder) SetWriteDeadline(
+	deadline time.Time,
+) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return w.setErr
+}
+
+func TestBriefFollowupWriteBudgetCoversBoundedRetryContract(t *testing.T) {
+	if groundedBriefFollowupExecutionBudget != 397*time.Second {
+		t.Fatalf("grounded retry contract drifted to %s",
+			groundedBriefFollowupExecutionBudget)
+	}
+	if groundedBriefFollowupWriteBudget != 7*time.Minute {
+		t.Fatalf("write budget = %s, want exactly 7m", groundedBriefFollowupWriteBudget)
+	}
+	if groundedBriefFollowupWriteBudget <=
+		groundedBriefFollowupExecutionBudget {
+		t.Fatalf("write budget %s does not leave response headroom after %s",
+			groundedBriefFollowupWriteBudget,
+			groundedBriefFollowupExecutionBudget)
+	}
+}
+
+func TestBriefFollowupExtendsRealServerWriteDeadlineForStructuredLLMError(
+	t *testing.T,
+) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := prepareBriefFollowupResponseV1(
+			w, r.Context(), time.Now(),
+		); err != nil {
+			t.Errorf("prepare response: %v", err)
+			return
+		}
+		// Exceed the real server WriteTimeout. Without the route-local
+		// ResponseController deadline the client observes EOF, not this JSON.
+		time.Sleep(100 * time.Millisecond)
+		writeAppError(w, types.NewAppError(
+			types.CodeLLMRateLimit,
+			"模型服务繁忙，请稍后重试",
+			errors.New("provider returned 429"),
+		))
+	})
+	testServer := httptest.NewUnstartedServer(handler)
+	testServer.Config.WriteTimeout = 20 * time.Millisecond
+	testServer.Start()
+	t.Cleanup(testServer.Close)
+
+	response, err := testServer.Client().Get(testServer.URL)
+	if err != nil {
+		t.Fatalf("grounded error response became a transport failure: %v", err)
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read structured response: %v", err)
+	}
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body=%s",
+			response.StatusCode, http.StatusBadGateway, raw)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("response is not JSON: %v; body=%s", err, raw)
+	}
+	if payload["error"] != "模型服务繁忙，请稍后重试" {
+		t.Fatalf("unexpected structured error: %#v", payload)
+	}
+}
+
+func TestGroundedBriefFollowupDeadlineWrapsRealRouteBeforeSlowAuth(
+	t *testing.T,
+) {
+	mux := http.NewServeMux()
+	Mount(mux, Deps{Auth: &briefFollowupSlowAuthStore{
+		delay: 100 * time.Millisecond,
+	}})
+	testServer := httptest.NewUnstartedServer(mux)
+	testServer.Config.WriteTimeout = 20 * time.Millisecond
+	testServer.Start()
+	t.Cleanup(testServer.Close)
+
+	request, err := http.NewRequest(
+		http.MethodPost,
+		testServer.URL+"/api/schedules/task-v1/reports/3/ask",
+		strings.NewReader(`{"question":"依据是什么？"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "test"})
+	response, err := testServer.Client().Do(request)
+	if err != nil {
+		t.Fatalf("slow auth became EOF instead of structured response: %v", err)
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body=%s",
+			response.StatusCode, http.StatusUnauthorized, raw)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("slow-auth response is not JSON: %v; body=%s", err, raw)
+	}
+	if payload["error"] != "未登录或会话已过期" {
+		t.Fatalf("unexpected slow-auth response: %#v", payload)
+	}
+}
+
+func TestGroundedBriefFollowupAuthDeadlineBecomesStructuredUpstreamError(
+	t *testing.T,
+) {
+	s := &server{deps: Deps{Auth: &briefFollowupSlowAuthStore{
+		delay: time.Hour,
+	}}}
+	inner := http.NewServeMux()
+	inner.HandleFunc(
+		"POST /api/schedules/{id}/reports/{target_id}/ask",
+		func(http.ResponseWriter, *http.Request) {
+			t.Error("expired authentication must not reach grounded handler")
+		},
+	)
+	handler := groundedBriefFollowupDeadlineWithBudgetV1(
+		s.cors(s.requireSession(inner)),
+		40*time.Millisecond,
+		200*time.Millisecond,
+	)
+	testServer := httptest.NewUnstartedServer(handler)
+	testServer.Config.WriteTimeout = 20 * time.Millisecond
+	testServer.Start()
+	t.Cleanup(testServer.Close)
+
+	request, err := http.NewRequest(
+		http.MethodPost,
+		testServer.URL+"/api/schedules/task-v1/reports/3/ask",
+		strings.NewReader(`{"question":"依据是什么？"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "test"})
+	response, err := testServer.Client().Do(request)
+	if err != nil {
+		t.Fatalf("auth deadline became a transport failure: %v", err)
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body=%s",
+			response.StatusCode, http.StatusBadGateway, raw)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("deadline response is not JSON: %v; body=%s", err, raw)
+	}
+	if payload["error"] != "简报追问处理超时，请稍后重试" {
+		t.Fatalf("auth deadline leaked a 401 response: %#v", payload)
+	}
+}
+
+func TestGroundedBriefFollowupDeadlineRouteMatchIsExact(t *testing.T) {
+	for _, tc := range []struct {
+		method string
+		path   string
+		want   bool
+	}{
+		{http.MethodPost, "/api/schedules/task/briefs/1/ask", true},
+		{http.MethodPost, "/api/schedules/task/reports/1/ask", true},
+		{http.MethodGet, "/api/schedules/task/reports/1/ask", false},
+		{http.MethodOptions, "/api/schedules/task/reports/1/ask", false},
+		{http.MethodPost, "/api/schedules/task/reports/1/deep-dive", false},
+		{http.MethodPost, "/api/schedules/task/reports/1/ask/extra", false},
+		{http.MethodPost, "/api/schedules//reports/1/ask", false},
+		{http.MethodPost, "/api/schedules/task/runs/1/ask", false},
+		{http.MethodPost, "/api/schedules/task%2Fchild/reports/1/ask", true},
+		{http.MethodPost, "/%61pi/schedules/task/reports/1/%61sk", true},
+	} {
+		request := httptest.NewRequest(tc.method, tc.path, nil)
+		if got := isGroundedBriefFollowupRequestV1(request); got != tc.want {
+			t.Fatalf("%s %s matched=%t, want %t",
+				tc.method, tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestGroundedBriefFollowupDeadlineDoesNotWrapOtherAPIRoutes(
+	t *testing.T,
+) {
+	response := &briefFollowupDeadlineRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+	}
+	called := false
+	handler := groundedBriefFollowupDeadlineWithBudgetV1(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			called = true
+			writeError(w, http.StatusTeapot, "control")
+		}),
+		20*time.Millisecond,
+		20*time.Millisecond,
+	)
+	handler.ServeHTTP(
+		response,
+		httptest.NewRequest(
+			http.MethodPost, "/api/schedules/task/run", nil),
+	)
+	if !called {
+		t.Fatal("ordinary API route did not reach original handler")
+	}
+	if len(response.deadlines) != 0 {
+		t.Fatalf("ordinary API route received %d write deadlines, want 0",
+			len(response.deadlines))
+	}
+	if response.Code != http.StatusTeapot {
+		t.Fatalf("ordinary API status = %d, want %d",
+			response.Code, http.StatusTeapot)
+	}
+}
+
+func TestBriefFollowupDeadlineIsFirstBoundedStepForDeterministicError(
+	t *testing.T,
+) {
+	response := &briefFollowupDeadlineRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+	}
+	request := httptest.NewRequest(
+		http.MethodPost, "/api/schedules/task/reports/not-a-number/ask", nil)
+	request.SetPathValue("target_id", "not-a-number")
+	before := time.Now()
+
+	(&server{}).handleBriefFollowup(
+		response, request, store.GroundedBriefReport)
+
+	after := time.Now()
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+	if len(response.deadlines) != 1 {
+		t.Fatalf("SetWriteDeadline calls = %d, want 1", len(response.deadlines))
+	}
+	deadline := response.deadlines[0]
+	if deadline.Before(before.Add(groundedBriefFollowupWriteBudget)) ||
+		deadline.After(after.Add(groundedBriefFollowupWriteBudget)) {
+		t.Fatalf("deadline %s is outside bounded request-start window [%s, %s]",
+			deadline,
+			before.Add(groundedBriefFollowupWriteBudget),
+			after.Add(groundedBriefFollowupWriteBudget))
+	}
+}
+
+func TestBriefFollowupDeadlineFailureStopsBeforeRequestWork(t *testing.T) {
+	response := &briefFollowupDeadlineRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		setErr:           errors.New("deadline unavailable"),
+	}
+	request := httptest.NewRequest(
+		http.MethodPost, "/api/schedules/task/reports/not-a-number/ask", nil)
+	request.SetPathValue("target_id", "not-a-number")
+
+	(&server{}).handleBriefFollowup(
+		response, request, store.GroundedBriefReport)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d; body=%s",
+			response.Code, http.StatusServiceUnavailable, response.Body.String())
+	}
+	if len(response.deadlines) != 1 {
+		t.Fatalf("SetWriteDeadline calls = %d, want 1", len(response.deadlines))
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if payload["error"] == "" {
+		t.Fatalf("deadline failure did not return a structured error: %#v", payload)
+	}
+}
+
+func TestBriefFollowupExecutionDeadlineReturnsStructuredUpstreamError(
+	t *testing.T,
+) {
+	response := &briefFollowupDeadlineRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+	}
+	ctx, cancel := context.WithDeadline(
+		context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	request := httptest.NewRequest(
+		http.MethodPost, "/api/schedules/task/reports/3/ask", nil,
+	).WithContext(ctx)
+	request.SetPathValue("target_id", "3")
+
+	(&server{}).handleBriefFollowup(
+		response, request, store.GroundedBriefReport)
+
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body=%s",
+			response.Code, http.StatusBadGateway, response.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if payload["error"] != "简报追问处理超时，请稍后重试" {
+		t.Fatalf("unexpected deadline response: %#v", payload)
+	}
+}
+
+func TestBriefFollowupHandlerReusesOuterWriteDeadline(t *testing.T) {
+	response := &briefFollowupDeadlineRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+	}
+	want := time.Now().Add(groundedBriefFollowupWriteBudget)
+	ctx := context.WithValue(
+		context.Background(),
+		briefFollowupWriteDeadlineContextKeyV1{},
+		want,
+	)
+	if err := prepareBriefFollowupResponseV1(
+		response, ctx, time.Now().Add(time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.deadlines) != 1 ||
+		!response.deadlines[0].Equal(want) {
+		t.Fatalf("handler deadline = %v, want exact outer deadline %s",
+			response.deadlines, want)
+	}
+}
+
+func TestBriefFollowupDeadlinePreservesClientCancellation(t *testing.T) {
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(finished)
+		if err := prepareBriefFollowupResponseV1(
+			w, r.Context(), time.Now(),
+		); err != nil {
+			t.Errorf("prepare response: %v", err)
+			return
+		}
+		close(started)
+		<-r.Context().Done()
+		// Exercise the disconnected write path too: it must return rather than
+		// leave handler work alive until the seven-minute write deadline.
+		writeError(w, http.StatusBadGateway, "request canceled")
+	})
+	testServer := httptest.NewServer(handler)
+	t.Cleanup(testServer.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, testServer.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestDone := make(chan error, 1)
+	go func() {
+		response, requestErr := testServer.Client().Do(request)
+		if response != nil {
+			response.Body.Close()
+		}
+		requestDone <- requestErr
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+	cancel()
+	select {
+	case requestErr := <-requestDone:
+		if requestErr == nil {
+			t.Fatal("canceled client request unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client request did not observe cancellation")
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("handler leaked after client cancellation/write failure")
+	}
+}
 
 func TestExecutiveBriefTaskEnabledUsesExactRolloutScope(t *testing.T) {
 	s := &server{deps: Deps{

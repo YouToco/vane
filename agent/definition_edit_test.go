@@ -478,9 +478,10 @@ func TestRecordDefinitionEditReceiptSessionUsesAgentUserLock(t *testing.T) {
 	messages := json.RawMessage(
 		`[{"role":"user","content":"[卡片回调] fixed edit fact"}]`,
 	)
-	muValue, _ := loop.userMu.LoadOrStore(int64(7), &sync.Mutex{})
-	userMu := muValue.(*sync.Mutex)
-	userMu.Lock()
+	userMu := loop.lockForUser(7)
+	if err := userMu.Lock(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	started := time.Now()
 	err := loop.RecordDefinitionEditReceiptSession(
 		t.Context(), receipt, messages,

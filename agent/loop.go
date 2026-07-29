@@ -181,8 +181,18 @@ const (
 
 	// chatCallTimeout 单次模型调用的硬超时（审查 #信号量瘫痪），
 	// 对齐 workflow llmActivityOptions 的 120s 预算。
-	chatCallTimeout      = 120 * time.Second
-	agentChatMaxAttempts = 3
+	chatCallTimeout         = 120 * time.Second
+	agentChatMaxAttempts    = 3
+	agentChatFirstRetryWait = 2 * time.Second
+	agentChatLaterRetryWait = 5 * time.Second
+
+	// GroundedBriefExecutionBudget is the HTTP-visible upper bound for one
+	// tool-free grounded Agent turn. The 10s term mirrors the bounded detached
+	// llm recorder tail for each attempt. API route deadlines consume this
+	// shared Agent contract instead of copying retry timings independently.
+	GroundedBriefExecutionBudget = agentChatMaxAttempts*
+		(chatCallTimeout+10*time.Second) +
+		agentChatFirstRetryWait + agentChatLaterRetryWait
 
 	// appendCallbackTimeout 卡片回调回写的 DB 预算，在拿到 userMu 之后才起算——
 	// 锁等待可达对端整条消息预算（分钟级），不能占用回写自己的超时窗口。
@@ -393,8 +403,10 @@ type Loop struct {
 	// 即使最终 CommitAgentSessionTurn 有 base fence，用户在机器人"思考中"补发第二条消息
 	// 就会整段覆盖丢失第一条的交换，TTL 边界还会双开会话分叉。串行化后第二条消息
 	// 排队等待，天然看到第一条的完整上下文，也更符合"共享多轮会话"的语义。
+	// 等锁必须服从调用方 ctx：HTTP 已断开或 route execution deadline 已到时，
+	// 排队请求不能在旧 turn 结束后又开始读库、调用模型或持久化新 turn。
 	// 单 owner MVP 下 map 只会有一个条目，无清理需求。
-	userMu sync.Map // map[int64]*sync.Mutex
+	userMu sync.Map // map[int64]*userTurnLock
 
 	// sessionWriteMu closes admission before shutdown and serializes WaitGroup.Add
 	// with DrainSessionWrites.Wait. Without this gate a card callback can return,
@@ -408,6 +420,59 @@ type Loop struct {
 	// Loop while admitting adjacent model/final steps. A full slot set drops
 	// shadow evidence; it never queues goroutines behind the legacy Agent path.
 	contextShadowSlots chan struct{}
+}
+
+// userTurnLock is a context-aware binary semaphore. sync.Mutex cannot abandon
+// Lock when an HTTP request is canceled, so a queued grounded ask could outlive
+// its response deadline and then start a fresh paid/persistent turn.
+type userTurnLock struct {
+	token chan struct{}
+}
+
+func newUserTurnLock() *userTurnLock {
+	lock := &userTurnLock{token: make(chan struct{}, 1)}
+	lock.token <- struct{}{}
+	return lock
+}
+
+func (m *userTurnLock) Lock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.token:
+		// Cancellation may race a ready token. Return it before leaving so the
+		// canceled waiter cannot enter any database/model work or strand the lock.
+		if err := ctx.Err(); err != nil {
+			m.Unlock()
+			return err
+		}
+		return nil
+	}
+}
+
+func (m *userTurnLock) TryLock() bool {
+	select {
+	case <-m.token:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *userTurnLock) Unlock() {
+	select {
+	case m.token <- struct{}{}:
+	default:
+		panic("agent: unlock of unlocked user turn lock")
+	}
+}
+
+func (l *Loop) lockForUser(userID int64) *userTurnLock {
+	value, _ := l.userMu.LoadOrStore(userID, newUserTurnLock())
+	return value.(*userTurnLock)
 }
 
 // chatMetaKey/chatMeta 经 ctx 旁路传递记账元信息：chatFn 的签名由契约固定、
@@ -520,9 +585,9 @@ func NewChecked(d Deps) (*Loop, error) {
 func agentChatRetryDelay(failedAttempt int) time.Duration {
 	switch failedAttempt {
 	case 1:
-		return 2 * time.Second
+		return agentChatFirstRetryWait
 	default:
-		return 5 * time.Second
+		return agentChatLaterRetryWait
 	}
 }
 
@@ -687,10 +752,14 @@ func (l *Loop) handleGroundedMessage(
 		return Outcome{}, types.NewAppError(
 			types.CodeValidation, "简报追问输入无效", types.ErrValidation)
 	}
-	muVal, _ := l.userMu.LoadOrStore(userID, &sync.Mutex{})
-	mu := muVal.(*sync.Mutex)
-	mu.Lock()
+	mu := l.lockForUser(userID)
+	if err := mu.Lock(ctx); err != nil {
+		return Outcome{}, err
+	}
 	defer mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Outcome{}, err
+	}
 	sess, err := l.loadOrCreateSession(ctx, userID)
 	if err != nil {
 		return Outcome{}, err
@@ -715,6 +784,9 @@ func (l *Loop) handleGroundedMessage(
 	if err != nil {
 		return Outcome{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return Outcome{}, err
+	}
 	if outcome.Confirm != nil {
 		return Outcome{}, types.NewAppError(
 			types.CodeConflict,
@@ -734,12 +806,23 @@ func (l *Loop) handleGroundedMessage(
 		}
 		outcome.Reply = guarded
 	}
+	if err := ctx.Err(); err != nil {
+		return Outcome{}, err
+	}
 	visible := []llm.ChatMessage{
 		{Role: "user", Content: question},
 		{Role: "assistant", Content: outcome.Reply},
 	}
 	persisted := truncateMessages(append(history, visible...))
-	l.saveSession(ctx, sess, persisted, turns, state, nil, turnID)
+	if err := l.saveSession(
+		ctx, sess, persisted, turns, state, nil, turnID,
+	); err != nil {
+		return Outcome{}, types.NewAppError(
+			types.CodeInternal,
+			"简报追问结果保存失败，请稍后重试",
+			err,
+		)
+	}
 	return outcome, nil
 }
 
@@ -752,10 +835,14 @@ func (l *Loop) handleMessage(
 	externalInput bool,
 ) (Outcome, error) {
 	// per-user 串行化整个 load→loop→save（见 userMu 字段注释）。
-	muVal, _ := l.userMu.LoadOrStore(userID, &sync.Mutex{})
-	mu := muVal.(*sync.Mutex)
-	mu.Lock()
+	mu := l.lockForUser(userID)
+	if err := mu.Lock(ctx); err != nil {
+		return Outcome{}, err
+	}
 	defer mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Outcome{}, err
+	}
 
 	sess, err := l.loadOrCreateSession(ctx, userID)
 	if err != nil {
@@ -874,7 +961,14 @@ func (l *Loop) handleMessage(
 		}
 	}
 	msgs = l.scrubUntrustedHistory(msgs)
-	l.saveSession(ctx, sess, msgs, turns, state, outcome.Confirm, turnID)
+	// Ordinary chat preserves the established best-effort persistence policy:
+	// the user already has a generated answer, so a ledger failure is logged by
+	// saveSession but does not replace it. Grounded HTTP asks handle the same
+	// return value strictly because their response deadline promises that a
+	// visible 200 corresponds to a durable guarded turn.
+	_ = l.saveSession(
+		ctx, sess, msgs, turns, state, outcome.Confirm, turnID,
+	)
 	return outcome, nil
 }
 
@@ -3068,8 +3162,7 @@ func (l *Loop) RecordCreationReceiptSession(
 	if !ok {
 		return errors.New("agent: task creation receipt session store is unavailable")
 	}
-	muVal, _ := l.userMu.LoadOrStore(receipt.UserID, &sync.Mutex{})
-	mu := muVal.(*sync.Mutex)
+	mu := l.lockForUser(receipt.UserID)
 	// A normal Agent turn may hold this lock for its full model/tool budget.
 	// The receipt dispatcher must not block an entire tenant scan (or shutdown)
 	// behind that turn. A busy lock is a retryable outbox outcome; the immutable
@@ -3103,10 +3196,7 @@ func (l *Loop) RecordDefinitionEditReceiptSession(
 			"agent: task definition edit receipt session store is unavailable",
 		)
 	}
-	muValue, _ := l.userMu.LoadOrStore(
-		receipt.UserID, &sync.Mutex{},
-	)
-	userMu := muValue.(*sync.Mutex)
+	userMu := l.lockForUser(receipt.UserID)
 	if !userMu.TryLock() {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -3191,9 +3281,12 @@ func (l *Loop) asyncSessionWrite(ctx context.Context, userID int64, write func(d
 				slog.Error("agent: 会话旁路回写 panic（已兜住，仅丢本条）", "user_id", userID, "recover", r)
 			}
 		}()
-		muVal, _ := l.userMu.LoadOrStore(userID, &sync.Mutex{})
-		mu := muVal.(*sync.Mutex)
-		mu.Lock()
+		mu := l.lockForUser(userID)
+		// Side-writes intentionally survive the originating callback context;
+		// their lifecycle is owned by sessionWriteWG/DrainSessionWrites.
+		if err := mu.Lock(context.Background()); err != nil {
+			return
+		}
 		defer mu.Unlock()
 		dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), appendCallbackTimeout)
 		defer cancel()
@@ -3242,8 +3335,8 @@ func (l *Loop) loadOrCreateSession(ctx context.Context, userID int64) (*types.Ag
 // saveSession 持久化会话（system 不入库；契约 §7：每次 HandleMessage 结束都要写，
 // 含出确认卡路径）。turn_count 记会话累计模型调用次数；激活端点集随行写回
 // （端点注册表契约 §4：激活在 TTL 内跨消息有效）。
-// 持久化失败只记日志不上抛：回复已经生成，宁可下一轮丢上下文，
-// 也不把已成功的对话放大成用户可见的失败（与 llm.Recorder 的旁路原则一致）。
+// 调用方决定持久化失败是否影响可见回复：普通聊天保持 best-effort，grounded HTTP
+// 追问则要求 guarded reply 成功落账后才能返回 200。
 func (l *Loop) saveSession(
 	ctx context.Context,
 	sess *types.AgentSession,
@@ -3252,11 +3345,11 @@ func (l *Loop) saveSession(
 	state *toolRunState,
 	confirm *Confirm,
 	turnID string,
-) {
+) error {
 	raw, err := json.Marshal(msgs)
 	if err != nil {
 		slog.Error("agent: 会话 messages 序列化失败", "session_id", sess.ID, "err", err)
-		return
+		return fmt.Errorf("marshal agent session messages: %w", err)
 	}
 	activatedTools := state.activation.encode()
 	var confirmationAction string
@@ -3281,7 +3374,7 @@ func (l *Loop) saveSession(
 			"user_id", sess.UserID,
 			"session_id", sess.ID,
 			"err", err)
-		return
+		return fmt.Errorf("digest agent session base projection: %w", err)
 	}
 	batch, err := agentledger.BuildProjectionSnapshotBatch(
 		agentledger.ProjectionSnapshotInput{
@@ -3305,7 +3398,7 @@ func (l *Loop) saveSession(
 			"user_id", sess.UserID,
 			"session_id", sess.ID,
 			"err", err)
-		return
+		return fmt.Errorf("build agent session snapshot: %w", err)
 	}
 	audit, err := l.store.CommitAgentSessionTurn(ctx, projection, batch)
 	if err != nil {
@@ -3314,7 +3407,7 @@ func (l *Loop) saveSession(
 			"user_id", sess.UserID,
 			"session_id", sess.ID,
 			"err", err)
-		return
+		return fmt.Errorf("commit agent session turn: %w", err)
 	}
 	if !audit.Match {
 		slog.Error("agent: 会话事件 shadow 投影不一致",
@@ -3325,7 +3418,7 @@ func (l *Loop) saveSession(
 			"prior_state", audit.PriorState,
 			"legacy_message_count", audit.LegacyMessageCount,
 			"event_message_count", audit.EventMessageCount)
-		return
+		return errors.New("agent: session event shadow projection mismatch")
 	}
 	if audit.PriorState != "match" && audit.PriorState != "uninitialized" {
 		// Every production projection writer is transactional with the ledger
@@ -3339,6 +3432,7 @@ func (l *Loop) saveSession(
 			"reason", audit.Reason,
 			"prior_state", audit.PriorState)
 	}
+	return nil
 }
 
 // execRecorded 是全部工具执行的唯一入口（读工具直执与确认后执行两条路径共用），
