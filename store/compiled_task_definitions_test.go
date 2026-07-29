@@ -57,6 +57,8 @@ func newCompiledTaskFixture(t *testing.T, st *Store) *compiledTaskFixture {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM task_run_snapshots WHERE tenant_id = $1`, tenantID)
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM schedules WHERE tenant_id = $1`, tenantID)
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM memberships WHERE tenant_id = $1`, tenantID)
 		cleanupExec(cleanupCtx, t, st, `DELETE FROM fetch_targets WHERE url LIKE $1`, f.urlRoot+"%")

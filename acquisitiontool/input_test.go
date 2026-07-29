@@ -26,6 +26,27 @@ func TestBuild_WebFeed(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeToolArgumentsV1RejectsUnknownAndSecretFields(t *testing.T) {
+	for _, raw := range []string{
+		`{"query":"AI","api_key":"SECRET-CANARY"}`,
+		`{"query":"AI","token":"SECRET-CANARY"}`,
+		`{"query":"AI","unknown":true}`,
+		`{"query":"AI","query":"crypto"}`,
+	} {
+		if _, err := CanonicalizeToolArgumentsV1(
+			"web_search", json.RawMessage(raw)); err == nil {
+			t.Fatalf("unsafe Tool arguments were accepted: %s", raw)
+		}
+	}
+	got, err := CanonicalizeToolArgumentsV1(
+		"web_search",
+		json.RawMessage(`{"query":"AI","category":"news"}`))
+	if err != nil ||
+		string(got) != `{"category":"news","query":"AI"}` {
+		t.Fatalf("canonical Tool arguments=%s err=%v", got, err)
+	}
+}
+
 func TestBuild_WebFeedRejectsBadURL(t *testing.T) {
 	for _, u := range []string{"", "ftp://x.com/feed", "vane://web/search?q=x", "not-a-url"} {
 		if _, msg := BuildTarget(Requirement{

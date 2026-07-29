@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/taskstate"
 	"github.com/YouToco/vane/types"
 )
@@ -56,8 +57,14 @@ func buildTaskCreationToolApprovedDefinition(
 	}
 	calls := make([]taskstate.ToolInvocationV1, 0, len(plan.Targets))
 	for _, target := range plan.Targets {
+		arguments, err := acquisitiontool.CanonicalizeToolArgumentsV1(
+			target.ToolName, target.ToolArgs)
+		if err != nil {
+			return taskstate.ApprovedDefinitionV2{}, taskCreationValidation(
+				"compiled acquisition Tool arguments are invalid")
+		}
 		call, err := taskstate.BuildToolInvocationV1(
-			target.ToolName, "v1", target.ToolArgs)
+			target.ToolName, "v1", arguments)
 		if err != nil {
 			return taskstate.ApprovedDefinitionV2{}, taskCreationValidation(
 				"compiled acquisition Tool call is invalid")

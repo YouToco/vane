@@ -59,8 +59,9 @@ func (s *Store) FreezeTaskRunSnapshotShadowAuditScope(
 	if err := tx.QueryRow(ctx,
 		`SELECT COALESCE(MAX(id), 0), COUNT(*)
 		   FROM task_run_snapshots
-		  WHERE task_id=$1 AND created_at >= $2`,
-		taskID, since,
+		  WHERE task_id=$1 AND created_at >= $2
+		    AND reference_schema_version=$3`,
+		taskID, since, taskRunReferenceSchemaVersionV1,
 	).Scan(&scope.ThroughID, &scope.Count); err != nil {
 		return TaskRunSnapshotShadowAuditScope{},
 			taskRunDatabaseError("freeze task run snapshot v2 audit scope", err)
@@ -130,9 +131,11 @@ func (s *Store) auditTaskRunSnapshotShadowsV2(
 		`SELECT id, tenant_id, user_id, task_id, temporal_workflow_id, temporal_run_id
 		   FROM task_run_snapshots
 		  WHERE task_id=$1 AND created_at >= $2 AND id > $3 AND id <= $4
+		    AND reference_schema_version=$6
 		  ORDER BY id
 		  LIMIT $5`,
-		taskID, since, afterID, throughID, limit+1)
+		taskID, since, afterID, throughID, limit+1,
+		taskRunReferenceSchemaVersionV1)
 	if err != nil {
 		return TaskRunSnapshotShadowAuditPage{},
 			taskRunDatabaseError("list task run snapshot v2 audit page", err)

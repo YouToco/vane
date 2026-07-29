@@ -1292,6 +1292,12 @@ func decodeCreationToolCall(
 	if err != nil {
 		return acquisitiontool.Requirement{}, "", nil, err
 	}
+	canonicalArguments, err =
+		acquisitiontool.CanonicalizeToolArgumentsV1(
+			call.Name, canonicalArguments)
+	if err != nil {
+		return acquisitiontool.Requirement{}, "", nil, err
+	}
 	return requirement, call.Name, canonicalArguments, nil
 }
 

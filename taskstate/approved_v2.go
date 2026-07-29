@@ -1,11 +1,13 @@
 package taskstate
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"slices"
 
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/types"
 )
@@ -82,9 +84,18 @@ func ValidateApprovedDefinitionV2ForWrite(definition ApprovedDefinitionV2) error
 		return err
 	}
 	for _, call := range normalized.ToolCalls {
-		if call.ToolContractVersion != "v1" ||
-			!validApprovedAcquisitionToolV2ForWrite(call.ToolName) {
+		if call.ToolContractVersion != "v1" {
 			return invalidState("approved tool call is not writable")
+		}
+		contract, ok := acquisitiontool.LookupToolContractV1(call.ToolName)
+		if !ok || contract.Name != call.ToolName {
+			return invalidState("approved tool call is not writable")
+		}
+		canonicalArguments, err :=
+			acquisitiontool.CanonicalizeToolArgumentsV1(
+				call.ToolName, call.Arguments)
+		if err != nil || !bytes.Equal(canonicalArguments, call.Arguments) {
+			return invalidState("approved tool arguments are not writable")
 		}
 	}
 	return nil
@@ -193,16 +204,4 @@ func normalizeApprovedDefinitionV2(
 		return ApprovedDefinitionV2{}, err
 	}
 	return definition, nil
-}
-
-func validApprovedAcquisitionToolV2ForWrite(name string) bool {
-	switch name {
-	case "web_search", "web_feed", "web_contents", "x_user_posts",
-		"xhs_search", "xhs_user_posts", "xhs_hot_list", "xhs_topic_feed",
-		"xhs_faved_notes", "weibo_user_posts", "weibo_hot_list",
-		"wechat_mp_user_posts":
-		return true
-	default:
-		return false
-	}
 }
