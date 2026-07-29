@@ -535,6 +535,9 @@ func TestNaturalTaskDefinitionEditCandidate(t *testing.T) {
 		{"能不能把早报改为只看官方博客？", true},
 		{"能否把早报改为只看官方博客？", true},
 		{"修改竞品情报：以后只看官方博客", true},
+		{"把“竞品动态”改成每周一次", true},
+		{"把早报频率设成每周一", true},
+		{"早报以后只看官方博客", true},
 		{"创建任务：每天看官方博客", false},
 	} {
 		if got := isNaturalTaskDefinitionEditCandidate(test.text); got != test.want {
@@ -611,6 +614,49 @@ func TestTaskDefinitionEditIntentClassifierRequiresExplicitExecute(t *testing.T)
 	}
 }
 
+func TestTaskDefinitionEditIntentAndMainCallsSealOrderedContextSteps(t *testing.T) {
+	store := &contextShadowStore{fakeStore: newFakeStore()}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			FinishReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID:   "route-shadow",
+				Name: taskDefinitionEditIntentTool.Name,
+				Arguments: `{
+					"decision":"non_execute"
+				}`,
+			}},
+		},
+		{Content: "这是咨询，不执行修改。"},
+	}}
+	loop := New(Deps{
+		Store:      store,
+		Model:      "test-model",
+		MaxTurns:   20,
+		SessionTTL: 30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+
+	if _, err := loop.HandleMessage(
+		t.Context(), 7, "把“竞品动态”改成每周一次是否合适？",
+	); err != nil {
+		t.Fatal(err)
+	}
+	drainCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := loop.DrainSessionWrites(drainCtx); err != nil {
+		t.Fatal(err)
+	}
+	steps := make(map[int]bool)
+	for _, snapshot := range store.snapshots() {
+		steps[snapshot.ContextStep] = true
+	}
+	if !steps[1] || !steps[2] {
+		t.Fatalf("sealed context steps=%v, want adjudication=1 main=2",
+			steps)
+	}
+}
+
 func TestTaskDefinitionEditNonExecuteCannotWrite(t *testing.T) {
 	for _, ownerRequest := range []string{
 		"请把 AI 日报改为周报是否合适？",
@@ -674,6 +720,86 @@ func TestTaskDefinitionEditNonExecuteCannotWrite(t *testing.T) {
 				t.Fatal("non-execute request reached durable controller")
 			}
 		})
+	}
+}
+
+func TestTaskDefinitionEditAdjudicationFailureSuppressesAllWrites(t *testing.T) {
+	create := &fakeTool{
+		name:       "create_schedule",
+		parameters: json.RawMessage(createScheduleSchema),
+		result:     "must not run",
+	}
+	remove := &fakeTool{
+		name:   "remove_schedule",
+		result: "must not run",
+	}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			FinishReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID:   "hallucinated-create",
+				Name: "create_schedule",
+				Arguments: `{
+					"intent":"错误代偿创建周报"
+				}`,
+			}},
+		},
+		{Content: "任务编辑意图无法安全判定，本轮没有执行写入。"},
+	}}
+	loop := New(Deps{
+		Store: newFakeStore(),
+		Tools: []ToolSpec{
+			newToolSpec(create, ownerPolicy(
+				Effects(
+					EffectDurableProposal,
+					EffectStateWrite,
+					EffectDirectOwnerWrite,
+				),
+				BudgetNone,
+			)),
+			newToolSpec(remove, ownerPolicy(
+				Effects(EffectStateWrite, EffectDirectOwnerWrite),
+				BudgetNone,
+			)),
+		},
+		Model:      "test-model",
+		MaxTurns:   20,
+		SessionTTL: 30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+	loop.taskEditIntentFn = func(
+		context.Context,
+		[]llm.ChatMessage,
+	) (bool, error) {
+		return false, errors.New("semantic gate unavailable")
+	}
+
+	out, err := loop.HandleMessage(
+		t.Context(), 7, "把日报改成周报",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply != "任务编辑意图无法安全判定，本轮没有执行写入。" {
+		t.Fatalf("Reply=%q", out.Reply)
+	}
+	if len(chat.requests) != 2 {
+		t.Fatalf("requests=%d, want hidden-write rejection + reply",
+			len(chat.requests))
+	}
+	for _, request := range chat.requests {
+		for _, name := range toolDefNames(request.Tools) {
+			if name == "create_schedule" ||
+				name == "remove_schedule" ||
+				name == definitionEditToolName {
+				t.Fatalf("side-effect-free tools=%v",
+					toolDefNames(request.Tools))
+			}
+		}
+	}
+	if len(create.calls) != 0 || len(remove.calls) != 0 {
+		t.Fatalf("create calls=%d remove calls=%d, want zero",
+			len(create.calls), len(remove.calls))
 	}
 }
 

@@ -101,6 +101,14 @@ type toolRunState struct {
 	clarificationCount int
 	candidateSearches  int
 	candidateHits      int
+	// sideEffectFreeTurn is set when a possible task edit did not receive a
+	// valid execute decision from the isolated semantic gate. The main Agent
+	// may still answer or use read-only evidence, but every state write,
+	// delivery and activation is removed at declaration and execution time.
+	sideEffectFreeTurn bool
+	// contextStepOffset reserves context step 1 for semantic adjudication so
+	// the main Agent's first request is sealed as step 2 on the same trace.
+	contextStepOffset int
 	// groundedBrief confines a trusted internal Brief/report follow-up to the
 	// exact supplied artifact. It has no tool surface at declaration or
 	// execution time, so source text can inform an answer but can never trigger

@@ -33,8 +33,9 @@ definition edit. A separate side-effect-free semantic adjudication must first cl
 the current owner turn as an immediate edit rather than advice, a hypothetical,
 negation, cancellation, or another operation. The edit then requires a second
 independent model decision to call the bound write tool. Any adjudication error
-fails closed into ordinary conversation, where the ID-based write tool is
-absent at both declaration and execution boundaries. The isolated edit lane
+fails closed into a side-effect-free answer turn: all writes, deliveries,
+activation changes, and billable tools are absent at both declaration and
+execution boundaries. The isolated edit lane
 exposes only `list_schedules` followed by `edit_task_definition`; a requirement
 that future runs open official pages does not authorize ad-hoc web research
 during the edit. The user is never asked for an internal task ID or to split one

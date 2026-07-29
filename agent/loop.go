@@ -571,7 +571,7 @@ func (l *Loop) classifyTaskDefinitionEditIntent(
 		Tools:           []llm.ToolDef{taskDefinitionEditIntentTool},
 		MaxTokens:       iptr(64),
 		DisableThinking: true,
-	}, nil, 0)
+	}, nil, 1)
 	if err != nil {
 		return false, err
 	}
@@ -917,6 +917,8 @@ func (l *Loop) handleMessage(
 	}
 	directProposal := directTaskCreation || directDefinitionEdit ||
 		naturalTaskDefinitionEdit
+	sideEffectFreeTurn := naturalTaskDefinitionEditCandidate &&
+		!naturalTaskDefinitionEdit
 
 	// 外部上下文入口不读取画像：不是“读了但不渲染”，而是从数据访问层就不碰。
 	// direct-task-creation 同样从数据访问层跳过画像，防止模型把用户没有批准的
@@ -964,6 +966,8 @@ func (l *Loop) handleMessage(
 		directActionID:             directActionID,
 		directTaskDefinitionEditID: directDefinitionEditTaskID,
 		naturalTaskDefinitionEdit:  naturalTaskDefinitionEdit,
+		sideEffectFreeTurn:         sideEffectFreeTurn,
+		contextStepOffset:          intentClassificationTurns,
 		untrustedExternalResult:    externalInput,
 	}
 	if externalInput {
@@ -1221,7 +1225,7 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		// then admit a bounded asynchronous seal. Store/root-lock latency cannot
 		// consume chatFn's context or alter its Outcome.
 		resp, err := l.chatWithContextShadow(
-			ctx, request, state, turns,
+			ctx, request, state, turns+state.contextStepOffset,
 		)
 		if err != nil {
 			if errors.Is(err, llm.ErrToolProtocolResponse) && state.untrustedExternalResult {
@@ -1609,6 +1613,7 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		dyn = l.endpoints.Defs(state.activation)
 	}
 	candidate := appendToolDefs(static, dyn)
+	candidate = l.filterSideEffectFreeToolDefs(candidate, state)
 	if state == nil || state.intentToolkitsEnabled {
 		return candidate
 	}
@@ -1619,6 +1624,7 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		}
 	}
 	legacy := appendToolDefs(legacyStatic, dyn)
+	legacy = l.filterSideEffectFreeToolDefs(legacy, state)
 	if state.intentToolkitsShadow && !state.intentToolkitsShadowSeen {
 		state.intentToolkitsShadowSeen = true
 		state.intentToolkitsLegacyCount = len(legacy)
@@ -1628,6 +1634,24 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		)
 	}
 	return legacy
+}
+
+func (l *Loop) filterSideEffectFreeToolDefs(
+	defs []llm.ToolDef,
+	state *toolRunState,
+) []llm.ToolDef {
+	if state == nil || !state.sideEffectFreeTurn {
+		return defs
+	}
+	out := make([]llm.ToolDef, 0, len(defs))
+	for _, def := range defs {
+		spec, ok := l.resolveTool(def.Name, state)
+		if !ok || toolHasObservableSideEffect(spec) {
+			continue
+		}
+		out = append(out, def)
+	}
+	return out
 }
 
 func appendToolDefs(prefix, suffix []llm.ToolDef) []llm.ToolDef {
@@ -1678,6 +1702,16 @@ func (l *Loop) resolveTool(name string, state *toolRunState) (ToolSpec, bool) {
 
 func isUntrustedResultTool(spec ToolSpec) bool {
 	return spec.Policy.Effects.Has(EffectTrustTaint)
+}
+
+func toolHasObservableSideEffect(spec ToolSpec) bool {
+	effects := spec.Policy.Effects
+	return effects.Has(EffectStateWrite) ||
+		effects.Has(EffectDelivery) ||
+		effects.Has(EffectDurableProposal) ||
+		effects.Has(EffectDirectOwnerWrite) ||
+		effects.Has(EffectActivationWrite) ||
+		effects.Has(EffectBillable)
 }
 
 func isSafeAfterUntrusted(spec ToolSpec) bool {
@@ -1733,6 +1767,21 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 	// 模型单独重试。只“放行一个、拒绝其余”仍会把被拒调用的 args/content
 	// 写进下一轮消息，与随后返回的恶意网页同屏。
 	state := runStateFrom(ctx)
+	if state != nil && state.sideEffectFreeTurn {
+		for _, call := range calls {
+			spec, ok := l.resolveTool(call.Name, state)
+			if !ok || !toolHasObservableSideEffect(spec) {
+				continue
+			}
+			for _, rejected := range calls {
+				out = append(out, toolMsg(
+					rejected.ID,
+					"本轮任务编辑意图未获得明确执行裁决，只允许只读回答；本批写入、投递或计费调用均未执行。",
+				))
+			}
+			return out, nil
+		}
+	}
 	if state != nil && state.directTaskDefinitionEditID != "" {
 		if len(calls) != 1 || calls[0].Name != definitionEditToolName {
 			state.directTaskDefinitionEditToolRejected = true
@@ -2392,12 +2441,15 @@ func isNaturalTaskDefinitionEditCandidate(text string) bool {
 		"监控", "监测", "情报", "跟踪", "关注",
 		"schedule", "task",
 	)
-	hasEdit := containsAny(normalized,
+	hasExplicitEdit := containsAny(normalized,
 		"更新为", "改为", "调整为", "换成", "改成",
-		"修改", "更新", "调整", "编辑",
-		"updateto", "changeto", "change", "update", "edit",
+		"修改", "更新", "调整", "编辑", "设成", "设置为",
+		"updateto", "changeto", "setto", "change", "update", "edit",
 	)
-	return hasTaskTarget && hasEdit
+	hasTaskContinuation := hasTaskTarget && containsAny(normalized,
+		"以后", "从现在", "频率", "只看", "只推", "不再推",
+	)
+	return hasExplicitEdit || hasTaskContinuation
 }
 
 func isNaturalTaskDefinitionEditContinuation(history []llm.ChatMessage) bool {
