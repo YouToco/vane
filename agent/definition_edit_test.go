@@ -134,6 +134,7 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 				Arguments: `{"query":"每周一上午9:00推送AI官方重大更新"}`,
 			}},
 		},
+		{Content: replyMaxTurns},
 		{
 			FinishReason: "tool_calls",
 			ToolCalls: []llm.ToolCall{{
@@ -178,8 +179,8 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 	if out.Reply != "已修改定时推送任务（id=task-edit-1）。" {
 		t.Fatalf("Reply=%q", out.Reply)
 	}
-	if len(chat.requests) != 4 {
-		t.Fatalf("model calls=%d, want route + 3 edit calls",
+	if len(chat.requests) != 5 {
+		t.Fatalf("model calls=%d, want route + 4 edit calls",
 			len(chat.requests))
 	}
 	if got := toolDefNames(chat.requests[0].Tools); len(got) != 1 ||
@@ -197,6 +198,16 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 	if got := toolDefNames(chat.requests[3].Tools); len(got) != 1 ||
 		got[0] != "edit_task_definition" {
 		t.Fatalf("third tools=%v, want edit_task_definition only", got)
+	}
+	if got := toolDefNames(chat.requests[4].Tools); len(got) != 1 ||
+		got[0] != "edit_task_definition" {
+		t.Fatalf("fourth tools=%v, want edit_task_definition only", got)
+	}
+	if !strings.Contains(
+		chat.requests[4].Messages[0].Content,
+		"不得再次要求用户重复、拆分或确认",
+	) {
+		t.Fatal("resolved no-tool retry lacks explicit execution guidance")
 	}
 	if len(list.calls) != 1 {
 		t.Fatalf("list calls=%d, want 1", len(list.calls))
