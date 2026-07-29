@@ -1177,8 +1177,14 @@ func scanPeriodicSynthesisReceiptV1(
 	}
 	if len(payload) > 0 {
 		var content types.ExecutiveBriefContentV1
-		if json.Unmarshal(payload, &content) != nil ||
-			content.ValidatePeriodic() != nil {
+		if json.Unmarshal(payload, &content) != nil {
+			return PeriodicSynthesisReceiptV1{}, periodicIntegrityErrorV1()
+		}
+		contentErr := content.ValidatePeriodic()
+		if receipt.GenerationMode == types.ExecutiveGenerationFallback {
+			contentErr = content.ValidatePeriodicFallback()
+		}
+		if contentErr != nil {
 			return PeriodicSynthesisReceiptV1{}, periodicIntegrityErrorV1()
 		}
 		receipt.Content = &content
@@ -1217,9 +1223,11 @@ func (s *Store) finalizePeriodicBriefReportV1(
 	fallback bool,
 	role string,
 ) (types.PeriodicBriefReportV1, error) {
+	draftIsFallback := draft.GenerationMode ==
+		types.ExecutiveGenerationFallback
 	if intentID <= 0 || !validStoreDigestV1(requestDigest) ||
 		draft.Validate() != nil || draft.TenantID != tenantID ||
-		draft.UserID != userID {
+		draft.UserID != userID || fallback != draftIsFallback {
 		return types.PeriodicBriefReportV1{}, types.NewAppError(
 			types.CodeValidation, "周期报告终态无效", nil)
 	}

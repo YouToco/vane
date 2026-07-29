@@ -347,7 +347,9 @@ func ParseIssueContentV1(
 		return types.ExecutiveBriefContentV1{},
 			errors.New("executive brief output has trailing data")
 	}
-	if err := validateIssueReferencesV1(content, draft); err != nil {
+	if err := validateIssueReferencesV1(
+		content, draft, types.ExecutiveGenerationModel,
+	); err != nil {
 		return types.ExecutiveBriefContentV1{}, err
 	}
 	return content, nil
@@ -369,7 +371,9 @@ func ParsePeriodicContentV1(
 		return types.ExecutiveBriefContentV1{},
 			errors.New("periodic brief output has trailing data")
 	}
-	if err := validatePeriodicReferencesV1(content, briefs); err != nil {
+	if err := validatePeriodicReferencesV1(
+		content, briefs, types.ExecutiveGenerationModel,
+	); err != nil {
 		return types.ExecutiveBriefContentV1{}, err
 	}
 	return content, nil
@@ -378,6 +382,7 @@ func ParsePeriodicContentV1(
 func validatePeriodicReferencesV1(
 	content types.ExecutiveBriefContentV1,
 	briefs []types.BriefV1,
+	generationMode types.ExecutiveGenerationModeV1,
 ) error {
 	claims := make(map[[2]int64]int)
 	for _, brief := range briefs {
@@ -422,7 +427,11 @@ func validatePeriodicReferencesV1(
 			return err
 		}
 	}
-	if content.ValidatePeriodic() != nil {
+	contentErr := content.ValidatePeriodic()
+	if generationMode == types.ExecutiveGenerationFallback {
+		contentErr = content.ValidatePeriodicFallback()
+	}
+	if contentErr != nil {
 		return errors.New("periodic brief content is invalid")
 	}
 	return nil
@@ -431,6 +440,7 @@ func validatePeriodicReferencesV1(
 func validateIssueReferencesV1(
 	content types.ExecutiveBriefContentV1,
 	draft types.BriefDraftV1,
+	generationMode types.ExecutiveGenerationModeV1,
 ) error {
 	if draft.Validate() != nil {
 		return errors.New("executive brief draft is invalid")
@@ -481,9 +491,14 @@ func validateIssueReferencesV1(
 		TenantID: 1, UserID: 1, TaskID: "probe",
 		ProfileDigest:  strings.Repeat("a", 64),
 		InputDigest:    strings.Repeat("b", 64),
-		GenerationMode: types.ExecutiveGenerationModel,
-		Processing:     types.RunCompletenessComplete,
-		GeneratedAt:    draft.GeneratedAt, Content: content,
+		GenerationMode: generationMode,
+		Processing: func() types.RunCompletenessV1 {
+			if generationMode == types.ExecutiveGenerationFallback {
+				return types.RunCompletenessPartial
+			}
+			return types.RunCompletenessComplete
+		}(),
+		GeneratedAt: draft.GeneratedAt, Content: content,
 	}
 	if err := probe.Validate(); err != nil {
 		return errors.New("executive brief content is invalid")
@@ -519,8 +534,20 @@ func DeterministicFallbackV1(
 		})
 	}
 	if len(signals) == 0 {
-		return types.ExecutiveBriefContentV1{},
-			errors.New("executive brief fallback has no claimed insight")
+		content := types.ExecutiveBriefContentV1{
+			Headline:         "最高优先级内容证据不足，暂不形成综合判断",
+			ExecutiveSummary: "逐条情报已保留，但最高优先级内容缺少可验证的结构化主张；本期不生成未经证据支持的共同信号或下一步。",
+			DecisionState:    types.ExecutiveDecisionInsufficientEvidence,
+			WhyForYou:        "当前证据无法可靠解释个人影响，请以完整简报中的原始内容为准。",
+			Signals:          []types.ExecutiveSignalV1{},
+			NextSteps:        []types.ExecutiveNextStepV1{},
+		}
+		if err := validateIssueReferencesV1(
+			content, draft, types.ExecutiveGenerationFallback,
+		); err != nil {
+			return types.ExecutiveBriefContentV1{}, err
+		}
+		return content, nil
 	}
 	steps = append(steps, types.ExecutiveNextStepV1{
 		Kind:      types.ExecutiveNextStepDeepDive,
@@ -537,7 +564,9 @@ func DeterministicFallbackV1(
 		WhyForYou:        "当前画像依据或综合覆盖不足，请以逐条证据为准。",
 		Signals:          signals, NextSteps: steps,
 	}
-	if err := validateIssueReferencesV1(content, draft); err != nil {
+	if err := validateIssueReferencesV1(
+		content, draft, types.ExecutiveGenerationFallback,
+	); err != nil {
 		return types.ExecutiveBriefContentV1{}, err
 	}
 	return content, nil
@@ -572,8 +601,20 @@ func DeterministicPeriodicFallbackV1(
 		}
 	}
 	if len(signals) == 0 {
-		return types.ExecutiveBriefContentV1{},
-			errors.New("periodic fallback has no claimed insight")
+		content := types.ExecutiveBriefContentV1{
+			Headline:         "本期证据不足，暂不形成跨期判断",
+			ExecutiveSummary: "各期简报已保留，但缺少可验证的结构化主张；本报告不生成未经证据支持的趋势或下一步。",
+			DecisionState:    types.ExecutiveDecisionInsufficientEvidence,
+			WhyForYou:        "当前证据无法可靠解释跨期变化，请以各期完整简报中的原始内容为准。",
+			Signals:          []types.ExecutiveSignalV1{},
+			NextSteps:        []types.ExecutiveNextStepV1{},
+		}
+		if err := validatePeriodicReferencesV1(
+			content, briefs, types.ExecutiveGenerationFallback,
+		); err != nil {
+			return types.ExecutiveBriefContentV1{}, err
+		}
+		return content, nil
 	}
 	content := types.ExecutiveBriefContentV1{
 		Headline:         "本期变化值得继续观察",
@@ -590,7 +631,9 @@ func DeterministicPeriodicFallbackV1(
 				signals[0].EvidenceRefs...),
 		}},
 	}
-	if err := validatePeriodicReferencesV1(content, briefs); err != nil {
+	if err := validatePeriodicReferencesV1(
+		content, briefs, types.ExecutiveGenerationFallback,
+	); err != nil {
 		return types.ExecutiveBriefContentV1{}, err
 	}
 	return content, nil

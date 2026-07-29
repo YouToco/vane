@@ -83,6 +83,82 @@ func TestExecutiveBriefArtifactV1RejectsUngroundedAndModeMismatch(t *testing.T) 
 	}
 }
 
+func TestExecutiveBriefContentAllowsClaimlessInsufficientEvidenceFallback(
+	t *testing.T,
+) {
+	content := ExecutiveBriefContentV1{
+		Headline:         "本期证据不足",
+		ExecutiveSummary: "不生成未经证据支持的综合判断。",
+		DecisionState:    ExecutiveDecisionInsufficientEvidence,
+		WhyForYou:        "请以完整简报为准。",
+		Signals:          []ExecutiveSignalV1{},
+		NextSteps:        []ExecutiveNextStepV1{},
+	}
+	if err := content.ValidateIssue(); err == nil {
+		t.Fatal("claimless insufficient-evidence model issue was accepted")
+	}
+	if err := content.ValidateIssueFallback(); err != nil {
+		t.Fatalf("claimless insufficient-evidence issue fallback: %v", err)
+	}
+	if err := content.ValidatePeriodicFallback(); err != nil {
+		t.Fatalf("claimless insufficient-evidence periodic fallback: %v", err)
+	}
+	if err := content.ValidatePeriodic(); err == nil {
+		t.Fatal("claimless insufficient-evidence periodic model was accepted")
+	}
+	content.DecisionState = ExecutiveDecisionNoAction
+	if err := content.ValidateIssue(); err == nil {
+		t.Fatal("claimless issue no-action content was accepted")
+	}
+	if err := content.ValidatePeriodicFallback(); err != nil {
+		t.Fatalf("claimless periodic no-action content: %v", err)
+	}
+	if err := content.ValidatePeriodic(); err == nil {
+		t.Fatal("claimless no-action periodic model was accepted")
+	}
+	content.NextSteps = []ExecutiveNextStepV1{{
+		Kind: ExecutiveNextStepDeepDive, Label: "深入了解",
+		Rationale: "没有可绑定证据。",
+	}}
+	if err := content.ValidatePeriodic(); err == nil {
+		t.Fatal("claimless content with next step was accepted")
+	}
+}
+
+func TestExecutiveBriefArtifactV1RestrictsClaimlessContentToFallback(
+	t *testing.T,
+) {
+	content := ExecutiveBriefContentV1{
+		Headline:         "最高优先级内容证据不足",
+		ExecutiveSummary: "不生成未经证据支持的综合判断。",
+		DecisionState:    ExecutiveDecisionInsufficientEvidence,
+		WhyForYou:        "请以完整简报为准。",
+		Signals:          []ExecutiveSignalV1{},
+		NextSteps:        []ExecutiveNextStepV1{},
+	}
+	base := ExecutiveBriefArtifactDraftV1{
+		SchemaVersion: ExecutiveBriefSchemaVersionV1,
+		RunOutcomeID:  1, RunSnapshotID: 2, PushBatchID: 3,
+		TenantID: 4, UserID: 5, TaskID: "task-a",
+		ProfileDigest: strings.Repeat("a", 64),
+		InputDigest:   strings.Repeat("b", 64),
+		GeneratedAt:   time.Date(2026, 7, 28, 1, 2, 3, 0, time.UTC),
+		Content:       content,
+	}
+	model := base
+	model.GenerationMode = ExecutiveGenerationModel
+	model.Processing = RunCompletenessComplete
+	if err := model.Validate(); err == nil {
+		t.Fatal("claimless model artifact was accepted")
+	}
+	fallback := base
+	fallback.GenerationMode = ExecutiveGenerationFallback
+	fallback.Processing = RunCompletenessPartial
+	if err := fallback.Validate(); err != nil {
+		t.Fatalf("claimless fallback artifact: %v", err)
+	}
+}
+
 func TestExecutiveBriefContentBindsCanonicalBriefWithoutMutatingInput(
 	t *testing.T,
 ) {
@@ -115,8 +191,8 @@ func TestPeriodicBriefReportV1CanonicalizesInputsAndRequiresBriefRefs(t *testing
 			{BriefID: 9, Digest: strings.Repeat("c", 64)},
 			{BriefID: 7, Digest: strings.Repeat("d", 64)},
 		},
-		RunOutcomeIDs: []int64{6, 4},
-		OutcomeDigest: strings.Repeat("e", 64),
+		RunOutcomeIDs:  []int64{6, 4},
+		OutcomeDigest:  strings.Repeat("e", 64),
 		GenerationMode: ExecutiveGenerationModel,
 		SourceCoverage: RunCompletenessComplete,
 		Processing:     RunCompletenessComplete,

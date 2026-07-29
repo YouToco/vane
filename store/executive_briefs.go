@@ -128,9 +128,14 @@ func scanExecutiveSynthesisReceiptV1(
 			return ExecutiveSynthesisReceiptV1{},
 				canonicalBriefIntegrityError()
 		}
+		contentErr := content.ValidateIssue()
+		if receipt.GenerationMode ==
+			types.ExecutiveGenerationFallback {
+			contentErr = content.ValidateIssueFallback()
+		}
 		canonical, err := json.Marshal(content)
 		if err != nil || !bytes.Equal(canonical, payload) ||
-			content.ValidateIssue() != nil {
+			contentErr != nil {
 			return ExecutiveSynthesisReceiptV1{},
 				canonicalBriefIntegrityError()
 		}
@@ -449,7 +454,11 @@ func (s *Store) finalizeExecutiveSynthesisV1(
 	content types.ExecutiveBriefContentV1,
 	fallback bool,
 ) (ExecutiveSynthesisReceiptV1, error) {
-	if err := content.ValidateIssue(); err != nil {
+	contentErr := content.ValidateIssue()
+	if fallback {
+		contentErr = content.ValidateIssueFallback()
+	}
+	if contentErr != nil {
 		return ExecutiveSynthesisReceiptV1{},
 			canonicalBriefValidationError(
 				"executive synthesis content is invalid")
@@ -726,7 +735,12 @@ func (s *Store) freezeExecutiveBriefArtifactV1(
 			canonicalBriefDatabaseError(
 				"load executive Brief canonical snapshot", err)
 	}
-	boundContent, err := draft.Content.BindBriefID(briefID)
+	var boundContent types.ExecutiveBriefContentV1
+	if draft.GenerationMode == types.ExecutiveGenerationFallback {
+		boundContent, err = draft.Content.BindBriefIDFallback(briefID)
+	} else {
+		boundContent, err = draft.Content.BindBriefID(briefID)
+	}
 	if err != nil {
 		return types.ExecutiveBriefArtifactV1{},
 			canonicalBriefIntegrityError()

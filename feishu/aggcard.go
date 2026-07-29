@@ -92,38 +92,43 @@ func BuildAggregateCard(in feedback.AggregateCardInput) string {
 	}
 
 	elements := make([]any, 0, len(in.Items)*6)
-	if executive := in.Executive; executive != nil &&
-		executive.ValidateIssue() == nil {
-		state := "继续观察"
-		switch executive.DecisionState {
-		case types.ExecutiveDecisionAct:
-			state = "建议行动"
-		case types.ExecutiveDecisionNoAction:
-			state = "暂不行动"
-		case types.ExecutiveDecisionInsufficientEvidence:
-			state = "证据不足"
+	if executive := in.Executive; executive != nil {
+		executiveErr := executive.ValidateIssue()
+		if in.ExecutiveFallback {
+			executiveErr = executive.ValidateIssueFallback()
 		}
-		coverage := ""
-		if in.ExecutivePartial || in.ExecutiveFallback {
-			coverage = "\n<font color='orange'>覆盖不完整，请结合下方证据判断。</font>"
+		if executiveErr == nil {
+			state := "继续观察"
+			switch executive.DecisionState {
+			case types.ExecutiveDecisionAct:
+				state = "建议行动"
+			case types.ExecutiveDecisionNoAction:
+				state = "暂不行动"
+			case types.ExecutiveDecisionInsufficientEvidence:
+				state = "证据不足"
+			}
+			coverage := ""
+			if in.ExecutivePartial || in.ExecutiveFallback {
+				coverage = "\n<font color='orange'>覆盖不完整，请结合下方证据判断。</font>"
+			}
+			elements = append(elements, map[string]any{
+				"tag": "markdown",
+				"content": fmt.Sprintf(
+					"**%s**　<font color='blue'>%s</font>\n%s\n<font color='grey'>与你有关：%s</font>%s",
+					escapeMarkdown(truncateRunesV1(executive.Headline, 120)), state,
+					escapeMarkdown(truncateRunesV1(
+						executive.ExecutiveSummary, 320)),
+					escapeMarkdown(truncateRunesV1(executive.WhyForYou, 220)),
+					coverage,
+				),
+			})
+			if brief := in.CanonicalBrief; validCanonicalBriefCardV1(
+				brief, len(in.Items),
+			) {
+				elements = append(elements, executiveActionColumnsV1(brief.WebURL))
+			}
+			elements = append(elements, map[string]any{"tag": "hr"})
 		}
-		elements = append(elements, map[string]any{
-			"tag": "markdown",
-			"content": fmt.Sprintf(
-				"**%s**　<font color='blue'>%s</font>\n%s\n<font color='grey'>与你有关：%s</font>%s",
-				escapeMarkdown(truncateRunesV1(executive.Headline, 120)), state,
-				escapeMarkdown(truncateRunesV1(
-					executive.ExecutiveSummary, 320)),
-				escapeMarkdown(truncateRunesV1(executive.WhyForYou, 220)),
-				coverage,
-			),
-		})
-		if brief := in.CanonicalBrief; validCanonicalBriefCardV1(
-			brief, len(in.Items),
-		) {
-			elements = append(elements, executiveActionColumnsV1(brief.WebURL))
-		}
-		elements = append(elements, map[string]any{"tag": "hr"})
 	}
 	for i, item := range in.Items {
 		if i > 0 {

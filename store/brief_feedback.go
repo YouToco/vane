@@ -86,9 +86,18 @@ func (s *Store) LoadExecutiveBriefForFeedbackV1(
 				briefFeedDBError("读取执行简报终态回执", err)
 		}
 		var content types.ExecutiveBriefContentV1
+		var contentErr error
 		if !generation.Valid() || !processing.Valid() ||
-			json.Unmarshal(payload, &content) != nil ||
-			content.ValidateIssue() != nil {
+			json.Unmarshal(payload, &content) != nil {
+			return types.ExecutiveBriefRenderV1{}, false,
+				canonicalBriefIntegrityError()
+		}
+		if generation == types.ExecutiveGenerationFallback {
+			contentErr = content.ValidateIssueFallback()
+		} else {
+			contentErr = content.ValidateIssue()
+		}
+		if contentErr != nil {
 			return types.ExecutiveBriefRenderV1{}, false,
 				canonicalBriefIntegrityError()
 		}
