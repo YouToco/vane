@@ -1811,9 +1811,9 @@ func TestHandleMessage_ContextualCreateAcceptsFlatFetchPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm != nil || len(creation.proposeCalls) != 1 ||
-		len(creation.confirmCalls) != 1 {
-		t.Fatalf("带上下文的明确创建应一次直达 durable 执行: out=%+v propose=%d confirm=%d",
+	if out.Confirm == nil || out.Reply != replyTaskCreationConfirm ||
+		len(creation.proposeCalls) != 1 || len(creation.confirmCalls) != 0 {
+		t.Fatalf("带上下文的明确创建应一次生成 durable confirmation card: out=%+v propose=%d confirm=%d",
 			out, len(creation.proposeCalls), len(creation.confirmCalls))
 	}
 	var proposed struct {
