@@ -3,8 +3,8 @@
 > 状态：正式演进契约，2026-07-21 起按 C0→C4 小步落地。本文描述运行时边界，
 > 不新增公开 HTTP/A2A wire contract。7.10-B5 起任务创建仍以 A5/A6 saga 为唯一生产
 > 写入口，但 Agent 以 server-owned receipt 自动授权推进，不再发行新确认卡。
-> 2026-07-29 起当前运行只接受 `approved_plan` 与精确
-> `task_fetch_targets`；`legacy_subscriptions` 只存在于不可变历史 wire 的读取器。
+> 2026-07-29 起 Agent 只从任务手册选择版本化 Tool。旧 target projection
+> 仅作为可恢复 v1 Run 与历史内容证据的迁移兼容根。
 
 ## 1. 产品语义
 
@@ -241,9 +241,10 @@ schema version 分派到固定 reader；不得先调用 current DTO validator，
 
 存量任务必须显式区分：
 
-- `approved_plan`：按已批准 fetch_plan 和精确 task_fetch_targets 执行；二者不一致即拒绝运行。
-  fetch_plan 中的 platform/capability/title/URL/config 是执行身份真相源，task_fetch_targets 与全局
-  sources 只提供稳定 SourceID 和可变健康状态；共享源元数据变化不得改写用户已批准的下一 run。
+- 当前 writer：任务 Approved Definition 直接封存 Tool 名称、canonical arguments 和版本路由；
+  新 Run 只能从该不可变 head 建快照，不得从可变 projection 重建。
+- retained v1：旧 fetch plan、target projection 与正整数 SourceID 只服务已经存在的可恢复
+  Run 和历史 provenance；它们不得进入 Agent 工具协议或成为新任务的用户真相源。
 - `legacy_subscriptions`：仅允许版本化读取器解释既有不可变快照；禁止创建新快照或当前运行。
 
 `discover_at_run` 的空计划永远不得进入 legacy“抓全部订阅源”分支。
