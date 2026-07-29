@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 74
+const latestMigrationVersion int64 = 75
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -122,6 +122,13 @@ var wantTables = []string{
 	"periodic_synthesis_receipts",
 	"periodic_brief_reports",
 	"periodic_report_deliveries",
+	// 075 task-owned Source, frozen run Source and scoped content provenance.
+	"task_sources",
+	"task_source_states",
+	"task_run_sources",
+	"task_content_records",
+	"task_content_appearances",
+	"task_content_evidence",
 }
 
 // droppedTables 是"曾被某迁移 CREATE、又被后续迁移 DROP"的表：它们出现在迁移的
