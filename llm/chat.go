@@ -58,6 +58,9 @@ type ChatRequest struct {
 	Temperature     *float32 // nil = 不传该字段
 	MaxTokens       *int     // nil = 不传该字段
 	DisableThinking bool     // 语义同 Request.DisableThinking（见 client.go 的事故注释）
+	// beforeSend is installed only by DoChat after it estimates this request.
+	// Keeping it private prevents callers from replacing the quota gate.
+	beforeSend func(context.Context) error
 }
 
 // ChatResponse 单次 Chat 调用结果。现有调用方 API 保持不变；字段由通过
@@ -147,7 +150,7 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	select {
 	case c.sem <- struct{}{}:
 	case <-ctx.Done():
-		return nil, wrapCtxErr(ctx.Err())
+		return nil, wrapChatRequestNotSent(ctx.Err())
 	}
 	defer func() { <-c.sem }()
 
@@ -218,6 +221,20 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	if err := ctx.Err(); err != nil {
+		return nil, wrapChatRequestNotSent(err)
+	}
+	if req.beforeSend != nil {
+		if err := req.beforeSend(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		// The quota hook may have reserved successfully just as the owner
+		// canceled. Mark this as definitely not sent so DoChat refunds it.
+		return nil, wrapChatRequestNotSent(err)
+	}
 
 	httpResp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -292,6 +309,16 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	return resp, nil
 }
 
+var errChatRequestNotSent = errors.New("llm: chat request not sent")
+
+func wrapChatRequestNotSent(cause error) error {
+	return types.NewAppError(
+		types.CodeLLMUnavailable,
+		"llm: 请求发送前已取消",
+		errors.Join(errChatRequestNotSent, cause),
+	)
+}
+
 // userPromptMaxBytes DoChat 记账时 UserPrompt（messages 数组 JSON）的截断上限。
 // 多轮会话上下文会越滚越大，全量入库会让 llm_calls 无谓膨胀；
 // 8KB（契约 §4）足够排障时看清最近几轮对话。
@@ -343,26 +370,42 @@ func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Ch
 	// 循环里一次用户消息会触发多轮调用，单次交互的总量还要再乘一个轮数。
 	// 第一版把这条漏了，却在 Do 的注释里断言"唯一咽喉"——错得最贵的那种。
 	estimate := estimateTokens(chatPromptRunes(req), req.MaxTokens)
-	if err := rec.CheckQuota(ctx, meta.UserID, estimate); err != nil {
-		switch {
-		case errors.Is(err, store.ErrQuotaExceeded):
-			return nil, types.NewAppError(types.CodeQuotaExceeded,
-				"本租户的 LLM 额度已用尽，稍后会随时间自动恢复", nil)
-		case errors.Is(err, store.ErrAmbiguousTenant):
-			// 归属不明 ⇒ 拒绝。此刻根本不知道该记谁的账，而花一笔无法归属的钱
-			// 正是这道护栏存在的理由；且它是确定性的，放行等于给该用户无限额度。
-			slog.Error("llm: 用户归属多个租户，无法判定配额归属，拒绝调用", "user_id", *meta.UserID)
-			return nil, types.NewAppError(types.CodeInternal,
-				"账号归属异常，暂时无法处理，请联系管理员", err)
-		default:
-			// 其余（数据库抖动等）放行：让 DB 抖动升级成全局 LLM 停摆，比超额一点糟糕得多。
-			// 用 Error 而非 Warn——护栏此刻是失效的，这件事必须在日志里显眼。
-			slog.Error("llm: 配额查询失败，本次放行（护栏此刻失效）", "err", err)
+	reserved := 0.0
+	var gateErr error
+	req.beforeSend = func(sendCtx context.Context) error {
+		if err := rec.CheckQuota(sendCtx, meta.UserID, estimate); err != nil {
+			switch {
+			case errors.Is(err, store.ErrQuotaExceeded):
+				gateErr = types.NewAppError(types.CodeQuotaExceeded,
+					"本租户的 LLM 额度已用尽，稍后会随时间自动恢复", nil)
+				return gateErr
+			case errors.Is(err, store.ErrAmbiguousTenant):
+				// 归属不明 ⇒ 拒绝。此刻根本不知道该记谁的账，而花一笔无法归属的钱
+				// 正是这道护栏存在的理由；且它是确定性的，放行等于给该用户无限额度。
+				if meta.UserID != nil {
+					slog.Error("llm: 用户归属多个租户，无法判定配额归属，拒绝调用",
+						"user_id", *meta.UserID)
+				}
+				gateErr = types.NewAppError(types.CodeInternal,
+					"账号归属异常，暂时无法处理，请联系管理员", err)
+				return gateErr
+			default:
+				// 其余（数据库抖动等）放行：让 DB 抖动升级成全局 LLM 停摆，
+				// 比超额一点糟糕得多。reserved 保持 0，成功后按实际量补扣。
+				slog.Error("llm: 配额查询失败，本次放行（护栏此刻失效）", "err", err)
+			}
+		} else {
+			reserved = estimate
 		}
+		return nil
 	}
 
 	start := time.Now()
 	resp, err := c.Chat(ctx, req)
+	if gateErr != nil {
+		// 保持既有语义：配额闸门在上游零调用时直接返回，不伪造一次 LLM 调用。
+		return nil, gateErr
+	}
 
 	msgsJSON, mErr := json.Marshal(req.Messages)
 	if mErr != nil {
@@ -418,8 +461,26 @@ func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Ch
 	}
 
 	// 与 Do 共用一个有硬上限的 detached tail：既不能因请求取消漏记，
-	// 也不能让同步 DB 写无限拖住 Activity/进程关停。
-	rec.finishCallAccounting(ctx, call, meta.UserID, estimate, call.PromptTokens+call.CompletionTokens)
+	// 也不能让同步 DB 写无限拖住 Activity/进程关停。HTTP 429/4xx 是上游
+	// 明确拒绝，actual=0 可安全退还；但 timeout、5xx、读取/解析响应失败都可能
+	// 发生在供应商已生成并计费之后。用量未知时保留事前预扣，不能让自动重试把
+	// 最多三笔真实支出全部记成零成本并退回租户额度。
+	actualTokens := call.PromptTokens + call.CompletionTokens
+	reconcileQuota := reserved > 0 || actualTokens > 0
+	if err != nil && resp == nil &&
+		types.CodeOf(err) == types.CodeLLMUnavailable &&
+		!errors.Is(err, errChatRequestNotSent) {
+		reconcileQuota = false
+		slog.Warn("llm: 响应用量未知，保留 Agent 调用的保守预扣",
+			"trace_id", meta.TraceID,
+			"model", c.requestModel(req.Model),
+			"reserved_tokens", reserved,
+			"error_code", types.CodeOf(err))
+	}
+	rec.finishCallAccountingWithReservation(
+		ctx, call, nil, meta.UserID, reserved,
+		actualTokens, nil, reconcileQuota,
+	)
 	if err != nil {
 		// Chat may return a metadata-only response for accounting. Never expose
 		// that partial response to callers which could accidentally use it.

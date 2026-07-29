@@ -19,6 +19,8 @@ type capturingRecorderStore struct {
 	calls             []types.LLMCall
 	legacyTryCalls    int
 	legacyAdjustCalls int
+	legacyAdjustments []float64
+	onTryConsume      func()
 }
 
 func (s *capturingRecorderStore) InsertLLMCall(_ context.Context, call *types.LLMCall) (int64, error) {
@@ -36,18 +38,23 @@ func (s *capturingRecorderStore) TryConsumeForUser(
 ) error {
 	s.mu.Lock()
 	s.legacyTryCalls++
+	hook := s.onTryConsume
 	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return nil
 }
 
 func (s *capturingRecorderStore) AdjustForUser(
-	context.Context,
-	int64,
-	store.QuotaBucket,
-	float64,
+	_ context.Context,
+	_ int64,
+	_ store.QuotaBucket,
+	adjustment float64,
 ) error {
 	s.mu.Lock()
 	s.legacyAdjustCalls++
+	s.legacyAdjustments = append(s.legacyAdjustments, adjustment)
 	s.mu.Unlock()
 	return nil
 }

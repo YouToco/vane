@@ -473,6 +473,72 @@ func (s *scriptedChat) fn(_ context.Context, req llm.ChatRequest) (*llm.ChatResp
 	return resp, nil
 }
 
+func TestRetryAgentChatRetriesTransientFailuresInSameMessage(t *testing.T) {
+	calls := 0
+	want := &llm.ChatResponse{Content: "grounded answer"}
+	got, err := retryAgentChat(t.Context(), 3, func(int) time.Duration { return 0 },
+		func(context.Context) (*llm.ChatResponse, error) {
+			calls++
+			if calls < 3 {
+				return nil, types.NewAppError(
+					types.CodeLLMRateLimit, "engine overloaded", nil,
+				)
+			}
+			return want, nil
+		})
+	if err != nil {
+		t.Fatalf("retryAgentChat() error = %v", err)
+	}
+	if got != want {
+		t.Fatalf("retryAgentChat() response = %#v, want %#v", got, want)
+	}
+	if calls != 3 {
+		t.Fatalf("attempts = %d, want 3", calls)
+	}
+}
+
+func TestRetryAgentChatDoesNotRetryDeterministicFailure(t *testing.T) {
+	for _, code := range []types.ErrCode{
+		types.CodeLLMBadRequest,
+		types.CodeQuotaExceeded,
+	} {
+		t.Run(string(code), func(t *testing.T) {
+			calls := 0
+			_, err := retryAgentChat(t.Context(), 3, func(int) time.Duration { return 0 },
+				func(context.Context) (*llm.ChatResponse, error) {
+					calls++
+					return nil, types.NewAppError(code, "deterministic failure", nil)
+				})
+			if types.CodeOf(err) != code {
+				t.Fatalf("error code = %s, want %s", types.CodeOf(err), code)
+			}
+			if calls != 1 {
+				t.Fatalf("attempts = %d, want 1", calls)
+			}
+		})
+	}
+}
+
+func TestRetryAgentChatStopsWhenOwnerContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	calls := 0
+	_, err := retryAgentChat(ctx, 3, func(int) time.Duration {
+		cancel()
+		return time.Minute
+	}, func(context.Context) (*llm.ChatResponse, error) {
+		calls++
+		return nil, types.NewAppError(
+			types.CodeLLMUnavailable, "temporary failure", nil,
+		)
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if calls != 1 {
+		t.Fatalf("attempts = %d, want 1", calls)
+	}
+}
+
 type countingProfileReader struct {
 	calls   int
 	profile *types.Profile

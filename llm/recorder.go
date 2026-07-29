@@ -188,13 +188,6 @@ func (r *Recorder) ReconcileQuotaWithRule(
 	}
 }
 
-// finishCallAccounting records the call and reconciles quota under one bounded
-// context detached from the already-finished request. Sharing one deadline
-// prevents two sequential 10s tails while preserving failure/cancel accounting.
-func (r *Recorder) finishCallAccounting(ctx context.Context, call *types.LLMCall, userID *int64, estimate float64, actualTokens int) {
-	r.finishCallAccountingWithRule(ctx, call, nil, userID, estimate, actualTokens, nil)
-}
-
 func (r *Recorder) finishCallAccountingWithRule(
 	ctx context.Context,
 	call *types.LLMCall,

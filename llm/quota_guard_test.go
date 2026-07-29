@@ -51,7 +51,7 @@ var upstreamEntries = []upstreamEntry{
 	},
 	{
 		file: "chat.go", fn: "DoChat", upstream: "Chat",
-		gate: "CheckQuota", accounting: "finishCallAccounting",
+		gate: "CheckQuota", accounting: "finishCallAccountingWithReservation",
 		why: "多轮 function calling：agent 循环 / 深挖 / A2A assistant.chat——" +
 			"生产实测 prompt 均值 4381、峰值 44871，是最贵的一条",
 		estimator: "estimateTokens",

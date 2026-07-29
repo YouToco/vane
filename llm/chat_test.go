@@ -3,9 +3,11 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/types"
@@ -404,6 +406,128 @@ func TestDoChatErrorPropagates(t *testing.T) {
 	}
 	if code := types.CodeOf(err); code != types.CodeLLMUnavailable {
 		t.Errorf("错误码 = %s, 期望 %s", code, types.CodeLLMUnavailable)
+	}
+}
+
+func TestDoChatUnknownUsageFailureRetainsConservativeReservation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream failed after accepting request", http.StatusBadGateway)
+	}))
+	t.Cleanup(srv.Close)
+
+	userID := int64(42)
+	st := &capturingRecorderStore{}
+	rec := &Recorder{st: st}
+	_, err := DoChat(t.Context(), newTestClient(srv.URL, 5), rec,
+		CallMeta{TraceID: "unknown-usage", SpanName: "agent", UserID: &userID},
+		ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "research"}}})
+	if types.CodeOf(err) != types.CodeLLMUnavailable {
+		t.Fatalf("error code = %s, want %s", types.CodeOf(err), types.CodeLLMUnavailable)
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.legacyTryCalls != 1 {
+		t.Fatalf("quota reservations = %d, want 1", st.legacyTryCalls)
+	}
+	if st.legacyAdjustCalls != 0 {
+		t.Fatalf("unknown usage refunds = %d, want 0", st.legacyAdjustCalls)
+	}
+	if len(st.calls) != 1 || st.calls[0].Error == "" {
+		t.Fatalf("ledger calls = %#v, want one explicit error row", st.calls)
+	}
+}
+
+func TestDoChatExplicitRateLimitRefundsReservation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"error":{"message":"rate limit exceeded"}}`, http.StatusTooManyRequests)
+	}))
+	t.Cleanup(srv.Close)
+
+	userID := int64(42)
+	st := &capturingRecorderStore{}
+	rec := &Recorder{st: st}
+	_, err := DoChat(t.Context(), newTestClient(srv.URL, 5), rec,
+		CallMeta{TraceID: "rate-limit-refund", SpanName: "agent", UserID: &userID},
+		ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "research"}}})
+	if types.CodeOf(err) != types.CodeLLMRateLimit {
+		t.Fatalf("error code = %s, want %s", types.CodeOf(err), types.CodeLLMRateLimit)
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.legacyTryCalls != 1 || st.legacyAdjustCalls != 1 {
+		t.Fatalf("quota reserve/adjust = %d/%d, want 1/1",
+			st.legacyTryCalls, st.legacyAdjustCalls)
+	}
+	if len(st.legacyAdjustments) != 1 || st.legacyAdjustments[0] <= 0 {
+		t.Fatalf("refund adjustments = %v, want one positive refund", st.legacyAdjustments)
+	}
+}
+
+func TestDoChatSemaphoreWaitCancellationNeverReservesOrCallsUpstream(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(chatOKBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newTestClient(srv.URL, 1)
+	c.sem <- struct{}{} // occupy the only provider slot before DoChat reaches its gate
+	defer func() { <-c.sem }()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+
+	userID := int64(42)
+	st := &capturingRecorderStore{}
+	_, err := DoChat(ctx, c, &Recorder{st: st},
+		CallMeta{TraceID: "queue-cancel", SpanName: "agent", UserID: &userID},
+		ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "research"}}})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline", err)
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("upstream calls = %d, want 0", hits)
+	}
+	if st.legacyTryCalls != 0 || st.legacyAdjustCalls != 0 {
+		t.Fatalf("quota reserve/adjust = %d/%d, want 0/0",
+			st.legacyTryCalls, st.legacyAdjustCalls)
+	}
+}
+
+func TestDoChatCancellationAfterReservationRefundsBeforeSend(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(chatOKBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	userID := int64(42)
+	st := &capturingRecorderStore{onTryConsume: cancel}
+	_, err := DoChat(ctx, newTestClient(srv.URL, 1), &Recorder{st: st},
+		CallMeta{TraceID: "post-reserve-cancel", SpanName: "agent", UserID: &userID},
+		ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "research"}}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("upstream calls = %d, want 0", hits)
+	}
+	if st.legacyTryCalls != 1 || st.legacyAdjustCalls != 1 {
+		t.Fatalf("quota reserve/adjust = %d/%d, want 1/1",
+			st.legacyTryCalls, st.legacyAdjustCalls)
+	}
+	if len(st.legacyAdjustments) != 1 || st.legacyAdjustments[0] <= 0 {
+		t.Fatalf("refund adjustments = %v, want one positive refund", st.legacyAdjustments)
 	}
 }
 

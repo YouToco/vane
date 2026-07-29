@@ -181,7 +181,8 @@ const (
 
 	// chatCallTimeout 单次模型调用的硬超时（审查 #信号量瘫痪），
 	// 对齐 workflow llmActivityOptions 的 120s 预算。
-	chatCallTimeout = 120 * time.Second
+	chatCallTimeout      = 120 * time.Second
+	agentChatMaxAttempts = 3
 
 	// appendCallbackTimeout 卡片回调回写的 DB 预算，在拿到 userMu 之后才起算——
 	// 锁等待可达对端整条消息预算（分钟级），不能占用回写自己的超时窗口。
@@ -502,15 +503,73 @@ func NewChecked(d Deps) (*Loop, error) {
 			meta.TraceID = m.traceID
 			meta.UserID = &m.userID
 		}
-		// per-call 超时（审查 #信号量瘫痪）：llm.Client 刻意不设 HTTP 超时、由调用方
-		// ctx 控制，而 agent 链上游是无 deadline 的 WS 连接级 ctx——上游响应黑洞时该调用
-		// 会永久挂死并占住共享 LLM 信号量槽位（与打分/出卡同池），5 条卡死消息即可
-		// 瘫痪全部 LLM 面。120s 对齐 workflow llmActivityOptions 的预算。
-		cctx, cancel := context.WithTimeout(ctx, chatCallTimeout)
-		defer cancel()
-		return llm.DoChat(cctx, d.Client, d.Recorder, meta, req)
+		return retryAgentChat(ctx, agentChatMaxAttempts, agentChatRetryDelay,
+			func(attemptCtx context.Context) (*llm.ChatResponse, error) {
+				// per-attempt 超时（审查 #信号量瘫痪）：llm.Client 刻意不设 HTTP
+				// 超时、由调用方 ctx 控制，而 agent 链上游是无 deadline 的 WS
+				// 连接级 ctx。每次自动重试都必须拿到独立的 120s 窗口；复用一次
+				// 已超时的 child context 会让后续尝试在发请求前立即失败。
+				cctx, cancel := context.WithTimeout(attemptCtx, chatCallTimeout)
+				defer cancel()
+				return llm.DoChat(cctx, d.Client, d.Recorder, meta, req)
+			})
 	}
 	return l, nil
+}
+
+func agentChatRetryDelay(failedAttempt int) time.Duration {
+	switch failedAttempt {
+	case 1:
+		return 2 * time.Second
+	default:
+		return 5 * time.Second
+	}
+}
+
+// retryAgentChat keeps transient provider failures inside the same owner
+// message. Each failed DoChat call remains independently metered; only errors
+// already classified retryable by the shared error policy (timeouts, HTTP 429
+// and 5xx) may enter this path. Protocol, quota, validation and authorization
+// failures return immediately.
+func retryAgentChat(
+	ctx context.Context,
+	maxAttempts int,
+	delay func(failedAttempt int) time.Duration,
+	call func(context.Context) (*llm.ChatResponse, error),
+) (*llm.ChatResponse, error) {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	for attempt := 1; ; attempt++ {
+		resp, err := call(ctx)
+		if err == nil || attempt >= maxAttempts ||
+			!types.IsRetryable(err) || ctx.Err() != nil {
+			return resp, err
+		}
+
+		wait := time.Duration(0)
+		if delay != nil {
+			wait = delay(attempt)
+		}
+		slog.Warn("agent: 模型暂时不可用，同一消息内自动重试",
+			"attempt", attempt,
+			"max_attempts", maxAttempts,
+			"error_code", types.CodeOf(err),
+			"retry_after", wait)
+		if wait <= 0 {
+			continue
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			// Go 1.23+ guarantees that after Stop returns, a receive from the
+			// timer channel cannot observe a stale tick. Draining after a false
+			// return can therefore block forever when cancellation races expiry.
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // HandleMessage 执行完整 agent loop（契约 §7）：取/建会话 → 多轮 FC →
