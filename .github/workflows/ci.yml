@@ -19,11 +19,14 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 22
+          node-version: 22.23.1
           cache: npm
 
       - name: Install
         run: npm ci
+
+      - name: Vulnerability scan
+        run: npm audit --audit-level=high
 
       - name: Test
         run: npm test
