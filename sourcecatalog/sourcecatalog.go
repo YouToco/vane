@@ -69,7 +69,7 @@ type key struct {
 //   - web/contents：监控指定 URL 的内容变化，用 Exa /contents 抓取（fetcher/exa_contents.go）。
 //     这是 page_watch 下线时声称的"改由 Exa /contents 覆盖"的实际落地——极简变化检测
 //     （canonical_key=contents://url#hash，无基线表、无 LLM 门），不重蹈 page_watch 的复杂度。
-//   - x/user_posts：追 X 官号，已实现（fetcher/x.go）。
+//   - x/user_posts：追 X 官号，仅通过 TikHub 绑定引擎实现（fetcher/binding.go）。
 //   - x/search：**Unavailable**——上游 search_type=Latest 排序不可靠，无法追新（见 Reason）。
 //   - xhs/search：小红书关键词搜索，已实现（fetcher/tikhub.go）。
 //   - xhs/user_posts：订阅小红书博主，本次新增（fetcher/xhs_user.go）。

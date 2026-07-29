@@ -108,6 +108,57 @@ func TestLookup(t *testing.T) {
 	}
 }
 
+// TestInvariant_TwitterEndpointsPreserved locks the complete TikHub Twitter
+// keep-set. The provider policy forbids direct X/Twitter APIs, but must never
+// remove TikHub endpoints merely because their names or tags contain Twitter.
+func TestInvariant_TwitterEndpointsPreserved(t *testing.T) {
+	want := []string{
+		"twitter_web_fetch_latest_post_comments",
+		"twitter_web_fetch_post_comments",
+		"twitter_web_fetch_retweet_user_list",
+		"twitter_web_fetch_search_timeline",
+		"twitter_web_fetch_trending",
+		"twitter_web_fetch_tweet_detail",
+		"twitter_web_fetch_user_followers",
+		"twitter_web_fetch_user_followings",
+		"twitter_web_fetch_user_media",
+		"twitter_web_fetch_user_post_tweet",
+		"twitter_web_fetch_user_profile",
+		"twitter_web_fetch_user_tweet_replies",
+	}
+	wantSet := make(map[string]struct{}, len(want))
+	for _, name := range want {
+		wantSet[name] = struct{}{}
+		entry, ok := Lookup(name)
+		if !ok {
+			t.Errorf("TikHub Twitter endpoint %q is missing", name)
+			continue
+		}
+		wantPath := "/api/v1/twitter/web/" + strings.TrimPrefix(name, "twitter_web_")
+		if entry.Method != "GET" ||
+			entry.Path != wantPath ||
+			entry.Platform != "twitter" ||
+			entry.Tag != "Twitter-Web-API" {
+			t.Errorf("%s metadata drifted: %+v", name, entry)
+		}
+	}
+
+	var got []string
+	for _, entry := range entries {
+		if entry.Platform != "twitter" {
+			continue
+		}
+		got = append(got, entry.Name)
+		if _, ok := wantSet[entry.Name]; !ok {
+			t.Errorf("unreviewed TikHub Twitter endpoint %q entered the catalog", entry.Name)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("TikHub Twitter endpoint count = %d, want %d; got %v",
+			len(got), len(want), got)
+	}
+}
+
 // TestSearch_Golden 用一组代表性查询锁住检索质量下限：这些用例是「agent 会怎么问」
 // 的最小样本，重构分词/打分后必须仍然命中。断言只要求目标端点进 top-K，
 // 不锁具体排名——BM25 参数微调不应打红测试。
