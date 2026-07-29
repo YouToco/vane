@@ -86,13 +86,17 @@ func TestPeriodicReportRecoveryFreezesExactCanonicalInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.base.st.FinalizeRunOutcomeClaimV1(
+	if receipt.FinalizedAt == nil {
+		t.Fatal("executive synthesis receipt is not finalized")
+	}
+	outcome, err := f.base.st.FinalizeRunOutcomeClaimV1(
 		t.Context(), f.identity, f.ref, types.RunOutcomeClaimV1{
 			RunOutcomeMarkerV1: marker,
 			Result:             types.RunResultContent,
 			SourceCoverage:     types.RunCompletenessComplete,
 			Processing:         types.RunCompletenessPartial,
-		}); err != nil {
+		})
+	if err != nil {
 		t.Fatal(err)
 	}
 	artifact, err := f.base.st.FreezeExecutiveBriefArtifactRecoveryV1(
@@ -124,13 +128,20 @@ func TestPeriodicReportRecoveryFreezesExactCanonicalInputs(t *testing.T) {
 	if err := json.Unmarshal(briefPayload, &brief); err != nil {
 		t.Fatal(err)
 	}
-	if receipt.FinalizedAt == nil {
-		t.Fatal("executive synthesis receipt is not finalized")
-	}
 	// Period membership is defined by the run outcome's database-clock
 	// finalized_at, not the Brief fixture's intentionally frozen GeneratedAt.
-	periodStart := receipt.FinalizedAt.AddDate(0, 0, -1)
-	periodEnd := receipt.FinalizedAt.AddDate(0, 0, 1)
+	if outcome.FinalizedAt.IsZero() {
+		t.Fatal("run outcome is not finalized")
+	}
+	periodStart := outcome.FinalizedAt
+	periodEnd := outcome.FinalizedAt.Add(time.Microsecond)
+	if !brief.GeneratedAt.Before(periodStart) &&
+		brief.GeneratedAt.Before(periodEnd) {
+		t.Fatalf(
+			"fixed Brief time %s unexpectedly overlaps outcome window [%s,%s)",
+			brief.GeneratedAt, periodStart, periodEnd,
+		)
+	}
 	intent, err := f.base.st.PreparePeriodicBriefIntentV1(
 		t.Context(), f.identity.TenantID, f.identity.UserID,
 		f.identity.TaskID, BriefReportCadenceWeekly,
