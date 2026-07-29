@@ -409,6 +409,33 @@ func TestExecutiveBriefRolloutValidation(t *testing.T) {
 			t.Fatal("expected Web rollout nesting error")
 		}
 	})
+	t.Run("Web projection allow all is independent from exact synthesis", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = "task-a"
+		cfg.Pipeline.ExecutiveBriefWebProjectionAllowAll = true
+		cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID = "task-a"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Web projection allow-all rejected: %v", err)
+		}
+	})
+	t.Run("Web canary and projection allow all coexist", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefEnabled = true
+		cfg.Pipeline.ExecutiveBriefCanaryScheduleID = "task-a"
+		cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID = "task-a"
+		cfg.Pipeline.ExecutiveBriefWebProjectionAllowAll = true
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("projection allow-all disabled exact Web canary: %v", err)
+		}
+	})
+	t.Run("Web projection allow all requires synthesis capability", func(t *testing.T) {
+		cfg := base()
+		cfg.Pipeline.ExecutiveBriefWebProjectionAllowAll = true
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected Web/synthesis capability error")
+		}
+	})
 	t.Run("renderer without Web canary is rejected", func(t *testing.T) {
 		cfg := base()
 		cfg.Pipeline.ExecutiveBriefEnabled = true
@@ -1233,11 +1260,32 @@ func TestEnvOnlyExecutiveBriefCanary(t *testing.T) {
 			cfg.Pipeline.ExecutiveBriefCanaryScheduleID != taskID ||
 			cfg.Pipeline.ExecutiveBriefAllowAll ||
 			cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID != taskID ||
+			cfg.Pipeline.ExecutiveBriefWebProjectionAllowAll ||
 			cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID != taskID {
 			t.Fatalf(
 				"VANE_PIPELINE_EXECUTIVE_BRIEF_* 未进入配置或被改写: %+v",
 				cfg.Pipeline,
 			)
+		}
+	})
+
+	t.Run("Web projection allow all key reaches config", func(t *testing.T) {
+		clearVaneEnv(t)
+		skipIfSystemConfigExists(t)
+		t.Chdir(t.TempDir())
+		for key, value := range base {
+			t.Setenv(key, value)
+		}
+		t.Setenv(
+			"VANE_PIPELINE_EXECUTIVE_BRIEF_WEB_PROJECTION_ALLOW_ALL", "true")
+
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatalf("环境变量 Web projection allow-all 配置应能启动: %v", err)
+		}
+		if !cfg.Pipeline.ExecutiveBriefWebProjectionAllowAll ||
+			cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID != taskID {
+			t.Fatalf("Web projection allow-all 未进入配置: %+v", cfg.Pipeline)
 		}
 	})
 
@@ -1316,6 +1364,7 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.executive_brief_canary_schedule_id", cfg.Pipeline.ExecutiveBriefCanaryScheduleID, ""},
 		{"pipeline.executive_brief_allow_all", cfg.Pipeline.ExecutiveBriefAllowAll, false},
 		{"pipeline.executive_brief_web_canary_schedule_id", cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID, ""},
+		{"pipeline.executive_brief_web_projection_allow_all", cfg.Pipeline.ExecutiveBriefWebProjectionAllowAll, false},
 		{"pipeline.executive_brief_renderer_canary_schedule_id", cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID, ""},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
 		{"agent.intent_toolkits_shadow_enabled", cfg.Agent.IntentToolkitsShadowEnabled, true},

@@ -21,7 +21,7 @@ func (s *server) handleListPeriodicBriefReports(
 		writeError(w, http.StatusBadRequest, "缺少 schedule id")
 		return
 	}
-	if !s.executiveBriefTaskEnabled(taskID) {
+	if !s.executiveBriefProjectionEnabled(taskID) {
 		writeError(w, http.StatusNotFound, "周期报告未启用")
 		return
 	}

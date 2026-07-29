@@ -444,6 +444,72 @@ func TestExecutiveBriefTaskEnabledUsesExactRolloutScope(t *testing.T) {
 	if s.executiveBriefTaskEnabled("task-other") {
 		t.Fatal("disabled executive Brief rollout remained visible")
 	}
+	s.deps.ExecutiveBriefWebProjectionAllowAll = true
+	if s.executiveBriefTaskEnabled("task-other") ||
+		!s.executiveBriefProjectionEnabled("task-other") ||
+		s.executiveBriefProjectionEnabled("") {
+		t.Fatal("projection allow-all widened interactive scope")
+	}
+}
+
+func TestWebProjectionAllowAllKeepsInteractiveRoutesDark(t *testing.T) {
+	s := &server{deps: Deps{
+		ExecutiveBriefWebCanaryScheduleID:   "task-canary",
+		ExecutiveBriefWebProjectionAllowAll: true,
+	}}
+	if !s.executiveBriefTaskEnabled("task-canary") ||
+		!s.executiveBriefProjectionEnabled("task-canary") {
+		t.Fatal("projection allow-all disabled exact interactive canary")
+	}
+	assertNotFound := func(
+		name string,
+		handler func(http.ResponseWriter, *http.Request),
+		request *http.Request,
+	) {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		handler(recorder, request)
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("%s status=%d body=%s",
+				name, recorder.Code, recorder.Body.String())
+		}
+	}
+
+	settingsRequest := httptest.NewRequest(
+		http.MethodPatch, "/api/schedules/task-other/report-settings",
+		strings.NewReader(`{"delivery":"web_only"}`))
+	settingsRequest.SetPathValue("id", "task-other")
+	assertNotFound(
+		"settings", s.handlePatchBriefReportSettings, settingsRequest)
+
+	groundingRequest := httptest.NewRequest(
+		http.MethodGet, "/api/schedules/task-other/reports/3/grounding", nil)
+	groundingRequest.SetPathValue("id", "task-other")
+	groundingRequest.SetPathValue("target_id", "3")
+	assertNotFound(
+		"grounding", s.handlePeriodicBriefGrounding, groundingRequest)
+
+	deepDiveRequest := httptest.NewRequest(
+		http.MethodPost, "/api/schedules/task-other/reports/3/deep-dive",
+		strings.NewReader(`{"insight_id":7}`))
+	deepDiveRequest.SetPathValue("id", "task-other")
+	deepDiveRequest.SetPathValue("target_id", "3")
+	assertNotFound(
+		"deep-dive", s.handlePeriodicBriefDeepDive, deepDiveRequest)
+
+	followupRequest := httptest.NewRequest(
+		http.MethodPost, "/api/schedules/task-other/reports/3/ask",
+		strings.NewReader(`{"question":"依据是什么？"}`))
+	followupRequest.SetPathValue("id", "task-other")
+	followupRequest.SetPathValue("target_id", "3")
+	followupRecorder := &briefFollowupDeadlineRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+	}
+	s.handlePeriodicBriefFollowup(followupRecorder, followupRequest)
+	if followupRecorder.Code != http.StatusNotFound {
+		t.Fatalf("follow-up status=%d body=%s",
+			followupRecorder.Code, followupRecorder.Body.String())
+	}
 }
 
 func TestBriefPublicProjectionsDoNotExposeIntegrityMetadata(t *testing.T) {
