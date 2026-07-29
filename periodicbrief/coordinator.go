@@ -194,9 +194,23 @@ func (c *Coordinator) runTask(ctx context.Context, taskID string) error {
 	if err != nil {
 		var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
 		if errors.As(err, &alreadyStarted) {
+			// A durable binding proves this exact period workflow was already
+			// started successfully. Temporal may report a different current
+			// run after an operator reset; the sealed intent must not rewrite
+			// its original execution identity during process startup.
+			runID, bind := existingPeriodicBriefRunBinding(
+				intent.TemporalRunID, alreadyStarted.RunId)
+			if !bind {
+				return nil
+			}
+			if runID != "" {
+				return c.store.BindPeriodicBriefIntentRunV1(
+					ctx, intent.TenantID, intent.UserID, intent.ID,
+					runID)
+			}
 			description, describeErr :=
 				c.temporal.DescribeWorkflowExecution(
-					ctx, intent.WorkflowID, intent.TemporalRunID)
+					ctx, intent.WorkflowID, "")
 			if describeErr != nil {
 				return describeErr
 			}
@@ -214,6 +228,19 @@ func (c *Coordinator) runTask(ctx context.Context, taskID string) error {
 	}
 	return c.store.BindPeriodicBriefIntentRunV1(
 		ctx, intent.TenantID, intent.UserID, intent.ID, run.GetRunID())
+}
+
+// existingPeriodicBriefRunBinding returns whether an already-started workflow
+// still needs its Temporal run identity persisted. A non-empty stored identity
+// is sealed evidence of a completed start+bind operation and must never be
+// rewritten by a later process startup.
+func existingPeriodicBriefRunBinding(
+	storedRunID, reportedRunID string,
+) (string, bool) {
+	if storedRunID != "" {
+		return "", false
+	}
+	return reportedRunID, true
 }
 
 func previousNaturalPeriodV1(
