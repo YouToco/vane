@@ -114,10 +114,10 @@ func TestBuildTools_DefinitionEditFlagBoundary(t *testing.T) {
 	if tool == nil {
 		t.Fatal("enabled BuildTools did not register edit_task_definition")
 	}
-	if tool.Policy.Confirmation != ConfirmationNone ||
+	if tool.Policy.Confirmation != ConfirmationRequired ||
 		!tool.Policy.Effects.Has(EffectDurableProposal) ||
-		!tool.Policy.Effects.Has(EffectDirectOwnerWrite) {
-		t.Fatal("edit_task_definition must auto-authorize its durable operation")
+		tool.Policy.Effects.Has(EffectDirectOwnerWrite) {
+		t.Fatal("edit_task_definition must produce exactly one confirmation")
 	}
 	var schema struct {
 		Required []string `json:"required"`
@@ -152,7 +152,7 @@ func TestLoop_DefinitionEditProposalUsesControllerNotGenericPending(t *testing.T
 	if err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if out.Confirm != nil || out.Reply == "" {
+	if out.Confirm == nil || out.Reply == "" {
 		t.Fatalf("outcome = %+v", out)
 	}
 	if len(controller.proposeCalls) != 1 {
@@ -167,10 +167,10 @@ func TestLoop_DefinitionEditProposalUsesControllerNotGenericPending(t *testing.T
 	if store.createCalls != 0 {
 		t.Fatalf("definition edit used generic pending action: %d calls", store.createCalls)
 	}
-	if len(controller.confirmCalls) != 1 ||
-		controller.confirmCalls[0].actionID != controller.proposeCalls[0].ActionID ||
-		controller.confirmCalls[0].receipt.Provider != task.AgentAutoReceiptProvider {
-		t.Fatalf("auto-authorization calls=%+v", controller.confirmCalls)
+	if out.Confirm.ActionID != controller.proposeCalls[0].ActionID ||
+		len(controller.confirmCalls) != 0 {
+		t.Fatalf("confirmation card/controller calls drifted: out=%+v confirm=%+v",
+			out, controller.confirmCalls)
 	}
 }
 
@@ -216,7 +216,7 @@ func TestLoop_WebDefinitionEditIsolatesHistoryAndPinsToolAndTask(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Confirm != nil || out.Reply == "" {
+	if out.Confirm == nil || out.Reply == "" {
 		t.Fatalf("outcome=%+v", out)
 	}
 	if len(requests) != 2 {
@@ -242,10 +242,9 @@ func TestLoop_WebDefinitionEditIsolatesHistoryAndPinsToolAndTask(
 			`{"task_id":"task-edit-1","strictness":"strict"}` {
 		t.Fatalf("proposal calls=%+v", controller.proposeCalls)
 	}
-	if len(controller.confirmCalls) != 1 ||
-		controller.confirmCalls[0].actionID != actionID ||
-		controller.confirmCalls[0].receipt.Provider != task.AgentAutoReceiptProvider {
-		t.Fatalf("auto-authorization calls=%+v", controller.confirmCalls)
+	if out.Confirm.ActionID != actionID || len(controller.confirmCalls) != 0 {
+		t.Fatalf("confirmation card/controller calls drifted: out=%+v confirm=%+v",
+			out, controller.confirmCalls)
 	}
 }
 
@@ -311,17 +310,16 @@ func TestLoop_WebCreationUsesTrustedActionIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Confirm != nil || len(controller.proposeCalls) != 1 ||
+	if out.Confirm == nil || len(controller.proposeCalls) != 1 ||
 		controller.proposeCalls[0].ActionID != actionID {
 		t.Fatalf(
 			"outcome=%+v calls=%+v",
 			out, controller.proposeCalls,
 		)
 	}
-	if len(controller.confirmCalls) != 1 ||
-		controller.confirmCalls[0].actionID != actionID ||
-		controller.confirmCalls[0].receipt != task.AgentAutoReceiptTarget(actionID) {
-		t.Fatalf("auto-authorization calls=%+v", controller.confirmCalls)
+	if out.Confirm.ActionID != actionID || len(controller.confirmCalls) != 0 {
+		t.Fatalf("confirmation card/controller calls drifted: out=%+v confirm=%+v",
+			out, controller.confirmCalls)
 	}
 }
 

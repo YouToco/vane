@@ -1242,8 +1242,7 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 	if state != nil && state.directTaskDefinitionEditID != "" {
 		spec, ok := l.tools["edit_task_definition"]
 		if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
-			!spec.Policy.Effects.Has(EffectDirectOwnerWrite) ||
-			spec.Policy.Confirmation != ConfirmationNone ||
+			spec.Policy.Confirmation != ConfirmationRequired ||
 			l.taskDefinitionEdit == nil {
 			return nil
 		}
@@ -1254,8 +1253,7 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		// create_schedule 冻结 durable proposal，仍只发一张确认卡。
 		spec, ok := l.tools["create_schedule"]
 		if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
-			!spec.Policy.Effects.Has(EffectDirectOwnerWrite) ||
-			spec.Policy.Confirmation != ConfirmationNone {
+			spec.Policy.Confirmation != ConfirmationRequired {
 			return nil
 		}
 		direct, ok := projectDirectTaskCreationToolDef(spec.Definition)
@@ -1410,8 +1408,7 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		}
 		spec, ok := l.tools["edit_task_definition"]
 		if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
-			!spec.Policy.Effects.Has(EffectDirectOwnerWrite) ||
-			spec.Policy.Confirmation != ConfirmationNone ||
+			spec.Policy.Confirmation != ConfirmationRequired ||
 			l.taskDefinitionEdit == nil {
 			state.directTaskDefinitionEditToolRejected = true
 			out = append(out, toolMsg(
@@ -1455,8 +1452,7 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		}
 		spec, ok := l.tools["create_schedule"]
 		if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
-			!spec.Policy.Effects.Has(EffectDirectOwnerWrite) ||
-			spec.Policy.Confirmation != ConfirmationNone {
+			spec.Policy.Confirmation != ConfirmationRequired {
 			state.directTaskCreationToolRejected = true
 			for _, rejected := range calls {
 				out = append(out, toolMsg(rejected.ID,

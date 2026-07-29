@@ -85,8 +85,8 @@ func TestProductionToolPolicyGolden(t *testing.T) {
 			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
 		},
 		{
-			name: "update_profile", effects: Effects(EffectStateWrite, EffectDirectOwnerWrite),
-			auth: AuthorizationOwner, confirmation: ConfirmationNone, budget: BudgetNone,
+			name: "update_profile", effects: Effects(EffectStateWrite),
+			auth: AuthorizationOwner, confirmation: ConfirmationRequired, budget: BudgetNone,
 		},
 		{
 			name: "view_task_playbook", effects: Effects(EffectInternalRead),
