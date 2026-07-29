@@ -16,8 +16,7 @@ import (
 // 这是全仓**唯一不可逆**的批量删除路径，红线是契约 I-A3：
 //
 //	硬删只删「租户所有表」。fetch_targets / content_items / content_sources
-//	是 retained-v1 共享归档；当前代际的私有 Source/appearance/content 必须进入
-//	下方租户清单，不能借“客观事实”名义留存。
+//	是**跨租户客观事实**——同一篇文章可能被多个租户的信源指向，删了会伤到别人。
 //
 // 三道结构性保证（不是纪律要求）：
 //
@@ -65,10 +64,6 @@ type purgeStep struct {
 //	schedules(definition-edit marker)     → task_definition_edit_operations
 //	schedule_commands                     → tenants / users
 //	task_adaptive_states                  → task_approved_definition_versions → schedules
-//	task_content_evidence / task_content_appearances
-//	                                      → task_run_sources / task_content_records
-//	task_run_sources                      → task_run_snapshots / task_sources
-//	task_source_states                    → task_sources → schedules
 //	profile_edit_receipts                 → profile_edit_revisions
 //	其余                                   → tenants / users
 //
@@ -92,15 +87,6 @@ var purgeOrder = []purgeStep{
 	// 删除当前 definition 会由 FK 把 schedules 收敛为 compiled/headless，随后
 	// schedules 自己在父表位置删除；动态任务也不会短暂留下无 definition 的模式。
 	{"task_approved_definition_versions", "tenant_id = $1"},
-	// Current-generation content/evidence is private tenant+user data. Remove
-	// append-only evidence and appearances before both the frozen run Source and
-	// scoped content parents; remove state/run rows before task Sources.
-	{"task_content_evidence", "tenant_id = $1"},
-	{"task_content_appearances", "tenant_id = $1"},
-	{"task_content_records", "tenant_id = $1"},
-	{"task_run_sources", "tenant_id = $1"},
-	{"task_source_states", "tenant_id = $1"},
-	{"task_sources", "tenant_id = $1"},
 
 	{"feedback_freshness_triage", "tenant_id = $1"},
 	{"feedbacks", "tenant_id = $1"},
@@ -180,9 +166,8 @@ var purgeOrder = []purgeStep{
 	{"invites", "consumed_by_tenant = $1"},
 }
 
-// purgeSharedTables 是 retained-v1 共享归档，迁移期仍不能由单租户硬删。
-// 当前代际数据必须使用上方 task_* scoped tables；待 v1 reader/recovery 清空后，
-// 这些归档会整体迁走或删除，而不是混入单租户 purge。
+// purgeSharedTables 是**绝不能出现在 purgeOrder 里**的跨租户客观事实表（红线 I-A3）。
+// 单列出来是为了让守卫测试能直接断言，而不是靠 review 时肉眼比对。
 var purgeSharedTables = []string{"fetch_targets", "content_items", "content_sources"}
 
 // PurgeReport 是一次清理的结果。dry-run 与真删返回同样的结构，
