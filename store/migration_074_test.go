@@ -32,6 +32,11 @@ func TestFetchTargetCutoverMigrationIsExplicitAndIrreversible(t *testing.T) {
 		"DELETE FROM pending_actions WHERE execution_version IN (0,2)",
 		"DROP TABLE agent_action_continuation_authority_events",
 		"DROP TABLE agent_action_continuations",
+		"UPDATE pending_actions p",
+		"UPDATE task_creation_receipts",
+		"UPDATE task_definition_edit_operations o",
+		"UPDATE task_definition_edit_receipts",
+		"retired receipt adapter adoption did not converge",
 		"DROP TABLE subscriptions",
 		"ALTER TABLE sources RENAME TO fetch_targets",
 		"ALTER TABLE schedule_sources RENAME TO task_fetch_targets",
@@ -207,7 +212,7 @@ func seedMigration074CreationV1(
 		 ) VALUES (
 		     'migration-074-create-v1',$1,$2,$3,'create_schedule','{}',
 		     'migration 074 v1','pending',clock_timestamp()+interval '1 hour',
-		     1,'agent_auto/v1','session:migration-074'
+		     1,'agent_auto/v1','migration-074-create-v1'
 		 )`,
 		fixture.tenantID, fixture.userID, fixture.sessionID)
 }
@@ -327,6 +332,29 @@ func TestMigration074CleansTerminalV2AndOldConstraintNames(t *testing.T) {
 	seedMigration074ApprovedTask(t, database, &fixture)
 	seedMigration074CreationV1(t, database, fixture)
 	seedMigration074TerminalV2(t, database, fixture)
+	mustExec(t.Context(), t, database,
+		`UPDATE pending_actions
+		    SET receipt_provider='feishu_card_patch:retired',
+		        receipt_target='om_retired'
+		  WHERE id='migration-074-create-v1'`)
+	mustExec(t.Context(), t, database,
+		`INSERT INTO task_creation_receipts (
+		     operation_id,tenant_id,user_id,session_id,provider,target,
+		     provider_key,status,lease_owner,lease_until,takeover_not_before,
+		     fence,attempt,next_attempt_at,payload,payload_digest,
+		     session_recorded_at,session_messages_digest,failure_class
+		 ) VALUES (
+		     'migration-074-create-v1',$1,$2,$3,
+		     'feishu_card_patch:retired','om_retired',
+		     md5('migration-074-retired-receipt')::uuid,'pending',
+		     'retired-worker',clock_timestamp()+interval '1 minute',
+		     clock_timestamp()+interval '2 minutes',1,1,
+		     clock_timestamp()+interval '1 minute',
+		     convert_to('retired-card-payload','UTF8'),
+		     encode(sha256(convert_to('retired-card-payload','UTF8')),'hex'),
+		     clock_timestamp(),repeat('a',64),'retryable'
+		 )`,
+		fixture.tenantID, fixture.userID, fixture.sessionID)
 
 	if _, err := provider.UpTo(t.Context(), 74); err != nil {
 		t.Fatalf("migrate exact fixture to 074: %v", err)
@@ -346,6 +374,33 @@ func TestMigration074CleansTerminalV2AndOldConstraintNames(t *testing.T) {
 		&v2Exists)
 	if v2Exists {
 		t.Fatal("retired source-action root survived the cutover")
+	}
+	var operationProvider, operationTarget, receiptProvider, receiptTarget string
+	var receiptCheckpointCleared bool
+	if err := database.QueryRowContext(t.Context(),
+		`SELECT o.receipt_provider,o.receipt_target,r.provider,r.target,
+		        r.payload IS NULL AND r.payload_digest=''
+		        AND r.session_recorded_at IS NULL
+		        AND r.session_messages_digest=''
+		        AND r.lease_owner='' AND r.lease_until IS NULL
+		        AND r.takeover_not_before IS NULL
+		        AND r.failure_class=''
+		   FROM task_creation_operations o
+		   JOIN task_creation_receipts r ON r.operation_id=o.id
+		  WHERE o.id='migration-074-create-v1'`).Scan(
+		&operationProvider, &operationTarget,
+		&receiptProvider, &receiptTarget, &receiptCheckpointCleared,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if operationProvider != "agent_auto/v1" ||
+		operationTarget != "migration-074-create-v1" ||
+		receiptProvider != operationProvider ||
+		receiptTarget != operationTarget ||
+		!receiptCheckpointCleared {
+		t.Fatalf("retired receipt was not adopted exactly: operation=%q/%q receipt=%q/%q cleared=%v",
+			operationProvider, operationTarget,
+			receiptProvider, receiptTarget, receiptCheckpointCleared)
 	}
 	if _, err := database.ExecContext(t.Context(),
 		`UPDATE task_creation_operations

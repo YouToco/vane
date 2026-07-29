@@ -348,37 +348,165 @@ ALTER TABLE pending_actions
     DROP CONSTRAINT IF EXISTS uq_pending_actions_exact_scope;
 
 -- Direct execution has exactly one completion channel: append the terminal
--- fact to the Agent session. Refuse to orphan any live operation created by a
--- retired card/browser adapter. Agent-session receipts may safely discard a
--- not-yet-dispatched v1 presentation payload; the dispatcher deterministically
--- rebuilds the v2 session-only payload from the terminal operation.
+-- fact to the Agent session. Adopt live operations and unsent receipts created
+-- by a retired card/browser adapter instead of stranding them at cutover. The
+-- operation ID is the exact agent_auto target. A pending presentation payload,
+-- lease or session checkpoint belongs to the retired adapter and is cleared;
+-- the session dispatcher deterministically rebuilds the v2 payload from the
+-- terminal operation. Terminal sent/blocked adapter rows remain immutable
+-- historical audit and need no live dispatcher.
+--
+-- Definition-edit receipt identity includes provider/target in its composite
+-- foreign key, so remove and recreate that fence around the atomic adoption.
+ALTER TABLE task_definition_edit_receipts
+    DROP CONSTRAINT fk_task_definition_edit_receipts_operation_scope;
+
+UPDATE pending_actions p
+   SET receipt_provider = 'agent_auto/v1',
+       receipt_target = p.id,
+       updated_at = clock_timestamp()
+ WHERE p.execution_version = 1
+   AND (
+       (
+           p.status IN ('pending','executing')
+           AND (
+               p.receipt_provider IS DISTINCT FROM 'agent_auto/v1'
+               OR p.receipt_target IS DISTINCT FROM p.id
+           )
+       )
+       OR EXISTS (
+           SELECT 1
+             FROM task_creation_receipts r
+            WHERE r.operation_id = p.id
+              AND r.tenant_id = p.tenant_id
+              AND r.user_id = p.user_id
+              AND r.status = 'pending'
+              AND (
+                  r.provider IS DISTINCT FROM 'agent_auto/v1'
+                  OR r.target IS DISTINCT FROM r.operation_id
+              )
+       )
+   );
+
+UPDATE task_creation_receipts
+   SET provider = 'agent_auto/v1',
+       target = operation_id,
+       lease_owner = '',
+       lease_until = NULL,
+       takeover_not_before = NULL,
+       next_attempt_at = clock_timestamp(),
+       payload = NULL,
+       payload_digest = '',
+       session_recorded_at = NULL,
+       session_messages_digest = '',
+       provider_message_id = '',
+       failure_class = '',
+       ambiguous_since = NULL,
+       sent_at = NULL,
+       blocked_at = NULL,
+       updated_at = clock_timestamp()
+ WHERE status = 'pending'
+   AND (
+       provider IS DISTINCT FROM 'agent_auto/v1'
+       OR target IS DISTINCT FROM operation_id
+   );
+
+UPDATE task_definition_edit_operations o
+   SET receipt_provider = 'agent_auto/v1',
+       receipt_target = o.id,
+       updated_at = clock_timestamp()
+ WHERE (
+       o.status IN ('pending','executing')
+       AND (
+           o.receipt_provider IS DISTINCT FROM 'agent_auto/v1'
+           OR o.receipt_target IS DISTINCT FROM o.id
+       )
+   )
+    OR EXISTS (
+       SELECT 1
+         FROM task_definition_edit_receipts r
+        WHERE r.operation_id = o.id
+          AND r.tenant_id = o.tenant_id
+          AND r.user_id = o.user_id
+          AND r.session_id = o.session_id
+          AND r.status = 'pending'
+          AND (
+              r.provider IS DISTINCT FROM 'agent_auto/v1'
+              OR r.target IS DISTINCT FROM r.operation_id
+          )
+   );
+
+UPDATE task_definition_edit_receipts
+   SET provider = 'agent_auto/v1',
+       target = operation_id,
+       lease_owner = '',
+       lease_until = NULL,
+       takeover_not_before = NULL,
+       next_attempt_at = clock_timestamp(),
+       payload = NULL,
+       payload_digest = '',
+       session_recorded_at = NULL,
+       session_messages_digest = '',
+       provider_message_id = '',
+       failure_class = '',
+       ambiguous_since = NULL,
+       sent_at = NULL,
+       blocked_at = NULL,
+       updated_at = clock_timestamp()
+ WHERE status = 'pending'
+   AND (
+       provider IS DISTINCT FROM 'agent_auto/v1'
+       OR target IS DISTINCT FROM operation_id
+   );
+
+ALTER TABLE task_definition_edit_receipts
+    ADD CONSTRAINT fk_task_definition_edit_receipts_operation_scope
+    FOREIGN KEY (
+        operation_id, tenant_id, user_id, session_id, provider, target
+    ) REFERENCES task_definition_edit_operations (
+        id, tenant_id, user_id, session_id,
+        receipt_provider, receipt_target
+    );
+
 -- +goose StatementBegin
 DO $$
 BEGIN
     IF EXISTS (
         SELECT 1
-          FROM pending_actions
+         FROM pending_actions
          WHERE execution_version = 1
            AND status IN ('pending','executing')
-           AND receipt_provider <> 'agent_auto/v1'
+           AND (
+               receipt_provider IS DISTINCT FROM 'agent_auto/v1'
+               OR receipt_target IS DISTINCT FROM id
+           )
     ) OR EXISTS (
         SELECT 1
           FROM task_definition_edit_operations
          WHERE status IN ('pending','executing')
-           AND receipt_provider <> 'agent_auto/v1'
+           AND (
+               receipt_provider IS DISTINCT FROM 'agent_auto/v1'
+               OR receipt_target IS DISTINCT FROM id
+           )
     ) OR EXISTS (
         SELECT 1
           FROM task_creation_receipts
          WHERE status = 'pending'
-           AND provider <> 'agent_auto/v1'
+           AND (
+               provider IS DISTINCT FROM 'agent_auto/v1'
+               OR target IS DISTINCT FROM operation_id
+           )
     ) OR EXISTS (
         SELECT 1
           FROM task_definition_edit_receipts
          WHERE status = 'pending'
-           AND provider <> 'agent_auto/v1'
+           AND (
+               provider IS DISTINCT FROM 'agent_auto/v1'
+               OR target IS DISTINCT FROM operation_id
+           )
     ) THEN
         RAISE EXCEPTION
-            '074: refusing cutover while a retired receipt adapter is live';
+            '074: retired receipt adapter adoption did not converge';
     END IF;
 END
 $$;
