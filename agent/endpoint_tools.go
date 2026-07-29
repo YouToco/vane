@@ -101,6 +101,17 @@ type toolRunState struct {
 	clarificationCount int
 	candidateSearches  int
 	candidateHits      int
+	// sideEffectConstrainedTurn is set for every semantically routed task
+	// action except a uniquely bound definition edit. Only the side-effecting
+	// tool named by allowedSideEffectTool may survive; one-off research instead
+	// uses allowBillableResearch. Answer-only/unavailable decisions set neither,
+	// producing a fully side-effect-free turn.
+	sideEffectConstrainedTurn bool
+	allowedSideEffectTool     string
+	allowBillableResearch     bool
+	// contextStepOffset reserves context step 1 for semantic adjudication so
+	// the main Agent's first request is sealed as step 2 on the same trace.
+	contextStepOffset int
 	// groundedBrief confines a trusted internal Brief/report follow-up to the
 	// exact supplied artifact. It has no tool surface at declaration or
 	// execution time, so source text can inform an answer but can never trigger
@@ -143,6 +154,15 @@ type toolRunState struct {
 	directTaskDefinitionEditResponseRejected bool
 	directTaskDefinitionEditFailures         int
 	directTaskDefinitionEditResult           string
+	// naturalTaskDefinitionEdit is the Feishu/name-based edit lane. It first
+	// resolves the readable task description with list_schedules, then exposes
+	// only edit_task_definition. The user never has to provide an internal ID.
+	naturalTaskDefinitionEdit                 bool
+	naturalTaskDefinitionEditTaskListed       bool
+	naturalTaskDefinitionEditResolvedID       string
+	naturalTaskDefinitionEditToolRejected     bool
+	naturalTaskDefinitionEditResponseRejected bool
+	naturalTaskDefinitionEditFailures         int
 	// A direct write may return probe detail that is safe
 	// to show once but unsafe to feed into another model turn or persist. The
 	// loop returns it deterministically and the normal history scrub replaces

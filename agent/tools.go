@@ -18,7 +18,9 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"unicode"
 
+	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/store"
@@ -252,18 +254,44 @@ type listSchedulesTool struct {
 	st *store.Store
 }
 
+const listSchedulesSchema = `{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "可选：按用户记得的连续原话筛选任务名称、描述或频率；省略时列出全部任务"
+    }
+  },
+  "additionalProperties": false
+}`
+
 func (t *listSchedulesTool) Name() string { return "list_schedules" }
 func (t *listSchedulesTool) Description() string {
-	return "列出用户当前的全部定时推送任务（含 id、触发频率、状态、描述）。"
+	return "列出用户当前的定时推送任务（含 id、触发频率、状态、描述）。可用用户原话筛选；无唯一结果时按可读名称追问，不能要求用户提供 id。"
 }
-func (t *listSchedulesTool) Parameters() json.RawMessage { return json.RawMessage(emptyParamsSchema) }
+func (t *listSchedulesTool) Parameters() json.RawMessage {
+	return json.RawMessage(listSchedulesSchema)
+}
 
-func (t *listSchedulesTool) Execute(ctx context.Context, userID int64, _ json.RawMessage) (string, error) {
+func (t *listSchedulesTool) Execute(ctx context.Context, userID int64, raw json.RawMessage) (string, error) {
+	var args struct {
+		Query string `json:"query"`
+	}
+	if err := strictjson.DecodeExact(raw, &args); err != nil {
+		return "list_schedules 参数不是合法 JSON，或包含未知字段", nil
+	}
 	list, err := t.st.ListSchedulesByUser(ctx, userID)
 	if err != nil {
 		return "", err
 	}
+	query := normalizeScheduleLookupText(args.Query)
+	if query != "" {
+		list = filterSchedulesByQuery(list, query)
+	}
 	if len(list) == 0 {
+		if query != "" {
+			return "没有找到与该描述匹配的定时推送任务。", nil
+		}
 		return "当前没有任何定时推送任务。", nil
 	}
 	var b strings.Builder
@@ -279,6 +307,32 @@ func (t *listSchedulesTool) Execute(ctx context.Context, userID int64, _ json.Ra
 }
 
 func (t *listSchedulesTool) Summarize(json.RawMessage) string { return "" }
+
+func normalizeScheduleLookupText(value string) string {
+	var out strings.Builder
+	for _, r := range strings.ToLower(value) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			out.WriteRune(r)
+		}
+	}
+	return out.String()
+}
+
+func filterSchedulesByQuery(
+	list []types.Schedule,
+	normalizedQuery string,
+) []types.Schedule {
+	filtered := make([]types.Schedule, 0, len(list))
+	for _, sc := range list {
+		haystack := normalizeScheduleLookupText(
+			sc.NLDescription + " " + formatSpecJSON(sc.SpecJSON),
+		)
+		if strings.Contains(haystack, normalizedQuery) {
+			filtered = append(filtered, sc)
+		}
+	}
+	return filtered
+}
 
 // formatSpecJSON 把镜像表里的 spec JSONB 渲染成中文频率描述；解析失败时
 // 原样展示 JSON（列表工具不应因单条脏数据整体失败）。

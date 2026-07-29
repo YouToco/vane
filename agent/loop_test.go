@@ -328,6 +328,7 @@ type fakeTool struct {
 	mutating   bool
 	untrusted  bool
 	result     string
+	results    []string
 	execErr    error
 	calls      []toolCallRecord
 	parameters json.RawMessage
@@ -377,6 +378,11 @@ func (t *fakeTool) Execute(ctx context.Context, userID int64, args json.RawMessa
 		trace = meta.traceID
 	}
 	t.calls = append(t.calls, toolCallRecord{userID: userID, args: string(args), trace: trace})
+	if len(t.results) > 0 {
+		result := t.results[0]
+		t.results = t.results[1:]
+		return result, t.execErr
+	}
 	return t.result, t.execErr
 }
 

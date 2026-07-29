@@ -85,6 +85,63 @@ const directTaskDefinitionEditRetrySystemNote = `
 const directTaskDefinitionEditResponseRetrySystemNote = `
 - 你刚才没有调用 edit_task_definition；该回复已被系统丢弃。若变更要求足够，现在调用 edit_task_definition；若确实不足，不得编造，应自然追问。`
 
+const naturalTaskDefinitionEditSystemNote = `
+- 本隔离流程来自用户句首明确发出的任务修改命令，或紧接该命令后对可读候选的简短选择。原始命令与本次选择都在当前消息列表中；不得把咨询、假设或否定表达当成执行命令。
+- 整项请求是一项任务定义编辑，不得因为同时包含频率、任务手册、信息入口、推送门槛或输出格式而要求用户拆分。
+- 用户不需要提供内部 ID。按用户记得的名称、时间、主题或用途定位任务；得到唯一匹配后一次性编辑，完整承载本条消息要求。
+- 本轮不得调用 web_search、read_page、search_endpoints、create_schedule、画像工具或其他工具。任务手册中要求未来运行时打开网页，不代表现在要联网。
+- 若 list_schedules 后确有多个合理候选，只用人能看懂的任务名称做一次针对性追问。没有真实调用 edit_task_definition 就绝不能声称已修改。`
+
+const naturalTaskDefinitionEditLocateSystemNote = `
+- 现在先且只调用 list_schedules。query 必须复制当前用户消息中用于识别任务的一段连续原话，不能用“任务/日报/每周”等泛词，不能改写或补充。不要猜任务 ID，不要调用编辑或其他工具。`
+
+const naturalTaskDefinitionEditResolvedSystemNote = `
+- list_schedules 已唯一命中一个任务。现在只允许调用 edit_task_definition；task_id 必须使用该唯一命中，绝不能把 ID 交给用户处理。`
+
+const naturalTaskDefinitionEditAmbiguousSystemNote = `
+- list_schedules 没有唯一命中任务，因此当前没有任何写工具。请用列表中的可读名称做一次针对性追问；不得猜 ID 或声称已经修改。`
+
+const naturalTaskDefinitionEditRetrySystemNote = `
+- 系统刚拒绝了不属于“按名称定位后编辑任务”的工具调用；它没有执行。严格按当前阶段唯一声明的工具继续。`
+
+const taskDefinitionEditIntentSystemPrompt = `
+你是任务操作的只读意图裁决器。你不能执行任何操作，只能调用 route_task_edit_intent 一次。
+
+判断最后一条用户消息是否授权“现在立即修改已有任务定义”：
+- execute_edit：用户本轮明确命令立即修改；或上一轮已明确命令修改、助手仅追问目标任务，本轮用户直接选择了一个候选且没有撤销。
+- delete_task：用户明确命令立即删除已有任务。
+- run_task：用户明确命令立即运行已有任务。
+- create_task：用户明确命令立即创建新任务。
+- one_off_search：用户明确要求一次性联网查询，不创建或修改任务。
+- update_profile：用户明确命令首次建立画像；或在画像采集对话中直接提供自己的行业、职业/岗位或关注标签，信息已经足够首次创建。已有画像由存储层拒绝覆盖。
+- answer_only：询问是否合适、利弊、影响、怎么做、假设场景、表达否定/取消/不用改，或任何含糊情况。
+
+必须理解整句话和相邻对话，不能因为出现“把/改为/可以/任务/更新”等词就推断授权。含糊时一律 answer_only。`
+
+var taskDefinitionEditIntentTool = llm.ToolDef{
+	Name:        "route_task_edit_intent",
+	Description: "只读判断当前用户是否授权立即修改已有任务；不执行修改。",
+	Parameters: json.RawMessage(`{
+	  "type": "object",
+	  "properties": {
+	    "decision": {
+	      "type": "string",
+	      "enum": [
+	        "execute_edit",
+	        "delete_task",
+	        "run_task",
+	        "create_task",
+	        "one_off_search",
+	        "update_profile",
+	        "answer_only"
+	      ]
+	    }
+	  },
+	  "required": ["decision"],
+	  "additionalProperties": false
+	}`),
+}
+
 // 契约 §7 固定的回复/占位文案。
 const (
 	// replyMaxTurns 是 MaxTurns 内未收敛时的兜底回复（契约原文，勿改）。
@@ -146,6 +203,8 @@ const (
 	directTaskCreationMaxValidationFailures = 2
 	directTaskDefinitionEditMaxTurns        = 4
 	directTaskDefinitionEditMaxFailures     = 2
+	naturalTaskDefinitionEditMaxTurns       = 6
+	naturalTaskDefinitionEditMaxFailures    = 2
 
 	// durableOperationTTL bounds how long a frozen operation may wait for an
 	// execution lease before it is expired by recovery.
@@ -267,6 +326,19 @@ type Outcome struct {
 	Reply string // 给用户的文字回复（恒非空）
 }
 
+type taskEditIntentDecision uint8
+
+const (
+	taskEditIntentUnavailable taskEditIntentDecision = iota
+	taskEditIntentExecute
+	taskEditIntentDelete
+	taskEditIntentRun
+	taskEditIntentCreate
+	taskEditIntentSearch
+	taskEditIntentProfileUpdate
+	taskEditIntentAnswerOnly
+)
+
 type creationReceiptSessionStore interface {
 	RecordTaskCreationReceiptSessionMessages(
 		ctx context.Context,
@@ -305,6 +377,15 @@ type Loop struct {
 	sessionTTL            time.Duration
 	intentToolkitsEnabled bool
 	intentToolkitsShadow  bool
+	// taskEditIntentFn is an isolated, side-effect-free semantic gate. It is separate
+	// from the main Agent call so a durable edit requires two agreeing model
+	// decisions: classify the current owner turn as an immediate edit, then
+	// explicitly call the uniquely bound edit tool. Tests may replace it with
+	// a deterministic decision without weakening the production default.
+	taskEditIntentFn func(
+		context.Context,
+		[]llm.ChatMessage,
+	) (taskEditIntentDecision, error)
 
 	// userMu 按 userID 串行化 HandleMessage（审查 #并发盲覆盖）：feishu 对每条消息
 	// 起独立 goroutine，而 HandleMessage 是 load→append→save 的读改写；
@@ -485,6 +566,7 @@ func NewChecked(d Deps) (*Loop, error) {
 				return llm.DoChat(cctx, d.Client, d.Recorder, meta, req)
 			})
 	}
+	l.taskEditIntentFn = l.classifyTaskDefinitionEditIntent
 	return l, nil
 }
 
@@ -495,6 +577,75 @@ func agentChatRetryDelay(failedAttempt int) time.Duration {
 	default:
 		return agentChatLaterRetryWait
 	}
+}
+
+func (l *Loop) classifyTaskDefinitionEditIntent(
+	ctx context.Context,
+	messages []llm.ChatMessage,
+) (taskEditIntentDecision, error) {
+	if l == nil || l.chatFn == nil {
+		return taskEditIntentUnavailable, nil
+	}
+	resp, err := l.chatWithContextShadow(ctx, llm.ChatRequest{
+		Model: l.model,
+		Messages: withSystem(
+			taskDefinitionEditIntentSystemPrompt,
+			messages,
+			"",
+			false,
+		),
+		Tools:           []llm.ToolDef{taskDefinitionEditIntentTool},
+		MaxTokens:       iptr(64),
+		DisableThinking: true,
+	}, nil, 1)
+	if err != nil {
+		return taskEditIntentUnavailable, err
+	}
+	if resp == nil || len(resp.ToolCalls) != 1 ||
+		resp.ToolCalls[0].Name != taskDefinitionEditIntentTool.Name {
+		return taskEditIntentUnavailable, nil
+	}
+	var args struct {
+		Decision string `json:"decision"`
+	}
+	if strictjson.DecodeExact(
+		json.RawMessage(resp.ToolCalls[0].Arguments),
+		&args,
+	) != nil {
+		return taskEditIntentUnavailable, nil
+	}
+	switch args.Decision {
+	case "execute_edit":
+		return taskEditIntentExecute, nil
+	case "delete_task":
+		return taskEditIntentDelete, nil
+	case "run_task":
+		return taskEditIntentRun, nil
+	case "create_task":
+		return taskEditIntentCreate, nil
+	case "one_off_search":
+		return taskEditIntentSearch, nil
+	case "update_profile":
+		return taskEditIntentProfileUpdate, nil
+	case "answer_only":
+		return taskEditIntentAnswerOnly, nil
+	default:
+		return taskEditIntentUnavailable, nil
+	}
+}
+
+func (l *Loop) chatWithContextShadow(
+	ctx context.Context,
+	request llm.ChatRequest,
+	state *toolRunState,
+	contextStep int,
+) (*llm.ChatResponse, error) {
+	contextShadow := l.prepareAgentContextShadow(
+		ctx, request, state, contextStep,
+	)
+	resp, err := l.chatFn(ctx, request)
+	l.sealPreparedAgentContextShadow(ctx, contextShadow)
+	return resp, err
 }
 
 // retryAgentChat keeps transient provider failures inside the same owner
@@ -750,40 +901,13 @@ func (l *Loop) handleMessage(
 		return Outcome{}, err
 	}
 
-	directDefinitionEdit := directDefinitionEditTaskID != ""
-	directTaskCreation := directActionID != "" && !directDefinitionEdit
-	if directActionID == "" {
-		directTaskCreation = !externalInput &&
-			isDirectTaskCreationRequest(text)
-	}
-	directProposal := directTaskCreation || directDefinitionEdit
-
-	// 外部上下文入口不读取画像：不是“读了但不渲染”，而是从数据访问层就不碰。
-	// direct-task-creation 同样从数据访问层跳过画像，防止模型把用户没有批准的
-	// 行业/岗位/标签扩写进 proposal。其余普通消息仍每条现查一次，本条消息内
-	// 的多轮模型调用共享同一快照。
-	var hint string
-	if !externalInput && !directProposal {
-		hint = l.profileHint(ctx, userID)
-	}
-
-	// 兼容清洗部署前已经落库的外部 tool result：不能只保护新写入，否则旧会话
-	// 在下一条消息仍会与画像和完整工具面同屏。
+	// Decode and scrub before routing so a targeted clarification can resume
+	// the immediately preceding isolated edit turn without persisting an
+	// internal task ID. Only the original command and the readable assistant
+	// question are reused; task candidates are resolved again under the current
+	// owner on the follow-up turn.
 	history := l.scrubUntrustedHistory(decodeMessages(sess))
-	// 外部追问/引用正文的首轮模型请求不能看到既有会话：即使零工具、
-	// 零画像，恶意正文仍可直接要求模型复述旧私聊/任务结果。
-	// self-contained direct-task-creation 同样只给当前用户消息：历史里可能
-	// 留有 view_profile 回执或模型派生画像，不能让它们扩写本次 proposal。
-	// 两类历史都只留待本轮结束后重新合并持久化，不进入 converse。
-	modelHistory := history
-	if externalInput || directProposal {
-		modelHistory = nil
-	}
-	msgs := append(modelHistory, llm.ChatMessage{Role: "user", Content: text})
-	msgs = truncateMessages(msgs)
-
-	// 同一条消息内的多轮模型调用共享 trace_id，llm_calls/tool_calls 里可按 trace
-	// 回放整个 loop。
+	// 同一条消息内的所有模型调用（含只读意图裁决）共享 trace_id。
 	turnID := uuid.NewString()
 	ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{
 		traceID: turnID,
@@ -793,6 +917,124 @@ func (l *Loop) handleMessage(
 			SessionID: sess.ID,
 		},
 	})
+	directDefinitionEdit := directDefinitionEditTaskID != ""
+	directTaskCreation := directActionID != "" && !directDefinitionEdit
+	if directActionID == "" {
+		directTaskCreation = !externalInput &&
+			isDirectTaskCreationRequest(text)
+	}
+	// A short answer such as "互联网，产品经理，AI、机器人" only means
+	// profile intake when the immediately preceding assistant turn actually
+	// asked for profile fields and the profile is still empty. Load the hint
+	// once here for that narrow continuation; all other turns retain the
+	// normal later read point.
+	var hint string
+	hintLoaded := false
+	profileIntakeContinuation := false
+	if !externalInput &&
+		!directTaskCreation &&
+		!directDefinitionEdit &&
+		isProfileIntakePrompt(history) {
+		hint = l.profileHint(ctx, userID)
+		hintLoaded = true
+		profileIntakeContinuation = hint == ""
+	}
+	naturalTaskDefinitionEditContinuation :=
+		!externalInput &&
+			!directTaskCreation &&
+			!directDefinitionEdit &&
+			isNaturalTaskDefinitionEditContinuation(history)
+	naturalTaskDefinitionEditCandidate := !externalInput &&
+		!directTaskCreation &&
+		!directDefinitionEdit &&
+		(isNaturalTaskDefinitionEditCandidate(text) ||
+			naturalTaskDefinitionEditContinuation ||
+			profileIntakeContinuation)
+	naturalTaskDefinitionEdit := false
+	taskEditDecision := taskEditIntentUnavailable
+	intentClassificationTurns := 0
+	if naturalTaskDefinitionEditCandidate {
+		intentMessages := []llm.ChatMessage{{
+			Role: "user", Content: text,
+		}}
+		if naturalTaskDefinitionEditContinuation {
+			intentMessages = append(
+				naturalTaskDefinitionEditContinuationHistory(history),
+				intentMessages...,
+			)
+		} else if profileIntakeContinuation {
+			intentMessages = append(
+				profileIntakeContinuationHistory(history),
+				intentMessages...,
+			)
+		}
+		if l.taskEditIntentFn != nil {
+			intentClassificationTurns = 1
+			decision, classifyErr := l.taskEditIntentFn(
+				ctx, intentMessages,
+			)
+			if classifyErr != nil {
+				slog.Warn(
+					"agent: 任务编辑意图裁决失败，按非执行请求处理",
+					"user_id", userID,
+					"error", classifyErr,
+				)
+			} else {
+				taskEditDecision = decision
+			}
+			naturalTaskDefinitionEdit =
+				classifyErr == nil &&
+					decision == taskEditIntentExecute
+		}
+	}
+	directProposal := directTaskCreation || directDefinitionEdit ||
+		naturalTaskDefinitionEdit
+	sideEffectConstrainedTurn := naturalTaskDefinitionEditCandidate &&
+		!naturalTaskDefinitionEdit
+	allowedSideEffectTool := ""
+	allowBillableResearch := false
+	switch taskEditDecision {
+	case taskEditIntentDelete:
+		allowedSideEffectTool = "remove_schedule"
+	case taskEditIntentRun:
+		allowedSideEffectTool = "run_task_now"
+	case taskEditIntentCreate:
+		allowedSideEffectTool = "create_schedule"
+	case taskEditIntentSearch:
+		allowBillableResearch = true
+	case taskEditIntentProfileUpdate:
+		allowedSideEffectTool = "update_profile"
+	}
+	if directTaskCreation {
+		allowedSideEffectTool = "create_schedule"
+	}
+
+	// 外部上下文入口不读取画像：不是“读了但不渲染”，而是从数据访问层就不碰。
+	// direct-task-creation 同样从数据访问层跳过画像，防止模型把用户没有批准的
+	// 行业/岗位/标签扩写进 proposal。其余普通消息仍每条现查一次，本条消息内
+	// 的多轮模型调用共享同一快照。
+	if !externalInput && !directProposal {
+		if !hintLoaded {
+			hint = l.profileHint(ctx, userID)
+		}
+	}
+
+	// 兼容清洗部署前已经落库的外部 tool result：不能只保护新写入，否则旧会话
+	// 在下一条消息仍会与画像和完整工具面同屏。
+	// 外部追问/引用正文的首轮模型请求不能看到既有会话：即使零工具、
+	// 零画像，恶意正文仍可直接要求模型复述旧私聊/任务结果。
+	// self-contained direct-task-creation 同样只给当前用户消息：历史里可能
+	// 留有 view_profile 回执或模型派生画像，不能让它们扩写本次 proposal。
+	// 两类历史都只留待本轮结束后重新合并持久化，不进入 converse。
+	modelHistory := history
+	if externalInput || directProposal {
+		modelHistory = nil
+	}
+	if naturalTaskDefinitionEditContinuation {
+		modelHistory = naturalTaskDefinitionEditContinuationHistory(history)
+	}
+	msgs := append(modelHistory, llm.ChatMessage{Role: "user", Content: text})
+	msgs = truncateMessages(msgs)
 
 	// 端点注册表契约 §4：激活集随会话持久化，本条消息的工具运行状态经 ctx 旁路
 	// 传给工具 Execute（工具是全局单例，不能携带 per-message 状态）。
@@ -813,6 +1055,11 @@ func (l *Loop) handleMessage(
 		directTaskCreation:         directTaskCreation,
 		directActionID:             directActionID,
 		directTaskDefinitionEditID: directDefinitionEditTaskID,
+		naturalTaskDefinitionEdit:  naturalTaskDefinitionEdit,
+		sideEffectConstrainedTurn:  sideEffectConstrainedTurn,
+		allowedSideEffectTool:      allowedSideEffectTool,
+		allowBillableResearch:      allowBillableResearch,
+		contextStepOffset:          intentClassificationTurns,
 		untrustedExternalResult:    externalInput,
 	}
 	if externalInput {
@@ -832,6 +1079,7 @@ func (l *Loop) handleMessage(
 	if err != nil {
 		return Outcome{}, err
 	}
+	turns += intentClassificationTurns
 	if externalInput {
 		// 本轮从第一条请求起就含飞书卡片/引用消息等外部正文，即使模型没有
 		// 调工具也必须把整轮压平。不能依赖文本前缀：调用者已经通过类型化入口
@@ -932,7 +1180,8 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 
 	var directProposalBase []llm.ChatMessage
 	if state != nil && (state.directTaskCreation ||
-		state.directTaskDefinitionEditID != "") {
+		state.directTaskDefinitionEditID != "" ||
+		state.naturalTaskDefinitionEdit) {
 		// 缩面后若模型仍幻觉隐藏工具，下一轮回到这一份进入本消息时的
 		// 安全基线；不把“未声明工具的原生 tool history”送回供应商。
 		directProposalBase = append([]llm.ChatMessage(nil), msgs...)
@@ -944,6 +1193,10 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 	if state != nil && state.directTaskDefinitionEditID != "" &&
 		maxTurns > directTaskDefinitionEditMaxTurns {
 		maxTurns = directTaskDefinitionEditMaxTurns
+	}
+	if state != nil && state.naturalTaskDefinitionEdit &&
+		maxTurns > naturalTaskDefinitionEditMaxTurns {
+		maxTurns = naturalTaskDefinitionEditMaxTurns
 	}
 	turns := 0
 	for turns < maxTurns ||
@@ -961,7 +1214,8 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			// runToolCalls 双层关闭，避免把上下文编码进第二个 URL/query 外带。
 			profileHint, renderProfile = "", false
 		}
-		if state.directTaskCreation || state.directTaskDefinitionEditID != "" {
+		if state.directTaskCreation || state.directTaskDefinitionEditID != "" ||
+			state.naturalTaskDefinitionEdit {
 			// direct 模式也不渲染“画像尚未建立”占位：基础 prompt 会据此主动
 			// 追问行业/岗位，正好偏离当前已明确的出卡请求。
 			profileHint, renderProfile = "", false
@@ -1010,6 +1264,21 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				system += directTaskDefinitionEditResponseRetrySystemNote
 			}
 		}
+		if state.naturalTaskDefinitionEdit {
+			system += naturalTaskDefinitionEditSystemNote
+			if state.naturalTaskDefinitionEditTaskListed {
+				if state.naturalTaskDefinitionEditResolvedID != "" {
+					system += naturalTaskDefinitionEditResolvedSystemNote
+				} else {
+					system += naturalTaskDefinitionEditAmbiguousSystemNote
+				}
+			} else {
+				system += naturalTaskDefinitionEditLocateSystemNote
+			}
+			if state.naturalTaskDefinitionEditToolRejected {
+				system += naturalTaskDefinitionEditRetrySystemNote
+			}
+		}
 		if state.externalFollowupSearchQuery != "" &&
 			!state.externalFollowupSearchAttempted {
 			system += externalFollowupSearchSystemNote
@@ -1047,11 +1316,9 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		// candidate, send the already-built legacy request unchanged, and only
 		// then admit a bounded asynchronous seal. Store/root-lock latency cannot
 		// consume chatFn's context or alter its Outcome.
-		contextShadow := l.prepareAgentContextShadow(
-			ctx, request, state, turns,
+		resp, err := l.chatWithContextShadow(
+			ctx, request, state, turns+state.contextStepOffset,
 		)
-		resp, err := l.chatFn(ctx, request)
-		l.sealPreparedAgentContextShadow(ctx, contextShadow)
 		if err != nil {
 			if errors.Is(err, llm.ErrToolProtocolResponse) && state.untrustedExternalResult {
 				slog.Warn("agent: 外部读取后模型协议异常，返回确定性恢复文案",
@@ -1123,6 +1390,29 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				msgs = append(msgs, llm.ChatMessage{
 					Role:    "assistant",
 					Content: replyTaskDefinitionEditNotCreated,
+				})
+				return Outcome{
+					Reply: replyTaskDefinitionEditNotCreated,
+				}, msgs, turns, nil
+			}
+			if state.naturalTaskDefinitionEdit {
+				if state.naturalTaskDefinitionEditTaskListed {
+					if reply, ok := directClarificationReply(resp.Content); ok {
+						msgs = append(msgs, llm.ChatMessage{
+							Role: "assistant", Content: reply,
+						})
+						return Outcome{Reply: reply}, msgs, turns, nil
+					}
+				}
+				if !state.naturalTaskDefinitionEditResponseRejected {
+					state.naturalTaskDefinitionEditResponseRejected = true
+					if !state.naturalTaskDefinitionEditTaskListed {
+						msgs = append([]llm.ChatMessage(nil), directProposalBase...)
+					}
+					continue
+				}
+				msgs = append(msgs, llm.ChatMessage{
+					Role: "assistant", Content: replyTaskDefinitionEditNotCreated,
 				})
 				return Outcome{
 					Reply: replyTaskDefinitionEditNotCreated,
@@ -1266,6 +1556,24 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			msgs = append([]llm.ChatMessage(nil), directProposalBase...)
 			continue
 		}
+		if state.naturalTaskDefinitionEdit &&
+			state.naturalTaskDefinitionEditFailures >=
+				naturalTaskDefinitionEditMaxFailures {
+			msgs = append(msgs, llm.ChatMessage{
+				Role: "assistant", Content: replyTaskDefinitionEditNotCreated,
+			})
+			return Outcome{
+				Reply: replyTaskDefinitionEditNotCreated,
+			}, msgs, turns, nil
+		}
+		if state.naturalTaskDefinitionEdit &&
+			state.naturalTaskDefinitionEditToolRejected {
+			if !state.naturalTaskDefinitionEditTaskListed {
+				msgs = append([]llm.ChatMessage(nil), directProposalBase...)
+			}
+			state.naturalTaskDefinitionEditToolRejected = false
+			continue
+		}
 		continue // tool results are fed back for the next model turn.
 	}
 
@@ -1275,6 +1583,9 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		reply = replyTaskCreationNotCreated
 	}
 	if state != nil && state.directTaskDefinitionEditID != "" {
+		reply = replyTaskDefinitionEditNotCreated
+	}
+	if state != nil && state.naturalTaskDefinitionEdit {
 		reply = replyTaskDefinitionEditNotCreated
 	}
 	if state != nil && state.webSearchSucceeded &&
@@ -1354,8 +1665,36 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		}
 		return []llm.ToolDef{direct}
 	}
+	if state != nil && state.naturalTaskDefinitionEdit {
+		if !state.naturalTaskDefinitionEditTaskListed {
+			spec, ok := l.tools["list_schedules"]
+			if !ok || !spec.Policy.Effects.Has(EffectInternalRead) {
+				return nil
+			}
+			return []llm.ToolDef{spec.Definition}
+		}
+		if state.naturalTaskDefinitionEditResolvedID == "" {
+			// Zero or multiple matches require a readable clarification. There
+			// is no write tool to hallucinate into while the target is ambiguous.
+			return nil
+		}
+		spec, ok := l.tools["edit_task_definition"]
+		if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
+			!spec.Policy.Effects.Has(EffectDirectOwnerWrite) ||
+			l.taskDefinitionEdit == nil {
+			return nil
+		}
+		return []llm.ToolDef{spec.Definition}
+	}
 	static := make([]llm.ToolDef, 0, len(l.toolDefs))
 	for _, def := range l.toolDefs {
+		if def.Name == definitionEditToolName {
+			// ID-based definition editing is never a general-chat capability.
+			// It is projected only by the server-selected Web lane or the
+			// isolated name-resolution lane above, both of which bind the
+			// resulting ID before execution.
+			continue
+		}
 		spec, ok := l.tools[def.Name]
 		if ok && toolVisibleForRequest(spec, state) {
 			static = append(static, def)
@@ -1366,10 +1705,18 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		dyn = l.endpoints.Defs(state.activation)
 	}
 	candidate := appendToolDefs(static, dyn)
+	candidate = l.filterConstrainedSideEffectToolDefs(candidate, state)
 	if state == nil || state.intentToolkitsEnabled {
 		return candidate
 	}
-	legacy := appendToolDefs(l.toolDefs, dyn)
+	legacyStatic := make([]llm.ToolDef, 0, len(l.toolDefs))
+	for _, def := range l.toolDefs {
+		if def.Name != definitionEditToolName {
+			legacyStatic = append(legacyStatic, def)
+		}
+	}
+	legacy := appendToolDefs(legacyStatic, dyn)
+	legacy = l.filterConstrainedSideEffectToolDefs(legacy, state)
 	if state.intentToolkitsShadow && !state.intentToolkitsShadowSeen {
 		state.intentToolkitsShadowSeen = true
 		state.intentToolkitsLegacyCount = len(legacy)
@@ -1379,6 +1726,65 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 		)
 	}
 	return legacy
+}
+
+func (l *Loop) filterConstrainedSideEffectToolDefs(
+	defs []llm.ToolDef,
+	state *toolRunState,
+) []llm.ToolDef {
+	if state == nil || !state.sideEffectConstrainedTurn {
+		return defs
+	}
+	out := make([]llm.ToolDef, 0, len(defs))
+	for _, def := range defs {
+		spec, ok := l.resolveTool(def.Name, state)
+		if !ok {
+			continue
+		}
+		if state.allowBillableResearch {
+			if !publicResearchToolAllowed(spec) {
+				continue
+			}
+		} else if toolHasObservableSideEffect(spec) &&
+			!constrainedSideEffectAllowed(state, spec) {
+			continue
+		}
+		out = append(out, def)
+	}
+	return out
+}
+
+func publicResearchToolAllowed(spec ToolSpec) bool {
+	effects := spec.Policy.Effects
+	if effects.Has(EffectInternalRead) ||
+		effects.Has(EffectStateWrite) ||
+		effects.Has(EffectDelivery) ||
+		effects.Has(EffectDurableProposal) ||
+		effects.Has(EffectDirectOwnerWrite) ||
+		effects.Has(EffectActivationWrite) {
+		return false
+	}
+	return effects.Has(EffectNetworkRead) ||
+		effects.Has(EffectBillable) ||
+		effects.Has(EffectTrustTaint) ||
+		effects.Has(EffectLocalHandleRead)
+}
+
+func constrainedSideEffectAllowed(
+	state *toolRunState,
+	spec ToolSpec,
+) bool {
+	if state == nil {
+		return false
+	}
+	if state.allowedSideEffectTool != "" &&
+		spec.Name() == state.allowedSideEffectTool {
+		return true
+	}
+	if !state.allowBillableResearch {
+		return false
+	}
+	return publicResearchToolAllowed(spec)
 }
 
 func appendToolDefs(prefix, suffix []llm.ToolDef) []llm.ToolDef {
@@ -1429,6 +1835,26 @@ func (l *Loop) resolveTool(name string, state *toolRunState) (ToolSpec, bool) {
 
 func isUntrustedResultTool(spec ToolSpec) bool {
 	return spec.Policy.Effects.Has(EffectTrustTaint)
+}
+
+func toolHasObservableSideEffect(spec ToolSpec) bool {
+	effects := spec.Policy.Effects
+	return effects.Has(EffectStateWrite) ||
+		effects.Has(EffectDelivery) ||
+		effects.Has(EffectDurableProposal) ||
+		effects.Has(EffectDirectOwnerWrite) ||
+		effects.Has(EffectActivationWrite) ||
+		effects.Has(EffectBillable)
+}
+
+func requiresSemanticOwnerAction(toolName string) bool {
+	switch toolName {
+	case "remove_schedule", "run_task_now", "create_schedule",
+		"update_profile":
+		return true
+	default:
+		return false
+	}
 }
 
 func isSafeAfterUntrusted(spec ToolSpec) bool {
@@ -1484,6 +1910,48 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 	// 模型单独重试。只“放行一个、拒绝其余”仍会把被拒调用的 args/content
 	// 写进下一轮消息，与随后返回的恶意网页同屏。
 	state := runStateFrom(ctx)
+	for _, call := range calls {
+		if !requiresSemanticOwnerAction(call.Name) || (state != nil &&
+			state.allowedSideEffectTool == call.Name) {
+			continue
+		}
+		for _, rejected := range calls {
+			out = append(out, toolMsg(
+				rejected.ID,
+				"任务创建、删除、立即运行或画像更新必须先通过当前用户消息的语义动作裁决；本批未执行。",
+			))
+		}
+		return out, nil
+	}
+	if state != nil && state.sideEffectConstrainedTurn {
+		for _, call := range calls {
+			spec, ok := l.resolveTool(call.Name, state)
+			if !ok {
+				continue
+			}
+			if state.allowBillableResearch &&
+				!publicResearchToolAllowed(spec) {
+				for _, rejected := range calls {
+					out = append(out, toolMsg(
+						rejected.ID,
+						"一次性公开查询不能读取画像、任务或其他内部状态；本批未执行。",
+					))
+				}
+				return out, nil
+			}
+			if !toolHasObservableSideEffect(spec) ||
+				constrainedSideEffectAllowed(state, spec) {
+				continue
+			}
+			for _, rejected := range calls {
+				out = append(out, toolMsg(
+					rejected.ID,
+					"本轮语义裁决只授权了当前明确动作；本批其他写入、投递或计费调用均未执行。",
+				))
+			}
+			return out, nil
+		}
+	}
 	if state != nil && state.directTaskDefinitionEditID != "" {
 		if len(calls) != 1 || calls[0].Name != definitionEditToolName {
 			state.directTaskDefinitionEditToolRejected = true
@@ -1519,6 +1987,94 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			return out, nil
 		}
 		state.directTaskDefinitionEditToolRejected = false
+	}
+	if state != nil && state.naturalTaskDefinitionEdit {
+		want := "list_schedules"
+		if state.naturalTaskDefinitionEditTaskListed {
+			want = definitionEditToolName
+		}
+		if state.naturalTaskDefinitionEditTaskListed &&
+			state.naturalTaskDefinitionEditResolvedID == "" {
+			want = ""
+		}
+		if len(calls) != 1 || calls[0].Name != want {
+			state.naturalTaskDefinitionEditToolRejected = true
+			for _, rejected := range calls {
+				message := "任务目标仍有歧义，本次工具调用未执行；请按可读名称向用户追问。"
+				if want != "" {
+					message = "当前任务编辑阶段只允许调用 " + want +
+						"；本次其他调用未执行。"
+				}
+				out = append(out, toolMsg(
+					rejected.ID,
+					message,
+				))
+			}
+			return out, nil
+		}
+		if want == "list_schedules" &&
+			!validNaturalEditScheduleQuery(
+				json.RawMessage(calls[0].Arguments),
+				state.ownerRequest,
+			) {
+			state.naturalTaskDefinitionEditFailures++
+			out = append(out, toolMsg(
+				calls[0].ID,
+				"query 必须是用户原话中连续、具体的任务名称或描述，不能使用泛词或改写。",
+			))
+			return out, nil
+		}
+		if want == "list_schedules" {
+			spec, ok := l.tools["list_schedules"]
+			if !ok || !spec.Policy.Effects.Has(EffectInternalRead) {
+				state.naturalTaskDefinitionEditToolRejected = true
+				out = append(out, toolMsg(
+					calls[0].ID,
+					"任务查询能力当前不可用；本次调用未执行。",
+				))
+				return out, nil
+			}
+		}
+		if want == definitionEditToolName {
+			spec, ok := l.tools[definitionEditToolName]
+			if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
+				!spec.Policy.Effects.Has(EffectDirectOwnerWrite) ||
+				l.taskDefinitionEdit == nil {
+				state.naturalTaskDefinitionEditToolRejected = true
+				out = append(out, toolMsg(
+					calls[0].ID,
+					"任务编辑能力当前不可用；本次调用未执行。",
+				))
+				return out, nil
+			}
+			if !directDefinitionEditTargetsTask(
+				json.RawMessage(calls[0].Arguments),
+				state.naturalTaskDefinitionEditResolvedID,
+			) {
+				state.naturalTaskDefinitionEditFailures++
+				state.naturalTaskDefinitionEditToolRejected = true
+				out = append(out, toolMsg(
+					calls[0].ID,
+					"edit_task_definition 的 task_id 与唯一命中任务不一致；本次调用未执行。",
+				))
+				return out, nil
+			}
+		}
+	}
+	if state == nil || (state.directTaskDefinitionEditID == "" &&
+		!state.naturalTaskDefinitionEdit) {
+		for _, call := range calls {
+			if call.Name != definitionEditToolName {
+				continue
+			}
+			for _, rejected := range calls {
+				out = append(out, toolMsg(
+					rejected.ID,
+					"任务定义编辑只允许在系统已绑定唯一任务的编辑流程中执行；本批未执行。",
+				))
+			}
+			return out, nil
+		}
 	}
 	if state != nil && state.directTaskCreation {
 		if len(calls) != 1 {
@@ -1590,7 +2146,10 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		if spec.Policy.RoutingConfigured &&
 			spec.Policy.DirectOnExplicitIntent &&
 			(state == nil ||
-				!explicitOwnerToolIntent(spec.Name(), state.ownerRequest)) {
+				(state.allowedSideEffectTool != spec.Name() &&
+					!explicitOwnerToolIntent(
+						spec.Name(), state.ownerRequest,
+					))) {
 			out = append(out, toolMsg(tc.ID, toolMsgExplicitIntent))
 			continue
 		}
@@ -1626,6 +2185,9 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 				if message, ok := directOperationValidationMessage(err); ok {
 					if state != nil && state.directTaskDefinitionEditID != "" {
 						state.directTaskDefinitionEditFailures++
+					}
+					if state != nil && state.naturalTaskDefinitionEdit {
+						state.naturalTaskDefinitionEditFailures++
 					}
 					out = append(out, toolMsg(tc.ID, message))
 					continue
@@ -1665,6 +2227,17 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		if err != nil {
 			// Only the public AppError message can re-enter model context.
 			result = "工具执行失败：" + toolErrText(err)
+		}
+		if state != nil && state.naturalTaskDefinitionEdit &&
+			tc.Name == "list_schedules" && err == nil {
+			state.naturalTaskDefinitionEditTaskListed = true
+			ids := taskIDsFromScheduleListResult(result)
+			if len(ids) == 1 {
+				state.naturalTaskDefinitionEditResolvedID = ids[0]
+			} else {
+				state.naturalTaskDefinitionEditResolvedID = ""
+			}
+			state.naturalTaskDefinitionEditResponseRejected = false
 		}
 		if state != nil &&
 			spec.Policy.Effects.Has(EffectStateWrite) &&
@@ -2025,6 +2598,192 @@ func isDirectTaskCreationRequest(text string) bool {
 		return false
 	}
 	return true
+}
+
+func isNaturalTaskDefinitionEditCandidate(text string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(text), ""))
+	if normalized == "" {
+		return false
+	}
+	// Candidate detection only decides whether to pay for the isolated semantic
+	// adjudicator. It is deliberately broad and grants no capability. Negated,
+	// hypothetical and consultative wording is included here so authorization
+	// is based on sentence meaning, not an open-ended lexical blacklist.
+	hasTaskTarget := containsAny(normalized,
+		"任务", "早报", "日报", "周报", "月报", "定时推送",
+		"监控", "监测", "情报", "跟踪", "关注",
+		"schedule", "task",
+	)
+	hasExplicitEdit := containsAny(normalized,
+		"更新为", "改为", "调整为", "换成", "改成",
+		"修改", "更新", "调整", "编辑", "设成", "设置为",
+		"updateto", "changeto", "setto", "change", "update", "edit",
+	)
+	hasTaskContinuation := hasTaskTarget && containsAny(normalized,
+		"以后", "从现在", "频率", "只看", "只推", "不再推",
+	)
+	hasTaskAction := containsAny(normalized,
+		"删除", "删掉", "移除",
+		"运行", "执行", "启动", "跑一下",
+		"创建", "新建", "新增", "生成", "建立",
+		"设一个", "设置一个", "帮我设", "做一个",
+		"取消", "停止", "关掉", "停掉", "终止",
+		"create", "delete", "remove", "run", "execute", "launch", "stop",
+	)
+	hasProfileDeclaration := classifyOwnerIntents(text).HasAny(IntentProfile) &&
+		containsAny(normalized,
+			"我是", "我在", "我的行业", "我的职业", "我的岗位",
+			"我负责", "我从事", "我关注",
+			"iam", "i'm", "iworkin", "myrole", "myjob",
+		)
+	hasCapabilityIntent := classifyOwnerIntents(text).HasAny(IntentTasks)
+	return hasCapabilityIntent || hasExplicitEdit ||
+		hasTaskContinuation || hasTaskAction || hasProfileDeclaration
+}
+
+func isNaturalTaskDefinitionEditContinuation(history []llm.ChatMessage) bool {
+	if len(history) < 2 {
+		return false
+	}
+	owner := history[len(history)-2]
+	assistant := history[len(history)-1]
+	if owner.Role != "user" || assistant.Role != "assistant" ||
+		!isNaturalTaskDefinitionEditCandidate(owner.Content) {
+		return false
+	}
+	_, ok := directClarificationReply(assistant.Content)
+	return ok
+}
+
+func naturalTaskDefinitionEditContinuationHistory(
+	history []llm.ChatMessage,
+) []llm.ChatMessage {
+	if !isNaturalTaskDefinitionEditContinuation(history) {
+		return nil
+	}
+	return append([]llm.ChatMessage(nil), history[len(history)-2:]...)
+}
+
+func isProfileIntakePrompt(history []llm.ChatMessage) bool {
+	if len(history) == 0 {
+		return false
+	}
+	assistant := history[len(history)-1]
+	if assistant.Role != "assistant" {
+		return false
+	}
+	normalized := strings.ToLower(strings.Join(
+		strings.Fields(assistant.Content), "",
+	))
+	if !containsAny(normalized,
+		"行业", "职业", "岗位", "关注的主题", "关注主题", "关注标签",
+		"industry", "occupation", "role", "interests", "topics",
+	) {
+		return false
+	}
+	return containsAny(normalized,
+		"?", "？", "请介绍", "请告诉", "告诉我", "方便说",
+		"是什么", "哪些", "什么主题", "可以说",
+		"tellme", "what", "which", "share",
+	)
+}
+
+func profileIntakeContinuationHistory(
+	history []llm.ChatMessage,
+) []llm.ChatMessage {
+	if !isProfileIntakePrompt(history) {
+		return nil
+	}
+	return append([]llm.ChatMessage(nil), history[len(history)-1])
+}
+
+func validNaturalEditScheduleQuery(raw json.RawMessage, ownerRequest string) bool {
+	var args struct {
+		Query string `json:"query"`
+	}
+	if strictjson.DecodeExact(raw, &args) != nil {
+		return false
+	}
+	query := normalizeScheduleLookupText(args.Query)
+	if len([]rune(query)) < 2 {
+		return false
+	}
+	switch query {
+	case "任务", "task", "schedule":
+		return false
+	}
+	lookupScope := naturalEditLookupScope(ownerRequest)
+	if lookupScope == "" {
+		return false
+	}
+	return strings.Contains(
+		normalizeScheduleLookupText(lookupScope),
+		query,
+	)
+}
+
+func naturalEditLookupScope(ownerRequest string) string {
+	normalized := strings.ToLower(strings.Join(strings.Fields(ownerRequest), ""))
+	earliest := len(normalized)
+	for _, marker := range []string{
+		"更新为", "改为", "调整为", "换成", "改成",
+		"updateto", "changeto",
+	} {
+		if index := strings.Index(normalized, marker); index >= 0 &&
+			index < earliest {
+			earliest = index
+		}
+	}
+	if earliest == len(normalized) {
+		for _, prefix := range []string{
+			"请修改", "帮我修改", "麻烦修改", "修改",
+			"请更新", "帮我更新", "麻烦更新", "更新",
+			"请调整", "帮我调整", "麻烦调整", "调整",
+			"请编辑", "帮我编辑", "麻烦编辑", "编辑",
+			"pleasechange", "change", "pleaseupdate", "update",
+			"pleaseedit", "edit",
+		} {
+			if !strings.HasPrefix(normalized, prefix) {
+				continue
+			}
+			scope := strings.TrimPrefix(normalized, prefix)
+			cut := len(scope)
+			for _, separator := range []string{
+				"：", ":", "；", ";", "。", "，", ",",
+				"以后", "从现在", "只看", "只推", "改成", "改为",
+			} {
+				if at := strings.Index(scope, separator); at >= 0 &&
+					at < cut {
+					cut = at
+				}
+			}
+			if cut > 0 {
+				return scope[:cut]
+			}
+			return ""
+		}
+		// A targeted follow-up such as “周报那个” intentionally contains no
+		// second edit marker. The semantic gate has already verified that the
+		// immediately preceding isolated turn established this edit operation.
+		return normalized
+	}
+	return normalized[:earliest]
+}
+
+func taskIDsFromScheduleListResult(result string) []string {
+	var ids []string
+	for _, line := range strings.Split(result, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "- id=") {
+			continue
+		}
+		id, _, _ := strings.Cut(strings.TrimPrefix(line, "- id="), " ")
+		id = strings.Trim(id, "；;，,")
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // claimsRetiredConfirmationCard 判定模型是否幻觉声称已发送下线的确认卡。

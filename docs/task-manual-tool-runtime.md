@@ -26,6 +26,31 @@ state of the task, not separately managed user objects.
 True ambiguity is resolved with one targeted natural-language question.
 Otherwise the Agent executes directly.
 
+Natural-language edits are one user operation even when the request changes
+several fields of the same task. The Agent first resolves the task from the
+user's remembered name, schedule, topic or purpose, then submits one complete
+definition edit. A separate side-effect-free semantic adjudication first routes
+the current owner turn to edit, delete, run, create, profile update, one-off
+research, or an answer-only request such as advice, a hypothetical, negation,
+or cancellation.
+Natural first-profile intake, such as directly answering with an industry,
+role, and interests, uses the same semantic route; the profile store still
+rejects overwriting an existing profile.
+Lexical matches never authorize deletion. The edit then requires a second
+independent model decision to call the bound write tool. Other explicit actions
+expose only their matching side-effect capability; unrelated writes remain
+closed. Answer-only decisions and any adjudication error fail closed into a
+side-effect-free turn: all writes, deliveries, activation changes, and billable
+tools are absent at both declaration and execution boundaries. The isolated edit lane
+exposes only `list_schedules` followed by `edit_task_definition`; a requirement
+that future runs open official pages does not authorize ad-hoc web research
+during the edit. The user is never asked for an internal task ID or to split one
+task/manual edit into smaller requests.
+The lookup phrase must be a specific contiguous phrase from the authenticated
+request, the lookup must resolve exactly one owned task, and the durable edit
+must target that exact resolved ID. Zero or multiple matches produce one
+readable clarification and expose no write tool.
+
 ## Current writer contract
 
 `create_schedule` accepts:
