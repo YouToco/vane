@@ -358,8 +358,27 @@ func TestTaskCreationOperationStore(t *testing.T) {
 			}{op: op, err: err}
 		}()
 
-		time.Sleep(650 * time.Millisecond)
-		releasedAt := time.Now()
+		// The lease is owned by PostgreSQL's clock, which can drift briefly
+		// from the host clock used by the Go test under a loaded VM. Wait for
+		// the authoritative clock to cross the persisted boundary instead of
+		// assuming a host-side sleep proves database expiry.
+		databaseExpired := false
+		var releasedAt time.Time
+		waitDeadline := time.Now().Add(5 * time.Second)
+		for !databaseExpired {
+			if err := st.pool.QueryRow(ctx,
+				`SELECT clock_timestamp() >= $1, clock_timestamp()`,
+				first.LeaseUntil,
+			).Scan(&databaseExpired, &releasedAt); err != nil {
+				t.Fatal(err)
+			}
+			if !databaseExpired {
+				if time.Now().After(waitDeadline) {
+					t.Fatal("database clock did not cross lease expiry")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
 		if err := locker.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
