@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import React from "react";
+import "./insight-surfaces.test";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   act,
