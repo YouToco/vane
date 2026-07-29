@@ -153,17 +153,18 @@ type PushBatch struct {
 // 关键设计：content_item_id ON DELETE SET NULL —— 内容按 TTL 清理后
 // 投递记录仍保留为推送历史，只是不再能追溯原始内容。
 type Delivery struct {
-	ID              int64           `json:"id"`
-	BatchID         int64           `json:"batch_id"`
-	UserID          int64           `json:"user_id"`
-	ContentItemID   *int64          `json:"content_item_id,omitempty"` // 可空：原内容已被清理
-	Score           float64         `json:"score"`                     // NUMERIC NOT NULL：Delivery 在打分之后才创建，恒有值
-	BodyMD          string          `json:"body_md"`                   // 解读正文 markdown（含阅读原文行）
-	CardJSON        json.RawMessage `json:"card_json"`                 // JSONB，飞书交互卡片
-	FeishuMessageID string          `json:"feishu_message_id"`         // 发送成功后回填
-	Status          DeliveryStatus  `json:"status"`
-	SentAt          *time.Time      `json:"sent_at,omitempty"` // 未发送时为 NULL
-	CreatedAt       time.Time       `json:"created_at"`
+	ID               int64           `json:"id"`
+	BatchID          int64           `json:"batch_id"`
+	UserID           int64           `json:"user_id"`
+	ContentItemID    *int64          `json:"content_item_id,omitempty"` // 可空：原内容已被清理
+	InvocationDigest string          `json:"invocation_digest,omitempty"`
+	Score            float64         `json:"score"`             // NUMERIC NOT NULL：Delivery 在打分之后才创建，恒有值
+	BodyMD           string          `json:"body_md"`           // 解读正文 markdown（含阅读原文行）
+	CardJSON         json.RawMessage `json:"card_json"`         // JSONB，飞书交互卡片
+	FeishuMessageID  string          `json:"feishu_message_id"` // 发送成功后回填
+	Status           DeliveryStatus  `json:"status"`
+	SentAt           *time.Time      `json:"sent_at,omitempty"` // 未发送时为 NULL
+	CreatedAt        time.Time       `json:"created_at"`
 }
 
 // Feedback 用户反馈（feedbacks 表）。

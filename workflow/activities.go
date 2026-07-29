@@ -317,6 +317,28 @@ type CompiledToolRunStoreV2 interface {
 		context.Context, types.RunIdentity, types.RunSnapshotRefV2,
 		runtimepolicy.QuotaBucketV1, float64,
 	) error
+	CreateOrRecoverPushBatchForTaskRunV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2, string,
+	) (int64, bool, error)
+	RecordEmptyPushBatchForTaskRunV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2, string,
+		types.BatchExitGate, types.PipelineCounts,
+	) (int64, bool, error)
+	InsertDeliveryForTaskRunV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2,
+		string, string, *types.Delivery,
+	) (int64, bool, bool, error)
+	ClaimPushBatchDeliveryAuthorityForTaskRunV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2, int64,
+	) (types.PushBatchDeliveryAuthority, error)
+	CreatePushEffectForTaskRunV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2,
+		pusheffect.Prepared,
+	) (*pusheffect.Effect, error)
+	ClaimPushEffectForTaskRunV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2,
+		pusheffect.ClaimParams,
+	) (*pusheffect.Effect, error)
 }
 
 type RunOutcomeStoreV1 interface {
@@ -4478,7 +4500,7 @@ func (a *Activities) Push(ctx context.Context, in PushIn) error {
 			effect, prepareErr := a.prepareDurablePushChunk(
 				ctx,
 				compiledIdentity,
-				in.Run.Snapshot,
+				in.Run.Snapshot.SnapshotID,
 				batchID,
 				chunkIndex,
 				len(plannedChunks),
@@ -4668,7 +4690,7 @@ func completePushEffectPlan(
 func (a *Activities) prepareDurablePushChunk(
 	ctx context.Context,
 	identity types.RunIdentity,
-	ref types.RunSnapshotRef,
+	runSnapshotID int64,
 	batchID int64,
 	chunkIndex int,
 	chunkCount int,
@@ -4679,13 +4701,42 @@ func (a *Activities) prepareDurablePushChunk(
 	ownerChatID string,
 	appIdentity string,
 ) (*pusheffect.Effect, error) {
+	if a.pushEffectStore == nil {
+		return nil, types.NewAppError(
+			types.CodeValidation,
+			"durable push effect store is unavailable", nil)
+	}
+	return a.prepareDurablePushChunkWithCreator(
+		ctx, identity, runSnapshotID, batchID, chunkIndex, chunkCount,
+		chunk, cardJSON, effectID, ownerOpenID, ownerChatID, appIdentity,
+		a.pushEffectStore.CreatePushEffect)
+}
+
+func (a *Activities) prepareDurablePushChunkWithCreator(
+	ctx context.Context,
+	identity types.RunIdentity,
+	runSnapshotID int64,
+	batchID int64,
+	chunkIndex int,
+	chunkCount int,
+	chunk []pushPendingItem,
+	cardJSON string,
+	effectID string,
+	ownerOpenID string,
+	ownerChatID string,
+	appIdentity string,
+	create func(context.Context, pusheffect.Prepared) (
+		*pusheffect.Effect, error,
+	),
+) (*pusheffect.Effect, error) {
 	if a.pushEffectStore == nil || !activity.IsActivity(ctx) ||
+		runSnapshotID <= 0 ||
 		batchID <= 0 || chunkIndex < 0 || chunkCount <= 0 ||
 		chunkIndex >= chunkCount || len(chunk) == 0 ||
 		effectID == "" ||
 		ownerOpenID == "" ||
 		ownerChatID == "" ||
-		appIdentity == "" {
+		appIdentity == "" || create == nil {
 		return nil, types.NewAppError(
 			types.CodeValidation,
 			"durable push effect input is invalid",
@@ -4713,11 +4764,11 @@ func (a *Activities) prepareDurablePushChunk(
 	if !hasObservationEvent {
 		observationEventKeys = nil
 	}
-	return a.pushEffectStore.CreatePushEffect(
+	return create(
 		ctx,
 		pusheffect.Prepared{
 			ID: effectID, TenantID: identity.TenantID, UserID: identity.UserID,
-			TaskID: identity.TaskID, RunSnapshotID: ref.SnapshotID,
+			TaskID: identity.TaskID, RunSnapshotID: runSnapshotID,
 			RunID: identity.TemporalRunID, StepID: pushEffectStepID,
 			ChunkIndex: chunkIndex, ChunkCount: chunkCount,
 			BatchID: batchID, DeliveryIDs: deliveryIDs,
@@ -4739,8 +4790,32 @@ func (a *Activities) sendFrozenPushEffects(
 	run *CompiledRunInputV1,
 	effects []*pusheffect.Effect,
 ) error {
+	return a.sendFrozenPushEffectsWithAuthorizer(
+		ctx, effects,
+		func(effectCtx context.Context) error {
+			return a.authorizeCompiledEffectV1(effectCtx, userID, run)
+		})
+}
+
+func (a *Activities) sendFrozenPushEffectsWithAuthorizer(
+	ctx context.Context,
+	effects []*pusheffect.Effect,
+	authorize func(context.Context) error,
+) error {
+	return a.sendFrozenPushEffectsWithAuthorizerAndClaimer(
+		ctx, effects, authorize, nil)
+}
+
+func (a *Activities) sendFrozenPushEffectsWithAuthorizerAndClaimer(
+	ctx context.Context,
+	effects []*pusheffect.Effect,
+	authorize func(context.Context) error,
+	claim func(context.Context, pusheffect.ClaimParams) (
+		*pusheffect.Effect, error,
+	),
+) error {
 	complete, _ := completePushEffectPlan(effects)
-	if !complete {
+	if !complete || authorize == nil {
 		return types.NewAppError(
 			types.CodeConflict,
 			"durable push effect plan is incomplete",
@@ -4748,8 +4823,8 @@ func (a *Activities) sendFrozenPushEffects(
 		)
 	}
 	for _, effect := range effects {
-		if err := a.sendFrozenPushEffect(
-			ctx, userID, run, effect,
+		if err := a.sendFrozenPushEffectWithAuthorizer(
+			ctx, effect, authorize, claim,
 		); err != nil {
 			return err
 		}
@@ -4808,8 +4883,23 @@ func (a *Activities) sendFrozenPushEffect(
 	run *CompiledRunInputV1,
 	effect *pusheffect.Effect,
 ) error {
+	return a.sendFrozenPushEffectWithAuthorizer(
+		ctx, effect,
+		func(effectCtx context.Context) error {
+			return a.authorizeCompiledEffectV1(effectCtx, userID, run)
+		}, nil)
+}
+
+func (a *Activities) sendFrozenPushEffectWithAuthorizer(
+	ctx context.Context,
+	effect *pusheffect.Effect,
+	authorize func(context.Context) error,
+	claim func(context.Context, pusheffect.ClaimParams) (
+		*pusheffect.Effect, error,
+	),
+) error {
 	if a.pushEffectStore == nil || effect == nil ||
-		!activity.IsActivity(ctx) {
+		authorize == nil || !activity.IsActivity(ctx) {
 		return types.NewAppError(
 			types.CodeValidation,
 			"durable push effect replay is invalid",
@@ -4831,13 +4921,15 @@ func (a *Activities) sendFrozenPushEffect(
 	var err error
 	switch effect.Status {
 	case pusheffect.StatusPrepared, pusheffect.StatusDefiniteFailed:
-		effect, err = a.pushEffectStore.ClaimPushEffect(
-			ctx,
-			pusheffect.ClaimParams{
-				Scope: effect.Scope(), LeaseOwner: leaseOwner,
-				LeaseDuration: pushEffectLeaseDuration,
-			},
-		)
+		params := pusheffect.ClaimParams{
+			Scope: effect.Scope(), LeaseOwner: leaseOwner,
+			LeaseDuration: pushEffectLeaseDuration,
+		}
+		if claim != nil {
+			effect, err = claim(ctx, params)
+		} else {
+			effect, err = a.pushEffectStore.ClaimPushEffect(ctx, params)
+		}
 	case pusheffect.StatusSent:
 		return a.pushEffectStore.RecordPushEffectSentWithDeliveries(
 			ctx,
@@ -4880,9 +4972,7 @@ func (a *Activities) sendFrozenPushEffect(
 	// Preserve the #165 live revocation fence immediately before each new
 	// provider attempt. Sent-receipt replay above is local settlement only and
 	// deliberately does not consume or re-check external-send authority.
-	if authorizationErr := a.authorizeCompiledEffectV1(
-		ctx, userID, run,
-	); authorizationErr != nil {
+	if authorizationErr := authorize(ctx); authorizationErr != nil {
 		// Claiming precedes the final live Gate so the exact effect is fenced
 		// against another sender. If the Gate closes (or its DB read fails),
 		// release that lease back to a safe retryable state; otherwise a

@@ -11,9 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/testsuite"
 
+	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/taskstate"
@@ -39,6 +42,8 @@ type compiledToolRunStoreFake struct {
 	commitObservationErr error
 	recentSimhashErr     error
 	quotaErr             error
+	pushEffects          PushEffectStore
+	pushRecoveryOnly     bool
 
 	loadRefCalls           int
 	createCalls            int
@@ -49,6 +54,9 @@ type compiledToolRunStoreFake struct {
 	listCandidateCalls     int
 	recentSimhashCalls     int
 	quotaCalls             int
+	pushBatchCalls         int
+	insertDeliveryCalls    int
+	deliveryInvocation     string
 	createPolicies         []runtimepolicy.BundleV1
 }
 
@@ -132,6 +140,95 @@ func (f *compiledToolRunStoreFake) AuthorizeAndConsumeTaskRunLLMQuotaV2(
 	defer f.mu.Unlock()
 	f.quotaCalls++
 	return f.quotaErr
+}
+
+func (f *compiledToolRunStoreFake) CreateOrRecoverPushBatchForTaskRunV2(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRefV2,
+	string,
+) (int64, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pushBatchCalls++
+	return 1, f.pushRecoveryOnly, nil
+}
+
+func (*compiledToolRunStoreFake) RecordEmptyPushBatchForTaskRunV2(
+	context.Context,
+	types.RunIdentity,
+	types.RunSnapshotRefV2,
+	string,
+	types.BatchExitGate,
+	types.PipelineCounts,
+) (int64, bool, error) {
+	return 1, false, nil
+}
+
+func (f *compiledToolRunStoreFake) InsertDeliveryForTaskRunV2(
+	_ context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRefV2,
+	_ string,
+	invocationDigest string,
+	_ *types.Delivery,
+) (int64, bool, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.insertDeliveryCalls++
+	f.deliveryInvocation = invocationDigest
+	return 1, false, false, nil
+}
+
+func (f *compiledToolRunStoreFake) ClaimPushBatchDeliveryAuthorityForTaskRunV2(
+	ctx context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRefV2,
+	batchID int64,
+) (types.PushBatchDeliveryAuthority, error) {
+	if f.pushEffects != nil {
+		return f.pushEffects.ClaimPushBatchDeliveryAuthority(
+			ctx, types.PushBatchScope{
+				TenantID: f.snapshot.Definition.TenantID,
+				UserID:   f.snapshot.Definition.UserID,
+				BatchID:  batchID,
+			}, types.PushBatchDeliveryAuthorityEffect)
+	}
+	return types.PushBatchDeliveryAuthorityEffect, nil
+}
+
+func (f *compiledToolRunStoreFake) CreatePushEffectForTaskRunV2(
+	ctx context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRefV2,
+	prepared pusheffect.Prepared,
+) (*pusheffect.Effect, error) {
+	if f.pushEffects != nil {
+		return f.pushEffects.CreatePushEffect(ctx, prepared)
+	}
+	return &pusheffect.Effect{
+		Prepared: prepared,
+		Status:   pusheffect.StatusPrepared,
+	}, nil
+}
+
+func (f *compiledToolRunStoreFake) ClaimPushEffectForTaskRunV2(
+	ctx context.Context,
+	_ types.RunIdentity,
+	_ types.RunSnapshotRefV2,
+	params pusheffect.ClaimParams,
+) (*pusheffect.Effect, error) {
+	if f.pushEffects != nil {
+		return f.pushEffects.ClaimPushEffect(ctx, params)
+	}
+	return &pusheffect.Effect{
+		Prepared: pusheffect.Prepared{
+			ID: params.ID, TenantID: params.TenantID, UserID: params.UserID,
+		},
+		Status:     pusheffect.StatusSending,
+		LeaseOwner: params.LeaseOwner,
+		Fence:      1,
+	}, nil
 }
 
 type compiledToolFetcherV2Fake struct {
@@ -724,6 +821,11 @@ func TestToolCandidatePipelineV2_PreservesInvocationProvenance(
 			},
 		},
 	}
+	st.observation = []types.ContentItem{
+		candidates[0].Item,
+		candidates[1].Item,
+	}
+	st.observationFound = true
 	encoded, err := env.ExecuteActivity(
 		a.DedupToolCandidatesV2,
 		DedupToolCandidatesV2Input{
@@ -809,13 +911,17 @@ func TestToolCandidatePipelineV2_PreservesInvocationProvenance(
 	}
 }
 
-func TestScoreToolCandidatesV2_RejectsUnknownInvocationBeforeSpend(
+func TestScoreToolCandidatesV2_RejectsTamperedPayloadBeforeSpend(
 	t *testing.T,
 ) {
 	identity := testActivityIdentity(7, 9, "task-tool-v2-provenance")
 	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
 	st := &compiledToolRunStoreFake{
 		ref: ref, found: true, snapshot: snapshot, authorize: true,
+		observation: []types.ContentItem{{
+			ID: 103, Kind: types.KindArticle,
+			Title: "canonical", Content: "canonical",
+		}},
 	}
 	scorer := new(compiledQuotaScorerFake)
 	a := NewActivities(
@@ -842,7 +948,7 @@ func TestScoreToolCandidatesV2_RejectsUnknownInvocationBeforeSpend(
 				Snapshot: ref,
 			},
 			Candidates: []runcontext.ToolCandidateV1{{
-				InvocationDigest: strings.Repeat("f", 64),
+				InvocationDigest: snapshot.Definition.ToolCalls[0].Digest,
 				Item: types.ContentItem{
 					ID: 103, Kind: types.KindArticle,
 					Title: "tampered", Content: "tampered",
@@ -850,14 +956,328 @@ func TestScoreToolCandidatesV2_RejectsUnknownInvocationBeforeSpend(
 			}},
 		})
 	if err == nil {
-		t.Fatal("unknown Tool invocation reached score")
+		t.Fatal("tampered Tool candidate reached score")
 	}
 	if scorer.calls.Load() != 0 {
-		t.Fatal("unknown Tool invocation spent model quota")
+		t.Fatal("tampered Tool candidate spent model quota")
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.quotaCalls != 0 || st.authorizeCalls != 0 {
-		t.Fatalf("unknown invocation reached gates: %+v", st)
+		t.Fatalf("tampered candidate reached gates: %+v", st)
+	}
+}
+
+func TestPushToolCardsV2_UsesDurableEffectAndToolProvenance(
+	t *testing.T,
+) {
+	identity := testActivityIdentity(7, 9, "task-tool-v2-push")
+	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
+	st := &compiledToolRunStoreFake{
+		ref: ref, found: true, snapshot: snapshot, authorize: true,
+		observation: []types.ContentItem{{
+			ID: 201, Kind: types.KindArticle,
+			Title: "Tool result",
+			URL:   "https://example.com/tool-result",
+		}},
+		observationFound: true,
+	}
+	effectStore := newPRBActivityEffectStore(nil, nil)
+	st.pushEffects = effectStore
+	pusher := &prbActivityPusher{chatID: "oc_tool_v2"}
+	feishu := &prbEffectFeishu{
+		owner: "ou_tool_v2", chat: "oc_tool_v2", app: "cli_tool_v2",
+	}
+	var captured []feedback.CardInput
+	build := func(in feedback.AggregateCardInput) string {
+		captured = append([]feedback.CardInput(nil), in.Items...)
+		return prbEffectCard(in)
+	}
+	a := NewActivities(
+		fakeFetcher{}, fakeScorer{}, fakeCardGen{}, pusher,
+		&fakeStore{}, feishu, nil, nil, build, nil,
+		WithCompiledToolRuntimeV2(
+			st,
+			func(context.Context, int64, bool) (
+				runtimepolicy.BundleV1, error,
+			) {
+				return snapshot.Policy, nil
+			},
+			new(compiledModelResolverFake)),
+		WithPushEffectCanary(effectStore, identity.TaskID))
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.PushToolCardsV2)
+	invocation := snapshot.Definition.ToolCalls[0].Digest
+	_, err := env.ExecuteActivity(
+		a.PushToolCardsV2,
+		PushToolCardsV2Input{
+			UserID: identity.UserID, TraceID: "trace-tool-v2-push",
+			Run: CompiledToolRunInputV2{
+				TenantID: identity.TenantID,
+				TaskID:   identity.TaskID,
+				Snapshot: ref,
+			},
+			Cards: []ToolGeneratedCardV1{{
+				InvocationDigest: invocation,
+				Card: GeneratedCard{
+					Scored: types.ScoredItem{
+						Item: types.ContentItem{
+							ID: 201, Kind: types.KindArticle,
+							Title: "Tool result",
+							URL:   "https://example.com/tool-result",
+						},
+						Score: 88,
+					},
+					BodyMD: "durable Tool insight",
+				},
+			}},
+		})
+	if err != nil {
+		t.Fatalf("PushToolCardsV2: %v", err)
+	}
+	calls := pusher.snapshot()
+	prepared, claimed, receipts := effectStore.snapshot()
+	if len(calls) != 1 || len(prepared) != 1 ||
+		len(claimed) != 1 || len(receipts) != 1 {
+		t.Fatalf("durable Tool push: calls=%d prepared=%d claimed=%d receipts=%d",
+			len(calls), len(prepared), len(claimed), len(receipts))
+	}
+	if prepared[0].RunSnapshotID != ref.SnapshotID ||
+		len(prepared[0].DeliveryIDs) != 1 ||
+		prepared[0].DeliveryIDs[0] != 1 ||
+		calls[0].uuid != prepared[0].ProviderUUID {
+		t.Fatalf("durable Tool effect differs: prepared=%+v call=%+v",
+			prepared[0], calls[0])
+	}
+	if len(captured) != 1 ||
+		captured[0].SourceTitle !=
+			snapshot.ToolBindings[0].Contract.ToolName ||
+		captured[0].Platform !=
+			types.Platform(snapshot.ToolBindings[0].Contract.Platform) {
+		t.Fatalf("Tool display provenance = %+v", captured)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.pushBatchCalls != 1 || st.insertDeliveryCalls != 1 ||
+		st.deliveryInvocation != invocation ||
+		st.authorizeCalls != 1 {
+		t.Fatalf("Tool push Store gates: %+v", st)
+	}
+}
+
+func TestPushToolCardsV2_RecoveryOnlySettlesWithoutLiveAuthorization(
+	t *testing.T,
+) {
+	identity := testActivityIdentity(7, 9, "task-tool-v2-recovery")
+	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
+	effectStore := newPRBActivityEffectStore(nil, nil)
+	st := &compiledToolRunStoreFake{
+		ref: ref, found: true, snapshot: snapshot,
+		authorize: false, pushRecoveryOnly: true,
+		pushEffects: effectStore,
+	}
+	pusher := &prbActivityPusher{chatID: "oc_tool_v2"}
+	a := NewActivities(
+		fakeFetcher{}, fakeScorer{}, fakeCardGen{}, pusher,
+		&fakeStore{}, fakeFeishu{}, nil, nil, nil, nil,
+		WithCompiledToolRuntimeV2(
+			st,
+			func(context.Context, int64, bool) (
+				runtimepolicy.BundleV1, error,
+			) {
+				return snapshot.Policy, nil
+			},
+			new(compiledModelResolverFake)),
+		WithPushEffectCanary(effectStore, identity.TaskID))
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.PushToolCardsV2)
+	_, err := env.ExecuteActivity(
+		a.PushToolCardsV2,
+		PushToolCardsV2Input{
+			UserID: identity.UserID, TraceID: "trace-tool-v2-recovery",
+			Run: CompiledToolRunInputV2{
+				TenantID: identity.TenantID,
+				TaskID:   identity.TaskID,
+				Snapshot: ref,
+			},
+			// Receipt recovery must not depend on replayed card payloads.
+			Cards: nil,
+		})
+	if err != nil {
+		t.Fatalf("recover Tool push receipt: %v", err)
+	}
+	effectStore.mu.Lock()
+	settles := effectStore.settles
+	effectStore.mu.Unlock()
+	if settles != 1 || len(pusher.snapshot()) != 0 {
+		t.Fatalf("recovery-only Tool push: settles=%d provider_calls=%d",
+			settles, len(pusher.snapshot()))
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.pushBatchCalls != 1 || st.authorizeCalls != 0 ||
+		st.insertDeliveryCalls != 0 ||
+		st.loadObservationCalls != 0 {
+		t.Fatalf("recovery-only Tool push crossed live gates: %+v", st)
+	}
+}
+
+func TestPushPipelineWorkflow_CompiledToolV2CommandSequence(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	identity := testActivityIdentity(7, 9, "task-tool-v2-workflow")
+	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
+	invocation := snapshot.Definition.ToolCalls[0].Digest
+	item := types.ContentItem{
+		ID: 301, Kind: types.KindArticle,
+		Title: "Tool result", URL: "https://example.com/tool-result",
+	}
+	candidate := runcontext.ToolCandidateV1{
+		InvocationDigest: invocation, Item: item,
+	}
+	scored := runcontext.ToolScoredCandidateV1{
+		InvocationDigest: invocation,
+		Scored:           types.ScoredItem{Item: item, Score: 88},
+	}
+	card := ToolGeneratedCardV1{
+		InvocationDigest: invocation,
+		Card:             GeneratedCard{Scored: scored.Scored, BodyMD: "insight"},
+	}
+	var mu sync.Mutex
+	var calls []string
+	record := func(name string) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, name)
+	}
+	register := func(name string, fn any) {
+		env.RegisterActivityWithOptions(
+			fn, activity.RegisterOptions{Name: name})
+	}
+	register("PrepareToolRunV2",
+		func(context.Context, PushParams) (PrepareToolRunV2Result, error) {
+			record("prepare")
+			return PrepareToolRunV2Result{
+				Authorized: true, Snapshot: ref,
+				InvocationDigests: []string{invocation},
+			}, nil
+		})
+	register("ExecuteToolInvocationV2",
+		func(
+			_ context.Context,
+			in ExecuteToolInvocationV2Input,
+		) (ToolInvocationReceiptV1, error) {
+			record("execute")
+			return ToolInvocationReceiptV1{
+				InvocationDigest:  in.InvocationDigest,
+				ObservationDigest: strings.Repeat("b", 64),
+				ContentCount:      1,
+			}, nil
+		})
+	register("CollectToolRunContentV2",
+		func(
+			context.Context,
+			CollectToolRunContentV2Input,
+		) ([]runcontext.ToolCandidateV1, error) {
+			record("collect")
+			return []runcontext.ToolCandidateV1{candidate}, nil
+		})
+	register("DedupToolCandidatesV2",
+		func(
+			context.Context,
+			DedupToolCandidatesV2Input,
+		) ([]runcontext.ToolCandidateV1, error) {
+			record("dedup")
+			return []runcontext.ToolCandidateV1{candidate}, nil
+		})
+	register("ScoreToolCandidatesV2",
+		func(
+			context.Context,
+			ScoreToolCandidatesV2Input,
+		) ([]runcontext.ToolScoredCandidateV1, error) {
+			record("score")
+			return []runcontext.ToolScoredCandidateV1{scored}, nil
+		})
+	register("SelectToolCandidatesV2",
+		func(
+			context.Context,
+			SelectToolCandidatesV2Input,
+		) ([]runcontext.ToolScoredCandidateV1, error) {
+			record("select")
+			return []runcontext.ToolScoredCandidateV1{scored}, nil
+		})
+	register("CardGenToolCandidatesV2",
+		func(
+			context.Context,
+			CardGenToolCandidatesV2Input,
+		) ([]ToolGeneratedCardV1, error) {
+			record("cardgen")
+			return []ToolGeneratedCardV1{card}, nil
+		})
+	register("PushToolCardsV2",
+		func(context.Context, PushToolCardsV2Input) error {
+			record("push")
+			return nil
+		})
+
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
+		TenantID: identity.TenantID, UserID: identity.UserID,
+		RunKind:        PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeToolSnapshotV2,
+		ScheduleID:     identity.TaskID,
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("compiled Tool workflow: %v", err)
+	}
+	want := []string{
+		"prepare", "execute", "collect", "dedup",
+		"score", "select", "cardgen", "push",
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("compiled Tool command sequence=%v, want %v", calls, want)
+	}
+}
+
+func TestPushPipelineWorkflow_ToolProviderFailureIsNotRetried(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	identity := testActivityIdentity(7, 9, "task-tool-v2-no-retry")
+	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
+	invocation := snapshot.Definition.ToolCalls[0].Digest
+	var executeCalls atomic.Int32
+	env.RegisterActivityWithOptions(
+		func(context.Context, PushParams) (PrepareToolRunV2Result, error) {
+			return PrepareToolRunV2Result{
+				Authorized: true, Snapshot: ref,
+				InvocationDigests: []string{invocation},
+			}, nil
+		}, activity.RegisterOptions{Name: "PrepareToolRunV2"})
+	env.RegisterActivityWithOptions(
+		func(
+			context.Context,
+			ExecuteToolInvocationV2Input,
+		) (ToolInvocationReceiptV1, error) {
+			executeCalls.Add(1)
+			return ToolInvocationReceiptV1{}, errors.New("provider failed")
+		}, activity.RegisterOptions{Name: "ExecuteToolInvocationV2"})
+
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
+		TenantID: identity.TenantID, UserID: identity.UserID,
+		RunKind:        PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeToolSnapshotV2,
+		ScheduleID:     identity.TaskID,
+	})
+	if env.GetWorkflowError() == nil {
+		t.Fatal("Tool provider failure unexpectedly succeeded")
+	}
+	if executeCalls.Load() != 1 {
+		t.Fatalf("Tool provider calls=%d, want exactly one",
+			executeCalls.Load())
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -195,6 +196,52 @@ func validateToolScoredCandidatesV2(
 	return validateToolCandidatesV2(snapshot, unscored)
 }
 
+func (a *Activities) validateCanonicalToolCandidatesV2(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRefV2,
+	candidates []runcontext.ToolCandidateV1,
+) error {
+	byInvocation := make(map[string][]types.ContentItem)
+	for _, candidate := range candidates {
+		if _, loaded := byInvocation[candidate.InvocationDigest]; !loaded {
+			items, found, err := a.compiledToolStoreV2.
+				LoadContentObservationForTaskRunV2(
+					ctx, expected, ref, candidate.InvocationDigest)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return types.NewAppError(types.CodeValidation,
+					"compiled Tool observation is not authoritative", nil)
+			}
+			byInvocation[candidate.InvocationDigest] = items
+		}
+		var stored *types.ContentItem
+		for i := range byInvocation[candidate.InvocationDigest] {
+			item := &byInvocation[candidate.InvocationDigest][i]
+			if item.ID == candidate.Item.ID {
+				stored = item
+				break
+			}
+		}
+		if stored == nil {
+			return types.NewAppError(types.CodeValidation,
+				"compiled Tool candidate provenance is not authoritative", nil)
+		}
+		// Dedup is allowed to compute Simhash in memory. Every other content
+		// field consumed by the model must match the canonical Store row.
+		storedItem := *stored
+		storedItem.Simhash = nil
+		candidate.Item.Simhash = nil
+		if !reflect.DeepEqual(storedItem, candidate.Item) {
+			return types.NewAppError(types.CodeValidation,
+				"compiled Tool candidate payload is not authoritative", nil)
+		}
+	}
+	return nil
+}
+
 // DedupToolCandidatesV2 performs the retained pure simhash algorithm while
 // reading history only through the exact Source-free run reference.
 func (a *Activities) DedupToolCandidatesV2(
@@ -208,6 +255,10 @@ func (a *Activities) DedupToolCandidatesV2(
 	}
 	if err := validateToolCandidatesV2(snapshot, in.Candidates); err != nil {
 		return nil, nonRetryable(err)
+	}
+	if err := a.validateCanonicalToolCandidatesV2(
+		ctx, expected, in.Run.Snapshot, in.Candidates); err != nil {
+		return nil, retryableOrNot(err)
 	}
 	batchIDs := make([]int64, 0, len(in.Candidates))
 	for _, candidate := range in.Candidates {
@@ -252,6 +303,10 @@ func (a *Activities) ScoreToolCandidatesV2(
 	}
 	if err := validateToolCandidatesV2(snapshot, in.Candidates); err != nil {
 		return nil, nonRetryable(err)
+	}
+	if err := a.validateCanonicalToolCandidatesV2(
+		ctx, expected, in.Run.Snapshot, in.Candidates); err != nil {
+		return nil, retryableOrNot(err)
 	}
 	if a.compiledToolModelResolverV2 == nil {
 		return nil, nonRetryable(types.NewAppError(types.CodeInternal,
@@ -345,7 +400,7 @@ func (a *Activities) SelectToolCandidatesV2(
 	ctx context.Context,
 	in SelectToolCandidatesV2Input,
 ) ([]runcontext.ToolScoredCandidateV1, error) {
-	snapshot, _, err := a.loadAuthoritativeToolRunV2(
+	snapshot, expected, err := a.loadAuthoritativeToolRunV2(
 		ctx, in.UserID, in.Run)
 	if err != nil {
 		return nil, retryableOrNot(err)
@@ -353,6 +408,17 @@ func (a *Activities) SelectToolCandidatesV2(
 	if err := validateToolScoredCandidatesV2(
 		snapshot, in.Candidates); err != nil {
 		return nil, nonRetryable(err)
+	}
+	canonicalCandidates := make([]runcontext.ToolCandidateV1, len(in.Candidates))
+	for i, candidate := range in.Candidates {
+		canonicalCandidates[i] = runcontext.ToolCandidateV1{
+			InvocationDigest: candidate.InvocationDigest,
+			Item:             candidate.Scored.Item,
+		}
+	}
+	if err := a.validateCanonicalToolCandidatesV2(
+		ctx, expected, in.Run.Snapshot, canonicalCandidates); err != nil {
+		return nil, retryableOrNot(err)
 	}
 	var scope PushScope
 	if err := json.Unmarshal(snapshot.Definition.ScopeJSON, &scope); err != nil ||
@@ -399,6 +465,17 @@ func (a *Activities) CardGenToolCandidatesV2(
 	if err := validateToolScoredCandidatesV2(
 		snapshot, in.Candidates); err != nil {
 		return nil, nonRetryable(err)
+	}
+	canonicalCandidates := make([]runcontext.ToolCandidateV1, len(in.Candidates))
+	for i, candidate := range in.Candidates {
+		canonicalCandidates[i] = runcontext.ToolCandidateV1{
+			InvocationDigest: candidate.InvocationDigest,
+			Item:             candidate.Scored.Item,
+		}
+	}
+	if err := a.validateCanonicalToolCandidatesV2(
+		ctx, expected, in.Run.Snapshot, canonicalCandidates); err != nil {
+		return nil, retryableOrNot(err)
 	}
 	if a.compiledToolModelResolverV2 == nil {
 		return nil, nonRetryable(types.NewAppError(types.CodeInternal,

@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/YouToco/vane/observation"
+	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
 	"github.com/YouToco/vane/taskstate"
@@ -517,21 +518,151 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		candidates[0].Item.SourceID != 0 {
 		t.Fatalf("Source-free candidates=%+v err=%v", candidates, err)
 	}
-	insertCompiledTestDelivery(
-		t, st, identity.TenantID, identity.UserID,
-		identity.TaskID, contentID)
+	deliveryKey := "tool-delivery-" + uuid.NewString()
+	batchID, recoveryOnly, err :=
+		st.CreateOrRecoverPushBatchForTaskRunV2(
+			ctx, identity, ref, deliveryKey)
+	if err != nil || recoveryOnly || batchID <= 0 {
+		t.Fatalf("create Source-free delivery batch: id=%d recovery=%v err=%v",
+			batchID, recoveryOnly, err)
+	}
 	t.Cleanup(func() {
 		cleanupCtx, cancel := cleanupContext()
 		defer cancel()
 		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM deliveries
-			  WHERE tenant_id=$1 AND user_id=$2 AND content_item_id=$3`,
-			identity.TenantID, identity.UserID, contentID)
+			`DELETE FROM push_effects WHERE batch_id=$1`, batchID)
 		cleanupExec(cleanupCtx, t, st,
-			`DELETE FROM push_batches
-			  WHERE tenant_id=$1 AND user_id=$2 AND schedule_id=$3`,
-			identity.TenantID, identity.UserID, identity.TaskID)
+			`DELETE FROM deliveries WHERE batch_id=$1`, batchID)
+		cleanupExec(cleanupCtx, t, st,
+			`DELETE FROM push_batches WHERE id=$1`, batchID)
 	})
+	authority, err :=
+		st.ClaimPushBatchDeliveryAuthorityForTaskRunV2(
+			ctx, identity, ref, batchID)
+	if err != nil ||
+		authority != types.PushBatchDeliveryAuthorityEffect {
+		t.Fatalf("claim Source-free delivery authority: %s err=%v",
+			authority, err)
+	}
+	delivery := &types.Delivery{
+		BatchID: batchID, UserID: identity.UserID,
+		ContentItemID: &contentID, Score: 88, BodyMD: "Tool insight",
+	}
+	deliveryID, existed, sentAlready, err :=
+		st.InsertDeliveryForTaskRunV2(
+			ctx, identity, ref, deliveryKey,
+			invocationDigest, delivery)
+	if err != nil || existed || sentAlready || deliveryID <= 0 {
+		t.Fatalf("insert Source-free delivery: id=%d existed=%v sent=%v err=%v",
+			deliveryID, existed, sentAlready, err)
+	}
+	replayedDeliveryID, existed, sentAlready, err :=
+		st.InsertDeliveryForTaskRunV2(
+			ctx, identity, ref, deliveryKey,
+			invocationDigest, delivery)
+	if err != nil || !existed || sentAlready ||
+		replayedDeliveryID != deliveryID {
+		t.Fatalf("replay Source-free delivery: id=%d existed=%v sent=%v err=%v",
+			replayedDeliveryID, existed, sentAlready, err)
+	}
+	var storedInvocation string
+	if err := st.pool.QueryRow(ctx,
+		`SELECT invocation_digest FROM deliveries WHERE id=$1`,
+		deliveryID).Scan(&storedInvocation); err != nil ||
+		storedInvocation != invocationDigest {
+		t.Fatalf("Source-free delivery provenance=%q err=%v",
+			storedInvocation, err)
+	}
+	if _, _, _, err := st.InsertDeliveryForTaskRunV2(
+		ctx, identity, ref, deliveryKey,
+		nonmemberDigest, &types.Delivery{
+			BatchID: batchID, UserID: identity.UserID,
+			ContentItemID: &contentID, Score: 88, BodyMD: "Tool insight",
+		},
+	); err == nil {
+		t.Fatal("Store admitted delivery for a nonmember Tool invocation")
+	}
+	_, err = st.pool.Exec(ctx,
+		`INSERT INTO deliveries (
+		    tenant_id,batch_id,user_id,content_item_id,
+		    score,body_md,status
+		 ) VALUES ($1,$2,$3,$4,1,'missing provenance',$5)`,
+		identity.TenantID, batchID, identity.UserID, contentID,
+		types.DeliveryStatusPending)
+	pgErr = nil
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("database admitted V2 delivery without invocation: %v", err)
+	}
+	_, err = st.pool.Exec(ctx,
+		`INSERT INTO deliveries (
+		    tenant_id,batch_id,user_id,content_item_id,invocation_digest,
+		    score,body_md,status
+		 ) VALUES ($1,$2,$3,$4,$5,1,'wrong provenance',$6)`,
+		identity.TenantID, batchID, identity.UserID, contentID,
+		nonmemberDigest, types.DeliveryStatusPending)
+	pgErr = nil
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("database admitted V2 delivery outside observation: %v", err)
+	}
+	var databaseNow time.Time
+	if err := st.pool.QueryRow(ctx,
+		`SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		t.Fatal(err)
+	}
+	effectID := "tool-effect-" + uuid.NewString()
+	providerUUID := uuid.NewString()
+	preparedEffect := pusheffect.Prepared{
+		ID:       effectID,
+		TenantID: identity.TenantID, UserID: identity.UserID,
+		TaskID: identity.TaskID, RunSnapshotID: ref.SnapshotID,
+		RunID: identity.TemporalRunID, StepID: "push-card",
+		ChunkIndex: 0, ChunkCount: 1,
+		BatchID: batchID, DeliveryIDs: []int64{deliveryID},
+		Provider:    "feishu-im-message-create",
+		AppIdentity: "cli_tool_v2", ProviderChatID: "oc_tool_v2",
+		Target: "ou_tool_v2", Card: []byte(`{"tool":"card"}`),
+		ProviderUUID: providerUUID,
+		IdempotencyExpiresAt: databaseNow.UTC().
+			Truncate(time.Microsecond).Add(time.Hour),
+	}
+	effect, err := st.CreatePushEffectForTaskRunV2(
+		ctx, identity, ref, preparedEffect)
+	if err != nil || effect.ID != effectID {
+		t.Fatalf("create Source-free durable effect: %+v err=%v",
+			effect, err)
+	}
+	claimed, err := st.ClaimPushEffectForTaskRunV2(
+		ctx, identity, ref, pusheffect.ClaimParams{
+			Scope: pusheffect.Scope{
+				ID: effectID, TenantID: identity.TenantID,
+				UserID: identity.UserID,
+			},
+			LeaseOwner: "tool-v2-test", LeaseDuration: time.Minute,
+		})
+	if err != nil || claimed == nil || claimed.Fence <= 0 {
+		t.Fatalf("claim Source-free durable effect: effect=%+v err=%v",
+			claimed, err)
+	}
+	if err := st.RecordPushEffectSentWithDeliveries(
+		ctx, pusheffect.SentReceipt{
+			Scope: claimed.Scope(), ExpectedFence: claimed.Fence,
+			LeaseOwner:        claimed.LeaseOwner,
+			ProviderMessageID: "om_tool_v2",
+		}); err != nil {
+		t.Fatalf("settle Source-free durable effect: %v", err)
+	}
+	var deliveryStatus types.DeliveryStatus
+	var batchStatus types.BatchStatus
+	if err := st.pool.QueryRow(ctx,
+		`SELECT d.status,b.status
+		   FROM deliveries d JOIN push_batches b ON b.id=d.batch_id
+		  WHERE d.id=$1`,
+		deliveryID).Scan(&deliveryStatus, &batchStatus); err != nil ||
+		deliveryStatus != types.DeliveryStatusSent ||
+		batchStatus != types.BatchStatusDone {
+		t.Fatalf("Source-free durable receipts: delivery=%s batch=%s err=%v",
+			deliveryStatus, batchStatus, err)
+	}
 	candidates, err = st.ListContentCandidatesForTaskRunV2(
 		ctx, identity, ref, 256)
 	if err != nil || len(candidates) != 0 {
@@ -630,6 +761,23 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		t.Fatalf("paused Source-free run authorization: authorized=%v err=%v",
 			authorized, err)
 	}
+	recoveredBatchID, recoveryOnly, err :=
+		st.CreateOrRecoverPushBatchForTaskRunV2(
+			ctx, identity, ref, deliveryKey)
+	if err != nil || !recoveryOnly || recoveredBatchID != batchID {
+		t.Fatalf("recover sent Source-free batch after revoke: id=%d recovery=%v err=%v",
+			recoveredBatchID, recoveryOnly, err)
+	}
+	if _, err := st.ClaimPushBatchDeliveryAuthorityForTaskRunV2(
+		ctx, identity, ref, batchID,
+	); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("revoked Tool run re-claimed batch authority: %v", err)
+	}
+	if _, err := st.CreatePushEffectForTaskRunV2(
+		ctx, identity, ref, preparedEffect,
+	); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("revoked Tool run re-prepared durable effect: %v", err)
+	}
 	if err := st.AuthorizeAndConsumeTaskRunLLMQuotaV2(
 		ctx, identity, ref, quotaRule, 1,
 	); !errors.Is(err, ErrQuotaExceeded) {
@@ -647,6 +795,22 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 	); err != nil || !found || len(recovered) != 1 {
 		t.Fatalf("revoked observation receipt was not recoverable: items=%+v found=%v err=%v",
 			recovered, found, err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`DELETE FROM content_items WHERE id=$1`, contentID); err != nil {
+		t.Fatalf("delete delivered Tool content: %v", err)
+	}
+	var tombstonedContentID *int64
+	var tombstonedInvocation string
+	if err := st.pool.QueryRow(ctx,
+		`SELECT content_item_id,invocation_digest
+		   FROM deliveries WHERE id=$1`,
+		deliveryID).Scan(
+		&tombstonedContentID, &tombstonedInvocation,
+	); err != nil || tombstonedContentID != nil ||
+		tombstonedInvocation != invocationDigest {
+		t.Fatalf("Tool delivery tombstone: content=%v invocation=%q err=%v",
+			tombstonedContentID, tombstonedInvocation, err)
 	}
 }
 

@@ -181,6 +181,23 @@ func canonicalBriefPushRecoveryAdmittedV1(
 	tx pgx.Tx,
 	effect *pusheffect.Effect,
 ) (bool, error) {
+	var referenceSchema string
+	if err := tx.QueryRow(ctx, `
+		SELECT reference_schema_version
+		  FROM task_run_snapshots
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3
+		   AND task_id=$4 AND temporal_run_id=$5`,
+		effect.RunSnapshotID, effect.TenantID, effect.UserID,
+		effect.TaskID, effect.RunID,
+	).Scan(&referenceSchema); err != nil {
+		return false, pushEffectDatabaseError(
+			"load canonical recovery snapshot schema", err)
+	}
+	if referenceSchema == types.RunSnapshotSchemaVersionV2 {
+		// Tool V2 does not produce a canonical Brief. Its exact delivery set is
+		// frozen by Tool provenance plus the durable effect itself.
+		return true, nil
+	}
 	var available bool
 	if err := tx.QueryRow(ctx, `
 		SELECT to_regprocedure(
@@ -243,20 +260,36 @@ func validatePushEffectRunSnapshotForClaim(
 		return pushEffectIntegrity()
 	}
 	snapshot.Mode = mode
-	ref, err := snapshot.safeRef()
-	if err != nil ||
-		ref.SnapshotID != effect.RunSnapshotID ||
-		ref.TenantID != effect.TenantID ||
-		ref.UserID != effect.UserID ||
-		ref.TaskID != effect.TaskID ||
-		ref.TemporalRunID != effect.RunID {
-		return pushEffectIntegrity()
+	var temporalWorkflowID string
+	switch snapshot.ReferenceSchemaVersion {
+	case types.RunSnapshotSchemaVersionV2:
+		ref, err := snapshot.safeRefV2()
+		if err != nil ||
+			ref.SnapshotID != effect.RunSnapshotID ||
+			ref.TenantID != effect.TenantID ||
+			ref.UserID != effect.UserID ||
+			ref.TaskID != effect.TaskID ||
+			ref.TemporalRunID != effect.RunID {
+			return pushEffectIntegrity()
+		}
+		temporalWorkflowID = ref.TemporalWorkflowID
+	default:
+		ref, err := snapshot.safeRef()
+		if err != nil ||
+			ref.SnapshotID != effect.RunSnapshotID ||
+			ref.TenantID != effect.TenantID ||
+			ref.UserID != effect.UserID ||
+			ref.TaskID != effect.TaskID ||
+			ref.TemporalRunID != effect.RunID {
+			return pushEffectIntegrity()
+		}
+		temporalWorkflowID = ref.TemporalWorkflowID
 	}
-	if ref.TemporalWorkflowID == scheduledTaskWorkflowID(effect.TaskID) {
+	if temporalWorkflowID == scheduledTaskWorkflowID(effect.TaskID) {
 		return nil
 	}
 	if !validScheduledTaskWorkflowExecutionIDV1(
-		effect.TaskID, ref.TemporalWorkflowID,
+		effect.TaskID, temporalWorkflowID,
 	) {
 		return pushEffectIntegrity()
 	}

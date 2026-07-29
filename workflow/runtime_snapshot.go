@@ -91,6 +91,31 @@ type ToolInvocationReceiptV1 struct {
 	ContentCount      int    `json:"content_count"`
 }
 
+func (r ToolInvocationReceiptV1) ValidateFor(
+	invocationDigest string,
+) error {
+	if r.InvocationDigest != invocationDigest ||
+		len(r.InvocationDigest) != 64 ||
+		len(r.ObservationDigest) != 64 ||
+		r.ContentCount < 0 {
+		return types.NewAppError(types.CodeValidation,
+			"compiled Tool invocation receipt is invalid", nil)
+	}
+	if _, err := hex.DecodeString(r.InvocationDigest);
+		err != nil ||
+			r.InvocationDigest != strings.ToLower(r.InvocationDigest) {
+		return types.NewAppError(types.CodeValidation,
+			"compiled Tool invocation receipt digest is invalid", nil)
+	}
+	if decoded, err := hex.DecodeString(r.ObservationDigest);
+		err != nil || len(decoded) != 32 ||
+		r.ObservationDigest != strings.ToLower(r.ObservationDigest) {
+		return types.NewAppError(types.CodeValidation,
+			"compiled Tool observation receipt digest is invalid", nil)
+	}
+	return nil
+}
+
 func (r PrepareToolRunV2Result) Validate() error {
 	if !r.Authorized {
 		if r.Snapshot != (RunSnapshotRefV2{}) ||

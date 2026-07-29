@@ -82,10 +82,22 @@ func PushPipelineWorkflow(ctx workflow.Context, p PushParams) (retErr error) {
 			return types.NewAppError(types.CodeValidation,
 				"scheduled run execution mode must be compiled", nil)
 		}
-		if p.RuntimeVersion != "" && !IsCompiledRuntimeV1(p.RuntimeVersion) {
+		if p.RuntimeVersion != "" &&
+			!IsCompiledRuntimeV1(p.RuntimeVersion) &&
+			!IsCompiledToolRuntimeV2(p.RuntimeVersion) {
 			return types.NewAppError(types.CodeValidation,
 				"scheduled run runtime version is not supported", nil)
 		}
+	}
+
+	if p.RunKind == PushRunKindScheduled &&
+		p.ExecutionMode == types.ExecutionModeCompiled &&
+		IsCompiledToolRuntimeV2(p.RuntimeVersion) &&
+		workflow.GetVersion(
+			ctx, "compiled-tool-pipeline-v2",
+			workflow.DefaultVersion, 1,
+		) >= 1 {
+		return runCompiledToolPipelineV2(ctx, p, traceID, a)
 	}
 
 	// C1b: only trusted scheduled Actions with an explicit tenant enter the

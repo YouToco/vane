@@ -322,6 +322,8 @@ func run() error {
 	w.RegisterActivity(activities.ScoreToolCandidatesV2)
 	w.RegisterActivity(activities.SelectToolCandidatesV2)
 	w.RegisterActivity(activities.CardGenToolCandidatesV2)
+	w.RegisterActivity(activities.PushToolCardsV2)
+	w.RegisterActivity(activities.RecordEmptyToolRunV2)
 	w.RegisterActivity(activities.BeginRunOutcomeV1)
 	w.RegisterActivity(activities.FinalizeRunOutcomeV1)
 	w.RegisterActivity(activities.PrepareCanonicalBriefV1)
