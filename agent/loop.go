@@ -280,6 +280,12 @@ type Deps struct {
 	Model      string        // cfg.LLM.AgentModel
 	MaxTurns   int           // cfg.Agent.MaxTurns
 	SessionTTL time.Duration // cfg.Agent.SessionTTLMinutes
+	// IntentToolkitsEnabled switches model-visible static tools from the legacy
+	// full registry to the deterministic intent-routed first-request surface.
+	IntentToolkitsEnabled bool
+	// IntentToolkitsShadow computes the routed surface while preserving legacy
+	// exposure and records aggregate differences at turn completion.
+	IntentToolkitsShadow bool
 	// Endpoints TikHub 端点工具面（端点注册表契约 §3/§4）。nil = 未装配
 	// （key 缺失），agent 退化为纯静态工具面，行为与该特性上线前一致。
 	Endpoints *EndpointTools
@@ -362,22 +368,24 @@ type Confirm struct {
 // 可安全被多个 goroutine（并发消息）共享。
 type Loop struct {
 	// chatFn 是模型调用入口（契约 §7）：默认包一层 DoChat，测试注入假实现。
-	chatFn             func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
-	store              Store
-	profiles           ProfileReader
-	tools              map[string]ToolSpec // 按 Name 索引的受信白名单注册表（静态部分）
-	toolDefs           []llm.ToolDef       // 预构建的静态工具声明；动态端点声明按会话追加在其后
-	endpoints          *EndpointTools      // 动态端点工具面，nil = 未装配
-	toolCalls          *ToolCallRecorder
-	taskCreation       CreationController
-	taskDefinitionEdit DefinitionEditController
-	actionContinuation ActionContinuationController
-	actionProposal     ActionProposalController
-	sys                string // system prompt（含端点检索能力说明段，装配时定型）
-	renderProfile      bool   // 是否渲染 [用户画像] 段：默认飞书轨 true，自定义 prompt 的 A2A 轨 false
-	model              string
-	maxTurns           int
-	sessionTTL         time.Duration
+	chatFn                func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error)
+	store                 Store
+	profiles              ProfileReader
+	tools                 map[string]ToolSpec // 按 Name 索引的受信白名单注册表（静态部分）
+	toolDefs              []llm.ToolDef       // 预构建的静态工具声明；动态端点声明按会话追加在其后
+	endpoints             *EndpointTools      // 动态端点工具面，nil = 未装配
+	toolCalls             *ToolCallRecorder
+	taskCreation          CreationController
+	taskDefinitionEdit    DefinitionEditController
+	actionContinuation    ActionContinuationController
+	actionProposal        ActionProposalController
+	sys                   string // system prompt（含端点检索能力说明段，装配时定型）
+	renderProfile         bool   // 是否渲染 [用户画像] 段：默认飞书轨 true，自定义 prompt 的 A2A 轨 false
+	model                 string
+	maxTurns              int
+	sessionTTL            time.Duration
+	intentToolkitsEnabled bool
+	intentToolkitsShadow  bool
 
 	// userMu 按 userID 串行化 HandleMessage（审查 #并发盲覆盖）：feishu 对每条消息
 	// 起独立 goroutine，而 HandleMessage 是 load→append→save 的读改写；
@@ -483,6 +491,8 @@ func NewChecked(d Deps) (*Loop, error) {
 		model:                 d.Model,
 		maxTurns:              maxTurns,
 		sessionTTL:            ttl,
+		intentToolkitsEnabled: d.IntentToolkitsEnabled,
+		intentToolkitsShadow:  d.IntentToolkitsShadow,
 		sessionWriteAccepting: true,
 		contextShadowSlots:    make(chan struct{}, agentContextShadowConcurrency),
 	}
@@ -706,6 +716,8 @@ func (l *Loop) handleMessage(
 		activation:                 decodeActivation(sess.ActivatedTools),
 		ownerRequest:               ownerRequest,
 		intents:                    classifyOwnerIntents(ownerRequest),
+		intentToolkitsEnabled:      l.intentToolkitsEnabled,
+		intentToolkitsShadow:       l.intentToolkitsShadow,
 		successfulCalls:            make(map[string]struct{}),
 		failedCalls:                make(map[string]int),
 		directTaskCreation:         directTaskCreation,
@@ -794,11 +806,13 @@ func (l *Loop) RunOnce(ctx context.Context, userID int64, history []llm.ChatMess
 		traceID: turnID, userID: userID,
 	})
 	state := &toolRunState{
-		activation:      &activationState{},
-		ownerRequest:    text,
-		intents:         classifyOwnerIntents(text),
-		successfulCalls: make(map[string]struct{}),
-		failedCalls:     make(map[string]int),
+		activation:            &activationState{},
+		ownerRequest:          text,
+		intents:               classifyOwnerIntents(text),
+		intentToolkitsEnabled: l.intentToolkitsEnabled,
+		intentToolkitsShadow:  l.intentToolkitsShadow,
+		successfulCalls:       make(map[string]struct{}),
+		failedCalls:           make(map[string]int),
 	}
 
 	outcome, msgs, _, err := l.converse(ctx, userID, nil, msgs, "", state)
@@ -1269,16 +1283,47 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 			static = append(static, def)
 		}
 	}
-	if l.endpoints == nil || state == nil {
-		return static
+	var dyn []llm.ToolDef
+	if l.endpoints != nil && state != nil {
+		dyn = l.endpoints.Defs(state.activation)
 	}
-	dyn := l.endpoints.Defs(state.activation)
-	if len(dyn) == 0 {
-		return static
+	candidate := appendToolDefs(static, dyn)
+	if state == nil || state.intentToolkitsEnabled {
+		return candidate
 	}
-	out := make([]llm.ToolDef, 0, len(static)+len(dyn))
-	out = append(out, static...)
-	return append(out, dyn...)
+	legacy := appendToolDefs(l.toolDefs, dyn)
+	if state.intentToolkitsShadow && !state.intentToolkitsShadowSeen {
+		state.intentToolkitsShadowSeen = true
+		state.intentToolkitsLegacyCount = len(legacy)
+		state.intentToolkitsCandidateCount = len(candidate)
+		state.intentToolkitsRemoved = toolDefNamesMissingFrom(
+			legacy, candidate,
+		)
+	}
+	return legacy
+}
+
+func appendToolDefs(prefix, suffix []llm.ToolDef) []llm.ToolDef {
+	if len(suffix) == 0 {
+		return prefix
+	}
+	out := make([]llm.ToolDef, 0, len(prefix)+len(suffix))
+	out = append(out, prefix...)
+	return append(out, suffix...)
+}
+
+func toolDefNamesMissingFrom(all, subset []llm.ToolDef) []string {
+	visible := make(map[string]struct{}, len(subset))
+	for _, def := range subset {
+		visible[def.Name] = struct{}{}
+	}
+	missing := make([]string, 0, len(all)-len(subset))
+	for _, def := range all {
+		if _, ok := visible[def.Name]; !ok {
+			missing = append(missing, def.Name)
+		}
+	}
+	return missing
 }
 
 func projectDirectTaskCreationToolDef(def llm.ToolDef) (llm.ToolDef, bool) {
@@ -1873,9 +1918,9 @@ func (l *Loop) executeDirectTaskCreation(
 	return "任务创建操作已受理。", nil
 }
 
-// executeDirectTaskDefinitionEdit applies the same auto-authorization rule to
-// the frozen definition-edit saga. The Web/Feishu identity was already
-// authenticated before this function; the coordinator rechecks task ownership.
+// executeDirectTaskDefinitionEdit is retained for replay compatibility with
+// already-issued auto-authorized edits. Current production policy creates a
+// confirmation card instead. The coordinator always rechecks task ownership.
 func (l *Loop) executeDirectTaskDefinitionEdit(
 	ctx context.Context,
 	userID int64,
@@ -1967,6 +2012,11 @@ func observeAgentRunState(state *toolRunState) {
 		"candidate_tool_hit_rate", hitRate,
 		"grounding_failure_count", state.externalFollowupGroundingFailures,
 		"web_research_succeeded", state.webResearchSucceeded,
+		"intent_toolkits_enabled", state.intentToolkitsEnabled,
+		"intent_toolkits_shadow", state.intentToolkitsShadowSeen,
+		"legacy_tool_count", state.intentToolkitsLegacyCount,
+		"candidate_tool_count", state.intentToolkitsCandidateCount,
+		"shadow_removed_tools", state.intentToolkitsRemoved,
 	)
 }
 

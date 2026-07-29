@@ -1318,6 +1318,9 @@ func TestDefaults(t *testing.T) {
 		{"pipeline.executive_brief_web_canary_schedule_id", cfg.Pipeline.ExecutiveBriefWebCanaryScheduleID, ""},
 		{"pipeline.executive_brief_renderer_canary_schedule_id", cfg.Pipeline.ExecutiveBriefRendererCanaryScheduleID, ""},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 20},
+		{"agent.intent_toolkits_shadow_enabled", cfg.Agent.IntentToolkitsShadowEnabled, true},
+		{"agent.intent_toolkits_owner_canary", cfg.Agent.IntentToolkitsOwnerCanary, false},
+		{"agent.intent_toolkits_allow_all", cfg.Agent.IntentToolkitsAllowAll, false},
 		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 100000},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},
 		{"log.level", cfg.Log.Level, "info"},
@@ -1327,6 +1330,42 @@ func TestDefaults(t *testing.T) {
 			t.Errorf("%s = %v, 期望默认值 %v", c.name, c.got, c.want)
 		}
 	}
+}
+
+func TestLoadIntentToolkitsRollout(t *testing.T) {
+	t.Run("owner canary from environment", func(t *testing.T) {
+		clearVaneEnv(t)
+		t.Setenv("VANE_AGENT_INTENT_TOOLKITS_SHADOW_ENABLED", "false")
+		t.Setenv("VANE_AGENT_INTENT_TOOLKITS_OWNER_CANARY", "true")
+		cfg, err := Load(writeTempConfig(t, `
+db:
+  url: "postgres://test"
+`))
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Agent.IntentToolkitsShadowEnabled ||
+			!cfg.Agent.IntentToolkitsOwnerCanary ||
+			cfg.Agent.IntentToolkitsAllowAll {
+			t.Fatalf("rollout config = %+v", cfg.Agent)
+		}
+	})
+
+	t.Run("canary and allow all conflict", func(t *testing.T) {
+		clearVaneEnv(t)
+		_, err := Load(writeTempConfig(t, `
+db:
+  url: "postgres://test"
+agent:
+  intent_toolkits_owner_canary: true
+  intent_toolkits_allow_all: true
+`))
+		if err == nil || !strings.Contains(
+			err.Error(), "owner canary 与 allow_all 不能同时启用",
+		) {
+			t.Fatalf("Load() error = %v", err)
+		}
+	})
 }
 
 func TestLLMConfigAgentClientConfig(t *testing.T) {

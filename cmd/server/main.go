@@ -635,14 +635,19 @@ func run() error {
 		definitionEditToolController,
 	)
 	agentLoop, err := agent.NewChecked(agent.Deps{
-		Client:       agentLLMClient,
-		Recorder:     recorder,
-		Store:        st,
-		Profiles:     st,
-		Tools:        tools,
-		Model:        cfg.LLM.AgentModel,
-		MaxTurns:     cfg.Agent.MaxTurns,
-		SessionTTL:   time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
+		Client:     agentLLMClient,
+		Recorder:   recorder,
+		Store:      st,
+		Profiles:   st,
+		Tools:      tools,
+		Model:      cfg.LLM.AgentModel,
+		MaxTurns:   cfg.Agent.MaxTurns,
+		SessionTTL: time.Duration(cfg.Agent.SessionTTLMinutes) * time.Minute,
+		IntentToolkitsEnabled: cfg.Agent.IntentToolkitsOwnerCanary ||
+			cfg.Agent.IntentToolkitsAllowAll,
+		IntentToolkitsShadow: cfg.Agent.IntentToolkitsShadowEnabled &&
+			!cfg.Agent.IntentToolkitsOwnerCanary &&
+			!cfg.Agent.IntentToolkitsAllowAll,
 		Endpoints:    endpoints,
 		ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用记账（契约 §6，全量工具）
 		TaskCreation: creationCoordinator,
@@ -1060,13 +1065,16 @@ func run() error {
 			)
 		}
 		a2aLoop, loopErr := agent.NewChecked(agent.Deps{
-			Client:       agentLLMClient,
-			Recorder:     recorder,
-			Tools:        a2aTools,
-			Model:        cfg.LLM.AgentModel,
-			MaxTurns:     cfg.Agent.MaxTurns,
-			SystemPrompt: a2a.ChatSystemPrompt,
-			ToolCalls:    agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
+			Client:                agentLLMClient,
+			Recorder:              recorder,
+			Tools:                 a2aTools,
+			Model:                 cfg.LLM.AgentModel,
+			MaxTurns:              cfg.Agent.MaxTurns,
+			SystemPrompt:          a2a.ChatSystemPrompt,
+			IntentToolkitsEnabled: cfg.Agent.IntentToolkitsAllowAll,
+			IntentToolkitsShadow: cfg.Agent.IntentToolkitsShadowEnabled &&
+				!cfg.Agent.IntentToolkitsAllowAll,
+			ToolCalls: agent.NewToolCallRecorder(st), // 工具调用同样记账（契约 §6）
 		})
 		if loopErr != nil {
 			actionDispatcherErr := stopActionDispatcher()

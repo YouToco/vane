@@ -1,6 +1,6 @@
 // TikHub 端点注册表的 agent 工具面（端点注册表契约 §3/§4/§7）：
 //
-//   - search_endpoints 检索元工具：在 tikhubcatalog（1002 端点）上 BM25 检索，
+//   - search_endpoints 检索元工具：在 tikhubcatalog 的 Agent 安全子目录上 BM25 检索，
 //     命中的端点**激活**进会话（动态注入为一等 FC 工具，业内 Tool Search /
 //     retrieve-then-inject 模式，Boss 拍板 2026-07-18 选注入而非通用转发）。
 //   - endpointTool 动态端点工具：按 catalog Entry 即时构造，参数 schema 从注册表
@@ -12,8 +12,8 @@
 //   - 白名单语义（M4 契约 §10）扩展为「静态工具 ∪ 会话已激活端点」：模型编造的
 //     端点名（哪怕真在注册表里）只要没被本会话 search_endpoints 激活过，一律拒绝——
 //     激活集是显式审计过的调用面，跳过检索直呼端点名是绕过检索留痕的旁门。
-//   - 免确认的代价用双重限额兜底（契约 §7）：单条消息 EndpointMsgCap 次 +
-//     滚动 24h EndpointDailyCap 次，超限回文案让模型向用户解释，绝不静默熔断。
+//   - 免确认的调用受滚动 24h EndpointDailyCap 与 Agent 统一单消息隐藏熔断器保护；
+//     EndpointMsgCap 只保留历史配置兼容，不参与日常规划。
 package agent
 
 import (
@@ -83,6 +83,15 @@ type toolRunState struct {
 	// intent routing or direct-write authorization.
 	ownerRequest string
 	intents      ToolIntent
+	// Intent toolkit rollout is fixed by the locally assembled Loop, never by
+	// model or external content. Shadow records aggregate exposure differences
+	// while returning the legacy registry unchanged.
+	intentToolkitsEnabled        bool
+	intentToolkitsShadow         bool
+	intentToolkitsShadowSeen     bool
+	intentToolkitsLegacyCount    int
+	intentToolkitsCandidateCount int
+	intentToolkitsRemoved        []string
 	// Unified loop breaker state. Provider-specific message caps are not used
 	// for planning; this hidden ceiling only stops repeated or runaway calls.
 	toolExecutions     int
@@ -100,7 +109,7 @@ type toolRunState struct {
 	groundedBrief bool
 	// directTaskCreation 表示用户已经明确要求按当前消息直接创建任务，
 	// 且没有要求先查询/核对。该模式只缩小当前消息的工具面到 create_schedule；
-	// durable proposal 会由 Agent 自动授权并立即推进，不经过确认卡。
+	// durable proposal 成功后返回一张确认卡，由用户点击推进。
 	directTaskCreation bool
 	// directTaskCreationToolRejected 记录模型在缩面后仍幻觉调用了其他工具。
 	// 下一轮会丢弃这段未执行的原生 tool protocol，只保留进入本消息时的
@@ -633,7 +642,7 @@ func (t *searchEndpointsTool) Execute(ctx context.Context, _ int64, args json.Ra
 }
 
 // ============================================================
-// endpointTool：动态注入的端点工具（按次计费面，双重限额）
+// endpointTool：动态注入的端点工具（按次计费面 + daily/统一熔断护栏）
 // ============================================================
 
 type endpointTool struct {

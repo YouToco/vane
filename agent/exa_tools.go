@@ -5,8 +5,8 @@
 // 信源再抓——一次性需求被迫走订阅设施（信源成了"固定点"）。两个工具把 Exa /search
 // 与 /contents 接成即时能力：**不建信源、不写内容库、结果只回给当前对话**。
 //
-// 成本纪律（双重限额，端点工具同模板——按次计费 + 免确认就必须有频率护栏）：
-//   - 单条消息上限（ExaMsgCap，默认 5）：消息内计数，超限回文案；
+// 成本纪律：
+//   - 单条消息统一由 Agent 20 次隐藏熔断器保护；ExaMsgCap 仅兼容旧配置；
 //   - 滚动 24h 上限（ExaDailyCap，默认 100）：从 tool_calls 表 COUNT（排除
 //     invalid_args/budget_exceeded——没打上游的拒绝不把限额越顶越死），
 //     判定失败 fail-closed 拒绝（护栏失效即放开计费面，宁可少查）；
@@ -194,7 +194,7 @@ type webSearchArgs struct {
 }
 
 func (t *webSearchTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
-	// 限额判定先于一切上游动作（双重限额，见文件头成本纪律）。
+	// Daily 限额判定先于一切上游动作（见文件头成本纪律）。
 	if msg := t.et.checkBudget(ctx); msg != "" {
 		return msg, nil
 	}
@@ -351,7 +351,7 @@ type readPageArgs struct {
 }
 
 func (t *readPageTool) Execute(ctx context.Context, userID int64, args json.RawMessage) (string, error) {
-	// 限额判定先于一切上游动作（双重限额，见文件头成本纪律）。
+	// Daily 限额判定先于一切上游动作（见文件头成本纪律）。
 	if msg := t.et.checkBudget(ctx); msg != "" {
 		return msg, nil
 	}

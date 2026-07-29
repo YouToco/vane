@@ -189,28 +189,35 @@ type PipelineConfig struct {
 // AgentConfig 是 agent loop 运行约束配置。
 type AgentConfig struct {
 	MaxTurns int `mapstructure:"max_turns"`
+	// IntentToolkitsShadowEnabled computes the intent-routed first-request
+	// toolset without changing model-visible tools and records only aggregate
+	// old/new exposure differences. It is the default rollout stage.
+	IntentToolkitsShadowEnabled bool `mapstructure:"intent_toolkits_shadow_enabled"`
+	// IntentToolkitsOwnerCanary enables intent-routed tool exposure only for the
+	// production Feishu owner loop. A2A remains on the legacy exposure surface.
+	IntentToolkitsOwnerCanary bool `mapstructure:"intent_toolkits_owner_canary"`
+	// IntentToolkitsAllowAll enables intent-routed exposure for every locally
+	// assembled Agent loop. It is mutually exclusive with the owner canary.
+	IntentToolkitsAllowAll bool `mapstructure:"intent_toolkits_allow_all"`
 	// DefinitionEditEnabled exposes the single C2b3-2d Agent/controller path.
 	// It is false by default until the real-card Gate and receipt dispatcher
 	// are completed; false omits the tool and controller from Agent entirely.
 	DefinitionEditEnabled bool `mapstructure:"definition_edit_enabled"`
 	// TokenBudgetDaily 预留、**当前未接线**：无任何代码按它拦截、也不递增 profiles 表的
-	// tokens_used_today（那三列恒为建表默认值）。agent 现有的按次护栏是 MaxTurns 与
-	// EndpointMsgCap/EndpointDailyCap（后两者是活的、从 tool_calls 表 COUNT 强制）。
-	// 别把这个键当作可调旋钮——设了不生效。
+	// tokens_used_today（那三列恒为建表默认值）。别把这个键当作可调旋钮——
+	// 设了不生效。实际单消息边界是 MaxTurns 与 Agent 统一 20 次工具熔断；
+	// provider daily cap 仍从 tool_calls 强制。
 	TokenBudgetDaily int `mapstructure:"token_budget_daily"`
 	// SessionTTLMinutes 是会话闲置过期窗口（分钟）：同一 owner 在窗口内的
 	// 消息共享一个多轮会话（上下文连续），超时后新开会话（契约 §0）。
 	SessionTTLMinutes int `mapstructure:"session_ttl_minutes"`
-	// TikHub 端点调用护栏（端点注册表契约 §7，Boss 拍板 2026-07-17：免确认 + 双重限额）。
-	// EndpointMsgCap 单条用户消息内的端点调用上限（一条消息最多 20 模型轮，不设限
-	// 一轮循环就能烧几十次按次计费调用）；EndpointDailyCap 滚动 24h 窗口的调用总量
-	// 上限（从 tool_calls 表 COUNT，含失败调用——失败同样计费）。
+	// 社媒端点调用护栏。EndpointMsgCap 仅保留配置兼容，不再作为 provider
+	// 规划上限；单消息统一由 Agent 20 次隐藏熔断器保护。EndpointDailyCap 是
+	// 滚动 24h 总量上限（从 tool_calls 表 COUNT，含失败调用）。
 	EndpointMsgCap   int `mapstructure:"endpoint_msg_cap"`
 	EndpointDailyCap int `mapstructure:"endpoint_daily_cap"`
-	// Exa ad-hoc 工具护栏（web_search/read_page，2026-07-20 对抗审查 HIGH 补齐）：
-	// 与端点工具同模板的双重限额——按次计费 + 免确认就必须有频率护栏，否则模型
-	// 一轮并行 N 个调用或注入诱导就能把 Exa 账单烧穿。ExaMsgCap 单条消息上限
-	// （默认 5）；ExaDailyCap 滚动 24h 上限（默认 100，从 tool_calls 表 COUNT）。
+	// 网页研究工具护栏。ExaMsgCap 同样只为历史配置兼容保留；统一熔断器负责
+	// 单消息边界。ExaDailyCap 是滚动 24h 上限（从 tool_calls 表 COUNT）。
 	ExaMsgCap   int `mapstructure:"exa_msg_cap"`
 	ExaDailyCap int `mapstructure:"exa_daily_cap"`
 }
@@ -379,6 +386,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("pipeline.push_effect_recovery_canary_schedule_id", "")
 
 	v.SetDefault("agent.max_turns", 20)
+	v.SetDefault("agent.intent_toolkits_shadow_enabled", true)
+	v.SetDefault("agent.intent_toolkits_owner_canary", false)
+	v.SetDefault("agent.intent_toolkits_allow_all", false)
 	v.SetDefault("agent.definition_edit_enabled", false)
 	v.SetDefault("agent.token_budget_daily", 100000)
 	v.SetDefault("agent.session_ttl_minutes", 30)
@@ -861,6 +871,12 @@ func (c *Config) Validate() error {
 	}
 	if _, err := c.LLM.AgentClientConfig(); err != nil {
 		return err
+	}
+	if c.Agent.IntentToolkitsOwnerCanary &&
+		c.Agent.IntentToolkitsAllowAll {
+		return errors.New(
+			"config: agent intent toolkits owner canary 与 allow_all 不能同时启用",
+		)
 	}
 	if c.LLM.CompiledEndpointGeneration == 0 {
 		c.LLM.CompiledEndpointGeneration = 1

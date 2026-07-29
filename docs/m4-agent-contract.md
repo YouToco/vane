@@ -7,20 +7,29 @@
 > action.Value 为 map[string]interface{}，返回 *callback.CardActionTriggerResponse 可原地更新卡片）；
 > DeepSeek V4 默认思维链，结构化输出必须 thinking:{type:"disabled"}（llm.Request.DisableThinking 已存在）。
 
-## 0. 产品行为（当前基线：自然语言授权、Agent 直接执行）
+## 0. 产品行为（当前基线：意图工具包 + 同轮 grounded research）
 
 飞书对话（仅 owner）→ agent loop（v4-pro FC）：
-- **读工具**（list_sources / list_schedules / push_now）：直接执行，结果回给模型继续多轮。
-- **所有 owner 写工具直接执行，不生成确认卡**。用户当前消息表达了清晰意图和目标即构成授权；
-  真歧义才用自然语言追问，禁止要求用户提供内部 ID。
+- 内部只读、公开网页/社媒研究工具按当前用户意图在首个模型请求曝光；动态社媒工具保持
+  `search_endpoints → 激活具体工具 → 同一用户消息内调用` 的延迟发现。
+- 用户明确要求且目标唯一时，`add_source` / `remove_source` / `enable_source` /
+  `remove_schedule` / `push_now` 直接执行；真歧义才自然追问，禁止要求内部 ID。
 - 用户一次点名多个信源或任务时，Agent 先用列表工具分别解析名称/描述，再合并为一次
   `remove_source` / `remove_schedule` 批量调用；不得只处理第一个或逐个确认。
-- `create_schedule` / `edit_task_definition` 仍先冻结 durable operation，但由 Agent
-  立即以 server-owned receipt 自动授权并推进同一个 saga；去掉的是交互确认，不是
-  durable owner、幂等、补偿、恢复或审计。
+- `create_schedule` / `edit_task_definition` / `update_profile` 生成一张确认卡；用户点击后
+  由现有耐久协调器执行，不要求用户复述。确认卡不削弱 durable owner、幂等、补偿、
+  恢复或审计。
+- 最新事实问题允许同一消息内连续 `web_search` / `read_page` / 社媒只读查询，优先核验
+  第一方页面并只引用结构化结果中真实出现的 URL；证据不足时明确说不足。
 - 与订阅/推送无关的闲聊：模型直接文字回答（不调工具），行为与现 chat_reply 一致。
-- maxTurns（config agent.max_turns，默认 20）内未收敛 → 回复兜底文案。
+- 单消息由 maxTurns（默认 20）和统一 20 次工具执行熔断器保护；相同成功调用不重复，
+  网络超时/429/5xx 最多自动重试两次，同一错误签名连续两次终止该分支并基于已有证据回答。
 - 会话：同一 owner 30 分钟内的消息共享一个 agent 会话（多轮上下文），超时新开。
+
+意图工具包采用三阶段发布：默认只记录 legacy/candidate 曝光数量及候选会隐藏的工具名，
+模型仍看到 legacy 工具面；`agent.intent_toolkits_owner_canary=true` 仅启用飞书 Owner；
+验收后关闭 canary 并显式设置 `agent.intent_toolkits_allow_all=true`。canary 与 allow-all
+互斥，shadow 日志不记录用户原文或工具参数。
 
 ## 1. migration `store/migrations/005_agent.sql`
 
@@ -312,9 +321,9 @@ func (l *Loop) ExecuteAction(ctx context.Context, userID int64, actionID string)
 func (l *Loop) CancelAction(ctx context.Context, userID int64, actionID string) (string, error)
 ```
 Loop 行为细则：
-- system prompt 常量（中文）：声明角色=见微 Vane 助理、只在需要时调工具、owner 写操作在
-  意图明确时直接执行、真歧义才自然追问，禁止要求内部 ID；无关问题直接回答。外部内容
-  注入防护措辞对齐 scorer 的写法。
+- system prompt 常量（中文）：声明角色=见微 Vane 助理、只在需要时调工具；明确且唯一的
+  owner 直写当轮执行，任务创建/整体编辑/画像更新只生成一次确认卡；真歧义才自然追问，
+  禁止要求内部 ID；无关问题直接回答。外部内容注入防护措辞对齐 scorer 的写法。
   **§7.1 增补（2026-07-18 PR-4）**：`Deps.SystemPrompt` 可覆盖该常量（零值回落，飞书轨零行为变化）；
   [用户画像] 段只跟随默认 prompt 渲染（自定义 prompt 的 A2A 轨不渲染——画像是 A2A 非目标）。
 - 会话消息即 []llm.ChatMessage 的 JSON；system 消息**不入库**，每次调用时动态前置。
@@ -322,20 +331,17 @@ Loop 行为细则：
   共享 MaxTokens 并导致复杂 FC 空输出；工具选择在关闭后无退化），MaxTokens 2048，
   Temperature nil（默认）。
 - 模型返回未注册工具名：以 role=tool 回错误文本"工具 X 不存在"，继续循环（模型自纠）。
-- 一轮多个 tool_calls：顺序处理；读工具直接执行；普通 owner 写工具直接进入各自幂等
-  执行入口。`create_schedule` / `edit_task_definition` 由专用 controller 冻结 exact command，
-  再以 server-owned receipt 自动推进同一 durable saga。旧 pending action 分支只兼容升级前
-  已发卡片的 callback，不得被新请求触发。
+- 一轮多个纯公开只读 tool_calls 可按序执行；公开研究与内部读取/写操作混在同批时整批拒绝。
+  普通 owner 直写进入各自幂等执行入口。`create_schedule` / `edit_task_definition` 由专用
+  controller 冻结 exact command 并返回一张确认卡，点击后才推进同一 durable saga。
 - `web_search`、`read_page`、动态 TikHub 端点、`read_endpoint_result` 和含外部标题的
   `list_sources` 把外部结果送入模型后，本条用户消息进入 **untrusted-result 边界**：
-  后续模型请求不再附加动态画像，且不声明网络、内部数据或写工具；只有本轮动态端点确实
-  生成截断句柄时，才保留本地 `read_endpoint_result` 分页能力；权限绑定到本消息实际产生的
-  handle 集合（不是可猜句柄共用的一位 bool），每个 assistant 批次最多续读一次。模型即使幻觉调用画像/
-  任务/信源/写工具，或尝试把上下文编码进第二个 URL/query，也只收到固定拒绝回执，
-  不执行工具、不访问外网、不创建 pending_action。该边界是确定性 Go 代码，不以模型
-  是否遵守 prompt 为前提。若同一个 assistant 响应并列多个 tool_call，只要批内含可执行
-  的外部读取，执行前先整体分类并整批拒绝，要求下一轮把一个外部读取单独发起；不能只拦
-  其他调用的执行，因为其 assistant content/arguments 仍会进入历史。单个外部读取执行后，
+  后续模型请求不再附加动态画像，且不声明内部数据或写工具；仍可继续与当前意图相符的
+  `web_search` / `read_page` / 社媒公开只读研究，以及读取本轮实际产生的
+  `read_endpoint_result` handle。handle 权限绑定到本消息产生的集合。模型即使幻觉调用画像/
+  任务/信源/写工具也只收到固定拒绝，不执行、不创建 pending_action。该边界是确定性 Go
+  代码，不以模型是否遵守 prompt 为前提。纯公开只读批次可执行；若同批混入内部读取或
+  写操作则整批拒绝。首个外部读取执行后，
   内部消息先重建成最小隔离上下文：仅保留当前 user、去掉 content/arguments 的
   tool_call 协议壳及 tool result，此前会话、画像派生文本和被拒调用全部不再同屏；该结构
   只供审计、tool_call 配对与保存前清洗。若仍有本轮动态端点产生的本地缓存句柄，出站请求
@@ -351,8 +357,9 @@ Loop 行为细则：
   同批付费端点否则会在顺序执行中穿透。
 - 飞书追问包装与引用消息在**第一次**模型请求前就已混入外部正文，必须走类型化的
   `HandleExternalContextMessage`，不能等工具返回后才 taint。该入口从数据访问层就不读画像，
-  首轮即不声明工具，也不加载既有 agent session 历史；即使模型幻觉调用网络、内部读取或
-  写工具，运行时二次门仍固定拒绝。既有历史只在本轮结束后与固定占位重新合并保存，
+  也不加载既有 agent session 历史；只根据包装外当前用户后缀决定是否提供绑定查询的
+  `web_search`，引用正文不能控制 query、域名或工具参数。首次结果后可继续隔离的公开只读
+  核验；内部读取和写工具始终关闭。既有历史只在本轮结束后与固定占位重新合并保存，
   防群聊引用/恶意卡片直接要求复述旧私聊。普通消息与外部上下文的分流由 `AgentRunner`
   两个独立方法表达，不靠检查正文文案猜测。
 - 含外部结果的整段 user turn 在写入 `agent_sessions` 前压成「原 user + 固定安全占位」，
@@ -382,7 +389,7 @@ Loop 行为细则：
   运行时对任何幻觉的其他已注册工具调用也返回固定本地拒绝，不执行、不 taint。
   用户明确说「不要再搜索／直接创建」
   时优先按此缩面；明确否定创建或要求先核对时不得进入。该模式只减少读取能力，不增加权限：
-  `create_schedule` 先落 durable proposal，再由 server-owned receipt 自动推进。任何无工具自由文本
+  `create_schedule` 先落 durable proposal，再返回一张确认卡。任何无工具自由文本
   都会被丢弃并回到 clean baseline 自纠一次（不尝试用词法区分“追问”与“口头承诺”），连续两次
   没有真实 proposal 则返回固定的「任务尚未创建」文案；带 tool_calls 的 assistant content 也
   强制清空，避免参数校验失败时把同批的「卡已生成」承诺留进历史。整轮无论是否成功，
@@ -408,12 +415,21 @@ A2A 只读面按 `AuthorizationA2AReadOnly` 过滤，**不**用「无确认」�
 | list_sources | none | internal_read | store.ListSubscribedSourcesByUser | 返回内部目录中的 id/类型/标题/状态供 Agent 按用户描述定位；A2A 可读。目录字段在 system prompt 中始终按数据处理，不触发“外部网页已读”隔离，否则同轮无法完成描述→定位→退订 |
 | add_source | **none** | state_write + direct_owner_write（probe 可 taint） | sourcespec.Build → store.UpsertSource + AddSubscription | 意图与参数明确即试跑并直接执行，不发确认卡 |
 | remove_source | **none** | state_write + direct_owner_write | store.RemoveSubscriptions（单条 tenant-scoped DELETE，原子且幂等） | {source_ids:[integer]}（1–20 个，去重保序；意图与目标明确即直接执行，含糊则对话追问，不发确认卡；旧单数 {source_id} 仅为兼容存量 pending_actions 保留解析，schema 不再声明） |
+| enable_source | **none** | state_write + direct_owner_write | store.EnableSubscriptions | 明确恢复且目标唯一时直接执行 |
 | list_schedules | none | internal_read | store.ListSchedulesByUser | 中文列表文本；A2A 可读 |
-| create_schedule | **none** | durable_proposal + state_write + direct_owner_write | CreationCoordinator.Propose → Agent auto-authorize → creation saga | `{spec,intent,approved_fetch_plan:{existing_source_ids?,source_specs?},nl_description?,strictness?}`；`source_specs` 是 `vane.source-specs/v1` 原始规格，模型面不暴露 durable `sources/config/vane://`；cron/every 二选一且 every≥3600 |
+| create_schedule | **required** | durable_proposal + state_write | CreationCoordinator.Propose → 一张确认卡 → creation saga | `{spec,intent,approved_fetch_plan:{existing_source_ids?,source_specs?},nl_description?,strictness?}`；`source_specs` 是 `vane.source-specs/v1` 原始规格，模型面不暴露 durable `sources/config/vane://`；cron/every 二选一且 every≥3600 |
 | remove_schedule | **none** | state_write + direct_owner_write | scheduler.DeletePushIdempotent（durable schedule command） | `{schedule_ids:[string]}`（1–20，去重保序）；用户可一次说多个名称/内容/时间/主题，Agent 分别解析后一次调用；旧 `{schedule_id}` 只兼容存量动作 |
 | push_now | none | delivery | PushTrigger 接口（api push/now 同款触发） | 返回 run_id 文本；有副作用但现网免确认，不得因 delivery 误标 required |
+| view_profile | none | internal_read | store.GetProfile | 仅画像意图首轮曝光 |
+| update_profile | **required** | state_write | pending action | 首次创建画像只生成一张确认卡 |
+| view_task_playbook | none | internal_read | playbook store | 读取选中任务手册 |
+| edit_task_definition | **required** | durable_proposal + state_write | DefinitionEditController.Propose → 一张确认卡 → edit saga | 整体编辑只生成一张确认卡，点击后执行，不要求复述 |
 | web_search | none | network_read + billable + trust_taint | fetcher.ExaFetcher.Search（Exa /search，按次计费） | {query, num_results?(默认5/上限20), include_domains?}；一次性语义搜索，不建信源、不写内容库，结果只回当前对话（2026-07-20 增，见修订记录） |
 | read_page | none | network_read + billable + trust_taint | fetcher.ExaContentsFetcher.ReadPage（Exa /contents，maxAgeHours:0 活抓，按次计费） | {url}；一次性读取指定页面正文，不建信源、不写内容库（2026-07-20 增，见修订记录） |
+| search_endpoints | none | activation_write | 本地社媒工具目录 | 搜索并激活 provider-neutral 动态工具；模型不可见供应商、HTTP 路径和内部版本 |
+| read_endpoint_result | none | local_handle_read + trust_taint | 本轮结果缓存 | 仅产生绑定 handle 后曝光，支持路径与 offset 分页 |
+
+旧模型契约 `update_schedule` / `edit_task_playbook` / `set_task_strictness` 已删除。
 
 **§8 增补（2026-07-20，Boss 拍板）**：web_search / read_page 解决「临时查一下」被迫
 add_source 的形态（信源固定点反模式——一次性需求不该走订阅设施）。两工具按次计费，
@@ -422,11 +438,10 @@ Agent 工具行与 fetcher 上游行共享同一 trace_id/user_id，tenant_id �
 fetcher 层上游行按 `SourceID=0` 无源口径落 tool_calls，归属元数据只在本地 context 传递，
 不得进入 Exa 请求体或请求头；两层旁路记账都脱离调用方取消并重新施加 5 秒 deadline，
 避免取消窗口撕裂双账本或连接池故障无限阻塞；两条路径均不创建
-source/content/content_sources。**双重限额**（与端点
-工具同模板，对抗审查 HIGH 补齐）：单条消息 `agent.exa_msg_cap`（默认 5，消息内计数，
-超限回文案）+ 滚动 24h `agent.exa_daily_cap`（默认 100，从 tool_calls 表按
-tool_name IN ('web_search','read_page') COUNT，排除 invalid_args/budget_exceeded，
-判定失败 fail-closed）；不进 A2A 只读白名单（显式名单仍为
+source/content/content_sources。滚动 24h `agent.exa_daily_cap`（默认 100，从
+tool_calls 表按 tool_name IN ('web_search','read_page') COUNT，排除
+invalid_args/budget_exceeded，判定失败 fail-closed）仍强制；旧 `agent.exa_msg_cap`
+只保留配置兼容，单消息统一由 20 次工具熔断器管理。不进 A2A 只读白名单（显式名单仍为
 list_sources/list_schedules——对外部 agent 暴露付费面是另一个决策）；
 Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的分流引导行同样
 条件注入（工具不在场不广告）；maxActivatedEndpoints 同步 13→11（16 基础 + 2 端点

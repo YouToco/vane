@@ -63,8 +63,9 @@ func TestIntentToolkitsNarrowFirstRequest(t *testing.T) {
 		nil, nil, nil, nil, nil, nil, exa,
 	)})
 	state := &toolRunState{
-		ownerRequest: "GPT-Live 是否已提供 API 定价？",
-		intents:      classifyOwnerIntents("GPT-Live 是否已提供 API 定价？"),
+		ownerRequest:          "GPT-Live 是否已提供 API 定价？",
+		intents:               classifyOwnerIntents("GPT-Live 是否已提供 API 定价？"),
+		intentToolkitsEnabled: true,
 	}
 	defs := loop.requestTools(state)
 	got := make(map[string]bool, len(defs))
@@ -80,6 +81,63 @@ func TestIntentToolkitsNarrowFirstRequest(t *testing.T) {
 		if got[hidden] {
 			t.Errorf("unrelated tool %s was exposed", hidden)
 		}
+	}
+}
+
+func TestIntentToolkitsShadowPreservesLegacyExposure(t *testing.T) {
+	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)
+	loop := New(Deps{Tools: BuildTools(
+		nil, nil, nil, nil, nil, nil, exa,
+	)})
+	state := &toolRunState{
+		ownerRequest:         "GPT-Live 是否已提供 API 定价？",
+		intents:              classifyOwnerIntents("GPT-Live 是否已提供 API 定价？"),
+		intentToolkitsShadow: true,
+	}
+	defs := loop.requestTools(state)
+	got := make(map[string]bool, len(defs))
+	for _, def := range defs {
+		got[def.Name] = true
+	}
+	if !got["web_search"] || !got["read_page"] ||
+		!got["view_profile"] || !got["list_sources"] {
+		t.Fatalf("shadow must preserve legacy exposure: %v", got)
+	}
+	if !state.intentToolkitsShadowSeen ||
+		state.intentToolkitsLegacyCount != len(defs) ||
+		state.intentToolkitsCandidateCount >= state.intentToolkitsLegacyCount {
+		t.Fatalf("shadow diff not recorded: %+v", state)
+	}
+	if len(state.intentToolkitsRemoved) == 0 {
+		t.Fatal("shadow diff must identify tools hidden by the candidate surface")
+	}
+}
+
+func TestIntentToolkitsRolloutPropagatesIntoRunOnce(t *testing.T) {
+	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)
+	chat := &scriptedChat{responses: []*llm.ChatResponse{{
+		Content: "基于当前信息回答。",
+	}}}
+	loop := New(Deps{
+		Tools:                 BuildTools(nil, nil, nil, nil, nil, nil, exa),
+		IntentToolkitsEnabled: true,
+	})
+	loop.chatFn = chat.fn
+	if _, _, err := loop.RunOnce(
+		t.Context(), 7, nil, "GPT-Live 是否已提供 API 定价？",
+	); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if len(chat.requests) != 1 {
+		t.Fatalf("requests = %d, want 1", len(chat.requests))
+	}
+	got := make(map[string]bool, len(chat.requests[0].Tools))
+	for _, def := range chat.requests[0].Tools {
+		got[def.Name] = true
+	}
+	if !got["web_search"] || !got["read_page"] ||
+		got["view_profile"] || got["list_sources"] {
+		t.Fatalf("owner canary tool exposure = %v", got)
 	}
 }
 
