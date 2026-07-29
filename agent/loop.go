@@ -92,10 +92,13 @@ const naturalTaskDefinitionEditSystemNote = `
 - 若 list_schedules 后确有多个合理候选，只用人能看懂的任务名称做一次针对性追问。没有真实调用 edit_task_definition 就绝不能声称已修改。`
 
 const naturalTaskDefinitionEditLocateSystemNote = `
-- 现在先且只调用 list_schedules。不要猜任务 ID，不要调用编辑或其他工具。`
+- 现在先且只调用 list_schedules。query 必须复制当前用户消息中用于识别任务的一段连续原话，不能用“任务/日报/每周”等泛词，不能改写或补充。不要猜任务 ID，不要调用编辑或其他工具。`
 
 const naturalTaskDefinitionEditResolvedSystemNote = `
-- list_schedules 已完成。现在只允许调用 edit_task_definition；用唯一匹配任务的内部 ID 完成编辑，绝不能把 ID 交给用户处理。`
+- list_schedules 已唯一命中一个任务。现在只允许调用 edit_task_definition；task_id 必须使用该唯一命中，绝不能把 ID 交给用户处理。`
+
+const naturalTaskDefinitionEditAmbiguousSystemNote = `
+- list_schedules 没有唯一命中任务，因此当前没有任何写工具。请用列表中的可读名称做一次针对性追问；不得猜 ID 或声称已经修改。`
 
 const naturalTaskDefinitionEditRetrySystemNote = `
 - 系统刚拒绝了不属于“按名称定位后编辑任务”的工具调用；它没有执行。严格按当前阶段唯一声明的工具继续。`
@@ -1042,7 +1045,11 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		if state.naturalTaskDefinitionEdit {
 			system += naturalTaskDefinitionEditSystemNote
 			if state.naturalTaskDefinitionEditTaskListed {
-				system += naturalTaskDefinitionEditResolvedSystemNote
+				if state.naturalTaskDefinitionEditResolvedID != "" {
+					system += naturalTaskDefinitionEditResolvedSystemNote
+				} else {
+					system += naturalTaskDefinitionEditAmbiguousSystemNote
+				}
 			} else {
 				system += naturalTaskDefinitionEditLocateSystemNote
 			}
@@ -1341,7 +1348,9 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		}
 		if state.naturalTaskDefinitionEdit &&
 			state.naturalTaskDefinitionEditToolRejected {
-			msgs = append([]llm.ChatMessage(nil), directProposalBase...)
+			if !state.naturalTaskDefinitionEditTaskListed {
+				msgs = append([]llm.ChatMessage(nil), directProposalBase...)
+			}
 			state.naturalTaskDefinitionEditToolRejected = false
 			continue
 		}
@@ -1443,6 +1452,11 @@ func (l *Loop) requestTools(state *toolRunState) []llm.ToolDef {
 				return nil
 			}
 			return []llm.ToolDef{spec.Definition}
+		}
+		if state.naturalTaskDefinitionEditResolvedID == "" {
+			// Zero or multiple matches require a readable clarification. There
+			// is no write tool to hallucinate into while the target is ambiguous.
+			return nil
 		}
 		spec, ok := l.tools["edit_task_definition"]
 		if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
@@ -1623,15 +1637,72 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		if state.naturalTaskDefinitionEditTaskListed {
 			want = definitionEditToolName
 		}
+		if state.naturalTaskDefinitionEditTaskListed &&
+			state.naturalTaskDefinitionEditResolvedID == "" {
+			want = ""
+		}
 		if len(calls) != 1 || calls[0].Name != want {
 			state.naturalTaskDefinitionEditToolRejected = true
 			for _, rejected := range calls {
+				message := "任务目标仍有歧义，本次工具调用未执行；请按可读名称向用户追问。"
+				if want != "" {
+					message = "当前任务编辑阶段只允许调用 " + want +
+						"；本次其他调用未执行。"
+				}
 				out = append(out, toolMsg(
 					rejected.ID,
-					"当前任务编辑阶段只允许调用 "+want+"；本次其他调用未执行。",
+					message,
 				))
 			}
 			return out, nil
+		}
+		if want == "list_schedules" &&
+			!validNaturalEditScheduleQuery(
+				json.RawMessage(calls[0].Arguments),
+				state.ownerRequest,
+			) {
+			state.naturalTaskDefinitionEditFailures++
+			out = append(out, toolMsg(
+				calls[0].ID,
+				"query 必须是用户原话中连续、具体的任务名称或描述，不能使用泛词或改写。",
+			))
+			return out, nil
+		}
+		if want == "list_schedules" {
+			spec, ok := l.tools["list_schedules"]
+			if !ok || !spec.Policy.Effects.Has(EffectInternalRead) {
+				state.naturalTaskDefinitionEditToolRejected = true
+				out = append(out, toolMsg(
+					calls[0].ID,
+					"任务查询能力当前不可用；本次调用未执行。",
+				))
+				return out, nil
+			}
+		}
+		if want == definitionEditToolName {
+			spec, ok := l.tools[definitionEditToolName]
+			if !ok || !spec.Policy.Effects.Has(EffectDurableProposal) ||
+				!spec.Policy.Effects.Has(EffectDirectOwnerWrite) ||
+				l.taskDefinitionEdit == nil {
+				state.naturalTaskDefinitionEditToolRejected = true
+				out = append(out, toolMsg(
+					calls[0].ID,
+					"任务编辑能力当前不可用；本次调用未执行。",
+				))
+				return out, nil
+			}
+			if !directDefinitionEditTargetsTask(
+				json.RawMessage(calls[0].Arguments),
+				state.naturalTaskDefinitionEditResolvedID,
+			) {
+				state.naturalTaskDefinitionEditFailures++
+				state.naturalTaskDefinitionEditToolRejected = true
+				out = append(out, toolMsg(
+					calls[0].ID,
+					"edit_task_definition 的 task_id 与唯一命中任务不一致；本次调用未执行。",
+				))
+				return out, nil
+			}
 		}
 	}
 	if state != nil && state.directTaskCreation {
@@ -1786,6 +1857,12 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 		if state != nil && state.naturalTaskDefinitionEdit &&
 			tc.Name == "list_schedules" && err == nil {
 			state.naturalTaskDefinitionEditTaskListed = true
+			ids := taskIDsFromScheduleListResult(result)
+			if len(ids) == 1 {
+				state.naturalTaskDefinitionEditResolvedID = ids[0]
+			} else {
+				state.naturalTaskDefinitionEditResolvedID = ""
+			}
 			state.naturalTaskDefinitionEditResponseRejected = false
 		}
 		if state != nil &&
@@ -2156,13 +2233,15 @@ func isNaturalTaskDefinitionEditRequest(text string) bool {
 	}
 	if containsAny(normalized,
 		"不要修改", "别修改", "不要更新", "别更新", "取消修改",
+		"不要把", "别把", "不要将", "别将", "不许把", "禁止把",
+		"不需要把", "无需把", "不用把", "不是要把",
 		"暂不修改", "先不修改", "donotedit", "don'tedit", "canceledit",
 	) {
 		return false
 	}
 	if containsAny(normalized,
-		"?", "？", "吗", "为什么", "怎么", "如何", "能否", "能不能",
-		"是否", "可不可以", "howdo", "howcan", "canwe", "cani",
+		"为什么", "怎么修改", "怎么更新", "如何修改", "如何更新",
+		"什么是", "是否已经", "是否已", "why", "howdo", "howcan",
 	) {
 		return false
 	}
@@ -2171,10 +2250,70 @@ func isNaturalTaskDefinitionEditRequest(text string) bool {
 		"schedule", "task",
 	)
 	hasEdit := containsAny(normalized,
-		"修改", "更新为", "改为", "调整为", "换成", "改成", "编辑",
-		"updateto", "changeto", "edittask", "updateschedule",
+		"更新为", "改为", "调整为", "换成", "改成",
+		"updateto", "changeto",
 	)
 	return hasTaskTarget && hasEdit
+}
+
+func validNaturalEditScheduleQuery(raw json.RawMessage, ownerRequest string) bool {
+	var args struct {
+		Query string `json:"query"`
+	}
+	if strictjson.DecodeExact(raw, &args) != nil {
+		return false
+	}
+	query := normalizeScheduleLookupText(args.Query)
+	if len([]rune(query)) < 4 {
+		return false
+	}
+	switch query {
+	case "任务", "日报", "周报", "月报", "早报", "每周", "每天",
+		"推送", "task", "schedule":
+		return false
+	}
+	lookupScope := naturalEditLookupScope(ownerRequest)
+	if lookupScope == "" {
+		return false
+	}
+	return strings.Contains(
+		normalizeScheduleLookupText(lookupScope),
+		query,
+	)
+}
+
+func naturalEditLookupScope(ownerRequest string) string {
+	normalized := strings.ToLower(strings.Join(strings.Fields(ownerRequest), ""))
+	earliest := len(normalized)
+	for _, marker := range []string{
+		"更新为", "改为", "调整为", "换成", "改成",
+		"updateto", "changeto",
+	} {
+		if index := strings.Index(normalized, marker); index >= 0 &&
+			index < earliest {
+			earliest = index
+		}
+	}
+	if earliest == len(normalized) {
+		return ""
+	}
+	return normalized[:earliest]
+}
+
+func taskIDsFromScheduleListResult(result string) []string {
+	var ids []string
+	for _, line := range strings.Split(result, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "- id=") {
+			continue
+		}
+		id, _, _ := strings.Cut(strings.TrimPrefix(line, "- id="), " ")
+		id = strings.Trim(id, "；;，,")
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // claimsRetiredConfirmationCard 判定模型是否幻觉声称已发送下线的确认卡。

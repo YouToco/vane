@@ -19,6 +19,32 @@ type fakeTaskRunTrigger struct {
 	calls []string
 }
 
+func TestFilterSchedulesByQueryRequiresContiguousReadableMatch(t *testing.T) {
+	list := []types.Schedule{
+		{
+			ID:            "task-ai",
+			NLDescription: "每周一上午 9:00 推送 AI 官方重大更新",
+			SpecJSON:      json.RawMessage(`{"cron":"0 9 * * 1"}`),
+		},
+		{
+			ID:            "task-finance",
+			NLDescription: "每天推送财经日报",
+			SpecJSON:      json.RawMessage(`{"cron":"0 8 * * *"}`),
+		},
+	}
+	got := filterSchedulesByQuery(
+		list,
+		normalizeScheduleLookupText("每周一上午9:00推送AI官方重大更新"),
+	)
+	if len(got) != 1 || got[0].ID != "task-ai" {
+		t.Fatalf("matches=%+v, want task-ai only", got)
+	}
+	if len(list) != 2 || list[0].ID != "task-ai" ||
+		list[1].ID != "task-finance" {
+		t.Fatal("filter mutated the caller-owned schedule list")
+	}
+}
+
 func (f *fakeTaskRunTrigger) TriggerScheduleNowIdempotent(
 	_ context.Context,
 	scheduleID string,

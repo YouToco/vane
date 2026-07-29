@@ -148,6 +148,7 @@ type toolRunState struct {
 	// only edit_task_definition. The user never has to provide an internal ID.
 	naturalTaskDefinitionEdit                 bool
 	naturalTaskDefinitionEditTaskListed       bool
+	naturalTaskDefinitionEditResolvedID       string
 	naturalTaskDefinitionEditToolRejected     bool
 	naturalTaskDefinitionEditResponseRejected bool
 	naturalTaskDefinitionEditFailures         int

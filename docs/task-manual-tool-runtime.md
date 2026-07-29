@@ -33,6 +33,10 @@ definition edit. That lane exposes only `list_schedules` followed by
 `edit_task_definition`; a requirement that future runs open official pages does
 not authorize ad-hoc web research during the edit. The user is never asked for
 an internal task ID or to split one task/manual edit into smaller requests.
+The lookup phrase must be a specific contiguous phrase from the authenticated
+request, the lookup must resolve exactly one owned task, and the durable edit
+must target that exact resolved ID. Zero or multiple matches produce one
+readable clarification and expose no write tool.
 
 ## Current writer contract
 

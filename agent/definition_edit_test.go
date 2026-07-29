@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -104,8 +105,9 @@ func TestDirectTaskDefinitionEditPreservesTargetedClarification(t *testing.T) {
 func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 	fs := newFakeStore()
 	list := &fakeTool{
-		name:   "list_schedules",
-		result: "- id=task-edit-1; 名称=每周一上午9:00推送AI官方重大更新",
+		name:       "list_schedules",
+		parameters: json.RawMessage(listSchedulesSchema),
+		result:     "- id=task-edit-1 按 cron「0 9 * * 1」触发（状态: active，描述: 每周一上午9:00推送AI官方重大更新）",
 	}
 	controller := &fakeDefinitionEditController{
 		execute: task.TaskDefinitionEditOutcome{
@@ -118,7 +120,8 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 		{
 			FinishReason: "tool_calls",
 			ToolCalls: []llm.ToolCall{{
-				ID: "list-1", Name: "list_schedules", Arguments: `{}`,
+				ID: "list-1", Name: "list_schedules",
+				Arguments: `{"query":"每周一上午9:00推送AI官方重大更新"}`,
 			}},
 		},
 		{
@@ -197,6 +200,101 @@ func TestNaturalTaskDefinitionEditResolvesNameThenEditsOnce(t *testing.T) {
 	}
 }
 
+func TestNaturalTaskDefinitionEditAmbiguityExposesNoWriteTool(t *testing.T) {
+	fs := newFakeStore()
+	list := &fakeTool{
+		name:       "list_schedules",
+		parameters: json.RawMessage(listSchedulesSchema),
+		result: strings.Join([]string{
+			"共 2 个定时推送任务：",
+			"- id=task-ai-daily 按 cron「0 8 * * *」触发（状态: active，描述: AI更新日报）",
+			"- id=task-ai-weekly 按 cron「0 9 * * 1」触发（状态: active，描述: AI更新周报）",
+		}, "\n"),
+	}
+	controller := &fakeDefinitionEditController{
+		execute: task.TaskDefinitionEditOutcome{
+			Status: types.TaskDefinitionEditOperationStatusCompleted,
+			TaskID: "task-ai-weekly",
+		},
+	}
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{
+			FinishReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID: "list-ambiguous", Name: "list_schedules",
+				Arguments: `{"query":"AI更新"}`,
+			}},
+		},
+		{Content: "你要修改“AI更新日报”还是“AI更新周报”？"},
+		{
+			FinishReason: "tool_calls",
+			ToolCalls: []llm.ToolCall{{
+				ID:   "edit-followup",
+				Name: definitionEditToolName,
+				Arguments: `{
+					"task_id":"task-ai-weekly",
+					"intent":"每周一只推重大官方发布"
+				}`,
+			}},
+		},
+	}}
+	loop := New(Deps{
+		Store: fs,
+		Tools: []ToolSpec{
+			newToolSpec(list, ownerPolicy(
+				Effects(EffectInternalRead), BudgetNone)),
+			newToolSpec(&editTaskDefinitionTool{}, ownerPolicy(
+				Effects(
+					EffectDurableProposal,
+					EffectStateWrite,
+					EffectDirectOwnerWrite,
+				),
+				BudgetNone,
+			)),
+		},
+		TaskDefinitionEdit: controller,
+		Model:              "test-model",
+		MaxTurns:           20,
+		SessionTTL:         30 * time.Minute,
+	})
+	loop.chatFn = chat.fn
+
+	out, err := loop.HandleMessage(
+		t.Context(),
+		7,
+		"请把“AI更新”任务更新为每周一只推重大官方发布。",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply != "你要修改“AI更新日报”还是“AI更新周报”？" {
+		t.Fatalf("Reply=%q", out.Reply)
+	}
+	if len(chat.requests) != 2 || len(chat.requests[1].Tools) != 0 {
+		t.Fatalf("requests=%d second tools=%v, want no write tool",
+			len(chat.requests), toolDefNames(chat.requests[1].Tools))
+	}
+	if len(controller.proposeCalls) != 0 || len(controller.executeCalls) != 0 {
+		t.Fatal("ambiguous lookup reached durable edit controller")
+	}
+
+	followup, err := loop.HandleMessage(t.Context(), 7, "周报那个")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if followup.Reply != "已修改定时推送任务（id=task-ai-weekly）。" {
+		t.Fatalf("followup Reply=%q", followup.Reply)
+	}
+	if len(list.calls) != 1 {
+		t.Fatalf("followup repeated list_schedules: calls=%d", len(list.calls))
+	}
+	if len(controller.proposeCalls) != 1 ||
+		len(controller.executeCalls) != 1 {
+		t.Fatalf("followup prepare=%d execute=%d, want 1/1",
+			len(controller.proposeCalls), len(controller.executeCalls))
+	}
+}
+
 func TestNaturalTaskDefinitionEditClassifier(t *testing.T) {
 	for _, test := range []struct {
 		text string
@@ -206,11 +304,108 @@ func TestNaturalTaskDefinitionEditClassifier(t *testing.T) {
 		{"把日报改成每周一推送", true},
 		{"如何修改这个任务？", false},
 		{"不要修改这个任务", false},
+		{"不要把日报改成周报", false},
+		{"别把 AI 周报改为每天", false},
+		{"我不是要把日报改成周报", false},
+		{"可以把 AI 日报改成每周一推送吗？", true},
+		{"能不能把早报改为只看官方博客？", true},
 		{"创建任务：每天看官方博客", false},
 	} {
 		if got := isNaturalTaskDefinitionEditRequest(test.text); got != test.want {
 			t.Errorf("isNaturalTaskDefinitionEditRequest(%q)=%v, want %v",
 				test.text, got, test.want)
+		}
+	}
+}
+
+func TestNaturalTaskDefinitionEditBindsUniqueResolvedTask(t *testing.T) {
+	controller := &fakeDefinitionEditController{}
+	loop := New(Deps{
+		Tools: []ToolSpec{
+			newToolSpec(&editTaskDefinitionTool{}, ownerPolicy(
+				Effects(
+					EffectDurableProposal,
+					EffectStateWrite,
+					EffectDirectOwnerWrite,
+				),
+				BudgetNone,
+			)),
+		},
+		TaskDefinitionEdit: controller,
+	})
+	state := &toolRunState{
+		naturalTaskDefinitionEdit:           true,
+		naturalTaskDefinitionEditTaskListed: true,
+		naturalTaskDefinitionEditResolvedID: "task-edit-1",
+	}
+	ctx := context.WithValue(t.Context(), toolRunKey{}, state)
+	sessionID := int64(9)
+	msgs, err := loop.runToolCalls(ctx, 7, &sessionID, []llm.ToolCall{{
+		ID: "wrong", Name: definitionEditToolName,
+		Arguments: `{"task_id":"task-other","intent":"wrong target"}`,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.proposeCalls) != 0 || len(controller.executeCalls) != 0 {
+		t.Fatal("wrong same-owner task ID reached durable edit controller")
+	}
+	if len(msgs) != 1 ||
+		!bytes.Contains([]byte(msgs[0].Content), []byte("唯一命中任务不一致")) {
+		t.Fatalf("tool result=%+v", msgs)
+	}
+}
+
+func TestNaturalTaskDefinitionEditRequiresDeclaredDurablePolicy(t *testing.T) {
+	controller := &fakeDefinitionEditController{}
+	loop := New(Deps{
+		Tools: []ToolSpec{
+			newToolSpec(&editTaskDefinitionTool{}, ownerPolicy(
+				Effects(EffectStateWrite, EffectDirectOwnerWrite),
+				BudgetNone,
+			)),
+		},
+		TaskDefinitionEdit: controller,
+	})
+	state := &toolRunState{
+		naturalTaskDefinitionEdit:           true,
+		naturalTaskDefinitionEditTaskListed: true,
+		naturalTaskDefinitionEditResolvedID: "task-edit-1",
+	}
+	ctx := context.WithValue(t.Context(), toolRunKey{}, state)
+	sessionID := int64(9)
+	msgs, err := loop.runToolCalls(ctx, 7, &sessionID, []llm.ToolCall{{
+		ID: "hidden", Name: definitionEditToolName,
+		Arguments: `{"task_id":"task-edit-1","intent":"hidden write"}`,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(controller.proposeCalls) != 0 || len(controller.executeCalls) != 0 {
+		t.Fatal("undeclared edit policy reached durable controller")
+	}
+	if len(msgs) != 1 ||
+		!bytes.Contains([]byte(msgs[0].Content), []byte("能力当前不可用")) {
+		t.Fatalf("tool result=%+v", msgs)
+	}
+}
+
+func TestNaturalTaskDefinitionEditQueryMustComeFromOwnerRequest(t *testing.T) {
+	owner := "请把“AI 官方更新”任务改为每周一推送"
+	for _, test := range []struct {
+		args string
+		want bool
+	}{
+		{`{"query":"AI 官方更新"}`, true},
+		{`{"query":"财经日报"}`, false},
+		{`{"query":"每周一推送"}`, false},
+		{`{"query":"任务"}`, false},
+		{`{"query":"AI 官方更新","extra":true}`, false},
+	} {
+		if got := validNaturalEditScheduleQuery(
+			json.RawMessage(test.args), owner,
+		); got != test.want {
+			t.Errorf("valid query %s=%v, want %v", test.args, got, test.want)
 		}
 	}
 }
