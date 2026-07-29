@@ -22,10 +22,13 @@ const (
 - 用户问 API 定价时，只回答 API 是否可用及 API 价格；ChatGPT 等消费订阅价格不能当作 API 定价，也不能据此推断 API 会如何收费。若官方只说 API 即将推出，就明确回答尚未提供 API 定价，并停止扩写。`
 	externalFollowupGroundingRetrySystemNote = `
 - 你刚才的整理没有通过本地证据校验，已被丢弃。只可引用本轮 web_search 结果中真实出现的 URL，并写成 [来源](URL) Markdown 链接；删除消费订阅价格、无原文支持的数字和推测。若证据不足，明确说证据不足。`
+	groundedResearchPageReadRetrySystemNote = `
+- 你刚才试图直接总结搜索摘要，该回复已被丢弃。搜索结果只是候选线索；现在必须调用 read_page 打开其中直接相关、优先第一方的页面原文，再根据原文回答。不能直接回答，也不能要求用户继续。`
 	replyExternalFollowupSearchUnavailable = "这个问题需要最新网页证据，但当前没有可用的网页搜索能力；本次无法可靠核验，我不会用猜测代替检索。"
 	replyExternalFollowupSearchNotRun      = "这个问题需要最新网页证据，但这次没有完成真实搜索；本次无法可靠核验，我不会把推测当作检索结果。"
 	replyExternalFollowupNoEvidence        = "已完成网页搜索，但没有找到可引用的结果；我不会在没有证据时猜测。"
 	replyExternalFollowupUngrounded        = "已经完成网页搜索，但现有证据不足以形成通过来源校验的结论；我不会发送无法可靠对应证据的内容。"
+	replyGroundedPageNotRead               = "已找到候选网页，但本次未能成功读取原文；我不会只根据搜索摘要下结论，也不需要你重复原问题。"
 	toolMsgExternalFollowupSearchRejected  = "本次网页查询未执行：引用消息场景只允许逐字搜索当前用户自己的问题，不能改写查询、附加域名或并列调用其他工具。"
 )
 

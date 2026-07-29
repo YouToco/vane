@@ -60,6 +60,222 @@ func TestGroundedResearchCompletesSearchReadAndAnswerInOneMessage(t *testing.T) 
 	}
 }
 
+func TestGroundedResearchRejectsSearchSummaryUntilPageRead(t *testing.T) {
+	const official = "https://openai.com/index/introducing-gpt-live/"
+	searcher := &fakeWebSearcher{results: []fetcher.SearchResult{{
+		Title: "Introducing GPT-Live",
+		URL:   official,
+		Text:  "We plan to bring GPT-Live to the API soon.",
+	}}}
+	reader := &fakePageReader{
+		title: "Introducing GPT-Live",
+		text:  "We plan to bring GPT-Live to the API soon.",
+	}
+	exa := newTestExaTools(searcher, reader)
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "search", Name: "web_search",
+			Arguments: `{"query":"OpenAI GPT-Live API pricing"}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "只看摘要就回答：" + official, FinishReason: "stop"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "read", Name: "read_page",
+			Arguments: `{"url":"` + official + `"}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "官方只说 API 即将推出，尚无 API 定价：" + official,
+			FinishReason: "stop"},
+	}}
+	loop := newTestLoop(
+		t, newFakeStore(), chat.fn, exa.SearchTool(), exa.ReadPageTool(),
+	)
+
+	out, err := loop.HandleMessage(
+		t.Context(), 7, "请查 GPT-Live 是否已经提供 API 定价",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply == replyGroundedPageNotRead ||
+		!strings.Contains(out.Reply, "**来源**") ||
+		searcher.calls != 1 || reader.calls != 1 || len(chat.requests) != 4 {
+		t.Fatalf(
+			"out=%+v search=%d read=%d requests=%d",
+			out, searcher.calls, reader.calls, len(chat.requests),
+		)
+	}
+	if !strings.Contains(
+		chat.requests[2].Messages[0].Content,
+		"必须调用 read_page",
+	) {
+		t.Fatal("page-read correction was not added to the retry system prompt")
+	}
+}
+
+func TestGroundedResearchFailsClosedWhenPageIsNeverRead(t *testing.T) {
+	const official = "https://openai.com/index/introducing-gpt-live/"
+	searcher := &fakeWebSearcher{results: []fetcher.SearchResult{{
+		Title: "Introducing GPT-Live",
+		URL:   official,
+		Text:  "Candidate summary only.",
+	}}}
+	exa := newTestExaTools(searcher, &fakePageReader{})
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "search", Name: "web_search",
+			Arguments: `{"query":"OpenAI GPT-Live API pricing"}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "第一次直接回答：" + official, FinishReason: "stop"},
+		{Content: "第二次仍直接回答：" + official, FinishReason: "stop"},
+	}}
+	loop := newTestLoop(
+		t, newFakeStore(), chat.fn, exa.SearchTool(), exa.ReadPageTool(),
+	)
+
+	out, err := loop.HandleMessage(
+		t.Context(), 7, "请查 GPT-Live 是否已经提供 API 定价",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply != replyGroundedPageNotRead ||
+		searcher.calls != 1 || len(chat.requests) != 3 {
+		t.Fatalf(
+			"out=%+v search=%d requests=%d",
+			out, searcher.calls, len(chat.requests),
+		)
+	}
+}
+
+func TestGroundedResearchRequiresReadAfterLatestSearch(t *testing.T) {
+	const (
+		initial  = "https://example.com/background"
+		official = "https://openai.com/index/introducing-gpt-live/"
+	)
+	searcher := &fakeWebSearcher{results: []fetcher.SearchResult{{
+		Title: "Introducing GPT-Live",
+		URL:   official,
+		Text:  "Candidate summary only.",
+	}}}
+	reader := &fakePageReader{
+		title: "Public page",
+		text:  "Public page body.",
+	}
+	exa := newTestExaTools(searcher, reader)
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "early-read", Name: "read_page",
+			Arguments: `{"url":"` + initial + `"}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "later-search", Name: "web_search",
+			Arguments: `{"query":"OpenAI GPT-Live API pricing"}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "搜索摘要直接回答：" + official, FinishReason: "stop"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "required-read", Name: "read_page",
+			Arguments: `{"url":"` + official + `"}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "读取原文后回答：" + official, FinishReason: "stop"},
+	}}
+	loop := newTestLoop(
+		t, newFakeStore(), chat.fn, exa.SearchTool(), exa.ReadPageTool(),
+	)
+
+	out, err := loop.HandleMessage(
+		t.Context(), 7, "请核验 OpenAI GPT-Live API 定价",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply == replyGroundedPageNotRead ||
+		!strings.Contains(out.Reply, "**来源**") ||
+		searcher.calls != 1 || reader.calls != 2 || len(chat.requests) != 5 {
+		t.Fatalf(
+			"out=%+v search=%d reads=%d requests=%d",
+			out, searcher.calls, reader.calls, len(chat.requests),
+		)
+	}
+}
+
+func TestGroundedResearchReservesFinalRoundAfterLastTurnPageRead(t *testing.T) {
+	const official = "https://openai.com/index/introducing-gpt-live/"
+	searcher := &fakeWebSearcher{results: []fetcher.SearchResult{{
+		Title: "Introducing GPT-Live", URL: official,
+		Text: "Candidate summary only.",
+	}}}
+	reader := &fakePageReader{title: "Official", text: "Official body."}
+	exa := newTestExaTools(searcher, reader)
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "search", Name: "web_search",
+			Arguments: `{"query":"OpenAI GPT-Live API pricing"}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "read", Name: "read_page",
+			Arguments: `{"url":"` + official + `"}`,
+		}}, FinishReason: "tool_calls"},
+		{Content: "原文结论：" + official, FinishReason: "stop"},
+	}}
+	loop := newTestLoop(
+		t, newFakeStore(), chat.fn, exa.SearchTool(), exa.ReadPageTool(),
+	)
+	loop.maxTurns = 2
+
+	out, err := loop.HandleMessage(
+		t.Context(), 7, "请核验 OpenAI GPT-Live API 定价",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply == replyMaxTurns || len(chat.requests) != 3 ||
+		len(chat.requests[2].Tools) != 0 ||
+		!strings.Contains(out.Reply, "**来源**") {
+		t.Fatalf("out=%+v requests=%d final_tools=%d",
+			out, len(chat.requests), len(chat.requests[2].Tools))
+	}
+}
+
+func TestGroundedResearchRejectsToolsOnReservedFinalRound(t *testing.T) {
+	const official = "https://openai.com/index/introducing-gpt-live/"
+	searcher := &fakeWebSearcher{results: []fetcher.SearchResult{{
+		Title: "Introducing GPT-Live", URL: official,
+		Text: "Candidate summary only.",
+	}}}
+	reader := &fakePageReader{title: "Official", text: "Official body."}
+	exa := newTestExaTools(searcher, reader)
+	chat := &scriptedChat{responses: []*llm.ChatResponse{
+		{ToolCalls: []llm.ToolCall{{
+			ID: "search", Name: "web_search",
+			Arguments: `{"query":"OpenAI GPT-Live API pricing"}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "read", Name: "read_page",
+			Arguments: `{"url":"` + official + `"}`,
+		}}, FinishReason: "tool_calls"},
+		{ToolCalls: []llm.ToolCall{{
+			ID: "hallucinated-read", Name: "read_page",
+			Arguments: `{"url":"https://example.com/extra"}`,
+		}}, FinishReason: "tool_calls"},
+	}}
+	loop := newTestLoop(
+		t, newFakeStore(), chat.fn, exa.SearchTool(), exa.ReadPageTool(),
+	)
+	loop.maxTurns = 2
+
+	out, err := loop.HandleMessage(
+		t.Context(), 7, "请核验 OpenAI GPT-Live API 定价",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Reply != replyExternalProtocolFailure ||
+		reader.calls != 1 || len(chat.requests) != 3 ||
+		len(chat.requests[2].Tools) != 0 {
+		t.Fatalf("out=%+v reads=%d requests=%d final_tools=%d",
+			out, reader.calls, len(chat.requests), len(chat.requests[2].Tools))
+	}
+}
+
 func TestIntentToolkitsNarrowFirstRequest(t *testing.T) {
 	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)
 	loop := New(Deps{Tools: BuildTools(

@@ -272,6 +272,12 @@ func markExternalFollowupSearchSuccess(
 ) {
 	if state := runStateFrom(ctx); state != nil {
 		state.webResearchSucceeded = true
+		state.webSearchSucceeded = true
+		// A read only grounds searches that happened before it. Every new
+		// successful search creates a fresh read debt, even when this message
+		// already opened another page.
+		state.webPageReadSucceeded = false
+		state.webPageReadResponseRejected = false
 		for _, item := range results {
 			appendExternalFollowupEvidence(state, externalFollowupSearchEvidence{
 				URL:           truncateRunes(item.URL, exaOutURLMaxRunes),
@@ -396,6 +402,7 @@ func (t *readPageTool) Execute(ctx context.Context, userID int64, args json.RawM
 	result := b.String()
 	if state := runStateFrom(ctx); state != nil {
 		state.webResearchSucceeded = true
+		state.webPageReadSucceeded = true
 		appendExternalFollowupEvidence(state, externalFollowupSearchEvidence{
 			URL:   truncateRunes(u, exaOutURLMaxRunes),
 			Title: truncateRunes(title, exaOutMetaMaxRunes),

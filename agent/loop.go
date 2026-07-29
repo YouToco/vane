@@ -899,7 +899,8 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 		maxTurns = directTaskDefinitionEditMaxTurns
 	}
 	turns := 0
-	for turns < maxTurns {
+	for turns < maxTurns ||
+		(state != nil && state.webPageReadSucceeded && turns == maxTurns) {
 		// Do not start a new paid model turn after the owner canceled. Individual
 		// LLM calls still finish their bounded ledger tail before returning.
 		if err := ctx.Err(); err != nil {
@@ -919,6 +920,13 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			profileHint, renderProfile = "", false
 		}
 		tools := l.requestTools(state)
+		synthesisOnly := turns > maxTurns
+		if synthesisOnly {
+			// A successful page read on the last normal turn reserves one
+			// synthesis-only round. Do not let that extra round start more
+			// work and starve the user-visible answer again.
+			tools = nil
+		}
 		requestMessages := msgs
 		if state.untrustedExternalResult {
 			// DeepSeek v4-pro 对 tools=[] 但 messages 仍含原生
@@ -969,6 +977,11 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				system += externalFollowupGroundingRetrySystemNote
 			}
 		}
+		if state.webSearchSucceeded &&
+			!state.webPageReadSucceeded &&
+			state.webPageReadResponseRejected {
+			system += groundedResearchPageReadRetrySystemNote
+		}
 		request := llm.ChatRequest{
 			Model:    l.model,
 			Messages: withSystem(system, requestMessages, profileHint, renderProfile),
@@ -1003,6 +1016,16 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 				return Outcome{Reply: replyExternalProtocolFailure}, msgs, turns, nil
 			}
 			return Outcome{}, nil, 0, err
+		}
+
+		if synthesisOnly && len(resp.ToolCalls) > 0 {
+			// Tools=nil is only a provider hint. Enforce the reserved final
+			// round at the harness boundary so hallucinated public reads cannot
+			// consume more network/cost budget or starve the final reply.
+			msgs = append(msgs, llm.ChatMessage{
+				Role: "assistant", Content: replyExternalProtocolFailure,
+			})
+			return Outcome{Reply: replyExternalProtocolFailure}, msgs, turns, nil
 		}
 
 		// 无 tool_calls 即收敛：模型给出了最终文字回复。
@@ -1052,6 +1075,16 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 			if state != nil && (strings.Contains(reply, "？") ||
 				strings.HasSuffix(strings.TrimSpace(reply), "?")) {
 				state.clarificationCount++
+			}
+			if state.webSearchSucceeded && !state.webPageReadSucceeded {
+				if !state.webPageReadResponseRejected {
+					state.webPageReadResponseRejected = true
+					continue
+				}
+				msgs = append(msgs, llm.ChatMessage{
+					Role: "assistant", Content: replyGroundedPageNotRead,
+				})
+				return Outcome{Reply: replyGroundedPageNotRead}, msgs, turns, nil
 			}
 			if state.webResearchSucceeded &&
 				!externalFollowupReplyGrounded(
@@ -1250,6 +1283,10 @@ func (l *Loop) converse(ctx context.Context, userID int64, sessionID *int64, msg
 	}
 	if state != nil && state.directTaskDefinitionEditID != "" {
 		reply = replyTaskDefinitionEditNotCreated
+	}
+	if state != nil && state.webSearchSucceeded &&
+		!state.webPageReadSucceeded {
+		reply = replyGroundedPageNotRead
 	}
 	msgs = append(msgs, llm.ChatMessage{Role: "assistant", Content: reply})
 	return Outcome{Reply: reply}, msgs, turns, nil
@@ -2060,6 +2097,7 @@ func observeAgentRunState(state *toolRunState) {
 		"candidate_tool_hit_rate", hitRate,
 		"grounding_failure_count", state.externalFollowupGroundingFailures,
 		"web_research_succeeded", state.webResearchSucceeded,
+		"web_page_read_succeeded", state.webPageReadSucceeded,
 		"intent_toolkits_enabled", state.intentToolkitsEnabled,
 		"intent_toolkits_shadow", state.intentToolkitsShadowSeen,
 		"legacy_tool_count", state.intentToolkitsLegacyCount,

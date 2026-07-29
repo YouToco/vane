@@ -104,7 +104,11 @@ func TestHandleExternalContextMessage_FreshQuestionUsesOneExactUserBoundSearch(
 			Text: "OpenAI 官方发布页写明计划很快提供 API，尚未公布 GPT-Live 独立 API 定价。",
 		}},
 	}
-	search := newTestExaTools(upstream, nil).SearchTool()
+	reader := &fakePageReader{
+		title: "Introducing GPT-Live",
+		text:  "OpenAI plans to bring GPT-Live to the API soon.",
+	}
+	exa := newTestExaTools(upstream, reader)
 	chat := &scriptedChat{responses: []*llm.ChatResponse{
 		{
 			ToolCalls: []llm.ToolCall{{
@@ -114,11 +118,18 @@ func TestHandleExternalContextMessage_FreshQuestionUsesOneExactUserBoundSearch(
 			FinishReason: "tool_calls",
 		},
 		{
+			ToolCalls: []llm.ToolCall{{
+				ID: "grounded-read", Name: "read_page",
+				Arguments: `{"url":"` + official + `"}`,
+			}},
+			FinishReason: "tool_calls",
+		},
+		{
 			Content:      "OpenAI 官方页当时只说明 API 即将推出，未提供 API 定价：" + official,
 			FinishReason: "stop",
 		},
 	}}
-	l := newTestLoop(t, fs, chat.fn, search)
+	l := newTestLoop(t, fs, chat.fn, exa.SearchTool(), exa.ReadPageTool())
 	toolCalls := &capturingExternalFollowupToolCalls{}
 	l.toolCalls = NewToolCallRecorder(toolCalls)
 	profiles := &countingProfileReader{
@@ -155,19 +166,26 @@ func TestHandleExternalContextMessage_FreshQuestionUsesOneExactUserBoundSearch(
 			upstream.calls, upstream.gotQuery, upstream.gotNum,
 			upstream.gotDomains)
 	}
-	if len(toolCalls.calls) != 1 ||
+	if len(toolCalls.calls) != 2 ||
 		string(toolCalls.calls[0].Arguments) !=
 			`{"query":"`+question+
 				`","include_domains":["openai.com","developers.openai.com","help.openai.com","platform.openai.com","status.openai.com"]}` {
 		t.Fatalf("tool ledger must record executed bound query, calls=%+v",
 			toolCalls.calls)
 	}
-	if len(chat.requests) != 2 {
-		t.Fatalf("GPT-Live pricing should use a grounded synthesis turn; requests=%d",
-			len(chat.requests))
+	if toolCalls.calls[1].ToolName != "read_page" ||
+		string(toolCalls.calls[1].Arguments) != `{"url":"`+official+`"}` {
+		t.Fatalf("tool ledger must record the official page read, calls=%+v",
+			toolCalls.calls)
+	}
+	if len(chat.requests) != 3 || reader.calls != 1 {
+		t.Fatalf("GPT-Live pricing should search, read, then synthesize; requests=%d reads=%d",
+			len(chat.requests), reader.calls)
 	}
 	first := chat.requests[0]
-	if len(first.Tools) != 1 || first.Tools[0].Name != "web_search" {
+	if len(first.Tools) != 2 ||
+		first.Tools[0].Name != "web_search" ||
+		first.Tools[1].Name != "read_page" {
 		t.Fatalf("first tools=%+v", first.Tools)
 	}
 	var schema struct {
@@ -349,10 +367,21 @@ func TestHandleExternalContextMessage_RejectsUngroundedSearchAnswerTwice(
 			Text: "Official current status.",
 		}},
 	}
+	reader := &fakePageReader{
+		title: "API status",
+		text:  "Official current status.",
+	}
 	chat := &scriptedChat{responses: []*llm.ChatResponse{
 		{
 			ToolCalls: []llm.ToolCall{{
 				ID: "search", Name: "web_search", Arguments: `{}`,
+			}},
+			FinishReason: "tool_calls",
+		},
+		{
+			ToolCalls: []llm.ToolCall{{
+				ID: "read", Name: "read_page",
+				Arguments: `{"url":"` + official + `"}`,
 			}},
 			FinishReason: "tool_calls",
 		},
@@ -365,7 +394,8 @@ func TestHandleExternalContextMessage_RejectsUngroundedSearchAnswerTwice(
 			FinishReason: "stop",
 		},
 	}}
-	l := newTestLoop(t, fs, chat.fn, newTestExaTools(upstream, nil).SearchTool())
+	exa := newTestExaTools(upstream, reader)
+	l := newTestLoop(t, fs, chat.fn, exa.SearchTool(), exa.ReadPageTool())
 
 	out, err := l.HandleExternalContextMessage(
 		t.Context(), 7,
@@ -375,12 +405,12 @@ func TestHandleExternalContextMessage_RejectsUngroundedSearchAnswerTwice(
 		t.Fatalf("HandleExternalContextMessage: %v", err)
 	}
 	if out.Reply != replyExternalFollowupUngrounded ||
-		len(chat.requests) != 3 || upstream.calls != 1 {
-		t.Fatalf("out=%+v requests=%d upstream=%d",
-			out, len(chat.requests), upstream.calls)
+		len(chat.requests) != 4 || upstream.calls != 1 || reader.calls != 1 {
+		t.Fatalf("out=%+v requests=%d upstream=%d reads=%d",
+			out, len(chat.requests), upstream.calls, reader.calls)
 	}
 	if !strings.Contains(
-		chat.requests[2].Messages[0].Content,
+		chat.requests[3].Messages[0].Content,
 		externalFollowupGroundingRetrySystemNote,
 	) {
 		t.Fatal("retry request lacks deterministic grounding correction")
