@@ -258,7 +258,12 @@ func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID
 			fmt.Sprintf("归集任务取材成本（schedule_id=%s）", scheduleID), err)
 	}
 	if err := s.pool.QueryRow(ctx,
-		`WITH latest_run AS (
+		`WITH authorized_task AS (
+		     SELECT tenant_id, user_id, id
+		       FROM schedules
+		      WHERE id = $2 AND user_id = $1
+		   ),
+		   latest_run AS (
 		     SELECT latest.tenant_id, latest.user_id, latest.task_id,
 		            latest.temporal_workflow_id,
 		            (
@@ -271,7 +276,10 @@ func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID
 		                     latest.temporal_workflow_id
 		            ) AS workflow_run_count
 		       FROM task_run_snapshots latest
-		      WHERE latest.user_id = $1 AND latest.task_id = $2
+		       JOIN authorized_task task
+		         ON latest.tenant_id = task.tenant_id
+		        AND latest.user_id = task.user_id
+		        AND latest.task_id = task.id
 		      ORDER BY latest.created_at DESC, latest.id DESC
 		      LIMIT 1
 		   ),
