@@ -618,6 +618,64 @@ export interface ReplaceProviderPriceRule {
   note: string;
 }
 
+export type CallCostKind = "llm" | "tool";
+export type CallCostPricingStatus =
+  | "provider_reported"
+  | "calculated"
+  | "estimated"
+  | "unpriced"
+  | "legacy";
+
+export interface CallCostLLMUsage {
+  prompt_tokens: number;
+  prompt_cache_hit_tokens?: number;
+  prompt_cache_miss_tokens?: number;
+  completion_tokens: number;
+  reasoning_tokens?: number;
+}
+
+export interface CallCostToolUsage {
+  tool_name: string;
+  tool_kind: string;
+  endpoint_path?: string;
+  usage_quantity: number;
+  http_status?: number;
+}
+
+export interface CallCostLedgerItem {
+  kind: CallCostKind;
+  id: number;
+  created_at: string;
+  provider: string;
+  resource: string;
+  meter: ProviderPriceMeter;
+  pricing_status: CallCostPricingStatus;
+  cost_amount?: number;
+  cost_currency?: ProviderPriceCurrency;
+  pricing_rule?: ProviderPriceRule;
+  llm_usage?: CallCostLLMUsage;
+  tool_usage?: CallCostToolUsage;
+  trace_id: string;
+  task_id?: string;
+  task_title?: string;
+  span_name?: string;
+  duration_ms: number;
+  failed: boolean;
+  error_type?: string;
+}
+
+export interface CallCostLedgerFilters {
+  kind?: CallCostKind;
+  provider?: string;
+  pricing_status?: CallCostPricingStatus;
+  task_id?: string;
+}
+
+export interface CallCostLedgerResponse {
+  items: CallCostLedgerItem[];
+  next_page_token?: string;
+}
+
 export interface SchedulePlaybook {
   content: string;
   updated_at: string; // UTC
@@ -1591,6 +1649,27 @@ export const api = {
       },
       body: JSON.stringify(input),
     }),
+  adminListCostCalls: (
+    filters: CallCostLedgerFilters = {},
+    pageToken?: string,
+    pageSize = 50,
+  ) => {
+    const params = new URLSearchParams();
+    params.set("page_size", String(pageSize));
+    if (pageToken) params.set("page_token", pageToken);
+    if (filters.kind) params.set("kind", filters.kind);
+    if (filters.provider) params.set("provider", filters.provider);
+    if (filters.pricing_status) {
+      params.set("pricing_status", filters.pricing_status);
+    }
+    if (filters.task_id?.trim()) params.set("task_id", filters.task_id.trim());
+    return request<CallCostLedgerResponse>(
+      `/api/admin/cost-calls?${params.toString()}`,
+    ).then((response) => ({
+      ...response,
+      items: arr(response.items),
+    }));
+  },
 
   // ---- M5 Gate 可观测性（契约 §16）----
   // 只读端点，窗口由前端固化档位给（见 Observability.tsx 的 WINDOW_OPTIONS），

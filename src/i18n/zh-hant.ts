@@ -357,6 +357,7 @@ export const zhHant: Dict = {
       ownerBadge: "平台管理 · 僅平台 owner 可見",
       tabObservability: "可觀測",
       tabCosts: "LLM 成本",
+      tabCallCosts: "呼叫帳單",
       tabPricing: "價格設定",
       tabInvites: "使用者與邀請",
       zhOnly: "可觀測與成本看板是平台維運視圖，內文暫僅提供簡體中文。",
