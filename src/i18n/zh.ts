@@ -359,6 +359,7 @@ export const zh = {
       ownerBadge: "平台管理 · 仅平台 owner 可见",
       tabObservability: "可观测",
       tabCosts: "LLM 成本",
+      tabPricing: "价格配置",
       tabInvites: "用户与邀请",
       zhOnly: "可观测与成本看板是平台运维视图，正文暂仅提供中文。",
       invites: {

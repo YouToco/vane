@@ -361,6 +361,7 @@ export const ja: Dict = {
       ownerBadge: "プラットフォーム管理 · オーナー専用",
       tabObservability: "可観測性",
       tabCosts: "LLM コスト",
+      tabPricing: "料金設定",
       tabInvites: "ユーザーと招待",
       zhOnly: "可観測性とコストのダッシュボードはプラットフォーム運用向けのため、現在は中国語のみです。",
       invites: {

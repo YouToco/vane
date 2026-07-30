@@ -30,6 +30,11 @@ export interface TaskHealthCopy {
   modelCalls: string;
   acquisitionCalls: string;
   pricedCalls: string;
+  estimatedCalls: string;
+  inputTokens: string;
+  outputTokens: string;
+  cacheTokens: string;
+  reasoningTokens: string;
   recommended: string;
   states: Record<TaskHealthState, string>;
   issues: Record<TaskHealthIssue, string>;
@@ -78,11 +83,24 @@ export default function TaskHealthPanel({
     health.permissions.can_delete && copy.capabilities.delete,
     health.permissions.can_view_usage && copy.capabilities.viewUsage,
   ].filter((value): value is string => Boolean(value));
-  const cost = new Intl.NumberFormat(locale, {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: 4,
-  }).format(health.usage?.known_cost_usd ?? 0);
+  const costs =
+    (health.usage?.known_costs ?? []).map((known) =>
+      new Intl.NumberFormat(locale, {
+        style: "currency",
+        currency: known.currency,
+        maximumFractionDigits: 6,
+      }).format(known.amount),
+    ) ?? [];
+  if (costs.length === 0 && health.usage) {
+    costs.push(
+      new Intl.NumberFormat(locale, {
+        style: "currency",
+        currency: "USD",
+        maximumFractionDigits: 6,
+      }).format(health.usage.known_cost_usd),
+    );
+  }
+  const integer = new Intl.NumberFormat(locale);
 
   return (
     <section aria-labelledby="task-health-title" className="grid gap-3 lg:grid-cols-3">
@@ -142,7 +160,7 @@ export default function TaskHealthPanel({
           {health.permissions.can_view_usage && health.usage ? (
             <>
               <p className="text-lg font-semibold">
-                {copy.knownCost}: {cost}
+                {copy.knownCost}: {costs.join(" · ")}
               </p>
               <p className="text-xs text-muted-foreground">
                 {copy.coverage[health.usage.coverage]} ·{" "}
@@ -151,6 +169,10 @@ export default function TaskHealthPanel({
               <p className="text-xs text-muted-foreground">
                 {health.usage.llm_calls !== undefined &&
                   `${copy.modelCalls} ${health.usage.llm_calls}`}
+                {health.usage.llm_priced_calls !== undefined &&
+                  health.usage.llm_calls !== undefined &&
+                  health.usage.llm_priced_calls < health.usage.llm_calls &&
+                  ` (${copy.pricedCalls} ${health.usage.llm_priced_calls})`}
                 {health.usage.llm_calls !== undefined &&
                   health.usage.tool_calls !== undefined &&
                   " · "}
@@ -162,6 +184,40 @@ export default function TaskHealthPanel({
                     health.usage.tool_calls &&
                   ` (${copy.pricedCalls} ${health.usage.tool_priced_calls})`}
               </p>
+              {(health.usage.llm_estimated_calls ?? 0) +
+                (health.usage.tool_estimated_calls ?? 0) >
+                0 && (
+                <p className="text-xs text-amber-700 dark:text-amber-300">
+                  {copy.estimatedCalls}:{" "}
+                  {(health.usage.llm_estimated_calls ?? 0) +
+                    (health.usage.tool_estimated_calls ?? 0)}
+                </p>
+              )}
+              {health.usage.prompt_tokens !== undefined &&
+                health.usage.completion_tokens !== undefined && (
+                  <div className="space-y-1 border-t pt-2 text-xs text-muted-foreground">
+                    <p>
+                      {copy.inputTokens}{" "}
+                      {integer.format(health.usage.prompt_tokens)} ·{" "}
+                      {copy.outputTokens}{" "}
+                      {integer.format(health.usage.completion_tokens)}
+                    </p>
+                    <p>
+                      {copy.cacheTokens}:{" "}
+                      {integer.format(
+                        health.usage.prompt_cache_hit_tokens ?? 0,
+                      )}
+                      {" / "}
+                      {integer.format(
+                        health.usage.prompt_cache_miss_tokens ?? 0,
+                      )}
+                      {(health.usage.reasoning_tokens ?? 0) > 0 &&
+                        ` · ${copy.reasoningTokens} ${integer.format(
+                          health.usage.reasoning_tokens ?? 0,
+                        )}`}
+                    </p>
+                  </div>
+                )}
             </>
           ) : (
             <p className="text-sm text-muted-foreground">

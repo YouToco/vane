@@ -80,8 +80,16 @@ describe("task health projection contract", () => {
     acquisition: { total: 2, failing: 0, max_fail_count: 0 },
     usage: {
       known_cost_usd: 1.25,
+      known_costs: [{ currency: "USD", amount: 1.25 }],
       coverage: "llm_only",
       llm_calls: 3,
+      llm_priced_calls: 3,
+      llm_estimated_calls: 0,
+      prompt_tokens: 1_000,
+      prompt_cache_hit_tokens: 200,
+      prompt_cache_miss_tokens: 800,
+      completion_tokens: 300,
+      reasoning_tokens: 100,
       budget_state: "not_configured",
     },
     permissions: {
@@ -98,6 +106,105 @@ describe("task health projection contract", () => {
     expect(normalizeTaskHealth(raw)).toEqual(raw);
   });
 
+  test("accepts the original v1 response during a rolling deployment", () => {
+    const legacyUsage = {
+      known_cost_usd: 1.25,
+      coverage: "llm_only",
+      llm_calls: 3,
+      budget_state: "not_configured",
+    };
+    expect(
+      normalizeTaskHealth({
+        ...raw,
+        usage: legacyUsage,
+      })?.usage,
+    ).toEqual({
+      ...legacyUsage,
+      known_costs: [{ currency: "USD", amount: 1.25 }],
+      llm_priced_calls: 3,
+      llm_estimated_calls: 0,
+    });
+  });
+
+  test("fails closed on a partial token extension", () => {
+    const health = normalizeTaskHealth({
+      ...raw,
+      usage: {
+        ...raw.usage,
+        reasoning_tokens: undefined,
+      },
+    });
+    expect(health).toBeDefined();
+    expect(health).not.toHaveProperty("usage");
+  });
+
+  test("fails closed when an estimated amount claims a budget verdict", () => {
+    const health = normalizeTaskHealth({
+      ...raw,
+      usage: {
+        ...raw.usage,
+        coverage: "llm_only",
+        llm_calls: 3,
+        llm_priced_calls: 2,
+        llm_estimated_calls: 1,
+        budget_usd: 1,
+        budget_state: "exhausted",
+      },
+    });
+    expect(health).toBeDefined();
+    expect(health).not.toHaveProperty("usage");
+  });
+
+  test("accepts disjoint exact and estimated counts for old Web compatibility", () => {
+    const health = normalizeTaskHealth({
+      ...raw,
+      usage: {
+        ...raw.usage,
+        known_cost_usd: 0.01,
+        known_costs: [{ currency: "USD", amount: 0.01 }],
+        coverage: "tools_partial",
+        llm_calls: undefined,
+        llm_priced_calls: undefined,
+        llm_estimated_calls: undefined,
+        tool_calls: 2,
+        tool_priced_calls: 1,
+        tool_estimated_calls: 1,
+        budget_state: "incomplete",
+      },
+    });
+    expect(health?.usage).toMatchObject({
+      coverage: "tools_partial",
+      tool_calls: 2,
+      tool_priced_calls: 1,
+      tool_estimated_calls: 1,
+      budget_state: "incomplete",
+    });
+  });
+
+  test("keeps legacy full tool coverage when only the LLM amount is estimated", () => {
+    const health = normalizeTaskHealth({
+      ...raw,
+      usage: {
+        ...raw.usage,
+        coverage: "llm_and_tools",
+        llm_calls: 3,
+        llm_priced_calls: 2,
+        llm_estimated_calls: 1,
+        tool_calls: 2,
+        tool_priced_calls: 2,
+        tool_estimated_calls: 0,
+        budget_state: "incomplete",
+      },
+    });
+    expect(health?.usage).toMatchObject({
+      coverage: "llm_and_tools",
+      llm_priced_calls: 2,
+      llm_estimated_calls: 1,
+      tool_priced_calls: 2,
+      budget_state: "incomplete",
+    });
+  });
+
   test("keeps known acquisition cost while marking incomplete provider receipts", () => {
     const partial = {
       ...raw,
@@ -111,11 +218,16 @@ describe("task health projection contract", () => {
         failure_reason: "provider_error",
       },
       usage: {
+        ...raw.usage,
         known_cost_usd: 1.271,
+        known_costs: [{ currency: "USD", amount: 1.271 }],
         coverage: "llm_and_tools_partial",
         llm_calls: 3,
+        llm_priced_calls: 3,
+        llm_estimated_calls: 0,
         tool_calls: 3,
         tool_priced_calls: 2,
+        tool_estimated_calls: 0,
         budget_state: "incomplete",
       },
     };
@@ -147,11 +259,13 @@ describe("task health projection contract", () => {
     const malformed = normalizeTaskHealth({
       ...raw,
       usage: {
+        ...raw.usage,
         known_cost_usd: 1.25,
         coverage: "llm_and_tools",
         llm_calls: 3,
         tool_calls: 3,
         tool_priced_calls: 2,
+        tool_estimated_calls: 0,
         budget_state: "not_configured",
       },
     });
@@ -161,10 +275,12 @@ describe("task health projection contract", () => {
     const missingReceiptCount = normalizeTaskHealth({
       ...raw,
       usage: {
+        ...raw.usage,
         known_cost_usd: 1.25,
         coverage: "llm_and_tools",
         llm_calls: 3,
         tool_calls: 3,
+        tool_estimated_calls: 0,
         budget_state: "not_configured",
       },
     });
