@@ -80,8 +80,16 @@ describe("task health projection contract", () => {
     acquisition: { total: 2, failing: 0, max_fail_count: 0 },
     usage: {
       known_cost_usd: 1.25,
+      known_costs: [{ currency: "USD", amount: 1.25 }],
       coverage: "llm_only",
       llm_calls: 3,
+      llm_priced_calls: 3,
+      llm_estimated_calls: 0,
+      prompt_tokens: 1_000,
+      prompt_cache_hit_tokens: 200,
+      prompt_cache_miss_tokens: 800,
+      completion_tokens: 300,
+      reasoning_tokens: 100,
       budget_state: "not_configured",
     },
     permissions: {
@@ -111,11 +119,16 @@ describe("task health projection contract", () => {
         failure_reason: "provider_error",
       },
       usage: {
+        ...raw.usage,
         known_cost_usd: 1.271,
+        known_costs: [{ currency: "USD", amount: 1.271 }],
         coverage: "llm_and_tools_partial",
         llm_calls: 3,
+        llm_priced_calls: 3,
+        llm_estimated_calls: 0,
         tool_calls: 3,
         tool_priced_calls: 2,
+        tool_estimated_calls: 0,
         budget_state: "incomplete",
       },
     };
@@ -147,11 +160,13 @@ describe("task health projection contract", () => {
     const malformed = normalizeTaskHealth({
       ...raw,
       usage: {
+        ...raw.usage,
         known_cost_usd: 1.25,
         coverage: "llm_and_tools",
         llm_calls: 3,
         tool_calls: 3,
         tool_priced_calls: 2,
+        tool_estimated_calls: 0,
         budget_state: "not_configured",
       },
     });
@@ -161,10 +176,12 @@ describe("task health projection contract", () => {
     const missingReceiptCount = normalizeTaskHealth({
       ...raw,
       usage: {
+        ...raw.usage,
         known_cost_usd: 1.25,
         coverage: "llm_and_tools",
         llm_calls: 3,
         tool_calls: 3,
+        tool_estimated_calls: 0,
         budget_state: "not_configured",
       },
     });

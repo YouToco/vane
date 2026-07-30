@@ -4,6 +4,7 @@ import { Info, ShieldCheck } from "lucide-react";
 import Observability from "./Observability";
 import Costs from "./Costs";
 import Invites from "./Invites";
+import Pricing from "./Pricing";
 import { useI18n } from "@/i18n";
 
 // 管理面：只承载**平台级**视图（跨租户/系统级），与用户面严格分开。
@@ -42,6 +43,7 @@ export default function Admin() {
         <TabsList>
           <TabsTrigger value="observability">{A.tabObservability}</TabsTrigger>
           <TabsTrigger value="costs">{A.tabCosts}</TabsTrigger>
+          <TabsTrigger value="pricing">{A.tabPricing}</TabsTrigger>
           <TabsTrigger value="invites">{A.tabInvites}</TabsTrigger>
         </TabsList>
         <TabsContent value="observability" className="mt-4 space-y-4">
@@ -51,6 +53,10 @@ export default function Admin() {
         <TabsContent value="costs" className="mt-4 space-y-4">
           {zhOnly}
           <Costs />
+        </TabsContent>
+        <TabsContent value="pricing" className="mt-4 space-y-4">
+          {zhOnly}
+          <Pricing />
         </TabsContent>
         <TabsContent value="invites" className="mt-4">
           <Invites />

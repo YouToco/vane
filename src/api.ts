@@ -447,6 +447,7 @@ export type TaskHealthAction =
 export type CostCoverage =
   | "none"
   | "llm_only"
+  | "llm_partial"
   | "tools_only"
   | "tools_partial"
   | "llm_and_tools"
@@ -478,10 +479,19 @@ export interface TaskHealthProjection {
   };
   usage?: {
     known_cost_usd: number;
+    known_costs: CurrencyCost[];
     coverage: CostCoverage;
     llm_calls?: number;
+    llm_priced_calls?: number;
+    llm_estimated_calls?: number;
     tool_calls?: number;
     tool_priced_calls?: number;
+    tool_estimated_calls?: number;
+    prompt_tokens?: number;
+    prompt_cache_hit_tokens?: number;
+    prompt_cache_miss_tokens?: number;
+    completion_tokens?: number;
+    reasoning_tokens?: number;
     window_start?: string;
     window_end?: string;
     budget_usd?: number;
@@ -495,6 +505,11 @@ export interface TaskHealthProjection {
     can_delete: boolean;
     can_view_usage: boolean;
   };
+}
+
+export interface CurrencyCost {
+  currency: "USD" | "CNY";
+  amount: number;
 }
 
 export interface TaskBriefsResp {
@@ -563,11 +578,58 @@ export interface GroundedBriefContext {
 export interface ScheduleRunCost {
   llm_cost_usd: number;
   llm_calls: number;
+  llm_priced_calls: number;
+  llm_estimated_calls: number;
+  prompt_tokens: number;
+  prompt_cache_hit_tokens: number;
+  prompt_cache_miss_tokens: number;
+  completion_tokens: number;
+  reasoning_tokens: number;
   tool_cost_usd: number;
   tool_calls: number;
   tool_priced_calls: number;
+  tool_estimated_calls: number;
+  known_costs: CurrencyCost[];
   latest_acquisition_calls: number;
   latest_acquisition_failures: number;
+}
+
+export type ProviderPriceMeter = "llm_tokens" | "request";
+export type ProviderPriceCurrency = "USD" | "CNY";
+
+export interface ProviderPriceRule {
+  id: number;
+  provider: string;
+  resource: string;
+  meter: ProviderPriceMeter;
+  currency: ProviderPriceCurrency;
+  input_cache_hit_per_million?: number;
+  input_cache_miss_per_million?: number;
+  output_per_million?: number;
+  request_unit_price?: number;
+  request_included_quantity?: number;
+  request_additional_unit_price?: number;
+  effective_from: string;
+  effective_to?: string;
+  source_url: string;
+  note: string;
+  created_by?: number;
+  created_at: string;
+}
+
+export interface ReplaceProviderPriceRule {
+  provider: string;
+  resource: string;
+  meter: ProviderPriceMeter;
+  currency: ProviderPriceCurrency;
+  input_cache_hit_per_million?: number;
+  input_cache_miss_per_million?: number;
+  output_per_million?: number;
+  request_unit_price?: number;
+  request_included_quantity?: number;
+  request_additional_unit_price?: number;
+  source_url: string;
+  note: string;
 }
 
 export interface SchedulePlaybook {
@@ -924,6 +986,7 @@ const taskHealthActions = new Set<TaskHealthAction>([
 const taskHealthCostCoverage = new Set<CostCoverage>([
   "none",
   "llm_only",
+  "llm_partial",
   "tools_only",
   "tools_partial",
   "llm_and_tools",
@@ -1023,6 +1086,18 @@ export function normalizeTaskHealth(
     typeof usage.llm_calls === "number" &&
     Number.isSafeInteger(usage.llm_calls) &&
     usage.llm_calls >= 0;
+  const llmPricedCallsValid =
+    typeof usage.llm_priced_calls === "number" &&
+    Number.isSafeInteger(usage.llm_priced_calls) &&
+    usage.llm_priced_calls >= 0 &&
+    llmCallsValid &&
+    usage.llm_priced_calls <= Number(usage.llm_calls);
+  const llmEstimatedCallsValid =
+    typeof usage.llm_estimated_calls === "number" &&
+    Number.isSafeInteger(usage.llm_estimated_calls) &&
+    usage.llm_estimated_calls >= 0 &&
+    llmPricedCallsValid &&
+    usage.llm_estimated_calls <= Number(usage.llm_priced_calls);
   const toolCallsValid =
     typeof usage.tool_calls === "number" &&
     Number.isSafeInteger(usage.tool_calls) &&
@@ -1033,6 +1108,57 @@ export function normalizeTaskHealth(
     usage.tool_priced_calls >= 0 &&
     toolCallsValid &&
     usage.tool_priced_calls <= Number(usage.tool_calls);
+  const toolEstimatedCallsValid =
+    typeof usage.tool_estimated_calls === "number" &&
+    Number.isSafeInteger(usage.tool_estimated_calls) &&
+    usage.tool_estimated_calls >= 0 &&
+    toolPricedCallsValid &&
+    usage.tool_estimated_calls <= Number(usage.tool_priced_calls);
+  const integerUsage = (
+    key:
+      | "prompt_tokens"
+      | "prompt_cache_hit_tokens"
+      | "prompt_cache_miss_tokens"
+      | "completion_tokens"
+      | "reasoning_tokens",
+  ): number | undefined => {
+    const amount = usage[key];
+    return typeof amount === "number" &&
+      Number.isSafeInteger(amount) &&
+      amount >= 0
+      ? amount
+      : undefined;
+  };
+  const promptTokens = integerUsage("prompt_tokens");
+  const promptCacheHitTokens = integerUsage("prompt_cache_hit_tokens");
+  const promptCacheMissTokens = integerUsage("prompt_cache_miss_tokens");
+  const completionTokens = integerUsage("completion_tokens");
+  const reasoningTokens = integerUsage("reasoning_tokens");
+  const tokenShapeValid =
+    promptTokens !== undefined &&
+    promptCacheHitTokens !== undefined &&
+    promptCacheMissTokens !== undefined &&
+    completionTokens !== undefined &&
+    reasoningTokens !== undefined &&
+    promptCacheHitTokens + promptCacheMissTokens <= promptTokens &&
+    reasoningTokens <= completionTokens;
+  const knownCostsShapeValid = Array.isArray(usage.known_costs);
+  const knownCostsRaw: unknown[] = knownCostsShapeValid
+    ? (usage.known_costs as unknown[])
+    : [];
+  const knownCosts = knownCostsRaw.flatMap((rawCost) => {
+    const cost = asObject<Record<string, unknown>>(rawCost);
+    return (cost.currency === "USD" || cost.currency === "CNY") &&
+      typeof cost.amount === "number" &&
+      Number.isFinite(cost.amount) &&
+      cost.amount >= 0
+      ? [{ currency: cost.currency, amount: cost.amount } satisfies CurrencyCost]
+      : [];
+  });
+  const knownCostsValid =
+    knownCostsShapeValid &&
+    knownCosts.length === knownCostsRaw.length &&
+    new Set(knownCosts.map((cost) => cost.currency)).size === knownCosts.length;
   const usageCoverageCoherent =
     (coverage === "none" &&
       !llmCallsValid &&
@@ -1040,28 +1166,56 @@ export function normalizeTaskHealth(
       !toolPricedCallsValid) ||
     (coverage === "llm_only" &&
       llmCallsValid &&
+      llmPricedCallsValid &&
+      llmEstimatedCallsValid &&
+      Number(usage.llm_priced_calls) === Number(usage.llm_calls) &&
+      Number(usage.llm_estimated_calls) === 0 &&
+      !toolCallsValid &&
+      !toolPricedCallsValid) ||
+    (coverage === "llm_partial" &&
+      llmCallsValid &&
+      llmPricedCallsValid &&
+      llmEstimatedCallsValid &&
+      (Number(usage.llm_priced_calls) < Number(usage.llm_calls) ||
+        Number(usage.llm_estimated_calls) > 0) &&
       !toolCallsValid &&
       !toolPricedCallsValid) ||
     (coverage === "tools_only" &&
       !llmCallsValid &&
       toolCallsValid &&
       toolPricedCallsValid &&
-      Number(usage.tool_priced_calls) === Number(usage.tool_calls)) ||
+      toolEstimatedCallsValid &&
+      Number(usage.tool_priced_calls) === Number(usage.tool_calls) &&
+      Number(usage.tool_estimated_calls) === 0) ||
     (coverage === "tools_partial" &&
       !llmCallsValid &&
       toolCallsValid &&
       toolPricedCallsValid &&
-      Number(usage.tool_priced_calls) < Number(usage.tool_calls)) ||
+      toolEstimatedCallsValid &&
+      (Number(usage.tool_priced_calls) < Number(usage.tool_calls) ||
+        Number(usage.tool_estimated_calls) > 0)) ||
     (coverage === "llm_and_tools" &&
       llmCallsValid &&
+      llmPricedCallsValid &&
+      llmEstimatedCallsValid &&
       toolCallsValid &&
       toolPricedCallsValid &&
-      Number(usage.tool_priced_calls) === Number(usage.tool_calls)) ||
+      toolEstimatedCallsValid &&
+      Number(usage.llm_priced_calls) === Number(usage.llm_calls) &&
+      Number(usage.llm_estimated_calls) === 0 &&
+      Number(usage.tool_priced_calls) === Number(usage.tool_calls) &&
+      Number(usage.tool_estimated_calls) === 0) ||
     (coverage === "llm_and_tools_partial" &&
       llmCallsValid &&
+      llmPricedCallsValid &&
+      llmEstimatedCallsValid &&
       toolCallsValid &&
       toolPricedCallsValid &&
-      Number(usage.tool_priced_calls) < Number(usage.tool_calls));
+      toolEstimatedCallsValid &&
+      (Number(usage.llm_priced_calls) < Number(usage.llm_calls) ||
+        Number(usage.llm_estimated_calls) > 0 ||
+        Number(usage.tool_priced_calls) < Number(usage.tool_calls) ||
+        Number(usage.tool_estimated_calls) > 0));
   if (
     projected.permissions.can_view_usage &&
     typeof usage.known_cost_usd === "number" &&
@@ -1069,14 +1223,23 @@ export function normalizeTaskHealth(
     usage.known_cost_usd >= 0 &&
     taskHealthCostCoverage.has(coverage) &&
     taskHealthBudgetStates.has(budgetState) &&
+    knownCostsValid &&
+    tokenShapeValid &&
     usageCoverageCoherent
   ) {
     projected.usage = {
       known_cost_usd: usage.known_cost_usd,
+      known_costs: knownCosts,
       coverage,
       budget_state: budgetState,
       ...(llmCallsValid
         ? { llm_calls: Number(usage.llm_calls) }
+        : {}),
+      ...(llmPricedCallsValid
+        ? { llm_priced_calls: Number(usage.llm_priced_calls) }
+        : {}),
+      ...(llmEstimatedCallsValid
+        ? { llm_estimated_calls: Number(usage.llm_estimated_calls) }
         : {}),
       ...(toolCallsValid
         ? { tool_calls: Number(usage.tool_calls) }
@@ -1084,6 +1247,14 @@ export function normalizeTaskHealth(
       ...(toolPricedCallsValid
         ? { tool_priced_calls: Number(usage.tool_priced_calls) }
         : {}),
+      ...(toolEstimatedCallsValid
+        ? { tool_estimated_calls: Number(usage.tool_estimated_calls) }
+        : {}),
+      prompt_tokens: promptTokens!,
+      prompt_cache_hit_tokens: promptCacheHitTokens!,
+      prompt_cache_miss_tokens: promptCacheMissTokens!,
+      completion_tokens: completionTokens!,
+      reasoning_tokens: reasoningTokens!,
       ...(typeof usage.window_start === "string"
         ? { window_start: usage.window_start }
         : {}),
@@ -1382,6 +1553,22 @@ export const api = {
     request<RunstatsResp>(
       `/api/admin/runstats?window_hours=${encodeURIComponent(windowHours)}`,
     ).then((r) => ({ ...r, spans: arr(r.spans), days: arr(r.days), models: arr(r.models) })),
+  adminListProviderPrices: () =>
+    request<{ rules: ProviderPriceRule[] }>("/api/admin/provider-prices").then(
+      (response) => arr(response.rules),
+    ),
+  adminReplaceProviderPrice: (
+    input: ReplaceProviderPriceRule,
+    idempotencyKey: string,
+  ) =>
+    request<ProviderPriceRule>("/api/admin/provider-prices", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(input),
+    }),
 
   // ---- M5 Gate 可观测性（契约 §16）----
   // 只读端点，窗口由前端固化档位给（见 Observability.tsx 的 WINDOW_OPTIONS），

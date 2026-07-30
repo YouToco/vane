@@ -11,6 +11,11 @@ const copies = {
     modelCalls: "Model calls",
     acquisitionCalls: "Acquisition calls",
     pricedCalls: "priced",
+    estimatedCalls: "Estimated-price calls",
+    inputTokens: "Input tokens",
+    outputTokens: "Output tokens",
+    cacheTokens: "Cache hit / miss",
+    reasoningTokens: "Reasoning tokens",
     recommended: "Recommended",
     states: {
       healthy: "Healthy",
@@ -38,6 +43,7 @@ const copies = {
     coverage: {
       none: "No attributable cost yet",
       llm_only: "LLM cost only; acquisition cost is not yet attributed",
+      llm_partial: "Known LLM cost is incomplete or includes an estimate",
       tools_only: "Acquisition cost only",
       tools_partial: "Known acquisition cost is a lower bound",
       llm_and_tools: "LLM and acquisition costs included",
@@ -83,6 +89,11 @@ const copies = {
     modelCalls: "模型调用",
     acquisitionCalls: "信息获取次数",
     pricedCalls: "已统计费用",
+    estimatedCalls: "使用估算价格的调用",
+    inputTokens: "输入 token",
+    outputTokens: "输出 token",
+    cacheTokens: "缓存命中 / 未命中",
+    reasoningTokens: "其中推理 token",
     recommended: "建议",
     states: {
       healthy: "运行正常",
@@ -110,6 +121,7 @@ const copies = {
     coverage: {
       none: "暂无可归集成本",
       llm_only: "仅含模型成本，采集成本尚未完成归集",
+      llm_partial: "模型费用包含估算或仍有调用未定价",
       tools_only: "仅含信息获取费用",
       tools_partial: "信息获取费用只统计了已知部分",
       llm_and_tools: "已包含模型与信息获取费用",
@@ -155,6 +167,11 @@ const copies = {
     modelCalls: "模型呼叫",
     acquisitionCalls: "資訊取得次數",
     pricedCalls: "已統計費用",
+    estimatedCalls: "使用估算價格的呼叫",
+    inputTokens: "輸入 token",
+    outputTokens: "輸出 token",
+    cacheTokens: "快取命中 / 未命中",
+    reasoningTokens: "其中推理 token",
     recommended: "建議",
     states: {
       healthy: "執行正常",
@@ -182,6 +199,7 @@ const copies = {
     coverage: {
       none: "暫無可歸集成本",
       llm_only: "僅含模型成本，蒐集成本尚未歸集",
+      llm_partial: "模型費用包含估算或仍有呼叫未定價",
       tools_only: "僅含蒐集成本",
       tools_partial: "蒐集成本只統計了已知部分",
       llm_and_tools: "已包含模型與蒐集成本",
@@ -227,6 +245,11 @@ const copies = {
     modelCalls: "モデル呼び出し",
     acquisitionCalls: "収集呼び出し",
     pricedCalls: "価格確認済み",
+    estimatedCalls: "推定価格の呼び出し",
+    inputTokens: "入力 token",
+    outputTokens: "出力 token",
+    cacheTokens: "キャッシュ hit / miss",
+    reasoningTokens: "推論 token",
     recommended: "推奨",
     states: {
       healthy: "正常",
@@ -254,6 +277,7 @@ const copies = {
     coverage: {
       none: "計上済みコストなし",
       llm_only: "モデル費用のみ。収集費用は未計上です",
+      llm_partial: "モデル費用に推定または未価格の呼び出しがあります",
       tools_only: "収集費用のみ",
       tools_partial: "確認済みの収集費用は下限です",
       llm_and_tools: "モデル費用と収集費用を含みます",
@@ -299,6 +323,11 @@ const copies = {
     modelCalls: "모델 호출",
     acquisitionCalls: "수집 호출",
     pricedCalls: "가격 확인",
+    estimatedCalls: "추정 가격 호출",
+    inputTokens: "입력 token",
+    outputTokens: "출력 token",
+    cacheTokens: "캐시 적중 / 미적중",
+    reasoningTokens: "추론 token",
     recommended: "권장",
     states: {
       healthy: "정상",
@@ -326,6 +355,7 @@ const copies = {
     coverage: {
       none: "귀속된 비용 없음",
       llm_only: "모델 비용만 포함하며 수집 비용은 아직 귀속되지 않음",
+      llm_partial: "모델 비용에 추정 또는 미가격 호출이 포함됨",
       tools_only: "수집 비용만 포함",
       tools_partial: "확인된 수집 비용은 하한값임",
       llm_and_tools: "모델 및 수집 비용 포함",
@@ -371,6 +401,11 @@ const copies = {
     modelCalls: "Llamadas al modelo",
     acquisitionCalls: "Llamadas de recopilación",
     pricedCalls: "con precio",
+    estimatedCalls: "Llamadas con precio estimado",
+    inputTokens: "Tokens de entrada",
+    outputTokens: "Tokens de salida",
+    cacheTokens: "Caché acierto / fallo",
+    reasoningTokens: "Tokens de razonamiento",
     recommended: "Recomendado",
     states: {
       healthy: "Correcto",
@@ -398,6 +433,7 @@ const copies = {
     coverage: {
       none: "Aún no hay costes atribuibles",
       llm_only: "Solo coste del modelo; falta atribuir la recopilación",
+      llm_partial: "El coste del modelo incluye estimaciones o llamadas sin precio",
       tools_only: "Solo coste de recopilación",
       tools_partial: "El coste conocido de recopilación es un mínimo",
       llm_and_tools: "Incluye modelo y recopilación",
@@ -443,6 +479,11 @@ const copies = {
     modelCalls: "Appels modèle",
     acquisitionCalls: "Appels collecte",
     pricedCalls: "tarifés",
+    estimatedCalls: "Appels au tarif estimé",
+    inputTokens: "Tokens d’entrée",
+    outputTokens: "Tokens de sortie",
+    cacheTokens: "Cache succès / échec",
+    reasoningTokens: "Tokens de raisonnement",
     recommended: "Recommandé",
     states: {
       healthy: "Normal",
@@ -470,6 +511,7 @@ const copies = {
     coverage: {
       none: "Aucun coût attribuable",
       llm_only: "Coût du modèle uniquement ; collecte non attribuée",
+      llm_partial: "Le coût du modèle inclut une estimation ou des appels non tarifés",
       tools_only: "Coût de collecte uniquement",
       tools_partial: "Le coût de collecte connu est un minimum",
       llm_and_tools: "Modèle et collecte inclus",
@@ -515,6 +557,11 @@ const copies = {
     modelCalls: "Modellaufrufe",
     acquisitionCalls: "Erfassungsaufrufe",
     pricedCalls: "bepreist",
+    estimatedCalls: "Aufrufe mit Schätzpreis",
+    inputTokens: "Eingabe-Token",
+    outputTokens: "Ausgabe-Token",
+    cacheTokens: "Cache-Treffer / Fehlschlag",
+    reasoningTokens: "Reasoning-Token",
     recommended: "Empfohlen",
     states: {
       healthy: "In Ordnung",
@@ -542,6 +589,7 @@ const copies = {
     coverage: {
       none: "Noch keine zurechenbaren Kosten",
       llm_only: "Nur Modellkosten; Erfassung noch nicht zugerechnet",
+      llm_partial: "Modellkosten enthalten Schätzungen oder unbepreiste Aufrufe",
       tools_only: "Nur Erfassungskosten",
       tools_partial: "Bekannte Erfassungskosten sind nur eine Untergrenze",
       llm_and_tools: "Modell- und Erfassungskosten enthalten",

@@ -361,6 +361,7 @@ export const ko: Dict = {
       ownerBadge: "플랫폼 관리 · 오너 전용",
       tabObservability: "관측성",
       tabCosts: "LLM 비용",
+      tabPricing: "가격 설정",
       tabInvites: "사용자 및 초대",
       zhOnly: "관측성·비용 대시보드는 플랫폼 운영용 화면으로, 현재 중국어로만 제공됩니다.",
       invites: {

@@ -361,6 +361,7 @@ export const fr: Dict = {
       ownerBadge: "Administration plateforme · réservé à l'owner",
       tabObservability: "Observabilité",
       tabCosts: "Coûts LLM",
+      tabPricing: "Tarification",
       tabInvites: "Utilisateurs et invitations",
       zhOnly: "Les tableaux d'observabilité et de coûts sont des vues d'exploitation de la plateforme, disponibles pour l'instant en chinois uniquement.",
       invites: {
