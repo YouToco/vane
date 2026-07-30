@@ -12,6 +12,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/types"
 )
@@ -49,6 +51,25 @@ func validScheduledTaskWorkflowExecutionIDV1(taskID, workflowID string) bool {
 	return err == nil && parsed.UTC().Format(timestampLayout) == timestamp
 }
 
+// validTaskWorkflowExecutionIDV1 admits the two durable workflow identities:
+// Temporal Schedule executions remain task-bound, while one-off manual runs
+// carry an exact schedule_commands UUID. The database authorization layer
+// subsequently proves that UUID belongs to the same tenant, user, task, kind,
+// and live command state; this function only rejects malformed identities
+// before any database work.
+func validTaskWorkflowExecutionIDV1(taskID, workflowID string) bool {
+	if validScheduledTaskWorkflowExecutionIDV1(taskID, workflowID) {
+		return true
+	}
+	if !validTaskRunReferenceTextV1(workflowID, maxTaskRunReferenceBytesV1) ||
+		!strings.HasPrefix(workflowID, types.ManualTaskWorkflowPrefix) {
+		return false
+	}
+	commandID := strings.TrimPrefix(workflowID, types.ManualTaskWorkflowPrefix)
+	parsed, err := uuid.Parse(commandID)
+	return err == nil && parsed.String() == commandID
+}
+
 func validateTaskRunSnapshotReferenceForExpectedV1(
 	ref types.RunSnapshotRef,
 	expected types.RunIdentity,
@@ -77,7 +98,7 @@ func validateTaskRunExpectedIdentityV1(expected types.RunIdentity) error {
 		!validTaskRunReferenceTextV1(expected.TemporalWorkflowID, maxTaskRunReferenceBytesV1) ||
 		!validTaskRunReferenceTextV1(expected.TemporalRunID, maxTaskRunReferenceBytesV1) ||
 		!validTaskRunReferenceTextV1(expected.TaskID, maxTaskRunReferenceTaskIDV1) ||
-		!validScheduledTaskWorkflowExecutionIDV1(
+		!validTaskWorkflowExecutionIDV1(
 			expected.TaskID, expected.TemporalWorkflowID) {
 		return errors.New("invalid expected v1 task run identity")
 	}

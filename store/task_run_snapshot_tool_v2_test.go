@@ -100,7 +100,9 @@ func TestCompiledTaskRunSnapshotV2_PausedManualRunRequiresExactCommand(
 
 	if _, err := st.pool.Exec(ctx,
 		`UPDATE schedule_commands
-		    SET status=$2, phase=$3
+		    SET status=$2, phase=$3, completed_at=clock_timestamp(),
+		        error_code='manual_run_blocked',
+		        error_message='manual run blocked by test'
 		  WHERE id=$1`,
 		command.ID, types.ScheduleCommandBlocked,
 		types.ScheduleCommandBlockedPhase,
