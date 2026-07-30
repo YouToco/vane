@@ -275,13 +275,19 @@ func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID
 		                 AND same_workflow.temporal_workflow_id =
 		                     latest.temporal_workflow_id
 		            ) AS workflow_run_count
-		       FROM task_run_snapshots latest
-		       JOIN authorized_task task
-		         ON latest.tenant_id = task.tenant_id
-		        AND latest.user_id = task.user_id
-		        AND latest.task_id = task.id
-		      ORDER BY latest.created_at DESC, latest.id DESC
-		      LIMIT 1
+		       FROM authorized_task task
+		       CROSS JOIN LATERAL (
+		         SELECT candidate.tenant_id, candidate.user_id,
+		                candidate.task_id,
+		                candidate.temporal_workflow_id
+		           FROM task_run_snapshots candidate
+		          WHERE candidate.tenant_id = task.tenant_id
+		            AND candidate.user_id = task.user_id
+		            AND candidate.task_id = task.id
+		          ORDER BY candidate.created_at DESC,
+		                   candidate.id DESC
+		          LIMIT 1
+		       ) latest
 		   ),
 		   latest_calls AS (
 		     SELECT tc.error_type
