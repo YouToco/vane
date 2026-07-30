@@ -2807,6 +2807,10 @@ func (a *Activities) qualifyEventCandidates(
 		return nil, "", nonRetryable(types.NewAppError(
 			types.CodeConflict, "observation qualification state is invalid", nil))
 	}
+	result = attachIndependentCrossEvidence(
+		result, candidates, window,
+		snapshot.Definition.PlaybookContent,
+	)
 	qualified, outcome, err := a.validateQualifiedEvents(
 		policy, policyDigest, window, candidates,
 		snapshot.Definition.PlaybookContent, result)
@@ -3041,6 +3045,76 @@ func evidenceSupportsReleaseIdentity(
 	if len(releaseTokens) == 0 {
 		return false
 	}
+	matches := releaseEvidenceTokenMatches(releaseIdentifier, candidate)
+	required := 2
+	if len(releaseTokens) == 1 {
+		required = 1
+	}
+	return matches >= required
+}
+
+func attachIndependentCrossEvidence(
+	result eventqualifier.Result,
+	candidates []types.ContentItem,
+	window observation.Window,
+	taskManual string,
+) eventqualifier.Result {
+	if result.Outcome != "match" ||
+		!taskManualRequiresCrossEvidence(taskManual) {
+		return result
+	}
+	byID := make(map[int64]types.ContentItem, len(candidates))
+	for _, candidate := range candidates {
+		byID[candidate.ID] = candidate
+	}
+	events := append([]eventqualifier.Event(nil), result.Events...)
+	for index := range events {
+		event := &events[index]
+		if len(event.EvidenceContentIDs) != 1 {
+			continue
+		}
+		primary, ok := byID[event.EvidenceContentIDs[0]]
+		if !ok {
+			continue
+		}
+		primaryHost := evidenceHostname(primary.URL)
+		bestID := int64(0)
+		bestScore := 0
+		for _, candidate := range candidates {
+			if candidate.ID == primary.ID ||
+				candidate.PublishedAt == nil ||
+				!window.Contains(candidate.PublishedAt.UTC()) ||
+				evidenceHostname(candidate.URL) == "" ||
+				evidenceHostname(candidate.URL) == primaryHost ||
+				officialHostGroundedInTaskManual(
+					candidate.URL, taskManual) {
+				continue
+			}
+			score := releaseEvidenceTokenMatches(
+				event.ReleaseIdentifier, candidate)
+			if score < 2 {
+				continue
+			}
+			if score > bestScore ||
+				(score == bestScore && (bestID == 0 || candidate.ID < bestID)) {
+				bestID = candidate.ID
+				bestScore = score
+			}
+		}
+		if bestID != 0 {
+			event.EvidenceContentIDs = append(
+				append([]int64(nil), event.EvidenceContentIDs...), bestID)
+		}
+	}
+	result.Events = events
+	return result
+}
+
+func releaseEvidenceTokenMatches(
+	releaseIdentifier string,
+	candidate types.ContentItem,
+) int {
+	releaseTokens := meaningfulReleaseTokens(releaseIdentifier)
 	candidateTokens := meaningfulReleaseTokens(
 		candidate.Title + " " + candidate.Content)
 	matches := 0
@@ -3049,11 +3123,7 @@ func evidenceSupportsReleaseIdentity(
 			matches++
 		}
 	}
-	required := 2
-	if len(releaseTokens) == 1 {
-		required = 1
-	}
-	return matches >= required
+	return matches
 }
 
 func meaningfulReleaseTokens(value string) map[string]struct{} {

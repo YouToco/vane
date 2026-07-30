@@ -282,6 +282,59 @@ func TestValidateQualifiedEventsRejectsUnrelatedCrossEvidence(t *testing.T) {
 	}
 }
 
+func TestAttachIndependentCrossEvidenceUsesMatchingMediaOnly(t *testing.T) {
+	releasedAt := time.Date(2026, 7, 28, 16, 0, 0, 0, time.UTC)
+	crossAt := releasedAt.Add(time.Hour)
+	unrelatedAt := releasedAt.Add(2 * time.Hour)
+	window := observation.Window{
+		Start: releasedAt.Add(-time.Hour),
+		End:   releasedAt.Add(48 * time.Hour),
+	}
+	items := []types.ContentItem{
+		{
+			ID: 1, URL: "https://blog.google/managed-agents",
+			Title:       "What's new in Managed Agents in Gemini API",
+			Content:     "Managed Agents now use Gemini 3.6 Flash.",
+			PublishedAt: &releasedAt,
+		},
+		{
+			ID: 2, URL: "https://gcn.com/google-managed-agents",
+			Title:       "Google upgrades Gemini API Managed Agents",
+			Content:     "Managed Agents get Gemini 3.6 Flash and hooks.",
+			PublishedAt: &crossAt,
+		},
+		{
+			ID: 3, URL: "https://media.example/gpt-5-6",
+			Title:       "GPT 5.6 benchmark settings",
+			Content:     "GPT 5.6 on ARC AGI.",
+			PublishedAt: &unrelatedAt,
+		},
+	}
+	result := eventqualifier.Result{Outcome: "match", Events: []eventqualifier.Event{{
+		ReleaseIdentifier:  "Gemini API Managed Agents 3.6 Flash hooks",
+		EvidenceContentIDs: []int64{1},
+	}}}
+	got := attachIndependentCrossEvidence(
+		result, items, window,
+		"监控 Google DeepMind 官方原文；必须有独立交叉证据。",
+	)
+	if len(got.Events) != 1 ||
+		len(got.Events[0].EvidenceContentIDs) != 2 ||
+		got.Events[0].EvidenceContentIDs[1] != 2 {
+		t.Fatalf("matching cross evidence = %+v", got)
+	}
+
+	result.Events[0].ReleaseIdentifier =
+		"GPT Live Transcribe transcription"
+	got = attachIndependentCrossEvidence(
+		result, items, window,
+		"监控 OpenAI 官方原文；必须有独立交叉证据。",
+	)
+	if len(got.Events[0].EvidenceContentIDs) != 1 {
+		t.Fatalf("unrelated GPT evidence was attached: %+v", got)
+	}
+}
+
 func TestOfficialHostGroundedInTaskManualRejectsPathImpersonation(t *testing.T) {
 	manual := "监控 OpenAI、Anthropic 和 Google DeepMind 的官方原文。"
 	for rawURL, want := range map[string]bool{
