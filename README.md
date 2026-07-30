@@ -21,8 +21,11 @@ contain no production workflow, runner label, or production credential.
   read-only deploy keys to resolve each source `main`, then compares those exact
   SHAs with the VM's durable state. It neither checks out nor executes source.
 - `build` runs on `vane-build` only when a component changed. Backend Gate is
-  `go mod download`, `go vet ./...`, and the complete uncached shuffled race
-  test suite against PostgreSQL 18. Frontend Gate is `npm ci`, tests, typecheck,
+  `go mod download`, `go vet ./...`, and the complete uncached race test suite
+  against PostgreSQL 18. It deliberately matches source CI test ordering:
+  Store integration tests share one database, so random start-order changes
+  produce timing-only migration-lock and refill-clock failures rather than an
+  independent isolation signal. Frontend Gate is `npm ci`, tests, typecheck,
   and build. After each Gate, the source is materialized again at the exact SHA
   with a short-lived read key; release builds start from that new clean tree.
 - `deploy` runs on `vane-deploy`. It downloads only artifacts named with the

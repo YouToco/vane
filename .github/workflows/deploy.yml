@@ -255,7 +255,11 @@ jobs:
           go mod download
           go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
           go vet ./...
-          go test -race -count=1 -shuffle=on \
+          # Store integration tests share one PostgreSQL service. Randomizing
+          # their start order creates timing-only failures in migration locks
+          # and refill clocks without adding isolation coverage; source CI
+          # already uses this same complete race gate deterministically.
+          go test -race -count=1 \
             -coverprofile=coverage.txt -covermode=atomic ./...
 
       - name: Rematerialize clean backend source for release
