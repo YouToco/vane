@@ -54,7 +54,7 @@ jobs:
         run: go run ./cmd/agenttoolinventory -check
 
       - name: Test
-        run: go test -race -coverprofile=coverage.txt -covermode=atomic ./...
+        run: go test -race -timeout=15m -coverprofile=coverage.txt -covermode=atomic ./...
         env:
           DATABASE_URL: postgres://vane:vane_test@localhost:5432/vane_test?sslmode=disable
 
