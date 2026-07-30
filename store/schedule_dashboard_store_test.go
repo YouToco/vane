@@ -116,14 +116,29 @@ func TestScheduleDashboardStore(t *testing.T) {
 			t.Fatalf("种子 SQL 失败: %v\n  %s", err, sql)
 		}
 	}
-	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, tenant_id, user_id, cost_usd)
-		VALUES ($1,'score','test-model',(SELECT tenant_id FROM schedules WHERE id=$2),$3,0.5)`,
+	mustExec(t, `INSERT INTO llm_calls (
+			trace_id, span_name, model, tenant_id, user_id, cost_usd,
+			cost_amount, cost_currency, pricing_status
+		) VALUES (
+			$1,'score','test-model',(SELECT tenant_id FROM schedules WHERE id=$2),
+			$3,0.5,0.5,'USD','legacy'
+		)`,
 		trace1, schedID, owner.ID)
-	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, tenant_id, user_id, cost_usd)
-		VALUES ($1,'cardgen','test-model',(SELECT tenant_id FROM schedules WHERE id=$2),$3,0.25)`,
+	mustExec(t, `INSERT INTO llm_calls (
+			trace_id, span_name, model, tenant_id, user_id, cost_usd,
+			cost_amount, cost_currency, pricing_status
+		) VALUES (
+			$1,'cardgen','test-model',(SELECT tenant_id FROM schedules WHERE id=$2),
+			$3,0.25,0.25,'USD','legacy'
+		)`,
 		trace1, schedID, owner.ID)
-	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, tenant_id, user_id, cost_usd)
-		VALUES ($1,'score','test-model',(SELECT tenant_id FROM schedules WHERE id=$2),$3,9.9)`,
+	mustExec(t, `INSERT INTO llm_calls (
+			trace_id, span_name, model, tenant_id, user_id, cost_usd,
+			cost_amount, cost_currency, pricing_status
+		) VALUES (
+			$1,'score','test-model',(SELECT tenant_id FROM schedules WHERE id=$2),
+			$3,9.9,9.9,'USD','legacy'
+		)`,
 		foreignTrace, foreignSchedID, stranger.ID)
 
 	t.Cleanup(func() {
@@ -280,6 +295,10 @@ func TestScheduleDashboardStore(t *testing.T) {
 		if math.Abs(cost.LLMCostUSD-0.75) > 1e-9 || cost.LLMCalls != 2 {
 			t.Errorf("LLM 成本不符: cost=%v calls=%d, 期望 0.75/2（外人 9.9 不得串入）",
 				cost.LLMCostUSD, cost.LLMCalls)
+		}
+		if cost.LLMPricedCalls != 2 || cost.LLMEstimatedCalls != 2 {
+			t.Errorf("legacy LLM 必须保守标为估算: priced=%d estimated=%d",
+				cost.LLMPricedCalls, cost.LLMEstimatedCalls)
 		}
 		// 外人查 owner 的任务：全零。
 		fcost, err := st.GetScheduleRunCost(ctx, stranger.ID, schedID)

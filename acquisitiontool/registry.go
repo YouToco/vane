@@ -5,7 +5,7 @@
 // 为什么要有这一层，而不是把可用性散落在各处的 switch 注释里（契约 §2.2）：
 // 现状把"某能力为什么不能用"写在 const 注释上（tikhub.go 记 get_video_note_detail
 // 串号、general 排序坏），**只对读代码的人生效，对 agent 不生效**。三个月后有人看到
-// TikHub 有 fetch_search_timeline 且只要 $0.001，会理直气壮加上去，ship 一个 code=200、
+// TikHub 有 fetch_search_timeline 且看起来便宜，会理直气壮加上去，ship 一个 code=200、
 // 报文毫无异常的**教科书级静默失败**源。
 //
 // 本注册表把 (平台, 能力) → {内容种类, 可用状态, 不可用原因} 变成**数据**，被三处共用：

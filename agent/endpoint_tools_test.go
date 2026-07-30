@@ -757,6 +757,10 @@ func TestExecRecorded_SanitizesNonUTF8AndNUL(t *testing.T) {
 	if endpointRec == nil {
 		t.Fatal("缺端点记账行")
 	}
+	if endpointRec.Provider != "tikhub" || endpointRec.UsageQuantity != 1 {
+		t.Fatalf("TikHub endpoint billing receipt = provider %q quantity %v",
+			endpointRec.Provider, endpointRec.UsageQuantity)
+	}
 	if !utf8.ValidString(endpointRec.ResultPreview) {
 		t.Errorf("result_preview 含非法 UTF-8: %q", endpointRec.ResultPreview)
 	}

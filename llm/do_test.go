@@ -92,6 +92,48 @@ func TestDo_ErrorAuditUsesRequestedModelOverride(t *testing.T) {
 	}
 }
 
+func TestDo_RecordsUsageFromInvalidSuccessfulResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"model":"deepseek-v4-pro",
+			"choices":[],
+			"usage":{
+				"prompt_tokens":100,
+				"completion_tokens":25,
+				"prompt_cache_hit_tokens":40,
+				"prompt_cache_miss_tokens":60,
+				"completion_tokens_details":{"reasoning_tokens":10}
+			}
+		}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	st := &capturingRecorderStore{}
+	resp, err := Do(t.Context(), newTestClient(srv.URL, 1), &Recorder{st: st},
+		CallMeta{TraceID: "invalid-success-usage", SpanName: "score"},
+		Request{User: "compiled run", Model: "deepseek-v4-pro"})
+	if err == nil || resp != nil {
+		t.Fatalf("Do() = response %v, error %v; want hidden metadata and error", resp, err)
+	}
+	call := st.onlyCall(t)
+	if call.PromptTokens != 100 || call.CompletionTokens != 25 {
+		t.Fatalf("recorded tokens = (%d,%d), want (100,25)",
+			call.PromptTokens, call.CompletionTokens)
+	}
+	if call.PromptCacheHitTokens == nil || *call.PromptCacheHitTokens != 40 ||
+		call.PromptCacheMissTokens == nil || *call.PromptCacheMissTokens != 60 {
+		t.Fatalf("recorded cache tokens = (%v,%v), want (40,60)",
+			call.PromptCacheHitTokens, call.PromptCacheMissTokens)
+	}
+	if call.ReasoningTokens == nil || *call.ReasoningTokens != 10 {
+		t.Fatalf("recorded reasoning tokens = %v, want 10", call.ReasoningTokens)
+	}
+	if call.Error == "" {
+		t.Fatal("invalid successful response audit omitted error")
+	}
+}
+
 type routingRecorderStore struct {
 	insertCalls int
 

@@ -92,16 +92,20 @@ type Request struct {
 }
 
 // Response 单次调用结果。CacheHitTokens/CacheMissTokens 对应 DeepSeek
-// usage 顶层的 prompt_cache_hit_tokens / prompt_cache_miss_tokens，
-// 上游未返回时为 0（DeepSeek 恒有 hit+miss == prompt_tokens）。
+// CacheTokensReported / ReasoningTokensReported preserve whether the provider
+// actually returned the corresponding breakdown instead of collapsing
+// "unknown" into a real zero.
 type Response struct {
-	Content          string
-	PromptTokens     int
-	CompletionTokens int
-	CacheHitTokens   int
-	CacheMissTokens  int
-	Model            string
-	LatencyMs        int
+	Content                 string
+	PromptTokens            int
+	CompletionTokens        int
+	CacheHitTokens          int
+	CacheMissTokens         int
+	CacheTokensReported     bool
+	ReasoningTokens         int
+	ReasoningTokensReported bool
+	Model                   string
+	LatencyMs               int
 }
 
 // chatMessage / chatRequest / chatResponse 是 OpenAI 兼容协议的收发结构，
@@ -134,11 +138,35 @@ type chatResponse struct {
 		} `json:"message"`
 	} `json:"choices"`
 	Usage struct {
-		PromptTokens          int `json:"prompt_tokens"`
-		CompletionTokens      int `json:"completion_tokens"`
-		PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
-		PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+		PromptTokens          int  `json:"prompt_tokens"`
+		CompletionTokens      int  `json:"completion_tokens"`
+		PromptCacheHitTokens  *int `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens *int `json:"prompt_cache_miss_tokens"`
+		PromptTokensDetails   struct {
+			CachedTokens *int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+		CompletionTokensDetails struct {
+			ReasoningTokens *int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
+}
+
+func usageCacheBreakdown(prompt int, topHit, topMiss, nestedHit *int) (hit, miss int, reported bool) {
+	if topHit != nil && topMiss != nil && *topHit >= 0 && *topMiss >= 0 &&
+		*topHit+*topMiss == prompt {
+		return *topHit, *topMiss, true
+	}
+	if nestedHit != nil && *nestedHit >= 0 && *nestedHit <= prompt {
+		return *nestedHit, prompt - *nestedHit, true
+	}
+	return 0, prompt, false
+}
+
+func usageReasoningBreakdown(completion int, reported *int) (int, bool) {
+	if reported == nil || *reported < 0 || *reported > completion {
+		return 0, false
+	}
+	return *reported, true
 }
 
 // maxErrBodyBytes 错误响应体读取上限：只为生成不可逆诊断指纹，防上游异常大响应。
@@ -230,32 +258,49 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	if err := json.Unmarshal(raw, &cr); err != nil {
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "llm: 响应体不是合法 JSON", err)
 	}
-	if len(cr.Choices) == 0 {
-		return nil, types.NewAppError(types.CodeLLMUnavailable, "llm: 响应缺少 choices", nil)
-	}
-
 	model := cr.Model
 	if model == "" {
 		model = requestModel
 	}
+	hit, miss, cacheReported := usageCacheBreakdown(
+		cr.Usage.PromptTokens,
+		cr.Usage.PromptCacheHitTokens,
+		cr.Usage.PromptCacheMissTokens,
+		cr.Usage.PromptTokensDetails.CachedTokens,
+	)
+	reasoning, reasoningReported := usageReasoningBreakdown(
+		cr.Usage.CompletionTokens,
+		cr.Usage.CompletionTokensDetails.ReasoningTokens,
+	)
+	resp := &Response{
+		PromptTokens:            cr.Usage.PromptTokens,
+		CompletionTokens:        cr.Usage.CompletionTokens,
+		CacheHitTokens:          hit,
+		CacheMissTokens:         miss,
+		CacheTokensReported:     cacheReported,
+		ReasoningTokens:         reasoning,
+		ReasoningTokensReported: reasoningReported,
+		Model:                   model,
+		LatencyMs:               int(time.Since(start).Milliseconds()),
+	}
+	if len(cr.Choices) == 0 {
+		// HTTP 200 已经携带 token 回执时，即使业务响应缺少 choices 也必须把
+		// 用量交给 Do 落账；返回 metadata-only response，与 Chat 的协议失败
+		// 路径保持一致，调用方仍只收到原始错误。
+		return resp, types.NewAppError(types.CodeLLMUnavailable, "llm: 响应缺少 choices", nil)
+	}
+
+	resp.Content = cr.Choices[0].Message.Content
 	// content 空是隐性故障信号（如思维链吃光 max_tokens 预算导致 finish_reason=length
 	// 且 content=""），静默返回会让上层用兜底值掩盖问题——2026-07-14 打分全回退中位分
 	// 三个批次才被发现。这里不报错（语义留给调用方），但必须留下可检索的告警。
-	if cr.Choices[0].Message.Content == "" {
+	if resp.Content == "" {
 		slog.Warn("llm: 上游返回空 content",
 			"model", model,
 			"finish_reason", cr.Choices[0].FinishReason,
 			"completion_tokens", cr.Usage.CompletionTokens)
 	}
-	return &Response{
-		Content:          cr.Choices[0].Message.Content,
-		PromptTokens:     cr.Usage.PromptTokens,
-		CompletionTokens: cr.Usage.CompletionTokens,
-		CacheHitTokens:   cr.Usage.PromptCacheHitTokens,
-		CacheMissTokens:  cr.Usage.PromptCacheMissTokens,
-		Model:            model,
-		LatencyMs:        int(time.Since(start).Milliseconds()),
-	}, nil
+	return resp, nil
 }
 
 // wrapCtxErr 把 ctx 取消/超时包成 AppError，Cause 保留原始 ctx 错误

@@ -125,10 +125,25 @@ func projectTaskHealthV1(
 	if cost != nil {
 		usage.LLMCostUSD = &cost.LLMCostUSD
 		usage.LLMCalls = &cost.LLMCalls
+		usage.LLMPricedCalls = &cost.LLMPricedCalls
+		usage.LLMEstimatedCalls = &cost.LLMEstimatedCalls
+		usage.PromptTokens = &cost.PromptTokens
+		usage.PromptCacheHitTokens = &cost.PromptCacheHitTokens
+		usage.PromptCacheMissTokens = &cost.PromptCacheMissTokens
+		usage.CompletionTokens = &cost.CompletionTokens
+		usage.ReasoningTokens = &cost.ReasoningTokens
+		usage.KnownCosts = make([]taskhealth.CurrencyCostV1, 0, len(cost.KnownCosts))
+		for _, known := range cost.KnownCosts {
+			usage.KnownCosts = append(usage.KnownCosts, taskhealth.CurrencyCostV1{
+				Currency: known.Currency,
+				Amount:   known.Amount,
+			})
+		}
 		if cost.ToolCalls > 0 {
 			usage.ToolCostUSD = &cost.ToolCostUSD
 			usage.ToolCalls = &cost.ToolCalls
 			usage.ToolPricedCalls = &cost.ToolPricedCalls
+			usage.ToolEstimatedCalls = &cost.ToolEstimatedCalls
 		}
 		acquisition.Total = cost.LatestAcquisitionCalls
 		acquisition.Failing = cost.LatestAcquisitionFailures

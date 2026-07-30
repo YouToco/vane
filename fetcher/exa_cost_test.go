@@ -294,7 +294,7 @@ func TestExaRecordCall_DetachesCancellationWithBoundedDeadline(t *testing.T) {
 
 	rec := &mockRecorder{}
 	e := NewExa(config.FetchConfig{}, rec)
-	e.recordCall(ctx, types.FetchTarget{}, 200, 0, 0, 0, nil)
+	e.recordCall(ctx, types.FetchTarget{}, 200, 0, 0, 0, 10, nil)
 
 	got := rec.last()
 	if got == nil || got.TraceID != "trace-cancel" || got.UserID == nil || *got.UserID != 7 {

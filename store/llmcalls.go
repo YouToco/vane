@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/YouToco/vane/types"
+	"github.com/jackc/pgx/v5"
 )
 
 // InsertLLMCall 写入一条 LLM 调用记录，返回新 id。
@@ -38,28 +39,102 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 			"显式 llm_calls 租户归属必须同时包含正数 tenant_id 与 user_id",
 			types.ErrValidation)
 	}
+	if (c.PromptCacheHitTokens == nil) != (c.PromptCacheMissTokens == nil) {
+		return 0, types.NewAppError(types.CodeValidation,
+			"缓存命中与未命中 token 必须同时提供或同时缺省", types.ErrValidation)
+	}
+	if c.PromptCacheHitTokens != nil &&
+		(*c.PromptCacheHitTokens < 0 || *c.PromptCacheMissTokens < 0 ||
+			*c.PromptCacheHitTokens+*c.PromptCacheMissTokens != c.PromptTokens) {
+		return 0, types.NewAppError(types.CodeValidation,
+			"缓存 token 明细必须非负且合计等于 prompt_tokens", types.ErrValidation)
+	}
+	if c.ReasoningTokens != nil &&
+		(*c.ReasoningTokens < 0 || *c.ReasoningTokens > c.CompletionTokens) {
+		return 0, types.NewAppError(types.CodeValidation,
+			"reasoning_tokens 必须是 completion_tokens 的非负子集", types.ErrValidation)
+	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "开始写入 llm_calls 记录", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))`,
+		providerPricingLedgerLock,
+	); err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "锁定供应商价格账本", err)
+	}
 	var id int64
-	err := s.pool.QueryRow(ctx,
-		`INSERT INTO llm_calls (
+	err = tx.QueryRow(ctx,
+		`WITH stamp AS (
+		   SELECT statement_timestamp() AS at
+		 ),
+		 price AS (
+		   SELECT pr.id, pr.currency,
+		          (
+		            COALESCE($19::int, 0)::numeric * pr.input_cache_hit_per_million
+		            + (CASE WHEN $20::int IS NULL THEN $11::int ELSE $20::int END)::numeric
+		              * pr.input_cache_miss_per_million
+		            + $12::int::numeric * pr.output_per_million
+		          ) / 1000000::numeric AS amount
+		     FROM provider_price_rules pr, stamp
+		    WHERE pr.provider = lower(btrim($6))
+		      AND pr.resource = btrim($7)
+		      AND pr.meter = 'llm_tokens'
+		      AND pr.effective_from <= stamp.at
+		      AND (pr.effective_to IS NULL OR pr.effective_to > stamp.at)
+		    ORDER BY pr.effective_from DESC, pr.id DESC
+		    LIMIT 1
+		 )
+		 INSERT INTO llm_calls (
 			trace_id, span_name, user_id, ref_type, ref_id,
 			provider, model, system_prompt, user_prompt, completion,
 			prompt_tokens, completion_tokens, latency_ms, cost_usd,
 			prefix_cache_hit, temperature, max_tokens, error,
-			tenant_id
+			tenant_id, prompt_cache_hit_tokens, prompt_cache_miss_tokens,
+			reasoning_tokens, pricing_rule_id, pricing_status,
+			cost_amount, cost_currency, created_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10,
-			$11, $12, $13, $14,
+			$11, $12, $13,
+			CASE
+			  WHEN $14::numeric > 0 THEN $14::numeric
+			  WHEN (SELECT currency FROM price) = 'USD' THEN COALESCE((SELECT amount FROM price), 0)
+			  ELSE 0
+			END,
 			$15, $16, $17, $18,
-			CASE WHEN $19::bigint IS NULL THEN `+tenantOfUser+`$3) ELSE $19 END
+			CASE WHEN $22::bigint IS NULL THEN `+tenantOfUser+`$3) ELSE $22 END,
+			$19, $20, $21,
+			CASE WHEN $14::numeric > 0 THEN NULL ELSE (SELECT id FROM price) END,
+			CASE
+			  WHEN $14::numeric > 0 THEN 'provider_reported'
+			  WHEN NOT EXISTS (SELECT 1 FROM price) THEN 'unpriced'
+			  WHEN $19::int IS NULL THEN 'estimated'
+			  ELSE 'calculated'
+			END,
+			CASE
+			  WHEN $14::numeric > 0 THEN $14::numeric
+			  ELSE (SELECT amount FROM price)
+			END,
+			CASE
+			  WHEN $14::numeric > 0 THEN 'USD'
+			  ELSE (SELECT currency FROM price)
+			END,
+			(SELECT at FROM stamp)
 		) RETURNING id`,
 		c.TraceID, c.SpanName, c.UserID, c.RefType, c.RefID,
 		c.Provider, c.Model, c.SystemPrompt, c.UserPrompt, c.Completion,
 		c.PromptTokens, c.CompletionTokens, c.LatencyMs, c.CostUSD,
-		c.PrefixCacheHit, c.Temperature, c.MaxTokens, c.Error, c.TenantID,
+		c.PrefixCacheHit, c.Temperature, c.MaxTokens, c.Error,
+		c.PromptCacheHitTokens, c.PromptCacheMissTokens, c.ReasoningTokens, c.TenantID,
 	).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "写入 llm_calls 记录", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "提交 llm_calls 记录", err)
 	}
 	return id, nil
 }

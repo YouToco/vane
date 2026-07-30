@@ -62,14 +62,28 @@ type ScheduleRunSummary struct {
 type ScheduleRunCost struct {
 	LLMCostUSD                float64 `json:"llm_cost_usd"`
 	LLMCalls                  int64   `json:"llm_calls"`
+	LLMPricedCalls            int64   `json:"llm_priced_calls"`
+	LLMEstimatedCalls         int64   `json:"llm_estimated_calls"`
+	PromptTokens              int64   `json:"prompt_tokens"`
+	PromptCacheHitTokens      int64   `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens     int64   `json:"prompt_cache_miss_tokens"`
+	CompletionTokens          int64   `json:"completion_tokens"`
+	ReasoningTokens           int64   `json:"reasoning_tokens"`
 	ToolCostUSD               float64 `json:"tool_cost_usd"`
 	ToolCalls                 int64   `json:"tool_calls"`
 	ToolPricedCalls           int64   `json:"tool_priced_calls"`
+	ToolEstimatedCalls        int64   `json:"tool_estimated_calls"`
 	LatestAcquisitionCalls    int     `json:"latest_acquisition_calls"`
 	LatestAcquisitionFailures int     `json:"latest_acquisition_failures"`
 	// Internal low-cardinality fact consumed only by taskhealth sanitization.
 	// Never serialize it through the sibling schedule-detail response.
-	LatestAcquisitionErrorType string `json:"-"`
+	LatestAcquisitionErrorType string         `json:"-"`
+	KnownCosts                 []CurrencyCost `json:"known_costs"`
+}
+
+type CurrencyCost struct {
+	Currency string  `json:"currency"`
+	Amount   float64 `json:"amount"`
 }
 
 // ListScheduleBatches 按任务倒序返回运行历史（push_batches + 每批投递计数）。
@@ -218,14 +232,29 @@ func (s *Store) GetScheduleRunSummary(ctx context.Context, userID int64, schedul
 func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID string) (*ScheduleRunCost, error) {
 	var out ScheduleRunCost
 	if err := s.pool.QueryRow(ctx,
-		`SELECT COALESCE(sum(lc.cost_usd), 0), count(*)
+		`SELECT COALESCE(sum(lc.cost_usd), 0),
+		        count(*),
+		        count(lc.cost_amount),
+		        count(*) FILTER (
+		            WHERE lc.pricing_status IN ('estimated', 'legacy')
+		        ),
+		        COALESCE(sum(lc.prompt_tokens), 0),
+		        COALESCE(sum(lc.prompt_cache_hit_tokens), 0),
+		        COALESCE(sum(lc.prompt_cache_miss_tokens), 0),
+		        COALESCE(sum(lc.completion_tokens), 0),
+		        COALESCE(sum(lc.reasoning_tokens), 0)
 		   FROM llm_calls lc
 		   JOIN push_batches pb ON pb.idempotency_key = lc.trace_id
 		  WHERE pb.user_id = $1 AND pb.schedule_id = $2
 		    AND lc.user_id = $1
 		    AND lc.tenant_id IS NOT DISTINCT FROM pb.tenant_id
 		    AND pb.idempotency_key <> ''`,
-		userID, scheduleID).Scan(&out.LLMCostUSD, &out.LLMCalls); err != nil {
+		userID, scheduleID).Scan(
+		&out.LLMCostUSD, &out.LLMCalls, &out.LLMPricedCalls,
+		&out.LLMEstimatedCalls,
+		&out.PromptTokens, &out.PromptCacheHitTokens, &out.PromptCacheMissTokens,
+		&out.CompletionTokens, &out.ReasoningTokens,
+	); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("归集任务 LLM 成本（schedule_id=%s）", scheduleID), err)
 	}
@@ -237,7 +266,10 @@ func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID
 		   )
 		 SELECT COALESCE(sum(tc.cost_usd), 0),
 		        count(*),
-		        count(tc.cost_usd)
+		        count(tc.cost_amount),
+		        count(*) FILTER (
+		            WHERE tc.pricing_status IN ('estimated', 'legacy')
+		        )
 		   FROM tool_calls tc
 		   JOIN authorized_task task
 		     ON tc.tenant_id IS NOT DISTINCT FROM task.tenant_id
@@ -253,10 +285,69 @@ func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID
 		    )`,
 		userID, scheduleID,
 		types.ToolCallKindBindingFetch, types.ToolCallKindExaFetch,
-	).Scan(&out.ToolCostUSD, &out.ToolCalls, &out.ToolPricedCalls); err != nil {
+	).Scan(
+		&out.ToolCostUSD, &out.ToolCalls, &out.ToolPricedCalls,
+		&out.ToolEstimatedCalls,
+	); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("归集任务取材成本（schedule_id=%s）", scheduleID), err)
 	}
+	rows, err := s.pool.Query(ctx,
+		`WITH authorized_task AS (
+		     SELECT tenant_id
+		       FROM schedules
+		      WHERE id = $2 AND user_id = $1
+		   ),
+		   costs AS (
+		     SELECT lc.cost_currency AS currency, lc.cost_amount AS amount
+		       FROM llm_calls lc
+		       JOIN push_batches pb ON pb.idempotency_key = lc.trace_id
+		      WHERE pb.user_id = $1 AND pb.schedule_id = $2
+		        AND lc.user_id = $1
+		        AND lc.tenant_id IS NOT DISTINCT FROM pb.tenant_id
+		        AND pb.idempotency_key <> ''
+		        AND lc.cost_amount IS NOT NULL
+		     UNION ALL
+		     SELECT tc.cost_currency, tc.cost_amount
+		       FROM tool_calls tc
+		       JOIN authorized_task task
+		         ON tc.tenant_id IS NOT DISTINCT FROM task.tenant_id
+		      WHERE tc.user_id = $1
+		        AND tc.tool_kind IN ($3, $4)
+		        AND tc.cost_amount IS NOT NULL
+		        AND EXISTS (
+		             SELECT 1 FROM task_run_snapshots rs
+		              WHERE rs.tenant_id = task.tenant_id
+		                AND rs.user_id = $1
+		                AND rs.task_id = $2
+		                AND rs.temporal_workflow_id = tc.trace_id
+		        )
+		   )
+		 SELECT currency, sum(amount)
+		   FROM costs
+		  WHERE currency IS NOT NULL
+		  GROUP BY currency
+		  ORDER BY currency`,
+		userID, scheduleID,
+		types.ToolCallKindBindingFetch, types.ToolCallKindExaFetch,
+	)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("归集任务多币种成本（schedule_id=%s）", scheduleID), err)
+	}
+	defer rows.Close()
+	out.KnownCosts = make([]CurrencyCost, 0)
+	for rows.Next() {
+		var cost CurrencyCost
+		if err := rows.Scan(&cost.Currency, &cost.Amount); err != nil {
+			return nil, types.NewAppError(types.CodeDatabase, "扫描任务多币种成本", err)
+		}
+		out.KnownCosts = append(out.KnownCosts, cost)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "遍历任务多币种成本", err)
+	}
+	rows.Close()
 	if err := s.pool.QueryRow(ctx,
 		`WITH authorized_task AS (
 		     SELECT tenant_id, user_id, id

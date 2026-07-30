@@ -191,6 +191,10 @@ func (e *ExaFetcher) doSearchWithEffectGate(
 	src types.FetchTarget,
 	beforeEffect func(context.Context) error,
 ) (*exaResponse, error) {
+	usageQuantity := float64(reqBody.NumResults)
+	if usageQuantity <= 0 {
+		usageQuantity = exaDefaultNumResults
+	}
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, types.NewAppError(types.CodeValidation, "构造 Exa 请求体失败", err)
@@ -214,7 +218,7 @@ func (e *ExaFetcher) doSearchWithEffectGate(
 		ae := classifyDoError(e.searchURL, err)
 		// Do 失败（超时/连接拒绝）也记账（对抗审查 F1）：真实发起了上游尝试，
 		// 不记则网络层故障在账本上隐形。status=0 表示未拿到 HTTP 响应。
-		e.recordCall(ctx, src, 0, elapsed, 0, 0, ae)
+		e.recordCall(ctx, src, 0, elapsed, 0, 0, usageQuantity, ae)
 		return nil, ae
 	}
 	defer resp.Body.Close()
@@ -224,7 +228,7 @@ func (e *ExaFetcher) doSearchWithEffectGate(
 	// 账本上隐形，只能翻应用日志。与 TikHub（binding.go 成败都记）对齐：拿到 HTTP
 	// 响应即记，cost 只在成功路径填。fail 闭包统一"记账后返回该错误"。
 	fail := func(status, bodySize int, ae error) error {
-		e.recordCall(ctx, src, status, elapsed, bodySize, 0, ae)
+		e.recordCall(ctx, src, status, elapsed, bodySize, 0, usageQuantity, ae)
 		return ae
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
@@ -260,7 +264,8 @@ func (e *ExaFetcher) doSearchWithEffectGate(
 		return nil, fail(resp.StatusCode, len(data), ae)
 	}
 
-	e.recordCall(ctx, src, resp.StatusCode, elapsed, len(data), er.CostDollars.Total, nil)
+	e.recordCall(ctx, src, resp.StatusCode, elapsed, len(data),
+		er.CostDollars.Total, usageQuantity, nil)
 	return &er, nil
 }
 
@@ -355,7 +360,16 @@ func mapExaResults(src types.FetchTarget, results []exaResult) ([]types.ContentI
 }
 
 // recordCall 写一行 tool_calls（与 binding.record 同纪律：旁路，失败不放大）。
-func (e *ExaFetcher) recordCall(ctx context.Context, src types.FetchTarget, status int, elapsed time.Duration, bodySize int, costTotal float64, callErr error) {
+func (e *ExaFetcher) recordCall(
+	ctx context.Context,
+	src types.FetchTarget,
+	status int,
+	elapsed time.Duration,
+	bodySize int,
+	costTotal float64,
+	usageQuantity float64,
+	callErr error,
+) {
 	if e.rec == nil {
 		return
 	}
@@ -363,15 +377,17 @@ func (e *ExaFetcher) recordCall(ctx context.Context, src types.FetchTarget, stat
 	defer cancel()
 	trace, tenantID, userID := bindingAttribution(ctx)
 	rec := &types.ToolCall{
-		TraceID:      trace,
-		TenantID:     tenantID,
-		UserID:       userID,
-		ToolName:     "exa:search",
-		ToolKind:     types.ToolCallKindExaFetch,
-		EndpointPath: "/search",
-		DurationMs:   int(elapsed.Milliseconds()),
-		ResultSize:   bodySize,
-		HTTPStatus:   &status,
+		TraceID:       trace,
+		TenantID:      tenantID,
+		UserID:        userID,
+		ToolName:      "exa:search",
+		ToolKind:      types.ToolCallKindExaFetch,
+		Provider:      "exa",
+		EndpointPath:  "/search",
+		DurationMs:    int(elapsed.Milliseconds()),
+		ResultSize:    bodySize,
+		HTTPStatus:    &status,
+		UsageQuantity: usageQuantity,
 	}
 	if src.ID > 0 {
 		srcID := src.ID

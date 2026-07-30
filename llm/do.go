@@ -152,41 +152,48 @@ func do(
 		MaxTokens:    req.MaxTokens,
 	}
 
-	if err != nil {
-		call.Error = err.Error()
-		// Complete 失败拿不到 resp.LatencyMs，用 Do 自己的计时兜底。
-		call.LatencyMs = int(time.Since(start).Milliseconds())
-	} else {
+	if resp != nil {
 		call.Model = resp.Model
-		call.Completion = resp.Content
 		call.PromptTokens = resp.PromptTokens
 		call.CompletionTokens = resp.CompletionTokens
 		call.LatencyMs = resp.LatencyMs
 
-		// prefix_cache_hit 三态判定：Response 只有 int 字段、没有"字段是否
-		// 存在"的信号，借助 DeepSeek 的不变量 hit+miss == prompt_tokens 推断
-		// 缓存字段是否被上游返回——恒等式成立视为返回了（hit>0 即命中），
-		// 不成立视为该 provider 未报告缓存信息，落 NULL。
-		hitTokens, missTokens := resp.CacheHitTokens, resp.CacheMissTokens
-		cacheReported := resp.PromptTokens > 0 && hitTokens+missTokens == resp.PromptTokens
-		if cacheReported {
+		// 精确用量先于计价：DeepSeek 顶层字段与 Kimi nested cached_tokens
+		// 都在协议解析层归一化；未报告时保留 nil，数据库按生效价格把全部
+		// prompt 作为 cache miss 估算并标 estimated，而不是伪装成精确值。
+		if resp.CacheTokensReported {
+			hitTokens, missTokens := resp.CacheHitTokens, resp.CacheMissTokens
+			call.PromptCacheHitTokens = &hitTokens
+			call.PromptCacheMissTokens = &missTokens
 			hit := hitTokens > 0
 			call.PrefixCacheHit = &hit
-		} else {
-			// 未报告缓存时按全量未命中计价：宁可略高估也不低估成本。
-			hitTokens, missTokens = 0, resp.PromptTokens
 		}
-		call.CostUSD = CostUSD(resp.Model, hitTokens, missTokens, resp.CompletionTokens)
+		if resp.ReasoningTokensReported {
+			reasoningTokens := resp.ReasoningTokens
+			call.ReasoningTokens = &reasoningTokens
+		}
+	}
+	if err != nil {
+		call.Error = err.Error()
+		if resp == nil {
+			// Transport/JSON failures have no response latency metadata.
+			call.LatencyMs = int(time.Since(start).Milliseconds())
+		}
+	} else {
+		call.Completion = resp.Content
 	}
 
 	// 失败路径的 ctx 往往已经超时/取消；记账与配额对账共享一个有硬上限的
 	// detached tail。调用已完成，不该漏账，也不能让 DB stall 无限拖住 Activity。
-	// 失败/取消时 call.*Tokens 为 0，于是这里把预扣的估算**全额退还**——
-	// 这是刻意的：上游若真的计了费，我们也没有任何字段能知道，凭空扣一笔
-	// 猜出来的量会让账目更不可信。
+	// 若 HTTP 200 的业务形态不合法但上游已返回 usage，metadata-only resp 仍会
+	// 把真实 token 落账；只有完全拿不到 usage 时才维持既有保守对账语义。
 	rec.finishCallAccountingWithReservation(ctx, call, meta.TenantID, meta.UserID, reserved,
 		call.PromptTokens+call.CompletionTokens, meta.QuotaRule, reconcileQuota)
-	return resp, err
+	if err != nil {
+		// metadata-only response 只用于内部记账，不能让业务调用方误用不完整结果。
+		return nil, err
+	}
+	return resp, nil
 }
 
 func mapQuotaGateError(userID *int64, err error) error {

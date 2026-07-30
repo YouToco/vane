@@ -459,6 +459,51 @@ func TestDoChatUnknownUsageFailureRetainsConservativeReservation(t *testing.T) {
 	}
 }
 
+func TestDoChatRecordsKimiUsageFromInvalidSuccessfulResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"model":"kimi-k2.6",
+			"choices":[],
+			"usage":{
+				"prompt_tokens":100,
+				"completion_tokens":25,
+				"prompt_tokens_details":{"cached_tokens":40},
+				"completion_tokens_details":{"reasoning_tokens":10}
+			}
+		}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := New(config.LLMConfig{
+		Provider: "kimi", BaseURL: srv.URL, APIKey: "test-key",
+		Model: "kimi-k2.6", MaxConcurrent: 1,
+	})
+	st := &capturingRecorderStore{}
+	resp, err := DoChat(t.Context(), client, &Recorder{st: st},
+		CallMeta{TraceID: "invalid-chat-success-usage", SpanName: "agent"},
+		ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "research"}}})
+	if err == nil || resp != nil {
+		t.Fatalf("DoChat() = response %v, error %v; want hidden metadata and error", resp, err)
+	}
+	call := st.onlyCall(t)
+	if call.PromptTokens != 100 || call.CompletionTokens != 25 {
+		t.Fatalf("recorded tokens = (%d,%d), want (100,25)",
+			call.PromptTokens, call.CompletionTokens)
+	}
+	if call.PromptCacheHitTokens == nil || *call.PromptCacheHitTokens != 40 ||
+		call.PromptCacheMissTokens == nil || *call.PromptCacheMissTokens != 60 {
+		t.Fatalf("recorded cache tokens = (%v,%v), want (40,60)",
+			call.PromptCacheHitTokens, call.PromptCacheMissTokens)
+	}
+	if call.ReasoningTokens == nil || *call.ReasoningTokens != 10 {
+		t.Fatalf("recorded reasoning tokens = %v, want 10", call.ReasoningTokens)
+	}
+	if call.Error == "" {
+		t.Fatal("invalid successful response audit omitted error")
+	}
+}
+
 func TestDoChatExplicitRateLimitRefundsReservation(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, `{"error":{"message":"rate limit exceeded"}}`, http.StatusTooManyRequests)

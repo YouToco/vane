@@ -172,6 +172,11 @@ func TestHandleExternalContextMessage_FreshQuestionUsesOneExactUserBoundSearch(
 		t.Fatalf("tool ledger must record executed bound query, calls=%+v",
 			toolCalls.calls)
 	}
+	for _, call := range toolCalls.calls {
+		if call.Provider != "" || call.UsageQuantity != 0 {
+			t.Fatalf("semantic Exa tool row must not duplicate the fetcher billing receipt: %+v", call)
+		}
+	}
 	if toolCalls.calls[1].ToolName != "read_page" ||
 		string(toolCalls.calls[1].Arguments) != `{"url":"`+official+`"}` {
 		t.Fatalf("tool ledger must record the official page read, calls=%+v",

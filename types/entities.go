@@ -226,26 +226,33 @@ type LLMCall struct {
 	// TenantID is an internal accounting identity for prepared runs. Legacy
 	// calls leave it nil and retain membership-derived attribution; compiled
 	// calls pin the tenant authorized immediately before the paid request.
-	TenantID         *int64    `json:"-"`
-	TraceID          string    `json:"trace_id"`
-	SpanName         string    `json:"span_name"`
-	UserID           *int64    `json:"user_id,omitempty"` // 可空：系统级调用无归属用户；刻意不建 FK
-	RefType          RefType   `json:"ref_type"`
-	RefID            *int64    `json:"ref_id,omitempty"` // 可空（索引 WHERE ref_id IS NOT NULL）
-	Provider         string    `json:"provider"`
-	Model            string    `json:"model"`
-	SystemPrompt     string    `json:"system_prompt"`
-	UserPrompt       string    `json:"user_prompt"`
-	Completion       string    `json:"completion"`
-	PromptTokens     int       `json:"prompt_tokens"`
-	CompletionTokens int       `json:"completion_tokens"`
-	LatencyMs        int       `json:"latency_ms"`
-	CostUSD          float64   `json:"cost_usd"`                   // NUMERIC(10,6)，MVP 精度用 float64 足够
-	PrefixCacheHit   *bool     `json:"prefix_cache_hit,omitempty"` // 可空：provider 未报告缓存信息
-	Temperature      *float32  `json:"temperature,omitempty"`      // REAL，可空：未显式设置
-	MaxTokens        *int      `json:"max_tokens,omitempty"`       // 可空：未显式设置
-	Error            string    `json:"error"`                      // 调用失败原因，成功为空串
-	CreatedAt        time.Time `json:"created_at"`
+	TenantID         *int64  `json:"-"`
+	TraceID          string  `json:"trace_id"`
+	SpanName         string  `json:"span_name"`
+	UserID           *int64  `json:"user_id,omitempty"` // 可空：系统级调用无归属用户；刻意不建 FK
+	RefType          RefType `json:"ref_type"`
+	RefID            *int64  `json:"ref_id,omitempty"` // 可空（索引 WHERE ref_id IS NOT NULL）
+	Provider         string  `json:"provider"`
+	Model            string  `json:"model"`
+	SystemPrompt     string  `json:"system_prompt"`
+	UserPrompt       string  `json:"user_prompt"`
+	Completion       string  `json:"completion"`
+	PromptTokens     int     `json:"prompt_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
+	// Cache token counts are nil when the provider did not report a breakdown.
+	// Keeping nil distinct from zero lets pricing mark the amount estimated
+	// (all prompt tokens charged at cache-miss price) without losing exact
+	// total input/output usage.
+	PromptCacheHitTokens  *int      `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens *int      `json:"prompt_cache_miss_tokens,omitempty"`
+	ReasoningTokens       *int      `json:"reasoning_tokens,omitempty"` // completion_tokens 的可选子集
+	LatencyMs             int       `json:"latency_ms"`
+	CostUSD               float64   `json:"cost_usd"`                   // 供应商直报或动态价格目录计算后的 USD 兼容投影
+	PrefixCacheHit        *bool     `json:"prefix_cache_hit,omitempty"` // 可空：provider 未报告缓存信息
+	Temperature           *float32  `json:"temperature,omitempty"`      // REAL，可空：未显式设置
+	MaxTokens             *int      `json:"max_tokens,omitempty"`       // 可空：未显式设置
+	Error                 string    `json:"error"`                      // 调用失败原因，成功为空串
+	CreatedAt             time.Time `json:"created_at"`
 }
 
 // ToolCallKind 工具调用分类（tool_calls.tool_kind），区分三个调用面，
@@ -260,8 +267,9 @@ const (
 	// 计费调用一行（endpoint-binding-contract.md §5）。compiled 调度明确记录冻结的
 	// tenant/user；legacy 系统抓取仍可为空。不占 agent 免确认双限额。
 	ToolCallKindBindingFetch ToolCallKind = "binding_fetch"
-	// ToolCallKindExaFetch Exa API 调用（/search 与 /contents）。按次计费，
-	// costDollars 由上游响应返回、落 cost_usd 列。source_id 归因到具体信源。
+	// ToolCallKindExaFetch Exa API 调用（/search 与 /contents）。按次计费；
+	// 上游返回 costDollars 时保存原金额，否则由数据库生效价目表计算。
+	// source_id 归因到具体信源。
 	ToolCallKindExaFetch ToolCallKind = "exa_fetch"
 )
 
@@ -290,6 +298,7 @@ type ToolCall struct {
 	SessionID      *int64          `json:"session_id,omitempty"` // 可空：后台恢复等无会话来源
 	ToolName       string          `json:"tool_name"`
 	ToolKind       ToolCallKind    `json:"tool_kind"`
+	Provider       string          `json:"provider"`              // kimi/deepseek/exa/tikhub；非计费工具为空
 	EndpointPath   string          `json:"endpoint_path"`         // 仅 tikhub_endpoint
 	Arguments      json.RawMessage `json:"arguments,omitempty"`   // 模型产出的参数原文
 	ResultPreview  string          `json:"result_preview"`        // 截断版结果（8K rune）
@@ -301,8 +310,12 @@ type ToolCall struct {
 	RetrievalQuery string          `json:"retrieval_query"`           // 仅 tikhub_search
 	CandidateTools []string        `json:"candidate_tools,omitempty"` // 仅 tikhub_search
 	CostUSD        *float64        `json:"cost_usd,omitempty"`        // 上游返回的花费（美元）；无计费信息时 nil
-	SourceID       *int64          `json:"source_id,omitempty"`       // 抓取面调用的归属信源；agent 面为 nil
-	CreatedAt      time.Time       `json:"created_at"`
+	// UsageQuantity is the provider billing unit count: Exa search records the
+	// requested result count, contents records pages, and TikHub normally records
+	// one request. This keeps tier formulas data-driven for batched endpoints.
+	UsageQuantity float64   `json:"usage_quantity"`
+	SourceID      *int64    `json:"source_id,omitempty"` // 抓取面调用的归属信源；agent 面为 nil
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // ScheduleStatus 调度状态（schedules.status）。
