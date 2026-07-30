@@ -149,6 +149,29 @@ func TestProjectUsageV1NeverClaimsUnknownToolCostIsZero(t *testing.T) {
 		*partial.ToolPricedCalls != 1 {
 		t.Fatalf("partially priced tool usage = %#v", partial)
 	}
+	estimatedLLM := int64(1)
+	llmPriced := llmCalls
+	estimated := projectUsageV1(UsageV1{
+		LLMCostUSD:        &llmCost,
+		LLMCalls:          &llmCalls,
+		LLMPricedCalls:    &llmPriced,
+		LLMEstimatedCalls: &estimatedLLM,
+	})
+	if estimated.Coverage != CostCoverageLLMPartialV1 ||
+		estimated.LLMEstimatedCalls == nil ||
+		*estimated.LLMEstimatedCalls != 1 {
+		t.Fatalf("estimated LLM price was presented as complete: %#v", estimated)
+	}
+	estimatedTool := int64(1)
+	estimatedTools := projectUsageV1(UsageV1{
+		ToolCostUSD:        &toolCost,
+		ToolCalls:          &toolCalls,
+		ToolPricedCalls:    &pricedToolCalls,
+		ToolEstimatedCalls: &estimatedTool,
+	})
+	if estimatedTools.Coverage != CostCoverageToolsPartialV1 {
+		t.Fatalf("wildcard tool price was presented as complete: %#v", estimatedTools)
+	}
 }
 
 func TestProjectUsageV1BudgetStatesAndInvalidMoney(t *testing.T) {
@@ -194,6 +217,23 @@ func TestProjectUsageV1BudgetStatesAndInvalidMoney(t *testing.T) {
 	})
 	if partial.BudgetState != BudgetIncompleteV1 {
 		t.Fatalf("partial low usage claimed budget safety: %#v", partial)
+	}
+	priced, estimated := int64(1), int64(0)
+	cny := CurrencyCostV1{Currency: "CNY", Amount: 8}
+	mixedCurrency := projectUsageV1(UsageV1{
+		LLMCostUSD:         &partialCost,
+		LLMCalls:           &oneCall,
+		LLMPricedCalls:     &priced,
+		LLMEstimatedCalls:  &estimated,
+		ToolCostUSD:        &zero,
+		ToolCalls:          &zeroCalls,
+		ToolPricedCalls:    &zeroCalls,
+		ToolEstimatedCalls: &zeroCalls,
+		KnownCosts:         []CurrencyCostV1{cny},
+		BudgetUSD:          &budget,
+	})
+	if mixedCurrency.BudgetState != BudgetIncompleteV1 {
+		t.Fatalf("CNY amount cannot be compared to a USD budget: %#v", mixedCurrency)
 	}
 }
 

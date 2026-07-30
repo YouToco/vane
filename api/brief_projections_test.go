@@ -605,6 +605,7 @@ func TestTaskHealthProjectionUsesControlledFailureCostAndExactRole(t *testing.T)
 		&store.ScheduleRunCost{
 			LLMCostUSD:                 1.25,
 			LLMCalls:                   3,
+			LLMPricedCalls:             3,
 			ToolCostUSD:                0.21,
 			ToolCalls:                  3,
 			ToolPricedCalls:            3,

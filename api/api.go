@@ -224,6 +224,8 @@ func Mount(mux *http.ServeMux, deps Deps) {
 
 	// M7 运行统计端点（功能 6.5）：只读，成本/token/延迟/缓存按 span 聚合。
 	inner.HandleFunc("GET /api/admin/runstats", s.handleRunstats)
+	inner.HandleFunc("GET /api/admin/provider-prices", s.handleListProviderPrices)
+	inner.HandleFunc("POST /api/admin/provider-prices", s.handleReplaceProviderPrice)
 
 	// M7 画像 authority：profile 是只读投影；来源级 claim 操作使用
 	// version CAS + 幂等回执 + append-only 补偿事件。

@@ -51,6 +51,8 @@ var wantTables = []string{
 	"user_sessions",
 	// 015 agent 工具调用记账（TikHub 端点注册表契约 §6）
 	"tool_calls",
+	// 079 provider/model/endpoint price history and ledger calculation authority.
+	"provider_price_rules",
 	// 017 情报任务手册（Task Playbook P0）
 	"schedule_playbooks",
 	// 020 任务手册 P1b：「任务 ↔ 源」软范围绑定

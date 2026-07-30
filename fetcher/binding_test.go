@@ -1104,8 +1104,11 @@ func TestBinding_RecorderCostAndSourceID(t *testing.T) {
 		t.Fatalf("期望 1 行记账，实际 %d", len(rec.rows))
 	}
 	got := rec.rows[0]
-	if got.CostUSD == nil || *got.CostUSD != 0.001 {
-		t.Errorf("CostUSD: 期望 0.001（hot_list 单价），实际 %v", got.CostUSD)
+	if got.CostUSD != nil {
+		t.Errorf("TikHub 未返回官方金额时调用层不应写死美元价，实际 %v", *got.CostUSD)
+	}
+	if got.Provider != "tikhub" || got.UsageQuantity != 1 {
+		t.Errorf("动态定价用量 = provider %q quantity %v", got.Provider, got.UsageQuantity)
 	}
 	if got.SourceID == nil || *got.SourceID != 7 {
 		t.Errorf("SourceID: 期望 7（bindingSrc 固定值），实际 %v", got.SourceID)
@@ -1125,8 +1128,11 @@ func TestBinding_RecorderCostPerEndpoint(t *testing.T) {
 		t.Fatalf("期望 1 行记账，实际 %d", len(rec.rows))
 	}
 	got := rec.rows[0]
-	if got.CostUSD == nil || *got.CostUSD != 0.010 {
-		t.Errorf("CostUSD: 期望 0.010（app_v2 search 单价），实际 %v", got.CostUSD)
+	if got.CostUSD != nil {
+		t.Errorf("端点单价应由数据库价目表决定，调用层实际写入 %v", *got.CostUSD)
+	}
+	if got.Provider != "tikhub" || got.UsageQuantity != 1 {
+		t.Errorf("动态定价用量 = provider %q quantity %v", got.Provider, got.UsageQuantity)
 	}
 }
 

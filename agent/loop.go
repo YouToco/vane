@@ -2313,7 +2313,7 @@ func (l *Loop) executeDirectTaskCreation(
 	proposal, err := l.taskCreation.Prepare(ctx, task.CreationProposalInput{
 		ActionID: actionID, UserID: userID, SessionID: sessionID,
 		OwnerRequest: state.ownerRequest,
-		RawArgs: args, ExpiresAt: time.Now().Add(durableOperationTTL),
+		RawArgs:      args, ExpiresAt: time.Now().Add(durableOperationTTL),
 	})
 	if err != nil {
 		return "", fmt.Errorf("propose durable task creation: %w", err)
@@ -3344,6 +3344,14 @@ func (l *Loop) execRecorded(ctx context.Context, userID int64, sessionID *int64,
 	}
 	if k, ok := spec.Tool.(interface{ toolKind() types.ToolCallKind }); ok {
 		rec.ToolKind = k.toolKind()
+	}
+	// Exa/binding tools record their billable upstream request in the fetcher
+	// layer. Pricing this semantic Agent row as well would double-charge one
+	// provider request. Dynamic TikHub endpoint tools have no lower recorder,
+	// so this row is their single billing receipt.
+	if rec.ToolKind == types.ToolCallKindTikHubEndpoint {
+		rec.Provider = "tikhub"
+		rec.UsageQuantity = 1
 	}
 	if m, ok := ctx.Value(chatMetaKey{}).(chatMeta); ok {
 		rec.TraceID = m.traceID // 与 llm_calls 同一 trace，可 JOIN 回放整条消息链路

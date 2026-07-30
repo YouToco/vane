@@ -103,8 +103,8 @@ content_items；某端点若证明适合长期任务抓取，走 capabilitycatal
   摘要**（深度 2 前 10 键，模型免读全文直接写路径）+ 强命令式取回指引 + 预览
   混淆压制话术（Claude Code 社区实测模型 ~70% 概率拿预览当全文，必须显式压）。
 - **内联上限由模型的上下文窗口派生，不再是常量（2026-07-18，OpenClaw 同款）**：
-  模型属性（窗口大小）声明在 `llm/context.go` 的 `modelContextWindows`（与 `pricing.go`
-  同一模式：模型属性集中一处），`DeriveInlineLimits(window)` 按分档 + 窗口占比封顶
+  模型属性（窗口大小）声明在 `llm/context.go` 的 `modelContextWindows`；可变价格
+  由数据库 `provider_price_rules` 版本化。`DeriveInlineLimits(window)` 按分档 + 窗口占比封顶
   算出三个数：单次上限 `PerCall`、每消息累计预算 `MsgBudget = 3×PerCall`、
   预算耗尽后的保底 `MinPerCall = PerCall/10`（下限 2000）。
 

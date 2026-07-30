@@ -52,6 +52,7 @@ type CostCoverageV1 string
 const (
 	CostCoverageNoneV1               CostCoverageV1 = "none"
 	CostCoverageLLMOnlyV1            CostCoverageV1 = "llm_only"
+	CostCoverageLLMPartialV1         CostCoverageV1 = "llm_partial"
 	CostCoverageToolsOnlyV1          CostCoverageV1 = "tools_only"
 	CostCoverageToolsPartialV1       CostCoverageV1 = "tools_partial"
 	CostCoverageLLMAndToolsV1        CostCoverageV1 = "llm_and_tools"
@@ -97,17 +98,26 @@ type AcquisitionSummaryV1 struct {
 // UsageV1 represents attribution facts. Every component is nullable so
 // "unknown" cannot collapse into a real zero.
 type UsageV1 struct {
-	LLMCostUSD  *float64
-	LLMCalls    *int64
-	ToolCostUSD *float64
-	ToolCalls   *int64
+	LLMCostUSD        *float64
+	LLMCalls          *int64
+	LLMPricedCalls    *int64
+	LLMEstimatedCalls *int64
+	ToolCostUSD       *float64
+	ToolCalls         *int64
 	// ToolPricedCalls counts Tool rows with an explicit provider cost receipt.
 	// It may be lower than ToolCalls; the known subtotal remains useful but is
 	// then a lower bound rather than complete attribution.
-	ToolPricedCalls *int64
-	WindowStart     time.Time
-	WindowEnd       time.Time
-	BudgetUSD       *float64
+	ToolPricedCalls       *int64
+	ToolEstimatedCalls    *int64
+	KnownCosts            []CurrencyCostV1
+	PromptTokens          *int64
+	PromptCacheHitTokens  *int64
+	PromptCacheMissTokens *int64
+	CompletionTokens      *int64
+	ReasoningTokens       *int64
+	WindowStart           time.Time
+	WindowEnd             time.Time
+	BudgetUSD             *float64
 }
 
 type AccessV1 struct {
@@ -125,16 +135,30 @@ type PermissionsV1 struct {
 	CanViewUsage bool                 `json:"can_view_usage"`
 }
 
+type CurrencyCostV1 struct {
+	Currency string  `json:"currency"`
+	Amount   float64 `json:"amount"`
+}
+
 type UsageProjectionV1 struct {
-	KnownCostUSD    float64        `json:"known_cost_usd"`
-	Coverage        CostCoverageV1 `json:"coverage"`
-	LLMCalls        *int64         `json:"llm_calls,omitempty"`
-	ToolCalls       *int64         `json:"tool_calls,omitempty"`
-	ToolPricedCalls *int64         `json:"tool_priced_calls,omitempty"`
-	WindowStart     *time.Time     `json:"window_start,omitempty"`
-	WindowEnd       *time.Time     `json:"window_end,omitempty"`
-	BudgetUSD       *float64       `json:"budget_usd,omitempty"`
-	BudgetState     BudgetStateV1  `json:"budget_state"`
+	KnownCostUSD          float64          `json:"known_cost_usd"`
+	KnownCosts            []CurrencyCostV1 `json:"known_costs"`
+	Coverage              CostCoverageV1   `json:"coverage"`
+	LLMCalls              *int64           `json:"llm_calls,omitempty"`
+	LLMPricedCalls        *int64           `json:"llm_priced_calls,omitempty"`
+	LLMEstimatedCalls     *int64           `json:"llm_estimated_calls,omitempty"`
+	ToolCalls             *int64           `json:"tool_calls,omitempty"`
+	ToolPricedCalls       *int64           `json:"tool_priced_calls,omitempty"`
+	ToolEstimatedCalls    *int64           `json:"tool_estimated_calls,omitempty"`
+	PromptTokens          *int64           `json:"prompt_tokens,omitempty"`
+	PromptCacheHitTokens  *int64           `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens *int64           `json:"prompt_cache_miss_tokens,omitempty"`
+	CompletionTokens      *int64           `json:"completion_tokens,omitempty"`
+	ReasoningTokens       *int64           `json:"reasoning_tokens,omitempty"`
+	WindowStart           *time.Time       `json:"window_start,omitempty"`
+	WindowEnd             *time.Time       `json:"window_end,omitempty"`
+	BudgetUSD             *float64         `json:"budget_usd,omitempty"`
+	BudgetState           BudgetStateV1    `json:"budget_state"`
 }
 
 type ProjectionV1 struct {
@@ -310,36 +334,76 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 	out := UsageProjectionV1{
 		Coverage:    CostCoverageNoneV1,
 		BudgetState: BudgetNotConfiguredV1,
+		KnownCosts:  make([]CurrencyCostV1, 0),
+	}
+	llmPriced := in.LLMPricedCalls
+	if llmPriced == nil && in.LLMCostUSD != nil && in.LLMCalls != nil {
+		// Compatibility for internal callers created before the pricing ledger:
+		// an explicit amount and call count meant every LLM row was priced.
+		v := *in.LLMCalls
+		llmPriced = &v
+	}
+	llmEstimated := in.LLMEstimatedCalls
+	if llmEstimated == nil {
+		v := int64(0)
+		llmEstimated = &v
+	}
+	toolEstimated := in.ToolEstimatedCalls
+	if toolEstimated == nil {
+		v := int64(0)
+		toolEstimated = &v
 	}
 	llmKnown := in.LLMCostUSD != nil && in.LLMCalls != nil &&
-		validMoneyV1(*in.LLMCostUSD) && *in.LLMCalls >= 0
+		llmPriced != nil &&
+		validMoneyV1(*in.LLMCostUSD) && *in.LLMCalls >= 0 &&
+		*llmPriced >= 0 && *llmPriced <= *in.LLMCalls &&
+		*llmEstimated >= 0 && *llmEstimated <= *llmPriced &&
+		(*llmPriced > 0 || *in.LLMCalls == 0)
+	llmComplete := llmKnown && *llmPriced == *in.LLMCalls &&
+		*llmEstimated == 0
 	toolsKnown := in.ToolCostUSD != nil && in.ToolCalls != nil &&
 		in.ToolPricedCalls != nil &&
 		validMoneyV1(*in.ToolCostUSD) && *in.ToolCalls >= 0 &&
 		*in.ToolPricedCalls >= 0 &&
-		*in.ToolPricedCalls <= *in.ToolCalls
+		*in.ToolPricedCalls <= *in.ToolCalls &&
+		*toolEstimated >= 0 &&
+		*toolEstimated <= *in.ToolPricedCalls &&
+		(*in.ToolPricedCalls > 0 || *in.ToolCalls == 0)
 	toolsComplete := toolsKnown &&
-		*in.ToolPricedCalls == *in.ToolCalls
+		*in.ToolPricedCalls == *in.ToolCalls &&
+		*toolEstimated == 0
 	switch {
 	case llmKnown && toolsKnown:
 		sum := *in.LLMCostUSD + *in.ToolCostUSD
 		if validMoneyV1(sum) {
 			out.KnownCostUSD = sum
-			if toolsComplete {
+			if llmComplete && toolsComplete {
 				out.Coverage = CostCoverageLLMAndToolsV1
 			} else {
 				out.Coverage = CostCoverageLLMAndToolsPartialV1
 			}
-			llmCalls, toolCalls, pricedToolCalls :=
-				*in.LLMCalls, *in.ToolCalls, *in.ToolPricedCalls
+			llmCalls, pricedLLMCalls, toolCalls, pricedToolCalls :=
+				*in.LLMCalls, *llmPriced, *in.ToolCalls, *in.ToolPricedCalls
 			out.LLMCalls, out.ToolCalls = &llmCalls, &toolCalls
+			out.LLMPricedCalls = &pricedLLMCalls
 			out.ToolPricedCalls = &pricedToolCalls
+			llmEstimated, toolEstimated :=
+				*llmEstimated, *toolEstimated
+			out.LLMEstimatedCalls = &llmEstimated
+			out.ToolEstimatedCalls = &toolEstimated
 		}
 	case llmKnown:
 		out.KnownCostUSD = *in.LLMCostUSD
-		out.Coverage = CostCoverageLLMOnlyV1
-		llmCalls := *in.LLMCalls
+		if llmComplete {
+			out.Coverage = CostCoverageLLMOnlyV1
+		} else {
+			out.Coverage = CostCoverageLLMPartialV1
+		}
+		llmCalls, pricedLLMCalls := *in.LLMCalls, *llmPriced
 		out.LLMCalls = &llmCalls
+		out.LLMPricedCalls = &pricedLLMCalls
+		estimated := *llmEstimated
+		out.LLMEstimatedCalls = &estimated
 	case toolsKnown:
 		out.KnownCostUSD = *in.ToolCostUSD
 		if toolsComplete {
@@ -351,6 +415,55 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 			*in.ToolCalls, *in.ToolPricedCalls
 		out.ToolCalls = &toolCalls
 		out.ToolPricedCalls = &pricedToolCalls
+		estimated := *toolEstimated
+		out.ToolEstimatedCalls = &estimated
+	}
+	if in.LLMCalls != nil && *in.LLMCalls >= 0 && out.LLMCalls == nil {
+		v := *in.LLMCalls
+		out.LLMCalls = &v
+	}
+	if in.LLMPricedCalls != nil && *in.LLMPricedCalls >= 0 &&
+		in.LLMCalls != nil && *in.LLMPricedCalls <= *in.LLMCalls &&
+		out.LLMPricedCalls == nil {
+		v := *in.LLMPricedCalls
+		out.LLMPricedCalls = &v
+	}
+	if in.LLMEstimatedCalls != nil && *in.LLMEstimatedCalls >= 0 &&
+		in.LLMPricedCalls != nil && *in.LLMEstimatedCalls <= *in.LLMPricedCalls &&
+		out.LLMEstimatedCalls == nil {
+		v := *in.LLMEstimatedCalls
+		out.LLMEstimatedCalls = &v
+	}
+	if in.ToolEstimatedCalls != nil && *in.ToolEstimatedCalls >= 0 &&
+		in.ToolPricedCalls != nil && *in.ToolEstimatedCalls <= *in.ToolPricedCalls &&
+		out.ToolEstimatedCalls == nil {
+		v := *in.ToolEstimatedCalls
+		out.ToolEstimatedCalls = &v
+	}
+	copyToken := func(v *int64) *int64 {
+		if v == nil || *v < 0 {
+			return nil
+		}
+		n := *v
+		return &n
+	}
+	out.PromptTokens = copyToken(in.PromptTokens)
+	out.PromptCacheHitTokens = copyToken(in.PromptCacheHitTokens)
+	out.PromptCacheMissTokens = copyToken(in.PromptCacheMissTokens)
+	out.CompletionTokens = copyToken(in.CompletionTokens)
+	out.ReasoningTokens = copyToken(in.ReasoningTokens)
+	for _, cost := range in.KnownCosts {
+		if (cost.Currency == "USD" || cost.Currency == "CNY") &&
+			validMoneyV1(cost.Amount) {
+			out.KnownCosts = append(out.KnownCosts, cost)
+		}
+	}
+	usdBudgetComparable := true
+	for _, cost := range out.KnownCosts {
+		if cost.Currency != "USD" && cost.Amount > 0 {
+			usdBudgetComparable = false
+			break
+		}
 	}
 	if !in.WindowStart.IsZero() && in.WindowEnd.After(in.WindowStart) {
 		start := in.WindowStart.Round(0).UTC()
@@ -366,7 +479,7 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 			out.BudgetState = BudgetExhaustedV1
 		case ratio >= 0.8:
 			out.BudgetState = BudgetWarningV1
-		case out.Coverage == CostCoverageLLMAndToolsV1:
+		case out.Coverage == CostCoverageLLMAndToolsV1 && usdBudgetComparable:
 			out.BudgetState = BudgetOKV1
 		default:
 			out.BudgetState = BudgetIncompleteV1

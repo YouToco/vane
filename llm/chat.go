@@ -76,15 +76,18 @@ type ChatRequest struct {
 // ChatResponse 单次 Chat 调用结果。现有调用方 API 保持不变；字段由通过
 // provider-neutral 校验的 AssistantTurn 投影而来。
 type ChatResponse struct {
-	Content          string
-	ToolCalls        []ToolCall
-	FinishReason     string
-	PromptTokens     int
-	CompletionTokens int
-	CacheHitTokens   int
-	CacheMissTokens  int
-	Model            string
-	LatencyMs        int
+	Content                 string
+	ToolCalls               []ToolCall
+	FinishReason            string
+	PromptTokens            int
+	CompletionTokens        int
+	CacheHitTokens          int
+	CacheMissTokens         int
+	CacheTokensReported     bool
+	ReasoningTokens         int
+	ReasoningTokensReported bool
+	Model                   string
+	LatencyMs               int
 }
 
 // wire* 是 OpenAI 兼容线协议的收发结构，仅本文件内部使用。
@@ -134,10 +137,16 @@ type wireChatResponse struct {
 	Model   string           `json:"model"`
 	Choices []wireChatChoice `json:"choices"`
 	Usage   struct {
-		PromptTokens          int `json:"prompt_tokens"`
-		CompletionTokens      int `json:"completion_tokens"`
-		PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
-		PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+		PromptTokens          int  `json:"prompt_tokens"`
+		CompletionTokens      int  `json:"completion_tokens"`
+		PromptCacheHitTokens  *int `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens *int `json:"prompt_cache_miss_tokens"`
+		PromptTokensDetails   struct {
+			CachedTokens *int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+		CompletionTokensDetails struct {
+			ReasoningTokens *int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
 }
 
@@ -283,13 +292,26 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	if respModel == "" {
 		respModel = model
 	}
+	hit, miss, cacheReported := usageCacheBreakdown(
+		cr.Usage.PromptTokens,
+		cr.Usage.PromptCacheHitTokens,
+		cr.Usage.PromptCacheMissTokens,
+		cr.Usage.PromptTokensDetails.CachedTokens,
+	)
+	reasoning, reasoningReported := usageReasoningBreakdown(
+		cr.Usage.CompletionTokens,
+		cr.Usage.CompletionTokensDetails.ReasoningTokens,
+	)
 	resp := &ChatResponse{
-		PromptTokens:     cr.Usage.PromptTokens,
-		CompletionTokens: cr.Usage.CompletionTokens,
-		CacheHitTokens:   cr.Usage.PromptCacheHitTokens,
-		CacheMissTokens:  cr.Usage.PromptCacheMissTokens,
-		Model:            respModel,
-		LatencyMs:        int(time.Since(start).Milliseconds()),
+		PromptTokens:            cr.Usage.PromptTokens,
+		CompletionTokens:        cr.Usage.CompletionTokens,
+		CacheHitTokens:          hit,
+		CacheMissTokens:         miss,
+		CacheTokensReported:     cacheReported,
+		ReasoningTokens:         reasoning,
+		ReasoningTokensReported: reasoningReported,
+		Model:                   respModel,
+		LatencyMs:               int(time.Since(start).Milliseconds()),
 	}
 	turn, err := adaptAssistantTurn(cr.Choices[0], assistantTurnOptions{
 		Provider:      c.provider,
@@ -367,7 +389,7 @@ func chatPromptRunes(req ChatRequest) int {
 }
 
 // DoChat = Chat + 记账，行为对齐 do.go 的 Do：失败也记账、记账用
-// WithoutCancel 剥离取消信号、成本按缓存三段单价计算。
+// WithoutCancel 剥离取消信号；精确 token 用量写入后由数据库按生效价格计价。
 // 与 Do 的差异只在 prompt/completion 的落库形态：UserPrompt 记 messages
 // 数组 JSON（截断到 8KB）；Completion 记 Content，若有 ToolCalls 则记
 // "tool_calls: <json>"（FC 响应的 content 通常为空，工具调用才是有效输出）。
@@ -444,18 +466,17 @@ func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Ch
 		call.CompletionTokens = resp.CompletionTokens
 		call.LatencyMs = resp.LatencyMs
 
-		// prefix_cache_hit 三态判定与计价：与 do.go 的 Do 保持一致
-		// （借 DeepSeek 不变量 hit+miss == prompt_tokens 推断缓存字段是否
-		// 被上游返回；未报告时按全量未命中计价，宁可略高估）。
-		hitTokens, missTokens := resp.CacheHitTokens, resp.CacheMissTokens
-		cacheReported := resp.PromptTokens > 0 && hitTokens+missTokens == resp.PromptTokens
-		if cacheReported {
+		if resp.CacheTokensReported {
+			hitTokens, missTokens := resp.CacheHitTokens, resp.CacheMissTokens
+			call.PromptCacheHitTokens = &hitTokens
+			call.PromptCacheMissTokens = &missTokens
 			hit := hitTokens > 0
 			call.PrefixCacheHit = &hit
-		} else {
-			hitTokens, missTokens = 0, resp.PromptTokens
 		}
-		call.CostUSD = CostUSD(resp.Model, hitTokens, missTokens, resp.CompletionTokens)
+		if resp.ReasoningTokensReported {
+			reasoningTokens := resp.ReasoningTokens
+			call.ReasoningTokens = &reasoningTokens
+		}
 	}
 	if err != nil {
 		call.Error = err.Error()

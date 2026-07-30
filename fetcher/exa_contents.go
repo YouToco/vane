@@ -412,15 +412,17 @@ func (e *ExaContentsFetcher) recordCall(ctx context.Context, src types.FetchTarg
 	defer cancel()
 	trace, tenantID, userID := bindingAttribution(ctx)
 	rec := &types.ToolCall{
-		TraceID:      trace,
-		TenantID:     tenantID,
-		UserID:       userID,
-		ToolName:     "exa:contents",
-		ToolKind:     types.ToolCallKindExaFetch,
-		EndpointPath: "/contents",
-		DurationMs:   int(elapsed.Milliseconds()),
-		ResultSize:   bodySize,
-		HTTPStatus:   &status,
+		TraceID:       trace,
+		TenantID:      tenantID,
+		UserID:        userID,
+		ToolName:      "exa:contents",
+		ToolKind:      types.ToolCallKindExaFetch,
+		Provider:      "exa",
+		EndpointPath:  "/contents",
+		DurationMs:    int(elapsed.Milliseconds()),
+		ResultSize:    bodySize,
+		HTTPStatus:    &status,
+		UsageQuantity: 1,
 	}
 	if src.ID > 0 {
 		srcID := src.ID

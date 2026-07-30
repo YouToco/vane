@@ -350,8 +350,11 @@ func TestDoChatAccountsRejectedDSMLWithoutLeakingIt(t *testing.T) {
 	if st.call == nil {
 		t.Fatal("DSML protocol error was not recorded")
 	}
-	if st.call.PromptTokens != 20 || st.call.CompletionTokens != 8 || st.call.CostUSD <= 0 {
+	if st.call.PromptTokens != 20 || st.call.CompletionTokens != 8 {
 		t.Fatalf("paid usage was lost: %+v", st.call)
+	}
+	if st.call.CostUSD != 0 {
+		t.Fatalf("调用层不应把模型单价写死在代码里: %+v", st.call)
 	}
 	if st.call.Model != "deepseek-v4-pro" || st.call.Completion != "" {
 		t.Fatalf("unsafe or incomplete ledger row: %+v", st.call)

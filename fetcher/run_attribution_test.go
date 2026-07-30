@@ -33,7 +33,7 @@ func TestCompiledFetchRecordersPreserveExactRunAttribution(t *testing.T) {
 			name: "exa search",
 			record: func(rec *mockRecorder) {
 				NewExa(config.FetchConfig{}, rec).recordCall(
-					ctx, types.FetchTarget{ID: 1}, 200, 0, 0, 0, nil)
+					ctx, types.FetchTarget{ID: 1}, 200, 0, 0, 0, 10, nil)
 			},
 		},
 		{
@@ -81,7 +81,7 @@ func TestLegacyFetchAttributionDoesNotInventTenant(t *testing.T) {
 	ctx := WithBindingAttribution(context.Background(), "legacy-trace", 7)
 	rec := &mockRecorder{}
 	NewExa(config.FetchConfig{}, rec).recordCall(
-		ctx, types.FetchTarget{ID: 1}, 200, 0, 0, 0, nil)
+		ctx, types.FetchTarget{ID: 1}, 200, 0, 0, 0, 10, nil)
 
 	got := rec.last()
 	if got == nil || got.UserID == nil || *got.UserID != 7 {

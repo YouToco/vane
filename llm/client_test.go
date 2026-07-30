@@ -95,7 +95,7 @@ func TestCompleteRoundtrip(t *testing.T) {
 	if resp.PromptTokens != 10 || resp.CompletionTokens != 5 {
 		t.Errorf("tokens = (%d, %d), 期望 (10, 5)", resp.PromptTokens, resp.CompletionTokens)
 	}
-	if resp.CacheHitTokens != 4 || resp.CacheMissTokens != 6 {
+	if !resp.CacheTokensReported || resp.CacheHitTokens != 4 || resp.CacheMissTokens != 6 {
 		t.Errorf("cache tokens = (%d, %d), 期望 (4, 6)", resp.CacheHitTokens, resp.CacheMissTokens)
 	}
 	if resp.Model != "deepseek-v4-flash" {
@@ -103,6 +103,34 @@ func TestCompleteRoundtrip(t *testing.T) {
 	}
 	if resp.LatencyMs < 0 {
 		t.Errorf("LatencyMs = %d, 不应为负", resp.LatencyMs)
+	}
+}
+
+func TestCompleteParsesKimiNestedUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+		  "model":"kimi-k2.6",
+		  "choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],
+		  "usage":{
+		    "prompt_tokens":100,
+		    "completion_tokens":40,
+		    "prompt_tokens_details":{"cached_tokens":25},
+		    "completion_tokens_details":{"reasoning_tokens":30}
+		  }
+		}`))
+	}))
+	defer srv.Close()
+	resp, err := newTestClient(srv.URL, 1).Complete(t.Context(), Request{User: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.CacheTokensReported || resp.CacheHitTokens != 25 ||
+		resp.CacheMissTokens != 75 {
+		t.Fatalf("Kimi cache usage = %+v", resp)
+	}
+	if !resp.ReasoningTokensReported || resp.ReasoningTokens != 30 {
+		t.Fatalf("Kimi reasoning usage = %+v", resp)
 	}
 }
 
@@ -349,35 +377,23 @@ func TestCompleteSemaphoreSerial(t *testing.T) {
 	}
 }
 
-// TestCostUSD 按模型三段单价核对一组已知值（M4 起 flash/pro 双模型分价）。
-func TestCostUSD(t *testing.T) {
-	tests := []struct {
-		name                  string
-		model                 string
-		hit, miss, completion int
-		want                  float64
-	}{
-		// 整百万便于人肉核对：1M 命中 + 2M 未命中 + 0.5M 输出
-		// flash = 0.0028 + 0.28 + 0.14 = 0.4228
-		{"flash整百万", "deepseek-v4-flash", 1_000_000, 2_000_000, 500_000, 0.4228},
-		// pro = 0.003625 + 0.87 + 0.435 = 1.308625
-		{"pro整百万", "deepseek-v4-pro", 1_000_000, 2_000_000, 500_000, 1.308625},
-		// Kimi K2.6 = 0.16 + 1.90 + 2.00 = 4.06
-		{"kimi整百万", "kimi-k2.6", 1_000_000, 2_000_000, 500_000, 4.06},
-		// 贴近真实单次调用量级：
-		// 100/1e6*0.0028 + 900/1e6*0.14 + 500/1e6*0.28 = 0.00026628
-		{"flash真实量级", "deepseek-v4-flash", 100, 900, 500, 0.00026628},
-		// 未知模型按最贵档（pro）兜底：宁高估不低估。
-		{"未知模型按pro兜底", "some-future-model", 1_000_000, 2_000_000, 500_000, 1.308625},
-		{"全零", "deepseek-v4-flash", 0, 0, 0, 0},
+func TestUsageCacheBreakdownSupportsProviderShapes(t *testing.T) {
+	topHit, topMiss, nestedHit := 4, 6, 3
+	if hit, miss, ok := usageCacheBreakdown(10, &topHit, &topMiss, nil); !ok ||
+		hit != 4 || miss != 6 {
+		t.Fatalf("DeepSeek cache breakdown = (%d,%d,%v)", hit, miss, ok)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := CostUSD(tt.model, tt.hit, tt.miss, tt.completion)
-			if math.Abs(got-tt.want) > 1e-12 {
-				t.Errorf("CostUSD(%s, %d, %d, %d) = %.10f, 期望 %.10f",
-					tt.model, tt.hit, tt.miss, tt.completion, got, tt.want)
-			}
-		})
+	if hit, miss, ok := usageCacheBreakdown(10, nil, nil, &nestedHit); !ok ||
+		hit != 3 || miss != 7 {
+		t.Fatalf("Kimi cache breakdown = (%d,%d,%v)", hit, miss, ok)
+	}
+	if hit, miss, ok := usageCacheBreakdown(10, nil, nil, nil); ok ||
+		hit != 0 || miss != 10 {
+		t.Fatalf("unreported cache breakdown = (%d,%d,%v)", hit, miss, ok)
+	}
+	tooManyReasoning := 11
+	if reasoning, ok := usageReasoningBreakdown(10, &tooManyReasoning); ok ||
+		reasoning != 0 {
+		t.Fatalf("invalid reasoning breakdown = (%d,%v)", reasoning, ok)
 	}
 }
