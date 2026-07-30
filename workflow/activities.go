@@ -643,7 +643,7 @@ func WithCompiledRuntimeV1(
 	}
 }
 
-// WithCompiledToolRuntimeV2 installs the dark Source-free run-start boundary.
+// WithCompiledToolRuntimeV2 installs the Source-free run-start boundary.
 // No Schedule Action selects it until Tool execution and provenance are wired.
 func WithCompiledToolRuntimeV2(
 	st CompiledToolRunStoreV2,
@@ -1202,10 +1202,10 @@ func (a *Activities) PrepareRun(ctx context.Context, p PushParams) (PrepareRunRe
 	return result, nil
 }
 
-// PrepareToolRunV2 is the dark Source-free run-start producer. It recovers an
+// PrepareToolRunV2 is the Source-free run-start producer. It recovers an
 // already committed ref before consulting mutable policy and returns only the
 // V2 safe reference; Tool arguments and policy bodies remain outside Temporal
-// history. No existing Schedule Action selects this Activity yet.
+// history. Recurring and command-bound manual executions share this boundary.
 func (a *Activities) PrepareToolRunV2(
 	ctx context.Context,
 	p PushParams,

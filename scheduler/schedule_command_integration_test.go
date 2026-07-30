@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/api/serviceerror"
 	workflowservice "go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
@@ -145,9 +146,9 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 		WithTaskScheduleNamespace(namespace),
 	)
 
-	// Temporal applied TriggerImmediately but the response was lost. The
-	// operation remains intent; a fresh process retries the same RequestId and
-	// Temporal deduplicates it.
+	// Temporal started the command-bound manual workflow but the response was
+	// lost. The operation remains intent; a fresh process retries the same
+	// workflow ID and adopts AlreadyStarted without touching the Schedule.
 	faults.arm("trigger")
 	const runKey = "integration-trigger-response-loss"
 	if err := faultScheduler.TriggerScheduleNowIdempotent(
@@ -173,10 +174,21 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 	if run.Status != types.ScheduleCommandCompleted {
 		t.Fatalf("run checkpoint=%+v", run)
 	}
-	if got := faults.requestCount(run.RemoteRequestID); got != 2 {
-		t.Fatalf("raw trigger attempts=%d, want response-loss retry 2", got)
+	manualWorkflowID := manualTaskWorkflowID(run.ID)
+	if got := faults.requestCount(manualWorkflowID); got != 2 {
+		t.Fatalf("manual workflow attempts=%d, want response-loss retry 2", got)
 	}
-	assertScheduleActionCount(t, ctx, server.Client(), taskID, 1)
+	assertScheduleActionCount(t, ctx, server.Client(), taskID, 0)
+	if _, err := server.Client().WorkflowService().DescribeWorkflowExecution(
+		ctx, &workflowservice.DescribeWorkflowExecutionRequest{
+			Namespace: namespace,
+			Execution: &commonpb.WorkflowExecution{
+				WorkflowId: manualWorkflowID,
+			},
+		},
+	); err != nil {
+		t.Fatalf("describe command-bound manual workflow: %v", err)
+	}
 
 	// Pause response loss is converged in the same attempt by Describe: no
 	// reverse compensation and no DB/Temporal split.
@@ -327,6 +339,34 @@ func (c *scheduleCommandFaultClient) WorkflowService() workflowservice.WorkflowS
 	return c.service
 }
 
+func (c *scheduleCommandFaultClient) ExecuteWorkflow(
+	ctx context.Context,
+	options client.StartWorkflowOptions,
+	workflowType interface{},
+	args ...interface{},
+) (client.WorkflowRun, error) {
+	faults, _ := c.service.(*scheduleCommandResponseLossService)
+	if faults != nil {
+		faults.mu.Lock()
+		faults.requestIDs[options.ID]++
+		lose := faults.armed == "trigger"
+		if lose {
+			faults.armed = ""
+		}
+		faults.mu.Unlock()
+		if lose {
+			run, err := c.Client.ExecuteWorkflow(
+				ctx, options, workflowType, args...,
+			)
+			if err != nil {
+				return run, err
+			}
+			return nil, context.DeadlineExceeded
+		}
+	}
+	return c.Client.ExecuteWorkflow(ctx, options, workflowType, args...)
+}
+
 type scheduleCommandResponseLossService struct {
 	workflowservice.WorkflowServiceClient
 	mu                    sync.Mutex
@@ -371,8 +411,6 @@ func (s *scheduleCommandResponseLossService) PatchSchedule(
 	s.requestIDs[request.GetRequestId()]++
 	kind := ""
 	switch {
-	case request.GetPatch().GetTriggerImmediately() != nil:
-		kind = "trigger"
 	case request.GetPatch().GetPause() != "":
 		kind = "pause"
 	case request.GetPatch().GetUnpause() != "":

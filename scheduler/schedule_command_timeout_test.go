@@ -27,6 +27,15 @@ func (c *scheduleCommandTimeoutClient) WorkflowService() workflowservice.Workflo
 	return c.service
 }
 
+func (c *scheduleCommandTimeoutClient) ExecuteWorkflow(
+	context.Context,
+	client.StartWorkflowOptions,
+	interface{},
+	...interface{},
+) (client.WorkflowRun, error) {
+	return nil, nil
+}
+
 type scheduleCommandFirstRPCBlackhole struct {
 	workflowservice.WorkflowServiceClient
 	mu          sync.Mutex

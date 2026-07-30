@@ -23,6 +23,97 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+func TestCompiledTaskRunSnapshotV2_PausedManualRunRequiresExactCommand(
+	t *testing.T,
+) {
+	st := tenantTestStore(t)
+	f := newCompiledTaskFixture(t, st)
+	cleanupA5Fixture(t, st, f)
+	query := "paused-manual-v2-" + uuid.NewString()
+	target := validA5PlanSource(t, query, "Paused manual Tool run")
+	target.ToolName = "web_search"
+	target.ToolArgs = json.RawMessage(`{"query":"` + query + `"}`)
+	creation := preparedA5CommitWithSources(
+		t, st, f, "paused-manual-tool-v2", target)
+	ctx := t.Context()
+
+	if err := st.CommitPausedCompiledTaskDefinitionForCreation(
+		ctx, creation); err != nil {
+		t.Fatal(err)
+	}
+	started, err := st.BeginTaskCreationActivation(
+		ctx, creation.Lease, creation.Definition.TaskID)
+	if err != nil || !started {
+		t.Fatalf("begin activation: started=%v err=%v", started, err)
+	}
+	if err := st.CommitTaskCreationActivation(
+		ctx, creation.Lease, creation.Definition.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CompleteTaskCreationOperation(
+		ctx, creation.Lease, creation.Definition.TaskID,
+		json.RawMessage(`{"created":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE schedules SET status=$4
+		  WHERE tenant_id=$1 AND user_id=$2 AND id=$3`,
+		creation.Lease.TenantID, creation.Lease.UserID,
+		creation.Definition.TaskID, types.ScheduleStatusPaused,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	command, err := st.CreateOrLoadScheduleCommand(
+		ctx, creation.Lease.TenantID, creation.Lease.UserID,
+		creation.Definition.TaskID, "paused-manual-command",
+		types.ScheduleCommandRun,
+		strings.Repeat("a", 64), strings.Repeat("b", 64),
+	)
+	if err != nil {
+		t.Fatalf("create manual command: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupExec(context.Background(), t, st,
+			`DELETE FROM schedule_commands WHERE id=$1`, command.ID)
+	})
+	identity := types.RunIdentity{
+		TemporalWorkflowID: types.ManualTaskWorkflowPrefix + command.ID,
+		TemporalRunID:      uuid.NewString(),
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           creation.Lease.TenantID,
+		UserID:             creation.Lease.UserID,
+		TaskID:             creation.Definition.TaskID,
+	}
+	ref, err := st.CreateOrGetCompiledRunSnapshotV2(
+		ctx, identity, testCompiledRunPolicyV1(t),
+		observation.RolloutAuthority,
+	)
+	if err != nil {
+		t.Fatalf("prepare exact paused manual run: %v", err)
+	}
+	if authorized, err := st.AuthorizeTaskRunSideEffectV2(
+		ctx, identity, ref); err != nil || !authorized {
+		t.Fatalf("authorize exact paused manual run=%v err=%v",
+			authorized, err)
+	}
+
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE schedule_commands
+		    SET status=$2, phase=$3
+		  WHERE id=$1`,
+		command.ID, types.ScheduleCommandBlocked,
+		types.ScheduleCommandBlockedPhase,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if authorized, err := st.AuthorizeTaskRunSideEffectV2(
+		ctx, identity, ref); err != nil || authorized {
+		t.Fatalf("blocked manual command remained authorized=%v err=%v",
+			authorized, err)
+	}
+}
+
 func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 	t *testing.T,
 ) {

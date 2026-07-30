@@ -800,8 +800,8 @@ func (s *Scheduler) TriggerScheduleNow(
 
 // TriggerScheduleNowIdempotent starts the exact stored Action for one owned
 // active or paused task without changing its recurring schedule state.
-// Temporal receives a deterministic PatchSchedule RequestId, so response loss
-// and recovery cannot trigger a second action.
+// A durable command ID becomes the one-off workflow ID, so response loss and
+// recovery cannot start a second execution or mutate the recurring Schedule.
 func (s *Scheduler) TriggerScheduleNowIdempotent(
 	ctx context.Context,
 	schedID string,
@@ -1194,16 +1194,55 @@ func (s *Scheduler) applyScheduleCommandRemote(
 	namespace := s.taskScheduleEnv.namespace
 	switch command.Kind {
 	case types.ScheduleCommandRun:
-		_, err := s.c.WorkflowService().PatchSchedule(
-			ctx, &workflowservice.PatchScheduleRequest{
-				Namespace: namespace, ScheduleId: command.TaskID,
-				Identity:  taskScheduleIdentity(taskScheduleFingerprintVersion),
-				RequestId: command.RemoteRequestID,
-				Patch: &schedulepb.SchedulePatch{
-					TriggerImmediately: &schedulepb.TriggerImmediatelyRequest{},
+		description, err := s.describeTaskSchedule(
+			ctx,
+			taskScheduleExpected{
+				taskID: command.TaskID,
+				prepared: PreparedTaskSchedule{
+					Namespace: namespace,
 				},
 			},
 		)
+		if err != nil {
+			return err
+		}
+		params, found, err := s.decodeRawScheduleActionPushParams(
+			description, command.TaskID,
+		)
+		if err != nil {
+			return err
+		}
+		if !found ||
+			params.UserID != command.UserID ||
+			params.ScheduleID != command.TaskID ||
+			params.RunKind != workflow.PushRunKindScheduled ||
+			params.Snapshot != nil ||
+			(params.TenantID != 0 && params.TenantID != command.TenantID) {
+			return types.NewAppError(
+				types.CodeConflict,
+				"立即运行的任务执行定义与耐久命令不一致",
+				types.ErrConflict,
+			)
+		}
+		_, err = s.c.ExecuteWorkflow(
+			ctx,
+			client.StartWorkflowOptions{
+				ID:        manualTaskWorkflowID(command.ID),
+				TaskQueue: s.tq,
+				WorkflowIDReusePolicy: enums.
+					WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+				// A response-lost retry must surface AlreadyStarted so this
+				// command can adopt the exact existing execution instead of
+				// silently attaching to some unrelated caller state.
+				WorkflowExecutionErrorWhenAlreadyStarted: true,
+			},
+			workflow.PushPipelineWorkflow,
+			params,
+		)
+		var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
+		if errors.As(err, &alreadyStarted) {
+			return nil
+		}
 		return err
 	case types.ScheduleCommandPause, types.ScheduleCommandResume:
 		wantPaused := command.Kind == types.ScheduleCommandPause
@@ -1274,6 +1313,13 @@ func (s *Scheduler) applyScheduleCommandRemote(
 			types.CodeValidation, "未知任务命令", types.ErrValidation,
 		)
 	}
+}
+
+// manualTaskWorkflowID binds one explicit run command to exactly one Temporal
+// execution. It deliberately does not reuse or patch the recurring Schedule:
+// manual execution and recurring cadence are independent product operations.
+func manualTaskWorkflowID(commandID string) string {
+	return types.ManualTaskWorkflowPrefix + commandID
 }
 
 func scheduleCommandDetachedContext(

@@ -833,7 +833,7 @@ func taskDefinitionEditRawTransportExpectations(
 			filepath.Clean(filepath.Join(schedulerDir, "scheduler.go")),
 			"applyScheduleCommandRemote",
 			"PatchSchedule",
-			2,
+			1,
 		},
 		{
 			filepath.Clean(filepath.Join(schedulerDir, "scheduler.go")),

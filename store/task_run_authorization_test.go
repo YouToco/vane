@@ -297,6 +297,9 @@ func TestAuthorizeLiveTaskRunSideEffect_QueryShapeAndFailures(t *testing.T) {
 		wantArgs := []any{
 			identity.TaskID, identity.TenantID, identity.UserID,
 			types.ScheduleStatusActive, types.TenantStatusActive,
+			types.ScheduleStatusPaused, identity.TemporalWorkflowID,
+			types.ManualTaskWorkflowPrefix, types.ScheduleCommandRun,
+			types.ScheduleCommandPending, types.ScheduleCommandCompleted,
 		}
 		if !reflect.DeepEqual(q.args, wantArgs) {
 			t.Fatalf("query args = %#v, want %#v", q.args, wantArgs)

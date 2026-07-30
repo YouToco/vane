@@ -13,6 +13,11 @@ const (
 	ScheduleCommandDelete ScheduleCommandKind = "delete"
 )
 
+// ManualTaskWorkflowPrefix is the durable identity boundary between an
+// explicit one-off run command and a recurring Temporal Schedule execution.
+// Store authorization reconstructs the same identity from schedule_commands.
+const ManualTaskWorkflowPrefix = "wf-manual-"
+
 // ScheduleCommandStatus deliberately has only a non-terminal and terminal
 // value. A remote timeout never means failure: recovery retries the exact
 // request identity until it can prove the requested fact.
@@ -38,8 +43,9 @@ const (
 
 // ScheduleCommand is the retained idempotency and recovery record for the Web
 // task control loop. IdempotencyKey is owner-scoped; PayloadDigest binds that
-// key to one exact kind/task payload and RemoteRequestID binds retries to one
-// Temporal Schedule patch.
+// key to one exact kind/task payload. RemoteRequestID binds pause/resume retries
+// to one Temporal Schedule patch; run commands use ID as their one-off workflow
+// identity and retain RemoteRequestID for the versioned persistence contract.
 type ScheduleCommand struct {
 	ID              string
 	TenantID        int64

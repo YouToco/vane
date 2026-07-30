@@ -689,3 +689,8 @@ command，再用 operation ID 构造 server-owned `agent_auto/v1` receipt 立即
 `[Agent执行]`，不得伪造“用户点击确认卡”。
 外部内容 taint 后禁止同轮写、
 A2A 只读白名单、tenant/user 归属校验、预算和幂等边界全部保持不变。
+`run_task_now` 与周期调度开关是两个正交操作：它不 Patch/Trigger 周期
+Schedule，而是用耐久 run command ID 启动唯一的一次性工作流。active 与 paused
+任务都可手动运行；paused 时只有与该 command 精确绑定的工作流可通过快照和后续
+副作用授权，周期 Schedule 的 paused 状态、cron、时区和下一次触发时间均不得改变。
+响应丢失时重试同一个工作流 ID，并以 `AlreadyStarted` 作为已应用事实收敛。

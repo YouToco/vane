@@ -97,9 +97,8 @@ const CompiledRuntimeStructuredEventEvidenceV1 = workflowruntime.StructuredEvent
 const CompiledRuntimeExecutiveBriefV1 = workflowruntime.ExecutiveBriefV1
 
 // CompiledRuntimeToolSnapshotV2 selects the Source-free task Tool snapshot
-// protocol. It is dark until the versioned Tool execution and observation
-// provenance Activities are wired; defining the label does not make any
-// existing Schedule Action select it.
+// protocol. Its versioned Tool execution and observation provenance Activities
+// serve both recurring and command-bound manual task runs.
 const CompiledRuntimeToolSnapshotV2 = workflowruntime.CompiledToolSnapshotV2
 
 func IsCompiledToolRuntimeV2(version string) bool {

@@ -11,7 +11,7 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
-// ExecuteToolInvocationV2 is the dark Source-free data-plane Activity. It is
+// ExecuteToolInvocationV2 is the Source-free data-plane Activity. It is
 // recovery-first and returns only a receipt. Provider errors after execution
 // begins are non-retryable because Exa/TikHub do not provide a reliable
 // idempotency key; a Workflow must decide how to surface/reconcile uncertainty.
