@@ -12,6 +12,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/types"
 )
@@ -49,6 +51,21 @@ func validScheduledTaskWorkflowExecutionIDV1(taskID, workflowID string) bool {
 	return err == nil && parsed.UTC().Format(timestampLayout) == timestamp
 }
 
+func validManualTaskWorkflowExecutionIDV1(workflowID string) bool {
+	if !strings.HasPrefix(workflowID, types.ManualTaskWorkflowPrefix) {
+		return false
+	}
+	raw := strings.TrimPrefix(workflowID, types.ManualTaskWorkflowPrefix)
+	parsed, err := uuid.Parse(raw)
+	return err == nil && parsed.String() == raw &&
+		types.ManualTaskWorkflowPrefix+raw == workflowID
+}
+
+func validTaskRunWorkflowExecutionIDV1(taskID, workflowID string) bool {
+	return validScheduledTaskWorkflowExecutionIDV1(taskID, workflowID) ||
+		validManualTaskWorkflowExecutionIDV1(workflowID)
+}
+
 func validateTaskRunSnapshotReferenceForExpectedV1(
 	ref types.RunSnapshotRef,
 	expected types.RunIdentity,
@@ -77,7 +94,7 @@ func validateTaskRunExpectedIdentityV1(expected types.RunIdentity) error {
 		!validTaskRunReferenceTextV1(expected.TemporalWorkflowID, maxTaskRunReferenceBytesV1) ||
 		!validTaskRunReferenceTextV1(expected.TemporalRunID, maxTaskRunReferenceBytesV1) ||
 		!validTaskRunReferenceTextV1(expected.TaskID, maxTaskRunReferenceTaskIDV1) ||
-		!validScheduledTaskWorkflowExecutionIDV1(
+		!validTaskRunWorkflowExecutionIDV1(
 			expected.TaskID, expected.TemporalWorkflowID) {
 		return errors.New("invalid expected v1 task run identity")
 	}

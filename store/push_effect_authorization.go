@@ -288,7 +288,7 @@ func validatePushEffectRunSnapshotForClaim(
 	if temporalWorkflowID == scheduledTaskWorkflowID(effect.TaskID) {
 		return nil
 	}
-	if !validScheduledTaskWorkflowExecutionIDV1(
+	if !validTaskRunWorkflowExecutionIDV1(
 		effect.TaskID, temporalWorkflowID,
 	) {
 		return pushEffectIntegrity()
@@ -493,7 +493,14 @@ func authorizedPushEffectRunPredicate() string {
 	   AND r.user_id=e.user_id
 	   AND r.task_id=e.task_id
 	   AND r.temporal_run_id=e.run_id
-	   AND s.status=$8
+	   AND (
+	     s.status=$8 OR (
+	       s.status='paused' AND authorize_manual_task_run_v1(
+	         r.tenant_id, r.user_id, r.task_id,
+	         r.temporal_workflow_id
+	       )
+	     )
+	   )
 	   AND t.status=$9 AND t.deleted_at IS NULL
 	   AND NOT EXISTS (
 	       SELECT 1

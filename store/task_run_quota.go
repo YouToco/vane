@@ -60,7 +60,14 @@ func (s *Store) AuthorizeAndConsumeTaskRunLLMQuotaV1(
 		    AND s.id = r.task_id
 		    AND s.tenant_id = r.tenant_id
 		    AND s.user_id = r.user_id
-		    AND s.status = $18
+		    AND (
+		      s.status = $18 OR (
+		        s.status = $20 AND authorize_manual_task_run_v1(
+		          r.tenant_id, r.user_id, r.task_id,
+		          r.temporal_workflow_id
+		        )
+		      )
+		    )
 		    AND t.id = s.tenant_id
 		    AND t.status = $19
 		    AND t.deleted_at IS NULL
@@ -77,6 +84,7 @@ func (s *Store) AuthorizeAndConsumeTaskRunLLMQuotaV1(
 		pinned.Policy.PromptPolicyDigest, pinned.Policy.ModelPolicyDigest,
 		pinned.Policy.QuotaPolicyDigest, types.ScheduleStatusActive,
 		types.TenantStatusActive,
+		types.ScheduleStatusPaused,
 	)
 	if err != nil {
 		return classifyQuotaErr(err, fmt.Sprintf(
@@ -141,7 +149,14 @@ func (s *Store) AuthorizeAndConsumeTaskRunLLMQuotaV2(
 		    AND s.id = r.task_id
 		    AND s.tenant_id = r.tenant_id
 		    AND s.user_id = r.user_id
-		    AND s.status = $19
+		    AND (
+		      s.status = $19 OR (
+		        s.status = $21 AND authorize_manual_task_run_v1(
+		          r.tenant_id, r.user_id, r.task_id,
+		          r.temporal_workflow_id
+		        )
+		      )
+		    )
 		    AND t.id = s.tenant_id
 		    AND t.status = $20
 		    AND t.deleted_at IS NULL
@@ -158,6 +173,7 @@ func (s *Store) AuthorizeAndConsumeTaskRunLLMQuotaV2(
 		ref.Policy.PromptPolicyDigest, ref.Policy.ModelPolicyDigest,
 		ref.Policy.QuotaPolicyDigest, types.RunSnapshotSchemaVersionV2,
 		types.ScheduleStatusActive, types.TenantStatusActive,
+		types.ScheduleStatusPaused,
 	)
 	if err != nil {
 		return classifyQuotaErr(err, fmt.Sprintf(

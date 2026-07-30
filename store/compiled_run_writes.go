@@ -153,12 +153,19 @@ func lockLiveCompiledRunWriteV1(
 		  WHERE s.id = $1
 		    AND s.tenant_id = $2
 		    AND s.user_id = $3
-		    AND s.status = $4
+		    AND (
+		      s.status = $4 OR (
+		        s.status = $6 AND authorize_manual_task_run_v1(
+		          s.tenant_id, s.user_id, s.id, $7
+		        )
+		      )
+		    )
 		    AND t.status = $5 AND t.deleted_at IS NULL
 		    AND `+matureSchedulePredicate+`
 		  FOR SHARE OF s, t, m`,
 		identity.TaskID, identity.TenantID, identity.UserID,
 		types.ScheduleStatusActive, types.TenantStatusActive,
+		types.ScheduleStatusPaused, identity.TemporalWorkflowID,
 	).Scan(&live)
 	if errors.Is(err, pgx.ErrNoRows) || !live {
 		return taskRunNotFound()

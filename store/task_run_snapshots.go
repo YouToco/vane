@@ -532,9 +532,17 @@ func loadTaskRunDefinition(
 		   FROM schedules s
 		   LEFT JOIN schedule_playbooks pb ON pb.schedule_id = s.id
 		  WHERE s.id = $1 AND s.tenant_id = $2 AND s.user_id = $3
-		    AND s.status = $4 AND `+matureSchedulePredicate+`
+		    AND (
+		      s.status = $4 OR (
+		        s.status = $5 AND authorize_manual_task_run_v1(
+		          s.tenant_id, s.user_id, s.id, $6
+		        )
+		      )
+		    )
+		    AND `+matureSchedulePredicate+`
 		  FOR SHARE OF s`,
 		p.TaskID, p.TenantID, p.UserID, types.ScheduleStatusActive,
+		types.ScheduleStatusPaused, p.TemporalWorkflowID,
 	).Scan(
 		&definition.NLDescription, &definition.SpecJSON, &definition.ScopeJSON,
 		&strictness, &definition.PlaybookContent, &definition.FetchPlan,

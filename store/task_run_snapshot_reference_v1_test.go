@@ -92,6 +92,32 @@ func TestValidScheduledTaskWorkflowExecutionIDV1(t *testing.T) {
 	}
 }
 
+func TestValidTaskRunWorkflowExecutionIDV1_ManualCommandIdentity(t *testing.T) {
+	const commandID = "3b5af7c5-229f-4542-b493-e17ff90593de"
+	valid := types.ManualTaskWorkflowPrefix + commandID
+	tests := []struct {
+		name       string
+		workflowID string
+		want       bool
+	}{
+		{name: "exact lowercase command UUID", workflowID: valid, want: true},
+		{name: "missing command", workflowID: types.ManualTaskWorkflowPrefix},
+		{name: "non UUID", workflowID: types.ManualTaskWorkflowPrefix + "manual"},
+		{name: "uppercase UUID", workflowID: types.ManualTaskWorkflowPrefix +
+			strings.ToUpper(commandID)},
+		{name: "trailing bytes", workflowID: valid + "-extra"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validTaskRunWorkflowExecutionIDV1(
+				"task-any", test.workflowID); got != test.want {
+				t.Fatalf("manual workflow validity=%v want=%v for %q",
+					got, test.want, test.workflowID)
+			}
+		})
+	}
+}
+
 // This is a hand-authored persisted row and reference envelope. Neither the
 // expected bytes nor digest are produced by the current types contract, so an
 // incompatible v1 representation change fails before old rows reach runtime.

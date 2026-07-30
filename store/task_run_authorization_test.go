@@ -287,6 +287,7 @@ func TestAuthorizeLiveTaskRunSideEffect_QueryShapeAndFailures(t *testing.T) {
 			"s.tenant_id = $2",
 			"s.user_id = $3",
 			"s.status = $4",
+			"authorize_manual_task_run_v1(",
 			"t.status = $5 AND t.deleted_at IS NULL",
 			"FROM task_creation_operations p",
 			"p.task_id = s.id",
@@ -298,8 +299,6 @@ func TestAuthorizeLiveTaskRunSideEffect_QueryShapeAndFailures(t *testing.T) {
 			identity.TaskID, identity.TenantID, identity.UserID,
 			types.ScheduleStatusActive, types.TenantStatusActive,
 			types.ScheduleStatusPaused, identity.TemporalWorkflowID,
-			types.ManualTaskWorkflowPrefix, types.ScheduleCommandRun,
-			types.ScheduleCommandPending, types.ScheduleCommandCompleted,
 		}
 		if !reflect.DeepEqual(q.args, wantArgs) {
 			t.Fatalf("query args = %#v, want %#v", q.args, wantArgs)

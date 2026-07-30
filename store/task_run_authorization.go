@@ -177,15 +177,8 @@ func authorizeLiveTaskRunSideEffectV1(
 		       AND s.user_id = $3
 		       AND (
 		         s.status = $4 OR (
-		           s.status = $6 AND EXISTS (
-		             SELECT 1
-		               FROM schedule_commands c
-		              WHERE $7 = $8 || c.id::text
-		                AND c.tenant_id=s.tenant_id
-		                AND c.user_id=s.user_id
-		                AND c.task_id=s.id
-		                AND c.kind=$9
-		                AND c.status IN ($10, $11)
+		           s.status = $6 AND authorize_manual_task_run_v1(
+		             s.tenant_id, s.user_id, s.id, $7
 		           )
 		         )
 		       )
@@ -195,8 +188,6 @@ func authorizeLiveTaskRunSideEffectV1(
 		identity.TaskID, identity.TenantID, identity.UserID,
 		types.ScheduleStatusActive, types.TenantStatusActive,
 		types.ScheduleStatusPaused, identity.TemporalWorkflowID,
-		types.ManualTaskWorkflowPrefix, types.ScheduleCommandRun,
-		types.ScheduleCommandPending, types.ScheduleCommandCompleted,
 	).Scan(&authorized); err != nil {
 		return false, taskRunDatabaseError("authorize task run side effect", err)
 	}

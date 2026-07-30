@@ -268,15 +268,8 @@ func loadCurrentToolApprovedDefinitionTx(
 		  WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.id=$3
 		    AND (
 		      s.status=$4 OR (
-		        s.status=$7 AND EXISTS (
-		          SELECT 1
-		            FROM schedule_commands c
-		           WHERE $8 = $9 || c.id::text
-		             AND c.tenant_id=s.tenant_id
-		             AND c.user_id=s.user_id
-		             AND c.task_id=s.id
-		             AND c.kind=$10
-		             AND c.status IN ($11, $12)
+		        s.status=$7 AND authorize_manual_task_run_v1(
+		          s.tenant_id, s.user_id, s.id, $8
 		        )
 		      )
 		    )
@@ -287,8 +280,7 @@ func loadCurrentToolApprovedDefinitionTx(
 		types.ScheduleStatusActive, types.ExecutionModeCompiled,
 		taskstate.ApprovedDefinitionSchemaVersionV2,
 		types.ScheduleStatusPaused, identity.TemporalWorkflowID,
-		types.ManualTaskWorkflowPrefix, types.ScheduleCommandRun,
-		types.ScheduleCommandPending, types.ScheduleCommandCompleted),
+	),
 		identity.TenantID, identity.UserID, identity.TaskID)
 	if err != nil {
 		if errors.Is(err, types.ErrNotFound) {

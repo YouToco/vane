@@ -85,6 +85,28 @@ func TestCompiledTaskRunSnapshotV2_PausedManualRunRequiresExactCommand(
 		UserID:             creation.Lease.UserID,
 		TaskID:             creation.Definition.TaskID,
 	}
+	claimTx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimTx.Exec(
+		ctx, `SET LOCAL ROLE vane_push_effect_coordinator`); err != nil {
+		t.Fatal(err)
+	}
+	var claimRoleAuthorized bool
+	if err := claimTx.QueryRow(ctx,
+		`SELECT authorize_manual_task_run_v1($1,$2,$3,$4)`,
+		identity.TenantID, identity.UserID, identity.TaskID,
+		identity.TemporalWorkflowID,
+	).Scan(&claimRoleAuthorized); err != nil {
+		t.Fatalf("push-effect role manual authority: %v", err)
+	}
+	if !claimRoleAuthorized {
+		t.Fatal("push-effect role could not read exact manual authority")
+	}
+	if err := claimTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
 	ref, err := st.CreateOrGetCompiledRunSnapshotV2(
 		ctx, identity, testCompiledRunPolicyV1(t),
 		observation.RolloutAuthority,
@@ -97,10 +119,40 @@ func TestCompiledTaskRunSnapshotV2_PausedManualRunRequiresExactCommand(
 		t.Fatalf("authorize exact paused manual run=%v err=%v",
 			authorized, err)
 	}
+	setBucket(t, st, identity.TenantID, QuotaLLMTokens,
+		100, 0.000001, 100)
+	t.Cleanup(func() {
+		cleanupExec(context.Background(), t, st,
+			`DELETE FROM tenant_quota WHERE tenant_id=$1`,
+			identity.TenantID)
+	})
+	quotaRule := runtimepolicy.QuotaBucketV1{
+		Name: string(QuotaLLMTokens), Financial: true,
+		EnforcementVersion: runtimepolicy.QuotaEnforcementLLMPrechargeV1,
+	}
+	if err := st.AuthorizeAndConsumeTaskRunLLMQuotaV2(
+		ctx, identity, ref, quotaRule, 1); err != nil {
+		t.Fatalf("paused manual quota authorization: %v", err)
+	}
+	if _, _, err := st.RecordEmptyPushBatchForTaskRunV2(
+		ctx, identity, ref, "paused-manual-empty",
+		types.BatchExitGateObservationNoMatch,
+		types.PipelineCounts{},
+	); err != nil {
+		t.Fatalf("paused manual write authorization: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupExec(context.Background(), t, st,
+			`DELETE FROM push_batches WHERE run_snapshot_id=$1`,
+			ref.SnapshotID)
+	})
 
 	if _, err := st.pool.Exec(ctx,
 		`UPDATE schedule_commands
-		    SET status=$2, phase=$3
+		    SET status=$2, phase=$3,
+		        completed_at=clock_timestamp(),
+		        error_code='test_blocked',
+		        error_message='test blocked manual command'
 		  WHERE id=$1`,
 		command.ID, types.ScheduleCommandBlocked,
 		types.ScheduleCommandBlockedPhase,
@@ -111,6 +163,11 @@ func TestCompiledTaskRunSnapshotV2_PausedManualRunRequiresExactCommand(
 		ctx, identity, ref); err != nil || authorized {
 		t.Fatalf("blocked manual command remained authorized=%v err=%v",
 			authorized, err)
+	}
+	if err := st.AuthorizeAndConsumeTaskRunLLMQuotaV2(
+		ctx, identity, ref, quotaRule, 1,
+	); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("blocked manual command consumed quota: %v", err)
 	}
 }
 
