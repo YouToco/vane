@@ -276,10 +276,11 @@ func authorizeNewScheduleCommand(
 	}
 	switch command.Kind {
 	case types.ScheduleCommandRun:
-		if schedule.Status != types.ScheduleStatusActive {
+		if schedule.Status != types.ScheduleStatusActive &&
+			schedule.Status != types.ScheduleStatusPaused {
 			return types.NewAppError(
 				types.CodeConflict,
-				"任务已暂停，请先恢复后再立即运行。",
+				"任务当前状态不支持立即运行，请刷新后重试。",
 				types.ErrConflict,
 			)
 		}

@@ -763,7 +763,7 @@ type runTaskNowTool struct {
 
 func (t *runTaskNowTool) Name() string { return "run_task_now" }
 func (t *runTaskNowTool) Description() string {
-	return "立即运行一个或多个已有任务，只使用各任务手册已经批准并冻结的范围。先用 list_schedules 按用户记得的名称、主题、时间或用途定位；唯一匹配直接运行，真歧义才按可读名称追问，绝不能要求用户提供内部 id。"
+	return "立即运行一个或多个已有任务，只使用各任务手册已经批准并冻结的范围。一次性手动执行独立于周期调度开关：active 或 paused 任务都能运行，paused 只暂停自动周期触发；绝不能要求先恢复任务或再次确认，也不能改变周期调度状态。先用 list_schedules 按用户记得的名称、主题、时间或用途定位；唯一匹配直接运行，真歧义才按可读名称追问，绝不能要求用户提供内部 id。"
 }
 func (t *runTaskNowTool) Parameters() json.RawMessage {
 	return json.RawMessage(runTaskNowSchema)

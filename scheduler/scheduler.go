@@ -799,8 +799,9 @@ func (s *Scheduler) TriggerScheduleNow(
 }
 
 // TriggerScheduleNowIdempotent starts the exact stored Action for one owned
-// active task. Temporal receives a deterministic PatchSchedule RequestId, so
-// response loss and recovery cannot trigger a second action.
+// active or paused task without changing its recurring schedule state.
+// Temporal receives a deterministic PatchSchedule RequestId, so response loss
+// and recovery cannot trigger a second action.
 func (s *Scheduler) TriggerScheduleNowIdempotent(
 	ctx context.Context,
 	schedID string,
@@ -875,10 +876,11 @@ func (s *Scheduler) triggerScheduleNowLegacy(
 	if err != nil {
 		return err
 	}
-	if sc.Status != types.ScheduleStatusActive {
+	if sc.Status != types.ScheduleStatusActive &&
+		sc.Status != types.ScheduleStatusPaused {
 		return types.NewAppError(
 			types.CodeConflict,
-			"任务已暂停，请先恢复后再立即运行。",
+			"任务当前状态不支持立即运行，请刷新后重试。",
 			types.ErrConflict,
 		)
 	}

@@ -766,8 +766,15 @@ func TestTaskLifecycleActionsPreserveSelectedScheduleIdentity(t *testing.T) {
 	}
 	if err := s.TriggerScheduleNow(
 		t.Context(), "task-web-1", 7,
-	); !errors.Is(err, types.ErrConflict) {
-		t.Fatalf("paused trigger err=%v, want conflict", err)
+	); err != nil {
+		t.Fatalf("paused one-off trigger: %v", err)
+	}
+	if store.status != types.ScheduleStatusPaused ||
+		handle.triggerCalls != 2 {
+		t.Fatalf(
+			"paused one-off changed recurring state: status=%s trigger=%d",
+			store.status, handle.triggerCalls,
+		)
 	}
 	if err := s.ResumePush(
 		t.Context(), "task-web-1", 7,

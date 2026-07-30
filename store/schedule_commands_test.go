@@ -12,6 +12,17 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+func TestAuthorizeNewScheduleCommandAllowsPausedOneOffRun(t *testing.T) {
+	command := &types.ScheduleCommand{Kind: types.ScheduleCommandRun}
+	schedule := &types.Schedule{Status: types.ScheduleStatusPaused}
+	if err := authorizeNewScheduleCommand(command, schedule, true); err != nil {
+		t.Fatalf("paused one-off run authorization: %v", err)
+	}
+	if schedule.Status != types.ScheduleStatusPaused {
+		t.Fatalf("authorization changed recurring status to %q", schedule.Status)
+	}
+}
+
 func TestScheduleCommands_PostgreSQLLifecycleAndSharedLock(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -157,6 +168,35 @@ func TestScheduleCommands_PostgreSQLLifecycleAndSharedLock(t *testing.T) {
 	}
 	if pauseReplay.ID != pause.ID {
 		t.Fatalf("pause replay id=%s want=%s", pauseReplay.ID, pause.ID)
+	}
+
+	pausedRun, err := st.CreateOrLoadScheduleCommand(
+		ctx, 1, user.ID, taskID, "store-paused-run-key",
+		types.ScheduleCommandRun, runPayload,
+		"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+	)
+	if err != nil {
+		t.Fatalf("create paused one-off run intent: %v", err)
+	}
+	command, _, complete, _, rollback, err =
+		st.BeginScheduleCommandAttempt(
+			ctx, 1, user.ID, pausedRun.IdempotencyKey,
+		)
+	if err != nil {
+		t.Fatalf("begin paused one-off run: %v", err)
+	}
+	if command.ID != pausedRun.ID {
+		t.Fatalf("paused run command=%s want=%s", command.ID, pausedRun.ID)
+	}
+	if err := complete(ctx); err != nil {
+		t.Fatalf("complete paused one-off run: %v", err)
+	}
+	if err := rollback(ctx); err != nil {
+		t.Fatalf("release paused one-off run: %v", err)
+	}
+	stored, err = st.GetSchedule(ctx, taskID, user.ID)
+	if err != nil || stored.Status != types.ScheduleStatusPaused {
+		t.Fatalf("one-off run changed paused mirror=%+v err=%v", stored, err)
 	}
 
 	if _, err := st.LoadScheduleCommand(
