@@ -1,11 +1,14 @@
 package api
 
 import (
+	"log/slog"
 	"net/http"
 	"strconv"
 
 	"github.com/YouToco/vane/auth"
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/taskhealth"
+	"github.com/YouToco/vane/types"
 )
 
 // handleListTaskBriefs returns immutable whole Briefs for one exact task.
@@ -46,7 +49,90 @@ func (s *server) handleListTaskBriefs(w http.ResponseWriter, r *http.Request) {
 		writeAppError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK,
-		publicTaskBriefPageV1(
-			page, s.executiveBriefProjectionEnabled(taskID)))
+	memberships, membershipErr := s.deps.Auth.ListMembershipsByUser(
+		r.Context(), principal.UserID,
+	)
+	role := membershipRoleForTenantV1(
+		memberships,
+		int64(principal.TenantID),
+		principal.UserID,
+	)
+	if membershipErr != nil {
+		slog.WarnContext(
+			r.Context(),
+			"api: task health membership projection unavailable",
+			"task_id", taskID,
+			"error_code", types.CodeOf(membershipErr),
+		)
+		role = ""
+	}
+	cost, costErr := s.deps.Store.GetScheduleRunCost(
+		r.Context(), principal.UserID, taskID,
+	)
+	if costErr != nil {
+		slog.WarnContext(
+			r.Context(),
+			"api: task health usage projection unavailable",
+			"task_id", taskID,
+			"error_code", types.CodeOf(costErr),
+		)
+		cost = nil
+	}
+	response := publicTaskBriefPageV1(
+		page, s.executiveBriefProjectionEnabled(taskID))
+	health := projectTaskHealthV1(
+		page.LatestCheck,
+		cost,
+		role,
+		s.deps.DefinitionEditEnabled,
+	)
+	response.Health = &health
+	writeJSON(w, http.StatusOK, response)
+}
+
+func membershipRoleForTenantV1(
+	memberships []types.Membership,
+	tenantID int64,
+	userID int64,
+) types.MembershipRole {
+	for _, membership := range memberships {
+		if membership.TenantID == tenantID &&
+			membership.UserID == userID {
+			return membership.Role
+		}
+	}
+	return ""
+}
+
+func projectTaskHealthV1(
+	latest *store.TaskLatestCheckV1,
+	cost *store.ScheduleRunCost,
+	role types.MembershipRole,
+	definitionEditEnabled bool,
+) taskhealth.ProjectionV1 {
+	var latestCheck *taskhealth.LatestCheckV1
+	if latest != nil {
+		latestCheck = &taskhealth.LatestCheckV1{
+			Result:         latest.Result,
+			SourceCoverage: latest.SourceCoverage,
+			Processing:     latest.Processing,
+			FailureCode:    latest.FailureCode,
+			FinalizedAt:    latest.FinalizedAt,
+		}
+	}
+	usage := taskhealth.UsageV1{}
+	if cost != nil {
+		usage.LLMCostUSD = &cost.LLMCostUSD
+		usage.LLMCalls = &cost.LLMCalls
+	}
+	return taskhealth.ProjectV1(
+		latestCheck,
+		taskhealth.AcquisitionSummaryV1{},
+		usage,
+		taskhealth.AccessV1{
+			Role:                  role,
+			TaskAccessVerified:    true,
+			DefinitionEditEnabled: definitionEditEnabled,
+		},
+	)
 }

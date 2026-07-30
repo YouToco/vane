@@ -6,12 +6,13 @@ import (
 	"io/fs"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 )
 
-func TestTaskHealthHasNoProductionImportV1(t *testing.T) {
+func TestTaskHealthProductionImportIsLimitedToBriefWebProjectionV1(t *testing.T) {
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate task health guard")
@@ -54,7 +55,23 @@ func TestTaskHealthHasNoProductionImportV1(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(imports) != 0 {
-		t.Fatalf("task health gained production imports before API rollout: %v", imports)
+	sort.Strings(imports)
+	allowed := []string{
+		"api/brief_projections.go",
+		"api/briefs.go",
+	}
+	if len(imports) != len(allowed) {
+		t.Fatalf(
+			"task health production import scope drifted: %v",
+			imports,
+		)
+	}
+	for index := range allowed {
+		if imports[index] != allowed[index] {
+			t.Fatalf(
+				"task health production import scope drifted: %v",
+				imports,
+			)
+		}
 	}
 }
