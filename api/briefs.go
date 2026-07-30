@@ -121,13 +121,26 @@ func projectTaskHealthV1(
 		}
 	}
 	usage := taskhealth.UsageV1{}
+	acquisition := taskhealth.AcquisitionSummaryV1{}
 	if cost != nil {
 		usage.LLMCostUSD = &cost.LLMCostUSD
 		usage.LLMCalls = &cost.LLMCalls
+		if cost.ToolCalls > 0 {
+			usage.ToolCostUSD = &cost.ToolCostUSD
+			usage.ToolCalls = &cost.ToolCalls
+			usage.ToolPricedCalls = &cost.ToolPricedCalls
+		}
+		acquisition.Total = cost.LatestAcquisitionCalls
+		acquisition.Failing = cost.LatestAcquisitionFailures
+		if acquisition.Failing > 0 {
+			acquisition.FailureReason =
+				projectAcquisitionFailureV1(
+					cost.LatestAcquisitionErrorType)
+		}
 	}
 	return taskhealth.ProjectV1(
 		latestCheck,
-		taskhealth.AcquisitionSummaryV1{},
+		acquisition,
 		usage,
 		taskhealth.AccessV1{
 			Role:                  role,
@@ -135,4 +148,21 @@ func projectTaskHealthV1(
 			DefinitionEditEnabled: definitionEditEnabled,
 		},
 	)
+}
+
+func projectAcquisitionFailureV1(
+	errorType string,
+) taskhealth.AcquisitionFailureV1 {
+	switch errorType {
+	case types.ToolErrTimeout:
+		return taskhealth.AcquisitionFailureTimeoutV1
+	case types.ToolErrHTTP:
+		return taskhealth.AcquisitionFailureProviderV1
+	case types.ToolErrInvalidArgs:
+		return taskhealth.AcquisitionFailureInvalidRequestV1
+	case types.ToolErrBudgetExceeded:
+		return taskhealth.AcquisitionFailureUsageLimitV1
+	default:
+		return taskhealth.AcquisitionFailureInternalV1
+	}
 }

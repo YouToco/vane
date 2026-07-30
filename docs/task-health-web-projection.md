@@ -24,11 +24,17 @@ task manual and lets the Agent recompile its internal Tool calls.
 
 ## Cost truthfulness
 
+- Tool calls are attributed only through the exact immutable run snapshot
+  `(tenant, user, task, Temporal workflow ID)` binding. No time-window or
+  workflow-name prefix heuristic is allowed.
 - A missing tool-cost attribution is `llm_only`, never a fabricated zero-cost
-  tool total.
+  tool total. Legacy calls without a run snapshot remain unattributed.
 - Both LLM and tool cost/call pairs are nullable; a missing pair means
   unattributed, while an explicit zero pair means a verified zero.
 - `known_cost_usd` is the sum of the components whose attribution is known.
+- If only some Tool rows carry a provider cost receipt, their subtotal is
+  included but coverage is `llm_and_tools_partial` (or `tools_partial`).
+  `tool_calls` and `tool_priced_calls` make the lower bound auditable.
 - `budget=ok` requires complete LLM-and-tool attribution. Partial attribution
   can prove only a lower-bound warning/exhaustion; otherwise it is incomplete.
 - The reporting window is included only when both boundaries form a valid
@@ -47,3 +53,16 @@ remains false and the usage object is omitted.
 
 The package is exposed only through the task-scoped Brief Web projection after
 the task-playbook cutover. It has no Feishu, workflow, or model call point.
+
+## Acquisition failure language
+
+The latest exact run may expose only a bounded failure category:
+`timeout`, `provider_error`, `invalid_request`, `usage_limit`, or `internal`.
+This category is projected only when the latest snapshot's Temporal workflow ID
+names exactly one run snapshot in that task scope. Retained schedulers that
+reuse a workflow ID are ambiguous and therefore expose no "latest" Tool fact;
+history is never guessed into the current check.
+Provider bodies, endpoint paths, SQL/driver details and raw error strings never
+cross the API. The recommended action follows the category: transient failures
+wait for retry, invalid requests review the task manual, usage limits review
+usage, and internal failures contact support.

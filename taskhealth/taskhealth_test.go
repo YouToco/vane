@@ -41,11 +41,41 @@ func TestProjectV1AcquisitionFailureTakesPrecedence(t *testing.T) {
 		SourceCoverage: types.RunCompletenessPartial,
 		Processing:     types.RunCompletenessPartial,
 		FinalizedAt:    time.Now(),
-	}, AcquisitionSummaryV1{Total: 2, Failing: 1, MaxFailCount: 4},
+	}, AcquisitionSummaryV1{
+		Total: 2, Failing: 1, MaxFailCount: 4,
+		FailureReason: AcquisitionFailureInvalidRequestV1,
+	},
 		UsageV1{}, AccessV1{})
 	if got.Issue != IssueAcquisitionUnavailableV1 ||
 		got.RecommendedAction != ActionReviewTaskV1 {
 		t.Fatalf("acquisition failure projection = %#v", got)
+	}
+}
+
+func TestProjectV1AcquisitionFailureActionsAreActionable(t *testing.T) {
+	for _, test := range []struct {
+		reason AcquisitionFailureV1
+		action RecommendedActionV1
+	}{
+		{AcquisitionFailureTimeoutV1, ActionWaitForRetryV1},
+		{AcquisitionFailureProviderV1, ActionWaitForRetryV1},
+		{AcquisitionFailureInvalidRequestV1, ActionReviewTaskV1},
+		{AcquisitionFailureUsageLimitV1, ActionReviewUsageV1},
+		{AcquisitionFailureInternalV1, ActionContactSupportV1},
+	} {
+		got := ProjectV1(&LatestCheckV1{
+			Result:         types.RunResultContent,
+			SourceCoverage: types.RunCompletenessPartial,
+			Processing:     types.RunCompletenessComplete,
+			FinalizedAt:    time.Now(),
+		}, AcquisitionSummaryV1{
+			Total: 1, Failing: 1, MaxFailCount: 1,
+			FailureReason: test.reason,
+		}, UsageV1{}, AccessV1{})
+		if got.RecommendedAction != test.action {
+			t.Fatalf("reason=%q action=%q want=%q",
+				test.reason, got.RecommendedAction, test.action)
+		}
 	}
 }
 
@@ -92,16 +122,32 @@ func TestProjectUsageV1NeverClaimsUnknownToolCostIsZero(t *testing.T) {
 	}
 	toolCost := 0.75
 	toolCalls := int64(2)
+	pricedToolCalls := int64(2)
 	complete := projectUsageV1(UsageV1{
-		LLMCostUSD:  &llmCost,
-		LLMCalls:    &llmCalls,
-		ToolCostUSD: &toolCost,
-		ToolCalls:   &toolCalls,
+		LLMCostUSD:      &llmCost,
+		LLMCalls:        &llmCalls,
+		ToolCostUSD:     &toolCost,
+		ToolCalls:       &toolCalls,
+		ToolPricedCalls: &pricedToolCalls,
 	})
 	if complete.Coverage != CostCoverageLLMAndToolsV1 ||
 		complete.KnownCostUSD != 2 ||
 		complete.ToolCalls == nil || *complete.ToolCalls != 2 {
 		t.Fatalf("complete usage = %#v", complete)
+	}
+	onePriced := int64(1)
+	partial := projectUsageV1(UsageV1{
+		LLMCostUSD:      &llmCost,
+		LLMCalls:        &llmCalls,
+		ToolCostUSD:     &toolCost,
+		ToolCalls:       &toolCalls,
+		ToolPricedCalls: &onePriced,
+	})
+	if partial.Coverage != CostCoverageLLMAndToolsPartialV1 ||
+		partial.KnownCostUSD != 2 ||
+		partial.ToolPricedCalls == nil ||
+		*partial.ToolPricedCalls != 1 {
+		t.Fatalf("partially priced tool usage = %#v", partial)
 	}
 }
 
@@ -120,11 +166,12 @@ func TestProjectUsageV1BudgetStatesAndInvalidMoney(t *testing.T) {
 		cost := test.cost
 		calls := int64(1)
 		got := projectUsageV1(UsageV1{
-			LLMCostUSD:  &cost,
-			LLMCalls:    &calls,
-			ToolCostUSD: &zero,
-			ToolCalls:   &zeroCalls,
-			BudgetUSD:   &budget,
+			LLMCostUSD:      &cost,
+			LLMCalls:        &calls,
+			ToolCostUSD:     &zero,
+			ToolCalls:       &zeroCalls,
+			ToolPricedCalls: &zeroCalls,
+			BudgetUSD:       &budget,
 		})
 		if got.BudgetState != test.want {
 			t.Fatalf("cost %.2f budget state = %q, want %q", test.cost, got.BudgetState, test.want)
@@ -157,6 +204,22 @@ func TestProjectV1MalformedFactsFailClosed(t *testing.T) {
 	}, AcquisitionSummaryV1{Total: 0, Failing: 2}, UsageV1{}, AccessV1{})
 	if got.State != StateAttentionV1 || got.Issue != IssueCheckFailedV1 {
 		t.Fatalf("malformed facts projected healthy: %#v", got)
+	}
+}
+
+func TestProjectV1AcquisitionFailureDoesNotInventAStreak(t *testing.T) {
+	got := ProjectV1(&LatestCheckV1{
+		Result:         types.RunResultContent,
+		SourceCoverage: types.RunCompletenessPartial,
+		Processing:     types.RunCompletenessComplete,
+		FinalizedAt:    time.Now(),
+	}, AcquisitionSummaryV1{
+		Total: 2, Failing: 2,
+		FailureReason: AcquisitionFailureTimeoutV1,
+	}, UsageV1{}, AccessV1{})
+	if got.Acquisition.MaxFailCount != 0 ||
+		got.RecommendedAction != ActionWaitForRetryV1 {
+		t.Fatalf("source-free call failures invented streak=%#v", got)
 	}
 }
 
@@ -199,10 +262,11 @@ func TestProjectUsageV1RejectsOverflowingTotal(t *testing.T) {
 	max := math.MaxFloat64
 	calls := int64(1)
 	got := projectUsageV1(UsageV1{
-		LLMCostUSD:  &max,
-		LLMCalls:    &calls,
-		ToolCostUSD: &max,
-		ToolCalls:   &calls,
+		LLMCostUSD:      &max,
+		LLMCalls:        &calls,
+		ToolCostUSD:     &max,
+		ToolCalls:       &calls,
+		ToolPricedCalls: &calls,
 	})
 	if got.Coverage != CostCoverageNoneV1 || got.KnownCostUSD != 0 {
 		t.Fatalf("overflowing total was presented: %#v", got)
