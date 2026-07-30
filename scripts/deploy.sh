@@ -326,10 +326,12 @@ stat_oss_object_with_size() {
   local object=$1
   local expected_size=$2
   local object_meta
-  [[ $expected_size =~ ^[0-9]+$ ]] || {
+  if [[ $expected_size =~ ^[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+    expected_size=${BASH_REMATCH[1]}
+  else
     echo "invalid expected OSS object size for $object" >&2
     return 1
-  }
+  fi
   object_meta=$(
     "$OSSUTIL_BIN" stat "oss://zhuoqidev-vane-web/$object"
   )
