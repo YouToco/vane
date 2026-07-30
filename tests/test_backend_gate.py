@@ -10,7 +10,9 @@ class BackendGateTests(unittest.TestCase):
     def test_shared_database_race_gate_is_not_randomized(self) -> None:
         workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
 
-        self.assertIn("go test -race -count=1 \\\n", workflow)
+        self.assertIn(
+            "go test -race -count=1 -timeout=15m \\\n", workflow
+        )
         self.assertNotIn("-shuffle", workflow)
         self.assertIn(
             "-coverprofile=coverage.txt -covermode=atomic ./...", workflow
