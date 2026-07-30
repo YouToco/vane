@@ -25,7 +25,10 @@
   - 确需对外监听（如临时联调）：设环境变量 `VANE_SERVER_ADDR=0.0.0.0:8080`（写进
     `/opt/vane/.env`）或改 config `server.addr`，**并同时用防火墙（ufw/nftables）限制来源**——
     改绑是零依赖根治，防火墙是可并行的第二道防线。
-- vane 二进制由 CI（GitHub Actions）构建并 scp 到 `/opt/vane/bin/vane`，systemd 管理。
+- vane 二进制由私有 `vane-deploy` 控制面独立检出当前 `main` 的精确 SHA，
+  在无生产凭证的 build runner 上完成完整 Gate 和构建，再由隔离的 deploy runner
+  校验制品、上传到 `/opt/vane/bin/vane` 并交给 systemd 管理。源仓库 CI 不持有生产凭证，
+  也不直接部署。
 - Web Dashboard（vane-web 仓库）由其 CI 构建，dist 内容 scp 到 `/opt/vane/web/`，
   compose 里以只读卷 `./web:/srv/vane-web:ro` 挂给 Caddy 做静态托管；
   两个仓库共用同一组 CI secrets（VPS_HOST/VPS_PORT/VPS_USER/VPS_SSH_KEY）。
@@ -50,7 +53,8 @@ cd /opt/vane && docker compose up -d
 cp /opt/vane/vane.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable vane
 
-# 5. 之后每次 push main，CI 自动构建上传二进制并 restart vane
+# 5. 之后 push main；私有 vane-deploy 控制面定时解析最新 SHA，
+#    独立 Gate 通过后上传二进制、优雅重启并执行生产探针
 ```
 
 ## 日常运维

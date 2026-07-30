@@ -7,7 +7,9 @@
 
 参考 React / Next.js / Go：`main` 单主干常绿，短命功能分支，不用 Git Flow。
 
-- **`main`**：永远可部署。CI 全绿才能合入；push 到 main 自动部署（后端→VPS，前端→CDN）。
+- **`main`**：永远可部署。源仓库 CI 全绿才能合入；生产发布由私有
+  `vane-deploy` 控制面定时解析后端与前端 `main` 的精确 SHA，重新执行独立 Gate
+  后部署（后端→VPS，前端→CDN）。源仓库工作流不持有生产凭证。
 - **功能分支**：从 main 切出，命名 `<type>/<slug>`：
   - `feat/agent-loop-policy`、`fix/rss-timeout`、`chore/bump-deps`、`docs/api-schema`
 - **合并方式**：**squash merge**（保持 main 线性历史，React/Next.js 实践），
