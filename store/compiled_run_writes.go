@@ -25,19 +25,26 @@ func compiledPushBatchPhysicalKeyV1(snapshotID int64, logicalKey string) string 
 		strconv.FormatInt(snapshotID, 10) + "/" + logicalKey
 }
 
-// compiledPushBatchLogicalKeyV1 restores the public trace/idempotency value
-// from the rollback-compatible physical key. run_snapshot_id is supplied from
-// the same row, so an arbitrary look-alike prefix cannot be decoded under a
-// different run.
-func compiledPushBatchLogicalKeyV1(snapshotID int64, physicalKey string) (string, bool) {
+// compiledPushBatchLogicalKey restores the public trace/idempotency value from
+// every retained compiled-runtime physical key. run_snapshot_id is supplied
+// from the same row, so an arbitrary look-alike prefix cannot be decoded under
+// a different run. Wire namespaces remain readable for rollback and recovery;
+// callers do not branch on runtime versions.
+func compiledPushBatchLogicalKey(snapshotID int64, physicalKey string) (string, bool) {
 	if snapshotID <= 0 {
 		return "", false
 	}
-	prefix := compiledPushBatchPhysicalKeyV1(snapshotID, "")
-	if len(physicalKey) <= len(prefix) || physicalKey[:len(prefix)] != prefix {
-		return "", false
+	prefixes := [...]string{
+		compiledPushBatchPhysicalKeyV1(snapshotID, ""),
+		compiledToolPushBatchPhysicalKeyV2(snapshotID, ""),
 	}
-	return physicalKey[len(prefix):], true
+	for _, prefix := range prefixes {
+		if len(physicalKey) > len(prefix) &&
+			physicalKey[:len(prefix)] == prefix {
+			return physicalKey[len(prefix):], true
+		}
+	}
+	return "", false
 }
 
 // beginAuthorizedCompiledRunWriteV1 opens the only transaction in which a

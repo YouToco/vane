@@ -293,9 +293,10 @@ func validatePushEffectRunSnapshotForClaim(
 	) {
 		return pushEffectIntegrity()
 	}
-	// Dated workflow executions belonged to a retired one-shot repair and are
-	// never eligible for a new provider claim.
-	return pushEffectIntegrity()
+	// Temporal Schedule appends the nominal UTC time to ordinary executions.
+	// The sealed snapshot and exact effect coordinates provide the authority;
+	// no separate repair-era workflow allowlist is needed.
+	return nil
 }
 
 const pushEffectRunSnapshotReferenceColumns = `id, tenant_id, user_id, task_id,
@@ -337,7 +338,7 @@ func loadAuthorizedPushEffectClaimReplay(
 		effect.Fence, params.LeaseDuration.Microseconds(),
 		params.DenialRetryAfter.Microseconds(),
 		types.ScheduleStatusActive, types.TenantStatusActive,
-		scheduledTaskWorkflowID(effect.TaskID), params.ExpectedTaskID)
+		params.ExpectedTaskID)
 	replayed, err := scanPushEffect(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
@@ -385,7 +386,7 @@ func updateAuthorizedPushEffectClaim(
 		effect.Fence, params.LeaseDuration.Microseconds(),
 		(params.LeaseDuration + pushEffectTakeoverGrace).Microseconds(),
 		types.ScheduleStatusActive, types.TenantStatusActive,
-		scheduledTaskWorkflowID(effect.TaskID), params.ExpectedTaskID)
+		params.ExpectedTaskID)
 	claimed, err := scanPushEffect(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
@@ -437,7 +438,7 @@ func updateFreshAuthorizedPushEffectClaim(
 		       next_attempt_at=CASE WHEN decision.authorized
 		                   THEN e.next_attempt_at
 		                   ELSE decision.database_now+
-		                        ($12*interval '1 microsecond') END,
+		                        ($11*interval '1 microsecond') END,
 		       failure_class=CASE WHEN decision.authorized THEN ''
 		                          ELSE e.failure_class END,
 		       ambiguous_since=CASE WHEN decision.authorized THEN NULL
@@ -445,7 +446,7 @@ func updateFreshAuthorizedPushEffectClaim(
 		       updated_at=decision.database_now
 		  FROM decision
 		 WHERE e.id=$1 AND e.tenant_id=$2 AND e.user_id=$3 AND e.fence=$5
-		   AND e.task_id=$11
+		   AND e.task_id=$10
 		   AND e.status IN ('prepared','definite_failed')
 		   AND e.next_attempt_at<=clock_timestamp()
 		   AND e.lease_owner='' AND e.lease_until IS NULL
@@ -454,7 +455,7 @@ func updateFreshAuthorizedPushEffectClaim(
 		effect.Fence, params.LeaseDuration.Microseconds(),
 		(params.LeaseDuration + pushEffectTakeoverGrace).Microseconds(),
 		types.ScheduleStatusActive, types.TenantStatusActive,
-		scheduledTaskWorkflowID(effect.TaskID), params.ExpectedTaskID,
+		params.ExpectedTaskID,
 		params.DenialRetryAfter.Microseconds(),
 	).Scan(&authorized)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -487,12 +488,11 @@ func authorizedPushEffectRunPredicate() string {
 	  JOIN memberships m
 	    ON m.tenant_id=r.tenant_id AND m.user_id=r.user_id
 	 WHERE r.id=e.run_snapshot_id
-	   AND e.task_id=$11
+	   AND e.task_id=$10
 	   AND r.tenant_id=e.tenant_id
 	   AND r.user_id=e.user_id
 	   AND r.task_id=e.task_id
 	   AND r.temporal_run_id=e.run_id
-	   AND r.temporal_workflow_id=$10
 	   AND s.status=$8
 	   AND t.status=$9 AND t.deleted_at IS NULL
 	   AND NOT EXISTS (

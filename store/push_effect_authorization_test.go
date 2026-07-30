@@ -553,19 +553,19 @@ func TestClaimAuthorizedPushEffectHasOneConcurrentWinner(t *testing.T) {
 	}
 }
 
-func TestClaimAuthorizedPushEffectRejectsDatedWorkflowWithoutExactRepairAudit(
+func TestClaimAuthorizedPushEffectAcceptsExactTemporalScheduleExecution(
 	t *testing.T,
 ) {
 	f, effect := authorizedPushEffectFixtureForWorkflow(
 		t, "dated")
-	_, decision, err := f.st.ClaimAuthorizedPushEffect(
+	claimed, decision, err := f.st.ClaimAuthorizedPushEffect(
 		t.Context(),
 		authorizedPushEffectClaimParams(effect, "ordinary-dated-workflow"),
 	)
-	if err == nil || decision != "" {
+	if err != nil || decision != pusheffect.AuthorizedClaimed ||
+		claimed == nil || claimed.Status != pusheffect.StatusSending {
 		t.Fatalf("ordinary dated workflow decision=%q err=%v", decision, err)
 	}
-	assertPushEffectProviderStateUnclaimed(t, f, effect)
 }
 
 func authorizedPushEffectClaimParams(

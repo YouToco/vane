@@ -29,6 +29,34 @@ type compiledRunWriteFixture struct {
 	content []int64
 }
 
+func TestCompiledPushBatchLogicalKeySupportsRetainedRuntimeNamespaces(
+	t *testing.T,
+) {
+	const snapshotID int64 = 45
+	const logicalKey = "f427fb42-798b-48b0-934e-58ad66fb2918"
+	for _, physicalKey := range []string{
+		compiledPushBatchPhysicalKeyV1(snapshotID, logicalKey),
+		compiledToolPushBatchPhysicalKeyV2(snapshotID, logicalKey),
+	} {
+		got, ok := compiledPushBatchLogicalKey(snapshotID, physicalKey)
+		if !ok || got != logicalKey {
+			t.Fatalf("decode %q = %q/%v, want %q/true",
+				physicalKey, got, ok, logicalKey)
+		}
+	}
+	for _, physicalKey := range []string{
+		compiledPushBatchPhysicalKeyV1(snapshotID+1, logicalKey),
+		compiledToolPushBatchPhysicalKeyV2(snapshotID+1, logicalKey),
+		compiledPushBatchPhysicalKeyV1(snapshotID, ""),
+		compiledToolPushBatchPhysicalKeyV2(snapshotID, ""),
+		"uncompiled/" + logicalKey,
+	} {
+		if got, ok := compiledPushBatchLogicalKey(snapshotID, physicalKey); ok {
+			t.Fatalf("decoded mismatched key %q as %q", physicalKey, got)
+		}
+	}
+}
+
 func newCompiledRunWriteFixture(t *testing.T) *compiledRunWriteFixture {
 	t.Helper()
 	base := newTaskRunSnapshotFixture(t)

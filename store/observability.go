@@ -381,7 +381,7 @@ func (s *Store) ListPushBatchSummaries(ctx context.Context, userID int64, since 
 			return nil, types.NewAppError(types.CodeDatabase, "扫描推送批次统计行", err)
 		}
 		if runSnapshotID != nil {
-			logicalKey, ok := compiledPushBatchLogicalKeyV1(*runSnapshotID, b.IdempotencyKey)
+			logicalKey, ok := compiledPushBatchLogicalKey(*runSnapshotID, b.IdempotencyKey)
 			if !ok {
 				return nil, types.NewAppError(types.CodeDatabase,
 					fmt.Sprintf("解析批次 %d 的运行幂等键", b.ID), nil)

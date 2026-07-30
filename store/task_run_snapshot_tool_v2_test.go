@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,12 +65,13 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 
 	policy := testCompiledRunPolicyV1(t)
 	identity := types.RunIdentity{
-		TemporalWorkflowID: scheduledTaskWorkflowID(creation.Definition.TaskID),
-		TemporalRunID:      uuid.NewString(),
-		RunKind:            types.RunSnapshotKindScheduled,
-		TenantID:           creation.Lease.TenantID,
-		UserID:             creation.Lease.UserID,
-		TaskID:             creation.Definition.TaskID,
+		TemporalWorkflowID: scheduledTaskWorkflowID(creation.Definition.TaskID) +
+			"-2026-07-30T07:04:20Z",
+		TemporalRunID: uuid.NewString(),
+		RunKind:       types.RunSnapshotKindScheduled,
+		TenantID:      creation.Lease.TenantID,
+		UserID:        creation.Lease.UserID,
+		TaskID:        creation.Definition.TaskID,
 	}
 	ref, err := st.CreateOrGetCompiledRunSnapshotV2(
 		ctx, identity, policy, observation.RolloutAuthority)
@@ -651,17 +653,85 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		t.Fatalf("create Source-free durable effect: %+v err=%v",
 			effect, err)
 	}
-	claimed, err := st.ClaimPushEffectForTaskRunV2(
-		ctx, identity, ref, pusheffect.ClaimParams{
-			Scope: pusheffect.Scope{
-				ID: effectID, TenantID: identity.TenantID,
-				UserID: identity.UserID,
-			},
-			LeaseOwner: "tool-v2-test", LeaseDuration: time.Minute,
-		})
-	if err != nil || claimed == nil || claimed.Fence <= 0 {
-		t.Fatalf("claim Source-free durable effect: effect=%+v err=%v",
-			claimed, err)
+	baseClaim := pusheffect.ClaimParams{
+		Scope: pusheffect.Scope{
+			ID: effectID, TenantID: identity.TenantID,
+			UserID: identity.UserID,
+		},
+		LeaseDuration: time.Minute,
+	}
+	for name, mutate := range map[string]func(
+		*types.RunIdentity, *types.RunSnapshotRefV2,
+	){
+		"task": func(got *types.RunIdentity, _ *types.RunSnapshotRefV2) {
+			got.TaskID += "-other"
+		},
+		"run": func(got *types.RunIdentity, _ *types.RunSnapshotRefV2) {
+			got.TemporalRunID = uuid.NewString()
+		},
+		"snapshot": func(_ *types.RunIdentity, got *types.RunSnapshotRefV2) {
+			got.SnapshotID++
+		},
+	} {
+		wrongIdentity, wrongRef := identity, ref
+		mutate(&wrongIdentity, &wrongRef)
+		wrongClaim := baseClaim
+		wrongClaim.LeaseOwner = "tool-v2-wrong-" + name
+		if _, err := st.ClaimPushEffectForTaskRunV2(
+			ctx, wrongIdentity, wrongRef, wrongClaim); err == nil {
+			t.Fatalf("claim admitted wrong V2 %s coordinate", name)
+		}
+	}
+	type claimResult struct {
+		effect *pusheffect.Effect
+		err    error
+	}
+	start := make(chan struct{})
+	claimResults := make(chan claimResult, 2)
+	var claimers sync.WaitGroup
+	for _, owner := range []string{"tool-v2-winner-a", "tool-v2-winner-b"} {
+		owner := owner
+		claimers.Add(1)
+		go func() {
+			defer claimers.Done()
+			<-start
+			params := baseClaim
+			params.LeaseOwner = owner
+			got, claimErr := st.ClaimPushEffectForTaskRunV2(
+				ctx, identity, ref, params)
+			claimResults <- claimResult{effect: got, err: claimErr}
+		}()
+	}
+	close(start)
+	claimers.Wait()
+	close(claimResults)
+	var claimed *pusheffect.Effect
+	losers := 0
+	for result := range claimResults {
+		if result.err == nil && result.effect != nil {
+			if claimed != nil {
+				t.Fatal("two V2 claimers acquired the same provider effect")
+			}
+			claimed = result.effect
+			continue
+		}
+		if result.err != nil {
+			losers++
+		}
+	}
+	if claimed == nil || claimed.Fence <= 0 || losers != 1 {
+		t.Fatalf("concurrent V2 claims: winner=%+v losers=%d",
+			claimed, losers)
+	}
+	replayClaim := baseClaim
+	replayClaim.LeaseOwner = claimed.LeaseOwner
+	replayedEffect, err := st.ClaimPushEffectForTaskRunV2(
+		ctx, identity, ref, replayClaim)
+	if err != nil || replayedEffect == nil ||
+		replayedEffect.Fence != claimed.Fence ||
+		replayedEffect.LeaseOwner != claimed.LeaseOwner {
+		t.Fatalf("same-owner V2 claim replay: effect=%+v err=%v",
+			replayedEffect, err)
 	}
 	if err := st.RecordPushEffectSentWithDeliveries(
 		ctx, pusheffect.SentReceipt{
