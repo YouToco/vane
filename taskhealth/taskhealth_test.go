@@ -158,6 +158,8 @@ func TestProjectUsageV1NeverClaimsUnknownToolCostIsZero(t *testing.T) {
 		LLMEstimatedCalls: &estimatedLLM,
 	})
 	if estimated.Coverage != CostCoverageLLMOnlyV1 ||
+		estimated.LLMPricedCalls == nil ||
+		*estimated.LLMPricedCalls != llmCalls-estimatedLLM ||
 		estimated.LLMEstimatedCalls == nil ||
 		*estimated.LLMEstimatedCalls != 1 {
 		t.Fatalf("estimated LLM price was presented as complete: %#v", estimated)
@@ -169,8 +171,26 @@ func TestProjectUsageV1NeverClaimsUnknownToolCostIsZero(t *testing.T) {
 		ToolPricedCalls:    &pricedToolCalls,
 		ToolEstimatedCalls: &estimatedTool,
 	})
-	if estimatedTools.Coverage != CostCoverageToolsPartialV1 {
+	if estimatedTools.Coverage != CostCoverageToolsPartialV1 ||
+		estimatedTools.ToolPricedCalls == nil ||
+		*estimatedTools.ToolPricedCalls != pricedToolCalls-estimatedTool {
 		t.Fatalf("wildcard tool price was presented as complete: %#v", estimatedTools)
+	}
+	zeroEstimated := int64(0)
+	exactToolsWithEstimatedLLM := projectUsageV1(UsageV1{
+		LLMCostUSD:         &llmCost,
+		LLMCalls:           &llmCalls,
+		LLMPricedCalls:     &llmPriced,
+		LLMEstimatedCalls:  &estimatedLLM,
+		ToolCostUSD:        &toolCost,
+		ToolCalls:          &toolCalls,
+		ToolPricedCalls:    &pricedToolCalls,
+		ToolEstimatedCalls: &zeroEstimated,
+	})
+	if exactToolsWithEstimatedLLM.Coverage != CostCoverageLLMAndToolsV1 ||
+		exactToolsWithEstimatedLLM.BudgetState != BudgetNotConfiguredV1 {
+		t.Fatalf("estimated LLM broke legacy v1 tool coverage: %#v",
+			exactToolsWithEstimatedLLM)
 	}
 }
 

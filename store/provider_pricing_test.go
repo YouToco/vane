@@ -137,6 +137,105 @@ func TestProviderPricingLedger(t *testing.T) {
 	assertPricingReceipt(t, st, "llm_calls", secondCallID, second.ID, "calculated", "USD", 6.5)
 	assertPricingReceipt(t, st, "llm_calls", callID, first.ID, "calculated", "USD", 3.25)
 
+	// Hold the per-resource lock so Replace has acquired its global exclusive
+	// ledger fence but cannot publish the new version yet. A call that starts in
+	// that window must wait, then bind the newly committed price—not an old MVCC
+	// snapshot whose interval has just been closed.
+	blocker, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("开始价格并发阻塞事务: %v", err)
+	}
+	defer func() { _ = blocker.Rollback(ctx) }()
+	resourceLockKey := provider + "\x1f" + model + "\x1f" + string(PriceMeterLLMTokens)
+	if _, err := blocker.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		resourceLockKey,
+	); err != nil {
+		t.Fatalf("锁定测试价格资源: %v", err)
+	}
+	hit3, miss3, output3 := 3.0, 6.0, 9.0
+	type replaceResult struct {
+		rule *ProviderPriceRule
+		err  error
+	}
+	replaceDone := make(chan replaceResult, 1)
+	go func() {
+		rule, replaceErr := st.ReplaceProviderPriceRule(ctx, ReplaceProviderPriceRuleInput{
+			Provider: provider, Resource: model, Meter: PriceMeterLLMTokens, Currency: "USD",
+			InputCacheHitPerMillion: &hit3, InputCacheMissPerMillion: &miss3,
+			OutputPerMillion: &output3,
+			SourceURL:        "https://example.com/pricing-v3", Note: "concurrent",
+			CreatedBy: userID, ChangeID: "pricing-third-" + suffix,
+		})
+		replaceDone <- replaceResult{rule: rule, err: replaceErr}
+	}()
+	globalFenceHeld := false
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		probe, probeErr := st.pool.Begin(ctx)
+		if probeErr != nil {
+			t.Fatalf("开始价格 fence 探针: %v", probeErr)
+		}
+		if _, probeErr = probe.Exec(ctx, `SET LOCAL lock_timeout='20ms'`); probeErr == nil {
+			_, probeErr = probe.Exec(ctx,
+				`SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))`,
+				providerPricingLedgerLock,
+			)
+		}
+		_ = probe.Rollback(ctx)
+		if probeErr != nil {
+			globalFenceHeld = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !globalFenceHeld {
+		t.Fatal("价格替换未在时限内持有全局 exclusive fence")
+	}
+	type callResult struct {
+		id  int64
+		err error
+	}
+	callDone := make(chan callResult, 1)
+	go func() {
+		id, callErr := st.InsertLLMCall(ctx, &types.LLMCall{
+			TraceID: "pricing-llm-concurrent-" + suffix, SpanName: "pricing_test",
+			Provider: provider, Model: model,
+			PromptTokens: 1_000_000, CompletionTokens: 500_000,
+			PromptCacheHitTokens: &cacheHit, PromptCacheMissTokens: &cacheMiss,
+		})
+		callDone <- callResult{id: id, err: callErr}
+	}()
+	select {
+	case result := <-callDone:
+		t.Fatalf("调用越过未提交的价格替换 fence: id=%d err=%v", result.id, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("释放价格资源锁: %v", err)
+	}
+	var third *ProviderPriceRule
+	select {
+	case result := <-replaceDone:
+		if result.err != nil {
+			t.Fatalf("并发更新模型价格: %v", result.err)
+		}
+		third = result.rule
+	case <-time.After(5 * time.Second):
+		t.Fatal("并发价格更新未结束")
+	}
+	var concurrentCallID int64
+	select {
+	case result := <-callDone:
+		if result.err != nil {
+			t.Fatalf("写入等待新价格的模型用量: %v", result.err)
+		}
+		concurrentCallID = result.id
+	case <-time.After(5 * time.Second):
+		t.Fatal("等待新价格的模型调用未结束")
+	}
+	assertPricingReceipt(t, st, "llm_calls", concurrentCallID,
+		third.ID, "calculated", "USD", 9.75)
+
 	unit := 0.25
 	exactToolRule, err := st.ReplaceProviderPriceRule(ctx, ReplaceProviderPriceRuleInput{
 		Provider: provider, Resource: endpoint, Meter: PriceMeterRequest, Currency: "CNY",
@@ -235,6 +334,17 @@ func TestProviderPricingLedger(t *testing.T) {
 	}
 	assertPricingReceipt(t, st, "tool_calls", tikhubUnknownID,
 		tikhubWildcardRuleID, "estimated", "USD", 0.01)
+	noContentStatus := 204
+	tikhubNoChargeID, err := st.InsertToolCall(ctx, &types.ToolCall{
+		TraceID: "pricing-tikhub-204-" + suffix, Provider: "tikhub",
+		ToolName:     "xiaohongshu_app_v2_search_notes",
+		ToolKind:     types.ToolCallKindBindingFetch,
+		EndpointPath: xhsSearchPath, HTTPStatus: &noContentStatus, UsageQuantity: 1,
+	})
+	if err != nil {
+		t.Fatalf("写入 TikHub 204 用量: %v", err)
+	}
+	assertUnpricedReceipt(t, st, "tool_calls", tikhubNoChargeID)
 
 	upstreamAmount := 0.12345678
 	reportedID, err := st.InsertToolCall(ctx, &types.ToolCall{

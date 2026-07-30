@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/types"
+	"github.com/jackc/pgx/v5"
 )
 
 // InsertToolCall 写入一条工具调用记录，返回新 id。
@@ -37,13 +38,27 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 	if cands == nil {
 		cands = []string{}
 	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "开始写入 tool_calls 记录", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))`,
+		providerPricingLedgerLock,
+	); err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "锁定供应商价格账本", err)
+	}
 	var id int64
-	err := s.pool.QueryRow(ctx,
-		`WITH guard AS MATERIALIZED (
-		   SELECT pg_advisory_xact_lock_shared(hashtextextended($21, 0))
+	err = tx.QueryRow(ctx,
+		`WITH stamp AS (
+		   SELECT statement_timestamp() AS at
 		 ),
-		 stamp AS (
-		   SELECT statement_timestamp() AS at FROM guard
+		 billable AS (
+		   SELECT $11 = '' AND (
+		            ($19 = 'tikhub' AND $10 = 200)
+		         OR ($19 <> 'tikhub' AND $10 BETWEEN 200 AND 299)
+		          ) AS ok
 		 ),
 		 price AS (
 		   SELECT pr.id, pr.currency,
@@ -73,7 +88,7 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 			$11, $12, $13, $14, $15,
 			CASE
 			  WHEN $16::numeric IS NOT NULL THEN $16::numeric
-			  WHEN $11 = '' AND $10 BETWEEN 200 AND 299
+			  WHEN (SELECT ok FROM billable)
 			       AND (SELECT currency FROM price) = 'USD'
 			    THEN (SELECT amount FROM price)
 			  ELSE NULL
@@ -82,11 +97,11 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 			CASE WHEN $18::bigint IS NULL THEN `+tenantOfUser+`$2) ELSE $18 END,
 			$19, $20,
 			CASE WHEN $16::numeric IS NOT NULL THEN NULL
-			     WHEN $11 = '' AND $10 BETWEEN 200 AND 299 THEN (SELECT id FROM price)
+			     WHEN (SELECT ok FROM billable) THEN (SELECT id FROM price)
 			     ELSE NULL END,
 			CASE
 			  WHEN $16::numeric IS NOT NULL THEN 'provider_reported'
-			  WHEN $19 = '' OR $11 <> '' OR $10 IS NULL OR $10 NOT BETWEEN 200 AND 299
+			  WHEN $19 = '' OR NOT COALESCE((SELECT ok FROM billable), false)
 			    THEN 'unpriced'
 			  WHEN NOT EXISTS (SELECT 1 FROM price) THEN 'unpriced'
 			  WHEN (SELECT wildcard FROM price) THEN 'estimated'
@@ -94,12 +109,12 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 			END,
 			CASE
 			  WHEN $16::numeric IS NOT NULL THEN $16::numeric
-			  WHEN $11 = '' AND $10 BETWEEN 200 AND 299 THEN (SELECT amount FROM price)
+			  WHEN (SELECT ok FROM billable) THEN (SELECT amount FROM price)
 			  ELSE NULL
 			END,
 			CASE
 			  WHEN $16::numeric IS NOT NULL THEN 'USD'
-			  WHEN $11 = '' AND $10 BETWEEN 200 AND 299 THEN (SELECT currency FROM price)
+			  WHEN (SELECT ok FROM billable) THEN (SELECT currency FROM price)
 			  ELSE NULL
 			END,
 			(SELECT at FROM stamp)
@@ -108,10 +123,12 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 		c.EndpointPath, c.Arguments, c.ResultPreview, c.ResultSize, c.HTTPStatus,
 		c.ErrorType, c.Error, c.DurationMs, c.RetrievalQuery, cands,
 		c.CostUSD, c.SourceID, c.TenantID, c.Provider, c.UsageQuantity,
-		providerPricingLedgerLock,
 	).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "写入 tool_calls 记录", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "提交 tool_calls 记录", err)
 	}
 	return id, nil
 }

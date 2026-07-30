@@ -103,9 +103,10 @@ type UsageV1 struct {
 	LLMEstimatedCalls *int64
 	ToolCostUSD       *float64
 	ToolCalls         *int64
-	// ToolPricedCalls counts Tool rows with an explicit provider cost receipt.
-	// It may be lower than ToolCalls; the known subtotal remains useful but is
-	// then a lower bound rather than complete attribution.
+	// *PricedCalls counts rows with any attributed amount at the Store boundary;
+	// *EstimatedCalls is a subset. The v1 projection subtracts that subset so its
+	// JSON priced_calls fields remain exact-only and compatible with old Web
+	// clients, while estimated_calls reports the disjoint estimated count.
 	ToolPricedCalls       *int64
 	ToolEstimatedCalls    *int64
 	KnownCosts            []CurrencyCostV1
@@ -360,6 +361,10 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 		(*llmPriced > 0 || *in.LLMCalls == 0)
 	llmComplete := llmKnown && *llmPriced == *in.LLMCalls &&
 		*llmEstimated == 0
+	llmExactPriced := int64(0)
+	if llmKnown {
+		llmExactPriced = *llmPriced - *llmEstimated
+	}
 	toolsKnown := in.ToolCostUSD != nil && in.ToolCalls != nil &&
 		in.ToolPricedCalls != nil &&
 		validMoneyV1(*in.ToolCostUSD) && *in.ToolCalls >= 0 &&
@@ -371,18 +376,25 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 	toolsComplete := toolsKnown &&
 		*in.ToolPricedCalls == *in.ToolCalls &&
 		*toolEstimated == 0
+	toolExactPriced := int64(0)
+	if toolsKnown {
+		toolExactPriced = *in.ToolPricedCalls - *toolEstimated
+	}
 	switch {
 	case llmKnown && toolsKnown:
 		sum := *in.LLMCostUSD + *in.ToolCostUSD
 		if validMoneyV1(sum) {
 			out.KnownCostUSD = sum
-			if llmComplete && toolsComplete {
+			// v1 coverage historically described Tool attribution. Keep that
+			// meaning so cached Web clients can read an estimated LLM amount:
+			// LLM precision is carried by llm_estimated_calls and budget_state.
+			if toolsComplete {
 				out.Coverage = CostCoverageLLMAndToolsV1
 			} else {
 				out.Coverage = CostCoverageLLMAndToolsPartialV1
 			}
 			llmCalls, pricedLLMCalls, toolCalls, pricedToolCalls :=
-				*in.LLMCalls, *llmPriced, *in.ToolCalls, *in.ToolPricedCalls
+				*in.LLMCalls, llmExactPriced, *in.ToolCalls, toolExactPriced
 			out.LLMCalls, out.ToolCalls = &llmCalls, &toolCalls
 			out.LLMPricedCalls = &pricedLLMCalls
 			out.ToolPricedCalls = &pricedToolCalls
@@ -394,7 +406,7 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 	case llmKnown:
 		out.KnownCostUSD = *in.LLMCostUSD
 		out.Coverage = CostCoverageLLMOnlyV1
-		llmCalls, pricedLLMCalls := *in.LLMCalls, *llmPriced
+		llmCalls, pricedLLMCalls := *in.LLMCalls, llmExactPriced
 		out.LLMCalls = &llmCalls
 		out.LLMPricedCalls = &pricedLLMCalls
 		estimated := *llmEstimated
@@ -407,7 +419,7 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 			out.Coverage = CostCoverageToolsPartialV1
 		}
 		toolCalls, pricedToolCalls :=
-			*in.ToolCalls, *in.ToolPricedCalls
+			*in.ToolCalls, toolExactPriced
 		out.ToolCalls = &toolCalls
 		out.ToolPricedCalls = &pricedToolCalls
 		estimated := *toolEstimated
@@ -417,23 +429,27 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 		v := *in.LLMCalls
 		out.LLMCalls = &v
 	}
-	if in.LLMPricedCalls != nil && *in.LLMPricedCalls >= 0 &&
-		in.LLMCalls != nil && *in.LLMPricedCalls <= *in.LLMCalls &&
+	if llmPriced != nil && *llmPriced >= 0 &&
+		in.LLMCalls != nil && *llmPriced <= *in.LLMCalls &&
+		*llmEstimated >= 0 && *llmEstimated <= *llmPriced &&
 		out.LLMPricedCalls == nil {
-		v := *in.LLMPricedCalls
+		v := *llmPriced - *llmEstimated
 		out.LLMPricedCalls = &v
+		if out.LLMEstimatedCalls == nil {
+			estimated := *llmEstimated
+			out.LLMEstimatedCalls = &estimated
+		}
 	}
-	if in.LLMEstimatedCalls != nil && *in.LLMEstimatedCalls >= 0 &&
-		in.LLMPricedCalls != nil && *in.LLMEstimatedCalls <= *in.LLMPricedCalls &&
-		out.LLMEstimatedCalls == nil {
-		v := *in.LLMEstimatedCalls
-		out.LLMEstimatedCalls = &v
-	}
-	if in.ToolEstimatedCalls != nil && *in.ToolEstimatedCalls >= 0 &&
-		in.ToolPricedCalls != nil && *in.ToolEstimatedCalls <= *in.ToolPricedCalls &&
-		out.ToolEstimatedCalls == nil {
-		v := *in.ToolEstimatedCalls
-		out.ToolEstimatedCalls = &v
+	if in.ToolPricedCalls != nil && *in.ToolPricedCalls >= 0 &&
+		in.ToolCalls != nil && *in.ToolPricedCalls <= *in.ToolCalls &&
+		*toolEstimated >= 0 && *toolEstimated <= *in.ToolPricedCalls &&
+		out.ToolPricedCalls == nil {
+		v := *in.ToolPricedCalls - *toolEstimated
+		out.ToolPricedCalls = &v
+		if out.ToolEstimatedCalls == nil {
+			estimated := *toolEstimated
+			out.ToolEstimatedCalls = &estimated
+		}
 	}
 	copyToken := func(v *int64) *int64 {
 		if v == nil || *v < 0 {

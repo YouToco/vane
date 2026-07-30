@@ -230,7 +230,7 @@ func (s *Store) ReplaceProviderPriceRule(
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))`,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
 		providerPricingLedgerLock,
 	); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase, "锁定供应商价格账本", err)

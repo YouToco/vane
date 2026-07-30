@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/YouToco/vane/types"
+	"github.com/jackc/pgx/v5"
 )
 
 // InsertLLMCall 写入一条 LLM 调用记录，返回新 id。
@@ -53,13 +54,21 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 		return 0, types.NewAppError(types.CodeValidation,
 			"reasoning_tokens 必须是 completion_tokens 的非负子集", types.ErrValidation)
 	}
+	tx, err := s.beginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "开始写入 llm_calls 记录", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))`,
+		providerPricingLedgerLock,
+	); err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "锁定供应商价格账本", err)
+	}
 	var id int64
-	err := s.pool.QueryRow(ctx,
-		`WITH guard AS MATERIALIZED (
-		   SELECT pg_advisory_xact_lock_shared(hashtextextended($23, 0))
-		 ),
-		 stamp AS (
-		   SELECT statement_timestamp() AS at FROM guard
+	err = tx.QueryRow(ctx,
+		`WITH stamp AS (
+		   SELECT statement_timestamp() AS at
 		 ),
 		 price AS (
 		   SELECT pr.id, pr.currency,
@@ -120,10 +129,12 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 		c.PromptTokens, c.CompletionTokens, c.LatencyMs, c.CostUSD,
 		c.PrefixCacheHit, c.Temperature, c.MaxTokens, c.Error,
 		c.PromptCacheHitTokens, c.PromptCacheMissTokens, c.ReasoningTokens, c.TenantID,
-		providerPricingLedgerLock,
 	).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "写入 llm_calls 记录", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, types.NewAppError(types.CodeDatabase, "提交 llm_calls 记录", err)
 	}
 	return id, nil
 }
