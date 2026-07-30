@@ -137,9 +137,12 @@ wrapper that explicitly executes the pinned Node and Wrangler entrypoint; it
 does not depend on `PATH`. Workflows verify the exact Wrangler version and never
 run npm on the deployment VM.
 
-Aliyun CLI is installed per run below `RUNNER_TEMP` from the exact `3.4.10`
-ARM64 release archive after checking the official SHA256
-`349f3d31af9cc85aa2b444899e7d805f6409f5a53d667ce74d00dafbc17f9ae5`.
+Aliyun CLI and ossutil are installed per run below `RUNNER_TEMP` from exact
+official release archives. The installer accepts only Linux x86_64/amd64 and
+ARM64/aarch64, maps each to a separately pinned SHA256, and fails closed for
+every other architecture. This lets the isolated x86_64 primary deploy runner
+and ARM64 standby use the same audited workflow without executing a
+wrong-architecture binary.
 No `latest` lookup, `curl | sh`, container action, or local `sudo` is used.
 
 The VPS SSH principal is separate from the runner Unix user and must retain the

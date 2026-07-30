@@ -3,8 +3,12 @@ set -euo pipefail
 umask 077
 
 version=2.3.0
-archive_name=ossutil-2.3.0-linux-arm64.zip
-archive_sha256=f6c95ba0c2d2ef30290af686ce4d706c701f4734ce8090bee4288a77e3f1d764
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+selection=$(
+  "$script_dir/select-aliyun-tool-archive.sh" ossutil "$(uname -m)"
+)
+IFS=$'\t' read -r archive_name archive_sha256 <<<"$selection"
+[[ -n "$archive_name" && "$archive_sha256" =~ ^[0-9a-f]{64}$ ]]
 archive_url="https://gosspublic.alicdn.com/ossutil/v2/${version}/${archive_name}"
 install_dir="$RUNNER_TEMP/aliyun-3.4.10"
 binary_path="$install_dir/ossutil"
