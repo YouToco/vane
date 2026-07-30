@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/YouToco/vane/acquisitiontool"
+	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -113,6 +114,82 @@ func TestRunTaskNowTool_Execute(t *testing.T) {
 			t.Fatalf("控制面错误应上抛: got=%q err=%v", got, err)
 		}
 	})
+}
+
+func TestScopedToolInvocationIDIncludesAgentTurn(t *testing.T) {
+	const providerCallID = "run_task_now_3"
+	first := context.WithValue(context.Background(), chatMetaKey{}, chatMeta{
+		traceID: "turn-a",
+	})
+	replay := context.WithValue(context.Background(), chatMetaKey{}, chatMeta{
+		traceID: "turn-a",
+	})
+	second := context.WithValue(context.Background(), chatMetaKey{}, chatMeta{
+		traceID: "turn-b",
+	})
+
+	firstID := scopedToolInvocationID(first, providerCallID)
+	if firstID != scopedToolInvocationID(replay, providerCallID) {
+		t.Fatal("same durable Agent turn did not retain its invocation identity")
+	}
+	if firstID == scopedToolInvocationID(second, providerCallID) {
+		t.Fatal("provider call id collision crossed Agent turns")
+	}
+	if got := scopedToolInvocationID(context.Background(), providerCallID); got != providerCallID {
+		t.Fatalf("isolated tool test fallback=%q, want provider call id", got)
+	}
+}
+
+func TestRunToolCallsScopesProviderCallIDToAgentTurn(t *testing.T) {
+	runner := &fakeTaskRunTrigger{}
+	var runNow ToolSpec
+	for _, spec := range BuildTools(nil, nil, runner, nil, nil) {
+		if spec.Name() == "run_task_now" {
+			runNow = spec
+			break
+		}
+	}
+	if runNow.Tool == nil {
+		t.Fatal("run_task_now was not registered")
+	}
+	loop := &Loop{tools: map[string]ToolSpec{"run_task_now": runNow}}
+	call := []llm.ToolCall{{
+		ID:        "run_task_now_3",
+		Name:      "run_task_now",
+		Arguments: `{"schedule_ids":["task-a"]}`,
+	}}
+	run := func(traceID string) {
+		t.Helper()
+		state := &toolRunState{
+			ownerRequest:           "立即执行一次任务",
+			allowedSideEffectTool:  "run_task_now",
+			successfulCalls:        make(map[string]struct{}),
+			failedCalls:            make(map[string]int),
+			sideEffectConstrainedTurn: true,
+		}
+		ctx := context.WithValue(t.Context(), toolRunKey{}, state)
+		ctx = context.WithValue(ctx, chatMetaKey{}, chatMeta{traceID: traceID})
+		if _, err := loop.runToolCalls(ctx, 7, nil, call); err != nil {
+			t.Fatalf("runToolCalls(%q): %v", traceID, err)
+		}
+	}
+
+	run("turn-a")
+	run("turn-a")
+	run("turn-b")
+	if len(runner.calls) != 3 {
+		t.Fatalf("trigger calls=%d, want 3: %v", len(runner.calls), runner.calls)
+	}
+	firstKey := strings.Split(runner.calls[0], "\x00")[1]
+	replayKey := strings.Split(runner.calls[1], "\x00")[1]
+	secondTurnKey := strings.Split(runner.calls[2], "\x00")[1]
+	if firstKey != replayKey {
+		t.Fatalf("same turn replay changed idempotency key: %q vs %q",
+			firstKey, replayKey)
+	}
+	if firstKey == secondTurnKey {
+		t.Fatalf("provider call id collision crossed turns: %q", firstKey)
+	}
 }
 
 func TestRemoveScheduleIDsRejectsRemovedAndUnknownFields(t *testing.T) {

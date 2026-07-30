@@ -29,8 +29,10 @@ import (
 
 // TaskRunTrigger is the narrow task-scoped run-now control plane. The Agent
 // resolves human descriptions through list_schedules and never exposes the
-// internal id to the user. Every execution carries the provider tool-call id
-// into a durable schedule-command idempotency key.
+// internal id to the user. Every execution carries the Agent turn plus the
+// provider tool-call id into a durable schedule-command idempotency key.
+// Provider call ids are only unique inside one model response and may repeat
+// across user turns.
 type TaskRunTrigger interface {
 	TriggerScheduleNowIdempotent(
 		ctx context.Context,
@@ -49,6 +51,15 @@ func withToolInvocationID(ctx context.Context, id string) context.Context {
 func toolInvocationIDFrom(ctx context.Context) (string, bool) {
 	id, ok := ctx.Value(toolInvocationIDKey{}).(string)
 	return id, ok && strings.TrimSpace(id) != ""
+}
+
+func scopedToolInvocationID(ctx context.Context, providerCallID string) string {
+	providerCallID = strings.TrimSpace(providerCallID)
+	meta, ok := ctx.Value(chatMetaKey{}).(chatMeta)
+	if !ok || strings.TrimSpace(meta.traceID) == "" {
+		return providerCallID
+	}
+	return strings.TrimSpace(meta.traceID) + "\x00" + providerCallID
 }
 
 type scheduleDeleter interface {

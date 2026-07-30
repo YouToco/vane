@@ -2240,7 +2240,7 @@ func (l *Loop) runToolCalls(ctx context.Context, userID int64, sessionID *int64,
 			continue
 		}
 		result, err := l.execRecordedAgentic(
-			withToolInvocationID(ctx, tc.ID),
+			withToolInvocationID(ctx, scopedToolInvocationID(ctx, tc.ID)),
 			userID, sessionID, spec, args,
 		)
 		if err != nil {
