@@ -36,7 +36,15 @@ function rawDetail(capabilities?: unknown) {
       next_run_state: "none",
     },
     summary,
-    cost: { llm_cost_usd: 0, llm_calls: 0 },
+    cost: {
+      llm_cost_usd: 0,
+      llm_calls: 0,
+      tool_cost_usd: 0,
+      tool_calls: 0,
+      tool_priced_calls: 0,
+      latest_acquisition_calls: 0,
+      latest_acquisition_failures: 0,
+    },
     ...(capabilities === undefined ? {} : { capabilities }),
   };
 }
@@ -90,6 +98,30 @@ describe("task health projection contract", () => {
     expect(normalizeTaskHealth(raw)).toEqual(raw);
   });
 
+  test("keeps known acquisition cost while marking incomplete provider receipts", () => {
+    const partial = {
+      ...raw,
+      state: "attention",
+      issue: "acquisition_unavailable",
+      recommended_action: "wait_for_retry",
+      acquisition: {
+        total: 3,
+        failing: 1,
+        max_fail_count: 1,
+        failure_reason: "provider_error",
+      },
+      usage: {
+        known_cost_usd: 1.271,
+        coverage: "llm_and_tools_partial",
+        llm_calls: 3,
+        tool_calls: 3,
+        tool_priced_calls: 2,
+        budget_state: "incomplete",
+      },
+    };
+    expect(normalizeTaskHealth(partial)).toEqual(partial);
+  });
+
   test("fails closed when permissions or acquisition shape are not exact", () => {
     expect(
       normalizeTaskHealth({
@@ -103,6 +135,41 @@ describe("task health projection contract", () => {
         acquisition: { total: 1, failing: 2, max_fail_count: 2 },
       }),
     ).toBeUndefined();
+    expect(
+      normalizeTaskHealth({
+        ...raw,
+        acquisition: { total: 1, failing: 1, max_fail_count: 1 },
+      }),
+    ).toBeUndefined();
+  });
+
+  test("rejects cost coverage that contradicts provider pricing receipts", () => {
+    const malformed = normalizeTaskHealth({
+      ...raw,
+      usage: {
+        known_cost_usd: 1.25,
+        coverage: "llm_and_tools",
+        llm_calls: 3,
+        tool_calls: 3,
+        tool_priced_calls: 2,
+        budget_state: "not_configured",
+      },
+    });
+    expect(malformed).toBeDefined();
+    expect(malformed).not.toHaveProperty("usage");
+
+    const missingReceiptCount = normalizeTaskHealth({
+      ...raw,
+      usage: {
+        known_cost_usd: 1.25,
+        coverage: "llm_and_tools",
+        llm_calls: 3,
+        tool_calls: 3,
+        budget_state: "not_configured",
+      },
+    });
+    expect(missingReceiptCount).toBeDefined();
+    expect(missingReceiptCount).not.toHaveProperty("usage");
   });
 
   test("does not expose usage when the account lacks usage permission", () => {

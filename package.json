@@ -12,7 +12,7 @@
     "bundle:check": "node scripts/verify-bundle-budget.mjs",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
-    "test": "node --test tests/prototype-isolation.test.mjs tests/prototype-build.test.mjs tests/task-detail-surface.test.mjs tests/cache-headers.test.mjs && vitest run tests/task-action-dialog.test.tsx tests/task-contract.test.ts tests/task-detail-presentation.test.ts tests/task-brief-feed.test.tsx tests/p0a-fixture.test.ts tests/p0a-task-brief.test.tsx tests/profile-edit.test.tsx tests/profile-api.test.ts tests/chunk-load-recovery.test.tsx"
+    "test": "node --test tests/prototype-isolation.test.mjs tests/prototype-build.test.mjs tests/task-detail-surface.test.mjs tests/cache-headers.test.mjs && vitest run tests/task-action-dialog.test.tsx tests/task-contract.test.ts tests/task-health-panel.test.tsx tests/task-detail-presentation.test.ts tests/task-brief-feed.test.tsx tests/p0a-fixture.test.ts tests/p0a-task-brief.test.tsx tests/profile-edit.test.tsx tests/profile-api.test.ts tests/chunk-load-recovery.test.tsx"
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",

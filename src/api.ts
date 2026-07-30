@@ -448,7 +448,15 @@ export type CostCoverage =
   | "none"
   | "llm_only"
   | "tools_only"
-  | "llm_and_tools";
+  | "tools_partial"
+  | "llm_and_tools"
+  | "llm_and_tools_partial";
+export type AcquisitionFailure =
+  | "timeout"
+  | "provider_error"
+  | "invalid_request"
+  | "usage_limit"
+  | "internal";
 export type BudgetState =
   | "not_configured"
   | "ok"
@@ -466,12 +474,14 @@ export interface TaskHealthProjection {
     total: number;
     failing: number;
     max_fail_count: number;
+    failure_reason?: AcquisitionFailure;
   };
   usage?: {
     known_cost_usd: number;
     coverage: CostCoverage;
     llm_calls?: number;
     tool_calls?: number;
+    tool_priced_calls?: number;
     window_start?: string;
     window_end?: string;
     budget_usd?: number;
@@ -548,12 +558,16 @@ export interface GroundedBriefContext {
   evidence: GroundedEvidenceBrief[];
 }
 
-// 任务累计 LLM 成本。**只覆盖推送管道的 LLM 调用**：工具费（Exa/TikHub）的
-// trace 锚在写入侧尚未统一，后端刻意不归集（vane#142 审查结论）——前端文案
-// 必须写明「LLM 成本」，别标成「总成本」编造完整性。
+// 任务累计成本。模型与取材分别通过 push trace 和 immutable run snapshot
+// 精确归因；tool_priced_calls < tool_calls 时取材金额只是已知下限。
 export interface ScheduleRunCost {
   llm_cost_usd: number;
   llm_calls: number;
+  tool_cost_usd: number;
+  tool_calls: number;
+  tool_priced_calls: number;
+  latest_acquisition_calls: number;
+  latest_acquisition_failures: number;
 }
 
 export interface SchedulePlaybook {
@@ -911,7 +925,16 @@ const taskHealthCostCoverage = new Set<CostCoverage>([
   "none",
   "llm_only",
   "tools_only",
+  "tools_partial",
   "llm_and_tools",
+  "llm_and_tools_partial",
+]);
+const taskHealthAcquisitionFailures = new Set<AcquisitionFailure>([
+  "timeout",
+  "provider_error",
+  "invalid_request",
+  "usage_limit",
+  "internal",
 ]);
 const taskHealthBudgetStates = new Set<BudgetState>([
   "not_configured",
@@ -929,6 +952,8 @@ export function normalizeTaskHealth(
   const issue = value.issue as TaskHealthIssue | undefined;
   const action = value.recommended_action as TaskHealthAction | undefined;
   const acquisition = asObject<Record<string, unknown>>(value.acquisition);
+  const acquisitionFailure =
+    acquisition.failure_reason as AcquisitionFailure | undefined;
   const permissions = asObject<Record<string, unknown>>(value.permissions);
   const role = permissions.role;
   const permissionKeys = [
@@ -950,6 +975,12 @@ export function normalizeTaskHealth(
     Number(acquisition.failing) < 0 ||
     Number(acquisition.failing) > Number(acquisition.total) ||
     Number(acquisition.max_fail_count) < 0 ||
+    (acquisitionFailure !== undefined &&
+      !taskHealthAcquisitionFailures.has(acquisitionFailure)) ||
+    (Number(acquisition.failing) === 0 &&
+      acquisitionFailure !== undefined) ||
+    (Number(acquisition.failing) > 0 &&
+      acquisitionFailure === undefined) ||
     !(
       role === "" ||
       role === "owner" ||
@@ -972,6 +1003,9 @@ export function normalizeTaskHealth(
       total: Number(acquisition.total),
       failing: Number(acquisition.failing),
       max_fail_count: Number(acquisition.max_fail_count),
+      ...(acquisitionFailure
+        ? { failure_reason: acquisitionFailure }
+        : {}),
     },
     permissions: {
       role,
@@ -985,27 +1019,70 @@ export function normalizeTaskHealth(
   const usage = asObject<Record<string, unknown>>(value.usage);
   const coverage = usage.coverage as CostCoverage;
   const budgetState = usage.budget_state as BudgetState;
+  const llmCallsValid =
+    typeof usage.llm_calls === "number" &&
+    Number.isSafeInteger(usage.llm_calls) &&
+    usage.llm_calls >= 0;
+  const toolCallsValid =
+    typeof usage.tool_calls === "number" &&
+    Number.isSafeInteger(usage.tool_calls) &&
+    usage.tool_calls >= 0;
+  const toolPricedCallsValid =
+    typeof usage.tool_priced_calls === "number" &&
+    Number.isSafeInteger(usage.tool_priced_calls) &&
+    usage.tool_priced_calls >= 0 &&
+    toolCallsValid &&
+    usage.tool_priced_calls <= Number(usage.tool_calls);
+  const usageCoverageCoherent =
+    (coverage === "none" &&
+      !llmCallsValid &&
+      !toolCallsValid &&
+      !toolPricedCallsValid) ||
+    (coverage === "llm_only" &&
+      llmCallsValid &&
+      !toolCallsValid &&
+      !toolPricedCallsValid) ||
+    (coverage === "tools_only" &&
+      !llmCallsValid &&
+      toolCallsValid &&
+      toolPricedCallsValid &&
+      Number(usage.tool_priced_calls) === Number(usage.tool_calls)) ||
+    (coverage === "tools_partial" &&
+      !llmCallsValid &&
+      toolCallsValid &&
+      toolPricedCallsValid &&
+      Number(usage.tool_priced_calls) < Number(usage.tool_calls)) ||
+    (coverage === "llm_and_tools" &&
+      llmCallsValid &&
+      toolCallsValid &&
+      toolPricedCallsValid &&
+      Number(usage.tool_priced_calls) === Number(usage.tool_calls)) ||
+    (coverage === "llm_and_tools_partial" &&
+      llmCallsValid &&
+      toolCallsValid &&
+      toolPricedCallsValid &&
+      Number(usage.tool_priced_calls) < Number(usage.tool_calls));
   if (
     projected.permissions.can_view_usage &&
     typeof usage.known_cost_usd === "number" &&
     Number.isFinite(usage.known_cost_usd) &&
     usage.known_cost_usd >= 0 &&
     taskHealthCostCoverage.has(coverage) &&
-    taskHealthBudgetStates.has(budgetState)
+    taskHealthBudgetStates.has(budgetState) &&
+    usageCoverageCoherent
   ) {
     projected.usage = {
       known_cost_usd: usage.known_cost_usd,
       coverage,
       budget_state: budgetState,
-      ...(typeof usage.llm_calls === "number" &&
-      Number.isSafeInteger(usage.llm_calls) &&
-      usage.llm_calls >= 0
-        ? { llm_calls: usage.llm_calls }
+      ...(llmCallsValid
+        ? { llm_calls: Number(usage.llm_calls) }
         : {}),
-      ...(typeof usage.tool_calls === "number" &&
-      Number.isSafeInteger(usage.tool_calls) &&
-      usage.tool_calls >= 0
-        ? { tool_calls: usage.tool_calls }
+      ...(toolCallsValid
+        ? { tool_calls: Number(usage.tool_calls) }
+        : {}),
+      ...(toolPricedCallsValid
+        ? { tool_priced_calls: Number(usage.tool_priced_calls) }
         : {}),
       ...(typeof usage.window_start === "string"
         ? { window_start: usage.window_start }

@@ -3,6 +3,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import type {
+  AcquisitionFailure,
   BudgetState,
   CostCoverage,
   TaskHealthAction,
@@ -25,10 +26,16 @@ export interface TaskHealthCopy {
   usageTitle: string;
   accessTitle: string;
   knownCost: string;
+  latestAcquisition: string;
+  modelCalls: string;
+  acquisitionCalls: string;
+  pricedCalls: string;
+  recommended: string;
   states: Record<TaskHealthState, string>;
   issues: Record<TaskHealthIssue, string>;
   actions: Record<TaskHealthAction, string>;
   coverage: Record<CostCoverage, string>;
+  acquisitionFailures: Record<AcquisitionFailure, string>;
   budget: Record<BudgetState, string>;
   roles: Record<"owner" | "admin" | "member" | "unknown", string>;
   allowedActions: string;
@@ -49,7 +56,6 @@ function actionAllowed(
 ): boolean {
   if (action === "run_again") return permissions.can_run;
   if (action === "review_task") return permissions.can_edit;
-  if (action === "review_usage") return permissions.can_view_usage;
   return false;
 }
 
@@ -101,9 +107,17 @@ export default function TaskHealthPanel({
               {copy.issues[health.issue]}
             </p>
           )}
+          {health.acquisition.failure_reason && (
+            <p className="text-xs text-muted-foreground">
+              {copy.latestAcquisition}:{" "}
+              {copy.acquisitionFailures[
+                health.acquisition.failure_reason
+              ]}
+            </p>
+          )}
           {health.recommended_action &&
-            onAction &&
-            actionAllowed(health.recommended_action, health.permissions) && (
+          onAction &&
+          actionAllowed(health.recommended_action, health.permissions) ? (
             <Button
               variant="outline"
               size="sm"
@@ -111,7 +125,12 @@ export default function TaskHealthPanel({
             >
               {copy.actions[health.recommended_action]}
             </Button>
-          )}
+          ) : health.recommended_action ? (
+            <p className="text-xs text-muted-foreground">
+              {copy.recommended}:{" "}
+              {copy.actions[health.recommended_action]}
+            </p>
+          ) : null}
         </CardContent>
       </Card>
       <Card>
@@ -128,6 +147,20 @@ export default function TaskHealthPanel({
               <p className="text-xs text-muted-foreground">
                 {copy.coverage[health.usage.coverage]} ·{" "}
                 {copy.budget[health.usage.budget_state]}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {health.usage.llm_calls !== undefined &&
+                  `${copy.modelCalls} ${health.usage.llm_calls}`}
+                {health.usage.llm_calls !== undefined &&
+                  health.usage.tool_calls !== undefined &&
+                  " · "}
+                {health.usage.tool_calls !== undefined &&
+                  `${copy.acquisitionCalls} ${health.usage.tool_calls}`}
+                {health.usage.tool_priced_calls !== undefined &&
+                  health.usage.tool_calls !== undefined &&
+                  health.usage.tool_priced_calls <
+                    health.usage.tool_calls &&
+                  ` (${copy.pricedCalls} ${health.usage.tool_priced_calls})`}
               </p>
             </>
           ) : (
