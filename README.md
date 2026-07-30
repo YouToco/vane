@@ -92,12 +92,15 @@ All runner registrations are repository-scoped and implement three roles:
   permits both X64 and ARM64 Linux hosts.
 - build VM: `[self-hosted, Linux, vane-build]`; Docker is available for the
   PostgreSQL service, and the pinned setup actions provide Go 1.26 and Node 22.
-- deploy VM: `[self-hosted, Linux, vane-deploy]`; both X64 and ARM64 Linux hosts
-  are supported. Install Git, Python 3, OpenSSH, OpenSSL, `flock`, GNU `date`,
-  `curl`, `sha256sum`, and `strings`. Do not install Docker access or `sudo` for
-  the runner user. The production VPS fallback uses the dedicated
-  `vane-deploy-runner` system user with systemd hardening, no supplementary
-  groups, and durable state under its private home.
+- primary deploy VM: `[self-hosted, Linux, mac-mini, vane-deploy]`. `plan`,
+  `deploy`, and certificate renewal are deliberately pinned to this one
+  durable-state owner; a broad-label fallback must not split a single DAG or
+  create a second certificate/deployed-SHA authority. Install Git, Python 3,
+  OpenSSH, OpenSSL, `flock`, GNU `date`, `curl`, `sha256sum`, and `strings`.
+  Do not install Docker access or `sudo` for the runner user. A standby runner
+  requires an explicit state migration and label handoff before it can become
+  the primary; registering it with only `vane-deploy` does not make failover
+  automatic.
 
 The optional Windows WSL2 build runner uses the same `vane-build` trust role
 without production secrets. Its systemd service must use a dedicated `HOME`
