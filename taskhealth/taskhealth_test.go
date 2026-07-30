@@ -207,6 +207,22 @@ func TestProjectV1MalformedFactsFailClosed(t *testing.T) {
 	}
 }
 
+func TestProjectV1AcquisitionFailureDoesNotInventAStreak(t *testing.T) {
+	got := ProjectV1(&LatestCheckV1{
+		Result:         types.RunResultContent,
+		SourceCoverage: types.RunCompletenessPartial,
+		Processing:     types.RunCompletenessComplete,
+		FinalizedAt:    time.Now(),
+	}, AcquisitionSummaryV1{
+		Total: 2, Failing: 2,
+		FailureReason: AcquisitionFailureTimeoutV1,
+	}, UsageV1{}, AccessV1{})
+	if got.Acquisition.MaxFailCount != 0 ||
+		got.RecommendedAction != ActionWaitForRetryV1 {
+		t.Fatalf("source-free call failures invented streak=%#v", got)
+	}
+}
+
 func TestProjectV1OmitsUsageWithoutPermission(t *testing.T) {
 	cost := 6.0
 	calls := int64(2)

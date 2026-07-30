@@ -133,7 +133,6 @@ func projectTaskHealthV1(
 		acquisition.Total = cost.LatestAcquisitionCalls
 		acquisition.Failing = cost.LatestAcquisitionFailures
 		if acquisition.Failing > 0 {
-			acquisition.MaxFailCount = 1
 			acquisition.FailureReason =
 				projectAcquisitionFailureV1(
 					cost.LatestAcquisitionErrorType)

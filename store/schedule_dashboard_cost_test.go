@@ -119,6 +119,30 @@ func TestGetScheduleRunCostExactAttribution(t *testing.T) {
 		t.Fatalf("latest acquisition=%#v", got)
 	}
 
+	reusedLatest := latest
+	reusedLatest.TemporalRunID = "run-" + uuid.NewString()
+	if _, err := fixture.st.createOrGetTaskRunSnapshot(
+		t.Context(), reusedLatest,
+	); err != nil {
+		t.Fatal(err)
+	}
+	ambiguous, err := fixture.st.GetScheduleRunCost(
+		t.Context(), fixture.userID, taskID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ambiguous.LatestAcquisitionCalls != 0 ||
+		ambiguous.LatestAcquisitionFailures != 0 ||
+		ambiguous.LatestAcquisitionErrorType != "" {
+		t.Fatalf("reused workflow latest facts must fail closed=%#v",
+			ambiguous)
+	}
+	if ambiguous.ToolCalls != 3 ||
+		math.Abs(ambiguous.ToolCostUSD-0.017) > 1e-9 {
+		t.Fatalf("reused workflow changed lifetime cost=%#v", ambiguous)
+	}
+
 	foreign, err := fixture.st.GetScheduleRunCost(
 		t.Context(), fixture.userID+999999, taskID,
 	)

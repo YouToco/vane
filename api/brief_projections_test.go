@@ -655,6 +655,22 @@ func TestTaskHealthProjectionUsesControlledFailureCostAndExactRole(t *testing.T)
 	}
 }
 
+func TestScheduleRunCostJSONNeverExposesInternalAcquisitionError(t *testing.T) {
+	raw, err := json.Marshal(store.ScheduleRunCost{
+		LatestAcquisitionCalls:     1,
+		LatestAcquisitionFailures:  1,
+		LatestAcquisitionErrorType: "postgres password=secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "postgres") ||
+		strings.Contains(string(raw), "error_type") {
+		t.Fatalf("schedule detail leaked internal acquisition error: %s",
+			raw)
+	}
+}
+
 func TestTaskHealthMembershipRoleRequiresExactTenantAndUser(t *testing.T) {
 	memberships := []types.Membership{
 		{

@@ -60,14 +60,16 @@ type ScheduleRunSummary struct {
 // ToolPricedCalls 小于 ToolCalls 表示部分上游回执没有可信 cost_usd；调用仍计数，
 // 已知金额仍保留为下限，但上层不得宣称完整成本。
 type ScheduleRunCost struct {
-	LLMCostUSD                 float64 `json:"llm_cost_usd"`
-	LLMCalls                   int64   `json:"llm_calls"`
-	ToolCostUSD                float64 `json:"tool_cost_usd"`
-	ToolCalls                  int64   `json:"tool_calls"`
-	ToolPricedCalls            int64   `json:"tool_priced_calls"`
-	LatestAcquisitionCalls     int     `json:"latest_acquisition_calls"`
-	LatestAcquisitionFailures  int     `json:"latest_acquisition_failures"`
-	LatestAcquisitionErrorType string  `json:"latest_acquisition_error_type,omitempty"`
+	LLMCostUSD                float64 `json:"llm_cost_usd"`
+	LLMCalls                  int64   `json:"llm_calls"`
+	ToolCostUSD               float64 `json:"tool_cost_usd"`
+	ToolCalls                 int64   `json:"tool_calls"`
+	ToolPricedCalls           int64   `json:"tool_priced_calls"`
+	LatestAcquisitionCalls    int     `json:"latest_acquisition_calls"`
+	LatestAcquisitionFailures int     `json:"latest_acquisition_failures"`
+	// Internal low-cardinality fact consumed only by taskhealth sanitization.
+	// Never serialize it through the sibling schedule-detail response.
+	LatestAcquisitionErrorType string `json:"-"`
 }
 
 // ListScheduleBatches 按任务倒序返回运行历史（push_batches + 每批投递计数）。
@@ -257,10 +259,20 @@ func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID
 	}
 	if err := s.pool.QueryRow(ctx,
 		`WITH latest_run AS (
-		     SELECT tenant_id, user_id, task_id, temporal_workflow_id
-		       FROM task_run_snapshots
-		      WHERE user_id = $1 AND task_id = $2
-		      ORDER BY created_at DESC, id DESC
+		     SELECT latest.tenant_id, latest.user_id, latest.task_id,
+		            latest.temporal_workflow_id,
+		            (
+		              SELECT count(*)
+		                FROM task_run_snapshots same_workflow
+		               WHERE same_workflow.tenant_id = latest.tenant_id
+		                 AND same_workflow.user_id = latest.user_id
+		                 AND same_workflow.task_id = latest.task_id
+		                 AND same_workflow.temporal_workflow_id =
+		                     latest.temporal_workflow_id
+		            ) AS workflow_run_count
+		       FROM task_run_snapshots latest
+		      WHERE latest.user_id = $1 AND latest.task_id = $2
+		      ORDER BY latest.created_at DESC, latest.id DESC
 		      LIMIT 1
 		   ),
 		   latest_calls AS (
@@ -271,6 +283,7 @@ func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID
 		        AND tc.user_id = run.user_id
 		        AND tc.trace_id = run.temporal_workflow_id
 		      WHERE tc.tool_kind IN ($3, $4)
+		        AND run.workflow_run_count = 1
 		   )
 		 SELECT count(*),
 		        count(*) FILTER (WHERE error_type <> ''),

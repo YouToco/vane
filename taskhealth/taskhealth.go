@@ -268,9 +268,7 @@ func normalizeAcquisitionV1(
 ) (AcquisitionSummaryV1, bool) {
 	valid := in.Total >= 0 && in.Failing >= 0 &&
 		in.Failing <= in.Total && in.MaxFailCount >= 0 &&
-		((in.Failing == 0 && in.MaxFailCount == 0) ||
-			(in.Failing > 0 && in.MaxFailCount > 0)) &&
-		((in.Failing == 0 &&
+		((in.Failing == 0 && in.MaxFailCount == 0 &&
 			in.FailureReason == AcquisitionFailureNoneV1) ||
 			(in.Failing > 0 &&
 				validAcquisitionFailureV1(in.FailureReason)))

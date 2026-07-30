@@ -58,6 +58,10 @@ the task-playbook cutover. It has no Feishu, workflow, or model call point.
 
 The latest exact run may expose only a bounded failure category:
 `timeout`, `provider_error`, `invalid_request`, `usage_limit`, or `internal`.
+This category is projected only when the latest snapshot's Temporal workflow ID
+names exactly one run snapshot in that task scope. Retained schedulers that
+reuse a workflow ID are ambiguous and therefore expose no "latest" Tool fact;
+history is never guessed into the current check.
 Provider bodies, endpoint paths, SQL/driver details and raw error strings never
 cross the API. The recommended action follows the category: transient failures
 wait for retry, invalid requests review the task manual, usage limits review
