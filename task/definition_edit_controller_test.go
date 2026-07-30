@@ -26,6 +26,9 @@ type definitionEditControllerFakeStore struct {
 
 	operation *types.TaskDefinitionEditOperation
 	loadErr   error
+
+	materialized   []*types.FetchTarget
+	materializeErr error
 }
 
 func (f *definitionEditControllerFakeStore) LoadTaskDefinitionEditProposalBasis(
@@ -50,6 +53,34 @@ func (f *definitionEditControllerFakeStore) LoadTaskDefinitionEditOperationByAct
 	int64,
 ) (*types.TaskDefinitionEditOperation, error) {
 	return f.operation, f.loadErr
+}
+
+func (f *definitionEditControllerFakeStore) GetOrCreateFetchTarget(
+	_ context.Context,
+	target *types.FetchTarget,
+) (int64, bool, error) {
+	if f.materializeErr != nil {
+		return 0, false, f.materializeErr
+	}
+	copy := *target
+	copy.Config = bytes.Clone(target.Config)
+	f.materialized = append(f.materialized, &copy)
+	return int64(100 + len(f.materialized)), true, nil
+}
+
+type definitionEditControllerFakePlanCompiler struct {
+	plan    json.RawMessage
+	err     error
+	content []string
+}
+
+func (f *definitionEditControllerFakePlanCompiler) Translate(
+	_ context.Context,
+	_ int64,
+	content string,
+) (json.RawMessage, error) {
+	f.content = append(f.content, content)
+	return bytes.Clone(f.plan), f.err
 }
 
 type definitionEditControllerFakeCoordinator struct {
@@ -108,7 +139,14 @@ func TestDefinitionEditController_ProposeSealsExactPatchedDefinition(t *testing.
 			TargetTenantID: 7, TargetUserID: 11, TaskID: "task-edit-1",
 		},
 	}
-	controller := NewDefinitionEditController(store, coordinator)
+	compiler := &definitionEditControllerFakePlanCompiler{
+		plan: json.RawMessage(`{"targets":[{
+			"platform":"web","capability":"search","title":"搜索: AI 官方重大更新",
+			"url":"vane://web/search?q=AI+%E5%AE%98%E6%96%B9%E9%87%8D%E5%A4%A7%E6%9B%B4%E6%96%B0",
+			"config":{"query":"AI 官方重大更新"}
+		}]}`),
+	}
+	controller := NewDefinitionEditController(store, coordinator, compiler)
 	sessionID := int64(91)
 	proposal, err := controller.Prepare(t.Context(), DefinitionEditProposalInput{
 		ActionID: "edit-action-1", UserID: 11, SessionID: &sessionID,
@@ -155,6 +193,13 @@ func TestDefinitionEditController_ProposeSealsExactPatchedDefinition(t *testing.
 		got.TargetDefinition.Strictness != types.StrictnessStrict ||
 		string(got.TargetDefinition.SpecJSON) != `{"cron":"30 9 * * *","tz":"Asia/Shanghai"}` {
 		t.Fatalf("target definition patch drifted: %+v", got.TargetDefinition)
+	}
+	if len(compiler.content) != 1 ||
+		compiler.content[0] != "只监控 AI 官方重大更新" ||
+		len(store.materialized) != 1 ||
+		!bytes.Contains(got.TargetDefinition.FetchPlan, []byte("AI 官方重大更新")) {
+		t.Fatalf("task manual was not recompiled: content=%v targets=%+v plan=%s",
+			compiler.content, store.materialized, got.TargetDefinition.FetchPlan)
 	}
 	targetDigest, err := taskstate.DigestApprovedDefinitionV1(got.TargetDefinition)
 	if err != nil {

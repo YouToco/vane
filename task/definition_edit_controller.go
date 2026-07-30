@@ -82,13 +82,21 @@ type definitionEditCoordinatorBoundary interface {
 type DefinitionEditController struct {
 	store       definitionEditControllerStore
 	coordinator definitionEditCoordinatorBoundary
+	planCompiler DefinitionEditPlanCompiler
 }
 
 func NewDefinitionEditController(
 	store definitionEditControllerStore,
 	coordinator definitionEditCoordinatorBoundary,
+	planCompilers ...DefinitionEditPlanCompiler,
 ) *DefinitionEditController {
-	return &DefinitionEditController{store: store, coordinator: coordinator}
+	var planCompiler DefinitionEditPlanCompiler
+	if len(planCompilers) > 0 {
+		planCompiler = planCompilers[0]
+	}
+	return &DefinitionEditController{
+		store: store, coordinator: coordinator, planCompiler: planCompiler,
+	}
 }
 
 func (c *DefinitionEditController) Prepare(
@@ -141,10 +149,23 @@ func (c *DefinitionEditController) Prepare(
 			"task: definition edit basis digest differs",
 		)
 	}
+	effectiveAt := time.Now().UTC().Truncate(time.Second)
 	target, summary, err := applyDefinitionEditCommand(
-		base, command, time.Now().UTC().Truncate(time.Second))
+		base, command, effectiveAt)
 	if err != nil {
 		return DefinitionEditProposal{}, err
+	}
+	if command.Intent != nil && target.Intent != base.Intent {
+		target, err = c.recompileDefinitionEditPlan(
+			ctx, in.UserID, target,
+		)
+		if err != nil {
+			return DefinitionEditProposal{}, err
+		}
+	}
+	if err := taskstate.ValidateApprovedDefinitionV1ForWrite(target); err != nil {
+		return DefinitionEditProposal{}, definitionEditControllerValidation(
+			"目标任务定义未通过安全校验")
 	}
 	baseBytes, err := taskstate.EncodeApprovedDefinitionV1(base)
 	if err != nil {
@@ -419,10 +440,6 @@ func applyDefinitionEditCommand(
 		target.ScopeJSON = canonical
 		changes = append(changes, "新鲜度策略已更新（生效时间 "+
 			policy.EffectiveAt.Format(time.RFC3339)+"）")
-	}
-	if err := taskstate.ValidateApprovedDefinitionV1ForWrite(target); err != nil {
-		return taskstate.ApprovedDefinitionV1{}, "",
-			definitionEditControllerValidation("目标任务定义未通过安全校验")
 	}
 	return target, "编辑定时推送任务（id=" + command.TaskID + "）：\n" +
 		strings.Join(changes, "\n"), nil
