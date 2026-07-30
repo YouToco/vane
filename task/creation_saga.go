@@ -54,8 +54,12 @@ type CreationProposalInput struct {
 	ActionID  string
 	UserID    int64
 	SessionID *int64
-	RawArgs   json.RawMessage
-	ExpiresAt time.Time
+	// OwnerRequest is the authenticated current-user instruction. Unlike
+	// model-produced intent/tool_calls, it is safe to use as the authority for
+	// external locators such as domains, URLs, handles and account IDs.
+	OwnerRequest string
+	RawArgs      json.RawMessage
+	ExpiresAt    time.Time
 }
 
 type CreationProposal struct {
@@ -191,7 +195,16 @@ func (c *CreationCoordinator) Prepare(
 			"任务方案未通过校验："+err.Error(), err,
 		)
 	}
-	materialized, err := materializeCreationToolCalls(proposalArgs.ToolCalls)
+	if err := validateCreationObservationLocators(
+		in.OwnerRequest, proposalArgs.ObservationPolicy,
+	); err != nil {
+		return CreationProposal{}, creationValidation(
+			"任务方案未通过校验："+err.Error(), err,
+		)
+	}
+	materialized, err := materializeCreationToolCalls(
+		proposalArgs.ToolCalls, in.OwnerRequest,
+	)
 	if err != nil {
 		return CreationProposal{}, creationValidation(
 			"任务方案未通过校验："+err.Error(), err,
@@ -1195,11 +1208,23 @@ func decodeCreationProposalArgs(raw json.RawMessage) (*createScheduleProposalArg
 
 func materializeCreationToolCalls(
 	calls []json.RawMessage,
+	ownerRequests ...string,
 ) ([]compiledFetchTarget, error) {
+	ownerRequest := ""
+	if len(ownerRequests) > 0 {
+		ownerRequest = ownerRequests[0]
+	}
 	materialized := make([]compiledFetchTarget, 0, len(calls))
 	for i, raw := range calls {
 		spec, toolName, toolArgs, err := decodeCreationToolCall(raw)
 		if err != nil {
+			return nil, fmt.Errorf(
+				"task: tool_calls[%d]: %w", i, err,
+			)
+		}
+		if err := validateCreationToolLocators(
+			ownerRequest, toolName, toolArgs,
+		); err != nil {
 			return nil, fmt.Errorf(
 				"task: tool_calls[%d]: %w", i, err,
 			)
@@ -1244,6 +1269,114 @@ func materializeCreationToolCalls(
 		})
 	}
 	return materialized, nil
+}
+
+func validateCreationObservationLocators(
+	ownerRequest string,
+	policy *observation.PolicySpecV1,
+) error {
+	if policy == nil {
+		return nil
+	}
+	for _, domain := range policy.Evidence.OfficialDomains {
+		if !creationOwnerExplicitlyNamed(ownerRequest, domain) {
+			return fmt.Errorf(
+				"official_domains 中的 %q 必须由用户在当前消息中明确提供",
+				domain,
+			)
+		}
+	}
+	return nil
+}
+
+func validateCreationToolLocators(
+	ownerRequest string,
+	toolName string,
+	raw json.RawMessage,
+) error {
+	var fields map[string]json.RawMessage
+	if err := strictjson.DecodeExact(raw, &fields); err != nil {
+		return err
+	}
+	var names []string
+	switch toolName {
+	case "web_search":
+		var domains []string
+		if rawDomains, ok := fields["include_domains"]; ok {
+			if err := strictjson.DecodeExact(rawDomains, &domains); err != nil {
+				return err
+			}
+		}
+		for _, domain := range domains {
+			if !creationOwnerExplicitlyNamed(ownerRequest, domain) {
+				return fmt.Errorf(
+					"include_domains 中的 %q 必须由用户在当前消息中明确提供；"+
+						"否则请使用不带域名约束的语义搜索",
+					domain,
+				)
+			}
+		}
+		return nil
+	case "web_feed":
+		names = []string{"feed_url"}
+	case "web_contents":
+		names = []string{"page_url"}
+	case "x_user_posts":
+		names = []string{"screen_name"}
+	case "xhs_user_posts", "xhs_faved_notes":
+		names = []string{"user_id", "profile_url"}
+	case "xhs_topic_feed":
+		names = []string{"page_id", "topic_url"}
+	case "weibo_user_posts":
+		names = []string{"uid", "profile_url"}
+	case "wechat_mp_user_posts":
+		names = []string{"username"}
+	default:
+		return nil
+	}
+	for _, name := range names {
+		rawValue, ok := fields[name]
+		if !ok {
+			continue
+		}
+		var value string
+		if strictjson.DecodeExact(rawValue, &value) != nil ||
+			strings.TrimSpace(value) == "" {
+			continue
+		}
+		explicit := creationOwnerExplicitlyNamed(ownerRequest, value)
+		if toolName == "x_user_posts" && name == "screen_name" {
+			explicit = creationOwnerExplicitlyNamedXHandle(
+				ownerRequest, value,
+			)
+		}
+		if !explicit {
+			return fmt.Errorf(
+				"%s=%q 必须由用户在当前消息中明确提供；请向用户追问准确值",
+				name, value,
+			)
+		}
+	}
+	return nil
+}
+
+func creationOwnerExplicitlyNamed(ownerRequest, value string) bool {
+	request := strings.ToLower(promptguard.StripInvisible(ownerRequest))
+	needle := strings.ToLower(promptguard.StripInvisible(strings.TrimSpace(value)))
+	return needle != "" && strings.Contains(request, needle)
+}
+
+func creationOwnerExplicitlyNamedXHandle(ownerRequest, value string) bool {
+	request := strings.ToLower(promptguard.StripInvisible(ownerRequest))
+	handle := strings.ToLower(
+		promptguard.StripInvisible(strings.TrimSpace(value)),
+	)
+	if handle == "" {
+		return false
+	}
+	return strings.Contains(request, "@"+handle) ||
+		strings.Contains(request, "x.com/"+handle) ||
+		strings.Contains(request, "twitter.com/"+handle)
 }
 
 // decodeCreationToolCall accepts one exact Agent tool invocation and delegates

@@ -134,10 +134,9 @@ func TestTaskDefinitionEditWiringUsesFlaggedController(t *testing.T) {
 				workerStartPos = value.Pos()
 			}
 			if isPackageSelector(value.Fun, "task", "NewDefinitionEditController") &&
-				len(value.Args) == 3 {
+				len(value.Args) == 2 {
 				if coordinator, ok := value.Args[1].(*ast.Ident); ok &&
-					coordinator.Name == coordinatorName &&
-					isPackageCall(value.Args[2], "agent", "NewPlaybookTranslator") {
+					coordinator.Name == coordinatorName {
 					controllerCalls++
 					controllerPos = value.Pos()
 				}
@@ -189,11 +188,6 @@ func TestTaskDefinitionEditWiringUsesFlaggedController(t *testing.T) {
 		t.Fatalf("stopDefinitionEditRecovery calls = %d, want worker/A2A startup-failure and normal-shutdown drains",
 			stopCalls)
 	}
-}
-
-func isPackageCall(node ast.Expr, pkg, name string) bool {
-	call, ok := node.(*ast.CallExpr)
-	return ok && isPackageSelector(call.Fun, pkg, name)
 }
 
 func isSelectorPath(expr ast.Expr, path ...string) bool {

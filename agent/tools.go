@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"strconv"
 	"strings"
 	"unicode"
@@ -71,18 +70,11 @@ type profileStore interface {
 	UpsertProfileFields(ctx context.Context, userID int64, industry, occupation *string, tags []string) (*types.Profile, error)
 }
 
-// playbookStore is the task-manual persistence/compiler boundary. Fetch targets
-// are internal execution material derived from the manual, never independent
-// account objects.
+// playbookStore is deliberately read-only. The task manual is the user-facing
+// task definition; internal execution calls are inspected through run
+// provenance, not exposed as a second editable product object.
 type playbookStore interface {
 	GetSchedulePlaybook(ctx context.Context, userID int64, scheduleID string) (*types.SchedulePlaybook, error)
-	UpsertSchedulePlaybook(ctx context.Context, userID int64, scheduleID, content string) (ok bool, err error)
-	// SetFetchPlan 只改 fetch_plan（P1 编译层），归属同 Upsert 进 SQL；ok=false=任务不存在/非本人/无手册行。
-	SetFetchPlan(ctx context.Context, userID int64, scheduleID string, plan json.RawMessage) (ok bool, err error)
-	// GetOrCreateFetchTarget 材料化计划目标：不存在就建、已存在原样返回不覆写。
-	GetOrCreateFetchTarget(ctx context.Context, target *types.FetchTarget) (id int64, created bool, err error)
-	// ReplaceTaskFetchTargets 整体替换任务的抓取目标投影，归属校验进入 SQL。
-	ReplaceTaskFetchTargets(ctx context.Context, userID int64, scheduleID string, targetIDs []int64) error
 }
 
 // BuildTools 装配 agent 全部可用工具。返回的切片即工具白名单的静态部分（契约 §10）：
@@ -748,7 +740,7 @@ func removeScheduleIDs(args json.RawMessage) (ids []string, errText string, malf
 
 // ============================================================
 // run_task_now：立即运行一个或多个已有任务。不存在账号级“立即推送”；
-// 每个调用只执行任务已经冻结的定义和抓取计划。
+// 每个调用只执行任务已经冻结的定义和版本化 Tool 调用。
 // ============================================================
 
 const runTaskNowSchema = `{
@@ -1058,97 +1050,13 @@ func (t *viewTaskPlaybookTool) Execute(ctx context.Context, userID int64, args j
 
 func (t *viewTaskPlaybookTool) Summarize(json.RawMessage) string { return "" }
 
-// renderPlaybook 把手册渲染成给模型/用户看的中文文本：手册正文 +（P1 编译层）据此编译出的
-// 抓取计划摘要。content 为空时给引导文案，让模型知道该采集什么；fetch_plan 无源时不赘述。
+// renderPlaybook only renders the user-owned manual. Legacy fetch_plan data is
+// an internal compatibility projection and must not reappear as a second
+// product concept.
 func renderPlaybook(pb *types.SchedulePlaybook) string {
 	content := strings.TrimSpace(pb.Content)
 	if content == "" {
 		content = "（手册为空——可以告诉我这个任务要抓什么、关注哪些主题、偏好哪些来源。）"
 	}
-	out := fmt.Sprintf("任务手册（id=%s）：\n%s", pb.ScheduleID, content)
-	if plan := renderFetchPlan(pb.FetchPlan); plan != "" {
-		out += "\n\n" + plan
-	}
-	return out
-}
-
-// renderFetchPlan 渲染 fetch_plan 里已编译的抓取目标；无目标/不合法时返回空串。
-func renderFetchPlan(raw json.RawMessage) string {
-	var plan FetchPlan
-	if len(raw) == 0 || json.Unmarshal(raw, &plan) != nil || len(plan.Targets) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "据此编译出的抓取计划（%d 个目标）：", len(plan.Targets))
-	for _, target := range plan.Targets {
-		title := target.Title
-		if title == "" {
-			title = target.URL
-		}
-		fmt.Fprintf(&b, "\n- [%s/%s] %s", target.Platform, target.Capability, title)
-	}
-	return b.String()
-}
-
-// compilePlaybookPlan 把手册正文翻译成 fetch_plan 并落库（P1 编译层的工具侧胶水）。
-// **best-effort**：翻译器未装配（tr==nil）或任何一步失败都只 slog、绝不影响主效果
-// （调度已建 / 手册正文已存）。返回成功落库的计划源数（>=0），供 edit 回执展示。
-func compilePlaybookPlan(ctx context.Context, st playbookStore, tr playbookTranslator, userID int64, scheduleID, content string) int {
-	if tr == nil {
-		return 0 // 未装配 LLM 翻译器（部分测试/降级路径）：手册仍可用，只是不编译计划。
-	}
-	plan, err := tr.Translate(ctx, userID, content)
-	if err != nil {
-		// 翻译失败（LLM 调用错误 / 输出取不出 JSON）：保留既有计划不动，只记日志。
-		slog.Warn("agent: 手册编译成抓取计划失败（手册已存，本次不更新计划）", "schedule_id", scheduleID, "err", err)
-		return 0
-	}
-	ok, serr := st.SetFetchPlan(ctx, userID, scheduleID, plan)
-	if serr != nil {
-		slog.Error("agent: 抓取计划落库失败", "schedule_id", scheduleID, "err", serr)
-		return 0
-	}
-	if !ok {
-		slog.Warn("agent: 抓取计划落库未命中手册行（任务不存在/非本人/无手册行）", "schedule_id", scheduleID)
-		return 0
-	}
-	// 把手册计划材料化为内部抓取目标，并同步任务的精确目标投影。
-	// best-effort、不改回执：链接同步失败不影响已落库的 fetch_plan，也不改用户看到的源数。
-	// 软范围≠硬闸门：只圈定本任务取材范围，不建订阅、不碰 agent 的配源/搜索工具面。
-	syncPlaybookTargets(ctx, st, userID, scheduleID, plan)
-	return countPlanTargets(plan)
-}
-
-// syncPlaybookTargets 把 fetch_plan 里的每个目标材料化为 fetch_targets 行，再整体
-// 替换本任务的 task_fetch_targets 精确投影。只有全部材料化成功才更新投影。
-func syncPlaybookTargets(ctx context.Context, st playbookStore, userID int64, scheduleID string, planJSON json.RawMessage) {
-	var plan FetchPlan
-	if len(planJSON) == 0 || json.Unmarshal(planJSON, &plan) != nil {
-		return
-	}
-	ids := make([]int64, 0, len(plan.Targets))
-	for _, planned := range plan.Targets {
-		target := &types.FetchTarget{
-			Platform:   types.Platform(planned.Platform),
-			Capability: types.Capability(planned.Capability),
-			URL:        planned.URL,
-			Title:      planned.Title,
-			Config:     planned.Config,
-		}
-		id, _, err := st.GetOrCreateFetchTarget(ctx, target)
-		if err != nil {
-			// 有目标没材料化成：**不半更新链接**。ReplaceTaskFetchTargets 是整体替换，
-			// 若拿"成功子集"去替换，会把 fetch_plan 里仍列出、只是本次瞬时建目标失败的目标
-			// 旧投影误删——fetch_plan 与 task_fetch_targets 就分叉了。保留既有投影不动，下次
-			// 改手册（或重试）自愈，比"因一次 DB 抖动静默丢一条正确链接"安全。
-			slog.Warn("agent: 部分计划目标材料化失败，跳过本次链接同步（保留既有链接，避免与 fetch_plan 分叉）",
-				"schedule_id", scheduleID, "url", planned.URL, "err", err)
-			return
-		}
-		ids = append(ids, id)
-	}
-	// 全部材料化成功（含"计划本就零目标"→ ids 空 → 清空该任务链接，正当）才整体替换链接。
-	if err := st.ReplaceTaskFetchTargets(ctx, userID, scheduleID, ids); err != nil {
-		slog.Error("agent: 同步任务抓取目标链接失败", "schedule_id", scheduleID, "err", err)
-	}
+	return fmt.Sprintf("任务手册（id=%s）：\n%s", pb.ScheduleID, content)
 }

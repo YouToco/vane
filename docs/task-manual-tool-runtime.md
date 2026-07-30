@@ -81,6 +81,28 @@ The accepted Tool calls are stored on the approved task head without losing
 the Tool name or canonical arguments. Materialized provider URL/config is
 derived execution data, not the task's authority.
 
+## External-fact authority
+
+Model weights are not a current truth source for mutable external facts.
+The Agent may translate the user's goal into semantic search terms, but it
+must not infer a domain, URL, social handle, UID, username or other external
+locator from its training data.
+
+An external locator may be sealed only when it appears explicitly in the
+authenticated current user request. The creation controller enforces this
+against the owner request itself, never against model-produced `intent`.
+If no locator was supplied:
+
+- use a live semantic-search Tool call when that Tool does not require a fixed
+  locator; or
+- ask one targeted question when the selected Tool requires an exact locator.
+
+The scheduled run executes the sealed Tool call against the live network.
+Therefore a model-authored semantic query is an instruction to a live Tool,
+not a model-authored claim about the current web. A legacy
+manual-to-`fetch_plan` LLM translator is forbidden: it duplicates the Tool
+contract and can freeze stale model knowledge as execution authority.
+
 ## Isolation invariants
 
 Tool arguments, provider configuration, cursor, failure count and next-run
@@ -192,6 +214,10 @@ claim cannot be represented exactly.
 - sharing Tool-call arguments, configuration or health across
   tenant/user/task/call boundaries;
 - asking the user for task, source or target IDs;
+- inferring domains, URLs, handles or account IDs from model weights and
+  freezing them as task authority;
+- reviving a separate model-to-`fetch_plan` compiler beside acquisition Tool
+  definitions;
 - reconstructing execution from mutable current Tool definitions;
 - deleting provenance rows to make a migration pass;
 - silently falling back from a missing retained Tool route;

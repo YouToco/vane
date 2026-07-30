@@ -507,64 +507,18 @@ func TestBuildTools_RetiredToolsStayAbsent(t *testing.T) {
 // 任务手册工具（Task Playbook P0）
 // ============================================================
 
-// fakePlaybookStore 满足 playbookStore：books 存内容，owner 存归属。
-// Get 未命中/非本人 → types.ErrNotFound；Upsert 校归属返回 ok，记录入参供断言。
+// fakePlaybookStore 满足只读 playbookStore：books 存内容，owner 存归属。
+// Get 未命中/非本人 → types.ErrNotFound。
 type fakePlaybookStore struct {
-	books     map[string]*types.SchedulePlaybook
-	owner     map[string]int64
-	getErr    error
-	upsertErr error
-	upserts   []struct {
-		userID     int64
-		scheduleID string
-		content    string
-	}
-	setPlanErr error
-	plans      []struct {
-		userID     int64
-		scheduleID string
-		plan       string
-	}
-	// P1b b2：材料化 + 链接同步的捕获。
-	targetByURL   map[string]int64 // url → 分配的抓取目标 id（模拟 GetOrCreateFetchTarget 幂等）
-	nextTargetID  int64
-	gotTargetURLs []string           // GetOrCreateFetchTarget 收到的 url（按序）
-	links         map[string][]int64 // scheduleID → 最后一次 ReplaceTaskFetchTargets 的 targetIDs
-	targetErr     error              // 非 nil = GetOrCreateFetchTarget 失败
-	linkErr       error              // 非 nil = ReplaceTaskFetchTargets 失败
-	linkCalls     int
+	books  map[string]*types.SchedulePlaybook
+	owner  map[string]int64
+	getErr error
 }
 
 func newFakePlaybookStore() *fakePlaybookStore {
 	return &fakePlaybookStore{
 		books: map[string]*types.SchedulePlaybook{}, owner: map[string]int64{},
-		targetByURL: map[string]int64{}, links: map[string][]int64{},
 	}
-}
-
-func (f *fakePlaybookStore) GetOrCreateFetchTarget(_ context.Context, target *types.FetchTarget) (int64, bool, error) {
-	f.gotTargetURLs = append(f.gotTargetURLs, target.URL)
-	if f.targetErr != nil {
-		return 0, false, f.targetErr
-	}
-	if id, ok := f.targetByURL[target.URL]; ok {
-		return id, false, nil // 已存在：原样返回，不覆写。
-	}
-	f.nextTargetID++
-	f.targetByURL[target.URL] = f.nextTargetID
-	return f.nextTargetID, true, nil
-}
-
-func (f *fakePlaybookStore) ReplaceTaskFetchTargets(_ context.Context, userID int64, scheduleID string, targetIDs []int64) error {
-	f.linkCalls++
-	if f.linkErr != nil {
-		return f.linkErr
-	}
-	if o, ok := f.owner[scheduleID]; ok && o != userID {
-		return nil // 非本人：归属未命中，不动链接（真 store 靠 SQL EXISTS 门禁）。
-	}
-	f.links[scheduleID] = append([]int64(nil), targetIDs...)
-	return nil
 }
 
 func (f *fakePlaybookStore) GetSchedulePlaybook(_ context.Context, userID int64, scheduleID string) (*types.SchedulePlaybook, error) {
@@ -576,63 +530,6 @@ func (f *fakePlaybookStore) GetSchedulePlaybook(_ context.Context, userID int64,
 		return nil, types.NewAppError(types.CodeNotFound, "无手册或非本人", nil)
 	}
 	return pb, nil
-}
-
-func (f *fakePlaybookStore) UpsertSchedulePlaybook(_ context.Context, userID int64, scheduleID, content string) (bool, error) {
-	f.upserts = append(f.upserts, struct {
-		userID     int64
-		scheduleID string
-		content    string
-	}{userID, scheduleID, content})
-	if f.upsertErr != nil {
-		return false, f.upsertErr
-	}
-	if o, ok := f.owner[scheduleID]; ok && o != userID {
-		return false, nil // 非本人：归属未命中
-	}
-	f.owner[scheduleID] = userID
-	f.books[scheduleID] = &types.SchedulePlaybook{ScheduleID: scheduleID, Content: content}
-	return true, nil
-}
-
-// SetFetchPlan 模拟 store 的 UPDATE … FROM schedules 语义：需已存在手册行 + 归属命中才写。
-func (f *fakePlaybookStore) SetFetchPlan(_ context.Context, userID int64, scheduleID string, plan json.RawMessage) (bool, error) {
-	f.plans = append(f.plans, struct {
-		userID     int64
-		scheduleID string
-		plan       string
-	}{userID, scheduleID, string(plan)})
-	if f.setPlanErr != nil {
-		return false, f.setPlanErr
-	}
-	if o, ok := f.owner[scheduleID]; ok && o != userID {
-		return false, nil // 非本人：归属未命中。
-	}
-	pb, ok := f.books[scheduleID]
-	if !ok {
-		return false, nil // 无手册行：计划依附不上。
-	}
-	pb.FetchPlan = plan
-	return true, nil
-}
-
-// fakeTranslator 是 playbookTranslator 的假实现：返回预设计划 / err，并记录调用入参。
-type fakeTranslator struct {
-	plan    json.RawMessage
-	err     error
-	calls   int
-	gotUser int64
-	gotText string
-}
-
-func (f *fakeTranslator) Translate(_ context.Context, userID int64, content string) (json.RawMessage, error) {
-	f.calls++
-	f.gotUser = userID
-	f.gotText = content
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.plan, nil
 }
 
 func TestViewTaskPlaybookTool(t *testing.T) {
@@ -657,7 +554,7 @@ func TestViewTaskPlaybookTool(t *testing.T) {
 			t.Fatalf("空手册应给引导文案: %q", got)
 		}
 	})
-	t.Run("有抓取计划时一并渲染（P1 编译层）", func(t *testing.T) {
+	t.Run("旧抓取计划不作为第二产品概念暴露", func(t *testing.T) {
 		fs := newFakePlaybookStore()
 		fs.books["s1"] = &types.SchedulePlaybook{
 			ScheduleID: "s1",
@@ -666,17 +563,8 @@ func TestViewTaskPlaybookTool(t *testing.T) {
 		}
 		fs.owner["s1"] = 7
 		got, _ := (&viewTaskPlaybookTool{st: fs}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":"s1"}`))
-		if !strings.Contains(got, "抓取计划（1 个目标）") || !strings.Contains(got, "[web/search]") {
-			t.Fatalf("应渲染抓取计划: %q", got)
-		}
-	})
-	t.Run("空 fetch_plan 不赘述计划", func(t *testing.T) {
-		fs := newFakePlaybookStore()
-		fs.books["s1"] = &types.SchedulePlaybook{ScheduleID: "s1", Content: "x", FetchPlan: json.RawMessage(`{"targets":[]}`)}
-		fs.owner["s1"] = 7
-		got, _ := (&viewTaskPlaybookTool{st: fs}).Execute(context.Background(), 7, json.RawMessage(`{"schedule_id":"s1"}`))
-		if strings.Contains(got, "抓取计划") {
-			t.Fatalf("零源不该出现计划段: %q", got)
+		if got != "任务手册（id=s1）：\nAI 官方新闻" {
+			t.Fatalf("旧抓取计划不应暴露: %q", got)
 		}
 	})
 	t.Run("NotFound 回文案不报错", func(t *testing.T) {

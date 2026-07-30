@@ -34,6 +34,7 @@ func materializeCreationFetchRequirements(
 		return nil, errors.New("invalid test acquisition requirements")
 	}
 	calls := make([]json.RawMessage, 0, len(requirements.Items))
+	var ownerRequest strings.Builder
 	for _, item := range requirements.Items {
 		var fields map[string]any
 		if err := json.Unmarshal(item, &fields); err != nil {
@@ -41,6 +42,13 @@ func materializeCreationFetchRequirements(
 		}
 		name, _ := fields["kind"].(string)
 		delete(fields, "kind")
+		for field, value := range fields {
+			if field == "screen_name" {
+				ownerRequest.WriteByte('@')
+			}
+			ownerRequest.WriteString(fmt.Sprint(value))
+			ownerRequest.WriteByte('\n')
+		}
 		call, err := json.Marshal(map[string]any{
 			"name": name, "arguments": fields,
 		})
@@ -49,7 +57,7 @@ func materializeCreationFetchRequirements(
 		}
 		calls = append(calls, call)
 	}
-	return materializeCreationToolCalls(calls)
+	return materializeCreationToolCalls(calls, ownerRequest.String())
 }
 
 var testCreationReceiptTarget = CreationReceiptTarget{
@@ -604,6 +612,7 @@ func TestCreationCoordinator_ProposalMaterializesVersionedFetchRequirementsBefor
 
 	proposal, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 		ActionID: "action-fetch-requirements", UserID: 11,
+		OwnerRequest: string(plan),
 		RawArgs: mustCreateArgsWithPlan(
 			t, "只监控三家公司官方确认的重大更新", "三家官方 AI 动态", plan,
 		),
@@ -707,7 +716,8 @@ func TestCreationCoordinator_ProposalPreservesObservationPolicyAcrossCanonicalRe
 	})
 
 	proposal, err := coordinator.Prepare(t.Context(), CreationProposalInput{
-		ActionID: "action-observation-policy", UserID: 11, RawArgs: raw,
+		ActionID: "action-observation-policy", UserID: 11,
+		OwnerRequest: string(raw), RawArgs: raw,
 		ExpiresAt: time.Now().Add(time.Hour),
 	})
 	if err != nil {
@@ -962,7 +972,7 @@ func TestCreationCoordinator_ToolCallsAreStrictAtomicAndUnambiguous(t *testing.T
 				`"tool_calls":` + tc.calls + `}`)
 			_, err := coordinator.Prepare(t.Context(), CreationProposalInput{
 				ActionID: "action-invalid-source-spec", UserID: 11,
-				RawArgs:   raw,
+				OwnerRequest: tc.calls, RawArgs: raw,
 				ExpiresAt: time.Now().Add(time.Hour),
 			})
 			if !errors.Is(err, types.ErrValidation) || !strings.Contains(err.Error(), tc.want) ||
@@ -973,6 +983,147 @@ func TestCreationCoordinator_ToolCallsAreStrictAtomicAndUnambiguous(t *testing.T
 					store.membershipCalls, store.tenantCalls)
 			}
 		})
+	}
+}
+
+func TestCreationCoordinator_RejectsModelInventedExternalLocators(t *testing.T) {
+	tests := []struct {
+		name      string
+		toolCalls string
+		want      string
+	}{
+		{
+			name: "domain inferred from institution name",
+			toolCalls: `[{"name":"web_search","arguments":{
+				"query":"OpenAI 官方更新","include_domains":["openai.com"]
+			}}]`,
+			want: "include_domains",
+		},
+		{
+			name: "page URL recalled from model weights",
+			toolCalls: `[{"name":"web_contents","arguments":{
+				"page_url":"https://openai.com/news/"
+			}}]`,
+			want: "page_url",
+		},
+		{
+			name: "social handle inferred from display name",
+			toolCalls: `[{"name":"x_user_posts","arguments":{
+				"screen_name":"OpenAI"
+			}}]`,
+			want: "screen_name",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newCreationSagaFakeStore()
+			coordinator := NewCreationCoordinator(
+				store, &creationSagaFakeScheduler{}, nil,
+			)
+			raw := json.RawMessage(`{
+				"spec":{"every_seconds":3600,"tz":"UTC"},
+				"intent":"监控 OpenAI 官方更新",
+				"nl_description":"OpenAI 官方更新",
+				"strictness":"normal",
+				"tool_calls":` + tc.toolCalls + `
+			}`)
+			_, err := coordinator.Prepare(
+				t.Context(),
+				CreationProposalInput{
+					ActionID: "action-untrusted-locator", UserID: 11,
+					OwnerRequest: "帮我持续监控 OpenAI 官方更新",
+					RawArgs:      raw, ExpiresAt: time.Now().Add(time.Hour),
+				},
+			)
+			if !errors.Is(err, types.ErrValidation) ||
+				!strings.Contains(err.Error(), tc.want) ||
+				store.createCalls != 0 || store.membershipCalls != 0 {
+				t.Fatalf(
+					"invented locator was not rejected before persistence: "+
+						"err=%v create=%d membership=%d",
+					err, store.createCalls, store.membershipCalls,
+				)
+			}
+		})
+	}
+}
+
+func TestCreationCoordinator_AcceptsOnlyOwnerSuppliedExternalLocator(t *testing.T) {
+	store := newCreationSagaFakeStore()
+	coordinator := NewCreationCoordinator(
+		store, &creationSagaFakeScheduler{}, nil,
+	)
+	raw := json.RawMessage(`{
+		"spec":{"every_seconds":3600,"tz":"UTC"},
+		"intent":"监控 OpenAI 官方更新",
+		"nl_description":"OpenAI 官方更新",
+		"strictness":"normal",
+		"tool_calls":[{"name":"web_search","arguments":{
+			"query":"OpenAI 官方更新","include_domains":["openai.com"]
+		}}]
+	}`)
+	if _, err := coordinator.Prepare(
+		t.Context(),
+		CreationProposalInput{
+			ActionID: "action-explicit-locator", UserID: 11,
+			OwnerRequest: "只从 OPENAI.COM 持续检查 OpenAI 官方更新",
+			RawArgs:      raw, ExpiresAt: time.Now().Add(time.Hour),
+		},
+	); err != nil {
+		t.Fatalf("explicit owner locator rejected: %v", err)
+	}
+	if store.createCalls != 1 {
+		t.Fatalf("explicit owner locator was not persisted: %d", store.createCalls)
+	}
+}
+
+func TestCreationCoordinator_RejectsModelInventedOfficialEvidenceDomain(t *testing.T) {
+	store := newCreationSagaFakeStore()
+	coordinator := NewCreationCoordinator(
+		store, &creationSagaFakeScheduler{}, nil,
+	)
+	raw := json.RawMessage(`{
+		"spec":{"every_seconds":3600,"tz":"UTC"},
+		"intent":"监控 OpenAI 官方更新",
+		"nl_description":"OpenAI 官方更新",
+		"strictness":"strict",
+		"tool_calls":[{"name":"web_search","arguments":{
+			"query":"OpenAI 官方更新"
+		}}],
+		"observation_policy":{
+			"schema":"vane.observation-policy/v1",
+			"mode":"event",
+			"window":{"kind":"schedule_interval"},
+			"late_policy":"strict",
+			"evidence":{
+				"requirement":"official_required",
+				"official_domains":["openai.com"]
+			},
+			"unknown_time":"reject",
+			"event":{
+				"subject":"OpenAI",
+				"event_kind":"重大更新",
+				"qualification":"official_announcement"
+			},
+			"qualifier_prompt":"vane.qualify-events/v1"
+		}
+	}`)
+	_, err := coordinator.Prepare(
+		t.Context(),
+		CreationProposalInput{
+			ActionID: "action-invented-evidence-domain", UserID: 11,
+			OwnerRequest: "持续检查 OpenAI 官方重大更新，无更新不推送",
+			RawArgs:      raw, ExpiresAt: time.Now().Add(time.Hour),
+		},
+	)
+	if !errors.Is(err, types.ErrValidation) ||
+		!strings.Contains(err.Error(), "official_domains") ||
+		store.createCalls != 0 || store.membershipCalls != 0 {
+		t.Fatalf(
+			"invented evidence domain was not rejected before persistence: "+
+				"err=%v create=%d membership=%d",
+			err, store.createCalls, store.membershipCalls,
+		)
 	}
 }
 
@@ -1231,7 +1382,9 @@ func TestMaterializeCreationToolCalls_CoversRegisteredBloggerTools(t *testing.T)
 			raw := json.RawMessage(
 				`{"name":` + strconv.Quote(tc.name) + `,"arguments":` + tc.arguments + `}`,
 			)
-			got, err := materializeCreationToolCalls([]json.RawMessage{raw})
+			got, err := materializeCreationToolCalls(
+				[]json.RawMessage{raw}, string(raw),
+			)
 			if err != nil || len(got) != 1 {
 				t.Fatalf("materialize %s: got=%+v err=%v", tc.name, got, err)
 			}
