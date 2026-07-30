@@ -221,6 +221,27 @@ the strong model performs bounded semantic judgment over those observations;
 deterministic code enforces ownership, window, citation identity, quota and
 the no-push terminal gates.
 
+### Run outcome truth
+
+Every newly authorized Tool V2 run creates one `task_run_outcomes` marker for
+its exact immutable snapshot before any provider Tool, paid model or delivery
+effect is scheduled. The same durable result vocabulary used by the retained
+compiled runtime is authoritative:
+
+- a delivered card finalizes as `content`;
+- a fully evaluated run with nothing publishable finalizes as `quiet`;
+- a provider, storage or delivery failure finalizes as `failed`;
+- cancellation finalizes as `interrupted`.
+
+`source_coverage` means Tool acquisition coverage for Tool V2; it is `complete`
+only after every frozen invocation has returned a valid receipt. `processing`
+is `partial` when qualification is uncertain or quota prevents a required
+stage, even though the user-facing terminal remains a successful silent run.
+Normal no-match and deterministic empty gates are `quiet` with complete
+coverage and processing. Finalization is an idempotent claim bound to database
+time, and the existing stale-marker recovery path applies without a second
+Tool-specific status table.
+
 ## Compatibility boundary
 
 The deployed v1 snapshot and content provenance schema used positive global

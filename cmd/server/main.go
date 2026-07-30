@@ -261,6 +261,7 @@ func run() error {
 					})
 			}, st, recorder),
 		workflow.WithRunOutcomeStoreV1(st),
+		workflow.WithRunOutcomeStoreV2(st),
 		workflow.WithCanonicalBriefStoreV1(st),
 		workflow.WithCanonicalBriefRendererV1(
 			cfg.Pipeline.CanonicalBriefRendererCanaryScheduleID,
@@ -327,6 +328,8 @@ func run() error {
 	w.RegisterActivity(activities.RecordEmptyToolRunV2)
 	w.RegisterActivity(activities.BeginRunOutcomeV1)
 	w.RegisterActivity(activities.FinalizeRunOutcomeV1)
+	w.RegisterActivity(activities.BeginToolRunOutcomeV2)
+	w.RegisterActivity(activities.FinalizeToolRunOutcomeV2)
 	w.RegisterActivity(activities.PrepareCanonicalBriefV1)
 	w.RegisterActivity(activities.SynthesizeExecutiveBriefV1)
 	w.RegisterActivity(activities.FreezeExecutiveBriefV1)

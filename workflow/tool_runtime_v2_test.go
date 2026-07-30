@@ -1425,6 +1425,12 @@ func TestPushPipelineWorkflow_CompiledToolV2CommandSequence(t *testing.T) {
 	var calls []string
 	var cardGenEvidenceRequired bool
 	var pushEvidenceRequired bool
+	var finalizedClaim types.RunOutcomeClaimV1
+	marker := types.RunOutcomeMarkerV1{
+		ID: 901, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID, TenantID: identity.TenantID,
+		UserID: identity.UserID, TaskID: identity.TaskID,
+	}
 	record := func(name string) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -1441,6 +1447,23 @@ func TestPushPipelineWorkflow_CompiledToolV2CommandSequence(t *testing.T) {
 				Authorized: true, Snapshot: ref,
 				InvocationDigests: []string{invocation},
 			}, nil
+		})
+	register("BeginToolRunOutcomeV2",
+		func(
+			context.Context,
+			ToolRunOutcomeBeginV2Input,
+		) (types.RunOutcomeMarkerV1, error) {
+			record("begin")
+			return marker, nil
+		})
+	register("FinalizeToolRunOutcomeV2",
+		func(
+			_ context.Context,
+			in ToolRunOutcomeFinalizeV2Input,
+		) (types.RunOutcomeV1, error) {
+			record("finalize")
+			finalizedClaim = in.Claim
+			return types.RunOutcomeV1{}, nil
 		})
 	register("ExecuteToolInvocationV2",
 		func(
@@ -1529,8 +1552,8 @@ func TestPushPipelineWorkflow_CompiledToolV2CommandSequence(t *testing.T) {
 		t.Fatalf("compiled Tool workflow: %v", err)
 	}
 	want := []string{
-		"prepare", "execute", "collect", "dedup",
-		"qualify", "score", "select", "cardgen", "push",
+		"prepare", "begin", "execute", "collect", "dedup",
+		"qualify", "score", "select", "cardgen", "push", "finalize",
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -1541,6 +1564,11 @@ func TestPushPipelineWorkflow_CompiledToolV2CommandSequence(t *testing.T) {
 		t.Fatalf(
 			"evidence requirement was not carried: cardgen=%t push=%t",
 			cardGenEvidenceRequired, pushEvidenceRequired)
+	}
+	if finalizedClaim.Result != types.RunResultContent ||
+		finalizedClaim.SourceCoverage != types.RunCompletenessComplete ||
+		finalizedClaim.Processing != types.RunCompletenessComplete {
+		t.Fatalf("content outcome claim = %+v", finalizedClaim)
 	}
 }
 
@@ -1569,6 +1597,27 @@ func TestPushPipelineWorkflow_ToolV2NoMatchStopsBeforeScoreAndPush(
 				Authorized: true, Snapshot: ref,
 				InvocationDigests: []string{invocation},
 			}, nil
+		})
+	marker := types.RunOutcomeMarkerV1{
+		ID: 902, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID, TenantID: identity.TenantID,
+		UserID: identity.UserID, TaskID: identity.TaskID,
+	}
+	register("BeginToolRunOutcomeV2",
+		func(
+			context.Context,
+			ToolRunOutcomeBeginV2Input,
+		) (types.RunOutcomeMarkerV1, error) {
+			return marker, nil
+		})
+	var finalizedClaim types.RunOutcomeClaimV1
+	register("FinalizeToolRunOutcomeV2",
+		func(
+			_ context.Context,
+			in ToolRunOutcomeFinalizeV2Input,
+		) (types.RunOutcomeV1, error) {
+			finalizedClaim = in.Claim
+			return types.RunOutcomeV1{}, nil
 		})
 	register("ExecuteToolInvocationV2",
 		func(
@@ -1627,6 +1676,11 @@ func TestPushPipelineWorkflow_ToolV2NoMatchStopsBeforeScoreAndPush(
 		got.Counts.Qualified == nil || *got.Counts.Qualified != 0 {
 		t.Fatalf("no-match receipt = %+v", got)
 	}
+	if finalizedClaim.Result != types.RunResultQuiet ||
+		finalizedClaim.SourceCoverage != types.RunCompletenessComplete ||
+		finalizedClaim.Processing != types.RunCompletenessComplete {
+		t.Fatalf("quiet outcome claim = %+v", finalizedClaim)
+	}
 }
 
 func TestPushPipelineWorkflow_ToolProviderFailureIsNotRetried(t *testing.T) {
@@ -1636,6 +1690,11 @@ func TestPushPipelineWorkflow_ToolProviderFailureIsNotRetried(t *testing.T) {
 	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
 	invocation := snapshot.Definition.ToolCalls[0].Digest
 	var executeCalls atomic.Int32
+	marker := types.RunOutcomeMarkerV1{
+		ID: 903, SchemaVersion: types.RunOutcomeSchemaVersionV1,
+		RunSnapshotID: ref.SnapshotID, TenantID: identity.TenantID,
+		UserID: identity.UserID, TaskID: identity.TaskID,
+	}
 	env.RegisterActivityWithOptions(
 		func(context.Context, PushParams) (PrepareToolRunV2Result, error) {
 			return PrepareToolRunV2Result{
@@ -1643,6 +1702,22 @@ func TestPushPipelineWorkflow_ToolProviderFailureIsNotRetried(t *testing.T) {
 				InvocationDigests: []string{invocation},
 			}, nil
 		}, activity.RegisterOptions{Name: "PrepareToolRunV2"})
+	env.RegisterActivityWithOptions(
+		func(
+			context.Context,
+			ToolRunOutcomeBeginV2Input,
+		) (types.RunOutcomeMarkerV1, error) {
+			return marker, nil
+		}, activity.RegisterOptions{Name: "BeginToolRunOutcomeV2"})
+	var finalizedClaim types.RunOutcomeClaimV1
+	env.RegisterActivityWithOptions(
+		func(
+			_ context.Context,
+			in ToolRunOutcomeFinalizeV2Input,
+		) (types.RunOutcomeV1, error) {
+			finalizedClaim = in.Claim
+			return types.RunOutcomeV1{}, nil
+		}, activity.RegisterOptions{Name: "FinalizeToolRunOutcomeV2"})
 	env.RegisterActivityWithOptions(
 		func(
 			context.Context,
@@ -1665,5 +1740,10 @@ func TestPushPipelineWorkflow_ToolProviderFailureIsNotRetried(t *testing.T) {
 	if executeCalls.Load() != 1 {
 		t.Fatalf("Tool provider calls=%d, want exactly one",
 			executeCalls.Load())
+	}
+	if finalizedClaim.Result != types.RunResultFailed ||
+		finalizedClaim.SourceCoverage != types.RunCompletenessPartial ||
+		finalizedClaim.Processing != types.RunCompletenessPartial {
+		t.Fatalf("failed outcome claim = %+v", finalizedClaim)
 	}
 }

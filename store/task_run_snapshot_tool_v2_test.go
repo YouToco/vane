@@ -253,6 +253,49 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		t.Fatalf("authorize Source-free run: authorized=%v err=%v",
 			authorized, err)
 	}
+	t.Cleanup(func() {
+		cleanupExec(context.Background(), t, st,
+			`DELETE FROM task_run_outcomes WHERE run_snapshot_id=$1`,
+			ref.SnapshotID)
+	})
+	tamperedRef := ref
+	tamperedRef.PayloadDigest = strings.Repeat("f", 64)
+	if _, err := st.CreatePendingToolRunOutcomeV2(
+		ctx, identity, tamperedRef); !errors.Is(err, types.ErrValidation) {
+		t.Fatalf("tampered Tool outcome reference accepted: %v", err)
+	}
+	marker, err := st.CreatePendingToolRunOutcomeV2(ctx, identity, ref)
+	if err != nil {
+		t.Fatalf("create Tool run outcome marker: %v", err)
+	}
+	recoveredMarker, err := st.CreatePendingToolRunOutcomeV2(ctx, identity, ref)
+	if err != nil || recoveredMarker != marker {
+		t.Fatalf("recover Tool run outcome marker=%+v err=%v",
+			recoveredMarker, err)
+	}
+	contentClaim := types.RunOutcomeClaimV1{
+		RunOutcomeMarkerV1: marker,
+		Result:             types.RunResultContent,
+		SourceCoverage:     types.RunCompletenessComplete,
+		Processing:         types.RunCompletenessComplete,
+	}
+	contentOutcome, err := st.FinalizeToolRunOutcomeClaimV2(
+		ctx, identity, ref, contentClaim)
+	if err != nil {
+		t.Fatalf("finalize Tool run outcome: %v", err)
+	}
+	replayedOutcome, err := st.FinalizeToolRunOutcomeClaimV2(
+		ctx, identity, ref, contentClaim)
+	if err != nil || replayedOutcome != contentOutcome {
+		t.Fatalf("replay Tool run outcome=%+v err=%v", replayedOutcome, err)
+	}
+	conflictingClaim := contentClaim
+	conflictingClaim.Result = types.RunResultQuiet
+	if _, err := st.FinalizeToolRunOutcomeClaimV2(
+		ctx, identity, ref, conflictingClaim,
+	); !errors.Is(err, types.ErrConflict) {
+		t.Fatalf("different Tool run outcome replay accepted: %v", err)
+	}
 	assertToolRunSnapshotV2RecoveryWaitsForWriter(t, st, identity)
 	assertToolRunSnapshotV2AdmissionRejects(t, st, identity, ref.SnapshotID,
 		"non-v2 adaptive schema",

@@ -11,6 +11,7 @@ import (
 )
 
 const toolObservationQualificationVersionID = "compiled-tool-v2-observation-qualification-v1"
+const toolRunOutcomeVersionID = "compiled-tool-v2-run-outcome-v1"
 
 // runCompiledToolPipelineV2 is a separately versioned Source-free command
 // sequence. No V1 ref, Source activity, or confirmation step appears here.
@@ -19,7 +20,7 @@ func runCompiledToolPipelineV2(
 	p PushParams,
 	traceID string,
 	a *Activities,
-) error {
+) (retErr error) {
 	log := workflow.GetLogger(ctx)
 	info := workflow.GetInfo(ctx).WorkflowExecution
 	expected := types.RunIdentity{
@@ -51,6 +52,68 @@ func runCompiledToolPipelineV2(
 		TenantID: p.TenantID,
 		TaskID:   p.ScheduleID,
 		Snapshot: prepared.Snapshot,
+	}
+	outcomeCoverage := types.RunCompletenessPartial
+	outcomeProcessing := types.RunCompletenessComplete
+	var outcomeTerminal *runOutcomeTerminalV1
+	if workflow.GetVersion(
+		ctx, toolRunOutcomeVersionID,
+		workflow.DefaultVersion, 1,
+	) >= 1 {
+		beginCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
+		var marker types.RunOutcomeMarkerV1
+		if err := workflow.ExecuteActivity(
+			beginCtx, a.BeginToolRunOutcomeV2,
+			ToolRunOutcomeBeginV2Input{
+				UserID: p.UserID,
+				Run:    run,
+			},
+		).Get(beginCtx, &marker); err != nil {
+			return err
+		}
+		if err := marker.Validate(); err != nil ||
+			marker.RunSnapshotID != run.Snapshot.SnapshotID ||
+			marker.TenantID != run.TenantID ||
+			marker.UserID != p.UserID ||
+			marker.TaskID != run.TaskID {
+			return types.NewAppError(
+				types.CodeValidation, "Tool run outcome marker differs from run", err)
+		}
+		defer func() {
+			terminal := outcomeTerminal
+			if terminal == nil {
+				terminal = terminalRunOutcomeForError(retErr)
+			}
+			processing := outcomeProcessing
+			if retErr != nil && outcomeTerminal == nil {
+				processing = types.RunCompletenessPartial
+			}
+			claim := types.RunOutcomeClaimV1{
+				RunOutcomeMarkerV1: marker,
+				Result:             terminal.result,
+				SourceCoverage:     outcomeCoverage,
+				Processing:         processing,
+				FailureCode:        terminal.failureCode,
+				FailureMessage:     terminal.failureMessage,
+			}
+			finalizeCtx, cancel := workflow.NewDisconnectedContext(ctx)
+			defer cancel()
+			finalizeCtx = workflow.WithActivityOptions(
+				finalizeCtx, quickActivityOptions())
+			err := workflow.ExecuteActivity(
+				finalizeCtx, a.FinalizeToolRunOutcomeV2,
+				ToolRunOutcomeFinalizeV2Input{
+					UserID: p.UserID, Run: run, Claim: claim,
+				},
+			).Get(finalizeCtx, nil)
+			if err != nil {
+				log.Error("Tool run outcome finalization failed",
+					"snapshot_id", marker.RunSnapshotID, "err", err)
+				if retErr == nil {
+					retErr = err
+				}
+			}
+		}()
 	}
 	var counts types.PipelineCounts
 	recordEmpty := func(gate types.BatchExitGate) {
@@ -102,6 +165,7 @@ func runCompiledToolPipelineV2(
 	if firstExecutionErr != nil {
 		return firstExecutionErr
 	}
+	outcomeCoverage = types.RunCompletenessComplete
 	counts = counts.WithFetched(fetched)
 
 	readCtx := workflow.WithActivityOptions(ctx, quickActivityOptions())
@@ -116,6 +180,7 @@ func runCompiledToolPipelineV2(
 		return err
 	}
 	if len(candidates) == 0 {
+		outcomeTerminal = quietRunOutcomeV1()
 		recordEmpty(types.BatchExitGateFetch)
 		return nil
 	}
@@ -132,6 +197,7 @@ func runCompiledToolPipelineV2(
 	}
 	counts = counts.WithDeduped(len(deduped))
 	if len(deduped) == 0 {
+		outcomeTerminal = quietRunOutcomeV1()
 		recordEmpty(types.BatchExitGateDedup)
 		return nil
 	}
@@ -154,6 +220,8 @@ func runCompiledToolPipelineV2(
 			},
 		).Get(paidCtx, &qualified); err != nil {
 			if isQuotaFailure(err) {
+				outcomeProcessing = types.RunCompletenessPartial
+				outcomeTerminal = quietRunOutcomeV1()
 				recordEmpty(types.BatchExitGateQuota)
 				return nil
 			}
@@ -164,7 +232,9 @@ func runCompiledToolPipelineV2(
 			gate := types.BatchExitGateObservationNoMatch
 			if qualified.Outcome == "uncertain" {
 				gate = types.BatchExitGateObservationUncertain
+				outcomeProcessing = types.RunCompletenessPartial
 			}
+			outcomeTerminal = quietRunOutcomeV1()
 			recordEmpty(gate)
 			return nil
 		}
@@ -179,6 +249,8 @@ func runCompiledToolPipelineV2(
 		},
 	).Get(paidCtx, &scored); err != nil {
 		if isQuotaFailure(err) {
+			outcomeProcessing = types.RunCompletenessPartial
+			outcomeTerminal = quietRunOutcomeV1()
 			recordEmpty(types.BatchExitGateQuota)
 			return nil
 		}
@@ -186,6 +258,7 @@ func runCompiledToolPipelineV2(
 	}
 	counts = counts.WithScored(len(scored))
 	if len(scored) == 0 {
+		outcomeTerminal = quietRunOutcomeV1()
 		recordEmpty(types.BatchExitGateScore)
 		return nil
 	}
@@ -202,6 +275,7 @@ func runCompiledToolPipelineV2(
 	}
 	counts = counts.WithSelected(len(selected))
 	if len(selected) == 0 {
+		outcomeTerminal = quietRunOutcomeV1()
 		recordEmpty(types.BatchExitGateSelect)
 		return nil
 	}
@@ -217,6 +291,8 @@ func runCompiledToolPipelineV2(
 		},
 	).Get(paidCtx, &cards); err != nil {
 		if isQuotaFailure(err) {
+			outcomeProcessing = types.RunCompletenessPartial
+			outcomeTerminal = quietRunOutcomeV1()
 			recordEmpty(types.BatchExitGateQuota)
 			return nil
 		}
@@ -224,19 +300,24 @@ func runCompiledToolPipelineV2(
 	}
 	counts = counts.WithCards(len(cards))
 	if len(cards) == 0 {
+		outcomeTerminal = quietRunOutcomeV1()
 		recordEmpty(types.BatchExitGateCardGen)
 		return nil
 	}
 
 	pushCtx := workflow.WithActivityOptions(ctx, ioActivityOptions())
-	return workflow.ExecuteActivity(
+	if err := workflow.ExecuteActivity(
 		pushCtx, a.PushToolCardsV2,
 		PushToolCardsV2Input{
 			UserID: p.UserID, TraceID: traceID,
 			Run: run, Cards: cards,
 			EvidenceRequired: qualified.EvidenceRequired,
 		},
-	).Get(pushCtx, nil)
+	).Get(pushCtx, nil); err != nil {
+		return err
+	}
+	outcomeTerminal = contentRunOutcomeV1()
+	return nil
 }
 
 // Provider Tool calls and paid LLM stages are never automatically repeated

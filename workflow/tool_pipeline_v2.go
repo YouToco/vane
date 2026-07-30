@@ -33,6 +33,17 @@ type CompiledToolRunInputV2 struct {
 	Snapshot types.RunSnapshotRefV2 `json:"snapshot"`
 }
 
+type ToolRunOutcomeBeginV2Input struct {
+	UserID int64                  `json:"user_id"`
+	Run    CompiledToolRunInputV2 `json:"run"`
+}
+
+type ToolRunOutcomeFinalizeV2Input struct {
+	UserID int64                   `json:"user_id"`
+	Run    CompiledToolRunInputV2  `json:"run"`
+	Claim  types.RunOutcomeClaimV1 `json:"claim"`
+}
+
 type DedupToolCandidatesV2Input struct {
 	UserID     int64                        `json:"user_id"`
 	TraceID    string                       `json:"trace_id"`

@@ -360,6 +360,16 @@ type RunOutcomeStoreV1 interface {
 	) (types.RunOutcomeV1, error)
 }
 
+type RunOutcomeStoreV2 interface {
+	CreatePendingToolRunOutcomeV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2,
+	) (types.RunOutcomeMarkerV1, error)
+	FinalizeToolRunOutcomeClaimV2(
+		context.Context, types.RunIdentity, types.RunSnapshotRefV2,
+		types.RunOutcomeClaimV1,
+	) (types.RunOutcomeV1, error)
+}
+
 type CanonicalBriefStoreV1 interface {
 	LoadPreparedBriefDraftV1(
 		context.Context, types.RunIdentity, types.RunSnapshotRef,
@@ -531,6 +541,7 @@ type Activities struct {
 	compiledStore                    CompiledRunStore
 	compiledToolStoreV2              CompiledToolRunStoreV2
 	runOutcomeStore                  RunOutcomeStoreV1
+	runOutcomeStoreV2                RunOutcomeStoreV2
 	canonicalBriefStore              CanonicalBriefStoreV1
 	buildCompiledPolicyV1            CompiledPolicyBuilderV1
 	buildCompiledToolPolicyV2        CompiledPolicyBuilderV1
@@ -685,6 +696,12 @@ func WithExecutiveBriefRuntimeV1(
 func WithRunOutcomeStoreV1(st RunOutcomeStoreV1) ActivitiesOption {
 	return func(a *Activities) {
 		a.runOutcomeStore = st
+	}
+}
+
+func WithRunOutcomeStoreV2(st RunOutcomeStoreV2) ActivitiesOption {
+	return func(a *Activities) {
+		a.runOutcomeStoreV2 = st
 	}
 }
 
@@ -1348,6 +1365,47 @@ func (a *Activities) FinalizeRunOutcomeV1(
 		return types.RunOutcomeV1{}, nonRetryable(err)
 	}
 	outcome, err := a.runOutcomeStore.FinalizeRunOutcomeClaimV1(
+		ctx, expected, in.Run.Snapshot, in.Claim)
+	if err != nil {
+		return types.RunOutcomeV1{}, retryableOrNot(err)
+	}
+	return outcome, nil
+}
+
+// BeginToolRunOutcomeV2 binds the shared outcome fact to an exact immutable
+// Source-free Tool snapshot. It remains a distinct Activity so V1 and V2
+// references cannot be mixed accidentally.
+func (a *Activities) BeginToolRunOutcomeV2(
+	ctx context.Context, in ToolRunOutcomeBeginV2Input,
+) (types.RunOutcomeMarkerV1, error) {
+	if a.runOutcomeStoreV2 == nil {
+		return types.RunOutcomeMarkerV1{}, nonRetryable(types.NewAppError(
+			types.CodeInternal, "Tool run outcome store is not configured", nil))
+	}
+	expected, err := activityToolRunIdentityV2(ctx, in.UserID, in.Run)
+	if err != nil {
+		return types.RunOutcomeMarkerV1{}, nonRetryable(err)
+	}
+	marker, err := a.runOutcomeStoreV2.CreatePendingToolRunOutcomeV2(
+		ctx, expected, in.Run.Snapshot)
+	if err != nil {
+		return types.RunOutcomeMarkerV1{}, retryableOrNot(err)
+	}
+	return marker, nil
+}
+
+func (a *Activities) FinalizeToolRunOutcomeV2(
+	ctx context.Context, in ToolRunOutcomeFinalizeV2Input,
+) (types.RunOutcomeV1, error) {
+	if a.runOutcomeStoreV2 == nil {
+		return types.RunOutcomeV1{}, nonRetryable(types.NewAppError(
+			types.CodeInternal, "Tool run outcome store is not configured", nil))
+	}
+	expected, err := activityToolRunIdentityV2(ctx, in.UserID, in.Run)
+	if err != nil {
+		return types.RunOutcomeV1{}, nonRetryable(err)
+	}
+	outcome, err := a.runOutcomeStoreV2.FinalizeToolRunOutcomeClaimV2(
 		ctx, expected, in.Run.Snapshot, in.Claim)
 	if err != nil {
 		return types.RunOutcomeV1{}, retryableOrNot(err)

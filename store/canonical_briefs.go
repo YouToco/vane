@@ -97,7 +97,47 @@ func (s *Store) CreatePendingRunOutcomeV1(
 		return types.RunOutcomeMarkerV1{}, err
 	}
 	defer rollbackCompiledTaskTx(ctx, tx)
-	if err := lockCanonicalBriefRunV1(ctx, tx, ref.SnapshotID); err != nil {
+	marker, err := createPendingRunOutcomeTxV1(
+		ctx, tx, expected, ref.SnapshotID)
+	if err != nil {
+		return types.RunOutcomeMarkerV1{}, err
+	}
+	if err := commitCanonicalBriefTxV1(ctx, tx, "commit run outcome marker"); err != nil {
+		return types.RunOutcomeMarkerV1{}, err
+	}
+	return marker, nil
+}
+
+// CreatePendingToolRunOutcomeV2 uses the same immutable outcome fact while
+// requiring an exact V2 reference at the store boundary.
+func (s *Store) CreatePendingToolRunOutcomeV2(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRefV2,
+) (types.RunOutcomeMarkerV1, error) {
+	tx, err := s.beginCanonicalBriefTxV2(ctx, expected, ref)
+	if err != nil {
+		return types.RunOutcomeMarkerV1{}, err
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+	marker, err := createPendingRunOutcomeTxV1(
+		ctx, tx, expected, ref.SnapshotID)
+	if err != nil {
+		return types.RunOutcomeMarkerV1{}, err
+	}
+	if err := commitCanonicalBriefTxV1(ctx, tx, "commit Tool run outcome marker"); err != nil {
+		return types.RunOutcomeMarkerV1{}, err
+	}
+	return marker, nil
+}
+
+func createPendingRunOutcomeTxV1(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected types.RunIdentity,
+	snapshotID int64,
+) (types.RunOutcomeMarkerV1, error) {
+	if err := lockCanonicalBriefRunV1(ctx, tx, snapshotID); err != nil {
 		return types.RunOutcomeMarkerV1{}, err
 	}
 	var recoveryAvailable bool
@@ -118,7 +158,7 @@ func (s *Store) CreatePendingRunOutcomeV1(
 	}
 
 	stored, found, err := loadRunOutcomeForSnapshotV1(
-		ctx, tx, ref.SnapshotID, false)
+		ctx, tx, snapshotID, false)
 	if err != nil {
 		return types.RunOutcomeMarkerV1{}, err
 	}
@@ -130,9 +170,6 @@ func (s *Store) CreatePendingRunOutcomeV1(
 			marker.TaskID != expected.TaskID {
 			return types.RunOutcomeMarkerV1{}, canonicalBriefIntegrityError()
 		}
-		if err := commitCanonicalBriefTxV1(ctx, tx, "recover run outcome marker"); err != nil {
-			return types.RunOutcomeMarkerV1{}, err
-		}
 		return marker, nil
 	}
 
@@ -142,7 +179,7 @@ func (s *Store) CreatePendingRunOutcomeV1(
 		 ) VALUES ($1,$2,$3,$4,$5)
 		 RETURNING `+runOutcomeColumnsV1,
 		expected.TenantID, expected.UserID, expected.TaskID,
-		ref.SnapshotID, types.RunOutcomeSchemaVersionV1,
+		snapshotID, types.RunOutcomeSchemaVersionV1,
 	))
 	if err != nil {
 		return types.RunOutcomeMarkerV1{},
@@ -151,9 +188,6 @@ func (s *Store) CreatePendingRunOutcomeV1(
 	marker := stored.marker()
 	if err := marker.Validate(); err != nil {
 		return types.RunOutcomeMarkerV1{}, canonicalBriefIntegrityError()
-	}
-	if err := commitCanonicalBriefTxV1(ctx, tx, "commit run outcome marker"); err != nil {
-		return types.RunOutcomeMarkerV1{}, err
 	}
 	return marker, nil
 }
@@ -264,6 +298,47 @@ func (s *Store) FinalizeRunOutcomeClaimV1(
 		return types.RunOutcomeV1{}, err
 	}
 	return outcome, nil
+}
+
+func (s *Store) FinalizeToolRunOutcomeClaimV2(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRefV2,
+	claim types.RunOutcomeClaimV1,
+) (types.RunOutcomeV1, error) {
+	if err := validateRunOutcomeClaimForExpectedV1(
+		claim, expected, ref.SnapshotID); err != nil {
+		return types.RunOutcomeV1{},
+			canonicalBriefValidationError("Tool run outcome claim is invalid")
+	}
+	tx, err := s.beginCanonicalBriefTxV2(ctx, expected, ref)
+	if err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	defer rollbackCompiledTaskTx(ctx, tx)
+	outcome, err := finalizeRunOutcomeClaimTxV1(ctx, tx, claim)
+	if err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	if err := commitCanonicalBriefTxV1(ctx, tx, "commit Tool run outcome claim"); err != nil {
+		return types.RunOutcomeV1{}, err
+	}
+	return outcome, nil
+}
+
+func validateRunOutcomeClaimForExpectedV1(
+	claim types.RunOutcomeClaimV1,
+	expected types.RunIdentity,
+	snapshotID int64,
+) error {
+	if err := claim.Validate(); err != nil ||
+		claim.RunSnapshotID != snapshotID ||
+		claim.TenantID != expected.TenantID ||
+		claim.UserID != expected.UserID ||
+		claim.TaskID != expected.TaskID {
+		return canonicalBriefValidationError("run outcome claim is invalid")
+	}
+	return nil
 }
 
 func finalizeRunOutcomeClaimTxV1(
@@ -1273,6 +1348,34 @@ func (s *Store) beginCanonicalBriefTxV1(
 		return nil, canonicalBriefValidationError(
 			"canonical brief run reference is invalid")
 	}
+	return s.beginCanonicalBriefTxForReferenceV1(
+		ctx, expected, ref.SnapshotID, ref.SchemaVersion,
+		ref.ReferenceDigest, ref.PayloadDigest)
+}
+
+func (s *Store) beginCanonicalBriefTxV2(
+	ctx context.Context,
+	expected types.RunIdentity,
+	ref types.RunSnapshotRefV2,
+) (pgx.Tx, error) {
+	if err := validateTaskRunSnapshotReferenceForExpectedV2(
+		ref, expected); err != nil || ref.SnapshotID <= 0 {
+		return nil, canonicalBriefValidationError(
+			"Tool run outcome reference is invalid")
+	}
+	return s.beginCanonicalBriefTxForReferenceV1(
+		ctx, expected, ref.SnapshotID, ref.SchemaVersion,
+		ref.ReferenceDigest, ref.PayloadDigest)
+}
+
+func (s *Store) beginCanonicalBriefTxForReferenceV1(
+	ctx context.Context,
+	expected types.RunIdentity,
+	snapshotID int64,
+	schemaVersion string,
+	referenceDigest string,
+	payloadDigest string,
+) (pgx.Tx, error) {
 	tx, err := s.beginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, canonicalBriefDatabaseError(
@@ -1326,9 +1429,9 @@ func (s *Store) beginCanonicalBriefTxV1(
 		    AND temporal_workflow_id=$3 AND temporal_run_id=$4
 		    AND reference_schema_version=$5
 		    AND reference_digest=$6 AND payload_digest=$7`,
-		ref.SnapshotID, expected.TaskID,
+		snapshotID, expected.TaskID,
 		expected.TemporalWorkflowID, expected.TemporalRunID,
-		ref.SchemaVersion, ref.ReferenceDigest, ref.PayloadDigest,
+		schemaVersion, referenceDigest, payloadDigest,
 	).Scan(&exact)
 	if errors.Is(err, pgx.ErrNoRows) || !exact {
 		rollbackCompiledTaskTx(ctx, tx)

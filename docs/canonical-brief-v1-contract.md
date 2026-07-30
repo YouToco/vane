@@ -13,6 +13,9 @@ and remains off by default.
   `task_run_snapshots.id`; a database admission trigger proves existence and
   binds the exact tenant, user, and task scope. Runtime roles cannot delete
   snapshots, and tenant purge deletes outcomes before snapshots.
+- Source-free Tool V2 snapshots reuse this outcome fact and recovery lifecycle
+  through a distinct typed reference boundary; they do not participate in
+  canonical Brief staging.
 - One finalized content outcome may own one `brief_snapshots` row.
 - A Brief binds one exact compiled `push_batches` row from the same run.
 - `InsightV1.ID` is the existing `deliveries.id`. Phase 1 therefore preserves
