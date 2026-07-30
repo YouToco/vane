@@ -141,7 +141,7 @@ func TestValidateQualifiedEventsEnforcesManualEvidencePair(t *testing.T) {
 	}
 	items := []types.ContentItem{
 		{
-			ID: 21, URL: "https://official.example/release",
+			ID: 21, URL: "https://openai.com/release",
 			Content: "official release body", PublishedAt: &officialAt,
 		},
 		{
@@ -163,7 +163,7 @@ func TestValidateQualifiedEventsEnforcesManualEvidencePair(t *testing.T) {
 	activities := &Activities{}
 	got, outcome, err := activities.validateQualifiedEvents(
 		policy, digest, window, items,
-		"必须有官方原文交叉核验；输出交叉证据。", result)
+		"监控 OpenAI；必须有官方原文交叉核验；输出交叉证据。", result)
 	if err != nil || outcome != "match" || len(got) != 1 {
 		t.Fatalf("manual evidence pair got=%+v outcome=%q err=%v",
 			got, outcome, err)
@@ -171,9 +171,27 @@ func TestValidateQualifiedEventsEnforcesManualEvidencePair(t *testing.T) {
 	result.Events[0].EvidenceContentIDs = []int64{21}
 	if _, _, err := activities.validateQualifiedEvents(
 		policy, digest, window, items,
-		"必须有官方原文交叉核验；输出交叉证据。", result,
+		"监控 OpenAI；必须有官方原文交叉核验；输出交叉证据。", result,
 	); err == nil {
 		t.Fatal("manual cross-evidence requirement admitted one source")
+	}
+}
+
+func TestOfficialHostGroundedInTaskManualRejectsPathImpersonation(t *testing.T) {
+	manual := "监控 OpenAI、Anthropic 和 Google DeepMind 的官方原文。"
+	for rawURL, want := range map[string]bool{
+		"https://openai.com/index/model":                  true,
+		"https://www.anthropic.com/news/model":            true,
+		"https://ai.google.dev/gemini-api/docs/changelog": true,
+		"https://deepmind.google/discover/blog/model":     true,
+		"https://releasebot.io/updates/anthropic/model":   false,
+		"https://media.example/openai/model":              false,
+		"http://openai.com/insecure":                      false,
+	} {
+		if got := officialHostGroundedInTaskManual(rawURL, manual); got != want {
+			t.Errorf("officialHostGroundedInTaskManual(%q)=%t want %t",
+				rawURL, got, want)
+		}
 	}
 }
 

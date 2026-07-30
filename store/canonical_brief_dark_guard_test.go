@@ -48,7 +48,8 @@ func TestCanonicalBriefP1EHasOnlyScopedProductionCallPoints(t *testing.T) {
 			"workflow/activities.go": true,
 		},
 		"GenerateStructuredWithEvidencePolicyV3": {
-			"workflow/activities.go": true,
+			"workflow/activities.go":       true,
+			"workflow/tool_pipeline_v2.go": true,
 		},
 		"LoadSealedEmptyBriefBatchV1": {
 			"workflow/activities.go": true,

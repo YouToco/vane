@@ -40,8 +40,9 @@ func BuildCurrentCompiledV1(input CurrentCompiledV1Input) (runtimepolicy.BundleV
 }
 
 // BuildStructuredInsightCompiledV1 preserves the compiled policy envelope but
-// freezes CardGen renderer v2 and its one-call request parameters. It is used
-// only by the independent exact-task Phase 2-A runtime.
+// freezes CardGen renderer v2 and its one-call request parameters. Structured
+// compiled runtimes, including the Source-free Tool pipeline, share this one
+// policy builder instead of maintaining another card-generation policy branch.
 func BuildStructuredInsightCompiledV1(
 	input CurrentCompiledV1Input,
 ) (runtimepolicy.BundleV1, error) {

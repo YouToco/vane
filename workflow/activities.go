@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"go.temporal.io/sdk/activity"
@@ -2991,10 +2992,20 @@ func (a *Activities) validateQualifiedEvents(
 		}
 		if requireOfficial &&
 			(strings.TrimSpace(primary.URL) == "" ||
-				strings.TrimSpace(primary.Content) == "") {
+				strings.TrimSpace(primary.Content) == "" ||
+				(policy.Evidence.Requirement !=
+					observation.EvidenceOfficialRequired &&
+					!officialHostGroundedInTaskManual(
+						primary.URL, taskManual))) {
 			return nil, "", nonRetryable(types.NewAppError(
 				types.CodeValidation,
 				"qualified event lacks a live official page candidate", nil))
+		}
+		if requireCross &&
+			!hasIndependentEvidenceHost(primary, event.EvidenceContentIDs[1:], byID) {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"qualified event lacks an independent evidence host", nil))
 		}
 		if _, duplicate := seenPrimary[primary.ID]; duplicate {
 			return nil, "", nonRetryable(types.NewAppError(
@@ -3023,6 +3034,77 @@ func (a *Activities) validateQualifiedEvents(
 		return nil, "no_match", nil
 	}
 	return out, "match", nil
+}
+
+// officialHostGroundedInTaskManual is the Source-free official-page guard for
+// tasks that intentionally do not pre-register domains. It accepts only a
+// meaningful hostname label explicitly named by the user's task manual. URL
+// paths and page titles never participate, so an aggregator URL such as
+// releasebot.io/.../anthropic cannot impersonate anthropic.com.
+func officialHostGroundedInTaskManual(rawURL, taskManual string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
+		return false
+	}
+	manualTokens := make(map[string]struct{})
+	for _, token := range strings.FieldsFunc(
+		strings.ToLower(taskManual),
+		func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) },
+	) {
+		if len([]rune(token)) >= 3 {
+			manualTokens[token] = struct{}{}
+		}
+	}
+	generic := map[string]struct{}{
+		"www": {}, "com": {}, "org": {}, "net": {}, "io": {}, "co": {},
+		"app": {}, "apps": {}, "api": {}, "dev": {}, "docs": {},
+		"developer": {}, "developers": {}, "cloud": {}, "blog": {},
+		"news": {}, "help": {}, "support": {}, "platform": {},
+		"research": {}, "labs": {}, "status": {},
+	}
+	for _, label := range strings.Split(
+		strings.TrimSuffix(strings.ToLower(parsed.Hostname()), "."), ".",
+	) {
+		if len(label) < 3 {
+			continue
+		}
+		if _, skip := generic[label]; skip {
+			continue
+		}
+		if _, explicit := manualTokens[label]; explicit {
+			return true
+		}
+	}
+	return false
+}
+
+func hasIndependentEvidenceHost(
+	primary types.ContentItem,
+	crossIDs []int64,
+	byID map[int64]types.ContentItem,
+) bool {
+	primaryHost := evidenceHostname(primary.URL)
+	if primaryHost == "" {
+		return false
+	}
+	for _, contentID := range crossIDs {
+		if candidate, ok := byID[contentID]; ok {
+			host := evidenceHostname(candidate.URL)
+			if host != "" && host != primaryHost {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func evidenceHostname(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
+		return ""
+	}
+	return strings.TrimPrefix(
+		strings.TrimSuffix(strings.ToLower(parsed.Hostname()), "."), "www.")
 }
 
 func taskManualRequiresOfficialOriginal(taskManual string) bool {

@@ -217,7 +217,7 @@ func run() error {
 					return runtimepolicy.BundleV1{}, err
 				}
 				_ = quota
-				return runtimeconfig.BuildCurrentCompiledV1(runtimeconfig.CurrentCompiledV1Input{
+				return runtimeconfig.BuildStructuredInsightCompiledV1(runtimeconfig.CurrentCompiledV1Input{
 					Model:                      cfg.LLM.Model,
 					TaskInstructionEnabled:     taskInstructionEnabled,
 					ModelEndpointGeneration:    cfg.LLM.CompiledEndpointGeneration,

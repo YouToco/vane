@@ -299,16 +299,69 @@ func renderGroundedEvidenceBodyV1(
 		return "", types.NewAppError(types.CodeValidation,
 			"cardgen evidence output lacks required semantic fields", nil)
 	}
+	rendered, err := renderGroundedEvidenceFieldsV1(
+		fields["变化"], fields["影响判断"], taskInstruction, sources)
+	if err != nil {
+		return "", err
+	}
+	if err := ValidateGroundedEvidenceBodyV1(
+		rendered, taskInstruction, sources,
+	); err != nil {
+		return "", err
+	}
+	return rendered, nil
+}
+
+// RenderGroundedEvidenceInsightV1 turns a validated structured model result
+// into the user-requested four-field body. The model supplies only semantics;
+// code owns field labels and exact current-run evidence links.
+func RenderGroundedEvidenceInsightV1(
+	insight types.StructuredInsightV1,
+	taskInstruction string,
+	sources []EventEvidenceSourceV1,
+) (string, error) {
+	if _, err := EventEvidenceCorpusV1(sources); err != nil {
+		return "", types.NewAppError(types.CodeValidation,
+			"structured card evidence is invalid", err)
+	}
+	if !manualRequiresEvidenceOutputV1(taskInstruction) {
+		body := strings.TrimSpace(insight.BodyMD)
+		if body == "" || unsafeSemanticLinkV1.MatchString(body) {
+			return "", types.NewAppError(types.CodeValidation,
+				"structured card body is invalid", nil)
+		}
+		return body, nil
+	}
+	return renderGroundedEvidenceFieldsV1(
+		insight.WhatChanged, insight.WhyItMatters,
+		taskInstruction, sources)
+}
+
+func renderGroundedEvidenceFieldsV1(
+	change string,
+	impact string,
+	taskInstruction string,
+	sources []EventEvidenceSourceV1,
+) (string, error) {
+	change = plainSemanticFieldV1(change)
+	impact = plainSemanticFieldV1(impact)
+	if change == "" || impact == "" ||
+		unsafeSemanticLinkV1.MatchString(change) ||
+		unsafeSemanticLinkV1.MatchString(impact) ||
+		len(sources) < 2 {
+		return "", types.NewAppError(types.CodeValidation,
+			"cardgen evidence output lacks required semantic fields", nil)
+	}
 	official := groundedEvidenceLinkV1(sources[0])
 	cross := make([]string, 0, len(sources)-1)
 	for _, source := range sources[1:] {
 		cross = append(cross, groundedEvidenceLinkV1(source))
 	}
 	labels := evidenceOutputLabelsV1(taskInstruction)
-	rendered := labels.change + fields["变化"] +
+	rendered := labels.change + change +
 		"\n\n" + labels.official + official +
 		"\n\n" + labels.cross + strings.Join(cross, "；") +
-		"\n\n" + labels.impact + fields["影响判断"]
+		"\n\n" + labels.impact + impact
 	if err := ValidateGroundedEvidenceBodyV1(
 		rendered, taskInstruction, sources,
 	); err != nil {

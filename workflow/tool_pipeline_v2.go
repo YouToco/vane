@@ -802,14 +802,45 @@ func (a *Activities) CardGenToolCandidatesV2(
 		return nil, nonRetryable(types.NewAppError(types.CodeValidation,
 			"compiled Tool card model route is unavailable", err))
 	}
-	consumer, ok := a.cardgen.(compiledCardGeneratorV1)
-	if !ok {
-		return nil, nonRetryable(types.NewAppError(types.CodeInternal,
-			"compiled Tool card generator is unsupported", nil))
+	rendererVersion := snapshot.Policy.PromptPolicy.CardGen.RendererVersion
+	var (
+		ok               bool
+		legacyConsumer   compiledCardGeneratorV1
+		legacyEvidence   compiledEvidenceCardGeneratorV1
+		legacyPolicy     cardgenpkg.PolicyV1
+		structured       compiledCardGeneratorV2
+		structuredEvents compiledCardGeneratorV3
+		structuredPolicy cardgenpkg.PolicyV2
+	)
+	switch rendererVersion {
+	case cardgenpkg.RendererVersionV1:
+		legacyConsumer, ok = a.cardgen.(compiledCardGeneratorV1)
+		if !ok {
+			return nil, nonRetryable(types.NewAppError(types.CodeInternal,
+				"compiled Tool card generator v1 is unsupported", nil))
+		}
+		legacyEvidence, _ =
+			a.cardgen.(compiledEvidenceCardGeneratorV1)
+		legacyPolicy, err = cardgenpkg.PrepareCompiledPolicyV1(
+			snapshot.Policy.PromptPolicy, snapshot.Policy.ModelPolicy,
+			snapshot.Policy.QuotaPolicy, modelClient)
+	case cardgenpkg.RendererVersionV2:
+		structured, ok = a.cardgen.(compiledCardGeneratorV2)
+		if !ok {
+			return nil, nonRetryable(types.NewAppError(types.CodeInternal,
+				"compiled Tool card generator v2 is unsupported", nil))
+		}
+		structuredEvents, ok = a.cardgen.(compiledCardGeneratorV3)
+		if !ok {
+			return nil, nonRetryable(types.NewAppError(types.CodeInternal,
+				"compiled Tool evidence card generator v3 is unsupported", nil))
+		}
+		structuredPolicy, err = cardgenpkg.PrepareCompiledPolicyV2(
+			snapshot.Policy.PromptPolicy, snapshot.Policy.ModelPolicy,
+			snapshot.Policy.QuotaPolicy, modelClient)
+	default:
+		err = runtimepolicy.ErrInvalidPolicy
 	}
-	policy, err := cardgenpkg.PrepareCompiledPolicyV1(
-		snapshot.Policy.PromptPolicy, snapshot.Policy.ModelPolicy,
-		snapshot.Policy.QuotaPolicy, modelClient)
 	if err != nil {
 		return nil, nonRetryable(types.NewAppError(types.CodeValidation,
 			"compiled Tool card policy is invalid", err))
@@ -819,6 +850,7 @@ func (a *Activities) CardGenToolCandidatesV2(
 		taskManual = snapshot.Definition.TaskManual
 	}
 	var quotaHit atomic.Bool
+	var validationRejected atomic.Bool
 	var authorizationOnce sync.Once
 	var authorizationErr error
 	cards := mapConcurrent(ctx, in.Candidates, parBatchFanout,
@@ -847,24 +879,45 @@ func (a *Activities) CardGenToolCandidatesV2(
 					"compiled Tool card candidate lacks required evidence",
 					nil)
 			}
-			if len(evidence) > 0 {
-				evidenceConsumer, ok :=
-					a.cardgen.(compiledEvidenceCardGeneratorV1)
-				if !ok {
-					return ToolGeneratedCardV1{}, types.NewAppError(
-						types.CodeInternal,
-						"compiled Tool evidence card generator is unsupported",
-						nil)
+			switch rendererVersion {
+			case cardgenpkg.RendererVersionV1:
+				if len(evidence) > 0 {
+					if legacyEvidence == nil {
+						return ToolGeneratedCardV1{}, types.NewAppError(
+							types.CodeInternal,
+							"compiled Tool evidence card generator v1 is unsupported",
+							nil)
+					}
+					body, err = legacyEvidence.GenerateWithEvidencePolicyV1(
+						ctx, snapshot.Definition.TenantID, in.UserID,
+						candidate.Scored, evidence, in.TraceID,
+						taskManual, legacyPolicy, beforeSpend)
+				} else {
+					body, err = legacyConsumer.GenerateWithPolicyV1(
+						ctx, snapshot.Definition.TenantID, in.UserID,
+						candidate.Scored, in.TraceID,
+						taskManual, legacyPolicy, beforeSpend)
 				}
-				body, err = evidenceConsumer.GenerateWithEvidencePolicyV1(
-					ctx, snapshot.Definition.TenantID, in.UserID,
-					candidate.Scored, evidence, in.TraceID,
-					taskManual, policy, beforeSpend)
-			} else {
-				body, err = consumer.GenerateWithPolicyV1(
-					ctx, snapshot.Definition.TenantID, in.UserID,
-					candidate.Scored, in.TraceID,
-					taskManual, policy, beforeSpend)
+			case cardgenpkg.RendererVersionV2:
+				var insight types.StructuredInsightV1
+				if len(evidence) > 0 {
+					insight, err =
+						structuredEvents.GenerateStructuredWithEvidencePolicyV3(
+							ctx, snapshot.Definition.TenantID, in.UserID,
+							candidate.Scored, evidence, in.TraceID,
+							taskManual, structuredPolicy, beforeSpend)
+					if err == nil {
+						body, err =
+							cardgenpkg.RenderGroundedEvidenceInsightV1(
+								insight, taskManual, evidence)
+					}
+				} else {
+					insight, err = structured.GenerateStructuredWithPolicyV2(
+						ctx, snapshot.Definition.TenantID, in.UserID,
+						candidate.Scored, in.TraceID,
+						taskManual, structuredPolicy, beforeSpend)
+					body = insight.BodyMD
+				}
 			}
 			if err != nil {
 				return ToolGeneratedCardV1{}, err
@@ -897,6 +950,9 @@ func (a *Activities) CardGenToolCandidatesV2(
 			if isQuotaErr(err) {
 				quotaHit.Store(true)
 			}
+			if types.CodeOf(err) == types.CodeValidation {
+				validationRejected.Store(true)
+			}
 			logPipelineItemFailure(ctx,
 				"Tool V2 card generation failed; item skipped",
 				candidate.Scored.Item.ID, in.TraceID, err)
@@ -909,6 +965,11 @@ func (a *Activities) CardGenToolCandidatesV2(
 			return nil, nonRetryable(types.NewAppError(
 				types.CodeQuotaExceeded,
 				"compiled Tool LLM quota exhausted during card generation", nil))
+		}
+		if validationRejected.Load() {
+			return nil, nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"compiled Tool card output was rejected", nil))
 		}
 		return nil, types.NewAppError(types.CodeLLMUnavailable,
 			"compiled Tool card generation batch failed", nil)

@@ -592,7 +592,7 @@ func TestGenerateWithEvidencePolicyV1RejectsModelAuthoredURL(t *testing.T) {
 	}
 	cg, _ := newTestCardGen(t, http.StatusOK,
 		"变化：发布新模型\n官方原文：https://fake.example\n影响判断：可使用", nil)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	sources := []EventEvidenceSourceV1{
 		{
 			ContentItemID: 81,
@@ -620,6 +620,53 @@ func TestGenerateWithEvidencePolicyV1RejectsModelAuthoredURL(t *testing.T) {
 		policy, nil)
 	if err == nil || types.CodeOf(err) != types.CodeValidation {
 		t.Fatalf("model-authored URL err=%v", err)
+	}
+}
+
+func TestRenderGroundedEvidenceInsightV1OwnsFourFieldShape(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	sources := []EventEvidenceSourceV1{
+		{
+			ContentItemID: 91,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-1", Title: "official",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://openai.com/release", DiscoveredAt: now,
+			},
+			EvidenceText: "official release",
+		},
+		{
+			ContentItemID: 92,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-2", Title: "independent",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://media.example/report", DiscoveredAt: now,
+			},
+			EvidenceText: "independent report",
+		},
+	}
+	body, err := RenderGroundedEvidenceInsightV1(
+		types.StructuredInsightV1{
+			SchemaVersion: StructuredInsightSchemaV1,
+			BodyMD:        "模型可以自由组织正文",
+			WhatChanged:   "发布了新模型",
+			WhyItMatters:  "开发者获得新能力",
+		},
+		"固定输出：变化、官方原文、交叉证据、影响判断。",
+		sources,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"**变化：** 发布了新模型",
+		"**官方原文：** [official](https://openai.com/release)",
+		"**交叉证据：** [independent](https://media.example/report)",
+		"**影响判断：** 开发者获得新能力",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("grounded structured body omitted %q: %q", required, body)
+		}
 	}
 }
 

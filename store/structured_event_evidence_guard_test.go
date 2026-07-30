@@ -87,6 +87,7 @@ func TestStructuredEventEvidenceV1HasExactProductionCallPoints(
 		},
 		"GenerateStructuredWithEvidencePolicyV3": {
 			"workflow/activities.go:cardGen",
+			"workflow/tool_pipeline_v2.go:CardGenToolCandidatesV2",
 		},
 		"PrepareBriefDraftV3": {
 			"workflow/activities.go:PrepareCanonicalBriefV1",
