@@ -2,12 +2,19 @@ import { describe, expect, test } from "vitest";
 import {
   normalizeSchedule,
   normalizeScheduleDetail,
+  normalizeTaskHealth,
   type ScheduleRunSummary,
 } from "@/api";
 import {
   nextRunPresentation,
   taskDefinitionEditEnabled,
 } from "@/lib/task-detail-contract";
+import { LOCALES } from "@/i18n";
+import {
+  taskHealthCopy,
+  taskHealthLoadingCopy,
+  taskHealthUnavailableCopy,
+} from "@/i18n/task-health";
 
 const summary: ScheduleRunSummary = {
   schedule_id: "task-1",
@@ -16,7 +23,6 @@ const summary: ScheduleRunSummary = {
   batches_7d: 0,
   empty_batches_7d: 0,
   sent_pushes_7d: 0,
-  source_count: 0,
 };
 
 function rawDetail(capabilities?: unknown) {
@@ -30,7 +36,6 @@ function rawDetail(capabilities?: unknown) {
       next_run_state: "none",
     },
     summary,
-    sources: null,
     cost: { llm_cost_usd: 0, llm_calls: 0 },
     ...(capabilities === undefined ? {} : { capabilities }),
   };
@@ -57,6 +62,74 @@ describe("task detail capability contract", () => {
     const detail = normalizeScheduleDetail(rawDetail(capabilities));
     expect(detail.capabilities.definition_edit).toBe(expected);
     expect(taskDefinitionEditEnabled(detail)).toBe(expected);
+  });
+});
+
+describe("task health projection contract", () => {
+  const raw = {
+    schema_version: "vane.task-health/v1",
+    state: "healthy",
+    acquisition: { total: 2, failing: 0, max_fail_count: 0 },
+    usage: {
+      known_cost_usd: 1.25,
+      coverage: "llm_only",
+      llm_calls: 3,
+      budget_state: "not_configured",
+    },
+    permissions: {
+      role: "owner",
+      can_run: true,
+      can_pause: true,
+      can_edit: true,
+      can_delete: true,
+      can_view_usage: true,
+    },
+  };
+
+  test("accepts the exact server projection", () => {
+    expect(normalizeTaskHealth(raw)).toEqual(raw);
+  });
+
+  test("fails closed when permissions or acquisition shape are not exact", () => {
+    expect(
+      normalizeTaskHealth({
+        ...raw,
+        permissions: { ...raw.permissions, can_delete: "yes" },
+      }),
+    ).toBeUndefined();
+    expect(
+      normalizeTaskHealth({
+        ...raw,
+        acquisition: { total: 1, failing: 2, max_fail_count: 2 },
+      }),
+    ).toBeUndefined();
+  });
+
+  test("does not expose usage when the account lacks usage permission", () => {
+    const health = normalizeTaskHealth({
+      ...raw,
+      permissions: { ...raw.permissions, can_view_usage: false },
+    });
+    expect(health).toBeDefined();
+    expect(health).not.toHaveProperty("usage");
+  });
+});
+
+describe("task health localization contract", () => {
+  test("every supported locale has its own task health copy", () => {
+    const english = taskHealthCopy("en");
+    for (const { code } of LOCALES) {
+      const copy = taskHealthCopy(code);
+      expect(copy.title).toBeTruthy();
+      expect(taskHealthLoadingCopy(code)).toBeTruthy();
+      expect(taskHealthUnavailableCopy(code)).toBeTruthy();
+      if (code !== "en") {
+        expect(copy.title).not.toBe(english.title);
+      }
+    }
+    expect(taskHealthCopy("zh-Hant").title).not.toBe(
+      taskHealthCopy("zh").title,
+    );
   });
 });
 

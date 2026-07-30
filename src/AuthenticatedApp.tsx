@@ -21,7 +21,6 @@ import {
   Home as HomeIcon,
   ListTodo,
   Send,
-  Rss,
   User,
   MessageSquare,
   ShieldCheck,
@@ -46,7 +45,6 @@ const Home = lazy(() => import("./pages/Home"));
 const TaskDashboard = lazy(() => import("./pages/TaskDashboard"));
 const TaskDetail = lazy(() => import("./pages/TaskDetail"));
 const History = lazy(() => import("./pages/History"));
-const Sources = lazy(() => import("./pages/Sources"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Admin = lazy(() => import("./pages/Admin"));
 
@@ -69,7 +67,6 @@ function useNav() {
         { hash: "#/", label: N.home, icon: HomeIcon },
         { hash: "#/tasks", label: N.tasks, icon: ListTodo },
         { hash: "#/history", label: N.history, icon: Send },
-        { hash: "#/sources", label: N.sources, icon: Rss },
       ],
     },
     {
@@ -109,8 +106,6 @@ function renderPage(
       return <TaskDashboard actorScope={actorScope} />;
     case "#/history":
       return <History />;
-    case "#/sources":
-      return <Sources />;
     case "#/settings":
     case "#/settings/channel":
       return <Settings hash={hash} />;

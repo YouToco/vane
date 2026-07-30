@@ -2,7 +2,6 @@ import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   Loader2,
-  ExternalLink,
   Newspaper,
   Clock,
   Pencil,
@@ -10,12 +9,15 @@ import {
   Play,
   Trash2,
   MoreHorizontal,
+  Settings2,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import TaskActionDialog from "@/components/TaskActionDialog";
 import DeliveriesTable from "@/components/DeliveriesTable";
+import TaskHealthPanel from "@/components/TaskHealthPanel";
+import type { TaskHealthAction } from "@/components/TaskHealthPanel";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -37,13 +39,17 @@ import { api, ApiError } from "../api";
 import type {
   ScheduleDetail,
   ScheduleBatchItem,
-  ScheduleSourceInfo,
   ObservationPolicy,
-  TaskActionStatus,
   TaskLatestCheck,
+  TaskHealthProjection,
 } from "../api";
-import { fmt, useI18n, type Dict } from "@/i18n";
+import { fmt, useI18n, type Dict, type Locale } from "@/i18n";
 import { briefDict } from "@/i18n/brief";
+import {
+  taskHealthCopy,
+  taskHealthLoadingCopy,
+  taskHealthUnavailableCopy,
+} from "@/i18n/task-health";
 import { fmtBeijing } from "@/lib/time";
 import { SCHEDULE_COMMAND_STORAGE_PREFIX } from "@/lib/task-action-session";
 import {
@@ -51,14 +57,40 @@ import {
   taskRunOutcome,
   type TaskRunOutcome,
 } from "@/lib/task-detail-presentation";
-import {
-  nextRunPresentation,
-  taskDefinitionEditEnabled,
-} from "@/lib/task-detail-contract";
+import { nextRunPresentation } from "@/lib/task-detail-contract";
 
 const PAGE_SIZE = 20;
 const TaskBriefFeed = lazy(() => import("@/components/TaskBriefFeed"));
 type ScheduleCommand = "run" | "pause" | "resume" | "delete";
+type TaskSection = "brief" | "manage";
+
+function taskSurfaceCopy(
+  locale: Locale,
+  d: Dict["app"]["taskDetail"],
+): {
+  tabs: Record<TaskSection, string>;
+  health: ReturnType<typeof taskHealthCopy>;
+  healthLoading: string;
+  healthUnavailable: string;
+  manageDescription: string;
+  playbookTitle: string;
+  observationTitle: string;
+  runsTitle: string;
+} {
+  return {
+    tabs: {
+      brief: d.tabPushes,
+      manage: d.tabPlaybook,
+    },
+    health: taskHealthCopy(locale),
+    healthLoading: taskHealthLoadingCopy(locale),
+    healthUnavailable: taskHealthUnavailableCopy(locale),
+    manageDescription: d.playbookDesc,
+    playbookTitle: d.playbookTitle,
+    observationTitle: d.tabObservation,
+    runsTitle: d.tabRuns,
+  };
+}
 
 function commandStorageKey(
   actorScope: string,
@@ -271,12 +303,6 @@ function RunsTab({ scheduleID }: { scheduleID: string }) {
   );
 }
 
-function sourceStatusVariant(status: string): "default" | "secondary" | "outline" | "destructive" {
-  if (status === "disabled") return "destructive";
-  if (status === "paused") return "secondary";
-  return "outline";
-}
-
 function durationText(seconds: number, d: Dict["app"]["taskDetail"]): string {
   if (seconds % 86400 === 0) return `${seconds / 86400} ${d.observationDays}`;
   if (seconds % 3600 === 0) return `${seconds / 3600} ${d.observationHours}`;
@@ -364,79 +390,6 @@ function ObservationTab({ policy }: { policy: ObservationPolicy }) {
   );
 }
 
-// 绑定信源 Tab：详情接口已随首屏取回，这里纯渲染。空 ≠ 坏：老任务走账号级
-// 订阅、没有 schedule_sources 行，空态文案要说真话而不是「没数据」。
-function SourcesTab({ sources }: { sources: ScheduleSourceInfo[] }) {
-  const { t } = useI18n();
-  const D = t.app.taskDetail;
-  if (sources.length === 0) {
-    return (
-      <Card>
-        <CardContent className="py-12 text-center text-sm text-muted-foreground">
-          {D.sourcesEmpty}
-        </CardContent>
-      </Card>
-    );
-  }
-  return (
-    <Card>
-      <div className="overflow-x-auto">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>{D.srcColSource}</TableHead>
-              <TableHead>{D.srcColStatus}</TableHead>
-              <TableHead>{D.srcColLastFetch}</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {sources.map((s) => (
-              <TableRow key={s.id}>
-                <TableCell className="max-w-[280px]">
-                  <div className="truncate">
-                    {s.url ? (
-                      <a
-                        href={s.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 text-primary hover:underline"
-                      >
-                        <span className="truncate">{s.title || s.url}</span>
-                        <ExternalLink className="size-3 shrink-0" />
-                      </a>
-                    ) : (
-                      <span>{s.title}</span>
-                    )}
-                  </div>
-                  <div className="text-xs text-muted-foreground mt-0.5">
-                    {s.platform}
-                    {s.capability ? ` · ${s.capability}` : ""}
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex items-center gap-2">
-                    <Badge variant={sourceStatusVariant(s.status)}>
-                      {(D.srcStatus as Record<string, string>)[s.status] ?? s.status}
-                    </Badge>
-                    {s.fail_count > 0 && (
-                      <span className="text-xs text-destructive">
-                        {fmt(D.srcFailTimes, { n: s.fail_count })}
-                      </span>
-                    )}
-                  </div>
-                </TableCell>
-                <TableCell className="text-sm whitespace-nowrap text-muted-foreground">
-                  {fmtBeijing(s.last_fetched_at)}
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </div>
-    </Card>
-  );
-}
-
 export default function TaskDetail({
   scheduleID,
   actorScope,
@@ -444,9 +397,10 @@ export default function TaskDetail({
   scheduleID: string;
   actorScope: string;
 }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const D = t.app.taskDetail;
   const A = t.app.tasks;
+  const surface = taskSurfaceCopy(locale, D);
   const [detail, setDetail] = useState<ScheduleDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -454,24 +408,52 @@ export default function TaskDetail({
   const [showCreate, setShowCreate] = useState(false);
   const [command, setCommand] = useState("");
   const commandRef = useRef<ScheduleCommand | "">("");
+  const scheduleIDRef = useRef(scheduleID);
+  scheduleIDRef.current = scheduleID;
   const [commandMessage, setCommandMessage] = useState("");
   const [commandError, setCommandError] = useState("");
   const [latestCheckState, setLatestCheckState] = useState<{
     scheduleID: string;
     check?: TaskLatestCheck;
   }>();
-  const editEnabled = detail ? taskDefinitionEditEnabled(detail) : false;
+  const [healthState, setHealthState] = useState<{
+    scheduleID: string;
+    loaded: boolean;
+    health?: TaskHealthProjection;
+  }>();
+  const [section, setSection] = useState<TaskSection>("brief");
+  const health =
+    healthState?.scheduleID === scheduleID
+      ? healthState.health
+      : undefined;
+  const healthLoaded =
+    healthState?.scheduleID === scheduleID && healthState.loaded;
+  const permissions = health?.permissions;
+  const editEnabled = permissions?.can_edit === true;
+  const hasTaskActions = Boolean(
+    permissions?.can_run ||
+      permissions?.can_pause ||
+      permissions?.can_edit ||
+      permissions?.can_delete,
+  );
 
-  async function reloadDetail() {
-    const next = await api.scheduleDetail(scheduleID);
+  async function reloadDetail(requestedScheduleID = scheduleID) {
+    const next = await api.scheduleDetail(requestedScheduleID);
+    if (scheduleIDRef.current !== requestedScheduleID) return false;
     setDetail(next);
     setLoadError("");
+    return true;
   }
 
   useEffect(() => {
     let alive = true;
     setLoading(true);
     setDetail(null);
+    setHealthState({ scheduleID, loaded: false, health: undefined });
+    setSection("brief");
+    setShowEdit(false);
+    setCommandMessage("");
+    setCommandError("");
     api
       .scheduleDetail(scheduleID)
       .then((d) => {
@@ -501,34 +483,50 @@ export default function TaskDetail({
   }, [editEnabled, scheduleID]);
 
   async function runCommand(kind: "run" | "pause" | "resume") {
+    if (
+      (kind === "run" && !permissions?.can_run) ||
+      ((kind === "pause" || kind === "resume") &&
+        !permissions?.can_pause)
+    ) {
+      return;
+    }
     if (commandRef.current) return;
+    const requestedScheduleID = scheduleID;
     commandRef.current = kind;
     setCommand(kind);
     setCommandError("");
     setCommandMessage("");
     const idempotencyKey = commandIdempotencyKey(
       actorScope,
-      scheduleID,
+      requestedScheduleID,
       kind,
     );
     try {
       if (kind === "run") {
-        await api.runScheduleNow(scheduleID, idempotencyKey);
-        setCommandMessage(D.runAccepted);
+        await api.runScheduleNow(requestedScheduleID, idempotencyKey);
+        if (scheduleIDRef.current === requestedScheduleID) {
+          setCommandMessage(D.runAccepted);
+        }
       } else if (kind === "pause") {
-        await api.pauseSchedule(scheduleID, idempotencyKey);
-        await reloadDetail();
-        setCommandMessage(D.pauseDone);
+        await api.pauseSchedule(requestedScheduleID, idempotencyKey);
+        if (await reloadDetail(requestedScheduleID)) {
+          setCommandMessage(D.pauseDone);
+        }
       } else {
-        await api.resumeSchedule(scheduleID, idempotencyKey);
-        await reloadDetail();
-        setCommandMessage(D.resumeDone);
+        await api.resumeSchedule(requestedScheduleID, idempotencyKey);
+        if (await reloadDetail(requestedScheduleID)) {
+          setCommandMessage(D.resumeDone);
+        }
       }
-      clearCommandIdempotencyKey(actorScope, scheduleID, kind);
+      clearCommandIdempotencyKey(actorScope, requestedScheduleID, kind);
     } catch (err) {
-      setCommandError(err instanceof ApiError ? err.message : t.app.common.loadFailed);
+      if (scheduleIDRef.current === requestedScheduleID) {
+        setCommandError(
+          err instanceof ApiError ? err.message : t.app.common.loadFailed,
+        );
+      }
       if (!commandMayHaveReachedServer(err)) {
-        clearCommandIdempotencyKey(actorScope, scheduleID, kind);
+        clearCommandIdempotencyKey(actorScope, requestedScheduleID, kind);
       }
     } finally {
       commandRef.current = "";
@@ -537,34 +535,62 @@ export default function TaskDetail({
   }
 
   async function deleteTask() {
-    if (commandRef.current || !window.confirm(D.deleteConfirm)) return;
+    if (!permissions?.can_delete) return;
+    if (commandRef.current) return;
+    if (!window.confirm(D.deleteConfirm)) return;
+    const requestedScheduleID = scheduleID;
     commandRef.current = "delete";
     setCommand("delete");
     setCommandError("");
     const idempotencyKey = commandIdempotencyKey(
       actorScope,
-      scheduleID,
+      requestedScheduleID,
       "delete",
     );
     try {
-      await api.deleteSchedule(scheduleID, idempotencyKey);
-      clearCommandIdempotencyKey(actorScope, scheduleID, "delete");
-      location.hash = "#/tasks";
-    } catch (err) {
-      setCommandError(err instanceof ApiError ? err.message : t.app.common.loadFailed);
-      if (!commandMayHaveReachedServer(err)) {
-        clearCommandIdempotencyKey(actorScope, scheduleID, "delete");
+      await api.deleteSchedule(requestedScheduleID, idempotencyKey);
+      clearCommandIdempotencyKey(actorScope, requestedScheduleID, "delete");
+      if (scheduleIDRef.current === requestedScheduleID) {
+        location.hash = "#/tasks";
       }
-      commandRef.current = "";
-      setCommand("");
+    } catch (err) {
+      if (scheduleIDRef.current === requestedScheduleID) {
+        setCommandError(
+          err instanceof ApiError ? err.message : t.app.common.loadFailed,
+        );
+      }
+      if (!commandMayHaveReachedServer(err)) {
+        clearCommandIdempotencyKey(actorScope, requestedScheduleID, "delete");
+      }
+    } finally {
+      if (commandRef.current === "delete") {
+        commandRef.current = "";
+        setCommand("");
+      }
     }
   }
 
-  function handleEditComplete(status: TaskActionStatus) {
-    if (status.kind === "edit" && status.status === "completed") {
-      void reloadDetail().catch((err) => {
-        setCommandError(err instanceof ApiError ? err.message : t.app.common.loadFailed);
-      });
+  function handleEditComplete() {
+    const requestedScheduleID = scheduleID;
+    void reloadDetail(requestedScheduleID).catch((err) => {
+      if (scheduleIDRef.current !== requestedScheduleID) return;
+      setCommandError(
+        err instanceof ApiError ? err.message : t.app.common.loadFailed,
+      );
+    });
+  }
+
+  function handleHealthAction(action: TaskHealthAction) {
+    if (action === "run_again" && permissions?.can_run) {
+      void runCommand("run");
+      return;
+    }
+    if (action === "review_task" && permissions?.can_edit) {
+      setShowEdit(true);
+      return;
+    }
+    if (action === "review_usage" && permissions?.can_view_usage) {
+      setSection("manage");
     }
   }
 
@@ -598,7 +624,7 @@ export default function TaskDetail({
     );
   }
 
-  const { schedule, summary, sources, playbook } = detail;
+  const { schedule, summary, playbook } = detail;
   const nextRun = nextRunPresentation(schedule);
   // `observation` is the immutable runtime-policy projection; the alias keeps
   // this first read-only UI useful while older API deployments expose the
@@ -636,6 +662,7 @@ export default function TaskDetail({
             >
               {schedule.status === "active" ? t.app.tasks.running : t.app.tasks.paused}
             </Badge>
+            {hasTaskActions && (
             <DropdownMenu>
               <DropdownMenuTrigger
                 render={
@@ -654,40 +681,47 @@ export default function TaskDetail({
                 )}
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem
-                  onClick={() => void runCommand("run")}
-                  disabled={schedule.status !== "active"}
-                >
-                  <Play className="size-4" />
-                  {D.runNow}
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() =>
-                    void runCommand(schedule.status === "active" ? "pause" : "resume")
-                  }
-                >
-                  {schedule.status === "active" ? (
-                    <Pause className="size-4" />
-                  ) : (
+                {permissions?.can_run && (
+                  <DropdownMenuItem
+                    onClick={() => void runCommand("run")}
+                    disabled={schedule.status !== "active"}
+                  >
                     <Play className="size-4" />
-                  )}
-                  {schedule.status === "active" ? D.pauseTask : D.resumeTask}
-                </DropdownMenuItem>
+                    {D.runNow}
+                  </DropdownMenuItem>
+                )}
+                {permissions?.can_pause && (
+                  <DropdownMenuItem
+                    onClick={() =>
+                      void runCommand(schedule.status === "active" ? "pause" : "resume")
+                    }
+                  >
+                    {schedule.status === "active" ? (
+                      <Pause className="size-4" />
+                    ) : (
+                      <Play className="size-4" />
+                    )}
+                    {schedule.status === "active" ? D.pauseTask : D.resumeTask}
+                  </DropdownMenuItem>
+                )}
                 {editEnabled && (
                   <DropdownMenuItem onClick={() => setShowEdit(true)}>
                     <Pencil className="size-4" />
                     {D.editTask}
                   </DropdownMenuItem>
                 )}
-                <DropdownMenuItem
-                  variant="destructive"
-                  onClick={() => void deleteTask()}
-                >
-                  <Trash2 className="size-4" />
-                  {D.deleteTask}
-                </DropdownMenuItem>
+                {permissions?.can_delete && (
+                  <DropdownMenuItem
+                    variant="destructive"
+                    onClick={() => void deleteTask()}
+                  >
+                    <Trash2 className="size-4" />
+                    {D.deleteTask}
+                  </DropdownMenuItem>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
+            )}
           </div>
         </div>
         <p className="text-sm text-muted-foreground mt-1">
@@ -743,15 +777,21 @@ export default function TaskDetail({
         </CardContent>
       </Card>
 
-      <Tabs defaultValue="pushes">
-        <TabsList>
-          <TabsTrigger value="pushes">{D.tabPushes}</TabsTrigger>
-          <TabsTrigger value="runs">{D.tabRuns}</TabsTrigger>
-          <TabsTrigger value="sources">{D.tabSources}</TabsTrigger>
-          <TabsTrigger value="playbook">{D.tabPlaybook}</TabsTrigger>
-          {observation && <TabsTrigger value="observation">{D.tabObservation}</TabsTrigger>}
+      <Tabs
+        value={section}
+        onValueChange={(value) => setSection(value as TaskSection)}
+      >
+        <TabsList className="w-full justify-start overflow-x-auto">
+          <TabsTrigger value="brief">
+            <Newspaper className="size-4" />
+            {surface.tabs.brief}
+          </TabsTrigger>
+          <TabsTrigger value="manage">
+            <Settings2 className="size-4" />
+            {surface.tabs.manage}
+          </TabsTrigger>
         </TabsList>
-        <TabsContent value="pushes">
+        <TabsContent value="brief">
           <Suspense
             fallback={
               <Card>
@@ -767,6 +807,13 @@ export default function TaskDetail({
               onLatestCheck={(check) =>
                 setLatestCheckState({ scheduleID, check })
               }
+              onHealth={(nextHealth) =>
+                setHealthState({
+                  scheduleID,
+                  loaded: true,
+                  health: nextHealth,
+                })
+              }
               onAdjustTask={
                 editEnabled ? () => setShowEdit(true) : undefined
               }
@@ -774,37 +821,74 @@ export default function TaskDetail({
             />
           </Suspense>
         </TabsContent>
-        <TabsContent value="runs">
-          <RunsTab scheduleID={scheduleID} />
+        <TabsContent value="manage">
+          <div className="space-y-6">
+            <p className="text-sm text-muted-foreground">
+              {surface.manageDescription}
+            </p>
+            {health ? (
+              <TaskHealthPanel
+                health={health}
+                copy={surface.health}
+                locale={locale}
+                onAction={handleHealthAction}
+              />
+            ) : healthLoaded ? (
+              <Card>
+                <CardContent className="py-5 text-sm text-muted-foreground">
+                  {surface.healthUnavailable}
+                </CardContent>
+              </Card>
+            ) : (
+              <Card>
+                <CardContent className="flex items-center gap-2 py-5 text-sm text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" />
+                  {surface.healthLoading}
+                </CardContent>
+              </Card>
+            )}
+            <section className="space-y-3">
+              <h2 className="text-base font-semibold">
+                {surface.playbookTitle}
+              </h2>
+              {playbook ? (
+                <Card>
+                  <CardContent className="space-y-3 py-5">
+                    <p className="text-xs text-muted-foreground">
+                      {D.playbookDesc} ·{" "}
+                      {fmt(D.playbookUpdated, {
+                        time: fmtBeijing(playbook.updated_at),
+                      })}
+                    </p>
+                    <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-relaxed">
+                      {playbook.content}
+                    </pre>
+                  </CardContent>
+                </Card>
+              ) : (
+                <Card>
+                  <CardContent className="py-12 text-center text-sm text-muted-foreground">
+                    {D.playbookEmpty}
+                  </CardContent>
+                </Card>
+              )}
+            </section>
+            {observation && (
+              <section className="space-y-3">
+                <h2 className="text-base font-semibold">
+                  {surface.observationTitle}
+                </h2>
+                <ObservationTab policy={observation} />
+              </section>
+            )}
+            <section className="space-y-3">
+              <h2 className="text-base font-semibold">
+                {surface.runsTitle}
+              </h2>
+              <RunsTab scheduleID={scheduleID} />
+            </section>
+          </div>
         </TabsContent>
-        <TabsContent value="sources">
-          <SourcesTab sources={sources} />
-        </TabsContent>
-        <TabsContent value="playbook">
-          {playbook ? (
-            <Card>
-              <CardContent className="py-5 space-y-3">
-                <p className="text-xs text-muted-foreground">
-                  {D.playbookDesc} · {fmt(D.playbookUpdated, { time: fmtBeijing(playbook.updated_at) })}
-                </p>
-                <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-relaxed">
-                  {playbook.content}
-                </pre>
-              </CardContent>
-            </Card>
-          ) : (
-            <Card>
-              <CardContent className="py-12 text-center text-sm text-muted-foreground">
-                {D.playbookEmpty}
-              </CardContent>
-            </Card>
-          )}
-        </TabsContent>
-        {observation && (
-          <TabsContent value="observation">
-            <ObservationTab policy={observation} />
-          </TabsContent>
-        )}
       </Tabs>
       {editEnabled && (
         <TaskActionDialog
@@ -818,19 +902,10 @@ export default function TaskDetail({
             description: D.editDesc,
             placeholder: D.editPlaceholder,
             inputLabel: D.editInputLabel,
-            draft: D.generateEdit,
-            drafting: D.generatingEdit,
-            preview: D.editPreview,
-            confirm: D.confirmEdit,
-            confirming: D.confirmingEdit,
-            cancel: D.cancelEdit,
+            execute: D.generateEdit,
+            executing: D.generatingEdit,
             close: D.closeEdit,
-            waiting: D.editWaiting,
-            checkAgain: A.checkAgain,
             requestFailed: A.requestFailed,
-            resultStatus: A.resultStatus,
-            invalidProposal: A.invalidProposal,
-            status: A.actionStatus,
           }}
         />
       )}
@@ -844,19 +919,10 @@ export default function TaskDetail({
           description: A.dialogDesc,
           placeholder: A.dialogPlaceholder,
           inputLabel: A.dialogInputLabel,
-          draft: A.generate,
-          drafting: A.generating,
-          preview: A.preview,
-          confirm: A.confirmCreate,
-          confirming: A.confirming,
-          cancel: A.cancel,
+          execute: A.generate,
+          executing: A.generating,
           close: A.close,
-          waiting: A.waiting,
-          checkAgain: A.checkAgain,
           requestFailed: A.requestFailed,
-          resultStatus: A.resultStatus,
-          invalidProposal: A.invalidProposal,
-          status: A.actionStatus,
         }}
       />
     </div>

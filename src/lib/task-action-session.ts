@@ -1,11 +1,16 @@
 export const TASK_ACTION_STORAGE_PREFIX = "vane.task-action.v1";
-export const TASK_PROPOSAL_STORAGE_PREFIX = "vane.task-proposal.v1";
+export const TASK_EXECUTION_STORAGE_PREFIX = "vane.task-execution.v2";
 export const SCHEDULE_COMMAND_STORAGE_PREFIX = "vane.schedule-command.v1";
+
+// Logout also removes data written by the retired proposal/confirmation flow.
+// No current write path may import this historical prefix.
+const LEGACY_TASK_PROPOSAL_STORAGE_PREFIX = "vane.task-proposal.v1";
 
 const TASK_MUTATION_PREFIXES = [
   TASK_ACTION_STORAGE_PREFIX,
-  TASK_PROPOSAL_STORAGE_PREFIX,
+  TASK_EXECUTION_STORAGE_PREFIX,
   SCHEDULE_COMMAND_STORAGE_PREFIX,
+  LEGACY_TASK_PROPOSAL_STORAGE_PREFIX,
 ];
 
 export function clearTaskMutationSessionStorage(

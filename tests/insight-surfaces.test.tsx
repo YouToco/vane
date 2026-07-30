@@ -46,7 +46,7 @@ const healthCopy: TaskHealthCopy = {
   },
   issues: {
     coverage_incomplete: "Coverage was incomplete",
-    sources_unavailable: "A source is unavailable",
+    acquisition_unavailable: "Acquisition is unavailable",
     quota_paused: "Usage limit reached",
     model_temporarily_unavailable: "Analysis is temporarily unavailable",
     delivery_failed: "Delivery failed",
@@ -55,7 +55,7 @@ const healthCopy: TaskHealthCopy = {
   },
   actions: {
     wait_for_retry: "Wait for retry",
-    review_sources: "Review sources",
+    review_task: "Review task",
     review_usage: "Review usage",
     review_delivery: "Review delivery",
     run_again: "Run again",
@@ -110,6 +110,11 @@ function health(): TaskHealthProjection {
     state: "attention",
     issue: "coverage_incomplete",
     recommended_action: "wait_for_retry",
+    acquisition: {
+      total: 2,
+      failing: 0,
+      max_fail_count: 0,
+    },
     usage: {
       known_cost_usd: 1.25,
       coverage: "llm_only",

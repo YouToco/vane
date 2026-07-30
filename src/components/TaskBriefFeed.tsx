@@ -13,6 +13,7 @@ import type {
   PeriodicBriefReport,
   BriefReportSettings,
   GroundedBriefContext,
+  TaskHealthProjection,
 } from "@/api";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -859,11 +860,13 @@ type BriefPeriodView = "issue" | "daily" | "weekly" | "monthly";
 export default function TaskBriefFeed({
   scheduleID,
   onLatestCheck,
+  onHealth,
   onAdjustTask,
   onCreateTask,
 }: {
   scheduleID: string;
   onLatestCheck?: (check?: TaskLatestCheck) => void;
+  onHealth?: (health?: TaskHealthProjection) => void;
   onAdjustTask?: () => void;
   onCreateTask?: () => void;
 }) {
@@ -940,12 +943,14 @@ export default function TaskBriefFeed({
         setNextToken(page.next_page_token ?? "");
         setLoadError("");
         onLatestCheck?.(page.latest_check);
+        onHealth?.(page.health);
       })
       .catch((error) => {
         if (!isCurrent()) return;
         setItems([]);
         setTotal(0);
         setNextToken("");
+        onHealth?.(undefined);
         setLoadError(
           error instanceof ApiError ? error.message : t.app.common.loadFailed,
         );
@@ -954,7 +959,7 @@ export default function TaskBriefFeed({
     return () => {
       alive = false;
     };
-    // onLatestCheck is a notification sink; refetch is task-bound only.
+    // Projection callbacks are notification sinks; refetch is task-bound only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scheduleID]);
 
@@ -1053,6 +1058,7 @@ export default function TaskBriefFeed({
       setNextToken(page.next_page_token ?? "");
       setLoadError("");
       onLatestCheck?.(page.latest_check);
+      onHealth?.(page.health);
     } catch (error) {
       if (!isCurrent()) return;
       setLoadError(

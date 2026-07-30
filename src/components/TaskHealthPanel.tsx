@@ -2,58 +2,23 @@ import { Activity, CircleDollarSign, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import type {
+  BudgetState,
+  CostCoverage,
+  TaskHealthAction,
+  TaskHealthIssue,
+  TaskHealthProjection,
+  TaskHealthState,
+} from "@/api";
 
-export type TaskHealthState =
-  | "healthy"
-  | "attention"
-  | "waiting"
-  | "never_run";
-export type TaskHealthIssue =
-  | "coverage_incomplete"
-  | "sources_unavailable"
-  | "quota_paused"
-  | "model_temporarily_unavailable"
-  | "delivery_failed"
-  | "check_interrupted"
-  | "check_failed";
-export type TaskHealthAction =
-  | "wait_for_retry"
-  | "review_sources"
-  | "review_usage"
-  | "review_delivery"
-  | "run_again"
-  | "contact_support";
-export type CostCoverage =
-  | "none"
-  | "llm_only"
-  | "tools_only"
-  | "llm_and_tools";
-export type BudgetState =
-  | "not_configured"
-  | "ok"
-  | "warning"
-  | "exhausted"
-  | "incomplete";
-
-export interface TaskHealthProjection {
-  schema_version: "vane.task-health/v1";
-  state: TaskHealthState;
-  issue?: TaskHealthIssue;
-  recommended_action?: TaskHealthAction;
-  usage?: {
-    known_cost_usd: number;
-    coverage: CostCoverage;
-    budget_state: BudgetState;
-  };
-  permissions: {
-    role: "owner" | "admin" | "member" | "";
-    can_run: boolean;
-    can_pause: boolean;
-    can_edit: boolean;
-    can_delete: boolean;
-    can_view_usage: boolean;
-  };
-}
+export type {
+  BudgetState,
+  CostCoverage,
+  TaskHealthAction,
+  TaskHealthIssue,
+  TaskHealthProjection,
+  TaskHealthState,
+} from "@/api";
 
 export interface TaskHealthCopy {
   title: string;
@@ -83,8 +48,9 @@ function actionAllowed(
   permissions: TaskHealthProjection["permissions"],
 ): boolean {
   if (action === "run_again") return permissions.can_run;
+  if (action === "review_task") return permissions.can_edit;
   if (action === "review_usage") return permissions.can_view_usage;
-  return true;
+  return false;
 }
 
 export default function TaskHealthPanel({

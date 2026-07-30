@@ -10,7 +10,6 @@ import type {
   Schedule,
   ScheduleSpec,
   ScheduleRunSummary,
-  TaskActionStatus,
 } from "../api";
 import { fmt, useI18n, type Dict } from "@/i18n";
 import { fmtBeijing } from "@/lib/time";
@@ -123,7 +122,7 @@ function TaskCard({ task, summary }: { task: Schedule; summary?: ScheduleRunSumm
             </div>
             <StatusBadge status={task.status} />
           </div>
-          {/* 密度行：最近检查 + 用户结论、近 7 天情报、来源数。summary 接口失败/缺行时
+          {/* 密度行：最近检查 + 用户结论、近 7 天情报。summary 接口失败/缺行时
               整行省略（老数据没有假装成 0 的必要），任务本体信息不受影响。 */}
           {summary && (
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-3 text-xs text-muted-foreground">
@@ -144,7 +143,6 @@ function TaskCard({ task, summary }: { task: Schedule; summary?: ScheduleRunSumm
                 )}
               </span>
               <span>{fmt(T.insights7d, { n: summary.sent_pushes_7d })}</span>
-              <span>{fmt(T.sourceCount, { n: summary.source_count })}</span>
             </div>
           )}
           {task.next_run && (
@@ -168,15 +166,8 @@ export default function TaskDashboard({ actorScope }: { actorScope: string }) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
 
-  function handleCreateClose(status?: TaskActionStatus) {
+  function handleCreateClose() {
     setShowCreate(false);
-    if (
-      status?.kind === "create" &&
-      status.status === "executed" &&
-      status.task_id
-    ) {
-      location.hash = `#/tasks/${encodeURIComponent(status.task_id)}`;
-    }
   }
 
   useEffect(() => {
@@ -249,27 +240,20 @@ export default function TaskDashboard({ actorScope }: { actorScope: string }) {
         actorScope={actorScope}
         onClose={handleCreateClose}
         onComplete={() => {
-          // The durable terminal result stays visible until the user
-          // acknowledges it. Successful navigation happens in onClose.
+          void api.listSchedules().then(setTasks);
+          void api.scheduleSummaries().then((values) => {
+            setSummaries(new Map(values.map((item) => [item.schedule_id, item])));
+          });
         }}
         labels={{
           title: T.newTask,
           description: T.dialogDesc,
           placeholder: T.dialogPlaceholder,
           inputLabel: T.dialogInputLabel,
-          draft: T.generate,
-          drafting: T.generating,
-          preview: T.preview,
-          confirm: T.confirmCreate,
-          confirming: T.confirming,
-          cancel: T.cancel,
+          execute: T.generate,
+          executing: T.generating,
           close: T.close,
-          waiting: T.waiting,
-          checkAgain: T.checkAgain,
           requestFailed: T.requestFailed,
-          resultStatus: T.resultStatus,
-          invalidProposal: T.invalidProposal,
-          status: T.actionStatus,
         }}
       />
     </div>

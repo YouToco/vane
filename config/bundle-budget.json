@@ -13,7 +13,6 @@
     "src/pages/TaskDashboard.tsx",
     "src/pages/TaskDetail.tsx",
     "src/pages/History.tsx",
-    "src/pages/Sources.tsx",
     "src/pages/Settings.tsx",
     "src/pages/Admin.tsx"
   ],

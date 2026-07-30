@@ -131,6 +131,28 @@ function page(
       processing: "complete",
       failure_code: task,
     },
+    health: {
+      schema_version: "vane.task-health/v1",
+      state: "healthy",
+      acquisition: {
+        total: 1,
+        failing: 0,
+        max_fail_count: 0,
+      },
+      usage: {
+        known_cost_usd: id,
+        coverage: "llm_only",
+        budget_state: "not_configured",
+      },
+      permissions: {
+        role: "owner",
+        can_run: true,
+        can_pause: true,
+        can_edit: true,
+        can_delete: true,
+        can_view_usage: true,
+      },
+    },
   };
 }
 
@@ -574,11 +596,13 @@ describe("TaskBriefFeed Markdown boundary", () => {
       },
     );
     const onLatestCheck = vi.fn();
+    const onHealth = vi.fn();
 
     const view = render(
       <TaskBriefFeed
         scheduleID="task-a"
         onLatestCheck={onLatestCheck}
+        onHealth={onHealth}
       />,
     );
     await screen.findByText("task-a insight 1");
@@ -597,6 +621,7 @@ describe("TaskBriefFeed Markdown boundary", () => {
         <TaskBriefFeed
           scheduleID="task-b"
           onLatestCheck={onLatestCheck}
+          onHealth={onHealth}
         />,
       );
     });
@@ -610,6 +635,8 @@ describe("TaskBriefFeed Markdown boundary", () => {
     expect(screen.queryByText(/task-a/)).toBeNull();
     expect(onLatestCheck).toHaveBeenCalledTimes(2);
     expect(onLatestCheck.mock.calls.at(-1)?.[0]?.failure_code).toBe("task-b");
+    expect(onHealth).toHaveBeenCalledTimes(2);
+    expect(onHealth.mock.calls.at(-1)?.[0]?.usage?.known_cost_usd).toBe(3);
     view.unmount();
   });
 });

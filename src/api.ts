@@ -1,4 +1,3 @@
-import type { AddSubscriptionRequest } from "@/lib/source-view";
 
 // 统一 fetch 封装。
 // 为什么集中封装：所有请求都要带 cookie（credentials:'include'），且 401 需要统一踢回登录页，
@@ -96,27 +95,6 @@ export interface Schedule {
   status: string; // active/paused
   next_run_state: "scheduled" | "paused" | "none" | "unavailable";
   next_run?: string; // 只有 next_run_state=scheduled 时才是可信的 Temporal 下一次触发
-  created_at?: string;
-}
-
-// 加订阅请求体，与后端 addSubscriptionReq 对齐（api/subscriptions.go）。
-// 旧三种输入仍走兼容格式；web/contents 走当前 platform+capability+params 契约。
-export type AddSubscriptionReq = AddSubscriptionRequest;
-
-// Source 直接复用后端 types.Source 的 JSON（entities.go）。
-// 信源管理页只用到其中几列，其余字段忽略即可。
-export interface Source {
-  id: number;
-  type: string;
-  platform: string;
-  capability: string;
-  url: string;
-  title: string;
-  config: Record<string, unknown> | string | null;
-  status: string; // active/disabled/paused
-  fail_count: number;
-  last_fetched_at?: string;
-  next_fetch_at?: string;
   created_at?: string;
 }
 
@@ -302,20 +280,6 @@ export interface ScheduleRunSummary {
   batches_7d: number;
   empty_batches_7d: number;
   sent_pushes_7d: number;
-  source_count: number;
-}
-
-// 任务绑定的信源（schedule_sources 关联）。老任务（走账号级订阅）此列表为空，
-// 空 ≠ 坏——详情页要给「本任务未绑定专属信源」的真话空态，别渲染成加载失败。
-export interface ScheduleSourceInfo {
-  id: number;
-  platform: string;
-  capability: string;
-  url: string;
-  title: string;
-  status: string; // active/disabled/paused
-  fail_count: number;
-  last_fetched_at?: string; // UTC
 }
 
 // 单任务一次运行（push_batch）。stage_counts 语义同 PipelineCounts：
@@ -460,11 +424,75 @@ export interface TaskLatestCheck {
   failure_code?: string;
 }
 
+export type TaskHealthState =
+  | "healthy"
+  | "attention"
+  | "waiting"
+  | "never_run";
+export type TaskHealthIssue =
+  | "coverage_incomplete"
+  | "acquisition_unavailable"
+  | "quota_paused"
+  | "model_temporarily_unavailable"
+  | "delivery_failed"
+  | "check_interrupted"
+  | "check_failed";
+export type TaskHealthAction =
+  | "wait_for_retry"
+  | "review_task"
+  | "review_usage"
+  | "review_delivery"
+  | "run_again"
+  | "contact_support";
+export type CostCoverage =
+  | "none"
+  | "llm_only"
+  | "tools_only"
+  | "llm_and_tools";
+export type BudgetState =
+  | "not_configured"
+  | "ok"
+  | "warning"
+  | "exhausted"
+  | "incomplete";
+
+export interface TaskHealthProjection {
+  schema_version: "vane.task-health/v1";
+  state: TaskHealthState;
+  issue?: TaskHealthIssue;
+  recommended_action?: TaskHealthAction;
+  last_checked_at?: string;
+  acquisition: {
+    total: number;
+    failing: number;
+    max_fail_count: number;
+  };
+  usage?: {
+    known_cost_usd: number;
+    coverage: CostCoverage;
+    llm_calls?: number;
+    tool_calls?: number;
+    window_start?: string;
+    window_end?: string;
+    budget_usd?: number;
+    budget_state: BudgetState;
+  };
+  permissions: {
+    role: "owner" | "admin" | "member" | "";
+    can_run: boolean;
+    can_pause: boolean;
+    can_edit: boolean;
+    can_delete: boolean;
+    can_view_usage: boolean;
+  };
+}
+
 export interface TaskBriefsResp {
   items: TaskBrief[];
   total: number;
   next_page_token?: string;
   latest_check?: TaskLatestCheck;
+  health?: TaskHealthProjection;
 }
 
 export interface PeriodicBriefReport {
@@ -540,34 +568,14 @@ export interface ScheduleDetail {
     definition_edit: boolean;
   };
   summary: ScheduleRunSummary;
-  sources: ScheduleSourceInfo[];
   playbook?: SchedulePlaybook;
   cost: ScheduleRunCost;
 }
 
 // ---- Web 原生任务控制面（功能 6.8）----
 
-export interface TaskActionPreview {
-  id: string;
-  kind: "create" | "edit";
-  task_id?: string;
-  summary: string;
-}
-
-export interface TaskActionProposal {
-  reply: string;
-  action?: TaskActionPreview;
-}
-
-export interface TaskActionStatus {
-  id: string;
-  kind: "create" | "edit";
-  status: string;
-  terminal: boolean;
-  task_id?: string;
-  summary?: string;
-  message?: string;
-  recovering?: boolean;
+export interface TaskActionResult {
+  message: string;
 }
 
 // ---- M7 成本与运行监控（功能 6.5）----
@@ -855,10 +863,9 @@ export function normalizeSchedule(raw: Record<string, unknown>): Schedule {
 
 type RawScheduleDetail = Omit<
   ScheduleDetail,
-  "schedule" | "sources" | "capabilities"
+  "schedule" | "capabilities"
 > & {
   schedule: Record<string, unknown>;
-  sources?: ScheduleSourceInfo[] | null;
   capabilities?: unknown;
 };
 
@@ -869,13 +876,151 @@ export function normalizeScheduleDetail(
   return {
     ...raw,
     schedule: normalizeSchedule(raw.schedule),
-    sources: arr(raw.sources),
     capabilities: {
       // Legacy/malformed responses must not expose an edit control which the
       // currently deployed backend may be unable to honor.
       definition_edit: capabilities.definition_edit === true,
     },
   };
+}
+
+const taskHealthStates = new Set<TaskHealthState>([
+  "healthy",
+  "attention",
+  "waiting",
+  "never_run",
+]);
+const taskHealthIssues = new Set<TaskHealthIssue>([
+  "coverage_incomplete",
+  "acquisition_unavailable",
+  "quota_paused",
+  "model_temporarily_unavailable",
+  "delivery_failed",
+  "check_interrupted",
+  "check_failed",
+]);
+const taskHealthActions = new Set<TaskHealthAction>([
+  "wait_for_retry",
+  "review_task",
+  "review_usage",
+  "review_delivery",
+  "run_again",
+  "contact_support",
+]);
+const taskHealthCostCoverage = new Set<CostCoverage>([
+  "none",
+  "llm_only",
+  "tools_only",
+  "llm_and_tools",
+]);
+const taskHealthBudgetStates = new Set<BudgetState>([
+  "not_configured",
+  "ok",
+  "warning",
+  "exhausted",
+  "incomplete",
+]);
+
+export function normalizeTaskHealth(
+  raw: unknown,
+): TaskHealthProjection | undefined {
+  const value = asObject<Record<string, unknown>>(raw);
+  const state = value.state as TaskHealthState;
+  const issue = value.issue as TaskHealthIssue | undefined;
+  const action = value.recommended_action as TaskHealthAction | undefined;
+  const acquisition = asObject<Record<string, unknown>>(value.acquisition);
+  const permissions = asObject<Record<string, unknown>>(value.permissions);
+  const role = permissions.role;
+  const permissionKeys = [
+    "can_run",
+    "can_pause",
+    "can_edit",
+    "can_delete",
+    "can_view_usage",
+  ] as const;
+  if (
+    value.schema_version !== "vane.task-health/v1" ||
+    !taskHealthStates.has(state) ||
+    (issue !== undefined && !taskHealthIssues.has(issue)) ||
+    (action !== undefined && !taskHealthActions.has(action)) ||
+    !Number.isInteger(acquisition.total) ||
+    !Number.isInteger(acquisition.failing) ||
+    !Number.isInteger(acquisition.max_fail_count) ||
+    Number(acquisition.total) < 0 ||
+    Number(acquisition.failing) < 0 ||
+    Number(acquisition.failing) > Number(acquisition.total) ||
+    Number(acquisition.max_fail_count) < 0 ||
+    !(
+      role === "" ||
+      role === "owner" ||
+      role === "admin" ||
+      role === "member"
+    ) ||
+    permissionKeys.some((key) => typeof permissions[key] !== "boolean")
+  ) {
+    return undefined;
+  }
+  const projected: TaskHealthProjection = {
+    schema_version: "vane.task-health/v1",
+    state,
+    ...(issue ? { issue } : {}),
+    ...(action ? { recommended_action: action } : {}),
+    ...(typeof value.last_checked_at === "string"
+      ? { last_checked_at: value.last_checked_at }
+      : {}),
+    acquisition: {
+      total: Number(acquisition.total),
+      failing: Number(acquisition.failing),
+      max_fail_count: Number(acquisition.max_fail_count),
+    },
+    permissions: {
+      role,
+      can_run: permissions.can_run as boolean,
+      can_pause: permissions.can_pause as boolean,
+      can_edit: permissions.can_edit as boolean,
+      can_delete: permissions.can_delete as boolean,
+      can_view_usage: permissions.can_view_usage as boolean,
+    },
+  };
+  const usage = asObject<Record<string, unknown>>(value.usage);
+  const coverage = usage.coverage as CostCoverage;
+  const budgetState = usage.budget_state as BudgetState;
+  if (
+    projected.permissions.can_view_usage &&
+    typeof usage.known_cost_usd === "number" &&
+    Number.isFinite(usage.known_cost_usd) &&
+    usage.known_cost_usd >= 0 &&
+    taskHealthCostCoverage.has(coverage) &&
+    taskHealthBudgetStates.has(budgetState)
+  ) {
+    projected.usage = {
+      known_cost_usd: usage.known_cost_usd,
+      coverage,
+      budget_state: budgetState,
+      ...(typeof usage.llm_calls === "number" &&
+      Number.isSafeInteger(usage.llm_calls) &&
+      usage.llm_calls >= 0
+        ? { llm_calls: usage.llm_calls }
+        : {}),
+      ...(typeof usage.tool_calls === "number" &&
+      Number.isSafeInteger(usage.tool_calls) &&
+      usage.tool_calls >= 0
+        ? { tool_calls: usage.tool_calls }
+        : {}),
+      ...(typeof usage.window_start === "string"
+        ? { window_start: usage.window_start }
+        : {}),
+      ...(typeof usage.window_end === "string"
+        ? { window_end: usage.window_end }
+        : {}),
+      ...(typeof usage.budget_usd === "number" &&
+      Number.isFinite(usage.budget_usd) &&
+      usage.budget_usd > 0
+        ? { budget_usd: usage.budget_usd }
+        : {}),
+    };
+  }
+  return projected;
 }
 
 // Go 的 nil slice 序列化成 null 而不是 []：窗口内没跑过批次时 score_traces/costs/
@@ -1007,6 +1152,7 @@ export const api = {
       `/api/schedules/${encodeURIComponent(id)}/briefs${qs ? "?" + qs : ""}`,
     ).then((r) => ({
       ...r,
+      health: normalizeTaskHealth(r.health),
       items: arr(r.items).map((brief) => ({
         ...brief,
         executive: brief.executive
@@ -1102,24 +1248,12 @@ export const api = {
       `/api/schedules/${encodeURIComponent(scheduleID)}/reports/${reportID}`,
     ),
 
-  proposeTaskAction: (text: string, taskId: string | undefined, requestId: string) =>
-    post<TaskActionProposal>("/api/task-actions/propose", {
+  executeTaskAction: (text: string, taskId: string | undefined, requestId: string) =>
+    post<TaskActionResult>("/api/task-actions", {
       text,
       request_id: requestId,
       ...(taskId ? { task_id: taskId } : {}),
     }),
-  confirmTaskAction: (id: string) =>
-    post<{ message: string }>(
-      `/api/task-actions/${encodeURIComponent(id)}/confirm`,
-    ),
-  cancelTaskAction: (id: string) =>
-    post<{ message: string }>(
-      `/api/task-actions/${encodeURIComponent(id)}/cancel`,
-    ),
-  taskActionStatus: (id: string) =>
-    request<TaskActionStatus>(
-      `/api/task-actions/${encodeURIComponent(id)}`,
-    ),
   runScheduleNow: (id: string, idempotencyKey: string) =>
     request<{ ok: boolean }>(
       `/api/schedules/${encodeURIComponent(id)}/run`,
@@ -1150,20 +1284,6 @@ export const api = {
       method: "DELETE",
       headers: { "Idempotency-Key": idempotencyKey },
     }),
-  // push/now 的 body 是 {scope?}（B8）；固化"现在推一次"默认不带 scope = 推全部订阅
-  pushNow: (scope?: PushScope) =>
-    post<{ run_id: string }>("/api/push/now", scope ? { scope } : {}),
-
-  // ---- M3 信源管理（B8）----
-  listSubscriptions: () => request<Source[]>("/api/subscriptions"),
-  addSubscription: (req: AddSubscriptionReq) =>
-    post<{ source_id: number }>("/api/subscriptions", req),
-  removeSubscription: (sourceId: number) =>
-    request<{ ok: boolean }>(`/api/subscriptions/${sourceId}`, { method: "DELETE" }),
-  // 重新启用一个因连续抓取失败被自动停用的信源（功能 5.2）。后端清零 fail_count、立即恢复抓取。
-  enableSource: (sourceId: number) =>
-    request<{ ok: boolean }>(`/api/sources/${sourceId}/enable`, { method: "POST" }),
-
   // ---- M7 推送历史（功能 6.4）----
   // 键集分页：pageToken 是后端不透明游标，前端只负责原样带回。
   // items/feedbacks 用 arr 收敛 Go nil-slice 的 null（后端首页为空时 items 已保证 []，
