@@ -106,6 +106,44 @@ func TestQualifyContentWindowDeprioritizesUnknownDates(t *testing.T) {
 	}
 }
 
+func TestAdmissibleEventEvidenceCandidatesRequireOfficialDatedEvidence(t *testing.T) {
+	policy := workflowEventPolicy(t)
+	window := observation.Window{
+		Start: time.Date(2026, 7, 23, 1, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 7, 24, 1, 0, 0, 0, time.UTC),
+	}
+	inWindow := window.Start.Add(time.Hour)
+	beforeWindow := window.Start
+	got := admissibleEventEvidenceCandidates(policy, window, []types.ContentItem{
+		{ID: 1, URL: "https://openai.com/index/unknown-date"},
+		{ID: 2, URL: "https://openai.com/index/too-old", PublishedAt: &beforeWindow},
+		{ID: 3, URL: "https://example.com/index/model", PublishedAt: &inWindow},
+		{ID: 4, URL: "https://news.openai.com/index/model", PublishedAt: &inWindow},
+	})
+	if len(got) != 1 || got[0].ID != 4 {
+		t.Fatalf("got=%+v", got)
+	}
+}
+
+func TestAdmissibleEventEvidenceCandidatesHonorBoundedLateness(t *testing.T) {
+	policy := workflowEventPolicy(t)
+	policy.LatePolicy = observation.LateBounded
+	policy.AllowedLatenessSecs = int64((2 * time.Hour) / time.Second)
+	window := observation.Window{
+		Start: time.Date(2026, 7, 23, 1, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 7, 24, 1, 0, 0, 0, time.UTC),
+	}
+	withinLateness := window.Start.Add(-time.Hour)
+	beyondLateness := window.Start.Add(-2 * time.Hour)
+	got := admissibleEventEvidenceCandidates(policy, window, []types.ContentItem{
+		{ID: 1, URL: "https://openai.com/index/accepted", PublishedAt: &withinLateness},
+		{ID: 2, URL: "https://openai.com/index/rejected", PublishedAt: &beyondLateness},
+	})
+	if len(got) != 1 || got[0].ID != 1 {
+		t.Fatalf("got=%+v", got)
+	}
+}
+
 func workflowEventPolicy(t *testing.T) observation.PolicyV1 {
 	t.Helper()
 	policy, err := observation.Compile(observation.PolicySpecV1{

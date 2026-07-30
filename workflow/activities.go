@@ -2685,13 +2685,17 @@ func (a *Activities) qualifyEventCandidates(
 		return nil, "", nonRetryable(types.NewAppError(
 			types.CodeInternal, "event qualifier is not configured", nil))
 	}
+	candidates := admissibleEventEvidenceCandidates(policy, window, in.Items)
+	if len(candidates) == 0 {
+		return nil, "no_match", nil
+	}
 	policyDigest, err := observation.PolicyDigest(policy)
 	if err != nil {
 		return nil, "", nonRetryable(types.NewAppError(
 			types.CodeValidation, "observation policy digest failed", err))
 	}
 	requestDigest, err := observationQualificationRequestDigest(
-		policyDigest, window, in.Items)
+		policyDigest, window, candidates)
 	if err != nil {
 		return nil, "", nonRetryable(types.NewAppError(
 			types.CodeValidation, "observation request digest failed", err))
@@ -2742,7 +2746,7 @@ func (a *Activities) qualifyEventCandidates(
 		qualifierRequest := eventqualifier.Request{
 			TenantID: expected.TenantID, UserID: expected.UserID,
 			TraceID: in.TraceID, Policy: policy, Window: window,
-			Candidates: in.Items, Client: modelClient, ModelCall: modelCall,
+			Candidates: candidates, Client: modelClient, ModelCall: modelCall,
 			QuotaRule: quotaRule, BeforeSpend: beforeSpend,
 		}
 		if rollout == observation.RolloutShadow {
@@ -2769,7 +2773,7 @@ func (a *Activities) qualifyEventCandidates(
 			types.CodeConflict, "observation qualification state is invalid", nil))
 	}
 	qualified, outcome, err := a.validateQualifiedEvents(
-		policy, policyDigest, window, in.Items, result)
+		policy, policyDigest, window, candidates, result)
 	if err != nil && types.CodeOf(err) == types.CodeValidation {
 		slog.WarnContext(ctx, "observation qualifier output rejected",
 			"task_id", expected.TaskID,
@@ -2805,6 +2809,32 @@ func (a *Activities) qualifyEventCandidates(
 		}
 	}
 	return qualified, outcome, err
+}
+
+func admissibleEventEvidenceCandidates(
+	policy observation.PolicyV1,
+	window observation.Window,
+	items []types.ContentItem,
+) []types.ContentItem {
+	start := window.Start
+	if policy.LatePolicy == observation.LateBounded {
+		start = start.Add(-time.Duration(policy.AllowedLatenessSecs) * time.Second)
+	}
+	admission := observation.Window{Start: start, End: window.End}
+	out := make([]types.ContentItem, 0, len(items))
+	for _, item := range items {
+		if item.PublishedAt == nil ||
+			!admission.Contains(item.PublishedAt.UTC()) {
+			continue
+		}
+		if policy.Evidence.Requirement == observation.EvidenceOfficialRequired &&
+			!observation.OfficialURLAllowed(
+				item.URL, policy.Evidence.OfficialDomains) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func detachedObservationReceiptContext(ctx context.Context) (context.Context, context.CancelFunc) {
