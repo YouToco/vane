@@ -50,10 +50,23 @@ const (
 type CostCoverageV1 string
 
 const (
-	CostCoverageNoneV1        CostCoverageV1 = "none"
-	CostCoverageLLMOnlyV1     CostCoverageV1 = "llm_only"
-	CostCoverageToolsOnlyV1   CostCoverageV1 = "tools_only"
-	CostCoverageLLMAndToolsV1 CostCoverageV1 = "llm_and_tools"
+	CostCoverageNoneV1               CostCoverageV1 = "none"
+	CostCoverageLLMOnlyV1            CostCoverageV1 = "llm_only"
+	CostCoverageToolsOnlyV1          CostCoverageV1 = "tools_only"
+	CostCoverageToolsPartialV1       CostCoverageV1 = "tools_partial"
+	CostCoverageLLMAndToolsV1        CostCoverageV1 = "llm_and_tools"
+	CostCoverageLLMAndToolsPartialV1 CostCoverageV1 = "llm_and_tools_partial"
+)
+
+type AcquisitionFailureV1 string
+
+const (
+	AcquisitionFailureNoneV1           AcquisitionFailureV1 = ""
+	AcquisitionFailureTimeoutV1        AcquisitionFailureV1 = "timeout"
+	AcquisitionFailureProviderV1       AcquisitionFailureV1 = "provider_error"
+	AcquisitionFailureInvalidRequestV1 AcquisitionFailureV1 = "invalid_request"
+	AcquisitionFailureUsageLimitV1     AcquisitionFailureV1 = "usage_limit"
+	AcquisitionFailureInternalV1       AcquisitionFailureV1 = "internal"
 )
 
 type BudgetStateV1 string
@@ -75,9 +88,10 @@ type LatestCheckV1 struct {
 }
 
 type AcquisitionSummaryV1 struct {
-	Total        int `json:"total"`
-	Failing      int `json:"failing"`
-	MaxFailCount int `json:"max_fail_count"`
+	Total         int                  `json:"total"`
+	Failing       int                  `json:"failing"`
+	MaxFailCount  int                  `json:"max_fail_count"`
+	FailureReason AcquisitionFailureV1 `json:"failure_reason,omitempty"`
 }
 
 // UsageV1 represents attribution facts. Every component is nullable so
@@ -87,9 +101,13 @@ type UsageV1 struct {
 	LLMCalls    *int64
 	ToolCostUSD *float64
 	ToolCalls   *int64
-	WindowStart time.Time
-	WindowEnd   time.Time
-	BudgetUSD   *float64
+	// ToolPricedCalls counts Tool rows with an explicit provider cost receipt.
+	// It may be lower than ToolCalls; the known subtotal remains useful but is
+	// then a lower bound rather than complete attribution.
+	ToolPricedCalls *int64
+	WindowStart     time.Time
+	WindowEnd       time.Time
+	BudgetUSD       *float64
 }
 
 type AccessV1 struct {
@@ -108,14 +126,15 @@ type PermissionsV1 struct {
 }
 
 type UsageProjectionV1 struct {
-	KnownCostUSD float64        `json:"known_cost_usd"`
-	Coverage     CostCoverageV1 `json:"coverage"`
-	LLMCalls     *int64         `json:"llm_calls,omitempty"`
-	ToolCalls    *int64         `json:"tool_calls,omitempty"`
-	WindowStart  *time.Time     `json:"window_start,omitempty"`
-	WindowEnd    *time.Time     `json:"window_end,omitempty"`
-	BudgetUSD    *float64       `json:"budget_usd,omitempty"`
-	BudgetState  BudgetStateV1  `json:"budget_state"`
+	KnownCostUSD    float64        `json:"known_cost_usd"`
+	Coverage        CostCoverageV1 `json:"coverage"`
+	LLMCalls        *int64         `json:"llm_calls,omitempty"`
+	ToolCalls       *int64         `json:"tool_calls,omitempty"`
+	ToolPricedCalls *int64         `json:"tool_priced_calls,omitempty"`
+	WindowStart     *time.Time     `json:"window_start,omitempty"`
+	WindowEnd       *time.Time     `json:"window_end,omitempty"`
+	BudgetUSD       *float64       `json:"budget_usd,omitempty"`
+	BudgetState     BudgetStateV1  `json:"budget_state"`
 }
 
 type ProjectionV1 struct {
@@ -168,7 +187,9 @@ func ProjectV1(
 		case normalizedAcquisition.Failing > 0:
 			projection.State = StateAttentionV1
 			projection.Issue = IssueAcquisitionUnavailableV1
-			projection.RecommendedAction = ActionReviewTaskV1
+			projection.RecommendedAction =
+				acquisitionFailureActionV1(
+					normalizedAcquisition.FailureReason)
 		case latest.SourceCoverage == types.RunCompletenessPartial ||
 			latest.Processing == types.RunCompletenessPartial:
 			projection.State = StateAttentionV1
@@ -248,11 +269,43 @@ func normalizeAcquisitionV1(
 	valid := in.Total >= 0 && in.Failing >= 0 &&
 		in.Failing <= in.Total && in.MaxFailCount >= 0 &&
 		((in.Failing == 0 && in.MaxFailCount == 0) ||
-			(in.Failing > 0 && in.MaxFailCount > 0))
+			(in.Failing > 0 && in.MaxFailCount > 0)) &&
+		((in.Failing == 0 &&
+			in.FailureReason == AcquisitionFailureNoneV1) ||
+			(in.Failing > 0 &&
+				validAcquisitionFailureV1(in.FailureReason)))
 	if !valid {
 		return AcquisitionSummaryV1{}, false
 	}
 	return in, true
+}
+
+func validAcquisitionFailureV1(reason AcquisitionFailureV1) bool {
+	switch reason {
+	case AcquisitionFailureTimeoutV1,
+		AcquisitionFailureProviderV1,
+		AcquisitionFailureInvalidRequestV1,
+		AcquisitionFailureUsageLimitV1,
+		AcquisitionFailureInternalV1:
+		return true
+	default:
+		return false
+	}
+}
+
+func acquisitionFailureActionV1(
+	reason AcquisitionFailureV1,
+) RecommendedActionV1 {
+	switch reason {
+	case AcquisitionFailureTimeoutV1, AcquisitionFailureProviderV1:
+		return ActionWaitForRetryV1
+	case AcquisitionFailureInvalidRequestV1:
+		return ActionReviewTaskV1
+	case AcquisitionFailureUsageLimitV1:
+		return ActionReviewUsageV1
+	default:
+		return ActionContactSupportV1
+	}
 }
 
 func projectUsageV1(in UsageV1) UsageProjectionV1 {
@@ -263,15 +316,26 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 	llmKnown := in.LLMCostUSD != nil && in.LLMCalls != nil &&
 		validMoneyV1(*in.LLMCostUSD) && *in.LLMCalls >= 0
 	toolsKnown := in.ToolCostUSD != nil && in.ToolCalls != nil &&
-		validMoneyV1(*in.ToolCostUSD) && *in.ToolCalls >= 0
+		in.ToolPricedCalls != nil &&
+		validMoneyV1(*in.ToolCostUSD) && *in.ToolCalls >= 0 &&
+		*in.ToolPricedCalls >= 0 &&
+		*in.ToolPricedCalls <= *in.ToolCalls
+	toolsComplete := toolsKnown &&
+		*in.ToolPricedCalls == *in.ToolCalls
 	switch {
 	case llmKnown && toolsKnown:
 		sum := *in.LLMCostUSD + *in.ToolCostUSD
 		if validMoneyV1(sum) {
 			out.KnownCostUSD = sum
-			out.Coverage = CostCoverageLLMAndToolsV1
-			llmCalls, toolCalls := *in.LLMCalls, *in.ToolCalls
+			if toolsComplete {
+				out.Coverage = CostCoverageLLMAndToolsV1
+			} else {
+				out.Coverage = CostCoverageLLMAndToolsPartialV1
+			}
+			llmCalls, toolCalls, pricedToolCalls :=
+				*in.LLMCalls, *in.ToolCalls, *in.ToolPricedCalls
 			out.LLMCalls, out.ToolCalls = &llmCalls, &toolCalls
+			out.ToolPricedCalls = &pricedToolCalls
 		}
 	case llmKnown:
 		out.KnownCostUSD = *in.LLMCostUSD
@@ -280,9 +344,15 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 		out.LLMCalls = &llmCalls
 	case toolsKnown:
 		out.KnownCostUSD = *in.ToolCostUSD
-		out.Coverage = CostCoverageToolsOnlyV1
-		toolCalls := *in.ToolCalls
+		if toolsComplete {
+			out.Coverage = CostCoverageToolsOnlyV1
+		} else {
+			out.Coverage = CostCoverageToolsPartialV1
+		}
+		toolCalls, pricedToolCalls :=
+			*in.ToolCalls, *in.ToolPricedCalls
 		out.ToolCalls = &toolCalls
+		out.ToolPricedCalls = &pricedToolCalls
 	}
 	if !in.WindowStart.IsZero() && in.WindowEnd.After(in.WindowStart) {
 		start := in.WindowStart.Round(0).UTC()

@@ -116,9 +116,15 @@ func TestScheduleDashboardStore(t *testing.T) {
 			t.Fatalf("种子 SQL 失败: %v\n  %s", err, sql)
 		}
 	}
-	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, user_id, cost_usd) VALUES ($1,'score','test-model',$2,0.5)`, trace1, owner.ID)
-	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, user_id, cost_usd) VALUES ($1,'cardgen','test-model',$2,0.25)`, trace1, owner.ID)
-	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, user_id, cost_usd) VALUES ($1,'score','test-model',$2,9.9)`, foreignTrace, stranger.ID)
+	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, tenant_id, user_id, cost_usd)
+		VALUES ($1,'score','test-model',(SELECT tenant_id FROM schedules WHERE id=$2),$3,0.5)`,
+		trace1, schedID, owner.ID)
+	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, tenant_id, user_id, cost_usd)
+		VALUES ($1,'cardgen','test-model',(SELECT tenant_id FROM schedules WHERE id=$2),$3,0.25)`,
+		trace1, schedID, owner.ID)
+	mustExec(t, `INSERT INTO llm_calls (trace_id, span_name, model, tenant_id, user_id, cost_usd)
+		VALUES ($1,'score','test-model',(SELECT tenant_id FROM schedules WHERE id=$2),$3,9.9)`,
+		foreignTrace, foreignSchedID, stranger.ID)
 
 	t.Cleanup(func() {
 		cctx, cancel := cleanupContext()

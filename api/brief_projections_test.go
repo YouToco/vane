@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/taskhealth"
 	"github.com/YouToco/vane/types"
 )
 
@@ -602,8 +603,14 @@ func TestTaskHealthProjectionUsesControlledFailureCostAndExactRole(t *testing.T)
 			FailureCode:    string(types.CodeLLMRateLimit),
 		},
 		&store.ScheduleRunCost{
-			LLMCostUSD: 1.25,
-			LLMCalls:   3,
+			LLMCostUSD:                 1.25,
+			LLMCalls:                   3,
+			ToolCostUSD:                0.21,
+			ToolCalls:                  3,
+			ToolPricedCalls:            3,
+			LatestAcquisitionCalls:     3,
+			LatestAcquisitionFailures:  1,
+			LatestAcquisitionErrorType: types.ToolErrHTTP,
 		},
 		types.MembershipRoleOwner,
 		true,
@@ -614,9 +621,16 @@ func TestTaskHealthProjectionUsesControlledFailureCostAndExactRole(t *testing.T)
 		t.Fatalf("health failure projection=%#v", health)
 	}
 	if health.Usage == nil ||
-		health.Usage.Coverage != "llm_only" ||
-		health.Usage.KnownCostUSD != 1.25 {
+		health.Usage.Coverage != "llm_and_tools" ||
+		health.Usage.KnownCostUSD != 1.46 ||
+		health.Usage.ToolCalls == nil ||
+		*health.Usage.ToolCalls != 3 {
 		t.Fatalf("health usage projection=%#v", health.Usage)
+	}
+	if health.Acquisition.FailureReason !=
+		taskhealth.AcquisitionFailureProviderV1 {
+		t.Fatalf("health acquisition projection=%#v",
+			health.Acquisition)
 	}
 	if !health.Permissions.CanRun ||
 		!health.Permissions.CanPause ||

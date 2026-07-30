@@ -8,10 +8,9 @@
 // 这**只覆盖推送管道运行**：agent 会话、深挖、A2A 的调用不挂任务批次，不在此口径内；
 // 020 之前的历史批次 schedule_id 为 NULL，同样不计入。宁可少算、口径清晰，不编大数。
 //
-// **tool_calls（Exa/TikHub 抓取费）刻意不归集**：管道抓取的记账 trace 锚是 workflow
-// execution ID 而非管线 traceID（workflow/activities.go 的绑定引擎注释——PushParams 没有
-// traceID，为它改活动入参会碰在途 run 的确定性），与 idempotency_key 永不相等；按执行 ID
-// 前缀模糊匹配是靠字符串巧合的口径，宁缺毋滥。待写入侧 trace 锚统一后再补（独立车道）。
+// 抓取侧 tool_calls 的 trace 锚是 Temporal workflow ID。task_run_snapshots 已把该 ID
+// 与 exact tenant/user/task 不可变绑定，因此工具成本通过 snapshot EXISTS 精确归集；
+// 不按时间、字符串前缀或当前任务手册猜测。没有 snapshot 的 legacy 调用保持未归因。
 package store
 
 import (
@@ -57,11 +56,18 @@ type ScheduleRunSummary struct {
 	SentPushes7d   int64      `json:"sent_pushes_7d"`
 }
 
-// ScheduleRunCost 任务运行 LLM 成本（口径见文件头注释：仅推送管道运行，trace 归集；
-// 抓取侧 tool_calls 因 trace 锚不一致本批不做，字段留白胜过编数）。
+// ScheduleRunCost 是任务运行的已知成本与最近一次取材调用摘要。
+// ToolPricedCalls 小于 ToolCalls 表示部分上游回执没有可信 cost_usd；调用仍计数，
+// 已知金额仍保留为下限，但上层不得宣称完整成本。
 type ScheduleRunCost struct {
-	LLMCostUSD float64 `json:"llm_cost_usd"`
-	LLMCalls   int64   `json:"llm_calls"`
+	LLMCostUSD                 float64 `json:"llm_cost_usd"`
+	LLMCalls                   int64   `json:"llm_calls"`
+	ToolCostUSD                float64 `json:"tool_cost_usd"`
+	ToolCalls                  int64   `json:"tool_calls"`
+	ToolPricedCalls            int64   `json:"tool_priced_calls"`
+	LatestAcquisitionCalls     int     `json:"latest_acquisition_calls"`
+	LatestAcquisitionFailures  int     `json:"latest_acquisition_failures"`
+	LatestAcquisitionErrorType string  `json:"latest_acquisition_error_type,omitempty"`
 }
 
 // ListScheduleBatches 按任务倒序返回运行历史（push_batches + 每批投递计数）。
@@ -204,18 +210,93 @@ func (s *Store) GetScheduleRunSummary(ctx context.Context, userID int64, schedul
 	return &sum, nil
 }
 
-// GetScheduleRunCost 按 trace 归集任务运行 LLM 成本（口径见文件头注释）。
-// 无可归集调用 → 全零结构体，不是错误；他人任务同样得全零（批次带 user_id 谓词）。
+// GetScheduleRunCost 按两个不可变锚归集任务成本：LLM 走 push batch trace，
+// acquisition Tool 走 task run snapshot workflow identity。无可归集调用返回全零；
+// 他人任务也返回全零，不泄露任务或调用是否存在。
 func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID string) (*ScheduleRunCost, error) {
 	var out ScheduleRunCost
 	if err := s.pool.QueryRow(ctx,
 		`SELECT COALESCE(sum(lc.cost_usd), 0), count(*)
 		   FROM llm_calls lc
 		   JOIN push_batches pb ON pb.idempotency_key = lc.trace_id
-		  WHERE pb.user_id = $1 AND pb.schedule_id = $2 AND pb.idempotency_key <> ''`,
+		  WHERE pb.user_id = $1 AND pb.schedule_id = $2
+		    AND lc.user_id = $1
+		    AND lc.tenant_id IS NOT DISTINCT FROM pb.tenant_id
+		    AND pb.idempotency_key <> ''`,
 		userID, scheduleID).Scan(&out.LLMCostUSD, &out.LLMCalls); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase,
 			fmt.Sprintf("归集任务 LLM 成本（schedule_id=%s）", scheduleID), err)
+	}
+	if err := s.pool.QueryRow(ctx,
+		`WITH authorized_task AS (
+		     SELECT tenant_id
+		       FROM schedules
+		      WHERE id = $2 AND user_id = $1
+		   )
+		 SELECT COALESCE(sum(tc.cost_usd), 0),
+		        count(*),
+		        count(tc.cost_usd)
+		   FROM tool_calls tc
+		   JOIN authorized_task task
+		     ON tc.tenant_id IS NOT DISTINCT FROM task.tenant_id
+		  WHERE tc.user_id = $1
+		    AND tc.tool_kind IN ($3, $4)
+		    AND EXISTS (
+		         SELECT 1
+		           FROM task_run_snapshots rs
+		          WHERE rs.tenant_id = task.tenant_id
+		            AND rs.user_id = $1
+		            AND rs.task_id = $2
+		            AND rs.temporal_workflow_id = tc.trace_id
+		    )`,
+		userID, scheduleID,
+		types.ToolCallKindBindingFetch, types.ToolCallKindExaFetch,
+	).Scan(&out.ToolCostUSD, &out.ToolCalls, &out.ToolPricedCalls); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("归集任务取材成本（schedule_id=%s）", scheduleID), err)
+	}
+	if err := s.pool.QueryRow(ctx,
+		`WITH latest_run AS (
+		     SELECT tenant_id, user_id, task_id, temporal_workflow_id
+		       FROM task_run_snapshots
+		      WHERE user_id = $1 AND task_id = $2
+		      ORDER BY created_at DESC, id DESC
+		      LIMIT 1
+		   ),
+		   latest_calls AS (
+		     SELECT tc.error_type
+		       FROM tool_calls tc
+		       JOIN latest_run run
+		         ON tc.tenant_id IS NOT DISTINCT FROM run.tenant_id
+		        AND tc.user_id = run.user_id
+		        AND tc.trace_id = run.temporal_workflow_id
+		      WHERE tc.tool_kind IN ($3, $4)
+		   )
+		 SELECT count(*),
+		        count(*) FILTER (WHERE error_type <> ''),
+		        COALESCE((
+		          SELECT error_type
+		            FROM latest_calls
+		           WHERE error_type <> ''
+		           ORDER BY CASE error_type
+		             WHEN 'budget_exceeded' THEN 1
+		             WHEN 'invalid_args' THEN 2
+		             WHEN 'timeout' THEN 3
+		             WHEN 'http_error' THEN 4
+		             ELSE 5
+		           END
+		           LIMIT 1
+		        ), '')
+		   FROM latest_calls`,
+		userID, scheduleID,
+		types.ToolCallKindBindingFetch, types.ToolCallKindExaFetch,
+	).Scan(
+		&out.LatestAcquisitionCalls,
+		&out.LatestAcquisitionFailures,
+		&out.LatestAcquisitionErrorType,
+	); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase,
+			fmt.Sprintf("归集最近任务取材状态（schedule_id=%s）", scheduleID), err)
 	}
 	return &out, nil
 }
