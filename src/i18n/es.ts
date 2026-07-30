@@ -361,6 +361,7 @@ export const es: Dict = {
       ownerBadge: "Administración de la plataforma · solo owner",
       tabObservability: "Observabilidad",
       tabCosts: "Costes LLM",
+      tabCallCosts: "Registro de llamadas",
       tabPricing: "Precios",
       tabInvites: "Usuarios e invitaciones",
       zhOnly: "Los paneles de observabilidad y costes son vistas de operación de la plataforma y por ahora solo están en chino.",

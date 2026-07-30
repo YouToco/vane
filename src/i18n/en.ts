@@ -361,6 +361,7 @@ export const en: Dict = {
       ownerBadge: "Platform admin · owner only",
       tabObservability: "Observability",
       tabCosts: "LLM costs",
+      tabCallCosts: "Call ledger",
       tabPricing: "Pricing",
       tabInvites: "Users & invites",
       zhOnly: "The observability and cost dashboards are platform-ops views and currently Chinese-only.",
