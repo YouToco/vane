@@ -1,4 +1,4 @@
--- 079: 可版本化 Provider 价格目录 + 精确用量计价回执。
+-- 080: 可版本化 Provider 价格目录 + 精确用量计价回执。
 --
 -- 单价不能编译进 binary：模型、Exa、TikHub 都会改价，且同一供应商存在
 -- token 三段价、按请求/页面计价等不同 meter。价格规则是平台全局配置，
@@ -178,7 +178,7 @@ INSERT INTO provider_price_rules (
     effective_from, source_url, note, created_by
 )
 SELECT provider, resource, 'llm_tokens', 'USD', hit_price, miss_price, output_price,
-       TIMESTAMPTZ '2026-07-30 00:00:00+00', source_url, '079 初始官方价', NULL
+       TIMESTAMPTZ '2026-07-30 00:00:00+00', source_url, '080 初始官方价', NULL
   FROM (VALUES
     ('deepseek', 'deepseek-v4-flash', 0.0028::numeric, 0.14::numeric, 0.28::numeric,
      'https://api-docs.deepseek.com/quick_start/pricing'),
@@ -195,7 +195,7 @@ INSERT INTO provider_price_rules (
 )
 SELECT provider, resource, 'request', 'USD', unit_price, included_quantity,
        additional_unit_price,
-       TIMESTAMPTZ '2026-07-30 00:00:00+00', source_url, '079 初始官方价', NULL
+       TIMESTAMPTZ '2026-07-30 00:00:00+00', source_url, '080 初始官方价', NULL
   FROM (VALUES
     ('exa', '/search', 0.007::numeric, 10::numeric, 0.001::numeric, 'https://exa.ai/pricing'),
     ('exa', '/contents', 0.001::numeric, 1::numeric, 0.001::numeric, 'https://exa.ai/pricing'),
