@@ -936,6 +936,39 @@ func TestToolCandidatePipelineV2_PreservesInvocationProvenance(
 	}
 }
 
+func TestDedupToolCandidateBatchV2PreservesIndependentEvidence(t *testing.T) {
+	candidates := []runcontext.ToolCandidateV1{
+		{
+			InvocationDigest: strings.Repeat("a", 64),
+			Item: types.ContentItem{
+				ID: 1, Kind: types.KindArticle,
+				Title: "Claude Opus 5 release",
+				URL:   "https://www.anthropic.com/news/claude-opus-5",
+				Content: "Claude Opus 5 release with one million token " +
+					"context.",
+			},
+		},
+		{
+			InvocationDigest: strings.Repeat("b", 64),
+			Item: types.ContentItem{
+				ID: 2, Kind: types.KindArticle,
+				Title: "Claude Opus 5 release",
+				URL:   "https://media.example/claude-opus-5",
+				Content: "Claude Opus 5 release with one million token " +
+					"context.",
+			},
+		},
+	}
+	if got := dedupToolCandidateBatchV2(candidates, nil, false); len(got) != 1 {
+		t.Fatalf("ordinary near-duplicate count=%d, want 1", len(got))
+	}
+	got := dedupToolCandidateBatchV2(candidates, nil, true)
+	if len(got) != 2 || got[0].Item.Simhash == nil ||
+		got[1].Item.Simhash == nil {
+		t.Fatalf("independent evidence was collapsed: %+v", got)
+	}
+}
+
 func TestScoreToolCandidatesV2_RejectsTamperedPayloadBeforeSpend(
 	t *testing.T,
 ) {

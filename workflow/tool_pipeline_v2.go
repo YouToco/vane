@@ -300,12 +300,25 @@ func (a *Activities) DedupToolCandidatesV2(
 	if err != nil {
 		return nil, retryableOrNot(err)
 	}
-	batchSeen := make([]int64, 0, len(in.Candidates))
-	kept := make([]runcontext.ToolCandidateV1, 0, len(in.Candidates))
-	for _, candidate := range in.Candidates {
+	return dedupToolCandidateBatchV2(
+		in.Candidates,
+		history,
+		taskManualRequiresCrossEvidence(snapshot.Definition.TaskManual),
+	), nil
+}
+
+func dedupToolCandidateBatchV2(
+	candidates []runcontext.ToolCandidateV1,
+	history []int64,
+	preserveIndependentEvidence bool,
+) []runcontext.ToolCandidateV1 {
+	batchSeen := make([]int64, 0, len(candidates))
+	kept := make([]runcontext.ToolCandidateV1, 0, len(candidates))
+	for _, candidate := range candidates {
 		sh := dedup.Simhash(candidate.Item.Title + " " + candidate.Item.Content)
 		candidate.Item.Simhash = &sh
-		if candidate.Item.Kind == types.KindPageContent {
+		if candidate.Item.Kind == types.KindPageContent ||
+			preserveIndependentEvidence {
 			kept = append(kept, candidate)
 			continue
 		}
@@ -316,7 +329,7 @@ func (a *Activities) DedupToolCandidatesV2(
 		kept = append(kept, candidate)
 		batchSeen = append(batchSeen, sh)
 	}
-	return kept, nil
+	return kept
 }
 
 // QualifyToolCandidatesV2 makes the sealed task manual an authority gate over
@@ -435,13 +448,15 @@ func (a *Activities) QualifyToolCandidatesV2(
 	result, _, err := a.eventQualifier.Qualify(
 		ctx,
 		eventqualifier.Request{
-			TenantID:    expected.TenantID,
-			UserID:      expected.UserID,
-			TraceID:     in.TraceID,
-			Policy:      *policy,
-			Window:      window,
-			TaskManual:  snapshot.Definition.TaskManual,
-			Candidates:  candidates,
+			TenantID:   expected.TenantID,
+			UserID:     expected.UserID,
+			TraceID:    in.TraceID,
+			Policy:     *policy,
+			Window:     window,
+			TaskManual: snapshot.Definition.TaskManual,
+			Candidates: candidates,
+			OfficialContentIDs: officialContentIDsForTask(
+				candidates, snapshot.Definition.TaskManual),
 			Client:      modelClient,
 			ModelCall:   modelCall,
 			QuotaRule:   &quotaRule,

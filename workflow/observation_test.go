@@ -285,18 +285,41 @@ func TestValidateQualifiedEventsRejectsUnrelatedCrossEvidence(t *testing.T) {
 func TestOfficialHostGroundedInTaskManualRejectsPathImpersonation(t *testing.T) {
 	manual := "监控 OpenAI、Anthropic 和 Google DeepMind 的官方原文。"
 	for rawURL, want := range map[string]bool{
-		"https://openai.com/index/model":                  true,
-		"https://www.anthropic.com/news/model":            true,
-		"https://ai.google.dev/gemini-api/docs/changelog": true,
-		"https://deepmind.google/discover/blog/model":     true,
-		"https://releasebot.io/updates/anthropic/model":   false,
-		"https://media.example/openai/model":              false,
-		"http://openai.com/insecure":                      false,
+		"https://openai.com/index/model":                   true,
+		"https://www.anthropic.com/news/model":             true,
+		"https://ai.google.dev/gemini-api/docs/changelog":  true,
+		"https://blog.google/technology/ai/update":         true,
+		"https://cloud.google.com/blog/products/ai/update": true,
+		"https://deepmind.google/discover/blog/model":      true,
+		"https://releasebot.io/updates/anthropic/model":    false,
+		"https://media.example/openai/model":               false,
+		"http://openai.com/insecure":                       false,
 	} {
 		if got := officialHostGroundedInTaskManual(rawURL, manual); got != want {
 			t.Errorf("officialHostGroundedInTaskManual(%q)=%t want %t",
 				rawURL, got, want)
 		}
+	}
+}
+
+func TestOfficialContentIDsForTaskUsesHostNotBranding(t *testing.T) {
+	items := []types.ContentItem{
+		{ID: 1, URL: "https://www.anthropic.com/news/claude-opus-5"},
+		{ID: 2, URL: "https://blog.google/technology/ai/update"},
+		{ID: 3, URL: "https://releasebot.io/updates/anthropic/claude-opus-5"},
+	}
+	got := officialContentIDsForTask(
+		items,
+		"监控 Anthropic 和 Google DeepMind；必须有官方原文交叉核验。",
+	)
+	if _, ok := got[1]; !ok {
+		t.Fatal("Anthropic official host was not marked")
+	}
+	if _, ok := got[2]; !ok {
+		t.Fatal("Google official host was not marked")
+	}
+	if _, ok := got[3]; ok {
+		t.Fatal("third-party branding was marked official")
 	}
 }
 

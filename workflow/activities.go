@@ -2782,21 +2782,8 @@ func (a *Activities) qualifyEventCandidates(
 			Candidates: candidates, Client: modelClient, ModelCall: modelCall,
 			QuotaRule: quotaRule, BeforeSpend: beforeSpend,
 		}
-		if taskManualRequiresOfficialOriginal(
-			snapshot.Definition.PlaybookContent,
-		) {
-			qualifierRequest.OfficialContentIDs =
-				make(map[int64]struct{}, len(candidates))
-			for _, candidate := range candidates {
-				if officialHostGroundedInTaskManual(
-					candidate.URL,
-					snapshot.Definition.PlaybookContent,
-				) {
-					qualifierRequest.OfficialContentIDs[candidate.ID] =
-						struct{}{}
-				}
-			}
-		}
+		qualifierRequest.OfficialContentIDs = officialContentIDsForTask(
+			candidates, snapshot.Definition.PlaybookContent)
 		if rollout == observation.RolloutShadow {
 			result, canonical, err = a.eventQualifier.QualifyObservationShadow(
 				ctx, qualifierRequest)
@@ -3133,6 +3120,22 @@ func officialHostGroundedInTaskManual(rawURL, taskManual string) bool {
 		}
 	}
 	return false
+}
+
+func officialContentIDsForTask(
+	candidates []types.ContentItem,
+	taskManual string,
+) map[int64]struct{} {
+	if !taskManualRequiresOfficialOriginal(taskManual) {
+		return nil
+	}
+	ids := make(map[int64]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if officialHostGroundedInTaskManual(candidate.URL, taskManual) {
+			ids[candidate.ID] = struct{}{}
+		}
+	}
+	return ids
 }
 
 func hasIndependentEvidenceHost(
