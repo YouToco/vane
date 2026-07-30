@@ -591,6 +591,80 @@ func TestBriefPublicProjectionsDoNotExposeIntegrityMetadata(t *testing.T) {
 	}
 }
 
+func TestTaskHealthProjectionUsesControlledFailureCostAndExactRole(t *testing.T) {
+	now := time.Date(2026, 7, 29, 18, 0, 0, 0, time.UTC)
+	health := projectTaskHealthV1(
+		&store.TaskLatestCheckV1{
+			FinalizedAt:    now,
+			Result:         types.RunResultFailed,
+			SourceCoverage: types.RunCompletenessPartial,
+			Processing:     types.RunCompletenessPartial,
+			FailureCode:    string(types.CodeLLMRateLimit),
+		},
+		&store.ScheduleRunCost{
+			LLMCostUSD: 1.25,
+			LLMCalls:   3,
+		},
+		types.MembershipRoleOwner,
+		true,
+	)
+	if health.State != "attention" ||
+		health.Issue != "model_temporarily_unavailable" ||
+		health.RecommendedAction != "wait_for_retry" {
+		t.Fatalf("health failure projection=%#v", health)
+	}
+	if health.Usage == nil ||
+		health.Usage.Coverage != "llm_only" ||
+		health.Usage.KnownCostUSD != 1.25 {
+		t.Fatalf("health usage projection=%#v", health.Usage)
+	}
+	if !health.Permissions.CanRun ||
+		!health.Permissions.CanPause ||
+		!health.Permissions.CanEdit ||
+		!health.Permissions.CanDelete ||
+		!health.Permissions.CanViewUsage {
+		t.Fatalf("owner health permissions=%#v", health.Permissions)
+	}
+
+	member := projectTaskHealthV1(
+		nil,
+		&store.ScheduleRunCost{LLMCostUSD: 99, LLMCalls: 8},
+		types.MembershipRoleMember,
+		true,
+	)
+	if member.Usage == nil ||
+		!member.Permissions.CanRun ||
+		!member.Permissions.CanEdit ||
+		!member.Permissions.CanDelete ||
+		!member.Permissions.CanViewUsage {
+		t.Fatalf("task-owned authority drifted by membership label=%#v", member)
+	}
+}
+
+func TestTaskHealthMembershipRoleRequiresExactTenantAndUser(t *testing.T) {
+	memberships := []types.Membership{
+		{
+			TenantID: 7,
+			UserID:   11,
+			Role:     types.MembershipRoleAdmin,
+		},
+		{
+			TenantID: 8,
+			UserID:   12,
+			Role:     types.MembershipRoleOwner,
+		},
+	}
+	if got := membershipRoleForTenantV1(memberships, 7, 11); got != types.MembershipRoleAdmin {
+		t.Fatalf("exact membership role=%q", got)
+	}
+	if got := membershipRoleForTenantV1(memberships, 7, 12); got != "" {
+		t.Fatalf("cross-user membership escaped=%q", got)
+	}
+	if got := membershipRoleForTenantV1(memberships, 8, 11); got != "" {
+		t.Fatalf("cross-tenant membership escaped=%q", got)
+	}
+}
+
 func TestGroundedContextDeepDiveRequiresExactFrozenReference(t *testing.T) {
 	contextValue := store.GroundedBriefContextV1{
 		Content: types.ExecutiveBriefContentV1{

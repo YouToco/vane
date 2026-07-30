@@ -25,14 +25,14 @@ const (
 type IssueV1 string
 
 const (
-	IssueNoneV1               IssueV1 = ""
-	IssueCoverageIncompleteV1 IssueV1 = "coverage_incomplete"
-	IssueSourcesUnavailableV1 IssueV1 = "sources_unavailable"
-	IssueQuotaPausedV1        IssueV1 = "quota_paused"
-	IssueModelUnavailableV1   IssueV1 = "model_temporarily_unavailable"
-	IssueDeliveryFailedV1     IssueV1 = "delivery_failed"
-	IssueCheckInterruptedV1   IssueV1 = "check_interrupted"
-	IssueCheckFailedV1        IssueV1 = "check_failed"
+	IssueNoneV1                   IssueV1 = ""
+	IssueCoverageIncompleteV1     IssueV1 = "coverage_incomplete"
+	IssueAcquisitionUnavailableV1 IssueV1 = "acquisition_unavailable"
+	IssueQuotaPausedV1            IssueV1 = "quota_paused"
+	IssueModelUnavailableV1       IssueV1 = "model_temporarily_unavailable"
+	IssueDeliveryFailedV1         IssueV1 = "delivery_failed"
+	IssueCheckInterruptedV1       IssueV1 = "check_interrupted"
+	IssueCheckFailedV1            IssueV1 = "check_failed"
 )
 
 type RecommendedActionV1 string
@@ -40,7 +40,7 @@ type RecommendedActionV1 string
 const (
 	ActionNoneV1           RecommendedActionV1 = ""
 	ActionWaitForRetryV1   RecommendedActionV1 = "wait_for_retry"
-	ActionReviewSourcesV1  RecommendedActionV1 = "review_sources"
+	ActionReviewTaskV1     RecommendedActionV1 = "review_task"
 	ActionReviewUsageV1    RecommendedActionV1 = "review_usage"
 	ActionReviewDeliveryV1 RecommendedActionV1 = "review_delivery"
 	ActionRunAgainV1       RecommendedActionV1 = "run_again"
@@ -74,7 +74,7 @@ type LatestCheckV1 struct {
 	FinalizedAt    time.Time
 }
 
-type SourceSummaryV1 struct {
+type AcquisitionSummaryV1 struct {
 	Total        int `json:"total"`
 	Failing      int `json:"failing"`
 	MaxFailCount int `json:"max_fail_count"`
@@ -94,6 +94,7 @@ type UsageV1 struct {
 
 type AccessV1 struct {
 	Role                  types.MembershipRole
+	TaskAccessVerified    bool
 	DefinitionEditEnabled bool
 }
 
@@ -118,34 +119,35 @@ type UsageProjectionV1 struct {
 }
 
 type ProjectionV1 struct {
-	SchemaVersion     string              `json:"schema_version"`
-	State             StateV1             `json:"state"`
-	Issue             IssueV1             `json:"issue,omitempty"`
-	RecommendedAction RecommendedActionV1 `json:"recommended_action,omitempty"`
-	LastCheckedAt     *time.Time          `json:"last_checked_at,omitempty"`
-	Sources           SourceSummaryV1     `json:"sources"`
-	Usage             *UsageProjectionV1  `json:"usage,omitempty"`
-	Permissions       PermissionsV1       `json:"permissions"`
+	SchemaVersion     string               `json:"schema_version"`
+	State             StateV1              `json:"state"`
+	Issue             IssueV1              `json:"issue,omitempty"`
+	RecommendedAction RecommendedActionV1  `json:"recommended_action,omitempty"`
+	LastCheckedAt     *time.Time           `json:"last_checked_at,omitempty"`
+	Acquisition       AcquisitionSummaryV1 `json:"acquisition"`
+	Usage             *UsageProjectionV1   `json:"usage,omitempty"`
+	Permissions       PermissionsV1        `json:"permissions"`
 }
 
 func ProjectV1(
 	latest *LatestCheckV1,
-	sources SourceSummaryV1,
+	acquisition AcquisitionSummaryV1,
 	usage UsageV1,
 	access AccessV1,
 ) ProjectionV1 {
 	permissions := projectPermissionsV1(access)
-	normalizedSources, sourcesValid := normalizeSourcesV1(sources)
+	normalizedAcquisition, acquisitionValid :=
+		normalizeAcquisitionV1(acquisition)
 	projection := ProjectionV1{
 		SchemaVersion: SchemaVersionV1,
-		Sources:       normalizedSources,
+		Acquisition:   normalizedAcquisition,
 		Permissions:   permissions,
 	}
 	if permissions.CanViewUsage {
 		projected := projectUsageV1(usage)
 		projection.Usage = &projected
 	}
-	if !sourcesValid {
+	if !acquisitionValid {
 		return failedProjectionV1(projection, IssueCheckFailedV1,
 			ActionContactSupportV1)
 	}
@@ -163,10 +165,10 @@ func ProjectV1(
 	switch latest.Result {
 	case types.RunResultContent, types.RunResultQuiet:
 		switch {
-		case normalizedSources.Failing > 0:
+		case normalizedAcquisition.Failing > 0:
 			projection.State = StateAttentionV1
-			projection.Issue = IssueSourcesUnavailableV1
-			projection.RecommendedAction = ActionReviewSourcesV1
+			projection.Issue = IssueAcquisitionUnavailableV1
+			projection.RecommendedAction = ActionReviewTaskV1
 		case latest.SourceCoverage == types.RunCompletenessPartial ||
 			latest.Processing == types.RunCompletenessPartial:
 			projection.State = StateAttentionV1
@@ -225,7 +227,7 @@ func failurePresentationV1(code string) (IssueV1, RecommendedActionV1) {
 	case types.CodeQuotaExceeded:
 		return IssueQuotaPausedV1, ActionReviewUsageV1
 	case types.CodeFetchTimeout, types.CodeFetchRateLimit:
-		return IssueSourcesUnavailableV1, ActionReviewSourcesV1
+		return IssueAcquisitionUnavailableV1, ActionReviewTaskV1
 	case types.CodeLLMRateLimit, types.CodeLLMUnavailable:
 		return IssueModelUnavailableV1, ActionWaitForRetryV1
 	case types.CodePushFailed:
@@ -240,13 +242,15 @@ func failurePresentationV1(code string) (IssueV1, RecommendedActionV1) {
 	}
 }
 
-func normalizeSourcesV1(in SourceSummaryV1) (SourceSummaryV1, bool) {
+func normalizeAcquisitionV1(
+	in AcquisitionSummaryV1,
+) (AcquisitionSummaryV1, bool) {
 	valid := in.Total >= 0 && in.Failing >= 0 &&
 		in.Failing <= in.Total && in.MaxFailCount >= 0 &&
 		((in.Failing == 0 && in.MaxFailCount == 0) ||
 			(in.Failing > 0 && in.MaxFailCount > 0))
 	if !valid {
-		return SourceSummaryV1{}, false
+		return AcquisitionSummaryV1{}, false
 	}
 	return in, true
 }
@@ -306,23 +310,24 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 func projectPermissionsV1(in AccessV1) PermissionsV1 {
 	out := PermissionsV1{Role: in.Role}
 	switch in.Role {
-	case types.MembershipRoleOwner:
-		out.CanRun = true
-		out.CanPause = true
-		out.CanEdit = in.DefinitionEditEnabled
-		out.CanDelete = true
-		out.CanViewUsage = true
-	case types.MembershipRoleAdmin:
-		out.CanRun = true
-		out.CanPause = true
-		out.CanEdit = in.DefinitionEditEnabled
-		out.CanViewUsage = true
-	case types.MembershipRoleMember:
-		// Members remain read-only until team task permissions have an
-		// explicit authority model.
+	case types.MembershipRoleOwner,
+		types.MembershipRoleAdmin,
+		types.MembershipRoleMember:
 	default:
 		out.Role = ""
 	}
+	if !in.TaskAccessVerified {
+		return out
+	}
+	// Current task actions authorize the authenticated user against the exact
+	// task owner, not the tenant membership label. ListTaskBriefsV1 has already
+	// locked and verified that same tenant/user/task tuple before this
+	// projection is built, so these booleans mirror the real action endpoints.
+	out.CanRun = true
+	out.CanPause = true
+	out.CanEdit = in.DefinitionEditEnabled
+	out.CanDelete = true
+	out.CanViewUsage = true
 	return out
 }
 
