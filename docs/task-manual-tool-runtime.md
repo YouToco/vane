@@ -176,6 +176,44 @@ tenant/user/task → approved Tool invocation → run snapshot
 
 Display labels are not acquisition identity.
 
+### Live evidence qualification
+
+The Tool runtime does not treat a successful search request as a publishable
+result. After canonical content dedup and before score/card generation, it
+applies the sealed observation policy and task manual to the current run's
+live Tool candidates.
+
+- The qualifier receives the task manual, current deterministic observation
+  window and only the canonical candidate content fetched in this run.
+- It has no Tool surface and cannot use model memory as evidence.
+- If the manual requires an official original, a matching event must cite the
+  official page from the current candidate set first. Media coverage, reposts
+  and results without live page text alone cannot qualify an event.
+- If the manual requires cross verification, the event must cite at least one
+  different current-run candidate after the primary. Its publication time may
+  differ, but it must remain inside the deterministic observation window.
+- `no_match`, uncertain model output, malformed citations and unavailable
+  evidence all stop before score, card generation and push.
+- Card generation follows explicit output fields in the task manual. Its
+  generic three-part layout is only a default. The model cannot author URLs:
+  official and cross-evidence links are rendered from the admitted canonical
+  evidence bundle, and a model-authored URL fails closed.
+- The ordered evidence manifest is persisted with each Tool V2 delivery.
+  Application and database admission both prove every content/invocation pair
+  belongs to the exact frozen run snapshot; the push boundary re-derives
+  presentation metadata from canonical content before any external effect.
+  A new qualification run freezes whether evidence is required; required
+  evidence cannot be omitted or later erased. Pre-qualification Temporal
+  histories deserialize the new flag as false and retain replay compatibility.
+- Chinese and English manuals use the same semantic output contract. Change
+  and impact fields may be written in either approved language; official and
+  cross-evidence URLs remain system-owned in both.
+
+This keeps responsibilities small: acquisition Tools observe the live world;
+the strong model performs bounded semantic judgment over those observations;
+deterministic code enforces ownership, window, citation identity, quota and
+the no-push terminal gates.
+
 ## Compatibility boundary
 
 The deployed v1 snapshot and content provenance schema used positive global
@@ -189,6 +227,33 @@ IDs. Until their evidence is migrated, the old physical acquisition tables are:
 - forbidden from receiving new private query, URL or configuration data.
 
 This is a temporary compatibility root, not the target architecture.
+
+The words `source` and `sources` may still appear in retained V1 replay,
+historical evidence and human-readable evidence lists. They do not imply a
+current Source product entity. Deleting those compatibility readers before
+their durable histories are drained would destroy replay or evidence; adding
+new current writers to them is forbidden.
+
+## Deliberate simplification log
+
+The runtime configuration must expose only controls that change behavior.
+The following no-op knobs were removed in 7.10-B2:
+
+- `agent.token_budget_daily`: never enforced and duplicated the durable tenant
+  quota mechanism;
+- `agent.endpoint_msg_cap` and `agent.exa_msg_cap`: ignored after the single
+  per-message Tool fuse became authoritative.
+
+The rolling daily provider caps remain because they protect real billable
+effects. Historical profile quota columns remain data compatibility fields,
+not runtime controls.
+
+One operational debt remains intentionally separate from this behavior patch:
+the exact-task release train is represented by many nested canary settings.
+They currently protect independently recoverable historical stages, so simply
+deleting them would weaken rollback safety. The target is one operator-facing
+release selector that derives the internal stage scopes atomically, plus
+quarantine of a failed recovery effect instead of process-fatal startup.
 
 ## Removal sequence
 

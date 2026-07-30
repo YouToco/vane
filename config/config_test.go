@@ -1100,7 +1100,6 @@ pipeline:
   playbook_prompts_allow_all: false
 agent:
   max_turns: 15
-  token_budget_daily: 50000
 log:
   level: "debug"
 `)
@@ -1140,7 +1139,6 @@ log:
 		{"pipeline.playbook_prompt_canary_schedule_id", cfg.Pipeline.PlaybookPromptCanaryScheduleID, "schedule-yaml"},
 		{"pipeline.playbook_prompts_allow_all", cfg.Pipeline.PlaybookPromptsAllowAll, false},
 		{"agent.max_turns", cfg.Agent.MaxTurns, 15},
-		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 50000},
 		{"log.level", cfg.Log.Level, "debug"},
 	}
 	for _, c := range checks {
@@ -1454,7 +1452,6 @@ func TestDefaults(t *testing.T) {
 		{"agent.intent_toolkits_shadow_enabled", cfg.Agent.IntentToolkitsShadowEnabled, true},
 		{"agent.intent_toolkits_owner_canary", cfg.Agent.IntentToolkitsOwnerCanary, false},
 		{"agent.intent_toolkits_allow_all", cfg.Agent.IntentToolkitsAllowAll, false},
-		{"agent.token_budget_daily", cfg.Agent.TokenBudgetDaily, 100000},
 		{"agent.session_ttl_minutes", cfg.Agent.SessionTTLMinutes, 30},
 		{"log.level", cfg.Log.Level, "info"},
 	}

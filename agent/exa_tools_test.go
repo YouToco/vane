@@ -302,44 +302,6 @@ func TestReadPage_错误翻译(t *testing.T) {
 // 双重限额（对抗审查 HIGH）：按次计费 + 免确认就必须有频率护栏。
 // ============================================================
 
-// msgCap remains constructor-compatible but no longer imposes a planning
-// quota; the Agent loop owns the unified hidden fuse.
-func TestExaTools_消息内旧限额不再拦截(t *testing.T) {
-	fs := &fakeWebSearcher{}
-	et := &ExaTools{searcher: fs, msgCap: 2}
-	tl := &webSearchTool{et: et}
-	state := &toolRunState{}
-	ctx := ctxWithRun(state, &types.ToolCall{})
-
-	// 前 2 次放行并计数。
-	for i := 1; i <= 2; i++ {
-		if _, err := tl.Execute(ctx, 1, json.RawMessage(`{"query":"x"}`)); err != nil {
-			t.Fatalf("第 %d 次调用失败: %v", i, err)
-		}
-	}
-	if fs.calls != 2 || state.exaCalls != 2 {
-		t.Fatalf("前 2 次应放行且计数，实得 upstream=%d exaCalls=%d", fs.calls, state.exaCalls)
-	}
-	// 第 3 次仍放行；provider-family count is observation-only.
-	rec := &types.ToolCall{}
-	out, err := tl.Execute(ctxWithRun(state, rec), 1, json.RawMessage(`{"query":"x"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out, "没有搜到") || fs.calls != 3 ||
-		rec.ErrorType != "" {
-		t.Errorf("legacy cap should not reject: out=%q calls=%d type=%q",
-			out, fs.calls, rec.ErrorType)
-	}
-	// 参数校验失败不吃限额（没打上游）。
-	if _, err := tl.Execute(ctxWithRun(state, &types.ToolCall{}), 1, json.RawMessage(`{"query":" "}`)); err != nil {
-		t.Fatal(err)
-	}
-	if state.exaCalls != 3 {
-		t.Errorf("校验失败不该增加计数，实得 %d", state.exaCalls)
-	}
-}
-
 // TestExaTools_每日限额与failclosed 钉住第二重：24h 窗口达 dailyCap 拒绝；
 // 计数查询失败时 fail-closed 拒绝（护栏失效即放开计费面，宁可少查）。
 func TestExaTools_每日限额与failclosed(t *testing.T) {
@@ -395,7 +357,7 @@ func TestBuildTools_Exa装配(t *testing.T) {
 		}
 		return m
 	}
-	with := names(BuildTools(nil, nil, nil, nil, NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)))
+	with := names(BuildTools(nil, nil, nil, nil, NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)))
 	if !with["web_search"] || !with["read_page"] {
 		t.Errorf("exa 非 nil 时 web_search/read_page 必须在白名单，实得 %v", with)
 	}
@@ -404,7 +366,7 @@ func TestBuildTools_Exa装配(t *testing.T) {
 		t.Errorf("exa=nil 时两工具不得出现（缺 key 不广告），实得 %v", without)
 	}
 	// 两工具成本由工具现有 cap 管理。
-	for _, tl := range BuildTools(nil, nil, nil, nil, NewExaTools(nil, nil, nil, 0, 0)) {
+	for _, tl := range BuildTools(nil, nil, nil, nil, NewExaTools(nil, nil, nil, 0)) {
 		if (tl.Name() == "web_search" || tl.Name() == "read_page") &&
 			tl.Policy.Budget != BudgetToolManaged {
 			t.Errorf("%s 策略不符: %+v", tl.Name(), tl.Policy)

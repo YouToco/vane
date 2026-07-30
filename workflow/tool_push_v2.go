@@ -2,8 +2,11 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"strings"
 
+	cardgenpkg "github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/feedback"
 	"github.com/YouToco/vane/pusheffect"
 	"github.com/YouToco/vane/runcontext"
@@ -11,10 +14,11 @@ import (
 )
 
 type PushToolCardsV2Input struct {
-	UserID  int64                  `json:"user_id"`
-	TraceID string                 `json:"trace_id"`
-	Run     CompiledToolRunInputV2 `json:"run"`
-	Cards   []ToolGeneratedCardV1  `json:"cards"`
+	UserID           int64                  `json:"user_id"`
+	TraceID          string                 `json:"trace_id"`
+	Run              CompiledToolRunInputV2 `json:"run"`
+	Cards            []ToolGeneratedCardV1  `json:"cards"`
+	EvidenceRequired bool                   `json:"evidence_required,omitempty"`
 }
 
 type RecordEmptyToolRunV2Input struct {
@@ -86,6 +90,48 @@ func (a *Activities) PushToolCardsV2(
 			return nonRetryable(types.NewAppError(
 				types.CodeValidation,
 				"compiled Tool push card is invalid", nil))
+		}
+		if in.EvidenceRequired && len(card.Evidence) == 0 {
+			return nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"compiled Tool push card lacks required evidence", nil))
+		}
+		if len(card.Evidence) > 0 {
+			candidates := make(
+				[]runcontext.ToolCandidateV1, len(card.Evidence))
+			sources := make(
+				[]cardgenpkg.EventEvidenceSourceV1, len(card.Evidence))
+			for index := range card.Evidence {
+				candidates[index] = card.Evidence[index].Candidate
+				sources[index] = card.Evidence[index].Source
+			}
+			if candidates[0].Item.ID != card.Card.Scored.Item.ID ||
+				sources[0].ContentItemID != card.Card.Scored.Item.ID {
+				return nonRetryable(types.NewAppError(
+					types.CodeValidation,
+					"compiled Tool push evidence is invalid", nil))
+			}
+			if err := validateToolCandidatesV2(
+				snapshot, candidates); err != nil {
+				return nonRetryable(err)
+			}
+			if err := a.validateCanonicalToolCandidatesV2(
+				ctx, expected, in.Run.Snapshot, candidates); err != nil {
+				return retryableOrNot(err)
+			}
+			canonicalSources, err := toolCardEvidenceSourcesV2(
+				snapshot, candidates)
+			if err != nil || !reflect.DeepEqual(canonicalSources, sources) {
+				return nonRetryable(types.NewAppError(
+					types.CodeValidation,
+					"compiled Tool push evidence differs from canonical content",
+					err))
+			}
+			if err := cardgenpkg.ValidateGroundedEvidenceBodyV1(
+				card.Card.BodyMD, snapshot.Definition.TaskManual,
+				sources); err != nil {
+				return nonRetryable(err)
+			}
 		}
 		scored[i] = runcontext.ToolScoredCandidateV1{
 			InvocationDigest: card.InvocationDigest,
@@ -184,18 +230,25 @@ func (a *Activities) PushToolCardsV2(
 	for _, generated := range in.Cards {
 		card := generated.Card
 		contentID := card.Scored.Item.ID
+		evidenceJSON, evidenceErr :=
+			toolDeliveryEvidenceJSONV1(generated.Evidence)
+		if evidenceErr != nil {
+			return nonRetryable(evidenceErr)
+		}
 		deliveryID, existed, sentAlready, insertErr :=
 			a.compiledToolStoreV2.InsertDeliveryForTaskRunV2(
 				ctx, expected, in.Run.Snapshot, in.TraceID,
 				generated.InvocationDigest,
 				&types.Delivery{
-					BatchID:          batchID,
-					UserID:           in.UserID,
-					ContentItemID:    &contentID,
-					InvocationDigest: generated.InvocationDigest,
-					Score:            card.Scored.Score,
-					BodyMD:           card.BodyMD,
-					Status:           types.DeliveryStatusPending,
+					BatchID:              batchID,
+					UserID:               in.UserID,
+					ContentItemID:        &contentID,
+					InvocationDigest:     generated.InvocationDigest,
+					Score:                card.Scored.Score,
+					BodyMD:               card.BodyMD,
+					ToolEvidenceJSON:     evidenceJSON,
+					ToolEvidenceRequired: in.EvidenceRequired,
+					Status:               types.DeliveryStatusPending,
 				})
 		if insertErr != nil {
 			return retryableOrNot(insertErr)
@@ -277,4 +330,38 @@ func (a *Activities) PushToolCardsV2(
 					ClaimPushEffectForTaskRunV2(
 						claimCtx, expected, in.Run.Snapshot, params)
 			}))
+}
+
+type toolDeliveryEvidenceManifestV1 struct {
+	ContentItemID    int64                            `json:"content_item_id"`
+	InvocationDigest string                           `json:"invocation_digest"`
+	Metadata         types.StructuredEvidenceSourceV1 `json:"metadata"`
+}
+
+func toolDeliveryEvidenceJSONV1(
+	evidence []ToolCardEvidenceV1,
+) (json.RawMessage, error) {
+	if len(evidence) == 0 {
+		return nil, nil
+	}
+	manifest := make(
+		[]toolDeliveryEvidenceManifestV1, len(evidence))
+	for i := range evidence {
+		if evidence[i].Candidate.Item.ID !=
+			evidence[i].Source.ContentItemID {
+			return nil, types.NewAppError(types.CodeValidation,
+				"compiled Tool delivery evidence is invalid", nil)
+		}
+		manifest[i] = toolDeliveryEvidenceManifestV1{
+			ContentItemID:    evidence[i].Source.ContentItemID,
+			InvocationDigest: evidence[i].Candidate.InvocationDigest,
+			Metadata:         evidence[i].Source.Metadata,
+		}
+	}
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		return nil, types.NewAppError(types.CodeInternal,
+			"compiled Tool delivery evidence encoding failed", err)
+	}
+	return raw, nil
 }

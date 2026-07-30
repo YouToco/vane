@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/YouToco/vane/config"
 	"github.com/YouToco/vane/llm"
@@ -494,5 +495,273 @@ func TestGenerate_ParamsUnchangedByEvidenceGate(t *testing.T) {
 		types.ScoredItem{Item: types.ContentItem{ID: 50, Title: "t", Content: "#前端  #java"}},
 		"trace-s4", ""); err != nil {
 		t.Fatalf("纯标签内容仍应正常出卡（防编造靠 prompt 而非拒绝）: %v", err)
+	}
+}
+
+func TestSystemPromptLetsTaskManualOverrideDefaultOutputShape(t *testing.T) {
+	for _, required := range []string{
+		"默认包含三部分",
+		"任务手册",
+		"明确规定了字段或输出格式",
+		"优先逐项遵循任务手册",
+		"不得擅自改回默认格式",
+	} {
+		if !strings.Contains(cardSystemPrompt, required) {
+			t.Fatalf("card system prompt omitted manual output rule %q",
+				required)
+		}
+	}
+}
+
+func TestGenerateWithEvidencePolicyV1ShowsOnlyCurrentEvidenceBundle(
+	t *testing.T,
+) {
+	prompts, models := validPolicyV1(t, true)
+	policy, err := PreparePolicyV1(prompts, models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cg, captured := newTestCardGen(t, http.StatusOK,
+		"变化：发布了新模型\n官方原文：由系统填充\n交叉证据：由系统填充\n影响判断：开发者可使用新能力", nil)
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	item := types.ScoredItem{Item: types.ContentItem{
+		ID: 71, Title: "official", URL: "https://example.com/official",
+		Content: "official announcement", CreatedAt: now,
+	}}
+	sources := []EventEvidenceSourceV1{
+		{
+			ContentItemID: 71,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-1", Title: "official",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL:    "https://example.com/official",
+				DiscoveredAt: now,
+			},
+			EvidenceText: "official announcement",
+		},
+		{
+			ContentItemID: 72,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-2", Title: "cross check",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL:    "https://example.net/cross-check",
+				DiscoveredAt: now,
+			},
+			EvidenceText: "independent cross-check",
+		},
+	}
+	body, err := cg.GenerateWithEvidencePolicyV1(
+		t.Context(), 1, 2, item, sources, "trace-evidence",
+		"固定输出：变化、官方原文、交叉证据、影响判断。",
+		policy, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"**变化：** 发布了新模型",
+		"**官方原文：** [official](https://example.com/official)",
+		"**交叉证据：** [cross check](https://example.net/cross-check)",
+		"**影响判断：** 开发者可使用新能力",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("grounded body omitted %q: %q", required, body)
+		}
+	}
+	if strings.Contains(body, "由系统填充") {
+		t.Fatalf("body = %q", body)
+	}
+	_, user := captured.snapshot()
+	for _, required := range []string{
+		"source-1", "https://example.com/official",
+		"source-2", "https://example.net/cross-check",
+		"independent cross-check",
+		"固定输出：变化、官方原文、交叉证据、影响判断。",
+	} {
+		if !strings.Contains(user, required) {
+			t.Fatalf("evidence card prompt omitted %q: %s",
+				required, user)
+		}
+	}
+}
+
+func TestGenerateWithEvidencePolicyV1RejectsModelAuthoredURL(t *testing.T) {
+	prompts, models := validPolicyV1(t, true)
+	policy, err := PreparePolicyV1(prompts, models)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cg, _ := newTestCardGen(t, http.StatusOK,
+		"变化：发布新模型\n官方原文：https://fake.example\n影响判断：可使用", nil)
+	now := time.Now().UTC()
+	sources := []EventEvidenceSourceV1{
+		{
+			ContentItemID: 81,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-1", Title: "official",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://example.com/official", DiscoveredAt: now,
+			},
+			EvidenceText: "official",
+		},
+		{
+			ContentItemID: 82,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-2", Title: "cross",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://example.net/cross", DiscoveredAt: now,
+			},
+			EvidenceText: "cross",
+		},
+	}
+	_, err = cg.GenerateWithEvidencePolicyV1(
+		t.Context(), 1, 2,
+		types.ScoredItem{Item: types.ContentItem{ID: 81}},
+		sources, "trace", "变化、官方原文、交叉证据、影响判断",
+		policy, nil)
+	if err == nil || types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("model-authored URL err=%v", err)
+	}
+}
+
+func TestRenderGroundedEvidenceBodySupportsEnglishManual(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	sources := []EventEvidenceSourceV1{
+		{
+			ContentItemID: 86,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-1", Title: "official",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://example.com/official", DiscoveredAt: now,
+			},
+			EvidenceText: "official",
+		},
+		{
+			ContentItemID: 87,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-2", Title: "cross",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://example.net/cross", DiscoveredAt: now,
+			},
+			EvidenceText: "cross",
+		},
+	}
+	body, err := renderGroundedEvidenceBodyV1(
+		"What changed: A new model shipped\n"+
+			"Official source: supplied by system\n"+
+			"Cross evidence: supplied by system\n"+
+			"Impact assessment: Developers can use it",
+		"Output Change, Official source, Cross evidence, and Impact.",
+		sources,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"**Change:** A new model shipped",
+		"**Official source:** [official](https://example.com/official)",
+		"**Cross evidence:** [cross](https://example.net/cross)",
+		"**Impact:** Developers can use it",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("English grounded body omitted %q: %q",
+				required, body)
+		}
+	}
+}
+
+func TestRenderGroundedEvidenceBodyRejectsAlternateLinkSyntax(t *testing.T) {
+	now := time.Now().UTC()
+	sources := []EventEvidenceSourceV1{
+		{
+			ContentItemID: 91,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-1", Title: "official",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://example.com/official", DiscoveredAt: now,
+			},
+			EvidenceText: "official",
+		},
+		{
+			ContentItemID: 92,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-2", Title: "cross",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://example.net/cross", DiscoveredAt: now,
+			},
+			EvidenceText: "cross",
+		},
+	}
+	for _, injected := range []string{
+		"[点击](//fake.example)",
+		"[邮件](mailto:x@y.example)",
+		"[载荷](data:text/plain,x)",
+		"<ftp://fake.example>",
+	} {
+		t.Run(injected, func(t *testing.T) {
+			_, err := renderGroundedEvidenceBodyV1(
+				"变化："+injected+"\n影响判断：不可接受",
+				"变化、官方原文、交叉证据、影响判断", sources)
+			if err == nil {
+				t.Fatalf("alternate link syntax admitted: %s", injected)
+			}
+		})
+	}
+}
+
+func TestValidateGroundedEvidenceBodyRequiresExactOwnedLinks(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	sources := []EventEvidenceSourceV1{
+		{
+			ContentItemID: 101,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-1", Title: "official",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://example.com/official", DiscoveredAt: now,
+			},
+			EvidenceText: "official",
+		},
+		{
+			ContentItemID: 102,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-2", Title: "cross",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://example.net/cross", DiscoveredAt: now,
+			},
+			EvidenceText: "cross",
+		},
+	}
+	manual := "变化、官方原文、交叉证据、影响判断"
+	valid := "**变化：** 发布新模型" +
+		"\n\n**官方原文：** [official](https://example.com/official)" +
+		"\n\n**交叉证据：** [cross](https://example.net/cross)" +
+		"\n\n**影响判断：** 可使用"
+	if err := ValidateGroundedEvidenceBodyV1(
+		valid, manual, sources,
+	); err != nil {
+		t.Fatalf("valid grounded body: %v", err)
+	}
+	for name, body := range map[string]string{
+		"omitted cross": strings.Replace(
+			valid,
+			"**交叉证据：** [cross](https://example.net/cross)",
+			"**交叉证据：** 无",
+			1,
+		),
+		"replaced official": strings.Replace(
+			valid,
+			"[official](https://example.com/official)",
+			"[cross](https://example.net/cross)",
+			1,
+		),
+		"duplicate field": valid +
+			"\n\n**官方原文：** [official](https://example.com/official)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateGroundedEvidenceBodyV1(
+				body, manual, sources,
+			); err == nil {
+				t.Fatalf("forged grounded body admitted: %s", body)
+			}
+		})
 	}
 }

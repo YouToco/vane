@@ -139,9 +139,14 @@ func TestActivationState_EncodeDecodeRoundTrip(t *testing.T) {
 // search_endpoints
 // ============================================================
 
-func newTestEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, dailyCap int) *EndpointTools {
+func newTestEndpointTools(
+	inv endpointInvoker,
+	counter endpointCallCounter,
+	_ int,
+	dailyCap int,
+) *EndpointTools {
 	// 测试按 1M 窗口（生产 agent 模型 deepseek-v4-pro 同档）派生上限。
-	return NewEndpointTools(inv, counter, msgCap, dailyCap, 1_000_000)
+	return NewEndpointTools(inv, counter, dailyCap, 1_000_000)
 }
 
 func TestSearchEndpointsTool_ActivatesAndRecords(t *testing.T) {

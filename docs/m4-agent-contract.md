@@ -442,8 +442,8 @@ fetcher 层上游行按 `SourceID=0` 无源口径落 tool_calls，归属元数�
 避免取消窗口撕裂双账本或连接池故障无限阻塞；两条路径均不创建
 source/content/content_sources。滚动 24h `agent.exa_daily_cap`（默认 100，从
 tool_calls 表按 tool_name IN ('web_search','read_page') COUNT，排除
-invalid_args/budget_exceeded，判定失败 fail-closed）仍强制；旧 `agent.exa_msg_cap`
-只保留配置兼容，单消息统一由 20 次工具熔断器管理。不进 A2A 只读白名单（显式名单仍为
+invalid_args/budget_exceeded，判定失败 fail-closed）仍强制；`agent.exa_msg_cap`
+已删除，单消息统一由 20 次工具熔断器管理。不进 A2A 只读白名单（显式名单仍为
 list_sources/list_schedules——对外部 agent 暴露付费面是另一个决策）；
 Exa key 未配置时不装配（BuildTools exa 参为 nil），system prompt 的分流引导行同样
 条件注入（工具不在场不广告）；maxActivatedEndpoints 同步 13→11（16 基础 + 2 端点

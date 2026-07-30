@@ -9,6 +9,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/YouToco/vane/promptguard"
@@ -218,6 +219,38 @@ func buildStructuredEventEvidenceUserV1(
 		builder.WriteString("\n标题：")
 		builder.WriteString(promptguard.Sanitize(
 			promptguard.SingleLine(source.Metadata.Title)))
+		builder.WriteString("\n正文：")
+		builder.WriteString(source.EvidenceText)
+	}
+	return builder.String()
+}
+
+func buildEvidenceCardUserV1(
+	hint string,
+	sources []EventEvidenceSourceV1,
+) string {
+	if hint == "" {
+		hint = "暂无"
+	}
+	var builder strings.Builder
+	builder.WriteString("用户画像：")
+	builder.WriteString(hint)
+	for _, source := range sources {
+		builder.WriteString("\n来源标签：")
+		builder.WriteString(source.Metadata.Ref)
+		builder.WriteString("\n来源名称：")
+		builder.WriteString(promptguard.Sanitize(
+			promptguard.SingleLine(source.Metadata.SourceTitle)))
+		builder.WriteString("\n标题：")
+		builder.WriteString(promptguard.Sanitize(
+			promptguard.SingleLine(source.Metadata.Title)))
+		builder.WriteString("\nURL：")
+		builder.WriteString(source.Metadata.SourceURL)
+		if source.Metadata.PublishedAt != nil {
+			builder.WriteString("\n发布时间：")
+			builder.WriteString(
+				source.Metadata.PublishedAt.UTC().Format(time.RFC3339))
+		}
 		builder.WriteString("\n正文：")
 		builder.WriteString(source.EvidenceText)
 	}

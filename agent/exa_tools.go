@@ -6,7 +6,7 @@
 // 与 /contents 接成即时能力：**不建信源、不写内容库、结果只回给当前对话**。
 //
 // 成本纪律：
-//   - 单条消息统一由 Agent 20 次隐藏熔断器保护；ExaMsgCap 仅兼容旧配置；
+//   - 单条消息统一由 Agent 20 次隐藏熔断器保护；
 //   - 滚动 24h 上限（ExaDailyCap，默认 100）：从 tool_calls 表 COUNT（排除
 //     invalid_args/budget_exceeded——没打上游的拒绝不把限额越顶越死），
 //     判定失败 fail-closed 拒绝（护栏失效即放开计费面，宁可少查）；
@@ -47,21 +47,28 @@ type exaCallCounter interface {
 
 // ExaTools 是 web_search / read_page 的装配句柄（与 EndpointTools 同风格）：
 // key 未配置时不装配（nil），agent 工具面与上线前一致，而不是装两个恒报「缺 key」的工具。
-// counter 为 nil 时不查滚动 24h 限额；msgCap 保留在构造签名中仅用于配置兼容，
-// 单条消息统一由 Agent 隐藏熔断器管理。dailyCap ≤0 视为不设限。
+// counter 为 nil 时不查滚动 24h 限额；单条消息统一由 Agent 隐藏熔断器管理。
+// dailyCap ≤0 视为不设限。
 type ExaTools struct {
 	searcher webSearcher
 	reader   pageReader
 	counter  exaCallCounter
-	msgCap   int
 	dailyCap int
 }
 
 // NewExaTools 构造 Exa ad-hoc 工具对。searcher/reader 生产传 *fetcher.ExaFetcher /
 // *fetcher.ExaContentsFetcher（经 Multi.Exa()/Multi.ExaContents() 取出，与信源抓取
 // 共享同一实例与记账通道）；counter 生产传 *store.Store。
-func NewExaTools(searcher webSearcher, reader pageReader, counter exaCallCounter, msgCap, dailyCap int) *ExaTools {
-	return &ExaTools{searcher: searcher, reader: reader, counter: counter, msgCap: msgCap, dailyCap: dailyCap}
+func NewExaTools(
+	searcher webSearcher,
+	reader pageReader,
+	counter exaCallCounter,
+	dailyCap int,
+) *ExaTools {
+	return &ExaTools{
+		searcher: searcher, reader: reader,
+		counter: counter, dailyCap: dailyCap,
+	}
 }
 
 // SearchTool 返回 web_search（进静态白名单，BuildTools 装配）。

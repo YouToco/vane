@@ -10,6 +10,8 @@ import (
 	"github.com/YouToco/vane/types"
 )
 
+const toolObservationQualificationVersionID = "compiled-tool-v2-observation-qualification-v1"
+
 // runCompiledToolPipelineV2 is a separately versioned Source-free command
 // sequence. No V1 ref, Source activity, or confirmation step appears here.
 func runCompiledToolPipelineV2(
@@ -136,12 +138,44 @@ func runCompiledToolPipelineV2(
 
 	paidCtx := workflow.WithActivityOptions(
 		ctx, toolSideEffectActivityOptions())
+	qualified := QualifyToolCandidatesV2Result{
+		Candidates: deduped,
+		Outcome:    "legacy_replay",
+	}
+	if workflow.GetVersion(
+		ctx, toolObservationQualificationVersionID,
+		workflow.DefaultVersion, 1,
+	) >= 1 {
+		if err := workflow.ExecuteActivity(
+			paidCtx, a.QualifyToolCandidatesV2,
+			QualifyToolCandidatesV2Input{
+				UserID: p.UserID, TraceID: traceID,
+				Run: run, Candidates: deduped,
+			},
+		).Get(paidCtx, &qualified); err != nil {
+			if isQuotaFailure(err) {
+				recordEmpty(types.BatchExitGateQuota)
+				return nil
+			}
+			return err
+		}
+		counts = counts.WithQualified(len(qualified.Candidates))
+		if len(qualified.Candidates) == 0 {
+			gate := types.BatchExitGateObservationNoMatch
+			if qualified.Outcome == "uncertain" {
+				gate = types.BatchExitGateObservationUncertain
+			}
+			recordEmpty(gate)
+			return nil
+		}
+	}
+
 	var scored []runcontext.ToolScoredCandidateV1
 	if err := workflow.ExecuteActivity(
 		paidCtx, a.ScoreToolCandidatesV2,
 		ScoreToolCandidatesV2Input{
 			UserID: p.UserID, TraceID: traceID,
-			Run: run, Candidates: deduped,
+			Run: run, Candidates: qualified.Candidates,
 		},
 	).Get(paidCtx, &scored); err != nil {
 		if isQuotaFailure(err) {
@@ -178,6 +212,8 @@ func runCompiledToolPipelineV2(
 		CardGenToolCandidatesV2Input{
 			UserID: p.UserID, TraceID: traceID,
 			Run: run, Candidates: selected,
+			Evidence:         qualified.Evidence,
+			EvidenceRequired: qualified.EvidenceRequired,
 		},
 	).Get(paidCtx, &cards); err != nil {
 		if isQuotaFailure(err) {
@@ -198,6 +234,7 @@ func runCompiledToolPipelineV2(
 		PushToolCardsV2Input{
 			UserID: p.UserID, TraceID: traceID,
 			Run: run, Cards: cards,
+			EvidenceRequired: qualified.EvidenceRequired,
 		},
 	).Get(pushCtx, nil)
 }

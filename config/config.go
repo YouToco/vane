@@ -209,22 +209,14 @@ type AgentConfig struct {
 	// It is false by default until the real-card Gate and receipt dispatcher
 	// are completed; false omits the tool and controller from Agent entirely.
 	DefinitionEditEnabled bool `mapstructure:"definition_edit_enabled"`
-	// TokenBudgetDaily 预留、**当前未接线**：无任何代码按它拦截、也不递增 profiles 表的
-	// tokens_used_today（那三列恒为建表默认值）。别把这个键当作可调旋钮——
-	// 设了不生效。实际单消息边界是 MaxTurns 与 Agent 统一 20 次工具熔断；
-	// provider daily cap 仍从 tool_calls 强制。
-	TokenBudgetDaily int `mapstructure:"token_budget_daily"`
 	// SessionTTLMinutes 是会话闲置过期窗口（分钟）：同一 owner 在窗口内的
 	// 消息共享一个多轮会话（上下文连续），超时后新开会话（契约 §0）。
 	SessionTTLMinutes int `mapstructure:"session_ttl_minutes"`
-	// 社媒端点调用护栏。EndpointMsgCap 仅保留配置兼容，不再作为 provider
-	// 规划上限；单消息统一由 Agent 20 次隐藏熔断器保护。EndpointDailyCap 是
-	// 滚动 24h 总量上限（从 tool_calls 表 COUNT，含失败调用）。
-	EndpointMsgCap   int `mapstructure:"endpoint_msg_cap"`
+	// 社媒端点调用护栏。单消息统一由 Agent 20 次隐藏熔断器保护；
+	// EndpointDailyCap 是滚动 24h 总量上限（从 tool_calls 表 COUNT，含失败调用）。
 	EndpointDailyCap int `mapstructure:"endpoint_daily_cap"`
-	// 网页研究工具护栏。ExaMsgCap 同样只为历史配置兼容保留；统一熔断器负责
-	// 单消息边界。ExaDailyCap 是滚动 24h 上限（从 tool_calls 表 COUNT）。
-	ExaMsgCap   int `mapstructure:"exa_msg_cap"`
+	// 网页研究工具护栏。单消息边界同样由统一熔断器负责；
+	// ExaDailyCap 是滚动 24h 上限（从 tool_calls 表 COUNT）。
 	ExaDailyCap int `mapstructure:"exa_daily_cap"`
 }
 
@@ -398,11 +390,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("agent.intent_toolkits_owner_canary", false)
 	v.SetDefault("agent.intent_toolkits_allow_all", false)
 	v.SetDefault("agent.definition_edit_enabled", false)
-	v.SetDefault("agent.token_budget_daily", 100000)
 	v.SetDefault("agent.session_ttl_minutes", 30)
-	v.SetDefault("agent.endpoint_msg_cap", 10)
 	v.SetDefault("agent.endpoint_daily_cap", 200)
-	v.SetDefault("agent.exa_msg_cap", 5)
 	v.SetDefault("agent.exa_daily_cap", 100)
 
 	v.SetDefault("log.level", "info")

@@ -3,6 +3,8 @@ package cardgen
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/runtimepolicy"
@@ -209,6 +211,243 @@ func (cg *CardGen) GenerateWithPolicyV1(
 		return "", fmt.Errorf("%w: cardgen policy v1 is not prepared", runtimepolicy.ErrInvalidPolicy)
 	}
 	return cg.generate(ctx, tenantID, userID, item, traceID, taskInstruction, policy.execution, beforeSpend)
+}
+
+// GenerateWithEvidencePolicyV1 uses the same frozen V1 model/prompt policy,
+// but renders the exact ordered evidence bundle admitted by the current run.
+// It remains one CardGen call and returns the same markdown body contract.
+func (cg *CardGen) GenerateWithEvidencePolicyV1(
+	ctx context.Context,
+	tenantID int64,
+	userID int64,
+	item types.ScoredItem,
+	sources []EventEvidenceSourceV1,
+	traceID string,
+	taskInstruction string,
+	policy PolicyV1,
+	beforeSpend func(context.Context, float64) error,
+) (string, error) {
+	if !policy.isPrepared {
+		return "", fmt.Errorf(
+			"%w: cardgen evidence policy v1 is not prepared",
+			runtimepolicy.ErrInvalidPolicy)
+	}
+	if _, err := EventEvidenceCorpusV1(sources); err != nil ||
+		item.Item.ID <= 0 ||
+		sources[0].ContentItemID != item.Item.ID {
+		return "", types.NewAppError(types.CodeValidation,
+			"cardgen evidence input is invalid", err)
+	}
+	body, err := cg.generateResponse(
+		ctx, tenantID, userID, item, traceID, taskInstruction,
+		policy.execution, beforeSpend,
+		func(hint string, _ types.ContentItem) string {
+			return buildEvidenceCardUserV1(hint, sources)
+		},
+	)
+	if err != nil {
+		return "", err
+	}
+	if body == "" {
+		return "", types.NewAppError(types.CodeValidation,
+			"cardgen evidence output is empty", nil)
+	}
+	return renderGroundedEvidenceBodyV1(
+		body, taskInstruction, sources)
+}
+
+var evidenceOutputFieldV1 = regexp.MustCompile(
+	`(?mi)^\s*(?:\*\*)?(变化|影响判断|change|what changed|impact|impact assessment)\s*[：:](?:\*\*)?\s*(.+?)\s*$`,
+)
+var evidenceOutputLabelV1 = regexp.MustCompile(
+	`(?mi)^\s*(?:\*\*)?(?:变化|官方原文|交叉证据|影响判断|change|what changed|official source|cross evidence|impact|impact assessment)\s*[：:](?:\*\*)?\s*`,
+)
+var unsafeSemanticLinkV1 = regexp.MustCompile(
+	`(?i)(?:[a-z][a-z0-9+.-]*:|//|\[[^\]]*\]\s*\(|!\[|<[^>]*>)`,
+)
+
+func renderGroundedEvidenceBodyV1(
+	body string,
+	taskInstruction string,
+	sources []EventEvidenceSourceV1,
+) (string, error) {
+	if unsafeSemanticLinkV1.MatchString(
+		evidenceOutputLabelV1.ReplaceAllString(body, ""),
+	) {
+		return "", types.NewAppError(types.CodeValidation,
+			"cardgen evidence output contains model-authored link syntax", nil)
+	}
+	if !manualRequiresEvidenceOutputV1(taskInstruction) {
+		return body, nil
+	}
+	if len(sources) < 2 {
+		return "", types.NewAppError(types.CodeValidation,
+			"cardgen evidence output lacks a cross-evidence source", nil)
+	}
+	fields := make(map[string]string, 2)
+	for _, match := range evidenceOutputFieldV1.FindAllStringSubmatch(body, -1) {
+		if len(match) != 3 {
+			continue
+		}
+		value := strings.TrimSpace(match[2])
+		if value != "" && !unsafeSemanticLinkV1.MatchString(value) {
+			fields[canonicalEvidenceFieldV1(match[1])] =
+				plainSemanticFieldV1(value)
+		}
+	}
+	if fields["变化"] == "" || fields["影响判断"] == "" {
+		return "", types.NewAppError(types.CodeValidation,
+			"cardgen evidence output lacks required semantic fields", nil)
+	}
+	official := groundedEvidenceLinkV1(sources[0])
+	cross := make([]string, 0, len(sources)-1)
+	for _, source := range sources[1:] {
+		cross = append(cross, groundedEvidenceLinkV1(source))
+	}
+	labels := evidenceOutputLabelsV1(taskInstruction)
+	rendered := labels.change + fields["变化"] +
+		"\n\n" + labels.official + official +
+		"\n\n" + labels.cross + strings.Join(cross, "；") +
+		"\n\n" + labels.impact + fields["影响判断"]
+	if err := ValidateGroundedEvidenceBodyV1(
+		rendered, taskInstruction, sources,
+	); err != nil {
+		return "", err
+	}
+	return rendered, nil
+}
+
+func manualRequiresEvidenceOutputV1(taskInstruction string) bool {
+	manual := strings.ToLower(taskInstruction)
+	return manualRequiresChineseEvidenceOutputV1(manual) ||
+		manualRequiresEnglishEvidenceOutputV1(manual)
+}
+
+func manualRequiresChineseEvidenceOutputV1(manual string) bool {
+	return strings.Contains(manual, "变化") &&
+		strings.Contains(manual, "官方原文") &&
+		strings.Contains(manual, "交叉证据") &&
+		strings.Contains(manual, "影响判断")
+}
+
+func manualRequiresEnglishEvidenceOutputV1(manual string) bool {
+	return strings.Contains(manual, "change") &&
+		strings.Contains(manual, "official") &&
+		strings.Contains(manual, "cross") &&
+		strings.Contains(manual, "impact")
+}
+
+func canonicalEvidenceFieldV1(field string) string {
+	switch strings.ToLower(strings.TrimSpace(field)) {
+	case "变化", "change", "what changed":
+		return "变化"
+	case "影响判断", "impact", "impact assessment":
+		return "影响判断"
+	default:
+		return ""
+	}
+}
+
+type evidenceOutputLabels struct {
+	change   string
+	official string
+	cross    string
+	impact   string
+}
+
+func evidenceOutputLabelsV1(taskInstruction string) evidenceOutputLabels {
+	manual := strings.ToLower(taskInstruction)
+	if manualRequiresEnglishEvidenceOutputV1(manual) &&
+		!manualRequiresChineseEvidenceOutputV1(manual) {
+		return evidenceOutputLabels{
+			change:   "**Change:** ",
+			official: "**Official source:** ",
+			cross:    "**Cross evidence:** ",
+			impact:   "**Impact:** ",
+		}
+	}
+	return evidenceOutputLabels{
+		change:   "**变化：** ",
+		official: "**官方原文：** ",
+		cross:    "**交叉证据：** ",
+		impact:   "**影响判断：** ",
+	}
+}
+
+func plainSemanticFieldV1(value string) string {
+	return strings.TrimSpace(strings.NewReplacer(
+		"*", "", "_", "", "`", "", "[", "〔", "]", "〕",
+		"<", "＜", ">", "＞",
+	).Replace(value))
+}
+
+func groundedEvidenceLinkV1(source EventEvidenceSourceV1) string {
+	label := strings.TrimSpace(source.Metadata.Title)
+	if label == "" {
+		label = source.Metadata.SourceTitle
+	}
+	label = strings.NewReplacer(
+		"[", "〔", "]", "〕", "(", "（", ")", "）",
+	).Replace(label)
+	return "[" + label + "](" + source.Metadata.SourceURL + ")"
+}
+
+// ValidateGroundedEvidenceBodyV1 is repeated at the push boundary so a
+// forged Activity result cannot bypass the CardGen renderer.
+func ValidateGroundedEvidenceBodyV1(
+	body string,
+	taskInstruction string,
+	sources []EventEvidenceSourceV1,
+) error {
+	if _, err := EventEvidenceCorpusV1(sources); err != nil {
+		return err
+	}
+	linkFree := stripGroundedEvidenceLinksV1(body, sources)
+	linkFree = evidenceOutputLabelV1.ReplaceAllString(linkFree, "")
+	if unsafeSemanticLinkV1.MatchString(linkFree) {
+		return types.NewAppError(types.CodeValidation,
+			"grounded evidence body contains an unowned link", nil)
+	}
+	if manualRequiresEvidenceOutputV1(taskInstruction) {
+		if len(sources) < 2 {
+			return types.NewAppError(types.CodeValidation,
+				"grounded evidence body lacks cross evidence", nil)
+		}
+		labels := evidenceOutputLabelsV1(taskInstruction)
+		for _, required := range []string{
+			labels.change, labels.official,
+			labels.cross, labels.impact,
+		} {
+			if strings.Count(body, required) != 1 {
+				return types.NewAppError(types.CodeValidation,
+					"grounded evidence body lacks a required field", nil)
+			}
+		}
+		officialLine := labels.official +
+			groundedEvidenceLinkV1(sources[0])
+		cross := make([]string, 0, len(sources)-1)
+		for _, source := range sources[1:] {
+			cross = append(cross, groundedEvidenceLinkV1(source))
+		}
+		crossLine := labels.cross + strings.Join(cross, "；")
+		if strings.Count(body, officialLine) != 1 ||
+			strings.Count(body, crossLine) != 1 {
+			return types.NewAppError(types.CodeValidation,
+				"grounded evidence body differs from owned evidence links", nil)
+		}
+	}
+	return nil
+}
+
+func stripGroundedEvidenceLinksV1(
+	body string,
+	sources []EventEvidenceSourceV1,
+) string {
+	for _, source := range sources {
+		body = strings.ReplaceAll(
+			body, groundedEvidenceLinkV1(source), "")
+	}
+	return body
 }
 
 func legacyCardExecutionV1() cardExecutionV1 {

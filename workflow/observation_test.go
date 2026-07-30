@@ -29,7 +29,7 @@ func TestValidateQualifiedEventsRejectsForgedTimeAndEvidence(t *testing.T) {
 	}}}
 	activities := &Activities{}
 	got, outcome, err := activities.validateQualifiedEvents(
-		policy, digest, window, []types.ContentItem{item}, base)
+		policy, digest, window, []types.ContentItem{item}, "", base)
 	if err != nil || outcome != "match" || len(got) != 1 {
 		t.Fatalf("valid result got=%v outcome=%q err=%v", got, outcome, err)
 	}
@@ -67,7 +67,8 @@ func TestValidateQualifiedEventsRejectsForgedTimeAndEvidence(t *testing.T) {
 			candidate.Events = append([]eventqualifier.Event(nil), base.Events...)
 			tc.mutate(&candidate)
 			_, _, err := activities.validateQualifiedEvents(
-				policy, digest, window, []types.ContentItem{tc.candidate}, candidate)
+				policy, digest, window,
+				[]types.ContentItem{tc.candidate}, "", candidate)
 			if err == nil || types.CodeOf(err) != types.CodeValidation {
 				t.Fatalf("err=%v", err)
 			}
@@ -106,7 +107,7 @@ func TestQualifyContentWindowDeprioritizesUnknownDates(t *testing.T) {
 	}
 }
 
-func TestAdmissibleEventEvidenceCandidatesRequireOfficialDatedEvidence(t *testing.T) {
+func TestAdmissibleEventEvidenceCandidatesKeepsDatedCrossEvidence(t *testing.T) {
 	policy := workflowEventPolicy(t)
 	window := observation.Window{
 		Start: time.Date(2026, 7, 23, 1, 0, 0, 0, time.UTC),
@@ -120,8 +121,101 @@ func TestAdmissibleEventEvidenceCandidatesRequireOfficialDatedEvidence(t *testin
 		{ID: 3, URL: "https://example.com/index/model", PublishedAt: &inWindow},
 		{ID: 4, URL: "https://news.openai.com/index/model", PublishedAt: &inWindow},
 	})
-	if len(got) != 1 || got[0].ID != 4 {
+	if len(got) != 2 || got[0].ID != 3 || got[1].ID != 4 {
 		t.Fatalf("got=%+v", got)
+	}
+}
+
+func TestValidateQualifiedEventsEnforcesManualEvidencePair(t *testing.T) {
+	policy := workflowEventPolicy(t)
+	policy.Evidence.Requirement = observation.EvidenceTrustedAllowed
+	policy.Evidence.OfficialDomains = nil
+	digest, err := observation.PolicyDigest(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	officialAt := time.Date(2026, 7, 24, 1, 0, 0, 0, time.UTC)
+	crossAt := officialAt.Add(time.Hour)
+	window := observation.Window{
+		Start: officialAt.Add(-time.Hour), End: crossAt.Add(time.Hour),
+	}
+	items := []types.ContentItem{
+		{
+			ID: 21, URL: "https://official.example/release",
+			Content: "official release body", PublishedAt: &officialAt,
+		},
+		{
+			ID: 22, URL: "https://media.example/report",
+			Content: "independent report", PublishedAt: &crossAt,
+		},
+	}
+	result := eventqualifier.Result{
+		Outcome: "match",
+		Events: []eventqualifier.Event{{
+			EventType: "model_release", Subject: "OpenAI models",
+			ReleaseIdentifier: "gpt-test",
+			OccurredAt:        officialAt.Format(time.RFC3339),
+			Qualification: string(
+				observation.QualificationGeneralAvailability),
+			EvidenceContentIDs: []int64{21, 22},
+		}},
+	}
+	activities := &Activities{}
+	got, outcome, err := activities.validateQualifiedEvents(
+		policy, digest, window, items,
+		"必须有官方原文交叉核验；输出交叉证据。", result)
+	if err != nil || outcome != "match" || len(got) != 1 {
+		t.Fatalf("manual evidence pair got=%+v outcome=%q err=%v",
+			got, outcome, err)
+	}
+	result.Events[0].EvidenceContentIDs = []int64{21}
+	if _, _, err := activities.validateQualifiedEvents(
+		policy, digest, window, items,
+		"必须有官方原文交叉核验；输出交叉证据。", result,
+	); err == nil {
+		t.Fatal("manual cross-evidence requirement admitted one source")
+	}
+}
+
+func TestValidateQualifiedEventsRejectsReusedPrimary(t *testing.T) {
+	policy := workflowEventPolicy(t)
+	digest, err := observation.PolicyDigest(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := time.Date(2026, 7, 24, 1, 0, 0, 0, time.UTC)
+	window := observation.Window{
+		Start: published.Add(-time.Hour), End: published.Add(time.Hour),
+	}
+	item := types.ContentItem{
+		ID: 31, URL: "https://openai.com/release",
+		Content: "official", PublishedAt: &published,
+	}
+	result := eventqualifier.Result{
+		Outcome: "match",
+		Events: []eventqualifier.Event{
+			{
+				EventType: "model_release", Subject: "OpenAI models",
+				ReleaseIdentifier: "gpt-one",
+				OccurredAt:        published.Format(time.RFC3339),
+				Qualification: string(
+					observation.QualificationGeneralAvailability),
+				EvidenceContentIDs: []int64{31},
+			},
+			{
+				EventType: "model_release", Subject: "OpenAI models",
+				ReleaseIdentifier: "gpt-two",
+				OccurredAt:        published.Format(time.RFC3339),
+				Qualification: string(
+					observation.QualificationGeneralAvailability),
+				EvidenceContentIDs: []int64{31},
+			},
+		},
+	}
+	if _, _, err := (&Activities{}).validateQualifiedEvents(
+		policy, digest, window, []types.ContentItem{item}, "", result,
+	); err == nil {
+		t.Fatal("one primary candidate was reused for two events")
 	}
 }
 

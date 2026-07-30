@@ -566,9 +566,30 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 		t.Fatalf("claim Source-free delivery authority: %s err=%v",
 			authority, err)
 	}
+	_, err = st.pool.Exec(ctx,
+		`INSERT INTO deliveries (
+		    tenant_id,batch_id,user_id,content_item_id,invocation_digest,
+		    score,body_md,tool_evidence_required,tool_evidence,status
+		 ) VALUES (
+		    $1,$2,$3,$4,$5,1,'missing evidence metadata',TRUE,
+		    jsonb_build_array(jsonb_build_object(
+		        'content_item_id',$4::BIGINT,
+		        'invocation_digest',$5::TEXT
+		    )),$6
+		 )`,
+		identity.TenantID, batchID, identity.UserID, contentID,
+		invocationDigest, types.DeliveryStatusPending)
+	pgErr = nil
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("database admitted Tool evidence without metadata: %v", err)
+	}
 	delivery := &types.Delivery{
 		BatchID: batchID, UserID: identity.UserID,
 		ContentItemID: &contentID, Score: 88, BodyMD: "Tool insight",
+		ToolEvidenceRequired: true,
+		ToolEvidenceJSON: json.RawMessage(fmt.Sprintf(
+			`[{"content_item_id":%d,"invocation_digest":%q,"metadata":{}}]`,
+			contentID, invocationDigest)),
 	}
 	deliveryID, existed, sentAlready, err :=
 		st.InsertDeliveryForTaskRunV2(
@@ -588,12 +609,24 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 			replayedDeliveryID, existed, sentAlready, err)
 	}
 	var storedInvocation string
+	var storedEvidence json.RawMessage
+	var storedEvidenceRequired bool
 	if err := st.pool.QueryRow(ctx,
-		`SELECT invocation_digest FROM deliveries WHERE id=$1`,
-		deliveryID).Scan(&storedInvocation); err != nil ||
-		storedInvocation != invocationDigest {
-		t.Fatalf("Source-free delivery provenance=%q err=%v",
-			storedInvocation, err)
+		`SELECT invocation_digest,tool_evidence,tool_evidence_required
+		   FROM deliveries WHERE id=$1`,
+		deliveryID).Scan(
+		&storedInvocation, &storedEvidence,
+		&storedEvidenceRequired,
+	); err != nil ||
+		storedInvocation != invocationDigest ||
+		len(storedEvidence) == 0 || !storedEvidenceRequired {
+		t.Fatalf("Source-free delivery provenance=%q evidence=%s err=%v",
+			storedInvocation, storedEvidence, err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE deliveries SET tool_evidence=NULL WHERE id=$1`,
+		deliveryID); err == nil {
+		t.Fatal("Store admitted removal of durable Tool evidence")
 	}
 	if _, _, _, err := st.InsertDeliveryForTaskRunV2(
 		ctx, identity, ref, deliveryKey,
@@ -892,15 +925,23 @@ func TestCompiledTaskRunSnapshotV2_FreezesSourceFreeRunAndReplaysExactly(
 	}
 	var tombstonedContentID *int64
 	var tombstonedInvocation string
+	var tombstonedEvidence json.RawMessage
+	var tombstonedEvidenceRequired bool
 	if err := st.pool.QueryRow(ctx,
-		`SELECT content_item_id,invocation_digest
+		`SELECT content_item_id,invocation_digest,
+		        tool_evidence,tool_evidence_required
 		   FROM deliveries WHERE id=$1`,
 		deliveryID).Scan(
 		&tombstonedContentID, &tombstonedInvocation,
+		&tombstonedEvidence, &tombstonedEvidenceRequired,
 	); err != nil || tombstonedContentID != nil ||
-		tombstonedInvocation != invocationDigest {
-		t.Fatalf("Tool delivery tombstone: content=%v invocation=%q err=%v",
-			tombstonedContentID, tombstonedInvocation, err)
+		tombstonedInvocation != invocationDigest ||
+		!tombstonedEvidenceRequired ||
+		!bytes.Equal(tombstonedEvidence, storedEvidence) {
+		t.Fatalf(
+			"Tool delivery tombstone: content=%v invocation=%q evidence=%s required=%t err=%v",
+			tombstonedContentID, tombstonedInvocation,
+			tombstonedEvidence, tombstonedEvidenceRequired, err)
 	}
 }
 

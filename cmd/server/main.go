@@ -319,6 +319,7 @@ func run() error {
 	w.RegisterActivity(activities.ExecuteToolInvocationV2)
 	w.RegisterActivity(activities.CollectToolRunContentV2)
 	w.RegisterActivity(activities.DedupToolCandidatesV2)
+	w.RegisterActivity(activities.QualifyToolCandidatesV2)
 	w.RegisterActivity(activities.ScoreToolCandidatesV2)
 	w.RegisterActivity(activities.SelectToolCandidatesV2)
 	w.RegisterActivity(activities.CardGenToolCandidatesV2)
@@ -627,7 +628,7 @@ func run() error {
 		// 内联上限由 agent 模型声明的上下文窗口派生（llm/context.go）：模型换代
 		// 时上限自动跟随，不再依赖有人记得改常量（6000 rune 失真一年的教训）。
 		endpoints = agent.NewEndpointTools(tikhubinvoke.New(cfg.Fetch), st,
-			cfg.Agent.EndpointMsgCap, cfg.Agent.EndpointDailyCap,
+			cfg.Agent.EndpointDailyCap,
 			llm.ContextWindowTokens(cfg.LLM.AgentModel))
 	}
 	// prober 传 fetch（*fetcher.Multi）而非 fetch.Binding()：1.5 起试跑=准入统一由
@@ -637,7 +638,7 @@ func run() error {
 	var exaTools *agent.ExaTools
 	if cfg.Fetch.ExaAPIKey != "" {
 		exaTools = agent.NewExaTools(fetch.Exa(), fetch.ExaContents(), st,
-			cfg.Agent.ExaMsgCap, cfg.Agent.ExaDailyCap)
+			cfg.Agent.ExaDailyCap)
 	}
 	// Legacy v0 create_schedule cards are deliberately drained without execution
 	// in Loop.ExecuteAction. Passing no legacy creator makes the old active-first

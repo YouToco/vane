@@ -225,7 +225,7 @@ func resolveResultPath(body []byte, path string) (any, error) {
 // ────────── read_endpoint_result 工具 ──────────
 
 // readEndpointResultTool 取回被截断的端点响应。本地缓存读取：不打上游、不计费、
-// 不占端点限额（msgCap/dailyCap 只数真实上游调用）。
+// 不占端点每日限额（dailyCap 只数真实上游调用）。
 type readEndpointResultTool struct {
 	cache *resultCache
 	// perRead 单次取回的字符上限，与端点内联同源（由模型窗口派生）：

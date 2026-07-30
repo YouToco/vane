@@ -143,6 +143,14 @@ type compiledCardGeneratorV1 interface {
 	GenerateWithPolicyV1(context.Context, int64, int64, types.ScoredItem, string, string, cardgenpkg.PolicyV1, func(context.Context, float64) error) (string, error)
 }
 
+type compiledEvidenceCardGeneratorV1 interface {
+	GenerateWithEvidencePolicyV1(
+		context.Context, int64, int64, types.ScoredItem,
+		[]cardgenpkg.EventEvidenceSourceV1, string, string,
+		cardgenpkg.PolicyV1, func(context.Context, float64) error,
+	) (string, error)
+}
+
 type compiledCardGeneratorV2 interface {
 	GenerateStructuredWithPolicyV2(context.Context, int64, int64, types.ScoredItem, string, string, cardgenpkg.PolicyV2, func(context.Context, float64) error) (types.StructuredInsightV1, error)
 }
@@ -2558,16 +2566,6 @@ func (a *Activities) QualifyEvents(
 	if !compiled {
 		return QualifyEventsResult{Items: in.Items, Outcome: "not_configured"}, nil
 	}
-	var scope struct {
-		Observation *observation.PolicyV1 `json:"observation,omitempty"`
-	}
-	if err := json.Unmarshal(snapshot.Definition.ScopeJSON, &scope); err != nil {
-		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
-			types.CodeValidation, "compiled observation scope is invalid", err))
-	}
-	if scope.Observation == nil {
-		return QualifyEventsResult{Items: in.Items, Outcome: "not_configured"}, nil
-	}
 	rollout := snapshot.ObservationRollout
 	if !rollout.Valid() {
 		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
@@ -2588,41 +2586,28 @@ func (a *Activities) QualifyEvents(
 		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
 			types.CodeValidation, "compiled observation task differs", nil))
 	}
-	nominal, err := observation.NominalTrigger(
-		expected.TaskID, expected.TemporalWorkflowID)
+	policy, window, err := compiledObservationPolicyAndWindow(
+		snapshot.Definition.ScopeJSON,
+		snapshot.Definition.SpecJSON,
+		expected,
+	)
 	if err != nil {
-		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
-			types.CodeValidation, "scheduled observation has no nominal trigger", err))
+		return QualifyEventsResult{}, nonRetryable(err)
 	}
-	var spec struct {
-		Cron         string `json:"cron"`
-		EverySeconds int    `json:"every_seconds"`
-		AnchorAt     string `json:"anchor_at"`
-		TZ           string `json:"tz"`
-	}
-	if err := json.Unmarshal(snapshot.Definition.SpecJSON, &spec); err != nil {
-		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
-			types.CodeValidation, "compiled observation schedule is invalid", err))
-	}
-	window, err := observation.WindowForNominal(*scope.Observation, observation.Schedule{
-		Cron: spec.Cron, EverySeconds: spec.EverySeconds,
-		AnchorAt: spec.AnchorAt, TimeZone: spec.TZ,
-	}, nominal)
-	if err != nil {
-		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
-			types.CodeValidation, "compiled observation window is invalid", err))
+	if policy == nil {
+		return QualifyEventsResult{Items: in.Items, Outcome: "not_configured"}, nil
 	}
 
 	var qualified []types.ContentItem
 	outcome := "no_match"
-	if scope.Observation.Mode == observation.ModeContent {
-		qualified = qualifyContentWindow(*scope.Observation, window, in.Items)
+	if policy.Mode == observation.ModeContent {
+		qualified = qualifyContentWindow(*policy, window, in.Items)
 		if len(qualified) > 0 {
 			outcome = "match"
 		}
 	} else {
 		qualified, outcome, err = a.qualifyEventCandidates(
-			ctx, expected, snapshot, in, rollout, *scope.Observation, window)
+			ctx, expected, snapshot, in, rollout, *policy, window)
 		if err != nil {
 			return QualifyEventsResult{}, err
 		}
@@ -2630,7 +2615,7 @@ func (a *Activities) QualifyEvents(
 	slog.InfoContext(ctx, "observation qualification",
 		"task_id", expected.TaskID,
 		"snapshot_id", in.Run.Snapshot.SnapshotID,
-		"mode", scope.Observation.Mode,
+		"mode", policy.Mode,
 		"rollout", rollout,
 		"outcome", outcome,
 		"candidate_count", len(in.Items),
@@ -2641,6 +2626,52 @@ func (a *Activities) QualifyEvents(
 		return QualifyEventsResult{Items: in.Items, Outcome: "shadow_" + outcome}, nil
 	}
 	return QualifyEventsResult{Items: qualified, Outcome: outcome}, nil
+}
+
+func compiledObservationPolicyAndWindow(
+	scopeJSON json.RawMessage,
+	specJSON json.RawMessage,
+	expected types.RunIdentity,
+) (*observation.PolicyV1, observation.Window, error) {
+	var scope struct {
+		Observation *observation.PolicyV1 `json:"observation,omitempty"`
+	}
+	if err := json.Unmarshal(scopeJSON, &scope); err != nil {
+		return nil, observation.Window{}, types.NewAppError(
+			types.CodeValidation, "compiled observation scope is invalid", err)
+	}
+	if scope.Observation == nil {
+		return nil, observation.Window{}, nil
+	}
+	nominal, err := observation.NominalTrigger(
+		expected.TaskID, expected.TemporalWorkflowID)
+	if err != nil {
+		return nil, observation.Window{}, types.NewAppError(
+			types.CodeValidation, "scheduled observation has no nominal trigger", err)
+	}
+	var spec struct {
+		Cron         string `json:"cron"`
+		EverySeconds int    `json:"every_seconds"`
+		AnchorAt     string `json:"anchor_at"`
+		TZ           string `json:"tz"`
+	}
+	if err := json.Unmarshal(specJSON, &spec); err != nil {
+		return nil, observation.Window{}, types.NewAppError(
+			types.CodeValidation, "compiled observation schedule is invalid", err)
+	}
+	window, err := observation.WindowForNominal(
+		*scope.Observation,
+		observation.Schedule{
+			Cron: spec.Cron, EverySeconds: spec.EverySeconds,
+			AnchorAt: spec.AnchorAt, TimeZone: spec.TZ,
+		},
+		nominal,
+	)
+	if err != nil {
+		return nil, observation.Window{}, types.NewAppError(
+			types.CodeValidation, "compiled observation window is invalid", err)
+	}
+	return scope.Observation, window, nil
 }
 
 func qualifyContentWindow(
@@ -2746,6 +2777,7 @@ func (a *Activities) qualifyEventCandidates(
 		qualifierRequest := eventqualifier.Request{
 			TenantID: expected.TenantID, UserID: expected.UserID,
 			TraceID: in.TraceID, Policy: policy, Window: window,
+			TaskManual: snapshot.Definition.PlaybookContent,
 			Candidates: candidates, Client: modelClient, ModelCall: modelCall,
 			QuotaRule: quotaRule, BeforeSpend: beforeSpend,
 		}
@@ -2773,7 +2805,8 @@ func (a *Activities) qualifyEventCandidates(
 			types.CodeConflict, "observation qualification state is invalid", nil))
 	}
 	qualified, outcome, err := a.validateQualifiedEvents(
-		policy, policyDigest, window, candidates, result)
+		policy, policyDigest, window, candidates,
+		snapshot.Definition.PlaybookContent, result)
 	if err != nil && types.CodeOf(err) == types.CodeValidation {
 		slog.WarnContext(ctx, "observation qualifier output rejected",
 			"task_id", expected.TaskID,
@@ -2827,11 +2860,6 @@ func admissibleEventEvidenceCandidates(
 			!admission.Contains(item.PublishedAt.UTC()) {
 			continue
 		}
-		if policy.Evidence.Requirement == observation.EvidenceOfficialRequired &&
-			!observation.OfficialURLAllowed(
-				item.URL, policy.Evidence.OfficialDomains) {
-			continue
-		}
 		out = append(out, item)
 	}
 	return out
@@ -2876,6 +2904,7 @@ func (a *Activities) validateQualifiedEvents(
 	policyDigest string,
 	window observation.Window,
 	items []types.ContentItem,
+	taskManual string,
 	result eventqualifier.Result,
 ) ([]types.ContentItem, string, error) {
 	if result.Outcome == "no_match" || result.Outcome == "uncertain" {
@@ -2902,6 +2931,9 @@ func (a *Activities) validateQualifiedEvents(
 	admission := observation.Window{Start: admissionStart, End: window.End}
 	out := make([]types.ContentItem, 0, len(result.Events))
 	seenKeys := make(map[string]struct{}, len(result.Events))
+	seenPrimary := make(map[int64]struct{}, len(result.Events))
+	requireOfficial := taskManualRequiresOfficialOriginal(taskManual)
+	requireCross := taskManualRequiresCrossEvidence(taskManual)
 	for _, event := range result.Events {
 		if event.EventType != policy.Event.EventKind ||
 			event.Subject != policy.Event.Subject ||
@@ -2909,7 +2941,8 @@ func (a *Activities) validateQualifiedEvents(
 			!qualificationAllowed(
 				policy.Event.Qualification,
 				observation.Qualification(event.Qualification)) ||
-			len(event.EvidenceContentIDs) == 0 {
+			len(event.EvidenceContentIDs) == 0 ||
+			len(event.EvidenceContentIDs) > 8 {
 			return nil, "", nonRetryable(types.NewAppError(
 				types.CodeValidation, "qualified event differs from approved definition", nil))
 		}
@@ -2918,16 +2951,35 @@ func (a *Activities) validateQualifiedEvents(
 			return nil, "", nonRetryable(types.NewAppError(
 				types.CodeValidation, "qualified event time is outside the approved window", err))
 		}
+		if requireCross && len(event.EvidenceContentIDs) < 2 {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"qualified event lacks task-manual cross evidence", nil))
+		}
 		var primary types.ContentItem
+		seenEvidence := make(map[int64]struct{}, len(event.EvidenceContentIDs))
 		for index, contentID := range event.EvidenceContentIDs {
 			candidate, ok := byID[contentID]
+			if _, duplicate := seenEvidence[contentID]; duplicate {
+				return nil, "", nonRetryable(types.NewAppError(
+					types.CodeValidation,
+					"qualified event duplicated evidence", nil))
+			}
+			seenEvidence[contentID] = struct{}{}
 			if !ok || candidate.PublishedAt == nil ||
-				!candidate.PublishedAt.UTC().Truncate(time.Second).
-					Equal(occurredAt.UTC().Truncate(time.Second)) {
+				!admission.Contains(candidate.PublishedAt.UTC()) {
 				return nil, "", nonRetryable(types.NewAppError(
 					types.CodeValidation, "qualified event cited unverifiable evidence", nil))
 			}
-			if policy.Evidence.Requirement == observation.EvidenceOfficialRequired &&
+			if index == 0 &&
+				!candidate.PublishedAt.UTC().Truncate(time.Second).
+					Equal(occurredAt.UTC().Truncate(time.Second)) {
+				return nil, "", nonRetryable(types.NewAppError(
+					types.CodeValidation,
+					"qualified event time differs from primary evidence", nil))
+			}
+			if index == 0 &&
+				policy.Evidence.Requirement == observation.EvidenceOfficialRequired &&
 				!observation.OfficialURLAllowed(
 					candidate.URL, policy.Evidence.OfficialDomains) {
 				return nil, "", nonRetryable(types.NewAppError(
@@ -2937,6 +2989,19 @@ func (a *Activities) validateQualifiedEvents(
 				primary = candidate
 			}
 		}
+		if requireOfficial &&
+			(strings.TrimSpace(primary.URL) == "" ||
+				strings.TrimSpace(primary.Content) == "") {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"qualified event lacks a live official page candidate", nil))
+		}
+		if _, duplicate := seenPrimary[primary.ID]; duplicate {
+			return nil, "", nonRetryable(types.NewAppError(
+				types.CodeValidation,
+				"qualified events reused one primary candidate", nil))
+		}
+		seenPrimary[primary.ID] = struct{}{}
 		releaseIdentity := canonicalReleaseIdentity(event.ReleaseIdentifier)
 		if releaseIdentity == "" {
 			return nil, "", nonRetryable(types.NewAppError(
@@ -2958,6 +3023,31 @@ func (a *Activities) validateQualifiedEvents(
 		return nil, "no_match", nil
 	}
 	return out, "match", nil
+}
+
+func taskManualRequiresOfficialOriginal(taskManual string) bool {
+	manual := strings.ToLower(taskManual)
+	return strings.Contains(manual, "官方原文") ||
+		strings.Contains(manual, "official original") ||
+		strings.Contains(manual, "official source")
+}
+
+func taskManualRequiresCrossEvidence(taskManual string) bool {
+	manual := strings.ToLower(taskManual)
+	return strings.Contains(manual, "交叉核验") ||
+		strings.Contains(manual, "交叉证据") ||
+		strings.Contains(manual, "cross-check") ||
+		strings.Contains(manual, "cross evidence")
+}
+
+func taskManualRequiresObservationGate(taskManual string) bool {
+	manual := strings.ToLower(taskManual)
+	return taskManualRequiresOfficialOriginal(taskManual) ||
+		taskManualRequiresCrossEvidence(taskManual) ||
+		strings.Contains(manual, "仅推送重大更新") ||
+		strings.Contains(manual, "无重大更新") ||
+		strings.Contains(manual, "only push major") ||
+		strings.Contains(manual, "no major update")
 }
 
 func qualificationAllowed(

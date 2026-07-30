@@ -30,6 +30,10 @@ func TestCompiledToolPipelineV2CutoverGuards(t *testing.T) {
 	}
 	for _, required := range []string{
 		"a.ExecuteToolInvocationV2",
+		"workflow.GetVersion(",
+		"toolObservationQualificationVersionID",
+		"workflow.DefaultVersion, 1",
+		"a.QualifyToolCandidatesV2",
 		"a.ScoreToolCandidatesV2",
 		"a.CardGenToolCandidatesV2",
 		"MaximumAttempts:        1",

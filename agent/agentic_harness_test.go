@@ -276,7 +276,7 @@ func TestGroundedResearchRejectsToolsOnReservedFinalRound(t *testing.T) {
 }
 
 func TestIntentToolkitsNarrowFirstRequest(t *testing.T) {
-	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)
+	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
 	loop := New(Deps{Tools: BuildTools(
 		nil, nil, nil, nil, exa,
 	)})
@@ -303,7 +303,7 @@ func TestIntentToolkitsNarrowFirstRequest(t *testing.T) {
 }
 
 func TestIntentToolkitsShadowPreservesLegacyExposure(t *testing.T) {
-	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)
+	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
 	loop := New(Deps{Tools: BuildTools(
 		nil, nil, nil, nil, exa,
 	)})
@@ -332,7 +332,7 @@ func TestIntentToolkitsShadowPreservesLegacyExposure(t *testing.T) {
 }
 
 func TestIntentToolkitsRolloutPropagatesIntoRunOnce(t *testing.T) {
-	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)
+	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
 	chat := &scriptedChat{responses: []*llm.ChatResponse{{
 		Content: "基于当前信息回答。",
 	}}}
@@ -405,8 +405,8 @@ func TestDynamicDescriptionsHideProviderAndTransport(t *testing.T) {
 }
 
 func TestProductionToolSchemasHideProvidersAndTransport(t *testing.T) {
-	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0, 0)
-	endpoints := NewEndpointTools(nil, nil, 0, 0, 1_000_000)
+	exa := NewExaTools(&fakeWebSearcher{}, &fakePageReader{}, nil, 0)
+	endpoints := NewEndpointTools(nil, nil, 0, 1_000_000)
 	static := BuildTools(
 		nil, nil, nil, endpoints, exa,
 		&fakeDefinitionEditController{},

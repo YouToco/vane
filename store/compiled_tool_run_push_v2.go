@@ -249,6 +249,8 @@ func (s *Store) InsertDeliveryForTaskRunV2(
 		d.UserID != expected.UserID ||
 		d.ContentItemID == nil || *d.ContentItemID <= 0 ||
 		idempotencyKey == "" ||
+		d.ToolEvidenceRequired && len(d.ToolEvidenceJSON) == 0 ||
+		len(d.ToolEvidenceJSON) > 0 && !json.Valid(d.ToolEvidenceJSON) ||
 		!validToolInvocationDigestV2(invocationDigest) ||
 		d.InvocationDigest != "" &&
 			d.InvocationDigest != invocationDigest {
@@ -304,17 +306,20 @@ func (s *Store) InsertDeliveryForTaskRunV2(
 			   JOIN push_batches b ON b.id=d.batch_id
 			  WHERE d.batch_id=$1 AND d.content_item_id=$2
 			    AND d.tenant_id=$3 AND d.user_id=$4
-			    AND d.invocation_digest=$5
-			    AND d.score IS NOT DISTINCT FROM $6
-			    AND d.body_md=$7
-			    AND b.idempotency_key=$8
-			    AND b.schedule_id=$9
-			    AND b.run_snapshot_id=$10
+		    AND d.invocation_digest=$5
+		    AND d.score IS NOT DISTINCT FROM $6
+		    AND d.body_md=$7
+		    AND d.tool_evidence IS NOT DISTINCT FROM $8
+		    AND d.tool_evidence_required=$9
+		    AND b.idempotency_key=$10
+		    AND b.schedule_id=$11
+		    AND b.run_snapshot_id=$12
 			  FOR UPDATE OF d`,
 			d.BatchID, *d.ContentItemID,
 			expected.TenantID, expected.UserID, invocationDigest,
-			d.Score, d.BodyMD, physicalKey, expected.TaskID,
-			ref.SnapshotID,
+			d.Score, d.BodyMD, d.ToolEvidenceJSON,
+			d.ToolEvidenceRequired,
+			physicalKey, expected.TaskID, ref.SnapshotID,
 		).Scan(&id, &storedStatus)
 		if lookupErr == nil {
 			if err := commitCompiledRunWriteV1(
@@ -337,18 +342,20 @@ func (s *Store) InsertDeliveryForTaskRunV2(
 	err = tx.QueryRow(ctx,
 		`INSERT INTO deliveries (
 		    tenant_id,batch_id,user_id,content_item_id,invocation_digest,
-		    score,body_md,card_json,feishu_message_id,status
+		    score,body_md,tool_evidence,tool_evidence_required,
+		    card_json,feishu_message_id,status
 		 )
-		 SELECT $1,b.id,$2,$5,$6,$7,$8,$9,$10,$11
+		 SELECT $1,b.id,$2,$5,$6,$7,$8,$9,$10,$11,$12,$13
 		   FROM push_batches b
 		  WHERE b.id=$3 AND b.idempotency_key=$4
 		    AND b.tenant_id=$1 AND b.user_id=$2
-		    AND b.schedule_id=$12 AND b.run_snapshot_id=$13
+		    AND b.schedule_id=$14 AND b.run_snapshot_id=$15
 		 ON CONFLICT (batch_id,content_item_id)
 		     WHERE content_item_id IS NOT NULL DO NOTHING
 		 RETURNING id`,
 		expected.TenantID, expected.UserID, d.BatchID, physicalKey,
 		d.ContentItemID, invocationDigest, d.Score, d.BodyMD,
+		d.ToolEvidenceJSON, d.ToolEvidenceRequired,
 		card, d.FeishuMessageID, status, expected.TaskID,
 		ref.SnapshotID,
 	).Scan(&id)
@@ -373,11 +380,15 @@ func (s *Store) InsertDeliveryForTaskRunV2(
 		    AND d.invocation_digest=$5
 		    AND d.score IS NOT DISTINCT FROM $6
 		    AND d.body_md=$7
-		    AND b.idempotency_key=$8
-		    AND b.schedule_id=$9 AND b.run_snapshot_id=$10`,
+		    AND d.tool_evidence IS NOT DISTINCT FROM $8
+		    AND d.tool_evidence_required=$9
+		    AND b.idempotency_key=$10
+		    AND b.schedule_id=$11 AND b.run_snapshot_id=$12`,
 		d.BatchID, *d.ContentItemID,
 		expected.TenantID, expected.UserID, invocationDigest,
-		d.Score, d.BodyMD, physicalKey, expected.TaskID,
+		d.Score, d.BodyMD, d.ToolEvidenceJSON,
+		d.ToolEvidenceRequired,
+		physicalKey, expected.TaskID,
 		ref.SnapshotID,
 	).Scan(&id, &storedStatus)
 	if lookupErr == nil {

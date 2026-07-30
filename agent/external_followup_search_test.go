@@ -490,7 +490,7 @@ func TestHandleExternalContextMessage_SearchFailureNeverBecomesModelResult(
 				err: test.upstreamError,
 			}
 			exa := NewExaTools(
-				upstream, nil, test.counter, 5, test.dailyCap,
+				upstream, nil, test.counter, test.dailyCap,
 			)
 			chat := &scriptedChat{responses: []*llm.ChatResponse{{
 				ToolCalls: []llm.ToolCall{{
@@ -608,7 +608,7 @@ func TestHandleExternalContextMessage_OverlongFreshQuestionFailsClosed(
 ) {
 	fs := newFakeStore()
 	upstream := &fakeWebSearcher{}
-	exa := NewExaTools(upstream, nil, nil, 5, 100)
+	exa := NewExaTools(upstream, nil, nil, 100)
 	chat := &scriptedChat{}
 	l := newTestLoop(t, fs, chat.fn, exa.SearchTool())
 

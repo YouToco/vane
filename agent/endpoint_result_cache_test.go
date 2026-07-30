@@ -156,7 +156,7 @@ func TestToolCountBudget(t *testing.T) {
 	// 按生产满配计数（endpoints + exa 都非 nil）：任一为 nil 会把静态面算小，
 	// 账单就对不上真实在场工具数（2026-07-20 web_search/read_page 入列教训——
 	// 加工具的人必须过这张账单，而账单必须按满配开）。
-	static := len(BuildTools(nil, nil, nil, ep, NewExaTools(nil, nil, nil, 0, 0)))
+	static := len(BuildTools(nil, nil, nil, ep, NewExaTools(nil, nil, nil, 0)))
 	if got := static + maxActivatedEndpoints; got >= 30 {
 		t.Errorf("在场工具数 %d（静态 %d + 激活上限 %d）触及 30 工具退化线（RAG-MCP 证据，契约 §4.1）",
 			got, static, maxActivatedEndpoints)
@@ -220,7 +220,7 @@ func TestRenderShape_ArrayConsumesDepth(t *testing.T) {
 
 // TestInlineBudget_PerMessageCurve 钉死每消息累计预算曲线（契约 §3.5）：
 // 前几次给满额、预算耗尽后降到保底，绝不给 0（模型看不见任何内容会瞎猜）。
-// 这是单次上限从 6000 放大到 40000 的安全网——没有它，msgCap=10 次调用
+// 这是单次上限从 6000 放大到 40000 的安全网——统一熔断器放行 10 次调用时
 // 最坏能内联 400k 字符，且 FC 多轮历史重发会把这笔账乘以轮数。
 func TestInlineBudget_PerMessageCurve(t *testing.T) {
 	s := &toolRunState{}
@@ -237,7 +237,7 @@ func TestInlineBudget_PerMessageCurve(t *testing.T) {
 		total += got
 		calls++
 	}
-	// 10 次（msgCap 上限）累计不得失控：预算 + 保底×剩余次数是硬上界。
+	// 10 次（统一熔断器上限）累计不得失控：预算 + 保底×剩余次数是硬上界。
 	if max := testLimits.MsgBudget + testLimits.MinPerCall*calls; total > max {
 		t.Errorf("累计内联 %d 超硬上界 %d", total, max)
 	}

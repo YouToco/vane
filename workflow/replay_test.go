@@ -581,6 +581,130 @@ func TestPushPipelineWorkflow_ReplayCompiledV1HappyPath(t *testing.T) {
 	}
 }
 
+// compiledToolV2PreQualificationHistory captures the first Tool V2 command
+// sequence, before observation qualification was inserted between Dedup and
+// Score. It deliberately omits toolObservationQualificationVersionID.
+func compiledToolV2PreQualificationHistory(
+	t *testing.T,
+	execution sdkworkflow.Execution,
+) *historypb.History {
+	t.Helper()
+	p := PushParams{
+		TenantID: 7, UserID: 9, RunKind: PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeToolSnapshotV2,
+		ScheduleID:     "task-tool-v2-pre-qualification",
+	}
+	identity := types.RunIdentity{
+		TemporalWorkflowID: execution.ID,
+		TemporalRunID:      execution.RunID,
+		RunKind:            types.RunSnapshotKindScheduled,
+		TenantID:           p.TenantID,
+		UserID:             p.UserID,
+		TaskID:             p.ScheduleID,
+	}
+	digest := strings.Repeat("a", 64)
+	ref, err := (types.RunSnapshotRefV2{
+		SchemaVersion:      types.RunSnapshotSchemaVersionV2,
+		SnapshotID:         201,
+		TemporalWorkflowID: identity.TemporalWorkflowID,
+		TemporalRunID:      identity.TemporalRunID,
+		RunKind:            identity.RunKind,
+		TenantID:           identity.TenantID,
+		UserID:             identity.UserID,
+		TaskID:             identity.TaskID,
+		Mode:               types.ExecutionModeCompiled,
+		DefinitionDigest:   digest,
+		PlanDigest:         digest,
+		AdaptiveVersion:    1,
+		Policy: types.RuntimePolicyDigests{
+			CapabilityCatalogDigest: digest,
+			ToolPolicyDigest:        digest,
+			PromptPolicyDigest:      digest,
+			ModelPolicyDigest:       digest,
+			QuotaPolicyDigest:       digest,
+		},
+		PayloadDigest: digest,
+	}).Seal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := CompiledToolRunInputV2{
+		TenantID: p.TenantID, TaskID: p.ScheduleID, Snapshot: ref,
+	}
+	item := types.ContentItem{
+		ID: 301, Kind: types.KindArticle,
+		Title: "Tool result", URL: "https://example.com/tool-result",
+	}
+	candidate := runcontext.ToolCandidateV1{
+		InvocationDigest: digest, Item: item,
+	}
+	scored := runcontext.ToolScoredCandidateV1{
+		InvocationDigest: digest,
+		Scored:           types.ScoredItem{Item: item, Score: 88},
+	}
+	card := ToolGeneratedCardV1{
+		InvocationDigest: digest,
+		Card: GeneratedCard{
+			Scored: scored.Scored, BodyMD: "insight",
+		},
+	}
+	const traceID = "9f1d6c5e-0000-4000-8000-toolv2replay0"
+	b := newHistoryBuilder(t, p)
+	b.sideEffect(1, traceID)
+	b.versionWithSearchAttributes("scheduled-runtime-envelope-v1", 1)
+	b.versionWithSearchAttributes("compiled-tool-pipeline-v2", 1)
+	b.activity("PrepareToolRunV2", p, PrepareToolRunV2Result{
+		Authorized: true, Snapshot: ref,
+		InvocationDigests: []string{digest},
+	})
+	b.activity("ExecuteToolInvocationV2", ExecuteToolInvocationV2Input{
+		TenantID: p.TenantID, UserID: p.UserID,
+		TaskID: p.ScheduleID, Snapshot: ref,
+		InvocationDigest: digest,
+	}, ToolInvocationReceiptV1{
+		InvocationDigest:  digest,
+		ObservationDigest: strings.Repeat("b", 64),
+		ContentCount:      1,
+	})
+	b.activity("CollectToolRunContentV2", CollectToolRunContentV2Input{
+		TenantID: p.TenantID, UserID: p.UserID,
+		TaskID: p.ScheduleID, Snapshot: ref,
+	}, []runcontext.ToolCandidateV1{candidate})
+	b.activity("DedupToolCandidatesV2", DedupToolCandidatesV2Input{
+		UserID: p.UserID, TraceID: traceID,
+		Run: run, Candidates: []runcontext.ToolCandidateV1{candidate},
+	}, []runcontext.ToolCandidateV1{candidate})
+	b.activity("ScoreToolCandidatesV2", ScoreToolCandidatesV2Input{
+		UserID: p.UserID, TraceID: traceID,
+		Run: run, Candidates: []runcontext.ToolCandidateV1{candidate},
+	}, []runcontext.ToolScoredCandidateV1{scored})
+	b.activity("SelectToolCandidatesV2", SelectToolCandidatesV2Input{
+		UserID: p.UserID, TraceID: traceID,
+		Run: run, Candidates: []runcontext.ToolScoredCandidateV1{scored},
+	}, []runcontext.ToolScoredCandidateV1{scored})
+	b.activity("CardGenToolCandidatesV2", CardGenToolCandidatesV2Input{
+		UserID: p.UserID, TraceID: traceID,
+		Run: run, Candidates: []runcontext.ToolScoredCandidateV1{scored},
+	}, []ToolGeneratedCardV1{card})
+	b.activity("PushToolCardsV2", PushToolCardsV2Input{
+		UserID: p.UserID, TraceID: traceID,
+		Run: run, Cards: []ToolGeneratedCardV1{card},
+	}, nil)
+	return b.complete()
+}
+
+func TestPushPipelineWorkflow_ReplayToolV2PreQualification(t *testing.T) {
+	execution := sdkworkflow.Execution{
+		ID:    "wf-task-tool-v2-replay",
+		RunID: "00000000-0000-4000-8000-000000000201",
+	}
+	history := compiledToolV2PreQualificationHistory(t, execution)
+	if err := replayWithExecution(t, history, execution); err != nil {
+		t.Fatalf("pre-qualification Tool V2 history must replay exactly: %v", err)
+	}
+}
+
 func compiledRunOutcomeV1HappyPathHistory(
 	t *testing.T,
 	execution sdkworkflow.Execution,

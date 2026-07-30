@@ -12,8 +12,7 @@
 //   - 白名单语义（M4 契约 §10）扩展为「静态工具 ∪ 会话已激活端点」：模型编造的
 //     端点名（哪怕真在注册表里）只要没被本会话 search_endpoints 激活过，一律拒绝——
 //     激活集是显式审计过的调用面，跳过检索直呼端点名是绕过检索留痕的旁门。
-//   - 免确认的调用受滚动 24h EndpointDailyCap 与 Agent 统一单消息隐藏熔断器保护；
-//     EndpointMsgCap 只保留历史配置兼容，不参与日常规划。
+//   - 免确认的调用受滚动 24h EndpointDailyCap 与 Agent 统一单消息隐藏熔断器保护。
 package agent
 
 import (
@@ -318,7 +317,6 @@ type endpointInvoker interface {
 type EndpointTools struct {
 	inv      endpointInvoker
 	counter  endpointCallCounter
-	msgCap   int
 	dailyCap int
 	results  *resultCache // 大结果缓存（契约 §3.5：截断句柄 + read_endpoint_result 取回）
 	// limits 由 agent 模型的上下文窗口派生（llm.DeriveInlineLimits）：内联多少
@@ -326,13 +324,15 @@ type EndpointTools struct {
 	limits llm.InlineLimits
 }
 
-// NewEndpointTools 构造端点工具面。caps ≤0 时兜底为保守默认（装配疏漏不能变成无限额）。
+// NewEndpointTools 构造端点工具面。dailyCap ≤0 时兜底为保守默认
+// （装配疏漏不能变成无限额）。
 // contextTokens 是 agent 模型声明的上下文窗口（llm.ContextWindowTokens）；
 // ≤0 时按保守兜底档派生，绝不因装配疏漏放大内联量。
-func NewEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, dailyCap, contextTokens int) *EndpointTools {
-	if msgCap <= 0 {
-		msgCap = 10
-	}
+func NewEndpointTools(
+	inv endpointInvoker,
+	counter endpointCallCounter,
+	dailyCap, contextTokens int,
+) *EndpointTools {
 	if dailyCap <= 0 {
 		dailyCap = 200
 	}
@@ -344,7 +344,7 @@ func NewEndpointTools(inv endpointInvoker, counter endpointCallCounter, msgCap, 
 			MinPerCall: endpointResultFallbackRunes / 4,
 		}
 	}
-	return &EndpointTools{inv: inv, counter: counter, msgCap: msgCap, dailyCap: dailyCap,
+	return &EndpointTools{inv: inv, counter: counter, dailyCap: dailyCap,
 		results: newResultCache(), limits: limits}
 }
 

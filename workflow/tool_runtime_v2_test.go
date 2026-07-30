@@ -45,19 +45,21 @@ type compiledToolRunStoreFake struct {
 	pushEffects          PushEffectStore
 	pushRecoveryOnly     bool
 
-	loadRefCalls           int
-	createCalls            int
-	loadCalls              int
-	authorizeCalls         int
-	loadObservationCalls   int
-	commitObservationCalls int
-	listCandidateCalls     int
-	recentSimhashCalls     int
-	quotaCalls             int
-	pushBatchCalls         int
-	insertDeliveryCalls    int
-	deliveryInvocation     string
-	createPolicies         []runtimepolicy.BundleV1
+	loadRefCalls             int
+	createCalls              int
+	loadCalls                int
+	authorizeCalls           int
+	loadObservationCalls     int
+	commitObservationCalls   int
+	listCandidateCalls       int
+	recentSimhashCalls       int
+	quotaCalls               int
+	pushBatchCalls           int
+	insertDeliveryCalls      int
+	deliveryInvocation       string
+	deliveryEvidence         json.RawMessage
+	deliveryEvidenceRequired bool
+	createPolicies           []runtimepolicy.BundleV1
 }
 
 func (f *compiledToolRunStoreFake) LoadContentObservationForTaskRunV2(
@@ -171,12 +173,15 @@ func (f *compiledToolRunStoreFake) InsertDeliveryForTaskRunV2(
 	_ types.RunSnapshotRefV2,
 	_ string,
 	invocationDigest string,
-	_ *types.Delivery,
+	delivery *types.Delivery,
 ) (int64, bool, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.insertDeliveryCalls++
 	f.deliveryInvocation = invocationDigest
+	f.deliveryEvidence = append(
+		json.RawMessage(nil), delivery.ToolEvidenceJSON...)
+	f.deliveryEvidenceRequired = delivery.ToolEvidenceRequired
 	return 1, false, false, nil
 }
 
@@ -793,6 +798,7 @@ func TestToolCandidatePipelineV2_PreservesInvocationProvenance(
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestActivityEnvironment()
 	env.RegisterActivity(a.DedupToolCandidatesV2)
+	env.RegisterActivity(a.QualifyToolCandidatesV2)
 	env.RegisterActivity(a.ScoreToolCandidatesV2)
 	env.RegisterActivity(a.SelectToolCandidatesV2)
 	env.RegisterActivity(a.CardGenToolCandidatesV2)
@@ -846,10 +852,29 @@ func TestToolCandidatePipelineV2_PreservesInvocationProvenance(
 	}
 
 	encoded, err = env.ExecuteActivity(
+		a.QualifyToolCandidatesV2,
+		QualifyToolCandidatesV2Input{
+			UserID: identity.UserID, TraceID: "trace-tool-v2",
+			Run: run, Candidates: deduped,
+		})
+	if err != nil {
+		t.Fatalf("qualify Tool candidates: %v", err)
+	}
+	var qualified QualifyToolCandidatesV2Result
+	if err := encoded.Get(&qualified); err != nil {
+		t.Fatal(err)
+	}
+	if qualified.Outcome != "not_configured" ||
+		len(qualified.Candidates) != 1 ||
+		qualified.Candidates[0].InvocationDigest != invocation {
+		t.Fatalf("qualified candidates = %+v", qualified)
+	}
+
+	encoded, err = env.ExecuteActivity(
 		a.ScoreToolCandidatesV2,
 		ScoreToolCandidatesV2Input{
 			UserID: identity.UserID, TraceID: "trace-tool-v2",
-			Run: run, Candidates: deduped,
+			Run: run, Candidates: qualified.Candidates,
 		})
 	if err != nil {
 		t.Fatalf("score Tool candidates: %v", err)
@@ -968,17 +993,62 @@ func TestScoreToolCandidatesV2_RejectsTamperedPayloadBeforeSpend(
 	}
 }
 
+func TestToolCardEvidenceSourcesV2UsesLiveCanonicalURLs(t *testing.T) {
+	identity := testActivityIdentity(7, 9, "task-tool-v2-evidence")
+	_, snapshot := compiledToolActivityFixtureV2(t, identity)
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	invocation := snapshot.Definition.ToolCalls[0].Digest
+	sources, err := toolCardEvidenceSourcesV2(
+		snapshot,
+		[]runcontext.ToolCandidateV1{
+			{
+				InvocationDigest: invocation,
+				Item: types.ContentItem{
+					ID: 171, Title: "official",
+					URL:       "https://example.com/official",
+					Content:   "official announcement",
+					CreatedAt: now,
+				},
+			},
+			{
+				InvocationDigest: invocation,
+				Item: types.ContentItem{
+					ID: 172, Title: "cross-check",
+					URL:       "https://example.net/cross-check",
+					Content:   "independent evidence",
+					CreatedAt: now,
+				},
+			},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 2 ||
+		sources[0].ContentItemID != 171 ||
+		sources[0].Metadata.Ref != "source-1" ||
+		sources[0].Metadata.SourceURL !=
+			"https://example.com/official" ||
+		sources[1].Metadata.Ref != "source-2" ||
+		sources[1].Metadata.SourceURL !=
+			"https://example.net/cross-check" {
+		t.Fatalf("Tool evidence sources = %+v", sources)
+	}
+}
+
 func TestPushToolCardsV2_UsesDurableEffectAndToolProvenance(
 	t *testing.T,
 ) {
 	identity := testActivityIdentity(7, 9, "task-tool-v2-push")
 	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
 	st := &compiledToolRunStoreFake{
 		ref: ref, found: true, snapshot: snapshot, authorize: true,
 		observation: []types.ContentItem{{
 			ID: 201, Kind: types.KindArticle,
-			Title: "Tool result",
-			URL:   "https://example.com/tool-result",
+			Title:     "Tool result",
+			URL:       "https://example.com/tool-result",
+			Content:   "Tool body",
+			CreatedAt: now,
 		}},
 		observationFound: true,
 	}
@@ -1009,7 +1079,22 @@ func TestPushToolCardsV2_UsesDurableEffectAndToolProvenance(
 	env := suite.NewTestActivityEnvironment()
 	env.RegisterActivity(a.PushToolCardsV2)
 	invocation := snapshot.Definition.ToolCalls[0].Digest
-	_, err := env.ExecuteActivity(
+	evidenceCandidate := runcontext.ToolCandidateV1{
+		InvocationDigest: invocation,
+		Item: types.ContentItem{
+			ID: 201, Kind: types.KindArticle,
+			Title:     "Tool result",
+			URL:       "https://example.com/tool-result",
+			Content:   "Tool body",
+			CreatedAt: now,
+		},
+	}
+	evidenceSources, err := toolCardEvidenceSourcesV2(
+		snapshot, []runcontext.ToolCandidateV1{evidenceCandidate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = env.ExecuteActivity(
 		a.PushToolCardsV2,
 		PushToolCardsV2Input{
 			UserID: identity.UserID, TraceID: "trace-tool-v2-push",
@@ -1018,19 +1103,26 @@ func TestPushToolCardsV2_UsesDurableEffectAndToolProvenance(
 				TaskID:   identity.TaskID,
 				Snapshot: ref,
 			},
+			EvidenceRequired: true,
 			Cards: []ToolGeneratedCardV1{{
 				InvocationDigest: invocation,
 				Card: GeneratedCard{
 					Scored: types.ScoredItem{
 						Item: types.ContentItem{
 							ID: 201, Kind: types.KindArticle,
-							Title: "Tool result",
-							URL:   "https://example.com/tool-result",
+							Title:     "Tool result",
+							URL:       "https://example.com/tool-result",
+							Content:   "Tool body",
+							CreatedAt: now,
 						},
 						Score: 88,
 					},
 					BodyMD: "durable Tool insight",
 				},
+				Evidence: []ToolCardEvidenceV1{{
+					Candidate: evidenceCandidate,
+					Source:    evidenceSources[0],
+				}},
 			}},
 		})
 	if err != nil {
@@ -1061,8 +1153,158 @@ func TestPushToolCardsV2_UsesDurableEffectAndToolProvenance(
 	defer st.mu.Unlock()
 	if st.pushBatchCalls != 1 || st.insertDeliveryCalls != 1 ||
 		st.deliveryInvocation != invocation ||
+		len(st.deliveryEvidence) == 0 ||
+		!st.deliveryEvidenceRequired ||
 		st.authorizeCalls != 1 {
 		t.Fatalf("Tool push Store gates: %+v", st)
+	}
+}
+
+func TestPushToolCardsV2RejectsMissingRequiredEvidence(t *testing.T) {
+	identity := testActivityIdentity(
+		7, 9, "task-tool-v2-missing-evidence")
+	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	st := &compiledToolRunStoreFake{
+		ref: ref, found: true, snapshot: snapshot, authorize: true,
+	}
+	effectStore := newPRBActivityEffectStore(nil, nil)
+	st.pushEffects = effectStore
+	pusher := &prbActivityPusher{chatID: "oc_tool_v2"}
+	a := NewActivities(
+		fakeFetcher{}, fakeScorer{}, fakeCardGen{}, pusher,
+		&fakeStore{}, fakeFeishu{}, nil, nil, prbEffectCard, nil,
+		WithCompiledToolRuntimeV2(
+			st,
+			func(context.Context, int64, bool) (
+				runtimepolicy.BundleV1, error,
+			) {
+				return snapshot.Policy, nil
+			},
+			new(compiledModelResolverFake)),
+		WithPushEffectCanary(effectStore, identity.TaskID))
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.PushToolCardsV2)
+	invocation := snapshot.Definition.ToolCalls[0].Digest
+	_, err := env.ExecuteActivity(
+		a.PushToolCardsV2,
+		PushToolCardsV2Input{
+			UserID: identity.UserID, TraceID: "trace-missing-evidence",
+			Run: CompiledToolRunInputV2{
+				TenantID: identity.TenantID,
+				TaskID:   identity.TaskID,
+				Snapshot: ref,
+			},
+			EvidenceRequired: true,
+			Cards: []ToolGeneratedCardV1{{
+				InvocationDigest: invocation,
+				Card: GeneratedCard{
+					Scored: types.ScoredItem{
+						Item: types.ContentItem{
+							ID: 211, Kind: types.KindArticle,
+							Title: "Tool result", Content: "Tool body",
+							URL:       "https://example.com/tool-result",
+							CreatedAt: now,
+						},
+						Score: 88,
+					},
+					BodyMD: "[fake](https://fake.example)",
+				},
+			}},
+		})
+	if err == nil {
+		t.Fatalf("missing required evidence err=%v", err)
+	}
+	if len(pusher.snapshot()) != 0 {
+		t.Fatal("missing required evidence reached provider")
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.insertDeliveryCalls != 0 {
+		t.Fatal("missing required evidence reached durable delivery")
+	}
+}
+
+func TestPushToolCardsV2RejectsForgedSecondaryEvidence(t *testing.T) {
+	identity := testActivityIdentity(
+		7, 9, "task-tool-v2-forged-evidence")
+	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
+	invocation := snapshot.Definition.ToolCalls[0].Digest
+	now := time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC)
+	official := types.ContentItem{
+		ID: 211, Kind: types.KindArticle, Title: "official",
+		URL:     "https://official.example/release",
+		Content: "official body", CreatedAt: now,
+	}
+	cross := types.ContentItem{
+		ID: 212, Kind: types.KindArticle, Title: "cross",
+		URL:     "https://media.example/report",
+		Content: "cross body", CreatedAt: now,
+	}
+	candidates := []runcontext.ToolCandidateV1{
+		{InvocationDigest: invocation, Item: official},
+		{InvocationDigest: invocation, Item: cross},
+	}
+	sources, err := toolCardEvidenceSourcesV2(snapshot, candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources[1].Metadata.SourceURL = "https://fake.example/report"
+	st := &compiledToolRunStoreFake{
+		ref: ref, found: true, snapshot: snapshot, authorize: true,
+		observation:      []types.ContentItem{official, cross},
+		observationFound: true,
+	}
+	effectStore := newPRBActivityEffectStore(nil, nil)
+	st.pushEffects = effectStore
+	a := NewActivities(
+		fakeFetcher{}, fakeScorer{}, fakeCardGen{}, &fakePusher{},
+		&fakeStore{}, fakeFeishu{}, nil, nil,
+		func(feedback.AggregateCardInput) string { return "{}" }, nil,
+		WithCompiledToolRuntimeV2(
+			st,
+			func(context.Context, int64, bool) (
+				runtimepolicy.BundleV1, error,
+			) {
+				return snapshot.Policy, nil
+			},
+			new(compiledModelResolverFake)),
+		WithPushEffectCanary(effectStore, identity.TaskID))
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(a.PushToolCardsV2)
+	_, err = env.ExecuteActivity(
+		a.PushToolCardsV2,
+		PushToolCardsV2Input{
+			UserID:  identity.UserID,
+			TraceID: "trace-tool-v2-forged-evidence",
+			Run: CompiledToolRunInputV2{
+				TenantID: identity.TenantID,
+				TaskID:   identity.TaskID,
+				Snapshot: ref,
+			},
+			Cards: []ToolGeneratedCardV1{{
+				InvocationDigest: invocation,
+				Card: GeneratedCard{
+					Scored: types.ScoredItem{
+						Item: official, Score: 88,
+					},
+					BodyMD: "safe",
+				},
+				Evidence: []ToolCardEvidenceV1{
+					{Candidate: candidates[0], Source: sources[0]},
+					{Candidate: candidates[1], Source: sources[1]},
+				},
+			}},
+		})
+	if err == nil {
+		t.Fatal("forged secondary evidence reached Tool push")
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.insertDeliveryCalls != 0 {
+		t.Fatal("forged secondary evidence reached durable delivery")
 	}
 }
 
@@ -1147,6 +1389,8 @@ func TestPushPipelineWorkflow_CompiledToolV2CommandSequence(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var calls []string
+	var cardGenEvidenceRequired bool
+	var pushEvidenceRequired bool
 	record := func(name string) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -1192,6 +1436,18 @@ func TestPushPipelineWorkflow_CompiledToolV2CommandSequence(t *testing.T) {
 			record("dedup")
 			return []runcontext.ToolCandidateV1{candidate}, nil
 		})
+	register("QualifyToolCandidatesV2",
+		func(
+			context.Context,
+			QualifyToolCandidatesV2Input,
+		) (QualifyToolCandidatesV2Result, error) {
+			record("qualify")
+			return QualifyToolCandidatesV2Result{
+				Candidates:       []runcontext.ToolCandidateV1{candidate},
+				EvidenceRequired: true,
+				Outcome:          "match",
+			}, nil
+		})
 	register("ScoreToolCandidatesV2",
 		func(
 			context.Context,
@@ -1210,15 +1466,21 @@ func TestPushPipelineWorkflow_CompiledToolV2CommandSequence(t *testing.T) {
 		})
 	register("CardGenToolCandidatesV2",
 		func(
-			context.Context,
-			CardGenToolCandidatesV2Input,
+			_ context.Context,
+			in CardGenToolCandidatesV2Input,
 		) ([]ToolGeneratedCardV1, error) {
 			record("cardgen")
+			mu.Lock()
+			cardGenEvidenceRequired = in.EvidenceRequired
+			mu.Unlock()
 			return []ToolGeneratedCardV1{card}, nil
 		})
 	register("PushToolCardsV2",
-		func(context.Context, PushToolCardsV2Input) error {
+		func(_ context.Context, in PushToolCardsV2Input) error {
 			record("push")
+			mu.Lock()
+			pushEvidenceRequired = in.EvidenceRequired
+			mu.Unlock()
 			return nil
 		})
 
@@ -1234,12 +1496,102 @@ func TestPushPipelineWorkflow_CompiledToolV2CommandSequence(t *testing.T) {
 	}
 	want := []string{
 		"prepare", "execute", "collect", "dedup",
-		"score", "select", "cardgen", "push",
+		"qualify", "score", "select", "cardgen", "push",
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	if !reflect.DeepEqual(calls, want) {
 		t.Fatalf("compiled Tool command sequence=%v, want %v", calls, want)
+	}
+	if !cardGenEvidenceRequired || !pushEvidenceRequired {
+		t.Fatalf(
+			"evidence requirement was not carried: cardgen=%t push=%t",
+			cardGenEvidenceRequired, pushEvidenceRequired)
+	}
+}
+
+func TestPushPipelineWorkflow_ToolV2NoMatchStopsBeforeScoreAndPush(
+	t *testing.T,
+) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	identity := testActivityIdentity(7, 9, "task-tool-v2-no-match")
+	ref, snapshot := compiledToolActivityFixtureV2(t, identity)
+	invocation := snapshot.Definition.ToolCalls[0].Digest
+	item := types.ContentItem{
+		ID: 302, Kind: types.KindArticle,
+		Title: "media rumor", URL: "https://media.example/rumor",
+	}
+	candidate := runcontext.ToolCandidateV1{
+		InvocationDigest: invocation, Item: item,
+	}
+	register := func(name string, fn any) {
+		env.RegisterActivityWithOptions(
+			fn, activity.RegisterOptions{Name: name})
+	}
+	register("PrepareToolRunV2",
+		func(context.Context, PushParams) (PrepareToolRunV2Result, error) {
+			return PrepareToolRunV2Result{
+				Authorized: true, Snapshot: ref,
+				InvocationDigests: []string{invocation},
+			}, nil
+		})
+	register("ExecuteToolInvocationV2",
+		func(
+			context.Context,
+			ExecuteToolInvocationV2Input,
+		) (ToolInvocationReceiptV1, error) {
+			return ToolInvocationReceiptV1{
+				InvocationDigest:  invocation,
+				ObservationDigest: strings.Repeat("c", 64),
+				ContentCount:      1,
+			}, nil
+		})
+	register("CollectToolRunContentV2",
+		func(
+			context.Context,
+			CollectToolRunContentV2Input,
+		) ([]runcontext.ToolCandidateV1, error) {
+			return []runcontext.ToolCandidateV1{candidate}, nil
+		})
+	register("DedupToolCandidatesV2",
+		func(
+			context.Context,
+			DedupToolCandidatesV2Input,
+		) ([]runcontext.ToolCandidateV1, error) {
+			return []runcontext.ToolCandidateV1{candidate}, nil
+		})
+	register("QualifyToolCandidatesV2",
+		func(
+			context.Context,
+			QualifyToolCandidatesV2Input,
+		) (QualifyToolCandidatesV2Result, error) {
+			return QualifyToolCandidatesV2Result{
+				Outcome: "no_match",
+			}, nil
+		})
+	var got RecordEmptyToolRunV2Input
+	register("RecordEmptyToolRunV2",
+		func(_ context.Context, in RecordEmptyToolRunV2Input) error {
+			got = in
+			return nil
+		})
+
+	env.ExecuteWorkflow(PushPipelineWorkflow, PushParams{
+		TenantID: identity.TenantID, UserID: identity.UserID,
+		RunKind:        PushRunKindScheduled,
+		ExecutionMode:  types.ExecutionModeCompiled,
+		RuntimeVersion: CompiledRuntimeToolSnapshotV2,
+		ScheduleID:     identity.TaskID,
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("compiled Tool no-match workflow: %v", err)
+	}
+	if got.Gate != types.BatchExitGateObservationNoMatch ||
+		got.Counts.Fetched == nil || *got.Counts.Fetched != 1 ||
+		got.Counts.Deduped == nil || *got.Counts.Deduped != 1 ||
+		got.Counts.Qualified == nil || *got.Counts.Qualified != 0 {
+		t.Fatalf("no-match receipt = %+v", got)
 	}
 }
 
