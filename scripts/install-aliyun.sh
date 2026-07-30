@@ -3,8 +3,12 @@ set -euo pipefail
 umask 077
 
 version=3.4.10
-archive_name=aliyun-cli-linux-3.4.10-arm64.tgz
-archive_sha256=349f3d31af9cc85aa2b444899e7d805f6409f5a53d667ce74d00dafbc17f9ae5
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+selection=$(
+  "$script_dir/select-aliyun-tool-archive.sh" aliyun "$(uname -m)"
+)
+IFS=$'\t' read -r archive_name archive_sha256 <<<"$selection"
+[[ -n "$archive_name" && "$archive_sha256" =~ ^[0-9a-f]{64}$ ]]
 archive_url="https://github.com/aliyun/aliyun-cli/releases/download/v${version}/${archive_name}"
 install_dir="$RUNNER_TEMP/aliyun-$version"
 
