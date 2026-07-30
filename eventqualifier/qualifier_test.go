@@ -33,6 +33,7 @@ func TestRenderUserContainsOnlyBoundedCandidates(t *testing.T) {
 			ID: 8, Title: "later context", URL: "https://openai.com/index/later",
 			PublishedAt: &later, Content: "same subject observed later",
 		}},
+		OfficialContentIDs: map[int64]struct{}{7: {}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -43,6 +44,11 @@ func TestRenderUserContainsOnlyBoundedCandidates(t *testing.T) {
 	}
 	if !strings.Contains(rendered, `"url_host":"openai.com"`) {
 		t.Fatalf("rendered request omitted derived URL host: %s", rendered)
+	}
+	if !strings.Contains(rendered, `"id":7,"title":"release announcement","url":"https://openai.com/index/example","url_host":"openai.com","official_for_task":true`) ||
+		!strings.Contains(rendered, `"id":8,"title":"later context","url":"https://openai.com/index/later","url_host":"openai.com","official_for_task":false`) {
+		t.Fatalf("rendered request omitted deterministic official boundary: %s",
+			rendered)
 	}
 	if strings.Count(rendered, "候选正文") >= 1000 {
 		t.Fatal("candidate content was not bounded")
@@ -102,7 +108,8 @@ func TestSystemPromptIncludesEvidenceTimeContract(t *testing.T) {
 	for _, required := range []string{
 		"任务手册",
 		"官方原始页面",
-		"官方身份看 URL 主机名",
+		"URL 主机名和任务手册预先验证",
+		"official_for_task 必须为 true",
 		"evidence_content_ids 第一项必须是该官方页面",
 		"只有媒体报道、转载或没有正文的搜索结果时不得 match",
 	} {

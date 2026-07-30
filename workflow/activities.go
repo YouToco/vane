@@ -2782,6 +2782,21 @@ func (a *Activities) qualifyEventCandidates(
 			Candidates: candidates, Client: modelClient, ModelCall: modelCall,
 			QuotaRule: quotaRule, BeforeSpend: beforeSpend,
 		}
+		if taskManualRequiresOfficialOriginal(
+			snapshot.Definition.PlaybookContent,
+		) {
+			qualifierRequest.OfficialContentIDs =
+				make(map[int64]struct{}, len(candidates))
+			for _, candidate := range candidates {
+				if officialHostGroundedInTaskManual(
+					candidate.URL,
+					snapshot.Definition.PlaybookContent,
+				) {
+					qualifierRequest.OfficialContentIDs[candidate.ID] =
+						struct{}{}
+				}
+			}
+		}
 		if rollout == observation.RolloutShadow {
 			result, canonical, err = a.eventQualifier.QualifyObservationShadow(
 				ctx, qualifierRequest)
