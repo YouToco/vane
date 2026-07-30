@@ -357,6 +357,38 @@ func TestBuild_XHSUserPosts(t *testing.T) {
 	}
 }
 
+func TestBuild_XHSDirectIDsAreExact(t *testing.T) {
+	for _, capability := range []string{"user_posts", "faved_notes"} {
+		for _, userID := range []string{
+			"abc",
+			"6A5578B3000000000E03CC00",
+			" 6a5578b3000000000e03cc00",
+			"https://www.xiaohongshu.com/user/profile/6a5578b3000000000e03cc00",
+		} {
+			if _, message := BuildTarget(Requirement{
+				Platform: "xhs", Capability: capability,
+				Params: map[string]string{"user_id": userID},
+			}); message == "" {
+				t.Fatalf("%s accepted non-exact user_id %q",
+					capability, userID)
+			}
+		}
+	}
+	for _, pageID := range []string{
+		"abc",
+		"6301C499DF9BEA0001DC6F47",
+		" 6301c499df9bea0001dc6f47",
+		"https://www.xiaohongshu.com/page/topics/6301c499df9bea0001dc6f47",
+	} {
+		if _, message := BuildTarget(Requirement{
+			Platform: "xhs", Capability: "topic_feed",
+			Params: map[string]string{"page_id": pageID},
+		}); message == "" {
+			t.Fatalf("topic_feed accepted non-exact page_id %q", pageID)
+		}
+	}
+}
+
 // TestBuild_XSearchUnavailable：x/search 在 capabilitycatalog 里标记 Unavailable，
 // BuildTarget 应直接回其 Reason 而非构造坏源，且 Reason 里应指路到 user_posts。
 func TestBuild_XSearchUnavailable(t *testing.T) {

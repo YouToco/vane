@@ -70,12 +70,16 @@ The model must never produce:
 Each acquisition Tool owns one definition containing:
 
 - its model-visible name and arguments;
+- its model-visible description and external-locator policy;
 - strict argument decoding and canonicalization;
 - availability and the reason for deliberate unavailability;
 - output kind;
 - the retained implementation and credential generations used by a run.
 
 No second catalog or specification compiler may restate those facts.
+`create_schedule` embeds a generated discriminated union from these
+definitions; the creation controller calls the same Tool decoder and
+materializer instead of maintaining a second argument switch.
 
 The accepted Tool calls are stored on the approved task head without losing
 the Tool name or canonical arguments. Materialized provider URL/config is

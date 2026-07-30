@@ -48,181 +48,247 @@ func decodeApprovedToolArgumentsV1(
 	raw json.RawMessage,
 ) (Requirement, error) {
 	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return Requirement{}, errors.New("frozen Tool arguments must be an object")
+		return Requirement{}, errors.New(
+			"frozen Tool arguments must be an object",
+		)
 	}
-	switch toolName {
-	case "web_search":
-		var input struct {
-			Query          string   `json:"query"`
-			Category       string   `json:"category,omitempty"`
-			IncludeDomains []string `json:"include_domains,omitempty"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return Requirement{}, err
-		}
-		params := map[string]string{"query": input.Query}
-		if input.Category != "" {
-			params["category"] = input.Category
-		}
-		if input.IncludeDomains != nil {
-			encoded, err := json.Marshal(input.IncludeDomains)
-			if err != nil {
-				return Requirement{}, err
-			}
-			params["include_domains"] = string(encoded)
-		}
-		return Requirement{
-			Platform:   string(types.PlatformWeb),
-			Capability: string(types.CapSearch), Params: params,
-		}, nil
-	case "web_feed":
-		var input struct {
-			FeedURL    string   `json:"feed_url"`
-			Categories []string `json:"categories,omitempty"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return Requirement{}, err
-		}
-		params := map[string]string{"url": input.FeedURL}
-		if input.Categories != nil {
-			encoded, err := json.Marshal(input.Categories)
-			if err != nil {
-				return Requirement{}, err
-			}
-			params["categories"] = string(encoded)
-		}
-		return Requirement{
-			Platform:   string(types.PlatformWeb),
-			Capability: string(types.CapFeed), Params: params,
-		}, nil
-	case "web_contents":
-		var input struct {
-			PageURL string `json:"page_url"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return Requirement{}, err
-		}
-		return Requirement{
-			Platform:   string(types.PlatformWeb),
-			Capability: string(types.CapContents),
-			Params:     map[string]string{"url": input.PageURL},
-		}, nil
-	case "x_user_posts":
-		var input struct {
-			ScreenName string `json:"screen_name"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return Requirement{}, err
-		}
-		return Requirement{
-			Platform:   string(types.PlatformX),
-			Capability: string(types.CapUserPosts),
-			Params:     map[string]string{"screen_name": input.ScreenName},
-		}, nil
-	case "xhs_search":
-		var input struct {
-			Keyword string `json:"keyword"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return Requirement{}, err
-		}
-		return Requirement{
-			Platform:   string(types.PlatformXHS),
-			Capability: string(types.CapSearch),
-			Params:     map[string]string{"keyword": input.Keyword},
-		}, nil
-	case "xhs_user_posts", "xhs_faved_notes":
-		var input struct {
-			UserID     string `json:"user_id,omitempty"`
-			ProfileURL string `json:"profile_url,omitempty"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return Requirement{}, err
-		}
-		if !exactlyOne(input.UserID, input.ProfileURL) {
-			return Requirement{},
-				errors.New("exactly one of user_id or profile_url is required")
-		}
-		capability := types.CapUserPosts
-		if toolName == "xhs_faved_notes" {
-			capability = types.CapFavedNotes
-		}
-		return Requirement{
-			Platform: string(types.PlatformXHS), Capability: string(capability),
-			Params: map[string]string{
-				"user_id": input.UserID, "profile_url": input.ProfileURL,
-			},
-		}, nil
-	case "xhs_hot_list":
-		var input struct{}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return Requirement{}, err
-		}
-		return Requirement{
-			Platform:   string(types.PlatformXHS),
-			Capability: string(types.CapHotList), Params: map[string]string{},
-		}, nil
-	case "xhs_topic_feed":
-		var input struct {
-			PageID   string `json:"page_id,omitempty"`
-			TopicURL string `json:"topic_url,omitempty"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return Requirement{}, err
-		}
-		if !exactlyOne(input.PageID, input.TopicURL) {
-			return Requirement{},
-				errors.New("exactly one of page_id or topic_url is required")
-		}
-		return Requirement{
-			Platform:   string(types.PlatformXHS),
-			Capability: string(types.CapTopicFeed),
-			Params: map[string]string{
-				"page_id": input.PageID, "topic_url": input.TopicURL,
-			},
-		}, nil
-	case "weibo_user_posts":
-		var input struct {
-			UID        string `json:"uid,omitempty"`
-			ProfileURL string `json:"profile_url,omitempty"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return Requirement{}, err
-		}
-		if !exactlyOne(input.UID, input.ProfileURL) {
-			return Requirement{},
-				errors.New("exactly one of uid or profile_url is required")
-		}
-		return Requirement{
-			Platform:   string(types.PlatformWeibo),
-			Capability: string(types.CapUserPosts),
-			Params: map[string]string{
-				"uid": input.UID, "profile_url": input.ProfileURL,
-			},
-		}, nil
-	case "weibo_hot_list":
-		var input struct{}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return Requirement{}, err
-		}
-		return Requirement{
-			Platform:   string(types.PlatformWeibo),
-			Capability: string(types.CapHotList), Params: map[string]string{},
-		}, nil
-	case "wechat_mp_user_posts":
-		var input struct {
-			Username string `json:"username"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return Requirement{}, err
-		}
-		return Requirement{
-			Platform:   string(types.PlatformWechatMP),
-			Capability: string(types.CapUserPosts),
-			Params:     map[string]string{"username": input.Username},
-		}, nil
-	default:
+	var fields map[string]json.RawMessage
+	if strictjson.DecodeExact(raw, &fields) != nil || fields == nil {
+		return Requirement{}, errors.New(
+			"frozen Tool arguments must be an object",
+		)
+	}
+	definition, ok := lookupModelToolDefinitionV1(toolName)
+	if !ok || definition.decoder == nil {
 		return Requirement{}, fmt.Errorf(
-			"unsupported approved acquisition Tool %q", toolName)
+			"unsupported approved acquisition Tool %q", toolName,
+		)
 	}
+	return definition.decoder(raw)
+}
+
+func decodeWebSearchArgumentsV1(raw json.RawMessage) (Requirement, error) {
+	if explicitNullToolArgument(raw, "include_domains") {
+		return Requirement{}, errors.New("include_domains must be an array")
+	}
+	var input struct {
+		Query          string   `json:"query"`
+		Category       string   `json:"category,omitempty"`
+		IncludeDomains []string `json:"include_domains,omitempty"`
+	}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	params := map[string]string{"query": input.Query}
+	if input.Category != "" {
+		params["category"] = input.Category
+	}
+	if input.IncludeDomains != nil {
+		encoded, err := json.Marshal(input.IncludeDomains)
+		if err != nil {
+			return Requirement{}, err
+		}
+		params["include_domains"] = string(encoded)
+	}
+	return Requirement{
+		Platform: string(types.PlatformWeb), Capability: string(types.CapSearch),
+		Params: params,
+	}, nil
+}
+
+func decodeWebFeedArgumentsV1(raw json.RawMessage) (Requirement, error) {
+	if explicitNullToolArgument(raw, "categories") {
+		return Requirement{}, errors.New("categories must be an array")
+	}
+	var input struct {
+		FeedURL    string   `json:"feed_url"`
+		Categories []string `json:"categories,omitempty"`
+	}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	params := map[string]string{"url": input.FeedURL}
+	if input.Categories != nil {
+		encoded, err := json.Marshal(input.Categories)
+		if err != nil {
+			return Requirement{}, err
+		}
+		params["categories"] = string(encoded)
+	}
+	return Requirement{
+		Platform: string(types.PlatformWeb), Capability: string(types.CapFeed),
+		Params: params,
+	}, nil
+}
+
+func decodeWebContentsArgumentsV1(raw json.RawMessage) (Requirement, error) {
+	var input struct {
+		PageURL string `json:"page_url"`
+	}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	return Requirement{
+		Platform: string(types.PlatformWeb), Capability: string(types.CapContents),
+		Params: map[string]string{"url": input.PageURL},
+	}, nil
+}
+
+func decodeXUserPostsArgumentsV1(raw json.RawMessage) (Requirement, error) {
+	var input struct {
+		ScreenName string `json:"screen_name"`
+	}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	return Requirement{
+		Platform: string(types.PlatformX), Capability: string(types.CapUserPosts),
+		Params: map[string]string{"screen_name": input.ScreenName},
+	}, nil
+}
+
+func decodeXHSSearchArgumentsV1(raw json.RawMessage) (Requirement, error) {
+	var input struct {
+		Keyword string `json:"keyword"`
+	}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	return Requirement{
+		Platform: string(types.PlatformXHS), Capability: string(types.CapSearch),
+		Params: map[string]string{"keyword": input.Keyword},
+	}, nil
+}
+
+func decodeXHSUserPostsArgumentsV1(
+	raw json.RawMessage,
+) (Requirement, error) {
+	return decodeXHSUserLocatorArgumentsV1(
+		raw, types.CapUserPosts,
+	)
+}
+
+func decodeXHSFavedNotesArgumentsV1(
+	raw json.RawMessage,
+) (Requirement, error) {
+	return decodeXHSUserLocatorArgumentsV1(
+		raw, types.CapFavedNotes,
+	)
+}
+
+func decodeXHSUserLocatorArgumentsV1(
+	raw json.RawMessage,
+	capability types.Capability,
+) (Requirement, error) {
+	var input struct {
+		UserID     string `json:"user_id,omitempty"`
+		ProfileURL string `json:"profile_url,omitempty"`
+	}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	if !exactlyOne(input.UserID, input.ProfileURL) {
+		return Requirement{}, errors.New(
+			"exactly one of user_id or profile_url is required",
+		)
+	}
+	return Requirement{
+		Platform: string(types.PlatformXHS), Capability: string(capability),
+		Params: map[string]string{
+			"user_id": input.UserID, "profile_url": input.ProfileURL,
+		},
+	}, nil
+}
+
+func decodeXHSHotListArgumentsV1(raw json.RawMessage) (Requirement, error) {
+	var input struct{}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	return Requirement{
+		Platform: string(types.PlatformXHS), Capability: string(types.CapHotList),
+		Params: map[string]string{},
+	}, nil
+}
+
+func decodeXHSTopicFeedArgumentsV1(raw json.RawMessage) (Requirement, error) {
+	var input struct {
+		PageID   string `json:"page_id,omitempty"`
+		TopicURL string `json:"topic_url,omitempty"`
+	}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	if !exactlyOne(input.PageID, input.TopicURL) {
+		return Requirement{}, errors.New(
+			"exactly one of page_id or topic_url is required",
+		)
+	}
+	return Requirement{
+		Platform: string(types.PlatformXHS), Capability: string(types.CapTopicFeed),
+		Params: map[string]string{
+			"page_id": input.PageID, "topic_url": input.TopicURL,
+		},
+	}, nil
+}
+
+func decodeWeiboUserPostsArgumentsV1(
+	raw json.RawMessage,
+) (Requirement, error) {
+	var input struct {
+		UID        string `json:"uid,omitempty"`
+		ProfileURL string `json:"profile_url,omitempty"`
+	}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	if !exactlyOne(input.UID, input.ProfileURL) {
+		return Requirement{}, errors.New(
+			"exactly one of uid or profile_url is required",
+		)
+	}
+	return Requirement{
+		Platform: string(types.PlatformWeibo), Capability: string(types.CapUserPosts),
+		Params: map[string]string{
+			"uid": input.UID, "profile_url": input.ProfileURL,
+		},
+	}, nil
+}
+
+func decodeWeiboHotListArgumentsV1(
+	raw json.RawMessage,
+) (Requirement, error) {
+	var input struct{}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	return Requirement{
+		Platform: string(types.PlatformWeibo), Capability: string(types.CapHotList),
+		Params: map[string]string{},
+	}, nil
+}
+
+func decodeWechatMPUserPostsArgumentsV1(
+	raw json.RawMessage,
+) (Requirement, error) {
+	var input struct {
+		Username string `json:"username"`
+	}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	return Requirement{
+		Platform:   string(types.PlatformWechatMP),
+		Capability: string(types.CapUserPosts),
+		Params:     map[string]string{"username": input.Username},
+	}, nil
+}
+
+func explicitNullToolArgument(raw json.RawMessage, name string) bool {
+	var fields map[string]json.RawMessage
+	if strictjson.DecodeExact(raw, &fields) != nil {
+		return false
+	}
+	value, ok := fields[name]
+	return ok && bytes.Equal(bytes.TrimSpace(value), []byte("null"))
 }

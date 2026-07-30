@@ -7,10 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -1216,7 +1216,7 @@ func materializeCreationToolCalls(
 	}
 	materialized := make([]compiledFetchTarget, 0, len(calls))
 	for i, raw := range calls {
-		spec, toolName, toolArgs, err := decodeCreationToolCall(raw)
+		toolName, toolArgs, err := decodeCreationToolCall(raw)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"task: tool_calls[%d]: %w", i, err,
@@ -1229,10 +1229,13 @@ func materializeCreationToolCalls(
 				"task: tool_calls[%d]: %w", i, err,
 			)
 		}
-		source, message := acquisitiontool.BuildTarget(spec)
-		if message != "" || source == nil {
-			if message == "" {
-				message = "信源无法构造"
+		source, err := acquisitiontool.MaterializeApprovedToolCallV1(
+			toolName, "v1", toolArgs,
+		)
+		if err != nil || source == nil {
+			message := "Tool 调用无法物化"
+			if err != nil {
+				message = err.Error()
 			}
 			return nil, fmt.Errorf(
 				"task: tool_calls[%d]: %s", i, message,
@@ -1244,18 +1247,7 @@ func materializeCreationToolCalls(
 		// with the exact safe title so ValidateMaterialized remains a proof.
 		safeTitle := promptguard.SingleLine(promptguard.StripInvisible(source.Title))
 		safeTitle = truncateCreationRunes(safeTitle, maxCompiledSourceRunes)
-		if safeTitle != source.Title {
-			spec.Title = safeTitle
-			source, message = acquisitiontool.BuildTarget(spec)
-			if message != "" || source == nil {
-				if message == "" {
-					message = "信源安全标题无法构造"
-				}
-				return nil, fmt.Errorf(
-					"task: tool_calls[%d]: %s", i, message,
-				)
-			}
-		}
+		source.Title = safeTitle
 		config := bytes.Clone(source.Config)
 		if len(bytes.TrimSpace(config)) == 0 {
 			// json.RawMessage(nil) marshals as null, while durable source config
@@ -1279,7 +1271,7 @@ func validateCreationObservationLocators(
 		return nil
 	}
 	for _, domain := range policy.Evidence.OfficialDomains {
-		if !creationOwnerExplicitlyNamed(ownerRequest, domain) {
+		if !creationOwnerExplicitlyNamedDomain(ownerRequest, domain) {
 			return fmt.Errorf(
 				"official_domains 中的 %q 必须由用户在当前消息中明确提供",
 				domain,
@@ -1298,45 +1290,31 @@ func validateCreationToolLocators(
 	if err := strictjson.DecodeExact(raw, &fields); err != nil {
 		return err
 	}
-	var names []string
-	switch toolName {
-	case "web_search":
-		var domains []string
-		if rawDomains, ok := fields["include_domains"]; ok {
-			if err := strictjson.DecodeExact(rawDomains, &domains); err != nil {
+	definition, ok := acquisitiontool.LookupModelToolDefinitionV1(toolName)
+	if !ok {
+		return fmt.Errorf("unknown acquisition Tool %q", toolName)
+	}
+	for _, locator := range definition.ExternalLocators {
+		rawValue, exists := fields[locator.Argument]
+		if !exists {
+			continue
+		}
+		if locator.Kind == acquisitiontool.ExternalLocatorDomainsV1 {
+			var domains []string
+			if err := strictjson.DecodeExact(rawValue, &domains); err != nil {
 				return err
 			}
-		}
-		for _, domain := range domains {
-			if !creationOwnerExplicitlyNamed(ownerRequest, domain) {
-				return fmt.Errorf(
-					"include_domains 中的 %q 必须由用户在当前消息中明确提供；"+
-						"否则请使用不带域名约束的语义搜索",
-					domain,
-				)
+			for _, domain := range domains {
+				if !creationOwnerExplicitlyNamedDomain(
+					ownerRequest, domain,
+				) {
+					return fmt.Errorf(
+						"%s 中的 %q 必须由用户在当前消息中明确提供；"+
+							"否则请使用不带域名约束的语义搜索",
+						locator.Argument, domain,
+					)
+				}
 			}
-		}
-		return nil
-	case "web_feed":
-		names = []string{"feed_url"}
-	case "web_contents":
-		names = []string{"page_url"}
-	case "x_user_posts":
-		names = []string{"screen_name"}
-	case "xhs_user_posts", "xhs_faved_notes":
-		names = []string{"user_id", "profile_url"}
-	case "xhs_topic_feed":
-		names = []string{"page_id", "topic_url"}
-	case "weibo_user_posts":
-		names = []string{"uid", "profile_url"}
-	case "wechat_mp_user_posts":
-		names = []string{"username"}
-	default:
-		return nil
-	}
-	for _, name := range names {
-		rawValue, ok := fields[name]
-		if !ok {
 			continue
 		}
 		var value string
@@ -1345,7 +1323,7 @@ func validateCreationToolLocators(
 			continue
 		}
 		explicit := creationOwnerExplicitlyNamed(ownerRequest, value)
-		if toolName == "x_user_posts" && name == "screen_name" {
+		if locator.Kind == acquisitiontool.ExternalLocatorXHandleV1 {
 			explicit = creationOwnerExplicitlyNamedXHandle(
 				ownerRequest, value,
 			)
@@ -1353,7 +1331,7 @@ func validateCreationToolLocators(
 		if !explicit {
 			return fmt.Errorf(
 				"%s=%q 必须由用户在当前消息中明确提供；请向用户追问准确值",
-				name, value,
+				locator.Argument, value,
 			)
 		}
 	}
@@ -1363,7 +1341,22 @@ func validateCreationToolLocators(
 func creationOwnerExplicitlyNamed(ownerRequest, value string) bool {
 	request := strings.ToLower(promptguard.StripInvisible(ownerRequest))
 	needle := strings.ToLower(promptguard.StripInvisible(strings.TrimSpace(value)))
-	return needle != "" && strings.Contains(request, needle)
+	if strings.Contains(needle, "://") {
+		return creationExactURLTokenContains(request, needle)
+	}
+	return creationBoundedLocatorContains(
+		request, needle, creationIdentifierContinuation,
+	)
+}
+
+func creationOwnerExplicitlyNamedDomain(ownerRequest, value string) bool {
+	request := strings.ToLower(promptguard.StripInvisible(ownerRequest))
+	domain := strings.ToLower(
+		promptguard.StripInvisible(strings.TrimSpace(value)),
+	)
+	return creationBoundedLocatorContains(
+		request, domain, creationDomainContinuation,
+	)
 }
 
 func creationOwnerExplicitlyNamedXHandle(ownerRequest, value string) bool {
@@ -1371,12 +1364,107 @@ func creationOwnerExplicitlyNamedXHandle(ownerRequest, value string) bool {
 	handle := strings.ToLower(
 		promptguard.StripInvisible(strings.TrimSpace(value)),
 	)
+	handle = strings.TrimPrefix(handle, "@")
 	if handle == "" {
 		return false
 	}
-	return strings.Contains(request, "@"+handle) ||
-		strings.Contains(request, "x.com/"+handle) ||
-		strings.Contains(request, "twitter.com/"+handle)
+	for _, candidate := range []string{
+		"@" + handle,
+		"x.com/" + handle,
+		"twitter.com/" + handle,
+	} {
+		if creationBoundedLocatorContains(
+			request, candidate, creationHandleContinuation,
+		) {
+			return true
+		}
+	}
+	return false
+}
+
+func creationBoundedLocatorContains(
+	request string,
+	needle string,
+	continues func(byte) bool,
+) bool {
+	if needle == "" {
+		return false
+	}
+	for offset := 0; offset <= len(request)-len(needle); {
+		index := strings.Index(request[offset:], needle)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeOK := index == 0 || !continues(request[index-1])
+		after := index + len(needle)
+		afterOK := after == len(request) || !continues(request[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func creationDomainContinuation(value byte) bool {
+	return creationASCIIAlphaNumeric(value) ||
+		value == '-' || value == '.'
+}
+
+func creationIdentifierContinuation(value byte) bool {
+	return creationASCIIAlphaNumeric(value) ||
+		value == '-' || value == '_'
+}
+
+func creationHandleContinuation(value byte) bool {
+	return creationASCIIAlphaNumeric(value) || value == '_'
+}
+
+func creationASCIIAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' ||
+		value >= '0' && value <= '9'
+}
+
+func creationExactURLTokenContains(request, needle string) bool {
+	for offset := 0; offset <= len(request)-len(needle); {
+		index := strings.Index(request[offset:], needle)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		if creationURLStartBoundary(request, index) &&
+			creationURLEndBoundary(request, index+len(needle)) {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func creationURLStartBoundary(request string, index int) bool {
+	if index == 0 {
+		return true
+	}
+	value, _ := utf8.DecodeLastRuneInString(request[:index])
+	if unicode.IsSpace(value) || value > unicode.MaxASCII {
+		return true
+	}
+	return strings.ContainsRune("([<{\"", value)
+}
+
+func creationURLEndBoundary(request string, index int) bool {
+	if index == len(request) {
+		return true
+	}
+	value, _ := utf8.DecodeRuneInString(request[index:])
+	if unicode.IsSpace(value) {
+		return true
+	}
+	// ASCII punctuation is deliberately not accepted here: many such bytes
+	// are legal RFC 3986 URL characters. Treating them as prose boundaries
+	// would let a model truncate the exact URL supplied by the owner.
+	return strings.ContainsRune("\"`，。；：！？、」』】》〉”’", value)
 }
 
 // decodeCreationToolCall accepts one exact Agent tool invocation and delegates
@@ -1384,16 +1472,16 @@ func creationOwnerExplicitlyNamedXHandle(ownerRequest, value string) bool {
 // exists only inside this adapter; it is not part of the model-facing contract.
 func decodeCreationToolCall(
 	raw json.RawMessage,
-) (acquisitiontool.Requirement, string, json.RawMessage, error) {
+) (string, json.RawMessage, error) {
 	var call struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
 	}
 	if err := strictjson.DecodeExact(raw, &call); err != nil {
-		return acquisitiontool.Requirement{}, "", nil, err
+		return "", nil, err
 	}
 	if strings.TrimSpace(call.Name) == "" || call.Name != strings.TrimSpace(call.Name) {
-		return acquisitiontool.Requirement{}, "", nil,
+		return "", nil,
 			errors.New("name must be a non-empty string")
 	}
 	var fields map[string]json.RawMessage
@@ -1401,271 +1489,24 @@ func decodeCreationToolCall(
 		if err == nil {
 			err = errors.New("arguments must be a non-null JSON object")
 		}
-		return acquisitiontool.Requirement{}, "", nil, err
+		return "", nil, err
 	}
 	if _, exists := fields["kind"]; exists {
-		return acquisitiontool.Requirement{}, "", nil, errors.New(
+		return "", nil, errors.New(
 			"arguments.kind is forbidden; use the enclosing Tool name",
 		)
 	}
 	canonicalArguments, err := json.Marshal(fields)
 	if err != nil {
-		return acquisitiontool.Requirement{}, "", nil, err
-	}
-	kind, err := json.Marshal(call.Name)
-	if err != nil {
-		return acquisitiontool.Requirement{}, "", nil, err
-	}
-	fields["kind"] = kind
-	flattened, err := json.Marshal(fields)
-	if err != nil {
-		return acquisitiontool.Requirement{}, "", nil, err
-	}
-	requirement, err := decodeCreationFetchRequirement(flattened)
-	if err != nil {
-		return acquisitiontool.Requirement{}, "", nil, err
+		return "", nil, err
 	}
 	canonicalArguments, err =
 		acquisitiontool.CanonicalizeToolArgumentsV1(
 			call.Name, canonicalArguments)
 	if err != nil {
-		return acquisitiontool.Requirement{}, "", nil, err
+		return "", nil, err
 	}
-	return requirement, call.Name, canonicalArguments, nil
-}
-
-var creationXHSIDRe = regexp.MustCompile(`^[0-9a-f]{24}$`)
-
-func decodeCreationFetchRequirement(raw json.RawMessage) (acquisitiontool.Requirement, error) {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return acquisitiontool.Requirement{}, errors.New("fetch requirement must be a JSON object")
-	}
-	var fields map[string]json.RawMessage
-	if err := decodeStrictJSON(raw, &fields); err != nil || fields == nil {
-		if err == nil {
-			err = errors.New("fetch requirement must be a non-null JSON object")
-		}
-		return acquisitiontool.Requirement{}, err
-	}
-	var kind string
-	kindRaw, ok := fields["kind"]
-	if !ok || json.Unmarshal(kindRaw, &kind) != nil || strings.TrimSpace(kind) != kind {
-		return acquisitiontool.Requirement{}, errors.New("kind must be a non-empty string")
-	}
-	switch kind {
-	case "web_search":
-		if isExplicitJSONNull(fields["include_domains"]) {
-			return acquisitiontool.Requirement{}, errors.New("include_domains must be an array")
-		}
-		var input struct {
-			Kind           string   `json:"kind"`
-			Query          string   `json:"query"`
-			Category       string   `json:"category,omitempty"`
-			IncludeDomains []string `json:"include_domains,omitempty"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return acquisitiontool.Requirement{}, err
-		}
-		params := map[string]string{"query": input.Query}
-		if input.Category != "" {
-			params["category"] = input.Category
-		}
-		if input.IncludeDomains != nil {
-			encoded, err := json.Marshal(input.IncludeDomains)
-			if err != nil {
-				return acquisitiontool.Requirement{}, fmt.Errorf("encode include_domains: %w", err)
-			}
-			params["include_domains"] = string(encoded)
-		}
-		return acquisitiontool.Requirement{
-			Platform: string(types.PlatformWeb), Capability: string(types.CapSearch),
-			Params: params,
-		}, nil
-
-	case "web_feed":
-		if isExplicitJSONNull(fields["categories"]) {
-			return acquisitiontool.Requirement{}, errors.New("categories must be an array")
-		}
-		var input struct {
-			Kind       string   `json:"kind"`
-			FeedURL    string   `json:"feed_url"`
-			Categories []string `json:"categories,omitempty"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return acquisitiontool.Requirement{}, err
-		}
-		params := map[string]string{"url": input.FeedURL}
-		if input.Categories != nil {
-			encoded, err := json.Marshal(input.Categories)
-			if err != nil {
-				return acquisitiontool.Requirement{}, fmt.Errorf("encode categories: %w", err)
-			}
-			params["categories"] = string(encoded)
-		}
-		return acquisitiontool.Requirement{
-			Platform: string(types.PlatformWeb), Capability: string(types.CapFeed),
-			Params: params,
-		}, nil
-
-	case "web_contents":
-		var input struct {
-			Kind    string `json:"kind"`
-			PageURL string `json:"page_url"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return acquisitiontool.Requirement{}, err
-		}
-		return acquisitiontool.Requirement{
-			Platform: string(types.PlatformWeb), Capability: string(types.CapContents),
-			Params: map[string]string{"url": input.PageURL},
-		}, nil
-
-	case "x_user_posts":
-		var input struct {
-			Kind       string `json:"kind"`
-			ScreenName string `json:"screen_name"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return acquisitiontool.Requirement{}, err
-		}
-		return acquisitiontool.Requirement{
-			Platform: string(types.PlatformX), Capability: string(types.CapUserPosts),
-			Params: map[string]string{"screen_name": input.ScreenName},
-		}, nil
-
-	case "xhs_search":
-		var input struct {
-			Kind    string `json:"kind"`
-			Keyword string `json:"keyword"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return acquisitiontool.Requirement{}, err
-		}
-		return acquisitiontool.Requirement{
-			Platform: string(types.PlatformXHS), Capability: string(types.CapSearch),
-			Params: map[string]string{"keyword": input.Keyword},
-		}, nil
-
-	case "xhs_user_posts", "xhs_faved_notes":
-		var input struct {
-			Kind       string `json:"kind"`
-			UserID     string `json:"user_id,omitempty"`
-			ProfileURL string `json:"profile_url,omitempty"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return acquisitiontool.Requirement{}, err
-		}
-		if (strings.TrimSpace(input.UserID) == "") ==
-			(strings.TrimSpace(input.ProfileURL) == "") {
-			return acquisitiontool.Requirement{}, errors.New(
-				"exactly one of user_id or profile_url is required",
-			)
-		}
-		if input.UserID != "" && !creationXHSIDRe.MatchString(input.UserID) {
-			return acquisitiontool.Requirement{}, errors.New(
-				"user_id must be exactly 24 lowercase hexadecimal characters",
-			)
-		}
-		capability := types.CapUserPosts
-		if kind == "xhs_faved_notes" {
-			capability = types.CapFavedNotes
-		}
-		return acquisitiontool.Requirement{
-			Platform: string(types.PlatformXHS), Capability: string(capability),
-			Params: map[string]string{
-				"user_id": input.UserID, "profile_url": input.ProfileURL,
-			},
-		}, nil
-
-	case "xhs_hot_list":
-		var input struct {
-			Kind string `json:"kind"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return acquisitiontool.Requirement{}, err
-		}
-		return acquisitiontool.Requirement{
-			Platform: string(types.PlatformXHS), Capability: string(types.CapHotList),
-			Params: map[string]string{},
-		}, nil
-
-	case "xhs_topic_feed":
-		var input struct {
-			Kind     string `json:"kind"`
-			PageID   string `json:"page_id,omitempty"`
-			TopicURL string `json:"topic_url,omitempty"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return acquisitiontool.Requirement{}, err
-		}
-		if (strings.TrimSpace(input.PageID) == "") ==
-			(strings.TrimSpace(input.TopicURL) == "") {
-			return acquisitiontool.Requirement{}, errors.New(
-				"exactly one of page_id or topic_url is required",
-			)
-		}
-		if input.PageID != "" && !creationXHSIDRe.MatchString(input.PageID) {
-			return acquisitiontool.Requirement{}, errors.New(
-				"page_id must be exactly 24 lowercase hexadecimal characters",
-			)
-		}
-		return acquisitiontool.Requirement{
-			Platform: string(types.PlatformXHS), Capability: string(types.CapTopicFeed),
-			Params: map[string]string{
-				"page_id": input.PageID, "topic_url": input.TopicURL,
-			},
-		}, nil
-
-	case "weibo_user_posts":
-		var input struct {
-			Kind       string `json:"kind"`
-			UID        string `json:"uid,omitempty"`
-			ProfileURL string `json:"profile_url,omitempty"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return acquisitiontool.Requirement{}, err
-		}
-		if (strings.TrimSpace(input.UID) == "") ==
-			(strings.TrimSpace(input.ProfileURL) == "") {
-			return acquisitiontool.Requirement{}, errors.New(
-				"exactly one of uid or profile_url is required",
-			)
-		}
-		return acquisitiontool.Requirement{
-			Platform: string(types.PlatformWeibo), Capability: string(types.CapUserPosts),
-			Params: map[string]string{
-				"uid": input.UID, "profile_url": input.ProfileURL,
-			},
-		}, nil
-
-	case "weibo_hot_list":
-		var input struct {
-			Kind string `json:"kind"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return acquisitiontool.Requirement{}, err
-		}
-		return acquisitiontool.Requirement{
-			Platform: string(types.PlatformWeibo), Capability: string(types.CapHotList),
-			Params: map[string]string{},
-		}, nil
-
-	case "wechat_mp_user_posts":
-		var input struct {
-			Kind     string `json:"kind"`
-			Username string `json:"username"`
-		}
-		if err := strictjson.DecodeExact(raw, &input); err != nil {
-			return acquisitiontool.Requirement{}, err
-		}
-		return acquisitiontool.Requirement{
-			Platform: string(types.PlatformWechatMP), Capability: string(types.CapUserPosts),
-			Params: map[string]string{"username": input.Username},
-		}, nil
-
-	default:
-		return acquisitiontool.Requirement{}, fmt.Errorf("unsupported kind %q", kind)
-	}
+	return call.Name, canonicalArguments, nil
 }
 
 func isExplicitJSONNull(raw json.RawMessage) bool {

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/scheduler"
 	"github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -641,15 +642,18 @@ func TestCreateScheduleSchema_RequiresIntentAndToolCalls(t *testing.T) {
 				MinItems int `json:"minItems"`
 				MaxItems int `json:"maxItems"`
 				Items    struct {
-					Required   []string `json:"required"`
-					Properties struct {
-						Name struct {
-							Enum []string `json:"enum"`
-						} `json:"name"`
-						Arguments struct {
-							Properties map[string]any `json:"properties"`
-						} `json:"arguments"`
-					} `json:"properties"`
+					OneOf []struct {
+						Required   []string `json:"required"`
+						Properties struct {
+							Name struct {
+								Const       string `json:"const"`
+								Description string `json:"description"`
+							} `json:"name"`
+							Arguments struct {
+								Properties map[string]any `json:"properties"`
+							} `json:"arguments"`
+						} `json:"properties"`
+					} `json:"oneOf"`
 				} `json:"items"`
 			} `json:"tool_calls"`
 		} `json:"properties"`
@@ -666,25 +670,47 @@ func TestCreateScheduleSchema_RequiresIntentAndToolCalls(t *testing.T) {
 	if calls.MinItems != 1 || calls.MaxItems != 64 {
 		t.Fatalf("tool_calls 边界不完整：%+v", calls)
 	}
-	for _, required := range []string{"name", "arguments"} {
-		if !slices.Contains(calls.Items.Required, required) {
-			t.Fatalf("tool_calls item 缺少必填字段 %q：%v",
-				required, calls.Items.Required)
-		}
+	definitions := acquisitiontool.ModelToolDefinitionsV1()
+	if len(calls.Items.OneOf) != len(definitions) {
+		t.Fatalf("tool_calls definitions=%d want=%d",
+			len(calls.Items.OneOf), len(definitions))
 	}
-	for _, forbidden := range []string{"config", "selectors", "url", "title"} {
-		if _, exposed := calls.Items.Properties.Arguments.Properties[forbidden]; exposed {
-			t.Fatalf("tool_calls 不得暴露内部或可伪造字段 %q", forbidden)
+	allProperties := make(map[string]any)
+	for index, variant := range calls.Items.OneOf {
+		for _, required := range []string{"name", "arguments"} {
+			if !slices.Contains(variant.Required, required) {
+				t.Fatalf("tool_calls[%d] 缺少必填字段 %q：%v",
+					index, required, variant.Required)
+			}
+		}
+		if variant.Properties.Name.Const !=
+			definitions[index].Contract.Name ||
+			strings.TrimSpace(variant.Properties.Name.Description) == "" {
+			t.Fatalf("tool_calls[%d] definition drifted: %+v",
+				index, variant.Properties.Name)
+		}
+		for name, property := range variant.Properties.Arguments.Properties {
+			allProperties[name] = property
+			for _, forbidden := range []string{
+				"config", "selectors", "url", "title",
+			} {
+				if name == forbidden {
+					t.Fatalf(
+						"tool_calls 不得暴露内部或可伪造字段 %q",
+						forbidden,
+					)
+				}
+			}
 		}
 	}
 	for _, required := range []string{
 		"query", "include_domains", "feed_url", "page_url", "user_id",
 	} {
-		if _, ok := calls.Items.Properties.Arguments.Properties[required]; !ok {
+		if _, ok := allProperties[required]; !ok {
 			t.Fatalf("tool_calls 缺少模型可理解字段 %q", required)
 		}
 	}
-	userID, ok := calls.Items.Properties.Arguments.Properties["user_id"].(map[string]any)
+	userID, ok := allProperties["user_id"].(map[string]any)
 	if !ok || userID["pattern"] != "^[0-9a-f]{24}$" ||
 		!strings.Contains(fmt.Sprint(userID["description"]), "24 位小写十六进制") {
 		t.Fatalf("xhs user_id schema 必须逐字暴露服务端格式约束：%+v", userID)

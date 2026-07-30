@@ -945,7 +945,7 @@ func TestCreationCoordinator_ToolCallsAreStrictAtomicAndUnambiguous(t *testing.T
 		{
 			name:  "invalid xhs user id before any lookup",
 			calls: `[{"name":"xhs_faved_notes","arguments":{"user_id":"abc"}}]`,
-			want:  "24 lowercase hexadecimal",
+			want:  "24 位十六进制",
 		},
 		{
 			name:  "invalid include domain",
@@ -988,30 +988,74 @@ func TestCreationCoordinator_ToolCallsAreStrictAtomicAndUnambiguous(t *testing.T
 
 func TestCreationCoordinator_RejectsModelInventedExternalLocators(t *testing.T) {
 	tests := []struct {
-		name      string
-		toolCalls string
-		want      string
+		name         string
+		ownerRequest string
+		toolCalls    string
+		want         string
 	}{
 		{
-			name: "domain inferred from institution name",
+			name:         "domain inferred from institution name",
+			ownerRequest: "帮我持续监控 OpenAI 官方更新",
 			toolCalls: `[{"name":"web_search","arguments":{
 				"query":"OpenAI 官方更新","include_domains":["openai.com"]
 			}}]`,
 			want: "include_domains",
 		},
 		{
-			name: "page URL recalled from model weights",
+			name:         "page URL recalled from model weights",
+			ownerRequest: "帮我持续监控 OpenAI 官方更新",
 			toolCalls: `[{"name":"web_contents","arguments":{
 				"page_url":"https://openai.com/news/"
 			}}]`,
 			want: "page_url",
 		},
 		{
-			name: "social handle inferred from display name",
+			name:         "social handle inferred from display name",
+			ownerRequest: "帮我持续监控 OpenAI 官方更新",
 			toolCalls: `[{"name":"x_user_posts","arguments":{
 				"screen_name":"OpenAI"
 			}}]`,
 			want: "screen_name",
+		},
+		{
+			name:         "domain suffix is not an exact domain",
+			ownerRequest: "只监控 malicious-openai.com",
+			toolCalls: `[{"name":"web_search","arguments":{
+				"query":"OpenAI","include_domains":["openai.com"]
+			}}]`,
+			want: "include_domains",
+		},
+		{
+			name:         "handle prefix is not an exact handle",
+			ownerRequest: "监控 @OpenAIDev",
+			toolCalls: `[{"name":"x_user_posts","arguments":{
+				"screen_name":"OpenAI"
+			}}]`,
+			want: "screen_name",
+		},
+		{
+			name:         "URL prefix is not the supplied page",
+			ownerRequest: "监控 https://openai.com/news/",
+			toolCalls: `[{"name":"web_contents","arguments":{
+				"page_url":"https://openai.com"
+			}}]`,
+			want: "page_url",
+		},
+		{
+			name:         "URL semicolon suffix is not a boundary",
+			ownerRequest: "监控 https://example.com/releases;archive",
+			toolCalls: `[{"name":"web_contents","arguments":{
+				"page_url":"https://example.com/releases"
+			}}]`,
+			want: "page_url",
+		},
+		{
+			name:         "Unicode URL path is not a boundary",
+			ownerRequest: "监控 https://example.com/releases/中文",
+			toolCalls: `[{"name":"web_contents","arguments":{
+				"page_url":"https://example.com/releases/"
+			}}]`,
+			want: "page_url",
 		},
 	}
 	for _, tc := range tests {
@@ -1031,7 +1075,7 @@ func TestCreationCoordinator_RejectsModelInventedExternalLocators(t *testing.T) 
 				t.Context(),
 				CreationProposalInput{
 					ActionID: "action-untrusted-locator", UserID: 11,
-					OwnerRequest: "帮我持续监控 OpenAI 官方更新",
+					OwnerRequest: tc.ownerRequest,
 					RawArgs:      raw, ExpiresAt: time.Now().Add(time.Hour),
 				},
 			)
@@ -1074,6 +1118,30 @@ func TestCreationCoordinator_AcceptsOnlyOwnerSuppliedExternalLocator(t *testing.
 	}
 	if store.createCalls != 1 {
 		t.Fatalf("explicit owner locator was not persisted: %d", store.createCalls)
+	}
+}
+
+func TestCreationToolLocator_AcceptsExactXHandle(t *testing.T) {
+	raw := json.RawMessage(`{"name":"x_user_posts","arguments":{
+		"screen_name":"OpenAI"
+	}}`)
+	if _, err := materializeCreationToolCalls(
+		[]json.RawMessage{raw},
+		"持续监控 @OpenAI 的新帖子",
+	); err != nil {
+		t.Fatalf("exact @handle rejected: %v", err)
+	}
+}
+
+func TestCreationToolLocator_AcceptsExactURLBeforeChinesePunctuation(t *testing.T) {
+	raw := json.RawMessage(`{"name":"web_contents","arguments":{
+		"page_url":"https://example.com/releases/中文"
+	}}`)
+	if _, err := materializeCreationToolCalls(
+		[]json.RawMessage{raw},
+		"持续监控 https://example.com/releases/中文，有变化就告诉我。",
+	); err != nil {
+		t.Fatalf("exact URL token rejected: %v", err)
 	}
 }
 
@@ -1311,7 +1379,7 @@ func TestMaterializeCreationFetchRequirements_ValidatesXHSUserIDs(t *testing.T) 
 						"kind": kind, "user_id": value,
 					})},
 				})
-				if err == nil || !strings.Contains(err.Error(), "24 lowercase hexadecimal") {
+				if err == nil || !strings.Contains(err.Error(), "24 位十六进制") {
 					t.Fatalf("invalid direct user_id must be rejected: value=%q err=%v", value, err)
 				}
 			})
@@ -1350,7 +1418,7 @@ func TestMaterializeCreationFetchRequirements_ValidatesXHSTopicPageID(t *testing
 	} {
 		t.Run(value, func(t *testing.T) {
 			_, err := materialize("page_id", value)
-			if err == nil || !strings.Contains(err.Error(), "24 lowercase hexadecimal") {
+			if err == nil || !strings.Contains(err.Error(), "24 位十六进制") {
 				t.Fatalf("invalid direct page_id must be rejected: value=%q err=%v", value, err)
 			}
 		})

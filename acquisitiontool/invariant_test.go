@@ -72,8 +72,8 @@ func TestInvariant_FetchAffectingParamsChangeIdempotencyKey(t *testing.T) {
 		},
 		{
 			name: "xhs/user_posts 的 user_id", platform: "xhs", cap: "user_posts",
-			base:    map[string]string{"user_id": "aaa"},
-			variant: map[string]string{"user_id": "bbb"},
+			base:    map[string]string{"user_id": "6a5578b3000000000e03cc00"},
+			variant: map[string]string{"user_id": "5e397e34654fda00010b7321"},
 		},
 		{
 			name: "xhs/topic_feed 的 page_id", platform: "xhs", cap: "topic_feed",
@@ -82,8 +82,8 @@ func TestInvariant_FetchAffectingParamsChangeIdempotencyKey(t *testing.T) {
 		},
 		{
 			name: "xhs/faved_notes 的 user_id", platform: "xhs", cap: "faved_notes",
-			base:    map[string]string{"user_id": "aaa"},
-			variant: map[string]string{"user_id": "bbb"},
+			base:    map[string]string{"user_id": "6a5578b3000000000e03cc00"},
+			variant: map[string]string{"user_id": "5e397e34654fda00010b7321"},
 		},
 		{
 			name: "weibo/user_posts 的 uid", platform: "weibo", cap: "user_posts",

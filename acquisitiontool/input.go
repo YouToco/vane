@@ -22,6 +22,7 @@ const maxSourceParamRunes = 256
 // https://www.xiaohongshu.com/user/profile/6a5578b3000000000e03cc00 。
 // user_id 恒为 24 位小写十六进制（实测），据此锚定，避免把 query 串里别的段误当 id。
 var xhsProfileRe = regexp.MustCompile(`/user/profile/([0-9a-f]{24})`)
+var xhsHex24ExactRe = regexp.MustCompile(`^[0-9a-f]{24}$`)
 
 // Requirement 是抓取目标构造入参。Platform + Capability 决定必填 Params。
 type Requirement struct {
@@ -687,9 +688,16 @@ func extractWeiboUID(params map[string]string) string {
 // topic_url / url / page_id 的任意链接形态里抽第一个 24 位 hex（话题深链
 // xhsdiscover://…?id=<hex> 与话题页 URL 都命中）。都拿不到返回空串。
 func extractXHSPageID(params map[string]string) string {
-	for _, k := range []string{"page_id", "topic_url", "url"} {
-		if v := strings.TrimSpace(params[k]); v != "" {
-			if m := xhsHex24Re.FindString(strings.ToLower(v)); m != "" {
+	if rawPageID := params["page_id"]; rawPageID != "" {
+		if rawPageID == strings.TrimSpace(rawPageID) &&
+			xhsHex24ExactRe.MatchString(rawPageID) {
+			return rawPageID
+		}
+		return ""
+	}
+	for _, k := range []string{"topic_url", "url"} {
+		if value := strings.TrimSpace(params[k]); value != "" {
+			if m := xhsHex24Re.FindString(value); m != "" {
 				return m
 			}
 		}
@@ -702,12 +710,12 @@ var xhsHex24Re = regexp.MustCompile(`[0-9a-f]{24}`)
 // extractXHSUserID 从 params 里解析小红书 user_id：优先 user_id 直填，其次从
 // profile_url / url 里按 /user/profile/<24hex> 抽取。都拿不到返回空串。
 func extractXHSUserID(params map[string]string) string {
-	if uid := strings.TrimSpace(params["user_id"]); uid != "" {
-		// 若误把整条主页链接填进了 user_id，也从中抽一次，容错。
-		if m := xhsProfileRe.FindStringSubmatch(uid); m != nil {
-			return m[1]
+	if rawUserID := params["user_id"]; rawUserID != "" {
+		if rawUserID == strings.TrimSpace(rawUserID) &&
+			xhsHex24ExactRe.MatchString(rawUserID) {
+			return rawUserID
 		}
-		return uid
+		return ""
 	}
 	for _, k := range []string{"profile_url", "url"} {
 		if raw := strings.TrimSpace(params[k]); raw != "" {

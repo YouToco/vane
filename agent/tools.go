@@ -19,6 +19,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/YouToco/vane/acquisitiontool"
 	"github.com/YouToco/vane/internal/strictjson"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/scheduler"
@@ -361,7 +362,7 @@ func formatScheduleSpec(spec scheduler.ScheduleSpec) string {
 // 这里前置拦截只为尽早给模型清晰文案，scheduler.validateSpec 仍是权威校验方。
 const minEverySeconds = 3600
 
-const createScheduleSchema = `{
+const createScheduleSchemaTemplate = `{
   "type": "object",
   "properties": {
     "spec": {
@@ -380,39 +381,7 @@ const createScheduleSchema = `{
       "minItems": 1,
       "maxItems": 64,
       "description": "根据任务手册选择的长期取材 Tool 调用。每项直接填写 Tool 名称和参数；不要构造信源、计划、内部 URL 或内部 id。",
-      "items": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "enum": ["web_search", "web_feed", "web_contents", "x_user_posts", "xhs_search", "xhs_user_posts", "xhs_hot_list", "xhs_topic_feed", "xhs_faved_notes", "weibo_user_posts", "weibo_hot_list", "wechat_mp_user_posts"],
-            "description": "要调用的取材 Tool"
-          },
-          "arguments": {
-          "type": "object",
-          "description": "对应 Tool 的人类可读参数；只填写该 Tool 使用的字段",
-          "properties": {
-            "query": {"type": "string", "description": "仅 web_search 必填：搜索词"},
-            "category": {"type": "string", "description": "仅 web_search 可选：公开网页搜索类别，如 news"},
-            "include_domains": {"type": "array","uniqueItems":true,"items":{"type":"string"},"description":"仅 web_search 可选：裸域名白名单"},
-            "feed_url": {"type": "string", "description": "仅 web_feed 必填：已知 RSS/Atom 的 http/https 地址"},
-            "categories": {"type": "array", "items": {"type": "string"}, "description": "仅 web_feed 可选：RSS 分类过滤"},
-            "page_url": {"type": "string", "description": "仅 web_contents 必填：要监控的普通 http/https 页面地址"},
-            "screen_name": {"type": "string", "description": "仅 x_user_posts 必填：X 用户名"},
-            "keyword": {"type": "string", "description": "仅 xhs_search 必填：小红书搜索词"},
-            "uid": {"type": "string", "pattern": "^[0-9]+$", "description": "仅 weibo_user_posts：微博用户数字 ID"},
-            "user_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "description": "仅 xhs_user_posts/xhs_faved_notes：24 位小写十六进制用户 ID"},
-            "profile_url": {"type": "string", "description": "仅 xhs_user_posts/xhs_faved_notes/weibo_user_posts：对应平台用户主页"},
-            "page_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "description": "仅 xhs_topic_feed"},
-            "topic_url": {"type": "string", "description": "仅 xhs_topic_feed"},
-            "username": {"type": "string", "pattern": "^gh_.+$", "description": "仅 wechat_mp_user_posts：公众号 gh_ 原始 ID"}
-          },
-          "additionalProperties": false
-          }
-        },
-        "required": ["name", "arguments"],
-        "additionalProperties": false
-      }
+      "items": __ACQUISITION_TOOL_CALL_SCHEMA_V1__
     },
     "observation_policy": {
       "type": "object",
@@ -463,6 +432,25 @@ const createScheduleSchema = `{
   "required": ["spec", "intent", "tool_calls"],
   "additionalProperties": false
 }`
+
+var createScheduleSchema = buildCreateScheduleSchema()
+
+func buildCreateScheduleSchema() string {
+	toolCallSchema, err := acquisitiontool.ToolCallSchemaV1()
+	if err != nil {
+		panic(err)
+	}
+	schema := strings.Replace(
+		createScheduleSchemaTemplate,
+		"__ACQUISITION_TOOL_CALL_SCHEMA_V1__",
+		string(toolCallSchema),
+		1,
+	)
+	if !json.Valid([]byte(schema)) {
+		panic("agent: generated create_schedule schema is invalid")
+	}
+	return schema
+}
 
 // createScheduleArgs 与工具 schema 对应；spec 结构与 api 的 scheduleSpecDTO 一致。
 type createScheduleArgs struct {

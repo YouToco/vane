@@ -70,56 +70,7 @@ type ToolContractV1 struct {
 	ImplementationVersion runtimepolicy.CapabilityImplementationIDV1
 }
 
-var toolContractsV1 = map[string]ToolContractV1{
-	"web_search": {
-		Name: "web_search", Platform: types.PlatformWeb, Capability: types.CapSearch,
-		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationExaV1,
-	},
-	"web_feed": {
-		Name: "web_feed", Platform: types.PlatformWeb, Capability: types.CapFeed,
-		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationRSSV1,
-	},
-	"web_contents": {
-		Name: "web_contents", Platform: types.PlatformWeb, Capability: types.CapContents,
-		Kind: types.KindPageContent, ImplementationVersion: runtimepolicy.CapabilityImplementationExaV1,
-	},
-	"x_user_posts": {
-		Name: "x_user_posts", Platform: types.PlatformX, Capability: types.CapUserPosts,
-		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
-	},
-	"xhs_search": {
-		Name: "xhs_search", Platform: types.PlatformXHS, Capability: types.CapSearch,
-		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
-	},
-	"xhs_user_posts": {
-		Name: "xhs_user_posts", Platform: types.PlatformXHS, Capability: types.CapUserPosts,
-		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
-	},
-	"xhs_hot_list": {
-		Name: "xhs_hot_list", Platform: types.PlatformXHS, Capability: types.CapHotList,
-		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
-	},
-	"xhs_topic_feed": {
-		Name: "xhs_topic_feed", Platform: types.PlatformXHS, Capability: types.CapTopicFeed,
-		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
-	},
-	"xhs_faved_notes": {
-		Name: "xhs_faved_notes", Platform: types.PlatformXHS, Capability: types.CapFavedNotes,
-		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
-	},
-	"weibo_user_posts": {
-		Name: "weibo_user_posts", Platform: types.PlatformWeibo, Capability: types.CapUserPosts,
-		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
-	},
-	"weibo_hot_list": {
-		Name: "weibo_hot_list", Platform: types.PlatformWeibo, Capability: types.CapHotList,
-		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
-	},
-	"wechat_mp_user_posts": {
-		Name: "wechat_mp_user_posts", Platform: types.PlatformWechatMP, Capability: types.CapUserPosts,
-		Kind: types.KindArticle, ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,
-	},
-}
+var toolContractsV1 = buildToolContractsV1()
 
 // LookupToolContractV1 resolves only the frozen logical V1 contract. A future
 // contract version gets a separate resolver instead of changing this map.
