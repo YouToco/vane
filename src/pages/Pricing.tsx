@@ -55,6 +55,54 @@ interface PriceDraft {
   note: string;
 }
 
+interface StoredPriceAttempt {
+  version: 1;
+  signature: string;
+  key: string;
+}
+
+const priceAttemptStorageKey = "vane:provider-pricing:replace:v1";
+
+function readPriceAttempt(): StoredPriceAttempt | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const parsed = JSON.parse(
+      window.sessionStorage.getItem(priceAttemptStorageKey) ?? "null",
+    ) as Partial<StoredPriceAttempt> | null;
+    return parsed?.version === 1 &&
+      typeof parsed.signature === "string" &&
+      typeof parsed.key === "string"
+      ? (parsed as StoredPriceAttempt)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function writePriceAttempt(attempt: StoredPriceAttempt): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(
+      priceAttemptStorageKey,
+      JSON.stringify(attempt),
+    );
+  } catch {
+    // The mounted page still retains the key in memory.
+  }
+}
+
+function clearPriceAttempt(key: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    const stored = readPriceAttempt();
+    if (stored?.key === key) {
+      window.sessionStorage.removeItem(priceAttemptStorageKey);
+    }
+  } catch {
+    // The successful server response is already authoritative.
+  }
+}
+
 const emptyDraft: PriceDraft = {
   provider: "kimi",
   resource: "kimi-k2.6",
@@ -238,14 +286,19 @@ export default function Pricing() {
           }),
     };
     const signature = JSON.stringify(input);
+    const storedIntent = readPriceAttempt();
     const idempotencyKey =
-      submitIntent.current?.signature === signature
-        ? submitIntent.current.key
-        : crypto.randomUUID();
+      storedIntent?.signature === signature
+        ? storedIntent.key
+        : submitIntent.current?.signature === signature
+          ? submitIntent.current.key
+          : crypto.randomUUID();
     submitIntent.current = { signature, key: idempotencyKey };
+    writePriceAttempt({ version: 1, signature, key: idempotencyKey });
     setSaving(true);
     try {
       await api.adminReplaceProviderPrice(input, idempotencyKey);
+      clearPriceAttempt(idempotencyKey);
       submitIntent.current = null;
       toast.success("新价格版本已生效，历史调用不会被重算。");
       setNonce((value) => value + 1);

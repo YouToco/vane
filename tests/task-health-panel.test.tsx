@@ -70,7 +70,7 @@ describe("TaskHealthPanel failure guidance", () => {
       ],
       coverage: "llm_and_tools_partial",
       llm_calls: 2,
-      llm_priced_calls: 2,
+      llm_priced_calls: 1,
       llm_estimated_calls: 1,
       tool_calls: 1,
       tool_priced_calls: 1,

@@ -138,6 +138,73 @@ describe("task health projection contract", () => {
     expect(health).not.toHaveProperty("usage");
   });
 
+  test("fails closed when an estimated amount claims a budget verdict", () => {
+    const health = normalizeTaskHealth({
+      ...raw,
+      usage: {
+        ...raw.usage,
+        coverage: "llm_only",
+        llm_calls: 3,
+        llm_priced_calls: 2,
+        llm_estimated_calls: 1,
+        budget_usd: 1,
+        budget_state: "exhausted",
+      },
+    });
+    expect(health).toBeDefined();
+    expect(health).not.toHaveProperty("usage");
+  });
+
+  test("accepts disjoint exact and estimated counts for old Web compatibility", () => {
+    const health = normalizeTaskHealth({
+      ...raw,
+      usage: {
+        ...raw.usage,
+        known_cost_usd: 0.01,
+        known_costs: [{ currency: "USD", amount: 0.01 }],
+        coverage: "tools_partial",
+        llm_calls: undefined,
+        llm_priced_calls: undefined,
+        llm_estimated_calls: undefined,
+        tool_calls: 2,
+        tool_priced_calls: 1,
+        tool_estimated_calls: 1,
+        budget_state: "incomplete",
+      },
+    });
+    expect(health?.usage).toMatchObject({
+      coverage: "tools_partial",
+      tool_calls: 2,
+      tool_priced_calls: 1,
+      tool_estimated_calls: 1,
+      budget_state: "incomplete",
+    });
+  });
+
+  test("keeps legacy full tool coverage when only the LLM amount is estimated", () => {
+    const health = normalizeTaskHealth({
+      ...raw,
+      usage: {
+        ...raw.usage,
+        coverage: "llm_and_tools",
+        llm_calls: 3,
+        llm_priced_calls: 2,
+        llm_estimated_calls: 1,
+        tool_calls: 2,
+        tool_priced_calls: 2,
+        tool_estimated_calls: 0,
+        budget_state: "incomplete",
+      },
+    });
+    expect(health?.usage).toMatchObject({
+      coverage: "llm_and_tools",
+      llm_priced_calls: 2,
+      llm_estimated_calls: 1,
+      tool_priced_calls: 2,
+      budget_state: "incomplete",
+    });
+  });
+
   test("keeps known acquisition cost while marking incomplete provider receipts", () => {
     const partial = {
       ...raw,

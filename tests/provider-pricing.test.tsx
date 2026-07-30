@@ -33,6 +33,7 @@ const current: ProviderPriceRule = {
 
 afterEach(() => {
   cleanup();
+  window.sessionStorage.clear();
   vi.restoreAllMocks();
 });
 
@@ -71,22 +72,36 @@ describe("provider pricing admin", () => {
     expect(key).toBeTruthy();
   });
 
-  test("reuses one idempotency key after an ambiguous save failure", async () => {
+  test("reuses one idempotency key after remounting from an ambiguous failure", async () => {
     vi.spyOn(api, "adminListProviderPrices").mockResolvedValue([current]);
     const replace = vi
       .spyOn(api, "adminReplaceProviderPrice")
       .mockRejectedValueOnce(new Error("response lost"))
       .mockResolvedValue({ ...current, id: 8 });
 
-    render(<Pricing />);
+    const first = render(<Pricing />);
     await screen.findByText("kimi-k2.6");
     await userEvent.click(screen.getByRole("button", { name: "更新" }));
     await userEvent.click(screen.getByRole("button", { name: "保存并生效" }));
     await waitFor(() => expect(replace).toHaveBeenCalledTimes(1));
+    const stored = window.sessionStorage.getItem(
+      "vane:provider-pricing:replace:v1",
+    );
+    expect(stored).toContain(replace.mock.calls[0][1]);
+    first.unmount();
+
+    render(<Pricing />);
+    await screen.findByText("kimi-k2.6");
+    await userEvent.click(screen.getByRole("button", { name: "更新" }));
     await userEvent.click(screen.getByRole("button", { name: "保存并生效" }));
     await waitFor(() => expect(replace).toHaveBeenCalledTimes(2));
 
     expect(replace.mock.calls[0][1]).toBe(replace.mock.calls[1][1]);
+    await waitFor(() =>
+      expect(
+        window.sessionStorage.getItem("vane:provider-pricing:replace:v1"),
+      ).toBeNull(),
+    );
   });
 
   test("separates future and historical prices from the active catalog", async () => {

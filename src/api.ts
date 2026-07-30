@@ -1093,7 +1093,7 @@ export function normalizeTaskHealth(
     llmPricedCalls <= Number(usage.llm_calls) &&
     Number.isSafeInteger(llmEstimatedCalls) &&
     llmEstimatedCalls >= 0 &&
-    llmEstimatedCalls <= llmPricedCalls;
+    llmPricedCalls + llmEstimatedCalls <= Number(usage.llm_calls);
   const toolCallsValid =
     typeof usage.tool_calls === "number" &&
     Number.isSafeInteger(usage.tool_calls) &&
@@ -1112,8 +1112,8 @@ export function normalizeTaskHealth(
     toolPricedCallsValid &&
     Number.isSafeInteger(toolEstimatedCalls) &&
     toolEstimatedCalls >= 0 &&
-    toolPricedCallsValid &&
-    toolEstimatedCalls <= Number(usage.tool_priced_calls);
+    Number(usage.tool_priced_calls) + toolEstimatedCalls <=
+      Number(usage.tool_calls);
   const integerUsage = (
     key:
       | "prompt_tokens"
@@ -1213,18 +1213,28 @@ export function normalizeTaskHealth(
       llmPricingValid &&
       toolCallsValid &&
       toolPricingValid &&
-      llmPricedCalls === Number(usage.llm_calls) &&
-      llmEstimatedCalls === 0 &&
       Number(usage.tool_priced_calls) === Number(usage.tool_calls) &&
       toolEstimatedCalls === 0) ||
     (coverage === "llm_and_tools_partial" &&
       llmPricingValid &&
       toolCallsValid &&
       toolPricingValid &&
-      (llmPricedCalls < Number(usage.llm_calls) ||
-        llmEstimatedCalls > 0 ||
-        Number(usage.tool_priced_calls) < Number(usage.tool_calls) ||
+      (Number(usage.tool_priced_calls) < Number(usage.tool_calls) ||
         toolEstimatedCalls > 0));
+  const budgetUSDValid =
+    typeof usage.budget_usd === "number" &&
+    Number.isFinite(usage.budget_usd) &&
+    usage.budget_usd > 0;
+  const budgetStateCoherent =
+    !["ok", "warning", "exhausted"].includes(budgetState) ||
+    (budgetUSDValid &&
+      coverage === "llm_and_tools" &&
+      llmPricingValid &&
+      llmPricedCalls === Number(usage.llm_calls) &&
+      llmEstimatedCalls === 0 &&
+      toolPricingValid &&
+      Number(usage.tool_priced_calls) === Number(usage.tool_calls) &&
+      toolEstimatedCalls === 0);
   if (
     projected.permissions.can_view_usage &&
     knownCostUSDValid &&
@@ -1232,7 +1242,8 @@ export function normalizeTaskHealth(
     taskHealthBudgetStates.has(budgetState) &&
     knownCostsValid &&
     tokenShapeValid &&
-    usageCoverageCoherent
+    usageCoverageCoherent &&
+    budgetStateCoherent
   ) {
     projected.usage = {
       known_cost_usd: Number(usage.known_cost_usd),
@@ -1262,11 +1273,7 @@ export function normalizeTaskHealth(
       ...(typeof usage.window_end === "string"
         ? { window_end: usage.window_end }
         : {}),
-      ...(typeof usage.budget_usd === "number" &&
-      Number.isFinite(usage.budget_usd) &&
-      usage.budget_usd > 0
-        ? { budget_usd: usage.budget_usd }
-        : {}),
+      ...(budgetUSDValid ? { budget_usd: Number(usage.budget_usd) } : {}),
     };
   }
   return projected;
