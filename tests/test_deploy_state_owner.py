@@ -8,7 +8,7 @@ DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
 CERT_WORKFLOW = ROOT / ".github" / "workflows" / "cert-renew.yml"
 ACTIONLINT_CONFIG = ROOT / ".github" / "actionlint.yaml"
 
-EXPECTED_LABELS = {"self-hosted", "Linux", "mac-mini", "vane-deploy"}
+EXPECTED_LABELS = {"self-hosted", "Linux", "vps-primary", "vane-deploy"}
 
 
 def job_block(workflow: str, job_name: str) -> str:
@@ -45,7 +45,7 @@ class DeployStateOwnerTests(unittest.TestCase):
     def test_actionlint_knows_the_primary_runner_label(self) -> None:
         config = ACTIONLINT_CONFIG.read_text(encoding="utf-8")
 
-        self.assertIn("    - mac-mini\n", config)
+        self.assertIn("    - vps-primary\n", config)
 
 
 if __name__ == "__main__":

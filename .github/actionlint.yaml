@@ -1,6 +1,6 @@
 self-hosted-runner:
   labels:
-    - mac-mini
+    - vps-primary
     - vane-test
     - vane-build
     - vane-deploy

@@ -31,7 +31,7 @@ jobs:
       github.event.workflow_run.head_sha == github.sha
     # plan and deploy must use the same durable-state owner. A second runner
     # carrying only the broad vane-deploy label must never split this DAG.
-    runs-on: [self-hosted, Linux, mac-mini, vane-deploy]
+    runs-on: [self-hosted, Linux, vps-primary, vane-deploy]
     timeout-minutes: 10
     outputs:
       backend_sha: ${{ steps.plan.outputs.backend_sha }}
@@ -392,7 +392,7 @@ jobs:
     if: >-
       needs.plan.outputs.any_changed == 'true' &&
       needs.build.result == 'success'
-    runs-on: [self-hosted, Linux, mac-mini, vane-deploy]
+    runs-on: [self-hosted, Linux, vps-primary, vane-deploy]
     timeout-minutes: 35
     env:
       DEPLOY_ROOT_NAME: vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}

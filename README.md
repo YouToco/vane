@@ -95,15 +95,24 @@ All runner registrations are repository-scoped and implement three roles:
   permits both X64 and ARM64 Linux hosts.
 - build VM: `[self-hosted, Linux, vane-build]`; Docker is available for the
   PostgreSQL service, and the pinned setup actions provide Go 1.26 and Node 22.
-- primary deploy VM: `[self-hosted, Linux, mac-mini, vane-deploy]`. `plan`,
+- primary deploy VM: `[self-hosted, Linux, vps-primary, vane-deploy]`. `plan`,
   `deploy`, and certificate renewal are deliberately pinned to this one
   durable-state owner; a broad-label fallback must not split a single DAG or
   create a second certificate/deployed-SHA authority. Install Git, Python 3,
   OpenSSH, OpenSSL, `flock`, GNU `date`, `curl`, `sha256sum`, and `strings`.
-  Do not install Docker access or `sudo` for the runner user. A standby runner
-  requires an explicit state migration and label handoff before it can become
-  the primary; registering it with only `vane-deploy` does not make failover
-  automatic.
+  Do not install Docker access or `sudo` for the runner user. The primary is
+  the isolated VPS runner so a Mac login, sleep, or Colima outage cannot block
+  production. A standby runner requires an explicit state migration and unique
+  label handoff before it can become primary; the broad `vane-deploy` label
+  alone never authorizes ownership.
+
+The 2026-07-30 handoff first cancelled the queued Mac-owned DAG, proved the
+live backend revision from its embedded Go build information, proved the
+frontend revision from the last successful dual-line deployment plus a
+same-main plan, and only then migrated both durable SHA files to the VPS
+runner. The `vps-primary` label was assigned after that state write. This is
+the required failover order: quiesce old DAG, prove live state, atomically
+migrate state, move the unique label, then trigger a fresh plan.
 
 The optional Windows WSL2 build runner uses the same `vane-build` trust role
 without production secrets. Its systemd service must use a dedicated `HOME`
