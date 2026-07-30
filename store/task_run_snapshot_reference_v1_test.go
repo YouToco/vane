@@ -95,17 +95,22 @@ func TestValidScheduledTaskWorkflowExecutionIDV1(t *testing.T) {
 func TestValidTaskRunWorkflowExecutionIDV1_ManualCommandIdentity(t *testing.T) {
 	const commandID = "3b5af7c5-229f-4542-b493-e17ff90593de"
 	valid := types.ManualTaskWorkflowPrefix + commandID
+	timestamped := valid + "-2026-07-30T12:24:59Z"
 	tests := []struct {
 		name       string
 		workflowID string
 		want       bool
 	}{
 		{name: "exact lowercase command UUID", workflowID: valid, want: true},
+		{name: "timestamped lowercase command UUID", workflowID: timestamped, want: true},
 		{name: "missing command", workflowID: types.ManualTaskWorkflowPrefix},
 		{name: "non UUID", workflowID: types.ManualTaskWorkflowPrefix + "manual"},
 		{name: "uppercase UUID", workflowID: types.ManualTaskWorkflowPrefix +
 			strings.ToUpper(commandID)},
 		{name: "trailing bytes", workflowID: valid + "-extra"},
+		{name: "timestamp offset", workflowID: valid +
+			"-2026-07-30T12:24:59+01:00"},
+		{name: "timestamp trailing bytes", workflowID: timestamped + "-extra"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

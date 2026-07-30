@@ -113,10 +113,11 @@ func TestMigration079ManualAuthorityMatrix(t *testing.T) {
 			`INSERT INTO schedule_commands (
 			    id,tenant_id,user_id,task_id,idempotency_key,kind,
 			    payload_digest,remote_request_id,status,phase,completed_at,
-			    error_code,error_message
+			    error_code,error_message,created_at,updated_at
 			 ) VALUES (
 			    $1,$2,$3,$4,$5,$6,repeat('a',64),repeat('b',64),$7,$8,
-			    CASE WHEN $9 THEN clock_timestamp() ELSE NULL END,$10,$11
+			    CASE WHEN $9 THEN clock_timestamp() ELSE NULL END,$10,$11,
+			    '2026-07-30 12:00:00+00','2026-07-30 12:00:00+00'
 			 )`,
 			command.id, tenantID, userID, command.taskID,
 			"migration-079-"+command.id, command.kind, command.status,
@@ -143,6 +144,10 @@ func TestMigration079ManualAuthorityMatrix(t *testing.T) {
 		want       bool
 	}{
 		{"pending run", tenantID, userID, commands[0].taskID, "wf-manual-" + commands[0].id, true},
+		{"timestamped pending run", tenantID, userID, commands[0].taskID,
+			"wf-manual-" + commands[0].id + "-2026-07-30T12:00:00Z", true},
+		{"forged timestamp", tenantID, userID, commands[0].taskID,
+			"wf-manual-" + commands[0].id + "-2026-07-30T12:00:01Z", false},
 		{"completed run", tenantID, userID, commands[1].taskID, "wf-manual-" + commands[1].id, true},
 		{"wrong tenant", otherTenantID, userID, commands[0].taskID, "wf-manual-" + commands[0].id, false},
 		{"wrong user", tenantID, otherUserID, commands[0].taskID, "wf-manual-" + commands[0].id, false},

@@ -1227,7 +1227,9 @@ func (s *Scheduler) applyScheduleCommandRemote(
 		_, err = s.c.ExecuteWorkflow(
 			ctx,
 			client.StartWorkflowOptions{
-				ID:        manualTaskWorkflowID(command.ID),
+				ID: manualTaskWorkflowID(
+					command.ID, command.CreatedAt,
+				),
 				TaskQueue: s.tq,
 				WorkflowIDReusePolicy: enums.
 					WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
@@ -1318,8 +1320,10 @@ func (s *Scheduler) applyScheduleCommandRemote(
 // manualTaskWorkflowID binds one explicit run command to exactly one Temporal
 // execution. It deliberately does not reuse or patch the recurring Schedule:
 // manual execution and recurring cadence are independent product operations.
-func manualTaskWorkflowID(commandID string) string {
-	return types.ManualTaskWorkflowPrefix + commandID
+func manualTaskWorkflowID(commandID string, createdAt time.Time) string {
+	const timestampLayout = "2006-01-02T15:04:05Z"
+	return types.ManualTaskWorkflowPrefix + commandID + "-" +
+		createdAt.UTC().Truncate(time.Second).Format(timestampLayout)
 }
 
 func scheduleCommandDetachedContext(

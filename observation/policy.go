@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/YouToco/vane/internal/strictjson"
+	"github.com/google/uuid"
 	"github.com/robfig/cron"
 )
 
@@ -314,16 +315,39 @@ func PolicyDigest(policy PolicyV1) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// NominalTrigger parses Temporal Schedule's exact UTC-second suffix. Bare
-// action IDs are valid for retained runtime authorization but do not carry a
-// trustworthy time window and therefore fail closed for observation policies.
+// NominalTrigger parses the exact UTC-second suffix carried by recurring and
+// explicit manual workflow identities. Bare retained Action IDs and legacy
+// manual IDs remain valid for runtime authorization, but do not carry a
+// trustworthy observation window and therefore fail closed here.
 func NominalTrigger(taskID, workflowID string) (time.Time, error) {
+	const (
+		layout       = "2006-01-02T15:04:05Z"
+		manualPrefix = "wf-manual-"
+		uuidLength   = 36
+	)
+	if strings.HasPrefix(workflowID, manualPrefix) {
+		raw := strings.TrimPrefix(workflowID, manualPrefix)
+		if len(raw) != uuidLength+1+len(layout) || raw[uuidLength] != '-' {
+			return time.Time{}, errors.New(
+				"observation: manual workflow ID has no nominal trigger")
+		}
+		commandID := raw[:uuidLength]
+		parsedID, err := uuid.Parse(commandID)
+		if err != nil || parsedID.String() != commandID {
+			return time.Time{}, errors.New(
+				"observation: manual workflow ID is invalid")
+		}
+		return parseNominalTrigger(raw[uuidLength+1:], layout)
+	}
 	base := "wf-" + taskID + "-"
 	if !strings.HasPrefix(workflowID, base) {
 		return time.Time{}, errors.New("observation: workflow ID has no nominal trigger")
 	}
 	raw := strings.TrimPrefix(workflowID, base)
-	const layout = "2006-01-02T15:04:05Z"
+	return parseNominalTrigger(raw, layout)
+}
+
+func parseNominalTrigger(raw, layout string) (time.Time, error) {
 	if len(raw) != len(layout) {
 		return time.Time{}, errors.New("observation: nominal trigger has invalid length")
 	}

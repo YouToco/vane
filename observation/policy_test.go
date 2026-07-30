@@ -8,6 +8,61 @@ import (
 	"time"
 )
 
+func TestNominalTrigger_RecurringAndManualExecution(t *testing.T) {
+	const (
+		taskID    = "task-v1-test"
+		commandID = "ba6cf460-0fba-4c01-89fa-d792cdc5001b"
+		trigger   = "2026-07-30T12:24:59Z"
+	)
+	want := time.Date(2026, 7, 30, 12, 24, 59, 0, time.UTC)
+	tests := []struct {
+		name       string
+		workflowID string
+		wantErr    bool
+	}{
+		{
+			name:       "recurring schedule",
+			workflowID: "wf-" + taskID + "-" + trigger,
+		},
+		{
+			name:       "explicit manual command",
+			workflowID: "wf-manual-" + commandID + "-" + trigger,
+		},
+		{
+			name:       "legacy manual command has no window",
+			workflowID: "wf-manual-" + commandID,
+			wantErr:    true,
+		},
+		{
+			name: "manual command timestamp cannot be forged",
+			workflowID: "wf-manual-" + commandID +
+				"-2026-07-30T12:24:59+01:00",
+			wantErr: true,
+		},
+		{
+			name: "manual command UUID must be canonical",
+			workflowID: "wf-manual-BA6CF460-0FBA-4C01-89FA-D792CDC5001B-" +
+				trigger,
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := NominalTrigger(taskID, test.workflowID)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("NominalTrigger()=%v, want error", got)
+				}
+				return
+			}
+			if err != nil || !got.Equal(want) {
+				t.Fatalf("NominalTrigger()=%v err=%v, want %v",
+					got, err, want)
+			}
+		})
+	}
+}
+
 func TestDecodePolicyV1Exact_FlattenedEmbeddedWire(t *testing.T) {
 	want := mustScheduleIntervalPolicy(
 		t, time.Date(2026, 7, 25, 1, 0, 0, 0, time.UTC),

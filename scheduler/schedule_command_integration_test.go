@@ -174,7 +174,7 @@ func TestScheduleCommandIntegration_PostgreSQLTemporalFaultMatrix(t *testing.T) 
 	if run.Status != types.ScheduleCommandCompleted {
 		t.Fatalf("run checkpoint=%+v", run)
 	}
-	manualWorkflowID := manualTaskWorkflowID(run.ID)
+	manualWorkflowID := manualTaskWorkflowID(run.ID, run.CreatedAt)
 	if got := faults.requestCount(manualWorkflowID); got != 2 {
 		t.Fatalf("manual workflow attempts=%d, want response-loss retry 2", got)
 	}

@@ -56,9 +56,24 @@ func validManualTaskWorkflowExecutionIDV1(workflowID string) bool {
 		return false
 	}
 	raw := strings.TrimPrefix(workflowID, types.ManualTaskWorkflowPrefix)
-	parsed, err := uuid.Parse(raw)
-	return err == nil && parsed.String() == raw &&
-		types.ManualTaskWorkflowPrefix+raw == workflowID
+	commandID := raw
+	timestamp := ""
+	const timestampLayout = "2006-01-02T15:04:05Z"
+	if len(raw) == 36+1+len(timestampLayout) && raw[36] == '-' {
+		commandID = raw[:36]
+		timestamp = raw[37:]
+	}
+	parsed, err := uuid.Parse(commandID)
+	if err != nil || parsed.String() != commandID {
+		return false
+	}
+	if timestamp == "" {
+		return types.ManualTaskWorkflowPrefix+commandID == workflowID
+	}
+	parsedTime, err := time.Parse(timestampLayout, timestamp)
+	return err == nil &&
+		parsedTime.UTC().Format(timestampLayout) == timestamp &&
+		types.ManualTaskWorkflowPrefix+commandID+"-"+timestamp == workflowID
 }
 
 func validTaskRunWorkflowExecutionIDV1(taskID, workflowID string) bool {
