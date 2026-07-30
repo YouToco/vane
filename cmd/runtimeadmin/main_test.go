@@ -638,7 +638,7 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 	}
 	workflow := strings.ReplaceAll(string(payload), "\r\n", "\n")
 	for _, required := range []string{
-		"runs-on: [self-hosted, Linux, ARM64, vane-test]",
+		"runs-on: [self-hosted, Linux, vane-test]",
 		"permissions:\n  contents: read",
 		"persist-credentials: false",
 	} {
@@ -647,7 +647,9 @@ func TestSourceCIExcludesProductionDeployment(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
+		"vane-build",
 		"vane-deploy",
+		"vps-primary",
 		"VPS_",
 		"appleboy/",
 		"workflow_dispatch:",
