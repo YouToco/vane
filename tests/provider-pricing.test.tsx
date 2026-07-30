@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -25,14 +31,21 @@ const current: ProviderPriceRule = {
   created_at: "2026-07-30T00:00:00Z",
 };
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("provider pricing admin", () => {
   test("prefills an active rule and creates a new immutable version", async () => {
     vi.spyOn(api, "adminListProviderPrices").mockResolvedValue([current]);
     const replace = vi
       .spyOn(api, "adminReplaceProviderPrice")
-      .mockResolvedValue({ ...current, id: 8, input_cache_hit_per_million: 0.2 });
+      .mockResolvedValue({
+        ...current,
+        id: 8,
+        input_cache_hit_per_million: 0.2,
+      });
 
     render(<Pricing />);
     expect(await screen.findByText("kimi-k2.6")).toBeTruthy();
@@ -56,5 +69,51 @@ describe("provider pricing admin", () => {
       source_url: current.source_url,
     });
     expect(key).toBeTruthy();
+  });
+
+  test("reuses one idempotency key after an ambiguous save failure", async () => {
+    vi.spyOn(api, "adminListProviderPrices").mockResolvedValue([current]);
+    const replace = vi
+      .spyOn(api, "adminReplaceProviderPrice")
+      .mockRejectedValueOnce(new Error("response lost"))
+      .mockResolvedValue({ ...current, id: 8 });
+
+    render(<Pricing />);
+    await screen.findByText("kimi-k2.6");
+    await userEvent.click(screen.getByRole("button", { name: "更新" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存并生效" }));
+    await waitFor(() => expect(replace).toHaveBeenCalledTimes(1));
+    await userEvent.click(screen.getByRole("button", { name: "保存并生效" }));
+    await waitFor(() => expect(replace).toHaveBeenCalledTimes(2));
+
+    expect(replace.mock.calls[0][1]).toBe(replace.mock.calls[1][1]);
+  });
+
+  test("separates future and historical prices from the active catalog", async () => {
+    const upcoming = {
+      ...current,
+      id: 8,
+      resource: "future-model",
+      effective_from: "2099-01-01T00:00:00Z",
+    };
+    const historical = {
+      ...current,
+      id: 6,
+      resource: "old-model",
+      effective_from: "2025-01-01T00:00:00Z",
+      effective_to: "2025-02-01T00:00:00Z",
+    };
+    vi.spyOn(api, "adminListProviderPrices").mockResolvedValue([
+      current,
+      upcoming,
+      historical,
+    ]);
+
+    render(<Pricing />);
+    expect(await screen.findByText("待生效价格")).toBeTruthy();
+    expect(screen.getByText("future-model")).toBeTruthy();
+    expect(screen.getByText("历史价格版本")).toBeTruthy();
+    expect(screen.getByText("old-model")).toBeTruthy();
+    expect(screen.getAllByRole("link", { name: "官方文档" }).length).toBe(3);
   });
 });

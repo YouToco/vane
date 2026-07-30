@@ -106,6 +106,38 @@ describe("task health projection contract", () => {
     expect(normalizeTaskHealth(raw)).toEqual(raw);
   });
 
+  test("accepts the original v1 response during a rolling deployment", () => {
+    const legacyUsage = {
+      known_cost_usd: 1.25,
+      coverage: "llm_only",
+      llm_calls: 3,
+      budget_state: "not_configured",
+    };
+    expect(
+      normalizeTaskHealth({
+        ...raw,
+        usage: legacyUsage,
+      })?.usage,
+    ).toEqual({
+      ...legacyUsage,
+      known_costs: [{ currency: "USD", amount: 1.25 }],
+      llm_priced_calls: 3,
+      llm_estimated_calls: 0,
+    });
+  });
+
+  test("fails closed on a partial token extension", () => {
+    const health = normalizeTaskHealth({
+      ...raw,
+      usage: {
+        ...raw.usage,
+        reasoning_tokens: undefined,
+      },
+    });
+    expect(health).toBeDefined();
+    expect(health).not.toHaveProperty("usage");
+  });
+
   test("keeps known acquisition cost while marking incomplete provider receipts", () => {
     const partial = {
       ...raw,

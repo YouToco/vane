@@ -40,7 +40,7 @@ export default function Admin() {
         </span>
       </div>
       <Tabs defaultValue="observability">
-        <TabsList>
+        <TabsList className="max-w-full justify-start overflow-x-auto">
           <TabsTrigger value="observability">{A.tabObservability}</TabsTrigger>
           <TabsTrigger value="costs">{A.tabCosts}</TabsTrigger>
           <TabsTrigger value="pricing">{A.tabPricing}</TabsTrigger>

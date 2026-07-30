@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   BadgeDollarSign,
@@ -133,6 +133,7 @@ export default function Pricing() {
   const [saving, setSaving] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [nonce, setNonce] = useState(0);
+  const submitIntent = useRef<{ signature: string; key: string } | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -158,13 +159,30 @@ export default function Pricing() {
     };
   }, [nonce]);
 
+  const now = Date.now();
   const active = useMemo(
-    () => rules.filter((rule) => !rule.effective_to),
-    [rules],
+    () =>
+      rules.filter((rule) => {
+        const from = new Date(rule.effective_from).getTime();
+        const to = rule.effective_to
+          ? new Date(rule.effective_to).getTime()
+          : Number.POSITIVE_INFINITY;
+        return from <= now && now < to;
+      }),
+    [now, rules],
+  );
+  const upcoming = useMemo(
+    () => rules.filter((rule) => new Date(rule.effective_from).getTime() > now),
+    [now, rules],
   );
   const history = useMemo(
-    () => rules.filter((rule) => Boolean(rule.effective_to)),
-    [rules],
+    () =>
+      rules.filter(
+        (rule) =>
+          Boolean(rule.effective_to) &&
+          new Date(rule.effective_to!).getTime() <= now,
+      ),
+    [now, rules],
   );
 
   function editRule(rule: ProviderPriceRule) {
@@ -173,6 +191,9 @@ export default function Pricing() {
     if (typeof editor?.scrollIntoView === "function") {
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
     }
+    requestAnimationFrame(() => {
+      document.getElementById("price-provider")?.focus();
+    });
   }
 
   async function submit(event: FormEvent) {
@@ -216,9 +237,16 @@ export default function Pricing() {
             request_additional_unit_price: additional,
           }),
     };
+    const signature = JSON.stringify(input);
+    const idempotencyKey =
+      submitIntent.current?.signature === signature
+        ? submitIntent.current.key
+        : crypto.randomUUID();
+    submitIntent.current = { signature, key: idempotencyKey };
     setSaving(true);
     try {
-      await api.adminReplaceProviderPrice(input, crypto.randomUUID());
+      await api.adminReplaceProviderPrice(input, idempotencyKey);
+      submitIntent.current = null;
       toast.success("新价格版本已生效，历史调用不会被重算。");
       setNonce((value) => value + 1);
     } catch (error) {
@@ -233,7 +261,8 @@ export default function Pricing() {
       <div className="flex items-start justify-between gap-4">
         <div className="space-y-1">
           <p className="text-sm text-muted-foreground">
-            每次调用先保存真实 token 或请求次数，再绑定当时生效的价格版本。这里改价只影响后续调用。
+            每次调用先保存真实 token
+            或请求次数，再绑定当时生效的价格版本。这里改价只影响后续调用。
           </p>
           <p className="text-xs text-muted-foreground">
             供应商直接返回金额时，以供应商回执为准；通配价格和缺少缓存明细的模型费用会标为估算。
@@ -337,6 +366,58 @@ export default function Pricing() {
           )}
         </CardContent>
       </Card>
+
+      {upcoming.length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <History className="size-4" />
+              待生效价格
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>供应商 / 资源</TableHead>
+                    <TableHead>单价</TableHead>
+                    <TableHead>生效时间</TableHead>
+                    <TableHead>来源</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {upcoming.map((rule) => (
+                    <TableRow key={rule.id}>
+                      <TableCell>
+                        <div className="font-medium">{rule.provider}</div>
+                        <div className="font-mono text-xs text-muted-foreground">
+                          {rule.resource}
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-xs">{formula(rule)}</TableCell>
+                      <TableCell className="whitespace-nowrap text-xs">
+                        {formatTime(rule.effective_from)}
+                      </TableCell>
+                      <TableCell>
+                        <a
+                          href={rule.source_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-xs text-brand-strong hover:underline"
+                        >
+                          官方文档
+                          <ExternalLink className="size-3" />
+                        </a>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <Card id="provider-price-editor">
         <CardHeader className="pb-3">
@@ -566,6 +647,7 @@ export default function Pricing() {
                     <TableHead>旧单价</TableHead>
                     <TableHead>有效区间</TableHead>
                     <TableHead>备注</TableHead>
+                    <TableHead>来源</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -580,11 +662,21 @@ export default function Pricing() {
                       <TableCell className="text-xs">{formula(rule)}</TableCell>
                       <TableCell className="whitespace-nowrap text-xs">
                         {formatTime(rule.effective_from)}
-                        <br />
-                        至 {formatTime(rule.effective_to!)}
+                        <br />至 {formatTime(rule.effective_to!)}
                       </TableCell>
                       <TableCell className="text-xs text-muted-foreground">
                         {rule.note || "—"}
+                      </TableCell>
+                      <TableCell>
+                        <a
+                          href={rule.source_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-xs text-brand-strong hover:underline"
+                        >
+                          官方文档
+                          <ExternalLink className="size-3" />
+                        </a>
                       </TableCell>
                     </TableRow>
                   ))}

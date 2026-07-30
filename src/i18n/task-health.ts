@@ -6,7 +6,7 @@ const copies = {
     title: "Latest check",
     usageTitle: "Known usage",
     accessTitle: "Task access",
-    knownCost: "Known cost",
+    knownCost: "Recorded amount",
     latestAcquisition: "Latest acquisition",
     modelCalls: "Model calls",
     acquisitionCalls: "Acquisition calls",
@@ -25,7 +25,8 @@ const copies = {
     },
     issues: {
       coverage_incomplete: "Some coverage or processing was incomplete.",
-      acquisition_unavailable: "Part of this task could not collect information.",
+      acquisition_unavailable:
+        "Part of this task could not collect information.",
       quota_paused: "This check stopped because available usage ran out.",
       model_temporarily_unavailable: "Analysis was temporarily unavailable.",
       delivery_failed: "The result was created but delivery did not finish.",
@@ -43,16 +44,18 @@ const copies = {
     coverage: {
       none: "No attributable cost yet",
       llm_only: "LLM cost only; acquisition cost is not yet attributed",
-      llm_partial: "Known LLM cost is incomplete or includes an estimate",
       tools_only: "Acquisition cost only",
-      tools_partial: "Known acquisition cost is a lower bound",
+      tools_partial: "Acquisition amount is incomplete or includes an estimate",
       llm_and_tools: "LLM and acquisition costs included",
-      llm_and_tools_partial: "Includes model cost and known acquisition cost; acquisition is incomplete",
+      llm_and_tools_partial:
+        "Recorded amount is incomplete or includes an estimate",
     },
     acquisitionFailures: {
       timeout: "The provider timed out. Vane will retry.",
-      provider_error: "The provider was temporarily unavailable. Vane will retry.",
-      invalid_request: "A collection instruction could not run. Review the task manual.",
+      provider_error:
+        "The provider was temporarily unavailable. Vane will retry.",
+      invalid_request:
+        "A collection instruction could not run. Review the task manual.",
       usage_limit: "The collection usage limit was reached.",
       internal: "Collection accounting or execution needs support.",
     },
@@ -61,7 +64,7 @@ const copies = {
       ok: "Within budget",
       warning: "Near budget",
       exhausted: "Budget reached",
-      incomplete: "Known cost is only a lower bound",
+      incomplete: "Amount is incomplete or estimated; budget status is paused",
     },
     roles: {
       owner: "Owner",
@@ -84,7 +87,7 @@ const copies = {
     title: "最近检查",
     usageTitle: "已知用量",
     accessTitle: "任务权限",
-    knownCost: "已知成本",
+    knownCost: "记录金额",
     latestAcquisition: "最近一次信息获取",
     modelCalls: "模型调用",
     acquisitionCalls: "信息获取次数",
@@ -121,11 +124,10 @@ const copies = {
     coverage: {
       none: "暂无可归集成本",
       llm_only: "仅含模型成本，采集成本尚未完成归集",
-      llm_partial: "模型费用包含估算或仍有调用未定价",
       tools_only: "仅含信息获取费用",
-      tools_partial: "信息获取费用只统计了已知部分",
+      tools_partial: "信息获取金额不完整或含估算",
       llm_and_tools: "已包含模型与信息获取费用",
-      llm_and_tools_partial: "已含模型费用和部分已知信息获取费用，完整金额仍是下限",
+      llm_and_tools_partial: "记录金额不完整或含估算",
     },
     acquisitionFailures: {
       timeout: "信息服务响应超时，Vane 会自动重试。",
@@ -139,7 +141,7 @@ const copies = {
       ok: "预算充足",
       warning: "接近预算",
       exhausted: "预算已用尽",
-      incomplete: "已知成本只是下限",
+      incomplete: "金额不完整或含估算，暂不判断预算",
     },
     roles: {
       owner: "所有者",
@@ -162,7 +164,7 @@ const copies = {
     title: "最近檢查",
     usageTitle: "已知用量",
     accessTitle: "任務權限",
-    knownCost: "已知成本",
+    knownCost: "記錄金額",
     latestAcquisition: "最近一次資訊取得",
     modelCalls: "模型呼叫",
     acquisitionCalls: "資訊取得次數",
@@ -199,11 +201,10 @@ const copies = {
     coverage: {
       none: "暫無可歸集成本",
       llm_only: "僅含模型成本，蒐集成本尚未歸集",
-      llm_partial: "模型費用包含估算或仍有呼叫未定價",
       tools_only: "僅含蒐集成本",
-      tools_partial: "蒐集成本只統計了已知部分",
+      tools_partial: "蒐集金額不完整或含估算",
       llm_and_tools: "已包含模型與蒐集成本",
-      llm_and_tools_partial: "已含模型成本和部分已知蒐集成本，完整金額仍是下限",
+      llm_and_tools_partial: "記錄金額不完整或含估算",
     },
     acquisitionFailures: {
       timeout: "上游回應逾時，Vane 會自動重試。",
@@ -217,7 +218,7 @@ const copies = {
       ok: "預算充足",
       warning: "接近預算",
       exhausted: "預算已用盡",
-      incomplete: "已知成本只是下限",
+      incomplete: "金額不完整或含估算，暫不判斷預算",
     },
     roles: {
       owner: "擁有者",
@@ -240,7 +241,7 @@ const copies = {
     title: "最新チェック",
     usageTitle: "確認済み使用量",
     accessTitle: "タスク権限",
-    knownCost: "確認済みコスト",
+    knownCost: "記録金額",
     latestAcquisition: "最新の収集",
     modelCalls: "モデル呼び出し",
     acquisitionCalls: "収集呼び出し",
@@ -261,7 +262,8 @@ const copies = {
       coverage_incomplete: "今回の収集または処理が一部完了していません。",
       acquisition_unavailable: "タスクの一部の情報を収集できませんでした。",
       quota_paused: "利用可能量が不足したため停止しました。",
-      model_temporarily_unavailable: "分析サービスを一時的に利用できませんでした。",
+      model_temporarily_unavailable:
+        "分析サービスを一時的に利用できませんでした。",
       delivery_failed: "結果は作成されましたが、配信が完了していません。",
       check_interrupted: "チェックは完了前に中断されました。",
       check_failed: "チェックを安全に完了できませんでした。",
@@ -277,16 +279,17 @@ const copies = {
     coverage: {
       none: "計上済みコストなし",
       llm_only: "モデル費用のみ。収集費用は未計上です",
-      llm_partial: "モデル費用に推定または未価格の呼び出しがあります",
       tools_only: "収集費用のみ",
-      tools_partial: "確認済みの収集費用は下限です",
+      tools_partial: "収集金額が未完了または推定を含みます",
       llm_and_tools: "モデル費用と収集費用を含みます",
-      llm_and_tools_partial: "モデル費用と確認済み収集費用を含みますが、収集費用は未完了です",
+      llm_and_tools_partial: "記録金額が未完了または推定を含みます",
     },
     acquisitionFailures: {
       timeout: "プロバイダーがタイムアウトしました。自動で再試行します。",
-      provider_error: "プロバイダーを一時的に利用できません。自動で再試行します。",
-      invalid_request: "収集指示を実行できません。タスク手順書を確認してください。",
+      provider_error:
+        "プロバイダーを一時的に利用できません。自動で再試行します。",
+      invalid_request:
+        "収集指示を実行できません。タスク手順書を確認してください。",
       usage_limit: "収集の利用上限に達しました。",
       internal: "収集の実行または計上にサポートが必要です。",
     },
@@ -295,7 +298,7 @@ const copies = {
       ok: "予算内",
       warning: "予算上限に接近",
       exhausted: "予算上限に到達",
-      incomplete: "確認済みコストは下限です",
+      incomplete: "金額が未完了または推定のため、予算判定を保留します",
     },
     roles: {
       owner: "所有者",
@@ -318,7 +321,7 @@ const copies = {
     title: "최근 확인",
     usageTitle: "확인된 사용량",
     accessTitle: "작업 권한",
-    knownCost: "확인된 비용",
+    knownCost: "기록 금액",
     latestAcquisition: "최근 수집",
     modelCalls: "모델 호출",
     acquisitionCalls: "수집 호출",
@@ -339,7 +342,8 @@ const copies = {
       coverage_incomplete: "이번 수집 또는 처리가 일부 완료되지 않았습니다.",
       acquisition_unavailable: "작업의 일부 정보를 수집하지 못했습니다.",
       quota_paused: "사용 가능량이 부족해 이번 확인을 중단했습니다.",
-      model_temporarily_unavailable: "분석 서비스를 일시적으로 사용할 수 없었습니다.",
+      model_temporarily_unavailable:
+        "분석 서비스를 일시적으로 사용할 수 없었습니다.",
       delivery_failed: "결과는 생성됐지만 전송이 완료되지 않았습니다.",
       check_interrupted: "확인이 완료되기 전에 중단되었습니다.",
       check_failed: "확인을 안전하게 완료하지 못했습니다.",
@@ -355,16 +359,17 @@ const copies = {
     coverage: {
       none: "귀속된 비용 없음",
       llm_only: "모델 비용만 포함하며 수집 비용은 아직 귀속되지 않음",
-      llm_partial: "모델 비용에 추정 또는 미가격 호출이 포함됨",
       tools_only: "수집 비용만 포함",
-      tools_partial: "확인된 수집 비용은 하한값임",
+      tools_partial: "수집 금액이 불완전하거나 추정값을 포함함",
       llm_and_tools: "모델 및 수집 비용 포함",
-      llm_and_tools_partial: "모델 비용과 확인된 수집 비용을 포함하지만 수집 비용은 불완전함",
+      llm_and_tools_partial: "기록 금액이 불완전하거나 추정값을 포함함",
     },
     acquisitionFailures: {
       timeout: "공급자 응답 시간이 초과되었습니다. 자동 재시도합니다.",
-      provider_error: "공급자를 일시적으로 사용할 수 없습니다. 자동 재시도합니다.",
-      invalid_request: "수집 지시를 실행할 수 없습니다. 작업 매뉴얼을 확인하세요.",
+      provider_error:
+        "공급자를 일시적으로 사용할 수 없습니다. 자동 재시도합니다.",
+      invalid_request:
+        "수집 지시를 실행할 수 없습니다. 작업 매뉴얼을 확인하세요.",
       usage_limit: "수집 사용량 한도에 도달했습니다.",
       internal: "수집 실행 또는 비용 기록에 지원이 필요합니다.",
     },
@@ -373,7 +378,7 @@ const copies = {
       ok: "예산 내",
       warning: "예산에 근접",
       exhausted: "예산 소진",
-      incomplete: "확인된 비용은 하한값임",
+      incomplete: "금액이 불완전하거나 추정되어 예산 판단을 보류함",
     },
     roles: {
       owner: "소유자",
@@ -396,7 +401,7 @@ const copies = {
     title: "Última comprobación",
     usageTitle: "Uso conocido",
     accessTitle: "Acceso a la tarea",
-    knownCost: "Coste conocido",
+    knownCost: "Importe registrado",
     latestAcquisition: "Última recopilación",
     modelCalls: "Llamadas al modelo",
     acquisitionCalls: "Llamadas de recopilación",
@@ -414,10 +419,12 @@ const copies = {
       never_run: "Aún no comprobado",
     },
     issues: {
-      coverage_incomplete: "Parte de la cobertura o del procesamiento quedó incompleta.",
+      coverage_incomplete:
+        "Parte de la cobertura o del procesamiento quedó incompleta.",
       acquisition_unavailable: "No se pudo recopilar parte de la información.",
       quota_paused: "La comprobación se detuvo por falta de uso disponible.",
-      model_temporarily_unavailable: "El análisis no estuvo disponible temporalmente.",
+      model_temporarily_unavailable:
+        "El análisis no estuvo disponible temporalmente.",
       delivery_failed: "El resultado se creó, pero no terminó de enviarse.",
       check_interrupted: "La comprobación se interrumpió antes de terminar.",
       check_failed: "La comprobación no pudo terminar de forma segura.",
@@ -433,15 +440,17 @@ const copies = {
     coverage: {
       none: "Aún no hay costes atribuibles",
       llm_only: "Solo coste del modelo; falta atribuir la recopilación",
-      llm_partial: "El coste del modelo incluye estimaciones o llamadas sin precio",
       tools_only: "Solo coste de recopilación",
-      tools_partial: "El coste conocido de recopilación es un mínimo",
+      tools_partial:
+        "El importe de recopilación está incompleto o incluye una estimación",
       llm_and_tools: "Incluye modelo y recopilación",
-      llm_and_tools_partial: "Incluye el modelo y el coste conocido de recopilación; la recopilación está incompleta",
+      llm_and_tools_partial:
+        "El importe registrado está incompleto o incluye una estimación",
     },
     acquisitionFailures: {
       timeout: "El proveedor agotó el tiempo. Vane reintentará.",
-      provider_error: "El proveedor no estaba disponible temporalmente. Vane reintentará.",
+      provider_error:
+        "El proveedor no estaba disponible temporalmente. Vane reintentará.",
       invalid_request: "No se pudo ejecutar una instrucción. Revisa el manual.",
       usage_limit: "Se alcanzó el límite de recopilación.",
       internal: "La ejecución o contabilización requiere soporte.",
@@ -451,7 +460,8 @@ const copies = {
       ok: "Dentro del presupuesto",
       warning: "Cerca del presupuesto",
       exhausted: "Presupuesto agotado",
-      incomplete: "El coste conocido es solo un mínimo",
+      incomplete:
+        "Importe incompleto o estimado; se pausa el estado del presupuesto",
     },
     roles: {
       owner: "Propietario",
@@ -474,7 +484,7 @@ const copies = {
     title: "Dernière vérification",
     usageTitle: "Usage connu",
     accessTitle: "Accès à la mission",
-    knownCost: "Coût connu",
+    knownCost: "Montant enregistré",
     latestAcquisition: "Dernière collecte",
     modelCalls: "Appels modèle",
     acquisitionCalls: "Appels collecte",
@@ -492,10 +502,13 @@ const copies = {
       never_run: "Pas encore vérifié",
     },
     issues: {
-      coverage_incomplete: "Une partie de la couverture ou du traitement est incomplète.",
-      acquisition_unavailable: "Certaines informations n’ont pas pu être collectées.",
+      coverage_incomplete:
+        "Une partie de la couverture ou du traitement est incomplète.",
+      acquisition_unavailable:
+        "Certaines informations n’ont pas pu être collectées.",
       quota_paused: "La vérification s’est arrêtée faute d’usage disponible.",
-      model_temporarily_unavailable: "L’analyse était temporairement indisponible.",
+      model_temporarily_unavailable:
+        "L’analyse était temporairement indisponible.",
       delivery_failed: "Le résultat existe, mais son envoi n’est pas terminé.",
       check_interrupted: "La vérification a été interrompue avant la fin.",
       check_failed: "La vérification n’a pas pu se terminer en toute sécurité.",
@@ -511,16 +524,17 @@ const copies = {
     coverage: {
       none: "Aucun coût attribuable",
       llm_only: "Coût du modèle uniquement ; collecte non attribuée",
-      llm_partial: "Le coût du modèle inclut une estimation ou des appels non tarifés",
       tools_only: "Coût de collecte uniquement",
-      tools_partial: "Le coût de collecte connu est un minimum",
+      tools_partial: "Le montant de collecte est incomplet ou estimé",
       llm_and_tools: "Modèle et collecte inclus",
-      llm_and_tools_partial: "Inclut le modèle et le coût de collecte connu ; la collecte est incomplète",
+      llm_and_tools_partial: "Le montant enregistré est incomplet ou estimé",
     },
     acquisitionFailures: {
       timeout: "Le fournisseur a expiré. Vane réessaiera.",
-      provider_error: "Le fournisseur était temporairement indisponible. Vane réessaiera.",
-      invalid_request: "Une instruction de collecte a échoué. Vérifiez le manuel.",
+      provider_error:
+        "Le fournisseur était temporairement indisponible. Vane réessaiera.",
+      invalid_request:
+        "Une instruction de collecte a échoué. Vérifiez le manuel.",
       usage_limit: "La limite de collecte a été atteinte.",
       internal: "L’exécution ou la comptabilisation nécessite une assistance.",
     },
@@ -529,7 +543,7 @@ const copies = {
       ok: "Dans le budget",
       warning: "Budget bientôt atteint",
       exhausted: "Budget atteint",
-      incomplete: "Le coût connu n’est qu’un minimum",
+      incomplete: "Montant incomplet ou estimé ; état du budget suspendu",
     },
     roles: {
       owner: "Propriétaire",
@@ -552,7 +566,7 @@ const copies = {
     title: "Letzte Prüfung",
     usageTitle: "Bekannte Nutzung",
     accessTitle: "Aufgabenzugriff",
-    knownCost: "Bekannte Kosten",
+    knownCost: "Erfasster Betrag",
     latestAcquisition: "Letzte Erfassung",
     modelCalls: "Modellaufrufe",
     acquisitionCalls: "Erfassungsaufrufe",
@@ -570,11 +584,16 @@ const copies = {
       never_run: "Noch nicht geprüft",
     },
     issues: {
-      coverage_incomplete: "Erfassung oder Verarbeitung war teilweise unvollständig.",
-      acquisition_unavailable: "Ein Teil der Informationen konnte nicht erfasst werden.",
-      quota_paused: "Die Prüfung wurde wegen fehlender Nutzungskapazität beendet.",
-      model_temporarily_unavailable: "Die Analyse war vorübergehend nicht verfügbar.",
-      delivery_failed: "Das Ergebnis wurde erstellt, aber nicht vollständig zugestellt.",
+      coverage_incomplete:
+        "Erfassung oder Verarbeitung war teilweise unvollständig.",
+      acquisition_unavailable:
+        "Ein Teil der Informationen konnte nicht erfasst werden.",
+      quota_paused:
+        "Die Prüfung wurde wegen fehlender Nutzungskapazität beendet.",
+      model_temporarily_unavailable:
+        "Die Analyse war vorübergehend nicht verfügbar.",
+      delivery_failed:
+        "Das Ergebnis wurde erstellt, aber nicht vollständig zugestellt.",
       check_interrupted: "Die Prüfung wurde vor Abschluss unterbrochen.",
       check_failed: "Die Prüfung konnte nicht sicher abgeschlossen werden.",
     },
@@ -589,15 +608,16 @@ const copies = {
     coverage: {
       none: "Noch keine zurechenbaren Kosten",
       llm_only: "Nur Modellkosten; Erfassung noch nicht zugerechnet",
-      llm_partial: "Modellkosten enthalten Schätzungen oder unbepreiste Aufrufe",
       tools_only: "Nur Erfassungskosten",
-      tools_partial: "Bekannte Erfassungskosten sind nur eine Untergrenze",
+      tools_partial: "Erfassungsbetrag ist unvollständig oder geschätzt",
       llm_and_tools: "Modell- und Erfassungskosten enthalten",
-      llm_and_tools_partial: "Enthält Modell- und bekannte Erfassungskosten; Erfassung ist unvollständig",
+      llm_and_tools_partial:
+        "Erfasster Betrag ist unvollständig oder geschätzt",
     },
     acquisitionFailures: {
       timeout: "Zeitüberschreitung beim Anbieter. Vane versucht es erneut.",
-      provider_error: "Der Anbieter war vorübergehend nicht verfügbar. Vane versucht es erneut.",
+      provider_error:
+        "Der Anbieter war vorübergehend nicht verfügbar. Vane versucht es erneut.",
       invalid_request: "Eine Erfassungsanweisung schlug fehl. Handbuch prüfen.",
       usage_limit: "Das Erfassungslimit wurde erreicht.",
       internal: "Ausführung oder Abrechnung benötigt Support.",
@@ -607,7 +627,7 @@ const copies = {
       ok: "Im Budget",
       warning: "Nahe am Budget",
       exhausted: "Budget erreicht",
-      incomplete: "Bekannte Kosten sind nur eine Untergrenze",
+      incomplete: "Betrag unvollständig oder geschätzt; Budgetstatus pausiert",
     },
     roles: {
       owner: "Eigentümer",

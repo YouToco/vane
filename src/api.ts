@@ -1,4 +1,3 @@
-
 // 统一 fetch 封装。
 // 为什么集中封装：所有请求都要带 cookie（credentials:'include'），且 401 需要统一踢回登录页，
 // 分散在各页面写会漏；错误统一转成后端约定的 {"error":"人话"} 文案，页面只管展示。
@@ -59,7 +58,8 @@ export interface ObservationPolicy {
   schema?: string;
   mode?: "content" | "event" | string;
   window?: {
-    kind?: "schedule_interval" | "rolling_duration" | "calendar_period" | string;
+    kind?:
+      "schedule_interval" | "rolling_duration" | "calendar_period" | string;
     rolling_duration_seconds?: number;
     calendar_period?: "day" | "week" | "month" | string;
   };
@@ -73,7 +73,8 @@ export interface ObservationPolicy {
   event?: {
     subject?: string;
     event_kind?: string;
-    qualification?: "official_announcement" | "general_availability" | "either" | string;
+    qualification?:
+      "official_announcement" | "general_availability" | "either" | string;
   };
   effective_at?: string;
 }
@@ -179,7 +180,8 @@ export interface EvolveView {
 // BatchExitGate 对齐 types.BatchExitGate（enums.go）：pipeline 从哪个闸门提前退出。
 // 空串 = 没有提前退出（跑到了 Push）。取值顺序即 pipeline 顺序。
 // 注意闸门名 = 产出该结果的**上一步活动名**："dedup" 意为"Dedup 跑完后没剩下东西"。
-export type BatchExitGate = "" | "fetch" | "dedup" | "score" | "select" | "cardgen";
+export type BatchExitGate =
+  "" | "fetch" | "dedup" | "score" | "select" | "cardgen";
 
 // PipelineCounts 对齐 types.PipelineCounts（entities.go）：每一步**跑完之后还剩几条**。
 //
@@ -354,10 +356,7 @@ export interface TaskBriefInsight {
 }
 
 export type ExecutiveDecisionState =
-  | "act"
-  | "watch"
-  | "no_action"
-  | "insufficient_evidence";
+  "act" | "watch" | "no_action" | "insufficient_evidence";
 
 export interface ExecutiveEvidenceRef {
   brief_id?: number;
@@ -424,11 +423,7 @@ export interface TaskLatestCheck {
   failure_code?: string;
 }
 
-export type TaskHealthState =
-  | "healthy"
-  | "attention"
-  | "waiting"
-  | "never_run";
+export type TaskHealthState = "healthy" | "attention" | "waiting" | "never_run";
 export type TaskHealthIssue =
   | "coverage_incomplete"
   | "acquisition_unavailable"
@@ -447,23 +442,14 @@ export type TaskHealthAction =
 export type CostCoverage =
   | "none"
   | "llm_only"
-  | "llm_partial"
   | "tools_only"
   | "tools_partial"
   | "llm_and_tools"
   | "llm_and_tools_partial";
 export type AcquisitionFailure =
-  | "timeout"
-  | "provider_error"
-  | "invalid_request"
-  | "usage_limit"
-  | "internal";
+  "timeout" | "provider_error" | "invalid_request" | "usage_limit" | "internal";
 export type BudgetState =
-  | "not_configured"
-  | "ok"
-  | "warning"
-  | "exhausted"
-  | "incomplete";
+  "not_configured" | "ok" | "warning" | "exhausted" | "incomplete";
 
 export interface TaskHealthProjection {
   schema_version: "vane.task-health/v1";
@@ -726,9 +712,7 @@ export interface ProfileEditsResponse {
 
 export type ProfileClaimField = "industry" | "occupation" | "tag" | "summary";
 export type ProfileClaimSourceState =
-  | "evidence"
-  | "manual"
-  | "source_unavailable";
+  "evidence" | "manual" | "source_unavailable";
 
 export interface ProfileClaimSource {
   state: ProfileClaimSourceState;
@@ -779,18 +763,18 @@ type ProfileClaimActionAuthority = {
 export type ProfileClaimActionRequest = ProfileClaimActionAuthority &
   (
     | {
-      action: "correct";
-      claim_id: string;
-      value: string;
-    }
+        action: "correct";
+        claim_id: string;
+        value: string;
+      }
     | {
-      action: "suppress" | "pin";
-      claim_id: string;
-    }
+        action: "suppress" | "pin";
+        claim_id: string;
+      }
     | {
-      action: "revoke";
-      event_id: string;
-    }
+        action: "revoke";
+        event_id: string;
+      }
   );
 
 export interface ProfileClaimActionResponse {
@@ -871,7 +855,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(0, "网络错误，请确认后端服务在线后重试");
   }
   // 会话失效统一踢回登录页；登录接口自身的 401 要留给登录页展示"密码错误"，不能跳
-  if (res.status === 401 && path !== "/api/auth/login" && path !== "/api/auth/register" && path !== "/api/auth/me") {
+  if (
+    res.status === 401 &&
+    path !== "/api/auth/login" &&
+    path !== "/api/auth/register" &&
+    path !== "/api/auth/me"
+  ) {
     location.hash = "#/login";
     throw new ApiError(401, "登录已失效，请重新登录");
   }
@@ -891,7 +880,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 function post<T>(path: string, body?: unknown): Promise<T> {
   return request<T>(path, {
     method: "POST",
-    headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+    headers:
+      body !== undefined ? { "Content-Type": "application/json" } : undefined,
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
 }
@@ -925,22 +915,18 @@ export function normalizeSchedule(raw: Record<string, unknown>): Schedule {
           : "unavailable";
   return {
     id: String(raw.id ?? ""),
-    nl_description: typeof raw.nl_description === "string" ? raw.nl_description : "",
+    nl_description:
+      typeof raw.nl_description === "string" ? raw.nl_description : "",
     spec: asObject<ScheduleSpec>(raw.spec ?? raw.spec_json),
     scope: asObject<PushScope>(raw.scope ?? raw.scope_json),
     status: typeof raw.status === "string" ? raw.status : "active",
     next_run_state: nextRunState,
-    ...(nextRunState === "scheduled" && nextRun
-      ? { next_run: nextRun }
-      : {}),
+    ...(nextRunState === "scheduled" && nextRun ? { next_run: nextRun } : {}),
     created_at: raw.created_at as string | undefined,
   };
 }
 
-type RawScheduleDetail = Omit<
-  ScheduleDetail,
-  "schedule" | "capabilities"
-> & {
+type RawScheduleDetail = Omit<ScheduleDetail, "schedule" | "capabilities"> & {
   schedule: Record<string, unknown>;
   capabilities?: unknown;
 };
@@ -986,7 +972,6 @@ const taskHealthActions = new Set<TaskHealthAction>([
 const taskHealthCostCoverage = new Set<CostCoverage>([
   "none",
   "llm_only",
-  "llm_partial",
   "tools_only",
   "tools_partial",
   "llm_and_tools",
@@ -1015,8 +1000,8 @@ export function normalizeTaskHealth(
   const issue = value.issue as TaskHealthIssue | undefined;
   const action = value.recommended_action as TaskHealthAction | undefined;
   const acquisition = asObject<Record<string, unknown>>(value.acquisition);
-  const acquisitionFailure =
-    acquisition.failure_reason as AcquisitionFailure | undefined;
+  const acquisitionFailure = acquisition.failure_reason as
+    AcquisitionFailure | undefined;
   const permissions = asObject<Record<string, unknown>>(value.permissions);
   const role = permissions.role;
   const permissionKeys = [
@@ -1040,10 +1025,8 @@ export function normalizeTaskHealth(
     Number(acquisition.max_fail_count) < 0 ||
     (acquisitionFailure !== undefined &&
       !taskHealthAcquisitionFailures.has(acquisitionFailure)) ||
-    (Number(acquisition.failing) === 0 &&
-      acquisitionFailure !== undefined) ||
-    (Number(acquisition.failing) > 0 &&
-      acquisitionFailure === undefined) ||
+    (Number(acquisition.failing) === 0 && acquisitionFailure !== undefined) ||
+    (Number(acquisition.failing) > 0 && acquisitionFailure === undefined) ||
     !(
       role === "" ||
       role === "owner" ||
@@ -1066,9 +1049,7 @@ export function normalizeTaskHealth(
       total: Number(acquisition.total),
       failing: Number(acquisition.failing),
       max_fail_count: Number(acquisition.max_fail_count),
-      ...(acquisitionFailure
-        ? { failure_reason: acquisitionFailure }
-        : {}),
+      ...(acquisitionFailure ? { failure_reason: acquisitionFailure } : {}),
     },
     permissions: {
       role,
@@ -1082,22 +1063,37 @@ export function normalizeTaskHealth(
   const usage = asObject<Record<string, unknown>>(value.usage);
   const coverage = usage.coverage as CostCoverage;
   const budgetState = usage.budget_state as BudgetState;
+  const knownCostUSDValid =
+    typeof usage.known_cost_usd === "number" &&
+    Number.isFinite(usage.known_cost_usd) &&
+    usage.known_cost_usd >= 0;
   const llmCallsValid =
     typeof usage.llm_calls === "number" &&
     Number.isSafeInteger(usage.llm_calls) &&
     usage.llm_calls >= 0;
-  const llmPricedCallsValid =
-    typeof usage.llm_priced_calls === "number" &&
-    Number.isSafeInteger(usage.llm_priced_calls) &&
-    usage.llm_priced_calls >= 0 &&
+  const llmPricingFieldsPresent =
+    usage.llm_priced_calls !== undefined ||
+    usage.llm_estimated_calls !== undefined;
+  const llmPricingFieldsComplete =
+    usage.llm_priced_calls !== undefined &&
+    usage.llm_estimated_calls !== undefined;
+  const llmPricedCalls =
+    !llmPricingFieldsPresent && llmCallsValid
+      ? Number(usage.llm_calls)
+      : Number(usage.llm_priced_calls);
+  const llmEstimatedCalls =
+    !llmPricingFieldsPresent && llmCallsValid
+      ? 0
+      : Number(usage.llm_estimated_calls);
+  const llmPricingValid =
     llmCallsValid &&
-    usage.llm_priced_calls <= Number(usage.llm_calls);
-  const llmEstimatedCallsValid =
-    typeof usage.llm_estimated_calls === "number" &&
-    Number.isSafeInteger(usage.llm_estimated_calls) &&
-    usage.llm_estimated_calls >= 0 &&
-    llmPricedCallsValid &&
-    usage.llm_estimated_calls <= Number(usage.llm_priced_calls);
+    (!llmPricingFieldsPresent || llmPricingFieldsComplete) &&
+    Number.isSafeInteger(llmPricedCalls) &&
+    llmPricedCalls >= 0 &&
+    llmPricedCalls <= Number(usage.llm_calls) &&
+    Number.isSafeInteger(llmEstimatedCalls) &&
+    llmEstimatedCalls >= 0 &&
+    llmEstimatedCalls <= llmPricedCalls;
   const toolCallsValid =
     typeof usage.tool_calls === "number" &&
     Number.isSafeInteger(usage.tool_calls) &&
@@ -1108,12 +1104,16 @@ export function normalizeTaskHealth(
     usage.tool_priced_calls >= 0 &&
     toolCallsValid &&
     usage.tool_priced_calls <= Number(usage.tool_calls);
-  const toolEstimatedCallsValid =
-    typeof usage.tool_estimated_calls === "number" &&
-    Number.isSafeInteger(usage.tool_estimated_calls) &&
-    usage.tool_estimated_calls >= 0 &&
+  const toolEstimatedCalls =
+    usage.tool_estimated_calls === undefined && toolPricedCallsValid
+      ? 0
+      : Number(usage.tool_estimated_calls);
+  const toolPricingValid =
     toolPricedCallsValid &&
-    usage.tool_estimated_calls <= Number(usage.tool_priced_calls);
+    Number.isSafeInteger(toolEstimatedCalls) &&
+    toolEstimatedCalls >= 0 &&
+    toolPricedCallsValid &&
+    toolEstimatedCalls <= Number(usage.tool_priced_calls);
   const integerUsage = (
     key:
       | "prompt_tokens"
@@ -1134,93 +1134,100 @@ export function normalizeTaskHealth(
   const promptCacheMissTokens = integerUsage("prompt_cache_miss_tokens");
   const completionTokens = integerUsage("completion_tokens");
   const reasoningTokens = integerUsage("reasoning_tokens");
+  const tokenValues = [
+    promptTokens,
+    promptCacheHitTokens,
+    promptCacheMissTokens,
+    completionTokens,
+    reasoningTokens,
+  ];
+  const tokenFieldsPresent = [
+    "prompt_tokens",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
+    "completion_tokens",
+    "reasoning_tokens",
+  ].some((key) => usage[key] !== undefined);
   const tokenShapeValid =
-    promptTokens !== undefined &&
-    promptCacheHitTokens !== undefined &&
-    promptCacheMissTokens !== undefined &&
-    completionTokens !== undefined &&
-    reasoningTokens !== undefined &&
-    promptCacheHitTokens + promptCacheMissTokens <= promptTokens &&
-    reasoningTokens <= completionTokens;
-  const knownCostsShapeValid = Array.isArray(usage.known_costs);
-  const knownCostsRaw: unknown[] = knownCostsShapeValid
+    !tokenFieldsPresent ||
+    (tokenValues.every((amount) => amount !== undefined) &&
+      promptCacheHitTokens! + promptCacheMissTokens! <= promptTokens! &&
+      reasoningTokens! <= completionTokens!);
+  const knownCostsPresent = usage.known_costs !== undefined;
+  const knownCostsShapeValid =
+    !knownCostsPresent || Array.isArray(usage.known_costs);
+  const knownCostsRaw: unknown[] = Array.isArray(usage.known_costs)
     ? (usage.known_costs as unknown[])
     : [];
-  const knownCosts = knownCostsRaw.flatMap((rawCost) => {
+  const parsedKnownCosts = knownCostsRaw.flatMap((rawCost) => {
     const cost = asObject<Record<string, unknown>>(rawCost);
     return (cost.currency === "USD" || cost.currency === "CNY") &&
       typeof cost.amount === "number" &&
       Number.isFinite(cost.amount) &&
       cost.amount >= 0
-      ? [{ currency: cost.currency, amount: cost.amount } satisfies CurrencyCost]
+      ? [
+          {
+            currency: cost.currency,
+            amount: cost.amount,
+          } satisfies CurrencyCost,
+        ]
       : [];
   });
   const knownCostsValid =
     knownCostsShapeValid &&
-    knownCosts.length === knownCostsRaw.length &&
-    new Set(knownCosts.map((cost) => cost.currency)).size === knownCosts.length;
+    parsedKnownCosts.length === knownCostsRaw.length &&
+    new Set(parsedKnownCosts.map((cost) => cost.currency)).size ===
+      parsedKnownCosts.length;
+  const knownCosts = knownCostsPresent
+    ? parsedKnownCosts
+    : knownCostUSDValid
+      ? [
+          {
+            currency: "USD",
+            amount: Number(usage.known_cost_usd),
+          } satisfies CurrencyCost,
+        ]
+      : [];
   const usageCoverageCoherent =
     (coverage === "none" &&
       !llmCallsValid &&
       !toolCallsValid &&
       !toolPricedCallsValid) ||
     (coverage === "llm_only" &&
-      llmCallsValid &&
-      llmPricedCallsValid &&
-      llmEstimatedCallsValid &&
-      Number(usage.llm_priced_calls) === Number(usage.llm_calls) &&
-      Number(usage.llm_estimated_calls) === 0 &&
-      !toolCallsValid &&
-      !toolPricedCallsValid) ||
-    (coverage === "llm_partial" &&
-      llmCallsValid &&
-      llmPricedCallsValid &&
-      llmEstimatedCallsValid &&
-      (Number(usage.llm_priced_calls) < Number(usage.llm_calls) ||
-        Number(usage.llm_estimated_calls) > 0) &&
+      llmPricingValid &&
       !toolCallsValid &&
       !toolPricedCallsValid) ||
     (coverage === "tools_only" &&
       !llmCallsValid &&
       toolCallsValid &&
-      toolPricedCallsValid &&
-      toolEstimatedCallsValid &&
+      toolPricingValid &&
       Number(usage.tool_priced_calls) === Number(usage.tool_calls) &&
-      Number(usage.tool_estimated_calls) === 0) ||
+      toolEstimatedCalls === 0) ||
     (coverage === "tools_partial" &&
       !llmCallsValid &&
       toolCallsValid &&
-      toolPricedCallsValid &&
-      toolEstimatedCallsValid &&
+      toolPricingValid &&
       (Number(usage.tool_priced_calls) < Number(usage.tool_calls) ||
-        Number(usage.tool_estimated_calls) > 0)) ||
+        toolEstimatedCalls > 0)) ||
     (coverage === "llm_and_tools" &&
-      llmCallsValid &&
-      llmPricedCallsValid &&
-      llmEstimatedCallsValid &&
+      llmPricingValid &&
       toolCallsValid &&
-      toolPricedCallsValid &&
-      toolEstimatedCallsValid &&
-      Number(usage.llm_priced_calls) === Number(usage.llm_calls) &&
-      Number(usage.llm_estimated_calls) === 0 &&
+      toolPricingValid &&
+      llmPricedCalls === Number(usage.llm_calls) &&
+      llmEstimatedCalls === 0 &&
       Number(usage.tool_priced_calls) === Number(usage.tool_calls) &&
-      Number(usage.tool_estimated_calls) === 0) ||
+      toolEstimatedCalls === 0) ||
     (coverage === "llm_and_tools_partial" &&
-      llmCallsValid &&
-      llmPricedCallsValid &&
-      llmEstimatedCallsValid &&
+      llmPricingValid &&
       toolCallsValid &&
-      toolPricedCallsValid &&
-      toolEstimatedCallsValid &&
-      (Number(usage.llm_priced_calls) < Number(usage.llm_calls) ||
-        Number(usage.llm_estimated_calls) > 0 ||
+      toolPricingValid &&
+      (llmPricedCalls < Number(usage.llm_calls) ||
+        llmEstimatedCalls > 0 ||
         Number(usage.tool_priced_calls) < Number(usage.tool_calls) ||
-        Number(usage.tool_estimated_calls) > 0));
+        toolEstimatedCalls > 0));
   if (
     projected.permissions.can_view_usage &&
-    typeof usage.known_cost_usd === "number" &&
-    Number.isFinite(usage.known_cost_usd) &&
-    usage.known_cost_usd >= 0 &&
+    knownCostUSDValid &&
     taskHealthCostCoverage.has(coverage) &&
     taskHealthBudgetStates.has(budgetState) &&
     knownCostsValid &&
@@ -1228,33 +1235,27 @@ export function normalizeTaskHealth(
     usageCoverageCoherent
   ) {
     projected.usage = {
-      known_cost_usd: usage.known_cost_usd,
+      known_cost_usd: Number(usage.known_cost_usd),
       known_costs: knownCosts,
       coverage,
       budget_state: budgetState,
-      ...(llmCallsValid
-        ? { llm_calls: Number(usage.llm_calls) }
-        : {}),
-      ...(llmPricedCallsValid
-        ? { llm_priced_calls: Number(usage.llm_priced_calls) }
-        : {}),
-      ...(llmEstimatedCallsValid
-        ? { llm_estimated_calls: Number(usage.llm_estimated_calls) }
-        : {}),
-      ...(toolCallsValid
-        ? { tool_calls: Number(usage.tool_calls) }
-        : {}),
+      ...(llmCallsValid ? { llm_calls: Number(usage.llm_calls) } : {}),
+      ...(llmPricingValid ? { llm_priced_calls: llmPricedCalls } : {}),
+      ...(llmPricingValid ? { llm_estimated_calls: llmEstimatedCalls } : {}),
+      ...(toolCallsValid ? { tool_calls: Number(usage.tool_calls) } : {}),
       ...(toolPricedCallsValid
         ? { tool_priced_calls: Number(usage.tool_priced_calls) }
         : {}),
-      ...(toolEstimatedCallsValid
-        ? { tool_estimated_calls: Number(usage.tool_estimated_calls) }
+      ...(toolPricingValid ? { tool_estimated_calls: toolEstimatedCalls } : {}),
+      ...(tokenFieldsPresent
+        ? {
+            prompt_tokens: promptTokens!,
+            prompt_cache_hit_tokens: promptCacheHitTokens!,
+            prompt_cache_miss_tokens: promptCacheMissTokens!,
+            completion_tokens: completionTokens!,
+            reasoning_tokens: reasoningTokens!,
+          }
         : {}),
-      prompt_tokens: promptTokens!,
-      prompt_cache_hit_tokens: promptCacheHitTokens!,
-      prompt_cache_miss_tokens: promptCacheMissTokens!,
-      completion_tokens: completionTokens!,
-      reasoning_tokens: reasoningTokens!,
       ...(typeof usage.window_start === "string"
         ? { window_start: usage.window_start }
         : {}),
@@ -1305,7 +1306,11 @@ function normalizeProfileClaim(claim: ProfileClaim): ProfileClaim {
 // 补零就成了"漏斗各阶段都跑了、都是 0"——凭空编造一份观测结果，比白屏更坏。
 // exit_gate 同理：缺席按 "" 处理 = "没有提前退出"，那正是 008 之前所有行的真实语义。
 function normalizeBatch(b: PushBatchSummary): PushBatchSummary {
-  return { ...b, exit_gate: b.exit_gate ?? "", stage_counts: b.stage_counts ?? {} };
+  return {
+    ...b,
+    exit_gate: b.exit_gate ?? "",
+    stage_counts: b.stage_counts ?? {},
+  };
 }
 
 function normalizeReport(raw: ObservabilityReport): ObservabilityReport {
@@ -1326,7 +1331,10 @@ export const api = {
   // **必须与后端同批上线**：后端合并后旧的 {password} 形态会一律 401，
   // 而这个 bundle 是线上 Dashboard 的唯一入口——前后端脱节就是全量登不进去。
   login: (email: string, password: string) =>
-    post<{ ok: boolean; tenant_id: number }>("/api/auth/login", { email, password }),
+    post<{ ok: boolean; tenant_id: number }>("/api/auth/login", {
+      email,
+      password,
+    }),
 
   // 注册需邀请码（后端决议 D4：邀请制是平台垫付第三方 API 成本的财务闸门）。
   register: (email: string, password: string, inviteCode: string) =>
@@ -1339,9 +1347,15 @@ export const api = {
   me: () => request<MeResponse>("/api/auth/me"),
   feishuStatus: () => request<FeishuStatus>("/api/feishu/status"),
   feishuVerify: (appId: string, appSecret: string) =>
-    post<VerifyResult>("/api/feishu/verify", { app_id: appId, app_secret: appSecret }),
+    post<VerifyResult>("/api/feishu/verify", {
+      app_id: appId,
+      app_secret: appSecret,
+    }),
   feishuConfig: (appId: string, appSecret: string) =>
-    post<ConfigResult>("/api/feishu/config", { app_id: appId, app_secret: appSecret }),
+    post<ConfigResult>("/api/feishu/config", {
+      app_id: appId,
+      app_secret: appSecret,
+    }),
   feishuTest: () => post<{ ok: boolean }>("/api/feishu/test"),
 
   // ---- M3 定时任务（B8）----
@@ -1354,12 +1368,12 @@ export const api = {
   // scope_json 直出）；batches 的 stage_counts 是后端 json.RawMessage 直出，形状
   // 用 asObject 收敛（同 normalizeSchedule 的理由：JSONB 可能内联也可能字符串）。
   scheduleDetail: (id: string) =>
-    request<RawScheduleDetail>(
-      `/api/schedules/${encodeURIComponent(id)}`,
-    ).then(normalizeScheduleDetail),
+    request<RawScheduleDetail>(`/api/schedules/${encodeURIComponent(id)}`).then(
+      normalizeScheduleDetail,
+    ),
   scheduleSummaries: () =>
-    request<{ items: ScheduleRunSummary[] }>("/api/schedules/summary").then((r) =>
-      arr(r.items),
+    request<{ items: ScheduleRunSummary[] }>("/api/schedules/summary").then(
+      (r) => arr(r.items),
     ),
   scheduleBatches: (id: string, pageSize?: number, pageToken?: string) => {
     const params = new URLSearchParams();
@@ -1388,7 +1402,10 @@ export const api = {
       `/api/schedules/${encodeURIComponent(id)}/deliveries${qs ? "?" + qs : ""}`,
     ).then((r) => ({
       ...r,
-      items: arr(r.items).map((it) => ({ ...it, feedbacks: arr(it.feedbacks) })),
+      items: arr(r.items).map((it) => ({
+        ...it,
+        feedbacks: arr(it.feedbacks),
+      })),
     }));
   },
   scheduleBriefs: (id: string, pageSize?: number, pageToken?: string) => {
@@ -1420,9 +1437,7 @@ export const api = {
           feedback: {
             preference: insight.feedback?.preference,
             misjudged: Boolean(insight.feedback?.misjudged),
-            deep_dive_requested: Boolean(
-              insight.feedback?.deep_dive_requested,
-            ),
+            deep_dive_requested: Boolean(insight.feedback?.deep_dive_requested),
           },
         })),
       })),
@@ -1469,20 +1484,12 @@ export const api = {
       `/api/schedules/${encodeURIComponent(scheduleID)}/reports/${reportID}/ask`,
       { method: "POST", body: JSON.stringify({ question }) },
     ),
-  deepDiveBrief: (
-    scheduleID: string,
-    briefID: number,
-    insightID: number,
-  ) =>
+  deepDiveBrief: (scheduleID: string, briefID: number, insightID: number) =>
     request<BriefDeepDiveResponse>(
       `/api/schedules/${encodeURIComponent(scheduleID)}/briefs/${briefID}/deep-dive`,
       { method: "POST", body: JSON.stringify({ insight_id: insightID }) },
     ),
-  deepDiveReport: (
-    scheduleID: string,
-    reportID: number,
-    insightID: number,
-  ) =>
+  deepDiveReport: (scheduleID: string, reportID: number, insightID: number) =>
     request<BriefDeepDiveResponse>(
       `/api/schedules/${encodeURIComponent(scheduleID)}/reports/${reportID}/deep-dive`,
       { method: "POST", body: JSON.stringify({ insight_id: insightID }) },
@@ -1496,28 +1503,26 @@ export const api = {
       `/api/schedules/${encodeURIComponent(scheduleID)}/reports/${reportID}`,
     ),
 
-  executeTaskAction: (text: string, taskId: string | undefined, requestId: string) =>
+  executeTaskAction: (
+    text: string,
+    taskId: string | undefined,
+    requestId: string,
+  ) =>
     post<TaskActionResult>("/api/task-actions", {
       text,
       request_id: requestId,
       ...(taskId ? { task_id: taskId } : {}),
     }),
   runScheduleNow: (id: string, idempotencyKey: string) =>
-    request<{ ok: boolean }>(
-      `/api/schedules/${encodeURIComponent(id)}/run`,
-      {
-        method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey },
-      },
-    ),
+    request<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/run`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+    }),
   pauseSchedule: (id: string, idempotencyKey: string) =>
-    request<{ ok: boolean }>(
-      `/api/schedules/${encodeURIComponent(id)}/pause`,
-      {
-        method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey },
-      },
-    ),
+    request<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/pause`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+    }),
   resumeSchedule: (id: string, idempotencyKey: string) =>
     request<{ ok: boolean }>(
       `/api/schedules/${encodeURIComponent(id)}/resume`,
@@ -1541,10 +1546,15 @@ export const api = {
     if (pageSize) params.set("page_size", String(pageSize));
     if (pageToken) params.set("page_token", pageToken);
     const qs = params.toString();
-    return request<DeliveriesResp>(`/api/deliveries${qs ? "?" + qs : ""}`).then((r) => ({
-      ...r,
-      items: arr(r.items).map((it) => ({ ...it, feedbacks: arr(it.feedbacks) })),
-    }));
+    return request<DeliveriesResp>(`/api/deliveries${qs ? "?" + qs : ""}`).then(
+      (r) => ({
+        ...r,
+        items: arr(r.items).map((it) => ({
+          ...it,
+          feedbacks: arr(it.feedbacks),
+        })),
+      }),
+    );
   },
 
   // ---- M7 成本与运行监控（功能 6.5）----
@@ -1552,7 +1562,12 @@ export const api = {
   runstats: (windowHours: number) =>
     request<RunstatsResp>(
       `/api/admin/runstats?window_hours=${encodeURIComponent(windowHours)}`,
-    ).then((r) => ({ ...r, spans: arr(r.spans), days: arr(r.days), models: arr(r.models) })),
+    ).then((r) => ({
+      ...r,
+      spans: arr(r.spans),
+      days: arr(r.days),
+      models: arr(r.models),
+    })),
   adminListProviderPrices: () =>
     request<{ rules: ProviderPriceRule[] }>("/api/admin/provider-prices").then(
       (response) => arr(response.rules),
@@ -1611,7 +1626,11 @@ export const api = {
         undoable: item.undoable === true,
       })),
     })),
-  undoProfileEdit: (id: string, expectedUpdatedAt: string, idempotencyKey: string) =>
+  undoProfileEdit: (
+    id: string,
+    expectedUpdatedAt: string,
+    idempotencyKey: string,
+  ) =>
     request<Profile>(`/api/profile/edits/${encodeURIComponent(id)}/undo`, {
       method: "POST",
       headers: {
@@ -1645,7 +1664,8 @@ export const api = {
         typeof r.events_next_cursor === "string" &&
         r.events_next_cursor.length > 0,
       events_next_cursor:
-        typeof r.events_next_cursor === "string" && r.events_next_cursor.length > 0
+        typeof r.events_next_cursor === "string" &&
+        r.events_next_cursor.length > 0
           ? r.events_next_cursor
           : undefined,
       profile_epoch:
@@ -1707,7 +1727,9 @@ export const api = {
   //                                        使用的多用码）后端 409——错误文案要如实展示，
   //                                        「以为码废了、实际还能用」比报错糟糕
   adminListInvites: () =>
-    request<{ invites: Invite[] }>("/api/admin/invites").then((r) => arr(r.invites)),
+    request<{ invites: Invite[] }>("/api/admin/invites").then((r) =>
+      arr(r.invites),
+    ),
   adminCreateInvite: () => post<Invite>("/api/admin/invites"),
   adminRevokeInvite: (code: string) =>
     request<{ ok: boolean }>(`/api/admin/invites/${encodeURIComponent(code)}`, {
