@@ -77,6 +77,15 @@ func TestCompiledTaskRunSnapshotV2_PausedManualRunRequiresExactCommand(
 		cleanupExec(context.Background(), t, st,
 			`DELETE FROM schedule_commands WHERE id=$1`, command.ID)
 	})
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE schedule_commands
+		    SET status=$2, phase=$3, completed_at=clock_timestamp()
+		  WHERE id=$1`,
+		command.ID, types.ScheduleCommandCompleted,
+		types.ScheduleCommandCompletedPhase,
+	); err != nil {
+		t.Fatal(err)
+	}
 	identity := types.RunIdentity{
 		TemporalWorkflowID: types.ManualTaskWorkflowPrefix + command.ID,
 		TemporalRunID:      uuid.NewString(),
@@ -163,6 +172,14 @@ func TestCompiledTaskRunSnapshotV2_PausedManualRunRequiresExactCommand(
 		ctx, identity, ref); err != nil || authorized {
 		t.Fatalf("blocked manual command remained authorized=%v err=%v",
 			authorized, err)
+	}
+	blockedIdentity := identity
+	blockedIdentity.TemporalRunID = uuid.NewString()
+	if _, err := st.CreateOrGetCompiledRunSnapshotV2(
+		ctx, blockedIdentity, testCompiledRunPolicyV1(t),
+		observation.RolloutAuthority,
+	); !errors.Is(err, types.ErrNotFound) {
+		t.Fatalf("blocked manual command created a new snapshot: %v", err)
 	}
 	if err := st.AuthorizeAndConsumeTaskRunLLMQuotaV2(
 		ctx, identity, ref, quotaRule, 1,
