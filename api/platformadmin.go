@@ -20,7 +20,8 @@ const platformOwnerTenantID = types.SingleTenantID
 //     真多用户下，任一受邀用户改掉它即可劫持**所有租户**的推送通道（把机器人
 //     指向自己的飞书应用），这是跨租户完全沦陷。
 //   - /api/feishu/status、/api/feishu/test —— 泄漏 owner 身份、可向 owner 定向发卡。
-//   - /api/admin/observability、/api/admin/runstats —— 返回**全库**聚合
+//   - /api/admin/observability、/api/admin/runstats、/api/admin/cost-calls
+//     —— 返回**全库**聚合或逐笔调用账单
 //     （成本、token 用量、推送量），任一登录用户可读走全平台经营数据。
 //
 // 这些端点的正解是接缝②：配置与统计都要按租户切分（飞书凭证 per-tenant 由决议
