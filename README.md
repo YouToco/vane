@@ -122,20 +122,14 @@ tests retain CGO support. This keeps trusted exact-`main` builds from inheriting
 workstation credentials while providing an X64 fallback when the ARM64 build
 runner is unavailable.
 
-Wrangler and its Node runtime are provisioned out-of-band on the deploy VM.
+Wrangler is materialized per frontend deployment below that run's private
+`RUNNER_TEMP` directory. `actions/setup-node` pins Node `v22.23.1`, while
 [`tools/wrangler/package-lock.json`](tools/wrangler/package-lock.json) pins the
-complete dependency tree with registry integrity hashes. From an audited
-checkout, an administrator runs `scripts/provision-wrangler.sh` in a root shell.
-The script downloads the fixed official Node `v22.23.1` Linux ARM64 archive,
-checks SHA256
-`0294e8b915ab75f92c7513d2fcb830ae06e10684e6c603e99a87dbf8835389c1`,
-and uses that exact Node/npm with the committed lock. npm runs as
-`vane-deploy-runner` with dependency lifecycle scripts disabled. After Wrangler
-version and Pages-command verification, Node and the `4.115.0` dependency tree
-become root-owned/read-only. `/opt/vane-deploy-tools/wrangler` is a root-owned
-wrapper that explicitly executes the pinned Node and Wrangler entrypoint; it
-does not depend on `PATH`. Workflows verify the exact Wrangler version and never
-run npm on the deployment VM.
+complete Wrangler `4.115.0` dependency tree with registry integrity hashes.
+Lifecycle scripts are disabled; the exact version and Pages command are checked
+before provider credentials enter any step. The deploy VM therefore needs no
+out-of-band Node/Wrangler installation and a replacement runner receives the
+same verified tool environment automatically.
 
 Aliyun CLI and ossutil are installed per run below `RUNNER_TEMP` from exact
 official release archives. The installer accepts only Linux x86_64/amd64 and

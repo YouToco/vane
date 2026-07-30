@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import re
 import unittest
 
 
@@ -28,6 +29,20 @@ class WranglerLockTest(unittest.TestCase):
                 f"{path} has non-registry source {resolved!r}",
             )
             self.assertRegex(entry.get("integrity", ""), r"^sha512-[A-Za-z0-9+/]+=*$")
+
+    def test_deploy_materializes_wrangler_without_runner_preinstall(self) -> None:
+        workflow = (ROOT / ".github/workflows/deploy.yml").read_text(
+            encoding="utf-8"
+        )
+        installer = (ROOT / "scripts/install-wrangler.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Set up Node for pinned deployment tools", workflow)
+        self.assertIn("scripts/install-wrangler.sh", workflow)
+        self.assertNotIn("/opt/vane-deploy-tools/wrangler", workflow)
+        self.assertIn('npm_bin" ci --ignore-scripts --no-audit --no-fund', installer)
+        self.assertRegex(installer, re.escape('== "v22.23.1"'))
+        self.assertIn("wrangler_version=4.115.0", installer)
 
 
 if __name__ == "__main__":

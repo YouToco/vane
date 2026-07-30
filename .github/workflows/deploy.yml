@@ -386,7 +386,9 @@ jobs:
           rm -rf -- "$BUILD_ROOT"
 
   # This job receives only control-plane code and same-run artifacts. It never
-  # downloads or executes source trees, npm, or Go build/test commands.
+  # downloads or executes source trees or Go build/test commands. Frontend
+  # deploys materialize the lock-pinned Wrangler tree before any secret-bearing
+  # provider step, so runner images carry no hidden tool dependency.
   deploy:
     needs: [plan, build]
     if: >-
@@ -414,6 +416,12 @@ jobs:
           clean: true
           persist-credentials: false
           path: control-plane
+
+      - name: Set up Node for pinned deployment tools
+        if: needs.plan.outputs.frontend_changed == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22.23.1
 
       - name: Download backend artifact from this run
         if: needs.plan.outputs.backend_changed == 'true'
@@ -453,6 +461,12 @@ jobs:
           control-plane/scripts/install-aliyun.sh
           control-plane/scripts/install-ossutil.sh
 
+      - name: Install pinned Wrangler
+        if: needs.plan.outputs.frontend_changed == 'true'
+        run: |
+          control-plane/scripts/install-wrangler.sh \
+            "$DEPLOY_ROOT/wrangler"
+
       - name: Deploy backend and run production Gate
         if: needs.plan.outputs.backend_changed == 'true'
         env:
@@ -488,7 +502,7 @@ jobs:
           FRONTEND_RECEIPT_DIR: ${{ runner.temp }}/vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}/frontend-receipts
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          WRANGLER_BIN: /opt/vane-deploy-tools/wrangler
+          WRANGLER_BIN: ${{ runner.temp }}/vane-deploy-${{ github.run_id }}-${{ github.run_attempt }}/wrangler/wrangler
         run: |
           "$GITHUB_WORKSPACE/control-plane/scripts/deploy.sh" frontend-cloudflare \
             "$DEPLOY_ROOT/verified/frontend" \
