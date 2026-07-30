@@ -19,7 +19,6 @@ import (
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
-	scorerpkg "github.com/YouToco/vane/scorer"
 	"github.com/YouToco/vane/selector"
 	storepkg "github.com/YouToco/vane/store"
 	"github.com/YouToco/vane/types"
@@ -583,9 +582,14 @@ func toolEventQualificationEvidenceV2(
 	return out
 }
 
-// ScoreToolCandidatesV2 uses only the snapshot's model/prompt/quota policies
-// and its frozen task manual. Every model call is guarded by live auth and an
-// atomic V2 quota reservation.
+// ScoreToolCandidatesV2 preserves the historical Temporal activity name while
+// assigning a deterministic score to candidates that already passed the task
+// manual's qualification and evidence gates.
+//
+// Tool tasks are explicit user intent: running a second generic profile-based
+// LLM scorer after qualification can contradict the task manual and silently
+// discard valid events. The selector still applies the frozen strictness
+// threshold and Top-N ranking. Observation penalties remain authoritative.
 func (a *Activities) ScoreToolCandidatesV2(
 	ctx context.Context,
 	in ScoreToolCandidatesV2Input,
@@ -602,88 +606,17 @@ func (a *Activities) ScoreToolCandidatesV2(
 		ctx, expected, in.Run.Snapshot, in.Candidates); err != nil {
 		return nil, retryableOrNot(err)
 	}
-	if a.compiledToolModelResolverV2 == nil {
-		return nil, nonRetryable(types.NewAppError(types.CodeInternal,
-			"compiled Tool model resolver is not configured", nil))
-	}
-	modelClient, err := a.compiledToolModelResolverV2.
-		ResolveRuntimeModelPolicyV1(snapshot.Policy.ModelPolicy)
-	if err != nil {
-		return nil, nonRetryable(types.NewAppError(types.CodeValidation,
-			"compiled Tool score model route is unavailable", err))
-	}
-	consumer, ok := a.scorer.(compiledScorerV1)
-	if !ok {
-		return nil, nonRetryable(types.NewAppError(types.CodeInternal,
-			"compiled Tool scorer is unsupported", nil))
-	}
-	policy, err := scorerpkg.PrepareCompiledPolicyV1(
-		snapshot.Policy.PromptPolicy, snapshot.Policy.ModelPolicy,
-		snapshot.Policy.QuotaPolicy, modelClient)
-	if err != nil {
-		return nil, nonRetryable(types.NewAppError(types.CodeValidation,
-			"compiled Tool score policy is invalid", err))
-	}
-	taskManual := ""
-	if snapshot.Policy.PromptPolicy.TaskInstructionEnabled {
-		taskManual = snapshot.Definition.TaskManual
-	}
-	var quotaHit atomic.Bool
-	var authorizationOnce sync.Once
-	var authorizationErr error
-	scored := mapConcurrent(ctx, in.Candidates, parBatchFanout,
-		func(ctx context.Context, candidate runcontext.ToolCandidateV1) (
-			runcontext.ToolScoredCandidateV1, error,
-		) {
-			if err := a.authorizeToolEffectV2(
-				ctx, expected, in.Run.Snapshot); err != nil {
-				authorizationOnce.Do(func() { authorizationErr = err })
-				return runcontext.ToolScoredCandidateV1{}, err
-			}
-			beforeSpend := func(effectCtx context.Context, amount float64) error {
-				err := a.consumeToolLLMQuotaV2(
-					effectCtx, expected, in.Run.Snapshot,
-					snapshot.Policy.QuotaPolicy, amount)
-				if err != nil && !errors.Is(err, storepkg.ErrQuotaExceeded) {
-					authorizationOnce.Do(func() { authorizationErr = err })
-				}
-				return err
-			}
-			score, err := consumer.ScoreWithPolicyV1(
-				ctx, snapshot.Definition.TenantID, in.UserID, candidate.Item,
-				in.TraceID, taskManual, policy, beforeSpend)
-			if err != nil {
-				return runcontext.ToolScoredCandidateV1{}, err
-			}
-			score = max(0, min(100,
-				score+candidate.Item.ObservationScorePenalty))
-			return runcontext.ToolScoredCandidateV1{
-				InvocationDigest: candidate.InvocationDigest,
-				Scored: types.ScoredItem{
-					Item:  candidate.Item,
-					Score: score,
-				},
-			}, nil
-		},
-		func(candidate runcontext.ToolCandidateV1, err error) {
-			if isQuotaErr(err) {
-				quotaHit.Store(true)
-			}
-			logPipelineItemFailure(ctx,
-				"Tool V2 score failed; item skipped",
-				candidate.Item.ID, in.TraceID, err)
+	scored := make([]runcontext.ToolScoredCandidateV1, 0, len(in.Candidates))
+	for _, candidate := range in.Candidates {
+		score := max(0, min(100,
+			100+candidate.Item.ObservationScorePenalty))
+		scored = append(scored, runcontext.ToolScoredCandidateV1{
+			InvocationDigest: candidate.InvocationDigest,
+			Scored: types.ScoredItem{
+				Item:  candidate.Item,
+				Score: score,
+			},
 		})
-	if len(scored) == 0 && len(in.Candidates) > 0 {
-		if authorizationErr != nil {
-			return nil, retryableOrNot(authorizationErr)
-		}
-		if quotaHit.Load() {
-			return nil, nonRetryable(types.NewAppError(
-				types.CodeQuotaExceeded,
-				"compiled Tool LLM quota exhausted during score", nil))
-		}
-		return nil, types.NewAppError(types.CodeLLMUnavailable,
-			"compiled Tool score batch failed", nil)
 	}
 	return scored, nil
 }

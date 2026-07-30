@@ -994,6 +994,29 @@ func testProfile(userID int64) *types.Profile {
 	}
 }
 
+func assertDefaultSystemEnvironment(
+	t *testing.T,
+	got string,
+	profileSection string,
+) {
+	t.Helper()
+	prefix := systemPrompt + profileSection + environmentSection
+	if !strings.HasPrefix(got, prefix) {
+		t.Fatalf("system 固定段不符:\n实得 %q\n期望前缀 %q", got, prefix)
+	}
+	timestamp, guidance, ok := strings.Cut(
+		strings.TrimPrefix(got, prefix), "。")
+	if !ok {
+		t.Fatalf("system 缺少运行环境分隔: %q", got)
+	}
+	if _, err := time.Parse(time.RFC3339, timestamp); err != nil {
+		t.Fatalf("system UTC 时间无效: %q: %v", timestamp, err)
+	}
+	if guidance != "涉及“今天”“最近”“截至”等时间表达时必须以此为准；不得用训练记忆猜测当前日期。" {
+		t.Fatalf("system 时间纪律不符: %q", guidance)
+	}
+}
+
 // 画像注入两态（契约 §12.2 逐字文案）：有画像 → system 末尾是 profilehint.Build
 // 的单行渲染；NotFound / 读取失败 / 全空画像 / 未注入 → 一律「尚未建立。」且不失败。
 // 画像只进请求侧：M4「system 不入库」不变式对画像段同样成立。
@@ -1005,10 +1028,8 @@ func TestHandleMessage_ProfileInjection(t *testing.T) {
 		sys := runOneMessage(t, newTestLoop(t, fs, chat.fn), chat, 7)
 
 		// 契约 §12.2 锁死的尾段文案，逐字钉住（渲染格式与 scorer/cardgen 同一份 Build）。
-		want := systemPrompt + "\n\n[用户画像] 行业：金融；职业：量化研究员；关注标签：AI、宏观；摘要：关注 AI 与宏观经济。"
-		if sys != want {
-			t.Fatalf("system 画像段不符:\n实得 %q\n期望 %q", sys, want)
-		}
+		assertDefaultSystemEnvironment(t, sys,
+			"\n\n[用户画像] 行业：金融；职业：量化研究员；关注标签：AI、宏观；摘要：关注 AI 与宏观经济。")
 
 		// M4 不变式：system 不入库——画像一个字都不得随会话落库。
 		for _, m := range persistedMessages(t, fs) {
@@ -1026,10 +1047,7 @@ func TestHandleMessage_ProfileInjection(t *testing.T) {
 		chat := newChatOK()
 		sys := runOneMessage(t, newTestLoop(t, fs, chat.fn), chat, 7)
 
-		want := systemPrompt + "\n\n[用户画像] 尚未建立。"
-		if sys != want {
-			t.Fatalf("空画像段不符:\n实得 %q\n期望 %q", sys, want)
-		}
+		assertDefaultSystemEnvironment(t, sys, "\n\n[用户画像] 尚未建立。")
 	})
 
 	t.Run("画像读取 DB 失败时按空画像继续且不失败", func(t *testing.T) {
@@ -1048,9 +1066,7 @@ func TestHandleMessage_ProfileInjection(t *testing.T) {
 			t.Fatalf("降级后仍应正常回复, 实得 %q", out.Reply)
 		}
 		sys := chat.requests[0].Messages[0].Content
-		if sys != systemPrompt+"\n\n[用户画像] 尚未建立。" {
-			t.Fatalf("读取失败应按空画像继续, 实得 %q", sys)
-		}
+		assertDefaultSystemEnvironment(t, sys, "\n\n[用户画像] 尚未建立。")
 		if strings.Contains(sys, "金融") || strings.Contains(sys, "量化研究员") {
 			t.Fatalf("读取失败时不得漏出半截画像, 实得 %q", sys)
 		}
@@ -1062,9 +1078,7 @@ func TestHandleMessage_ProfileInjection(t *testing.T) {
 		chat := newChatOK()
 		sys := runOneMessage(t, newTestLoop(t, fs, chat.fn), chat, 7)
 
-		if sys != systemPrompt+"\n\n[用户画像] 尚未建立。" {
-			t.Fatalf("全空画像应走空态文案, 实得 %q", sys)
-		}
+		assertDefaultSystemEnvironment(t, sys, "\n\n[用户画像] 尚未建立。")
 	})
 
 	t.Run("Profiles 未注入时按空画像", func(t *testing.T) {
@@ -1075,9 +1089,7 @@ func TestHandleMessage_ProfileInjection(t *testing.T) {
 		l.chatFn = chat.fn
 
 		sys := runOneMessage(t, l, chat, 7)
-		if sys != systemPrompt+"\n\n[用户画像] 尚未建立。" {
-			t.Fatalf("未注入 Profiles 应按空画像, 实得 %q", sys)
-		}
+		assertDefaultSystemEnvironment(t, sys, "\n\n[用户画像] 尚未建立。")
 	})
 }
 

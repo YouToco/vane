@@ -52,6 +52,7 @@ const systemPrompt = `你是"见微 Vane"的 AI 助理，帮助主人管理周�
 const (
 	profileSectionEmpty  = "\n\n[用户画像] 尚未建立。"
 	profileSectionPrefix = "\n\n[用户画像] "
+	environmentSection   = "\n\n[运行环境] 当前 UTC 时间："
 )
 
 // exaAdHocSystemNote 是 Exa ad-hoc 工具对（web_search/read_page）在场时才注入的
@@ -3715,6 +3716,8 @@ func withSystem(base string, msgs []llm.ChatMessage, profileHint string, renderP
 		} else {
 			sys = base + profileSectionEmpty
 		}
+		sys += environmentSection + time.Now().UTC().Format(time.RFC3339) +
+			"。涉及“今天”“最近”“截至”等时间表达时必须以此为准；不得用训练记忆猜测当前日期。"
 	}
 	out := make([]llm.ChatMessage, 0, len(msgs)+1)
 	out = append(out, llm.ChatMessage{Role: "system", Content: sys})

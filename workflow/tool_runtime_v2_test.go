@@ -885,7 +885,8 @@ func TestToolCandidatePipelineV2_PreservesInvocationProvenance(
 	}
 	if len(scored) != 1 ||
 		scored[0].InvocationDigest != invocation ||
-		scored[0].Scored.Score != 88 {
+		scored[0].Scored.Score != 100 ||
+		scorer.calls.Load() != 0 {
 		t.Fatalf("scored candidates = %+v", scored)
 	}
 
@@ -929,8 +930,8 @@ func TestToolCandidatePipelineV2_PreservesInvocationProvenance(
 
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.recentSimhashCalls != 1 || st.quotaCalls != 2 ||
-		st.authorizeCalls != 2 {
+	if st.recentSimhashCalls != 1 || st.quotaCalls != 1 ||
+		st.authorizeCalls != 1 {
 		t.Fatalf("Tool pipeline gates: simhash=%d quota=%d authorize=%d",
 			st.recentSimhashCalls, st.quotaCalls, st.authorizeCalls)
 	}

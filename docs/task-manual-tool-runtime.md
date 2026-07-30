@@ -194,6 +194,13 @@ live Tool candidates.
   differ, but it must remain inside the deterministic observation window.
 - `no_match`, uncertain model output, malformed citations and unavailable
   evidence all stop before score, card generation and push.
+- A qualified Tool-task event is already matched to explicit user intent in
+  the task manual. The retained `ScoreToolCandidatesV2` Temporal activity
+  therefore assigns a deterministic high score (subject only to sealed
+  observation penalties); it does not call the generic profile-interest
+  scorer. Frozen strictness and Top-N still apply in selection. This prevents
+  an empty or unrelated profile from overruling the task the user explicitly
+  asked Vane to monitor, while preserving replay-compatible activity names.
 - Card generation follows explicit output fields in the task manual. Its
   generic three-part layout is only a default. The model cannot author URLs:
   official and cross-evidence links are rendered from the admitted canonical
