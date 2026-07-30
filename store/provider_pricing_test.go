@@ -185,6 +185,57 @@ func TestProviderPricingLedger(t *testing.T) {
 	// 官方规则：$7/千次包含 10 条结果，超出的每条按 $1/千次。
 	assertPricingReceipt(t, st, "tool_calls", exaSearchID, exaRuleID, "calculated", "USD", 0.017)
 
+	tikhubTraceID := "pricing-tikhub-xhs-" + suffix
+	tikhubUnknownTraceID := "pricing-tikhub-unknown-" + suffix
+	t.Cleanup(func() {
+		cctx, cancel := cleanupContext()
+		defer cancel()
+		cleanupExec(cctx, t, st, `DELETE FROM tool_calls WHERE trace_id = ANY($1)`,
+			[]string{tikhubTraceID, tikhubUnknownTraceID})
+	})
+	const xhsSearchPath = "/api/v1/xiaohongshu/app_v2/search_notes"
+	var tikhubRuleID int64
+	if err := st.pool.QueryRow(ctx,
+		`SELECT id
+		   FROM provider_price_rules
+		  WHERE provider='tikhub' AND resource=$1 AND meter='request'
+		    AND effective_to IS NULL`,
+		xhsSearchPath,
+	).Scan(&tikhubRuleID); err != nil {
+		t.Fatalf("读取 TikHub 小红书价格: %v", err)
+	}
+	tikhubID, err := st.InsertToolCall(ctx, &types.ToolCall{
+		TraceID: tikhubTraceID, Provider: "tikhub",
+		ToolName:     "xiaohongshu_app_v2_search_notes",
+		ToolKind:     types.ToolCallKindBindingFetch,
+		EndpointPath: xhsSearchPath, HTTPStatus: &okStatus, UsageQuantity: 1,
+	})
+	if err != nil {
+		t.Fatalf("写入 TikHub 小红书用量: %v", err)
+	}
+	assertPricingReceipt(t, st, "tool_calls", tikhubID, tikhubRuleID, "calculated", "USD", 0.01)
+
+	tikhubUnknownID, err := st.InsertToolCall(ctx, &types.ToolCall{
+		TraceID: tikhubUnknownTraceID, Provider: "tikhub",
+		ToolName:     "unknown_tikhub_tool",
+		ToolKind:     types.ToolCallKindBindingFetch,
+		EndpointPath: "/api/v1/unknown", HTTPStatus: &okStatus, UsageQuantity: 1,
+	})
+	if err != nil {
+		t.Fatalf("写入未知 TikHub 端点用量: %v", err)
+	}
+	var tikhubWildcardRuleID int64
+	if err := st.pool.QueryRow(ctx,
+		`SELECT id
+		   FROM provider_price_rules
+		  WHERE provider='tikhub' AND resource='*' AND meter='request'
+		    AND effective_to IS NULL`,
+	).Scan(&tikhubWildcardRuleID); err != nil {
+		t.Fatalf("读取 TikHub 保守兜底价格: %v", err)
+	}
+	assertPricingReceipt(t, st, "tool_calls", tikhubUnknownID,
+		tikhubWildcardRuleID, "estimated", "USD", 0.01)
+
 	upstreamAmount := 0.12345678
 	reportedID, err := st.InsertToolCall(ctx, &types.ToolCall{
 		TraceID: "pricing-tool-provider-" + suffix, Provider: provider,

@@ -199,13 +199,62 @@ SELECT provider, resource, 'request', 'USD', unit_price, included_quantity,
   FROM (VALUES
     ('exa', '/search', 0.007::numeric, 10::numeric, 0.001::numeric, 'https://exa.ai/pricing'),
     ('exa', '/contents', 0.001::numeric, 1::numeric, 0.001::numeric, 'https://exa.ai/pricing'),
-    ('tikhub', '*', 0.001::numeric, 1::numeric, 0.001::numeric, 'https://docs.tikhub.io/4592751m0')
+    -- TikHub 的通用页面只承诺“多数服务”基础价，不能据此把所有端点都算成
+    -- $0.001。以下 exact 路径沿用已由 provider 使用日志核对的价格；未知路径
+    -- 用保守 wildcard 估算并在调用回执上标 estimated，管理员可随时版本化修正。
+    ('tikhub', '/api/v1/xiaohongshu/app_v2/search_notes',
+     0.010::numeric, 1::numeric, 0.010::numeric, 'https://docs.tikhub.io/4592751m0'),
+    ('tikhub', '/api/v1/xiaohongshu/app_v2/get_user_posted_notes',
+     0.010::numeric, 1::numeric, 0.010::numeric, 'https://docs.tikhub.io/4592751m0'),
+    ('tikhub', '/api/v1/xiaohongshu/app_v2/get_topic_feed',
+     0.010::numeric, 1::numeric, 0.010::numeric, 'https://docs.tikhub.io/4592751m0'),
+    ('tikhub', '/api/v1/xiaohongshu/app_v2/get_user_faved_notes',
+     0.010::numeric, 1::numeric, 0.010::numeric, 'https://docs.tikhub.io/4592751m0'),
+    ('tikhub', '/api/v1/xiaohongshu/web_v3/fetch_note_detail',
+     0.010::numeric, 1::numeric, 0.010::numeric, 'https://docs.tikhub.io/4592751m0'),
+    ('tikhub', '/api/v1/xiaohongshu/web_v3/fetch_hot_list',
+     0.001::numeric, 1::numeric, 0.001::numeric, 'https://docs.tikhub.io/4592751m0'),
+    ('tikhub', '/api/v1/twitter/web/fetch_user_post_tweet',
+     0.001::numeric, 1::numeric, 0.001::numeric, 'https://docs.tikhub.io/4592751m0'),
+    ('tikhub', '/api/v1/wechat_mp/v2/fetch_account_articles',
+     0.010::numeric, 1::numeric, 0.010::numeric, 'https://docs.tikhub.io/4592751m0'),
+    ('tikhub', '*',
+     0.010::numeric, 1::numeric, 0.010::numeric, 'https://docs.tikhub.io/4592751m0')
   ) seed(provider, resource, unit_price, included_quantity, additional_unit_price, source_url);
 
 GRANT SELECT, INSERT, UPDATE ON provider_price_rules TO vane_app;
 GRANT USAGE, SELECT ON SEQUENCE provider_price_rules_id_seq TO vane_app;
 
 -- +goose Down
+
+-- 与三个业务 writer 共用 advisory fence；拿到 exclusive 后再取表锁，
+-- 保证“检查为空 → DROP”之间不会插入一条刚发生的付费回执。
+SELECT pg_advisory_xact_lock(
+    hashtextextended('vane-provider-pricing-v1', 0)
+);
+LOCK TABLE provider_price_rules, llm_calls, tool_calls
+    IN ACCESS EXCLUSIVE MODE;
+
+-- +goose StatementBegin
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM llm_calls WHERE pricing_status <> 'legacy'
+    ) OR EXISTS (
+        SELECT 1 FROM tool_calls WHERE pricing_status <> 'legacy'
+    ) OR EXISTS (
+        SELECT 1
+          FROM provider_price_rules
+         WHERE created_by IS NOT NULL
+            OR change_id <> ''
+            OR effective_to IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION
+            'refusing Down while provider pricing ledger state exists';
+    END IF;
+END
+$$;
+-- +goose StatementEnd
 
 REVOKE ALL ON SEQUENCE provider_price_rules_id_seq FROM vane_app;
 REVOKE ALL ON provider_price_rules FROM vane_app;

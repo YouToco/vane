@@ -235,7 +235,9 @@ func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID
 		`SELECT COALESCE(sum(lc.cost_usd), 0),
 		        count(*),
 		        count(lc.cost_amount),
-		        count(*) FILTER (WHERE lc.pricing_status = 'estimated'),
+		        count(*) FILTER (
+		            WHERE lc.pricing_status IN ('estimated', 'legacy')
+		        ),
 		        COALESCE(sum(lc.prompt_tokens), 0),
 		        COALESCE(sum(lc.prompt_cache_hit_tokens), 0),
 		        COALESCE(sum(lc.prompt_cache_miss_tokens), 0),
@@ -265,7 +267,9 @@ func (s *Store) GetScheduleRunCost(ctx context.Context, userID int64, scheduleID
 		 SELECT COALESCE(sum(tc.cost_usd), 0),
 		        count(*),
 		        count(tc.cost_amount),
-		        count(*) FILTER (WHERE tc.pricing_status = 'estimated')
+		        count(*) FILTER (
+		            WHERE tc.pricing_status IN ('estimated', 'legacy')
+		        )
 		   FROM tool_calls tc
 		   JOIN authorized_task task
 		     ON tc.tenant_id IS NOT DISTINCT FROM task.tenant_id

@@ -52,7 +52,6 @@ type CostCoverageV1 string
 const (
 	CostCoverageNoneV1               CostCoverageV1 = "none"
 	CostCoverageLLMOnlyV1            CostCoverageV1 = "llm_only"
-	CostCoverageLLMPartialV1         CostCoverageV1 = "llm_partial"
 	CostCoverageToolsOnlyV1          CostCoverageV1 = "tools_only"
 	CostCoverageToolsPartialV1       CostCoverageV1 = "tools_partial"
 	CostCoverageLLMAndToolsV1        CostCoverageV1 = "llm_and_tools"
@@ -394,11 +393,7 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 		}
 	case llmKnown:
 		out.KnownCostUSD = *in.LLMCostUSD
-		if llmComplete {
-			out.Coverage = CostCoverageLLMOnlyV1
-		} else {
-			out.Coverage = CostCoverageLLMPartialV1
-		}
+		out.Coverage = CostCoverageLLMOnlyV1
 		llmCalls, pricedLLMCalls := *in.LLMCalls, *llmPriced
 		out.LLMCalls = &llmCalls
 		out.LLMPricedCalls = &pricedLLMCalls
@@ -474,15 +469,17 @@ func projectUsageV1(in UsageV1) UsageProjectionV1 {
 		budget := *in.BudgetUSD
 		out.BudgetUSD = &budget
 		ratio := out.KnownCostUSD / budget
+		exactComparable := out.Coverage == CostCoverageLLMAndToolsV1 &&
+			llmComplete && toolsComplete && usdBudgetComparable
 		switch {
+		case !exactComparable:
+			out.BudgetState = BudgetIncompleteV1
 		case ratio >= 1:
 			out.BudgetState = BudgetExhaustedV1
 		case ratio >= 0.8:
 			out.BudgetState = BudgetWarningV1
-		case out.Coverage == CostCoverageLLMAndToolsV1 && usdBudgetComparable:
-			out.BudgetState = BudgetOKV1
 		default:
-			out.BudgetState = BudgetIncompleteV1
+			out.BudgetState = BudgetOKV1
 		}
 	}
 	return out

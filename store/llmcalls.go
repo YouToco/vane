@@ -55,8 +55,11 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 	}
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`WITH stamp AS (
-		   SELECT statement_timestamp() AS at
+		`WITH guard AS MATERIALIZED (
+		   SELECT pg_advisory_xact_lock_shared(hashtextextended($23, 0))
+		 ),
+		 stamp AS (
+		   SELECT statement_timestamp() AS at FROM guard
 		 ),
 		 price AS (
 		   SELECT pr.id, pr.currency,
@@ -117,6 +120,7 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 		c.PromptTokens, c.CompletionTokens, c.LatencyMs, c.CostUSD,
 		c.PrefixCacheHit, c.Temperature, c.MaxTokens, c.Error,
 		c.PromptCacheHitTokens, c.PromptCacheMissTokens, c.ReasoningTokens, c.TenantID,
+		providerPricingLedgerLock,
 	).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "写入 llm_calls 记录", err)

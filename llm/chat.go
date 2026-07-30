@@ -284,10 +284,6 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	if err := json.Unmarshal(raw, &cr); err != nil {
 		return nil, types.NewAppError(types.CodeLLMUnavailable, "llm: 响应体不是合法 JSON", err)
 	}
-	if len(cr.Choices) == 0 {
-		return nil, types.NewAppError(types.CodeLLMUnavailable, "llm: 响应缺少 choices", nil)
-	}
-
 	respModel := cr.Model
 	if respModel == "" {
 		respModel = model
@@ -312,6 +308,11 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		ReasoningTokensReported: reasoningReported,
 		Model:                   respModel,
 		LatencyMs:               int(time.Since(start).Milliseconds()),
+	}
+	if len(cr.Choices) == 0 {
+		// HTTP 200 已携带 usage 时，即使业务响应缺 choices 也必须把 metadata
+		// 交给 DoChat 落账；调用方仍只收到固定错误，不暴露不完整响应。
+		return resp, types.NewAppError(types.CodeLLMUnavailable, "llm: 响应缺少 choices", nil)
 	}
 	turn, err := adaptAssistantTurn(cr.Choices[0], assistantTurnOptions{
 		Provider:      c.provider,

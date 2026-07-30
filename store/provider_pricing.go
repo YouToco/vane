@@ -19,6 +19,8 @@ import (
 const (
 	PriceMeterLLMTokens = "llm_tokens"
 	PriceMeterRequest   = "request"
+
+	providerPricingLedgerLock = "vane-provider-pricing-v1"
 )
 
 // ProviderPriceRule is an immutable price version. Updating a price closes the
@@ -227,6 +229,12 @@ func (s *Store) ReplaceProviderPriceRule(
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))`,
+		providerPricingLedgerLock,
+	); err != nil {
+		return nil, types.NewAppError(types.CodeDatabase, "锁定供应商价格账本", err)
+	}
 	var dbNow time.Time
 	if err := tx.QueryRow(ctx, `SELECT statement_timestamp()`).Scan(&dbNow); err != nil {
 		return nil, types.NewAppError(types.CodeDatabase, "读取数据库时间", err)

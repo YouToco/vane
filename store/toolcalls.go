@@ -39,8 +39,11 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 	}
 	var id int64
 	err := s.pool.QueryRow(ctx,
-		`WITH stamp AS (
-		   SELECT statement_timestamp() AS at
+		`WITH guard AS MATERIALIZED (
+		   SELECT pg_advisory_xact_lock_shared(hashtextextended($21, 0))
+		 ),
+		 stamp AS (
+		   SELECT statement_timestamp() AS at FROM guard
 		 ),
 		 price AS (
 		   SELECT pr.id, pr.currency,
@@ -105,6 +108,7 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 		c.EndpointPath, c.Arguments, c.ResultPreview, c.ResultSize, c.HTTPStatus,
 		c.ErrorType, c.Error, c.DurationMs, c.RetrievalQuery, cands,
 		c.CostUSD, c.SourceID, c.TenantID, c.Provider, c.UsageQuantity,
+		providerPricingLedgerLock,
 	).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "写入 tool_calls 记录", err)

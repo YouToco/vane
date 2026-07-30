@@ -157,7 +157,7 @@ func TestProjectUsageV1NeverClaimsUnknownToolCostIsZero(t *testing.T) {
 		LLMPricedCalls:    &llmPriced,
 		LLMEstimatedCalls: &estimatedLLM,
 	})
-	if estimated.Coverage != CostCoverageLLMPartialV1 ||
+	if estimated.Coverage != CostCoverageLLMOnlyV1 ||
 		estimated.LLMEstimatedCalls == nil ||
 		*estimated.LLMEstimatedCalls != 1 {
 		t.Fatalf("estimated LLM price was presented as complete: %#v", estimated)
@@ -234,6 +234,22 @@ func TestProjectUsageV1BudgetStatesAndInvalidMoney(t *testing.T) {
 	})
 	if mixedCurrency.BudgetState != BudgetIncompleteV1 {
 		t.Fatalf("CNY amount cannot be compared to a USD budget: %#v", mixedCurrency)
+	}
+	estimatedHighCost := 20.0
+	oneEstimated := int64(1)
+	estimatedHigh := projectUsageV1(UsageV1{
+		LLMCostUSD:         &estimatedHighCost,
+		LLMCalls:           &oneCall,
+		LLMPricedCalls:     &priced,
+		LLMEstimatedCalls:  &oneEstimated,
+		ToolCostUSD:        &zero,
+		ToolCalls:          &zeroCalls,
+		ToolPricedCalls:    &zeroCalls,
+		ToolEstimatedCalls: &zeroCalls,
+		BudgetUSD:          &budget,
+	})
+	if estimatedHigh.BudgetState != BudgetIncompleteV1 {
+		t.Fatalf("estimated amount must not claim budget exhaustion: %#v", estimatedHigh)
 	}
 }
 
