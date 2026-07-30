@@ -14,7 +14,7 @@ env:
 
 jobs:
   test:
-    runs-on: [self-hosted, Linux, ARM64, vane-test]
+    runs-on: [self-hosted, Linux, vane-test]
 
     services:
       postgres:
