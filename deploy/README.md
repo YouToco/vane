@@ -29,9 +29,9 @@
   在无生产凭证的 build runner 上完成完整 Gate 和构建，再由隔离的 deploy runner
   校验制品、上传到 `/opt/vane/bin/vane` 并交给 systemd 管理。源仓库 CI 不持有生产凭证，
   也不直接部署。
-- Web Dashboard（vane-web 仓库）由其 CI 构建，dist 内容 scp 到 `/opt/vane/web/`，
-  compose 里以只读卷 `./web:/srv/vane-web:ro` 挂给 Caddy 做静态托管；
-  两个仓库共用同一组 CI secrets（VPS_HOST/VPS_PORT/VPS_USER/VPS_SSH_KEY）。
+- Web Dashboard 同样由私有 `vane-deploy` 控制面按 `vane-web/main` 的精确 SHA
+  独立 Gate 和构建；经制品校验后分别发布到 OSS/CDN 与 Cloudflare Pages。
+  前后端源仓库都不持有生产 secrets。
 - Caddy 用 host 网络：主域名托管 SPA + 反代 /api，api 子域整体反代 8080，证书自动签发。
 
 ## 首次部署（bootstrap）
