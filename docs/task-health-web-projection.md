@@ -17,8 +17,10 @@ responses, SQL/driver errors, workflow IDs, stage names, and raw
 `check_failed + contact_support`.
 
 Successful-but-partial checks remain useful and are presented as incomplete
-coverage, not as total failure. A known failing source takes precedence because
-it gives the user a concrete action.
+coverage, not as total failure. A known failing acquisition route takes
+precedence because it gives the user a concrete action. The projection never
+reintroduces a Source object or Source-management action: the user reviews the
+task manual and lets the Agent recompile its internal Tool calls.
 
 ## Cost truthfulness
 
@@ -40,6 +42,5 @@ Deleting a task remains owner-only. The Web client must render from these
 booleans and must not infer authority merely because a button component exists.
 When `can_view_usage=false`, the server omits the usage object entirely.
 
-The package currently has no API call point. It can be wired after the
-task-playbook runtime cutover freezes the schedule detail contract. A repository
-guard keeps production imports at zero until that rollout is intentional.
+The package is exposed only through the task-scoped Brief Web projection after
+the task-playbook cutover. It has no Feishu, workflow, or model call point.

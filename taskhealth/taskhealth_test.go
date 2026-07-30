@@ -17,7 +17,7 @@ func TestProjectV1HealthyAndPartialResults(t *testing.T) {
 		SourceCoverage: types.RunCompletenessComplete,
 		Processing:     types.RunCompletenessComplete,
 		FinalizedAt:    now,
-	}, SourceSummaryV1{Total: 2}, UsageV1{}, AccessV1{})
+	}, AcquisitionSummaryV1{Total: 2}, UsageV1{}, AccessV1{})
 	if healthy.State != StateHealthyV1 || healthy.Issue != IssueNoneV1 {
 		t.Fatalf("healthy projection = %#v", healthy)
 	}
@@ -27,7 +27,7 @@ func TestProjectV1HealthyAndPartialResults(t *testing.T) {
 		SourceCoverage: types.RunCompletenessPartial,
 		Processing:     types.RunCompletenessComplete,
 		FinalizedAt:    now,
-	}, SourceSummaryV1{Total: 2}, UsageV1{}, AccessV1{})
+	}, AcquisitionSummaryV1{Total: 2}, UsageV1{}, AccessV1{})
 	if partial.State != StateAttentionV1 ||
 		partial.Issue != IssueCoverageIncompleteV1 ||
 		partial.RecommendedAction != ActionWaitForRetryV1 {
@@ -41,10 +41,10 @@ func TestProjectV1SourceFailureTakesPrecedence(t *testing.T) {
 		SourceCoverage: types.RunCompletenessPartial,
 		Processing:     types.RunCompletenessPartial,
 		FinalizedAt:    time.Now(),
-	}, SourceSummaryV1{Total: 2, Failing: 1, MaxFailCount: 4},
+	}, AcquisitionSummaryV1{Total: 2, Failing: 1, MaxFailCount: 4},
 		UsageV1{}, AccessV1{})
-	if got.Issue != IssueSourcesUnavailableV1 ||
-		got.RecommendedAction != ActionReviewSourcesV1 {
+	if got.Issue != IssueAcquisitionUnavailableV1 ||
+		got.RecommendedAction != ActionReviewTaskV1 {
 		t.Fatalf("source failure projection = %#v", got)
 	}
 }
@@ -58,7 +58,7 @@ func TestProjectV1SanitizesFailureCodes(t *testing.T) {
 	}{
 		{string(types.CodeQuotaExceeded), IssueQuotaPausedV1, ActionReviewUsageV1},
 		{string(types.CodeLLMRateLimit), IssueModelUnavailableV1, ActionWaitForRetryV1},
-		{string(types.CodeFetchTimeout), IssueSourcesUnavailableV1, ActionReviewSourcesV1},
+		{string(types.CodeFetchTimeout), IssueAcquisitionUnavailableV1, ActionReviewTaskV1},
 		{string(types.CodePushFailed), IssueDeliveryFailedV1, ActionReviewDeliveryV1},
 		{"workflow_terminated", IssueCheckInterruptedV1, ActionRunAgainV1},
 		{"postgres password=secret", IssueCheckFailedV1, ActionContactSupportV1},
@@ -71,7 +71,7 @@ func TestProjectV1SanitizesFailureCodes(t *testing.T) {
 				Processing:     types.RunCompletenessPartial,
 				FailureCode:    test.code,
 				FinalizedAt:    now,
-			}, SourceSummaryV1{}, UsageV1{}, AccessV1{})
+			}, AcquisitionSummaryV1{}, UsageV1{}, AccessV1{})
 			if got.Issue != test.issue || got.RecommendedAction != test.action {
 				t.Fatalf("projection = %#v", got)
 			}
@@ -154,7 +154,7 @@ func TestProjectV1MalformedFactsFailClosed(t *testing.T) {
 	got := ProjectV1(&LatestCheckV1{
 		Result:      types.RunResultContent,
 		FinalizedAt: time.Now(),
-	}, SourceSummaryV1{Total: 0, Failing: 2}, UsageV1{}, AccessV1{})
+	}, AcquisitionSummaryV1{Total: 0, Failing: 2}, UsageV1{}, AccessV1{})
 	if got.State != StateAttentionV1 || got.Issue != IssueCheckFailedV1 {
 		t.Fatalf("malformed facts projected healthy: %#v", got)
 	}
@@ -164,7 +164,7 @@ func TestProjectV1OmitsUsageWithoutPermission(t *testing.T) {
 	cost := 6.0
 	calls := int64(2)
 	budget := 10.0
-	got := ProjectV1(nil, SourceSummaryV1{}, UsageV1{
+	got := ProjectV1(nil, AcquisitionSummaryV1{}, UsageV1{
 		LLMCostUSD: &cost,
 		LLMCalls:   &calls,
 		BudgetUSD:  &budget,
@@ -175,7 +175,7 @@ func TestProjectV1OmitsUsageWithoutPermission(t *testing.T) {
 }
 
 func TestProjectionV1JSONOmitsInvalidWindowAndUsesSnakeCase(t *testing.T) {
-	got := ProjectV1(nil, SourceSummaryV1{}, UsageV1{},
+	got := ProjectV1(nil, AcquisitionSummaryV1{}, UsageV1{},
 		AccessV1{Role: types.MembershipRoleOwner})
 	raw, err := json.Marshal(got)
 	if err != nil {
@@ -187,8 +187,8 @@ func TestProjectionV1JSONOmitsInvalidWindowAndUsesSnakeCase(t *testing.T) {
 			t.Fatalf("projection leaked invalid JSON field %q: %s", forbidden, text)
 		}
 	}
-	if !strings.Contains(text, `"sources":{"total":0,"failing":0,"max_fail_count":0}`) {
-		t.Fatalf("source JSON shape mismatch: %s", text)
+	if !strings.Contains(text, `"acquisition":{"total":0,"failing":0,"max_fail_count":0}`) {
+		t.Fatalf("acquisition JSON shape mismatch: %s", text)
 	}
 }
 

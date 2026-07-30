@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/YouToco/vane/store"
+	"github.com/YouToco/vane/taskhealth"
 	"github.com/YouToco/vane/types"
 )
 
@@ -32,6 +33,7 @@ type taskBriefPageResponseV1 struct {
 	Total         int64                     `json:"total"`
 	NextPageToken string                    `json:"next_page_token,omitempty"`
 	LatestCheck   *store.TaskLatestCheckV1  `json:"latest_check,omitempty"`
+	Health        *taskhealth.ProjectionV1  `json:"health,omitempty"`
 }
 
 func publicTaskBriefPageV1(
