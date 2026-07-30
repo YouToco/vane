@@ -207,21 +207,25 @@ def is_manifest(path: str) -> bool:
     )
 
 
+def write_text_lf(path: Path, value: str) -> None:
+    # Path.write_text gained its newline parameter only in newer Python
+    # releases. The production runner intentionally uses the distribution
+    # Python, so use the long-supported open() contract while preserving
+    # deterministic UTF-8/LF release receipts.
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(value)
+
+
 def write_list(path: Path, values: list[str]) -> None:
-    path.write_text(
-        "".join(f"{value}\n" for value in values),
-        encoding="utf-8",
-        newline="\n",
-    )
+    write_text_lf(path, "".join(f"{value}\n" for value in values))
 
 
 def write_sized_list(
     path: Path, values: list[str], files: dict[str, Path]
 ) -> None:
-    path.write_text(
+    write_text_lf(
+        path,
         "".join(f"{files[value].stat().st_size}\t{value}\n" for value in values),
-        encoding="utf-8",
-        newline="\n",
     )
 
 
@@ -358,10 +362,9 @@ def plan(dist: Path, source_sha: str, output: Path) -> None:
     )
     write_list(output / "cdn-refresh-paths.list", cdn_refresh_paths)
     write_list(output / "html-before-entry.list", html_before_entry)
-    (output / "release.json").write_text(
+    write_text_lf(
+        output / "release.json",
         json.dumps(receipt, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
     )
 
 
