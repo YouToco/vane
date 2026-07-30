@@ -41,6 +41,9 @@ func TestRenderUserContainsOnlyBoundedCandidates(t *testing.T) {
 		!strings.Contains(rendered, "【本轮候选】") {
 		t.Fatalf("rendered request omitted candidate boundary: %s", rendered)
 	}
+	if !strings.Contains(rendered, `"url_host":"openai.com"`) {
+		t.Fatalf("rendered request omitted derived URL host: %s", rendered)
+	}
 	if strings.Count(rendered, "候选正文") >= 1000 {
 		t.Fatal("candidate content was not bounded")
 	}
@@ -99,6 +102,7 @@ func TestSystemPromptIncludesEvidenceTimeContract(t *testing.T) {
 	for _, required := range []string{
 		"任务手册",
 		"官方原始页面",
+		"官方身份看 URL 主机名",
 		"evidence_content_ids 第一项必须是该官方页面",
 		"只有媒体报道、转载或没有正文的搜索结果时不得 match",
 	} {

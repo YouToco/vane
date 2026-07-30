@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -175,6 +176,7 @@ func renderUser(req Request) (string, error) {
 		ID          int64  `json:"id"`
 		Title       string `json:"title"`
 		URL         string `json:"url"`
+		URLHost     string `json:"url_host"`
 		PublishedAt string `json:"published_at,omitempty"`
 		Content     string `json:"content"`
 	}
@@ -184,9 +186,13 @@ func renderUser(req Request) (string, error) {
 		if item.PublishedAt != nil {
 			published = item.PublishedAt.UTC().Format(time.RFC3339)
 		}
+		urlHost := ""
+		if parsed, parseErr := url.Parse(item.URL); parseErr == nil {
+			urlHost = strings.ToLower(parsed.Hostname())
+		}
 		candidates = append(candidates, candidate{
 			ID: item.ID, Title: promptguard.Sanitize(promptguard.SingleLine(item.Title)),
-			URL: item.URL, PublishedAt: published,
+			URL: item.URL, URLHost: urlHost, PublishedAt: published,
 			Content: promptguard.TruncateRunes(
 				promptguard.Sanitize(strings.TrimSpace(item.Content)), maxCandidateRunes),
 		})

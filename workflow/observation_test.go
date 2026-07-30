@@ -19,6 +19,7 @@ func TestValidateQualifiedEventsRejectsForgedTimeAndEvidence(t *testing.T) {
 	window := observation.Window{Start: published.Add(-24 * time.Hour), End: published}
 	item := types.ContentItem{
 		ID: 11, URL: "https://openai.com/index/model",
+		Title: "GPT Test", Content: "GPT Test is generally available.",
 		PublishedAt: &published, ContentHash: "hash",
 	}
 	base := eventqualifier.Result{Outcome: "match", Events: []eventqualifier.Event{{
@@ -142,11 +143,13 @@ func TestValidateQualifiedEventsEnforcesManualEvidencePair(t *testing.T) {
 	items := []types.ContentItem{
 		{
 			ID: 21, URL: "https://openai.com/release",
-			Content: "official release body", PublishedAt: &officialAt,
+			Title: "GPT Test", Content: "GPT Test official release body",
+			PublishedAt: &officialAt,
 		},
 		{
 			ID: 22, URL: "https://media.example/report",
-			Content: "independent report", PublishedAt: &crossAt,
+			Title: "GPT Test ships", Content: "Independent GPT Test report",
+			PublishedAt: &crossAt,
 		},
 	}
 	result := eventqualifier.Result{
@@ -174,6 +177,108 @@ func TestValidateQualifiedEventsEnforcesManualEvidencePair(t *testing.T) {
 		"监控 OpenAI；必须有官方原文交叉核验；输出交叉证据。", result,
 	); err == nil {
 		t.Fatal("manual cross-evidence requirement admitted one source")
+	}
+}
+
+func TestValidateQualifiedEventsKeepsValidEventFromMixedBatch(t *testing.T) {
+	policy := workflowEventPolicy(t)
+	policy.Event.Subject = "Frontier AI releases"
+	policy.Evidence.Requirement = observation.EvidenceTrustedAllowed
+	policy.Evidence.OfficialDomains = nil
+	digest, err := observation.PolicyDigest(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releasedAt := time.Date(2026, 7, 24, 17, 0, 0, 0, time.UTC)
+	crossAt := releasedAt.Add(time.Hour)
+	window := observation.Window{
+		Start: releasedAt.Add(-time.Hour), End: crossAt.Add(time.Hour),
+	}
+	items := []types.ContentItem{
+		{
+			ID: 1, URL: "https://releasebot.io/updates/anthropic/claude-opus-5",
+			Title: "Claude Opus 5", Content: "Claude Opus 5 release tracker",
+			PublishedAt: &releasedAt,
+		},
+		{
+			ID: 2, URL: "https://blog.google/products/google-cloud/managed-agents/",
+			Title:       "Google Managed Agents",
+			Content:     "Google Managed Agents are generally available",
+			PublishedAt: &releasedAt,
+		},
+		{
+			ID: 3, URL: "https://gcn.com/cloud/google-managed-agents",
+			Title:       "Google Managed Agents launch",
+			Content:     "Google Managed Agents reach general availability",
+			PublishedAt: &crossAt,
+		},
+	}
+	result := eventqualifier.Result{Outcome: "match", Events: []eventqualifier.Event{
+		{
+			EventType: "model_release", Subject: "Frontier AI releases",
+			ReleaseIdentifier: "Claude Opus 5",
+			OccurredAt:        releasedAt.Format(time.RFC3339),
+			Qualification: string(
+				observation.QualificationGeneralAvailability),
+			EvidenceContentIDs: []int64{1, 3},
+		},
+		{
+			EventType: "model_release", Subject: "Frontier AI releases",
+			ReleaseIdentifier: "Google Managed Agents",
+			OccurredAt:        releasedAt.Format(time.RFC3339),
+			Qualification: string(
+				observation.QualificationGeneralAvailability),
+			EvidenceContentIDs: []int64{2, 3},
+		},
+	}}
+	got, outcome, err := (&Activities{}).validateQualifiedEvents(
+		policy, digest, window, items,
+		"监控 Anthropic 和 Google 官方原文；必须交叉核验。", result)
+	if err != nil || outcome != "match" || len(got) != 1 || got[0].ID != 2 {
+		t.Fatalf("mixed batch got=%+v outcome=%q err=%v", got, outcome, err)
+	}
+}
+
+func TestValidateQualifiedEventsRejectsUnrelatedCrossEvidence(t *testing.T) {
+	policy := workflowEventPolicy(t)
+	policy.Evidence.Requirement = observation.EvidenceTrustedAllowed
+	policy.Evidence.OfficialDomains = nil
+	digest, err := observation.PolicyDigest(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releasedAt := time.Date(2026, 7, 24, 17, 0, 0, 0, time.UTC)
+	crossAt := releasedAt.Add(time.Hour)
+	window := observation.Window{
+		Start: releasedAt.Add(-time.Hour), End: crossAt.Add(time.Hour),
+	}
+	items := []types.ContentItem{
+		{
+			ID: 1, URL: "https://openai.com/index/gpt-live-transcribe",
+			Title:       "GPT Live Transcribe",
+			Content:     "GPT Live Transcribe adds transcription",
+			PublishedAt: &releasedAt,
+		},
+		{
+			ID: 2, URL: "https://media.example/gpt-5-6-arc-agi",
+			Title:       "GPT 5.6 ARC-AGI settings",
+			Content:     "Testing GPT 5.6 on ARC-AGI",
+			PublishedAt: &crossAt,
+		},
+	}
+	result := eventqualifier.Result{Outcome: "match", Events: []eventqualifier.Event{{
+		EventType: "model_release", Subject: "OpenAI models",
+		ReleaseIdentifier: "GPT Live Transcribe transcription",
+		OccurredAt:        releasedAt.Format(time.RFC3339),
+		Qualification: string(
+			observation.QualificationGeneralAvailability),
+		EvidenceContentIDs: []int64{1, 2},
+	}}}
+	if _, _, err := (&Activities{}).validateQualifiedEvents(
+		policy, digest, window, items,
+		"监控 OpenAI 官方原文；必须交叉核验。", result,
+	); err == nil || types.CodeOf(err) != types.CodeValidation {
+		t.Fatalf("unrelated cross evidence err=%v", err)
 	}
 }
 

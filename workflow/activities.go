@@ -2944,51 +2944,51 @@ func (a *Activities) validateQualifiedEvents(
 				observation.Qualification(event.Qualification)) ||
 			len(event.EvidenceContentIDs) == 0 ||
 			len(event.EvidenceContentIDs) > 8 {
-			return nil, "", nonRetryable(types.NewAppError(
-				types.CodeValidation, "qualified event differs from approved definition", nil))
+			continue
 		}
 		occurredAt, err := time.Parse(time.RFC3339, event.OccurredAt)
 		if err != nil || !admission.Contains(occurredAt.UTC()) {
-			return nil, "", nonRetryable(types.NewAppError(
-				types.CodeValidation, "qualified event time is outside the approved window", err))
+			continue
 		}
 		if requireCross && len(event.EvidenceContentIDs) < 2 {
-			return nil, "", nonRetryable(types.NewAppError(
-				types.CodeValidation,
-				"qualified event lacks task-manual cross evidence", nil))
+			continue
 		}
 		var primary types.ContentItem
 		seenEvidence := make(map[int64]struct{}, len(event.EvidenceContentIDs))
+		validEvidence := true
 		for index, contentID := range event.EvidenceContentIDs {
 			candidate, ok := byID[contentID]
 			if _, duplicate := seenEvidence[contentID]; duplicate {
-				return nil, "", nonRetryable(types.NewAppError(
-					types.CodeValidation,
-					"qualified event duplicated evidence", nil))
+				validEvidence = false
+				break
 			}
 			seenEvidence[contentID] = struct{}{}
 			if !ok || candidate.PublishedAt == nil ||
-				!admission.Contains(candidate.PublishedAt.UTC()) {
-				return nil, "", nonRetryable(types.NewAppError(
-					types.CodeValidation, "qualified event cited unverifiable evidence", nil))
+				!admission.Contains(candidate.PublishedAt.UTC()) ||
+				!evidenceSupportsReleaseIdentity(
+					event.ReleaseIdentifier, candidate) {
+				validEvidence = false
+				break
 			}
 			if index == 0 &&
 				!candidate.PublishedAt.UTC().Truncate(time.Second).
 					Equal(occurredAt.UTC().Truncate(time.Second)) {
-				return nil, "", nonRetryable(types.NewAppError(
-					types.CodeValidation,
-					"qualified event time differs from primary evidence", nil))
+				validEvidence = false
+				break
 			}
 			if index == 0 &&
 				policy.Evidence.Requirement == observation.EvidenceOfficialRequired &&
 				!observation.OfficialURLAllowed(
 					candidate.URL, policy.Evidence.OfficialDomains) {
-				return nil, "", nonRetryable(types.NewAppError(
-					types.CodeValidation, "qualified event lacks approved official evidence", nil))
+				validEvidence = false
+				break
 			}
 			if index == 0 {
 				primary = candidate
 			}
+		}
+		if !validEvidence {
+			continue
 		}
 		if requireOfficial &&
 			(strings.TrimSpace(primary.URL) == "" ||
@@ -2997,26 +2997,19 @@ func (a *Activities) validateQualifiedEvents(
 					observation.EvidenceOfficialRequired &&
 					!officialHostGroundedInTaskManual(
 						primary.URL, taskManual))) {
-			return nil, "", nonRetryable(types.NewAppError(
-				types.CodeValidation,
-				"qualified event lacks a live official page candidate", nil))
+			continue
 		}
 		if requireCross &&
 			!hasIndependentEvidenceHost(primary, event.EvidenceContentIDs[1:], byID) {
-			return nil, "", nonRetryable(types.NewAppError(
-				types.CodeValidation,
-				"qualified event lacks an independent evidence host", nil))
+			continue
 		}
 		if _, duplicate := seenPrimary[primary.ID]; duplicate {
-			return nil, "", nonRetryable(types.NewAppError(
-				types.CodeValidation,
-				"qualified events reused one primary candidate", nil))
+			continue
 		}
 		seenPrimary[primary.ID] = struct{}{}
 		releaseIdentity := canonicalReleaseIdentity(event.ReleaseIdentifier)
 		if releaseIdentity == "" {
-			return nil, "", nonRetryable(types.NewAppError(
-				types.CodeValidation, "qualified event release identity is invalid", nil))
+			continue
 		}
 		eventKey := qualifiedEventKey(
 			policyDigest, event.EventType, releaseIdentity)
@@ -3031,9 +3024,58 @@ func (a *Activities) validateQualifiedEvents(
 		out = append(out, primary)
 	}
 	if len(out) == 0 {
-		return nil, "no_match", nil
+		return nil, "", nonRetryable(types.NewAppError(
+			types.CodeValidation,
+			"all claimed events failed deterministic evidence validation", nil))
 	}
 	return out, "match", nil
+}
+
+func evidenceSupportsReleaseIdentity(
+	releaseIdentifier string,
+	candidate types.ContentItem,
+) bool {
+	releaseTokens := meaningfulReleaseTokens(releaseIdentifier)
+	if len(releaseTokens) == 0 {
+		return false
+	}
+	candidateTokens := meaningfulReleaseTokens(
+		candidate.Title + " " + candidate.Content)
+	matches := 0
+	for token := range releaseTokens {
+		if _, ok := candidateTokens[token]; ok {
+			matches++
+		}
+	}
+	required := 2
+	if len(releaseTokens) == 1 {
+		required = 1
+	}
+	return matches >= required
+}
+
+func meaningfulReleaseTokens(value string) map[string]struct{} {
+	generic := map[string]struct{}{
+		"the": {}, "and": {}, "for": {}, "with": {}, "new": {},
+		"release": {}, "released": {}, "announcement": {}, "introducing": {},
+		"model": {}, "models": {}, "api": {}, "apis": {}, "agent": {},
+		"agents": {}, "product": {}, "products": {}, "update": {},
+		"updates": {}, "official": {}, "major": {},
+	}
+	tokens := make(map[string]struct{})
+	for _, token := range strings.FieldsFunc(
+		strings.ToLower(value),
+		func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) },
+	) {
+		if len([]rune(token)) < 3 {
+			continue
+		}
+		if _, skip := generic[token]; skip {
+			continue
+		}
+		tokens[token] = struct{}{}
+	}
+	return tokens
 }
 
 // officialHostGroundedInTaskManual is the Source-free official-page guard for
