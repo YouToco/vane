@@ -144,6 +144,28 @@ func renderUser(req Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	eventTypeJSON, err := json.Marshal(req.Policy.Event.EventKind)
+	if err != nil {
+		return "", err
+	}
+	subjectJSON, err := json.Marshal(req.Policy.Event.Subject)
+	if err != nil {
+		return "", err
+	}
+	qualification := string(req.Policy.Event.Qualification)
+	qualificationJSON, err := json.Marshal(qualification)
+	if err != nil {
+		return "", err
+	}
+	qualificationRule := "qualification 必须逐字复制 " +
+		string(qualificationJSON)
+	qualificationSchema := string(qualificationJSON)
+	if req.Policy.Event.Qualification == observation.QualificationEither {
+		qualificationRule =
+			"qualification 只能是 \"official_announcement\" 或 \"general_availability\""
+		qualificationSchema =
+			"\"official_announcement|general_availability\""
+	}
 	type candidate struct {
 		ID          int64  `json:"id"`
 		Title       string `json:"title"`
@@ -171,12 +193,18 @@ func renderUser(req Request) (string, error) {
 	return fmt.Sprintf(
 		"任务策略：%s\n判定窗口：(start=%s, end=%s]\n"+
 			"证据时间约束：%s\n"+
+			"定义字段约束：每个 match 事件的 event_type 必须逐字复制 %s；"+
+			"subject 必须逐字复制 %s；%s。"+
+			"这些字段描述批准的监控范围，不得改写成其中某个厂商或事件子类；"+
+			"具体产品只写入 release_identifier。\n"+
 			"输出 schema：{\"outcome\":\"match|no_match|uncertain\",\"events\":[{"+
-			"\"event_type\":\"...\",\"subject\":\"...\",\"release_identifier\":\"...\","+
-			"\"occurred_at\":\"RFC3339\",\"qualification\":\"official_announcement|general_availability\","+
+			"\"event_type\":%s,\"subject\":%s,\"release_identifier\":\"...\","+
+			"\"occurred_at\":\"RFC3339\",\"qualification\":%s,"+
 			"\"evidence_content_ids\":[1],\"reason\":\"...\"}]}\n"+
 			"【本轮候选】%s【本轮候选结束】",
 		policyJSON, req.Window.Start.Format(time.RFC3339),
-		req.Window.End.Format(time.RFC3339), evidenceTimeContractV1, candidateJSON,
+		req.Window.End.Format(time.RFC3339), evidenceTimeContractV1,
+		eventTypeJSON, subjectJSON, qualificationRule,
+		eventTypeJSON, subjectJSON, qualificationSchema, candidateJSON,
 	), nil
 }

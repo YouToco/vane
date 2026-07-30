@@ -47,12 +47,45 @@ func TestRenderUserContainsOnlyBoundedCandidates(t *testing.T) {
 		"occurred_at 必须逐字复制",
 		"evidence_content_ids 中的每个候选",
 		"不得把 published_at 不同的候选合并",
+		`event_type 必须逐字复制 "model_release"`,
+		`subject 必须逐字复制 "OpenAI models"`,
+		`qualification 必须逐字复制 "general_availability"`,
+		`"event_type":"model_release"`,
+		`"subject":"OpenAI models"`,
+		`"qualification":"general_availability"`,
 		published.Format(time.RFC3339),
 		later.Format(time.RFC3339),
 	} {
 		if !strings.Contains(rendered, required) {
 			t.Fatalf("rendered request omitted evidence-time contract %q: %s",
 				required, rendered)
+		}
+	}
+}
+
+func TestRenderUserEitherQualificationKeepsBoundedChoice(t *testing.T) {
+	policy := eventPolicy(t)
+	policy.Event.Qualification = observation.QualificationEither
+	rendered, err := renderUser(Request{
+		Policy: policy,
+		Window: observation.Window{
+			Start: time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC),
+			End:   time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC),
+		},
+		Candidates: []types.ContentItem{{
+			ID: 1, Title: "release", URL: "https://openai.com/release",
+			Content: "official release",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`qualification 只能是 "official_announcement" 或 "general_availability"`,
+		`"qualification":"official_announcement|general_availability"`,
+	} {
+		if !strings.Contains(rendered, required) {
+			t.Fatalf("rendered request omitted %q: %s", required, rendered)
 		}
 	}
 }
