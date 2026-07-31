@@ -495,8 +495,6 @@ func (a *Activities) QualifyToolCandidatesV2(
 			types.NewAppError(types.CodeValidation,
 				"compiled Tool observation policy digest failed", err))
 	}
-	result = attachIndependentCrossEvidence(
-		result, candidates, window, snapshot.Definition.TaskManual)
 	qualified, outcome, err := a.validateQualifiedEvents(
 		*policy, policyDigest, window, candidates,
 		snapshot.Definition.TaskManual, result)
