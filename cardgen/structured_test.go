@@ -361,6 +361,67 @@ func TestGenerateStructuredWithEvidencePolicyV3RejectsInventoryBeforeCall(
 	}
 }
 
+func TestEvidenceInsightKeepsOneFieldAndUsesValidatedBodyFallback(t *testing.T) {
+	raw := []byte(`{"schema_version":"vane.cardgen-insight/v1","body_md":"OpenAI 下调 GPT-5.6 API 价格，使开发者获得更高性价比。","what_changed":"Luna 降价 80%，Terra 同步降价，Sol 性能提升。","why_it_matters":"","importance_reason":"","claims":[]}`)
+	insight, err := parseStructuredInsightV1(raw, map[string]string{
+		"source-1": "官方原文", "source-2": "独立报道",
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if insight.WhatChanged == "" || insight.WhyItMatters != insight.BodyMD ||
+		insight.ImportanceReason != insight.BodyMD {
+		t.Fatalf("partial evidence projection was not completed: %+v", insight)
+	}
+	now := time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)
+	sources := []EventEvidenceSourceV1{
+		{
+			ContentItemID: 2854,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-1", Title: "OpenAI GPT-5.6",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://openai.com/index/gpt-5-6", DiscoveredAt: now,
+			},
+			EvidenceText: "官方原文",
+		},
+		{
+			ContentItemID: 2877,
+			Metadata: types.StructuredEvidenceSourceV1{
+				Ref: "source-2", Title: "GPT-5.6 price cut",
+				SourceTitle: "web_search", Platform: "web",
+				SourceURL: "https://media.example/gpt-5-6", DiscoveredAt: now,
+			},
+			EvidenceText: "独立报道",
+		},
+	}
+	body, err := RenderGroundedEvidenceInsightV1(
+		insight, "固定输出：变化、官方原文、交叉证据、影响判断。", sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"**变化：** Luna 降价 80%",
+		"[OpenAI GPT-5.6](https://openai.com/index/gpt-5-6)",
+		"[GPT-5.6 price cut](https://media.example/gpt-5-6)",
+		"**影响判断：** OpenAI 下调 GPT-5.6 API 价格，使开发者获得更高性价比。",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("fallback body omitted %q: %q", required, body)
+		}
+	}
+	bodyOnly, err := parseStructuredInsightV1([]byte(
+		`{"schema_version":"vane.cardgen-insight/v1","body_md":"只有正文","what_changed":"","why_it_matters":"","importance_reason":"","claims":[]}`,
+	), map[string]string{"source-1": "官方原文", "source-2": "独立报道"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RenderGroundedEvidenceInsightV1(
+		bodyOnly, "固定输出：变化、官方原文、交叉证据、影响判断。", sources,
+	); err == nil {
+		t.Fatal("body-only response bypassed required semantic fields")
+	}
+}
+
 func TestEventEvidenceSourceV1RejectsEmptyEvidence(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	_, err := NewEventEvidenceSourceV1(
