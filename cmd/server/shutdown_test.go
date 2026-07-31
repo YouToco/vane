@@ -105,17 +105,23 @@ func TestHTTPShutdownCanBeReprovedAfterOwnedDrain(t *testing.T) {
 		t.Fatal("blocking handler did not start")
 	}
 
-	initial := beginHTTPShutdown(srv, 25*time.Millisecond)
-	// Let the admission-closing attempt expire while the subsystem-owned work
-	// remains in flight, then drain that owner before the final proof.
-	time.Sleep(40 * time.Millisecond)
+	initialAttempt := beginHTTPShutdown(srv, 25*time.Millisecond)
+	// Prove the admission-closing attempt actually expired while the
+	// subsystem-owned work remained in flight. Sleeping for a nominally longer
+	// duration is scheduler-dependent under the race detector.
+	initialErr := <-initialAttempt
+	if !errors.Is(initialErr, context.DeadlineExceeded) {
+		t.Fatalf("initial HTTP shutdown error = %v, want deadline exceeded", initialErr)
+	}
+	initial := make(chan error, 1)
+	initial <- initialErr
 	close(release)
 	select {
 	case <-handlerDone:
 	case <-time.After(time.Second):
 		t.Fatal("owned handler did not exit after drain")
 	}
-	shutdownErr := completeHTTPShutdown(srv, initial, 25*time.Millisecond)
+	shutdownErr := completeHTTPShutdown(srv, initial, time.Second)
 	if shutdownErr != nil {
 		t.Fatalf("final HTTP drain proof failed: %v", shutdownErr)
 	}

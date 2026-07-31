@@ -741,7 +741,36 @@ func testMigration061TaskSnapshotFence(t *testing.T, up bool) {
 		_, err := provider.Down(ctx)
 		migrationDone <- err
 	}()
-	time.Sleep(200 * time.Millisecond)
+	// Do not guess that the migration acquired its exclusive schema fence from
+	// elapsed wall time. On a loaded race runner the goroutine may not have
+	// started within 200ms; letting the snapshot writer win the shared fence
+	// then creates a deadlock in the test itself. Observe the actual PostgreSQL
+	// lock before introducing the competing writer.
+	fenceDeadline := time.Now().Add(5 * time.Second)
+	for {
+		var migrationHoldsFence bool
+		if err := db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+			  SELECT 1
+			    FROM pg_locks
+			   WHERE locktype='advisory'
+			     AND mode='ExclusiveLock'
+			     AND granted
+			     AND database=(
+			       SELECT oid FROM pg_database
+			        WHERE datname=current_database()
+			     )
+			)`).Scan(&migrationHoldsFence); err != nil {
+			t.Fatal(err)
+		}
+		if migrationHoldsFence {
+			break
+		}
+		if time.Now().After(fenceDeadline) {
+			t.Fatal("061 migration did not acquire its exclusive schema fence")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	fenceDone := make(chan error, 1)
 	go func() {
