@@ -341,6 +341,12 @@ func TestMeaningfulReleaseTokensPreservesDottedVersion(t *testing.T) {
 		"GPT-Live-Transcribe", types.ContentItem{Title: "GPT-5.6 price cut"}) {
 		t.Fatal("dotted version token admitted an unrelated GPT release")
 	}
+	if crossEvidenceTitleSupportsReleaseIdentity(
+		"Google Gemini Enterprise Agent Platform 新功能全面可用",
+		types.ContentItem{Title: "Google upgrades Gemini API Managed Agents"},
+	) {
+		t.Fatal("generic organization and model family admitted a different product")
+	}
 }
 
 func TestOfficialHostGroundedInTaskManualRejectsPathImpersonation(t *testing.T) {

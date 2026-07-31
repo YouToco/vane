@@ -284,6 +284,7 @@ func StructuredEvidenceTextV1(item types.ContentItem) string {
 
 type structuredInsightWireV1 struct {
 	SchemaVersion    string          `json:"schema_version"`
+	Title            json.RawMessage `json:"title"`
 	BodyMD           string          `json:"body_md"`
 	WhatChanged      json.RawMessage `json:"what_changed"`
 	WhyItMatters     json.RawMessage `json:"why_it_matters"`
@@ -318,6 +319,11 @@ func parseStructuredInsightV1(
 	}
 	if err := requireJSONEOF(decoder); err != nil {
 		return StructuredInsightV1{}, err
+	}
+	title, titleOK := decodeOptionalStructuredStringV1(wire.Title)
+	if !titleOK || !validStructuredText(title, maxStructuredFieldBytes, true) {
+		return StructuredInsightV1{}, errors.New(
+			"structured insight optional title is invalid")
 	}
 	insight := StructuredInsightV1{
 		SchemaVersion: wire.SchemaVersion,
