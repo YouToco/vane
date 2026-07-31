@@ -16,6 +16,7 @@ import (
 	cardgenpkg "github.com/YouToco/vane/cardgen"
 	"github.com/YouToco/vane/dedup"
 	"github.com/YouToco/vane/eventqualifier"
+	"github.com/YouToco/vane/llm"
 	"github.com/YouToco/vane/observation"
 	"github.com/YouToco/vane/runcontext"
 	"github.com/YouToco/vane/runtimepolicy"
@@ -357,6 +358,8 @@ func (a *Activities) QualifyToolCandidatesV2(
 	if err != nil {
 		return QualifyToolCandidatesV2Result{}, retryableOrNot(err)
 	}
+	ctx = llm.WithRunSnapshotAttribution(
+		ctx, in.Run.Snapshot.SnapshotID)
 	if err := validateToolCandidatesV2(snapshot, in.Candidates); err != nil {
 		return QualifyToolCandidatesV2Result{}, nonRetryable(err)
 	}
@@ -700,6 +703,8 @@ func (a *Activities) CardGenToolCandidatesV2(
 	if err != nil {
 		return nil, retryableOrNot(err)
 	}
+	ctx = llm.WithRunSnapshotAttribution(
+		ctx, in.Run.Snapshot.SnapshotID)
 	if err := validateToolScoredCandidatesV2(
 		snapshot, in.Candidates); err != nil {
 		return nil, nonRetryable(err)

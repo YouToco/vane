@@ -92,6 +92,23 @@ func TestDo_ErrorAuditUsesRequestedModelOverride(t *testing.T) {
 	}
 }
 
+func TestDo_RecordsExactRunSnapshotAttribution(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+	}))
+	t.Cleanup(srv.Close)
+
+	st := &capturingRecorderStore{}
+	ctx := WithRunSnapshotAttribution(t.Context(), 91)
+	_, _ = Do(ctx, newTestClient(srv.URL, 1), &Recorder{st: st},
+		CallMeta{TraceID: "exact-run", SpanName: "score"},
+		Request{User: "compiled run", Model: "deepseek-v4-pro"})
+	call := st.onlyCall(t)
+	if call.RunSnapshotID == nil || *call.RunSnapshotID != 91 {
+		t.Fatalf("run snapshot attribution = %v, want 91", call.RunSnapshotID)
+	}
+}
+
 func TestDo_RecordsUsageFromInvalidSuccessfulResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

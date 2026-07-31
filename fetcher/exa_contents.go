@@ -201,6 +201,7 @@ func (e *ExaContentsFetcher) pageResultsWithEffectGate(
 	if err != nil {
 		return nil, false, types.NewAppError(types.CodeValidation, "构造 Exa /contents 请求体失败", err)
 	}
+	var resultBody []byte
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.contentURL, bytes.NewReader(payload))
 	if err != nil {
@@ -221,7 +222,7 @@ func (e *ExaContentsFetcher) pageResultsWithEffectGate(
 		// Do 失败（超时/连接拒绝）也记账（对抗审查 F1，同 exa.go）：真实发起了
 		// 上游尝试，不记则网络层故障在账本上隐形。status=0 表示未拿到 HTTP 响应。
 		if src != nil {
-			e.recordCall(ctx, *src, 0, elapsed, 0, 0, ae)
+			e.recordCall(ctx, *src, payload, resultBody, 0, elapsed, 0, 0, ae)
 		}
 		return nil, false, ae
 	}
@@ -233,7 +234,7 @@ func (e *ExaContentsFetcher) pageResultsWithEffectGate(
 	// enrich 传真实源按 source_id 记账，ad-hoc 传零值 Source 记 SourceID=0）。
 	fail := func(status, bodySize int, ae error) error {
 		if src != nil {
-			e.recordCall(ctx, *src, status, elapsed, bodySize, 0, ae)
+			e.recordCall(ctx, *src, payload, resultBody, status, elapsed, bodySize, 0, ae)
 		}
 		return ae
 	}
@@ -256,6 +257,7 @@ func (e *ExaContentsFetcher) pageResultsWithEffectGate(
 	if err != nil {
 		return nil, false, fail(resp.StatusCode, 0, classifyDoError(e.contentURL, err))
 	}
+	resultBody = data
 	if int64(len(data)) > e.maxBytes {
 		return nil, false, fail(resp.StatusCode, len(data), types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("Exa /contents 响应体超过 %d 字节上限", e.maxBytes), nil))
@@ -280,7 +282,7 @@ func (e *ExaContentsFetcher) pageResultsWithEffectGate(
 				fmt.Sprintf("Exa /contents 抓取失败（url=%s，status=error）", pageURL), ErrPageUnreachable)
 			ae.Retryable = true
 			if src != nil {
-				e.recordCall(ctx, *src, resp.StatusCode, elapsed, len(data), cr.CostDollars.Total, ae)
+				e.recordCall(ctx, *src, payload, resultBody, resp.StatusCode, elapsed, len(data), cr.CostDollars.Total, ae)
 			}
 			return nil, false, ae
 		}
@@ -289,7 +291,7 @@ func (e *ExaContentsFetcher) pageResultsWithEffectGate(
 		}
 	}
 	if src != nil {
-		e.recordCall(ctx, *src, resp.StatusCode, elapsed, len(data), cr.CostDollars.Total, nil)
+		e.recordCall(ctx, *src, payload, resultBody, resp.StatusCode, elapsed, len(data), cr.CostDollars.Total, nil)
 	}
 	return cr.Results, cached, nil
 }
@@ -404,14 +406,25 @@ func sanitizeContentsText(s string) string {
 }
 
 // recordCall 写一行 tool_calls（与 exa.go recordCall 同纪律：旁路，失败不放大）。
-func (e *ExaContentsFetcher) recordCall(ctx context.Context, src types.FetchTarget, status int, elapsed time.Duration, bodySize int, costTotal float64, callErr error) {
+func (e *ExaContentsFetcher) recordCall(
+	ctx context.Context,
+	src types.FetchTarget,
+	arguments json.RawMessage,
+	resultBody []byte,
+	status int,
+	elapsed time.Duration,
+	bodySize int,
+	costTotal float64,
+	callErr error,
+) {
 	if e.rec == nil {
 		return
 	}
 	ctx, cancel := detachedBindingRecordContext(ctx)
 	defer cancel()
-	trace, tenantID, userID := bindingAttribution(ctx)
+	trace, tenantID, userID, runSnapshotID := bindingAttribution(ctx)
 	rec := &types.ToolCall{
+		RunSnapshotID: runSnapshotID,
 		TraceID:       trace,
 		TenantID:      tenantID,
 		UserID:        userID,
@@ -419,8 +432,10 @@ func (e *ExaContentsFetcher) recordCall(ctx context.Context, src types.FetchTarg
 		ToolKind:      types.ToolCallKindExaFetch,
 		Provider:      "exa",
 		EndpointPath:  "/contents",
+		Arguments:     append(json.RawMessage(nil), arguments...),
 		DurationMs:    int(elapsed.Milliseconds()),
 		ResultSize:    bodySize,
+		ResultPreview: toolResultPreview(resultBody),
 		HTTPStatus:    &status,
 		UsageQuantity: 1,
 	}

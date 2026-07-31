@@ -449,16 +449,17 @@ func DoChat(ctx context.Context, c *Client, rec *Recorder, meta CallMeta, req Ch
 	}
 
 	call := &types.LLMCall{
-		TraceID:     meta.TraceID,
-		SpanName:    meta.SpanName,
-		UserID:      meta.UserID,
-		RefType:     meta.RefType,
-		RefID:       meta.RefID,
-		Provider:    c.provider,
-		Model:       c.requestModel(req.Model), // 成功路径下面会覆盖为上游回报的实际模型名
-		UserPrompt:  truncateUTF8Tail(string(msgsJSON), userPromptMaxBytes),
-		Temperature: req.Temperature,
-		MaxTokens:   req.MaxTokens,
+		RunSnapshotID: runSnapshotAttribution(ctx),
+		TraceID:       meta.TraceID,
+		SpanName:      meta.SpanName,
+		UserID:        meta.UserID,
+		RefType:       meta.RefType,
+		RefID:         meta.RefID,
+		Provider:      c.provider,
+		Model:         c.requestModel(req.Model), // 成功路径下面会覆盖为上游回报的实际模型名
+		UserPrompt:    truncateUTF8Tail(string(msgsJSON), userPromptMaxBytes),
+		Temperature:   req.Temperature,
+		MaxTokens:     req.MaxTokens,
 	}
 
 	if resp != nil {

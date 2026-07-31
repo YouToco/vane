@@ -16,31 +16,40 @@ import (
 // whatever memberships happen to exist when the receipt is written.
 func TestCompiledFetchRecordersPreserveExactRunAttribution(t *testing.T) {
 	const (
-		traceID  = "wf-compiled-attribution"
-		tenantID = int64(81)
-		userID   = int64(19)
+		traceID    = "wf-compiled-attribution"
+		tenantID   = int64(81)
+		userID     = int64(19)
+		snapshotID = int64(27)
 	)
 	base := WithBindingRunAttribution(
-		context.Background(), traceID, tenantID, userID)
+		context.Background(), traceID, tenantID, userID, snapshotID)
 	ctx, cancel := context.WithCancel(base)
 	cancel()
 
 	tests := []struct {
-		name   string
-		record func(*mockRecorder)
+		name             string
+		hasRequestResult bool
+		record           func(*mockRecorder)
 	}{
 		{
-			name: "exa search",
+			name:             "exa search",
+			hasRequestResult: true,
 			record: func(rec *mockRecorder) {
 				NewExa(config.FetchConfig{}, rec).recordCall(
-					ctx, types.FetchTarget{ID: 1}, 200, 0, 0, 0, 10, nil)
+					ctx, types.FetchTarget{ID: 1},
+					[]byte(`{"query":"exact"}`), []byte(`{"items":[1]}`),
+					200, 0, 0, 0, 10, nil)
 			},
 		},
 		{
-			name: "exa contents",
+			name:             "exa contents",
+			hasRequestResult: true,
 			record: func(rec *mockRecorder) {
 				NewExaContents(config.FetchConfig{}, rec).recordCall(
-					ctx, types.FetchTarget{ID: 2}, 200, 0, 0, 0, nil)
+					ctx, types.FetchTarget{ID: 2},
+					[]byte(`{"urls":["https://example.test"]}`),
+					[]byte(`{"results":[1]}`),
+					200, 0, 0, 0, nil)
 			},
 		},
 		{
@@ -66,8 +75,13 @@ func TestCompiledFetchRecordersPreserveExactRunAttribution(t *testing.T) {
 			}
 			if got.TraceID != traceID || got.TenantID == nil ||
 				*got.TenantID != tenantID || got.UserID == nil ||
-				*got.UserID != userID {
+				*got.UserID != userID || got.RunSnapshotID == nil ||
+				*got.RunSnapshotID != snapshotID {
 				t.Fatalf("receipt lost exact run attribution: %+v", got)
+			}
+			if tt.hasRequestResult &&
+				(len(got.Arguments) == 0 || got.ResultPreview == "") {
+				t.Fatalf("receipt omitted actual request/result evidence: %+v", got)
 			}
 			if ctxErr, hasDeadline := rec.contextState(); ctxErr != nil || !hasDeadline {
 				t.Fatalf("receipt context must detach cancellation but stay bounded: err=%v deadline=%v",
@@ -81,7 +95,8 @@ func TestLegacyFetchAttributionDoesNotInventTenant(t *testing.T) {
 	ctx := WithBindingAttribution(context.Background(), "legacy-trace", 7)
 	rec := &mockRecorder{}
 	NewExa(config.FetchConfig{}, rec).recordCall(
-		ctx, types.FetchTarget{ID: 1}, 200, 0, 0, 0, 10, nil)
+		ctx, types.FetchTarget{ID: 1}, nil, nil,
+		200, 0, 0, 0, 10, nil)
 
 	got := rec.last()
 	if got == nil || got.UserID == nil || *got.UserID != 7 {

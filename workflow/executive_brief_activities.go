@@ -33,6 +33,8 @@ func (a *Activities) SynthesizeExecutiveBriefV1(
 		expected, in.Run.Snapshot, in.Marker, in.Draft); err != nil {
 		return ExecutiveBriefSynthesizeResult{}, nonRetryable(err)
 	}
+	ctx = llm.WithRunSnapshotAttribution(
+		ctx, in.Run.Snapshot.SnapshotID)
 	snapshot, authority, err :=
 		a.compiledStore.LoadAuthoritativeCompiledTaskRunSnapshot(
 			ctx, expected, in.Run.Snapshot)
