@@ -216,7 +216,11 @@ live Tool candidates.
 - Card generation follows explicit output fields in the task manual. Its
   generic three-part layout is only a default. The model cannot author URLs:
   official and cross-evidence links are rendered from the admitted canonical
-  evidence bundle, and a model-authored URL fails closed.
+  evidence bundle, and a model-authored URL fails closed. If an evidence-card
+  response fills at least one requested semantic field but leaves a sibling
+  field empty, the runtime completes the missing field from that same validated
+  `body_md`; it never pays for a repair call. If all semantic fields are absent,
+  the required four-field card still fails closed.
 - The ordered evidence manifest is persisted with each Tool V2 delivery.
   Application and database admission both prove every content/invocation pair
   belongs to the exact frozen run snapshot; the push boundary re-derives
