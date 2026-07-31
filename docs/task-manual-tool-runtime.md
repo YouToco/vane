@@ -200,7 +200,10 @@ live Tool candidates.
 - Missing cross evidence is never synthesized from lexical overlap. The
   qualifier must cite the pair it judged to describe the same release, and
   deterministic validation rejects a secondary page whose title does not
-  identify that release.
+  identify that release. Dotted product versions remain exact identity tokens
+  (`GPT-5.6` and `GPT 5.6` both retain `5.6`) instead of being split into
+  disposable one-digit fragments; a generic shared family name alone still
+  cannot pass this gate.
 - `no_match`, uncertain model output, malformed citations and unavailable
   evidence all stop before score, card generation and push.
 - A qualified Tool-task event is already matched to explicit user intent in

@@ -3164,8 +3164,14 @@ func meaningfulReleaseTokens(value string) map[string]struct{} {
 	tokens := make(map[string]struct{})
 	for _, token := range strings.FieldsFunc(
 		strings.ToLower(value),
-		func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) },
+		func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '.'
+		},
 	) {
+		if version, ok := dottedVersionToken(token); ok {
+			tokens[version] = struct{}{}
+			continue
+		}
 		if len([]rune(token)) < 3 {
 			continue
 		}
@@ -3175,6 +3181,29 @@ func meaningfulReleaseTokens(value string) map[string]struct{} {
 		tokens[token] = struct{}{}
 	}
 	return tokens
+}
+
+// dottedVersionToken preserves a dotted numeric version as one specific token.
+// Without it GPT-5.6 became only "gpt" because the one-rune 5 and 6 fragments
+// were discarded, making a true GPT-5.6 cross-source headline look unrelated.
+func dottedVersionToken(value string) (string, bool) {
+	if !strings.Contains(value, ".") {
+		return "", false
+	}
+	var compact strings.Builder
+	for _, r := range value {
+		if r == '.' {
+			continue
+		}
+		if !unicode.IsDigit(r) {
+			return "", false
+		}
+		compact.WriteRune(r)
+	}
+	if compact.Len() < 2 {
+		return "", false
+	}
+	return "version:" + compact.String(), true
 }
 
 // officialHostGroundedInTaskManual is the Source-free official-page guard for
