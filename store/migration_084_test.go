@@ -63,7 +63,7 @@ func TestMigration084TaskDeleteCascadesImmutablePeriodicReport(t *testing.T) {
 		    $1,1,$2,$3,'daily',
 		    '2026-07-29T00:00:00Z','2026-07-30T00:00:00Z',
 		    'vane.periodic-brief/v1',repeat('d',64),$4,
-		    convert_to(jsonb_build_object('digest',$4)::text,'UTF8'),
+		    convert_to(jsonb_build_object('digest',$4::text)::text,'UTF8'),
 		    '2026-07-30T00:01:00Z'
 		) RETURNING id`, intentID, userID, taskID, payloadDigest,
 	).Scan(&reportID); err != nil {
