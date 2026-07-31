@@ -189,6 +189,11 @@ live Tool candidates.
 - If the manual requires an official original, a matching event must cite the
   official page from the current candidate set first. Media coverage, reposts
   and results without live page text alone cannot qualify an event.
+- Provider `publishedDate` remains authoritative. When it is absent, Exa
+  acquisition may recover only a strict whole-line calendar date from the
+  first 12 non-empty lines of the fetched page text. It never asks the model to
+  invent a timestamp and never treats dates buried in prose, navigation or
+  related links as publication evidence.
 - If the manual requires cross verification, the event must cite at least one
   different current-run candidate after the primary. Its publication time may
   differ, but it must remain inside the deterministic observation window.

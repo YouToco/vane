@@ -345,7 +345,7 @@ func mapExaResults(src types.FetchTarget, results []exaResult) ([]types.ContentI
 			Title:       r.Title,
 			Content:     content,
 			Author:      r.Author,
-			PublishedAt: parseExaDate(r.PublishedDate),
+			PublishedAt: parseExaPublishedAt(r.PublishedDate, r.Text),
 			FetchedAt:   now,
 			Kind:        types.KindArticle, // 搜索结果是"一篇内容"（M6 契约 §7.2(b)：构造处赋值，finalize 只校验）
 		}
@@ -414,6 +414,7 @@ func (e *ExaFetcher) recordCall(
 
 // parseExaDate 解析 Exa 的 ISO 8601 发布时间；解析失败或为空返回 nil（列可空）。
 func parseExaDate(s string) *time.Time {
+	s = strings.TrimSpace(s)
 	if s == "" {
 		return nil
 	}
@@ -423,6 +424,54 @@ func parseExaDate(s string) *time.Time {
 	// Exa 有时带毫秒（RFC3339Nano 可覆盖），再退一步用日期。
 	if t, err := time.Parse("2006-01-02", s); err == nil {
 		return &t
+	}
+	return nil
+}
+
+// parseExaPublishedAt keeps Exa's structured publishedDate authoritative, then
+// falls back to an exact, leading visible date line from the fetched page text.
+// Exa commonly leaves publishedDate empty for official release pages even when
+// their rendered article starts with an explicit date. Restricting the fallback
+// to the first 12 non-empty lines and strict whole-line formats avoids treating
+// dates in related links, navigation, or article prose as publication evidence.
+func parseExaPublishedAt(publishedDate, text string) *time.Time {
+	if published := parseExaDate(publishedDate); published != nil {
+		return published
+	}
+	const maxLeadingLines = 12
+	seen := 0
+	for _, rawLine := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		seen++
+		if seen > maxLeadingLines {
+			break
+		}
+		line = strings.TrimSpace(strings.TrimLeft(line, "#>*- \t"))
+		lower := strings.ToLower(line)
+		for _, prefix := range []string{"published on:", "published:", "date:"} {
+			if strings.HasPrefix(lower, prefix) {
+				line = strings.TrimSpace(line[len(prefix):])
+				break
+			}
+		}
+		if len(line) > 64 {
+			continue
+		}
+		if published := parseExaDate(line); published != nil {
+			return published
+		}
+		for _, layout := range []string{
+			"January 2, 2006", "Jan 2, 2006",
+			"2 January 2006", "2 Jan 2006",
+		} {
+			if published, err := time.Parse(layout, line); err == nil &&
+				published.Year() >= 2000 && published.Year() <= 2100 {
+				return &published
+			}
+		}
 	}
 	return nil
 }
