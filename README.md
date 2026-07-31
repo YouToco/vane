@@ -30,7 +30,9 @@ contain no production workflow, runner label, or production credential.
   coverage, and a forced uncached run. Frontend Gate is `npm ci`, tests,
   typecheck, and build. After each Gate, the source is materialized again at
   the exact SHA with a short-lived read key; release builds start from that new
-  clean tree.
+  clean tree. PostgreSQL uses a GitHub-assigned ephemeral host port so stale or
+  concurrent runner workloads cannot collide on a fixed host port before the
+  Gate starts.
 - `deploy` runs on `vane-deploy`. It downloads only artifacts named with the
   current run ID, attempt, component, and source SHA. It never downloads source
   trees and runs no source build, npm install, or Go build/test command.

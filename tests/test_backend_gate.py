@@ -18,6 +18,13 @@ class BackendGateTests(unittest.TestCase):
             "-coverprofile=coverage.txt -covermode=atomic ./...", workflow
         )
 
+    def test_postgres_uses_an_ephemeral_host_port(self) -> None:
+        workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("- 5432/tcp", workflow)
+        self.assertNotIn("- 5432:5432", workflow)
+        self.assertIn("job.services.postgres.ports['5432']", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

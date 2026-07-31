@@ -193,7 +193,7 @@ jobs:
           POSTGRES_USER: vane
           POSTGRES_PASSWORD: vane_test
         ports:
-          - 5432:5432
+          - 5432/tcp
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -244,7 +244,10 @@ jobs:
       - name: Backend independent full gate
         if: needs.plan.outputs.backend_changed == 'true'
         env:
-          DATABASE_URL: postgres://vane:vane_test@localhost:5432/vane_test?sslmode=disable
+          DATABASE_URL: >-
+            postgres://vane:vane_test@localhost:${{
+              job.services.postgres.ports['5432']
+            }}/vane_test?sslmode=disable
         run: |
           cd "$BUILD_ROOT/source/vane-gate"
           if find "$RUNNER_TEMP" -maxdepth 1 -name 'source-checkout.*' -print -quit |
