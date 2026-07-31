@@ -43,6 +43,8 @@ func TestParseStructuredInsightV1RejectsUntrustedOutput(t *testing.T) {
 		"empty body": strings.Replace(valid, `"body_md":"正文"`, `"body_md":""`, 1),
 		"body wrong type": strings.Replace(
 			valid, `"body_md":"正文"`, `"body_md":{}`, 1),
+		"title wrong type": strings.Replace(
+			valid, `"body_md":"正文"`, `"title":123,"body_md":"正文"`, 1),
 	}
 	for name, raw := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -362,7 +364,7 @@ func TestGenerateStructuredWithEvidencePolicyV3RejectsInventoryBeforeCall(
 }
 
 func TestEvidenceInsightKeepsOneFieldAndUsesValidatedBodyFallback(t *testing.T) {
-	raw := []byte(`{"schema_version":"vane.cardgen-insight/v1","body_md":"OpenAI 下调 GPT-5.6 API 价格，使开发者获得更高性价比。","what_changed":"Luna 降价 80%，Terra 同步降价，Sol 性能提升。","why_it_matters":"","importance_reason":"","claims":[]}`)
+	raw := []byte(`{"schema_version":"vane.cardgen-insight/v1","title":"OpenAI 下调 GPT-5.6 系列 API 价格","body_md":"OpenAI 下调 GPT-5.6 API 价格，使开发者获得更高性价比。","what_changed":"Luna 降价 80%，Terra 同步降价，Sol 性能提升。","why_it_matters":"","importance_reason":"","claims":[]}`)
 	insight, err := parseStructuredInsightV1(raw, map[string]string{
 		"source-1": "官方原文", "source-2": "独立报道",
 	}, true)

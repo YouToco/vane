@@ -203,7 +203,10 @@ live Tool candidates.
   identify that release. Dotted product versions remain exact identity tokens
   (`GPT-5.6` and `GPT 5.6` both retain `5.6`) instead of being split into
   disposable one-digit fragments; a generic shared family name alone still
-  cannot pass this gate.
+  cannot pass this gate. Without a shared dotted version, a secondary title
+  must share three meaningful identity tokens, preventing organization plus
+  model-family overlap (for example `Google + Gemini`) from joining different
+  products.
 - `no_match`, uncertain model output, malformed citations and unavailable
   evidence all stop before score, card generation and push.
 - A qualified Tool-task event is already matched to explicit user intent in
@@ -220,7 +223,9 @@ live Tool candidates.
   response fills at least one requested semantic field but leaves a sibling
   field empty, the runtime completes the missing field from that same validated
   `body_md`; it never pays for a repair call. If all semantic fields are absent,
-  the required four-field card still fails closed.
+  the required four-field card still fails closed. A bounded optional model
+  `title` is ignored for provider compatibility; every other unknown field is
+  still rejected and the system continues to own the displayed source titles.
 - The ordered evidence manifest is persisted with each Tool V2 delivery.
   Application and database admission both prove every content/invocation pair
   belongs to the exact frozen run snapshot; the push boundary re-derives

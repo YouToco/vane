@@ -3130,9 +3130,18 @@ func crossEvidenceTitleSupportsReleaseIdentity(
 	titleCandidate := candidate
 	titleCandidate.Content = ""
 	matches := releaseEvidenceTokenMatches(releaseIdentifier, titleCandidate)
-	required := 2
-	if len(releaseTokens) == 1 {
-		required = 1
+	required := 3
+	if len(releaseTokens) < required {
+		required = len(releaseTokens)
+	}
+	titleTokens := meaningfulReleaseTokens(candidate.Title)
+	for token := range releaseTokens {
+		if strings.HasPrefix(token, "version:") {
+			if _, shared := titleTokens[token]; shared && len(releaseTokens) >= 2 {
+				required = 2
+				break
+			}
+		}
 	}
 	return matches >= required
 }
