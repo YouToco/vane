@@ -284,6 +284,65 @@ func TestValidateQualifiedEventsRejectsUnrelatedCrossEvidence(t *testing.T) {
 	}
 }
 
+func TestValidateQualifiedEventsAcceptsVersionedReleaseCrossHeadline(t *testing.T) {
+	policy := workflowEventPolicy(t)
+	policy.Event.Subject = "Frontier AI releases"
+	policy.Evidence.Requirement = observation.EvidenceTrustedAllowed
+	policy.Evidence.OfficialDomains = nil
+	digest, err := observation.PolicyDigest(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	officialAt := time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)
+	crossAt := officialAt.Add(27*time.Hour + 53*time.Minute)
+	window := observation.Window{
+		Start: officialAt.Add(-time.Hour), End: crossAt.Add(time.Hour),
+	}
+	items := []types.ContentItem{
+		{
+			ID: 2854, URL: "https://openai.com/index/advancing-the-price-performance-frontier-with-gpt-5-6/",
+			Title:       "Advancing the price-performance frontier with GPT-5.6",
+			Content:     "GPT-5.6 Luna and Terra pricing changes with Sol performance improvements.",
+			PublishedAt: &officialAt,
+		},
+		{
+			ID: 2877, URL: "https://www.moneycontrol.com/technology/openai-cuts-gpt-5-6-token-prices.html",
+			Title: "OpenAI cuts GPT-5.6 token prices by up to 80%",
+			Content: "OpenAI lowers API costs across GPT-5.6 lineup, with Luna " +
+				"receiving the biggest reduction, Terra becoming cheaper, and Sol " +
+				"getting a faster API mode.",
+			PublishedAt: &crossAt,
+		},
+	}
+	result := eventqualifier.Result{Outcome: "match", Events: []eventqualifier.Event{{
+		EventType: "model_release", Subject: "Frontier AI releases",
+		ReleaseIdentifier: "GPT-5.6 API 定价下调（Luna 降 80%、Terra 降 20%）及 Sol 性能提升",
+		OccurredAt:        officialAt.Format(time.RFC3339),
+		Qualification: string(
+			observation.QualificationGeneralAvailability),
+		EvidenceContentIDs: []int64{2854, 2877},
+	}}}
+	got, outcome, err := (&Activities{}).validateQualifiedEvents(
+		policy, digest, window, items,
+		"Monitor OpenAI official original; require cross evidence.", result)
+	if err != nil || outcome != "match" || len(got) != 1 || got[0].ID != 2854 {
+		t.Fatalf("versioned release pair got=%+v outcome=%q err=%v", got, outcome, err)
+	}
+}
+
+func TestMeaningfulReleaseTokensPreservesDottedVersion(t *testing.T) {
+	for _, value := range []string{"GPT-5.6 pricing change", "GPT 5.6 price cut"} {
+		tokens := meaningfulReleaseTokens(value)
+		if _, ok := tokens["version:56"]; !ok {
+			t.Fatalf("meaningfulReleaseTokens(%q)=%v, missing dotted version", value, tokens)
+		}
+	}
+	if crossEvidenceTitleSupportsReleaseIdentity(
+		"GPT-Live-Transcribe", types.ContentItem{Title: "GPT-5.6 price cut"}) {
+		t.Fatal("dotted version token admitted an unrelated GPT release")
+	}
+}
+
 func TestOfficialHostGroundedInTaskManualRejectsPathImpersonation(t *testing.T) {
 	manual := "监控 OpenAI、Anthropic 和 Google DeepMind 的官方原文。"
 	for rawURL, want := range map[string]bool{
