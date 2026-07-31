@@ -54,7 +54,10 @@ jobs:
         run: go run ./cmd/agenttoolinventory -check
 
       - name: Test
-        run: go test -race -timeout=15m -coverprofile=coverage.txt -covermode=atomic ./...
+        # The migration-heavy store package can exceed 15 minutes on a clean
+        # race+coverage run. Keep the complete gate and give it a deterministic
+        # package budget instead of relying on a warm self-hosted runner cache.
+        run: go test -race -timeout=25m -coverprofile=coverage.txt -covermode=atomic ./...
         env:
           DATABASE_URL: postgres://vane:vane_test@localhost:5432/vane_test?sslmode=disable
 
