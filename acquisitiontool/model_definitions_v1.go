@@ -98,6 +98,24 @@ var modelToolDefinitionsV1 = []ModelToolDefinitionV1{
 	},
 	{
 		Contract: ToolContractV1{
+			Name: "web_product_status", Platform: types.PlatformWeb,
+			Capability: types.CapProductStatus, Kind: types.KindPageContent,
+			ImplementationVersion: runtimepolicy.CapabilityImplementationProductStatusV1,
+		},
+		Description: "每次运行从受支持的官方套餐页及其第一方公开接口读取结构化购买状态；适合动态渲染、普通网页抓取拿不到按钮的套餐页。当前支持 Kimi 会员定价页。page_url 必须由用户当前消息明确提供。",
+		decoder:     decodeWebProductStatusArgumentsV1,
+		ExternalLocators: []ExternalLocatorV1{
+			{Argument: "page_url", Kind: ExternalLocatorLiteralV1},
+		},
+		ArgumentsSchema: json.RawMessage(`{
+			"type":"object",
+			"properties":{"page_url":{"type":"string","description":"用户明确给出的受支持官方套餐页面 http/https 地址"}},
+			"required":["page_url"],
+			"additionalProperties":false
+		}`),
+	},
+	{
+		Contract: ToolContractV1{
 			Name: "x_user_posts", Platform: types.PlatformX,
 			Capability: types.CapUserPosts, Kind: types.KindArticle,
 			ImplementationVersion: runtimepolicy.CapabilityImplementationBindingV1,

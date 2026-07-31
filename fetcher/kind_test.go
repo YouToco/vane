@@ -89,6 +89,20 @@ func TestCatalogKindMatchesFetcherEmittedKind(t *testing.T) {
 				types.FetchTarget{ID: 1, Platform: types.PlatformWeb, Capability: types.CapContents},
 				[]exaContentsResult{{ID: "c1", URL: "https://x.example/pricing", Title: "定价", Text: "正文"}})
 		}},
+		{types.PlatformWeb, types.CapProductStatus, func(t *testing.T) []types.ContentItem {
+			content, _, err := normalizeKimiProductStatus(kimiGoodsResponse{Goods: []kimiGood{
+				{Title: "Moderato", MembershipLevel: "LEVEL_BASIC",
+					Amounts: []struct {
+						Currency     string `json:"currency"`
+						PriceInCents string `json:"priceInCents"`
+					}{{Currency: "USD", PriceInCents: "1900"}}},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			item := types.ContentItem{Kind: types.KindPageContent, Content: content}
+			return []types.ContentItem{item}
+		}},
 		{types.PlatformXHS, types.CapSearch, bindingItems(b, types.PlatformXHS, types.CapSearch, `{"keyword":"k"}`)},
 		{types.PlatformXHS, types.CapUserPosts, bindingItems(b, types.PlatformXHS, types.CapUserPosts, `{"user_id":"6a5578b3000000000e03cc00"}`)},
 		{types.PlatformX, types.CapUserPosts, bindingItems(b, types.PlatformX, types.CapUserPosts, `{"screen_name":"OpenAI"}`)},

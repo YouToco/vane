@@ -669,7 +669,8 @@ func validateApprovedSourceNetworkBoundary(source *types.FetchTarget) error {
 	switch {
 	case source.Platform == types.PlatformWeb && source.Capability == types.CapFeed:
 		rawURL = source.URL
-	case source.Platform == types.PlatformWeb && source.Capability == types.CapContents:
+	case source.Platform == types.PlatformWeb &&
+		(source.Capability == types.CapContents || source.Capability == types.CapProductStatus):
 		var config struct {
 			URL string `json:"url"`
 		}

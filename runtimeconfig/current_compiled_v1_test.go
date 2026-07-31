@@ -239,6 +239,13 @@ func assertCurrentCapabilityV1(
 			!reflect.DeepEqual(capability.DependencyCredentialRefs, wantDependency) {
 			t.Errorf("web/feed binding = %+v", capability)
 		}
+	case entry.Platform == types.PlatformWeb && entry.Capability == types.CapProductStatus:
+		if capability.ImplementationVersion !=
+			runtimepolicy.CapabilityImplementationProductStatusV1 ||
+			capability.CredentialRef != (runtimepolicy.CredentialRefV1{}) ||
+			len(capability.DependencyCredentialRefs) != 0 {
+			t.Errorf("web/product_status binding = %+v", capability)
+		}
 	case entry.Platform == types.PlatformWeb:
 		wantRef := runtimepolicy.CredentialRefV1{
 			ID:         runtimepolicy.CredentialIDExaPrimaryV1,

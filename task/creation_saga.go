@@ -1743,7 +1743,9 @@ func summarizeApprovedTarget(source compiledFetchTarget) string {
 			}
 			return base + "；" + detail
 		}
-	case source.Platform == string(types.PlatformWeb) && source.Capability == string(types.CapContents):
+	case source.Platform == string(types.PlatformWeb) &&
+		(source.Capability == string(types.CapContents) ||
+			source.Capability == string(types.CapProductStatus)):
 		var config struct {
 			URL string `json:"url"`
 		}

@@ -22,6 +22,11 @@ const (
 	CapSearch    Capability = "search"     // 关键词/语义搜索
 	CapUserPosts Capability = "user_posts" // 某账号的新发布
 	CapContents  Capability = "contents"   // 监控指定 URL 的内容变化（Exa /contents 抓取）
+	// CapProductStatus reads a supported official pricing/catalog endpoint and
+	// emits a stable, structured purchase-state snapshot. It is deliberately
+	// separate from CapContents: dynamic product pages may have no crawlable
+	// HTML, while their first-party catalog API is still the authoritative fact.
+	CapProductStatus Capability = "product_status"
 
 	// 以下三个是绑定引擎承载的能力（endpoint-binding-contract.md §7，2026-07-18 实测准入）。
 	CapHotList    Capability = "hot_list"    // 平台热榜（xhs：全局一份，无参数）
