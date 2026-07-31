@@ -14,6 +14,7 @@ func TestMaterializeApprovedToolCallV1MatchesApprovedV1Writes(t *testing.T) {
 		{"web_search", `{"query":"AI","category":"news","include_domains":["openai.com"]}`},
 		{"web_feed", `{"feed_url":"https://openai.com/rss.xml","categories":["AI"]}`},
 		{"web_contents", `{"page_url":"https://openai.com/pricing"}`},
+		{"web_product_status", `{"page_url":"https://www.kimi.com/membership/pricing"}`},
 		{"x_user_posts", `{"screen_name":"@OpenAI"}`},
 		{"xhs_search", `{"keyword":"AI 创业"}`},
 		{"xhs_user_posts", `{"user_id":"6a5578b3000000000e03cc00"}`},

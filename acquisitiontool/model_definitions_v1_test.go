@@ -84,6 +84,7 @@ func TestModelToolDefinitionsV1ExamplesPassStrictRuntimeDecoder(t *testing.T) {
 		"web_search":           json.RawMessage(`{"query":"AI 官方更新"}`),
 		"web_feed":             json.RawMessage(`{"feed_url":"https://example.com/feed.xml"}`),
 		"web_contents":         json.RawMessage(`{"page_url":"https://example.com/changelog"}`),
+		"web_product_status":   json.RawMessage(`{"page_url":"https://www.kimi.com/membership/pricing"}`),
 		"x_user_posts":         json.RawMessage(`{"screen_name":"OpenAI"}`),
 		"xhs_search":           json.RawMessage(`{"keyword":"AI 产品"}`),
 		"xhs_user_posts":       json.RawMessage(`{"user_id":"6a5578b3000000000e03cc00"}`),

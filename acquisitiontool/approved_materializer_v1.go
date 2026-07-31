@@ -134,6 +134,19 @@ func decodeWebContentsArgumentsV1(raw json.RawMessage) (Requirement, error) {
 	}, nil
 }
 
+func decodeWebProductStatusArgumentsV1(raw json.RawMessage) (Requirement, error) {
+	var input struct {
+		PageURL string `json:"page_url"`
+	}
+	if err := strictjson.DecodeExact(raw, &input); err != nil {
+		return Requirement{}, err
+	}
+	return Requirement{
+		Platform: string(types.PlatformWeb), Capability: string(types.CapProductStatus),
+		Params: map[string]string{"url": input.PageURL},
+	}, nil
+}
+
 func decodeXUserPostsArgumentsV1(raw json.RawMessage) (Requirement, error) {
 	var input struct {
 		ScreenName string `json:"screen_name"`

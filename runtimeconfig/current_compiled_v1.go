@@ -165,6 +165,9 @@ func currentCapabilityV1(
 			ID:         runtimepolicy.CredentialIDExaPrimaryV1,
 			Generation: exaCredentialGeneration,
 		}
+	case entry.Platform == types.PlatformWeb && entry.Capability == types.CapProductStatus:
+		capability.ImplementationVersion =
+			runtimepolicy.CapabilityImplementationProductStatusV1
 	case fetcher.IsBindingBacked(entry.Platform, entry.Capability):
 		capability.ImplementationVersion = runtimepolicy.CapabilityImplementationBindingV1
 		capability.CredentialRef = runtimepolicy.CredentialRefV1{

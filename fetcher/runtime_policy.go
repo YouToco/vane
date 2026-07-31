@@ -15,6 +15,7 @@ const (
 	runtimeFetchExecutorRSSV1 runtimeFetchExecutorKindV1 = iota + 1
 	runtimeFetchExecutorExaSearchV1
 	runtimeFetchExecutorExaContentsV1
+	runtimeFetchExecutorProductStatusV1
 	runtimeFetchExecutorBindingV1
 )
 
@@ -38,11 +39,12 @@ type runtimeFetchRouteKeyV1 struct {
 // capability. Rotations add routes; they never change an existing key's
 // meaning.
 type RuntimeFetchRouteV1 struct {
-	Capability  runtimepolicy.CapabilityV1
-	RSS         *Fetcher
-	ExaSearch   *ExaFetcher
-	ExaContents *ExaContentsFetcher
-	Binding     *BindingFetcher
+	Capability    runtimepolicy.CapabilityV1
+	RSS           *Fetcher
+	ExaSearch     *ExaFetcher
+	ExaContents   *ExaContentsFetcher
+	ProductStatus *ProductStatusFetcher
+	Binding       *BindingFetcher
 }
 
 type runtimeFetchExecutorV1 struct {
@@ -50,6 +52,7 @@ type runtimeFetchExecutorV1 struct {
 	rss                *Fetcher
 	exaSearch          *ExaFetcher
 	exaContents        *ExaContentsFetcher
+	productStatus      *ProductStatusFetcher
 	binding            *BindingFetcher
 	bindingSpec        bindingSpec
 	bindingEntry       tikhubcatalog.Entry
@@ -108,6 +111,9 @@ func (route RuntimeFetchRouteV1) executorV1(
 	if route.ExaContents != nil {
 		count++
 	}
+	if route.ProductStatus != nil {
+		count++
+	}
 	if route.Binding != nil {
 		count++
 	}
@@ -117,11 +123,13 @@ func (route RuntimeFetchRouteV1) executorV1(
 	}
 	executor := runtimeFetchExecutorV1{
 		kind: want, rss: route.RSS, exaSearch: route.ExaSearch,
-		exaContents: route.ExaContents, binding: route.Binding,
+		exaContents: route.ExaContents, productStatus: route.ProductStatus,
+		binding: route.Binding,
 	}
 	valid := (want == runtimeFetchExecutorRSSV1 && route.RSS != nil) ||
 		(want == runtimeFetchExecutorExaSearchV1 && route.ExaSearch != nil) ||
 		(want == runtimeFetchExecutorExaContentsV1 && route.ExaContents != nil) ||
+		(want == runtimeFetchExecutorProductStatusV1 && route.ProductStatus != nil) ||
 		(want == runtimeFetchExecutorBindingV1 && route.Binding != nil)
 	if !valid {
 		return runtimeFetchExecutorV1{}, fmt.Errorf(
@@ -164,6 +172,8 @@ func (executor runtimeFetchExecutorV1) fetch(
 		return executor.exaSearch.fetchWithEffectGate(ctx, source, beforeEffect)
 	case runtimeFetchExecutorExaContentsV1:
 		return executor.exaContents.fetchWithEffectGate(ctx, source, beforeEffect)
+	case runtimeFetchExecutorProductStatusV1:
+		return executor.productStatus.fetchWithEffectGate(ctx, source, beforeEffect)
 	case runtimeFetchExecutorBindingV1:
 		return executor.binding.fetchWithRetainedRouteV1(
 			ctx, source, executor.bindingSpec, executor.bindingEntry,
@@ -282,6 +292,12 @@ func runtimeFetchShapeV1(
 			kind:           types.KindPageContent,
 			implementation: runtimepolicy.CapabilityImplementationExaV1,
 			executor:       runtimeFetchExecutorExaContentsV1,
+		}, true
+	case platform == types.PlatformWeb && capability == types.CapProductStatus:
+		return runtimeFetchCapabilityShapeV1{
+			kind:           types.KindPageContent,
+			implementation: runtimepolicy.CapabilityImplementationProductStatusV1,
+			executor:       runtimeFetchExecutorProductStatusV1,
 		}, true
 	case IsBindingBacked(platform, capability):
 		return runtimeFetchCapabilityShapeV1{

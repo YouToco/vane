@@ -197,6 +197,14 @@ func specFromMaterialized(source *types.FetchTarget, config json.RawMessage) (Re
 		params["url"] = decoded.URL
 		params["title"] = decoded.Title
 
+	case source.Platform == types.PlatformWeb && source.Capability == types.CapProductStatus:
+		var decoded materializedContentsConfig
+		if err := strictjson.Decode(config, &decoded); err != nil {
+			return Requirement{}, "web/product_status config 非法"
+		}
+		params["url"] = decoded.URL
+		params["title"] = decoded.Title
+
 	case source.Platform == types.PlatformX && source.Capability == types.CapUserPosts:
 		var decoded materializedScreenNameConfig
 		if err := strictjson.Decode(config, &decoded); err != nil {
@@ -399,12 +407,12 @@ func buildWeb(cap types.Capability, params map[string]string, title string) (*ty
 			Status:     types.FetchTargetStatusActive,
 		}, ""
 
-	case types.CapContents:
+	case types.CapContents, types.CapProductStatus:
 		rawURL := strings.TrimSpace(params["url"])
 		u, err := url.Parse(rawURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
 			u.User != nil {
-			return nil, "web/contents 必须提供合法的 http/https 页面地址（url）"
+			return nil, "web 页面工具必须提供合法的 http/https 页面地址（url）"
 		}
 		cfgMap := map[string]string{"url": rawURL}
 		if t := strings.TrimSpace(params["title"]); t != "" {
@@ -417,19 +425,20 @@ func buildWeb(cap types.Capability, params map[string]string, title string) (*ty
 		if title == "" {
 			title = "页面监控: " + rawURL
 		}
+		capabilityName := string(cap)
 		// 幂等键含 url（一个页面一个监控源）；rawURL 本身是 http(s)://，与 contents:// 前缀
 		// 的内容 canonical_key 不同命名空间，互不干扰。
 		return &types.FetchTarget{
 			Platform:   types.PlatformWeb,
-			Capability: types.CapContents,
-			URL:        "vane://web/contents?url=" + url.QueryEscape(rawURL),
+			Capability: cap,
+			URL:        "vane://web/" + capabilityName + "?url=" + url.QueryEscape(rawURL),
 			Title:      title,
 			Config:     cfg,
 			Status:     types.FetchTargetStatusActive,
 		}, ""
 
 	default:
-		return nil, "web 平台仅支持 feed / search / contents 能力"
+		return nil, "web 平台仅支持 feed / search / contents / product_status 能力"
 	}
 }
 

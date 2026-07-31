@@ -43,6 +43,9 @@ const (
 	CapabilityImplementationExaV1 CapabilityImplementationIDV1 = "fetcher.exa/v1"
 	// CapabilityImplementationBindingV1 is the vetted TikHub binding engine.
 	CapabilityImplementationBindingV1 CapabilityImplementationIDV1 = "fetcher.binding/v1"
+	// CapabilityImplementationProductStatusV1 reads a supported first-party
+	// public product catalog without a user credential or paid proxy.
+	CapabilityImplementationProductStatusV1 CapabilityImplementationIDV1 = "fetcher.product-status/v1"
 )
 
 // ModelProviderIDV1 names a controlled model-provider adapter.

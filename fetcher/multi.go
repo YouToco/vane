@@ -20,19 +20,21 @@ import (
 
 // Multi 持有各类型抓取器。零外部状态，多 goroutine 可并发复用。
 type Multi struct {
-	rss          *Fetcher
-	exa          *ExaFetcher
-	exaContents  *ExaContentsFetcher
-	binding      *BindingFetcher
-	runtimeV1    *RuntimeFetchResolverV1
-	runtimeV1Err error
+	rss           *Fetcher
+	exa           *ExaFetcher
+	exaContents   *ExaContentsFetcher
+	productStatus *ProductStatusFetcher
+	binding       *BindingFetcher
+	runtimeV1     *RuntimeFetchResolverV1
+	runtimeV1Err  error
 }
 
 type runtimeFetchExecutorSetV1 struct {
-	rss         *Fetcher
-	exa         *ExaFetcher
-	exaContents *ExaContentsFetcher
-	binding     *BindingFetcher
+	rss           *Fetcher
+	exa           *ExaFetcher
+	exaContents   *ExaContentsFetcher
+	productStatus *ProductStatusFetcher
+	binding       *BindingFetcher
 }
 
 // NewMulti 按抓取配置构造全部抓取器。未配置 key 的信源类型仍会构造
@@ -54,7 +56,8 @@ func NewMulti(cfg config.FetchConfig, seen SeenChecker, rec BindingCallRecorder)
 	set := newRuntimeFetchExecutorSetV1(cfg, seen, rec)
 	return &Multi{
 		rss: set.rss, exa: set.exa, exaContents: set.exaContents,
-		binding: set.binding, runtimeV1Err: err,
+		productStatus: set.productStatus,
+		binding:       set.binding, runtimeV1Err: err,
 	}
 }
 
@@ -75,14 +78,25 @@ func NewMultiWithRuntimeRoutesV1(
 	}
 	routes := make([]RuntimeFetchRouteV1, 0, len(currentRoutes)+len(retainedRoutes))
 	routes = append(routes, currentRoutes...)
-	routes = append(routes, retainedRoutes...)
+	// Credentialless product-status routes have no generation to retain. An
+	// older provider set therefore contains the exact same route key; keep the
+	// current executor once instead of presenting a false duplicate to the
+	// strict resolver. Credentialed duplicate identities remain rejected.
+	for _, retained := range retainedRoutes {
+		if retained.Capability.ImplementationVersion ==
+			runtimepolicy.CapabilityImplementationProductStatusV1 {
+			continue
+		}
+		routes = append(routes, retained)
+	}
 	resolver, err := NewRuntimeFetchResolverV1(routes...)
 	if err != nil {
 		return nil, err
 	}
 	return &Multi{
 		rss: set.rss, exa: set.exa, exaContents: set.exaContents,
-		binding: set.binding, runtimeV1: resolver,
+		productStatus: set.productStatus,
+		binding:       set.binding, runtimeV1: resolver,
 	}, nil
 }
 
@@ -111,10 +125,11 @@ func newRuntimeFetchExecutorSetV1(
 	rss.seen = seen
 
 	return runtimeFetchExecutorSetV1{
-		rss:         rss,
-		exa:         NewExa(cfg, rec),
-		exaContents: exaContents,
-		binding:     NewBinding(cfg, seen, rec),
+		rss:           rss,
+		exa:           NewExa(cfg, rec),
+		exaContents:   exaContents,
+		productStatus: NewProductStatus(cfg, rec),
+		binding:       NewBinding(cfg, seen, rec),
 	}
 }
 
@@ -166,6 +181,14 @@ func runtimeFetchRoutesV1(
 				CredentialRef:         exaRef,
 			},
 			ExaContents: set.exaContents,
+		},
+		{
+			Capability: runtimepolicy.CapabilityV1{
+				Platform: string(types.PlatformWeb), Capability: string(types.CapProductStatus),
+				Kind:                  string(types.KindPageContent),
+				ImplementationVersion: runtimepolicy.CapabilityImplementationProductStatusV1,
+			},
+			ProductStatus: set.productStatus,
 		},
 	}
 	for _, pair := range []struct {
@@ -230,6 +253,8 @@ func (m *Multi) Fetch(ctx context.Context, src types.FetchTarget) ([]types.Conte
 			return m.exa.Fetch(ctx, src)
 		case types.CapContents:
 			return m.exaContents.Fetch(ctx, src)
+		case types.CapProductStatus:
+			return m.productStatus.Fetch(ctx, src)
 		}
 
 	case types.PlatformXHS:

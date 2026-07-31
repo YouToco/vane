@@ -206,6 +206,11 @@ func (c CapabilityV1) validateImplementationCredential() error {
 			return invalidPolicy("binding capability has unexpected dependency credentials")
 		}
 		return c.CredentialRef.validateFor(CredentialIDTikHubPrimaryV1)
+	case CapabilityImplementationProductStatusV1:
+		if c.CredentialRef != (CredentialRefV1{}) || len(c.DependencyCredentialRefs) != 0 {
+			return invalidPolicy("product status capability must be credentialless")
+		}
+		return nil
 	default:
 		return invalidPolicy("capability implementation is unsupported")
 	}

@@ -85,6 +85,30 @@ The accepted Tool calls are stored on the approved task head without losing
 the Tool name or canonical arguments. Materialized provider URL/config is
 derived execution data, not the task's authority.
 
+### Dynamic official product pages
+
+`web_contents` is a general extracted-page Tool. It must not silently pretend
+that a JavaScript-only page was read when the extractor returned no body.
+
+`web_product_status` is the narrow structured alternative for supported
+official pricing pages. It accepts the user-provided page URL, but its runtime
+calls only a code-allowlisted first-party public endpoint and emits a stable
+purchase-state snapshot. The first adapter is Kimi's membership pricing page:
+
+- official page: `https://www.kimi.com/membership/pricing`;
+- official ConnectRPC method: `kimi.gateway.order.v1.GoodsService/ListGoods`;
+- `REASON_SUBSCRIPTION_NEED_APPLY` on every paid plan means reservation-only,
+  not directly purchasable;
+- a paid plan with no transition gate means directly purchasable;
+- the raw reason, plan, billing cycle and price are preserved in evidence and
+  the upstream call is recorded as `official_fetch` for admin trace review.
+
+This Tool is intentionally separate from `web_contents`. Hiding a domain
+adapter inside the Exa implementation would make the frozen implementation
+label, credential policy and admin trace untrue. Unsupported product pages
+fail explicitly rather than falling back to model memory or guessing a
+private endpoint.
+
 ## External-fact authority
 
 Model weights are not a current truth source for mutable external facts.

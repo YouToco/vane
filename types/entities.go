@@ -274,6 +274,9 @@ const (
 	// 上游返回 costDollars 时保存原金额，否则由数据库生效价目表计算。
 	// source_id 归因到具体信源。
 	ToolCallKindExaFetch ToolCallKind = "exa_fetch"
+	// ToolCallKindOfficialFetch is a credentialless request to a first-party,
+	// allowlisted public API used to render an official page.
+	ToolCallKindOfficialFetch ToolCallKind = "official_fetch"
 )
 
 // 工具调用错误分类（tool_calls.error_type）。低基数硬枚举：per-tool 错误率

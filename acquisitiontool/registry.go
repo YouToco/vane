@@ -112,6 +112,10 @@ var catalog = map[key]Entry{
 		Platform: types.PlatformWeb, Capability: types.CapContents,
 		Kind: types.KindPageContent, Status: StatusAvailable,
 	},
+	{types.PlatformWeb, types.CapProductStatus}: {
+		Platform: types.PlatformWeb, Capability: types.CapProductStatus,
+		Kind: types.KindPageContent, Status: StatusAvailable,
+	},
 	{types.PlatformX, types.CapUserPosts}: {
 		Platform: types.PlatformX, Capability: types.CapUserPosts,
 		Kind: types.KindArticle, Status: StatusAvailable,
