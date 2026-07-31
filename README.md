@@ -25,9 +25,12 @@ contain no production workflow, runner label, or production credential.
   against PostgreSQL 18. It deliberately matches source CI test ordering:
   Store integration tests share one database, so random start-order changes
   produce timing-only migration-lock and refill-clock failures rather than an
-  independent isolation signal. Frontend Gate is `npm ci`, tests, typecheck,
-  and build. After each Gate, the source is materialized again at the exact SHA
-  with a short-lived read key; release builds start from that new clean tree.
+  independent isolation signal. The Go package timeout is 25 minutes because
+  the migration-heavy store package can exceed 15 minutes under race,
+  coverage, and a forced uncached run. Frontend Gate is `npm ci`, tests,
+  typecheck, and build. After each Gate, the source is materialized again at
+  the exact SHA with a short-lived read key; release builds start from that new
+  clean tree.
 - `deploy` runs on `vane-deploy`. It downloads only artifacts named with the
   current run ID, attempt, component, and source SHA. It never downloads source
   trees and runs no source build, npm install, or Go build/test command.

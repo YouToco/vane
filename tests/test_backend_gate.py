@@ -11,7 +11,7 @@ class BackendGateTests(unittest.TestCase):
         workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
 
         self.assertIn(
-            "go test -race -count=1 -timeout=15m \\\n", workflow
+            "go test -race -count=1 -timeout=25m \\\n", workflow
         )
         self.assertNotIn("-shuffle", workflow)
         self.assertIn(
