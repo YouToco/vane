@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/YouToco/vane/config"
@@ -124,6 +125,38 @@ func TestExaFetch_MapsResults(t *testing.T) {
 	contents, _ := req["contents"].(map[string]any)
 	if contents == nil || contents["text"] != true {
 		t.Errorf("contents.text 应为 true，实际 %v", req["contents"])
+	}
+}
+
+func TestParseExaPublishedAtUsesLeadingVisibleDate(t *testing.T) {
+	text := "Advancing the price-performance frontier with GPT-5.6 | OpenAI\n\n" +
+		"July 30, 2026\n\n# Advancing the price-performance frontier with GPT-5.6"
+	got := parseExaPublishedAt("", text)
+	want := time.Date(2026, time.July, 30, 0, 0, 0, 0, time.UTC)
+	if got == nil || !got.Equal(want) {
+		t.Fatalf("visible official date = %v, want %v", got, want)
+	}
+}
+
+func TestParseExaPublishedAtKeepsStructuredDateAuthoritative(t *testing.T) {
+	got := parseExaPublishedAt(
+		"2026-07-31T06:25:43Z",
+		"Media title\n\nJuly 30, 2026\n\nArticle body",
+	)
+	want := time.Date(2026, time.July, 31, 6, 25, 43, 0, time.UTC)
+	if got == nil || !got.Equal(want) {
+		t.Fatalf("structured date = %v, want %v", got, want)
+	}
+}
+
+func TestParseExaPublishedAtRejectsDatesOutsideLeadingMetadata(t *testing.T) {
+	lines := []string{"Article title"}
+	for i := 0; i < 12; i++ {
+		lines = append(lines, "leading article line")
+	}
+	lines = append(lines, "July 30, 2026")
+	if got := parseExaPublishedAt("", strings.Join(lines, "\n")); got != nil {
+		t.Fatalf("deep article date was accepted as publication evidence: %v", got)
 	}
 }
 
