@@ -192,6 +192,10 @@ live Tool candidates.
 - If the manual requires cross verification, the event must cite at least one
   different current-run candidate after the primary. Its publication time may
   differ, but it must remain inside the deterministic observation window.
+- Missing cross evidence is never synthesized from lexical overlap. The
+  qualifier must cite the pair it judged to describe the same release, and
+  deterministic validation rejects a secondary page whose title does not
+  identify that release.
 - `no_match`, uncertain model output, malformed citations and unavailable
   evidence all stop before score, card generation and push.
 - A qualified Tool-task event is already matched to explicit user intent in
