@@ -297,7 +297,10 @@ func TestGenerateStructuredWithEvidencePolicyV3UsesOneMultiSourceCall(
 			t.Fatal(err)
 		}
 	}
-	reply := `{"schema_version":"vane.cardgen-insight/v1","body_md":"**已发布**","what_changed":"正式发布","why_it_matters":"影响当前任务","importance_reason":"两份来源交叉确认","claims":[{"text":"已确认发布","excerpt":"共同证据","source_refs":["source-1","source-2"]}]}`
+	// Evidence-card claims are intentionally discarded. Reproduce the
+	// production failure shape: an excerpt differs by one Unicode hyphen and
+	// therefore cannot be sealed against either exact source.
+	reply := `{"schema_version":"vane.cardgen-insight/v1","body_md":"**已发布**","what_changed":"正式发布","why_it_matters":"影响当前任务","importance_reason":"两份来源交叉确认","claims":[{"text":"已确认发布","excerpt":"共同‑证据","source_refs":["source-1","source-2"]}]}`
 	cg, captured := newTestCardGen(t, http.StatusOK, reply, nil)
 	got, err := cg.GenerateStructuredWithEvidencePolicyV3(
 		t.Context(), 2, 3, types.ScoredItem{Item: items[0]},
@@ -306,17 +309,15 @@ func TestGenerateStructuredWithEvidencePolicyV3UsesOneMultiSourceCall(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.WhatChanged != "正式发布" || len(got.Claims) != 1 ||
+	if got.WhatChanged != "正式发布" || got.WhyItMatters != "影响当前任务" ||
+		len(got.Claims) != 0 ||
 		captured.callCount() != 1 {
 		t.Fatalf("result=%+v calls=%d", got, captured.callCount())
 	}
 	system, user := captured.snapshot()
 	if system != structuredEventEvidenceSystemPromptV1 ||
 		!strings.Contains(system,
-			"单一来源事实只能引用含有该 excerpt 的标签") ||
-		!strings.Contains(system,
-			"禁止为了表示交叉验证而加入不含该逐字 excerpt 的来源") ||
-		!strings.Contains(system, structuredProjectionClaimContractV1) ||
+			"claims 必须输出空数组") ||
 		!strings.Contains(user, "来源标签：source-1") ||
 		!strings.Contains(user, "来源标签：source-2") ||
 		strings.Contains(user, `"content_item_id"`) ||
