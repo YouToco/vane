@@ -6,6 +6,7 @@ import Costs from "./Costs";
 import Invites from "./Invites";
 import Pricing from "./Pricing";
 import CallCostLedger from "./CallCostLedger";
+import ExecutionTraces from "./ExecutionTraces";
 import { useI18n } from "@/i18n";
 
 // 管理面：只承载**平台级**视图（跨租户/系统级），与用户面严格分开。
@@ -46,6 +47,7 @@ export default function Admin() {
           <TabsTrigger value="costs">{A.tabCosts}</TabsTrigger>
           <TabsTrigger value="cost-calls">{A.tabCallCosts}</TabsTrigger>
           <TabsTrigger value="pricing">{A.tabPricing}</TabsTrigger>
+          <TabsTrigger value="execution-traces">执行轨迹</TabsTrigger>
           <TabsTrigger value="invites">{A.tabInvites}</TabsTrigger>
         </TabsList>
         <TabsContent value="observability" className="mt-4 space-y-4">
@@ -63,6 +65,10 @@ export default function Admin() {
         <TabsContent value="pricing" className="mt-4 space-y-4">
           {zhOnly}
           <Pricing />
+        </TabsContent>
+        <TabsContent value="execution-traces" className="mt-4 space-y-4">
+          {zhOnly}
+          <ExecutionTraces />
         </TabsContent>
         <TabsContent value="invites" className="mt-4">
           <Invites />

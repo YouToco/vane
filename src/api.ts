@@ -16,6 +16,74 @@ export interface MeResponse {
   email?: string;
 }
 
+// ---- 平台管理：指定用户/任务/运行的真实执行轨迹 ----
+
+export interface AdminTraceUser {
+  tenant_id: number;
+  user_id: number;
+  name: string;
+  email: string;
+  task_count: number;
+}
+
+export interface AdminTraceTask {
+  task_id: string;
+  title: string;
+  status: string;
+  run_count: number;
+  last_run_at?: string;
+}
+
+export interface AdminTraceRun {
+  snapshot_id: number;
+  schema_version: string;
+  status: string;
+  result: string;
+  source_coverage: string;
+  processing: string;
+  failure_code: string;
+  failure_message: string;
+  created_at: string;
+  finalized_at?: string;
+  model_calls: number;
+  tool_calls: number;
+}
+
+export interface AdminTraceEvent {
+  kind: "model" | "tool";
+  created_at: string;
+  span_name?: string;
+  provider?: string;
+  model?: string;
+  system_prompt?: string;
+  user_prompt?: string;
+  completion?: string;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  latency_ms?: number;
+  temperature?: number;
+  max_tokens?: number;
+  tool_name?: string;
+  tool_kind?: string;
+  endpoint_path?: string;
+  arguments?: unknown;
+  result_preview?: string;
+  result_size?: number;
+  result_truncated?: boolean;
+  http_status?: number;
+  duration_ms?: number;
+  error_type?: string;
+  error?: string;
+  pricing_status?: string;
+  cost_amount?: number;
+  cost_currency?: string;
+}
+
+export interface AdminExecutionTrace {
+  run: AdminTraceRun;
+  events: AdminTraceEvent[];
+}
+
 export interface FeishuStatus {
   configured: boolean;
   connected: boolean;
@@ -1670,7 +1738,30 @@ export const api = {
       items: arr(response.items),
     }));
   },
-
+  adminTraceUsers: () =>
+    request<{ items: AdminTraceUser[] }>(
+      "/api/admin/execution-traces/users",
+    ).then((response) => arr(response.items)),
+  adminTraceTasks: (tenantID: number, userID: number) =>
+    request<{ items: AdminTraceTask[] }>(
+      `/api/admin/execution-traces/tenants/${tenantID}/users/${userID}/tasks`,
+    ).then((response) => arr(response.items)),
+  adminTraceRuns: (tenantID: number, userID: number, taskID: string) =>
+    request<{ items: AdminTraceRun[] }>(
+      `/api/admin/execution-traces/tenants/${tenantID}/users/${userID}/tasks/${encodeURIComponent(taskID)}/runs`,
+    ).then((response) => arr(response.items)),
+  adminExecutionTrace: (
+    tenantID: number,
+    userID: number,
+    taskID: string,
+    snapshotID: number,
+  ) =>
+    request<AdminExecutionTrace>(
+      `/api/admin/execution-traces/tenants/${tenantID}/users/${userID}/tasks/${encodeURIComponent(taskID)}/runs/${snapshotID}`,
+    ).then((response) => ({
+      ...response,
+      events: arr(response.events),
+    })),
   // ---- M5 Gate 可观测性（契约 §16）----
   // 只读端点，窗口由前端固化档位给（见 Observability.tsx 的 WINDOW_OPTIONS），
   // 不接受自由输入——window_hours 直接进后端 time.Duration 与全部聚合 SQL 的 since。
