@@ -501,6 +501,17 @@ func truncateUTF8(s string, max int) string {
 	return s[:cut]
 }
 
+const toolResultPreviewMaxBytes = 8 * 1024
+
+func toolResultPreview(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	safe := strings.ToValidUTF8(
+		strings.ReplaceAll(string(body), "\x00", ""), "�")
+	return truncateUTF8(safe, toolResultPreviewMaxBytes)
+}
+
 // noRedirect 禁止 http.Client 跟随重定向，30x 原样返回给调用方按非 2xx 处理。
 // 原因：Go 跨域重定向只剥离 Authorization/Cookie 等四个标准头，自定义头
 // （如 Exa 的 x-api-key）会被原样带到任意 Location 目标——上游 CDN 配置错误或

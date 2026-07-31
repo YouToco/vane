@@ -138,18 +138,19 @@ func do(
 	resp, err := c.Complete(ctx, req)
 
 	call := &types.LLMCall{
-		TenantID:     meta.TenantID,
-		TraceID:      meta.TraceID,
-		SpanName:     meta.SpanName,
-		UserID:       meta.UserID,
-		RefType:      meta.RefType,
-		RefID:        meta.RefID,
-		Provider:     c.provider,
-		Model:        c.requestModel(req.Model), // 成功路径下面会覆盖为上游回报的实际模型名
-		SystemPrompt: req.System,
-		UserPrompt:   req.User,
-		Temperature:  req.Temperature,
-		MaxTokens:    req.MaxTokens,
+		RunSnapshotID: runSnapshotAttribution(ctx),
+		TenantID:      meta.TenantID,
+		TraceID:       meta.TraceID,
+		SpanName:      meta.SpanName,
+		UserID:        meta.UserID,
+		RefType:       meta.RefType,
+		RefID:         meta.RefID,
+		Provider:      c.provider,
+		Model:         c.requestModel(req.Model), // 成功路径下面会覆盖为上游回报的实际模型名
+		SystemPrompt:  req.System,
+		UserPrompt:    req.User,
+		Temperature:   req.Temperature,
+		MaxTokens:     req.MaxTokens,
 	}
 
 	if resp != nil {

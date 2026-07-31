@@ -199,6 +199,7 @@ func (e *ExaFetcher) doSearchWithEffectGate(
 	if err != nil {
 		return nil, types.NewAppError(types.CodeValidation, "构造 Exa 请求体失败", err)
 	}
+	var resultBody []byte
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.searchURL, bytes.NewReader(payload))
 	if err != nil {
@@ -218,7 +219,7 @@ func (e *ExaFetcher) doSearchWithEffectGate(
 		ae := classifyDoError(e.searchURL, err)
 		// Do 失败（超时/连接拒绝）也记账（对抗审查 F1）：真实发起了上游尝试，
 		// 不记则网络层故障在账本上隐形。status=0 表示未拿到 HTTP 响应。
-		e.recordCall(ctx, src, 0, elapsed, 0, 0, usageQuantity, ae)
+		e.recordCall(ctx, src, payload, resultBody, 0, elapsed, 0, 0, usageQuantity, ae)
 		return nil, ae
 	}
 	defer resp.Body.Close()
@@ -228,7 +229,7 @@ func (e *ExaFetcher) doSearchWithEffectGate(
 	// 账本上隐形，只能翻应用日志。与 TikHub（binding.go 成败都记）对齐：拿到 HTTP
 	// 响应即记，cost 只在成功路径填。fail 闭包统一"记账后返回该错误"。
 	fail := func(status, bodySize int, ae error) error {
-		e.recordCall(ctx, src, status, elapsed, bodySize, 0, usageQuantity, ae)
+		e.recordCall(ctx, src, payload, resultBody, status, elapsed, bodySize, 0, usageQuantity, ae)
 		return ae
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
@@ -252,6 +253,7 @@ func (e *ExaFetcher) doSearchWithEffectGate(
 	if err != nil {
 		return nil, fail(resp.StatusCode, 0, classifyDoError(e.searchURL, err))
 	}
+	resultBody = data
 	if int64(len(data)) > e.maxBytes {
 		return nil, fail(resp.StatusCode, len(data), types.NewAppError(types.CodeValidation,
 			fmt.Sprintf("Exa 响应体超过 %d 字节上限", e.maxBytes), nil))
@@ -264,7 +266,7 @@ func (e *ExaFetcher) doSearchWithEffectGate(
 		return nil, fail(resp.StatusCode, len(data), ae)
 	}
 
-	e.recordCall(ctx, src, resp.StatusCode, elapsed, len(data),
+	e.recordCall(ctx, src, payload, resultBody, resp.StatusCode, elapsed, len(data),
 		er.CostDollars.Total, usageQuantity, nil)
 	return &er, nil
 }
@@ -363,6 +365,8 @@ func mapExaResults(src types.FetchTarget, results []exaResult) ([]types.ContentI
 func (e *ExaFetcher) recordCall(
 	ctx context.Context,
 	src types.FetchTarget,
+	arguments json.RawMessage,
+	resultBody []byte,
 	status int,
 	elapsed time.Duration,
 	bodySize int,
@@ -375,8 +379,9 @@ func (e *ExaFetcher) recordCall(
 	}
 	ctx, cancel := detachedBindingRecordContext(ctx)
 	defer cancel()
-	trace, tenantID, userID := bindingAttribution(ctx)
+	trace, tenantID, userID, runSnapshotID := bindingAttribution(ctx)
 	rec := &types.ToolCall{
+		RunSnapshotID: runSnapshotID,
 		TraceID:       trace,
 		TenantID:      tenantID,
 		UserID:        userID,
@@ -384,8 +389,10 @@ func (e *ExaFetcher) recordCall(
 		ToolKind:      types.ToolCallKindExaFetch,
 		Provider:      "exa",
 		EndpointPath:  "/search",
+		Arguments:     append(json.RawMessage(nil), arguments...),
 		DurationMs:    int(elapsed.Milliseconds()),
 		ResultSize:    bodySize,
+		ResultPreview: toolResultPreview(resultBody),
 		HTTPStatus:    &status,
 		UsageQuantity: usageQuantity,
 	}

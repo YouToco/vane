@@ -442,10 +442,12 @@ type BindingCallRecorder interface {
 type bindingTraceKeyT struct{}
 type bindingTenantIDKeyT struct{}
 type bindingUserIDKeyT struct{}
+type bindingRunSnapshotIDKeyT struct{}
 
 var bindingTraceKey bindingTraceKeyT
 var bindingTenantIDKey bindingTenantIDKeyT
 var bindingUserIDKey bindingUserIDKeyT
+var bindingRunSnapshotIDKey bindingRunSnapshotIDKeyT
 
 const bindingRecordTimeout = 5 * time.Second
 
@@ -471,9 +473,14 @@ func WithBindingRunAttribution(
 	traceID string,
 	tenantID int64,
 	userID int64,
+	runSnapshotID int64,
 ) context.Context {
 	ctx = WithBindingAttribution(ctx, traceID, userID)
-	return context.WithValue(ctx, bindingTenantIDKey, tenantID)
+	ctx = context.WithValue(ctx, bindingTenantIDKey, tenantID)
+	if runSnapshotID > 0 {
+		ctx = context.WithValue(ctx, bindingRunSnapshotIDKey, runSnapshotID)
+	}
+	return ctx
 }
 
 // BindingAttributionFromContext 读取上游账本归属。hasUser=false 是合法的系统/调度
@@ -500,6 +507,7 @@ func bindingAttribution(ctx context.Context) (
 	traceID string,
 	tenantID *int64,
 	userID *int64,
+	runSnapshotID *int64,
 ) {
 	traceID, uid, ok := BindingAttributionFromContext(ctx)
 	if ok {
@@ -509,7 +517,11 @@ func bindingAttribution(ctx context.Context) (
 	if hasTenant {
 		tenantID = &tid
 	}
-	return traceID, tenantID, userID
+	snapshotID, hasSnapshot := ctx.Value(bindingRunSnapshotIDKey).(int64)
+	if hasSnapshot && snapshotID > 0 {
+		runSnapshotID = &snapshotID
+	}
+	return traceID, tenantID, userID, runSnapshotID
 }
 
 // detachedBindingRecordContext 让“已经打到上游”的调用即使随后被调用方取消也能
@@ -982,7 +994,7 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 	}
 	ctx, cancel := detachedBindingRecordContext(ctx)
 	defer cancel()
-	trace, tenantID, userID := bindingAttribution(ctx)
+	trace, tenantID, userID, runSnapshotID := bindingAttribution(ctx)
 	clean := make(map[string]any, len(params))
 	for k, v := range params {
 		if s, isStr := v.(string); isStr {
@@ -993,6 +1005,7 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 	}
 	args, _ := json.Marshal(clean)
 	rec := &types.ToolCall{
+		RunSnapshotID: runSnapshotID,
 		TraceID:       trace,
 		TenantID:      tenantID,
 		UserID:        userID,
@@ -1012,6 +1025,7 @@ func (b *BindingFetcher) record(ctx context.Context, entry tikhubcatalog.Entry, 
 		rec.HTTPStatus = &status
 		rec.DurationMs = res.DurationMs
 		rec.ResultSize = len(res.Body)
+		rec.ResultPreview = toolResultPreview(res.Body)
 		if res.Status < 200 || res.Status >= 300 {
 			rec.ErrorType = types.ToolErrHTTP
 		}

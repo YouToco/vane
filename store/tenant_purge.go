@@ -69,6 +69,9 @@ type purgeStep struct {
 //
 // 排错了不会静默——FK 约束会让整个事务失败，而 dry-run 就是为了在真删之前撞出这个。
 var purgeOrder = []purgeStep{
+	// Sensitive admin-read evidence binds an exact immutable target run and
+	// must be removed before its snapshot during explicit tenant erasure.
+	{"admin_trace_access_events", "(target_tenant_id = $1 OR actor_tenant_id = $1)"},
 	// Edit receipts are children of the durable operation. Deleting the operation
 	// clears a surviving schedule's operation/fence marker through its scoped FK;
 	// both audit tables still need explicit rows in the purge report.
@@ -132,6 +135,9 @@ var purgeOrder = []purgeStep{
 	// Remove it before snapshots; shared content remains outside tenant purge.
 	{"task_run_content_provenance", "tenant_id = $1"},
 	{"push_batches", "tenant_id = $1"},
+	// Exact model/tool receipts reference immutable run snapshots from 082.
+	{"llm_calls", "tenant_id = $1"},
+	{"tool_calls", "tenant_id = $1"},
 	// Compiled push batches retain the immutable run snapshot through migration
 	// 031, so batches must be gone before either the marked parent or its
 	// sidecar. A marked run also points at its immutable cutover event; parents
@@ -159,8 +165,6 @@ var purgeOrder = []purgeStep{
 	// pointer row while preserving event evidence; tenant purge then reports
 	// and deletes the now-unreferenced immutable events explicitly.
 	{"task_run_snapshot_v2_cutover_events", "tenant_id = $1"},
-	{"llm_calls", "tenant_id = $1"},
-	{"tool_calls", "tenant_id = $1"},
 	{"user_sessions", "tenant_id = $1"},
 
 	// tenant_quota 与 memberships 一样是纯租户所有的行，无子表引用它，位置随意；

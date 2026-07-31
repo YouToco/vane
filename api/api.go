@@ -226,6 +226,10 @@ func Mount(mux *http.ServeMux, deps Deps) {
 	inner.HandleFunc("GET /api/admin/runstats", s.handleRunstats)
 	inner.HandleFunc("GET /api/admin/provider-prices", s.handleListProviderPrices)
 	inner.HandleFunc("POST /api/admin/provider-prices", s.handleReplaceProviderPrice)
+	inner.HandleFunc("GET /api/admin/execution-traces/users", s.handleListAdminTraceUsers)
+	inner.HandleFunc("GET /api/admin/execution-traces/tenants/{tenant_id}/users/{user_id}/tasks", s.handleListAdminTraceTasks)
+	inner.HandleFunc("GET /api/admin/execution-traces/tenants/{tenant_id}/users/{user_id}/tasks/{task_id}/runs", s.handleListAdminTraceRuns)
+	inner.HandleFunc("GET /api/admin/execution-traces/tenants/{tenant_id}/users/{user_id}/tasks/{task_id}/runs/{snapshot_id}", s.handleGetAdminExecutionTrace)
 
 	// M7 画像 authority：profile 是只读投影；来源级 claim 操作使用
 	// version CAS + 幂等回执 + append-only 补偿事件。

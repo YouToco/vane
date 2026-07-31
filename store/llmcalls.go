@@ -39,6 +39,12 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 			"显式 llm_calls 租户归属必须同时包含正数 tenant_id 与 user_id",
 			types.ErrValidation)
 	}
+	if c.RunSnapshotID != nil &&
+		(*c.RunSnapshotID <= 0 || c.TenantID == nil || c.UserID == nil) {
+		return 0, types.NewAppError(types.CodeValidation,
+			"llm_calls 运行快照归属必须包含正数 snapshot/tenant/user",
+			types.ErrValidation)
+	}
 	if (c.PromptCacheHitTokens == nil) != (c.PromptCacheMissTokens == nil) {
 		return 0, types.NewAppError(types.CodeValidation,
 			"缓存命中与未命中 token 必须同时提供或同时缺省", types.ErrValidation)
@@ -94,7 +100,7 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 			prefix_cache_hit, temperature, max_tokens, error,
 			tenant_id, prompt_cache_hit_tokens, prompt_cache_miss_tokens,
 			reasoning_tokens, pricing_rule_id, pricing_status,
-			cost_amount, cost_currency, created_at
+			cost_amount, cost_currency, run_snapshot_id, created_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10,
@@ -122,6 +128,7 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 			  WHEN $14::numeric > 0 THEN 'USD'
 			  ELSE (SELECT currency FROM price)
 			END,
+			$23,
 			(SELECT at FROM stamp)
 		) RETURNING id`,
 		c.TraceID, c.SpanName, c.UserID, c.RefType, c.RefID,
@@ -129,6 +136,7 @@ func (s *Store) InsertLLMCall(ctx context.Context, c *types.LLMCall) (int64, err
 		c.PromptTokens, c.CompletionTokens, c.LatencyMs, c.CostUSD,
 		c.PrefixCacheHit, c.Temperature, c.MaxTokens, c.Error,
 		c.PromptCacheHitTokens, c.PromptCacheMissTokens, c.ReasoningTokens, c.TenantID,
+		c.RunSnapshotID,
 	).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "写入 llm_calls 记录", err)

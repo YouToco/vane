@@ -223,6 +223,9 @@ type Profile struct {
 // 否则演化与卡片生成的行会混进打分统计。
 type LLMCall struct {
 	ID int64 `json:"id"`
+	// RunSnapshotID is the exact immutable task-run attribution. It is nil for
+	// conversations and historical calls recorded before migration 082.
+	RunSnapshotID *int64 `json:"run_snapshot_id,omitempty"`
 	// TenantID is an internal accounting identity for prepared runs. Legacy
 	// calls leave it nil and retain membership-derived attribution; compiled
 	// calls pin the tenant authorized immediately before the paid request.
@@ -288,6 +291,9 @@ const (
 // （tool_name / error_type / duration），检索留痕字段的存在理由见 015 头注。
 type ToolCall struct {
 	ID int64 `json:"id"`
+	// RunSnapshotID prevents recurring Temporal workflow IDs from mixing tool
+	// calls between separate executions. Legacy/ad-hoc calls remain nil.
+	RunSnapshotID *int64 `json:"run_snapshot_id,omitempty"`
 	// TenantID is an internal post-effect accounting identity for compiled
 	// runs. It is carried separately from UserID because one user may belong to
 	// more than one tenant. Legacy calls leave it nil and retain the historical

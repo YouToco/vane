@@ -30,6 +30,12 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 			"显式 tool_calls 租户归属必须同时包含正数 tenant_id 与 user_id",
 			types.ErrValidation)
 	}
+	if c.RunSnapshotID != nil &&
+		(*c.RunSnapshotID <= 0 || c.TenantID == nil || c.UserID == nil) {
+		return 0, types.NewAppError(types.CodeValidation,
+			"tool_calls 运行快照归属必须包含正数 snapshot/tenant/user",
+			types.ErrValidation)
+	}
 	c.Provider = strings.ToLower(strings.TrimSpace(c.Provider))
 	if c.UsageQuantity <= 0 {
 		c.UsageQuantity = 1
@@ -81,7 +87,7 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 			error_type, error, duration_ms, retrieval_query, candidate_tools,
 			cost_usd, source_id, tenant_id,
 			provider, usage_quantity, pricing_rule_id, pricing_status,
-			cost_amount, cost_currency, created_at
+			cost_amount, cost_currency, run_snapshot_id, created_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10,
@@ -117,12 +123,14 @@ func (s *Store) InsertToolCall(ctx context.Context, c *types.ToolCall) (int64, e
 			  WHEN (SELECT ok FROM billable) THEN (SELECT currency FROM price)
 			  ELSE NULL
 			END,
+			$21,
 			(SELECT at FROM stamp)
 		) RETURNING id`,
 		c.TraceID, c.UserID, c.SessionID, c.ToolName, c.ToolKind,
 		c.EndpointPath, c.Arguments, c.ResultPreview, c.ResultSize, c.HTTPStatus,
 		c.ErrorType, c.Error, c.DurationMs, c.RetrievalQuery, cands,
 		c.CostUSD, c.SourceID, c.TenantID, c.Provider, c.UsageQuantity,
+		c.RunSnapshotID,
 	).Scan(&id)
 	if err != nil {
 		return 0, types.NewAppError(types.CodeDatabase, "写入 tool_calls 记录", err)

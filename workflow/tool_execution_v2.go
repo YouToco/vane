@@ -96,7 +96,7 @@ func (a *Activities) ExecuteToolInvocationV2(
 	}
 	ctx = fetcher.WithBindingRunAttribution(
 		ctx, expected.TemporalWorkflowID,
-		expected.TenantID, expected.UserID)
+		expected.TenantID, expected.UserID, input.Snapshot.SnapshotID)
 	items, fetchErr := frozenFetcher.FetchWithPolicyV1(
 		ctx, target, binding.Capability,
 		func(effectCtx context.Context) error {

@@ -397,6 +397,10 @@ func TestSec_ProtectedEndpointsRequireSession(t *testing.T) {
 		{http.MethodDelete, "/api/admin/invites/SOMECODE"},
 		{http.MethodGet, "/api/admin/provider-prices"},
 		{http.MethodPost, "/api/admin/provider-prices"},
+		{http.MethodGet, "/api/admin/execution-traces/users"},
+		{http.MethodGet, "/api/admin/execution-traces/tenants/1/users/1/tasks"},
+		{http.MethodGet, "/api/admin/execution-traces/tenants/1/users/1/tasks/task/runs"},
+		{http.MethodGet, "/api/admin/execution-traces/tenants/1/users/1/tasks/task/runs/1"},
 		{http.MethodGet, "/api/feishu/status"},
 		{http.MethodPost, "/api/feishu/config"},
 	}
@@ -726,6 +730,10 @@ func TestSec_PlatformEndpointsGatedToOwner(t *testing.T) {
 		{http.MethodDelete, "/api/admin/invites/SOMECODE"},
 		{http.MethodGet, "/api/admin/provider-prices"},
 		{http.MethodPost, "/api/admin/provider-prices"},
+		{http.MethodGet, "/api/admin/execution-traces/users"},
+		{http.MethodGet, "/api/admin/execution-traces/tenants/1/users/1/tasks"},
+		{http.MethodGet, "/api/admin/execution-traces/tenants/1/users/1/tasks/task/runs"},
+		{http.MethodGet, "/api/admin/execution-traces/tenants/1/users/1/tasks/task/runs/1"},
 	}
 	// 普通租户（非平台 owner）：一律不可见。
 	mux, cookie := authzMux(t, 555, 555, nil)

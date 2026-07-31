@@ -16,7 +16,7 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-const latestMigrationVersion int64 = 81
+const latestMigrationVersion int64 = 82
 
 // wantTables 是全部迁移建出的业务表，迁移完成后必须全部存在。
 // 与 TestMigrationsCoverWantTables 双向对账：加表必须同步补账，漏一张 CI 红。
@@ -51,6 +51,8 @@ var wantTables = []string{
 	"user_sessions",
 	// 015 agent 工具调用记账（TikHub 端点注册表契约 §6）
 	"tool_calls",
+	// 082 immutable audit ledger for sensitive platform-owner trace reads.
+	"admin_trace_access_events",
 	// 080 provider/model/endpoint price history and ledger calculation authority.
 	"provider_price_rules",
 	// 017 情报任务手册（Task Playbook P0）

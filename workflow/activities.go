@@ -998,6 +998,10 @@ func (a *Activities) EvolveProfile(ctx context.Context, in EvolveIn) error {
 	if err != nil {
 		return retryableOrNot(err)
 	}
+	if compiled {
+		ctx = llm.WithRunSnapshotAttribution(
+			ctx, in.Run.Snapshot.SnapshotID)
+	}
 	if a.evolver == nil {
 		if compiled {
 			return nonRetryable(types.NewAppError(types.CodeInternal,
@@ -1961,7 +1965,8 @@ func (a *Activities) Fetch(ctx context.Context, p PushParams) ([]types.ContentIt
 		workflowID := activity.GetInfo(ctx).WorkflowExecution.ID
 		if compiled {
 			ctx = fetcher.WithBindingRunAttribution(
-				ctx, workflowID, snapshot.Definition.TenantID, snapshot.Definition.UserID)
+				ctx, workflowID, snapshot.Definition.TenantID,
+				snapshot.Definition.UserID, compiledInput.Snapshot.SnapshotID)
 		} else {
 			ctx = fetcher.WithBindingTrace(ctx, workflowID)
 		}
@@ -2625,6 +2630,8 @@ func (a *Activities) QualifyEvents(
 	if !compiled {
 		return QualifyEventsResult{Items: in.Items, Outcome: "not_configured"}, nil
 	}
+	ctx = llm.WithRunSnapshotAttribution(
+		ctx, in.Run.Snapshot.SnapshotID)
 	rollout := snapshot.ObservationRollout
 	if !rollout.Valid() {
 		return QualifyEventsResult{}, nonRetryable(types.NewAppError(
@@ -3397,6 +3404,10 @@ func (a *Activities) Score(ctx context.Context, in ScoreIn) ([]types.ScoredItem,
 	if err != nil {
 		return nil, retryableOrNot(err)
 	}
+	if compiled {
+		ctx = llm.WithRunSnapshotAttribution(
+			ctx, in.Run.Snapshot.SnapshotID)
+	}
 	// D9 闸门（bug 狩猎 2026-07-19 HIGH：此前只有 EvolveProfile/Fetch 有闸，
 	// Fetch 之后软删的租户仍会在这里烧一整批 LLM 打分钱）。返回空切片走
 	// score 闸门的空批正常终态，与 EvolveProfile 的处理同一条理由：报错会重试，
@@ -3591,6 +3602,10 @@ func (a *Activities) cardGen(
 	snapshot, compiled, err := a.loadAuthoritativeCompiledRun(ctx, in.UserID, in.Run)
 	if err != nil {
 		return nil, retryableOrNot(err)
+	}
+	if compiled {
+		ctx = llm.WithRunSnapshotAttribution(
+			ctx, in.Run.Snapshot.SnapshotID)
 	}
 	// D9 闸门（同 Score，bug 狩猎 2026-07-19 HIGH）：不为已注销租户生成解读正文。
 	if !compiled && a.refuseIfTenantGone(ctx, in.UserID, "cardgen") {
