@@ -15,7 +15,6 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import TaskActionDialog from "@/components/TaskActionDialog";
-import DeliveriesTable from "@/components/DeliveriesTable";
 import TaskHealthPanel from "@/components/TaskHealthPanel";
 import type { TaskHealthAction } from "@/components/TaskHealthPanel";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -44,7 +43,6 @@ import type {
   TaskHealthProjection,
 } from "../api";
 import { fmt, useI18n, type Dict, type Locale } from "@/i18n";
-import { briefDict } from "@/i18n/brief";
 import {
   taskHealthCopy,
   taskHealthLoadingCopy,
@@ -165,9 +163,8 @@ function runOutcomeVariant(
 // 运行与诊断：保留检查时间、用户可理解的结果和情报条数；batch id、发送状态、
 // 阶段漏斗等运维对象不进入普通任务页。
 function RunsTab({ scheduleID }: { scheduleID: string }) {
-  const { t, locale } = useI18n();
+  const { t } = useI18n();
   const D = t.app.taskDetail;
-  const B = briefDict(locale);
   const [items, setItems] = useState<ScheduleBatchItem[]>([]);
   const [total, setTotal] = useState(0);
   const [nextToken, setNextToken] = useState("");
@@ -241,65 +238,53 @@ function RunsTab({ scheduleID }: { scheduleID: string }) {
     );
   }
   return (
-    <div className="space-y-5">
-      <Card>
-        <div className="overflow-x-auto">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>{D.runsColTime}</TableHead>
-                <TableHead>{D.runsColOutcome}</TableHead>
-                <TableHead className="text-right">{D.runsColInsights}</TableHead>
+    <Card>
+      <div className="overflow-x-auto">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>{D.runsColTime}</TableHead>
+              <TableHead>{D.runsColOutcome}</TableHead>
+              <TableHead className="text-right">{D.runsColInsights}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {items.map((b) => (
+              <TableRow key={b.id} className={b.status === "failed" ? "bg-destructive/5" : ""}>
+                <TableCell className="text-sm whitespace-nowrap">
+                  {fmtBeijing(b.created_at)}
+                </TableCell>
+                <TableCell>
+                  <Badge variant={runOutcomeVariant(taskRunOutcome(b.status))}>
+                    {runOutcomeLabel(taskRunOutcome(b.status), D)}
+                  </Badge>
+                </TableCell>
+                <TableCell className="text-right font-mono text-sm whitespace-nowrap">
+                  {fmt(D.insightCount, { n: b.deliveries })}
+                </TableCell>
               </TableRow>
-            </TableHeader>
-            <TableBody>
-              {items.map((b) => (
-                <TableRow key={b.id} className={b.status === "failed" ? "bg-destructive/5" : ""}>
-                  <TableCell className="text-sm whitespace-nowrap">
-                    {fmtBeijing(b.created_at)}
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant={runOutcomeVariant(taskRunOutcome(b.status))}>
-                      {runOutcomeLabel(taskRunOutcome(b.status), D)}
-                    </Badge>
-                  </TableCell>
-                  <TableCell className="text-right font-mono text-sm whitespace-nowrap">
-                    {fmt(D.insightCount, { n: b.deliveries })}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-        <div className="flex items-center justify-between border-t px-4 py-3">
-          <span className="text-sm text-muted-foreground">
-            {fmt(D.shownRuns, { shown: items.length, total })}
-          </span>
-          {nextToken && (
-            <Button variant="outline" size="sm" onClick={loadMore} disabled={loadingMore}>
-              {loadingMore ? (
-                <>
-                  <Loader2 className="mr-2 size-4 animate-spin" />
-                  {t.app.common.loading}
-                </>
-              ) : (
-                t.app.common.loadMore
-              )}
-            </Button>
-          )}
-        </div>
-      </Card>
-      <div className="space-y-2">
-        <h3 className="text-sm font-medium">{B.legacyDiscoveries}</h3>
-        <DeliveriesTable
-          presentation="task-content"
-          fetchPage={(pageSize, pageToken) =>
-            api.scheduleDeliveries(scheduleID, pageSize, pageToken)
-          }
-          emptyText={D.pushesEmpty}
-        />
+            ))}
+          </TableBody>
+        </Table>
       </div>
-    </div>
+      <div className="flex items-center justify-between border-t px-4 py-3">
+        <span className="text-sm text-muted-foreground">
+          {fmt(D.shownRuns, { shown: items.length, total })}
+        </span>
+        {nextToken && (
+          <Button variant="outline" size="sm" onClick={loadMore} disabled={loadingMore}>
+            {loadingMore ? (
+              <>
+                <Loader2 className="mr-2 size-4 animate-spin" />
+                {t.app.common.loading}
+              </>
+            ) : (
+              t.app.common.loadMore
+            )}
+          </Button>
+        )}
+      </div>
+    </Card>
   );
 }
 

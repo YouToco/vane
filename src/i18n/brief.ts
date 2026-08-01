@@ -21,7 +21,6 @@ export interface BriefDict {
   briefFeedbackDeepDive: string;
   briefsEmpty: string;
   briefsShown: string;
-  legacyDiscoveries: string;
 }
 
 const BRIEF_DICTS: Record<Locale, BriefDict> = {
@@ -46,7 +45,6 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefFeedbackDeepDive: "深入了解",
     briefsEmpty: "还没有非空简报。最近检查结果会单独显示，不会覆盖上一份有内容的简报。",
     briefsShown: "已显示 {shown} / {total} 份简报",
-    legacyDiscoveries: "旧版逐条发现记录",
   },
   "zh-Hant": {
     briefTitle: "本次簡報",
@@ -69,7 +67,6 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefFeedbackDeepDive: "深入瞭解",
     briefsEmpty: "還沒有非空簡報。最近檢查結果會單獨顯示，不會覆蓋上一份有內容的簡報。",
     briefsShown: "已顯示 {shown} / {total} 份簡報",
-    legacyDiscoveries: "舊版逐條發現紀錄",
   },
   en: {
     briefTitle: "Brief",
@@ -92,7 +89,6 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefFeedbackDeepDive: "Deep dive",
     briefsEmpty: "No non-empty Brief yet. The latest check is shown separately and never replaces the last useful Brief.",
     briefsShown: "Showing {shown} of {total} Briefs",
-    legacyDiscoveries: "Legacy item-level discoveries",
   },
   ja: {
     briefTitle: "今回のブリーフ",
@@ -115,7 +111,6 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefFeedbackDeepDive: "詳しく見る",
     briefsEmpty: "内容のあるブリーフはまだありません。最新チェックは別に表示され、前回の有用なブリーフを上書きしません。",
     briefsShown: "{total} 件中 {shown} 件のブリーフを表示",
-    legacyDiscoveries: "旧形式の個別発見記録",
   },
   ko: {
     briefTitle: "이번 브리프",
@@ -138,7 +133,6 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefFeedbackDeepDive: "자세히 보기",
     briefsEmpty: "내용이 있는 브리프가 아직 없습니다. 최신 확인은 별도로 표시되며 이전의 유용한 브리프를 덮어쓰지 않습니다.",
     briefsShown: "브리프 {total}개 중 {shown}개 표시",
-    legacyDiscoveries: "기존 항목별 발견 기록",
   },
   es: {
     briefTitle: "Informe",
@@ -161,7 +155,6 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefFeedbackDeepDive: "Profundizar",
     briefsEmpty: "Aún no hay informes con contenido. La última comprobación se muestra aparte y no reemplaza el último informe útil.",
     briefsShown: "Mostrando {shown} de {total} informes",
-    legacyDiscoveries: "Hallazgos individuales del formato anterior",
   },
   fr: {
     briefTitle: "Brief",
@@ -184,7 +177,6 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefFeedbackDeepDive: "Approfondir",
     briefsEmpty: "Aucun Brief non vide pour le moment. La dernière vérification est affichée séparément et ne remplace pas le dernier Brief utile.",
     briefsShown: "{shown} Briefs affichés sur {total}",
-    legacyDiscoveries: "Anciennes découvertes élément par élément",
   },
   de: {
     briefTitle: "Brief",
@@ -207,7 +199,6 @@ const BRIEF_DICTS: Record<Locale, BriefDict> = {
     briefFeedbackDeepDive: "Vertiefen",
     briefsEmpty: "Noch kein nicht-leerer Brief. Die letzte Prüfung wird separat angezeigt und ersetzt den letzten nützlichen Brief nicht.",
     briefsShown: "{shown} von {total} Briefs angezeigt",
-    legacyDiscoveries: "Ältere Einzelfund-Aufzeichnungen",
   },
 };
 

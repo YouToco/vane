@@ -22,7 +22,6 @@ import {
 import { Loader2, ExternalLink } from "lucide-react";
 import { fmt, useI18n, type Dict } from "@/i18n";
 import { fmtBeijing } from "@/lib/time";
-import { taskContentTimestamp } from "@/lib/task-detail-presentation";
 
 const PAGE_SIZE = 20;
 
@@ -74,25 +73,21 @@ function safeExternalHref(raw: string | null | undefined): string | null {
   }
 }
 
-// 投递记录表：推送历史页（全局）与任务详情页（单任务）共用同一渲染与三态逻辑，
-// 差异只在取数函数与空态文案。加载失败与空数据是两种状态（vane-web#18 教训），
-// 这里分别渲染，绝不把错误吞成空表。
+// 投递档案表：专门展示跨任务的发送凭证、用户反馈和审计状态。
+// 任务详情使用 canonical Brief / report，不再重复暴露逐条 delivery。加载失败与空数据
+// 是两种状态（vane-web#18 教训），这里分别渲染，绝不把错误吞成空表。
 // 重新加载：父组件换 key 触发整体重挂载（History 的刷新按钮就是这么做的）。
 export default function DeliveriesTable({
   fetchPage,
   emptyText,
   onLoadingChange,
-  presentation = "history",
 }: {
   fetchPage: (pageSize: number, pageToken?: string) => Promise<DeliveriesResp>;
   emptyText: string;
   onLoadingChange?: (loading: boolean) => void;
-  presentation?: "history" | "task-content";
 }) {
   const { t } = useI18n();
   const H = t.app.history;
-  const D = t.app.taskDetail;
-  const isTaskContent = presentation === "task-content";
   const FEEDBACK_META = feedbackMeta(H);
   const [items, setItems] = useState<DeliveryHistoryItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -220,51 +215,15 @@ export default function DeliveriesTable({
         )
       ) : (
         <Card>
-          {isTaskContent && (
-            <div className="divide-y sm:hidden">
-              {items.map((it) => {
-                const href = safeExternalHref(it.url);
-                return (
-                  <article key={it.id} className="space-y-3 p-4">
-                    <div className="space-y-1">
-                      <time className="block text-xs text-muted-foreground">
-                        {fmtBeijing(taskContentTimestamp(it))}
-                      </time>
-                      {href ? (
-                        <a
-                          href={href}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex items-start gap-1 text-sm font-medium text-primary hover:underline"
-                        >
-                          <span>{it.title || H.noContent}</span>
-                          <ExternalLink className="mt-0.5 size-3 shrink-0" />
-                        </a>
-                      ) : (
-                        <span className="text-sm text-muted-foreground">
-                          {it.title || H.contentDeleted}
-                        </span>
-                      )}
-                    </div>
-                    <div className="text-xs">{renderFeedbacks(it)}</div>
-                  </article>
-                );
-              })}
-            </div>
-          )}
-          <div className={isTaskContent ? "hidden overflow-x-auto sm:block" : "overflow-x-auto"}>
+          <div className="overflow-x-auto">
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>{isTaskContent ? D.contentColTime : H.colTime}</TableHead>
-                  <TableHead>{isTaskContent ? D.contentColContent : H.colContent}</TableHead>
-                  {!isTaskContent && (
-                    <>
-                      <TableHead className="text-right">{H.colScore}</TableHead>
-                      <TableHead>{H.colStatus}</TableHead>
-                    </>
-                  )}
-                  <TableHead>{isTaskContent ? D.contentColFeedback : H.colFeedback}</TableHead>
+                  <TableHead>{H.colTime}</TableHead>
+                  <TableHead>{H.colContent}</TableHead>
+                  <TableHead className="text-right">{H.colScore}</TableHead>
+                  <TableHead>{H.colStatus}</TableHead>
+                  <TableHead>{H.colFeedback}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -273,21 +232,13 @@ export default function DeliveriesTable({
                   return (
                     <TableRow
                       key={it.id}
-                      className={!isTaskContent && it.status === "failed" ? "bg-destructive/5" : ""}
+                      className={it.status === "failed" ? "bg-destructive/5" : ""}
                     >
                       <TableCell
                         className="text-sm whitespace-nowrap"
-                        title={
-                          isTaskContent
-                            ? undefined
-                            : `delivery ${it.id} · batch ${it.batch_id}`
-                        }
+                        title={`delivery ${it.id} · batch ${it.batch_id}`}
                       >
-                        {fmtBeijing(
-                          isTaskContent
-                            ? taskContentTimestamp(it)
-                            : it.sent_at ?? it.created_at,
-                        )}
+                        {fmtBeijing(it.sent_at ?? it.created_at)}
                       </TableCell>
                       <TableCell className="max-w-[200px] truncate">
                         {href ? (
@@ -306,16 +257,12 @@ export default function DeliveriesTable({
                           </span>
                         )}
                       </TableCell>
-                      {!isTaskContent && (
-                        <>
-                          <TableCell className="text-right font-mono text-sm">
-                            {it.score}
-                          </TableCell>
-                          <TableCell>
-                            <Badge variant={statusBadge(it.status)}>{it.status}</Badge>
-                          </TableCell>
-                        </>
-                      )}
+                      <TableCell className="text-right font-mono text-sm">
+                        {it.score}
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant={statusBadge(it.status)}>{it.status}</Badge>
+                      </TableCell>
                       <TableCell>
                         {renderFeedbacks(it)}
                       </TableCell>
@@ -327,7 +274,7 @@ export default function DeliveriesTable({
           </div>
           <div className="flex items-center justify-between border-t px-4 py-3">
             <span className="text-sm text-muted-foreground">
-              {fmt(isTaskContent ? D.contentShown : H.shown, {
+              {fmt(H.shown, {
                 shown: items.length,
                 total,
               })}

@@ -6,11 +6,13 @@ import { test } from "node:test";
 const root = resolve(import.meta.dirname, "..");
 
 test("task pages keep operational internals off the reader-facing surface", async () => {
-  const [dashboard, detail, briefs, zh] = await Promise.all([
+  const [dashboard, detail, briefs, zh, apiClient, briefDictionary] = await Promise.all([
     readFile(resolve(root, "src/pages/TaskDashboard.tsx"), "utf8"),
     readFile(resolve(root, "src/pages/TaskDetail.tsx"), "utf8"),
     readFile(resolve(root, "src/components/TaskBriefFeed.tsx"), "utf8"),
     readFile(resolve(root, "src/i18n/zh.ts"), "utf8"),
+    readFile(resolve(root, "src/api.ts"), "utf8"),
+    readFile(resolve(root, "src/i18n/brief.ts"), "utf8"),
   ]);
 
   assert.doesNotMatch(dashboard, /batches_7d|last_exit_gate/);
@@ -24,6 +26,9 @@ test("task pages keep operational internals off the reader-facing surface", asyn
   assert.doesNotMatch(detail, /batchOutcomeLabel|batchOutcomeVariant/);
   assert.match(detail, /TaskBriefFeed/);
   assert.match(detail, /TaskHealthPanel/);
+  assert.doesNotMatch(detail, /DeliveriesTable|scheduleDeliveries|legacyDiscoveries/);
+  assert.doesNotMatch(apiClient, /scheduleDeliveries/);
+  assert.doesNotMatch(briefDictionary, /legacyDiscoveries|旧版逐条发现记录/);
   assert.match(detail, /health\?\.permissions/);
   assert.match(detail, /latestCheck\?\.finalized_at/);
   assert.match(detail, /scheduleIDRef\.current !== requestedScheduleID/);
