@@ -63,6 +63,7 @@ func TestResearchRunPlanRefV3SealsAllScopeFields(t *testing.T) {
 		TemporalRunID:      identity.TemporalRunID, TenantID: identity.TenantID,
 		UserID: identity.UserID, TaskID: identity.TaskID,
 		DefinitionDigest: digest, CapabilityCatalogDigest: digest, PlanDigest: digest,
+		StepCount: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -74,6 +75,7 @@ func TestResearchRunPlanRefV3SealsAllScopeFields(t *testing.T) {
 		func(ref *ResearchRunPlanRefV3) { ref.UserID++ },
 		func(ref *ResearchRunPlanRefV3) { ref.TaskID += "-other" },
 		func(ref *ResearchRunPlanRefV3) { ref.PlanDigest = strings.Repeat("b", 64) },
+		func(ref *ResearchRunPlanRefV3) { ref.StepCount-- },
 		func(ref *ResearchRunPlanRefV3) { ref.ReferenceDigest = strings.Repeat("b", 64) },
 	}
 	for index, mutate := range mutations {

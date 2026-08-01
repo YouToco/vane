@@ -15,6 +15,7 @@ const (
 	ExecutiveBriefV1 = "compiled-snapshot/v1+run-outcome/v1+brief/v1+" +
 		"structured-insight/v1+event-evidence/v1+executive-brief/v1"
 	CompiledToolSnapshotV2 = "compiled-tool-snapshot/v2"
+	ResearchRunV3          = "research-run/v3"
 )
 
 func IsCompiledV1(version string) bool {
@@ -35,9 +36,12 @@ func IsCompiledToolV2(version string) bool {
 	return version == CompiledToolSnapshotV2
 }
 
+func IsResearchV3(version string) bool { return version == ResearchRunV3 }
+
 // IsDurableActionRuntime includes the empty legacy selector retained by
 // pre-rollout schedule Actions. Unknown future labels remain fail-closed until
 // this shared catalog is intentionally extended.
 func IsDurableActionRuntime(version string) bool {
-	return version == "" || IsCompiledV1(version) || IsCompiledToolV2(version)
+	return version == "" || IsCompiledV1(version) || IsCompiledToolV2(version) ||
+		IsResearchV3(version)
 }

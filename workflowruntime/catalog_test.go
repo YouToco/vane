@@ -11,6 +11,7 @@ func TestDurableActionRuntimeCatalog(t *testing.T) {
 		StructuredInsightV1,
 		StructuredEventEvidenceV1,
 		ExecutiveBriefV1,
+		ResearchRunV3,
 		CompiledToolSnapshotV2,
 	} {
 		if !IsDurableActionRuntime(version) {

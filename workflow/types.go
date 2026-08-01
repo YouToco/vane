@@ -101,12 +101,20 @@ const CompiledRuntimeExecutiveBriefV1 = workflowruntime.ExecutiveBriefV1
 // serve both recurring and command-bound manual task runs.
 const CompiledRuntimeToolSnapshotV2 = workflowruntime.CompiledToolSnapshotV2
 
+// ResearchRuntimeV3 selects the task-manual-driven research workflow. No
+// scheduler emits it until the exact-task canary is explicitly configured.
+const ResearchRuntimeV3 = workflowruntime.ResearchRunV3
+
 func IsCompiledToolRuntimeV2(version string) bool {
 	return workflowruntime.IsCompiledToolV2(version)
 }
 
 func IsCompiledRuntimeV1(version string) bool {
 	return workflowruntime.IsCompiledV1(version)
+}
+
+func IsResearchRuntimeV3(version string) bool {
+	return workflowruntime.IsResearchV3(version)
 }
 
 func HasRunOutcomeV1(version string) bool {

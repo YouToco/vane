@@ -605,6 +605,10 @@ func scanResearchRunPlanV3(scanner researchRunPlanScannerV3) (researchRunPlanRow
 }
 
 func researchRunPlanRefV3(row researchRunPlanRowV3) (types.ResearchRunPlanRefV3, error) {
+	plan, err := runcontext.DecodeResearchExecutionPlanV3(row.PlanPayload)
+	if err != nil {
+		return types.ResearchRunPlanRefV3{}, err
+	}
 	return types.SealResearchRunPlanRefV3(types.ResearchRunPlanRefV3{
 		PlanID: row.ID, RunSnapshotID: row.RunSnapshotID,
 		TemporalWorkflowID: row.TemporalWorkflowID, TemporalRunID: row.TemporalRunID,
@@ -612,6 +616,7 @@ func researchRunPlanRefV3(row researchRunPlanRowV3) (types.ResearchRunPlanRefV3,
 		DefinitionDigest:        row.DefinitionDigest,
 		CapabilityCatalogDigest: row.CapabilityCatalogDigest,
 		PlanDigest:              row.PlanDigest,
+		StepCount:               len(plan.Steps),
 	})
 }
 
@@ -630,7 +635,8 @@ func loadAndValidateResearchRunPlanV3(
 	}
 	plan, err := runcontext.DecodeResearchExecutionPlanV3(row.PlanPayload)
 	if err != nil || plan.DefinitionDigest != row.DefinitionDigest ||
-		plan.CapabilityCatalogDigest != row.CapabilityCatalogDigest {
+		plan.CapabilityCatalogDigest != row.CapabilityCatalogDigest ||
+		len(plan.Steps) != ref.StepCount {
 		return runcontext.ResearchExecutionPlanV3{}, researchRunPlanRowV3{}, researchRunIntegrityError()
 	}
 	return plan, row, nil

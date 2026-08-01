@@ -565,6 +565,7 @@ type Activities struct {
 	pushEffectCanaryTaskID           string
 	canonicalBriefRendererTaskID     string
 	canonicalBriefDashboardOrigin    string
+	researchRuntimeV3                ResearchRuntimeCoordinatorV3
 }
 
 // ActivitiesOption configures rollout-only Activity behavior without adding

@@ -154,6 +154,7 @@ type ResearchRunPlanRefV3 struct {
 	DefinitionDigest        string `json:"definition_digest"`
 	CapabilityCatalogDigest string `json:"capability_catalog_digest"`
 	PlanDigest              string `json:"plan_digest"`
+	StepCount               int    `json:"step_count"`
 	ReferenceDigest         string `json:"reference_digest"`
 }
 
@@ -169,6 +170,7 @@ type researchRunPlanRefDigestV3 struct {
 	DefinitionDigest        string `json:"definition_digest"`
 	CapabilityCatalogDigest string `json:"capability_catalog_digest"`
 	PlanDigest              string `json:"plan_digest"`
+	StepCount               int    `json:"step_count"`
 }
 
 func SealResearchRunPlanRefV3(ref ResearchRunPlanRefV3) (ResearchRunPlanRefV3, error) {
@@ -211,6 +213,7 @@ func validateResearchRunPlanRefFieldsV3(r ResearchRunPlanRefV3, requireDigest bo
 		!boundedResearchRefText(r.TemporalRunID, 512) ||
 		!researchSHA256(r.DefinitionDigest) ||
 		!researchSHA256(r.CapabilityCatalogDigest) || !researchSHA256(r.PlanDigest) ||
+		r.StepCount <= 0 || r.StepCount > 16 ||
 		(requireDigest && !researchSHA256(r.ReferenceDigest)) {
 		return NewAppError(CodeValidation, "research plan 引用无效", ErrValidation)
 	}
@@ -224,6 +227,7 @@ func researchRunPlanReferenceDigestV3(r ResearchRunPlanRefV3) (string, error) {
 		TemporalRunID: r.TemporalRunID, TenantID: r.TenantID, UserID: r.UserID,
 		TaskID: r.TaskID, DefinitionDigest: r.DefinitionDigest,
 		CapabilityCatalogDigest: r.CapabilityCatalogDigest, PlanDigest: r.PlanDigest,
+		StepCount: r.StepCount,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode research plan reference: %w", err)
